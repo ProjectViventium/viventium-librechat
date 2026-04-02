@@ -60,6 +60,25 @@ jest.mock('@librechat/client', () => ({
   SharePointIcon: () => <span />,
   AttachmentIcon: () => <span />,
   DropdownPopup: () => null,
+  Switch: ({
+    checked,
+    onCheckedChange,
+    disabled,
+    'aria-label': ariaLabel,
+  }: {
+    checked?: boolean;
+    onCheckedChange?: (checked: boolean) => void;
+    disabled?: boolean;
+    'aria-label'?: string;
+  }) => (
+    <button
+      type="button"
+      aria-label={ariaLabel}
+      aria-pressed={checked}
+      disabled={disabled}
+      onClick={() => onCheckedChange?.(!checked)}
+    />
+  ),
 }));
 
 function Wrapper({ provider, children }: { provider?: string; children: React.ReactNode }) {

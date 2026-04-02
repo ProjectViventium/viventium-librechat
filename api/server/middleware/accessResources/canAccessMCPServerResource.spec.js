@@ -1,9 +1,8 @@
 const mongoose = require('mongoose');
 const { ResourceType, PrincipalType, PrincipalModel } = require('librechat-data-provider');
-const { SystemCapabilities } = require('@librechat/data-schemas');
 const { MongoMemoryServer } = require('mongodb-memory-server');
 const { canAccessMCPServerResource } = require('./canAccessMCPServerResource');
-const { User, Role, AclEntry, SystemGrant } = require('~/db/models');
+const { User, Role, AclEntry } = require('~/db/models');
 const { createMCPServer } = require('~/models');
 
 describe('canAccessMCPServerResource middleware', () => {
@@ -512,7 +511,7 @@ describe('canAccessMCPServerResource middleware', () => {
       });
     });
 
-    test('should allow users with MANAGE_MCP_SERVERS capability to bypass permission checks', async () => {
+    test('should allow admin users to bypass permission checks', async () => {
       const { SystemRoles } = require('librechat-data-provider');
 
       // Create an MCP server owned by another user
@@ -530,14 +529,6 @@ describe('canAccessMCPServerResource middleware', () => {
           title: 'Admin Test MCP Server',
         },
         author: otherUser._id,
-      });
-
-      // Seed MANAGE_MCP_SERVERS capability for the ADMIN role
-      await SystemGrant.create({
-        principalType: PrincipalType.ROLE,
-        principalId: SystemRoles.ADMIN,
-        capability: SystemCapabilities.MANAGE_MCP_SERVERS,
-        grantedAt: new Date(),
       });
 
       // Set user as admin

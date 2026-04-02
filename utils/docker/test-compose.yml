@@ -45,7 +45,7 @@ services:
     environment:
       POSTGRES_DB: mydatabase
       POSTGRES_USER: myuser
-      POSTGRES_PASSWORD: mypassword
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-CHANGE_ME_LOCAL_POSTGRES_PASSWORD}
     restart: always
     volumes:
       - pgdata2:/var/lib/postgresql/data

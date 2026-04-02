@@ -3,10 +3,10 @@ const path = require('path');
 const express = require('express');
 const request = require('supertest');
 const zlib = require('zlib');
-const staticCache = require('../staticCache');
 
 describe('staticCache', () => {
   let app;
+  let staticCache;
   let testDir;
   let testFile;
   let indexFile;
@@ -61,12 +61,15 @@ describe('staticCache', () => {
   });
 
   beforeEach(() => {
+    jest.resetModules();
     app = express();
 
     // Clear environment variables
     delete process.env.NODE_ENV;
     delete process.env.STATIC_CACHE_S_MAX_AGE;
     delete process.env.STATIC_CACHE_MAX_AGE;
+
+    staticCache = require('../staticCache');
   });
   describe('cache headers in production', () => {
     beforeEach(() => {

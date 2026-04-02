@@ -9,14 +9,12 @@ interface ServerInitializationSectionProps {
   requiresOAuth: boolean;
   hasCustomUserVars?: boolean;
   conversationId?: string | null;
-  storageContextKey?: string;
 }
 
 export default function ServerInitializationSection({
   serverName,
   requiresOAuth,
   conversationId,
-  storageContextKey,
   sidePanel = false,
   hasCustomUserVars = false,
 }: ServerInitializationSectionProps) {
@@ -30,7 +28,7 @@ export default function ServerInitializationSection({
     initializeServer,
     availableMCPServers,
     revokeOAuthForServer,
-  } = useMCPServerManager({ conversationId, storageContextKey });
+  } = useMCPServerManager({ conversationId });
 
   const { connectionStatus } = useMCPConnectionStatus({
     enabled: !!availableMCPServers && availableMCPServers.length > 0,
@@ -109,7 +107,7 @@ export default function ServerInitializationSection({
       )}
       <Button
         variant={buttonVariant}
-        onClick={() => initializeServer(serverName, false)}
+        onClick={() => initializeServer(serverName)}
         disabled={isServerInitializing}
         size={sidePanel ? 'sm' : 'default'}
         className="flex-1"

@@ -7,6 +7,7 @@ const accessRoleSchema = new Schema<IAccessRole>(
       type: String,
       required: true,
       index: true,
+      unique: true,
     },
     name: {
       type: String,
@@ -23,14 +24,8 @@ const accessRoleSchema = new Schema<IAccessRole>(
       type: Number,
       required: true,
     },
-    tenantId: {
-      type: String,
-      index: true,
-    },
   },
   { timestamps: true },
 );
-
-accessRoleSchema.index({ accessRoleId: 1, tenantId: 1 }, { unique: true });
 
 export default accessRoleSchema;

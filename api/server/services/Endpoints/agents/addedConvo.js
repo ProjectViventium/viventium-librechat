@@ -1,16 +1,12 @@
 const { logger } = require('@librechat/data-schemas');
-const {
-  ADDED_AGENT_ID,
-  initializeAgent,
-  validateAgentModel,
-  loadAddedAgent: loadAddedAgentFn,
-} = require('@librechat/api');
-const { filterFilesByAgentAccess } = require('~/server/services/Files/permissions');
-const { getMCPServerTools } = require('~/server/services/Config');
+const { initializeAgent, validateAgentModel } = require('@librechat/api');
+const { loadAddedAgent, setGetAgent, ADDED_AGENT_ID } = require('~/models/loadAddedAgent');
+const { getConvoFiles } = require('~/models/Conversation');
+const { getAgent } = require('~/models/Agent');
 const db = require('~/models');
 
-const loadAddedAgent = (params) =>
-  loadAddedAgentFn(params, { getAgent: db.getAgent, getMCPServerTools });
+// Initialize the getAgent dependency
+setGetAgent(getAgent);
 
 /**
  * Process addedConvo for parallel agent execution.
@@ -59,21 +55,29 @@ const processAddedConvo = async ({
   userMCPAuthMap,
 }) => {
   const addedConvo = endpointOption.addedConvo;
+  logger.debug('[processAddedConvo] Called with addedConvo:', {
+    hasAddedConvo: addedConvo != null,
+    addedConvoEndpoint: addedConvo?.endpoint,
+    addedConvoModel: addedConvo?.model,
+    addedConvoAgentId: addedConvo?.agent_id,
+  });
   if (addedConvo == null) {
     return { userMCPAuthMap };
   }
-
-  logger.debug('[processAddedConvo] Processing added conversation', {
-    model: addedConvo.model,
-    agentId: addedConvo.agent_id,
-    endpoint: addedConvo.endpoint,
-  });
 
   try {
     const addedAgent = await loadAddedAgent({ req, conversation: addedConvo, primaryAgent });
     if (!addedAgent) {
       return { userMCPAuthMap };
     }
+
+    /* === VIVENTIUM START ===
+     * Feature: Voice Chat LLM Override (parallel/handoff agents)
+     * Added: 2026-02-24
+     */
+    const { applyVoiceModelOverride } = require('~/server/services/viventium/voiceLlmOverride');
+    applyVoiceModelOverride(addedAgent, req, modelsConfig);
+    /* === VIVENTIUM END === */
 
     const addedValidation = await validateAgentModel({
       req,
@@ -103,16 +107,16 @@ const processAddedConvo = async ({
         allowedProviders,
       },
       {
+        getConvoFiles,
         getFiles: db.getFiles,
         getUserKey: db.getUserKey,
         getMessages: db.getMessages,
-        getConvoFiles: db.getConvoFiles,
+        updateUserKey: db.updateUserKey,
         updateFilesUsage: db.updateFilesUsage,
         getUserCodeFiles: db.getUserCodeFiles,
         getUserKeyValues: db.getUserKeyValues,
         getToolFilesByIds: db.getToolFilesByIds,
         getCodeGeneratedFiles: db.getCodeGeneratedFiles,
-        filterFilesByAgentAccess,
       },
     );
 

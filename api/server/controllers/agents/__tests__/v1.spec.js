@@ -1,8 +1,10 @@
 const { duplicateAgent } = require('../v1');
-const { getAgent, createAgent, getActions } = require('~/models');
+const { getAgent, createAgent } = require('~/models/Agent');
+const { getActions } = require('~/models/Action');
 const { nanoid } = require('nanoid');
 
-jest.mock('~/models');
+jest.mock('~/models/Agent');
+jest.mock('~/models/Action');
 jest.mock('nanoid');
 
 describe('duplicateAgent', () => {

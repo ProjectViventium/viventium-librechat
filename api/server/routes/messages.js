@@ -3,9 +3,18 @@ const { v4: uuidv4 } = require('uuid');
 const { logger } = require('@librechat/data-schemas');
 const { ContentTypes } = require('librechat-data-provider');
 const { unescapeLaTeX, countTokens } = require('@librechat/api');
+const {
+  saveConvo,
+  getMessage,
+  saveMessage,
+  getMessages,
+  updateMessage,
+  deleteMessages,
+} = require('~/models');
 const { findAllArtifacts, replaceArtifactContent } = require('~/server/services/Artifacts/update');
 const { requireJwtAuth, validateMessageReq } = require('~/server/middleware');
-const db = require('~/models');
+const { getConvosQueried } = require('~/models/Conversation');
+const { Message } = require('~/db/models');
 
 const router = express.Router();
 router.use(requireJwtAuth);
@@ -31,19 +40,34 @@ router.get('/', async (req, res) => {
     const sortOrder = sortDirection === 'asc' ? 1 : -1;
 
     if (conversationId && messageId) {
-      const messages = await db.getMessages({ conversationId, messageId, user });
-      response = { messages: messages?.length ? [messages[0]] : [], nextCursor: null };
+      const message = await Message.findOne({
+        conversationId,
+        messageId,
+        user: user,
+      }).lean();
+      response = { messages: message ? [message] : [], nextCursor: null };
     } else if (conversationId) {
-      response = await db.getMessagesByCursor(
-        { conversationId, user },
-        { sortField, sortOrder, limit: pageSize, cursor },
-      );
+      const filter = { conversationId, user: user };
+      if (cursor) {
+        filter[sortField] = sortOrder === 1 ? { $gt: cursor } : { $lt: cursor };
+      }
+      const messages = await Message.find(filter)
+        .sort({ [sortField]: sortOrder })
+        .limit(pageSize + 1)
+        .lean();
+      let nextCursor = null;
+      if (messages.length > pageSize) {
+        messages.pop(); // Remove extra item used to detect next page
+        // Create cursor from the last RETURNED item (not the popped one)
+        nextCursor = messages[messages.length - 1][sortField];
+      }
+      response = { messages, nextCursor };
     } else if (search) {
-      const searchResults = await db.searchMessages(search, { filter: `user = "${user}"` }, true);
+      const searchResults = await Message.meiliSearch(search, { filter: `user = "${user}"` }, true);
 
       const messages = searchResults.hits || [];
 
-      const result = await db.getConvosQueried(req.user.id, messages, cursor);
+      const result = await getConvosQueried(req.user.id, messages, cursor);
 
       const messageIds = [];
       const cleanedMessages = [];
@@ -55,7 +79,7 @@ router.get('/', async (req, res) => {
         }
       }
 
-      const dbMessages = await db.getMessages({
+      const dbMessages = await getMessages({
         user,
         messageId: { $in: messageIds },
       });
@@ -112,7 +136,7 @@ router.post('/branch', async (req, res) => {
       return res.status(400).json({ error: 'messageId and agentId are required' });
     }
 
-    const sourceMessage = await db.getMessage({ user: userId, messageId });
+    const sourceMessage = await getMessage({ user: userId, messageId });
     if (!sourceMessage) {
       return res.status(404).json({ error: 'Source message not found' });
     }
@@ -163,15 +187,9 @@ router.post('/branch', async (req, res) => {
       user: userId,
     };
 
-    const savedMessage = await db.saveMessage(
-      {
-        userId: req?.user?.id,
-        isTemporary: req?.body?.isTemporary,
-        interfaceConfig: req?.config?.interfaceConfig,
-      },
-      newMessage,
-      { context: 'POST /api/messages/branch' },
-    );
+    const savedMessage = await saveMessage(req, newMessage, {
+      context: 'POST /api/messages/branch',
+    });
 
     if (!savedMessage) {
       return res.status(500).json({ error: 'Failed to save branch message' });
@@ -193,7 +211,7 @@ router.post('/artifact/:messageId', async (req, res) => {
       return res.status(400).json({ error: 'Invalid request parameters' });
     }
 
-    const message = await db.getMessage({ user: req.user.id, messageId });
+    const message = await getMessage({ user: req.user.id, messageId });
     if (!message) {
       return res.status(404).json({ error: 'Message not found' });
     }
@@ -238,12 +256,8 @@ router.post('/artifact/:messageId', async (req, res) => {
       return res.status(400).json({ error: 'Original content not found in target artifact' });
     }
 
-    const savedMessage = await db.saveMessage(
-      {
-        userId: req?.user?.id,
-        isTemporary: req?.body?.isTemporary,
-        interfaceConfig: req?.config?.interfaceConfig,
-      },
+    const savedMessage = await saveMessage(
+      req,
       {
         messageId,
         conversationId: message.conversationId,
@@ -269,7 +283,7 @@ router.post('/artifact/:messageId', async (req, res) => {
 router.get('/:conversationId', validateMessageReq, async (req, res) => {
   try {
     const { conversationId } = req.params;
-    const messages = await db.getMessages({ conversationId }, '-_id -__v -user');
+    const messages = await getMessages({ conversationId }, '-_id -__v -user');
     res.status(200).json(messages);
   } catch (error) {
     logger.error('Error fetching messages:', error);
@@ -280,20 +294,15 @@ router.get('/:conversationId', validateMessageReq, async (req, res) => {
 router.post('/:conversationId', validateMessageReq, async (req, res) => {
   try {
     const message = req.body;
-    const reqCtx = {
-      userId: req?.user?.id,
-      isTemporary: req?.body?.isTemporary,
-      interfaceConfig: req?.config?.interfaceConfig,
-    };
-    const savedMessage = await db.saveMessage(
-      reqCtx,
+    const savedMessage = await saveMessage(
+      req,
       { ...message, user: req.user.id },
       { context: 'POST /api/messages/:conversationId' },
     );
     if (!savedMessage) {
       return res.status(400).json({ error: 'Message not saved' });
     }
-    await db.saveConvo(reqCtx, savedMessage, { context: 'POST /api/messages/:conversationId' });
+    await saveConvo(req, savedMessage, { context: 'POST /api/messages/:conversationId' });
     res.status(201).json(savedMessage);
   } catch (error) {
     logger.error('Error saving message:', error);
@@ -304,7 +313,7 @@ router.post('/:conversationId', validateMessageReq, async (req, res) => {
 router.get('/:conversationId/:messageId', validateMessageReq, async (req, res) => {
   try {
     const { conversationId, messageId } = req.params;
-    const message = await db.getMessages({ conversationId, messageId }, '-_id -__v -user');
+    const message = await getMessages({ conversationId, messageId }, '-_id -__v -user');
     if (!message) {
       return res.status(404).json({ error: 'Message not found' });
     }
@@ -322,7 +331,7 @@ router.put('/:conversationId/:messageId', validateMessageReq, async (req, res) =
 
     if (index === undefined) {
       const tokenCount = await countTokens(text, model);
-      const result = await db.updateMessage(req?.user?.id, { messageId, text, tokenCount });
+      const result = await updateMessage(req, { messageId, text, tokenCount });
       return res.status(200).json(result);
     }
 
@@ -330,9 +339,7 @@ router.put('/:conversationId/:messageId', validateMessageReq, async (req, res) =
       return res.status(400).json({ error: 'Invalid index' });
     }
 
-    const message = (
-      await db.getMessages({ conversationId, messageId }, 'content tokenCount')
-    )?.[0];
+    const message = (await getMessages({ conversationId, messageId }, 'content tokenCount'))?.[0];
     if (!message) {
       return res.status(404).json({ error: 'Message not found' });
     }
@@ -362,11 +369,7 @@ router.put('/:conversationId/:messageId', validateMessageReq, async (req, res) =
       tokenCount = Math.max(0, tokenCount - oldTokenCount) + newTokenCount;
     }
 
-    const result = await db.updateMessage(req?.user?.id, {
-      messageId,
-      content: updatedContent,
-      tokenCount,
-    });
+    const result = await updateMessage(req, { messageId, content: updatedContent, tokenCount });
     return res.status(200).json(result);
   } catch (error) {
     logger.error('Error updating message:', error);
@@ -379,8 +382,8 @@ router.put('/:conversationId/:messageId/feedback', validateMessageReq, async (re
     const { conversationId, messageId } = req.params;
     const { feedback } = req.body;
 
-    const updatedMessage = await db.updateMessage(
-      req?.user?.id,
+    const updatedMessage = await updateMessage(
+      req,
       {
         messageId,
         feedback: feedback || null,
@@ -401,8 +404,8 @@ router.put('/:conversationId/:messageId/feedback', validateMessageReq, async (re
 
 router.delete('/:conversationId/:messageId', validateMessageReq, async (req, res) => {
   try {
-    const { conversationId, messageId } = req.params;
-    await db.deleteMessages({ messageId, conversationId, user: req.user.id });
+    const { messageId } = req.params;
+    await deleteMessages({ messageId });
     res.status(204).send();
   } catch (error) {
     logger.error('Error deleting message:', error);

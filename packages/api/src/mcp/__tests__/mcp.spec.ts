@@ -179,7 +179,6 @@ describe('Environment Variable Extraction (MCP)', () => {
   describe('processMCPEnv', () => {
     it('should create a deep clone of the input object', () => {
       const originalObj: MCPOptions = {
-        type: 'stdio',
         command: 'node',
         args: ['server.js'],
         env: {
@@ -203,7 +202,6 @@ describe('Environment Variable Extraction (MCP)', () => {
 
     it('should process environment variables in env field', () => {
       const options: MCPOptions = {
-        type: 'stdio',
         command: 'node',
         args: ['server.js'],
         env: {
@@ -254,7 +252,6 @@ describe('Environment Variable Extraction (MCP)', () => {
 
     it('should not modify objects without env or headers', () => {
       const options: MCPOptions = {
-        type: 'stdio',
         command: 'node',
         args: ['server.js'],
         timeout: 5000,
@@ -436,7 +433,6 @@ describe('Environment Variable Extraction (MCP)', () => {
         ldapId: 'ldap-user-123',
       });
       const options: MCPOptions = {
-        type: 'stdio',
         command: 'node',
         args: ['server.js'],
         env: {
@@ -603,7 +599,6 @@ describe('Environment Variable Extraction (MCP)', () => {
         CUSTOM_VAR_2: 'custom-value-2',
       };
       const options: MCPOptions = {
-        type: 'stdio',
         command: 'node',
         args: ['server.js'],
         env: {
@@ -679,7 +674,6 @@ describe('Environment Variable Extraction (MCP)', () => {
         PROFILE_NAME: 'production-profile',
       };
       const options: MCPOptions = {
-        type: 'stdio',
         command: 'npx',
         args: [
           '-y',
@@ -740,7 +734,6 @@ describe('Environment Variable Extraction (MCP)', () => {
         UNUSED_VAR: 'unused-value',
       };
       const options: MCPOptions = {
-        type: 'stdio',
         command: 'node',
         args: ['server.js'],
         env: {
@@ -830,7 +823,7 @@ describe('Environment Variable Extraction (MCP)', () => {
     it('should process GitHub MCP server configuration with PAT_TOKEN placeholder', () => {
       const user = createTestUser({ id: 'github-user-123', email: 'user@example.com' });
       const customUserVars = {
-        PAT_TOKEN: 'ghp_1234567890abcdef1234567890abcdef12345678', // GitHub Personal Access Token
+        PAT_TOKEN: 'test_pat_token_for_mcp_header_resolution',
       };
 
       // Simulate the GitHub MCP server configuration from librechat.yaml
@@ -847,7 +840,7 @@ describe('Environment Variable Extraction (MCP)', () => {
       const result = processMCPEnv({ options, user, customUserVars });
 
       expect('headers' in result && result.headers).toEqual({
-        Authorization: 'ghp_1234567890abcdef1234567890abcdef12345678',
+        Authorization: 'test_pat_token_for_mcp_header_resolution',
         'Content-Type': 'application/json',
         'User-Agent': 'LibreChat-MCP-Client',
       });
@@ -966,7 +959,6 @@ describe('Environment Variable Extraction (MCP)', () => {
       }) as unknown as IUser;
 
       const options: MCPOptions = {
-        type: 'stdio',
         command: 'node',
         args: ['mcp-server.js', '--user', '{{LIBRECHAT_USER_USERNAME}}'],
         env: {

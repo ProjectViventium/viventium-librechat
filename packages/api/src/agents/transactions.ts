@@ -3,11 +3,9 @@ import type { TCustomConfig, TTransactionsConfig } from 'librechat-data-provider
 import type { TransactionData } from '@librechat/data-schemas';
 import type { EndpointTokenConfig } from '~/types/tokens';
 
-type TokenType = 'prompt' | 'completion';
-
 interface GetMultiplierParams {
   valueKey?: string;
-  tokenType?: TokenType;
+  tokenType?: string;
   model?: string;
   endpointTokenConfig?: EndpointTokenConfig;
   inputTokenCount?: number;
@@ -36,14 +34,14 @@ interface BaseTxData {
 }
 
 interface StandardTxData extends BaseTxData {
-  tokenType: TokenType;
+  tokenType: string;
   rawAmount: number;
   inputTokenCount?: number;
   valueKey?: string;
 }
 
 interface StructuredTxData extends BaseTxData {
-  tokenType: TokenType;
+  tokenType: string;
   inputTokens?: number;
   writeTokens?: number;
   readTokens?: number;

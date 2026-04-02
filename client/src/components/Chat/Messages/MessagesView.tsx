@@ -8,7 +8,16 @@ import ScrollToBottom from '~/components/Messages/ScrollToBottom';
 import { MessagesViewProvider } from '~/Providers';
 import { fontSizeAtom } from '~/store/fontSize';
 import MultiMessage from './MultiMessage';
-import { cn } from '~/utils';
+/* === VIVENTIUM START ===
+ * Feature: Hide internal no-response ({NTA}) follow-ups from the UI
+ *
+ * Purpose:
+ * - Filter internal no-response follow-ups from rendering/exporting in the chat UI.
+ *
+ * Added: 2026-02-07
+ */
+import { cn, filterNoResponseMessagesTree } from '~/utils';
+/* === VIVENTIUM END === */
 import store from '~/store';
 
 function MessagesViewContent({
@@ -23,6 +32,20 @@ function MessagesViewContent({
   const [currentEditId, setCurrentEditId] = useState<number | string | null>(-1);
   const scrollToBottomRef = useRef<HTMLButtonElement>(null);
 
+  /* === VIVENTIUM DISABLED (2026-02-21) ===
+   * NTA client-side auto-hide disabled on LC Web UI for full visibility.
+   * LC interface shows ALL responses (including {NTA} text and tool calls).
+   * Other channels (Telegram, Voice, OpenClaw) still suppress NTA server-side.
+   * To re-enable: uncomment the filterNoResponseMessagesTree line below and
+   * remove the passthrough assignment.
+   *
+   * Original feature added: 2026-02-07
+   */
+  // const messagesTree = filterNoResponseMessagesTree(_messagesTree, {
+  //   brewNoResponsePlaceholder: '-',
+  // });
+  const messagesTree = _messagesTree;
+
   const {
     conversation,
     scrollableRef,
@@ -30,7 +53,8 @@ function MessagesViewContent({
     showScrollButton,
     handleSmoothToRef,
     debouncedHandleScroll,
-  } = useMessageScrolling(_messagesTree);
+  } = useMessageScrolling(messagesTree);
+  /* === VIVENTIUM END === */
 
   const { conversationId } = conversation ?? {};
 
@@ -49,7 +73,12 @@ function MessagesViewContent({
             }}
           >
             <div className="flex flex-col pb-9 pt-14 dark:bg-transparent">
-              {(_messagesTree && _messagesTree.length == 0) || _messagesTree === null ? (
+              {/* === VIVENTIUM START ===
+               * Feature: Hide internal no-response ({NTA}) follow-ups from the UI
+               * Purpose: Render the filtered messages tree (`messagesTree`) instead of upstream raw `_messagesTree`.
+               * Added: 2026-02-07
+               */}
+              {(messagesTree && messagesTree.length == 0) || messagesTree === null ? (
                 <div
                   className={cn(
                     'flex w-full items-center justify-center p-3 text-text-secondary',
@@ -63,7 +92,7 @@ function MessagesViewContent({
                   <div ref={screenshotTargetRef}>
                     <MultiMessage
                       key={conversationId}
-                      messagesTree={_messagesTree}
+                      messagesTree={messagesTree}
                       messageId={conversationId ?? null}
                       setCurrentEditId={setCurrentEditId}
                       currentEditId={currentEditId ?? null}
@@ -71,6 +100,7 @@ function MessagesViewContent({
                   </div>
                 </>
               )}
+              {/* === VIVENTIUM END === */}
               <div
                 id="messages-end"
                 className="group h-0 w-full flex-shrink-0"

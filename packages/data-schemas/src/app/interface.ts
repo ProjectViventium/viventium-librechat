@@ -48,6 +48,13 @@ export async function loadDefaultInterface({
     prompts: interfaceConfig?.prompts,
     multiConvo: interfaceConfig?.multiConvo,
     agents: interfaceConfig?.agents,
+    /* === VIVENTIUM START ===
+     * Feature: Default agent selection (Viventium)
+     * Purpose: Allow a configured default agent to be honored by the client and surface entrypoints.
+     * Added: 2026-02-07
+     */
+    defaultAgent: interfaceConfig?.defaultAgent,
+    /* === VIVENTIUM END === */
     temporaryChat: interfaceConfig?.temporaryChat,
     runCode: interfaceConfig?.runCode,
     webSearch: interfaceConfig?.webSearch,

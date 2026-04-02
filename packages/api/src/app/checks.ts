@@ -6,10 +6,10 @@ import { isEnabled, checkEmailConfig } from '~/utils';
 import { handleRateLimits } from './limits';
 
 const secretDefaults = {
-  CREDS_KEY: 'f34be427ebb29de8d88c107a71546019685ed8b241d8f2ed00c3df97ad2566f0',
-  CREDS_IV: 'e2341419ec3dd3d19b13a1a87fafcbfb',
-  JWT_SECRET: '16f8c0ef4a5d391b26034086c628469d3f9f497f08163ab9b40137092f2909ef',
-  JWT_REFRESH_SECRET: 'eaa5191f2914e30b9387fd84e254e4ba6fc51b4654968a9b0803b456a54b8418',
+  CREDS_KEY: 'CHANGE_ME_GENERATE_64_HEX_CHARS',
+  CREDS_IV: 'CHANGE_ME_GENERATE_32_HEX_CHARS',
+  JWT_SECRET: 'CHANGE_ME_GENERATE_64_HEX_CHARS',
+  JWT_REFRESH_SECRET: 'CHANGE_ME_GENERATE_64_HEX_CHARS',
 };
 
 const deprecatedVariables = [
@@ -29,6 +29,18 @@ const deprecatedVariables = [
       'Please use the `GOOGLE_SEARCH_API_KEY` environment variable for the Google Search Tool instead.',
   },
 ];
+
+const webSearchConfigEnvVars: Record<string, string> = {
+  serperApiKey: 'SERPER_API_KEY',
+  searxngInstanceUrl: 'SEARXNG_INSTANCE_URL',
+  searxngApiKey: 'SEARXNG_API_KEY',
+  firecrawlApiKey: 'FIRECRAWL_API_KEY',
+  firecrawlApiUrl: 'FIRECRAWL_API_URL',
+  firecrawlVersion: 'FIRECRAWL_VERSION',
+  jinaApiKey: 'JINA_API_KEY',
+  jinaApiUrl: 'JINA_API_URL',
+  cohereApiKey: 'COHERE_API_KEY',
+};
 
 export const deprecatedAzureVariables = [
   /* "related to" precedes description text */
@@ -135,15 +147,48 @@ export function checkVariables() {
  * Logs information or warning based on the API's availability and response.
  */
 export async function checkHealth() {
+  if (!process.env.RAG_API_URL) {
+    return;
+  }
+
+  /* === VIVENTIUM START ===
+   * Feature: Bounded startup health checks (prevent boot hangs).
+   *
+   * Root cause:
+   * - Startup awaited `fetch(${RAG_API_URL}/health)` with no timeout.
+   * - Under transient network stalls, this can block startup long enough to fail container probes.
+   *
+   * Added: 2026-02-19
+   * === VIVENTIUM END === */
+  const timeoutMs = Math.max(
+    500,
+    Number.parseInt(process.env.VIVENTIUM_STARTUP_HEALTH_TIMEOUT_MS || '3000', 10) || 3000,
+  );
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  if (typeof timer.unref === 'function') {
+    timer.unref();
+  }
+
   try {
-    const response = await fetch(`${process.env.RAG_API_URL}/health`);
+    const response = await fetch(`${process.env.RAG_API_URL}/health`, {
+      signal: controller.signal,
+    });
     if (response?.ok && response?.status === 200) {
       logger.info(`RAG API is running and reachable at ${process.env.RAG_API_URL}.`);
     }
-  } catch {
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      logger.warn(
+        `RAG API health check timed out after ${timeoutMs}ms at ${process.env.RAG_API_URL}, startup will continue.`,
+      );
+      return;
+    }
     logger.warn(
       `RAG API is either not running or not reachable at ${process.env.RAG_API_URL}, you may experience errors with file uploads.`,
     );
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -288,6 +333,13 @@ export function checkWebSearchConfig(webSearchConfig?: Partial<TCustomConfig['we
           );
         }
       } else {
+        const fallbackEnvVar = webSearchConfigEnvVars[String(key)];
+        if (fallbackEnvVar && process.env[fallbackEnvVar] === value) {
+          logger.debug(
+            `Web search ${key}: Using resolved environment variable ${fallbackEnvVar} with value set`,
+          );
+          return;
+        }
         // This is not an environment variable reference - warn user
         logger.warn(
           `❗ Web search configuration error: ${key} contains an actual value instead of an environment variable reference.

@@ -13,7 +13,6 @@ const {
   checkEmailConfig,
   isEmailDomainAllowed,
   shouldUseSecureCookie,
-  resolveAppConfigForUser,
 } = require('@librechat/api');
 const {
   findUser,
@@ -34,6 +33,15 @@ const {
 const { registerSchema } = require('~/strategies/validators');
 const { getAppConfig } = require('~/server/services/Config');
 const { sendEmail } = require('~/server/utils');
+/* === VIVENTIUM START ===
+ * Feature: Registration approval workflow gates and notifications.
+ * === VIVENTIUM END === */
+const {
+  isRegistrationApprovalEnabled,
+  assertViventiumApproved,
+  markUserPendingApproval,
+  notifyAdminRegistration,
+} = require('~/server/services/viventium/registrationApprovalService');
 
 const domains = {
   client: process.env.DOMAIN_CLIENT,
@@ -190,7 +198,7 @@ const registerUser = async (user, additionalData = {}) => {
 
   let newUserId;
   try {
-    const appConfig = await getAppConfig({ baseOnly: true });
+    const appConfig = await getAppConfig();
     if (!isEmailDomainAllowed(email, appConfig?.registration?.allowedDomains)) {
       const errorMessage =
         'The email address provided cannot be used. Please use a different email address.';
@@ -232,6 +240,19 @@ const registerUser = async (user, additionalData = {}) => {
 
     const newUser = await createUser(newUserData, appConfig.balance, disableTTL, true);
     newUserId = newUser._id;
+    /* === VIVENTIUM START ===
+     * Feature: Registration approval workflow.
+     * Purpose: Mark all newly created accounts as pending and notify admin for review.
+     * === VIVENTIUM END === */
+    if (isRegistrationApprovalEnabled()) {
+      await markUserPendingApproval(newUserId.toString());
+      await notifyAdminRegistration({
+        userId: newUserId.toString(),
+        name,
+        email,
+        provider: provider ?? 'local',
+      });
+    }
     if (emailEnabled && !newUser.emailVerified) {
       await sendVerificationEmail({
         _id: newUserId,
@@ -256,52 +277,19 @@ const registerUser = async (user, additionalData = {}) => {
 };
 
 /**
- * Request password reset.
- *
- * Uses a two-phase domain check: fast-fail with the memory-cached base config
- * (zero DB queries) to block globally denied domains before user lookup, then
- * re-check with tenant-scoped config after user lookup so tenant-specific
- * restrictions are enforced.
- *
- * Phase 1 (base check) returns an Error (HTTP 400) — this intentionally reveals
- * that the domain is globally blocked, but fires before any DB lookup so it
- * cannot confirm user existence. Phase 2 (tenant check) returns the generic
- * success message (HTTP 200) to prevent user-enumeration via status codes.
- *
+ * Request password reset
  * @param {ServerRequest} req
  */
 const requestPasswordReset = async (req) => {
   const { email } = req.body;
-
-  const baseConfig = await getAppConfig({ baseOnly: true });
-  if (!isEmailDomainAllowed(email, baseConfig?.registration?.allowedDomains)) {
-    logger.warn(
-      `[requestPasswordReset] Blocked - email domain not allowed [Email: ${email}] [IP: ${req.ip}]`,
-    );
+  const appConfig = await getAppConfig();
+  if (!isEmailDomainAllowed(email, appConfig?.registration?.allowedDomains)) {
     const error = new Error(ErrorTypes.AUTH_FAILED);
     error.code = ErrorTypes.AUTH_FAILED;
     error.message = 'Email domain not allowed';
     return error;
   }
-
-  const user = await findUser({ email }, 'email _id role tenantId');
-  let appConfig = baseConfig;
-  if (user?.tenantId) {
-    try {
-      appConfig = await resolveAppConfigForUser(getAppConfig, user);
-    } catch (err) {
-      logger.error('[requestPasswordReset] Failed to resolve tenant config, using base:', err);
-    }
-  }
-
-  if (!isEmailDomainAllowed(email, appConfig?.registration?.allowedDomains)) {
-    logger.warn(
-      `[requestPasswordReset] Tenant config blocked domain [Email: ${email}] [IP: ${req.ip}]`,
-    );
-    return {
-      message: 'If an account with that email exists, a password reset link has been sent to it.',
-    };
-  }
+  const user = await findUser({ email }, 'email _id');
   const emailEnabled = checkEmailConfig();
 
   logger.warn(`[requestPasswordReset] [Password reset request initiated] [Email: ${email}]`);
@@ -425,6 +413,11 @@ const setAuthTokens = async (userId, res, _session = null) => {
     }
 
     const user = await getUserById(userId);
+    /* === VIVENTIUM START ===
+     * Feature: Approval gate at token issuance layer.
+     * Purpose: Block local login, refresh, and 2FA token issuance for pending/denied users.
+     * === VIVENTIUM END === */
+    await assertViventiumApproved(user);
     const sessionExpiry = math(process.env.SESSION_EXPIRY, DEFAULT_SESSION_EXPIRY);
     const token = await generateToken(user, sessionExpiry);
 
@@ -505,59 +498,86 @@ const setOpenIDAuthTokens = (tokenset, req, res, userId, existingRefreshToken) =
      * The refresh token is small (opaque string) so it doesn't hit the HTTP/2 header
      * size limits that motivated session storage for the larger access_token/id_token.
      */
-    res.cookie('refreshToken', refreshToken, {
-      expires: expirationDate,
-      httpOnly: true,
-      secure: shouldUseSecureCookie(),
-      sameSite: 'strict',
-    });
-
-    /** Store tokens server-side in session to avoid large cookies */
-    if (req.session) {
-      req.session.openidTokens = {
-        accessToken: tokenset.access_token,
-        idToken: tokenset.id_token,
-        refreshToken: refreshToken,
-        expiresAt: expirationDate.getTime(),
-      };
-    } else {
-      logger.warn('[setOpenIDAuthTokens] No session available, falling back to cookies');
-      res.cookie('openid_access_token', tokenset.access_token, {
+    const persistTokens = () => {
+      res.cookie('refreshToken', refreshToken, {
         expires: expirationDate,
         httpOnly: true,
         secure: shouldUseSecureCookie(),
         sameSite: 'strict',
       });
-      if (tokenset.id_token) {
-        res.cookie('openid_id_token', tokenset.id_token, {
+
+      /** Store tokens server-side in session to avoid large cookies */
+      if (req.session) {
+        req.session.openidTokens = {
+          accessToken: tokenset.access_token,
+          idToken: tokenset.id_token,
+          refreshToken: refreshToken,
+          expiresAt: expirationDate.getTime(),
+        };
+      } else {
+        logger.warn('[setOpenIDAuthTokens] No session available, falling back to cookies');
+        res.cookie('openid_access_token', tokenset.access_token, {
+          expires: expirationDate,
+          httpOnly: true,
+          secure: shouldUseSecureCookie(),
+          sameSite: 'strict',
+        });
+        if (tokenset.id_token) {
+          res.cookie('openid_id_token', tokenset.id_token, {
+            expires: expirationDate,
+            httpOnly: true,
+            secure: shouldUseSecureCookie(),
+            sameSite: 'strict',
+          });
+        }
+      }
+
+      /** Small cookie to indicate token provider (required for auth middleware) */
+      res.cookie('token_provider', 'openid', {
+        expires: expirationDate,
+        httpOnly: true,
+        secure: shouldUseSecureCookie(),
+        sameSite: 'strict',
+      });
+      if (userId && isEnabled(process.env.OPENID_REUSE_TOKENS)) {
+        /** JWT-signed user ID cookie for image path validation when OPENID_REUSE_TOKENS is enabled */
+        const signedUserId = jwt.sign({ id: userId }, process.env.JWT_REFRESH_SECRET, {
+          expiresIn: expiryInMilliseconds / 1000,
+        });
+        res.cookie('openid_user_id', signedUserId, {
           expires: expirationDate,
           httpOnly: true,
           secure: shouldUseSecureCookie(),
           sameSite: 'strict',
         });
       }
+
+      return appAuthToken;
+    };
+
+    /* === VIVENTIUM START ===
+     * Feature: Approval gate for OpenID token issuance.
+     * Purpose: Prevent pending/denied OpenID users from receiving reusable session tokens.
+     * Notes:
+     * - Preserve upstream synchronous behavior when approval mode is disabled.
+     * - Return a Promise only on the approval-gated path; existing callers already await it.
+     * === VIVENTIUM END === */
+    if (!isRegistrationApprovalEnabled()) {
+      return persistTokens();
     }
 
-    /** Small cookie to indicate token provider (required for auth middleware) */
-    res.cookie('token_provider', 'openid', {
-      expires: expirationDate,
-      httpOnly: true,
-      secure: shouldUseSecureCookie(),
-      sameSite: 'strict',
-    });
-    if (userId && isEnabled(process.env.OPENID_REUSE_TOKENS)) {
-      /** JWT-signed user ID cookie for image path validation when OPENID_REUSE_TOKENS is enabled */
-      const signedUserId = jwt.sign({ id: userId }, process.env.JWT_REFRESH_SECRET, {
-        expiresIn: expiryInMilliseconds / 1000,
-      });
-      res.cookie('openid_user_id', signedUserId, {
-        expires: expirationDate,
-        httpOnly: true,
-        secure: shouldUseSecureCookie(),
-        sameSite: 'strict',
-      });
+    if (!userId) {
+      const error = new Error('Unable to verify registration approval state');
+      error.code = 'VIVENTIUM_APPROVAL_PENDING';
+      throw error;
     }
-    return appAuthToken;
+
+    return Promise.resolve(assertViventiumApproved(userId))
+      .then(() => persistTokens())
+      .catch((error) => {
+        logger.error('[setOpenIDAuthTokens] Error in setting authentication tokens:', error);
+        throw error;
+      });
   } catch (error) {
     logger.error('[setOpenIDAuthTokens] Error in setting authentication tokens:', error);
     throw error;

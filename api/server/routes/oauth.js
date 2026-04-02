@@ -7,13 +7,12 @@ const { ErrorTypes } = require('librechat-data-provider');
 const { createSetBalanceConfig } = require('@librechat/api');
 const { checkDomainAllowed, loginLimiter, logHeaders } = require('~/server/middleware');
 const { createOAuthHandler } = require('~/server/controllers/auth/oauth');
-const { findBalanceByUser, upsertBalanceFields } = require('~/models');
 const { getAppConfig } = require('~/server/services/Config');
+const { Balance } = require('~/db/models');
 
 const setBalanceConfig = createSetBalanceConfig({
   getAppConfig,
-  findBalanceByUser,
-  upsertBalanceFields,
+  Balance,
 });
 
 const router = express.Router();

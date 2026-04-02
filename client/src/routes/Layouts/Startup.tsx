@@ -44,7 +44,11 @@ export default function StartupLayout({ isAuthenticated }: { isAuthenticated?: b
   }, [isAuthenticated, navigate, data]);
 
   useEffect(() => {
-    document.title = startupConfig?.appTitle || 'LibreChat';
+    // VIVENTIUM START
+    // Purpose: Ensure default app title uses Viventium branding when config is missing.
+    // Details: docs/requirements_and_learnings/16_Branding_and_Assets.md#librechat-startup-title
+    document.title = startupConfig?.appTitle || 'Viventium';
+    // VIVENTIUM END
   }, [startupConfig?.appTitle]);
 
   useEffect(() => {

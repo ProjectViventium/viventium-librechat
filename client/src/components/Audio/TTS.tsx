@@ -47,11 +47,18 @@ export function BrowserTTS({
     }
   }, [audioRef, isSpeaking, playbackRate, messageId]);
 
-  logger.log(
-    'MessageAudio: audioRef.current?.src, audioRef.current',
-    audioRef.current?.src,
-    audioRef.current,
-  );
+  /* VIVENTIUM START
+   * Purpose: Silence noisy audio debug logs in Viventium runtime.
+   * Details: docs/requirements_and_learnings/05_Open_Source_Modifications.md#librechat-tts-logging
+   */
+  // Disabled excessive audio logging that pollutes console
+  // Uncomment for debugging audio issues:
+  // logger.log(
+  //   'MessageAudio: audioRef.current?.src, audioRef.current',
+  //   audioRef.current?.src,
+  //   audioRef.current,
+  // );
+  /* VIVENTIUM END */
 
   const handleClick = () => {
     if (audioRef.current) {
@@ -77,6 +84,10 @@ export function BrowserTTS({
           {renderIcon()}
         </button>
       )}
+      {/* VIVENTIUM START
+       * Purpose: Keep hidden audio element minimal for Viventium playback flow.
+       * Details: docs/requirements_and_learnings/05_Open_Source_Modifications.md#librechat-tts-audio-element
+       */}
       <audio
         ref={audioRef}
         controls
@@ -89,13 +100,9 @@ export function BrowserTTS({
           height: '0px',
           width: '0px',
         }}
-        src={audioRef.current?.src}
-        onError={(error) => {
-          logger.error('Error fetching audio:', error);
-        }}
         id={`audio-${messageId}`}
-        autoPlay
       />
+      {/* VIVENTIUM END */}
     </>
   );
 }
@@ -140,11 +147,18 @@ export function ExternalTTS({
     }
   }, [audioRef, isSpeaking, playbackRate, messageId]);
 
-  logger.log(
-    'MessageAudio: audioRef.current?.src, audioRef.current',
-    audioRef.current?.src,
-    audioRef.current,
-  );
+  /* VIVENTIUM START
+   * Purpose: Silence noisy audio debug logs in Viventium runtime.
+   * Details: docs/requirements_and_learnings/05_Open_Source_Modifications.md#librechat-tts-logging
+   */
+  // Disabled excessive audio logging that pollutes console
+  // Uncomment for debugging audio issues:
+  // logger.log(
+  //   'MessageAudio: audioRef.current?.src, audioRef.current',
+  //   audioRef.current?.src,
+  //   audioRef.current,
+  // );
+  /* VIVENTIUM END */
 
   return (
     <>
@@ -175,6 +189,10 @@ export function ExternalTTS({
           {renderIcon()}
         </button>
       )}
+      {/* VIVENTIUM START
+       * Purpose: Keep hidden audio element minimal for Viventium playback flow.
+       * Details: docs/requirements_and_learnings/05_Open_Source_Modifications.md#librechat-tts-audio-element
+       */}
       <audio
         ref={audioRef}
         controls
@@ -187,13 +205,9 @@ export function ExternalTTS({
           height: '0px',
           width: '0px',
         }}
-        src={audioRef.current?.src}
-        onError={(error) => {
-          logger.error('Error fetching audio:', error);
-        }}
         id={`audio-${messageId}`}
-        autoPlay
       />
+      {/* VIVENTIUM END */}
     </>
   );
 }

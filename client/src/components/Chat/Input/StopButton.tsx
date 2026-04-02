@@ -1,15 +1,8 @@
-import { memo } from 'react';
 import { TooltipAnchor } from '@librechat/client';
 import { useLocalize } from '~/hooks';
 import { cn } from '~/utils';
 
-export default memo(function StopButton({
-  stop,
-  setShowStopButton,
-}: {
-  stop: (e: React.MouseEvent<HTMLButtonElement>) => void;
-  setShowStopButton: (value: boolean) => void;
-}) {
+export default function StopButton({ stop, setShowStopButton }) {
   const localize = useLocalize();
 
   return (
@@ -41,4 +34,4 @@ export default memo(function StopButton({
       }
     ></TooltipAnchor>
   );
-});
+}

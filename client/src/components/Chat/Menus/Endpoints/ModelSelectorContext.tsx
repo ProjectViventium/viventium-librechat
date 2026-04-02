@@ -28,6 +28,7 @@ type ModelSelectorContextType = {
   agentsMap: t.TAgentsMap | undefined;
   assistantsMap: t.TAssistantsMap | undefined;
   endpointsConfig: t.TEndpointsConfig;
+  connectedAccountsEnabled: boolean;
 
   // Functions
   endpointRequiresUserKey: (endpoint: string) => boolean;
@@ -62,6 +63,9 @@ export function ModelSelectorProvider({ children, startupConfig }: ModelSelector
     useModelSelectorChatContext();
   const localize = useLocalize();
   const { announcePolite } = useLiveAnnouncer();
+  const connectedAccountsEnabled =
+    (startupConfig as { viventiumConnectedAccountsEnabled?: boolean } | undefined)
+      ?.viventiumConnectedAccountsEnabled === true;
   const modelSpecs = useMemo(() => {
     const specs = startupConfig?.modelSpecs?.list ?? [];
     if (!agentsMap) {
@@ -153,7 +157,7 @@ export function ModelSelectorProvider({ children, startupConfig }: ModelSelector
   const [searchValue, setSearchValueState] = useState('');
   const [endpointSearchValues, setEndpointSearchValues] = useState<Record<string, string>>({});
 
-  const keyProps = useKeyDialog();
+  const keyProps = useKeyDialog({ connectedAccountsEnabled });
 
   /** Memoized search results */
   const searchResults = useMemo(() => {
@@ -171,115 +175,91 @@ export function ModelSelectorProvider({ children, startupConfig }: ModelSelector
       }, 200),
     [],
   );
-  const setEndpointSearchValue = useCallback((endpoint: string, value: string) => {
+  const setEndpointSearchValue = (endpoint: string, value: string) => {
     setEndpointSearchValues((prev) => ({
       ...prev,
       [endpoint]: value,
     }));
-  }, []);
+  };
 
-  const handleSelectSpec = useCallback(
-    (spec: t.TModelSpec) => {
-      let model = spec.preset.model ?? null;
-      onSelectSpec?.(spec);
-      if (isAgentsEndpoint(spec.preset.endpoint)) {
-        model = spec.preset.agent_id ?? '';
-      } else if (isAssistantsEndpoint(spec.preset.endpoint)) {
-        model = spec.preset.assistant_id ?? '';
-      }
-      setSelectedValues({
-        endpoint: spec.preset.endpoint,
-        model,
-        modelSpec: spec.name,
-      });
-    },
-    [onSelectSpec],
-  );
+  const handleSelectSpec = (spec: t.TModelSpec) => {
+    let model = spec.preset.model ?? null;
+    onSelectSpec?.(spec);
+    if (isAgentsEndpoint(spec.preset.endpoint)) {
+      model = spec.preset.agent_id ?? '';
+    } else if (isAssistantsEndpoint(spec.preset.endpoint)) {
+      model = spec.preset.assistant_id ?? '';
+    }
+    setSelectedValues({
+      endpoint: spec.preset.endpoint,
+      model,
+      modelSpec: spec.name,
+    });
+  };
 
-  const handleSelectEndpoint = useCallback(
-    (endpoint: Endpoint) => {
-      if (!endpoint.hasModels) {
-        if (endpoint.value) {
-          onSelectEndpoint?.(endpoint.value);
-        }
-        setSelectedValues({
-          endpoint: endpoint.value,
-          model: '',
-          modelSpec: '',
-        });
-      }
-    },
-    [onSelectEndpoint],
-  );
-
-  const handleSelectModel = useCallback(
-    (endpoint: Endpoint, model: string) => {
-      if (isAgentsEndpoint(endpoint.value)) {
-        onSelectEndpoint?.(endpoint.value, {
-          agent_id: model,
-          model: agentsMap?.[model]?.model ?? '',
-        });
-      } else if (isAssistantsEndpoint(endpoint.value)) {
-        onSelectEndpoint?.(endpoint.value, {
-          assistant_id: model,
-          model: assistantsMap?.[endpoint.value]?.[model]?.model ?? '',
-        });
-      } else if (endpoint.value) {
-        onSelectEndpoint?.(endpoint.value, { model });
+  const handleSelectEndpoint = (endpoint: Endpoint) => {
+    if (!endpoint.hasModels) {
+      if (endpoint.value) {
+        onSelectEndpoint?.(endpoint.value);
       }
       setSelectedValues({
         endpoint: endpoint.value,
-        model,
+        model: '',
         modelSpec: '',
       });
+    }
+  };
 
-      const modelDisplayName = getModelDisplayName(endpoint, model);
-      const announcement = localize('com_ui_model_selected', { 0: modelDisplayName });
-      announcePolite({ message: announcement, isStatus: true });
-    },
-    [agentsMap, announcePolite, assistantsMap, getModelDisplayName, localize, onSelectEndpoint],
-  );
+  const handleSelectModel = (endpoint: Endpoint, model: string) => {
+    if (isAgentsEndpoint(endpoint.value)) {
+      onSelectEndpoint?.(endpoint.value, {
+        agent_id: model,
+        model: agentsMap?.[model]?.model ?? '',
+      });
+    } else if (isAssistantsEndpoint(endpoint.value)) {
+      onSelectEndpoint?.(endpoint.value, {
+        assistant_id: model,
+        model: assistantsMap?.[endpoint.value]?.[model]?.model ?? '',
+      });
+    } else if (endpoint.value) {
+      onSelectEndpoint?.(endpoint.value, { model });
+    }
+    setSelectedValues({
+      endpoint: endpoint.value,
+      model,
+      modelSpec: '',
+    });
 
-  const value = useMemo(
-    () => ({
-      searchValue,
-      searchResults,
-      selectedValues,
-      endpointSearchValues,
-      agentsMap,
-      modelSpecs,
-      assistantsMap,
-      mappedEndpoints,
-      endpointsConfig,
-      handleSelectSpec,
-      handleSelectModel,
-      setSelectedValues,
-      handleSelectEndpoint,
-      setEndpointSearchValue,
-      endpointRequiresUserKey,
-      setSearchValue: setDebouncedSearchValue,
-      ...keyProps,
-    }),
-    [
-      searchValue,
-      searchResults,
-      selectedValues,
-      endpointSearchValues,
-      agentsMap,
-      modelSpecs,
-      assistantsMap,
-      mappedEndpoints,
-      endpointsConfig,
-      handleSelectSpec,
-      handleSelectModel,
-      setSelectedValues,
-      handleSelectEndpoint,
-      setEndpointSearchValue,
-      endpointRequiresUserKey,
-      setDebouncedSearchValue,
-      keyProps,
-    ],
-  );
+    const modelDisplayName = getModelDisplayName(endpoint, model);
+    const announcement = localize('com_ui_model_selected', { 0: modelDisplayName });
+    announcePolite({ message: announcement, isStatus: true });
+  };
+
+  const value = {
+    // State
+    searchValue,
+    searchResults,
+    selectedValues,
+    endpointSearchValues,
+    // LibreChat
+    agentsMap,
+    modelSpecs,
+    assistantsMap,
+    mappedEndpoints,
+    endpointsConfig,
+    connectedAccountsEnabled,
+
+    // Functions
+    handleSelectSpec,
+    handleSelectModel,
+    setSelectedValues,
+    handleSelectEndpoint,
+    setEndpointSearchValue,
+    endpointRequiresUserKey,
+    setSearchValue: setDebouncedSearchValue,
+    // Dialog
+    ...keyProps,
+  };
 
   return <ModelSelectorContext.Provider value={value}>{children}</ModelSelectorContext.Provider>;
 }

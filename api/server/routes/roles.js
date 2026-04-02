@@ -1,5 +1,4 @@
 const express = require('express');
-const { logger, SystemCapabilities } = require('@librechat/data-schemas');
 const {
   SystemRoles,
   roleDefaults,
@@ -12,13 +11,11 @@ const {
   peoplePickerPermissionsSchema,
   remoteAgentsPermissionsSchema,
 } = require('librechat-data-provider');
-const { hasCapability, requireCapability } = require('~/server/middleware/roles/capabilities');
-const { updateRoleByName, getRoleByName } = require('~/models');
-const { requireJwtAuth } = require('~/server/middleware');
+const { checkAdmin, requireJwtAuth } = require('~/server/middleware');
+const { updateRoleByName, getRoleByName } = require('~/models/Role');
 
 const router = express.Router();
 router.use(requireJwtAuth);
-const manageRoles = requireCapability(SystemCapabilities.MANAGE_ROLES);
 
 /**
  * Permission configuration mapping
@@ -114,17 +111,14 @@ router.get('/:roleName', async (req, res) => {
   // TODO: TEMP, use a better parsing for roleName
   const roleName = _r.toUpperCase();
 
-  try {
-    let hasReadRoles = false;
-    try {
-      hasReadRoles = await hasCapability(req.user, SystemCapabilities.READ_ROLES);
-    } catch (err) {
-      logger.warn(`[GET /roles/:roleName] capability check failed: ${err.message}`);
-    }
-    if (!hasReadRoles && (roleName === SystemRoles.ADMIN || !roleDefaults[roleName])) {
-      return res.status(403).send({ message: 'Unauthorized' });
-    }
+  if (
+    (req.user.role !== SystemRoles.ADMIN && roleName === SystemRoles.ADMIN) ||
+    (req.user.role !== SystemRoles.ADMIN && !roleDefaults[roleName])
+  ) {
+    return res.status(403).send({ message: 'Unauthorized' });
+  }
 
+  try {
     const role = await getRoleByName(roleName, '-_id -__v');
     if (!role) {
       return res.status(404).send({ message: 'Role not found' });
@@ -132,8 +126,7 @@ router.get('/:roleName', async (req, res) => {
 
     res.status(200).send(role);
   } catch (error) {
-    logger.error('[GET /roles/:roleName] Error:', error);
-    return res.status(500).send({ message: 'Failed to retrieve role' });
+    return res.status(500).send({ message: 'Failed to retrieve role', error: error.message });
   }
 });
 
@@ -141,42 +134,42 @@ router.get('/:roleName', async (req, res) => {
  * PUT /api/roles/:roleName/prompts
  * Update prompt permissions for a specific role
  */
-router.put('/:roleName/prompts', manageRoles, createPermissionUpdateHandler('prompts'));
+router.put('/:roleName/prompts', checkAdmin, createPermissionUpdateHandler('prompts'));
 
 /**
  * PUT /api/roles/:roleName/agents
  * Update agent permissions for a specific role
  */
-router.put('/:roleName/agents', manageRoles, createPermissionUpdateHandler('agents'));
+router.put('/:roleName/agents', checkAdmin, createPermissionUpdateHandler('agents'));
 
 /**
  * PUT /api/roles/:roleName/memories
  * Update memory permissions for a specific role
  */
-router.put('/:roleName/memories', manageRoles, createPermissionUpdateHandler('memories'));
+router.put('/:roleName/memories', checkAdmin, createPermissionUpdateHandler('memories'));
 
 /**
  * PUT /api/roles/:roleName/people-picker
  * Update people picker permissions for a specific role
  */
-router.put('/:roleName/people-picker', manageRoles, createPermissionUpdateHandler('people-picker'));
+router.put('/:roleName/people-picker', checkAdmin, createPermissionUpdateHandler('people-picker'));
 
 /**
  * PUT /api/roles/:roleName/mcp-servers
  * Update MCP servers permissions for a specific role
  */
-router.put('/:roleName/mcp-servers', manageRoles, createPermissionUpdateHandler('mcp-servers'));
+router.put('/:roleName/mcp-servers', checkAdmin, createPermissionUpdateHandler('mcp-servers'));
 
 /**
  * PUT /api/roles/:roleName/marketplace
  * Update marketplace permissions for a specific role
  */
-router.put('/:roleName/marketplace', manageRoles, createPermissionUpdateHandler('marketplace'));
+router.put('/:roleName/marketplace', checkAdmin, createPermissionUpdateHandler('marketplace'));
 
 /**
  * PUT /api/roles/:roleName/remote-agents
  * Update remote agents (API) permissions for a specific role
  */
-router.put('/:roleName/remote-agents', manageRoles, createPermissionUpdateHandler('remote-agents'));
+router.put('/:roleName/remote-agents', checkAdmin, createPermissionUpdateHandler('remote-agents'));
 
 module.exports = router;

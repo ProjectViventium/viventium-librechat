@@ -3,6 +3,7 @@ const { logger } = require('@librechat/data-schemas');
 const { CacheKeys } = require('librechat-data-provider');
 const getLogStores = require('~/cache/getLogStores');
 const { saveConvo } = require('~/models');
+const buildFallbackTitle = require('~/server/utils/buildFallbackTitle');
 
 /**
  * Add title to conversation in a way that avoids memory retention
@@ -26,32 +27,27 @@ const addTitle = async (req, { text, response, client }) => {
   const key = `${req.user.id}-${response.conversationId}`;
   /** @type {NodeJS.Timeout} */
   let timeoutId;
+  const fallbackTitle = buildFallbackTitle(text);
   try {
     const timeoutPromise = new Promise((_, reject) => {
       timeoutId = setTimeout(() => reject(new Error('Title generation timeout')), 45000);
-    }).catch((error) => {
-      logger.error('Title error:', error);
     });
 
     let titlePromise;
-    let abortController = new AbortController();
+    const abortController = new AbortController();
     if (client && typeof client.titleConvo === 'function') {
       titlePromise = Promise.race([
-        client
-          .titleConvo({
-            text,
-            abortController,
-          })
-          .catch((error) => {
-            logger.error('Client title error:', error);
-          }),
+        client.titleConvo({
+          text,
+          abortController,
+        }),
         timeoutPromise,
       ]);
     } else {
       return;
     }
 
-    const title = await titlePromise;
+    let title = await titlePromise;
     if (!abortController.signal.aborted) {
       abortController.abort();
     }
@@ -60,17 +56,13 @@ const addTitle = async (req, { text, response, client }) => {
     }
 
     if (!title) {
-      logger.debug(`[${key}] No title generated`);
-      return;
+      logger.debug(`[${key}] No title generated, using fallback title`);
+      title = fallbackTitle;
     }
 
     await titleCache.set(key, title, 120000);
     await saveConvo(
-      {
-        userId: req?.user?.id,
-        isTemporary: req?.body?.isTemporary,
-        interfaceConfig: req?.config?.interfaceConfig,
-      },
+      req,
       {
         conversationId: response.conversationId,
         title,
@@ -78,7 +70,19 @@ const addTitle = async (req, { text, response, client }) => {
       { context: 'api/server/services/Endpoints/agents/title.js', noUpsert: true },
     );
   } catch (error) {
-    logger.error('Error generating title:', error);
+    logger.warn('Error generating title, using fallback title:', error);
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+    await titleCache.set(key, fallbackTitle, 120000);
+    await saveConvo(
+      req,
+      {
+        conversationId: response.conversationId,
+        title: fallbackTitle,
+      },
+      { context: 'api/server/services/Endpoints/agents/title.js' },
+    );
   }
 };
 

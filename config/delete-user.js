@@ -107,7 +107,7 @@ async function gracefulExit(code = 0) {
   await Promise.all(tasks);
 
   // 6) Remove user from all groups
-  await Group.updateMany({ memberIds: uid }, { $pullAll: { memberIds: [uid] } });
+  await Group.updateMany({ memberIds: user._id }, { $pull: { memberIds: user._id } });
 
   // 7) Finally delete the user document itself
   await User.deleteOne({ _id: uid });

@@ -37,6 +37,7 @@ import { queueTitleGeneration } from '~/data-provider/SSE/queries';
 import useAttachmentHandler from '~/hooks/SSE/useAttachmentHandler';
 import useContentHandler from '~/hooks/SSE/useContentHandler';
 import useStepHandler from '~/hooks/SSE/useStepHandler';
+import { preserveTransientCortexState } from '~/hooks/SSE/viventiumTransientCortex';
 import { useApplyAgentTemplate } from '~/hooks/Agents';
 import { useAuthContext } from '~/hooks/AuthContext';
 import { MESSAGE_UPDATE_INTERVAL } from '~/common';
@@ -477,9 +478,15 @@ export default function useEventHandlers({
           return;
         }
 
+        const finalResponseMessage = preserveTransientCortexState({
+          currentMessages,
+          requestMessageId: requestMessage?.messageId,
+          responseMessage,
+        });
+
         /* a11y announcements */
         announcePolite({ message: 'end', isStatus: true });
-        announcePolite({ message: getAllContentText(responseMessage) });
+        announcePolite({ message: getAllContentText(finalResponseMessage ?? responseMessage) });
 
         const isNewConvo = conversation.conversationId !== submissionConvo.conversationId;
 
@@ -521,10 +528,10 @@ export default function useEventHandlers({
         let finalMessages: TMessage[] = [];
         if (runMessages) {
           finalMessages = [...runMessages];
-        } else if (isRegenerate && responseMessage) {
-          finalMessages = [...messages, responseMessage];
-        } else if (requestMessage != null && responseMessage != null) {
-          finalMessages = [...messages, requestMessage, responseMessage];
+        } else if (isRegenerate && finalResponseMessage) {
+          finalMessages = [...messages, finalResponseMessage];
+        } else if (requestMessage != null && finalResponseMessage != null) {
+          finalMessages = [...messages, requestMessage, finalResponseMessage];
         }
 
         /* Preserve files from current messages when server response lacks them */

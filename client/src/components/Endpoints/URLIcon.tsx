@@ -1,4 +1,4 @@
-import React, { memo, useState } from 'react';
+import React, { memo, useEffect, useState } from 'react';
 import { AlertCircle } from 'lucide-react';
 import { icons } from '~/hooks/Endpoint/Icons';
 
@@ -19,6 +19,19 @@ export const URLIcon = memo(
     endpoint?: string;
   }) => {
     const [imageError, setImageError] = useState(false);
+
+    /* === VIVENTIUM START ===
+     * Feature: Auto-recover conversation icons after stale URL fallback
+     * Purpose:
+     * - Old conversation icon URLs can fail first, then later resolve to a valid avatar URL
+     *   once agent/assistant maps hydrate.
+     * - Without resetting local error state, URLIcon remains stuck on the red error badge.
+     * Added: 2026-03-05
+     */
+    useEffect(() => {
+      setImageError(false);
+    }, [iconURL]);
+    /* === VIVENTIUM END === */
 
     const handleImageError = () => {
       setImageError(true);

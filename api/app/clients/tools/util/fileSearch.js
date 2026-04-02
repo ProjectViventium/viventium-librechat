@@ -5,6 +5,10 @@ const { generateShortLivedToken } = require('@librechat/api');
 const { Tools, EToolResources } = require('librechat-data-provider');
 const { filterFilesByAgentAccess } = require('~/server/services/Files/permissions');
 const { getFiles } = require('~/models');
+/* === VIVENTIUM START ===
+ * Feature: Evidence-oriented file_search fallback output.
+ * === VIVENTIUM END === */
+const { getFileSearchFailureOutput } = require('./modelFacingToolOutput');
 
 const fileSearchJsonSchema = {
   type: 'object',
@@ -16,6 +20,289 @@ const fileSearchJsonSchema = {
     },
   },
   required: ['query'],
+};
+
+/* === VIVENTIUM START ===
+ * Hardening: file_search request/aggregation robustness
+ * - Add bounded request timeout per /query call.
+ * - Keep file/result mapping stable on partial failures.
+ * - Deduplicate merged file resources by file_id.
+ * === VIVENTIUM END === */
+const DEFAULT_FILE_SEARCH_QUERY_TIMEOUT_MS = 12000;
+const DEFAULT_FILE_SEARCH_QUERY_K = 5;
+const DEFAULT_FILE_SEARCH_QUERY_TIMEOUT_MS_CONVERSATION_RECALL = 8000;
+const DEFAULT_FILE_SEARCH_QUERY_K_CONVERSATION_RECALL = 8;
+const DEFAULT_FILE_SEARCH_MAX_RESULTS = 10;
+const DEFAULT_FILE_SEARCH_MAX_RESULTS_CONVERSATION_RECALL = 6;
+const DEFAULT_FILE_SEARCH_RESULT_MAX_CHARS = 1600;
+const DEFAULT_FILE_SEARCH_RESULT_MAX_CHARS_CONVERSATION_RECALL = 800;
+const DEFAULT_FILE_SEARCH_OUTPUT_MAX_CHARS = 20000;
+const DEFAULT_FILE_SEARCH_OUTPUT_MAX_CHARS_CONVERSATION_RECALL = 12000;
+const DEFAULT_FILE_SEARCH_RECALL_INTENT_ONLY = false;
+const RECALL_INTENT_REGEX =
+  /\b(remember|recall|previous|earlier|before|last time|past conversation|chat history|you said|i said|shared|mentioned|memory)\b/i;
+const PERSONAL_FACT_RECALL_REGEX =
+  /\b(?:my|me|i|am i)\b[\s\S]{0,48}\b(?:name|legal|wife|husband|mom|mother|dad|father|birthday|move|moving|project|lab|blood|results?|shared|mentioned)\b/i;
+const NAME_QUERY_REGEX = /\b(name|call me|who am i|who i am)\b/i;
+const IDENTITY_SIGNAL_REGEX = /\b(my name is|i am|i'm|call me|legal name)\b/i;
+const ROLE_USER_TAG_REGEX = /\brole=["']user["']/i;
+const ASSISTANT_MEMORY_DISCLAIMER_REGEX =
+  /(?:\b(?:i\s+(?:don't|do not|can't|cannot)\s+(?:have|see|find|access|recall|remember)|i\s+have\s+no\s+(?:specific\s+)?(?:memory|memories|record|records|information|mentions?)|no\s+memories?\s+found)\b[\s\S]{0,180}\b(?:memory|memories|conversation|chat history|past chats|history|name|details?|mention|criteria)\b|\bi\s+don't\s+think\s+you(?:'ve| have)\s+told\s+me\s+that\s+yet\b|\bi\s+don't\s+know\s+(?:your|the)\s+name\b)/i;
+const RECALL_QUERY_STOP_WORDS = new Set([
+  'about',
+  'again',
+  'all',
+  'also',
+  'and',
+  'are',
+  'can',
+  'did',
+  'does',
+  'for',
+  'from',
+  'have',
+  'into',
+  'just',
+  'last',
+  'memory',
+  'memories',
+  'past',
+  'please',
+  'previous',
+  'recall',
+  'remember',
+  'said',
+  'search',
+  'shared',
+  'tell',
+  'that',
+  'the',
+  'them',
+  'this',
+  'what',
+  'when',
+  'where',
+  'with',
+  'your',
+  'you',
+]);
+
+const parsePositiveIntEnv = (value, fallbackValue) => {
+  const parsed = Number.parseInt(value ?? '', 10);
+  if (Number.isFinite(parsed) && parsed > 0) {
+    return parsed;
+  }
+  return fallbackValue;
+};
+
+const parseBooleanEnv = (value, fallbackValue) => {
+  if (value == null) {
+    return fallbackValue;
+  }
+  const normalized = String(value).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) {
+    return true;
+  }
+  if (['0', 'false', 'no', 'off'].includes(normalized)) {
+    return false;
+  }
+  return fallbackValue;
+};
+
+const getFileSearchQueryTimeoutMs = () =>
+  parsePositiveIntEnv(
+    process.env.VIVENTIUM_FILE_SEARCH_QUERY_TIMEOUT_MS,
+    DEFAULT_FILE_SEARCH_QUERY_TIMEOUT_MS,
+  );
+
+const getConversationRecallFileSearchQueryTimeoutMs = () =>
+  parsePositiveIntEnv(
+    process.env.VIVENTIUM_FILE_SEARCH_QUERY_TIMEOUT_MS_CONVERSATION_RECALL,
+    DEFAULT_FILE_SEARCH_QUERY_TIMEOUT_MS_CONVERSATION_RECALL,
+  );
+
+const getFileSearchTopK = () =>
+  parsePositiveIntEnv(process.env.VIVENTIUM_FILE_SEARCH_TOP_K, DEFAULT_FILE_SEARCH_QUERY_K);
+
+const getConversationRecallFileSearchTopK = () =>
+  parsePositiveIntEnv(
+    process.env.VIVENTIUM_FILE_SEARCH_TOP_K_CONVERSATION_RECALL,
+    DEFAULT_FILE_SEARCH_QUERY_K_CONVERSATION_RECALL,
+  );
+
+const getFileSearchMaxResults = () =>
+  parsePositiveIntEnv(process.env.VIVENTIUM_FILE_SEARCH_MAX_RESULTS, DEFAULT_FILE_SEARCH_MAX_RESULTS);
+
+const getConversationRecallFileSearchMaxResults = () =>
+  parsePositiveIntEnv(
+    process.env.VIVENTIUM_FILE_SEARCH_MAX_RESULTS_CONVERSATION_RECALL,
+    DEFAULT_FILE_SEARCH_MAX_RESULTS_CONVERSATION_RECALL,
+  );
+
+const getFileSearchResultMaxChars = () =>
+  parsePositiveIntEnv(
+    process.env.VIVENTIUM_FILE_SEARCH_RESULT_MAX_CHARS,
+    DEFAULT_FILE_SEARCH_RESULT_MAX_CHARS,
+  );
+
+const getConversationRecallFileSearchResultMaxChars = () =>
+  parsePositiveIntEnv(
+    process.env.VIVENTIUM_FILE_SEARCH_RESULT_MAX_CHARS_CONVERSATION_RECALL,
+    DEFAULT_FILE_SEARCH_RESULT_MAX_CHARS_CONVERSATION_RECALL,
+  );
+
+const getFileSearchOutputMaxChars = () =>
+  parsePositiveIntEnv(
+    process.env.VIVENTIUM_FILE_SEARCH_OUTPUT_MAX_CHARS,
+    DEFAULT_FILE_SEARCH_OUTPUT_MAX_CHARS,
+  );
+
+const getConversationRecallFileSearchOutputMaxChars = () =>
+  parsePositiveIntEnv(
+    process.env.VIVENTIUM_FILE_SEARCH_OUTPUT_MAX_CHARS_CONVERSATION_RECALL,
+    DEFAULT_FILE_SEARCH_OUTPUT_MAX_CHARS_CONVERSATION_RECALL,
+  );
+
+const isRecallIntentOnlyEnabled = () =>
+  parseBooleanEnv(
+    process.env.VIVENTIUM_FILE_SEARCH_RECALL_INTENT_ONLY,
+    DEFAULT_FILE_SEARCH_RECALL_INTENT_ONLY,
+  );
+
+const isConversationRecallFileId = (fileId) =>
+  typeof fileId === 'string' && fileId.startsWith('conversation_recall:');
+
+const getFileSearchTopKForFile = (file) =>
+  isConversationRecallFileId(file?.file_id)
+    ? getConversationRecallFileSearchTopK()
+    : getFileSearchTopK();
+
+const getFileSearchQueryTimeoutMsForFile = (file) =>
+  isConversationRecallFileId(file?.file_id)
+    ? getConversationRecallFileSearchQueryTimeoutMs()
+    : getFileSearchQueryTimeoutMs();
+
+const clipContent = (content, maxChars) => {
+  if (typeof content !== 'string') {
+    return '';
+  }
+  if (content.length <= maxChars) {
+    return content;
+  }
+  return `${content.slice(0, Math.max(0, maxChars - 3))}...`;
+};
+
+const dedupeFilesById = (files = []) => {
+  const seen = new Set();
+  const uniqueFiles = [];
+  for (const file of files) {
+    const fileId = file?.file_id;
+    if (!file || !fileId || seen.has(fileId)) {
+      continue;
+    }
+    seen.add(fileId);
+    uniqueFiles.push(file);
+  }
+  return uniqueFiles;
+};
+
+const hasConversationRecallIntent = (query) => {
+  const text = String(query || '');
+  return RECALL_INTENT_REGEX.test(text) || PERSONAL_FACT_RECALL_REGEX.test(text);
+};
+
+const tokenizeRecallQuery = (query) => {
+  const tokens = String(query || '')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/g)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 3 && !RECALL_QUERY_STOP_WORDS.has(token));
+
+  const expanded = new Set();
+  for (const token of tokens) {
+    expanded.add(token);
+    if (token.endsWith('ies') && token.length >= 5) {
+      expanded.add(`${token.slice(0, -3)}y`);
+    } else if (token.endsWith('es') && token.length >= 5) {
+      expanded.add(token.slice(0, -2));
+    } else if (token.endsWith('s') && token.length >= 4) {
+      expanded.add(token.slice(0, -1));
+    }
+  }
+
+  return Array.from(expanded).slice(0, 14);
+};
+
+const countTermMatches = (contentLower, terms) => {
+  if (!contentLower || !terms?.length) {
+    return 0;
+  }
+
+  let matchCount = 0;
+  for (const term of terms) {
+    if (contentLower.includes(term)) {
+      matchCount += 1;
+    }
+  }
+  return matchCount;
+};
+
+const getConversationRecallRerankScore = ({ query, result, queryTerms, isNameQuery }) => {
+  const content = typeof result?.content === 'string' ? result.content : '';
+  const contentLower = content.toLowerCase();
+  const queryLower = String(query || '').toLowerCase();
+
+  let score = 1.0 - Number(result?.distance || 0);
+  const termMatches = countTermMatches(contentLower, queryTerms);
+  score += Math.min(0.9, termMatches * 0.18);
+
+  if (queryLower.length >= 8 && contentLower.includes(queryLower)) {
+    score += 0.45;
+  }
+
+  if (isNameQuery && IDENTITY_SIGNAL_REGEX.test(contentLower)) {
+    score += 0.95;
+  }
+
+  if (isNameQuery && ROLE_USER_TAG_REGEX.test(contentLower)) {
+    score += 0.35;
+  }
+
+  if (ASSISTANT_MEMORY_DISCLAIMER_REGEX.test(contentLower)) {
+    score -= 1.25;
+  }
+
+  return score;
+};
+
+const rerankConversationRecallResults = ({ query, results }) => {
+  if (!Array.isArray(results) || !results.length) {
+    return [];
+  }
+
+  const queryTerms = tokenizeRecallQuery(query);
+  const queryLower = String(query || '').toLowerCase();
+  const isNameQuery = NAME_QUERY_REGEX.test(queryLower);
+
+  return results
+    .map((result) => {
+      const rerankScore = getConversationRecallRerankScore({
+        query,
+        result,
+        queryTerms,
+        isNameQuery,
+      });
+      return {
+        ...result,
+        recallRerankScore: rerankScore,
+      };
+    })
+    .sort((a, b) => {
+      if (b.recallRerankScore !== a.recallRerankScore) {
+        return b.recallRerankScore - a.recallRerankScore;
+      }
+      return a.distance - b.distance;
+    });
 };
 
 /**
@@ -51,7 +338,7 @@ const primeFiles = async (options) => {
     dbFiles = allFiles;
   }
 
-  dbFiles = dbFiles.concat(resourceFiles);
+  dbFiles = dedupeFilesById(dbFiles.concat(resourceFiles));
 
   let toolContext = `- Note: Semantic search is available through the ${Tools.file_search} tool but no files are currently loaded. Request the user to upload documents to search through.`;
 
@@ -93,7 +380,7 @@ const createFileSearchTool = async ({ userId, files, entity_id, fileCitations = 
       }
       const jwtToken = generateShortLivedToken(userId);
       if (!jwtToken) {
-        return ['There was an error authenticating the file search request.', undefined];
+        return [getFileSearchFailureOutput(), undefined];
       }
 
       /**
@@ -104,7 +391,7 @@ const createFileSearchTool = async ({ userId, files, entity_id, fileCitations = 
         const body = {
           file_id: file.file_id,
           query,
-          k: 5,
+          k: getFileSearchTopKForFile(file),
         };
         if (!entity_id) {
           return body;
@@ -114,39 +401,128 @@ const createFileSearchTool = async ({ userId, files, entity_id, fileCitations = 
         return body;
       };
 
-      const queryPromises = files.map((file) =>
-        axios
-          .post(`${process.env.RAG_API_URL}/query`, createQueryBody(file), {
-            headers: {
-              Authorization: `Bearer ${jwtToken}`,
-              'Content-Type': 'application/json',
-            },
-          })
-          .catch((error) => {
-            logger.error('Error encountered in `file_search` while querying file:', error);
+      const recallIntent = hasConversationRecallIntent(query);
+      const recallFiles = files.filter((file) => isConversationRecallFileId(file?.file_id));
+      const nonRecallFiles = files.filter((file) => !isConversationRecallFileId(file?.file_id));
+      const recallIntentOnly = isRecallIntentOnlyEnabled();
+      const preferRecallFiles = recallIntent && recallIntentOnly && recallFiles.length > 0;
+
+      /* === VIVENTIUM START ===
+       * Feature: Structured file_search query observability + error differentiation
+       *
+       * Purpose:
+       * - Emit per-query structured logs (latencyMs, isRecall, timedOut, resultCount)
+       *   so failure modes (timeout vs empty hit vs auth error) are distinguishable.
+       * - Return distinct user-facing messages for timeout/error vs genuinely empty results.
+       * - Add low-intent guard: skip recall files when query has no substantive content
+       *   (e.g. "yo", "hi") to avoid unnecessary RAG calls, while keeping regular file
+       *   search fully intact.
+       *
+       * Added: 2026-02-20
+       * === VIVENTIUM END === */
+      let queryErrorCount = 0;
+
+      const queryFiles = async (targetFiles) => {
+        const queryPromises = targetFiles.map(async (file) => {
+          const isRecall = isConversationRecallFileId(file?.file_id);
+          const queryStart = Date.now();
+          try {
+            const fileSearchQueryTimeoutMs = getFileSearchQueryTimeoutMsForFile(file);
+            const response = await axios.post(
+              `${process.env.RAG_API_URL}/query`,
+              createQueryBody(file),
+              {
+                headers: {
+                  Authorization: `Bearer ${jwtToken}`,
+                  'Content-Type': 'application/json',
+                },
+                timeout: fileSearchQueryTimeoutMs,
+              },
+            );
+            const resultCount = Array.isArray(response?.data) ? response.data.length : 0;
+            logger.debug(`[${Tools.file_search}] query ok`, {
+              fileId: file.file_id,
+              isRecall,
+              latencyMs: Date.now() - queryStart,
+              resultCount,
+            });
+            return { file, response };
+          } catch (error) {
+            const latencyMs = Date.now() - queryStart;
+            const timedOut = error?.code === 'ECONNABORTED' || error?.code === 'ETIMEDOUT';
+            queryErrorCount += 1;
+            logger.error(`[${Tools.file_search}] query failed`, {
+              fileId: file.file_id,
+              isRecall,
+              latencyMs,
+              timedOut,
+              code: error?.code,
+              status: error?.response?.status,
+              message: error?.message,
+            });
             return null;
-          }),
-      );
+          }
+        });
 
-      const results = await Promise.all(queryPromises);
-      const validResults = results.filter((result) => result !== null);
+        const results = await Promise.all(queryPromises);
+        return results.filter((result) => result?.response && Array.isArray(result?.response?.data));
+      };
 
-      if (validResults.length === 0) {
-        return ['No results found or errors occurred while searching the files.', undefined];
+      const hasAnyMatches = (results) =>
+        Array.isArray(results) &&
+        results.some((result) => Array.isArray(result?.response?.data) && result.response.data.length > 0);
+
+      const queryTokens = tokenizeRecallQuery(query);
+      const hasSubstantiveIntent = hasConversationRecallIntent(query) || queryTokens.length >= 3;
+      const skipRecallFiles = !hasSubstantiveIntent && nonRecallFiles.length > 0 && recallFiles.length > 0;
+      const initialFiles = skipRecallFiles
+        ? nonRecallFiles
+        : preferRecallFiles
+          ? recallFiles
+          : files;
+
+      let validResults = await queryFiles(initialFiles);
+
+      if ((!validResults.length || !hasAnyMatches(validResults)) && preferRecallFiles && nonRecallFiles.length > 0) {
+        validResults = await queryFiles(nonRecallFiles);
       }
 
-      const formattedResults = validResults
-        .flatMap((result, fileIndex) =>
-          result.data.map(([docInfo, distance]) => ({
-            filename: docInfo.metadata.source.split('/').pop(),
-            content: docInfo.page_content,
-            distance,
-            file_id: files[fileIndex]?.file_id,
-            page: docInfo.metadata.page || null,
-          })),
+      if (validResults.length === 0) {
+        const msg = queryErrorCount > 0
+          ? getFileSearchFailureOutput()
+          : 'No matching content found in conversation history for this query.';
+        return [msg, undefined];
+      }
+
+      let formattedResults = validResults
+        .flatMap(({ file, response }) =>
+          response.data.map(([docInfo, distance]) => {
+            const source = docInfo?.metadata?.source || file.filename || 'unknown';
+            return {
+              filename: source.split('/').pop(),
+              content: docInfo?.page_content,
+              distance,
+              file_id: file.file_id,
+              page: docInfo?.metadata?.page || null,
+            };
+          }),
         )
-        .sort((a, b) => a.distance - b.distance)
-        .slice(0, 10);
+        .filter(
+          (result) =>
+            Number.isFinite(result?.distance) &&
+            typeof result?.content === 'string' &&
+            result.content.trim().length > 0,
+        );
+
+      const hasConversationRecallResults = formattedResults.some((result) =>
+        isConversationRecallFileId(result.file_id),
+      );
+
+      if (hasConversationRecallResults) {
+        formattedResults = rerankConversationRecallResults({ query, results: formattedResults });
+      } else {
+        formattedResults.sort((a, b) => a.distance - b.distance);
+      }
 
       if (formattedResults.length === 0) {
         return [
@@ -155,23 +531,75 @@ const createFileSearchTool = async ({ userId, files, entity_id, fileCitations = 
         ];
       }
 
-      const formattedString = formattedResults
+      const maxResults = hasConversationRecallResults
+        ? getConversationRecallFileSearchMaxResults()
+        : getFileSearchMaxResults();
+      const resultMaxChars = hasConversationRecallResults
+        ? getConversationRecallFileSearchResultMaxChars()
+        : getFileSearchResultMaxChars();
+      const outputMaxChars = hasConversationRecallResults
+        ? getConversationRecallFileSearchOutputMaxChars()
+        : getFileSearchOutputMaxChars();
+
+      const limitedResults = formattedResults.slice(0, maxResults);
+      const includedResults = [];
+      let usedOutputChars = 0;
+
+      for (let index = 0; index < limitedResults.length; index += 1) {
+        const result = limitedResults[index];
+        const content = clipContent(result.content, resultMaxChars);
+        const displayRelevance = Number.isFinite(result?.recallRerankScore)
+          ? result.recallRerankScore
+          : 1.0 - result.distance;
+        const block = `File: ${result.filename}${
+          fileCitations ? `\nAnchor: \\ue202turn0file${index} (${result.filename})` : ''
+        }\nRelevance: ${displayRelevance.toFixed(4)}\nContent: ${content}\n`;
+        const separator = includedResults.length ? '\n---\n' : '';
+        if (usedOutputChars + separator.length + block.length > outputMaxChars) {
+          break;
+        }
+        includedResults.push({ ...result, content });
+        usedOutputChars += separator.length + block.length;
+      }
+
+      if (!includedResults.length) {
+        return [
+          'Search results were too large to return safely. Please refine your query for a narrower answer.',
+          undefined,
+        ];
+      }
+
+      const formattedString = includedResults
         .map(
-          (result, index) =>
+          (result, index) => {
+            const displayRelevance = Number.isFinite(result?.recallRerankScore)
+              ? result.recallRerankScore
+              : 1.0 - result.distance;
+            return (
             `File: ${result.filename}${
               fileCitations ? `\nAnchor: \\ue202turn0file${index} (${result.filename})` : ''
-            }\nRelevance: ${(1.0 - result.distance).toFixed(4)}\nContent: ${result.content}\n`,
+            }\nRelevance: ${displayRelevance.toFixed(4)}\nContent: ${result.content}\n`
+            );
+          },
         )
         .join('\n---\n');
 
-      const sources = formattedResults.map((result) => ({
+      const sources = includedResults.map((result) => ({
+        relevance: Number.isFinite(result?.recallRerankScore)
+          ? result.recallRerankScore
+          : 1.0 - result.distance,
         type: 'file',
         fileId: result.file_id,
         content: result.content,
         fileName: result.filename,
-        relevance: 1.0 - result.distance,
         pages: result.page ? [result.page] : [],
-        pageRelevance: result.page ? { [result.page]: 1.0 - result.distance } : {},
+        pageRelevance: result.page
+          ? {
+              [result.page]: Number.isFinite(result?.recallRerankScore)
+                ? result.recallRerankScore
+                : 1.0 - result.distance,
+            }
+          : {},
       }));
 
       return [formattedString, { [Tools.file_search]: { sources, fileCitations } }];

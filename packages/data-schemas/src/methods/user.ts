@@ -1,5 +1,11 @@
 import mongoose, { FilterQuery } from 'mongoose';
-import type { IUser, BalanceConfig, CreateUserRequest, UserDeleteResult } from '~/types';
+import type {
+  IUser,
+  BalanceConfig,
+  CreateUserRequest,
+  UserDeleteResult,
+  ViventiumVoiceRouteState,
+} from '~/types';
 import { signPayload } from '~/crypto';
 
 /** Default JWT session expiry: 15 minutes in milliseconds */
@@ -35,36 +41,13 @@ export function createUserMethods(mongoose: typeof import('mongoose')) {
     searchCriteria: FilterQuery<IUser>,
     fieldsToSelect?: string | string[] | null,
   ): Promise<IUser | null> {
-    const User = mongoose.models.User as mongoose.Model<IUser>;
+    const User = mongoose.models.User;
     const normalizedCriteria = normalizeEmailInCriteria(searchCriteria);
     const query = User.findOne(normalizedCriteria);
     if (fieldsToSelect) {
       query.select(fieldsToSelect);
     }
-    return await query.lean();
-  }
-
-  async function findUsers(
-    searchCriteria: FilterQuery<IUser>,
-    fieldsToSelect?: string | string[] | null,
-    options?: { limit?: number; offset?: number; sort?: Record<string, 1 | -1> },
-  ): Promise<IUser[]> {
-    const User = mongoose.models.User as mongoose.Model<IUser>;
-    const normalizedCriteria = normalizeEmailInCriteria(searchCriteria);
-    const query = User.find(normalizedCriteria);
-    if (fieldsToSelect) {
-      query.select(fieldsToSelect);
-    }
-    if (options?.sort != null) {
-      query.sort(options.sort);
-    }
-    if (options?.offset != null) {
-      query.skip(options.offset);
-    }
-    if (options?.limit != null && options.limit > 0) {
-      query.limit(options.limit);
-    }
-    return (await query.lean()) as IUser[];
+    return (await query.lean()) as IUser | null;
   }
 
   /**
@@ -217,25 +200,87 @@ export function createUserMethods(mongoose: typeof import('mongoose')) {
     userId: string,
     memoriesEnabled: boolean,
   ): Promise<IUser | null> {
+    return await updateUserPersonalization(userId, { memories: memoriesEnabled });
+  }
+
+  /* === VIVENTIUM START ===
+   * Feature: Unified personalization preference updates
+   *
+   * Purpose:
+   * - Support both memory preference and conversation-recall preference updates
+   *   through one server-side method.
+   * - Preserve existing behavior where nested personalization fields are created
+   *   automatically when missing.
+   *
+   * Added: 2026-02-19
+   * === VIVENTIUM END === */
+  async function updateUserPersonalization(
+    userId: string,
+    personalization: { memories?: boolean; conversation_recall?: boolean },
+  ): Promise<IUser | null> {
     const User = mongoose.models.User;
 
-    // First, ensure the personalization object exists
     const user = await User.findById(userId);
     if (!user) {
       return null;
     }
 
-    // Use $set to update the nested field, which will create the personalization object if it doesn't exist
-    const updateOperation = {
-      $set: {
-        'personalization.memories': memoriesEnabled,
-      },
-    };
+    const updateSet: Record<string, boolean> = {};
+    if (typeof personalization.memories === 'boolean') {
+      updateSet['personalization.memories'] = personalization.memories;
+    }
+    if (typeof personalization.conversation_recall === 'boolean') {
+      updateSet['personalization.conversation_recall'] = personalization.conversation_recall;
+    }
 
-    return (await User.findByIdAndUpdate(userId, updateOperation, {
-      new: true,
-      runValidators: true,
-    }).lean()) as IUser | null;
+    if (Object.keys(updateSet).length === 0) {
+      return (await User.findById(userId).lean()) as IUser | null;
+    }
+
+    return (await User.findByIdAndUpdate(
+      userId,
+      { $set: updateSet },
+      {
+        new: true,
+        runValidators: true,
+      },
+    ).lean()) as IUser | null;
+  }
+
+  /* === VIVENTIUM START ===
+   * Feature: Modern playground voice-route persistence
+   *
+   * Purpose:
+   * - Persist per-user STT/TTS defaults in a Viventium-owned field.
+   * - Avoid overloading generic personalization settings with voice routing state.
+   * === VIVENTIUM END === */
+  async function updateUserViventiumVoicePreferences(
+    userId: string,
+    viventiumVoicePreferences: { livekitPlayground?: ViventiumVoiceRouteState | null },
+  ): Promise<IUser | null> {
+    const User = mongoose.models.User;
+    const user = await User.findById(userId);
+    if (!user) {
+      return null;
+    }
+
+    if (!('livekitPlayground' in viventiumVoicePreferences)) {
+      return (await User.findById(userId).lean()) as IUser | null;
+    }
+
+    return (await User.findByIdAndUpdate(
+      userId,
+      {
+        $set: {
+          'viventiumVoicePreferences.livekitPlayground':
+            viventiumVoicePreferences.livekitPlayground ?? null,
+        },
+      },
+      {
+        new: true,
+        runValidators: true,
+      },
+    ).lean()) as IUser | null;
   }
 
   /**
@@ -311,6 +356,8 @@ export function createUserMethods(mongoose: typeof import('mongoose')) {
       .sort((a, b) => b._searchScore - a._searchScore)
       .slice(0, limit)
       .map((user) => {
+        // Remove the search score from final results
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
         const { _searchScore, ...userWithoutScore } = user;
         return userWithoutScore;
       });
@@ -344,7 +391,6 @@ export function createUserMethods(mongoose: typeof import('mongoose')) {
 
   return {
     findUser,
-    findUsers,
     countUsers,
     createUser,
     updateUser,
@@ -354,6 +400,8 @@ export function createUserMethods(mongoose: typeof import('mongoose')) {
     deleteUserById,
     updateUserPlugins,
     toggleUserMemories,
+    updateUserPersonalization,
+    updateUserViventiumVoicePreferences,
   };
 }
 

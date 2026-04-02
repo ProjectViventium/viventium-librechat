@@ -19,6 +19,47 @@ const baseConversation: TConversation = {
 };
 
 describe('buildDefaultConvo - defaultParamsEndpoint', () => {
+  describe('agents endpoint defaults', () => {
+    it('preserves an explicit conversation agent id for fresh new chats', () => {
+      const result = buildDefaultConvo({
+        models: ['agent_other', 'agent_viventium_main_95aeb3'],
+        conversation: {
+          ...baseConversation,
+          endpoint: EModelEndpoint.agents,
+          endpointType: EModelEndpoint.agents,
+          agent_id: 'agent_viventium_main_95aeb3',
+        },
+        endpoint: EModelEndpoint.agents,
+        lastConversationSetup: null,
+      });
+
+      expect(result.endpoint).toBe(EModelEndpoint.agents);
+      expect(result.agent_id).toBe('agent_viventium_main_95aeb3');
+    });
+
+    it('does not let an existing Viventium conversation overwrite a newly selected built-in agent', () => {
+      const result = buildDefaultConvo({
+        models: ['agent_viventium_main_95aeb3', 'agent_viventium_ms365_95aeb3'],
+        conversation: {
+          ...baseConversation,
+          endpoint: EModelEndpoint.agents,
+          endpointType: EModelEndpoint.agents,
+          agent_id: 'agent_viventium_main_95aeb3',
+        },
+        endpoint: EModelEndpoint.agents,
+        lastConversationSetup: {
+          ...baseConversation,
+          endpoint: EModelEndpoint.agents,
+          endpointType: EModelEndpoint.agents,
+          agent_id: 'agent_viventium_ms365_95aeb3',
+        },
+      });
+
+      expect(result.endpoint).toBe(EModelEndpoint.agents);
+      expect(result.agent_id).toBe('agent_viventium_ms365_95aeb3');
+    });
+  });
+
   describe('custom endpoint with defaultParamsEndpoint: anthropic', () => {
     const models = ['anthropic/claude-opus-4.5', 'anthropic/claude-sonnet-4'];
 

@@ -31,22 +31,12 @@ describe('formatToolContent', () => {
     });
   });
 
-  describe('recognized providers', () => {
-    const allProviders: t.Provider[] = [
-      'google',
-      'anthropic',
-      'openai',
-      'azureopenai',
-      'openrouter',
-      'xai',
-      'deepseek',
-      'ollama',
-      'bedrock',
-    ];
+  describe('recognized providers - content array providers', () => {
+    const contentArrayProviders: t.Provider[] = ['google', 'anthropic', 'openai', 'azureopenai'];
 
-    allProviders.forEach((provider) => {
+    contentArrayProviders.forEach((provider) => {
       describe(`${provider} provider`, () => {
-        it('should format text content as string', () => {
+        it('should format text content as content array', () => {
           const result: t.MCPToolCallResponse = {
             content: [
               { type: 'text', text: 'First text' },
@@ -55,11 +45,11 @@ describe('formatToolContent', () => {
           };
 
           const [content, artifacts] = formatToolContent(result, provider);
-          expect(content).toBe('First text\n\nSecond text');
+          expect(content).toEqual([{ type: 'text', text: 'First text\n\nSecond text' }]);
           expect(artifacts).toBeUndefined();
         });
 
-        it('should extract images to artifacts and keep text as string', () => {
+        it('should separate text blocks when images are present', () => {
           const result: t.MCPToolCallResponse = {
             content: [
               { type: 'text', text: 'Before image' },
@@ -69,7 +59,10 @@ describe('formatToolContent', () => {
           };
 
           const [content, artifacts] = formatToolContent(result, provider);
-          expect(content).toBe('Before image\n\nAfter image');
+          expect(content).toEqual([
+            { type: 'text', text: 'Before image' },
+            { type: 'text', text: 'After image' },
+          ]);
           expect(artifacts).toEqual({
             content: [
               {
@@ -83,8 +76,49 @@ describe('formatToolContent', () => {
         it('should handle empty content', () => {
           const result: t.MCPToolCallResponse = { content: [] };
           const [content, artifacts] = formatToolContent(result, provider);
-          expect(content).toBe('(No response)');
+          expect(content).toEqual([{ type: 'text', text: '(No response)' }]);
           expect(artifacts).toBeUndefined();
+        });
+      });
+    });
+  });
+
+  describe('recognized providers - string providers', () => {
+    const stringProviders: t.Provider[] = ['openrouter', 'xai', 'deepseek', 'ollama', 'bedrock'];
+
+    stringProviders.forEach((provider) => {
+      describe(`${provider} provider`, () => {
+        it('should format content as string', () => {
+          const result: t.MCPToolCallResponse = {
+            content: [
+              { type: 'text', text: 'First text' },
+              { type: 'text', text: 'Second text' },
+            ],
+          };
+
+          const [content, artifacts] = formatToolContent(result, provider);
+          expect(content).toBe('First text\n\nSecond text');
+          expect(artifacts).toBeUndefined();
+        });
+
+        it('should handle images with string output', () => {
+          const result: t.MCPToolCallResponse = {
+            content: [
+              { type: 'text', text: 'Some text' },
+              { type: 'image', data: 'base64data', mimeType: 'image/png' },
+            ],
+          };
+
+          const [content, artifacts] = formatToolContent(result, provider);
+          expect(content).toBe('Some text');
+          expect(artifacts).toEqual({
+            content: [
+              {
+                type: 'image_url',
+                image_url: { url: 'data:image/png;base64,base64data' },
+              },
+            ],
+          });
         });
       });
     });
@@ -96,8 +130,8 @@ describe('formatToolContent', () => {
         content: [{ type: 'image', data: 'https://example.com/image.png', mimeType: 'image/png' }],
       };
 
-      const [content, artifacts] = formatToolContent(result, 'openai');
-      expect(content).toBe('');
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const [_content, artifacts] = formatToolContent(result, 'openai');
       expect(artifacts).toEqual({
         content: [
           {
@@ -113,8 +147,8 @@ describe('formatToolContent', () => {
         content: [{ type: 'image', data: 'iVBORw0KGgoAAAA...', mimeType: 'image/png' }],
       };
 
-      const [content, artifacts] = formatToolContent(result, 'openai');
-      expect(content).toBe('');
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const [_content, artifacts] = formatToolContent(result, 'openai');
       expect(artifacts).toEqual({
         content: [
           {
@@ -123,29 +157,6 @@ describe('formatToolContent', () => {
           },
         ],
       });
-    });
-
-    it('should return empty string for image-only content when artifacts exist', () => {
-      const result: t.MCPToolCallResponse = {
-        content: [{ type: 'image', data: 'base64data', mimeType: 'image/png' }],
-      };
-      const [content, artifacts] = formatToolContent(result, 'anthropic');
-      expect(content).toBe('');
-      expect(artifacts).toBeDefined();
-      expect(artifacts?.content).toHaveLength(1);
-    });
-
-    it('should handle multiple images without text', () => {
-      const result: t.MCPToolCallResponse = {
-        content: [
-          { type: 'image', data: 'https://example.com/a.png', mimeType: 'image/png' },
-          { type: 'image', data: 'https://example.com/b.jpg', mimeType: 'image/jpeg' },
-        ],
-      };
-      const [content, artifacts] = formatToolContent(result, 'google');
-      expect(content).toBe('');
-      expect(artifacts).toBeDefined();
-      expect(artifacts?.content).toHaveLength(2);
     });
   });
 
@@ -165,11 +176,13 @@ describe('formatToolContent', () => {
       };
 
       const [content, artifacts] = formatToolContent(result, 'openai');
-      expect(typeof content).toBe('string');
-      expect(content).toContain('UI Resource ID:');
-      expect(content).toContain('UI Resource Marker: \\ui{');
-      expect(content).toContain('Resource URI: ui://carousel');
-      expect(content).toContain('Resource MIME Type: application/json');
+      expect(Array.isArray(content)).toBe(true);
+      const textContent = Array.isArray(content) ? content[0] : { text: '' };
+      expect(textContent).toMatchObject({ type: 'text' });
+      expect(textContent.text).toContain('UI Resource ID:');
+      expect(textContent.text).toContain('UI Resource Marker: \\ui{');
+      expect(textContent.text).toContain('Resource URI: ui://carousel');
+      expect(textContent.text).toContain('Resource MIME Type: application/json');
 
       const uiResourceArtifact = artifacts?.ui_resources?.data?.[0];
       expect(uiResourceArtifact).toBeTruthy();
@@ -196,11 +209,15 @@ describe('formatToolContent', () => {
       };
 
       const [content, artifacts] = formatToolContent(result, 'openai');
-      expect(content).toBe(
-        'Resource Text: Document content\n' +
-          'Resource URI: file://document.pdf\n' +
-          'Resource MIME Type: application/pdf',
-      );
+      expect(content).toEqual([
+        {
+          type: 'text',
+          text:
+            'Resource Text: Document content\n' +
+            'Resource URI: file://document.pdf\n' +
+            'Resource MIME Type: application/pdf',
+        },
+      ]);
       expect(artifacts).toBeUndefined();
     });
 
@@ -218,7 +235,12 @@ describe('formatToolContent', () => {
       };
 
       const [content, artifacts] = formatToolContent(result, 'openai');
-      expect(content).toBe('Resource URI: https://example.com/resource');
+      expect(content).toEqual([
+        {
+          type: 'text',
+          text: 'Resource URI: https://example.com/resource',
+        },
+      ]);
       expect(artifacts).toBeUndefined();
     });
 
@@ -245,12 +267,14 @@ describe('formatToolContent', () => {
       };
 
       const [content, artifacts] = formatToolContent(result, 'openai');
-      expect(typeof content).toBe('string');
-      expect(content).toContain('Some text');
-      expect(content).toContain('UI Resource Marker: \\ui{');
-      expect(content).toContain('Resource URI: ui://button');
-      expect(content).toContain('Resource MIME Type: application/json');
-      expect(content).toContain('Resource URI: file://data.csv');
+      expect(Array.isArray(content)).toBe(true);
+      const textEntry = Array.isArray(content) ? content[0] : { text: '' };
+      expect(textEntry).toMatchObject({ type: 'text' });
+      expect(textEntry.text).toContain('Some text');
+      expect(textEntry.text).toContain('UI Resource Marker: \\ui{');
+      expect(textEntry.text).toContain('Resource URI: ui://button');
+      expect(textEntry.text).toContain('Resource MIME Type: application/json');
+      expect(textEntry.text).toContain('Resource URI: file://data.csv');
 
       const uiResource = artifacts?.ui_resources?.data?.[0];
       expect(uiResource).toMatchObject({
@@ -278,11 +302,14 @@ describe('formatToolContent', () => {
       };
 
       const [content, artifacts] = formatToolContent(result, 'openai');
-      expect(typeof content).toBe('string');
-      expect(content).toContain('Content with multimedia');
-      expect(content).toContain('UI Resource Marker: \\ui{');
-      expect(content).toContain('Resource URI: ui://graph');
-      expect(content).toContain('Resource MIME Type: application/json');
+      expect(Array.isArray(content)).toBe(true);
+      if (Array.isArray(content)) {
+        expect(content[0]).toMatchObject({ type: 'text', text: 'Content with multimedia' });
+        expect(content[1].type).toBe('text');
+        expect(content[1].text).toContain('UI Resource Marker: \\ui{');
+        expect(content[1].text).toContain('Resource URI: ui://graph');
+        expect(content[1].text).toContain('Resource MIME Type: application/json');
+      }
       expect(artifacts).toEqual({
         content: [
           {
@@ -314,9 +341,12 @@ describe('formatToolContent', () => {
       };
 
       const [content, artifacts] = formatToolContent(result, 'openai');
-      expect(content).toBe(
-        'Normal text\n\n' + JSON.stringify({ type: 'unknown', data: 'some data' }, null, 2),
-      );
+      expect(content).toEqual([
+        {
+          type: 'text',
+          text: 'Normal text\n\n' + JSON.stringify({ type: 'unknown', data: 'some data' }, null, 2),
+        },
+      ]);
       expect(artifacts).toBeUndefined();
     });
   });
@@ -349,16 +379,20 @@ describe('formatToolContent', () => {
       };
 
       const [content, artifacts] = formatToolContent(result, 'anthropic');
-      expect(typeof content).toBe('string');
-      expect(content).toContain('Introduction');
-      expect(content).toContain('Middle section');
-      expect(content).toContain('UI Resource ID:');
-      expect(content).toContain('UI Resource Marker: \\ui{');
-      expect(content).toContain('Resource URI: ui://chart');
-      expect(content).toContain('Resource MIME Type: application/json');
-      expect(content).toContain('Resource URI: https://api.example.com/data');
-      expect(content).toContain('Conclusion');
-      expect(content).toContain('UI Resource Markers Available:');
+      expect(Array.isArray(content)).toBe(true);
+      if (Array.isArray(content)) {
+        expect(content[0]).toEqual({ type: 'text', text: 'Introduction' });
+        expect(content[1].type).toBe('text');
+        expect(content[1].text).toContain('Middle section');
+        expect(content[1].text).toContain('UI Resource ID:');
+        expect(content[1].text).toContain('UI Resource Marker: \\ui{');
+        expect(content[1].text).toContain('Resource URI: ui://chart');
+        expect(content[1].text).toContain('Resource MIME Type: application/json');
+        expect(content[1].text).toContain('Resource URI: https://api.example.com/data');
+        expect(content[2].type).toBe('text');
+        expect(content[2].text).toContain('Conclusion');
+        expect(content[2].text).toContain('UI Resource Markers Available:');
+      }
       expect(artifacts).toMatchObject({
         content: [
           {
@@ -390,7 +424,7 @@ describe('formatToolContent', () => {
       };
 
       const [content, artifacts] = formatToolContent(result, 'openai');
-      expect(content).toBe('Error occurred');
+      expect(content).toEqual([{ type: 'text', text: 'Error occurred' }]);
       expect(artifacts).toBeUndefined();
     });
 
@@ -401,7 +435,7 @@ describe('formatToolContent', () => {
       };
 
       const [content, artifacts] = formatToolContent(result, 'google');
-      expect(content).toBe('Response with metadata');
+      expect(content).toEqual([{ type: 'text', text: 'Response with metadata' }]);
       expect(artifacts).toBeUndefined();
     });
   });

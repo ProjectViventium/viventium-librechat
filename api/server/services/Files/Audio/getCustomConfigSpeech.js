@@ -17,7 +17,6 @@ async function getCustomConfigSpeech(req, res) {
   try {
     const appConfig = await getAppConfig({
       role: req.user?.role,
-      tenantId: req.user?.tenantId,
     });
 
     if (!appConfig) {

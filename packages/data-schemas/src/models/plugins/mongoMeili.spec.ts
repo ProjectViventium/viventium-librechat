@@ -11,11 +11,13 @@ const mockUpdateDocuments = jest.fn();
 const mockDeleteDocument = jest.fn();
 const mockDeleteDocuments = jest.fn();
 const mockGetDocument = jest.fn();
+const mockWaitForTask = jest.fn();
 const mockIndex = jest.fn().mockReturnValue({
   getRawInfo: jest.fn(),
   updateSettings: jest.fn(),
   addDocuments: mockAddDocuments,
   addDocumentsInBatches: mockAddDocumentsInBatches,
+  waitForTask: mockWaitForTask,
   updateDocuments: mockUpdateDocuments,
   deleteDocument: mockDeleteDocument,
   deleteDocuments: mockDeleteDocuments,
@@ -53,10 +55,13 @@ describe('Meilisearch Mongoose plugin', () => {
   beforeEach(() => {
     mockAddDocuments.mockClear();
     mockAddDocumentsInBatches.mockClear();
+    mockWaitForTask.mockClear();
     mockUpdateDocuments.mockClear();
     mockDeleteDocument.mockClear();
     mockDeleteDocuments.mockClear();
     mockGetDocument.mockClear();
+    mockAddDocumentsInBatches.mockResolvedValue([{ taskUid: 1 }]);
+    mockWaitForTask.mockResolvedValue({});
   });
 
   afterAll(async () => {
@@ -185,6 +190,30 @@ describe('Meilisearch Mongoose plugin', () => {
       await expect(messageModel.syncWithMeili()).resolves.not.toThrow();
     });
 
+    test('syncWithMeili indexes legacy documents missing _meiliIndex', async () => {
+      const messageModel = createMessageModel(mongoose) as SchemaWithMeiliMethods;
+      await messageModel.deleteMany({});
+      mockAddDocumentsInBatches.mockClear();
+
+      const messageId = new mongoose.Types.ObjectId();
+      await messageModel.collection.insertOne({
+        messageId,
+        conversationId: new mongoose.Types.ObjectId(),
+        user: new mongoose.Types.ObjectId(),
+        isCreatedByUser: true,
+        expiredAt: null,
+      });
+
+      const beforeSync = await messageModel.collection.findOne({ messageId });
+      expect(beforeSync?._meiliIndex).toBeUndefined();
+
+      await expect(messageModel.syncWithMeili()).resolves.not.toThrow();
+
+      expect(mockAddDocumentsInBatches).toHaveBeenCalled();
+      const afterSync = await messageModel.collection.findOne({ messageId });
+      expect(afterSync?._meiliIndex).toBe(true);
+    });
+
     test('estimatedDocumentCount returns count for non-empty collection', async () => {
       const conversationModel = createConversationModel(mongoose) as SchemaWithMeiliMethods;
       await conversationModel.deleteMany({});
@@ -286,6 +315,7 @@ describe('Meilisearch Mongoose plugin', () => {
       await conversationModel.deleteMany({});
       mockAddDocumentsInBatches.mockClear();
       mockAddDocuments.mockClear();
+      mockWaitForTask.mockClear();
 
       await conversationModel.collection.insertOne({
         conversationId: new mongoose.Types.ObjectId(),
@@ -301,6 +331,10 @@ describe('Meilisearch Mongoose plugin', () => {
 
       // Verify addDocumentsInBatches was called (new batch method)
       expect(mockAddDocumentsInBatches).toHaveBeenCalled();
+      expect(mockWaitForTask).toHaveBeenCalledWith(1, {
+        timeOutMs: 30000,
+        intervalMs: 50,
+      });
     });
 
     test('addObjectToMeili retries on failure', async () => {

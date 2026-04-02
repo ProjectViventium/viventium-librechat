@@ -1,15 +1,16 @@
 const path = require('path');
 const { v4 } = require('uuid');
-const { countTokens } = require('@librechat/api');
-const { escapeRegExp } = require('@librechat/data-schemas');
+const { countTokens, escapeRegExp } = require('@librechat/api');
 const {
   Constants,
   ContentTypes,
   AnnotationTypes,
   defaultOrderQuery,
 } = require('librechat-data-provider');
-const { recordMessage, getMessages, spendTokens, saveConvo } = require('~/models');
 const { retrieveAndProcessFile } = require('~/server/services/Files/process');
+const { recordMessage, getMessages } = require('~/models/Message');
+const { spendTokens } = require('~/models/spendTokens');
+const { saveConvo } = require('~/models/Conversation');
 
 /**
  * Initializes a new thread or adds messages to an existing thread.
@@ -61,6 +62,24 @@ async function initThread({ openai, body, thread_id: _thread_id }) {
 async function saveUserMessage(req, params) {
   const tokenCount = await countTokens(params.text);
 
+  // todo: do this on the frontend
+  // const { file_ids = [] } = params;
+  // let content;
+  // if (file_ids.length) {
+  //   content = [
+  //     {
+  //       value: params.text,
+  //     },
+  //     ...(
+  //       file_ids
+  //         .filter(f => f)
+  //         .map((file_id) => ({
+  //           file_id,
+  //         }))
+  //     ),
+  //   ];
+  // }
+
   const userMessage = {
     user: params.user,
     endpoint: params.endpoint,
@@ -91,15 +110,9 @@ async function saveUserMessage(req, params) {
   }
 
   const message = await recordMessage(userMessage);
-  await saveConvo(
-    {
-      userId: req?.user?.id,
-      isTemporary: req?.body?.isTemporary,
-      interfaceConfig: req?.config?.interfaceConfig,
-    },
-    convo,
-    { context: 'api/server/services/Threads/manage.js #saveUserMessage' },
-  );
+  await saveConvo(req, convo, {
+    context: 'api/server/services/Threads/manage.js #saveUserMessage',
+  });
   return message;
 }
 
@@ -148,11 +161,7 @@ async function saveAssistantMessage(req, params) {
   });
 
   await saveConvo(
-    {
-      userId: req?.user?.id,
-      isTemporary: req?.body?.isTemporary,
-      interfaceConfig: req?.config?.interfaceConfig,
-    },
+    req,
     {
       endpoint: params.endpoint,
       conversationId: params.conversationId,
@@ -344,11 +353,7 @@ async function syncMessages({
   await Promise.all(recordPromises);
 
   await saveConvo(
-    {
-      userId: openai.req?.user?.id,
-      isTemporary: openai.req?.body?.isTemporary,
-      interfaceConfig: openai.req?.config?.interfaceConfig,
-    },
+    openai.req,
     {
       conversationId,
       file_ids: attached_file_ids,

@@ -6,9 +6,14 @@ services:
     environment:
       POSTGRES_DB: mydatabase
       POSTGRES_USER: myuser
-      POSTGRES_PASSWORD: mypassword
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-CHANGE_ME_LOCAL_POSTGRES_PASSWORD}
     volumes:
-      - pgdata2:/var/lib/postgresql/data
+      # === VIVENTIUM START ===
+      # Keep local RAG vector data on the host filesystem instead of a Docker-managed
+      # volume so the launcher's isolated runtime survives Docker Desktop disk-pressure
+      # without deleting user conversation-recall state.
+      # === VIVENTIUM END ===
+      - ${VIVENTIUM_RAG_PGDATA_PATH:-./.rag-pgdata}:/var/lib/postgresql/data
     ports:
       - "5433:5432"
 
@@ -19,13 +24,22 @@ services:
       - DB_PORT=5432
       - POSTGRES_DB=mydatabase
       - POSTGRES_USER=myuser
-      - POSTGRES_PASSWORD=mypassword
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-CHANGE_ME_LOCAL_POSTGRES_PASSWORD}
+      # === VIVENTIUM START ===
+      # Fix: Honor the local launcher-selected RAG port for isolated runs.
+      # Without this, the container always binds its internal default port and
+      # `docker compose -f rag.yml ...` cannot reliably start on the local profile port.
+      # Added: 2026-03-11
+      # === VIVENTIUM END ===
+      - RAG_PORT=${RAG_PORT:-8000}
     ports:
-      - "${RAG_PORT}:${RAG_PORT}"
+      # === VIVENTIUM START ===
+      # Fix: Provide a default published port so compose does not fail when RAG_PORT
+      # was not pre-exported in the shell.
+      # Added: 2026-03-11
+      # === VIVENTIUM END ===
+      - "${RAG_PORT:-8000}:${RAG_PORT:-8000}"
     depends_on:
       - vectordb
     env_file:
       - .env
-
-volumes:
-  pgdata2:

@@ -20,6 +20,13 @@ jest.mock('@librechat/data-schemas', () => ({
   },
 }));
 
+const makeTestJwt = (payload: Record<string, unknown>) =>
+  [
+    Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT' })).toString('base64url'),
+    Buffer.from(JSON.stringify(payload)).toString('base64url'),
+    'fake-signature',
+  ].join('.');
+
 describe('OpenID Connect Federated Provider Token Integration', () => {
   // Mock user with Cognito tokens
   const mockCognitoUser: Partial<IUser> = {
@@ -30,7 +37,12 @@ describe('OpenID Connect Federated Provider Token Integration', () => {
     openidId: 'cognito-user-123',
     federatedTokens: {
       access_token: 'cognito-access-token-123',
-      id_token: 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJjb2duaXRvLXVzZXItMTIzIiwiZW1haWwiOiJ0ZXN0QGV4YW1wbGUuY29tIiwibmFtZSI6IlRlc3QgVXNlciIsImV4cCI6MTcwMDAwMDAwMH0.fake-signature',
+      id_token: makeTestJwt({
+        sub: 'cognito-user-123',
+        email: 'test@example.com',
+        name: 'Test User',
+        exp: 1700000000,
+      }),
       expires_at: Math.floor(Date.now() / 1000) + 3600, // Expires in 1 hour
     },
   };
@@ -68,7 +80,7 @@ describe('OpenID Connect Federated Provider Token Integration', () => {
 
       expect(tokenInfo).toEqual({
         accessToken: 'cognito-access-token-123',
-        idToken: expect.stringContaining('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9'),
+        idToken: mockCognitoUser.federatedTokens?.id_token,
         expiresAt: expect.any(Number),
         userId: 'cognito-user-123',
         userEmail: 'test@example.com',
@@ -312,7 +324,7 @@ describe('OpenID Connect Federated Provider Token Integration', () => {
       });
 
       expect(resolvedHeaders['Authorization']).toBe('Bearer cognito-access-token-123');
-      expect(resolvedHeaders['X-Cognito-ID-Token']).toContain('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9');
+      expect(resolvedHeaders['X-Cognito-ID-Token']).toBe(mockCognitoUser.federatedTokens?.id_token);
     });
   });
 
@@ -356,7 +368,9 @@ describe('OpenID Connect Federated Provider Token Integration', () => {
 
       expect(processedOptions.headers?.['Authorization']).toBe('Bearer cognito-access-token-123');
       expect(processedOptions.headers?.['X-Cognito-User-Info']).toBe('test@example.com');
-      expect(processedOptions.headers?.['X-Cognito-ID-Token']).toContain('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9');
+      expect(processedOptions.headers?.['X-Cognito-ID-Token']).toBe(
+        mockCognitoUser.federatedTokens?.id_token,
+      );
     });
 
     it('should handle AWS-specific MCP server configuration', () => {
@@ -376,7 +390,9 @@ describe('OpenID Connect Federated Provider Token Integration', () => {
       });
 
       expect(processedOptions.env?.['AWS_COGNITO_TOKEN']).toBe('cognito-access-token-123');
-      expect(processedOptions.env?.['AWS_COGNITO_ID_TOKEN']).toContain('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9');
+      expect(processedOptions.env?.['AWS_COGNITO_ID_TOKEN']).toBe(
+        mockCognitoUser.federatedTokens?.id_token,
+      );
       expect(processedOptions.env?.['COGNITO_USER_SUB']).toBe('cognito-user-123');
     });
   });

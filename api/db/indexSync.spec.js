@@ -102,6 +102,7 @@ describe('performSync() - syncThreshold logic', () => {
     mockMeiliIndex.mockReturnValue({
       getSettings: jest.fn().mockResolvedValue({ filterableAttributes: ['user'] }),
       updateSettings: jest.fn().mockResolvedValue({}),
+      getStats: jest.fn().mockResolvedValue({ numberOfDocuments: 10000 }),
       search: jest.fn().mockResolvedValue({ hits: [] }),
     });
 
@@ -463,68 +464,119 @@ describe('performSync() - syncThreshold logic', () => {
     expect(mockLogger.info).toHaveBeenCalledWith('[indexSync] Starting convos sync (50 unindexed)');
   });
 
-  test('forces sync when zero documents indexed (reset scenario) even if below threshold', async () => {
-    Message.getSyncProgress.mockResolvedValue({
-      totalProcessed: 0,
-      totalDocuments: 680,
-      isComplete: false,
-    });
+  test('resets stale sync flags when Meili index is empty but Mongo flags say indexed', async () => {
+    Message.getSyncProgress
+      .mockResolvedValueOnce({
+        totalProcessed: 100,
+        totalDocuments: 150,
+        isComplete: false,
+      })
+      .mockResolvedValueOnce({
+        totalProcessed: 0,
+        totalDocuments: 150,
+        isComplete: false,
+      });
 
-    Conversation.getSyncProgress.mockResolvedValue({
-      totalProcessed: 0,
-      totalDocuments: 76,
-      isComplete: false,
-    });
+    Conversation.getSyncProgress
+      .mockResolvedValueOnce({
+        totalProcessed: 50,
+        totalDocuments: 50,
+        isComplete: true,
+      })
+      .mockResolvedValueOnce({
+        totalProcessed: 50,
+        totalDocuments: 50,
+        isComplete: true,
+      });
 
     Message.syncWithMeili.mockResolvedValue(undefined);
-    Conversation.syncWithMeili.mockResolvedValue(undefined);
+
+    mockMeiliIndex.mockImplementation((indexName) => ({
+      getSettings: jest.fn().mockResolvedValue({ filterableAttributes: ['user'] }),
+      updateSettings: jest.fn().mockResolvedValue({}),
+      getStats: jest.fn().mockResolvedValue({
+        numberOfDocuments: indexName === 'messages' ? 0 : 50,
+      }),
+      search: jest.fn().mockResolvedValue({ hits: [] }),
+    }));
+
+    process.env.MEILI_SYNC_THRESHOLD = '1000';
 
     const indexSync = require('./indexSync');
     await indexSync();
 
+    expect(mockBatchResetMeiliFlags).toHaveBeenCalledWith(Message.collection);
+    expect(mockBatchResetMeiliFlags).not.toHaveBeenCalledWith(Conversation.collection);
     expect(Message.syncWithMeili).toHaveBeenCalledTimes(1);
-    expect(Conversation.syncWithMeili).toHaveBeenCalledTimes(1);
     expect(mockLogger.info).toHaveBeenCalledWith(
-      '[indexSync] No messages marked as indexed, forcing full sync',
+      '[indexSync] Messages index is empty while Mongo has 100 indexed flags. Resetting sync flags...',
     );
     expect(mockLogger.info).toHaveBeenCalledWith(
-      '[indexSync] Starting message sync (680 unindexed)',
+      '[indexSync] Index parity reset complete. Full re-sync will be triggered.',
     );
     expect(mockLogger.info).toHaveBeenCalledWith(
-      '[indexSync] No conversations marked as indexed, forcing full sync',
+      '[indexSync] Starting message sync (150 unindexed)',
     );
-    expect(mockLogger.info).toHaveBeenCalledWith('[indexSync] Starting convos sync (76 unindexed)');
   });
 
-  test('does NOT force sync when some documents already indexed and below threshold', async () => {
-    Message.getSyncProgress.mockResolvedValue({
-      totalProcessed: 630,
-      totalDocuments: 680,
-      isComplete: false,
-    });
+  test('resets stale sync flags when Meili is partially missing indexed messages', async () => {
+    /* === VIVENTIUM START ===
+     * Feature: Meili parity self-healing.
+     * Purpose: Cover the local failure mode where Meili loses only part of the
+     * index, leaving Mongo `_meiliIndex=true` for documents that no longer
+     * exist in search.
+     * === VIVENTIUM END === */
+    Message.getSyncProgress
+      .mockResolvedValueOnce({
+        totalProcessed: 150,
+        totalDocuments: 150,
+        isComplete: true,
+      })
+      .mockResolvedValueOnce({
+        totalProcessed: 0,
+        totalDocuments: 150,
+        isComplete: false,
+      });
 
-    Conversation.getSyncProgress.mockResolvedValue({
-      totalProcessed: 70,
-      totalDocuments: 76,
-      isComplete: false,
-    });
+    Conversation.getSyncProgress
+      .mockResolvedValueOnce({
+        totalProcessed: 50,
+        totalDocuments: 50,
+        isComplete: true,
+      })
+      .mockResolvedValueOnce({
+        totalProcessed: 50,
+        totalDocuments: 50,
+        isComplete: true,
+      });
+
+    Message.syncWithMeili.mockResolvedValue(undefined);
+
+    mockMeiliIndex.mockImplementation((indexName) => ({
+      getSettings: jest.fn().mockResolvedValue({ filterableAttributes: ['user'] }),
+      updateSettings: jest.fn().mockResolvedValue({}),
+      getStats: jest.fn().mockResolvedValue({
+        numberOfDocuments: indexName === 'messages' ? 125 : 50,
+      }),
+      search: jest.fn().mockResolvedValue({ hits: [] }),
+    }));
+
+    process.env.MEILI_SYNC_THRESHOLD = '1000';
 
     const indexSync = require('./indexSync');
     await indexSync();
 
-    expect(Message.syncWithMeili).not.toHaveBeenCalled();
-    expect(Conversation.syncWithMeili).not.toHaveBeenCalled();
-    expect(mockLogger.info).not.toHaveBeenCalledWith(
-      '[indexSync] No messages marked as indexed, forcing full sync',
-    );
-    expect(mockLogger.info).not.toHaveBeenCalledWith(
-      '[indexSync] No conversations marked as indexed, forcing full sync',
+    expect(mockBatchResetMeiliFlags).toHaveBeenCalledWith(Message.collection);
+    expect(mockBatchResetMeiliFlags).not.toHaveBeenCalledWith(Conversation.collection);
+    expect(Message.syncWithMeili).toHaveBeenCalledTimes(1);
+    expect(mockLogger.info).toHaveBeenCalledWith(
+      '[indexSync] Messages index is missing 25 documents (125 in Meili vs 150 indexed in Mongo). Resetting sync flags...',
     );
     expect(mockLogger.info).toHaveBeenCalledWith(
-      '[indexSync] 50 messages unindexed (below threshold: 1000, skipping)',
+      '[indexSync] Index parity reset complete. Full re-sync will be triggered.',
     );
     expect(mockLogger.info).toHaveBeenCalledWith(
-      '[indexSync] 6 convos unindexed (below threshold: 1000, skipping)',
+      '[indexSync] Starting message sync (150 unindexed)',
     );
   });
 });

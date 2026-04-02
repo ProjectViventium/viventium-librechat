@@ -1,8 +1,8 @@
 const { ResourceType, PermissionTypes, Permissions } = require('librechat-data-provider');
 const { checkSharePublicAccess } = require('./checkSharePublicAccess');
-const { getRoleByName } = require('~/models');
+const { getRoleByName } = require('~/models/Role');
 
-jest.mock('~/models');
+jest.mock('~/models/Role');
 
 describe('checkSharePublicAccess middleware', () => {
   let mockReq;

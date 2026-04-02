@@ -18,10 +18,6 @@ const pluginAuthSchema: Schema<IPluginAuth> = new Schema(
     pluginKey: {
       type: String,
     },
-    tenantId: {
-      type: String,
-      index: true,
-    },
   },
   { timestamps: true },
 );

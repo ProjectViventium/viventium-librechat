@@ -3,8 +3,6 @@ import { useWatch } from 'react-hook-form';
 import { TextareaAutosize } from '@librechat/client';
 import { useRecoilState, useRecoilValue } from 'recoil';
 import { Constants, isAssistantsEndpoint, isAgentsEndpoint } from 'librechat-data-provider';
-import type { TConversation } from 'librechat-data-provider';
-import type { ExtendedFile, FileSetter, ConvoGenerator } from '~/common';
 import {
   useChatContext,
   useChatFormContext,
@@ -37,30 +35,7 @@ import BadgeRow from './BadgeRow';
 import Mention from './Mention';
 import store from '~/store';
 
-interface ChatFormProps {
-  index: number;
-  /** From ChatContext — individual values so memo can compare them */
-  files: Map<string, ExtendedFile>;
-  setFiles: FileSetter;
-  conversation: TConversation | null;
-  isSubmitting: boolean;
-  filesLoading: boolean;
-  setFilesLoading: React.Dispatch<React.SetStateAction<boolean>>;
-  newConversation: ConvoGenerator;
-  handleStopGenerating: (e: React.MouseEvent<HTMLButtonElement>) => void;
-}
-
-const ChatForm = memo(function ChatForm({
-  index,
-  files,
-  setFiles,
-  conversation,
-  isSubmitting,
-  filesLoading,
-  setFilesLoading,
-  newConversation,
-  handleStopGenerating,
-}: ChatFormProps) {
+const ChatForm = memo(({ index = 0 }: { index?: number }) => {
   const submitButtonRef = useRef<HTMLButtonElement>(null);
   const textAreaRef = useRef<HTMLTextAreaElement>(null);
   useFocusChatEffect(textAreaRef);
@@ -90,6 +65,15 @@ const ChatForm = memo(function ChatForm({
 
   const { requiresKey } = useRequiresKey();
   const methods = useChatFormContext();
+  const {
+    files,
+    setFiles,
+    conversation,
+    isSubmitting,
+    filesLoading,
+    newConversation,
+    handleStopGenerating,
+  } = useChatContext();
   const {
     generateConversation,
     conversation: addedConvo,
@@ -135,15 +119,6 @@ const ChatForm = memo(function ChatForm({
       setIsCollapsed(false);
     }
   }, [isCollapsed]);
-
-  const handleTextareaFocus = useCallback(() => {
-    handleFocusOrClick();
-    setIsTextAreaFocused(true);
-  }, [handleFocusOrClick]);
-
-  const handleTextareaBlur = useCallback(() => {
-    setIsTextAreaFocused(false);
-  }, []);
 
   useAutoSave({
     files,
@@ -278,12 +253,7 @@ const ChatForm = memo(function ChatForm({
               handleSaveBadges={handleSaveBadges}
               setBadges={setBadges}
             />
-            <FileFormChat
-              conversation={conversation}
-              files={files}
-              setFiles={setFiles}
-              setFilesLoading={setFilesLoading}
-            />
+            <FileFormChat conversation={conversation} />
             {endpoint && (
               <div className={cn('flex', isRTL ? 'flex-row-reverse' : 'flex-row')}>
                 <div
@@ -314,8 +284,11 @@ const ChatForm = memo(function ChatForm({
                     tabIndex={0}
                     data-testid="text-input"
                     rows={1}
-                    onFocus={handleTextareaFocus}
-                    onBlur={handleTextareaBlur}
+                    onFocus={() => {
+                      handleFocusOrClick();
+                      setIsTextAreaFocused(true);
+                    }}
+                    onBlur={setIsTextAreaFocused.bind(null, false)}
                     aria-label={localize('com_ui_message_input')}
                     onClick={handleFocusOrClick}
                     style={{ height: 44, overflowY: 'auto' }}
@@ -342,13 +315,7 @@ const ChatForm = memo(function ChatForm({
               )}
             >
               <div className={`${isRTL ? 'mr-2' : 'ml-2'}`}>
-                <AttachFileChat
-                  conversation={conversation}
-                  disableInputs={disableInputs}
-                  files={files}
-                  setFiles={setFiles}
-                  setFilesLoading={setFilesLoading}
-                />
+                <AttachFileChat conversation={conversation} disableInputs={disableInputs} />
               </div>
               <BadgeRow
                 showEphemeralBadges={
@@ -393,77 +360,5 @@ const ChatForm = memo(function ChatForm({
     </form>
   );
 });
-ChatForm.displayName = 'ChatForm';
 
-/**
- * Wrapper that subscribes to ChatContext and passes stable individual values
- * to the memo'd ChatForm. This prevents ChatForm from re-rendering on every
- * streaming chunk — it only re-renders when the specific values it uses change.
- */
-function ChatFormWrapper({ index = 0 }: { index?: number }) {
-  const {
-    files,
-    setFiles,
-    conversation,
-    isSubmitting,
-    filesLoading,
-    setFilesLoading,
-    newConversation,
-    handleStopGenerating,
-  } = useChatContext();
-
-  /**
-   * Stabilize conversation reference: only update when rendering-relevant fields change,
-   * not on every metadata update (e.g., title generation during streaming).
-   */
-  const hasMessages = (conversation?.messages?.length ?? 0) > 0;
-  const stableConversation = useMemo(
-    () => conversation,
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [
-      conversation?.conversationId,
-      conversation?.endpoint,
-      conversation?.endpointType,
-      conversation?.agent_id,
-      conversation?.assistant_id,
-      conversation?.spec,
-      conversation?.useResponsesApi,
-      conversation?.model,
-      hasMessages,
-    ],
-  );
-
-  /** Stabilize function refs so they never trigger ChatForm re-renders */
-  const handleStopRef = useRef(handleStopGenerating);
-  handleStopRef.current = handleStopGenerating;
-  const stableHandleStop = useCallback(
-    (e: React.MouseEvent<HTMLButtonElement>) => handleStopRef.current(e),
-    [],
-  );
-
-  const newConvoRef = useRef(newConversation);
-  newConvoRef.current = newConversation;
-  const stableNewConversation: ConvoGenerator = useCallback(
-    (...args: Parameters<ConvoGenerator>): ReturnType<ConvoGenerator> =>
-      newConvoRef.current(...args),
-    [],
-  );
-
-  return (
-    <ChatForm
-      index={index}
-      files={files}
-      setFiles={setFiles}
-      conversation={stableConversation}
-      isSubmitting={isSubmitting}
-      filesLoading={filesLoading}
-      setFilesLoading={setFilesLoading}
-      newConversation={stableNewConversation}
-      handleStopGenerating={stableHandleStop}
-    />
-  );
-}
-
-ChatFormWrapper.displayName = 'ChatFormWrapper';
-
-export default ChatFormWrapper;
+export default ChatForm;

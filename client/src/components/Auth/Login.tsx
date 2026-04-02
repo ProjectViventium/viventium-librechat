@@ -46,6 +46,24 @@ function Login() {
       const newParams = new URLSearchParams(searchParams);
       newParams.delete('error');
       setSearchParams(newParams, { replace: true });
+      return;
+    }
+
+    /* === VIVENTIUM START ===
+     * Feature: Pending-approval OAuth redirect message.
+     * === VIVENTIUM END === */
+    if (oauthError && oauthError === 'viventium_pending_approval') {
+      const description =
+        searchParams?.get('error_description') ??
+        'Your account is pending approval. We will notify you once approved.';
+      showToast({
+        message: description,
+        status: 'warning',
+      });
+      const newParams = new URLSearchParams(searchParams);
+      newParams.delete('error');
+      newParams.delete('error_description');
+      setSearchParams(newParams, { replace: true });
     }
   }, [searchParams, setSearchParams, showToast, localize, location.state]);
 

@@ -1,8 +1,17 @@
 import type { Document, Types } from 'mongoose';
 import { CursorPaginationParams } from '~/common';
 
+export interface ViventiumVoiceRouteSelection {
+  provider?: string | null;
+  variant?: string | null;
+}
+
+export interface ViventiumVoiceRouteState {
+  stt?: ViventiumVoiceRouteSelection | null;
+  tts?: ViventiumVoiceRouteSelection | null;
+}
+
 export interface IUser extends Document {
-  _id: Types.ObjectId;
   name?: string;
   username?: string;
   email: string;
@@ -27,12 +36,6 @@ export interface IUser extends Document {
     used: boolean;
     usedAt?: Date | null;
   }>;
-  pendingTotpSecret?: string;
-  pendingBackupCodes?: Array<{
-    codeHash: string;
-    used: boolean;
-    usedAt?: Date | null;
-  }>;
   refreshToken?: Array<{
     refreshToken: string;
   }>;
@@ -40,6 +43,12 @@ export interface IUser extends Document {
   termsAccepted?: boolean;
   personalization?: {
     memories?: boolean;
+    /* === VIVENTIUM START ===
+     * Feature: Global conversation recall personalization toggle
+     * Added: 2026-02-19
+     */
+    conversation_recall?: boolean;
+    /* === VIVENTIUM END === */
   };
   favorites?: Array<{
     agentId?: string;
@@ -48,18 +57,22 @@ export interface IUser extends Document {
   }>;
   createdAt?: Date;
   updatedAt?: Date;
+  /* === VIVENTIUM START ===
+   * Feature: Registration approval status fields.
+   * Purpose: Support pending/approved/denied onboarding workflow.
+   * === VIVENTIUM END === */
+  viventiumApprovalStatus?: 'pending' | 'approved' | 'denied';
+  viventiumApprovalRequestedAt?: Date | null;
+  viventiumApprovalReviewedAt?: Date | null;
+  /* === VIVENTIUM START ===
+   * Feature: Modern playground voice-route persistence
+   * Purpose: Store per-user STT/TTS defaults for the LiveKit playground.
+   * === VIVENTIUM END === */
+  viventiumVoicePreferences?: {
+    livekitPlayground?: ViventiumVoiceRouteState | null;
+  };
   /** Field for external source identification (for consistency with TPrincipal schema) */
   idOnTheSource?: string;
-  tenantId?: string;
-  federatedTokens?: OIDCTokens;
-  openidTokens?: OIDCTokens;
-}
-
-export interface OIDCTokens {
-  access_token?: string;
-  id_token?: string;
-  refresh_token?: string;
-  expires_at?: number;
 }
 
 export interface BalanceConfig {
@@ -87,6 +100,21 @@ export interface UpdateUserRequest {
   termsAccepted?: boolean;
   personalization?: {
     memories?: boolean;
+    /* === VIVENTIUM START ===
+     * Feature: Global conversation recall personalization toggle
+     * Added: 2026-02-19
+     */
+    conversation_recall?: boolean;
+    /* === VIVENTIUM END === */
+  };
+  /* === VIVENTIUM START ===
+   * Feature: Registration approval status fields.
+   * === VIVENTIUM END === */
+  viventiumApprovalStatus?: 'pending' | 'approved' | 'denied';
+  viventiumApprovalRequestedAt?: Date | null;
+  viventiumApprovalReviewedAt?: Date | null;
+  viventiumVoicePreferences?: {
+    livekitPlayground?: ViventiumVoiceRouteState | null;
   };
 }
 

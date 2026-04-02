@@ -2,11 +2,11 @@ import { logger } from '@librechat/data-schemas';
 import type { OAuthClientInformation } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import type { TokenMethods } from '@librechat/data-schemas';
-import type { MCPOAuthTokens, OAuthMetadata, MCPOAuthFlowMetadata } from '~/mcp/oauth';
+import type { MCPOAuthTokens, OAuthMetadata } from '~/mcp/oauth';
 import type { FlowStateManager } from '~/flow/manager';
+import type { FlowMetadata } from '~/flow/types';
 import type * as t from './types';
-import { MCPTokenStorage, MCPOAuthHandler, ReauthenticationRequiredError } from '~/mcp/oauth';
-import { PENDING_STALE_MS, normalizeExpiresAt } from '~/flow/manager';
+import { MCPTokenStorage, MCPOAuthHandler } from '~/mcp/oauth';
 import { sanitizeUrlForLogging } from './utils';
 import { withTimeout } from '~/utils/promise';
 import { MCPConnection } from './connection';
@@ -30,7 +30,6 @@ export class MCPConnectionFactory {
   protected readonly logPrefix: string;
   protected readonly useOAuth: boolean;
   protected readonly useSSRFProtection: boolean;
-  protected readonly allowedDomains?: string[] | null;
 
   // OAuth-related properties (only set when useOAuth is true)
   protected readonly userId?: string;
@@ -58,13 +57,9 @@ export class MCPConnectionFactory {
    */
   static async discoverTools(
     basic: t.BasicConnectionOptions,
-    options?: Omit<t.OAuthConnectionOptions, 'returnOnOAuth'> | t.UserConnectionContext,
+    oauth?: Omit<t.OAuthConnectionOptions, 'returnOnOAuth'>,
   ): Promise<ToolDiscoveryResult> {
-    if (options != null && 'useOAuth' in options) {
-      const factory = new this(basic, { ...options, returnOnOAuth: true });
-      return factory.discoverToolsInternal();
-    }
-    const factory = new this(basic, options);
+    const factory = new this(basic, oauth ? { ...oauth, returnOnOAuth: true } : undefined);
     return factory.discoverToolsInternal();
   }
 
@@ -81,7 +76,7 @@ export class MCPConnectionFactory {
       useSSRFProtection: this.useSSRFProtection,
     });
 
-    const oauthHandler = () => {
+    const oauthHandler = async () => {
       logger.info(
         `${this.logPrefix} [Discovery] OAuth required; skipping URL generation in discovery mode`,
       );
@@ -89,9 +84,9 @@ export class MCPConnectionFactory {
       connection.emit('oauthFailed', new Error('OAuth required during tool discovery'));
     };
 
-    // Register unconditionally: non-OAuth servers that return 401 also emit 'oauthRequired',
-    // and without this listener, connectClient()'s oauthHandledPromise hangs for 30s+.
-    connection.once('oauthRequired', oauthHandler);
+    if (this.useOAuth) {
+      connection.on('oauthRequired', oauthHandler);
+    }
 
     try {
       const connectTimeout = this.connectionTimeout ?? this.serverConfig.initTimeout ?? 30000;
@@ -103,11 +98,12 @@ export class MCPConnectionFactory {
 
       if (await connection.isConnected()) {
         const tools = await connection.fetchTools();
-        connection.removeListener('oauthRequired', oauthHandler);
+        if (this.useOAuth) {
+          connection.removeListener('oauthRequired', oauthHandler);
+        }
         return { tools, connection, oauthRequired: false, oauthUrl: null };
       }
     } catch {
-      MCPConnection.decrementCycleCount(this.serverName);
       logger.debug(
         `${this.logPrefix} [Discovery] Connection failed, attempting unauthenticated tool listing`,
       );
@@ -115,7 +111,9 @@ export class MCPConnectionFactory {
 
     try {
       const tools = await this.attemptUnauthenticatedToolListing();
-      connection.removeListener('oauthRequired', oauthHandler);
+      if (this.useOAuth) {
+        connection.removeListener('oauthRequired', oauthHandler);
+      }
       if (tools && tools.length > 0) {
         logger.info(
           `${this.logPrefix} [Discovery] Successfully discovered ${tools.length} tools without auth`,
@@ -127,13 +125,13 @@ export class MCPConnectionFactory {
         }
         return { tools, connection: null, oauthRequired, oauthUrl };
       }
-      MCPConnection.decrementCycleCount(this.serverName);
     } catch (listError) {
-      MCPConnection.decrementCycleCount(this.serverName);
       logger.debug(`${this.logPrefix} [Discovery] Unauthenticated tool listing failed:`, listError);
     }
 
-    connection.removeListener('oauthRequired', oauthHandler);
+    if (this.useOAuth) {
+      connection.removeListener('oauthRequired', oauthHandler);
+    }
 
     try {
       await connection.disconnect();
@@ -185,36 +183,30 @@ export class MCPConnectionFactory {
     return null;
   }
 
-  protected constructor(
-    basic: t.BasicConnectionOptions,
-    options?: t.OAuthConnectionOptions | t.UserConnectionContext,
-  ) {
+  protected constructor(basic: t.BasicConnectionOptions, oauth?: t.OAuthConnectionOptions) {
     this.serverConfig = processMCPEnv({
-      user: options?.user,
-      body: options?.requestBody,
+      user: oauth?.user,
+      body: oauth?.requestBody,
       dbSourced: basic.dbSourced,
       options: basic.serverConfig,
-      customUserVars: options?.customUserVars,
+      customUserVars: oauth?.customUserVars,
     });
     this.serverName = basic.serverName;
+    this.useOAuth = !!oauth?.useOAuth;
     this.useSSRFProtection = basic.useSSRFProtection === true;
-    this.allowedDomains = basic.allowedDomains;
-    this.connectionTimeout = options?.connectionTimeout;
-    this.logPrefix = options?.user
-      ? `[MCP][${basic.serverName}][${options.user.id}]`
+    this.connectionTimeout = oauth?.connectionTimeout;
+    this.logPrefix = oauth?.user
+      ? `[MCP][${basic.serverName}][${oauth.user.id}]`
       : `[MCP][${basic.serverName}]`;
 
-    if (options != null && 'useOAuth' in options) {
-      this.useOAuth = true;
-      this.userId = options.user?.id;
-      this.flowManager = options.flowManager;
-      this.tokenMethods = options.tokenMethods;
-      this.signal = options.signal;
-      this.oauthStart = options.oauthStart;
-      this.oauthEnd = options.oauthEnd;
-      this.returnOnOAuth = options.returnOnOAuth;
-    } else {
-      this.useOAuth = false;
+    if (oauth?.useOAuth) {
+      this.userId = oauth.user?.id;
+      this.flowManager = oauth.flowManager;
+      this.tokenMethods = oauth.tokenMethods;
+      this.signal = oauth.signal;
+      this.oauthStart = oauth.oauthStart;
+      this.oauthEnd = oauth.oauthEnd;
+      this.returnOnOAuth = oauth.returnOnOAuth;
     }
   }
 
@@ -273,10 +265,6 @@ export class MCPConnectionFactory {
       if (tokens) logger.info(`${this.logPrefix} Loaded OAuth tokens`);
       return tokens;
     } catch (error) {
-      if (error instanceof ReauthenticationRequiredError) {
-        logger.info(`${this.logPrefix} ${error.message}, will trigger OAuth flow`);
-        return null;
-      }
       logger.debug(`${this.logPrefix} No existing tokens found or error loading tokens`, error);
       return null;
     }
@@ -290,8 +278,6 @@ export class MCPConnectionFactory {
       serverName: string;
       identifier: string;
       clientInfo?: OAuthClientInformation;
-      storedTokenEndpoint?: string;
-      storedAuthMethods?: string[];
     },
   ) => Promise<MCPOAuthTokens> {
     return async (refreshToken, metadata) => {
@@ -301,75 +287,93 @@ export class MCPConnectionFactory {
           serverUrl: (this.serverConfig as t.SSEOptions | t.StreamableHTTPOptions).url,
           serverName: metadata.serverName,
           clientInfo: metadata.clientInfo,
-          storedTokenEndpoint: metadata.storedTokenEndpoint,
-          storedAuthMethods: metadata.storedAuthMethods,
         },
         this.serverConfig.oauth_headers ?? {},
         this.serverConfig.oauth,
-        this.allowedDomains,
       );
     };
   }
 
   /** Sets up OAuth event handlers for the connection */
   protected handleOAuthEvents(connection: MCPConnection): () => void {
+    /* === VIVENTIUM START ===
+     * Feature: Refresh-on-auth-error for OAuth MCP servers.
+     * Purpose: If an MCP server rejects an access token (401/invalid_token) even though our
+     * stored expiry indicates it is still valid, attempt a refresh using the stored refresh token
+     * before forcing a full OAuth re-authentication flow.
+     */
+    let attemptedForceRefresh = false;
+    /* === VIVENTIUM END === */
+
     const oauthHandler = async (data: { serverUrl?: string }) => {
       logger.info(`${this.logPrefix} oauthRequired event received`);
 
+      /* === VIVENTIUM START === */
+      if (
+        !attemptedForceRefresh &&
+        this.userId &&
+        this.flowManager &&
+        this.tokenMethods?.findToken &&
+        this.tokenMethods?.createToken
+      ) {
+        attemptedForceRefresh = true;
+        try {
+          const refreshedTokens = await MCPTokenStorage.getTokens({
+            userId: this.userId,
+            serverName: this.serverName,
+            findToken: this.tokenMethods.findToken,
+            createToken: this.tokenMethods.createToken,
+            updateToken: this.tokenMethods.updateToken,
+            refreshTokens: this.createRefreshTokensFunction(),
+            forceRefresh: true,
+          });
+
+          if (refreshedTokens) {
+            // Clear cached token flow state so subsequent connections don't reuse stale tokens.
+            try {
+              const flowId = MCPOAuthHandler.generateFlowId(this.userId, this.serverName);
+              await this.flowManager.deleteFlow(flowId, 'mcp_get_tokens');
+            } catch (cacheError) {
+              logger.debug(`${this.logPrefix} Failed to clear mcp_get_tokens flow`, cacheError);
+            }
+
+            connection.setOAuthTokens(refreshedTokens);
+            logger.info(`${this.logPrefix} Refreshed OAuth tokens after auth error`);
+            connection.emit('oauthHandled');
+            return;
+          }
+        } catch (refreshError) {
+          logger.warn(
+            `${this.logPrefix} Token refresh after auth error failed; falling back to OAuth flow`,
+            refreshError,
+          );
+        }
+      }
+      /* === VIVENTIUM END === */
+
+      // If we just want to initiate OAuth and return, handle it differently
       if (this.returnOnOAuth) {
         try {
           const config = this.serverConfig;
-          const flowId = MCPOAuthHandler.generateFlowId(this.userId!, this.serverName);
-          const existingFlow = await this.flowManager!.getFlowState(flowId, 'mcp_oauth');
-
-          if (existingFlow?.status === 'PENDING') {
-            const pendingAge = existingFlow.createdAt
-              ? Date.now() - existingFlow.createdAt
-              : Infinity;
-
-            if (pendingAge < PENDING_STALE_MS) {
-              logger.debug(
-                `${this.logPrefix} Recent PENDING OAuth flow exists (${Math.round(pendingAge / 1000)}s old), skipping new initiation`,
-              );
-              connection.emit('oauthFailed', new Error('OAuth flow initiated - return early'));
-              return;
-            }
-
-            logger.debug(
-              `${this.logPrefix} Found stale PENDING OAuth flow (${Math.round(pendingAge / 1000)}s old), will replace`,
+          const { authorizationUrl, flowId, flowMetadata } =
+            await MCPOAuthHandler.initiateOAuthFlow(
+              this.serverName,
+              data.serverUrl || '',
+              this.userId!,
+              config?.oauth_headers ?? {},
+              config?.oauth,
             );
-          }
 
-          const {
-            authorizationUrl,
-            flowId: newFlowId,
-            flowMetadata,
-          } = await MCPOAuthHandler.initiateOAuthFlow(
-            this.serverName,
-            data.serverUrl || '',
-            this.userId!,
-            config?.oauth_headers ?? {},
-            config?.oauth,
-            this.allowedDomains,
-          );
+          // Delete any existing flow state to ensure we start fresh
+          // This prevents stale codeVerifier issues when re-authenticating
+          await this.flowManager!.deleteFlow(flowId, 'mcp_oauth');
 
-          if (existingFlow) {
-            const oldState = (existingFlow.metadata as MCPOAuthFlowMetadata)?.state;
-            await this.flowManager!.deleteFlow(newFlowId, 'mcp_oauth');
-            if (oldState) {
-              await MCPOAuthHandler.deleteStateMapping(oldState, this.flowManager!);
-            }
-          }
-
-          // Store flow state BEFORE redirecting so the callback can find it
-          const metadataWithUrl = { ...flowMetadata, authorizationUrl };
-          await this.flowManager!.initFlow(newFlowId, 'mcp_oauth', metadataWithUrl);
-          await MCPOAuthHandler.storeStateMapping(flowMetadata.state, newFlowId, this.flowManager!);
-
-          // Start monitoring in background — createFlow will find the existing PENDING state
-          // written by initFlow above, so metadata arg is unused (pass {} to make that explicit)
-          this.flowManager!.createFlow(newFlowId, 'mcp_oauth', {}, this.signal).catch((error) => {
-            logger.debug(`${this.logPrefix} OAuth flow monitor ended`, error);
+          // Create the flow state so the OAuth callback can find it
+          // We spawn this in the background without waiting for it
+          // Pass signal so the flow can be aborted if the request is cancelled
+          this.flowManager!.createFlow(flowId, 'mcp_oauth', flowMetadata, this.signal).catch(() => {
+            // The OAuth callback will resolve this flow, so we expect it to timeout here
+            // or it will be aborted if the request is cancelled - both are fine
           });
 
           if (this.oauthStart) {
@@ -377,6 +381,8 @@ export class MCPConnectionFactory {
             await this.oauthStart(authorizationUrl);
           }
 
+          // Emit oauthFailed to signal that connection should not proceed
+          // but OAuth was successfully initiated
           connection.emit('oauthFailed', new Error('OAuth flow initiated - return early'));
           return;
         } catch (error) {
@@ -438,9 +444,11 @@ export class MCPConnectionFactory {
     logger.error(`${this.logPrefix} Failed to establish connection.`);
   }
 
+  // Handles connection attempts with retry logic and OAuth error handling
   private async connectTo(connection: MCPConnection): Promise<void> {
     const maxAttempts = 3;
     let attempts = 0;
+    let oauthHandled = false;
 
     while (attempts < maxAttempts) {
       try {
@@ -453,6 +461,22 @@ export class MCPConnectionFactory {
         attempts++;
 
         if (this.useOAuth && this.isOAuthError(error)) {
+          // For returnOnOAuth mode, let the event handler (handleOAuthEvents) deal with OAuth
+          // We just need to stop retrying and let the error propagate
+          if (this.returnOnOAuth) {
+            logger.info(
+              `${this.logPrefix} OAuth required (return on OAuth mode), stopping retries`,
+            );
+            throw error;
+          }
+
+          // Normal flow - wait for OAuth to complete
+          if (this.oauthStart && !oauthHandled) {
+            oauthHandled = true;
+            logger.info(`${this.logPrefix} Handling OAuth`);
+            await this.handleOAuthRequired();
+          }
+          // Don't retry on OAuth errors - just throw
           logger.info(`${this.logPrefix} OAuth required, stopping connection attempts`);
           throw error;
         }
@@ -528,79 +552,26 @@ export class MCPConnectionFactory {
       /** Check if there's already an ongoing OAuth flow for this flowId */
       const existingFlow = await this.flowManager.getFlowState(flowId, 'mcp_oauth');
 
+      // If any flow exists (PENDING, COMPLETED, FAILED), cancel it and start fresh
+      // This ensures the user always gets a new OAuth URL instead of waiting for stale flows
       if (existingFlow) {
-        const flowMeta = existingFlow.metadata as MCPOAuthFlowMetadata | undefined;
-
-        if (existingFlow.status === 'PENDING') {
-          const pendingAge = existingFlow.createdAt
-            ? Date.now() - existingFlow.createdAt
-            : Infinity;
-
-          if (pendingAge < PENDING_STALE_MS) {
-            logger.debug(
-              `${this.logPrefix} Found recent PENDING OAuth flow (${Math.round(pendingAge / 1000)}s old), joining instead of creating new one`,
-            );
-
-            const storedAuthUrl = flowMeta?.authorizationUrl;
-            if (storedAuthUrl && typeof this.oauthStart === 'function') {
-              logger.info(
-                `${this.logPrefix} Re-issuing stored authorization URL to caller while joining PENDING flow`,
-              );
-              await this.oauthStart(storedAuthUrl);
-            }
-
-            const tokens = await this.flowManager.createFlow(flowId, 'mcp_oauth', {}, this.signal);
-            if (typeof this.oauthEnd === 'function') {
-              await this.oauthEnd();
-            }
-            logger.info(
-              `${this.logPrefix} Joined existing OAuth flow completed for ${this.serverName}`,
-            );
-            return {
-              tokens,
-              clientInfo: flowMeta?.clientInfo,
-              metadata: flowMeta?.metadata,
-            };
-          }
-
-          logger.debug(
-            `${this.logPrefix} Found stale PENDING OAuth flow (${Math.round(pendingAge / 1000)}s old), will delete and start fresh`,
-          );
-        }
-
-        if (existingFlow.status === 'COMPLETED') {
-          const completedAge = existingFlow.completedAt
-            ? Date.now() - existingFlow.completedAt
-            : Infinity;
-          const cachedTokens = existingFlow.result as MCPOAuthTokens | null | undefined;
-          const isTokenExpired =
-            cachedTokens?.expires_at != null &&
-            normalizeExpiresAt(cachedTokens.expires_at) < Date.now();
-
-          if (completedAge <= PENDING_STALE_MS && cachedTokens !== undefined && !isTokenExpired) {
-            logger.debug(
-              `${this.logPrefix} Found non-stale COMPLETED OAuth flow, reusing cached tokens`,
-            );
-            return {
-              tokens: cachedTokens,
-              clientInfo: flowMeta?.clientInfo,
-              metadata: flowMeta?.metadata,
-            };
-          }
-        }
-
         logger.debug(
-          `${this.logPrefix} Found existing OAuth flow (status: ${existingFlow.status}), cleaning up to start fresh`,
+          `${this.logPrefix} Found existing OAuth flow (status: ${existingFlow.status}), cancelling to start fresh`,
         );
         try {
-          const oldState = flowMeta?.state;
-          await this.flowManager.deleteFlow(flowId, 'mcp_oauth');
-          if (oldState) {
-            await MCPOAuthHandler.deleteStateMapping(oldState, this.flowManager);
+          if (existingFlow.status === 'PENDING') {
+            await this.flowManager.failFlow(
+              flowId,
+              'mcp_oauth',
+              new Error('Cancelled for new OAuth request'),
+            );
+          } else {
+            await this.flowManager.deleteFlow(flowId, 'mcp_oauth');
           }
         } catch (error) {
-          logger.warn(`${this.logPrefix} Failed to clean up existing OAuth flow`, error);
+          logger.warn(`${this.logPrefix} Failed to cancel existing OAuth flow`, error);
         }
+        // Continue to start a new flow below
       }
 
       logger.debug(`${this.logPrefix} Initiating new OAuth flow for ${this.serverName}...`);
@@ -614,13 +585,7 @@ export class MCPConnectionFactory {
         this.userId!,
         this.serverConfig.oauth_headers ?? {},
         this.serverConfig.oauth,
-        this.allowedDomains,
       );
-
-      // Store flow state BEFORE redirecting so the callback can find it
-      const metadataWithUrl = { ...flowMetadata, authorizationUrl };
-      await this.flowManager.initFlow(newFlowId, 'mcp_oauth', metadataWithUrl);
-      await MCPOAuthHandler.storeStateMapping(flowMetadata.state, newFlowId, this.flowManager);
 
       if (typeof this.oauthStart === 'function') {
         logger.info(`${this.logPrefix} OAuth flow started, issued authorization URL to user`);
@@ -631,9 +596,13 @@ export class MCPConnectionFactory {
         );
       }
 
-      // createFlow will find the existing PENDING state written by initFlow above,
-      // so metadata arg is unused (pass {} to make that explicit)
-      const tokens = await this.flowManager.createFlow(newFlowId, 'mcp_oauth', {}, this.signal);
+      /** Tokens from the new flow */
+      const tokens = await this.flowManager.createFlow(
+        newFlowId,
+        'mcp_oauth',
+        flowMetadata as FlowMetadata,
+        this.signal,
+      );
       if (typeof this.oauthEnd === 'function') {
         await this.oauthEnd();
       }

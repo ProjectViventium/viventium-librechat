@@ -3,11 +3,71 @@ import type {
   BaseInitializeParams,
   InitializeResultBase,
   OpenAIConfigOptions,
+  OpenAIModelOptions,
   UserKeyValues,
 } from '~/types';
 import { getAzureCredentials, resolveHeaders, isUserProvided, checkUserKeyExpiry } from '~/utils';
-import { validateEndpointURL } from '~/auth';
 import { getOpenAIConfig } from './config';
+
+/* === VIVENTIUM START ===
+ * Feature: Connected Accounts routing policy.
+ * Purpose: Attempt user credential first for OpenAI-family endpoints, then fallback to
+ * platform credential when user credential is missing (while preserving invalid/expired failures).
+ * === VIVENTIUM END === */
+const OPENAI_CONNECTED_ACCOUNT_RECONNECT_MESSAGE =
+  'OpenAI connected account needs reconnect in Settings > Account > Connected Accounts.';
+
+const isNoUserKeyError = (error: unknown): boolean => {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  try {
+    const parsed = JSON.parse(error.message) as { type?: string };
+    return parsed.type === ErrorTypes.NO_USER_KEY;
+  } catch {
+    return false;
+  }
+};
+
+const isInvalidUserKeyError = (error: unknown): boolean => {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  try {
+    const parsed = JSON.parse(error.message) as { type?: string };
+    return parsed.type === ErrorTypes.INVALID_USER_KEY;
+  } catch {
+    return false;
+  }
+};
+
+const isOpenAIConnectedAccountReadError = (error: unknown): boolean => {
+  if (isInvalidUserKeyError(error)) {
+    return true;
+  }
+
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  const message = error.message.toLowerCase();
+  return (
+    message.includes('operation-specific reason') ||
+    message.includes('bad decrypt') ||
+    message.includes('invalid key length')
+  );
+};
+
+const isConnectedAccountAuthMode = (): boolean => {
+  const values = [
+    process.env.VIVENTIUM_OPENAI_AUTH_MODE,
+    process.env.VIVENTIUM_PRIMARY_AUTH_MODE,
+  ];
+
+  return values.some((value) => value?.trim().toLowerCase() === 'connected_account');
+};
 
 /**
  * Initializes OpenAI options for agent usage. This function always returns configuration
@@ -23,6 +83,7 @@ export async function initializeOpenAI({
   model_parameters,
   db,
 }: BaseInitializeParams): Promise<InitializeResultBase> {
+  const codexDebugEnabled = process.env.VIVENTIUM_OPENAI_CODEX_DEBUG === 'true';
   const appConfig = req.config;
   const { PROXY, OPENAI_API_KEY, AZURE_API_KEY, OPENAI_REVERSE_PROXY, AZURE_OPENAI_BASEURL } =
     process.env;
@@ -44,20 +105,43 @@ export async function initializeOpenAI({
   const userProvidesURL = isUserProvided(baseURLOptions[endpoint as keyof typeof baseURLOptions]);
 
   let userValues: UserKeyValues | null = null;
-  if (expiresAt && (userProvidesKey || userProvidesURL)) {
-    checkUserKeyExpiry(expiresAt, endpoint);
+  try {
     userValues = await db.getUserKeyValues({ userId: req.user?.id ?? '', name: endpoint });
+    if (expiresAt) {
+      checkUserKeyExpiry(expiresAt, endpoint);
+    }
+  } catch (error) {
+    if (isNoUserKeyError(error)) {
+      userValues = null;
+    } else if (isOpenAIConnectedAccountReadError(error)) {
+      if (isConnectedAccountAuthMode()) {
+        throw new Error(OPENAI_CONNECTED_ACCOUNT_RECONNECT_MESSAGE);
+      }
+      userValues = null;
+    } else {
+      throw error;
+    }
   }
 
-  let apiKey = userProvidesKey
-    ? userValues?.apiKey
-    : credentials[endpoint as keyof typeof credentials];
-  const baseURL = userProvidesURL
-    ? userValues?.baseURL
-    : baseURLOptions[endpoint as keyof typeof baseURLOptions];
+  const hasUserApiKey = Boolean(userValues?.apiKey);
+  const hasUserBaseURL = Boolean(userValues?.baseURL);
+  const hasUserHeaders = Boolean(userValues?.headers && Object.keys(userValues.headers).length > 0);
+  const isOpenAIOAuthSubscription = userValues?.oauthProvider === 'openai-codex';
 
-  if (userProvidesURL && baseURL) {
-    await validateEndpointURL(baseURL, endpoint);
+  let apiKey = credentials[endpoint as keyof typeof credentials];
+  if (userProvidesKey) {
+    apiKey = undefined;
+  }
+  if (hasUserApiKey) {
+    apiKey = userValues?.apiKey;
+  }
+
+  let baseURL = baseURLOptions[endpoint as keyof typeof baseURLOptions];
+  if (userProvidesURL) {
+    baseURL = undefined;
+  }
+  if (hasUserBaseURL) {
+    baseURL = userValues?.baseURL;
   }
 
   const clientOptions: OpenAIConfigOptions = {
@@ -65,6 +149,16 @@ export async function initializeOpenAI({
     reverseProxyUrl: baseURL || undefined,
     streaming: true,
   };
+
+  if (hasUserHeaders) {
+    clientOptions.headers = resolveHeaders({
+      headers: {
+        ...(clientOptions.headers ?? {}),
+        ...(userValues?.headers ?? {}),
+      },
+      user: req.user,
+    });
+  }
 
   const isAzureOpenAI = endpoint === EModelEndpoint.azureOpenAI;
   const azureConfig = isAzureOpenAI && appConfig?.endpoints?.[EModelEndpoint.azureOpenAI];
@@ -111,7 +205,7 @@ export async function initializeOpenAI({
     }
   } else if (isAzureOpenAI) {
     clientOptions.azure =
-      userProvidesKey && userValues?.apiKey ? JSON.parse(userValues.apiKey) : getAzureCredentials();
+      hasUserApiKey && userValues?.apiKey ? JSON.parse(userValues.apiKey) : getAzureCredentials();
     apiKey = clientOptions.azure ? clientOptions.azure.azureOpenAIApiKey : undefined;
   }
 
@@ -127,11 +221,34 @@ export async function initializeOpenAI({
     throw new Error(`${endpoint} API Key not provided.`);
   }
 
-  const modelOptions = {
-    ...(model_parameters ?? {}),
+  const modelOptions: OpenAIModelOptions & { user?: string } = {
+    ...(model_parameters as OpenAIModelOptions),
     model: modelName,
     user: req.user?.id,
   };
+
+  if (isOpenAIOAuthSubscription && modelOptions.useResponsesApi == null) {
+    modelOptions.useResponsesApi = true;
+  }
+
+  if (codexDebugEnabled && endpoint === EModelEndpoint.openAI) {
+    console.info(
+      '[OpenAI Init Debug]',
+      JSON.stringify({
+        endpoint,
+        userId: req.user?.id ?? null,
+        model: modelName ?? null,
+        hasUserApiKey,
+        hasUserBaseURL,
+        oauthProvider: userValues?.oauthProvider ?? null,
+        oauthType: userValues?.oauthType ?? null,
+        resolvedBaseURL: baseURL ?? null,
+        useResponsesApi:
+          (typeof modelOptions.useResponsesApi === 'boolean' ? modelOptions.useResponsesApi : null) ??
+          null,
+      }),
+    );
+  }
 
   const finalClientOptions: OpenAIConfigOptions = {
     ...clientOptions,

@@ -1,0 +1,31 @@
+{
+  "_description": "Expected /exec response format for compiled languages (Go, Java, C, etc.)",
+  "_version": "1.0.0",
+  "_librechat_compatible": true,
+
+  "compiled_languages": ["go", "java", "c", "cpp", "rs", "f90", "d", "ts"],
+
+  "request_example_go": {
+    "code": "package main\nimport \"fmt\"\nfunc main() { fmt.Println(\"Hello Go\") }",
+    "lang": "go"
+  },
+
+  "request_example_java": {
+    "code": "public class Code { public static void main(String[] args) { System.out.println(\"Hello Java\"); } }",
+    "lang": "java"
+  },
+
+  "response_format": {
+    "session_id": "string (required)",
+    "files": "array (may be empty)",
+    "stdout": "string (compilation + execution output)",
+    "stderr": "string (compilation errors if any)"
+  },
+
+  "notes": [
+    "Compiled languages write code to file before execution",
+    "Java requires class name 'Code' in code",
+    "Compilation errors appear in stderr",
+    "Longer timeout multipliers may apply (see config)"
+  ]
+}

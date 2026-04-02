@@ -1,23 +1,27 @@
 import { memo, useMemo } from 'react';
-import { useRecoilValue } from 'recoil';
 import { useMediaQuery } from '@librechat/client';
+import { useOutletContext } from 'react-router-dom';
+import { AnimatePresence, motion } from 'framer-motion';
 import { getConfigDefaults, PermissionTypes, Permissions } from 'librechat-data-provider';
+import type { ContextType } from '~/common';
+import { PresetsMenu, HeaderNewChat, OpenSidebar } from './Menus';
 import ModelSelector from './Menus/Endpoints/ModelSelector';
 import { useGetStartupConfig } from '~/data-provider';
 import ExportAndShareMenu from './ExportAndShareMenu';
-import { OpenSidebar, PresetsMenu } from './Menus';
 import BookmarkMenu from './Menus/BookmarkMenu';
 import { TemporaryChat } from './TemporaryChat';
 import AddMultiConvo from './AddMultiConvo';
 import { useHasAccess } from '~/hooks';
 import { cn } from '~/utils';
-import store from '~/store';
+// === VIVENTIUM START - Voice Call Button ===
+import { CallButton } from '~/components/Viventium';
+// === VIVENTIUM END ===
 
 const defaultInterface = getConfigDefaults().interface;
 
 function Header() {
   const { data: startupConfig } = useGetStartupConfig();
-  const navVisible = useRecoilValue(store.sidebarExpanded);
+  const { navVisible, setNavVisible } = useOutletContext<ContextType>();
 
   const interfaceConfig = useMemo(
     () => startupConfig?.interface ?? defaultInterface,
@@ -42,15 +46,30 @@ function Header() {
   const isSmallScreen = useMediaQuery('(max-width: 768px)');
 
   return (
-    <div className="via-presentation/70 md:from-presentation/80 md:via-presentation/50 2xl:from-presentation/0 absolute top-0 z-10 flex h-[52px] w-full items-center justify-between bg-gradient-to-b from-presentation to-transparent p-2 font-semibold text-text-primary 2xl:via-transparent">
+    <div className="via-presentation/70 md:from-presentation/80 md:via-presentation/50 2xl:from-presentation/0 absolute top-0 z-10 flex h-14 w-full items-center justify-between bg-gradient-to-b from-presentation to-transparent p-2 font-semibold text-text-primary 2xl:via-transparent">
       <div className="hide-scrollbar flex w-full items-center justify-between gap-2 overflow-x-auto">
         <div className="mx-1 flex items-center">
-          <OpenSidebar className="md:hidden" />
+          <AnimatePresence initial={false}>
+            {!navVisible && (
+              <motion.div
+                className="flex items-center gap-2"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.15 }}
+                key="header-buttons"
+              >
+                <OpenSidebar setNavVisible={setNavVisible} className="max-md:hidden" />
+                <HeaderNewChat />
+              </motion.div>
+            )}
+          </AnimatePresence>
           {!(navVisible && isSmallScreen) && (
             <div
               className={cn(
-                'flex items-center gap-2 pl-2',
+                'flex items-center gap-2',
                 !isSmallScreen ? 'transition-all duration-200 ease-in-out' : '',
+                !navVisible && !isSmallScreen ? 'pl-2' : '',
               )}
             >
               <ModelSelector startupConfig={startupConfig} />
@@ -59,6 +78,9 @@ function Header() {
               {hasAccessToMultiConvo === true && <AddMultiConvo />}
               {isSmallScreen && (
                 <>
+                  {/* === VIVENTIUM START - Voice Call Button === */}
+                  <CallButton />
+                  {/* === VIVENTIUM END === */}
                   <ExportAndShareMenu
                     isSharedButtonEnabled={startupConfig?.sharedLinksEnabled ?? false}
                   />
@@ -71,6 +93,9 @@ function Header() {
 
         {!isSmallScreen && (
           <div className="flex items-center gap-2">
+            {/* === VIVENTIUM START - Voice Call Button === */}
+            <CallButton />
+            {/* === VIVENTIUM END === */}
             <ExportAndShareMenu
               isSharedButtonEnabled={startupConfig?.sharedLinksEnabled ?? false}
             />

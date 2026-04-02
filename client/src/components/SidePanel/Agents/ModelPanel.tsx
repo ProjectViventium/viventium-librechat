@@ -1,4 +1,4 @@
-import React, { useMemo, useEffect } from 'react';
+import React, { useMemo, useEffect, useRef } from 'react';
 import keyBy from 'lodash/keyBy';
 import { ControlCombobox } from '@librechat/client';
 import { ChevronLeft, RotateCcw } from 'lucide-react';
@@ -19,6 +19,7 @@ import { useLiveAnnouncer } from '~/Providers';
 import { useLocalize } from '~/hooks';
 import { Panel } from '~/common';
 import { cn } from '~/utils';
+import { resolveAgentModelForProvider } from './modelSelection';
 
 export default function ModelPanel({
   providers,
@@ -29,6 +30,7 @@ export default function ModelPanel({
   const { announcePolite } = useLiveAnnouncer();
 
   const { control, setValue } = useFormContext<AgentForm>();
+  const previousProviderRef = useRef<string | undefined>(undefined);
 
   const model = useWatch({ control, name: 'model' });
   const providerOption = useWatch({ control, name: 'provider' });
@@ -48,19 +50,28 @@ export default function ModelPanel({
 
   useEffect(() => {
     const _model = model ?? '';
-    if (provider && _model) {
-      const modelExists = models.includes(_model);
-      if (!modelExists) {
-        const newModels = modelsData[provider] ?? [];
-        setValue('model', newModels[0] ?? '');
-      }
-      localStorage.setItem(LocalStorageKeys.LAST_AGENT_MODEL, _model);
+    if (!provider) {
+      previousProviderRef.current = provider;
+      return;
+    }
+
+    const resolvedModel = resolveAgentModelForProvider({
+      provider,
+      model: _model,
+      availableModels: modelsData[provider] ?? [],
+      previousProvider: previousProviderRef.current,
+    });
+
+    if (resolvedModel !== _model) {
+      setValue('model', resolvedModel);
+    }
+
+    if (resolvedModel) {
+      localStorage.setItem(LocalStorageKeys.LAST_AGENT_MODEL, resolvedModel);
       localStorage.setItem(LocalStorageKeys.LAST_AGENT_PROVIDER, provider);
     }
 
-    if (provider && !_model) {
-      setValue('model', models[0] ?? '');
-    }
+    previousProviderRef.current = provider;
   }, [provider, models, modelsData, setValue, model]);
 
   const { data: endpointsConfig = {} } = useGetEndpointsQuery();
@@ -97,7 +108,7 @@ export default function ModelPanel({
   };
 
   return (
-    <div className="mb-1 flex h-full min-h-[50vh] w-full flex-col gap-2 text-sm">
+    <div className="mx-1 mb-1 flex h-full min-h-[50vh] w-full flex-col gap-2 text-sm">
       <div className="model-panel relative flex flex-col items-center px-16 py-4 text-center">
         <div className="absolute left-0 top-4">
           <button
@@ -116,12 +127,12 @@ export default function ModelPanel({
 
         <div className="mb-2 mt-2 text-xl font-medium">{localize('com_ui_model_parameters')}</div>
       </div>
-      <div>
+      <div className="p-2">
         {/* Endpoint aka Provider for Agents */}
         <div className="mb-4">
           <label
             id="provider-label"
-            className="text-token-text-primary model-panel-label mb-2 block text-sm font-medium"
+            className="text-token-text-primary model-panel-label mb-2 block font-medium"
             htmlFor="provider"
           >
             {localize('com_ui_provider')} <span className="text-red-500">*</span>
@@ -172,7 +183,7 @@ export default function ModelPanel({
           <label
             id="model-label"
             className={cn(
-              'text-token-text-primary model-panel-label mb-2 block text-sm font-medium',
+              'text-token-text-primary model-panel-label mb-2 block font-medium',
               !provider && 'text-gray-500 dark:text-gray-400',
             )}
             htmlFor="model"
@@ -218,7 +229,7 @@ export default function ModelPanel({
       </div>
       {/* Model Parameters */}
       {parameters && (
-        <div className="h-auto max-w-full">
+        <div className="h-auto max-w-full overflow-x-hidden p-2">
           <div className="grid grid-cols-2 gap-4">
             {/* This is the parent element containing all settings */}
             {/* Below is an example of an applied dynamic setting, each be contained by a div with the column span specified */}

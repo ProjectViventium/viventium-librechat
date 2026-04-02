@@ -61,10 +61,6 @@ export const fullMimeTypesList = [
   'application/xml',
   'application/zip',
   'application/x-parquet',
-  'application/vnd.oasis.opendocument.text',
-  'application/vnd.oasis.opendocument.spreadsheet',
-  'application/vnd.oasis.opendocument.presentation',
-  'application/vnd.oasis.opendocument.graphics',
   'image/svg',
   'image/svg+xml',
   // Video formats
@@ -202,13 +198,12 @@ export const defaultOCRMimeTypes = [
   /^application\/vnd\.oasis\.opendocument\.(text|spreadsheet|presentation|graphics)$/,
 ];
 
-/** MIME types handled by the built-in document parser (pdf, docx, excel variants, ods/odt) */
+/** MIME types handled by the built-in document parser (pdf, docx, excel variants, ods) */
 export const documentParserMimeTypes = [
   excelMimeTypes,
   /^application\/pdf$/,
   /^application\/vnd\.openxmlformats-officedocument\.wordprocessingml\.document$/,
   /^application\/vnd\.oasis\.opendocument\.spreadsheet$/,
-  /^application\/vnd\.oasis\.opendocument\.text$/,
 ];
 
 export const defaultTextMimeTypes = [/^[\w.-]+\/[\w.-]+$/];
@@ -243,7 +238,6 @@ export const codeTypeMapping: { [key: string]: string } = {
   py: 'text/x-python', // .py - Python source
   rb: 'text/x-ruby', // .rb - Ruby source
   tex: 'text/x-tex', // .tex - LaTeX source
-  java: 'text/x-java', // .java - Java source
   js: 'text/javascript', // .js - JavaScript source
   sh: 'application/x-sh', // .sh - Shell script
   ts: 'application/typescript', // .ts - TypeScript source
@@ -347,10 +341,6 @@ export const codeTypeMapping: { [key: string]: string } = {
   tcl: 'text/plain', // .tcl - Tcl source
   awk: 'text/plain', // .awk - AWK script
   sed: 'text/plain', // .sed - Sed script
-  odt: 'application/vnd.oasis.opendocument.text', // .odt - OpenDocument Text
-  ods: 'application/vnd.oasis.opendocument.spreadsheet', // .ods - OpenDocument Spreadsheet
-  odp: 'application/vnd.oasis.opendocument.presentation', // .odp - OpenDocument Presentation
-  odg: 'application/vnd.oasis.opendocument.graphics', // .odg - OpenDocument Graphics
 };
 
 /** Maps image extensions to MIME types for formats browsers may not recognize */
@@ -359,21 +349,15 @@ export const imageTypeMapping: { [key: string]: string } = {
   heif: 'image/heif',
 };
 
-/** Normalizes non-standard MIME types that browsers may report to their canonical forms */
-export const mimeTypeAliases: Readonly<Record<string, string>> = {
-  'text/x-python-script': 'text/x-python',
-};
-
 /**
- * Infers the MIME type from a file's extension when the browser doesn't recognize it,
- * and normalizes known non-standard MIME type aliases to their canonical forms.
- * @param fileName - The file name including its extension
- * @param currentType - The MIME type reported by the browser (may be empty string)
- * @returns The normalized or inferred MIME type; empty string if unresolvable
+ * Infers the MIME type from a file's extension when the browser doesn't recognize it
+ * @param fileName - The name of the file including extension
+ * @param currentType - The current MIME type reported by the browser (may be empty)
+ * @returns The inferred MIME type if browser didn't provide one, otherwise the original type
  */
 export function inferMimeType(fileName: string, currentType: string): string {
   if (currentType) {
-    return mimeTypeAliases[currentType] ?? currentType;
+    return currentType;
   }
 
   const extension = fileName.split('.').pop()?.toLowerCase() ?? '';
@@ -442,7 +426,22 @@ export const fileConfig = {
   },
 };
 
-const supportedMimeTypesSchema = z.array(z.string()).optional();
+const supportedMimeTypesSchema = z
+  .array(z.any())
+  .optional()
+  .refine(
+    (mimeTypes) => {
+      if (!mimeTypes) {
+        return true;
+      }
+      return mimeTypes.every(
+        (mimeType) => mimeType instanceof RegExp || typeof mimeType === 'string',
+      );
+    },
+    {
+      message: 'Each mimeType must be a string or a RegExp object.',
+    },
+  );
 
 export const endpointFileConfigSchema = z.object({
   disabled: z.boolean().optional(),
@@ -675,24 +674,22 @@ export function mergeFileConfig(dynamic: z.infer<typeof fileConfigSchema> | unde
   }
 
   if (dynamic.ocr !== undefined) {
-    const { supportedMimeTypes: ocrMimeTypes, ...ocrRest } = dynamic.ocr;
     mergedConfig.ocr = {
       ...mergedConfig.ocr,
-      ...ocrRest,
+      ...dynamic.ocr,
     };
-    if (ocrMimeTypes) {
-      mergedConfig.ocr.supportedMimeTypes = convertStringsToRegex(ocrMimeTypes);
+    if (dynamic.ocr.supportedMimeTypes) {
+      mergedConfig.ocr.supportedMimeTypes = convertStringsToRegex(dynamic.ocr.supportedMimeTypes);
     }
   }
 
   if (dynamic.text !== undefined) {
-    const { supportedMimeTypes: textMimeTypes, ...textRest } = dynamic.text;
     mergedConfig.text = {
       ...mergedConfig.text,
-      ...textRest,
+      ...dynamic.text,
     };
-    if (textMimeTypes) {
-      mergedConfig.text.supportedMimeTypes = convertStringsToRegex(textMimeTypes);
+    if (dynamic.text.supportedMimeTypes) {
+      mergedConfig.text.supportedMimeTypes = convertStringsToRegex(dynamic.text.supportedMimeTypes);
     }
   }
 

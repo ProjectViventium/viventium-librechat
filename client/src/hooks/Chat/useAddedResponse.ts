@@ -1,4 +1,4 @@
-import { useCallback, useMemo } from 'react';
+import { useCallback } from 'react';
 import { useRecoilValue } from 'recoil';
 import { useGetModelsQuery } from 'librechat-data-provider/react-query';
 import {
@@ -122,12 +122,9 @@ export default function useAddedResponse() {
     ],
   );
 
-  return useMemo(
-    () => ({
-      conversation,
-      setConversation,
-      generateConversation,
-    }),
-    [conversation, setConversation, generateConversation],
-  );
+  return {
+    conversation,
+    setConversation,
+    generateConversation,
+  };
 }

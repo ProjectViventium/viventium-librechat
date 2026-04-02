@@ -192,8 +192,8 @@ describe('MemoryInfo', () => {
       render(<MemoryInfo memoryArtifacts={memoryArtifacts} />);
 
       // Should render generic error message
-      expect(screen.getByText('Memory Storage Full')).toBeInTheDocument();
-      expect(screen.getByText('Memory Error')).toBeInTheDocument();
+      expect(screen.getByRole('heading', { name: 'Memory Error' })).toBeInTheDocument();
+      expect(screen.getAllByText('Memory Error')).toHaveLength(2);
     });
 
     test('handles missing value in error artifact', () => {
@@ -207,8 +207,8 @@ describe('MemoryInfo', () => {
 
       render(<MemoryInfo memoryArtifacts={memoryArtifacts} />);
 
-      expect(screen.getByText('Memory Storage Full')).toBeInTheDocument();
-      expect(screen.getByText('Memory Error')).toBeInTheDocument();
+      expect(screen.getByRole('heading', { name: 'Memory Error' })).toBeInTheDocument();
+      expect(screen.getAllByText('Memory Error')).toHaveLength(2);
     });
 
     test('handles unknown errorType gracefully', () => {
@@ -223,8 +223,32 @@ describe('MemoryInfo', () => {
       render(<MemoryInfo memoryArtifacts={memoryArtifacts} />);
 
       // Should show generic error message for unknown types
-      expect(screen.getByText('Memory Storage Full')).toBeInTheDocument();
+      expect(screen.getByRole('heading', { name: 'Memory Error' })).toBeInTheDocument();
+      expect(screen.getAllByText('Memory Error')).toHaveLength(2);
+    });
+
+    test('renders backend-provided per-key budget messages without mislabeling them as storage full', () => {
+      const memoryArtifacts: MemoryArtifact[] = [
+        {
+          type: 'error',
+          key: 'system',
+          value: JSON.stringify({
+            errorType: 'key_limit_exceeded',
+            key: 'drafts',
+            keyLimit: 1000,
+            projectedKeyTokens: 1027,
+            message: 'Memory key "drafts" would exceed its 1000-token budget.',
+          }),
+        },
+      ];
+
+      render(<MemoryInfo memoryArtifacts={memoryArtifacts} />);
+
       expect(screen.getByText('Memory Error')).toBeInTheDocument();
+      expect(
+        screen.getByText('Memory key "drafts" would exceed its 1000-token budget.'),
+      ).toBeInTheDocument();
+      expect(screen.queryByText('Memory Storage Full')).not.toBeInTheDocument();
     });
 
     test('returns null when no memories of any type exist', () => {

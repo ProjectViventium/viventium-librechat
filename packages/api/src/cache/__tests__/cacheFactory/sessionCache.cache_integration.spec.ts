@@ -1,36 +1,33 @@
-import type { MemoryStore, SessionData } from 'express-session';
-import type { RedisStore as ConnectRedis } from 'connect-redis';
-
-interface TestSessionData {
+interface SessionData {
   [key: string]: unknown;
   cookie?: { maxAge: number };
   user?: { id: string; name: string };
   userId?: string;
 }
 
-type CacheSessionStore = MemoryStore | ConnectRedis;
+interface SessionStore {
+  prefix?: string;
+  set: (id: string, data: SessionData, callback?: (err?: Error) => void) => void;
+  get: (id: string, callback: (err: Error | null, data?: SessionData | null) => void) => void;
+  destroy: (id: string, callback?: (err?: Error) => void) => void;
+  touch: (id: string, data: SessionData, callback?: (err?: Error) => void) => void;
+  on?: (event: string, handler: (...args: unknown[]) => void) => void;
+}
 
 describe('sessionCache', () => {
   let originalEnv: NodeJS.ProcessEnv;
 
-  // Helper to make session stores async — uses generic store type to bridge
-  // between MemoryStore/ConnectRedis and the test's relaxed SessionData shape.
-  // The store methods accept express-session's SessionData but test data is
-  // intentionally simpler; the cast bridges the gap for integration tests.
-  const asyncStore = (store: CacheSessionStore) => ({
-    set: (id: string, data: TestSessionData) =>
-      new Promise<void>((resolve) =>
-        store.set(id, data as Partial<SessionData> as SessionData, () => resolve()),
-      ),
+  // Helper to make session stores async
+  const asyncStore = (store: SessionStore) => ({
+    set: (id: string, data: SessionData) =>
+      new Promise<void>((resolve) => store.set(id, data, () => resolve())),
     get: (id: string) =>
-      new Promise<TestSessionData | null | undefined>((resolve) =>
-        store.get(id, (_, data) => resolve(data as TestSessionData | null | undefined)),
+      new Promise<SessionData | null | undefined>((resolve) =>
+        store.get(id, (_, data) => resolve(data)),
       ),
     destroy: (id: string) => new Promise<void>((resolve) => store.destroy(id, () => resolve())),
-    touch: (id: string, data: TestSessionData) =>
-      new Promise<void>((resolve) =>
-        store.touch(id, data as Partial<SessionData> as SessionData, () => resolve()),
-      ),
+    touch: (id: string, data: SessionData) =>
+      new Promise<void>((resolve) => store.touch(id, data, () => resolve())),
   });
 
   beforeEach(() => {
@@ -69,11 +66,11 @@ describe('sessionCache', () => {
     // Verify it returns a ConnectRedis instance
     expect(store).toBeDefined();
     expect(store.constructor.name).toBe('RedisStore');
-    expect((store as CacheSessionStore & { prefix: string }).prefix).toBe('test-sessions:');
+    expect(store.prefix).toBe('test-sessions:');
 
     // Test session operations
     const sessionId = 'sess:123456';
-    const sessionData: TestSessionData = {
+    const sessionData: SessionData = {
       user: { id: 'user123', name: 'Test User' },
       cookie: { maxAge: 3600000 },
     };
@@ -110,7 +107,7 @@ describe('sessionCache', () => {
 
     // Test session operations
     const sessionId = 'mem:789012';
-    const sessionData: TestSessionData = {
+    const sessionData: SessionData = {
       user: { id: 'user456', name: 'Memory User' },
       cookie: { maxAge: 3600000 },
     };
@@ -138,8 +135,8 @@ describe('sessionCache', () => {
     const store1 = cacheFactory.sessionCache('namespace1');
     const store2 = cacheFactory.sessionCache('namespace2:');
 
-    expect((store1 as CacheSessionStore & { prefix: string }).prefix).toBe('namespace1:');
-    expect((store2 as CacheSessionStore & { prefix: string }).prefix).toBe('namespace2:');
+    expect(store1.prefix).toBe('namespace1:');
+    expect(store2.prefix).toBe('namespace2:');
   });
 
   test('should register error handler for Redis connection', async () => {
@@ -174,7 +171,7 @@ describe('sessionCache', () => {
     }
 
     const sessionId = 'ttl:12345';
-    const sessionData: TestSessionData = { userId: 'ttl-user' };
+    const sessionData: SessionData = { userId: 'ttl-user' };
     const async = asyncStore(store);
 
     // Set session with short TTL

@@ -21,9 +21,13 @@ export interface IMongoFile extends Omit<Document, 'model'> {
   height?: number;
   metadata?: {
     fileIdentifier?: string;
+    conversationRecallSourceDigest?: string;
+    conversationRecallUploadedDigest?: string;
+    conversationRecallDigest?: string;
+    conversationRecallTurnCount?: number;
+    conversationRecallCharCount?: number;
   };
   expiresAt?: Date;
   createdAt?: Date;
   updatedAt?: Date;
-  tenantId?: string;
 }

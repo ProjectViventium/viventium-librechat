@@ -1,0 +1,128 @@
+{
+  "_description": "All 12 supported programming languages",
+  "_version": "1.0.0",
+
+  "languages": {
+    "py": {
+      "name": "Python",
+      "execution_type": "stdin",
+      "file_extension": ".py",
+      "example_code": "print('Hello Python')",
+      "timeout_multiplier": 1.0,
+      "memory_multiplier": 1.0
+    },
+    "js": {
+      "name": "JavaScript (Node.js)",
+      "execution_type": "stdin",
+      "file_extension": ".js",
+      "example_code": "console.log('Hello JavaScript')",
+      "timeout_multiplier": 1.0,
+      "memory_multiplier": 1.0
+    },
+    "ts": {
+      "name": "TypeScript",
+      "execution_type": "file",
+      "file_extension": ".ts",
+      "example_code": "console.log('Hello TypeScript')",
+      "timeout_multiplier": 1.2,
+      "memory_multiplier": 1.0
+    },
+    "go": {
+      "name": "Go",
+      "execution_type": "file",
+      "file_extension": ".go",
+      "example_code": "package main\nimport \"fmt\"\nfunc main() { fmt.Println(\"Hello Go\") }",
+      "timeout_multiplier": 1.5,
+      "memory_multiplier": 1.2
+    },
+    "java": {
+      "name": "Java",
+      "execution_type": "file",
+      "file_extension": ".java",
+      "example_code": "public class Code { public static void main(String[] args) { System.out.println(\"Hello Java\"); } }",
+      "timeout_multiplier": 2.0,
+      "memory_multiplier": 1.5,
+      "notes": "Class must be named 'Code'"
+    },
+    "c": {
+      "name": "C",
+      "execution_type": "file",
+      "file_extension": ".c",
+      "example_code": "#include <stdio.h>\nint main() { printf(\"Hello C\\n\"); return 0; }",
+      "timeout_multiplier": 1.5,
+      "memory_multiplier": 1.0
+    },
+    "cpp": {
+      "name": "C++",
+      "execution_type": "file",
+      "file_extension": ".cpp",
+      "example_code": "#include <iostream>\nint main() { std::cout << \"Hello C++\" << std::endl; return 0; }",
+      "timeout_multiplier": 1.5,
+      "memory_multiplier": 1.0
+    },
+    "php": {
+      "name": "PHP",
+      "execution_type": "stdin",
+      "file_extension": ".php",
+      "example_code": "<?php echo \"Hello PHP\\n\"; ?>",
+      "timeout_multiplier": 1.0,
+      "memory_multiplier": 1.0
+    },
+    "rs": {
+      "name": "Rust",
+      "execution_type": "file",
+      "file_extension": ".rs",
+      "example_code": "fn main() { println!(\"Hello Rust\"); }",
+      "timeout_multiplier": 2.0,
+      "memory_multiplier": 1.2
+    },
+    "r": {
+      "name": "R",
+      "execution_type": "stdin",
+      "file_extension": ".r",
+      "example_code": "print(\"Hello R\")",
+      "timeout_multiplier": 1.5,
+      "memory_multiplier": 1.0
+    },
+    "f90": {
+      "name": "Fortran",
+      "execution_type": "file",
+      "file_extension": ".f90",
+      "example_code": "program hello\n  print *, \"Hello Fortran\"\nend program hello",
+      "timeout_multiplier": 1.5,
+      "memory_multiplier": 1.0
+    },
+    "d": {
+      "name": "D",
+      "execution_type": "file",
+      "file_extension": ".d",
+      "example_code": "import std.stdio; void main() { writeln(\"Hello D\"); }",
+      "timeout_multiplier": 2.0,
+      "memory_multiplier": 1.2
+    }
+  },
+
+  "valid_lang_codes": [
+    "py",
+    "js",
+    "ts",
+    "go",
+    "java",
+    "c",
+    "cpp",
+    "php",
+    "rs",
+    "r",
+    "f90",
+    "d"
+  ],
+
+  "invalid_codes_examples": [
+    "python",
+    "javascript",
+    "c++",
+    "rust",
+    "fortran",
+    "golang"
+  ]
+}

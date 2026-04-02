@@ -1,0 +1,596 @@
+/* === VIVENTIUM START ===
+ * Feature: Surface-aware prompt helpers (voice, web, telegram, playground)
+ *
+ * Purpose:
+ * - Centralize surface detection and formatting instructions.
+ * - Keep main agents and background cortices aligned on output style.
+ *
+ * Added: 2026-01-15
+ * === VIVENTIUM END === */
+
+function resolveViventiumSurface(req) {
+  const bodySurface = (req?.body?.viventiumSurface || '').toString().toLowerCase();
+  if (bodySurface) {
+    return bodySurface;
+  }
+  const headerSurface = (req?.headers?.['x-viventium-surface'] || '').toString().toLowerCase();
+  if (headerSurface) {
+    return headerSurface;
+  }
+  const url = (req?.originalUrl || req?.baseUrl || req?.path || '').toString().toLowerCase();
+  if (url.includes('/viventium/telegram')) {
+    return 'telegram';
+  }
+  if (url.includes('/viventium/voice')) {
+    return 'voice';
+  }
+  return '';
+}
+
+function buildVoiceModeInstructions(voiceProvider) {
+  const override = (process.env.VIVENTIUM_VOICE_MODE_PROMPT || '').trim();
+  if (override) {
+    return override;
+  }
+
+  const baseRules = [
+    'VOICE MODE:',
+    '- Respond as spoken audio. Use short sentences. No markdown, lists, or code blocks.',
+    '- Do not output planning steps or tool instructions.',
+    '- Do not read URLs or email addresses aloud; offer to send details instead.',
+    '- Use natural language for dates/times (no raw timestamps).',
+    '- Keep responses concise (1-4 sentences) unless the user asks for detail.',
+    '- If the user includes [voice], treat it as a strict voice-mode tag.',
+  ];
+
+  const provider = (voiceProvider || '').toLowerCase();
+  if (provider.includes('chatterbox')) {
+    return [
+      ...baseRules,
+      // Conservative set only: keep markers that reliably render as nonverbal audio in local MLX tests.
+      '- Allowed nonverbal markers (use exactly these tokens): [laugh], [sigh], [gasp].',
+      '- Put nonverbal markers on their own line or between sentences (do not embed inside a sentence).',
+      '- Do NOT invent other bracketed stage directions.',
+      '- Do NOT use <emotion .../> tags (those are Cartesia-only).',
+    ].join('\n');
+  }
+  if (provider === 'cartesia') {
+    return [
+      ...baseRules,
+      '- Allowed nonverbal markers (use exactly these tokens): [laughter], [sigh], [gasp], [breath], [hmm].',
+      '- Put nonverbal markers on their own line or between sentences (do not embed inside a sentence).',
+      '- Do NOT invent other bracketed stage directions.',
+      /* === VIVENTIUM NOTE ===
+       * Feature: Cartesia SSML emotion parity (self-closing tags).
+       * Purpose: Align the model-facing contract with Cartesia docs and our adapter parsing.
+       * Updated 2026-02-22: Added recommended emotion list (Cartesia primary set) and <break> guidance.
+       */
+      '- Optional emotion control (preferred): <emotion value="excited"/> before a sentence to set the tone for subsequent text (until changed).',
+      '- Optional wrapper form (also supported): <emotion value="excited">TEXT</emotion> to apply emotion to a specific phrase only.',
+      '- Recommended emotions (most reliable): neutral, excited, content, sad, angry, scared, curious, calm, surprised, contemplative.',
+      '- Use <break time="1s"/> for natural pauses between thoughts (supports seconds "1s" or milliseconds "500ms").',
+      '- If demoing emotions, change emotion once per sentence and avoid extra preamble.',
+      /* === VIVENTIUM NOTE === */
+    ].join('\n');
+  }
+
+  /* === VIVENTIUM NOTE ===
+   * Feature: xAI Grok Voice prompt guard.
+   * Purpose: xAI Grok Voice is a conversational voice model that interprets bracket
+   * stage markers as directions to perform (e.g., [laugh] → actually laugh).
+   * Instruct the LLM to generate bracket markers and avoid Cartesia SSML.
+   * Added 2026-02-22.
+   */
+  if (provider === 'xai') {
+    return [
+      ...baseRules,
+      '- Allowed nonverbal markers (use exactly these tokens): [laugh], [sigh], [gasp], [whisper], [hmm], [chuckle].',
+      '- Put nonverbal markers on their own line or between sentences (do not embed inside a sentence).',
+      '- Do NOT invent other bracketed stage directions.',
+      '- Do NOT use <emotion .../> or any XML/SSML-like tags.',
+      '- Express tone naturally and let the voice model interpret the energy of your words.',
+    ].join('\n');
+  }
+  /* === VIVENTIUM NOTE === */
+
+  /* === VIVENTIUM NOTE ===
+   * Feature: Non-Cartesia prompt guard (ElevenLabs, OpenAI).
+   * Purpose: After TTS fallback, prevent LLM from continuing to emit
+   * Cartesia-specific SSML/stage markers that would be spoken literally
+   * by providers that do not support them.
+   */
+  if (provider === 'openai' || provider === 'elevenlabs') {
+    return [
+      ...baseRules,
+      '- Do NOT use <emotion .../> or any XML/SSML-like tags.',
+      '- Do NOT use bracketed stage directions like [laugh], [laughter], or [sigh].',
+      '- Express tone and emotion through natural word choice and sentence structure only.',
+    ].join('\n');
+  }
+  /* === VIVENTIUM NOTE === */
+
+  return baseRules.join('\n');
+}
+
+function buildTelegramTextInstructions() {
+  const override = (process.env.VIVENTIUM_TELEGRAM_TEXT_MODE_PROMPT || '').trim();
+  if (override) {
+    return override;
+  }
+  return [
+    'TELEGRAM TEXT MODE:',
+    '- Use standard Markdown formatting (bold, italic, inline code, code blocks, block quotes).',
+    '- Do NOT use Telegram MarkdownV2 escaping (no backslash-escaped punctuation like \\. \\- \\!).',
+    '- Avoid markdown tables, heading syntax (#), and HTML.',
+    '- Use short bold section titles and bullet lists; keep paragraphs short.',
+    '- If sources are helpful, include plain URLs on a "Sources" line (no markdown links, no citation markers).',
+  ].join('\n');
+}
+
+function buildWebTextInstructions() {
+  const override = (process.env.VIVENTIUM_WEB_TEXT_MODE_PROMPT || '').trim();
+  if (override) {
+    return override;
+  }
+  return [
+    'WEB TEXT MODE:',
+    '- Use standard Markdown formatting (bold, italic, inline code, code blocks, block quotes).',
+    '- Prefer short paragraphs and bullet lists when they improve scanability.',
+    '- Avoid markdown tables, heading syntax (#), and HTML.',
+    '- If sources are helpful, include plain URLs on a "Sources" line (no markdown links, no citation markers).',
+  ].join('\n');
+}
+
+function buildPlaygroundTextInstructions() {
+  const override = (process.env.VIVENTIUM_PLAYGROUND_TEXT_MODE_PROMPT || '').trim();
+  if (override) {
+    return override;
+  }
+  return [
+    'PLAYGROUND TEXT MODE:',
+    '- Respond conversationally in plain text.',
+    '- Avoid markdown formatting, lists, tables, and citation markers.',
+  ].join('\n');
+}
+
+function buildVoiceNoteInputInstructions() {
+  const override = (process.env.VIVENTIUM_TELEGRAM_VOICE_NOTE_PROMPT || '').trim();
+  if (override) {
+    return override;
+  }
+  return [
+    'INPUT MODE: TELEGRAM VOICE NOTE TRANSCRIPTION',
+    '- The user spoke this request; transcription may contain minor errors.',
+    '- Ask a clarifying question if the wording seems ambiguous.',
+  ].join('\n');
+}
+
+function buildVoiceCallInputInstructions() {
+  const override = (process.env.VIVENTIUM_VOICE_CALL_INPUT_PROMPT || '').trim();
+  if (override) {
+    return override;
+  }
+  return [
+    'INPUT MODE: LIVE VOICE CALL',
+    '- The user is speaking in real time; prioritize quick, spoken responses.',
+    '- Avoid long lists, URLs, and email addresses; offer to send details via text.',
+  ].join('\n');
+}
+
+function buildWingModeInstructions() {
+  const override =
+    (process.env.VIVENTIUM_WING_MODE_PROMPT || '').trim() ||
+    (process.env.VIVENTIUM_SHADOW_MODE_PROMPT || '').trim();
+  if (override) {
+    return override;
+  }
+  return [
+    'WING MODE:',
+    '- You are in Wing Mode during a live voice call: quietly aware, helpful, and unobtrusive.',
+    '- Treat TV, podcasts, videos, songs, meetings, and nearby chatter as background context unless the user is clearly talking to you.',
+    '- If you are not sure the user is addressing you, output exactly {NTA}.',
+    '- Err aggressively on the side of silence.',
+  ].join('\n');
+}
+
+function isWingModeEnabledForRequest(req, inputMode) {
+  if ((inputMode || '').toString().toLowerCase() !== 'voice_call') {
+    return false;
+  }
+
+  const session = req?.viventiumCallSession;
+  if (!session || typeof session !== 'object') {
+    return false;
+  }
+  if (typeof session.wingModeEnabled === 'boolean') {
+    return session.wingModeEnabled;
+  }
+  if (typeof session.shadowModeEnabled === 'boolean') {
+    return session.shadowModeEnabled;
+  }
+  return false;
+}
+
+function buildCortexOutputInstructions({ voiceMode, surface, inputMode }) {
+  const override = (process.env.VIVENTIUM_CORTEX_OUTPUT_RULES || '').trim();
+  if (override) {
+    return override;
+  }
+
+  const voiceInput =
+    voiceMode === true ||
+    surface === 'voice' ||
+    inputMode === 'voice_note' ||
+    inputMode === 'voice_call';
+
+  const lines = [
+    'CORTEX OUTPUT RULES:',
+    '- Provide only a concise, user-facing summary of the results.',
+    '- Do NOT include internal plans, tool instructions, or API field names.',
+    '- Do NOT include citation markers.',
+  ];
+
+  if (voiceInput) {
+    lines.push(
+      '- Output plain conversational text (no markdown, no lists, no tables).',
+      '- Do not read URLs or email addresses aloud; offer to send details.',
+      '- Use natural language for dates/times (no raw timestamps).',
+      '- Keep it to 1-3 short sentences unless the user asked for more detail.',
+      /* === VIVENTIUM NOTE ===
+       * Feature: Prevent cortex outputs from containing TTS-specific markup.
+       * Purpose: Cortex outputs feed into follow-up voice speech. Tags would be spoken literally
+       * by non-Cartesia providers or appear raw in persisted messages.
+       * Added: 2026-02-22
+       */
+      '- Do NOT use emotion tags, SSML tags, or bracketed stage directions (e.g., [laughter]).',
+      /* === VIVENTIUM NOTE END === */
+    );
+  } else if (surface === 'telegram') {
+    lines.push(
+      '- Use standard Markdown formatting; avoid tables, heading syntax (#), and MarkdownV2 backslash escaping.',
+      '- Keep paragraphs short and use simple bullet lists when helpful.',
+    );
+  } else if (surface === 'playground') {
+    lines.push('- Output plain conversational text (no markdown, no lists, no tables).');
+  } else {
+    lines.push(
+      '- Use standard Markdown formatting; prefer short paragraphs and bullet lists when they improve clarity.',
+      '- Avoid markdown tables, heading syntax (#), and HTML.',
+    );
+  }
+
+  return lines.join('\n');
+}
+
+/* === VIVENTIUM NOTE ===
+ * Feature: Timezone validation helpers for time context injection
+ *
+ * Purpose:
+ * - Prevent invalid timezones from silently producing UTC output.
+ * - Normalize and validate client-provided timezones before formatting.
+ * - Ensure the label matches the actual timezone used.
+ *
+ * Added: 2026-02-01
+ * === VIVENTIUM NOTE === */
+const TIMEZONE_VALIDATION_CACHE = new Map();
+
+function normalizeTimezone(value) {
+  if (typeof value !== 'string') {
+    return '';
+  }
+  return value.trim();
+}
+
+function isValidTimezone(timezone) {
+  const normalized = normalizeTimezone(timezone);
+  if (!normalized) {
+    return false;
+  }
+  const isIanaLike =
+    normalized.includes('/') ||
+    normalized === 'UTC' ||
+    normalized === 'GMT' ||
+    normalized.startsWith('UTC') ||
+    normalized.startsWith('GMT') ||
+    normalized.startsWith('Etc/');
+  if (!isIanaLike) {
+    TIMEZONE_VALIDATION_CACHE.set(normalized, false);
+    return false;
+  }
+  if (TIMEZONE_VALIDATION_CACHE.has(normalized)) {
+    return TIMEZONE_VALIDATION_CACHE.get(normalized);
+  }
+  try {
+    Intl.DateTimeFormat('en-US', { timeZone: normalized }).format(new Date());
+    TIMEZONE_VALIDATION_CACHE.set(normalized, true);
+    return true;
+  } catch (_err) {
+    TIMEZONE_VALIDATION_CACHE.set(normalized, false);
+    return false;
+  }
+}
+
+function resolveTimeContextTimezone({ clientTimezone, defaultTimezone }) {
+  const normalizedClient = normalizeTimezone(clientTimezone);
+  const normalizedDefault = normalizeTimezone(defaultTimezone);
+
+  if (normalizedClient && isValidTimezone(normalizedClient)) {
+    return normalizedClient;
+  }
+  if (normalizedDefault && isValidTimezone(normalizedDefault)) {
+    return normalizedDefault;
+  }
+  return 'UTC';
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Timezone-safe parsing for naive client timestamps
+ *
+ * Purpose:
+ * - Interpret naive timestamps (no offset) as wall-clock time in the resolved client timezone.
+ * - Remove dependency on container/server TZ when building "Current time: ...".
+ * - Keep explicit ISO timestamps with offsets/Z behavior unchanged.
+ *
+ * Added: 2026-02-19
+ * === VIVENTIUM END === */
+const NAIVE_TIMESTAMP_REGEX = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/;
+const TIMEZONE_PARTS_FORMATTER_CACHE = new Map();
+
+function hasExplicitTimezone(timestamp) {
+  return /(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(timestamp);
+}
+
+function parseNaiveTimestamp(timestamp) {
+  const match = timestamp.match(NAIVE_TIMESTAMP_REGEX);
+  if (!match) {
+    return null;
+  }
+
+  const millisecondSource = match[7] ? match[7].padEnd(3, '0') : '0';
+  return {
+    year: Number(match[1]),
+    month: Number(match[2]),
+    day: Number(match[3]),
+    hour: Number(match[4]),
+    minute: Number(match[5]),
+    second: Number(match[6] || '0'),
+    millisecond: Number(millisecondSource),
+  };
+}
+
+function getTimeZonePartsFormatter(timeZone) {
+  if (TIMEZONE_PARTS_FORMATTER_CACHE.has(timeZone)) {
+    return TIMEZONE_PARTS_FORMATTER_CACHE.get(timeZone);
+  }
+
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  });
+  TIMEZONE_PARTS_FORMATTER_CACHE.set(timeZone, formatter);
+  return formatter;
+}
+
+function extractTimeZoneParts(dateObj, timeZone) {
+  const formatter = getTimeZonePartsFormatter(timeZone);
+  const tokens = formatter.formatToParts(dateObj);
+  const values = {};
+
+  for (const token of tokens) {
+    if (
+      token.type === 'year' ||
+      token.type === 'month' ||
+      token.type === 'day' ||
+      token.type === 'hour' ||
+      token.type === 'minute' ||
+      token.type === 'second'
+    ) {
+      values[token.type] = Number(token.value);
+    }
+  }
+
+  if (
+    !Number.isFinite(values.year) ||
+    !Number.isFinite(values.month) ||
+    !Number.isFinite(values.day) ||
+    !Number.isFinite(values.hour) ||
+    !Number.isFinite(values.minute) ||
+    !Number.isFinite(values.second)
+  ) {
+    return null;
+  }
+
+  return values;
+}
+
+function getTimezoneOffsetMinutesAtInstant(dateObj, timeZone) {
+  const parts = extractTimeZoneParts(dateObj, timeZone);
+  if (!parts) {
+    return null;
+  }
+
+  const asUtcMs = Date.UTC(
+    parts.year,
+    parts.month - 1,
+    parts.day,
+    parts.hour,
+    parts.minute,
+    parts.second,
+  );
+  return Math.round((asUtcMs - dateObj.getTime()) / 60000);
+}
+
+function resolveNaiveTimestampToDate(parts, timeZone) {
+  if (!parts || !isValidTimezone(timeZone)) {
+    return null;
+  }
+
+  const baseUtcMs = Date.UTC(
+    parts.year,
+    parts.month - 1,
+    parts.day,
+    parts.hour,
+    parts.minute,
+    parts.second,
+    parts.millisecond,
+  );
+
+  let candidateMs = baseUtcMs;
+  for (let i = 0; i < 3; i += 1) {
+    const offsetMinutes = getTimezoneOffsetMinutesAtInstant(new Date(candidateMs), timeZone);
+    if (!Number.isFinite(offsetMinutes)) {
+      return null;
+    }
+
+    const nextCandidateMs = baseUtcMs - offsetMinutes * 60 * 1000;
+    if (nextCandidateMs === candidateMs) {
+      break;
+    }
+    candidateMs = nextCandidateMs;
+  }
+
+  const resolved = new Date(candidateMs);
+  return Number.isNaN(resolved.getTime()) ? null : resolved;
+}
+
+function parseClientTimestamp(clientTimestamp, timeZone) {
+  if (typeof clientTimestamp !== 'string') {
+    return null;
+  }
+
+  const normalized = clientTimestamp.trim();
+  if (!normalized) {
+    return null;
+  }
+
+  if (hasExplicitTimezone(normalized)) {
+    const parsed = new Date(normalized);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+  }
+
+  const naiveParts = parseNaiveTimestamp(normalized);
+  if (naiveParts) {
+    return resolveNaiveTimestampToDate(naiveParts, timeZone);
+  }
+
+  const parsed = new Date(normalized);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+/* === VIVENTIUM NOTE ===
+ * Feature: Time context injection for scheduling awareness
+ *
+ * Purpose:
+ * - Provide LLM with user's current local time for scheduling tasks.
+ * - Uses clientTimestamp + clientTimezone from request if available.
+ * - Falls back to server time + default timezone.
+ * - Ensures invalid timezones do not silently force UTC while keeping a stale label.
+ *
+ * Added: 2026-01-31
+ * Updated: 2026-02-01
+ * === VIVENTIUM NOTE === */
+function buildTimeContextInstructions(req) {
+  const override = (process.env.VIVENTIUM_TIME_CONTEXT_PROMPT || '').trim();
+  if (override) {
+    return override;
+  }
+
+  // Skip if explicitly disabled
+  if (process.env.VIVENTIUM_TIME_CONTEXT_DISABLED === '1') {
+    return '';
+  }
+
+  const body = req?.body || {};
+  const clientTimestamp = body.clientTimestamp;
+  const resolvedTimezone = resolveTimeContextTimezone({
+    clientTimezone: body.clientTimezone,
+    defaultTimezone: process.env.VIVENTIUM_DEFAULT_TIMEZONE,
+  });
+
+  const dateObj = parseClientTimestamp(clientTimestamp, resolvedTimezone) || new Date();
+
+  // Format in user's timezone with human-readable output
+  let formatted;
+  try {
+    formatted = dateObj.toLocaleString('en-US', {
+      timeZone: resolvedTimezone,
+      weekday: 'long',
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+    });
+  } catch (_err) {
+    // Invalid timezone - fall back to UTC
+    formatted = dateObj.toLocaleString('en-US', {
+      timeZone: 'UTC',
+      weekday: 'long',
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+    });
+  }
+
+  return `Current time: ${formatted} (${resolvedTimezone})`;
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Strip voice control tags for display/persistence.
+ * Purpose: Remove Cartesia SSML, bracket nonverbal markers, and other TTS-specific
+ * markup from text before it is displayed in the UI or persisted to the database.
+ * This prevents raw tags like <emotion value="excited"/> and [laughter] from appearing
+ * in conversation transcripts.
+ * Added: 2026-02-22
+ * === VIVENTIUM END === */
+const _DISPLAY_EMOTION_SELF_CLOSING_RE = /<emotion\s+value=["']?[^"'>]+["']?\s*\/>/gi;
+const _DISPLAY_EMOTION_WRAPPER_RE = /<emotion\s+value=["']?[^"'>]+["']?\s*>(.*?)<\/emotion>/gis;
+const _DISPLAY_SPEAK_RE = /<\/?speak[^>]*>/gi;
+const _DISPLAY_BREAK_RE = /<break\s+time=["']?[^"'>]+["']?\s*\/>/gi;
+const _DISPLAY_SPEED_RE = /<speed\s+ratio=["']?[^"'>]+["']?\s*\/>/gi;
+const _DISPLAY_VOLUME_RE = /<volume\s+ratio=["']?[^"'>]+["']?\s*\/>/gi;
+const _DISPLAY_SPELL_RE = /<spell>(.*?)<\/spell>/gis;
+const _DISPLAY_BRACKET_NONVERBAL_RE =
+  /\[(?:laugh(?:ter)?|giggle|chuckle|soft laugh|gentle laugh|quiet laugh|nervous laugh|awkward laugh|light laugh|sigh|gentle sigh|soft sigh|breath|breath in|breath out|inhale|exhale|gasp|whisper|hmm|hm)\]/gi;
+
+function stripVoiceControlTagsForDisplay(text) {
+  if (!text) {
+    return '';
+  }
+  let cleaned = text;
+  cleaned = cleaned.replace(_DISPLAY_SPEAK_RE, '');
+  cleaned = cleaned.replace(_DISPLAY_EMOTION_SELF_CLOSING_RE, '');
+  cleaned = cleaned.replace(_DISPLAY_EMOTION_WRAPPER_RE, '$1');
+  cleaned = cleaned.replace(_DISPLAY_BREAK_RE, '');
+  cleaned = cleaned.replace(_DISPLAY_SPEED_RE, '');
+  cleaned = cleaned.replace(_DISPLAY_VOLUME_RE, '');
+  cleaned = cleaned.replace(_DISPLAY_SPELL_RE, '$1');
+  cleaned = cleaned.replace(_DISPLAY_BRACKET_NONVERBAL_RE, '');
+  cleaned = cleaned.replace(/[ \t]{2,}/g, ' ');
+  return cleaned.trim();
+}
+
+module.exports = {
+  resolveViventiumSurface,
+  buildVoiceModeInstructions,
+  buildTelegramTextInstructions,
+  buildWebTextInstructions,
+  buildPlaygroundTextInstructions,
+  buildVoiceNoteInputInstructions,
+  buildVoiceCallInputInstructions,
+  buildWingModeInstructions,
+  isWingModeEnabledForRequest,
+  buildCortexOutputInstructions,
+  buildTimeContextInstructions,
+  stripVoiceControlTagsForDisplay,
+};

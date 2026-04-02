@@ -611,6 +611,294 @@ describe('getOpenAIConfig', () => {
     });
   });
 
+  /* === VIVENTIUM START ===
+   * Feature: OpenAI Connected Accounts (Codex bridge regression coverage).
+   * Purpose: Ensure Codex payload normalization and stream/non-stream behavior remain
+   * compatible while preserving real-time token delivery semantics.
+   * === VIVENTIUM END === */
+  it('should normalize Codex responses payload for connected account requests', async () => {
+    const originalFetch = globalThis.fetch;
+    const mockFetch = jest.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+        },
+      });
+    });
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+
+    try {
+      const result = getOpenAIConfig(mockApiKey, {
+        reverseProxyUrl: 'https://chatgpt.com/backend-api/codex',
+      });
+
+      const wrappedFetch = result.configOptions?.fetch;
+      expect(wrappedFetch).toBeDefined();
+
+      await wrappedFetch?.('https://chatgpt.com/backend-api/codex/responses', {
+        method: 'POST',
+        body: JSON.stringify({
+          model: 'gpt-5.2',
+          input: [{ type: 'message', role: 'user', content: 'hello' }],
+          store: true,
+          stream: false,
+          user: 'test-user-id',
+        }),
+      });
+
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      const sentInit = mockFetch.mock.calls[0]?.[1] as RequestInit;
+      const sentPayload = JSON.parse(String(sentInit.body));
+      expect(sentPayload.store).toBe(false);
+      expect(sentPayload.stream).toBe(true);
+      expect(sentPayload.user).toBeUndefined();
+      expect(sentPayload.instructions).toBe('You are a helpful assistant.');
+      expect(sentPayload.include).toEqual(['reasoning.encrypted_content']);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('should keep simple Codex responses stateless when no continuation state is needed', async () => {
+    const originalFetch = globalThis.fetch;
+    const mockFetch = jest.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      return new Response(JSON.stringify({ ok: true, echoed: init?.body ?? null }), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+        },
+      });
+    });
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+
+    try {
+      const result = getOpenAIConfig(mockApiKey, {
+        reverseProxyUrl: 'https://chatgpt.com/backend-api/codex',
+      });
+
+      const wrappedFetch = result.configOptions?.fetch;
+      expect(wrappedFetch).toBeDefined();
+
+      await wrappedFetch?.('https://chatgpt.com/backend-api/codex/responses', {
+        method: 'POST',
+        body: JSON.stringify({
+          model: 'gpt-5.2',
+          input: [{ type: 'message', role: 'user', content: 'hello' }],
+          stream: false,
+        }),
+      });
+
+      const sentInit = mockFetch.mock.calls[0]?.[1] as RequestInit;
+      const sentPayload = JSON.parse(String(sentInit.body));
+      expect(sentPayload.store).toBe(false);
+      expect(sentPayload.stream).toBe(true);
+      expect(sentPayload.include).toEqual(['reasoning.encrypted_content']);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('should normalize Codex continuation payloads into stateless follow-up requests', async () => {
+    const originalFetch = globalThis.fetch;
+    const mockFetch = jest.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      return new Response(JSON.stringify({ ok: true, echoed: init?.body ?? null }), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+        },
+      });
+    });
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+
+    try {
+      const result = getOpenAIConfig(mockApiKey, {
+        reverseProxyUrl: 'https://chatgpt.com/backend-api/codex',
+      });
+
+      const wrappedFetch = result.configOptions?.fetch;
+      expect(wrappedFetch).toBeDefined();
+
+      await wrappedFetch?.('https://chatgpt.com/backend-api/codex/responses', {
+        method: 'POST',
+        body: JSON.stringify({
+          model: 'gpt-5.2',
+          input: [
+            { type: 'message', role: 'user', content: 'hello' },
+            { type: 'item_reference', id: 'rs_123' },
+            {
+              type: 'reasoning',
+              id: 'rs_missing_encrypted',
+              summary: [{ type: 'summary_text', text: 'missing encrypted content' }],
+            },
+            {
+              type: 'reasoning',
+              id: 'rs_with_encrypted',
+              encrypted_content: 'enc_123',
+              summary: [{ type: 'summary_text', text: 'keep this reasoning item' }],
+            },
+            {
+              type: 'function_call_output',
+              call_id: 'call_123',
+              output: '{"ok":true}',
+            },
+          ],
+          previous_response_id: 'resp_prev',
+          include: ['file_search_call.results'],
+          tools: [{ type: 'web_search' }],
+          stream: true,
+        }),
+      });
+
+      const sentInit = mockFetch.mock.calls[0]?.[1] as RequestInit;
+      const sentPayload = JSON.parse(String(sentInit.body));
+      expect(sentPayload.store).toBe(false);
+      expect(sentPayload.stream).toBe(true);
+      expect(sentPayload.previous_response_id).toBeUndefined();
+      expect(sentPayload.include).toEqual([
+        'file_search_call.results',
+        'reasoning.encrypted_content',
+      ]);
+      expect(sentPayload.input).toEqual([
+        { type: 'message', role: 'user', content: 'hello' },
+        {
+          type: 'reasoning',
+          id: 'rs_with_encrypted',
+          encrypted_content: 'enc_123',
+          summary: [{ type: 'summary_text', text: 'keep this reasoning item' }],
+        },
+        {
+          type: 'function_call_output',
+          call_id: 'call_123',
+          output: '{"ok":true}',
+        },
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('should adapt Codex non-stream SSE responses into JSON responses', async () => {
+    const originalFetch = globalThis.fetch;
+    const ssePayload = [
+      'event: response.created',
+      'data: {"type":"response.created","response":{"id":"resp_1","object":"response","status":"in_progress"}}',
+      '',
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","output":[]}}',
+      '',
+    ].join('\n');
+    const mockFetch = jest.fn(async () => {
+      return new Response(ssePayload, {
+        status: 200,
+        headers: {
+          'content-type': 'text/event-stream',
+        },
+      });
+    });
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+
+    try {
+      const result = getOpenAIConfig(mockApiKey, {
+        reverseProxyUrl: 'https://chatgpt.com/backend-api/codex',
+      });
+
+      const wrappedFetch = result.configOptions?.fetch;
+      expect(wrappedFetch).toBeDefined();
+
+      const response = await wrappedFetch?.('https://chatgpt.com/backend-api/codex/responses', {
+        method: 'POST',
+        body: JSON.stringify({
+          model: 'gpt-5.2',
+          input: [{ type: 'message', role: 'user', content: 'title me' }],
+          stream: false,
+        }),
+      });
+
+      expect(response?.ok).toBe(true);
+      expect(response?.headers.get('content-type')).toContain('application/json');
+      const parsed = await response?.json();
+      expect(parsed).toMatchObject({
+        id: 'resp_1',
+        object: 'response',
+        status: 'completed',
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('should not block stream responses while Codex debug logging is enabled', async () => {
+    const originalFetch = globalThis.fetch;
+    const originalDebug = process.env.VIVENTIUM_OPENAI_CODEX_DEBUG;
+    process.env.VIVENTIUM_OPENAI_CODEX_DEBUG = 'true';
+
+    const delayMs = 700;
+    const encoder = new TextEncoder();
+    const mockFetch = jest.fn(async () => {
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_stream","object":"response"}}\n\n',
+            ),
+          );
+          setTimeout(() => {
+            controller.enqueue(
+              encoder.encode(
+                'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_stream","object":"response","status":"completed","output":[]}}\n\n',
+              ),
+            );
+            controller.close();
+          }, delayMs);
+        },
+      });
+
+      return new Response(stream, {
+        status: 200,
+        headers: {
+          'content-type': 'text/event-stream',
+        },
+      });
+    });
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+
+    try {
+      const result = getOpenAIConfig(mockApiKey, {
+        reverseProxyUrl: 'https://chatgpt.com/backend-api/codex',
+      });
+
+      const wrappedFetch = result.configOptions?.fetch;
+      expect(wrappedFetch).toBeDefined();
+
+      const started = Date.now();
+      const response = await wrappedFetch?.('https://chatgpt.com/backend-api/codex/responses', {
+        method: 'POST',
+        body: JSON.stringify({
+          model: 'gpt-5.2',
+          input: [{ type: 'message', role: 'user', content: 'streaming test' }],
+          stream: true,
+        }),
+      });
+      const elapsedMs = Date.now() - started;
+
+      expect(response?.ok).toBe(true);
+      expect(elapsedMs).toBeLessThan(350);
+      await response?.text();
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (originalDebug == null) {
+        delete process.env.VIVENTIUM_OPENAI_CODEX_DEBUG;
+      } else {
+        process.env.VIVENTIUM_OPENAI_CODEX_DEBUG = originalDebug;
+      }
+    }
+  });
+  /* === VIVENTIUM START ===
+   * Feature: OpenAI Connected Accounts (Codex bridge regression coverage).
+   * Purpose: End marker for Viventium-added Codex compatibility tests.
+   * === VIVENTIUM END === */
+
   describe('Azure Configuration', () => {
     it('should handle Azure configuration with model name as deployment', () => {
       const originalEnv = process.env.AZURE_USE_MODEL_AS_DEPLOYMENT_NAME;
@@ -1399,8 +1687,10 @@ describe('getOpenAIConfig', () => {
           dropParams: ['presence_penalty'],
           titleConvo: true,
           titleModel: 'gpt-3.5-turbo',
+          summaryModel: 'gpt-3.5-turbo',
           modelDisplayLabel: 'Custom GPT-4',
           titleMethod: 'completion',
+          contextStrategy: 'summarize',
           directEndpoint: true,
           titleMessageRole: 'user',
           streamRate: 25,
@@ -1415,8 +1705,10 @@ describe('getOpenAIConfig', () => {
           customParams: {},
           titleConvo: endpointConfig.titleConvo,
           titleModel: endpointConfig.titleModel,
+          summaryModel: endpointConfig.summaryModel,
           modelDisplayLabel: endpointConfig.modelDisplayLabel,
           titleMethod: endpointConfig.titleMethod,
+          contextStrategy: endpointConfig.contextStrategy,
           directEndpoint: endpointConfig.directEndpoint,
           titleMessageRole: endpointConfig.titleMessageRole,
           streamRate: endpointConfig.streamRate,

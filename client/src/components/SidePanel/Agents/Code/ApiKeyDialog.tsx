@@ -72,14 +72,21 @@ export default function ApiKeyDialog({
                   </div>
                 ))}
               </div>
+              {/* === VIVENTIUM START ===
+               * Feature: Viventium branding (code interpreter link)
+               * Purpose: Replace LibreChat code interpreter link with Viventium.ai.
+               * Details: docs/requirements_and_learnings/16_Branding_and_Assets.md#librechat-code-api-link
+               * Added: 2026-01-26
+               */}
               <a
-                href="https://code.librechat.ai/pricing"
+                href="https://viventium.ai"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="block text-center text-[15px] font-medium text-blue-500 underline decoration-1 hover:text-blue-600 dark:text-blue-400 dark:hover:text-blue-300"
               >
                 {localize('com_ui_librechat_code_api_key')}
               </a>
+              {/* === VIVENTIUM END === */}
             </div>
             <form onSubmit={handleSubmit(onSubmit)}>
               <Input

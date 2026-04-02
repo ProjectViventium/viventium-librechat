@@ -7,6 +7,7 @@ import {
 } from 'librechat-data-provider';
 import type * as t from 'librechat-data-provider';
 import type { SelectedValues } from '~/common';
+import { useGetStartupConfig } from '~/data-provider';
 import useSetIndexOptions from '~/hooks/Conversations/useSetIndexOptions';
 
 export default function useSelectorEffects({
@@ -23,6 +24,7 @@ export default function useSelectorEffects({
   setSelectedValues: React.Dispatch<React.SetStateAction<SelectedValues>>;
 }) {
   const { setOption } = useSetIndexOptions();
+  const { data: startupConfig } = useGetStartupConfig();
   const agents: t.Agent[] = useMemo(() => {
     return Object.values(agentsMap ?? {}) as t.Agent[];
   }, [agentsMap]);
@@ -44,8 +46,17 @@ export default function useSelectorEffects({
     }
     if (selectedAgentId == null && agents.length > 0) {
       let agent_id = localStorage.getItem(`${LocalStorageKeys.AGENT_ID_PREFIX}${index}`);
-      if (agent_id == null || isEphemeralAgentId(agent_id)) {
-        agent_id = agents[0]?.id;
+      if (agent_id == null || isEphemeralAgentId(agent_id) || agentsMap?.[agent_id] == null) {
+        const configuredDefaultAgentId = startupConfig?.interface?.defaultAgent;
+        if (
+          configuredDefaultAgentId &&
+          !isEphemeralAgentId(configuredDefaultAgentId) &&
+          agentsMap?.[configuredDefaultAgentId]
+        ) {
+          agent_id = configuredDefaultAgentId;
+        } else {
+          agent_id = agents[0]?.id;
+        }
       }
       const agent = agentsMap?.[agent_id];
 
@@ -54,7 +65,7 @@ export default function useSelectorEffects({
         setOption('agent_id')(agent_id);
       }
     }
-  }, [index, agents, selectedAgentId, agentsMap, endpoint, setOption]);
+  }, [index, agents, selectedAgentId, agentsMap, endpoint, setOption, startupConfig]);
   useEffect(() => {
     if (!isAssistantsEndpoint(endpoint as string)) {
       return;

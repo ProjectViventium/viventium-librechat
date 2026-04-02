@@ -70,7 +70,6 @@ export class InMemoryJobStore implements IJobStore {
     streamId: string,
     userId: string,
     conversationId?: string,
-    tenantId?: string,
   ): Promise<SerializableJobData> {
     if (this.jobs.size >= this.maxJobs) {
       await this.evictOldest();
@@ -79,7 +78,6 @@ export class InMemoryJobStore implements IJobStore {
     const job: SerializableJobData = {
       streamId,
       userId,
-      ...(tenantId && { tenantId }),
       status: 'running',
       createdAt: Date.now(),
       conversationId,
@@ -88,12 +86,11 @@ export class InMemoryJobStore implements IJobStore {
 
     this.jobs.set(streamId, job);
 
-    // Track job by userId (tenant-qualified when available) for efficient user-scoped queries
-    const userKey = tenantId ? `${tenantId}:${userId}` : userId;
-    let userJobs = this.userJobMap.get(userKey);
+    // Track job by userId for efficient user-scoped queries
+    let userJobs = this.userJobMap.get(userId);
     if (!userJobs) {
       userJobs = new Set();
-      this.userJobMap.set(userKey, userJobs);
+      this.userJobMap.set(userId, userJobs);
     }
     userJobs.add(streamId);
 
@@ -149,17 +146,6 @@ export class InMemoryJobStore implements IJobStore {
     }
 
     for (const id of toDelete) {
-      const job = this.jobs.get(id);
-      if (job) {
-        const userKey = job.tenantId ? `${job.tenantId}:${job.userId}` : job.userId;
-        const userJobs = this.userJobMap.get(userKey);
-        if (userJobs) {
-          userJobs.delete(id);
-          if (userJobs.size === 0) {
-            this.userJobMap.delete(userKey);
-          }
-        }
-      }
       await this.deleteJob(id);
     }
 
@@ -183,17 +169,6 @@ export class InMemoryJobStore implements IJobStore {
 
     if (oldestId) {
       logger.warn(`[InMemoryJobStore] Evicting oldest job: ${oldestId}`);
-      const job = this.jobs.get(oldestId);
-      if (job) {
-        const userKey = job.tenantId ? `${job.tenantId}:${job.userId}` : job.userId;
-        const userJobs = this.userJobMap.get(userKey);
-        if (userJobs) {
-          userJobs.delete(oldestId);
-          if (userJobs.size === 0) {
-            this.userJobMap.delete(userKey);
-          }
-        }
-      }
       await this.deleteJob(oldestId);
     }
   }
@@ -230,9 +205,8 @@ export class InMemoryJobStore implements IJobStore {
    * Returns conversation IDs of running jobs belonging to the user.
    * Also performs self-healing cleanup: removes stale entries for jobs that no longer exist.
    */
-  async getActiveJobIdsByUser(userId: string, tenantId?: string): Promise<string[]> {
-    const userKey = tenantId ? `${tenantId}:${userId}` : userId;
-    const trackedIds = this.userJobMap.get(userKey);
+  async getActiveJobIdsByUser(userId: string): Promise<string[]> {
+    const trackedIds = this.userJobMap.get(userId);
     if (!trackedIds || trackedIds.size === 0) {
       return [];
     }
@@ -252,7 +226,7 @@ export class InMemoryJobStore implements IJobStore {
 
     // Clean up empty set
     if (trackedIds.size === 0) {
-      this.userJobMap.delete(userKey);
+      this.userJobMap.delete(userId);
     }
 
     return activeIds;

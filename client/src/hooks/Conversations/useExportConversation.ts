@@ -112,6 +112,33 @@ export default function useExportConversation({
       return [sender, text];
     }
 
+    /* === VIVENTIUM START ===
+     * Feature: Background Agents - Export friendly formatting for cortex content parts
+     */
+    if (
+      content.type === ContentTypes.CORTEX_ACTIVATION ||
+      content.type === ContentTypes.CORTEX_BREWING ||
+      content.type === ContentTypes.CORTEX_INSIGHT
+    ) {
+      const name =
+        typeof content.cortex_name === 'string' && content.cortex_name.length > 0
+          ? content.cortex_name
+          : 'Background Agent';
+      const status = content.status ? String(content.status) : '';
+      const reason =
+        typeof content.reason === 'string' && content.reason.length > 0
+          ? ` — ${content.reason}`
+          : '';
+      const insight =
+        typeof content.insight === 'string' && content.insight.length > 0
+          ? `: ${content.insight}`
+          : '';
+      const label =
+        content.type === ContentTypes.CORTEX_INSIGHT ? 'Background Insight' : 'Background Update';
+
+      return [label, `${name}${status ? ` (${status})` : ''}${reason}${insight}`];
+    }
+    /* === VIVENTIUM END === */
     if (content.type === ContentTypes.TOOL_CALL) {
       const type = content[ContentTypes.TOOL_CALL].type;
 

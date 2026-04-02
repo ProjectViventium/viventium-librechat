@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { ViolationTypes, ErrorTypes } from 'librechat-data-provider';
+import { ViolationTypes, ErrorTypes, normalizeEndpointName } from 'librechat-data-provider';
 import type { Agent, TModelsConfig } from 'librechat-data-provider';
 import type { Request, Response } from 'express';
 
@@ -60,6 +60,30 @@ export const toolOptionsSchema = z.object({
 /** Agent tool options - map of tool_id to tool options */
 export const agentToolOptionsSchema = z.record(z.string(), toolOptionsSchema).optional();
 
+/* === VIVENTIUM START ===
+ * Feature: Background Cortices (Multi-Agent Brain Architecture)
+ * Purpose: Validation schemas for background cortices configuration
+ * Added: 2026-01-03
+ */
+
+/** Activation config schema for background cortices */
+export const activationConfigSchema = z.object({
+  enabled: z.boolean(),
+  model: z.string(),
+  provider: z.string(),
+  prompt: z.string(),
+  intent_scope: z.string().optional(),
+  confidence_threshold: z.number().min(0).max(1),
+  cooldown_ms: z.number().min(0),
+  max_history: z.number().min(1),
+});
+
+/** Background cortex schema - an agent with its activation config */
+export const backgroundCortexSchema = z.object({
+  agent_id: z.string(),
+  activation: activationConfigSchema,
+});
+/* === VIVENTIUM END === */
 /** Base agent schema with all common fields */
 export const agentBaseSchema = z.object({
   name: z.string().nullable().optional(),
@@ -80,6 +104,23 @@ export const agentBaseSchema = z.object({
   tool_options: agentToolOptionsSchema,
   support_contact: agentSupportContactSchema,
   category: z.string().optional(),
+  /* === VIVENTIUM START ===
+   * Feature: Agent-scoped conversation recall toggle
+   * Added: 2026-02-19
+   */
+  conversation_recall_agent_only: z.boolean().optional(),
+  /* === VIVENTIUM END === */
+  /* === VIVENTIUM START === */
+  /** Background cortices attached to this main agent */
+  background_cortices: z.array(backgroundCortexSchema).optional(),
+  /* === VIVENTIUM END === */
+  /* === VIVENTIUM START ===
+   * Feature: Voice Chat LLM Override
+   * Added: 2026-02-24
+   */
+  voice_llm_model: z.string().nullable().optional(),
+  voice_llm_provider: z.string().nullable().optional(),
+  /* === VIVENTIUM END === */
 });
 
 /** Create schema extends base with required fields for creation */
@@ -94,6 +135,9 @@ export const agentUpdateSchema = agentBaseSchema.extend({
   avatar: z.union([agentAvatarSchema, z.null()]).optional(),
   provider: z.string().optional(),
   model: z.string().nullable().optional(),
+  projectIds: z.array(z.string()).optional(),
+  removeProjectIds: z.array(z.string()).optional(),
+  isCollaborative: z.boolean().optional(),
 });
 
 interface ValidateAgentModelParams {
@@ -149,7 +193,14 @@ export async function validateAgentModel(
     };
   }
 
-  const availableModels = modelsConfig[endpoint];
+  let availableModels: string[] | undefined = modelsConfig[endpoint];
+  if (!availableModels) {
+    const normalizedEndpoint = normalizeEndpointName(endpoint);
+    const matchedKey = Object.keys(modelsConfig).find(
+      (key) => normalizeEndpointName(key) === normalizedEndpoint,
+    );
+    availableModels = matchedKey ? modelsConfig[matchedKey] : undefined;
+  }
   if (!availableModels) {
     return {
       isValid: false,

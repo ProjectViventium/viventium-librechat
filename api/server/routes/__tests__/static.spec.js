@@ -7,11 +7,6 @@ const zlib = require('zlib');
 // Create test setup
 const mockTestDir = path.join(__dirname, 'test-static-route');
 
-// Mock the paths module to point to our test directory
-jest.mock('~/config/paths', () => ({
-  imageOutput: mockTestDir,
-}));
-
 describe('Static Route Integration', () => {
   let app;
   let staticRoute;
@@ -48,6 +43,10 @@ describe('Static Route Integration', () => {
     } else {
       process.env.ENABLE_IMAGE_OUTPUT_GZIP_SCAN = 'true';
     }
+
+    jest.doMock('~/config/paths', () => ({
+      imageOutput: mockTestDir,
+    }));
 
     staticRoute = require('../static');
     app.use('/images', staticRoute);

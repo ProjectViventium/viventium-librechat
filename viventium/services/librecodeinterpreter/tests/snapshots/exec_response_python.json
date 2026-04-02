@@ -1,0 +1,41 @@
+{
+  "_description": "Expected /exec response format for Python execution",
+  "_version": "1.0.0",
+  "_librechat_compatible": true,
+
+  "request": {
+    "code": "print('Hello, World!')",
+    "lang": "py",
+    "entity_id": "optional-entity-id",
+    "user_id": "optional-user-id",
+    "files": [],
+    "args": null
+  },
+
+  "response": {
+    "session_id": "string (required, non-empty)",
+    "files": "array of FileRef objects (may be empty)",
+    "stdout": "string (output from execution, ends with newline)",
+    "stderr": "string (error output, empty on success)"
+  },
+
+  "response_example": {
+    "session_id": "abc123def456ghi789",
+    "files": [],
+    "stdout": "Hello, World!\n",
+    "stderr": ""
+  },
+
+  "file_ref_schema": {
+    "id": "string (required, file identifier)",
+    "name": "string (required, filename)",
+    "path": "string (optional, file path in container)"
+  },
+
+  "notes": [
+    "stdout MUST end with newline for LibreChat UI compatibility",
+    "HTTP status is always 200 for execution (errors go to stderr)",
+    "session_id persists for same entity_id",
+    "files array contains generated files, not input files"
+  ]
+}

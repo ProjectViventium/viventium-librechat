@@ -208,6 +208,12 @@ export default function useChatFunctions({
       text,
       sender: 'User',
       clientTimestamp: new Date().toLocaleString('sv').replace(' ', 'T'),
+      // === VIVENTIUM START ===
+      // Feature: Timezone-aware server-side processing (cortex follow-ups, scheduling, audit)
+      // Purpose: Send the client's IANA timezone name so the API can interpret timestamps consistently across surfaces.
+      // Added: 2026-02-07
+      clientTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      // === VIVENTIUM END ===
       isCreatedByUser: true,
       parentMessageId,
       conversationId,

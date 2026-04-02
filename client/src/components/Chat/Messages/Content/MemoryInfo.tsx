@@ -5,7 +5,7 @@ import { useLocalize } from '~/hooks';
 export default function MemoryInfo({ memoryArtifacts }: { memoryArtifacts: MemoryArtifact[] }) {
   const localize = useLocalize();
 
-  const { updatedMemories, deletedMemories, errorMessages } = useMemo(() => {
+  const { updatedMemories, deletedMemories, errorMessages, hasStorageFullErrors } = useMemo(() => {
     const updated = memoryArtifacts.filter((art) => art.type === 'update');
     const deleted = memoryArtifacts.filter((art) => art.type === 'delete');
     const errors = memoryArtifacts.filter((art) => art.type === 'error');
@@ -13,20 +13,38 @@ export default function MemoryInfo({ memoryArtifacts }: { memoryArtifacts: Memor
     const messages = errors.map((artifact) => {
       try {
         const errorData = JSON.parse(artifact.value as string);
+        const errorType = errorData.errorType;
 
-        if (errorData.errorType === 'already_exceeded') {
-          return localize('com_ui_memory_already_exceeded', {
-            tokens: errorData.tokenCount,
-          });
-        } else if (errorData.errorType === 'would_exceed') {
-          return localize('com_ui_memory_would_exceed', {
-            tokens: errorData.tokenCount,
-          });
+        if (errorType === 'already_exceeded') {
+          return {
+            isStorageFull: true,
+            message: localize('com_ui_memory_already_exceeded', {
+              tokens: errorData.tokenCount,
+            }),
+          };
+        } else if (errorType === 'would_exceed') {
+          return {
+            isStorageFull: true,
+            message: localize('com_ui_memory_would_exceed', {
+              tokens: errorData.tokenCount,
+            }),
+          };
+        } else if (typeof errorData.message === 'string' && errorData.message.trim().length > 0) {
+          return {
+            isStorageFull: false,
+            message: errorData.message.trim(),
+          };
         } else {
-          return localize('com_ui_memory_error');
+          return {
+            isStorageFull: false,
+            message: localize('com_ui_memory_error'),
+          };
         }
       } catch {
-        return localize('com_ui_memory_error');
+        return {
+          isStorageFull: false,
+          message: localize('com_ui_memory_error'),
+        };
       }
     });
 
@@ -34,6 +52,7 @@ export default function MemoryInfo({ memoryArtifacts }: { memoryArtifacts: Memor
       updatedMemories: updated,
       deletedMemories: deleted,
       errorMessages: messages,
+      hasStorageFullErrors: messages.some((message) => message.isStorageFull),
     };
   }, [memoryArtifacts, localize]);
 
@@ -90,15 +109,17 @@ export default function MemoryInfo({ memoryArtifacts }: { memoryArtifacts: Memor
       {errorMessages.length > 0 && (
         <div>
           <h4 className="mb-2 text-sm font-semibold text-red-500">
-            {localize('com_ui_memory_storage_full')}
+            {hasStorageFullErrors
+              ? localize('com_ui_memory_storage_full')
+              : localize('com_ui_memory_error')}
           </h4>
           <div className="space-y-2">
-            {errorMessages.map((errorMessage) => (
+            {errorMessages.map((errorMessage, index) => (
               <div
-                key={errorMessage}
+                key={`${index}-${errorMessage.message}`}
                 className="rounded-md bg-red-50 p-3 text-sm text-red-800 dark:bg-red-900/20 dark:text-red-400"
               >
-                {errorMessage}
+                {errorMessage.message}
               </div>
             ))}
           </div>

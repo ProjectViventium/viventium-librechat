@@ -1,6 +1,10 @@
 const { ToolMessage } = require('@langchain/core/messages');
 const { EModelEndpoint, ContentTypes } = require('librechat-data-provider');
 const { HumanMessage, AIMessage, SystemMessage } = require('@langchain/core/messages');
+/* === VIVENTIUM START ===
+ * Feature: Normalize legacy search-tool diagnostics before they re-enter model context.
+ * === VIVENTIUM END === */
+const { normalizeToolOutputForModel } = require('../tools/util/modelFacingToolOutput');
 
 /**
  * Formats a message to OpenAI Vision API payload format.
@@ -142,6 +146,9 @@ const formatAgentMessages = (payload) => {
   const messages = [];
 
   for (const message of payload) {
+    if (!message || typeof message !== 'object') {
+      continue;
+    }
     if (typeof message.content === 'string') {
       message.content = [{ type: ContentTypes.TEXT, [ContentTypes.TEXT]: message.content }];
     }
@@ -154,7 +161,28 @@ const formatAgentMessages = (payload) => {
     let lastAIMessage = null;
 
     let hasReasoning = false;
-    for (const part of message.content) {
+    for (const part of Array.isArray(message.content) ? message.content : []) {
+      /* === VIVENTIUM START ===
+       * Feature: Guard against malformed/null content blocks in historical payloads.
+       * === VIVENTIUM END === */
+      if (part == null) {
+        continue;
+      }
+      if (typeof part === 'string') {
+        const text = part;
+        if (!text.trim()) {
+          continue;
+        }
+        currentContent.push({
+          type: ContentTypes.TEXT,
+          text,
+          [ContentTypes.TEXT]: text,
+        });
+        continue;
+      }
+      if (typeof part !== 'object') {
+        continue;
+      }
       if (part.type === ContentTypes.TEXT && part.tool_call_ids) {
         /*
         If there's pending content, it needs to be aggregated as a single string to prepare for tool calls.
@@ -184,6 +212,9 @@ const formatAgentMessages = (payload) => {
         if (!lastAIMessage) {
           throw new Error('Invalid tool call structure: No preceding AIMessage with tool_call_ids');
         }
+        if (!part.tool_call || typeof part.tool_call !== 'object') {
+          continue;
+        }
 
         // Note: `tool_calls` list is defined when constructed by `AIMessage` class, and outputs should be excluded from it
         const { output, args: _args, ...tool_call } = part.tool_call;
@@ -205,9 +236,48 @@ const formatAgentMessages = (payload) => {
           new ToolMessage({
             tool_call_id: tool_call.id,
             name: tool_call.name,
-            content: output || '',
+            content: normalizeToolOutputForModel({
+              toolName: tool_call.name,
+              output,
+            }),
           }),
         );
+      /* VIVENTIUM START
+       * Purpose: Suppress cortex activation/brewing parts and surface insights as assistant text.
+       * Details: docs/requirements_and_learnings/05_Open_Source_Modifications.md#librechat-formatmessages-cortex
+       */
+      } else if (
+        part.type === ContentTypes.CORTEX_ACTIVATION ||
+        part.type === ContentTypes.CORTEX_BREWING
+      ) {
+        continue;
+      } else if (part.type === ContentTypes.CORTEX_INSIGHT) {
+        const insight = typeof part.insight === 'string' ? part.insight.trim() : '';
+        if (!insight) {
+          continue;
+        }
+
+        if (currentContent.length > 0) {
+          let content = currentContent.reduce((acc, curr) => {
+            if (curr.type === ContentTypes.TEXT) {
+              return `${acc}${curr[ContentTypes.TEXT]}\n`;
+            }
+            return acc;
+          }, '');
+          content = content.trim();
+          if (content) {
+            messages.push(new AIMessage({ content }));
+          }
+          currentContent = [];
+        }
+
+        const cortexLabel = String(
+          part.cortex_name || part.cortexName || part.cortex_id || 'Background Insight',
+        );
+        messages.push(
+          new AIMessage({ content: `[Background Insight - ${cortexLabel}]: ${insight}` }),
+        );
+      /* VIVENTIUM END */
       } else if (part.type === ContentTypes.THINK) {
         hasReasoning = true;
         continue;
@@ -221,7 +291,7 @@ const formatAgentMessages = (payload) => {
     if (hasReasoning) {
       currentContent = currentContent
         .reduce((acc, curr) => {
-          if (curr.type === ContentTypes.TEXT) {
+          if (curr && typeof curr === 'object' && curr.type === ContentTypes.TEXT) {
             return `${acc}${curr[ContentTypes.TEXT]}\n`;
           }
           return acc;

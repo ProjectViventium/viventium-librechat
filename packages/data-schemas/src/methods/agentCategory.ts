@@ -1,6 +1,5 @@
 import type { Model, Types } from 'mongoose';
 import type { IAgentCategory } from '~/types';
-import { tenantSafeBulkWrite } from '~/utils/tenantBulkWrite';
 
 export function createAgentCategoryMethods(mongoose: typeof import('mongoose')) {
   /**
@@ -75,7 +74,7 @@ export function createAgentCategoryMethods(mongoose: typeof import('mongoose')) 
       },
     }));
 
-    return await tenantSafeBulkWrite(AgentCategory, operations);
+    return await AgentCategory.bulkWrite(operations);
   }
 
   /**
@@ -242,7 +241,7 @@ export function createAgentCategoryMethods(mongoose: typeof import('mongoose')) 
         },
       }));
 
-      await tenantSafeBulkWrite(AgentCategory, bulkOps, { ordered: false });
+      await AgentCategory.bulkWrite(bulkOps, { ordered: false });
     }
 
     return updates.length > 0 || created > 0;

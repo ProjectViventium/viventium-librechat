@@ -32,21 +32,13 @@ describe('LeaderElection with Redis', () => {
     process.setMaxListeners(200);
   });
 
-  beforeEach(async () => {
+  afterEach(async () => {
+    await Promise.all(instances.map((instance) => instance.resign()));
+    instances = [];
+
+    // Clean up: clear the leader key directly from Redis
     if (keyvRedisClient) {
       await keyvRedisClient.del(LeaderElection.LEADER_KEY);
-    }
-    new LeaderElection().clearRefreshTimer();
-  });
-
-  afterEach(async () => {
-    try {
-      await Promise.all(instances.map((instance) => instance.resign()));
-    } finally {
-      instances = [];
-      if (keyvRedisClient) {
-        await keyvRedisClient.del(LeaderElection.LEADER_KEY);
-      }
     }
   });
 

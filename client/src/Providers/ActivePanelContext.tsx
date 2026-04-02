@@ -1,31 +1,31 @@
-import { createContext, useCallback, useContext, useMemo, useState, ReactNode } from 'react';
-
-const STORAGE_KEY = 'side:active-panel';
-const DEFAULT_PANEL = 'conversations';
-
-function getInitialActivePanel(): string {
-  const saved = localStorage.getItem(STORAGE_KEY);
-  return saved ? saved : DEFAULT_PANEL;
-}
+import { createContext, useContext, useState, ReactNode } from 'react';
 
 interface ActivePanelContextType {
-  active: string;
+  active: string | undefined;
   setActive: (id: string) => void;
 }
 
 const ActivePanelContext = createContext<ActivePanelContextType | undefined>(undefined);
 
-export function ActivePanelProvider({ children }: { children: ReactNode }) {
-  const [active, _setActive] = useState<string>(getInitialActivePanel);
+export function ActivePanelProvider({
+  children,
+  defaultActive,
+}: {
+  children: ReactNode;
+  defaultActive?: string;
+}) {
+  const [active, _setActive] = useState<string | undefined>(defaultActive);
 
-  const setActive = useCallback((id: string) => {
-    localStorage.setItem(STORAGE_KEY, id);
+  const setActive = (id: string) => {
+    localStorage.setItem('side:active-panel', id);
     _setActive(id);
-  }, []);
+  };
 
-  const value = useMemo(() => ({ active, setActive }), [active, setActive]);
-
-  return <ActivePanelContext.Provider value={value}>{children}</ActivePanelContext.Provider>;
+  return (
+    <ActivePanelContext.Provider value={{ active, setActive }}>
+      {children}
+    </ActivePanelContext.Provider>
+  );
 }
 
 export function useActivePanel() {
@@ -34,12 +34,4 @@ export function useActivePanel() {
     throw new Error('useActivePanel must be used within an ActivePanelProvider');
   }
   return context;
-}
-
-/** Returns `active` when it matches a known link, otherwise the first link's id. */
-export function resolveActivePanel(active: string, links: { id: string }[]): string {
-  if (links.length > 0 && links.some((l) => l.id === active)) {
-    return active;
-  }
-  return links[0]?.id ?? active;
 }

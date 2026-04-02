@@ -7,7 +7,6 @@ export interface IMemoryEntry extends Document {
   value: string;
   tokenCount?: number;
   updated_at?: Date;
-  tenantId?: string;
 }
 
 export interface IMemoryEntryLean {
@@ -46,4 +45,9 @@ export interface FormattedMemoriesResult {
   withKeys: string;
   withoutKeys: string;
   totalTokens?: number;
+  /* === VIVENTIUM START ===
+   * Fix: Expose per-key token counts to support overwrite-aware tokenLimit checks.
+   * Added: 2026-02-09
+   * === VIVENTIUM END === */
+  memoryTokenMap?: Record<string, number>;
 }

@@ -190,7 +190,7 @@ describe('initializeAgent — maxContextTokens', () => {
       db,
     );
 
-    const expected = Math.round((modelDefault - maxOutputTokens) * 0.95);
+    const expected = Math.round((modelDefault - maxOutputTokens) * 0.9);
     expect(result.maxContextTokens).toBe(expected);
   });
 
@@ -222,7 +222,7 @@ describe('initializeAgent — maxContextTokens', () => {
     // optionalChainWithEmptyCheck(0, 200000, 18000) returns 0 (not null/undefined),
     // then Number(0) || 18000 = 18000 (the fallback default).
     expect(result.maxContextTokens).not.toBe(0);
-    const expected = Math.round((18000 - maxOutputTokens) * 0.95);
+    const expected = Math.round((18000 - maxOutputTokens) * 0.9);
     expect(result.maxContextTokens).toBe(expected);
   });
 
@@ -278,43 +278,32 @@ describe('initializeAgent — maxContextTokens', () => {
       db,
     );
 
-    // Should NOT be overridden to Math.round((128000 - 4096) * 0.95) = 117,709
+    // Should NOT be overridden to Math.round((128000 - 4096) * 0.9) = 111,514
     expect(result.maxContextTokens).toBe(userValue);
   });
+});
 
-  it('sets baseContextTokens to agentMaxContextNum minus maxOutputTokensNum', async () => {
-    const modelDefault = 200000;
-    const maxOutputTokens = 4096;
-    const { agent, req, res, loadTools, db } = createMocks({
-      maxContextTokens: undefined,
-      modelDefault,
-      maxOutputTokens,
-    });
+describe('initializeAgent — conversation recall resources', () => {
+  const originalRagApiUrl = process.env.RAG_API_URL;
 
-    const result = await initializeAgent(
-      {
-        req,
-        res,
-        agent,
-        loadTools,
-        endpointOption: { endpoint: EModelEndpoint.agents },
-        allowedProviders: new Set([Providers.OPENAI]),
-        isInitialAgent: true,
-      },
-      db,
-    );
-
-    expect(result.baseContextTokens).toBe(modelDefault - maxOutputTokens);
+  beforeEach(() => {
+    jest.clearAllMocks();
   });
 
-  it('clamps maxContextTokens to at least 1024 for tiny models', async () => {
-    const modelDefault = 1100;
-    const maxOutputTokens = 1050;
-    const { agent, req, res, loadTools, db } = createMocks({
-      maxContextTokens: undefined,
-      modelDefault,
-      maxOutputTokens,
-    });
+  afterEach(() => {
+    if (originalRagApiUrl == null) {
+      delete process.env.RAG_API_URL;
+    } else {
+      process.env.RAG_API_URL = originalRagApiUrl;
+    }
+  });
+
+  it('does not attach conversation recall files when RAG is unavailable', async () => {
+    delete process.env.RAG_API_URL;
+
+    const { agent, req, res, loadTools, db } = createMocks();
+    agent.tools = [];
+    req.user.personalization = { conversation_recall: true };
 
     const result = await initializeAgent(
       {
@@ -329,8 +318,7 @@ describe('initializeAgent — maxContextTokens', () => {
       db,
     );
 
-    // baseContextTokens = 1100 - 1050 = 50, formula would give ~47.5 rounded
-    // but Math.max(1024, ...) clamps it
-    expect(result.maxContextTokens).toBe(1024);
+    expect(db.getFiles).not.toHaveBeenCalled();
+    expect(result.tool_resources).toBeUndefined();
   });
 });

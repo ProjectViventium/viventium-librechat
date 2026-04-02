@@ -5,6 +5,72 @@ const { logger } = require('@librechat/data-schemas');
 const { FileSources } = require('librechat-data-provider');
 const { logAxiosError, generateShortLivedToken } = require('@librechat/api');
 
+const EMBED_ERROR_DETAIL_LIMIT = 1400;
+const EMBEDDING_VECTOR_REGEX = /(['"]embedding['"]\s*:\s*)\[[\s\S]*?\]/gi;
+const EMBED_INPUT_TOKEN_REGEX = /(['"]input['"]\s*:\s*)\[[\s\S]*?\]/gi;
+const EMBED_TEXT_FIELD_REGEX = /(['"]text['"]\s*:\s*)(['"])(?:\\.|(?!\2)[\s\S])*\2/gi;
+
+function sanitizeEmbeddingFailureDetails(value) {
+  if (typeof value !== 'string') {
+    return '';
+  }
+
+  let next = value
+    .replace(EMBEDDING_VECTOR_REGEX, '$1[omitted]')
+    .replace(EMBED_INPUT_TOKEN_REGEX, '$1[omitted]')
+    .replace(EMBED_TEXT_FIELD_REGEX, (match, prefix, quote) => {
+      if (match.length <= 220) {
+        return match;
+      }
+      return `${prefix}${quote}[omitted]${quote}`;
+    })
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (next.length > EMBED_ERROR_DETAIL_LIMIT) {
+    next = `${next.slice(0, EMBED_ERROR_DETAIL_LIMIT)}... [truncated]`;
+  }
+
+  return next;
+}
+
+function compactErrorMessage(message) {
+  const cleaned = sanitizeEmbeddingFailureDetails(String(message || ''));
+  return cleaned || 'An error occurred during file upload.';
+}
+
+function buildSafeUploadError(error) {
+  const safe = new Error(compactErrorMessage(error?.message));
+
+  if (error?.response) {
+    const safeMessage = sanitizeEmbeddingFailureDetails(
+      typeof error?.response?.data?.message === 'string'
+        ? error.response.data.message
+        : typeof error?.response?.data?.error === 'string'
+          ? error.response.data.error
+          : '',
+    );
+
+    safe.response = {
+      ...error.response,
+      data: {
+        status: error?.response?.data?.status,
+        known_type: error?.response?.data?.known_type,
+        message: safeMessage,
+      },
+    };
+  }
+
+  if (error?.code) {
+    safe.code = error.code;
+  }
+  if (error?.status) {
+    safe.status = error.status;
+  }
+
+  return safe;
+}
+
 /**
  * Deletes a file from the vector database. This function takes a file object, constructs the full path, and
  * verifies the path's validity before deleting the file. If the path is invalid, an error is thrown.
@@ -58,13 +124,14 @@ const deleteVectors = async (req, file) => {
  * @param {string} params.file_id - The file ID.
  * @param {string} [params.entity_id] - The entity ID for shared resources.
  * @param {Object} [params.storageMetadata] - Storage metadata for dual storage pattern.
+ * @param {number} [params.timeoutMs] - Optional request timeout for embedding uploads.
  *
  * @returns {Promise<{ filepath: string, bytes: number }>}
  *          A promise that resolves to an object containing:
  *            - filepath: The path where the file is saved.
  *            - bytes: The size of the file in bytes.
  */
-async function uploadVectors({ req, file, file_id, entity_id, storageMetadata }) {
+async function uploadVectors({ req, file, file_id, entity_id, storageMetadata, timeoutMs }) {
   if (!process.env.RAG_API_URL) {
     throw new Error('RAG_API_URL not defined');
   }
@@ -91,6 +158,7 @@ async function uploadVectors({ req, file, file_id, entity_id, storageMetadata })
         accept: 'application/json',
         ...formHeaders,
       },
+      ...(Number.isFinite(timeoutMs) && timeoutMs > 0 ? { timeout: timeoutMs } : {}),
     });
 
     const responseData = response.data;
@@ -101,7 +169,28 @@ async function uploadVectors({ req, file, file_id, entity_id, storageMetadata })
     }
 
     if (!responseData.status) {
-      throw new Error('File embedding failed.');
+      const details = sanitizeEmbeddingFailureDetails(
+        typeof responseData?.message === 'string'
+          ? responseData.message
+          : typeof responseData?.error === 'string'
+            ? responseData.error
+            : '',
+      );
+
+      const failure = new Error(`File embedding failed${details ? `: ${details}` : '.'}`);
+      failure.response = {
+        status: response?.status,
+        data: {
+          status: responseData?.status,
+          known_type: responseData?.known_type,
+          message: details,
+          error:
+            typeof responseData?.error === 'string'
+              ? sanitizeEmbeddingFailureDetails(responseData.error)
+              : undefined,
+        },
+      };
+      throw failure;
     }
 
     return {
@@ -111,11 +200,22 @@ async function uploadVectors({ req, file, file_id, entity_id, storageMetadata })
       embedded: Boolean(responseData.known_type),
     };
   } catch (error) {
+    const safeError = buildSafeUploadError(error);
     logAxiosError({
-      error,
+      error: safeError,
       message: 'Error uploading vectors',
     });
-    throw new Error(error.message || 'An error occurred during file upload.');
+    /* === VIVENTIUM START ===
+     * Feature: Preserve upstream transport metadata for retry-aware callers.
+     *
+     * Purpose:
+     * - `conversationRecallService` classifies transient failures (e.g., 503) by status/code.
+     * - Wrapping with a plain Error discarded `response.status` and `code`, defeating retry logic.
+     *
+     * Added: 2026-02-19
+     * === VIVENTIUM END === */
+    const wrapped = safeError;
+    throw wrapped;
   }
 }
 

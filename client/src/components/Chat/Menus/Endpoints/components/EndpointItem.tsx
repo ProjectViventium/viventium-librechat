@@ -1,7 +1,7 @@
 import { useMemo } from 'react';
 import { VisuallyHidden } from '@ariakit/react';
 import { Spinner, TooltipAnchor } from '@librechat/client';
-import { CheckCircle2, MousePointerClick, SettingsIcon } from 'lucide-react';
+import { CheckCircle2, MousePointerClick, Plug2, SettingsIcon } from 'lucide-react';
 import { EModelEndpoint, isAgentsEndpoint, isAssistantsEndpoint } from 'librechat-data-provider';
 import type { TModelSpec } from 'librechat-data-provider';
 import type { Endpoint } from '~/common';
@@ -9,6 +9,7 @@ import { CustomMenu as Menu, CustomMenuItem as MenuItem } from '../CustomMenu';
 import { useModelSelectorContext } from '../ModelSelectorContext';
 import { renderEndpointModels } from './EndpointModelItem';
 import { ModelSpecItem } from './ModelSpecItem';
+import { isSpecMappedToEndpoint } from './modelSpecGrouping';
 import { filterModels } from '../utils';
 import { useLocalize } from '~/hooks';
 import { cn } from '~/utils';
@@ -21,14 +22,29 @@ interface EndpointItemProps {
 const SettingsButton = ({
   endpoint,
   className,
+  connectedAccountsEnabled,
   handleOpenKeyDialog,
 }: {
   endpoint: Endpoint;
   className?: string;
-  handleOpenKeyDialog: (endpoint: EModelEndpoint, e: React.MouseEvent) => void;
+  connectedAccountsEnabled: boolean;
+  handleOpenKeyDialog: (
+    endpoint: EModelEndpoint,
+    e: React.MouseEvent | React.KeyboardEvent,
+  ) => void;
 }) => {
   const localize = useLocalize();
-  const text = localize('com_endpoint_config_key');
+  /* === VIVENTIUM START ===
+   * Feature: Connected Accounts quick connect from endpoint menu.
+   * Purpose: Match each provider's real auth flow instead of showing a fake generic key action.
+   * === VIVENTIUM END === */
+  const isOAuthConnectedEndpoint =
+    connectedAccountsEnabled &&
+    (endpoint.value === EModelEndpoint.openAI || endpoint.value === EModelEndpoint.anthropic);
+  const text = isOAuthConnectedEndpoint
+    ? localize('com_ui_connect_account')
+    : localize('com_endpoint_config_key');
+  const Icon = isOAuthConnectedEndpoint ? Plug2 : SettingsIcon;
 
   const handleClick = (e: React.MouseEvent<HTMLButtonElement>) => {
     if (!endpoint.value) {
@@ -43,7 +59,7 @@ const SettingsButton = ({
       e.preventDefault();
       e.stopPropagation();
       if (endpoint.value) {
-        handleOpenKeyDialog(endpoint.value as EModelEndpoint, e as unknown as React.MouseEvent);
+        handleOpenKeyDialog(endpoint.value as EModelEndpoint, e);
       }
     }
   };
@@ -64,7 +80,7 @@ const SettingsButton = ({
       )}
       aria-label={`${text} ${endpoint.label}`}
     >
-      <SettingsIcon className="size-4 shrink-0" aria-hidden="true" />
+      <Icon className="size-4 shrink-0" aria-hidden="true" />
       <span
         aria-hidden="true"
         className={cn(
@@ -80,78 +96,32 @@ const SettingsButton = ({
   );
 };
 
-/**
- * Lazily-rendered content for an endpoint submenu. By extracting this into a
- * separate component, the expensive model-list rendering (and per-item hooks
- * such as MutationObservers in EndpointModelItem) only runs when the submenu
- * is actually mounted — which Ariakit defers via `unmountOnHide`.
- */
-function EndpointMenuContent({
-  endpoint,
-  endpointIndex,
-}: {
-  endpoint: Endpoint;
-  endpointIndex: number;
-}) {
-  const localize = useLocalize();
-  const { agentsMap, assistantsMap, modelSpecs, selectedValues, endpointSearchValues } =
-    useModelSelectorContext();
-  const { modelSpec: selectedSpec } = selectedValues;
-  const searchValue = endpointSearchValues[endpoint.value] || '';
-
-  const endpointSpecs = useMemo(() => {
-    if (!modelSpecs || !modelSpecs.length) {
-      return [];
-    }
-    return modelSpecs.filter((spec: TModelSpec) => spec.group === endpoint.value);
-  }, [modelSpecs, endpoint.value]);
-
-  if (isAssistantsEndpoint(endpoint.value) && endpoint.models === undefined) {
-    return (
-      <div
-        className="flex items-center justify-center p-2"
-        role="status"
-        aria-label={localize('com_ui_loading')}
-      >
-        <Spinner aria-hidden="true" />
-      </div>
-    );
-  }
-
-  const filteredModels = searchValue
-    ? filterModels(
-        endpoint,
-        (endpoint.models || []).map((model) => model.name),
-        searchValue,
-        agentsMap,
-        assistantsMap,
-      )
-    : null;
-
-  return (
-    <>
-      {endpointSpecs.map((spec: TModelSpec) => (
-        <ModelSpecItem key={spec.name} spec={spec} isSelected={selectedSpec === spec.name} />
-      ))}
-      {filteredModels
-        ? renderEndpointModels(endpoint, endpoint.models || [], filteredModels, endpointIndex)
-        : endpoint.models &&
-          renderEndpointModels(endpoint, endpoint.models, undefined, endpointIndex)}
-    </>
-  );
-}
-
 export function EndpointItem({ endpoint, endpointIndex }: EndpointItemProps) {
   const localize = useLocalize();
   const {
+    agentsMap,
+    assistantsMap,
+    modelSpecs,
     selectedValues,
     handleOpenKeyDialog,
     handleSelectEndpoint,
     endpointSearchValues,
     setEndpointSearchValue,
     endpointRequiresUserKey,
+    connectedAccountsEnabled,
   } = useModelSelectorContext();
-  const { endpoint: selectedEndpoint, modelSpec: selectedSpec } = selectedValues;
+  const {
+    endpoint: selectedEndpoint,
+    modelSpec: selectedSpec,
+  } = selectedValues;
+
+  // Filter modelSpecs for this endpoint.
+  const endpointSpecs = useMemo(() => {
+    if (!modelSpecs || !modelSpecs.length) {
+      return [];
+    }
+    return modelSpecs.filter((spec: TModelSpec) => isSpecMappedToEndpoint(spec, endpoint));
+  }, [modelSpecs, endpoint]);
 
   const searchValue = endpointSearchValues[endpoint.value] || '';
   const isUserProvided = useMemo(
@@ -173,9 +143,18 @@ export function EndpointItem({ endpoint, endpointIndex }: EndpointItemProps) {
     </div>
   );
 
-  const isEndpointSelected = !selectedSpec && selectedEndpoint === endpoint.value;
+  const isEndpointSelected = selectedEndpoint === endpoint.value;
 
   if (endpoint.hasModels) {
+    const filteredModels = searchValue
+      ? filterModels(
+          endpoint,
+          (Array.isArray(endpoint.models) ? endpoint.models : []).map((model) => model.name),
+          searchValue,
+          agentsMap,
+          assistantsMap,
+        )
+      : null;
     const placeholder =
       isAgentsEndpoint(endpoint.value) || isAssistantsEndpoint(endpoint.value)
         ? localize('com_endpoint_search_var', { 0: endpoint.label })
@@ -184,6 +163,7 @@ export function EndpointItem({ endpoint, endpointIndex }: EndpointItemProps) {
       <Menu
         id={`endpoint-${endpoint.value}-menu`}
         key={`endpoint-${endpoint.value}-item`}
+        defaultOpen={endpoint.value === selectedEndpoint}
         searchValue={searchValue}
         onSearch={(value) => setEndpointSearchValue(endpoint.value, value)}
         combobox={<input placeholder=" " />}
@@ -194,7 +174,11 @@ export function EndpointItem({ endpoint, endpointIndex }: EndpointItemProps) {
             {renderIconLabel()}
             <div className="flex shrink-0 items-center gap-1">
               {isUserProvided && (
-                <SettingsButton endpoint={endpoint} handleOpenKeyDialog={handleOpenKeyDialog} />
+                <SettingsButton
+                  endpoint={endpoint}
+                  connectedAccountsEnabled={connectedAccountsEnabled}
+                  handleOpenKeyDialog={handleOpenKeyDialog}
+                />
               )}
               {isEndpointSelected && (
                 <>
@@ -206,7 +190,37 @@ export function EndpointItem({ endpoint, endpointIndex }: EndpointItemProps) {
           </div>
         }
       >
-        <EndpointMenuContent endpoint={endpoint} endpointIndex={endpointIndex} />
+        {isAssistantsEndpoint(endpoint.value) && endpoint.models === undefined ? (
+          <div
+            className="flex items-center justify-center p-2"
+            role="status"
+            aria-label={localize('com_ui_loading')}
+          >
+            <Spinner aria-hidden="true" />
+          </div>
+        ) : (
+          <>
+            {/* Render modelSpecs for this endpoint */}
+            {endpointSpecs.map((spec: TModelSpec) => (
+              <ModelSpecItem key={spec.name} spec={spec} isSelected={selectedSpec === spec.name} />
+            ))}
+            {/* Render endpoint models */}
+            {filteredModels
+              ? renderEndpointModels(
+                  endpoint,
+                  endpoint.models || [],
+                  filteredModels,
+                  endpointIndex,
+                )
+              : endpoint.models &&
+                renderEndpointModels(
+                  endpoint,
+                  endpoint.models,
+                  undefined,
+                  endpointIndex,
+                )}
+          </>
+        )}
       </Menu>
     );
   } else {
@@ -221,7 +235,11 @@ export function EndpointItem({ endpoint, endpointIndex }: EndpointItemProps) {
         {renderIconLabel()}
         <div className="flex shrink-0 items-center gap-2">
           {endpointRequiresUserKey(endpoint.value) && (
-            <SettingsButton endpoint={endpoint} handleOpenKeyDialog={handleOpenKeyDialog} />
+            <SettingsButton
+              endpoint={endpoint}
+              connectedAccountsEnabled={connectedAccountsEnabled}
+              handleOpenKeyDialog={handleOpenKeyDialog}
+            />
           )}
           {isAssistantsNotLoaded && (
             <TooltipAnchor

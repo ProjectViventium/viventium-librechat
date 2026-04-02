@@ -3,6 +3,14 @@ const { FileSources } = require('librechat-data-provider');
 const { getStrategyFunctions } = require('~/server/services/Files/strategies');
 const { resizeAvatar } = require('~/server/services/Files/images/avatar');
 const { updateUser, createUser, getUserById } = require('~/models');
+/* === VIVENTIUM START ===
+ * Feature: Registration approval support for social-auth account creation.
+ * === VIVENTIUM END === */
+const {
+  isRegistrationApprovalEnabled,
+  markUserPendingApproval,
+  notifyAdminRegistration,
+} = require('~/server/services/viventium/registrationApprovalService');
 
 /**
  * Updates the avatar URL and email of an existing user. If the user's avatar URL does not include the query parameter
@@ -99,6 +107,18 @@ const createSocialUser = async ({
 
   const balanceConfig = getBalanceConfig(appConfig);
   const newUserId = await createUser(update, balanceConfig);
+  /* === VIVENTIUM START ===
+   * Feature: Registration approval workflow for social providers.
+   * === VIVENTIUM END === */
+  if (isRegistrationApprovalEnabled()) {
+    await markUserPendingApproval(newUserId.toString());
+    await notifyAdminRegistration({
+      userId: newUserId.toString(),
+      name,
+      email,
+      provider,
+    });
+  }
   const fileStrategy = appConfig?.fileStrategy ?? process.env.CDN_PROVIDER;
   const isLocal = fileStrategy === FileSources.local;
 

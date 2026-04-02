@@ -34,7 +34,13 @@ jest.mock('~/config', () => ({
 
 describe('Server Configuration', () => {
   // Increase the default timeout to allow for Mongo cleanup
-  jest.setTimeout(30_000);
+  /* === VIVENTIUM START ===
+   * Feature: Test stability (mongodb-memory-server cold start)
+   * Purpose: mongodb-memory-server may need to download a MongoDB binary on first run; 30s is too tight and causes flaky CI/local failures.
+   * Added: 2026-02-06
+   */
+  jest.setTimeout(120_000);
+  /* === VIVENTIUM END === */
 
   let mongoServer;
   let app;
@@ -72,7 +78,11 @@ describe('Server Configuration', () => {
       '<!DOCTYPE html><html><head><title>LibreChat</title></head><body><div id="root"></div></body></html>',
     );
 
-    mongoServer = await MongoMemoryServer.create();
+    mongoServer = await MongoMemoryServer.create({
+      instance: {
+        launchTimeout: 45_000,
+      },
+    });
     process.env.MONGO_URI = mongoServer.getUri();
     process.env.PORT = '0'; // Use a random available port
     app = require('~/server');
@@ -82,12 +92,29 @@ describe('Server Configuration', () => {
   });
 
   afterAll(async () => {
-    await mongoServer.stop();
-    await mongoose.disconnect();
+    /* === VIVENTIUM START ===
+     * Feature: Test stability (teardown guard)
+     * Purpose: Guard teardown when beforeAll fails/times out to prevent cascading failures.
+     * Added: 2026-02-06
+     */
+    try {
+      if (mongoServer) {
+        await mongoServer.stop();
+      }
+    } finally {
+      await mongoose.disconnect().catch(() => {});
+    }
+    /* === VIVENTIUM END === */
   });
 
   it('should return OK for /health', async () => {
     const response = await request(app).get('/health');
+    expect(response.status).toBe(200);
+    expect(response.text).toBe('OK');
+  });
+
+  it('should return OK for /api/health', async () => {
+    const response = await request(app).get('/api/health');
     expect(response.status).toBe(200);
     expect(response.text).toBe('OK');
   });

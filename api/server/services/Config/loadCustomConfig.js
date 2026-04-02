@@ -16,6 +16,29 @@ const projectRoot = path.resolve(__dirname, '..', '..', '..', '..');
 const defaultConfigPath = path.resolve(projectRoot, 'librechat.yaml');
 
 let i = 0;
+const ENV_PLACEHOLDER_REGEX = /\$\{([A-Z0-9_]+)\}/g;
+
+function interpolateEnvPlaceholders(value) {
+  if (typeof value === 'string') {
+    return value.replace(ENV_PLACEHOLDER_REGEX, (_, envKey) => process.env[envKey] ?? '');
+  }
+
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      value[index] = interpolateEnvPlaceholders(value[index]);
+    }
+    return value;
+  }
+
+  if (value && typeof value === 'object') {
+    for (const [key, nestedValue] of Object.entries(value)) {
+      value[key] = interpolateEnvPlaceholders(nestedValue);
+    }
+    return value;
+  }
+
+  return value;
+}
 
 /**
  * Load custom configuration files and caches the object if the `cache` field at root is true.
@@ -65,6 +88,8 @@ async function loadCustomConfig(printConfig = true) {
       return null;
     }
   }
+
+  customConfig = interpolateEnvPlaceholders(customConfig);
 
   const result = configSchema.strict().safeParse(customConfig);
   if (result?.error?.errors?.some((err) => err?.path && err.path?.includes('imageOutputType'))) {

@@ -1,12 +1,12 @@
 # Dockerfile.multi
-# v0.8.4
+# v0.8.3
 
 # Set configurable max-old-space-size with default
 ARG NODE_MAX_OLD_SPACE_SIZE=6144
 
 # Base for all builds
 FROM node:20-alpine AS base-min
-RUN apk upgrade --no-cache
+# Install jemalloc
 RUN apk add --no-cache jemalloc
 # Set environment variable to use jemalloc
 ENV LD_PRELOAD=/usr/lib/libjemalloc.so.2
@@ -58,6 +58,13 @@ RUN npm run build
 
 # Client build
 FROM base AS client-build
+# === VIVENTIUM START ===
+# Feature: Docker build stability (configurable Node heap)
+# Purpose: Redeclare NODE_MAX_OLD_SPACE_SIZE in this stage so NODE_OPTIONS honors the ARG during client build.
+# Why: Docker ARGs are stage-scoped; without redeclaration the build stage ignores the configured value, which can cause OOM in CI/ACR builds.
+# Added: 2026-02-07
+ARG NODE_MAX_OLD_SPACE_SIZE=6144
+# === VIVENTIUM END ===
 WORKDIR /app/client
 COPY client ./
 COPY --from=data-provider-build /app/packages/data-provider/dist /app/packages/data-provider/dist

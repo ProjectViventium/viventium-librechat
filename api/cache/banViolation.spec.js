@@ -13,14 +13,34 @@ describe('banViolation', () => {
   let req, res, errorMessage;
 
   beforeAll(async () => {
-    mongoServer = await MongoMemoryServer.create();
+    /* === VIVENTIUM START ===
+     * Feature: Test stability (mongodb-memory-server cold start)
+     * Purpose: mongodb-memory-server can take >10s on first run (binary download/cold start).
+     * Approach: Increase jest timeout and MongoMemoryServer launchTimeout to avoid flaky local runs.
+     * Added: 2026-02-07
+     */
+    jest.setTimeout(120000);
+    mongoServer = await MongoMemoryServer.create({
+      instance: {
+        launchTimeout: 60000,
+      },
+    });
+    /* === VIVENTIUM END === */
     const mongoUri = mongoServer.getUri();
     await mongoose.connect(mongoUri);
   });
 
   afterAll(async () => {
     await mongoose.disconnect();
-    await mongoServer.stop();
+    /* === VIVENTIUM START ===
+     * Feature: Test stability (teardown guard)
+     * Purpose: Avoid teardown errors if MongoMemoryServer failed to create.
+     * Added: 2026-02-07
+     */
+    if (mongoServer) {
+      await mongoServer.stop();
+    }
+    /* === VIVENTIUM END === */
   });
 
   beforeEach(() => {

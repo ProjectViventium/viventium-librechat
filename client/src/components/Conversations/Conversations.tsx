@@ -48,7 +48,7 @@ const MeasuredRow: FC<MeasuredRowProps> = memo(
   ({ cache, rowKey, parent, index, style, children }) => (
     <CellMeasurer cache={cache} columnIndex={0} key={rowKey} parent={parent} rowIndex={index}>
       {({ registerChild }) => (
-        <div ref={registerChild as React.LegacyRef<HTMLDivElement>} style={style} className="px-3">
+        <div ref={registerChild as React.LegacyRef<HTMLDivElement>} style={style}>
           {children}
         </div>
       )}
@@ -99,9 +99,6 @@ const DateLabel: FC<{ groupName: string; isFirst?: boolean }> = memo(({ groupNam
   const localize = useLocalize();
   return (
     <h2
-      aria-label={localize('com_a11y_chats_date_section', {
-        date: localize(groupName as TranslationKeys) || groupName,
-      })}
       className={cn('pl-1 pt-1 text-text-secondary', isFirst === true ? 'mt-0' : 'mt-2')}
       style={{ fontSize: '0.7rem' }}
     >
@@ -168,8 +165,6 @@ const Conversations: FC<ConversationsProps> = ({
   const convoHeight = isSmallScreen ? 44 : 34;
   const showAgentMarketplace = useShowMarketplace();
 
-  const favoritesContentKeyRef = useRef('');
-
   // Fetch active job IDs for showing generation indicators
   const { data: activeJobsData } = useActiveJobs();
   const activeJobIds = useMemo(
@@ -180,8 +175,6 @@ const Conversations: FC<ConversationsProps> = ({
   // Determine if FavoritesList will render content
   const shouldShowFavorites =
     !search.query && (isFavoritesLoading || favorites.length > 0 || showAgentMarketplace);
-
-  favoritesContentKeyRef.current = `${favorites.length}-${showAgentMarketplace ? 1 : 0}-${isFavoritesLoading ? 1 : 0}`;
 
   const filteredConversations = useMemo(
     () => rawConversations.filter(Boolean) as TConversation[],
@@ -230,7 +223,7 @@ const Conversations: FC<ConversationsProps> = ({
             return `unknown-${index}`;
           }
           if (item.type === 'favorites') {
-            return `favorites-${favoritesContentKeyRef.current}`;
+            return 'favorites';
           }
           if (item.type === 'chats-header') {
             return 'chats-header';
@@ -250,6 +243,7 @@ const Conversations: FC<ConversationsProps> = ({
     [convoHeight],
   );
 
+  // Debounced function to clear cache and recompute heights
   const clearFavoritesCache = useCallback(() => {
     if (cache) {
       cache.clear(0, 0);
@@ -259,12 +253,13 @@ const Conversations: FC<ConversationsProps> = ({
     }
   }, [cache, containerRef]);
 
+  // Clear cache when favorites change
   useEffect(() => {
     const frameId = requestAnimationFrame(() => {
       clearFavoritesCache();
     });
     return () => cancelAnimationFrame(frameId);
-  }, [favorites.length, isFavoritesLoading, showAgentMarketplace, clearFavoritesCache]);
+  }, [favorites.length, isFavoritesLoading, clearFavoritesCache]);
 
   const rowRenderer = useCallback(
     ({ index, key, parent, style }) => {
@@ -282,7 +277,11 @@ const Conversations: FC<ConversationsProps> = ({
       if (item.type === 'favorites') {
         return (
           <MeasuredRow key={key} {...rowProps}>
-            <FavoritesList isSmallScreen={isSmallScreen} toggleNav={toggleNav} />
+            <FavoritesList
+              isSmallScreen={isSmallScreen}
+              toggleNav={toggleNav}
+              onHeightChange={clearFavoritesCache}
+            />
           </MeasuredRow>
         );
       }
@@ -331,6 +330,7 @@ const Conversations: FC<ConversationsProps> = ({
       flattenedItems,
       moveToTop,
       toggleNav,
+      clearFavoritesCache,
       isSmallScreen,
       isChatsExpanded,
       setIsChatsExpanded,
@@ -383,7 +383,7 @@ const Conversations: FC<ConversationsProps> = ({
                 aria-label="Conversations"
                 onRowsRendered={handleRowsRendered}
                 tabIndex={-1}
-                style={{ outline: 'none' }}
+                style={{ outline: 'none', scrollbarGutter: 'stable' }}
                 containerRole="rowgroup"
               />
             )}
@@ -394,5 +394,4 @@ const Conversations: FC<ConversationsProps> = ({
   );
 };
 
-export { DateLabel };
 export default memo(Conversations);

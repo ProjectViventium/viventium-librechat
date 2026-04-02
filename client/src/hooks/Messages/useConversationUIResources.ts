@@ -2,7 +2,7 @@ import { useMemo } from 'react';
 import { useRecoilValue } from 'recoil';
 import { Tools } from 'librechat-data-provider';
 import type { TAttachment, UIResource } from 'librechat-data-provider';
-import { useOptionalMessagesOperations } from '~/Providers';
+import { useMessagesOperations } from '~/Providers';
 import store from '~/store';
 
 /**
@@ -16,7 +16,7 @@ import store from '~/store';
 export function useConversationUIResources(
   conversationId: string | undefined,
 ): Map<string, UIResource> {
-  const { getMessages } = useOptionalMessagesOperations();
+  const { getMessages } = useMessagesOperations();
 
   const conversationAttachmentsMap = useRecoilValue(
     store.conversationAttachmentsSelector(conversationId),

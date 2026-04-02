@@ -8,6 +8,14 @@ const {
 } = require('@librechat/api');
 const { syncUserEntraGroupMemberships } = require('~/server/services/PermissionService');
 const { setAuthTokens, setOpenIDAuthTokens } = require('~/server/services/AuthService');
+/* === VIVENTIUM START ===
+ * Feature: Registration approval gate for OAuth callbacks.
+ * === VIVENTIUM END === */
+const {
+  isRegistrationApprovalEnabled,
+  isViventiumApproved,
+  PENDING_APPROVAL_MESSAGE,
+} = require('~/server/services/viventium/registrationApprovalService');
 const getLogStores = require('~/cache/getLogStores');
 const { checkBan } = require('~/server/middleware');
 const { generateToken } = require('~/models');
@@ -36,6 +44,19 @@ function createOAuthHandler(redirectUri = domains.client) {
         return;
       }
 
+      /* === VIVENTIUM START ===
+       * Feature: OAuth registration approval gate.
+       * Purpose: Prevent pending/denied users from receiving OAuth session tokens.
+       * === VIVENTIUM END === */
+      if (isRegistrationApprovalEnabled() && !isViventiumApproved(req.user)) {
+        const loginUrl = new URL(domains.client || redirectUri);
+        loginUrl.pathname = '/login';
+        loginUrl.searchParams.set('redirect', 'false');
+        loginUrl.searchParams.set('error', 'viventium_pending_approval');
+        loginUrl.searchParams.set('error_description', PENDING_APPROVAL_MESSAGE);
+        return res.redirect(loginUrl.toString());
+      }
+
       /** Check if this is an admin panel redirect (cross-origin) */
       if (isAdminPanelRedirect(redirectUri, getAdminPanelUrl(), domains.client)) {
         /** For admin panel, generate exchange code instead of setting cookies */
@@ -47,15 +68,9 @@ function createOAuthHandler(redirectUri = domains.client) {
         const refreshToken =
           req.user.tokenset?.refresh_token || req.user.federatedTokens?.refresh_token;
 
+        const exchangeCode = await generateAdminExchangeCode(cache, req.user, token, refreshToken);
+
         const callbackUrl = new URL(redirectUri);
-        const exchangeCode = await generateAdminExchangeCode(
-          cache,
-          req.user,
-          token,
-          refreshToken,
-          callbackUrl.origin,
-          req.pkceChallenge,
-        );
         callbackUrl.searchParams.set('code', exchangeCode);
         logger.info(`[OAuth] Admin panel redirect with exchange code for user: ${req.user.email}`);
         return res.redirect(callbackUrl.toString());
@@ -68,7 +83,7 @@ function createOAuthHandler(redirectUri = domains.client) {
         isEnabled(process.env.OPENID_REUSE_TOKENS) === true
       ) {
         await syncUserEntraGroupMemberships(req.user, req.user.tokenset.access_token);
-        setOpenIDAuthTokens(req.user.tokenset, req, res, req.user._id.toString());
+        await setOpenIDAuthTokens(req.user.tokenset, req, res, req.user._id.toString());
       } else {
         await setAuthTokens(req.user._id, res);
       }

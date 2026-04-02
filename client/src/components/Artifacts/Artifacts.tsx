@@ -1,16 +1,15 @@
-import { useRef, useState, useEffect, useCallback } from 'react';
-import copy from 'copy-to-clipboard';
+import { useRef, useState, useEffect } from 'react';
 import * as Tabs from '@radix-ui/react-tabs';
 import { Code, Play, RefreshCw, X } from 'lucide-react';
 import { useSetRecoilState, useResetRecoilState } from 'recoil';
 import { Button, Spinner, useMediaQuery, Radio } from '@librechat/client';
 import type { SandpackPreviewRef } from '@codesandbox/sandpack-react';
-import CopyButton from '~/components/Messages/Content/CopyButton';
 import { useShareContext, useMutationState } from '~/Providers';
 import useArtifacts from '~/hooks/Artifacts/useArtifacts';
 import DownloadArtifact from './DownloadArtifact';
 import ArtifactVersion from './ArtifactVersion';
 import ArtifactTabs from './ArtifactTabs';
+import { CopyCodeButton } from './Code';
 import { useLocalize } from '~/hooks';
 import { cn } from '~/utils';
 import store from '~/store';
@@ -31,7 +30,6 @@ export default function Artifacts() {
   const [height, setHeight] = useState(90);
   const [isDragging, setIsDragging] = useState(false);
   const [blurAmount, setBlurAmount] = useState(0);
-  const [isCopied, setIsCopied] = useState(false);
   const dragStartY = useRef(0);
   const dragStartHeight = useRef(90);
   const setArtifactsVisible = useSetRecoilState(store.artifactsVisibility);
@@ -87,16 +85,6 @@ export default function Artifacts() {
     orderedArtifactIds,
     setCurrentArtifactId,
   } = useArtifacts();
-
-  const handleCopyArtifact = useCallback(() => {
-    const content = currentArtifact?.content ?? '';
-    if (!content) {
-      return;
-    }
-    copy(content, { format: 'text/plain' });
-    setIsCopied(true);
-    setTimeout(() => setIsCopied(false), 3000);
-  }, [currentArtifact?.content]);
 
   const handleDragStart = (e: React.PointerEvent) => {
     setIsDragging(true);
@@ -228,7 +216,7 @@ export default function Artifacts() {
           {/* Header */}
           <div
             className={cn(
-              'flex h-[52px] flex-shrink-0 items-center justify-between gap-2 border-b border-border-light bg-surface-primary-alt p-2 transition-all duration-300',
+              'flex flex-shrink-0 items-center justify-between gap-2 border-b border-border-light bg-surface-primary-alt px-3 py-2 transition-all duration-300',
               isMobile ? 'justify-center' : 'overflow-hidden',
             )}
           >
@@ -246,7 +234,6 @@ export default function Artifacts() {
                   value={activeTab}
                   onChange={setActiveTab}
                   disabled={isMutating && activeTab !== 'code'}
-                  buttonClassName="h-9 px-3 gap-1.5"
                 />
               </div>
             )}
@@ -262,7 +249,6 @@ export default function Artifacts() {
                 <Button
                   size="icon"
                   variant="ghost"
-                  className="h-9 w-9"
                   onClick={handleRefresh}
                   disabled={isRefreshing}
                   aria-label={localize('com_ui_refresh')}
@@ -293,12 +279,11 @@ export default function Artifacts() {
                   }}
                 />
               )}
-              <CopyButton isCopied={isCopied} iconOnly onClick={handleCopyArtifact} />
+              <CopyCodeButton content={currentArtifact.content ?? ''} />
               <DownloadArtifact artifact={currentArtifact} />
               <Button
                 size="icon"
                 variant="ghost"
-                className="h-9 w-9"
                 onClick={closeArtifacts}
                 aria-label={localize('com_ui_close')}
               >

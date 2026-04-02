@@ -61,11 +61,18 @@ function AuthLayout({
       <Banner />
       <BlinkAnimation active={isFetching}>
         <div className="mt-6 h-10 w-full bg-cover">
+          {/* === VIVENTIUM START ===
+           * Feature: Viventium branding fallback (auth logo alt)
+           * Purpose: Default to "Viventium" for logo alt text when startup config is missing.
+           * Details: docs/requirements_and_learnings/16_Branding_and_Assets.md#librechat-auth-logo
+           * Added: 2026-01-26
+           */}
           <img
             src="assets/logo.svg"
             className="h-full w-full object-contain"
-            alt={localize('com_ui_logo', { 0: startupConfig?.appTitle ?? 'LibreChat' })}
+            alt={localize('com_ui_logo', { 0: startupConfig?.appTitle ?? 'Viventium' })}
           />
+          {/* === VIVENTIUM END === */}
         </div>
       </BlinkAnimation>
       <DisplayError />

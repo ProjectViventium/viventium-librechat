@@ -1,34 +1,127 @@
 const { nanoid } = require('nanoid');
+const { Constants } = require('@librechat/agents');
 const { logger } = require('@librechat/data-schemas');
-const { Tools, StepTypes, FileContext, ErrorTypes } = require('librechat-data-provider');
-const {
-  EnvVar,
-  Constants,
-  GraphEvents,
-  GraphNodeKeys,
-  ToolEndHandler,
-} = require('@librechat/agents');
 const {
   sendEvent,
   GenerationJobManager,
   writeAttachmentEvent,
   createToolExecuteHandler,
 } = require('@librechat/api');
+const { Tools, StepTypes, FileContext, ErrorTypes } = require('librechat-data-provider');
+const {
+  EnvVar,
+  Providers,
+  GraphEvents,
+  getMessageId,
+  ToolEndHandler,
+  handleToolCalls,
+} = require('@librechat/agents');
 const { processFileCitations } = require('~/server/services/Files/Citations');
 const { processCodeOutput } = require('~/server/services/Files/Code/process');
 const { loadAuthValues } = require('~/server/services/Tools/credentials');
 const { saveBase64Image } = require('~/server/services/Files/process');
+/* === VIVENTIUM START ===
+ * Feature: Deep Telegram timing instrumentation (toggleable)
+ * Purpose: Add request-scoped timing logs for Telegram streams (cold starts, latency hotspots) without affecting other surfaces.
+ * Added: 2026-02-07
+ */
+const {
+  isDeepTimingEnabled,
+  logDeepTiming,
+} = require('~/server/services/viventium/telegramTimingDeep');
+/* === VIVENTIUM END === */
+
+/* === VIVENTIUM NOTE ===
+ * Feature: Voice latency stage logging inside stream handlers.
+ * Purpose: Mark first delta and tool-step milestones relative to process_stream_start.
+ * Added: 2026-03-03
+ */
+const isVoiceLatencyEnabled = (req) => req?.viventiumVoiceLogLatency === true;
+
+const getVoiceLatencyRequestId = (req) => {
+  const requestId = req?.viventiumVoiceRequestId;
+  if (typeof requestId === 'string' && requestId.length > 0) {
+    return requestId;
+  }
+  return 'unknown';
+};
+
+const getVoiceProcessStreamStartAt = (req) =>
+  typeof req?._viventiumVoiceProcessStreamStartedAt === 'number'
+    ? req._viventiumVoiceProcessStreamStartedAt
+    : null;
+
+const logVoiceLatencyStage = (req, stage, stageStartAt = null, details = '') => {
+  if (!isVoiceLatencyEnabled(req)) {
+    return;
+  }
+  const now = Date.now();
+  const routeStartAt = typeof req?.viventiumVoiceStartAt === 'number' ? req.viventiumVoiceStartAt : now;
+  const stageMs = typeof stageStartAt === 'number' ? now - stageStartAt : null;
+  const requestId = getVoiceLatencyRequestId(req);
+  const stagePart = stageMs == null ? '' : ` stage_ms=${stageMs}`;
+  const detailPart = details ? ` ${details}` : '';
+  logger.info(
+    `[VoiceLatency][LC] stage=${stage} request_id=${requestId} total_ms=${now - routeStartAt}${stagePart}${detailPart}`,
+  );
+};
+
+/* === VIVENTIUM START ===
+ * Feature: Voice orchestration event timeline (compact per-turn telemetry state).
+ * Purpose: Capture first-occurrence timestamps and event counts with low log volume.
+ * Added: 2026-03-03
+ */
+const getOrInitVoiceOrchState = (req) => {
+  if (!req) {
+    return null;
+  }
+  if (!req._viventiumVoiceOrchState || typeof req._viventiumVoiceOrchState !== 'object') {
+    req._viventiumVoiceOrchState = {
+      firstTs: Object.create(null),
+      counts: Object.create(null),
+    };
+  }
+  return req._viventiumVoiceOrchState;
+};
+
+const markVoiceOrchEvent = (req, eventKey) => {
+  if (!isVoiceLatencyEnabled(req) || !eventKey) {
+    return null;
+  }
+  const state = getOrInitVoiceOrchState(req);
+  if (!state) {
+    return null;
+  }
+  const now = Date.now();
+  const prevCount = Number(state.counts[eventKey] || 0);
+  state.counts[eventKey] = prevCount + 1;
+  const firstSeen = state.firstTs[eventKey] == null;
+  if (firstSeen) {
+    state.firstTs[eventKey] = now;
+  }
+  return { firstSeen, now, count: state.counts[eventKey] };
+};
+/* === VIVENTIUM END === */
+/* === VIVENTIUM NOTE END === */
 
 class ModelEndHandler {
+  /* === VIVENTIUM START ===
+   * Feature: Deep Telegram timing instrumentation (toggleable)
+   * Purpose: Thread `req` through ModelEndHandler so we can log model_end timing for Telegram streams.
+   * Added: 2026-02-07
+   */
   /**
    * @param {Array<UsageMetadata>} collectedUsage
+   * @param {import('http').IncomingMessage | undefined} req
    */
-  constructor(collectedUsage) {
+  constructor(collectedUsage, req) {
     if (!Array.isArray(collectedUsage)) {
       throw new Error('collectedUsage must be an array');
     }
     this.collectedUsage = collectedUsage;
+    this.req = req;
   }
+  /* === VIVENTIUM END === */
 
   finalize(errorMessage) {
     if (!errorMessage) {
@@ -54,6 +147,8 @@ class ModelEndHandler {
     let errorMessage;
     try {
       const agentContext = graph.getAgentContext(metadata);
+      const isGoogle = agentContext.provider === Providers.GOOGLE;
+      const streamingDisabled = !!agentContext.clientOptions?.disableStreaming;
       if (data?.output?.additional_kwargs?.stop_reason === 'refusal') {
         const info = { ...data.output.additional_kwargs };
         errorMessage = JSON.stringify({
@@ -68,6 +163,21 @@ class ModelEndHandler {
         });
       }
 
+      const toolCalls = data?.output?.tool_calls;
+      let hasUnprocessedToolCalls = false;
+      if (Array.isArray(toolCalls) && toolCalls.length > 0 && graph?.toolCallStepIds?.has) {
+        try {
+          hasUnprocessedToolCalls = toolCalls.some(
+            (tc) => tc?.id && !graph.toolCallStepIds.has(tc.id),
+          );
+        } catch {
+          hasUnprocessedToolCalls = false;
+        }
+      }
+      if (isGoogle || streamingDisabled || hasUnprocessedToolCalls) {
+        await handleToolCalls(toolCalls, metadata, graph);
+      }
+
       const usage = data?.output?.usage_metadata;
       if (!usage) {
         return this.finalize(errorMessage);
@@ -77,9 +187,62 @@ class ModelEndHandler {
         usage.model = modelName;
       }
 
-      const taggedUsage = markSummarizationUsage(usage, metadata);
-
-      this.collectedUsage.push(taggedUsage);
+      this.collectedUsage.push(usage);
+      /* === VIVENTIUM START ===
+       * Feature: Deep Telegram timing instrumentation (toggleable)
+       * Purpose: Log model_end timing for Telegram streams.
+       * Added: 2026-02-07
+       */
+      if (isDeepTimingEnabled(this.req)) {
+        logDeepTiming(this.req, 'model_end', null, `model=${usage.model || 'na'}`);
+      }
+      /* === VIVENTIUM END === */
+      /* === VIVENTIUM START ===
+       * Feature: Voice orchestration timeline marker for model end.
+       * Added: 2026-03-03
+       */
+      const modelEndMetric = markVoiceOrchEvent(this.req, 'chat_model_end');
+      if (modelEndMetric?.firstSeen) {
+        logVoiceLatencyStage(
+          this.req,
+          'first_chat_model_end',
+          getVoiceProcessStreamStartAt(this.req),
+          `model=${usage.model || 'unknown'}`,
+        );
+      }
+      /* === VIVENTIUM END === */
+      if (!streamingDisabled) {
+        return this.finalize(errorMessage);
+      }
+      if (!data.output.content) {
+        return this.finalize(errorMessage);
+      }
+      const stepKey = graph.getStepKey(metadata);
+      const message_id = getMessageId(stepKey, graph) ?? '';
+      if (message_id) {
+        await graph.dispatchRunStep(stepKey, {
+          type: StepTypes.MESSAGE_CREATION,
+          message_creation: {
+            message_id,
+          },
+        });
+      }
+      const stepId = graph.getStepIdByKey(stepKey);
+      const content = data.output.content;
+      if (typeof content === 'string') {
+        await graph.dispatchMessageDelta(stepId, {
+          content: [
+            {
+              type: 'text',
+              text: content,
+            },
+          ],
+        });
+      } else if (content.every((c) => c.type?.startsWith('text'))) {
+        await graph.dispatchMessageDelta(stepId, {
+          content,
+        });
+      }
     } catch (error) {
       logger.error('Error handling model end event:', error);
       return this.finalize(errorMessage);
@@ -135,21 +298,163 @@ async function emitEvent(res, streamId, eventData) {
  * @throws {Error} If the request is not found.
  */
 function getDefaultHandlers({
+  /* === VIVENTIUM START ===
+   * Feature: Deep Telegram timing instrumentation (toggleable)
+   * Purpose: Thread `req` into handler builder so we can log timing for Telegram streams.
+   * Added: 2026-02-07
+   */
+  req,
+  /* === VIVENTIUM END === */
   res,
   aggregateContent,
   toolEndCallback,
   collectedUsage,
   streamId = null,
   toolExecuteOptions = null,
-  summarizationOptions = null,
 }) {
   if (!res || !aggregateContent) {
     throw new Error(
       `[getDefaultHandlers] Missing required options: res: ${!res}, aggregateContent: ${!aggregateContent}`,
     );
   }
+  /* === VIVENTIUM START ===
+   * Feature: Deep Telegram timing instrumentation (toggleable)
+   * Purpose: Track whether we've logged first model delta for this request (Telegram traces).
+   * Added: 2026-02-07
+   */
+  const timingEnabled = isDeepTimingEnabled(req);
+  if (timingEnabled && req && req._viventiumFirstDeltaLogged == null) {
+    req._viventiumFirstDeltaLogged = false;
+  }
+  const voiceLatencyEnabled = isVoiceLatencyEnabled(req);
+  if (voiceLatencyEnabled && req) {
+    req._viventiumVoiceOrchState = {
+      firstTs: Object.create(null),
+      counts: Object.create(null),
+    };
+    if (req._viventiumVoiceFirstMessageDeltaLogged == null) {
+      req._viventiumVoiceFirstMessageDeltaLogged = false;
+    }
+    if (req._viventiumVoiceFirstMessageDeltaEmittedLogged == null) {
+      req._viventiumVoiceFirstMessageDeltaEmittedLogged = false;
+    }
+    if (req._viventiumVoiceFirstToolStepLogged == null) {
+      req._viventiumVoiceFirstToolStepLogged = false;
+    }
+    if (req._viventiumVoiceFirstToolCompletedLogged == null) {
+      req._viventiumVoiceFirstToolCompletedLogged = false;
+    }
+  }
+  /* === VIVENTIUM END === */
   const handlers = {
-    [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(collectedUsage),
+    [GraphEvents.CHAT_MODEL_START]: {
+      handle: async (_event, _data, metadata) => {
+        const metric = markVoiceOrchEvent(req, 'chat_model_start');
+        if (metric?.firstSeen) {
+          const modelName =
+            typeof metadata?.ls_model_name === 'string' && metadata.ls_model_name.length > 0
+              ? metadata.ls_model_name
+              : 'unknown';
+          logVoiceLatencyStage(
+            req,
+            'first_chat_model_start',
+            getVoiceProcessStreamStartAt(req),
+            `model=${modelName}`,
+          );
+        }
+      },
+    },
+    [GraphEvents.LLM_START]: {
+      handle: async () => {
+        const metric = markVoiceOrchEvent(req, 'llm_start');
+        if (metric?.firstSeen) {
+          logVoiceLatencyStage(req, 'first_llm_start', getVoiceProcessStreamStartAt(req), '');
+        }
+      },
+    },
+    [GraphEvents.LLM_STREAM]: {
+      handle: async () => {
+        const metric = markVoiceOrchEvent(req, 'llm_stream');
+        if (metric?.firstSeen) {
+          logVoiceLatencyStage(req, 'first_llm_stream', getVoiceProcessStreamStartAt(req), '');
+        }
+      },
+    },
+    [GraphEvents.PROMPT_START]: {
+      handle: async (_event, _data, metadata) => {
+        const metric = markVoiceOrchEvent(req, 'prompt_start');
+        if (metric?.firstSeen) {
+          const node =
+            typeof metadata?.langgraph_node === 'string' && metadata.langgraph_node.length > 0
+              ? metadata.langgraph_node
+              : 'unknown';
+          logVoiceLatencyStage(
+            req,
+            'first_prompt_start',
+            getVoiceProcessStreamStartAt(req),
+            `node=${node}`,
+          );
+        }
+      },
+    },
+    [GraphEvents.PROMPT_END]: {
+      handle: async (_event, _data, metadata) => {
+        const metric = markVoiceOrchEvent(req, 'prompt_end');
+        if (metric?.firstSeen) {
+          const node =
+            typeof metadata?.langgraph_node === 'string' && metadata.langgraph_node.length > 0
+              ? metadata.langgraph_node
+              : 'unknown';
+          logVoiceLatencyStage(
+            req,
+            'first_prompt_end',
+            getVoiceProcessStreamStartAt(req),
+            `node=${node}`,
+          );
+        }
+      },
+    },
+    [GraphEvents.CHAIN_START]: {
+      handle: async (_event, _data, metadata) => {
+        const metric = markVoiceOrchEvent(req, 'chain_start');
+        if (metric?.firstSeen) {
+          const node =
+            typeof metadata?.langgraph_node === 'string' && metadata.langgraph_node.length > 0
+              ? metadata.langgraph_node
+              : 'unknown';
+          logVoiceLatencyStage(
+            req,
+            'first_chain_start',
+            getVoiceProcessStreamStartAt(req),
+            `node=${node}`,
+          );
+        }
+      },
+    },
+    [GraphEvents.CHAIN_END]: {
+      handle: async (_event, _data, metadata) => {
+        const metric = markVoiceOrchEvent(req, 'chain_end');
+        if (metric?.firstSeen) {
+          const node =
+            typeof metadata?.langgraph_node === 'string' && metadata.langgraph_node.length > 0
+              ? metadata.langgraph_node
+              : 'unknown';
+          logVoiceLatencyStage(
+            req,
+            'first_chain_end',
+            getVoiceProcessStreamStartAt(req),
+            `node=${node}`,
+          );
+        }
+      },
+    },
+    /* === VIVENTIUM START ===
+     * Feature: Deep Telegram timing instrumentation (toggleable)
+     * Purpose: Provide req to ModelEndHandler so it can log model_end timing for Telegram streams.
+     * Added: 2026-02-07
+     */
+    [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(collectedUsage, req),
+    /* === VIVENTIUM END === */
     [GraphEvents.TOOL_END]: new ToolEndHandler(toolEndCallback, logger),
     [GraphEvents.ON_RUN_STEP]: {
       /**
@@ -159,7 +464,41 @@ function getDefaultHandlers({
        * @param {GraphRunnableConfig['configurable']} [metadata] The runnable metadata.
        */
       handle: async (event, data, metadata) => {
-        aggregateContent({ event, data });
+        const runStepMetric = markVoiceOrchEvent(req, 'on_run_step');
+        if (runStepMetric?.firstSeen) {
+          logVoiceLatencyStage(
+            req,
+            'first_run_step',
+            getVoiceProcessStreamStartAt(req),
+            `step_type=${data?.stepDetails?.type || 'unknown'}`,
+          );
+        }
+        if (voiceLatencyEnabled && data?.stepDetails?.type === StepTypes.TOOL_CALLS) {
+          const toolCalls = Array.isArray(data?.stepDetails?.tool_calls)
+            ? data.stepDetails.tool_calls
+            : [];
+          const toolNames = toolCalls
+            .map((toolCall) => toolCall?.function?.name || toolCall?.name)
+            .filter((name) => typeof name === 'string')
+            .slice(0, 6)
+            .join(',');
+          const processStreamStartAt = getVoiceProcessStreamStartAt(req);
+          logVoiceLatencyStage(
+            req,
+            'run_step_tool_calls',
+            processStreamStartAt,
+            `step_id=${data?.id || 'unknown'} calls=${toolCalls.length}${toolNames ? ` names=${toolNames}` : ''}`,
+          );
+          if (req && req._viventiumVoiceFirstToolStepLogged === false) {
+            req._viventiumVoiceFirstToolStepLogged = true;
+            logVoiceLatencyStage(
+              req,
+              'first_tool_call_step',
+              processStreamStartAt,
+              `step_id=${data?.id || 'unknown'} calls=${toolCalls.length}`,
+            );
+          }
+        }
         if (data?.stepDetails.type === StepTypes.TOOL_CALLS) {
           await emitEvent(res, streamId, { event, data });
         } else if (checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node)) {
@@ -178,6 +517,7 @@ function getDefaultHandlers({
             },
           });
         }
+        aggregateContent({ event, data });
       },
     },
     [GraphEvents.ON_RUN_STEP_DELTA]: {
@@ -188,7 +528,15 @@ function getDefaultHandlers({
        * @param {GraphRunnableConfig['configurable']} [metadata] The runnable metadata.
        */
       handle: async (event, data, metadata) => {
-        aggregateContent({ event, data });
+        const runStepDeltaMetric = markVoiceOrchEvent(req, 'on_run_step_delta');
+        if (runStepDeltaMetric?.firstSeen) {
+          logVoiceLatencyStage(
+            req,
+            'first_run_step_delta',
+            getVoiceProcessStreamStartAt(req),
+            `delta_type=${data?.delta?.type || 'unknown'}`,
+          );
+        }
         if (data?.delta.type === StepTypes.TOOL_CALLS) {
           await emitEvent(res, streamId, { event, data });
         } else if (checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node)) {
@@ -196,6 +544,7 @@ function getDefaultHandlers({
         } else if (!metadata?.hide_sequential_outputs) {
           await emitEvent(res, streamId, { event, data });
         }
+        aggregateContent({ event, data });
       },
     },
     [GraphEvents.ON_RUN_STEP_COMPLETED]: {
@@ -206,7 +555,36 @@ function getDefaultHandlers({
        * @param {GraphRunnableConfig['configurable']} [metadata] The runnable metadata.
        */
       handle: async (event, data, metadata) => {
-        aggregateContent({ event, data });
+        const runStepCompletedMetric = markVoiceOrchEvent(req, 'on_run_step_completed');
+        if (runStepCompletedMetric?.firstSeen) {
+          logVoiceLatencyStage(
+            req,
+            'first_run_step_completed',
+            getVoiceProcessStreamStartAt(req),
+            `result_type=${data?.result?.type || 'unknown'}`,
+          );
+        }
+        if (voiceLatencyEnabled && data?.result?.type === 'tool_call') {
+          const toolCall = data?.result?.tool_call || {};
+          const toolName = typeof toolCall?.name === 'string' ? toolCall.name : 'unknown';
+          const toolId = typeof toolCall?.id === 'string' ? toolCall.id : 'unknown';
+          const processStreamStartAt = getVoiceProcessStreamStartAt(req);
+          logVoiceLatencyStage(
+            req,
+            'run_step_tool_call_completed',
+            processStreamStartAt,
+            `step_id=${data?.result?.id || 'unknown'} tool_name=${toolName} tool_id=${toolId}`,
+          );
+          if (req && req._viventiumVoiceFirstToolCompletedLogged === false) {
+            req._viventiumVoiceFirstToolCompletedLogged = true;
+            logVoiceLatencyStage(
+              req,
+              'first_tool_call_completed',
+              processStreamStartAt,
+              `tool_name=${toolName} tool_id=${toolId}`,
+            );
+          }
+        }
         if (data?.result != null) {
           await emitEvent(res, streamId, { event, data });
         } else if (checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node)) {
@@ -214,6 +592,7 @@ function getDefaultHandlers({
         } else if (!metadata?.hide_sequential_outputs) {
           await emitEvent(res, streamId, { event, data });
         }
+        aggregateContent({ event, data });
       },
     },
     [GraphEvents.ON_MESSAGE_DELTA]: {
@@ -224,12 +603,61 @@ function getDefaultHandlers({
        * @param {GraphRunnableConfig['configurable']} [metadata] The runnable metadata.
        */
       handle: async (event, data, metadata) => {
-        aggregateContent({ event, data });
-        if (checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node)) {
-          await emitEvent(res, streamId, { event, data });
-        } else if (!metadata?.hide_sequential_outputs) {
-          await emitEvent(res, streamId, { event, data });
+        markVoiceOrchEvent(req, 'on_message_delta');
+        /* === VIVENTIUM START ===
+         * Feature: Deep Telegram timing instrumentation (toggleable)
+         * Purpose: Log the first model delta for Telegram streams (helps pinpoint cold-start latency).
+         * Added: 2026-02-07
+         */
+        if (
+          timingEnabled &&
+          req &&
+          req._viventiumFirstDeltaLogged === false &&
+          checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node)
+        ) {
+          req._viventiumFirstDeltaLogged = true;
+          logDeepTiming(req, 'model_first_delta');
         }
+        /* === VIVENTIUM END === */
+        if (
+          voiceLatencyEnabled &&
+          req &&
+          req._viventiumVoiceFirstMessageDeltaLogged === false &&
+          (checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node) ||
+            !metadata?.hide_sequential_outputs)
+        ) {
+          req._viventiumVoiceFirstMessageDeltaLogged = true;
+          const processStreamStartAt = getVoiceProcessStreamStartAt(req);
+          const deltaCount = Array.isArray(data?.delta?.content) ? data.delta.content.length : 0;
+          logVoiceLatencyStage(
+            req,
+            'first_message_delta',
+            processStreamStartAt,
+            `delta_parts=${deltaCount}`,
+          );
+        }
+        const shouldEmitLastAgent = checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node);
+        const shouldEmit = shouldEmitLastAgent || !metadata?.hide_sequential_outputs;
+        const emitStartedAt = shouldEmit ? Date.now() : null;
+
+        if (shouldEmit) {
+          await emitEvent(res, streamId, { event, data });
+          if (
+            voiceLatencyEnabled &&
+            req &&
+            req._viventiumVoiceFirstMessageDeltaEmittedLogged === false &&
+            emitStartedAt != null
+          ) {
+            req._viventiumVoiceFirstMessageDeltaEmittedLogged = true;
+            logVoiceLatencyStage(
+              req,
+              'first_message_delta_emit_done',
+              emitStartedAt,
+              `emit_target=${streamId ? 'generation_job' : 'http_sse'}`,
+            );
+          }
+        }
+        aggregateContent({ event, data });
       },
     },
     [GraphEvents.ON_REASONING_DELTA]: {
@@ -240,12 +668,21 @@ function getDefaultHandlers({
        * @param {GraphRunnableConfig['configurable']} [metadata] The runnable metadata.
        */
       handle: async (event, data, metadata) => {
-        aggregateContent({ event, data });
+        const reasoningMetric = markVoiceOrchEvent(req, 'on_reasoning_delta');
+        if (reasoningMetric?.firstSeen) {
+          logVoiceLatencyStage(
+            req,
+            'first_reasoning_delta',
+            getVoiceProcessStreamStartAt(req),
+            '',
+          );
+        }
         if (checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node)) {
           await emitEvent(res, streamId, { event, data });
         } else if (!metadata?.hide_sequential_outputs) {
           await emitEvent(res, streamId, { event, data });
         }
+        aggregateContent({ event, data });
       },
     },
   };
@@ -253,37 +690,6 @@ function getDefaultHandlers({
   if (toolExecuteOptions) {
     handlers[GraphEvents.ON_TOOL_EXECUTE] = createToolExecuteHandler(toolExecuteOptions);
   }
-
-  if (summarizationOptions?.enabled !== false) {
-    handlers[GraphEvents.ON_SUMMARIZE_START] = {
-      handle: async (_event, data) => {
-        await emitEvent(res, streamId, {
-          event: GraphEvents.ON_SUMMARIZE_START,
-          data,
-        });
-      },
-    };
-    handlers[GraphEvents.ON_SUMMARIZE_DELTA] = {
-      handle: async (_event, data) => {
-        aggregateContent({ event: GraphEvents.ON_SUMMARIZE_DELTA, data });
-        await emitEvent(res, streamId, {
-          event: GraphEvents.ON_SUMMARIZE_DELTA,
-          data,
-        });
-      },
-    };
-    handlers[GraphEvents.ON_SUMMARIZE_COMPLETE] = {
-      handle: async (_event, data) => {
-        aggregateContent({ event: GraphEvents.ON_SUMMARIZE_COMPLETE, data });
-        await emitEvent(res, streamId, {
-          event: GraphEvents.ON_SUMMARIZE_COMPLETE,
-          data,
-        });
-      },
-    };
-  }
-
-  handlers[GraphEvents.ON_AGENT_LOG] = { handle: agentLogHandler };
 
   return handlers;
 }
@@ -708,62 +1114,8 @@ function createResponsesToolEndCallback({ req, res, tracker, artifactPromises })
   };
 }
 
-const ALLOWED_LOG_LEVELS = new Set(['debug', 'info', 'warn', 'error']);
-
-function agentLogHandler(_event, data) {
-  if (!data) {
-    return;
-  }
-  const logFn = ALLOWED_LOG_LEVELS.has(data.level) ? logger[data.level] : logger.debug;
-  const meta = typeof data.data === 'object' && data.data != null ? data.data : {};
-  logFn(`[agents:${data.scope ?? 'unknown'}] ${data.message ?? ''}`, {
-    ...meta,
-    runId: data.runId,
-    agentId: data.agentId,
-  });
-}
-
-function markSummarizationUsage(usage, metadata) {
-  const node = metadata?.langgraph_node;
-  if (typeof node === 'string' && node.startsWith(GraphNodeKeys.SUMMARIZE)) {
-    return { ...usage, usage_type: 'summarization' };
-  }
-  return usage;
-}
-
-const agentLogHandlerObj = { handle: agentLogHandler };
-
-/**
- * Builds the three summarization SSE event handlers.
- * In streaming mode, each event is forwarded to the client via `res.write`.
- * In non-streaming mode, the handlers are no-ops.
- * @param {{ isStreaming: boolean, res: import('express').Response }} opts
- */
-function buildSummarizationHandlers({ isStreaming, res }) {
-  if (!isStreaming) {
-    const noop = { handle: () => {} };
-    return { on_summarize_start: noop, on_summarize_delta: noop, on_summarize_complete: noop };
-  }
-  const writeEvent = (name) => ({
-    handle: async (_event, data) => {
-      if (!res.writableEnded) {
-        res.write(`event: ${name}\ndata: ${JSON.stringify(data)}\n\n`);
-      }
-    },
-  });
-  return {
-    on_summarize_start: writeEvent('on_summarize_start'),
-    on_summarize_delta: writeEvent('on_summarize_delta'),
-    on_summarize_complete: writeEvent('on_summarize_complete'),
-  };
-}
-
 module.exports = {
-  agentLogHandler,
-  agentLogHandlerObj,
   getDefaultHandlers,
   createToolEndCallback,
-  markSummarizationUsage,
-  buildSummarizationHandlers,
   createResponsesToolEndCallback,
 };

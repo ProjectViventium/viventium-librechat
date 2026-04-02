@@ -4,6 +4,13 @@ import { AgentCapabilities } from 'librechat-data-provider';
 import { useFormContext, Controller } from 'react-hook-form';
 import type { AgentForm } from '~/common';
 import { useAgentPanelContext } from '~/Providers';
+/* === VIVENTIUM START ===
+ * Feature: Background Cortices (Multi-Agent Brain Architecture)
+ * Added: 2026-01-03
+ * Updated: 2026-01-03 - Using new many-to-many cortex relationships
+ */
+import { BackgroundCorticesConfig } from '../Viventium';
+/* === VIVENTIUM END === */
 import MaxAgentSteps from './MaxAgentSteps';
 import AgentHandoffs from './AgentHandoffs';
 import { useLocalize } from '~/hooks';
@@ -42,6 +49,20 @@ export default function AdvancedPanel() {
         <div className="mb-2 mt-2 text-xl font-medium">{localize('com_ui_advanced_settings')}</div>
       </div>
       <div className="flex flex-col gap-4 px-2">
+        {/* === VIVENTIUM START ===
+         * Feature: Background Cortices (Multi-Agent Brain Architecture)
+         * Added: 2026-01-03
+         * Updated: 2026-01-03 - Using new many-to-many cortex relationships
+         */}
+        <Controller
+          name="background_cortices"
+          control={control}
+          defaultValue={[]}
+          render={({ field }) => (
+            <BackgroundCorticesConfig field={field} currentAgentId={currentAgentId} />
+          )}
+        />
+        {/* === VIVENTIUM END === */}
         <MaxAgentSteps />
         <Controller
           name="edges"

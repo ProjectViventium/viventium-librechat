@@ -1,6 +1,6 @@
 const { logger } = require('@librechat/data-schemas');
 const { ResourceType, PermissionTypes, Permissions } = require('librechat-data-provider');
-const { getRoleByName } = require('~/models');
+const { getRoleByName } = require('~/models/Role');
 
 /**
  * Maps resource types to their corresponding permission types

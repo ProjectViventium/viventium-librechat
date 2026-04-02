@@ -9,7 +9,6 @@ export interface IToken extends Document {
   createdAt: Date;
   expiresAt: Date;
   metadata?: Map<string, unknown>;
-  tenantId?: string;
 }
 
 export interface TokenCreateData {
@@ -26,7 +25,6 @@ export interface TokenQuery {
   userId?: Types.ObjectId | string;
   token?: string;
   email?: string;
-  type?: string;
   identifier?: string;
 }
 

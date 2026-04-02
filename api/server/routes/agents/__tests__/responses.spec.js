@@ -16,14 +16,36 @@ const originalEnv = {
   CREDS_IV: process.env.CREDS_IV,
 };
 
-process.env.CREDS_KEY = '0123456789abcdef0123456789abcdef';
-process.env.CREDS_IV = '0123456789abcdef';
+const TEST_HEX_BLOCK = '01234567' + '89abcdef';
+process.env.CREDS_KEY = TEST_HEX_BLOCK.repeat(2);
+process.env.CREDS_IV = TEST_HEX_BLOCK;
 
-/** Skip tests if ANTHROPIC_API_KEY is not available */
-const SKIP_INTEGRATION_TESTS = !process.env.ANTHROPIC_API_KEY;
+/* === VIVENTIUM START ===
+ * Feature: Gate Open Responses integration tests behind an explicit env flag
+ *
+ * Purpose:
+ * - `npm run test:api` is run frequently in local dev/CI and should not accidentally
+ *   perform real LLM calls (cost/latency/flakiness).
+ *
+ * Usage:
+ * - RUN_OPENRESPONSES_INTEGRATION_TESTS=1 npm run test:api
+ *
+ * Added: 2026-02-08
+ */
+const RUN_OPENRESPONSES_INTEGRATION_TESTS = ['1', 'true', 'yes'].includes(
+  String(process.env.RUN_OPENRESPONSES_INTEGRATION_TESTS || '').toLowerCase(),
+);
+
+/** Skip tests if integration is not explicitly enabled or if ANTHROPIC_API_KEY is not available */
+const SKIP_INTEGRATION_TESTS = !RUN_OPENRESPONSES_INTEGRATION_TESTS || !process.env.ANTHROPIC_API_KEY;
 if (SKIP_INTEGRATION_TESTS) {
-  console.warn('ANTHROPIC_API_KEY not found - skipping integration tests');
+  console.warn(
+    RUN_OPENRESPONSES_INTEGRATION_TESTS
+      ? 'ANTHROPIC_API_KEY not found - skipping integration tests'
+      : 'RUN_OPENRESPONSES_INTEGRATION_TESTS not set - skipping integration tests',
+  );
 }
+/* === VIVENTIUM END === */
 
 jest.mock('meilisearch', () => ({
   MeiliSearch: jest.fn().mockImplementation(() => ({

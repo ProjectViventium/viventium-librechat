@@ -1,0 +1,567 @@
+version: 1.3.6
+cache: true
+interface:
+  customWelcome: Welcome to Viventium
+  endpointsMenu: true
+  modelSelect: true
+  parameters: true
+  sidePanel: true
+  presets: true
+  runCode: false
+  prompts:
+    use: true
+    create: true
+    share: false
+    public: false
+  bookmarks: true
+  multiConvo: true
+  memories: true
+  temporaryChat: true
+  temporaryChatRetention: 24
+  agents:
+    use: true
+    create: true
+    share: false
+    public: false
+  peoplePicker:
+    users: false
+    groups: false
+    roles: false
+  marketplace:
+    use: false
+  fileCitations: true
+  webSearch: true
+  fileSearch: true
+  defaultAgent: agent_viventium_main_95aeb3
+  remoteAgents:
+    use: false
+    create: false
+    share: false
+    public: false
+  mcpServers:
+    placeholder: Integrations
+    use: true
+    create: true
+    share: false
+    public: false
+    trustCheckbox:
+      label:
+        en: I understand and want to continue
+      subLabel:
+        en: Only connect MCP servers you trust. Unreviewed servers can expose data
+          or trigger unintended actions.
+viventium:
+  background_cortices:
+    activation_format:
+      response_format: "Respond with a JSON object:\n{\n  \"should_activate\": true,\n\
+        \  \"confidence\": 1.0,\n  \"reason\": \"2-4 explanatory words\"\n}\n"
+      brew_begin_tag: <!--viv_internal:brew_begin-->
+  no_response:
+    prompt: 'NO RESPONSE TAG:
+
+      - If you have nothing meaningful to add, respond with exactly: {NTA}
+
+      - When you use {NTA}, output ONLY that token and nothing else.
+
+      - Never use {NTA} to hide errors/tool failures; explain the issue briefly instead.
+
+      '
+  configVersion: 1
+  primaryProvider: openai
+  installMode: native
+  consciousAgent:
+    provider: x_ai
+    model: grok-4-1-fast-non-reasoning
+balance:
+  enabled: false
+  startBalance: 200000
+  autoRefillEnabled: true
+  refillIntervalValue: 30
+  refillIntervalUnit: days
+  refillAmount: 200000
+modelSpecs:
+  prioritize: false
+  list:
+  - name: viventium
+    label: Viventium
+    description: Main AI Agent
+    default: true
+    iconURL: /assets/logo.svg
+    preset:
+      endpoint: agents
+      agent_id: agent_viventium_main_95aeb3
+  - name: gemini-3-flash-preview
+    label: Gemini 3 Flash
+    description: Google Gemini
+    group: Google
+    groupIcon: /assets/google.png
+    iconURL: /assets/google.png
+    preset:
+      endpoint: google
+      model: gemini-3-flash-preview
+  - name: gemini-3-pro-preview
+    label: Gemini 3 Pro
+    description: Google Gemini
+    group: Google
+    groupIcon: /assets/google.png
+    iconURL: /assets/google.png
+    preset:
+      endpoint: google
+      model: gemini-3-pro-preview
+  - name: gemini-3.1-pro
+    label: Gemini 3.1 Pro
+    description: Google Gemini
+    group: Google
+    groupIcon: /assets/google.png
+    iconURL: /assets/google.png
+    preset:
+      endpoint: google
+      model: gemini-3.1-pro-preview
+  - name: claude-sonnet-4-6
+    label: Claude Sonnet 4 6
+    description: Anthropic Direct
+    group: anthropic
+    groupIcon: anthropic
+    iconURL: anthropic
+    preset:
+      endpoint: anthropic
+      model: claude-sonnet-4-6
+  - name: claude-opus-4-6
+    label: Claude Opus 4 6
+    description: Anthropic Direct
+    group: anthropic
+    groupIcon: anthropic
+    iconURL: anthropic
+    preset:
+      endpoint: anthropic
+      model: claude-opus-4-6
+  addedEndpoints:
+  - agents
+  - anthropic
+  - google
+  - groq
+  - openrouter
+  - xai
+  - perplexity
+  - custom
+  - openAI
+webSearch:
+  searxngInstanceUrl: ${SEARXNG_INSTANCE_URL}
+  searchProvider: searxng
+  firecrawlApiKey: ${FIRECRAWL_API_KEY}
+  firecrawlApiUrl: ${FIRECRAWL_API_URL}
+  firecrawlVersion: ${FIRECRAWL_VERSION}
+  scraperProvider: firecrawl
+  scraperTimeout: 7500
+  safeSearch: 1
+fileConfig:
+  enabled: true
+  serverFileSizeLimit: 64
+  standardMimeTypes: &id001
+  - application/pdf
+  - text/plain
+  - text/markdown
+  - text/csv
+  - text/tab-separated-values
+  - text/html
+  - text/xml
+  - application/xml
+  - application/json
+  - text/rtf
+  - application/msword
+  - application/vnd.ms-excel
+  - application/vnd.ms-powerpoint
+  - application/vnd.visio
+  - application/vnd.openxmlformats-officedocument.wordprocessingml.document
+  - application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+  - application/vnd.openxmlformats-officedocument.presentationml.presentation
+  - application/vnd.ms-excel.sheet.macroEnabled.12
+  - application/vnd.ms-powerpoint.presentation.macroEnabled.12
+  - application/vnd.oasis.opendocument.text
+  - application/vnd.oasis.opendocument.spreadsheet
+  - application/vnd.oasis.opendocument.presentation
+  - text/x-python
+  - text/javascript
+  - application/javascript
+  - application/typescript
+  - text/x-java-source
+  - text/x-c
+  - text/x-cpp
+  - text/x-csharp
+  - application/x-yaml
+  - application/toml
+  - text/x-sql
+  - text/x-shellscript
+  - application/x-powershell
+  - application/zip
+  - application/x-rar-compressed
+  - application/x-tar
+  - application/gzip
+  - application/x-7z-compressed
+  - image/jpeg
+  - image/png
+  - image/gif
+  - image/webp
+  - image/svg+xml
+  - image/bmp
+  - image/tiff
+  endpoints:
+    azureOpenAI:
+      disabled: false
+      fileLimit: 100
+      fileSizeLimit: 50
+      totalSizeLimit: 100
+      supportedMimeTypes: *id001
+    openAI:
+      disabled: false
+      fileLimit: 100
+      fileSizeLimit: 50
+      totalSizeLimit: 100
+      supportedMimeTypes: *id001
+    google:
+      disabled: false
+      fileLimit: 100
+      fileSizeLimit: 50
+      totalSizeLimit: 100
+      supportedMimeTypes: *id001
+    agents:
+      disabled: false
+      fileLimit: 100
+      fileSizeLimit: 50
+      totalSizeLimit: 100
+      supportedMimeTypes: *id001
+    default:
+      fileLimit: 100
+      fileSizeLimit: 50
+      totalSizeLimit: 100
+      supportedMimeTypes: *id001
+ocr:
+  strategy: document_parser
+endpoints:
+  anthropic:
+    titleEndpoint: xai
+    titleModel: grok-4-1-fast-non-reasoning
+    summarize: false
+    summaryModel: claude-sonnet-4-6
+    modelDisplayLabel: Azure AI Foundry (Claude)
+  agents:
+    order: -1
+    recursionLimit: 2000
+    maxRecursionLimit: 2000
+    disableBuilder: false
+    defaultId: agent_viventium_main_95aeb3
+    iconURL: /assets/logo.svg
+    capabilities:
+    - deferred_tools
+    - programmatic_tools
+    - file_search
+    - web_search
+    - artifacts
+    - actions
+    - context
+    - tools
+    - ocr
+    - chain
+  custom:
+  - name: perplexity
+    apiKey: ${PERPLEXITY_API_KEY}
+    baseURL: https://api.perplexity.ai/
+    models:
+      default:
+      - sonar-deep-research
+      - sonar-reasoning-pro
+      - sonar-reasoning
+      - sonar-pro
+      - sonar
+      - r1-1776
+      fetch: false
+    titleConvo: true
+    titleModel: sonar
+    summarize: false
+    summaryModel: sonar
+    modelDisplayLabel: Perplexity
+    dropParams:
+    - stop
+    - frequency_penalty
+    forcePrompt: false
+  - name: xai
+    apiKey: ${XAI_API_KEY}
+    baseURL: https://api.x.ai/v1
+    models:
+      default:
+      - grok-4.20-experimental-beta-0304-reasoning
+      - grok-4.20-experimental-beta-0304-non-reasoning
+      - grok-4.20-multi-agent-experimental-beta-0304
+      - grok-4-1-fast-non-reasoning
+      - grok-4-1-fast-reasoning
+      - grok-4-fast-non-reasoning
+      - grok-4-fast-reasoning
+      - grok-4-0709
+      - grok-code-fast-1
+      - grok-3-mini
+      - grok-3
+      - grok-2-vision-1212
+      - grok-2-image-1212
+      fetch: true
+    titleConvo: true
+    titleModel: grok-4-1-fast-non-reasoning
+    summarize: false
+    summaryModel: grok-4-1-fast-non-reasoning
+    modelDisplayLabel: Grok
+    titleMethod: completion
+    forcePrompt: false
+  - name: openrouter
+    apiKey: ${OPENROUTER_API_KEY}
+    baseURL: https://openrouter.ai/api/v1
+    models:
+      default:
+      - moonshotai/kimi-k2.5
+      - moonshotai/kimi-k2
+      - moonshotai/kimi-k2-0905
+      fetch: false
+    titleConvo: true
+    titleModel: moonshotai/kimi-k2.5
+    summarize: false
+    summaryModel: moonshotai/kimi-k2.5
+    modelDisplayLabel: OpenRouter (Kimi)
+    dropParams:
+    - stop
+  - name: groq
+    apiKey: ${GROQ_API_KEY}
+    baseURL: https://api.groq.com/openai/v1/
+    models:
+      default:
+      - meta-llama/llama-4-maverick-17b-128e-instruct
+      - meta-llama/llama-4-scout-17b-16e-instruct
+      - meta-llama/llama-guard-4-12b
+      - meta-llama/llama-prompt-guard-2-22m
+      - meta-llama/llama-prompt-guard-2-86m
+      - moonshotai/kimi-k2-instruct
+      - moonshotai/kimi-k2-instruct-0905
+      - qwen/qwen3-32b
+      - openai/gpt-oss-120b
+      - openai/gpt-oss-20b
+      - openai/gpt-oss-safeguard-20b
+      - groq/compound
+      - groq/compound-mini
+      - allam-2-7b
+      - canopylabs/orpheus-arabic-saudi
+      - canopylabs/orpheus-v1-english
+      fetch: true
+    titleConvo: true
+    titleModel: meta-llama/llama-4-scout-17b-16e-instruct
+    summarize: false
+    summaryModel: meta-llama/llama-4-scout-17b-16e-instruct
+    modelDisplayLabel: Groq
+mcpSettings:
+  allowedDomains:
+  - localhost
+  - 127.0.0.1
+  - host.docker.internal
+mcpServers:
+  ms-365:
+    type: streamable-http
+    url: ${MS365_MCP_SERVER_URL}
+    startup: false
+    chatMenu: true
+    timeout: 120000
+    requiresOAuth: true
+    oauth:
+      authorization_url: ${MS365_MCP_AUTH_URL}
+      token_url: ${MS365_MCP_TOKEN_URL}
+      redirect_uri: http://localhost:3180/api/mcp/ms-365/oauth/callback
+      client_id: ${MS365_MCP_CLIENT_ID}
+      client_secret: ${MS365_MCP_CLIENT_SECRET}
+      scope: ${MS365_MCP_SCOPE}
+    serverInstructions: This MCP server provides access to Microsoft 365 mail, calendar,
+      files, teams, contacts, tasks, and notes using the authenticated user account.
+  google_workspace:
+    type: streamable-http
+    url: ${GOOGLE_WORKSPACE_MCP_URL}
+    startup: false
+    chatMenu: true
+    timeout: 120000
+    requiresOAuth: true
+    oauth:
+      authorization_url: ${GOOGLE_WORKSPACE_MCP_AUTH_URL}
+      token_url: ${GOOGLE_WORKSPACE_MCP_TOKEN_URL}
+      redirect_uri: http://localhost:3180/api/mcp/google_workspace/oauth/callback
+      scope: ${GOOGLE_WORKSPACE_MCP_SCOPE}
+    serverInstructions: This MCP server provides access to Google Workspace mail,
+      calendar, drive, docs, sheets, slides, tasks, forms, and chat using the authenticated
+      user.
+  sequential-thinking:
+    type: stdio
+    command: npx
+    args:
+    - -y
+    - '@modelcontextprotocol/server-sequential-thinking'
+    timeout: 300000
+    chatMenu: true
+  scheduling-cortex:
+    type: streamable-http
+    url: ${SCHEDULING_MCP_URL}
+    headers:
+      X-Viventium-User-Id: '{{LIBRECHAT_USER_ID}}'
+      X-Viventium-Agent-Id: agent_viventium_main_95aeb3
+    startup: false
+    chatMenu: true
+    timeout: 120000
+    serverInstructions: Scheduling Cortex MCP for reminders, recurring jobs, and schedule
+      management.
+  glasshive-workers-projects:
+    type: streamable-http
+    url: ${GLASSHIVE_MCP_URL}
+    startup: false
+    chatMenu: true
+    timeout: 120000
+    serverInstructions: GlassHive MCP for persistent projects, resumable workers,
+      workstation sandboxes, and live operator takeover. Use it when work needs delegation,
+      persistence, or a human handoff into a live sandbox.
+speech:
+  tts: {}
+  stt: {}
+memory:
+  disabled: false
+  validKeys:
+  - core
+  - preferences
+  - world
+  - context
+  - moments
+  - me
+  - working
+  - signals
+  - drafts
+  tokenLimit: 8000
+  keyLimits:
+    core: 800
+    preferences: 600
+    world: 1200
+    context: 1200
+    moments: 1200
+    me: 600
+    working: 400
+    signals: 1000
+    drafts: 1000
+  maintenanceThresholdPercent: 80
+  messageWindowSize: 15
+  personalize: true
+  agent:
+    provider: xai
+    model: grok-4-1-fast-non-reasoning
+    model_parameters:
+      temperature: 0.2
+    instructions: "You are the Memory Archivist. Maintain a LIVING, ACCURATE memory.\
+      \ Structure, compress, never lose data.\n\n# RULE 1: NO DATA LOSS (HIGHEST PRIORITY)\n\
+      When updating a key, you receive its EXISTING value. You MUST:\n- Start from\
+      \ the existing value\n- ADD new information to it\n- MODIFY only what changed\
+      \ (correct facts, update dates)\n- REMOVE only what is explicitly stale or contradicted\n\
+      - Output the FULL updated value (no diffs, no placeholders like \"...\" or \"\
+      [previous preserved]\")\n- If nothing changed for a key, DO NOT call set_memory\
+      \ for it\nException: `working` is overwritten each conversation (fresh state).\n\
+      \n# RULE 2: TOKEN BUDGET (8000 TOTAL)\nAll keys combined must stay under 8000\
+      \ tokens. Be ruthlessly concise.\n- Dense prose, no filler. Compress by merging\
+      \ similar items, dropping stale details.\n- If near limit, compress EXISTING\
+      \ bloated content first before adding new.\n- Per-key budgets: core 800, preferences\
+      \ 600, world 1200, context 1200, moments 1200, me 600, working 400, signals\
+      \ 1000, drafts 1000.\n- Never log trivial interactions (greetings, STT tests,\
+      \ check-ins) as moments or evidence.\n- NEVER store scheduler self-prompts,\
+      \ wake-loop counts, internal checks, tool auth failures, MCP status, or `{NTA}`\
+      \ residue.\n- When near limit, preserve durable facts and move recoverable detail\
+      \ back to conversation history rather than bloating memory.\n\n# RULE 3: DATES\n\
+      Current time is in your system context. Use ONLY that date for all markers.\n\
+      Never extrapolate or use future dates. If existing markers have future dates,\
+      \ correct them.\n\n# RULE 4: STORE USER DECISIONS WITH SPECIFICS\nWhen user\
+      \ provides researched lists with names/numbers/rankings \u2192 MUST store with\
+      \ exact specifics.\n\"Remember this\" / \"pin this\" / numbered priority lists\
+      \ \u2192 store in full.\n\n# 9-KEY ARCHITECTURE\n\n## `core` \u2014 WHO they\
+      \ ARE (update \u22642x/month)\nPermanent identity. Narrative sentences.\nInclude:\
+      \ legal name, DOB, nationality, personality, location, health CONDITIONS (not\
+      \ visit outcomes), skills, ventures.\nNEVER include: specific appointment outcomes,\
+      \ dose changes from dated visits, one-time events. Those go in context/working.\n\
+      End with: `_v: N | _confirmed: YYYY-MM-DD`\n\n## `preferences` \u2014 HOW to\
+      \ communicate (update rarely)\nCommunication style, thinking frameworks, content\
+      \ preferences, personal rules.\nEnd with: `_confirmed: YYYY-MM-DD`\n\n## `world`\
+      \ \u2014 PEOPLE and VENTURES (update occasionally)\nDurable relationships and\
+      \ what ventures ARE. Include formation context (how/when met).\nONLY durable\
+      \ facts: who people are, their role, what ventures do.\nNEVER include: current\
+      \ status, phases, deadlines, pending tasks, one-time events \u2192 those go\
+      \ in context.\nWORLD OVERWRITE CONTRACT:\n- Treat the existing world value\
+      \ as the canonical base.\n- Review the EXISTING world value line by line before\
+      \ writing.\n- Preserve durable identities, relationships, roles, venture definitions,\
+      \ and formation context unless contradicted.\n- Before adding anything, remove\
+      \ temporal residue: status, phase, deadline, pending item, outreach/reply\
+      \ state, meeting/call timing, pricing negotiation, one-off event, recent purchase/request,\
+      \ and contact logistics.\n- Rewrite shorter before dropping any durable fact.\n-\
+      \ Merge duplicate people/role details instead of appending parallel variants.\n-\
+      \ If a fact mainly matters within the next 30 days, it belongs in context\
+      \ or drafts, not world.\n- Output the full rewritten world value only.\nBad:\
+      \ \"ClientCo phase1 paid Feb23, production\
+      \ live, pending DNS setup\" (temporal \u2192 context)\nGood: \"ClientCo: flagship\
+      \ client via a named executive sponsor. Internal champion remains durable.\" (durable)\nEnd with:\
+      \ `_updated: YYYY-MM-DD`\n\
+      \n## `context` \u2014 CURRENT FOCUS (always update)\nWhat's happening NOW. Active\
+      \ status of projects, deadlines, open loops, priorities.\nAbsorb all temporal\
+      \ status that world/drafts should NOT carry.\nKeep this as a compact weekly\
+      \ index, not a full operational ledger.\nRemove completed items. Include `_updated`\
+      \ and `_expires` (+7 days).\n\n## `moments` \u2014 EPISODIC MEMORY (append +\
+      \ prune to 10-15)\nSpecific moments with VERBATIM QUOTES. Format: `YYYY-MM-DD\
+      \ | type | \"quote\" | context`\nPRIORITY ORDER when pruning:\n1. Emotional\
+      \ confessions (vulnerability, fear, joy, jealousy) \u2014 these reveal WHO the\
+      \ user IS\n2. Relationship-defining statements (how user defines your role,\
+      \ what they need from you)\n3. Milestone celebrations (first revenue, completed\
+      \ work, bookings)\n4. Factual updates (sent deck, status changes) \u2014 LOWEST\
+      \ priority, drop these first\nONE entry per event. Never log greetings, tests,\
+      \ or brew prompts.\n\n## `me` \u2014 AI self-observations (update when patterns\
+      \ shift)\nFirst person. What works in your dynamic with the user. Distilled\
+      \ patterns, not per-message logs.\nTrack: what helps, what hurts, communication\
+      \ patterns, relationship foundation.\nNEVER store scheduler noise, wake counts,\
+      \ internal checks, tool auth errors, or MCP health here.\nKeep to ~8-12 bullets\
+      \ max. End with: `_updated: YYYY-MM-DD`\n\n## `working` \u2014 RIGHT NOW (overwrite\
+      \ each conversation)\nWhere user is, what they're doing, what's next. Temporal\
+      \ anchors.\nCapture: locations, activities, times, corrections, specific names/numbers\
+      \ from THIS conversation.\nInclude: `_updated`, `_stale_after` (+24h), `_expires`\
+      \ (+3-5 days).\n\n## `signals` \u2014 PATTERNS across conversations (update\
+      \ when new evidence)\nEach signal: domain, observation (1-2 sentences), confidence,\
+      \ first_seen, last_seen, evidence (2-3 strongest).\nMax 7 active domains. Every\
+      \ domain MUST have evidence. Thin domains (no evidence) \u2192 merge or drop.\n\
+      Do NOT duplicate what's already fully covered in preferences or core.\nNEVER\
+      \ create operational domains for wake loops, scheduler runs, auth failures,\
+      \ or tool availability.\nCreate domains organically from patterns. Set confidence:\
+      \ low (1x), medium (2-3x), high (consistent).\nEnd with: `_updated: YYYY-MM-DD`\n\
+      \n## `drafts` \u2014 PERSISTENT WORK (update during active work)\nMulti-session\
+      \ work threads. Track: status, one short direction summary, one short next step.\n\
+      Statuses: in_progress / paused / done.\nDrafts are a COMPACT project index,\
+      \ not a long-form archive. Keep detailed reasoning and long notes in conversation\
+      \ history/artifacts.\nWhen done \u2192 REMOVE from drafts immediately. Note\
+      \ outcome in context if needed.\nMax ~4-5 active threads. Keep lean.\nEnd with:\
+      \ `_updated: YYYY-MM-DD`\n\n# DECISION TREE\nUser shares something \u2192 Ask:\n\
+      1. About NOW? (location, activity, appointment, time) \u2192 `working`\n2. Specific\
+      \ list with names/numbers? \u2192 `working` (details) AND `context` (summary)\n\
+      3. Verbatim quote or emotional confession? \u2192 `moments`\n4. WHO they ARE?\
+      \ \u2192 `core`\n5. HOW to communicate? \u2192 `preferences`\n6. PEOPLE or VENTURES\
+      \ (durable facts)? \u2192 `world`\n7. Current work/plans/status? \u2192 `context`\n\
+      8. Something about our dynamic? \u2192 `me`\n9. Pattern emerging over multiple\
+      \ conversations? \u2192 `signals`\n10. Multi-session ongoing work? \u2192 `drafts`\n\
+      11. System config or test? \u2192 DON'T STORE\n\nDEDUP RULE: Before writing,\
+      \ check if the info already exists in another key.\nStore in the MOST appropriate\
+      \ single key. Do not duplicate across keys.\n- Durable relationship facts \u2192\
+      \ world ONLY\n- Current status/deadlines \u2192 context ONLY\n- Patterns over\
+      \ time \u2192 signals ONLY\n- Active work threads \u2192 drafts ONLY\n\n# TEMPORAL\
+      \ HIERARCHY\nworking = RIGHT NOW (hours) \u2192 drafts = ACTIVE WORK (days/weeks,\
+      \ expires when done) \u2192 context = THIS WEEK (7-day expiry) \u2192 signals\
+      \ = EVOLVING (weeks/months) \u2192 world = DURABLE (months/years) \u2192 core\
+      \ = PERMANENT\n\n# NEVER STORE\n- System config, test messages, bare greetings,\
+      \ brew/self-prompts\n- Scheduler operational chatter, wake-loop counts, internal\
+      \ checks, tool auth failures, MCP availability, `{NTA}` residue\n- Specific\
+      \ email/calendar content (but DO store appointments user mentions verbally)\n\
+      - Your own speculative guesses (only user-confirmed facts)\n- Repeated identical\
+      \ messages (note repetition as priority signal once, not each instance)\n- STT\
+      \ artifacts \u2014 clean garbled text when updating, don't preserve corruption\n\
+      \n# ALWAYS STORE\n- Where user is going / what they're doing NOW\n- Times, appointments,\
+      \ deadlines mentioned\n- Priority lists with specific names and numbers\n- Corrections\
+      \ user makes\n- Emotional confessions and vulnerable moments\n- When user will\
+      \ resume or what's next\n"
+registration:
+  socialLogins: []

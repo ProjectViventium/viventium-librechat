@@ -216,12 +216,17 @@ describe('access middleware', () => {
 
       defaultParams.getRoleByName.mockResolvedValue(mockRole);
 
-      const checkObject = { id: 'agent123' };
+      const checkObject = {
+        projectIds: ['project1'],
+        removeProjectIds: ['project2'],
+      };
 
       const result = await checkAccess({
         ...defaultParams,
         permissions: [Permissions.USE, Permissions.SHARE],
-        bodyProps: { [Permissions.SHARE]: ['id'] } as Record<Permissions, string[]>,
+        bodyProps: {
+          [Permissions.SHARE]: ['projectIds', 'removeProjectIds'],
+        } as Record<Permissions, string[]>,
         checkObject,
       });
       expect(result).toBe(true);
@@ -239,12 +244,17 @@ describe('access middleware', () => {
 
       defaultParams.getRoleByName.mockResolvedValue(mockRole);
 
-      const checkObject = {};
+      const checkObject = {
+        projectIds: ['project1'],
+        // missing removeProjectIds
+      };
 
       const result = await checkAccess({
         ...defaultParams,
         permissions: [Permissions.SHARE],
-        bodyProps: {} as Record<Permissions, string[]>,
+        bodyProps: {
+          [Permissions.SHARE]: ['projectIds', 'removeProjectIds'],
+        } as Record<Permissions, string[]>,
         checkObject,
       });
       expect(result).toBe(false);
@@ -333,12 +343,17 @@ describe('access middleware', () => {
       } as unknown as IRole;
 
       mockGetRoleByName.mockResolvedValue(mockRole);
-      mockReq.body = { id: 'agent123' };
+      mockReq.body = {
+        projectIds: ['project1'],
+        removeProjectIds: ['project2'],
+      };
 
       const middleware = generateCheckAccess({
         permissionType: PermissionTypes.AGENTS,
         permissions: [Permissions.USE, Permissions.CREATE, Permissions.SHARE],
-        bodyProps: { [Permissions.SHARE]: ['id'] } as Record<Permissions, string[]>,
+        bodyProps: {
+          [Permissions.SHARE]: ['projectIds', 'removeProjectIds'],
+        } as Record<Permissions, string[]>,
         getRoleByName: mockGetRoleByName,
       });
 

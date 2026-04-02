@@ -13,7 +13,6 @@ export type AgentCategory = {
   isActive: boolean;
   /** Whether this is a custom user-created category */
   custom?: boolean;
-  tenantId?: string;
 };
 
 export type IAgentCategory = AgentCategory &

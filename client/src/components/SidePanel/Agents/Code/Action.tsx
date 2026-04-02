@@ -75,7 +75,7 @@ export default function Action({ authType = '', isToolAuthenticated = false }) {
             id="execute-code-label"
             htmlFor="execute-code-checkbox"
             className={cn(
-              'form-check-label text-token-text-primary text-sm',
+              'form-check-label text-token-text-primary',
               (runCodeIsEnabled || isToolAuthenticated) && 'cursor-pointer',
             )}
           >

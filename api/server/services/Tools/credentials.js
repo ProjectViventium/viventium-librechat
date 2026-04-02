@@ -24,7 +24,19 @@ const loadAuthValues = async ({ userId, authFields, optional, throwError = true 
         return { authField: field, authValue: value };
       }
       try {
-        value = await getUserPluginAuthValue(userId, field, throwError);
+        /* === VIVENTIUM START ===
+         * Feature: Optional tool auth fields should not emit hard missing-auth errors.
+         * Purpose:
+         * - Web search includes optional auth slots such as `SEARXNG_API_KEY`.
+         * - When those optional values are absent in local env and intentionally unused,
+         *   we should not log them as user-facing auth failures.
+         * Added: 2026-03-08
+         * === VIVENTIUM END === */
+        value = await getUserPluginAuthValue(
+          userId,
+          field,
+          optional?.has(field) ? false : throwError,
+        );
       } catch (err) {
         if (optional && optional.has(field)) {
           return { authField: field, authValue: undefined };

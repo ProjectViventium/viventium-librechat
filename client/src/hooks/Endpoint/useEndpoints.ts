@@ -34,10 +34,23 @@ export const useEndpoints = ({
   const modelsQuery = useGetModelsQuery();
   const { data: endpoints = [] } = useGetEndpointsQuery({ select: mapEndpoints });
   const interfaceConfig = startupConfig?.interface ?? {};
-  const includedEndpoints = useMemo(
-    () => new Set(startupConfig?.modelSpecs?.addedEndpoints ?? []),
-    [startupConfig?.modelSpecs?.addedEndpoints],
-  );
+  const includedEndpoints = useMemo(() => {
+    const endpointSet = new Set(startupConfig?.modelSpecs?.addedEndpoints ?? []);
+
+    /* === VIVENTIUM START ===
+     * Feature: Connected Accounts endpoint discoverability.
+     * Purpose: Ensure OpenAI/Anthropic remain selectable when OAuth account-connection mode is enabled.
+     * === VIVENTIUM END === */
+    const connectedAccountsEnabled =
+      (startupConfig as { viventiumConnectedAccountsEnabled?: boolean } | undefined)
+        ?.viventiumConnectedAccountsEnabled === true;
+    if (connectedAccountsEnabled) {
+      endpointSet.add(EModelEndpoint.openAI);
+      endpointSet.add(EModelEndpoint.anthropic);
+    }
+
+    return endpointSet;
+  }, [startupConfig]);
 
   const hasAgentAccess = useHasAccess({
     permissionType: PermissionTypes.AGENTS,

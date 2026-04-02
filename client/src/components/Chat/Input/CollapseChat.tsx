@@ -52,4 +52,4 @@ const CollapseChat = ({
   );
 };
 
-export default React.memo(CollapseChat);
+export default CollapseChat;

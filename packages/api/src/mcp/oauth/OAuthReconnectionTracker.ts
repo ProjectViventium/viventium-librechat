@@ -1,12 +1,6 @@
-interface FailedMeta {
-  attempts: number;
-  lastFailedAt: number;
-}
-
-const COOLDOWN_SCHEDULE_MS = [5 * 60 * 1000, 10 * 60 * 1000, 20 * 60 * 1000, 30 * 60 * 1000];
-
 export class OAuthReconnectionTracker {
-  private failedMeta: Map<string, Map<string, FailedMeta>> = new Map();
+  /** Map of userId -> Set of serverNames that have failed reconnection */
+  private failed: Map<string, Set<string>> = new Map();
   /** Map of userId -> Set of serverNames that are actively reconnecting */
   private active: Map<string, Set<string>> = new Map();
   /** Map of userId:serverName -> timestamp when reconnection started */
@@ -15,17 +9,7 @@ export class OAuthReconnectionTracker {
   private readonly RECONNECTION_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes
 
   public isFailed(userId: string, serverName: string): boolean {
-    const meta = this.failedMeta.get(userId)?.get(serverName);
-    if (!meta) {
-      return false;
-    }
-    const idx = Math.min(meta.attempts - 1, COOLDOWN_SCHEDULE_MS.length - 1);
-    const cooldown = COOLDOWN_SCHEDULE_MS[idx];
-    const elapsed = Date.now() - meta.lastFailedAt;
-    if (elapsed >= cooldown) {
-      return false;
-    }
-    return true;
+    return this.failed.get(userId)?.has(serverName) ?? false;
   }
 
   /** Check if server is in the active set (original simple check) */
@@ -64,15 +48,11 @@ export class OAuthReconnectionTracker {
   }
 
   public setFailed(userId: string, serverName: string): void {
-    if (!this.failedMeta.has(userId)) {
-      this.failedMeta.set(userId, new Map());
+    if (!this.failed.has(userId)) {
+      this.failed.set(userId, new Set());
     }
-    const userMap = this.failedMeta.get(userId)!;
-    const existing = userMap.get(serverName);
-    userMap.set(serverName, {
-      attempts: (existing?.attempts ?? 0) + 1,
-      lastFailedAt: Date.now(),
-    });
+
+    this.failed.get(userId)?.add(serverName);
   }
 
   public setActive(userId: string, serverName: string): void {
@@ -88,10 +68,10 @@ export class OAuthReconnectionTracker {
   }
 
   public removeFailed(userId: string, serverName: string): void {
-    const userMap = this.failedMeta.get(userId);
-    userMap?.delete(serverName);
-    if (userMap?.size === 0) {
-      this.failedMeta.delete(userId);
+    const userServers = this.failed.get(userId);
+    userServers?.delete(serverName);
+    if (userServers?.size === 0) {
+      this.failed.delete(userId);
     }
   }
 
@@ -114,7 +94,7 @@ export class OAuthReconnectionTracker {
     activeTimestamps: number;
   } {
     return {
-      usersWithFailedServers: this.failedMeta.size,
+      usersWithFailedServers: this.failed.size,
       usersWithActiveReconnections: this.active.size,
       activeTimestamps: this.activeTimestamps.size,
     };

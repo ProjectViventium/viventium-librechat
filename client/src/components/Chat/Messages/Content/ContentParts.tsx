@@ -6,72 +6,31 @@ import type {
   TAttachment,
   Agents,
 } from 'librechat-data-provider';
-import { ParallelContentRenderer, type PartWithIndex } from './ParallelContent';
-import { mapAttachments, groupSequentialToolCalls } from '~/utils';
 import { MessageContext, SearchContext } from '~/Providers';
+import { ParallelContentRenderer, type PartWithIndex } from './ParallelContent';
+import { mapAttachments } from '~/utils';
 import { EditTextPart, EmptyText } from './Parts';
 import MemoryArtifacts from './MemoryArtifacts';
-import ToolCallGroup from './ToolCallGroup';
+import Sources from '~/components/Web/Sources';
 import Container from './Container';
 import Part from './Part';
 
-type PartWithContextProps = {
-  part: TMessageContentParts;
-  idx: number;
-  isLastPart: boolean;
-  messageId: string;
-  conversationId?: string | null;
-  nextType?: string;
-  isSubmitting: boolean;
-  isLatestMessage?: boolean;
-  isCreatedByUser: boolean;
-  isLast: boolean;
-  partAttachments: TAttachment[] | undefined;
-};
-
-const PartWithContext = memo(function PartWithContext({
-  part,
-  idx,
-  isLastPart,
-  messageId,
-  conversationId,
-  nextType,
-  isSubmitting,
-  isLatestMessage,
-  isCreatedByUser,
-  isLast,
-  partAttachments,
-}: PartWithContextProps) {
-  const contextValue = useMemo(
-    () => ({
-      messageId,
-      isExpanded: true as const,
-      conversationId,
-      partIndex: idx,
-      nextType,
-      isSubmitting,
-      isLatestMessage,
-    }),
-    [messageId, conversationId, idx, nextType, isSubmitting, isLatestMessage],
-  );
-
-  return (
-    <MessageContext.Provider value={contextValue}>
-      <Part
-        part={part}
-        attachments={partAttachments}
-        isSubmitting={isSubmitting}
-        key={`part-${messageId}-${idx}`}
-        isCreatedByUser={isCreatedByUser}
-        isLast={isLastPart}
-        showCursor={isLastPart && isLast}
-      />
-    </MessageContext.Provider>
-  );
-});
-
+/* === VIVENTIUM START ===
+ * Feature: Background Cortex content parts rendering (activation/brewing/insights)
+ *
+ * Purpose:
+ * - Support rendering Background Cortex status rows as message parts.
+ * - Keep cortex parts separate during streaming (avoids index collisions with streamed content/tool calls).
+ *
+ * Why:
+ * - Viventium streams cortex updates in parallel with the main agent response; upstream UI expects only
+ *   standard LibreChat parts unless explicitly handled.
+ *
+ * Added: 2026-01-05
+ */
 type ContentPartsProps = {
   content: Array<TMessageContentParts | undefined> | undefined;
+  cortexParts?: Array<TMessageContentParts | undefined> | undefined;
   messageId: string;
   conversationId?: string | null;
   attachments?: TAttachment[];
@@ -99,6 +58,7 @@ const ContentParts = memo(function ContentParts({
   edit,
   isLast,
   content,
+  cortexParts,
   messageId,
   enterEdit,
   siblingIdx,
@@ -112,25 +72,78 @@ const ContentParts = memo(function ContentParts({
 }: ContentPartsProps) {
   const attachmentMap = useMemo(() => mapAttachments(attachments ?? []), [attachments]);
   const effectiveIsSubmitting = isLatestMessage ? isSubmitting : false;
+  const cortexTypes = useMemo(
+    () =>
+      new Set([
+        ContentTypes.CORTEX_ACTIVATION,
+        ContentTypes.CORTEX_BREWING,
+        ContentTypes.CORTEX_INSIGHT,
+      ]),
+    [],
+  );
 
+  /**
+   * Cortex parts come from a dedicated transient store during streaming
+   * (`__viventiumCortexParts`) to avoid index collisions with streamed content/tool calls.
+   * After streaming completes, cortex parts are also persisted into message.content (DB truth).
+   */
+  const cortexPartsFromContent: PartWithIndex[] = useMemo(() => {
+    if (!content) {
+      return [];
+    }
+    const parts: PartWithIndex[] = [];
+    content.forEach((part, idx) => {
+      if (part && cortexTypes.has(part.type)) {
+        parts.push({ part, idx });
+      }
+    });
+    return parts;
+  }, [content, cortexTypes]);
+
+  const cortexPartsEffective: PartWithIndex[] = useMemo(() => {
+    if (Array.isArray(cortexParts) && cortexParts.length > 0) {
+      const parts: PartWithIndex[] = [];
+      cortexParts.forEach((part, idx) => {
+        if (part) {
+          parts.push({ part, idx });
+        }
+      });
+      return parts;
+    }
+    return cortexPartsFromContent;
+  }, [cortexParts, cortexPartsFromContent]);
+
+  /**
+   * Render a single content part with proper context.
+   */
   const renderPart = useCallback(
     (part: TMessageContentParts, idx: number, isLastPart: boolean) => {
       const toolCallId = (part?.[ContentTypes.TOOL_CALL] as Agents.ToolCall | undefined)?.id ?? '';
+      const partAttachments = attachmentMap[toolCallId];
+
       return (
-        <PartWithContext
+        <MessageContext.Provider
           key={`provider-${messageId}-${idx}`}
-          idx={idx}
-          part={part}
-          isLast={isLast}
-          messageId={messageId}
-          isLastPart={isLastPart}
-          conversationId={conversationId}
-          isLatestMessage={isLatestMessage}
-          isCreatedByUser={isCreatedByUser}
-          nextType={content?.[idx + 1]?.type}
-          isSubmitting={effectiveIsSubmitting}
-          partAttachments={attachmentMap[toolCallId]}
-        />
+          value={{
+            messageId,
+            isExpanded: true,
+            conversationId,
+            partIndex: idx,
+            nextType: content?.[idx + 1]?.type,
+            isSubmitting: effectiveIsSubmitting,
+            isLatestMessage,
+          }}
+        >
+          <Part
+            part={part}
+            attachments={partAttachments}
+            isSubmitting={effectiveIsSubmitting}
+            key={`part-${messageId}-${idx}`}
+            isCreatedByUser={isCreatedByUser}
+            isLast={isLastPart}
+            showCursor={isLastPart && isLast}
+          />
+        </MessageContext.Provider>
       );
     },
     [
@@ -160,10 +173,10 @@ const ContentParts = memo(function ContentParts({
           }
           const isTextPart =
             part?.type === ContentTypes.TEXT ||
-            typeof (part as unknown as Agents.MessageContentText)?.text === 'string';
+            typeof (part as unknown as Agents.MessageContentText)?.text !== 'string';
           const isThinkPart =
             part?.type === ContentTypes.THINK ||
-            typeof (part as unknown as Agents.ReasoningDeltaUpdate)?.think === 'string';
+            typeof (part as unknown as Agents.ReasoningDeltaUpdate)?.think !== 'string';
           if (!isTextPart && !isThinkPart) {
             return null;
           }
@@ -191,10 +204,11 @@ const ContentParts = memo(function ContentParts({
   }
 
   const showEmptyCursor = content.length === 0 && effectiveIsSubmitting;
-  const lastContentIdx = content.length - 1;
 
   // Parallel content: use dedicated renderer with columns (TMessageContentParts includes ContentMetadata)
-  const hasParallelContent = content.some((part) => part?.groupId != null);
+  const hasParallelContent = content.some(
+    (part) => part?.groupId != null && (part?.type == null || !cortexTypes.has(part.type)),
+  );
   if (hasParallelContent) {
     return (
       <ParallelContentRenderer
@@ -213,37 +227,47 @@ const ContentParts = memo(function ContentParts({
   const sequentialParts: PartWithIndex[] = [];
   content.forEach((part, idx) => {
     if (part) {
+      if (cortexTypes.has(part.type)) {
+        return;
+      }
       sequentialParts.push({ part, idx });
     }
   });
-  const groupedParts = groupSequentialToolCalls(sequentialParts);
+  const lastSequentialIdx = sequentialParts.length
+    ? sequentialParts[sequentialParts.length - 1].idx
+    : -1;
 
   return (
     <SearchContext.Provider value={{ searchResults }}>
       <MemoryArtifacts attachments={attachments} />
+      <Sources messageId={messageId} conversationId={conversationId || undefined} />
+      {/* VIVENTIUM NOTE: Render cortex status rows BEFORE main message content. */}
+      {cortexPartsEffective.map(({ part }, idx) => {
+        if (!part) {
+          return null;
+        }
+        return (
+          <Part
+            key={`cortex-${messageId}-${idx}`}
+            part={part}
+            attachments={undefined}
+            isSubmitting={effectiveIsSubmitting}
+            isCreatedByUser={isCreatedByUser}
+            isLast={false}
+            showCursor={false}
+          />
+        );
+      })}
       {showEmptyCursor && (
         <Container>
           <EmptyText />
         </Container>
       )}
-      {groupedParts.map((group) => {
-        if (group.type === 'single') {
-          const { part, idx } = group.part;
-          return renderPart(part, idx, idx === lastContentIdx);
-        }
-        return (
-          <ToolCallGroup
-            key={`tool-group-${group.parts[0].idx}`}
-            parts={group.parts}
-            isSubmitting={effectiveIsSubmitting}
-            isLast={group.parts.some((p) => p.idx === lastContentIdx)}
-            renderPart={renderPart}
-            lastContentIdx={lastContentIdx}
-          />
-        );
-      })}
+      {sequentialParts.map(({ part, idx }) => renderPart(part, idx, idx === lastSequentialIdx))}
     </SearchContext.Provider>
   );
 });
 
 export default ContentParts;
+
+/* === VIVENTIUM END === */

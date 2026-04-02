@@ -1,6 +1,5 @@
-const { logger, SystemCapabilities } = require('@librechat/data-schemas');
-const { hasCapability } = require('~/server/middleware/roles/capabilities');
-const { getAssistant } = require('~/models');
+const { SystemRoles } = require('librechat-data-provider');
+const { getAssistant } = require('~/models/Assistant');
 
 /**
  * Checks if the assistant is supported or excluded
@@ -13,6 +12,10 @@ const { getAssistant } = require('~/models');
  * @returns {Promise<void>}
  */
 const validateAuthor = async ({ req, openai, overrideEndpoint, overrideAssistantId }) => {
+  if (req.user.role === SystemRoles.ADMIN) {
+    return;
+  }
+
   const endpoint = overrideEndpoint ?? req.body.endpoint ?? req.query.endpoint;
   const assistant_id =
     overrideAssistantId ?? req.params.id ?? req.body.assistant_id ?? req.query.assistant_id;
@@ -25,18 +28,6 @@ const validateAuthor = async ({ req, openai, overrideEndpoint, overrideAssistant
   }
 
   if (!assistantsConfig.privateAssistants) {
-    return;
-  }
-
-  let canManageAssistants = false;
-  try {
-    canManageAssistants = await hasCapability(req.user, SystemCapabilities.MANAGE_ASSISTANTS);
-  } catch (err) {
-    logger.warn(`[validateAuthor] capability check failed, denying bypass: ${err.message}`);
-  }
-
-  if (canManageAssistants) {
-    logger.debug(`[validateAuthor] MANAGE_ASSISTANTS bypass for user ${req.user.id}`);
     return;
   }
 

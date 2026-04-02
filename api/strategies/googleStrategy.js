@@ -11,26 +11,14 @@ const getProfileDetails = ({ profile }) => ({
 });
 
 const googleLogin = socialLogin('google', getProfileDetails);
-const googleAdminLogin = socialLogin('google', getProfileDetails, { existingUsersOnly: true });
 
-const getGoogleConfig = (callbackURL) => ({
-  clientID: process.env.GOOGLE_CLIENT_ID,
-  clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-  callbackURL,
-  proxy: true,
-});
-
-const googleStrategy = () =>
+module.exports = () =>
   new GoogleStrategy(
-    getGoogleConfig(`${process.env.DOMAIN_SERVER}${process.env.GOOGLE_CALLBACK_URL}`),
+    {
+      clientID: process.env.GOOGLE_CLIENT_ID,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+      callbackURL: `${process.env.DOMAIN_SERVER}${process.env.GOOGLE_CALLBACK_URL}`,
+      proxy: true,
+    },
     googleLogin,
   );
-
-const googleAdminStrategy = () =>
-  new GoogleStrategy(
-    getGoogleConfig(`${process.env.DOMAIN_SERVER}/api/admin/oauth/google/callback`),
-    googleAdminLogin,
-  );
-
-module.exports = googleStrategy;
-module.exports.googleAdminLogin = googleAdminStrategy;

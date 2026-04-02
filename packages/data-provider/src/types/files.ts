@@ -28,6 +28,12 @@ export enum FileContext {
   image_generation = 'image_generation',
   assistants_output = 'assistants_output',
   message_attachment = 'message_attachment',
+  /* === VIVENTIUM START ===
+   * Feature: Conversation Recall RAG file context
+   * Added: 2026-02-19
+   */
+  conversation_recall = 'conversation_recall',
+  /* === VIVENTIUM END === */
   filename = 'filename',
   updatedAt = 'updatedAt',
   source = 'source',

@@ -1,12 +1,11 @@
 import { useEffect } from 'react';
 import { useRecoilState } from 'recoil';
 import TagManager from 'react-gtm-module';
-import { LocalStorageKeys, PermissionTypes, Permissions } from 'librechat-data-provider';
+import { LocalStorageKeys } from 'librechat-data-provider';
 import type { TStartupConfig, TUser } from 'librechat-data-provider';
-import { useMCPToolsQuery, useMCPServersQuery } from '~/data-provider';
 import { cleanupTimestampedStorage } from '~/utils/timestamps';
 import useSpeechSettingsInit from './useSpeechSettingsInit';
-import { useHasAccess } from '~/hooks';
+import { useMCPToolsQuery, useMCPServersQuery } from '~/data-provider';
 import store from '~/store';
 
 export default function useAppStartup({
@@ -17,23 +16,12 @@ export default function useAppStartup({
   user?: TUser;
 }) {
   const [defaultPreset, setDefaultPreset] = useRecoilState(store.defaultPreset);
-  const canUseMcp = useHasAccess({
-    permissionType: PermissionTypes.MCP_SERVERS,
-    permission: Permissions.USE,
-  });
 
   useSpeechSettingsInit(!!user);
-  const { data: loadedServers, isLoading: serversLoading } = useMCPServersQuery({
-    enabled: canUseMcp,
-  });
+  const { data: loadedServers, isLoading: serversLoading } = useMCPServersQuery();
 
   useMCPToolsQuery({
-    enabled:
-      canUseMcp &&
-      !serversLoading &&
-      !!loadedServers &&
-      Object.keys(loadedServers).length > 0 &&
-      !!user,
+    enabled: !serversLoading && !!loadedServers && Object.keys(loadedServers).length > 0 && !!user,
   });
 
   /** Clean up old localStorage entries on startup */

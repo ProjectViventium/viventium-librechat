@@ -1,9 +1,8 @@
-import { memo } from 'react';
 import AddedConvo from './AddedConvo';
 import type { TConversation } from 'librechat-data-provider';
 import type { SetterOrUpdater } from 'recoil';
 
-export default memo(function TextareaHeader({
+export default function TextareaHeader({
   addedConvo,
   setAddedConvo,
 }: {
@@ -18,4 +17,4 @@ export default memo(function TextareaHeader({
       <AddedConvo addedConvo={addedConvo} setAddedConvo={setAddedConvo} />
     </div>
   );
-});
+}

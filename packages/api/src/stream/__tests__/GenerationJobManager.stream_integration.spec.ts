@@ -1,18 +1,4 @@
-/* eslint jest/no-standalone-expect: ["error", { "additionalTestBlockFunctions": ["testRedis"] }] */
 import type { Redis, Cluster } from 'ioredis';
-import type { ServerSentEvent, StreamEvent, CreatedEvent } from '~/types';
-import { InMemoryEventTransport } from '~/stream/implementations/InMemoryEventTransport';
-import { RedisEventTransport } from '~/stream/implementations/RedisEventTransport';
-import { InMemoryJobStore } from '~/stream/implementations/InMemoryJobStore';
-import { GenerationJobManagerClass } from '~/stream/GenerationJobManager';
-import { RedisJobStore } from '~/stream/implementations/RedisJobStore';
-import { createStreamServices } from '~/stream/createStreamServices';
-import { GenerationJobManager } from '~/stream/GenerationJobManager';
-import {
-  ioredisClient as staticRedisClient,
-  keyvRedisClient as staticKeyvClient,
-  keyvRedisClientReady,
-} from '~/cache/redisClients';
 
 /**
  * Integration tests for GenerationJobManager.
@@ -25,26 +11,20 @@ import {
 describe('GenerationJobManager Integration Tests', () => {
   let originalEnv: NodeJS.ProcessEnv;
   let ioredisClient: Redis | Cluster | null = null;
-  let dynamicKeyvClient: unknown = null;
-  let dynamicKeyvReady: Promise<unknown> | null = null;
   const testPrefix = 'JobManager-Integration-Test';
-  const redisConfigured = process.env.USE_REDIS === 'true';
-  const describeRedis = redisConfigured ? describe : describe.skip;
-  const testRedis = redisConfigured ? test : test.skip;
 
   beforeAll(async () => {
     originalEnv = { ...process.env };
 
+    // Set up test environment
     process.env.USE_REDIS = process.env.USE_REDIS ?? 'true';
     process.env.REDIS_URI = process.env.REDIS_URI ?? 'redis://127.0.0.1:6379';
     process.env.REDIS_KEY_PREFIX = testPrefix;
 
     jest.resetModules();
 
-    const redisModule = await import('~/cache/redisClients');
-    ioredisClient = redisModule.ioredisClient;
-    dynamicKeyvClient = redisModule.keyvRedisClient;
-    dynamicKeyvReady = redisModule.keyvRedisClientReady;
+    const { ioredisClient: client } = await import('../../cache/redisClients');
+    ioredisClient = client;
   });
 
   afterEach(async () => {
@@ -65,91 +45,28 @@ describe('GenerationJobManager Integration Tests', () => {
   });
 
   afterAll(async () => {
-    for (const ready of [keyvRedisClientReady, dynamicKeyvReady]) {
-      if (ready) {
-        await ready.catch(() => {});
-      }
-    }
-
-    const clients = [ioredisClient, staticRedisClient, staticKeyvClient, dynamicKeyvClient];
-    for (const client of clients) {
-      if (!client) {
-        continue;
-      }
+    if (ioredisClient) {
       try {
-        await (client as { disconnect: () => void | Promise<void> }).disconnect();
+        // Use quit() to gracefully close - waits for pending commands
+        await ioredisClient.quit();
       } catch {
-        /* ignore */
+        // Fall back to disconnect if quit fails
+        try {
+          ioredisClient.disconnect();
+        } catch {
+          // Ignore
+        }
       }
     }
-
     process.env = originalEnv;
   });
 
-  function createInMemoryManager(): GenerationJobManagerClass {
-    const manager = new GenerationJobManagerClass();
-    manager.configure({
-      jobStore: new InMemoryJobStore({ ttlAfterComplete: 60000 }),
-      eventTransport: new InMemoryEventTransport(),
-      isRedis: false,
-    });
-    manager.initialize();
-    return manager;
-  }
-
-  function createRedisManager(): GenerationJobManagerClass {
-    const manager = new GenerationJobManagerClass();
-    manager.configure(
-      createStreamServices({
-        useRedis: true,
-        redisClient: ioredisClient!,
-      }),
-    );
-    manager.initialize();
-    return manager;
-  }
-
-  async function setupDisconnectedStream(
-    manager: GenerationJobManagerClass,
-    streamId: string,
-    delay: number,
-  ): Promise<ServerSentEvent[]> {
-    const firstEvents: ServerSentEvent[] = [];
-    const sub = await manager.subscribe(streamId, (event) => firstEvents.push(event));
-
-    await new Promise((resolve) => setTimeout(resolve, delay));
-
-    await manager.emitChunk(streamId, {
-      event: 'on_run_step',
-      data: { id: 'step-1', runId: 'run-1', index: 0, stepDetails: { type: 'message_creation' } },
-    });
-    await manager.emitChunk(streamId, {
-      event: 'on_message_delta',
-      data: { id: 'step-1', delta: { content: { type: 'text', text: 'Hello' } } },
-    });
-
-    await new Promise((resolve) => setTimeout(resolve, delay));
-    expect(firstEvents.length).toBe(2);
-
-    sub?.unsubscribe();
-    await new Promise((resolve) => setTimeout(resolve, delay));
-
-    await manager.emitChunk(streamId, {
-      event: 'on_message_delta',
-      data: { id: 'step-1', delta: { content: { type: 'text', text: ' world' } } },
-    });
-    await manager.emitChunk(streamId, {
-      event: 'on_message_delta',
-      data: { id: 'step-1', delta: { content: { type: 'text', text: '!' } } },
-    });
-
-    await new Promise((resolve) => setTimeout(resolve, delay));
-
-    return firstEvents;
-  }
-
   describe('In-Memory Mode', () => {
     test('should create and manage jobs', async () => {
+      const { GenerationJobManager } = await import('../GenerationJobManager');
+      const { InMemoryJobStore } = await import('../implementations/InMemoryJobStore');
+      const { InMemoryEventTransport } = await import('../implementations/InMemoryEventTransport');
+
       // Configure with in-memory
       // cleanupOnComplete: false so we can verify completed status
       GenerationJobManager.configure({
@@ -159,7 +76,7 @@ describe('GenerationJobManager Integration Tests', () => {
         cleanupOnComplete: false,
       });
 
-      GenerationJobManager.initialize();
+      await GenerationJobManager.initialize();
 
       const streamId = `inmem-job-${Date.now()}`;
       const userId = 'test-user-1';
@@ -191,13 +108,17 @@ describe('GenerationJobManager Integration Tests', () => {
     });
 
     test('should handle event streaming', async () => {
+      const { GenerationJobManager } = await import('../GenerationJobManager');
+      const { InMemoryJobStore } = await import('../implementations/InMemoryJobStore');
+      const { InMemoryEventTransport } = await import('../implementations/InMemoryEventTransport');
+
       GenerationJobManager.configure({
         jobStore: new InMemoryJobStore({ ttlAfterComplete: 60000 }),
         eventTransport: new InMemoryEventTransport(),
         isRedis: false,
       });
 
-      GenerationJobManager.initialize();
+      await GenerationJobManager.initialize();
 
       const streamId = `inmem-events-${Date.now()}`;
       await GenerationJobManager.createJob(streamId, 'user-1');
@@ -237,8 +158,16 @@ describe('GenerationJobManager Integration Tests', () => {
     });
   });
 
-  describeRedis('Redis Mode', () => {
+  describe('Redis Mode', () => {
     test('should create and manage jobs via Redis', async () => {
+      if (!ioredisClient) {
+        console.warn('Redis not available, skipping test');
+        return;
+      }
+
+      const { GenerationJobManager } = await import('../GenerationJobManager');
+      const { createStreamServices } = await import('../createStreamServices');
+
       // Create Redis services
       const services = createStreamServices({
         useRedis: true,
@@ -248,7 +177,7 @@ describe('GenerationJobManager Integration Tests', () => {
       expect(services.isRedis).toBe(true);
 
       GenerationJobManager.configure(services);
-      GenerationJobManager.initialize();
+      await GenerationJobManager.initialize();
 
       const streamId = `redis-job-${Date.now()}`;
       const userId = 'test-user-redis';
@@ -270,13 +199,21 @@ describe('GenerationJobManager Integration Tests', () => {
     });
 
     test('should persist chunks for cross-instance resume', async () => {
+      if (!ioredisClient) {
+        console.warn('Redis not available, skipping test');
+        return;
+      }
+
+      const { GenerationJobManager } = await import('../GenerationJobManager');
+      const { createStreamServices } = await import('../createStreamServices');
+
       const services = createStreamServices({
         useRedis: true,
         redisClient: ioredisClient,
       });
 
       GenerationJobManager.configure(services);
-      GenerationJobManager.initialize();
+      await GenerationJobManager.initialize();
 
       const streamId = `redis-chunks-${Date.now()}`;
       await GenerationJobManager.createJob(streamId, 'user-1');
@@ -320,13 +257,21 @@ describe('GenerationJobManager Integration Tests', () => {
     });
 
     test('should handle abort and return content', async () => {
+      if (!ioredisClient) {
+        console.warn('Redis not available, skipping test');
+        return;
+      }
+
+      const { GenerationJobManager } = await import('../GenerationJobManager');
+      const { createStreamServices } = await import('../createStreamServices');
+
       const services = createStreamServices({
         useRedis: true,
         redisClient: ioredisClient,
       });
 
       GenerationJobManager.configure(services);
-      GenerationJobManager.initialize();
+      await GenerationJobManager.initialize();
 
       const streamId = `redis-abort-${Date.now()}`;
       await GenerationJobManager.createJob(streamId, 'user-1');
@@ -369,7 +314,10 @@ describe('GenerationJobManager Integration Tests', () => {
       const runTestWithMode = async (isRedis: boolean) => {
         jest.resetModules();
 
+        const { GenerationJobManager } = await import('../GenerationJobManager');
+
         if (isRedis && ioredisClient) {
+          const { createStreamServices } = await import('../createStreamServices');
           GenerationJobManager.configure({
             ...createStreamServices({
               useRedis: true,
@@ -378,6 +326,10 @@ describe('GenerationJobManager Integration Tests', () => {
             cleanupOnComplete: false, // Keep job for verification
           });
         } else {
+          const { InMemoryJobStore } = await import('../implementations/InMemoryJobStore');
+          const { InMemoryEventTransport } = await import(
+            '../implementations/InMemoryEventTransport'
+          );
           GenerationJobManager.configure({
             jobStore: new InMemoryJobStore({ ttlAfterComplete: 60000 }),
             eventTransport: new InMemoryEventTransport(),
@@ -386,7 +338,7 @@ describe('GenerationJobManager Integration Tests', () => {
           });
         }
 
-        GenerationJobManager.initialize();
+        await GenerationJobManager.initialize();
 
         const streamId = `consistency-${isRedis ? 'redis' : 'inmem'}-${Date.now()}`;
 
@@ -425,7 +377,7 @@ describe('GenerationJobManager Integration Tests', () => {
     });
   });
 
-  describeRedis('Cross-Replica Support (Redis)', () => {
+  describe('Cross-Replica Support (Redis)', () => {
     /**
      * Problem: In k8s with Redis and multiple replicas, when a user sends a message:
      * 1. POST /api/agents/chat hits Replica A, creates job
@@ -438,10 +390,17 @@ describe('GenerationJobManager Integration Tests', () => {
      * when the job exists in Redis but not in local memory.
      */
     test('should NOT return 404 when stream endpoint hits different replica than job creator', async () => {
+      if (!ioredisClient) {
+        console.warn('Redis not available, skipping test');
+        return;
+      }
+
+      const { RedisJobStore } = await import('../implementations/RedisJobStore');
+
       // === REPLICA A: Creates the job ===
       // Simulate Replica A creating the job directly in Redis
       // (In real scenario, this happens via GenerationJobManager.createJob on Replica A)
-      const replicaAJobStore = new RedisJobStore(ioredisClient!);
+      const replicaAJobStore = new RedisJobStore(ioredisClient);
       await replicaAJobStore.initialize();
 
       const streamId = `cross-replica-404-test-${Date.now()}`;
@@ -453,6 +412,8 @@ describe('GenerationJobManager Integration Tests', () => {
       // === REPLICA B: Receives the stream request ===
       // Fresh GenerationJobManager that does NOT have this job in its local runtimeState
       jest.resetModules();
+      const { GenerationJobManager } = await import('../GenerationJobManager');
+      const { createStreamServices } = await import('../createStreamServices');
 
       const services = createStreamServices({
         useRedis: true,
@@ -460,7 +421,7 @@ describe('GenerationJobManager Integration Tests', () => {
       });
 
       GenerationJobManager.configure(services);
-      GenerationJobManager.initialize();
+      await GenerationJobManager.initialize();
 
       // This is what the stream endpoint does:
       // const job = await GenerationJobManager.getJob(streamId);
@@ -498,8 +459,17 @@ describe('GenerationJobManager Integration Tests', () => {
     });
 
     test('should lazily create runtime state for jobs created on other replicas', async () => {
+      if (!ioredisClient) {
+        console.warn('Redis not available, skipping test');
+        return;
+      }
+
+      // Simulate two instances - one creates job, other tries to get it
+      const { createStreamServices } = await import('../createStreamServices');
+      const { RedisJobStore } = await import('../implementations/RedisJobStore');
+
       // Instance 1: Create the job directly in Redis (simulating another replica)
-      const jobStore = new RedisJobStore(ioredisClient!);
+      const jobStore = new RedisJobStore(ioredisClient);
       await jobStore.initialize();
 
       const streamId = `cross-replica-${Date.now()}`;
@@ -510,6 +480,7 @@ describe('GenerationJobManager Integration Tests', () => {
 
       // Instance 2: Fresh GenerationJobManager that doesn't have this job in memory
       jest.resetModules();
+      const { GenerationJobManager } = await import('../GenerationJobManager');
 
       const services = createStreamServices({
         useRedis: true,
@@ -517,7 +488,7 @@ describe('GenerationJobManager Integration Tests', () => {
       });
 
       GenerationJobManager.configure(services);
-      GenerationJobManager.initialize();
+      await GenerationJobManager.initialize();
 
       // This should work even though the job was created by "another instance"
       // The manager should lazily create runtime state from Redis data
@@ -541,13 +512,21 @@ describe('GenerationJobManager Integration Tests', () => {
     });
 
     test('should persist syncSent to Redis for cross-replica consistency', async () => {
+      if (!ioredisClient) {
+        console.warn('Redis not available, skipping test');
+        return;
+      }
+
+      const { GenerationJobManager } = await import('../GenerationJobManager');
+      const { createStreamServices } = await import('../createStreamServices');
+
       const services = createStreamServices({
         useRedis: true,
         redisClient: ioredisClient,
       });
 
       GenerationJobManager.configure(services);
-      GenerationJobManager.initialize();
+      await GenerationJobManager.initialize();
 
       const streamId = `sync-sent-${Date.now()}`;
       await GenerationJobManager.createJob(streamId, 'user-1');
@@ -575,6 +554,14 @@ describe('GenerationJobManager Integration Tests', () => {
     });
 
     test('should persist finalEvent to Redis for cross-replica access', async () => {
+      if (!ioredisClient) {
+        console.warn('Redis not available, skipping test');
+        return;
+      }
+
+      const { GenerationJobManager } = await import('../GenerationJobManager');
+      const { createStreamServices } = await import('../createStreamServices');
+
       const services = createStreamServices({
         useRedis: true,
         redisClient: ioredisClient,
@@ -584,7 +571,7 @@ describe('GenerationJobManager Integration Tests', () => {
         ...services,
         cleanupOnComplete: false, // Keep job for verification
       });
-      GenerationJobManager.initialize();
+      await GenerationJobManager.initialize();
 
       const streamId = `final-event-${Date.now()}`;
       await GenerationJobManager.createJob(streamId, 'user-1');
@@ -612,13 +599,21 @@ describe('GenerationJobManager Integration Tests', () => {
     });
 
     test('should emit cross-replica abort signal via Redis pub/sub', async () => {
+      if (!ioredisClient) {
+        console.warn('Redis not available, skipping test');
+        return;
+      }
+
+      const { GenerationJobManager } = await import('../GenerationJobManager');
+      const { createStreamServices } = await import('../createStreamServices');
+
       const services = createStreamServices({
         useRedis: true,
         redisClient: ioredisClient,
       });
 
       GenerationJobManager.configure(services);
-      GenerationJobManager.initialize();
+      await GenerationJobManager.initialize();
 
       const streamId = `abort-signal-${Date.now()}`;
       const job = await GenerationJobManager.createJob(streamId, 'user-1');
@@ -646,11 +641,19 @@ describe('GenerationJobManager Integration Tests', () => {
     });
 
     test('should handle abort for lazily-initialized cross-replica jobs', async () => {
+      if (!ioredisClient) {
+        console.warn('Redis not available, skipping test');
+        return;
+      }
+
       // This test validates that jobs created on Replica A and lazily-initialized
       // on Replica B can still receive and handle abort signals.
 
+      const { createStreamServices } = await import('../createStreamServices');
+      const { RedisJobStore } = await import('../implementations/RedisJobStore');
+
       // === Replica A: Create job directly in Redis ===
-      const replicaAJobStore = new RedisJobStore(ioredisClient!);
+      const replicaAJobStore = new RedisJobStore(ioredisClient);
       await replicaAJobStore.initialize();
 
       const streamId = `lazy-abort-${Date.now()}`;
@@ -658,6 +661,7 @@ describe('GenerationJobManager Integration Tests', () => {
 
       // === Replica B: Fresh manager that lazily initializes the job ===
       jest.resetModules();
+      const { GenerationJobManager } = await import('../GenerationJobManager');
 
       const services = createStreamServices({
         useRedis: true,
@@ -665,7 +669,7 @@ describe('GenerationJobManager Integration Tests', () => {
       });
 
       GenerationJobManager.configure(services);
-      GenerationJobManager.initialize();
+      await GenerationJobManager.initialize();
 
       // Get job triggers lazy initialization of runtime state
       const job = await GenerationJobManager.getJob(streamId);
@@ -696,19 +700,29 @@ describe('GenerationJobManager Integration Tests', () => {
     });
 
     test('should abort generation when abort signal received from another replica', async () => {
+      if (!ioredisClient) {
+        console.warn('Redis not available, skipping test');
+        return;
+      }
+
       // This test simulates:
       // 1. Replica A creates a job and starts generation
       // 2. Replica B receives abort request and emits abort signal
       // 3. Replica A receives signal and aborts its AbortController
 
+      const { createStreamServices } = await import('../createStreamServices');
+      const { RedisEventTransport } = await import('../implementations/RedisEventTransport');
+
       // Create the job on "Replica A"
+      const { GenerationJobManager } = await import('../GenerationJobManager');
+
       const services = createStreamServices({
         useRedis: true,
         redisClient: ioredisClient,
       });
 
       GenerationJobManager.configure(services);
-      GenerationJobManager.initialize();
+      await GenerationJobManager.initialize();
 
       const streamId = `cross-abort-${Date.now()}`;
       const job = await GenerationJobManager.createJob(streamId, 'user-1');
@@ -745,8 +759,16 @@ describe('GenerationJobManager Integration Tests', () => {
     });
 
     test('should handle wasSyncSent for cross-replica scenarios', async () => {
+      if (!ioredisClient) {
+        console.warn('Redis not available, skipping test');
+        return;
+      }
+
+      const { createStreamServices } = await import('../createStreamServices');
+      const { RedisJobStore } = await import('../implementations/RedisJobStore');
+
       // Create job directly in Redis with syncSent: true
-      const jobStore = new RedisJobStore(ioredisClient!);
+      const jobStore = new RedisJobStore(ioredisClient);
       await jobStore.initialize();
 
       const streamId = `cross-sync-${Date.now()}`;
@@ -755,6 +777,7 @@ describe('GenerationJobManager Integration Tests', () => {
 
       // Fresh manager that doesn't have this job locally
       jest.resetModules();
+      const { GenerationJobManager } = await import('../GenerationJobManager');
 
       const services = createStreamServices({
         useRedis: true,
@@ -762,7 +785,7 @@ describe('GenerationJobManager Integration Tests', () => {
       });
 
       GenerationJobManager.configure(services);
-      GenerationJobManager.initialize();
+      await GenerationJobManager.initialize();
 
       // wasSyncSent should check Redis even without local runtime
       const wasSent = await GenerationJobManager.wasSyncSent(streamId);
@@ -771,130 +794,9 @@ describe('GenerationJobManager Integration Tests', () => {
       await GenerationJobManager.destroy();
       await jobStore.destroy();
     });
-
-    test('should emit created event from metadata on cross-replica subscribe', async () => {
-      const replicaAJobStore = new RedisJobStore(ioredisClient!);
-      await replicaAJobStore.initialize();
-
-      const streamId = `cross-created-${Date.now()}`;
-      const userId = 'test-user';
-
-      await replicaAJobStore.createJob(streamId, userId);
-      await replicaAJobStore.updateJob(streamId, {
-        userMessage: {
-          messageId: 'msg-123',
-          parentMessageId: '00000000-0000-0000-0000-000000000000',
-          conversationId: streamId,
-          text: 'hello world',
-        },
-      });
-
-      jest.resetModules();
-
-      const services = createStreamServices({
-        useRedis: true,
-        redisClient: ioredisClient,
-      });
-
-      GenerationJobManager.configure(services);
-      GenerationJobManager.initialize();
-
-      const received: unknown[] = [];
-      const subscription = await GenerationJobManager.subscribe(
-        streamId,
-        (event) => received.push(event),
-      );
-
-      expect(subscription).not.toBeNull();
-      expect(received.length).toBe(1);
-
-      const created = received[0] as CreatedEvent;
-      expect(created.created).toBe(true);
-      expect(created.streamId).toBe(streamId);
-      expect(created.message.messageId).toBe('msg-123');
-      expect(created.message.conversationId).toBe(streamId);
-      expect(created.message.sender).toBe('User');
-      expect(created.message.isCreatedByUser).toBe(true);
-
-      subscription?.unsubscribe();
-      await GenerationJobManager.destroy();
-      await replicaAJobStore.destroy();
-    });
-
-    test('should NOT emit created event from metadata when userMessage is not set', async () => {
-      const replicaAJobStore = new RedisJobStore(ioredisClient!);
-      await replicaAJobStore.initialize();
-
-      const streamId = `cross-no-created-${Date.now()}`;
-      await replicaAJobStore.createJob(streamId, 'test-user');
-
-      jest.resetModules();
-
-      const services = createStreamServices({
-        useRedis: true,
-        redisClient: ioredisClient,
-      });
-
-      GenerationJobManager.configure(services);
-      GenerationJobManager.initialize();
-
-      const received: unknown[] = [];
-      const subscription = await GenerationJobManager.subscribe(
-        streamId,
-        (event) => received.push(event),
-      );
-
-      expect(subscription).not.toBeNull();
-      expect(received.length).toBe(0);
-
-      subscription?.unsubscribe();
-      await GenerationJobManager.destroy();
-      await replicaAJobStore.destroy();
-    });
-
-    test('should NOT emit created event when skipBufferReplay is true (resume path)', async () => {
-      const replicaAJobStore = new RedisJobStore(ioredisClient!);
-      await replicaAJobStore.initialize();
-
-      const streamId = `cross-no-replay-${Date.now()}`;
-      await replicaAJobStore.createJob(streamId, 'test-user');
-      await replicaAJobStore.updateJob(streamId, {
-        userMessage: {
-          messageId: 'msg-456',
-          conversationId: streamId,
-          text: 'hi',
-        },
-      });
-
-      jest.resetModules();
-
-      const services = createStreamServices({
-        useRedis: true,
-        redisClient: ioredisClient,
-      });
-
-      GenerationJobManager.configure(services);
-      GenerationJobManager.initialize();
-
-      const received: unknown[] = [];
-      const subscription = await GenerationJobManager.subscribe(
-        streamId,
-        (event) => received.push(event),
-        undefined,
-        undefined,
-        { skipBufferReplay: true },
-      );
-
-      expect(subscription).not.toBeNull();
-      expect(received.length).toBe(0);
-
-      subscription?.unsubscribe();
-      await GenerationJobManager.destroy();
-      await replicaAJobStore.destroy();
-    });
   });
 
-  describeRedis('Sequential Event Ordering (Redis)', () => {
+  describe('Sequential Event Ordering (Redis)', () => {
     /**
      * These tests verify that events are delivered in strict sequential order
      * when using Redis mode. This is critical because:
@@ -905,7 +807,14 @@ describe('GenerationJobManager Integration Tests', () => {
      * The fix: emitChunk now awaits Redis publish to ensure ordered delivery.
      */
     test('should maintain strict order for rapid sequential emits', async () => {
+      if (!ioredisClient) {
+        console.warn('Redis not available, skipping test');
+        return;
+      }
+
       jest.resetModules();
+      const { GenerationJobManager } = await import('../GenerationJobManager');
+      const { createStreamServices } = await import('../createStreamServices');
 
       const services = createStreamServices({
         useRedis: true,
@@ -913,7 +822,7 @@ describe('GenerationJobManager Integration Tests', () => {
       });
 
       GenerationJobManager.configure(services);
-      GenerationJobManager.initialize();
+      await GenerationJobManager.initialize();
 
       const streamId = `order-rapid-${Date.now()}`;
       await GenerationJobManager.createJob(streamId, 'user-1');
@@ -950,7 +859,14 @@ describe('GenerationJobManager Integration Tests', () => {
     });
 
     test('should maintain order for tool call argument deltas', async () => {
+      if (!ioredisClient) {
+        console.warn('Redis not available, skipping test');
+        return;
+      }
+
       jest.resetModules();
+      const { GenerationJobManager } = await import('../GenerationJobManager');
+      const { createStreamServices } = await import('../createStreamServices');
 
       const services = createStreamServices({
         useRedis: true,
@@ -958,7 +874,7 @@ describe('GenerationJobManager Integration Tests', () => {
       });
 
       GenerationJobManager.configure(services);
-      GenerationJobManager.initialize();
+      await GenerationJobManager.initialize();
 
       const streamId = `tool-args-${Date.now()}`;
       await GenerationJobManager.createJob(streamId, 'user-1');
@@ -1004,7 +920,14 @@ describe('GenerationJobManager Integration Tests', () => {
     });
 
     test('should maintain order: on_run_step before on_run_step_delta', async () => {
+      if (!ioredisClient) {
+        console.warn('Redis not available, skipping test');
+        return;
+      }
+
       jest.resetModules();
+      const { GenerationJobManager } = await import('../GenerationJobManager');
+      const { createStreamServices } = await import('../createStreamServices');
 
       const services = createStreamServices({
         useRedis: true,
@@ -1012,7 +935,7 @@ describe('GenerationJobManager Integration Tests', () => {
       });
 
       GenerationJobManager.configure(services);
-      GenerationJobManager.initialize();
+      await GenerationJobManager.initialize();
 
       const streamId = `step-order-${Date.now()}`;
       await GenerationJobManager.createJob(streamId, 'user-1');
@@ -1062,7 +985,14 @@ describe('GenerationJobManager Integration Tests', () => {
     });
 
     test('should not block other streams when awaiting emitChunk', async () => {
+      if (!ioredisClient) {
+        console.warn('Redis not available, skipping test');
+        return;
+      }
+
       jest.resetModules();
+      const { GenerationJobManager } = await import('../GenerationJobManager');
+      const { createStreamServices } = await import('../createStreamServices');
 
       const services = createStreamServices({
         useRedis: true,
@@ -1070,7 +1000,7 @@ describe('GenerationJobManager Integration Tests', () => {
       });
 
       GenerationJobManager.configure(services);
-      GenerationJobManager.initialize();
+      await GenerationJobManager.initialize();
 
       const streamId1 = `concurrent-1-${Date.now()}`;
       const streamId2 = `concurrent-2-${Date.now()}`;
@@ -1127,605 +1057,6 @@ describe('GenerationJobManager Integration Tests', () => {
     });
   });
 
-  describe('Race Condition: Events Before Subscriber Ready', () => {
-    /**
-     * These tests verify the fix for the race condition where early events
-     * (like the 'created' event at seq 0) are lost because the Redis SUBSCRIBE
-     * command hasn't completed when events are published.
-     *
-     * Symptom: "[RedisEventTransport] Stream <id>: timeout waiting for seq 0"
-     *          followed by truncated responses in the UI.
-     *
-     * Root cause: RedisEventTransport.subscribe() fired Redis SUBSCRIBE as
-     * fire-and-forget. GenerationJobManager set hasSubscriber=true immediately,
-     * disabling the earlyEventBuffer before Redis was actually listening.
-     *
-     * Fix: subscribe() now returns a `ready` promise that resolves when the
-     * Redis subscription is confirmed. earlyEventBuffer stays active until then.
-     */
-
-    test('should buffer and replay events emitted before subscribe (in-memory)', async () => {
-      const manager = new GenerationJobManagerClass();
-      manager.configure({
-        jobStore: new InMemoryJobStore({ ttlAfterComplete: 60000 }),
-        eventTransport: new InMemoryEventTransport(),
-        isRedis: false,
-      });
-
-      manager.initialize();
-
-      const streamId = `early-buf-inmem-${Date.now()}`;
-      await manager.createJob(streamId, 'user-1');
-
-      await manager.emitChunk(streamId, {
-        created: true,
-        message: { text: 'hello' },
-        streamId,
-      } as CreatedEvent);
-      await manager.emitChunk(streamId, {
-        event: 'on_message_delta',
-        data: { delta: { content: { type: 'text', text: 'First chunk' } } },
-      });
-
-      const receivedEvents: unknown[] = [];
-      const subscription = await manager.subscribe(streamId, (event: unknown) =>
-        receivedEvents.push(event),
-      );
-
-      await new Promise((resolve) => setTimeout(resolve, 50));
-
-      expect(receivedEvents.length).toBe(2);
-      expect((receivedEvents[0] as Record<string, unknown>).created).toBe(true);
-
-      subscription?.unsubscribe();
-      await manager.destroy();
-    });
-
-    testRedis('should buffer and replay events emitted before subscribe (Redis)', async () => {
-      const manager = new GenerationJobManagerClass();
-      const services = createStreamServices({
-        useRedis: true,
-        redisClient: ioredisClient,
-      });
-
-      manager.configure(services);
-      manager.initialize();
-
-      const streamId = `early-buf-redis-${Date.now()}`;
-      await manager.createJob(streamId, 'user-1');
-
-      await manager.emitChunk(streamId, {
-        created: true,
-        message: { text: 'hello' },
-        streamId,
-      } as CreatedEvent);
-      await manager.emitChunk(streamId, {
-        event: 'on_message_delta',
-        data: { delta: { content: { type: 'text', text: 'First' } } },
-      });
-      await manager.emitChunk(streamId, {
-        event: 'on_message_delta',
-        data: { delta: { content: { type: 'text', text: ' chunk' } } },
-      });
-
-      const receivedEvents: unknown[] = [];
-      const subscription = await manager.subscribe(streamId, (event: unknown) =>
-        receivedEvents.push(event),
-      );
-
-      await new Promise((resolve) => setTimeout(resolve, 100));
-
-      expect(receivedEvents.length).toBe(3);
-      expect((receivedEvents[0] as Record<string, unknown>).created).toBe(true);
-      expect(
-        ((receivedEvents[1] as Record<string, unknown>).data as Record<string, unknown>).delta,
-      ).toBeDefined();
-
-      subscription?.unsubscribe();
-      await manager.destroy();
-    });
-
-    testRedis(
-      'should not lose events when emitting before and after subscribe (Redis)',
-      async () => {
-        const manager = new GenerationJobManagerClass();
-        const services = createStreamServices({
-          useRedis: true,
-          redisClient: ioredisClient,
-        });
-
-        manager.configure(services);
-        manager.initialize();
-
-        const streamId = `no-loss-${Date.now()}`;
-        await manager.createJob(streamId, 'user-1');
-
-        await manager.emitChunk(streamId, {
-          created: true,
-          message: { text: 'hello' },
-          streamId,
-        } as CreatedEvent);
-        await manager.emitChunk(streamId, {
-          event: 'on_run_step',
-          data: { id: 'step-1', type: 'message_creation', index: 0 },
-        });
-
-        const receivedEvents: unknown[] = [];
-        const subscription = await manager.subscribe(streamId, (event: unknown) =>
-          receivedEvents.push(event),
-        );
-
-        await new Promise((resolve) => setTimeout(resolve, 100));
-
-        for (let i = 0; i < 10; i++) {
-          await manager.emitChunk(streamId, {
-            event: 'on_message_delta',
-            data: { delta: { content: { type: 'text', text: `word${i} ` } }, index: i },
-          });
-        }
-
-        await new Promise((resolve) => setTimeout(resolve, 300));
-
-        expect(receivedEvents.length).toBe(12);
-        expect((receivedEvents[0] as Record<string, unknown>).created).toBe(true);
-        expect((receivedEvents[1] as Record<string, unknown>).event).toBe('on_run_step');
-        for (let i = 0; i < 10; i++) {
-          expect((receivedEvents[i + 2] as Record<string, unknown>).event).toBe('on_message_delta');
-        }
-
-        subscription?.unsubscribe();
-        await manager.destroy();
-      },
-    );
-
-    testRedis('RedisEventTransport.subscribe() should return a ready promise', async () => {
-      const subscriber = (ioredisClient as unknown as { duplicate: () => unknown }).duplicate();
-      const transport = new RedisEventTransport(ioredisClient as never, subscriber as never);
-
-      const streamId = `ready-promise-${Date.now()}`;
-      const result = transport.subscribe(streamId, {
-        onChunk: () => {},
-      });
-
-      expect(result.ready).toBeDefined();
-      expect(result.ready).toBeInstanceOf(Promise);
-
-      await result.ready;
-
-      result.unsubscribe();
-      transport.destroy();
-      (subscriber as { disconnect: () => void }).disconnect();
-    });
-
-    test('InMemoryEventTransport.subscribe() should not have a ready promise', () => {
-      const transport = new InMemoryEventTransport();
-      const streamId = `no-ready-${Date.now()}`;
-      const result = transport.subscribe(streamId, {
-        onChunk: () => {},
-      });
-
-      expect(result.ready).toBeUndefined();
-
-      result.unsubscribe();
-      transport.destroy();
-    });
-  });
-
-  describe('Resume: skipBufferReplay prevents duplication', () => {
-    /**
-     * Verifies the fix for duplicated content when navigating away from an
-     * in-progress conversation and back. Events accumulate in earlyEventBuffer
-     * while the subscriber is absent. On resume, the sync event delivers all
-     * accumulated content via aggregatedContent, so buffer replay must be
-     * skipped to prevent duplication.
-     */
-
-    test('should NOT replay buffer when skipBufferReplay is true (resume scenario)', async () => {
-      const manager = createInMemoryManager();
-      const streamId = `skip-buf-${Date.now()}`;
-      await manager.createJob(streamId, 'user-1');
-
-      await setupDisconnectedStream(manager, streamId, 10);
-
-      const resumeState = await manager.getResumeState(streamId);
-      expect(resumeState).not.toBeNull();
-
-      const resumeEvents: ServerSentEvent[] = [];
-      const sub2 = await manager.subscribe(
-        streamId,
-        (event) => resumeEvents.push(event),
-        undefined,
-        undefined,
-        { skipBufferReplay: true },
-      );
-
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      expect(resumeEvents.length).toBe(0);
-
-      await manager.emitChunk(streamId, {
-        event: 'on_message_delta',
-        data: { id: 'step-1', delta: { content: { type: 'text', text: ' Live!' } } },
-      });
-
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      expect(resumeEvents.length).toBe(1);
-      expect((resumeEvents[0] as StreamEvent).event).toBe('on_message_delta');
-
-      sub2?.unsubscribe();
-      await manager.destroy();
-    });
-
-    test('should replay buffer by default when no options are passed', async () => {
-      const manager = createInMemoryManager();
-      const streamId = `replay-buf-${Date.now()}`;
-      await manager.createJob(streamId, 'user-1');
-
-      const sub1Events: ServerSentEvent[] = [];
-      const sub1 = await manager.subscribe(streamId, (event) => sub1Events.push(event));
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
-      await manager.emitChunk(streamId, {
-        event: 'on_run_step',
-        data: { id: 'step-1', runId: 'run-1', index: 0, stepDetails: { type: 'message_creation' } },
-      });
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
-      sub1?.unsubscribe();
-      await new Promise((resolve) => setTimeout(resolve, 20));
-
-      await manager.emitChunk(streamId, {
-        event: 'on_message_delta',
-        data: { id: 'step-1', delta: { content: { type: 'text', text: 'buffered' } } },
-      });
-
-      const sub2Events: ServerSentEvent[] = [];
-      const sub2 = await manager.subscribe(streamId, (event) => sub2Events.push(event));
-      await new Promise((resolve) => setTimeout(resolve, 20));
-
-      expect(sub2Events.length).toBe(1);
-      expect((sub2Events[0] as StreamEvent).event).toBe('on_message_delta');
-
-      sub2?.unsubscribe();
-      await manager.destroy();
-    });
-
-    test('should clear earlyEventBuffer even when skipping replay (no memory leak)', async () => {
-      const manager = createInMemoryManager();
-      const streamId = `buf-clear-${Date.now()}`;
-      await manager.createJob(streamId, 'user-1');
-
-      const sub1 = await manager.subscribe(streamId, () => {});
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      sub1?.unsubscribe();
-      await new Promise((resolve) => setTimeout(resolve, 20));
-
-      await manager.emitChunk(streamId, {
-        event: 'on_message_delta',
-        data: { delta: { content: { type: 'text', text: 'buf1' } } },
-      });
-      await manager.emitChunk(streamId, {
-        event: 'on_message_delta',
-        data: { delta: { content: { type: 'text', text: 'buf2' } } },
-      });
-
-      const sub2Events: ServerSentEvent[] = [];
-      const sub2 = await manager.subscribe(
-        streamId,
-        (event) => sub2Events.push(event),
-        undefined,
-        undefined,
-        { skipBufferReplay: true },
-      );
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      expect(sub2Events.length).toBe(0);
-
-      sub2?.unsubscribe();
-      await new Promise((resolve) => setTimeout(resolve, 20));
-
-      await manager.emitChunk(streamId, {
-        event: 'on_message_delta',
-        data: { delta: { content: { type: 'text', text: 'new-event' } } },
-      });
-
-      const sub3Events: ServerSentEvent[] = [];
-      const sub3 = await manager.subscribe(streamId, (event) => sub3Events.push(event));
-      await new Promise((resolve) => setTimeout(resolve, 20));
-
-      expect(sub3Events.length).toBe(1);
-      const event = sub3Events[0] as {
-        event: string;
-        data: { delta: { content: { text: string } } };
-      };
-      expect(event.data.delta.content.text).toBe('new-event');
-
-      sub3?.unsubscribe();
-      await manager.destroy();
-    });
-
-    test('should handle multiple disconnect/reconnect cycles with skipBufferReplay', async () => {
-      const manager = createInMemoryManager();
-      const streamId = `multi-reconnect-${Date.now()}`;
-      await manager.createJob(streamId, 'user-1');
-
-      const sub1 = await manager.subscribe(streamId, () => {});
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
-      await manager.emitChunk(streamId, {
-        event: 'on_message_delta',
-        data: { delta: { content: { type: 'text', text: 'initial' } } },
-      });
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
-      sub1?.unsubscribe();
-      await new Promise((resolve) => setTimeout(resolve, 20));
-
-      await manager.emitChunk(streamId, {
-        event: 'on_message_delta',
-        data: { delta: { content: { type: 'text', text: 'buffered-1' } } },
-      });
-
-      const resumeState1 = await manager.getResumeState(streamId);
-      expect(resumeState1).not.toBeNull();
-
-      const sub2Events: ServerSentEvent[] = [];
-      const sub2 = await manager.subscribe(
-        streamId,
-        (event) => sub2Events.push(event),
-        undefined,
-        undefined,
-        { skipBufferReplay: true },
-      );
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      expect(sub2Events.length).toBe(0);
-
-      await manager.emitChunk(streamId, {
-        event: 'on_message_delta',
-        data: { delta: { content: { type: 'text', text: 'live-1' } } },
-      });
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      expect(sub2Events.length).toBe(1);
-
-      sub2?.unsubscribe();
-      await new Promise((resolve) => setTimeout(resolve, 20));
-
-      await manager.emitChunk(streamId, {
-        event: 'on_message_delta',
-        data: { delta: { content: { type: 'text', text: 'buffered-2' } } },
-      });
-
-      const resumeState2 = await manager.getResumeState(streamId);
-      expect(resumeState2).not.toBeNull();
-
-      const sub3Events: ServerSentEvent[] = [];
-      const sub3 = await manager.subscribe(
-        streamId,
-        (event) => sub3Events.push(event),
-        undefined,
-        undefined,
-        { skipBufferReplay: true },
-      );
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      expect(sub3Events.length).toBe(0);
-
-      await manager.emitChunk(streamId, {
-        event: 'on_message_delta',
-        data: { delta: { content: { type: 'text', text: 'live-2' } } },
-      });
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      expect(sub3Events.length).toBe(1);
-
-      sub3?.unsubscribe();
-      await manager.destroy();
-    });
-
-    testRedis('should NOT replay buffer when skipBufferReplay is true (Redis)', async () => {
-      const manager = createRedisManager();
-      const streamId = `skip-buf-redis-${Date.now()}`;
-      await manager.createJob(streamId, 'user-1');
-
-      await setupDisconnectedStream(manager, streamId, 100);
-
-      const resumeState = await manager.getResumeState(streamId);
-      expect(resumeState).not.toBeNull();
-      expect(resumeState!.aggregatedContent?.length).toBeGreaterThan(0);
-
-      const resumeEvents: ServerSentEvent[] = [];
-      const sub2 = await manager.subscribe(
-        streamId,
-        (event) => resumeEvents.push(event),
-        undefined,
-        undefined,
-        { skipBufferReplay: true },
-      );
-
-      await new Promise((resolve) => setTimeout(resolve, 200));
-      expect(resumeEvents.length).toBe(0);
-
-      await manager.emitChunk(streamId, {
-        event: 'on_message_delta',
-        data: { id: 'step-1', delta: { content: { type: 'text', text: ' Live!' } } },
-      });
-
-      await new Promise((resolve) => setTimeout(resolve, 200));
-      expect(resumeEvents.length).toBe(1);
-      expect((resumeEvents[0] as StreamEvent).event).toBe('on_message_delta');
-
-      sub2?.unsubscribe();
-      await manager.destroy();
-    });
-
-    testRedis(
-      'should replay buffer without skipBufferReplay after disconnect (Redis)',
-      async () => {
-        const manager = createRedisManager();
-        const streamId = `replay-buf-redis-${Date.now()}`;
-        await manager.createJob(streamId, 'user-1');
-
-        const sub1 = await manager.subscribe(streamId, () => {});
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        sub1?.unsubscribe();
-        await new Promise((resolve) => setTimeout(resolve, 100));
-
-        await manager.emitChunk(streamId, {
-          event: 'on_message_delta',
-          data: { delta: { content: { type: 'text', text: 'buffered-redis' } } },
-        });
-
-        await new Promise((resolve) => setTimeout(resolve, 100));
-
-        const sub2Events: ServerSentEvent[] = [];
-        const sub2 = await manager.subscribe(streamId, (event) => sub2Events.push(event));
-
-        await new Promise((resolve) => setTimeout(resolve, 200));
-
-        expect(sub2Events.length).toBe(1);
-        expect((sub2Events[0] as StreamEvent).event).toBe('on_message_delta');
-
-        sub2?.unsubscribe();
-        await manager.destroy();
-      },
-    );
-  });
-
-  describe('Atomic subscribeWithResume', () => {
-    test('should return empty pendingEvents for pre-snapshot buffer events (in-memory)', async () => {
-      const manager = createInMemoryManager();
-      const streamId = `atomic-drain-${Date.now()}`;
-      await manager.createJob(streamId, 'user-1');
-
-      const sub1 = await manager.subscribe(streamId, () => {});
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      sub1?.unsubscribe();
-      await new Promise((resolve) => setTimeout(resolve, 20));
-
-      await manager.emitChunk(streamId, {
-        event: 'on_run_step',
-        data: { id: 'step-1', runId: 'run-1', index: 0, stepDetails: { type: 'message_creation' } },
-      });
-      await manager.emitChunk(streamId, {
-        event: 'on_message_delta',
-        data: { id: 'step-1', delta: { content: { type: 'text', text: 'buffered' } } },
-      });
-
-      const liveEvents: ServerSentEvent[] = [];
-      const { subscription, resumeState, pendingEvents } = await manager.subscribeWithResume(
-        streamId,
-        (event) => liveEvents.push(event),
-      );
-
-      expect(resumeState).not.toBeNull();
-      expect(pendingEvents.length).toBe(0);
-      expect(liveEvents.length).toBe(0);
-
-      subscription?.unsubscribe();
-      await manager.destroy();
-    });
-
-    test('should return empty pendingEvents when buffer is empty', async () => {
-      const manager = createInMemoryManager();
-      const streamId = `atomic-empty-${Date.now()}`;
-      await manager.createJob(streamId, 'user-1');
-
-      const sub1 = await manager.subscribe(streamId, () => {});
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
-      await manager.emitChunk(streamId, {
-        event: 'on_message_delta',
-        data: { delta: { content: { type: 'text', text: 'delivered' } } },
-      });
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
-      sub1?.unsubscribe();
-      await new Promise((resolve) => setTimeout(resolve, 20));
-
-      const { pendingEvents } = await manager.subscribeWithResume(streamId, () => {});
-
-      expect(pendingEvents.length).toBe(0);
-
-      await manager.destroy();
-    });
-
-    test('should deliver live events after subscribeWithResume', async () => {
-      const manager = createInMemoryManager();
-      const streamId = `atomic-live-${Date.now()}`;
-      await manager.createJob(streamId, 'user-1');
-
-      const sub1 = await manager.subscribe(streamId, () => {});
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      sub1?.unsubscribe();
-      await new Promise((resolve) => setTimeout(resolve, 20));
-
-      await manager.emitChunk(streamId, {
-        event: 'on_message_delta',
-        data: { delta: { content: { type: 'text', text: 'buffered-pre-snapshot' } } },
-      });
-
-      const liveEvents: ServerSentEvent[] = [];
-      const { subscription, pendingEvents } = await manager.subscribeWithResume(streamId, (event) =>
-        liveEvents.push(event),
-      );
-
-      expect(pendingEvents.length).toBe(0);
-      expect(liveEvents.length).toBe(0);
-
-      await manager.emitChunk(streamId, {
-        event: 'on_message_delta',
-        data: { delta: { content: { type: 'text', text: 'live-after' } } },
-      });
-
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      expect(liveEvents.length).toBe(1);
-      const liveEvent = liveEvents[0] as {
-        event: string;
-        data: { delta: { content: { text: string } } };
-      };
-      expect(liveEvent.data.delta.content.text).toBe('live-after');
-
-      subscription?.unsubscribe();
-      await manager.destroy();
-    });
-
-    testRedis(
-      'should return empty pendingEvents in Redis mode (chunks already persisted)',
-      async () => {
-        const manager = createRedisManager();
-        const streamId = `atomic-redis-${Date.now()}`;
-        await manager.createJob(streamId, 'user-1');
-
-        const sub1 = await manager.subscribe(streamId, () => {});
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        sub1?.unsubscribe();
-        await new Promise((resolve) => setTimeout(resolve, 100));
-
-        await manager.emitChunk(streamId, {
-          event: 'on_message_delta',
-          data: { delta: { content: { type: 'text', text: 'buffered-redis' } } },
-        });
-        await new Promise((resolve) => setTimeout(resolve, 100));
-
-        const liveEvents: ServerSentEvent[] = [];
-        const { subscription, resumeState, pendingEvents } = await manager.subscribeWithResume(
-          streamId,
-          (event) => liveEvents.push(event),
-        );
-
-        expect(resumeState).not.toBeNull();
-        expect(pendingEvents.length).toBe(0);
-
-        await manager.emitChunk(streamId, {
-          event: 'on_message_delta',
-          data: { delta: { content: { type: 'text', text: 'live-redis' } } },
-        });
-
-        await new Promise((resolve) => setTimeout(resolve, 200));
-        expect(liveEvents.length).toBe(1);
-
-        subscription?.unsubscribe();
-        await manager.destroy();
-      },
-    );
-  });
-
   describe('Error Preservation for Late Subscribers', () => {
     /**
      * These tests verify the fix for the race condition where errors
@@ -1736,6 +1067,10 @@ describe('GenerationJobManager Integration Tests', () => {
      */
 
     test('should store error in emitError for late-connecting subscribers', async () => {
+      const { GenerationJobManager } = await import('../GenerationJobManager');
+      const { InMemoryJobStore } = await import('../implementations/InMemoryJobStore');
+      const { InMemoryEventTransport } = await import('../implementations/InMemoryEventTransport');
+
       GenerationJobManager.configure({
         jobStore: new InMemoryJobStore({ ttlAfterComplete: 60000 }),
         eventTransport: new InMemoryEventTransport(),
@@ -1743,7 +1078,7 @@ describe('GenerationJobManager Integration Tests', () => {
         cleanupOnComplete: false,
       });
 
-      GenerationJobManager.initialize();
+      await GenerationJobManager.initialize();
 
       const streamId = `error-store-${Date.now()}`;
       await GenerationJobManager.createJob(streamId, 'user-1');
@@ -1764,6 +1099,10 @@ describe('GenerationJobManager Integration Tests', () => {
     });
 
     test('should NOT delete job immediately when completeJob is called with error', async () => {
+      const { GenerationJobManager } = await import('../GenerationJobManager');
+      const { InMemoryJobStore } = await import('../implementations/InMemoryJobStore');
+      const { InMemoryEventTransport } = await import('../implementations/InMemoryEventTransport');
+
       GenerationJobManager.configure({
         jobStore: new InMemoryJobStore({ ttlAfterComplete: 60000 }),
         eventTransport: new InMemoryEventTransport(),
@@ -1771,7 +1110,7 @@ describe('GenerationJobManager Integration Tests', () => {
         cleanupOnComplete: true, // Default behavior
       });
 
-      GenerationJobManager.initialize();
+      await GenerationJobManager.initialize();
 
       const streamId = `error-no-delete-${Date.now()}`;
       await GenerationJobManager.createJob(streamId, 'user-1');
@@ -1794,6 +1133,10 @@ describe('GenerationJobManager Integration Tests', () => {
     });
 
     test('should send stored error to late-connecting subscriber', async () => {
+      const { GenerationJobManager } = await import('../GenerationJobManager');
+      const { InMemoryJobStore } = await import('../implementations/InMemoryJobStore');
+      const { InMemoryEventTransport } = await import('../implementations/InMemoryEventTransport');
+
       GenerationJobManager.configure({
         jobStore: new InMemoryJobStore({ ttlAfterComplete: 60000 }),
         eventTransport: new InMemoryEventTransport(),
@@ -1801,7 +1144,7 @@ describe('GenerationJobManager Integration Tests', () => {
         cleanupOnComplete: true,
       });
 
-      GenerationJobManager.initialize();
+      await GenerationJobManager.initialize();
 
       const streamId = `error-late-sub-${Date.now()}`;
       await GenerationJobManager.createJob(streamId, 'user-1');
@@ -1839,6 +1182,10 @@ describe('GenerationJobManager Integration Tests', () => {
     });
 
     test('should prioritize error status over finalEvent in subscribe', async () => {
+      const { GenerationJobManager } = await import('../GenerationJobManager');
+      const { InMemoryJobStore } = await import('../implementations/InMemoryJobStore');
+      const { InMemoryEventTransport } = await import('../implementations/InMemoryEventTransport');
+
       GenerationJobManager.configure({
         jobStore: new InMemoryJobStore({ ttlAfterComplete: 60000 }),
         eventTransport: new InMemoryEventTransport(),
@@ -1846,7 +1193,7 @@ describe('GenerationJobManager Integration Tests', () => {
         cleanupOnComplete: false,
       });
 
-      GenerationJobManager.initialize();
+      await GenerationJobManager.initialize();
 
       const streamId = `error-priority-${Date.now()}`;
       await GenerationJobManager.createJob(streamId, 'user-1');
@@ -1884,9 +1231,17 @@ describe('GenerationJobManager Integration Tests', () => {
       await GenerationJobManager.destroy();
     });
 
-    testRedis('should handle error preservation in Redis mode (cross-replica)', async () => {
+    test('should handle error preservation in Redis mode (cross-replica)', async () => {
+      if (!ioredisClient) {
+        console.warn('Redis not available, skipping test');
+        return;
+      }
+
+      const { createStreamServices } = await import('../createStreamServices');
+      const { RedisJobStore } = await import('../implementations/RedisJobStore');
+
       // === Replica A: Creates job and emits error ===
-      const replicaAJobStore = new RedisJobStore(ioredisClient!);
+      const replicaAJobStore = new RedisJobStore(ioredisClient);
       await replicaAJobStore.initialize();
 
       const streamId = `redis-error-${Date.now()}`;
@@ -1901,6 +1256,7 @@ describe('GenerationJobManager Integration Tests', () => {
 
       // === Replica B: Fresh manager receives client connection ===
       jest.resetModules();
+      const { GenerationJobManager } = await import('../GenerationJobManager');
 
       const services = createStreamServices({
         useRedis: true,
@@ -1911,7 +1267,7 @@ describe('GenerationJobManager Integration Tests', () => {
         ...services,
         cleanupOnComplete: false,
       });
-      GenerationJobManager.initialize();
+      await GenerationJobManager.initialize();
 
       // Client connects to Replica B (job created on Replica A)
       let receivedError: string | undefined;
@@ -1937,6 +1293,10 @@ describe('GenerationJobManager Integration Tests', () => {
     });
 
     test('error jobs should be cleaned up by periodic cleanup after TTL', async () => {
+      const { GenerationJobManager } = await import('../GenerationJobManager');
+      const { InMemoryJobStore } = await import('../implementations/InMemoryJobStore');
+      const { InMemoryEventTransport } = await import('../implementations/InMemoryEventTransport');
+
       // Use a very short TTL for testing
       const jobStore = new InMemoryJobStore({ ttlAfterComplete: 100 });
 
@@ -1947,7 +1307,7 @@ describe('GenerationJobManager Integration Tests', () => {
         cleanupOnComplete: true,
       });
 
-      GenerationJobManager.initialize();
+      await GenerationJobManager.initialize();
 
       const streamId = `error-cleanup-${Date.now()}`;
       await GenerationJobManager.createJob(streamId, 'user-1');
@@ -1973,418 +1333,36 @@ describe('GenerationJobManager Integration Tests', () => {
     });
   });
 
-  describeRedis('Cross-Replica Live Streaming (Redis)', () => {
-    test('should publish events to Redis even when no local subscriber exists', async () => {
-      const replicaA = new GenerationJobManagerClass();
-      const servicesA = createStreamServices({
-        useRedis: true,
-        redisClient: ioredisClient,
-      });
-      replicaA.configure(servicesA);
-      replicaA.initialize();
-
-      const replicaB = new GenerationJobManagerClass();
-      const servicesB = createStreamServices({
-        useRedis: true,
-        redisClient: ioredisClient,
-      });
-      replicaB.configure(servicesB);
-      replicaB.initialize();
-
-      const streamId = `cross-live-${Date.now()}`;
-      await replicaA.createJob(streamId, 'user-1');
-
-      const replicaBJobStore = new RedisJobStore(ioredisClient!);
-      await replicaBJobStore.initialize();
-      await replicaBJobStore.createJob(streamId, 'user-1');
-
-      const receivedOnB: unknown[] = [];
-      const subB = await replicaB.subscribe(streamId, (event: unknown) => receivedOnB.push(event));
-
-      await new Promise((resolve) => setTimeout(resolve, 100));
-
-      for (let i = 0; i < 5; i++) {
-        await replicaA.emitChunk(streamId, {
-          event: 'on_message_delta',
-          data: { delta: { content: { type: 'text', text: `token${i} ` } }, index: i },
-        });
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, 300));
-
-      expect(receivedOnB.length).toBe(5);
-      for (let i = 0; i < 5; i++) {
-        expect((receivedOnB[i] as Record<string, unknown>).event).toBe('on_message_delta');
-      }
-
-      subB?.unsubscribe();
-      replicaBJobStore.destroy();
-      await replicaA.destroy();
-      await replicaB.destroy();
-    });
-
-    test('should not cause data loss on cross-replica subscribers when local subscriber joins', async () => {
-      const replicaA = new GenerationJobManagerClass();
-      const servicesA = createStreamServices({
-        useRedis: true,
-        redisClient: ioredisClient,
-      });
-      replicaA.configure(servicesA);
-      replicaA.initialize();
-
-      const replicaB = new GenerationJobManagerClass();
-      const servicesB = createStreamServices({
-        useRedis: true,
-        redisClient: ioredisClient,
-      });
-      replicaB.configure(servicesB);
-      replicaB.initialize();
-
-      const streamId = `cross-seq-safe-${Date.now()}`;
-
-      await replicaA.createJob(streamId, 'user-1');
-      const replicaBJobStore = new RedisJobStore(ioredisClient!);
-      await replicaBJobStore.initialize();
-      await replicaBJobStore.createJob(streamId, 'user-1');
-
-      const receivedOnB: unknown[] = [];
-      const subB = await replicaB.subscribe(streamId, (event: unknown) => receivedOnB.push(event));
-      await new Promise((resolve) => setTimeout(resolve, 100));
-
-      for (let i = 0; i < 3; i++) {
-        await replicaA.emitChunk(streamId, {
-          event: 'on_message_delta',
-          data: { delta: { content: { type: 'text', text: `pre-local-${i}` } }, index: i },
-        });
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, 300));
-      expect(receivedOnB.length).toBe(3);
-
-      const receivedOnA: unknown[] = [];
-      const subA = await replicaA.subscribe(streamId, (event: unknown) => receivedOnA.push(event));
-      await new Promise((resolve) => setTimeout(resolve, 100));
-
-      expect(receivedOnA.length).toBe(3);
-
-      for (let i = 0; i < 3; i++) {
-        await replicaA.emitChunk(streamId, {
-          event: 'on_message_delta',
-          data: { delta: { content: { type: 'text', text: `post-local-${i}` } }, index: i + 3 },
-        });
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, 300));
-
-      expect(receivedOnB.length).toBe(6);
-      expect(receivedOnA.length).toBe(6);
-
-      for (let i = 0; i < 3; i++) {
-        const data = (receivedOnB[i] as Record<string, unknown>).data as Record<string, unknown>;
-        const delta = data.delta as Record<string, unknown>;
-        const content = delta.content as Record<string, unknown>;
-        expect(content.text).toBe(`pre-local-${i}`);
-      }
-      for (let i = 0; i < 3; i++) {
-        const data = (receivedOnB[i + 3] as Record<string, unknown>).data as Record<
-          string,
-          unknown
-        >;
-        const delta = data.delta as Record<string, unknown>;
-        const content = delta.content as Record<string, unknown>;
-        expect(content.text).toBe(`post-local-${i}`);
-      }
-
-      subA?.unsubscribe();
-      subB?.unsubscribe();
-      replicaBJobStore.destroy();
-      await replicaA.destroy();
-      await replicaB.destroy();
-    });
-
-    test('should deliver buffered events locally AND publish live events cross-replica', async () => {
-      const replicaA = new GenerationJobManagerClass();
-      const servicesA = createStreamServices({
-        useRedis: true,
-        redisClient: ioredisClient,
-      });
-      replicaA.configure(servicesA);
-      replicaA.initialize();
-
-      const streamId = `cross-buf-live-${Date.now()}`;
-      await replicaA.createJob(streamId, 'user-1');
-
-      await replicaA.emitChunk(streamId, {
-        created: true,
-        message: { text: 'hello' },
-        streamId,
-      } as CreatedEvent);
-
-      const receivedOnA: unknown[] = [];
-      const subA = await replicaA.subscribe(streamId, (event: unknown) => receivedOnA.push(event));
-
-      await new Promise((resolve) => setTimeout(resolve, 100));
-
-      expect(receivedOnA.length).toBe(1);
-      expect((receivedOnA[0] as Record<string, unknown>).created).toBe(true);
-
-      const replicaB = new GenerationJobManagerClass();
-      const servicesB = createStreamServices({
-        useRedis: true,
-        redisClient: ioredisClient,
-      });
-      replicaB.configure(servicesB);
-      replicaB.initialize();
-
-      const replicaBJobStore = new RedisJobStore(ioredisClient!);
-      await replicaBJobStore.initialize();
-      await replicaBJobStore.createJob(streamId, 'user-1');
-
-      const receivedOnB: unknown[] = [];
-      const subB = await replicaB.subscribe(streamId, (event: unknown) => receivedOnB.push(event));
-
-      await new Promise((resolve) => setTimeout(resolve, 100));
-
-      for (let i = 0; i < 3; i++) {
-        await replicaA.emitChunk(streamId, {
-          event: 'on_message_delta',
-          data: { delta: { content: { type: 'text', text: `word${i} ` } }, index: i },
-        });
-      }
-
-      /** B joined after A published seq 0, so B's reorder buffer force-flushes after REORDER_TIMEOUT_MS (500ms) */
-      await new Promise((resolve) => setTimeout(resolve, 700));
-
-      expect(receivedOnA.length).toBe(4);
-      expect(receivedOnB.length).toBe(4);
-      expect((receivedOnB[0] as CreatedEvent).created).toBe(true);
-
-      subA?.unsubscribe();
-      subB?.unsubscribe();
-      replicaBJobStore.destroy();
-      await replicaA.destroy();
-      await replicaB.destroy();
-    });
-  });
-
-  describeRedis('Concurrent Subscriber Readiness (Redis)', () => {
-    test('should return ready promise to all concurrent subscribers for same stream', async () => {
-      const subscriber = (
-        ioredisClient as unknown as { duplicate: () => typeof ioredisClient }
-      ).duplicate()!;
-      const transport = new RedisEventTransport(ioredisClient as never, subscriber as never);
-
-      const streamId = `concurrent-sub-${Date.now()}`;
-
-      const sub1 = transport.subscribe(streamId, {
-        onChunk: () => {},
-        onDone: () => {},
-      });
-      const sub2 = transport.subscribe(streamId, {
-        onChunk: () => {},
-        onDone: () => {},
-      });
-
-      expect(sub1.ready).toBeDefined();
-      expect(sub2.ready).toBeDefined();
-
-      await Promise.all([sub1.ready, sub2.ready]);
-
-      sub1.unsubscribe();
-      sub2.unsubscribe();
-      transport.destroy();
-      subscriber.disconnect();
-    });
-  });
-
-  describeRedis('Sequence Reset Safety (Redis)', () => {
-    test('should not receive stale pre-subscribe events via Redis after sequence reset', async () => {
-      const manager = new GenerationJobManagerClass();
-      const services = createStreamServices({
-        useRedis: true,
-        redisClient: ioredisClient,
-      });
-      manager.configure(services);
-      manager.initialize();
-
-      const streamId = `seq-stale-${Date.now()}`;
-      await manager.createJob(streamId, 'user-1');
-
-      await manager.emitChunk(streamId, {
-        event: 'on_message_delta',
-        data: { delta: { content: { type: 'text', text: 'pre-sub-0' } }, index: 0 },
-      });
-      await manager.emitChunk(streamId, {
-        event: 'on_message_delta',
-        data: { delta: { content: { type: 'text', text: 'pre-sub-1' } }, index: 1 },
-      });
-
-      const receivedEvents: unknown[] = [];
-      const sub = await manager.subscribe(streamId, (event: unknown) => receivedEvents.push(event));
-
-      await new Promise((resolve) => setTimeout(resolve, 100));
-
-      expect(receivedEvents.length).toBe(2);
-      expect(
-        ((receivedEvents[0] as Record<string, unknown>).data as Record<string, unknown>).delta,
-      ).toBeDefined();
-
-      for (let i = 0; i < 5; i++) {
-        await manager.emitChunk(streamId, {
-          event: 'on_message_delta',
-          data: { delta: { content: { type: 'text', text: `post-sub-${i}` } }, index: i + 2 },
-        });
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, 300));
-
-      expect(receivedEvents.length).toBe(7);
-
-      const texts = receivedEvents.map(
-        (e) =>
-          (
-            ((e as Record<string, unknown>).data as Record<string, unknown>).delta as Record<
-              string,
-              unknown
-            >
-          ).content as Record<string, unknown>,
-      );
-      expect((texts[0] as Record<string, unknown>).text).toBe('pre-sub-0');
-      expect((texts[1] as Record<string, unknown>).text).toBe('pre-sub-1');
-      for (let i = 0; i < 5; i++) {
-        expect((texts[i + 2] as Record<string, unknown>).text).toBe(`post-sub-${i}`);
-      }
-
-      sub?.unsubscribe();
-      await manager.destroy();
-    });
-
-    test('should not reset sequence when second subscriber joins mid-stream', async () => {
-      const manager = new GenerationJobManagerClass();
-      const services = createStreamServices({
-        useRedis: true,
-        redisClient: ioredisClient,
-      });
-      manager.configure({ ...services, cleanupOnComplete: false });
-      manager.initialize();
-
-      const streamId = `seq-2nd-sub-${Date.now()}`;
-      await manager.createJob(streamId, 'user-1');
-
-      const eventsA: unknown[] = [];
-      const subA = await manager.subscribe(streamId, (event: unknown) => eventsA.push(event));
-
-      await new Promise((resolve) => setTimeout(resolve, 50));
-
-      for (let i = 0; i < 3; i++) {
-        await manager.emitChunk(streamId, {
-          event: 'on_message_delta',
-          data: { delta: { content: { type: 'text', text: `chunk-${i}` } }, index: i },
-        });
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, 100));
-
-      expect(eventsA.length).toBe(3);
-
-      const eventsB: unknown[] = [];
-      const subB = await manager.subscribe(streamId, (event: unknown) => eventsB.push(event));
-
-      for (let i = 3; i < 6; i++) {
-        await manager.emitChunk(streamId, {
-          event: 'on_message_delta',
-          data: { delta: { content: { type: 'text', text: `chunk-${i}` } }, index: i },
-        });
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, 300));
-
-      expect(eventsA.length).toBe(6);
-      expect(eventsB.length).toBe(3);
-
-      for (let i = 0; i < 6; i++) {
-        const text = (
-          (
-            ((eventsA[i] as Record<string, unknown>).data as Record<string, unknown>)
-              .delta as Record<string, unknown>
-          ).content as Record<string, unknown>
-        ).text;
-        expect(text).toBe(`chunk-${i}`);
-      }
-
-      subA?.unsubscribe();
-      subB?.unsubscribe();
-      await manager.destroy();
-    });
-  });
-
-  describeRedis('Subscribe Error Recovery (Redis)', () => {
-    test('should allow resubscription after Redis subscribe failure', async () => {
-      const subscriber = (
-        ioredisClient as unknown as { duplicate: () => typeof ioredisClient }
-      ).duplicate()!;
-
-      const realSubscribe = subscriber.subscribe.bind(subscriber);
-      let callCount = 0;
-      subscriber.subscribe = ((...args: Parameters<typeof subscriber.subscribe>) => {
-        callCount++;
-        if (callCount === 1) {
-          return Promise.reject(new Error('Simulated Redis SUBSCRIBE failure'));
-        }
-        return realSubscribe(...args);
-      }) as typeof subscriber.subscribe;
-
-      const transport = new RedisEventTransport(ioredisClient as never, subscriber as never);
-
-      const streamId = `err-retry-${Date.now()}`;
-
-      const sub1 = transport.subscribe(streamId, {
-        onChunk: () => {},
-        onDone: () => {},
-      });
-
-      await sub1.ready;
-
-      const receivedEvents: unknown[] = [];
-      sub1.unsubscribe();
-
-      const sub2 = transport.subscribe(streamId, {
-        onChunk: (event: unknown) => receivedEvents.push(event),
-        onDone: () => {},
-      });
-
-      expect(sub2.ready).toBeDefined();
-      await sub2.ready;
-
-      await transport.emitChunk(streamId, { event: 'test', data: { value: 'hello' } });
-      await new Promise((resolve) => setTimeout(resolve, 100));
-
-      expect(receivedEvents.length).toBe(1);
-
-      sub2.unsubscribe();
-      transport.destroy();
-      subscriber.disconnect();
-    });
-  });
-
   describe('createStreamServices Auto-Detection', () => {
-    testRedis('should use Redis when useRedis is true and client is available', () => {
-      const services = createStreamServices({
-        useRedis: true,
-        redisClient: ioredisClient,
-      });
+    test('should auto-detect Redis when USE_REDIS is true', async () => {
+      if (!ioredisClient) {
+        console.warn('Redis not available, skipping test');
+        return;
+      }
 
+      // Force USE_REDIS to true
+      process.env.USE_REDIS = 'true';
+      jest.resetModules();
+
+      const { createStreamServices } = await import('../createStreamServices');
+      const services = createStreamServices();
+
+      // Should detect Redis
       expect(services.isRedis).toBe(true);
-      services.eventTransport.destroy();
     });
 
-    test('should fall back to in-memory when useRedis is false', () => {
-      const services = createStreamServices({ useRedis: false });
+    test('should fall back to in-memory when USE_REDIS is false', async () => {
+      process.env.USE_REDIS = 'false';
+      jest.resetModules();
+
+      const { createStreamServices } = await import('../createStreamServices');
+      const services = createStreamServices();
 
       expect(services.isRedis).toBe(false);
     });
 
     test('should allow forcing in-memory via config override', async () => {
+      const { createStreamServices } = await import('../createStreamServices');
       const services = createStreamServices({ useRedis: false });
 
       expect(services.isRedis).toBe(false);

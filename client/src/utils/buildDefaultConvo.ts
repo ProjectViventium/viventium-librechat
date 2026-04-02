@@ -68,15 +68,31 @@ const buildDefaultConvo = ({
     defaultConvo.assistant_id = assistantId;
   }
 
+  /* === VIVENTIUM START ===
+   * Preserve the pinned default agent for truly fresh local chats, but never let the previous
+   * conversation's non-ephemeral built-in agent overwrite an explicit new built-in selection.
+   * This keeps Viventium pinned by default without breaking user-driven switches to MS365,
+   * Google, or other bundled agents mid-conversation.
+   * === VIVENTIUM END === */
   // Ensures agent_id is always defined
+  const explicitConversationAgentId = conversation?.agent_id ?? '';
   const agentId = convo?.agent_id ?? '';
-  const defaultAgentId = lastConversationSetup?.agent_id ?? '';
+  const selectedPresetAgentId = lastConversationSetup?.agent_id ?? '';
+  const defaultAgentId = selectedPresetAgentId || explicitConversationAgentId || '';
   if (
     isAgentsEndpoint(endpoint) &&
     agentId &&
     (!defaultAgentId || isEphemeralAgentId(defaultAgentId))
   ) {
     defaultConvo.agent_id = agentId;
+  }
+  if (
+    isAgentsEndpoint(endpoint) &&
+    explicitConversationAgentId &&
+    !isEphemeralAgentId(explicitConversationAgentId) &&
+    (!selectedPresetAgentId || isEphemeralAgentId(selectedPresetAgentId))
+  ) {
+    defaultConvo.agent_id = explicitConversationAgentId;
   }
 
   // Clear model for non-ephemeral agents - agents use their configured model internally

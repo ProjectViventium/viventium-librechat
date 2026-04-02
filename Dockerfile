@@ -1,11 +1,18 @@
-# v0.8.4
+# v0.8.3
 
 # Base node image
 FROM node:20-alpine AS node
 
-RUN apk upgrade --no-cache
+# Install jemalloc
 RUN apk add --no-cache jemalloc
-RUN apk add --no-cache python3 py3-pip uv
+# === VIVENTIUM START ===
+# Feature: Skyvern MCP runtime deps in container
+# Purpose: Install bash and lightweight MCP deps for Skyvern wrappers without pulling the full SDK.
+# Why: Skyvern wrapper scripts rely on bash; fastmcp/httpx/mcp enable MCP bridging inside the container.
+# Added: 2026-02-07
+RUN apk add --no-cache python3 py3-pip uv bash
+RUN pip install --no-cache-dir --break-system-packages fastmcp httpx mcp
+# === VIVENTIUM END ===
 
 # Set environment variable to use jemalloc
 ENV LD_PRELOAD=/usr/lib/libjemalloc.so.2
@@ -47,6 +54,10 @@ RUN \
     npm prune --production; \
     npm cache clean --force
 
+# VIVENTIUM START
+# Purpose: Ensure Skyvern MCP wrappers are executable inside the container.
+RUN chmod +x /app/scripts/skyvern-mcp.sh /app/scripts/skyvern-mcp-lite.py
+# VIVENTIUM END
 # Node API setup
 EXPOSE 3080
 ENV HOST=0.0.0.0

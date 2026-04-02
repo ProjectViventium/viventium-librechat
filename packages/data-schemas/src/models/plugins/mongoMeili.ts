@@ -1,7 +1,7 @@
 import _ from 'lodash';
+import { MeiliSearch } from 'meilisearch';
 import { parseTextParts } from 'librechat-data-provider';
-import { MeiliSearch, MeiliSearchTimeOutError } from 'meilisearch';
-import type { SearchResponse, SearchParams, Index, MeiliSearchErrorInfo } from 'meilisearch';
+import type { SearchResponse, SearchParams, Index } from 'meilisearch';
 import type {
   CallbackWithoutResultAndOptionalError,
   FilterQuery,
@@ -122,6 +122,24 @@ const processBatch = async <T>(
   }
 };
 
+const waitForMeiliTasks = async (
+  index: Index<MeiliIndexable>,
+  tasks: Array<{ taskUid?: number | null }> | { taskUid?: number | null } | undefined,
+): Promise<void> => {
+  const taskList = Array.isArray(tasks) ? tasks : tasks ? [tasks] : [];
+
+  for (const task of taskList) {
+    if (task?.taskUid == null || typeof index.waitForTask !== 'function') {
+      continue;
+    }
+
+    await index.waitForTask(task.taskUid, {
+      timeOutMs: parseInt(process.env.MEILI_SYNC_TASK_TIMEOUT_MS || '30000', 10),
+      intervalMs: parseInt(process.env.MEILI_SYNC_TASK_INTERVAL_MS || '50', 10),
+    });
+  }
+};
+
 /**
  * Factory function to create a MeiliMongooseModel class which extends a Mongoose model.
  * This class contains static and instance methods to synchronize and manage the MeiliSearch index
@@ -162,8 +180,9 @@ const createMeiliMongooseModel = ({
 
     /**
      * Synchronizes data between the MongoDB collection and the MeiliSearch index by
-     * incrementally indexing only documents where `expiredAt` is `null` and `_meiliIndex` is not `true`
-     * (i.e., non-expired documents that have not yet been indexed, including those with missing or null `_meiliIndex`).
+     * incrementally indexing non-expired documents that have not yet been indexed.
+     * Legacy records created before the plugin was enabled may not have `_meiliIndex`
+     * at all, so missing flags must be treated the same as `false`.
      * */
     static async syncWithMeili(this: SchemaWithMeiliMethods): Promise<void> {
       const startTime = Date.now();
@@ -194,6 +213,12 @@ const createMeiliMongooseModel = ({
       let hasMore = true;
 
       while (hasMore) {
+        /* === VIVENTIUM START ===
+         * Feature: First-run legacy conversation/message backfill.
+         * Purpose: Local search can be enabled after months of existing history.
+         * Those documents may not have `_meiliIndex` yet, so `_meiliIndex !== true`
+         * must be considered syncable.
+         * === VIVENTIUM END === */
         const query: FilterQuery<unknown> = {
           expiredAt: null,
           _meiliIndex: { $ne: true },
@@ -254,18 +279,19 @@ const createMeiliMongooseModel = ({
       );
 
       try {
-        // Add documents to MeiliSearch
-        await index.addDocumentsInBatches(formattedDocs);
+        /* === VIVENTIUM START ===
+         * Feature: Deterministic Meili batch sync completion.
+         * Purpose: `addDocumentsInBatches()` only enqueues Meili tasks. Wait for
+         * task completion before marking Mongo `_meiliIndex=true`, otherwise
+         * parity checks can observe Mongo as indexed while Meili is still
+         * missing documents.
+         * === VIVENTIUM END === */
+        const tasks = await index.addDocumentsInBatches(formattedDocs);
+        await waitForMeiliTasks(index, tasks);
 
-        // Update MongoDB to mark documents as indexed.
-        // { timestamps: false } prevents Mongoose from touching updatedAt, preserving
-        // original conversation/message timestamps (fixes sidebar chronological sort).
+        // Update MongoDB to mark documents as indexed
         const docsIds = documents.map((doc) => doc._id);
-        await this.updateMany(
-          { _id: { $in: docsIds } },
-          { $set: { _meiliIndex: true } },
-          { timestamps: false },
-        );
+        await this.updateMany({ _id: { $in: docsIds } }, { $set: { _meiliIndex: true } });
       } catch (error) {
         logger.error('[processSyncBatch] Error processing batch:', error);
         throw error;
@@ -581,6 +607,7 @@ export default function mongoMeili(schema: Schema, options: MongoMeiliOptions): 
   /** Create index only if it doesn't exist */
   const index = client.index<MeiliIndexable>(indexName);
 
+  // Check if index exists and create if needed
   (async () => {
     try {
       await index.getRawInfo();
@@ -590,34 +617,18 @@ export default function mongoMeili(schema: Schema, options: MongoMeiliOptions): 
       if (errorCode === 'index_not_found') {
         try {
           logger.info(`[mongoMeili] Creating new index: ${indexName}`);
-          const enqueued = await client.createIndex(indexName, { primaryKey });
-          const task = await client.waitForTask(enqueued.taskUid, {
-            timeOutMs: 10000,
-            intervalMs: 100,
-          });
-          logger.debug(`[mongoMeili] Index ${indexName} creation task:`, task);
-          if (task.status !== 'succeeded') {
-            const taskError = task.error as MeiliSearchErrorInfo | null;
-            if (taskError?.code === 'index_already_exists') {
-              logger.debug(`[mongoMeili] Index ${indexName} was created by another instance`);
-            } else {
-              logger.warn(`[mongoMeili] Index ${indexName} creation failed:`, taskError);
-            }
-          } else {
-            logger.info(`[mongoMeili] Successfully created index: ${indexName}`);
-          }
+          await client.createIndex(indexName, { primaryKey });
+          logger.info(`[mongoMeili] Successfully created index: ${indexName}`);
         } catch (createError) {
-          if (createError instanceof MeiliSearchTimeOutError) {
-            logger.warn(`[mongoMeili] Timed out waiting for index ${indexName} creation`);
-          } else {
-            logger.warn(`[mongoMeili] Error creating index ${indexName}:`, createError);
-          }
+          // Index might have been created by another instance
+          logger.debug(`[mongoMeili] Index ${indexName} may already exist:`, createError);
         }
       } else {
         logger.error(`[mongoMeili] Error checking index ${indexName}:`, error);
       }
     }
 
+    // Configure index settings to make 'user' field filterable
     try {
       await index.updateSettings({
         filterableAttributes: ['user'],

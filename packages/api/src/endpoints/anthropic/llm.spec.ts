@@ -1,6 +1,10 @@
 import { AnthropicEffort } from 'librechat-data-provider';
 import type * as t from '~/types';
-import { getLLMConfig } from './llm';
+import {
+  ANTHROPIC_OAUTH_SYSTEM_TEXT,
+  ensureAnthropicOAuthSystemPrompt,
+  getLLMConfig,
+} from './llm';
 
 jest.mock('https-proxy-agent', () => ({
   HttpsProxyAgent: jest.fn().mockImplementation((proxy) => ({ proxy })),
@@ -18,6 +22,102 @@ describe('getLLMConfig', () => {
     expect(result.llmConfig).toHaveProperty('model', 'claude-3-5-sonnet-latest');
     expect(result.llmConfig).toHaveProperty('stream', true);
     expect(result.llmConfig).toHaveProperty('maxTokens');
+  });
+
+  it('should configure authToken + OAuth beta headers for subscription tokens', () => {
+    const result = getLLMConfig('sk-ant-oat01-test-token', { modelOptions: {} });
+    const clientOptions = result.llmConfig.clientOptions as Record<string, unknown>;
+    const defaultHeaders = clientOptions?.defaultHeaders as Record<string, string>;
+    const oauthClient = result.llmConfig.createClient?.({ apiKey: 'user_provided' });
+    const oauthClientHeaders = (oauthClient as { _options?: { defaultHeaders?: Record<string, string> } })
+      ?._options?.defaultHeaders;
+
+    expect(result.llmConfig).not.toHaveProperty('apiKey');
+    expect(clientOptions?.authToken).toBe('sk-ant-oat01-test-token');
+    expect(defaultHeaders?.['anthropic-beta']).toContain('oauth-2025-04-20');
+    expect(defaultHeaders?.['anthropic-beta']).toContain('claude-code-20250219');
+    expect(oauthClient?.apiKey).toBeNull();
+    expect(oauthClient?.authToken).toBe('sk-ant-oat01-test-token');
+    expect(oauthClientHeaders?.['anthropic-beta']).toContain('oauth-2025-04-20');
+  });
+
+  /* === VIVENTIUM START ===
+   * Feature: Connected Accounts Anthropic subscription-token compatibility.
+   * Purpose: Ensure connected-account OAuth tokens without `sk-ant-oat*` prefix
+   * still use OAuth bearer mode when `oauthType=subscription` is present.
+   * === VIVENTIUM END === */
+  it('should configure OAuth bearer mode for connected-account subscription tokens', () => {
+    const result = getLLMConfig('oauth-access-token', {
+      modelOptions: {},
+      oauthType: 'subscription',
+      oauthProvider: 'anthropic',
+    });
+    const clientOptions = result.llmConfig.clientOptions as Record<string, unknown>;
+    const defaultHeaders = clientOptions?.defaultHeaders as Record<string, string>;
+    const oauthClient = result.llmConfig.createClient?.({ apiKey: 'user_provided' });
+    const oauthClientHeaders = (oauthClient as { _options?: { defaultHeaders?: Record<string, string> } })
+      ?._options?.defaultHeaders;
+
+    expect(result.llmConfig).not.toHaveProperty('apiKey');
+    expect(clientOptions?.authToken).toBe('oauth-access-token');
+    expect(defaultHeaders?.['anthropic-beta']).toContain('oauth-2025-04-20');
+    expect(defaultHeaders?.['anthropic-beta']).toContain('claude-code-20250219');
+    expect(oauthClient?.apiKey).toBeNull();
+    expect(oauthClient?.authToken).toBe('oauth-access-token');
+    expect(oauthClientHeaders?.['anthropic-beta']).toContain('oauth-2025-04-20');
+  });
+
+  it('should inject the Claude Code system block for OAuth requests without system instructions', () => {
+    const request = ensureAnthropicOAuthSystemPrompt({
+      model: 'claude-sonnet-4-6',
+      messages: [{ role: 'user', content: 'Hello' }],
+    });
+
+    expect(request.system).toEqual([{ type: 'text', text: ANTHROPIC_OAUTH_SYSTEM_TEXT }]);
+  });
+
+  it('should prepend the Claude Code system block ahead of string system instructions', () => {
+    const request = ensureAnthropicOAuthSystemPrompt({
+      model: 'claude-sonnet-4-6',
+      system: 'You are concise.',
+      messages: [{ role: 'user', content: 'Hello' }],
+    });
+
+    expect(request.system).toEqual([
+      { type: 'text', text: ANTHROPIC_OAUTH_SYSTEM_TEXT },
+      { type: 'text', text: 'You are concise.' },
+    ]);
+  });
+
+  it('should preserve existing Anthropic system blocks after the Claude Code block', () => {
+    const request = ensureAnthropicOAuthSystemPrompt({
+      model: 'claude-sonnet-4-6',
+      system: [
+        { type: 'text', text: 'You are concise.', cache_control: { type: 'ephemeral' } },
+      ],
+      messages: [{ role: 'user', content: 'Hello' }],
+    });
+
+    expect(request.system).toEqual([
+      { type: 'text', text: ANTHROPIC_OAUTH_SYSTEM_TEXT },
+      { type: 'text', text: 'You are concise.', cache_control: { type: 'ephemeral' } },
+    ]);
+  });
+
+  it('should avoid duplicating the Claude Code system block when already present', () => {
+    const request = ensureAnthropicOAuthSystemPrompt({
+      model: 'claude-sonnet-4-6',
+      system: [
+        { type: 'text', text: ANTHROPIC_OAUTH_SYSTEM_TEXT },
+        { type: 'text', text: 'You are concise.' },
+      ],
+      messages: [{ role: 'user', content: 'Hello' }],
+    });
+
+    expect(request.system).toEqual([
+      { type: 'text', text: ANTHROPIC_OAUTH_SYSTEM_TEXT },
+      { type: 'text', text: 'You are concise.' },
+    ]);
   });
 
   it('should include proxy settings when provided', () => {
@@ -107,39 +207,6 @@ describe('getLLMConfig', () => {
       'claude-sonnet-4-20250514',
       'claude-sonnet-4-latest',
       'anthropic/claude-sonnet-4-20250514',
-    ];
-
-    modelVariations.forEach((model) => {
-      const modelOptions = { model, promptCache: true };
-      const result = getLLMConfig('test-key', { modelOptions });
-      const clientOptions = result.llmConfig.clientOptions;
-      expect(clientOptions?.defaultHeaders).toBeDefined();
-      expect(clientOptions?.defaultHeaders).toHaveProperty('anthropic-beta');
-      const defaultHeaders = clientOptions?.defaultHeaders as Record<string, string>;
-      expect(defaultHeaders['anthropic-beta']).toBe('context-1m-2025-08-07');
-      expect(result.llmConfig.promptCache).toBe(true);
-    });
-  });
-
-  it('should add "context-1m" beta header for claude-sonnet-4-6 model', () => {
-    const modelOptions = {
-      model: 'claude-sonnet-4-6',
-      promptCache: true,
-    };
-    const result = getLLMConfig('test-key', { modelOptions });
-    const clientOptions = result.llmConfig.clientOptions;
-    expect(clientOptions?.defaultHeaders).toBeDefined();
-    expect(clientOptions?.defaultHeaders).toHaveProperty('anthropic-beta');
-    const defaultHeaders = clientOptions?.defaultHeaders as Record<string, string>;
-    expect(defaultHeaders['anthropic-beta']).toBe('context-1m-2025-08-07');
-    expect(result.llmConfig.promptCache).toBe(true);
-  });
-
-  it('should add "context-1m" beta header for claude-sonnet-4-6 model formats', () => {
-    const modelVariations = [
-      'claude-sonnet-4-6',
-      'claude-sonnet-4-6-20260101',
-      'anthropic/claude-sonnet-4-6',
     ];
 
     modelVariations.forEach((model) => {
@@ -994,51 +1061,6 @@ describe('getLLMConfig', () => {
         expect(result.llmConfig.invocationKwargs?.output_config).toEqual({
           effort: AnthropicEffort.low,
         });
-      });
-
-      it('should use adaptive thinking for Sonnet 4.6 instead of enabled + budget_tokens', () => {
-        const result = getLLMConfig('test-key', {
-          modelOptions: {
-            model: 'claude-sonnet-4-6',
-            thinking: true,
-            thinkingBudget: 10000,
-          },
-        });
-
-        expect((result.llmConfig.thinking as unknown as { type: string }).type).toBe('adaptive');
-        expect(result.llmConfig.thinking).not.toHaveProperty('budget_tokens');
-        expect(result.llmConfig.maxTokens).toBe(64000);
-      });
-
-      it('should set effort via output_config for Sonnet 4.6', () => {
-        const result = getLLMConfig('test-key', {
-          modelOptions: {
-            model: 'claude-sonnet-4-6',
-            thinking: true,
-            effort: AnthropicEffort.high,
-          },
-        });
-
-        expect((result.llmConfig.thinking as unknown as { type: string }).type).toBe('adaptive');
-        expect(result.llmConfig.invocationKwargs).toHaveProperty('output_config');
-        expect(result.llmConfig.invocationKwargs?.output_config).toEqual({
-          effort: AnthropicEffort.high,
-        });
-      });
-
-      it('should exclude topP/topK for Sonnet 4.6 with adaptive thinking', () => {
-        const result = getLLMConfig('test-key', {
-          modelOptions: {
-            model: 'claude-sonnet-4-6',
-            thinking: true,
-            topP: 0.9,
-            topK: 40,
-          },
-        });
-
-        expect((result.llmConfig.thinking as unknown as { type: string }).type).toBe('adaptive');
-        expect(result.llmConfig).not.toHaveProperty('topP');
-        expect(result.llmConfig).not.toHaveProperty('topK');
       });
 
       it('should NOT set adaptive thinking or effort for non-adaptive models', () => {

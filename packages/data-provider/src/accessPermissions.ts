@@ -200,9 +200,9 @@ export type TUpdateResourcePermissionsResponse = z.infer<
  * Principal search request parameters
  */
 export type TPrincipalSearchParams = {
-  q: string;
-  limit?: number;
-  types?: Array<PrincipalType.USER | PrincipalType.GROUP | PrincipalType.ROLE>;
+  q: string; // search query (required)
+  limit?: number; // max results (1-50, default 10)
+  type?: PrincipalType.USER | PrincipalType.GROUP | PrincipalType.ROLE; // filter by type (optional)
 };
 
 /**
@@ -228,7 +228,7 @@ export type TPrincipalSearchResult = {
 export type TPrincipalSearchResponse = {
   query: string;
   limit: number;
-  types?: Array<PrincipalType.USER | PrincipalType.GROUP | PrincipalType.ROLE> | null;
+  type?: PrincipalType.USER | PrincipalType.GROUP | PrincipalType.ROLE;
   results: TPrincipalSearchResult[];
   count: number;
   sources: {

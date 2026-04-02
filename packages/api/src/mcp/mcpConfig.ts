@@ -12,18 +12,24 @@ export const mcpConfig = {
   USER_CONNECTION_IDLE_TIMEOUT: math(
     process.env.MCP_USER_CONNECTION_IDLE_TIMEOUT ?? 15 * 60 * 1000,
   ),
-  /** Max connect/disconnect cycles before the circuit breaker trips. Default: 7 */
-  CB_MAX_CYCLES: math(process.env.MCP_CB_MAX_CYCLES ?? 7),
-  /** Sliding window (ms) for counting cycles. Default: 45s */
-  CB_CYCLE_WINDOW_MS: math(process.env.MCP_CB_CYCLE_WINDOW_MS ?? 45_000),
-  /** Cooldown (ms) after the cycle breaker trips. Default: 15s */
-  CB_CYCLE_COOLDOWN_MS: math(process.env.MCP_CB_CYCLE_COOLDOWN_MS ?? 15_000),
-  /** Max consecutive failed connection rounds before backoff. Default: 3 */
-  CB_MAX_FAILED_ROUNDS: math(process.env.MCP_CB_MAX_FAILED_ROUNDS ?? 3),
-  /** Sliding window (ms) for counting failed rounds. Default: 120s */
-  CB_FAILED_WINDOW_MS: math(process.env.MCP_CB_FAILED_WINDOW_MS ?? 120_000),
-  /** Base backoff (ms) after failed round threshold is reached. Default: 30s */
-  CB_BASE_BACKOFF_MS: math(process.env.MCP_CB_BASE_BACKOFF_MS ?? 30_000),
-  /** Max backoff cap (ms) for exponential backoff. Default: 300s */
-  CB_MAX_BACKOFF_MS: math(process.env.MCP_CB_MAX_BACKOFF_MS ?? 300_000),
+  /* === VIVENTIUM START ===
+   * Feature: Keep selected MCP servers warm across user idle cleanup.
+   * Purpose: Prevent high-value persistent tools (e.g., scheduling-cortex) from
+   * repeatedly dropping to disconnected state between user interactions.
+   */
+  PERSISTENT_CONNECTION_SERVERS: new Set(
+    (process.env.MCP_PERSISTENT_CONNECTION_SERVERS ?? 'scheduling-cortex')
+      .split(',')
+      .map((serverName) => serverName.trim())
+      .filter(Boolean),
+  ),
+  /* === VIVENTIUM END === */
+  /* === VIVENTIUM START ===
+   * Feature: Proactively reconnect OAuth MCP connections before tokens expire.
+   * Purpose: Prevent stale access tokens from breaking scheduled/background tool calls.
+   */
+  OAUTH_TOKEN_EXPIRE_GRACE_MS: math(
+    process.env.MCP_OAUTH_TOKEN_EXPIRE_GRACE_MS ?? 2 * 60 * 1000,
+  ),
+  /* === VIVENTIUM END === */
 };

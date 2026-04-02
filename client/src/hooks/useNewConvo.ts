@@ -155,6 +155,19 @@ const useNewConvo = (index = 0) => {
           } else if (conversation.endpointType && !endpointType) {
             conversation.endpointType = undefined;
           }
+          /* === VIVENTIUM START === */
+          const defaultAgentId =
+            endpointsConfig?.agents?.defaultId || startupConfig?.interface?.defaultAgent || '';
+          const agentEndpointKey = (endpointType || defaultEndpoint) as EModelEndpoint | undefined;
+          if (
+            defaultAgentId &&
+            agentEndpointKey &&
+            isAgentsEndpoint(agentEndpointKey) &&
+            (!conversation.agent_id || isEphemeralAgentId(conversation.agent_id))
+          ) {
+            conversation.agent_id = defaultAgentId;
+          }
+          /* === VIVENTIUM END === */
 
           const isAssistantEndpoint = isAssistantsEndpoint(defaultEndpoint);
           const assistants: AssistantListItem[] = assistantsListMap[defaultEndpoint] ?? [];

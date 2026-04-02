@@ -30,7 +30,7 @@ import AgentTool from './AgentTool';
 import CodeForm from './Code/Form';
 import MCPTools from './MCPTools';
 
-const labelClass = 'mb-2 text-token-text-primary block text-sm font-medium';
+const labelClass = 'mb-2 text-token-text-primary block font-medium';
 const inputClass = cn(
   defaultTextProps,
   'flex w-full px-3 py-2 border-border-light bg-surface-secondary focus-visible:ring-2 focus-visible:ring-ring-primary',
@@ -176,11 +176,31 @@ export default function AgentConfig() {
     Icon = icons[iconKey];
   }
 
+  /* === VIVENTIUM START ===
+   * Feature: Voice Chat LLM Override — resolve voice provider icon
+   * Added: 2026-02-24
+   */
+  const voiceLlmModel = useWatch({ control, name: 'voice_llm_model' });
+  const voiceLlmProvider = useWatch({ control, name: 'voice_llm_provider' });
+  let VoiceIcon: IconComponentTypes | null | undefined;
+  if (voiceLlmProvider) {
+    const voiceEndpointType = getEndpointField(endpointsConfig, voiceLlmProvider, 'type');
+    const voiceEndpointIconURL = getEndpointField(endpointsConfig, voiceLlmProvider, 'iconURL');
+    const voiceIconKey = getIconKey({
+      endpoint: voiceLlmProvider,
+      endpointsConfig,
+      endpointType: voiceEndpointType,
+      endpointIconURL: voiceEndpointIconURL,
+    });
+    VoiceIcon = icons[voiceIconKey];
+  }
+  /* === VIVENTIUM END === */
+
   const { toolIds, mcpServerNames } = useVisibleTools(tools, regularTools, mcpServersMap);
 
   return (
     <>
-      <div className="h-auto pt-1">
+      <div className="h-auto bg-white px-4 pt-3 dark:bg-transparent">
         {/* Avatar & Name */}
         <div className="mb-4">
           <AgentAvatar avatar={agent?.['avatar'] ?? null} />
@@ -265,7 +285,7 @@ export default function AgentConfig() {
           <button
             type="button"
             onClick={() => setActivePanel(Panel.model)}
-            className="btn btn-neutral border-token-border-light relative h-9 w-full rounded-lg font-medium"
+            className="btn btn-neutral border-token-border-light relative h-10 w-full rounded-lg font-medium"
             aria-haspopup="true"
             aria-expanded="false"
           >
@@ -284,13 +304,48 @@ export default function AgentConfig() {
             </div>
           </button>
         </div>
+        {/* === VIVENTIUM START ===
+         * Feature: Voice Chat LLM Override — Voice model button
+         * Added: 2026-02-24
+         */}
+        <div className="mb-4">
+          <label className={labelClass} htmlFor="voice-provider">
+            {localize('com_ui_voice_chat_llm')}
+          </label>
+          <button
+            type="button"
+            onClick={() => setActivePanel(Panel.voiceLlmModel)}
+            className="btn btn-neutral border-token-border-light relative h-10 w-full rounded-lg font-medium"
+            aria-haspopup="true"
+            aria-expanded="false"
+          >
+            <div className="flex w-full items-center gap-2">
+              {VoiceIcon && voiceLlmProvider && (
+                <div className="shadow-stroke relative flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-full bg-white text-black dark:bg-white">
+                  <VoiceIcon
+                    className="h-2/3 w-2/3"
+                    endpoint={voiceLlmProvider}
+                    endpointType={getEndpointField(endpointsConfig, voiceLlmProvider, 'type')}
+                    iconURL={getEndpointField(endpointsConfig, voiceLlmProvider, 'iconURL')}
+                  />
+                </div>
+              )}
+              <span>
+                {voiceLlmModel && voiceLlmProvider
+                  ? voiceLlmModel
+                  : localize('com_ui_voice_chat_llm_fallback')}
+              </span>
+            </div>
+          </button>
+        </div>
+        {/* === VIVENTIUM END === */}
         {(codeEnabled ||
           fileSearchEnabled ||
           artifactsEnabled ||
           contextEnabled ||
           webSearchEnabled) && (
           <div className="mb-4 flex w-full flex-col items-start gap-3">
-            <label className="text-token-text-primary block text-sm font-medium">
+            <label className="text-token-text-primary block font-medium">
               {localize('com_assistants_capabilities')}
             </label>
             {/* Code Execution */}
@@ -393,7 +448,7 @@ export default function AgentConfig() {
         <div className="mb-4">
           <div className="mb-1.5 flex items-center gap-2">
             <span>
-              <label className="text-token-text-primary block text-sm font-medium">
+              <label className="text-token-text-primary block font-medium">
                 {localize('com_ui_support_contact')}
               </label>
             </span>

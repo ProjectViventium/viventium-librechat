@@ -189,81 +189,89 @@ const AdminSettingsDialog: React.FC<AdminSettingsDialogProps> = ({
           <OGDialogTitle>
             {localize('com_ui_admin_settings_section', { section: localize(sectionKey) })}
           </OGDialogTitle>
+          <div className="p-2">
+            {/* Role selection dropdown */}
+            <div className="flex items-center gap-2">
+              <span className="font-medium">{localize('com_ui_role_select')}:</span>
+              <DropdownPopup
+                unmountOnHide={true}
+                menuId={menuId}
+                isOpen={isRoleMenuOpen}
+                setIsOpen={setIsRoleMenuOpen}
+                trigger={
+                  <Ariakit.MenuButton className="inline-flex w-1/4 items-center justify-center rounded-lg border border-border-light bg-transparent px-2 py-1 text-text-primary transition-all ease-in-out hover:bg-surface-tertiary">
+                    {selectedRole}
+                  </Ariakit.MenuButton>
+                }
+                items={roleDropdownItems}
+                itemClassName="items-center justify-center"
+                sameWidth={true}
+              />
+            </div>
+            {/* Permissions form */}
+            <form onSubmit={handleSubmit(onSubmit)}>
+              <div className="py-5">
+                {permissions.map(({ permission, labelKey }) => {
+                  const label = localize(labelKey);
+                  const needsConfirm =
+                    selectedRole === SystemRoles.ADMIN &&
+                    confirmPermissions.includes(permission) &&
+                    onPermissionConfirm;
 
-          {/* Role selection dropdown */}
-          <div className="flex items-center gap-2">
-            <span className="font-medium">{localize('com_ui_role_select')}:</span>
-            <DropdownPopup
-              unmountOnHide={true}
-              menuId={menuId}
-              isOpen={isRoleMenuOpen}
-              setIsOpen={setIsRoleMenuOpen}
-              trigger={
-                <Ariakit.MenuButton className="inline-flex w-1/4 items-center justify-center rounded-lg border border-border-light bg-transparent px-2 py-1 text-text-primary transition-all ease-in-out hover:bg-surface-tertiary">
-                  {selectedRole}
-                </Ariakit.MenuButton>
-              }
-              items={roleDropdownItems}
-              itemClassName="items-center justify-center"
-              sameWidth={true}
-            />
+                  return (
+                    <div key={permission}>
+                      <LabelController
+                        control={control}
+                        permission={permission}
+                        label={label}
+                        getValues={getValues}
+                        setValue={setValue}
+                        onConfirm={
+                          needsConfirm
+                            ? (newValue, onChange) =>
+                                onPermissionConfirm(permission, newValue, onChange)
+                            : undefined
+                        }
+                      />
+                      {showAdminWarning &&
+                        selectedRole === SystemRoles.ADMIN &&
+                        permission === Permissions.USE && (
+                          <div className="mb-2 max-w-full whitespace-normal break-words text-sm text-red-600">
+                            <span>{localize('com_ui_admin_access_warning')}</span>
+                            {'\n'}
+                            {/* === VIVENTIUM START ===
+                             * Feature: Viventium branding (admin links)
+                             * Purpose: Link branding references to Viventium.ai.
+                             * Details: docs/requirements_and_learnings/16_Branding_and_Assets.md#librechat-admin-links
+                             * Added: 2026-01-26
+                             */}
+                            <a
+                              href="https://viventium.ai"
+                              target="_blank"
+                              rel="noreferrer"
+                              className="text-blue-500 underline"
+                            >
+                              {localize('com_ui_more_info')}
+                            </a>
+                            {/* === VIVENTIUM END === */}
+                          </div>
+                        )}
+                    </div>
+                  );
+                })}
+              </div>
+              <div className="flex justify-end">
+                <Button
+                  type="submit"
+                  variant="submit"
+                  disabled={isSubmitting || isLoading}
+                  aria-label={localize('com_ui_save')}
+                >
+                  {localize('com_ui_save')}
+                </Button>
+              </div>
+            </form>
           </div>
-          {/* Permissions form */}
-          <form onSubmit={handleSubmit(onSubmit)}>
-            <div className="py-5">
-              {permissions.map(({ permission, labelKey }) => {
-                const label = localize(labelKey);
-                const needsConfirm =
-                  selectedRole === SystemRoles.ADMIN &&
-                  confirmPermissions.includes(permission) &&
-                  onPermissionConfirm;
-
-                return (
-                  <div key={permission}>
-                    <LabelController
-                      control={control}
-                      permission={permission}
-                      label={label}
-                      getValues={getValues}
-                      setValue={setValue}
-                      onConfirm={
-                        needsConfirm
-                          ? (newValue, onChange) =>
-                              onPermissionConfirm(permission, newValue, onChange)
-                          : undefined
-                      }
-                    />
-                    {showAdminWarning &&
-                      selectedRole === SystemRoles.ADMIN &&
-                      permission === Permissions.USE && (
-                        <div className="mb-2 max-w-full whitespace-normal break-words text-sm text-red-600">
-                          <span>{localize('com_ui_admin_access_warning')}</span>
-                          {'\n'}
-                          <a
-                            href="https://www.librechat.ai/docs/configuration/librechat_yaml/object_structure/interface"
-                            target="_blank"
-                            rel="noreferrer"
-                            className="text-blue-500 underline"
-                          >
-                            {localize('com_ui_more_info')}
-                          </a>
-                        </div>
-                      )}
-                  </div>
-                );
-              })}
-            </div>
-            <div className="flex justify-end">
-              <Button
-                type="submit"
-                variant="submit"
-                disabled={isSubmitting || isLoading}
-                aria-label={localize('com_ui_save')}
-              >
-                {localize('com_ui_save')}
-              </Button>
-            </div>
-          </form>
         </OGDialogContent>
       </OGDialog>
       {extraContent}

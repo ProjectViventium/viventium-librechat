@@ -18,7 +18,6 @@ import { preProcessGraphTokens } from '~/utils/graph';
 import { formatToolContent } from './parsers';
 import { MCPConnection } from './connection';
 import { processMCPEnv } from '~/utils/env';
-import { isUserSourced } from './utils';
 
 /**
  * Centralized manager for MCP server connections and tool execution.
@@ -54,8 +53,6 @@ export class MCPManager extends UserConnectionManager {
       user?: IUser;
       forceNew?: boolean;
       flowManager?: FlowStateManager<MCPOAuthTokens | null>;
-      /** Pre-resolved config for config-source servers not in YAML/DB */
-      serverConfig?: t.ParsedServerConfig;
     } & Omit<t.OAuthConnectionOptions, 'useOAuth' | 'user' | 'flowManager'>,
   ): Promise<MCPConnection> {
     //the get method checks if the config is still valid as app level
@@ -91,38 +88,31 @@ export class MCPManager extends UserConnectionManager {
       logger.debug(`${logPrefix} [Discovery] App connection not available, trying discovery mode`);
     }
 
-    const serverConfig = await MCPServersRegistry.getInstance().getServerConfig(
+    const serverConfig = (await MCPServersRegistry.getInstance().getServerConfig(
       serverName,
       user?.id,
-      args.configServers,
-    );
+    )) as t.MCPOptions | null;
 
     if (!serverConfig) {
       logger.warn(`${logPrefix} [Discovery] Server config not found`);
       return { tools: null, oauthRequired: false, oauthUrl: null };
     }
 
-    const useOAuth = Boolean(serverConfig.requiresOAuth || serverConfig.oauthMetadata);
+    const useOAuth = Boolean(
+      serverConfig.requiresOAuth || (serverConfig as t.ParsedServerConfig).oauthMetadata,
+    );
 
-    const registry = MCPServersRegistry.getInstance();
-    const useSSRFProtection = registry.shouldEnableSSRFProtection();
-    const allowedDomains = registry.getAllowedDomains();
-    const dbSourced = isUserSourced(serverConfig);
+    const useSSRFProtection = MCPServersRegistry.getInstance().shouldEnableSSRFProtection();
+    const dbSourced = !!(serverConfig as t.ParsedServerConfig).dbId;
     const basic: t.BasicConnectionOptions = {
       dbSourced,
       serverName,
       serverConfig,
       useSSRFProtection,
-      allowedDomains,
     };
 
     if (!useOAuth) {
-      const result = await MCPConnectionFactory.discoverTools(basic, {
-        user: args.user,
-        customUserVars: args.customUserVars,
-        requestBody: args.requestBody,
-        connectionTimeout: args.connectionTimeout,
-      });
+      const result = await MCPConnectionFactory.discoverTools(basic);
       return {
         tools: result.tools,
         oauthRequired: result.oauthRequired,
@@ -197,15 +187,9 @@ export class MCPManager extends UserConnectionManager {
    * @param serverNames Optional array of server names. If not provided or empty, returns all servers.
    * @returns Object mapping server names to their instructions
    */
-  private async getInstructions(
-    serverNames?: string[],
-    configServers?: Record<string, t.ParsedServerConfig>,
-  ): Promise<Record<string, string>> {
+  private async getInstructions(serverNames?: string[]): Promise<Record<string, string>> {
     const instructions: Record<string, string> = {};
-    const configs = await MCPServersRegistry.getInstance().getAllServerConfigs(
-      undefined,
-      configServers,
-    );
+    const configs = await MCPServersRegistry.getInstance().getAllServerConfigs();
     for (const [serverName, config] of Object.entries(configs)) {
       if (config.serverInstructions != null) {
         instructions[serverName] = config.serverInstructions as string;
@@ -220,11 +204,9 @@ export class MCPManager extends UserConnectionManager {
    * @param serverNames Optional array of server names to include. If not provided, includes all servers.
    * @returns Formatted instructions string ready for context injection
    */
-  public async formatInstructionsForContext(
-    serverNames?: string[],
-    configServers?: Record<string, t.ParsedServerConfig>,
-  ): Promise<string> {
-    const instructionsToInclude = await this.getInstructions(serverNames, configServers);
+  public async formatInstructionsForContext(serverNames?: string[]): Promise<string> {
+    /** Instructions for specified servers or all stored instructions */
+    const instructionsToInclude = await this.getInstructions(serverNames);
 
     if (Object.keys(instructionsToInclude).length === 0) {
       return '';
@@ -260,7 +242,6 @@ Please follow these instructions when using tools from the respective MCP server
   async callTool({
     user,
     serverName,
-    serverConfig: providedConfig,
     toolName,
     provider,
     toolArguments,
@@ -275,8 +256,6 @@ Please follow these instructions when using tools from the respective MCP server
   }: {
     user?: IUser;
     serverName: string;
-    /** Pre-resolved config from tool creation context — avoids readThrough TTL and cross-tenant issues */
-    serverConfig?: t.ParsedServerConfig;
     toolName: string;
     provider: t.Provider;
     toolArguments?: Record<string, unknown>;
@@ -307,7 +286,6 @@ Please follow these instructions when using tools from the respective MCP server
         signal: options?.signal,
         customUserVars,
         requestBody,
-        serverConfig: providedConfig,
       });
 
       if (!(await connection.isConnected())) {
@@ -318,16 +296,8 @@ Please follow these instructions when using tools from the respective MCP server
         );
       }
 
-      const rawConfig =
-        providedConfig ??
-        (await MCPServersRegistry.getInstance().getServerConfig(serverName, userId));
-      if (!rawConfig) {
-        throw new McpError(
-          ErrorCode.InvalidRequest,
-          `${logPrefix} Configuration for server "${serverName}" not found.`,
-        );
-      }
-      const isDbSourced = isUserSourced(rawConfig);
+      const rawConfig = await MCPServersRegistry.getInstance().getServerConfig(serverName, userId);
+      const isDbSourced = !!(rawConfig as t.ParsedServerConfig | null)?.dbId;
 
       /** Pre-process Graph token placeholders (async) before the synchronous processMCPEnv pass */
       const graphProcessedConfig = isDbSourced

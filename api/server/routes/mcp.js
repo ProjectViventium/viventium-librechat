@@ -1,5 +1,5 @@
 const { Router } = require('express');
-const { logger, getTenantId } = require('@librechat/data-schemas');
+const { logger } = require('@librechat/data-schemas');
 const {
   CacheKeys,
   Constants,
@@ -8,12 +8,11 @@ const {
   Permissions,
 } = require('librechat-data-provider');
 const {
-  getBasePath,
   createSafeUser,
   MCPOAuthHandler,
   MCPTokenStorage,
+  getBasePath,
   setOAuthSession,
-  PENDING_STALE_MS,
   getUserMCPAuthMap,
   validateOAuthCsrf,
   OAUTH_CSRF_COOKIE,
@@ -23,46 +22,278 @@ const {
   OAUTH_SESSION_COOKIE,
 } = require('@librechat/api');
 const {
-  createMCPServerController,
-  updateMCPServerController,
-  deleteMCPServerController,
-  getMCPServersList,
-  getMCPServerById,
-  getMCPTools,
-} = require('~/server/controllers/mcp');
-const {
+  getMCPManager,
+  getFlowStateManager,
   getOAuthReconnectionManager,
   getMCPServersRegistry,
-  getFlowStateManager,
-  getMCPManager,
 } = require('~/config');
-const {
-  getServerConnectionStatus,
-  resolveConfigServers,
-  getMCPSetupData,
-} = require('~/server/services/MCP');
+const { getMCPSetupData, getServerConnectionStatus } = require('~/server/services/MCP');
 const { requireJwtAuth, canAccessMCPServerResource } = require('~/server/middleware');
+const { findToken, updateToken, createToken, deleteTokens } = require('~/models');
 const { getUserPluginAuthValue } = require('~/server/services/PluginService');
 const { updateMCPServerTools } = require('~/server/services/Config/mcp');
 const { reinitMCPServer } = require('~/server/services/Tools/mcp');
+const { getMCPTools } = require('~/server/controllers/mcp');
+const { findPluginAuthsByKeys } = require('~/models');
+const { getRoleByName } = require('~/models/Role');
 const { getLogStores } = require('~/cache');
-const db = require('~/models');
+const {
+  createMCPServerController,
+  getMCPServerById,
+  getMCPServersList,
+  updateMCPServerController,
+  deleteMCPServerController,
+} = require('~/server/controllers/mcp');
 
 const router = Router();
-
 const OAUTH_CSRF_COOKIE_PATH = '/api/mcp';
 
-const checkMCPUsePermissions = generateCheckAccess({
-  permissionType: PermissionTypes.MCP_SERVERS,
-  permissions: [Permissions.USE],
-  getRoleByName: db.getRoleByName,
-});
+/* VIVENTIUM START: MCP OAuth redirect-uri hardening + config source-of-truth */
+function getExpectedMCPOAuthCallback(serverName) {
+  if (!process.env.DOMAIN_SERVER) {
+    return null;
+  }
+  const domain = process.env.DOMAIN_SERVER.replace(/\/+$/, '');
+  return `${domain}/api/mcp/${serverName}/oauth/callback`;
+}
 
-const checkMCPCreate = generateCheckAccess({
-  permissionType: PermissionTypes.MCP_SERVERS,
-  permissions: [Permissions.USE, Permissions.CREATE],
-  getRoleByName: db.getRoleByName,
-});
+function getExpectedMCPOAuthUrls(serverName) {
+  switch (serverName) {
+    case 'google_workspace':
+      return {
+        authorization_url: process.env.GOOGLE_WORKSPACE_MCP_AUTH_URL,
+        token_url: process.env.GOOGLE_WORKSPACE_MCP_TOKEN_URL,
+      };
+    case 'ms-365':
+      return {
+        authorization_url: process.env.MS365_MCP_AUTH_URL,
+        token_url: process.env.MS365_MCP_TOKEN_URL,
+      };
+    default:
+      return null;
+  }
+}
+
+function isLoopbackUrl(urlString) {
+  if (!urlString || typeof urlString !== 'string') {
+    return false;
+  }
+
+  try {
+    const parsed = new URL(urlString);
+    return parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1';
+  } catch (_error) {
+    return false;
+  }
+}
+
+/* VIVENTIUM START: persistent MCP warm-up across app restarts */
+function getPersistentMCPServers() {
+  return new Set(
+    (process.env.MCP_PERSISTENT_CONNECTION_SERVERS ?? 'scheduling-cortex')
+      .split(',')
+      .map((serverName) => serverName.trim())
+      .filter(Boolean),
+  );
+}
+
+/* VIVENTIUM START: persistent MCP warm-up dedupe across status pollers */
+const persistentWarmupInFlight = new Set();
+const persistentWarmupLastAttemptAt = new Map();
+
+function getPersistentWarmupKey(userId, serverName) {
+  return `${userId}:${serverName}`;
+}
+
+function getPersistentWarmupCooldownMs() {
+  const parsed = Number.parseInt(process.env.MCP_PERSISTENT_WARMUP_COOLDOWN_MS ?? '10000', 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 10000;
+}
+
+function clearPersistentWarmupTracking(warmupKey) {
+  persistentWarmupInFlight.delete(warmupKey);
+  persistentWarmupLastAttemptAt.delete(warmupKey);
+}
+/* VIVENTIUM END */
+
+async function warmPersistentUserMCPConnections(user, mcpConfig, oauthServers) {
+  const persistentServers = [...getPersistentMCPServers()].filter(
+    (serverName) => mcpConfig?.[serverName] && !oauthServers?.has?.(serverName),
+  );
+
+  if (!persistentServers.length) {
+    return;
+  }
+
+  const mcpManager = getMCPManager();
+  if (
+    !mcpManager ||
+    typeof mcpManager.getConnection !== 'function' ||
+    typeof mcpManager.getUserConnections !== 'function'
+  ) {
+    return;
+  }
+
+  const flowManager = getFlowStateManager(getLogStores(CacheKeys.FLOWS));
+  const tokenMethods = { findToken, updateToken, createToken, deleteTokens };
+
+  for (const serverName of persistentServers) {
+    const warmupKey = getPersistentWarmupKey(user.id, serverName);
+    const existingConnection = mcpManager.getUserConnections(user.id)?.get(serverName);
+    if (existingConnection?.connectionState === 'connected') {
+      clearPersistentWarmupTracking(warmupKey);
+      continue;
+    }
+
+    if (existingConnection?.connectionState === 'connecting') {
+      logger.debug(
+        `[MCP Persistent Warmup][User: ${user.id}] Skipping "${serverName}" because connection is already in-flight`,
+      );
+      continue;
+    }
+
+    if (persistentWarmupInFlight.has(warmupKey)) {
+      logger.debug(
+        `[MCP Persistent Warmup][User: ${user.id}] Skipping "${serverName}" because a warm-up is already running`,
+      );
+      continue;
+    }
+
+    const cooldownMs = getPersistentWarmupCooldownMs();
+    const lastAttemptAt = persistentWarmupLastAttemptAt.get(warmupKey);
+    if (lastAttemptAt && Date.now() - lastAttemptAt < cooldownMs) {
+      logger.debug(
+        `[MCP Persistent Warmup][User: ${user.id}] Skipping "${serverName}" because the last warm-up was attempted ${Date.now() - lastAttemptAt}ms ago`,
+      );
+      continue;
+    }
+
+    const serverConfig = mcpConfig[serverName];
+    const hasCustomVars =
+      serverConfig?.customUserVars && Object.keys(serverConfig.customUserVars).length > 0;
+
+    if (hasCustomVars) {
+      logger.debug(
+        `[MCP Persistent Warmup] Skipping server "${serverName}" because custom user vars are required`,
+      );
+      continue;
+    }
+
+    persistentWarmupInFlight.add(warmupKey);
+    persistentWarmupLastAttemptAt.set(warmupKey, Date.now());
+    try {
+      await mcpManager.getConnection({
+        user,
+        serverName,
+        flowManager,
+        tokenMethods,
+        returnOnOAuth: true,
+      });
+      logger.info(
+        `[MCP Persistent Warmup][User: ${user.id}] Ensured connection for "${serverName}"`,
+      );
+    } catch (error) {
+      logger.warn(
+        `[MCP Persistent Warmup][User: ${user.id}] Failed to warm "${serverName}": ${error?.message ?? String(error)}`,
+      );
+    } finally {
+      persistentWarmupInFlight.delete(warmupKey);
+    }
+  }
+}
+
+function getStatusSettleWindowMs() {
+  const parsed = Number.parseInt(process.env.MCP_CONNECTION_STATUS_SETTLE_WINDOW_MS ?? '3500', 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function getStatusSettlePollMs() {
+  const parsed = Number.parseInt(process.env.MCP_CONNECTION_STATUS_SETTLE_POLL_MS ?? '500', 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 500;
+}
+
+async function settleTransientConnectingOAuthStatuses({
+  userId,
+  connectionStatus,
+  mcpConfig,
+  oauthServers,
+  targetServers,
+}) {
+  const oauthServerSet =
+    oauthServers instanceof Set
+      ? oauthServers
+      : new Set(Array.isArray(oauthServers) ? oauthServers : []);
+
+  const settleWindowMs = getStatusSettleWindowMs();
+  if (!settleWindowMs) {
+    return;
+  }
+
+  const connectingServers = (targetServers ?? Object.keys(connectionStatus)).filter(
+    (serverName) =>
+      oauthServerSet.has(serverName) &&
+      connectionStatus[serverName]?.connectionState === 'connecting',
+  );
+
+  if (!connectingServers.length) {
+    return;
+  }
+
+  const pollMs = Math.max(250, getStatusSettlePollMs());
+  const maxAttempts = Math.max(1, Math.ceil(settleWindowMs / pollMs));
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+
+    let setupData;
+    try {
+      setupData = await getMCPSetupData(userId);
+    } catch (error) {
+      logger.warn(
+        `[MCP Connection Status] Failed settle setup fetch (attempt ${attempt + 1}/${maxAttempts}): ${error?.message ?? String(error)}`,
+      );
+      break;
+    }
+
+    if (!setupData) {
+      break;
+    }
+
+    const latestConfig = setupData.mcpConfig ?? mcpConfig;
+    let stillConnecting = 0;
+
+    for (const serverName of connectingServers) {
+      const config = latestConfig?.[serverName];
+      if (!config) {
+        continue;
+      }
+
+      try {
+        connectionStatus[serverName] = await getServerConnectionStatus(
+          userId,
+          serverName,
+          config,
+          setupData.appConnections,
+          setupData.userConnections,
+          setupData.oauthServers,
+        );
+      } catch (error) {
+        logger.warn(
+          `[MCP Connection Status] Failed settle pass for server "${serverName}" (attempt ${attempt + 1}/${maxAttempts}): ${error?.message ?? String(error)}`,
+        );
+      }
+
+      if (connectionStatus[serverName]?.connectionState === 'connecting') {
+        stillConnecting += 1;
+      }
+    }
+
+    if (!stillConnecting) {
+      break;
+    }
+  }
+}
+/* VIVENTIUM END */
 
 /**
  * Get all MCP tools available to the user
@@ -79,11 +310,14 @@ router.get('/tools', requireJwtAuth, async (req, res) => {
 router.get('/:serverName/oauth/initiate', requireJwtAuth, setOAuthSession, async (req, res) => {
   try {
     const { serverName } = req.params;
-    const { userId, flowId } = req.query;
     const user = req.user;
+    const queryUserId = typeof req.query.userId === 'string' ? req.query.userId : undefined;
+    const flowId = typeof req.query.flowId === 'string' ? req.query.flowId : undefined;
+    const userId = user.id;
 
-    // Verify the userId matches the authenticated user
-    if (userId !== user.id) {
+    // Some clients call this endpoint without userId/flowId query params.
+    // Only enforce user match when userId is explicitly provided.
+    if (queryUserId && queryUserId !== userId) {
       return res.status(403).json({ error: 'User mismatch' });
     }
 
@@ -92,26 +326,84 @@ router.get('/:serverName/oauth/initiate', requireJwtAuth, setOAuthSession, async
     const flowsCache = getLogStores(CacheKeys.FLOWS);
     const flowManager = getFlowStateManager(flowsCache);
 
-    /** Flow state to retrieve OAuth config */
-    const flowState = await flowManager.getFlowState(flowId, 'mcp_oauth');
-    if (!flowState) {
-      logger.error('[MCP OAuth] Flow state not found', { flowId });
-      return res.status(404).json({ error: 'Flow not found' });
+    const serverConfig = await getMCPServersRegistry().getServerConfig(serverName, userId);
+    /** VIVENTIUM START: prefer live registry config; flow metadata is fallback only */
+    let flowState = null;
+    if (flowId) {
+      flowState = await flowManager.getFlowState(flowId, 'mcp_oauth');
+      if (!flowState && !serverConfig?.oauth) {
+        logger.error('[MCP OAuth] Flow state not found', { flowId, serverName, userId });
+        return res.status(404).json({ error: 'Flow not found' });
+      }
+      if (!flowState) {
+        logger.warn('[MCP OAuth] Flow state missing, falling back to live registry config', {
+          flowId,
+          serverName,
+          userId,
+        });
+      }
     }
+    const flowMetadata = flowState?.metadata || {};
 
-    const { serverUrl, oauth: oauthConfig } = flowState.metadata || {};
+    const serverUrl = serverConfig?.url || flowMetadata.serverUrl;
+    let oauthConfig = serverConfig?.oauth || flowMetadata.oauth;
+    /** VIVENTIUM END */
     if (!serverUrl || !oauthConfig) {
       logger.error('[MCP OAuth] Missing server URL or OAuth config in flow state');
       return res.status(400).json({ error: 'Invalid flow state' });
     }
 
-    const configServers = await resolveConfigServers(req);
-    const oauthHeaders = await getOAuthHeaders(serverName, userId, configServers);
-    const {
-      authorizationUrl,
-      flowId: oauthFlowId,
-      flowMetadata,
-    } = await MCPOAuthHandler.initiateOAuthFlow(
+    /* VIVENTIUM START: stabilize OAuth URLs + callback for active local/prod environment */
+    const expectedOauthUrls = getExpectedMCPOAuthUrls(serverName);
+    if (expectedOauthUrls) {
+      const nextOauthConfig = { ...oauthConfig };
+      let urlsPatched = false;
+
+      if (
+        expectedOauthUrls.authorization_url &&
+        expectedOauthUrls.authorization_url !== oauthConfig.authorization_url
+      ) {
+        logger.warn('[MCP OAuth] Rewriting authorization_url from env source', {
+          serverName,
+          originalAuthorizationUrl: oauthConfig.authorization_url,
+          expectedAuthorizationUrl: expectedOauthUrls.authorization_url,
+        });
+        nextOauthConfig.authorization_url = expectedOauthUrls.authorization_url;
+        urlsPatched = true;
+      }
+
+      if (expectedOauthUrls.token_url && expectedOauthUrls.token_url !== oauthConfig.token_url) {
+        logger.warn('[MCP OAuth] Rewriting token_url from env source', {
+          serverName,
+          originalTokenUrl: oauthConfig.token_url,
+          expectedTokenUrl: expectedOauthUrls.token_url,
+        });
+        nextOauthConfig.token_url = expectedOauthUrls.token_url;
+        urlsPatched = true;
+      }
+
+      if (urlsPatched) {
+        oauthConfig = nextOauthConfig;
+      }
+    }
+
+    const expectedCallback = getExpectedMCPOAuthCallback(serverName);
+    if (expectedCallback && oauthConfig.redirect_uri !== expectedCallback) {
+      logger.warn('[MCP OAuth] Rewriting redirect_uri from domain source', {
+        serverName,
+        originalRedirectUri: oauthConfig.redirect_uri,
+        expectedCallback,
+        originalWasLoopback: isLoopbackUrl(oauthConfig.redirect_uri),
+      });
+      oauthConfig = {
+        ...oauthConfig,
+        redirect_uri: expectedCallback,
+      };
+    }
+    /* VIVENTIUM END */
+
+    const oauthHeaders = await getOAuthHeaders(serverName, userId);
+    const { authorizationUrl, flowId: oauthFlowId } = await MCPOAuthHandler.initiateOAuthFlow(
       serverName,
       serverUrl,
       userId,
@@ -121,7 +413,6 @@ router.get('/:serverName/oauth/initiate', requireJwtAuth, setOAuthSession, async
 
     logger.debug('[MCP OAuth] OAuth flow initiated', { oauthFlowId, authorizationUrl });
 
-    await MCPOAuthHandler.storeStateMapping(flowMetadata.state, oauthFlowId, flowManager);
     setOAuthCsrfCookie(res, oauthFlowId, OAUTH_CSRF_COOKIE_PATH);
     res.redirect(authorizationUrl);
   } catch (error) {
@@ -164,52 +455,30 @@ router.get('/:serverName/oauth/callback', async (req, res) => {
       return res.redirect(`${basePath}/oauth/error?error=missing_state`);
     }
 
-    const flowsCache = getLogStores(CacheKeys.FLOWS);
-    const flowManager = getFlowStateManager(flowsCache);
-
-    const flowId = await MCPOAuthHandler.resolveStateToFlowId(state, flowManager);
-    if (!flowId) {
-      logger.error('[MCP OAuth] Could not resolve state to flow ID', { state });
-      return res.redirect(`${basePath}/oauth/error?error=invalid_state`);
-    }
-    logger.debug('[MCP OAuth] Resolved flow ID from state', { flowId });
+    const flowId = state;
+    logger.debug('[MCP OAuth] Using flow ID from state', { flowId });
 
     const flowParts = flowId.split(':');
     if (flowParts.length < 2 || !flowParts[0] || !flowParts[1]) {
-      logger.error('[MCP OAuth] Invalid flow ID format', { flowId });
+      logger.error('[MCP OAuth] Invalid flow ID format in state', { flowId });
       return res.redirect(`${basePath}/oauth/error?error=invalid_state`);
     }
 
     const [flowUserId] = flowParts;
-
-    const hasCsrf = validateOAuthCsrf(req, res, flowId, OAUTH_CSRF_COOKIE_PATH);
-    const hasSession = !hasCsrf && validateOAuthSession(req, flowUserId);
-    let hasActiveFlow = false;
-    if (!hasCsrf && !hasSession) {
-      const pendingFlow = await flowManager.getFlowState(flowId, 'mcp_oauth');
-      const pendingAge = pendingFlow?.createdAt ? Date.now() - pendingFlow.createdAt : Infinity;
-      hasActiveFlow = pendingFlow?.status === 'PENDING' && pendingAge < PENDING_STALE_MS;
-      if (hasActiveFlow) {
-        logger.debug(
-          '[MCP OAuth] CSRF/session cookies absent, validating via active PENDING flow',
-          {
-            flowId,
-          },
-        );
-      }
-    }
-
-    if (!hasCsrf && !hasSession && !hasActiveFlow) {
-      logger.error(
-        '[MCP OAuth] CSRF validation failed: no valid CSRF cookie, session cookie, or active flow',
-        {
-          flowId,
-          hasCsrfCookie: !!req.cookies?.[OAUTH_CSRF_COOKIE],
-          hasSessionCookie: !!req.cookies?.[OAUTH_SESSION_COOKIE],
-        },
-      );
+    if (
+      !validateOAuthCsrf(req, res, flowId, OAUTH_CSRF_COOKIE_PATH) &&
+      !validateOAuthSession(req, flowUserId)
+    ) {
+      logger.error('[MCP OAuth] CSRF validation failed: no valid CSRF or session cookie', {
+        flowId,
+        hasCsrfCookie: !!req.cookies?.[OAUTH_CSRF_COOKIE],
+        hasSessionCookie: !!req.cookies?.[OAUTH_SESSION_COOKIE],
+      });
       return res.redirect(`${basePath}/oauth/error?error=csrf_validation_failed`);
     }
+
+    const flowsCache = getLogStores(CacheKeys.FLOWS);
+    const flowManager = getFlowStateManager(flowsCache);
 
     logger.debug('[MCP OAuth] Getting flow state for flowId: ' + flowId);
     const flowState = await MCPOAuthHandler.getFlowState(flowId, flowManager);
@@ -238,14 +507,7 @@ router.get('/:serverName/oauth/callback', async (req, res) => {
     }
 
     logger.debug('[MCP OAuth] Completing OAuth flow');
-    if (!flowState.oauthHeaders) {
-      logger.warn(
-        '[MCP OAuth] oauthHeaders absent from flow state — config-source server oauth_headers will be empty',
-        { serverName, flowId },
-      );
-    }
-    const oauthHeaders =
-      flowState.oauthHeaders ?? (await getOAuthHeaders(serverName, flowState.userId));
+    const oauthHeaders = await getOAuthHeaders(serverName, flowState.userId);
     const tokens = await MCPOAuthHandler.completeOAuthFlow(flowId, code, flowManager, oauthHeaders);
     logger.info('[MCP OAuth] OAuth flow completed, tokens received in callback route');
 
@@ -256,9 +518,9 @@ router.get('/:serverName/oauth/callback', async (req, res) => {
           userId: flowState.userId,
           serverName,
           tokens,
-          createToken: db.createToken,
-          updateToken: db.updateToken,
-          findToken: db.findToken,
+          createToken,
+          updateToken,
+          findToken,
           clientInfo: flowState.clientInfo,
           metadata: flowState.metadata,
         });
@@ -296,10 +558,10 @@ router.get('/:serverName/oauth/callback', async (req, res) => {
           serverName,
           flowManager,
           tokenMethods: {
-            findToken: db.findToken,
-            updateToken: db.updateToken,
-            createToken: db.createToken,
-            deleteTokens: db.deleteTokens,
+            findToken,
+            updateToken,
+            createToken,
+            deleteTokens,
           },
         });
 
@@ -331,13 +593,7 @@ router.get('/:serverName/oauth/callback', async (req, res) => {
     const toolFlowId = flowState.metadata?.toolFlowId;
     if (toolFlowId) {
       logger.debug('[MCP OAuth] Completing tool flow', { toolFlowId });
-      const completed = await flowManager.completeFlow(toolFlowId, 'mcp_oauth', tokens);
-      if (!completed) {
-        logger.warn(
-          '[MCP OAuth] Tool flow state not found during completion — waiter will time out',
-          { toolFlowId },
-        );
-      }
+      await flowManager.completeFlow(toolFlowId, 'mcp_oauth', tokens);
     }
 
     /** Redirect to success page with flowId and serverName */
@@ -492,82 +748,69 @@ router.post('/oauth/cancel/:serverName', requireJwtAuth, async (req, res) => {
  * Reinitialize MCP server
  * This endpoint allows reinitializing a specific MCP server
  */
-router.post(
-  '/:serverName/reinitialize',
-  requireJwtAuth,
-  checkMCPUsePermissions,
-  setOAuthSession,
-  async (req, res) => {
-    try {
-      const { serverName } = req.params;
-      const user = createSafeUser(req.user);
+router.post('/:serverName/reinitialize', requireJwtAuth, setOAuthSession, async (req, res) => {
+  try {
+    const { serverName } = req.params;
+    const user = createSafeUser(req.user);
 
-      if (!user.id) {
-        return res.status(401).json({ error: 'User not authenticated' });
-      }
-
-      logger.info(`[MCP Reinitialize] Reinitializing server: ${serverName}`);
-
-      const mcpManager = getMCPManager();
-      const configServers = await resolveConfigServers(req);
-      const serverConfig = await getMCPServersRegistry().getServerConfig(
-        serverName,
-        user.id,
-        configServers,
-      );
-      if (!serverConfig) {
-        return res.status(404).json({
-          error: `MCP server '${serverName}' not found in configuration`,
-        });
-      }
-
-      await mcpManager.disconnectUserConnection(user.id, serverName);
-      logger.info(
-        `[MCP Reinitialize] Disconnected existing user connection for server: ${serverName}`,
-      );
-
-      /** @type {Record<string, Record<string, string>> | undefined} */
-      let userMCPAuthMap;
-      if (serverConfig.customUserVars && typeof serverConfig.customUserVars === 'object') {
-        userMCPAuthMap = await getUserMCPAuthMap({
-          userId: user.id,
-          servers: [serverName],
-          findPluginAuthsByKeys: db.findPluginAuthsByKeys,
-        });
-      }
-
-      const result = await reinitMCPServer({
-        user,
-        serverName,
-        serverConfig,
-        configServers,
-        userMCPAuthMap,
-      });
-
-      if (!result) {
-        return res.status(500).json({ error: 'Failed to reinitialize MCP server for user' });
-      }
-
-      const { success, message, oauthRequired, oauthUrl } = result;
-
-      if (oauthRequired) {
-        const flowId = MCPOAuthHandler.generateFlowId(user.id, serverName);
-        setOAuthCsrfCookie(res, flowId, OAUTH_CSRF_COOKIE_PATH);
-      }
-
-      res.json({
-        success,
-        message,
-        oauthUrl,
-        serverName,
-        oauthRequired,
-      });
-    } catch (error) {
-      logger.error('[MCP Reinitialize] Unexpected error', error);
-      res.status(500).json({ error: 'Internal server error' });
+    if (!user.id) {
+      return res.status(401).json({ error: 'User not authenticated' });
     }
-  },
-);
+
+    logger.info(`[MCP Reinitialize] Reinitializing server: ${serverName}`);
+
+    const mcpManager = getMCPManager();
+    const serverConfig = await getMCPServersRegistry().getServerConfig(serverName, user.id);
+    if (!serverConfig) {
+      return res.status(404).json({
+        error: `MCP server '${serverName}' not found in configuration`,
+      });
+    }
+
+    await mcpManager.disconnectUserConnection(user.id, serverName);
+    logger.info(
+      `[MCP Reinitialize] Disconnected existing user connection for server: ${serverName}`,
+    );
+
+    /** @type {Record<string, Record<string, string>> | undefined} */
+    let userMCPAuthMap;
+    if (serverConfig.customUserVars && typeof serverConfig.customUserVars === 'object') {
+      userMCPAuthMap = await getUserMCPAuthMap({
+        userId: user.id,
+        servers: [serverName],
+        findPluginAuthsByKeys,
+      });
+    }
+
+    const result = await reinitMCPServer({
+      user,
+      serverName,
+      userMCPAuthMap,
+    });
+
+    if (!result) {
+      return res.status(500).json({ error: 'Failed to reinitialize MCP server for user' });
+    }
+
+    const { success, message, oauthRequired, oauthUrl } = result;
+
+    if (oauthRequired) {
+      const flowId = MCPOAuthHandler.generateFlowId(user.id, serverName);
+      setOAuthCsrfCookie(res, flowId, OAUTH_CSRF_COOKIE_PATH);
+    }
+
+    res.json({
+      success,
+      message,
+      oauthUrl,
+      serverName,
+      oauthRequired,
+    });
+  } catch (error) {
+    logger.error('[MCP Reinitialize] Unexpected error', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 /**
  * Get connection status for all MCP servers
@@ -581,10 +824,12 @@ router.get('/connection/status', requireJwtAuth, async (req, res) => {
       return res.status(401).json({ error: 'User not authenticated' });
     }
 
-    const { mcpConfig, appConnections, userConnections, oauthServers } = await getMCPSetupData(
+    let { mcpConfig, appConnections, userConnections, oauthServers } = await getMCPSetupData(
       user.id,
-      { role: user.role, tenantId: getTenantId() },
     );
+
+    await warmPersistentUserMCPConnections(createSafeUser(user), mcpConfig, oauthServers);
+    ({ mcpConfig, appConnections, userConnections, oauthServers } = await getMCPSetupData(user.id));
     const connectionStatus = {};
 
     for (const [serverName, config] of Object.entries(mcpConfig)) {
@@ -608,11 +853,21 @@ router.get('/connection/status', requireJwtAuth, async (req, res) => {
       }
     }
 
+    await settleTransientConnectingOAuthStatuses({
+      userId: user.id,
+      connectionStatus,
+      mcpConfig,
+      oauthServers,
+    });
+
     res.json({
       success: true,
       connectionStatus,
     });
   } catch (error) {
+    if (error.message === 'MCP config not found') {
+      return res.status(404).json({ error: error.message });
+    }
     logger.error('[MCP Connection Status] Failed to get connection status', error);
     res.status(500).json({ error: 'Failed to get connection status' });
   }
@@ -631,10 +886,12 @@ router.get('/connection/status/:serverName', requireJwtAuth, async (req, res) =>
       return res.status(401).json({ error: 'User not authenticated' });
     }
 
-    const { mcpConfig, appConnections, userConnections, oauthServers } = await getMCPSetupData(
+    let { mcpConfig, appConnections, userConnections, oauthServers } = await getMCPSetupData(
       user.id,
-      { role: user.role, tenantId: getTenantId() },
     );
+
+    await warmPersistentUserMCPConnections(createSafeUser(user), mcpConfig, oauthServers);
+    ({ mcpConfig, appConnections, userConnections, oauthServers } = await getMCPSetupData(user.id));
 
     if (!mcpConfig[serverName]) {
       return res
@@ -650,14 +907,28 @@ router.get('/connection/status/:serverName', requireJwtAuth, async (req, res) =>
       userConnections,
       oauthServers,
     );
+    const settledStatus = { [serverName]: serverStatus };
+
+    await settleTransientConnectingOAuthStatuses({
+      userId: user.id,
+      connectionStatus: settledStatus,
+      mcpConfig,
+      oauthServers,
+      targetServers: [serverName],
+    });
+
+    const finalServerStatus = settledStatus[serverName] ?? serverStatus;
 
     res.json({
       success: true,
       serverName,
-      connectionStatus: serverStatus.connectionState,
-      requiresOAuth: serverStatus.requiresOAuth,
+      connectionStatus: finalServerStatus.connectionState,
+      requiresOAuth: finalServerStatus.requiresOAuth,
     });
   } catch (error) {
+    if (error.message === 'MCP config not found') {
+      return res.status(404).json({ error: error.message });
+    }
     logger.error(
       `[MCP Per-Server Status] Failed to get connection status for ${req.params.serverName}`,
       error,
@@ -670,7 +941,7 @@ router.get('/connection/status/:serverName', requireJwtAuth, async (req, res) =>
  * Check which authentication values exist for a specific MCP server
  * This endpoint returns only boolean flags indicating if values are set, not the actual values
  */
-router.get('/:serverName/auth-values', requireJwtAuth, checkMCPUsePermissions, async (req, res) => {
+router.get('/:serverName/auth-values', requireJwtAuth, async (req, res) => {
   try {
     const { serverName } = req.params;
     const user = req.user;
@@ -679,12 +950,7 @@ router.get('/:serverName/auth-values', requireJwtAuth, checkMCPUsePermissions, a
       return res.status(401).json({ error: 'User not authenticated' });
     }
 
-    const configServers = await resolveConfigServers(req);
-    const serverConfig = await getMCPServersRegistry().getServerConfig(
-      serverName,
-      user.id,
-      configServers,
-    );
+    const serverConfig = await getMCPServersRegistry().getServerConfig(serverName, user.id);
     if (!serverConfig) {
       return res.status(404).json({
         error: `MCP server '${serverName}' not found in configuration`,
@@ -723,18 +989,27 @@ router.get('/:serverName/auth-values', requireJwtAuth, checkMCPUsePermissions, a
   }
 });
 
-async function getOAuthHeaders(serverName, userId, configServers) {
-  const serverConfig = await getMCPServersRegistry().getServerConfig(
-    serverName,
-    userId,
-    configServers,
-  );
+async function getOAuthHeaders(serverName, userId) {
+  const serverConfig = await getMCPServersRegistry().getServerConfig(serverName, userId);
   return serverConfig?.oauth_headers ?? {};
 }
 
 /**
 MCP Server CRUD Routes (User-Managed MCP Servers)
 */
+
+// Permission checkers for MCP server management
+const checkMCPUsePermissions = generateCheckAccess({
+  permissionType: PermissionTypes.MCP_SERVERS,
+  permissions: [Permissions.USE],
+  getRoleByName,
+});
+
+const checkMCPCreate = generateCheckAccess({
+  permissionType: PermissionTypes.MCP_SERVERS,
+  permissions: [Permissions.USE, Permissions.CREATE],
+  getRoleByName,
+});
 
 /**
  * Get list of accessible MCP servers
@@ -808,3 +1083,9 @@ router.delete(
 );
 
 module.exports = router;
+/* VIVENTIUM START: MCP route test reset hook for module-level warm-up state */
+module.exports.__resetPersistentWarmupStateForTests = () => {
+  persistentWarmupInFlight.clear();
+  persistentWarmupLastAttemptAt.clear();
+};
+/* VIVENTIUM END */

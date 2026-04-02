@@ -7,6 +7,13 @@ const {
 } = require('~/server/services/twoFactorService');
 const { setAuthTokens } = require('~/server/services/AuthService');
 const { getUserById } = require('~/models');
+/* === VIVENTIUM START ===
+ * Feature: Registration approval message passthrough for 2FA flow.
+ * === VIVENTIUM END === */
+const {
+  APPROVAL_ERROR_CODE,
+  PENDING_APPROVAL_MESSAGE,
+} = require('~/server/services/viventium/registrationApprovalService');
 
 /**
  * Verifies the 2FA code during login using a temporary token.
@@ -53,6 +60,9 @@ const verify2FAWithTempToken = async (req, res) => {
     const authToken = await setAuthTokens(user._id, res);
     return res.status(200).json({ token: authToken, user: userData });
   } catch (err) {
+    if (err?.code === APPROVAL_ERROR_CODE) {
+      return res.status(403).json({ message: PENDING_APPROVAL_MESSAGE });
+    }
     logger.error('[verify2FAWithTempToken]', err);
     return res.status(500).json({ message: 'Something went wrong' });
   }

@@ -1,5 +1,5 @@
-const { logger, ResourceCapabilityMap } = require('@librechat/data-schemas');
-const { hasCapability } = require('~/server/middleware/roles/capabilities');
+const { logger } = require('@librechat/data-schemas');
+const { SystemRoles } = require('librechat-data-provider');
 const { checkPermission } = require('~/server/services/PermissionService');
 
 /**
@@ -71,17 +71,8 @@ const canAccessResource = (options) => {
           message: 'Authentication required',
         });
       }
-      const cap = ResourceCapabilityMap[resourceType];
-      let hasCap = false;
-      try {
-        hasCap = cap != null && (await hasCapability(req.user, cap));
-      } catch (err) {
-        logger.warn(`[canAccessResource] capability check failed, denying bypass: ${err.message}`);
-      }
-      if (hasCap) {
-        logger.debug(
-          `[canAccessResource] ${cap} bypass for user ${req.user.id} on ${resourceType} ${rawResourceId}`,
-        );
+      // if system admin let through
+      if (req.user.role === SystemRoles.ADMIN) {
         return next();
       }
       const userId = req.user.id;

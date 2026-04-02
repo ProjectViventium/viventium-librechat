@@ -1,7 +1,7 @@
 import type { TEndpointsConfig } from './types';
 import { EModelEndpoint, isDocumentSupportedProvider } from './schemas';
 import { getEndpointFileConfig, mergeFileConfig } from './file-config';
-import { resolveEndpointType } from './config';
+import { getEndpointField, resolveEndpointType } from './config';
 
 const endpointsConfig: TEndpointsConfig = {
   [EModelEndpoint.openAI]: { userProvide: false, order: 0 },
@@ -11,6 +11,7 @@ const endpointsConfig: TEndpointsConfig = {
   Moonshot: { type: EModelEndpoint.custom, userProvide: false, order: 9999 },
   'Some Endpoint': { type: EModelEndpoint.custom, userProvide: false, order: 9999 },
   Gemini: { type: EModelEndpoint.custom, userProvide: false, order: 9999 },
+  xAI: { type: EModelEndpoint.custom, userProvide: false, order: 9999 },
 };
 
 describe('resolveEndpointType', () => {
@@ -72,6 +73,12 @@ describe('resolveEndpointType', () => {
         'UnknownProvider',
       );
     });
+
+    it('matches custom providers case-insensitively', () => {
+      expect(resolveEndpointType(endpointsConfig, EModelEndpoint.agents, 'xai')).toBe(
+        EModelEndpoint.custom,
+      );
+    });
   });
 
   describe('agents endpoint without provider', () => {
@@ -110,6 +117,13 @@ describe('resolveEndpointType', () => {
     it('handles undefined endpointsConfig', () => {
       expect(resolveEndpointType(undefined, 'Moonshot')).toBe('Moonshot');
     });
+  });
+});
+
+describe('getEndpointField', () => {
+  it('matches custom endpoint keys case-insensitively', () => {
+    expect(getEndpointField(endpointsConfig, 'xai', 'type')).toBe(EModelEndpoint.custom);
+    expect(getEndpointField(endpointsConfig, 'XAI', 'type')).toBe(EModelEndpoint.custom);
   });
 });
 
@@ -228,13 +242,13 @@ describe('resolveEndpointType + isDocumentSupportedProvider (upload menu)', () =
     expect(isDocumentSupportedProvider(endpointType)).toBe(true);
   });
 
-  it('agent with bedrock provider is document-supported', () => {
+  it('agent with bedrock provider is not document-supported', () => {
     const endpointType = resolveEndpointType(
       endpointsConfig,
       EModelEndpoint.agents,
       EModelEndpoint.bedrock,
     );
-    expect(isDocumentSupportedProvider(endpointType)).toBe(true);
+    expect(isDocumentSupportedProvider(endpointType)).toBe(false);
   });
 
   it('direct custom endpoint (not agents) is document-supported', () => {

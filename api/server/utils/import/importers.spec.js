@@ -1,21 +1,23 @@
 const fs = require('fs');
 const path = require('path');
 const { EModelEndpoint, Constants, openAISettings } = require('librechat-data-provider');
+const { bulkSaveConvos: _bulkSaveConvos } = require('~/models/Conversation');
 const { getImporter, processAssistantMessage } = require('./importers');
 const { ImportBatchBuilder } = require('./importBatchBuilder');
-const { bulkSaveMessages, bulkSaveConvos: _bulkSaveConvos } = require('~/models');
+const { bulkSaveMessages } = require('~/models/Message');
+const getLogStores = require('~/cache/getLogStores');
 
-const mockGetEndpointsConfig = jest.fn().mockResolvedValue({
-  [EModelEndpoint.openAI]: { userProvide: false },
-});
-
-jest.mock('~/server/services/Config', () => ({
-  getEndpointsConfig: (...args) => mockGetEndpointsConfig(...args),
+jest.mock('~/cache/getLogStores');
+const mockedCacheGet = jest.fn();
+getLogStores.mockImplementation(() => ({
+  get: mockedCacheGet,
 }));
 
 // Mock the database methods
-jest.mock('~/models', () => ({
+jest.mock('~/models/Conversation', () => ({
   bulkSaveConvos: jest.fn(),
+}));
+jest.mock('~/models/Message', () => ({
   bulkSaveMessages: jest.fn(),
 }));
 
@@ -759,7 +761,7 @@ describe('importLibreChatConvo', () => {
   );
 
   it('should import conversation correctly', async () => {
-    mockGetEndpointsConfig.mockResolvedValue({
+    mockedCacheGet.mockResolvedValue({
       [EModelEndpoint.openAI]: {},
     });
     const expectedNumberOfMessages = 6;
@@ -785,7 +787,7 @@ describe('importLibreChatConvo', () => {
   });
 
   it('should import linear, non-recursive thread correctly with correct endpoint', async () => {
-    mockGetEndpointsConfig.mockResolvedValue({
+    mockedCacheGet.mockResolvedValue({
       [EModelEndpoint.azureOpenAI]: {},
     });
 
@@ -925,7 +927,7 @@ describe('importLibreChatConvo', () => {
   });
 
   it('should retain properties from the original conversation as well as new settings', async () => {
-    mockGetEndpointsConfig.mockResolvedValue({
+    mockedCacheGet.mockResolvedValue({
       [EModelEndpoint.azureOpenAI]: {},
     });
     const requestUserId = 'user-123';
@@ -1243,7 +1245,7 @@ describe('processAssistantMessage', () => {
     const regExp = '(a+)+';
     const results = [];
 
-    sizes.forEach((size) => {
+    const measureOnce = (size) => {
       const startTime = process.hrtime();
 
       const maliciousMessageData = {
@@ -1267,12 +1269,31 @@ describe('processAssistantMessage', () => {
       };
 
       const maliciousText = '【' + 'a'.repeat(size) + '】';
-
       processAssistantMessage(maliciousMessageData, maliciousText);
 
       const endTime = process.hrtime(startTime);
-      const duration = endTime[0] * 1000 + endTime[1] / 1000000; // Convert to milliseconds
-      results.push(duration);
+      return endTime[0] * 1000 + endTime[1] / 1000000; // Convert to milliseconds
+    };
+
+    /* === VIVENTIUM START ===
+     * Test stability: this is a microbenchmark intended to detect catastrophic backtracking.
+     * Running with Jest parallel workers can introduce timing jitter that causes false failures.
+     * We take the median across multiple runs per size to keep the signal while reducing flakiness.
+     *
+     * Added: 2026-02-10
+     * === VIVENTIUM END === */
+    const samplesPerSize = 25;
+
+    sizes.forEach((size) => {
+      // Warm-up (JIT, caches)
+      measureOnce(size);
+      const samples = [];
+      for (let i = 0; i < samplesPerSize; i++) {
+        samples.push(measureOnce(size));
+      }
+      samples.sort((a, b) => a - b);
+      const median = samples[Math.floor(samples.length / 2)];
+      results.push(median);
     });
 
     // Each size should complete well under 100ms; a ReDoS would cause exponential blowup

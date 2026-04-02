@@ -38,7 +38,6 @@ const DownloadArtifact = ({ artifact }: { artifact: Artifact }) => {
     <Button
       size="icon"
       variant="ghost"
-      className="h-9 w-9"
       onClick={handleDownload}
       aria-label={localize('com_ui_download_artifact')}
     >

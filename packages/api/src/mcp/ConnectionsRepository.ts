@@ -1,9 +1,8 @@
 import { logger } from '@librechat/data-schemas';
-import type * as t from './types';
-import { MCPServersRegistry } from '~/mcp/registry/MCPServersRegistry';
 import { MCPConnectionFactory } from '~/mcp/MCPConnectionFactory';
-import { hasCustomUserVars, isUserSourced } from './utils';
 import { MCPConnection } from './connection';
+import { MCPServersRegistry } from '~/mcp/registry/MCPServersRegistry';
+import type * as t from './types';
 
 const CONNECT_CONCURRENCY = 3;
 
@@ -77,14 +76,12 @@ export class ConnectionsRepository {
         await this.disconnect(serverName);
       }
     }
-    const registry = MCPServersRegistry.getInstance();
     const connection = await MCPConnectionFactory.create(
       {
         serverName,
         serverConfig,
-        dbSourced: isUserSourced(serverConfig as t.ParsedServerConfig),
-        useSSRFProtection: registry.shouldEnableSSRFProtection(),
-        allowedDomains: registry.getAllowedDomains(),
+        dbSourced: !!(serverConfig as t.ParsedServerConfig).dbId,
+        useSSRFProtection: MCPServersRegistry.getInstance().shouldEnableSSRFProtection(),
       },
       this.oauthOpts,
     );
@@ -142,19 +139,12 @@ export class ConnectionsRepository {
     return `[MCP][${serverName}]`;
   }
 
-  /**
-   * App-level (shared) connections cannot serve servers that need per-user context:
-   * env/header placeholders like `{{MY_KEY}}` are only resolved by `processMCPEnv()`
-   * when real `customUserVars` values exist — which requires a user-level connection.
-   */
   private isAllowedToConnectToServer(config: t.ParsedServerConfig) {
     if (config.inspectionFailed) {
       return false;
     }
-    if (
-      this.ownerId === undefined &&
-      (config.startup === false || config.requiresOAuth || hasCustomUserVars(config))
-    ) {
+    //the repository is not allowed to be connected in case the Connection repository is shared (ownerId is undefined/null) and the server requires Auth or startup false.
+    if (this.ownerId === undefined && (config.startup === false || config.requiresOAuth)) {
       return false;
     }
     return true;

@@ -27,10 +27,14 @@ function Footer({ className }: { className?: string }) {
   const mainContentParts = (
     typeof config?.customFooter === 'string'
       ? config.customFooter
-      : '[LibreChat ' +
+      : // VIVENTIUM START
+        // Purpose: Default footer should use Viventium branding and links.
+        // Details: docs/requirements_and_learnings/16_Branding_and_Assets.md#librechat-footer
+        '[Viventium ' +
         Constants.VERSION +
-        '](https://librechat.ai) - ' +
+        '](https://viventium.ai) - ' +
         localize('com_ui_latest_footer')
+        // VIVENTIUM END
   ).split('|');
 
   useEffect(() => {

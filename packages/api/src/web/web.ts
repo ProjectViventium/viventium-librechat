@@ -13,37 +13,6 @@ import type {
   TWebSearchConfig,
 } from 'librechat-data-provider';
 import type { TWebSearchKeys, TWebSearchCategories } from '@librechat/data-schemas';
-import { isSSRFTarget, resolveHostnameSSRF } from '../auth';
-
-/**
- * URL-type keys in TWebSearchKeys (not API keys or version strings).
- * Must stay in sync with URL-typed fields in webSearchAuth (packages/data-schemas).
- */
-const WEB_SEARCH_URL_KEYS = new Set<TWebSearchKeys>([
-  'searxngInstanceUrl',
-  'firecrawlApiUrl',
-  'jinaApiUrl',
-]);
-
-/**
- * Returns true if the URL should be blocked for SSRF risk.
- * Fail-closed: unparseable URLs and non-HTTP(S) schemes return true.
- */
-async function isSSRFUrl(url: string): Promise<boolean> {
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch {
-    return true;
-  }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    return true;
-  }
-  if (isSSRFTarget(parsed.hostname)) {
-    return true;
-  }
-  return resolveHostnameSSRF(parsed.hostname);
-}
 
 export function extractWebSearchEnvVars({
   keys,
@@ -70,6 +39,27 @@ export function extractWebSearchEnvVars({
   }
 
   return authFields;
+}
+
+function resolveWebSearchConfigValue(
+  key: TWebSearchKeys,
+  config: TCustomConfig['webSearch'] | undefined,
+): { authField?: string; literalValue?: string } | null {
+  if (!config) {
+    return null;
+  }
+
+  const value = config[key];
+  if (typeof value !== 'string' || value.length === 0) {
+    return null;
+  }
+
+  const authField = extractVariableName(value);
+  if (authField) {
+    return { authField };
+  }
+
+  return { literalValue: value };
 }
 
 /**
@@ -125,6 +115,10 @@ export async function loadWebSearchAuth({
       specificService = webSearchConfig.rerankerType as unknown as ServiceType;
     }
 
+    if (category === SearchCategories.RERANKERS && !specificService) {
+      return [true, false];
+    }
+
     // If a specific service is specified, only check that one
     const services = specificService
       ? [specificService]
@@ -153,54 +147,78 @@ export async function loadWebSearchAuth({
 
       if (requiredKeys.length === 0) continue;
 
-      const requiredAuthFields = extractWebSearchEnvVars({
-        keys: requiredKeys,
-        config: webSearchConfig,
-      });
-      const optionalAuthFields = extractWebSearchEnvVars({
-        keys: optionalKeys,
-        config: webSearchConfig,
-      });
-      if (requiredAuthFields.length !== requiredKeys.length) continue;
-
       const allKeys = [...requiredKeys, ...optionalKeys];
-      const allAuthFields = [...requiredAuthFields, ...optionalAuthFields];
-      const optionalSet = new Set(optionalAuthFields);
+      const resolvedEntries = allKeys.map((key) => ({
+        key,
+        resolved: resolveWebSearchConfigValue(key, webSearchConfig),
+      }));
+      const requiredSatisfied = resolvedEntries
+        .filter((entry) => requiredKeys.includes(entry.key))
+        .every((entry) => entry.resolved?.authField || entry.resolved?.literalValue != null);
+
+      if (!requiredSatisfied) {
+        continue;
+      }
+
+      const envEntries = resolvedEntries.filter((entry) => entry.resolved?.authField);
+      const allAuthFields = envEntries
+        .map((entry) => entry.resolved?.authField)
+        .filter((field): field is string => typeof field === 'string' && field.length > 0);
+      const optionalSet = new Set(
+        envEntries
+          .filter((entry) => optionalKeys.includes(entry.key))
+          .map((entry) => entry.resolved?.authField)
+          .filter((field): field is string => typeof field === 'string' && field.length > 0),
+      );
+
+      const categoryResult: Partial<TWebSearchConfig> = {};
+      let authValues: Record<string, string> = {};
 
       try {
-        const authValues = await loadAuthValues({
-          userId,
-          authFields: allAuthFields,
-          optional: optionalSet,
-          throwError,
-        });
+        if (allAuthFields.length > 0) {
+          authValues = await loadAuthValues({
+            userId,
+            authFields: allAuthFields,
+            optional: optionalSet,
+            throwError,
+          });
+        }
 
         let allFieldsAuthenticated = true;
-        for (let j = 0; j < allAuthFields.length; j++) {
-          const field = allAuthFields[j];
-          const value = authValues[field];
-          const originalKey = allKeys[j];
-
-          if (!optionalSet.has(field) && !value) {
+        for (const entry of resolvedEntries) {
+          const originalKey = entry.key;
+          const resolved = entry.resolved;
+          if (!resolved) {
+            if (optionalKeys.includes(originalKey)) {
+              continue;
+            }
             allFieldsAuthenticated = false;
             break;
           }
 
-          const isFieldUserProvided = value != null && process.env[field] !== value;
-          const isUrlKey = originalKey != null && WEB_SEARCH_URL_KEYS.has(originalKey);
-          let contributed = false;
-
-          if (isUrlKey && isFieldUserProvided && (await isSSRFUrl(value))) {
-            if (!optionalSet.has(field)) {
-              allFieldsAuthenticated = false;
-              break;
-            }
-          } else if (originalKey) {
-            authResult[originalKey] = value;
-            contributed = true;
+          if (resolved.literalValue != null) {
+            categoryResult[originalKey] = resolved.literalValue;
+            continue;
           }
 
-          if (!isUserProvided && isFieldUserProvided && contributed) {
+          const field = resolved.authField;
+          if (!field) {
+            if (optionalKeys.includes(originalKey)) {
+              continue;
+            }
+            allFieldsAuthenticated = false;
+            break;
+          }
+
+          const value = authValues[field];
+          if (!optionalSet.has(field) && !value) {
+            allFieldsAuthenticated = false;
+            break;
+          }
+          if (value) {
+            categoryResult[originalKey] = value;
+          }
+          if (!isUserProvided && value && process.env[field] !== value) {
             isUserProvided = true;
           }
         }
@@ -208,6 +226,7 @@ export async function loadWebSearchAuth({
         if (!allFieldsAuthenticated) {
           continue;
         }
+        Object.assign(authResult, categoryResult);
         if (category === SearchCategories.PROVIDERS) {
           authResult.searchProvider = service as SearchProviders;
         } else if (category === SearchCategories.SCRAPERS) {

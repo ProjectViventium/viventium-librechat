@@ -358,4 +358,39 @@ describe('formatAgentMessages', () => {
     );
     expect(hasErrorContent).toBe(false);
   });
+
+  it('should tolerate null and string parts in assistant content arrays', () => {
+    const payload = [
+      {
+        role: 'assistant',
+        content: [null, 'hello', { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'world' }],
+      },
+    ];
+
+    const result = formatAgentMessages(payload);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toBeInstanceOf(AIMessage);
+    expect(JSON.stringify(result[0].content)).toContain('hello');
+    expect(JSON.stringify(result[0].content)).toContain('world');
+  });
+
+  it('should skip malformed tool_call blocks without crashing', () => {
+    const payload = [
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'Checking...', tool_call_ids: ['tc-1'] },
+          { type: ContentTypes.TOOL_CALL },
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'Done.' },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(payload);
+    expect(result).toHaveLength(2);
+    expect(result[0]).toBeInstanceOf(AIMessage);
+    expect(result[1]).toBeInstanceOf(AIMessage);
+    expect(result[0].content).toBe('Checking...');
+    expect(JSON.stringify(result[1].content)).toContain('Done.');
+  });
 });

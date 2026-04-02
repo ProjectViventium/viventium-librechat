@@ -88,7 +88,11 @@ describe('encodeAndFormatDocuments - fileConfig integration', () => {
       updatedAt: new Date(),
     }) as unknown as IMongoFile;
 
-  const createMockDocFile = (sizeInMB: number, mimeType: string, filename: string): IMongoFile =>
+  const createMockDocFile = (
+    sizeInMB: number,
+    mimeType: string,
+    filename: string,
+  ): IMongoFile =>
     ({
       _id: new Types.ObjectId(),
       user: new Types.ObjectId(),
@@ -131,7 +135,6 @@ describe('encodeAndFormatDocuments - fileConfig integration', () => {
         expect.any(Number),
         Providers.OPENAI,
         configuredLimit,
-        undefined,
       );
     });
 
@@ -159,7 +162,6 @@ describe('encodeAndFormatDocuments - fileConfig integration', () => {
         expect.any(Buffer),
         expect.any(Number),
         Providers.OPENAI,
-        undefined,
         undefined,
       );
     });
@@ -193,7 +195,6 @@ describe('encodeAndFormatDocuments - fileConfig integration', () => {
         expect.any(Buffer),
         expect.any(Number),
         Providers.OPENAI,
-        undefined,
         undefined,
       );
     });
@@ -234,7 +235,6 @@ describe('encodeAndFormatDocuments - fileConfig integration', () => {
         expect.any(Number),
         Providers.ANTHROPIC,
         configuredLimit,
-        undefined,
       );
     });
 
@@ -274,7 +274,6 @@ describe('encodeAndFormatDocuments - fileConfig integration', () => {
         expect.any(Number),
         Providers.GOOGLE,
         configuredLimit,
-        undefined,
       );
     });
 
@@ -314,7 +313,6 @@ describe('encodeAndFormatDocuments - fileConfig integration', () => {
         expect.any(Buffer),
         expect.any(Number),
         Providers.OPENAI,
-        undefined,
         undefined,
       );
     });
@@ -409,7 +407,6 @@ describe('encodeAndFormatDocuments - fileConfig integration', () => {
         expect.any(Number),
         Providers.OPENAI,
         mbToBytes(5),
-        undefined,
       );
     });
 
@@ -444,7 +441,6 @@ describe('encodeAndFormatDocuments - fileConfig integration', () => {
         expect.any(Number),
         Providers.OPENAI,
         mbToBytes(50),
-        undefined,
       );
     });
 
@@ -484,7 +480,6 @@ describe('encodeAndFormatDocuments - fileConfig integration', () => {
         expect.any(Number),
         Providers.OPENAI,
         mbToBytes(10),
-        undefined,
       );
       expect(mockedValidatePdf).toHaveBeenNthCalledWith(
         2,
@@ -492,7 +487,6 @@ describe('encodeAndFormatDocuments - fileConfig integration', () => {
         expect.any(Number),
         Providers.OPENAI,
         mbToBytes(10),
-        undefined,
       );
     });
   });
@@ -661,36 +655,6 @@ describe('encodeAndFormatDocuments - fileConfig integration', () => {
           },
         },
       });
-    });
-
-    it('should thread model to validateBedrockDocument when model is provided', async () => {
-      const req = createMockRequest() as ServerRequest;
-      const model = 'anthropic.claude-sonnet-4-20250514-v1:0';
-      const file = createMockDocFile(1, 'text/csv', 'data.csv');
-
-      const mockContent = Buffer.from('col1,col2\nval1,val2').toString('base64');
-      mockedGetFileStream.mockResolvedValue({
-        file,
-        content: mockContent,
-        metadata: file,
-      });
-
-      mockedValidateBedrockDocument.mockResolvedValue({ isValid: true });
-
-      await encodeAndFormatDocuments(
-        req,
-        [file],
-        { provider: Providers.BEDROCK, model },
-        mockStrategyFunctions,
-      );
-
-      expect(mockedValidateBedrockDocument).toHaveBeenCalledWith(
-        expect.any(Number),
-        'text/csv',
-        expect.any(Buffer),
-        undefined,
-        model,
-      );
     });
 
     it('should reject Bedrock document when validation fails', async () => {

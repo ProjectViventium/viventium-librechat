@@ -112,8 +112,8 @@ describe('MCPServersRegistry', () => {
       const userConfigBefore = await registry.getServerConfig('user_server');
       const allConfigsBefore = await registry.getAllServerConfigs();
 
-      expect(appConfigBefore).toEqual(expect.objectContaining(testParsedConfig));
-      expect(userConfigBefore).toEqual(expect.objectContaining(testParsedConfig));
+      expect(appConfigBefore).toEqual(testParsedConfig);
+      expect(userConfigBefore).toEqual(testParsedConfig);
       expect(Object.keys(allConfigsBefore)).toHaveLength(2);
 
       // Reset everything
@@ -250,18 +250,22 @@ describe('MCPServersRegistry', () => {
       });
 
       it('should use different cache keys for different userIds', async () => {
-        await registry['cacheConfigsRepo'].add('test_server', testParsedConfig);
+        // Spy on the cache repository get method
         const cacheRepoGetSpy = jest.spyOn(registry['cacheConfigsRepo'], 'get');
 
+        // First call without userId
         await registry.getServerConfig('test_server');
         expect(cacheRepoGetSpy).toHaveBeenCalledTimes(1);
 
+        // Call with userId - should be a different cache key, so hits repository again
         await registry.getServerConfig('test_server', 'user123');
         expect(cacheRepoGetSpy).toHaveBeenCalledTimes(2);
 
+        // Repeat call with same userId - should hit read-through cache
         await registry.getServerConfig('test_server', 'user123');
-        expect(cacheRepoGetSpy).toHaveBeenCalledTimes(2);
+        expect(cacheRepoGetSpy).toHaveBeenCalledTimes(2); // Still 2
 
+        // Call with different userId - should hit repository
         await registry.getServerConfig('test_server', 'user456');
         expect(cacheRepoGetSpy).toHaveBeenCalledTimes(3);
       });

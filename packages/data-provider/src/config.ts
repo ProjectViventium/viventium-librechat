@@ -2,12 +2,12 @@ import { z } from 'zod';
 import type { ZodError } from 'zod';
 import type { TEndpointsConfig, TModelsConfig, TConfig } from './types';
 import { EModelEndpoint, eModelEndpointSchema, isAgentsEndpoint } from './schemas';
-import { ComponentTypes, SettingTypes, OptionTypes } from './generate';
 import { specsConfigSchema, TSpecsConfig } from './models';
 import { fileConfigSchema } from './file-config';
 import { apiBaseUrl } from './api-endpoints';
 import { FileSources } from './types/files';
 import { MCPServersSchema } from './mcp';
+import { normalizeEndpointName } from './utils';
 
 export const defaultSocialLogins = ['google', 'facebook', 'openid', 'github', 'discord', 'saml'];
 
@@ -121,11 +121,11 @@ export const azureBaseSchema = z.object({
   instanceName: z.string().optional(),
   deploymentName: z.string().optional(),
   assistants: z.boolean().optional(),
-  addParams: z.record(z.union([z.string(), z.number(), z.boolean(), z.null()])).optional(),
+  addParams: z.record(z.any()).optional(),
   dropParams: z.array(z.string()).optional(),
   version: z.string().optional(),
   baseURL: z.string().optional(),
-  additionalHeaders: z.record(z.string()).optional(),
+  additionalHeaders: z.record(z.any()).optional(),
 });
 
 export type TAzureBaseSchema = z.infer<typeof azureBaseSchema>;
@@ -206,8 +206,6 @@ export const baseEndpointSchema = z.object({
     .optional(),
   titleEndpoint: z.string().optional(),
   titlePromptTemplate: z.string().optional(),
-  /** Maximum characters allowed in a single tool result before truncation. */
-  maxToolResultChars: z.number().positive().optional(),
 });
 
 export type TBaseEndpoint = z.infer<typeof baseEndpointSchema>;
@@ -258,7 +256,7 @@ export const assistantEndpointSchema = baseEndpointSchema.merge(
         userIdQuery: z.boolean().optional(),
       })
       .optional(),
-    headers: z.record(z.string()).optional(),
+    headers: z.record(z.any()).optional(),
   }),
 );
 
@@ -280,7 +278,6 @@ export const defaultAgentCapabilities = [
 ];
 
 export const agentsEndpointSchema = baseEndpointSchema
-  .omit({ baseURL: true })
   .merge(
     z.object({
       /* agents specific */
@@ -307,43 +304,6 @@ export const agentsEndpointSchema = baseEndpointSchema
 
 export type TAgentsEndpoint = z.infer<typeof agentsEndpointSchema>;
 
-export const paramDefinitionSchema = z.object({
-  key: z.string(),
-  description: z.string().optional(),
-  type: z.nativeEnum(SettingTypes).optional(),
-  default: z.union([z.number(), z.boolean(), z.string(), z.array(z.string())]).optional(),
-  showLabel: z.boolean().optional(),
-  showDefault: z.boolean().optional(),
-  options: z.array(z.string()).optional(),
-  range: z
-    .object({
-      min: z.number(),
-      max: z.number(),
-      step: z.number().optional(),
-    })
-    .optional(),
-  enumMappings: z.record(z.union([z.number(), z.boolean(), z.string()])).optional(),
-  component: z.nativeEnum(ComponentTypes).optional(),
-  optionType: z.nativeEnum(OptionTypes).optional(),
-  columnSpan: z.number().int().nonnegative().optional(),
-  columns: z.number().int().min(1).max(4).optional(),
-  label: z.string().optional(),
-  placeholder: z.string().optional(),
-  labelCode: z.boolean().optional(),
-  placeholderCode: z.boolean().optional(),
-  descriptionCode: z.boolean().optional(),
-  minText: z.number().optional(),
-  maxText: z.number().optional(),
-  minTags: z.number().min(0).optional(),
-  maxTags: z.number().min(0).optional(),
-  includeInput: z.boolean().optional(),
-  descriptionSide: z.enum(['top', 'right', 'bottom', 'left']).optional(),
-  searchPlaceholder: z.string().optional(),
-  selectPlaceholder: z.string().optional(),
-  searchPlaceholderCode: z.boolean().optional(),
-  selectPlaceholderCode: z.boolean().optional(),
-});
-
 export const endpointSchema = baseEndpointSchema.merge(
   z.object({
     name: z.string().refine((value) => !eModelEndpointSchema.safeParse(value).success, {
@@ -358,20 +318,23 @@ export const endpointSchema = baseEndpointSchema.merge(
       fetch: z.boolean().optional(),
       userIdQuery: z.boolean().optional(),
     }),
+    summarize: z.boolean().optional(),
+    summaryModel: z.string().optional(),
     iconURL: z.string().optional(),
     modelDisplayLabel: z.string().optional(),
-    headers: z.record(z.string()).optional(),
-    addParams: z.record(z.union([z.string(), z.number(), z.boolean(), z.null()])).optional(),
+    headers: z.record(z.any()).optional(),
+    addParams: z.record(z.any()).optional(),
     dropParams: z.array(z.string()).optional(),
     customParams: z
       .object({
         defaultParamsEndpoint: z.string().default('custom'),
-        paramDefinitions: z.array(paramDefinitionSchema).optional(),
+        paramDefinitions: z.array(z.record(z.any())).optional(),
       })
       .strict()
       .optional(),
+    customOrder: z.number().optional(),
     directEndpoint: z.boolean().optional(),
-    titleMessageRole: z.enum(['system', 'user', 'assistant']).optional(),
+    titleMessageRole: z.string().optional(),
   }),
 );
 
@@ -380,6 +343,7 @@ export type TEndpoint = z.infer<typeof endpointSchema>;
 export const azureEndpointSchema = z
   .object({
     groups: azureGroupConfigsSchema,
+    plugins: z.boolean().optional(),
     assistants: z.boolean().optional(),
   })
   .and(
@@ -391,6 +355,9 @@ export const azureEndpointSchema = z
         titleModel: true,
         titlePrompt: true,
         titlePromptTemplate: true,
+        summarize: true,
+        summaryModel: true,
+        customOrder: true,
       })
       .partial(),
   );
@@ -533,8 +500,7 @@ const speechTab = z
       .optional()
       .or(
         z.object({
-          /** Keep in sync with STTProviders enum (defined below — cannot reference due to eval order) */
-          engineSTT: z.enum(['openai', 'azureOpenAI']).optional(),
+          engineSTT: z.string().optional(),
           languageSTT: z.string().optional(),
           autoTranscribeAudio: z.boolean().optional(),
           decibelValue: z.number().optional(),
@@ -547,12 +513,11 @@ const speechTab = z
       .optional()
       .or(
         z.object({
-          /** Keep in sync with TTSProviders enum (defined below — cannot reference due to eval order) */
-          engineTTS: z.enum(['openai', 'azureOpenAI', 'elevenlabs', 'localai']).optional(),
+          engineTTS: z.string().optional(),
           voice: z.string().optional(),
           languageTTS: z.string().optional(),
           automaticPlayback: z.boolean().optional(),
-          playbackRate: z.number().min(0.25).max(4).optional(),
+          playbackRate: z.number().optional(),
           cacheTTS: z.boolean().optional(),
         }),
       )
@@ -681,6 +646,13 @@ export const interfaceSchema = z
         }),
       ])
       .optional(),
+    /* VIVENTIUM START
+     * Feature: Default agent selection (Viventium)
+     * Purpose: Allow setting a default agent via interface config (used by Viventium surfaces/entrypoints).
+     * Added: 2026-02-07
+     */
+    defaultAgent: z.string().optional(),
+    /* VIVENTIUM END */
     temporaryChat: z.boolean().optional(),
     temporaryChatRetention: z.number().min(1).max(8760).optional(),
     runCode: z.boolean().optional(),
@@ -811,12 +783,18 @@ export type TStartupConfig = {
   emailEnabled: boolean;
   showBirthdayIcon: boolean;
   helpAndFaqURL: string;
+  /* === VIVENTIUM START ===
+   * Feature: Connected Accounts local gating.
+   * Purpose: Expose startup toggle for OAuth-only connected account UI/actions.
+   * === VIVENTIUM END === */
+  viventiumConnectedAccountsEnabled?: boolean;
   customFooter?: string;
   modelSpecs?: TSpecsConfig;
   modelDescriptions?: Record<string, Record<string, string>>;
   sharedLinksEnabled: boolean;
   publicSharedLinksEnabled: boolean;
   analyticsGtmId?: string;
+  instanceProjectId: string;
   bundlerURL?: string;
   staticBundlerURL?: string;
   sharePointFilePickerEnabled?: boolean;
@@ -898,7 +876,7 @@ export const webSearchSchema = z.object({
   searchProvider: z.nativeEnum(SearchProviders).optional(),
   scraperProvider: z.nativeEnum(ScraperProviders).optional(),
   rerankerType: z.nativeEnum(RerankerTypes).optional(),
-  scraperTimeout: z.number().int().nonnegative().optional(),
+  scraperTimeout: z.number().optional(),
   safeSearch: z.nativeEnum(SafeSearchTypes).default(SafeSearchTypes.MODERATE),
   firecrawlOptions: z
     .object({
@@ -907,7 +885,7 @@ export const webSearchSchema = z.object({
       excludeTags: z.array(z.string()).optional(),
       headers: z.record(z.string()).optional(),
       waitFor: z.number().optional(),
-      timeout: z.number().int().nonnegative().optional(),
+      timeout: z.number().optional(),
       maxAge: z.number().optional(),
       mobile: z.boolean().optional(),
       skipTlsVerification: z.boolean().optional(),
@@ -964,6 +942,17 @@ export const memorySchema = z.object({
   disabled: z.boolean().optional(),
   validKeys: z.array(z.string()).optional(),
   tokenLimit: z.number().optional(),
+  /* === VIVENTIUM START ===
+   * Feature: Per-key memory budgets and maintenance threshold
+   *
+   * Purpose:
+   * - Keep one memory key from monopolizing the shared memory budget.
+   * - Trigger deterministic maintenance before the global store hard-fails.
+   *
+   * Added: 2026-03-09
+   * === VIVENTIUM END === */
+  keyLimits: z.record(z.number()).optional(),
+  maintenanceThresholdPercent: z.number().optional(),
   charLimit: z.number().optional().default(10000),
   personalize: z.boolean().default(true),
   messageWindowSize: z.number().optional().default(5),
@@ -976,7 +965,7 @@ export const memorySchema = z.object({
         provider: z.string(),
         model: z.string(),
         instructions: z.string().optional(),
-        model_parameters: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
+        model_parameters: z.record(z.any()).optional(),
       }),
     ])
     .optional(),
@@ -984,33 +973,22 @@ export const memorySchema = z.object({
 
 export type TMemoryConfig = DeepPartial<z.infer<typeof memorySchema>>;
 
-export const summarizationTriggerSchema = z.object({
-  type: z.enum(['token_count']),
-  value: z.number().positive(),
+/* VIVENTIUM START
+ * Purpose: Extend config schema for background cortex activation formatting.
+ * Details: docs/requirements_and_learnings/05_Open_Source_Modifications.md#librechat-config-schema
+ */
+const backgroundCortexActivationFormatSchema = z.object({
+  response_format: z.string().optional(),
+  brew_begin_tag: z.string().optional(),
 });
 
-export const contextPruningSchema = z.object({
-  enabled: z.boolean().optional(),
-  keepLastAssistants: z.number().min(0).max(10).optional(),
-  softTrimRatio: z.number().min(0).max(1).optional(),
-  hardClearRatio: z.number().min(0).max(1).optional(),
-  minPrunableToolChars: z.number().min(0).optional(),
+const backgroundCorticesSchema = z.object({
+  activation_format: backgroundCortexActivationFormatSchema.optional(),
 });
 
-export const summarizationConfigSchema = z.object({
-  enabled: z.boolean().optional(),
-  provider: z.string().optional(),
-  model: z.string().optional(),
-  parameters: z.record(z.union([z.string(), z.number(), z.boolean(), z.null()])).optional(),
-  trigger: summarizationTriggerSchema.optional(),
-  prompt: z.string().optional(),
-  updatePrompt: z.string().optional(),
-  reserveRatio: z.number().min(0).max(1).optional(),
-  maxSummaryTokens: z.number().positive().optional(),
-  contextPruning: contextPruningSchema.optional(),
+const viventiumSchema = z.object({
+  background_cortices: backgroundCorticesSchema.optional(),
 });
-
-export type SummarizationConfig = z.infer<typeof summarizationConfigSchema>;
 
 const customEndpointsSchema = z.array(endpointSchema.partial()).optional();
 
@@ -1020,7 +998,8 @@ export const configSchema = z.object({
   ocr: ocrSchema.optional(),
   webSearch: webSearchSchema.optional(),
   memory: memorySchema.optional(),
-  summarization: summarizationConfigSchema.optional(),
+  viventium: viventiumSchema.optional(),
+  /* VIVENTIUM END */
   secureImageLinks: z.boolean().optional(),
   imageOutputType: z.nativeEnum(EImageOutputType).default(EImageOutputType.PNG),
   includedTools: z.array(z.string()).optional(),
@@ -1060,7 +1039,7 @@ export const configSchema = z.object({
   modelSpecs: specsConfigSchema.optional(),
   endpoints: z
     .object({
-      all: baseEndpointSchema.omit({ baseURL: true }).optional(),
+      all: baseEndpointSchema.optional(),
       [EModelEndpoint.openAI]: baseEndpointSchema.optional(),
       [EModelEndpoint.google]: baseEndpointSchema.optional(),
       [EModelEndpoint.anthropic]: anthropicEndpointSchema.optional(),
@@ -1165,10 +1144,6 @@ export const alternateName = {
 };
 
 const sharedOpenAIModels = [
-  'gpt-5.4',
-  // TODO: gpt-5.4-thinking may have separate reasoning token pricing — verify before release
-  'gpt-5.4-thinking',
-  'gpt-5.4-pro',
   'gpt-5.1',
   'gpt-5.1-chat-latest',
   'gpt-5.1-codex',
@@ -1202,7 +1177,6 @@ const sharedOpenAIModels = [
 ];
 
 const sharedAnthropicModels = [
-  'claude-sonnet-4-6',
   'claude-opus-4-6',
   'claude-sonnet-4-5',
   'claude-sonnet-4-5-20250929',
@@ -1224,7 +1198,6 @@ const sharedAnthropicModels = [
 ];
 
 export const bedrockModels = [
-  'anthropic.claude-sonnet-4-6',
   'anthropic.claude-opus-4-6-v1',
   'anthropic.claude-sonnet-4-5-20250929-v1:0',
   'anthropic.claude-haiku-4-5-20251001-v1:0',
@@ -1261,17 +1234,13 @@ export const defaultModels = {
   [EModelEndpoint.assistants]: [...sharedOpenAIModels, 'chatgpt-4o-latest'],
   [EModelEndpoint.agents]: sharedOpenAIModels, // TODO: Add agent models (agentsModels)
   [EModelEndpoint.google]: [
-    // Gemini 3.1 Models
-    'gemini-3.1-pro-preview',
-    'gemini-3.1-pro-preview-customtools',
-    'gemini-3.1-flash-lite-preview',
-    // Gemini 3 Models
-    'gemini-3-pro-preview',
-    'gemini-3-flash-preview',
     // Gemini 2.5 Models
     'gemini-2.5-pro',
     'gemini-2.5-flash',
     'gemini-2.5-flash-lite',
+    // Gemini 2.0 Models
+    'gemini-2.0-flash-001',
+    'gemini-2.0-flash-lite',
   ],
   [EModelEndpoint.anthropic]: sharedAnthropicModels,
   [EModelEndpoint.openAI]: [
@@ -1341,7 +1310,6 @@ export const visionModels = [
   'o4-mini',
   'o3',
   'o1',
-  'gpt-5',
   'gpt-4.1',
   'gpt-4.5',
   'llava',
@@ -1441,10 +1409,6 @@ export enum CacheKeys {
    */
   CONFIG_STORE = 'CONFIG_STORE',
   /**
-   * Key for the tool cache namespace (plugins, MCP tools, tool definitions).
-   */
-  TOOL_CACHE = 'TOOL_CACHE',
-  /**
    * Key for the roles cache.
    */
   ROLES = 'ROLES',
@@ -1456,6 +1420,10 @@ export enum CacheKeys {
    * Key for the tools cache.
    */
   TOOLS = 'TOOLS',
+  /**
+   * Key for the tool namespace cache.
+   */
+  TOOL_CACHE = 'TOOL_CACHE',
   /**
    * Key for the model config cache.
    */
@@ -1622,10 +1590,6 @@ export enum ErrorTypes {
    */
   NO_BASE_URL = 'no_base_url',
   /**
-   * Base URL targets a restricted or invalid address (SSRF protection).
-   */
-  INVALID_BASE_URL = 'invalid_base_url',
-  /**
    * Moderation error
    */
   MODERATION = 'moderation',
@@ -1677,10 +1641,6 @@ export enum ErrorTypes {
    * Model refused to respond (content policy violation)
    */
   REFUSAL = 'refusal',
-  /**
-   * SSE stream 404 — job completed, expired, or was deleted before the subscriber connected
-   */
-  STREAM_EXPIRED = 'stream_expired',
 }
 
 /**
@@ -1805,7 +1765,7 @@ export enum TTSProviders {
 /** Enum for app-wide constants */
 export enum Constants {
   /** Key for the app's version. */
-  VERSION = 'v0.8.4',
+  VERSION = 'v0.8.3',
   /** Key for the Custom Config's version (librechat.yaml). */
   CONFIG_VERSION = '1.3.6',
   /** Standard value for the first message's `parentMessageId` value, to indicate no parent exists. */
@@ -1832,6 +1792,8 @@ export enum Constants {
   SAVED_TAG = 'Saved',
   /** Max number of Conversation starters for Agents/Assistants */
   MAX_CONVO_STARTERS = 4,
+  /** Global/instance Project Name */
+  GLOBAL_PROJECT_NAME = 'instance',
   /** Delimiter for MCP tools */
   mcp_delimiter = '_mcp_',
   /** Prefix for MCP plugins */
@@ -1840,8 +1802,6 @@ export enum Constants {
   mcp_all = 'sys__all__sys',
   /** Unique value to indicate clearing MCP servers from UI state. For frontend use only. */
   mcp_clear = 'sys__clear__sys',
-  /** Key suffix for non-spec user default tool storage */
-  spec_defaults_key = '__defaults__',
   /**
    * Unique value to indicate the MCP tool was added to an agent.
    * This helps inform the UI if the mcp server was previously added.
@@ -1888,8 +1848,8 @@ export enum LocalStorageKeys {
   LAST_PROMPT_CATEGORY = 'lastPromptCategory',
   /** Key for rendering User Messages as Markdown */
   ENABLE_USER_MSG_MARKDOWN = 'enableUserMsgMarkdown',
-  /** Key for auto-expanding tool call details */
-  AUTO_EXPAND_TOOLS = 'autoExpandTools',
+  /** Key for displaying analysis tool code input */
+  SHOW_ANALYSIS_CODE = 'showAnalysisCode',
   /** Last selected MCP values per conversation ID */
   LAST_MCP_ = 'LAST_MCP_',
   /** Last checked toggle for Code Interpreter API per conversation ID */
@@ -1986,7 +1946,16 @@ export function getEndpointField<
   if (!endpointsConfig || endpoint === null || endpoint === undefined) {
     return undefined;
   }
-  const config = endpointsConfig[endpoint];
+  const directConfig = endpointsConfig[endpoint];
+  if (directConfig) {
+    return directConfig[property];
+  }
+
+  const normalizedEndpoint = normalizeEndpointName(String(endpoint));
+  const matchedKey = Object.keys(endpointsConfig).find(
+    (key) => normalizeEndpointName(key) === normalizedEndpoint,
+  );
+  const config = matchedKey ? endpointsConfig[matchedKey] : undefined;
   if (!config) {
     return undefined;
   }

@@ -156,7 +156,11 @@ export function renderEndpointModels(
   filteredModels?: string[],
   endpointIndex?: number,
 ) {
-  const modelsToRender = filteredModels || models.map((model) => model.name);
+  const modelsToRender = Array.isArray(filteredModels)
+    ? filteredModels
+    : Array.isArray(models)
+      ? models.map((model) => model.name)
+      : [];
   const indexSuffix = endpointIndex != null ? `-${endpointIndex}` : '';
 
   return modelsToRender.map(

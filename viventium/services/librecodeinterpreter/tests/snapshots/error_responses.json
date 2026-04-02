@@ -1,0 +1,70 @@
+{
+  "_description": "Expected error response formats",
+  "_version": "1.0.0",
+
+  "validation_error_422": {
+    "description": "Returned when request validation fails",
+    "status_code": 422,
+    "response": {
+      "detail": [
+        {
+          "type": "missing",
+          "loc": ["body", "code"],
+          "msg": "Field required",
+          "input": {}
+        }
+      ]
+    }
+  },
+
+  "auth_error_401": {
+    "description": "Returned when authentication fails",
+    "status_code": 401,
+    "response": {
+      "error": "Invalid or missing API key"
+    }
+  },
+
+  "not_found_404": {
+    "description": "Returned when resource not found",
+    "status_code": 404,
+    "response": {
+      "detail": "File not found"
+    }
+  },
+
+  "unsupported_language_400": {
+    "description": "Returned when language is not supported",
+    "status_code": 400,
+    "response": {
+      "error": "Unsupported language",
+      "detail": {
+        "field": "lang",
+        "message": "Unsupported language: xyz"
+      }
+    }
+  },
+
+  "execution_error_200": {
+    "description": "Execution errors return 200 with error in output",
+    "status_code": 200,
+    "response": {
+      "session_id": "abc123",
+      "files": [],
+      "stdout": "",
+      "stderr": "NameError: name 'undefined' is not defined"
+    },
+    "note": "LibreChat expects 200 for execution errors"
+  },
+
+  "timeout_error_200": {
+    "description": "Timeout errors return 200 with timeout message",
+    "status_code": 200,
+    "response": {
+      "session_id": "abc123",
+      "files": [],
+      "stdout": "",
+      "stderr": "Execution timed out after 30 seconds"
+    }
+  }
+}

@@ -1,0 +1,197 @@
+services:
+  # Code Interpreter API
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BUILD_DATE: ${BUILD_DATE:-$(date -u +'%Y-%m-%dT%H:%M:%SZ')}
+        VERSION: ${VERSION:-1.0.0}
+        VCS_REF: ${VCS_REF:-$(git rev-parse --short HEAD)}
+    container_name: code-interpreter-api
+    # VIVENTIUM START
+    # Feature: Configurable container runtime user.
+    # Why: Keep Docker socket/file permissions portable across local and cloud hosts.
+    user: "${CODE_INTERPRETER_USER:-1000:988}" # Run as user with docker group access
+    labels:
+      - "viventium.stack=viventium_lc_livekit"
+      - "viventium.component=code-interpreter"
+      - "viventium.service=code-interpreter-api"
+    # VIVENTIUM END
+    cap_add:
+      - NET_ADMIN  # Required for iptables management when WAN access is enabled
+    ports:
+      - "${API_PORT:-8000}:8000"
+      - "${HTTPS_PORT:-443}:443"
+    env_file:
+      - .env
+    environment:
+      # Container-specific overrides (these override .env values)
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+
+      # Service discovery (container names)
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - MINIO_ENDPOINT=minio:9000
+
+      # Docker socket path inside container
+      - DOCKER_BASE_URL=unix://var/run/docker.sock
+
+      # SSL paths inside container
+      - SSL_CERT_FILE=/app/ssl/cert.pem
+      - SSL_KEY_FILE=/app/ssl/key.pem
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./logs:/app/logs
+      - app-data:/app/data
+      - ${SSL_CERTS_PATH:-./ssl}:/app/ssl
+      - ./dashboard:/app/dashboard
+      - ./src:/app/src
+      - ./docker:/app/docker:ro  # Seccomp profile for container security
+    depends_on:
+      - redis
+      - minio
+    networks:
+      - code-interpreter-network
+    restart: unless-stopped
+    stop_grace_period: 30s # Allow time to cleanup pooled containers
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "sh",
+          "-c",
+          "curl -f -k https://localhost:443/health 2>/dev/null || curl -f http://localhost:8000/health 2>/dev/null || curl -f http://localhost:80/health || exit 1",
+        ]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 15s
+
+  # Redis for session management
+  redis:
+    image: redis:7-alpine
+    container_name: code-interpreter-redis
+    # VIVENTIUM START
+    # Feature: Internal-only Redis for interpreter stack.
+    # Why: Avoid host port collisions with other Redis users and reduce accidental external coupling.
+    labels:
+      - "viventium.stack=viventium_lc_livekit"
+      - "viventium.component=code-interpreter"
+      - "viventium.service=code-interpreter-redis"
+    # VIVENTIUM END
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+    command: >
+      sh -c "
+        if [ -n \"$$REDIS_PASSWORD\" ]; then
+          redis-server --requirepass $$REDIS_PASSWORD --appendonly yes --appendfsync everysec
+        else
+          redis-server --appendonly yes --appendfsync everysec
+        fi
+      "
+    volumes:
+      - redis-data:/data
+      - ./docker/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    networks:
+      - code-interpreter-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # MinIO for file storage
+  minio:
+    image: minio/minio:latest
+    container_name: code-interpreter-minio
+    # VIVENTIUM START
+    # Feature: Service discovery labels for Viventium operations.
+    # Why: Keep container ownership and troubleshooting consistent across environments.
+    labels:
+      - "viventium.stack=viventium_lc_livekit"
+      - "viventium.component=code-interpreter"
+      - "viventium.service=code-interpreter-minio"
+    # VIVENTIUM END
+    ports:
+      # API port for local testing
+      - "127.0.0.1:9000:9000"
+      # Console only, bound to localhost (access via SSH tunnel)
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ACCESS_KEY:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_SECRET_KEY:-minioadmin}
+      - MINIO_BROWSER_REDIRECT_URL=http://localhost:9001
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    networks:
+      - code-interpreter-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # MinIO bucket initialization
+  minio-init:
+    image: minio/mc:latest
+    container_name: code-interpreter-minio-init
+    # VIVENTIUM START
+    # Feature: Service discovery labels for one-shot init job.
+    # Why: Easier log filtering and lifecycle tracking in shared hosts.
+    labels:
+      - "viventium.stack=viventium_lc_livekit"
+      - "viventium.component=code-interpreter"
+      - "viventium.service=code-interpreter-minio-init"
+    # VIVENTIUM END
+    depends_on:
+      - minio
+    environment:
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-minioadmin}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-minioadmin}
+      - MINIO_BUCKET=${MINIO_BUCKET:-code-interpreter-files}
+    entrypoint: >
+      /bin/sh -c " echo 'Waiting for MinIO to be ready...'; until mc alias set minio http://$$MINIO_ENDPOINT $$MINIO_ACCESS_KEY $$MINIO_SECRET_KEY; do
+        echo 'MinIO not ready, waiting...';
+        sleep 2;
+      done; echo 'MinIO is ready. Creating bucket if it does not exist...'; mc mb minio/$$MINIO_BUCKET --ignore-existing; echo 'Bucket setup complete.'; "
+    networks:
+      - code-interpreter-network
+
+volumes:
+  redis-data:
+    driver: local
+  minio-data:
+    driver: local
+  app-data:
+    driver: local
+
+networks:
+  code-interpreter-network:
+    driver: bridge
+    # VIVENTIUM START
+    # Feature: Let Docker allocate non-conflicting local subnets.
+    # Why: Fixed CIDRs collided with other local/Docker networks on multi-service dev hosts.
+    # VIVENTIUM END
+
+  # WAN-only network for execution containers that need internet access
+  # This network is only created when ENABLE_WAN_ACCESS=true
+  code-interpreter-wan:
+    driver: bridge
+    # VIVENTIUM START
+    # Feature: Docker-managed subnet assignment for optional WAN bridge.
+    # Why: Prevent deterministic subnet conflicts when multiple stacks run side-by-side.
+    # VIVENTIUM END
+    driver_opts:
+      # Enable NAT for outbound internet access
+      com.docker.network.bridge.enable_ip_masquerade: "true"
+      # Disable inter-container communication
+      com.docker.network.bridge.enable_icc: "false"
+    labels:
+      com.code-interpreter.managed: "true"
+      com.code-interpreter.type: "wan-access"

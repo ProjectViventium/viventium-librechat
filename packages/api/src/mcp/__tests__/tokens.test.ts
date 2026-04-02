@@ -15,6 +15,128 @@ describe('MCPTokenStorage', () => {
     jest.clearAllMocks();
   });
 
+  /* === VIVENTIUM START ===
+   * Purpose: Ensure we can force-refresh MCP OAuth tokens after an auth error
+   * even when our stored access-token expiry says it is still valid.
+   * (Prevents repeated full OAuth re-auth flows.)
+   */
+  describe('getTokens', () => {
+    const userId = '000000001111111122222222';
+    const serverName = 'test-server';
+    const identifier = `mcp:${serverName}`;
+
+    let mockFindToken: jest.MockedFunction<TokenMethods['findToken']>;
+    let mockCreateToken: jest.MockedFunction<TokenMethods['createToken']>;
+    let mockUpdateToken: jest.MockedFunction<TokenMethods['updateToken']>;
+
+    beforeEach(() => {
+      jest.clearAllMocks();
+      mockFindToken = jest.fn();
+      mockCreateToken = jest.fn().mockResolvedValue(undefined);
+      mockUpdateToken = jest.fn().mockResolvedValue(undefined);
+    });
+
+    it('should force refresh tokens even when access token is not expired', async () => {
+      const accessTokenData = {
+        userId: new Types.ObjectId(userId),
+        type: 'mcp_oauth',
+        identifier,
+        token: 'enc-access',
+        createdAt: new Date(Date.now() - 60_000),
+        expiresAt: new Date(Date.now() + 60 * 60_000), // 1 hour from now
+      } as unknown as IToken;
+
+      const refreshTokenData = {
+        userId: new Types.ObjectId(userId),
+        type: 'mcp_oauth_refresh',
+        identifier: `${identifier}:refresh`,
+        token: 'enc-refresh',
+        createdAt: new Date(Date.now() - 60_000),
+        expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60_000),
+      } as unknown as IToken;
+
+      const clientInfoData = {
+        userId: new Types.ObjectId(userId),
+        type: 'mcp_oauth_client',
+        identifier: `${identifier}:client`,
+        token: 'enc-client',
+        createdAt: new Date(Date.now() - 60_000),
+        expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60_000),
+      } as unknown as IToken;
+
+      mockFindToken.mockImplementation(async ({ type, identifier: id }) => {
+        if (type === 'mcp_oauth' && id === identifier) {
+          return accessTokenData;
+        }
+        if (type === 'mcp_oauth_refresh' && id === `${identifier}:refresh`) {
+          return refreshTokenData;
+        }
+        if (type === 'mcp_oauth_client' && id === `${identifier}:client`) {
+          return clientInfoData;
+        }
+        return null;
+      });
+
+      mockDecryptV2.mockImplementation(async (ciphertext) => {
+        if (ciphertext === 'enc-refresh') {
+          return 'refresh-token';
+        }
+        if (ciphertext === 'enc-client') {
+          return JSON.stringify({ client_id: 'client-123', client_secret: 'secret-123' });
+        }
+        if (ciphertext === 'enc-access') {
+          return 'access-token';
+        }
+        return '';
+      });
+
+      const refreshTokens = jest.fn().mockResolvedValue({
+        access_token: 'new-access-token',
+        refresh_token: 'new-refresh-token',
+        token_type: 'Bearer',
+        obtained_at: Date.now(),
+        expires_at: Date.now() + 60 * 60_000,
+      });
+
+      // Avoid exercising encryption logic inside storeTokens for this unit test.
+      const storeTokensSpy = jest
+        .spyOn(MCPTokenStorage, 'storeTokens')
+        .mockResolvedValue(undefined);
+
+      const result = await MCPTokenStorage.getTokens({
+        userId,
+        serverName,
+        findToken: mockFindToken,
+        createToken: mockCreateToken,
+        updateToken: mockUpdateToken,
+        refreshTokens,
+        forceRefresh: true,
+      });
+
+      expect(refreshTokens).toHaveBeenCalledWith(
+        'refresh-token',
+        expect.objectContaining({
+          userId,
+          serverName,
+          identifier,
+          clientInfo: expect.objectContaining({
+            client_id: 'client-123',
+          }),
+        }),
+      );
+      expect(storeTokensSpy).toHaveBeenCalled();
+      expect(result).toEqual(
+        expect.objectContaining({
+          access_token: 'new-access-token',
+          refresh_token: 'new-refresh-token',
+        }),
+      );
+
+      storeTokensSpy.mockRestore();
+    });
+  });
+  /* === VIVENTIUM END === */
+
   describe('deleteUserTokens', () => {
     const userId = '000000001111111122222222';
     const serverName = 'test-server';

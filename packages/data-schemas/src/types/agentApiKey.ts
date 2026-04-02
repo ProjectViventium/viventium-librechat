@@ -9,7 +9,6 @@ export interface IAgentApiKey extends Document {
   expiresAt?: Date;
   createdAt: Date;
   updatedAt: Date;
-  tenantId?: string;
 }
 
 export interface AgentApiKeyCreateData {

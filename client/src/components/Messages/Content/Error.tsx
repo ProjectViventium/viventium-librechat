@@ -1,9 +1,9 @@
+import { useState } from 'react';
 // file deepcode ignore HardcodedNonCryptoSecret: No hardcoded secrets
 import { ViolationTypes, ErrorTypes, alternateName } from 'librechat-data-provider';
 import type { LocalizeFunction } from '~/common';
-import { formatJSON, extractJson, isJson } from '~/utils/json';
+import { extractJson, isJson } from '~/utils/json';
 import { useLocalize } from '~/hooks';
-import CodeBlock from './CodeBlock';
 
 const localizedErrorPrefix = 'com_error';
 
@@ -36,12 +36,91 @@ type TGenericError = {
   info: string;
 };
 
+/* === VIVENTIUM START ===
+ * Feature: Out-of-credits inline CTA + modal request flow.
+ * Purpose: Give users a one-click path to request additional credits from chat errors.
+ * === VIVENTIUM END === */
+function TokenBalanceAction({ json }: { json: TTokenBalance }) {
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [feedback, setFeedback] = useState('');
+  const { balance, tokenCost, promptTokens } = json;
+
+  const submitCreditsRequest = async () => {
+    setIsSubmitting(true);
+    setFeedback('');
+    try {
+      const response = await fetch('/api/viventium/credits/request', {
+        method: 'POST',
+        credentials: 'include',
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok || body?.success === false) {
+        throw new Error(body?.message || 'Could not submit your credits request.');
+      }
+      setFeedback(body?.message || "Thank you! We've received your request and will review it shortly.");
+      setIsModalOpen(false);
+    } catch (error) {
+      setFeedback(error instanceof Error ? error.message : 'Could not submit your credits request.');
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <>
+      {`You've used all your monthly credits. Current balance: ${balance}. Prompt tokens: ${promptTokens}. Cost: ${tokenCost}.`}
+      <br />
+      <br />
+      <button
+        type="button"
+        className="rounded bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-500"
+        onClick={() => setIsModalOpen(true)}
+      >
+        Request More Credits
+      </button>
+      {feedback ? (
+        <>
+          <br />
+          <br />
+          <span>{feedback}</span>
+        </>
+      ) : null}
+      {isModalOpen ? (
+        <div className="mt-3 rounded border border-gray-300 bg-white p-3 text-black dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100">
+          <p className="mb-3 text-sm">
+            Send a request for additional credits to the Viventium team. We will review it and get
+            back to you shortly.
+          </p>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              className="rounded bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-500 disabled:opacity-70"
+              onClick={submitCreditsRequest}
+              disabled={isSubmitting}
+            >
+              {isSubmitting ? 'Submitting...' : 'Confirm Request'}
+            </button>
+            <button
+              type="button"
+              className="rounded border border-gray-400 px-3 py-2 text-sm"
+              onClick={() => setIsModalOpen(false)}
+              disabled={isSubmitting}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      ) : null}
+    </>
+  );
+}
+
 const errorMessages = {
   [ErrorTypes.MODERATION]: 'com_error_moderation',
   [ErrorTypes.NO_USER_KEY]: 'com_error_no_user_key',
   [ErrorTypes.INVALID_USER_KEY]: 'com_error_invalid_user_key',
   [ErrorTypes.NO_BASE_URL]: 'com_error_no_base_url',
-  [ErrorTypes.INVALID_BASE_URL]: 'com_error_invalid_base_url',
   [ErrorTypes.INVALID_ACTION]: `com_error_${ErrorTypes.INVALID_ACTION}`,
   [ErrorTypes.INVALID_REQUEST]: `com_error_${ErrorTypes.INVALID_REQUEST}`,
   [ErrorTypes.REFUSAL]: 'com_error_refusal',
@@ -75,7 +154,6 @@ const errorMessages = {
     return info;
   },
   [ErrorTypes.GOOGLE_TOOL_CONFLICT]: 'com_error_google_tool_conflict',
-  [ErrorTypes.STREAM_EXPIRED]: 'com_error_stream_expired',
   [ViolationTypes.BAN]:
     'Your account has been temporarily banned due to violations of our service.',
   [ViolationTypes.ILLEGAL_MODEL_REQUEST]: (json: TGenericError, localize: LocalizeFunction) => {
@@ -100,28 +178,7 @@ const errorMessages = {
       windowInMinutes > 1 ? `${windowInMinutes} minutes` : 'minute'
     }.`;
   },
-  token_balance: (json: TTokenBalance) => {
-    const { balance, tokenCost, promptTokens, generations } = json;
-    const message = `Insufficient Funds! Balance: ${balance}. Prompt tokens: ${promptTokens}. Cost: ${tokenCost}.`;
-    return (
-      <>
-        {message}
-        {generations && (
-          <>
-            <br />
-            <br />
-          </>
-        )}
-        {generations && (
-          <CodeBlock
-            lang="Generations"
-            error={true}
-            codeChildren={formatJSON(JSON.stringify(generations))}
-          />
-        )}
-      </>
-    );
-  },
+  token_balance: (json: TTokenBalance) => <TokenBalanceAction json={json} />,
 };
 
 const Error = ({ text }: { text: string }) => {

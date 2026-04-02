@@ -22,9 +22,8 @@ jest.mock('winston', () => ({
 }));
 
 // Mock the Tokenizer
-jest.mock('~/utils/tokenizer', () => ({
-  __esModule: true,
-  default: {
+jest.mock('~/utils', () => ({
+  Tokenizer: {
     getTokenCount: jest.fn((text: string) => text.length), // Simple mock: 1 char = 1 token
   },
 }));
@@ -53,7 +52,6 @@ describe('createMemoryTool', () => {
     mockSetMemory = jest.fn().mockResolvedValue({ ok: true });
   });
 
-  // Memory overflow tests
   describe('overflow handling', () => {
     it('should return error artifact when memory is already overflowing', async () => {
       const tool = createMemoryTool({
@@ -66,7 +64,7 @@ describe('createMemoryTool', () => {
       // Call the underlying function directly since invoke() doesn't handle responseFormat in tests
       const result = await tool.func({ key: 'test', value: 'new memory' });
       expect(result).toHaveLength(2);
-      expect(result[0]).toBe('Memory storage exceeded. Cannot save new memories.');
+      expect(result[0]).toBe('Memory storage exceeded. Reduce existing memory before adding more.');
 
       const artifacts = result[1] as Record<Tools.memory, MemoryArtifact>;
       expect(artifacts[Tools.memory]).toBeDefined();
@@ -74,12 +72,14 @@ describe('createMemoryTool', () => {
       expect(artifacts[Tools.memory].key).toBe('system');
 
       const errorData = JSON.parse(artifacts[Tools.memory].value as string);
-      expect(errorData).toEqual({
-        errorType: 'already_exceeded',
-        tokenCount: 50,
-        totalTokens: 150,
-        tokenLimit: 100,
-      });
+      expect(errorData).toEqual(
+        expect.objectContaining({
+          errorType: 'already_exceeded',
+          totalTokens: 150,
+          tokenLimit: 100,
+          projectedTotalTokens: 160,
+        }),
+      );
 
       expect(mockSetMemory).not.toHaveBeenCalled();
     });
@@ -95,7 +95,7 @@ describe('createMemoryTool', () => {
       // This would put us at 101 tokens total, exceeding the limit
       const result = await tool.func({ key: 'test', value: 'This is a 20 char str' });
       expect(result).toHaveLength(2);
-      expect(result[0]).toBe('Memory storage would exceed limit. Cannot save this memory.');
+      expect(result[0]).toBe('Memory storage would exceed the configured token limit.');
 
       const artifacts = result[1] as Record<Tools.memory, MemoryArtifact>;
       expect(artifacts[Tools.memory]).toBeDefined();
@@ -103,12 +103,15 @@ describe('createMemoryTool', () => {
       expect(artifacts[Tools.memory].key).toBe('system');
 
       const errorData = JSON.parse(artifacts[Tools.memory].value as string);
-      expect(errorData).toEqual({
-        errorType: 'would_exceed',
-        tokenCount: 1, // Math.abs(-1)
-        totalTokens: 101,
-        tokenLimit: 100,
-      });
+      expect(errorData).toEqual(
+        expect.objectContaining({
+          errorType: 'would_exceed',
+          totalTokens: 80,
+          tokenLimit: 100,
+          projectedTotalTokens: 101,
+          tokenDelta: 21,
+        }),
+      );
 
       expect(mockSetMemory).not.toHaveBeenCalled();
     });
@@ -138,10 +141,233 @@ describe('createMemoryTool', () => {
         tokenCount: 12,
       });
     });
+
+    it('should include the backend error message for per-key budget violations', async () => {
+      const tool = createMemoryTool({
+        userId: 'test-user',
+        setMemory: mockSetMemory,
+        keyLimits: { drafts: 10 },
+        memoryTokenMap: { drafts: 9 },
+        totalTokens: 9,
+      });
+
+      const result = await tool.func({ key: 'drafts', value: 'this update is longer' });
+      expect(result).toHaveLength(2);
+      expect(result[0]).toBe('Memory key "drafts" would exceed its 10-token budget.');
+
+      const artifacts = result[1] as Record<Tools.memory, MemoryArtifact>;
+      const errorData = JSON.parse(artifacts[Tools.memory].value as string);
+      expect(errorData).toEqual(
+        expect.objectContaining({
+          errorType: 'key_limit_exceeded',
+          key: 'drafts',
+          keyLimit: 10,
+          message: 'Memory key "drafts" would exceed its 10-token budget.',
+        }),
+      );
+
+      expect(mockSetMemory).not.toHaveBeenCalled();
+    });
+
+    it('compacts world writes before returning a per-key budget error', async () => {
+      const tool = createMemoryTool({
+        userId: 'test-user',
+        setMemory: mockSetMemory,
+        keyLimits: { world: 220 },
+        memoryTokenMap: { world: 190 },
+        totalTokens: 190,
+      });
+
+      const worldValue = [
+        'Partner: Sam. Met May 25 2022. Recently requested a birthday gift.',
+        'Ventures:',
+        '- Project Atlas: Decision intelligence for regulated enterprises. prod live. pending DNS/Gemini. Robin call Thu 3PM ET.',
+        'Key people: Morgan (co-founder), Taylor (outreach stalled)',
+      ].join('\n');
+
+      const result = await tool.func({ key: 'world', value: worldValue });
+      expect(result).toHaveLength(2);
+      expect(result[0]).toContain('Memory set for key "world"');
+
+      expect(mockSetMemory).toHaveBeenCalledWith(
+        expect.objectContaining({
+          userId: 'test-user',
+          key: 'world',
+        }),
+      );
+      const savedValue = mockSetMemory.mock.calls[0][0].value;
+      expect(savedValue).toContain('Met May 25 2022');
+      expect(savedValue).not.toContain('birthday gift');
+      expect(savedValue).not.toContain('pending DNS');
+      expect(savedValue).not.toContain('@');
+    });
   });
 
-  // Basic functionality tests
+  /* === VIVENTIUM START ===
+   * Fix: Tests for overwrite-aware tokenLimit enforcement (delta-based).
+   * Added: 2026-02-09
+   * === VIVENTIUM END === */
+  describe('overwrite delta handling', () => {
+    it('should allow overwriting a key with fewer tokens (net-negative delta)', async () => {
+      const tool = createMemoryTool({
+        userId: 'test-user',
+        setMemory: mockSetMemory,
+        tokenLimit: 100,
+        totalTokens: 90,
+        memoryTokenMap: { context: 50, working: 40 },
+      });
+
+      const smaller = 'x'.repeat(40); // delta = 40 - 50 = -10
+      const result = await tool.func({ key: 'context', value: smaller });
+      expect(result).toHaveLength(2);
+      expect(result[0]).toBe('Memory set for key "context" (40 tokens)');
+
+      const artifacts = result[1] as Record<Tools.memory, MemoryArtifact>;
+      expect(artifacts[Tools.memory]).toBeDefined();
+      expect(artifacts[Tools.memory].type).toBe('update');
+      expect(artifacts[Tools.memory].key).toBe('context');
+
+      expect(mockSetMemory).toHaveBeenCalledWith({
+        userId: 'test-user',
+        key: 'context',
+        value: smaller,
+        tokenCount: 40,
+      });
+    });
+
+    it('should block overwriting a key only when the net delta would exceed the limit', async () => {
+      const tool = createMemoryTool({
+        userId: 'test-user',
+        setMemory: mockSetMemory,
+        tokenLimit: 100,
+        totalTokens: 90,
+        memoryTokenMap: { context: 50, working: 40 },
+      });
+
+      const bigger = 'x'.repeat(65); // delta = 65 - 50 = +15 => projected total 105
+      const result = await tool.func({ key: 'context', value: bigger });
+      expect(result).toHaveLength(2);
+      expect(result[0]).toBe('Memory storage would exceed the configured token limit.');
+
+      const artifacts = result[1] as Record<Tools.memory, MemoryArtifact>;
+      expect(artifacts[Tools.memory]).toBeDefined();
+      expect(artifacts[Tools.memory].type).toBe('error');
+      expect(artifacts[Tools.memory].key).toBe('system');
+
+      const errorData = JSON.parse(artifacts[Tools.memory].value as string);
+      expect(errorData).toEqual(
+        expect.objectContaining({
+          errorType: 'would_exceed',
+          totalTokens: 90,
+          tokenLimit: 100,
+          projectedTotalTokens: 105,
+          tokenDelta: 15,
+        }),
+      );
+
+      expect(mockSetMemory).not.toHaveBeenCalled();
+    });
+
+    it('should track running total across consecutive overwrites in the same run', async () => {
+      const tool = createMemoryTool({
+        userId: 'test-user',
+        setMemory: mockSetMemory,
+        tokenLimit: 100,
+        totalTokens: 90,
+        memoryTokenMap: { context: 50, working: 40 },
+      });
+
+      const result1 = await tool.func({ key: 'context', value: 'x'.repeat(40) }); // total 80
+      expect(result1[0]).toBe('Memory set for key "context" (40 tokens)');
+
+      const result2 = await tool.func({ key: 'working', value: 'x'.repeat(60) }); // total 100
+      expect(result2[0]).toBe('Memory set for key "working" (60 tokens)');
+
+      expect(mockSetMemory).toHaveBeenCalledTimes(2);
+    });
+
+    it('should allow self-healing overwrites when already over limit (delta <= 0)', async () => {
+      const tool = createMemoryTool({
+        userId: 'test-user',
+        setMemory: mockSetMemory,
+        tokenLimit: 100,
+        totalTokens: 110, // Already over limit
+        memoryTokenMap: { context: 60, working: 50 },
+      });
+
+      const smaller = 'x'.repeat(30); // delta = 30 - 60 = -30
+      const result = await tool.func({ key: 'context', value: smaller });
+      expect(result).toHaveLength(2);
+      expect(result[0]).toBe('Memory set for key "context" (30 tokens)');
+
+      expect(mockSetMemory).toHaveBeenCalledWith({
+        userId: 'test-user',
+        key: 'context',
+        value: smaller,
+        tokenCount: 30,
+      });
+    });
+  });
+
   describe('basic functionality', () => {
+    it('should reject operational residue instead of storing it', async () => {
+      const tool = createMemoryTool({
+        userId: 'test-user',
+        setMemory: mockSetMemory,
+      });
+
+      const result = await tool.func({
+        key: 'me',
+        value: 'Wake loop {NTA} with tool auth errors and schedule_list user_id missing',
+      });
+      expect(result).toHaveLength(2);
+      expect(result[0]).toBe(
+        'Memory value contains scheduler or tool operational residue. Store the durable user fact or project state instead.',
+      );
+
+      const artifacts = result[1] as Record<Tools.memory, MemoryArtifact>;
+      expect(artifacts[Tools.memory].type).toBe('error');
+      expect(mockSetMemory).not.toHaveBeenCalled();
+    });
+
+    it('should reject writes that exceed a per-key budget', async () => {
+      const tool = createMemoryTool({
+        userId: 'test-user',
+        setMemory: mockSetMemory,
+        keyLimits: { drafts: 10 },
+      });
+
+      const result = await tool.func({
+        key: 'drafts',
+        value: '01234567890',
+      });
+      expect(result).toHaveLength(2);
+      expect(result[0]).toBe('Memory key "drafts" would exceed its 10-token budget.');
+      expect(mockSetMemory).not.toHaveBeenCalled();
+    });
+
+    it('should allow a self-healing overwrite for an over-budget key', async () => {
+      const tool = createMemoryTool({
+        userId: 'test-user',
+        setMemory: mockSetMemory,
+        keyLimits: { drafts: 10 },
+        totalTokens: 18,
+        memoryTokenMap: { drafts: 18 },
+      });
+
+      const result = await tool.func({
+        key: 'drafts',
+        value: '012345678',
+      });
+      expect(result[0]).toBe('Memory set for key "drafts" (9 tokens)');
+      expect(mockSetMemory).toHaveBeenCalledWith({
+        userId: 'test-user',
+        key: 'drafts',
+        value: '012345678',
+        tokenCount: 9,
+      });
+    });
+
     it('should validate keys when validKeys is provided', async () => {
       const tool = createMemoryTool({
         userId: 'test-user',
@@ -152,7 +378,8 @@ describe('createMemoryTool', () => {
       const result = await tool.func({ key: 'invalid', value: 'some value' });
       expect(result).toHaveLength(2);
       expect(result[0]).toBe('Invalid key "invalid". Must be one of: allowed, keys');
-      expect(result[1]).toBeUndefined();
+      const artifacts = result[1] as Record<Tools.memory, MemoryArtifact>;
+      expect(artifacts[Tools.memory].type).toBe('error');
       expect(mockSetMemory).not.toHaveBeenCalled();
     });
 

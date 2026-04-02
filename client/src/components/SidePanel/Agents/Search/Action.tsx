@@ -83,7 +83,7 @@ export default function Action({
             id="web-search-label"
             htmlFor="web-search-checkbox"
             className={cn(
-              'form-check-label text-token-text-primary text-sm',
+              'form-check-label text-token-text-primary',
               (webSearchIsEnabled || isToolAuthenticated) && 'cursor-pointer',
             )}
           >

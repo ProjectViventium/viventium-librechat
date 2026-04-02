@@ -6,6 +6,9 @@ const { isEnabled, FlowStateManager } = require('@librechat/api');
 const { getLogStores } = require('~/cache');
 const { batchResetMeiliFlags } = require('./utils');
 
+const Conversation = mongoose.models.Conversation;
+const Message = mongoose.models.Message;
+
 const searchEnabled = isEnabled(process.env.SEARCH);
 const indexingDisabled = isEnabled(process.env.MEILI_NO_SYNC);
 let currentTimeout = null;
@@ -197,14 +200,6 @@ async function performSync(flowManager, flowId, flowType) {
       return { messagesSync: false, convosSync: false };
     }
 
-    const Message = mongoose.models.Message;
-    const Conversation = mongoose.models.Conversation;
-    if (!Message || !Conversation) {
-      throw new Error(
-        '[indexSync] Models not registered. Ensure createModels() has been called before indexSync.',
-      );
-    }
-
     const client = MeiliSearchClient.getInstance();
 
     const { status } = await client.health();
@@ -230,10 +225,77 @@ async function performSync(flowManager, flowId, flowType) {
       await batchResetMeiliFlags(Conversation.collection);
     }
 
+    const ensureIndexParity = async ({ messageProgress, convoProgress }) => {
+      let parityReset = false;
+
+      const checks = [
+        { indexName: 'messages', label: 'Messages', progress: messageProgress, model: Message },
+        {
+          indexName: 'convos',
+          label: 'Conversations',
+          progress: convoProgress,
+          model: Conversation,
+        },
+      ];
+
+      for (const check of checks) {
+        try {
+          const stats = await client.index(check.indexName).getStats();
+          const meiliDocuments = stats?.numberOfDocuments ?? 0;
+          const mongoFlags = check.progress.totalProcessed;
+
+          /* === VIVENTIUM START ===
+           * Feature: Meili parity self-healing.
+           * Purpose: Partial Meili data loss can leave Mongo `_meiliIndex=true`
+           * while Meili is missing a subset of documents. Treat any Meili
+           * deficit as stale sync state so the next sync fully repairs the index.
+           * === VIVENTIUM END === */
+          if (meiliDocuments < mongoFlags) {
+            if (meiliDocuments === 0) {
+              logger.info(
+                `[indexSync] ${check.label} index is empty while Mongo has ${mongoFlags} indexed flags. Resetting sync flags...`,
+              );
+            } else {
+              logger.info(
+                `[indexSync] ${check.label} index is missing ${mongoFlags - meiliDocuments} documents (${meiliDocuments} in Meili vs ${mongoFlags} indexed in Mongo). Resetting sync flags...`,
+              );
+            }
+            await batchResetMeiliFlags(check.model.collection);
+            parityReset = true;
+          }
+        } catch (error) {
+          if (error.code !== 'index_not_found') {
+            logger.warn(
+              `[indexSync] Could not verify ${check.indexName} index parity: ${error.message}`,
+            );
+          }
+        }
+      }
+
+      if (parityReset) {
+        logger.info('[indexSync] Index parity reset complete. Full re-sync will be triggered.');
+      }
+
+      return parityReset;
+    };
+
     // Check if we need to sync messages
     logger.info('[indexSync] Requesting message sync progress...');
-    const messageProgress = await Message.getSyncProgress();
-    if (!messageProgress.isComplete || settingsUpdated) {
+    let messageProgress = await Message.getSyncProgress();
+    let convoProgress = await Conversation.getSyncProgress();
+    let parityReset = false;
+
+    if (!settingsUpdated) {
+      parityReset = await ensureIndexParity({ messageProgress, convoProgress });
+      if (parityReset) {
+        messageProgress = await Message.getSyncProgress();
+        convoProgress = await Conversation.getSyncProgress();
+      }
+    }
+
+    const forceFullResync = settingsUpdated || parityReset;
+
+    if (!messageProgress.isComplete || forceFullResync) {
       logger.info(
         `[indexSync] Messages need syncing: ${messageProgress.totalProcessed}/${messageProgress.totalDocuments} indexed`,
       );
@@ -241,12 +303,8 @@ async function performSync(flowManager, flowId, flowType) {
       const messageCount = messageProgress.totalDocuments;
       const messagesIndexed = messageProgress.totalProcessed;
       const unindexedMessages = messageCount - messagesIndexed;
-      const noneIndexed = messagesIndexed === 0 && unindexedMessages > 0;
 
-      if (settingsUpdated || noneIndexed || unindexedMessages > syncThreshold) {
-        if (noneIndexed && !settingsUpdated) {
-          logger.info('[indexSync] No messages marked as indexed, forcing full sync');
-        }
+      if (forceFullResync || unindexedMessages > syncThreshold) {
         logger.info(`[indexSync] Starting message sync (${unindexedMessages} unindexed)`);
         await Message.syncWithMeili();
         messagesSync = true;
@@ -262,21 +320,16 @@ async function performSync(flowManager, flowId, flowType) {
     }
 
     // Check if we need to sync conversations
-    const convoProgress = await Conversation.getSyncProgress();
-    if (!convoProgress.isComplete || settingsUpdated) {
+    if (!convoProgress.isComplete || forceFullResync) {
       logger.info(
         `[indexSync] Conversations need syncing: ${convoProgress.totalProcessed}/${convoProgress.totalDocuments} indexed`,
       );
 
       const convoCount = convoProgress.totalDocuments;
       const convosIndexed = convoProgress.totalProcessed;
-      const unindexedConvos = convoCount - convosIndexed;
-      const noneConvosIndexed = convosIndexed === 0 && unindexedConvos > 0;
 
-      if (settingsUpdated || noneConvosIndexed || unindexedConvos > syncThreshold) {
-        if (noneConvosIndexed && !settingsUpdated) {
-          logger.info('[indexSync] No conversations marked as indexed, forcing full sync');
-        }
+      const unindexedConvos = convoCount - convosIndexed;
+      if (forceFullResync || unindexedConvos > syncThreshold) {
         logger.info(`[indexSync] Starting convos sync (${unindexedConvos} unindexed)`);
         await Conversation.syncWithMeili();
         convosSync = true;
@@ -354,13 +407,6 @@ async function indexSync() {
       logger.debug('[indexSync] Creating indices...');
       currentTimeout = setTimeout(async () => {
         try {
-          const Message = mongoose.models.Message;
-          const Conversation = mongoose.models.Conversation;
-          if (!Message || !Conversation) {
-            throw new Error(
-              '[indexSync] Models not registered. Ensure createModels() has been called before indexSync.',
-            );
-          }
           await Message.syncWithMeili();
           await Conversation.syncWithMeili();
         } catch (err) {

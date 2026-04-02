@@ -7,6 +7,17 @@ data/
 logs
 *.log
 
+# VIVENTIUM START
+# Purpose: Ignore local runtime artifacts and debug outputs in the private fork.
+# Details: docs/requirements_and_learnings/05_Open_Source_Modifications.md#librechat-ignore-runtime
+data-node-dual/
+logs-direct/
+logs-foundry/
+.tmp_probe.json
+tmp/
+.viventium/artifacts/agents-sync/
+# VIVENTIUM END
+
 # Runtime data
 pids
 *.pid
@@ -63,7 +74,6 @@ bower_components/
 .clineignore
 .cursor
 .aider*
-.bg-shell/
 
 # Floobits
 .floo
@@ -99,6 +109,7 @@ monospace.json
 *.pem
 config.local.ts
 **/storageState.json
+**/__pycache__/
 junit.xml
 **/.venv/
 **/venv/
@@ -130,7 +141,6 @@ helm/**/charts/
 helm/**/.values.yaml
 
 !/client/src/@types/i18next.d.ts
-!/client/src/@types/react.d.ts
 
 # SAML Idp cert
 *.cert
@@ -145,6 +155,7 @@ helm/**/.values.yaml
 /.codeium
 *.local.md
 
+
 # Removed Windows wrapper files per user request
 hive-mind-prompt-*.txt
 
@@ -156,15 +167,15 @@ claude-flow.config.json
 .hive-mind/
 .claude-flow/
 /memory/
-/coordination/
-/memory/claude-flow-data.json
-/memory/sessions/*
-!/memory/sessions/README.md
-/memory/agents/*
-!/memory/agents/README.md
-/coordination/memory_bank/*
-/coordination/subtasks/*
-/coordination/orchestration/*
+coordination/
+memory/claude-flow-data.json
+memory/sessions/*
+!memory/sessions/README.md
+memory/agents/*
+!memory/agents/README.md
+coordination/memory_bank/*
+coordination/subtasks/*
+coordination/orchestration/*
 *.db
 *.db-journal
 *.db-wal
@@ -172,8 +183,16 @@ claude-flow.config.json
 *.sqlite-journal
 *.sqlite-wal
 claude-flow
-.playwright-mcp/*
 # Removed Windows wrapper files per user request
 hive-mind-prompt-*.txt
-CLAUDE.md
-.gsd
+
+# Viventium public-release hardening
+        .env
+        .env.*
+        !.env.example
+        node_modules/
+        .venv*/
+        __pycache__/
+        .local_artifacts/
+        tmp/
+        backups/

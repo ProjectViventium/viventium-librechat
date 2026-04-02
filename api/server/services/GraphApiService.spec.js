@@ -33,20 +33,38 @@ const getLogStores = require('~/cache/getLogStores');
 const GraphApiService = require('./GraphApiService');
 
 describe('GraphApiService', () => {
+  /* === VIVENTIUM START ===
+   * Feature: Test stability (mongodb-memory-server cold start)
+   * Purpose: Full-suite runs can exceed the default MongoMemoryServer launch timeout and
+   * leave teardown trying to stop an undefined instance.
+   * Added: 2026-03-08
+   */
+  jest.setTimeout(120_000);
+  /* === VIVENTIUM END === */
+
   let mongoServer;
   let mockGraphClient;
   let mockTokensCache;
   let mockOpenIdConfig;
 
   beforeAll(async () => {
-    mongoServer = await MongoMemoryServer.create();
+    mongoServer = await MongoMemoryServer.create({
+      instance: {
+        launchTimeout: 45_000,
+      },
+    });
     const mongoUri = mongoServer.getUri();
     await mongoose.connect(mongoUri);
   });
 
   afterAll(async () => {
-    await mongoose.disconnect();
-    await mongoServer.stop();
+    try {
+      await mongoose.disconnect();
+    } finally {
+      if (mongoServer) {
+        await mongoServer.stop();
+      }
+    }
   });
 
   afterEach(() => {

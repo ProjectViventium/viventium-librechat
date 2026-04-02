@@ -2,7 +2,7 @@ import { Types } from 'mongoose';
 import { Run, Providers } from '@librechat/agents';
 import type { IUser } from '@librechat/data-schemas';
 import type { Response } from 'express';
-import { processMemory } from './memory';
+import { createMemoryProcessor, loadMemorySnapshot, processMemory } from './memory';
 
 jest.mock('~/stream/GenerationJobManager');
 
@@ -536,5 +536,69 @@ describe('Memory Agent Header Resolution', () => {
     const runConfig = (Run.create as jest.Mock).mock.calls[0][0];
 
     expect(runConfig.graphConfig.llmConfig.temperature).toBe(0.7);
+  });
+});
+
+describe('Memory snapshot loading', () => {
+  it('loads stored memory without requiring a writer agent', async () => {
+    const methods = {
+      setMemory: jest.fn().mockResolvedValue({ ok: true }),
+      deleteMemory: jest.fn(),
+      getAllUserMemories: jest.fn().mockResolvedValue([]),
+      getFormattedMemories: jest.fn().mockResolvedValue({
+        withKeys: 'with keys',
+        withoutKeys: 'without keys',
+        totalTokens: 42,
+        memoryTokenMap: { core: 42 },
+      }),
+    };
+
+    const snapshot = await loadMemorySnapshot({
+      userId: 'user-123',
+      memoryMethods: methods,
+      config: { validKeys: ['core'] },
+    });
+
+    expect(snapshot).toEqual({
+      withKeys: 'with keys',
+      withoutKeys: 'without keys',
+      totalTokens: 42,
+      memoryTokenMap: { core: 42 },
+    });
+    expect(methods.getFormattedMemories).toHaveBeenCalledWith({ userId: 'user-123' });
+  });
+
+  it('reuses a preloaded snapshot when creating the memory processor', async () => {
+    const methods = {
+      setMemory: jest.fn().mockResolvedValue({ ok: true }),
+      deleteMemory: jest.fn(),
+      getAllUserMemories: jest.fn().mockResolvedValue([]),
+      getFormattedMemories: jest.fn(),
+    };
+
+    const snapshot = {
+      withKeys: 'with keys',
+      withoutKeys: 'without keys',
+      totalTokens: 42,
+      memoryTokenMap: { core: 42 },
+    };
+
+    const [withoutKeys] = await createMemoryProcessor({
+      res: {
+        write: jest.fn(),
+        end: jest.fn(),
+        headersSent: false,
+      } as unknown as Response,
+      userId: 'user-123',
+      messageId: 'msg-123',
+      conversationId: 'conv-123',
+      memoryMethods: methods,
+      config: { validKeys: ['core'] },
+      snapshot,
+      user: createTestUser(),
+    });
+
+    expect(withoutKeys).toBe('without keys');
+    expect(methods.getFormattedMemories).not.toHaveBeenCalled();
   });
 });

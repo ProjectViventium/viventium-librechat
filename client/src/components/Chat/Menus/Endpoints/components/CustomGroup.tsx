@@ -1,9 +1,11 @@
 import React from 'react';
 import type { TModelSpec } from 'librechat-data-provider';
+import type { Endpoint } from '~/common';
 import { CustomMenu as Menu } from '../CustomMenu';
 import { ModelSpecItem } from './ModelSpecItem';
 import { useModelSelectorContext } from '../ModelSelectorContext';
 import GroupIcon from './GroupIcon';
+import { isSpecMappedToAnyEndpoint } from './modelSpecGrouping';
 
 interface CustomGroupProps {
   groupName: string;
@@ -44,18 +46,18 @@ export function CustomGroup({ groupName, specs, groupIcon }: CustomGroupProps) {
   );
 }
 
-export function renderCustomGroups(
-  modelSpecs: TModelSpec[],
-  mappedEndpoints: Array<{ value: string }>,
-) {
-  // Get all endpoint values to exclude them from custom groups
-  const endpointValues = new Set(mappedEndpoints.map((ep) => ep.value));
+export function renderCustomGroups(modelSpecs: TModelSpec[], mappedEndpoints: Endpoint[]) {
+  const mappedEndpointValues = new Set(mappedEndpoints.map((endpoint) => endpoint.value));
 
-  // Group specs by their group field (excluding endpoint-matched groups and ungrouped)
+  // Group specs by their group field (excluding endpoint-mapped groups and ungrouped).
   // Also track the groupIcon for each group (first spec with groupIcon wins)
   const customGroups = modelSpecs.reduce(
     (acc, spec) => {
-      if (!spec.group || endpointValues.has(spec.group)) {
+      if (spec.preset?.endpoint && !mappedEndpointValues.has(spec.preset.endpoint)) {
+        return acc;
+      }
+
+      if (!spec.group || isSpecMappedToAnyEndpoint(spec, mappedEndpoints)) {
         return acc;
       }
       if (!acc[spec.group]) {

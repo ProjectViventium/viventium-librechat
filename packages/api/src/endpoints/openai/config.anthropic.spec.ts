@@ -838,7 +838,7 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
       });
 
       it('should handle Claude 3.7 with defaultParams and thinking disabled', () => {
-        const apiKey = 'sk-37-defaults';
+        const apiKey = 'anthropic-test-key';
         const result = getOpenAIConfig(apiKey, {
           modelOptions: {
             model: 'claude-3.7-sonnet-20241022',

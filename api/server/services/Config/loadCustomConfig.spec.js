@@ -70,6 +70,12 @@ describe('loadCustomConfig', () => {
       throw new Error(`process.exit called with "${code}"`);
     });
     delete process.env.CONFIG_PATH;
+    delete process.env.MS365_MCP_SERVER_URL;
+    delete process.env.MS365_MCP_AUTH_URL;
+    delete process.env.MS365_MCP_TOKEN_URL;
+    delete process.env.GOOGLE_WORKSPACE_MCP_URL;
+    delete process.env.GOOGLE_WORKSPACE_MCP_AUTH_URL;
+    delete process.env.GOOGLE_WORKSPACE_MCP_TOKEN_URL;
   });
 
   it('should return null and log error if remote config fetch fails', async () => {
@@ -106,6 +112,54 @@ describe('loadCustomConfig', () => {
     const result = await loadCustomConfig();
 
     expect(result).toEqual(mockConfig);
+  });
+
+  it('should interpolate env placeholders before validating MCP OAuth URLs', async () => {
+    const mockConfig = {
+      version: '1.0',
+      cache: true,
+      mcpServers: {
+        'ms-365': {
+          type: 'streamable-http',
+          url: '${MS365_MCP_SERVER_URL}',
+          requiresOAuth: true,
+          oauth: {
+            authorization_url: '${MS365_MCP_AUTH_URL}',
+            token_url: '${MS365_MCP_TOKEN_URL}',
+            redirect_uri: 'http://localhost:3180/api/mcp/ms-365/oauth/callback',
+            scope: 'Mail.Read',
+          },
+        },
+        google_workspace: {
+          type: 'streamable-http',
+          url: '${GOOGLE_WORKSPACE_MCP_URL}',
+          requiresOAuth: true,
+          oauth: {
+            authorization_url: '${GOOGLE_WORKSPACE_MCP_AUTH_URL}',
+            token_url: '${GOOGLE_WORKSPACE_MCP_TOKEN_URL}',
+            redirect_uri: 'http://localhost:3180/api/mcp/google_workspace/oauth/callback',
+            scope: 'openid email profile',
+          },
+        },
+      },
+    };
+    process.env.CONFIG_PATH = 'validConfig.yaml';
+    process.env.MS365_MCP_SERVER_URL = 'http://localhost:6274/mcp';
+    process.env.MS365_MCP_AUTH_URL = 'http://localhost:6274/authorize';
+    process.env.MS365_MCP_TOKEN_URL = 'http://localhost:6274/token';
+    process.env.GOOGLE_WORKSPACE_MCP_URL = 'http://localhost:8111/mcp';
+    process.env.GOOGLE_WORKSPACE_MCP_AUTH_URL = 'http://localhost:8111/authorize';
+    process.env.GOOGLE_WORKSPACE_MCP_TOKEN_URL = 'http://localhost:8111/token';
+    loadYaml.mockReturnValueOnce(mockConfig);
+
+    const result = await loadCustomConfig(false);
+
+    expect(result?.mcpServers?.['ms-365']?.oauth?.authorization_url).toBe(
+      'http://localhost:6274/authorize',
+    );
+    expect(result?.mcpServers?.google_workspace?.oauth?.token_url).toBe(
+      'http://localhost:8111/token',
+    );
   });
 
   it('should return null and log if config schema validation fails', async () => {

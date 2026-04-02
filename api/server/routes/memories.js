@@ -1,15 +1,30 @@
 const express = require('express');
-const { Tokenizer, generateCheckAccess } = require('@librechat/api');
+const {
+  evaluateMemoryWrite,
+  generateCheckAccess,
+  prepareMemoryValueForWrite,
+  runMemoryMaintenance,
+} = require('@librechat/api');
 const { PermissionTypes, Permissions } = require('librechat-data-provider');
 const {
   getAllUserMemories,
   toggleUserMemories,
-  getRoleByName,
+  updateUserPersonalization,
   createMemory,
   deleteMemory,
   setMemory,
 } = require('~/models');
 const { requireJwtAuth, configMiddleware } = require('~/server/middleware');
+const { getRoleByName } = require('~/models/Role');
+/* === VIVENTIUM START ===
+ * Feature: Conversation Recall RAG refresh on personalization changes
+ * Added: 2026-02-19
+ */
+const {
+  scheduleConversationRecallRefresh,
+} = require('~/server/services/viventium/conversationRecallService');
+const { resolveMemoryTokenLimit } = require('~/server/services/viventium/memoryTokenLimit');
+/* === VIVENTIUM END === */
 
 const router = express.Router();
 
@@ -43,6 +58,31 @@ const checkMemoryOptOut = generateCheckAccess({
 
 router.use(requireJwtAuth);
 
+function getMemoryPolicy(config) {
+  const memoryConfig = config?.memory ?? {};
+  return {
+    validKeys: memoryConfig.validKeys,
+    tokenLimit: resolveMemoryTokenLimit(memoryConfig.tokenLimit),
+    keyLimits: memoryConfig.keyLimits,
+    maintenanceThresholdPercent: memoryConfig.maintenanceThresholdPercent,
+  };
+}
+
+async function runRouteMemoryMaintenance({ userId, policy }) {
+  await runMemoryMaintenance({
+    userId: String(userId),
+    getAllUserMemories: async (resolvedUserId) => getAllUserMemories(resolvedUserId),
+    setMemory: async ({ userId: maintenanceUserId, key, value, tokenCount }) =>
+      setMemory({
+        userId: maintenanceUserId,
+        key,
+        value,
+        tokenCount,
+      }),
+    policy,
+  });
+}
+
 /**
  * GET /memories
  * Returns all memories for the authenticated user, sorted by updated_at (newest first).
@@ -62,7 +102,7 @@ router.get('/', checkMemoryRead, configMiddleware, async (req, res) => {
 
     const appConfig = req.config;
     const memoryConfig = appConfig?.memory;
-    const tokenLimit = memoryConfig?.tokenLimit;
+    const tokenLimit = resolveMemoryTokenLimit(memoryConfig?.tokenLimit);
     const charLimit = memoryConfig?.charLimit || 10000;
 
     let usagePercentage = null;
@@ -116,36 +156,48 @@ router.post('/', memoryPayloadLimit, checkMemoryCreate, configMiddleware, async 
   }
 
   try {
-    const tokenCount = Tokenizer.getTokenCount(value, 'o200k_base');
-
     const memories = await getAllUserMemories(req.user.id);
-
-    const appConfig = req.config;
-    const memoryConfig = appConfig?.memory;
-    const tokenLimit = memoryConfig?.tokenLimit;
-
-    if (tokenLimit) {
-      const currentTotalTokens = memories.reduce(
-        (sum, memory) => sum + (memory.tokenCount || 0),
-        0,
-      );
-      if (currentTotalTokens + tokenCount > tokenLimit) {
-        return res.status(400).json({
-          error: `Adding this memory would exceed the token limit of ${tokenLimit}. Current usage: ${currentTotalTokens} tokens.`,
-        });
-      }
+    const memoryPolicy = getMemoryPolicy(req.config);
+    const preparedValue = prepareMemoryValueForWrite({
+      key: key.trim(),
+      value: value.trim(),
+      keyLimits: memoryPolicy.keyLimits,
+    });
+    const nextValue = preparedValue.value;
+    const tokenCount = preparedValue.tokenCount;
+    const currentTotalTokens = memories.reduce((sum, memory) => sum + (memory.tokenCount || 0), 0);
+    const evaluation = evaluateMemoryWrite({
+      key: key.trim(),
+      value: nextValue,
+      tokenCount,
+      validKeys: memoryPolicy.validKeys,
+      tokenLimit: memoryPolicy.tokenLimit,
+      keyLimits: memoryPolicy.keyLimits,
+      baselineTotalTokens: currentTotalTokens,
+      previousTokenCount: 0,
+    });
+    if (!evaluation.ok) {
+      return res.status(400).json({
+        error: evaluation.message,
+        details: evaluation.details,
+      });
     }
 
     const result = await createMemory({
       userId: req.user.id,
       key: key.trim(),
-      value: value.trim(),
+      value: nextValue,
       tokenCount,
     });
 
     if (!result.ok) {
       return res.status(500).json({ error: 'Failed to create memory.' });
     }
+
+    await runRouteMemoryMaintenance({
+      userId: req.user.id,
+      policy: memoryPolicy,
+    });
 
     const updatedMemories = await getAllUserMemories(req.user.id);
     const newMemory = updatedMemories.find((m) => m.key === key.trim());
@@ -162,27 +214,45 @@ router.post('/', memoryPayloadLimit, checkMemoryCreate, configMiddleware, async 
 /**
  * PATCH /memories/preferences
  * Updates the user's memory preferences (e.g., enabling/disabling memories).
- * Body: { memories: boolean }
- * Returns 200 and { updated: true, preferences: { memories: boolean } } when successful.
+ * Body: { memories?: boolean, conversation_recall?: boolean }
+ * Returns 200 and resolved preferences when successful.
  */
 router.patch('/preferences', checkMemoryOptOut, async (req, res) => {
-  const { memories } = req.body;
+  const { memories, conversation_recall } = req.body ?? {};
+  const hasMemories = typeof memories === 'boolean';
+  const hasConversationRecall = typeof conversation_recall === 'boolean';
 
-  if (typeof memories !== 'boolean') {
-    return res.status(400).json({ error: 'memories must be a boolean value.' });
+  if (!hasMemories && !hasConversationRecall) {
+    return res.status(400).json({
+      error:
+        'At least one boolean preference must be provided: memories and/or conversation_recall.',
+    });
   }
 
   try {
-    const updatedUser = await toggleUserMemories(req.user.id, memories);
+    const updatedUser =
+      hasMemories && !hasConversationRecall
+        ? await toggleUserMemories(req.user.id, memories)
+        : await updateUserPersonalization(req.user.id, {
+            ...(hasMemories ? { memories } : {}),
+            ...(hasConversationRecall ? { conversation_recall } : {}),
+          });
 
     if (!updatedUser) {
       return res.status(404).json({ error: 'User not found.' });
+    }
+
+    if (hasConversationRecall) {
+      scheduleConversationRecallRefresh({
+        userId: req.user.id,
+      });
     }
 
     res.json({
       updated: true,
       preferences: {
         memories: updatedUser.personalization?.memories ?? true,
+        conversation_recall: updatedUser.personalization?.conversation_recall ?? false,
       },
     });
   } catch (error) {
@@ -222,10 +292,17 @@ router.patch('/:key', memoryPayloadLimit, checkMemoryUpdate, configMiddleware, a
   }
 
   try {
-    const tokenCount = Tokenizer.getTokenCount(value, 'o200k_base');
-
     const memories = await getAllUserMemories(req.user.id);
     const existingMemory = memories.find((m) => m.key === urlKey);
+    const memoryPolicy = getMemoryPolicy(req.config);
+    const currentTotalTokens = memories.reduce((sum, memory) => sum + (memory.tokenCount || 0), 0);
+    const preparedValue = prepareMemoryValueForWrite({
+      key: newKey,
+      value,
+      keyLimits: memoryPolicy.keyLimits,
+    });
+    const nextValue = preparedValue.value;
+    const tokenCount = preparedValue.tokenCount;
 
     if (!existingMemory) {
       return res.status(404).json({ error: 'Memory not found.' });
@@ -237,10 +314,27 @@ router.patch('/:key', memoryPayloadLimit, checkMemoryUpdate, configMiddleware, a
         return res.status(409).json({ error: 'Memory with this key already exists.' });
       }
 
+      const createEvaluation = evaluateMemoryWrite({
+        key: newKey,
+        value: nextValue,
+        tokenCount,
+        validKeys: memoryPolicy.validKeys,
+        tokenLimit: memoryPolicy.tokenLimit,
+        keyLimits: memoryPolicy.keyLimits,
+        baselineTotalTokens: currentTotalTokens - (existingMemory.tokenCount || 0),
+        previousTokenCount: 0,
+      });
+      if (!createEvaluation.ok) {
+        return res.status(400).json({
+          error: createEvaluation.message,
+          details: createEvaluation.details,
+        });
+      }
+
       const createResult = await createMemory({
         userId: req.user.id,
         key: newKey,
-        value,
+        value: nextValue,
         tokenCount,
       });
 
@@ -253,10 +347,27 @@ router.patch('/:key', memoryPayloadLimit, checkMemoryUpdate, configMiddleware, a
         return res.status(500).json({ error: 'Failed to delete old memory.' });
       }
     } else {
+      const updateEvaluation = evaluateMemoryWrite({
+        key: newKey,
+        value: nextValue,
+        tokenCount,
+        validKeys: memoryPolicy.validKeys,
+        tokenLimit: memoryPolicy.tokenLimit,
+        keyLimits: memoryPolicy.keyLimits,
+        baselineTotalTokens: currentTotalTokens,
+        previousTokenCount: existingMemory.tokenCount || 0,
+      });
+      if (!updateEvaluation.ok) {
+        return res.status(400).json({
+          error: updateEvaluation.message,
+          details: updateEvaluation.details,
+        });
+      }
+
       const result = await setMemory({
         userId: req.user.id,
         key: newKey,
-        value,
+        value: nextValue,
         tokenCount,
       });
 
@@ -264,6 +375,11 @@ router.patch('/:key', memoryPayloadLimit, checkMemoryUpdate, configMiddleware, a
         return res.status(500).json({ error: 'Failed to update memory.' });
       }
     }
+
+    await runRouteMemoryMaintenance({
+      userId: req.user.id,
+      policy: memoryPolicy,
+    });
 
     const updatedMemories = await getAllUserMemories(req.user.id);
     const updatedMemory = updatedMemories.find((m) => m.key === newKey);

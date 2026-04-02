@@ -41,8 +41,18 @@ function checkPromptCacheSupport(modelName: string): boolean {
 function getClaudeHeaders(
   model: string,
   supportsCacheControl: boolean,
+  isOAuthToken = false,
 ): Record<string, string> | undefined {
   if (!supportsCacheControl) {
+    return undefined;
+  }
+
+  if (isOAuthToken) {
+    /**
+     * Anthropic OAuth/subscription tokens have stricter beta-header requirements.
+     * We avoid injecting model-specific cache/context betas here and let the OAuth
+     * path set only required OAuth-compatible betas.
+     */
     return undefined;
   }
 
@@ -65,7 +75,7 @@ function getClaudeHeaders(
 
 /**
  * Configures reasoning-related options for Claude models.
- * Models supporting adaptive thinking (Opus 4.6+, Sonnet 4.6+) use effort control instead of manual budget_tokens.
+ * Models supporting adaptive thinking (Opus 4.6+, Sonnet 5+) use effort control instead of manual budget_tokens.
  */
 function configureReasoning(
   anthropicInput: AnthropicClientOptions & { max_tokens?: number },

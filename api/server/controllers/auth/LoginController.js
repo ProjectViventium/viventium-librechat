@@ -1,6 +1,13 @@
 const { logger } = require('@librechat/data-schemas');
 const { generate2FATempToken } = require('~/server/services/twoFactorService');
 const { setAuthTokens } = require('~/server/services/AuthService');
+/* === VIVENTIUM START ===
+ * Feature: Registration approval message passthrough.
+ * === VIVENTIUM END === */
+const {
+  APPROVAL_ERROR_CODE,
+  PENDING_APPROVAL_MESSAGE,
+} = require('~/server/services/viventium/registrationApprovalService');
 
 const loginController = async (req, res) => {
   try {
@@ -20,6 +27,9 @@ const loginController = async (req, res) => {
 
     return res.status(200).send({ token, user });
   } catch (err) {
+    if (err?.code === APPROVAL_ERROR_CODE) {
+      return res.status(403).json({ message: PENDING_APPROVAL_MESSAGE });
+    }
     logger.error('[loginController]', err);
     return res.status(500).json({ message: 'Something went wrong' });
   }

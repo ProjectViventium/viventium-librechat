@@ -153,11 +153,9 @@ const generateBackupCodes = async (count = 10) => {
  * @param {Object} params
  * @param {Object} params.user
  * @param {string} params.backupCode
- * @param {boolean} [params.persist=true] - Whether to persist the used-mark to the database.
- *   Pass `false` when the caller will immediately overwrite `backupCodes` (e.g. re-enrollment).
  * @returns {Promise<boolean>}
  */
-const verifyBackupCode = async ({ user, backupCode, persist = true }) => {
+const verifyBackupCode = async ({ user, backupCode }) => {
   if (!backupCode || !user || !Array.isArray(user.backupCodes)) {
     return false;
   }
@@ -167,50 +165,17 @@ const verifyBackupCode = async ({ user, backupCode, persist = true }) => {
     (codeObj) => codeObj.codeHash === hashedInput && !codeObj.used,
   );
 
-  if (!matchingCode) {
-    return false;
-  }
-
-  if (persist) {
+  if (matchingCode) {
     const updatedBackupCodes = user.backupCodes.map((codeObj) =>
       codeObj.codeHash === hashedInput && !codeObj.used
         ? { ...codeObj, used: true, usedAt: new Date() }
         : codeObj,
     );
+    // Update the user record with the marked backup code.
     await updateUser(user._id, { backupCodes: updatedBackupCodes });
+    return true;
   }
-  return true;
-};
-
-/**
- * Verifies a user's identity via TOTP token or backup code.
- * @param {Object} params
- * @param {Object} params.user - The user document (must include totpSecret and backupCodes).
- * @param {string} [params.token] - A 6-digit TOTP token.
- * @param {string} [params.backupCode] - An 8-character backup code.
- * @param {boolean} [params.persistBackupUse=true] - Whether to mark the backup code as used in the DB.
- * @returns {Promise<{ verified: boolean, status?: number, message?: string }>}
- */
-const verifyOTPOrBackupCode = async ({ user, token, backupCode, persistBackupUse = true }) => {
-  if (!token && !backupCode) {
-    return { verified: false, status: 400 };
-  }
-
-  if (token) {
-    const secret = await getTOTPSecret(user.totpSecret);
-    if (!secret) {
-      return { verified: false, status: 400, message: '2FA secret is missing or corrupted' };
-    }
-    const ok = await verifyTOTP(secret, token);
-    return ok
-      ? { verified: true }
-      : { verified: false, status: 401, message: 'Invalid token or backup code' };
-  }
-
-  const ok = await verifyBackupCode({ user, backupCode, persist: persistBackupUse });
-  return ok
-    ? { verified: true }
-    : { verified: false, status: 401, message: 'Invalid token or backup code' };
+  return false;
 };
 
 /**
@@ -248,12 +213,11 @@ const generate2FATempToken = (userId) => {
 };
 
 module.exports = {
-  verifyOTPOrBackupCode,
-  generate2FATempToken,
-  generateBackupCodes,
   generateTOTPSecret,
-  verifyBackupCode,
-  getTOTPSecret,
   generateTOTP,
   verifyTOTP,
+  generateBackupCodes,
+  verifyBackupCode,
+  getTOTPSecret,
+  generate2FATempToken,
 };

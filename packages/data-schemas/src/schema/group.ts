@@ -41,16 +41,12 @@ const groupSchema = new Schema<IGroup>(
         return this.source !== 'local';
       },
     },
-    tenantId: {
-      type: String,
-      index: true,
-    },
   },
   { timestamps: true },
 );
 
 groupSchema.index(
-  { idOnTheSource: 1, source: 1, tenantId: 1 },
+  { idOnTheSource: 1, source: 1 },
   {
     unique: true,
     partialFilterExpression: { idOnTheSource: { $exists: true } },

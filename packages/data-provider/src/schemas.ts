@@ -49,7 +49,6 @@ export enum Providers {
 export const documentSupportedProviders = new Set<string>([
   EModelEndpoint.anthropic,
   EModelEndpoint.openAI,
-  EModelEndpoint.bedrock,
   EModelEndpoint.custom,
   // handled in AttachFileMenu and DragDropModal since azureOpenAI only supports documents with Use Responses API set to true
   // EModelEndpoint.azureOpenAI,
@@ -185,12 +184,6 @@ export enum AnthropicEffort {
   max = 'max',
 }
 
-export enum BedrockReasoningConfig {
-  low = 'low',
-  medium = 'medium',
-  high = 'high',
-}
-
 export enum ReasoningSummary {
   none = '',
   auto = 'auto',
@@ -258,8 +251,11 @@ export const defaultAgentFormValues = {
   tools: [],
   tool_options: {},
   provider: {},
+  projectIds: [],
   edges: [],
   artifacts: '',
+  /** @deprecated Use ACL permissions instead */
+  isCollaborative: false,
   recursion_limit: undefined,
   [Tools.execute_code]: false,
   [Tools.file_search]: false,
@@ -269,6 +265,25 @@ export const defaultAgentFormValues = {
     name: '',
     email: '',
   },
+  /* === VIVENTIUM START ===
+   * Feature: Agent-scoped conversation recall toggle
+   * Added: 2026-02-19
+   */
+  conversation_recall_agent_only: false,
+  /* === VIVENTIUM END === */
+  /* === VIVENTIUM START ===
+   * Feature: Background Cortices (Multi-Agent Brain Architecture)
+   * Added: 2026-01-03
+   */
+  background_cortices: [],
+  /* === VIVENTIUM END === */
+  /* === VIVENTIUM START ===
+   * Feature: Voice Chat LLM Override
+   * Added: 2026-02-24
+   */
+  voice_llm_model: null,
+  voice_llm_provider: null,
+  /* === VIVENTIUM END === */
 };
 
 export const ImageVisionTool: FunctionTool = {
@@ -559,7 +574,6 @@ export const tPluginAuthConfigSchema = z.object({
   authField: z.string(),
   label: z.string(),
   description: z.string(),
-  optional: z.boolean().optional(),
 });
 
 export type TPluginAuthConfig = z.infer<typeof tPluginAuthConfigSchema>;
@@ -611,6 +625,13 @@ export const tMessageSchema = z.object({
   isCreatedByUser: z.boolean(),
   error: z.boolean().optional(),
   clientTimestamp: z.string().optional(),
+  /* === VIVENTIUM START ===
+   * Feature: Timezone-aware message metadata
+   * Purpose: Persist clientTimezone so server-side processing can render time context and interpret clientTimestamp consistently.
+   * Added: 2026-02-07
+   */
+  clientTimezone: z.string().optional(),
+  /* === VIVENTIUM END === */
   createdAt: z
     .string()
     .optional()
@@ -630,22 +651,6 @@ export const tMessageSchema = z.object({
   feedback: feedbackSchema.optional(),
   /** metadata */
   metadata: z.record(z.unknown()).optional(),
-  contextMeta: z
-    .object({
-      calibrationRatio: z
-        .number()
-        .optional()
-        .describe(
-          'EMA ratio of provider-reported vs local token estimates; seeds the pruner on subsequent runs',
-        ),
-      encoding: z
-        .string()
-        .optional()
-        .describe(
-          'Tokenizer encoding used when this ratio was computed (e.g. "claude", "o200k_base")',
-        ),
-    })
-    .optional(),
 });
 
 export type MemoryArtifact = {
@@ -690,6 +695,13 @@ export type TMessage = z.input<typeof tMessageSchema> & {
   siblingIndex?: number;
   attachments?: TAttachment[];
   clientTimestamp?: string;
+  /* === VIVENTIUM START ===
+   * Feature: Timezone-aware message metadata
+   * Purpose: Include clientTimezone in TMessage typings for downstream time-context rendering and scheduling.
+   * Added: 2026-02-07
+   */
+  clientTimezone?: string;
+  /* === VIVENTIUM END === */
   feedback?: TFeedback;
 };
 
@@ -922,30 +934,6 @@ export const tQueryParamsSchema = tConversationSchema
       endpoint: extendedModelEndpointSchema.nullable(),
     }),
   );
-
-/** Narrowed preset schema for use in model specs — omits system/DB/deprecated fields */
-export const tModelSpecPresetSchema = tPresetSchema.omit({
-  conversationId: true,
-  presetId: true,
-  title: true,
-  defaultPreset: true,
-  order: true,
-  isArchived: true,
-  user: true,
-  messages: true,
-  tags: true,
-  file_ids: true,
-  expiredAt: true,
-  parentMessageId: true,
-  resendImages: true,
-  chatGptLabel: true,
-  presetOverride: true,
-  greeting: true,
-  iconURL: true,
-  spec: true,
-});
-
-export type TModelSpecPreset = z.infer<typeof tModelSpecPresetSchema>;
 
 export type TPreset = z.infer<typeof tPresetSchema>;
 

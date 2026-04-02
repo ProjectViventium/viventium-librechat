@@ -337,7 +337,26 @@ describe('getCustomEndpointConfig', () => {
       });
     });
 
-    it('should handle mixed case endpoint names', () => {
+    it('should handle mixed case known provider endpoint names', () => {
+      const appConfig = createTestAppConfig({
+        endpoints: {
+          [EModelEndpoint.custom]: [
+            {
+              name: 'xAI',
+              apiKey: 'xai-key',
+            } as TEndpoint,
+          ],
+        },
+      });
+
+      const result = getCustomEndpointConfig({ endpoint: 'xai', appConfig });
+      expect(result).toEqual({
+        name: 'xAI',
+        apiKey: 'xai-key',
+      });
+    });
+
+    it('should keep arbitrary custom endpoint names case-sensitive', () => {
       const appConfig = createTestAppConfig({
         endpoints: {
           [EModelEndpoint.custom]: [

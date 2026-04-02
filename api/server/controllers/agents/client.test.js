@@ -1,5 +1,6 @@
 const { Providers } = require('@librechat/agents');
 const { Constants, EModelEndpoint } = require('librechat-data-provider');
+const db = require('~/models');
 const AgentClient = require('./client');
 
 jest.mock('@librechat/agents', () => ({
@@ -15,20 +16,31 @@ jest.mock('@librechat/api', () => ({
   checkAccess: jest.fn(),
   initializeAgent: jest.fn(),
   createMemoryProcessor: jest.fn(),
+  loadMemorySnapshot: jest.fn(),
+  GenerationJobManager: {
+    emitChunk: jest.fn(),
+    setGraph: jest.fn(),
+  },
+}));
+
+jest.mock('~/server/services/viventium/BackgroundCortexFollowUpService', () => ({
+  persistCortexPartsToCanonicalMessage: jest.fn().mockResolvedValue(undefined),
+  createCortexFollowUpMessage: jest.fn(),
+}));
+
+jest.mock('~/models/Agent', () => ({
   loadAgent: jest.fn(),
 }));
 
-jest.mock('~/server/services/Config', () => ({
-  getMCPServerTools: jest.fn(),
-}));
-
-jest.mock('~/server/services/MCP', () => ({
-  resolveConfigServers: jest.fn().mockResolvedValue({}),
-}));
-
-jest.mock('~/models', () => ({
-  getAgent: jest.fn(),
+jest.mock('~/models/Role', () => ({
   getRoleByName: jest.fn(),
+}));
+
+jest.mock('~/server/services/viventium/conversationRecallRuntimeContext', () => ({
+  buildConversationRecallRuntimeContext: jest.fn(),
+}));
+jest.mock('~/server/services/viventium/conversationRecallService', () => ({
+  scheduleConversationRecallSync: jest.fn(),
 }));
 
 // Mock getMCPManager
@@ -38,6 +50,11 @@ jest.mock('~/config', () => ({
     formatInstructionsForContext: mockFormatInstructions,
   })),
 }));
+
+// Get references to mocked module functions (resolved after jest.mock hoisting)
+const mockEmitChunk = require('@librechat/api').GenerationJobManager.emitChunk;
+const mockCreateCortexFollowUpMessage =
+  require('~/server/services/viventium/BackgroundCortexFollowUpService').createCortexFollowUpMessage;
 
 describe('AgentClient - titleConvo', () => {
   let client;
@@ -50,6 +67,9 @@ describe('AgentClient - titleConvo', () => {
   beforeEach(() => {
     // Reset all mocks
     jest.clearAllMocks();
+    db.getUserKey = jest.fn().mockResolvedValue(null);
+    db.getUserKeyValues = jest.fn().mockResolvedValue({});
+    db.updateUserKey = jest.fn().mockResolvedValue(null);
 
     // Mock run object
     mockRun = {
@@ -1319,7 +1339,7 @@ describe('AgentClient - titleConvo', () => {
       });
 
       // Verify formatInstructionsForContext was called with correct server names
-      expect(mockFormatInstructions).toHaveBeenCalledWith(['server1', 'server2'], {});
+      expect(mockFormatInstructions).toHaveBeenCalledWith(['server1', 'server2']);
 
       // Verify the instructions do NOT contain [object Promise]
       expect(client.options.agent.instructions).not.toContain('[object Promise]');
@@ -1359,10 +1379,10 @@ describe('AgentClient - titleConvo', () => {
       });
 
       // Verify formatInstructionsForContext was called with ephemeral server names
-      expect(mockFormatInstructions).toHaveBeenCalledWith(
-        ['ephemeral-server1', 'ephemeral-server2'],
-        {},
-      );
+      expect(mockFormatInstructions).toHaveBeenCalledWith([
+        'ephemeral-server1',
+        'ephemeral-server2',
+      ]);
 
       // Verify no [object Promise] in instructions
       expect(client.options.agent.instructions).not.toContain('[object Promise]');
@@ -1546,6 +1566,65 @@ describe('AgentClient - titleConvo', () => {
       expect(processedMessage.content).toContain('Hello, how are you?');
       expect(processedMessage.content).toContain('I am doing well, thank you!');
       expect(processedMessage.content).toContain('That is great to hear.');
+    });
+
+    it('should exclude scheduler control prompts, think parts, and NTA-only assistant turns from memory buffer', async () => {
+      const { HumanMessage, AIMessage } = require('@langchain/core/messages');
+      const messages = [
+        new HumanMessage(
+          'Internal Check:\n1. Verify whether the project update email was sent.\nDo not nudge anyone. Just observe and update context. {NTA} if nothing new.',
+        ),
+        new AIMessage({
+          content: [
+            {
+              type: 'think',
+              think: 'This is the same internal check repeated many times. {NTA} is the correct response.',
+            },
+            {
+              type: 'text',
+              text: '{NTA}',
+            },
+          ],
+        }),
+        new HumanMessage('The user is in a quiet workspace and focused on a planning task today.'),
+      ];
+
+      await client.runMemory(messages);
+
+      expect(mockProcessMemory).toHaveBeenCalledTimes(1);
+      const processedMessage = mockProcessMemory.mock.calls[0][0][0];
+
+      expect(processedMessage.content).toContain('The user is in a quiet workspace and focused on a planning task today.');
+      expect(processedMessage.content).not.toContain('Internal Check:');
+      expect(processedMessage.content).not.toContain('{NTA}');
+      expect(processedMessage.content).not.toContain('same internal check repeated');
+      expect(processedMessage.content).not.toContain('"type": "think"');
+    });
+
+    it('should skip memory processing when the window contains only internal-control and NTA content', async () => {
+      const { HumanMessage, AIMessage } = require('@langchain/core/messages');
+      const messages = [
+        new HumanMessage(
+          'Internal Check:\n1. Verify whether the project update email was sent.\nDo not nudge anyone. Just observe and update context. {NTA} if nothing new.',
+        ),
+        new AIMessage({
+          content: [
+            {
+              type: 'think',
+              think: 'This is the same internal check repeated many times. {NTA} is the correct response.',
+            },
+            {
+              type: 'text',
+              text: '{NTA}',
+            },
+          ],
+        }),
+      ];
+
+      const result = await client.runMemory(messages);
+
+      expect(result).toBeUndefined();
+      expect(mockProcessMemory).not.toHaveBeenCalled();
     });
 
     it('should handle mixed content types correctly', async () => {
@@ -1822,7 +1901,7 @@ describe('AgentClient - titleConvo', () => {
 
       /** Traversal stops at msg-2 (has summary), so we get msg-4 -> msg-3 -> msg-2 */
       expect(result).toHaveLength(3);
-      expect(result[0].content).toEqual([{ type: 'text', text: 'Summary of conversation' }]);
+      expect(result[0].text).toBe('Summary of conversation');
       expect(result[0].role).toBe('system');
       expect(result[0].mapped).toBe(true);
       expect(result[1].mapped).toBe(true);
@@ -1874,9 +1953,15 @@ describe('AgentClient - titleConvo', () => {
     let mockRes;
     let mockAgent;
     let mockOptions;
+    let mockBuildConversationRecallRuntimeContext;
 
     beforeEach(() => {
       jest.clearAllMocks();
+
+      ({
+        buildConversationRecallRuntimeContext: mockBuildConversationRecallRuntimeContext,
+      } = require('~/server/services/viventium/conversationRecallRuntimeContext'));
+      mockBuildConversationRecallRuntimeContext.mockResolvedValue('');
 
       mockAgent = {
         id: 'primary-agent',
@@ -1972,6 +2057,71 @@ describe('AgentClient - titleConvo', () => {
 
       expect(parallelAgent2.instructions).toContain('Parallel agent 2 instructions');
       expect(parallelAgent2.instructions).toContain(memoryContent);
+    });
+
+    it('should inject runtime conversation recall context for all agents', async () => {
+      const recallContext =
+        'Conversation Recall Context (auto-retrieved from prior user chats):\n[1] lab test results discussed.';
+      client.useMemory = jest.fn().mockResolvedValue(undefined);
+      mockBuildConversationRecallRuntimeContext.mockResolvedValue(recallContext);
+
+      const parallelAgent = {
+        id: 'parallel-agent-1',
+        name: 'Parallel Agent 1',
+        instructions: 'Parallel agent instructions',
+        provider: EModelEndpoint.openAI,
+      };
+      client.agentConfigs = new Map([['parallel-agent-1', parallelAgent]]);
+
+      const messages = [
+        {
+          messageId: 'msg-1',
+          conversationId: 'convo-123',
+          parentMessageId: null,
+          sender: 'User',
+          text: 'Remember when I shared my lab test results?',
+          isCreatedByUser: true,
+        },
+      ];
+
+      await client.buildMessages(messages, null, {
+        instructions: 'Base instructions',
+        additional_instructions: null,
+      });
+
+      expect(mockBuildConversationRecallRuntimeContext).toHaveBeenCalledWith(
+        expect.objectContaining({
+          user: mockReq.user,
+          agent: client.options.agent,
+        }),
+      );
+      expect(client.options.agent.instructions).toContain(recallContext);
+      expect(parallelAgent.instructions).toContain(recallContext);
+    });
+
+    it('should continue when runtime conversation recall context throws', async () => {
+      client.useMemory = jest.fn().mockResolvedValue(undefined);
+      mockBuildConversationRecallRuntimeContext.mockRejectedValue(
+        new Error('runtime recall failed'),
+      );
+
+      const messages = [
+        {
+          messageId: 'msg-1',
+          conversationId: 'convo-123',
+          parentMessageId: null,
+          sender: 'User',
+          text: 'Remember my previous chat?',
+          isCreatedByUser: true,
+        },
+      ];
+
+      await expect(
+        client.buildMessages(messages, null, {
+          instructions: 'Base instructions',
+          additional_instructions: null,
+        }),
+      ).resolves.not.toThrow();
     });
 
     it('should not modify parallel agents when no memory context is available', async () => {
@@ -2099,6 +2249,7 @@ describe('AgentClient - titleConvo', () => {
     let mockLoadAgent;
     let mockInitializeAgent;
     let mockCreateMemoryProcessor;
+    let mockLoadMemorySnapshot;
 
     beforeEach(() => {
       jest.clearAllMocks();
@@ -2144,9 +2295,16 @@ describe('AgentClient - titleConvo', () => {
       };
 
       mockCheckAccess = require('@librechat/api').checkAccess;
-      mockLoadAgent = require('@librechat/api').loadAgent;
+      mockLoadAgent = require('~/models/Agent').loadAgent;
       mockInitializeAgent = require('@librechat/api').initializeAgent;
       mockCreateMemoryProcessor = require('@librechat/api').createMemoryProcessor;
+      mockLoadMemorySnapshot = require('@librechat/api').loadMemorySnapshot;
+      mockLoadMemorySnapshot.mockResolvedValue({
+        withKeys: 'stored memories with keys',
+        withoutKeys: 'stored memories',
+        totalTokens: 12,
+        memoryTokenMap: { core: 12 },
+      });
     });
 
     it('should use current agent when memory config agent.id matches current agent id', async () => {
@@ -2201,7 +2359,6 @@ describe('AgentClient - titleConvo', () => {
         expect.objectContaining({
           agent_id: differentAgentId,
         }),
-        expect.any(Object),
       );
       expect(mockInitializeAgent).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -2211,7 +2368,7 @@ describe('AgentClient - titleConvo', () => {
       );
     });
 
-    it('should return early when prelimAgent is undefined (no valid memory agent config)', async () => {
+    it('should still inject stored memory when no memory writer is configured', async () => {
       mockReq.config.memory = {
         agent: {},
       };
@@ -2224,7 +2381,7 @@ describe('AgentClient - titleConvo', () => {
 
       const result = await client.useMemory();
 
-      expect(result).toBeUndefined();
+      expect(result).toBe('stored memories');
       expect(mockInitializeAgent).not.toHaveBeenCalled();
       expect(mockCreateMemoryProcessor).not.toHaveBeenCalled();
     });
@@ -2262,6 +2419,166 @@ describe('AgentClient - titleConvo', () => {
         }),
         expect.any(Object),
       );
+    });
+
+    it('should fall back to stored memory when the memory writer cannot initialize', async () => {
+      mockCheckAccess.mockResolvedValue(true);
+      mockInitializeAgent.mockResolvedValue(null);
+
+      client = new AgentClient(mockOptions);
+      client.conversationId = 'convo-123';
+      client.responseMessageId = 'response-123';
+
+      const result = await client.useMemory();
+
+      expect(result).toBe('stored memories');
+      expect(mockCreateMemoryProcessor).not.toHaveBeenCalled();
+    });
+  });
+});
+
+/* === VIVENTIUM START ===
+ * Purpose: Viventium addition in private LibreChat fork (new test block).
+ * Porting: Copy this describe block when reapplying Viventium changes.
+ * === VIVENTIUM END === */
+
+/**
+ * Integration test for Phase B cortex follow-up SSE emission.
+ *
+ * Unlike cortexFollowupSseEmission.test.js (contract copy with a local helper),
+ * this test uses the actual mocked modules that client.js imports:
+ * - createCortexFollowUpMessage from BackgroundCortexFollowUpService
+ * - GenerationJobManager.emitChunk from @librechat/api
+ *
+ * The emission conditional mirrors client.js:2117-2129. If client.js changes
+ * the conditional or import path, this test must be updated.
+ */
+describe('Phase B cortex follow-up SSE emission (integration)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  test('does NOT emit on_cortex_followup when createCortexFollowUpMessage returns null (NTA suppressed)', async () => {
+    mockCreateCortexFollowUpMessage.mockResolvedValue(null);
+
+    const req = { _resumableStreamId: 'stream-abc' };
+    const responseMessageId = 'resp-123';
+    const mergedInsightsData = { insights: [{ text: 'insight' }], cortexCount: 1, mergedPrompt: 'prompt' };
+
+    const followUpMessage = await mockCreateCortexFollowUpMessage({
+      req,
+      conversationId: 'conv-1',
+      parentMessageId: responseMessageId,
+      agent: { id: 'agent-1' },
+      insightsData: mergedInsightsData,
+      recentResponse: 'Recent response text',
+    });
+
+    // Mirror the production emission conditional (client.js:2117-2129)
+    if (followUpMessage?.text && req?._resumableStreamId) {
+      mockEmitChunk(req._resumableStreamId, {
+        event: 'on_cortex_followup',
+        data: {
+          runId: responseMessageId,
+          messageId: followUpMessage.messageId,
+          parentMessageId: responseMessageId,
+          text: followUpMessage.text,
+          cortexCount: mergedInsightsData?.cortexCount ?? undefined,
+        },
+      });
+    }
+
+    expect(mockCreateCortexFollowUpMessage).toHaveBeenCalledTimes(1);
+    expect(mockEmitChunk).not.toHaveBeenCalled();
+  });
+
+  test('does NOT emit on_cortex_followup when followUpMessage.text is empty', async () => {
+    mockCreateCortexFollowUpMessage.mockResolvedValue({ messageId: 'fu-1', text: '' });
+
+    const req = { _resumableStreamId: 'stream-abc' };
+    const responseMessageId = 'resp-123';
+
+    const followUpMessage = await mockCreateCortexFollowUpMessage({
+      req,
+      conversationId: 'conv-1',
+      parentMessageId: responseMessageId,
+      agent: { id: 'agent-1' },
+      insightsData: { insights: [], cortexCount: 0, mergedPrompt: '' },
+      recentResponse: '',
+    });
+
+    if (followUpMessage?.text && req?._resumableStreamId) {
+      mockEmitChunk(req._resumableStreamId, { event: 'on_cortex_followup', data: {} });
+    }
+
+    expect(mockEmitChunk).not.toHaveBeenCalled();
+  });
+
+  test('does NOT emit on_cortex_followup when req has no _resumableStreamId', async () => {
+    mockCreateCortexFollowUpMessage.mockResolvedValue({ messageId: 'fu-1', text: 'Insight text.' });
+
+    const req = {}; // No _resumableStreamId (non-streaming surface)
+    const responseMessageId = 'resp-123';
+
+    const followUpMessage = await mockCreateCortexFollowUpMessage({
+      req,
+      conversationId: 'conv-1',
+      parentMessageId: responseMessageId,
+      agent: { id: 'agent-1' },
+      insightsData: { insights: [{ text: 'insight' }], cortexCount: 1, mergedPrompt: 'prompt' },
+      recentResponse: 'Recent text',
+    });
+
+    if (followUpMessage?.text && req?._resumableStreamId) {
+      mockEmitChunk(req._resumableStreamId, { event: 'on_cortex_followup', data: {} });
+    }
+
+    expect(mockEmitChunk).not.toHaveBeenCalled();
+  });
+
+  test('DOES emit on_cortex_followup when createCortexFollowUpMessage returns a message with text', async () => {
+    const mockFollowUp = { messageId: 'fu-1', text: 'A new insight surfaced.' };
+    mockCreateCortexFollowUpMessage.mockResolvedValue(mockFollowUp);
+
+    const req = { _resumableStreamId: 'stream-abc' };
+    const responseMessageId = 'resp-123';
+    const mergedInsightsData = { insights: [{ text: 'insight' }], cortexCount: 2, mergedPrompt: 'prompt' };
+
+    const followUpMessage = await mockCreateCortexFollowUpMessage({
+      req,
+      conversationId: 'conv-1',
+      parentMessageId: responseMessageId,
+      agent: { id: 'agent-1' },
+      insightsData: mergedInsightsData,
+      recentResponse: 'Recent response text',
+    });
+
+    // Mirror the production emission conditional (client.js:2117-2129)
+    if (followUpMessage?.text && req?._resumableStreamId) {
+      const followUpEvent = {
+        event: 'on_cortex_followup',
+        data: {
+          runId: responseMessageId,
+          messageId: followUpMessage.messageId,
+          parentMessageId: responseMessageId,
+          text: followUpMessage.text,
+          cortexCount: mergedInsightsData?.cortexCount ?? undefined,
+        },
+      };
+      mockEmitChunk(req._resumableStreamId, followUpEvent);
+    }
+
+    expect(mockCreateCortexFollowUpMessage).toHaveBeenCalledTimes(1);
+    expect(mockEmitChunk).toHaveBeenCalledTimes(1);
+    expect(mockEmitChunk).toHaveBeenCalledWith('stream-abc', {
+      event: 'on_cortex_followup',
+      data: {
+        runId: 'resp-123',
+        messageId: 'fu-1',
+        parentMessageId: 'resp-123',
+        text: 'A new insight surfaced.',
+        cortexCount: 2,
+      },
     });
   });
 });

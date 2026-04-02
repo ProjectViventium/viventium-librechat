@@ -1,7 +1,13 @@
 import type { OpenAPIV3 } from 'openapi-types';
 import type { AssistantsEndpoint, AgentProvider } from 'src/schemas';
 import type { Agents, GraphEdge } from './agents';
-import type { ContentTypes } from './runs';
+/* === VIVENTIUM START ===
+ * Feature: Cortex message content part typing
+ * Purpose: Import CortexContentPart so assistant/agent message types can include Viventium cortex parts.
+ * Added: 2026-01-03
+ */
+import type { ContentTypes, CortexContentPart } from './runs';
+/* === VIVENTIUM END === */
 import type { TFile } from './files';
 import { ArtifactModes } from 'src/artifacts';
 
@@ -155,6 +161,47 @@ export type File = {
 
 /* Agent types */
 
+/* === VIVENTIUM START ===
+ * Feature: Background Cortices (Multi-Agent Brain Architecture)
+ * Purpose: Type definitions for background cortices with per-cortex activation
+ * Added: 2026-01-03
+ * Updated: 2026-01-03 - Redesigned for many-to-many cortex relationships
+ */
+
+/**
+ * Configuration for LLM-based activation detection.
+ * Each cortex attached to a main agent has its own activation config.
+ */
+export interface ActivationConfig {
+  /** Whether activation detection is enabled */
+  enabled: boolean;
+  /** Model to use for activation detection (e.g., "gpt-4o-mini") */
+  model: string;
+  /** Provider for the activation model (e.g., "openai") */
+  provider: string;
+  /** System prompt for making activation decisions */
+  prompt: string;
+  /** Optional config-defined routing scope for runtime helper context */
+  intent_scope?: string;
+  /** Minimum confidence threshold (0.0-1.0) to trigger activation */
+  confidence_threshold: number;
+  /** Minimum time between activations in milliseconds */
+  cooldown_ms: number;
+  /** Number of recent messages to include in activation context */
+  max_history: number;
+}
+
+/**
+ * A background cortex entry attached to a main agent.
+ * Each cortex has its own activation configuration specific to this main agent.
+ */
+export interface BackgroundCortex {
+  /** ID of the agent serving as a background cortex */
+  agent_id: string;
+  /** Activation configuration for this cortex (specific to this main agent) */
+  activation: ActivationConfig;
+}
+/* === VIVENTIUM END === */
 export type AgentParameterValue = number | string | null;
 
 export type AgentModelParameters = {
@@ -252,12 +299,15 @@ export type Agent = {
   instructions?: string | null;
   additional_instructions?: string | null;
   tools?: string[];
+  projectIds?: string[];
   tool_kwargs?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
   provider: AgentProvider;
   model: string | null;
   model_parameters: AgentModelParameters;
   conversation_starters?: string[];
+  /** @deprecated Use ACL permissions instead */
+  isCollaborative?: boolean;
   tool_resources?: AgentToolResources;
   /** @deprecated Use edges instead */
   agent_ids?: string[];
@@ -272,6 +322,28 @@ export type Agent = {
   support_contact?: SupportContact;
   /** Per-tool configuration options (deferred loading, allowed callers, etc.) */
   tool_options?: AgentToolOptions;
+  /* === VIVENTIUM START ===
+   * Feature: Agent-scoped conversation recall toggle
+   * Purpose: Allow an agent to use only its own conversation history corpus.
+   * Added: 2026-02-19
+   */
+  conversation_recall_agent_only?: boolean;
+  /* === VIVENTIUM END === */
+  /* === VIVENTIUM START === */
+  /**
+   * Background cortices attached to this main agent.
+   * Each cortex runs in parallel, independently deciding whether to activate.
+   */
+  background_cortices?: BackgroundCortex[];
+  /* === VIVENTIUM END === */
+  /* === VIVENTIUM START ===
+   * Feature: Voice Chat LLM Override
+   * Purpose: Allow a faster model for LiveKit voice calls while keeping a smarter model for text.
+   * Added: 2026-02-24
+   */
+  voice_llm_model?: string | null;
+  voice_llm_provider?: string | null;
+  /* === VIVENTIUM END === */
 };
 
 export type TAgentsMap = Record<string, Agent | undefined>;
@@ -297,6 +369,12 @@ export type AgentCreateParams = {
   | 'category'
   | 'support_contact'
   | 'tool_options'
+  | 'conversation_recall_agent_only'
+  /* === VIVENTIUM START === */
+  | 'background_cortices'
+  /* === VIVENTIUM END === */
+  | 'voice_llm_model'
+  | 'voice_llm_provider'
 >;
 
 export type AgentUpdateParams = {
@@ -310,6 +388,9 @@ export type AgentUpdateParams = {
   provider?: AgentProvider;
   model?: string | null;
   model_parameters?: AgentModelParameters;
+  projectIds?: string[];
+  removeProjectIds?: string[];
+  isCollaborative?: boolean;
 } & Pick<
   Agent,
   | 'agent_ids'
@@ -321,6 +402,12 @@ export type AgentUpdateParams = {
   | 'category'
   | 'support_contact'
   | 'tool_options'
+  | 'conversation_recall_agent_only'
+  /* === VIVENTIUM START === */
+  | 'background_cortices'
+  /* === VIVENTIUM END === */
+  | 'voice_llm_model'
+  | 'voice_llm_provider'
 >;
 
 export type AgentListParams = {
@@ -521,21 +608,6 @@ export type ContentPart = (
 
 export type TextData = (Text & PartMetadata) | undefined;
 
-export type SummaryContentPart = {
-  type: ContentTypes.SUMMARY;
-  content?: Array<{ type: ContentTypes.TEXT; text: string }>;
-  tokenCount?: number;
-  summarizing?: boolean;
-  summaryVersion?: number;
-  model?: string;
-  provider?: string;
-  createdAt?: string;
-  boundary?: {
-    messageId: string;
-    contentIndex: number;
-  };
-};
-
 export type TMessageContentParts =
   | ({
       type: ContentTypes.ERROR;
@@ -560,11 +632,17 @@ export type TMessageContentParts =
         PartMetadata;
     } & ContentMetadata)
   | ({ type: ContentTypes.IMAGE_FILE; image_file: ImageFile & PartMetadata } & ContentMetadata)
-  | (SummaryContentPart & ContentMetadata)
   | (Agents.AgentUpdate & ContentMetadata)
   | (Agents.MessageContentImageUrl & ContentMetadata)
   | (Agents.MessageContentVideoUrl & ContentMetadata)
-  | (Agents.MessageContentInputAudio & ContentMetadata);
+  /* === VIVENTIUM START ===
+   * Feature: Cortex content parts in message streams
+   * Purpose: Extend TMessageContentParts to include CortexContentPart (cortex activation/brewing/insight/etc).
+   * Added: 2026-01-03
+   */
+  | (Agents.MessageContentInputAudio & ContentMetadata)
+  | (CortexContentPart & ContentMetadata);
+  /* === VIVENTIUM END === */
 
 export type StreamContentData = TMessageContentParts & {
   /** The index of the current content part */

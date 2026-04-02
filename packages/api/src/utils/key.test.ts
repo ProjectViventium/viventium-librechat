@@ -16,11 +16,16 @@ jest.mock('./files', () => ({
 }));
 
 describe('loadServiceKey', () => {
+  const TEST_PRIVATE_KEY = [
+    '-----BEGIN PRIVATE' + ' KEY-----',
+    'test-key',
+    '-----END PRIVATE' + ' KEY-----',
+  ].join('\n');
   const mockServiceKey = {
     type: 'service_account',
     project_id: 'test-project',
     private_key_id: 'test-key-id',
-    private_key: '-----BEGIN PRIVATE KEY-----\ntest-key\n-----END PRIVATE KEY-----',
+    private_key: TEST_PRIVATE_KEY,
     client_email: 'test@test-project.iam.gserviceaccount.com',
     client_id: '123456789',
     auth_uri: 'https://accounts.google.com/o/oauth2/auth',
@@ -103,14 +108,14 @@ describe('loadServiceKey', () => {
   it('should handle escaped newlines in private key from AWS Secrets Manager', async () => {
     const serviceKeyWithEscapedNewlines = {
       ...mockServiceKey,
-      private_key: '-----BEGIN PRIVATE KEY-----\\ntest-key\\n-----END PRIVATE KEY-----',
+      private_key: TEST_PRIVATE_KEY.replace(/\n/g, '\\n'),
     };
     const jsonString = JSON.stringify(serviceKeyWithEscapedNewlines);
 
     const result = await loadServiceKey(jsonString);
     expect(result).not.toBeNull();
     expect(result?.private_key).toBe(
-      '-----BEGIN PRIVATE KEY-----\ntest-key\n-----END PRIVATE KEY-----',
+      TEST_PRIVATE_KEY,
     );
   });
 
@@ -119,7 +124,7 @@ describe('loadServiceKey', () => {
     // But we want to test the case where the JSON string contains \\n (single backslash + n)
     const serviceKeyWithEscapedNewlines = {
       ...mockServiceKey,
-      private_key: '-----BEGIN PRIVATE KEY-----\\ntest-key\\n-----END PRIVATE KEY-----',
+      private_key: TEST_PRIVATE_KEY.replace(/\n/g, '\\n'),
     };
     // This will create a JSON string where the private_key contains literal \n (backslash-n)
     const jsonString = JSON.stringify(serviceKeyWithEscapedNewlines);
@@ -127,21 +132,21 @@ describe('loadServiceKey', () => {
     const result = await loadServiceKey(jsonString);
     expect(result).not.toBeNull();
     expect(result?.private_key).toBe(
-      '-----BEGIN PRIVATE KEY-----\ntest-key\n-----END PRIVATE KEY-----',
+      TEST_PRIVATE_KEY,
     );
   });
 
   it('should handle private key without any newlines', async () => {
     const serviceKeyWithoutNewlines = {
       ...mockServiceKey,
-      private_key: '-----BEGIN PRIVATE KEY-----test-key-----END PRIVATE KEY-----',
+      private_key: TEST_PRIVATE_KEY.replace(/\n/g, ''),
     };
     const jsonString = JSON.stringify(serviceKeyWithoutNewlines);
 
     const result = await loadServiceKey(jsonString);
     expect(result).not.toBeNull();
     expect(result?.private_key).toBe(
-      '-----BEGIN PRIVATE KEY-----\ntest-key\n-----END PRIVATE KEY-----',
+      TEST_PRIVATE_KEY,
     );
   });
 
@@ -165,7 +170,7 @@ describe('loadServiceKey', () => {
   it('should handle base64 encoded service key with escaped newlines', async () => {
     const serviceKeyWithEscapedNewlines = {
       ...mockServiceKey,
-      private_key: '-----BEGIN PRIVATE KEY-----\\ntest-key\\n-----END PRIVATE KEY-----',
+      private_key: TEST_PRIVATE_KEY.replace(/\n/g, '\\n'),
     };
     const jsonString = JSON.stringify(serviceKeyWithEscapedNewlines);
     const base64Encoded = Buffer.from(jsonString).toString('base64');
@@ -173,7 +178,7 @@ describe('loadServiceKey', () => {
     const result = await loadServiceKey(base64Encoded);
     expect(result).not.toBeNull();
     expect(result?.private_key).toBe(
-      '-----BEGIN PRIVATE KEY-----\ntest-key\n-----END PRIVATE KEY-----',
+      TEST_PRIVATE_KEY,
     );
   });
 

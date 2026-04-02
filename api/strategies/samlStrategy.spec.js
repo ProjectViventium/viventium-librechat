@@ -1,4 +1,5 @@
 // --- Mocks ---
+jest.mock('tiktoken');
 jest.mock('fs');
 jest.mock('path');
 jest.mock('node-fetch');
@@ -26,11 +27,11 @@ jest.mock('~/server/services/Config', () => ({
 }));
 jest.mock('@librechat/api', () => ({
   isEmailDomainAllowed: jest.fn(() => true),
+  isEnabled: jest.fn(() => false),
   getBalanceConfig: jest.fn(() => ({
     tokenCredits: 1000,
     startBalance: 1000,
   })),
-  resolveAppConfigForUser: jest.fn(async (_getAppConfig, _user) => ({})),
 }));
 jest.mock('~/server/services/Config/EndpointService', () => ({
   config: {},
@@ -48,9 +49,6 @@ const fs = require('fs');
 const path = require('path');
 const fetch = require('node-fetch');
 const { Strategy: SamlStrategy } = require('@node-saml/passport-saml');
-const { findUser } = require('~/models');
-const { resolveAppConfigForUser } = require('@librechat/api');
-const { getAppConfig } = require('~/server/services/Config');
 const { setupSaml, getCertificateContent } = require('./samlStrategy');
 
 // Configure fs mock
@@ -58,14 +56,10 @@ jest.mocked(fs).existsSync = jest.fn();
 jest.mocked(fs).statSync = jest.fn();
 jest.mocked(fs).readFileSync = jest.fn();
 
-// To capture the verify callback from the strategy, we grab it from the mock constructor.
-// setupSaml() registers both 'saml' (regular) and 'samlAdmin' strategies, so we capture
-// only the first callback per setupSaml() call (the regular one).
+// To capture the verify callback from the strategy, we grab it from the mock constructor
 let verifyCallback;
 SamlStrategy.mockImplementation((options, verify) => {
-  if (!verifyCallback) {
-    verifyCallback = verify;
-  }
+  verifyCallback = verify;
   return { name: 'saml', options, verify };
 });
 
@@ -223,8 +217,6 @@ describe('setupSaml', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
-    // Reset so the mock captures the regular (non-admin) callback on next setupSaml() call
-    verifyCallback = null;
 
     // Configure mocks
     const { findUser, createUser, updateUser } = require('~/models');
@@ -449,51 +441,5 @@ u7wlOSk+oFzDIO/UILIA
     await validate(profile);
 
     expect(fetch).not.toHaveBeenCalled();
-  });
-
-  it('should pass the found user to resolveAppConfigForUser', async () => {
-    const existingUser = {
-      _id: 'tenant-user-id',
-      provider: 'saml',
-      samlId: 'saml-1234',
-      email: 'test@example.com',
-      tenantId: 'tenant-c',
-      role: 'USER',
-    };
-    findUser.mockResolvedValue(existingUser);
-
-    const profile = { ...baseProfile };
-    await validate(profile);
-
-    expect(resolveAppConfigForUser).toHaveBeenCalledWith(getAppConfig, existingUser);
-  });
-
-  it('should use baseConfig for new SAML user without calling resolveAppConfigForUser', async () => {
-    const profile = { ...baseProfile };
-    await validate(profile);
-
-    expect(resolveAppConfigForUser).not.toHaveBeenCalled();
-    expect(getAppConfig).toHaveBeenCalledWith({ baseOnly: true });
-  });
-
-  it('should block login when tenant config restricts the domain', async () => {
-    const { isEmailDomainAllowed } = require('@librechat/api');
-    const existingUser = {
-      _id: 'tenant-blocked',
-      provider: 'saml',
-      samlId: 'saml-1234',
-      email: 'test@example.com',
-      tenantId: 'tenant-restrict',
-      role: 'USER',
-    };
-    findUser.mockResolvedValue(existingUser);
-    resolveAppConfigForUser.mockResolvedValue({
-      registration: { allowedDomains: ['other.com'] },
-    });
-    isEmailDomainAllowed.mockReturnValueOnce(true).mockReturnValueOnce(false);
-
-    const profile = { ...baseProfile };
-    const { user } = await validate(profile);
-    expect(user).toBe(false);
   });
 });

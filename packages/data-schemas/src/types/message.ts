@@ -11,7 +11,7 @@ export interface IMessage extends Document {
   conversationSignature?: string;
   clientId?: string;
   invocationId?: number;
-  parentMessageId?: string | null;
+  parentMessageId?: string;
   tokenCount?: number;
   summaryTokenCount?: number;
   sender?: string;
@@ -39,13 +39,8 @@ export interface IMessage extends Document {
   iconURL?: string;
   addedConvo?: boolean;
   metadata?: Record<string, unknown>;
-  contextMeta?: {
-    calibrationRatio?: number;
-    encoding?: string;
-  };
   attachments?: unknown[];
-  expiredAt?: Date | null;
+  expiredAt?: Date;
   createdAt?: Date;
   updatedAt?: Date;
-  tenantId?: string;
 }

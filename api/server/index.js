@@ -2,14 +2,15 @@ require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 require('module-alias')({ base: path.resolve(__dirname, '..') });
+require('./services/viventium/anthropicOAuthPatch');
 const cors = require('cors');
 const axios = require('axios');
 const express = require('express');
 const passport = require('passport');
 const compression = require('compression');
 const cookieParser = require('cookie-parser');
+const { logger } = require('@librechat/data-schemas');
 const mongoSanitize = require('express-mongo-sanitize');
-const { logger, runAsSystem } = require('@librechat/data-schemas');
 const {
   isEnabled,
   apiNotFound,
@@ -20,22 +21,19 @@ const {
   GenerationJobManager,
   createStreamServices,
   initializeFileStorage,
-  updateInterfacePermissions,
-  preAuthTenantMiddleware,
 } = require('@librechat/api');
 const { connectDb, indexSync } = require('~/db');
 const initializeOAuthReconnectManager = require('./services/initializeOAuthReconnectManager');
-const { getRoleByName, updateAccessPermissions, seedDatabase } = require('~/models');
-const { capabilityContextMiddleware } = require('./middleware/roles/capabilities');
 const createValidateImageRequest = require('./middleware/validateImageRequest');
 const { jwtLogin, ldapLogin, passportLogin } = require('~/strategies');
+const { updateInterfacePermissions } = require('~/models/interface');
 const { checkMigrations } = require('./services/start/migration');
 const initializeMCPs = require('./services/initializeMCPs');
 const configureSocialLogins = require('./socialLogins');
 const { getAppConfig } = require('./services/Config');
 const staticCache = require('./utils/staticCache');
-const optionalJwtAuth = require('./middleware/optionalJwtAuth');
 const noIndex = require('./middleware/noIndex');
+const { seedDatabase } = require('~/models');
 const routes = require('./routes');
 
 const { PORT, HOST, ALLOW_SOCIAL_LOGIN, DISABLE_COMPRESSION, TRUST_PROXY } = process.env ?? {};
@@ -61,20 +59,11 @@ const startServer = async () => {
   app.disable('x-powered-by');
   app.set('trust proxy', trusted_proxy);
 
-  if (isEnabled(process.env.TENANT_ISOLATION_STRICT)) {
-    logger.warn(
-      '[Security] TENANT_ISOLATION_STRICT is active. Ensure your reverse proxy strips or sets ' +
-        'the X-Tenant-Id header — untrusted clients must not be able to set it directly.',
-    );
-  }
-
-  await runAsSystem(seedDatabase);
-  const appConfig = await getAppConfig({ baseOnly: true });
+  await seedDatabase();
+  const appConfig = await getAppConfig();
   initializeFileStorage(appConfig);
-  await runAsSystem(async () => {
-    await performStartupChecks(appConfig);
-    await updateInterfacePermissions({ appConfig, getRoleByName, updateAccessPermissions });
-  });
+  await performStartupChecks(appConfig);
+  await updateInterfacePermissions(appConfig);
 
   const indexPath = path.join(appConfig.paths.dist, 'index.html');
   let indexHTML = fs.readFileSync(indexPath, 'utf8');
@@ -92,13 +81,44 @@ const startServer = async () => {
     }
   }
 
-  app.get('/health', (_req, res) => res.status(200).send('OK'));
+  /* === VIVENTIUM START ===
+   * Feature: Health probe parity for Azure Container Apps.
+   * Purpose: Liveness/readiness probes currently hit /api/health in managed cloud.
+   * Keep both routes lightweight and equivalent to avoid false restarts.
+   */
+  app.get(['/health', '/api/health'], (_req, res) => res.status(200).send('OK'));
+  /* === VIVENTIUM END === */
 
   /* Middleware */
   app.use(noIndex);
-  app.use(express.json({ limit: '3mb' }));
-  app.use(express.urlencoded({ extended: true, limit: '3mb' }));
+  /* === VIVENTIUM START ===
+   * Feature: Telegram file upload payload sizing
+   * Purpose: Allow larger JSON bodies when Telegram sends base64 files.
+   * Added: 2026-01-31
+   */
+  const baseJsonLimitMb = 3;
+  let jsonLimitMb = baseJsonLimitMb;
+  const telegramPayloadLimit = Number.parseInt(
+    process.env.VIVENTIUM_TELEGRAM_PAYLOAD_LIMIT_MB,
+    10,
+  );
+  if (Number.isFinite(telegramPayloadLimit) && telegramPayloadLimit > 0) {
+    jsonLimitMb = Math.max(baseJsonLimitMb, telegramPayloadLimit);
+  } else {
+    const telegramMaxFileBytes = Number.parseInt(
+      process.env.VIVENTIUM_TELEGRAM_MAX_FILE_SIZE,
+      10,
+    );
+    if (Number.isFinite(telegramMaxFileBytes) && telegramMaxFileBytes > 0) {
+      const estimatedMb = Math.ceil((telegramMaxFileBytes * 4) / 3 / (1024 * 1024));
+      jsonLimitMb = Math.max(baseJsonLimitMb, estimatedMb + 1);
+    }
+  }
+  const jsonLimit = `${jsonLimitMb}mb`;
+  app.use(express.json({ limit: jsonLimit }));
+  app.use(express.urlencoded({ extended: true, limit: jsonLimit }));
   app.use(handleJsonParseError);
+  /* === VIVENTIUM END === */
 
   /**
    * Express 5 Compatibility: Make req.query writable for mongoSanitize
@@ -145,20 +165,10 @@ const startServer = async () => {
     await configureSocialLogins(app);
   }
 
-  /* Per-request capability cache — must be registered before any route that calls hasCapability */
-  app.use(capabilityContextMiddleware);
-
-  /* Pre-auth tenant context for unauthenticated routes that need tenant scoping.
-   * The reverse proxy / auth gateway sets `X-Tenant-Id` header for multi-tenant deployments. */
-  app.use('/oauth', preAuthTenantMiddleware, routes.oauth);
+  app.use('/oauth', routes.oauth);
   /* API Endpoints */
-  app.use('/api/auth', preAuthTenantMiddleware, routes.auth);
+  app.use('/api/auth', routes.auth);
   app.use('/api/admin', routes.adminAuth);
-  app.use('/api/admin/config', routes.adminConfig);
-  app.use('/api/admin/grants', routes.adminGrants);
-  app.use('/api/admin/groups', routes.adminGroups);
-  app.use('/api/admin/roles', routes.adminRoles);
-  app.use('/api/admin/users', routes.adminUsers);
   app.use('/api/actions', routes.actions);
   app.use('/api/keys', routes.keys);
   app.use('/api/api-keys', routes.apiKeys);
@@ -172,19 +182,26 @@ const startServer = async () => {
   app.use('/api/endpoints', routes.endpoints);
   app.use('/api/balance', routes.balance);
   app.use('/api/models', routes.models);
-  app.use('/api/config', preAuthTenantMiddleware, optionalJwtAuth, routes.config);
+  app.use('/api/config', routes.config);
   app.use('/api/assistants', routes.assistants);
   app.use('/api/files', await routes.files.initialize());
   app.use('/images/', createValidateImageRequest(appConfig.secureImageLinks), routes.staticRoute);
-  app.use('/api/share', preAuthTenantMiddleware, routes.share);
+  app.use('/api/share', routes.share);
   app.use('/api/roles', routes.roles);
   app.use('/api/agents', routes.agents);
   app.use('/api/banner', routes.banner);
   app.use('/api/memories', routes.memories);
   app.use('/api/permissions', routes.accessPermissions);
+  /* === VIVENTIUM START ===
+   * Feature: Connected Accounts OAuth API.
+   * === VIVENTIUM END === */
+  app.use('/api/connected-accounts', routes.connectedAccounts);
 
   app.use('/api/tags', routes.tags);
   app.use('/api/mcp', routes.mcp);
+  // === VIVENTIUM START - Voice Call Routes ===
+  app.use('/api/viventium', routes.viventium);
+  // === VIVENTIUM END ===
 
   /** 404 for unmatched API routes */
   app.use('/api', apiNotFound);
@@ -222,10 +239,8 @@ const startServer = async () => {
       logger.info(`Server listening at http://${host == '0.0.0.0' ? 'localhost' : host}:${port}`);
     }
 
-    await runAsSystem(async () => {
-      await initializeMCPs();
-      await initializeOAuthReconnectManager();
-    });
+    await initializeMCPs();
+    await initializeOAuthReconnectManager();
     await checkMigrations();
 
     // Configure stream services (auto-detects Redis from USE_REDIS env var)

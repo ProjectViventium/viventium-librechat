@@ -11,7 +11,6 @@ import type {
   TCustomEndpoints,
   TAssistantEndpoint,
   TAnthropicEndpoint,
-  SummarizationConfig,
 } from 'librechat-data-provider';
 
 export type JsonSchemaType = {
@@ -57,8 +56,6 @@ export interface AppConfig {
   };
   /** Memory configuration */
   memory?: TMemoryConfig;
-  /** Summarization configuration */
-  summarization?: SummarizationConfig;
   /** Web search configuration */
   webSearch?: TCustomConfig['webSearch'];
   /** File storage strategy ('local', 's3', 'firebase', 'azure_blob') */

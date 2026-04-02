@@ -78,6 +78,18 @@ export interface AnthropicConfigOptions {
   proxy?: string | null;
   /** URL for a reverse proxy, if used */
   reverseProxyUrl?: string | null;
+  /* === VIVENTIUM START ===
+   * Feature: Connected Accounts Anthropic OAuth mode propagation.
+   * Purpose: Preserve connected-account OAuth metadata from initialization to LLM config,
+   * allowing runtime selection between API-key and OAuth bearer auth modes.
+   * === VIVENTIUM END === */
+  /**
+   * Optional connected-account OAuth marker.
+   * When `subscription`, Anthropic requests should use OAuth bearer auth mode.
+   */
+  oauthType?: string;
+  /** Optional connected-account provider marker (e.g. "anthropic"). */
+  oauthProvider?: string;
   /** Default parameters to apply only if fields are undefined */
   defaultParams?: Record<string, unknown>;
   /** Additional parameters to add to the configuration */

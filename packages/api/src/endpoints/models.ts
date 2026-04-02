@@ -1,14 +1,7 @@
-import crypto from 'crypto';
 import axios from 'axios';
 import { logger } from '@librechat/data-schemas';
 import { HttpsProxyAgent } from 'https-proxy-agent';
-import {
-  Time,
-  CacheKeys,
-  KnownEndpoints,
-  EModelEndpoint,
-  defaultModels,
-} from 'librechat-data-provider';
+import { CacheKeys, KnownEndpoints, EModelEndpoint, defaultModels } from 'librechat-data-provider';
 import type { IUser } from '@librechat/data-schemas';
 import {
   processModelData,
@@ -44,8 +37,6 @@ export interface FetchModelsParams {
   headers?: Record<string, string> | null;
   /** Optional user object for header resolution */
   userObject?: Partial<IUser>;
-  /** Skip MODEL_QUERIES cache (e.g., for user-provided keys) */
-  skipCache?: boolean;
 }
 
 /**
@@ -113,7 +104,6 @@ export async function fetchModels({
   tokenKey,
   headers,
   userObject,
-  skipCache = false,
 }: FetchModelsParams): Promise<string[]> {
   let models: string[] = [];
   const baseURL = direct ? extractBaseURL(_baseURL ?? '') : _baseURL;
@@ -126,32 +116,13 @@ export async function fetchModels({
     return models;
   }
 
-  const shouldCache = !skipCache && !(userIdQuery && user);
-  const cacheKey = shouldCache ? modelsCacheKey(baseURL ?? '', apiKey) : '';
-  const modelsCache = shouldCache ? standardCache(CacheKeys.MODEL_QUERIES) : null;
-  if (modelsCache && cacheKey) {
-    const cachedModels = await modelsCache.get(cacheKey);
-    if (cachedModels) {
-      return cachedModels as string[];
-    }
-  }
-
   if (name && name.toLowerCase().startsWith(KnownEndpoints.ollama)) {
-    let ollamaModels: string[] | null = null;
     try {
-      ollamaModels = await fetchOllamaModels(baseURL ?? '', { headers, user: userObject });
+      return await fetchOllamaModels(baseURL ?? '', { headers, user: userObject });
     } catch (ollamaError) {
-      logAxiosError({
-        message:
-          'Failed to fetch models from Ollama API. Attempting to fetch via OpenAI-compatible endpoint.',
-        error: ollamaError as Error,
-      });
-    }
-    if (ollamaModels !== null) {
-      if (modelsCache && cacheKey && ollamaModels.length > 0) {
-        await modelsCache.set(cacheKey, ollamaModels, Time.TWO_MINUTES);
-      }
-      return ollamaModels;
+      const logMessage =
+        'Failed to fetch models from Ollama API. Attempting to fetch via OpenAI-compatible endpoint.';
+      logAxiosError({ message: logMessage, error: ollamaError as Error });
     }
   }
 
@@ -204,15 +175,7 @@ export async function fetchModels({
     logAxiosError({ message: logMessage, error: error as Error });
   }
 
-  if (modelsCache && cacheKey && models.length > 0) {
-    await modelsCache.set(cacheKey, models, Time.TWO_MINUTES);
-  }
-
   return models;
-}
-
-function modelsCacheKey(baseURL: string, apiKey: string): string {
-  return crypto.createHash('sha256').update(`${baseURL}:${apiKey}`).digest('hex').slice(0, 32);
 }
 
 /** Options for fetching OpenAI models */
@@ -227,8 +190,6 @@ export interface GetOpenAIModelsOptions {
   openAIApiKey?: string;
   /** Whether user provides their own API key */
   userProvidedOpenAI?: boolean;
-  /** Skip MODEL_QUERIES cache (e.g., for user-provided keys) */
-  skipCache?: boolean;
 }
 
 /**
@@ -257,6 +218,13 @@ export async function fetchOpenAIModels(
     baseURL = extractBaseURL(reverseProxyUrl) ?? openaiBaseURL;
   }
 
+  const modelsCache = standardCache(CacheKeys.MODEL_QUERIES);
+
+  const cachedModels = await modelsCache.get(baseURL);
+  if (cachedModels) {
+    return cachedModels as string[];
+  }
+
   if (baseURL || opts.azure) {
     models = await fetchModels({
       apiKey: apiKey ?? '',
@@ -264,7 +232,6 @@ export async function fetchOpenAIModels(
       azure: opts.azure,
       user: opts.user,
       name: EModelEndpoint.openAI,
-      skipCache: opts.skipCache,
     });
   }
 
@@ -281,6 +248,7 @@ export async function fetchOpenAIModels(
     models = otherModels.concat(instructModels);
   }
 
+  await modelsCache.set(baseURL, models);
   return models;
 }
 
@@ -325,7 +293,7 @@ export async function getOpenAIModels(opts: GetOpenAIModelsOptions = {}): Promis
  * @returns Promise resolving to array of model IDs
  */
 export async function fetchAnthropicModels(
-  opts: { user?: string; skipCache?: boolean } = {},
+  opts: { user?: string } = {},
   _models: string[] = [],
 ): Promise<string[]> {
   let models = _models.slice() ?? [];
@@ -342,6 +310,13 @@ export async function fetchAnthropicModels(
     return models;
   }
 
+  const modelsCache = standardCache(CacheKeys.MODEL_QUERIES);
+
+  const cachedModels = await modelsCache.get(baseURL);
+  if (cachedModels) {
+    return cachedModels as string[];
+  }
+
   if (baseURL) {
     models = await fetchModels({
       apiKey,
@@ -349,7 +324,6 @@ export async function fetchAnthropicModels(
       user: opts.user,
       name: EModelEndpoint.anthropic,
       tokenKey: EModelEndpoint.anthropic,
-      skipCache: opts.skipCache,
     });
   }
 
@@ -357,6 +331,7 @@ export async function fetchAnthropicModels(
     return _models;
   }
 
+  await modelsCache.set(baseURL, models);
   return models;
 }
 

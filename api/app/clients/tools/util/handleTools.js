@@ -1,19 +1,21 @@
 const { logger } = require('@librechat/data-schemas');
-const {
-  EnvVar,
-  Calculator,
-  createSearchTool,
-  createCodeExecutionTool,
-} = require('@librechat/agents');
+const { EnvVar, Calculator, createCodeExecutionTool } = require('@librechat/agents');
+/* === VIVENTIUM START ===
+ * Fix: Do not import `buildWebSearchContext` from `@librechat/api`.
+ * Reason: This file defines a Viventium-specific `buildWebSearchContext()` below (surface-aware prompt tuning).
+ * Importing both causes a duplicate identifier parse error (Jest/Node).
+ * Porting note: If upstream refactors tool context generation, keep this import list aligned with the Viventium override.
+ */
 const {
   checkAccess,
-  toolkitParent,
   createSafeUser,
   mcpToolPattern,
   loadWebSearchAuth,
   buildImageToolContext,
-  buildWebSearchContext,
+  // buildWebSearchContext, // VIVENTIUM: overridden in this file
 } = require('@librechat/api');
+/* === VIVENTIUM END === */
+const { getMCPServersRegistry } = require('~/config');
 const {
   Tools,
   Constants,
@@ -21,6 +23,19 @@ const {
   EToolResources,
   PermissionTypes,
 } = require('librechat-data-provider');
+/* === VIVENTIUM START ===
+ * Bugfix: Restore `web_search` tool loading on server.
+ *
+ * Context:
+ * - Viventium overrides `buildWebSearchContext()` in this file and uses `replaceSpecialVars()`
+ *   to inject the current datetime into the tool context.
+ * - During the 0.8.2 migration, we added the override but missed importing `replaceSpecialVars`,
+ *   causing runtime crashes: "Error loading tool web_search: replaceSpecialVars is not defined".
+ *
+ * Added: 2026-02-10
+ */
+const { replaceSpecialVars } = require('librechat-data-provider');
+/* === VIVENTIUM END === */
 const {
   availableTools,
   manifestToolMap,
@@ -38,14 +53,19 @@ const {
   createGeminiImageTool,
   createOpenAIImageTools,
 } = require('../');
-const { createMCPTool, createMCPTools, resolveConfigServers } = require('~/server/services/MCP');
-const { createFileSearchTool, primeFiles: primeSearchFiles } = require('./fileSearch');
 const { primeFiles: primeCodeFiles } = require('~/server/services/Files/Code/process');
+const { createFileSearchTool, primeFiles: primeSearchFiles } = require('./fileSearch');
 const { getUserPluginAuthValue } = require('~/server/services/PluginService');
+const { createMCPTool, createMCPTools } = require('~/server/services/MCP');
 const { loadAuthValues } = require('~/server/services/Tools/credentials');
 const { getMCPServerTools } = require('~/server/services/Config');
-const { getMCPServersRegistry } = require('~/config');
-const { getRoleByName } = require('~/models');
+const { getRoleByName } = require('~/models/Role');
+/* === VIVENTIUM START ===
+ * Feature: Surface-aware prompt helpers (shared across tools + agents)
+ */
+const { resolveViventiumSurface } = require('~/server/services/viventium/surfacePrompts');
+const { createViventiumSearchTool } = require('./viventiumSearchTool');
+/* === VIVENTIUM END === */
 
 /**
  * Validates the availability and authentication of tools for a user based on environment variables or user-specific plugin authentication values.
@@ -110,6 +130,40 @@ const validateTools = async (user, tools = []) => {
   }
 };
 
+/* === VIVENTIUM START ===
+ * Feature: Surface-aware web search prompt tuning.
+ */
+function buildWebSearchContext({ tool, req }) {
+  const now = replaceSpecialVars({ text: '{{iso_datetime}}' });
+  const header = `# \`${tool}\`:\nCurrent Date & Time: ${now}\n\n`;
+  const voiceMode = req?.body?.voiceMode === true;
+  const surface = resolveViventiumSurface(req);
+
+  if (voiceMode) {
+    return `${header}**Execute immediately without preface.** After search, respond in plain conversational text. No markdown, no lists, no tables, no code blocks. Keep it brief unless the user asks for detail. If sources matter, mention the source names inline. Do NOT include citation markers or bracketed references.`.trim();
+  }
+
+  if (surface === 'telegram') {
+    return `${header}**Execute immediately without preface.** After search, provide a concise summary and format for Telegram MarkdownV2 (bold/italic/underline/strikethrough/spoiler, inline code, code blocks). Avoid markdown tables, heading syntax (#), and HTML. Use short bold section titles and bullet lists. If sources are helpful, include plain URLs under a "Sources:" line (no markdown links, no citation markers).`.trim();
+  }
+
+  return `${header}**Execute immediately without preface.** After search, provide a brief summary addressing the query directly, then structure your response with clear Markdown formatting (## headers, lists, tables). Cite sources properly, tailor tone to query type, and provide comprehensive details.
+
+**CITATION FORMAT - UNICODE ESCAPE SEQUENCES ONLY:**
+Use these EXACT escape sequences (copy verbatim): \\ue202 (before each anchor), \\ue200 (group start), \\ue201 (group end), \\ue203 (highlight start), \\ue204 (highlight end)
+
+Anchor pattern: \\ue202turn{N}{type}{index} where N=turn number, type=search|news|image|ref, index=0,1,2...
+
+**Examples (copy these exactly):**
+- Single: "Statement.\\ue202turn0search0"
+- Multiple: "Statement.\\ue202turn0search0\\ue202turn0news1"
+- Group: "Statement. \\ue200\\ue202turn0search0\\ue202turn0news1\\ue201"
+- Highlight: "\\ue203Cited text.\\ue204\\ue202turn0search0"
+- Image: "See photo\\ue202turn0image0."
+
+**CRITICAL:** Output escape sequences EXACTLY as shown. Do NOT substitute with † or other symbols. Place anchors AFTER punctuation. Cite every non-obvious fact/quote. NEVER use markdown links, [1], footnotes, or HTML tags.`.trim();
+}
+/* === VIVENTIUM END === */
 /** @typedef {typeof import('@langchain/core/tools').Tool} ToolConstructor */
 /** @typedef {import('@langchain/core/tools').Tool} Tool */
 
@@ -208,7 +262,7 @@ const loadTools = async ({
     },
     gemini_image_gen: async (toolContextMap) => {
       const authFields = getAuthFields('gemini_image_gen');
-      const authValues = await loadAuthValues({ userId: user, authFields, throwError: false });
+      const authValues = await loadAuthValues({ userId: user, authFields });
       const imageFiles = options.tool_resources?.[EToolResources.image_edit]?.files ?? [];
       const toolContext = buildImageToolContext({
         imageFiles,
@@ -223,6 +277,7 @@ const loadTools = async ({
         isAgent: !!agent,
         req: options.req,
         imageFiles,
+        processFileURL: options.processFileURL,
         userId: user,
         fileStrategy,
       });
@@ -255,12 +310,6 @@ const loadTools = async ({
   /** @type {Record<string, string>} */
   const toolContextMap = {};
   const requestedMCPTools = {};
-
-  /** Resolve config-source servers for the current user/tenant context */
-  let configServers;
-  if (tools.some((tool) => tool && mcpToolPattern.test(tool))) {
-    configServers = await resolveConfigServers(options.req);
-  }
 
   for (const tool of tools) {
     if (tool === Tools.execute_code) {
@@ -331,8 +380,18 @@ const loadTools = async ({
       });
       const { onSearchResults, onGetHighlights } = options?.[Tools.web_search] ?? {};
       requestedTools[tool] = async () => {
-        toolContextMap[tool] = buildWebSearchContext();
-        return createSearchTool({
+        /* === VIVENTIUM START ===
+         * Feature: Viventium web_search runtime wrapper
+         * Purpose:
+         * - Attach the correct surface-specific instructions (voice/telegram/playground) to the tool call.
+         * - Route all web_search execution through the Viventium safety wrapper so unsafe/noisy
+         *   provider results are sanitized before they reach attachments, scraping, or model context.
+         * Added: 2026-01-15
+         */
+        toolContextMap[tool] = buildWebSearchContext({ tool, req: options?.req });
+        // Shared runtime wrapper for Web UI, background cortices, Telegram, and voice flows.
+        /* === VIVENTIUM END === */
+        return createViventiumSearchTool({
           ...result.authResult,
           onSearchResults,
           onGetHighlights,
@@ -347,7 +406,7 @@ const loadTools = async ({
         continue;
       }
       const serverConfig = serverName
-        ? await getMCPServersRegistry().getServerConfig(serverName, user, configServers)
+        ? await getMCPServersRegistry().getServerConfig(serverName, user)
         : null;
       if (!serverConfig) {
         logger.warn(
@@ -376,16 +435,8 @@ const loadTools = async ({
       continue;
     }
 
-    const toolKey = customConstructors[tool] ? tool : toolkitParent[tool];
-    if (toolKey && customConstructors[toolKey]) {
-      if (!requestedTools[toolKey]) {
-        let cached;
-        requestedTools[toolKey] = async () => {
-          cached ??= customConstructors[toolKey](toolContextMap);
-          return cached;
-        };
-      }
-      requestedTools[tool] = requestedTools[toolKey];
+    if (customConstructors[tool]) {
+      requestedTools[tool] = async () => customConstructors[tool](toolContextMap);
       continue;
     }
 
@@ -425,7 +476,6 @@ const loadTools = async ({
   let index = -1;
   const failedMCPServers = new Set();
   const safeUser = createSafeUser(options.req?.user);
-
   for (const [serverName, toolConfigs] of Object.entries(requestedMCPTools)) {
     index++;
     /** @type {LCAvailableTools} */
@@ -440,7 +490,6 @@ const loadTools = async ({
           signal,
           user: safeUser,
           userMCPAuthMap,
-          configServers,
           res: options.res,
           streamId: options.req?._resumableStreamId || null,
           model: agent?.model ?? model,

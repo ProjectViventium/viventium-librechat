@@ -154,10 +154,10 @@ describe('Agent Context Utilities', () => {
       );
 
       expect(result).toBe(instructions);
-      expect(mockMCPManager.formatInstructionsForContext).toHaveBeenCalledWith(
-        ['server1', 'server2'],
-        undefined,
-      );
+      expect(mockMCPManager.formatInstructionsForContext).toHaveBeenCalledWith([
+        'server1',
+        'server2',
+      ]);
       expect(mockLogger.debug).toHaveBeenCalledWith(
         '[AgentContext] Fetched MCP instructions for servers:',
         ['server1', 'server2'],
@@ -345,10 +345,9 @@ describe('Agent Context Utilities', () => {
         logger: mockLogger,
       });
 
-      expect(mockMCPManager.formatInstructionsForContext).toHaveBeenCalledWith(
-        ['ephemeral-server'],
-        undefined,
-      );
+      expect(mockMCPManager.formatInstructionsForContext).toHaveBeenCalledWith([
+        'ephemeral-server',
+      ]);
       expect(agent.instructions).toContain('Ephemeral MCP');
     });
 
@@ -376,10 +375,7 @@ describe('Agent Context Utilities', () => {
         logger: mockLogger,
       });
 
-      expect(mockMCPManager.formatInstructionsForContext).toHaveBeenCalledWith(
-        ['agent-server'],
-        undefined,
-      );
+      expect(mockMCPManager.formatInstructionsForContext).toHaveBeenCalledWith(['agent-server']);
     });
 
     it('should work without agentId', async () => {

@@ -13,7 +13,6 @@ const promptSchema: Schema<IPrompt> = new Schema(
       type: Schema.Types.ObjectId,
       ref: 'User',
       required: true,
-      index: true,
     },
     prompt: {
       type: String,
@@ -23,10 +22,6 @@ const promptSchema: Schema<IPrompt> = new Schema(
       type: String,
       enum: ['text', 'chat'],
       required: true,
-    },
-    tenantId: {
-      type: String,
-      index: true,
     },
   },
   {

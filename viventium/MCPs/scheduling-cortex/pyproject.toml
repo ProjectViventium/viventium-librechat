@@ -1,0 +1,20 @@
+# VIVENTIUM START
+# Purpose: Viventium addition in private LibreChat fork (new file).
+# Porting: Copy this file wholesale when reapplying Viventium changes onto a fresh upstream checkout.
+# VIVENTIUM END
+
+[project]
+name = "scheduling-cortex-mcp"
+version = "0.1.0"
+description = "Viventium Scheduling Cortex MCP server"
+authors = [{ name = "Viventium" }]
+requires-python = ">=3.10"
+dependencies = [
+  "fastmcp>=2.12.5",
+  "pydantic>=2.7",
+  "croniter>=2.0",
+  "md2tgmd>=0.3.10",
+]
+
+[project.scripts]
+scheduling-cortex = "scheduling_cortex.server:main"

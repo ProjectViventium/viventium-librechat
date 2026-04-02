@@ -14,4 +14,3 @@ export * from './prompts';
 export * from './run';
 export * from './tokens';
 export * from './stream';
-export * from './principal';

@@ -123,6 +123,9 @@ function disposeClient(client) {
     if (client.maxContextTokens) {
       client.maxContextTokens = null;
     }
+    if (client.contextStrategy) {
+      client.contextStrategy = null;
+    }
     if (client.currentDateString) {
       client.currentDateString = null;
     }

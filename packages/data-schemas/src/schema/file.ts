@@ -73,14 +73,20 @@ const file: Schema<IMongoFile> = new Schema(
     height: Number,
     metadata: {
       fileIdentifier: String,
+      /* === VIVENTIUM START ===
+       * Feature: Conversation Recall corpus change detection metadata
+       * Added: 2026-02-20
+       */
+      conversationRecallSourceDigest: String,
+      conversationRecallUploadedDigest: String,
+      conversationRecallDigest: String,
+      conversationRecallTurnCount: Number,
+      conversationRecallCharCount: Number,
+      /* === VIVENTIUM END === */
     },
     expiresAt: {
       type: Date,
       expires: 3600, // 1 hour in seconds
-    },
-    tenantId: {
-      type: String,
-      index: true,
     },
   },
   {
@@ -90,7 +96,7 @@ const file: Schema<IMongoFile> = new Schema(
 
 file.index({ createdAt: 1, updatedAt: 1 });
 file.index(
-  { filename: 1, conversationId: 1, context: 1, tenantId: 1 },
+  { filename: 1, conversationId: 1, context: 1 },
   { unique: true, partialFilterExpression: { context: FileContext.execute_code } },
 );
 

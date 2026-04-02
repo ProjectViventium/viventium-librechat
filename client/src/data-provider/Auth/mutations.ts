@@ -68,14 +68,14 @@ export const useRefreshTokenMutation = (
 
 /* User */
 export const useDeleteUserMutation = (
-  options?: t.MutationOptions<unknown, t.TDeleteUserRequest | undefined>,
-): UseMutationResult<unknown, unknown, t.TDeleteUserRequest | undefined, unknown> => {
+  options?: t.MutationOptions<unknown, undefined>,
+): UseMutationResult<unknown, unknown, undefined, unknown> => {
   const queryClient = useQueryClient();
   const clearStates = useClearStates();
   const resetDefaultPreset = useResetRecoilState(store.defaultPreset);
 
   return useMutation([MutationKeys.deleteUser], {
-    mutationFn: (payload?: t.TDeleteUserRequest) => dataService.deleteUser(payload),
+    mutationFn: () => dataService.deleteUser(),
     ...(options || {}),
     onSuccess: (...args) => {
       resetDefaultPreset();
@@ -90,11 +90,11 @@ export const useDeleteUserMutation = (
 export const useEnableTwoFactorMutation = (): UseMutationResult<
   t.TEnable2FAResponse,
   unknown,
-  t.TEnable2FARequest | undefined,
+  void,
   unknown
 > => {
   const queryClient = useQueryClient();
-  return useMutation((payload?: t.TEnable2FARequest) => dataService.enableTwoFactor(payload), {
+  return useMutation(() => dataService.enableTwoFactor(), {
     onSuccess: (data) => {
       queryClient.setQueryData([QueryKeys.user, '2fa'], data);
     },
@@ -146,18 +146,15 @@ export const useDisableTwoFactorMutation = (): UseMutationResult<
 export const useRegenerateBackupCodesMutation = (): UseMutationResult<
   t.TRegenerateBackupCodesResponse,
   unknown,
-  t.TRegenerateBackupCodesRequest | undefined,
+  void,
   unknown
 > => {
   const queryClient = useQueryClient();
-  return useMutation(
-    (payload?: t.TRegenerateBackupCodesRequest) => dataService.regenerateBackupCodes(payload),
-    {
-      onSuccess: (data) => {
-        queryClient.setQueryData([QueryKeys.user, '2fa', 'backup'], data);
-      },
+  return useMutation(() => dataService.regenerateBackupCodes(), {
+    onSuccess: (data) => {
+      queryClient.setQueryData([QueryKeys.user, '2fa', 'backup'], data);
     },
-  );
+  });
 };
 
 export const useVerifyTwoFactorTempMutation = (

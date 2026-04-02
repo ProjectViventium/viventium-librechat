@@ -1,7 +1,7 @@
-import React, { useMemo, useCallback, useRef, useState } from 'react';
 import { Plus } from 'lucide-react';
+import React, { useMemo, useCallback, useRef, useState } from 'react';
 import { Button, useToastContext } from '@librechat/client';
-import { useWatch, useForm, FormProvider } from 'react-hook-form';
+import { useWatch, useForm, FormProvider, type FieldNamesMarkedBoolean } from 'react-hook-form';
 import { useGetModelsQuery } from 'librechat-data-provider/react-query';
 import {
   Tools,
@@ -11,10 +11,8 @@ import {
   PermissionBits,
   isAssistantsEndpoint,
 } from 'librechat-data-provider';
-import type { FieldNamesMarkedBoolean } from 'react-hook-form';
-import type { Agent } from 'librechat-data-provider';
-import type { TranslationKeys } from '~/hooks/useLocalize';
 import type { AgentForm, StringOption } from '~/common';
+import type { Agent } from 'librechat-data-provider';
 import {
   useCreateAgentMutation,
   useUpdateAgentMutation,
@@ -25,6 +23,7 @@ import {
 import { createProviderOption, getDefaultAgentFormValues } from '~/utils';
 import { useResourcePermissions } from '~/hooks/useResourcePermissions';
 import { useSelectAgent, useLocalize, useAuthContext } from '~/hooks';
+import type { TranslationKeys } from '~/hooks/useLocalize';
 import { useAgentPanelContext } from '~/Providers/AgentPanelContext';
 import AgentPanelSkeleton from './AgentPanelSkeleton';
 import AdvancedPanel from './Advanced/AdvancedPanel';
@@ -32,7 +31,9 @@ import { Panel, isEphemeralAgent } from '~/common';
 import AgentConfig from './AgentConfig';
 import AgentSelect from './AgentSelect';
 import AgentFooter from './AgentFooter';
+import VoiceLlmPanel from './VoiceLlmPanel';
 import ModelPanel from './ModelPanel';
+import { resolveSelectedAgentIdForApply } from './selection';
 
 /* Helpers */
 function getUpdateToastMessage(
@@ -75,7 +76,26 @@ export function composeAgentUpdatePayload(data: AgentForm, agent_id?: string | n
     category,
     support_contact,
     tool_options,
+    /* === VIVENTIUM START ===
+     * Feature: Agent-scoped conversation recall toggle
+     * Added: 2026-02-19
+     */
+    conversation_recall_agent_only,
+    /* === VIVENTIUM END === */
     avatar_action: avatarActionState,
+    /* === VIVENTIUM START ===
+     * Feature: Background Cortices (Multi-Agent Brain Architecture)
+     * Added: 2026-01-03 - Include background_cortices in payload
+     */
+    background_cortices,
+    /* === VIVENTIUM END === */
+    /* === VIVENTIUM START ===
+     * Feature: Voice Chat LLM Override
+     * Added: 2026-02-24
+     */
+    voice_llm_model,
+    voice_llm_provider,
+    /* === VIVENTIUM END === */
   } = data;
 
   const shouldResetAvatar =
@@ -83,6 +103,15 @@ export function composeAgentUpdatePayload(data: AgentForm, agent_id?: string | n
   const model = _model ?? '';
   const provider =
     (typeof _provider === 'string' ? _provider : (_provider as StringOption).value) ?? '';
+  const alignedModelParameters =
+    model_parameters && typeof model_parameters === 'object'
+      ? {
+          ...model_parameters,
+          ...(model ? { model } : {}),
+        }
+      : model
+        ? { model }
+        : model_parameters;
 
   return {
     payload: {
@@ -92,7 +121,7 @@ export function composeAgentUpdatePayload(data: AgentForm, agent_id?: string | n
       instructions,
       model,
       provider,
-      model_parameters,
+      model_parameters: alignedModelParameters,
       agent_ids,
       edges,
       end_after_tools,
@@ -101,6 +130,30 @@ export function composeAgentUpdatePayload(data: AgentForm, agent_id?: string | n
       category,
       support_contact,
       tool_options,
+      ...(typeof conversation_recall_agent_only === 'boolean'
+        ? {
+            /* === VIVENTIUM START ===
+             * Feature: Agent-scoped conversation recall toggle
+             * Added: 2026-02-19
+             */
+            conversation_recall_agent_only,
+            /* === VIVENTIUM END === */
+          }
+        : {}),
+      /* === VIVENTIUM START ===
+       * Feature: Background Cortices (Multi-Agent Brain Architecture)
+       * Added: 2026-01-03 - Include background_cortices in payload
+       */
+      background_cortices,
+      /* === VIVENTIUM END === */
+      /* === VIVENTIUM START ===
+       * Feature: Voice Chat LLM Override
+       * Send null when cleared to reset in DB, or the selected voice model/provider.
+       * Added: 2026-02-24
+       */
+      voice_llm_model: voice_llm_model ?? null,
+      voice_llm_provider: voice_llm_provider ?? null,
+      /* === VIVENTIUM END === */
       ...(shouldResetAvatar ? { avatar: null } : {}),
     },
     provider,
@@ -459,10 +512,11 @@ export default function AgentPanel() {
   );
 
   const handleSelectAgent = useCallback(() => {
-    if (agent_id) {
-      onSelectAgent(agent_id);
+    const selectedAgentId = resolveSelectedAgentIdForApply(current_agent_id, agent_id);
+    if (selectedAgentId) {
+      onSelectAgent(selectedAgentId);
     }
-  }, [agent_id, onSelectAgent]);
+  }, [agent_id, current_agent_id, onSelectAgent]);
 
   const canEditAgent = useMemo(() => {
     if (!agentQuery.data?.id) {
@@ -480,10 +534,10 @@ export default function AgentPanel() {
     <FormProvider {...methods}>
       <form
         onSubmit={handleSubmit(onSubmit)}
-        className="scrollbar-gutter-stable h-auto w-full flex-shrink-0 px-3 pb-3"
+        className="scrollbar-gutter-stable h-auto w-full flex-shrink-0 overflow-y-hidden overflow-x-visible"
         aria-label="Agent configuration form"
       >
-        <div className="flex w-full flex-wrap gap-2">
+        <div className="mx-1 mt-2 flex w-full flex-wrap gap-2">
           <div className="w-full">
             <AgentSelect
               createMutation={create}
@@ -539,6 +593,11 @@ export default function AgentPanel() {
         {canEditAgent && !agentQuery.isInitialLoading && activePanel === Panel.model && (
           <ModelPanel models={models} providers={providers} setActivePanel={setActivePanel} />
         )}
+        {/* === VIVENTIUM START === Voice Chat LLM Override panel */}
+        {canEditAgent && !agentQuery.isInitialLoading && activePanel === Panel.voiceLlmModel && (
+          <VoiceLlmPanel models={models} providers={providers} setActivePanel={setActivePanel} />
+        )}
+        {/* === VIVENTIUM END === */}
         {canEditAgent && !agentQuery.isInitialLoading && activePanel === Panel.builder && (
           <AgentConfig />
         )}

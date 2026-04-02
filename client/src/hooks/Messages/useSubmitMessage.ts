@@ -3,7 +3,6 @@ import { useRecoilValue, useSetRecoilState } from 'recoil';
 import { replaceSpecialVars } from 'librechat-data-provider';
 import { useChatContext, useChatFormContext, useAddedChatContext } from '~/Providers';
 import { useAuthContext } from '~/hooks/AuthContext';
-import { mainTextareaId } from '~/common';
 import store from '~/store';
 
 export default function useSubmitMessage() {
@@ -50,8 +49,7 @@ export default function useSubmitMessage() {
         return;
       }
 
-      const textarea = document.getElementById(mainTextareaId) as HTMLTextAreaElement | null;
-      const currentText = textarea?.value ?? methods.getValues('text');
+      const currentText = methods.getValues('text');
       const newText = currentText.trim().length > 1 ? `\n${parsedText}` : parsedText;
       setActivePrompt(newText);
     },

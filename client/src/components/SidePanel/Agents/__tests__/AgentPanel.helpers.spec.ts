@@ -64,6 +64,24 @@ describe('composeAgentUpdatePayload', () => {
 
     expect(payload.avatar).toBeUndefined();
   });
+
+  it('aligns model_parameters.model with the selected model', () => {
+    const form = createForm();
+    form.provider = 'openAI';
+    form.model = 'gpt-5.4';
+    form.model_parameters = {
+      model: 'claude-opus-4-6',
+      reasoning_effort: 'xhigh',
+    } as AgentForm['model_parameters'];
+
+    const { payload } = composeAgentUpdatePayload(form, 'agent_123');
+
+    expect(payload.model).toBe('gpt-5.4');
+    expect(payload.model_parameters).toMatchObject({
+      model: 'gpt-5.4',
+      reasoning_effort: 'xhigh',
+    });
+  });
 });
 
 describe('persistAvatarChanges', () => {

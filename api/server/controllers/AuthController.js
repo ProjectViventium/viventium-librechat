@@ -10,6 +10,13 @@ const {
   setAuthTokens,
   registerUser,
 } = require('~/server/services/AuthService');
+/* === VIVENTIUM START ===
+ * Feature: Registration approval errors in refresh flows.
+ * === VIVENTIUM END === */
+const {
+  APPROVAL_ERROR_CODE,
+  PENDING_APPROVAL_MESSAGE,
+} = require('~/server/services/viventium/registrationApprovalService');
 const {
   deleteAllUserSessions,
   getUserById,
@@ -19,6 +26,14 @@ const {
 } = require('~/models');
 const { getGraphApiToken } = require('~/server/services/GraphTokenService');
 const { getOpenIdConfig, getOpenIdEmail } = require('~/strategies');
+
+const clearRefreshCookies = (res) => {
+  res.clearCookie('refreshToken');
+  res.clearCookie('openid_access_token');
+  res.clearCookie('openid_id_token');
+  res.clearCookie('openid_user_id');
+  res.clearCookie('token_provider');
+};
 
 const registrationController = async (req, res) => {
   try {
@@ -117,12 +132,22 @@ const refreshController = async (req, res) => {
         );
       }
 
-      const token = setOpenIDAuthTokens(tokenset, req, res, user._id.toString(), refreshToken);
+      const token = await setOpenIDAuthTokens(tokenset, req, res, user._id.toString(), refreshToken);
 
-      const { password: _pw, __v: _v, totpSecret: _ts, backupCodes: _bc, ...safeUser } = user;
-      return res.status(200).send({ token, user: safeUser });
+      user.federatedTokens = {
+        access_token: tokenset.access_token,
+        id_token: tokenset.id_token,
+        refresh_token: refreshToken,
+        expires_at: claims.exp,
+      };
+
+      return res.status(200).send({ token, user });
     } catch (error) {
-      logger.error('[refreshController] OpenID token refresh error', error);
+      if (error?.code === APPROVAL_ERROR_CODE) {
+        return res.status(403).send({ message: PENDING_APPROVAL_MESSAGE });
+      }
+      clearRefreshCookies(res);
+      logger.warn('[refreshController] Invalid OpenID refresh state cleared', error?.message ?? error);
       return res.status(403).send('Invalid OpenID refresh token');
     }
   }
@@ -169,7 +194,11 @@ const refreshController = async (req, res) => {
       res.status(401).send('Refresh token expired or not found for this user');
     }
   } catch (err) {
-    logger.error(`[refreshController] Invalid refresh token:`, err);
+    if (err?.code === APPROVAL_ERROR_CODE) {
+      return res.status(403).send({ message: PENDING_APPROVAL_MESSAGE });
+    }
+    clearRefreshCookies(res);
+    logger.warn('[refreshController] Invalid refresh token cleared', err?.message ?? err);
     res.status(403).send('Invalid refresh token');
   }
 };

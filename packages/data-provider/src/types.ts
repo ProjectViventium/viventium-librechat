@@ -13,6 +13,19 @@ import type { TMinimalFeedback } from './feedback';
 import type { ContentTypes } from './types/runs';
 import type { Agent } from './types/assistants';
 
+export {
+  AnthropicEffort,
+  BedrockProviders,
+  EModelEndpoint,
+  ImageDetail,
+  ReasoningEffort,
+  ReasoningSummary,
+  ThinkingLevel,
+  Verbosity,
+  anthropicSettings,
+  googleSettings,
+  openAISettings,
+} from './schemas';
 export * from './schemas';
 
 export type TMessages = TMessage[];
@@ -100,7 +113,6 @@ export type TEphemeralAgent = {
   web_search?: boolean;
   file_search?: boolean;
   execute_code?: boolean;
-  artifacts?: string;
 };
 
 export type TPayload = Partial<TMessage> &
@@ -206,6 +218,12 @@ export type TUser = {
   backupCodes?: TBackupCode[];
   personalization?: {
     memories?: boolean;
+    /* === VIVENTIUM START ===
+     * Feature: Global conversation recall preference
+     * Added: 2026-02-19
+     */
+    conversation_recall?: boolean;
+    /* === VIVENTIUM END === */
   };
   createdAt: string;
   updatedAt: string;
@@ -366,7 +384,6 @@ export type TConfig = {
   azure?: boolean;
   availableTools?: [];
   availableRegions?: string[];
-  allowedProviders?: (string | EModelEndpoint)[];
   plugins?: Record<string, string>;
   name?: string;
   iconURL?: string;
@@ -426,29 +443,28 @@ export type TLoginResponse = {
   tempToken?: string;
 };
 
-/** Shared payload for any operation that requires OTP or backup-code verification. */
-export type TOTPVerificationPayload = {
-  token?: string;
-  backupCode?: string;
-};
-
-export type TEnable2FARequest = TOTPVerificationPayload;
-
 export type TEnable2FAResponse = {
   otpauthUrl: string;
   backupCodes: string[];
   message?: string;
 };
 
-export type TVerify2FARequest = TOTPVerificationPayload;
+export type TVerify2FARequest = {
+  token?: string;
+  backupCode?: string;
+};
 
 export type TVerify2FAResponse = {
   message: string;
 };
 
-/** For verifying 2FA during login with a temporary token. */
-export type TVerify2FATempRequest = TOTPVerificationPayload & {
+/**
+ * For verifying 2FA during login with a temporary token.
+ */
+export type TVerify2FATempRequest = {
   tempToken: string;
+  token?: string;
+  backupCode?: string;
 };
 
 export type TVerify2FATempResponse = {
@@ -457,21 +473,29 @@ export type TVerify2FATempResponse = {
   message?: string;
 };
 
-export type TDisable2FARequest = TOTPVerificationPayload;
+/**
+ * Request for disabling 2FA.
+ */
+export type TDisable2FARequest = {
+  token?: string;
+  backupCode?: string;
+};
 
+/**
+ * Response from disabling 2FA.
+ */
 export type TDisable2FAResponse = {
   message: string;
 };
 
-export type TRegenerateBackupCodesRequest = TOTPVerificationPayload;
-
+/**
+ * Response from regenerating backup codes.
+ */
 export type TRegenerateBackupCodesResponse = {
-  message?: string;
+  message: string;
   backupCodes: string[];
-  backupCodesHash: TBackupCode[];
+  backupCodesHash: string[];
 };
-
-export type TDeleteUserRequest = TOTPVerificationPayload;
 
 export type TRequestPasswordReset = {
   email: string;
@@ -535,6 +559,7 @@ export type TPromptGroup = {
   command?: string;
   oneliner?: string;
   category?: string;
+  projectIds?: string[];
   productionId?: string | null;
   productionPrompt?: Pick<TPrompt, 'prompt'> | null;
   author: string;
@@ -587,7 +612,9 @@ export type TCreatePromptResponse = {
   group?: TPromptGroup;
 };
 
-export type TUpdatePromptGroupPayload = Partial<TPromptGroup>;
+export type TUpdatePromptGroupPayload = Partial<TPromptGroup> & {
+  removeProjectIds?: string[];
+};
 
 export type TUpdatePromptGroupVariables = {
   id: string;

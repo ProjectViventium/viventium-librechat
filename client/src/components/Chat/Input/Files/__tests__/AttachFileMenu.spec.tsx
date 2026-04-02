@@ -9,14 +9,13 @@ jest.mock('~/hooks', () => ({
   useAgentToolPermissions: jest.fn(),
   useAgentCapabilities: jest.fn(),
   useGetAgentsConfig: jest.fn(),
-  useFileHandlingNoChatContext: jest.fn(),
+  useFileHandling: jest.fn(),
   useLocalize: jest.fn(),
 }));
 
 jest.mock('~/hooks/Files/useSharePointFileHandling', () => ({
   __esModule: true,
   default: jest.fn(),
-  useSharePointFileHandlingNoChatContext: jest.fn(),
 }));
 
 jest.mock('~/data-provider', () => ({
@@ -53,7 +52,6 @@ jest.mock('@librechat/client', () => {
       ),
     AttachmentIcon: () => R.createElement('span', { 'data-testid': 'attachment-icon' }),
     SharePointIcon: () => R.createElement('span', { 'data-testid': 'sharepoint-icon' }),
-    useToastContext: () => ({ showToast: jest.fn() }),
   };
 });
 
@@ -68,14 +66,11 @@ jest.mock('@ariakit/react', () => {
 const mockUseAgentToolPermissions = jest.requireMock('~/hooks').useAgentToolPermissions;
 const mockUseAgentCapabilities = jest.requireMock('~/hooks').useAgentCapabilities;
 const mockUseGetAgentsConfig = jest.requireMock('~/hooks').useGetAgentsConfig;
-const mockUseFileHandlingNoChatContext = jest.requireMock('~/hooks').useFileHandlingNoChatContext;
+const mockUseFileHandling = jest.requireMock('~/hooks').useFileHandling;
 const mockUseLocalize = jest.requireMock('~/hooks').useLocalize;
 const mockUseSharePointFileHandling = jest.requireMock(
   '~/hooks/Files/useSharePointFileHandling',
 ).default;
-const mockUseSharePointFileHandlingNoChatContext = jest.requireMock(
-  '~/hooks/Files/useSharePointFileHandling',
-).useSharePointFileHandlingNoChatContext;
 const mockUseGetStartupConfig = jest.requireMock('~/data-provider').useGetStartupConfig;
 
 const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -97,15 +92,12 @@ function setupMocks(overrides: { provider?: string } = {}) {
     codeEnabled: false,
   });
   mockUseGetAgentsConfig.mockReturnValue({ agentsConfig: {} });
-  mockUseFileHandlingNoChatContext.mockReturnValue({ handleFileChange: jest.fn() });
-  const sharePointReturnValue = {
+  mockUseFileHandling.mockReturnValue({ handleFileChange: jest.fn() });
+  mockUseSharePointFileHandling.mockReturnValue({
     handleSharePointFiles: jest.fn(),
     isProcessing: false,
     downloadProgress: 0,
-    error: null,
-  };
-  mockUseSharePointFileHandling.mockReturnValue(sharePointReturnValue);
-  mockUseSharePointFileHandlingNoChatContext.mockReturnValue(sharePointReturnValue);
+  });
   mockUseGetStartupConfig.mockReturnValue({ data: { sharePointFilePickerEnabled: false } });
   mockUseAgentToolPermissions.mockReturnValue({
     fileSearchAllowedByAgent: false,
@@ -118,14 +110,7 @@ function renderMenu(props: Record<string, unknown> = {}) {
   return render(
     <QueryClientProvider client={queryClient}>
       <RecoilRoot>
-        <AttachFileMenu
-          conversationId="test-convo"
-          files={new Map()}
-          setFiles={() => {}}
-          setFilesLoading={() => {}}
-          conversation={null}
-          {...props}
-        />
+        <AttachFileMenu conversationId="test-convo" {...props} />
       </RecoilRoot>
     </QueryClientProvider>,
   );

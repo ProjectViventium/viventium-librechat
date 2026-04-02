@@ -7,12 +7,13 @@ jest.mock('@librechat/data-schemas', () => ({
   ...jest.requireActual('@librechat/data-schemas'),
   logger: {
     debug: jest.fn(),
+    info: jest.fn(),
     warn: jest.fn(),
   },
 }));
 
 import { handleRateLimits } from './limits';
-import { checkWebSearchConfig } from './checks';
+import { checkHealth, checkWebSearchConfig } from './checks';
 import { logger } from '@librechat/data-schemas';
 import { extractVariableName as extract } from 'librechat-data-provider';
 
@@ -97,9 +98,25 @@ describe('checkWebSearchConfig', () => {
   });
 
   describe('when config values are actual values instead of environment variable references', () => {
+    it('should treat resolved environment values as valid runtime config', () => {
+      const config = {
+        searxngInstanceUrl: 'http://localhost:8082',
+      };
+
+      extractVariableName.mockReturnValue(null);
+      process.env.SEARXNG_INSTANCE_URL = 'http://localhost:8082';
+
+      checkWebSearchConfig(config);
+
+      expect(logger.debug).toHaveBeenCalledWith(
+        'Web search searxngInstanceUrl: Using resolved environment variable SEARXNG_INSTANCE_URL with value set',
+      );
+      expect(logger.warn).not.toHaveBeenCalled();
+    });
+
     it('should warn when serperApiKey contains actual API key', () => {
       const config = {
-        serperApiKey: 'sk-1234567890abcdef',
+        serperApiKey: 'example-serper-key',
       };
 
       extractVariableName.mockReturnValue(null);
@@ -354,5 +371,58 @@ describe('handleRateLimits', () => {
     expect(process.env.STT_IP_WINDOW).toEqual('50');
     expect(process.env.STT_USER_MAX).toEqual('30');
     expect(process.env.STT_USER_WINDOW).toEqual('20');
+  });
+});
+
+describe('checkHealth', () => {
+  let originalEnv: NodeJS.ProcessEnv;
+  const originalFetch = global.fetch;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    originalEnv = process.env;
+    process.env = { ...originalEnv };
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+    global.fetch = originalFetch;
+    jest.useRealTimers();
+  });
+
+  it('returns early when RAG_API_URL is not configured', async () => {
+    delete process.env.RAG_API_URL;
+    global.fetch = jest.fn();
+
+    await checkHealth();
+
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it('times out health fetch and continues startup', async () => {
+    process.env.RAG_API_URL = 'https://rag.example.test';
+    process.env.VIVENTIUM_STARTUP_HEALTH_TIMEOUT_MS = '500';
+
+    jest.useFakeTimers();
+    global.fetch = jest.fn((_, init) => {
+      return new Promise((_, reject) => {
+        const signal = init?.signal as AbortSignal | undefined;
+        signal?.addEventListener('abort', () => {
+          const abortError = new Error('aborted');
+          abortError.name = 'AbortError';
+          reject(abortError);
+        });
+      });
+    }) as typeof fetch;
+
+    const healthPromise = checkHealth();
+    jest.advanceTimersByTime(1000);
+    await healthPromise;
+
+    expect(global.fetch).toHaveBeenCalledWith('https://rag.example.test/health', expect.any(Object));
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('RAG API health check timed out after 500ms'),
+    );
   });
 });

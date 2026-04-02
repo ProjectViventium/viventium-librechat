@@ -1,8 +1,8 @@
 import React from 'react';
 import { UIResourceRenderer } from '@mcp-ui/client';
-import { useOptionalMessagesConversation, useOptionalMessagesOperations } from '~/Providers';
-import { useConversationUIResources } from '~/hooks/Messages/useConversationUIResources';
 import { handleUIAction } from '~/utils';
+import { useConversationUIResources } from '~/hooks/Messages/useConversationUIResources';
+import { useMessagesConversation, useMessagesOperations } from '~/Providers';
 import { useLocalize } from '~/hooks';
 
 interface MCPUIResourceProps {
@@ -13,14 +13,19 @@ interface MCPUIResourceProps {
   };
 }
 
-/** Renders an MCP UI resource based on its resource ID. Works in chat, share, and search views. */
+/**
+ * Component that renders an MCP UI resource based on its resource ID.
+ * Works in both main app and share view.
+ */
 export function MCPUIResource(props: MCPUIResourceProps) {
   const { resourceId } = props.node.properties;
   const localize = useLocalize();
-  const { ask } = useOptionalMessagesOperations();
-  const { conversationId } = useOptionalMessagesConversation();
+  const { ask } = useMessagesOperations();
+  const { conversation } = useMessagesConversation();
 
-  const conversationResourceMap = useConversationUIResources(conversationId ?? undefined);
+  const conversationResourceMap = useConversationUIResources(
+    conversation?.conversationId ?? undefined,
+  );
 
   const uiResource = conversationResourceMap.get(resourceId ?? '');
 

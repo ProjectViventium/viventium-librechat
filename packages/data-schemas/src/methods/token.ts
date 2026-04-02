@@ -48,7 +48,10 @@ export function createTokenMethods(mongoose: typeof import('mongoose')) {
     }
   }
 
-  /** Deletes all Token documents matching every provided field (AND semantics). */
+  /**
+   * Deletes all Token documents that match the provided token, user ID, or email.
+   * Email is automatically normalized to lowercase for case-insensitive matching.
+   */
   async function deleteTokens(query: TokenQuery): Promise<TokenDeleteResult> {
     try {
       const Token = mongoose.models.Token;
@@ -63,19 +66,19 @@ export function createTokenMethods(mongoose: typeof import('mongoose')) {
       if (query.email !== undefined) {
         conditions.push({ email: query.email.trim().toLowerCase() });
       }
-      if (query.type !== undefined) {
-        conditions.push({ type: query.type });
-      }
       if (query.identifier !== undefined) {
         conditions.push({ identifier: query.identifier });
       }
 
+      /**
+       * If no conditions are specified, throw an error to prevent accidental deletion of all tokens
+       */
       if (conditions.length === 0) {
         throw new Error('At least one query parameter must be provided');
       }
 
       return await Token.deleteMany({
-        $and: conditions,
+        $or: conditions,
       });
     } catch (error) {
       logger.debug('An error occurred while deleting tokens:', error);
@@ -100,9 +103,6 @@ export function createTokenMethods(mongoose: typeof import('mongoose')) {
       }
       if (query.email) {
         conditions.push({ email: query.email.trim().toLowerCase() });
-      }
-      if (query.type) {
-        conditions.push({ type: query.type });
       }
       if (query.identifier) {
         conditions.push({ identifier: query.identifier });

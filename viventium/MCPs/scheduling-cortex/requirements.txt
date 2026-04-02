@@ -1,0 +1,9 @@
+# VIVENTIUM START
+# Purpose: Viventium addition in private LibreChat fork (new file).
+# Porting: Copy this file wholesale when reapplying Viventium changes onto a fresh upstream checkout.
+# VIVENTIUM END
+
+fastmcp>=2.12.5
+pydantic>=2.7
+croniter>=2.0
+md2tgmd>=0.3.10

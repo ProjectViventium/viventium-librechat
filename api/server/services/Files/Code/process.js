@@ -1,15 +1,9 @@
 const path = require('path');
 const { v4 } = require('uuid');
+const axios = require('axios');
 const { logger } = require('@librechat/data-schemas');
 const { getCodeBaseURL } = require('@librechat/agents');
-const {
-  getBasePath,
-  logAxiosError,
-  sanitizeFilename,
-  createAxiosInstance,
-  codeServerHttpAgent,
-  codeServerHttpsAgent,
-} = require('@librechat/api');
+const { logAxiosError, getBasePath } = require('@librechat/api');
 const {
   Tools,
   megabyte,
@@ -28,8 +22,6 @@ const { createFile, getFiles, updateFile, claimCodeFile } = require('~/models');
 const { getStrategyFunctions } = require('~/server/services/Files/strategies');
 const { convertImage } = require('~/server/services/Files/images/convert');
 const { determineFileType } = require('~/server/utils');
-
-const axios = createAxiosInstance();
 
 /**
  * Creates a fallback download URL response when file cannot be processed locally.
@@ -110,8 +102,6 @@ const processCodeOutput = async ({
         'User-Agent': 'LibreChat/1.0',
         'X-API-Key': apiKey,
       },
-      httpAgent: codeServerHttpAgent,
-      httpsAgent: codeServerHttpsAgent,
       timeout: 15000,
     });
 
@@ -156,13 +146,6 @@ const processCodeOutput = async ({
       );
     }
 
-    const safeName = sanitizeFilename(name);
-    if (safeName !== name) {
-      logger.warn(
-        `[processCodeOutput] Filename sanitized: "${name}" -> "${safeName}" | conv=${conversationId}`,
-      );
-    }
-
     if (isImage) {
       const usage = isUpdate ? (claimed.usage ?? 0) + 1 : 1;
       const _file = await convertImage(req, buffer, 'high', `${file_id}${fileExt}`);
@@ -173,7 +156,7 @@ const processCodeOutput = async ({
         file_id,
         messageId,
         usage,
-        filename: safeName,
+        filename: name,
         conversationId,
         user: req.user.id,
         type: `image/${appConfig.imageOutputType}`,
@@ -217,7 +200,7 @@ const processCodeOutput = async ({
       );
     }
 
-    const fileName = `${file_id}__${safeName}`;
+    const fileName = `${file_id}__${name}`;
     const filepath = await saveBuffer({
       userId: req.user.id,
       buffer,
@@ -230,7 +213,7 @@ const processCodeOutput = async ({
       filepath,
       messageId,
       object: 'file',
-      filename: safeName,
+      filename: name,
       type: mimeType,
       conversationId,
       user: req.user.id,
@@ -246,11 +229,6 @@ const processCodeOutput = async ({
     await createFile(file, true);
     return Object.assign(file, { messageId, toolCallId });
   } catch (error) {
-    if (error?.message === 'Path traversal detected in filename') {
-      logger.warn(
-        `[processCodeOutput] Path traversal blocked for file "${name}" | conv=${conversationId}`,
-      );
-    }
     logAxiosError({
       message: 'Error downloading/processing code environment file',
       error,
@@ -310,8 +288,6 @@ async function getSessionInfo(fileIdentifier, apiKey) {
         'User-Agent': 'LibreChat/1.0',
         'X-API-Key': apiKey,
       },
-      httpAgent: codeServerHttpAgent,
-      httpsAgent: codeServerHttpsAgent,
       timeout: 5000,
     });
 
@@ -460,6 +436,5 @@ const primeFiles = async (options, apiKey) => {
 
 module.exports = {
   primeFiles,
-  getSessionInfo,
   processCodeOutput,
 };

@@ -23,6 +23,38 @@ const BackupCodeSchema = new Schema(
   { _id: false },
 );
 
+/* === VIVENTIUM START ===
+ * Feature: Modern playground voice-route persistence
+ * Purpose: Reuse a normalized provider/variant shape for per-user voice defaults.
+ * === VIVENTIUM END === */
+const ViventiumVoiceRouteSelectionSchema = new Schema(
+  {
+    provider: {
+      type: String,
+      default: null,
+    },
+    variant: {
+      type: String,
+      default: null,
+    },
+  },
+  { _id: false },
+);
+
+const ViventiumVoiceRouteStateSchema = new Schema(
+  {
+    stt: {
+      type: ViventiumVoiceRouteSelectionSchema,
+      default: null,
+    },
+    tts: {
+      type: ViventiumVoiceRouteSelectionSchema,
+      default: null,
+    },
+  },
+  { _id: false },
+);
+
 const userSchema = new Schema<IUser>(
   {
     name: {
@@ -37,6 +69,7 @@ const userSchema = new Schema<IUser>(
       type: String,
       required: [true, "can't be blank"],
       lowercase: true,
+      unique: true,
       match: [/\S+@\S+\.\S+/, 'is invalid'],
       index: true,
     },
@@ -67,27 +100,43 @@ const userSchema = new Schema<IUser>(
     },
     googleId: {
       type: String,
+      unique: true,
+      sparse: true,
     },
     facebookId: {
       type: String,
+      unique: true,
+      sparse: true,
     },
     openidId: {
       type: String,
+      unique: true,
+      sparse: true,
     },
     samlId: {
       type: String,
+      unique: true,
+      sparse: true,
     },
     ldapId: {
       type: String,
+      unique: true,
+      sparse: true,
     },
     githubId: {
       type: String,
+      unique: true,
+      sparse: true,
     },
     discordId: {
       type: String,
+      unique: true,
+      sparse: true,
     },
     appleId: {
       type: String,
+      unique: true,
+      sparse: true,
     },
     plugins: {
       type: Array,
@@ -103,15 +152,6 @@ const userSchema = new Schema<IUser>(
     backupCodes: {
       type: [BackupCodeSchema],
       select: false,
-    },
-    pendingTotpSecret: {
-      type: String,
-      select: false,
-    },
-    pendingBackupCodes: {
-      type: [BackupCodeSchema],
-      select: false,
-      default: undefined,
     },
     refreshToken: {
       type: [SessionSchema],
@@ -130,6 +170,16 @@ const userSchema = new Schema<IUser>(
           type: Boolean,
           default: true,
         },
+        /* === VIVENTIUM START ===
+         * Feature: Global conversation recall personalization toggle
+         * Purpose: Controls whether agents can semantically retrieve from the user's full chat history.
+         * Added: 2026-02-19
+         */
+        conversation_recall: {
+          type: Boolean,
+          default: false,
+        },
+        /* === VIVENTIUM END === */
       },
       default: {},
     },
@@ -144,38 +194,47 @@ const userSchema = new Schema<IUser>(
       ],
       default: [],
     },
+    /* === VIVENTIUM START ===
+     * Feature: Registration approval workflow fields.
+     * Purpose: Gate authentication for newly registered users until admin approval.
+     *
+     * Note:
+     * - default 'approved' keeps existing users unlocked without a migration script.
+     * - new users are explicitly set to 'pending' when approval mode is enabled.
+     * === VIVENTIUM END === */
+    viventiumApprovalStatus: {
+      type: String,
+      enum: ['pending', 'approved', 'denied'],
+      default: 'approved',
+    },
+    viventiumApprovalRequestedAt: {
+      type: Date,
+      default: null,
+    },
+    viventiumApprovalReviewedAt: {
+      type: Date,
+      default: null,
+    },
+    /* === VIVENTIUM START ===
+     * Feature: Modern playground voice-route persistence
+     * Purpose: Persist per-user STT/TTS defaults outside generic personalization.
+     * === VIVENTIUM END === */
+    viventiumVoicePreferences: {
+      type: {
+        livekitPlayground: {
+          type: ViventiumVoiceRouteStateSchema,
+          default: null,
+        },
+      },
+      default: {},
+    },
     /** Field for external source identification (for consistency with TPrincipal schema) */
     idOnTheSource: {
       type: String,
       sparse: true,
     },
-    tenantId: {
-      type: String,
-      index: true,
-    },
   },
   { timestamps: true },
 );
-
-userSchema.index({ email: 1, tenantId: 1 }, { unique: true });
-userSchema.index({ role: 1, tenantId: 1 });
-
-const oAuthIdFields = [
-  'googleId',
-  'facebookId',
-  'openidId',
-  'samlId',
-  'ldapId',
-  'githubId',
-  'discordId',
-  'appleId',
-] as const;
-
-for (const field of oAuthIdFields) {
-  userSchema.index(
-    { [field]: 1, tenantId: 1 },
-    { unique: true, partialFilterExpression: { [field]: { $exists: true } } },
-  );
-}
 
 export default userSchema;

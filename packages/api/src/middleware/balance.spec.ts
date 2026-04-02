@@ -2,7 +2,7 @@ import mongoose from 'mongoose';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import { logger, balanceSchema } from '@librechat/data-schemas';
 import type { NextFunction, Request as ServerRequest, Response as ServerResponse } from 'express';
-import type { IBalance, IBalanceUpdate } from '@librechat/data-schemas';
+import type { IBalance } from '@librechat/data-schemas';
 import { createSetBalanceConfig } from './balance';
 
 jest.mock('@librechat/data-schemas', () => ({
@@ -14,16 +14,6 @@ jest.mock('@librechat/data-schemas', () => ({
 
 let mongoServer: MongoMemoryServer;
 let Balance: mongoose.Model<IBalance>;
-
-const findBalanceByUser = (userId: string) =>
-  Balance.findOne({ user: userId }).lean() as Promise<IBalance | null>;
-
-const upsertBalanceFields = (userId: string, fields: IBalanceUpdate) =>
-  Balance.findOneAndUpdate(
-    { user: userId },
-    { $set: fields },
-    { upsert: true, new: true },
-  ).lean() as Promise<IBalance | null>;
 
 beforeAll(async () => {
   mongoServer = await MongoMemoryServer.create();
@@ -74,8 +64,7 @@ describe('createSetBalanceConfig', () => {
 
       const middleware = createSetBalanceConfig({
         getAppConfig,
-        findBalanceByUser,
-        upsertBalanceFields,
+        Balance,
       });
 
       const req = createMockRequest(userId);
@@ -106,8 +95,7 @@ describe('createSetBalanceConfig', () => {
 
       const middleware = createSetBalanceConfig({
         getAppConfig,
-        findBalanceByUser,
-        upsertBalanceFields,
+        Balance,
       });
 
       const req = createMockRequest(userId);
@@ -132,8 +120,7 @@ describe('createSetBalanceConfig', () => {
 
       const middleware = createSetBalanceConfig({
         getAppConfig,
-        findBalanceByUser,
-        upsertBalanceFields,
+        Balance,
       });
 
       const req = createMockRequest(userId);
@@ -162,8 +149,7 @@ describe('createSetBalanceConfig', () => {
 
       const middleware = createSetBalanceConfig({
         getAppConfig,
-        findBalanceByUser,
-        upsertBalanceFields,
+        Balance,
       });
 
       const req = createMockRequest(userId);
@@ -192,8 +178,7 @@ describe('createSetBalanceConfig', () => {
 
       const middleware = createSetBalanceConfig({
         getAppConfig,
-        findBalanceByUser,
-        upsertBalanceFields,
+        Balance,
       });
 
       const req = {} as ServerRequest;
@@ -234,8 +219,7 @@ describe('createSetBalanceConfig', () => {
 
       const middleware = createSetBalanceConfig({
         getAppConfig,
-        findBalanceByUser,
-        upsertBalanceFields,
+        Balance,
       });
 
       const req = createMockRequest(userId);
@@ -287,8 +271,7 @@ describe('createSetBalanceConfig', () => {
 
       const middleware = createSetBalanceConfig({
         getAppConfig,
-        findBalanceByUser,
-        upsertBalanceFields,
+        Balance,
       });
 
       const req = createMockRequest(userId);
@@ -332,8 +315,7 @@ describe('createSetBalanceConfig', () => {
 
       const middleware = createSetBalanceConfig({
         getAppConfig,
-        findBalanceByUser,
-        upsertBalanceFields,
+        Balance,
       });
 
       const req = createMockRequest(userId);
@@ -364,8 +346,7 @@ describe('createSetBalanceConfig', () => {
 
       const middleware = createSetBalanceConfig({
         getAppConfig,
-        findBalanceByUser,
-        upsertBalanceFields,
+        Balance,
       });
 
       const req = createMockRequest(userId);
@@ -411,8 +392,7 @@ describe('createSetBalanceConfig', () => {
 
       const middleware = createSetBalanceConfig({
         getAppConfig,
-        findBalanceByUser,
-        upsertBalanceFields,
+        Balance,
       });
 
       const req = createMockRequest(userId);
@@ -454,20 +434,21 @@ describe('createSetBalanceConfig', () => {
         },
       });
 
+      const middleware = createSetBalanceConfig({
+        getAppConfig,
+        Balance,
+      });
+
       const req = createMockRequest(userId);
       const res = createMockResponse();
 
-      const upsertSpy = jest.fn();
-      const spiedMiddleware = createSetBalanceConfig({
-        getAppConfig,
-        findBalanceByUser,
-        upsertBalanceFields: upsertSpy,
-      });
+      // Spy on Balance.findOneAndUpdate to verify it's not called
+      const updateSpy = jest.spyOn(Balance, 'findOneAndUpdate');
 
-      await spiedMiddleware(req as ServerRequest, res as ServerResponse, mockNext);
+      await middleware(req as ServerRequest, res as ServerResponse, mockNext);
 
       expect(mockNext).toHaveBeenCalled();
-      expect(upsertSpy).not.toHaveBeenCalled();
+      expect(updateSpy).not.toHaveBeenCalled();
     });
 
     test('should set tokenCredits for user with null tokenCredits', async () => {
@@ -489,8 +470,7 @@ describe('createSetBalanceConfig', () => {
 
       const middleware = createSetBalanceConfig({
         getAppConfig,
-        findBalanceByUser,
-        upsertBalanceFields,
+        Balance,
       });
 
       const req = createMockRequest(userId);
@@ -518,12 +498,16 @@ describe('createSetBalanceConfig', () => {
       });
       const dbError = new Error('Database error');
 
-      const failingFindBalance = () => Promise.reject(dbError);
+      // Mock Balance.findOne to throw an error
+      jest.spyOn(Balance, 'findOne').mockImplementationOnce((() => {
+        return {
+          lean: jest.fn().mockRejectedValue(dbError),
+        };
+      }) as unknown as mongoose.Model<IBalance>['findOne']);
 
       const middleware = createSetBalanceConfig({
         getAppConfig,
-        findBalanceByUser: failingFindBalance,
-        upsertBalanceFields,
+        Balance,
       });
 
       const req = createMockRequest(userId);
@@ -542,8 +526,7 @@ describe('createSetBalanceConfig', () => {
 
       const middleware = createSetBalanceConfig({
         getAppConfig,
-        findBalanceByUser,
-        upsertBalanceFields,
+        Balance,
       });
 
       const req = createMockRequest(userId);
@@ -573,8 +556,7 @@ describe('createSetBalanceConfig', () => {
 
       const middleware = createSetBalanceConfig({
         getAppConfig,
-        findBalanceByUser,
-        upsertBalanceFields,
+        Balance,
       });
 
       const req = createMockRequest(userId);
@@ -608,8 +590,7 @@ describe('createSetBalanceConfig', () => {
 
       const middleware = createSetBalanceConfig({
         getAppConfig,
-        findBalanceByUser,
-        upsertBalanceFields,
+        Balance,
       });
 
       const req = createMockRequest(userId);
@@ -654,8 +635,7 @@ describe('createSetBalanceConfig', () => {
 
         const middleware = createSetBalanceConfig({
           getAppConfig,
-          findBalanceByUser,
-          upsertBalanceFields,
+          Balance,
         });
 
         const req = createMockRequest(userId);

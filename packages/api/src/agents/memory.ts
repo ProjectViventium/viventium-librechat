@@ -5,6 +5,7 @@ import { Tools } from 'librechat-data-provider';
 import { logger } from '@librechat/data-schemas';
 import { HumanMessage } from '@langchain/core/messages';
 import { Run, Providers, GraphEvents } from '@librechat/agents';
+import type { MemoryKeyLimits } from '~/memory';
 import type {
   OpenAIClientOptions,
   StreamEventData,
@@ -19,12 +20,17 @@ import type { TAttachment, MemoryArtifact } from 'librechat-data-provider';
 import type { BaseMessage, ToolMessage } from '@langchain/core/messages';
 import type { Response as ServerResponse } from 'express';
 import { GenerationJobManager } from '~/stream/GenerationJobManager';
+import {
+  evaluateMemoryWrite,
+  prepareMemoryValueForWrite,
+  resolveMemoryKeyLimits,
+  runMemoryMaintenance,
+} from '~/memory';
 import { resolveHeaders, createSafeUser } from '~/utils';
-import Tokenizer from '~/utils/tokenizer';
 
 type RequiredMemoryMethods = Pick<
   MemoryMethods,
-  'setMemory' | 'deleteMemory' | 'getFormattedMemories'
+  'setMemory' | 'deleteMemory' | 'getFormattedMemories' | 'getAllUserMemories'
 >;
 
 type ToolEndMetadata = Record<string, unknown> & {
@@ -37,6 +43,15 @@ export interface MemoryConfig {
   instructions?: string;
   llmConfig?: Partial<LLMConfig>;
   tokenLimit?: number;
+  keyLimits?: MemoryKeyLimits;
+  maintenanceThresholdPercent?: number;
+}
+
+export interface MemorySnapshot {
+  withKeys: string;
+  withoutKeys: string;
+  totalTokens: number;
+  memoryTokenMap: Record<string, number>;
 }
 
 export const memoryInstructions =
@@ -73,6 +88,24 @@ ${tokenLimit ? `\nTOKEN LIMIT: Maximum ${tokenLimit} tokens per memory value.` :
 
 When in doubt, and the user hasn't asked to remember or forget anything, END THE TURN IMMEDIATELY.`;
 
+function buildMemoryErrorArtifact(
+  evaluation: ReturnType<typeof evaluateMemoryWrite>,
+  currentTotalTokens: number,
+): Record<Tools.memory, MemoryArtifact> {
+  return {
+    [Tools.memory]: {
+      key: 'system',
+      type: 'error',
+      value: JSON.stringify({
+        errorType: evaluation.errorType ?? 'validation_failed',
+        message: evaluation.message,
+        ...(evaluation.details ?? {}),
+      }),
+      tokenCount: currentTotalTokens,
+    },
+  };
+}
+
 /**
  * Creates a memory tool instance with user context
  */
@@ -81,81 +114,82 @@ export const createMemoryTool = ({
   setMemory,
   validKeys,
   tokenLimit,
+  keyLimits,
+  memoryTokenMap,
   totalTokens = 0,
 }: {
   userId: string | ObjectId;
   setMemory: MemoryMethods['setMemory'];
   validKeys?: string[];
   tokenLimit?: number;
+  keyLimits?: MemoryKeyLimits;
+  memoryTokenMap?: Record<string, number>;
   totalTokens?: number;
 }) => {
-  const remainingTokens = tokenLimit ? tokenLimit - totalTokens : Infinity;
-  const isOverflowing = tokenLimit ? remainingTokens <= 0 : false;
+  /* === VIVENTIUM START ===
+   * Fix: Prevent tokenLimit double-counting for per-key overwrites.
+   *
+   * Problem:
+   * - Memory agent writes full replacement values per key (overwrite semantics).
+   * - Previous logic treated each write as append-only: newTotal = total + newValueTokens.
+   * - This rejects valid overwrites once memories grow, showing "Memory Error" in UI.
+   *
+   * Solution:
+   * - Track per-key token counts and compute delta = newTokens - previousTokens.
+   * - Maintain a running total across tool calls within the same memory run.
+   *
+   * Added: 2026-02-09
+   * === VIVENTIUM END === */
+  const tokenCounts: Record<string, number> = { ...(memoryTokenMap ?? {}) };
+  let runningTotalTokens = totalTokens;
+
+  // Prefer the map sum if provided (keeps us consistent even if caller total is stale).
+  if (memoryTokenMap) {
+    const computedTotal = Object.values(tokenCounts).reduce((sum, n) => sum + (Number(n) || 0), 0);
+    if (Number.isFinite(computedTotal) && computedTotal !== runningTotalTokens) {
+      runningTotalTokens = computedTotal;
+    }
+  }
 
   return tool(
     async ({ key, value }) => {
       try {
-        if (validKeys && validKeys.length > 0 && !validKeys.includes(key)) {
-          logger.warn(
-            `Memory Agent failed to set memory: Invalid key "${key}". Must be one of: ${validKeys.join(
-              ', ',
-            )}`,
-          );
-          return [`Invalid key "${key}". Must be one of: ${validKeys.join(', ')}`, undefined];
+        const preparedValue = prepareMemoryValueForWrite({ key, value, keyLimits });
+        const nextValue = preparedValue.value;
+        const tokenCount = preparedValue.tokenCount;
+        const previousTokenCount = tokenCounts[key] ?? 0;
+        const evaluation = evaluateMemoryWrite({
+          key,
+          value: nextValue,
+          tokenCount,
+          validKeys,
+          tokenLimit,
+          keyLimits,
+          baselineTotalTokens: runningTotalTokens,
+          previousTokenCount,
+        });
+        if (!evaluation.ok) {
+          logger.warn(`Memory Agent failed to set memory for key "${key}": ${evaluation.message}`);
+          return [
+            evaluation.message ?? `Failed to set memory for key "${key}"`,
+            buildMemoryErrorArtifact(evaluation, runningTotalTokens),
+          ];
         }
 
-        const tokenCount = Tokenizer.getTokenCount(value, 'o200k_base');
-
-        if (isOverflowing) {
-          const errorArtifact: Record<Tools.memory, MemoryArtifact> = {
-            [Tools.memory]: {
-              key: 'system',
-              type: 'error',
-              value: JSON.stringify({
-                errorType: 'already_exceeded',
-                tokenCount: Math.abs(remainingTokens),
-                totalTokens: totalTokens,
-                tokenLimit: tokenLimit!,
-              }),
-              tokenCount: totalTokens,
-            },
-          };
-          return [`Memory storage exceeded. Cannot save new memories.`, errorArtifact];
-        }
-
-        if (tokenLimit) {
-          const newTotalTokens = totalTokens + tokenCount;
-          const newRemainingTokens = tokenLimit - newTotalTokens;
-
-          if (newRemainingTokens < 0) {
-            const errorArtifact: Record<Tools.memory, MemoryArtifact> = {
-              [Tools.memory]: {
-                key: 'system',
-                type: 'error',
-                value: JSON.stringify({
-                  errorType: 'would_exceed',
-                  tokenCount: Math.abs(newRemainingTokens),
-                  totalTokens: newTotalTokens,
-                  tokenLimit,
-                }),
-                tokenCount: totalTokens,
-              },
-            };
-            return [`Memory storage would exceed limit. Cannot save this memory.`, errorArtifact];
-          }
-        }
-
+        const tokenDelta = tokenCount - previousTokenCount;
         const artifact: Record<Tools.memory, MemoryArtifact> = {
           [Tools.memory]: {
             key,
-            value,
+            value: nextValue,
             tokenCount,
             type: 'update',
           },
         };
 
-        const result = await setMemory({ userId, key, value, tokenCount });
+        const result = await setMemory({ userId, key, value: nextValue, tokenCount });
         if (result.ok) {
+          tokenCounts[key] = tokenCount;
+          runningTotalTokens += tokenDelta;
           logger.debug(`Memory set for key "${key}" (${tokenCount} tokens) for user "${userId}"`);
           return [`Memory set for key "${key}" (${tokenCount} tokens)`, artifact];
         }
@@ -178,11 +212,16 @@ export const createMemoryTool = ({
               ? `The key of the memory value. Must be one of: ${validKeys.join(', ')}`
               : 'The key identifier for this memory',
           ),
-        value: z
-          .string()
-          .describe(
-            'Value MUST be a complete sentence that fully describes relevant user information.',
-          ),
+        value: z.string().describe(
+          /* === VIVENTIUM START ===
+           * Memory values in Viventium are often structured multi-line blocks (core/context/moments/etc),
+           * not single sentences. Requiring a full replacement value also helps avoid placeholder-based
+           * rewrites that silently drop prior memory content.
+           * Added: 2026-02-07
+           */
+          'The full memory value to store for this key. May be multi-line. When updating existing memory, provide the complete updated value (not a diff).',
+          /* === VIVENTIUM END === */
+        ),
       }),
     },
   );
@@ -285,6 +324,8 @@ export async function processMemory({
   instructions,
   llmConfig,
   tokenLimit,
+  keyLimits,
+  memoryTokenMap,
   totalTokens = 0,
   streamId = null,
   user,
@@ -300,17 +341,22 @@ export async function processMemory({
   validKeys?: string[];
   instructions: string;
   tokenLimit?: number;
+  keyLimits?: MemoryKeyLimits;
+  memoryTokenMap?: Record<string, number>;
   totalTokens?: number;
   llmConfig?: Partial<LLMConfig>;
   streamId?: string | null;
   user?: IUser;
 }): Promise<(TAttachment | null)[] | undefined> {
   try {
+    const resolvedKeyLimits = resolveMemoryKeyLimits(keyLimits);
     const memoryTool = createMemoryTool({
       userId,
       tokenLimit,
+      keyLimits: resolvedKeyLimits,
       setMemory,
       validKeys,
+      memoryTokenMap,
       totalTokens,
     });
     const deleteMemoryTool = createDeleteMemoryTool({
@@ -332,6 +378,18 @@ Remaining capacity: ${remainingTokens} tokens
 
 # Existing memory:
 ${memory ?? 'No existing memories'}`;
+    }
+    if (resolvedKeyLimits && Object.keys(resolvedKeyLimits).length > 0) {
+      const perKeyStatus = Object.entries(resolvedKeyLimits)
+        .map(([memoryKey, limit]) => {
+          const current = memoryTokenMap?.[memoryKey] ?? 0;
+          const delta = current - limit;
+          const status =
+            delta > 0 ? `OVER by ${delta}` : `${Math.max(0, limit - current)} remaining`;
+          return `- ${memoryKey}: ${current}/${limit} (${status})`;
+        })
+        .join('\n');
+      memoryStatus = `${memoryStatus}\n\nPer-key budgets:\n${perKeyStatus}`;
     }
 
     const defaultLLMConfig: LLMConfig = {
@@ -494,6 +552,54 @@ ${memory ?? 'No existing memories'}`;
   }
 }
 
+export async function loadMemorySnapshot({
+  userId,
+  memoryMethods,
+  config = {},
+}: {
+  userId: string | ObjectId;
+  memoryMethods: RequiredMemoryMethods;
+  config?: MemoryConfig;
+}): Promise<MemorySnapshot> {
+  const { validKeys, tokenLimit, keyLimits, maintenanceThresholdPercent } = config;
+  /* === VIVENTIUM START ===
+   * Feature: Deterministic memory maintenance before memory-agent execution
+   *
+   * Purpose:
+   * - Compact overgrown keys and remove operational residue before the memory agent
+   *   reads the current store.
+   * - This keeps the memory agent aligned with the actual writable budget and reduces
+   *   repeated write failures once memory pressure builds up.
+   *
+   * Added: 2026-03-09
+   * === VIVENTIUM END === */
+  await runMemoryMaintenance({
+    userId: String(userId),
+    getAllUserMemories: async (resolvedUserId) => memoryMethods.getAllUserMemories(resolvedUserId),
+    setMemory: async ({ userId: maintenanceUserId, key, value, tokenCount }) =>
+      memoryMethods.setMemory({
+        userId: maintenanceUserId,
+        key,
+        value,
+        tokenCount,
+      }),
+    policy: {
+      validKeys,
+      tokenLimit,
+      keyLimits,
+      maintenanceThresholdPercent,
+    },
+  });
+
+  const formatted = await memoryMethods.getFormattedMemories({ userId });
+  return {
+    withKeys: formatted.withKeys ?? '',
+    withoutKeys: formatted.withoutKeys ?? '',
+    totalTokens: formatted.totalTokens ?? 0,
+    memoryTokenMap: formatted.memoryTokenMap ?? {},
+  };
+}
+
 export async function createMemoryProcessor({
   res,
   userId,
@@ -503,6 +609,7 @@ export async function createMemoryProcessor({
   config = {},
   streamId = null,
   user,
+  snapshot,
 }: {
   res: ServerResponse;
   messageId: string;
@@ -512,13 +619,18 @@ export async function createMemoryProcessor({
   config?: MemoryConfig;
   streamId?: string | null;
   user?: IUser;
+  snapshot?: MemorySnapshot;
 }): Promise<[string, (messages: BaseMessage[]) => Promise<(TAttachment | null)[] | undefined>]> {
-  const { validKeys, instructions, llmConfig, tokenLimit } = config;
+  const { validKeys, instructions, llmConfig, tokenLimit, keyLimits } = config;
   const finalInstructions = instructions || getDefaultInstructions(validKeys, tokenLimit);
-
-  const { withKeys, withoutKeys, totalTokens } = await memoryMethods.getFormattedMemories({
-    userId,
-  });
+  const preparedSnapshot =
+    snapshot ??
+    (await loadMemorySnapshot({
+      userId,
+      memoryMethods,
+      config,
+    }));
+  const { withKeys, withoutKeys, totalTokens, memoryTokenMap } = preparedSnapshot;
 
   return [
     withoutKeys,
@@ -530,8 +642,10 @@ export async function createMemoryProcessor({
           messages,
           validKeys,
           llmConfig,
+          keyLimits,
           messageId,
           tokenLimit,
+          memoryTokenMap: memoryTokenMap ?? {},
           streamId,
           conversationId,
           memory: withKeys,

@@ -1,8 +1,40 @@
-import { EModelEndpoint, AuthKeys } from 'librechat-data-provider';
-import type { BaseInitializeParams, InitializeResultBase, AnthropicConfigOptions } from '~/types';
+import { EModelEndpoint, AuthKeys, ErrorTypes } from 'librechat-data-provider';
+import type {
+  BaseInitializeParams,
+  InitializeResultBase,
+  AnthropicConfigOptions,
+  UserKeyValues,
+} from '~/types';
 import { checkUserKeyExpiry, isEnabled } from '~/utils';
 import { loadAnthropicVertexCredentials, getVertexCredentialOptions } from './vertex';
 import { getLLMConfig } from './llm';
+import { resolveAnthropicSubscriptionUserValues } from './oauthSubscription';
+
+const isNoUserKeyError = (error: unknown): boolean => {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  try {
+    const parsed = JSON.parse(error.message) as { type?: string };
+    return parsed.type === ErrorTypes.NO_USER_KEY;
+  } catch {
+    return false;
+  }
+};
+
+const isInvalidUserKeyError = (error: unknown): boolean => {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  try {
+    const parsed = JSON.parse(error.message) as { type?: string };
+    return parsed.type === ErrorTypes.INVALID_USER_KEY;
+  } catch {
+    return false;
+  }
+};
 
 /**
  * Initializes Anthropic endpoint configuration.
@@ -25,6 +57,7 @@ export async function initializeAnthropic({
 
   let credentials: Record<string, unknown> = {};
   let vertexOptions: { region?: string; projectId?: string } | undefined;
+  let userValues: UserKeyValues | null = null;
 
   /** @type {undefined | import('librechat-data-provider').TVertexAIConfig} */
   const vertexConfig = appConfig?.endpoints?.[EModelEndpoint.anthropic]?.vertexConfig;
@@ -48,17 +81,51 @@ export async function initializeAnthropic({
     }
   } else {
     const isUserProvided = ANTHROPIC_API_KEY === 'user_provided';
-
-    const anthropicApiKey = isUserProvided
-      ? await db.getUserKey({ userId: req.user?.id ?? '', name: EModelEndpoint.anthropic })
-      : ANTHROPIC_API_KEY;
-
-    if (!anthropicApiKey) {
-      throw new Error('Anthropic API key not provided. Please provide it again.');
+    let anthropicApiKey: string | undefined;
+    try {
+      userValues = await db.getUserKeyValues({
+        userId: req.user?.id ?? '',
+        name: EModelEndpoint.anthropic,
+      });
+      userValues = await resolveAnthropicSubscriptionUserValues(req.user?.id ?? '', userValues, db);
+      anthropicApiKey = userValues?.authToken || userValues?.apiKey;
+      if (expiresAt && anthropicApiKey && userValues?.oauthProvider !== 'anthropic') {
+        checkUserKeyExpiry(expiresAt, EModelEndpoint.anthropic);
+      }
+    } catch (error) {
+      if (isInvalidUserKeyError(error)) {
+        /** Backward compatibility for older plain-string Anthropic keys */
+        try {
+          anthropicApiKey = await db.getUserKey({
+            userId: req.user?.id ?? '',
+            name: EModelEndpoint.anthropic,
+          });
+          if (expiresAt) {
+            checkUserKeyExpiry(expiresAt, EModelEndpoint.anthropic);
+          }
+        } catch (legacyError) {
+          if (!isNoUserKeyError(legacyError)) {
+            throw legacyError;
+          }
+        }
+      } else if (!isNoUserKeyError(error)) {
+        throw error;
+      }
     }
 
-    if (expiresAt && isUserProvided) {
-      checkUserKeyExpiry(expiresAt, EModelEndpoint.anthropic);
+    if (!anthropicApiKey) {
+      anthropicApiKey = isUserProvided ? undefined : ANTHROPIC_API_KEY;
+    }
+
+    if (!anthropicApiKey) {
+      if (isUserProvided) {
+        throw new Error(
+          JSON.stringify({
+            type: ErrorTypes.NO_USER_KEY,
+          }),
+        );
+      }
+      throw new Error('Anthropic API key not provided. Please provide it again.');
     }
 
     credentials[AuthKeys.ANTHROPIC_API_KEY] = anthropicApiKey;
@@ -67,6 +134,8 @@ export async function initializeAnthropic({
   const clientOptions: AnthropicConfigOptions = {
     proxy: PROXY ?? undefined,
     reverseProxyUrl: ANTHROPIC_REVERSE_PROXY ?? undefined,
+    ...(userValues?.oauthType ? { oauthType: userValues.oauthType } : {}),
+    ...(userValues?.oauthProvider ? { oauthProvider: userValues.oauthProvider } : {}),
     modelOptions: {
       ...(model_parameters ?? {}),
       user: req.user?.id,

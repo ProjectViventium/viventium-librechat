@@ -1,6 +1,6 @@
 import { render, screen } from '@testing-library/react';
 import type { Endpoint, SelectedValues } from '~/common';
-import { EndpointModelItem } from '../EndpointModelItem';
+import { EndpointModelItem, renderEndpointModels } from '../EndpointModelItem';
 
 const mockHandleSelectModel = jest.fn();
 let mockSelectedValues: SelectedValues;
@@ -81,5 +81,20 @@ describe('EndpointModelItem', () => {
 
     const menuItem = screen.getByRole('menuitem');
     expect(menuItem).not.toHaveAttribute('aria-selected');
+  });
+
+  it('falls back to endpoint models when filteredModels is not an array', () => {
+    mockSelectedValues = { endpoint: 'anthropic', model: '', modelSpec: '' };
+    render(
+      <>
+        {renderEndpointModels(
+          baseEndpoint,
+          baseEndpoint.models ?? [],
+          'claude-opus-4-6' as unknown as string[],
+        )}
+      </>,
+    );
+
+    expect(screen.getByText('claude-opus-4-6')).toBeInTheDocument();
   });
 });

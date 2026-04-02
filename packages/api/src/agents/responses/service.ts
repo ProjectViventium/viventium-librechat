@@ -6,12 +6,12 @@
  */
 import type { Response as ServerResponse } from 'express';
 import type {
-  RequestValidationResult,
   ResponseRequest,
-  ResponseContext,
+  RequestValidationResult,
+  InputItem,
   InputContent,
   ModelContent,
-  InputItem,
+  ResponseContext,
   Response,
 } from './types';
 import {
@@ -82,13 +82,6 @@ export function validateResponseRequest(body: unknown): RequestValidationResult 
     if (typeof request.max_output_tokens !== 'number' || request.max_output_tokens < 1) {
       return { valid: false, error: 'max_output_tokens must be a positive number' };
     }
-  }
-
-  if (
-    request.previous_response_id !== undefined &&
-    typeof request.previous_response_id !== 'string'
-  ) {
-    return { valid: false, error: 'previous_response_id must be a string' };
   }
 
   return { valid: true, request: request as unknown as ResponseRequest };

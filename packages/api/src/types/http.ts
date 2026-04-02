@@ -11,6 +11,13 @@ export type RequestBody = {
   fileTokenLimit?: number;
   conversationId?: string;
   parentMessageId?: string;
+  /* === VIVENTIUM START ===
+   * Feature: Timezone-aware request metadata
+   * Purpose: Allow clients to provide an IANA timezone for downstream time-context rendering ({{current_datetime}}) and scheduling.
+   * Added: 2026-02-07
+   */
+  clientTimezone?: string;
+  /* === VIVENTIUM END === */
   endpoint?: string;
   endpointType?: string;
   model?: string;

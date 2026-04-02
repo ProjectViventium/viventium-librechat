@@ -4,6 +4,7 @@ import DeleteAccount from './DeleteAccount';
 import Avatar from './Avatar';
 import EnableTwoFactorItem from './TwoFactorAuthentication';
 import BackupCodesItem from './BackupCodesItem';
+import ConnectedAccounts from './ConnectedAccounts';
 import { useAuthContext } from '~/hooks';
 
 function Account() {
@@ -11,6 +12,13 @@ function Account() {
 
   return (
     <div className="flex flex-col gap-3 p-1 text-sm text-text-primary">
+      {/* === VIVENTIUM START ===
+       * Feature: Connected Accounts.
+       * Purpose: Surface OpenAI/Anthropic account connection in Settings > Account for reliable discoverability.
+       * === VIVENTIUM END === */}
+      <div className="pb-3">
+        <ConnectedAccounts />
+      </div>
       <div className="pb-3">
         <DisplayUsernameMessages />
       </div>

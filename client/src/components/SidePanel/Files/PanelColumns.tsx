@@ -39,13 +39,12 @@ export const columns: ColumnDef<TFile | undefined>[] = [
       return (
         <Button
           variant="ghost"
-          size="sm"
-          className="h-auto px-1 py-0.5 hover:bg-surface-hover"
+          className="hover:bg-surface-hover"
           onClick={() => column.toggleSorting(column.getIsSorted() === 'asc')}
           aria-label={localize('com_ui_date')}
         >
           {localize('com_ui_date')}
-          <ArrowUpDown className="ml-1 h-3 w-3" />
+          <ArrowUpDown className="ml-2 h-4 w-4" />
         </Button>
       );
     },

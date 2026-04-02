@@ -14,6 +14,15 @@ jest.mock('@librechat/data-schemas', () => {
   };
 });
 
+jest.mock('tiktoken', () => {
+  return {
+    encoding_for_model: jest.fn().mockReturnValue({
+      encode: jest.fn(),
+      decode: jest.fn(),
+    }),
+  };
+});
+
 const processFileURL = jest.fn();
 
 const generate = jest.fn();

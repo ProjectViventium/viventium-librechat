@@ -221,25 +221,6 @@ export class ServerConfigsDB implements IServerConfigsRepositoryInterface {
   }
 
   /**
-   * Atomic add-or-update. For DB-backed servers this delegates to update since
-   * DB servers are always created via the explicit add() flow with ACL setup.
-   * Config-source servers should use configCacheRepo, not dbConfigsRepo.
-   */
-  public async upsert(
-    serverName: string,
-    config: ParsedServerConfig,
-    userId?: string,
-  ): Promise<void> {
-    if (!userId) {
-      throw new Error(
-        `[ServerConfigsDB.upsert] User ID is required for DB-backed MCP server upsert of "${serverName}". ` +
-          'Config-source servers should use configCacheRepo, not dbConfigsRepo.',
-      );
-    }
-    return this.update(serverName, config, userId);
-  }
-
-  /**
    * Deletes an MCP server and removes all associated ACL entries.
    * @param serverName - The serverName of the server to remove
    * @param userId - User performing the deletion (for logging)
@@ -386,12 +367,12 @@ export class ServerConfigsDB implements IServerConfigsRepositoryInterface {
 
     const parsedConfigs: Record<string, ParsedServerConfig> = {};
     const directData = directResults.data || [];
-    const directServerNames = new Set(directData.map((s: MCPServerDocument) => s.serverName));
+    const directServerNames = new Set(directData.map((s) => s.serverName));
 
     const directParsed = await Promise.all(
-      directData.map((s: MCPServerDocument) => this.mapDBServerToParsedConfig(s)),
+      directData.map((s) => this.mapDBServerToParsedConfig(s)),
     );
-    directData.forEach((s: MCPServerDocument, i: number) => {
+    directData.forEach((s, i) => {
       parsedConfigs[s.serverName] = directParsed[i];
     });
 
@@ -404,9 +385,9 @@ export class ServerConfigsDB implements IServerConfigsRepositoryInterface {
 
       const agentData = agentServers.data || [];
       const agentParsed = await Promise.all(
-        agentData.map((s: MCPServerDocument) => this.mapDBServerToParsedConfig(s)),
+        agentData.map((s) => this.mapDBServerToParsedConfig(s)),
       );
-      agentData.forEach((s: MCPServerDocument, i: number) => {
+      agentData.forEach((s, i) => {
         parsedConfigs[s.serverName] = { ...agentParsed[i], consumeOnly: true };
       });
     }
@@ -430,7 +411,6 @@ export class ServerConfigsDB implements IServerConfigsRepositoryInterface {
     const config: ParsedServerConfig = {
       ...serverDBDoc.config,
       dbId: (serverDBDoc._id as Types.ObjectId).toString(),
-      source: 'user',
       updatedAt: serverDBDoc.updatedAt?.getTime(),
     };
     return await this.decryptConfig(config);

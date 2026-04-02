@@ -1,35 +1,136 @@
 const express = require('express');
 const request = require('supertest');
 
-const MOCKS = '../__test-utils__/convos-route-mocks';
+jest.mock('@librechat/agents', () => ({
+  sleep: jest.fn(),
+}));
 
-jest.mock('@librechat/agents', () => require(MOCKS).agents());
-jest.mock('@librechat/api', () => require(MOCKS).api());
-jest.mock('@librechat/data-schemas', () => require(MOCKS).dataSchemas());
-jest.mock('librechat-data-provider', () => require(MOCKS).dataProvider());
-jest.mock('~/models', () => require(MOCKS).sharedModels());
-jest.mock('~/server/middleware/requireJwtAuth', () => require(MOCKS).requireJwtAuth());
-jest.mock('~/server/middleware', () => require(MOCKS).middlewarePassthrough());
-jest.mock('~/server/utils/import/fork', () => require(MOCKS).forkUtils());
-jest.mock('~/server/utils/import', () => require(MOCKS).importUtils());
-jest.mock('~/cache/getLogStores', () => require(MOCKS).logStores());
-jest.mock('~/server/routes/files/multer', () => require(MOCKS).multerSetup());
-jest.mock('multer', () => require(MOCKS).multerLib());
-jest.mock('~/server/services/Endpoints/azureAssistants', () => require(MOCKS).assistantEndpoint());
-jest.mock('~/server/services/Endpoints/assistants', () => require(MOCKS).assistantEndpoint());
+jest.mock('@librechat/api', () => ({
+  isEnabled: jest.fn(),
+  sanitizeTitle: jest.fn((title) => title),
+  createAxiosInstance: jest.fn(() => ({
+    get: jest.fn(),
+    post: jest.fn(),
+    put: jest.fn(),
+    delete: jest.fn(),
+  })),
+  logAxiosError: jest.fn(),
+}));
+
+jest.mock('@librechat/data-schemas', () => ({
+  logger: {
+    debug: jest.fn(),
+    info: jest.fn(),
+    warn: jest.fn(),
+    error: jest.fn(),
+  },
+  createModels: jest.fn(() => ({
+    User: {},
+    Conversation: {},
+    Message: {},
+    SharedLink: {},
+  })),
+}));
+
+jest.mock('~/models/Conversation', () => ({
+  getConvosByCursor: jest.fn(),
+  getConvo: jest.fn(),
+  deleteConvos: jest.fn(),
+  saveConvo: jest.fn(),
+}));
+
+jest.mock('~/models/Message', () => ({
+  getMessages: jest.fn(),
+}));
+
+jest.mock('~/models/ToolCall', () => ({
+  deleteToolCalls: jest.fn(),
+}));
+
+jest.mock('~/models', () => ({
+  deleteAllSharedLinks: jest.fn(),
+  deleteConvoSharedLink: jest.fn(),
+}));
+
+jest.mock('~/server/middleware/requireJwtAuth', () => (req, res, next) => next());
+
+jest.mock('~/server/middleware', () => ({
+  createImportLimiters: jest.fn(() => ({
+    importIpLimiter: (req, res, next) => next(),
+    importUserLimiter: (req, res, next) => next(),
+  })),
+  createForkLimiters: jest.fn(() => ({
+    forkIpLimiter: (req, res, next) => next(),
+    forkUserLimiter: (req, res, next) => next(),
+  })),
+  configMiddleware: (req, res, next) => next(),
+  validateConvoAccess: (req, res, next) => next(),
+}));
+
+jest.mock('~/server/utils/import/fork', () => ({
+  forkConversation: jest.fn(),
+  duplicateConversation: jest.fn(),
+}));
+
+jest.mock('~/server/utils/import', () => ({
+  importConversations: jest.fn(),
+}));
+
+jest.mock('~/cache/getLogStores', () => jest.fn());
+
+jest.mock('~/server/routes/files/multer', () => ({
+  storage: {},
+  importFileFilter: jest.fn(),
+}));
+
+jest.mock('multer', () => {
+  return jest.fn(() => ({
+    single: jest.fn(() => (req, res, next) => {
+      req.file = { path: '/tmp/test-file.json' };
+      next();
+    }),
+  }));
+});
+
+jest.mock('librechat-data-provider', () => ({
+  CacheKeys: {
+    GEN_TITLE: 'GEN_TITLE',
+  },
+  EModelEndpoint: {
+    azureAssistants: 'azureAssistants',
+    assistants: 'assistants',
+  },
+}));
+
+jest.mock('~/server/services/Endpoints/azureAssistants', () => ({
+  initializeClient: jest.fn(),
+}));
+
+jest.mock('~/server/services/Endpoints/assistants', () => ({
+  initializeClient: jest.fn(),
+}));
 
 describe('Convos Routes', () => {
   let app;
   let convosRouter;
-  const {
-    deleteAllSharedLinks,
-    deleteConvoSharedLink,
-    deleteToolCalls,
-    deleteConvos,
-    saveConvo,
-  } = require('~/models');
+  let deleteAllSharedLinks;
+  let deleteConvoSharedLink;
+  let deleteConvos;
+  let getConvo;
+  let getMessages;
+  let saveConvo;
+  let deleteToolCalls;
+  let getLogStores;
 
-  beforeAll(() => {
+  beforeEach(() => {
+    jest.resetModules();
+    jest.clearAllMocks();
+
+    ({ deleteAllSharedLinks, deleteConvoSharedLink } = require('~/models'));
+    ({ deleteConvos, getConvo, saveConvo } = require('~/models/Conversation'));
+    ({ getMessages } = require('~/models/Message'));
+    ({ deleteToolCalls } = require('~/models/ToolCall'));
+    getLogStores = require('~/cache/getLogStores');
     convosRouter = require('../convos');
 
     app = express();
@@ -42,10 +143,6 @@ describe('Convos Routes', () => {
     });
 
     app.use('/api/convos', convosRouter);
-  });
-
-  beforeEach(() => {
-    jest.clearAllMocks();
   });
 
   describe('DELETE /all', () => {
@@ -212,6 +309,67 @@ describe('Convos Routes', () => {
 
       /** Verify no shared links remain for deleted conversations */
       expect(deleteAllSharedLinks).toHaveBeenCalledAfter(deleteConvos);
+    });
+  });
+
+  describe('GET /gen_title/:conversationId', () => {
+    it('should synthesize a fallback title from the first user message when the cache is empty', async () => {
+      const titleCache = {
+        get: jest.fn().mockResolvedValue(null),
+        set: jest.fn().mockResolvedValue(undefined),
+        delete: jest.fn().mockResolvedValue(undefined),
+      };
+      getLogStores.mockReturnValue(titleCache);
+      getConvo.mockResolvedValue({
+        conversationId: 'conv-title-1',
+        title: 'New Chat',
+      });
+      getMessages.mockResolvedValue([
+        {
+          sender: 'User',
+          text: 'check my ms365 inbox',
+        },
+      ]);
+
+      const response = await request(app).get('/api/convos/gen_title/conv-title-1');
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({ title: 'check my ms365 inbox' });
+      expect(titleCache.set).toHaveBeenCalledWith(
+        'test-user-123-conv-title-1',
+        'check my ms365 inbox',
+        120000,
+      );
+      expect(saveConvo).toHaveBeenCalledWith(
+        expect.objectContaining({
+          user: { id: 'test-user-123' },
+        }),
+        {
+          conversationId: 'conv-title-1',
+          title: 'check my ms365 inbox',
+        },
+        { context: 'api/server/routes/convos.js gen_title fallback' },
+      );
+    });
+
+    it('should return the persisted conversation title when cache is empty but the conversation is already titled', async () => {
+      const titleCache = {
+        get: jest.fn().mockResolvedValue(null),
+        set: jest.fn(),
+        delete: jest.fn().mockResolvedValue(undefined),
+      };
+      getLogStores.mockReturnValue(titleCache);
+      getConvo.mockResolvedValue({
+        conversationId: 'conv-title-2',
+        title: 'MS365 Inbox Review',
+      });
+
+      const response = await request(app).get('/api/convos/gen_title/conv-title-2');
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({ title: 'MS365 Inbox Review' });
+      expect(getMessages).not.toHaveBeenCalled();
+      expect(saveConvo).not.toHaveBeenCalled();
     });
   });
 
@@ -437,7 +595,7 @@ describe('Convos Routes', () => {
       expect(response.status).toBe(200);
       expect(response.body).toEqual(mockArchivedConvo);
       expect(saveConvo).toHaveBeenCalledWith(
-        expect.objectContaining({ userId: 'test-user-123' }),
+        expect.objectContaining({ user: { id: 'test-user-123' } }),
         { conversationId: mockConversationId, isArchived: true },
         { context: `POST /api/convos/archive ${mockConversationId}` },
       );
@@ -466,7 +624,7 @@ describe('Convos Routes', () => {
       expect(response.status).toBe(200);
       expect(response.body).toEqual(mockUnarchivedConvo);
       expect(saveConvo).toHaveBeenCalledWith(
-        expect.objectContaining({ userId: 'test-user-123' }),
+        expect.objectContaining({ user: { id: 'test-user-123' } }),
         { conversationId: mockConversationId, isArchived: false },
         { context: `POST /api/convos/archive ${mockConversationId}` },
       );

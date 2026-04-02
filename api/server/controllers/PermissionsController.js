@@ -9,17 +9,22 @@ const { enrichRemoteAgentPrincipals, backfillRemoteAgentPermissions } = require(
 const {
   bulkUpdateResourcePermissions,
   ensureGroupPrincipalExists,
-  getResourcePermissionsMap,
-  findAccessibleResources,
   getEffectivePermissions,
   ensurePrincipalExists,
   getAvailableRoles,
+  findAccessibleResources,
+  getResourcePermissionsMap,
 } = require('~/server/services/PermissionService');
+const {
+  searchPrincipals: searchLocalPrincipals,
+  sortPrincipalsByRelevance,
+  calculateRelevanceScore,
+} = require('~/models');
 const {
   entraIdPrincipalFeatureEnabled,
   searchEntraIdPrincipals,
 } = require('~/server/services/GraphApiService');
-const db = require('~/models');
+const { AclEntry, AccessRole } = require('~/db/models');
 
 /**
  * Generic controller for resource permission endpoints
@@ -150,18 +155,6 @@ const updateResourcePermissions = async (req, res) => {
       grantedBy: userId,
     });
 
-    const isAgentResource =
-      resourceType === ResourceType.AGENT || resourceType === ResourceType.REMOTE_AGENT;
-    const revokedUserIds = results.revoked
-      .filter((p) => p.type === PrincipalType.USER && p.id)
-      .map((p) => p.id);
-
-    if (isAgentResource && revokedUserIds.length > 0) {
-      db.removeAgentFromUserFavorites(resourceId, revokedUserIds).catch((err) => {
-        logger.error('[removeRevokedAgentFromFavorites] Error cleaning up favorites', err);
-      });
-    }
-
     /** @type {TUpdateResourcePermissionsResponse} */
     const response = {
       message: 'Permissions updated successfully',
@@ -192,7 +185,8 @@ const getResourcePermissions = async (req, res) => {
     const { resourceType, resourceId } = req.params;
     validateResourceType(resourceType);
 
-    const results = await db.aggregateAclEntries([
+    // Use aggregation pipeline for efficient single-query data retrieval
+    const results = await AclEntry.aggregate([
       // Match ACL entries for this resource
       {
         $match: {
@@ -288,12 +282,7 @@ const getResourcePermissions = async (req, res) => {
     }
 
     if (resourceType === ResourceType.REMOTE_AGENT) {
-      const enricherDeps = {
-        aggregateAclEntries: db.aggregateAclEntries,
-        bulkWriteAclEntries: db.bulkWriteAclEntries,
-        findRoleByIdentifier: db.findRoleByIdentifier,
-        logger,
-      };
+      const enricherDeps = { AclEntry, AccessRole, logger };
       const enrichResult = await enrichRemoteAgentPrincipals(enricherDeps, resourceId, principals);
       principals = enrichResult.principals;
       backfillRemoteAgentPermissions(enricherDeps, resourceId, enrichResult.entriesToBackfill);
@@ -410,7 +399,7 @@ const searchPrincipals = async (req, res) => {
       typeFilters = validTypes.length > 0 ? validTypes : null;
     }
 
-    const localResults = await db.searchPrincipals(query.trim(), searchLimit, typeFilters);
+    const localResults = await searchLocalPrincipals(query.trim(), searchLimit, typeFilters);
     let allPrincipals = [...localResults];
 
     const useEntraId = entraIdPrincipalFeatureEnabled(req.user);
@@ -466,11 +455,10 @@ const searchPrincipals = async (req, res) => {
     }
     const scoredResults = allPrincipals.map((item) => ({
       ...item,
-      _searchScore: db.calculateRelevanceScore(item, query.trim()),
+      _searchScore: calculateRelevanceScore(item, query.trim()),
     }));
 
-    const finalResults = db
-      .sortPrincipalsByRelevance(scoredResults)
+    const finalResults = sortPrincipalsByRelevance(scoredResults)
       .slice(0, searchLimit)
       .map((result) => {
         const { _searchScore, ...resultWithoutScore } = result;

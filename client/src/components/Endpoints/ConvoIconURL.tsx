@@ -1,5 +1,4 @@
 import { memo, useMemo } from 'react';
-import type { IconMapProps } from '~/common';
 import { URLIcon } from '~/components/Endpoints/URLIcon';
 import { icons } from '~/hooks/Endpoint/Icons';
 
@@ -39,15 +38,31 @@ const ConvoIconURL: React.FC<ConvoIconURLProps> = ({
   agentName,
   context,
 }) => {
-  const Icon = useMemo(() => icons[iconURL] ?? icons.unknown, [iconURL]);
+  /* === VIVENTIUM START ===
+   * Feature: Avatar-first icon resolution for agent/assistant conversations.
+   * Purpose: Prevent stale persisted `iconURL` values (e.g., old cloud-hosted URLs)
+   * from breaking chat icons when a current local avatar is available.
+   * Added: 2026-03-05
+   */
+  const resolvedIconURL = useMemo(
+    () => assistantAvatar || agentAvatar || iconURL,
+    [assistantAvatar, agentAvatar, iconURL],
+  );
+  /* === VIVENTIUM END === */
+
+  const Icon = useMemo(() => icons[resolvedIconURL] ?? icons.unknown, [resolvedIconURL]);
   const isURL = useMemo(
-    () => !!(iconURL && (iconURL.includes('http') || iconURL.startsWith('/images/'))),
-    [iconURL],
+    () =>
+      !!(
+        resolvedIconURL &&
+        (resolvedIconURL.includes('http') || resolvedIconURL.startsWith('/images/'))
+      ),
+    [resolvedIconURL],
   );
   if (isURL) {
     return (
       <URLIcon
-        iconURL={iconURL}
+        iconURL={resolvedIconURL}
         altName={modelLabel}
         className={classMap[context ?? 'default'] ?? classMap.default}
         containerStyle={styleMap[context ?? 'default'] ?? styleMap.default}

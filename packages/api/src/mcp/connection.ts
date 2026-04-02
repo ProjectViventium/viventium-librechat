@@ -11,17 +11,16 @@ import { WebSocketClientTransport } from '@modelcontextprotocol/sdk/client/webso
 import { ResourceListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
+import type { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
 import type {
   RequestInit as UndiciRequestInit,
   RequestInfo as UndiciRequestInfo,
   Response as UndiciResponse,
 } from 'undici';
 import type { MCPOAuthTokens } from './oauth/types';
-import type * as t from './types';
-import { createSSRFSafeUndiciConnect, resolveHostnameSSRF } from '~/auth';
-import { runOutsideTracing } from '~/utils/tracing';
-import { sanitizeUrlForLogging } from './utils';
 import { withTimeout } from '~/utils/promise';
+import type * as t from './types';
+import { sanitizeUrlForLogging } from './utils';
 import { mcpConfig } from './mcpConfig';
 
 type FetchLike = (url: string | URL, init?: RequestInit) => Promise<Response>;
@@ -71,28 +70,6 @@ const FIVE_MINUTES = 5 * 60 * 1000;
 const DEFAULT_TIMEOUT = 60000;
 /** SSE connections through proxies may need longer initial handshake time */
 const SSE_CONNECT_TIMEOUT = 120000;
-const DEFAULT_INIT_TIMEOUT = 30000;
-
-interface CircuitBreakerState {
-  cycleCount: number;
-  cycleWindowStart: number;
-  cooldownUntil: number;
-  failedRounds: number;
-  failedWindowStart: number;
-  failedBackoffUntil: number;
-}
-
-/** Default body timeout for Streamable HTTP GET SSE streams that idle between server pushes */
-const DEFAULT_SSE_READ_TIMEOUT = FIVE_MINUTES;
-
-/**
- * Error message prefixes emitted by the MCP SDK's StreamableHTTPClientTransport
- * (client/streamableHttp.ts → _handleSseStream / _scheduleReconnection).
- * These are SDK-internal strings, not part of a public API. If the SDK changes
- * them, suppression in setupTransportErrorHandlers will silently stop working.
- */
-const SDK_SSE_STREAM_DISCONNECTED = 'SSE stream disconnected';
-const SDK_SSE_RECONNECT_FAILED = 'Failed to reconnect SSE stream';
 
 /**
  * Headers for SSE connections.
@@ -164,6 +141,24 @@ function extractSSEErrorMessage(error: unknown): {
    * - "timed out" / "timeout": Generic timeout messages
    */
   const lowerMessage = rawMessage.toLowerCase();
+  /* === VIVENTIUM START ===
+   * Feature: Recognize expected streamable-http SSE side-channel disconnects.
+   * Purpose: These events are commonly auto-recovered and should be treated as transient.
+   */
+  if (
+    lowerMessage.includes('sse stream disconnected') &&
+    (lowerMessage.includes('typeerror: terminated') ||
+      lowerMessage.includes('aborterror') ||
+      lowerMessage.includes('operation was aborted'))
+  ) {
+    return {
+      message: `SSE stream side-channel disconnected: ${rawMessage}`,
+      code,
+      isProxyHint: false,
+      isTransient: true,
+    };
+  }
+  /* === VIVENTIUM END === */
   if (
     rawMessage.includes('ETIMEDOUT') ||
     rawMessage.includes('ESOCKETTIMEDOUT') ||
@@ -223,21 +218,6 @@ function extractSSEErrorMessage(error: unknown): {
     };
   }
 
-  /**
-   * "fetch failed" is a generic undici TypeError that occurs when an in-flight HTTP request
-   * is aborted (e.g. after an MCP protocol-level timeout fires). The transport itself is still
-   * functional — only the individual request was lost — so treat this as transient.
-   */
-  if (rawMessage === 'fetch failed') {
-    return {
-      message:
-        'fetch failed (request aborted, likely after a timeout — connection may still be usable)',
-      code,
-      isProxyHint: false,
-      isTransient: true,
-    };
-  }
-
   return {
     message: rawMessage,
     code,
@@ -263,21 +243,22 @@ export class MCPConnection extends EventEmitter {
   private readonly MAX_RECONNECT_ATTEMPTS = 3;
   public readonly serverName: string;
   private shouldStopReconnecting = false;
+  // === VIVENTIUM START ===
+  // Feature: Suppress transport error once when intentionally disconnecting (e.g., OAuth refresh).
+  // Purpose: Avoid noisy reconnection loops on deliberate disconnects.
+  private suppressNextTransportError = false;
+  // === VIVENTIUM END ===
   private isReconnecting = false;
   private isInitializing = false;
   private reconnectAttempts = 0;
-  private agents: Agent[] = [];
   private readonly userId?: string;
   private lastPingTime: number;
   private lastConnectionCheckAt: number = 0;
   private oauthTokens?: MCPOAuthTokens | null;
   private requestHeaders?: Record<string, string> | null;
   private oauthRequired = false;
-  private oauthRecovery = false;
-  private readonly useSSRFProtection: boolean;
   iconPath?: string;
   timeout?: number;
-  sseReadTimeout?: number;
   url?: string;
 
   /**
@@ -285,88 +266,6 @@ export class MCPConnection extends EventEmitter {
    * Used to detect if connection is stale compared to updated config.
    */
   public readonly createdAt: number;
-
-  private static circuitBreakers: Map<string, CircuitBreakerState> = new Map();
-
-  public static clearCooldown(serverName: string): void {
-    MCPConnection.circuitBreakers.delete(serverName);
-    logger.debug(`[MCP][${serverName}] Circuit breaker state cleared`);
-  }
-
-  private getCircuitBreaker(): CircuitBreakerState {
-    let cb = MCPConnection.circuitBreakers.get(this.serverName);
-    if (!cb) {
-      cb = {
-        cycleCount: 0,
-        cycleWindowStart: Date.now(),
-        cooldownUntil: 0,
-        failedRounds: 0,
-        failedWindowStart: Date.now(),
-        failedBackoffUntil: 0,
-      };
-      MCPConnection.circuitBreakers.set(this.serverName, cb);
-    }
-    return cb;
-  }
-
-  private isCircuitOpen(): boolean {
-    const cb = this.getCircuitBreaker();
-    const now = Date.now();
-    return now < cb.cooldownUntil || now < cb.failedBackoffUntil;
-  }
-
-  private recordCycle(): void {
-    const cb = this.getCircuitBreaker();
-    const now = Date.now();
-    if (now - cb.cycleWindowStart > mcpConfig.CB_CYCLE_WINDOW_MS) {
-      cb.cycleCount = 0;
-      cb.cycleWindowStart = now;
-    }
-    cb.cycleCount++;
-    if (cb.cycleCount >= mcpConfig.CB_MAX_CYCLES) {
-      cb.cooldownUntil = now + mcpConfig.CB_CYCLE_COOLDOWN_MS;
-      cb.cycleCount = 0;
-      cb.cycleWindowStart = now;
-      logger.warn(
-        `${this.getLogPrefix()} Circuit breaker: too many cycles, cooling down for ${mcpConfig.CB_CYCLE_COOLDOWN_MS}ms`,
-      );
-    }
-  }
-
-  private recordFailedRound(): void {
-    const cb = this.getCircuitBreaker();
-    const now = Date.now();
-    if (now - cb.failedWindowStart > mcpConfig.CB_FAILED_WINDOW_MS) {
-      cb.failedRounds = 0;
-      cb.failedWindowStart = now;
-    }
-    cb.failedRounds++;
-    if (cb.failedRounds >= mcpConfig.CB_MAX_FAILED_ROUNDS) {
-      const backoff = Math.min(
-        mcpConfig.CB_BASE_BACKOFF_MS *
-          Math.pow(2, cb.failedRounds - mcpConfig.CB_MAX_FAILED_ROUNDS),
-        mcpConfig.CB_MAX_BACKOFF_MS,
-      );
-      cb.failedBackoffUntil = now + backoff;
-      logger.warn(
-        `${this.getLogPrefix()} Circuit breaker: too many failures, backing off for ${backoff}ms`,
-      );
-    }
-  }
-
-  private resetFailedRounds(): void {
-    const cb = this.getCircuitBreaker();
-    cb.failedRounds = 0;
-    cb.failedWindowStart = Date.now();
-    cb.failedBackoffUntil = 0;
-  }
-
-  public static decrementCycleCount(serverName: string): void {
-    const cb = MCPConnection.circuitBreakers.get(serverName);
-    if (cb && cb.cycleCount > 0) {
-      cb.cycleCount--;
-    }
-  }
 
   setRequestHeaders(headers: Record<string, string> | null): void {
     if (!headers) {
@@ -388,10 +287,8 @@ export class MCPConnection extends EventEmitter {
     this.options = params.serverConfig;
     this.serverName = params.serverName;
     this.userId = params.userId;
-    this.useSSRFProtection = params.useSSRFProtection === true;
     this.iconPath = params.serverConfig.iconPath;
     this.timeout = params.serverConfig.timeout;
-    this.sseReadTimeout = params.serverConfig.sseReadTimeout;
     this.lastPingTime = Date.now();
     this.createdAt = Date.now(); // Record creation timestamp for staleness detection
     if (params.oauthTokens) {
@@ -416,49 +313,73 @@ export class MCPConnection extends EventEmitter {
     return `[MCP]${userPart}[${this.serverName}]`;
   }
 
+  /* === VIVENTIUM START ===
+   * Feature: OAuth expiry guard for MCP connections.
+   * Purpose: Ensure expired access tokens trigger reconnection + refresh.
+   */
+  private isOAuthTokenExpired(): boolean {
+    if (!this.oauthTokens?.expires_at) {
+      return false;
+    }
+    const expiresAt = Number(this.oauthTokens.expires_at);
+    if (!Number.isFinite(expiresAt)) {
+      return false;
+    }
+    const graceMs = Math.max(mcpConfig.OAUTH_TOKEN_EXPIRE_GRACE_MS ?? 0, 0);
+    return Date.now() >= expiresAt - graceMs;
+  }
+  /* === VIVENTIUM END === */
+
+  /* === VIVENTIUM START ===
+   * Feature: Ignore expected streamable-http side-channel disconnect noise.
+   * Purpose: Prevent false MCP error states and reconnection churn.
+   */
+  private isExpectedStreamableHTTPDisconnect(error: unknown): boolean {
+    if (!isStreamableHTTPOptions(this.options)) {
+      return false;
+    }
+    if (!error || typeof error !== 'object') {
+      return false;
+    }
+    if (!('message' in error) || typeof error.message !== 'string') {
+      return false;
+    }
+    const message = error.message.toLowerCase();
+    if (!message.includes('sse stream disconnected')) {
+      return false;
+    }
+    return (
+      message.includes('typeerror: terminated') ||
+      message.includes('aborterror') ||
+      message.includes('this operation was aborted')
+    );
+  }
+
+  /* === VIVENTIUM END === */
   /**
    * Factory function to create fetch functions without capturing the entire `this` context.
    * This helps prevent memory leaks by only passing necessary dependencies.
    *
-   * When `sseBodyTimeout` is provided, a second Agent is created with a much longer
-   * body timeout for GET requests (the Streamable HTTP SSE stream). POST requests
-   * continue using the normal timeout so they fail fast on real errors.
+   * @param getHeaders Function to retrieve request headers
+   * @param timeout Timeout value for the agent (in milliseconds)
+   * @returns A fetch function that merges headers appropriately
    */
   private createFetchFunction(
     getHeaders: () => Record<string, string> | null | undefined,
     timeout?: number,
-    sseBodyTimeout?: number,
   ): (input: UndiciRequestInfo, init?: UndiciRequestInit) => Promise<UndiciResponse> {
-    const ssrfConnect = this.useSSRFProtection ? createSSRFSafeUndiciConnect() : undefined;
-    const connectOpts = ssrfConnect != null ? { connect: ssrfConnect } : {};
-    const effectiveTimeout = timeout || DEFAULT_TIMEOUT;
-    const postAgent = new Agent({
-      bodyTimeout: effectiveTimeout,
-      headersTimeout: effectiveTimeout,
-      ...connectOpts,
-    });
-    this.agents.push(postAgent);
-
-    let getAgent: Agent | undefined;
-    if (sseBodyTimeout != null) {
-      getAgent = new Agent({
-        bodyTimeout: sseBodyTimeout,
-        headersTimeout: effectiveTimeout,
-        ...connectOpts,
-      });
-      this.agents.push(getAgent);
-    }
-
     return function customFetch(
       input: UndiciRequestInfo,
       init?: UndiciRequestInit,
     ): Promise<UndiciResponse> {
-      const isGet = (init?.method ?? 'GET').toUpperCase() === 'GET';
-      const dispatcher = isGet && getAgent ? getAgent : postAgent;
-
       const requestHeaders = getHeaders();
+      const effectiveTimeout = timeout || DEFAULT_TIMEOUT;
+      const agent = new Agent({
+        bodyTimeout: effectiveTimeout,
+        headersTimeout: effectiveTimeout,
+      });
       if (!requestHeaders) {
-        return undiciFetch(input, { ...init, redirect: 'manual', dispatcher });
+        return undiciFetch(input, { ...init, dispatcher: agent });
       }
 
       let initHeaders: Record<string, string> = {};
@@ -474,12 +395,11 @@ export class MCPConnection extends EventEmitter {
 
       return undiciFetch(input, {
         ...init,
-        redirect: 'manual',
         headers: {
           ...initHeaders,
           ...requestHeaders,
         },
-        dispatcher,
+        dispatcher: agent,
       });
     };
   }
@@ -489,7 +409,7 @@ export class MCPConnection extends EventEmitter {
     logger.error(`${this.getLogPrefix()} ${errorContext}: ${errorMessage}`);
   }
 
-  private async constructTransport(options: t.MCPOptions): Promise<Transport> {
+  private constructTransport(options: t.MCPOptions): Transport {
     try {
       let type: t.MCPOptions['type'];
       if (isStdioOptions(options)) {
@@ -520,29 +440,12 @@ export class MCPConnection extends EventEmitter {
             env: { ...getDefaultEnvironment(), ...(options.env ?? {}) },
           });
 
-        case 'websocket': {
+        case 'websocket':
           if (!isWebSocketOptions(options)) {
             throw new Error('Invalid options for websocket transport.');
           }
           this.url = options.url;
-          /**
-           * SSRF pre-check: always validate resolved IPs for WebSocket, regardless
-           * of allowlist configuration. Allowlisting a domain grants trust to that
-           * name, not to whatever IP it resolves to at runtime (DNS rebinding).
-           *
-           * Note: WebSocketClientTransport does its own DNS resolution, creating a
-           * small TOCTOU window. This is an SDK limitation — the transport accepts
-           * only a URL with no custom DNS lookup hook.
-           */
-          const wsHostname = new URL(options.url).hostname;
-          const isSSRF = await resolveHostnameSSRF(wsHostname);
-          if (isSSRF) {
-            throw new Error(
-              `SSRF protection: WebSocket host "${wsHostname}" resolved to a private/reserved IP address`,
-            );
-          }
           return new WebSocketClientTransport(new URL(options.url));
-        }
 
         case 'sse': {
           if (!isSSEOptions(options)) {
@@ -566,15 +469,6 @@ export class MCPConnection extends EventEmitter {
            * The connect timeout is extended because proxies may delay initial response.
            */
           const sseTimeout = this.timeout || SSE_CONNECT_TIMEOUT;
-          const ssrfConnect = this.useSSRFProtection ? createSSRFSafeUndiciConnect() : undefined;
-          const sseAgent = new Agent({
-            bodyTimeout: sseTimeout,
-            headersTimeout: sseTimeout,
-            keepAliveTimeout: sseTimeout,
-            keepAliveMaxTimeout: sseTimeout * 2,
-            ...(ssrfConnect != null ? { connect: ssrfConnect } : {}),
-          });
-          this.agents.push(sseAgent);
           const transport = new SSEClientTransport(url, {
             requestInit: {
               /** User/OAuth headers override SSE defaults */
@@ -587,10 +481,16 @@ export class MCPConnection extends EventEmitter {
                 const fetchHeaders = new Headers(
                   Object.assign({}, SSE_REQUEST_HEADERS, init?.headers, headers),
                 );
+                const agent = new Agent({
+                  bodyTimeout: sseTimeout,
+                  headersTimeout: sseTimeout,
+                  /** Extended keep-alive for long-lived SSE connections */
+                  keepAliveTimeout: sseTimeout,
+                  keepAliveMaxTimeout: sseTimeout * 2,
+                });
                 return undiciFetch(url, {
                   ...init,
-                  redirect: 'manual',
-                  dispatcher: sseAgent,
+                  dispatcher: agent,
                   headers: fetchHeaders,
                 });
               },
@@ -604,6 +504,10 @@ export class MCPConnection extends EventEmitter {
           transport.onclose = () => {
             logger.info(`${this.getLogPrefix()} SSE transport closed`);
             this.emit('connectionChange', 'disconnected');
+          };
+
+          transport.onmessage = (message) => {
+            logger.info(`${this.getLogPrefix()} Message received: ${JSON.stringify(message)}`);
           };
 
           this.setupTransportErrorHandlers(transport);
@@ -635,13 +539,16 @@ export class MCPConnection extends EventEmitter {
             fetch: this.createFetchFunction(
               this.getRequestHeaders.bind(this),
               this.timeout,
-              this.sseReadTimeout || DEFAULT_SSE_READ_TIMEOUT,
             ) as unknown as FetchLike,
           });
 
           transport.onclose = () => {
             logger.info(`${this.getLogPrefix()} Streamable-http transport closed`);
             this.emit('connectionChange', 'disconnected');
+          };
+
+          transport.onmessage = (message: JSONRPCMessage) => {
+            logger.info(`${this.getLogPrefix()} Message received: ${JSON.stringify(message)}`);
           };
 
           this.setupTransportErrorHandlers(transport);
@@ -702,11 +609,7 @@ export class MCPConnection extends EventEmitter {
     }
 
     this.isReconnecting = true;
-    const backoffDelay = (attempt: number) => {
-      const base = Math.min(1000 * Math.pow(2, attempt), 30000);
-      const jitter = Math.floor(Math.random() * 1000); // up to 1s of random jitter
-      return base + jitter;
-    };
+    const backoffDelay = (attempt: number) => Math.min(1000 * Math.pow(2, attempt), 30000);
 
     try {
       while (
@@ -780,12 +683,6 @@ export class MCPConnection extends EventEmitter {
       return;
     }
 
-    if (this.isCircuitOpen()) {
-      this.connectionState = 'error';
-      this.emit('connectionChange', 'error');
-      throw new Error(`${this.getLogPrefix()} Circuit breaker is open, connection attempt blocked`);
-    }
-
     this.emit('connectionChange', 'connecting');
 
     this.connectPromise = (async () => {
@@ -793,37 +690,25 @@ export class MCPConnection extends EventEmitter {
         if (this.transport) {
           try {
             await this.client.close();
+            this.transport = null;
           } catch (error) {
             logger.warn(`${this.getLogPrefix()} Error closing connection:`, error);
           }
-          this.transport = null;
-          await this.closeAgents();
         }
 
-        this.transport = await runOutsideTracing(() => this.constructTransport(this.options));
-        this.patchTransportSend();
+        this.transport = this.constructTransport(this.options);
+        this.setupTransportDebugHandlers();
 
-        const connectTimeout = this.options.initTimeout ?? DEFAULT_INIT_TIMEOUT;
-        await runOutsideTracing(() =>
-          withTimeout(
-            this.client.connect(this.transport!),
-            connectTimeout,
-            `Connection timeout after ${connectTimeout}ms`,
-          ),
+        const connectTimeout = this.options.initTimeout ?? 120000;
+        await withTimeout(
+          this.client.connect(this.transport),
+          connectTimeout,
+          `Connection timeout after ${connectTimeout}ms`,
         );
 
-        this.setupTransportOnMessageHandler();
         this.connectionState = 'connected';
         this.emit('connectionChange', 'connected');
         this.reconnectAttempts = 0;
-        this.resetFailedRounds();
-        if (this.oauthRecovery) {
-          MCPConnection.decrementCycleCount(this.serverName);
-          this.oauthRecovery = false;
-          logger.debug(
-            `${this.getLogPrefix()} OAuth recovery: decremented cycle count after successful reconnect`,
-          );
-        }
       } catch (error) {
         // Check if it's a rate limit error - stop immediately to avoid making it worse
         if (this.isRateLimitError(error)) {
@@ -907,8 +792,9 @@ export class MCPConnection extends EventEmitter {
           try {
             // Wait for OAuth to be handled
             await oauthHandledPromise;
+            // Reset the oauthRequired flag
             this.oauthRequired = false;
-            this.oauthRecovery = true;
+            // Don't throw the error - just return so connection can be retried
             logger.info(
               `${this.getLogPrefix()} OAuth handled successfully, connection will be retried`,
             );
@@ -924,7 +810,6 @@ export class MCPConnection extends EventEmitter {
 
         this.connectionState = 'error';
         this.emit('connectionChange', 'error');
-        this.recordFailedRound();
         throw error;
       } finally {
         this.connectPromise = null;
@@ -934,10 +819,14 @@ export class MCPConnection extends EventEmitter {
     return this.connectPromise;
   }
 
-  private patchTransportSend(): void {
+  private setupTransportDebugHandlers(): void {
     if (!this.transport) {
       return;
     }
+
+    this.transport.onmessage = (msg) => {
+      logger.debug(`${this.getLogPrefix()} Transport received: ${JSON.stringify(msg)}`);
+    };
 
     const originalSend = this.transport.send.bind(this.transport);
     this.transport.send = async (msg) => {
@@ -947,35 +836,14 @@ export class MCPConnection extends EventEmitter {
         }
         this.lastPingTime = Date.now();
       }
-      const method = 'method' in msg ? msg.method : undefined;
-      const id = 'id' in msg ? (msg as { id: string | number | null }).id : undefined;
-      logger.debug(
-        `${this.getLogPrefix()} Transport sending: method=${method ?? 'response'} id=${id ?? 'none'}`,
-      );
+      logger.debug(`${this.getLogPrefix()} Transport sending: ${JSON.stringify(msg)}`);
       return originalSend(msg);
-    };
-  }
-
-  private setupTransportOnMessageHandler(): void {
-    if (!this.transport?.onmessage) {
-      return;
-    }
-
-    const sdkHandler = this.transport.onmessage;
-    this.transport.onmessage = (msg) => {
-      const method = 'method' in msg ? msg.method : undefined;
-      const id = 'id' in msg ? (msg as { id: string | number | null }).id : undefined;
-      logger.debug(
-        `${this.getLogPrefix()} Transport received: method=${method ?? 'response'} id=${id ?? 'none'}`,
-      );
-      sdkHandler(msg);
     };
   }
 
   async connect(): Promise<void> {
     try {
-      // preserve cycle tracking across reconnects so the circuit breaker can detect rapid cycling
-      await this.disconnect(false);
+      await this.disconnect();
       await this.connectClient();
       if (!(await this.isConnected())) {
         throw new Error('Connection not established');
@@ -988,26 +856,28 @@ export class MCPConnection extends EventEmitter {
 
   private setupTransportErrorHandlers(transport: Transport): void {
     transport.onerror = (error) => {
-      const rawMessage =
-        error && typeof error === 'object' ? ((error as { message?: string }).message ?? '') : '';
-
-      /**
-       * The MCP SDK's StreamableHTTPClientTransport fires onerror for SSE GET stream
-       * disconnects but also handles reconnection internally via _scheduleReconnection.
-       * Escalating these to a full transport rebuild creates a redundant reconnection
-       * loop. Log at debug level and let the SDK recover the GET stream on its own.
-       *
-       * "Maximum reconnection attempts … exceeded" means the SDK gave up — that one
-       * must fall through so our higher-level reconnection takes over.
+      /* === VIVENTIUM START ===
+       * Feature: Suppress expected transport errors after intentional disconnects.
        */
-      if (
-        rawMessage.startsWith(SDK_SSE_STREAM_DISCONNECTED) ||
-        rawMessage.startsWith(SDK_SSE_RECONNECT_FAILED)
-      ) {
-        logger.debug(`${this.getLogPrefix()} SDK SSE stream recovery in progress: ${rawMessage}`);
+      if (this.suppressNextTransportError) {
+        this.suppressNextTransportError = false;
+        logger.debug(
+          `${this.getLogPrefix()} Suppressing transport error after intentional disconnect`,
+        );
         return;
       }
-
+      /* === VIVENTIUM END === */
+      /* === VIVENTIUM START ===
+       * Feature: Skip error-state transitions for expected streamable-http side-channel disconnects.
+       */
+      if (this.isExpectedStreamableHTTPDisconnect(error)) {
+        logger.debug(
+          `${this.getLogPrefix()} Streamable-http SSE side-channel disconnected (expected transient event)`,
+        );
+        return;
+      }
+      /* === VIVENTIUM END === */
+      // Extract meaningful error information (handles "SSE error: undefined" cases)
       const {
         message: errorMessage,
         code: errorCode,
@@ -1015,24 +885,10 @@ export class MCPConnection extends EventEmitter {
         isTransient,
       } = extractSSEErrorMessage(error);
 
-      if (errorCode === 400 || errorCode === 404 || errorCode === 405) {
-        const hasSession =
-          'sessionId' in transport &&
-          (transport as { sessionId?: string }).sessionId != null &&
-          (transport as { sessionId?: string }).sessionId !== '';
-
-        if (!hasSession && errorMessage.toLowerCase().includes('failed to open sse stream')) {
-          logger.warn(
-            `${this.getLogPrefix()} SSE stream not available (${errorCode}), no session. Ignoring.`,
-          );
-          return;
-        }
-
-        if (hasSession) {
-          logger.warn(
-            `${this.getLogPrefix()} ${errorCode} with active session — session lost, triggering reconnection.`,
-          );
-        }
+      // Ignore SSE 404 errors for servers that don't support SSE
+      if (errorCode === 404 && errorMessage.toLowerCase().includes('failed to open sse stream')) {
+        logger.warn(`${this.getLogPrefix()} SSE stream not available (404). Ignoring.`);
+        return;
       }
 
       // Check if it's an OAuth authentication error
@@ -1090,24 +946,12 @@ export class MCPConnection extends EventEmitter {
     };
   }
 
-  private async closeAgents(): Promise<void> {
-    const logPrefix = this.getLogPrefix();
-    const closing = this.agents.map((agent) =>
-      agent.close().catch((err: unknown) => {
-        logger.debug(`${logPrefix} Agent close error (non-fatal):`, err);
-      }),
-    );
-    this.agents = [];
-    await Promise.all(closing);
-  }
-
-  public async disconnect(resetCycleTracking = true): Promise<void> {
+  public async disconnect(): Promise<void> {
     try {
       if (this.transport) {
         await this.client.close();
         this.transport = null;
       }
-      await this.closeAgents();
       if (this.connectionState === 'disconnected') {
         return;
       }
@@ -1115,9 +959,6 @@ export class MCPConnection extends EventEmitter {
       this.emit('connectionChange', 'disconnected');
     } finally {
       this.connectPromise = null;
-      if (!resetCycleTracking) {
-        this.recordCycle();
-      }
     }
   }
 
@@ -1157,6 +998,21 @@ export class MCPConnection extends EventEmitter {
       return false;
     }
 
+    /* === VIVENTIUM START ===
+     * Feature: Force reconnection when OAuth tokens are expiring.
+     * Reason: Long-lived MCP connections can retain stale access tokens.
+     */
+    if (this.isOAuthTokenExpired()) {
+      logger.info(
+        `${this.getLogPrefix()} OAuth access token expired/expiring, disconnecting to refresh`,
+      );
+      // Prevent reconnection loops on this stale connection instance.
+      this.shouldStopReconnecting = true;
+      this.suppressNextTransportError = true;
+      await this.disconnect();
+      return false;
+    }
+    /* === VIVENTIUM END === */
     // If we recently checked, skip expensive verification
     const now = Date.now();
     if (now - this.lastConnectionCheckAt < mcpConfig.CONNECTION_CHECK_TTL) {

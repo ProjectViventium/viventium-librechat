@@ -2,7 +2,8 @@ const crypto = require('crypto');
 const { logger } = require('@librechat/data-schemas');
 const { parseConvo } = require('librechat-data-provider');
 const { sendEvent, handleError, sanitizeMessageForTransmit } = require('@librechat/api');
-const { saveMessage, getMessages, getConvo } = require('~/models');
+const { saveMessage, getMessages } = require('~/models/Message');
+const { getConvo } = require('~/models/Conversation');
 
 /**
  * Processes an error with provided options, saves the error message and sends a corresponding SSE response
@@ -48,11 +49,7 @@ const sendError = async (req, res, options, callback) => {
 
   if (shouldSaveMessage) {
     await saveMessage(
-      {
-        userId: req?.user?.id,
-        isTemporary: req?.body?.isTemporary,
-        interfaceConfig: req?.config?.interfaceConfig,
-      },
+      req,
       { ...errorMessage, user },
       {
         context: 'api/server/utils/streamResponse.js - sendError',

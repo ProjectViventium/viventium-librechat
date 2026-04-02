@@ -2,7 +2,7 @@ import { useEffect, useRef } from 'react';
 import { useSetRecoilState, useRecoilValue } from 'recoil';
 import { Constants, tMessageSchema, isAssistantsEndpoint } from 'librechat-data-provider';
 import type { TMessage, TConversation, TSubmission, Agents } from 'librechat-data-provider';
-import { useStreamStatus } from '~/data-provider';
+import { useActiveJobs, useStreamStatus } from '~/data-provider';
 import store from '~/store';
 
 /**
@@ -125,11 +125,8 @@ export default function useResumeOnLoad(
     conversationId !== Constants.NEW_CONVO &&
     processedConvoRef.current !== conversationId; // Don't re-check processed convos
 
-  const {
-    data: streamStatus,
-    isSuccess,
-    isFetching,
-  } = useStreamStatus(conversationId, shouldCheck);
+  const { data: streamStatus, isSuccess } = useStreamStatus(conversationId, shouldCheck);
+  const { data: activeJobsData, isSuccess: activeJobsReady } = useActiveJobs(resumableEnabled);
 
   useEffect(() => {
     console.log('[ResumeOnLoad] Effect check', {
@@ -139,7 +136,6 @@ export default function useResumeOnLoad(
       hasCurrentSubmission: !!currentSubmission,
       currentSubmissionConvoId: currentSubmission?.conversation?.conversationId,
       isSuccess,
-      isFetching,
       streamStatusActive: streamStatus?.active,
       streamStatusStreamId: streamStatus?.streamId,
       processedConvoRef: processedConvoRef.current,
@@ -153,6 +149,22 @@ export default function useResumeOnLoad(
     // Wait for messages to load to avoid race condition where sync overwrites then DB overwrites
     if (!messagesLoaded) {
       console.log('[ResumeOnLoad] Waiting for messages to load');
+      return;
+    }
+
+    // Local active-job cache is the single source of truth for same-session resume decisions.
+    // FINAL removes the job optimistically so Phase B can finish in the background without
+    // immediately re-opening a stale resume stream on the same page.
+    if (!activeJobsReady) {
+      console.log('[ResumeOnLoad] Waiting for active jobs query');
+      return;
+    }
+
+    const activeJobIds = activeJobsData?.activeJobIds ?? [];
+    const isConversationInActiveJobs = activeJobIds.includes(conversationId);
+    if (!isConversationInActiveJobs) {
+      console.log('[ResumeOnLoad] Skipping resume - conversation not active in local job cache');
+      processedConvoRef.current = conversationId;
       return;
     }
 
@@ -176,9 +188,8 @@ export default function useResumeOnLoad(
       );
     }
 
-    // Wait for stream status query to complete (including background refetches
-    // that may replace a stale cached result with fresh data)
-    if (!isSuccess || !streamStatus || isFetching) {
+    // Wait for stream status query to complete
+    if (!isSuccess || !streamStatus) {
       console.log('[ResumeOnLoad] Waiting for stream status query');
       return;
     }
@@ -189,12 +200,15 @@ export default function useResumeOnLoad(
       return;
     }
 
+    // Check if there's an active job to resume
+    // DON'T mark as processed here - only mark when we actually create a submission
+    // This prevents stale cache data from blocking subsequent resume attempts
     if (!streamStatus.active || !streamStatus.streamId) {
       console.log('[ResumeOnLoad] No active job to resume for:', conversationId);
-      processedConvoRef.current = conversationId;
       return;
     }
 
+    // Mark as processed NOW - we verified there's an active job and will create submission
     processedConvoRef.current = conversationId;
 
     console.log('[ResumeOnLoad] Found active job, creating submission...', {
@@ -243,8 +257,9 @@ export default function useResumeOnLoad(
     hasActiveSubmissionForThisConvo,
     submissionConvoId,
     currentSubmission,
+    activeJobsData?.activeJobIds,
+    activeJobsReady,
     isSuccess,
-    isFetching,
     streamStatus,
     getMessages,
     setSubmission,

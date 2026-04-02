@@ -1,12 +1,15 @@
 import { logger } from '@librechat/data-schemas';
 import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
-import type * as t from './types';
-import { MCPServersRegistry } from '~/mcp/registry/MCPServersRegistry';
-import { ConnectionsRepository } from '~/mcp/ConnectionsRepository';
 import { MCPConnectionFactory } from '~/mcp/MCPConnectionFactory';
-import { isUserSourced } from './utils';
+import { MCPServersRegistry } from '~/mcp/registry/MCPServersRegistry';
 import { MCPConnection } from './connection';
+import type * as t from './types';
+import { ConnectionsRepository } from '~/mcp/ConnectionsRepository';
 import { mcpConfig } from './mcpConfig';
+
+type DisconnectUserConnectionsOptions = {
+  serverNames?: string[];
+};
 
 /**
  * Abstract base class for managing user-specific MCP connections with lifecycle management.
@@ -22,8 +25,6 @@ export abstract class UserConnectionManager {
   protected userConnections: Map<string, Map<string, MCPConnection>> = new Map();
   /** Last activity timestamp for users (not per server) */
   protected userLastActivity: Map<string, number> = new Map();
-  /** In-flight connection promises keyed by `userId:serverName` — coalesces concurrent attempts */
-  protected pendingConnections: Map<string, Promise<MCPConnection>> = new Map();
 
   /** Updates the last activity timestamp for a user */
   protected updateUserLastActivity(userId: string): void {
@@ -34,68 +35,44 @@ export abstract class UserConnectionManager {
     );
   }
 
-  /** Gets or creates a connection for a specific user, coalescing concurrent attempts */
-  public async getUserConnection(
-    opts: {
-      serverName: string;
-      forceNew?: boolean;
-      /** Pre-resolved config for config-source servers not in YAML/DB */
-      serverConfig?: t.ParsedServerConfig;
-    } & Omit<t.OAuthConnectionOptions, 'useOAuth'>,
-  ): Promise<MCPConnection> {
-    const { serverName, forceNew, user } = opts;
+  /* === VIVENTIUM START ===
+   * Feature: Keep selected MCP servers connected across idle cleanup.
+   * Purpose: Avoid disconnect churn for persistent MCPs (e.g., scheduling-cortex).
+   */
+  private getIdleDisconnectServers(userId: string): string[] {
+    const userMap = this.userConnections.get(userId);
+    if (!userMap || userMap.size === 0) {
+      return [];
+    }
+    return Array.from(userMap.keys()).filter(
+      (serverName) => !mcpConfig.PERSISTENT_CONNECTION_SERVERS.has(serverName),
+    );
+  }
+  /* === VIVENTIUM END === */
+
+  /** Gets or creates a connection for a specific user */
+  public async getUserConnection({
+    serverName,
+    forceNew,
+    user,
+    flowManager,
+    customUserVars,
+    requestBody,
+    tokenMethods,
+    oauthStart,
+    oauthEnd,
+    signal,
+    returnOnOAuth = false,
+    connectionTimeout,
+  }: {
+    serverName: string;
+    forceNew?: boolean;
+  } & Omit<t.OAuthConnectionOptions, 'useOAuth'>): Promise<MCPConnection> {
     const userId = user?.id;
     if (!userId) {
       throw new McpError(ErrorCode.InvalidRequest, `[MCP] User object missing id property`);
     }
 
-    const lockKey = `${userId}:${serverName}`;
-
-    if (!forceNew) {
-      const pending = this.pendingConnections.get(lockKey);
-      if (pending) {
-        logger.debug(`[MCP][User: ${userId}][${serverName}] Joining in-flight connection attempt`);
-        return pending;
-      }
-    }
-
-    const connectionPromise = this.createUserConnectionInternal(opts, userId);
-
-    if (!forceNew) {
-      this.pendingConnections.set(lockKey, connectionPromise);
-    }
-
-    try {
-      return await connectionPromise;
-    } finally {
-      if (!forceNew && this.pendingConnections.get(lockKey) === connectionPromise) {
-        this.pendingConnections.delete(lockKey);
-      }
-    }
-  }
-
-  private async createUserConnectionInternal(
-    {
-      serverName,
-      forceNew,
-      user,
-      flowManager,
-      customUserVars,
-      requestBody,
-      tokenMethods,
-      oauthStart,
-      oauthEnd,
-      signal,
-      returnOnOAuth = false,
-      connectionTimeout,
-      serverConfig: providedConfig,
-    }: {
-      serverName: string;
-      forceNew?: boolean;
-      serverConfig?: t.ParsedServerConfig;
-    } & Omit<t.OAuthConnectionOptions, 'useOAuth'>,
-    userId: string,
-  ): Promise<MCPConnection> {
     if (await this.appConnections!.has(serverName)) {
       throw new McpError(
         ErrorCode.InvalidRequest,
@@ -103,29 +80,38 @@ export abstract class UserConnectionManager {
       );
     }
 
-    const config =
-      providedConfig ??
-      (await MCPServersRegistry.getInstance().getServerConfig(serverName, userId));
+    const config = await MCPServersRegistry.getInstance().getServerConfig(serverName, userId);
 
     const userServerMap = this.userConnections.get(userId);
     let connection = forceNew ? undefined : userServerMap?.get(serverName);
-    if (forceNew) {
-      MCPConnection.clearCooldown(serverName);
-    }
     const now = Date.now();
 
     // Check if user is idle
     const lastActivity = this.userLastActivity.get(userId);
     if (lastActivity && now - lastActivity > mcpConfig.USER_CONNECTION_IDLE_TIMEOUT) {
-      logger.info(`[MCP][User: ${userId}] User idle for too long. Disconnecting all connections.`);
-      // Disconnect all user connections
-      try {
-        await this.disconnectUserConnections(userId);
-      } catch (err) {
-        logger.error(`[MCP][User: ${userId}] Error disconnecting idle connections:`, err);
+      /* === VIVENTIUM START ===
+       * Feature: Preserve persistent MCP servers during idle cleanup.
+       */
+      const idleDisconnectServers = this.getIdleDisconnectServers(userId);
+      if (idleDisconnectServers.length > 0) {
+        logger.info(
+          `[MCP][User: ${userId}] User idle for too long. Disconnecting ${idleDisconnectServers.length} non-persistent connection(s).`,
+        );
+        try {
+          await this.disconnectUserConnections(userId, { serverNames: idleDisconnectServers });
+        } catch (err) {
+          logger.error(`[MCP][User: ${userId}] Error disconnecting idle connections:`, err);
+        }
+      } else {
+        logger.debug(
+          `[MCP][User: ${userId}] User idle but only persistent connections are active; preserving them.`,
+        );
       }
-      connection = undefined; // Force creation of a new connection
-    } else if (connection) {
+      connection = forceNew ? undefined : this.userConnections.get(userId)?.get(serverName);
+      /* === VIVENTIUM END === */
+    }
+
+    if (connection) {
       if (!config || (config.updatedAt && connection.isStale(config.updatedAt))) {
         if (config) {
           logger.info(
@@ -160,14 +146,12 @@ export abstract class UserConnectionManager {
     logger.info(`[MCP][User: ${userId}][${serverName}] Establishing new connection`);
 
     try {
-      const registry = MCPServersRegistry.getInstance();
       connection = await MCPConnectionFactory.create(
         {
           serverConfig: config,
           serverName: serverName,
-          dbSourced: isUserSourced(config),
-          useSSRFProtection: registry.shouldEnableSSRFProtection(),
-          allowedDomains: registry.getAllowedDomains(),
+          dbSourced: !!config.dbId,
+          useSSRFProtection: MCPServersRegistry.getInstance().shouldEnableSSRFProtection(),
         },
         {
           useOAuth: true,
@@ -234,7 +218,6 @@ export abstract class UserConnectionManager {
 
   /** Disconnects and removes a specific user connection */
   public async disconnectUserConnection(userId: string, serverName: string): Promise<void> {
-    this.pendingConnections.delete(`${userId}:${serverName}`);
     const userMap = this.userConnections.get(userId);
     const connection = userMap?.get(serverName);
     if (connection) {
@@ -245,12 +228,26 @@ export abstract class UserConnectionManager {
   }
 
   /** Disconnects and removes all connections for a specific user */
-  public async disconnectUserConnections(userId: string): Promise<void> {
+  public async disconnectUserConnections(
+    userId: string,
+    options?: DisconnectUserConnectionsOptions,
+  ): Promise<void> {
     const userMap = this.userConnections.get(userId);
     const disconnectPromises: Promise<void>[] = [];
     if (userMap) {
-      logger.info(`[MCP][User: ${userId}] Disconnecting all servers...`);
-      const userServers = Array.from(userMap.keys());
+      const targetServers = options?.serverNames?.length
+        ? options.serverNames.filter((serverName) => userMap.has(serverName))
+        : Array.from(userMap.keys());
+      if (targetServers.length === 0) {
+        this.userLastActivity.delete(userId);
+        return;
+      }
+      logger.info(
+        targetServers.length === userMap.size
+          ? `[MCP][User: ${userId}] Disconnecting all servers...`
+          : `[MCP][User: ${userId}] Disconnecting ${targetServers.length} server(s)...`,
+      );
+      const userServers = targetServers;
       for (const serverName of userServers) {
         disconnectPromises.push(
           this.disconnectUserConnection(userId, serverName).catch((error) => {
@@ -262,12 +259,6 @@ export abstract class UserConnectionManager {
         );
       }
       await Promise.allSettled(disconnectPromises);
-      // Clean up any pending connection promises for this user
-      for (const key of this.pendingConnections.keys()) {
-        if (key.startsWith(`${userId}:`)) {
-          this.pendingConnections.delete(key);
-        }
-      }
       // Ensure user activity timestamp is removed
       this.userLastActivity.delete(userId);
       logger.info(`[MCP][User: ${userId}] All connections processed for disconnection.`);
@@ -284,13 +275,26 @@ export abstract class UserConnectionManager {
         continue;
       }
       if (now - lastActivity > mcpConfig.USER_CONNECTION_IDLE_TIMEOUT) {
+        /* === VIVENTIUM START ===
+         * Feature: Preserve persistent MCP servers during periodic idle sweeps.
+         */
+        const idleDisconnectServers = this.getIdleDisconnectServers(userId);
+        if (idleDisconnectServers.length === 0) {
+          logger.debug(
+            `[MCP][User: ${userId}] Idle user has only persistent MCP connections; leaving active.`,
+          );
+          this.userLastActivity.delete(userId);
+          continue;
+        }
         logger.info(
-          `[MCP][User: ${userId}] User idle for too long. Disconnecting all connections...`,
+          `[MCP][User: ${userId}] User idle for too long. Disconnecting ${idleDisconnectServers.length} non-persistent connection(s)...`,
         );
-        // Disconnect all user connections asynchronously (fire and forget)
-        this.disconnectUserConnections(userId).catch((err) =>
-          logger.error(`[MCP][User: ${userId}] Error disconnecting idle connections:`, err),
+        // Disconnect idle non-persistent user connections asynchronously (fire and forget)
+        this.disconnectUserConnections(userId, { serverNames: idleDisconnectServers }).catch(
+          (err) =>
+            logger.error(`[MCP][User: ${userId}] Error disconnecting idle connections:`, err),
         );
+        /* === VIVENTIUM END === */
       }
     }
   }

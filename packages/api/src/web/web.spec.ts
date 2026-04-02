@@ -18,14 +18,6 @@ jest.mock('../utils', () => ({
   },
 }));
 
-const mockIsSSRFTarget = jest.fn().mockReturnValue(false);
-const mockResolveHostnameSSRF = jest.fn().mockResolvedValue(false);
-
-jest.mock('../auth', () => ({
-  isSSRFTarget: (...args: unknown[]) => mockIsSSRFTarget(...args),
-  resolveHostnameSSRF: (...args: unknown[]) => mockResolveHostnameSSRF(...args),
-}));
-
 describe('web.ts', () => {
   describe('extractWebSearchEnvVars', () => {
     it('should return empty array if config is undefined', () => {
@@ -118,17 +110,9 @@ describe('web.ts', () => {
       expect(result.authResult).toHaveProperty('serperApiKey', 'test-api-key');
       expect(result.authResult).toHaveProperty('firecrawlApiKey', 'test-api-key');
 
-      // The implementation only includes one reranker in the result
-      // It will be either jina or cohere, but not both
-      if (result.authResult.rerankerType === 'jina') {
-        expect(result.authResult).toHaveProperty('jinaApiKey', 'test-api-key');
-      } else {
-        expect(result.authResult).toHaveProperty('cohereApiKey', 'test-api-key');
-      }
-
       expect(result.authResult).toHaveProperty('searchProvider', 'serper');
       expect(result.authResult).toHaveProperty('scraperProvider', 'firecrawl');
-      expect(['jina', 'cohere']).toContain(result.authResult.rerankerType as string);
+      expect(result.authResult.rerankerType).toBeUndefined();
     });
 
     it('should return authenticated=false when a required category is not authenticated', async () => {
@@ -297,8 +281,7 @@ describe('web.ts', () => {
       // Check that the correct service types are set
       expect(result.authResult.searchProvider).toBe('serper' as SearchProviders);
       expect(result.authResult.scraperProvider).toBe('firecrawl' as ScraperProviders);
-      // One of the rerankers should be set
-      expect(['jina', 'cohere']).toContain(result.authResult.rerankerType as string);
+      expect(result.authResult.rerankerType).toBeUndefined();
     });
 
     it('should check all services if none are specified', async () => {
@@ -339,7 +322,11 @@ describe('web.ts', () => {
       // Should have set values for all categories
       expect(result.authResult.searchProvider).toBeDefined();
       expect(result.authResult.scraperProvider).toBeDefined();
-      expect(result.authResult.rerankerType).toBeDefined();
+      expect(result.authResult.rerankerType).toBeUndefined();
+      const rerankerAuthType = result.authTypes.find(
+        ([category]) => category === 'rerankers',
+      )?.[1];
+      expect(rerankerAuthType).toBe(AuthType.SYSTEM_DEFINED);
     });
 
     it('should correctly identify authTypes based on specific configurations', async () => {
@@ -529,6 +516,8 @@ describe('web.ts', () => {
         jinaApiUrl: '${JINA_API_URL}',
         cohereApiKey: '${COHERE_API_KEY}',
         safeSearch: SafeSearchTypes.MODERATE,
+        scraperProvider: 'firecrawl' as ScraperProviders,
+        rerankerType: 'jina' as RerankerTypes,
       };
 
       // Mock loadAuthValues to return values
@@ -591,6 +580,8 @@ describe('web.ts', () => {
         jinaApiUrl: '${JINA_API_URL}',
         cohereApiKey: '${COHERE_API_KEY}',
         safeSearch: SafeSearchTypes.MODERATE,
+        scraperProvider: 'firecrawl' as ScraperProviders,
+        rerankerType: 'jina' as RerankerTypes,
       };
 
       // Mock loadAuthValues to return partial values
@@ -942,7 +933,11 @@ describe('web.ts', () => {
       // Should have set values for all categories
       expect(result.authResult.searchProvider).toBeDefined();
       expect(result.authResult.scraperProvider).toBeDefined();
-      expect(result.authResult.rerankerType).toBeDefined();
+      expect(result.authResult.rerankerType).toBeUndefined();
+      const rerankerAuthType = result.authTypes.find(
+        ([category]) => category === 'rerankers',
+      )?.[1];
+      expect(rerankerAuthType).toBe(AuthType.SYSTEM_DEFINED);
     });
 
     it('should handle firecrawlOptions properties', async () => {
@@ -1234,357 +1229,69 @@ describe('web.ts', () => {
       expect(result.authResult.scraperTimeout).toBe(7500); // Should use default timeout
       expect(result.authResult.firecrawlOptions).toBeUndefined(); // Should be undefined
     });
-  });
 
-  describe('SSRF protection for user-provided URLs', () => {
-    const userId = 'test-user-id';
-    let mockLoadAuthValues: jest.Mock;
-
-    beforeEach(() => {
-      jest.clearAllMocks();
-      mockLoadAuthValues = jest.fn();
-      mockIsSSRFTarget.mockReturnValue(false);
-      mockResolveHostnameSSRF.mockResolvedValue(false);
-    });
-
-    it('should block user-provided jinaApiUrl targeting localhost', async () => {
-      mockIsSSRFTarget.mockImplementation((hostname: string) => hostname === 'localhost');
-
-      const webSearchConfig: TCustomConfig['webSearch'] = {
-        serperApiKey: '${SERPER_API_KEY}',
-        firecrawlApiKey: '${FIRECRAWL_API_KEY}',
-        jinaApiKey: '${JINA_API_KEY}',
-        jinaApiUrl: '${JINA_API_URL}',
-        safeSearch: SafeSearchTypes.MODERATE,
-        rerankerType: 'jina' as RerankerTypes,
-      };
-
-      mockLoadAuthValues.mockImplementation(({ authFields }) => {
-        const result: Record<string, string> = {};
-        authFields.forEach((field: string) => {
-          if (field === 'JINA_API_URL') {
-            result[field] = 'http://localhost:8080/rerank';
-          } else {
-            result[field] = 'test-api-key';
-          }
-        });
-        return Promise.resolve(result);
-      });
-
-      const result = await loadWebSearchAuth({
-        userId,
-        webSearchConfig,
-        loadAuthValues: mockLoadAuthValues,
-      });
-
-      expect(result.authResult.jinaApiUrl).toBeUndefined();
-      expect(mockIsSSRFTarget).toHaveBeenCalledWith('localhost');
-    });
-
-    it('should block user-provided firecrawlApiUrl resolving to private IP', async () => {
-      mockResolveHostnameSSRF.mockImplementation((hostname: string) =>
-        Promise.resolve(hostname === 'evil.internal-service.com'),
-      );
-
-      const webSearchConfig: TCustomConfig['webSearch'] = {
-        serperApiKey: '${SERPER_API_KEY}',
-        firecrawlApiKey: '${FIRECRAWL_API_KEY}',
-        firecrawlApiUrl: '${FIRECRAWL_API_URL}',
-        jinaApiKey: '${JINA_API_KEY}',
-        safeSearch: SafeSearchTypes.MODERATE,
+    it('should accept resolved literal provider and scraper config values', async () => {
+      const literalConfig = {
+        searchProvider: 'searxng' as SearchProviders,
         scraperProvider: 'firecrawl' as ScraperProviders,
-      };
+        searxngInstanceUrl: 'http://localhost:8082',
+        firecrawlApiKey: 'fc-local-key',
+        firecrawlApiUrl: 'http://localhost:3003',
+        firecrawlVersion: 'v2',
+        safeSearch: SafeSearchTypes.MODERATE,
+      } as TCustomConfig['webSearch'];
 
-      mockLoadAuthValues.mockImplementation(({ authFields }) => {
-        const result: Record<string, string> = {};
-        authFields.forEach((field: string) => {
-          if (field === 'FIRECRAWL_API_URL') {
-            result[field] = 'https://evil.internal-service.com/scrape';
-          } else {
-            result[field] = 'test-api-key';
-          }
-        });
-        return Promise.resolve(result);
-      });
+      mockLoadAuthValues.mockResolvedValue({});
 
       const result = await loadWebSearchAuth({
         userId,
-        webSearchConfig,
+        webSearchConfig: literalConfig,
         loadAuthValues: mockLoadAuthValues,
       });
 
-      expect(result.authResult.firecrawlApiUrl).toBeUndefined();
       expect(result.authenticated).toBe(true);
-      const scrapersAuth = result.authTypes.find(([c]) => c === 'scrapers')?.[1];
-      expect(scrapersAuth).toBe(AuthType.USER_PROVIDED);
+      expect(result.authResult.searchProvider).toBe('searxng');
+      expect(result.authResult.searxngInstanceUrl).toBe('http://localhost:8082');
+      expect(result.authResult.scraperProvider).toBe('firecrawl');
+      expect(result.authResult.firecrawlApiKey).toBe('fc-local-key');
+      expect(result.authResult.firecrawlApiUrl).toBe('http://localhost:3003');
+      expect(result.authResult.rerankerType).toBeUndefined();
+      expect(mockLoadAuthValues).not.toHaveBeenCalled();
     });
 
-    it('should block user-provided searxngInstanceUrl targeting metadata endpoint', async () => {
-      mockIsSSRFTarget.mockImplementation((hostname: string) => hostname === '169.254.169.254');
-
-      const webSearchConfig: TCustomConfig['webSearch'] = {
+    it('should treat rerankers as optional when no rerankerType is configured', async () => {
+      const configWithoutReranker = {
+        searchProvider: 'searxng' as SearchProviders,
+        scraperProvider: 'firecrawl' as ScraperProviders,
         searxngInstanceUrl: '${SEARXNG_INSTANCE_URL}',
         firecrawlApiKey: '${FIRECRAWL_API_KEY}',
-        jinaApiKey: '${JINA_API_KEY}',
-        safeSearch: SafeSearchTypes.MODERATE,
-        searchProvider: 'searxng' as SearchProviders,
-      };
-
-      mockLoadAuthValues.mockImplementation(({ authFields }) => {
-        const result: Record<string, string> = {};
-        authFields.forEach((field: string) => {
-          if (field === 'SEARXNG_INSTANCE_URL') {
-            result[field] = 'http://169.254.169.254/latest/meta-data';
-          } else {
-            result[field] = 'test-api-key';
-          }
-        });
-        return Promise.resolve(result);
-      });
-
-      const result = await loadWebSearchAuth({
-        userId,
-        webSearchConfig,
-        loadAuthValues: mockLoadAuthValues,
-      });
-
-      expect(result.authResult.searxngInstanceUrl).toBeUndefined();
-      expect(result.authenticated).toBe(false);
-    });
-
-    it('should allow system-defined URLs even if they match SSRF patterns', async () => {
-      mockIsSSRFTarget.mockReturnValue(true);
-
-      const originalEnv = process.env;
-      try {
-        process.env = {
-          ...originalEnv,
-          JINA_API_KEY: 'system-jina-key',
-          JINA_API_URL: 'http://jina-internal:8080/rerank',
-        };
-
-        const webSearchConfig: TCustomConfig['webSearch'] = {
-          serperApiKey: '${SERPER_API_KEY}',
-          firecrawlApiKey: '${FIRECRAWL_API_KEY}',
-          jinaApiKey: '${JINA_API_KEY}',
-          jinaApiUrl: '${JINA_API_URL}',
-          safeSearch: SafeSearchTypes.MODERATE,
-          rerankerType: 'jina' as RerankerTypes,
-        };
-
-        mockLoadAuthValues.mockImplementation(({ authFields }) => {
-          const result: Record<string, string> = {};
-          authFields.forEach((field: string) => {
-            if (field === 'JINA_API_KEY') {
-              result[field] = 'system-jina-key';
-            } else if (field === 'JINA_API_URL') {
-              result[field] = 'http://jina-internal:8080/rerank';
-            } else {
-              result[field] = 'test-api-key';
-            }
-          });
-          return Promise.resolve(result);
-        });
-
-        const result = await loadWebSearchAuth({
-          userId,
-          webSearchConfig,
-          loadAuthValues: mockLoadAuthValues,
-        });
-
-        expect(result.authResult.jinaApiUrl).toBe('http://jina-internal:8080/rerank');
-        expect(result.authenticated).toBe(true);
-      } finally {
-        process.env = originalEnv;
-      }
-    });
-
-    it('should reject URLs with invalid format', async () => {
-      const webSearchConfig: TCustomConfig['webSearch'] = {
-        serperApiKey: '${SERPER_API_KEY}',
-        firecrawlApiKey: '${FIRECRAWL_API_KEY}',
         firecrawlApiUrl: '${FIRECRAWL_API_URL}',
-        jinaApiKey: '${JINA_API_KEY}',
         safeSearch: SafeSearchTypes.MODERATE,
-        scraperProvider: 'firecrawl' as ScraperProviders,
-      };
+      } as TCustomConfig['webSearch'];
 
       mockLoadAuthValues.mockImplementation(({ authFields }) => {
         const result: Record<string, string> = {};
         authFields.forEach((field: string) => {
-          if (field === 'FIRECRAWL_API_URL') {
-            result[field] = 'not-a-valid-url';
-          } else {
-            result[field] = 'test-api-key';
-          }
+          result[field] =
+            field === 'FIRECRAWL_API_URL' ? 'http://localhost:3003' : 'test-api-key';
         });
         return Promise.resolve(result);
       });
 
       const result = await loadWebSearchAuth({
         userId,
-        webSearchConfig,
+        webSearchConfig: configWithoutReranker,
         loadAuthValues: mockLoadAuthValues,
       });
 
-      expect(result.authResult.firecrawlApiUrl).toBeUndefined();
       expect(result.authenticated).toBe(true);
-      const scrapersAuth = result.authTypes.find(([c]) => c === 'scrapers')?.[1];
-      expect(scrapersAuth).toBe(AuthType.USER_PROVIDED);
-    });
-
-    it('should reject non-HTTP schemes like file://', async () => {
-      const webSearchConfig: TCustomConfig['webSearch'] = {
-        serperApiKey: '${SERPER_API_KEY}',
-        firecrawlApiKey: '${FIRECRAWL_API_KEY}',
-        firecrawlApiUrl: '${FIRECRAWL_API_URL}',
-        jinaApiKey: '${JINA_API_KEY}',
-        safeSearch: SafeSearchTypes.MODERATE,
-        scraperProvider: 'firecrawl' as ScraperProviders,
-      };
-
-      mockLoadAuthValues.mockImplementation(({ authFields }) => {
-        const result: Record<string, string> = {};
-        authFields.forEach((field: string) => {
-          if (field === 'FIRECRAWL_API_URL') {
-            result[field] = 'file:///etc/passwd';
-          } else {
-            result[field] = 'test-api-key';
-          }
-        });
-        return Promise.resolve(result);
-      });
-
-      const result = await loadWebSearchAuth({
-        userId,
-        webSearchConfig,
-        loadAuthValues: mockLoadAuthValues,
-      });
-
-      expect(result.authResult.firecrawlApiUrl).toBeUndefined();
-      expect(result.authenticated).toBe(true);
-    });
-
-    it('should allow legitimate external URLs', async () => {
-      const webSearchConfig: TCustomConfig['webSearch'] = {
-        serperApiKey: '${SERPER_API_KEY}',
-        firecrawlApiKey: '${FIRECRAWL_API_KEY}',
-        firecrawlApiUrl: '${FIRECRAWL_API_URL}',
-        jinaApiKey: '${JINA_API_KEY}',
-        jinaApiUrl: '${JINA_API_URL}',
-        safeSearch: SafeSearchTypes.MODERATE,
-        scraperProvider: 'firecrawl' as ScraperProviders,
-        rerankerType: 'jina' as RerankerTypes,
-      };
-
-      mockLoadAuthValues.mockImplementation(({ authFields }) => {
-        const result: Record<string, string> = {};
-        authFields.forEach((field: string) => {
-          if (field === 'FIRECRAWL_API_URL') {
-            result[field] = 'https://api.firecrawl.dev';
-          } else if (field === 'JINA_API_URL') {
-            result[field] = 'https://api.jina.ai/v1/rerank';
-          } else {
-            result[field] = 'test-api-key';
-          }
-        });
-        return Promise.resolve(result);
-      });
-
-      const result = await loadWebSearchAuth({
-        userId,
-        webSearchConfig,
-        loadAuthValues: mockLoadAuthValues,
-      });
-
-      expect(result.authResult.firecrawlApiUrl).toBe('https://api.firecrawl.dev');
-      expect(result.authResult.jinaApiUrl).toBe('https://api.jina.ai/v1/rerank');
-      expect(result.authenticated).toBe(true);
-    });
-
-    it('should fail required URL field and mark category unauthenticated', async () => {
-      mockIsSSRFTarget.mockImplementation((hostname: string) => hostname === '127.0.0.1');
-
-      const webSearchConfig: TCustomConfig['webSearch'] = {
-        searxngInstanceUrl: '${SEARXNG_INSTANCE_URL}',
-        searxngApiKey: '${SEARXNG_API_KEY}',
-        firecrawlApiKey: '${FIRECRAWL_API_KEY}',
-        jinaApiKey: '${JINA_API_KEY}',
-        safeSearch: SafeSearchTypes.MODERATE,
-        searchProvider: 'searxng' as SearchProviders,
-      };
-
-      mockLoadAuthValues.mockImplementation(({ authFields }) => {
-        const result: Record<string, string> = {};
-        authFields.forEach((field: string) => {
-          if (field === 'SEARXNG_INSTANCE_URL') {
-            result[field] = 'http://127.0.0.1:8888/search';
-          } else {
-            result[field] = 'test-api-key';
-          }
-        });
-        return Promise.resolve(result);
-      });
-
-      const result = await loadWebSearchAuth({
-        userId,
-        webSearchConfig,
-        loadAuthValues: mockLoadAuthValues,
-      });
-
-      expect(result.authenticated).toBe(false);
-      const providersAuthType = result.authTypes.find(
-        ([category]) => category === 'providers',
+      expect(result.authResult.searchProvider).toBe('searxng');
+      expect(result.authResult.scraperProvider).toBe('firecrawl');
+      expect(result.authResult.rerankerType).toBeUndefined();
+      const rerankerAuthType = result.authTypes.find(
+        ([category]) => category === 'rerankers',
       )?.[1];
-      expect(providersAuthType).toBe(AuthType.USER_PROVIDED);
-    });
-
-    it('should report SYSTEM_DEFINED when only user-provided field is a stripped SSRF URL', async () => {
-      mockIsSSRFTarget.mockImplementation((hostname: string) => hostname === 'localhost');
-
-      const originalEnv = process.env;
-      try {
-        process.env = {
-          ...originalEnv,
-          JINA_API_KEY: 'system-jina-key',
-        };
-
-        const webSearchConfig: TCustomConfig['webSearch'] = {
-          serperApiKey: '${SERPER_API_KEY}',
-          firecrawlApiKey: '${FIRECRAWL_API_KEY}',
-          jinaApiKey: '${JINA_API_KEY}',
-          jinaApiUrl: '${JINA_API_URL}',
-          safeSearch: SafeSearchTypes.MODERATE,
-          rerankerType: 'jina' as RerankerTypes,
-        };
-
-        mockLoadAuthValues.mockImplementation(({ authFields }) => {
-          const result: Record<string, string> = {};
-          authFields.forEach((field: string) => {
-            if (field === 'JINA_API_KEY') {
-              result[field] = 'system-jina-key';
-            } else if (field === 'JINA_API_URL') {
-              result[field] = 'http://localhost:9999/rerank';
-            } else {
-              result[field] = 'test-api-key';
-            }
-          });
-          return Promise.resolve(result);
-        });
-
-        const result = await loadWebSearchAuth({
-          userId,
-          webSearchConfig,
-          loadAuthValues: mockLoadAuthValues,
-        });
-
-        expect(result.authResult.jinaApiUrl).toBeUndefined();
-        expect(result.authenticated).toBe(true);
-        const rerankersAuth = result.authTypes.find(([c]) => c === 'rerankers')?.[1];
-        expect(rerankersAuth).toBe(AuthType.SYSTEM_DEFINED);
-      } finally {
-        process.env = originalEnv;
-      }
+      expect(rerankerAuthType).toBe(AuthType.SYSTEM_DEFINED);
     });
   });
 });

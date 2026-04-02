@@ -1,7 +1,12 @@
 const { nanoid } = require('nanoid');
 const { logger } = require('@librechat/data-schemas');
-const { Callback, ToolEndHandler, formatAgentMessages } = require('@librechat/agents');
 const { EModelEndpoint, ResourceType, PermissionBits } = require('librechat-data-provider');
+const {
+  Callback,
+  ToolEndHandler,
+  formatAgentMessages,
+  ChatModelStreamHandler,
+} = require('@librechat/agents');
 const {
   writeSSE,
   createRun,
@@ -16,20 +21,23 @@ const {
   recordCollectedUsage,
   getTransactionsConfig,
   createToolExecuteHandler,
+  filterMalformedContentParts,
   buildNonStreamingResponse,
   createOpenAIStreamTracker,
   createOpenAIContentAggregator,
   isChatCompletionValidationFailure,
 } = require('@librechat/api');
-const {
-  buildSummarizationHandlers,
-  markSummarizationUsage,
-  createToolEndCallback,
-  agentLogHandlerObj,
-} = require('~/server/controllers/agents/callbacks');
 const { loadAgentTools, loadToolsForExecution } = require('~/server/services/ToolService');
+const { createToolEndCallback } = require('~/server/controllers/agents/callbacks');
 const { findAccessibleResources } = require('~/server/services/PermissionService');
+const { spendTokens, spendStructuredTokens } = require('~/models/spendTokens');
+const { getConvoFiles } = require('~/models/Conversation');
+const { getAgent, getAgents } = require('~/models/Agent');
 const db = require('~/models');
+const {
+  normalizeTextPartsInPayload,
+  sanitizeProviderFormattedMessages,
+} = require('~/server/services/viventium/normalizeTextContentParts');
 
 /**
  * Creates a tool loader function for the agent.
@@ -131,6 +139,7 @@ const OpenAIChatCompletionController = async (req, res) => {
   const appConfig = req.config;
   const requestStartTime = Date.now();
 
+  // Validate request
   const validation = validateRequest(req.body);
   if (isChatCompletionValidationFailure(validation)) {
     return sendErrorResponse(res, 400, validation.error);
@@ -140,7 +149,7 @@ const OpenAIChatCompletionController = async (req, res) => {
   const agentId = request.model;
 
   // Look up the agent
-  const agent = await db.getAgent({ id: agentId });
+  const agent = await getAgent({ id: agentId });
   if (!agent) {
     return sendErrorResponse(
       res,
@@ -151,18 +160,20 @@ const OpenAIChatCompletionController = async (req, res) => {
     );
   }
 
-  const responseId = `chatcmpl-${nanoid()}`;
+  // Generate IDs
+  const requestId = `chatcmpl-${nanoid()}`;
+  const conversationId = request.conversation_id ?? nanoid();
+  const parentMessageId = request.parent_message_id ?? null;
   const created = Math.floor(Date.now() / 1000);
 
-  /** @type {import('@librechat/api').OpenAIResponseContext} — key must be `requestId` to match the type used by createChunk/buildNonStreamingResponse */
   const context = {
     created,
-    requestId: responseId,
+    requestId,
     model: agentId,
   };
 
   logger.debug(
-    `[OpenAI API] Response ${responseId} started for agent ${agentId}, stream: ${request.stream}`,
+    `[OpenAI API] Request ${requestId} started for agent ${agentId}, stream: ${request.stream}`,
   );
 
   // Set up abort controller
@@ -177,23 +188,6 @@ const OpenAIChatCompletionController = async (req, res) => {
   });
 
   try {
-    if (request.conversation_id != null) {
-      if (typeof request.conversation_id !== 'string') {
-        return sendErrorResponse(
-          res,
-          400,
-          'conversation_id must be a string',
-          'invalid_request_error',
-        );
-      }
-      if (!(await db.getConvo(req.user?.id, request.conversation_id))) {
-        return sendErrorResponse(res, 404, 'Conversation not found', 'invalid_request_error');
-      }
-    }
-
-    const conversationId = request.conversation_id ?? nanoid();
-    const parentMessageId = request.parent_message_id ?? null;
-
     // Build allowed providers set
     const allowedProviders = new Set(
       appConfig?.endpoints?.[EModelEndpoint.agents]?.allowedProviders,
@@ -222,10 +216,11 @@ const OpenAIChatCompletionController = async (req, res) => {
         isInitialAgent: true,
       },
       {
-        getConvoFiles: db.getConvoFiles,
+        getConvoFiles,
         getFiles: db.getFiles,
         getUserKey: db.getUserKey,
         getMessages: db.getMessages,
+        updateUserKey: db.updateUserKey,
         updateFilesUsage: db.updateFilesUsage,
         getUserKeyValues: db.getUserKeyValues,
         getUserCodeFiles: db.getUserCodeFiles,
@@ -281,22 +276,31 @@ const OpenAIChatCompletionController = async (req, res) => {
           toolRegistry: primaryConfig.toolRegistry,
           userMCPAuthMap: primaryConfig.userMCPAuthMap,
           tool_resources: primaryConfig.tool_resources,
-          actionsEnabled: primaryConfig.actionsEnabled,
         });
       },
       toolEndCallback,
     };
 
-    const summarizationConfig = appConfig?.summarization;
-
     const openaiMessages = convertMessages(request.messages);
+    /* === VIVENTIUM START ===
+     * Feature: Harden OpenAI-compat payload formatting against malformed content parts.
+     * === VIVENTIUM END === */
+    const sanitizedMessages = normalizeTextPartsInPayload(openaiMessages);
+    const hardenedMessages = sanitizedMessages.map((message) => {
+      if (!message || !Array.isArray(message.content)) {
+        return message;
+      }
+      const nextContent = filterMalformedContentParts(message.content);
+      return nextContent === message.content ? message : { ...message, content: nextContent };
+    });
 
     const toolSet = buildToolSet(primaryConfig);
-    const {
-      messages: formattedMessages,
-      indexTokenCountMap,
-      summary: initialSummary,
-    } = formatAgentMessages(openaiMessages, {}, toolSet);
+    let { messages: formattedMessages, indexTokenCountMap } = formatAgentMessages(
+      hardenedMessages,
+      {},
+      toolSet,
+    );
+    formattedMessages = sanitizeProviderFormattedMessages(agent?.provider, formattedMessages);
 
     /**
      * Create a simple handler that processes data
@@ -339,8 +343,18 @@ const OpenAIChatCompletionController = async (req, res) => {
       }
     };
 
+    // Built-in handler for processing raw model stream chunks
+    const chatModelStreamHandler = new ChatModelStreamHandler();
+
     // Event handlers for OpenAI-compatible streaming
     const handlers = {
+      // Process raw model chunks and dispatch message/reasoning deltas
+      on_chat_model_stream: {
+        handle: async (event, data, metadata, graph) => {
+          await chatModelStreamHandler.handle(event, data, metadata, graph);
+        },
+      },
+
       // Text content streaming
       on_message_delta: createHandler((data) => {
         const content = data?.delta?.content;
@@ -439,30 +453,24 @@ const OpenAIChatCompletionController = async (req, res) => {
       }),
 
       // Usage tracking
-      on_chat_model_end: {
-        handle: (_event, data, metadata) => {
-          const usage = data?.output?.usage_metadata;
-          if (usage) {
-            const taggedUsage = markSummarizationUsage(usage, metadata);
-            collectedUsage.push(taggedUsage);
-            const target = isStreaming ? tracker : aggregator;
-            target.usage.promptTokens += taggedUsage.input_tokens ?? 0;
-            target.usage.completionTokens += taggedUsage.output_tokens ?? 0;
-          }
-        },
-      },
+      on_chat_model_end: createHandler((data) => {
+        const usage = data?.output?.usage_metadata;
+        if (usage) {
+          collectedUsage.push(usage);
+          const target = isStreaming ? tracker : aggregator;
+          target.usage.promptTokens += usage.input_tokens ?? 0;
+          target.usage.completionTokens += usage.output_tokens ?? 0;
+        }
+      }),
       on_run_step_completed: createHandler(),
       // Use proper ToolEndHandler for processing artifacts (images, file citations, code output)
       on_tool_end: new ToolEndHandler(toolEndCallback, logger),
       on_chain_stream: createHandler(),
       on_chain_end: createHandler(),
       on_agent_update: createHandler(),
-      on_agent_log: agentLogHandlerObj,
       on_custom_event: createHandler(),
+      // Event-driven tool execution handler
       on_tool_execute: createToolExecuteHandler(toolExecuteOptions),
-      ...(summarizationConfig?.enabled !== false
-        ? buildSummarizationHandlers({ isStreaming, res })
-        : {}),
     };
 
     // Create and run the agent
@@ -475,13 +483,11 @@ const OpenAIChatCompletionController = async (req, res) => {
       agents: [primaryConfig],
       messages: formattedMessages,
       indexTokenCountMap,
-      initialSummary,
-      runId: responseId,
-      summarizationConfig,
+      runId: requestId,
       signal: abortController.signal,
       customHandlers: handlers,
       requestBody: {
-        messageId: responseId,
+        messageId: requestId,
         conversationId,
       },
       user: { id: userId },
@@ -498,10 +504,6 @@ const OpenAIChatCompletionController = async (req, res) => {
         thread_id: conversationId,
         user_id: userId,
         user: createSafeUser(req.user),
-        requestBody: {
-          messageId: responseId,
-          conversationId,
-        },
         ...(userMCPAuthMap != null && { userMCPAuthMap }),
       },
       signal: abortController.signal,
@@ -521,18 +523,12 @@ const OpenAIChatCompletionController = async (req, res) => {
     const balanceConfig = getBalanceConfig(appConfig);
     const transactionsConfig = getTransactionsConfig(appConfig);
     recordCollectedUsage(
-      {
-        spendTokens: db.spendTokens,
-        spendStructuredTokens: db.spendStructuredTokens,
-        pricing: { getMultiplier: db.getMultiplier, getCacheMultiplier: db.getCacheMultiplier },
-        bulkWriteOps: { insertMany: db.bulkInsertTransactions, updateBalance: db.updateBalance },
-      },
+      { spendTokens, spendStructuredTokens },
       {
         user: userId,
         conversationId,
         collectedUsage,
         context: 'message',
-        messageId: responseId,
         balance: balanceConfig,
         transactions: transactionsConfig,
         model: primaryConfig.model || agent.model_parameters?.model,
@@ -546,7 +542,7 @@ const OpenAIChatCompletionController = async (req, res) => {
     if (isStreaming) {
       sendFinalChunk(handlerConfig);
       res.end();
-      logger.debug(`[OpenAI API] Response ${responseId} completed in ${duration}ms (streaming)`);
+      logger.debug(`[OpenAI API] Request ${requestId} completed in ${duration}ms (streaming)`);
 
       // Wait for artifact processing after response ends (non-blocking)
       if (artifactPromises.length > 0) {
@@ -585,9 +581,7 @@ const OpenAIChatCompletionController = async (req, res) => {
         usage,
       );
       res.json(response);
-      logger.debug(
-        `[OpenAI API] Response ${responseId} completed in ${duration}ms (non-streaming)`,
-      );
+      logger.debug(`[OpenAI API] Request ${requestId} completed in ${duration}ms (non-streaming)`);
     }
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'An error occurred';
@@ -601,14 +595,7 @@ const OpenAIChatCompletionController = async (req, res) => {
       writeSSE(res, '[DONE]');
       res.end();
     } else {
-      // Forward upstream provider status codes (e.g., Anthropic 400s) instead of masking as 500
-      const statusCode =
-        typeof error?.status === 'number' && error.status >= 400 && error.status < 600
-          ? error.status
-          : 500;
-      const errorType =
-        statusCode >= 400 && statusCode < 500 ? 'invalid_request_error' : 'server_error';
-      sendErrorResponse(res, statusCode, errorMessage, errorType);
+      sendErrorResponse(res, 500, errorMessage, 'server_error');
     }
   }
 };
@@ -638,7 +625,7 @@ const ListModelsController = async (req, res) => {
     // Get the accessible agents
     let agents = [];
     if (accessibleAgentIds.length > 0) {
-      agents = await db.getAgents({ _id: { $in: accessibleAgentIds } });
+      agents = await getAgents({ _id: { $in: accessibleAgentIds } });
     }
 
     const models = agents.map((agent) => ({
@@ -681,7 +668,7 @@ const GetModelController = async (req, res) => {
       return sendErrorResponse(res, 401, 'Authentication required', 'auth_error');
     }
 
-    const agent = await db.getAgent({ id: model });
+    const agent = await getAgent({ id: model });
 
     if (!agent) {
       return sendErrorResponse(

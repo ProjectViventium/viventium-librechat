@@ -1,9 +1,16 @@
-const bcrypt = require('bcryptjs');
 const { logger } = require('@librechat/data-schemas');
 const { errorsToString } = require('librechat-data-provider');
+const { isEnabled, checkEmailConfig } = require('@librechat/api');
 const { Strategy: PassportLocalStrategy } = require('passport-local');
-const { isEnabled, checkEmailConfig, comparePassword } = require('@librechat/api');
-const { findUser, updateUser } = require('~/models');
+const { findUser, comparePassword, updateUser } = require('~/models');
+/* === VIVENTIUM START ===
+ * Feature: Registration approval gate in local login.
+ * === VIVENTIUM END === */
+const {
+  isRegistrationApprovalEnabled,
+  isViventiumApproved,
+  PENDING_APPROVAL_MESSAGE,
+} = require('~/server/services/viventium/registrationApprovalService');
 const { loginSchema } = require('./validators');
 
 // Unix timestamp for 2024-06-07 15:20:18 Eastern Time
@@ -36,7 +43,7 @@ async function passportLogin(req, email, password, done) {
       return done(null, false, { message: 'Email does not exist.' });
     }
 
-    const isMatch = await comparePassword(user, password, { compare: bcrypt.compare });
+    const isMatch = await comparePassword(user, password);
     if (!isMatch) {
       logError('Passport Local Strategy - Password does not match', { isMatch });
       logger.error(`[Login] [Login failed] [Username: ${email}] [Request-IP: ${req.ip}]`);
@@ -64,6 +71,15 @@ async function passportLogin(req, email, password, done) {
       logError('Passport Local Strategy - Email not verified', { email });
       logger.error(`[Login] [Login failed] [Username: ${email}] [Request-IP: ${req.ip}]`);
       return done(null, user, { message: 'Email not verified.' });
+    }
+
+    /* === VIVENTIUM START ===
+     * Feature: Registration approval gate in local auth.
+     * Purpose: Pending/denied users always receive a pending-style message.
+     * === VIVENTIUM END === */
+    if (isRegistrationApprovalEnabled() && !isViventiumApproved(user)) {
+      logger.info(`[Login] [Approval pending] [Username: ${email}] [Request-IP: ${req.ip}]`);
+      return done(null, false, { message: PENDING_APPROVAL_MESSAGE });
     }
 
     logger.info(`[Login] [Login successful] [Username: ${email}] [Request-IP: ${req.ip}]`);

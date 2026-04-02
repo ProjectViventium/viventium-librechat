@@ -1,6 +1,7 @@
 const DALLE3 = require('../DALLE3');
 const { ProxyAgent } = require('undici');
 
+jest.mock('tiktoken');
 const processFileURL = jest.fn();
 
 describe('DALLE3 Proxy Configuration', () => {

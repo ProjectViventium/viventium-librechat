@@ -12,6 +12,7 @@ const {
 const {
   sendEvent,
   getToolkitKey,
+  hasCustomUserVars,
   getUserMCPAuthMap,
   loadToolDefinitions,
   GenerationJobManager,
@@ -19,7 +20,6 @@ const {
   buildWebSearchContext,
   buildImageToolContext,
   buildToolClassification,
-  buildOAuthToolCallName,
 } = require('@librechat/api');
 const {
   Time,
@@ -43,7 +43,6 @@ const {
 } = require('librechat-data-provider');
 const {
   createActionTool,
-  legacyDomainEncode,
   decryptMetadata,
   loadActionSets,
   domainParser,
@@ -60,35 +59,26 @@ const { manifestToolMap, toolkits } = require('~/app/clients/tools/manifest');
 const { createOnSearchResults } = require('~/server/services/Tools/search');
 const { loadAuthValues } = require('~/server/services/Tools/credentials');
 const { reinitMCPServer } = require('~/server/services/Tools/mcp');
-const { resolveConfigServers } = require('~/server/services/MCP');
 const { recordUsage } = require('~/server/services/Threads');
 const { loadTools } = require('~/app/clients/tools/util');
 const { redactMessage } = require('~/config/parsers');
 const { findPluginAuthsByKeys } = require('~/models');
 const { getFlowStateManager } = require('~/config');
 const { getLogStores } = require('~/cache');
-
-const domainSeparatorRegex = new RegExp(actionDomainSeparator, 'g');
-
-/**
- * Resolves the set of enabled agent capabilities from endpoints config,
- * falling back to app-level or default capabilities for ephemeral agents.
- * @param {ServerRequest} req
- * @param {Object} appConfig
- * @param {string} agentId
- * @returns {Promise<Set<string>>}
- */
-async function resolveAgentCapabilities(req, appConfig, agentId) {
-  const endpointsConfig = await getEndpointsConfig(req);
-  let capabilities = new Set(endpointsConfig?.[EModelEndpoint.agents]?.capabilities ?? []);
-  if (capabilities.size === 0 && isEphemeralAgentId(agentId)) {
-    capabilities = new Set(
-      appConfig.endpoints?.[EModelEndpoint.agents]?.capabilities ?? defaultAgentCapabilities,
-    );
-  }
-  return capabilities;
-}
-
+// === VIVENTIUM START ===
+// Feature: Telegram tool guard (fast-path for trivial messages).
+const { shouldSkipTelegramTools } = require('~/server/services/viventium/telegramToolGuard');
+// Feature: Deep Telegram timing instrumentation (toggleable).
+const {
+  isDeepTimingEnabled,
+  startDeepTiming,
+  logDeepTiming,
+} = require('~/server/services/viventium/telegramTimingDeep');
+const {
+  getMcpOAuthWaitDecision,
+  stripOAuthPendingMcpTools,
+} = require('~/server/services/viventium/mcpOAuthPolicy');
+// === VIVENTIUM END ===
 /**
  * Processes the required actions by calling the appropriate tools and returning the outputs.
  * @param {OpenAIClient} client - OpenAI or StreamRunManager Client.
@@ -177,7 +167,8 @@ async function processRequiredActions(client, requiredActions) {
 
   const promises = [];
 
-  let actionSetsData = null;
+  /** @type {Action[]} */
+  let actionSets = [];
   let isActionTool = false;
   const ActionToolMap = {};
   const ActionBuildersMap = {};
@@ -263,9 +254,9 @@ async function processRequiredActions(client, requiredActions) {
     if (!tool) {
       // throw new Error(`Tool ${currentAction.tool} not found.`);
 
-      if (!actionSetsData) {
-        /** @type {Action[]} */
-        const actionSets =
+      // Load all action sets once if not already loaded
+      if (!actionSets.length) {
+        actionSets =
           (await loadActionSets({
             assistant_id: client.req.body.assistant_id,
           })) ?? [];
@@ -273,16 +264,11 @@ async function processRequiredActions(client, requiredActions) {
         // Process all action sets once
         // Map domains to their processed action sets
         const processedDomains = new Map();
-        const domainLookupMap = new Map();
+        const domainMap = new Map();
 
         for (const action of actionSets) {
           const domain = await domainParser(action.metadata.domain, true);
-          domainLookupMap.set(domain, domain);
-
-          const legacyDomain = legacyDomainEncode(action.metadata.domain);
-          if (legacyDomain !== domain) {
-            domainLookupMap.set(legacyDomain, domain);
-          }
+          domainMap.set(domain, action);
 
           const isDomainAllowed = await isActionDomainAllowed(
             action.metadata.domain,
@@ -337,26 +323,27 @@ async function processRequiredActions(client, requiredActions) {
           ActionBuildersMap[action.metadata.domain] = requestBuilders;
         }
 
-        actionSetsData = { domainLookupMap, processedDomains };
+        // Update actionSets reference to use the domain map
+        actionSets = { domainMap, processedDomains };
       }
 
+      // Find the matching domain for this tool
       let currentDomain = '';
-      let matchedKey = '';
-      for (const [key, canonical] of actionSetsData.domainLookupMap.entries()) {
-        if (currentAction.tool.includes(key)) {
-          currentDomain = canonical;
-          matchedKey = key;
+      for (const domain of actionSets.domainMap.keys()) {
+        if (currentAction.tool.includes(domain)) {
+          currentDomain = domain;
           break;
         }
       }
 
-      if (!currentDomain || !actionSetsData.processedDomains.has(currentDomain)) {
+      if (!currentDomain || !actionSets.processedDomains.has(currentDomain)) {
+        // TODO: try `function` if no action set is found
+        // throw new Error(`Tool ${currentAction.tool} not found.`);
         continue;
       }
 
-      const { action, requestBuilders, encrypted } =
-        actionSetsData.processedDomains.get(currentDomain);
-      const functionName = currentAction.tool.replace(`${actionDelimiter}${matchedKey}`, '');
+      const { action, requestBuilders, encrypted } = actionSets.processedDomains.get(currentDomain);
+      const functionName = currentAction.tool.replace(`${actionDelimiter}${currentDomain}`, '');
       const requestBuilder = requestBuilders[functionName];
 
       if (!requestBuilder) {
@@ -365,7 +352,6 @@ async function processRequiredActions(client, requiredActions) {
       }
 
       // We've already decrypted the metadata, so we can pass it directly
-      const _allowedDomains = appConfig?.actions?.allowedDomains;
       tool = await createActionTool({
         userId: client.req.user.id,
         res: client.res,
@@ -373,7 +359,6 @@ async function processRequiredActions(client, requiredActions) {
         requestBuilder,
         // Note: intentionally not passing zodSchema, name, and description for assistants API
         encrypted, // Pass the encrypted values for OAuth flow
-        useSSRFProtection: !Array.isArray(_allowedDomains) || _allowedDomains.length === 0,
       });
       if (!tool) {
         logger.warn(
@@ -473,11 +458,17 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
   }
 
   const appConfig = req.config;
-  const enabledCapabilities = await resolveAgentCapabilities(req, appConfig, agent.id);
+  const endpointsConfig = await getEndpointsConfig(req);
+  let enabledCapabilities = new Set(endpointsConfig?.[EModelEndpoint.agents]?.capabilities ?? []);
+
+  if (enabledCapabilities.size === 0 && isEphemeralAgentId(agent.id)) {
+    enabledCapabilities = new Set(
+      appConfig.endpoints?.[EModelEndpoint.agents]?.capabilities ?? defaultAgentCapabilities,
+    );
+  }
 
   const checkCapability = (capability) => enabledCapabilities.has(capability);
   const areToolsEnabled = checkCapability(AgentCapabilities.tools);
-  const actionsEnabled = checkCapability(AgentCapabilities.actions);
   const deferredToolsEnabled = checkCapability(AgentCapabilities.deferred_tools);
 
   const filteredTools = agent.tools?.filter((tool) => {
@@ -490,10 +481,7 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
     if (tool === Tools.web_search) {
       return checkCapability(AgentCapabilities.web_search);
     }
-    if (tool.includes(actionDelimiter)) {
-      return actionsEnabled;
-    }
-    if (!areToolsEnabled) {
+    if (!areToolsEnabled && !tool.includes(actionDelimiter)) {
       return false;
     }
     return true;
@@ -505,7 +493,7 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
 
   /** @type {Record<string, Record<string, string>>} */
   let userMCPAuthMap;
-  if (agent.tools?.some((t) => t.includes(Constants.mcp_delimiter))) {
+  if (hasCustomUserVars(req.config)) {
     userMCPAuthMap = await getUserMCPAuthMap({
       tools: agent.tools,
       userId: req.user.id,
@@ -515,7 +503,6 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
 
   const flowsCache = getLogStores(CacheKeys.FLOWS);
   const flowManager = getFlowStateManager(flowsCache);
-  const configServers = await resolveConfigServers(req);
   const pendingOAuthServers = new Set();
 
   const createOAuthEmitter = (serverName) => {
@@ -524,7 +511,7 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
       const stepId = 'step_oauth_login_' + serverName;
       const toolCall = {
         id: flowId,
-        name: buildOAuthToolCallName(serverName),
+        name: serverName,
         type: 'tool_call_chunk',
       };
 
@@ -566,7 +553,40 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
     };
   };
 
+  // === VIVENTIUM START ===
+  // Feature: Skip MCP reinit for intentionally-disabled local services.
+  // Purpose: avoid per-turn latency spikes (reconnect retries) when stack flags skip MCP servers.
+  const isMCPServerDisabledByEnv = (serverName) => {
+    const normalized = String(serverName || '').trim().toLowerCase();
+    if (!normalized) {
+      return false;
+    }
+
+    const isFalse = (value) => String(value || '').trim().toLowerCase() === 'false';
+
+    if (normalized === 'scheduling-cortex' && isFalse(process.env.START_SCHEDULING_MCP)) {
+      return true;
+    }
+    if (normalized === 'google_workspace' && isFalse(process.env.START_GOOGLE_MCP)) {
+      return true;
+    }
+    if (normalized === 'ms-365' && isFalse(process.env.START_MS365_MCP)) {
+      return true;
+    }
+    return false;
+  };
+  // === VIVENTIUM END ===
+
   const getOrFetchMCPServerTools = async (userId, serverName) => {
+    // === VIVENTIUM START ===
+    if (isMCPServerDisabledByEnv(serverName)) {
+      logger.info(
+        `[Tool Definitions] Skipping MCP server ${serverName} because it is disabled by env`,
+      );
+      return null;
+    }
+    // === VIVENTIUM END ===
+
     const cached = await getMCPServerTools(userId, serverName);
     if (cached) {
       return cached;
@@ -581,7 +601,6 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
       oauthStart,
       flowManager,
       serverName,
-      configServers,
       userMCPAuthMap,
     });
 
@@ -596,16 +615,11 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
 
     const definitions = [];
     const allowedDomains = appConfig?.actions?.allowedDomains;
-    const normalizedToolNames = new Set(
-      actionToolNames.map((n) => n.replace(domainSeparatorRegex, '_')),
-    );
+    const domainSeparatorRegex = new RegExp(actionDomainSeparator, 'g');
 
     for (const action of actionSets) {
       const domain = await domainParser(action.metadata.domain, true);
       const normalizedDomain = domain.replace(domainSeparatorRegex, '_');
-
-      const legacyDomain = legacyDomainEncode(action.metadata.domain);
-      const legacyNormalized = legacyDomain.replace(domainSeparatorRegex, '_');
 
       const isDomainAllowed = await isActionDomainAllowed(action.metadata.domain, allowedDomains);
       if (!isDomainAllowed) {
@@ -626,8 +640,7 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
 
       for (const sig of functionSignatures) {
         const toolName = `${sig.name}${actionDelimiter}${normalizedDomain}`;
-        const legacyToolName = `${sig.name}${actionDelimiter}${legacyNormalized}`;
-        if (!normalizedToolNames.has(toolName) && !normalizedToolNames.has(legacyToolName)) {
+        if (!actionToolNames.some((name) => name.replace(domainSeparatorRegex, '_') === toolName)) {
           continue;
         }
 
@@ -660,61 +673,92 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
 
   if (pendingOAuthServers.size > 0 && (res || streamId)) {
     const serverNames = Array.from(pendingOAuthServers);
-    logger.info(
-      `[Tool Definitions] OAuth required for ${serverNames.length} server(s): ${serverNames.join(', ')}. Emitting events and waiting.`,
-    );
+    const oauthDecision = getMcpOAuthWaitDecision(req);
+    const { waitForOAuth, hasToolIntent, surface, mode } = oauthDecision;
 
-    const oauthWaitPromises = serverNames.map(async (serverName) => {
-      try {
-        const result = await reinitMCPServer({
-          user: req.user,
-          serverName,
-          configServers,
-          userMCPAuthMap,
-          flowManager,
-          returnOnOAuth: false,
-          oauthStart: createOAuthEmitter(serverName),
-          connectionTimeout: Time.TWO_MINUTES,
-        });
+    if (!hasToolIntent) {
+      const stripped = stripOAuthPendingMcpTools({
+        toolDefinitions,
+        toolRegistry,
+        pendingOAuthServers,
+      });
 
-        if (result?.availableTools) {
-          logger.info(`[Tool Definitions] OAuth completed for ${serverName}, tools available`);
-          return { serverName, success: true };
-        }
-        return { serverName, success: false };
-      } catch (error) {
-        logger.debug(`[Tool Definitions] OAuth wait failed for ${serverName}:`, error?.message);
-        return { serverName, success: false };
+      toolDefinitions = stripped.toolDefinitions;
+      toolRegistry = stripped.toolRegistry;
+
+      if (stripped.removedToolNames.length > 0) {
+        logger.info(
+          `[Tool Definitions] Stripped ${stripped.removedToolNames.length} OAuth-pending MCP tool(s) for non-tool-intent turn (surface=${surface}, servers=${serverNames.join(
+            ', ',
+          )})`,
+        );
       }
-    });
+    }
 
-    const results = await Promise.allSettled(oauthWaitPromises);
-    const successfulServers = results
-      .filter((r) => r.status === 'fulfilled' && r.value.success)
-      .map((r) => r.value.serverName);
-
-    if (successfulServers.length > 0) {
+    if (!waitForOAuth) {
       logger.info(
-        `[Tool Definitions] Reloading tools after OAuth for: ${successfulServers.join(', ')}`,
+        `[Tool Definitions] OAuth wait skipped (surface=${surface}, mode=${mode}, intent=${hasToolIntent}) for server(s): ${serverNames.join(
+          ', ',
+        )}`,
       );
-      const reloadResult = await loadToolDefinitions(
-        {
-          userId: req.user.id,
-          agentId: agent.id,
-          tools: filteredTools,
-          toolOptions: agent.tool_options,
-          deferredToolsEnabled,
-        },
-        {
-          isBuiltInTool,
-          loadAuthValues,
-          getOrFetchMCPServerTools,
-          getActionToolDefinitions,
-        },
+    }
+
+    if (waitForOAuth) {
+      logger.info(
+        `[Tool Definitions] OAuth required for ${serverNames.length} server(s): ${serverNames.join(', ')}. Emitting events and waiting.`,
       );
-      toolDefinitions = reloadResult.toolDefinitions;
-      toolRegistry = reloadResult.toolRegistry;
-      hasDeferredTools = reloadResult.hasDeferredTools;
+
+      const oauthWaitPromises = serverNames.map(async (serverName) => {
+        try {
+          const result = await reinitMCPServer({
+            user: req.user,
+            serverName,
+            userMCPAuthMap,
+            flowManager,
+            returnOnOAuth: false,
+            oauthStart: createOAuthEmitter(serverName),
+            connectionTimeout: Time.TWO_MINUTES,
+          });
+
+          if (result?.availableTools) {
+            logger.info(`[Tool Definitions] OAuth completed for ${serverName}, tools available`);
+            return { serverName, success: true };
+          }
+          return { serverName, success: false };
+        } catch (error) {
+          logger.debug(`[Tool Definitions] OAuth wait failed for ${serverName}:`, error?.message);
+          return { serverName, success: false };
+        }
+      });
+
+      const results = await Promise.allSettled(oauthWaitPromises);
+      const successfulServers = results
+        .filter((r) => r.status === 'fulfilled' && r.value.success)
+        .map((r) => r.value.serverName);
+
+      if (successfulServers.length > 0) {
+        logger.info(
+          `[Tool Definitions] Reloading tools after OAuth for: ${successfulServers.join(', ')}`,
+        );
+        const reloadResult = await loadToolDefinitions(
+          {
+            userId: req.user.id,
+            agentId: agent.id,
+            tools: filteredTools,
+            toolOptions: agent.tool_options,
+            deferredToolsEnabled,
+          },
+          {
+            isBuiltInTool,
+            loadAuthValues,
+            getOrFetchMCPServerTools,
+            getActionToolDefinitions,
+          },
+        );
+        toolDefinitions = reloadResult.toolDefinitions;
+        toolRegistry = reloadResult.toolRegistry;
+        hasDeferredTools = reloadResult.hasDeferredTools;
+      }
     }
   }
 
@@ -799,7 +843,6 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
     toolContextMap,
     toolDefinitions,
     hasDeferredTools,
-    actionsEnabled,
   };
 }
 
@@ -827,10 +870,26 @@ async function loadAgentTools({
   streamId = null,
   definitionsOnly = true,
 }) {
+  // === VIVENTIUM START ===
+  // Feature: Skip tool loading for trivial Telegram messages to avoid MCP stalls.
+  const toolLoadStart = startDeepTiming(req);
+  if (isDeepTimingEnabled(req)) {
+    logDeepTiming(req, 'tool_load_start', toolLoadStart, `tools=${agent?.tools?.length ?? 0}`);
+  }
+  if (shouldSkipTelegramTools(req)) {
+    const traceId = req?.body?.traceId || 'na';
+    logger.info(
+      `[VIVENTIUM][telegram] Tool guard: skipping tools for short message (trace=${traceId})`,
+    );
+    if (isDeepTimingEnabled(req)) {
+      logDeepTiming(req, 'tool_load_skip', toolLoadStart, 'reason=guard');
+    }
+    return {};
+  }
+  // === VIVENTIUM END ===
   if (definitionsOnly) {
     return loadToolDefinitionsWrapper({ req, res, agent, streamId, tool_resources });
   }
-
   if (!agent.tools || agent.tools.length === 0) {
     return { toolDefinitions: [] };
   } else if (
@@ -843,7 +902,14 @@ async function loadAgentTools({
   }
 
   const appConfig = req.config;
-  const enabledCapabilities = await resolveAgentCapabilities(req, appConfig, agent.id);
+  const endpointsConfig = await getEndpointsConfig(req);
+  let enabledCapabilities = new Set(endpointsConfig?.[EModelEndpoint.agents]?.capabilities ?? []);
+  /** Edge case: use defined/fallback capabilities when the "agents" endpoint is not enabled */
+  if (enabledCapabilities.size === 0 && isEphemeralAgentId(agent.id)) {
+    enabledCapabilities = new Set(
+      appConfig.endpoints?.[EModelEndpoint.agents]?.capabilities ?? defaultAgentCapabilities,
+    );
+  }
   const checkCapability = (capability) => {
     const enabled = enabledCapabilities.has(capability);
     if (!enabled) {
@@ -860,7 +926,6 @@ async function loadAgentTools({
     return enabled;
   };
   const areToolsEnabled = checkCapability(AgentCapabilities.tools);
-  const actionsEnabled = checkCapability(AgentCapabilities.actions);
 
   let includesWebSearch = false;
   const _agentTools = agent.tools?.filter((tool) => {
@@ -871,9 +936,7 @@ async function loadAgentTools({
     } else if (tool === Tools.web_search) {
       includesWebSearch = checkCapability(AgentCapabilities.web_search);
       return includesWebSearch;
-    } else if (tool.includes(actionDelimiter)) {
-      return actionsEnabled;
-    } else if (!areToolsEnabled) {
+    } else if (!areToolsEnabled && !tool.includes(actionDelimiter)) {
       return false;
     }
     return true;
@@ -890,7 +953,8 @@ async function loadAgentTools({
 
   /** @type {Record<string, Record<string, string>>} */
   let userMCPAuthMap;
-  if (agent.tools?.some((t) => t.includes(Constants.mcp_delimiter))) {
+  //TODO pass config from registry
+  if (hasCustomUserVars(req.config)) {
     userMCPAuthMap = await getUserMCPAuthMap({
       tools: agent.tools,
       userId: req.user.id,
@@ -898,6 +962,11 @@ async function loadAgentTools({
     });
   }
 
+  // === VIVENTIUM START ===
+  // Feature: Deep Telegram timing instrumentation (toggleable)
+  // Purpose: Capture tool loading time and total time for Telegram traces.
+  // Added: 2026-02-07
+  const toolLoadInnerStart = startDeepTiming(req);
   const { loadedTools, toolContextMap } = await loadTools({
     agent,
     signal,
@@ -919,6 +988,11 @@ async function loadAgentTools({
     fileStrategy: appConfig.fileStrategy,
     imageOutputType: appConfig.imageOutputType,
   });
+  if (isDeepTimingEnabled(req)) {
+    logDeepTiming(req, 'tool_load_done', toolLoadInnerStart, `count=${loadedTools.length}`);
+    logDeepTiming(req, 'tool_load_total', toolLoadStart);
+  }
+  // === VIVENTIUM END ===
 
   /** Build tool registry from MCP tools and create PTC/tool search tools if configured */
   const deferredToolsEnabled = checkCapability(AgentCapabilities.deferred_tools);
@@ -978,15 +1052,13 @@ async function loadAgentTools({
 
   agentTools.push(...additionalTools);
 
-  const hasActionTools = _agentTools.some((t) => t.includes(actionDelimiter));
-  if (!hasActionTools) {
+  if (!checkCapability(AgentCapabilities.actions)) {
     return {
       toolRegistry,
       userMCPAuthMap,
       toolContextMap,
       toolDefinitions,
       hasDeferredTools,
-      actionsEnabled,
       tools: agentTools,
     };
   }
@@ -1002,22 +1074,19 @@ async function loadAgentTools({
       toolContextMap,
       toolDefinitions,
       hasDeferredTools,
-      actionsEnabled,
       tools: agentTools,
     };
   }
 
+  // Process each action set once (validate spec, decrypt metadata)
   const processedActionSets = new Map();
-  const domainLookupMap = new Map();
+  const domainMap = new Map();
 
   for (const action of actionSets) {
     const domain = await domainParser(action.metadata.domain, true);
-    domainLookupMap.set(domain, domain);
+    domainMap.set(domain, action);
 
-    const legacyDomain = legacyDomainEncode(action.metadata.domain);
-    if (legacyDomain !== domain) {
-      domainLookupMap.set(legacyDomain, domain);
-    }
+    // Check if domain is allowed (do this once per action set)
     const isDomainAllowed = await isActionDomainAllowed(
       action.metadata.domain,
       appConfig?.actions?.allowedDomains,
@@ -1079,12 +1148,11 @@ async function loadAgentTools({
       continue;
     }
 
+    // Find the matching domain for this tool
     let currentDomain = '';
-    let matchedKey = '';
-    for (const [key, canonical] of domainLookupMap.entries()) {
-      if (toolName.includes(key)) {
-        currentDomain = canonical;
-        matchedKey = key;
+    for (const domain of domainMap.keys()) {
+      if (toolName.includes(domain)) {
+        currentDomain = domain;
         break;
       }
     }
@@ -1095,13 +1163,12 @@ async function loadAgentTools({
 
     const { action, encrypted, zodSchemas, requestBuilders, functionSignatures } =
       processedActionSets.get(currentDomain);
-    const functionName = toolName.replace(`${actionDelimiter}${matchedKey}`, '');
+    const functionName = toolName.replace(`${actionDelimiter}${currentDomain}`, '');
     const functionSig = functionSignatures.find((sig) => sig.name === functionName);
     const requestBuilder = requestBuilders[functionName];
     const zodSchema = zodSchemas[functionName];
 
     if (requestBuilder) {
-      const _allowedDomains = appConfig?.actions?.allowedDomains;
       const tool = await createActionTool({
         userId: req.user.id,
         res,
@@ -1112,7 +1179,6 @@ async function loadAgentTools({
         name: toolName,
         description: functionSig.description,
         streamId,
-        useSSRFProtection: !Array.isArray(_allowedDomains) || _allowedDomains.length === 0,
       });
 
       if (!tool) {
@@ -1138,7 +1204,6 @@ async function loadAgentTools({
     userMCPAuthMap,
     toolDefinitions,
     hasDeferredTools,
-    actionsEnabled,
     tools: agentTools,
   };
 }
@@ -1156,11 +1221,9 @@ async function loadAgentTools({
  * @param {AbortSignal} [params.signal] - Abort signal
  * @param {Object} params.agent - The agent object
  * @param {string[]} params.toolNames - Names of tools to load
- * @param {Map} [params.toolRegistry] - Tool registry
  * @param {Record<string, Record<string, string>>} [params.userMCPAuthMap] - User MCP auth map
  * @param {Object} [params.tool_resources] - Tool resources
  * @param {string|null} [params.streamId] - Stream ID for web search callbacks
- * @param {boolean} [params.actionsEnabled] - Whether the actions capability is enabled
  * @returns {Promise<{ loadedTools: Array, configurable: Object }>}
  */
 async function loadToolsForExecution({
@@ -1173,16 +1236,10 @@ async function loadToolsForExecution({
   userMCPAuthMap,
   tool_resources,
   streamId = null,
-  actionsEnabled,
 }) {
   const appConfig = req.config;
   const allLoadedTools = [];
   const configurable = { userMCPAuthMap };
-
-  if (actionsEnabled === undefined) {
-    const enabledCapabilities = await resolveAgentCapabilities(req, appConfig, agent?.id);
-    actionsEnabled = enabledCapabilities.has(AgentCapabilities.actions);
-  }
 
   const isToolSearch = toolNames.includes(AgentConstants.TOOL_SEARCH);
   const isPTC = toolNames.includes(AgentConstants.PROGRAMMATIC_TOOL_CALLING);
@@ -1240,6 +1297,7 @@ async function loadToolsForExecution({
   const actionToolNames = allToolNamesToLoad.filter((name) => name.includes(actionDelimiter));
   const regularToolNames = allToolNamesToLoad.filter((name) => !name.includes(actionDelimiter));
 
+  /** @type {Record<string, unknown>} */
   if (regularToolNames.length > 0) {
     const includesWebSearch = regularToolNames.includes(Tools.web_search);
     const webSearchCallbacks = includesWebSearch ? createOnSearchResults(res, streamId) : undefined;
@@ -1270,7 +1328,7 @@ async function loadToolsForExecution({
     }
   }
 
-  if (actionToolNames.length > 0 && agent && actionsEnabled) {
+  if (actionToolNames.length > 0 && agent) {
     const actionTools = await loadActionToolsForExecution({
       req,
       res,
@@ -1280,11 +1338,6 @@ async function loadToolsForExecution({
       actionToolNames,
     });
     allLoadedTools.push(...actionTools);
-  } else if (actionToolNames.length > 0 && agent && !actionsEnabled) {
-    logger.warn(
-      `[loadToolsForExecution] Capability "${AgentCapabilities.actions}" disabled. ` +
-        `Skipping action tool execution. User: ${req.user.id} | Agent: ${agent.id} | Tools: ${actionToolNames.join(', ')}`,
-    );
   }
 
   if (isPTC && allLoadedTools.length > 0) {
@@ -1330,20 +1383,12 @@ async function loadActionToolsForExecution({
   }
 
   const processedActionSets = new Map();
-  /** Maps both new and legacy normalized domains to their canonical (new) domain key */
-  const normalizedToDomain = new Map();
+  const domainMap = new Map();
   const allowedDomains = appConfig?.actions?.allowedDomains;
 
   for (const action of actionSets) {
     const domain = await domainParser(action.metadata.domain, true);
-    const normalizedDomain = domain.replace(domainSeparatorRegex, '_');
-    normalizedToDomain.set(normalizedDomain, domain);
-
-    const legacyDomain = legacyDomainEncode(action.metadata.domain);
-    const legacyNormalized = legacyDomain.replace(domainSeparatorRegex, '_');
-    if (legacyNormalized !== normalizedDomain) {
-      normalizedToDomain.set(legacyNormalized, domain);
-    }
+    domainMap.set(domain, action);
 
     const isDomainAllowed = await isActionDomainAllowed(action.metadata.domain, allowedDomains);
     if (!isDomainAllowed) {
@@ -1392,15 +1437,15 @@ async function loadActionToolsForExecution({
       functionSignatures,
       zodSchemas,
       encrypted,
-      legacyNormalized,
     });
   }
 
   for (const toolName of actionToolNames) {
     let currentDomain = '';
-    for (const [normalizedDomain, canonicalDomain] of normalizedToDomain.entries()) {
+    for (const domain of domainMap.keys()) {
+      const normalizedDomain = domain.replace(domainSeparatorRegex, '_');
       if (toolName.includes(normalizedDomain)) {
-        currentDomain = canonicalDomain;
+        currentDomain = domain;
         break;
       }
     }
@@ -1409,8 +1454,9 @@ async function loadActionToolsForExecution({
       continue;
     }
 
-    const { action, encrypted, zodSchemas, requestBuilders, functionSignatures, legacyNormalized } =
+    const { action, encrypted, zodSchemas, requestBuilders, functionSignatures } =
       processedActionSets.get(currentDomain);
+    const domainSeparatorRegex = new RegExp(actionDomainSeparator, 'g');
     const normalizedDomain = currentDomain.replace(domainSeparatorRegex, '_');
     const functionName = toolName.replace(`${actionDelimiter}${normalizedDomain}`, '');
     const functionSig = functionSignatures.find((sig) => sig.name === functionName);
@@ -1418,25 +1464,6 @@ async function loadActionToolsForExecution({
     const zodSchema = zodSchemas[functionName];
 
     if (!requestBuilder) {
-      const legacyFnName = toolName.replace(`${actionDelimiter}${legacyNormalized}`, '');
-      if (legacyFnName !== toolName && requestBuilders[legacyFnName]) {
-        const legacyTool = await createActionTool({
-          userId: req.user.id,
-          res,
-          action,
-          streamId,
-          encrypted,
-          requestBuilder: requestBuilders[legacyFnName],
-          zodSchema: zodSchemas[legacyFnName],
-          name: toolName,
-          description:
-            functionSignatures.find((sig) => sig.name === legacyFnName)?.description ?? '',
-          useSSRFProtection: !Array.isArray(allowedDomains) || allowedDomains.length === 0,
-        });
-        if (legacyTool) {
-          loadedActionTools.push(legacyTool);
-        }
-      }
       continue;
     }
 
@@ -1450,7 +1477,6 @@ async function loadActionToolsForExecution({
       requestBuilder,
       name: toolName,
       description: functionSig?.description ?? '',
-      useSSRFProtection: !Array.isArray(allowedDomains) || allowedDomains.length === 0,
     });
 
     if (!tool) {
@@ -1471,5 +1497,4 @@ module.exports = {
   loadAgentTools,
   loadToolsForExecution,
   processRequiredActions,
-  resolveAgentCapabilities,
 };

@@ -1,0 +1,55 @@
+requests>=2.31.0,<3
+# Core API framework
+fastapi==0.128.0
+uvicorn[standard]==0.40.0
+
+# Data validation and serialization
+pydantic==2.12.5
+pydantic-settings==2.12.0
+
+# HTTP client for external requests
+httpx==0.28.1
+
+# Redis for session management
+redis==7.1.0
+
+# SQLite async support for metrics
+aiosqlite>=0.19.0
+
+# MinIO/S3 client
+minio==7.2.20
+
+# Docker client for container management
+docker==7.1.0
+requests-unixsocket==0.4.1
+
+# Date/time parsing utilities
+python-dateutil==2.9.0.post0
+
+
+# Testing framework
+pytest==9.0.2
+pytest-asyncio==1.3.0
+pytest-cov==4.1.0
+pytest-mock==3.12.0
+
+# Development tools
+black>=24.3.0
+flake8==7.3.0
+mypy==1.7.1
+
+# Environment management
+python-dotenv==1.2.1
+
+# Logging
+structlog==25.5.0
+
+# File handling
+python-multipart>=0.0.18
+Unidecode==1.4.0
+
+# System monitoring for performance tests
+psutil==5.9.6
+
+# Stress testing
+locust==2.43.1

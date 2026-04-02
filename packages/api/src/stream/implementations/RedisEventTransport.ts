@@ -92,8 +92,8 @@ export class RedisEventTransport implements IEventTransport {
   private subscriber: Redis | Cluster;
   /** Track subscribers per stream */
   private streams = new Map<string, StreamSubscribers>();
-  /** Track channel subscription state: resolved promise = active, pending = in-flight */
-  private channelSubscriptions = new Map<string, Promise<void>>();
+  /** Track which channels we're subscribed to */
+  private subscribedChannels = new Set<string>();
   /** Counter for generating unique subscriber IDs */
   private subscriberIdCounter = 0;
   /** Sequence counters per stream for publishing (ensures ordered delivery in cluster mode) */
@@ -122,32 +122,9 @@ export class RedisEventTransport implements IEventTransport {
     return current;
   }
 
-  /** Reset publish sequence counter and subscriber reorder state for a stream (full cleanup only) */
+  /** Reset sequence counter for a stream */
   resetSequence(streamId: string): void {
     this.sequenceCounters.delete(streamId);
-    const state = this.streams.get(streamId);
-    if (state) {
-      if (state.reorderBuffer.flushTimeout) {
-        clearTimeout(state.reorderBuffer.flushTimeout);
-        state.reorderBuffer.flushTimeout = null;
-      }
-      state.reorderBuffer.nextSeq = 0;
-      state.reorderBuffer.pending.clear();
-    }
-  }
-
-  /** Advance subscriber reorder buffer to current publisher sequence without resetting publisher (cross-replica safe) */
-  syncReorderBuffer(streamId: string): void {
-    const currentSeq = this.sequenceCounters.get(streamId) ?? 0;
-    const state = this.streams.get(streamId);
-    if (state) {
-      if (state.reorderBuffer.flushTimeout) {
-        clearTimeout(state.reorderBuffer.flushTimeout);
-        state.reorderBuffer.flushTimeout = null;
-      }
-      state.reorderBuffer.nextSeq = currentSeq;
-      state.reorderBuffer.pending.clear();
-    }
   }
 
   /**
@@ -354,7 +331,7 @@ export class RedisEventTransport implements IEventTransport {
       onDone?: (event: unknown) => void;
       onError?: (error: string) => void;
     },
-  ): { unsubscribe: () => void; ready?: Promise<void> } {
+  ): { unsubscribe: () => void } {
     const channel = CHANNELS.events(streamId);
     const subscriberId = `sub_${++this.subscriberIdCounter}`;
 
@@ -377,23 +354,16 @@ export class RedisEventTransport implements IEventTransport {
     streamState.count++;
     streamState.handlers.set(subscriberId, handlers);
 
-    let readyPromise = this.channelSubscriptions.get(channel);
-
-    if (!readyPromise) {
-      readyPromise = this.subscriber
-        .subscribe(channel)
-        .then(() => {
-          logger.debug(`[RedisEventTransport] Subscription active for channel ${channel}`);
-        })
-        .catch((err) => {
-          this.channelSubscriptions.delete(channel);
-          logger.error(`[RedisEventTransport] Failed to subscribe to ${channel}:`, err);
-        });
-      this.channelSubscriptions.set(channel, readyPromise);
+    // Subscribe to Redis channel if this is first subscriber
+    if (!this.subscribedChannels.has(channel)) {
+      this.subscribedChannels.add(channel);
+      this.subscriber.subscribe(channel).catch((err) => {
+        logger.error(`[RedisEventTransport] Failed to subscribe to ${channel}:`, err);
+      });
     }
 
+    // Return unsubscribe function
     return {
-      ready: readyPromise,
       unsubscribe: () => {
         const state = this.streams.get(streamId);
         if (!state) {
@@ -415,7 +385,7 @@ export class RedisEventTransport implements IEventTransport {
           this.subscriber.unsubscribe(channel).catch((err) => {
             logger.error(`[RedisEventTransport] Failed to unsubscribe from ${channel}:`, err);
           });
-          this.channelSubscriptions.delete(channel);
+          this.subscribedChannels.delete(channel);
 
           // Call all-subscribers-left callbacks
           for (const callback of state.allSubscribersLeftCallbacks) {
@@ -425,15 +395,8 @@ export class RedisEventTransport implements IEventTransport {
               logger.error(`[RedisEventTransport] Error in allSubscribersLeft callback:`, err);
             }
           }
-          /**
-           *  Preserve stream state (callbacks, abort handlers) for reconnection.
-           *  Previously this deleted the entire state, which lost the
-           *  allSubscribersLeftCallbacks and abortCallbacks registered by
-           *  GenerationJobManager.createJob(). On the next subscribe() call,
-           *  fresh state was created without those callbacks, causing
-           *  hasSubscriber to never reset and syncReorderBuffer to be skipped.
-           *  State is fully cleaned up by cleanup() when the job completes.
-           */
+
+          this.streams.delete(streamId);
         }
       },
     };
@@ -468,7 +431,6 @@ export class RedisEventTransport implements IEventTransport {
       await this.publisher.publish(channel, JSON.stringify(message));
     } catch (err) {
       logger.error(`[RedisEventTransport] Failed to publish done:`, err);
-      throw err;
     }
   }
 
@@ -485,7 +447,6 @@ export class RedisEventTransport implements IEventTransport {
       await this.publisher.publish(channel, JSON.stringify(message));
     } catch (err) {
       logger.error(`[RedisEventTransport] Failed to publish error:`, err);
-      throw err;
     }
   }
 
@@ -571,15 +532,12 @@ export class RedisEventTransport implements IEventTransport {
 
     state.abortCallbacks.push(callback);
 
-    if (!this.channelSubscriptions.has(channel)) {
-      const ready = this.subscriber
-        .subscribe(channel)
-        .then(() => {})
-        .catch((err) => {
-          this.channelSubscriptions.delete(channel);
-          logger.error(`[RedisEventTransport] Failed to subscribe to ${channel}:`, err);
-        });
-      this.channelSubscriptions.set(channel, ready);
+    // Subscribe to Redis channel if not already subscribed
+    if (!this.subscribedChannels.has(channel)) {
+      this.subscribedChannels.add(channel);
+      this.subscriber.subscribe(channel).catch((err) => {
+        logger.error(`[RedisEventTransport] Failed to subscribe to ${channel}:`, err);
+      });
     }
   }
 
@@ -613,11 +571,12 @@ export class RedisEventTransport implements IEventTransport {
     // Reset sequence counter for this stream
     this.resetSequence(streamId);
 
-    if (this.channelSubscriptions.has(channel)) {
+    // Unsubscribe from Redis channel
+    if (this.subscribedChannels.has(channel)) {
       this.subscriber.unsubscribe(channel).catch((err) => {
         logger.error(`[RedisEventTransport] Failed to cleanup ${channel}:`, err);
       });
-      this.channelSubscriptions.delete(channel);
+      this.subscribedChannels.delete(channel);
     }
 
     this.streams.delete(streamId);
@@ -636,20 +595,18 @@ export class RedisEventTransport implements IEventTransport {
       state.reorderBuffer.pending.clear();
     }
 
-    for (const channel of this.channelSubscriptions.keys()) {
-      this.subscriber.unsubscribe(channel).catch(() => {});
+    // Unsubscribe from all channels
+    for (const channel of this.subscribedChannels) {
+      this.subscriber.unsubscribe(channel).catch(() => {
+        // Ignore errors during shutdown
+      });
     }
 
-    this.channelSubscriptions.clear();
+    this.subscribedChannels.clear();
     this.streams.clear();
     this.sequenceCounters.clear();
 
-    try {
-      this.subscriber.disconnect();
-    } catch {
-      /* ignore */
-    }
-
+    // Note: Don't close Redis connections - they may be shared
     logger.info('[RedisEventTransport] Destroyed');
   }
 }

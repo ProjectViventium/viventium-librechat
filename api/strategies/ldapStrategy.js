@@ -2,14 +2,17 @@ const fs = require('fs');
 const LdapStrategy = require('passport-ldapauth');
 const { logger } = require('@librechat/data-schemas');
 const { SystemRoles, ErrorTypes } = require('librechat-data-provider');
-const {
-  isEnabled,
-  getBalanceConfig,
-  isEmailDomainAllowed,
-  resolveAppConfigForUser,
-} = require('@librechat/api');
+const { isEnabled, getBalanceConfig, isEmailDomainAllowed } = require('@librechat/api');
 const { createUser, findUser, updateUser, countUsers } = require('~/models');
 const { getAppConfig } = require('~/server/services/Config');
+/* === VIVENTIUM START ===
+ * Feature: Registration approval support for LDAP account creation.
+ * === VIVENTIUM END === */
+const {
+  isRegistrationApprovalEnabled,
+  markUserPendingApproval,
+  notifyAdminRegistration,
+} = require('~/server/services/viventium/registrationApprovalService');
 
 const {
   LDAP_URL,
@@ -94,6 +97,16 @@ const ldapLogin = new LdapStrategy(ldapOptions, async (userinfo, done) => {
     const ldapId =
       (LDAP_ID && userinfo[LDAP_ID]) || userinfo.uid || userinfo.sAMAccountName || userinfo.mail;
 
+    let user = await findUser({ ldapId });
+    if (user && user.provider !== 'ldap') {
+      logger.info(
+        `[ldapStrategy] User ${user.email} already exists with provider ${user.provider}`,
+      );
+      return done(null, false, {
+        message: ErrorTypes.AUTH_FAILED,
+      });
+    }
+
     const fullNameAttributes = LDAP_FULL_NAME && LDAP_FULL_NAME.split(',');
     const fullName =
       fullNameAttributes && fullNameAttributes.length > 0
@@ -117,31 +130,7 @@ const ldapLogin = new LdapStrategy(ldapOptions, async (userinfo, done) => {
       );
     }
 
-    // Domain check before findUser for two-phase fast-fail (consistent with SAML/OpenID/social).
-    // This means cross-provider users from blocked domains get 'Email domain not allowed'
-    // instead of AUTH_FAILED — both deny access.
-    const baseConfig = await getAppConfig({ baseOnly: true });
-    if (!isEmailDomainAllowed(mail, baseConfig?.registration?.allowedDomains)) {
-      logger.error(
-        `[LDAP Strategy] Authentication blocked - email domain not allowed [Email: ${mail}]`,
-      );
-      return done(null, false, { message: 'Email domain not allowed' });
-    }
-
-    let user = await findUser({ ldapId });
-    if (user && user.provider !== 'ldap') {
-      logger.info(
-        `[ldapStrategy] User ${user.email} already exists with provider ${user.provider}`,
-      );
-      return done(null, false, {
-        message: ErrorTypes.AUTH_FAILED,
-      });
-    }
-
-    const appConfig = user?.tenantId
-      ? await resolveAppConfigForUser(getAppConfig, user)
-      : baseConfig;
-
+    const appConfig = await getAppConfig();
     if (!isEmailDomainAllowed(mail, appConfig?.registration?.allowedDomains)) {
       logger.error(
         `[LDAP Strategy] Authentication blocked - email domain not allowed [Email: ${mail}]`,
@@ -165,6 +154,19 @@ const ldapLogin = new LdapStrategy(ldapOptions, async (userinfo, done) => {
       const balanceConfig = getBalanceConfig(appConfig);
       const userId = await createUser(user, balanceConfig);
       user._id = userId;
+      /* === VIVENTIUM START ===
+       * Feature: Registration approval workflow for LDAP users.
+       * === VIVENTIUM END === */
+      if (isRegistrationApprovalEnabled()) {
+        await markUserPendingApproval(userId.toString());
+        await notifyAdminRegistration({
+          userId: userId.toString(),
+          name: fullName,
+          email: mail,
+          provider: 'ldap',
+        });
+        user.viventiumApprovalStatus = 'pending';
+      }
     } else {
       // Users registered in LDAP are assumed to have their user information managed in LDAP,
       // so update the user information with the values registered in LDAP

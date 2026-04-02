@@ -1,5 +1,6 @@
 // See .env.test.example for an example of the '.env.test' file.
 require('dotenv').config({ path: './test/.env.test' });
+const { MongoMemoryServer } = require('mongodb-memory-server');
 
 process.env.MONGO_URI = 'mongodb://127.0.0.1:27017/dummy-uri';
 process.env.BAN_VIOLATIONS = 'true';
@@ -12,7 +13,23 @@ process.env.CREDS_KEY = 'test';
 process.env.CREDS_IV = 'test';
 process.env.ALLOW_EMAIL_LOGIN = 'true';
 
-// Set global test timeout to 30 seconds
-// This can be overridden in individual tests if needed
-jest.setTimeout(30000);
+// Set global test timeout high enough for cold MongoMemoryServer startups in full-suite runs.
+// Individual tests can still override this lower when they need tighter bounds.
+jest.setTimeout(120000);
+
+/* === VIVENTIUM START ===
+ * Feature: Test stability (mongodb-memory-server cold start)
+ * Purpose: Prevent full-suite flakiness from the library's 10s default instance launch timeout.
+ * Added: 2026-03-08
+ */
+const originalMongoMemoryServerCreate = MongoMemoryServer.create.bind(MongoMemoryServer);
+MongoMemoryServer.create = (options = {}) =>
+  originalMongoMemoryServerCreate({
+    ...options,
+    instance: {
+      launchTimeout: 45_000,
+      ...(options.instance ?? {}),
+    },
+  });
+/* === VIVENTIUM END === */
 process.env.OPENAI_API_KEY = 'test';

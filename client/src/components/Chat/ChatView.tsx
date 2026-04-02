@@ -6,8 +6,20 @@ import { useParams } from 'react-router-dom';
 import { Constants, buildTree } from 'librechat-data-provider';
 import type { TMessage } from 'librechat-data-provider';
 import type { ChatFormValues } from '~/common';
-import { ChatContext, AddedChatContext, ChatFormProvider, useFileMapContext } from '~/Providers';
-import { useAddedResponse, useResumeOnLoad, useAdaptiveSSE, useChatHelpers } from '~/hooks';
+import { ChatContext, AddedChatContext, useFileMapContext, ChatFormProvider } from '~/Providers';
+/* === VIVENTIUM START ===
+ * Feature: Background Cortex follow-up polling (client)
+ * Purpose: Import hook that polls background cortex completion and merges follow-up results post-stream.
+ * Added: 2026-01-05
+ */
+import {
+  useAddedResponse,
+  useResumeOnLoad,
+  useAdaptiveSSE,
+  useChatHelpers,
+  useCortexFollowUpPoll,
+} from '~/hooks';
+/* === VIVENTIUM END === */
 import ConversationStarters from './Input/ConversationStarters';
 import { useGetMessagesByConvoId } from '~/data-provider';
 import MessagesView from './Messages/MessagesView';
@@ -34,10 +46,6 @@ function ChatView({ index = 0 }: { index?: number }) {
   const rootSubmission = useRecoilValue(store.submissionByIndex(index));
   const centerFormOnLanding = useRecoilValue(store.centerFormOnLanding);
 
-  const methods = useForm<ChatFormValues>({
-    defaultValues: { text: '' },
-  });
-
   const fileMap = useFileMapContext();
 
   const { data: messagesTree = null, isLoading } = useGetMessagesByConvoId(conversationId ?? '', {
@@ -56,9 +64,23 @@ function ChatView({ index = 0 }: { index?: number }) {
 
   useAdaptiveSSE(rootSubmission, chatHelpers, false, index);
 
+  /* VIVENTIUM START
+   * Purpose: Poll background cortex completion and merge follow-up results post-stream.
+   * Details: docs/requirements_and_learnings/05_Open_Source_Modifications.md#librechat-chatview-cortex-followup
+   */
+  useCortexFollowUpPoll({
+    conversationId,
+    getMessages: chatHelpers.getMessages,
+    isSubmitting: chatHelpers.isSubmitting,
+  });
+  /* VIVENTIUM END */
   // Auto-resume if navigating back to conversation with active job
   // Wait for messages to load before resuming to avoid race condition
   useResumeOnLoad(conversationId, chatHelpers.getMessages, index, !isLoading);
+
+  const methods = useForm<ChatFormValues>({
+    defaultValues: { text: '' },
+  });
 
   let content: JSX.Element | null | undefined;
   const isLandingPage =
@@ -82,7 +104,7 @@ function ChatView({ index = 0 }: { index?: number }) {
         <AddedChatContext.Provider value={addedChatHelpers}>
           <Presentation>
             <div className="relative flex h-full w-full flex-col">
-              <Header />
+              {!isLoading && <Header />}
               <>
                 <div
                   className={cn(

@@ -207,7 +207,6 @@ describe('MCPConnection Agent lifecycle – streamable-http', () => {
   });
 
   afterEach(async () => {
-    MCPConnection.clearCooldown('test');
     await safeDisconnect(conn);
     conn = null;
     jest.restoreAllMocks();
@@ -367,7 +366,6 @@ describe('MCPConnection Agent lifecycle – SSE', () => {
   });
 
   afterEach(async () => {
-    MCPConnection.clearCooldown('test-sse');
     await safeDisconnect(conn);
     conn = null;
     jest.restoreAllMocks();
@@ -377,7 +375,7 @@ describe('MCPConnection Agent lifecycle – SSE', () => {
   it('reuses the same Agents across multiple requests instead of creating one per request', async () => {
     conn = new MCPConnection({
       serverName: 'test-sse',
-      serverConfig: { url: server.url, type: 'sse' },
+      serverConfig: { url: server.url },
       useSSRFProtection: false,
     });
 
@@ -402,7 +400,7 @@ describe('MCPConnection Agent lifecycle – SSE', () => {
   it('calls Agent.close() on every registered Agent when disconnect() is called', async () => {
     conn = new MCPConnection({
       serverName: 'test-sse',
-      serverConfig: { url: server.url, type: 'sse' },
+      serverConfig: { url: server.url },
       useSSRFProtection: false,
     });
 
@@ -417,7 +415,7 @@ describe('MCPConnection Agent lifecycle – SSE', () => {
   it('closes at least two Agents for SSE transport (eventSourceInit + fetch)', async () => {
     conn = new MCPConnection({
       serverName: 'test-sse',
-      serverConfig: { url: server.url, type: 'sse' },
+      serverConfig: { url: server.url },
       useSSRFProtection: false,
     });
 
@@ -431,7 +429,7 @@ describe('MCPConnection Agent lifecycle – SSE', () => {
   it('does not double-close Agents when disconnect() is called twice', async () => {
     conn = new MCPConnection({
       serverName: 'test-sse',
-      serverConfig: { url: server.url, type: 'sse' },
+      serverConfig: { url: server.url },
       useSSRFProtection: false,
     });
 
@@ -455,7 +453,6 @@ describe('Regression: old per-request Agent pattern leaks agents', () => {
   });
 
   afterEach(async () => {
-    MCPConnection.clearCooldown('test-regression');
     await safeDisconnect(conn);
     conn = null;
     jest.restoreAllMocks();
@@ -533,7 +530,7 @@ describe('MCPConnection SSE 404 handling – session-aware', () => {
   function makeConn() {
     return new MCPConnection({
       serverName: 'test-404',
-      serverConfig: { url: 'http://127.0.0.1:1/sse', type: 'sse' },
+      serverConfig: { url: 'http://127.0.0.1:1/sse' },
       useSSRFProtection: false,
     });
   }
@@ -599,7 +596,7 @@ describe('MCPConnection SSE stream disconnect handling', () => {
   function makeConn() {
     return new MCPConnection({
       serverName: 'test-sse-disconnect',
-      serverConfig: { url: 'http://127.0.0.1:1/sse', type: 'sse' },
+      serverConfig: { url: 'http://127.0.0.1:1/sse' },
       useSSRFProtection: false,
     });
   }
@@ -678,7 +675,6 @@ describe('MCPConnection SSE GET stream recovery – integration', () => {
   });
 
   afterEach(async () => {
-    MCPConnection.clearCooldown('test-sse-recovery');
     await safeDisconnect(conn);
     conn = null;
     jest.restoreAllMocks();

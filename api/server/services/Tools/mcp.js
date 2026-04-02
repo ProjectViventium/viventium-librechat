@@ -1,9 +1,55 @@
 const { logger } = require('@librechat/data-schemas');
+const { MCPOAuthHandler } = require('@librechat/api');
 const { CacheKeys, Constants } = require('librechat-data-provider');
-const { getMCPManager, getMCPServersRegistry, getFlowStateManager } = require('~/config');
 const { findToken, createToken, updateToken, deleteTokens } = require('~/models');
 const { updateMCPServerTools } = require('~/server/services/Config');
+const { getMCPManager, getFlowStateManager, getMCPServersRegistry } = require('~/config');
 const { getLogStores } = require('~/cache');
+
+async function hasUsableOAuthTokens(userId, serverName) {
+  const now = new Date();
+  const accessToken = await findToken({
+    userId,
+    type: 'mcp_oauth',
+    identifier: `mcp:${serverName}`,
+  });
+  const refreshToken = await findToken({
+    userId,
+    type: 'mcp_oauth_refresh',
+    identifier: `mcp:${serverName}:refresh`,
+  });
+
+  if (accessToken?.expiresAt && accessToken.expiresAt >= now) {
+    return true;
+  }
+
+  if (refreshToken == null) {
+    return false;
+  }
+
+  return refreshToken.expiresAt == null || refreshToken.expiresAt >= now;
+}
+
+async function initiateOAuthFlowFallback({
+  user,
+  signal,
+  serverName,
+  flowManager,
+  oauthStart,
+  serverConfig,
+}) {
+  const { authorizationUrl, flowId, flowMetadata } = await MCPOAuthHandler.initiateOAuthFlow(
+    serverName,
+    serverConfig.url || '',
+    user.id,
+    serverConfig.oauth_headers ?? {},
+    serverConfig.oauth,
+  );
+
+  await flowManager.deleteFlow(flowId, 'mcp_oauth').catch(() => {});
+  flowManager.createFlow(flowId, 'mcp_oauth', flowMetadata, signal).catch(() => {});
+  await oauthStart(authorizationUrl);
+}
 
 /**
  * Reinitializes an MCP server connection and discovers available tools.
@@ -25,13 +71,11 @@ async function reinitMCPServer({
   signal,
   forceNew,
   serverName,
-  configServers,
   userMCPAuthMap,
   connectionTimeout,
   returnOnOAuth = true,
   oauthStart: _oauthStart,
   flowManager: _flowManager,
-  serverConfig: providedConfig,
 }) {
   /** @type {MCPConnection | null} */
   let connection = null;
@@ -44,28 +88,13 @@ async function reinitMCPServer({
 
   try {
     const registry = getMCPServersRegistry();
-    const serverConfig =
-      providedConfig ?? (await registry.getServerConfig(serverName, user?.id, configServers));
+    const serverConfig = await registry.getServerConfig(serverName, user?.id);
     if (serverConfig?.inspectionFailed) {
-      if (serverConfig.source === 'config') {
-        logger.info(
-          `[MCP Reinitialize] Config-source server ${serverName} has inspectionFailed — retry handled by config cache`,
-        );
-        return {
-          availableTools: null,
-          success: false,
-          message: `MCP server '${serverName}' is still unreachable`,
-          oauthRequired: false,
-          serverName,
-          oauthUrl: null,
-          tools: null,
-        };
-      }
       logger.info(
         `[MCP Reinitialize] Server ${serverName} had failed inspection, attempting reinspection`,
       );
       try {
-        const storageLocation = serverConfig.source === 'user' ? 'DB' : 'CACHE';
+        const storageLocation = serverConfig.dbId ? 'DB' : 'CACHE';
         await registry.reinspectServer(serverName, storageLocation, user?.id);
         logger.info(`[MCP Reinitialize] Reinspection succeeded for server: ${serverName}`);
       } catch (reinspectError) {
@@ -110,7 +139,6 @@ async function reinitMCPServer({
         returnOnOAuth,
         customUserVars,
         connectionTimeout,
-        serverConfig,
       });
 
       logger.info(`[MCP Reinitialize] Successfully established connection for ${serverName}`);
@@ -124,8 +152,46 @@ async function reinitMCPServer({
         err.message?.includes('OAuth') ||
         err.message?.includes('authentication') ||
         err.message?.includes('401');
+      const isConnectionTimeout = err.message?.includes('Connection timeout');
+      const serverConfig = await getMCPServersRegistry().getServerConfig(serverName, user.id);
+      const serverRequiresOAuth = Boolean(
+        serverConfig?.requiresOAuth || serverConfig?.oauthMetadata,
+      );
+      const hasStoredOAuthTokens =
+        serverRequiresOAuth && user.id
+          ? await hasUsableOAuthTokens(user.id, serverName)
+          : false;
 
       const isOAuthFlowInitiated = err.message === 'OAuth flow initiated - return early';
+
+      if (
+        serverRequiresOAuth &&
+        isConnectionTimeout &&
+        !oauthRequired &&
+        !isOAuthFlowInitiated &&
+        !hasStoredOAuthTokens
+      ) {
+        logger.warn(
+          `[MCP Reinitialize] ${serverName} timed out before surfacing OAuth; initiating fallback OAuth flow`,
+        );
+
+        try {
+          await initiateOAuthFlowFallback({
+            user,
+            signal,
+            serverName,
+            flowManager,
+            oauthStart,
+            serverConfig,
+          });
+          oauthRequired = true;
+        } catch (oauthFallbackError) {
+          logger.error(
+            `[MCP Reinitialize] Failed to initiate fallback OAuth flow for ${serverName}`,
+            oauthFallbackError,
+          );
+        }
+      }
 
       if (isOAuthError || oauthRequired || isOAuthFlowInitiated) {
         logger.info(
@@ -143,7 +209,6 @@ async function reinitMCPServer({
             oauthStart,
             customUserVars,
             connectionTimeout,
-            configServers,
           });
 
           if (discoveryResult.tools && discoveryResult.tools.length > 0) {

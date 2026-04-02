@@ -3,7 +3,8 @@ const { logger } = require('@librechat/data-schemas');
 const { EModelEndpoint, Constants, ForkOptions } = require('librechat-data-provider');
 const { createImportBatchBuilder } = require('./importBatchBuilder');
 const BaseClient = require('~/app/clients/BaseClient');
-const { getConvo, getMessages } = require('~/models');
+const { getConvo } = require('~/models/Conversation');
+const { getMessages } = require('~/models/Message');
 
 /**
  * Helper function to clone messages with proper parent-child relationships and timestamps
@@ -357,15 +358,16 @@ function splitAtTargetLevel(messages, targetMessageId) {
  * @param {object} params - The parameters for duplicating the conversation.
  * @param {string} params.userId - The ID of the user duplicating the conversation.
  * @param {string} params.conversationId - The ID of the conversation to duplicate.
- * @param {string} [params.title] - Optional title override for the duplicate.
  * @returns {Promise<{ conversation: TConversation, messages: TMessage[] }>} The duplicated conversation and messages.
  */
-async function duplicateConversation({ userId, conversationId, title }) {
+async function duplicateConversation({ userId, conversationId }) {
+  // Get original conversation
   const originalConvo = await getConvo(userId, conversationId);
   if (!originalConvo) {
     throw new Error('Conversation not found');
   }
 
+  // Get original messages
   const originalMessages = await getMessages({
     user: userId,
     conversationId,
@@ -381,11 +383,14 @@ async function duplicateConversation({ userId, conversationId, title }) {
 
   cloneMessagesWithTimestamps(messagesToClone, importBatchBuilder);
 
-  const duplicateTitle = title || originalConvo.title;
-  const result = importBatchBuilder.finishConversation(duplicateTitle, new Date(), originalConvo);
+  const result = importBatchBuilder.finishConversation(
+    originalConvo.title,
+    new Date(),
+    originalConvo,
+  );
   await importBatchBuilder.saveBatch();
   logger.debug(
-    `user: ${userId} | New conversation "${duplicateTitle}" duplicated from conversation ID ${conversationId}`,
+    `user: ${userId} | New conversation "${originalConvo.title}" duplicated from conversation ID ${conversationId}`,
   );
 
   const conversation = await getConvo(userId, result.conversation.conversationId);

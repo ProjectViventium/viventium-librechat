@@ -19,8 +19,14 @@ let flowManager = null;
  */
 function getFlowStateManager(flowsCache) {
   if (!flowManager) {
+    const DEFAULT_FLOW_TTL_MINUTES = 10;
+    const flowTtlEnv = Number.parseInt(process.env.FLOW_STATE_TTL_MINUTES ?? '', 10);
+    const flowTtlMinutes =
+      Number.isFinite(flowTtlEnv) && flowTtlEnv > 0 ? flowTtlEnv : DEFAULT_FLOW_TTL_MINUTES;
+
     flowManager = new FlowStateManager(flowsCache, {
-      ttl: Time.ONE_MINUTE * 3,
+      // OAuth flows (notably Google) can take several minutes to complete.
+      ttl: Time.ONE_MINUTE * flowTtlMinutes,
     });
   }
   return flowManager;

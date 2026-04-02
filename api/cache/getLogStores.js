@@ -9,6 +9,12 @@ const {
   violationCache,
 } = require('@librechat/api');
 
+const DEFAULT_FLOW_TTL_MINUTES = 10;
+const flowTtlEnv = Number.parseInt(process.env.FLOW_STATE_TTL_MINUTES ?? '', 10);
+const FLOW_CACHE_TTL_MS =
+  (Number.isFinite(flowTtlEnv) && flowTtlEnv > 0 ? flowTtlEnv : DEFAULT_FLOW_TTL_MINUTES) *
+  Time.ONE_MINUTE;
+
 const namespaces = {
   [ViolationTypes.GENERAL]: new Keyv({ store: logFile, namespace: 'violations' }),
   [ViolationTypes.LOGINS]: violationCache(ViolationTypes.LOGINS),
@@ -47,7 +53,17 @@ const namespaces = {
   [CacheKeys.MODEL_QUERIES]: standardCache(CacheKeys.MODEL_QUERIES),
   [CacheKeys.AUDIO_RUNS]: standardCache(CacheKeys.AUDIO_RUNS, Time.TEN_MINUTES),
   [CacheKeys.MESSAGES]: standardCache(CacheKeys.MESSAGES, Time.ONE_MINUTE),
-  [CacheKeys.FLOWS]: standardCache(CacheKeys.FLOWS, Time.ONE_MINUTE * 10),
+  /* === VIVENTIUM START ===
+   * Feature: Shared OAuth flow cache across replicas.
+   * Purpose: Prevent MCP OAuth callback failures when initiate/callback land on different pods.
+   * Constraint: No Redis dependency (uses existing Mongo-backed Keyv store).
+   */
+  [CacheKeys.FLOWS]: new Keyv({
+    store: keyvMongo,
+    namespace: CacheKeys.FLOWS,
+    ttl: FLOW_CACHE_TTL_MS,
+  }),
+  /* === VIVENTIUM END === */
   [CacheKeys.OPENID_EXCHANGED_TOKENS]: standardCache(
     CacheKeys.OPENID_EXCHANGED_TOKENS,
     Time.TEN_MINUTES,

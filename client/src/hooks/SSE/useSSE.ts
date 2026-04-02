@@ -2,15 +2,32 @@ import { useEffect, useState } from 'react';
 import { v4 } from 'uuid';
 import { SSE } from 'sse.js';
 import { useSetRecoilState } from 'recoil';
-import { request, createPayload, removeNullishValues } from 'librechat-data-provider';
+import {
+  request,
+  Constants,
+  /* @ts-ignore */
+  createPayload,
+  LocalStorageKeys,
+  removeNullishValues,
+} from 'librechat-data-provider';
 import type { TMessage, TPayload, TSubmission, EventSubmission } from 'librechat-data-provider';
 import type { EventHandlerParams } from './useEventHandlers';
 import type { TResData } from '~/common';
 import { useGetStartupConfig, useGetUserBalance } from '~/data-provider';
 import { useAuthContext } from '~/hooks/AuthContext';
 import useEventHandlers from './useEventHandlers';
-import { clearAllDrafts } from '~/utils';
+import { createCortexPendingBuffer } from './cortexPendingBuffer';
 import store from '~/store';
+
+const clearDraft = (conversationId?: string | null) => {
+  if (conversationId) {
+    localStorage.removeItem(`${LocalStorageKeys.TEXT_DRAFT}${conversationId}`);
+    localStorage.removeItem(`${LocalStorageKeys.FILES_DRAFT}${conversationId}`);
+  } else {
+    localStorage.removeItem(`${LocalStorageKeys.TEXT_DRAFT}${Constants.NEW_CONVO}`);
+    localStorage.removeItem(`${LocalStorageKeys.FILES_DRAFT}${Constants.NEW_CONVO}`);
+  }
+};
 
 type ChatHelpers = Pick<
   EventHandlerParams,
@@ -86,6 +103,16 @@ export default function useSSE(
     let textIndex = null;
     clearStepMaps();
 
+    /* === VIVENTIUM START ===
+     * Feature: Background Cortices - SSE buffering
+     * Purpose: Cortex updates can arrive before the response message is created;
+     *          buffer them and flush on `created`.
+     */
+    const cortexBuffer = createCortexPendingBuffer({
+      getMessages,
+      setMessages,
+    });
+    /* === VIVENTIUM END === */
     const sse = new SSE(payloadData.server, {
       payload: JSON.stringify(payload),
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
@@ -104,7 +131,7 @@ export default function useSSE(
       const data = JSON.parse(e.data);
 
       if (data.final != null) {
-        clearAllDrafts(submission.conversation?.conversationId);
+        clearDraft(submission.conversation?.conversationId);
         try {
           finalHandler(data, submission as EventSubmission);
         } catch (error) {
@@ -125,6 +152,71 @@ export default function useSSE(
         };
 
         createdHandler(data, { ...submission, userMessage } as EventSubmission);
+        /* === VIVENTIUM START ===
+         * Feature: Background Cortices - Flush buffered cortex updates
+         */
+        const createdMessageId = data.message?.messageId ?? data.messageId;
+        if (typeof createdMessageId === 'string' && createdMessageId.length > 0) {
+          cortexBuffer.handleCreated(createdMessageId);
+        }
+        /* === VIVENTIUM END === */
+      /* === VIVENTIUM START ===
+       * Feature: Background Cortices - Handle real-time cortex status updates
+       */
+      } else if (data.event === 'on_cortex_update' && data.data) {
+        const cortexData = data.data;
+        console.log('[SSE] Cortex update:', cortexData.cortex_name, cortexData.status);
+
+        // Update message cortex status WITHOUT touching message.content (avoids index collisions with streaming/tool calls)
+        const messages = getMessages() ?? [];
+        const candidateMessageIds = [
+          typeof cortexData.runId === 'string' ? cortexData.runId : null,
+          typeof cortexData.userMessageId === 'string' && cortexData.userMessageId.length > 0
+            ? `${cortexData.userMessageId}_`
+            : null,
+          typeof cortexData.canonicalMessageId === 'string' ? cortexData.canonicalMessageId : null,
+        ].filter((id): id is string => Boolean(id));
+        const responseMessageId = candidateMessageIds[0];
+
+        // Find the response message
+        const responseIdx = messages.findIndex(
+          (m) =>
+            candidateMessageIds.some(
+              (id) => m.messageId === id || m.messageId === `${id}` || m.messageId?.startsWith(id),
+            ),
+        );
+
+
+        const cortexPart = {
+          type: cortexData.type,
+          cortex_id: cortexData.cortex_id,
+          cortex_name: cortexData.cortex_name,
+          status: cortexData.status,
+          confidence: cortexData.confidence,
+          reason: cortexData.reason,
+          insight: cortexData.insight,
+        };
+
+        if (responseIdx < 0) {
+          if (responseMessageId) {
+            cortexBuffer.handleCortexUpdate(responseMessageId, cortexPart);
+          }
+          return;
+        }
+        const updatedMessages = [...messages];
+        const response = { ...updatedMessages[responseIdx] };
+        const existing = (response as any).__viventiumCortexParts ?? [];
+        const cortexParts = Array.isArray(existing) ? [...existing] : [];
+        const idx = cortexParts.findIndex((p) => p?.cortex_id === cortexPart?.cortex_id);
+        if (idx >= 0) {
+          cortexParts[idx] = cortexPart;
+        } else {
+          cortexParts.push(cortexPart);
+        }
+        (response as any).__viventiumCortexParts = cortexParts;
+        updatedMessages[responseIdx] = response;
+        setMessages(updatedMessages);
+      /* === VIVENTIUM END === */
       } else if (data.event != null) {
         stepHandler(data, { ...submission, userMessage } as EventSubmission);
       } else if (data.sync != null) {

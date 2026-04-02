@@ -47,3 +47,9 @@ export { default as createPayload } from './createPayload';
 /* feedback */
 export * from './feedback';
 export * from './parameterSettings';
+/* === VIVENTIUM START ===
+ * Feature: Conversation Recall RAG identity helpers
+ * Added: 2026-02-19
+ */
+export * from './conversationRecall';
+/* === VIVENTIUM END === */

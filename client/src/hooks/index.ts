@@ -16,6 +16,12 @@ export * from './Prompts';
 export * from './Roles';
 export * from './Sharing';
 export * from './SSE';
+/* VIVENTIUM START
+ * Purpose: Export Viventium-specific hooks (background cortex follow-up).
+ * Details: docs/requirements_and_learnings/05_Open_Source_Modifications.md#librechat-hooks-index
+ */
+export * from './Viventium';
+/* VIVENTIUM END */
 export * from './AuthContext';
 export * from './ScreenshotContext';
 export * from './ApiErrorBoundaryContext';
@@ -26,7 +32,6 @@ export type { TranslationKeys } from './useLocalize';
 export { default as useTimeout } from './useTimeout';
 export { default as useNewConvo } from './useNewConvo';
 export { default as useLocalize } from './useLocalize';
-export { default as useFocusTrap } from './useFocusTrap';
 export { default as useFavorites } from './useFavorites';
 export { default as useChatBadges } from './useChatBadges';
 export { default as useScrollToRef } from './useScrollToRef';

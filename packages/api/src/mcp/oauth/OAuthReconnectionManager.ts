@@ -96,24 +96,6 @@ export class OAuthReconnectionManager {
     }
   }
 
-  /**
-   * Attempts to reconnect a single OAuth MCP server.
-   * @returns true if reconnection succeeded, false otherwise.
-   */
-  public async reconnectServer(userId: string, serverName: string): Promise<boolean> {
-    if (this.mcpManager == null) {
-      return false;
-    }
-
-    this.reconnectionsTracker.setActive(userId, serverName);
-    try {
-      await this.tryReconnect(userId, serverName);
-      return !this.reconnectionsTracker.isFailed(userId, serverName);
-    } catch {
-      return false;
-    }
-  }
-
   public clearReconnection(userId: string, serverName: string) {
     this.reconnectionsTracker.removeFailed(userId, serverName);
     this.reconnectionsTracker.removeActive(userId, serverName);
@@ -192,31 +174,42 @@ export class OAuthReconnectionManager {
       }
     }
 
-    // if the server has a valid (non-expired) access token, allow reconnect
+    /* === VIVENTIUM START ===
+     * Feature: Auto-reconnect OAuth MCP servers using refresh tokens.
+     * Purpose: Access tokens may be short-lived; if we have a valid refresh token we can
+     * reconnect and refresh during connect without requiring manual user action.
+     */
+    const now = new Date();
+
     const accessToken = await this.tokenMethods.findToken({
       userId,
       type: 'mcp_oauth',
       identifier: `mcp:${serverName}`,
     });
 
-    if (accessToken != null) {
-      const now = new Date();
-      if (!accessToken.expiresAt || accessToken.expiresAt >= now) {
-        return true;
-      }
-    }
-
-    // if the access token is expired or TTL-deleted, fall back to refresh token
     const refreshToken = await this.tokenMethods.findToken({
       userId,
-      type: 'mcp_oauth',
+      type: 'mcp_oauth_refresh',
       identifier: `mcp:${serverName}:refresh`,
     });
 
-    if (refreshToken == null) {
+    // If there are no tokens at all for this server, there's nothing to reconnect with.
+    if (accessToken == null && refreshToken == null) {
       return false;
     }
 
-    return true;
+    // If access token is present and valid, we can reconnect.
+    if (accessToken?.expiresAt && accessToken.expiresAt >= now) {
+      return true;
+    }
+
+    // If access token is missing/expired but refresh token is valid, we can reconnect and refresh.
+    if (refreshToken?.expiresAt && refreshToken.expiresAt >= now) {
+      return true;
+    }
+
+    // No usable token.
+    return false;
+    /* === VIVENTIUM END === */
   }
 }

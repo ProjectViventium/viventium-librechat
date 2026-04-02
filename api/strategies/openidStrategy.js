@@ -15,11 +15,18 @@ const {
   findOpenIDUser,
   getBalanceConfig,
   isEmailDomainAllowed,
-  resolveAppConfigForUser,
 } = require('@librechat/api');
 const { getStrategyFunctions } = require('~/server/services/Files/strategies');
 const { findUser, createUser, updateUser } = require('~/models');
 const { getAppConfig } = require('~/server/services/Config');
+/* === VIVENTIUM START ===
+ * Feature: Registration approval support for OpenID account creation.
+ * === VIVENTIUM END === */
+const {
+  isRegistrationApprovalEnabled,
+  markUserPendingApproval,
+  notifyAdminRegistration,
+} = require('~/server/services/viventium/registrationApprovalService');
 const getLogStores = require('~/cache/getLogStores');
 
 /**
@@ -317,139 +324,6 @@ function convertToUsername(input, defaultValue = '') {
 }
 
 /**
- * Exchange the access token for a Graph-scoped token using the On-Behalf-Of (OBO) flow.
- *
- * The original access token has the app's own audience (api://<client-id>), which Microsoft Graph
- * rejects. This exchange produces a token with audience https://graph.microsoft.com and the
- * minimum delegated scope (User.Read) required by /me/getMemberObjects.
- *
- * Uses a dedicated cache key (`${sub}:overage`) to avoid collisions with other OBO exchanges
- * in the codebase (userinfo, Graph principal search).
- *
- * @param {string} accessToken - The original access token from the OpenID tokenset
- * @param {string} sub - The subject identifier for cache keying
- * @returns {Promise<string>} A Graph-scoped access token
- * @see https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-on-behalf-of-flow
- */
-async function exchangeTokenForOverage(accessToken, sub) {
-  if (!openidConfig) {
-    throw new Error('[openidStrategy] OpenID config not initialized; cannot exchange OBO token');
-  }
-
-  const tokensCache = getLogStores(CacheKeys.OPENID_EXCHANGED_TOKENS);
-  const cacheKey = `${sub}:overage`;
-
-  const cached = await tokensCache.get(cacheKey);
-  if (cached?.access_token) {
-    logger.debug('[openidStrategy] Using cached Graph token for overage resolution');
-    return cached.access_token;
-  }
-
-  const grantResponse = await client.genericGrantRequest(
-    openidConfig,
-    'urn:ietf:params:oauth:grant-type:jwt-bearer',
-    {
-      scope: 'https://graph.microsoft.com/User.Read',
-      assertion: accessToken,
-      requested_token_use: 'on_behalf_of',
-    },
-  );
-
-  if (!grantResponse.access_token) {
-    throw new Error(
-      '[openidStrategy] OBO exchange succeeded but returned no access_token; cannot call Graph API',
-    );
-  }
-
-  const ttlMs =
-    Number.isFinite(grantResponse.expires_in) && grantResponse.expires_in > 0
-      ? grantResponse.expires_in * 1000
-      : 3600 * 1000;
-
-  await tokensCache.set(cacheKey, { access_token: grantResponse.access_token }, ttlMs);
-
-  return grantResponse.access_token;
-}
-
-/**
- * Resolve Azure AD groups when group overage is in effect (groups moved to _claim_names/_claim_sources).
- *
- * NOTE: Microsoft recommends treating _claim_names/_claim_sources as a signal only and using Microsoft Graph
- * to resolve group membership instead of calling the endpoint in _claim_sources directly.
- *
- * Before calling Graph, the access token is exchanged via the OBO flow to obtain a token with the
- * correct audience (https://graph.microsoft.com) and User.Read scope.
- *
- * @param {string} accessToken - Access token from the OpenID tokenset (app audience)
- * @param {string} sub - The subject identifier of the user (for OBO exchange and cache keying)
- * @returns {Promise<string[] | null>} Resolved group IDs or null on failure
- * @see https://learn.microsoft.com/en-us/entra/identity-platform/access-token-claims-reference#groups-overage-claim
- * @see https://learn.microsoft.com/en-us/graph/api/directoryobject-getmemberobjects
- */
-async function resolveGroupsFromOverage(accessToken, sub) {
-  try {
-    if (!accessToken) {
-      logger.error('[openidStrategy] Access token missing; cannot resolve group overage');
-      return null;
-    }
-
-    const graphToken = await exchangeTokenForOverage(accessToken, sub);
-
-    // Use /me/getMemberObjects so least-privileged delegated permission User.Read is sufficient
-    // when resolving the signed-in user's group membership.
-    const url = 'https://graph.microsoft.com/v1.0/me/getMemberObjects';
-
-    logger.debug(
-      `[openidStrategy] Detected group overage, resolving groups via Microsoft Graph getMemberObjects: ${url}`,
-    );
-
-    const fetchOptions = {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${graphToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ securityEnabledOnly: false }),
-    };
-
-    if (process.env.PROXY) {
-      const { ProxyAgent } = undici;
-      fetchOptions.dispatcher = new ProxyAgent(process.env.PROXY);
-    }
-
-    const response = await undici.fetch(url, fetchOptions);
-    if (!response.ok) {
-      logger.error(
-        `[openidStrategy] Failed to resolve groups via Microsoft Graph getMemberObjects: HTTP ${response.status} ${response.statusText}`,
-      );
-      return null;
-    }
-
-    const data = await response.json();
-
-    const values = Array.isArray(data?.value) ? data.value : null;
-    if (!values) {
-      logger.error(
-        '[openidStrategy] Unexpected response format when resolving groups via Microsoft Graph getMemberObjects',
-      );
-      return null;
-    }
-    const groupIds = values.filter((id) => typeof id === 'string');
-
-    logger.debug(
-      `[openidStrategy] Successfully resolved ${groupIds.length} groups via Microsoft Graph getMemberObjects`,
-    );
-    return groupIds;
-  } catch (err) {
-    logger.error(
-      '[openidStrategy] Error resolving groups via Microsoft Graph getMemberObjects:',
-      err,
-    );
-    return null;
-  }
-}
-
-/**
  * Process OpenID authentication tokenset and userinfo
  * This is the core logic extracted from the passport strategy callback
  * Can be reused by both the passport strategy and proxy authentication
@@ -469,12 +343,12 @@ async function processOpenIDAuth(tokenset, existingUsersOnly = false) {
     Object.assign(userinfo, providerUserinfo);
   }
 
+  const appConfig = await getAppConfig();
+  /** Azure AD sometimes doesn't return email, use preferred_username as fallback */
   const email = getOpenIdEmail(userinfo);
-
-  const baseConfig = await getAppConfig({ baseOnly: true });
-  if (!isEmailDomainAllowed(email, baseConfig?.registration?.allowedDomains)) {
+  if (!isEmailDomainAllowed(email, appConfig?.registration?.allowedDomains)) {
     logger.error(
-      `[OpenID Strategy] Authentication blocked - email domain not allowed [Identifier: ${email}]`,
+      `[OpenID Strategy] Authentication blocked - email domain not allowed [Email: ${userinfo.email}]`,
     );
     throw new Error('Email domain not allowed');
   }
@@ -493,20 +367,9 @@ async function processOpenIDAuth(tokenset, existingUsersOnly = false) {
     throw new Error(ErrorTypes.AUTH_FAILED);
   }
 
-  const appConfig = user?.tenantId ? await resolveAppConfigForUser(getAppConfig, user) : baseConfig;
-
-  if (!isEmailDomainAllowed(email, appConfig?.registration?.allowedDomains)) {
-    logger.error(
-      `[OpenID Strategy] Authentication blocked - email domain not allowed [Identifier: ${email}]`,
-    );
-    throw new Error('Email domain not allowed');
-  }
-
   const fullName = getFullName(userinfo);
 
   const requiredRole = process.env.OPENID_REQUIRED_ROLE;
-  let resolvedOverageGroups = null;
-
   if (requiredRole) {
     const requiredRoles = requiredRole
       .split(',')
@@ -523,27 +386,6 @@ async function processOpenIDAuth(tokenset, existingUsersOnly = false) {
     }
 
     let roles = get(decodedToken, requiredRoleParameterPath);
-
-    // Handle Azure AD group overage for ID token groups: when hasgroups or _claim_* indicate overage,
-    // resolve groups via Microsoft Graph instead of relying on token group values.
-    const hasOverage =
-      decodedToken?.hasgroups ||
-      (decodedToken?._claim_names?.groups &&
-        decodedToken?._claim_sources?.[decodedToken._claim_names.groups]);
-
-    if (
-      requiredRoleTokenKind === 'id' &&
-      requiredRoleParameterPath === 'groups' &&
-      decodedToken &&
-      hasOverage
-    ) {
-      const overageGroups = await resolveGroupsFromOverage(tokenset.access_token, claims.sub);
-      if (overageGroups) {
-        roles = overageGroups;
-        resolvedOverageGroups = overageGroups;
-      }
-    }
-
     if (!roles || (!Array.isArray(roles) && typeof roles !== 'string')) {
       logger.error(
         `[openidStrategy] Key '${requiredRoleParameterPath}' not found in ${requiredRoleTokenKind} token!`,
@@ -555,9 +397,7 @@ async function processOpenIDAuth(tokenset, existingUsersOnly = false) {
       throw new Error(`You must have ${rolesList} role to log in.`);
     }
 
-    const roleValues = Array.isArray(roles) ? roles : roles.split(/[\s,]+/).filter(Boolean);
-
-    if (!requiredRoles.some((role) => roleValues.includes(role))) {
+    if (!requiredRoles.some((role) => roles.includes(role))) {
       const rolesList =
         requiredRoles.length === 1
           ? `"${requiredRoles[0]}"`
@@ -592,6 +432,19 @@ async function processOpenIDAuth(tokenset, existingUsersOnly = false) {
 
     const balanceConfig = getBalanceConfig(appConfig);
     user = await createUser(user, balanceConfig, true, true);
+    /* === VIVENTIUM START ===
+     * Feature: Registration approval workflow for OpenID providers.
+     * === VIVENTIUM END === */
+    if (isRegistrationApprovalEnabled()) {
+      await markUserPendingApproval(user._id.toString());
+      await notifyAdminRegistration({
+        userId: user._id.toString(),
+        name: fullName,
+        email: email || '',
+        provider: 'openid',
+      });
+      user.viventiumApprovalStatus = 'pending';
+    }
   } else {
     user.provider = 'openid';
     user.openidId = userinfo.sub;
@@ -627,33 +480,14 @@ async function processOpenIDAuth(tokenset, existingUsersOnly = false) {
         throw new Error('Invalid admin role token kind');
     }
 
-    let adminRoles = get(adminRoleObject, adminRoleParameterPath);
+    const adminRoles = get(adminRoleObject, adminRoleParameterPath);
 
-    // Handle Azure AD group overage for admin role when using ID token groups
-    if (adminRoleTokenKind === 'id' && adminRoleParameterPath === 'groups' && adminRoleObject) {
-      const hasAdminOverage =
-        adminRoleObject.hasgroups ||
-        (adminRoleObject._claim_names?.groups &&
-          adminRoleObject._claim_sources?.[adminRoleObject._claim_names.groups]);
-
-      if (hasAdminOverage) {
-        const overageGroups =
-          resolvedOverageGroups ||
-          (await resolveGroupsFromOverage(tokenset.access_token, claims.sub));
-        if (overageGroups) {
-          adminRoles = overageGroups;
-        }
-      }
-    }
-
-    let adminRoleValues = [];
-    if (Array.isArray(adminRoles)) {
-      adminRoleValues = adminRoles;
-    } else if (typeof adminRoles === 'string') {
-      adminRoleValues = adminRoles.split(/[\s,]+/).filter(Boolean);
-    }
-
-    if (adminRoles && (adminRoles === true || adminRoleValues.includes(adminRole))) {
+    if (
+      adminRoles &&
+      (adminRoles === true ||
+        adminRoles === adminRole ||
+        (Array.isArray(adminRoles) && adminRoles.includes(adminRole)))
+    ) {
       user.role = SystemRoles.ADMIN;
       logger.info(`[openidStrategy] User ${username} is an admin based on role: ${adminRole}`);
     } else if (user.role === SystemRoles.ADMIN) {
@@ -713,7 +547,6 @@ async function processOpenIDAuth(tokenset, existingUsersOnly = false) {
     tokenset,
     federatedTokens: {
       access_token: tokenset.access_token,
-      id_token: tokenset.id_token,
       refresh_token: tokenset.refresh_token,
       expires_at: tokenset.expires_at,
     },

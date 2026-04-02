@@ -4,6 +4,10 @@ import {
   ErrorTypes,
   EModelEndpoint,
   EToolResources,
+  FileContext,
+  Tools,
+  buildConversationRecallFileId,
+  ConversationRecallScope,
   paramEndpoints,
   isAgentsEndpoint,
   replaceSpecialVars,
@@ -30,15 +34,13 @@ import {
 import { filterFilesByEndpointConfig } from '~/files';
 import { generateArtifactsPrompt } from '~/prompts';
 import { getProviderConfig } from '~/endpoints';
+import { logger } from '@librechat/data-schemas';
+import {
+  getConversationRecallRuntimeScope,
+  mergeConversationRecallResources,
+  ensureConversationRecallTool,
+} from './conversationRecall';
 import { primeResources } from './resources';
-import type { TFilterFilesByAgentAccess } from './resources';
-
-/**
- * Fraction of context budget reserved as headroom when no explicit maxContextTokens is set.
- * Reduced from 0.10 to 0.05 alongside the introduction of summarization, which actively
- * manages overflow. `createRun` can further override this via `SummarizationConfig.reserveRatio`.
- */
-const DEFAULT_RESERVE_RATIO = 0.05;
 
 /**
  * Extended agent type with additional fields needed after initialization
@@ -48,8 +50,6 @@ export type InitializedAgent = Agent & {
   attachments: IMongoFile[];
   toolContextMap: Record<string, unknown>;
   maxContextTokens: number;
-  /** Pre-ratio context budget (agentMaxContextNum - maxOutputTokensNum). Used by createRun to apply a configurable reserve ratio. */
-  baseContextTokens?: number;
   useLegacyContent: boolean;
   resendFiles: boolean;
   tool_resources?: AgentToolResources;
@@ -62,10 +62,6 @@ export type InitializedAgent = Agent & {
   toolDefinitions?: LCTool[];
   /** Precomputed flag indicating if any tools have defer_loading enabled (for efficient runtime checks) */
   hasDeferredTools?: boolean;
-  /** Whether the actions capability is enabled (resolved during tool loading) */
-  actionsEnabled?: boolean;
-  /** Maximum characters allowed in a single tool result before truncation. */
-  maxToolResultChars?: number;
 };
 
 /**
@@ -104,7 +100,6 @@ export interface InitializeAgentParams {
     /** Serializable tool definitions for event-driven mode */
     toolDefinitions?: LCTool[];
     hasDeferredTools?: boolean;
-    actionsEnabled?: boolean;
   } | null>;
   /** Endpoint option (contains model_parameters and endpoint info) */
   endpointOption?: Partial<TEndpointOption>;
@@ -123,9 +118,7 @@ export interface InitializeAgentDbMethods extends EndpointDbMethods {
   /** Update usage tracking for multiple files */
   updateFilesUsage: (files: Array<{ file_id: string }>, fileIds?: string[]) => Promise<unknown[]>;
   /** Get files from database */
-  getFiles: (filter: unknown, sort: unknown, select: unknown) => Promise<unknown[]>;
-  /** Filter files by agent access permissions (ownership or agent attachment) */
-  filterFilesByAgentAccess?: TFilterFilesByAgentAccess;
+  getFiles: (filter: unknown, sort: unknown, select: unknown, opts?: unknown) => Promise<unknown[]>;
   /** Get tool files by IDs (user-uploaded files only, code files handled separately) */
   getToolFilesByIds: (fileIds: string[], toolSet: Set<EToolResources>) => Promise<unknown[]>;
   /** Get conversation file IDs */
@@ -282,10 +275,9 @@ export async function initializeAgent(
     });
   }
 
-  const { attachments: primedAttachments, tool_resources } = await primeResources({
+  const { attachments: primedAttachments, tool_resources: primedToolResources } = await primeResources({
     req: req as never,
     getFiles: db.getFiles as never,
-    filterFiles: db.filterFilesByAgentAccess,
     appConfig: req.config,
     agentId: agent.id,
     attachments: currentFiles
@@ -295,13 +287,81 @@ export async function initializeAgent(
     requestFileSet: new Set(requestFiles?.map((file) => file.file_id)),
   });
 
+  let tool_resources = primedToolResources;
+
+  /* === VIVENTIUM START ===
+   * Feature: Conversation Recall runtime file_search resource injection
+   *
+   * Purpose:
+   * - Reuse the existing file_search pipeline for conversation-history retrieval.
+   * - Scope selection policy:
+   *   1) Agent-level `conversation_recall_agent_only` => agent-only corpus
+   *   2) User personalization `conversation_recall` => all-conversations corpus
+   *
+  * Added: 2026-02-19
+  * === VIVENTIUM END === */
+  const conversationRecallScope = getConversationRecallRuntimeScope({
+    user: (req.user ?? null) as unknown as TUser | null,
+    agent,
+  });
+  const conversationRecallVectorEnabled = Boolean(process.env.RAG_API_URL?.trim());
+
+  if (conversationRecallScope !== 'none' && req.user?.id && conversationRecallVectorEnabled) {
+    try {
+      const recallFileId =
+        conversationRecallScope === 'agent'
+          ? buildConversationRecallFileId({
+              userId: req.user.id,
+              scope: ConversationRecallScope.agent,
+              agentId: agent.id,
+            })
+          : buildConversationRecallFileId({
+              userId: req.user.id,
+              scope: ConversationRecallScope.all,
+            });
+
+      const conversationRecallFiles =
+        (((await db.getFiles(
+          {
+            user: req.user.id,
+            context: FileContext.conversation_recall,
+            file_id: recallFileId,
+          },
+          null,
+          { text: 0 },
+          { userId: req.user.id, agentId: agent.id },
+        )) as TFile[]) ?? []) as TFile[];
+
+      if (conversationRecallFiles.length > 0) {
+        agent.tools = ensureConversationRecallTool(agent.tools);
+        tool_resources = mergeConversationRecallResources({
+          tool_resources,
+          recallFiles: conversationRecallFiles,
+        });
+      } else {
+        logger.debug('[initializeAgent] No conversation recall corpus found for current scope', {
+          userId: req.user.id,
+          agentId: agent.id,
+          scope: conversationRecallScope,
+        });
+      }
+    } catch (error) {
+      logger.error('[initializeAgent] Failed to load conversation recall resources', error);
+    }
+  } else if (conversationRecallScope !== 'none' && req.user?.id && !conversationRecallVectorEnabled) {
+    logger.debug('[initializeAgent] Skipping conversation recall corpus attachment because RAG is unavailable', {
+      userId: req.user.id,
+      agentId: agent.id,
+      scope: conversationRecallScope,
+    });
+  }
+
   const {
     toolRegistry,
     toolContextMap,
     userMCPAuthMap,
     toolDefinitions,
     hasDeferredTools,
-    actionsEnabled,
     tools: structuredTools,
   } = (await loadTools?.({
     req,
@@ -319,10 +379,9 @@ export async function initializeAgent(
     toolRegistry: undefined,
     toolDefinitions: [],
     hasDeferredTools: false,
-    actionsEnabled: undefined,
   };
 
-  const { getOptions, overrideProvider, customEndpointConfig } = getProviderConfig({
+  const { getOptions, overrideProvider } = getProviderConfig({
     provider,
     appConfig: req.config,
   });
@@ -400,10 +459,17 @@ export async function initializeAgent(
   }
 
   if (agent.instructions && agent.instructions !== '') {
+    /* === VIVENTIUM START ===
+     * Feature: Pass client timezone into special variable replacement
+     * Purpose: Render {{current_date}}/{{current_datetime}} in the user's timezone.
+     * Added: 2026-02-01
+     */
     agent.instructions = replaceSpecialVars({
       text: agent.instructions,
       user: req.user ? (req.user as unknown as TUser) : null,
+      timeZone: req?.body?.clientTimezone,
     });
+    /* === VIVENTIUM END === */
   }
 
   if (typeof agent.artifacts === 'string' && agent.artifacts !== '') {
@@ -416,24 +482,10 @@ export async function initializeAgent(
 
   const agentMaxContextNum = Number(agentMaxContextTokens) || 18000;
   const maxOutputTokensNum = Number(maxOutputTokens) || 0;
-  const baseContextTokens = Math.max(0, agentMaxContextNum - maxOutputTokensNum);
 
   const finalAttachments: IMongoFile[] = (primedAttachments ?? [])
     .filter((a): a is TFile => a != null)
     .map((a) => a as unknown as IMongoFile);
-
-  const endpointConfigs = req.config?.endpoints;
-  const providerConfig =
-    customEndpointConfig ?? endpointConfigs?.[agent.provider as keyof typeof endpointConfigs];
-  const providerMaxToolResultChars =
-    providerConfig != null &&
-    typeof providerConfig === 'object' &&
-    !Array.isArray(providerConfig) &&
-    'maxToolResultChars' in providerConfig
-      ? (providerConfig.maxToolResultChars as number | undefined)
-      : undefined;
-  const maxToolResultCharsResolved =
-    providerMaxToolResultChars ?? endpointConfigs?.all?.maxToolResultChars;
 
   const initializedAgent: InitializedAgent = {
     ...agent,
@@ -443,17 +495,11 @@ export async function initializeAgent(
     userMCPAuthMap,
     toolDefinitions,
     hasDeferredTools,
-    actionsEnabled,
-    baseContextTokens,
     attachments: finalAttachments,
     toolContextMap: toolContextMap ?? {},
     useLegacyContent: !!options.useLegacyContent,
     tools: (tools ?? []) as GenericTool[] & string[],
-    maxToolResultChars: maxToolResultCharsResolved,
-    maxContextTokens:
-      maxContextTokens != null && maxContextTokens > 0
-        ? maxContextTokens
-        : Math.max(1024, Math.round(baseContextTokens * (1 - DEFAULT_RESERVE_RATIO))),
+    maxContextTokens: Math.round((agentMaxContextNum - maxOutputTokensNum) * 0.9),
   };
 
   return initializedAgent;

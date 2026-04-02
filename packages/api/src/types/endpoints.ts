@@ -10,6 +10,13 @@ export type TCustomEndpointsConfig = Partial<{ [key: string]: Omit<TConfig, 'ord
 export interface UserKeyValues {
   apiKey?: string;
   baseURL?: string;
+  authToken?: string;
+  headers?: Record<string, string>;
+  oauthProvider?: string;
+  oauthType?: string;
+  refreshToken?: string;
+  oauthExpiresAt?: number;
+  accountId?: string;
 }
 
 /**
@@ -25,6 +32,13 @@ export type GetUserKeyValuesFunction = (params: {
   name: string;
 }) => Promise<UserKeyValues>;
 
+export type UpdateUserKeyFunction = (params: {
+  userId: string;
+  name: string;
+  value: string;
+  expiresAt?: Date | null;
+}) => Promise<unknown>;
+
 /**
  * Database methods required for endpoint initialization
  * These are passed in at invocation time to allow for dependency injection
@@ -34,6 +48,8 @@ export interface EndpointDbMethods {
   getUserKey: GetUserKeyFunction;
   /** Get parsed key values object (used for apiKey + baseURL combinations) */
   getUserKeyValues: GetUserKeyValuesFunction;
+  /** Update parsed key values when a connected account token is refreshed */
+  updateUserKey?: UpdateUserKeyFunction;
 }
 
 /**

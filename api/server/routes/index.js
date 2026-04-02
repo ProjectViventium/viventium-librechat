@@ -2,11 +2,6 @@ const accessPermissions = require('./accessPermissions');
 const assistants = require('./assistants');
 const categories = require('./categories');
 const adminAuth = require('./admin/auth');
-const adminConfig = require('./admin/config');
-const adminGrants = require('./admin/grants');
-const adminGroups = require('./admin/groups');
-const adminRoles = require('./admin/roles');
-const adminUsers = require('./admin/users');
 const endpoints = require('./endpoints');
 const staticRoute = require('./static');
 const messages = require('./messages');
@@ -31,21 +26,24 @@ const auth = require('./auth');
 const keys = require('./keys');
 const user = require('./user');
 const mcp = require('./mcp');
+/* === VIVENTIUM START ===
+ * Feature: Connected Accounts OAuth routes.
+ * === VIVENTIUM END === */
+const connectedAccounts = require('./connectedAccounts');
+// === VIVENTIUM START - Voice Call Routes ===
+const viventium = require('./viventium');
+// === VIVENTIUM END ===
 
 module.exports = {
   mcp,
   auth,
   adminAuth,
-  adminConfig,
-  adminGrants,
-  adminGroups,
-  adminRoles,
-  adminUsers,
   keys,
   apiKeys,
   user,
   tags,
   roles,
+  connectedAccounts,
   oauth,
   files,
   share,
@@ -66,4 +64,7 @@ module.exports = {
   categories,
   staticRoute,
   accessPermissions,
+  // === VIVENTIUM START ===
+  viventium,
+  // === VIVENTIUM END ===
 };

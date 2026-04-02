@@ -19,7 +19,7 @@ describe('useArtifactProps', () => {
       const { result } = renderHook(() => useArtifactProps({ artifact }));
 
       expect(result.current.fileKey).toBe('content.md');
-      expect(result.current.template).toBe('static');
+      expect(result.current.template).toBe('react-ts');
     });
 
     it('should handle text/plain type with content.md as fileKey', () => {
@@ -31,7 +31,7 @@ describe('useArtifactProps', () => {
       const { result } = renderHook(() => useArtifactProps({ artifact }));
 
       expect(result.current.fileKey).toBe('content.md');
-      expect(result.current.template).toBe('static');
+      expect(result.current.template).toBe('react-ts');
     });
 
     it('should include content.md in files with original markdown', () => {
@@ -46,7 +46,7 @@ describe('useArtifactProps', () => {
       expect(result.current.files['content.md']).toBe(markdownContent);
     });
 
-    it('should include index.html with static markdown rendering', () => {
+    it('should include App.tsx with wrapped markdown renderer', () => {
       const artifact = createArtifact({
         type: 'text/markdown',
         content: '# Test',
@@ -54,8 +54,8 @@ describe('useArtifactProps', () => {
 
       const { result } = renderHook(() => useArtifactProps({ artifact }));
 
-      expect(result.current.files['index.html']).toContain('<!DOCTYPE html>');
-      expect(result.current.files['index.html']).toContain('marked.parse');
+      expect(result.current.files['App.tsx']).toContain('MarkdownRenderer');
+      expect(result.current.files['App.tsx']).toContain('import React from');
     });
 
     it('should include all required markdown files', () => {
@@ -66,8 +66,12 @@ describe('useArtifactProps', () => {
 
       const { result } = renderHook(() => useArtifactProps({ artifact }));
 
+      // Check all required files are present
       expect(result.current.files['content.md']).toBeDefined();
-      expect(result.current.files['index.html']).toBeDefined();
+      expect(result.current.files['App.tsx']).toBeDefined();
+      expect(result.current.files['index.tsx']).toBeDefined();
+      expect(result.current.files['/components/ui/MarkdownRenderer.tsx']).toBeDefined();
+      expect(result.current.files['markdown.css']).toBeDefined();
     });
 
     it('should escape special characters in markdown content', () => {
@@ -78,11 +82,13 @@ describe('useArtifactProps', () => {
 
       const { result } = renderHook(() => useArtifactProps({ artifact }));
 
+      // Original content should be preserved in content.md
       expect(result.current.files['content.md']).toContain('`const x = 1;`');
       expect(result.current.files['content.md']).toContain('C:\\Users');
 
-      expect(result.current.files['index.html']).toContain('\\`');
-      expect(result.current.files['index.html']).toContain('\\\\');
+      // App.tsx should have escaped content
+      expect(result.current.files['App.tsx']).toContain('\\`');
+      expect(result.current.files['App.tsx']).toContain('\\\\');
     });
 
     it('should handle empty markdown content', () => {
@@ -106,7 +112,7 @@ describe('useArtifactProps', () => {
       expect(result.current.files['content.md']).toBe('# No content provided');
     });
 
-    it('should have no custom dependencies for markdown (uses CDN)', () => {
+    it('should provide marked-react dependency', () => {
       const artifact = createArtifact({
         type: 'text/markdown',
         content: '# Test',
@@ -114,8 +120,7 @@ describe('useArtifactProps', () => {
 
       const { result } = renderHook(() => useArtifactProps({ artifact }));
 
-      const deps = result.current.sharedProps.customSetup?.dependencies ?? {};
-      expect(deps).toEqual({});
+      expect(result.current.sharedProps.customSetup?.dependencies).toHaveProperty('marked-react');
     });
 
     it('should update files when content changes', () => {
@@ -130,6 +135,7 @@ describe('useArtifactProps', () => {
 
       expect(result.current.files['content.md']).toBe('# Original');
 
+      // Update the artifact content
       const updatedArtifact = createArtifact({
         ...artifact,
         content: '# Updated',
@@ -193,6 +199,8 @@ describe('useArtifactProps', () => {
 
       const { result } = renderHook(() => useArtifactProps({ artifact }));
 
+      // Language parameter should not affect markdown handling
+      // It checks the type directly, not the key
       expect(result.current.fileKey).toBe('content.md');
       expect(result.current.files['content.md']).toBe('# Test');
     });
@@ -204,6 +212,7 @@ describe('useArtifactProps', () => {
 
       const { result } = renderHook(() => useArtifactProps({ artifact }));
 
+      // Should use default behavior
       expect(result.current.template).toBe('static');
     });
   });

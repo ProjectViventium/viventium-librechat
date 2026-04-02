@@ -6,6 +6,7 @@ const agentCategorySchema = new Schema<IAgentCategory>(
     value: {
       type: String,
       required: true,
+      unique: true,
       trim: true,
       lowercase: true,
       index: true,
@@ -34,17 +35,12 @@ const agentCategorySchema = new Schema<IAgentCategory>(
       type: Boolean,
       default: false,
     },
-    tenantId: {
-      type: String,
-      index: true,
-    },
   },
   {
     timestamps: true,
   },
 );
 
-agentCategorySchema.index({ value: 1, tenantId: 1 }, { unique: true });
 agentCategorySchema.index({ isActive: 1, order: 1 });
 agentCategorySchema.index({ order: 1, label: 1 });
 

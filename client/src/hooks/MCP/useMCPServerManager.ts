@@ -2,14 +2,7 @@ import { useCallback, useState, useMemo, useRef, useEffect } from 'react';
 import { useAtom } from 'jotai';
 import { useToastContext } from '@librechat/client';
 import { useQueryClient } from '@tanstack/react-query';
-import {
-  Constants,
-  QueryKeys,
-  MCPOptions,
-  Permissions,
-  ResourceType,
-  PermissionTypes,
-} from 'librechat-data-provider';
+import { Constants, QueryKeys, MCPOptions, ResourceType } from 'librechat-data-provider';
 import {
   useCancelMCPOAuthMutation,
   useUpdateUserPluginsMutation,
@@ -18,7 +11,7 @@ import {
 } from 'librechat-data-provider/react-query';
 import type { TUpdateUserPlugins, TPlugin, MCPServersResponse } from 'librechat-data-provider';
 import type { ConfigFieldDetail } from '~/common';
-import { useLocalize, useHasAccess, useMCPSelect, useMCPConnectionStatus } from '~/hooks';
+import { useLocalize, useMCPSelect, useMCPConnectionStatus } from '~/hooks';
 import { useGetStartupConfig, useMCPServersQuery } from '~/data-provider';
 import { mcpServerInitStatesAtom, getServerInitState } from '~/store/mcp';
 import type { MCPServerInitState } from '~/store/mcp';
@@ -35,26 +28,50 @@ export interface MCPServerDefinition {
 // The init states (isInitializing, isCancellable, etc.) are stored in the global Jotai atom
 type PollIntervals = Record<string, NodeJS.Timeout | null>;
 
-export function useMCPServerManager({
-  conversationId,
-  storageContextKey,
-}: { conversationId?: string | null; storageContextKey?: string } = {}) {
+/* === VIVENTIUM START ===
+ * Feature: Cross-surface silent MCP auto-reconnect coordination.
+ * Purpose: The MCP manager hook is mounted in multiple UI surfaces at once.
+ * Shared coordination prevents each surface from launching duplicate background
+ * reconnects for the same server after a refresh or restart.
+ */
+const sharedAutoReconnectInFlight = new Set<string>();
+const sharedAutoReconnectBlocked = new Set<string>();
+const sharedAutoReconnectTargetRefCounts = new Map<string, number>();
+
+function retainSharedAutoReconnectTarget(serverName: string) {
+  sharedAutoReconnectTargetRefCounts.set(
+    serverName,
+    (sharedAutoReconnectTargetRefCounts.get(serverName) ?? 0) + 1,
+  );
+}
+
+function clearSharedAutoReconnectState(serverName: string) {
+  sharedAutoReconnectInFlight.delete(serverName);
+  sharedAutoReconnectBlocked.delete(serverName);
+}
+
+function releaseSharedAutoReconnectTarget(serverName: string) {
+  const nextCount = (sharedAutoReconnectTargetRefCounts.get(serverName) ?? 0) - 1;
+  if (nextCount > 0) {
+    sharedAutoReconnectTargetRefCounts.set(serverName, nextCount);
+    return;
+  }
+
+  sharedAutoReconnectTargetRefCounts.delete(serverName);
+  clearSharedAutoReconnectState(serverName);
+}
+/* === VIVENTIUM END === */
+
+export function useMCPServerManager({ conversationId }: { conversationId?: string | null } = {}) {
   const localize = useLocalize();
   const queryClient = useQueryClient();
   const { showToast } = useToastContext();
-  /** Retained for `interface.mcpServers.placeholder` used by `placeholderText` below */
-  const { data: startupConfig } = useGetStartupConfig();
-  const canUseMcp = useHasAccess({
-    permissionType: PermissionTypes.MCP_SERVERS,
-    permission: Permissions.USE,
-  });
+  const { data: startupConfig } = useGetStartupConfig(); // Keep for UI config only
 
-  const { data: loadedServers, isLoading } = useMCPServersQuery({ enabled: canUseMcp });
+  const { data: loadedServers, isLoading } = useMCPServersQuery();
 
   // Fetch effective permissions for all MCP servers
-  const { data: permissionsMap } = useGetAllEffectivePermissionsQuery(ResourceType.MCPSERVER, {
-    enabled: canUseMcp,
-  });
+  const { data: permissionsMap } = useGetAllEffectivePermissionsQuery(ResourceType.MCPSERVER);
 
   const [isConfigModalOpen, setIsConfigModalOpen] = useState(false);
   const [selectedToolForConfig, setSelectedToolForConfig] = useState<TPlugin | null>(null);
@@ -90,10 +107,16 @@ export function useMCPServerManager({
 
   const { mcpValues, setMCPValues, isPinned, setIsPinned } = useMCPSelect({
     conversationId,
-    storageContextKey,
     servers: selectableServers,
   });
   const mcpValuesRef = useRef(mcpValues);
+  /* === VIVENTIUM START ===
+   * Feature: Shared reconnect target registration.
+   * Purpose: Track which servers are currently eligible for silent reconnect across
+   * all mounted UI surfaces before any background initialize call is attempted.
+   */
+  const registeredAutoReconnectTargetsRef = useRef<Set<string>>(new Set());
+  /* === VIVENTIUM END === */
 
   // fixes the issue where OAuth flows would deselect all the servers except the one that is being authenticated on success
   useEffect(() => {
@@ -428,6 +451,125 @@ export function useMCPServerManager({
     [serverInitStates],
   );
 
+  /* === VIVENTIUM START ===
+   * Feature: Include always-on MCP servers in silent reconnect.
+   * Purpose: Ensure non-chatMenu servers like scheduling-cortex are warmed
+   * after restarts even when they are not manually selected in UI.
+   */
+  const alwaysOnReconnectServers = useMemo(() => {
+    const defaults = ['scheduling-cortex'];
+    const availableServerNames = new Set(availableMCPServers.map((server) => server.serverName));
+    return defaults.filter((serverName) => availableServerNames.has(serverName));
+  }, [availableMCPServers]);
+  /* === VIVENTIUM END === */
+
+  /* === VIVENTIUM START ===
+   * Feature: Stable reconnect target list shared by all MCP panels.
+   * Purpose: Reuse the exact same target set for registration and reconnect effects.
+   */
+  const reconnectTargets = useMemo(
+    () => Array.from(new Set<string>([...(mcpValues ?? []), ...alwaysOnReconnectServers])),
+    [alwaysOnReconnectServers, mcpValues],
+  );
+  /* === VIVENTIUM END === */
+
+  /* === VIVENTIUM START ===
+   * Feature: Module-level reconnect target reference counting.
+   * Purpose: Only clear shared reconnect state when the last mounted surface stops
+   * targeting a server, which avoids one panel undoing another panel's reconnect work.
+   */
+  useEffect(() => {
+    const nextTargets = new Set(reconnectTargets);
+    const previousTargets = registeredAutoReconnectTargetsRef.current;
+
+    previousTargets.forEach((serverName) => {
+      if (!nextTargets.has(serverName)) {
+        releaseSharedAutoReconnectTarget(serverName);
+      }
+    });
+
+    nextTargets.forEach((serverName) => {
+      if (!previousTargets.has(serverName)) {
+        retainSharedAutoReconnectTarget(serverName);
+      }
+    });
+
+    registeredAutoReconnectTargetsRef.current = nextTargets;
+  }, [reconnectTargets]);
+
+  useEffect(() => {
+    return () => {
+      registeredAutoReconnectTargetsRef.current.forEach((serverName) => {
+        releaseSharedAutoReconnectTarget(serverName);
+      });
+      registeredAutoReconnectTargetsRef.current = new Set();
+    };
+  }, []);
+  /* === VIVENTIUM END === */
+
+  /* === VIVENTIUM START ===
+   * Feature: Silent reinitialize pass for selected MCP servers that are disconnected.
+   * Behavior:
+   * - Never auto-opens OAuth windows.
+   * - If OAuth is required, it records a block for that server and waits for user action.
+   *
+   * Note: This effect must be declared after `connectionStatus`, `initializeServer`, and
+   * `isInitializing` are initialized to avoid TDZ runtime errors in production bundles.
+   */
+  useEffect(() => {
+    if (!connectionStatus || reconnectTargets.length === 0) {
+      return;
+    }
+
+    for (const serverName of reconnectTargets) {
+      const serverStatus = connectionStatus[serverName];
+      if (!serverStatus) {
+        continue;
+      }
+
+      /* === VIVENTIUM START ===
+       * Feature: Prevent hidden OAuth initiation during silent reconnect.
+       * Purpose: OAuth-backed servers must be explicitly user-initiated so the
+       * auth window opens. Server-side token warmup already covers saved tokens.
+       * === VIVENTIUM END === */
+      if (serverStatus.requiresOAuth) {
+        clearSharedAutoReconnectState(serverName);
+        continue;
+      }
+
+      if (
+        serverStatus.connectionState === 'connected' ||
+        serverStatus.connectionState === 'connecting'
+      ) {
+        clearSharedAutoReconnectState(serverName);
+        continue;
+      }
+
+      if (
+        sharedAutoReconnectBlocked.has(serverName) ||
+        sharedAutoReconnectInFlight.has(serverName) ||
+        isInitializing(serverName)
+      ) {
+        continue;
+      }
+
+      sharedAutoReconnectInFlight.add(serverName);
+      initializeServer(serverName, false)
+        .then((result) => {
+          if (result?.oauthRequired && result?.oauthUrl) {
+            sharedAutoReconnectBlocked.add(serverName);
+          }
+        })
+        .catch((error) => {
+          console.debug(`[MCP Manager] Silent auto-reconnect failed for ${serverName}:`, error);
+        })
+        .finally(() => {
+          sharedAutoReconnectInFlight.delete(serverName);
+        });
+    }
+  }, [connectionStatus, initializeServer, isInitializing, reconnectTargets]);
+  /* === VIVENTIUM END === */
+
   const isCancellable = useCallback(
     (serverName: string) => {
       return getServerInitState(serverInitStates, serverName).isCancellable;
@@ -447,6 +589,33 @@ export function useMCPServerManager({
     [startupConfig?.interface?.mcpServers?.placeholder, localize],
   );
 
+  const batchToggleServers = useCallback(
+    (serverNames: string[]) => {
+      const connectedServers: string[] = [];
+      const disconnectedServers: string[] = [];
+
+      serverNames.forEach((serverName) => {
+        if (isInitializing(serverName)) {
+          return;
+        }
+
+        const serverStatus = connectionStatus?.[serverName];
+        if (serverStatus?.connectionState === 'connected') {
+          connectedServers.push(serverName);
+        } else {
+          disconnectedServers.push(serverName);
+        }
+      });
+
+      setMCPValues(connectedServers);
+
+      disconnectedServers.forEach((serverName) => {
+        initializeServer(serverName);
+      });
+    },
+    [connectionStatus, setMCPValues, initializeServer, isInitializing],
+  );
+
   const toggleServerSelection = useCallback(
     (serverName: string) => {
       if (isInitializing(serverName)) {
@@ -460,10 +629,15 @@ export function useMCPServerManager({
         const filteredValues = currentValues.filter((name) => name !== serverName);
         setMCPValues(filteredValues);
       } else {
-        setMCPValues([...currentValues, serverName]);
+        const serverStatus = connectionStatus?.[serverName];
+        if (serverStatus?.connectionState === 'connected') {
+          setMCPValues([...currentValues, serverName]);
+        } else {
+          initializeServer(serverName);
+        }
       }
     },
-    [mcpValues, setMCPValues, isInitializing],
+    [mcpValues, setMCPValues, connectionStatus, initializeServer, isInitializing],
   );
 
   const handleConfigSave = useCallback(
@@ -659,6 +833,7 @@ export function useMCPServerManager({
     isPinned,
     setIsPinned,
     placeholderText,
+    batchToggleServers,
     toggleServerSelection,
     localize,
 

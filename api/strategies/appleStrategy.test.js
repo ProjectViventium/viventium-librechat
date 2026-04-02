@@ -46,16 +46,36 @@ describe('Apple Login Strategy', () => {
   const OLD_ENV = process.env;
   let getProfileDetails;
 
+  /* === VIVENTIUM START ===
+   * Feature: Test stability (mongodb-memory-server cold start)
+   * Purpose: Full-suite runs can exceed the default MongoMemoryServer launch timeout.
+   * Added: 2026-03-08
+   */
+  jest.setTimeout(120_000);
+
+  const createMongoMemoryServer = () =>
+    MongoMemoryServer.create({
+      instance: {
+        launchTimeout: 45_000,
+      },
+    });
+  /* === VIVENTIUM END === */
+
   // Start and stop in-memory MongoDB
   beforeAll(async () => {
-    mongoServer = await MongoMemoryServer.create();
+    mongoServer = await createMongoMemoryServer();
     const mongoUri = mongoServer.getUri();
     await mongoose.connect(mongoUri);
   });
 
   afterAll(async () => {
-    await mongoose.disconnect();
-    await mongoServer.stop();
+    try {
+      await mongoose.disconnect();
+    } finally {
+      if (mongoServer) {
+        await mongoServer.stop();
+      }
+    }
     process.env = OLD_ENV;
   });
 

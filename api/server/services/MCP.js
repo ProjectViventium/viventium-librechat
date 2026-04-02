@@ -1,5 +1,5 @@
 const { tool } = require('@langchain/core/tools');
-const { logger, getTenantId } = require('@librechat/data-schemas');
+const { logger } = require('@librechat/data-schemas');
 const {
   Providers,
   StepTypes,
@@ -12,11 +12,16 @@ const {
   isMCPDomainAllowed,
   normalizeServerName,
   normalizeJsonSchema,
-  GenerationJobManager,
   resolveJsonSchemaRefs,
-  buildOAuthToolCallName,
+  GenerationJobManager,
 } = require('@librechat/api');
-const { Time, CacheKeys, Constants, isAssistantsEndpoint } = require('librechat-data-provider');
+const {
+  Time,
+  CacheKeys,
+  Constants,
+  ContentTypes,
+  isAssistantsEndpoint,
+} = require('librechat-data-provider');
 const {
   getOAuthReconnectionManager,
   getMCPServersRegistry,
@@ -29,102 +34,34 @@ const { reinitMCPServer } = require('./Tools/mcp');
 const { getAppConfig } = require('./Config');
 const { getLogStores } = require('~/cache');
 
-const MAX_CACHE_SIZE = 1000;
-const lastReconnectAttempts = new Map();
-const RECONNECT_THROTTLE_MS = 10_000;
-
-const missingToolCache = new Map();
-const MISSING_TOOL_TTL_MS = 10_000;
-
-function evictStale(map, ttl) {
-  if (map.size <= MAX_CACHE_SIZE) {
-    return;
-  }
-  const now = Date.now();
-  for (const [key, timestamp] of map) {
-    if (now - timestamp >= ttl) {
-      map.delete(key);
-    }
-    if (map.size <= MAX_CACHE_SIZE) {
-      return;
-    }
-  }
-}
-
-const unavailableMsg =
-  "This tool's MCP server is temporarily unavailable. Please try again shortly.";
-
-/**
- * Resolves config-source MCP servers from admin Config overrides for the current
- * request context. Returns the parsed configs keyed by server name.
- * @param {import('express').Request} req - Express request with user context
- * @returns {Promise<Record<string, import('@librechat/api').ParsedServerConfig>>}
+/* === VIVENTIUM START ===
+ * Feature: Deep Telegram timing instrumentation (toggleable)
+ * Purpose: Log per-MCP server timing for Telegram streams (identify cold starts) without global overhead.
+ * Approach: Gate logs by streamId prefix + VIVENTIUM_TELEGRAM_TIMING_DEEP.
+ * Added: 2026-02-07
  */
-async function resolveConfigServers(req) {
-  try {
-    const registry = getMCPServersRegistry();
-    const user = req?.user;
-    const appConfig = await getAppConfig({
-      role: user?.role,
-      tenantId: getTenantId(),
-      userId: user?.id,
-    });
-    return await registry.ensureConfigServers(appConfig?.mcpConfig || {});
-  } catch (error) {
-    logger.warn(
-      '[resolveConfigServers] Failed to resolve config servers, degrading to empty:',
-      error,
-    );
-    return {};
-  }
-}
+const { performance } = require('perf_hooks');
 
-/**
- * Resolves config-source servers and merges all server configs (YAML + config + user DB)
- * for the given user context. Shared helper for controllers needing the full merged config.
- * @param {string} userId
- * @param {{ id?: string, role?: string }} [user]
- * @returns {Promise<Record<string, import('@librechat/api').ParsedServerConfig>>}
- */
-async function resolveAllMcpConfigs(userId, user) {
-  const registry = getMCPServersRegistry();
-  const appConfig = await getAppConfig({ role: user?.role, tenantId: getTenantId(), userId });
-  let configServers = {};
-  try {
-    configServers = await registry.ensureConfigServers(appConfig?.mcpConfig || {});
-  } catch (error) {
-    logger.warn(
-      '[resolveAllMcpConfigs] Config server resolution failed, continuing without:',
-      error,
-    );
-  }
-  return await registry.getAllServerConfigs(userId, configServers);
-}
+const _telegramMcpTimingEnabled = (streamId) => {
+  if (!streamId || typeof streamId !== 'string') return false;
+  if (!streamId.startsWith('telegram-')) return false;
+  const raw = process.env.VIVENTIUM_TELEGRAM_TIMING_DEEP;
+  if (raw == null) return false;
+  const normalized = String(raw).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+  return false;
+};
 
-/**
- * @param {string} toolName
- * @param {string} serverName
- */
-function createUnavailableToolStub(toolName, serverName) {
-  const normalizedToolKey = `${toolName}${Constants.mcp_delimiter}${normalizeServerName(serverName)}`;
-  const _call = async () => [unavailableMsg, null];
-  const toolInstance = tool(_call, {
-    schema: {
-      type: 'object',
-      properties: {
-        input: { type: 'string', description: 'Input for the tool' },
-      },
-      required: [],
-    },
-    name: normalizedToolKey,
-    description: unavailableMsg,
-    responseFormat: AgentConstants.CONTENT_AND_ARTIFACT,
-  });
-  toolInstance.mcp = true;
-  toolInstance.mcpRawServerName = serverName;
-  return toolInstance;
-}
-
+const _logTelegramMcpTiming = (streamId, step, startTs, extra = '') => {
+  if (!_telegramMcpTimingEnabled(streamId)) return;
+  const now = performance.now();
+  const ms = Number.isFinite(startTs) ? now - startTs : now;
+  const suffix = extra ? ` ${extra}` : '';
+  logger.info(
+    `[TG_TIMING][lc][deep] streamId=${streamId} step=${step} ms=${ms.toFixed(1)}${suffix}`,
+  );
+};
+/* === VIVENTIUM END === */
 function isEmptyObjectSchema(jsonSchema) {
   return (
     jsonSchema != null &&
@@ -296,31 +233,19 @@ async function reconnectServer({
   index,
   signal,
   serverName,
-  configServers,
   userMCPAuthMap,
   streamId = null,
 }) {
   logger.debug(
     `[MCP][reconnectServer] serverName: ${serverName}, user: ${user?.id}, hasUserMCPAuthMap: ${!!userMCPAuthMap}`,
   );
-
-  const throttleKey = `${user.id}:${serverName}`;
-  const now = Date.now();
-  const lastAttempt = lastReconnectAttempts.get(throttleKey) ?? 0;
-  if (now - lastAttempt < RECONNECT_THROTTLE_MS) {
-    logger.debug(`[MCP][reconnectServer] Throttled reconnect for ${serverName}`);
-    return null;
-  }
-  lastReconnectAttempts.set(throttleKey, now);
-  evictStale(lastReconnectAttempts, RECONNECT_THROTTLE_MS);
-
   const runId = Constants.USE_PRELIM_RESPONSE_MESSAGE_ID;
   const flowId = `${user.id}:${serverName}:${Date.now()}`;
   const flowManager = getFlowStateManager(getLogStores(CacheKeys.FLOWS));
   const stepId = 'step_oauth_login_' + serverName;
   const toolCall = {
     id: flowId,
-    name: buildOAuthToolCallName(serverName),
+    name: serverName,
     type: 'tool_call_chunk',
   };
 
@@ -365,13 +290,12 @@ async function reconnectServer({
       user,
       signal,
       serverName,
-      configServers,
       oauthStart,
       flowManager,
       userMCPAuthMap,
       forceNew: true,
       returnOnOAuth: false,
-      connectionTimeout: Time.THIRTY_SECONDS,
+      connectionTimeout: Time.TWO_MINUTES,
     });
   } finally {
     // Clean up abort handler to prevent memory leaks
@@ -408,14 +332,15 @@ async function createMCPTools({
   config,
   provider,
   serverName,
-  configServers,
   userMCPAuthMap,
   streamId = null,
 }) {
+  // Early domain validation before reconnecting server (avoid wasted work on disallowed domains)
+  // Use getAppConfig() to support per-user/role domain restrictions
   const serverConfig =
-    config ?? (await getMCPServersRegistry().getServerConfig(serverName, user?.id, configServers));
+    config ?? (await getMCPServersRegistry().getServerConfig(serverName, user?.id));
   if (serverConfig?.url) {
-    const appConfig = await getAppConfig({ role: user?.role, tenantId: user?.tenantId });
+    const appConfig = await getAppConfig({ role: user?.role });
     const allowedDomains = appConfig?.mcpSettings?.allowedDomains;
     const isDomainAllowed = await isMCPDomainAllowed(serverConfig, allowedDomains);
     if (!isDomainAllowed) {
@@ -424,33 +349,38 @@ async function createMCPTools({
     }
   }
 
+  /* === VIVENTIUM START ===
+   * Feature: Per-MCP timing for Telegram deep traces (toggleable)
+   *
+   * Purpose:
+   * - Record MCP reconnect + tool-build timings for Telegram deep traces (performance diagnostics).
+   *
+   * Added: 2026-02-07
+   */
+  const reconnectStart = _telegramMcpTimingEnabled(streamId) ? performance.now() : null;
   const result = await reconnectServer({
     res,
     user,
     index,
     signal,
     serverName,
-    configServers,
     userMCPAuthMap,
     streamId,
   });
-  if (result === null) {
-    logger.debug(`[MCP][${serverName}] Reconnect throttled, skipping tool creation.`);
-    return [];
-  }
+  _logTelegramMcpTiming(streamId, 'mcp_reconnect', reconnectStart, `server=${serverName}`);
   if (!result || !result.tools) {
     logger.warn(`[MCP][${serverName}] Failed to reinitialize MCP server.`);
-    return [];
+    return;
   }
 
   const serverTools = [];
+  const buildStart = _telegramMcpTimingEnabled(streamId) ? performance.now() : null;
   for (const tool of result.tools) {
     const toolInstance = await createMCPTool({
       res,
       user,
       provider,
       userMCPAuthMap,
-      configServers,
       streamId,
       availableTools: result.availableTools,
       toolKey: `${tool.name}${Constants.mcp_delimiter}${serverName}`,
@@ -460,6 +390,14 @@ async function createMCPTools({
       serverTools.push(toolInstance);
     }
   }
+  _logTelegramMcpTiming(
+    streamId,
+    'mcp_tools_build',
+    buildStart,
+    `server=${serverName} tools=${serverTools.length}`,
+  );
+
+  /* === VIVENTIUM END === */
 
   return serverTools;
 }
@@ -490,15 +428,16 @@ async function createMCPTool({
   userMCPAuthMap,
   availableTools,
   config,
-  configServers,
   streamId = null,
 }) {
   const [toolName, serverName] = toolKey.split(Constants.mcp_delimiter);
 
+  // Runtime domain validation: check if the server's domain is still allowed
+  // Use getAppConfig() to support per-user/role domain restrictions
   const serverConfig =
-    config ?? (await getMCPServersRegistry().getServerConfig(serverName, user?.id, configServers));
+    config ?? (await getMCPServersRegistry().getServerConfig(serverName, user?.id));
   if (serverConfig?.url) {
-    const appConfig = await getAppConfig({ role: user?.role, tenantId: user?.tenantId });
+    const appConfig = await getAppConfig({ role: user?.role });
     const allowedDomains = appConfig?.mcpSettings?.allowedDomains;
     const isDomainAllowed = await isMCPDomainAllowed(serverConfig, allowedDomains);
     if (!isDomainAllowed) {
@@ -510,14 +449,6 @@ async function createMCPTool({
   /** @type {LCTool | undefined} */
   let toolDefinition = availableTools?.[toolKey]?.function;
   if (!toolDefinition) {
-    const cachedAt = missingToolCache.get(toolKey);
-    if (cachedAt && Date.now() - cachedAt < MISSING_TOOL_TTL_MS) {
-      logger.debug(
-        `[MCP][${serverName}][${toolName}] Tool in negative cache, returning unavailable stub.`,
-      );
-      return createUnavailableToolStub(toolName, serverName);
-    }
-
     logger.warn(
       `[MCP][${serverName}][${toolName}] Requested tool not found in available tools, re-initializing MCP server.`,
     );
@@ -527,23 +458,15 @@ async function createMCPTool({
       index,
       signal,
       serverName,
-      configServers,
       userMCPAuthMap,
       streamId,
     });
     toolDefinition = result?.availableTools?.[toolKey]?.function;
-
-    if (!toolDefinition) {
-      missingToolCache.set(toolKey, Date.now());
-      evictStale(missingToolCache, MISSING_TOOL_TTL_MS);
-    }
   }
 
   if (!toolDefinition) {
-    logger.warn(
-      `[MCP][${serverName}][${toolName}] Tool definition not found, returning unavailable stub.`,
-    );
-    return createUnavailableToolStub(toolName, serverName);
+    logger.warn(`[MCP][${serverName}][${toolName}] Tool definition not found, cannot create tool.`);
+    return;
   }
 
   return createToolInstance({
@@ -551,7 +474,6 @@ async function createMCPTool({
     provider,
     toolName,
     serverName,
-    serverConfig,
     toolDefinition,
     streamId,
   });
@@ -561,14 +483,13 @@ function createToolInstance({
   res,
   toolName,
   serverName,
-  serverConfig: capturedServerConfig,
   toolDefinition,
-  provider: capturedProvider,
+  provider: _provider,
   streamId = null,
 }) {
   /** @type {LCTool} */
   const { description, parameters } = toolDefinition;
-  const isGoogle = capturedProvider === Providers.VERTEXAI || capturedProvider === Providers.GOOGLE;
+  const isGoogle = _provider === Providers.VERTEXAI || _provider === Providers.GOOGLE;
 
   let schema = parameters ? normalizeJsonSchema(resolveJsonSchemaRefs(parameters)) : null;
 
@@ -597,7 +518,7 @@ function createToolInstance({
       const flowManager = getFlowStateManager(flowsCache);
       derivedSignal = config?.signal ? AbortSignal.any([config.signal]) : undefined;
       const mcpManager = getMCPManager(userId);
-      const provider = (config?.metadata?.provider || capturedProvider)?.toLowerCase();
+      const provider = (config?.metadata?.provider || _provider)?.toLowerCase();
 
       const { args: _args, stepId, ...toolCall } = config.toolCall ?? {};
       const flowId = `${serverName}:oauth_login:${config.metadata.thread_id}:${config.metadata.run_id}`;
@@ -629,7 +550,6 @@ function createToolInstance({
 
       const result = await mcpManager.callTool({
         serverName,
-        serverConfig: capturedServerConfig,
         toolName,
         provider,
         toolArguments,
@@ -652,6 +572,9 @@ function createToolInstance({
 
       if (isAssistantsEndpoint(provider) && Array.isArray(result)) {
         return result[0];
+      }
+      if (isGoogle && Array.isArray(result[0]) && result[0][0]?.type === ContentTypes.TEXT) {
+        return [result[0][0].text, result[1]];
       }
       return result;
     } catch (error) {
@@ -697,36 +620,30 @@ function createToolInstance({
 }
 
 /**
- * Get MCP setup data including config, connections, and OAuth servers.
- * Resolves config-source servers from admin Config overrides when tenant context is available.
+ * Get MCP setup data including config, connections, and OAuth servers
  * @param {string} userId - The user ID
- * @param {{ role?: string, tenantId?: string }} [options] - Optional role/tenant context
  * @returns {Object} Object containing mcpConfig, appConnections, userConnections, and oauthServers
  */
-async function getMCPSetupData(userId, options = {}) {
-  const registry = getMCPServersRegistry();
-  const { role, tenantId } = options;
+async function getMCPSetupData(userId) {
+  const mcpConfig = await getMCPServersRegistry().getAllServerConfigs(userId);
 
-  const appConfig = await getAppConfig({ role, tenantId, userId });
-  const configServers = await registry.ensureConfigServers(appConfig?.mcpConfig || {});
-  const mcpConfig = await registry.getAllServerConfigs(userId, configServers);
+  if (!mcpConfig) {
+    throw new Error('MCP config not found');
+  }
+
   const mcpManager = getMCPManager(userId);
   /** @type {Map<string, import('@librechat/api').MCPConnection>} */
   let appConnections = new Map();
   try {
-    // Use getLoaded() instead of getAll() to avoid forcing connection creation.
+    // Use getLoaded() instead of getAll() to avoid forcing connection creation
     // getAll() creates connections for all servers, which is problematic for servers
-    // that require user context (e.g., those with {{LIBRECHAT_USER_ID}} placeholders).
+    // that require user context (e.g., those with {{LIBRECHAT_USER_ID}} placeholders)
     appConnections = (await mcpManager.appConnections?.getLoaded()) || new Map();
   } catch (error) {
     logger.error(`[MCP][User: ${userId}] Error getting app connections:`, error);
   }
   const userConnections = mcpManager.getUserConnections(userId) || new Map();
-  const oauthServers = new Set(
-    Object.entries(mcpConfig)
-      .filter(([, config]) => config.requiresOAuth)
-      .map(([name]) => name),
-  );
+  const oauthServers = await getMCPServersRegistry().getOAuthServers(userId);
 
   return {
     mcpConfig,
@@ -747,6 +664,12 @@ async function checkOAuthFlowStatus(userId, serverName) {
   const flowManager = getFlowStateManager(flowsCache);
   const flowId = MCPOAuthHandler.generateFlowId(userId, serverName);
 
+  const defaultFlowTtlMinutes = 10;
+  const flowTtlEnv = Number.parseInt(process.env.FLOW_STATE_TTL_MINUTES ?? '', 10);
+  const flowTtlMinutes =
+    Number.isFinite(flowTtlEnv) && flowTtlEnv > 0 ? flowTtlEnv : defaultFlowTtlMinutes;
+  const flowTTL = Time.ONE_MINUTE * flowTtlMinutes;
+
   try {
     const flowState = await flowManager.getFlowState(flowId, 'mcp_oauth');
     if (!flowState) {
@@ -754,9 +677,8 @@ async function checkOAuthFlowStatus(userId, serverName) {
     }
 
     const flowAge = Date.now() - flowState.createdAt;
-    const flowTTL = flowState.ttl || 180000; // Default 3 minutes
 
-    if (flowState.status === 'FAILED' || flowAge > flowTTL) {
+    if (flowState.status === 'FAILED') {
       const wasCancelled = flowState.error && flowState.error.includes('cancelled');
 
       if (wasCancelled) {
@@ -766,17 +688,27 @@ async function checkOAuthFlowStatus(userId, serverName) {
           error: flowState.error,
         });
         return { hasActiveFlow: false, hasFailedFlow: false };
-      } else {
-        logger.debug(`[MCP Connection Status] Found failed OAuth flow for ${serverName}`, {
-          flowId,
-          status: flowState.status,
-          flowAge,
-          flowTTL,
-          timedOut: flowAge > flowTTL,
-          error: flowState.error,
-        });
-        return { hasActiveFlow: false, hasFailedFlow: true };
       }
+
+      logger.debug(`[MCP Connection Status] Found failed OAuth flow for ${serverName}`, {
+        flowId,
+        status: flowState.status,
+        flowAge,
+        flowTTL,
+        timedOut: false,
+        error: flowState.error,
+      });
+      return { hasActiveFlow: false, hasFailedFlow: true };
+    }
+
+    if (flowAge > flowTTL) {
+      logger.debug(`[MCP Connection Status] Found stale OAuth flow for ${serverName}`, {
+        flowId,
+        status: flowState.status,
+        flowAge,
+        flowTTL,
+      });
+      return { hasActiveFlow: false, hasFailedFlow: false };
     }
 
     if (flowState.status === 'PENDING') {
@@ -848,9 +780,6 @@ module.exports = {
   createMCPTool,
   createMCPTools,
   getMCPSetupData,
-  resolveConfigServers,
-  resolveAllMcpConfigs,
   checkOAuthFlowStatus,
   getServerConnectionStatus,
-  createUnavailableToolStub,
 };

@@ -31,7 +31,8 @@ export const checkPluginAuth = (plugin?: TPlugin): boolean => {
   }
 
   return plugin.authConfig.every((authFieldObj) => {
-    if (authFieldObj.optional === true) {
+    const isOptional = (authFieldObj as { optional?: boolean }).optional === true;
+    if (isOptional) {
       return true;
     }
 

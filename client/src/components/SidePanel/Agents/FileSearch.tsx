@@ -2,15 +2,19 @@ import { memo, useMemo, useRef, useState } from 'react';
 import { Folder } from 'lucide-react';
 import * as Ariakit from '@ariakit/react';
 import { useFormContext } from 'react-hook-form';
-import { SharePointIcon, AttachmentIcon, DropdownPopup } from '@librechat/client';
-import { EModelEndpoint, EToolResources, AgentCapabilities } from 'librechat-data-provider';
+import { SharePointIcon, AttachmentIcon, DropdownPopup, Switch } from '@librechat/client';
+import {
+  EModelEndpoint,
+  EToolResources,
+  AgentCapabilities,
+} from 'librechat-data-provider';
 import type { ExtendedFile, AgentForm } from '~/common';
 import { useSharePointFileHandlingNoChatContext } from '~/hooks/Files/useSharePointFileHandling';
 import { useFileHandlingNoChatContext } from '~/hooks/Files/useFileHandling';
+import { useGetStartupConfig } from '~/data-provider';
 import { useAgentFileConfig, useLocalize, useLazyEffect } from '~/hooks';
 import { SharePointPickerDialog } from '~/components/SharePoint';
 import FileRow from '~/components/Chat/Input/Files/FileRow';
-import { useGetStartupConfig } from '~/data-provider';
 import FileSearchCheckbox from './FileSearchCheckbox';
 import { isEphemeralAgent } from '~/common';
 
@@ -22,7 +26,7 @@ function FileSearch({
   files?: [string, ExtendedFile][];
 }) {
   const localize = useLocalize();
-  const { watch } = useFormContext<AgentForm>();
+  const { watch, setValue } = useFormContext<AgentForm>();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [files, setFiles] = useState<Map<string, ExtendedFile>>(new Map());
   const fileHandlingState = useMemo(() => ({ files, setFiles, conversation: null }), [files]);
@@ -66,6 +70,13 @@ function FileSearch({
   );
 
   const fileSearchChecked = watch(AgentCapabilities.file_search);
+  /* === VIVENTIUM START ===
+   * Feature: Agent-scoped conversation recall toggle in Agent Builder
+   * Added: 2026-02-19
+   */
+  const conversationRecallAgentOnly = watch('conversation_recall_agent_only') ?? false;
+  /* === VIVENTIUM END === */
+
   const isUploadDisabled = endpointFileConfig?.disabled ?? false;
 
   const sharePointEnabled = startupConfig?.sharePointFilePickerEnabled;
@@ -114,7 +125,7 @@ function FileSearch({
   const menuTrigger = (
     <Ariakit.MenuButton
       disabled={disabledUploadButton}
-      className="btn btn-neutral border-token-border-light relative h-9 w-full rounded-lg text-sm font-medium"
+      className="btn btn-neutral border-token-border-light relative h-9 w-full rounded-lg font-medium"
     >
       <div className="flex w-full items-center justify-center gap-1">
         <AttachmentIcon className="text-token-text-primary h-4 w-4" />
@@ -127,12 +138,35 @@ function FileSearch({
     <div className="w-full">
       <div className="mb-1.5 flex items-center gap-2">
         <span>
-          <label className="text-token-text-primary block text-sm font-medium">
+          <label className="text-token-text-primary block font-medium">
             {localize('com_assistants_file_search')}
           </label>
         </span>
       </div>
       <FileSearchCheckbox />
+      {/* === VIVENTIUM START ===
+       * Feature: Agent-scoped conversation recall toggle
+       * Added: 2026-02-19
+       */}
+      <div className="mt-2 flex items-center justify-between gap-2 rounded-md border border-token-border-medium/70 p-2 text-xs">
+        <div className="pr-2">
+          <div className="font-medium text-token-text-primary">
+            {localize('com_agents_conversation_recall_agent_only')}
+          </div>
+          <div className="text-text-secondary">
+            {localize('com_agents_conversation_recall_agent_only_description')}
+          </div>
+        </div>
+        <Switch
+          checked={conversationRecallAgentOnly}
+          onCheckedChange={(checked) =>
+            setValue('conversation_recall_agent_only', checked, { shouldDirty: true })
+          }
+          disabled={fileSearchChecked === false}
+          aria-label={localize('com_agents_conversation_recall_agent_only')}
+        />
+      </div>
+      {/* === VIVENTIUM END === */}
       <div className="flex flex-col gap-3">
         {/* File Search (RAG API) Files */}
         <FileRow
@@ -158,7 +192,7 @@ function FileSearch({
             <button
               type="button"
               disabled={disabledUploadButton}
-              className="btn btn-neutral border-token-border-light relative h-9 w-full rounded-lg text-sm font-medium"
+              className="btn btn-neutral border-token-border-light relative h-9 w-full rounded-lg font-medium"
               onClick={handleButtonClick}
             >
               <div className="flex w-full items-center justify-center gap-1">

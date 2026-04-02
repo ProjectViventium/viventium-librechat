@@ -10,7 +10,6 @@ export type AccessRole = {
   resourceType: string;
   /** e.g., 1 for read, 3 for read+write */
   permBits: number;
-  tenantId?: string;
 };
 
 export type IAccessRole = AccessRole &

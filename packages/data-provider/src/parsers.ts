@@ -402,22 +402,101 @@ export function findLastSeparatorIndex(text: string, separators = SEPARATORS): n
   return lastIndex;
 }
 
-export function replaceSpecialVars({ text, user }: { text: string; user?: t.TUser | null }) {
+/* === VIVENTIUM START ===
+ * Feature: Timezone-aware special variable replacement
+ *
+ * Purpose:
+ * - Render {{current_date}} and {{current_datetime}} in the caller's timezone when provided.
+ * - Fall back to server time if the timezone is invalid or missing.
+ *
+ * Added: 2026-02-01
+ */
+function resolveTimeZoneParts(date: Date, timeZone?: string | null) {
+  const normalized = typeof timeZone === 'string' ? timeZone.trim() : '';
+  if (!normalized) {
+    return null;
+  }
+  const isIanaLike =
+    normalized.includes('/') ||
+    normalized === 'UTC' ||
+    normalized === 'GMT' ||
+    normalized.startsWith('UTC') ||
+    normalized.startsWith('GMT') ||
+    normalized.startsWith('Etc/');
+  if (!isIanaLike) {
+    return null;
+  }
+  try {
+    const formatter = new Intl.DateTimeFormat('en-CA', {
+      timeZone: normalized,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    });
+    const parts = formatter.formatToParts(date);
+    const values: Record<string, string> = {};
+    for (const part of parts) {
+      if (part.type !== 'literal') {
+        values[part.type] = part.value;
+      }
+    }
+    if (!values.year || !values.month || !values.day || !values.hour || !values.minute || !values.second) {
+      return null;
+    }
+    const weekdayLabel = new Intl.DateTimeFormat('en-US', {
+      timeZone: normalized,
+      weekday: 'short',
+    }).format(date);
+    const weekdayMap: Record<string, number> = {
+      Sun: 0,
+      Mon: 1,
+      Tue: 2,
+      Wed: 3,
+      Thu: 4,
+      Fri: 5,
+      Sat: 6,
+    };
+    const dayNumber = weekdayMap[weekdayLabel] ?? dayjs(date).day();
+    return {
+      currentDate: `${values.year}-${values.month}-${values.day}`,
+      currentDatetime: `${values.year}-${values.month}-${values.day} ${values.hour}:${values.minute}:${values.second}`,
+      dayNumber,
+    };
+  } catch (err) {
+    return null;
+  }
+}
+
+export function replaceSpecialVars({
+  text,
+  user,
+  timeZone,
+}: {
+  text: string;
+  user?: t.TUser | null;
+  timeZone?: string | null;
+}) {
   let result = text;
   if (!result) {
     return result;
   }
 
-  const now = dayjs();
-  const weekdayName = now.format('dddd');
+  // e.g., "2024-04-29 (1)" (1=Monday)
+  const now = new Date();
+  const tzParts = resolveTimeZoneParts(now, timeZone);
+  const currentDate = tzParts?.currentDate ?? dayjs(now).format('YYYY-MM-DD');
+  const dayNumber = tzParts?.dayNumber ?? dayjs(now).day();
+  const combinedDate = `${currentDate} (${dayNumber})`;
+  result = result.replace(/{{current_date}}/gi, combinedDate);
 
-  const currentDate = now.format('YYYY-MM-DD');
-  result = result.replace(/{{current_date}}/gi, `${currentDate} (${weekdayName})`);
+  const currentDatetime = tzParts?.currentDatetime ?? dayjs(now).format('YYYY-MM-DD HH:mm:ss');
+  result = result.replace(/{{current_datetime}}/gi, `${currentDatetime} (${dayNumber})`);
 
-  const currentDatetime = now.format('YYYY-MM-DD HH:mm:ss Z');
-  result = result.replace(/{{current_datetime}}/gi, `${currentDatetime} (${weekdayName})`);
-
-  const isoDatetime = now.toISOString();
+  const isoDatetime = dayjs(now).toISOString();
   result = result.replace(/{{iso_datetime}}/gi, isoDatetime);
 
   if (user && user.name) {
@@ -426,6 +505,7 @@ export function replaceSpecialVars({ text, user }: { text: string; user?: t.TUse
 
   return result;
 }
+/* === VIVENTIUM END === */
 
 /**
  * Parsed ephemeral agent ID result

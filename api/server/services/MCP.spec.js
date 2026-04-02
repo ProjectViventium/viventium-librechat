@@ -9,12 +9,35 @@ jest.mock('@librechat/data-schemas', () => ({
   },
 }));
 
+jest.mock('@langchain/core/tools', () => ({
+  tool: jest.fn((fn, config) => {
+    const toolInstance = { _call: fn, ...config };
+    return toolInstance;
+  }),
+}));
+
+jest.mock('@librechat/agents', () => ({
+  Providers: {
+    VERTEXAI: 'vertexai',
+    GOOGLE: 'google',
+  },
+  StepTypes: {
+    TOOL_CALLS: 'tool_calls',
+  },
+  GraphEvents: {
+    ON_RUN_STEP_DELTA: 'on_run_step_delta',
+    ON_RUN_STEP: 'on_run_step',
+  },
+  Constants: {
+    CONTENT_AND_ARTIFACT: 'content_and_artifact',
+  },
+}));
+
 // Create mock registry instance
 const mockRegistryInstance = {
   getOAuthServers: jest.fn(() => Promise.resolve(new Set())),
   getAllServerConfigs: jest.fn(() => Promise.resolve({})),
   getServerConfig: jest.fn(() => Promise.resolve(null)),
-  ensureConfigServers: jest.fn(() => Promise.resolve({})),
 };
 
 // Create isMCPDomainAllowed mock that can be configured per-test
@@ -23,31 +46,53 @@ const mockIsMCPDomainAllowed = jest.fn(() => Promise.resolve(true));
 const mockGetAppConfig = jest.fn(() => Promise.resolve({}));
 
 jest.mock('@librechat/api', () => {
-  const actual = jest.requireActual('@librechat/api');
+  // Access mock via getter to avoid hoisting issues
   return {
-    ...actual,
+    MCPOAuthHandler: {
+      generateFlowId: jest.fn(),
+    },
     sendEvent: jest.fn(),
+    normalizeServerName: jest.fn((name) => name),
+    normalizeJsonSchema: jest.fn((schema) => schema),
+    resolveJsonSchemaRefs: jest.fn((params) => params),
     get isMCPDomainAllowed() {
       return mockIsMCPDomainAllowed;
     },
-    GenerationJobManager: {
-      emitChunk: jest.fn(),
+    MCPServersRegistry: {
+      getInstance: () => mockRegistryInstance,
     },
   };
 });
 
 const { logger } = require('@librechat/data-schemas');
 const { MCPOAuthHandler } = require('@librechat/api');
-const { CacheKeys, Constants } = require('librechat-data-provider');
-const D = Constants.mcp_delimiter;
+const { CacheKeys } = require('librechat-data-provider');
 const {
   createMCPTool,
   createMCPTools,
   getMCPSetupData,
   checkOAuthFlowStatus,
   getServerConnectionStatus,
-  createUnavailableToolStub,
 } = require('./MCP');
+
+jest.mock('librechat-data-provider', () => ({
+  CacheKeys: {
+    FLOWS: 'flows',
+  },
+  Constants: {
+    USE_PRELIM_RESPONSE_MESSAGE_ID: 'prelim_response_id',
+    mcp_delimiter: '::',
+    mcp_prefix: 'mcp_',
+  },
+  ContentTypes: {
+    TEXT: 'text',
+  },
+  isAssistantsEndpoint: jest.fn(() => false),
+  Time: {
+    ONE_MINUTE: 60000,
+    TWO_MINUTES: 120000,
+  },
+}));
 
 jest.mock('./Config', () => ({
   loadCustomConfig: jest.fn(),
@@ -89,7 +134,6 @@ describe('tests for the new helper functions used by the MCP connection status e
 
   beforeEach(() => {
     jest.clearAllMocks();
-    jest.spyOn(MCPOAuthHandler, 'generateFlowId');
 
     mockGetMCPManager = require('~/config').getMCPManager;
     mockGetFlowStateManager = require('~/config').getFlowStateManager;
@@ -114,43 +158,38 @@ describe('tests for the new helper functions used by the MCP connection status e
     });
 
     it('should successfully return MCP setup data', async () => {
-      const mockConfigWithOAuth = {
-        server1: { type: 'stdio' },
-        server2: { type: 'http', requiresOAuth: true },
-      };
-      mockRegistryInstance.getAllServerConfigs.mockResolvedValue(mockConfigWithOAuth);
+      mockRegistryInstance.getAllServerConfigs.mockResolvedValue(mockConfig);
 
       const mockAppConnections = new Map([['server1', { status: 'connected' }]]);
       const mockUserConnections = new Map([['server2', { status: 'disconnected' }]]);
+      const mockOAuthServers = new Set(['server2']);
 
       const mockMCPManager = {
         appConnections: { getLoaded: jest.fn(() => Promise.resolve(mockAppConnections)) },
         getUserConnections: jest.fn(() => mockUserConnections),
       };
       mockGetMCPManager.mockReturnValue(mockMCPManager);
+      mockRegistryInstance.getOAuthServers.mockResolvedValue(mockOAuthServers);
 
       const result = await getMCPSetupData(mockUserId);
 
-      expect(mockRegistryInstance.ensureConfigServers).toHaveBeenCalled();
-      expect(mockRegistryInstance.getAllServerConfigs).toHaveBeenCalledWith(
-        mockUserId,
-        expect.any(Object),
-      );
+      expect(mockRegistryInstance.getAllServerConfigs).toHaveBeenCalledWith(mockUserId);
       expect(mockGetMCPManager).toHaveBeenCalledWith(mockUserId);
       expect(mockMCPManager.appConnections.getLoaded).toHaveBeenCalled();
       expect(mockMCPManager.getUserConnections).toHaveBeenCalledWith(mockUserId);
+      expect(mockRegistryInstance.getOAuthServers).toHaveBeenCalledWith(mockUserId);
 
-      expect(result.mcpConfig).toEqual(mockConfigWithOAuth);
-      expect(result.appConnections).toEqual(mockAppConnections);
-      expect(result.userConnections).toEqual(mockUserConnections);
-      expect(result.oauthServers).toEqual(new Set(['server2']));
+      expect(result).toEqual({
+        mcpConfig: mockConfig,
+        appConnections: mockAppConnections,
+        userConnections: mockUserConnections,
+        oauthServers: mockOAuthServers,
+      });
     });
 
-    it('should return empty data when no servers are configured', async () => {
-      mockRegistryInstance.getAllServerConfigs.mockResolvedValue({});
-      const result = await getMCPSetupData(mockUserId);
-      expect(result.mcpConfig).toEqual({});
-      expect(result.oauthServers).toEqual(new Set());
+    it('should throw error when MCP config not found', async () => {
+      mockRegistryInstance.getAllServerConfigs.mockResolvedValue(null);
+      await expect(getMCPSetupData(mockUserId)).rejects.toThrow('MCP config not found');
     });
 
     it('should handle null values from MCP manager gracefully', async () => {
@@ -206,7 +245,6 @@ describe('tests for the new helper functions used by the MCP connection status e
       const mockFlowState = {
         status: 'FAILED',
         createdAt: Date.now() - 60000, // 1 minute ago
-        ttl: 180000,
       };
       const mockFlowManager = { getFlowState: jest.fn(() => mockFlowState) };
       mockGetFlowStateManager.mockReturnValue(mockFlowManager);
@@ -223,45 +261,42 @@ describe('tests for the new helper functions used by the MCP connection status e
       );
     });
 
-    it('should detect failed flow when flow has timed out', async () => {
+    it('should treat a timed-out pending flow as stale (not failed)', async () => {
       const mockFlowState = {
         status: 'PENDING',
-        createdAt: Date.now() - 200000, // 200 seconds ago (> 180s TTL)
-        ttl: 180000,
+        createdAt: Date.now() - 11 * 60 * 1000, // 11 minutes ago (> 10m default TTL)
       };
       const mockFlowManager = { getFlowState: jest.fn(() => mockFlowState) };
       mockGetFlowStateManager.mockReturnValue(mockFlowManager);
 
       const result = await checkOAuthFlowStatus(mockUserId, mockServerName);
 
-      expect(result).toEqual({ hasActiveFlow: false, hasFailedFlow: true });
+      expect(result).toEqual({ hasActiveFlow: false, hasFailedFlow: false });
       expect(logger.debug).toHaveBeenCalledWith(
-        expect.stringContaining('Found failed OAuth flow'),
+        expect.stringContaining('Found stale OAuth flow'),
         expect.objectContaining({
-          timedOut: true,
+          flowId: mockFlowId,
         }),
       );
     });
 
-    it('should detect failed flow when TTL not specified and flow exceeds default TTL', async () => {
+    it('should mark timed-out flow inactive when TTL exceeds default', async () => {
       const mockFlowState = {
         status: 'PENDING',
-        createdAt: Date.now() - 200000, // 200 seconds ago (> 180s default TTL)
-        // ttl not specified, should use 180000 default
+        createdAt: Date.now() - 11 * 60 * 1000, // 11 minutes ago (> 10m default TTL)
       };
       const mockFlowManager = { getFlowState: jest.fn(() => mockFlowState) };
       mockGetFlowStateManager.mockReturnValue(mockFlowManager);
 
       const result = await checkOAuthFlowStatus(mockUserId, mockServerName);
 
-      expect(result).toEqual({ hasActiveFlow: false, hasFailedFlow: true });
+      expect(result).toEqual({ hasActiveFlow: false, hasFailedFlow: false });
     });
 
     it('should detect active flow when status is PENDING and within TTL', async () => {
       const mockFlowState = {
         status: 'PENDING',
-        createdAt: Date.now() - 60000, // 1 minute ago (< 180s TTL)
-        ttl: 180000,
+        createdAt: Date.now() - 6 * 60 * 1000, // 6 minutes ago (< 10m default TTL)
       };
       const mockFlowManager = { getFlowState: jest.fn(() => mockFlowState) };
       mockGetFlowStateManager.mockReturnValue(mockFlowManager);
@@ -281,7 +316,6 @@ describe('tests for the new helper functions used by the MCP connection status e
       const mockFlowState = {
         status: 'COMPLETED',
         createdAt: Date.now() - 60000,
-        ttl: 180000,
       };
       const mockFlowManager = { getFlowState: jest.fn(() => mockFlowState) };
       mockGetFlowStateManager.mockReturnValue(mockFlowManager);
@@ -307,6 +341,30 @@ describe('tests for the new helper functions used by the MCP connection status e
         expect.stringContaining('Error checking OAuth flows'),
         mockError,
       );
+    });
+
+    it('should respect FLOW_STATE_TTL_MINUTES when set', async () => {
+      const previous = process.env.FLOW_STATE_TTL_MINUTES;
+      try {
+        process.env.FLOW_STATE_TTL_MINUTES = '1';
+
+        const mockFlowState = {
+          status: 'PENDING',
+          createdAt: Date.now() - 70 * 1000, // 70 seconds ago (> 1m TTL)
+        };
+        const mockFlowManager = { getFlowState: jest.fn(() => mockFlowState) };
+        mockGetFlowStateManager.mockReturnValue(mockFlowManager);
+
+        const result = await checkOAuthFlowStatus(mockUserId, mockServerName);
+
+        expect(result).toEqual({ hasActiveFlow: false, hasFailedFlow: false });
+      } finally {
+        if (previous == null) {
+          delete process.env.FLOW_STATE_TTL_MINUTES;
+        } else {
+          process.env.FLOW_STATE_TTL_MINUTES = previous;
+        }
+      }
     });
   });
 
@@ -698,7 +756,7 @@ describe('User parameter passing tests', () => {
       mockReinitMCPServer.mockResolvedValue({
         tools: [{ name: 'test-tool' }],
         availableTools: {
-          [`test-tool${D}test-server`]: {
+          'test-tool::test-server': {
             function: {
               description: 'Test tool',
               parameters: { type: 'object', properties: {} },
@@ -758,7 +816,7 @@ describe('User parameter passing tests', () => {
 
       mockReinitMCPServer.mockResolvedValue({
         availableTools: {
-          [`test-tool${D}test-server`]: {
+          'test-tool::test-server': {
             function: {
               description: 'Test tool',
               parameters: { type: 'object', properties: {} },
@@ -771,7 +829,7 @@ describe('User parameter passing tests', () => {
       await createMCPTool({
         res: mockRes,
         user: mockUser,
-        toolKey: `test-tool${D}test-server`,
+        toolKey: 'test-tool::test-server',
         provider: 'openai',
         signal: mockSignal,
         userMCPAuthMap: {},
@@ -793,7 +851,7 @@ describe('User parameter passing tests', () => {
       const mockRes = { write: jest.fn(), flush: jest.fn() };
 
       const availableTools = {
-        [`test-tool${D}test-server`]: {
+        'test-tool::test-server': {
           function: {
             description: 'Cached tool',
             parameters: { type: 'object', properties: {} },
@@ -804,7 +862,7 @@ describe('User parameter passing tests', () => {
       await createMCPTool({
         res: mockRes,
         user: mockUser,
-        toolKey: `test-tool${D}test-server`,
+        toolKey: 'test-tool::test-server',
         provider: 'openai',
         userMCPAuthMap: {},
         availableTools: availableTools,
@@ -827,8 +885,8 @@ describe('User parameter passing tests', () => {
         return Promise.resolve({
           tools: [{ name: 'tool1' }, { name: 'tool2' }],
           availableTools: {
-            [`tool1${D}server1`]: { function: { description: 'Tool 1', parameters: {} } },
-            [`tool2${D}server1`]: { function: { description: 'Tool 2', parameters: {} } },
+            'tool1::server1': { function: { description: 'Tool 1', parameters: {} } },
+            'tool2::server1': { function: { description: 'Tool 2', parameters: {} } },
           },
         });
       });
@@ -859,7 +917,7 @@ describe('User parameter passing tests', () => {
         reinitCalls.push(params);
         return Promise.resolve({
           availableTools: {
-            [`my-tool${D}my-server`]: {
+            'my-tool::my-server': {
               function: { description: 'My Tool', parameters: {} },
             },
           },
@@ -869,7 +927,7 @@ describe('User parameter passing tests', () => {
       await createMCPTool({
         res: mockRes,
         user: mockUser,
-        toolKey: `my-tool${D}my-server`,
+        toolKey: 'my-tool::my-server',
         provider: 'google',
         userMCPAuthMap: {},
         availableTools: undefined, // Force reinit
@@ -903,11 +961,11 @@ describe('User parameter passing tests', () => {
       const result = await createMCPTool({
         res: mockRes,
         user: mockUser,
-        toolKey: `test-tool${D}test-server`,
+        toolKey: 'test-tool::test-server',
         provider: 'openai',
         userMCPAuthMap: {},
         availableTools: {
-          [`test-tool${D}test-server`]: {
+          'test-tool::test-server': {
             function: {
               description: 'Test tool',
               parameters: { type: 'object', properties: {} },
@@ -950,7 +1008,7 @@ describe('User parameter passing tests', () => {
       mockIsMCPDomainAllowed.mockResolvedValueOnce(true);
 
       const availableTools = {
-        [`test-tool${D}test-server`]: {
+        'test-tool::test-server': {
           function: {
             description: 'Test tool',
             parameters: { type: 'object', properties: {} },
@@ -961,7 +1019,7 @@ describe('User parameter passing tests', () => {
       const result = await createMCPTool({
         res: mockRes,
         user: mockUser,
-        toolKey: `test-tool${D}test-server`,
+        toolKey: 'test-tool::test-server',
         provider: 'openai',
         userMCPAuthMap: {},
         availableTools,
@@ -990,7 +1048,7 @@ describe('User parameter passing tests', () => {
       });
 
       const availableTools = {
-        [`test-tool${D}test-server`]: {
+        'test-tool::test-server': {
           function: {
             description: 'Test tool',
             parameters: { type: 'object', properties: {} },
@@ -1001,7 +1059,7 @@ describe('User parameter passing tests', () => {
       const result = await createMCPTool({
         res: mockRes,
         user: mockUser,
-        toolKey: `test-tool${D}test-server`,
+        toolKey: 'test-tool::test-server',
         provider: 'openai',
         userMCPAuthMap: {},
         availableTools,
@@ -1067,7 +1125,7 @@ describe('User parameter passing tests', () => {
       mockIsMCPDomainAllowed.mockResolvedValue(true);
 
       const availableTools = {
-        [`test-tool${D}test-server`]: {
+        'test-tool::test-server': {
           function: {
             description: 'Test tool',
             parameters: { type: 'object', properties: {} },
@@ -1079,7 +1137,7 @@ describe('User parameter passing tests', () => {
       await createMCPTool({
         res: mockRes,
         user: adminUser,
-        toolKey: `test-tool${D}test-server`,
+        toolKey: 'test-tool::test-server',
         provider: 'openai',
         userMCPAuthMap: {},
         availableTools,
@@ -1093,7 +1151,7 @@ describe('User parameter passing tests', () => {
       await createMCPTool({
         res: mockRes,
         user: regularUser,
-        toolKey: `test-tool${D}test-server`,
+        toolKey: 'test-tool::test-server',
         provider: 'openai',
         userMCPAuthMap: {},
         availableTools,
@@ -1102,188 +1160,6 @@ describe('User parameter passing tests', () => {
       // Verify getAppConfig was called with correct roles
       expect(mockGetAppConfig).toHaveBeenNthCalledWith(1, { role: 'admin' });
       expect(mockGetAppConfig).toHaveBeenNthCalledWith(2, { role: 'user' });
-    });
-  });
-
-  describe('createUnavailableToolStub', () => {
-    it('should return a tool whose _call returns a valid CONTENT_AND_ARTIFACT two-tuple', async () => {
-      const stub = createUnavailableToolStub('myTool', 'myServer');
-      // invoke() goes through langchain's base tool, which checks responseFormat.
-      // CONTENT_AND_ARTIFACT requires [content, artifact] — a bare string would throw:
-      //   "Tool response format is "content_and_artifact" but the output was not a two-tuple"
-      const result = await stub.invoke({});
-      // If we reach here without throwing, the two-tuple format is correct.
-      // invoke() returns the content portion of [content, artifact] as a string.
-      expect(result).toContain('temporarily unavailable');
-    });
-  });
-
-  describe('negative tool cache and throttle interaction', () => {
-    it('should cache tool as missing even when throttled (cross-user dedup)', async () => {
-      const mockUser = { id: 'throttle-test-user' };
-      const mockRes = { write: jest.fn(), flush: jest.fn() };
-
-      // First call: reconnect succeeds but tool not found
-      mockReinitMCPServer.mockResolvedValueOnce({
-        availableTools: {},
-      });
-
-      await createMCPTool({
-        res: mockRes,
-        user: mockUser,
-        toolKey: `missing-tool${D}cache-dedup-server`,
-        provider: 'openai',
-        userMCPAuthMap: {},
-        availableTools: undefined,
-      });
-
-      // Second call within 10s for DIFFERENT tool on same server:
-      // reconnect is throttled (returns null), tool is still cached as missing.
-      // This is intentional: the cache acts as cross-user dedup since the
-      // throttle is per-user-per-server and can't prevent N different users
-      // from each triggering their own reconnect.
-      const result2 = await createMCPTool({
-        res: mockRes,
-        user: mockUser,
-        toolKey: `other-tool${D}cache-dedup-server`,
-        provider: 'openai',
-        userMCPAuthMap: {},
-        availableTools: undefined,
-      });
-
-      expect(result2).toBeDefined();
-      expect(result2.name).toContain('other-tool');
-      expect(mockReinitMCPServer).toHaveBeenCalledTimes(1);
-    });
-
-    it('should prevent user B from triggering reconnect when user A already cached the tool', async () => {
-      const userA = { id: 'cache-user-A' };
-      const userB = { id: 'cache-user-B' };
-      const mockRes = { write: jest.fn(), flush: jest.fn() };
-
-      // User A: real reconnect, tool not found → cached
-      mockReinitMCPServer.mockResolvedValueOnce({
-        availableTools: {},
-      });
-
-      await createMCPTool({
-        res: mockRes,
-        user: userA,
-        toolKey: `shared-tool${D}cross-user-server`,
-        provider: 'openai',
-        userMCPAuthMap: {},
-        availableTools: undefined,
-      });
-
-      expect(mockReinitMCPServer).toHaveBeenCalledTimes(1);
-
-      // User B requests the SAME tool within 10s.
-      // The negative cache is keyed by toolKey (no user prefix), so user B
-      // gets a cache hit and no reconnect fires. This is the cross-user
-      // storm protection: without this, user B's unthrottled first request
-      // would trigger a second reconnect to the same server.
-      const result = await createMCPTool({
-        res: mockRes,
-        user: userB,
-        toolKey: `shared-tool${D}cross-user-server`,
-        provider: 'openai',
-        userMCPAuthMap: {},
-        availableTools: undefined,
-      });
-
-      expect(result).toBeDefined();
-      expect(result.name).toContain('shared-tool');
-      // reinitMCPServer still called only once — user B hit the cache
-      expect(mockReinitMCPServer).toHaveBeenCalledTimes(1);
-    });
-
-    it('should prevent user B from triggering reconnect for throttle-cached tools', async () => {
-      const userA = { id: 'storm-user-A' };
-      const userB = { id: 'storm-user-B' };
-      const mockRes = { write: jest.fn(), flush: jest.fn() };
-
-      // User A: real reconnect for tool-1, tool not found → cached
-      mockReinitMCPServer.mockResolvedValueOnce({
-        availableTools: {},
-      });
-
-      await createMCPTool({
-        res: mockRes,
-        user: userA,
-        toolKey: `tool-1${D}storm-server`,
-        provider: 'openai',
-        userMCPAuthMap: {},
-        availableTools: undefined,
-      });
-
-      // User A: tool-2 on same server within 10s → throttled → cached from throttle
-      await createMCPTool({
-        res: mockRes,
-        user: userA,
-        toolKey: `tool-2${D}storm-server`,
-        provider: 'openai',
-        userMCPAuthMap: {},
-        availableTools: undefined,
-      });
-
-      expect(mockReinitMCPServer).toHaveBeenCalledTimes(1);
-
-      // User B requests tool-2 — gets cache hit from the throttle-cached entry.
-      // Without this caching, user B would trigger a real reconnect since
-      // user B has their own throttle key and hasn't reconnected yet.
-      const result = await createMCPTool({
-        res: mockRes,
-        user: userB,
-        toolKey: `tool-2${D}storm-server`,
-        provider: 'openai',
-        userMCPAuthMap: {},
-        availableTools: undefined,
-      });
-
-      expect(result).toBeDefined();
-      expect(result.name).toContain('tool-2');
-      // Still only 1 real reconnect — user B was protected by the cache
-      expect(mockReinitMCPServer).toHaveBeenCalledTimes(1);
-    });
-  });
-
-  describe('createMCPTools throttle handling', () => {
-    it('should return empty array with debug log when reconnect is throttled', async () => {
-      const mockUser = { id: 'throttle-tools-user' };
-      const mockRes = { write: jest.fn(), flush: jest.fn() };
-
-      // First call: real reconnect
-      mockReinitMCPServer.mockResolvedValueOnce({
-        tools: [{ name: 'tool1' }],
-        availableTools: {
-          [`tool1${D}throttle-tools-server`]: {
-            function: { description: 'Tool 1', parameters: {} },
-          },
-        },
-      });
-
-      await createMCPTools({
-        res: mockRes,
-        user: mockUser,
-        serverName: 'throttle-tools-server',
-        provider: 'openai',
-        userMCPAuthMap: {},
-      });
-
-      // Second call within 10s — throttled
-      const result = await createMCPTools({
-        res: mockRes,
-        user: mockUser,
-        serverName: 'throttle-tools-server',
-        provider: 'openai',
-        userMCPAuthMap: {},
-      });
-
-      expect(result).toEqual([]);
-      // reinitMCPServer called only once — second was throttled
-      expect(mockReinitMCPServer).toHaveBeenCalledTimes(1);
-      // Should log at debug level (not warn) for throttled case
-      expect(logger.debug).toHaveBeenCalledWith(expect.stringContaining('Reconnect throttled'));
     });
   });
 
@@ -1303,7 +1179,7 @@ describe('User parameter passing tests', () => {
         return Promise.resolve({
           tools: [{ name: 'test' }],
           availableTools: {
-            [`test${D}server`]: { function: { description: 'Test', parameters: {} } },
+            'test::server': { function: { description: 'Test', parameters: {} } },
           },
         });
       });

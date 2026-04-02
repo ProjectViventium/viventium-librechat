@@ -1,11 +1,6 @@
 const FormData = require('form-data');
 const { getCodeBaseURL } = require('@librechat/agents');
-const {
-  logAxiosError,
-  createAxiosInstance,
-  codeServerHttpAgent,
-  codeServerHttpsAgent,
-} = require('@librechat/api');
+const { createAxiosInstance, logAxiosError } = require('@librechat/api');
 
 const axios = createAxiosInstance();
 
@@ -30,8 +25,6 @@ async function getCodeOutputDownloadStream(fileIdentifier, apiKey) {
         'User-Agent': 'LibreChat/1.0',
         'X-API-Key': apiKey,
       },
-      httpAgent: codeServerHttpAgent,
-      httpsAgent: codeServerHttpsAgent,
       timeout: 15000,
     };
 
@@ -76,9 +69,6 @@ async function uploadCodeEnvFile({ req, stream, filename, apiKey, entity_id = ''
         'User-Id': req.user.id,
         'X-API-Key': apiKey,
       },
-      httpAgent: codeServerHttpAgent,
-      httpsAgent: codeServerHttpsAgent,
-      timeout: 120000,
       maxContentLength: MAX_FILE_SIZE,
       maxBodyLength: MAX_FILE_SIZE,
     };

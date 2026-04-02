@@ -1,24 +1,40 @@
 const rateLimit = require('express-rate-limit');
+const { limiterCache } = require('@librechat/api');
 const { ViolationTypes } = require('librechat-data-provider');
-const { limiterCache, removePorts } = require('@librechat/api');
 const denyRequest = require('~/server/middleware/denyRequest');
 const { logViolation } = require('~/cache');
 
-const {
-  MESSAGE_IP_MAX = 40,
-  MESSAGE_IP_WINDOW = 1,
-  MESSAGE_USER_MAX = 40,
-  MESSAGE_USER_WINDOW = 1,
-  MESSAGE_VIOLATION_SCORE: score,
-} = process.env;
+/* VIVENTIUM START
+ * Purpose: Harden rate limiter env parsing to avoid NaN init failures.
+ * Details: docs/requirements_and_learnings/05_Open_Source_Modifications.md#librechat-message-limiters
+ */
+/**
+ * Env parsing helpers.
+ *
+ * Note: `process.env` values are always strings. If a variable is set to a non-numeric
+ * value (e.g. "1m"), JS math produces NaN and express-rate-limit throws during init.
+ */
+function parsePositiveNumber(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
 
-const ipWindowMs = MESSAGE_IP_WINDOW * 60 * 1000;
-const ipMax = MESSAGE_IP_MAX;
+function parsePositiveInt(value, fallback) {
+  const n = Number.parseInt(String(value), 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+const ipWindowMinutes = parsePositiveNumber(process.env.MESSAGE_IP_WINDOW, 1);
+const ipWindowMs = Math.max(1, Math.trunc(ipWindowMinutes * 60 * 1000));
+const ipMax = parsePositiveInt(process.env.MESSAGE_IP_MAX, 40);
 const ipWindowInMinutes = ipWindowMs / 60000;
 
-const userWindowMs = MESSAGE_USER_WINDOW * 60 * 1000;
-const userMax = MESSAGE_USER_MAX;
+const userWindowMinutes = parsePositiveNumber(process.env.MESSAGE_USER_WINDOW, 1);
+const userWindowMs = Math.max(1, Math.trunc(userWindowMinutes * 60 * 1000));
+const userMax = parsePositiveInt(process.env.MESSAGE_USER_MAX, 40);
 const userWindowInMinutes = userWindowMs / 60000;
+const score = process.env.MESSAGE_VIOLATION_SCORE;
+/* VIVENTIUM END */
 
 /**
  * Creates either an IP/User message request rate limiter for excessive requests
@@ -50,7 +66,6 @@ const ipLimiterOptions = {
   windowMs: ipWindowMs,
   max: ipMax,
   handler: createHandler(),
-  keyGenerator: removePorts,
   store: limiterCache('message_ip_limiter'),
 };
 
@@ -59,7 +74,7 @@ const userLimiterOptions = {
   max: userMax,
   handler: createHandler(false),
   keyGenerator: function (req) {
-    return req.user?.id;
+    return req.user?.id; // Use the user ID or NULL if not available
   },
   store: limiterCache('message_user_limiter'),
 };

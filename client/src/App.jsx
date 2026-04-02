@@ -16,6 +16,14 @@ import { router } from './routes';
 
 const App = () => {
   const { setError } = useApiErrorBoundary();
+  /* === VIVENTIUM START ===
+   * Keep React Query Devtools out of shipped localhost installs by default.
+   * The shipped local stack serves the client through Vite dev for live runtime wiring, so
+   * import.meta.env.DEV is true even in a real installed product session. Keep the floating
+   * toggle behind an explicit opt-in flag instead of exposing it to every fresh install.
+   * === VIVENTIUM END === */
+  const showReactQueryDevtools =
+    String(import.meta.env.VITE_ENABLE_REACT_QUERY_DEVTOOLS || '').toLowerCase() === 'true';
 
   const queryClient = new QueryClient({
     defaultOptions: {
@@ -63,7 +71,9 @@ const App = () => {
                 <DndProvider backend={HTML5Backend}>
                   <RouterProvider router={router} />
                   <WakeLockManager />
-                  <ReactQueryDevtools initialIsOpen={false} position="top-right" />
+                  {showReactQueryDevtools ? (
+                    <ReactQueryDevtools initialIsOpen={false} position="top-right" />
+                  ) : null}
                   <Toast />
                   <RadixToast.Viewport className="pointer-events-none fixed inset-0 z-[1000] mx-auto my-2 flex max-w-[560px] flex-col items-stretch justify-start md:pb-5" />
                 </DndProvider>

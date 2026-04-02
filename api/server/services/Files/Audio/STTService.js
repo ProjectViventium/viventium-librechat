@@ -142,7 +142,6 @@ class STTService {
       req.config ??
       (await getAppConfig({
         role: req?.user?.role,
-        tenantId: req?.user?.tenantId,
       }));
     const sttSchema = appConfig?.speech?.stt;
     if (!sttSchema) {

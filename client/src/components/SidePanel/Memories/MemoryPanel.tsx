@@ -4,7 +4,7 @@ import { matchSorter } from 'match-sorter';
 import { SystemRoles, PermissionTypes, Permissions } from 'librechat-data-provider';
 import {
   Button,
-  Checkbox,
+  Switch,
   Spinner,
   FilterInput,
   TooltipAnchor,
@@ -35,6 +35,12 @@ export default function MemoryPanel() {
   const [searchQuery, setSearchQuery] = useState('');
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [referenceSavedMemories, setReferenceSavedMemories] = useState(true);
+  /* === VIVENTIUM START ===
+   * Feature: Conversation Recall global preference toggle
+   * Added: 2026-02-19
+   */
+  const [recallAllConversations, setRecallAllConversations] = useState(false);
+  /* === VIVENTIUM END === */
 
   const updateMemoryPreferencesMutation = useUpdateMemoryPreferencesMutation({
     onSuccess: () => {
@@ -48,7 +54,6 @@ export default function MemoryPanel() {
         message: localize('com_ui_error_updating_preferences'),
         status: 'error',
       });
-      setReferenceSavedMemories((prev) => !prev);
     },
   });
 
@@ -56,12 +61,42 @@ export default function MemoryPanel() {
     if (userData?.personalization?.memories !== undefined) {
       setReferenceSavedMemories(userData.personalization.memories);
     }
-  }, [userData?.personalization?.memories]);
+    /* === VIVENTIUM START ===
+     * Feature: Conversation Recall global preference hydration
+     * Added: 2026-02-19
+     */
+    if (userData?.personalization?.conversation_recall !== undefined) {
+      setRecallAllConversations(userData.personalization.conversation_recall);
+    }
+    /* === VIVENTIUM END === */
+  }, [userData?.personalization?.memories, userData?.personalization?.conversation_recall]);
 
   const handleMemoryToggle = (checked: boolean) => {
+    const previous = referenceSavedMemories;
     setReferenceSavedMemories(checked);
-    updateMemoryPreferencesMutation.mutate({ memories: checked });
+    updateMemoryPreferencesMutation.mutate(
+      { memories: checked },
+      {
+        onError: () => setReferenceSavedMemories(previous),
+      },
+    );
   };
+
+  /* === VIVENTIUM START ===
+   * Feature: Conversation Recall global preference handler
+   * Added: 2026-02-19
+   */
+  const handleConversationRecallToggle = (checked: boolean) => {
+    const previous = recallAllConversations;
+    setRecallAllConversations(checked);
+    updateMemoryPreferencesMutation.mutate(
+      { conversation_recall: checked },
+      {
+        onError: () => setRecallAllConversations(previous),
+      },
+    );
+  };
+  /* === VIVENTIUM END === */
 
   const hasReadAccess = useHasAccess({
     permissionType: PermissionTypes.MEMORIES,
@@ -121,8 +156,8 @@ export default function MemoryPanel() {
   const totalPages = Math.ceil(filteredMemories.length / pageSize);
 
   return (
-    <div className="flex h-auto w-full flex-col px-3 pb-3">
-      <div role="region" aria-label={localize('com_ui_memories')} className="space-y-2">
+    <div className="flex h-full w-full flex-col">
+      <div role="region" aria-label={localize('com_ui_memories')} className="mt-2 space-y-3">
         {/* Header: Filter + Create Button */}
         <div className="flex items-center gap-2">
           <FilterInput
@@ -142,7 +177,7 @@ export default function MemoryPanel() {
                     <Button
                       variant="outline"
                       size="icon"
-                      className="size-9 shrink-0 bg-transparent"
+                      className="shrink-0 bg-transparent"
                       aria-label={localize('com_ui_create_memory')}
                       onClick={() => setCreateDialogOpen(true)}
                     >
@@ -169,23 +204,33 @@ export default function MemoryPanel() {
 
             {/* Memory Toggle */}
             {hasOptOutAccess && (
-              <Button
-                size="sm"
-                variant="outline"
-                className={`ml-auto ${referenceSavedMemories ? 'bg-surface-hover hover:bg-surface-hover' : ''}`}
-                onClick={() => handleMemoryToggle(!referenceSavedMemories)}
-                aria-label={localize('com_ui_use_memory')}
-                aria-pressed={referenceSavedMemories}
-                disabled={updateMemoryPreferencesMutation.isLoading}
-              >
-                <Checkbox
-                  checked={referenceSavedMemories}
-                  tabIndex={-1}
-                  aria-hidden="true"
-                  className="pointer-events-none mr-2"
-                />
-                {localize('com_ui_use_memory')}
-              </Button>
+              <div className="flex flex-col items-end gap-2 text-xs">
+                <div className="flex items-center gap-2">
+                  <span className="text-text-secondary">{localize('com_ui_use_memory')}</span>
+                  <Switch
+                    checked={referenceSavedMemories}
+                    onCheckedChange={handleMemoryToggle}
+                    aria-label={localize('com_ui_use_memory')}
+                    disabled={updateMemoryPreferencesMutation.isLoading}
+                  />
+                </div>
+                {/* === VIVENTIUM START ===
+                 * Feature: Conversation Recall global preference toggle in Memories panel
+                 * Added: 2026-02-19
+                 */}
+                <div className="flex items-center gap-2">
+                  <span className="text-text-secondary">
+                    {localize('com_ui_recall_all_conversations')}
+                  </span>
+                  <Switch
+                    checked={recallAllConversations}
+                    onCheckedChange={handleConversationRecallToggle}
+                    aria-label={localize('com_ui_recall_all_conversations')}
+                    disabled={updateMemoryPreferencesMutation.isLoading}
+                  />
+                </div>
+                {/* === VIVENTIUM END === */}
+              </div>
             )}
           </div>
         )}

@@ -7,8 +7,23 @@ export default function OAuthSuccess() {
   const [searchParams] = useSearchParams();
   const [secondsLeft, setSecondsLeft] = useState(3);
   const serverName = searchParams.get('serverName');
+  const provider = searchParams.get('provider');
 
   useEffect(() => {
+    /* === VIVENTIUM START ===
+     * Feature: Connected Accounts OAuth popup completion signal.
+     * Purpose: Notify the opener window immediately after successful provider auth.
+     * === VIVENTIUM END === */
+    if (window.opener && provider) {
+      window.opener.postMessage(
+        {
+          type: 'viventium_connected_account_oauth_success',
+          provider,
+        },
+        window.location.origin,
+      );
+    }
+
     const countdown = setInterval(() => {
       setSecondsLeft((prev) => {
         if (prev <= 1) {
@@ -21,7 +36,7 @@ export default function OAuthSuccess() {
     }, 1000);
 
     return () => clearInterval(countdown);
-  }, []);
+  }, [provider]);
 
   return (
     <div className="flex min-h-screen items-center justify-center bg-gray-50 p-8">

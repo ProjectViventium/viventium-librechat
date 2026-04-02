@@ -1,17 +1,35 @@
-**/.circleci
-**/.editorconfig
-**/.dockerignore
-**/.git
-**/.DS_Store
-**/.vscode
-**/node_modules
-
-# Specific patterns to ignore
-data-node
-meili_data*
-librechat*
-Dockerfile*
-docs
-
-# Ignore all hidden files
-.*
+# === VIVENTIUM START ===
+# Feature: Docker build context minimization (Azure ACR)
+# Purpose: Reduce build context size and prevent accidental upload of local artifacts/secrets.
+# Why: Faster builds, fewer cache misses, and less risk of leaking local runtime data into images.
+# Added: 2026-02-07
+node_modules
+api/node_modules
+client/node_modules
+packages/**/node_modules
+**/.cache
+**/dist
+**/build
+**/.next
+**/.turbo
+**/.vite
+**/.parcel-cache
+**/coverage
+**/logs
+logs-direct
+logs-foundry
+uploads-direct
+uploads-foundry
+.local_artifacts
+**/.local_artifacts
+backups
+**/backups
+tmp
+data
+data-node-dual
+meili_data_v1.12_dual
+.git
+.DS_Store
+.env
+.env.local
+# === VIVENTIUM END ===

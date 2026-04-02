@@ -46,10 +46,21 @@ export const useUpdateMemoryMutation = (
   );
 };
 
-export type UpdateMemoryPreferencesParams = { memories: boolean };
+export type UpdateMemoryPreferencesParams = {
+  memories?: boolean;
+  /* === VIVENTIUM START ===
+   * Feature: Conversation Recall global preference
+   * Added: 2026-02-19
+   */
+  conversation_recall?: boolean;
+  /* === VIVENTIUM END === */
+};
 export type UpdateMemoryPreferencesResponse = {
   updated: boolean;
-  preferences: { memories: boolean };
+  preferences: {
+    memories: boolean;
+    conversation_recall: boolean;
+  };
 };
 
 export const useUpdateMemoryPreferencesMutation = (

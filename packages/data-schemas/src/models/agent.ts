@@ -1,8 +1,9 @@
 import agentSchema from '~/schema/agent';
-import { applyTenantIsolation } from '~/models/plugins/tenantIsolation';
 import type { IAgent } from '~/types';
 
+/**
+ * Creates or returns the Agent model using the provided mongoose instance and schema
+ */
 export function createAgentModel(mongoose: typeof import('mongoose')) {
-  applyTenantIsolation(agentSchema);
   return mongoose.models.Agent || mongoose.model<IAgent>('Agent', agentSchema);
 }

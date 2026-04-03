@@ -1093,6 +1093,12 @@ class AgentClient extends BaseClient {
         .join('\n')
         .trim();
       agent.instructions = baseInstructions;
+      /* === VIVENTIUM FIX ===
+       * Clear additional_instructions after merging into instructions.
+       * Without this, run.ts buildAgentContext appends additional_instructions a second time
+       * (after Wing Mode / surface prompts), diluting voice behavior contracts like Wing Mode.
+       */
+      agent.additional_instructions = '';
       return agent;
     };
 
@@ -2496,6 +2502,64 @@ class AgentClient extends BaseClient {
         ) {
           config.recursionLimit = agentsEConfig?.maxRecursionLimit;
         }
+
+        /* === VIVENTIUM FIX ===
+         * Feature: Wing Mode + voice surface prompt injection for ALL agents.
+         *
+         * Purpose:
+         * - Ensure handoff/parallel agents receive the same Wing Mode and voice surface
+         *   instructions as the primary agent, so a handoff during a voice call does not
+         *   lose the Wing Mode or voice formatting contract.
+         *
+         * Why here (runAgents) instead of chatCompletion body:
+         * - The primary agent already had these injected in chatCompletion (lines ~1911-1982).
+         * - Handoff agents in agentConfigs only become visible here.
+         * - We skip the primary agent (agents[0]) to avoid double-injection.
+         */
+        if (agents.length > 1) {
+          const handoffAgents = agents.slice(1);
+          for (const agent of handoffAgents) {
+            if (!agent || typeof agent !== 'object') {
+              continue;
+            }
+            if (voiceMode) {
+              const voiceInstructions = buildVoiceModeInstructions(voiceProvider);
+              if (voiceInstructions) {
+                agent.instructions = [agent.instructions || '', voiceInstructions]
+                  .filter(Boolean).join('\n\n');
+              }
+            }
+            if (inputMode === 'voice_call') {
+              const voiceCallInstructions = buildVoiceCallInputInstructions();
+              if (voiceCallInstructions) {
+                agent.instructions = [agent.instructions || '', voiceCallInstructions]
+                  .filter(Boolean).join('\n\n');
+              }
+              const wingModeInstructions = isWingModeEnabledForRequest(this.options.req, inputMode)
+                ? buildWingModeInstructions()
+                : '';
+              if (wingModeInstructions) {
+                agent.instructions = [agent.instructions || '', wingModeInstructions]
+                  .filter(Boolean).join('\n\n');
+              }
+            }
+            if (inputMode === 'voice_note') {
+              const voiceNoteInstructions = buildVoiceNoteInputInstructions();
+              if (voiceNoteInstructions) {
+                agent.instructions = [agent.instructions || '', voiceNoteInstructions]
+                  .filter(Boolean).join('\n\n');
+              }
+            }
+            if (isTelegramSurface && !voiceMode) {
+              const telegramInstructions = buildTelegramTextInstructions();
+              if (telegramInstructions) {
+                agent.instructions = [agent.instructions || '', telegramInstructions]
+                  .filter(Boolean).join('\n\n');
+              }
+            }
+          }
+        }
+        /* === VIVENTIUM FIX END === */
 
         /* === VIVENTIUM NOTE ===
          * Feature: No Response Tag ({NTA}) prompt injection (env-gated, config-driven).

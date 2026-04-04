@@ -1,14 +1,100 @@
 const fs = require('fs');
 const axios = require('axios');
 const FormData = require('form-data');
-const { logger } = require('@librechat/data-schemas');
-const { FileSources } = require('librechat-data-provider');
+const mongoose = require('mongoose');
+const { createMethods, logger } = require('@librechat/data-schemas');
+const { ErrorTypes, EModelEndpoint, FileSources } = require('librechat-data-provider');
 const { logAxiosError, generateShortLivedToken } = require('@librechat/api');
+const { getUserKeyValues } = createMethods(mongoose);
 
 const EMBED_ERROR_DETAIL_LIMIT = 1400;
 const EMBEDDING_VECTOR_REGEX = /(['"]embedding['"]\s*:\s*)\[[\s\S]*?\]/gi;
 const EMBED_INPUT_TOKEN_REGEX = /(['"]input['"]\s*:\s*)\[[\s\S]*?\]/gi;
 const EMBED_TEXT_FIELD_REGEX = /(['"]text['"]\s*:\s*)(['"])(?:\\.|(?!\2)[\s\S])*\2/gi;
+const CONNECTED_ACCOUNT_OPENAI_BASE_URL = 'https://chatgpt.com/backend-api/codex';
+const RAG_EMBEDDINGS_OPENAI_KEY_HEADER = 'X-Viventium-Embeddings-OpenAI-Api-Key';
+const RAG_EMBEDDINGS_OPENAI_BASE_URL_HEADER = 'X-Viventium-Embeddings-OpenAI-Base-Url';
+
+function hasErrorType(error, type) {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  try {
+    const parsed = JSON.parse(error.message);
+    return parsed?.type === type;
+  } catch {
+    return false;
+  }
+}
+
+/* === VIVENTIUM START ===
+ * Feature: User-scoped embeddings auth overrides for RAG uploads.
+ *
+ * Purpose:
+ * - Let file embeddings and conversation-recall indexing honor the same user-first OpenAI
+ *   auth precedence as chat completions.
+ * - Keep the existing RAG env-key path intact by treating the user-scoped override as
+ *   best-effort and omitting Codex-only reverse proxy URLs for embeddings.
+ *
+ * Added: 2026-04-04
+ * === VIVENTIUM END === */
+function shouldOmitEmbeddingsBaseUrl(userValues) {
+  const baseURL =
+    typeof userValues?.baseURL === 'string' ? userValues.baseURL.trim().toLowerCase() : '';
+
+  return (
+    userValues?.oauthProvider === 'openai-codex' ||
+    userValues?.oauthType === 'subscription' ||
+    baseURL.includes(CONNECTED_ACCOUNT_OPENAI_BASE_URL)
+  );
+}
+
+async function resolveEmbeddingsAuthOverrideHeaders(userId) {
+  if (typeof userId !== 'string' || userId.trim().length === 0) {
+    return {};
+  }
+
+  let userValues;
+  try {
+    userValues = await getUserKeyValues({
+      userId,
+      name: EModelEndpoint.openAI,
+    });
+  } catch (error) {
+    if (
+      hasErrorType(error, ErrorTypes.NO_USER_KEY) ||
+      hasErrorType(error, ErrorTypes.INVALID_USER_KEY)
+    ) {
+      return {};
+    }
+
+    logger.warn(
+      '[VectorDB] Failed to resolve user-scoped OpenAI embeddings override; continuing with default RAG credentials',
+      {
+        userId,
+        message: error instanceof Error ? error.message : String(error),
+      },
+    );
+    return {};
+  }
+
+  const apiKey = typeof userValues?.apiKey === 'string' ? userValues.apiKey.trim() : '';
+  if (!apiKey) {
+    return {};
+  }
+
+  const headers = {
+    [RAG_EMBEDDINGS_OPENAI_KEY_HEADER]: apiKey,
+  };
+
+  const baseURL = typeof userValues?.baseURL === 'string' ? userValues.baseURL.trim() : '';
+  if (baseURL && !shouldOmitEmbeddingsBaseUrl(userValues)) {
+    headers[RAG_EMBEDDINGS_OPENAI_BASE_URL_HEADER] = baseURL;
+  }
+
+  return headers;
+}
 
 function sanitizeEmbeddingFailureDetails(value) {
   if (typeof value !== 'string') {
@@ -151,12 +237,14 @@ async function uploadVectors({ req, file, file_id, entity_id, storageMetadata, t
     }
 
     const formHeaders = formData.getHeaders();
+    const embeddingsOverrideHeaders = await resolveEmbeddingsAuthOverrideHeaders(req.user?.id);
 
     const response = await axios.post(`${process.env.RAG_API_URL}/embed`, formData, {
       headers: {
         Authorization: `Bearer ${jwtToken}`,
         accept: 'application/json',
         ...formHeaders,
+        ...embeddingsOverrideHeaders,
       },
       ...(Number.isFinite(timeoutMs) && timeoutMs > 0 ? { timeout: timeoutMs } : {}),
     });

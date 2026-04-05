@@ -6,6 +6,7 @@ import { VitePWA } from 'vite-plugin-pwa';
 import { compression } from 'vite-plugin-compression2';
 import { nodePolyfills } from 'vite-plugin-node-polyfills';
 import type { Plugin } from 'vite';
+import { resolveAllowedHosts, resolveBackendUrl, type RuntimeEnv } from './src/utils/devProxy';
 
 const require = createRequire(import.meta.url);
 
@@ -31,53 +32,23 @@ const NODE_POLYFILL_SHIMS: Record<string, string> = {
 /* === VIVENTIUM START ===
  * Feature: Launcher-aware frontend proxy target resolution.
  *
- * Root cause (2026-03-11):
- * - `viventium-librechat-start.sh` exports `DOMAIN_SERVER=http://localhost:3180` and writes
- *   the same source-of-truth into `.env`, but Vite config only consulted `process.env`.
- * - In direct/local starts where `BACKEND_PORT` was not explicitly exported, the frontend
- *   stayed on `3190` while `/api/*` proxied to legacy `3080`, yielding dev-proxy 500s.
+ * Root causes:
+ * - 2026-03-11: `viventium-librechat-start.sh` exported `DOMAIN_SERVER=http://localhost:3180`
+ *   and wrote the same source-of-truth into `.env`, but Vite config only consulted
+ *   `process.env`. In direct/local starts where `BACKEND_PORT` was not explicitly exported,
+ *   the frontend stayed on `3190` while `/api/*` proxied to legacy `3080`, yielding dev-proxy
+ *   500s.
+ * - 2026-04-04: remote-access modes deliberately changed `DOMAIN_SERVER` to the public browser
+ *   API origin. Reusing that public HTTPS URL as the local Vite proxy target caused the frontend
+ *   dev server to proxy back into the public Caddy endpoint instead of the local backend.
  *
  * Approach:
  * - Load the same env files Vite serves with (`envDir: ../`) before computing proxy targets.
- * - Prefer explicit `DOMAIN_SERVER`, then explicit ports, then the legacy fallback.
+ * - Separate the browser-facing `DOMAIN_SERVER` from the local dev proxy target.
+ * - Prefer an explicit local proxy target, then explicit local ports, and only fall back to
+ *   `DOMAIN_SERVER` when no local backend target is available.
  * - Preserve the IPv6/bind-all guardrails from the earlier proxy hardening.
  */
-type RuntimeEnv = Record<string, string | undefined>;
-
-function parsePortFromUrl(value: string | undefined) {
-  if (typeof value !== 'string' || value.trim() === '') {
-    return undefined;
-  }
-  try {
-    const url = new URL(value);
-    return url.port ? Number(url.port) : undefined;
-  } catch (_error) {
-    return undefined;
-  }
-}
-
-function resolveBackendPort(env: RuntimeEnv) {
-  return (
-    Number(env.BACKEND_PORT || env.VIVENTIUM_LC_API_PORT || parsePortFromUrl(env.DOMAIN_SERVER)) ||
-    3080
-  );
-}
-
-function resolveBackendUrl(env: RuntimeEnv) {
-  if (typeof env.DOMAIN_SERVER === 'string' && env.DOMAIN_SERVER.trim() !== '') {
-    return env.DOMAIN_SERVER.trim().replace(/\/+$/, '');
-  }
-
-  const devHost = env.HOST || 'localhost';
-  const backendPort = resolveBackendPort(env);
-  const isIPv6Host = devHost.includes(':') && devHost !== 'localhost';
-  const backendHost = devHost === '::' || devHost === '0.0.0.0' ? 'localhost' : devHost;
-
-  return isIPv6Host && backendHost !== 'localhost'
-    ? `http://[${backendHost}]:${backendPort}`
-    : `http://${backendHost}:${backendPort}`;
-}
-
 function resolveFrontendPort(env: RuntimeEnv) {
   return (
     Number(env.VIVENTIUM_LC_FRONTEND_PORT || env.FRONTEND_PORT || env.VITE_PORT) || 3090
@@ -97,8 +68,7 @@ export default defineConfig(({ command, mode }) => {
   return {
     base: '',
     server: {
-      allowedHosts:
-        (runtimeEnv.VITE_ALLOWED_HOSTS && runtimeEnv.VITE_ALLOWED_HOSTS.split(',')) || [],
+      allowedHosts: resolveAllowedHosts(runtimeEnv),
       host: runtimeEnv.HOST || 'localhost',
       port: resolveFrontendPort(runtimeEnv),
       strictPort: false,

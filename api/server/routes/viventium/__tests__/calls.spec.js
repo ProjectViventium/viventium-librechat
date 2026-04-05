@@ -81,6 +81,9 @@ describe('/api/viventium/calls', () => {
   beforeEach(() => {
     jest.resetModules();
     process.env.VIVENTIUM_PLAYGROUND_URL = 'http://localhost:3000';
+    process.env.VIVENTIUM_PUBLIC_CLIENT_URL = '';
+    process.env.VIVENTIUM_PUBLIC_SERVER_URL = '';
+    process.env.VIVENTIUM_PUBLIC_PLAYGROUND_URL = '';
     process.env.VIVENTIUM_VOICE_GATEWAY_AGENT_NAME = 'librechat-voice-gateway';
   });
 
@@ -105,6 +108,46 @@ describe('/api/viventium/calls', () => {
     expect(u.searchParams.get('callSessionId')).toBe(res.body.callSessionId);
     expect(u.searchParams.get('agentName')).toBe('librechat-voice-gateway');
     expect(u.searchParams.get('autoConnect')).toBe('1');
+  });
+
+  test('POST prefers the configured public playground for matching public browser origins', async () => {
+    process.env.VIVENTIUM_PUBLIC_CLIENT_URL = 'https://home-node.tail123.ts.net';
+    process.env.VIVENTIUM_PUBLIC_SERVER_URL = 'https://home-node.tail123.ts.net:8443';
+    process.env.VIVENTIUM_PUBLIC_PLAYGROUND_URL = 'https://home-node.tail123.ts.net:3443';
+
+    const callsRouter = require('../calls');
+
+    const app = express();
+    app.use(express.json());
+    app.use('/api/viventium/calls', callsRouter);
+
+    const res = await request(app)
+      .post('/api/viventium/calls')
+      .set('origin', 'https://home-node.tail123.ts.net')
+      .send({ conversationId: 'new', agentId: 'agent_123' })
+      .expect(200);
+
+    expect(new URL(res.body.playgroundUrl).origin).toBe('https://home-node.tail123.ts.net:3443');
+  });
+
+  test('POST keeps localhost playground links for localhost callers even when public origins exist', async () => {
+    process.env.VIVENTIUM_PUBLIC_CLIENT_URL = 'https://home-node.tail123.ts.net';
+    process.env.VIVENTIUM_PUBLIC_SERVER_URL = 'https://home-node.tail123.ts.net:8443';
+    process.env.VIVENTIUM_PUBLIC_PLAYGROUND_URL = 'https://home-node.tail123.ts.net:3443';
+
+    const callsRouter = require('../calls');
+
+    const app = express();
+    app.use(express.json());
+    app.use('/api/viventium/calls', callsRouter);
+
+    const res = await request(app)
+      .post('/api/viventium/calls')
+      .set('origin', 'http://localhost:3190')
+      .send({ conversationId: 'new', agentId: 'agent_123' })
+      .expect(200);
+
+    expect(new URL(res.body.playgroundUrl).origin).toBe('http://localhost:3000');
   });
 
   test('POST rejects missing agentId', async () => {

@@ -117,7 +117,7 @@ describe('voiceLlmOverride', () => {
     }
   });
 
-  test('resolveVoiceOverrideAssignment uses the machine fast-voice route when the agent fields are unset', () => {
+  test('resolveVoiceOverrideAssignment ignores legacy machine fast-voice env when the agent fields are unset', () => {
     const originalXaiKey = process.env.XAI_API_KEY;
     const originalVoiceProvider = process.env.VIVENTIUM_VOICE_FAST_LLM_PROVIDER;
     const originalVoiceModel = process.env.VIVENTIUM_VOICE_FAST_LLM_MODEL;
@@ -135,16 +135,72 @@ describe('voiceLlmOverride', () => {
         voice_llm_model: null,
       });
 
-      expect(assignment).toEqual({
-        provider: 'xai',
-        model: 'grok-4-1-fast-non-reasoning',
-        source: 'env',
-      });
+      expect(assignment).toBeNull();
     } finally {
       if (originalXaiKey === undefined) {
         delete process.env.XAI_API_KEY;
       } else {
         process.env.XAI_API_KEY = originalXaiKey;
+      }
+      if (originalVoiceProvider === undefined) {
+        delete process.env.VIVENTIUM_VOICE_FAST_LLM_PROVIDER;
+      } else {
+        process.env.VIVENTIUM_VOICE_FAST_LLM_PROVIDER = originalVoiceProvider;
+      }
+      if (originalVoiceModel === undefined) {
+        delete process.env.VIVENTIUM_VOICE_FAST_LLM_MODEL;
+      } else {
+        process.env.VIVENTIUM_VOICE_FAST_LLM_MODEL = originalVoiceModel;
+      }
+    }
+  });
+
+  test('applyVoiceModelOverride keeps the explicit agent voice-call LLM when legacy env disagrees', () => {
+    const originalXaiKey = process.env.XAI_API_KEY;
+    const originalOpenAIKey = process.env.OPENAI_API_KEY;
+    const originalVoiceProvider = process.env.VIVENTIUM_VOICE_FAST_LLM_PROVIDER;
+    const originalVoiceModel = process.env.VIVENTIUM_VOICE_FAST_LLM_MODEL;
+    process.env.XAI_API_KEY = 'test-xai-key';
+    process.env.OPENAI_API_KEY = 'test-openai-key';
+    process.env.VIVENTIUM_VOICE_FAST_LLM_PROVIDER = 'xai';
+    process.env.VIVENTIUM_VOICE_FAST_LLM_MODEL = 'grok-4-1-fast';
+
+    try {
+      const req = {
+        body: {
+          voiceMode: true,
+          viventiumInputMode: 'voice_call',
+          viventiumSurface: 'voice',
+        },
+        config: { endpoints: { agents: { allowedProviders: ['xai', 'openai'] } } },
+      };
+      const modelsConfig = {
+        xai: ['grok-4-1-fast'],
+        openAI: ['gpt-4o-mini', 'gpt-5.4'],
+      };
+      const agent = {
+        id: 'agent_explicit',
+        provider: 'openAI',
+        model: 'gpt-4o-mini',
+        model_parameters: { model: 'gpt-4o-mini' },
+        voice_llm_provider: 'openAI',
+        voice_llm_model: 'gpt-5.4',
+      };
+
+      const updated = applyVoiceModelOverride(agent, req, modelsConfig);
+      expect(updated.provider).toBe('openAI');
+      expect(updated.model).toBe('gpt-5.4');
+      expect(updated.model_parameters.model).toBe('gpt-5.4');
+    } finally {
+      if (originalXaiKey === undefined) {
+        delete process.env.XAI_API_KEY;
+      } else {
+        process.env.XAI_API_KEY = originalXaiKey;
+      }
+      if (originalOpenAIKey === undefined) {
+        delete process.env.OPENAI_API_KEY;
+      } else {
+        process.env.OPENAI_API_KEY = originalOpenAIKey;
       }
       if (originalVoiceProvider === undefined) {
         delete process.env.VIVENTIUM_VOICE_FAST_LLM_PROVIDER;

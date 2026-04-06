@@ -51,6 +51,12 @@ jest.mock('~/server/services/viventium/CallSessionService', () => ({
       stt: { provider: 'openai', variant: 'gpt-4o-transcribe' },
       tts: { provider: 'openai', variant: 'gpt-4o-mini-tts' },
     },
+    assistantRoute: {
+      primary: { provider: 'anthropic', model: 'claude-opus-4-6' },
+      voiceCallLlm: null,
+      effective: { provider: 'anthropic', model: 'claude-opus-4-6' },
+      inheritsPrimary: true,
+    },
   })),
   claimDispatch: jest.fn(async () => ({
     status: 'claimed',
@@ -67,6 +73,12 @@ jest.mock('~/server/services/viventium/CallSessionService', () => ({
     expiresAtMs: 123,
     requestedVoiceRoute,
     savedVoiceRoute: requestedVoiceRoute,
+    assistantRoute: {
+      primary: { provider: 'anthropic', model: 'claude-opus-4-6' },
+      voiceCallLlm: null,
+      effective: { provider: 'anthropic', model: 'claude-opus-4-6' },
+      inheritsPrimary: true,
+    },
   })),
 }));
 
@@ -215,6 +227,12 @@ describe('/api/viventium/calls', () => {
       stt: { provider: 'openai', variant: 'gpt-4o-transcribe' },
       tts: { provider: 'openai', variant: 'gpt-4o-mini-tts' },
     });
+    expect(res.body.assistantRoute).toEqual({
+      primary: { provider: 'anthropic', model: 'claude-opus-4-6' },
+      voiceCallLlm: null,
+      effective: { provider: 'anthropic', model: 'claude-opus-4-6' },
+      inheritsPrimary: true,
+    });
   });
 
   test('POST voice-settings updates the requested route', async () => {
@@ -242,6 +260,12 @@ describe('/api/viventium/calls', () => {
     expect(res.body.savedVoiceRoute).toEqual({
       stt: { provider: 'pywhispercpp', variant: 'tiny.en' },
       tts: { provider: 'elevenlabs', variant: 'voice_123' },
+    });
+    expect(res.body.assistantRoute).toEqual({
+      primary: { provider: 'anthropic', model: 'claude-opus-4-6' },
+      voiceCallLlm: null,
+      effective: { provider: 'anthropic', model: 'claude-opus-4-6' },
+      inheritsPrimary: true,
     });
   });
 });

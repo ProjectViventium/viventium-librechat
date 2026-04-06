@@ -603,7 +603,6 @@ describe('getLLMConfig', () => {
 
         expect(result.llmConfig).toMatchObject({
           model: 'claude-3-7-sonnet',
-          temperature: 0.4,
           maxTokens: 8192,
           stream: true, // default
           thinking: {
@@ -611,6 +610,7 @@ describe('getLLMConfig', () => {
             budget_tokens: 3000,
           },
         });
+        expect(result.llmConfig.temperature).toBeUndefined();
         // topP and topK should NOT be included for Claude-3.7 with thinking enabled
         expect(result.llmConfig).not.toHaveProperty('topP');
         expect(result.llmConfig).not.toHaveProperty('topK');
@@ -805,9 +805,60 @@ describe('getLLMConfig', () => {
           const result = getLLMConfig('sk-ant-variation-key', clientOptions);
 
           expect(result.llmConfig).toHaveProperty('model', model);
-          expect(result.llmConfig).toHaveProperty('temperature', 0.5);
           // The specific behavior (thinking, topP/topK inclusion) depends on model pattern
         });
+      });
+
+      it('should remove temperature for Claude 3.7 model-name variants when thinking is enabled', () => {
+        ['claude-3-7-sonnet', 'claude-3.7-sonnet'].forEach((model) => {
+          const result = getLLMConfig('sk-ant-variation-key', {
+            modelOptions: {
+              model,
+              temperature: 0.5,
+              thinking: true,
+              promptCache: true,
+              user: 'model-variation-user',
+            },
+          });
+
+          expect(result.llmConfig).toHaveProperty('model', model);
+          expect(result.llmConfig.thinking).toMatchObject({ type: 'enabled' });
+          expect(result.llmConfig.temperature).toBeUndefined();
+        });
+      });
+
+      it('should keep temperature for non-thinking legacy model-name variants', () => {
+        ['anthropic/claude-3-opus-20240229', 'claude-3-5-sonnet-latest'].forEach((model) => {
+          const result = getLLMConfig('sk-ant-variation-key', {
+            modelOptions: {
+              model,
+              temperature: 0.5,
+              thinking: true,
+              promptCache: true,
+              user: 'model-variation-user',
+            },
+          });
+
+          expect(result.llmConfig).toHaveProperty('model', model);
+          expect(result.llmConfig.thinking).toBeUndefined();
+          expect(result.llmConfig).toHaveProperty('temperature', 0.5);
+        });
+      });
+
+      it('should remove temperature for Sonnet 4 latest aliases when thinking is enabled', () => {
+        const result = getLLMConfig('sk-ant-variation-key', {
+          modelOptions: {
+            model: 'claude-sonnet-4-latest',
+            temperature: 0.5,
+            thinking: true,
+            promptCache: true,
+            user: 'model-variation-user',
+          },
+        });
+
+        expect(result.llmConfig).toHaveProperty('model', 'claude-sonnet-4-latest');
+        expect(result.llmConfig.thinking).toMatchObject({ type: 'enabled' });
+        expect(result.llmConfig.temperature).toBeUndefined();
       });
     });
   });
@@ -1029,6 +1080,32 @@ describe('getLLMConfig', () => {
         expect((result.llmConfig.thinking as unknown as { type: string }).type).toBe('adaptive');
         expect(result.llmConfig.thinking).not.toHaveProperty('budget_tokens');
         expect(result.llmConfig.maxTokens).toBe(128000);
+      });
+
+      it('should remove temperature when default thinking enables Sonnet 4.6 reasoning', () => {
+        const result = getLLMConfig('test-key', {
+          modelOptions: {
+            model: 'claude-sonnet-4-6',
+            temperature: 0.3,
+          },
+        });
+
+        expect(result.llmConfig.temperature).toBeUndefined();
+        expect(result.llmConfig.thinking).toMatchObject({
+          type: 'enabled',
+        });
+      });
+
+      it('should remove temperature when default thinking enables adaptive Opus 4.6 reasoning', () => {
+        const result = getLLMConfig('test-key', {
+          modelOptions: {
+            model: 'claude-opus-4-6',
+            temperature: 0.4,
+          },
+        });
+
+        expect(result.llmConfig.temperature).toBeUndefined();
+        expect((result.llmConfig.thinking as unknown as { type: string }).type).toBe('adaptive');
       });
 
       it('should set effort via output_config for adaptive thinking models', () => {

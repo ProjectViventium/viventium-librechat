@@ -507,7 +507,41 @@ describe('Memory Agent Header Resolution', () => {
     expect(runConfig.graphConfig.llmConfig.temperature).toBe(0.7);
   });
 
-  it('should not modify temperature for Anthropic with thinking type not enabled', async () => {
+  it('should remove temperature for Anthropic with adaptive thinking', async () => {
+    const llmConfig = {
+      provider: Providers.ANTHROPIC,
+      model: 'claude-opus-4-6',
+      temperature: 0.7,
+      thinking: {
+        type: 'adaptive',
+      },
+    };
+
+    await processMemory({
+      res: mockRes,
+      userId: 'user-123',
+      setMemory: mockMemoryMethods.setMemory,
+      deleteMemory: mockMemoryMethods.deleteMemory,
+      messages: [],
+      memory: 'existing memory',
+      messageId: 'msg-123',
+      conversationId: 'conv-123',
+      validKeys: ['preferences'],
+      instructions: 'test instructions',
+      llmConfig,
+      user: testUser,
+    });
+
+    expect(Run.create as jest.Mock).toHaveBeenCalled();
+    const runConfig = (Run.create as jest.Mock).mock.calls[0][0];
+
+    expect(runConfig.graphConfig.llmConfig.temperature).toBeUndefined();
+    expect(runConfig.graphConfig.llmConfig.thinking).toEqual({
+      type: 'adaptive',
+    });
+  });
+
+  it('should not modify temperature for Anthropic with disabled thinking', async () => {
     const llmConfig = {
       provider: Providers.ANTHROPIC,
       model: 'claude-sonnet-4-20250514',

@@ -995,9 +995,15 @@ function applyAnthropicConfig(llmConfig) {
   }
 }
 
-function hasAnthropicThinkingEnabled(modelParameters) {
-  const thinking = modelParameters?.thinking;
-  if (thinking == null) {
+/* === VIVENTIUM START ===
+ * Feature: Anthropic thinking/temperature compatibility guard.
+ * Purpose: Anthropic rejects temperature whenever thinking is active, including adaptive/default
+ * thinking that may be introduced after initial agent config hydration.
+ * SYNC: Keep the active-thinking shape aligned with
+ * `packages/api/src/endpoints/anthropic/helpers.ts::hasActiveAnthropicThinking`.
+ * === VIVENTIUM END === */
+function hasActiveAnthropicThinking(thinking) {
+  if (thinking == null || thinking === false) {
     return false;
   }
 
@@ -1006,20 +1012,23 @@ function hasAnthropicThinkingEnabled(modelParameters) {
   }
 
   if (typeof thinking !== 'object' || Array.isArray(thinking)) {
-    return false;
-  }
-
-  if (thinking.type === 'enabled' || thinking.enabled === true) {
+    logger.warn(
+      '[BackgroundCortexService] Unexpected Anthropic thinking shape encountered; treating as active for safety',
+      { thinking_type: Array.isArray(thinking) ? 'array' : typeof thinking },
+    );
     return true;
   }
 
-  const budgetTokens =
-    Number(thinking.budget_tokens ?? thinking.budgetTokens ?? thinking.max_tokens ?? 0) || 0;
-  return budgetTokens > 0;
+  const type = typeof thinking.type === 'string' ? thinking.type.trim().toLowerCase() : '';
+  if (type === 'disabled' || thinking.enabled === false) {
+    return false;
+  }
+
+  return true;
 }
 
 function sanitizeAnthropicThinkingTemperature(agentForRun, safeReq) {
-  if (!hasAnthropicThinkingEnabled(agentForRun?.model_parameters)) {
+  if (!hasActiveAnthropicThinking(agentForRun?.model_parameters?.thinking)) {
     return;
   }
 
@@ -1544,6 +1553,15 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
         getToolFilesByIds: db.getToolFilesByIds,
       },
     );
+
+    /* === VIVENTIUM START ===
+     * Feature: Post-hydration Anthropic temperature stripping for background cortices.
+     * Purpose: initializeAgent can materialize provider defaults (including thinking) after the
+     * raw source-of-truth agent was copied, so rerun the compatibility guard on the final config.
+     * === VIVENTIUM END === */
+    if ((initializedAgent.provider || agentForRun.provider || '').toLowerCase() === 'anthropic') {
+      sanitizeAnthropicThinkingTemperature(initializedAgent, safeReq);
+    }
 
     /* === VIVENTIUM NOTE ===
      * Feature: Event-driven tool execution for background cortices.

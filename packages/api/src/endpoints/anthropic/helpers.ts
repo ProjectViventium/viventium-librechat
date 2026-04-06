@@ -73,6 +73,46 @@ function getClaudeHeaders(
   return undefined;
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Anthropic thinking/temperature compatibility guard.
+ * Purpose: Anthropic rejects temperature whenever thinking is active, including adaptive thinking
+ * that can be enabled later by runtime defaults.
+ * === VIVENTIUM END === */
+function hasActiveAnthropicThinking(thinking: unknown): boolean {
+  if (thinking == null || thinking === false) {
+    return false;
+  }
+
+  if (thinking === true) {
+    return true;
+  }
+
+  if (typeof thinking !== 'object' || Array.isArray(thinking)) {
+    return true;
+  }
+
+  const typedThinking = thinking as { type?: unknown; enabled?: unknown };
+  const type =
+    typeof typedThinking.type === 'string' ? typedThinking.type.trim().toLowerCase() : '';
+  if (type === 'disabled' || typedThinking.enabled === false) {
+    return false;
+  }
+
+  return true;
+}
+
+function sanitizeAnthropicTemperatureForThinking<
+  T extends { thinking?: unknown; temperature?: number },
+>(config: T): T {
+  if (!hasActiveAnthropicThinking(config?.thinking) || config?.temperature == null) {
+    return config;
+  }
+
+  const nextConfig = { ...config };
+  delete nextConfig.temperature;
+  return nextConfig;
+}
+
 /**
  * Configures reasoning-related options for Claude models.
  * Models supporting adaptive thinking (Opus 4.6+, Sonnet 5+) use effort control instead of manual budget_tokens.
@@ -104,7 +144,7 @@ function configureReasoning(
       updatedOptions.max_tokens = anthropicSettings.maxOutputTokens.reset(modelName);
     }
 
-    return updatedOptions;
+    return sanitizeAnthropicTemperatureForThinking(updatedOptions);
   }
 
   if (
@@ -149,7 +189,14 @@ function configureReasoning(
     );
   }
 
-  return updatedOptions;
+  return sanitizeAnthropicTemperatureForThinking(updatedOptions);
 }
 
-export { checkPromptCacheSupport, getClaudeHeaders, configureReasoning, supportsAdaptiveThinking };
+export {
+  checkPromptCacheSupport,
+  getClaudeHeaders,
+  configureReasoning,
+  hasActiveAnthropicThinking,
+  sanitizeAnthropicTemperatureForThinking,
+  supportsAdaptiveThinking,
+};

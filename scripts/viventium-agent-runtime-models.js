@@ -257,45 +257,19 @@ function readVoiceAssignment(
     mainProvider = '',
     mainModel = '',
   },
-  { env = process.env, includeEnvProviderFallback = false } = {},
 ) {
-  const envProvider = normalizeProvider(env.VIVENTIUM_VOICE_FAST_LLM_PROVIDER);
-  const shippedProvider = normalizeProvider(explicitProvider);
-  const shippedModel = String(explicitModel || '').trim();
-  const envModel = String(env.VIVENTIUM_VOICE_FAST_LLM_MODEL || '').trim();
-  let provider = shippedProvider;
-  let model = shippedModel;
-
-  if (includeEnvProviderFallback && envProvider) {
-    provider = envProvider;
-    model =
-      envModel ||
-      (provider === shippedProvider ? shippedModel : '') ||
-      DEFAULT_VOICE_MODELS[provider] ||
-      DEFAULT_MODELS[provider] ||
-      '';
-  } else if (envProvider && shippedProvider && envProvider !== shippedProvider) {
-    return null;
-  } else if (envModel && envProvider && envProvider === shippedProvider) {
-    model = envModel;
-  }
+  const provider = normalizeProvider(explicitProvider);
+  const model = String(explicitModel || '').trim();
 
   if (!provider) {
     return null;
   }
-  if (!model) {
-    model = DEFAULT_VOICE_MODELS[provider] || DEFAULT_MODELS[provider] || '';
-  }
-  model = String(model).trim();
   if (!model) {
     return null;
   }
 
   const normalizedMainProvider = normalizeProvider(mainProvider);
   const normalizedMainModel = String(mainModel || '').trim();
-  if (!envProvider && !shippedProvider) {
-    return null;
-  }
   if (provider === normalizedMainProvider && model === normalizedMainModel) {
     return null;
   }
@@ -341,7 +315,7 @@ function rewriteAgentForRuntime(agent, { env = process.env } = {}) {
       explicitModel: rewritten.voice_llm_model,
       mainProvider: rewritten.provider,
       mainModel: rewritten.model,
-    }, { env });
+    });
     if (voiceAssignment) {
       rewritten.voice_llm_provider = voiceAssignment.provider;
       rewritten.voice_llm_model = voiceAssignment.model;

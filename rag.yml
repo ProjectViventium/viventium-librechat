@@ -43,3 +43,11 @@ services:
       - vectordb
     env_file:
       - .env
+    volumes:
+      # === VIVENTIUM START ===
+      # Feature: Request-scoped OpenAI embeddings overrides for connected accounts.
+      # Purpose: Mount the patched RAG embed route so local runs can honor user-scoped
+      # OpenAI embeddings auth while preserving the existing env-key fallback path.
+      # Added: 2026-04-04
+      # === VIVENTIUM END ===
+      - ./viventium/rag_api_overrides/app/routes/document_routes.py:/app/app/routes/document_routes.py:ro

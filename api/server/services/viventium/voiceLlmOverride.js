@@ -48,11 +48,11 @@ function hasConfiguredServerCredential(provider) {
 }
 
 /* === VIVENTIUM START ===
- * Feature: Runtime fast-voice provider fallback.
- * Purpose: Keep the shipped main-agent voice override unset by default while still allowing
- * machine-level fast voice routing to resolve at call time from runtime env.
- * Why here: Call-time selection is the right place to validate credentials and fall back cleanly
- * without rewriting the canonical built-in agent bundle.
+ * Feature: Voice Call LLM ownership alignment.
+ * Purpose: Only the explicit agent voice fields may select a dedicated call LLM. When those fields
+ * are unset, live calls must inherit the agent primary model/provider.
+ * Why here: Call-time override resolution is the product boundary that must stay aligned with the
+ * Agent Builder UI instead of hidden machine-level config.
  * === VIVENTIUM END === */
 function resolveVoiceOverrideAssignment(agent) {
   if (!agent || typeof agent !== 'object') {
@@ -68,14 +68,13 @@ function resolveVoiceOverrideAssignment(agent) {
       mainProvider: agent.provider,
       mainModel: agent.model || agent.model_parameters?.model || '',
     },
-    { includeEnvProviderFallback: true },
   );
 
   if (!assignment) {
     return null;
   }
 
-  const source = explicitProvider && explicitModel ? 'agent' : 'env';
+  const source = 'agent';
   const mainProvider = normalizeProvider(agent.provider);
   if (assignment.provider !== mainProvider && !hasConfiguredServerCredential(assignment.provider)) {
     logger.warn(

@@ -26,6 +26,7 @@ import {
   resolveMemoryKeyLimits,
   runMemoryMaintenance,
 } from '~/memory';
+import { hasActiveAnthropicThinking } from '~/endpoints/anthropic/helpers';
 import { resolveHeaders, createSafeUser } from '~/utils';
 
 type RequiredMemoryMethods = Pick<
@@ -441,12 +442,12 @@ ${memory ?? 'No existing memories'}`;
     }
 
     const anthropicConfig = finalLLMConfig as {
-      thinking?: { type?: string };
+      thinking?: unknown;
       temperature?: number;
     };
     if (
       llmConfig?.provider === Providers.ANTHROPIC &&
-      anthropicConfig.thinking?.type === 'enabled' &&
+      hasActiveAnthropicThinking(anthropicConfig.thinking) &&
       anthropicConfig.temperature != null
     ) {
       delete (finalLLMConfig as Record<string, unknown>).temperature;

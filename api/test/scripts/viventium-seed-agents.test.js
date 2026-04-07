@@ -53,8 +53,6 @@ describe('viventium-seed-agents', () => {
         VIVENTIUM_AGENT_SEED_OWNER_EMAIL: 'seed-owner@example.com',
         VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER: 'anthropic',
         VIVENTIUM_FC_CONSCIOUS_LLM_MODEL: 'claude-opus-4-6',
-        VIVENTIUM_VOICE_FAST_LLM_PROVIDER: 'openai',
-        VIVENTIUM_VOICE_FAST_LLM_MODEL: 'gpt-5.4',
         VIVENTIUM_CORTEX_PRODUCTIVITY_LLM_PROVIDER: 'anthropic',
         VIVENTIUM_CORTEX_PRODUCTIVITY_LLM_MODEL: 'claude-sonnet-4-6',
         OTUC_ACTIVATION_PROVIDER: 'groq',

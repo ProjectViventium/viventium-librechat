@@ -12,8 +12,12 @@ const mockAxiosPost = jest.fn();
 const mockCreateReadStream = jest.fn(() => 'mock-stream');
 const mockGenerateShortLivedToken = jest.fn(() => 'mock-token');
 const mockLogAxiosError = jest.fn();
+const mockGetUserKeyValues = jest.fn();
 
 jest.mock('@librechat/data-schemas', () => ({
+  createMethods: jest.fn(() => ({
+    getUserKeyValues: (...args) => mockGetUserKeyValues(...args),
+  })),
   logger: {
     debug: jest.fn(),
     info: jest.fn(),
@@ -48,6 +52,13 @@ jest.mock('@librechat/api', () => ({
 }));
 
 jest.mock('librechat-data-provider', () => ({
+  ErrorTypes: {
+    NO_USER_KEY: 'NO_USER_KEY',
+    INVALID_USER_KEY: 'INVALID_USER_KEY',
+  },
+  EModelEndpoint: {
+    openAI: 'openAI',
+  },
   FileSources: {
     vectordb: 'vectordb',
   },
@@ -58,6 +69,13 @@ describe('VectorDB uploadVectors', () => {
     jest.resetModules();
     jest.clearAllMocks();
     process.env.RAG_API_URL = 'https://rag.example.test';
+    mockGetUserKeyValues.mockRejectedValue(
+      new Error(
+        JSON.stringify({
+          type: 'NO_USER_KEY',
+        }),
+      ),
+    );
   });
 
   test('compacts massive duplicate-key embedding failures while preserving recovery signal', async () => {
@@ -141,5 +159,115 @@ describe('VectorDB uploadVectors', () => {
     const loggedError = mockLogAxiosError.mock.calls[0][0].error;
     expect(loggedError.message).toContain("text':'[omitted]'");
     expect(loggedError.message).not.toContain(massiveText.slice(0, 400));
+  });
+
+  test('preserves the existing env-key embeddings path when no user-scoped OpenAI key exists', async () => {
+    const { uploadVectors } = require('../crud');
+
+    mockAxiosPost.mockResolvedValue({
+      status: 200,
+      data: {
+        status: true,
+        known_type: true,
+      },
+    });
+
+    await uploadVectors({
+      req: { user: { id: 'user_1' } },
+      file: {
+        path: '/tmp/recall.txt',
+        size: 1200,
+        originalname: 'recall.txt',
+        mimetype: 'text/plain',
+      },
+      file_id: 'conversation_recall:user_1:all',
+    });
+
+    const requestConfig = mockAxiosPost.mock.calls[0][2];
+    expect(requestConfig.headers).toEqual(
+      expect.objectContaining({
+        Authorization: 'Bearer mock-token',
+      }),
+    );
+    expect(requestConfig.headers['X-Viventium-Embeddings-OpenAI-Api-Key']).toBeUndefined();
+    expect(requestConfig.headers['X-Viventium-Embeddings-OpenAI-Base-Url']).toBeUndefined();
+  });
+
+  test('prefers user-scoped OpenAI embeddings auth and omits Codex reverse proxy URL', async () => {
+    const { uploadVectors } = require('../crud');
+
+    mockGetUserKeyValues.mockResolvedValue({
+      apiKey: 'user-openai-token',
+      baseURL: 'https://chatgpt.com/backend-api/codex',
+      oauthProvider: 'openai-codex',
+      oauthType: 'subscription',
+    });
+    mockAxiosPost.mockResolvedValue({
+      status: 200,
+      data: {
+        status: true,
+        known_type: true,
+      },
+    });
+
+    await uploadVectors({
+      req: { user: { id: 'user_1' } },
+      file: {
+        path: '/tmp/recall.txt',
+        size: 1200,
+        originalname: 'recall.txt',
+        mimetype: 'text/plain',
+      },
+      file_id: 'conversation_recall:user_1:all',
+    });
+
+    expect(mockGetUserKeyValues).toHaveBeenCalledWith({
+      userId: 'user_1',
+      name: 'openAI',
+    });
+
+    const requestConfig = mockAxiosPost.mock.calls[0][2];
+    expect(requestConfig.headers).toEqual(
+      expect.objectContaining({
+        Authorization: 'Bearer mock-token',
+        'X-Viventium-Embeddings-OpenAI-Api-Key': 'user-openai-token',
+      }),
+    );
+    expect(requestConfig.headers['X-Viventium-Embeddings-OpenAI-Base-Url']).toBeUndefined();
+  });
+
+  test('passes through a non-Codex OpenAI base URL when the user key defines one', async () => {
+    const { uploadVectors } = require('../crud');
+
+    mockGetUserKeyValues.mockResolvedValue({
+      apiKey: 'user-openai-token',
+      baseURL: 'https://proxy.example.test/v1',
+    });
+    mockAxiosPost.mockResolvedValue({
+      status: 200,
+      data: {
+        status: true,
+        known_type: true,
+      },
+    });
+
+    await uploadVectors({
+      req: { user: { id: 'user_1' } },
+      file: {
+        path: '/tmp/recall.txt',
+        size: 1200,
+        originalname: 'recall.txt',
+        mimetype: 'text/plain',
+      },
+      file_id: 'conversation_recall:user_1:all',
+    });
+
+    const requestConfig = mockAxiosPost.mock.calls[0][2];
+    expect(requestConfig.headers).toEqual(
+      expect.objectContaining({
+        'X-Viventium-Embeddings-OpenAI-Api-Key': 'user-openai-token',
+        'X-Viventium-Embeddings-OpenAI-Base-Url': 'https://proxy.example.test/v1',
+      }),
+    );
   });
 });

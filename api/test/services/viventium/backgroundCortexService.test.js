@@ -1126,6 +1126,113 @@ describe('BackgroundCortexService.executeCortex', () => {
   });
   /* === VIVENTIUM NOTE === */
 
+  test('removes Anthropic temperature after initializeAgent hydrates default thinking for Phase B', async () => {
+    const processStream = jest.fn(async () => 'run-output');
+    const initializedAgent = {
+      id: 'agent_emotional',
+      name: 'Emotional Resonance',
+      tools: [],
+      userMCPAuthMap: null,
+      recursion_limit: 11,
+      provider: 'anthropic',
+      model_parameters: {
+        model: 'claude-opus-4-6',
+        temperature: 0.4,
+        thinking: { type: 'adaptive' },
+      },
+    };
+
+    initializeAgent.mockResolvedValueOnce(initializedAgent);
+    createRun.mockResolvedValueOnce({ processStream });
+
+    createContentAggregator.mockReturnValueOnce({
+      contentParts: [{ type: 'text', text: 'aggregated insight' }],
+      aggregateContent: jest.fn(),
+    });
+
+    await executeCortex({
+      agent: {
+        id: 'agent_emotional',
+        name: 'Emotional Resonance',
+        provider: 'anthropic',
+        model: 'claude-opus-4-6',
+        instructions: 'You are a cortex.',
+        model_parameters: {
+          temperature: 0.4,
+        },
+      },
+      messages: [{ role: 'user', content: 'how am I really feeling?' }],
+      runId: 'run-anthropic-default-thinking',
+      req: {
+        user: { id: 'user-1', role: 'USER' },
+        body: { conversationId: 'c1', parentMessageId: 'p1', temperature: 0.4 },
+      },
+    });
+
+    const runArgs = createRun.mock.calls[0][0];
+    expect(runArgs.agents[0].model_parameters.temperature).toBeUndefined();
+    expect(runArgs.agents[0].model_parameters.thinking).toEqual({ type: 'adaptive' });
+    expect(runArgs.requestBody).toEqual(
+      expect.not.objectContaining({ temperature: expect.anything() }),
+    );
+  });
+  /* === VIVENTIUM NOTE === */
+
+  test('removes Anthropic temperature for a user-created cortex after initializeAgent hydrates default thinking', async () => {
+    const processStream = jest.fn(async () => 'run-output');
+    const initializedAgent = {
+      id: 'agent_user_created',
+      name: 'Custom Reviewer',
+      tools: [],
+      userMCPAuthMap: null,
+      recursion_limit: 11,
+      provider: 'anthropic',
+      model_parameters: {
+        model: 'claude-sonnet-4-6',
+        temperature: 0.5,
+        thinking: { type: 'enabled', budget_tokens: 2000 },
+      },
+    };
+
+    initializeAgent.mockResolvedValueOnce(initializedAgent);
+    createRun.mockResolvedValueOnce({ processStream });
+
+    createContentAggregator.mockReturnValueOnce({
+      contentParts: [{ type: 'text', text: 'aggregated insight' }],
+      aggregateContent: jest.fn(),
+    });
+
+    await executeCortex({
+      agent: {
+        id: 'agent_user_created',
+        name: 'Custom Reviewer',
+        provider: 'anthropic',
+        model: 'claude-sonnet-4-6',
+        instructions: 'You are a custom cortex.',
+        model_parameters: {
+          temperature: 0.5,
+        },
+      },
+      messages: [{ role: 'user', content: 'review my plan' }],
+      runId: 'run-anthropic-user-agent-default-thinking',
+      req: {
+        user: { id: 'user-1', role: 'USER' },
+        body: { conversationId: 'c1', parentMessageId: 'p1', temperature: 0.5 },
+      },
+    });
+
+    const runArgs = createRun.mock.calls[0][0];
+    expect(runArgs.agents[0].model_parameters.temperature).toBeUndefined();
+    expect(runArgs.agents[0].model_parameters.thinking).toEqual({
+      type: 'enabled',
+      budget_tokens: 2000,
+    });
+    expect(runArgs.requestBody).toEqual(
+      expect.not.objectContaining({ temperature: expect.anything() }),
+    );
+  });
+  /* === VIVENTIUM NOTE === */
+
   /* === VIVENTIUM NOTE ===
    * Productivity specialist cortices must ignore stale long-term context and prefer direct Google file IDs.
    */

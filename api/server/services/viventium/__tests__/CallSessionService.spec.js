@@ -5,6 +5,7 @@
 
 const mongoose = require('mongoose');
 const { MongoMemoryServer } = require('mongodb-memory-server');
+const { agentSchema } = require('@librechat/data-schemas');
 
 const {
   compactVoiceRouteState,
@@ -24,11 +25,13 @@ describe('CallSessionService', () => {
   let mongoServer;
   let ViventiumCallSession;
   let User;
+  let Agent;
 
   beforeAll(async () => {
     mongoServer = await MongoMemoryServer.create();
     await mongoose.connect(mongoServer.getUri());
     ({ ViventiumCallSession, User } = require('~/db/models'));
+    Agent = mongoose.models.Agent || mongoose.model('Agent', agentSchema);
   });
 
   afterAll(async () => {
@@ -40,8 +43,12 @@ describe('CallSessionService', () => {
     process.env.VIVENTIUM_CALL_SESSION_SECRET = 'secret';
     process.env.VIVENTIUM_WING_MODE_DEFAULT_ENABLED = 'false';
     process.env.VIVENTIUM_SHADOW_MODE_DEFAULT_ENABLED = 'false';
+    process.env.VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER = 'anthropic';
+    process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL = 'claude-opus-4-6';
+    delete process.env.OPENAI_API_KEY;
     await ViventiumCallSession.deleteMany({});
     await User.deleteMany({});
+    await Agent.deleteMany({});
   });
 
   test('createCallSession persists and getCallSession returns it', async () => {
@@ -268,10 +275,21 @@ describe('CallSessionService', () => {
       email: 'voice-settings@example.com',
       provider: 'local',
     });
+    await Agent.create({
+      id: 'agent_viventium_main_95aeb3',
+      name: 'Main Agent',
+      provider: 'openAI',
+      model: 'gpt-5.4',
+      model_parameters: { model: 'gpt-5.4' },
+      voice_llm_provider: null,
+      voice_llm_model: null,
+      author: user._id.toString(),
+      versions: [],
+    });
 
     const created = await createCallSession({
       userId: user._id.toString(),
-      agentId: 'agent_1',
+      agentId: 'agent_viventium_main_95aeb3',
       conversationId: 'new',
     });
 
@@ -294,6 +312,12 @@ describe('CallSessionService', () => {
       savedVoiceRoute: {
         stt: { provider: 'openai', variant: 'gpt-4o-transcribe' },
         tts: { provider: 'elevenlabs', variant: 'voice_123' },
+      },
+      assistantRoute: {
+        primary: { provider: 'anthropic', model: 'claude-opus-4-6' },
+        voiceCallLlm: null,
+        effective: { provider: 'anthropic', model: 'claude-opus-4-6' },
+        inheritsPrimary: true,
       },
     });
 
@@ -318,10 +342,22 @@ describe('CallSessionService', () => {
         },
       },
     });
+    process.env.OPENAI_API_KEY = 'test-openai-key';
+    await Agent.create({
+      id: 'agent_viventium_main_95aeb3',
+      name: 'Main Agent',
+      provider: 'openAI',
+      model: 'gpt-5.4',
+      model_parameters: { model: 'gpt-5.4' },
+      voice_llm_provider: 'openAI',
+      voice_llm_model: 'gpt-5.4',
+      author: user._id.toString(),
+      versions: [],
+    });
 
     const created = await createCallSession({
       userId: user._id.toString(),
-      agentId: 'agent_1',
+      agentId: 'agent_viventium_main_95aeb3',
       conversationId: 'new',
       requestedVoiceRoute: {
         stt: { provider: 'pywhispercpp', variant: 'tiny.en' },
@@ -342,6 +378,12 @@ describe('CallSessionService', () => {
       savedVoiceRoute: {
         stt: { provider: 'openai', variant: 'gpt-4o-transcribe' },
         tts: { provider: 'cartesia', variant: 'sonic-2' },
+      },
+      assistantRoute: {
+        primary: { provider: 'anthropic', model: 'claude-opus-4-6' },
+        voiceCallLlm: { provider: 'openAI', model: 'gpt-5.4' },
+        effective: { provider: 'openAI', model: 'gpt-5.4' },
+        inheritsPrimary: false,
       },
     });
   });

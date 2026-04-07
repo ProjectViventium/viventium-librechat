@@ -18,9 +18,12 @@
  */
 
 const crypto = require('crypto');
+const mongoose = require('mongoose');
 const { logger } = require('@librechat/data-schemas');
 const { ViventiumCallSession } = require('~/db/models');
 const { getUserById, updateUserViventiumVoicePreferences } = require('~/models');
+const { resolveVoiceOverrideAssignment } = require('./voiceLlmOverride');
+const { rewriteAgentForRuntime } = require('../../../../scripts/viventium-agent-runtime-models');
 
 const DEFAULT_TTL_MS = 15 * 60 * 1000; // 15 minutes
 const DEFAULT_LEASE_MS = 60 * 1000; // 60 seconds
@@ -359,6 +362,65 @@ function getDefaultWingModeEnabled() {
   );
 }
 
+function normalizeAssistantRouteText(value) {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function buildAssistantRouteAssignment(provider, model) {
+  const normalizedProvider = normalizeAssistantRouteText(provider);
+  const normalizedModel = normalizeAssistantRouteText(model);
+  if (!normalizedProvider || !normalizedModel) {
+    return null;
+  }
+  return {
+    provider: normalizedProvider,
+    model: normalizedModel,
+  };
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Modern playground Assistant-route disclosure
+ * Purpose: Resolve the effective call-session LLM from the actual owning agent so Wing Mode shows
+ * the real agent primary route or explicit Voice Call LLM instead of a hidden machine default.
+ * === VIVENTIUM END === */
+async function resolveCallSessionAssistantRoute(agentId) {
+  if (!agentId) {
+    return null;
+  }
+
+  const Agent = mongoose.models.Agent;
+  if (!Agent) {
+    return null;
+  }
+
+  const persistedAgent = await Agent.findOne({ id: String(agentId) }).lean();
+  if (!persistedAgent) {
+    return null;
+  }
+
+  const runtimeAgent = rewriteAgentForRuntime(persistedAgent);
+  const primary = buildAssistantRouteAssignment(
+    runtimeAgent?.provider,
+    runtimeAgent?.model || runtimeAgent?.model_parameters?.model,
+  );
+  if (!primary) {
+    return null;
+  }
+
+  const voiceAssignment = resolveVoiceOverrideAssignment(runtimeAgent);
+  const voiceCallLlm = buildAssistantRouteAssignment(
+    voiceAssignment?.provider,
+    voiceAssignment?.model,
+  );
+
+  return {
+    primary,
+    voiceCallLlm,
+    effective: voiceCallLlm || primary,
+    inheritsPrimary: !voiceCallLlm,
+  };
+}
+
 async function createCallSession({
   userId,
   agentId,
@@ -470,12 +532,15 @@ async function getCallSessionVoiceSettings(callSessionId) {
     return null;
   }
 
+  const assistantRoute = await resolveCallSessionAssistantRoute(session.agentId);
+
   return {
     callSessionId: session.callSessionId,
     roomName: session.roomName,
     expiresAtMs: session.expiresAtMs || null,
     requestedVoiceRoute: normalizeVoiceRouteState(session.requestedVoiceRoute),
     savedVoiceRoute: await getUserSavedVoiceRoute(session.userId),
+    assistantRoute,
   };
 }
 
@@ -530,12 +595,15 @@ async function updateCallSessionVoiceSettings({
     savedVoiceRoute = normalizeVoiceRouteState(updatedUser?.viventiumVoicePreferences?.livekitPlayground);
   }
 
+  const assistantRoute = await resolveCallSessionAssistantRoute(normalizedSession.agentId);
+
   return {
     callSessionId: normalizedSession.callSessionId,
     roomName: normalizedSession.roomName,
     expiresAtMs: normalizedSession.expiresAtMs || null,
     requestedVoiceRoute: normalizeVoiceRouteState(normalizedSession.requestedVoiceRoute),
     savedVoiceRoute,
+    assistantRoute,
   };
 }
 

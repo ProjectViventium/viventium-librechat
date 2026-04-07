@@ -756,6 +756,7 @@ backgroundAgents:
       - web_search
     tool_kwargs: []
     model_parameters:
+      thinking: false
       temperature: 0.3
       model: claude-sonnet-4-6
     end_after_tools: false
@@ -1072,6 +1073,7 @@ backgroundAgents:
     tools: []
     tool_kwargs: []
     model_parameters:
+      thinking: false
       temperature: 0.4
       model: claude-opus-4-6
     background_cortices: []

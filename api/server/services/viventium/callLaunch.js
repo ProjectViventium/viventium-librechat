@@ -71,6 +71,58 @@ function resolveTelegramPublicPlaygroundBaseUrl() {
   return trimBaseUrl(parsed.toString());
 }
 
+/* === VIVENTIUM START ===
+ * Purpose: Prefer public playground links only for requests already coming through
+ * the configured public browser origins, while keeping localhost links for same-Mac use.
+ * === VIVENTIUM END === */
+function resolveConfiguredBrowserOrigins() {
+  return [
+    process.env.VIVENTIUM_PUBLIC_CLIENT_URL,
+    process.env.VIVENTIUM_PUBLIC_SERVER_URL,
+    process.env.VIVENTIUM_PUBLIC_PLAYGROUND_URL,
+  ]
+    .map((value) => parseBaseUrl(value))
+    .filter((value) => value && value.protocol === 'https:' && !isLocalHostname(value.hostname))
+    .map((value) => value.origin);
+}
+
+function extractRequestOrigins(req) {
+  const values = [];
+  const origin = req?.get?.('origin') || req?.headers?.origin || '';
+  const referer = req?.get?.('referer') || req?.get?.('referrer') || '';
+  const forwardedProto = req?.get?.('x-forwarded-proto') || '';
+  const host = req?.get?.('host') || req?.headers?.host || '';
+  const protocol = forwardedProto || req?.protocol || '';
+
+  if (origin) {
+    values.push(origin);
+  }
+  if (referer) {
+    values.push(referer);
+  }
+  if (protocol && host) {
+    values.push(`${protocol}://${host}`);
+  }
+
+  return values
+    .map((value) => parseBaseUrl(value))
+    .filter(Boolean)
+    .map((value) => value.origin);
+}
+
+function shouldPreferPublicPlaygroundForRequest(req) {
+  if (!resolveTelegramPublicPlaygroundBaseUrl()) {
+    return false;
+  }
+
+  const configuredOrigins = new Set(resolveConfiguredBrowserOrigins());
+  if (configuredOrigins.size === 0) {
+    return false;
+  }
+
+  return extractRequestOrigins(req).some((origin) => configuredOrigins.has(origin));
+}
+
 function resolveVoiceAgentName() {
   return (
     trimBaseUrl(process.env.VIVENTIUM_VOICE_GATEWAY_AGENT_NAME || '') ||
@@ -110,6 +162,7 @@ module.exports = {
   buildCallLaunchResponse,
   buildPlaygroundUrl,
   resolvePlaygroundBaseUrl,
+  shouldPreferPublicPlaygroundForRequest,
   resolveTelegramPublicPlaygroundBaseUrl,
   resolveVoiceAgentName,
 };

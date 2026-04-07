@@ -21,7 +21,10 @@ const {
   syncCallSessionState,
   updateCallSessionVoiceSettings,
 } = require('~/server/services/viventium/CallSessionService');
-const { buildCallLaunchResponse } = require('~/server/services/viventium/callLaunch');
+const {
+  buildCallLaunchResponse,
+  shouldPreferPublicPlaygroundForRequest,
+} = require('~/server/services/viventium/callLaunch');
 const { getConvo } = require('~/models');
 
 const router = express.Router();
@@ -98,7 +101,9 @@ router.post('/', requireJwtAuth, async (req, res) => {
 
     console.log('[VIVENTIUM][calls] Session created:', session);
 
-    const response = buildCallLaunchResponse(session);
+    const response = buildCallLaunchResponse(session, {
+      preferPublicPlayground: shouldPreferPublicPlaygroundForRequest(req),
+    });
 
     console.log('[VIVENTIUM][calls] Response:', response);
     res.json(response);

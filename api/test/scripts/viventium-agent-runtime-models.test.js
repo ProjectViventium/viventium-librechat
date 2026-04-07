@@ -53,8 +53,6 @@ describe('viventium-agent-runtime-models', () => {
       env: {
         VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER: 'openai',
         VIVENTIUM_FC_CONSCIOUS_LLM_MODEL: 'gpt-5.4',
-        VIVENTIUM_VOICE_FAST_LLM_PROVIDER: 'openai',
-        VIVENTIUM_VOICE_FAST_LLM_MODEL: 'gpt-5.4',
         VIVENTIUM_CORTEX_PRODUCTIVITY_LLM_PROVIDER: 'anthropic',
         VIVENTIUM_CORTEX_PRODUCTIVITY_LLM_MODEL: 'claude-sonnet-4-6',
         VIVENTIUM_BACKGROUND_ACTIVATION_PROVIDER: 'groq',
@@ -228,7 +226,7 @@ describe('viventium-agent-runtime-models', () => {
     expect(normalized.mainAgent.voice_llm_model).toBeNull();
   });
 
-  test('clears a stale shipped voice override when the fast voice provider changes', () => {
+  test('preserves an explicit voice override even when legacy machine fast-voice env disagrees', () => {
     const bundle = {
       mainAgent: {
         id: 'agent_viventium_main_95aeb3',
@@ -247,8 +245,10 @@ describe('viventium-agent-runtime-models', () => {
       },
     });
 
-    expect(normalized.mainAgent.voice_llm_provider).toBeNull();
-    expect(normalized.mainAgent.voice_llm_model).toBeNull();
+    expect(normalized.mainAgent.voice_llm_provider).toBe('xai');
+    expect(normalized.mainAgent.voice_llm_model).toBe(
+      'grok-4.20-experimental-beta-0304-non-reasoning',
+    );
   });
 
   test('strips install-disabled Google, MS365, web search, and code tools during runtime normalization', () => {

@@ -25,6 +25,10 @@ const telegramLink = require('./telegram_link');
 const registration = require('./registration');
 const credits = require('./credits');
 /* === VIVENTIUM NOTE ===
+ * Feature: Operator-issued password reset links.
+ * === VIVENTIUM NOTE === */
+const auth = require('./auth');
+/* === VIVENTIUM NOTE ===
  * Feature: Local Skyvern provider bridge routes.
  * === VIVENTIUM NOTE === */
 const skyvern = require('./skyvern');
@@ -40,6 +44,7 @@ router.use('/gateway', gateway);
 router.use('/telegram', telegramLink);
 router.use('/registration', registration);
 router.use('/credits', credits);
+router.use('/auth', auth);
 router.use('/skyvern', skyvern);
 
 module.exports = router;

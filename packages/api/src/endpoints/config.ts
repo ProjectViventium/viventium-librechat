@@ -49,6 +49,8 @@ export interface ProviderConfigResult {
   getOptions: InitializeFn;
   /** The resolved provider name (may be different from input if normalized) */
   overrideProvider: string;
+  /** The endpoint name that should be passed to the initializer */
+  initEndpoint: string;
   /** Custom endpoint configuration (if applicable) */
   customEndpointConfig?: Partial<TEndpoint>;
 }
@@ -75,6 +77,7 @@ export function getProviderConfig({
    * Purpose:
    * - Accept compiler-emitted `openai` and other case/alias variants without changing the compiler
    *   contract.
+   * - Preserve unknown custom endpoint names for downstream custom-endpoint lookup.
    *
    * Added: 2026-04-09
    * === VIVENTIUM END === */
@@ -82,6 +85,7 @@ export function getProviderConfig({
   let getOptions = providerConfigMap[normalizedProvider];
   let overrideProvider = getOptions != null ? normalizedProvider : provider;
   let customEndpointConfig: Partial<TEndpoint> | undefined;
+  let initEndpoint = overrideProvider;
 
   if (!getOptions) {
     customEndpointConfig = getCustomEndpointConfig({ endpoint: provider, appConfig });
@@ -92,6 +96,7 @@ export function getProviderConfig({
     }
     getOptions = initializeCustom;
     overrideProvider = Providers.OPENAI;
+    initEndpoint = customEndpointConfig.name ?? provider;
   }
 
   if (isKnownCustomProvider(overrideProvider) && !customEndpointConfig) {
@@ -105,9 +110,14 @@ export function getProviderConfig({
     }
   }
 
+  if (customEndpointConfig?.name) {
+    initEndpoint = customEndpointConfig.name;
+  }
+
   return {
     getOptions,
     overrideProvider,
+    initEndpoint,
     customEndpointConfig,
   };
 }

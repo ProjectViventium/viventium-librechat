@@ -3259,7 +3259,7 @@ class AgentClient extends BaseClient {
 
     const options = await titleProviderConfig.getOptions({
       req,
-      endpoint,
+      endpoint: titleProviderConfig.initEndpoint || endpoint,
       model_parameters: clientOptions,
       db: {
         getUserKey: db.getUserKey,

@@ -432,7 +432,7 @@ export async function initializeAgent(
     hasDeferredTools: false,
   };
 
-  const { getOptions, overrideProvider } = getProviderConfig({
+  const { getOptions, overrideProvider, initEndpoint } = getProviderConfig({
     provider,
     appConfig: req.config,
   });
@@ -448,7 +448,7 @@ export async function initializeAgent(
 
   const options: InitializeResultBase = await getOptions({
     req,
-    endpoint: resolvedProvider,
+    endpoint: initEndpoint,
     model_parameters: finalModelOptions,
     db,
   });

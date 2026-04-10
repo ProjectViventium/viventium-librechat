@@ -37,6 +37,7 @@ const providerConfigMap = {
  * @returns {{
  * getOptions: (typeof providerConfigMap)[keyof typeof providerConfigMap],
  * overrideProvider: string,
+ * initEndpoint: string,
  * customEndpointConfig?: TEndpoint
  * }}
  */
@@ -48,6 +49,7 @@ function getProviderConfig({ provider, appConfig }) {
   const normalizedProvider = normalizeProviderAlias(provider);
   let getOptions = providerConfigMap[normalizedProvider];
   let overrideProvider = getOptions ? normalizedProvider : provider;
+  let initEndpoint = overrideProvider;
   /** @type {TEndpoint | undefined} */
   let customEndpointConfig;
 
@@ -62,6 +64,7 @@ function getProviderConfig({ provider, appConfig }) {
     }
     getOptions = initCustom;
     overrideProvider = Providers.OPENAI;
+    initEndpoint = customEndpointConfig.name || provider;
   }
 
   if (isKnownCustomProvider(overrideProvider) && !customEndpointConfig) {
@@ -77,9 +80,14 @@ function getProviderConfig({ provider, appConfig }) {
     }
   }
 
+  if (customEndpointConfig?.name) {
+    initEndpoint = customEndpointConfig.name;
+  }
+
   return {
     getOptions,
     overrideProvider,
+    initEndpoint,
     customEndpointConfig,
   };
 }

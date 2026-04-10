@@ -368,6 +368,11 @@ const loadTools = async ({
           userId: user,
           files,
           entity_id: agent?.id,
+          /* === VIVENTIUM START ===
+           * Feature: Current-conversation exclusion for recall literal rescue.
+           * Reason: Source-backed recall rescue must avoid echoing the active prompt turn.
+           * === VIVENTIUM END === */
+          conversationId: options.req?.body?.conversationId,
           fileCitations,
         });
       };

@@ -6,6 +6,7 @@ const { MongoMemoryServer } = require('mongodb-memory-server');
 const {
   saveMessage,
   getMessages,
+  getLatestRecallEligibleMessageCreatedAt,
   updateMessage,
   deleteMessages,
   bulkSaveMessages,
@@ -192,6 +193,53 @@ describe('Message Operations', () => {
       expect(messages).toHaveLength(2);
       expect(messages[0].text).toBe('First message');
       expect(messages[1].text).toBe('Second message');
+    });
+  });
+
+  describe('getLatestRecallEligibleMessageCreatedAt', () => {
+    it('skips assistant recall-echo replies when computing freshness eligibility', async () => {
+      await Message.create([
+        {
+          user: 'user123',
+          messageId: 'source-msg',
+          conversationId: uuidv4(),
+          isCreatedByUser: true,
+          text: 'QA-only synthetic recall marker for testing: VIV-RAG-QA-20260409-1626-ONYX-FJ42. This is not a personal preference or durable memory.',
+          createdAt: new Date('2026-04-09T16:25:23.880Z'),
+          updatedAt: new Date('2026-04-09T16:25:23.880Z'),
+        },
+        {
+          user: 'user123',
+          messageId: 'meta-assistant',
+          parentMessageId: 'meta-user',
+          conversationId: 'meta-convo',
+          isCreatedByUser: false,
+          sender: 'Viventium',
+          text: 'Let me search for that. **VIV-RAG-QA-20260409-1626-ONYX-FJ42**',
+          attachments: [
+            {
+              type: 'file_search',
+              file_search: {
+                sources: [{ fileId: 'conversation_recall:user123:all' }],
+              },
+            },
+          ],
+          createdAt: new Date('2026-04-09T17:26:42.770Z'),
+          updatedAt: new Date('2026-04-09T17:26:42.770Z'),
+        },
+        {
+          user: 'user123',
+          messageId: 'meta-user',
+          conversationId: 'meta-convo',
+          isCreatedByUser: true,
+          text: 'Earlier today I told you a QA-only synthetic recall marker in another chat. What exact marker was it? Use file_search if needed and answer with only the exact marker.',
+          createdAt: new Date('2026-04-09T17:26:43.153Z'),
+          updatedAt: new Date('2026-04-09T17:26:43.153Z'),
+        },
+      ]);
+
+      const result = await getLatestRecallEligibleMessageCreatedAt({ user: 'user123' });
+      expect(new Date(result).toISOString()).toBe('2026-04-09T16:25:23.880Z');
     });
   });
 

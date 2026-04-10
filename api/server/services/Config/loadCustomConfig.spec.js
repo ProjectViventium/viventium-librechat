@@ -114,6 +114,35 @@ describe('loadCustomConfig', () => {
     expect(result).toEqual(mockConfig);
   });
 
+  it('preserves the YAML-configured conversation recall prompt on the loaded config', async () => {
+    const mockConfig = {
+      version: '1.0',
+      cache: true,
+      viventium: {
+        conversation_recall: {
+          prompt: 'CONVERSATION RECALL:\n- use file_search for earlier-chat questions.\n',
+        },
+      },
+      endpoints: {
+        custom: [
+          {
+            name: 'mistral',
+            apiKey: 'user_provided',
+            baseURL: 'https://api.mistral.ai/v1',
+          },
+        ],
+      },
+    };
+    process.env.CONFIG_PATH = 'validConfig.yaml';
+    loadYaml.mockReturnValueOnce(mockConfig);
+
+    const result = await loadCustomConfig(false);
+
+    expect(result?.viventium?.conversation_recall?.prompt).toBe(
+      'CONVERSATION RECALL:\n- use file_search for earlier-chat questions.\n',
+    );
+  });
+
   it('should interpolate env placeholders before validating MCP OAuth URLs', async () => {
     const mockConfig = {
       version: '1.0',

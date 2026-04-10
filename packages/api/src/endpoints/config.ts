@@ -1,5 +1,5 @@
 import { Providers } from '@librechat/agents';
-import { EModelEndpoint } from 'librechat-data-provider';
+import { EModelEndpoint, normalizeProviderAlias } from 'librechat-data-provider';
 import type { TEndpoint } from 'librechat-data-provider';
 import type { AppConfig } from '@librechat/data-schemas';
 import type { BaseInitializeParams, InitializeResultBase } from '~/types';
@@ -29,7 +29,7 @@ export function isKnownCustomProvider(provider?: string): boolean {
 /**
  * Provider configuration map mapping providers to their initialization functions
  */
-export const providerConfigMap: Record<string, InitializeFn> = {
+export const providerConfigMap: Partial<Record<string, InitializeFn>> = {
   [Providers.XAI]: initializeCustom,
   [Providers.DEEPSEEK]: initializeCustom,
   [Providers.MOONSHOT]: initializeCustom,
@@ -69,26 +69,39 @@ export function getProviderConfig({
   provider: string;
   appConfig?: AppConfig;
 }): ProviderConfigResult {
-  let getOptions = providerConfigMap[provider];
-  let overrideProvider = provider;
+  /* === VIVENTIUM START ===
+   * Feature: Shared provider alias normalization for runtime initialization.
+   *
+   * Purpose:
+   * - Accept compiler-emitted `openai` and other case/alias variants without changing the compiler
+   *   contract.
+   *
+   * Added: 2026-04-09
+   * === VIVENTIUM END === */
+  const normalizedProvider = normalizeProviderAlias(provider);
+  let getOptions = providerConfigMap[normalizedProvider];
+  let overrideProvider = getOptions != null ? normalizedProvider : provider;
   let customEndpointConfig: Partial<TEndpoint> | undefined;
 
-  if (!getOptions && providerConfigMap[provider.toLowerCase()] != null) {
-    overrideProvider = provider.toLowerCase();
-    getOptions = providerConfigMap[overrideProvider];
-  } else if (!getOptions) {
+  if (!getOptions) {
     customEndpointConfig = getCustomEndpointConfig({ endpoint: provider, appConfig });
     if (!customEndpointConfig) {
-      throw new Error(`Provider ${provider} not supported`);
+      throw new Error(
+        `Provider ${provider} not supported${normalizedProvider !== provider ? ` (normalized: ${normalizedProvider})` : ''}`,
+      );
     }
     getOptions = initializeCustom;
     overrideProvider = Providers.OPENAI;
   }
 
   if (isKnownCustomProvider(overrideProvider) && !customEndpointConfig) {
-    customEndpointConfig = getCustomEndpointConfig({ endpoint: provider, appConfig });
+    customEndpointConfig =
+      getCustomEndpointConfig({ endpoint: overrideProvider, appConfig }) ??
+      getCustomEndpointConfig({ endpoint: provider, appConfig });
     if (!customEndpointConfig) {
-      throw new Error(`Provider ${provider} not supported`);
+      throw new Error(
+        `Provider ${provider} not supported${normalizedProvider !== provider ? ` (normalized: ${normalizedProvider})` : ''}`,
+      );
     }
   }
 

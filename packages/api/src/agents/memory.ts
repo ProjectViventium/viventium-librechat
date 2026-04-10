@@ -64,8 +64,11 @@ const getDefaultInstructions = (
 ) => `Use the \`set_memory\` tool to save important information about the user, but ONLY when the user has requested you to remember something.
 
 The \`delete_memory\` tool should only be used in two scenarios:
-  1. When the user explicitly asks to forget or remove specific information
-  2. When updating existing memories, use the \`set_memory\` tool instead of deleting and re-adding the memory.
+  1. When the user explicitly asks to remove an entire memory key
+  2. When a memory key has become fully obsolete and should disappear completely
+
+For partial forgetting or corrections, use the \`set_memory\` tool instead of deleting and re-adding the memory. Rewrite the full affected value, remove only the forgotten or corrected detail, and preserve unrelated information.
+When the user asks to forget an entity, preference, or project reference, remove obvious aliases, abbreviations, and alternate spellings of that same target across every affected key.
 
 1. ONLY use memory tools when the user requests memory actions with phrases like:
    - "Remember [that] [I]..."
@@ -274,7 +277,7 @@ const createDeleteMemoryTool = ({
     {
       name: 'delete_memory',
       description:
-        'Deletes specific memory data about the user using the provided key. For updating existing memories, use the `set_memory` tool instead',
+        'Deletes an entire memory key for the user. Only use when the whole key should be removed; for partial forgetting or corrections, rewrite the full updated value with `set_memory` instead.',
       responseFormat: 'content_and_artifact',
       schema: z.object({
         key: z
@@ -546,9 +549,17 @@ ${memory ?? 'No existing memories'}`;
     }
     return await Promise.all(artifactPromises);
   } catch (error) {
+    const typedError = error as { message?: string; code?: string; type?: string } | undefined;
     logger.error(
       `[MemoryAgent] Failed to process memory | userId: ${userId} | conversationId: ${conversationId} | messageId: ${messageId}`,
-      { error },
+      {
+        error,
+        provider: llmConfig?.provider,
+        model: llmConfig?.model,
+        errorMessage: typedError?.message,
+        errorCode: typedError?.code,
+        errorType: typedError?.type,
+      },
     );
   }
 }

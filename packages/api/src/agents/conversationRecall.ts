@@ -8,10 +8,18 @@
  * Added: 2026-02-19
  * === VIVENTIUM END === */
 
-import { EToolResources, Tools } from 'librechat-data-provider';
+import {
+  buildConversationRecallFileId,
+  buildConversationRecallFilename,
+  ConversationRecallScope,
+  EToolResources,
+  FileContext,
+  Tools,
+} from 'librechat-data-provider';
 import type { Agent, AgentToolResources, TFile, TUser } from 'librechat-data-provider';
 
 export type ConversationRecallRuntimeScope = 'none' | 'all' | 'agent';
+export type ConversationRecallAttachmentMode = 'vector' | 'source_only';
 
 /**
  * Runtime policy:
@@ -78,6 +86,51 @@ export function mergeConversationRecallResources(params: {
   };
 
   return nextResources;
+}
+
+export function buildConversationRecallAttachmentFiles(params: {
+  userId: string;
+  scope: ConversationRecallRuntimeScope;
+  agentId?: string | null;
+  existingFiles?: TFile[] | null;
+  mode: ConversationRecallAttachmentMode;
+}): TFile[] {
+  const { userId, scope, agentId, existingFiles, mode } = params;
+  if (scope === 'none') {
+    return [];
+  }
+
+  const decorate = (file: TFile): TFile =>
+    ({
+      ...file,
+      viventiumConversationRecallMode: mode,
+    }) as TFile;
+
+  if (Array.isArray(existingFiles) && existingFiles.length > 0) {
+    return existingFiles.map((file) => decorate(file));
+  }
+
+  return [
+    decorate({
+      user: userId,
+      file_id: buildConversationRecallFileId({
+        userId,
+        scope: scope === 'agent' ? ConversationRecallScope.agent : ConversationRecallScope.all,
+        agentId,
+      }),
+      filename: buildConversationRecallFilename({
+        scope: scope === 'agent' ? ConversationRecallScope.agent : ConversationRecallScope.all,
+        agentId,
+      }),
+      filepath: 'conversation_recall',
+      object: 'file',
+      type: 'text/plain',
+      bytes: 0,
+      embedded: mode === 'vector',
+      usage: 0,
+      context: FileContext.conversation_recall,
+    } as TFile),
+  ];
 }
 
 export function ensureConversationRecallTool(tools?: string[] | null): string[] {

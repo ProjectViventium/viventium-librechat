@@ -66,6 +66,19 @@ viventium:
       - Never use {NTA} to hide errors/tool failures; explain the issue briefly instead.
 
       '
+  conversation_recall:
+    prompt: 'CONVERSATION RECALL:
+
+      - When the user asks about prior chats, earlier context, previous decisions,
+      or something mentioned before, use `file_search` to check conversation recall.
+
+      - For exact-history questions, verify with retrieved evidence instead of
+      guessing from memory alone.
+
+      - Do not answer live mailbox, calendar, or external-system status questions
+      from conversation recall alone; use the relevant live tool when available.
+
+      '
   configVersion: 1
   primaryProvider: openai
   installMode: native
@@ -446,10 +459,13 @@ memory:
     drafts: 1000
   maintenanceThresholdPercent: 80
   messageWindowSize: 15
+  historyContextMessageScanLimit: 40
+  historyContextUserTurnLimit: 4
+  historyContextCharLimit: 1200
   personalize: true
   agent:
-    provider: xai
-    model: grok-4-1-fast-non-reasoning
+    provider: anthropic
+    model: claude-sonnet-4-6
     model_parameters:
       temperature: 0.2
     instructions: "You are the Memory Archivist. Maintain a LIVING, ACCURATE memory.\
@@ -457,6 +473,13 @@ memory:
       When updating a key, you receive its EXISTING value. You MUST:\n- Start from\
       \ the existing value\n- ADD new information to it\n- MODIFY only what changed\
       \ (correct facts, update dates)\n- REMOVE only what is explicitly stale or contradicted\n\
+      - When the user asks to forget or remove only PART of memory, scan ALL keys\
+      \ before deciding what changes\n- For partial forgetting, rewrite every affected\
+      \ key with `set_memory` and remove ONLY the requested detail\n- Remove obvious\
+      \ aliases, abbreviations, and alternate spellings of the forgotten target across\
+      \ all affected keys when they clearly refer to the same entity\n- Use `delete_memory`\
+      \ ONLY when the ENTIRE key should disappear\n- Preserve unrelated history,\
+      \ change-tracking, and still-useful signals while removing the forgotten detail\n\
       - Output the FULL updated value (no diffs, no placeholders like \"...\" or \"\
       [previous preserved]\")\n- If nothing changed for a key, DO NOT call set_memory\
       \ for it\nException: `working` is overwritten each conversation (fresh state).\n\
@@ -558,7 +581,8 @@ memory:
       \ email/calendar content (but DO store appointments user mentions verbally)\n\
       - Your own speculative guesses (only user-confirmed facts)\n- Repeated identical\
       \ messages (note repetition as priority signal once, not each instance)\n- STT\
-      \ artifacts \u2014 clean garbled text when updating, don't preserve corruption\n\
+      \ artifacts \u2014 clean garbled text and repeated punctuation corruption when\
+      \ updating, don't preserve corruption\n\
       \n# ALWAYS STORE\n- Where user is going / what they're doing NOW\n- Times, appointments,\
       \ deadlines mentioned\n- Priority lists with specific names and numbers\n- Corrections\
       \ user makes\n- Emotional confessions and vulnerable moments\n- When user will\

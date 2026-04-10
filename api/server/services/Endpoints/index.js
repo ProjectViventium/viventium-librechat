@@ -1,5 +1,5 @@
 const { Providers } = require('@librechat/agents');
-const { EModelEndpoint } = require('librechat-data-provider');
+const { EModelEndpoint, normalizeProviderAlias } = require('librechat-data-provider');
 const { getCustomEndpointConfig } = require('@librechat/api');
 const initAnthropic = require('~/server/services/Endpoints/anthropic/initialize');
 const getBedrockOptions = require('~/server/services/Endpoints/bedrock/options');
@@ -41,27 +41,39 @@ const providerConfigMap = {
  * }}
  */
 function getProviderConfig({ provider, appConfig }) {
-  let getOptions = providerConfigMap[provider];
-  let overrideProvider = provider;
+  /* === VIVENTIUM START ===
+   * Feature: Shared provider alias normalization for runtime initialization.
+   * Added: 2026-04-09
+   * === VIVENTIUM END === */
+  const normalizedProvider = normalizeProviderAlias(provider);
+  let getOptions = providerConfigMap[normalizedProvider];
+  let overrideProvider = getOptions ? normalizedProvider : provider;
   /** @type {TEndpoint | undefined} */
   let customEndpointConfig;
 
-  if (!getOptions && providerConfigMap[provider.toLowerCase()] != null) {
-    overrideProvider = provider.toLowerCase();
-    getOptions = providerConfigMap[overrideProvider];
-  } else if (!getOptions) {
+  if (!getOptions) {
     customEndpointConfig = getCustomEndpointConfig({ endpoint: provider, appConfig });
     if (!customEndpointConfig) {
-      throw new Error(`Provider ${provider} not supported`);
+      throw new Error(
+        `Provider ${provider} not supported${
+          normalizedProvider !== provider ? ` (normalized: ${normalizedProvider})` : ''
+        }`,
+      );
     }
     getOptions = initCustom;
     overrideProvider = Providers.OPENAI;
   }
 
   if (isKnownCustomProvider(overrideProvider) && !customEndpointConfig) {
-    customEndpointConfig = getCustomEndpointConfig({ endpoint: provider, appConfig });
+    customEndpointConfig =
+      getCustomEndpointConfig({ endpoint: overrideProvider, appConfig }) ||
+      getCustomEndpointConfig({ endpoint: provider, appConfig });
     if (!customEndpointConfig) {
-      throw new Error(`Provider ${provider} not supported`);
+      throw new Error(
+        `Provider ${provider} not supported${
+          normalizedProvider !== provider ? ` (normalized: ${normalizedProvider})` : ''
+        }`,
+      );
     }
   }
 

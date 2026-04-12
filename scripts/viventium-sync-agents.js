@@ -730,23 +730,23 @@ function summarizeBackgroundCorticesDiff(leftValue, rightValue) {
     }
     const leftEntry = leftById.get(agentId) || {};
     const rightEntry = rightById.get(agentId) || {};
-    if (JSON.stringify(leftEntry) !== JSON.stringify(rightEntry)) {
-      const activationChangedFields = [];
-      const activationDetails = {};
-      const leftActivation = leftEntry.activation || {};
-      const rightActivation = rightEntry.activation || {};
-      const activationFieldNames = Array.from(
-        new Set([...Object.keys(leftActivation), ...Object.keys(rightActivation)]),
-      ).sort();
+    const activationChangedFields = [];
+    const activationDetails = {};
+    const leftActivation = leftEntry.activation || {};
+    const rightActivation = rightEntry.activation || {};
+    const activationFieldNames = Array.from(
+      new Set([...Object.keys(leftActivation), ...Object.keys(rightActivation)]),
+    ).sort();
 
-      for (const field of activationFieldNames) {
-        if (JSON.stringify(leftActivation[field] ?? null) === JSON.stringify(rightActivation[field] ?? null)) {
-          continue;
-        }
-        activationChangedFields.push(field);
-        activationDetails[field] = summarizeFieldDiff(field, leftActivation[field], rightActivation[field]);
+    for (const field of activationFieldNames) {
+      if (JSON.stringify(leftActivation[field] ?? null) === JSON.stringify(rightActivation[field] ?? null)) {
+        continue;
       }
+      activationChangedFields.push(field);
+      activationDetails[field] = summarizeFieldDiff(field, leftActivation[field], rightActivation[field]);
+    }
 
+    if (activationChangedFields.length > 0) {
       changedAgents.push({
         agentId,
         activationChangedFields,
@@ -862,8 +862,21 @@ function compareBundlesByAgent({
       if (JSON.stringify(leftValue ?? null) === JSON.stringify(rightValue ?? null)) {
         continue;
       }
+      const summary = summarizeFieldDiff(field, leftValue, rightValue);
+      if (
+        field === 'background_cortices' &&
+        summary &&
+        Array.isArray(summary.addedAgentIds) &&
+        Array.isArray(summary.removedAgentIds) &&
+        Array.isArray(summary.changedAgentIds) &&
+        summary.addedAgentIds.length === 0 &&
+        summary.removedAgentIds.length === 0 &&
+        summary.changedAgentIds.length === 0
+      ) {
+        continue;
+      }
       changedFields.push(field);
-      fieldDetails[field] = summarizeFieldDiff(field, leftValue, rightValue);
+      fieldDetails[field] = summary;
     }
 
     if (!changedFields.length) {
@@ -1236,6 +1249,36 @@ async function repairPersistedAgentRuntimeFields({ agentData, dryRun }) {
   };
 }
 
+function shouldRepairRuntimeFieldsForPushMode({
+  promptsOnly = false,
+  activationConfigOnly = false,
+  runtimeAware = false,
+}) {
+  if (!runtimeAware) {
+    return false;
+  }
+  if (promptsOnly || activationConfigOnly) {
+    return false;
+  }
+  return true;
+}
+
+function shouldPushStandaloneBackgroundAgent({
+  agentId,
+  selectedAgentIds = null,
+  activationConfigOnly = false,
+}) {
+  if (activationConfigOnly) {
+    return false;
+  }
+
+  if (Array.isArray(selectedAgentIds) && selectedAgentIds.length > 0) {
+    return selectedAgentIds.includes(agentId);
+  }
+
+  return true;
+}
+
 async function pushAgent({
   agentData,
   userId,
@@ -1243,6 +1286,7 @@ async function pushAgent({
   promptsOnly = false,
   activationConfigOnly = false,
   modelConfigOnly = false,
+  runtimeAware = false,
   activationFields = null,
   selectedAgentIds = null,
 }) {
@@ -1250,6 +1294,11 @@ async function pushAgent({
     return { id: null, status: 'skipped', reason: 'missing agent id' };
   }
   const existing = await Agent.findOne({ id: agentData.id }).lean();
+  const shouldRepairRuntimeFields = shouldRepairRuntimeFieldsForPushMode({
+    promptsOnly,
+    activationConfigOnly,
+    runtimeAware,
+  });
   /* === VIVENTIUM START ===
    * Feature: Auto-create agents that exist in source-of-truth YAML but not yet in MongoDB.
    * Root cause: --prompts-only push added activation entries to mainAgent.background_cortices
@@ -1309,7 +1358,9 @@ async function pushAgent({
       id: agentData.id,
       status: 'created',
       fieldsSet: Object.keys(createData),
-      runtimeRepair: await repairPersistedAgentRuntimeFields({ agentData, dryRun }),
+      runtimeRepair: shouldRepairRuntimeFields
+        ? await repairPersistedAgentRuntimeFields({ agentData, dryRun })
+        : { repaired: false, reason: 'safe-mode-skipped' },
     };
   }
 
@@ -1329,7 +1380,9 @@ async function pushAgent({
   if (!dryRun) {
     await updateAgent({ id: agentData.id }, updateData, { updatingUserId: userId });
   }
-  const runtimeRepair = await repairPersistedAgentRuntimeFields({ agentData, dryRun });
+  const runtimeRepair = shouldRepairRuntimeFields
+    ? await repairPersistedAgentRuntimeFields({ agentData, dryRun })
+    : { repaired: false, reason: 'safe-mode-skipped' };
 
   return {
     id: agentData.id,
@@ -1423,6 +1476,7 @@ async function pushBundle({
         promptsOnly,
         activationConfigOnly,
         modelConfigOnly,
+        runtimeAware,
         activationFields,
         selectedAgentIds,
       }),
@@ -1441,11 +1495,19 @@ async function pushBundle({
         results.push({ id: agentData.id || null, status: 'missing', reason: 'marked missing' });
         continue;
       }
-      if (selectedIdSet && !selectedIdSet.has(agentData.id)) {
+      if (
+        !shouldPushStandaloneBackgroundAgent({
+          agentId: agentData.id,
+          selectedAgentIds,
+          activationConfigOnly,
+        })
+      ) {
         results.push({
           id: agentData.id,
           status: 'skipped',
-          reason: 'filtered out by --agent-ids',
+          reason: activationConfigOnly
+            ? 'activation-config-only is owned by main agent background_cortices'
+            : 'filtered out by --agent-ids',
         });
         continue;
       }
@@ -1457,6 +1519,7 @@ async function pushBundle({
           promptsOnly,
           activationConfigOnly,
           modelConfigOnly,
+          runtimeAware,
           activationFields,
           selectedAgentIds,
         }),
@@ -1844,4 +1907,6 @@ module.exports = {
   mergeBackgroundCorticesActivationFields,
   resolveSafeActivationFields,
   shouldApplyRuntimeOverrides,
+  shouldRepairRuntimeFieldsForPushMode,
+  shouldPushStandaloneBackgroundAgent,
 };

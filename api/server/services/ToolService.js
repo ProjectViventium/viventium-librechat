@@ -673,9 +673,17 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
 
   if (pendingOAuthServers.size > 0 && (res || streamId)) {
     const serverNames = Array.from(pendingOAuthServers);
-    const oauthDecision = getMcpOAuthWaitDecision(req, pendingOAuthServers);
-    const { waitForOAuth, hasToolIntent, surface, mode, relevantPendingOAuthServers = [] } =
-      oauthDecision;
+    const oauthDecision = getMcpOAuthWaitDecision(req, pendingOAuthServers, {
+      toolDefinitions,
+      toolRegistry,
+    });
+    const {
+      waitForOAuth,
+      hasSpecializedAlternatives,
+      surface,
+      mode,
+      relevantPendingOAuthServers = [],
+    } = oauthDecision;
     const serversToWait = new Set(waitForOAuth ? relevantPendingOAuthServers : []);
     const serversToStrip = serverNames.filter((serverName) => !serversToWait.has(serverName));
 
@@ -691,7 +699,7 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
 
       if (stripped.removedToolNames.length > 0) {
         logger.info(
-          `[Tool Definitions] Stripped ${stripped.removedToolNames.length} OAuth-pending MCP tool(s) for non-wait turn path (surface=${surface}, intent=${hasToolIntent}, stripped=${serversToStrip.join(
+          `[Tool Definitions] Stripped ${stripped.removedToolNames.length} OAuth-pending MCP tool(s) for non-wait turn path (surface=${surface}, specializedAlternatives=${hasSpecializedAlternatives}, stripped=${serversToStrip.join(
             ', ',
           )}, wait=${Array.from(serversToWait).join(', ') || 'none'})`,
         );
@@ -700,7 +708,7 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
 
     if (!waitForOAuth) {
       logger.info(
-        `[Tool Definitions] OAuth wait skipped (surface=${surface}, mode=${mode}, intent=${hasToolIntent}, relevant=${relevantPendingOAuthServers.join(
+        `[Tool Definitions] OAuth wait skipped (surface=${surface}, mode=${mode}, specializedAlternatives=${hasSpecializedAlternatives}, relevant=${relevantPendingOAuthServers.join(
           ', ',
         ) || 'none'}) for server(s): ${serverNames.join(
           ', ',

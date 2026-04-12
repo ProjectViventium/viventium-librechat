@@ -15,6 +15,8 @@ const {
   normalizeBundleForSourceOfTruth,
   resolveSafeActivationFields,
   shouldApplyRuntimeOverrides,
+  shouldRepairRuntimeFieldsForPushMode,
+  shouldPushStandaloneBackgroundAgent,
 } = require('../../../scripts/viventium-sync-agents');
 
 describe('viventium-sync-agents args', () => {
@@ -88,6 +90,57 @@ describe('viventium-sync-agents args', () => {
     const args = parseArgs(['push', '--env=cloud', '--runtime-aware']);
 
     expect(shouldApplyRuntimeOverrides(args)).toBe(true);
+  });
+
+  test('safe prompt pushes do not run runtime repair', () => {
+    expect(
+      shouldRepairRuntimeFieldsForPushMode({
+        promptsOnly: true,
+        runtimeAware: true,
+      }),
+    ).toBe(false);
+  });
+
+  test('safe activation pushes do not run runtime repair', () => {
+    expect(
+      shouldRepairRuntimeFieldsForPushMode({
+        activationConfigOnly: true,
+        runtimeAware: true,
+      }),
+    ).toBe(false);
+  });
+
+  test('full runtime-aware pushes still run runtime repair', () => {
+    expect(
+      shouldRepairRuntimeFieldsForPushMode({
+        runtimeAware: true,
+      }),
+    ).toBe(true);
+  });
+
+  test('activation-config-only skips standalone background agent document pushes', () => {
+    expect(
+      shouldPushStandaloneBackgroundAgent({
+        agentId: 'agent-a',
+        selectedAgentIds: ['agent-a'],
+        activationConfigOnly: true,
+      }),
+    ).toBe(false);
+  });
+
+  test('non-activation safe modes still honor selected background agent ids', () => {
+    expect(
+      shouldPushStandaloneBackgroundAgent({
+        agentId: 'agent-a',
+        selectedAgentIds: ['agent-a'],
+      }),
+    ).toBe(true);
+    expect(
+      shouldPushStandaloneBackgroundAgent({
+        agentId: 'agent-b',
+        selectedAgentIds: ['agent-a'],
+      }),
+    ).toBe(false);
   });
 
   test('parseArgs captures surgical agent id filters', () => {
@@ -318,6 +371,47 @@ describe('viventium-sync-agents args', () => {
         }),
       ]),
     );
+  });
+
+  test('compareBundlesByAgent ignores background cortex metadata noise when activation matches', () => {
+    const diff = compareBundlesByAgent({
+      leftBundle: {
+        mainAgent: {
+          id: 'main',
+          name: 'Viventium',
+          background_cortices: [
+            {
+              agent_id: 'agent-ms365',
+              activation: {
+                prompt: 'same prompt',
+                confidence_threshold: 0.7,
+              },
+            },
+          ],
+        },
+        backgroundAgents: [],
+      },
+      rightBundle: {
+        mainAgent: {
+          id: 'main',
+          name: 'Viventium',
+          background_cortices: [
+            {
+              agent_id: 'agent-ms365',
+              activation: {
+                prompt: 'same prompt',
+                confidence_threshold: 0.7,
+              },
+              status: 'runtime-noise',
+            },
+          ],
+        },
+        backgroundAgents: [],
+      },
+    });
+
+    expect(diff.diffs).toEqual([]);
+    expect(diff.diffCount).toBe(0);
   });
 
   test('compareNamedFields surfaces adjacent webSearch drift in librechat config review', () => {

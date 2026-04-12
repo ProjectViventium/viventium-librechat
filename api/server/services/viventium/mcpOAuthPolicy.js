@@ -29,8 +29,6 @@ const normalizeWaitPolicy = (value) => {
   return 'intent';
 };
 
-const getServerIntentKeywords = (serverName) => DEFAULT_SERVER_INTENT_KEYWORDS[serverName] ?? [];
-
 const getSurface = (req) => {
   if (req?._viventiumTelegram) {
     return 'telegram';

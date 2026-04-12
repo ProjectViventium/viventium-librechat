@@ -120,6 +120,7 @@ export const agentBaseSchema = z.object({
    */
   voice_llm_model: z.string().nullable().optional(),
   voice_llm_provider: z.string().nullable().optional(),
+  voice_llm_model_parameters: z.record(z.unknown()).optional(),
   /* === VIVENTIUM END === */
 });
 

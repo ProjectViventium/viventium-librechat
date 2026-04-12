@@ -1523,7 +1523,7 @@ describe('models/Agent', () => {
 
       const emptyParamsAgent = await getAgent({ id: agentId });
       expect(emptyParamsAgent.versions).toHaveLength(4);
-      expect(emptyParamsAgent.model_parameters).toEqual({});
+      expect(emptyParamsAgent.model_parameters).toEqual({ model: 'test-model' });
     });
 
     test('should not create new version for duplicate updates', async () => {

@@ -130,6 +130,27 @@ function isVoiceModelValid(voiceLlmModel, voiceProvider, req, modelsConfig) {
   return providerModels.includes(model);
 }
 
+function cloneModelParameters(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+  return { ...value };
+}
+
+function resolveVoiceModelParameters(agent, voiceLlmModel) {
+  const resolved = {
+    ...cloneModelParameters(agent?.model_parameters),
+    ...cloneModelParameters(agent?.voice_llm_model_parameters),
+  };
+
+  const model = String(voiceLlmModel || agent?.voice_llm_model || '').trim();
+  if (model) {
+    resolved.model = model;
+  }
+
+  return resolved;
+}
+
 /**
  * Apply voice model override to agent object (mutates in place).
  * Must be called BEFORE validateAgentModel() so the swapped model is validated.
@@ -166,9 +187,7 @@ function applyVoiceModelOverride(agent, req, modelsConfig) {
 
   agent.model = voiceLlmModel;
   agent.provider = voiceProvider;
-  if (agent.model_parameters && typeof agent.model_parameters === 'object') {
-    agent.model_parameters.model = voiceLlmModel;
-  }
+  agent.model_parameters = resolveVoiceModelParameters(agent, voiceLlmModel);
 
   return agent;
 }
@@ -177,5 +196,6 @@ module.exports = {
   isVoiceCallActive,
   isVoiceModelValid,
   resolveVoiceOverrideAssignment,
+  resolveVoiceModelParameters,
   applyVoiceModelOverride,
 };

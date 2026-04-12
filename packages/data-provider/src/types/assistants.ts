@@ -343,6 +343,7 @@ export type Agent = {
    */
   voice_llm_model?: string | null;
   voice_llm_provider?: string | null;
+  voice_llm_model_parameters?: AgentModelParameters;
   /* === VIVENTIUM END === */
 };
 
@@ -375,6 +376,7 @@ export type AgentCreateParams = {
   /* === VIVENTIUM END === */
   | 'voice_llm_model'
   | 'voice_llm_provider'
+  | 'voice_llm_model_parameters'
 >;
 
 export type AgentUpdateParams = {
@@ -408,6 +410,7 @@ export type AgentUpdateParams = {
   /* === VIVENTIUM END === */
   | 'voice_llm_model'
   | 'voice_llm_provider'
+  | 'voice_llm_model_parameters'
 >;
 
 export type AgentListParams = {

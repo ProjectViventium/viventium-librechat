@@ -413,6 +413,40 @@ function buildCanonicalPersistedAgentFields(agent, existingAgent = null) {
     patch.voice_llm_model = agent.voice_llm_model ?? null;
   }
 
+  const hasIncomingVoiceModelParameters = Object.prototype.hasOwnProperty.call(
+    agent,
+    'voice_llm_model_parameters',
+  );
+  const existingVoiceModelParameters =
+    existingAgent?.voice_llm_model_parameters &&
+    typeof existingAgent.voice_llm_model_parameters === 'object' &&
+    !Array.isArray(existingAgent.voice_llm_model_parameters)
+      ? deepClone(existingAgent.voice_llm_model_parameters)
+      : {};
+  const incomingVoiceModelParameters =
+    hasIncomingVoiceModelParameters &&
+    agent.voice_llm_model_parameters &&
+    typeof agent.voice_llm_model_parameters === 'object' &&
+    !Array.isArray(agent.voice_llm_model_parameters)
+      ? deepClone(agent.voice_llm_model_parameters)
+      : {};
+
+  if (
+    hasIncomingVoiceModelParameters ||
+    Object.prototype.hasOwnProperty.call(agent, 'voice_llm_model')
+  ) {
+    const mergedVoiceModelParameters =
+      patch.voice_llm_model === null
+        ? {}
+        : {
+            ...existingVoiceModelParameters,
+            ...incomingVoiceModelParameters,
+            ...(patch.voice_llm_model ? { model: patch.voice_llm_model } : {}),
+          };
+
+    patch.voice_llm_model_parameters = mergedVoiceModelParameters;
+  }
+
   return Object.keys(patch).length > 0 ? patch : null;
 }
 

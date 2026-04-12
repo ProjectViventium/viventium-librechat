@@ -88,6 +88,12 @@ const EXISTING_MEMORY_NOISE_PATTERNS: RegExp[] = [...NOISE_PATTERNS, /\brepeated
 
 const TODAY_TOKEN_ENCODING = 'o200k_base';
 const WORLD_PRECOMPACT_THRESHOLD_PERCENT = 85;
+const CONTEXT_EXPIRY_DAYS = 7;
+const WORKING_STALE_AFTER_DAYS = 1;
+const WORKING_EXPIRY_DAYS = 3;
+const STALE_IN_PROGRESS_DRAFT_ARCHIVE_DAYS = 14;
+const NOISY_SEMICOLON_RUN_RE = /(?:\s*;\s*){2,}/g;
+const NOISY_SEMICOLON_RUN_TEST_RE = /(?:\s*;\s*){2,}/;
 const WORLD_TEMPORAL_MARKERS: RegExp[] = [
   /\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)(?:day)?\b/i,
   /\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)(?:[a-z]+)?\b/i,
@@ -151,6 +157,8 @@ type DraftRecord = {
   status?: string;
   started?: string;
   lastWorked?: string;
+  archived?: boolean;
+  archiveSummary?: string;
   direction?: string;
   next?: string;
   notes: string[];
@@ -353,6 +361,12 @@ export function createMemoryMaintenancePlan({
   const hasNoise = Array.from(memoryMap.values()).some((memory) =>
     containsOperationalNoise(memory.value, true),
   );
+  const hasSeparatorCorruption = Array.from(memoryMap.values()).some((memory) =>
+    containsSeparatorCorruption(memory.value),
+  );
+  const hasExpiredContext = hasExpiredContextSnapshot(memoryMap.get('context')?.value, now);
+  const hasExpiredWorking = hasExpiredWorkingSnapshot(memoryMap.get('working')?.value, now);
+  const hasStaleActiveDrafts = hasLongIdleActiveDrafts(memoryMap.get('drafts')?.value, now);
   const keysOverLimit =
     keyLimits == null
       ? []
@@ -380,6 +394,10 @@ export function createMemoryMaintenancePlan({
   if (
     !needsThresholdRelief &&
     !hasNoise &&
+    !hasSeparatorCorruption &&
+    !hasExpiredContext &&
+    !hasExpiredWorking &&
+    !hasStaleActiveDrafts &&
     keysOverLimit.length === 0 &&
     keysNearLimit.length === 0
   ) {
@@ -400,6 +418,18 @@ export function createMemoryMaintenancePlan({
   }
   if (hasNoise) {
     reason.push('existing memories contain scheduler or tool residue');
+  }
+  if (hasSeparatorCorruption) {
+    reason.push('existing memories contain repeated separator corruption');
+  }
+  if (hasExpiredContext) {
+    reason.push('context expired and needs refresh');
+  }
+  if (hasExpiredWorking) {
+    reason.push('working snapshot is stale or expired');
+  }
+  if (hasStaleActiveDrafts) {
+    reason.push('drafts contain long-idle active work');
   }
   if (keysOverLimit.length > 0) {
     reason.push(`keys over budget: ${keysOverLimit.join(', ')}`);
@@ -445,7 +475,7 @@ export function createMemoryMaintenancePlan({
   const updates: MemoryMaintenanceUpdate[] = [];
   for (const memory of memories) {
     const next = memoryMap.get(memory.key);
-    if (!next || normalizeText(next.value) === normalizeText(memory.value)) {
+    if (!next || normalizeComparisonText(next.value) === normalizeComparisonText(memory.value)) {
       continue;
     }
     updates.push({
@@ -538,7 +568,7 @@ function applyTransform(
   }
 
   const nextValue = transform(entry);
-  if (normalizeText(nextValue) === normalizeText(entry.value)) {
+  if (normalizeComparisonText(nextValue) === normalizeComparisonText(entry.value)) {
     return;
   }
 
@@ -746,6 +776,15 @@ function buildDraftsValue(
       compactSentence(summarySource, summaryWords) || 'See conversation history.';
     const compactNext = compactSentence(nextSource, nextWords) || 'Review conversation history.';
     const lastWorked = record.lastWorked || record.started || 'unknown';
+    if (record.archived) {
+      const archivedSummary =
+        compactSentence(record.archiveSummary || `${record.thread}: ${summarySource || nextSource || record.status || 'done'}`, 16) ||
+        `${record.thread}: ${record.status || 'done'}`;
+      archived.push(
+        `- ${record.thread} | ${record.status || 'done'} | last_worked: ${lastWorked} | ${archivedSummary}`,
+      );
+      continue;
+    }
     const archivedThread =
       isArchiveableDraft(record, now) &&
       compactSentence(
@@ -794,7 +833,7 @@ export function prepareMemoryValueForWrite({
   thresholdPercent?: number;
   now?: Date;
 }): { value: string; tokenCount: number; compacted: boolean } {
-  const trimmed = typeof value === 'string' ? value.trim() : '';
+  const trimmed = typeof value === 'string' ? collapseSeparatorNoise(value).trim() : '';
   if (!trimmed) {
     return { value: '', tokenCount: 0, compacted: false };
   }
@@ -941,8 +980,8 @@ function buildContextValue(
   trackWords: number,
   openLoopCount: number,
 ): string {
-  const updated = getDateMarker(value, '_updated') ?? formatDateOnly(now);
-  const expires = getDateMarker(value, '_expires');
+  const updated = formatDateOnly(now);
+  const expires = addDays(updated, CONTEXT_EXPIRY_DAYS);
   const lines: string[] = [];
 
   for (const rawLine of value.split(/\r?\n/)) {
@@ -973,9 +1012,7 @@ function buildContextValue(
   }
 
   lines.push(`_updated: ${updated}`);
-  if (expires) {
-    lines.push(`_expires: ${expires}`);
-  }
+  lines.push(`_expires: ${expires}`);
   return lines.join('\n').trim();
 }
 
@@ -1011,8 +1048,8 @@ function compactWorkingValue(value: string, now: Date, keyLimit?: number): strin
   }
 
   const updated = formatDateOnly(now);
-  const staleAfter = addDays(updated, 1);
-  const expires = addDays(updated, 3);
+  const staleAfter = addDays(updated, WORKING_STALE_AFTER_DAYS);
+  const expires = addDays(updated, WORKING_EXPIRY_DAYS);
   let candidate = `${compactBody}\n_updated: ${updated} | _stale_after: ${staleAfter} | _expires: ${expires}`;
 
   if (keyLimit != null && countTokens(candidate) > keyLimit) {
@@ -1133,10 +1170,20 @@ function parseDrafts(value: string): DraftRecord[] {
   const records: DraftRecord[] = [];
   let current: DraftRecord | null = null;
   let section: 'notes' | 'next_steps' | null = null;
+  let inArchivedSection = false;
 
   for (const rawLine of value.split(/\r?\n/)) {
     const line = rawLine.trim();
-    if (!line || isMarkerLine(line) || line === 'Archived:') {
+    if (!line || isMarkerLine(line)) {
+      continue;
+    }
+    if (line === 'Archived:') {
+      if (current) {
+        records.push(current);
+        current = null;
+      }
+      section = null;
+      inArchivedSection = true;
       continue;
     }
     if (line.startsWith('- thread: ')) {
@@ -1152,6 +1199,23 @@ function parseDrafts(value: string): DraftRecord[] {
       current.status = threadLine.match(/\bstatus:\s*([^|]+)/i)?.[1]?.trim();
       current.lastWorked = threadLine.match(/\blast_worked:\s*(\d{4}-\d{2}-\d{2})/i)?.[1];
       section = null;
+      inArchivedSection = false;
+      continue;
+    }
+    if (inArchivedSection && line.startsWith('- ')) {
+      const archivedMatch = line.match(/^- (.+?) \| ([^|]+) \| last_worked: ([^|]+) \| (.+)$/i);
+      if (archivedMatch) {
+        const [, thread, status, lastWorkedRaw, archiveSummary] = archivedMatch;
+        records.push({
+          thread: thread.trim(),
+          status: status.trim(),
+          lastWorked: lastWorkedRaw.trim() === 'unknown' ? undefined : lastWorkedRaw.trim(),
+          archived: true,
+          archiveSummary: archiveSummary.trim(),
+          notes: [],
+          nextSteps: [],
+        });
+      }
       continue;
     }
     if (!current) {
@@ -1298,7 +1362,11 @@ function compactSentence(value: string | undefined, wordLimit: number): string {
 
   const accepted: string[] = [];
   let usedWords = 0;
-  for (const clause of clauses) {
+  for (const rawClause of clauses) {
+    const clause = rawClause.replace(/[,.;:-]+$/, '').trim();
+    if (!clause) {
+      continue;
+    }
     const clauseWords = clause.split(/\s+/).filter(Boolean);
     if (accepted.length > 0 && usedWords + clauseWords.length > wordLimit) {
       break;
@@ -1328,7 +1396,22 @@ function truncateWords(words: string[], wordLimit: number): string {
   return `${words.slice(0, wordLimit).join(' ')}...`;
 }
 
+function collapseSeparatorNoise(value: string): string {
+  return value
+    .split(/\r?\n/)
+    .map((line) => line.replace(NOISY_SEMICOLON_RUN_RE, '; '))
+    .join('\n');
+}
+
 function normalizeText(value?: string): string {
+  const normalized = normalizeComparisonText(value);
+  if (!normalized) {
+    return '';
+  }
+  return collapseSeparatorNoise(normalized);
+}
+
+function normalizeComparisonText(value?: string): string {
   if (typeof value !== 'string') {
     return '';
   }
@@ -1357,6 +1440,7 @@ function sanitizeOperationalText(value?: string): string {
     .replace(/\bquiet state\b/gi, '')
     .replace(/\brepeated checks?\b/gi, '')
     .replace(/\{NTA\}/gi, '')
+    .replace(NOISY_SEMICOLON_RUN_RE, '; ')
     .replace(/\s+/g, ' ')
     .replace(/\s+([,.;:!?])/g, '$1')
     .trim();
@@ -1374,6 +1458,13 @@ function getBlockedPattern(value: string): string | undefined {
 
 function matchesNoiseLine(line: string): boolean {
   return EXISTING_MEMORY_NOISE_PATTERNS.some((pattern) => pattern.test(line));
+}
+
+function containsSeparatorCorruption(value?: string): boolean {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    return false;
+  }
+  return NOISY_SEMICOLON_RUN_TEST_RE.test(value);
 }
 
 function containsWorldTemporalResidue(value: string): boolean {
@@ -1603,10 +1694,55 @@ function addDays(dateOnly: string, days: number): string {
   return formatDateOnly(date);
 }
 
-function isArchiveableDraft(record: DraftRecord, now: Date): boolean {
-  if (!record.status || !['done', 'paused'].includes(record.status)) {
+function hasExpiredContextSnapshot(value: string | undefined, now: Date): boolean {
+  if (!value) {
     return false;
   }
+  return isDateMarkerBefore(value, '_expires', now);
+}
+
+function hasExpiredWorkingSnapshot(value: string | undefined, now: Date): boolean {
+  if (!value) {
+    return false;
+  }
+  return isDateMarkerBefore(value, '_stale_after', now) || isDateMarkerBefore(value, '_expires', now);
+}
+
+function hasLongIdleActiveDrafts(value: string | undefined, now: Date): boolean {
+  if (!value) {
+    return false;
+  }
+  return parseDrafts(value).some(
+    (record) => !record.archived && (record.status || '').toLowerCase() === 'in_progress' && isLongIdleActiveDraft(record, now),
+  );
+}
+
+function isLongIdleActiveDraft(record: DraftRecord, now: Date): boolean {
+  const dateValue = record.lastWorked || record.started;
+  if (!dateValue) {
+    return false;
+  }
+  return addDays(dateValue, STALE_IN_PROGRESS_DRAFT_ARCHIVE_DAYS) <= formatDateOnly(now);
+}
+
+function isArchiveableDraft(record: DraftRecord, now: Date): boolean {
+  if (record.archived) {
+    return true;
+  }
+
+  const status = (record.status || '').toLowerCase();
+  if (!status) {
+    return false;
+  }
+
+  if (status === 'in_progress') {
+    return isLongIdleActiveDraft(record, now);
+  }
+
+  if (!['done', 'paused'].includes(status)) {
+    return false;
+  }
+
   const dateValue = record.lastWorked || record.started;
   if (!dateValue) {
     return true;

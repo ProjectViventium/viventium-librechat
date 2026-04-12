@@ -68,6 +68,46 @@ function normalizeAgentModelFields(agentLike, options = {}) {
   return normalized;
 }
 
+function normalizeVoiceAgentModelFields(agentLike, options = {}) {
+  if (!agentLike || typeof agentLike !== 'object') {
+    return agentLike;
+  }
+
+  const normalized = { ...agentLike };
+  const existingVoiceModelParameters =
+    options.existingVoiceModelParameters && typeof options.existingVoiceModelParameters === 'object'
+      ? { ...options.existingVoiceModelParameters }
+      : undefined;
+
+  let voiceModelParameters =
+    normalized.voice_llm_model_parameters &&
+    typeof normalized.voice_llm_model_parameters === 'object' &&
+    !Array.isArray(normalized.voice_llm_model_parameters)
+      ? { ...normalized.voice_llm_model_parameters }
+      : existingVoiceModelParameters;
+
+  const topLevelVoiceModel =
+    typeof normalized.voice_llm_model === 'string' && normalized.voice_llm_model.trim().length > 0
+      ? normalized.voice_llm_model.trim()
+      : '';
+  const parameterVoiceModel =
+    typeof voiceModelParameters?.model === 'string' && voiceModelParameters.model.trim().length > 0
+      ? voiceModelParameters.model.trim()
+      : '';
+
+  if (topLevelVoiceModel && voiceModelParameters) {
+    voiceModelParameters.model = topLevelVoiceModel;
+  } else if (!topLevelVoiceModel && parameterVoiceModel) {
+    normalized.voice_llm_model = parameterVoiceModel;
+  }
+
+  if (voiceModelParameters) {
+    normalized.voice_llm_model_parameters = voiceModelParameters;
+  }
+
+  return normalized;
+}
+
 /* === VIVENTIUM START ===
  * Feature: Deep Telegram timing instrumentation (toggleable)
  * Purpose: Surface agent load latency (db/cache) in Telegram traces.
@@ -182,14 +222,14 @@ const _clearAgentCache = async (agentId) => {
  * @throws {Error} If the agent creation fails.
  */
 const createAgent = async (agentData) => {
-  const normalizedAgentData = normalizeAgentModelFields(agentData);
+  const normalizedAgentData = normalizeVoiceAgentModelFields(normalizeAgentModelFields(agentData));
   const { author: _author, ...versionData } = normalizedAgentData;
   const timestamp = new Date();
   const initialAgentData = {
     ...normalizedAgentData,
     versions: [
       {
-        ...normalizeAgentModelFields(versionData),
+        ...normalizeVoiceAgentModelFields(normalizeAgentModelFields(versionData)),
         createdAt: timestamp,
         updatedAt: timestamp,
       },
@@ -203,7 +243,9 @@ const createAgent = async (agentData) => {
    * Purpose: Immediately cache the created agent to avoid first-read latency (Telegram/UI).
    * Added: 2026-02-07
    */
-  const created = normalizeAgentModelFields((await Agent.create(initialAgentData)).toObject());
+  const created = normalizeVoiceAgentModelFields(
+    normalizeAgentModelFields((await Agent.create(initialAgentData)).toObject()),
+  );
   await _cacheAgent(created);
   return created;
   /* === VIVENTIUM END === */
@@ -242,7 +284,7 @@ const _getAgentWithCache = async (searchParameter) => {
   }
   const agent = await Agent.findOne(searchParameter).lean();
   if (agent) {
-    const normalizedAgent = normalizeAgentModelFields(agent);
+    const normalizedAgent = normalizeVoiceAgentModelFields(normalizeAgentModelFields(agent));
     await _cacheAgent(normalizedAgent);
     return normalizedAgent;
   }
@@ -257,7 +299,9 @@ const _getAgentWithCache = async (searchParameter) => {
  * @returns {Promise<Agent[]>} Array of agent documents as plain objects.
  */
 const getAgents = async (searchParameter) =>
-  (await Agent.find(searchParameter).lean()).map((agent) => normalizeAgentModelFields(agent));
+  (await Agent.find(searchParameter).lean()).map((agent) =>
+    normalizeVoiceAgentModelFields(normalizeAgentModelFields(agent)),
+  );
 
 /**
  * Load an agent based on the provided ID
@@ -386,7 +430,7 @@ const loadAgent = async ({ req, spec, agent_id, endpoint, model_parameters }) =>
     return null;
   }
 
-  const normalizedAgent = normalizeAgentModelFields(agent);
+  const normalizedAgent = normalizeVoiceAgentModelFields(normalizeAgentModelFields(agent));
   normalizedAgent.version = normalizedAgent.versions ? normalizedAgent.versions.length : 0;
   return normalizedAgent;
 };
@@ -583,9 +627,14 @@ const updateAgent = async (searchParameter, updateData, options = {}) => {
       author: _author,
       ...versionData
     } = currentAgent.toObject();
-    updateData = normalizeAgentModelFields(updateData, {
-      existingModelParameters: versionData.model_parameters,
-    });
+    updateData = normalizeVoiceAgentModelFields(
+      normalizeAgentModelFields(updateData, {
+        existingModelParameters: versionData.model_parameters,
+      }),
+      {
+        existingVoiceModelParameters: versionData.voice_llm_model_parameters,
+      },
+    );
     const { $push, $pull, $addToSet, ...directUpdates } = updateData;
 
     // Sync mcpServerNames when tools are updated
@@ -636,14 +685,18 @@ const updateAgent = async (searchParameter, updateData, options = {}) => {
       const duplicateVersion = isDuplicateVersion(updateData, versionData, versions, actionsHash);
       if (duplicateVersion && !forceVersion) {
         if (hasDirectUpdateDrift && !$push && !$pull && !$addToSet) {
-          const repaired = normalizeAgentModelFields(
-            await Agent.findOneAndUpdate(searchParameter, directUpdates, mongoOptions).lean(),
+          const repaired = normalizeVoiceAgentModelFields(
+            normalizeAgentModelFields(
+              await Agent.findOneAndUpdate(searchParameter, directUpdates, mongoOptions).lean(),
+            ),
           );
           await _cacheAgent(repaired);
           return repaired;
         }
         // No changes detected, return the current agent without creating a new version
-        const agentObj = normalizeAgentModelFields(currentAgent.toObject());
+        const agentObj = normalizeVoiceAgentModelFields(
+          normalizeAgentModelFields(currentAgent.toObject()),
+        );
         agentObj.version = versions.length;
         /* === VIVENTIUM START ===
          * Feature: Keep agent cache warm on no-op updates
@@ -685,9 +738,11 @@ const updateAgent = async (searchParameter, updateData, options = {}) => {
    * Purpose: Keep cached agent aligned with the latest DB version after writes.
    * Added: 2026-02-07
    */
-  updateData = normalizeAgentModelFields(updateData);
-  const updated = normalizeAgentModelFields(
-    await Agent.findOneAndUpdate(searchParameter, updateData, mongoOptions).lean(),
+  updateData = normalizeVoiceAgentModelFields(normalizeAgentModelFields(updateData));
+  const updated = normalizeVoiceAgentModelFields(
+    normalizeAgentModelFields(
+      await Agent.findOneAndUpdate(searchParameter, updateData, mongoOptions).lean(),
+    ),
   );
   await _cacheAgent(updated);
   return updated;
@@ -1074,8 +1129,10 @@ const revertAgentVersion = async (searchParameter, versionIndex) => {
   delete updateData.author;
   delete updateData.updatedBy;
 
-  return normalizeAgentModelFields(
-    await Agent.findOneAndUpdate(searchParameter, updateData, { new: true }).lean(),
+  return normalizeVoiceAgentModelFields(
+    normalizeAgentModelFields(
+      await Agent.findOneAndUpdate(searchParameter, updateData, { new: true }).lean(),
+    ),
   );
 };
 

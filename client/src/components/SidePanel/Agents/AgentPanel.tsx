@@ -95,6 +95,7 @@ export function composeAgentUpdatePayload(data: AgentForm, agent_id?: string | n
      */
     voice_llm_model,
     voice_llm_provider,
+    voice_llm_model_parameters,
     /* === VIVENTIUM END === */
   } = data;
 
@@ -112,6 +113,15 @@ export function composeAgentUpdatePayload(data: AgentForm, agent_id?: string | n
       : model
         ? { model }
         : model_parameters;
+  const alignedVoiceModelParameters =
+    voice_llm_model_parameters && typeof voice_llm_model_parameters === 'object'
+      ? {
+          ...voice_llm_model_parameters,
+          ...(voice_llm_model ? { model: voice_llm_model } : {}),
+        }
+      : voice_llm_model
+        ? { model: voice_llm_model }
+        : undefined;
 
   return {
     payload: {
@@ -153,6 +163,9 @@ export function composeAgentUpdatePayload(data: AgentForm, agent_id?: string | n
        */
       voice_llm_model: voice_llm_model ?? null,
       voice_llm_provider: voice_llm_provider ?? null,
+      ...(alignedVoiceModelParameters !== undefined
+        ? { voice_llm_model_parameters: alignedVoiceModelParameters }
+        : {}),
       /* === VIVENTIUM END === */
       ...(shouldResetAvatar ? { avatar: null } : {}),
     },

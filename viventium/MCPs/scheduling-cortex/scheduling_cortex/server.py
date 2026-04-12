@@ -116,6 +116,47 @@ def _resolve_actor_id(explicit_actor: Optional[str], agent_id: str) -> str:
 
 
 # === VIVENTIUM NOTE ===
+# Feature: Summary-safe schedule browsing.
+# Purpose: Keep list/search browsing useful without leaking full internal prompts or
+# generated delivery text into ordinary answer-building context.
+def serialize_task_summary(task: Dict[str, Any]) -> Dict[str, Any]:
+    if not task:
+        return {}
+    payload = ScheduleTask(**task).model_dump()
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    summary = (
+        str(metadata.get("name") or "").strip()
+        or str(metadata.get("template_id") or "").strip()
+        or str(payload.get("prompt") or "").strip().splitlines()[0][:120]
+        or "scheduled task"
+    )
+    return {
+        "id": payload.get("id"),
+        "user_id": payload.get("user_id"),
+        "agent_id": payload.get("agent_id"),
+        "channel": payload.get("channel"),
+        "schedule": payload.get("schedule"),
+        "conversation_policy": payload.get("conversation_policy"),
+        "active": payload.get("active"),
+        "created_by": payload.get("created_by"),
+        "created_source": payload.get("created_source"),
+        "created_at": payload.get("created_at"),
+        "updated_at": payload.get("updated_at"),
+        "updated_by": payload.get("updated_by"),
+        "updated_source": payload.get("updated_source"),
+        "last_run_at": payload.get("last_run_at"),
+        "next_run_at": payload.get("next_run_at"),
+        "last_status": payload.get("last_status"),
+        "last_error": payload.get("last_error"),
+        "last_delivery_outcome": payload.get("last_delivery_outcome"),
+        "last_delivery_reason": payload.get("last_delivery_reason"),
+        "last_delivery_at": payload.get("last_delivery_at"),
+        "summary": summary,
+        "metadata": metadata,
+    }
+
+
+# === VIVENTIUM NOTE ===
 # Feature: Normalize channel inputs and default to all when omitted.
 def _normalize_channels(value: Optional[ChannelValue], default_all: bool = False) -> list[str]:
     if value is None:
@@ -245,6 +286,9 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             return {}
         return ScheduleTask(**task).model_dump()
 
+    def _serialize_summary(task: Dict[str, Any]) -> Dict[str, Any]:
+        return serialize_task_summary(task)
+
     def _now_iso() -> str:
         return to_utc_iso(datetime.now(timezone.utc))
 
@@ -346,7 +390,8 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
         description=(
             "List scheduled tasks. Filters: active_only (default false), channel "
             "('telegram' | 'librechat' or list; matches any channel in task), agent_id. "
-            "user_id is auto-injected from request headers if omitted."
+            "Returns summary fields only; use schedule_get or schedule_last_delivery for full prompt "
+            "or delivery details. user_id is auto-injected from request headers if omitted."
         )
     )
     # === VIVENTIUM NOTE ===
@@ -360,14 +405,15 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             limit=args.limit,
             offset=args.offset,
         )
-        return {"tasks": [_serialize(t) for t in tasks], "total": len(tasks)}
+        return {"tasks": [_serialize_summary(t) for t in tasks], "total": len(tasks)}
 
     # === VIVENTIUM NOTE ===
     # Feature: Clarify tool schema defaults and channel filtering.
     @mcp.tool(
         description=(
             "Search scheduled tasks by prompt text. Filters: channel ('telegram' | 'librechat' or list), "
-            "agent_id. Defaults: limit=50, offset=0. user_id is auto-injected if omitted."
+            "agent_id. Returns summary fields only; use schedule_get or schedule_last_delivery for full "
+            "prompt or delivery details. Defaults: limit=50, offset=0. user_id is auto-injected if omitted."
         )
     )
     # === VIVENTIUM NOTE ===
@@ -381,7 +427,7 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             limit=args.limit,
             offset=args.offset,
         )
-        return {"tasks": [_serialize(t) for t in tasks], "total": len(tasks)}
+        return {"tasks": [_serialize_summary(t) for t in tasks], "total": len(tasks)}
 
     # === VIVENTIUM NOTE ===
     # Feature: Visibility tool for the last generated/suppressed scheduled output.

@@ -24,6 +24,14 @@ jest.mock('@librechat/agents', () => ({
 
 jest.mock('@librechat/api', () => ({
   initializeAgent: jest.fn(),
+  initializeAnthropic: jest.fn(async ({ model_parameters }) => ({
+    llmConfig: {
+      provider: 'anthropic',
+      model: model_parameters?.model,
+      temperature: model_parameters?.temperature,
+      maxTokens: model_parameters?.maxOutputTokens,
+    },
+  })),
   createRun: jest.fn(),
   checkAccess: jest.fn(async () => true),
   memoryInstructions: 'The system automatically stores important user information.',
@@ -109,6 +117,7 @@ jest.mock('~/models/Agent', () => ({
 const {
   detectActivations,
   checkCortexActivation,
+  clearActivationCooldowns,
   executeCortex,
   executeActivated,
   formatHistoryForActivation,
@@ -116,7 +125,7 @@ const {
   sanitizeCortexDisplayName,
 } = require('~/server/services/BackgroundCortexService');
 const { Run, createContentAggregator } = require('@librechat/agents');
-const { initializeAgent, createRun } = require('@librechat/api');
+const { initializeAgent, initializeAnthropic, createRun } = require('@librechat/api');
 const { getAppConfig } = require('~/server/services/Config/app');
 
 const PRODUCTIVITY_MS365_PROMPT = `You are a classifier. Decide whether to activate the MS365 (Microsoft) productivity tool agent.
@@ -213,14 +222,35 @@ describe('BackgroundCortexService.detectActivations', () => {
 
 describe('BackgroundCortexService config hygiene helpers', () => {
   const ORIGINAL_ENV = { ...process.env };
+  const ORIGINAL_ENDPOINT_ENV = {
+    GROQ_API_KEY: process.env.GROQ_API_KEY,
+    GROQ_KEY: process.env.GROQ_KEY,
+    GROQ_BASE_URL: process.env.GROQ_BASE_URL,
+    GROQ_API_BASE_URL: process.env.GROQ_API_BASE_URL,
+    SAMBANOVA_API_KEY: process.env.SAMBANOVA_API_KEY,
+    SAMBANOVA_BASE_URL: process.env.SAMBANOVA_BASE_URL,
+    SAMBANOVA_API_BASE_URL: process.env.SAMBANOVA_API_BASE_URL,
+  };
+
+  const restoreEndpointEnv = () => {
+    for (const [key, value] of Object.entries(ORIGINAL_ENDPOINT_ENV)) {
+      if (value == null) {
+        delete process.env[key];
+        continue;
+      }
+      process.env[key] = value;
+    }
+  };
 
   beforeEach(() => {
     process.env = { ...ORIGINAL_ENV };
+    restoreEndpointEnv();
     jest.clearAllMocks();
   });
 
   afterAll(() => {
     process.env = ORIGINAL_ENV;
+    restoreEndpointEnv();
   });
 
   test('preserves configured cortex display names', () => {
@@ -249,6 +279,18 @@ describe('BackgroundCortexService config hygiene helpers', () => {
     await expect(getCustomEndpointConfig('groq', { user: { role: 'USER' } })).resolves.toEqual({
       apiKey: 'groq-test-key',
       baseURL: 'https://api.groq.com/openai/v1/',
+    });
+  });
+
+  test('uses canonical Sambanova base URL when env fallback only has an API key', async () => {
+    getAppConfig.mockRejectedValueOnce(new Error('config unavailable'));
+    process.env.SAMBANOVA_API_KEY = 'sambanova-test-key';
+    delete process.env.SAMBANOVA_BASE_URL;
+    delete process.env.SAMBANOVA_API_BASE_URL;
+
+    await expect(getCustomEndpointConfig('sambanova', { user: { role: 'USER' } })).resolves.toEqual({
+      apiKey: 'sambanova-test-key',
+      baseURL: 'https://api.sambanova.ai/v1/',
     });
   });
 
@@ -326,109 +368,276 @@ describe('BackgroundCortexService.formatHistoryForActivation', () => {
 describe('BackgroundCortexService.checkCortexActivation', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    clearActivationCooldowns();
   });
 
-  test('deterministically activates MS365 for generic live email status requests', async () => {
-    const result = await checkCortexActivation({
-      cortexConfig: {
-        agent_id: 'agent_viventium_online_tool_use_95aeb3',
-        activation: {
-          enabled: true,
-          provider: 'openai',
-          model: 'gpt-4o-mini',
-          intent_scope: 'productivity_ms365',
-          cooldown_ms: 60000,
-          prompt: PRODUCTIVITY_MS365_PROMPT,
-        },
-      },
-      messages: [{ role: 'user', content: 'Any replies from Joey yet, or should I follow up?' }],
-      runId: 'run-ms365-live-email',
-      req: {
-        user: { id: 'user-1' },
-        body: { conversationId: 'conversation-1' },
-      },
+  test('passes provider-clarification history to the activation classifier without deterministic preemption', async () => {
+    const processStream = jest.fn(async ({ messages }) => {
+      const prompt = messages[0]?.content || '';
+      expect(prompt).toContain('[User] Check my inbox for replies from Joey.');
+      expect(prompt).toContain('[Assistant] Gmail or Outlook?');
+      expect(prompt).toContain('[User] Ms365');
+      return JSON.stringify({ should_activate: true, confidence: 0.95, reason: 'matched clarification' });
     });
 
-    expect(Run.create).not.toHaveBeenCalled();
-    expect(result).toEqual(
-      expect.objectContaining({
-        shouldActivate: true,
-        reason: 'live_email_status_request:generic',
-        agentId: 'agent_viventium_online_tool_use_95aeb3',
-      }),
-    );
-  });
+    Run.create.mockResolvedValueOnce({ processStream });
 
-  test('deterministically rejects out-of-scope productivity providers for live email requests', async () => {
     const result = await checkCortexActivation({
       cortexConfig: {
         agent_id: 'agent_viventium_online_tool_use_95aeb3',
         activation: {
           enabled: true,
           provider: 'openai',
-          model: 'gpt-4o-mini',
-          intent_scope: 'productivity_ms365',
-          prompt: PRODUCTIVITY_MS365_PROMPT,
-        },
-      },
-      messages: [{ role: 'user', content: 'Check my Gmail inbox for any reply from Joey.' }],
-      runId: 'run-ms365-out-of-scope',
-      req: { user: { id: 'user-1' }, body: {} },
-    });
-
-    expect(Run.create).not.toHaveBeenCalled();
-    expect(result).toEqual(
-      expect.objectContaining({
-        shouldActivate: false,
-        reason: 'live_email_status_request:out_of_scope:google_workspace',
-        agentId: 'agent_viventium_online_tool_use_95aeb3',
-      }),
-    );
-  });
-
-  test('deterministically activates MS365 for inbox-check clarification follow-ups', async () => {
-    const result = await checkCortexActivation({
-      cortexConfig: {
-        agent_id: 'agent_viventium_online_tool_use_95aeb3',
-        activation: {
-          enabled: true,
-          provider: 'openai',
-          model: 'gpt-4o-mini',
+          model: 'gpt-5.4',
           intent_scope: 'productivity_ms365',
           prompt: PRODUCTIVITY_MS365_PROMPT,
         },
       },
       messages: [
-        {
-          role: 'user',
-          content: 'Check everything on my inbox and tell me who the contact introduced us to',
-        },
-        {
-          role: 'assistant',
-          content:
-            'No emails from or about that contact introducing you to anyone in the inbox search results.',
-        },
-        {
-          role: 'user',
-          content:
-            'Did you check my work account outlook? Jordi had introduced us to Blanca and then she had introduced us to other people',
-        },
+        { role: 'user', content: 'Check my inbox for replies from Joey.' },
+        { role: 'assistant', content: 'Gmail or Outlook?' },
+        { role: 'user', content: 'Ms365' },
       ],
-      runId: 'run-ms365-clarification-follow-up',
-      req: {
-        user: { id: 'user-1' },
-        body: { conversationId: 'conversation-1' },
-      },
+      runId: 'run-ms365-provider-only-prompt-context',
+      req: { body: {}, user: {} },
     });
 
-    expect(Run.create).not.toHaveBeenCalled();
+    expect(Run.create).toHaveBeenCalledTimes(1);
     expect(result).toEqual(
       expect.objectContaining({
         shouldActivate: true,
-        reason: 'live_email_status_request:ms365',
+        reason: 'matched clarification',
+        agentId: 'agent_viventium_online_tool_use_95aeb3',
+        providerUsed: 'openai',
+      }),
+    );
+  });
+
+  test('passes assistant live-email recap history to the activation classifier without semantic pruning', async () => {
+    const processStream = jest.fn(async ({ messages }) => {
+      const prompt = messages[0]?.content || '';
+      expect(prompt).toContain('[User] Fair to say Contact A and Contact B ghosted?');
+      expect(prompt).toContain(
+        '[Assistant] Zero email activity in either direction for the last 30 days from or to either of them.',
+      );
+      expect(prompt).toContain('[User] Ms365');
+      return JSON.stringify({ should_activate: true, confidence: 0.91, reason: 'matched recap' });
+    });
+
+    Run.create.mockResolvedValueOnce({ processStream });
+
+    const result = await checkCortexActivation({
+      cortexConfig: {
+        agent_id: 'agent_viventium_online_tool_use_95aeb3',
+        activation: {
+          enabled: true,
+          provider: 'openai',
+          model: 'gpt-5.4',
+          intent_scope: 'productivity_ms365',
+          prompt: PRODUCTIVITY_MS365_PROMPT,
+        },
+      },
+      messages: [
+        { role: 'user', content: 'Fair to say Contact A and Contact B ghosted?' },
+        {
+          role: 'assistant',
+          content:
+            'Zero email activity in either direction for the last 30 days from or to either of them.',
+        },
+        { role: 'user', content: 'Ms365' },
+      ],
+      runId: 'run-ms365-provider-only-after-email-result',
+      req: { body: {}, user: {} },
+    });
+
+    expect(Run.create).toHaveBeenCalledTimes(1);
+    expect(result).toEqual(
+      expect.objectContaining({
+        shouldActivate: true,
+        reason: 'matched recap',
         agentId: 'agent_viventium_online_tool_use_95aeb3',
       }),
     );
+  });
+
+  test('falls back to later classifier providers on operational errors', async () => {
+    const primaryProcessStream = jest.fn(async () => {
+      const error = new Error('Groq billing restriction');
+      error.response = { status: 402 };
+      throw error;
+    });
+    const fallbackProcessStream = jest.fn(async () =>
+      JSON.stringify({ should_activate: true, confidence: 0.93, reason: 'fallback matched' }),
+    );
+
+    Run.create
+      .mockResolvedValueOnce({ processStream: primaryProcessStream })
+      .mockResolvedValueOnce({ processStream: fallbackProcessStream });
+
+    const result = await checkCortexActivation({
+      cortexConfig: {
+        agent_id: 'agent_viventium_online_tool_use_95aeb3',
+        activation: {
+          enabled: true,
+          provider: 'groq',
+          model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+          fallbacks: [{ provider: 'openai', model: 'gpt-5.4' }],
+          intent_scope: 'productivity_ms365',
+          prompt: PRODUCTIVITY_MS365_PROMPT,
+        },
+      },
+      messages: [{ role: 'user', content: 'Check my Outlook inbox and summarize anything urgent.' }],
+      runId: 'run-ms365-fallback-chain',
+      req: { body: {}, user: {} },
+    });
+
+    expect(Run.create).toHaveBeenCalledTimes(2);
+    expect(result).toEqual(
+      expect.objectContaining({
+        shouldActivate: true,
+        reason: 'fallback matched',
+        providerUsed: 'openai',
+      }),
+    );
+    expect(result.providerAttempts).toEqual([
+      expect.objectContaining({
+        provider: 'groq',
+        status: 'error',
+      }),
+      expect.objectContaining({
+        provider: 'openai',
+        status: 'completed',
+        shouldActivate: true,
+      }),
+    ]);
+  });
+
+  test('does not invoke fallback providers after a completed classifier decision', async () => {
+    const processStream = jest.fn(async () =>
+      JSON.stringify({ should_activate: false, confidence: 0.99, reason: 'chat_format' }),
+    );
+
+    Run.create.mockResolvedValueOnce({ processStream });
+
+    const result = await checkCortexActivation({
+      cortexConfig: {
+        agent_id: 'agent_viventium_online_tool_use_95aeb3',
+        activation: {
+          enabled: true,
+          provider: 'groq',
+          model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+          fallbacks: [
+            { provider: 'openai', model: 'gpt-5.4' },
+            { provider: 'anthropic', model: 'claude-haiku-4-5' },
+          ],
+          intent_scope: 'productivity_ms365',
+          prompt: PRODUCTIVITY_MS365_PROMPT,
+        },
+      },
+      messages: [{ role: 'user', content: 'Please reply with exactly DIRECT_OK and nothing else.' }],
+      runId: 'run-ms365-no-fallback-after-decision',
+      req: { body: {}, user: {} },
+    });
+
+    expect(Run.create).toHaveBeenCalledTimes(1);
+    expect(result).toEqual(
+      expect.objectContaining({
+        shouldActivate: false,
+        reason: 'chat_format',
+        providerUsed: 'groq',
+      }),
+    );
+    expect(result.providerAttempts).toHaveLength(1);
+  });
+
+  test('uses Anthropic connected-account initialization with thinking disabled for activation checks', async () => {
+    const processStream = jest.fn(async () =>
+      JSON.stringify({ should_activate: true, confidence: 0.88, reason: 'anthropic matched' }),
+    );
+
+    Run.create.mockResolvedValueOnce({ processStream });
+
+    const result = await checkCortexActivation({
+      cortexConfig: {
+        agent_id: 'agent_viventium_support_95aeb3',
+        activation: {
+          enabled: true,
+          provider: 'anthropic',
+          model: 'claude-haiku-4-5',
+          prompt: 'Support activation prompt',
+        },
+      },
+      messages: [{ role: 'user', content: 'How do I change my reminder schedule?' }],
+      runId: 'run-anthropic-connected-account-activation',
+      req: { body: {}, user: { id: 'user-123', role: 'USER' }, config: {} },
+    });
+
+    expect(initializeAnthropic).toHaveBeenCalledWith(
+      expect.objectContaining({
+        endpoint: 'anthropic',
+        model_parameters: expect.objectContaining({
+          model: 'claude-haiku-4-5',
+          thinking: false,
+          temperature: 0.1,
+          maxOutputTokens: 100,
+        }),
+      }),
+    );
+    expect(Run.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        graphConfig: expect.objectContaining({
+          llmConfig: expect.objectContaining({
+            provider: 'anthropic',
+            model: 'claude-haiku-4-5',
+          }),
+        }),
+      }),
+    );
+    expect(result).toEqual(
+      expect.objectContaining({
+        shouldActivate: true,
+        providerUsed: 'anthropic',
+      }),
+    );
+  });
+
+  test('allows diagnostics to clear cooldown state between independent activation runs', async () => {
+    const processStream = jest.fn(async () =>
+      JSON.stringify({ should_activate: true, confidence: 0.97, reason: 'matched' }),
+    );
+
+    Run.create.mockResolvedValue({ processStream });
+
+    const activationRequest = {
+      cortexConfig: {
+        agent_id: 'agent_viventium_support_95aeb3',
+        activation: {
+          enabled: true,
+          provider: 'openai',
+          model: 'gpt-5.4',
+          cooldown_ms: 60_000,
+          prompt: 'Support activation prompt',
+        },
+      },
+      messages: [{ role: 'user', content: 'How do I create a recurring reminder?' }],
+      runId: 'run-cooldown-reset',
+      req: { body: { conversationId: 'c1' }, user: { id: 'user-123' } },
+    };
+
+    const first = await checkCortexActivation(activationRequest);
+    const cooledDown = await checkCortexActivation(activationRequest);
+    clearActivationCooldowns();
+    const afterClear = await checkCortexActivation(activationRequest);
+
+    expect(first).toEqual(expect.objectContaining({ shouldActivate: true }));
+    expect(cooledDown).toEqual(
+      expect.objectContaining({
+        shouldActivate: false,
+        reason: 'cooldown',
+      }),
+    );
+    expect(afterClear).toEqual(expect.objectContaining({ shouldActivate: true }));
+    expect(Run.create).toHaveBeenCalledTimes(2);
   });
 
   test('adds mixed-provider guidance for the MS365 productivity cortex', async () => {
@@ -438,9 +647,7 @@ describe('BackgroundCortexService.checkCortexActivation', () => {
       expect(prompt).toContain(
         'LatestUserMessage: check both outlook and gmail and summarize anything urgent',
       );
-      expect(prompt).toContain('ActivationScope: Microsoft 365 / Outlook / OneDrive');
-      expect(prompt).toContain('ParallelRequestsAllowed: If the latest user message asks for multiple services at once');
-      expect(prompt).toContain('RejectOnlyWhenOutOfScope: Reject only when the request is exclusively for Google Workspace requests');
+      expect(prompt).toContain('ActivationScopeKey: productivity_ms365');
       return JSON.stringify({ should_activate: true, confidence: 0.93, reason: 'matched' });
     });
 
@@ -481,9 +688,7 @@ describe('BackgroundCortexService.checkCortexActivation', () => {
       expect(prompt).toContain(
         'LatestUserMessage: check both outlook and gmail and summarize anything urgent',
       );
-      expect(prompt).toContain('ActivationScope: Google Workspace / Gmail / Drive / Calendar');
-      expect(prompt).toContain('ParallelRequestsAllowed: If the latest user message asks for multiple services at once');
-      expect(prompt).toContain('RejectOnlyWhenOutOfScope: Reject only when the request is exclusively for Microsoft 365 / Outlook requests');
+      expect(prompt).toContain('ActivationScopeKey: productivity_google_workspace');
       return JSON.stringify({ should_activate: true, confidence: 0.91, reason: 'matched' });
     });
 
@@ -517,14 +722,20 @@ describe('BackgroundCortexService.checkCortexActivation', () => {
     );
   });
 
-  test('deterministically activates Google for Gmail live email status requests even with Microsoft exclusions in the prompt', async () => {
+  test('uses the classifier path for Google live email status requests', async () => {
+    const processStream = jest.fn(async () =>
+      JSON.stringify({ should_activate: true, confidence: 0.94, reason: 'gmail inbox request' }),
+    );
+
+    Run.create.mockResolvedValueOnce({ processStream });
+
     const result = await checkCortexActivation({
       cortexConfig: {
         agent_id: 'agent_8Y1d7JNhpubtvzYz3hvEv',
         activation: {
           enabled: true,
           provider: 'openai',
-          model: 'gpt-4o-mini',
+          model: 'gpt-5.4',
           intent_scope: 'productivity_google_workspace',
           prompt: PRODUCTIVITY_GOOGLE_PROMPT,
         },
@@ -534,24 +745,23 @@ describe('BackgroundCortexService.checkCortexActivation', () => {
       req: { body: {}, user: {} },
     });
 
-    expect(Run.create).not.toHaveBeenCalled();
+    expect(Run.create).toHaveBeenCalledTimes(1);
     expect(result).toEqual(
       expect.objectContaining({
         shouldActivate: true,
-        reason: 'live_email_status_request:google_workspace',
+        reason: 'gmail inbox request',
         agentId: 'agent_8Y1d7JNhpubtvzYz3hvEv',
       }),
     );
   });
 
-  test('strips stale assistant failure context from productivity activation prompts', async () => {
+  test('keeps structural conversation history for productivity activation prompts', async () => {
     const processStream = jest.fn(async ({ messages }) => {
       const prompt = messages[0]?.content || '';
       expect(prompt).toContain('LatestUserMessage: Please reply with exactly DIRECT_OK and nothing else.');
-      expect(prompt).toContain('ActivationScope: Google Workspace / Gmail / Drive / Calendar');
-      expect(prompt).not.toContain('ActivationScope: Microsoft 365 / Outlook / OneDrive');
-      expect(prompt).not.toContain('now, check my gmail as well as my outlook');
-      expect(prompt).not.toContain("I couldn't finish that check just now.");
+      expect(prompt).toContain('ActivationScopeKey: productivity_google_workspace');
+      expect(prompt).toContain('now, check my gmail as well as my outlook');
+      expect(prompt).toContain("I couldn't finish that check just now.");
       return JSON.stringify({ should_activate: false, confidence: 1, reason: 'simple reply' });
     });
 
@@ -593,8 +803,7 @@ describe('BackgroundCortexService.checkCortexActivation', () => {
   test('uses config-defined productivity scope instead of prompt-title or agent-name matching', async () => {
     const processStream = jest.fn(async ({ messages }) => {
       const prompt = messages[0]?.content || '';
-      expect(prompt).toContain('ActivationScope: Google Workspace / Gmail / Drive / Calendar');
-      expect(prompt).not.toContain('ActivationScope: Microsoft 365 / Outlook / OneDrive');
+      expect(prompt).toContain('ActivationScopeKey: productivity_google_workspace');
       return JSON.stringify({ should_activate: false, confidence: 1, reason: 'simple reply' });
     });
 
@@ -1301,8 +1510,9 @@ describe('BackgroundCortexService.executeCortex', () => {
     expect(initArgs.agent.instructions).not.toContain('# Existing memory about the user:');
 
     const callMessages = processStream.mock.calls[0][0].messages;
-    expect(callMessages).toHaveLength(1);
-    expect(callMessages[0].content).toContain(
+    expect(callMessages).toHaveLength(3);
+    expect(callMessages[1].content).toContain('I still cannot access the docs.');
+    expect(callMessages[2].content).toContain(
       'https://docs.google.com/document/d/1Ki8pi6Yl9q0VZ_kv9CXTApe29Gx_ThAPYp9impNvG4c/edit',
     );
   });

@@ -92,6 +92,11 @@ export default function AgentSelect({
           return;
         }
 
+        if (name === 'voice_llm_model_parameters') {
+          formValues[name] = value;
+          return;
+        }
+
         if (capabilities[name] !== undefined) {
           formValues[name] = value;
           return;

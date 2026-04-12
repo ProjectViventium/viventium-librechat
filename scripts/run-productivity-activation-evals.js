@@ -143,6 +143,24 @@ function getScenarios() {
       ],
       expectations: { google: false, ms365: true },
     },
+    {
+      id: 'provider_clarification_ms365',
+      messages: [
+        { role: 'user', content: 'Fair to say Contact A and Contact B ghosted?' },
+        {
+          role: 'assistant',
+          content:
+            'Zero email activity in either direction for the last 30 days from or to either of them.',
+        },
+        { role: 'user', content: 'Ms365' },
+      ],
+      expectations: { google: false, ms365: true },
+    },
+    {
+      id: 'provider_name_without_email_context',
+      messages: [{ role: 'user', content: 'Ms365' }],
+      expectations: { google: false, ms365: false },
+    },
   ];
 }
 
@@ -231,35 +249,59 @@ async function run() {
 
       const expected = scenario.expectations[agent.key];
       const actual = outcome ? Boolean(outcome.shouldActivate) : null;
+      const providerAttempts = Array.isArray(outcome?.providerAttempts) ? outcome.providerAttempts : [];
+      const primaryOutageRecovered =
+        error == null &&
+        providerAttempts[0]?.status === 'error' &&
+        providerAttempts.some((attempt, index) => index > 0 && attempt?.status === 'completed') &&
+        actual === expected;
+      const unavailable =
+        providerAttempts.length > 0 &&
+        providerAttempts.every((attempt) => attempt?.status === 'error');
       results.push({
         scenarioId: scenario.id,
         agent: agent.label,
         agentId: agent.agentId,
         expectedShouldActivate: expected,
         actualShouldActivate: actual,
-        pass: error == null && actual === expected,
+        pass: error == null && !unavailable && actual === expected,
+        unavailable,
         durationMs: Date.now() - startedAt,
         reason: outcome?.reason || null,
         confidence: outcome?.confidence ?? null,
+        providerUsed: outcome?.providerUsed || null,
+        modelUsed: outcome?.modelUsed || null,
+        providerAttempts,
+        primaryOutageRecovered,
         error,
         messages: scenario.messages,
       });
     }
   }
 
-  const failures = results.filter((entry) => !entry.pass);
+  const failures = results.filter((entry) => !entry.pass && !entry.unavailable);
+  const unavailable = results.filter((entry) => entry.unavailable);
   const summary = {
     generatedAt: new Date().toISOString(),
     bundlePath: args.bundlePath,
     resultCount: results.length,
-    passCount: results.length - failures.length,
+    passCount: results.filter((entry) => entry.pass).length,
     failCount: failures.length,
+    unavailableCount: unavailable.length,
+    primaryOutageCount: results.filter((entry) => entry.primaryOutageRecovered).length,
     failures: failures.map((entry) => ({
       scenarioId: entry.scenarioId,
       agent: entry.agent,
       expectedShouldActivate: entry.expectedShouldActivate,
       actualShouldActivate: entry.actualShouldActivate,
       reason: entry.reason,
+      error: entry.error?.message || null,
+    })),
+    unavailable: unavailable.map((entry) => ({
+      scenarioId: entry.scenarioId,
+      agent: entry.agent,
+      reason: entry.reason,
+      providerAttempts: entry.providerAttempts,
       error: entry.error?.message || null,
     })),
   };
@@ -274,9 +316,11 @@ async function run() {
     `- Bundle: ${summary.bundlePath}`,
     `- Pass: ${summary.passCount}/${summary.resultCount}`,
     `- Failures: ${summary.failCount}`,
+    `- Unavailable: ${summary.unavailableCount}`,
+    `- Primary provider outage recoveries: ${summary.primaryOutageCount}`,
     '',
-    '| Scenario | Agent | Expected | Actual | Pass | Confidence | Reason |',
-    '| --- | --- | --- | --- | --- | --- | --- |',
+    '| Scenario | Agent | Expected | Actual | Status | Provider | Confidence | Reason |',
+    '| --- | --- | --- | --- | --- | --- | --- | --- |',
     ...results.map((entry) => {
       const actualText =
         entry.actualShouldActivate === null ? 'error' : String(entry.actualShouldActivate);
@@ -285,12 +329,26 @@ async function run() {
           ? ''
           : Number(entry.confidence).toFixed(2);
       const reasonText = entry.error?.message || entry.reason || '';
-      return `| ${entry.scenarioId} | ${entry.agent} | ${entry.expectedShouldActivate} | ${actualText} | ${
-        entry.pass ? 'PASS' : 'FAIL'
-      } | ${confidenceText} | ${reasonText.replace(/\|/g, '\\|')} |`;
+      const providerText =
+        entry.providerUsed && entry.modelUsed ? `${entry.providerUsed}/${entry.modelUsed}` : '';
+      const statusText = entry.pass ? 'PASS' : entry.unavailable ? 'UNAVAILABLE' : 'FAIL';
+      return `| ${entry.scenarioId} | ${entry.agent} | ${entry.expectedShouldActivate} | ${actualText} | ${statusText} | ${providerText.replace(/\|/g, '\\|')} | ${confidenceText} | ${reasonText.replace(/\|/g, '\\|')} |`;
     }),
     '',
   ];
+
+  if (summary.primaryOutageCount > 0) {
+    markdownLines.push('## Primary Provider Outage Recoveries');
+    markdownLines.push('');
+    for (const entry of results.filter((result) => result.primaryOutageRecovered)) {
+      const recoveredProvider =
+        entry.providerUsed && entry.modelUsed ? `${entry.providerUsed}/${entry.modelUsed}` : 'fallback';
+      markdownLines.push(
+        `- ${entry.scenarioId} | ${entry.agent} recovered via ${recoveredProvider} after primary-provider error`,
+      );
+    }
+    markdownLines.push('');
+  }
 
   const markdownPath = path.join(outputDir, 'productivity-activation-eval.md');
   fs.writeFileSync(markdownPath, `${markdownLines.join('\n')}\n`);
@@ -308,7 +366,7 @@ async function run() {
     ),
   );
 
-  if (failures.length > 0) {
+  if (failures.length > 0 || unavailable.length > 0) {
     process.exitCode = 1;
   }
 }

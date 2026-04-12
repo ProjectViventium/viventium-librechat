@@ -105,5 +105,6 @@ export interface IAgent extends Omit<Document, 'model'> {
    */
   voice_llm_model?: string | null;
   voice_llm_provider?: string | null;
+  voice_llm_model_parameters?: Record<string, unknown>;
   /* === VIVENTIUM END === */
 }

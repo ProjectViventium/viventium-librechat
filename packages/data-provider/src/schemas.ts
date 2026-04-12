@@ -283,6 +283,7 @@ export const defaultAgentFormValues = {
    */
   voice_llm_model: null,
   voice_llm_provider: null,
+  voice_llm_model_parameters: undefined,
   /* === VIVENTIUM END === */
 };
 

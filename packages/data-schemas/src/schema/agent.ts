@@ -174,6 +174,7 @@ const agentSchema = new Schema<IAgent>(
      */
     voice_llm_model: { type: String, default: null },
     voice_llm_provider: { type: String, default: null },
+    voice_llm_model_parameters: { type: Object, default: undefined },
     /* === VIVENTIUM END === */
   },
   {

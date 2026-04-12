@@ -8,7 +8,12 @@ const { Message } = require('~/db/models');
  */
 const {
   scheduleConversationRecallSync,
+  getMessageText: getConversationRecallMessageText,
+  shouldSkipFromRecallCorpus,
 } = require('~/server/services/viventium/conversationRecallService');
+const {
+  buildRecallDerivedParentIdSet,
+} = require('~/server/services/viventium/conversationRecallFilters');
 /* === VIVENTIUM END === */
 
 const idSchema = z.string().uuid();
@@ -368,6 +373,54 @@ async function getMessages(filter, select) {
   }
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Recall freshness timestamp helper.
+ * Purpose: Let runtime attachment logic compare a recall corpus timestamp against the newest
+ * recall-eligible message instead of blindly trusting stale vector state.
+ * Added: 2026-04-08
+ * === VIVENTIUM END === */
+async function getLatestRecallEligibleMessageCreatedAt({ user, scanLimit = 200 }) {
+  try {
+    if (!user) {
+      return null;
+    }
+
+    const messages = await Message.find({
+      user,
+      unfinished: { $ne: true },
+      error: { $ne: true },
+      $or: [{ expiredAt: { $exists: false } }, { expiredAt: null }],
+    })
+      .select('messageId parentMessageId conversationId createdAt text content attachments isCreatedByUser')
+      .sort({ createdAt: -1 })
+      .limit(Math.max(1, scanLimit))
+      .lean();
+
+    const recallDerivedParentIds = buildRecallDerivedParentIdSet(messages);
+
+    for (let index = 0; index < messages.length; index += 1) {
+      const message = messages[index];
+      const messageText = getConversationRecallMessageText(message);
+      if (
+        shouldSkipFromRecallCorpus({
+          message,
+          messageText,
+          isCreatedByUser: message?.isCreatedByUser,
+          hasRecallDerivedChild: recallDerivedParentIds.has(message?.messageId),
+        })
+      ) {
+        continue;
+      }
+      return message?.createdAt ?? null;
+    }
+
+    return null;
+  } catch (err) {
+    logger.error('Error getting latest recall-eligible message timestamp:', err);
+    throw err;
+  }
+}
+
 /**
  * Retrieves a single message from the database.
  * @async
@@ -414,6 +467,7 @@ module.exports = {
   updateMessage,
   deleteMessagesSince,
   getMessages,
+  getLatestRecallEligibleMessageCreatedAt,
   getMessage,
   deleteMessages,
 };

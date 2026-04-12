@@ -24,7 +24,6 @@
  * === VIVENTIUM END === */
 
 const {
-  hasExplicitProductivityRequest,
   resolveProductivitySpecialistScope,
 } = require('~/server/services/viventium/productivitySpecialistContext');
 
@@ -73,7 +72,7 @@ function collectConfiguredHoldScopeKeys(cortices) {
   return scopeKeys;
 }
 
-function shouldDeferMainResponse({ activatedCortices, latestUserText } = {}) {
+function shouldDeferMainResponse({ activatedCortices } = {}) {
   if (isEnvDisabled('VIVENTIUM_TOOL_CORTEX_HOLD_ENABLED')) {
     return false;
   }
@@ -87,11 +86,6 @@ function shouldDeferMainResponse({ activatedCortices, latestUserText } = {}) {
   if (!matchedHoldCortex) {
     return false;
   }
-
-  if (typeof latestUserText === 'string') {
-    return hasExplicitProductivityRequest(latestUserText);
-  }
-
   return true;
 }
 

@@ -13,6 +13,50 @@ jest.mock('~/utils', () => ({
 }));
 
 describe('memory policy', () => {
+  describe('prepareMemoryValueForWrite', () => {
+    it('collapses repeated semicolon corruption before storing structured memory', () => {
+      const prepared = prepareMemoryValueForWrite({
+        key: 'context',
+        value: [
+          'Priority tracks:',
+          '- Track1 Work: Release prep;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; blocked on review',
+          '_updated: 2026-03-08',
+        ].join('\n'),
+      });
+
+      expect(prepared.value).toContain('Release prep; blocked on review');
+      expect(prepared.value).not.toContain(';;;;;;;;;;;;;;;;');
+    });
+
+    it('preserves intentional single semicolon separators', () => {
+      const prepared = prepareMemoryValueForWrite({
+        key: 'context',
+        value: [
+          'Priority tracks:',
+          '- Track1 Work: Release prep; blocked on review',
+          '_updated: 2026-03-08',
+        ].join('\n'),
+      });
+
+      expect(prepared.value).toContain('Release prep; blocked on review');
+      expect(prepared.value).not.toContain('Release prep  blocked on review');
+    });
+
+    it('cleans repeated semicolon corruption in draft summaries before storing', () => {
+      const prepared = prepareMemoryValueForWrite({
+        key: 'drafts',
+        value: [
+          '- thread: partner_followup | status: in_progress | last_worked: 2026-03-08',
+          '  summary: "Partner follow-up;;;;;;;;;;;;;;;; blocked on response."',
+          '  next: Send concise update.',
+        ].join('\n'),
+      });
+
+      expect(prepared.value).toContain('summary: "Partner follow-up; blocked on response."');
+      expect(prepared.value).not.toContain(';;;;;;;;;;;;;;;;');
+    });
+  });
+
   describe('evaluateMemoryWrite', () => {
     it('rejects scheduler and tool operational residue', () => {
       const result = evaluateMemoryWrite({
@@ -228,6 +272,115 @@ describe('memory policy', () => {
       expect(workingUpdate?.value).not.toContain('{NTA}');
       expect(workingUpdate?.value).not.toContain('Internal Checks');
       expect(workingUpdate?.value).not.toContain('no new data');
+    });
+
+    it('refreshes expired context and working snapshots even without token pressure', () => {
+      const plan = createMemoryMaintenancePlan({
+        memories: [
+          {
+            key: 'context',
+            tokenCount: 140,
+            value: [
+              'Priority tracks:',
+              '- Track1 Work: Release prep blocked on final review.',
+              '_updated: 2026-03-01',
+              '_expires: 2026-03-08',
+            ].join('\n'),
+          },
+          {
+            key: 'working',
+            tokenCount: 96,
+            value: [
+              'At desk preparing release notes.',
+              '_updated: 2026-03-01 | _stale_after: 2026-03-02 | _expires: 2026-03-04',
+            ].join('\n'),
+          },
+        ],
+        policy: {
+          tokenLimit: 8000,
+          keyLimits: DEFAULT_VIVENTIUM_MEMORY_KEY_LIMITS,
+          maintenanceThresholdPercent: 80,
+        },
+        now: new Date('2026-03-09T16:00:00.000Z'),
+      });
+
+      expect(plan.shouldApply).toBe(true);
+      expect(plan.reason).toContain('context expired and needs refresh');
+      expect(plan.reason).toContain('working snapshot is stale or expired');
+
+      const contextUpdate = plan.updates.find((update) => update.key === 'context');
+      expect(contextUpdate?.value).toContain('_updated: 2026-03-09');
+      expect(contextUpdate?.value).toContain('_expires: 2026-03-16');
+
+      const workingUpdate = plan.updates.find((update) => update.key === 'working');
+      expect(workingUpdate?.value).toContain(
+        '_updated: 2026-03-09 | _stale_after: 2026-03-10 | _expires: 2026-03-12',
+      );
+    });
+
+    it('treats repeated separator corruption as a maintenance trigger even without other pressure', () => {
+      const plan = createMemoryMaintenancePlan({
+        memories: [
+          {
+            key: 'me',
+            tokenCount: 160,
+            value: [
+              "What I've noticed:",
+              '- Stable when the next step is obvious;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; concise wins',
+              '_updated: 2026-03-09',
+            ].join('\n'),
+          },
+        ],
+        policy: {
+          tokenLimit: 8000,
+          keyLimits: DEFAULT_VIVENTIUM_MEMORY_KEY_LIMITS,
+          maintenanceThresholdPercent: 80,
+        },
+        now: new Date('2026-03-09T16:00:00.000Z'),
+      });
+
+      expect(plan.shouldApply).toBe(true);
+      expect(plan.reason).toContain('existing memories contain repeated separator corruption');
+
+      const meUpdate = plan.updates.find((update) => update.key === 'me');
+      expect(meUpdate?.value).toContain('obvious; concise wins');
+      expect(meUpdate?.value).not.toContain(';;;;;;;;;;;;;;;;');
+    });
+
+    it('archives long-idle active drafts and preserves archived history', () => {
+      const plan = createMemoryMaintenancePlan({
+        memories: [
+          {
+            key: 'drafts',
+            tokenCount: 320,
+            value: [
+              '- thread: stale_partner_followup | status: in_progress | last_worked: 2026-03-01',
+              '  summary: "Partner follow-up;;;;;;;;;;;;;;;;;;;;;;;; blocked on response."',
+              '  next: Send concise update.',
+              '',
+              'Archived:',
+              '- shipped_launch_note | done | last_worked: 2026-02-20 | shipped_launch_note: Sent launch note and closed thread',
+              '_updated: 2026-03-02',
+            ].join('\n'),
+          },
+        ],
+        policy: {
+          tokenLimit: 8000,
+          keyLimits: DEFAULT_VIVENTIUM_MEMORY_KEY_LIMITS,
+          maintenanceThresholdPercent: 80,
+        },
+        now: new Date('2026-03-20T16:00:00.000Z'),
+      });
+
+      expect(plan.shouldApply).toBe(true);
+      expect(plan.reason).toContain('drafts contain long-idle active work');
+
+      const draftsUpdate = plan.updates.find((update) => update.key === 'drafts');
+      expect(draftsUpdate?.value).toContain('Archived:');
+      expect(draftsUpdate?.value).toContain('shipped_launch_note | done');
+      expect(draftsUpdate?.value).toContain('stale_partner_followup | in_progress');
+      expect(draftsUpdate?.value).not.toContain('- thread: stale_partner_followup');
+      expect(draftsUpdate?.value).not.toContain(';;;;;;;;;;;;;;;;');
     });
   });
 });

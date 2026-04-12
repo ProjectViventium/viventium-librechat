@@ -28,6 +28,12 @@ const {
 } = require('librechat-data-provider');
 const { uploadVectors, deleteVectors } = require('~/server/services/Files/VectorDB/crud');
 const { Agent, Conversation, File, Message, User } = require('~/db/models');
+const {
+  buildRecallDerivedParentIdSet,
+  cleanupText,
+  messageUsesConversationRecallSearch,
+  shouldSkipRecallMessage,
+} = require('./conversationRecallFilters');
 
 const timers = new Map();
 const pendingConversationSyncByUser = new Map();
@@ -106,6 +112,20 @@ const UPLOAD_TIMEOUT_MS = Math.max(
   1000,
   Number.parseInt(process.env.VIVENTIUM_CONVERSATION_RECALL_UPLOAD_TIMEOUT_MS || '60000', 10),
 );
+const UPLOAD_TIMEOUT_PER_100K_CHARS_MS = Math.max(
+  0,
+  Number.parseInt(
+    process.env.VIVENTIUM_CONVERSATION_RECALL_UPLOAD_TIMEOUT_PER_100K_CHARS_MS || '20000',
+    10,
+  ),
+);
+const UPLOAD_TIMEOUT_MAX_MS = Math.max(
+  UPLOAD_TIMEOUT_MS,
+  Number.parseInt(
+    process.env.VIVENTIUM_CONVERSATION_RECALL_UPLOAD_TIMEOUT_MAX_MS || '180000',
+    10,
+  ),
+);
 const UPLOAD_RETRY_BASE_MS = Math.max(
   0,
   Number.parseInt(process.env.VIVENTIUM_CONVERSATION_RECALL_UPLOAD_RETRY_BASE_MS || '750', 10),
@@ -152,20 +172,6 @@ const MIN_SYNC_INTERVAL_MS = Math.max(
   0,
   Number.parseInt(process.env.VIVENTIUM_CONVERSATION_RECALL_MIN_SYNC_INTERVAL_MS || '45000', 10),
 );
-const RECALL_INTENT_REGEX =
-  /\b(remember|recall|previous|earlier|before|last time|past conversation|chat history|you said|i said|shared)\b/i;
-const META_MEMORY_TEXT_REGEX =
-  /(<memory_search>|<\/memory_search>|<query>|<\/query>|\bno memories found\b|\bsearch criteria\b|\bmemory tool\b|\bmemory system\b|\bexact results from memory tool\b)/i;
-const INTERNAL_CONTROL_TEXT_REGEX =
-  /<!--\s*viv_internal:|##\s*background processing\s*\(brewing\)|scheduled self-prompt|wake\.\s*check date,\s*time,\s*timezone|conversation_policy|output:\s*\{nta\}|^#\s*current chat:/i;
-const NTA_ONLY_REGEX = /^\{NTA\}\.?$/i;
-const ASSISTANT_LOW_SIGNAL_REGEX =
-  /^(?:hi|hello|hey|yo|thanks|thank you|ok|okay|sure|sounds good|what's up)\b[!.?]*$/i;
-const ASSISTANT_MEMORY_DISCLAIMER_REGEX =
-  /(?:\b(?:i\s+(?:don't|do not|can't|cannot)\s+(?:have|see|find|access|recall|remember)|i\s+have\s+no\s+(?:specific\s+)?(?:memory|memories|record|records|information|mentions?)|no\s+memories?\s+found)\b[\s\S]{0,180}\b(?:memory|memories|conversation|chat history|past chats|history|name|details?|mention|criteria)\b|\bi\s+don't\s+think\s+you(?:'ve| have)\s+told\s+me\s+that\s+yet\b|\bi\s+don't\s+know\s+(?:your|the)\s+name\b)/i;
-const ASSISTANT_RECALL_SUMMARY_REGEX =
-  /(?:\bbased on (?:my|our) (?:search|scan|review)\b|\b(?:from|in) (?:our|your) (?:conversation|chat) history\b|\bin (?:our|your) previous (?:conversation|chats)\b|\byes[, ]+i (?:remember|do)\b|\bi (?:remember|recall) (?:you|that|when)\b|\bi (?:have|can see) (?:a )?(?:record|records)\b)/i;
-
 function isConversationRecallInfraEnabled() {
   if (!process.env.RAG_API_URL) {
     return false;
@@ -262,13 +268,6 @@ function enqueueConversationSync({ userId, conversationId }) {
   pendingConversationSyncByUser.set(userId, pending);
 }
 
-function cleanupText(text) {
-  if (typeof text !== 'string') {
-    return '';
-  }
-  return text.split('\0').join('').replace(/\s+/g, ' ').trim();
-}
-
 function sleep(ms) {
   return new Promise((resolve) => {
     const timer = setTimeout(resolve, Math.max(0, ms));
@@ -360,7 +359,7 @@ function trimCorpusToChars(corpus, maxChars) {
   return corpus.slice(corpus.length - limit);
 }
 
-async function uploadVectorsWithRetry({ userId, file_id, file }) {
+async function uploadVectorsWithRetry({ userId, file_id, file, timeoutMs }) {
   let attempt = 0;
   while (attempt < UPLOAD_MAX_ATTEMPTS) {
     attempt += 1;
@@ -369,7 +368,7 @@ async function uploadVectorsWithRetry({ userId, file_id, file }) {
         req: { user: { id: userId } },
         file,
         file_id,
-        timeoutMs: UPLOAD_TIMEOUT_MS,
+        timeoutMs,
       });
       return;
     } catch (error) {
@@ -391,6 +390,18 @@ async function uploadVectorsWithRetry({ userId, file_id, file }) {
       await sleep(delayMs);
     }
   }
+}
+
+function computeAdaptiveUploadTimeoutMs(charCount) {
+  if (!Number.isFinite(charCount) || charCount <= 0) {
+    return UPLOAD_TIMEOUT_MS;
+  }
+
+  const chunksOf100k = Math.ceil(charCount / 100000);
+  const adaptiveTimeout =
+    UPLOAD_TIMEOUT_MS + chunksOf100k * UPLOAD_TIMEOUT_PER_100K_CHARS_MS;
+
+  return Math.min(UPLOAD_TIMEOUT_MAX_MS, adaptiveTimeout);
 }
 
 function escapeXmlText(value) {
@@ -461,49 +472,43 @@ function clipMessageText(text) {
   return `${text.slice(0, MAX_MESSAGE_TEXT_CHARS - 3)}...`;
 }
 
-function isLikelyMetaRecallPrompt(messageText) {
-  const cleaned = cleanupText(messageText);
-  if (!cleaned) {
-    return false;
-  }
-
-  if (META_MEMORY_TEXT_REGEX.test(cleaned)) {
-    return true;
-  }
-
-  if (!RECALL_INTENT_REGEX.test(cleaned)) {
-    return false;
-  }
-
-  const tokenCount = cleaned.split(/\s+/).filter(Boolean).length;
-  const numericSignals = cleaned.match(/\b\d{1,4}(?:\.\d+)?\b/g)?.length ?? 0;
-  return tokenCount <= 28 && numericSignals === 0;
+function shouldSkipFromRecallCorpus({
+  message,
+  messageText,
+  isCreatedByUser,
+  hasRecallDerivedChild,
+}) {
+  return shouldSkipRecallMessage({
+    message,
+    messageText,
+    isCreatedByUser,
+    hasRecallDerivedChild,
+  });
 }
 
-function shouldSkipFromRecallCorpus({ messageText, isCreatedByUser }) {
-  const cleaned = cleanupText(messageText);
-  if (!cleaned) {
-    return true;
+/* === VIVENTIUM START ===
+ * Feature: Skip assistant recall-echo replies from corpus freshness/content.
+ * Purpose: Assistant answers to meta recall prompts are derivative retrieval chatter, not source history.
+ * === VIVENTIUM END === */
+async function hasRecallDerivedChildMessage({ userId, messageId }) {
+  if (!userId || !messageId) {
+    return false;
   }
-  if (isLikelyMetaRecallPrompt(cleaned)) {
-    return true;
-  }
-  if (INTERNAL_CONTROL_TEXT_REGEX.test(cleaned)) {
-    return true;
-  }
-  if (NTA_ONLY_REGEX.test(cleaned)) {
-    return true;
-  }
-  if (!isCreatedByUser && ASSISTANT_MEMORY_DISCLAIMER_REGEX.test(cleaned)) {
-    return true;
-  }
-  if (!isCreatedByUser && ASSISTANT_RECALL_SUMMARY_REGEX.test(cleaned)) {
-    return true;
-  }
-  if (!isCreatedByUser && ASSISTANT_LOW_SIGNAL_REGEX.test(cleaned)) {
-    return true;
-  }
-  return false;
+
+  const childMessages = await Message.find({
+    user: userId,
+    parentMessageId: messageId,
+    isCreatedByUser: false,
+    unfinished: { $ne: true },
+    error: { $ne: true },
+    $or: [{ expiredAt: { $exists: false } }, { expiredAt: null }],
+  })
+    .select('attachments parentMessageId')
+    .sort({ createdAt: 1 })
+    .limit(4)
+    .lean();
+
+  return childMessages.some((message) => messageUsesConversationRecallSearch(message));
 }
 
 async function getAgentIdForConversation(userId, conversationId) {
@@ -570,8 +575,8 @@ async function buildConversationRecallCorpus({ userId, agentId }) {
   };
 
   const selectFields = CORPUS_TEXT_ONLY
-    ? 'conversationId createdAt sender isCreatedByUser text'
-    : 'conversationId createdAt sender isCreatedByUser text content';
+    ? 'messageId parentMessageId conversationId createdAt sender isCreatedByUser text attachments'
+    : 'messageId parentMessageId conversationId createdAt sender isCreatedByUser text content attachments';
 
   const rawMessageLimit = Math.max(
     Math.max(1, MAX_MESSAGES),
@@ -590,12 +595,21 @@ async function buildConversationRecallCorpus({ userId, agentId }) {
 
   rawMessages.reverse();
 
+  const recallDerivedParentIds = buildRecallDerivedParentIdSet(rawMessages);
   const segments = [];
   let totalChars = 0;
   let latestTimestamp = '';
-  for (const message of rawMessages) {
+  for (let i = 0; i < rawMessages.length; i += 1) {
+    const message = rawMessages[i];
     const content = clipMessageText(getMessageText(message));
-    if (shouldSkipFromRecallCorpus({ messageText: content, isCreatedByUser: message.isCreatedByUser })) {
+    if (
+      shouldSkipFromRecallCorpus({
+        message,
+        messageText: content,
+        isCreatedByUser: message.isCreatedByUser,
+        hasRecallDerivedChild: recallDerivedParentIds.has(message?.messageId),
+      })
+    ) {
       continue;
     }
 
@@ -693,19 +707,46 @@ async function upsertRecallFile({ userId, scope, agentId, corpus }) {
   const sourceDigest = computeCorpusDigest(corpus);
 
   const existing = await File.findOne({ user: userId, file_id })
-    .select('metadata')
+    .select('metadata embedded file_id')
     .lean();
   const existingSourceDigest =
     existing?.metadata?.conversationRecallSourceDigest || existing?.metadata?.conversationRecallDigest;
+  const existingUploadedDigest = existing?.metadata?.conversationRecallUploadedDigest;
   const lastKnownDigest = lastUploadedCorpusDigestByFileId.get(file_id);
 
-  if (existing && (existingSourceDigest === sourceDigest || lastKnownDigest === sourceDigest)) {
+  if (existing && (existingUploadedDigest === sourceDigest || lastKnownDigest === sourceDigest)) {
     lastUploadedCorpusDigestByFileId.set(file_id, sourceDigest);
     logger.debug('[conversationRecall] Skipping unchanged corpus upload', {
       file_id,
       chars: corpus.length,
     });
     return;
+  }
+
+  if (existing && existingSourceDigest === sourceDigest && existingUploadedDigest !== sourceDigest) {
+    logger.info('[conversationRecall] Rebuilding corpus because prior upload used a reduced window', {
+      file_id,
+      sourceChars: corpus.length,
+      uploadedChars: existing?.metadata?.conversationRecallCharCount ?? null,
+    });
+  }
+
+  /* === VIVENTIUM START ===
+   * Integrity: replace prior vectors before uploading a changed recall corpus.
+   *
+   * Reason:
+   * - The RAG upload path appends new embeddings for the same logical `file_id`.
+   * - Without a pre-upload delete, repeated recall refreshes retain stale cohorts and
+   *   distort retrieval with duplicate / superseded snippets.
+   * === VIVENTIUM END === */
+  if (existing) {
+    await deleteVectors(
+      { user: { id: userId } },
+      {
+        file_id,
+        embedded: existing.embedded !== false,
+      },
+    );
   }
 
   let uploadCorpus = corpus;
@@ -735,6 +776,7 @@ async function upsertRecallFile({ userId, scope, agentId, corpus }) {
           originalname: filename,
           mimetype: 'text/plain',
         },
+        timeoutMs: computeAdaptiveUploadTimeoutMs(uploadCorpus.length),
       });
       logger.info('[conversationRecall] Corpus upload completed', {
         file_id,
@@ -835,15 +877,20 @@ async function upsertRecallFile({ userId, scope, agentId, corpus }) {
   }
 
   const uploadedDigest = computeCorpusDigest(uploadCorpus);
-  const turnCount = (uploadCorpus.match(/<turn\s/g) || []).length;
+  const sourceTurnCount = (corpus.match(/<turn\s/g) || []).length;
+  const uploadedTurnCount = (uploadCorpus.match(/<turn\s/g) || []).length;
+  const usedReducedUploadWindow = uploadedDigest !== sourceDigest;
   const existingMetadata = existing?.metadata ?? {};
   const nextMetadata = {
     ...(existingMetadata.fileIdentifier ? { fileIdentifier: existingMetadata.fileIdentifier } : {}),
     conversationRecallSourceDigest: sourceDigest,
     conversationRecallUploadedDigest: uploadedDigest,
     conversationRecallDigest: sourceDigest,
-    conversationRecallTurnCount: turnCount,
+    conversationRecallTurnCount: uploadedTurnCount,
     conversationRecallCharCount: uploadCorpus.length,
+    conversationRecallSourceTurnCount: sourceTurnCount,
+    conversationRecallSourceCharCount: corpus.length,
+    conversationRecallUsedReducedUploadWindow: usedReducedUploadWindow,
   };
 
   await File.findOneAndUpdate(
@@ -874,7 +921,11 @@ async function upsertRecallFile({ userId, scope, agentId, corpus }) {
     { upsert: true, new: true },
   ).lean();
 
-  lastUploadedCorpusDigestByFileId.set(file_id, sourceDigest);
+  if (usedReducedUploadWindow) {
+    lastUploadedCorpusDigestByFileId.delete(file_id);
+  } else {
+    lastUploadedCorpusDigestByFileId.set(file_id, sourceDigest);
+  }
 }
 
 async function getExistingAgentRecallFiles(userId) {
@@ -1128,6 +1179,8 @@ module.exports = {
   scheduleConversationRecallSync,
   scheduleConversationRecallRefresh,
   /* exported for testability */
+  getMessageText,
+  shouldSkipFromRecallCorpus,
   refreshConversationRecallForUser,
   syncConversationRecallForConversation,
 };

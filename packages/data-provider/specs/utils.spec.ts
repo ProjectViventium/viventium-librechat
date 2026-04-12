@@ -1,4 +1,4 @@
-import { extractEnvVariable } from '../src/utils';
+import { extractEnvVariable, normalizeProviderAlias } from '../src/utils';
 
 describe('Environment Variable Extraction', () => {
   const originalEnv = process.env;
@@ -124,6 +124,21 @@ describe('Environment Variable Extraction', () => {
       expect(extractEnvVariable('Welcome, ${USER}!\nYour message: ${HELLO}')).toBe(
         'Welcome, testuser!\nYour message: world',
       );
+    });
+  });
+
+  describe('normalizeProviderAlias', () => {
+    it('normalizes known provider aliases to canonical runtime values', () => {
+      expect(normalizeProviderAlias('openai')).toBe('openAI');
+      expect(normalizeProviderAlias(' openAI ')).toBe('openAI');
+      expect(normalizeProviderAlias('azure_openai')).toBe('azureOpenAI');
+      expect(normalizeProviderAlias('Anthropic')).toBe('anthropic');
+      expect(normalizeProviderAlias('x_ai')).toBe('xai');
+      expect(normalizeProviderAlias('OpenRouter')).toBe('openrouter');
+    });
+
+    it('preserves unknown custom endpoint names', () => {
+      expect(normalizeProviderAlias('MyCustomEndpoint')).toBe('MyCustomEndpoint');
     });
   });
 });

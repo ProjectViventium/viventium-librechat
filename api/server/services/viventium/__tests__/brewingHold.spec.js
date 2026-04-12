@@ -81,24 +81,12 @@ describe('brewingHold', () => {
     ).toBe(false);
   });
 
-  test('shouldDeferMainResponse suppresses stale productivity holds for non-tool turns', () => {
+  test('shouldDeferMainResponse stays structural and does not inspect user-message phrasing', () => {
     delete process.env.VIVENTIUM_TOOL_CORTEX_HOLD_ENABLED;
 
     expect(
       shouldDeferMainResponse({
         activatedCortices: [{ cortexName: 'Google', activationScope: 'productivity_google_workspace' }],
-        latestUserText: 'Please reply with exactly DIRECT_OK and nothing else.',
-      }),
-    ).toBe(false);
-  });
-
-  test('shouldDeferMainResponse still allows explicit live-data requests', () => {
-    delete process.env.VIVENTIUM_TOOL_CORTEX_HOLD_ENABLED;
-
-    expect(
-      shouldDeferMainResponse({
-        activatedCortices: [{ cortexName: 'Google', activationScope: 'productivity_google_workspace' }],
-        latestUserText: 'Check my Gmail inbox and summarize anything urgent.',
       }),
     ).toBe(true);
   });

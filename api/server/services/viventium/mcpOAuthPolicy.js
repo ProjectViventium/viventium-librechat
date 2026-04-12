@@ -4,12 +4,12 @@
  * Purpose:
  * - Keep non-tool turns fast by avoiding OAuth wait loops and removing OAuth-pending MCP tools
  *   from the current turn's toolset.
- * - Preserve tool-driven behavior when the user clearly requests tool operations.
+ * - Preserve tool-driven behavior when the user clearly requests OAuth-backed MCP operations.
  *
  * Notes:
  * - Telegram/gateway surfaces never wait for OAuth in-turn (no interactive OAuth UX parity).
  * - Web/voice wait behavior is controlled by VIVENTIUM_MCP_OAUTH_WAIT_POLICY:
- *   - intent (default): wait only when tool intent is detected
+ *   - intent (default): wait only when provider-relevant MCP intent is detected
  *   - always: always wait on web/voice
  *   - never: never wait
  * === VIVENTIUM END === */
@@ -51,6 +51,34 @@ const DEFAULT_TOOL_INTENT_KEYWORDS = [
   'availability',
   'appointment',
 ];
+
+const DEFAULT_SERVER_INTENT_KEYWORDS = {
+  google_workspace: [
+    'gmail',
+    'google',
+    'google drive',
+    'gdrive',
+    'google docs',
+    'google sheets',
+    'google slides',
+    'google forms',
+    'google calendar',
+  ],
+  'ms-365': [
+    'outlook',
+    'microsoft',
+    'office365',
+    'office',
+    'ms365',
+    'onedrive',
+    'sharepoint',
+    'teams',
+    'excel',
+    'word',
+    'powerpoint',
+  ],
+  'scheduling-cortex': ['remind', 'reminder', 'reminders', 'todo', 'to do', 'task', 'tasks'],
+};
 
 const parseKeywordEnv = (raw, fallback) => {
   const value = String(raw || '').trim();
@@ -138,7 +166,12 @@ const hasToolIntentKeyword = (text, keywords) => {
   }
 
   const wordSet = new Set(words);
-  return keywords.some((keyword) => keyword && wordSet.has(keyword));
+  return keywords.some((keyword) => {
+    if (!keyword) {
+      return false;
+    }
+    return keyword.includes(' ') ? text.includes(keyword) : wordSet.has(keyword);
+  });
 };
 
 const hasLikelyToolIntent = (req) => {
@@ -162,6 +195,8 @@ const normalizeWaitPolicy = (value) => {
   return 'intent';
 };
 
+const getServerIntentKeywords = (serverName) => DEFAULT_SERVER_INTENT_KEYWORDS[serverName] ?? [];
+
 const getSurface = (req) => {
   if (req?._viventiumTelegram) {
     return 'telegram';
@@ -175,10 +210,34 @@ const getSurface = (req) => {
   return 'web';
 };
 
-const getMcpOAuthWaitDecision = (req) => {
+const getRelevantPendingOAuthServers = (req, pendingOAuthServers) => {
+  const serverNames = Array.from(pendingOAuthServers ?? []).filter(Boolean);
+  if (serverNames.length === 0) {
+    return [];
+  }
+
+  const text = extractTurnText(req).toLowerCase();
+  if (!text) {
+    return [];
+  }
+
+  return serverNames.filter((serverName) => {
+    const keywords = getServerIntentKeywords(serverName);
+    return keywords.length > 0 && hasToolIntentKeyword(text, keywords);
+  });
+};
+
+const getMcpOAuthWaitDecision = (req, pendingOAuthServers) => {
   const surface = getSurface(req);
   const hasToolIntent = hasLikelyToolIntent(req);
   const mode = normalizeWaitPolicy(process.env.VIVENTIUM_MCP_OAUTH_WAIT_POLICY);
+  const allPendingOAuthServers = Array.from(pendingOAuthServers ?? []).filter(Boolean);
+  const relevantPendingOAuthServers =
+    mode === 'always'
+      ? allPendingOAuthServers
+      : mode === 'never'
+        ? []
+        : getRelevantPendingOAuthServers(req, allPendingOAuthServers);
 
   let waitForOAuth = false;
   if (surface === 'telegram' || surface === 'gateway') {
@@ -188,13 +247,14 @@ const getMcpOAuthWaitDecision = (req) => {
   } else if (mode === 'never') {
     waitForOAuth = false;
   } else {
-    waitForOAuth = hasToolIntent;
+    waitForOAuth = relevantPendingOAuthServers.length > 0;
   }
 
   return {
     mode,
     surface,
     hasToolIntent,
+    relevantPendingOAuthServers,
     waitForOAuth,
   };
 };
@@ -250,6 +310,7 @@ const stripOAuthPendingMcpTools = ({ toolDefinitions, toolRegistry, pendingOAuth
 module.exports = {
   extractTurnText,
   hasLikelyToolIntent,
+  getRelevantPendingOAuthServers,
   getMcpOAuthWaitDecision,
   stripOAuthPendingMcpTools,
 };

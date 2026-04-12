@@ -4,7 +4,12 @@
  * === VIVENTIUM END === */
 
 const {
+  buildPushGuardError,
+  compareBundles,
+  compareBundlesByAgent,
+  compareNamedFields,
   isPlaceholderOwnerEmail,
+  LIBRECHAT_REVIEW_FIELDS,
   parseArgs,
   mergeBackgroundCorticesActivationFields,
   normalizeBundleForSourceOfTruth,
@@ -95,6 +100,12 @@ describe('viventium-sync-agents args', () => {
     expect(args.selectedAgentIds).toEqual(['agent-a', 'agent-b']);
   });
 
+  test('parseArgs captures compare-reviewed push acknowledgement', () => {
+    const args = parseArgs(['push', '--compare-reviewed']);
+
+    expect(args.compareReviewed).toBe(true);
+  });
+
   test('parseArgs rejects multiple safe push modes together', () => {
     expect(() =>
       parseArgs([
@@ -112,9 +123,19 @@ describe('viventium-sync-agents args', () => {
       'confidence_threshold',
       'model',
       'provider',
+      'fallbacks',
       'cooldown_ms',
       'max_history',
       'intent_scope',
+    ]);
+  });
+
+  test('resolveSafeActivationFields includes fallbacks for prompts-only mode', () => {
+    expect(resolveSafeActivationFields({ promptsOnly: true })).toEqual([
+      'enabled',
+      'prompt',
+      'confidence_threshold',
+      'fallbacks',
     ]);
   });
 
@@ -128,6 +149,7 @@ describe('viventium-sync-agents args', () => {
           confidence_threshold: 0.7,
           model: 'old-model',
           provider: 'old-provider',
+          fallbacks: [{ provider: 'anthropic', model: 'claude-haiku-4-5' }],
           cooldown_ms: 30000,
           max_history: 6,
         },
@@ -140,6 +162,7 @@ describe('viventium-sync-agents args', () => {
           prompt: 'new prompt',
           model: 'new-model',
           provider: 'new-provider',
+          fallbacks: [{ provider: 'openai', model: 'gpt-5.4' }],
           intent_scope: 'productivity_google_workspace',
         },
       },
@@ -150,6 +173,7 @@ describe('viventium-sync-agents args', () => {
         'prompt',
         'model',
         'provider',
+        'fallbacks',
         'intent_scope',
       ]),
     ).toEqual([
@@ -161,6 +185,7 @@ describe('viventium-sync-agents args', () => {
           confidence_threshold: 0.7,
           model: 'new-model',
           provider: 'new-provider',
+          fallbacks: [{ provider: 'openai', model: 'gpt-5.4' }],
           cooldown_ms: 30000,
           max_history: 6,
           intent_scope: 'productivity_google_workspace',
@@ -219,6 +244,156 @@ describe('viventium-sync-agents args', () => {
         },
       },
     ]);
+  });
+
+  test('compareBundlesByAgent includes tool_kwargs and activation field diffs in reviewed output', () => {
+    const diff = compareBundlesByAgent({
+      leftBundle: {
+        mainAgent: {
+          id: 'main',
+          name: 'Viventium',
+          background_cortices: [
+            {
+              agent_id: 'agent-ms365',
+              activation: {
+                prompt: 'old prompt',
+                confidence_threshold: 0.7,
+              },
+            },
+          ],
+        },
+        backgroundAgents: [
+          {
+            id: 'agent-support',
+            name: 'Support',
+            tool_kwargs: [{ name: 'web_search', throttle: 1 }],
+          },
+        ],
+      },
+      rightBundle: {
+        mainAgent: {
+          id: 'main',
+          name: 'Viventium',
+          background_cortices: [
+            {
+              agent_id: 'agent-ms365',
+              activation: {
+                prompt: 'new prompt',
+                confidence_threshold: 0.7,
+              },
+            },
+          ],
+        },
+        backgroundAgents: [
+          {
+            id: 'agent-support',
+            name: 'Support',
+            tool_kwargs: [{ name: 'web_search', throttle: 2 }],
+          },
+        ],
+      },
+    });
+
+    expect(diff.diffCount).toBe(2);
+    expect(diff.diffs).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: 'agent-support',
+          changedFields: ['tool_kwargs'],
+        }),
+        expect.objectContaining({
+          id: 'main',
+          changedFields: ['background_cortices'],
+          details: expect.objectContaining({
+            background_cortices: expect.objectContaining({
+              changedAgentIds: ['agent-ms365'],
+              changedAgents: [
+                expect.objectContaining({
+                  agentId: 'agent-ms365',
+                  activationChangedFields: ['prompt'],
+                }),
+              ],
+            }),
+          }),
+        }),
+      ]),
+    );
+  });
+
+  test('compareNamedFields surfaces adjacent webSearch drift in librechat config review', () => {
+    const diff = compareNamedFields({
+      leftValue: {
+        interface: {
+          webSearch: true,
+          fileSearch: true,
+        },
+        webSearch: {
+          searchProvider: 'searxng',
+        },
+      },
+      rightValue: {
+        interface: {
+          webSearch: false,
+          fileSearch: true,
+        },
+      },
+      fields: LIBRECHAT_REVIEW_FIELDS,
+    });
+
+    expect(diff.diffCount).toBeGreaterThanOrEqual(2);
+    expect(diff.diffs).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ field: 'interface.webSearch' }),
+        expect.objectContaining({ field: 'webSearch' }),
+      ]),
+    );
+  });
+
+  test('buildPushGuardError blocks non-dry-run pushes until compare drift is reviewed', () => {
+    const error = buildPushGuardError({
+      compareResult: {
+        env: 'local',
+        liveVsSource: { diffCount: 1 },
+        adjacentLibrechat: { liveVsSource: { diffCount: 1 } },
+      },
+      dryRun: false,
+      compareReviewed: false,
+    });
+
+    expect(error).toContain('Push blocked until drift is reviewed');
+    expect(error).toContain('--compare-reviewed');
+    expect(error).toContain('compare --env=local');
+  });
+
+  test('compareBundles ignores --json-style input parsing for yaml source-of-truth files', async () => {
+    const fs = require('fs');
+    const os = require('os');
+    const path = require('path');
+
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-sync-compare-'));
+    const livePath = path.join(tempDir, 'live.viventium-agents.yaml');
+    const sourcePath = path.join(tempDir, 'source.viventium-agents.yaml');
+    const bundleYaml = `
+meta:
+  user:
+    email: user@viventium.local
+    id: placeholder-owner
+mainAgent:
+  id: agent-main
+  background_cortices: []
+backgroundAgents: []
+`;
+    fs.writeFileSync(livePath, bundleYaml);
+    fs.writeFileSync(sourcePath, bundleYaml);
+
+    const result = await compareBundles({
+      env: 'local',
+      livePath,
+      sourcePath,
+      format: 'json',
+    });
+
+    expect(result.liveVsSource.diffCount).toBe(0);
   });
 
   test('normalizeBundleForSourceOfTruth strips owner-specific user metadata', () => {

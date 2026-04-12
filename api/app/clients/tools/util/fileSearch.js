@@ -6,6 +6,23 @@ const { Tools, EToolResources } = require('librechat-data-provider');
 const { filterFilesByAgentAccess } = require('~/server/services/Files/permissions');
 const { getFiles } = require('~/models');
 /* === VIVENTIUM START ===
+ * Feature: Conversation recall exact-literal rescue.
+ * Reason:
+ * - Conversation recall uses a synthetic file over chat turns, and pure vector retrieval can
+ *   miss exact marker-like strings.
+ * - The tool now has a bounded source-backed rescue path for recall files only.
+ * === VIVENTIUM END === */
+const { Message, Conversation } = require('~/db/models');
+const {
+  getMessageText: getConversationRecallMessageText,
+  shouldSkipFromRecallCorpus,
+} = require('~/server/services/viventium/conversationRecallService');
+const {
+  isAssistantMemoryDisclaimer,
+  isConversationRecallFileId,
+  messageUsesConversationRecallSearch,
+} = require('~/server/services/viventium/conversationRecallFilters');
+/* === VIVENTIUM START ===
  * Feature: Evidence-oriented file_search fallback output.
  * === VIVENTIUM END === */
 const { getFileSearchFailureOutput } = require('./modelFacingToolOutput');
@@ -31,23 +48,24 @@ const fileSearchJsonSchema = {
 const DEFAULT_FILE_SEARCH_QUERY_TIMEOUT_MS = 12000;
 const DEFAULT_FILE_SEARCH_QUERY_K = 5;
 const DEFAULT_FILE_SEARCH_QUERY_TIMEOUT_MS_CONVERSATION_RECALL = 8000;
-const DEFAULT_FILE_SEARCH_QUERY_K_CONVERSATION_RECALL = 8;
+const DEFAULT_FILE_SEARCH_QUERY_K_CONVERSATION_RECALL = 60;
 const DEFAULT_FILE_SEARCH_MAX_RESULTS = 10;
 const DEFAULT_FILE_SEARCH_MAX_RESULTS_CONVERSATION_RECALL = 6;
 const DEFAULT_FILE_SEARCH_RESULT_MAX_CHARS = 1600;
 const DEFAULT_FILE_SEARCH_RESULT_MAX_CHARS_CONVERSATION_RECALL = 800;
 const DEFAULT_FILE_SEARCH_OUTPUT_MAX_CHARS = 20000;
 const DEFAULT_FILE_SEARCH_OUTPUT_MAX_CHARS_CONVERSATION_RECALL = 12000;
-const DEFAULT_FILE_SEARCH_RECALL_INTENT_ONLY = false;
-const RECALL_INTENT_REGEX =
-  /\b(remember|recall|previous|earlier|before|last time|past conversation|chat history|you said|i said|shared|mentioned|memory)\b/i;
-const PERSONAL_FACT_RECALL_REGEX =
-  /\b(?:my|me|i|am i)\b[\s\S]{0,48}\b(?:name|legal|wife|husband|mom|mother|dad|father|birthday|move|moving|project|lab|blood|results?|shared|mentioned)\b/i;
-const NAME_QUERY_REGEX = /\b(name|call me|who am i|who i am)\b/i;
-const IDENTITY_SIGNAL_REGEX = /\b(my name is|i am|i'm|call me|legal name)\b/i;
-const ROLE_USER_TAG_REGEX = /\brole=["']user["']/i;
-const ASSISTANT_MEMORY_DISCLAIMER_REGEX =
-  /(?:\b(?:i\s+(?:don't|do not|can't|cannot)\s+(?:have|see|find|access|recall|remember)|i\s+have\s+no\s+(?:specific\s+)?(?:memory|memories|record|records|information|mentions?)|no\s+memories?\s+found)\b[\s\S]{0,180}\b(?:memory|memories|conversation|chat history|past chats|history|name|details?|mention|criteria)\b|\bi\s+don't\s+think\s+you(?:'ve| have)\s+told\s+me\s+that\s+yet\b|\bi\s+don't\s+know\s+(?:your|the)\s+name\b)/i;
+/* === VIVENTIUM START ===
+ * Retrieval: widen the bounded candidate pool for conversation recall before reranking.
+ * Reason:
+ * - Recall corpora are synthetic, compact, and reranked locally.
+ * - A larger top-k keeps exact/near-exact chat turns available for reranking without inflating
+ *   the model-facing output budget.
+ * === VIVENTIUM END === */
+const DEFAULT_FILE_SEARCH_LITERAL_FALLBACK_MAX_MATCHES = 4;
+const CONVERSATION_RECALL_MODE_SOURCE_ONLY = 'source_only';
+const QUOTED_LITERAL_REGEX = /"([^"\n]{4,180})"|“([^”\n]{4,180})”/g;
+const CODE_LIKE_LITERAL_REGEX = /\b[A-Za-z0-9][A-Za-z0-9:_./-]{7,}\b/g;
 const RECALL_QUERY_STOP_WORDS = new Set([
   'about',
   'again',
@@ -73,7 +91,6 @@ const RECALL_QUERY_STOP_WORDS = new Set([
   'remember',
   'said',
   'search',
-  'shared',
   'tell',
   'that',
   'the',
@@ -91,20 +108,6 @@ const parsePositiveIntEnv = (value, fallbackValue) => {
   const parsed = Number.parseInt(value ?? '', 10);
   if (Number.isFinite(parsed) && parsed > 0) {
     return parsed;
-  }
-  return fallbackValue;
-};
-
-const parseBooleanEnv = (value, fallbackValue) => {
-  if (value == null) {
-    return fallbackValue;
-  }
-  const normalized = String(value).trim().toLowerCase();
-  if (['1', 'true', 'yes', 'on'].includes(normalized)) {
-    return true;
-  }
-  if (['0', 'false', 'no', 'off'].includes(normalized)) {
-    return false;
   }
   return fallbackValue;
 };
@@ -163,14 +166,11 @@ const getConversationRecallFileSearchOutputMaxChars = () =>
     DEFAULT_FILE_SEARCH_OUTPUT_MAX_CHARS_CONVERSATION_RECALL,
   );
 
-const isRecallIntentOnlyEnabled = () =>
-  parseBooleanEnv(
-    process.env.VIVENTIUM_FILE_SEARCH_RECALL_INTENT_ONLY,
-    DEFAULT_FILE_SEARCH_RECALL_INTENT_ONLY,
+const getConversationRecallLiteralFallbackMaxMatches = () =>
+  parsePositiveIntEnv(
+    process.env.VIVENTIUM_FILE_SEARCH_LITERAL_FALLBACK_MAX_MATCHES,
+    DEFAULT_FILE_SEARCH_LITERAL_FALLBACK_MAX_MATCHES,
   );
-
-const isConversationRecallFileId = (fileId) =>
-  typeof fileId === 'string' && fileId.startsWith('conversation_recall:');
 
 const getFileSearchTopKForFile = (file) =>
   isConversationRecallFileId(file?.file_id)
@@ -192,6 +192,8 @@ const clipContent = (content, maxChars) => {
   return `${content.slice(0, Math.max(0, maxChars - 3))}...`;
 };
 
+const escapeRegex = (value) => String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 const dedupeFilesById = (files = []) => {
   const seen = new Set();
   const uniqueFiles = [];
@@ -206,9 +208,20 @@ const dedupeFilesById = (files = []) => {
   return uniqueFiles;
 };
 
-const hasConversationRecallIntent = (query) => {
-  const text = String(query || '');
-  return RECALL_INTENT_REGEX.test(text) || PERSONAL_FACT_RECALL_REGEX.test(text);
+const isSourceOnlyConversationRecallFile = (file) =>
+  isConversationRecallFileId(file?.file_id) &&
+  file?.viventiumConversationRecallMode === CONVERSATION_RECALL_MODE_SOURCE_ONLY;
+
+const dedupeRecallResults = (results = []) => {
+  const seen = new Set();
+  return results.filter((result) => {
+    const key = `${result?.file_id || ''}::${result?.content || ''}`;
+    if (!result || !result.content || seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
 };
 
 const tokenizeRecallQuery = (query) => {
@@ -247,7 +260,232 @@ const countTermMatches = (contentLower, terms) => {
   return matchCount;
 };
 
-const getConversationRecallRerankScore = ({ query, result, queryTerms, isNameQuery }) => {
+const isCodeLikeLiteralCandidate = (token) => {
+  if (typeof token !== 'string') {
+    return false;
+  }
+  const trimmed = token.trim();
+  if (trimmed.length < 8) {
+    return false;
+  }
+  return (
+    /\d/.test(trimmed) ||
+    trimmed.includes('-') ||
+    trimmed.includes('_') ||
+    trimmed.includes(':') ||
+    trimmed.includes('/') ||
+    trimmed.includes('@') ||
+    /[A-Z]{2,}/.test(trimmed)
+  );
+};
+
+const extractRecallLiteralCandidates = (query) => {
+  const text = String(query || '');
+  const candidates = [];
+  const seen = new Set();
+
+  const pushCandidate = (value) => {
+    const trimmed = String(value || '').trim();
+    if (!trimmed || trimmed.length < 4) {
+      return;
+    }
+    const normalized = trimmed.toLowerCase();
+    if (seen.has(normalized)) {
+      return;
+    }
+    seen.add(normalized);
+    candidates.push(trimmed);
+  };
+
+  for (const match of text.matchAll(QUOTED_LITERAL_REGEX)) {
+    pushCandidate(match[1] || match[2]);
+  }
+
+  for (const match of text.matchAll(CODE_LIKE_LITERAL_REGEX)) {
+    const token = match[0];
+    if (isCodeLikeLiteralCandidate(token)) {
+      pushCandidate(token);
+    }
+  }
+
+  return candidates.slice(0, 4);
+};
+
+const contentContainsLiteralCandidate = (content, literalCandidates) => {
+  const contentLower = String(content || '').toLowerCase();
+  return literalCandidates.some((candidate) => contentLower.includes(candidate.toLowerCase()));
+};
+
+const parseConversationRecallAgentIdFromFileId = (fileId) => {
+  const match = /^conversation_recall:[^:]+:agent:(.+)$/.exec(String(fileId || ''));
+  return match?.[1] || null;
+};
+
+const buildConversationRecallSnippet = ({ message, content }) => {
+  const role = message?.isCreatedByUser ? 'user' : message?.sender || 'assistant';
+  const timestamp = message?.createdAt
+    ? new Date(message.createdAt).toISOString()
+    : new Date().toISOString();
+  const conversation = message?.conversationId || 'unknown';
+  return `<turn timestamp="${timestamp}" conversation="${conversation}" role="${role}">\n${content}\n</turn>`;
+};
+
+const buildScopedConversationIds = async ({ userId, recallFileId, currentConversationId }) => {
+  const agentId = parseConversationRecallAgentIdFromFileId(recallFileId);
+  if (!agentId) {
+    return currentConversationId ? { $ne: currentConversationId } : undefined;
+  }
+
+  const conversations = await Conversation.find({
+    user: userId,
+    agent_id: agentId,
+  })
+    .select('conversationId')
+    .lean();
+
+  const conversationIds = conversations
+    .map((conversation) => conversation?.conversationId)
+    .filter((conversationId) => conversationId && conversationId !== currentConversationId);
+
+  if (!conversationIds.length) {
+    return { $in: [] };
+  }
+
+  return { $in: conversationIds };
+};
+
+async function hasRecallDerivedChildMessage({ userId, messageId }) {
+  if (!userId || !messageId) {
+    return false;
+  }
+
+  const childMessages = await Message.find({
+    user: userId,
+    parentMessageId: messageId,
+    isCreatedByUser: false,
+    unfinished: { $ne: true },
+    error: { $ne: true },
+    $or: [{ expiredAt: { $exists: false } }, { expiredAt: null }],
+  })
+    .select('attachments parentMessageId')
+    .sort({ createdAt: 1 })
+    .limit(4)
+    .lean();
+
+  return childMessages.some((message) => messageUsesConversationRecallSearch(message));
+}
+
+async function searchConversationRecallSourceMatches({
+  userId,
+  conversationId,
+  recallFiles,
+  query,
+  literalCandidates,
+}) {
+  if (!userId || !Array.isArray(recallFiles) || !recallFiles.length) {
+    return [];
+  }
+
+  const queryTerms = tokenizeRecallQuery(query).slice(0, 6);
+  const searchTerms = Array.from(new Set([...literalCandidates, ...queryTerms])).filter(Boolean);
+  if (!searchTerms.length) {
+    return [];
+  }
+
+  const queryLower = String(query || '').toLowerCase();
+  const regexes = searchTerms.map((candidate) => new RegExp(escapeRegex(candidate), 'i'));
+  const maxMatches = getConversationRecallLiteralFallbackMaxMatches();
+  const results = [];
+
+  for (const file of recallFiles) {
+    const scopedConversationIds = await buildScopedConversationIds({
+      userId,
+      recallFileId: file.file_id,
+      currentConversationId: conversationId,
+    });
+
+    const messages = await Message.find({
+      user: userId,
+      unfinished: { $ne: true },
+      error: { $ne: true },
+      ...(scopedConversationIds ? { conversationId: scopedConversationIds } : {}),
+      $or: [{ expiredAt: { $exists: false } }, { expiredAt: null }],
+      $and: [
+        {
+          $or: regexes.map((regex) => ({
+            text: regex,
+          })),
+        },
+      ],
+    })
+      .select('messageId parentMessageId conversationId createdAt sender isCreatedByUser text content attachments')
+      .sort({ createdAt: -1 })
+      .limit(maxMatches * 6)
+      .lean();
+
+    for (const message of messages) {
+      const content = getConversationRecallMessageText(message);
+      const contentLower = content.toLowerCase();
+      const hasRecallDerivedChild =
+        message?.isCreatedByUser === true
+          ? await hasRecallDerivedChildMessage({ userId, messageId: message?.messageId })
+          : false;
+      if (
+        shouldSkipFromRecallCorpus({
+          message,
+          messageText: content,
+          isCreatedByUser: message?.isCreatedByUser,
+          hasRecallDerivedChild,
+        })
+      ) {
+        continue;
+      }
+      const termMatches = countTermMatches(contentLower, queryTerms);
+      const literalMatchCount = literalCandidates.filter((candidate) =>
+        contentLower.includes(candidate.toLowerCase()),
+      ).length;
+      if (termMatches === 0 && literalMatchCount === 0) {
+        continue;
+      }
+
+      results.push({
+        filename: file.filename || 'conversation-recall-all.txt',
+        content: buildConversationRecallSnippet({ message, content }),
+        distance: 0,
+        file_id: file.file_id,
+        page: null,
+        sourceKind: 'raw_message',
+        sourceRecallScore:
+          literalMatchCount * 4 +
+          termMatches +
+          (queryLower.length >= 8 && contentLower.includes(queryLower) ? 2 : 0),
+        createdAt: message?.createdAt ? new Date(message.createdAt).getTime() : 0,
+      });
+
+      if (results.length >= maxMatches * 3) {
+        break;
+      }
+    }
+  }
+
+  return dedupeRecallResults(results)
+    .sort((a, b) => {
+      if ((b.sourceRecallScore || 0) !== (a.sourceRecallScore || 0)) {
+        return (b.sourceRecallScore || 0) - (a.sourceRecallScore || 0);
+      }
+      return (b.createdAt || 0) - (a.createdAt || 0);
+    })
+    .slice(0, maxMatches)
+    .map(({ sourceRecallScore, createdAt, ...result }) => result);
+}
+
+const shouldUseConversationRecallSourceRescue = ({ query, results, literalCandidates }) => {
+  const queryTerms = tokenizeRecallQuery(query);
+  void results;
+  return literalCandidates.length > 0 || queryTerms.length >= 2;
+};
+
+const getConversationRecallRerankScore = ({ query, result, queryTerms }) => {
   const content = typeof result?.content === 'string' ? result.content : '';
   const contentLower = content.toLowerCase();
   const queryLower = String(query || '').toLowerCase();
@@ -260,15 +498,15 @@ const getConversationRecallRerankScore = ({ query, result, queryTerms, isNameQue
     score += 0.45;
   }
 
-  if (isNameQuery && IDENTITY_SIGNAL_REGEX.test(contentLower)) {
-    score += 0.95;
+  if (Number.isFinite(result?.sourceRecallScore)) {
+    score += Math.min(1.4, Number(result.sourceRecallScore) * 0.22);
   }
 
-  if (isNameQuery && ROLE_USER_TAG_REGEX.test(contentLower)) {
-    score += 0.35;
+  if (result?.sourceKind === 'raw_message') {
+    score += 0.9;
   }
 
-  if (ASSISTANT_MEMORY_DISCLAIMER_REGEX.test(contentLower)) {
+  if (isAssistantMemoryDisclaimer(contentLower)) {
     score -= 1.25;
   }
 
@@ -281,8 +519,6 @@ const rerankConversationRecallResults = ({ query, results }) => {
   }
 
   const queryTerms = tokenizeRecallQuery(query);
-  const queryLower = String(query || '').toLowerCase();
-  const isNameQuery = NAME_QUERY_REGEX.test(queryLower);
 
   return results
     .map((result) => {
@@ -290,7 +526,6 @@ const rerankConversationRecallResults = ({ query, results }) => {
         query,
         result,
         queryTerms,
-        isNameQuery,
       });
       return {
         ...result,
@@ -357,6 +592,7 @@ const primeFiles = async (options) => {
     files.push({
       file_id: file.file_id,
       filename: file.filename,
+      viventiumConversationRecallMode: file?.viventiumConversationRecallMode,
     });
   }
 
@@ -372,7 +608,13 @@ const primeFiles = async (options) => {
  * @param {boolean} [options.fileCitations=false] - Whether to include citation instructions
  * @returns
  */
-const createFileSearchTool = async ({ userId, files, entity_id, fileCitations = false }) => {
+const createFileSearchTool = async ({
+  userId,
+  files,
+  entity_id,
+  conversationId,
+  fileCitations = false,
+}) => {
   return tool(
     async ({ query }) => {
       if (files.length === 0) {
@@ -401,11 +643,11 @@ const createFileSearchTool = async ({ userId, files, entity_id, fileCitations = 
         return body;
       };
 
-      const recallIntent = hasConversationRecallIntent(query);
+      const literalCandidates = extractRecallLiteralCandidates(query);
       const recallFiles = files.filter((file) => isConversationRecallFileId(file?.file_id));
-      const nonRecallFiles = files.filter((file) => !isConversationRecallFileId(file?.file_id));
-      const recallIntentOnly = isRecallIntentOnlyEnabled();
-      const preferRecallFiles = recallIntent && recallIntentOnly && recallFiles.length > 0;
+      const recallFilesNeedSourceFallback = recallFiles.some((file) =>
+        isSourceOnlyConversationRecallFile(file),
+      );
 
       /* === VIVENTIUM START ===
        * Feature: Structured file_search query observability + error differentiation
@@ -425,6 +667,12 @@ const createFileSearchTool = async ({ userId, files, entity_id, fileCitations = 
       const queryFiles = async (targetFiles) => {
         const queryPromises = targetFiles.map(async (file) => {
           const isRecall = isConversationRecallFileId(file?.file_id);
+          if (isSourceOnlyConversationRecallFile(file)) {
+            logger.debug(`[${Tools.file_search}] skipping vector query for source-only recall file`, {
+              fileId: file.file_id,
+            });
+            return { file, response: { data: [] } };
+          }
           const queryStart = Date.now();
           try {
             const fileSearchQueryTimeoutMs = getFileSearchQueryTimeoutMsForFile(file);
@@ -472,27 +720,7 @@ const createFileSearchTool = async ({ userId, files, entity_id, fileCitations = 
         Array.isArray(results) &&
         results.some((result) => Array.isArray(result?.response?.data) && result.response.data.length > 0);
 
-      const queryTokens = tokenizeRecallQuery(query);
-      const hasSubstantiveIntent = hasConversationRecallIntent(query) || queryTokens.length >= 3;
-      const skipRecallFiles = !hasSubstantiveIntent && nonRecallFiles.length > 0 && recallFiles.length > 0;
-      const initialFiles = skipRecallFiles
-        ? nonRecallFiles
-        : preferRecallFiles
-          ? recallFiles
-          : files;
-
-      let validResults = await queryFiles(initialFiles);
-
-      if ((!validResults.length || !hasAnyMatches(validResults)) && preferRecallFiles && nonRecallFiles.length > 0) {
-        validResults = await queryFiles(nonRecallFiles);
-      }
-
-      if (validResults.length === 0) {
-        const msg = queryErrorCount > 0
-          ? getFileSearchFailureOutput()
-          : 'No matching content found in conversation history for this query.';
-        return [msg, undefined];
-      }
+      const validResults = await queryFiles(files);
 
       let formattedResults = validResults
         .flatMap(({ file, response }) =>
@@ -514,13 +742,57 @@ const createFileSearchTool = async ({ userId, files, entity_id, fileCitations = 
             result.content.trim().length > 0,
         );
 
-      const hasConversationRecallResults = formattedResults.some((result) =>
+      let hasConversationRecallResults = formattedResults.some((result) =>
         isConversationRecallFileId(result.file_id),
       );
 
       if (hasConversationRecallResults) {
         formattedResults = rerankConversationRecallResults({ query, results: formattedResults });
-      } else {
+      }
+
+      const shouldAttemptSourceRescue =
+        recallFilesNeedSourceFallback ||
+        queryErrorCount > 0 ||
+        shouldUseConversationRecallSourceRescue({
+          query,
+          results: formattedResults,
+          literalCandidates,
+        });
+
+      if (recallFiles.length > 0 && shouldAttemptSourceRescue) {
+        const sourceRescueResults = await searchConversationRecallSourceMatches({
+          userId,
+          conversationId,
+          recallFiles,
+          query,
+          literalCandidates,
+        });
+
+        if (sourceRescueResults.length > 0) {
+          logger.info(`[${Tools.file_search}] conversation recall source rescue hit`, {
+            recallFileCount: recallFiles.length,
+            queryTerms: tokenizeRecallQuery(query).slice(0, 6),
+            literalCandidates,
+            rescueCount: sourceRescueResults.length,
+          });
+          formattedResults = dedupeRecallResults(formattedResults.concat(sourceRescueResults));
+          hasConversationRecallResults = formattedResults.some((result) =>
+            isConversationRecallFileId(result.file_id),
+          );
+          if (hasConversationRecallResults) {
+            formattedResults = rerankConversationRecallResults({ query, results: formattedResults });
+          }
+        }
+      }
+
+      if (formattedResults.length === 0) {
+        const msg = queryErrorCount > 0
+          ? getFileSearchFailureOutput()
+          : 'No matching content found in conversation history for this query.';
+        return [msg, undefined];
+      }
+
+      if (!hasConversationRecallResults) {
         formattedResults.sort((a, b) => a.distance - b.distance);
       }
 
@@ -608,6 +880,8 @@ const createFileSearchTool = async ({ userId, files, entity_id, fileCitations = 
       name: Tools.file_search,
       responseFormat: 'content_and_artifact',
       description: `Performs semantic search across attached "${Tools.file_search}" documents using natural language queries. This tool analyzes the content of uploaded files to find relevant information, quotes, and passages that best match your query. Use this to extract specific information or find relevant sections within the available documents.${
+        '\n\nPreserve distinctive exact strings from the user when they matter, such as IDs, codes, quoted phrases, names, and email addresses. Do not paraphrase them away in the query.'
+      }${
         fileCitations
           ? `
 

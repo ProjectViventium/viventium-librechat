@@ -24,6 +24,7 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from functools import lru_cache
 import asyncio
+import app.config as rag_config
 
 if TYPE_CHECKING:
     from app.services.vector_store.async_pg_vector import AsyncPgVector
@@ -34,7 +35,6 @@ from app.config import (
     ATLAS_SEARCH_INDEX,
     COLLECTION_NAME,
     CONNECTION_STRING,
-    EMBEDDINGS_CHUNK_SIZE,
     EMBEDDINGS_MODEL,
     EMBEDDINGS_PROVIDER,
     EmbeddingsProvider,
@@ -69,6 +69,20 @@ from app.utils.document_loader import (
 from app.utils.health import is_health_ok
 
 router = APIRouter()
+# === VIVENTIUM START ===
+# Feature: RAG override compatibility across shipped image config variants.
+# Purpose:
+# - The mounted override must work against the actual RAG image contract, not just one local
+#   source snapshot.
+# - Some shipped images expose EMBEDDING_BATCH_SIZE but not EMBEDDINGS_CHUNK_SIZE; importing the
+#   latter directly crashes the entire RAG API before health comes up.
+# Added: 2026-04-09
+EMBEDDINGS_CHUNK_SIZE = getattr(
+    rag_config,
+    "EMBEDDINGS_CHUNK_SIZE",
+    max(int(getattr(rag_config, "EMBEDDING_BATCH_SIZE", 1000) or 1000), 1),
+)
+# === VIVENTIUM END ===
 # === VIVENTIUM START ===
 # Feature: Request-scoped OpenAI embeddings overrides for RAG uploads.
 # Purpose: Allow LibreChat to pass user-scoped OpenAI embeddings credentials into the

@@ -134,6 +134,8 @@ describe('conversationRecallService', () => {
     process.env.VIVENTIUM_CONVERSATION_RECALL_UPLOAD_MAX_ATTEMPTS = '4';
     process.env.VIVENTIUM_CONVERSATION_RECALL_UPLOAD_RETRY_BASE_MS = '0';
     process.env.VIVENTIUM_CONVERSATION_RECALL_UPLOAD_TIMEOUT_MS = '5000';
+    process.env.VIVENTIUM_CONVERSATION_RECALL_UPLOAD_TIMEOUT_PER_100K_CHARS_MS = '0';
+    process.env.VIVENTIUM_CONVERSATION_RECALL_UPLOAD_TIMEOUT_MAX_MS = '5000';
     process.env.VIVENTIUM_CONVERSATION_RECALL_TEXT_ONLY = 'true';
     process.env.VIVENTIUM_CONVERSATION_RECALL_FAILURE_COOLDOWN_BASE_MS = '25';
     process.env.VIVENTIUM_CONVERSATION_RECALL_FAILURE_COOLDOWN_MAX_MS = '50';
@@ -199,6 +201,46 @@ describe('conversationRecallService', () => {
     );
   });
 
+  test('scales upload timeout with larger recall corpora', async () => {
+    process.env.VIVENTIUM_CONVERSATION_RECALL_UPLOAD_TIMEOUT_MS = '5000';
+    process.env.VIVENTIUM_CONVERSATION_RECALL_UPLOAD_TIMEOUT_PER_100K_CHARS_MS = '2000';
+    process.env.VIVENTIUM_CONVERSATION_RECALL_UPLOAD_TIMEOUT_MAX_MS = '12000';
+    process.env.VIVENTIUM_CONVERSATION_RECALL_MAX_MESSAGE_TEXT_CHARS = '400000';
+
+    mockUserFindById.mockReturnValue(
+      queryResult({
+        personalization: { conversation_recall: true },
+      }),
+    );
+
+    mockMessageFind.mockReturnValue(
+      queryResult([
+        {
+          conversationId: 'conv_1',
+          createdAt: '2026-02-19T00:00:00.000Z',
+          isCreatedByUser: true,
+          text: 'x'.repeat(250000),
+        },
+      ]),
+    );
+
+    mockConversationFind.mockImplementation((filter) => {
+      if (filter?.agent_id?.$exists) {
+        return queryResult([]);
+      }
+      return queryResult([]);
+    });
+
+    mockFileFind.mockReturnValue(queryResult([]));
+    mockFileFindOneAndUpdate.mockReturnValue(queryResult({ _id: 'file_all' }));
+
+    const service = require('../conversationRecallService');
+    await service.refreshConversationRecallForUser({ userId: 'user_1' });
+
+    expect(mockUploadVectors).toHaveBeenCalledTimes(1);
+    expect(mockUploadVectors.mock.calls[0][0].timeoutMs).toBe(11000);
+  });
+
   test('supports user-only corpus mode when assistant inclusion is disabled', async () => {
     process.env.VIVENTIUM_CONVERSATION_RECALL_INCLUDE_ASSISTANT = 'false';
 
@@ -238,7 +280,7 @@ describe('conversationRecallService', () => {
       }),
     );
     expect(messageQuery.select).toHaveBeenCalledWith(
-      'conversationId createdAt sender isCreatedByUser text',
+      'messageId parentMessageId conversationId createdAt sender isCreatedByUser text attachments',
     );
   });
 
@@ -312,6 +354,50 @@ describe('conversationRecallService', () => {
     expect(writtenCorpus).not.toContain("don't think you've told me that yet");
   });
 
+  test('shouldSkipFromRecallCorpus uses structural recall provenance instead of prompt phrases', () => {
+    const service = require('../conversationRecallService');
+    const assistantRecallTurn = {
+      messageId: 'assistant_1',
+      parentMessageId: 'user_meta',
+      isCreatedByUser: false,
+      attachments: [
+        {
+          type: 'file_search',
+          file_search: {
+            sources: [{ fileId: 'conversation_recall:user_1:all' }],
+          },
+        },
+      ],
+    };
+
+    expect(
+      service.shouldSkipFromRecallCorpus({
+        message: { messageId: 'user_meta', isCreatedByUser: true },
+        messageText: 'What exact marker was it?',
+        isCreatedByUser: true,
+        hasRecallDerivedChild: true,
+      }),
+    ).toBe(true);
+
+    expect(
+      service.shouldSkipFromRecallCorpus({
+        message: assistantRecallTurn,
+        messageText: 'Let me search for that.',
+        isCreatedByUser: false,
+      }),
+    ).toBe(true);
+
+    expect(
+      service.shouldSkipFromRecallCorpus({
+        message: { messageId: 'user_source', isCreatedByUser: true },
+        messageText:
+          'QA-only synthetic recall marker for testing: VIV-RAG-QA-20260409-1626-ONYX-FJ42. This is not a personal preference or durable memory. Reply only with the exact marker.',
+        isCreatedByUser: true,
+        hasRecallDerivedChild: false,
+      }),
+    ).toBe(false);
+  });
+
   test('skips upload when corpus digest is unchanged between syncs', async () => {
     mockUserFindById.mockReturnValue(
       queryResult({
@@ -352,6 +438,116 @@ describe('conversationRecallService', () => {
 
     expect(mockUploadVectors).toHaveBeenCalledTimes(1);
     expect(mockFileFindOneAndUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  test('does not skip refresh when prior upload digest differs from the current source digest', async () => {
+    mockUserFindById.mockReturnValue(
+      queryResult({
+        personalization: { conversation_recall: true },
+      }),
+    );
+
+    mockMessageFind.mockReturnValue(
+      queryResult([
+        {
+          conversationId: 'conv_1',
+          createdAt: '2026-02-19T00:00:00.000Z',
+          isCreatedByUser: true,
+          text: 'user note',
+        },
+      ]),
+    );
+
+    mockConversationFind.mockImplementation((filter) => {
+      if (filter?.agent_id?.$exists) {
+        return queryResult([]);
+      }
+      return queryResult([]);
+    });
+
+    mockFileFind.mockReturnValue(queryResult([]));
+    mockFileFindOneAndUpdate.mockReturnValue(queryResult({ _id: 'file_all' }));
+
+    const service = require('../conversationRecallService');
+    mockFileFindOne.mockReturnValueOnce(queryResult(null));
+    await service.refreshConversationRecallForUser({ userId: 'user_1' });
+
+    const sourceDigest =
+      mockFileFindOneAndUpdate.mock.calls[0][1].$set.metadata.conversationRecallSourceDigest;
+
+    jest.resetModules();
+    mockDeleteVectors.mockClear();
+    mockUploadVectors.mockClear();
+    mockFileFindOneAndUpdate.mockClear();
+    mockFileFindOne.mockReturnValue(
+      queryResult({
+        _id: 'existing_file',
+        file_id: 'conversation_recall:user_1:all',
+        embedded: true,
+        metadata: {
+          conversationRecallSourceDigest: sourceDigest,
+          conversationRecallUploadedDigest: 'reduced-window-digest',
+          conversationRecallCharCount: 12345,
+        },
+      }),
+    );
+
+    const serviceAfterRestart = require('../conversationRecallService');
+    await serviceAfterRestart.refreshConversationRecallForUser({ userId: 'user_1' });
+
+    expect(mockDeleteVectors).toHaveBeenCalledTimes(1);
+    expect(mockUploadVectors).toHaveBeenCalledTimes(1);
+  });
+
+  test('deletes prior vectors before uploading a changed recall corpus', async () => {
+    mockUserFindById.mockReturnValue(
+      queryResult({
+        personalization: { conversation_recall: true },
+      }),
+    );
+
+    mockMessageFind.mockReturnValue(
+      queryResult([
+        {
+          conversationId: 'conv_1',
+          createdAt: '2026-02-19T00:00:00.000Z',
+          isCreatedByUser: true,
+          text: 'user note updated',
+        },
+      ]),
+    );
+
+    mockConversationFind.mockImplementation((filter) => {
+      if (filter?.agent_id?.$exists) {
+        return queryResult([]);
+      }
+      return queryResult([]);
+    });
+
+    mockFileFind.mockReturnValue(queryResult([]));
+    mockFileFindOneAndUpdate.mockReturnValue(queryResult({ _id: 'file_all' }));
+    mockFileFindOne.mockReturnValue(
+      queryResult({
+        _id: 'existing_file',
+        file_id: 'conversation_recall:user_1:all',
+        embedded: true,
+        metadata: {
+          conversationRecallSourceDigest: 'old-digest',
+        },
+      }),
+    );
+
+    const service = require('../conversationRecallService');
+    await service.refreshConversationRecallForUser({ userId: 'user_1' });
+
+    expect(mockDeleteVectors).toHaveBeenCalledWith(
+      { user: { id: 'user_1' } },
+      {
+        file_id: 'conversation_recall:user_1:all',
+        embedded: true,
+      },
+    );
+    expect(mockUploadVectors).toHaveBeenCalledTimes(1);
   });
 
   test('overfetches raw messages before filtering when building recall corpus', async () => {
@@ -788,6 +984,57 @@ describe('conversationRecallService', () => {
     const secondSize = mockUploadVectors.mock.calls[1][0].file.size;
     expect(secondSize).toBeLessThan(firstSize);
     expect(secondSize).toBeGreaterThanOrEqual(20000);
+  });
+
+  test('records reduced-upload metadata and keeps the source digest eligible for future rebuilds', async () => {
+    process.env.VIVENTIUM_CONVERSATION_RECALL_UPLOAD_MAX_ATTEMPTS = '1';
+    process.env.VIVENTIUM_CONVERSATION_RECALL_UPLOAD_MAX_CORPUS_REDUCTIONS = '2';
+    process.env.VIVENTIUM_CONVERSATION_RECALL_UPLOAD_REDUCTION_FACTOR = '0.5';
+    process.env.VIVENTIUM_CONVERSATION_RECALL_MIN_CHARS = '20000';
+    process.env.VIVENTIUM_CONVERSATION_RECALL_MAX_MESSAGE_TEXT_CHARS = '60000';
+
+    mockUserFindById.mockReturnValue(
+      queryResult({
+        personalization: { conversation_recall: true },
+      }),
+    );
+
+    mockMessageFind.mockReturnValue(
+      queryResult([
+        {
+          conversationId: 'conv_1',
+          createdAt: '2026-02-19T00:00:00.000Z',
+          isCreatedByUser: true,
+          text: 'x'.repeat(50000),
+        },
+      ]),
+    );
+
+    mockConversationFind.mockImplementation((filter) => {
+      if (filter?.agent_id?.$exists) {
+        return queryResult([]);
+      }
+      return queryResult([]);
+    });
+
+    mockFileFind.mockReturnValue(queryResult([]));
+    mockFileFindOneAndUpdate.mockReturnValue(queryResult({ _id: 'file_all' }));
+
+    mockUploadVectors
+      .mockRejectedValueOnce({ code: 'ECONNABORTED', message: 'timeout of 60000ms exceeded' })
+      .mockResolvedValueOnce(undefined);
+
+    const service = require('../conversationRecallService');
+    await service.refreshConversationRecallForUser({ userId: 'user_1' });
+
+    const updateDoc = mockFileFindOneAndUpdate.mock.calls[0][1];
+    expect(updateDoc.$set.metadata.conversationRecallUsedReducedUploadWindow).toBe(true);
+    expect(updateDoc.$set.metadata.conversationRecallSourceCharCount).toBeGreaterThan(
+      updateDoc.$set.metadata.conversationRecallCharCount,
+    );
+    expect(updateDoc.$set.metadata.conversationRecallSourceDigest).not.toBe(
+      updateDoc.$set.metadata.conversationRecallUploadedDigest,
+    );
   });
 
   test('falls back to emergency seed corpus when reductions cannot shrink enough', async () => {

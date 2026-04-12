@@ -6,10 +6,25 @@
 import { EToolResources } from 'librechat-data-provider';
 import type { AgentToolResources, TFile } from 'librechat-data-provider';
 import {
+  buildConversationRecallAttachmentFiles,
   ensureConversationRecallTool,
   getConversationRecallRuntimeScope,
   mergeConversationRecallResources,
 } from './conversationRecall';
+
+const recallFiles: TFile[] = [
+  {
+    user: 'user1',
+    file_id: 'recall-file-1',
+    filename: 'conversation-recall-all.txt',
+    filepath: 'vectordb',
+    object: 'file',
+    type: 'text/plain',
+    bytes: 123,
+    embedded: true,
+    usage: 0,
+  },
+];
 
 describe('conversationRecall runtime helpers', () => {
   describe('getConversationRecallRuntimeScope', () => {
@@ -60,20 +75,6 @@ describe('conversationRecall runtime helpers', () => {
   });
 
   describe('mergeConversationRecallResources', () => {
-    const recallFiles: TFile[] = [
-      {
-        user: 'user1',
-        file_id: 'recall-file-1',
-        filename: 'conversation-recall-all.txt',
-        filepath: 'vectordb',
-        object: 'file',
-        type: 'text/plain',
-        bytes: 123,
-        embedded: true,
-        usage: 0,
-      },
-    ];
-
     it('adds recall files into file_search resources', () => {
       const result = mergeConversationRecallResources({
         tool_resources: {},
@@ -113,6 +114,41 @@ describe('conversationRecall runtime helpers', () => {
       const result = ensureConversationRecallTool(['file_search', 'web_search']);
 
       expect(result).toEqual(['file_search', 'web_search']);
+    });
+  });
+
+  describe('buildConversationRecallAttachmentFiles', () => {
+    it('builds a synthetic source-only recall file when no vector file exists yet', () => {
+      const result = buildConversationRecallAttachmentFiles({
+        userId: 'user1',
+        scope: 'all',
+        mode: 'source_only',
+      });
+
+      expect(result).toHaveLength(1);
+      expect(result[0]).toEqual(
+        expect.objectContaining({
+          file_id: 'conversation_recall:user1:all',
+          filename: 'conversation-recall-all.txt',
+          viventiumConversationRecallMode: 'source_only',
+        }),
+      );
+    });
+
+    it('decorates existing recall files with attachment mode metadata', () => {
+      const result = buildConversationRecallAttachmentFiles({
+        userId: 'user1',
+        scope: 'all',
+        existingFiles: recallFiles,
+        mode: 'vector',
+      });
+
+      expect(result).toEqual([
+        expect.objectContaining({
+          file_id: 'recall-file-1',
+          viventiumConversationRecallMode: 'vector',
+        }),
+      ]);
     });
   });
 });

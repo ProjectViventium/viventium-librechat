@@ -19,6 +19,7 @@ const createForm = (): AgentForm => ({
   instructions: null,
   model: 'gpt-4',
   model_parameters: {},
+  voice_llm_model_parameters: undefined,
   tools: [],
   provider: 'openai',
   agent_ids: [],
@@ -80,6 +81,35 @@ describe('composeAgentUpdatePayload', () => {
     expect(payload.model_parameters).toMatchObject({
       model: 'gpt-5.4',
       reasoning_effort: 'xhigh',
+    });
+  });
+
+  it('keeps voice model parameters separate from the primary model parameters', () => {
+    const form = createForm();
+    form.provider = 'openAI';
+    form.model = 'gpt-5.4';
+    form.model_parameters = {
+      model: 'gpt-5.4',
+      reasoning_effort: 'high',
+    } as AgentForm['model_parameters'];
+    form.voice_llm_provider = 'anthropic';
+    form.voice_llm_model = 'claude-haiku-4-5';
+    form.voice_llm_model_parameters = {
+      model: 'claude-opus-4-6',
+      temperature: 0.2,
+      max_output_tokens: 180,
+    } as AgentForm['voice_llm_model_parameters'];
+
+    const { payload } = composeAgentUpdatePayload(form, 'agent_123');
+
+    expect(payload.model_parameters).toMatchObject({
+      model: 'gpt-5.4',
+      reasoning_effort: 'high',
+    });
+    expect(payload.voice_llm_model_parameters).toMatchObject({
+      model: 'claude-haiku-4-5',
+      temperature: 0.2,
+      max_output_tokens: 180,
     });
   });
 });

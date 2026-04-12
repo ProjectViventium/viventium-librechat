@@ -16,6 +16,7 @@ logs-foundry/
 .tmp_probe.json
 tmp/
 .viventium/artifacts/agents-sync/
+.rag-pgdata/
 # VIVENTIUM END
 
 # Runtime data

@@ -1,11 +1,11 @@
 /* === VIVENTIUM START ===
  * Feature: Voice Chat LLM Override
  * Purpose: Panel for selecting a voice-specific model/provider in Agent Builder.
- * Mirrors ModelPanel.tsx but targets voice_llm_model/voice_llm_provider fields.
- * No model_parameters section — voice model inherits main agent's params.
+ * Mirrors ModelPanel.tsx but targets voice_llm_* fields so voice calls can own a separate
+ * parameter bag without mutating the primary model settings.
  * Added: 2026-02-24
  * === VIVENTIUM END === */
-import React, { useMemo, useEffect } from 'react';
+import React, { useMemo, useEffect, useRef } from 'react';
 import { ControlCombobox } from '@librechat/client';
 import { ChevronLeft, Trash2 } from 'lucide-react';
 import { useFormContext, useWatch, Controller } from 'react-hook-form';
@@ -14,6 +14,8 @@ import type { AgentForm, AgentModelPanelProps } from '~/common';
 import { useLocalize } from '~/hooks';
 import { Panel } from '~/common';
 import { cn } from '~/utils';
+import { resolveAgentModelForProvider } from './modelSelection';
+import ModelParametersSection from './ModelParametersSection';
 
 export default function VoiceLlmPanel({
   providers,
@@ -22,6 +24,7 @@ export default function VoiceLlmPanel({
 }: Pick<AgentModelPanelProps, 'models' | 'providers' | 'setActivePanel'>) {
   const localize = useLocalize();
   const { control, setValue } = useFormContext<AgentForm>();
+  const previousProviderRef = useRef<string | undefined>(undefined);
 
   const voiceModel = useWatch({ control, name: 'voice_llm_model' });
   const voiceProvider = useWatch({ control, name: 'voice_llm_provider' });
@@ -35,21 +38,34 @@ export default function VoiceLlmPanel({
     [modelsData, provider],
   );
 
-  // When provider changes, reset model if current model isn't in the new provider's list
   useEffect(() => {
     const _model = voiceModel ?? '';
-    if (provider && _model) {
-      const modelExists = models.includes(_model);
-      if (!modelExists) {
-        setValue('voice_llm_model', null);
-      }
+    if (!provider) {
+      previousProviderRef.current = provider;
+      return;
     }
-  }, [provider, models, setValue, voiceModel]);
+
+    const resolvedModel = resolveAgentModelForProvider({
+      provider,
+      model: _model,
+      availableModels: modelsData[provider] ?? [],
+      previousProvider: previousProviderRef.current,
+    });
+
+    if (resolvedModel !== _model) {
+      setValue('voice_llm_model', resolvedModel || null);
+    }
+
+    previousProviderRef.current = provider;
+  }, [provider, models, modelsData, setValue, voiceModel]);
 
   const handleClear = () => {
     setValue('voice_llm_model', null);
     setValue('voice_llm_provider', null);
+    setValue('voice_llm_model_parameters', {});
   };
+
+  const voiceParametersTitle = `${localize('com_ui_voice_chat_llm')} ${localize('com_ui_model_parameters')}`;
 
   return (
     <div className="mx-1 mb-1 flex h-full min-h-[50vh] w-full flex-col gap-2 text-sm">
@@ -153,6 +169,12 @@ export default function VoiceLlmPanel({
           />
         </div>
       </div>
+      <ModelParametersSection
+        fieldName="voice_llm_model_parameters"
+        provider={provider}
+        model={voiceModel ?? ''}
+        title={voiceParametersTitle}
+      />
       {/* Clear Button */}
       <button
         type="button"

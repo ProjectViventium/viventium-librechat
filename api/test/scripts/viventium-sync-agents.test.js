@@ -11,8 +11,10 @@ const {
   isPlaceholderOwnerEmail,
   LIBRECHAT_REVIEW_FIELDS,
   parseArgs,
+  pickAgentFields,
   mergeBackgroundCorticesActivationFields,
   normalizeBundleForSourceOfTruth,
+  buildUpdateData,
   resolveSafeActivationFields,
   shouldApplyRuntimeOverrides,
   shouldRepairRuntimeFieldsForPushMode,
@@ -59,6 +61,30 @@ describe('viventium-sync-agents args', () => {
 
     expect(args.action).toBe('push');
     expect(args.modelConfigOnly).toBe(true);
+  });
+
+  test('buildUpdateData keeps the dedicated voice parameter bag in model-config-only mode', () => {
+    const update = buildUpdateData(
+      {
+        id: 'agent_viventium_main_95aeb3',
+        provider: 'anthropic',
+        model: 'claude-opus-4-6',
+        model_parameters: { model: 'claude-opus-4-6' },
+        voice_llm_provider: 'anthropic',
+        voice_llm_model: 'claude-haiku-4-5',
+        voice_llm_model_parameters: { thinking: false },
+      },
+      { modelConfigOnly: true },
+    );
+
+    expect(update).toEqual({
+      provider: 'anthropic',
+      model: 'claude-opus-4-6',
+      model_parameters: { model: 'claude-opus-4-6' },
+      voice_llm_provider: 'anthropic',
+      voice_llm_model: 'claude-haiku-4-5',
+      voice_llm_model_parameters: { thinking: false },
+    });
   });
 
   test('parseArgs captures help flag without inventing an action', () => {
@@ -410,8 +436,107 @@ describe('viventium-sync-agents args', () => {
       },
     });
 
-    expect(diff.diffs).toEqual([]);
+    expect(diff.diffCount).toBe(1);
+    expect(diff.diffs).toEqual([
+      expect.objectContaining({
+        id: 'main',
+        changedFields: ['background_cortices'],
+        details: expect.objectContaining({
+          background_cortices: expect.objectContaining({
+            changedAgentIds: ['agent-ms365'],
+            changedAgents: [
+              expect.objectContaining({
+                agentId: 'agent-ms365',
+                metadataChangedFields: ['status'],
+              }),
+            ],
+          }),
+        }),
+      }),
+    ]);
+  });
+
+  test('compareBundlesByAgent surfaces dedicated voice parameter drift', () => {
+    const diff = compareBundlesByAgent({
+      leftBundle: {
+        mainAgent: {
+          id: 'main',
+          name: 'Viventium',
+          voice_llm_provider: 'anthropic',
+          voice_llm_model: 'claude-haiku-4-5',
+          voice_llm_model_parameters: {
+            thinking: false,
+          },
+        },
+        backgroundAgents: [],
+      },
+      rightBundle: {
+        mainAgent: {
+          id: 'main',
+          name: 'Viventium',
+          voice_llm_provider: 'anthropic',
+          voice_llm_model: 'claude-haiku-4-5',
+          voice_llm_model_parameters: {
+            thinking: true,
+          },
+        },
+        backgroundAgents: [],
+      },
+    });
+
+    expect(diff.diffCount).toBe(1);
+    expect(diff.diffs).toEqual([
+      expect.objectContaining({
+        id: 'main',
+        changedFields: ['voice_llm_model_parameters'],
+      }),
+    ]);
+  });
+
+  test('compareBundlesByAgent ignores dedicated voice parameter key-order noise', () => {
+    const diff = compareBundlesByAgent({
+      leftBundle: {
+        mainAgent: {
+          id: 'main',
+          name: 'Viventium',
+          voice_llm_model_parameters: {
+            thinking: false,
+            model: 'claude-haiku-4-5',
+          },
+        },
+        backgroundAgents: [],
+      },
+      rightBundle: {
+        mainAgent: {
+          id: 'main',
+          name: 'Viventium',
+          voice_llm_model_parameters: {
+            model: 'claude-haiku-4-5',
+            thinking: false,
+          },
+        },
+        backgroundAgents: [],
+      },
+    });
+
     expect(diff.diffCount).toBe(0);
+    expect(diff.diffs).toEqual([]);
+  });
+
+  test('pickAgentFields keeps the dedicated voice parameter bag in pulled bundles', () => {
+    expect(
+      pickAgentFields({
+        id: 'agent_viventium_main_95aeb3',
+        voice_llm_model: 'claude-haiku-4-5',
+        voice_llm_provider: 'anthropic',
+        voice_llm_model_parameters: { thinking: false },
+      }),
+    ).toEqual({
+      id: 'agent_viventium_main_95aeb3',
+      voice_llm_model: 'claude-haiku-4-5',
+      voice_llm_provider: 'anthropic',
+      voice_llm_model_parameters: { thinking: false },
+    });
   });
 
   test('compareNamedFields surfaces adjacent webSearch drift in librechat config review', () => {

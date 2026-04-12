@@ -162,6 +162,7 @@ const AGENT_FIELDS = [
   'background_cortices',
   'voice_llm_model',
   'voice_llm_provider',
+  'voice_llm_model_parameters',
   'agent_ids',
   'edges',
   'conversation_starters',
@@ -184,6 +185,7 @@ const MODEL_CONFIG_ONLY_FIELDS = [
   'model_parameters',
   'voice_llm_model',
   'voice_llm_provider',
+  'voice_llm_model_parameters',
 ];
 const REVIEW_FIELDS = [
   'name',
@@ -196,6 +198,7 @@ const REVIEW_FIELDS = [
   'model_parameters',
   'voice_llm_model',
   'voice_llm_provider',
+  'voice_llm_model_parameters',
   'conversation_starters',
   'background_cortices',
 ];
@@ -699,6 +702,27 @@ function summarizeScalar(value) {
   };
 }
 
+function sortValueForComparison(value) {
+  if (Array.isArray(value)) {
+    return value.map((entry) => sortValueForComparison(entry));
+  }
+
+  if (value && typeof value === 'object') {
+    return Object.keys(value)
+      .sort()
+      .reduce((acc, key) => {
+        acc[key] = sortValueForComparison(value[key]);
+        return acc;
+      }, {});
+  }
+
+  return value;
+}
+
+function stableSerialize(value) {
+  return JSON.stringify(sortValueForComparison(value ?? null));
+}
+
 function summarizeStringArrayDiff(leftValue, rightValue) {
   const left = Array.isArray(leftValue) ? leftValue.map((value) => String(value)) : [];
   const right = Array.isArray(rightValue) ? rightValue.map((value) => String(value)) : [];
@@ -732,6 +756,8 @@ function summarizeBackgroundCorticesDiff(leftValue, rightValue) {
     const rightEntry = rightById.get(agentId) || {};
     const activationChangedFields = [];
     const activationDetails = {};
+    const metadataChangedFields = [];
+    const metadataDetails = {};
     const leftActivation = leftEntry.activation || {};
     const rightActivation = rightEntry.activation || {};
     const activationFieldNames = Array.from(
@@ -739,18 +765,34 @@ function summarizeBackgroundCorticesDiff(leftValue, rightValue) {
     ).sort();
 
     for (const field of activationFieldNames) {
-      if (JSON.stringify(leftActivation[field] ?? null) === JSON.stringify(rightActivation[field] ?? null)) {
+      if (stableSerialize(leftActivation[field]) === stableSerialize(rightActivation[field])) {
         continue;
       }
       activationChangedFields.push(field);
       activationDetails[field] = summarizeFieldDiff(field, leftActivation[field], rightActivation[field]);
     }
 
-    if (activationChangedFields.length > 0) {
+    const entryFieldNames = Array.from(
+      new Set([...Object.keys(leftEntry), ...Object.keys(rightEntry)]),
+    )
+      .filter((field) => field !== 'agent_id' && field !== 'activation')
+      .sort();
+
+    for (const field of entryFieldNames) {
+      if (stableSerialize(leftEntry[field]) === stableSerialize(rightEntry[field])) {
+        continue;
+      }
+      metadataChangedFields.push(field);
+      metadataDetails[field] = summarizeFieldDiff(field, leftEntry[field], rightEntry[field]);
+    }
+
+    if (activationChangedFields.length > 0 || metadataChangedFields.length > 0) {
       changedAgents.push({
         agentId,
         activationChangedFields,
         activationDetails,
+        metadataChangedFields,
+        metadataDetails,
       });
     }
   }
@@ -787,8 +829,8 @@ function summarizeFieldDiff(field, leftValue, rightValue) {
   }
 
   return {
-    left: summarizeScalar(JSON.stringify(leftValue ?? null)),
-    right: summarizeScalar(JSON.stringify(rightValue ?? null)),
+    left: summarizeScalar(stableSerialize(leftValue)),
+    right: summarizeScalar(stableSerialize(rightValue)),
   };
 }
 
@@ -813,13 +855,13 @@ function compareNamedFields({
     const label = field.label || fieldPath.join('.');
     const leftFieldValue = getNestedValue(leftValue, fieldPath);
     const rightFieldValue = getNestedValue(rightValue, fieldPath);
-    if (JSON.stringify(leftFieldValue ?? null) === JSON.stringify(rightFieldValue ?? null)) {
+    if (stableSerialize(leftFieldValue) === stableSerialize(rightFieldValue)) {
       continue;
     }
     diffs.push({
       field: label,
-      left: summarizeScalar(JSON.stringify(leftFieldValue ?? null)),
-      right: summarizeScalar(JSON.stringify(rightFieldValue ?? null)),
+      left: summarizeScalar(stableSerialize(leftFieldValue)),
+      right: summarizeScalar(stableSerialize(rightFieldValue)),
     });
   }
 
@@ -859,7 +901,7 @@ function compareBundlesByAgent({
     for (const field of fields) {
       const leftValue = leftAgent[field];
       const rightValue = rightAgent[field];
-      if (JSON.stringify(leftValue ?? null) === JSON.stringify(rightValue ?? null)) {
+      if (stableSerialize(leftValue) === stableSerialize(rightValue)) {
         continue;
       }
       const summary = summarizeFieldDiff(field, leftValue, rightValue);
@@ -869,9 +911,11 @@ function compareBundlesByAgent({
         Array.isArray(summary.addedAgentIds) &&
         Array.isArray(summary.removedAgentIds) &&
         Array.isArray(summary.changedAgentIds) &&
+        Array.isArray(summary.changedAgents) &&
         summary.addedAgentIds.length === 0 &&
         summary.removedAgentIds.length === 0 &&
-        summary.changedAgentIds.length === 0
+        summary.changedAgentIds.length === 0 &&
+        summary.changedAgents.length === 0
       ) {
         continue;
       }
@@ -970,7 +1014,8 @@ function buildCompareRecommendations({
     liveDiffFields.has('model') ||
     liveDiffFields.has('model_parameters') ||
     liveDiffFields.has('voice_llm_model') ||
-    liveDiffFields.has('voice_llm_provider')
+    liveDiffFields.has('voice_llm_provider') ||
+    liveDiffFields.has('voice_llm_model_parameters')
   ) {
     recommendations.push(
       'Live model/provider drift exists. Reconcile that explicitly and use --model-config-only only when the reviewed target state is clear.',
@@ -1903,7 +1948,9 @@ module.exports = {
   LIBRECHAT_REVIEW_FIELDS,
   normalizeBundleForSourceOfTruth,
   parseArgs,
+  pickAgentFields,
   resolveFormat,
+  buildUpdateData,
   mergeBackgroundCorticesActivationFields,
   resolveSafeActivationFields,
   shouldApplyRuntimeOverrides,

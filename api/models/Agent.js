@@ -109,6 +109,34 @@ function normalizeVoiceAgentModelFields(agentLike, options = {}) {
 }
 
 /* === VIVENTIUM START ===
+ * Feature: Persist versioned direct field updates via $set
+ * Purpose: Keep the live agent document aligned with version history when updateAgent mixes
+ * direct field updates with operators like $push.
+ * Added: 2026-04-12
+ */
+function normalizeAtomicUpdateDocument(updateData) {
+  if (!updateData || typeof updateData !== 'object' || Array.isArray(updateData)) {
+    return updateData;
+  }
+
+  const directEntries = Object.entries(updateData).filter(([key]) => !key.startsWith('$'));
+  if (directEntries.length === 0) {
+    return updateData;
+  }
+
+  const operatorEntries = Object.entries(updateData).filter(([key]) => key.startsWith('$'));
+  return {
+    ...Object.fromEntries(operatorEntries),
+    $set: {
+      ...(updateData.$set && typeof updateData.$set === 'object' && !Array.isArray(updateData.$set)
+        ? updateData.$set
+        : {}),
+      ...Object.fromEntries(directEntries),
+    },
+  };
+}
+/* === VIVENTIUM END === */
+/* === VIVENTIUM START ===
  * Feature: Deep Telegram timing instrumentation (toggleable)
  * Purpose: Surface agent load latency (db/cache) in Telegram traces.
  * Added: 2026-02-07
@@ -738,7 +766,9 @@ const updateAgent = async (searchParameter, updateData, options = {}) => {
    * Purpose: Keep cached agent aligned with the latest DB version after writes.
    * Added: 2026-02-07
    */
-  updateData = normalizeVoiceAgentModelFields(normalizeAgentModelFields(updateData));
+  updateData = normalizeAtomicUpdateDocument(
+    normalizeVoiceAgentModelFields(normalizeAgentModelFields(updateData)),
+  );
   const updated = normalizeVoiceAgentModelFields(
     normalizeAgentModelFields(
       await Agent.findOneAndUpdate(searchParameter, updateData, mongoOptions).lean(),

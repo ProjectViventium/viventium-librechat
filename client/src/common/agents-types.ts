@@ -75,5 +75,6 @@ export type AgentForm = {
    */
   voice_llm_model?: string | null;
   voice_llm_provider?: string | null;
+  voice_llm_model_parameters?: AgentModelParameters;
   /* === VIVENTIUM END === */
 } & TAgentCapabilities;

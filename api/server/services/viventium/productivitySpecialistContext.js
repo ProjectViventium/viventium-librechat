@@ -16,23 +16,6 @@
  * === VIVENTIUM END === */
 
 'use strict';
-
-const {
-  resolveClarifiedLiveEmailProviderIntent,
-  resolveLiveEmailProviderIntent,
-} = require('~/server/services/viventium/liveEmailIntent');
-
-const PRODUCTIVITY_PROVIDER_PATTERN =
-  /\b(?:gmail|google(?:\s+workspace)?|google\s+(?:drive|docs?|sheets?|calendar)|outlook|microsoft(?:\s*365)?|ms365|office\s*365|onedrive|teams|planner|onenote)\b/i;
-const PRODUCTIVITY_ACTION_SCOPE_PATTERN =
-  /\b(?:calendar|meeting|meetings|event|events|drive|docs?|document|documents|sheets?|spreadsheet|spreadsheets|emails?|mail|inbox|reply|replies|response|responses|onedrive|teams|planner|onenote)\b/i;
-const PRODUCTIVITY_ACTION_VERB_PATTERN =
-  /\b(?:check|scan|search|read|review|summari[sz]e|get|pull|find|open|show|list|draft|write|create|schedule|share|sync)\b/i;
-const PRODUCTIVITY_STATUS_PATTERNS = [
-  /\bwhat\b[\s\S]{0,24}\b(?:meetings|events|calendar|emails?|inbox)\b/i,
-  /\bdo i have\b[\s\S]{0,24}\b(?:meetings|events|emails?|mail|calendar)\b/i,
-  /\bwhat(?:'s| is)\b[\s\S]{0,24}\b(?:on|in)\b[\s\S]{0,16}\b(?:calendar|inbox)\b/i,
-];
 const PRODUCTIVITY_SCOPE_KEYS = new Set(['google_workspace', 'ms365']);
 
 function normalizeText(value) {
@@ -148,40 +131,6 @@ function getLatestUserText(messages) {
   return '';
 }
 
-function hasExplicitProductivityRequest(text) {
-  const normalized = normalizeText(text);
-  if (!normalized) {
-    return false;
-  }
-
-  if (resolveLiveEmailProviderIntent(normalized) !== 'none') {
-    return true;
-  }
-
-  if (resolveClarifiedLiveEmailProviderIntent(normalized) !== 'none') {
-    return true;
-  }
-
-  if (PRODUCTIVITY_STATUS_PATTERNS.some((pattern) => pattern.test(normalized))) {
-    return true;
-  }
-
-  return (
-    PRODUCTIVITY_ACTION_VERB_PATTERN.test(normalized) &&
-    (PRODUCTIVITY_ACTION_SCOPE_PATTERN.test(normalized) ||
-      PRODUCTIVITY_PROVIDER_PATTERN.test(normalized))
-  );
-}
-
-function isProviderOnlyProductivityClarification(text) {
-  const normalized = normalizeText(text);
-  if (!normalized || !PRODUCTIVITY_PROVIDER_PATTERN.test(normalized)) {
-    return false;
-  }
-
-  return !hasExplicitProductivityRequest(normalized);
-}
-
 function normalizeProductivityScopeOverride(scope) {
   const normalized = normalizeText(scope)
     .toLowerCase()
@@ -243,8 +192,11 @@ function extractGoogleFileIds(text) {
   const normalized = String(text || '');
   const ids = new Set();
   const patterns = [
+    // runtime-nlu-allowlist: deterministic identifier extraction
     /https?:\/\/docs\.google\.com\/(?:document|spreadsheets|presentation|forms)\/d\/([A-Za-z0-9_-]{20,})/gi,
+    // runtime-nlu-allowlist: deterministic identifier extraction
     /https?:\/\/drive\.google\.com\/file\/d\/([A-Za-z0-9_-]{20,})/gi,
+    // runtime-nlu-allowlist: deterministic identifier extraction
     /[?&]id=([A-Za-z0-9_-]{20,})/gi,
   ];
 
@@ -292,45 +244,10 @@ function buildProductivitySpecialistRuntimeInstructions({ agent, latestUserText,
   return sections.join('\n');
 }
 
-function reduceMessagesForProductivitySpecialist(messages) {
-  const safeMessages = Array.isArray(messages) ? messages : [];
-  const latestUserText = getLatestUserText(safeMessages);
-  if (!latestUserText) {
-    return messages;
-  }
-
-  const { HumanMessage } = require('@langchain/core/messages');
-  const reducedMessages = [];
-
-  if (isProviderOnlyProductivityClarification(latestUserText)) {
-    for (let i = safeMessages.length - 1; i >= 0; i -= 1) {
-      const message = safeMessages[i];
-      if (getMessageRole(message) !== 'user') {
-        continue;
-      }
-      const text = normalizeText(
-        extractTextFromContent(message.content ?? message.text ?? message.message ?? ''),
-      );
-      if (!text || text === latestUserText) {
-        continue;
-      }
-      if (hasExplicitProductivityRequest(text)) {
-        reducedMessages.push(new HumanMessage(text));
-        break;
-      }
-    }
-  }
-
-  reducedMessages.push(new HumanMessage(latestUserText));
-  return reducedMessages;
-}
-
 module.exports = {
   buildProductivitySpecialistRuntimeInstructions,
   extractGoogleFileIds,
   getLatestUserText,
-  hasExplicitProductivityRequest,
-  reduceMessagesForProductivitySpecialist,
   resolveProductivitySpecialistScope,
   shouldIsolateProductivitySpecialistContext,
 };

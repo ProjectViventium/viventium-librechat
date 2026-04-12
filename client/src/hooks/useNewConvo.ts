@@ -319,7 +319,7 @@ const useNewConvo = (index = 0) => {
         startupConfig &&
         (startupConfig.modelSpecs?.prioritize === true ||
           (startupConfig.interface?.modelSelect ?? true) !== true ||
-          (result?.last != null && Object.keys(_template).length === 0)) &&
+          ((result?.default != null || result?.last != null) && Object.keys(_template).length === 0)) &&
         defaultModelSpec
       ) {
         preset = getModelSpecPreset(defaultModelSpec);

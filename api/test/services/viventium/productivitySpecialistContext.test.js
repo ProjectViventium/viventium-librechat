@@ -1,8 +1,7 @@
 const {
   buildProductivitySpecialistRuntimeInstructions,
   extractGoogleFileIds,
-  hasExplicitProductivityRequest,
-  reduceMessagesForProductivitySpecialist,
+  getLatestUserText,
   resolveProductivitySpecialistScope,
   shouldIsolateProductivitySpecialistContext,
 } = require('~/server/services/viventium/productivitySpecialistContext');
@@ -111,25 +110,13 @@ describe('productivitySpecialistContext', () => {
     expect(instructions).toContain('prefer direct Google Workspace retrieval tools');
   });
 
-  test('detects explicit productivity requests without over-triggering generic chat turns', () => {
+  test('returns the latest user text without semantic filtering', () => {
     expect(
-      hasExplicitProductivityRequest('Check my inbox and tell me what happened in the past 10 days.'),
-    ).toBe(true);
-    expect(
-      hasExplicitProductivityRequest('Please reply with exactly DIRECT_OK and nothing else.'),
-    ).toBe(false);
-  });
-
-  test('keeps only relevant user turns for provider clarifications', () => {
-    const reduced = reduceMessagesForProductivitySpecialist([
-      { role: 'user', content: 'Check my inbox for replies from Joey.' },
-      { role: 'assistant', content: 'Gmail or Outlook?' },
-      { role: 'user', content: 'Outlook.' },
-      { role: 'assistant', content: 'I could not finish that check just now.' },
-    ]);
-
-    expect(reduced).toHaveLength(2);
-    expect(reduced[0].content).toBe('Check my inbox for replies from Joey.');
-    expect(reduced[1].content).toBe('Outlook.');
+      getLatestUserText([
+        { role: 'user', content: 'Check my inbox for replies from Joey.' },
+        { role: 'assistant', content: 'Gmail or Outlook?' },
+        { role: 'user', content: 'Outlook.' },
+      ]),
+    ).toBe('Outlook.');
   });
 });

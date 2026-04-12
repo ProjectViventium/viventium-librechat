@@ -36,10 +36,20 @@ import { generateArtifactsPrompt } from '~/prompts';
 import { getProviderConfig } from '~/endpoints';
 import { logger } from '@librechat/data-schemas';
 import {
+  buildConversationRecallAttachmentFiles,
   getConversationRecallRuntimeScope,
   mergeConversationRecallResources,
   ensureConversationRecallTool,
 } from './conversationRecall';
+/* === VIVENTIUM START ===
+ * Feature: Conversation recall runtime health/freshness gating.
+ * Purpose: Avoid attaching stale or unreachable recall corpora as if they were live evidence.
+ * Added: 2026-04-08
+ * === VIVENTIUM END === */
+import {
+  evaluateConversationRecallCorpusFreshness,
+  getConversationRecallVectorRuntimeStatus,
+} from './conversationRecallAvailability';
 import { primeResources } from './resources';
 
 /**
@@ -136,6 +146,8 @@ export interface InitializeAgentDbMethods extends EndpointDbMethods {
     parentMessageId?: string;
     files?: Array<{ file_id: string }>;
   }> | null>;
+  /** Get the newest recall-eligible message timestamp for a user */
+  getLatestRecallEligibleMessageCreatedAt?: (params: { user: string }) => Promise<Date | string | null>;
 }
 
 /**
@@ -298,15 +310,18 @@ export async function initializeAgent(
    *   1) Agent-level `conversation_recall_agent_only` => agent-only corpus
    *   2) User personalization `conversation_recall` => all-conversations corpus
    *
-  * Added: 2026-02-19
-  * === VIVENTIUM END === */
+   * Added: 2026-02-19
+   * === VIVENTIUM END === */
   const conversationRecallScope = getConversationRecallRuntimeScope({
     user: (req.user ?? null) as unknown as TUser | null,
     agent,
   });
-  const conversationRecallVectorEnabled = Boolean(process.env.RAG_API_URL?.trim());
+  const conversationRecallVectorStatus =
+    conversationRecallScope !== 'none' && req.user?.id
+      ? await getConversationRecallVectorRuntimeStatus()
+      : { available: false, reason: 'unconfigured' as const };
 
-  if (conversationRecallScope !== 'none' && req.user?.id && conversationRecallVectorEnabled) {
+  if (conversationRecallScope !== 'none' && req.user?.id) {
     try {
       const recallFileId =
         conversationRecallScope === 'agent'
@@ -332,28 +347,64 @@ export async function initializeAgent(
           { userId: req.user.id, agentId: agent.id },
         )) as TFile[]) ?? []) as TFile[];
 
-      if (conversationRecallFiles.length > 0) {
+      let recallFilesAreFresh = conversationRecallFiles.length > 0;
+      if (conversationRecallScope === 'all' && db.getLatestRecallEligibleMessageCreatedAt) {
+        const latestRecallEligibleMessageCreatedAt =
+          await db.getLatestRecallEligibleMessageCreatedAt({ user: req.user.id });
+        const freshness = evaluateConversationRecallCorpusFreshness({
+          recallFiles: conversationRecallFiles,
+          latestMessageCreatedAt: latestRecallEligibleMessageCreatedAt,
+        });
+        recallFilesAreFresh = freshness.fresh;
+        if (!freshness.fresh) {
+          logger.debug('[initializeAgent] Falling back to source-only conversation recall attachment', {
+            userId: req.user.id,
+            agentId: agent.id,
+            scope: conversationRecallScope,
+            recallCorpusUpdatedAt: freshness.corpusUpdatedAt?.toISOString?.() ?? null,
+            latestRecallEligibleMessageCreatedAt:
+              freshness.latestMessageCreatedAt?.toISOString?.() ?? null,
+          });
+        }
+      }
+
+      const recallAttachmentMode =
+        conversationRecallVectorStatus.available && recallFilesAreFresh && conversationRecallFiles.length > 0
+          ? 'vector'
+          : 'source_only';
+      const recallAttachmentFiles = buildConversationRecallAttachmentFiles({
+        userId: req.user.id,
+        scope: conversationRecallScope,
+        agentId: agent.id,
+        existingFiles: conversationRecallFiles,
+        mode: recallAttachmentMode,
+      });
+
+      if (recallAttachmentFiles.length > 0) {
         agent.tools = ensureConversationRecallTool(agent.tools);
         tool_resources = mergeConversationRecallResources({
           tool_resources,
-          recallFiles: conversationRecallFiles,
+          recallFiles: recallAttachmentFiles,
         });
-      } else {
-        logger.debug('[initializeAgent] No conversation recall corpus found for current scope', {
+      }
+
+      if (conversationRecallFiles.length === 0) {
+        logger.debug('[initializeAgent] No vector-backed conversation recall corpus found; attached source-only recall resource', {
           userId: req.user.id,
           agentId: agent.id,
           scope: conversationRecallScope,
+        });
+      } else if (recallAttachmentMode === 'source_only') {
+        logger.debug('[initializeAgent] Attached source-only conversation recall resource', {
+          userId: req.user.id,
+          agentId: agent.id,
+          scope: conversationRecallScope,
+          reason: conversationRecallVectorStatus.reason,
         });
       }
     } catch (error) {
       logger.error('[initializeAgent] Failed to load conversation recall resources', error);
     }
-  } else if (conversationRecallScope !== 'none' && req.user?.id && !conversationRecallVectorEnabled) {
-    logger.debug('[initializeAgent] Skipping conversation recall corpus attachment because RAG is unavailable', {
-      userId: req.user.id,
-      agentId: agent.id,
-      scope: conversationRecallScope,
-    });
   }
 
   const {
@@ -381,12 +432,13 @@ export async function initializeAgent(
     hasDeferredTools: false,
   };
 
-  const { getOptions, overrideProvider } = getProviderConfig({
+  const { getOptions, overrideProvider, initEndpoint } = getProviderConfig({
     provider,
     appConfig: req.config,
   });
-  if (overrideProvider !== agent.provider) {
-    agent.provider = overrideProvider;
+  const resolvedProvider = overrideProvider;
+  if (resolvedProvider !== agent.provider) {
+    agent.provider = resolvedProvider;
   }
 
   const finalModelOptions = {
@@ -396,7 +448,7 @@ export async function initializeAgent(
 
   const options: InitializeResultBase = await getOptions({
     req,
-    endpoint: provider,
+    endpoint: initEndpoint,
     model_parameters: finalModelOptions,
     db,
   });
@@ -480,6 +532,10 @@ export async function initializeAgent(
     agent.additional_instructions = artifactsPromptResult ?? undefined;
   }
 
+  const explicitMaxContextTokens =
+    typeof maxContextTokens === 'number' && Number.isFinite(maxContextTokens) && maxContextTokens > 0
+      ? maxContextTokens
+      : null;
   const agentMaxContextNum = Number(agentMaxContextTokens) || 18000;
   const maxOutputTokensNum = Number(maxOutputTokens) || 0;
 
@@ -499,7 +555,8 @@ export async function initializeAgent(
     toolContextMap: toolContextMap ?? {},
     useLegacyContent: !!options.useLegacyContent,
     tools: (tools ?? []) as GenericTool[] & string[],
-    maxContextTokens: Math.round((agentMaxContextNum - maxOutputTokensNum) * 0.9),
+    maxContextTokens:
+      explicitMaxContextTokens ?? Math.round((agentMaxContextNum - maxOutputTokensNum) * 0.9),
   };
 
   return initializedAgent;

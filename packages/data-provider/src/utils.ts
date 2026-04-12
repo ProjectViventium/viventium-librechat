@@ -1,3 +1,5 @@
+import { EModelEndpoint, Providers } from './schemas';
+
 export const envVarRegex = /^\${(.+)}$/;
 
 const caseInsensitiveKnownEndpoints = new Set([
@@ -80,4 +82,36 @@ export function normalizeEndpointName(name = ''): string {
   const trimmed = name.trim();
   const lowered = trimmed.toLowerCase();
   return caseInsensitiveKnownEndpoints.has(lowered) ? lowered : trimmed;
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Shared runtime provider alias normalization.
+ *
+ * Purpose:
+ * - Accept compiler-emitted canonical provider strings such as `openai`.
+ * - Normalize only known provider aliases while preserving unknown custom endpoint names.
+ *
+ * Added: 2026-04-09
+ * === VIVENTIUM END === */
+const canonicalProviderAliases: Record<string, string> = {
+  openai: EModelEndpoint.openAI,
+  azureopenai: EModelEndpoint.azureOpenAI,
+  azure_openai: EModelEndpoint.azureOpenAI,
+  anthropic: EModelEndpoint.anthropic,
+  google: EModelEndpoint.google,
+  bedrock: EModelEndpoint.bedrock,
+  openrouter: Providers.OPENROUTER,
+  moonshot: Providers.MOONSHOT,
+  deepseek: Providers.DEEPSEEK,
+  xai: Providers.XAI,
+  x_ai: Providers.XAI,
+};
+
+export function normalizeProviderAlias(provider = ''): string {
+  const trimmed = String(provider ?? '').trim();
+  if (!trimmed) {
+    return '';
+  }
+
+  return canonicalProviderAliases[trimmed.toLowerCase()] ?? trimmed;
 }

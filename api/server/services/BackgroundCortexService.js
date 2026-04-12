@@ -13,6 +13,7 @@ const { logger } = require('@librechat/data-schemas');
 const { Run, Providers, createContentAggregator, getTokenCountForMessage } = require('@librechat/agents');
 const {
   initializeAgent,
+  initializeAnthropic,
   createRun,
   Tokenizer,
   memoryInstructions,
@@ -47,14 +48,9 @@ const {
 const {
   buildProductivitySpecialistRuntimeInstructions,
   getLatestUserText,
-  reduceMessagesForProductivitySpecialist,
   resolveProductivitySpecialistScope,
   shouldIsolateProductivitySpecialistContext,
 } = require('~/server/services/viventium/productivitySpecialistContext');
-const {
-  resolveClarifiedLiveEmailProviderIntent,
-  resolveLiveEmailProviderIntent,
-} = require('~/server/services/viventium/liveEmailIntent');
 
 /* === VIVENTIUM NOTE ===
  * Feature: No Response Tag ({NTA}) prompt injection + suppression for background cortices.
@@ -71,6 +67,10 @@ const { isNoResponseOnly } = require('~/server/services/viventium/noResponseTag'
 
 // In-memory cooldown tracker to avoid rapid re-activation spam per user+agent.
 const activationCooldowns = new Map();
+
+function clearActivationCooldowns() {
+  activationCooldowns.clear();
+}
 
 /* === VIVENTIUM NOTE ===
  * Feature: Deterministic timeouts for Phase B cortex execution.
@@ -235,6 +235,7 @@ function getEnvBackedEndpointConfig(endpointName) {
 
   const defaultBaseUrls = {
     GROQ: 'https://api.groq.com/openai/v1/',
+    SAMBANOVA: 'https://api.sambanova.ai/v1/',
     XAI: 'https://api.x.ai/v1',
     PERPLEXITY: 'https://api.perplexity.ai',
     OPENROUTER: 'https://openrouter.ai/api/v1',
@@ -702,41 +703,20 @@ function getLastUserMessageText(messages) {
   /* === VIVENTIUM NOTE === */
 }
 
-/* === VIVENTIUM START ===
- * Feature: Mixed-provider productivity activation with config-defined scopes.
- *
- * Why:
- * - Productivity cortex prompts are user-managed and may contain strict "other provider => false"
- *   wording. When the user asks for Outlook and Gmail in one sentence, that wording can cause
- *   both cortices to reject the same request unless the runtime clarifies mixed-provider intent.
- * - Earlier revisions drifted into brittle string matching on agent/prompt identity. The scope
- *   that drives helper context now belongs in activation config, not hardcoded runtime titles.
- *
- * Design:
- * - Prefer activation-config plumbing over runtime prompt-title heuristics.
- * - Use the latest user message as the authoritative activation intent signal.
- * - Only add provider-specific mixed-request guidance for productivity cortices.
- * === VIVENTIUM END === */
-const PRODUCTIVITY_SCOPE_DETAILS_BY_SCOPE = {
-  ms365: {
-    key: 'productivity_ms365',
-    providerIntent: 'ms365',
-    label: 'Microsoft 365 / Outlook / OneDrive',
-    otherLabel: 'Google Workspace requests',
-  },
-  google_workspace: {
-    key: 'productivity_google_workspace',
-    providerIntent: 'google_workspace',
-    label: 'Google Workspace / Gmail / Drive / Calendar',
-    otherLabel: 'Microsoft 365 / Outlook requests',
-  },
-};
-
 function normalizeActivationText(text) {
   return String(text || '').replace(/\s+/g, ' ').trim();
 }
 
-function resolveProductivityActivationScope(cortexConfig) {
+const RETRYABLE_ACTIVATION_STATUS_CODES = new Set([401, 402, 403, 429, 500, 502, 503, 504]);
+const RETRYABLE_ACTIVATION_ERROR_CODES = new Set([
+  'ECONNABORTED',
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'EAI_AGAIN',
+  'ETIMEDOUT',
+]);
+
+function resolveConfiguredProductivityActivationScopeKey(cortexConfig) {
   const scope = resolveProductivitySpecialistScope(cortexConfig, {
     scope:
       cortexConfig?.activation?.intent_scope ||
@@ -745,75 +725,8 @@ function resolveProductivityActivationScope(cortexConfig) {
       cortexConfig?.activation_scope ||
       null,
   });
-  if (!scope) {
-    return null;
-  }
 
-  return PRODUCTIVITY_SCOPE_DETAILS_BY_SCOPE[scope] || null;
-}
-
-function resolveProductivityActivationKind(cortexConfig) {
-  const scope = resolveProductivityActivationScope(cortexConfig);
-  if (scope?.providerIntent) {
-    return scope.providerIntent;
-  }
-  return null;
-}
-
-function resolveDeterministicLiveEmailActivation({ cortexConfig, messages }) {
-  const scope = resolveProductivityActivationScope(cortexConfig);
-  if (!scope?.providerIntent) {
-    return null;
-  }
-
-  const agentId = cortexConfig?.agent_id;
-  const kind = scope.providerIntent;
-  const latestUserMessage = normalizeActivationText(getLastUserMessageText(messages));
-  if (!latestUserMessage) {
-    return null;
-  }
-
-  let providerIntent = resolveLiveEmailProviderIntent(latestUserMessage);
-  if (providerIntent === 'none') {
-    providerIntent = resolveClarifiedLiveEmailProviderIntent(latestUserMessage);
-  }
-  if (providerIntent === 'none') {
-    return null;
-  }
-
-  if (providerIntent === 'generic' || providerIntent === 'both') {
-    return {
-      shouldActivate: true,
-      confidence: 1,
-      reason: `live_email_status_request:${providerIntent}`,
-      agentId,
-    };
-  }
-
-  if (providerIntent === 'google_workspace' && kind === 'google_workspace') {
-    return {
-      shouldActivate: true,
-      confidence: 1,
-      reason: 'live_email_status_request:google_workspace',
-      agentId,
-    };
-  }
-
-  if (providerIntent === 'ms365' && kind === 'ms365') {
-    return {
-      shouldActivate: true,
-      confidence: 1,
-      reason: 'live_email_status_request:ms365',
-      agentId,
-    };
-  }
-
-  return {
-    shouldActivate: false,
-    confidence: 1,
-    reason: `live_email_status_request:out_of_scope:${providerIntent}`,
-    agentId,
-  };
+  return scope ? `productivity_${scope}` : null;
 }
 
 function buildLatestUserIntentSection({ cortexConfig, messages }) {
@@ -823,21 +736,95 @@ function buildLatestUserIntentSection({ cortexConfig, messages }) {
   }
 
   const lines = [`LatestUserMessage: ${latestUserMessage}`];
-  const scope = resolveProductivityActivationScope(cortexConfig);
-
-  if (scope) {
-    lines.push(`ActivationScopeKey: ${scope.key}`);
-    lines.push(`ActivationProviderIntent: ${scope.providerIntent}`);
-    lines.push(`ActivationScope: ${scope.label}`);
-    lines.push(
-      `ParallelRequestsAllowed: If the latest user message asks for multiple services at once, activate when there is an explicit in-scope action for ${scope.label} even if ${scope.otherLabel} are mentioned in the same message. Another cortex may activate in parallel for the other service.`,
-    );
-    lines.push(
-      `RejectOnlyWhenOutOfScope: Reject only when the request is exclusively for ${scope.otherLabel}, or when there is no concrete in-scope action request at all.`,
-    );
+  const scopeKey = resolveConfiguredProductivityActivationScopeKey(cortexConfig);
+  if (scopeKey) {
+    lines.push(`ActivationScopeKey: ${scopeKey}`);
   }
 
   return `## Latest User Intent:\n${lines.join('\n')}\n\n`;
+}
+
+function extractActivationErrorStatus(error) {
+  const directStatus = Number(error?.response?.status || error?.status || 0);
+  if (Number.isFinite(directStatus) && directStatus > 0) {
+    return directStatus;
+  }
+
+  const message = typeof error?.message === 'string' ? error.message : '';
+  const statusMatch = message.match(/\bstatus code (\d{3})\b/i);
+  if (statusMatch?.[1]) {
+    return Number(statusMatch[1]);
+  }
+
+  return 0;
+}
+
+function summarizeActivationError(error) {
+  return {
+    status: extractActivationErrorStatus(error) || null,
+    code: String(error?.code || '').toUpperCase() || null,
+    message: String(error?.message || 'activation classifier error'),
+  };
+}
+
+function isActivationFallbackCandidate(error) {
+  const status = extractActivationErrorStatus(error);
+  if (RETRYABLE_ACTIVATION_STATUS_CODES.has(status)) {
+    return true;
+  }
+
+  const code = String(error?.code || '').toUpperCase();
+  if (RETRYABLE_ACTIVATION_ERROR_CODES.has(code)) {
+    return true;
+  }
+
+  const message = String(error?.message || '').toLowerCase();
+  return (
+    message.includes('billing') ||
+    message.includes('quota') ||
+    message.includes('rate limit') ||
+    message.includes('unauthorized') ||
+    message.includes('forbidden') ||
+    message.includes('permission') ||
+    message.includes('timeout')
+  );
+}
+
+function normalizeActivationFallbacks(activation = {}) {
+  const primaryProvider = String(activation?.provider || '').trim();
+  const primaryModel = String(activation?.model || '').trim();
+  const fallbacks = Array.isArray(activation?.fallbacks) ? activation.fallbacks : [];
+  const normalized = [];
+  const seen = new Set();
+
+  for (const entry of fallbacks) {
+    if (!entry || typeof entry !== 'object') {
+      continue;
+    }
+
+    const provider = String(entry.provider || '').trim();
+    const model = String(entry.model || '').trim();
+    if (!provider || !model) {
+      continue;
+    }
+
+    const dedupeKey = `${provider.toLowerCase()}::${model}`;
+    if (seen.has(dedupeKey)) {
+      continue;
+    }
+    seen.add(dedupeKey);
+
+    if (
+      provider.toLowerCase() === primaryProvider.toLowerCase() &&
+      model === primaryModel
+    ) {
+      continue;
+    }
+
+    normalized.push({ provider, model });
+  }
+
+  return normalized;
 }
 /* === VIVENTIUM NOTE === */
 
@@ -1053,6 +1040,133 @@ function sanitizeAnthropicThinkingTemperature(agentForRun, safeReq) {
   }
 }
 
+async function buildActivationLlmConfig({ providerName, model, req }) {
+  const mappedProvider = mapProvider(providerName);
+  const llmConfig = {
+    provider: mappedProvider,
+    model,
+    temperature: 0.1,
+    maxTokens: 100,
+    streaming: false,
+    disableStreaming: true,
+  };
+
+  if (req && providerName) {
+    const customConfig = await getCustomEndpointConfig(providerName, req);
+    if (customConfig?.apiKey && customConfig?.baseURL) {
+      llmConfig.provider = Providers.OPENAI;
+      llmConfig.configuration = {
+        apiKey: customConfig.apiKey,
+        baseURL: customConfig.baseURL,
+      };
+    }
+  }
+
+  if (providerName === 'anthropic') {
+    const anthropicReq = req
+      ? {
+          ...req,
+          body: {
+            ...(req.body || {}),
+          },
+        }
+      : {
+          body: {},
+          user: {},
+          config: null,
+        };
+
+    if (!anthropicReq.config) {
+      anthropicReq.config = await getAppConfig({ role: anthropicReq.user?.role });
+    }
+
+    const anthropicInit = await initializeAnthropic({
+      req: anthropicReq,
+      endpoint: EModelEndpoint.anthropic,
+      model_parameters: {
+        model,
+        temperature: 0.1,
+        maxOutputTokens: 100,
+        thinking: false,
+      },
+      db: {
+        getUserKey: db.getUserKey,
+        getUserKeyValues: db.getUserKeyValues,
+        updateUserKey: db.updateUserKey,
+      },
+    });
+
+    return {
+      ...anthropicInit.llmConfig,
+      provider: Providers.ANTHROPIC,
+      model,
+      streaming: false,
+      disableStreaming: true,
+    };
+  }
+  if (providerName === 'perplexity') {
+    delete llmConfig.temperature;
+  }
+
+  return llmConfig;
+}
+
+async function invokeActivationClassifierAttempt({
+  agentId,
+  providerName,
+  model,
+  fullPrompt,
+  runId,
+  req,
+  abortController,
+}) {
+  const llmConfig = await buildActivationLlmConfig({ providerName, model, req });
+  const runIdSuffix = `${providerName}-${model}`.replace(/[^a-z0-9_-]+/gi, '_');
+
+  const run = await Run.create({
+    runId: `${runId}-activation-${agentId}-${runIdSuffix}`,
+    graphConfig: {
+      type: 'standard',
+      llmConfig,
+      tools: [],
+      instructions: ACTIVATION_SYSTEM_PROMPT,
+    },
+    returnContent: true,
+  });
+
+  const config = {
+    runName: 'CortexActivation',
+    configurable: {
+      thread_id: runId,
+    },
+    streamMode: 'values',
+    recursionLimit: 5,
+    version: 'v2',
+    signal: abortController?.signal,
+  };
+
+  const { HumanMessage } = require('@langchain/core/messages');
+  const inputMessages = [new HumanMessage(fullPrompt)];
+  const content = await run.processStream({ messages: inputMessages }, config);
+
+  let responseText = '';
+  if (typeof content === 'string') {
+    responseText = content;
+  } else if (Array.isArray(content)) {
+    responseText = content
+      .filter((part) => part.type === 'text')
+      .map((part) => part.text)
+      .join('');
+  } else if (content?.text) {
+    responseText = content.text;
+  }
+
+  return {
+    responseText,
+    parsed: parseActivationResponse(responseText),
+  };
+}
+
 /**
  * Run activation detection for a single cortex using @librechat/agents Run
  * @param {object} params
@@ -1073,22 +1187,11 @@ async function checkCortexActivation({ cortexConfig, messages, runId, req, timeo
     prompt: activationPrompt,
     model = 'meta-llama/llama-4-scout-17b-16e-instruct', // Default to Llama 4 Scout on Groq (750 tps, best speed/instruction-following)
     provider = 'groq', // Default to Groq for cost-effectiveness
+    fallbacks = [],
     confidence_threshold = 0.7,
     max_history = 5,
     cooldown_ms = 0,
   } = activation;
-
-  const deterministicActivation = resolveDeterministicLiveEmailActivation({
-    cortexConfig,
-    messages,
-  });
-  if (deterministicActivation) {
-    logger.info(
-      `[BackgroundCortexService] Deterministic activation for ${agent_id}: ` +
-        `activate=${deterministicActivation.shouldActivate}, reason="${deterministicActivation.reason}"`,
-    );
-    return deterministicActivation;
-  }
 
   // Enforce per-user cooldown before spending an LLM call.
   const cooldownMs = Number(cooldown_ms) || 0;
@@ -1115,9 +1218,7 @@ async function checkCortexActivation({ cortexConfig, messages, runId, req, timeo
   const filteredHistoryMessages = Array.isArray(messages)
     ? filterCortexContentFromLangChainMessages(messages)
     : [];
-  const activationHistoryMessages = resolveProductivityActivationKind(cortexConfig)
-    ? reduceMessagesForProductivitySpecialist(filteredHistoryMessages)
-    : filteredHistoryMessages;
+  const activationHistoryMessages = filteredHistoryMessages;
   const history = formatHistoryForActivation(activationHistoryMessages, max_history);
   const latestUserIntentSection = buildLatestUserIntentSection({
     cortexConfig,
@@ -1185,113 +1286,129 @@ ${activationFormat}`;
 
   try {
     const startTime = Date.now();
+    const attempts = [
+      { provider: String(provider || '').trim(), model: String(model || '').trim(), source: 'primary' },
+      ...normalizeActivationFallbacks({ provider, model, fallbacks }).map((entry) => ({
+        ...entry,
+        source: 'fallback',
+      })),
+    ].filter((entry) => entry.provider && entry.model);
+    const providerAttempts = [];
 
-    // Map provider and get custom endpoint config if needed
-    const providerName = (provider || '').toLowerCase();
-    const mappedProvider = mapProvider(providerName);
+    for (let i = 0; i < attempts.length; i += 1) {
+      const attempt = attempts[i];
+      const providerName = attempt.provider.toLowerCase();
 
-    let llmConfig = {
-      provider: mappedProvider,
-      model,
-      temperature: 0.1, // Low temperature for consistent classification
-      maxTokens: 100,
-      streaming: false,
-      disableStreaming: true,
-    };
+      try {
+        const { responseText, parsed } = await invokeActivationClassifierAttempt({
+          agentId: agent_id,
+          providerName,
+          model: attempt.model,
+          fullPrompt,
+          runId,
+          req,
+          abortController,
+        });
 
-    // For OpenAI-compatible custom endpoints (Groq/xAI/etc), attach apiKey/baseURL from app config.
-    if (req && providerName) {
-      const customConfig = await getCustomEndpointConfig(providerName, req);
-      if (customConfig?.apiKey && customConfig?.baseURL) {
-        llmConfig.provider = Providers.OPENAI;
-        llmConfig.configuration = {
-          apiKey: customConfig.apiKey,
-          baseURL: customConfig.baseURL,
+        if (shouldLogActivationPrompt()) {
+          logger.info(
+            `[BackgroundCortexService] Activation raw response for ${agent_id} ` +
+              `(${providerName}/${attempt.model}): ${clampLogText(responseText)}`,
+          );
+        }
+
+        const shouldActivate = parsed.activate && parsed.confidence >= confidence_threshold;
+        const duration = Date.now() - startTime;
+        providerAttempts.push({
+          provider: providerName,
+          model: attempt.model,
+          source: attempt.source,
+          status: 'completed',
+          activate: parsed.activate,
+          shouldActivate,
+          confidence: parsed.confidence,
+          reason: parsed.reason,
+        });
+
+        logger.info(
+          `[BackgroundCortexService] Activation check for ${agent_id}: ` +
+            `provider=${providerName}, model=${attempt.model}, source=${attempt.source}, ` +
+            `activate=${parsed.activate}, confidence=${parsed.confidence.toFixed(2)}, ` +
+            `threshold=${confidence_threshold}, duration=${duration}ms, reason="${parsed.reason}"`,
+        );
+
+        if (shouldActivate && cooldownMs > 0) {
+          const userId = req?.user?.id;
+          const conversationId = req?.body?.conversationId;
+          const cooldownKey = `${agent_id}:${userId || conversationId || runId || 'global'}`;
+          activationCooldowns.set(cooldownKey, Date.now());
+        }
+
+        return {
+          shouldActivate,
+          confidence: parsed.confidence,
+          reason: parsed.reason,
+          agentId: agent_id,
+          providerUsed: providerName,
+          modelUsed: attempt.model,
+          providerAttempts,
+        };
+      } catch (error) {
+        const isAborted = abortController?.signal?.aborted === true || error?.name === 'AbortError';
+        if (isAborted) {
+          logger.info(
+            `[BackgroundCortexService] Activation check timed out for ${agent_id} after ${activationTimeoutMs}ms`,
+          );
+          return {
+            shouldActivate: false,
+            confidence: 0,
+            reason: 'global_timeout',
+            agentId: agent_id,
+            providerAttempts,
+          };
+        }
+
+        const errorSummary = summarizeActivationError(error);
+        providerAttempts.push({
+          provider: providerName,
+          model: attempt.model,
+          source: attempt.source,
+          status: 'error',
+          error: errorSummary,
+        });
+
+        const shouldRetry = i < attempts.length - 1 && isActivationFallbackCandidate(error);
+        if (shouldRetry) {
+          logger.warn(
+            `[BackgroundCortexService] Activation classifier failed for ${agent_id}; trying fallback`,
+            {
+              provider: providerName,
+              model: attempt.model,
+              error: errorSummary,
+              nextProvider: attempts[i + 1].provider,
+              nextModel: attempts[i + 1].model,
+            },
+          );
+          continue;
+        }
+
+        logger.error(`[BackgroundCortexService] Activation check failed for ${agent_id}:`, error);
+        return {
+          shouldActivate: false,
+          confidence: 0,
+          reason: 'error',
+          agentId: agent_id,
+          providerAttempts,
         };
       }
     }
 
-    if (providerName === 'anthropic') {
-      applyAnthropicConfig(llmConfig);
-    }
-    if (providerName === 'perplexity') {
-      delete llmConfig.temperature;
-    }
-
-    const run = await Run.create({
-      runId: `${runId}-activation-${agent_id}`,
-      graphConfig: {
-        type: 'standard',
-        llmConfig,
-        tools: [], // No tools needed for activation detection
-        instructions: ACTIVATION_SYSTEM_PROMPT,
-      },
-      returnContent: true,
-    });
-
-    const config = {
-      runName: 'CortexActivation',
-      configurable: {
-        thread_id: runId,
-      },
-      streamMode: 'values',
-      recursionLimit: 5, // LangGraph needs at least 2-3 iterations for a simple LLM call
-      version: 'v2',
-      // === VIVENTIUM START ===
-      // Feature: Abort slow activation checks when the per-turn budget is exhausted.
-      signal: abortController?.signal,
-      // === VIVENTIUM END ===
-    };
-
-    // Use HumanMessage for the activation prompt
-    const { HumanMessage } = require('@langchain/core/messages');
-    const inputMessages = [new HumanMessage(fullPrompt)];
-
-    const content = await run.processStream({ messages: inputMessages }, config);
-    const duration = Date.now() - startTime;
-
-    // Extract text content from response
-    let responseText = '';
-    if (typeof content === 'string') {
-      responseText = content;
-    } else if (Array.isArray(content)) {
-      responseText = content
-        .filter(part => part.type === 'text')
-        .map(part => part.text)
-        .join('');
-    } else if (content?.text) {
-      responseText = content.text;
-    }
-
-    if (shouldLogActivationPrompt()) {
-      logger.info(
-        `[BackgroundCortexService] Activation raw response for ${agent_id}: ${clampLogText(responseText)}`,
-      );
-    }
-
-    const parsed = parseActivationResponse(responseText);
-
-    logger.info(
-      `[BackgroundCortexService] Activation check for ${agent_id}: ` +
-      `activate=${parsed.activate}, confidence=${parsed.confidence.toFixed(2)}, ` +
-      `threshold=${confidence_threshold}, duration=${duration}ms, reason="${parsed.reason}"`
-    );
-
-    // Check against confidence threshold
-    const shouldActivate = parsed.activate && parsed.confidence >= confidence_threshold;
-
-    if (shouldActivate && cooldownMs > 0) {
-      const userId = req?.user?.id;
-      const conversationId = req?.body?.conversationId;
-      const cooldownKey = `${agent_id}:${userId || conversationId || runId || 'global'}`;
-      activationCooldowns.set(cooldownKey, Date.now());
-    }
-
     return {
-      shouldActivate,
-      confidence: parsed.confidence,
-      reason: parsed.reason,
+      shouldActivate: false,
+      confidence: 0,
+      reason: 'error',
       agentId: agent_id,
+      providerAttempts,
     };
   } catch (error) {
     // === VIVENTIUM START ===
@@ -1351,7 +1468,7 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
         intent_scope: activationScope,
       };
     }
-    const productivityScope = resolveProductivityActivationScope(agentForRun)?.key || null;
+    const productivityScope = resolveProductivitySpecialistScope(agentForRun) || null;
     const isolateProductivityContext = shouldIsolateProductivitySpecialistContext(agentForRun, {
       scope: productivityScope,
     });
@@ -1551,6 +1668,7 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
         updateFilesUsage: db.updateFilesUsage,
         getUserKeyValues: db.getUserKeyValues,
         getToolFilesByIds: db.getToolFilesByIds,
+        getLatestRecallEligibleMessageCreatedAt: db.getLatestRecallEligibleMessageCreatedAt,
       },
     );
 
@@ -1638,9 +1756,7 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
       Array.isArray(messages) && messages.length > 0
         ? filterCortexContentFromLangChainMessages(messages)
         : [];
-    const scopedMessages = isolateProductivityContext
-      ? reduceMessagesForProductivitySpecialist(filteredMessages)
-      : filteredMessages;
+    const scopedMessages = filteredMessages;
     const inputMessages =
       Array.isArray(scopedMessages) && scopedMessages.length > 0
         ? scopedMessages
@@ -1872,7 +1988,7 @@ async function detectActivations({
 
   const activationPromises = backgroundCortices.map(async (cortexConfig) => {
     const agentId = cortexConfig.agent_id;
-    const activationScope = resolveProductivityActivationScope(cortexConfig)?.key || null;
+    const activationScope = resolveConfiguredProductivityActivationScopeKey(cortexConfig);
     const cortexCheckStartAt = Date.now();
 
     // Emit activation check started (UI)
@@ -2615,6 +2731,7 @@ module.exports = {
   sanitizeCortexDisplayName,
   mapProvider,
   getCustomEndpointConfig,
+  clearActivationCooldowns,
   detectActivations,        // NEW: Phase A - Activation detection with timeout
   executeActivated,         // NEW: Phase B - Execute activated cortices with merging
   processBackgroundCortices,  // Keep for backward compat (deprecated)

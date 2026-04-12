@@ -8,6 +8,7 @@ const {
   isVoiceCallActive,
   isVoiceModelValid,
   resolveVoiceOverrideAssignment,
+  resolveVoiceModelParameters,
   applyVoiceModelOverride,
 } = require('../voiceLlmOverride');
 
@@ -99,15 +100,19 @@ describe('voiceLlmOverride', () => {
         id: 'agent_2',
         provider: 'openai',
         model: 'gpt-4o-mini',
-        model_parameters: { model: 'gpt-4o-mini' },
+        model_parameters: { model: 'gpt-4o-mini', reasoning_effort: 'medium' },
         voice_llm_provider: 'xai',
         voice_llm_model: 'grok-4-1-fast',
+        voice_llm_model_parameters: { temperature: 0.2, max_output_tokens: 144 },
       };
 
       const updated = applyVoiceModelOverride(agent, req, modelsConfig);
       expect(updated.provider).toBe('xai');
       expect(updated.model).toBe('grok-4-1-fast');
       expect(updated.model_parameters.model).toBe('grok-4-1-fast');
+      expect(updated.model_parameters.reasoning_effort).toBe('medium');
+      expect(updated.model_parameters.temperature).toBe(0.2);
+      expect(updated.model_parameters.max_output_tokens).toBe(144);
     } finally {
       if (originalXaiKey === undefined) {
         delete process.env.XAI_API_KEY;
@@ -252,5 +257,24 @@ describe('voiceLlmOverride', () => {
         process.env.XAI_API_KEY = originalXaiKey;
       }
     }
+  });
+
+  test('resolveVoiceModelParameters overlays the voice parameter bag without mutating the main one', () => {
+    const mainParameters = { model: 'gpt-4o-mini', reasoning_effort: 'high' };
+    const resolved = resolveVoiceModelParameters(
+      {
+        model_parameters: mainParameters,
+        voice_llm_model: 'claude-haiku-4-5',
+        voice_llm_model_parameters: { temperature: 0.1 },
+      },
+      'claude-haiku-4-5',
+    );
+
+    expect(resolved).toEqual({
+      model: 'claude-haiku-4-5',
+      reasoning_effort: 'high',
+      temperature: 0.1,
+    });
+    expect(mainParameters).toEqual({ model: 'gpt-4o-mini', reasoning_effort: 'high' });
   });
 });

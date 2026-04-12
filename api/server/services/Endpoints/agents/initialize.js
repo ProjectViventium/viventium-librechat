@@ -295,6 +295,14 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
         getToolFilesByIds: wrapDb('get_tool_files_by_ids', db.getToolFilesByIds),
         getUserCodeFiles: wrapDb('get_user_code_files', db.getUserCodeFiles),
         getCodeGeneratedFiles: wrapDb('get_code_generated_files', db.getCodeGeneratedFiles),
+        ...(db.getLatestRecallEligibleMessageCreatedAt
+          ? {
+              getLatestRecallEligibleMessageCreatedAt: wrapDb(
+                'get_latest_recall_eligible_message_created_at',
+                db.getLatestRecallEligibleMessageCreatedAt,
+              ),
+            }
+          : {}),
         ...(db.updateUserKey ? { updateUserKey: wrapDb('update_user_key', db.updateUserKey) } : {}),
       }
     : {
@@ -308,6 +316,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
         getToolFilesByIds: db.getToolFilesByIds,
         getUserCodeFiles: db.getUserCodeFiles,
         getCodeGeneratedFiles: db.getCodeGeneratedFiles,
+        getLatestRecallEligibleMessageCreatedAt: db.getLatestRecallEligibleMessageCreatedAt,
       };
 
   /** @type {string | null} */

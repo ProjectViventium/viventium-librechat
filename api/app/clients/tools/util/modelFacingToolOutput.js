@@ -3,15 +3,15 @@
  *
  * Purpose:
  * - Keep deterministic runtime/tool diagnostics out of the model's working context.
- * - Preserve evidence-level meaning ("no file evidence", "no relevant web evidence")
- *   without teaching the assistant to narrate internal timeouts or transport failures.
+ * - Preserve evidence-level meaning while still distinguishing an inconclusive retrieval
+ *   failure from a genuine "nothing found" outcome.
  *
  * Why:
  * - `file_search` and `web_search` tool outputs are serialized directly into later
  *   model turns via `formatMessages.js`.
- * - Raw diagnostics like "timed out" and "web results found nothing" were causing
- *   meta assistant replies about broken tools instead of grounded statements about
- *   missing evidence.
+ * - Raw diagnostics like "timed out" were causing meta assistant replies about broken
+ *   tools, but flattening every failure into "nothing found" also teaches the assistant
+ *   the wrong lesson when retrieval was simply unavailable in that run.
  *
  * Added: 2026-03-11
  * === VIVENTIUM END === */
@@ -21,7 +21,7 @@
 const { Tools } = require('librechat-data-provider');
 
 const FILE_SEARCH_NO_RETRIEVED_EVIDENCE =
-  'No file excerpts were retrieved for this query from the currently accessible files.';
+  'No file excerpts were retrieved for this query in the current run. Treat this as inconclusive, not proof that the information is absent.';
 const WEB_SEARCH_NO_RETRIEVED_EVIDENCE = 'No web evidence was retrieved for this query.';
 const WEB_SEARCH_NO_RELEVANT_EVIDENCE = 'No relevant web evidence was found for this query.';
 

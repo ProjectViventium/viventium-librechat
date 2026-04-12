@@ -1523,7 +1523,7 @@ describe('models/Agent', () => {
 
       const emptyParamsAgent = await getAgent({ id: agentId });
       expect(emptyParamsAgent.versions).toHaveLength(4);
-      expect(emptyParamsAgent.model_parameters).toEqual({});
+      expect(emptyParamsAgent.model_parameters).toEqual({ model: 'test-model' });
     });
 
     test('should not create new version for duplicate updates', async () => {
@@ -2311,6 +2311,41 @@ describe('models/Agent', () => {
         expect(repaired.provider).toBe('xai');
         expect(repaired.model).toBe('grok-4-1-fast-non-reasoning');
         expect(repaired.versions).toHaveLength(2);
+      });
+
+      test('should persist dedicated voice parameters on the live agent document when versioning updates', async () => {
+        const agentId = `agent_${uuidv4()}`;
+        const authorId = new mongoose.Types.ObjectId();
+
+        await createAgent({
+          id: agentId,
+          name: 'Voice Parameter Persistence Agent',
+          provider: 'anthropic',
+          model: 'claude-opus-4-6',
+          voice_llm_provider: 'anthropic',
+          voice_llm_model: 'claude-haiku-4-5',
+          author: authorId,
+        });
+
+        const updated = await updateAgent(
+          { id: agentId },
+          {
+            voice_llm_provider: 'anthropic',
+            voice_llm_model: 'claude-haiku-4-5',
+            voice_llm_model_parameters: {
+              thinking: false,
+            },
+          },
+        );
+
+        expect(updated.voice_llm_model_parameters).toEqual({
+          thinking: false,
+          model: 'claude-haiku-4-5',
+        });
+        expect(updated.versions.at(-1).voice_llm_model_parameters).toEqual({
+          thinking: false,
+          model: 'claude-haiku-4-5',
+        });
       });
     });
   });

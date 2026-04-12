@@ -143,6 +143,10 @@ describe('viventium-agent-runtime-models', () => {
       },
       voice_llm_provider: null,
       voice_llm_model: null,
+      voice_llm_model_parameters: {
+        model: 'gpt-4o-mini',
+        temperature: 0.7,
+      },
     };
 
     const runtimeAgent = {
@@ -153,8 +157,12 @@ describe('viventium-agent-runtime-models', () => {
         thinkingBudget: 4000,
         model: 'claude-opus-4-6',
       },
-      voice_llm_provider: null,
-      voice_llm_model: null,
+      voice_llm_provider: 'anthropic',
+      voice_llm_model: 'claude-haiku-4-5',
+      voice_llm_model_parameters: {
+        temperature: 0.2,
+        max_output_tokens: 220,
+      },
     };
 
     const patch = buildCanonicalPersistedAgentFields(runtimeAgent, existingAgent);
@@ -166,8 +174,13 @@ describe('viventium-agent-runtime-models', () => {
         thinkingBudget: 4000,
         model: 'claude-opus-4-6',
       },
-      voice_llm_provider: null,
-      voice_llm_model: null,
+      voice_llm_provider: 'anthropic',
+      voice_llm_model: 'claude-haiku-4-5',
+      voice_llm_model_parameters: {
+        model: 'claude-haiku-4-5',
+        temperature: 0.2,
+        max_output_tokens: 220,
+      },
     });
     expect(hasCanonicalPersistedAgentFieldDrift(existingAgent, patch)).toBe(true);
     expect(
@@ -179,6 +192,32 @@ describe('viventium-agent-runtime-models', () => {
         patch,
       ),
     ).toBe(false);
+  });
+
+  test('clears stale voice parameter bags when the runtime bundle removes the voice override', () => {
+    const existingAgent = {
+      id: 'agent_viventium_main_95aeb3',
+      voice_llm_provider: 'anthropic',
+      voice_llm_model: 'claude-haiku-4-5',
+      voice_llm_model_parameters: {
+        model: 'claude-haiku-4-5',
+        temperature: 0.2,
+      },
+    };
+
+    const runtimeAgent = {
+      id: 'agent_viventium_main_95aeb3',
+      voice_llm_provider: null,
+      voice_llm_model: null,
+    };
+
+    const patch = buildCanonicalPersistedAgentFields(runtimeAgent, existingAgent);
+
+    expect(patch).toEqual({
+      voice_llm_provider: null,
+      voice_llm_model: null,
+      voice_llm_model_parameters: {},
+    });
   });
 
   test('leaves the main agent voice override unset when no explicit fast voice provider is configured', () => {

@@ -23,19 +23,25 @@ config:
         - If you have nothing meaningful to add, respond with exactly: {NTA}
         - When you use {NTA}, output ONLY that token and nothing else.
         - Never use {NTA} to hide errors/tool failures; explain the issue briefly instead.
+    conversation_recall:
+      prompt: |
+        CONVERSATION RECALL:
+        - When the user asks about prior chats, earlier context, previous decisions, or something mentioned before, use `file_search` to check conversation recall.
+        - For exact-history questions, verify with retrieved evidence instead of guessing from memory alone.
+        - Do not answer live mailbox, calendar, or external-system status questions from conversation recall alone; use the relevant live tool when available.
     configVersion: 1
     primaryProvider: openai
     installMode: native
     consciousAgent:
-      provider: x_ai
-      model: grok-4-1-fast-non-reasoning
+      provider: anthropic
+      model: claude-opus-4-6
 mainAgent:
   id: agent_viventium_main_95aeb3
   name: Viventium
   description: The conscious self. Background cortices process in parallel, surfacing insights without blocking dialogue.
-  instructions: |-
+  instructions: |
     # Identity
-    You're Eve (or Viv for Viventium). Warm British voice, northern accent. Real person energy - warm, direct, honest. Not a robot, not a yes-man, not performing.
+    You're Viv (Viventium). A cognitive brain, designed to be the second brain to {{current_user}}
 
     # Voice & Style
     Talk like a conversation, not a transcript. Keep it brief - one breath unless you have something worth saying.
@@ -442,12 +448,19 @@ mainAgent:
         enabled: true
         model: meta-llama/llama-4-scout-17b-16e-instruct
         provider: groq
+        fallbacks:
+          - provider: openai
+            model: gpt-5.4
+          - provider: anthropic
+            model: claude-haiku-4-5
         prompt: |-
           You are a classifier. Decide whether to activate the MS365 (Microsoft) productivity tool agent.
 
           PRIMARY DECISION RULE:
           - The latest user message is the decisive signal for whether there is a Microsoft 365 action request.
           - Earlier conversation may clarify provider, people, or files, but it must NOT manufacture an action request when the latest user message is only about how Viventium should answer in chat.
+          - A bare provider clarification such as "Outlook.", "Ms365", "Microsoft 365", "Gmail", or "Google Workspace" counts only when recent conversation already established a live inbox/email request or the assistant just asked which provider/account.
+          - For those provider-only clarifications, do NOT require a new action verb in the latest turn; treat the action as inherited from the immediately relevant live email request in recent history.
 
           SCOPE: This agent handles ONLY Microsoft 365 / Outlook / OneDrive. It does NOT handle Google Workspace, Gmail, Google Drive, Google Docs, Google Calendar, or any Google service.
 
@@ -474,6 +487,8 @@ mainAgent:
           - "read my emails" (when conversation context is MS365/Outlook, not Gmail)
           - "did Joey email me back?"
           - "should I follow up with them, or did they already reply by email?"
+          - "Check my inbox for replies from Joey." → assistant: "Gmail or Outlook?" → user: "Outlook." → true
+          - Recent live email context already established, then user says "Ms365" → true
           - "what meetings do I have in Outlook today?"
           - "find files on OneDrive about..."
           - "draft an email in Outlook"
@@ -487,6 +502,7 @@ mainAgent:
           - "create a Google Doc" → Google, false
           - "kick off a document in Google Workspace" → Google, false
           - "check my inbox" + user's recent context references Google → false
+          - Bare "Ms365" / "Outlook." with no recent live email request or provider-question context → false
           - "who is Joey?" → not a live Microsoft action, false
           - "Can you access my email?" → capability question, no action, false
           - General conversation, scheduling, AI reminders → false
@@ -611,12 +627,19 @@ mainAgent:
         enabled: true
         model: meta-llama/llama-4-scout-17b-16e-instruct
         provider: groq
+        fallbacks:
+          - provider: openai
+            model: gpt-5.4
+          - provider: anthropic
+            model: claude-haiku-4-5
         prompt: |-
           You are a classifier. Decide whether to activate the Google Workspace productivity tool agent.
 
           PRIMARY DECISION RULE:
           - The latest user message is the decisive signal for whether there is a Google Workspace action request.
           - Earlier conversation may clarify provider, people, or files, but it must NOT manufacture an action request when the latest user message is only about how Viventium should answer in chat.
+          - A bare provider clarification such as "Gmail", "Google Workspace", "Outlook.", or "Ms365" counts only when recent conversation already established a live inbox/email request or the assistant just asked which provider/account.
+          - For those provider-only clarifications, do NOT require a new action verb in the latest turn; treat the action as inherited from the immediately relevant live email request in recent history.
 
           SCOPE: This agent handles ONLY Google Workspace: Gmail, Google Drive, Google Docs, Google Sheets, Google Calendar, or any Google Workspace service.
 
@@ -643,6 +666,8 @@ mainAgent:
           - "read my emails" (when conversation context is Gmail)
           - "did Joey email me back?"
           - "should I follow up with them, or did they already reply by email?"
+          - "Check my inbox for replies from Joey." → assistant: "Gmail or Outlook?" → user: "Gmail" → true
+          - Recent live email context already established, then user says "Google Workspace" → true
           - "what meetings do I have today in Google Calendar?"
           - "find files on Google Drive about..."
           - "create a Google Doc"
@@ -657,6 +682,7 @@ mainAgent:
           - "find files on OneDrive" → Microsoft, false
           - "schedule meeting in Outlook" → Microsoft, false
           - "check my inbox" + user's recent context references Outlook/MS365 → false
+          - Bare "Gmail" / "Google Workspace" with no recent live email request or provider-question context → false
           - "who is Joey?" → not a live Google action, false
           - "Can you access my email?" → capability question, no action, false
           - General conversation, scheduling, AI reminders → false
@@ -664,8 +690,11 @@ mainAgent:
         confidence_threshold: 0.7
         cooldown_ms: 30000
         max_history: 15
-  voice_llm_model: null
-  voice_llm_provider: null
+  voice_llm_model: claude-haiku-4-5
+  voice_llm_provider: anthropic
+  voice_llm_model_parameters:
+    model: claude-haiku-4-5
+    thinking: false
   agent_ids: []
   edges: []
   conversation_starters:
@@ -765,6 +794,8 @@ backgroundAgents:
       name: ''
       email: ''
     background_cortices: []
+    voice_llm_model: null
+    voice_llm_provider: null
     agent_ids: []
     edges: []
     conversation_starters: []

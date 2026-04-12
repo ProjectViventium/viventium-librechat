@@ -85,6 +85,12 @@ const createAgentHandler = async (req, res) => {
     if (agentData.model_parameters && typeof agentData.model_parameters === 'object') {
       agentData.model_parameters = removeNullishValues(agentData.model_parameters, true);
     }
+    if (agentData.voice_llm_model_parameters && typeof agentData.voice_llm_model_parameters === 'object') {
+      agentData.voice_llm_model_parameters = removeNullishValues(
+        agentData.voice_llm_model_parameters,
+        true,
+      );
+    }
 
     const { id: userId } = req.user;
 
@@ -260,6 +266,7 @@ const updateAgentHandler = async (req, res) => {
       /* === VIVENTIUM START === Voice Chat LLM Override — extract before removeNullishValues */
       voice_llm_model: voiceLlmModelField,
       voice_llm_provider: voiceProviderField,
+      voice_llm_model_parameters: voiceModelParametersField,
       /* === VIVENTIUM END === */
       _id,
       ...rest
@@ -268,6 +275,9 @@ const updateAgentHandler = async (req, res) => {
 
     if (updateData.model_parameters && typeof updateData.model_parameters === 'object') {
       updateData.model_parameters = removeNullishValues(updateData.model_parameters, true);
+    }
+    if (voiceModelParametersField && typeof voiceModelParametersField === 'object') {
+      updateData.voice_llm_model_parameters = removeNullishValues(voiceModelParametersField, true);
     }
 
     if (avatarField === null) {

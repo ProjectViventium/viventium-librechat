@@ -956,6 +956,18 @@ export const memorySchema = z.object({
   charLimit: z.number().optional().default(10000),
   personalize: z.boolean().default(true),
   messageWindowSize: z.number().optional().default(5),
+  /* === VIVENTIUM START ===
+   * Feature: Bounded older-user-context memory input.
+   *
+   * Purpose:
+   * - Keep long-conversation corrections visible to the memory writer without brute-forcing a
+   *   giant raw message window.
+   *
+   * Added: 2026-04-09
+   * === VIVENTIUM END === */
+  historyContextMessageScanLimit: z.number().optional().default(40),
+  historyContextUserTurnLimit: z.number().optional().default(4),
+  historyContextCharLimit: z.number().optional().default(1200),
   agent: z
     .union([
       z.object({

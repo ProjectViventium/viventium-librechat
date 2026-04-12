@@ -13,7 +13,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scheduling_cortex.storage import ScheduleStorage, StorageConfig
-from scheduling_cortex.server import build_server
+from scheduling_cortex.server import build_server, serialize_task_summary
 
 try:
     from starlette.testclient import TestClient
@@ -123,6 +123,41 @@ class BootstrapEndpointTests(unittest.TestCase):
             self.assertIsNotNone(found_u1)
             self.assertIsNotNone(found_u2)
             self.assertNotEqual(found_u1["id"], found_u2["id"])
+
+    def test_schedule_summary_omits_prompt_and_delivery_payloads(self):
+        summary = serialize_task_summary({
+            "id": "task-1",
+            "user_id": "user-1",
+            "agent_id": "agent-1",
+            "prompt": "Eve's Inner Monologue\nReview stale project notes and monologue text.",
+            "schedule": {"type": "daily", "time": "07:00", "timezone": "America/Toronto"},
+            "channel": ["telegram", "librechat"],
+            "conversation_policy": "same",
+            "conversation_id": None,
+            "last_conversation_id": None,
+            "active": 1,
+            "created_by": "agent:agent-1",
+            "created_source": "agent",
+            "created_at": "2026-04-08T07:00:00Z",
+            "updated_at": "2026-04-08T07:00:00Z",
+            "updated_by": "agent:agent-1",
+            "updated_source": "agent",
+            "last_run_at": "2026-04-08T07:00:00Z",
+            "next_run_at": "2026-04-09T07:00:00Z",
+            "last_status": "success",
+            "last_error": None,
+            "last_delivery_outcome": "sent",
+            "last_delivery_reason": "delivered",
+            "last_delivery_at": "2026-04-08T07:00:01Z",
+            "last_generated_text": "Here is the full stale generated prose.",
+            "last_delivery": {"generated_text": "Here is the full stale generated prose."},
+            "metadata": {"name": "Morning Briefing"},
+        })
+
+        self.assertEqual(summary["summary"], "Morning Briefing")
+        self.assertNotIn("prompt", summary)
+        self.assertNotIn("last_generated_text", summary)
+        self.assertNotIn("last_delivery", summary)
 
 
 if __name__ == "__main__":

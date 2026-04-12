@@ -54,6 +54,7 @@ jest.mock('../resources', () => ({
 }));
 
 import { initializeAgent } from '../initialize';
+import { __internal as recallAvailabilityInternal } from '../conversationRecallAvailability';
 
 /**
  * Creates minimal mock objects for initializeAgent tests.
@@ -62,13 +63,19 @@ function createMocks(overrides?: {
   maxContextTokens?: number;
   modelDefault?: number;
   maxOutputTokens?: number;
+  provider?: string;
 }) {
-  const { maxContextTokens, modelDefault = 200000, maxOutputTokens = 4096 } = overrides ?? {};
+  const {
+    maxContextTokens,
+    modelDefault = 200000,
+    maxOutputTokens = 4096,
+    provider = Providers.OPENAI,
+  } = overrides ?? {};
 
   const agent = {
     id: 'agent-1',
     model: 'test-model',
-    provider: Providers.OPENAI,
+    provider,
     tools: [],
     model_parameters: { model: 'test-model' },
   } as unknown as Agent;
@@ -91,6 +98,7 @@ function createMocks(overrides?: {
   mockGetProviderConfig.mockReturnValue({
     getOptions: mockGetOptions,
     overrideProvider: Providers.OPENAI,
+    initEndpoint: Providers.OPENAI,
   });
 
   // extractLibreChatParams returns maxContextTokens when provided in model_parameters
@@ -281,16 +289,70 @@ describe('initializeAgent — maxContextTokens', () => {
     // Should NOT be overridden to Math.round((128000 - 4096) * 0.9) = 111,514
     expect(result.maxContextTokens).toBe(userValue);
   });
+
 });
 
-describe('initializeAgent — conversation recall resources', () => {
-  const originalRagApiUrl = process.env.RAG_API_URL;
-
+describe('initializeAgent — custom endpoint init routing', () => {
   beforeEach(() => {
     jest.clearAllMocks();
   });
 
+  it('passes the real custom endpoint name into initialization while preserving the mapped provider', async () => {
+    const { agent, req, res, loadTools, db } = createMocks({
+      provider: 'groq',
+    });
+    const mockGetOptions = jest.fn().mockResolvedValue({
+      llmConfig: {
+        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+        maxTokens: 4096,
+      },
+      endpointTokenConfig: undefined,
+    } satisfies InitializeResultBase);
+
+    mockGetProviderConfig.mockReturnValue({
+      getOptions: mockGetOptions,
+      overrideProvider: Providers.OPENAI,
+      initEndpoint: 'groq',
+    });
+
+    const result = await initializeAgent(
+      {
+        req,
+        res,
+        agent,
+        loadTools,
+        endpointOption: { endpoint: EModelEndpoint.agents },
+        allowedProviders: new Set([Providers.OPENAI, 'groq']),
+        isInitialAgent: true,
+      },
+      db,
+    );
+
+    expect(mockGetOptions).toHaveBeenCalledWith(
+      expect.objectContaining({
+        endpoint: 'groq',
+      }),
+    );
+    expect(result.provider).toBe(Providers.OPENAI);
+  });
+});
+
+describe('initializeAgent — conversation recall resources', () => {
+  const originalRagApiUrl = process.env.RAG_API_URL;
+  const originalFetch = global.fetch;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    recallAvailabilityInternal.resetConversationRecallVectorRuntimeStatusCache();
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+    } as Response);
+  });
+
   afterEach(() => {
+    recallAvailabilityInternal.resetConversationRecallVectorRuntimeStatusCache();
+    global.fetch = originalFetch;
     if (originalRagApiUrl == null) {
       delete process.env.RAG_API_URL;
     } else {
@@ -298,7 +360,7 @@ describe('initializeAgent — conversation recall resources', () => {
     }
   });
 
-  it('does not attach conversation recall files when RAG is unavailable', async () => {
+  it('attaches source-only conversation recall files when RAG is unavailable', async () => {
     delete process.env.RAG_API_URL;
 
     const { agent, req, res, loadTools, db } = createMocks();
@@ -318,7 +380,128 @@ describe('initializeAgent — conversation recall resources', () => {
       db,
     );
 
-    expect(db.getFiles).not.toHaveBeenCalled();
-    expect(result.tool_resources).toBeUndefined();
+    expect(db.getFiles).toHaveBeenCalledTimes(1);
+    expect(result.tool_resources?.file_search?.files).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          file_id: 'conversation_recall:user-1:all',
+          viventiumConversationRecallMode: 'source_only',
+        }),
+      ]),
+    );
+  });
+
+  it('attaches source-only conversation recall files when vector runtime health check fails', async () => {
+    process.env.RAG_API_URL = 'http://rag.example.test';
+    global.fetch = jest.fn().mockRejectedValue(new Error('connect ECONNREFUSED'));
+
+    const { agent, req, res, loadTools, db } = createMocks();
+    agent.tools = [];
+    req.user.personalization = { conversation_recall: true };
+
+    const result = await initializeAgent(
+      {
+        req,
+        res,
+        agent,
+        loadTools,
+        endpointOption: { endpoint: EModelEndpoint.agents },
+        allowedProviders: new Set([Providers.OPENAI]),
+        isInitialAgent: true,
+      },
+      db,
+    );
+
+    expect(db.getFiles).toHaveBeenCalledTimes(1);
+    expect(result.tool_resources?.file_search?.files).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          file_id: 'conversation_recall:user-1:all',
+          viventiumConversationRecallMode: 'source_only',
+        }),
+      ]),
+    );
+  });
+
+  it('attaches source-only conversation recall files when the vector corpus is stale', async () => {
+    process.env.RAG_API_URL = 'http://rag.example.test';
+
+    const { agent, req, res, loadTools, db } = createMocks();
+    agent.tools = [];
+    req.user.personalization = { conversation_recall: true };
+    db.getFiles = jest.fn().mockResolvedValue([
+      {
+        file_id: 'conversation_recall:user-1:all',
+        filename: 'conversation-recall-all.txt',
+        updatedAt: '2026-04-08T15:00:00.000Z',
+      },
+    ]);
+    db.getLatestRecallEligibleMessageCreatedAt = jest
+      .fn()
+      .mockResolvedValue('2026-04-08T16:00:00.000Z');
+
+    const result = await initializeAgent(
+      {
+        req,
+        res,
+        agent,
+        loadTools,
+        endpointOption: { endpoint: EModelEndpoint.agents },
+        allowedProviders: new Set([Providers.OPENAI]),
+        isInitialAgent: true,
+      },
+      db,
+    );
+
+    expect(db.getFiles).toHaveBeenCalledTimes(1);
+    expect(db.getLatestRecallEligibleMessageCreatedAt).toHaveBeenCalledWith({ user: 'user-1' });
+    expect(result.tool_resources?.file_search?.files).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          file_id: 'conversation_recall:user-1:all',
+          viventiumConversationRecallMode: 'source_only',
+        }),
+      ]),
+    );
+  });
+
+  it('attaches fresh global conversation recall corpora when vector runtime is healthy', async () => {
+    process.env.RAG_API_URL = 'http://rag.example.test';
+
+    const { agent, req, res, loadTools, db } = createMocks();
+    agent.tools = [];
+    req.user.personalization = { conversation_recall: true };
+    db.getFiles = jest.fn().mockResolvedValue([
+      {
+        file_id: 'conversation_recall:user-1:all',
+        filename: 'conversation-recall-all.txt',
+        updatedAt: '2026-04-08T16:00:00.000Z',
+      },
+    ]);
+    db.getLatestRecallEligibleMessageCreatedAt = jest
+      .fn()
+      .mockResolvedValue('2026-04-08T16:00:00.000Z');
+
+    const result = await initializeAgent(
+      {
+        req,
+        res,
+        agent,
+        loadTools,
+        endpointOption: { endpoint: EModelEndpoint.agents },
+        allowedProviders: new Set([Providers.OPENAI]),
+        isInitialAgent: true,
+      },
+      db,
+    );
+
+    expect(result.tool_resources?.file_search?.files).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          file_id: 'conversation_recall:user-1:all',
+          viventiumConversationRecallMode: 'vector',
+        }),
+      ]),
+    );
   });
 });

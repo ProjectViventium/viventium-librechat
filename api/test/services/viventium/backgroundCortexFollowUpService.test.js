@@ -1210,6 +1210,66 @@ describe('BackgroundCortexFollowUpService', () => {
     );
   });
 
+  test('generateFollowUpText uses dedicated voice model parameters without overwriting the primary bag', async () => {
+    const originalAnthropicKey = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = 'anthropic-test-key';
+    const req = {
+      user: { id: 'u1' },
+      body: {
+        voiceMode: true,
+        viventiumInputMode: 'voice_call',
+        viventiumSurface: 'voice',
+      },
+      config: { endpoints: { agents: { allowedProviders: ['anthropic', 'openAI'] } } },
+    };
+    getAgent.mockResolvedValue({
+      id: 'agent_viventium_main_95aeb3',
+      provider: 'openAI',
+      model: 'gpt-5.4',
+      model_parameters: { reasoning_effort: 'high' },
+      voice_llm_provider: 'anthropic',
+      voice_llm_model: 'claude-haiku-4-5',
+      voice_llm_model_parameters: { temperature: 0.1, max_output_tokens: 160 },
+    });
+
+    try {
+      await generateFollowUpText({
+        req,
+        agent: {
+          id: 'agent_viventium_main_95aeb3',
+          provider: 'openAI',
+          model: 'gpt-5.4',
+          model_parameters: { reasoning_effort: 'high' },
+          voice_llm_provider: 'anthropic',
+          voice_llm_model: 'claude-haiku-4-5',
+          voice_llm_model_parameters: { temperature: 0.1, max_output_tokens: 160 },
+        },
+        insightsData: {
+          insights: [{ cortexName: 'Support', insight: 'Let them know the voice path is ready.' }],
+        },
+        recentResponse: 'Checking now.',
+        runId: 'run-voice-followup-params',
+      });
+
+      expect(initializeAnthropic).toHaveBeenCalledWith(
+        expect.objectContaining({
+          model_parameters: expect.objectContaining({
+            model: 'claude-haiku-4-5',
+            reasoning_effort: 'high',
+            temperature: 0.1,
+            max_output_tokens: 400,
+          }),
+        }),
+      );
+    } finally {
+      if (originalAnthropicKey === undefined) {
+        delete process.env.ANTHROPIC_API_KEY;
+      } else {
+        process.env.ANTHROPIC_API_KEY = originalAnthropicKey;
+      }
+    }
+  });
+
   test('generateFollowUpText restores canonical Anthropic reasoning flags even when runtime provider is already present', async () => {
     const req = { user: { id: 'u1' }, body: {}, config: {} };
     getAgent.mockResolvedValue({

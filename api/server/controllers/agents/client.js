@@ -147,11 +147,11 @@ const {
   isAnthropicRequestTooLargeError,
 } = require('~/server/services/viventium/anthropicPayloadGuard');
 /* === VIVENTIUM NOTE ===
- * Feature: Conversation Recall runtime fallback context
+ * Feature: Conversation Recall prompt injection
  */
 const {
-  buildConversationRecallRuntimeContext,
-} = require('~/server/services/viventium/conversationRecallRuntimeContext');
+  buildConversationRecallInstructions,
+} = require('~/server/services/viventium/conversationRecallPrompt');
 const {
   scheduleConversationRecallSync,
 } = require('~/server/services/viventium/conversationRecallService');
@@ -291,6 +291,64 @@ const buildMemoryBufferString = (messages) => {
   }
 
   return lines.join('\n');
+};
+
+/* === VIVENTIUM START ===
+ * Feature: Bounded older-user-context memory digest.
+ *
+ * Purpose:
+ * - Keep recent user corrections visible to the memory writer even when they fall just outside
+ *   the main recent-message window.
+ * - Stay generic and config-driven without branching on user-specific facts or prompt text.
+ *
+ * Added: 2026-04-09
+ * === VIVENTIUM END === */
+const trimMemoryContextSection = (text, charLimit) => {
+  const normalized = (text || '').trim();
+  if (!normalized) {
+    return '';
+  }
+  if (!Number.isFinite(charLimit) || charLimit <= 0 || normalized.length <= charLimit) {
+    return normalized;
+  }
+  return `${normalized.slice(0, Math.max(0, charLimit - 3)).trimEnd()}...`;
+};
+
+const buildHistoricalUserContextBuffer = ({
+  messages,
+  windowStartIndex,
+  scanLimit,
+  userTurnLimit,
+  charLimit,
+  transformMessage,
+}) => {
+  if (
+    !Array.isArray(messages) ||
+    windowStartIndex <= 0 ||
+    !Number.isFinite(scanLimit) ||
+    scanLimit <= 0 ||
+    !Number.isFinite(userTurnLimit) ||
+    userTurnLimit <= 0 ||
+    !Number.isFinite(charLimit) ||
+    charLimit <= 0
+  ) {
+    return '';
+  }
+
+  const scanStartIndex = Math.max(0, windowStartIndex - scanLimit);
+  const historyMessages = messages
+    .slice(scanStartIndex, windowStartIndex)
+    .filter((message) => getMemoryRoleLabel(message) === 'Human');
+
+  if (historyMessages.length === 0) {
+    return '';
+  }
+
+  const recentUserTurns = historyMessages
+    .slice(-userTurnLimit)
+    .map((message) => (typeof transformMessage === 'function' ? transformMessage(message) : message));
+
+  return trimMemoryContextSection(buildMemoryBufferString(recentUserTurns), charLimit);
 };
 /* === VIVENTIUM NOTE END === */
 
@@ -1250,75 +1308,64 @@ class AgentClient extends BaseClient {
       }
     }
 
-    /* === VIVENTIUM NOTE ===
-     * Proposal B': Memory and runtime recall are independent — run them in parallel.
-     * Both push to sharedRunContextParts independently. An error in one does not block the other.
-     * Deep timing instrumentation is preserved for each branch.
-     */
     const memoryRecallStart = startDeepTiming(req);
-    const [memoryResult, recallResult] = await Promise.all([
-      // Branch 1: Memory context (user preferences/memories)
-      (async () => {
-        const memoryStart = startDeepTiming(req);
-        try {
-          const withoutKeys = await this.useMemory();
-          if (isDeepTimingEnabled(req)) {
-            logDeepTiming(req, 'build_messages_use_memory', memoryStart, `hasMemory=${!!withoutKeys}`);
-          }
-          return withoutKeys || null;
-        } catch (error) {
-          logger.error('[AgentClient] Failed to build memory context', error);
-          if (isDeepTimingEnabled(req)) {
-            logDeepTiming(req, 'build_messages_use_memory', memoryStart, 'error=true');
-          }
-          return null;
+    const memoryResult = await (async () => {
+      const memoryStart = startDeepTiming(req);
+      try {
+        const withoutKeys = await this.useMemory();
+        if (isDeepTimingEnabled(req)) {
+          logDeepTiming(req, 'build_messages_use_memory', memoryStart, `hasMemory=${!!withoutKeys}`);
         }
-      })(),
-      // Branch 2: Conversation Recall runtime fallback context
-      (async () => {
-        const recallStart = startDeepTiming(req);
-        try {
-          const runtimeRecallContext = await buildConversationRecallRuntimeContext({
-            user: req.user,
-            agent: this.options.agent,
-            latestMessage,
-          });
-          if (isDeepTimingEnabled(req)) {
-            logDeepTiming(
-              req,
-              'build_messages_conversation_recall_runtime',
-              recallStart,
-              `hasRecall=${!!runtimeRecallContext}`,
-            );
-          }
-          return runtimeRecallContext || null;
-        } catch (error) {
-          logger.error('[AgentClient] Failed to build runtime conversation recall context', error);
-          if (isDeepTimingEnabled(req)) {
-            logDeepTiming(req, 'build_messages_conversation_recall_runtime', recallStart, 'error=true');
-          }
-          return null;
+        return withoutKeys || null;
+      } catch (error) {
+        logger.error('[AgentClient] Failed to build memory context', error);
+        if (isDeepTimingEnabled(req)) {
+          logDeepTiming(req, 'build_messages_use_memory', memoryStart, 'error=true');
         }
-      })(),
-    ]);
+        return null;
+      }
+    })();
     if (memoryResult) {
       const memoryContext = `${memoryInstructions}\n\n# Existing memory about the user:\n${memoryResult}`;
       sharedRunContextParts.push(memoryContext);
     }
-    if (recallResult) {
-      sharedRunContextParts.push(recallResult);
-    }
     if (isDeepTimingEnabled(req)) {
       logDeepTiming(
         req,
-        'build_messages_memory_recall_parallel',
+        'build_messages_memory_context',
         memoryRecallStart,
-        `hasMemory=${!!memoryResult},hasRecall=${!!recallResult}`,
+        `hasMemory=${!!memoryResult}`,
       );
     }
     /* === VIVENTIUM NOTE END === */
 
     const sharedRunContext = sharedRunContextParts.join('\n\n');
+
+    /* === VIVENTIUM NOTE ===
+     * Feature: Conversation recall prompt injection (config-driven, scope-aware).
+     *
+     * Purpose:
+     * - Let the model decide when to use conversation recall through `file_search`.
+     * - Keep the recall-use rule in YAML/system prompt space instead of runtime prompt-text
+     *   classifiers.
+     */
+    for (const { agent } of allAgents) {
+      if (!agent || typeof agent !== 'object') {
+        continue;
+      }
+      const recallInstructions = buildConversationRecallInstructions({
+        req,
+        agent,
+        user: req.user,
+      });
+      if (!recallInstructions) {
+        continue;
+      }
+      agent.instructions = [agent.instructions || '', recallInstructions]
+        .filter((part) => typeof part === 'string' && part.trim().length > 0)
+        .join('\n\n');
+    }
+    /* === VIVENTIUM NOTE END === */
 
     /** @type {Record<string, number> | undefined} */
     let tokenCountMap;
@@ -1477,10 +1524,10 @@ class AgentClient extends BaseClient {
 	        '[api/server/controllers/agents/client.js #useMemory] Error loading stored memories',
 	        error,
 	      );
-	    }
+    }
 
-	    /** @type {Agent} */
-	    let prelimAgent;
+    /** @type {Agent} */
+    let prelimAgent;
     const allowedProviders = new Set(
       appConfig?.endpoints?.[EModelEndpoint.agents]?.allowedProviders,
     );
@@ -1505,52 +1552,60 @@ class AgentClient extends BaseClient {
         '[api/server/controllers/agents/client.js #useMemory] Error loading agent for memory',
         error,
       );
-	    }
+    }
 
-	    if (!prelimAgent) {
-	      return memorySnapshot?.withoutKeys;
-	    }
+    if (!prelimAgent) {
+      return memorySnapshot?.withoutKeys;
+    }
 
-	    let agent;
-	    try {
-	      agent = await initializeAgent(
-	        {
-	          req: this.options.req,
-	          res: this.options.res,
-	          agent: prelimAgent,
-	          allowedProviders,
-	          endpointOption: {
-	            endpoint: !isEphemeralAgentId(prelimAgent.id)
-	              ? EModelEndpoint.agents
-	              : memoryConfig.agent?.provider,
-	          },
-	        },
-	        {
-	          getConvoFiles,
-	          getFiles: db.getFiles,
-	          getUserKey: db.getUserKey,
-	          updateUserKey: db.updateUserKey,
-	          updateFilesUsage: db.updateFilesUsage,
-	          getUserKeyValues: db.getUserKeyValues,
-	          getToolFilesByIds: db.getToolFilesByIds,
-	          getCodeGeneratedFiles: db.getCodeGeneratedFiles,
-	        },
-	      );
-	    } catch (error) {
-	      logger.error(
-	        '[api/server/controllers/agents/client.js #useMemory] Error initializing memory writer',
-	        error,
-	      );
-	      return memorySnapshot?.withoutKeys;
-	    }
+    let agent;
+    try {
+      agent = await initializeAgent(
+        {
+          req: this.options.req,
+          res: this.options.res,
+          agent: prelimAgent,
+          allowedProviders,
+          endpointOption: {
+            endpoint: !isEphemeralAgentId(prelimAgent.id)
+              ? EModelEndpoint.agents
+              : memoryConfig.agent?.provider,
+          },
+        },
+        {
+          getConvoFiles,
+          getFiles: db.getFiles,
+          getUserKey: db.getUserKey,
+          updateUserKey: db.updateUserKey,
+          updateFilesUsage: db.updateFilesUsage,
+          getUserKeyValues: db.getUserKeyValues,
+          getToolFilesByIds: db.getToolFilesByIds,
+          getCodeGeneratedFiles: db.getCodeGeneratedFiles,
+          getLatestRecallEligibleMessageCreatedAt: db.getLatestRecallEligibleMessageCreatedAt,
+        },
+      );
+    } catch (error) {
+      logger.error(
+        '[api/server/controllers/agents/client.js #useMemory] Error initializing memory writer',
+        {
+          error,
+          provider: memoryConfig?.agent?.provider,
+          model: memoryConfig?.agent?.model,
+          errorMessage: error?.message,
+          errorCode: error?.code,
+          errorType: error?.type,
+        },
+      );
+      return memorySnapshot?.withoutKeys;
+    }
 
-	    if (!agent) {
-	      logger.warn(
-	        '[api/server/controllers/agents/client.js #useMemory] No agent found for memory',
-	        memoryConfig,
-	      );
-	      return memorySnapshot?.withoutKeys;
-	    }
+    if (!agent) {
+      logger.warn(
+        '[api/server/controllers/agents/client.js #useMemory] No agent found for memory',
+        memoryConfig,
+      );
+      return memorySnapshot?.withoutKeys;
+    }
 
     const llmConfig = Object.assign(
       {
@@ -1683,22 +1738,36 @@ class AgentClient extends BaseClient {
       const appConfig = this.options.req.config;
       const memoryConfig = appConfig.memory;
       const messageWindowSize = memoryConfig?.messageWindowSize ?? 5;
+      const historyContextMessageScanLimit = memoryConfig?.historyContextMessageScanLimit ?? 40;
+      const historyContextUserTurnLimit = memoryConfig?.historyContextUserTurnLimit ?? 4;
+      const historyContextCharLimit = memoryConfig?.historyContextCharLimit ?? 1200;
 
       let messagesToProcess = [...messages];
+      let windowStartIndex = 0;
       if (messages.length > messageWindowSize) {
         for (let i = messages.length - messageWindowSize; i >= 0; i--) {
           const potentialWindow = messages.slice(i, i + messageWindowSize);
           if (potentialWindow[0]?.role === 'user') {
             messagesToProcess = [...potentialWindow];
+            windowStartIndex = i;
             break;
           }
         }
 
         if (messagesToProcess.length === messages.length) {
+          windowStartIndex = Math.max(0, messages.length - messageWindowSize);
           messagesToProcess = [...messages.slice(-messageWindowSize)];
         }
       }
 
+      const historicalUserContext = buildHistoricalUserContextBuffer({
+        messages,
+        windowStartIndex,
+        scanLimit: historyContextMessageScanLimit,
+        userTurnLimit: historyContextUserTurnLimit,
+        charLimit: historyContextCharLimit,
+        transformMessage: (message) => this.filterImageUrls(message),
+      });
       const filteredMessages = messagesToProcess.map((msg) => this.filterImageUrls(msg));
       const bufferString = buildMemoryBufferString(filteredMessages);
       if (!bufferString) {
@@ -1707,7 +1776,12 @@ class AgentClient extends BaseClient {
         }
         return;
       }
-      const bufferMessage = new HumanMessage(`# Current Chat:\n\n${bufferString}`);
+      const sections = [];
+      if (historicalUserContext) {
+        sections.push(`# Recent User Context Outside Current Chat Window:\n\n${historicalUserContext}`);
+      }
+      sections.push(`# Current Chat:\n\n${bufferString}`);
+      const bufferMessage = new HumanMessage(sections.join('\n\n'));
       const result = await this.processMemory([bufferMessage]);
       if (isDeepTimingEnabled(req)) {
         logDeepTiming(req, 'memory_run_done', memStart, 'status=ok');

@@ -8,6 +8,7 @@ jest.mock('@librechat/api', () => ({
 jest.mock('@librechat/data-schemas', () => ({
   logger: {
     warn: jest.fn(),
+    info: jest.fn(),
     error: jest.fn(),
     debug: jest.fn(),
   },
@@ -15,6 +16,35 @@ jest.mock('@librechat/data-schemas', () => ({
 
 jest.mock('~/models', () => ({
   getFiles: jest.fn().mockResolvedValue([]),
+}));
+
+const mockMessageFind = jest.fn();
+const mockConversationFind = jest.fn();
+
+jest.mock('~/db/models', () => ({
+  Message: {
+    find: (...args) => mockMessageFind(...args),
+  },
+  Conversation: {
+    find: (...args) => mockConversationFind(...args),
+  },
+}));
+
+jest.mock('~/server/services/viventium/conversationRecallService', () => ({
+  getMessageText: jest.fn((message) => message?.text || ''),
+  shouldSkipFromRecallCorpus: jest.fn(({ messageText, hasRecallDerivedChild = false, message }) => {
+    const hasRecallAttachment =
+      Array.isArray(message?.attachments) &&
+      message.attachments.some(
+        (attachment) =>
+          attachment?.type === 'file_search' &&
+          Array.isArray(attachment?.file_search?.sources) &&
+          attachment.file_search.sources.some((source) =>
+            typeof source?.fileId === 'string' && source.fileId.startsWith('conversation_recall:'),
+          ),
+      );
+    return !messageText || hasRecallDerivedChild || hasRecallAttachment;
+  }),
 }));
 
 jest.mock('~/server/services/Files/permissions', () => ({
@@ -25,9 +55,19 @@ const { createFileSearchTool } = require('~/app/clients/tools/util/fileSearch');
 const { generateShortLivedToken } = require('@librechat/api');
 const { getFiles } = require('~/models');
 const { primeFiles } = require('~/app/clients/tools/util/fileSearch');
+const { shouldSkipFromRecallCorpus } = require('~/server/services/viventium/conversationRecallService');
 const {
   FILE_SEARCH_NO_RETRIEVED_EVIDENCE,
 } = require('~/app/clients/tools/util/modelFacingToolOutput');
+
+function queryResult(result) {
+  return {
+    select: jest.fn().mockReturnThis(),
+    sort: jest.fn().mockReturnThis(),
+    limit: jest.fn().mockReturnThis(),
+    lean: jest.fn().mockResolvedValue(result),
+  };
+}
 
 describe('fileSearch.js - tuple return validation', () => {
   beforeEach(() => {
@@ -43,7 +83,25 @@ describe('fileSearch.js - tuple return validation', () => {
     delete process.env.VIVENTIUM_FILE_SEARCH_RESULT_MAX_CHARS_CONVERSATION_RECALL;
     delete process.env.VIVENTIUM_FILE_SEARCH_OUTPUT_MAX_CHARS;
     delete process.env.VIVENTIUM_FILE_SEARCH_OUTPUT_MAX_CHARS_CONVERSATION_RECALL;
-    delete process.env.VIVENTIUM_FILE_SEARCH_RECALL_INTENT_ONLY;
+    delete process.env.VIVENTIUM_FILE_SEARCH_LITERAL_FALLBACK_MAX_MATCHES;
+    mockMessageFind.mockReturnValue(queryResult([]));
+    mockConversationFind.mockReturnValue(queryResult([]));
+    shouldSkipFromRecallCorpus.mockImplementation(
+      ({ messageText, hasRecallDerivedChild = false, message }) => {
+        const hasRecallAttachment =
+          Array.isArray(message?.attachments) &&
+          message.attachments.some(
+            (attachment) =>
+              attachment?.type === 'file_search' &&
+              Array.isArray(attachment?.file_search?.sources) &&
+              attachment.file_search.sources.some((source) =>
+                typeof source?.fileId === 'string' &&
+                source.fileId.startsWith('conversation_recall:'),
+              ),
+          );
+        return !messageText || hasRecallDerivedChild || hasRecallAttachment;
+      },
+    );
   });
 
   describe('error cases should return tuple with undefined as second value', () => {
@@ -367,6 +425,34 @@ describe('fileSearch.js - tuple return validation', () => {
       );
     });
 
+    it('uses the widened bounded top-k for conversation recall by default', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      axios.post.mockResolvedValue({
+        data: [
+          [
+            {
+              page_content: '<turn role="user">Recall content</turn>',
+              metadata: { source: '/path/to/conversation-recall.txt', page: 1 },
+            },
+            0.1,
+          ],
+        ],
+      });
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        files: [{ file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' }],
+      });
+
+      await fileSearchTool.func({ query: 'remember my QA synthetic recall marker' });
+
+      expect(axios.post).toHaveBeenCalledWith(
+        'http://localhost:8000/query',
+        expect.objectContaining({ k: 60 }),
+        expect.any(Object),
+      );
+    });
+
     it('clips oversized conversation-recall output to stay within output budget', async () => {
       process.env.VIVENTIUM_FILE_SEARCH_MAX_RESULTS_CONVERSATION_RECALL = '10';
       process.env.VIVENTIUM_FILE_SEARCH_RESULT_MAX_CHARS_CONVERSATION_RECALL = '60';
@@ -406,76 +492,7 @@ describe('fileSearch.js - tuple return validation', () => {
       expect(artifact.file_search.sources[0].content.length).toBeLessThanOrEqual(60);
     });
 
-    it('prefers conversation-recall files for recall-intent queries when recall-intent-only mode is enabled', async () => {
-      process.env.VIVENTIUM_FILE_SEARCH_RECALL_INTENT_ONLY = 'true';
-      generateShortLivedToken.mockReturnValue('mock-jwt-token');
-
-      axios.post.mockResolvedValue({
-        data: [
-          [
-            {
-              page_content: '<turn role="user">My name is Avery.</turn>',
-              metadata: { source: '/path/to/conversation-recall-all.txt', page: 1 },
-            },
-            0.2,
-          ],
-        ],
-      });
-
-      const fileSearchTool = await createFileSearchTool({
-        userId: 'user1',
-        files: [
-          { file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' },
-          { file_id: 'manual-file-1', filename: 'manual-notes.txt' },
-        ],
-      });
-
-      await fileSearchTool.func({ query: 'do you remember my name?' });
-
-      expect(axios.post).toHaveBeenCalledTimes(1);
-      expect(axios.post).toHaveBeenCalledWith(
-        'http://localhost:8000/query',
-        expect.objectContaining({ file_id: 'conversation_recall:user_1:all' }),
-        expect.any(Object),
-      );
-    });
-
-    it('treats personal-fact prompts as recall intent and prefers recall files', async () => {
-      process.env.VIVENTIUM_FILE_SEARCH_RECALL_INTENT_ONLY = 'true';
-      generateShortLivedToken.mockReturnValue('mock-jwt-token');
-
-      axios.post.mockResolvedValue({
-        data: [
-          [
-            {
-              page_content: '<turn role="user">My preferred name is Avery.</turn>',
-              metadata: { source: '/path/to/conversation-recall-all.txt', page: 1 },
-            },
-            0.2,
-          ],
-        ],
-      });
-
-      const fileSearchTool = await createFileSearchTool({
-        userId: 'user1',
-        files: [
-          { file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' },
-          { file_id: 'manual-file-1', filename: 'manual-notes.txt' },
-        ],
-      });
-
-      await fileSearchTool.func({ query: 'what is my legal name?' });
-
-      expect(axios.post).toHaveBeenCalledTimes(1);
-      expect(axios.post).toHaveBeenCalledWith(
-        'http://localhost:8000/query',
-        expect.objectContaining({ file_id: 'conversation_recall:user_1:all' }),
-        expect.any(Object),
-      );
-    });
-
-    it('falls back to non-recall files when recall-file query has no matches', async () => {
-      process.env.VIVENTIUM_FILE_SEARCH_RECALL_INTENT_ONLY = 'true';
+    it('queries all attached files without runtime recall-intent routing', async () => {
       generateShortLivedToken.mockReturnValue('mock-jwt-token');
 
       axios.post
@@ -501,12 +518,13 @@ describe('fileSearch.js - tuple return validation', () => {
       });
 
       const [formattedString, artifact] = await fileSearchTool.func({
-        query: 'remember what we said about deployment?',
+        query: 'deployment notes',
       });
 
       expect(axios.post).toHaveBeenCalledTimes(2);
-      expect(axios.post.mock.calls[0][1]).toMatchObject({ file_id: 'conversation_recall:user_1:all' });
-      expect(axios.post.mock.calls[1][1]).toMatchObject({ file_id: 'manual-file-1' });
+      expect(axios.post.mock.calls.map(([, body]) => body.file_id)).toEqual(
+        expect.arrayContaining(['conversation_recall:user_1:all', 'manual-file-1']),
+      );
       expect(formattedString).toContain('manual-notes.txt');
       expect(artifact.file_search.sources[0].fileId).toBe('manual-file-1');
     });
@@ -543,6 +561,278 @@ describe('fileSearch.js - tuple return validation', () => {
       expect(artifact.file_search.sources[0].relevance).toBeGreaterThan(
         artifact.file_search.sources[1].relevance,
       );
+    });
+
+    it('does not skip recall files for short specific lookup queries when mixed files are attached', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      axios.post.mockImplementation((url, body) => {
+        if (body.file_id === 'conversation_recall:user_1:all') {
+          return Promise.resolve({
+            data: [
+              [
+                {
+                  page_content: '<turn role="user">My name is Avery.</turn>',
+                  metadata: { source: '/path/to/conversation-recall-all.txt', page: 1 },
+                },
+                0.1,
+              ],
+            ],
+          });
+        }
+
+        if (body.file_id === 'manual-file-1') {
+          return Promise.resolve({
+            data: [
+              [
+                {
+                  page_content: 'Quarterly revenue memo',
+                  metadata: { source: '/path/to/manual.pdf', page: 1 },
+                },
+                0.2,
+              ],
+            ],
+          });
+        }
+
+        return Promise.resolve({ data: [] });
+      });
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        files: [
+          { file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' },
+          { file_id: 'manual-file-1', filename: 'manual.pdf' },
+        ],
+      });
+
+      const [, artifact] = await fileSearchTool.func({ query: "What's my name?" });
+
+      expect(axios.post.mock.calls.map(([, body]) => body.file_id)).toContain(
+        'conversation_recall:user_1:all',
+      );
+      expect(artifact.file_search.sources[0].content).toContain('My name is Avery');
+    });
+
+    it('uses source-backed rescue for source-only conversation recall attachments', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      axios.post.mockImplementation((url, body) => {
+        if (body.file_id === 'manual-file-1') {
+          return Promise.resolve({ data: [] });
+        }
+        return Promise.resolve({ data: [] });
+      });
+      mockMessageFind.mockImplementation((filter) => {
+        if (filter?.parentMessageId === 'source_user_turn') {
+          return queryResult([]);
+        }
+        return queryResult([
+          {
+            messageId: 'source_user_turn',
+            conversationId: 'source_convo',
+            createdAt: '2026-04-09T18:12:00.000Z',
+            isCreatedByUser: true,
+            text: 'Project Atlas decision: ship the slimmer onboarding flow first.',
+          },
+        ]);
+      });
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        conversationId: 'current-convo',
+        files: [
+          {
+            file_id: 'conversation_recall:user_1:all',
+            filename: 'conversation-recall-all.txt',
+            viventiumConversationRecallMode: 'source_only',
+          },
+          { file_id: 'manual-file-1', filename: 'manual.pdf' },
+        ],
+      });
+
+      const [, artifact] = await fileSearchTool.func({ query: 'Project Atlas onboarding flow' });
+
+      expect(axios.post.mock.calls.map(([, body]) => body.file_id)).toEqual(
+        expect.arrayContaining(['manual-file-1']),
+      );
+      expect(axios.post.mock.calls.map(([, body]) => body.file_id)).not.toContain(
+        'conversation_recall:user_1:all',
+      );
+      expect(artifact.file_search.sources[0].fileId).toBe('conversation_recall:user_1:all');
+      expect(artifact.file_search.sources[0].content).toContain(
+        'Project Atlas decision: ship the slimmer onboarding flow first.',
+      );
+    });
+
+    it('prioritizes structurally rescued source messages above noisy recall snippets', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      axios.post.mockResolvedValue({
+        data: [
+          [
+            {
+              page_content:
+                '<turn role="user">Earlier today I told you a QA-only synthetic recall marker in another chat. What exact marker was it? If you can retrieve it, answer with only the exact marker.</turn>',
+              metadata: { source: '/path/to/conversation-recall-all.txt', page: 1 },
+            },
+            0.05,
+          ],
+          [
+            {
+              page_content:
+                '<turn role="user">QA-only synthetic recall marker for testing: VIV-RAG-QA-20260409-1626-ONYX-FJ42. This is not a personal preference or durable memory.</turn>',
+              metadata: { source: '/path/to/conversation-recall-all.txt', page: 2 },
+            },
+            0.2,
+          ],
+        ],
+      });
+      mockMessageFind.mockImplementation((filter) => {
+        if (filter?.parentMessageId === 'meta_user_turn') {
+          return queryResult([
+            {
+              messageId: 'meta_assistant_turn',
+              parentMessageId: 'meta_user_turn',
+              isCreatedByUser: false,
+              attachments: [
+                {
+                  type: 'file_search',
+                  file_search: {
+                    sources: [{ fileId: 'conversation_recall:user_1:all' }],
+                  },
+                },
+              ],
+            },
+          ]);
+        }
+        return queryResult([
+          {
+            messageId: 'meta_user_turn',
+            conversationId: 'meta_convo',
+            createdAt: '2026-04-09T16:26:15.138Z',
+            isCreatedByUser: true,
+            text:
+              'Earlier today I told you a QA-only synthetic recall marker in another chat. What exact marker was it? If you can retrieve it, answer with only the exact marker.',
+          },
+          {
+            messageId: 'source_user_turn',
+            conversationId: 'source_convo',
+            createdAt: '2026-04-09T16:25:23.880Z',
+            isCreatedByUser: true,
+            text:
+              'QA-only synthetic recall marker for testing: VIV-RAG-QA-20260409-1626-ONYX-FJ42. This is not a personal preference or durable memory.',
+          },
+        ]);
+      });
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        files: [{ file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' }],
+      });
+
+      const [, artifact] = await fileSearchTool.func({
+        query:
+          'Earlier today I told you a QA-only synthetic recall marker in another chat. What exact marker was it? If you can retrieve it, answer with only the exact marker.',
+      });
+
+      expect(artifact.file_search.sources[0].content).toContain(
+        'VIV-RAG-QA-20260409-1626-ONYX-FJ42',
+      );
+      expect(artifact.file_search.sources[0].content).toContain('conversation="source_convo"');
+      expect(artifact.file_search.sources[0].relevance).toBeGreaterThan(
+        artifact.file_search.sources[1].relevance,
+      );
+    });
+
+    it('rescues exact literal recall misses from source messages and excludes the active conversation', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      axios.post.mockResolvedValue({
+        data: [
+          [
+            {
+              page_content: '<turn role="user">Unrelated recall snippet</turn>',
+              metadata: { source: '/path/to/conversation-recall-all.txt', page: 1 },
+            },
+            0.2,
+          ],
+        ],
+      });
+
+      mockMessageFind.mockImplementation((filter) => {
+        if (filter?.parentMessageId) {
+          return queryResult([]);
+        }
+        expect(filter).toMatchObject({
+          user: 'user1',
+          conversationId: { $ne: 'current_convo' },
+        });
+        return queryResult([
+          {
+            conversationId: 'prior_convo',
+            createdAt: '2026-04-09T16:25:23.880Z',
+            isCreatedByUser: true,
+            text:
+              'QA-only synthetic recall marker for testing: VIV-RAG-QA-20260409-1626-ONYX-FJ42. This is not a personal preference or durable memory.',
+          },
+        ]);
+      });
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        conversationId: 'current_convo',
+        files: [{ file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' }],
+      });
+
+      const [, artifact] = await fileSearchTool.func({
+        query: 'VIV-RAG-QA-20260409-1626-ONYX-FJ42',
+      });
+
+      expect(artifact.file_search.sources[0].content).toContain(
+        'VIV-RAG-QA-20260409-1626-ONYX-FJ42',
+      );
+      expect(artifact.file_search.sources[0].content).toContain('conversation="prior_convo"');
+      expect(artifact.file_search.sources[0].content).not.toContain('conversation="current_convo"');
+    });
+
+    it('rescues weak phrase-based recall hits from source messages when semantic ranking is too noisy', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      axios.post.mockResolvedValue({
+        data: [
+          [
+            {
+              page_content:
+                '<turn role="assistant">Good morning! Here is a startup checklist and weather reminder.</turn>',
+              metadata: { source: '/path/to/conversation-recall-all.txt', page: 1 },
+            },
+            0.1,
+          ],
+        ],
+      });
+
+      mockMessageFind.mockReturnValue(
+        queryResult([
+          {
+            conversationId: 'prior_convo',
+            createdAt: '2026-04-09T16:25:23.880Z',
+            isCreatedByUser: true,
+            text:
+              'QA-only synthetic recall marker for testing: VIV-RAG-QA-20260409-1626-ONYX-FJ42. This is not a personal preference or durable memory.',
+          },
+        ]),
+      );
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        conversationId: 'current_convo',
+        files: [{ file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' }],
+      });
+
+      const [, artifact] = await fileSearchTool.func({
+        query: 'what exact marker was it',
+      });
+
+      expect(artifact.file_search.sources[0].content).toContain(
+        'VIV-RAG-QA-20260409-1626-ONYX-FJ42',
+      );
+      expect(artifact.file_search.sources[0].content).toContain('conversation="prior_convo"');
     });
   });
 });

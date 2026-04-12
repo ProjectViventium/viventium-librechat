@@ -36,8 +36,8 @@ jest.mock('~/models/Role', () => ({
   getRoleByName: jest.fn(),
 }));
 
-jest.mock('~/server/services/viventium/conversationRecallRuntimeContext', () => ({
-  buildConversationRecallRuntimeContext: jest.fn(),
+jest.mock('~/server/services/viventium/conversationRecallPrompt', () => ({
+  buildConversationRecallInstructions: jest.fn(),
 }));
 jest.mock('~/server/services/viventium/conversationRecallService', () => ({
   scheduleConversationRecallSync: jest.fn(),
@@ -1693,7 +1693,7 @@ describe('AgentClient - titleConvo', () => {
       expect(messages[0].content[1].image_url.url).toBe('data:image/png;base64,ABC123');
     });
 
-    it('should handle message window size correctly', async () => {
+    it('should keep the current chat window bounded while surfacing older user context separately', async () => {
       const { HumanMessage, AIMessage } = require('@langchain/core/messages');
       const messages = [
         new HumanMessage('Message 1'),
@@ -1710,11 +1710,60 @@ describe('AgentClient - titleConvo', () => {
       expect(mockProcessMemory).toHaveBeenCalledTimes(1);
       const processedMessage = mockProcessMemory.mock.calls[0][0][0];
 
-      // Should only include last 3 messages due to window size
+      // Current chat stays bounded to the last 3-message user-starting window.
+      expect(processedMessage.content).toContain('# Recent User Context Outside Current Chat Window:');
+      expect(processedMessage.content).toContain('Message 1');
       expect(processedMessage.content).toContain('Message 3');
       expect(processedMessage.content).toContain('Response 3');
-      expect(processedMessage.content).not.toContain('Message 1');
       expect(processedMessage.content).not.toContain('Response 1');
+    });
+
+    it('should include bounded older user context outside the current chat window', async () => {
+      const { HumanMessage, AIMessage } = require('@langchain/core/messages');
+      const messages = [
+        new HumanMessage('I used to work on Project Atlas.'),
+        new AIMessage('Noted.'),
+        new HumanMessage('The migration was delayed last week.'),
+        new AIMessage('Understood.'),
+        new HumanMessage('Current focus is the release checklist.'),
+        new AIMessage('Makes sense.'),
+        new HumanMessage('Actually the release checklist is blocked on vendor approval.'),
+        new AIMessage('I will keep that in mind.'),
+      ];
+
+      await client.runMemory(messages);
+
+      expect(mockProcessMemory).toHaveBeenCalledTimes(1);
+      const processedMessage = mockProcessMemory.mock.calls[0][0][0];
+
+      expect(processedMessage.content).toContain('# Recent User Context Outside Current Chat Window:');
+      expect(processedMessage.content).toContain('I used to work on Project Atlas.');
+      expect(processedMessage.content).toContain('The migration was delayed last week.');
+      expect(processedMessage.content).toContain('# Current Chat:');
+      expect(processedMessage.content).toContain('Current focus is the release checklist.');
+      expect(processedMessage.content).toContain('Actually the release checklist is blocked on vendor approval.');
+      expect(processedMessage.content).not.toContain('Noted.');
+      expect(processedMessage.content).not.toContain('Understood.');
+    });
+
+    it('should cap older user context by configured char limit', async () => {
+      const { HumanMessage, AIMessage } = require('@langchain/core/messages');
+      client.options.req.config.memory.historyContextCharLimit = 45;
+
+      const messages = [
+        new HumanMessage('This is a very long earlier correction that should be trimmed before it reaches the memory writer.'),
+        new AIMessage('Acknowledged.'),
+        new HumanMessage('Older filler user turn.'),
+        new AIMessage('Done with that.'),
+        new HumanMessage('Latest active task is short.'),
+        new AIMessage('Done.'),
+      ];
+
+      await client.runMemory(messages);
+
+      const processedMessage = mockProcessMemory.mock.calls[0][0][0];
+      expect(processedMessage.content).toContain('# Recent User Context Outside Current Chat Window:');
+      expect(processedMessage.content).toContain('...');
     });
 
     it('should return early if processMemory is not set', async () => {
@@ -1953,15 +2002,15 @@ describe('AgentClient - titleConvo', () => {
     let mockRes;
     let mockAgent;
     let mockOptions;
-    let mockBuildConversationRecallRuntimeContext;
+    let mockBuildConversationRecallInstructions;
 
     beforeEach(() => {
       jest.clearAllMocks();
 
       ({
-        buildConversationRecallRuntimeContext: mockBuildConversationRecallRuntimeContext,
-      } = require('~/server/services/viventium/conversationRecallRuntimeContext'));
-      mockBuildConversationRecallRuntimeContext.mockResolvedValue('');
+        buildConversationRecallInstructions: mockBuildConversationRecallInstructions,
+      } = require('~/server/services/viventium/conversationRecallPrompt'));
+      mockBuildConversationRecallInstructions.mockReturnValue('');
 
       mockAgent = {
         id: 'primary-agent',
@@ -2059,11 +2108,12 @@ describe('AgentClient - titleConvo', () => {
       expect(parallelAgent2.instructions).toContain(memoryContent);
     });
 
-    it('should inject runtime conversation recall context for all agents', async () => {
-      const recallContext =
-        'Conversation Recall Context (auto-retrieved from prior user chats):\n[1] lab test results discussed.';
+    it('should inject conversation recall instructions for all participating agents', async () => {
+      const recallPrompt =
+        'CONVERSATION RECALL:\n- Use `file_search` for prior-chat questions.';
       client.useMemory = jest.fn().mockResolvedValue(undefined);
-      mockBuildConversationRecallRuntimeContext.mockResolvedValue(recallContext);
+      mockReq.user.personalization.conversation_recall = true;
+      mockBuildConversationRecallInstructions.mockReturnValue(recallPrompt);
 
       const parallelAgent = {
         id: 'parallel-agent-1',
@@ -2089,39 +2139,15 @@ describe('AgentClient - titleConvo', () => {
         additional_instructions: null,
       });
 
-      expect(mockBuildConversationRecallRuntimeContext).toHaveBeenCalledWith(
+      expect(mockBuildConversationRecallInstructions).toHaveBeenCalledWith(
         expect.objectContaining({
-          user: mockReq.user,
           agent: client.options.agent,
+          req: mockReq,
+          user: mockReq.user,
         }),
       );
-      expect(client.options.agent.instructions).toContain(recallContext);
-      expect(parallelAgent.instructions).toContain(recallContext);
-    });
-
-    it('should continue when runtime conversation recall context throws', async () => {
-      client.useMemory = jest.fn().mockResolvedValue(undefined);
-      mockBuildConversationRecallRuntimeContext.mockRejectedValue(
-        new Error('runtime recall failed'),
-      );
-
-      const messages = [
-        {
-          messageId: 'msg-1',
-          conversationId: 'convo-123',
-          parentMessageId: null,
-          sender: 'User',
-          text: 'Remember my previous chat?',
-          isCreatedByUser: true,
-        },
-      ];
-
-      await expect(
-        client.buildMessages(messages, null, {
-          instructions: 'Base instructions',
-          additional_instructions: null,
-        }),
-      ).resolves.not.toThrow();
+      expect(client.options.agent.instructions).toContain(recallPrompt);
+      expect(parallelAgent.instructions).toContain(recallPrompt);
     });
 
     it('should not modify parallel agents when no memory context is available', async () => {

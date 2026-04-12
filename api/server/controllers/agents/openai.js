@@ -226,6 +226,7 @@ const OpenAIChatCompletionController = async (req, res) => {
         getUserCodeFiles: db.getUserCodeFiles,
         getToolFilesByIds: db.getToolFilesByIds,
         getCodeGeneratedFiles: db.getCodeGeneratedFiles,
+        getLatestRecallEligibleMessageCreatedAt: db.getLatestRecallEligibleMessageCreatedAt,
       },
     );
 

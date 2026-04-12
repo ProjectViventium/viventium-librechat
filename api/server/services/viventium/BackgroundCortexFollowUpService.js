@@ -34,7 +34,10 @@ const {
   buildPlaygroundTextInstructions,
   stripVoiceControlTagsForDisplay,
 } = require('~/server/services/viventium/surfacePrompts');
-const { resolveVoiceOverrideAssignment } = require('~/server/services/viventium/voiceLlmOverride');
+const {
+  resolveVoiceOverrideAssignment,
+  resolveVoiceModelParameters,
+} = require('~/server/services/viventium/voiceLlmOverride');
 /* === VIVENTIUM NOTE ===
  * Feature: No-response tag ({NTA}) normalization for passive/background follow-ups.
  */
@@ -143,6 +146,7 @@ function resolveFollowUpRuntimeAssignment(agent, { useVoiceModel = false } = {})
         ...baseRuntimeAgent,
         voice_llm_provider: voiceAssignment.provider,
         voice_llm_model: voiceAssignment.model,
+        model_parameters: resolveVoiceModelParameters(baseRuntimeAgent, voiceAssignment.model),
       }
     : baseRuntimeAgent;
   const effectiveModel = resolveGovernedFollowUpModel(runtimeAgent, { useVoiceModel });
@@ -171,6 +175,18 @@ function mergeFollowUpAgentRuntimeState(runtimeAgent, persistedAgent) {
       ? runtimeAgent.model_parameters
       : {}),
   };
+  const mergedVoiceModelParameters = {
+    ...(persistedAgent?.voice_llm_model_parameters &&
+    typeof persistedAgent.voice_llm_model_parameters === 'object' &&
+    !Array.isArray(persistedAgent.voice_llm_model_parameters)
+      ? persistedAgent.voice_llm_model_parameters
+      : {}),
+    ...(runtimeAgent?.voice_llm_model_parameters &&
+    typeof runtimeAgent.voice_llm_model_parameters === 'object' &&
+    !Array.isArray(runtimeAgent.voice_llm_model_parameters)
+      ? runtimeAgent.voice_llm_model_parameters
+      : {}),
+  };
 
   const merged = {
     ...(persistedAgent || {}),
@@ -194,6 +210,7 @@ function mergeFollowUpAgentRuntimeState(runtimeAgent, persistedAgent) {
     voice_llm_model: String(
       runtimeAgent?.voice_llm_model || persistedAgent?.voice_llm_model || '',
     ).trim() || null,
+    voice_llm_model_parameters: mergedVoiceModelParameters,
     model_parameters: mergedModelParameters,
   };
 
@@ -227,16 +244,15 @@ async function resolveCanonicalFollowUpAgent(agent, { useVoiceModel = false } = 
       return assignment;
     }
 
-    const canonicalRuntimeAgent = rewriteAgentForRuntime(
+    const canonicalSourceAgent = rewriteAgentForRuntime(
       mergeFollowUpAgentRuntimeState(assignment.runtimeAgent, persistedAgent),
     );
-    const effectiveModel = resolveGovernedFollowUpModel(canonicalRuntimeAgent, { useVoiceModel });
-    const rawProvider = String(
-      useVoiceModel
-        ? canonicalRuntimeAgent?.voice_llm_provider || canonicalRuntimeAgent?.provider
-        : canonicalRuntimeAgent?.provider,
-    ).trim();
-    const effectiveProvider = normalizeFollowUpProvider(rawProvider);
+    const canonicalAssignment = resolveFollowUpRuntimeAssignment(canonicalSourceAgent, {
+      useVoiceModel,
+    });
+    const canonicalRuntimeAgent = canonicalAssignment.runtimeAgent;
+    const effectiveModel = canonicalAssignment.effectiveModel;
+    const effectiveProvider = normalizeFollowUpProvider(canonicalAssignment.effectiveProvider);
 
     if (effectiveProvider) {
       logger.info(

@@ -162,6 +162,7 @@ const AGENT_FIELDS = [
   'background_cortices',
   'voice_llm_model',
   'voice_llm_provider',
+  'voice_llm_model_parameters',
   'agent_ids',
   'edges',
   'conversation_starters',
@@ -184,15 +185,46 @@ const MODEL_CONFIG_ONLY_FIELDS = [
   'model_parameters',
   'voice_llm_model',
   'voice_llm_provider',
+  'voice_llm_model_parameters',
+];
+const REVIEW_FIELDS = [
+  'name',
+  'description',
+  'instructions',
+  'tools',
+  'tool_kwargs',
+  'provider',
+  'model',
+  'model_parameters',
+  'voice_llm_model',
+  'voice_llm_provider',
+  'voice_llm_model_parameters',
+  'conversation_starters',
+  'background_cortices',
+];
+const LIBRECHAT_REVIEW_FIELDS = [
+  { path: ['interface', 'webSearch'], label: 'interface.webSearch' },
+  { path: ['interface', 'fileSearch'], label: 'interface.fileSearch' },
+  { path: ['interface', 'defaultAgent'], label: 'interface.defaultAgent' },
+  { path: ['webSearch'], label: 'webSearch' },
+  { path: ['viventium', 'primaryProvider'], label: 'viventium.primaryProvider' },
+  { path: ['viventium', 'consciousAgent', 'provider'], label: 'viventium.consciousAgent.provider' },
+  { path: ['viventium', 'consciousAgent', 'model'], label: 'viventium.consciousAgent.model' },
 ];
 
-const DEFAULT_PROMPTS_ONLY_ACTIVATION_FIELDS = ['enabled', 'prompt', 'confidence_threshold'];
+const DEFAULT_PROMPTS_ONLY_ACTIVATION_FIELDS = [
+  'enabled',
+  'prompt',
+  'confidence_threshold',
+  'fallbacks',
+];
 const DEFAULT_ACTIVATION_CONFIG_FIELDS = [
   'enabled',
   'prompt',
   'confidence_threshold',
   'model',
   'provider',
+  'fallbacks',
   'cooldown_ms',
   'max_history',
   'intent_scope',
@@ -327,6 +359,8 @@ function parseArgs(argv) {
     help: false,
     outPath: null,
     inPath: null,
+    sourcePath: null,
+    livePath: null,
     email: DEFAULT_EMAIL,
     agentId: DEFAULT_MAIN_AGENT_ID,
     env: DEFAULT_ENV_SLUG,
@@ -351,6 +385,7 @@ function parseArgs(argv) {
     schedulesLibrechatYamlPath: null,
     schedulesPrune: false,
     schedulesCreateMissing: false,
+    compareReviewed: false,
   };
 
   const readValue = (arg, prefix) => arg.slice(prefix.length);
@@ -368,8 +403,16 @@ function parseArgs(argv) {
       args.action = 'push';
       continue;
     }
+    if (arg === 'compare' || arg === '--compare') {
+      args.action = 'compare';
+      continue;
+    }
     if (arg === '--dry-run') {
       args.dryRun = true;
+      continue;
+    }
+    if (arg === '--compare-reviewed') {
+      args.compareReviewed = true;
       continue;
     }
     if (arg === '--prompts-only') {
@@ -438,6 +481,14 @@ function parseArgs(argv) {
     }
     if (arg.startsWith('--in=')) {
       args.inPath = readValue(arg, '--in=');
+      continue;
+    }
+    if (arg.startsWith('--source=')) {
+      args.sourcePath = readValue(arg, '--source=');
+      continue;
+    }
+    if (arg.startsWith('--live=')) {
+      args.livePath = readValue(arg, '--live=');
       continue;
     }
     if (arg.startsWith('--file=')) {
@@ -599,8 +650,12 @@ function resolveFormat({ filePath, explicitFormat }) {
 }
 
 function loadBundle(filePath, explicitFormat) {
-  const format = resolveFormat({ filePath, explicitFormat });
   const contents = fs.readFileSync(filePath, 'utf8');
+  return loadBundleFromContents({ contents, filePath, explicitFormat });
+}
+
+function loadBundleFromContents({ contents, filePath, explicitFormat }) {
+  const format = resolveFormat({ filePath, explicitFormat });
   if (format === 'json') {
     return JSON.parse(contents);
   }
@@ -616,6 +671,407 @@ function writeBundle(filePath, explicitFormat, bundle) {
   const output = yaml.dump(bundle, { schema: yaml.JSON_SCHEMA, lineWidth: -1 });
   fs.writeFileSync(filePath, output);
   return format;
+}
+
+function buildBundleAgentIndex(bundle) {
+  const map = new Map();
+  if (!bundle || typeof bundle !== 'object') {
+    return map;
+  }
+
+  if (bundle.mainAgent && typeof bundle.mainAgent === 'object') {
+    const id = bundle.mainAgent.id || bundle.meta?.mainAgentId || 'mainAgent';
+    map.set(id, { kind: 'mainAgent', data: bundle.mainAgent });
+  }
+
+  for (const agent of bundle.backgroundAgents || []) {
+    if (!agent || typeof agent !== 'object' || !agent.id) {
+      continue;
+    }
+    map.set(agent.id, { kind: 'backgroundAgent', data: agent });
+  }
+
+  return map;
+}
+
+function summarizeScalar(value) {
+  const text = String(value ?? '');
+  return {
+    length: text.length,
+    preview: text.slice(0, 240),
+  };
+}
+
+function sortValueForComparison(value) {
+  if (Array.isArray(value)) {
+    return value.map((entry) => sortValueForComparison(entry));
+  }
+
+  if (value && typeof value === 'object') {
+    return Object.keys(value)
+      .sort()
+      .reduce((acc, key) => {
+        acc[key] = sortValueForComparison(value[key]);
+        return acc;
+      }, {});
+  }
+
+  return value;
+}
+
+function stableSerialize(value) {
+  return JSON.stringify(sortValueForComparison(value ?? null));
+}
+
+function summarizeStringArrayDiff(leftValue, rightValue) {
+  const left = Array.isArray(leftValue) ? leftValue.map((value) => String(value)) : [];
+  const right = Array.isArray(rightValue) ? rightValue.map((value) => String(value)) : [];
+  const leftSet = new Set(left);
+  const rightSet = new Set(right);
+
+  return {
+    leftCount: left.length,
+    rightCount: right.length,
+    added: right.filter((value) => !leftSet.has(value)).slice(0, 20),
+    removed: left.filter((value) => !rightSet.has(value)).slice(0, 20),
+  };
+}
+
+function summarizeBackgroundCorticesDiff(leftValue, rightValue) {
+  const left = Array.isArray(leftValue) ? leftValue : [];
+  const right = Array.isArray(rightValue) ? rightValue : [];
+  const leftById = new Map(left.map((entry) => [entry?.agent_id, entry]).filter(([id]) => id));
+  const rightById = new Map(right.map((entry) => [entry?.agent_id, entry]).filter(([id]) => id));
+  const leftIds = Array.from(leftById.keys());
+  const rightIds = Array.from(rightById.keys());
+  const leftSet = new Set(leftIds);
+  const rightSet = new Set(rightIds);
+  const changedAgents = [];
+
+  for (const agentId of leftIds) {
+    if (!rightSet.has(agentId)) {
+      continue;
+    }
+    const leftEntry = leftById.get(agentId) || {};
+    const rightEntry = rightById.get(agentId) || {};
+    const activationChangedFields = [];
+    const activationDetails = {};
+    const metadataChangedFields = [];
+    const metadataDetails = {};
+    const leftActivation = leftEntry.activation || {};
+    const rightActivation = rightEntry.activation || {};
+    const activationFieldNames = Array.from(
+      new Set([...Object.keys(leftActivation), ...Object.keys(rightActivation)]),
+    ).sort();
+
+    for (const field of activationFieldNames) {
+      if (stableSerialize(leftActivation[field]) === stableSerialize(rightActivation[field])) {
+        continue;
+      }
+      activationChangedFields.push(field);
+      activationDetails[field] = summarizeFieldDiff(field, leftActivation[field], rightActivation[field]);
+    }
+
+    const entryFieldNames = Array.from(
+      new Set([...Object.keys(leftEntry), ...Object.keys(rightEntry)]),
+    )
+      .filter((field) => field !== 'agent_id' && field !== 'activation')
+      .sort();
+
+    for (const field of entryFieldNames) {
+      if (stableSerialize(leftEntry[field]) === stableSerialize(rightEntry[field])) {
+        continue;
+      }
+      metadataChangedFields.push(field);
+      metadataDetails[field] = summarizeFieldDiff(field, leftEntry[field], rightEntry[field]);
+    }
+
+    if (activationChangedFields.length > 0 || metadataChangedFields.length > 0) {
+      changedAgents.push({
+        agentId,
+        activationChangedFields,
+        activationDetails,
+        metadataChangedFields,
+        metadataDetails,
+      });
+    }
+  }
+
+  return {
+    leftCount: left.length,
+    rightCount: right.length,
+    addedAgentIds: rightIds.filter((id) => !leftSet.has(id)).slice(0, 20),
+    removedAgentIds: leftIds.filter((id) => !rightSet.has(id)).slice(0, 20),
+    changedAgentIds: changedAgents.map((entry) => entry.agentId).slice(0, 20),
+    changedAgents: changedAgents.slice(0, 20),
+  };
+}
+
+function summarizeFieldDiff(field, leftValue, rightValue) {
+  if (typeof leftValue === 'string' || typeof rightValue === 'string') {
+    return {
+      left: summarizeScalar(leftValue),
+      right: summarizeScalar(rightValue),
+    };
+  }
+
+  if (
+    Array.isArray(leftValue) &&
+    Array.isArray(rightValue) &&
+    leftValue.every((value) => typeof value === 'string') &&
+    rightValue.every((value) => typeof value === 'string')
+  ) {
+    return summarizeStringArrayDiff(leftValue, rightValue);
+  }
+
+  if (field === 'background_cortices') {
+    return summarizeBackgroundCorticesDiff(leftValue, rightValue);
+  }
+
+  return {
+    left: summarizeScalar(stableSerialize(leftValue)),
+    right: summarizeScalar(stableSerialize(rightValue)),
+  };
+}
+
+function getNestedValue(value, pathSegments) {
+  return pathSegments.reduce((current, segment) => {
+    if (!current || typeof current !== 'object') {
+      return undefined;
+    }
+    return current[segment];
+  }, value);
+}
+
+function compareNamedFields({
+  leftValue,
+  rightValue,
+  fields,
+}) {
+  const diffs = [];
+
+  for (const field of fields || []) {
+    const fieldPath = Array.isArray(field.path) ? field.path : [];
+    const label = field.label || fieldPath.join('.');
+    const leftFieldValue = getNestedValue(leftValue, fieldPath);
+    const rightFieldValue = getNestedValue(rightValue, fieldPath);
+    if (stableSerialize(leftFieldValue) === stableSerialize(rightFieldValue)) {
+      continue;
+    }
+    diffs.push({
+      field: label,
+      left: summarizeScalar(stableSerialize(leftFieldValue)),
+      right: summarizeScalar(stableSerialize(rightFieldValue)),
+    });
+  }
+
+  return {
+    totalFieldsCompared: (fields || []).length,
+    diffCount: diffs.length,
+    diffs,
+  };
+}
+
+function loadYamlDocument(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) {
+    return null;
+  }
+  const contents = fs.readFileSync(filePath, 'utf8');
+  return yaml.load(contents);
+}
+
+function compareBundlesByAgent({
+  leftBundle,
+  rightBundle,
+  fields = REVIEW_FIELDS,
+}) {
+  const leftMap = buildBundleAgentIndex(leftBundle);
+  const rightMap = buildBundleAgentIndex(rightBundle);
+  const ids = Array.from(new Set([...leftMap.keys(), ...rightMap.keys()])).sort();
+  const diffs = [];
+
+  for (const id of ids) {
+    const leftEntry = leftMap.get(id);
+    const rightEntry = rightMap.get(id);
+    const leftAgent = leftEntry?.data || {};
+    const rightAgent = rightEntry?.data || {};
+    const changedFields = [];
+    const fieldDetails = {};
+
+    for (const field of fields) {
+      const leftValue = leftAgent[field];
+      const rightValue = rightAgent[field];
+      if (stableSerialize(leftValue) === stableSerialize(rightValue)) {
+        continue;
+      }
+      const summary = summarizeFieldDiff(field, leftValue, rightValue);
+      if (
+        field === 'background_cortices' &&
+        summary &&
+        Array.isArray(summary.addedAgentIds) &&
+        Array.isArray(summary.removedAgentIds) &&
+        Array.isArray(summary.changedAgentIds) &&
+        Array.isArray(summary.changedAgents) &&
+        summary.addedAgentIds.length === 0 &&
+        summary.removedAgentIds.length === 0 &&
+        summary.changedAgentIds.length === 0 &&
+        summary.changedAgents.length === 0
+      ) {
+        continue;
+      }
+      changedFields.push(field);
+      fieldDetails[field] = summary;
+    }
+
+    if (!changedFields.length) {
+      continue;
+    }
+
+    diffs.push({
+      id,
+      kind: leftEntry?.kind || rightEntry?.kind || 'unknown',
+      changedFields,
+      details: fieldDetails,
+    });
+  }
+
+  return {
+    totalAgentsCompared: ids.length,
+    diffCount: diffs.length,
+    diffs,
+  };
+}
+
+function loadBundleFromGitHead(filePath, explicitFormat) {
+  const relativePath = path.relative(ROOT_DIR, path.resolve(filePath)).replace(/\\/g, '/');
+  if (!relativePath || relativePath.startsWith('..')) {
+    return null;
+  }
+
+  try {
+    const contents = execFileSync('git', ['show', `HEAD:${relativePath}`], {
+      cwd: ROOT_DIR,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    return loadBundleFromContents({ contents, filePath, explicitFormat });
+  } catch {
+    return null;
+  }
+}
+
+function buildCompareRecommendations({
+  liveVsSource,
+  workingTreeVsHead,
+  sourceExists,
+  adjacentLibrechat = null,
+}) {
+  const recommendations = [];
+  const liveDiffFields = new Set(
+    (liveVsSource?.diffs || []).flatMap((entry) => entry.changedFields || []),
+  );
+  const workingTreeDiffFields = new Set(
+    (workingTreeVsHead?.diffs || []).flatMap((entry) => entry.changedFields || []),
+  );
+  const adjacentLiveDiffFields = new Set(
+    (adjacentLibrechat?.liveVsSource?.diffs || []).map((entry) => entry.field),
+  );
+  const adjacentWorkingDiffFields = new Set(
+    (adjacentLibrechat?.workingTreeVsHead?.diffs || []).map((entry) => entry.field),
+  );
+
+  if (!sourceExists) {
+    recommendations.push(
+      'Tracked source-of-truth bundle is missing; do not push until a reviewed source-of-truth file exists for this environment.',
+    );
+  } else if ((liveVsSource?.diffCount || 0) === 0) {
+    recommendations.push(
+      'Live user-level agent config and tracked source-of-truth currently match for the reviewed sync fields.',
+    );
+  } else {
+    recommendations.push(
+      `Live user-level config differs from tracked source-of-truth for ${liveVsSource.diffCount} agent(s); review those drifts before any push.`,
+    );
+  }
+
+  if (liveDiffFields.has('tools')) {
+    recommendations.push(
+      'Live tool arrays drift from source-of-truth. Do not use full push until those live tool changes are intentionally reconciled.',
+    );
+  }
+  if (workingTreeDiffFields.has('tools')) {
+    recommendations.push(
+      'The tracked source-of-truth proposes tool-array changes versus HEAD. Review those removals/additions before any push so user-configured tool access is not silently lost.',
+    );
+  }
+  if (liveDiffFields.has('instructions') || liveDiffFields.has('conversation_starters')) {
+    recommendations.push(
+      'Live prompt/instruction drift exists. Present the differences to the user and decide whether live or tracked prompt text should win before pushing.',
+    );
+  }
+  if (
+    liveDiffFields.has('provider') ||
+    liveDiffFields.has('model') ||
+    liveDiffFields.has('model_parameters') ||
+    liveDiffFields.has('voice_llm_model') ||
+    liveDiffFields.has('voice_llm_provider') ||
+    liveDiffFields.has('voice_llm_model_parameters')
+  ) {
+    recommendations.push(
+      'Live model/provider drift exists. Reconcile that explicitly and use --model-config-only only when the reviewed target state is clear.',
+    );
+  }
+  if (liveDiffFields.has('background_cortices')) {
+    recommendations.push(
+      'Background cortex config drift exists. Reconcile it with --prompts-only or --activation-config-only plus --agent-ids instead of a broad rewrite.',
+    );
+    const hasMissingLiveFallbacks = liveVsSource?.changedAgents?.some((agentDiff) =>
+      agentDiff?.backgroundCortices?.changedAgents?.some((cortexDiff) =>
+        Array.isArray(cortexDiff?.activationChangedFields) &&
+        cortexDiff.activationChangedFields.includes('fallbacks'),
+      ),
+    );
+    if (hasMissingLiveFallbacks) {
+      recommendations.push(
+        'Live cortex activation is missing reviewed fallback changes on at least one agent. Propagate them with --prompts-only or --activation-config-only plus --activation-fields=fallbacks before relying on classifier failover.',
+      );
+    }
+  }
+
+  if ((workingTreeVsHead?.diffCount || 0) > 0) {
+    recommendations.push(
+      `The tracked source-of-truth file has local repo changes for ${workingTreeVsHead.diffCount} agent(s) versus HEAD. Treat those as proposed changes (C) and compare them against live user drift (A) before any sync.`,
+    );
+  } else {
+    recommendations.push('The tracked source-of-truth file has no local repo drift versus HEAD.');
+  }
+
+  if ((adjacentLibrechat?.liveVsSource?.diffCount || 0) > 0) {
+    recommendations.push(
+      `Adjacent librechat config differs from tracked source-of-truth for ${adjacentLibrechat.liveVsSource.diffCount} reviewed field(s). Review runtime toggles before assuming the agent bundle alone explains the behavior.`,
+    );
+  }
+  if ((adjacentLibrechat?.workingTreeVsHead?.diffCount || 0) > 0) {
+    recommendations.push(
+      `The tracked librechat scaffold has local repo changes for ${adjacentLibrechat.workingTreeVsHead.diffCount} reviewed field(s) versus HEAD. Treat those as proposed adjacent-config changes (C) too.`,
+    );
+  }
+  if (
+    adjacentLiveDiffFields.has('interface.webSearch') ||
+    adjacentWorkingDiffFields.has('interface.webSearch') ||
+    adjacentLiveDiffFields.has('webSearch') ||
+    adjacentWorkingDiffFields.has('webSearch')
+  ) {
+    recommendations.push(
+      'Web search capability drift exists in adjacent librechat config. Review both interface.webSearch and the top-level webSearch block before concluding that the agent tool array is the only problem.',
+    );
+  }
+
+  recommendations.push(
+    'Recommended flow: pull/compare, show A/B/C diffs to the user, choose the narrowest push mode with --agent-ids when possible, dry-run, apply, pull again, and verify the resulting live bundle.',
+  );
+
+  return recommendations;
 }
 
 function readViventiumConfig() {
@@ -838,6 +1294,36 @@ async function repairPersistedAgentRuntimeFields({ agentData, dryRun }) {
   };
 }
 
+function shouldRepairRuntimeFieldsForPushMode({
+  promptsOnly = false,
+  activationConfigOnly = false,
+  runtimeAware = false,
+}) {
+  if (!runtimeAware) {
+    return false;
+  }
+  if (promptsOnly || activationConfigOnly) {
+    return false;
+  }
+  return true;
+}
+
+function shouldPushStandaloneBackgroundAgent({
+  agentId,
+  selectedAgentIds = null,
+  activationConfigOnly = false,
+}) {
+  if (activationConfigOnly) {
+    return false;
+  }
+
+  if (Array.isArray(selectedAgentIds) && selectedAgentIds.length > 0) {
+    return selectedAgentIds.includes(agentId);
+  }
+
+  return true;
+}
+
 async function pushAgent({
   agentData,
   userId,
@@ -845,6 +1331,7 @@ async function pushAgent({
   promptsOnly = false,
   activationConfigOnly = false,
   modelConfigOnly = false,
+  runtimeAware = false,
   activationFields = null,
   selectedAgentIds = null,
 }) {
@@ -852,6 +1339,11 @@ async function pushAgent({
     return { id: null, status: 'skipped', reason: 'missing agent id' };
   }
   const existing = await Agent.findOne({ id: agentData.id }).lean();
+  const shouldRepairRuntimeFields = shouldRepairRuntimeFieldsForPushMode({
+    promptsOnly,
+    activationConfigOnly,
+    runtimeAware,
+  });
   /* === VIVENTIUM START ===
    * Feature: Auto-create agents that exist in source-of-truth YAML but not yet in MongoDB.
    * Root cause: --prompts-only push added activation entries to mainAgent.background_cortices
@@ -911,7 +1403,9 @@ async function pushAgent({
       id: agentData.id,
       status: 'created',
       fieldsSet: Object.keys(createData),
-      runtimeRepair: await repairPersistedAgentRuntimeFields({ agentData, dryRun }),
+      runtimeRepair: shouldRepairRuntimeFields
+        ? await repairPersistedAgentRuntimeFields({ agentData, dryRun })
+        : { repaired: false, reason: 'safe-mode-skipped' },
     };
   }
 
@@ -931,7 +1425,9 @@ async function pushAgent({
   if (!dryRun) {
     await updateAgent({ id: agentData.id }, updateData, { updatingUserId: userId });
   }
-  const runtimeRepair = await repairPersistedAgentRuntimeFields({ agentData, dryRun });
+  const runtimeRepair = shouldRepairRuntimeFields
+    ? await repairPersistedAgentRuntimeFields({ agentData, dryRun })
+    : { repaired: false, reason: 'safe-mode-skipped' };
 
   return {
     id: agentData.id,
@@ -953,12 +1449,14 @@ async function pushBundle({
   inPath,
   dryRun,
   format,
+  env = DEFAULT_ENV_SLUG,
   promptsOnly = false,
   activationConfigOnly = false,
   modelConfigOnly = false,
   runtimeAware = false,
   activationFields = null,
   selectedAgentIds = null,
+  compareReviewed = false,
 }) {
   const connectDb = loadConnectDb();
   await connectDb();
@@ -972,6 +1470,21 @@ async function pushBundle({
     : loadBundle(inPath, format);
   if (!bundle || !bundle.mainAgent) {
     throw new Error('Invalid bundle: missing mainAgent');
+  }
+  const compareResult = await compareBundles({
+    email,
+    agentId: bundle.mainAgent.id || bundle.meta?.mainAgentId || null,
+    env,
+    sourcePath: inPath,
+    format,
+  });
+  const pushGuardError = buildPushGuardError({
+    compareResult,
+    dryRun,
+    compareReviewed,
+  });
+  if (pushGuardError) {
+    throw new Error(pushGuardError);
   }
   const user = await resolveSyncUser({
     explicitEmail: email,
@@ -1008,6 +1521,7 @@ async function pushBundle({
         promptsOnly,
         activationConfigOnly,
         modelConfigOnly,
+        runtimeAware,
         activationFields,
         selectedAgentIds,
       }),
@@ -1026,11 +1540,19 @@ async function pushBundle({
         results.push({ id: agentData.id || null, status: 'missing', reason: 'marked missing' });
         continue;
       }
-      if (selectedIdSet && !selectedIdSet.has(agentData.id)) {
+      if (
+        !shouldPushStandaloneBackgroundAgent({
+          agentId: agentData.id,
+          selectedAgentIds,
+          activationConfigOnly,
+        })
+      ) {
         results.push({
           id: agentData.id,
           status: 'skipped',
-          reason: 'filtered out by --agent-ids',
+          reason: activationConfigOnly
+            ? 'activation-config-only is owned by main agent background_cortices'
+            : 'filtered out by --agent-ids',
         });
         continue;
       }
@@ -1042,6 +1564,7 @@ async function pushBundle({
           promptsOnly,
           activationConfigOnly,
           modelConfigOnly,
+          runtimeAware,
           activationFields,
           selectedAgentIds,
         }),
@@ -1065,10 +1588,152 @@ async function pushBundle({
   };
 }
 
+async function compareBundles({
+  email,
+  agentId,
+  env,
+  livePath = null,
+  sourcePath = null,
+  format,
+}) {
+  void format;
+  const compareInputFormat = null;
+  let resolvedLivePath = livePath;
+  let livePull = null;
+
+  if (resolvedLivePath) {
+    if (!fs.existsSync(resolvedLivePath)) {
+      throw new Error(`Live bundle not found: ${resolvedLivePath}`);
+    }
+  } else {
+    resolvedLivePath = resolveDefaultPullOutPath(env);
+    livePull = await pullBundle({
+      email,
+      agentId,
+      outPath: resolvedLivePath,
+      format: compareInputFormat,
+    });
+    markLatestRunFromFile(resolvedLivePath);
+  }
+
+  const resolvedSourcePath = sourcePath || resolveSourceOfTruthAgentsPath(env);
+  const sourceExists = fs.existsSync(resolvedSourcePath);
+
+  const liveBundle = loadBundle(resolvedLivePath, compareInputFormat);
+  const sourceBundle = sourceExists ? loadBundle(resolvedSourcePath, compareInputFormat) : null;
+  const headBundle = sourceExists ? loadBundleFromGitHead(resolvedSourcePath, compareInputFormat) : null;
+  const liveLibrechatPath = path.join(ROOT_DIR, 'librechat.yaml');
+  const sourceLibrechatPath = resolveSourceOfTruthLibrechatYamlPath(env);
+  const liveLibrechatExists = fs.existsSync(liveLibrechatPath);
+  const sourceLibrechatExists = fs.existsSync(sourceLibrechatPath);
+  const liveLibrechat = liveLibrechatExists ? loadYamlDocument(liveLibrechatPath) : null;
+  const sourceLibrechat = sourceLibrechatExists ? loadYamlDocument(sourceLibrechatPath) : null;
+  const headLibrechat = sourceLibrechatExists ? loadBundleFromGitHead(sourceLibrechatPath, 'yaml') : null;
+
+  const liveVsSource = sourceBundle
+    ? compareBundlesByAgent({
+        leftBundle: liveBundle,
+        rightBundle: sourceBundle,
+      })
+    : {
+        totalAgentsCompared: 0,
+        diffCount: 0,
+        diffs: [],
+      };
+
+  const workingTreeVsHead = headBundle
+    ? compareBundlesByAgent({
+        leftBundle: headBundle,
+        rightBundle: sourceBundle,
+      })
+    : {
+        totalAgentsCompared: 0,
+        diffCount: 0,
+        diffs: [],
+      };
+  const adjacentLibrechat = {
+    livePath: liveLibrechatPath,
+    liveExists: liveLibrechatExists,
+    sourcePath: sourceLibrechatPath,
+    sourceExists: sourceLibrechatExists,
+    liveVsSource:
+      liveLibrechat && sourceLibrechat
+        ? compareNamedFields({
+            leftValue: liveLibrechat,
+            rightValue: sourceLibrechat,
+            fields: LIBRECHAT_REVIEW_FIELDS,
+          })
+        : {
+            totalFieldsCompared: LIBRECHAT_REVIEW_FIELDS.length,
+            diffCount: 0,
+            diffs: [],
+          },
+    workingTreeVsHead:
+      headLibrechat && sourceLibrechat
+        ? compareNamedFields({
+            leftValue: headLibrechat,
+            rightValue: sourceLibrechat,
+            fields: LIBRECHAT_REVIEW_FIELDS,
+          })
+        : {
+            totalFieldsCompared: LIBRECHAT_REVIEW_FIELDS.length,
+            diffCount: 0,
+            diffs: [],
+          },
+  };
+
+  return {
+    action: 'compare',
+    env: sanitizeSlug(env),
+    livePath: resolvedLivePath,
+    livePull,
+    sourcePath: resolvedSourcePath,
+    sourceExists,
+    liveVsSource,
+    workingTreeVsHead,
+    adjacentLibrechat,
+    recommendations: buildCompareRecommendations({
+      liveVsSource,
+      workingTreeVsHead,
+      sourceExists,
+      adjacentLibrechat,
+    }),
+  };
+}
+
+function buildPushGuardError({ compareResult, dryRun, compareReviewed }) {
+  if (dryRun || compareReviewed) {
+    return null;
+  }
+
+  const blockingReasons = [];
+  if ((compareResult?.liveVsSource?.diffCount || 0) > 0) {
+    blockingReasons.push(
+      `${compareResult.liveVsSource.diffCount} live agent diff(s) on reviewed user-managed fields`,
+    );
+  }
+  if ((compareResult?.adjacentLibrechat?.liveVsSource?.diffCount || 0) > 0) {
+    blockingReasons.push(
+      `${compareResult.adjacentLibrechat.liveVsSource.diffCount} adjacent librechat config diff(s)`,
+    );
+  }
+
+  if (!blockingReasons.length) {
+    return null;
+  }
+
+  return (
+    `Push blocked until drift is reviewed: ${blockingReasons.join('; ')}. ` +
+    `Run 'node scripts/viventium-sync-agents.js compare --env=${compareResult?.env || DEFAULT_ENV_SLUG}' ` +
+    `and re-run push with --compare-reviewed only after presenting A/B/C drift to the user.`
+  );
+}
+
 function printUsage() {
   console.log('Usage:');
   console.log('  node scripts/viventium-sync-agents.js pull [<output-file>]');
   console.log('  node scripts/viventium-sync-agents.js push [<input-file>]');
+  console.log('  node scripts/viventium-sync-agents.js compare');
   console.log('');
   console.log('Options:');
   console.log(
@@ -1082,6 +1747,12 @@ function printUsage() {
   console.log(
     '  --in=...          Input path for push (default: viventium/source_of_truth/<env>.viventium-agents.yaml if present, else latest agents-sync run, fallback: tmp/viventium-agents.yaml)',
   );
+  console.log(
+    '  --source=...      Source-of-truth bundle for compare (default: viventium/source_of_truth/<env>.viventium-agents.yaml)',
+  );
+  console.log(
+    '  --live=...        Existing pulled live bundle for compare (default: pull fresh live state to a new agents-sync artifact)',
+  );
   console.log('  --file=...        Shortcut to set both --out and --in');
   console.log('  --json            Force JSON format (default is YAML)');
   console.log('  --yaml            Force YAML format');
@@ -1089,14 +1760,17 @@ function printUsage() {
   console.log('  env: VIVENTIUM_ARTIFACTS_DIR overrides artifacts root (default: <core>/.viventium/artifacts)');
   console.log('  --no-sot          Skip writing git-tracked source-of-truth copies (viventium/source_of_truth/*.yaml)');
   console.log('  --dry-run         Show push results without updating');
-  console.log('  --prompts-only    Safe mode: only update prompts/instructions, not tools or model config');
+  console.log('  --compare-reviewed  Confirm you already reviewed compare output and accept live-vs-source drift');
+  console.log(
+    '  --prompts-only    Safe merge mode: update prompts/instructions plus any explicitly reviewed activation reliability fields present in the safe allowlist (for example fallbacks); this still changes live failover behavior, so review compare output first',
+  );
   console.log('  --activation-config-only  Safe mode: only update background cortex activation config');
   console.log('  --model-config-only  Safe mode: only update agent model/provider fields');
   console.log('  --runtime-aware   Rewrite built-in model/provider fields from canonical runtime env before push');
   console.log('  --raw-source-of-truth  Push raw bundle values without runtime rewrite (disables local default)');
   console.log('  --agent-ids=...   Optional comma-separated background agent ids to update surgically');
   console.log(
-    '  --activation-fields=...   Comma-separated activation fields for safe modes (enabled,prompt,confidence_threshold,model,provider,cooldown_ms,max_history,intent_scope)',
+    '  --activation-fields=...   Comma-separated activation fields for safe modes (enabled,prompt,confidence_threshold,fallbacks,model,provider,cooldown_ms,max_history,intent_scope)',
   );
   console.log('  --schedules       Also pull/push Scheduling Cortex tasks for this user (via viv-schedule-sync.js)');
   console.log('');
@@ -1112,6 +1786,7 @@ function printUsage() {
   console.log('  --schedules-create-missing       Recreate missing tasks (new ids) instead of failing');
   console.log('');
   console.log('Safe Push Example:');
+  console.log('  node scripts/viventium-sync-agents.js compare --env=local           # Pull live state and review A/B/C drift');
   console.log('  node scripts/viventium-sync-agents.js push --prompts-only --dry-run  # Preview changes');
   console.log('  node scripts/viventium-sync-agents.js push --prompts-only            # Apply prompt changes only');
   console.log(
@@ -1173,6 +1848,19 @@ async function run() {
     return;
   }
 
+  if (args.action === 'compare') {
+    const result = await compareBundles({
+      email: args.email,
+      agentId: args.agentId,
+      env: args.env,
+      livePath: args.livePath,
+      sourcePath: args.sourcePath,
+      format: args.format,
+    });
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
   if (args.action === 'push') {
     const inPath = args.inPath || resolveDefaultPushInPath(args.env);
     const result = await pushBundle({
@@ -1186,6 +1874,8 @@ async function run() {
       runtimeAware: shouldApplyRuntimeOverrides(args),
       activationFields: args.activationFields,
       selectedAgentIds: args.selectedAgentIds,
+      env: args.env,
+      compareReviewed: args.compareReviewed,
     });
 
     let schedules = null;
@@ -1250,11 +1940,20 @@ if (require.main === module) {
 }
 
 module.exports = {
+  buildPushGuardError,
+  compareBundles,
+  compareBundlesByAgent,
+  compareNamedFields,
   isPlaceholderOwnerEmail,
+  LIBRECHAT_REVIEW_FIELDS,
   normalizeBundleForSourceOfTruth,
   parseArgs,
+  pickAgentFields,
   resolveFormat,
+  buildUpdateData,
   mergeBackgroundCorticesActivationFields,
   resolveSafeActivationFields,
   shouldApplyRuntimeOverrides,
+  shouldRepairRuntimeFieldsForPushMode,
+  shouldPushStandaloneBackgroundAgent,
 };

@@ -6,6 +6,7 @@
 const {
   normalizeBundleForRuntimeWithOwner,
   normalizePublicAccessRole,
+  pickAgentFields,
   preserveExistingEditableFields,
   resolvePublicAccessRoleIds,
 } = require('../../../scripts/viventium-seed-agents');
@@ -163,5 +164,25 @@ describe('viventium-seed-agents', () => {
     expect(normalizePublicAccessRole('nope')).toBe('viewer');
     expect(normalizePublicAccessRole('agent_owner')).toBe('owner');
     expect(normalizePublicAccessRole('edit')).toBe('editor');
+  });
+
+  test('pickAgentFields preserves dedicated voice parameters for seeded installs', () => {
+    expect(
+      pickAgentFields({
+        id: 'agent_viventium_main_95aeb3',
+        voice_llm_provider: 'anthropic',
+        voice_llm_model: 'claude-haiku-4-5',
+        voice_llm_model_parameters: {
+          thinking: false,
+        },
+      }),
+    ).toEqual({
+      id: 'agent_viventium_main_95aeb3',
+      voice_llm_provider: 'anthropic',
+      voice_llm_model: 'claude-haiku-4-5',
+      voice_llm_model_parameters: {
+        thinking: false,
+      },
+    });
   });
 });

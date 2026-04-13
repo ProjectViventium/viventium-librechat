@@ -1,5 +1,5 @@
 import { useForm } from 'react-hook-form';
-import React, { useContext, useState } from 'react';
+import React, { useContext, useEffect, useState } from 'react';
 import { Turnstile } from '@marsidev/react-turnstile';
 import { ThemeContext, Spinner, Button, isDark } from '@librechat/client';
 import { useNavigate, useOutletContext, useLocation } from 'react-router-dom';
@@ -27,6 +27,7 @@ const Registration: React.FC = () => {
   const [errorMessage, setErrorMessage] = useState<string>('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [countdown, setCountdown] = useState<number>(3);
+  const [registrationSucceeded, setRegistrationSucceeded] = useState(false);
   const [turnstileToken, setTurnstileToken] = useState<string | null>(null);
 
   const location = useLocation();
@@ -37,27 +38,37 @@ const Registration: React.FC = () => {
   // only require captcha if we have a siteKey
   const requireCaptcha = Boolean(startupConfig?.turnstile?.siteKey);
 
+  useEffect(() => {
+    if (!registrationSucceeded) {
+      return;
+    }
+
+    if (countdown <= 0) {
+      navigate('/c/new', { replace: true });
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      setCountdown((prevCountdown) => Math.max(prevCountdown - 1, 0));
+    }, 1000);
+
+    return () => window.clearTimeout(timer);
+  }, [countdown, navigate, registrationSucceeded]);
+
   const registerUser = useRegisterUserMutation({
     onMutate: () => {
       setIsSubmitting(true);
+      setRegistrationSucceeded(false);
     },
     onSuccess: () => {
       setIsSubmitting(false);
+      setErrorMessage('');
+      setRegistrationSucceeded(true);
       setCountdown(3);
-      const timer = setInterval(() => {
-        setCountdown((prevCountdown) => {
-          if (prevCountdown <= 1) {
-            clearInterval(timer);
-            navigate('/c/new', { replace: true });
-            return 0;
-          } else {
-            return prevCountdown - 1;
-          }
-        });
-      }, 1000);
     },
     onError: (error: unknown) => {
       setIsSubmitting(false);
+      setRegistrationSucceeded(false);
       if ((error as TError).response?.data?.message) {
         setErrorMessage((error as TError).response?.data?.message ?? '');
       }
@@ -103,7 +114,7 @@ const Registration: React.FC = () => {
           {localize('com_auth_error_create')} {errorMessage}
         </ErrorMessage>
       )}
-      {registerUser.isSuccess && countdown > 0 && (
+      {registrationSucceeded && countdown > 0 && (
         <div
           className="rounded-md border border-green-500 bg-green-500/10 px-3 py-2 text-sm text-gray-600 dark:text-gray-200"
           role="alert"

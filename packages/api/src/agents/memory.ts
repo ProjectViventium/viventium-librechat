@@ -550,12 +550,14 @@ ${memory ?? 'No existing memories'}`;
     return await Promise.all(artifactPromises);
   } catch (error) {
     const typedError = error as { message?: string; code?: string; type?: string } | undefined;
+    const configuredModel =
+      llmConfig != null && 'model' in llmConfig ? (llmConfig.model as string | undefined) : undefined;
     logger.error(
       `[MemoryAgent] Failed to process memory | userId: ${userId} | conversationId: ${conversationId} | messageId: ${messageId}`,
       {
         error,
         provider: llmConfig?.provider,
-        model: llmConfig?.model,
+        model: configuredModel,
         errorMessage: typedError?.message,
         errorCode: typedError?.code,
         errorType: typedError?.type,

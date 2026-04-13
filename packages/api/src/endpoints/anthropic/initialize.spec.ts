@@ -174,6 +174,22 @@ describe('initializeAnthropic', () => {
     }
   });
 
+  it('should require a connected account when connected-account auth has no stored Anthropic credential', async () => {
+    process.env.ANTHROPIC_API_KEY = 'user_provided';
+    process.env.VIVENTIUM_ANTHROPIC_AUTH_MODE = 'connected_account';
+    const params = createParams();
+
+    await expect(initializeAnthropic(params)).rejects.toThrow();
+
+    try {
+      await initializeAnthropic(params);
+    } catch (error) {
+      const parsedError = JSON.parse((error as Error).message);
+      expect(parsedError.type).toBe(ErrorTypes.CONNECTED_ACCOUNT_REQUIRED);
+      expect(parsedError.info).toBe(EModelEndpoint.anthropic);
+    }
+  });
+
   it('should validate user key expiry when a connected key is present and expiry is provided', async () => {
     const params = createParams({
       body: { key: '2099-12-31T23:59:59.000Z' },

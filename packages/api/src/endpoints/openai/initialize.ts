@@ -16,6 +16,8 @@ import { getOpenAIConfig } from './config';
  * === VIVENTIUM END === */
 const OPENAI_CONNECTED_ACCOUNT_RECONNECT_MESSAGE =
   'OpenAI connected account needs reconnect in Settings > Account > Connected Accounts.';
+const OPENAI_CONNECTED_ACCOUNT_REQUIRED_MESSAGE =
+  'OpenAI connected account is required in Settings > Account > Connected Accounts.';
 
 const isNoUserKeyError = (error: unknown): boolean => {
   if (!(error instanceof Error)) {
@@ -210,6 +212,15 @@ export async function initializeOpenAI({
   }
 
   if (userProvidesKey && !apiKey) {
+    if (isConnectedAccountAuthMode()) {
+      throw new Error(
+        JSON.stringify({
+          type: ErrorTypes.CONNECTED_ACCOUNT_REQUIRED,
+          info: EModelEndpoint.openAI,
+          message: OPENAI_CONNECTED_ACCOUNT_REQUIRED_MESSAGE,
+        }),
+      );
+    }
     throw new Error(
       JSON.stringify({
         type: ErrorTypes.NO_USER_KEY,

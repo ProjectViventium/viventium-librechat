@@ -102,7 +102,7 @@ function hasActiveAnthropicThinking(thinking: unknown): boolean {
 }
 
 function sanitizeAnthropicTemperatureForThinking<
-  T extends { thinking?: unknown; temperature?: number },
+  T extends { thinking?: unknown; temperature?: number | null },
 >(config: T): T {
   if (!hasActiveAnthropicThinking(config?.thinking) || config?.temperature == null) {
     return config;

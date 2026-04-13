@@ -39,6 +39,12 @@ const TOOL_RUNTIME_GATES = Object.freeze([
     matches: (tool) => tool === 'sys__server__sys_mcp_ms-365' || tool.endsWith('_mcp_ms-365'),
   },
   {
+    envKey: 'START_GLASSHIVE',
+    matches: (tool) =>
+      tool === 'sys__server__sys_mcp_glasshive-workers-projects' ||
+      tool.endsWith('_mcp_glasshive-workers-projects'),
+  },
+  {
     envKey: 'START_CODE_INTERPRETER',
     matches: (tool) => tool === 'execute_code',
   },

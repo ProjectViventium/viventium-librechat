@@ -38,10 +38,42 @@ function getRequestUrl(input: string | URL | Request): string {
   return input.url;
 }
 
+function extractInstructionText(content: unknown): string | undefined {
+  if (typeof content === 'string') {
+    const trimmed = content.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  }
+
+  if (!Array.isArray(content)) {
+    return undefined;
+  }
+
+  const textParts: string[] = [];
+  for (let j = 0; j < content.length; j++) {
+    const part = content[j];
+    if (!part || typeof part !== 'object') {
+      continue;
+    }
+    const type = (part as Record<string, unknown>).type;
+    const text = (part as Record<string, unknown>).text;
+    if (
+      (type === 'input_text' || type === 'text' || type === 'output_text') &&
+      typeof text === 'string' &&
+      text.trim().length > 0
+    ) {
+      textParts.push(text.trim());
+    }
+  }
+
+  return textParts.length > 0 ? textParts.join('\n') : undefined;
+}
+
 function extractInstructionsFromResponseInput(input: unknown): string | undefined {
   if (!Array.isArray(input)) {
     return undefined;
   }
+
+  const instructionParts: string[] = [];
 
   for (let i = 0; i < input.length; i++) {
     const item = input[i];
@@ -58,42 +90,13 @@ function extractInstructionsFromResponseInput(input: unknown): string | undefine
       continue;
     }
 
-    const content = (item as Record<string, unknown>).content;
-    if (typeof content === 'string') {
-      const trimmed = content.trim();
-      if (trimmed.length > 0) {
-        return trimmed;
-      }
-      continue;
-    }
-
-    if (!Array.isArray(content)) {
-      continue;
-    }
-
-    const textParts: string[] = [];
-    for (let j = 0; j < content.length; j++) {
-      const part = content[j];
-      if (!part || typeof part !== 'object') {
-        continue;
-      }
-      const type = (part as Record<string, unknown>).type;
-      const text = (part as Record<string, unknown>).text;
-      if (
-        (type === 'input_text' || type === 'text' || type === 'output_text') &&
-        typeof text === 'string' &&
-        text.trim().length > 0
-      ) {
-        textParts.push(text.trim());
-      }
-    }
-
-    if (textParts.length > 0) {
-      return textParts.join('\n');
+    const instructionText = extractInstructionText((item as Record<string, unknown>).content);
+    if (instructionText) {
+      instructionParts.push(instructionText);
     }
   }
 
-  return undefined;
+  return instructionParts.length > 0 ? instructionParts.join('\n\n') : undefined;
 }
 
 function parseCodexResponseFromSSE(raw: string): Record<string, unknown> | undefined {
@@ -181,18 +184,23 @@ function normalizeCodexResponseInput(input: unknown): {
   normalizedInput: unknown;
   removedItemReferenceCount: number;
   removedReasoningReferenceCount: number;
+  removedInstructionMessageCount: number;
+  extractedInstructions?: string;
 } {
   if (!Array.isArray(input)) {
     return {
       normalizedInput: input,
       removedItemReferenceCount: 0,
       removedReasoningReferenceCount: 0,
+      removedInstructionMessageCount: 0,
     };
   }
 
   const normalizedInput: unknown[] = [];
   let removedItemReferenceCount = 0;
   let removedReasoningReferenceCount = 0;
+  let removedInstructionMessageCount = 0;
+  const extractedInstructions: string[] = [];
 
   for (let i = 0; i < input.length; i++) {
     const item = input[i];
@@ -202,6 +210,18 @@ function normalizeCodexResponseInput(input: unknown): {
     }
 
     const itemRecord = item as Record<string, unknown>;
+    if (
+      itemRecord.type === 'message' &&
+      (itemRecord.role === 'system' || itemRecord.role === 'developer')
+    ) {
+      removedInstructionMessageCount++;
+      const instructionText = extractInstructionText(itemRecord.content);
+      if (instructionText) {
+        extractedInstructions.push(instructionText);
+      }
+      continue;
+    }
+
     if (itemRecord.type === 'item_reference') {
       removedItemReferenceCount++;
       continue;
@@ -223,6 +243,10 @@ function normalizeCodexResponseInput(input: unknown): {
     normalizedInput,
     removedItemReferenceCount,
     removedReasoningReferenceCount,
+    removedInstructionMessageCount,
+    ...(extractedInstructions.length > 0
+      ? { extractedInstructions: extractedInstructions.join('\n\n') }
+      : {}),
   };
 }
 
@@ -259,6 +283,7 @@ function createCodexResponsesFetch(baseFetch: Fetch): Fetch {
     let injectedReasoningEncryptedContentInclude = false;
     let removedItemReferenceCount = 0;
     let removedReasoningReferenceCount = 0;
+    let removedInstructionMessageCount = 0;
 
     if (isResponsesRequest && typeof init?.body === 'string' && init.body.trim().length > 0) {
       try {
@@ -280,6 +305,7 @@ function createCodexResponsesFetch(baseFetch: Fetch): Fetch {
         payload.input = normalizedInput.normalizedInput;
         removedItemReferenceCount = normalizedInput.removedItemReferenceCount;
         removedReasoningReferenceCount = normalizedInput.removedReasoningReferenceCount;
+        removedInstructionMessageCount = normalizedInput.removedInstructionMessageCount;
 
         if (Object.prototype.hasOwnProperty.call(payload, 'user')) {
           removedUserParam = true;
@@ -292,7 +318,9 @@ function createCodexResponsesFetch(baseFetch: Fetch): Fetch {
         if (!hasInstructions) {
           injectedInstructions = true;
           payload.instructions =
-            extractInstructionsFromResponseInput(payload.input) ?? DEFAULT_CODEX_INSTRUCTIONS;
+            normalizedInput.extractedInstructions ??
+            extractInstructionsFromResponseInput(payload.input) ??
+            DEFAULT_CODEX_INSTRUCTIONS;
         }
 
         injectedReasoningEncryptedContentInclude =
@@ -343,6 +371,7 @@ function createCodexResponsesFetch(baseFetch: Fetch): Fetch {
         injectedInstructions ||
         removedPreviousResponseId ||
         injectedReasoningEncryptedContentInclude ||
+        removedInstructionMessageCount > 0 ||
         removedItemReferenceCount > 0 ||
         removedReasoningReferenceCount > 0)
     ) {
@@ -370,6 +399,7 @@ function createCodexResponsesFetch(baseFetch: Fetch): Fetch {
           injectedInstructions,
           removedPreviousResponseId,
           injectedReasoningEncryptedContentInclude,
+          removedInstructionMessageCount,
           removedItemReferenceCount,
           removedReasoningReferenceCount,
           responsePreview,

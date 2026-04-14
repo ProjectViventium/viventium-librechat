@@ -291,6 +291,42 @@ const createDeleteMemoryTool = ({
     },
   );
 };
+
+const createNoopMemoryTool = () =>
+  tool(
+    async () => ['No durable memory update needed for this turn', undefined],
+    {
+      name: 'noop_memory',
+      description:
+        'Use this when the current chat does not require any durable memory changes. If the user explicitly asked you to remember, store, forget, delete, or update memory, do not use this tool.',
+      responseFormat: 'content_and_artifact',
+      schema: z.object({
+        reason: z
+          .string()
+          .optional()
+          .describe('Optional short reason why no durable memory update is needed.'),
+      }),
+    },
+  );
+
+const resolveMemoryToolChoice = (
+  provider?: string,
+): 'required' | 'any' | undefined => {
+  const normalized = String(provider ?? '').trim().toLowerCase();
+
+  switch (normalized) {
+    case 'openai':
+    case 'azureopenai':
+      return 'required';
+    case 'anthropic':
+    case 'google':
+    case 'vertexai':
+      return 'any';
+    default:
+      return undefined;
+  }
+};
+
 export class BasicToolEndHandler implements EventHandler {
   private callback?: ToolEndCallback;
   constructor(callback?: ToolEndCallback) {
@@ -368,6 +404,7 @@ export async function processMemory({
       validKeys,
       deleteMemory,
     });
+    const noopMemoryTool = createNoopMemoryTool();
 
     const currentMemoryTokens = totalTokens;
 
@@ -413,6 +450,13 @@ ${memory ?? 'No existing memories'}`;
       streaming: false,
       disableStreaming: true,
     };
+
+    const toolChoice = resolveMemoryToolChoice(
+      (finalLLMConfig as Partial<LLMConfig>).provider ?? llmConfig?.provider,
+    );
+    if (toolChoice != null) {
+      (finalLLMConfig as Record<string, unknown>).tool_choice = toolChoice;
+    }
 
     // Handle GPT-5+ models
     if ('model' in finalLLMConfig && /\bgpt-[5-9](?:\.\d+)?\b/i.test(finalLLMConfig.model ?? '')) {
@@ -512,7 +556,7 @@ ${memory ?? 'No existing memories'}`;
       graphConfig: {
         type: 'standard',
         llmConfig: finalLLMConfig,
-        tools: [memoryTool, deleteMemoryTool],
+        tools: [memoryTool, deleteMemoryTool, noopMemoryTool],
         instructions: graphInstructions,
         additional_instructions: graphAdditionalInstructions,
         toolEnd: true,

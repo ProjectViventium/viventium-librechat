@@ -381,6 +381,62 @@ describe('Memory Agent Header Resolution', () => {
     expect(runConfig.graphConfig.additional_instructions).toBeDefined();
   });
 
+  it('should require an explicit tool decision for OpenAI memory runs and expose noop_memory', async () => {
+    const llmConfig = {
+      provider: Providers.OPENAI,
+      model: 'gpt-5.4',
+    };
+
+    await processMemory({
+      res: mockRes,
+      userId: 'user-123',
+      setMemory: mockMemoryMethods.setMemory,
+      deleteMemory: mockMemoryMethods.deleteMemory,
+      messages: [],
+      memory: 'existing memory',
+      messageId: 'msg-123',
+      conversationId: 'conv-123',
+      validKeys: ['preferences'],
+      instructions: 'test instructions',
+      llmConfig,
+      user: testUser,
+    });
+
+    const runConfig = (Run.create as jest.Mock).mock.calls[0][0];
+    expect(runConfig.graphConfig.llmConfig.tool_choice).toBe('required');
+    expect(runConfig.graphConfig.tools.map((tool: { name: string }) => tool.name)).toEqual(
+      expect.arrayContaining(['set_memory', 'delete_memory', 'noop_memory']),
+    );
+  });
+
+  it('should force a tool choice for Anthropic memory runs and expose noop_memory', async () => {
+    const llmConfig = {
+      provider: Providers.ANTHROPIC,
+      model: 'claude-sonnet-4-6',
+    };
+
+    await processMemory({
+      res: mockRes,
+      userId: 'user-123',
+      setMemory: mockMemoryMethods.setMemory,
+      deleteMemory: mockMemoryMethods.deleteMemory,
+      messages: [],
+      memory: 'existing memory',
+      messageId: 'msg-123',
+      conversationId: 'conv-123',
+      validKeys: ['preferences'],
+      instructions: 'test instructions',
+      llmConfig,
+      user: testUser,
+    });
+
+    const runConfig = (Run.create as jest.Mock).mock.calls[0][0];
+    expect(runConfig.graphConfig.llmConfig.tool_choice).toBe('any');
+    expect(runConfig.graphConfig.tools.map((tool: { name: string }) => tool.name)).toEqual(
+      expect.arrayContaining(['set_memory', 'delete_memory', 'noop_memory']),
+    );
+  });
+
   it('should set temperature to 1 for Bedrock with thinking enabled', async () => {
     const llmConfig = {
       provider: Providers.BEDROCK,

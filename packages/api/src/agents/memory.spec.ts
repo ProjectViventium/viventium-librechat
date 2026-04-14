@@ -381,7 +381,7 @@ describe('Memory Agent Header Resolution', () => {
     expect(runConfig.graphConfig.additional_instructions).toBeDefined();
   });
 
-  it('should require an explicit tool decision for OpenAI memory runs and expose noop_memory', async () => {
+  it('should force the unified memory decision tool for OpenAI memory runs', async () => {
     const llmConfig = {
       provider: Providers.OPENAI,
       model: 'gpt-5.4',
@@ -403,13 +403,26 @@ describe('Memory Agent Header Resolution', () => {
     });
 
     const runConfig = (Run.create as jest.Mock).mock.calls[0][0];
-    expect(runConfig.graphConfig.llmConfig.tool_choice).toBe('required');
+    expect(runConfig.graphConfig.llmConfig.tool_choice).toBe('apply_memory_changes');
+    expect(runConfig.graphConfig.llmConfig.modelKwargs).toEqual(
+      expect.objectContaining({
+        tool_choice: {
+          type: 'function',
+          name: 'apply_memory_changes',
+        },
+      }),
+    );
     expect(runConfig.graphConfig.tools.map((tool: { name: string }) => tool.name)).toEqual(
-      expect.arrayContaining(['set_memory', 'delete_memory', 'noop_memory']),
+      expect.arrayContaining([
+        'apply_memory_changes',
+        'set_memory',
+        'delete_memory',
+        'noop_memory',
+      ]),
     );
   });
 
-  it('should force a tool choice for Anthropic memory runs and expose noop_memory', async () => {
+  it('should force the unified memory decision tool for Anthropic memory runs', async () => {
     const llmConfig = {
       provider: Providers.ANTHROPIC,
       model: 'claude-sonnet-4-6',
@@ -431,9 +444,22 @@ describe('Memory Agent Header Resolution', () => {
     });
 
     const runConfig = (Run.create as jest.Mock).mock.calls[0][0];
-    expect(runConfig.graphConfig.llmConfig.tool_choice).toBe('any');
+    expect(runConfig.graphConfig.llmConfig.tool_choice).toBe('apply_memory_changes');
+    expect(runConfig.graphConfig.llmConfig.invocationKwargs).toEqual(
+      expect.objectContaining({
+        tool_choice: {
+          type: 'tool',
+          name: 'apply_memory_changes',
+        },
+      }),
+    );
     expect(runConfig.graphConfig.tools.map((tool: { name: string }) => tool.name)).toEqual(
-      expect.arrayContaining(['set_memory', 'delete_memory', 'noop_memory']),
+      expect.arrayContaining([
+        'apply_memory_changes',
+        'set_memory',
+        'delete_memory',
+        'noop_memory',
+      ]),
     );
   });
 

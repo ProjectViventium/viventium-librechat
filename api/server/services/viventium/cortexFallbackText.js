@@ -71,6 +71,13 @@ const CONCRETE_RESULT_DETAIL_PATTERNS = [
   /\b(?:received|sent|found|scheduled)\b/i,
 ];
 
+function getDeferredFallbackErrorText({ scheduleId = '' } = {}) {
+  if (typeof scheduleId === 'string' && scheduleId.trim()) {
+    return '';
+  }
+  return "I couldn't finish that check just now.";
+}
+
 function isOperationalFallbackParagraph(text) {
   if (typeof text !== 'string') {
     return false;
@@ -211,6 +218,24 @@ function scoreFallbackInsightCandidate({ insight, index = 0 }) {
     return null;
   }
 
+  const hasEvidenceStyle = EVIDENCE_STYLE_FALLBACK_TEXT_PATTERNS.some((pattern) =>
+    pattern.test(visibleText),
+  );
+  const hasConcreteDetail = CONCRETE_RESULT_DETAIL_PATTERNS.some((pattern) =>
+    pattern.test(visibleText),
+  );
+  const visibleWords = visibleText.match(/[A-Za-z0-9]+/g) ?? [];
+  const lowSignal =
+    visibleWords.length <= 3 &&
+    visibleText.length <= 24 &&
+    !hasEvidenceStyle &&
+    !hasConcreteDetail &&
+    !/\d/.test(visibleText) &&
+    !/:\s/.test(visibleText);
+  if (lowSignal) {
+    return null;
+  }
+
   if (isAccessLimitationOnlyInsight(visibleText)) {
     return null;
   }
@@ -244,11 +269,11 @@ function scoreFallbackInsightCandidate({ insight, index = 0 }) {
     score -= 120;
   }
 
-  if (EVIDENCE_STYLE_FALLBACK_TEXT_PATTERNS.some((pattern) => pattern.test(visibleText))) {
+  if (hasEvidenceStyle) {
     score += 150;
   }
 
-  if (CONCRETE_RESULT_DETAIL_PATTERNS.some((pattern) => pattern.test(visibleText))) {
+  if (hasConcreteDetail) {
     score += 260;
   }
 
@@ -334,6 +359,7 @@ function getPreferredFallbackInsightText({
 
 module.exports = {
   cleanFallbackInsightText,
+  getDeferredFallbackErrorText,
   getPreferredFallbackInsightText,
   getVisibleFallbackInsightTexts,
   isOperationalFallbackParagraph,

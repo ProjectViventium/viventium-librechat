@@ -33,6 +33,7 @@ jest.mock('~/server/controllers/assistants/v2', () => ({
 jest.mock('~/models/Agent', () => ({
   addAgentResourceFile: jest.fn().mockResolvedValue({}),
   removeAgentResourceFiles: jest.fn(),
+  getAgent: jest.fn(),
 }));
 
 jest.mock('~/server/controllers/assistants/helpers', () => ({
@@ -77,10 +78,13 @@ const { EToolResources, FileSources, AgentCapabilities } = require('librechat-da
 const { mergeFileConfig } = require('librechat-data-provider');
 const { checkCapability } = require('~/server/services/Config');
 const { getStrategyFunctions } = require('~/server/services/Files/strategies');
+const { getAgent } = require('~/models/Agent');
 const { processAgentFileUpload } = require('./process');
 
 const PDF_MIME = 'application/pdf';
+const DOC_MIME = 'application/msword';
 const DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+const PPT_MIME = 'application/vnd.ms-powerpoint';
 const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 const XLS_MIME = 'application/vnd.ms-excel';
 const ODS_MIME = 'application/vnd.oasis.opendocument.spreadsheet';
@@ -104,10 +108,11 @@ const makeReq = ({ mimetype = PDF_MIME, ocrConfig = null } = {}) => ({
   },
 });
 
-const makeMetadata = () => ({
+const makeMetadata = (overrides = {}) => ({
   agent_id: 'agent-abc',
   tool_resource: EToolResources.context,
   file_id: 'file-uuid-123',
+  ...overrides,
 });
 
 const mockRes = {
@@ -115,11 +120,15 @@ const mockRes = {
   json: jest.fn().mockReturnValue({}),
 };
 
-const makeFileConfig = ({ ocrSupportedMimeTypes = [] } = {}) => ({
+const makeFileConfig = ({
+  ocrSupportedMimeTypes = [],
+  sttSupportedMimeTypes = [],
+  textSupportedMimeTypes = [],
+} = {}) => ({
   checkType: (mime, types) => (types ?? []).includes(mime),
   ocr: { supportedMimeTypes: ocrSupportedMimeTypes },
-  stt: { supportedMimeTypes: [] },
-  text: { supportedMimeTypes: [] },
+  stt: { supportedMimeTypes: sttSupportedMimeTypes },
+  text: { supportedMimeTypes: textSupportedMimeTypes },
 });
 
 describe('processAgentFileUpload', () => {
@@ -128,6 +137,7 @@ describe('processAgentFileUpload', () => {
     mockRes.status.mockReturnThis();
     mockRes.json.mockReturnValue({});
     checkCapability.mockResolvedValue(true);
+    getAgent.mockResolvedValue({ provider: 'openAI', model_parameters: {} });
     getStrategyFunctions.mockReturnValue({
       handleFileUpload: jest
         .fn()
@@ -342,6 +352,338 @@ describe('processAgentFileUpload', () => {
       await expect(
         processAgentFileUpload({ req, res: mockRes, metadata: makeMetadata() }),
       ).resolves.not.toThrow();
+    });
+  });
+
+  describe('message attachment auto-context promotion', () => {
+    test('auto-promotes parseable message attachments when they are not provider-native uploads', async () => {
+      const { createFile } = require('~/models');
+      const { parseText } = require('@librechat/api');
+      parseText.mockResolvedValueOnce({
+        text: '# Playbook\n\nContext from file.',
+        bytes: 29,
+      });
+      createFile.mockResolvedValueOnce({
+        file_id: 'file-uuid-123',
+        source: FileSources.text,
+        type: 'text/markdown',
+      });
+      mergeFileConfig.mockReturnValue(
+        makeFileConfig({ textSupportedMimeTypes: ['text/markdown'] }),
+      );
+      const req = makeReq({ mimetype: 'text/markdown', ocrConfig: null });
+      req.file.originalname = 'playbook.md';
+      req.body.endpoint = 'agents';
+      req.body.endpointType = 'agents';
+      getAgent.mockResolvedValueOnce({ provider: 'openAI', model_parameters: {} });
+
+      await processAgentFileUpload({
+        req,
+        res: mockRes,
+        metadata: makeMetadata({
+          agent_id: 'agent-abc',
+          tool_resource: undefined,
+          message_file: true,
+        }),
+      });
+
+      expect(parseText).toHaveBeenCalledWith({
+        req,
+        file: req.file,
+        file_id: 'file-uuid-123',
+      });
+      expect(createFile).toHaveBeenCalledWith(
+        expect.objectContaining({
+          file_id: 'file-uuid-123',
+          context: 'message_attachment',
+          source: FileSources.text,
+          type: 'text/markdown',
+          filename: 'playbook.md',
+          text: '# Playbook\n\nContext from file.',
+        }),
+        true,
+      );
+      expect(mockRes.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          message: 'Agent file uploaded and processed successfully',
+          file_id: 'file-uuid-123',
+          source: FileSources.text,
+          type: 'text/markdown',
+        }),
+      );
+    });
+
+    test('auto-promotes application/json message attachments into direct text extraction', async () => {
+      const { createFile } = require('~/models');
+      const { parseText } = require('@librechat/api');
+      parseText.mockResolvedValueOnce({
+        text: '{"priority":"high"}',
+        bytes: 19,
+      });
+      createFile.mockResolvedValueOnce({
+        file_id: 'file-uuid-123',
+        source: FileSources.text,
+        type: 'application/json',
+      });
+      mergeFileConfig.mockReturnValue(
+        makeFileConfig({ textSupportedMimeTypes: ['application/json'] }),
+      );
+      const req = makeReq({ mimetype: 'application/json', ocrConfig: null });
+      req.file.originalname = 'payload.json';
+      req.body.endpoint = 'agents';
+      req.body.endpointType = 'agents';
+      getAgent.mockResolvedValueOnce({ provider: 'anthropic', model_parameters: {} });
+
+      await processAgentFileUpload({
+        req,
+        res: mockRes,
+        metadata: makeMetadata({
+          agent_id: 'agent-abc',
+          tool_resource: undefined,
+          message_file: true,
+        }),
+      });
+
+      expect(parseText).toHaveBeenCalledWith({
+        req,
+        file: req.file,
+        file_id: 'file-uuid-123',
+      });
+      expect(createFile).toHaveBeenCalledWith(
+        expect.objectContaining({
+          file_id: 'file-uuid-123',
+          context: 'message_attachment',
+          source: FileSources.text,
+          type: 'application/json',
+          filename: 'payload.json',
+          text: '{"priority":"high"}',
+        }),
+        true,
+      );
+    });
+
+    test('preserves provider-native PDF message attachments on the raw upload path', async () => {
+      const { createFile } = require('~/models');
+      const { parseText } = require('@librechat/api');
+      createFile.mockClear();
+      parseText.mockClear();
+      mergeFileConfig.mockReturnValue(makeFileConfig());
+      getStrategyFunctions.mockReturnValueOnce({
+        handleFileUpload: jest.fn().mockResolvedValue({
+          bytes: 4096,
+          filename: 'brief.pdf',
+          filepath: '/uploads/brief.pdf',
+        }),
+      });
+      const req = makeReq({ mimetype: PDF_MIME, ocrConfig: null });
+      req.file.originalname = 'brief.pdf';
+      req.body.endpoint = 'agents';
+      req.body.endpointType = 'agents';
+      getAgent.mockResolvedValueOnce({ provider: 'openAI', model_parameters: {} });
+
+      await processAgentFileUpload({
+        req,
+        res: mockRes,
+        metadata: makeMetadata({
+          agent_id: 'agent-abc',
+          tool_resource: undefined,
+          message_file: true,
+        }),
+      });
+
+      expect(parseText).not.toHaveBeenCalled();
+      expect(getStrategyFunctions).toHaveBeenCalledWith('local');
+      expect(createFile).toHaveBeenCalledWith(
+        expect.objectContaining({
+          file_id: 'file-uuid-123',
+          context: 'message_attachment',
+          source: 'local',
+          type: PDF_MIME,
+          filename: 'brief.pdf',
+        }),
+        true,
+      );
+    });
+
+    test('preserves Bedrock-native markdown message attachments on the raw upload path', async () => {
+      const { createFile } = require('~/models');
+      const { parseText } = require('@librechat/api');
+      createFile.mockClear();
+      parseText.mockClear();
+      mergeFileConfig.mockReturnValue(
+        makeFileConfig({ textSupportedMimeTypes: ['text/markdown'] }),
+      );
+      getStrategyFunctions.mockReturnValueOnce({
+        handleFileUpload: jest.fn().mockResolvedValue({
+          bytes: 512,
+          filename: 'analysis.md',
+          filepath: '/uploads/analysis.md',
+        }),
+      });
+      const req = makeReq({ mimetype: 'text/markdown', ocrConfig: null });
+      req.file.originalname = 'analysis.md';
+      req.body.endpoint = 'agents';
+      req.body.endpointType = 'agents';
+      getAgent.mockResolvedValueOnce({ provider: 'bedrock', model_parameters: {} });
+
+      await processAgentFileUpload({
+        req,
+        res: mockRes,
+        metadata: makeMetadata({
+          agent_id: 'agent-abc',
+          tool_resource: undefined,
+          message_file: true,
+        }),
+      });
+
+      expect(parseText).not.toHaveBeenCalled();
+      expect(getStrategyFunctions).toHaveBeenCalledWith('local');
+      expect(createFile).toHaveBeenCalledWith(
+        expect.objectContaining({
+          file_id: 'file-uuid-123',
+          context: 'message_attachment',
+          source: 'local',
+          type: 'text/markdown',
+          filename: 'analysis.md',
+        }),
+        true,
+      );
+    });
+
+    test('preserves Google audio message attachments on the raw upload path even when STT is configured', async () => {
+      const { createFile } = require('~/models');
+      const { processAudioFile } = require('@librechat/api');
+      createFile.mockClear();
+      processAudioFile.mockClear();
+      mergeFileConfig.mockReturnValue(
+        makeFileConfig({ sttSupportedMimeTypes: ['audio/mpeg'] }),
+      );
+      getStrategyFunctions.mockReturnValueOnce({
+        handleFileUpload: jest.fn().mockResolvedValue({
+          bytes: 2048,
+          filename: 'memo.mp3',
+          filepath: '/uploads/memo.mp3',
+        }),
+      });
+      const req = makeReq({ mimetype: 'audio/mpeg', ocrConfig: null });
+      req.file.originalname = 'memo.mp3';
+      req.body.endpoint = 'agents';
+      req.body.endpointType = 'agents';
+      getAgent.mockResolvedValueOnce({ provider: 'google', model_parameters: {} });
+
+      await processAgentFileUpload({
+        req,
+        res: mockRes,
+        metadata: makeMetadata({
+          agent_id: 'agent-abc',
+          tool_resource: undefined,
+          message_file: true,
+        }),
+      });
+
+      expect(processAudioFile).not.toHaveBeenCalled();
+      expect(getStrategyFunctions).toHaveBeenCalledWith('local');
+      expect(createFile).toHaveBeenCalledWith(
+        expect.objectContaining({
+          file_id: 'file-uuid-123',
+          context: 'message_attachment',
+          source: 'local',
+          type: 'audio/mpeg',
+          filename: 'memo.mp3',
+        }),
+        true,
+      );
+    });
+
+    test('fails clearly for OCR-only legacy Word attachments when OCR is not configured', async () => {
+      const { parseText } = require('@librechat/api');
+      parseText.mockClear();
+      mergeFileConfig.mockReturnValue(makeFileConfig({ ocrSupportedMimeTypes: [DOC_MIME] }));
+      const req = makeReq({ mimetype: DOC_MIME, ocrConfig: null });
+      req.file.originalname = 'brief.doc';
+      req.body.endpoint = 'agents';
+      req.body.endpointType = 'agents';
+      getAgent.mockResolvedValueOnce({ provider: 'anthropic', model_parameters: {} });
+
+      await expect(
+        processAgentFileUpload({
+          req,
+          res: mockRes,
+          metadata: makeMetadata({
+            agent_id: 'agent-abc',
+            tool_resource: undefined,
+            message_file: true,
+          }),
+        }),
+      ).rejects.toThrow(/requires a configured OCR service/);
+
+      expect(parseText).not.toHaveBeenCalled();
+      expect(getStrategyFunctions).not.toHaveBeenCalledWith(FileSources.local);
+    });
+
+    test('uses configured OCR for provider-non-native PowerPoint message attachments', async () => {
+      const { createFile } = require('~/models');
+      mergeFileConfig.mockReturnValue(makeFileConfig({ ocrSupportedMimeTypes: [PPT_MIME] }));
+      getStrategyFunctions.mockReturnValueOnce({
+        handleFileUpload: jest.fn().mockResolvedValue({
+          text: 'slide summary',
+          bytes: 13,
+          filepath: 'ocr://deck',
+        }),
+      });
+      const req = makeReq({
+        mimetype: PPT_MIME,
+        ocrConfig: { strategy: FileSources.mistral_ocr },
+      });
+      req.file.originalname = 'deck.ppt';
+      req.body.endpoint = 'agents';
+      req.body.endpointType = 'agents';
+      getAgent.mockResolvedValueOnce({ provider: 'anthropic', model_parameters: {} });
+
+      await processAgentFileUpload({
+        req,
+        res: mockRes,
+        metadata: makeMetadata({
+          agent_id: 'agent-abc',
+          tool_resource: undefined,
+          message_file: true,
+        }),
+      });
+
+      expect(getStrategyFunctions).toHaveBeenCalledWith(FileSources.mistral_ocr);
+      expect(createFile).toHaveBeenCalledWith(
+        expect.objectContaining({
+          file_id: 'file-uuid-123',
+          context: 'message_attachment',
+          source: FileSources.text,
+          filename: 'deck.ppt',
+          text: 'slide summary',
+        }),
+        true,
+      );
+    });
+
+    test('fails closed for unsupported binary message attachments', async () => {
+      mergeFileConfig.mockReturnValue(makeFileConfig());
+      const req = makeReq({ mimetype: 'application/zip', ocrConfig: null });
+      req.file.originalname = 'archive.zip';
+      req.body.endpoint = 'agents';
+      req.body.endpointType = 'agents';
+      getAgent.mockResolvedValueOnce({ provider: 'anthropic', model_parameters: {} });
+
+      await expect(
+        processAgentFileUpload({
+          req,
+          res: mockRes,
+          metadata: makeMetadata({
+            agent_id: 'agent-abc',
+            tool_resource: undefined,
+            message_file: true,
+          }),
+        }),
+      ).rejects.toThrow(/Unsupported message attachment type application\/zip/);
+
+      expect(getStrategyFunctions).not.toHaveBeenCalledWith('local');
     });
   });
 });

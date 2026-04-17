@@ -51,6 +51,7 @@ const {
 } = require('~/server/services/viventium/followUpTextSanitizer');
 const {
   cleanFallbackInsightText,
+  getDeferredFallbackErrorText,
   getPreferredFallbackInsightText,
   getVisibleFallbackInsightTexts,
   isOperationalFallbackParagraph,
@@ -669,12 +670,7 @@ function formatFollowUpText({
   }
 
   if (hasErrors) {
-    // Scheduler-triggered runs must keep deterministic runtime failures out of continuity threads.
-    if (typeof scheduleId === 'string' && scheduleId.trim()) {
-      return '';
-    }
-    // Keep this minimal and user-safe; details belong in logs/DB status rows.
-    return "I couldn't finish that check just now.";
+    return getDeferredFallbackErrorText({ scheduleId });
   }
 
   // No meaningful follow-up.

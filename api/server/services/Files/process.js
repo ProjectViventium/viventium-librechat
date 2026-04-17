@@ -10,13 +10,18 @@ const {
   imageExtRegex,
   EModelEndpoint,
   EToolResources,
+  Providers,
   mergeFileConfig,
   AgentCapabilities,
   checkOpenAIStorage,
   removeNullishValues,
   isAssistantsEndpoint,
+  isDocumentSupportedProvider,
+  isBedrockDocumentType,
+  resolveEndpointType,
   getEndpointFileConfig,
   documentParserMimeTypes,
+  textMimeTypes,
 } = require('librechat-data-provider');
 const { EnvVar } = require('@librechat/agents');
 const { logger } = require('@librechat/data-schemas');
@@ -27,7 +32,7 @@ const {
   resizeImageBuffer,
 } = require('~/server/services/Files/images');
 const { addResourceFileId, deleteResourceFileId } = require('~/server/controllers/assistants/v2');
-const { addAgentResourceFile, removeAgentResourceFiles } = require('~/models/Agent');
+const { addAgentResourceFile, removeAgentResourceFiles, getAgent } = require('~/models/Agent');
 const { getOpenAIClient } = require('~/server/controllers/assistants/helpers');
 const { loadAuthValues } = require('~/server/services/Tools/credentials');
 const { createFile, updateFileUsage, deleteFiles } = require('~/models');
@@ -60,6 +65,122 @@ const createSanitizedUploadWrapper = (uploadFunction) => {
     return uploadFunction({ req, file: sanitizedFile, file_id, ...restParams });
   };
 };
+
+const parseBooleanFlag = (value) => {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'true') {
+      return true;
+    }
+    if (normalized === 'false') {
+      return false;
+    }
+  }
+  return Boolean(value);
+};
+
+/**
+ * MIME types that are safe for direct text extraction without OCR/document parsing.
+ *
+ * Why:
+ * - `fileConfig.text.supportedMimeTypes` intentionally defaults to a very broad matcher so the
+ *   RAG text endpoint can opt into more formats.
+ * - The message-attachment path must not silently fall back to native UTF-8 reads for binary
+ *   Office/OpenDocument/archive types, or the agent will receive garbage text instead of a clear
+ *   error.
+ */
+const directTextApplicationMimeTypes =
+  /^(application\/(csv|json|sql|xml|yaml|x-sh|typescript|vnd\.coffeescript))$/;
+
+function isDirectTextExtractionMimeType(mimetype = '') {
+  return textMimeTypes.test(mimetype) || directTextApplicationMimeTypes.test(mimetype);
+}
+
+const normalizeMessageAttachmentProvider = (provider) => {
+  if (typeof provider !== 'string') {
+    return '';
+  }
+  const trimmed = provider.trim();
+  if (trimmed.toLowerCase() === Providers.OPENROUTER) {
+    return Providers.OPENROUTER;
+  }
+  return trimmed;
+};
+
+async function resolveMessageAttachmentSurface({ req, agent_id }) {
+  const requestedEndpoint =
+    (typeof req.body?.endpoint === 'string' && req.body.endpoint.trim()) ||
+    (typeof req.body?.endpointType === 'string' && req.body.endpointType.trim()) ||
+    '';
+  const requestedEndpointType =
+    typeof req.body?.endpointType === 'string' && req.body.endpointType.trim()
+      ? req.body.endpointType.trim()
+      : '';
+
+  let provider =
+    typeof req.body?.provider === 'string' && req.body.provider.trim() ? req.body.provider.trim() : '';
+  let useResponsesApi = parseBooleanFlag(req.body?.useResponsesApi);
+
+  if ((requestedEndpoint === EModelEndpoint.agents || requestedEndpointType === EModelEndpoint.agents) && agent_id) {
+    const agent = await getAgent({ id: agent_id });
+    if (agent?.provider) {
+      provider = agent.provider;
+    }
+    if (agent?.model_parameters?.useResponsesApi != null) {
+      useResponsesApi = parseBooleanFlag(agent.model_parameters.useResponsesApi);
+    }
+  }
+
+  const currentProvider = normalizeMessageAttachmentProvider(provider || requestedEndpoint);
+  const endpointType =
+    (requestedEndpointType && requestedEndpointType !== EModelEndpoint.agents
+      ? requestedEndpointType
+      : resolveEndpointType(req.config?.endpoints, requestedEndpoint, provider)) ||
+    requestedEndpointType ||
+    requestedEndpoint;
+
+  return {
+    currentProvider,
+    endpointType,
+    useResponsesApi,
+  };
+}
+
+function isProviderNativeMessageAttachment({ mimetype, endpointType, currentProvider, useResponsesApi }) {
+  const isAzureWithResponsesApi =
+    currentProvider === EModelEndpoint.azureOpenAI && useResponsesApi === true;
+  const isBedrock =
+    currentProvider === Providers.BEDROCK || endpointType === EModelEndpoint.bedrock;
+  const providerSupportsDocuments =
+    isDocumentSupportedProvider(endpointType) ||
+    isDocumentSupportedProvider(currentProvider) ||
+    isBedrock ||
+    isAzureWithResponsesApi;
+
+  if (!providerSupportsDocuments) {
+    return false;
+  }
+
+  const supportsImageDocVideoAudio =
+    currentProvider === EModelEndpoint.google || currentProvider === Providers.OPENROUTER;
+  if (supportsImageDocVideoAudio) {
+    return (
+      mimetype.startsWith('image/') ||
+      mimetype.startsWith('video/') ||
+      mimetype.startsWith('audio/') ||
+      mimetype === 'application/pdf'
+    );
+  }
+
+  if (isBedrock) {
+    return mimetype.startsWith('image/') || isBedrockDocumentType(mimetype);
+  }
+
+  return mimetype.startsWith('image/') || mimetype === 'application/pdf';
+}
 
 /**
  * Enqueues the delete operation to the leaky bucket queue if necessary, or adds it directly to promises.
@@ -472,7 +593,8 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
   const appConfig = req.config;
   const { agent_id, tool_resource, file_id, temp_file_id = null } = metadata;
 
-  let messageAttachment = !!metadata.message_file;
+  let messageAttachment = parseBooleanFlag(metadata.message_file);
+  let resolvedToolResource = tool_resource;
 
   if (agent_id && !tool_resource && !messageAttachment) {
     throw new Error('No tool resource provided for agent file upload');
@@ -490,7 +612,107 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
   let fileInfoMetadata;
   const entity_id = messageAttachment === true ? undefined : agent_id;
   const basePath = mime.getType(file.originalname)?.startsWith('image') ? 'images' : 'uploads';
-  if (tool_resource === EToolResources.execute_code) {
+  const fileConfig = mergeFileConfig(appConfig.fileConfig);
+  const supportsOCRExtraction = fileConfig.checkType(
+    file.mimetype,
+    fileConfig.ocr?.supportedMimeTypes || [],
+  );
+  const shouldUseConfiguredOCR = appConfig?.ocr != null && supportsOCRExtraction;
+  const shouldUseDocumentParser =
+    !shouldUseConfiguredOCR && documentParserMimeTypes.some((regex) => regex.test(file.mimetype));
+  const shouldUseSTT = fileConfig.checkType(
+    file.mimetype,
+    fileConfig.stt?.supportedMimeTypes || [],
+  );
+  const shouldUseDirectText =
+    isDirectTextExtractionMimeType(file.mimetype) &&
+    fileConfig.checkType(file.mimetype, fileConfig.text?.supportedMimeTypes || []);
+
+  /* === VIVENTIUM START ===
+   * Root-cause fix: preserve native provider message uploads before falling back to context extraction.
+   *
+   * Why:
+   * - Web uploads distinguish "Upload to Provider" from "extract as context", but channel bridges
+   *   submit `message_file=true` without an interactive chooser.
+   * - Prior bridge behavior stored parseable files as opaque uploads, so the agent saw neither
+   *   extracted text context nor provider-native document payloads.
+   * - The first shared fix over-corrected by converting every parseable message attachment into
+   *   context, which broke parity for provider-native files such as PDFs, Bedrock docs, and
+   *   Google/OpenRouter audio-video uploads.
+   *
+   * Behavior:
+   * - If a message attachment matches LibreChat's native "Upload to Provider" contract for the
+   *   active endpoint/provider, preserve the normal raw attachment path so downstream client logic
+   *   can encode it for the provider.
+   * - Only auto-promote parseable message attachments into `tool_resource=context` when the file is
+   *   not a valid provider-native message upload for that surface.
+   * - If neither provider-native upload nor readable context extraction can handle the file, fail
+   *   honestly instead of storing an opaque attachment the agent cannot use.
+   * === VIVENTIUM END === */
+  const supportsContextExtraction =
+    supportsOCRExtraction || shouldUseDocumentParser || shouldUseSTT || shouldUseDirectText;
+  if (messageAttachment && !resolvedToolResource) {
+    const { currentProvider, endpointType, useResponsesApi } = await resolveMessageAttachmentSurface({
+      req,
+      agent_id,
+    });
+    const providerNativeAttachment = isProviderNativeMessageAttachment({
+      mimetype: file.mimetype,
+      endpointType,
+      currentProvider,
+      useResponsesApi,
+    });
+
+    if (providerNativeAttachment) {
+      logger.debug('[processAgentFileUpload] Preserving provider-native message attachment', {
+        agent_id,
+        endpointType,
+        currentProvider,
+        file_id,
+        mimetype: file.mimetype,
+        originalname: file.originalname,
+      });
+    } else if (supportsContextExtraction) {
+      resolvedToolResource = EToolResources.context;
+      logger.debug('[processAgentFileUpload] Auto-promoted message attachment to context', {
+        agent_id,
+        endpointType,
+        currentProvider,
+        file_id,
+        mimetype: file.mimetype,
+        originalname: file.originalname,
+      });
+    } else {
+      throw new Error(
+        `Unsupported message attachment type ${file.mimetype}. This file can't be sent provider-natively or extracted as readable text on this surface.`,
+      );
+    }
+  }
+
+  if (
+    messageAttachment &&
+    resolvedToolResource === EToolResources.context &&
+    supportsOCRExtraction &&
+    !shouldUseConfiguredOCR &&
+    !shouldUseDocumentParser
+  ) {
+    throw new Error(
+      `Unable to extract text from "${file.originalname}". This file type requires a configured OCR service to produce readable text.`,
+    );
+  }
+
+  if (
+    messageAttachment &&
+    resolvedToolResource === EToolResources.context &&
+    !supportsOCRExtraction &&
+    !shouldUseDocumentParser &&
+    !shouldUseSTT &&
+    !shouldUseDirectText
+  ) {
+    throw new Error(`File type ${file.mimetype} is not supported for text parsing.`);
+  }
+
+  if (resolvedToolResource === EToolResources.execute_code) {
     const isCodeEnabled = await checkCapability(req, AgentCapabilities.execute_code);
     if (!isCodeEnabled) {
       throw new Error('Code execution is not enabled for Agents');
@@ -506,13 +728,13 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
       entity_id,
     });
     fileInfoMetadata = { fileIdentifier };
-  } else if (tool_resource === EToolResources.file_search) {
+  } else if (resolvedToolResource === EToolResources.file_search) {
     const isFileSearchEnabled = await checkCapability(req, AgentCapabilities.file_search);
     if (!isFileSearchEnabled) {
       throw new Error('File search is not enabled for Agents');
     }
     // Note: File search processing continues to dual storage logic below
-  } else if (tool_resource === EToolResources.context) {
+  } else if (resolvedToolResource === EToolResources.context) {
     const { file_id, temp_file_id = null } = metadata;
 
     /**
@@ -544,12 +766,12 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
         context: messageAttachment ? FileContext.message_attachment : FileContext.agents,
       });
 
-      if (!messageAttachment && tool_resource) {
+      if (!messageAttachment && resolvedToolResource) {
         await addAgentResourceFile({
           req,
           file_id,
           agent_id,
-          tool_resource,
+          tool_resource: resolvedToolResource,
         });
       }
       const result = await createFile(fileInfo, true);
@@ -557,16 +779,6 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
         .status(200)
         .json({ message: 'Agent file uploaded and processed successfully', ...result });
     };
-
-    const fileConfig = mergeFileConfig(appConfig.fileConfig);
-
-    const shouldUseConfiguredOCR =
-      appConfig?.ocr != null &&
-      fileConfig.checkType(file.mimetype, fileConfig.ocr?.supportedMimeTypes || []);
-
-    const shouldUseDocumentParser =
-      !shouldUseConfiguredOCR && documentParserMimeTypes.some((regex) => regex.test(file.mimetype));
-
     const shouldUseOCR = shouldUseConfiguredOCR || shouldUseDocumentParser;
 
     const resolveDocumentText = async () => {
@@ -608,23 +820,13 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
       );
     }
 
-    const shouldUseSTT = fileConfig.checkType(
-      file.mimetype,
-      fileConfig.stt?.supportedMimeTypes || [],
-    );
-
     if (shouldUseSTT) {
       const sttService = await STTService.getInstance();
       const { text, bytes } = await processAudioFile({ req, file, sttService });
       return await createTextFile({ text, bytes });
     }
 
-    const shouldUseText = fileConfig.checkType(
-      file.mimetype,
-      fileConfig.text?.supportedMimeTypes || [],
-    );
-
-    if (!shouldUseText) {
+    if (!shouldUseDirectText) {
       throw new Error(`File type ${file.mimetype} is not supported for text parsing.`);
     }
 
@@ -637,7 +839,7 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
   const isImageFile = file.mimetype.startsWith('image');
   const source = getFileStrategy(appConfig, { isImage: isImageFile });
 
-  if (tool_resource === EToolResources.file_search) {
+  if (resolvedToolResource === EToolResources.file_search) {
     // FIRST: Upload to Storage for permanent backup (S3/local/etc.)
     const { handleFileUpload } = getStrategyFunctions(source);
     const sanitizedUploadFn = createSanitizedUploadWrapper(handleFileUpload);
@@ -677,19 +879,19 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
   let { bytes, filename, filepath: _filepath, height, width } = storageResult;
   // For RAG files, use embedding result; for others, use storage result
   let embedded = storageResult.embedded;
-  if (tool_resource === EToolResources.file_search) {
+  if (resolvedToolResource === EToolResources.file_search) {
     embedded = embeddingResult?.embedded;
     filename = embeddingResult?.filename || filename;
   }
 
   let filepath = _filepath;
 
-  if (!messageAttachment && tool_resource) {
+  if (!messageAttachment && resolvedToolResource) {
     await addAgentResourceFile({
       req,
       file_id,
       agent_id,
-      tool_resource,
+      tool_resource: resolvedToolResource,
     });
   }
 

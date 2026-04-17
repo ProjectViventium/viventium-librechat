@@ -13,10 +13,18 @@
 const { ContentTypes } = require('librechat-data-provider');
 const { logger } = require('@librechat/data-schemas');
 const { getMessage, getMessages } = require('~/models');
+const { getAgent } = require('~/models/Agent');
 const { sanitizeFollowUpDisplayText } = require('~/server/services/viventium/followUpTextSanitizer');
 const {
+  getDeferredFallbackErrorText,
   getPreferredFallbackInsightText,
 } = require('~/server/services/viventium/cortexFallbackText');
+const {
+  resolveConfiguredHoldTexts,
+} = require('~/server/services/viventium/brewingHold');
+const {
+  isRuntimeHoldTextPart,
+} = require('~/server/services/viventium/runtimeHoldText');
 
 const CORTEX_TYPES = new Set([
   ContentTypes.CORTEX_ACTIVATION,
@@ -57,17 +65,27 @@ function extractCanonicalMessageText(message) {
     return '';
   }
 
-  const directText = typeof message.text === 'string' ? message.text.trim() : '';
+  const content = Array.isArray(message.content) ? message.content : [];
+  const hasRuntimeHold = content.some((part) => isRuntimeHoldTextPart(part));
+
+  const directText =
+    !hasRuntimeHold && typeof message.text === 'string' ? message.text.trim() : '';
   if (directText) {
     return sanitizeFollowUpDisplayText(directText);
   }
 
-  if (!Array.isArray(message.content)) {
+  if (!Array.isArray(content)) {
     return '';
   }
 
-  const contentText = message.content
-    .filter((part) => part && typeof part === 'object' && part.type === 'text')
+  const contentText = content
+    .filter(
+      (part) =>
+        part &&
+        typeof part === 'object' &&
+        part.type === 'text' &&
+        !isRuntimeHoldTextPart(part),
+    )
     .map((part) => (typeof part.text === 'string' ? part.text.trim() : ''))
     .filter(Boolean)
     .join('\n\n')
@@ -103,18 +121,45 @@ function isPlaceholderCanonicalText(text) {
   return PLACEHOLDER_CANONICAL_TEXT_PATTERNS.some((pattern) => pattern.test(normalized));
 }
 
+function normalizeHoldText(text) {
+  return String(text || '')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .toLowerCase();
+}
+
+function hasRuntimeHoldText(content) {
+  return Array.isArray(content) && content.some((part) => isRuntimeHoldTextPart(part));
+}
+
+function isConfiguredHoldCanonicalText(text, holdTexts = []) {
+  const normalized = normalizeHoldText(text);
+  if (!normalized) {
+    return false;
+  }
+
+  return holdTexts.some((holdText) => normalizeHoldText(holdText) === normalized);
+}
+
 function resolveDeferredFallbackCanonicalText({
   message,
   followUp,
   canonicalText,
   cortexParts,
+  configuredHoldTexts = [],
 }) {
   if (followUp || hasActiveCortexParts(cortexParts)) {
     return canonicalText || null;
   }
 
+  const runtimeHoldText = hasRuntimeHoldText(message?.content);
+  const configuredHoldText = isConfiguredHoldCanonicalText(canonicalText, configuredHoldTexts);
   const needsFallback =
-    message?.unfinished === true || !canonicalText || isPlaceholderCanonicalText(canonicalText);
+    runtimeHoldText ||
+    configuredHoldText ||
+    message?.unfinished === true ||
+    !canonicalText ||
+    isPlaceholderCanonicalText(canonicalText);
   if (!needsFallback) {
     return canonicalText || null;
   }
@@ -140,13 +185,33 @@ function resolveDeferredFallbackCanonicalText({
   });
 
   if (!fallbackText) {
-    return canonicalText || null;
+    return getDeferredFallbackErrorText();
   }
 
   logger.warn(
     `[cortexMessageState] Resolved deferred fallback canonical text for message ${message?.messageId || ''}`,
   );
   return fallbackText;
+}
+
+async function resolveConfiguredHoldTextsForMessage(message) {
+  const agentId =
+    (typeof message?.agent_id === 'string' && message.agent_id.trim()) ||
+    (typeof message?.model === 'string' && message.model.startsWith('agent_') && message.model.trim()) ||
+    '';
+  if (!agentId) {
+    return [];
+  }
+
+  try {
+    const agent = await getAgent({ id: agentId });
+    return resolveConfiguredHoldTexts({ agentInstructions: agent?.instructions });
+  } catch (err) {
+    logger.warn(
+      `[cortexMessageState] Failed to load agent hold texts for message ${message?.messageId || ''}: ${err?.message || err}`,
+    );
+    return [];
+  }
 }
 
 async function getFollowUpMessageForParent({ userId, conversationId, parentMessageId }) {
@@ -209,11 +274,13 @@ async function getCortexMessageState({ userId, messageId, conversationId }) {
     followUp = null;
   }
 
+  const configuredHoldTexts = await resolveConfiguredHoldTextsForMessage(message);
   canonicalText = resolveDeferredFallbackCanonicalText({
     message,
     followUp,
     canonicalText,
     cortexParts,
+    configuredHoldTexts,
   });
 
   return {

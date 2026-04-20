@@ -58,16 +58,19 @@ export interface MemorySnapshot {
 export const memoryInstructions =
   'The system automatically stores important user information and can update or delete memories based on user requests, enabling dynamic memory management.';
 
+const MEMORY_DECISION_TOOL_NAME = 'apply_memory_changes';
+
 const getDefaultInstructions = (
   validKeys?: string[],
   tokenLimit?: number,
-) => `Use the \`set_memory\` tool to save important information about the user, but ONLY when the user has requested you to remember something.
+) => `Use the \`${MEMORY_DECISION_TOOL_NAME}\` tool to save, delete, or skip durable memory updates, but ONLY when the user has requested you to remember, forget, or update something.
 
-The \`delete_memory\` tool should only be used in two scenarios:
-  1. When the user explicitly asks to remove an entire memory key
-  2. When a memory key has become fully obsolete and should disappear completely
+Encode each durable action inside \`operations\`:
+  - Use \`{"action":"set","key":"...","value":"..."}\` to create or update a memory key
+  - Use \`{"action":"delete","key":"..."}\` only when the entire key should disappear
+  - Use \`{"action":"noop","reason":"..."}\` when the current turn does not require any durable memory change
 
-For partial forgetting or corrections, use the \`set_memory\` tool instead of deleting and re-adding the memory. Rewrite the full affected value, remove only the forgotten or corrected detail, and preserve unrelated information.
+For partial forgetting or corrections, use a \`set\` operation instead of deleting and re-adding the memory. Rewrite the full affected value, remove only the forgotten or corrected detail, and preserve unrelated information.
 When the user asks to forget an entity, preference, or project reference, remove obvious aliases, abbreviations, and alternate spellings of that same target across every affected key.
 
 1. ONLY use memory tools when the user requests memory actions with phrases like:
@@ -84,13 +87,22 @@ When the user asks to forget an entity, preference, or project reference, remove
 
 4. Memory tools are ONLY for memory requests, not for general tool usage.
 
-5. If the user doesn't ask you to remember or forget something, DO NOT use any memory tools.
+5. Call \`${MEMORY_DECISION_TOOL_NAME}\` exactly once per memory run. If no durable change is needed, emit a single \`noop\` operation instead of plain text.
 
 ${validKeys && validKeys.length > 0 ? `\nVALID KEYS: ${validKeys.join(', ')}` : ''}
 
 ${tokenLimit ? `\nTOKEN LIMIT: Maximum ${tokenLimit} tokens per memory value.` : ''}
 
-When in doubt, and the user hasn't asked to remember or forget anything, END THE TURN IMMEDIATELY.`;
+When in doubt, and the user hasn't asked to remember or forget anything, emit a single \`noop\` operation and END THE TURN IMMEDIATELY.`;
+
+const getMemoryToolProtocolInstructions = () => `TOOL PROTOCOL OVERRIDE:
+- The durable memory tool for this run is \`${MEMORY_DECISION_TOOL_NAME}\`.
+- Call \`${MEMORY_DECISION_TOOL_NAME}\` exactly once on every memory run.
+- Put every durable write inside \`operations\`.
+- Map any prior \`set_memory\` intent to \`{"action":"set","key":"...","value":"..."}\`.
+- Map any prior \`delete_memory\` intent to \`{"action":"delete","key":"..."}\`.
+- If nothing durable should change, emit exactly one \`{"action":"noop","reason":"..."}\` operation.
+- Do not answer in plain text instead of the tool call.`;
 
 function buildMemoryErrorArtifact(
   evaluation: ReturnType<typeof evaluateMemoryWrite>,
@@ -110,6 +122,53 @@ function buildMemoryErrorArtifact(
   };
 }
 
+function buildGenericMemoryErrorArtifact(
+  message: string,
+  currentTotalTokens: number,
+  details?: Record<string, unknown>,
+): Record<Tools.memory, MemoryArtifact> {
+  return {
+    [Tools.memory]: {
+      key: 'system',
+      type: 'error',
+      value: JSON.stringify({
+        errorType: 'invalid_operation',
+        message,
+        ...(details ?? {}),
+      }),
+      tokenCount: currentTotalTokens,
+    },
+  };
+}
+
+type MemoryRuntimeState = {
+  tokenCounts: Record<string, number>;
+  runningTotalTokens: number;
+};
+
+function createMemoryRuntimeState({
+  memoryTokenMap,
+  totalTokens = 0,
+}: {
+  memoryTokenMap?: Record<string, number>;
+  totalTokens?: number;
+}): MemoryRuntimeState {
+  const tokenCounts: Record<string, number> = { ...(memoryTokenMap ?? {}) };
+  let runningTotalTokens = totalTokens;
+
+  if (memoryTokenMap) {
+    const computedTotal = Object.values(tokenCounts).reduce((sum, n) => sum + (Number(n) || 0), 0);
+    if (Number.isFinite(computedTotal) && computedTotal !== runningTotalTokens) {
+      runningTotalTokens = computedTotal;
+    }
+  }
+
+  return {
+    tokenCounts,
+    runningTotalTokens,
+  };
+}
+
 /**
  * Creates a memory tool instance with user context
  */
@@ -121,6 +180,7 @@ export const createMemoryTool = ({
   keyLimits,
   memoryTokenMap,
   totalTokens = 0,
+  state,
 }: {
   userId: string | ObjectId;
   setMemory: MemoryMethods['setMemory'];
@@ -129,6 +189,7 @@ export const createMemoryTool = ({
   keyLimits?: MemoryKeyLimits;
   memoryTokenMap?: Record<string, number>;
   totalTokens?: number;
+  state?: MemoryRuntimeState;
 }) => {
   /* === VIVENTIUM START ===
    * Fix: Prevent tokenLimit double-counting for per-key overwrites.
@@ -144,16 +205,12 @@ export const createMemoryTool = ({
    *
    * Added: 2026-02-09
    * === VIVENTIUM END === */
-  const tokenCounts: Record<string, number> = { ...(memoryTokenMap ?? {}) };
-  let runningTotalTokens = totalTokens;
-
-  // Prefer the map sum if provided (keeps us consistent even if caller total is stale).
-  if (memoryTokenMap) {
-    const computedTotal = Object.values(tokenCounts).reduce((sum, n) => sum + (Number(n) || 0), 0);
-    if (Number.isFinite(computedTotal) && computedTotal !== runningTotalTokens) {
-      runningTotalTokens = computedTotal;
-    }
-  }
+  const runtimeState =
+    state ??
+    createMemoryRuntimeState({
+      memoryTokenMap,
+      totalTokens,
+    });
 
   return tool(
     async ({ key, value }) => {
@@ -161,7 +218,7 @@ export const createMemoryTool = ({
         const preparedValue = prepareMemoryValueForWrite({ key, value, keyLimits });
         const nextValue = preparedValue.value;
         const tokenCount = preparedValue.tokenCount;
-        const previousTokenCount = tokenCounts[key] ?? 0;
+        const previousTokenCount = runtimeState.tokenCounts[key] ?? 0;
         const evaluation = evaluateMemoryWrite({
           key,
           value: nextValue,
@@ -169,14 +226,14 @@ export const createMemoryTool = ({
           validKeys,
           tokenLimit,
           keyLimits,
-          baselineTotalTokens: runningTotalTokens,
+          baselineTotalTokens: runtimeState.runningTotalTokens,
           previousTokenCount,
         });
         if (!evaluation.ok) {
           logger.warn(`Memory Agent failed to set memory for key "${key}": ${evaluation.message}`);
           return [
             evaluation.message ?? `Failed to set memory for key "${key}"`,
-            buildMemoryErrorArtifact(evaluation, runningTotalTokens),
+            buildMemoryErrorArtifact(evaluation, runtimeState.runningTotalTokens),
           ];
         }
 
@@ -192,8 +249,8 @@ export const createMemoryTool = ({
 
         const result = await setMemory({ userId, key, value: nextValue, tokenCount });
         if (result.ok) {
-          tokenCounts[key] = tokenCount;
-          runningTotalTokens += tokenDelta;
+          runtimeState.tokenCounts[key] = tokenCount;
+          runtimeState.runningTotalTokens += tokenDelta;
           logger.debug(`Memory set for key "${key}" (${tokenCount} tokens) for user "${userId}"`);
           return [`Memory set for key "${key}" (${tokenCount} tokens)`, artifact];
         }
@@ -238,11 +295,24 @@ const createDeleteMemoryTool = ({
   userId,
   deleteMemory,
   validKeys,
+  memoryTokenMap,
+  totalTokens = 0,
+  state,
 }: {
   userId: string | ObjectId;
   deleteMemory: MemoryMethods['deleteMemory'];
   validKeys?: string[];
+  memoryTokenMap?: Record<string, number>;
+  totalTokens?: number;
+  state?: MemoryRuntimeState;
 }) => {
+  const runtimeState =
+    state ??
+    createMemoryRuntimeState({
+      memoryTokenMap,
+      totalTokens,
+    });
+
   return tool(
     async ({ key }) => {
       try {
@@ -264,6 +334,12 @@ const createDeleteMemoryTool = ({
 
         const result = await deleteMemory({ userId, key });
         if (result.ok) {
+          const previousTokenCount = runtimeState.tokenCounts[key] ?? 0;
+          delete runtimeState.tokenCounts[key];
+          runtimeState.runningTotalTokens = Math.max(
+            0,
+            runtimeState.runningTotalTokens - previousTokenCount,
+          );
           logger.debug(`Memory deleted for key "${key}" for user "${userId}"`);
           return [`Memory deleted for key "${key}"`, artifact];
         }
@@ -291,6 +367,258 @@ const createDeleteMemoryTool = ({
     },
   );
 };
+
+const createNoopMemoryTool = () =>
+  tool(
+    async () => ['No durable memory update needed for this turn', undefined],
+    {
+      name: 'noop_memory',
+      description:
+        'Use this when the current chat does not require any durable memory changes. If the user explicitly asked you to remember, store, forget, delete, or update memory, do not use this tool.',
+      responseFormat: 'content_and_artifact',
+      schema: z.object({
+        reason: z
+          .string()
+          .optional()
+          .describe('Optional short reason why no durable memory update is needed.'),
+      }),
+    },
+  );
+
+export const createApplyMemoryChangesTool = ({
+  userId,
+  setMemory,
+  deleteMemory,
+  validKeys,
+  tokenLimit,
+  keyLimits,
+  memoryTokenMap,
+  totalTokens = 0,
+}: {
+  userId: string | ObjectId;
+  setMemory: MemoryMethods['setMemory'];
+  deleteMemory: MemoryMethods['deleteMemory'];
+  validKeys?: string[];
+  tokenLimit?: number;
+  keyLimits?: MemoryKeyLimits;
+  memoryTokenMap?: Record<string, number>;
+  totalTokens?: number;
+}) => {
+  const runtimeState = createMemoryRuntimeState({
+    memoryTokenMap,
+    totalTokens,
+  });
+  const setMemoryTool = createMemoryTool({
+    userId,
+    setMemory,
+    validKeys,
+    tokenLimit,
+    keyLimits,
+    state: runtimeState,
+  });
+  const deleteMemoryTool = createDeleteMemoryTool({
+    userId,
+    deleteMemory,
+    validKeys,
+    state: runtimeState,
+  });
+  const noopMemoryTool = createNoopMemoryTool();
+
+  return tool(
+    async ({ operations }) => {
+      const normalizedOperations = Array.isArray(operations) ? operations : [];
+      if (normalizedOperations.length === 0) {
+        return [
+          'At least one memory operation is required.',
+          buildGenericMemoryErrorArtifact(
+            'At least one memory operation is required.',
+            runtimeState.runningTotalTokens,
+          ),
+        ];
+      }
+
+      const summaries: string[] = [];
+      let primaryArtifact: Record<Tools.memory, MemoryArtifact> | undefined;
+
+      for (const operation of normalizedOperations) {
+        const action = operation?.action;
+        let result:
+          | [string, Record<Tools.memory, MemoryArtifact> | undefined]
+          | undefined;
+
+        if (action === 'set') {
+          if (
+            typeof operation?.key !== 'string' ||
+            operation.key.trim().length === 0 ||
+            typeof operation?.value !== 'string'
+          ) {
+            result = [
+              'Set operations require both key and value.',
+              buildGenericMemoryErrorArtifact(
+                'Set operations require both key and value.',
+                runtimeState.runningTotalTokens,
+                {
+                  action,
+                },
+              ),
+            ];
+          } else {
+            result = (await setMemoryTool.func({
+              key: operation.key,
+              value: operation.value,
+            })) as [string, Record<Tools.memory, MemoryArtifact> | undefined];
+          }
+        } else if (action === 'delete') {
+          if (typeof operation?.key !== 'string' || operation.key.trim().length === 0) {
+            result = [
+              'Delete operations require a key.',
+              buildGenericMemoryErrorArtifact(
+                'Delete operations require a key.',
+                runtimeState.runningTotalTokens,
+                {
+                  action,
+                },
+              ),
+            ];
+          } else {
+            result = (await deleteMemoryTool.func({
+              key: operation.key,
+            })) as [string, Record<Tools.memory, MemoryArtifact> | undefined];
+          }
+        } else if (action === 'noop') {
+          result = (await noopMemoryTool.func({
+            reason: operation?.reason,
+          })) as [string, Record<Tools.memory, MemoryArtifact> | undefined];
+        } else {
+          result = [
+            `Unsupported memory action "${String(action ?? '')}"`,
+            buildGenericMemoryErrorArtifact(
+              `Unsupported memory action "${String(action ?? '')}"`,
+              runtimeState.runningTotalTokens,
+            ),
+          ];
+        }
+
+        if (!result) {
+          continue;
+        }
+
+        if (result[0]) {
+          summaries.push(result[0]);
+        }
+
+        if (primaryArtifact == null && result[1] != null) {
+          primaryArtifact = result[1];
+        }
+      }
+
+      return [
+        summaries.filter(Boolean).join('\n') || 'No durable memory update needed for this turn',
+        primaryArtifact,
+      ];
+    },
+    {
+      name: MEMORY_DECISION_TOOL_NAME,
+      description:
+        'Apply one or more durable memory operations for the user. Call this exactly once per memory run, using set, delete, or noop operations.',
+      responseFormat: 'content_and_artifact',
+      schema: z.object({
+        operations: z
+          .array(
+            z.object({
+              action: z.enum(['set', 'delete', 'noop']),
+              key: z
+                .string()
+                .optional()
+                .describe(
+                  validKeys && validKeys.length > 0
+                    ? `The memory key. Must be one of: ${validKeys.join(', ')}`
+                    : 'The memory key to modify',
+                ),
+              value: z
+                .string()
+                .optional()
+                .describe(
+                  'For set operations, the full memory value to store for this key. May be multi-line.',
+                ),
+              reason: z
+                .string()
+                .optional()
+                .describe('Optional short reason for noop operations.'),
+            }),
+          )
+          .min(1)
+          .describe('Ordered durable memory operations for this turn.'),
+      }),
+    },
+  );
+};
+
+const resolveMemoryToolChoice = (
+  provider?: string,
+): string | undefined => {
+  const normalized = String(provider ?? '').trim().toLowerCase();
+
+  switch (normalized) {
+    case 'openai':
+    case 'azureopenai':
+    case 'anthropic':
+    case 'google':
+    case 'vertexai':
+      return MEMORY_DECISION_TOOL_NAME;
+    default:
+      return undefined;
+  }
+};
+
+const preserveForcedToolChoice = ({
+  provider,
+  llmConfig,
+  toolChoice,
+}: {
+  provider?: string;
+  llmConfig: ClientOptions;
+  toolChoice: string;
+}): void => {
+  const normalized = String(provider ?? '').trim().toLowerCase();
+
+  if (normalized === 'openai' || normalized === 'azureopenai') {
+    const openAIConfig = llmConfig as OpenAIClientOptions;
+    const usesResponsesApi =
+      openAIConfig.useResponsesApi === true ||
+      /\bgpt-[5-9](?:\.\d+)?\b/i.test(String(openAIConfig.model ?? ''));
+    const preservedToolChoice = usesResponsesApi
+      ? {
+          type: 'function',
+          name: toolChoice,
+        }
+      : {
+          type: 'function',
+          function: {
+            name: toolChoice,
+          },
+        };
+    openAIConfig.modelKwargs = {
+      ...(openAIConfig.modelKwargs ?? {}),
+      tool_choice: preservedToolChoice,
+    };
+    return;
+  }
+
+  if (normalized === 'anthropic') {
+    const anthropicConfig = llmConfig as {
+      invocationKwargs?: Record<string, unknown>;
+    };
+    anthropicConfig.invocationKwargs = {
+      ...(anthropicConfig.invocationKwargs ?? {}),
+      tool_choice: {
+        type: 'tool',
+        name: toolChoice,
+      },
+    };
+  }
+};
+
 export class BasicToolEndHandler implements EventHandler {
   private callback?: ToolEndCallback;
   constructor(callback?: ToolEndCallback) {
@@ -367,6 +695,19 @@ export async function processMemory({
       userId,
       validKeys,
       deleteMemory,
+      memoryTokenMap,
+      totalTokens,
+    });
+    const noopMemoryTool = createNoopMemoryTool();
+    const applyMemoryChangesTool = createApplyMemoryChangesTool({
+      userId,
+      setMemory,
+      deleteMemory,
+      validKeys,
+      tokenLimit,
+      keyLimits: resolvedKeyLimits,
+      memoryTokenMap,
+      totalTokens,
     });
 
     const currentMemoryTokens = totalTokens;
@@ -413,6 +754,18 @@ ${memory ?? 'No existing memories'}`;
       streaming: false,
       disableStreaming: true,
     };
+
+    const memoryProvider =
+      (finalLLMConfig as Partial<LLMConfig>).provider ?? llmConfig?.provider;
+    const toolChoice = resolveMemoryToolChoice(memoryProvider);
+    if (toolChoice != null) {
+      (finalLLMConfig as Record<string, unknown>).tool_choice = toolChoice;
+      preserveForcedToolChoice({
+        provider: memoryProvider,
+        llmConfig: finalLLMConfig,
+        toolChoice,
+      });
+    }
 
     // Handle GPT-5+ models
     if ('model' in finalLLMConfig && /\bgpt-[5-9](?:\.\d+)?\b/i.test(finalLLMConfig.model ?? '')) {
@@ -512,7 +865,7 @@ ${memory ?? 'No existing memories'}`;
       graphConfig: {
         type: 'standard',
         llmConfig: finalLLMConfig,
-        tools: [memoryTool, deleteMemoryTool],
+        tools: [applyMemoryChangesTool, memoryTool, deleteMemoryTool, noopMemoryTool],
         instructions: graphInstructions,
         additional_instructions: graphAdditionalInstructions,
         toolEnd: true,
@@ -550,12 +903,14 @@ ${memory ?? 'No existing memories'}`;
     return await Promise.all(artifactPromises);
   } catch (error) {
     const typedError = error as { message?: string; code?: string; type?: string } | undefined;
+    const configuredModel =
+      llmConfig != null && 'model' in llmConfig ? (llmConfig.model as string | undefined) : undefined;
     logger.error(
       `[MemoryAgent] Failed to process memory | userId: ${userId} | conversationId: ${conversationId} | messageId: ${messageId}`,
       {
         error,
         provider: llmConfig?.provider,
-        model: llmConfig?.model,
+        model: configuredModel,
         errorMessage: typedError?.message,
         errorCode: typedError?.code,
         errorType: typedError?.type,
@@ -634,7 +989,12 @@ export async function createMemoryProcessor({
   snapshot?: MemorySnapshot;
 }): Promise<[string, (messages: BaseMessage[]) => Promise<(TAttachment | null)[] | undefined>]> {
   const { validKeys, instructions, llmConfig, tokenLimit, keyLimits } = config;
-  const finalInstructions = instructions || getDefaultInstructions(validKeys, tokenLimit);
+  const finalInstructions = [
+    instructions || getDefaultInstructions(validKeys, tokenLimit),
+    getMemoryToolProtocolInstructions(),
+  ]
+    .filter(Boolean)
+    .join('\n\n');
   const preparedSnapshot =
     snapshot ??
     (await loadMemorySnapshot({

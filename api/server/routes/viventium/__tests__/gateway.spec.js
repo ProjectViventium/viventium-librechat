@@ -31,6 +31,8 @@ let mockTelegramMappingUpdateOne;
 let mockFileAccess;
 let mockGetStrategyFunctions;
 let mockLoadAuthValues;
+let mockFilterFile;
+let mockProcessAgentFileUpload;
 
 jest.mock(
   '@librechat/data-schemas',
@@ -98,6 +100,11 @@ jest.mock('~/server/services/Files/strategies', () => ({
 
 jest.mock('~/server/services/Tools/credentials', () => ({
   loadAuthValues: (...args) => mockLoadAuthValues(...args),
+}));
+
+jest.mock('~/server/services/Files/process', () => ({
+  filterFile: (...args) => mockFilterFile(...args),
+  processAgentFileUpload: (...args) => mockProcessAgentFileUpload(...args),
 }));
 
 jest.mock('~/server/utils/files', () => ({
@@ -360,6 +367,18 @@ describe('/api/viventium/gateway', () => {
       getDownloadStream: jest.fn().mockResolvedValue(Readable.from([Buffer.from('file-bytes')])),
     });
     mockLoadAuthValues = jest.fn().mockResolvedValue({ CODE_API_KEY: 'code-key' });
+    mockFilterFile = jest.fn();
+    mockProcessAgentFileUpload = jest.fn(async ({ req, res, metadata }) => {
+      res.status(200).json({
+        message: 'Agent file uploaded and processed successfully',
+        file_id: metadata.file_id,
+        temp_file_id: metadata.temp_file_id,
+        filename: req.file?.originalname ?? 'attachment.bin',
+        filepath: '/uploads/mock/attachment.bin',
+        type: req.file?.mimetype ?? 'application/octet-stream',
+        source: 'local',
+      });
+    });
 
     process.env.VIVENTIUM_GATEWAY_SECRET = 'gateway_secret';
     process.env.VIVENTIUM_GATEWAY_REQUIRE_SIGNATURE = 'true';
@@ -572,6 +591,46 @@ describe('/api/viventium/gateway', () => {
 
     expect(res.statusCode).toBe(200);
     expect(lastParentMessageId).toBe('assistant-leaf');
+  });
+
+  test('POST fails closed when an attachment cannot be processed into raw provider upload or readable context', async () => {
+    const gatewayRouter = require('../gateway');
+    const app = createTestApp(gatewayRouter);
+    mockProcessAgentFileUpload.mockRejectedValueOnce(
+      new Error(
+        `Unsupported message attachment type application/zip. This file can't be sent provider-natively or extracted as readable text on this surface.`,
+      ),
+    );
+    const body = {
+      text: 'review this',
+      conversationId: 'new',
+      channel: 'discord',
+      accountId: 'acct-1',
+      externalUserId: 'ext-1',
+      attachments: [
+        {
+          filename: 'archive.zip',
+          mime_type: 'application/zip',
+          data: Buffer.from('zip-bytes').toString('base64'),
+        },
+      ],
+    };
+    const headers = signedGatewayHeaders({
+      secret: 'gateway_secret',
+      method: 'POST',
+      path: '/api/viventium/gateway/chat',
+      body,
+    });
+    const req = createMockReq({
+      url: '/api/viventium/gateway/chat',
+      headers,
+      body,
+    });
+    const res = createMockRes();
+
+    await expect(dispatch(app, req, res)).rejects.toThrow(
+      /Gateway attachment upload failed for "archive\.zip"/,
+    );
   });
 
   test('POST new convo persists iconURL spec parity', async () => {

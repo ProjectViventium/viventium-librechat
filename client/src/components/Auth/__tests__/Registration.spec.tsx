@@ -1,5 +1,6 @@
 import reactRouter from 'react-router-dom';
 import userEvent from '@testing-library/user-event';
+import { act } from 'react';
 import { render, waitFor, screen } from 'test/layout-test-utils';
 import * as mockDataProvider from 'librechat-data-provider/react-query';
 import type { TStartupConfig } from 'librechat-data-provider';
@@ -203,29 +204,138 @@ test('shows validation error messages', async () => {
 });
 
 test('shows error message when registration fails', async () => {
-  const mutate = jest.fn();
-  const { getByTestId, getByRole } = setup({
-    useRegisterUserMutationReturnValue: {
-      isLoading: false,
-      isError: true,
-      mutate,
-      error: new Error('Registration failed'),
-      data: {},
-      isSuccess: false,
-    },
-  });
+  const useRegisterSpy = jest
+    .spyOn(mockDataProvider, 'useRegisterUserMutation')
+    .mockImplementation((options?: Parameters<typeof mockDataProvider.useRegisterUserMutation>[0]) => {
+      const mutate = jest.fn(() =>
+        options?.onError?.({
+          response: {
+            data: {
+              message: 'Registration failed',
+            },
+          },
+        }),
+      );
 
-  await userEvent.type(getByRole('textbox', { name: /Full name/i }), 'John Doe');
-  await userEvent.type(getByRole('textbox', { name: /Username/i }), 'johndoe');
-  await userEvent.type(getByRole('textbox', { name: /Email/i }), 'test@test.com');
-  await userEvent.type(getByTestId('password'), 'password');
-  await userEvent.type(getByTestId('confirm_password'), 'password');
-  await userEvent.click(getByRole('button', { name: /Submit registration/i }));
+      return {
+        isLoading: false,
+        isError: true,
+        mutate,
+        error: new Error('Registration failed'),
+        data: {},
+        isSuccess: false,
+      } as ReturnType<typeof mockDataProvider.useRegisterUserMutation>;
+    });
 
-  waitFor(() => {
-    expect(screen.getByTestId('registration-error')).toBeInTheDocument();
-    expect(screen.getByTestId('registration-error')).toHaveTextContent(
-      /There was an error attempting to register your account. Please try again. Registration failed/i,
+  try {
+    render(
+      <AuthLayout
+        startupConfig={mockStartupConfig.data as TStartupConfig}
+        isFetching={false}
+        error={null}
+        startupConfigError={null}
+        header={'Create your account'}
+        pathname="register"
+      >
+        <Registration />
+      </AuthLayout>,
     );
-  });
+
+    await userEvent.type(screen.getByRole('textbox', { name: /Full name/i }), 'John Doe');
+    await userEvent.type(screen.getByRole('textbox', { name: /Username/i }), 'johndoe');
+    await userEvent.type(screen.getByRole('textbox', { name: /Email/i }), 'test@test.com');
+    await userEvent.type(screen.getByTestId('password'), 'password');
+    await userEvent.type(screen.getByTestId('confirm_password'), 'password');
+    await userEvent.click(screen.getByRole('button', { name: /Submit registration/i }));
+
+    await waitFor(() => {
+      const alert = screen
+        .getByText(/There was an error attempting to register your account\. Please try again\./i)
+        .closest('[role=\"alert\"]');
+      expect(alert).toBeInTheDocument();
+      expect(alert).toHaveTextContent(
+        /There was an error attempting to register your account. Please try again. Registration failed/i,
+      );
+    });
+  } finally {
+    useRegisterSpy.mockRestore();
+  }
+});
+
+test('redirects after successful registration countdown without render-time router updates', async () => {
+  jest.useFakeTimers();
+
+  const navigate = jest.fn();
+  jest.spyOn(reactRouter, 'useNavigate').mockReturnValue(navigate);
+
+  const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+  const useRegisterSpy = jest
+    .spyOn(mockDataProvider, 'useRegisterUserMutation')
+    .mockImplementation((options?: Parameters<typeof mockDataProvider.useRegisterUserMutation>[0]) => {
+      const mutate = jest.fn(() => options?.onSuccess?.());
+      return {
+        isLoading: false,
+        isError: false,
+        mutate,
+        data: {},
+        isSuccess: false,
+        error: null,
+      } as ReturnType<typeof mockDataProvider.useRegisterUserMutation>;
+    });
+
+  try {
+    const user = userEvent.setup({ advanceTimers: jest.advanceTimersByTime });
+    render(
+      <AuthLayout
+        startupConfig={mockStartupConfig.data as TStartupConfig}
+        isFetching={false}
+        error={null}
+        startupConfigError={null}
+        header={'Create your account'}
+        pathname="register"
+      >
+        <Registration />
+      </AuthLayout>,
+    );
+
+    await user.type(screen.getByRole('textbox', { name: /Full name/i }), 'Remote QA User');
+    await user.type(screen.getByRole('textbox', { name: /Username/i }), 'remote-qa-user');
+    await user.type(screen.getByRole('textbox', { name: /Email/i }), 'remote.qa.user@example.com');
+    await user.type(screen.getByTestId('password'), 'ViventiumQA!234');
+    await user.type(screen.getByTestId('confirm_password'), 'ViventiumQA!234');
+    await user.click(screen.getByRole('button', { name: /Submit registration/i }));
+
+    await waitFor(() =>
+      expect(screen.getByText(/Redirecting in 3 seconds/i)).toBeInTheDocument(),
+    );
+
+    act(() => {
+      jest.advanceTimersByTime(1000);
+    });
+    await waitFor(() =>
+      expect(screen.getByText(/Redirecting in 2 seconds/i)).toBeInTheDocument(),
+    );
+
+    act(() => {
+      jest.advanceTimersByTime(1000);
+    });
+    await waitFor(() =>
+      expect(screen.getByText(/Redirecting in 1 seconds/i)).toBeInTheDocument(),
+    );
+
+    act(() => {
+      jest.advanceTimersByTime(1000);
+    });
+
+    await waitFor(() => expect(navigate).toHaveBeenCalledWith('/c/new', { replace: true }));
+    expect(
+      consoleErrorSpy.mock.calls.some((call) =>
+        call.some((arg) => String(arg).includes('Cannot update a component')),
+      ),
+    ).toBe(false);
+  } finally {
+    useRegisterSpy.mockRestore();
+    consoleErrorSpy.mockRestore();
+    jest.useRealTimers();
+  }
 });

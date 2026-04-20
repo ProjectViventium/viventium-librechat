@@ -381,6 +381,88 @@ describe('Memory Agent Header Resolution', () => {
     expect(runConfig.graphConfig.additional_instructions).toBeDefined();
   });
 
+  it('should force the unified memory decision tool for OpenAI memory runs', async () => {
+    const llmConfig = {
+      provider: Providers.OPENAI,
+      model: 'gpt-5.4',
+    };
+
+    await processMemory({
+      res: mockRes,
+      userId: 'user-123',
+      setMemory: mockMemoryMethods.setMemory,
+      deleteMemory: mockMemoryMethods.deleteMemory,
+      messages: [],
+      memory: 'existing memory',
+      messageId: 'msg-123',
+      conversationId: 'conv-123',
+      validKeys: ['preferences'],
+      instructions: 'test instructions',
+      llmConfig,
+      user: testUser,
+    });
+
+    const runConfig = (Run.create as jest.Mock).mock.calls[0][0];
+    expect(runConfig.graphConfig.llmConfig.tool_choice).toBe('apply_memory_changes');
+    expect(runConfig.graphConfig.llmConfig.modelKwargs).toEqual(
+      expect.objectContaining({
+        tool_choice: {
+          type: 'function',
+          name: 'apply_memory_changes',
+        },
+      }),
+    );
+    expect(runConfig.graphConfig.tools.map((tool: { name: string }) => tool.name)).toEqual(
+      expect.arrayContaining([
+        'apply_memory_changes',
+        'set_memory',
+        'delete_memory',
+        'noop_memory',
+      ]),
+    );
+  });
+
+  it('should force the unified memory decision tool for Anthropic memory runs', async () => {
+    const llmConfig = {
+      provider: Providers.ANTHROPIC,
+      model: 'claude-sonnet-4-6',
+    };
+
+    await processMemory({
+      res: mockRes,
+      userId: 'user-123',
+      setMemory: mockMemoryMethods.setMemory,
+      deleteMemory: mockMemoryMethods.deleteMemory,
+      messages: [],
+      memory: 'existing memory',
+      messageId: 'msg-123',
+      conversationId: 'conv-123',
+      validKeys: ['preferences'],
+      instructions: 'test instructions',
+      llmConfig,
+      user: testUser,
+    });
+
+    const runConfig = (Run.create as jest.Mock).mock.calls[0][0];
+    expect(runConfig.graphConfig.llmConfig.tool_choice).toBe('apply_memory_changes');
+    expect(runConfig.graphConfig.llmConfig.invocationKwargs).toEqual(
+      expect.objectContaining({
+        tool_choice: {
+          type: 'tool',
+          name: 'apply_memory_changes',
+        },
+      }),
+    );
+    expect(runConfig.graphConfig.tools.map((tool: { name: string }) => tool.name)).toEqual(
+      expect.arrayContaining([
+        'apply_memory_changes',
+        'set_memory',
+        'delete_memory',
+        'noop_memory',
+      ]),
+    );
+  });
+
   it('should set temperature to 1 for Bedrock with thinking enabled', async () => {
     const llmConfig = {
       provider: Providers.BEDROCK,

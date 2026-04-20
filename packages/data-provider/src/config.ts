@@ -1590,6 +1590,10 @@ export enum ErrorTypes {
    */
   NO_USER_KEY = 'no_user_key',
   /**
+   * Connected account is required but missing.
+   */
+  CONNECTED_ACCOUNT_REQUIRED = 'connected_account_required',
+  /**
    * Expired User-provided Key.
    */
   EXPIRED_USER_KEY = 'expired_user_key',

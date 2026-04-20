@@ -573,6 +573,9 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
     if (normalized === 'ms-365' && isFalse(process.env.START_MS365_MCP)) {
       return true;
     }
+    if (normalized === 'glasshive-workers-projects' && isFalse(process.env.START_GLASSHIVE)) {
+      return true;
+    }
     return false;
   };
   // === VIVENTIUM END ===

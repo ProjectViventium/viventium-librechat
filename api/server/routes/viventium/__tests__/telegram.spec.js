@@ -31,6 +31,8 @@ let mockFileAccess;
 let mockGetStrategyFunctions;
 let mockLoadAuthValues;
 let mockCreateCallSession;
+let mockFilterFile;
+let mockProcessAgentFileUpload;
 
 jest.mock(
   '@librechat/data-schemas',
@@ -99,6 +101,11 @@ jest.mock('~/server/services/Files/strategies', () => ({
 
 jest.mock('~/server/services/Tools/credentials', () => ({
   loadAuthValues: (...args) => mockLoadAuthValues(...args),
+}));
+
+jest.mock('~/server/services/Files/process', () => ({
+  filterFile: (...args) => mockFilterFile(...args),
+  processAgentFileUpload: (...args) => mockProcessAgentFileUpload(...args),
 }));
 
 jest.mock('~/server/utils/files', () => ({
@@ -315,6 +322,18 @@ describe('/api/viventium/telegram', () => {
       getDownloadStream: jest.fn().mockResolvedValue(Readable.from([Buffer.from('file-bytes')])),
     });
     mockLoadAuthValues = jest.fn().mockResolvedValue({ CODE_API_KEY: 'code-key' });
+    mockFilterFile = jest.fn();
+    mockProcessAgentFileUpload = jest.fn(async ({ req, res, metadata }) => {
+      res.status(200).json({
+        message: 'Agent file uploaded and processed successfully',
+        file_id: metadata.file_id,
+        temp_file_id: metadata.temp_file_id,
+        filename: req.file?.originalname ?? 'attachment.bin',
+        filepath: '/uploads/mock/attachment.bin',
+        type: req.file?.mimetype ?? 'application/octet-stream',
+        source: 'local',
+      });
+    });
     mockCreateCallSession = jest.fn(async ({ userId, agentId, conversationId }) => ({
       callSessionId: 'call_session_test',
       userId,
@@ -483,6 +502,37 @@ describe('/api/viventium/telegram', () => {
 
     expect(res.statusCode).toBe(200);
     expect(lastParentMessageId).toBe('assistant-leaf');
+  });
+
+  test('POST fails closed when a Telegram attachment cannot be processed into raw provider upload or readable context', async () => {
+    const telegramRouter = require('../telegram');
+    const app = createTestApp(telegramRouter);
+    mockProcessAgentFileUpload.mockRejectedValueOnce(
+      new Error(
+        `Unsupported message attachment type application/zip. This file can't be sent provider-natively or extracted as readable text on this surface.`,
+      ),
+    );
+    const req = createMockReq({
+      url: '/api/viventium/telegram/chat',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      body: {
+        text: 'review this',
+        conversationId: 'new',
+        telegramUserId: 'tg-1',
+        files: [
+          {
+            filename: 'archive.zip',
+            mime_type: 'application/zip',
+            data: Buffer.from('zip-bytes').toString('base64'),
+          },
+        ],
+      },
+    });
+    const res = createMockRes();
+
+    await expect(dispatch(app, req, res)).rejects.toThrow(
+      /Telegram attachment upload failed for "archive\.zip"/,
+    );
   });
 
   test('POST stale existing convo resets to new for Telegram hidden conversation reuse', async () => {
@@ -847,6 +897,49 @@ describe('/api/viventium/telegram', () => {
     expect(res.body.canonicalText).toBe(
       'I read the doc. Short version: the profile is more plausibly O-1A than O-1B if the achievements are framed around business impact and measurable recognition.',
     );
+  });
+
+  test('GET cortex resolves configured hold text to clear deferred error when only low-signal insight exists', async () => {
+    const telegramRouter = require('../telegram');
+    const app = createTestApp(telegramRouter);
+
+    mockGetMessage.mockResolvedValueOnce({
+      messageId: 'msg-3',
+      conversationId: 'conv-1',
+      model: 'agent_main',
+      text: '',
+      unfinished: false,
+      content: [
+        { type: 'text', text: "I'm here. Shoot." },
+        {
+          type: 'cortex_insight',
+          status: 'complete',
+          cortex_name: 'Pattern Recognition',
+          insight: 'Go ahead.',
+        },
+      ],
+    });
+    mockGetMessages.mockResolvedValueOnce([]);
+    mockGetAgent.mockResolvedValueOnce({
+      instructions: `
+Holding Examples
+- "I'm here. Shoot."
+`,
+    });
+
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/telegram/cortex/msg-3?conversationId=conv-1',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      query: { conversationId: 'conv-1', telegramUserId: 'tg-1' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body.followUp).toBeNull();
+    expect(res.body.canonicalText).toBe("I couldn't finish that check just now.");
   });
 
   test('GET files/download streams file bytes (telegram-auth)', async () => {

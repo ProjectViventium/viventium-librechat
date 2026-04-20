@@ -7,16 +7,14 @@ import {
   request,
   Constants,
   QueryKeys,
-  ErrorTypes,
   apiBaseUrl,
   createPayload,
-  ViolationTypes,
   LocalStorageKeys,
   removeNullishValues,
 } from 'librechat-data-provider';
 import type { TMessage, TPayload, TSubmission, EventSubmission } from 'librechat-data-provider';
 import type { EventHandlerParams } from './useEventHandlers';
-import { useGetStartupConfig, useGetUserBalance, queueTitleGeneration } from '~/data-provider';
+import { useGetStartupConfig, useGetUserBalance } from '~/data-provider';
 import type { ActiveJobsResponse } from '~/data-provider';
 import { useAuthContext } from '~/hooks/AuthContext';
 import useEventHandlers from './useEventHandlers';
@@ -425,7 +423,7 @@ export default function useResumableSSE(
       /**
        * Error event handler - handles BOTH:
        * 1. HTTP-level errors (responseCode present) - 404, 401, network failures
-       * 2. Server-sent error events (event: error with data) - known errors like ViolationTypes/ErrorTypes
+       * 2. Server-sent error events (event: error with data) - user-facing structured errors
        *
        * Order matters: check responseCode first since HTTP errors may also include data
        */
@@ -468,7 +466,7 @@ export default function useResumableSSE(
 
         /**
          * Server-sent error event (event: error with data) - no responseCode.
-         * These are known errors (ErrorTypes, ViolationTypes) that should be displayed to user.
+         * These are structured server errors that should be displayed to the user.
          * Only check e.data if there's no HTTP responseCode, since HTTP errors may also have body data.
          */
         if (!responseCode && e.data) {
@@ -479,24 +477,7 @@ export default function useResumableSSE(
           try {
             const errorData = JSON.parse(e.data);
             const errorString = errorData.error ?? errorData.message ?? JSON.stringify(errorData);
-
-            // Check if it's a known error type (ViolationTypes or ErrorTypes)
-            let isKnownError = false;
-            try {
-              const parsed =
-                typeof errorString === 'string' ? JSON.parse(errorString) : errorString;
-              const errorType = parsed?.type ?? parsed?.code;
-              if (errorType) {
-                const violationValues = Object.values(ViolationTypes) as string[];
-                const errorTypeValues = Object.values(ErrorTypes) as string[];
-                isKnownError =
-                  violationValues.includes(errorType) || errorTypeValues.includes(errorType);
-              }
-            } catch {
-              // Not JSON or parsing failed - treat as generic error
-            }
-
-            console.log('[ResumableSSE] Error type check:', { isKnownError, errorString });
+            console.log('[ResumableSSE] Parsed server error:', { errorString });
 
             // Display the error to user via errorHandler
             errorHandler({
@@ -747,11 +728,6 @@ export default function useResumableSSE(
           setStreamId(newStreamId);
           // Optimistically add to active jobs
           addActiveJob(newStreamId);
-          // Queue title generation if this is a new conversation (first message)
-          const isNewConvo = submission.userMessage?.parentMessageId === Constants.NO_PARENT;
-          if (isNewConvo) {
-            queueTitleGeneration(newStreamId);
-          }
           subscribeToStream(newStreamId, submission);
         } else {
           console.error('[ResumableSSE] Failed to get streamId from startGeneration');

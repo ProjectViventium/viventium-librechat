@@ -699,6 +699,55 @@ describe('getOpenAIConfig', () => {
     }
   });
 
+  it('should lift Codex system and developer messages into top-level instructions', async () => {
+    const originalFetch = globalThis.fetch;
+    const mockFetch = jest.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      return new Response(JSON.stringify({ ok: true, echoed: init?.body ?? null }), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+        },
+      });
+    });
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+
+    try {
+      const result = getOpenAIConfig(mockApiKey, {
+        reverseProxyUrl: 'https://chatgpt.com/backend-api/codex',
+      });
+
+      const wrappedFetch = result.configOptions?.fetch;
+      expect(wrappedFetch).toBeDefined();
+
+      await wrappedFetch?.('https://chatgpt.com/backend-api/codex/responses', {
+        method: 'POST',
+        body: JSON.stringify({
+          model: 'gpt-5.2',
+          input: [
+            { type: 'message', role: 'system', content: 'System instruction' },
+            {
+              type: 'message',
+              role: 'developer',
+              content: [{ type: 'input_text', text: 'Developer instruction' }],
+            },
+            { type: 'message', role: 'user', content: 'hello' },
+          ],
+          stream: false,
+        }),
+      });
+
+      const sentInit = mockFetch.mock.calls[0]?.[1] as RequestInit;
+      const sentPayload = JSON.parse(String(sentInit.body));
+      expect(sentPayload.instructions).toBe('System instruction\n\nDeveloper instruction');
+      expect(sentPayload.input).toEqual([{ type: 'message', role: 'user', content: 'hello' }]);
+      expect(sentPayload.include).toEqual(['reasoning.encrypted_content']);
+      expect(sentPayload.store).toBe(false);
+      expect(sentPayload.stream).toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it('should normalize Codex continuation payloads into stateless follow-up requests', async () => {
     const originalFetch = globalThis.fetch;
     const mockFetch = jest.fn(async (_input: string | URL | Request, init?: RequestInit) => {
@@ -823,6 +872,70 @@ describe('getOpenAIConfig', () => {
         object: 'response',
         status: 'completed',
       });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('should reconstruct Codex function-call output items from SSE events for non-stream requests', async () => {
+    const originalFetch = globalThis.fetch;
+    const ssePayload = [
+      'event: response.created',
+      'data: {"type":"response.created","response":{"id":"resp_tool","object":"response","status":"in_progress"}}',
+      '',
+      'event: response.output_item.added',
+      'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"apply_memory_changes","arguments":"","status":"in_progress"}}',
+      '',
+      'event: response.function_call_arguments.done',
+      'data: {"type":"response.function_call_arguments.done","item_id":"fc_1","output_index":0,"call_id":"call_1","arguments":"{\\"operations\\":[{\\"action\\":\\"set\\",\\"key\\":\\"preferences\\",\\"value\\":\\"lucky number: 227\\"}]}" }',
+      '',
+      'event: response.output_item.done',
+      'data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"apply_memory_changes","arguments":"","status":"completed"}}',
+      '',
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"id":"resp_tool","object":"response","status":"completed","output":[]}}',
+      '',
+    ].join('\n');
+    const mockFetch = jest.fn(async () => {
+      return new Response(ssePayload, {
+        status: 200,
+        headers: {
+          'content-type': 'text/event-stream',
+        },
+      });
+    });
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+
+    try {
+      const result = getOpenAIConfig(mockApiKey, {
+        reverseProxyUrl: 'https://chatgpt.com/backend-api/codex',
+      });
+
+      const wrappedFetch = result.configOptions?.fetch;
+      expect(wrappedFetch).toBeDefined();
+
+      const response = await wrappedFetch?.('https://chatgpt.com/backend-api/codex/responses', {
+        method: 'POST',
+        body: JSON.stringify({
+          model: 'gpt-5.2',
+          input: [{ type: 'message', role: 'user', content: 'remember this' }],
+          stream: false,
+        }),
+      });
+
+      expect(response?.ok).toBe(true);
+      const parsed = await response?.json();
+      expect(parsed?.output).toEqual([
+        {
+          type: 'function_call',
+          id: 'fc_1',
+          call_id: 'call_1',
+          name: 'apply_memory_changes',
+          arguments:
+            '{"operations":[{"action":"set","key":"preferences","value":"lucky number: 227"}]}',
+          status: 'completed',
+        },
+      ]);
     } finally {
       globalThis.fetch = originalFetch;
     }

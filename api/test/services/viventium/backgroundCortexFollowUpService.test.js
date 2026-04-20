@@ -324,10 +324,10 @@ describe('BackgroundCortexFollowUpService', () => {
 
   test('formatFollowUpText skips empty insight strings', () => {
     const text = formatFollowUpText({
-      insights: [{ insight: '  ' }, { insight: 'Kept' }],
+      insights: [{ insight: '  ' }, { insight: 'Kept: file is attached.' }],
       hasErrors: false,
     });
-    expect(text).toBe('Kept');
+    expect(text).toBe('Kept: file is attached.');
   });
 
   test('getPreferredFallbackInsightText prioritizes tool and research cortices for deferred fallback', () => {

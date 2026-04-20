@@ -349,7 +349,7 @@ function formatGatewayImagesForVision(attachments) {
     .filter(Boolean);
 }
 
-async function uploadGatewayFiles({ req, attachments }) {
+async function uploadGatewayFiles({ req, attachments, agentId }) {
   if (!GATEWAY_FILE_UPLOAD_ENABLED) {
     return [];
   }
@@ -416,10 +416,15 @@ async function uploadGatewayFiles({ req, attachments }) {
       destination: tempDir,
     };
 
+    /* === VIVENTIUM START ===
+     * Feature: Bridge attachment parity with native agent uploads.
+     * Purpose: Preserve the active agent context when resolving provider-native vs context uploads.
+     * === VIVENTIUM END === */
     const metadata = {
       file_id: fileId,
       temp_file_id: fileId,
       message_file: true,
+      agent_id: agentId,
     };
 
     try {
@@ -429,6 +434,7 @@ async function uploadGatewayFiles({ req, attachments }) {
       req.body = {
         endpoint: 'agents',
         endpointType: 'agents',
+        agent_id: agentId,
         file_id: fileId,
         model,
       };
@@ -454,6 +460,11 @@ async function uploadGatewayFiles({ req, attachments }) {
       }
     } catch (err) {
       logger.error('[VIVENTIUM][gateway/chat] Attachment upload failed:', err);
+      const reason =
+        typeof err?.message === 'string' && err.message.trim().length > 0
+          ? err.message.trim()
+          : 'Attachment processing failed';
+      throw new Error(`Gateway attachment upload failed for "${safeName}": ${reason}`);
     } finally {
       req.file = originalFile;
       req.body = originalBody;
@@ -780,7 +791,7 @@ router.post(
 
     const uploadedFiles =
       GATEWAY_FILE_UPLOAD_ENABLED && nonImageAttachments.length > 0
-        ? await uploadGatewayFiles({ req, attachments: nonImageAttachments })
+        ? await uploadGatewayFiles({ req, attachments: nonImageAttachments, agentId })
         : [];
 
     const { attachments: _ignoredAttachments, files: _ignoredFiles, ...safeIncoming } = incoming;

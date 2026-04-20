@@ -36,6 +36,16 @@ const isInvalidUserKeyError = (error: unknown): boolean => {
   }
 };
 
+const isConnectedAccountAuthMode = (): boolean => {
+  const values = [
+    process.env.VIVENTIUM_ANTHROPIC_AUTH_MODE,
+    process.env.VIVENTIUM_PRIMARY_AUTH_MODE,
+    process.env.VIVENTIUM_SECONDARY_AUTH_MODE,
+  ];
+
+  return values.some((value) => value?.trim().toLowerCase() === 'connected_account');
+};
+
 /**
  * Initializes Anthropic endpoint configuration.
  * Supports both direct API key authentication and Google Cloud Vertex AI.
@@ -121,7 +131,10 @@ export async function initializeAnthropic({
       if (isUserProvided) {
         throw new Error(
           JSON.stringify({
-            type: ErrorTypes.NO_USER_KEY,
+            type: isConnectedAccountAuthMode()
+              ? ErrorTypes.CONNECTED_ACCOUNT_REQUIRED
+              : ErrorTypes.NO_USER_KEY,
+            info: EModelEndpoint.anthropic,
           }),
         );
       }

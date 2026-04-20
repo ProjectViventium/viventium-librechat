@@ -2,7 +2,7 @@ import { Response } from 'express';
 import { Providers } from '@librechat/agents';
 import { Tools } from 'librechat-data-provider';
 import type { MemoryArtifact } from 'librechat-data-provider';
-import { createMemoryTool, processMemory } from '../memory';
+import { createApplyMemoryChangesTool, createMemoryTool, processMemory } from '../memory';
 
 // Mock the logger
 jest.mock('winston', () => ({
@@ -411,6 +411,53 @@ describe('createMemoryTool', () => {
   });
 });
 
+describe('createApplyMemoryChangesTool', () => {
+  let mockSetMemory: jest.Mock;
+  let mockDeleteMemory: jest.Mock;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockSetMemory = jest.fn().mockResolvedValue({ ok: true });
+    mockDeleteMemory = jest.fn().mockResolvedValue({ ok: true });
+  });
+
+  it('should apply a delete before a later set using shared token state', async () => {
+    const tool = createApplyMemoryChangesTool({
+      userId: 'test-user',
+      setMemory: mockSetMemory,
+      deleteMemory: mockDeleteMemory,
+      tokenLimit: 20,
+      totalTokens: 20,
+      memoryTokenMap: { working: 10, context: 10 },
+    });
+
+    const result = await tool.func({
+      operations: [
+        { action: 'delete', key: 'working' },
+        { action: 'set', key: 'context', value: 'x'.repeat(15) },
+      ],
+    });
+
+    expect(result).toHaveLength(2);
+    expect(result[0]).toContain('Memory deleted for key "working"');
+    expect(result[0]).toContain('Memory set for key "context" (15 tokens)');
+    expect(mockDeleteMemory).toHaveBeenCalledWith({
+      userId: 'test-user',
+      key: 'working',
+    });
+    expect(mockSetMemory).toHaveBeenCalledWith({
+      userId: 'test-user',
+      key: 'context',
+      value: 'x'.repeat(15),
+      tokenCount: 15,
+    });
+
+    const artifacts = result[1] as Record<Tools.memory, MemoryArtifact>;
+    expect(artifacts[Tools.memory]).toBeDefined();
+    expect(['delete', 'update']).toContain(artifacts[Tools.memory].type);
+  });
+});
+
 describe('processMemory - GPT-5+ handling', () => {
   let mockSetMemory: jest.Mock;
   let mockDeleteMemory: jest.Mock;
@@ -458,6 +505,10 @@ describe('processMemory - GPT-5+ handling', () => {
           llmConfig: expect.objectContaining({
             model: 'gpt-5',
             modelKwargs: {
+              tool_choice: {
+                type: 'function',
+                name: 'apply_memory_changes',
+              },
               max_completion_tokens: 1000,
             },
           }),
@@ -501,6 +552,10 @@ describe('processMemory - GPT-5+ handling', () => {
             model: 'gpt-6',
             modelKwargs: {
               customParam: 'value',
+              tool_choice: {
+                type: 'function',
+                name: 'apply_memory_changes',
+              },
               max_completion_tokens: 2000,
             },
           }),
@@ -547,7 +602,14 @@ describe('processMemory - GPT-5+ handling', () => {
 
     // Verify nothing was moved to modelKwargs for GPT-4
     const callArgs = (Run.create as jest.Mock).mock.calls[0][0];
-    expect(callArgs.graphConfig.llmConfig.modelKwargs).toBeUndefined();
+    expect(callArgs.graphConfig.llmConfig.modelKwargs).toEqual({
+      tool_choice: {
+        type: 'function',
+        function: {
+          name: 'apply_memory_changes',
+        },
+      },
+    });
   });
 
   it('should handle various GPT-5+ model formats', async () => {
@@ -591,11 +653,26 @@ describe('processMemory - GPT-5+ handling', () => {
       if (shouldTransform) {
         expect(llmConfig.temperature).toBeUndefined();
         expect(llmConfig.maxTokens).toBeUndefined();
-        expect(llmConfig.modelKwargs?.max_completion_tokens).toBe(1500);
+        expect(llmConfig.modelKwargs).toEqual(
+          expect.objectContaining({
+            tool_choice: {
+              type: 'function',
+              name: 'apply_memory_changes',
+            },
+            max_completion_tokens: 1500,
+          }),
+        );
       } else {
         expect(llmConfig.temperature).toBe(0.5);
         expect(llmConfig.maxTokens).toBe(1500);
-        expect(llmConfig.modelKwargs).toBeUndefined();
+        expect(llmConfig.modelKwargs).toEqual({
+          tool_choice: {
+            type: 'function',
+            function: {
+              name: 'apply_memory_changes',
+            },
+          },
+        });
       }
     }
   });
@@ -653,6 +730,10 @@ describe('processMemory - GPT-5+ handling', () => {
           llmConfig: expect.objectContaining({
             model: 'gpt-5',
             modelKwargs: {
+              tool_choice: {
+                type: 'function',
+                name: 'apply_memory_changes',
+              },
               max_output_tokens: 1000,
             },
           }),
@@ -687,7 +768,45 @@ describe('processMemory - GPT-5+ handling', () => {
           llmConfig: expect.objectContaining({
             model: 'gpt-5',
             modelKwargs: {
+              tool_choice: {
+                type: 'function',
+                name: 'apply_memory_changes',
+              },
               max_completion_tokens: 1000,
+            },
+          }),
+        }),
+      }),
+    );
+  });
+
+  it('should preserve forced tool choice in anthropic invocation kwargs', async () => {
+    await processMemory({
+      res: mockRes as Response,
+      userId: 'test-user',
+      setMemory: mockSetMemory,
+      deleteMemory: mockDeleteMemory,
+      messages: [],
+      memory: 'Test memory',
+      messageId: 'msg-123',
+      conversationId: 'conv-123',
+      instructions: 'Test instructions',
+      llmConfig: {
+        provider: Providers.ANTHROPIC,
+        model: 'claude-sonnet-4-6',
+      },
+    });
+
+    const { Run } = jest.requireMock('@librechat/agents');
+    expect(Run.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        graphConfig: expect.objectContaining({
+          llmConfig: expect.objectContaining({
+            invocationKwargs: {
+              tool_choice: {
+                type: 'tool',
+                name: 'apply_memory_changes',
+              },
             },
           }),
         }),

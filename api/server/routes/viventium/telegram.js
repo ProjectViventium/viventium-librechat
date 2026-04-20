@@ -522,7 +522,7 @@ async function writeTelegramTempFile(buffer, filename) {
   return { tempDir, filePath };
 }
 
-async function uploadTelegramFiles({ req, files }) {
+async function uploadTelegramFiles({ req, files, agentId }) {
   if (!TELEGRAM_FILE_UPLOAD_ENABLED) {
     return [];
   }
@@ -597,10 +597,15 @@ async function uploadTelegramFiles({ req, files }) {
       destination: tempDir,
     };
 
+    /* === VIVENTIUM START ===
+     * Feature: Bridge attachment parity with native agent uploads.
+     * Purpose: Preserve the active agent context when resolving provider-native vs context uploads.
+     * === VIVENTIUM END === */
     const metadata = {
       file_id: fileId,
       temp_file_id: fileId,
       message_file: true,
+      agent_id: agentId,
     };
 
     try {
@@ -609,6 +614,7 @@ async function uploadTelegramFiles({ req, files }) {
       req.body = {
         endpoint: 'agents',
         endpointType: 'agents',
+        agent_id: agentId,
         file_id: fileId,
         model,
       };
@@ -634,6 +640,11 @@ async function uploadTelegramFiles({ req, files }) {
       }
     } catch (err) {
       logger.error('[VIVENTIUM][telegram/chat] File upload failed:', err);
+      const reason =
+        typeof err?.message === 'string' && err.message.trim().length > 0
+          ? err.message.trim()
+          : 'Attachment processing failed';
+      throw new Error(`Telegram attachment upload failed for "${safeName}": ${reason}`);
     } finally {
       req.file = originalFile;
       req.body = originalBody;
@@ -924,7 +935,7 @@ router.post('/chat', telegramAuth, configMiddleware, async (req, _res, next) => 
 
   const uploadStartTs = performance.now();
   const uploadedFiles = TELEGRAM_FILE_UPLOAD_ENABLED
-    ? await uploadTelegramFiles({ req, files: telegramNonImageFiles })
+    ? await uploadTelegramFiles({ req, files: telegramNonImageFiles, agentId })
     : [];
   logTelegramTiming(
     traceId,

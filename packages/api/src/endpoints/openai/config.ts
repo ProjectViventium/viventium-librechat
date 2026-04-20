@@ -38,10 +38,42 @@ function getRequestUrl(input: string | URL | Request): string {
   return input.url;
 }
 
+function extractInstructionText(content: unknown): string | undefined {
+  if (typeof content === 'string') {
+    const trimmed = content.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  }
+
+  if (!Array.isArray(content)) {
+    return undefined;
+  }
+
+  const textParts: string[] = [];
+  for (let j = 0; j < content.length; j++) {
+    const part = content[j];
+    if (!part || typeof part !== 'object') {
+      continue;
+    }
+    const type = (part as Record<string, unknown>).type;
+    const text = (part as Record<string, unknown>).text;
+    if (
+      (type === 'input_text' || type === 'text' || type === 'output_text') &&
+      typeof text === 'string' &&
+      text.trim().length > 0
+    ) {
+      textParts.push(text.trim());
+    }
+  }
+
+  return textParts.length > 0 ? textParts.join('\n') : undefined;
+}
+
 function extractInstructionsFromResponseInput(input: unknown): string | undefined {
   if (!Array.isArray(input)) {
     return undefined;
   }
+
+  const instructionParts: string[] = [];
 
   for (let i = 0; i < input.length; i++) {
     const item = input[i];
@@ -58,42 +90,95 @@ function extractInstructionsFromResponseInput(input: unknown): string | undefine
       continue;
     }
 
-    const content = (item as Record<string, unknown>).content;
-    if (typeof content === 'string') {
-      const trimmed = content.trim();
-      if (trimmed.length > 0) {
-        return trimmed;
-      }
-      continue;
-    }
-
-    if (!Array.isArray(content)) {
-      continue;
-    }
-
-    const textParts: string[] = [];
-    for (let j = 0; j < content.length; j++) {
-      const part = content[j];
-      if (!part || typeof part !== 'object') {
-        continue;
-      }
-      const type = (part as Record<string, unknown>).type;
-      const text = (part as Record<string, unknown>).text;
-      if (
-        (type === 'input_text' || type === 'text' || type === 'output_text') &&
-        typeof text === 'string' &&
-        text.trim().length > 0
-      ) {
-        textParts.push(text.trim());
-      }
-    }
-
-    if (textParts.length > 0) {
-      return textParts.join('\n');
+    const instructionText = extractInstructionText((item as Record<string, unknown>).content);
+    if (instructionText) {
+      instructionParts.push(instructionText);
     }
   }
 
+  return instructionParts.length > 0 ? instructionParts.join('\n\n') : undefined;
+}
+
+function cloneCodexEventItem(item: Record<string, unknown>): Record<string, unknown> {
+  return JSON.parse(JSON.stringify(item)) as Record<string, unknown>;
+}
+
+function mergeCodexOutputItem(
+  existing: Record<string, unknown> | undefined,
+  incoming: Record<string, unknown>,
+): Record<string, unknown> {
+  if (existing == null) {
+    return cloneCodexEventItem(incoming);
+  }
+
+  const merged = {
+    ...existing,
+    ...cloneCodexEventItem(incoming),
+  };
+
+  if (Array.isArray(existing.content)) {
+    const incomingContent = Array.isArray(incoming.content) ? incoming.content : undefined;
+    if (incomingContent == null || incomingContent.length === 0) {
+      merged.content = existing.content;
+    }
+  }
+
+  if (typeof existing.arguments === 'string') {
+    const incomingArguments = incoming.arguments;
+    if (typeof incomingArguments !== 'string' || incomingArguments.length === 0) {
+      merged.arguments = existing.arguments;
+    }
+  }
+
+  if (typeof existing.output === 'string') {
+    const incomingOutput = incoming.output;
+    if (typeof incomingOutput !== 'string' || incomingOutput.length === 0) {
+      merged.output = existing.output;
+    }
+  }
+
+  return merged;
+}
+
+function getCodexOutputIndexForEvent(
+  eventPayload: Record<string, unknown>,
+  itemIndexById: Map<string, number>,
+): number | undefined {
+  const directOutputIndex = eventPayload.output_index;
+  if (typeof directOutputIndex === 'number' && Number.isFinite(directOutputIndex)) {
+    return directOutputIndex;
+  }
+
+  const itemId = eventPayload.item_id;
+  if (typeof itemId === 'string') {
+    return itemIndexById.get(itemId);
+  }
+
   return undefined;
+}
+
+function ensureCodexOutputTextPart(item: Record<string, unknown>): Record<string, unknown> {
+  const content = Array.isArray(item.content) ? [...item.content] : [];
+  item.content = content;
+
+  for (let i = 0; i < content.length; i++) {
+    const part = content[i];
+    if (
+      part &&
+      typeof part === 'object' &&
+      (((part as Record<string, unknown>).type === 'output_text') ||
+        (part as Record<string, unknown>).type === 'text')
+    ) {
+      return part as Record<string, unknown>;
+    }
+  }
+
+  const nextPart: Record<string, unknown> = {
+    type: 'output_text',
+    text: '',
+  };
+  content.push(nextPart);
+  return nextPart;
 }
 
 function parseCodexResponseFromSSE(raw: string): Record<string, unknown> | undefined {
@@ -102,6 +187,8 @@ function parseCodexResponseFromSSE(raw: string): Record<string, unknown> | undef
   }
 
   let latestResponse: Record<string, unknown> | undefined;
+  const outputItems = new Map<number, Record<string, unknown>>();
+  const itemIndexById = new Map<string, number>();
   const lines = raw.split('\n');
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]?.trim();
@@ -128,13 +215,76 @@ function parseCodexResponseFromSSE(raw: string): Record<string, unknown> | undef
     if (eventPayload.type === 'response.completed') {
       const completedResponse = eventPayload.response;
       if (completedResponse && typeof completedResponse === 'object') {
-        return completedResponse as Record<string, unknown>;
+        latestResponse = completedResponse as Record<string, unknown>;
+      }
+    } else if (
+      eventPayload.type === 'response.output_item.added' ||
+      eventPayload.type === 'response.output_item.done'
+    ) {
+      const outputIndex = getCodexOutputIndexForEvent(eventPayload, itemIndexById);
+      const item = eventPayload.item;
+      if (
+        typeof outputIndex === 'number' &&
+        item &&
+        typeof item === 'object' &&
+        Number.isFinite(outputIndex)
+      ) {
+        const merged = mergeCodexOutputItem(
+          outputItems.get(outputIndex),
+          item as Record<string, unknown>,
+        );
+        outputItems.set(outputIndex, merged);
+        if (typeof merged.id === 'string') {
+          itemIndexById.set(merged.id, outputIndex);
+        }
+      }
+    } else if (
+      eventPayload.type === 'response.function_call_arguments.delta' ||
+      eventPayload.type === 'response.function_call_arguments.done'
+    ) {
+      const outputIndex = getCodexOutputIndexForEvent(eventPayload, itemIndexById);
+      if (typeof outputIndex === 'number' && Number.isFinite(outputIndex)) {
+        const item = outputItems.get(outputIndex);
+        if (item) {
+          if (eventPayload.type === 'response.function_call_arguments.delta') {
+            const delta = typeof eventPayload.delta === 'string' ? eventPayload.delta : '';
+            item.arguments = `${typeof item.arguments === 'string' ? item.arguments : ''}${delta}`;
+          } else if (typeof eventPayload.arguments === 'string') {
+            item.arguments = eventPayload.arguments;
+          }
+        }
+      }
+    } else if (
+      eventPayload.type === 'response.output_text.delta' ||
+      eventPayload.type === 'response.output_text.done'
+    ) {
+      const outputIndex = getCodexOutputIndexForEvent(eventPayload, itemIndexById);
+      if (typeof outputIndex === 'number' && Number.isFinite(outputIndex)) {
+        const item = outputItems.get(outputIndex);
+        if (item) {
+          const textPart = ensureCodexOutputTextPart(item);
+          if (eventPayload.type === 'response.output_text.delta') {
+            const delta = typeof eventPayload.delta === 'string' ? eventPayload.delta : '';
+            textPart.text = `${typeof textPart.text === 'string' ? textPart.text : ''}${delta}`;
+          } else if (typeof eventPayload.text === 'string') {
+            textPart.text = eventPayload.text;
+          }
+        }
       }
     }
 
     const maybeResponse = eventPayload.response;
     if (maybeResponse && typeof maybeResponse === 'object') {
       latestResponse = maybeResponse as Record<string, unknown>;
+    }
+  }
+
+  if (latestResponse && outputItems.size > 0) {
+    const output = [...outputItems.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([, item]) => item);
+    if (!Array.isArray(latestResponse.output) || latestResponse.output.length === 0) {
+      latestResponse.output = output;
     }
   }
 
@@ -181,18 +331,23 @@ function normalizeCodexResponseInput(input: unknown): {
   normalizedInput: unknown;
   removedItemReferenceCount: number;
   removedReasoningReferenceCount: number;
+  removedInstructionMessageCount: number;
+  extractedInstructions?: string;
 } {
   if (!Array.isArray(input)) {
     return {
       normalizedInput: input,
       removedItemReferenceCount: 0,
       removedReasoningReferenceCount: 0,
+      removedInstructionMessageCount: 0,
     };
   }
 
   const normalizedInput: unknown[] = [];
   let removedItemReferenceCount = 0;
   let removedReasoningReferenceCount = 0;
+  let removedInstructionMessageCount = 0;
+  const extractedInstructions: string[] = [];
 
   for (let i = 0; i < input.length; i++) {
     const item = input[i];
@@ -202,6 +357,18 @@ function normalizeCodexResponseInput(input: unknown): {
     }
 
     const itemRecord = item as Record<string, unknown>;
+    if (
+      itemRecord.type === 'message' &&
+      (itemRecord.role === 'system' || itemRecord.role === 'developer')
+    ) {
+      removedInstructionMessageCount++;
+      const instructionText = extractInstructionText(itemRecord.content);
+      if (instructionText) {
+        extractedInstructions.push(instructionText);
+      }
+      continue;
+    }
+
     if (itemRecord.type === 'item_reference') {
       removedItemReferenceCount++;
       continue;
@@ -223,6 +390,10 @@ function normalizeCodexResponseInput(input: unknown): {
     normalizedInput,
     removedItemReferenceCount,
     removedReasoningReferenceCount,
+    removedInstructionMessageCount,
+    ...(extractedInstructions.length > 0
+      ? { extractedInstructions: extractedInstructions.join('\n\n') }
+      : {}),
   };
 }
 
@@ -259,6 +430,7 @@ function createCodexResponsesFetch(baseFetch: Fetch): Fetch {
     let injectedReasoningEncryptedContentInclude = false;
     let removedItemReferenceCount = 0;
     let removedReasoningReferenceCount = 0;
+    let removedInstructionMessageCount = 0;
 
     if (isResponsesRequest && typeof init?.body === 'string' && init.body.trim().length > 0) {
       try {
@@ -280,6 +452,7 @@ function createCodexResponsesFetch(baseFetch: Fetch): Fetch {
         payload.input = normalizedInput.normalizedInput;
         removedItemReferenceCount = normalizedInput.removedItemReferenceCount;
         removedReasoningReferenceCount = normalizedInput.removedReasoningReferenceCount;
+        removedInstructionMessageCount = normalizedInput.removedInstructionMessageCount;
 
         if (Object.prototype.hasOwnProperty.call(payload, 'user')) {
           removedUserParam = true;
@@ -292,7 +465,9 @@ function createCodexResponsesFetch(baseFetch: Fetch): Fetch {
         if (!hasInstructions) {
           injectedInstructions = true;
           payload.instructions =
-            extractInstructionsFromResponseInput(payload.input) ?? DEFAULT_CODEX_INSTRUCTIONS;
+            normalizedInput.extractedInstructions ??
+            extractInstructionsFromResponseInput(payload.input) ??
+            DEFAULT_CODEX_INSTRUCTIONS;
         }
 
         injectedReasoningEncryptedContentInclude =
@@ -343,6 +518,7 @@ function createCodexResponsesFetch(baseFetch: Fetch): Fetch {
         injectedInstructions ||
         removedPreviousResponseId ||
         injectedReasoningEncryptedContentInclude ||
+        removedInstructionMessageCount > 0 ||
         removedItemReferenceCount > 0 ||
         removedReasoningReferenceCount > 0)
     ) {
@@ -370,6 +546,7 @@ function createCodexResponsesFetch(baseFetch: Fetch): Fetch {
           injectedInstructions,
           removedPreviousResponseId,
           injectedReasoningEncryptedContentInclude,
+          removedInstructionMessageCount,
           removedItemReferenceCount,
           removedReasoningReferenceCount,
           responsePreview,

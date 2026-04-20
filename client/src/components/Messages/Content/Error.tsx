@@ -119,6 +119,11 @@ function TokenBalanceAction({ json }: { json: TTokenBalance }) {
 const errorMessages = {
   [ErrorTypes.MODERATION]: 'com_error_moderation',
   [ErrorTypes.NO_USER_KEY]: 'com_error_no_user_key',
+  [ErrorTypes.CONNECTED_ACCOUNT_REQUIRED]: (json: TGenericError, localize: LocalizeFunction) => {
+    const { info } = json;
+    const provider = (alternateName[info] as string | undefined) ?? info ?? 'AI provider';
+    return localize('com_error_connected_account_required', { 0: provider });
+  },
   [ErrorTypes.INVALID_USER_KEY]: 'com_error_invalid_user_key',
   [ErrorTypes.NO_BASE_URL]: 'com_error_no_base_url',
   [ErrorTypes.INVALID_ACTION]: `com_error_${ErrorTypes.INVALID_ACTION}`,

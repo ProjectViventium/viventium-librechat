@@ -89,6 +89,9 @@ const {
   finalizeCanonicalCortexMessage,
   createCortexFollowUpMessage,
 } = require('~/server/services/viventium/BackgroundCortexFollowUpService');
+const {
+  createRuntimeHoldTextPart,
+} = require('~/server/services/viventium/runtimeHoldText');
 /* === VIVENTIUM NOTE ===
  * Feature: Background cortex follow-up grace window
  */
@@ -2861,11 +2864,7 @@ class AgentClient extends BaseClient {
          * Behavior:
          * - Persist hold text as plain string on both `text` and `ContentTypes.TEXT`.
          * === VIVENTIUM END === */
-        this.contentParts.push({
-          type: ContentTypes.TEXT,
-          text: holdText,
-          [ContentTypes.TEXT]: holdText,
-        });
+        this.contentParts.push(createRuntimeHoldTextPart(holdText));
         logger.info(
           `[AgentClient] Tool cortex brewing hold: deferred main response (activated=${activatedCorticesList.length})`,
         );

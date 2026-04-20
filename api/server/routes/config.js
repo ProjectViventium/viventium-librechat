@@ -6,6 +6,7 @@ const { getLdapConfig } = require('~/server/services/Config/ldap');
 const { getAppConfig } = require('~/server/services/Config/app');
 const { getProjectByName } = require('~/models/Project');
 const { getLogStores } = require('~/cache');
+const { isBrowserRegistrationOpen } = require('~/server/services/viventium/registrationGate');
 
 const router = express.Router();
 const emailLoginEnabled =
@@ -23,8 +24,10 @@ const openidReuseTokens = isEnabled(process.env.OPENID_REUSE_TOKENS);
 
 router.get('/', async function (req, res) {
   const cache = getLogStores(CacheKeys.CONFIG_STORE);
+  const bootstrapRegistrationOnce = isEnabled(process.env.VIVENTIUM_BOOTSTRAP_REGISTRATION_ONCE);
 
-  const cachedStartupConfig = await cache.get(CacheKeys.STARTUP_CONFIG);
+  const cachedStartupConfig =
+    bootstrapRegistrationOnce === true ? null : await cache.get(CacheKeys.STARTUP_CONFIG);
   if (cachedStartupConfig) {
     res.send(cachedStartupConfig);
     return;
@@ -41,6 +44,7 @@ router.get('/', async function (req, res) {
 
   try {
     const appConfig = await getAppConfig({ role: req.user?.role });
+    const registrationEnabled = await isBrowserRegistrationOpen({ ldapEnabled: !!ldap?.enabled });
 
     const isOpenIdEnabled =
       !!process.env.OPENID_CLIENT_ID &&
@@ -82,7 +86,7 @@ router.get('/', async function (req, res) {
       samlImageUrl: process.env.SAML_IMAGE_URL,
       serverDomain: process.env.DOMAIN_SERVER || 'http://localhost:3080',
       emailLoginEnabled,
-      registrationEnabled: !ldap?.enabled && isEnabled(process.env.ALLOW_REGISTRATION),
+      registrationEnabled,
       socialLoginEnabled: isEnabled(process.env.ALLOW_SOCIAL_LOGIN),
       emailEnabled:
         (!!process.env.EMAIL_SERVICE || !!process.env.EMAIL_HOST) &&
@@ -154,7 +158,9 @@ router.get('/', async function (req, res) {
       payload.customFooter = process.env.CUSTOM_FOOTER;
     }
 
-    await cache.set(CacheKeys.STARTUP_CONFIG, payload);
+    if (!bootstrapRegistrationOnce) {
+      await cache.set(CacheKeys.STARTUP_CONFIG, payload);
+    }
     return res.status(200).send(payload);
   } catch (err) {
     logger.error('Error in startup config', err);

@@ -195,6 +195,14 @@ function extractHoldTextsFromInstructions(instructions) {
   });
 }
 
+function resolveConfiguredHoldTexts({ agentInstructions } = {}) {
+  const configured = loadHoldTextsFromEnv();
+  if (configured.length > 0) {
+    return configured;
+  }
+  return extractHoldTextsFromInstructions(agentInstructions);
+}
+
 function pickHoldText({ responseMessageId, agentInstructions, scheduleId } = {}) {
   /* === VIVENTIUM NOTE ===
    * Feature: Silent hold for scheduler-triggered runs.
@@ -206,9 +214,7 @@ function pickHoldText({ responseMessageId, agentInstructions, scheduleId } = {})
     return '{NTA}';
   }
 
-  const configured = loadHoldTextsFromEnv();
-  const extracted = extractHoldTextsFromInstructions(agentInstructions);
-  const texts = configured.length > 0 ? configured : extracted;
+  const texts = resolveConfiguredHoldTexts({ agentInstructions });
 
   if (texts.length === 0) {
     // Single minimal fallback (should rarely be used; prefer prompt-owned examples above).
@@ -221,7 +227,9 @@ function pickHoldText({ responseMessageId, agentInstructions, scheduleId } = {})
 
 module.exports = {
   collectConfiguredHoldScopeKeys,
+  extractHoldTextsFromInstructions,
   isToolHoldCandidate,
   pickHoldText,
+  resolveConfiguredHoldTexts,
   shouldDeferMainResponse,
 };

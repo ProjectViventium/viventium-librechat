@@ -8,13 +8,13 @@ const DEFAULT_MODELS = {
 };
 
 const APPROVED_MAIN_RUNTIME_FAMILIES = new Set([
-  'anthropic::claude-opus-4-6',
+  'anthropic::claude-opus-4-7',
   'openAI::gpt-5.4',
 ]);
 
 const APPROVED_BACKGROUND_RUNTIME_FAMILIES = new Set([
   'anthropic::claude-sonnet-4-6',
-  'anthropic::claude-opus-4-6',
+  'anthropic::claude-opus-4-7',
   'openAI::gpt-5.4',
 ]);
 
@@ -119,6 +119,44 @@ const AGENT_RUNTIME_ENV_BY_ID = {
 const BUILT_IN_BACKGROUND_AGENT_IDS = Object.freeze(
   Object.keys(AGENT_RUNTIME_ENV_BY_ID).filter((agentId) => agentId !== 'agent_viventium_main_95aeb3'),
 );
+
+const CANONICAL_BUILT_IN_BACKGROUND_MODEL_PARAMETERS = Object.freeze({
+  agent_viventium_confirmation_bias_95aeb3: Object.freeze({
+    anthropic: Object.freeze({
+      thinking: false,
+      temperature: 0.3,
+    }),
+  }),
+  agent_viventium_red_team_95aeb3: Object.freeze({
+    anthropic: Object.freeze({
+      thinkingBudget: 4000,
+    }),
+  }),
+  agent_viventium_deep_research_95aeb3: Object.freeze({
+    openAI: Object.freeze({
+      reasoning_effort: 'xhigh',
+    }),
+    anthropic: Object.freeze({
+      thinkingBudget: 4000,
+    }),
+  }),
+  agent_viventium_parietal_cortex_95aeb3: Object.freeze({
+    openAI: Object.freeze({
+      temperature: 1,
+    }),
+  }),
+  agent_viventium_emotional_resonance_95aeb3: Object.freeze({
+    anthropic: Object.freeze({
+      thinking: false,
+      temperature: 0.4,
+    }),
+  }),
+  agent_viventium_strategic_planning_95aeb3: Object.freeze({
+    anthropic: Object.freeze({
+      thinkingBudget: 2000,
+    }),
+  }),
+});
 
 const ACTIVATION_RUNTIME_ENV_BY_AGENT_ID = {
   agent_viventium_background_analysis_95aeb3: {
@@ -283,6 +321,16 @@ function readVoiceAssignment(
   return { provider, model };
 }
 
+function canonicalBuiltInBackgroundModelParameters(agentId, provider) {
+  const normalizedProvider = normalizeProvider(provider);
+  if (!BUILT_IN_BACKGROUND_AGENT_IDS.includes(agentId)) {
+    return null;
+  }
+  const byProvider = CANONICAL_BUILT_IN_BACKGROUND_MODEL_PARAMETERS[agentId] || {};
+  const canonical = byProvider[normalizedProvider];
+  return canonical ? deepClone(canonical) : {};
+}
+
 function rewriteAgentForRuntime(agent, { env = process.env } = {}) {
   if (!agent?.id) {
     return agent;
@@ -303,7 +351,16 @@ function rewriteAgentForRuntime(agent, { env = process.env } = {}) {
     if (assignment) {
       rewritten.provider = assignment.provider;
       rewritten.model = assignment.model;
-      if (
+      const canonicalBuiltInParameters = canonicalBuiltInBackgroundModelParameters(
+        rewritten.id,
+        assignment.provider,
+      );
+      if (canonicalBuiltInParameters !== null) {
+        rewritten.model_parameters = {
+          ...canonicalBuiltInParameters,
+          model: assignment.model,
+        };
+      } else if (
         rewritten.model_parameters &&
         typeof rewritten.model_parameters === 'object' &&
         !Array.isArray(rewritten.model_parameters)
@@ -398,18 +455,28 @@ function buildCanonicalPersistedAgentFields(agent, existingAgent = null) {
     !Array.isArray(agent.model_parameters)
       ? deepClone(agent.model_parameters)
       : {};
+  const canonicalBuiltInParameters = canonicalBuiltInBackgroundModelParameters(agent.id, provider);
 
-  const mergedModelParameters = {
-    ...existingModelParameters,
-    ...incomingModelParameters,
-  };
+  if (canonicalBuiltInParameters !== null) {
+    patch.model_parameters = patch.model
+      ? {
+          ...canonicalBuiltInParameters,
+          model: patch.model,
+        }
+      : canonicalBuiltInParameters;
+  } else {
+    const mergedModelParameters = {
+      ...existingModelParameters,
+      ...incomingModelParameters,
+    };
 
-  if (patch.model) {
-    mergedModelParameters.model = patch.model;
-  }
+    if (patch.model) {
+      mergedModelParameters.model = patch.model;
+    }
 
-  if (Object.keys(mergedModelParameters).length > 0) {
-    patch.model_parameters = mergedModelParameters;
+    if (Object.keys(mergedModelParameters).length > 0) {
+      patch.model_parameters = mergedModelParameters;
+    }
   }
 
   if (Object.prototype.hasOwnProperty.call(agent, 'voice_llm_provider')) {

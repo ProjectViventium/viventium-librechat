@@ -1881,76 +1881,76 @@ describe('Claude Model Tests', () => {
     });
   });
 
-  it('should return correct prompt and completion rates for Claude Opus 4.6', () => {
-    expect(getMultiplier({ model: 'claude-opus-4-6', tokenType: 'prompt' })).toBe(
-      tokenValues['claude-opus-4-6'].prompt,
+  it('should return correct prompt and completion rates for Claude Opus 4.7', () => {
+    expect(getMultiplier({ model: 'claude-opus-4-7', tokenType: 'prompt' })).toBe(
+      tokenValues['claude-opus-4-7'].prompt,
     );
-    expect(getMultiplier({ model: 'claude-opus-4-6', tokenType: 'completion' })).toBe(
-      tokenValues['claude-opus-4-6'].completion,
+    expect(getMultiplier({ model: 'claude-opus-4-7', tokenType: 'completion' })).toBe(
+      tokenValues['claude-opus-4-7'].completion,
     );
   });
 
-  it('should handle Claude Opus 4.6 model name variations', () => {
+  it('should handle Claude Opus 4.7 model name variations', () => {
     const modelVariations = [
-      'claude-opus-4-6',
-      'claude-opus-4-6-20250801',
-      'claude-opus-4-6-latest',
-      'anthropic/claude-opus-4-6',
-      'claude-opus-4-6/anthropic',
-      'claude-opus-4-6-preview',
+      'claude-opus-4-7',
+      'claude-opus-4-7-20250801',
+      'claude-opus-4-7-latest',
+      'anthropic/claude-opus-4-7',
+      'claude-opus-4-7/anthropic',
+      'claude-opus-4-7-preview',
     ];
 
     modelVariations.forEach((model) => {
       const valueKey = getValueKey(model);
-      expect(valueKey).toBe('claude-opus-4-6');
+      expect(valueKey).toBe('claude-opus-4-7');
       expect(getMultiplier({ model, tokenType: 'prompt' })).toBe(
-        tokenValues['claude-opus-4-6'].prompt,
+        tokenValues['claude-opus-4-7'].prompt,
       );
       expect(getMultiplier({ model, tokenType: 'completion' })).toBe(
-        tokenValues['claude-opus-4-6'].completion,
+        tokenValues['claude-opus-4-7'].completion,
       );
     });
   });
 
-  it('should return correct cache rates for Claude Opus 4.6', () => {
-    expect(getCacheMultiplier({ model: 'claude-opus-4-6', cacheType: 'write' })).toBe(
-      cacheTokenValues['claude-opus-4-6'].write,
+  it('should return correct cache rates for Claude Opus 4.7', () => {
+    expect(getCacheMultiplier({ model: 'claude-opus-4-7', cacheType: 'write' })).toBe(
+      cacheTokenValues['claude-opus-4-7'].write,
     );
-    expect(getCacheMultiplier({ model: 'claude-opus-4-6', cacheType: 'read' })).toBe(
-      cacheTokenValues['claude-opus-4-6'].read,
+    expect(getCacheMultiplier({ model: 'claude-opus-4-7', cacheType: 'read' })).toBe(
+      cacheTokenValues['claude-opus-4-7'].read,
     );
   });
 
-  it('should handle Claude Opus 4.6 cache rates with model name variations', () => {
+  it('should handle Claude Opus 4.7 cache rates with model name variations', () => {
     const modelVariations = [
-      'claude-opus-4-6',
-      'claude-opus-4-6-20250801',
-      'claude-opus-4-6-latest',
-      'anthropic/claude-opus-4-6',
-      'claude-opus-4-6/anthropic',
-      'claude-opus-4-6-preview',
+      'claude-opus-4-7',
+      'claude-opus-4-7-20250801',
+      'claude-opus-4-7-latest',
+      'anthropic/claude-opus-4-7',
+      'claude-opus-4-7/anthropic',
+      'claude-opus-4-7-preview',
     ];
 
     modelVariations.forEach((model) => {
       expect(getCacheMultiplier({ model, cacheType: 'write' })).toBe(
-        cacheTokenValues['claude-opus-4-6'].write,
+        cacheTokenValues['claude-opus-4-7'].write,
       );
       expect(getCacheMultiplier({ model, cacheType: 'read' })).toBe(
-        cacheTokenValues['claude-opus-4-6'].read,
+        cacheTokenValues['claude-opus-4-7'].read,
       );
     });
   });
 });
 
 describe('Premium Token Pricing', () => {
-  const premiumModel = 'claude-opus-4-6';
+  const premiumModel = 'claude-opus-4-7';
   const premiumEntry = premiumTokenValues[premiumModel];
   const { threshold } = premiumEntry;
   const belowThreshold = threshold - 1;
   const aboveThreshold = threshold + 1;
   const wellAboveThreshold = threshold * 2;
 
-  it('should have premium pricing defined for claude-opus-4-6', () => {
+  it('should have premium pricing defined for claude-opus-4-7', () => {
     expect(premiumEntry).toBeDefined();
     expect(premiumEntry.threshold).toBeDefined();
     expect(premiumEntry.prompt).toBeDefined();

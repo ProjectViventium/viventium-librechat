@@ -1092,7 +1092,7 @@ describe('BackgroundCortexFollowUpService', () => {
     const originalProvider = process.env.VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER;
     const originalModel = process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL;
     process.env.VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER = 'anthropic';
-    process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL = 'claude-opus-4-6';
+    process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL = 'claude-opus-4-7';
 
     try {
       await generateFollowUpText({
@@ -1123,7 +1123,7 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(initializeAnthropic).toHaveBeenCalledWith(
       expect.objectContaining({
         model_parameters: expect.objectContaining({
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-4-7',
         }),
       }),
     );
@@ -1134,7 +1134,7 @@ describe('BackgroundCortexFollowUpService', () => {
     const originalProvider = process.env.VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER;
     const originalModel = process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL;
     process.env.VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER = 'anthropic';
-    process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL = 'claude-opus-4-6';
+    process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL = 'claude-opus-4-7';
 
     try {
       await generateFollowUpText({
@@ -1166,7 +1166,7 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(initializeAnthropic).toHaveBeenCalledWith(
       expect.objectContaining({
         model_parameters: expect.objectContaining({
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-4-7',
         }),
       }),
     );
@@ -1177,7 +1177,7 @@ describe('BackgroundCortexFollowUpService', () => {
     getAgent.mockResolvedValue({
       id: 'agent_viventium_main_95aeb3',
       provider: 'anthropic',
-      model: 'claude-opus-4-6',
+      model: 'claude-opus-4-7',
       model_parameters: { temperature: 0.2, thinking: false },
       voice_llm_provider: 'xai',
       voice_llm_model: 'grok-4-1-fast-non-reasoning',
@@ -1202,7 +1202,7 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(initializeAnthropic).toHaveBeenCalledWith(
       expect.objectContaining({
         model_parameters: expect.objectContaining({
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-4-7',
           temperature: 0.3,
           thinking: false,
         }),
@@ -1275,7 +1275,7 @@ describe('BackgroundCortexFollowUpService', () => {
     getAgent.mockResolvedValue({
       id: 'agent_viventium_main_95aeb3',
       provider: 'anthropic',
-      model: 'claude-opus-4-6',
+      model: 'claude-opus-4-7',
       model_parameters: { thinking: false },
     });
 
@@ -1284,7 +1284,7 @@ describe('BackgroundCortexFollowUpService', () => {
       agent: {
         id: 'agent_viventium_main_95aeb3',
         provider: 'anthropic',
-        model: 'claude-opus-4-6',
+        model: 'claude-opus-4-7',
         model_parameters: {},
       },
       insightsData: {
@@ -1297,7 +1297,7 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(initializeAnthropic).toHaveBeenCalledWith(
       expect.objectContaining({
         model_parameters: expect.objectContaining({
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-4-7',
           thinking: false,
         }),
       }),
@@ -1312,7 +1312,7 @@ describe('BackgroundCortexFollowUpService', () => {
       agent: {
         id: 'agent_123',
         provider: 'anthropic',
-        model: 'claude-opus-4-6',
+        model: 'claude-opus-4-7',
         model_parameters: { temperature: 0.1, max_output_tokens: 144 },
       },
       insightsData: {
@@ -1345,7 +1345,7 @@ describe('BackgroundCortexFollowUpService', () => {
         graphConfig: expect.objectContaining({
           llmConfig: expect.objectContaining({
             provider: 'anthropic',
-            model: 'claude-opus-4-6',
+            model: 'claude-opus-4-7',
           }),
         }),
       }),
@@ -1356,7 +1356,7 @@ describe('BackgroundCortexFollowUpService', () => {
     const req = { user: { id: 'u1' }, body: {}, config: {} };
     initializeAnthropic.mockResolvedValueOnce({
       llmConfig: {
-        model: 'claude-opus-4-6',
+        model: 'claude-opus-4-7',
         temperature: 0.7,
         maxTokens: 400,
         thinking: { type: 'adaptive' },
@@ -1369,7 +1369,7 @@ describe('BackgroundCortexFollowUpService', () => {
       agent: {
         id: 'agent_123',
         provider: 'anthropic',
-        model: 'claude-opus-4-6',
+        model: 'claude-opus-4-7',
         model_parameters: {},
       },
       insightsData: {
@@ -1381,7 +1381,7 @@ describe('BackgroundCortexFollowUpService', () => {
 
     const runCall = Run.create.mock.calls[Run.create.mock.calls.length - 1][0];
     expect(runCall.graphConfig.llmConfig.provider).toBe('anthropic');
-    expect(runCall.graphConfig.llmConfig.model).toBe('claude-opus-4-6');
+    expect(runCall.graphConfig.llmConfig.model).toBe('claude-opus-4-7');
     expect(runCall.graphConfig.llmConfig.thinking).toEqual({ type: 'adaptive' });
     expect(runCall.graphConfig.llmConfig.temperature).toBeUndefined();
   });

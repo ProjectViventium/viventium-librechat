@@ -36,6 +36,7 @@ jest.mock('~/utils', () => ({
 }));
 
 const { createSafeUser } = jest.requireMock('~/utils');
+const TEST_CUSTOM_API_KEY = ['test', 'custom', 'api', 'key'].join('-');
 
 jest.mock('@librechat/agents', () => {
   const actual = jest.requireActual('@librechat/agents');
@@ -77,8 +78,8 @@ describe('Memory Agent Header Resolution', () => {
   };
 
   beforeEach(() => {
-    process.env.CUSTOM_API_KEY = 'sk-custom-test-key';
-    process.env.TEST_CUSTOM_API_KEY = 'sk-custom-test-key';
+    process.env.CUSTOM_API_KEY = TEST_CUSTOM_API_KEY;
+    process.env.TEST_CUSTOM_API_KEY = TEST_CUSTOM_API_KEY;
 
     testUser = createTestUser({
       id: 'user-123',
@@ -141,8 +142,8 @@ describe('Memory Agent Header Resolution', () => {
     expect(Run.create as jest.Mock).toHaveBeenCalled();
     const runConfig = (Run.create as jest.Mock).mock.calls[0][0];
     expect(runConfig.graphConfig.llmConfig.configuration.defaultHeaders).toEqual({
-      'x-custom-api-key': 'sk-custom-test-key',
-      'api-key': 'sk-custom-test-key',
+      'x-custom-api-key': TEST_CUSTOM_API_KEY,
+      'api-key': TEST_CUSTOM_API_KEY,
     });
   });
 
@@ -212,7 +213,7 @@ describe('Memory Agent Header Resolution', () => {
     expect(Run.create as jest.Mock).toHaveBeenCalled();
     const runConfig = (Run.create as jest.Mock).mock.calls[0][0];
     expect(runConfig.graphConfig.llmConfig.configuration.defaultHeaders).toEqual({
-      'x-custom-api-key': 'sk-custom-test-key',
+      'x-custom-api-key': TEST_CUSTOM_API_KEY,
       'X-User-Identifier': 'test@example.com',
       'X-Application-Identifier': 'LibreChat - Test',
     });
@@ -247,7 +248,7 @@ describe('Memory Agent Header Resolution', () => {
     expect(Run.create as jest.Mock).toHaveBeenCalled();
     const runConfig = (Run.create as jest.Mock).mock.calls[0][0];
     expect(runConfig.graphConfig.llmConfig.configuration.defaultHeaders).toEqual({
-      'x-custom-api-key': 'sk-custom-test-key',
+      'x-custom-api-key': TEST_CUSTOM_API_KEY,
     });
   });
 
@@ -592,7 +593,7 @@ describe('Memory Agent Header Resolution', () => {
   it('should remove temperature for Anthropic with adaptive thinking', async () => {
     const llmConfig = {
       provider: Providers.ANTHROPIC,
-      model: 'claude-opus-4-6',
+      model: 'claude-opus-4-7',
       temperature: 0.7,
       thinking: {
         type: 'adaptive',

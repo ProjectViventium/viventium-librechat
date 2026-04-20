@@ -34,7 +34,7 @@ config:
     installMode: native
     consciousAgent:
       provider: anthropic
-      model: claude-opus-4-6
+      model: claude-opus-4-7
 mainAgent:
   id: agent_viventium_main_95aeb3
   name: Viventium
@@ -212,7 +212,7 @@ mainAgent:
 
     Current Date & Time: {{current_datetime}}
   provider: anthropic
-  model: claude-opus-4-6
+  model: claude-opus-4-7
   tools:
     - sys__server__sys_mcp_scheduling-cortex
     - schedule_create_mcp_scheduling-cortex
@@ -332,7 +332,7 @@ mainAgent:
     - web_search
   tool_kwargs: []
   model_parameters:
-    model: claude-opus-4-6
+    model: claude-opus-4-7
     thinking: false
   end_after_tools: false
   hide_sequential_outputs: false
@@ -881,7 +881,7 @@ backgroundAgents:
       - web_search
     tool_kwargs: []
     model_parameters:
-      thinkingBudget: 4000
+      reasoning_effort: xhigh
       model: gpt-5.4
     end_after_tools: false
     hide_sequential_outputs: false
@@ -1100,13 +1100,13 @@ backgroundAgents:
       - Sense and report emotions based on the conversation given to you — nothing more.
       - Do not reference memory systems or assumed prior context.
     provider: anthropic
-    model: claude-opus-4-6
+    model: claude-sonnet-4-6
     tools: []
     tool_kwargs: []
     model_parameters:
       thinking: false
       temperature: 0.4
-      model: claude-opus-4-6
+      model: claude-sonnet-4-6
     background_cortices: []
     agent_ids: []
     edges: []
@@ -1137,12 +1137,12 @@ backgroundAgents:
       - Plan and strategize based on the conversation given to you — nothing more.
       - Do not reference memory systems or assumed prior context.
     provider: anthropic
-    model: claude-opus-4-6
+    model: claude-opus-4-7
     tools: []
     tool_kwargs: []
     model_parameters:
       thinkingBudget: 2000
-      model: claude-opus-4-6
+      model: claude-opus-4-7
     end_after_tools: false
     hide_sequential_outputs: false
     support_contact:

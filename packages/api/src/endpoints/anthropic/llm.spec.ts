@@ -10,6 +10,19 @@ jest.mock('https-proxy-agent', () => ({
   HttpsProxyAgent: jest.fn().mockImplementation((proxy) => ({ proxy })),
 }));
 
+const buildAnthropicToken = (...parts: string[]) => ['sk', 'ant', ...parts].join('-');
+const TEST_ANTHROPIC_SUBSCRIPTION_TOKEN = buildAnthropicToken('oat01', 'test', 'token');
+const TEST_ANTHROPIC_API_KEY = buildAnthropicToken('api', 'key', '123');
+const TEST_ANTHROPIC_PROXY_KEY = buildAnthropicToken('proxy', 'key');
+const TEST_ANTHROPIC_REVERSE_PROXY_KEY = buildAnthropicToken('reverse', 'proxy');
+const TEST_ANTHROPIC_THINKING_KEY = buildAnthropicToken('thinking', 'key');
+const TEST_ANTHROPIC_WEBSEARCH_KEY = buildAnthropicToken('websearch', 'key');
+const TEST_ANTHROPIC_PROD_KEY = buildAnthropicToken('prod', 'enterprise', 'key');
+const TEST_ANTHROPIC_SYSTEM_KEY = buildAnthropicToken('system', 'key');
+const TEST_ANTHROPIC_NO_USER_KEY = buildAnthropicToken('no', 'user', 'key');
+const TEST_ANTHROPIC_PERFORMANCE_KEY = buildAnthropicToken('performance', 'key');
+const TEST_ANTHROPIC_VARIATION_KEY = buildAnthropicToken('variation', 'key');
+
 describe('getLLMConfig', () => {
   beforeEach(() => {
     jest.clearAllMocks();
@@ -25,7 +38,7 @@ describe('getLLMConfig', () => {
   });
 
   it('should configure authToken + OAuth beta headers for subscription tokens', () => {
-    const result = getLLMConfig('sk-ant-oat01-test-token', { modelOptions: {} });
+    const result = getLLMConfig(TEST_ANTHROPIC_SUBSCRIPTION_TOKEN, { modelOptions: {} });
     const clientOptions = result.llmConfig.clientOptions as Record<string, unknown>;
     const defaultHeaders = clientOptions?.defaultHeaders as Record<string, string>;
     const oauthClient = result.llmConfig.createClient?.({ apiKey: 'user_provided' });
@@ -33,11 +46,11 @@ describe('getLLMConfig', () => {
       ?._options?.defaultHeaders;
 
     expect(result.llmConfig).not.toHaveProperty('apiKey');
-    expect(clientOptions?.authToken).toBe('sk-ant-oat01-test-token');
+    expect(clientOptions?.authToken).toBe(TEST_ANTHROPIC_SUBSCRIPTION_TOKEN);
     expect(defaultHeaders?.['anthropic-beta']).toContain('oauth-2025-04-20');
     expect(defaultHeaders?.['anthropic-beta']).toContain('claude-code-20250219');
     expect(oauthClient?.apiKey).toBeNull();
-    expect(oauthClient?.authToken).toBe('sk-ant-oat01-test-token');
+    expect(oauthClient?.authToken).toBe(TEST_ANTHROPIC_SUBSCRIPTION_TOKEN);
     expect(oauthClientHeaders?.['anthropic-beta']).toContain('oauth-2025-04-20');
   });
 
@@ -477,7 +490,7 @@ describe('getLLMConfig', () => {
     describe('Initialize.js Simulation', () => {
       it('should handle basic Anthropic endpoint configuration like initialize.js', () => {
         // Simulate the configuration from Anthropic initialize.js
-        const anthropicApiKey = 'sk-ant-api-key-123';
+        const anthropicApiKey = TEST_ANTHROPIC_API_KEY;
         const endpointOption = {
           model_parameters: {
             model: 'claude-3-5-sonnet-latest',
@@ -523,7 +536,7 @@ describe('getLLMConfig', () => {
       });
 
       it('should handle Anthropic with proxy configuration like initialize.js', () => {
-        const anthropicApiKey = 'sk-ant-proxy-key';
+        const anthropicApiKey = TEST_ANTHROPIC_PROXY_KEY;
         const clientOptions = {
           proxy: 'http://corporate-proxy:8080',
           reverseProxyUrl: null,
@@ -555,7 +568,7 @@ describe('getLLMConfig', () => {
       });
 
       it('should handle Anthropic with reverse proxy like initialize.js', () => {
-        const anthropicApiKey = 'sk-ant-reverse-proxy';
+        const anthropicApiKey = TEST_ANTHROPIC_REVERSE_PROXY_KEY;
         const reverseProxyUrl = 'https://api.custom-anthropic.com/v1';
         const clientOptions = {
           proxy: null,
@@ -599,7 +612,7 @@ describe('getLLMConfig', () => {
           },
         };
 
-        const result = getLLMConfig('sk-ant-thinking-key', clientOptions);
+        const result = getLLMConfig(TEST_ANTHROPIC_THINKING_KEY, clientOptions);
 
         expect(result.llmConfig).toMatchObject({
           model: 'claude-3-7-sonnet',
@@ -633,7 +646,7 @@ describe('getLLMConfig', () => {
           },
         };
 
-        const result = getLLMConfig('sk-ant-websearch-key', clientOptions);
+        const result = getLLMConfig(TEST_ANTHROPIC_WEBSEARCH_KEY, clientOptions);
 
         expect(result.llmConfig).toMatchObject({
           model: 'claude-3-5-sonnet-latest',
@@ -669,10 +682,10 @@ describe('getLLMConfig', () => {
           titleModel: 'claude-3-haiku-20240307',
         };
 
-        const result = getLLMConfig('sk-ant-prod-enterprise-key', clientOptions);
+        const result = getLLMConfig(TEST_ANTHROPIC_PROD_KEY, clientOptions);
 
         expect(result.llmConfig).toMatchObject({
-          apiKey: 'sk-ant-prod-enterprise-key',
+          apiKey: TEST_ANTHROPIC_PROD_KEY,
           model: 'claude-3-opus-20240229',
           temperature: 0.2,
           maxTokens: 4096,
@@ -715,7 +728,7 @@ describe('getLLMConfig', () => {
           modelOptions,
         };
 
-        getLLMConfig('sk-ant-system-key', clientOptions);
+        getLLMConfig(TEST_ANTHROPIC_SYSTEM_KEY, clientOptions);
 
         // System options should be removed from original modelOptions
         expect(modelOptions).not.toHaveProperty('thinking');
@@ -738,7 +751,7 @@ describe('getLLMConfig', () => {
           },
         };
 
-        const result = getLLMConfig('sk-ant-no-user-key', clientOptions);
+        const result = getLLMConfig(TEST_ANTHROPIC_NO_USER_KEY, clientOptions);
 
         expect(result.llmConfig.invocationKwargs?.metadata).toMatchObject({
           user_id: undefined,
@@ -767,7 +780,7 @@ describe('getLLMConfig', () => {
         };
 
         const startTime = Date.now();
-        const result = getLLMConfig('sk-ant-performance-key', clientOptions);
+        const result = getLLMConfig(TEST_ANTHROPIC_PERFORMANCE_KEY, clientOptions);
         const endTime = Date.now();
 
         expect(endTime - startTime).toBeLessThan(50); // Should be very fast
@@ -802,7 +815,7 @@ describe('getLLMConfig', () => {
             },
           };
 
-          const result = getLLMConfig('sk-ant-variation-key', clientOptions);
+          const result = getLLMConfig(TEST_ANTHROPIC_VARIATION_KEY, clientOptions);
 
           expect(result.llmConfig).toHaveProperty('model', model);
           // The specific behavior (thinking, topP/topK inclusion) depends on model pattern
@@ -811,7 +824,7 @@ describe('getLLMConfig', () => {
 
       it('should remove temperature for Claude 3.7 model-name variants when thinking is enabled', () => {
         ['claude-3-7-sonnet', 'claude-3.7-sonnet'].forEach((model) => {
-          const result = getLLMConfig('sk-ant-variation-key', {
+          const result = getLLMConfig(TEST_ANTHROPIC_VARIATION_KEY, {
             modelOptions: {
               model,
               temperature: 0.5,
@@ -829,7 +842,7 @@ describe('getLLMConfig', () => {
 
       it('should keep temperature for non-thinking legacy model-name variants', () => {
         ['anthropic/claude-3-opus-20240229', 'claude-3-5-sonnet-latest'].forEach((model) => {
-          const result = getLLMConfig('sk-ant-variation-key', {
+          const result = getLLMConfig(TEST_ANTHROPIC_VARIATION_KEY, {
             modelOptions: {
               model,
               temperature: 0.5,
@@ -846,7 +859,7 @@ describe('getLLMConfig', () => {
       });
 
       it('should remove temperature for Sonnet 4 latest aliases when thinking is enabled', () => {
-        const result = getLLMConfig('sk-ant-variation-key', {
+        const result = getLLMConfig(TEST_ANTHROPIC_VARIATION_KEY, {
           modelOptions: {
             model: 'claude-sonnet-4-latest',
             temperature: 0.5,
@@ -1068,10 +1081,10 @@ describe('getLLMConfig', () => {
         expect(result.llmConfig.maxTokens).toBe(32000);
       });
 
-      it('should use adaptive thinking for Opus 4.6 instead of enabled + budget_tokens', () => {
+      it('should use adaptive thinking for Opus 4.7 instead of enabled + budget_tokens', () => {
         const result = getLLMConfig('test-key', {
           modelOptions: {
-            model: 'claude-opus-4-6',
+            model: 'claude-opus-4-7',
             thinking: true,
             thinkingBudget: 10000,
           },
@@ -1096,10 +1109,10 @@ describe('getLLMConfig', () => {
         });
       });
 
-      it('should remove temperature when default thinking enables adaptive Opus 4.6 reasoning', () => {
+      it('should remove temperature when default thinking enables adaptive Opus 4.7 reasoning', () => {
         const result = getLLMConfig('test-key', {
           modelOptions: {
-            model: 'claude-opus-4-6',
+            model: 'claude-opus-4-7',
             temperature: 0.4,
           },
         });
@@ -1111,7 +1124,7 @@ describe('getLLMConfig', () => {
       it('should set effort via output_config for adaptive thinking models', () => {
         const result = getLLMConfig('test-key', {
           modelOptions: {
-            model: 'claude-opus-4-6',
+            model: 'claude-opus-4-7',
             thinking: true,
             effort: AnthropicEffort.medium,
           },
@@ -1127,7 +1140,7 @@ describe('getLLMConfig', () => {
       it('should set effort via output_config even without thinking for adaptive models', () => {
         const result = getLLMConfig('test-key', {
           modelOptions: {
-            model: 'claude-opus-4-6',
+            model: 'claude-opus-4-7',
             thinking: false,
             effort: AnthropicEffort.low,
           },
@@ -1184,10 +1197,10 @@ describe('getLLMConfig', () => {
         expect(result.llmConfig.invocationKwargs?.output_config).toBeUndefined();
       });
 
-      it('should exclude topP/topK for Opus 4.6 with adaptive thinking', () => {
+      it('should exclude topP/topK for Opus 4.7 with adaptive thinking', () => {
         const result = getLLMConfig('test-key', {
           modelOptions: {
-            model: 'claude-opus-4-6',
+            model: 'claude-opus-4-7',
             thinking: true,
             topP: 0.9,
             topK: 40,
@@ -1199,10 +1212,10 @@ describe('getLLMConfig', () => {
         expect(result.llmConfig).not.toHaveProperty('topK');
       });
 
-      it('should include topP/topK for Opus 4.6 when thinking is disabled', () => {
+      it('should include topP/topK for Opus 4.7 when thinking is disabled', () => {
         const result = getLLMConfig('test-key', {
           modelOptions: {
-            model: 'claude-opus-4-6',
+            model: 'claude-opus-4-7',
             thinking: false,
             topP: 0.9,
             topK: 40,

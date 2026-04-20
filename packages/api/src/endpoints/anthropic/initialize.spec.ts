@@ -179,15 +179,44 @@ describe('initializeAnthropic', () => {
     process.env.VIVENTIUM_ANTHROPIC_AUTH_MODE = 'connected_account';
     const params = createParams();
 
-    await expect(initializeAnthropic(params)).rejects.toThrow();
+    await expect(initializeAnthropic(params)).rejects.toThrow(
+      'Anthropic connected account needs reconnect in Settings > Account > Connected Accounts.',
+    );
+  });
 
-    try {
-      await initializeAnthropic(params);
-    } catch (error) {
-      const parsedError = JSON.parse((error as Error).message);
-      expect(parsedError.type).toBe(ErrorTypes.CONNECTED_ACCOUNT_REQUIRED);
-      expect(parsedError.info).toBe(EModelEndpoint.anthropic);
-    }
+  it('should surface reconnect guidance when connected-account auth cannot read the stored Anthropic key', async () => {
+    process.env.VIVENTIUM_ANTHROPIC_AUTH_MODE = 'connected_account';
+    const params = createParams({
+      dbOverrides: {
+        getUserKeyValues: jest
+          .fn()
+          .mockRejectedValue(new Error('The operation failed for an operation-specific reason')),
+      },
+    });
+
+    await expect(initializeAnthropic(params)).rejects.toThrow(
+      'Anthropic connected account needs reconnect in Settings > Account > Connected Accounts.',
+    );
+  });
+
+  it('should fallback to platform key when an unreadable stored Anthropic key is encountered outside connected-account mode', async () => {
+    delete process.env.VIVENTIUM_ANTHROPIC_AUTH_MODE;
+    const params = createParams({
+      dbOverrides: {
+        getUserKeyValues: jest
+          .fn()
+          .mockRejectedValue(new Error('The operation failed for an operation-specific reason')),
+      },
+    });
+
+    await initializeAnthropic(params);
+
+    expect(mockGetLLMConfig).toHaveBeenCalledWith(
+      expect.objectContaining({
+        [AuthKeys.ANTHROPIC_API_KEY]: 'platform-anthropic-key',
+      }),
+      expect.any(Object),
+    );
   });
 
   it('should validate user key expiry when a connected key is present and expiry is provided', async () => {

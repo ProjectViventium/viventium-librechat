@@ -48,7 +48,7 @@ function parseSonnetVersion(model: string): number | null {
   return null;
 }
 
-/** Checks if a model supports adaptive thinking (Opus 4.6+, Sonnet 5+) */
+/** Checks if a model supports adaptive thinking on current Opus/Sonnet releases. */
 export function supportsAdaptiveThinking(model: string): boolean {
   const opus = parseOpusVersion(model);
   if (opus && (opus.major > 4 || (opus.major === 4 && opus.minor >= 6))) {
@@ -61,7 +61,7 @@ export function supportsAdaptiveThinking(model: string): boolean {
   return false;
 }
 
-/** Checks if a model qualifies for the context-1m beta header (Sonnet 4+, Opus 4.6+, Opus 5+) */
+/** Checks if a model qualifies for the context-1m beta header on current Sonnet/Opus releases. */
 export function supportsContext1m(model: string): boolean {
   const sonnet = parseSonnetVersion(model);
   if (sonnet != null && sonnet >= 4) {

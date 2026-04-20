@@ -6,8 +6,8 @@ import {
 } from '../src/bedrock';
 
 describe('supportsAdaptiveThinking', () => {
-  test('should return true for claude-opus-4-6', () => {
-    expect(supportsAdaptiveThinking('claude-opus-4-6')).toBe(true);
+  test('should return true for claude-opus-4-7', () => {
+    expect(supportsAdaptiveThinking('claude-opus-4-7')).toBe(true);
   });
 
   test('should return true for claude-opus-4.6', () => {
@@ -63,11 +63,11 @@ describe('supportsAdaptiveThinking', () => {
   });
 
   test('should handle Bedrock model ID with prefix stripping', () => {
-    expect(supportsAdaptiveThinking('anthropic.claude-opus-4-6-v1:0')).toBe(true);
+    expect(supportsAdaptiveThinking('anthropic.claude-opus-4-7')).toBe(true);
   });
 
   test('should handle cross-region Bedrock model ID', () => {
-    expect(supportsAdaptiveThinking('us.anthropic.claude-opus-4-6-v1')).toBe(true);
+    expect(supportsAdaptiveThinking('us.anthropic.claude-opus-4-7')).toBe(true);
   });
 
   test('should return true for claude-4-6-opus (alternate naming)', () => {
@@ -108,8 +108,8 @@ describe('supportsContext1m', () => {
     expect(supportsContext1m('claude-sonnet-5')).toBe(true);
   });
 
-  test('should return true for claude-opus-4-6', () => {
-    expect(supportsContext1m('claude-opus-4-6')).toBe(true);
+  test('should return true for claude-opus-4-7', () => {
+    expect(supportsContext1m('claude-opus-4-7')).toBe(true);
   });
 
   test('should return true for claude-opus-5 (future)', () => {
@@ -323,10 +323,10 @@ describe('bedrockInputParser', () => {
     });
   });
 
-  describe('Opus 4.6 Adaptive Thinking', () => {
-    test('should default to adaptive thinking for anthropic.claude-opus-4-6-v1', () => {
+  describe('Opus 4.7 Adaptive Thinking', () => {
+    test('should default to adaptive thinking for anthropic.claude-opus-4-7', () => {
       const input = {
-        model: 'anthropic.claude-opus-4-6-v1',
+        model: 'anthropic.claude-opus-4-7',
       };
       const result = bedrockInputParser.parse(input) as Record<string, unknown>;
       const additionalFields = result.additionalModelRequestFields as Record<string, unknown>;
@@ -338,9 +338,9 @@ describe('bedrockInputParser', () => {
       ]);
     });
 
-    test('should handle cross-region model ID us.anthropic.claude-opus-4-6-v1', () => {
+    test('should handle cross-region model ID us.anthropic.claude-opus-4-7', () => {
       const input = {
-        model: 'us.anthropic.claude-opus-4-6-v1',
+        model: 'us.anthropic.claude-opus-4-7',
       };
       const result = bedrockInputParser.parse(input) as Record<string, unknown>;
       const additionalFields = result.additionalModelRequestFields as Record<string, unknown>;
@@ -352,9 +352,9 @@ describe('bedrockInputParser', () => {
       ]);
     });
 
-    test('should handle cross-region model ID global.anthropic.claude-opus-4-6-v1', () => {
+    test('should handle cross-region model ID global.anthropic.claude-opus-4-7', () => {
       const input = {
-        model: 'global.anthropic.claude-opus-4-6-v1',
+        model: 'global.anthropic.claude-opus-4-7',
       };
       const result = bedrockInputParser.parse(input) as Record<string, unknown>;
       const additionalFields = result.additionalModelRequestFields as Record<string, unknown>;
@@ -367,7 +367,7 @@ describe('bedrockInputParser', () => {
 
     test('should pass effort parameter via output_config for adaptive models', () => {
       const input = {
-        model: 'anthropic.claude-opus-4-6-v1',
+        model: 'anthropic.claude-opus-4-7',
         effort: 'medium',
       };
       const result = bedrockInputParser.parse(input) as Record<string, unknown>;
@@ -379,7 +379,7 @@ describe('bedrockInputParser', () => {
 
     test('should not include output_config when effort is unset (empty string)', () => {
       const input = {
-        model: 'anthropic.claude-opus-4-6-v1',
+        model: 'anthropic.claude-opus-4-7',
         effort: '',
       };
       const result = bedrockInputParser.parse(input) as Record<string, unknown>;
@@ -390,7 +390,7 @@ describe('bedrockInputParser', () => {
 
     test('should respect thinking=false for adaptive models', () => {
       const input = {
-        model: 'anthropic.claude-opus-4-6-v1',
+        model: 'anthropic.claude-opus-4-7',
         thinking: false,
       };
       const result = bedrockInputParser.parse(input) as Record<string, unknown>;
@@ -405,7 +405,7 @@ describe('bedrockInputParser', () => {
 
     test('should preserve effort when thinking=false for adaptive models', () => {
       const input = {
-        model: 'anthropic.claude-opus-4-6-v1',
+        model: 'anthropic.claude-opus-4-7',
         thinking: false,
         effort: 'high',
       };
@@ -442,9 +442,9 @@ describe('bedrockInputParser', () => {
       expect(additionalFields.output_config).toBeUndefined();
     });
 
-    test('should support max effort for Opus 4.6', () => {
+    test('should support max effort for Opus 4.7', () => {
       const input = {
-        model: 'anthropic.claude-opus-4-6-v1',
+        model: 'anthropic.claude-opus-4-7',
         effort: 'max',
       };
       const result = bedrockInputParser.parse(input) as Record<string, unknown>;
@@ -457,7 +457,7 @@ describe('bedrockInputParser', () => {
   describe('bedrockOutputParser with configureThinking', () => {
     test('should preserve adaptive thinking config without setting default maxTokens', () => {
       const parsed = bedrockInputParser.parse({
-        model: 'anthropic.claude-opus-4-6-v1',
+        model: 'anthropic.claude-opus-4-7',
       }) as Record<string, unknown>;
       const output = bedrockOutputParser(parsed as Record<string, unknown>);
       const amrf = output.additionalModelRequestFields as Record<string, unknown>;
@@ -468,7 +468,7 @@ describe('bedrockInputParser', () => {
 
     test('should respect user-provided maxTokens for adaptive model', () => {
       const parsed = bedrockInputParser.parse({
-        model: 'anthropic.claude-opus-4-6-v1',
+        model: 'anthropic.claude-opus-4-7',
         maxTokens: 32000,
       }) as Record<string, unknown>;
       const output = bedrockOutputParser(parsed as Record<string, unknown>);
@@ -477,7 +477,7 @@ describe('bedrockInputParser', () => {
 
     test('should use maxOutputTokens as maxTokens for adaptive model when maxTokens is not set', () => {
       const parsed = bedrockInputParser.parse({
-        model: 'anthropic.claude-opus-4-6-v1',
+        model: 'anthropic.claude-opus-4-7',
         maxOutputTokens: 24000,
       }) as Record<string, unknown>;
       const output = bedrockOutputParser(parsed as Record<string, unknown>);
@@ -497,7 +497,7 @@ describe('bedrockInputParser', () => {
 
     test('should pass output_config through for adaptive model with effort', () => {
       const parsed = bedrockInputParser.parse({
-        model: 'anthropic.claude-opus-4-6-v1',
+        model: 'anthropic.claude-opus-4-7',
         effort: 'low',
       }) as Record<string, unknown>;
       const output = bedrockOutputParser(parsed as Record<string, unknown>);
@@ -508,7 +508,7 @@ describe('bedrockInputParser', () => {
 
     test('should not set maxTokens for adaptive models when neither maxTokens nor maxOutputTokens are provided', () => {
       const parsed = bedrockInputParser.parse({
-        model: 'anthropic.claude-opus-4-6-v1',
+        model: 'anthropic.claude-opus-4-7',
       }) as Record<string, unknown>;
       parsed.maxOutputTokens = undefined;
       (parsed as Record<string, unknown>).maxTokens = undefined;
@@ -621,7 +621,7 @@ describe('bedrockInputParser', () => {
 
     test('should not strip anthropic_beta when staying on an Anthropic model', () => {
       const input = {
-        model: 'anthropic.claude-opus-4-6-v1',
+        model: 'anthropic.claude-opus-4-7',
       };
       const result = bedrockInputParser.parse(input) as Record<string, unknown>;
       const amrf = result.additionalModelRequestFields as Record<string, unknown>;

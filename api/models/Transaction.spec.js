@@ -618,7 +618,7 @@ describe('calculateTokenValue Edge Cases', () => {
     const initialBalance = 100000000;
     await Balance.create({ user: userId, tokenCredits: initialBalance });
 
-    const model = 'claude-opus-4-6';
+    const model = 'claude-opus-4-7';
     const completionTokens = 500;
 
     const result = await createTransaction({
@@ -649,7 +649,7 @@ describe('Premium Token Pricing Integration Tests', () => {
     const initialBalance = 100000000;
     await Balance.create({ user: userId, tokenCredits: initialBalance });
 
-    const model = 'claude-opus-4-6';
+    const model = 'claude-opus-4-7';
     const promptTokens = 100000;
     const completionTokens = 500;
 
@@ -678,7 +678,7 @@ describe('Premium Token Pricing Integration Tests', () => {
     const initialBalance = 100000000;
     await Balance.create({ user: userId, tokenCredits: initialBalance });
 
-    const model = 'claude-opus-4-6';
+    const model = 'claude-opus-4-7';
     const promptTokens = 250000;
     const completionTokens = 500;
 
@@ -707,7 +707,7 @@ describe('Premium Token Pricing Integration Tests', () => {
     const initialBalance = 100000000;
     await Balance.create({ user: userId, tokenCredits: initialBalance });
 
-    const model = 'claude-opus-4-6';
+    const model = 'claude-opus-4-7';
     const promptTokens = premiumTokenValues[model].threshold;
     const completionTokens = 500;
 
@@ -736,7 +736,7 @@ describe('Premium Token Pricing Integration Tests', () => {
     const initialBalance = 100000000;
     await Balance.create({ user: userId, tokenCredits: initialBalance });
 
-    const model = 'claude-opus-4-6';
+    const model = 'claude-opus-4-7';
     const txData = {
       user: userId,
       conversationId: 'test-structured-premium',
@@ -782,7 +782,7 @@ describe('Premium Token Pricing Integration Tests', () => {
     const initialBalance = 100000000;
     await Balance.create({ user: userId, tokenCredits: initialBalance });
 
-    const model = 'claude-opus-4-6';
+    const model = 'claude-opus-4-7';
     const txData = {
       user: userId,
       conversationId: 'test-structured-standard',

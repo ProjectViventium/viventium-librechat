@@ -53,7 +53,7 @@ describe('viventium-seed-agents', () => {
       env: {
         VIVENTIUM_AGENT_SEED_OWNER_EMAIL: 'seed-owner@example.com',
         VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER: 'anthropic',
-        VIVENTIUM_FC_CONSCIOUS_LLM_MODEL: 'claude-opus-4-6',
+        VIVENTIUM_FC_CONSCIOUS_LLM_MODEL: 'claude-opus-4-7',
         VIVENTIUM_CORTEX_PRODUCTIVITY_LLM_PROVIDER: 'anthropic',
         VIVENTIUM_CORTEX_PRODUCTIVITY_LLM_MODEL: 'claude-sonnet-4-6',
         OTUC_ACTIVATION_PROVIDER: 'groq',
@@ -63,7 +63,7 @@ describe('viventium-seed-agents', () => {
 
     expect(normalized.meta.user).toEqual({ email: 'seed-owner@example.com' });
     expect(normalized.mainAgent.provider).toBe('anthropic');
-    expect(normalized.mainAgent.model).toBe('claude-opus-4-6');
+    expect(normalized.mainAgent.model).toBe('claude-opus-4-7');
     expect(normalized.mainAgent.voice_llm_provider).toBe('openAI');
     expect(normalized.mainAgent.voice_llm_model).toBe('gpt-5.4');
     expect(normalized.backgroundAgents[0].provider).toBe('anthropic');
@@ -71,13 +71,25 @@ describe('viventium-seed-agents', () => {
     expect(normalized.backgroundAgents[0].model_parameters.model).toBe('claude-sonnet-4-6');
   });
 
-  test('preserves only runtime-editable cortex wiring from existing agents', () => {
+  test('preserves live user-managed agent fields from existing agents during reseed', () => {
     const existing = {
       provider: 'anthropic',
       model: 'claude-sonnet-4-6',
+      name: 'My Viv',
+      description: 'custom description',
+      instructions: 'keep my live instructions',
+      tools: ['sys__server__sys_mcp_sequential-thinking'],
       model_parameters: {
         model: 'claude-sonnet-4-6',
       },
+      voice_llm_provider: 'anthropic',
+      voice_llm_model: 'claude-haiku-4-5',
+      voice_llm_model_parameters: {
+        model: 'claude-haiku-4-5',
+        thinking: false,
+      },
+      conversation_starters: ['keep this starter'],
+      category: 'Custom',
       background_cortices: [
         {
           agent_id: 'agent-a',
@@ -91,9 +103,20 @@ describe('viventium-seed-agents', () => {
     const incoming = {
       provider: 'openAI',
       model: 'gpt-5.4',
+      name: 'Bundle Viv',
+      description: 'bundle description',
+      instructions: 'replace me',
+      tools: ['sys__server__sys_mcp_sequential-thinking', 'web_search'],
       model_parameters: {
         model: 'gpt-5.4',
       },
+      voice_llm_provider: 'openAI',
+      voice_llm_model: 'gpt-4o-mini',
+      voice_llm_model_parameters: {
+        model: 'gpt-4o-mini',
+      },
+      conversation_starters: ['bundle starter'],
+      category: 'General',
       background_cortices: [
         {
           agent_id: 'agent-a',
@@ -106,11 +129,23 @@ describe('viventium-seed-agents', () => {
     };
 
     expect(preserveExistingEditableFields(existing, incoming)).toEqual({
-      provider: 'openAI',
-      model: 'gpt-5.4',
+      provider: 'anthropic',
+      model: 'claude-sonnet-4-6',
+      name: 'My Viv',
+      description: 'custom description',
+      instructions: 'keep my live instructions',
+      tools: ['sys__server__sys_mcp_sequential-thinking'],
       model_parameters: {
-        model: 'gpt-5.4',
+        model: 'claude-sonnet-4-6',
       },
+      voice_llm_provider: 'anthropic',
+      voice_llm_model: 'claude-haiku-4-5',
+      voice_llm_model_parameters: {
+        model: 'claude-haiku-4-5',
+        thinking: false,
+      },
+      conversation_starters: ['keep this starter'],
+      category: 'Custom',
       background_cortices: [
         {
           agent_id: 'agent-a',
@@ -120,6 +155,68 @@ describe('viventium-seed-agents', () => {
           },
         },
       ],
+    });
+  });
+
+  test('preserves existing tools during reseed instead of restoring scaffold tools', () => {
+    const existing = {
+      tools: ['sys__server__sys_mcp_sequential-thinking'],
+      background_cortices: [],
+    };
+    const incoming = {
+      tools: ['sys__server__sys_mcp_sequential-thinking', 'web_search'],
+      background_cortices: [],
+    };
+
+    expect(preserveExistingEditableFields(existing, incoming)).toEqual({
+      tools: ['sys__server__sys_mcp_sequential-thinking'],
+      background_cortices: [],
+    });
+  });
+
+  test('normalizes Deep Research onto the canonical Anthropic Opus bag during seed-style updates', () => {
+    const bundle = {
+      meta: {
+        user: {
+          email: 'seed-owner@example.com',
+        },
+      },
+      mainAgent: {
+        id: 'agent_viventium_main_95aeb3',
+        provider: 'anthropic',
+        model: 'claude-opus-4-7',
+      },
+      backgroundAgents: [
+        {
+          id: 'agent_viventium_deep_research_95aeb3',
+          provider: 'openAI',
+          model: 'gpt-5.4',
+          model_parameters: {
+            model: 'gpt-5.4',
+            reasoning_effort: 'xhigh',
+          },
+        },
+      ],
+    };
+
+    const normalized = normalizeBundleForRuntimeWithOwner(bundle, {
+      env: {
+        VIVENTIUM_AGENT_SEED_OWNER_EMAIL: 'seed-owner@example.com',
+        VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER: 'anthropic',
+        VIVENTIUM_FC_CONSCIOUS_LLM_MODEL: 'claude-opus-4-7',
+        VIVENTIUM_CORTEX_DEEP_RESEARCH_LLM_PROVIDER: 'anthropic',
+        VIVENTIUM_CORTEX_DEEP_RESEARCH_LLM_MODEL: 'claude-opus-4-7',
+      },
+    });
+
+    expect(normalized.backgroundAgents[0]).toMatchObject({
+      id: 'agent_viventium_deep_research_95aeb3',
+      provider: 'anthropic',
+      model: 'claude-opus-4-7',
+      model_parameters: {
+        model: 'claude-opus-4-7',
+        thinkingBudget: 4000,
+      },
     });
   });
 

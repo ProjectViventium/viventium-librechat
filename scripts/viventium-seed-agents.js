@@ -60,9 +60,12 @@ const AGENT_FIELDS = [
   'conversation_starters',
   'category',
 ];
-const PRESERVE_EXISTING_EDITABLE_FIELDS = [
-  'background_cortices',
-];
+/* === VIVENTIUM START ===
+ * Feature: Protect live user-managed built-in agent state on startup reseed.
+ * Purpose: Existing installs must keep editable agent fields until an intentional reviewed sync
+ * reconciles them; startup seeding should only create missing agents or fill missing fields.
+ * === VIVENTIUM END === */
+const PRESERVE_EXISTING_EDITABLE_FIELDS = AGENT_FIELDS.filter((field) => field !== 'id');
 
 const PUBLIC_ACCESS_ROLE_IDS = Object.freeze({
   viewer: {
@@ -275,11 +278,15 @@ async function upsertAgent({ agentData, userId, dryRun }) {
     };
   }
 
-  const updateData = buildUpdateData(preserveExistingEditableFields(existing, agentData));
+  const effectiveAgentData = preserveExistingEditableFields(existing, agentData);
+  const updateData = buildUpdateData(effectiveAgentData);
   if (!dryRun && Object.keys(updateData).length > 0) {
     await updateAgent({ id: agentData.id }, updateData, { updatingUserId: userId });
   }
-  const runtimeRepair = await repairPersistedAgentRuntimeFields({ agentData, dryRun });
+  const runtimeRepair = await repairPersistedAgentRuntimeFields({
+    agentData: effectiveAgentData,
+    dryRun,
+  });
   return {
     id: agentData.id,
     status: dryRun ? 'dry-run' : 'updated',

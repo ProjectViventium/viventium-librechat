@@ -757,14 +757,14 @@ describe('spendTokens', () => {
   });
 
   describe('premium token pricing', () => {
-    it('should charge standard rates for claude-opus-4-6 when prompt tokens are below threshold', async () => {
+    it('should charge standard rates for claude-opus-4-7 when prompt tokens are below threshold', async () => {
       const initialBalance = 100000000;
       await Balance.create({
         user: userId,
         tokenCredits: initialBalance,
       });
 
-      const model = 'claude-opus-4-6';
+      const model = 'claude-opus-4-7';
       const promptTokens = 100000;
       const completionTokens = 500;
 
@@ -785,14 +785,14 @@ describe('spendTokens', () => {
       expect(balance.tokenCredits).toBeCloseTo(initialBalance - expectedCost, 0);
     });
 
-    it('should charge premium rates for claude-opus-4-6 when prompt tokens exceed threshold', async () => {
+    it('should charge premium rates for claude-opus-4-7 when prompt tokens exceed threshold', async () => {
       const initialBalance = 100000000;
       await Balance.create({
         user: userId,
         tokenCredits: initialBalance,
       });
 
-      const model = 'claude-opus-4-6';
+      const model = 'claude-opus-4-7';
       const promptTokens = 250000;
       const completionTokens = 500;
 
@@ -821,7 +821,7 @@ describe('spendTokens', () => {
         tokenCredits: initialBalance,
       });
 
-      const model = 'claude-opus-4-6';
+      const model = 'claude-opus-4-7';
       const txData = {
         user: userId,
         conversationId: 'test-structured-premium',
@@ -863,7 +863,7 @@ describe('spendTokens', () => {
         tokenCredits: initialBalance,
       });
 
-      const model = 'claude-opus-4-6';
+      const model = 'claude-opus-4-7';
       const txData = {
         user: userId,
         conversationId: 'test-structured-standard',
@@ -937,7 +937,7 @@ describe('spendTokens', () => {
       const txData = {
         user: userId,
         conversationId: 'test-negative-prompt',
-        model: 'claude-opus-4-6',
+        model: 'claude-opus-4-7',
         context: 'test',
         balance: { enabled: true },
       };
@@ -952,7 +952,7 @@ describe('spendTokens', () => {
       expect(Math.abs(promptTx.rawAmount)).toBe(0);
       expect(completionTx.rawAmount).toBe(-100);
 
-      const standardCompletionRate = tokenValues['claude-opus-4-6'].completion;
+      const standardCompletionRate = tokenValues['claude-opus-4-7'].completion;
       expect(completionTx.rate).toBe(standardCompletionRate);
     });
 
@@ -963,7 +963,7 @@ describe('spendTokens', () => {
         tokenCredits: initialBalance,
       });
 
-      const model = 'claude-opus-4-6';
+      const model = 'claude-opus-4-7';
       const promptTokens = 250000;
       const completionTokens = 500;
 
@@ -996,7 +996,7 @@ describe('spendTokens', () => {
       const txData = {
         user: userId,
         conversationId: 'test-zero-prompt',
-        model: 'claude-opus-4-6',
+        model: 'claude-opus-4-7',
         context: 'test',
         balance: { enabled: true },
       };
@@ -1009,7 +1009,7 @@ describe('spendTokens', () => {
 
       expect(Math.abs(promptTx.rawAmount)).toBe(0);
 
-      const standardCompletionRate = tokenValues['claude-opus-4-6'].completion;
+      const standardCompletionRate = tokenValues['claude-opus-4-7'].completion;
       expect(completionTx.rate).toBe(standardCompletionRate);
     });
 
@@ -1020,7 +1020,7 @@ describe('spendTokens', () => {
         tokenCredits: initialBalance,
       });
 
-      const model = 'claude-opus-4-6';
+      const model = 'claude-opus-4-7';
       const txData = {
         user: userId,
         conversationId: 'test-negative-no-premium',
@@ -1045,7 +1045,7 @@ describe('spendTokens', () => {
         tokenCredits: initialBalance,
       });
 
-      const model = 'claude-opus-4-6';
+      const model = 'claude-opus-4-7';
       const txData = {
         user: userId,
         conversationId: 'test-negative-structured',

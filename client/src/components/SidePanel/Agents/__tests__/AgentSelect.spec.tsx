@@ -78,7 +78,7 @@ describe('AgentSelect', () => {
       id: 'agent_123',
       name: 'Voice Agent',
       provider: 'anthropic',
-      model: 'claude-opus-4-6',
+      model: 'claude-opus-4-7',
       tools: [],
       voice_llm_provider: 'anthropic',
       voice_llm_model: 'claude-haiku-4-5',

@@ -23,6 +23,8 @@ jest.mock('~/utils', () => ({
 }));
 
 const mockedCheckUserKeyExpiry = jest.mocked(checkUserKeyExpiry);
+const buildInferenceProfileArn = (profileId: string, accountId = '111122223333') =>
+  `arn:aws:bedrock:us-east-1:${accountId}:application-inference-profile/${profileId}`;
 
 const createMockParams = (
   overrides: Partial<{
@@ -316,8 +318,7 @@ describe('initializeBedrock', () => {
 
   describe('Inference Profile Configuration', () => {
     it('should set applicationInferenceProfile when model has matching inference profile config', async () => {
-      const inferenceProfileArn =
-        'arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123';
+      const inferenceProfileArn = buildInferenceProfileArn('abc123');
 
       const params = createMockParams({
         config: {
@@ -346,7 +347,7 @@ describe('initializeBedrock', () => {
             [EModelEndpoint.bedrock]: {
               inferenceProfiles: {
                 'us.anthropic.claude-sonnet-4-5-20250929-v1:0':
-                  'arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/xyz789',
+                  buildInferenceProfileArn('xyz789'),
               },
             },
           },
@@ -362,8 +363,7 @@ describe('initializeBedrock', () => {
     });
 
     it('should resolve environment variable in inference profile ARN', async () => {
-      const inferenceProfileArn =
-        'arn:aws:bedrock:us-east-1:951834775723:application-inference-profile/yjr1elcyt29s';
+      const inferenceProfileArn = buildInferenceProfileArn('yjr1elcyt29s');
       process.env.BEDROCK_INFERENCE_PROFILE_ARN = inferenceProfileArn;
 
       const params = createMockParams({
@@ -387,8 +387,7 @@ describe('initializeBedrock', () => {
     });
 
     it('should use direct ARN when no env variable syntax is used', async () => {
-      const directArn =
-        'arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/direct123';
+      const directArn = buildInferenceProfileArn('direct123');
 
       const params = createMockParams({
         config: {
@@ -439,10 +438,8 @@ describe('initializeBedrock', () => {
     });
 
     it('should resolve multiple different env variables for different models', async () => {
-      const claude37Arn =
-        'arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/claude37';
-      const sonnet45Arn =
-        'arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/sonnet45';
+      const claude37Arn = buildInferenceProfileArn('claude37');
+      const sonnet45Arn = buildInferenceProfileArn('sonnet45');
 
       process.env.CLAUDE_37_PROFILE = claude37Arn;
       process.env.SONNET_45_PROFILE = sonnet45Arn;
@@ -469,8 +466,7 @@ describe('initializeBedrock', () => {
     });
 
     it('should handle env variable with whitespace around it', async () => {
-      const inferenceProfileArn =
-        'arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/trimmed';
+      const inferenceProfileArn = buildInferenceProfileArn('trimmed');
       process.env.TRIMMED_PROFILE_ARN = inferenceProfileArn;
 
       const params = createMockParams({
@@ -526,10 +522,8 @@ describe('initializeBedrock', () => {
     });
 
     it('should handle multiple inference profiles and select the correct one', async () => {
-      const sonnet45Arn =
-        'arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/sonnet45';
-      const claude37Arn =
-        'arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/claude37';
+      const sonnet45Arn = buildInferenceProfileArn('sonnet45');
+      const claude37Arn = buildInferenceProfileArn('claude37');
 
       const params = createMockParams({
         config: {
@@ -538,8 +532,9 @@ describe('initializeBedrock', () => {
               inferenceProfiles: {
                 'us.anthropic.claude-sonnet-4-5-20250929-v1:0': sonnet45Arn,
                 'us.anthropic.claude-3-7-sonnet-20250219-v1:0': claude37Arn,
-                'global.anthropic.claude-opus-4-5-20251101-v1:0':
-                  'arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/opus45',
+                'global.anthropic.claude-opus-4-5-20251101-v1:0': buildInferenceProfileArn(
+                  'opus45',
+                ),
               },
             },
           },
@@ -555,8 +550,7 @@ describe('initializeBedrock', () => {
     });
 
     it('should work alongside guardrailConfig', async () => {
-      const inferenceProfileArn =
-        'arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123';
+      const inferenceProfileArn = buildInferenceProfileArn('abc123');
       const guardrailConfig = {
         guardrailIdentifier: 'test-guardrail',
         guardrailVersion: '1',
@@ -585,8 +579,7 @@ describe('initializeBedrock', () => {
     });
 
     it('should preserve the original model ID in llmConfig.model', async () => {
-      const inferenceProfileArn =
-        'arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123';
+      const inferenceProfileArn = buildInferenceProfileArn('abc123');
 
       const params = createMockParams({
         config: {
@@ -614,11 +607,11 @@ describe('initializeBedrock', () => {
     });
   });
 
-  describe('Opus 4.6 Adaptive Thinking', () => {
-    it('should configure adaptive thinking with no default maxTokens for Opus 4.6', async () => {
+  describe('Opus 4.7 Adaptive Thinking', () => {
+    it('should configure adaptive thinking with no default maxTokens for Opus 4.7', async () => {
       const params = createMockParams({
         model_parameters: {
-          model: 'anthropic.claude-opus-4-6-v1',
+          model: 'anthropic.claude-opus-4-7',
         },
       });
 
@@ -632,10 +625,10 @@ describe('initializeBedrock', () => {
       );
     });
 
-    it('should pass effort via output_config for Opus 4.6', async () => {
+    it('should pass effort via output_config for Opus 4.7', async () => {
       const params = createMockParams({
         model_parameters: {
-          model: 'anthropic.claude-opus-4-6-v1',
+          model: 'anthropic.claude-opus-4-7',
           effort: 'medium',
         },
       });
@@ -647,10 +640,10 @@ describe('initializeBedrock', () => {
       expect(amrf.output_config).toEqual({ effort: 'medium' });
     });
 
-    it('should respect user-provided maxTokens for Opus 4.6', async () => {
+    it('should respect user-provided maxTokens for Opus 4.7', async () => {
       const params = createMockParams({
         model_parameters: {
-          model: 'anthropic.claude-opus-4-6-v1',
+          model: 'anthropic.claude-opus-4-7',
           maxTokens: 32000,
         },
       });
@@ -660,10 +653,10 @@ describe('initializeBedrock', () => {
       expect(result.llmConfig.maxTokens).toBe(32000);
     });
 
-    it('should handle cross-region Opus 4.6 model IDs', async () => {
+    it('should handle cross-region Opus 4.7 model IDs', async () => {
       const params = createMockParams({
         model_parameters: {
-          model: 'us.anthropic.claude-opus-4-6-v1',
+          model: 'us.anthropic.claude-opus-4-7',
           effort: 'low',
         },
       });
@@ -671,7 +664,7 @@ describe('initializeBedrock', () => {
       const result = (await initializeBedrock(params)) as BedrockLLMConfigResult;
       const amrf = result.llmConfig.additionalModelRequestFields as Record<string, unknown>;
 
-      expect(result.llmConfig).toHaveProperty('model', 'us.anthropic.claude-opus-4-6-v1');
+      expect(result.llmConfig).toHaveProperty('model', 'us.anthropic.claude-opus-4-7');
       expect(amrf.thinking).toEqual({ type: 'adaptive' });
       expect(amrf.output_config).toEqual({ effort: 'low' });
     });
@@ -694,7 +687,7 @@ describe('initializeBedrock', () => {
     it('should not include output_config when effort is empty', async () => {
       const params = createMockParams({
         model_parameters: {
-          model: 'anthropic.claude-opus-4-6-v1',
+          model: 'anthropic.claude-opus-4-7',
           effort: '',
         },
       });

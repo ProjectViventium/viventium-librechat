@@ -1345,7 +1345,7 @@ describe('BackgroundCortexService.executeCortex', () => {
       recursion_limit: 11,
       provider: 'anthropic',
       model_parameters: {
-        model: 'claude-opus-4-6',
+        model: 'claude-opus-4-7',
         temperature: 0.4,
         thinking: { type: 'adaptive' },
       },
@@ -1364,7 +1364,7 @@ describe('BackgroundCortexService.executeCortex', () => {
         id: 'agent_emotional',
         name: 'Emotional Resonance',
         provider: 'anthropic',
-        model: 'claude-opus-4-6',
+        model: 'claude-opus-4-7',
         instructions: 'You are a cortex.',
         model_parameters: {
           temperature: 0.4,

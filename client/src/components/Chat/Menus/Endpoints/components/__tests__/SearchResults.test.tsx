@@ -43,7 +43,7 @@ const anthropicEndpoint: Endpoint = {
   value: 'anthropic',
   label: 'Anthropic',
   hasModels: true,
-  models: [{ name: 'claude-opus-4-6' }, { name: 'claude-sonnet-4-5' }],
+  models: [{ name: 'claude-opus-4-7' }, { name: 'claude-sonnet-4-5' }],
   icon: null,
 };
 
@@ -60,7 +60,7 @@ describe('SearchResults', () => {
   });
 
   it('marks model as selected when endpoint and model match with no active spec', () => {
-    mockSelectedValues = { endpoint: 'anthropic', model: 'claude-opus-4-6', modelSpec: '' };
+    mockSelectedValues = { endpoint: 'anthropic', model: 'claude-opus-4-7', modelSpec: '' };
     render(
       <SearchResults results={[anthropicEndpoint]} localize={localize} searchValue="claude" />,
     );
@@ -68,13 +68,13 @@ describe('SearchResults', () => {
     const items = screen.getAllByRole('menuitem');
     const selectedItem = items.find((el) => el.getAttribute('aria-selected') === 'true');
     expect(selectedItem).toBeDefined();
-    expect(selectedItem).toHaveTextContent('claude-opus-4-6');
+    expect(selectedItem).toHaveTextContent('claude-opus-4-7');
   });
 
   it('does not mark model as selected when a spec is active', () => {
     mockSelectedValues = {
       endpoint: 'anthropic',
-      model: 'claude-opus-4-6',
+      model: 'claude-opus-4-7',
       modelSpec: 'my-spec',
     };
     render(

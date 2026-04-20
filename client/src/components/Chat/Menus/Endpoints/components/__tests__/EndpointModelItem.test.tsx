@@ -38,7 +38,7 @@ const baseEndpoint: Endpoint = {
   value: 'anthropic',
   label: 'Anthropic',
   hasModels: true,
-  models: [{ name: 'claude-opus-4-6' }],
+  models: [{ name: 'claude-opus-4-7' }],
   icon: null,
 };
 
@@ -48,8 +48,8 @@ describe('EndpointModelItem', () => {
   });
 
   it('renders checkmark when model and endpoint match with no active spec', () => {
-    mockSelectedValues = { endpoint: 'anthropic', model: 'claude-opus-4-6', modelSpec: '' };
-    render(<EndpointModelItem modelId="claude-opus-4-6" endpoint={baseEndpoint} />);
+    mockSelectedValues = { endpoint: 'anthropic', model: 'claude-opus-4-7', modelSpec: '' };
+    render(<EndpointModelItem modelId="claude-opus-4-7" endpoint={baseEndpoint} />);
 
     const menuItem = screen.getByRole('menuitem');
     expect(menuItem).toHaveAttribute('aria-selected', 'true');
@@ -58,18 +58,18 @@ describe('EndpointModelItem', () => {
   it('does NOT render checkmark when a model spec is active even if endpoint and model match', () => {
     mockSelectedValues = {
       endpoint: 'anthropic',
-      model: 'claude-opus-4-6',
+      model: 'claude-opus-4-7',
       modelSpec: 'my-anthropic-spec',
     };
-    render(<EndpointModelItem modelId="claude-opus-4-6" endpoint={baseEndpoint} />);
+    render(<EndpointModelItem modelId="claude-opus-4-7" endpoint={baseEndpoint} />);
 
     const menuItem = screen.getByRole('menuitem');
     expect(menuItem).not.toHaveAttribute('aria-selected');
   });
 
   it('does NOT render checkmark when model matches but endpoint differs', () => {
-    mockSelectedValues = { endpoint: 'openai', model: 'claude-opus-4-6', modelSpec: '' };
-    render(<EndpointModelItem modelId="claude-opus-4-6" endpoint={baseEndpoint} />);
+    mockSelectedValues = { endpoint: 'openai', model: 'claude-opus-4-7', modelSpec: '' };
+    render(<EndpointModelItem modelId="claude-opus-4-7" endpoint={baseEndpoint} />);
 
     const menuItem = screen.getByRole('menuitem');
     expect(menuItem).not.toHaveAttribute('aria-selected');
@@ -77,7 +77,7 @@ describe('EndpointModelItem', () => {
 
   it('does NOT render checkmark when endpoint matches but model differs', () => {
     mockSelectedValues = { endpoint: 'anthropic', model: 'claude-sonnet-4-5', modelSpec: '' };
-    render(<EndpointModelItem modelId="claude-opus-4-6" endpoint={baseEndpoint} />);
+    render(<EndpointModelItem modelId="claude-opus-4-7" endpoint={baseEndpoint} />);
 
     const menuItem = screen.getByRole('menuitem');
     expect(menuItem).not.toHaveAttribute('aria-selected');
@@ -90,11 +90,11 @@ describe('EndpointModelItem', () => {
         {renderEndpointModels(
           baseEndpoint,
           baseEndpoint.models ?? [],
-          'claude-opus-4-6' as unknown as string[],
+          'claude-opus-4-7' as unknown as string[],
         )}
       </>,
     );
 
-    expect(screen.getByText('claude-opus-4-6')).toBeInTheDocument();
+    expect(screen.getByText('claude-opus-4-7')).toBeInTheDocument();
   });
 });

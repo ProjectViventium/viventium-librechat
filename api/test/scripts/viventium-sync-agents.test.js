@@ -68,8 +68,8 @@ describe('viventium-sync-agents args', () => {
       {
         id: 'agent_viventium_main_95aeb3',
         provider: 'anthropic',
-        model: 'claude-opus-4-6',
-        model_parameters: { model: 'claude-opus-4-6' },
+        model: 'claude-opus-4-7',
+        model_parameters: { model: 'claude-opus-4-7' },
         voice_llm_provider: 'anthropic',
         voice_llm_model: 'claude-haiku-4-5',
         voice_llm_model_parameters: { thinking: false },
@@ -79,8 +79,8 @@ describe('viventium-sync-agents args', () => {
 
     expect(update).toEqual({
       provider: 'anthropic',
-      model: 'claude-opus-4-6',
-      model_parameters: { model: 'claude-opus-4-6' },
+      model: 'claude-opus-4-7',
+      model_parameters: { model: 'claude-opus-4-7' },
       voice_llm_provider: 'anthropic',
       voice_llm_model: 'claude-haiku-4-5',
       voice_llm_model_parameters: { thinking: false },

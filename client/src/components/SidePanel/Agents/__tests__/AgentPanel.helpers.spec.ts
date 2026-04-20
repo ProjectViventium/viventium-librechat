@@ -71,7 +71,7 @@ describe('composeAgentUpdatePayload', () => {
     form.provider = 'openAI';
     form.model = 'gpt-5.4';
     form.model_parameters = {
-      model: 'claude-opus-4-6',
+      model: 'claude-opus-4-7',
       reasoning_effort: 'xhigh',
     } as AgentForm['model_parameters'];
 
@@ -95,7 +95,7 @@ describe('composeAgentUpdatePayload', () => {
     form.voice_llm_provider = 'anthropic';
     form.voice_llm_model = 'claude-haiku-4-5';
     form.voice_llm_model_parameters = {
-      model: 'claude-opus-4-6',
+      model: 'claude-opus-4-7',
       temperature: 0.2,
       max_output_tokens: 180,
     } as AgentForm['voice_llm_model_parameters'];

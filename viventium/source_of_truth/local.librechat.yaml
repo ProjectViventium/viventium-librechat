@@ -84,7 +84,7 @@ viventium:
   installMode: native
   consciousAgent:
     provider: anthropic
-    model: claude-opus-4-6
+    model: claude-opus-4-7
 balance:
   enabled: false
   startBalance: 200000
@@ -227,15 +227,15 @@ modelSpecs:
     preset:
       endpoint: anthropic
       model: claude-sonnet-4-6
-  - name: claude-opus-4-6
-    label: Claude Opus 4 6
+  - name: claude-opus-4-7
+    label: Claude Opus 4 7
     description: Anthropic Direct
     group: anthropic
     groupIcon: anthropic
     iconURL: anthropic
     preset:
       endpoint: anthropic
-      model: claude-opus-4-6
+      model: claude-opus-4-7
   addedEndpoints:
   - agents
   - anthropic

@@ -10,6 +10,13 @@ import { loadAnthropicVertexCredentials, getVertexCredentialOptions } from './ve
 import { getLLMConfig } from './llm';
 import { resolveAnthropicSubscriptionUserValues } from './oauthSubscription';
 
+/* === VIVENTIUM START ===
+ * Feature: Connected-account credential recovery.
+ * Purpose: Convert unreadable stored Anthropic credentials into reconnect guidance or safe fallback.
+ * === VIVENTIUM END === */
+const ANTHROPIC_CONNECTED_ACCOUNT_RECONNECT_MESSAGE =
+  'Anthropic connected account needs reconnect in Settings > Account > Connected Accounts.';
+
 const isNoUserKeyError = (error: unknown): boolean => {
   if (!(error instanceof Error)) {
     return false;
@@ -34,6 +41,23 @@ const isInvalidUserKeyError = (error: unknown): boolean => {
   } catch {
     return false;
   }
+};
+
+/* === VIVENTIUM START ===
+ * Feature: Connected-account credential recovery.
+ * Purpose: Detect keychain/decryption failures so Telegram surfaces reconnect guidance instead of a generic connection error.
+ * === VIVENTIUM END === */
+const isAnthropicConnectedAccountReadError = (error: unknown): boolean => {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  const message = error.message.toLowerCase();
+  return (
+    message.includes('operation-specific reason') ||
+    message.includes('bad decrypt') ||
+    message.includes('invalid key length')
+  );
 };
 
 const isConnectedAccountAuthMode = (): boolean => {
@@ -103,6 +127,10 @@ export async function initializeAnthropic({
         checkUserKeyExpiry(expiresAt, EModelEndpoint.anthropic);
       }
     } catch (error) {
+      /* === VIVENTIUM START ===
+       * Feature: Connected-account credential recovery.
+       * Purpose: Treat unreadable connected-account secrets as reconnect/fallback cases instead of hard initialization crashes.
+       * === VIVENTIUM END === */
       if (isInvalidUserKeyError(error)) {
         /** Backward compatibility for older plain-string Anthropic keys */
         try {
@@ -114,9 +142,17 @@ export async function initializeAnthropic({
             checkUserKeyExpiry(expiresAt, EModelEndpoint.anthropic);
           }
         } catch (legacyError) {
-          if (!isNoUserKeyError(legacyError)) {
+          if (isAnthropicConnectedAccountReadError(legacyError)) {
+            if (isConnectedAccountAuthMode()) {
+              throw new Error(ANTHROPIC_CONNECTED_ACCOUNT_RECONNECT_MESSAGE);
+            }
+          } else if (!isNoUserKeyError(legacyError)) {
             throw legacyError;
           }
+        }
+      } else if (isAnthropicConnectedAccountReadError(error)) {
+        if (isConnectedAccountAuthMode()) {
+          throw new Error(ANTHROPIC_CONNECTED_ACCOUNT_RECONNECT_MESSAGE);
         }
       } else if (!isNoUserKeyError(error)) {
         throw error;
@@ -129,12 +165,12 @@ export async function initializeAnthropic({
 
     if (!anthropicApiKey) {
       if (isUserProvided) {
+        if (isConnectedAccountAuthMode()) {
+          throw new Error(ANTHROPIC_CONNECTED_ACCOUNT_RECONNECT_MESSAGE);
+        }
         throw new Error(
           JSON.stringify({
-            type: isConnectedAccountAuthMode()
-              ? ErrorTypes.CONNECTED_ACCOUNT_REQUIRED
-              : ErrorTypes.NO_USER_KEY,
-            info: EModelEndpoint.anthropic,
+            type: ErrorTypes.NO_USER_KEY,
           }),
         );
       }

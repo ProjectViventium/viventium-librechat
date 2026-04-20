@@ -501,26 +501,26 @@ describe('models/Agent', () => {
         id: agentId,
         name: 'Anthropic Alias Agent',
         provider: 'anthropic',
-        model: 'claude-opus-4-6',
+        model: 'claude-opus-4-7',
         model_parameters: {
           model: 'claude-sonnet-4-6',
         },
         author: authorId,
       });
 
-      expect(createdAgent.model).toBe('claude-opus-4-6');
-      expect(createdAgent.model_parameters.model).toBe('claude-opus-4-6');
+      expect(createdAgent.model).toBe('claude-opus-4-7');
+      expect(createdAgent.model_parameters.model).toBe('claude-opus-4-7');
 
       const storedAgent = await Agent.findOne({ id: agentId }).lean();
-      expect(storedAgent.model).toBe('claude-opus-4-6');
-      expect(storedAgent.model_parameters.model).toBe('claude-opus-4-6');
+      expect(storedAgent.model).toBe('claude-opus-4-7');
+      expect(storedAgent.model_parameters.model).toBe('claude-opus-4-7');
 
       const legacyAgentId = `agent_${uuidv4()}`;
       await Agent.create({
         id: legacyAgentId,
         name: 'Legacy Anthropic Alias Agent',
         provider: 'anthropic',
-        model: 'claude-opus-4-6',
+        model: 'claude-opus-4-7',
         model_parameters: {
           model: 'claude-sonnet-4-6',
         },
@@ -529,20 +529,20 @@ describe('models/Agent', () => {
       });
 
       const retrievedLegacyAgent = await getAgent({ id: legacyAgentId });
-      expect(retrievedLegacyAgent.model).toBe('claude-opus-4-6');
-      expect(retrievedLegacyAgent.model_parameters.model).toBe('claude-opus-4-6');
+      expect(retrievedLegacyAgent.model).toBe('claude-opus-4-7');
+      expect(retrievedLegacyAgent.model_parameters.model).toBe('claude-opus-4-7');
 
       const listedLegacyAgents = await getAgents({ id: legacyAgentId });
       expect(listedLegacyAgents).toHaveLength(1);
-      expect(listedLegacyAgents[0].model).toBe('claude-opus-4-6');
-      expect(listedLegacyAgents[0].model_parameters.model).toBe('claude-opus-4-6');
+      expect(listedLegacyAgents[0].model).toBe('claude-opus-4-7');
+      expect(listedLegacyAgents[0].model_parameters.model).toBe('claude-opus-4-7');
 
       const loadedLegacyAgent = await loadAgent({
         req: { user: { id: authorId } },
         agent_id: legacyAgentId,
       });
-      expect(loadedLegacyAgent.model).toBe('claude-opus-4-6');
-      expect(loadedLegacyAgent.model_parameters.model).toBe('claude-opus-4-6');
+      expect(loadedLegacyAgent.model).toBe('claude-opus-4-7');
+      expect(loadedLegacyAgent.model_parameters.model).toBe('claude-opus-4-7');
     });
 
     test('should align model_parameters.model with the explicit model on update', async () => {
@@ -552,9 +552,9 @@ describe('models/Agent', () => {
         id: agentId,
         name: 'Anthropic Model Alignment Agent',
         provider: 'anthropic',
-        model: 'claude-opus-4-6',
+        model: 'claude-opus-4-7',
         model_parameters: {
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-4-7',
           temperature: 0.1,
         },
         author: authorId,
@@ -566,7 +566,7 @@ describe('models/Agent', () => {
           provider: 'openAI',
           model: 'gpt-5.4',
           model_parameters: {
-            model: 'claude-opus-4-6',
+            model: 'claude-opus-4-7',
             reasoning_effort: 'xhigh',
           },
         },
@@ -2299,7 +2299,7 @@ describe('models/Agent', () => {
 
         await Agent.findOneAndUpdate(
           { id: agentId },
-          { provider: 'anthropic', model: 'claude-opus-4-6' },
+          { provider: 'anthropic', model: 'claude-opus-4-7' },
           { new: true },
         );
 
@@ -2321,7 +2321,7 @@ describe('models/Agent', () => {
           id: agentId,
           name: 'Voice Parameter Persistence Agent',
           provider: 'anthropic',
-          model: 'claude-opus-4-6',
+          model: 'claude-opus-4-7',
           voice_llm_provider: 'anthropic',
           voice_llm_model: 'claude-haiku-4-5',
           author: authorId,

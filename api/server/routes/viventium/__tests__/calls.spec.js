@@ -52,9 +52,9 @@ jest.mock('~/server/services/viventium/CallSessionService', () => ({
       tts: { provider: 'openai', variant: 'gpt-4o-mini-tts' },
     },
     assistantRoute: {
-      primary: { provider: 'anthropic', model: 'claude-opus-4-6' },
+      primary: { provider: 'anthropic', model: 'claude-opus-4-7' },
       voiceCallLlm: null,
-      effective: { provider: 'anthropic', model: 'claude-opus-4-6' },
+      effective: { provider: 'anthropic', model: 'claude-opus-4-7' },
       inheritsPrimary: true,
     },
   })),
@@ -74,9 +74,9 @@ jest.mock('~/server/services/viventium/CallSessionService', () => ({
     requestedVoiceRoute,
     savedVoiceRoute: requestedVoiceRoute,
     assistantRoute: {
-      primary: { provider: 'anthropic', model: 'claude-opus-4-6' },
+      primary: { provider: 'anthropic', model: 'claude-opus-4-7' },
       voiceCallLlm: null,
-      effective: { provider: 'anthropic', model: 'claude-opus-4-6' },
+      effective: { provider: 'anthropic', model: 'claude-opus-4-7' },
       inheritsPrimary: true,
     },
   })),
@@ -228,9 +228,9 @@ describe('/api/viventium/calls', () => {
       tts: { provider: 'openai', variant: 'gpt-4o-mini-tts' },
     });
     expect(res.body.assistantRoute).toEqual({
-      primary: { provider: 'anthropic', model: 'claude-opus-4-6' },
+      primary: { provider: 'anthropic', model: 'claude-opus-4-7' },
       voiceCallLlm: null,
-      effective: { provider: 'anthropic', model: 'claude-opus-4-6' },
+      effective: { provider: 'anthropic', model: 'claude-opus-4-7' },
       inheritsPrimary: true,
     });
   });
@@ -262,9 +262,9 @@ describe('/api/viventium/calls', () => {
       tts: { provider: 'elevenlabs', variant: 'voice_123' },
     });
     expect(res.body.assistantRoute).toEqual({
-      primary: { provider: 'anthropic', model: 'claude-opus-4-6' },
+      primary: { provider: 'anthropic', model: 'claude-opus-4-7' },
       voiceCallLlm: null,
-      effective: { provider: 'anthropic', model: 'claude-opus-4-6' },
+      effective: { provider: 'anthropic', model: 'claude-opus-4-7' },
       inheritsPrimary: true,
     });
   });

@@ -454,6 +454,7 @@ describe('Memory Agent Header Resolution', () => {
         },
       }),
     );
+    expect(runConfig.graphConfig.llmConfig.thinking).toBeUndefined();
     expect(runConfig.graphConfig.tools.map((tool: { name: string }) => tool.name)).toEqual(
       expect.arrayContaining([
         'apply_memory_changes',
@@ -467,7 +468,7 @@ describe('Memory Agent Header Resolution', () => {
   it('should set temperature to 1 for Bedrock with thinking enabled', async () => {
     const llmConfig = {
       provider: Providers.BEDROCK,
-      model: 'us.anthropic.claude-sonnet-4-20250514-v1:0',
+      model: 'us.anthropic.claude-sonnet-4-6',
       temperature: 0.7,
       additionalModelRequestFields: {
         thinking: {
@@ -529,7 +530,7 @@ describe('Memory Agent Header Resolution', () => {
   it('should remove temperature for Anthropic with thinking enabled', async () => {
     const llmConfig = {
       provider: Providers.ANTHROPIC,
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-6',
       temperature: 0.7,
       thinking: {
         type: 'enabled',
@@ -556,16 +557,13 @@ describe('Memory Agent Header Resolution', () => {
     const runConfig = (Run.create as jest.Mock).mock.calls[0][0];
 
     expect(runConfig.graphConfig.llmConfig.temperature).toBeUndefined();
-    expect(runConfig.graphConfig.llmConfig.thinking).toEqual({
-      type: 'enabled',
-      budget_tokens: 5000,
-    });
+    expect(runConfig.graphConfig.llmConfig.thinking).toBeUndefined();
   });
 
-  it('should not modify temperature for Anthropic without thinking enabled', async () => {
+  it('should remove temperature for Anthropic when runtime default thinking applies', async () => {
     const llmConfig = {
       provider: Providers.ANTHROPIC,
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-6',
       temperature: 0.7,
     };
 
@@ -587,7 +585,78 @@ describe('Memory Agent Header Resolution', () => {
     expect(Run.create as jest.Mock).toHaveBeenCalled();
     const runConfig = (Run.create as jest.Mock).mock.calls[0][0];
 
-    expect(runConfig.graphConfig.llmConfig.temperature).toBe(0.7);
+    expect(runConfig.graphConfig.llmConfig.temperature).toBeUndefined();
+    expect(runConfig.graphConfig.llmConfig.thinking).toBeUndefined();
+  });
+
+  it('should disable Anthropic thinking and strip output_config when tool choice is forced', async () => {
+    const llmConfig = {
+      provider: Providers.ANTHROPIC,
+      model: 'claude-opus-4-7',
+      temperature: 0.7,
+      invocationKwargs: {
+        output_config: {
+          effort: 'high',
+        },
+      },
+    };
+
+    await processMemory({
+      res: mockRes,
+      userId: 'user-123',
+      setMemory: mockMemoryMethods.setMemory,
+      deleteMemory: mockMemoryMethods.deleteMemory,
+      messages: [],
+      memory: 'existing memory',
+      messageId: 'msg-123',
+      conversationId: 'conv-123',
+      validKeys: ['preferences'],
+      instructions: 'test instructions',
+      llmConfig,
+      user: testUser,
+    });
+
+    expect(Run.create as jest.Mock).toHaveBeenCalled();
+    const runConfig = (Run.create as jest.Mock).mock.calls[0][0];
+
+    expect(runConfig.graphConfig.llmConfig.temperature).toBeUndefined();
+    expect(runConfig.graphConfig.llmConfig.thinking).toBeUndefined();
+    expect(runConfig.graphConfig.llmConfig.invocationKwargs).toEqual({
+      tool_choice: {
+        type: 'tool',
+        name: 'apply_memory_changes',
+      },
+    });
+  });
+
+  it('should remove temperature for Anthropic adaptive-capable models when thinking is explicitly disabled', async () => {
+    const llmConfig = {
+      provider: Providers.ANTHROPIC,
+      model: 'claude-sonnet-4-6',
+      temperature: 0.7,
+      thinking: false,
+    };
+
+    await processMemory({
+      res: mockRes,
+      userId: 'user-123',
+      setMemory: mockMemoryMethods.setMemory,
+      deleteMemory: mockMemoryMethods.deleteMemory,
+      messages: [],
+      memory: 'existing memory',
+      messageId: 'msg-123',
+      conversationId: 'conv-123',
+      validKeys: ['preferences'],
+      instructions: 'test instructions',
+      llmConfig,
+      user: testUser,
+    });
+
+    expect(Run.create as jest.Mock).toHaveBeenCalled();
+    const runConfig = (Run.create as jest.Mock).mock.calls[0][0];
+
+    expect(runConfig.graphConfig.llmConfig.temperature).toBeUndefined();
+    expect(runConfig.graphConfig.llmConfig.thinking).toBeUndefined();
   });
 
   it('should remove temperature for Anthropic with adaptive thinking', async () => {
@@ -619,19 +688,46 @@ describe('Memory Agent Header Resolution', () => {
     const runConfig = (Run.create as jest.Mock).mock.calls[0][0];
 
     expect(runConfig.graphConfig.llmConfig.temperature).toBeUndefined();
-    expect(runConfig.graphConfig.llmConfig.thinking).toEqual({
-      type: 'adaptive',
-    });
+    expect(runConfig.graphConfig.llmConfig.thinking).toBeUndefined();
   });
 
-  it('should not modify temperature for Anthropic with disabled thinking', async () => {
+  it('should remove temperature for Anthropic adaptive-capable models with disabled thinking config', async () => {
     const llmConfig = {
       provider: Providers.ANTHROPIC,
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-6',
       temperature: 0.7,
       thinking: {
         type: 'disabled',
       },
+    };
+
+    await processMemory({
+      res: mockRes,
+      userId: 'user-123',
+      setMemory: mockMemoryMethods.setMemory,
+      deleteMemory: mockMemoryMethods.deleteMemory,
+      messages: [],
+      memory: 'existing memory',
+      messageId: 'msg-123',
+      conversationId: 'conv-123',
+      validKeys: ['preferences'],
+      instructions: 'test instructions',
+      llmConfig,
+      user: testUser,
+    });
+
+    expect(Run.create as jest.Mock).toHaveBeenCalled();
+    const runConfig = (Run.create as jest.Mock).mock.calls[0][0];
+
+    expect(runConfig.graphConfig.llmConfig.temperature).toBeUndefined();
+  });
+
+  it('should preserve temperature for legacy Anthropic models when thinking is explicitly disabled', async () => {
+    const llmConfig = {
+      provider: Providers.ANTHROPIC,
+      model: 'claude-sonnet-4-5-20250929',
+      temperature: 0.7,
+      thinking: false,
     };
 
     await processMemory({

@@ -15,13 +15,10 @@ module.exports = function createTelegramLinkToken(db) {
       tokenHash: { type: String, required: true, index: true, unique: true },
       telegramUserId: { type: String, required: true, index: true },
       telegramUsername: { type: String, default: '' },
-      expiresAt: { type: Date, required: true, index: true },
+      expiresAt: { type: Date, required: true, index: { expireAfterSeconds: 0 } },
       consumedAt: { type: Date, default: null },
     },
     { timestamps: true },
   );
-
-  schema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
-
   return connection.model('TelegramLinkToken', schema);
 };

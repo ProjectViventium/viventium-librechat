@@ -9,9 +9,15 @@ let mockAssertVoiceGatewayAuth;
 let mockGetUserById;
 let mockGetMessages;
 let mockGetConvo;
-let lastParentMessageId = null;
-let lastConversationId = null;
-let lastAgentId = null;
+let mockVoiceIngressCreate;
+let mockVoiceIngressFindOne;
+let mockVoiceIngressFindOneAndUpdate;
+let mockLastParentMessageId = null;
+let mockLastConversationId = null;
+let mockLastAgentId = null;
+let mockLastRequestText = null;
+let mockAgentControllerCallCount = 0;
+let mockAgentControllerResponseDelayMs = 0;
 
 jest.mock(
   '@librechat/data-schemas',
@@ -53,13 +59,21 @@ jest.mock('~/server/services/Endpoints/agents', () => ({
 jest.mock('~/server/services/Endpoints/agents/title', () => jest.fn());
 
 jest.mock('~/server/controllers/agents/request', () => (req, res) => {
-  lastParentMessageId = req.body.parentMessageId;
-  lastConversationId = req.body.conversationId;
-  lastAgentId = req.body.agent_id;
-  res.json({
-    streamId: 'stream_voice_1',
-    conversationId: req.body.conversationId || 'new',
-  });
+  mockAgentControllerCallCount += 1;
+  mockLastParentMessageId = req.body.parentMessageId;
+  mockLastConversationId = req.body.conversationId;
+  mockLastAgentId = req.body.agent_id;
+  mockLastRequestText = req.body.text;
+  const respond = () =>
+    res.json({
+      streamId: 'stream_voice_1',
+      conversationId: req.body.conversationId || 'new',
+    });
+  if (mockAgentControllerResponseDelayMs > 0) {
+    setTimeout(respond, mockAgentControllerResponseDelayMs);
+    return;
+  }
+  respond();
 });
 
 jest.mock('~/server/services/viventium/CallSessionService', () => ({
@@ -73,6 +87,14 @@ jest.mock('~/models', () => ({
   getUserById: (...args) => mockGetUserById(...args),
   getMessages: (...args) => mockGetMessages(...args),
   getConvo: (...args) => mockGetConvo(...args),
+}));
+
+jest.mock('~/db/models', () => ({
+  ViventiumVoiceIngressEvent: {
+    create: (...args) => mockVoiceIngressCreate(...args),
+    findOne: (...args) => mockVoiceIngressFindOne(...args),
+    findOneAndUpdate: (...args) => mockVoiceIngressFindOneAndUpdate(...args),
+  },
 }));
 
 jest.mock('~/server/services/viventium/VoiceCortexInsightsService', () => ({
@@ -169,12 +191,61 @@ function dispatch(app, req, res) {
   return res._done;
 }
 
+async function advanceVoiceRouteTimers(ms) {
+  if (typeof jest.advanceTimersByTimeAsync === 'function') {
+    await jest.advanceTimersByTimeAsync(ms);
+    return;
+  }
+  jest.advanceTimersByTime(ms);
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
 describe('/api/viventium/voice/chat', () => {
   beforeEach(() => {
     jest.resetModules();
-    lastParentMessageId = null;
-    lastConversationId = null;
-    lastAgentId = null;
+    const { logger } = require('@librechat/data-schemas');
+    logger.debug.mockClear();
+    logger.info.mockClear();
+    logger.warn.mockClear();
+    logger.error.mockClear();
+    mockLastParentMessageId = null;
+    mockLastConversationId = null;
+    mockLastAgentId = null;
+    mockLastRequestText = null;
+    mockAgentControllerCallCount = 0;
+    mockAgentControllerResponseDelayMs = 0;
+    const voiceIngressStore = new Map();
+    mockVoiceIngressCreate = jest.fn().mockImplementation(async (doc) => {
+      if (voiceIngressStore.has(doc.dedupeKey)) {
+        const err = new Error('duplicate');
+        err.code = 11000;
+        throw err;
+      }
+      const saved = { _id: `ingress_${voiceIngressStore.size + 1}`, ...doc };
+      voiceIngressStore.set(doc.dedupeKey, saved);
+      return saved;
+    });
+    mockVoiceIngressFindOne = jest.fn().mockImplementation((query) => ({
+      lean: async () => voiceIngressStore.get(query.dedupeKey) || null,
+    }));
+    mockVoiceIngressFindOneAndUpdate = jest.fn().mockImplementation((query, update) => {
+      const doc = voiceIngressStore.get(query.dedupeKey);
+      if (!doc) {
+        return { lean: async () => null };
+      }
+      if (query.status && doc.status !== query.status) {
+        return { lean: async () => null };
+      }
+      if (update.$push?.segments) {
+        doc.segments = [...(doc.segments || []), update.$push.segments];
+      }
+      if (update.$set) {
+        Object.assign(doc, update.$set);
+      }
+      voiceIngressStore.set(query.dedupeKey, doc);
+      return { lean: async () => doc };
+    });
     mockAssertVoiceGatewayAuth = jest.fn().mockResolvedValue({
       callSessionId: 'call_session_1',
       userId: 'user_1',
@@ -203,6 +274,14 @@ describe('/api/viventium/voice/chat', () => {
     ]);
   });
 
+  afterEach(() => {
+    jest.useRealTimers();
+    delete process.env.VIVENTIUM_VOICE_TURN_COALESCE_WINDOW_MS;
+    delete process.env.VIVENTIUM_VOICE_TURN_COALESCE_WAIT_MS;
+    delete process.env.VIVENTIUM_VOICE_TURN_COALESCE_POLL_MS;
+    delete process.env.VIVENTIUM_VOICE_TURN_COALESCE_RETURN_WINDOW_MS;
+  });
+
   test('reuses the latest assistant leaf as parentMessageId', async () => {
     const voiceRouter = require('../voice');
     const app = createTestApp(voiceRouter);
@@ -216,9 +295,9 @@ describe('/api/viventium/voice/chat', () => {
     await dispatch(app, req, res);
 
     expect(res.statusCode).toBe(200);
-    expect(lastConversationId).toBe('conv-voice-1');
-    expect(lastParentMessageId).toBe('voice-assistant-leaf');
-    expect(lastAgentId).toBe('agent_voice');
+    expect(mockLastConversationId).toBe('conv-voice-1');
+    expect(mockLastParentMessageId).toBe('voice-assistant-leaf');
+    expect(mockLastAgentId).toBe('agent_voice');
   });
 
   test('resets invalid conversations to new and NO_PARENT', async () => {
@@ -247,7 +326,127 @@ describe('/api/viventium/voice/chat', () => {
     await dispatch(app, req, res);
 
     expect(res.statusCode).toBe(200);
-    expect(lastConversationId).toBe('new');
-    expect(lastParentMessageId).toBe(Constants.NO_PARENT);
+    expect(mockLastConversationId).toBe('new');
+    expect(mockLastParentMessageId).toBe(Constants.NO_PARENT);
+  });
+
+  test('coalesces rapid same-parent voice turns into one launched stream', async () => {
+    jest.useFakeTimers();
+    process.env.VIVENTIUM_VOICE_TURN_COALESCE_WINDOW_MS = '10';
+    process.env.VIVENTIUM_VOICE_TURN_COALESCE_WAIT_MS = '200';
+    process.env.VIVENTIUM_VOICE_TURN_COALESCE_POLL_MS = '5';
+    process.env.VIVENTIUM_VOICE_TURN_COALESCE_RETURN_WINDOW_MS = '200';
+    mockAgentControllerResponseDelayMs = 20;
+
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+
+    const firstReq = createMockReq({
+      url: '/api/viventium/voice/chat',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-request-id': 'req-1',
+      },
+      body: { text: "i've also improved your voice capabilities a lot today" },
+    });
+    const secondReq = createMockReq({
+      url: '/api/viventium/voice/chat',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-request-id': 'req-2',
+      },
+      body: { text: "everything is on the main branch so you're stable and reliable" },
+    });
+    const firstRes = createMockRes();
+    const secondRes = createMockRes();
+
+    const firstPromise = dispatch(app, firstReq, firstRes);
+    await advanceVoiceRouteTimers(2);
+    const secondPromise = dispatch(app, secondReq, secondRes);
+    await advanceVoiceRouteTimers(100);
+    await Promise.all([firstPromise, secondPromise]);
+
+    expect(mockAgentControllerCallCount).toBe(1);
+    expect(mockLastRequestText).toBe(
+      "i've also improved your voice capabilities a lot today everything is on the main branch so you're stable and reliable",
+    );
+    expect(firstRes.body.streamId).toBe('stream_voice_1');
+    expect(secondRes.body.streamId).toBe('stream_voice_1');
+    expect([firstRes.body.coalesced, secondRes.body.coalesced].filter(Boolean)).toHaveLength(1);
+  });
+
+  test('coalesces three rapid same-parent voice turns in ingress order', async () => {
+    jest.useFakeTimers();
+    process.env.VIVENTIUM_VOICE_TURN_COALESCE_WINDOW_MS = '10';
+    process.env.VIVENTIUM_VOICE_TURN_COALESCE_WAIT_MS = '250';
+    process.env.VIVENTIUM_VOICE_TURN_COALESCE_POLL_MS = '5';
+    process.env.VIVENTIUM_VOICE_TURN_COALESCE_RETURN_WINDOW_MS = '250';
+    mockAgentControllerResponseDelayMs = 25;
+
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+
+    const makeReq = (requestId, text) =>
+      createMockReq({
+        url: '/api/viventium/voice/chat',
+        headers: {
+          'x-viventium-call-secret': 'secret',
+          'x-viventium-request-id': requestId,
+        },
+        body: { text },
+      });
+
+    const req1 = makeReq('req-a', 'first clause from speech');
+    const req2 = makeReq('req-b', 'second clause from speech');
+    const req3 = makeReq('req-c', 'third clause from speech');
+    const res1 = createMockRes();
+    const res2 = createMockRes();
+    const res3 = createMockRes();
+
+    const p1 = dispatch(app, req1, res1);
+    await advanceVoiceRouteTimers(2);
+    const p2 = dispatch(app, req2, res2);
+    await advanceVoiceRouteTimers(2);
+    const p3 = dispatch(app, req3, res3);
+    await advanceVoiceRouteTimers(120);
+    await Promise.all([p1, p2, p3]);
+
+    expect(mockAgentControllerCallCount).toBe(1);
+    expect(mockLastRequestText).toBe(
+      'first clause from speech second clause from speech third clause from speech',
+    );
+    expect(res1.body.streamId).toBe('stream_voice_1');
+    expect(res2.body.streamId).toBe('stream_voice_1');
+    expect(res3.body.streamId).toBe('stream_voice_1');
+    expect([res1.body.coalesced, res2.body.coalesced, res3.body.coalesced].filter(Boolean)).toHaveLength(2);
+  });
+
+  test('logs committed voice turns with callSessionId and requestId', async () => {
+    const { logger } = require('@librechat/data-schemas');
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      url: '/api/viventium/voice/chat',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-request-id': 'req-log-1',
+      },
+      body: { text: 'log this committed turn' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.stringContaining('[VIVENTIUM][voice/chat] user_turn_completed source=route'),
+      'call_session_1',
+      expect.any(String),
+      expect.any(String),
+      'agent_voice',
+      'req-log-1',
+      expect.any(Boolean),
+      expect.any(Number),
+    );
   });
 });

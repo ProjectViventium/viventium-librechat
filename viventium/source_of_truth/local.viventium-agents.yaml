@@ -26,8 +26,10 @@ config:
     conversation_recall:
       prompt: |
         CONVERSATION RECALL:
-        - When the user asks about prior chats, earlier context, previous decisions, or something mentioned before, use `file_search` to check conversation recall.
+        - When the user asks about prior chats, earlier context, previous decisions, same-day continuity, or something mentioned before, use `file_search` to check conversation recall before saying you do not remember.
+        - Treat "what were we talking about", "we were just talking about this", and "earlier today/this morning" as recall checks, not as fresh-chat onboarding.
         - For exact-history questions, verify with retrieved evidence instead of guessing from memory alone.
+        - If recall evidence is inconclusive, say that honestly and ask a focused clarification instead of claiming the conversation is missing.
         - Do not answer live mailbox, calendar, or external-system status questions from conversation recall alone; use the relevant live tool when available.
     configVersion: 1
     primaryProvider: openai
@@ -786,7 +788,6 @@ backgroundAgents:
     tool_kwargs: []
     model_parameters:
       thinking: false
-      temperature: 0.3
       model: claude-sonnet-4-6
     end_after_tools: false
     hide_sequential_outputs: false
@@ -1105,7 +1106,6 @@ backgroundAgents:
     tool_kwargs: []
     model_parameters:
       thinking: false
-      temperature: 0.4
       model: claude-sonnet-4-6
     background_cortices: []
     agent_ids: []

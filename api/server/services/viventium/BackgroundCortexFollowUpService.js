@@ -15,7 +15,7 @@ const { logger } = require('@librechat/data-schemas');
 const { Run, Providers } = require('@librechat/agents');
 const { initializeAnthropic, initializeOpenAI } = require('@librechat/api');
 const { HumanMessage } = require('@langchain/core/messages');
-const { ContentTypes, EModelEndpoint } = require('librechat-data-provider');
+const { ContentTypes, EModelEndpoint, supportsAdaptiveThinking } = require('librechat-data-provider');
 const db = require('~/models');
 const { getAgent } = require('~/models/Agent');
 const { getCustomEndpointConfig, mapProvider } = require('~/server/services/BackgroundCortexService');
@@ -72,6 +72,27 @@ const CORTEX_TYPES = new Set([
   ContentTypes.CORTEX_INSIGHT,
 ]);
 
+function hasActiveAnthropicThinking(thinking) {
+  if (thinking == null || thinking === false) {
+    return false;
+  }
+
+  if (thinking === true) {
+    return true;
+  }
+
+  if (typeof thinking !== 'object' || Array.isArray(thinking)) {
+    return true;
+  }
+
+  const type = typeof thinking.type === 'string' ? thinking.type.trim().toLowerCase() : '';
+  if (type === 'disabled' || thinking.enabled === false) {
+    return false;
+  }
+
+  return true;
+}
+
 function normalizeFollowUpProvider(provider) {
   const normalized = normalizeRuntimeProvider(provider);
   if (normalized === 'undefined' || normalized === 'null') {
@@ -85,16 +106,124 @@ function sanitizeAnthropicFollowUpLLMConfig(llmConfig = {}) {
     return llmConfig;
   }
 
-  if (llmConfig.thinking == null || !Object.prototype.hasOwnProperty.call(llmConfig, 'temperature')) {
+  if (!Object.prototype.hasOwnProperty.call(llmConfig, 'temperature')) {
+    return llmConfig;
+  }
+
+  const model = typeof llmConfig.model === 'string' ? llmConfig.model : '';
+  const effectiveThinking = Object.prototype.hasOwnProperty.call(llmConfig, 'thinking')
+    ? llmConfig.thinking
+    : true;
+  const thinkingIsActive = hasActiveAnthropicThinking(effectiveThinking);
+  const adaptiveModel = model ? supportsAdaptiveThinking(model) : false;
+  if (!thinkingIsActive && !adaptiveModel) {
     return llmConfig;
   }
 
   const nextConfig = { ...llmConfig };
   delete nextConfig.temperature;
   logger.info(
-    '[BackgroundCortexFollowUpService] Removed Anthropic follow-up temperature because thinking is active',
+    `[BackgroundCortexFollowUpService] Removed Anthropic follow-up temperature because ${
+      thinkingIsActive
+        ? `thinking is active (${Object.prototype.hasOwnProperty.call(llmConfig, 'thinking') ? 'explicit' : 'default'})`
+        : 'the model uses adaptive-thinking-era Anthropic temperature rules'
+    }`,
   );
   return nextConfig;
+}
+
+function resolveFollowUpPersistenceText({
+  generatedText = '',
+  insightsData,
+  replaceParentMessage = false,
+  voiceMode = false,
+  surface = '',
+  scheduleId = '',
+}) {
+  const decision = {
+    replaceParentMessage: replaceParentMessage === true,
+    hasInsights: Array.isArray(insightsData?.insights) && insightsData.insights.length > 0,
+    llmResult: 'empty',
+    selectedStrategy: 'none',
+    suppressionReason: '',
+    finalLength: 0,
+  };
+
+  let text = String(generatedText || '').trim();
+  if (isNoResponseOnly(text)) {
+    decision.llmResult = 'nta';
+    if (replaceParentMessage === true) {
+      decision.selectedStrategy = 'replace_parent_forced_fallback';
+    } else {
+      decision.selectedStrategy = 'nta_fallback_candidate';
+    }
+    text = '';
+  } else if (text) {
+    decision.llmResult = 'generated';
+    decision.selectedStrategy = 'llm_generated';
+  }
+
+  if (!text) {
+    text = formatFollowUpText({
+      ...(insightsData ?? {}),
+      voiceMode,
+      surface,
+      scheduleId,
+    });
+    if (text) {
+      decision.selectedStrategy = 'deterministic_fallback';
+    }
+  }
+
+  if (!text && replaceParentMessage === true) {
+    text = getPreferredFallbackInsightText({
+      insights: Array.isArray(insightsData?.insights) ? insightsData.insights : [],
+      scheduleId,
+      allowMultiInsightBestEffort: true,
+    });
+    if (text) {
+      decision.selectedStrategy = 'best_visible_insight';
+    }
+  }
+
+  text = stripQuestionSentences(String(text || '').trim());
+  text = sanitizeFollowUpDisplayText(text);
+  text = normalizeNoResponseText(text).trim();
+
+  if (!text || text.trim().length === 0) {
+    if (replaceParentMessage !== true) {
+      decision.suppressionReason = 'empty_after_fallback';
+      return { text: '', decision };
+    }
+
+    text = formatFollowUpText({
+      insights: [],
+      mergedPrompt: '',
+      hasErrors: true,
+      scheduleId,
+    });
+    if (!text || text.trim().length === 0) {
+      decision.suppressionReason = 'empty_after_error_fallback';
+      return { text: '', decision };
+    }
+    decision.selectedStrategy = 'error_fallback';
+  }
+
+  if (isNoResponseOnly(text)) {
+    decision.suppressionReason = 'no_response_tag';
+    return { text: '', decision };
+  }
+
+  if (voiceMode && typeof text === 'string') {
+    text = stripVoiceControlTagsForDisplay(text);
+    if (!text || text.trim().length === 0) {
+      decision.suppressionReason = 'empty_after_voice_tag_strip';
+      return { text: '', decision };
+    }
+  }
+
+  decision.finalLength = text.length;
+  return { text, decision };
 }
 
 /* === VIVENTIUM NOTE ===
@@ -437,7 +566,6 @@ async function resolveFollowUpLLMConfig({
     );
   }
 
-  const temperature = resolvedAgent.model_parameters?.temperature ?? 0.7;
   const configuredMaxTokens =
     resolvedAgent.model_parameters?.max_output_tokens ?? resolvedAgent.model_parameters?.max_tokens ?? 0;
   const deferredDefaultMaxTokens = Number.parseInt(
@@ -453,16 +581,20 @@ async function resolveFollowUpLLMConfig({
       : 400,
   );
 
+  const baseModelParameters = {
+    ...(resolvedAgent.model_parameters || {}),
+    model: resolvedModel,
+    max_output_tokens: maxTokens,
+  };
+  if (baseModelParameters.temperature == null) {
+    delete baseModelParameters.temperature;
+  }
+
   if (resolvedProviderName === 'openai') {
     const initialized = await initializeOpenAI({
       req,
       endpoint: EModelEndpoint.openAI,
-      model_parameters: {
-        ...(resolvedAgent.model_parameters || {}),
-        model: resolvedModel,
-        temperature,
-        max_output_tokens: maxTokens,
-      },
+      model_parameters: baseModelParameters,
       db,
     });
 
@@ -475,15 +607,11 @@ async function resolveFollowUpLLMConfig({
   }
 
   if (resolvedProviderName === 'anthropic') {
+    const anthropicModelParameters = sanitizeAnthropicFollowUpLLMConfig(baseModelParameters);
     const initialized = await initializeAnthropic({
       req,
       endpoint: EModelEndpoint.anthropic,
-      model_parameters: {
-        ...(resolvedAgent.model_parameters || {}),
-        model: resolvedModel,
-        temperature,
-        max_output_tokens: maxTokens,
-      },
+      model_parameters: anthropicModelParameters,
       db,
     });
 
@@ -499,11 +627,14 @@ async function resolveFollowUpLLMConfig({
   const llmConfig = {
     provider: mappedProvider,
     model: resolvedModel,
-    temperature,
     maxTokens,
     streaming: false,
     disableStreaming: true,
   };
+
+  if (baseModelParameters.temperature != null) {
+    llmConfig.temperature = baseModelParameters.temperature;
+  }
 
   if (req && resolvedProviderName) {
     const customConfig = await getCustomEndpointConfig(resolvedProviderName, req);
@@ -820,7 +951,8 @@ function formatFollowUpPrompt({
     `Here is the response you JUST sent to the user:\n---\n${recentBlock}\n---`,
     'You MUST NOT repeat, rephrase, re-ask, or echo ANY part of the above. If the background insights below overlap with what you already said, respond with {NTA}.',
     'Only respond if the insights contain genuinely NEW information not covered above.',
-    'If the only thing you can add is a question, respond with {NTA}.',
+    'If an insight contains new factual/contextual material followed by a question, keep the new material and drop the question.',
+    'Use {NTA} only when there is truly no new user-visible content beyond a question or repetition.',
     '',
     'Background insights that surfaced after your response:',
     summaryLines,
@@ -830,7 +962,9 @@ function formatFollowUpPrompt({
     '- If they add meaningful NEW information -> write a brief continuation that adds ONLY the new parts.',
     '- On web/telegram text surfaces, preserve helpful structure with short paragraphs and bullet lists instead of flattening everything into one dense paragraph.',
     '- On voice/playground surfaces, keep it in plain conversational sentences.',
-    '- Never ask the user a new question in this follow-up. If a question seems needed, output {NTA} instead.',
+    '- Never ask the user a new question in this follow-up.',
+    '- If an insight includes a question, drop the question and keep any accompanying factual material.',
+    '- Use {NTA} only when nothing new remains after dropping questions and repetition.',
     'Do not mention internal systems, background processing, or that insights "surfaced".',
   ]
     .filter(Boolean)
@@ -1045,9 +1179,21 @@ async function generateFollowUpText({
   }
 
   const rawText = String(text || '').trim();
+  if (rawText.length === 0) {
+    return '';
+  }
   const strippedText = stripQuestionSentences(rawText);
   const sanitizedText = sanitizeFollowUpDisplayText(strippedText);
   const normalizedText = normalizeNoResponseText(sanitizedText).trim();
+
+  if (
+    isNoResponseOnly(rawText) ||
+    isNoResponseOnly(sanitizedText) ||
+    isNoResponseOnly(normalizedText) ||
+    normalizedText.length === 0
+  ) {
+    return NO_RESPONSE_TAG;
+  }
 
   if (process.env.VIVENTIUM_DEBUG_PHASE_B === 'true') {
     const preview = (value) => String(value || '').slice(0, 220).replace(/\s+/g, ' ');
@@ -1056,7 +1202,7 @@ async function generateFollowUpText({
     );
   }
 
-  return normalizedText || NO_RESPONSE_TAG;
+  return normalizedText;
 }
 
 async function createCortexFollowUpMessage({
@@ -1104,78 +1250,30 @@ async function createCortexFollowUpMessage({
     }
   }
 
-  if (replaceParentMessage === true && isNoResponseOnly(text)) {
-    logger.warn(
-      '[BackgroundCortexFollowUpService] Deferred parent replacement received {NTA}; falling back to deterministic continuation',
-    );
-    text = '';
-  }
+  const { text: resolvedText, decision } = resolveFollowUpPersistenceText({
+    generatedText: text,
+    insightsData,
+    replaceParentMessage,
+    voiceMode,
+    surface,
+    scheduleId,
+  });
+  text = resolvedText;
 
-  if (!text) {
-    text = formatFollowUpText({
-      ...(insightsData ?? {}),
-      voiceMode,
-      surface,
-      scheduleId,
-    });
-  }
-
-  if (!text && replaceParentMessage === true) {
-    text = getPreferredFallbackInsightText({
-      insights: Array.isArray(insightsData?.insights) ? insightsData.insights : [],
-      scheduleId,
-      allowMultiInsightBestEffort: true,
-    });
-  }
-
-  text = stripQuestionSentences(String(text || '').trim());
-  text = sanitizeFollowUpDisplayText(text);
-  text = normalizeNoResponseText(text).trim();
+  logger.info('[BackgroundCortexFollowUpService] Follow-up persistence decision', {
+    conversationId,
+    parentMessageId,
+    replaceParentMessage: decision.replaceParentMessage,
+    hasInsights: decision.hasInsights,
+    llmResult: decision.llmResult,
+    selectedStrategy: decision.selectedStrategy,
+    suppressionReason: decision.suppressionReason || null,
+    finalLength: decision.finalLength,
+  });
 
   if (!text || text.trim().length === 0) {
-    if (replaceParentMessage !== true) {
-      return null;
-    }
-    text = formatFollowUpText({
-      insights: [],
-      mergedPrompt: '',
-      hasErrors: true,
-      scheduleId,
-    });
-    if (!text || text.trim().length === 0) {
-      logger.warn(
-        '[BackgroundCortexFollowUpService] Deferred follow-up produced no visible text after scheduler-safe fallback; suppressing persistence',
-      );
-      return null;
-    }
-  }
-  /* === VIVENTIUM START ===
-   * Feature: Suppress no-response follow-up persistence.
-   * Added: 2026-02-27
-   *
-   * `{NTA}` means "say nothing". Never persist/send it as a user-visible follow-up turn.
-   */
-  if (isNoResponseOnly(text)) {
-    logger.info('[BackgroundCortexFollowUpService] Suppressing follow-up via no-response tag');
     return null;
   }
-  /* === VIVENTIUM END === */
-
-  /* === VIVENTIUM START ===
-   * Feature: Strip voice control tags from follow-up text before persistence.
-   * Purpose: In voice mode, the LLM follow-up may contain emotion/SSML tags or bracket
-   * nonverbal markers from the voice prompt contract. These must be removed before saving
-   * to MongoDB so the LibreChat UI shows clean text, and before the voice gateway speaks
-   * it (to prevent literal reading of tags by fallback TTS providers).
-   * Added: 2026-02-22
-   */
-  if (voiceMode && typeof text === 'string') {
-    text = stripVoiceControlTagsForDisplay(text);
-    if (!text || text.trim().length === 0) {
-      return null;
-    }
-  }
-  /* === VIVENTIUM END === */
 
   /* === VIVENTIUM START ===
    * Feature: Follow-up branch-safe parent resolution.
@@ -1303,6 +1401,8 @@ module.exports = {
   extractRecentResponseTextFromMessage,
   getPreferredFallbackInsightText,
   resolveRecentResponseText,
+  resolveFollowUpPersistenceText,
   resolveConversationLeafMessageId,
+  sanitizeAnthropicFollowUpLLMConfig,
   stripQuestionSentences,
 };

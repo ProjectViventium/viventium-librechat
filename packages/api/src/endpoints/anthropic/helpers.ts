@@ -102,9 +102,17 @@ function hasActiveAnthropicThinking(thinking: unknown): boolean {
 }
 
 function sanitizeAnthropicTemperatureForThinking<
-  T extends { thinking?: unknown; temperature?: number | null },
+  T extends { thinking?: unknown; temperature?: number | null; model?: string | null },
 >(config: T): T {
-  if (!hasActiveAnthropicThinking(config?.thinking) || config?.temperature == null) {
+  if (config?.temperature == null) {
+    return config;
+  }
+
+  const adaptiveModel =
+    typeof config?.model === 'string' && config.model !== ''
+      ? supportsAdaptiveThinking(config.model)
+      : false;
+  if (!hasActiveAnthropicThinking(config?.thinking) && !adaptiveModel) {
     return config;
   }
 

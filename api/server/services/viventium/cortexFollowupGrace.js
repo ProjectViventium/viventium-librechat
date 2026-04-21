@@ -1,16 +1,17 @@
 /* === VIVENTIUM START ===
- * Feature: Background cortex follow-up grace window
+ * Feature: Background follow-up window
  *
  * Purpose:
  * - Allow follow-up "realizations" to surface even if the user sends new input
  *   shortly after the original request.
- * - Default behavior remains unchanged when env is unset or <= 0.
+ * - Keep the shipped default aligned across LibreChat, live voice, and Telegram so
+ *   the same Phase B window applies across user-facing surfaces.
  *
  * Env:
  * - VIVENTIUM_CORTEX_FOLLOWUP_GRACE_S (seconds)
  * === VIVENTIUM END === */
 
-const DEFAULT_GRACE_S = 0;
+const DEFAULT_GRACE_S = 30;
 
 function parseFloatEnv(name, fallback) {
   const raw = process.env[name];

@@ -41,6 +41,10 @@ export function filterMalformedContentParts<T>(
       return 'tool_call' in part && part.tool_call != null && typeof part.tool_call === 'object';
     }
 
+    if (type === ContentTypes.THINK) {
+      return typeof part.think === 'string' && part.think.trim().length > 0;
+    }
+
     return true;
   });
 }

@@ -26,7 +26,7 @@ jest.mock('@librechat/api', () => ({
   initializeAnthropic: jest.fn(async ({ model_parameters }) => ({
     llmConfig: {
       model: model_parameters?.model ?? 'claude-sonnet-4-5',
-      temperature: model_parameters?.temperature ?? 0.7,
+      ...(model_parameters?.temperature != null ? { temperature: model_parameters.temperature } : {}),
       maxTokens: model_parameters?.max_output_tokens ?? 400,
       anthropicApiUrl: 'https://anthropic-proxy.example.test',
     },
@@ -265,23 +265,23 @@ describe('BackgroundCortexFollowUpService', () => {
 
   test('cleanFallbackInsightText strips operational scheduler paragraphs', () => {
     const text = cleanFallbackInsightText(
-      'Tuesday 7PM Toronto. Evening reset.\n\nRepeated "Wake" prompts across 20+ turns today, hitting tool auth walls each time.',
+      'Tuesday 7PM UTC. Evening reset.\n\nRepeated "Wake" prompts across 20+ turns today, hitting tool auth walls each time.',
     );
-    expect(text).toBe('Tuesday 7PM Toronto. Evening reset.');
+    expect(text).toBe('Tuesday 7PM UTC. Evening reset.');
   });
 
   test('cleanFallbackInsightText strips reconnect and auth-expiry chatter', () => {
     const text = cleanFallbackInsightText(
-      'Taylor Reed sent the project onboarding invite for April 1 at 10 AM Pacific.\n\nGoogle auth is stale, so Gmail could not be verified tonight without reconnect.',
+      'The operations contact sent the project onboarding invite for April 1 at 10 AM Pacific.\n\nGoogle auth is stale, so Gmail could not be verified tonight without reconnect.',
     );
-    expect(text).toBe('Taylor Reed sent the project onboarding invite for April 1 at 10 AM Pacific.');
+    expect(text).toBe('The operations contact sent the project onboarding invite for April 1 at 10 AM Pacific.');
   });
 
   test('cleanFallbackInsightText strips generic no-access live tool chatter', () => {
     const text = cleanFallbackInsightText(
-      'It is Thursday night in Toronto.\n\nI checked what I could live here, but I do not have working Google/MS calendar, inbox, or schedule tools available in this run to verify anything important there.\n\nTomorrow still looks manageable.',
+      'It is Thursday night in UTC.\n\nI checked what I could live here, but I do not have working Google/MS calendar, inbox, or schedule tools available in this run to verify anything important there.\n\nTomorrow still looks manageable.',
     );
-    expect(text).toBe('It is Thursday night in Toronto.\n\nTomorrow still looks manageable.');
+    expect(text).toBe('It is Thursday night in UTC.\n\nTomorrow still looks manageable.');
   });
 
   test('cleanFallbackInsightText strips live-check and unauthenticated availability chatter', () => {
@@ -314,12 +314,12 @@ describe('BackgroundCortexFollowUpService', () => {
           insight:
             'Could not perform the requested live checks because no MS365/Google tools are available in this chat, and I won’t invent inbox/calendar results.{NTA}',
         },
-        { insight: 'Tuesday 9PM Toronto. Day crushed, tomorrow Steven/Raff blocks locked.' },
+        { insight: 'Tuesday 9PM UTC. Day wrapped, tomorrow design/review blocks locked.' },
       ],
       hasErrors: false,
       scheduleId: 'schedule-1',
     });
-    expect(text).toBe('Tuesday 9PM Toronto. Day crushed, tomorrow Steven/Raff blocks locked.');
+    expect(text).toBe('Tuesday 9PM UTC. Day wrapped, tomorrow design/review blocks locked.');
   });
 
   test('formatFollowUpText skips empty insight strings', () => {
@@ -363,12 +363,12 @@ describe('BackgroundCortexFollowUpService', () => {
         {
           cortexName: 'Background Analysis',
           insight:
-            'Thursday night in Toronto. The continuity thread is alive, but there are a few stale signals from last week mixed in.',
+            'Thursday night in UTC. The continuity thread is alive, but there are a few stale signals from last week mixed in.',
         },
         {
           cortexName: 'MS365',
           insight:
-            'Taylor Reed sent the project onboarding invite for April 1 at 10 AM Pacific. The application thread is moving.',
+            'The operations contact sent the project onboarding invite for April 1 at 10 AM Pacific. The application thread is moving.',
         },
         {
           cortexName: 'Google',
@@ -381,7 +381,7 @@ describe('BackgroundCortexFollowUpService', () => {
     });
 
     expect(text).toBe(
-      'Taylor Reed sent the project onboarding invite for April 1 at 10 AM Pacific. The application thread is moving.',
+      'The operations contact sent the project onboarding invite for April 1 at 10 AM Pacific. The application thread is moving.',
     );
   });
 
@@ -391,17 +391,17 @@ describe('BackgroundCortexFollowUpService', () => {
         {
           cortexName: 'Background Analysis',
           insight:
-            'Thursday, 9 PM in Toronto. End of the work week push.\n\nMemory has a gap from mid-March, so continuity is imperfect tonight.',
+            'Thursday, 9 PM UTC. End of the work week push.\n\nMemory has a gap from mid-March, so continuity is imperfect tonight.',
         },
         {
           cortexName: 'MS365',
           insight:
-            'It’s Thursday night in Toronto — late enough for companion mode, not push mode.\n\nA couple unread Outlook threads look real, not noise: one from David about user-login/cost questions, and one on Raffaele with an attachment. Tomorrow starts with a 10:00am partner strategy connect, then founder standup at 3:00pm.',
+            'It’s Thursday night in UTC — late enough for companion mode, not push mode.\n\nA couple unread Outlook threads look real, not noise: one about login/cost questions, and one with an attachment. Tomorrow starts with a 10:00am strategy connect, then team standup at 3:00pm.',
         },
         {
           cortexName: 'Google',
           insight:
-            'It’s Thursday night, 9:04 PM in Toronto — EDT, weekday energy, so light touch.\n\nI checked what I could live here, but I don’t have working Google/MS calendar, inbox, or schedule tools available in this run to verify anything important there.\n\nNow: nothing live is telling me there’s an urgent fire.',
+            'It’s Thursday night, 9:04 PM UTC — weekday energy, so light touch.\n\nI checked what I could live here, but I don’t have working Google/MS calendar, inbox, or schedule tools available in this run to verify anything important there.\n\nNow: nothing live is telling me there’s an urgent fire.',
         },
       ],
       scheduleId: 'schedule-1',
@@ -409,7 +409,7 @@ describe('BackgroundCortexFollowUpService', () => {
     });
 
     expect(text).toBe(
-      'It’s Thursday night in Toronto — late enough for companion mode, not push mode.\n\nA couple unread Outlook threads look real, not noise: one from David about user-login/cost questions, and one on Raffaele with an attachment. Tomorrow starts with a 10:00am partner strategy connect, then founder standup at 3:00pm.',
+      'It’s Thursday night in UTC — late enough for companion mode, not push mode.\n\nA couple unread Outlook threads look real, not noise: one about login/cost questions, and one with an attachment. Tomorrow starts with a 10:00am strategy connect, then team standup at 3:00pm.',
     );
   });
 
@@ -573,6 +573,86 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(db.saveMessage).not.toHaveBeenCalled();
   });
 
+  test('createCortexFollowUpMessage persists a deterministic fallback when synthesis is empty but insight is substantive', async () => {
+    const req = { user: { id: 'u1' } };
+    db.getMessages.mockResolvedValueOnce([{ messageId: 'm-parent' }]);
+    db.saveMessage.mockResolvedValueOnce({});
+
+    Run.create.mockResolvedValueOnce({
+      processStream: jest.fn(async () => ''),
+    });
+
+    const msg = await createCortexFollowUpMessage({
+      req,
+      conversationId: 'c-123',
+      parentMessageId: 'm-parent',
+      agent: { id: 'agent_123', provider: 'openai', model: 'gpt-4o-mini', model_parameters: {} },
+      insightsData: {
+        insights: [
+          {
+            cortexName: 'Pattern Recognition',
+            insight:
+              'Earlier today you already decided the on-site visit is optional for the reporting launch and more of a morale trip.',
+          },
+        ],
+      },
+      recentResponse: '',
+    });
+
+    expect(msg).toBeTruthy();
+    expect(msg.text).toContain('Earlier today you already decided');
+    expect(db.saveMessage).toHaveBeenCalledWith(
+      req,
+      expect.objectContaining({
+        conversationId: 'c-123',
+        parentMessageId: 'm-parent',
+        text: expect.stringContaining('Earlier today you already decided'),
+      }),
+      expect.any(Object),
+    );
+  });
+
+  test('createCortexFollowUpMessage persists deterministic fallback when non-deferred synthesis returns NTA but insight is substantive', async () => {
+    const req = { user: { id: 'u1' } };
+    db.getMessages.mockResolvedValueOnce([{ messageId: 'm-parent' }]);
+    db.saveMessage.mockResolvedValueOnce({});
+
+    Run.create.mockResolvedValueOnce({
+      processStream: jest.fn(async () => '{NTA}'),
+    });
+
+    const msg = await createCortexFollowUpMessage({
+      req,
+      conversationId: 'c-123',
+      parentMessageId: 'm-parent',
+      agent: { id: 'agent_123', provider: 'openai', model: 'gpt-5.4', model_parameters: {} },
+      insightsData: {
+        insights: [
+          {
+            cortexName: 'Pattern Recognition',
+            insight:
+              'The overnight batch job was overrunning, and that is what led into moving the backup window later.',
+          },
+        ],
+      },
+      recentResponse:
+        'Yeah — you were working through the maintenance schedule. Moving the backup window later is about reducing load overlap.',
+    });
+
+    expect(msg).toBeTruthy();
+    expect(msg.text).toContain('The overnight batch job was overrunning');
+    expect(msg.text).not.toContain('{NTA}');
+    expect(db.saveMessage).toHaveBeenCalledWith(
+      req,
+      expect.objectContaining({
+        conversationId: 'c-123',
+        parentMessageId: 'm-parent',
+        text: expect.stringContaining('The overnight batch job was overrunning'),
+      }),
+      expect.any(Object),
+    );
+  });
+
   test('createCortexFollowUpMessage suppresses question-only follow-up as {NTA}', async () => {
     const req = { user: { id: 'u1' } };
     db.getMessage.mockResolvedValueOnce({
@@ -592,7 +672,7 @@ describe('BackgroundCortexFollowUpService', () => {
       parentMessageId: 'm-parent',
       agent: { id: 'agent_123', provider: 'openai', model: 'gpt-4o-mini', model_parameters: {} },
       insightsData: {
-        insights: [{ cortexName: 'Background Analysis', insight: 'Duplicate question-style hint' }],
+        insights: [{ cortexName: 'Background Analysis', insight: 'Should I ask another question?' }],
       },
       recentResponse: '',
     });
@@ -800,7 +880,7 @@ describe('BackgroundCortexFollowUpService', () => {
           cortex_id: 'ms365-1',
           status: 'complete',
           insight:
-            'Taylor Reed sent the project onboarding invite for April 1 at 10 AM Pacific. The application thread is moving.',
+            'The operations contact sent the project onboarding invite for April 1 at 10 AM Pacific. The application thread is moving.',
         },
         {
           type: 'cortex_insight',
@@ -835,7 +915,7 @@ describe('BackgroundCortexFollowUpService', () => {
           {
             cortexName: 'MS365',
             insight:
-              'Taylor Reed sent the project onboarding invite for April 1 at 10 AM Pacific. The application thread is moving.',
+              'The operations contact sent the project onboarding invite for April 1 at 10 AM Pacific. The application thread is moving.',
           },
           {
             cortexName: 'Google',
@@ -853,7 +933,7 @@ describe('BackgroundCortexFollowUpService', () => {
       req,
       expect.objectContaining({
         messageId: 'm-parent',
-        text: 'Taylor Reed sent the project onboarding invite for April 1 at 10 AM Pacific. The application thread is moving.',
+        text: 'The operations contact sent the project onboarding invite for April 1 at 10 AM Pacific. The application thread is moving.',
         unfinished: false,
       }),
       expect.any(Object),
@@ -861,7 +941,7 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(msg).toEqual(
       expect.objectContaining({
         messageId: 'm-parent',
-        text: 'Taylor Reed sent the project onboarding invite for April 1 at 10 AM Pacific. The application thread is moving.',
+        text: 'The operations contact sent the project onboarding invite for April 1 at 10 AM Pacific. The application thread is moving.',
         unfinished: false,
       }),
     );
@@ -1178,7 +1258,7 @@ describe('BackgroundCortexFollowUpService', () => {
       id: 'agent_viventium_main_95aeb3',
       provider: 'anthropic',
       model: 'claude-opus-4-7',
-      model_parameters: { temperature: 0.2, thinking: false },
+      model_parameters: { thinking: false },
       voice_llm_provider: 'xai',
       voice_llm_model: 'grok-4-1-fast-non-reasoning',
     });
@@ -1189,7 +1269,7 @@ describe('BackgroundCortexFollowUpService', () => {
         id: 'agent_viventium_main_95aeb3',
         provider: 'undefined',
         model: '',
-        model_parameters: { temperature: 0.3 },
+        model_parameters: {},
       },
       insightsData: {
         insights: [{ cortexName: 'Strategic Planning', insight: 'Close revenue first.' }],
@@ -1203,7 +1283,6 @@ describe('BackgroundCortexFollowUpService', () => {
       expect.objectContaining({
         model_parameters: expect.objectContaining({
           model: 'claude-opus-4-7',
-          temperature: 0.3,
           thinking: false,
         }),
       }),
@@ -1256,7 +1335,6 @@ describe('BackgroundCortexFollowUpService', () => {
           model_parameters: expect.objectContaining({
             model: 'claude-haiku-4-5',
             reasoning_effort: 'high',
-            temperature: 0.1,
             max_output_tokens: 400,
           }),
         }),
@@ -1313,7 +1391,7 @@ describe('BackgroundCortexFollowUpService', () => {
         id: 'agent_123',
         provider: 'anthropic',
         model: 'claude-opus-4-7',
-        model_parameters: { temperature: 0.1, max_output_tokens: 144 },
+        model_parameters: { max_output_tokens: 144 },
       },
       insightsData: {
         insights: [{ cortexName: 'Pattern Recognition', insight: 'Evening reset is real.' }],

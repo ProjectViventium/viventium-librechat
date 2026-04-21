@@ -35,15 +35,25 @@ function parseOpusVersion(model: string): { major: number; minor: number } | nul
   return null;
 }
 
-/** Extracts sonnet major version from both naming formats */
-function parseSonnetVersion(model: string): number | null {
-  const nameFirst = model.match(/claude-sonnet[-.]?(\d+)/);
+/** Extracts sonnet major/minor version from both naming formats */
+function parseSonnetVersion(model: string): { major: number; minor: number } | null {
+  const nameFirst = model.match(/claude-sonnet[-.]?(\d+)(?:[-.](\d+))?/);
   if (nameFirst) {
-    return parseInt(nameFirst[1], 10);
+    const minorToken = nameFirst[2] != null ? String(nameFirst[2]) : '';
+    return {
+      major: parseInt(nameFirst[1], 10),
+      minor:
+        minorToken.length > 0 && minorToken.length < 4 ? parseInt(minorToken, 10) : 0,
+    };
   }
-  const numFirst = model.match(/claude-(\d+)(?:[-.]?\d+)?-sonnet/);
+  const numFirst = model.match(/claude-(\d+)(?:[-.](\d+))?-sonnet/);
   if (numFirst) {
-    return parseInt(numFirst[1], 10);
+    const minorToken = numFirst[2] != null ? String(numFirst[2]) : '';
+    return {
+      major: parseInt(numFirst[1], 10),
+      minor:
+        minorToken.length > 0 && minorToken.length < 4 ? parseInt(minorToken, 10) : 0,
+    };
   }
   return null;
 }
@@ -55,7 +65,7 @@ export function supportsAdaptiveThinking(model: string): boolean {
     return true;
   }
   const sonnet = parseSonnetVersion(model);
-  if (sonnet != null && sonnet >= 5) {
+  if (sonnet && (sonnet.major > 4 || (sonnet.major === 4 && sonnet.minor >= 6))) {
     return true;
   }
   return false;
@@ -64,7 +74,7 @@ export function supportsAdaptiveThinking(model: string): boolean {
 /** Checks if a model qualifies for the context-1m beta header on current Sonnet/Opus releases. */
 export function supportsContext1m(model: string): boolean {
   const sonnet = parseSonnetVersion(model);
-  if (sonnet != null && sonnet >= 4) {
+  if (sonnet && sonnet.major >= 4) {
     return true;
   }
   const opus = parseOpusVersion(model);

@@ -386,6 +386,7 @@ describe('initializeAgent — conversation recall resources', () => {
         expect.objectContaining({
           file_id: 'conversation_recall:user-1:all',
           viventiumConversationRecallMode: 'source_only',
+          viventiumConversationRecallAttachmentReason: 'missing_corpus',
         }),
       ]),
     );
@@ -418,6 +419,7 @@ describe('initializeAgent — conversation recall resources', () => {
         expect.objectContaining({
           file_id: 'conversation_recall:user-1:all',
           viventiumConversationRecallMode: 'source_only',
+          viventiumConversationRecallAttachmentReason: 'missing_corpus',
         }),
       ]),
     );
@@ -460,6 +462,7 @@ describe('initializeAgent — conversation recall resources', () => {
         expect.objectContaining({
           file_id: 'conversation_recall:user-1:all',
           viventiumConversationRecallMode: 'source_only',
+          viventiumConversationRecallAttachmentReason: 'stale_corpus',
         }),
       ]),
     );
@@ -500,6 +503,7 @@ describe('initializeAgent — conversation recall resources', () => {
         expect.objectContaining({
           file_id: 'conversation_recall:user-1:all',
           viventiumConversationRecallMode: 'vector',
+          viventiumConversationRecallAttachmentReason: 'vector_ready',
         }),
       ]),
     );

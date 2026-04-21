@@ -15,6 +15,14 @@ const CITATION_COMPOSITE_RE = /(?:\\ue200|ue200|\ue200).*?(?:\\ue201|ue201|\ue20
 const CITATION_STANDALONE_RE = /(?:\\ue202|ue202|\ue202)turn\d+[A-Za-z]+\d+/gi;
 const CITATION_CLEANUP_RE = /(?:\\ue2(?:00|01|02|03|04|06)|ue2(?:00|01|02|03|04|06)|[\ue200-\ue206])/gi;
 const BRACKET_CITATION_RE = /\[(\d{1,3})\](?=\s|$)/g;
+const LEADING_THINKING_MODE_REASONING_RE =
+  /^\s*<thinking_mode\b[^>]*>[\s\S]*?<\/thinking_mode>\s*[\s\S]*?<\/thinking>\s*/i;
+const LEADING_THINKING_MODE_RE = /^\s*<thinking_mode\b[^>]*>[\s\S]*?<\/thinking_mode>\s*/i;
+const LEADING_REASONING_BLOCK_RES = [
+  /^\s*<thinking\b[^>]*>[\s\S]*?<\/thinking>\s*/i,
+  /^\s*<think\b[^>]*>[\s\S]*?<\/think>\s*/i,
+  /^\s*:::thinking\s*[\r\n]*[\s\S]*?:::\s*/i,
+];
 
 function stripCitationArtifacts(text) {
   if (typeof text !== 'string' || text.length === 0) {
@@ -30,6 +38,52 @@ function stripCitationArtifacts(text) {
     .trim();
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Strip leaked reasoning wrappers from Phase B follow-up text.
+ * Purpose:
+ * - `cortex_followup` messages are plain user-visible assistant turns, not structured reasoning
+ *   payloads. If an upstream/provider path leaks reasoning wrappers into this string surface, the
+ *   follow-up must persist only the visible answer so LibreChat keeps its native thinking UI for
+ *   real structured turns.
+ * - This stays scoped to follow-up display sanitization instead of touching the shared renderer.
+ * Added: 2026-04-21
+ * === VIVENTIUM END === */
+function stripLeadingReasoningArtifacts(text) {
+  if (typeof text !== 'string' || text.length === 0) {
+    return '';
+  }
+
+  let cleaned = text;
+  let changed = false;
+
+  do {
+    changed = false;
+
+    const withoutMalformedThinkingLeak = cleaned.replace(LEADING_THINKING_MODE_REASONING_RE, '');
+    if (withoutMalformedThinkingLeak !== cleaned) {
+      cleaned = withoutMalformedThinkingLeak;
+      changed = true;
+    }
+
+    const withoutThinkingMode = cleaned.replace(LEADING_THINKING_MODE_RE, '');
+    if (withoutThinkingMode !== cleaned) {
+      cleaned = withoutThinkingMode;
+      changed = true;
+    }
+
+    for (const pattern of LEADING_REASONING_BLOCK_RES) {
+      const withoutReasoning = cleaned.replace(pattern, '');
+      if (withoutReasoning !== cleaned) {
+        cleaned = withoutReasoning;
+        changed = true;
+        break;
+      }
+    }
+  } while (changed);
+
+  return cleaned.trim();
+}
+
 function sanitizeFollowUpDisplayText(text) {
   if (typeof text !== 'string') {
     return '';
@@ -39,10 +93,12 @@ function sanitizeFollowUpDisplayText(text) {
   }
 
   const withoutNoResponseLeak = text.replace(LEADING_NTA_RE, '').replace(TRAILING_NTA_RE, '');
-  return stripCitationArtifacts(withoutNoResponseLeak);
+  const withoutReasoningLeak = stripLeadingReasoningArtifacts(withoutNoResponseLeak);
+  return stripCitationArtifacts(withoutReasoningLeak);
 }
 
 module.exports = {
+  stripLeadingReasoningArtifacts,
   stripCitationArtifacts,
   sanitizeFollowUpDisplayText,
 };

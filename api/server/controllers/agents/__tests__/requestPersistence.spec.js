@@ -56,7 +56,12 @@ jest.mock('~/server/services/viventium/morningBriefingBootstrap', () => ({
 }));
 
 jest.mock('~/server/services/viventium/surfacePrompts', () => ({
-  stripVoiceControlTagsForDisplay: jest.fn((text) => text.replace(/\[[^\]]+\]/g, '')),
+  stripVoiceControlTagsForDisplay: jest.fn((text) =>
+    text
+      .replace(/<emotion[^>]*\/>/g, '')
+      .replace(/<emotion[^>]*>(.*?)<\/emotion>/g, '$1')
+      .replace(/\[[^\]]+\]/g, ''),
+  ),
 }));
 
 describe('request persistence helpers', () => {
@@ -109,6 +114,41 @@ describe('request persistence helpers', () => {
         agent_id: 'agent-123',
       }),
       expect.objectContaining({ context: 'test-partial' }),
+    );
+  });
+
+  it('sanitizes persisted voice-mode content parts as well as top-level text', async () => {
+    const req = {
+      user: { id: 'user-1' },
+      body: { voiceMode: true },
+    };
+
+    const result = await __testables.persistAssistantSnapshot({
+      req,
+      streamId: 'stream-1',
+      userId: 'user-1',
+      client: { sender: 'AI', options: { endpoint: 'agents' }, model: 'test-model' },
+      conversationId: 'convo-1',
+      aggregatedContent: [
+        { type: 'text', text: '<emotion value="content"/>Yeah.' },
+        { type: 'tool_use', id: 'tool-1', name: 'x' },
+      ],
+      unfinished: true,
+      error: false,
+      context: 'test-voice-sanitized-content',
+    });
+
+    expect(result.persisted).toBe(true);
+    expect(mockSaveMessage).toHaveBeenCalledWith(
+      req,
+      expect.objectContaining({
+        text: 'Yeah.',
+        content: [
+          { type: 'text', text: 'Yeah.' },
+          { type: 'tool_use', id: 'tool-1', name: 'x' },
+        ],
+      }),
+      expect.objectContaining({ context: 'test-voice-sanitized-content' }),
     );
   });
 

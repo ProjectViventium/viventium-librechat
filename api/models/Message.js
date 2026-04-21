@@ -219,10 +219,25 @@ async function recordMessage({
       ...rest,
     };
 
-    return await Message.findOneAndUpdate({ user, messageId }, message, {
+    const savedMessage = await Message.findOneAndUpdate({ user, messageId }, message, {
       upsert: true,
       new: true,
     });
+
+    /* === VIVENTIUM START ===
+     * Feature: Conversation Recall RAG proactive sync on direct recordMessage writes
+     * Purpose: Keep recall freshness aligned across all message persistence surfaces, not only
+     * saveMessage/updateMessage.
+     * Added: 2026-04-21
+     * === VIVENTIUM END === */
+    if (savedMessage?.conversationId) {
+      scheduleConversationRecallSync({
+        userId: user,
+        conversationId: savedMessage.conversationId,
+      });
+    }
+
+    return savedMessage;
   } catch (err) {
     logger.error('Error recording message:', err);
     throw err;
@@ -243,7 +258,18 @@ async function recordMessage({
  */
 async function updateMessageText(req, { messageId, text }) {
   try {
-    await Message.updateOne({ messageId, user: req.user.id }, { text });
+    const result = await Message.findOneAndUpdate(
+      { messageId, user: req.user.id },
+      { text },
+      { new: true },
+    );
+
+    if (result?.conversationId) {
+      scheduleConversationRecallSync({
+        userId: req.user.id,
+        conversationId: result.conversationId,
+      });
+    }
   } catch (err) {
     logger.error('Error updating message text:', err);
     throw err;

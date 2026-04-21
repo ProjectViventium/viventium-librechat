@@ -216,7 +216,7 @@ describe('/api/viventium/skyvern/openai/v1/chat/completions', () => {
       .post('/api/viventium/skyvern/openai/v1/chat/completions')
       .set('authorization', 'Bearer bridge-secret')
       .send({
-        model: 'anthropic/claude-sonnet-4-20250514',
+        model: 'anthropic/claude-sonnet-4-6',
         messages: [{ role: 'user', content: 'Say hello' }],
       });
 

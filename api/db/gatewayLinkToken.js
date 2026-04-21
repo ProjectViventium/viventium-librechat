@@ -19,13 +19,10 @@ module.exports = function createGatewayLinkToken(db) {
       externalUserId: { type: String, required: true, index: true },
       externalUsername: { type: String, default: '' },
       metadata: { type: mongoose.Schema.Types.Mixed, default: {} },
-      expiresAt: { type: Date, required: true, index: true },
+      expiresAt: { type: Date, required: true, index: { expireAfterSeconds: 0 } },
       consumedAt: { type: Date, default: null },
     },
     { timestamps: true },
   );
-
-  schema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
-
   return connection.model('GatewayLinkToken', schema);
 };

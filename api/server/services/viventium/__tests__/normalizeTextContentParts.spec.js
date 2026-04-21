@@ -132,6 +132,42 @@ describe('normalizeTextContentParts', () => {
     expect(result[0].content).toBe('Context message.');
   });
 
+  test('sanitizeAnthropicFormattedMessages drops malformed thinking blocks but preserves valid reasoning', () => {
+    const messages = [
+      {
+        content: [
+          { type: 'thinking', signature: 'sig-only' },
+          { type: 'thinking', thinking: { text: 'wrong-shape' }, signature: 'sig-object' },
+          { type: 'redacted_thinking', data: '' },
+          { type: 'redacted_thinking', data: { opaque: true } },
+          { type: 'thinking', thinking: 'valid reasoning', signature: 'valid-sig' },
+          { type: 'redacted_thinking', data: 'opaque' },
+          { type: 'tool_use', id: 'tool-1', name: 'web_search', input: { q: 'hi' } },
+        ],
+      },
+    ];
+
+    const result = sanitizeAnthropicFormattedMessages(messages);
+    expect(result).toHaveLength(1);
+    expect(result[0].content).toEqual([
+      { type: 'thinking', thinking: 'valid reasoning', signature: 'valid-sig' },
+      { type: 'redacted_thinking', data: 'opaque' },
+      { type: 'tool_use', id: 'tool-1', name: 'web_search', input: { q: 'hi' } },
+    ]);
+  });
+
+  test('sanitizeAnthropicFormattedMessages falls back when malformed reasoning leaves no content', () => {
+    const messages = [
+      {
+        content: [{ type: 'thinking', thinking: '', signature: '' }],
+      },
+    ];
+
+    const result = sanitizeAnthropicFormattedMessages(messages);
+    expect(result).toHaveLength(1);
+    expect(result[0].content).toBe('Context message.');
+  });
+
   test('sanitizeAnthropicFormattedMessages preserves LangChain prototype when a message is rewritten', () => {
     const messages = [
       new HumanMessage({
@@ -226,6 +262,53 @@ describe('normalizeTextContentParts', () => {
             expect(typeof part.text).toBe('string');
             expect(part.text.trim().length).toBeGreaterThan(0);
           }
+        }
+      }
+    }
+  });
+
+  test('end-to-end pipeline drops empty think shells before Anthropic tool follow-up formatting', () => {
+    const payload = [
+      { role: 'user', content: 'hi' },
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.THINK, think: '' },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: { id: 'tool-1', name: 'file_search', args: '{}' },
+          },
+        ],
+      },
+    ];
+
+    const normalized = normalizeTextPartsInPayload(payload).map((message) => {
+      if (!Array.isArray(message.content)) {
+        return message;
+      }
+      return {
+        ...message,
+        content: filterMalformedContentParts(message.content),
+      };
+    });
+
+    const { messages: formatted } = formatAgentMessages(normalized, {}, new Set(['file_search']));
+    const hardened = sanitizeProviderFormattedMessages('anthropic', formatted);
+
+    expect(hardened.length).toBeGreaterThan(0);
+    for (const message of hardened) {
+      expect(typeof message._getType).toBe('function');
+      expect(() => coerceMessageLikeToMessage(message)).not.toThrow();
+      if (typeof message.content === 'string') {
+        expect(message.content.trim().length).toBeGreaterThan(0);
+        continue;
+      }
+      expect(Array.isArray(message.content)).toBe(true);
+      for (const part of message.content) {
+        expect(part?.type).not.toBe('thinking');
+        if (part?.type === ContentTypes.TEXT) {
+          expect(typeof part.text).toBe('string');
+          expect(part.text.trim().length).toBeGreaterThan(0);
         }
       }
     }

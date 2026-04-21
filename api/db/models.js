@@ -17,6 +17,11 @@ const createTelegramLinkToken = require('./telegramLinkToken');
 const createViventiumCallSession = require('./viventiumCallSession');
 /* === VIVENTIUM END === */
 /* === VIVENTIUM START ===
+ * Feature: Voice ingress coalescing model.
+ * Added: 2026-04-20
+ * === VIVENTIUM END === */
+const createViventiumVoiceIngressEvent = require('./viventiumVoiceIngressEvent');
+/* === VIVENTIUM START ===
  * Feature: Credits purchase request audit model.
  * Added: 2026-02-18
  * === VIVENTIUM END === */
@@ -46,6 +51,7 @@ module.exports = {
   GatewayUserMapping: createGatewayUserMapping(mongoose),
   GatewayLinkToken: createGatewayLinkToken(mongoose),
   ViventiumCallSession: createViventiumCallSession(mongoose),
+  ViventiumVoiceIngressEvent: createViventiumVoiceIngressEvent(mongoose),
   ViventiumCreditsRequest: createViventiumCreditsRequest(mongoose),
   ViventiumTelegramIngressEvent: createViventiumTelegramIngressEvent(mongoose),
   ViventiumGatewayIngressEvent: createViventiumGatewayIngressEvent(mongoose),

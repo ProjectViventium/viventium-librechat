@@ -812,5 +812,64 @@ describe('processMemory - GPT-5+ handling', () => {
         }),
       }),
     );
+    const callArgs = (Run.create as jest.Mock).mock.calls[0][0];
+    expect(callArgs.graphConfig.llmConfig.thinking).toBeUndefined();
+  });
+
+  it('should remove temperature for Anthropic when memory relies on default thinking', async () => {
+    await processMemory({
+      res: mockRes as Response,
+      userId: 'test-user',
+      setMemory: mockSetMemory,
+      deleteMemory: mockDeleteMemory,
+      messages: [],
+      memory: 'Test memory',
+      messageId: 'msg-123',
+      conversationId: 'conv-123',
+      instructions: 'Test instructions',
+      llmConfig: {
+        provider: Providers.ANTHROPIC,
+        model: 'claude-sonnet-4-6',
+        temperature: 0.4,
+      },
+    });
+
+    const { Run } = jest.requireMock('@librechat/agents');
+    const callArgs = (Run.create as jest.Mock).mock.calls[0][0];
+    expect(callArgs.graphConfig.llmConfig.temperature).toBeUndefined();
+    expect(callArgs.graphConfig.llmConfig.thinking).toBeUndefined();
+  });
+
+  it('should strip Anthropic output_config when memory forces tool use', async () => {
+    await processMemory({
+      res: mockRes as Response,
+      userId: 'test-user',
+      setMemory: mockSetMemory,
+      deleteMemory: mockDeleteMemory,
+      messages: [],
+      memory: 'Test memory',
+      messageId: 'msg-123',
+      conversationId: 'conv-123',
+      instructions: 'Test instructions',
+      llmConfig: {
+        provider: Providers.ANTHROPIC,
+        model: 'claude-opus-4-7',
+        invocationKwargs: {
+          output_config: {
+            effort: 'high',
+          },
+        },
+      },
+    });
+
+    const { Run } = jest.requireMock('@librechat/agents');
+    const callArgs = (Run.create as jest.Mock).mock.calls[0][0];
+    expect(callArgs.graphConfig.llmConfig.thinking).toBeUndefined();
+    expect(callArgs.graphConfig.llmConfig.invocationKwargs).toEqual({
+      tool_choice: {
+        type: 'tool',
+        name: 'apply_memory_changes',
+      },
+    });
   });
 });

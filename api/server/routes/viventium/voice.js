@@ -17,10 +17,12 @@
  * Porting: Copy this file wholesale when reapplying Viventium changes onto a fresh upstream checkout.
  * === VIVENTIUM END === */
 
+const crypto = require('crypto');
 const express = require('express');
 const { GenerationJobManager } = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
 const { SystemRoles } = require('librechat-data-provider');
+const { ViventiumVoiceIngressEvent } = require('~/db/models');
 const { configMiddleware, validateConvoAccess, buildEndpointOption } = require('~/server/middleware');
 const { initializeClient } = require('~/server/services/Endpoints/agents');
 const addTitle = require('~/server/services/Endpoints/agents/title');
@@ -47,6 +49,48 @@ const {
   resolveReusableConversationState,
 } = require('~/server/services/viventium/conversationThreading');
 
+function parseBoolEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw == null) {
+    return fallback;
+  }
+  const normalized = String(raw).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) {
+    return true;
+  }
+  if (['0', 'false', 'no', 'off'].includes(normalized)) {
+    return false;
+  }
+  return fallback;
+}
+
+function parseIntEnv(name, fallback) {
+  const parsed = Number.parseInt(process.env[name], 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+const VOICE_TURN_COALESCE_ENABLED = parseBoolEnv('VIVENTIUM_VOICE_TURN_COALESCE_ENABLED', true);
+const VOICE_TURN_COALESCE_WINDOW_MS = Math.max(
+  parseIntEnv('VIVENTIUM_VOICE_TURN_COALESCE_WINDOW_MS', 350),
+  0,
+);
+const VOICE_TURN_COALESCE_WAIT_MS = Math.max(
+  parseIntEnv('VIVENTIUM_VOICE_TURN_COALESCE_WAIT_MS', 4000),
+  250,
+);
+const VOICE_TURN_COALESCE_POLL_MS = Math.max(
+  parseIntEnv('VIVENTIUM_VOICE_TURN_COALESCE_POLL_MS', 50),
+  10,
+);
+const VOICE_TURN_COALESCE_RETURN_WINDOW_MS = Math.max(
+  parseIntEnv('VIVENTIUM_VOICE_TURN_COALESCE_RETURN_WINDOW_MS', 500),
+  100,
+);
+const VOICE_TURN_COALESCE_TTL_S = Math.max(
+  parseIntEnv('VIVENTIUM_VOICE_TURN_COALESCE_TTL_S', 30),
+  10,
+);
+
 const isVoiceLatencyEnabled = (req) => req?.viventiumVoiceLogLatency === true;
 
 const getVoiceLatencyRequestId = (req) => {
@@ -70,6 +114,221 @@ const logVoiceRouteStage = (req, stage, stageStartAt = null, details = '') => {
     `[VoiceLatency][LC][Route] stage=${stage} request_id=${getVoiceLatencyRequestId(req)} total_ms=${now - routeStartAt}${stagePart}${detailPart}`,
   );
 };
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isMongoDuplicateKeyError(error) {
+  return Boolean(error) && Number(error.code) === 11000;
+}
+
+async function findVoiceIngressEvent(query) {
+  const result = ViventiumVoiceIngressEvent.findOne(query);
+  if (result && typeof result.lean === 'function') {
+    return result.lean();
+  }
+  return result;
+}
+
+async function updateVoiceIngressEvent(query, update, options = {}) {
+  const result = ViventiumVoiceIngressEvent.findOneAndUpdate(query, update, options);
+  if (result && typeof result.lean === 'function') {
+    return result.lean();
+  }
+  return result;
+}
+
+function normalizeVoiceTurnText(value) {
+  if (typeof value !== 'string') {
+    return '';
+  }
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+function normalizeVoiceTurnSegment(segment) {
+  if (typeof segment === 'string') {
+    return {
+      text: normalizeVoiceTurnText(segment),
+      receivedAtMs: 0,
+    };
+  }
+  if (!segment || typeof segment !== 'object') {
+    return {
+      text: '',
+      receivedAtMs: 0,
+    };
+  }
+  const receivedAtMs = Number.isFinite(segment.receivedAtMs)
+    ? Number(segment.receivedAtMs)
+    : Number.isFinite(segment.receivedAt)
+      ? Number(segment.receivedAt)
+      : 0;
+  return {
+    text: normalizeVoiceTurnText(segment.text),
+    receivedAtMs,
+  };
+}
+
+function mergeVoiceTurnText(existing, incoming) {
+  const current = normalizeVoiceTurnText(existing);
+  const next = normalizeVoiceTurnText(incoming);
+  if (!current) {
+    return next;
+  }
+  if (!next) {
+    return current;
+  }
+  if (current === next) {
+    return current;
+  }
+
+  const currentLower = current.toLowerCase();
+  const nextLower = next.toLowerCase();
+  if (currentLower.includes(nextLower)) {
+    return current;
+  }
+  if (nextLower.includes(currentLower)) {
+    return next;
+  }
+
+  const maxOverlap = Math.min(current.length, next.length);
+  for (let size = maxOverlap; size >= 8; size -= 1) {
+    if (currentLower.slice(-size) === nextLower.slice(0, size)) {
+      return `${current}${next.slice(size)}`.replace(/\s+/g, ' ').trim();
+    }
+  }
+
+  return `${current} ${next}`.replace(/\s+/g, ' ').trim();
+}
+
+function combineVoiceTurnSegments(segments) {
+  if (!Array.isArray(segments)) {
+    return '';
+  }
+  const normalizedSegments = segments
+    .map((segment, index) => ({
+      ...normalizeVoiceTurnSegment(segment),
+      originalIndex: index,
+    }))
+    .filter((segment) => segment.text);
+  normalizedSegments.sort((left, right) => {
+    if (left.receivedAtMs !== right.receivedAtMs) {
+      return left.receivedAtMs - right.receivedAtMs;
+    }
+    return left.originalIndex - right.originalIndex;
+  });
+  return normalizedSegments.reduce(
+    (combined, segment) => mergeVoiceTurnText(combined, segment.text),
+    '',
+  );
+}
+
+function buildVoiceIngressKey({ callSessionId, conversationId, parentMessageId }) {
+  if (!callSessionId || !conversationId || !parentMessageId) {
+    return '';
+  }
+  return `${callSessionId}:${conversationId}:${parentMessageId}`;
+}
+
+async function coalesceVoiceTurn({
+  callSessionId,
+  userId,
+  conversationId,
+  parentMessageId,
+  text,
+  receivedAtMs,
+  requestId,
+}) {
+  const normalizedText = normalizeVoiceTurnText(text);
+  const dedupeKey = buildVoiceIngressKey({ callSessionId, conversationId, parentMessageId });
+  if (!VOICE_TURN_COALESCE_ENABLED || !normalizedText || !dedupeKey) {
+    return {
+      shouldLaunch: true,
+      mergedText: normalizedText || text,
+      dedupeKey: '',
+    };
+  }
+
+  const normalizedReceivedAtMs = Number.isFinite(receivedAtMs) ? Number(receivedAtMs) : Date.now();
+  const segment = {
+    text: normalizedText,
+    receivedAtMs: normalizedReceivedAtMs,
+    requestId,
+  };
+  const expiresAt = new Date(Date.now() + VOICE_TURN_COALESCE_TTL_S * 1000);
+  try {
+    await ViventiumVoiceIngressEvent.create({
+      dedupeKey,
+      callSessionId,
+      userId,
+      conversationId,
+      parentMessageId,
+      requestId,
+      status: 'buffering',
+      segments: [segment],
+      expiresAt,
+    });
+
+    if (VOICE_TURN_COALESCE_WINDOW_MS > 0) {
+      await sleep(VOICE_TURN_COALESCE_WINDOW_MS);
+    }
+    const doc = await findVoiceIngressEvent({ dedupeKey });
+    const mergedText = combineVoiceTurnSegments(doc?.segments || [normalizedText]) || normalizedText;
+    return {
+      shouldLaunch: true,
+      mergedText,
+      dedupeKey,
+    };
+  } catch (error) {
+    if (!isMongoDuplicateKeyError(error)) {
+      throw error;
+    }
+  }
+
+  const bufferingDoc = await updateVoiceIngressEvent(
+    { dedupeKey, status: 'buffering' },
+    {
+      $push: { segments: segment },
+      $set: { expiresAt, requestId },
+    },
+    { new: true },
+  );
+
+  const deadline = Date.now() + VOICE_TURN_COALESCE_WAIT_MS;
+  while (Date.now() < deadline) {
+    const doc = await findVoiceIngressEvent({ dedupeKey });
+    if (!doc) {
+      break;
+    }
+    if (doc.streamId) {
+      const launchedAtMs = doc.launchedAt ? new Date(doc.launchedAt).getTime() : 0;
+      if (!launchedAtMs || Date.now() - launchedAtMs <= VOICE_TURN_COALESCE_RETURN_WINDOW_MS) {
+        return {
+          shouldLaunch: false,
+          payload: {
+            streamId: doc.streamId,
+            conversationId: doc.conversationId || conversationId,
+            status: 'started',
+            coalesced: true,
+          },
+        };
+      }
+      break;
+    }
+
+    if (!bufferingDoc && doc.status !== 'buffering') {
+      break;
+    }
+    await sleep(VOICE_TURN_COALESCE_POLL_MS);
+  }
+
+  return {
+    shouldLaunch: true,
+    mergedText: normalizedText,
+    dedupeKey: '',
+  };
+}
 
 /* === VIVENTIUM NOTE ===
  * Feature: Voice conversation continuity - parentMessageId tracking
@@ -181,6 +440,7 @@ async function voiceAuth(req, res, next) {
  *   The agent should respond naturally with the insight, not as a user question.
  */
 router.post('/chat', voiceAuth, configMiddleware, async (req, _res, next) => {
+  req.viventiumVoiceIngressReceivedAtMs = Date.now();
   const session = req.viventiumCallSession;
   const incoming = req.body ?? {};
   const text = typeof incoming.text === 'string' ? incoming.text : '';
@@ -282,6 +542,53 @@ router.post('/chat', voiceAuth, configMiddleware, async (req, _res, next) => {
   // If this call session began from a "new" conversation, capture the real conversationId
   // returned by ResumableAgentController and update the session store.
   const session = req.viventiumCallSession;
+
+  const coalescedTurn = await coalesceVoiceTurn({
+    callSessionId: session?.callSessionId,
+    userId: req.user?.id,
+    conversationId: req.body?.conversationId,
+    parentMessageId: req.body?.parentMessageId,
+    text: req.body?.text,
+    receivedAtMs: req.viventiumVoiceIngressReceivedAtMs,
+    requestId:
+      req.viventiumVoiceRequestId || req.get('X-VIVENTIUM-REQUEST-ID') || crypto.randomUUID(),
+  });
+
+  if (!coalescedTurn.shouldLaunch && coalescedTurn.payload) {
+    logger.info(
+      '[VIVENTIUM][voice/chat] Coalesced onto existing stream parentMessageId=%s conversationId=%s streamId=%s',
+      req.body?.parentMessageId,
+      req.body?.conversationId,
+      coalescedTurn.payload.streamId,
+    );
+    return res.json(coalescedTurn.payload);
+  }
+
+  if (
+    typeof coalescedTurn.mergedText === 'string' &&
+    coalescedTurn.mergedText &&
+    coalescedTurn.mergedText !== req.body?.text
+  ) {
+    logger.info(
+      '[VIVENTIUM][voice/chat] Coalesced rapid same-parent turn text parentMessageId=%s chars=%s->%s',
+      req.body?.parentMessageId,
+      req.body?.text?.length || 0,
+      coalescedTurn.mergedText.length,
+    );
+    req.body.text = coalescedTurn.mergedText;
+  }
+
+  logger.info(
+    '[VIVENTIUM][voice/chat] user_turn_completed source=route callSessionId=%s conversationId=%s parentMessageId=%s agentId=%s requestId=%s coalesced=%s textChars=%s',
+    session?.callSessionId || 'unknown',
+    req.body?.conversationId || 'unknown',
+    req.body?.parentMessageId || 'none',
+    session?.agentId || 'unknown',
+    req.viventiumVoiceRequestId || req.get('X-VIVENTIUM-REQUEST-ID') || 'unknown',
+    Boolean(coalescedTurn.dedupeKey),
+    req.body?.text?.length || 0,
+  );
+
   const originalJson = res.json.bind(res);
   res.json = (payload) => {
     try {
@@ -289,6 +596,23 @@ router.post('/chat', voiceAuth, configMiddleware, async (req, _res, next) => {
       if (session && session.conversationId === 'new' && typeof convoId === 'string' && convoId.length > 0) {
         updateCallSessionConversationId(session.callSessionId, convoId).catch((err) => {
           logger.warn('[VIVENTIUM][voice/chat] Failed to update call session conversationId:', err);
+        });
+      }
+      if (coalescedTurn.dedupeKey && typeof payload?.streamId === 'string' && payload.streamId.length > 0) {
+        updateVoiceIngressEvent(
+          { dedupeKey: coalescedTurn.dedupeKey },
+          {
+            $set: {
+              streamId: payload.streamId,
+              status: 'launched',
+              launchedAt: new Date(),
+              conversationId: convoId || req.body?.conversationId || '',
+              expiresAt: new Date(Date.now() + VOICE_TURN_COALESCE_TTL_S * 1000),
+            },
+          },
+          { new: true },
+        ).catch((err) => {
+          logger.warn('[VIVENTIUM][voice/chat] Failed to update coalesced stream record:', err);
         });
       }
       if (req.viventiumVoiceLogLatency && typeof req.viventiumVoiceStartAt === 'number') {

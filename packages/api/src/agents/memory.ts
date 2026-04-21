@@ -1,7 +1,7 @@
 /** Memories */
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
-import { Tools } from 'librechat-data-provider';
+import { Tools, supportsAdaptiveThinking } from 'librechat-data-provider';
 import { logger } from '@librechat/data-schemas';
 import { HumanMessage } from '@langchain/core/messages';
 import { Run, Providers, GraphEvents } from '@librechat/agents';
@@ -26,7 +26,10 @@ import {
   resolveMemoryKeyLimits,
   runMemoryMaintenance,
 } from '~/memory';
-import { hasActiveAnthropicThinking } from '~/endpoints/anthropic/helpers';
+import {
+  hasActiveAnthropicThinking,
+  sanitizeAnthropicTemperatureForThinking,
+} from '~/endpoints/anthropic/helpers';
 import { resolveHeaders, createSafeUser } from '~/utils';
 
 type RequiredMemoryMethods = Pick<
@@ -59,6 +62,7 @@ export const memoryInstructions =
   'The system automatically stores important user information and can update or delete memories based on user requests, enabling dynamic memory management.';
 
 const MEMORY_DECISION_TOOL_NAME = 'apply_memory_changes';
+const ANTHROPIC_MEMORY_DEFAULT_THINKING = true;
 
 const getDefaultInstructions = (
   validKeys?: string[],
@@ -103,6 +107,118 @@ const getMemoryToolProtocolInstructions = () => `TOOL PROTOCOL OVERRIDE:
 - Map any prior \`delete_memory\` intent to \`{"action":"delete","key":"..."}\`.
 - If nothing durable should change, emit exactly one \`{"action":"noop","reason":"..."}\` operation.
 - Do not answer in plain text instead of the tool call.`;
+
+/* === VIVENTIUM START ===
+ * Feature: Anthropic memory tool-call hygiene
+ *
+ * Purpose:
+ * - Keep Anthropic memory runs compatible with forced tool usage and adaptive-thinking
+ *   models without mutating unrelated providers.
+ * - Contain retryability classification and thinking-shape sanitization in the memory
+ *   owner layer instead of scattering provider-specific patches through call sites.
+ * === VIVENTIUM END === */
+function describeAnthropicThinkingMode(thinking: unknown): string {
+  if (thinking == null) {
+    return 'default_enabled';
+  }
+  if (thinking === false) {
+    return 'disabled';
+  }
+  if (thinking === true) {
+    return 'enabled_boolean';
+  }
+  if (typeof thinking !== 'object' || Array.isArray(thinking)) {
+    return 'nonstandard';
+  }
+
+  const type = typeof (thinking as { type?: unknown }).type === 'string'
+    ? String((thinking as { type?: unknown }).type)
+    : '';
+  return type || 'object';
+}
+
+function sanitizeAnthropicMemoryConfig(config: ClientOptions): ClientOptions {
+  if ((config as Partial<LLMConfig>).provider !== Providers.ANTHROPIC) {
+    return config;
+  }
+
+  const configRecord = config as Record<string, unknown>;
+  const modelName = typeof configRecord.model === 'string' ? String(configRecord.model) : '';
+  const hasExplicitThinking = Object.prototype.hasOwnProperty.call(configRecord, 'thinking');
+  const effectiveThinking = hasExplicitThinking
+    ? configRecord.thinking
+    : ANTHROPIC_MEMORY_DEFAULT_THINKING;
+  const sanitized = sanitizeAnthropicTemperatureForThinking({
+    ...config,
+    thinking: effectiveThinking,
+  }) as ClientOptions & {
+    thinking?: unknown;
+    temperature?: number;
+    tool_choice?: unknown;
+    invocationKwargs?: Record<string, unknown>;
+  };
+  const hasForcedToolChoice =
+    sanitized.tool_choice != null || sanitized.invocationKwargs?.tool_choice != null;
+  const hasActiveThinkingForForcedToolUse =
+    hasActiveAnthropicThinking(effectiveThinking) || sanitized.invocationKwargs?.output_config != null;
+
+  if (hasForcedToolChoice && hasActiveThinkingForForcedToolUse) {
+    delete sanitized.thinking;
+
+    if (sanitized.invocationKwargs?.output_config != null) {
+      const { output_config: _outputConfig, ...remainingInvocationKwargs } =
+        sanitized.invocationKwargs;
+      sanitized.invocationKwargs = remainingInvocationKwargs;
+      if (Object.keys(remainingInvocationKwargs).length === 0) {
+        delete sanitized.invocationKwargs;
+      }
+    }
+  }
+
+  if (sanitized.thinking === false) {
+    delete sanitized.thinking;
+  }
+
+  if (modelName && supportsAdaptiveThinking(modelName) && sanitized.temperature != null) {
+    delete sanitized.temperature;
+  }
+
+  if (!hasExplicitThinking) {
+    delete sanitized.thinking;
+  }
+
+  return sanitized;
+}
+
+function isRetryableMemoryProcessingError(error: unknown): boolean {
+  const typedError = error as
+    | {
+        status?: number;
+        statusCode?: number;
+        code?: string | number;
+        response?: { status?: number };
+        message?: string;
+      }
+    | undefined;
+
+  const status = typedError?.status ?? typedError?.statusCode ?? typedError?.response?.status;
+  if (typeof status === 'number') {
+    return status === 429 || status >= 500;
+  }
+
+  const code = String(typedError?.code ?? '').toUpperCase();
+  if (['ECONNRESET', 'ECONNABORTED', 'ETIMEDOUT', 'ECONNREFUSED'].includes(code)) {
+    return true;
+  }
+
+  const message = String(typedError?.message ?? '').toLowerCase();
+  return (
+    message.includes('timeout') ||
+    message.includes('timed out') ||
+    message.includes('network') ||
+    message.includes('fetch failed')
+  );
+}
 
 function buildMemoryErrorArtifact(
   evaluation: ReturnType<typeof evaluateMemoryWrite>,
@@ -797,16 +913,41 @@ ${memory ?? 'No existing memories'}`;
       (finalLLMConfig as unknown as Record<string, unknown>).temperature = 1;
     }
 
-    const anthropicConfig = finalLLMConfig as {
-      thinking?: unknown;
-      temperature?: number;
-    };
-    if (
-      llmConfig?.provider === Providers.ANTHROPIC &&
-      hasActiveAnthropicThinking(anthropicConfig.thinking) &&
-      anthropicConfig.temperature != null
-    ) {
-      delete (finalLLMConfig as Record<string, unknown>).temperature;
+    if (llmConfig?.provider === Providers.ANTHROPIC) {
+      const anthropicConfig = finalLLMConfig as {
+        thinking?: unknown;
+        temperature?: number;
+      };
+      const hadTemperature = anthropicConfig.temperature != null;
+      const sanitizedAnthropicConfig = sanitizeAnthropicMemoryConfig(finalLLMConfig);
+      const removedTemperature =
+        hadTemperature &&
+        (sanitizedAnthropicConfig as { temperature?: number }).temperature == null;
+      const clearedThinking =
+        Object.prototype.hasOwnProperty.call(finalLLMConfig as Record<string, unknown>, 'thinking') &&
+        !Object.prototype.hasOwnProperty.call(
+          sanitizedAnthropicConfig as Record<string, unknown>,
+          'thinking',
+        );
+      if (removedTemperature) {
+        delete (finalLLMConfig as Record<string, unknown>).temperature;
+      }
+      if (clearedThinking) {
+        delete (finalLLMConfig as Record<string, unknown>).thinking;
+      }
+      Object.assign(finalLLMConfig as Record<string, unknown>, sanitizedAnthropicConfig);
+      if (removedTemperature) {
+        logger.info('[MemoryAgent] Removed Anthropic temperature for memory run', {
+          userId,
+          conversationId,
+          messageId,
+          model:
+            'model' in sanitizedAnthropicConfig
+              ? (sanitizedAnthropicConfig.model as string | undefined)
+              : undefined,
+          thinkingMode: describeAnthropicThinkingMode(anthropicConfig.thinking),
+        });
+      }
     }
 
     const llmConfigWithHeaders = finalLLMConfig as OpenAIClientOptions;
@@ -889,7 +1030,24 @@ ${memory ?? 'No existing memories'}`;
     const inputs = {
       messages: processedMessages,
     };
-    const content = await run.processStream(inputs, config);
+    let content;
+    try {
+      content = await run.processStream(inputs, config);
+    } catch (error) {
+      if (!isRetryableMemoryProcessingError(error)) {
+        throw error;
+      }
+
+      logger.warn('[MemoryAgent] Retrying memory run after retryable upstream error', {
+        userId,
+        conversationId,
+        messageId,
+        provider: llmConfig?.provider,
+        model:
+          llmConfig != null && 'model' in llmConfig ? (llmConfig.model as string | undefined) : undefined,
+      });
+      content = await run.processStream(inputs, config);
+    }
     if (content) {
       logger.debug('[MemoryAgent] Processed successfully', {
         userId,
@@ -905,8 +1063,12 @@ ${memory ?? 'No existing memories'}`;
     const typedError = error as { message?: string; code?: string; type?: string } | undefined;
     const configuredModel =
       llmConfig != null && 'model' in llmConfig ? (llmConfig.model as string | undefined) : undefined;
+    const anthropicThinking =
+      llmConfig?.provider === Providers.ANTHROPIC
+        ? ((llmConfig as Record<string, unknown>).thinking ?? ANTHROPIC_MEMORY_DEFAULT_THINKING)
+        : undefined;
     logger.error(
-      `[MemoryAgent] Failed to process memory | userId: ${userId} | conversationId: ${conversationId} | messageId: ${messageId}`,
+      `[MemoryAgent] Failed to process memory | userId: ${userId} | conversationId: ${conversationId} | messageId: ${messageId} | provider=${String(llmConfig?.provider ?? 'unknown')} | model=${configuredModel ?? 'unknown'} | thinkingMode=${anthropicThinking == null ? 'n/a' : describeAnthropicThinkingMode(anthropicThinking)} | temperature=${String((llmConfig as { temperature?: unknown } | undefined)?.temperature ?? 'unset')} | errorType=${typedError?.type ?? 'unknown'} | errorCode=${typedError?.code ?? 'unknown'} | errorMessage=${String(typedError?.message ?? 'unknown').replace(/\s+/g, ' ').slice(0, 300)}`,
       {
         error,
         provider: llmConfig?.provider,

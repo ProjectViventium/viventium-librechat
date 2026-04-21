@@ -601,6 +601,52 @@ describe('BackgroundCortexService.checkCortexActivation', () => {
     );
   });
 
+  test('omits temperature for adaptive Anthropic activation checks on Sonnet 4.6', async () => {
+    const processStream = jest.fn(async () =>
+      JSON.stringify({ should_activate: true, confidence: 0.91, reason: 'adaptive anthropic matched' }),
+    );
+
+    Run.create.mockResolvedValueOnce({ processStream });
+
+    await checkCortexActivation({
+      cortexConfig: {
+        agent_id: 'agent_pattern_recognition',
+        activation: {
+          enabled: true,
+          provider: 'anthropic',
+          model: 'claude-sonnet-4-6',
+          prompt: 'Pattern recognition activation prompt',
+        },
+      },
+      messages: [{ role: 'user', content: 'Notice any patterns from my last few messages?' }],
+      runId: 'run-anthropic-adaptive-activation',
+      req: { body: {}, user: { id: 'user-123', role: 'USER' }, config: {} },
+    });
+
+    expect(initializeAnthropic).toHaveBeenCalledWith(
+      expect.objectContaining({
+        endpoint: 'anthropic',
+        model_parameters: expect.objectContaining({
+          model: 'claude-sonnet-4-6',
+          thinking: false,
+          maxOutputTokens: 100,
+        }),
+      }),
+    );
+    expect(initializeAnthropic.mock.calls.at(-1)[0].model_parameters).not.toHaveProperty('temperature');
+    expect(Run.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        graphConfig: expect.objectContaining({
+          llmConfig: expect.objectContaining({
+            provider: 'anthropic',
+            model: 'claude-sonnet-4-6',
+          }),
+        }),
+      }),
+    );
+    expect(Run.create.mock.calls.at(-1)[0].graphConfig.llmConfig).not.toHaveProperty('temperature');
+  });
+
   test('allows diagnostics to clear cooldown state between independent activation runs', async () => {
     const processStream = jest.fn(async () =>
       JSON.stringify({ should_activate: true, confidence: 0.97, reason: 'matched' }),
@@ -1436,6 +1482,59 @@ describe('BackgroundCortexService.executeCortex', () => {
       type: 'enabled',
       budget_tokens: 2000,
     });
+    expect(runArgs.requestBody).toEqual(
+      expect.not.objectContaining({ temperature: expect.anything() }),
+    );
+  });
+  /* === VIVENTIUM NOTE === */
+
+  test('removes Anthropic temperature for adaptive-era Sonnet 4.6 even when thinking is explicitly disabled', async () => {
+    const processStream = jest.fn(async () => 'run-output');
+    const initializedAgent = {
+      id: 'agent_user_disabled',
+      name: 'Custom Reviewer',
+      tools: [],
+      userMCPAuthMap: null,
+      recursion_limit: 11,
+      provider: 'anthropic',
+      model_parameters: {
+        model: 'claude-sonnet-4-6',
+        temperature: 0.5,
+        thinking: false,
+      },
+    };
+
+    initializeAgent.mockResolvedValueOnce(initializedAgent);
+    createRun.mockResolvedValueOnce({ processStream });
+
+    createContentAggregator.mockReturnValueOnce({
+      contentParts: [{ type: 'text', text: 'aggregated insight' }],
+      aggregateContent: jest.fn(),
+    });
+
+    await executeCortex({
+      agent: {
+        id: 'agent_user_disabled',
+        name: 'Custom Reviewer',
+        provider: 'anthropic',
+        model: 'claude-sonnet-4-6',
+        instructions: 'You are a custom cortex.',
+        model_parameters: {
+          temperature: 0.5,
+          thinking: false,
+        },
+      },
+      messages: [{ role: 'user', content: 'review my plan' }],
+      runId: 'run-anthropic-user-agent-disabled-thinking',
+      req: {
+        user: { id: 'user-1', role: 'USER' },
+        body: { conversationId: 'c1', parentMessageId: 'p1', temperature: 0.5 },
+      },
+    });
+
+    const runArgs = createRun.mock.calls[0][0];
+    expect(runArgs.agents[0].model_parameters.temperature).toBeUndefined();
+    expect(runArgs.agents[0].model_parameters.thinking).toBe(false);
     expect(runArgs.requestBody).toEqual(
       expect.not.objectContaining({ temperature: expect.anything() }),
     );

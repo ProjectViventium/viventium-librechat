@@ -560,8 +560,79 @@ const _DISPLAY_BREAK_RE = /<break\s+time=["']?[^"'>]+["']?\s*\/>/gi;
 const _DISPLAY_SPEED_RE = /<speed\s+ratio=["']?[^"'>]+["']?\s*\/>/gi;
 const _DISPLAY_VOLUME_RE = /<volume\s+ratio=["']?[^"'>]+["']?\s*\/>/gi;
 const _DISPLAY_SPELL_RE = /<spell>(.*?)<\/spell>/gis;
-const _DISPLAY_BRACKET_NONVERBAL_RE =
-  /\[(?:laugh(?:ter)?|giggle|chuckle|soft laugh|gentle laugh|quiet laugh|nervous laugh|awkward laugh|light laugh|sigh|gentle sigh|soft sigh|breath|breath in|breath out|inhale|exhale|gasp|whisper|hmm|hm)\]/gi;
+const _DISPLAY_STAGE_DIRECTION_MIN_ALPHA = 3;
+const _DISPLAY_STAGE_DIRECTION_MAX_ALPHA = 24;
+const _DISPLAY_STAGE_DIRECTION_MAX_WORDS = 3;
+
+function isDisplayStageDirectionBoundary(ch) {
+  return !ch || /\s/.test(ch) || '.,!?;:(){}<>"\''.includes(ch);
+}
+
+function isBracketStageDirection(content) {
+  const candidate = typeof content === 'string' ? content.trim() : '';
+  if (!candidate || candidate !== candidate.toLowerCase()) {
+    return false;
+  }
+  if (/\d/.test(candidate)) {
+    return false;
+  }
+  if (!/^[a-z' -]+$/.test(candidate)) {
+    return false;
+  }
+
+  const alphaCount = (candidate.match(/[a-z]/g) || []).length;
+  if (
+    alphaCount < _DISPLAY_STAGE_DIRECTION_MIN_ALPHA ||
+    alphaCount > _DISPLAY_STAGE_DIRECTION_MAX_ALPHA
+  ) {
+    return false;
+  }
+
+  const words = candidate
+    .replace(/-/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean);
+  if (!words.length || words.length > _DISPLAY_STAGE_DIRECTION_MAX_WORDS) {
+    return false;
+  }
+  return words.every((word) => /^[a-z']+$/.test(word));
+}
+
+function stripBracketStageDirections(text) {
+  if (!text) {
+    return '';
+  }
+
+  let out = '';
+  let index = 0;
+  while (index < text.length) {
+    if (text[index] !== '[') {
+      out += text[index];
+      index += 1;
+      continue;
+    }
+
+    const closing = text.indexOf(']', index + 1);
+    if (closing < 0) {
+      out += text[index];
+      index += 1;
+      continue;
+    }
+
+    const content = text.slice(index + 1, closing);
+    const left = index > 0 ? text[index - 1] : '';
+    const right = closing + 1 < text.length ? text[closing + 1] : '';
+    if (isBracketStageDirection(content) && isDisplayStageDirectionBoundary(left) && isDisplayStageDirectionBoundary(right)) {
+      index = closing + 1;
+      continue;
+    }
+
+    out += text.slice(index, closing + 1);
+    index = closing + 1;
+  }
+
+  return out;
+}
 
 function stripVoiceControlTagsForDisplay(text) {
   if (!text) {
@@ -575,7 +646,7 @@ function stripVoiceControlTagsForDisplay(text) {
   cleaned = cleaned.replace(_DISPLAY_SPEED_RE, '');
   cleaned = cleaned.replace(_DISPLAY_VOLUME_RE, '');
   cleaned = cleaned.replace(_DISPLAY_SPELL_RE, '$1');
-  cleaned = cleaned.replace(_DISPLAY_BRACKET_NONVERBAL_RE, '');
+  cleaned = stripBracketStageDirections(cleaned);
   cleaned = cleaned.replace(/[ \t]{2,}/g, ' ');
   return cleaned.trim();
 }

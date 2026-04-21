@@ -373,7 +373,7 @@ describe('buildCortexOutputInstructions – telegram surface', () => {
 
 /* === VIVENTIUM START ===
  * Feature: stripVoiceControlTagsForDisplay tests
- * Purpose: Verify that SSML tags and bracket nonverbal markers are stripped
+ * Purpose: Verify that SSML tags and structural bracket stage directions are stripped
  * for display while preserving inner text content.
  * Added: 2026-02-22
  * === VIVENTIUM END === */
@@ -393,6 +393,13 @@ describe('stripVoiceControlTagsForDisplay', () => {
     const result = stripVoiceControlTagsForDisplay('[laughter] Hello [sigh] world');
     expect(result).not.toContain('[laughter]');
     expect(result).not.toContain('[sigh]');
+    expect(result).toContain('Hello');
+    expect(result).toContain('world');
+  });
+
+  test('strips generic lowercase bracket stage directions', () => {
+    const result = stripVoiceControlTagsForDisplay('Hello [smiles] world');
+    expect(result).not.toContain('[smiles]');
     expect(result).toContain('Hello');
     expect(result).toContain('world');
   });
@@ -438,6 +445,12 @@ describe('stripVoiceControlTagsForDisplay', () => {
     expect(result).not.toContain('[whisper]');
     expect(result).toContain('Hello');
     expect(result).toContain('secrets');
+  });
+
+  test('preserves non-stage bracket text', () => {
+    expect(stripVoiceControlTagsForDisplay('Choose [A] or [ok] for the label.')).toBe(
+      'Choose [A] or [ok] for the label.',
+    );
   });
   // === VIVENTIUM END ===
 });

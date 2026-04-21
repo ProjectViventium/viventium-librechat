@@ -203,7 +203,7 @@ describe('getLLMConfig', () => {
 
   it('should add "context-1m" beta header and promptCache boolean for claude-sonnet-4 model', () => {
     const modelOptions = {
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-6',
       promptCache: true,
     };
     const result = getLLMConfig('test-key', { modelOptions });
@@ -217,9 +217,9 @@ describe('getLLMConfig', () => {
 
   it('should add "context-1m" beta header and promptCache boolean for claude-sonnet-4 model formats', () => {
     const modelVariations = [
-      'claude-sonnet-4-20250514',
+      'claude-sonnet-4-6',
       'claude-sonnet-4-latest',
-      'anthropic/claude-sonnet-4-20250514',
+      'anthropic/claude-sonnet-4-6',
     ];
 
     modelVariations.forEach((model) => {
@@ -904,7 +904,7 @@ describe('getLLMConfig', () => {
           { model: 'claude-opus-4-1', expectedMaxTokens: 32000 },
           { model: 'claude-opus-4-1-20250805', expectedMaxTokens: 32000 },
           { model: 'claude-opus-4-5', expectedMaxTokens: 64000 },
-          { model: 'claude-sonnet-4-20250514', expectedMaxTokens: 64000 },
+          { model: 'claude-sonnet-4-6', expectedMaxTokens: 64000 },
           { model: 'claude-opus-4-0', expectedMaxTokens: 32000 },
         ];
 
@@ -980,7 +980,7 @@ describe('getLLMConfig', () => {
       });
 
       it('should default future Claude 4.x Sonnet/Haiku models to 64K (future-proofing)', () => {
-        const testCases = ['claude-sonnet-4-20250514', 'claude-sonnet-4-9', 'claude-haiku-4-8'];
+        const testCases = ['claude-sonnet-4-6', 'claude-sonnet-4-9', 'claude-haiku-4-8'];
 
         testCases.forEach((model) => {
           const result = getLLMConfig('test-key', {
@@ -1104,9 +1104,20 @@ describe('getLLMConfig', () => {
         });
 
         expect(result.llmConfig.temperature).toBeUndefined();
-        expect(result.llmConfig.thinking).toMatchObject({
-          type: 'enabled',
+        expect((result.llmConfig.thinking as unknown as { type: string }).type).toBe('adaptive');
+      });
+
+      it('should remove temperature for Sonnet 4.6 even when thinking is explicitly disabled', () => {
+        const result = getLLMConfig('test-key', {
+          modelOptions: {
+            model: 'claude-sonnet-4-6',
+            temperature: 0.3,
+            thinking: false,
+          },
         });
+
+        expect(result.llmConfig.temperature).toBeUndefined();
+        expect(result.llmConfig.thinking).toBeUndefined();
       });
 
       it('should remove temperature when default thinking enables adaptive Opus 4.7 reasoning', () => {
@@ -1509,7 +1520,7 @@ describe('getLLMConfig', () => {
             shouldHavePromptCache: true,
           },
           {
-            model: 'claude-sonnet-4-20250514',
+            model: 'claude-sonnet-4-6',
             promptCache: true,
             shouldHaveHeaders: true,
             shouldHavePromptCache: true,

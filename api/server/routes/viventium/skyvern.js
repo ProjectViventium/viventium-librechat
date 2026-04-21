@@ -788,8 +788,8 @@ router.get('/openai/v1/models', (_req, res) => {
   const defaults = [
     'openai/gpt-5.4',
     'openai/gpt-4o',
-    'anthropic/claude-sonnet-4-20250514',
-    'anthropic/claude-opus-4-20250514',
+    'anthropic/claude-sonnet-4-6',
+    'anthropic/claude-opus-4-7',
   ];
 
   res.json({

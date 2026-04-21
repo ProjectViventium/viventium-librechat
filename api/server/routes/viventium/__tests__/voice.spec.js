@@ -204,6 +204,11 @@ async function advanceVoiceRouteTimers(ms) {
 describe('/api/viventium/voice/chat', () => {
   beforeEach(() => {
     jest.resetModules();
+    const { logger } = require('@librechat/data-schemas');
+    logger.debug.mockClear();
+    logger.info.mockClear();
+    logger.warn.mockClear();
+    logger.error.mockClear();
     mockLastParentMessageId = null;
     mockLastConversationId = null;
     mockLastAgentId = null;
@@ -414,5 +419,34 @@ describe('/api/viventium/voice/chat', () => {
     expect(res2.body.streamId).toBe('stream_voice_1');
     expect(res3.body.streamId).toBe('stream_voice_1');
     expect([res1.body.coalesced, res2.body.coalesced, res3.body.coalesced].filter(Boolean)).toHaveLength(2);
+  });
+
+  test('logs committed voice turns with callSessionId and requestId', async () => {
+    const { logger } = require('@librechat/data-schemas');
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      url: '/api/viventium/voice/chat',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-request-id': 'req-log-1',
+      },
+      body: { text: 'log this committed turn' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.stringContaining('[VIVENTIUM][voice/chat] user_turn_completed source=route'),
+      'call_session_1',
+      expect.any(String),
+      expect.any(String),
+      'agent_voice',
+      'req-log-1',
+      expect.any(Boolean),
+      expect.any(Number),
+    );
   });
 });

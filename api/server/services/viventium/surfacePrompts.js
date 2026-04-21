@@ -188,6 +188,8 @@ function buildWingModeInstructions() {
     'WING MODE:',
     '- You are in Wing Mode during a live voice call: quietly aware, helpful, and unobtrusive.',
     '- Treat TV, podcasts, videos, songs, meetings, and nearby chatter as background context unless the user is clearly talking to you.',
+    '- A live call does not mean every spoken sentence is addressed to you; a bare spoken question, comment, or thought in the room is background unless the user directly addresses you or it clearly requires your memory, tools, or role in the call.',
+    '- If you do not have a clear, useful, additive contribution, output exactly {NTA}.',
     '- If you are not sure the user is addressing you, output exactly {NTA}.',
     '- Err aggressively on the side of silence.',
   ].join('\n');

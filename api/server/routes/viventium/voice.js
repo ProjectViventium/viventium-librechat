@@ -578,6 +578,17 @@ router.post('/chat', voiceAuth, configMiddleware, async (req, _res, next) => {
     req.body.text = coalescedTurn.mergedText;
   }
 
+  logger.info(
+    '[VIVENTIUM][voice/chat] user_turn_completed source=route callSessionId=%s conversationId=%s parentMessageId=%s agentId=%s requestId=%s coalesced=%s textChars=%s',
+    session?.callSessionId || 'unknown',
+    req.body?.conversationId || 'unknown',
+    req.body?.parentMessageId || 'none',
+    session?.agentId || 'unknown',
+    req.viventiumVoiceRequestId || req.get('X-VIVENTIUM-REQUEST-ID') || 'unknown',
+    Boolean(coalescedTurn.dedupeKey),
+    req.body?.text?.length || 0,
+  );
+
   const originalJson = res.json.bind(res);
   res.json = (payload) => {
     try {

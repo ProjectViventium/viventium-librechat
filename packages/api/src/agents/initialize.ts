@@ -40,6 +40,7 @@ import {
   getConversationRecallRuntimeScope,
   mergeConversationRecallResources,
   ensureConversationRecallTool,
+  type ConversationRecallAttachmentReason,
 } from './conversationRecall';
 /* === VIVENTIUM START ===
  * Feature: Conversation recall runtime health/freshness gating.
@@ -348,22 +349,27 @@ export async function initializeAgent(
         )) as TFile[]) ?? []) as TFile[];
 
       let recallFilesAreFresh = conversationRecallFiles.length > 0;
+      let recallAttachmentReason: ConversationRecallAttachmentReason | undefined;
+      let recallFreshness:
+        | ReturnType<typeof evaluateConversationRecallCorpusFreshness>
+        | undefined;
       if (conversationRecallScope === 'all' && db.getLatestRecallEligibleMessageCreatedAt) {
         const latestRecallEligibleMessageCreatedAt =
           await db.getLatestRecallEligibleMessageCreatedAt({ user: req.user.id });
-        const freshness = evaluateConversationRecallCorpusFreshness({
+        recallFreshness = evaluateConversationRecallCorpusFreshness({
           recallFiles: conversationRecallFiles,
           latestMessageCreatedAt: latestRecallEligibleMessageCreatedAt,
         });
-        recallFilesAreFresh = freshness.fresh;
-        if (!freshness.fresh) {
-          logger.debug('[initializeAgent] Falling back to source-only conversation recall attachment', {
+        recallFilesAreFresh = recallFreshness.fresh;
+        if (!recallFreshness.fresh) {
+          logger.info('[initializeAgent] Falling back to source-only conversation recall attachment', {
             userId: req.user.id,
             agentId: agent.id,
             scope: conversationRecallScope,
-            recallCorpusUpdatedAt: freshness.corpusUpdatedAt?.toISOString?.() ?? null,
+            reason: 'stale_corpus',
+            recallCorpusUpdatedAt: recallFreshness.corpusUpdatedAt?.toISOString?.() ?? null,
             latestRecallEligibleMessageCreatedAt:
-              freshness.latestMessageCreatedAt?.toISOString?.() ?? null,
+              recallFreshness.latestMessageCreatedAt?.toISOString?.() ?? null,
           });
         }
       }
@@ -372,12 +378,23 @@ export async function initializeAgent(
         conversationRecallVectorStatus.available && recallFilesAreFresh && conversationRecallFiles.length > 0
           ? 'vector'
           : 'source_only';
+      if (recallAttachmentMode === 'vector') {
+        recallAttachmentReason = 'vector_ready';
+      } else if (conversationRecallFiles.length === 0) {
+        recallAttachmentReason = 'missing_corpus';
+      } else if (recallFilesAreFresh === false) {
+        recallAttachmentReason = 'stale_corpus';
+      } else {
+        recallAttachmentReason =
+          `runtime_${conversationRecallVectorStatus.reason}` as ConversationRecallAttachmentReason;
+      }
       const recallAttachmentFiles = buildConversationRecallAttachmentFiles({
         userId: req.user.id,
         scope: conversationRecallScope,
         agentId: agent.id,
         existingFiles: conversationRecallFiles,
         mode: recallAttachmentMode,
+        reason: recallAttachmentReason,
       });
 
       if (recallAttachmentFiles.length > 0) {
@@ -389,17 +406,31 @@ export async function initializeAgent(
       }
 
       if (conversationRecallFiles.length === 0) {
-        logger.debug('[initializeAgent] No vector-backed conversation recall corpus found; attached source-only recall resource', {
+        logger.info('[initializeAgent] No vector-backed conversation recall corpus found; attached source-only recall resource', {
           userId: req.user.id,
           agentId: agent.id,
           scope: conversationRecallScope,
+          reason: recallAttachmentReason,
         });
       } else if (recallAttachmentMode === 'source_only') {
-        logger.debug('[initializeAgent] Attached source-only conversation recall resource', {
+        logger.info('[initializeAgent] Attached source-only conversation recall resource', {
           userId: req.user.id,
           agentId: agent.id,
           scope: conversationRecallScope,
-          reason: conversationRecallVectorStatus.reason,
+          reason: recallAttachmentReason,
+          recallCorpusUpdatedAt: recallFreshness?.corpusUpdatedAt?.toISOString?.() ?? null,
+          latestRecallEligibleMessageCreatedAt:
+            recallFreshness?.latestMessageCreatedAt?.toISOString?.() ?? null,
+        });
+      } else {
+        logger.debug('[initializeAgent] Attached vector-backed conversation recall resource', {
+          userId: req.user.id,
+          agentId: agent.id,
+          scope: conversationRecallScope,
+          reason: recallAttachmentReason,
+          recallCorpusUpdatedAt: recallFreshness?.corpusUpdatedAt?.toISOString?.() ?? null,
+          latestRecallEligibleMessageCreatedAt:
+            recallFreshness?.latestMessageCreatedAt?.toISOString?.() ?? null,
         });
       }
     } catch (error) {

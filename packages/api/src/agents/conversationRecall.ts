@@ -20,6 +20,15 @@ import type { Agent, AgentToolResources, TFile, TUser } from 'librechat-data-pro
 
 export type ConversationRecallRuntimeScope = 'none' | 'all' | 'agent';
 export type ConversationRecallAttachmentMode = 'vector' | 'source_only';
+export type ConversationRecallAttachmentReason =
+  | 'vector_ready'
+  | 'missing_corpus'
+  | 'stale_corpus'
+  | 'runtime_unconfigured'
+  | 'runtime_http_error'
+  | 'runtime_timeout'
+  | 'runtime_unreachable'
+  | 'runtime_stale_restore';
 
 /**
  * Runtime policy:
@@ -94,8 +103,9 @@ export function buildConversationRecallAttachmentFiles(params: {
   agentId?: string | null;
   existingFiles?: TFile[] | null;
   mode: ConversationRecallAttachmentMode;
+  reason?: ConversationRecallAttachmentReason;
 }): TFile[] {
-  const { userId, scope, agentId, existingFiles, mode } = params;
+  const { userId, scope, agentId, existingFiles, mode, reason } = params;
   if (scope === 'none') {
     return [];
   }
@@ -104,6 +114,7 @@ export function buildConversationRecallAttachmentFiles(params: {
     ({
       ...file,
       viventiumConversationRecallMode: mode,
+      ...(reason ? { viventiumConversationRecallAttachmentReason: reason } : {}),
     }) as TFile;
 
   if (Array.isArray(existingFiles) && existingFiles.length > 0) {

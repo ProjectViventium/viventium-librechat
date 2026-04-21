@@ -14,6 +14,14 @@ describe('supportsAdaptiveThinking', () => {
     expect(supportsAdaptiveThinking('claude-opus-4.6')).toBe(true);
   });
 
+  test('should return true for claude-sonnet-4-6', () => {
+    expect(supportsAdaptiveThinking('claude-sonnet-4-6')).toBe(true);
+  });
+
+  test('should return true for anthropic.claude-sonnet-4-6', () => {
+    expect(supportsAdaptiveThinking('anthropic.claude-sonnet-4-6')).toBe(true);
+  });
+
   test('should return true for claude-opus-4-7 (future)', () => {
     expect(supportsAdaptiveThinking('claude-opus-4-7')).toBe(true);
   });
@@ -48,6 +56,10 @@ describe('supportsAdaptiveThinking', () => {
 
   test('should return false for claude-sonnet-4-5', () => {
     expect(supportsAdaptiveThinking('claude-sonnet-4-5')).toBe(false);
+  });
+
+  test('should return false for anthropic.claude-sonnet-4-5-20250929-v1:0', () => {
+    expect(supportsAdaptiveThinking('anthropic.claude-sonnet-4-5-20250929-v1:0')).toBe(false);
   });
 
   test('should return false for claude-sonnet-4', () => {
@@ -243,8 +255,8 @@ describe('bedrockInputParser', () => {
       };
       const result = bedrockInputParser.parse(input) as Record<string, unknown>;
       const additionalFields = result.additionalModelRequestFields as Record<string, unknown>;
-      expect(additionalFields.thinking).toBe(true);
-      expect(additionalFields.thinkingBudget).toBe(2000);
+      expect(additionalFields.thinking).toEqual({ type: 'adaptive' });
+      expect(additionalFields.thinkingBudget).toBeUndefined();
       expect(additionalFields.anthropic_beta).toEqual([
         'output-128k-2025-02-19',
         'context-1m-2025-08-07',

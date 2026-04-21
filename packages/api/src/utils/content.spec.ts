@@ -34,7 +34,7 @@ describe('filterMalformedContentParts', () => {
       expect(result).toHaveLength(0);
     });
 
-    it('should keep other content types unchanged', () => {
+    it('should keep valid think parts and other content types unchanged', () => {
       const parts: TMessageContentParts[] = [
         { type: ContentTypes.TEXT, text: 'Hello world' },
         { type: ContentTypes.THINK, think: 'Thinking...' },
@@ -43,6 +43,18 @@ describe('filterMalformedContentParts', () => {
       const result = filterMalformedContentParts(parts);
       expect(result).toHaveLength(2);
       expect(result).toEqual(parts);
+    });
+
+    it('should filter out malformed think parts with empty reasoning', () => {
+      const parts: TMessageContentParts[] = [
+        { type: ContentTypes.TEXT, text: 'Hello world' },
+        { type: ContentTypes.THINK, think: '' },
+        { type: ContentTypes.THINK } as TMessageContentParts,
+        { type: ContentTypes.THINK, think: '  ' },
+      ];
+
+      const result = filterMalformedContentParts(parts);
+      expect(result).toEqual([{ type: ContentTypes.TEXT, text: 'Hello world' }]);
     });
 
     it('should filter out null or undefined parts', () => {

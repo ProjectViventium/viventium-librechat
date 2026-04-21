@@ -70,10 +70,17 @@ viventium:
     prompt: 'CONVERSATION RECALL:
 
       - When the user asks about prior chats, earlier context, previous decisions,
-      or something mentioned before, use `file_search` to check conversation recall.
+      same-day continuity, or something mentioned before, use `file_search` to check
+      conversation recall before saying you do not remember.
+
+      - Treat "what were we talking about", "we were just talking about this", and
+      "earlier today/this morning" as recall checks, not as fresh-chat onboarding.
 
       - For exact-history questions, verify with retrieved evidence instead of guessing
       from memory alone.
+
+      - If recall evidence is inconclusive, say that honestly and ask a focused clarification
+      instead of claiming the conversation is missing.
 
       - Do not answer live mailbox, calendar, or external-system status questions
       from conversation recall alone; use the relevant live tool when available.
@@ -557,8 +564,6 @@ memory:
   agent:
     provider: anthropic
     model: claude-sonnet-4-6
-    model_parameters:
-      temperature: 0.2
     instructions: "You are the Memory Archivist. Maintain a LIVING, ACCURATE memory.\
       \ Structure, compress, never lose data.\n\n# RULE 1: NO DATA LOSS (HIGHEST PRIORITY)\n\
       When updating a key, you receive its EXISTING value. You MUST:\n- Start from\

@@ -226,6 +226,8 @@ describe('buildWingModeInstructions', () => {
     const result = buildWingModeInstructions();
 
     expect(result).toContain('WING MODE:');
+    expect(result).toContain('A live call does not mean every spoken sentence is addressed to you;');
+    expect(result).toContain('If you do not have a clear, useful, additive contribution, output exactly {NTA}.');
     expect(result).toContain('output exactly {NTA}');
     expect(result).toContain('Err aggressively on the side of silence');
   });

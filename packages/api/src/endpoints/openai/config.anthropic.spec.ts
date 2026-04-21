@@ -78,7 +78,6 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
           apiKey: 'sk-yyyy',
           model: 'claude-3.7-sonnet-20241022',
           stream: true,
-          temperature: 0.7,
           maxTokens: 8192,
           modelKwargs: {
             metadata: {
@@ -143,6 +142,49 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
           baseURL: 'http://localhost:4000/v1',
           defaultHeaders: {
             'anthropic-beta': 'token-efficient-tools-2025-02-19,output-128k-2025-02-19',
+          },
+        },
+        tools: [],
+      });
+    });
+
+    it('should omit temperature for Claude Sonnet 4.6 even when thinking is explicitly disabled', () => {
+      const apiKey = 'anthropic-test-key-sonnet46';
+      const endpoint = 'Anthropic (via LiteLLM)';
+      const options = {
+        modelOptions: {
+          model: 'claude-sonnet-4-6',
+          user: 'user46',
+          temperature: 0.7,
+          thinking: false,
+        },
+        reverseProxyUrl: 'http://localhost:4000/v1',
+        customParams: {
+          defaultParamsEndpoint: 'anthropic',
+        },
+        endpoint: 'Anthropic (via LiteLLM)',
+        endpointType: 'custom',
+      };
+
+      const result = getOpenAIConfig(apiKey, options, endpoint);
+
+      expect(result).toEqual({
+        llmConfig: {
+          apiKey: 'anthropic-test-key-sonnet46',
+          model: 'claude-sonnet-4-6',
+          stream: true,
+          maxTokens: 64000,
+          modelKwargs: {
+            metadata: {
+              user_id: 'user46',
+            },
+            promptCache: true,
+          },
+        },
+        configOptions: {
+          baseURL: 'http://localhost:4000/v1',
+          defaultHeaders: {
+            'anthropic-beta': 'context-1m-2025-08-07',
           },
         },
         tools: [],

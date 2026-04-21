@@ -124,7 +124,6 @@ const CANONICAL_BUILT_IN_BACKGROUND_MODEL_PARAMETERS = Object.freeze({
   agent_viventium_confirmation_bias_95aeb3: Object.freeze({
     anthropic: Object.freeze({
       thinking: false,
-      temperature: 0.3,
     }),
   }),
   agent_viventium_red_team_95aeb3: Object.freeze({
@@ -148,7 +147,6 @@ const CANONICAL_BUILT_IN_BACKGROUND_MODEL_PARAMETERS = Object.freeze({
   agent_viventium_emotional_resonance_95aeb3: Object.freeze({
     anthropic: Object.freeze({
       thinking: false,
-      temperature: 0.4,
     }),
   }),
   agent_viventium_strategic_planning_95aeb3: Object.freeze({

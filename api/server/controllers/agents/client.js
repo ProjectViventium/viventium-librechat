@@ -144,6 +144,9 @@ const {
   sanitizeProviderFormattedMessages,
 } = require('~/server/services/viventium/normalizeTextContentParts');
 const {
+  sanitizeAggregatedContentParts,
+} = require('~/server/services/viventium/sanitizeAggregatedContentParts');
+const {
   getAnthropicPayloadGuardConfig,
   isAnthropicProvider,
   compactAnthropicMessagesForSize,
@@ -2920,6 +2923,7 @@ class AgentClient extends BaseClient {
           `activated=${activatedCorticesList.length}`,
         );
       }
+      sanitizeAggregatedContentParts(this.contentParts);
       /** @deprecated Agent Chain */
       if (hideSequentialOutputs) {
         this.contentParts = this.contentParts.filter((part, index) => {

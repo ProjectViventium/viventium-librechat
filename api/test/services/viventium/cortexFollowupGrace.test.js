@@ -4,7 +4,7 @@
  * === VIVENTIUM END === */
 
 /* === VIVENTIUM NOTE ===
- * Purpose: Viventium background cortex follow-up grace window tests.
+ * Purpose: Viventium background follow-up window tests.
  * Details: docs/requirements_and_learnings/02_Background_Agents.md
  * === VIVENTIUM NOTE === */
 
@@ -21,9 +21,9 @@ describe('cortexFollowupGrace', () => {
     process.env = originalEnv;
   });
 
-  test('returns 0 when env is unset', () => {
+  test('defaults to a 30-second background follow-up window when env is unset', () => {
     delete process.env.VIVENTIUM_CORTEX_FOLLOWUP_GRACE_S;
-    expect(getCortexFollowupGraceMs()).toBe(0);
+    expect(getCortexFollowupGraceMs()).toBe(30000);
   });
 
   test('returns 0 when env is zero or negative', () => {

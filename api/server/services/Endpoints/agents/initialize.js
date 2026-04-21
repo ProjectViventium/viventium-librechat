@@ -40,6 +40,9 @@ const { getConvoFiles } = require('~/models/Conversation');
 const { processAddedConvo } = require('./addedConvo');
 const { getAgent } = require('~/models/Agent');
 const { logViolation } = require('~/cache');
+const {
+  sanitizeAggregatedContentParts,
+} = require('~/server/services/viventium/sanitizeAggregatedContentParts');
 const db = require('~/models');
 const { isDeepTimingEnabled } = require('~/server/services/viventium/telegramTimingDeep');
 /* === VIVENTIUM START ===
@@ -326,7 +329,11 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
   const collectedUsage = [];
   /** @type {ArtifactPromises} */
   const artifactPromises = [];
-  const { contentParts, aggregateContent } = createContentAggregator();
+  const { contentParts, aggregateContent: rawAggregateContent } = createContentAggregator();
+  const aggregateContent = (event) => {
+    rawAggregateContent(event);
+    sanitizeAggregatedContentParts(contentParts);
+  };
   const toolEndCallback = createToolEndCallback({ req, res, artifactPromises, streamId });
 
   /**

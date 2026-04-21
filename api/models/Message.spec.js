@@ -3,6 +3,16 @@ const { v4: uuidv4 } = require('uuid');
 const { messageSchema } = require('@librechat/data-schemas');
 const { MongoMemoryServer } = require('mongodb-memory-server');
 
+const mockScheduleConversationRecallSync = jest.fn();
+
+jest.mock('~/server/services/viventium/conversationRecallService', () => {
+  const actual = jest.requireActual('~/server/services/viventium/conversationRecallService');
+  return {
+    ...actual,
+    scheduleConversationRecallSync: (...args) => mockScheduleConversationRecallSync(...args),
+  };
+});
+
 const {
   saveMessage,
   getMessages,
@@ -12,6 +22,7 @@ const {
   bulkSaveMessages,
   updateMessageText,
   deleteMessagesSince,
+  recordMessage,
 } = require('./Message');
 
 jest.mock('~/server/services/Config/app');
@@ -41,6 +52,7 @@ describe('Message Operations', () => {
   beforeEach(async () => {
     // Clear database
     await Message.deleteMany({});
+    mockScheduleConversationRecallSync.mockClear();
 
     mockReq = {
       user: { id: 'user123' },
@@ -71,6 +83,10 @@ describe('Message Operations', () => {
       const savedMessage = await Message.findOne({ messageId: 'msg123', user: 'user123' });
       expect(savedMessage).toBeTruthy();
       expect(savedMessage.text).toBe('Hello, world!');
+      expect(mockScheduleConversationRecallSync).toHaveBeenCalledWith({
+        userId: 'user123',
+        conversationId: mockMessageData.conversationId,
+      });
     });
 
     it('should throw an error for unauthenticated user', async () => {
@@ -89,6 +105,7 @@ describe('Message Operations', () => {
     it('should update message text for the authenticated user', async () => {
       // First save a message
       await saveMessage(mockReq, mockMessageData);
+      mockScheduleConversationRecallSync.mockClear();
 
       // Then update it
       await updateMessageText(mockReq, { messageId: 'msg123', text: 'Updated text' });
@@ -96,6 +113,10 @@ describe('Message Operations', () => {
       // Verify the update
       const updatedMessage = await Message.findOne({ messageId: 'msg123', user: 'user123' });
       expect(updatedMessage.text).toBe('Updated text');
+      expect(mockScheduleConversationRecallSync).toHaveBeenCalledWith({
+        userId: 'user123',
+        conversationId: mockMessageData.conversationId,
+      });
     });
   });
 
@@ -103,6 +124,7 @@ describe('Message Operations', () => {
     it('should update a message for the authenticated user', async () => {
       // First save a message
       await saveMessage(mockReq, mockMessageData);
+      mockScheduleConversationRecallSync.mockClear();
 
       const result = await updateMessage(mockReq, { messageId: 'msg123', text: 'Updated text' });
 
@@ -112,6 +134,10 @@ describe('Message Operations', () => {
       // Verify in database
       const updatedMessage = await Message.findOne({ messageId: 'msg123', user: 'user123' });
       expect(updatedMessage.text).toBe('Updated text');
+      expect(mockScheduleConversationRecallSync).toHaveBeenCalledWith({
+        userId: 'user123',
+        conversationId: mockMessageData.conversationId,
+      });
     });
 
     it('should throw an error if message is not found', async () => {
@@ -131,6 +157,7 @@ describe('Message Operations', () => {
         conversationId,
         text: 'First message',
         user: 'user123',
+        createdAt: new Date('2026-04-21T10:00:00.000Z'),
       });
 
       await saveMessage(mockReq, {
@@ -138,6 +165,7 @@ describe('Message Operations', () => {
         conversationId,
         text: 'Second message',
         user: 'user123',
+        createdAt: new Date('2026-04-21T10:00:01.000Z'),
       });
 
       await saveMessage(mockReq, {
@@ -145,6 +173,7 @@ describe('Message Operations', () => {
         conversationId,
         text: 'Third message',
         user: 'user123',
+        createdAt: new Date('2026-04-21T10:00:02.000Z'),
       });
 
       // Delete messages since message2 (this should only delete messages created AFTER msg2)
@@ -193,6 +222,27 @@ describe('Message Operations', () => {
       expect(messages).toHaveLength(2);
       expect(messages[0].text).toBe('First message');
       expect(messages[1].text).toBe('Second message');
+    });
+  });
+
+  describe('recordMessage', () => {
+    it('schedules conversation recall sync for direct recordMessage writes', async () => {
+      const conversationId = uuidv4();
+
+      const result = await recordMessage({
+        user: 'user123',
+        endpoint: 'agents',
+        messageId: 'recorded-msg',
+        conversationId,
+        text: 'Recorded directly',
+        isCreatedByUser: true,
+      });
+
+      expect(result).toBeTruthy();
+      expect(mockScheduleConversationRecallSync).toHaveBeenCalledWith({
+        userId: 'user123',
+        conversationId,
+      });
     });
   });
 

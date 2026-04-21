@@ -266,4 +266,51 @@ describe('normalizeTextContentParts', () => {
       }
     }
   });
+
+  test('end-to-end pipeline drops empty think shells before Anthropic tool follow-up formatting', () => {
+    const payload = [
+      { role: 'user', content: 'hi' },
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.THINK, think: '' },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: { id: 'tool-1', name: 'file_search', args: '{}' },
+          },
+        ],
+      },
+    ];
+
+    const normalized = normalizeTextPartsInPayload(payload).map((message) => {
+      if (!Array.isArray(message.content)) {
+        return message;
+      }
+      return {
+        ...message,
+        content: filterMalformedContentParts(message.content),
+      };
+    });
+
+    const { messages: formatted } = formatAgentMessages(normalized, {}, new Set(['file_search']));
+    const hardened = sanitizeProviderFormattedMessages('anthropic', formatted);
+
+    expect(hardened.length).toBeGreaterThan(0);
+    for (const message of hardened) {
+      expect(typeof message._getType).toBe('function');
+      expect(() => coerceMessageLikeToMessage(message)).not.toThrow();
+      if (typeof message.content === 'string') {
+        expect(message.content.trim().length).toBeGreaterThan(0);
+        continue;
+      }
+      expect(Array.isArray(message.content)).toBe(true);
+      for (const part of message.content) {
+        expect(part?.type).not.toBe('thinking');
+        if (part?.type === ContentTypes.TEXT) {
+          expect(typeof part.text).toBe('string');
+          expect(part.text.trim().length).toBeGreaterThan(0);
+        }
+      }
+    }
+  });
 });

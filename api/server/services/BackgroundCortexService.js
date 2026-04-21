@@ -23,7 +23,14 @@ const {
 } = require('@librechat/api');
 const { loadAgent } = require('~/models/Agent');
 const { getAppConfig } = require('./Config/app');
-const { Constants, EModelEndpoint, Tools, PermissionTypes, Permissions } = require('librechat-data-provider');
+const {
+  Constants,
+  EModelEndpoint,
+  Tools,
+  PermissionTypes,
+  Permissions,
+  supportsAdaptiveThinking,
+} = require('librechat-data-provider');
 const { loadAgentTools, loadToolsForExecution } = require('~/server/services/ToolService');
 const { createToolEndCallback, getDefaultHandlers } = require('~/server/controllers/agents/callbacks');
 const { getConvoFiles } = require('~/models/Conversation');
@@ -44,6 +51,9 @@ const {
 const {
   sanitizeProviderFormattedMessages,
 } = require('~/server/services/viventium/normalizeTextContentParts');
+const {
+  sanitizeAggregatedContentParts,
+} = require('~/server/services/viventium/sanitizeAggregatedContentParts');
 /* === VIVENTIUM NOTE === */
 const {
   buildProductivitySpecialistRuntimeInstructions,
@@ -1015,7 +1025,13 @@ function hasActiveAnthropicThinking(thinking) {
 }
 
 function sanitizeAnthropicThinkingTemperature(agentForRun, safeReq) {
-  if (!hasActiveAnthropicThinking(agentForRun?.model_parameters?.thinking)) {
+  const model = typeof agentForRun?.model_parameters?.model === 'string'
+    ? agentForRun.model_parameters.model
+    : typeof agentForRun?.model === 'string'
+      ? agentForRun.model
+      : '';
+  const adaptiveModel = model ? supportsAdaptiveThinking(model) : false;
+  if (!hasActiveAnthropicThinking(agentForRun?.model_parameters?.thinking) && !adaptiveModel) {
     return;
   }
 
@@ -1035,21 +1051,30 @@ function sanitizeAnthropicThinkingTemperature(agentForRun, safeReq) {
 
   if (removed) {
     logger.info(
-      '[BackgroundCortexService] Removed Anthropic cortex temperature because thinking is active',
+      `[BackgroundCortexService] Removed Anthropic cortex temperature because ${
+        hasActiveAnthropicThinking(agentForRun?.model_parameters?.thinking)
+          ? 'thinking is active'
+          : 'the model uses adaptive-thinking-era Anthropic temperature rules'
+      }`,
     );
   }
 }
 
 async function buildActivationLlmConfig({ providerName, model, req }) {
   const mappedProvider = mapProvider(providerName);
+  const usesAdaptiveAnthropicTemperatureRules =
+    providerName === 'anthropic' && supportsAdaptiveThinking(model);
   const llmConfig = {
     provider: mappedProvider,
     model,
-    temperature: 0.1,
     maxTokens: 100,
     streaming: false,
     disableStreaming: true,
   };
+
+  if (!(providerName === 'perplexity' || usesAdaptiveAnthropicTemperatureRules)) {
+    llmConfig.temperature = 0.1;
+  }
 
   if (req && providerName) {
     const customConfig = await getCustomEndpointConfig(providerName, req);
@@ -1085,9 +1110,9 @@ async function buildActivationLlmConfig({ providerName, model, req }) {
       endpoint: EModelEndpoint.anthropic,
       model_parameters: {
         model,
-        temperature: 0.1,
         maxOutputTokens: 100,
         thinking: false,
+        ...(usesAdaptiveAnthropicTemperatureRules ? {} : { temperature: 0.1 }),
       },
       db: {
         getUserKey: db.getUserKey,
@@ -1096,13 +1121,19 @@ async function buildActivationLlmConfig({ providerName, model, req }) {
       },
     });
 
-    return {
+    const anthropicLlmConfig = {
       ...anthropicInit.llmConfig,
       provider: Providers.ANTHROPIC,
       model,
       streaming: false,
       disableStreaming: true,
     };
+
+    if (usesAdaptiveAnthropicTemperatureRules) {
+      delete anthropicLlmConfig.temperature;
+    }
+
+    return anthropicLlmConfig;
   }
   if (providerName === 'perplexity') {
     delete llmConfig.temperature;
@@ -1608,7 +1639,11 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
 
     const collectedUsage = [];
     const artifactPromises = [];
-    const { contentParts, aggregateContent } = createContentAggregator();
+    const { contentParts, aggregateContent: rawAggregateContent } = createContentAggregator();
+    const aggregateContent = (event) => {
+      rawAggregateContent(event);
+      sanitizeAggregatedContentParts(contentParts);
+    };
     const toolExecutionState = {
       completed: 0,
       names: new Set(),

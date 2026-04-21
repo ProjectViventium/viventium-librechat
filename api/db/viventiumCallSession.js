@@ -37,7 +37,7 @@ module.exports = function createViventiumCallSession(db) {
       agentId: { type: String, required: true },
       conversationId: { type: String, required: true },
       roomName: { type: String, required: true },
-      expiresAt: { type: Date, required: true },
+      expiresAt: { type: Date, required: true, index: { expireAfterSeconds: 0 } },
       wingModeEnabled: { type: Boolean, default: null },
       shadowModeEnabled: { type: Boolean, default: null },
       requestedVoiceRoute: { type: voiceRouteStateSchema, default: null },
@@ -58,8 +58,5 @@ module.exports = function createViventiumCallSession(db) {
     },
     { timestamps: true },
   );
-
-  schema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
-
   return connection.model('ViventiumCallSession', schema);
 };

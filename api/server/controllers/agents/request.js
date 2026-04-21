@@ -106,6 +106,55 @@ function sanitizePersistedAssistantText(req, text) {
   return text;
 }
 
+function sanitizePersistedAssistantContent(req, content) {
+  if (!Array.isArray(content) || req.body?.voiceMode !== true) {
+    return content;
+  }
+
+  let changed = false;
+  const sanitized = content.map((part) => {
+    if (!part || typeof part !== 'object' || part.type !== 'text') {
+      return part;
+    }
+
+    const rawText =
+      typeof part.text === 'string'
+        ? part.text
+        : typeof part.text?.value === 'string'
+          ? part.text.value
+          : '';
+    const cleanedText = stripVoiceControlTagsForDisplay(rawText);
+    if (cleanedText === rawText) {
+      return part;
+    }
+
+    changed = true;
+    if (typeof part.text === 'string') {
+      return {
+        ...part,
+        text: cleanedText,
+      };
+    }
+
+    if (part.text && typeof part.text === 'object') {
+      return {
+        ...part,
+        text: {
+          ...part.text,
+          value: cleanedText,
+        },
+      };
+    }
+
+    return {
+      ...part,
+      text: cleanedText,
+    };
+  });
+
+  return changed ? sanitized : content;
+}
+
 async function persistAssistantSnapshot({
   req,
   streamId,
@@ -167,9 +216,10 @@ async function persistAssistantSnapshot({
     return { persisted: false, fingerprint: null };
   }
 
-  const effectiveContent = Array.isArray(aggregatedContent)
+  const rawContent = Array.isArray(aggregatedContent)
     ? aggregatedContent.filter(Boolean)
     : (resumeState?.aggregatedContent ?? []);
+  const effectiveContent = sanitizePersistedAssistantContent(req, rawContent);
   const extractedText = extractTextFromContentParts(effectiveContent);
   const text = sanitizePersistedAssistantText(req, extractedText || fallbackText || '');
 
@@ -407,6 +457,10 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
      * actual response messageId isn't available yet. The final response save will
      * overwrite this with the complete response using the same messageId pattern.
      */
+    let sender = client?.sender;
+    let userMessage;
+    let responseMessageId = editedResponseMessageId;
+
     job.emitter.on('allSubscribersLeft', async (aggregatedContent) => {
       if (!aggregatedContent || aggregatedContent.length === 0) {
         return;
@@ -467,7 +521,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
     }
 
     client = result.client;
-    let sender = client?.sender;
+    sender = client?.sender;
 
     if (client?.sender) {
       await GenerationJobManager.updateMetadata(streamId, { sender: client.sender });
@@ -477,9 +531,6 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
     if (client?.contentParts) {
       GenerationJobManager.setContentParts(streamId, client.contentParts);
     }
-
-    let userMessage;
-    let responseMessageId = editedResponseMessageId;
 
     const getReqData = (data = {}) => {
       if (data.userMessage) {
@@ -749,6 +800,12 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
             user: userId,
             unfinished: wasAbortedBeforeComplete,
           };
+          if (Array.isArray(persistedResponse.content)) {
+            persistedResponse.content = sanitizePersistedAssistantContent(
+              req,
+              persistedResponse.content,
+            );
+          }
           if (req.body?.voiceMode === true && typeof persistedResponse.text === 'string') {
             persistedResponse.text = stripVoiceControlTagsForDisplay(persistedResponse.text);
           }
@@ -1272,6 +1329,12 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
          * Feature: Strip voice control tags from persisted response text (non-resumable path).
          */
         const persistedFinalResponse = { ...finalResponse, user: userId };
+        if (Array.isArray(persistedFinalResponse.content)) {
+          persistedFinalResponse.content = sanitizePersistedAssistantContent(
+            req,
+            persistedFinalResponse.content,
+          );
+        }
         if (req.body?.voiceMode === true && typeof persistedFinalResponse.text === 'string') {
           persistedFinalResponse.text = stripVoiceControlTagsForDisplay(
             persistedFinalResponse.text,
@@ -1359,6 +1422,7 @@ module.exports = AgentController;
 module.exports.ResumableAgentController = ResumableAgentController;
 module.exports.__testables = {
   extractTextFromContentParts,
+  sanitizePersistedAssistantContent,
   sanitizePersistedAssistantText,
   persistAssistantSnapshot,
 };

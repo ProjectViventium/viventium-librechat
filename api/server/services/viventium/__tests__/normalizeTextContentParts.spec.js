@@ -132,6 +132,42 @@ describe('normalizeTextContentParts', () => {
     expect(result[0].content).toBe('Context message.');
   });
 
+  test('sanitizeAnthropicFormattedMessages drops malformed thinking blocks but preserves valid reasoning', () => {
+    const messages = [
+      {
+        content: [
+          { type: 'thinking', signature: 'sig-only' },
+          { type: 'thinking', thinking: { text: 'wrong-shape' }, signature: 'sig-object' },
+          { type: 'redacted_thinking', data: '' },
+          { type: 'redacted_thinking', data: { opaque: true } },
+          { type: 'thinking', thinking: 'valid reasoning', signature: 'valid-sig' },
+          { type: 'redacted_thinking', data: 'opaque' },
+          { type: 'tool_use', id: 'tool-1', name: 'web_search', input: { q: 'hi' } },
+        ],
+      },
+    ];
+
+    const result = sanitizeAnthropicFormattedMessages(messages);
+    expect(result).toHaveLength(1);
+    expect(result[0].content).toEqual([
+      { type: 'thinking', thinking: 'valid reasoning', signature: 'valid-sig' },
+      { type: 'redacted_thinking', data: 'opaque' },
+      { type: 'tool_use', id: 'tool-1', name: 'web_search', input: { q: 'hi' } },
+    ]);
+  });
+
+  test('sanitizeAnthropicFormattedMessages falls back when malformed reasoning leaves no content', () => {
+    const messages = [
+      {
+        content: [{ type: 'thinking', thinking: '', signature: '' }],
+      },
+    ];
+
+    const result = sanitizeAnthropicFormattedMessages(messages);
+    expect(result).toHaveLength(1);
+    expect(result[0].content).toBe('Context message.');
+  });
+
   test('sanitizeAnthropicFormattedMessages preserves LangChain prototype when a message is rewritten', () => {
     const messages = [
       new HumanMessage({

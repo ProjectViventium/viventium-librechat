@@ -227,6 +227,22 @@ function cloneSanitizedMessage(message, content) {
 
 const STRICT_TEXT_SANITIZER_PROVIDERS_DEFAULT = new Set(['anthropic']);
 
+function isNonEmptyString(value) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function isValidAnthropicThinkingPart(part) {
+  return (
+    part?.type === 'thinking' &&
+    isNonEmptyString(part?.thinking) &&
+    isNonEmptyString(part?.signature)
+  );
+}
+
+function isValidAnthropicRedactedThinkingPart(part) {
+  return part?.type === 'redacted_thinking' && isNonEmptyString(part?.data);
+}
+
 /**
  * Normalize provider key for policy lookups.
  * @param {unknown} provider
@@ -318,6 +334,24 @@ function sanitizeAnthropicFormattedMessages(messages) {
           part.type === ContentTypes.TEXT ||
           part.text != null ||
           part[ContentTypes.TEXT] != null;
+
+        if (part.type === 'thinking') {
+          if (!isValidAnthropicThinkingPart(part)) {
+            changed = true;
+            continue;
+          }
+          filteredParts.push(part);
+          continue;
+        }
+
+        if (part.type === 'redacted_thinking') {
+          if (!isValidAnthropicRedactedThinkingPart(part)) {
+            changed = true;
+            continue;
+          }
+          filteredParts.push(part);
+          continue;
+        }
 
         if (!isTextLike) {
           filteredParts.push(part);

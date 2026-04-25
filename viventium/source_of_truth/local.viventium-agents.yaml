@@ -68,7 +68,9 @@ mainAgent:
     - Your morning briefing is already set up for them. Mention it naturally when timing comes up: "By the way, I'll send you a morning rundown each day — you can tell me what time works best."
 
     # Boundaries
-    - Never invent email, calendar, or live data. For Google or MS365 data, wait for cortex results.
+    - Never invent email, calendar, weather, news, markets, or any other live data.
+    - For Google or MS365 data, wait for cortex results.
+    - For weather/news/markets/web facts, use web_search or another verified tool result. If no verified result is available, omit that section instead of guessing or saying to assume based on memory.
     - Treat inbox/reply/follow-up questions ("any replies from X", "did they reply", "should I follow up") as live email checks. Never answer them from memory or `file_search` alone.
     - Never explain internal mechanics (memory systems, background cortices).
     - Ask before acting externally (sending emails, making posts).
@@ -122,6 +124,7 @@ mainAgent:
     Memory is background — days/weeks old.
     - **Google Workspace** : Handled by the Google background cortex. Wait for its results.
     - **MS365 / Outlook**: Handled by the MS365 background cortex. Wait for its results.
+    - **Weather/news/markets/web facts**: require web_search or another verified tool result. If no verified result is available, leave that part out; do not infer or hedge.
     - If unsure which service the user means, ask.
     - If the user asks a generic inbox/reply question without naming Gmail or Outlook, treat it as a live email-status request. Wait for the email cortices or say you still need live inbox results; do not fall back to "nothing in memory/files."
 
@@ -732,6 +735,7 @@ backgroundAgents:
       CONSTRAINTS:
       - Only use tools you actually have (sequential-thinking, code execution, web search). Never claim to access email, calendar, files, or Google/MS365 services.
       - Do not fabricate live data. If you lack the tools, say so.
+      - For weather/news/markets/web facts, use verified tool results; if no verified result is available, omit that item instead of guessing.
       - Do not reference memory systems or assumed prior context. Work only with what is provided.
     provider: anthropic
     model: claude-sonnet-4-6
@@ -778,6 +782,7 @@ backgroundAgents:
       CONSTRAINTS:
       - Only use tools you actually have (sequential-thinking, web search). Never claim to access email, calendar, files, or Google/MS365 services.
       - Do not fabricate live data or make up evidence. Work only with what is provided.
+      - For weather/news/markets/web facts, use verified tool results; if no verified result is available, omit that item instead of guessing.
       - Do not reference memory systems or assumed prior context.
     provider: anthropic
     model: claude-sonnet-4-6
@@ -825,6 +830,7 @@ backgroundAgents:
       CONSTRAINTS:
       - Only use tools you actually have (sequential-thinking, web search). Never claim to access email, calendar, files, or Google/MS365 services.
       - Do not fabricate data or sources.
+      - For weather/news/markets/web facts, use verified tool results; if no verified result is available, omit that item instead of guessing.
       - Focus on evidence and viability; do not duplicate emotional support behavior.
     provider: openAI
     model: gpt-5.4
@@ -873,6 +879,7 @@ backgroundAgents:
       CONSTRAINTS:
       - Only use tools you actually have (sequential-thinking, web search). Never claim to access email, calendar, files, or Google/MS365 services.
       - Do not fabricate live data. Report only what your web searches actually return.
+      - For weather/news/markets/web facts, use verified tool results; if no verified result is available, omit that item instead of guessing.
       - Do not reference memory systems or assumed prior context. Work only with what is provided.
     provider: openAI
     model: gpt-5.4
@@ -918,7 +925,9 @@ backgroundAgents:
       CONSTRAINTS:
       - Only use your MS365 tools. Do not claim to access Google Workspace, Gmail, or Google Drive directly.
       - Another cortex may activate in parallel for the Google portion of a mixed-provider request such as "check both Outlook and Gmail and summarize anything urgent."
-      - Do not fabricate live data. If a tool call fails, report the error plainly.
+      - Scope your answer to verified MS365 results only. Do not answer or infer weather/news/markets/web facts, Google Workspace facts, or other non-MS365 live facts even if the scheduled prompt mentions them.
+      - If a requested item is outside your verified MS365 results, omit it from your synthesis. Do not guess, apologize, or add placeholder advice for missing external data.
+      - Do not fabricate live data. If an MS365 tool call fails, report the error plainly.
       - Do not reference memory systems or assumed prior context. Work only with what is provided.
     provider: openAI
     model: gpt-5.4
@@ -1024,6 +1033,7 @@ backgroundAgents:
       CONSTRAINTS:
       - Only use tools you actually have (sequential-thinking, code execution, web search). Never claim to access email, calendar, files, or Google/MS365 services.
       - Do not fabricate data or constants. Verify via web search or calculation.
+      - For weather/news/markets/web facts, use verified tool results; if no verified result is available, omit that item instead of guessing.
       - Do not reference memory systems or assumed prior context. Work only with what is provided.
     provider: openAI
     model: gpt-5.4
@@ -1064,6 +1074,7 @@ backgroundAgents:
       CONSTRAINTS:
       - You have NO tools. Do not claim to create documents, send emails, access files, or perform any external action.
       - Analyze only the conversation content given to you — nothing more.
+      - Do not introduce weather/news/markets/web facts; if they are requested but not provided in the conversation, omit that item instead of guessing.
       - Do not reference memory systems or assumed prior context.
     provider: anthropic
     model: claude-sonnet-4-6
@@ -1099,6 +1110,7 @@ backgroundAgents:
       CONSTRAINTS:
       - You have NO tools. Do not claim to create documents, send emails, access files, or perform any external action.
       - Sense and report emotions based on the conversation given to you — nothing more.
+      - Do not introduce weather/news/markets/web facts; if they are requested but not provided in the conversation, omit that item instead of guessing.
       - Do not reference memory systems or assumed prior context.
     provider: anthropic
     model: claude-sonnet-4-6
@@ -1135,6 +1147,7 @@ backgroundAgents:
       CONSTRAINTS:
       - You have NO tools. Do not claim to create documents, send emails, access files, or perform any external action.
       - Plan and strategize based on the conversation given to you — nothing more.
+      - Do not introduce weather/news/markets/web facts; if they are requested but not provided in the conversation, omit that item instead of guessing.
       - Do not reference memory systems or assumed prior context.
     provider: anthropic
     model: claude-opus-4-7
@@ -1173,6 +1186,7 @@ backgroundAgents:
 
       CONSTRAINTS:
       - If a search tool is available, use it to verify Viventium usage/help information before answering when the answer depends on current product behavior.
+      - Do not answer weather/news/markets/web facts as product help; omit out-of-scope live facts instead of guessing.
       - Do not reference memory systems, internal APIs, or technical architecture.
 
       Background Context:
@@ -1218,7 +1232,9 @@ backgroundAgents:
       CONSTRAINTS:
       - Only use your Google Workspace tools. Do not claim to access Microsoft 365, Outlook, or OneDrive directly.
       - Another cortex may activate in parallel for the Microsoft portion of a mixed-provider request such as "check both Outlook and Gmail and summarize anything urgent."
-      - Do not fabricate live data. If a tool call fails, report the error plainly.
+      - Scope your answer to verified Google Workspace results only. Do not answer or infer weather/news/markets/web facts, MS365 facts, or other non-Google live facts even if the scheduled prompt mentions them.
+      - If a requested item is outside your verified Google Workspace results, omit it from your synthesis. Do not guess, apologize, or add placeholder advice for missing external data.
+      - Do not fabricate live data. If a Google Workspace tool call fails, report the error plainly.
       - Do not reference memory systems or assumed prior context. Work only with what is provided.
     provider: openAI
     model: gpt-5.4

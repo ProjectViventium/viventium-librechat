@@ -27,6 +27,11 @@ SCHEDULED_SELF_PROMPT_LINE = (
     "This is a scheduled self-prompt (morning briefing, wake cycle, heartbeat), "
     "not a new user scheduling request."
 )
+LIVE_FACT_CONTRACT_LINE = (
+    "For live external facts such as weather, news, markets, or web facts, include them only "
+    "when a verified tool/cortex result is present; otherwise omit that section instead of "
+    "guessing, inferring from memory, or apologizing about missing data."
+)
 DEFAULT_SCHEDULER_PROMPT_PREFIX = "\n".join(
     [
         BREW_PROMPT_MARKER,
@@ -37,6 +42,7 @@ DEFAULT_SCHEDULER_PROMPT_PREFIX = "\n".join(
             "should wait for their insights, output exactly {NTA}."
         ),
         "If you can already give a complete stable answer without waiting, answer normally.",
+        LIVE_FACT_CONTRACT_LINE,
         "Do not mention internal mechanics or talk about scheduling.",
     ]
 )
@@ -495,14 +501,37 @@ def _looks_like_scheduled_self_prompt(text: str) -> bool:
     )
 
 
+def _has_live_fact_contract(text: str) -> bool:
+    if not isinstance(text, str):
+        return False
+    lowered = text.lower()
+    return (
+        "live external facts" in lowered
+        and "verified tool/cortex result" in lowered
+        and "omit that section" in lowered
+    )
+
+
+def _ensure_live_fact_contract(text: str) -> str:
+    cleaned = (text or "").strip()
+    if _has_live_fact_contract(cleaned):
+        return cleaned
+    if not cleaned:
+        return LIVE_FACT_CONTRACT_LINE
+    return f"{cleaned}\n\n{LIVE_FACT_CONTRACT_LINE}"
+
+
 def _compose_prompt(task: Dict[str, Any]) -> str:
     base = (task.get("prompt") or "").strip()
     prefix = _get_prompt_prefix()
+    composed = base
     if not prefix or _looks_like_scheduled_self_prompt(base):
-        return base
+        return _ensure_live_fact_contract(composed)
     if not base:
-        return prefix
-    return f"{prefix}\n\n{base}"
+        composed = prefix
+    else:
+        composed = f"{prefix}\n\n{base}"
+    return _ensure_live_fact_contract(composed)
 # === VIVENTIUM END ===
 
 

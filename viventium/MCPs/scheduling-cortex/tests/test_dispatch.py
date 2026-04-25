@@ -98,6 +98,9 @@ class DispatchTelegramTests(unittest.TestCase):
         composed = dispatch._compose_prompt(task)
         self.assertIn('Background Processing (Brewing)', composed)
         self.assertIn('scheduled self-prompt', composed)
+        self.assertIn('live external facts', composed)
+        self.assertIn('verified tool/cortex result', composed)
+        self.assertIn('omit that section', composed)
         self.assertIn('Take vitamin C', composed)
         self.assertTrue(composed.startswith('<!--viv_internal:brew_begin-->'))
     # === VIVENTIUM NOTE ===
@@ -107,6 +110,9 @@ class DispatchTelegramTests(unittest.TestCase):
         composed = dispatch._compose_prompt(task)
         self.assertIn('Background Processing (Brewing)', composed)
         self.assertIn('scheduled self-prompt', composed)
+        self.assertIn('live external facts', composed)
+        self.assertIn('verified tool/cortex result', composed)
+        self.assertIn('omit that section', composed)
         self.assertIn('Take vitamin C', composed)
         self.assertTrue(composed.startswith('<!--viv_internal:brew_begin-->'))
 
@@ -119,7 +125,11 @@ class DispatchTelegramTests(unittest.TestCase):
         )
         task = {'prompt': existing}
         composed = dispatch._compose_prompt(task)
-        self.assertEqual(composed, existing)
+        self.assertTrue(composed.startswith(existing))
+        self.assertEqual(composed.count('<!--viv_internal:brew_begin-->'), 1)
+        self.assertIn('live external facts', composed)
+        self.assertIn('verified tool/cortex result', composed)
+        self.assertIn('omit that section', composed)
 
     def test_dispatch_task_sends_telegram_message(self):
         task = {

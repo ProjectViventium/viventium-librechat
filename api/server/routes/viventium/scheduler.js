@@ -560,6 +560,7 @@ router.get('/cortex/:messageId', schedulerAuth, async (req, res) => {
   const messageId = req.params?.messageId;
   const conversationId =
     typeof req.query?.conversationId === 'string' ? req.query.conversationId : '';
+  const scheduleId = typeof req.query?.scheduleId === 'string' ? req.query.scheduleId : '';
 
   if (typeof userId !== 'string' || userId.length === 0) {
     return res.status(401).json({ error: 'Unauthorized' });
@@ -573,6 +574,7 @@ router.get('/cortex/:messageId', schedulerAuth, async (req, res) => {
       userId,
       messageId,
       conversationId,
+      scheduleId,
     });
     if (!state) {
       return res.status(404).json({ error: 'Message not found' });

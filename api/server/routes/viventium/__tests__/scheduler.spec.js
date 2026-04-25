@@ -469,6 +469,7 @@ describe('/api/viventium/scheduler/cortex', () => {
     expect(res.statusCode).toBe(200);
     expect(res.body.followUp).toEqual({ messageId: 'fu-1', text: 'Follow-up text' });
     expect(res.body.canonicalText).toBe('Canonical response');
+    expect(res.body.canonicalTextSource).toBe('message');
     expect(res.body.cortexParts).toHaveLength(1);
   });
 
@@ -495,6 +496,49 @@ describe('/api/viventium/scheduler/cortex', () => {
     expect(res.statusCode).toBe(200);
     expect(res.body.followUp).toBeNull();
     expect(res.body.canonicalText).toBe('Fresh inbox summary');
+    expect(res.body.canonicalTextSource).toBe('message');
+  });
+
+  test('suppresses generic deferred error text for scheduled polling when scheduleId is present', async () => {
+    mockGetMessage = jest.fn().mockResolvedValue({
+      messageId: 'msg-scheduled-empty',
+      conversationId: 'conv-1',
+      model: 'agent_main',
+      text: '',
+      content: [
+        { type: 'text', text: "I'm here. Shoot." },
+        {
+          type: 'cortex_insight',
+          status: 'complete',
+          cortex_name: 'Pattern Recognition',
+          insight: 'Go ahead.',
+        },
+      ],
+    });
+    mockGetMessages = jest.fn().mockResolvedValue([]);
+    mockGetAgent = jest.fn().mockResolvedValue({
+      instructions: `
+Holding Examples
+- "I'm here. Shoot."
+`,
+    });
+
+    const schedulerRouter = require('../scheduler');
+    const app = createTestApp(schedulerRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/scheduler/cortex/msg-scheduled-empty',
+      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+      query: { userId: 'user_1', conversationId: 'conv-1', scheduleId: 'schedule-1' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+    expect(res.statusCode).toBe(200);
+    expect(res.body.followUp).toBeNull();
+    expect(res.body.canonicalText).toBe('');
+    expect(res.body.canonicalTextSource).toBe('deferred_fallback');
+    expect(res.body.canonicalTextFallbackReason).toBe('empty_deferred_response');
   });
 
   test('suppresses followUp when the replaced parent message matches the parent id', async () => {

@@ -847,6 +847,7 @@ describe('/api/viventium/telegram', () => {
     expect(res.body.cortexParts).toHaveLength(1);
     expect(res.body.followUp.text).toBe('Follow-up text');
     expect(res.body.canonicalText).toBe('Canonical telegram response');
+    expect(res.body.canonicalTextSource).toBe('message');
     expect(mockGetMessages).toHaveBeenCalledWith({
       user: 'user_1',
       conversationId: 'conv-1',
@@ -898,6 +899,8 @@ describe('/api/viventium/telegram', () => {
     expect(res.body.canonicalText).toBe(
       'I read the doc. Short version: the profile is more plausibly O-1A than O-1B if the achievements are framed around business impact and measurable recognition.',
     );
+    expect(res.body.canonicalTextSource).toBe('deferred_fallback');
+    expect(res.body.canonicalTextFallbackReason).toBe('insight_fallback');
   });
 
   test('GET cortex resolves configured hold text to clear deferred error when only low-signal insight exists', async () => {
@@ -941,6 +944,53 @@ Holding Examples
     expect(res.statusCode).toBe(200);
     expect(res.body.followUp).toBeNull();
     expect(res.body.canonicalText).toBe("I couldn't finish that check just now.");
+    expect(res.body.canonicalTextSource).toBe('deferred_fallback');
+    expect(res.body.canonicalTextFallbackReason).toBe('empty_deferred_response');
+  });
+
+  test('GET cortex suppresses generic deferred error text for scheduled Telegram polling', async () => {
+    const telegramRouter = require('../telegram');
+    const app = createTestApp(telegramRouter);
+
+    mockGetMessage.mockResolvedValueOnce({
+      messageId: 'msg-4',
+      conversationId: 'conv-1',
+      model: 'agent_main',
+      text: '',
+      unfinished: false,
+      content: [
+        { type: 'text', text: "I'm here. Shoot." },
+        {
+          type: 'cortex_insight',
+          status: 'complete',
+          cortex_name: 'Pattern Recognition',
+          insight: 'Go ahead.',
+        },
+      ],
+    });
+    mockGetMessages.mockResolvedValueOnce([]);
+    mockGetAgent.mockResolvedValueOnce({
+      instructions: `
+Holding Examples
+- "I'm here. Shoot."
+`,
+    });
+
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/telegram/cortex/msg-4?conversationId=conv-1&scheduleId=schedule-1',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      query: { conversationId: 'conv-1', telegramUserId: 'tg-1', scheduleId: 'schedule-1' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body.followUp).toBeNull();
+    expect(res.body.canonicalText).toBe('');
+    expect(res.body.canonicalTextSource).toBe('deferred_fallback');
+    expect(res.body.canonicalTextFallbackReason).toBe('empty_deferred_response');
   });
 
   test('GET files/download streams file bytes (telegram-auth)', async () => {

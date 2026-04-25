@@ -170,6 +170,111 @@ class SchedulerDeliveryPersistenceTests(unittest.TestCase):
             self.assertIsNone(updated.get("last_generated_text"))
             self.assertEqual(updated.get("last_delivery", {}).get("outcome"), "failed")
 
+    def test_update_after_success_records_fallback_delivery_as_degraded_outcome(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = ScheduleStorage(StorageConfig(db_path=str(Path(tmpdir) / "schedules.db")))
+            task = _seed_task(storage, "task-fallback")
+            engine = SchedulerEngine(storage, poll_interval_s=30, misfire_grace_s=900, retry_delay_s=300)
+            now = datetime(2026, 2, 13, 19, 0, 0, tzinfo=timezone.utc)
+
+            engine._update_after_success(
+                task,
+                now,
+                {
+                    "conversation_id": "conv-fallback",
+                    "delivery": {
+                        "outcome": "fallback_delivered",
+                        "reason": "telegram:insight_fallback",
+                        "generated_text": "Best-effort fallback summary",
+                        "channels": {
+                            "telegram": {
+                                "outcome": "fallback_delivered",
+                                "reason": "insight_fallback",
+                                "fallback_delivered": True,
+                            },
+                        },
+                    },
+                },
+            )
+
+            updated = storage.get_task("user-1", "task-fallback")
+            self.assertEqual(updated.get("last_status"), "success")
+            self.assertEqual(updated.get("last_delivery_outcome"), "fallback_delivered")
+            self.assertEqual(updated.get("last_delivery_reason"), "telegram:insight_fallback")
+            self.assertEqual(updated.get("last_generated_text"), "Best-effort fallback summary")
+            self.assertEqual(
+                updated.get("last_delivery", {}).get("degradation", {}).get("type"),
+                "deferred_fallback",
+            )
+
+    def test_update_after_success_records_suppressed_deferred_fallback_as_degraded(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = ScheduleStorage(StorageConfig(db_path=str(Path(tmpdir) / "schedules.db")))
+            task = _seed_task(storage, "task-suppressed-fallback")
+            engine = SchedulerEngine(storage, poll_interval_s=30, misfire_grace_s=900, retry_delay_s=300)
+            now = datetime(2026, 2, 13, 19, 0, 0, tzinfo=timezone.utc)
+
+            engine._update_after_success(
+                task,
+                now,
+                {
+                    "conversation_id": "conv-suppressed-fallback",
+                    "delivery": {
+                        "outcome": "suppressed",
+                        "reason": "telegram:empty_deferred_response",
+                        "generated_text": "{NTA}",
+                        "channels": {
+                            "telegram": {
+                                "outcome": "suppressed",
+                                "reason": "empty_deferred_response",
+                            },
+                        },
+                    },
+                },
+            )
+
+            updated = storage.get_task("user-1", "task-suppressed-fallback")
+            self.assertEqual(updated.get("last_status"), "success")
+            self.assertEqual(updated.get("last_delivery_outcome"), "suppressed")
+            self.assertEqual(updated.get("last_delivery_reason"), "telegram:empty_deferred_response")
+            self.assertEqual(
+                updated.get("last_delivery", {}).get("degradation", {}).get("reason"),
+                "telegram:empty_deferred_response",
+            )
+
+    def test_update_after_success_reads_deferred_fallback_from_channel_detail(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = ScheduleStorage(StorageConfig(db_path=str(Path(tmpdir) / "schedules.db")))
+            task = _seed_task(storage, "task-channel-fallback")
+            engine = SchedulerEngine(storage, poll_interval_s=30, misfire_grace_s=900, retry_delay_s=300)
+            now = datetime(2026, 2, 13, 19, 0, 0, tzinfo=timezone.utc)
+
+            engine._update_after_success(
+                task,
+                now,
+                {
+                    "conversation_id": "conv-channel-fallback",
+                    "delivery": {
+                        "outcome": "suppressed",
+                        "reason": "suppressed",
+                        "generated_text": "{NTA}",
+                        "channels": {
+                            "telegram": {
+                                "outcome": "suppressed",
+                                "reason": "empty_deferred_response",
+                            },
+                        },
+                    },
+                },
+            )
+
+            updated = storage.get_task("user-1", "task-channel-fallback")
+            self.assertEqual(updated.get("last_delivery_outcome"), "suppressed")
+            self.assertEqual(
+                updated.get("last_delivery", {}).get("degradation", {}).get("reason"),
+                "telegram:empty_deferred_response",
+            )
+
 
     def test_update_after_success_with_partial_channel_errors(self):
         with tempfile.TemporaryDirectory() as tmpdir:

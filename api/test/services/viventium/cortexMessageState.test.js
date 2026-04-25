@@ -56,6 +56,8 @@ describe('cortexMessageState', () => {
     expect(state.canonicalText).toBe(
       'I read the doc. Short version: the profile is more plausibly O-1A than O-1B if the achievements are framed around business impact and measurable recognition.',
     );
+    expect(state.canonicalTextSource).toBe('deferred_fallback');
+    expect(state.canonicalTextFallbackReason).toBe('insight_fallback');
   });
 
   test('does not override canonical text while cortex work is still active', async () => {
@@ -89,6 +91,7 @@ describe('cortexMessageState', () => {
     });
 
     expect(state.canonicalText).toBe('Checking now.');
+    expect(state.canonicalTextSource).toBe('message');
   });
 
   test('resolves configured hold text to best completed insight when no follow-up exists', async () => {
@@ -134,6 +137,8 @@ Holding Examples
     expect(state.canonicalText).toBe(
       'I read the attached file. Short version: the launch plan is split into three tracks with outreach, future-living recon, and GTM workstreams.',
     );
+    expect(state.canonicalTextSource).toBe('deferred_fallback');
+    expect(state.canonicalTextFallbackReason).toBe('insight_fallback');
   });
 
   test('resolves tagged runtime hold without relying on hold phrase matching', async () => {
@@ -170,6 +175,8 @@ Holding Examples
     expect(state.canonicalText).toBe(
       'The attached brief says the main blocker is pricing clarity before the customer outreach starts next week.',
     );
+    expect(state.canonicalTextSource).toBe('deferred_fallback');
+    expect(state.canonicalTextFallbackReason).toBe('insight_fallback');
   });
 
   test('returns clear deferred error when only low-signal insight remains after a hold', async () => {
@@ -210,5 +217,50 @@ Holding Examples
     });
 
     expect(state.canonicalText).toBe("I couldn't finish that check just now.");
+    expect(state.canonicalTextSource).toBe('deferred_fallback');
+    expect(state.canonicalTextFallbackReason).toBe('empty_deferred_response');
+  });
+
+  test('suppresses generic deferred error text for scheduled callers', async () => {
+    const { getCortexMessageState } = require('~/server/services/viventium/cortexMessageState');
+
+    mockGetMessage.mockResolvedValueOnce({
+      messageId: 'msg-6',
+      conversationId: 'conv-1',
+      model: 'agent_main',
+      text: '',
+      unfinished: false,
+      content: [
+        {
+          type: 'text',
+          text: "I'm here. Shoot.",
+        },
+        {
+          type: 'cortex_insight',
+          status: 'complete',
+          cortex_name: 'Pattern Recognition',
+          insight: 'Go ahead.',
+        },
+      ],
+    });
+    mockGetMessages.mockResolvedValueOnce([]);
+    mockGetAgent.mockResolvedValueOnce({
+      id: 'agent_main',
+      instructions: `
+Holding Examples
+- "I'm here. Shoot."
+`,
+    });
+
+    const state = await getCortexMessageState({
+      userId: 'user-1',
+      messageId: 'msg-6',
+      conversationId: 'conv-1',
+      scheduleId: 'schedule-1',
+    });
+
+    expect(state.canonicalText).toBe('');
+    expect(state.canonicalTextSource).toBe('deferred_fallback');
+    expect(state.canonicalTextFallbackReason).toBe('empty_deferred_response');
   });
 });

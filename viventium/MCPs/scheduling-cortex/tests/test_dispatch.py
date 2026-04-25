@@ -255,7 +255,77 @@ class DispatchTelegramTests(unittest.TestCase):
             self.assertEqual(result.get('conversation_id'), 'conv-canonical')
             self.assertEqual(result.get('response_message_id'), 'msg-canonical')
             self.assertEqual(result.get('final_text'), 'Fresh canonical summary')
+            self.assertEqual(result.get('final_text_source'), 'canonical_parent')
             self.assertEqual(result.get('followup_text'), '')
+
+    def test_run_scheduler_generation_marks_promoted_deferred_fallback_source(self):
+        task = {
+            'id': 'task-canonical-fallback',
+            'user_id': 'user_1',
+            'agent_id': 'agent-1',
+            'prompt': 'check my inbox',
+            'channel': 'telegram',
+            'conversation_policy': 'new',
+            'metadata': None,
+        }
+
+        with patch.object(
+            dispatch,
+            '_post_json',
+            return_value={'streamId': 'stream-canonical-fallback', 'conversationId': 'conv-canonical-fallback'},
+        ), patch.object(
+            dispatch,
+            '_stream_scheduler_response',
+            return_value=('{NTA}', 'msg-canonical-fallback', ''),
+        ), patch.object(
+            dispatch,
+            '_poll_scheduler_followup',
+            return_value={
+                'followup_text': '',
+                'canonical_text': 'Best-effort fallback summary',
+                'canonical_text_source': 'deferred_fallback',
+                'canonical_text_fallback_reason': 'insight_fallback',
+            },
+        ):
+            result = dispatch._run_scheduler_generation(task, 'http://localhost:3080', 10, 'new')
+
+            self.assertEqual(result.get('final_text'), 'Best-effort fallback summary')
+            self.assertEqual(result.get('final_text_source'), 'deferred_fallback')
+            self.assertEqual(result.get('final_text_fallback_reason'), 'insight_fallback')
+
+    def test_run_scheduler_generation_preserves_empty_scheduled_fallback_reason(self):
+        task = {
+            'id': 'task-empty-fallback',
+            'user_id': 'user_1',
+            'agent_id': 'agent-1',
+            'prompt': 'check my inbox',
+            'channel': 'telegram',
+            'conversation_policy': 'new',
+            'metadata': None,
+        }
+
+        with patch.object(
+            dispatch,
+            '_post_json',
+            return_value={'streamId': 'stream-empty-fallback', 'conversationId': 'conv-empty-fallback'},
+        ), patch.object(
+            dispatch,
+            '_stream_scheduler_response',
+            return_value=('{NTA}', 'msg-empty-fallback', ''),
+        ), patch.object(
+            dispatch,
+            '_poll_scheduler_followup',
+            return_value={
+                'followup_text': '',
+                'canonical_text': '',
+                'canonical_text_source': 'deferred_fallback',
+                'canonical_text_fallback_reason': 'empty_deferred_response',
+            },
+        ):
+            result = dispatch._run_scheduler_generation(task, 'http://localhost:3080', 10, 'new')
+
+            self.assertEqual(result.get('final_text'), '{NTA}')
+            self.assertEqual(result.get('suppressed_fallback_reason'), 'empty_deferred_response')
 
     def test_run_scheduler_generation_dedupes_matching_followup_text(self):
         task = {
@@ -314,6 +384,7 @@ class DispatchTelegramTests(unittest.TestCase):
         self.assertEqual(kwargs['timeout_s'], 210.0)
         self.assertEqual(kwargs['grace_s'], 8.0)
         self.assertFalse(kwargs['allow_insight_fallback'])
+        self.assertIn('scheduleId=task-followup-telegram', kwargs['url'])
 
     def test_scheduler_followup_poll_uses_short_defaults_without_telegram(self):
         task = {
@@ -365,6 +436,33 @@ class DispatchTelegramTests(unittest.TestCase):
 
         kwargs = mock_poll.call_args.kwargs
         self.assertTrue(kwargs['allow_insight_fallback'])
+
+    def test_poll_followup_state_preserves_canonical_fallback_provenance(self):
+        with patch.object(
+            dispatch,
+            '_get_json',
+            return_value={
+                'canonicalText': '',
+                'canonicalTextSource': 'deferred_fallback',
+                'canonicalTextFallbackReason': 'empty_deferred_response',
+                'followUp': None,
+                'cortexParts': [],
+            },
+        ):
+            result = dispatch._poll_followup_state(
+                url='http://localhost:3080/api/viventium/scheduler/cortex/msg-1',
+                headers={},
+                http_timeout_s=1,
+                interval_s=0.01,
+                grace_s=0,
+                timeout_s=0.01,
+                allow_insight_fallback=False,
+                warning_prefix='Scheduler',
+            )
+
+        self.assertEqual(result.get('canonical_text'), '')
+        self.assertEqual(result.get('canonical_text_source'), 'deferred_fallback')
+        self.assertEqual(result.get('canonical_text_fallback_reason'), 'empty_deferred_response')
 
     def test_dispatch_task_defaults_to_all_channels(self):
         task = {
@@ -720,6 +818,74 @@ Content: <turn timestamp="2026-02-25T00:00:06.441Z" role="AI">Archived text</tur
             self.assertEqual(result.get('delivery', {}).get('outcome'), 'suppressed')
             self.assertEqual(result.get('delivery', {}).get('reason'), 'telegram:empty')
 
+    def test_dispatch_telegram_marks_visible_deferred_fallback_as_degraded(self):
+        task = {
+            'id': 'task-visible-fallback',
+            'user_id': 'user_1',
+            'agent_id': 'agent-1',
+            'prompt': 'hello',
+            'channel': 'telegram',
+            'conversation_policy': 'new',
+            'metadata': None,
+        }
+
+        with patch.object(
+            dispatch,
+            '_run_scheduler_generation',
+            return_value={
+                'conversation_id': 'new',
+                'response_message_id': 'msg-visible-fallback',
+                'final_text': 'Best-effort fallback summary',
+                'followup_text': '',
+                'final_text_source': 'deferred_fallback',
+                'final_text_fallback_reason': 'insight_fallback',
+            },
+        ), patch.object(
+            dispatch,
+            '_resolve_telegram_identity',
+            return_value=('tg-fallback', 'tg-fallback', {'always_voice_response': False, 'voice_responses_enabled': True}),
+        ), patch.object(dispatch, '_send_telegram_voice_or_text') as mock_send:
+            result = dispatch.dispatch_task(task)
+
+            mock_send.assert_called_once()
+            self.assertEqual(mock_send.call_args.args[1], 'Best-effort fallback summary')
+            self.assertEqual(result.get('delivery', {}).get('outcome'), 'fallback_delivered')
+            self.assertEqual(result.get('delivery', {}).get('reason'), 'telegram:insight_fallback')
+            telegram_delivery = result.get('delivery', {}).get('channels', {}).get('telegram', {})
+            self.assertTrue(telegram_delivery.get('fallback_delivered'))
+
+    def test_dispatch_telegram_suppresses_empty_scheduled_deferred_fallback(self):
+        task = {
+            'id': 'task-empty-scheduled-fallback',
+            'user_id': 'user_1',
+            'agent_id': 'agent-1',
+            'prompt': 'hello',
+            'channel': 'telegram',
+            'conversation_policy': 'new',
+            'metadata': None,
+        }
+
+        with patch.object(
+            dispatch,
+            '_run_scheduler_generation',
+            return_value={
+                'conversation_id': 'new',
+                'response_message_id': 'msg-empty-scheduled-fallback',
+                'final_text': '{NTA}',
+                'followup_text': '',
+                'suppressed_fallback_reason': 'empty_deferred_response',
+            },
+        ), patch.object(
+            dispatch,
+            '_resolve_telegram_identity',
+            return_value=('tg-empty-fallback', 'tg-empty-fallback', {'always_voice_response': False, 'voice_responses_enabled': True}),
+        ), patch.object(dispatch, '_send_telegram_voice_or_text') as mock_send:
+            result = dispatch.dispatch_task(task)
+
+            mock_send.assert_not_called()
+            self.assertEqual(result.get('delivery', {}).get('outcome'), 'suppressed')
+            self.assertEqual(result.get('delivery', {}).get('reason'), 'telegram:empty_deferred_response')
+
     def test_dispatch_telegram_suppresses_nta_final_text(self):
         """NTA final_text should be suppressed (existing behavior, regression guard)."""
         task = {
@@ -945,6 +1111,87 @@ Content: <turn timestamp="2026-02-25T00:00:06.441Z" role="AI">Archived text</tur
             self.assertEqual(result.get('delivery', {}).get('generated_text'), 'Inbox summary from canonical parent')
             self.assertEqual(result.get('delivery', {}).get('final_generated_text'), 'Inbox summary from canonical parent')
             self.assertTrue(result.get('delivery', {}).get('sent_final'))
+
+    def test_legacy_dispatch_telegram_marks_visible_deferred_fallback_as_degraded(self):
+        task = {
+            'id': 'task-legacy-visible-fallback',
+            'user_id': 'user_1',
+            'agent_id': 'agent-1',
+            'prompt': 'check my inbox',
+            'channel': 'telegram',
+            'conversation_policy': 'new',
+            'metadata': None,
+        }
+
+        with patch.object(
+            dispatch,
+            '_resolve_telegram_identity',
+            return_value=('tg-legacy-fallback', 'tg-legacy-fallback', {'always_voice_response': False, 'voice_responses_enabled': True}),
+        ), patch.object(
+            dispatch,
+            '_post_json',
+            return_value={'streamId': 'stream-legacy-fallback', 'conversationId': 'conv-legacy-fallback'},
+        ), patch.object(
+            dispatch,
+            '_stream_telegram_response',
+            return_value=('{NTA}', 'msg-legacy-fallback', ''),
+        ), patch.object(
+            dispatch,
+            '_poll_telegram_followup',
+            return_value={
+                'followup_text': '',
+                'canonical_text': 'Best-effort fallback summary',
+                'canonical_text_source': 'deferred_fallback',
+                'canonical_text_fallback_reason': 'insight_fallback',
+            },
+        ), patch.object(dispatch, '_send_telegram_voice_or_text') as mock_send:
+            result = dispatch._dispatch_telegram(task, 'http://localhost:3080', 10, 'new')
+
+            self.assertEqual(mock_send.call_count, 1)
+            self.assertEqual(mock_send.call_args_list[0].args[1], 'Best-effort fallback summary')
+            self.assertEqual(result.get('delivery', {}).get('outcome'), 'fallback_delivered')
+            self.assertEqual(result.get('delivery', {}).get('reason'), 'insight_fallback')
+            self.assertTrue(result.get('delivery', {}).get('fallback_delivered'))
+
+    def test_legacy_dispatch_telegram_suppresses_empty_scheduled_deferred_fallback(self):
+        task = {
+            'id': 'task-legacy-empty-fallback',
+            'user_id': 'user_1',
+            'agent_id': 'agent-1',
+            'prompt': 'check my inbox',
+            'channel': 'telegram',
+            'conversation_policy': 'new',
+            'metadata': None,
+        }
+
+        with patch.object(
+            dispatch,
+            '_resolve_telegram_identity',
+            return_value=('tg-legacy-empty', 'tg-legacy-empty', {'always_voice_response': False, 'voice_responses_enabled': True}),
+        ), patch.object(
+            dispatch,
+            '_post_json',
+            return_value={'streamId': 'stream-legacy-empty', 'conversationId': 'conv-legacy-empty'},
+        ), patch.object(
+            dispatch,
+            '_stream_telegram_response',
+            return_value=('{NTA}', 'msg-legacy-empty', ''),
+        ), patch.object(
+            dispatch,
+            '_poll_telegram_followup',
+            return_value={
+                'followup_text': '',
+                'canonical_text': '',
+                'canonical_text_source': 'deferred_fallback',
+                'canonical_text_fallback_reason': 'empty_deferred_response',
+            },
+        ), patch.object(dispatch, '_send_telegram_voice_or_text') as mock_send:
+            result = dispatch._dispatch_telegram(task, 'http://localhost:3080', 10, 'new')
+
+            mock_send.assert_not_called()
+            self.assertEqual(result.get('delivery', {}).get('outcome'), 'suppressed')
+            self.assertEqual(result.get('delivery', {}).get('reason'), 'empty_deferred_response')
+            self.assertFalse(result.get('delivery', {}).get('fallback_delivered'))
 
     def test_dispatch_telegram_dedupes_matching_followup_text(self):
         task = {

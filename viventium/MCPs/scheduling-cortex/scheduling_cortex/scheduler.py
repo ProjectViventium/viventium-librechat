@@ -19,6 +19,70 @@ from .storage import ScheduleStorage
 
 logger = logging.getLogger(__name__)
 
+DEFERRED_FALLBACK_REASON_MARKERS = (
+    "deferred_fallback",
+    "empty_deferred_response",
+    "insight_fallback",
+)
+
+
+def _has_deferred_fallback_marker(value: object) -> bool:
+    reason = str(value or "").strip()
+    return any(marker in reason for marker in DEFERRED_FALLBACK_REASON_MARKERS)
+
+
+def _channel_deferred_fallback_reason(
+    channel: object,
+    detail: object,
+) -> str:
+    if not isinstance(detail, dict):
+        return ""
+    outcome = str(detail.get("outcome") or "").strip()
+    reason = str(detail.get("reason") or "").strip()
+    fallback_delivered = detail.get("fallback_delivered") is True
+    if not fallback_delivered and outcome != "fallback_delivered" and not _has_deferred_fallback_marker(reason):
+        return ""
+    if not reason:
+        return "deferred_fallback"
+    channel_name = str(channel or "").strip()
+    if channel_name and ":" not in reason:
+        return f"{channel_name}:{reason}"
+    return reason
+
+
+def _delivery_detail_deferred_fallback_reason(delivery_detail: Optional[Dict[str, object]]) -> str:
+    if not isinstance(delivery_detail, dict):
+        return ""
+    reason = str(delivery_detail.get("reason") or "").strip()
+    if delivery_detail.get("fallback_delivered") is True or _has_deferred_fallback_marker(reason):
+        return reason or "deferred_fallback"
+    channels = delivery_detail.get("channels")
+    if isinstance(channels, dict):
+        for channel, detail in channels.items():
+            channel_reason = _channel_deferred_fallback_reason(channel, detail)
+            if channel_reason:
+                return channel_reason
+    return ""
+
+
+def _deferred_fallback_degradation(
+    *,
+    delivery_outcome: str,
+    delivery_reason: str,
+    delivery_detail: Optional[Dict[str, object]] = None,
+) -> Optional[Dict[str, object]]:
+    reason = str(delivery_reason or "").strip()
+    structured_reason = _delivery_detail_deferred_fallback_reason(delivery_detail)
+    if delivery_outcome == "fallback_delivered" or _has_deferred_fallback_marker(reason) or structured_reason:
+        degradation_reason = reason if _has_deferred_fallback_marker(reason) else structured_reason
+        if not degradation_reason:
+            degradation_reason = "deferred_fallback" if delivery_outcome == "fallback_delivered" else reason
+        return {
+            "type": "deferred_fallback",
+            "reason": degradation_reason or "deferred_fallback",
+        }
+    return None
+
 
 # === VIVENTIUM NOTE ===
 # Feature: Heartbeat quiet-streak metadata tracking.
@@ -206,6 +270,13 @@ class SchedulerEngine:
             "reason": delivery_reason,
             "generated_text": generated_text,
         }
+        degradation = _deferred_fallback_degradation(
+            delivery_outcome=delivery_outcome,
+            delivery_reason=delivery_reason,
+            delivery_detail=delivery_detail,
+        )
+        if degradation is not None:
+            base_delivery["degradation"] = degradation
         if isinstance(channel_errors, dict) and channel_errors:
             base_delivery["channel_errors"] = channel_errors
             updates["last_status"] = "partial_success"

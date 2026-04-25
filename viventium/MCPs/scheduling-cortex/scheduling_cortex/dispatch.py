@@ -829,6 +829,35 @@ def _extract_canonical_text(state: Dict[str, Any]) -> str:
     return ""
 
 
+def _extract_canonical_text_source(state: Dict[str, Any]) -> str:
+    for key in ("canonicalTextSource", "canonical_text_source"):
+        value = state.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _extract_canonical_text_fallback_reason(state: Dict[str, Any]) -> str:
+    for key in ("canonicalTextFallbackReason", "canonical_text_fallback_reason"):
+        value = state.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _is_fallback_text_source(source: Any) -> bool:
+    return str(source or "").strip() in {
+        "deferred_fallback",
+        "insight_fallback",
+        "cortex_insight_fallback",
+    }
+
+
+def _fallback_reason(reason: Any, default: str = "deferred_fallback") -> str:
+    value = str(reason or "").strip()
+    return value or default
+
+
 def _has_active_cortex(parts: list[Dict[str, Any]]) -> bool:
     return any(part.get("status") in _ACTIVE_CORTEX_STATUSES for part in parts)
 
@@ -941,6 +970,8 @@ def _poll_followup_state(
     grace_start = time.monotonic()
     last_parts: list[Dict[str, Any]] = []
     last_canonical_text = ""
+    last_canonical_text_source = ""
+    last_canonical_text_fallback_reason = ""
 
     while time.monotonic() < deadline:
         try:
@@ -953,6 +984,12 @@ def _poll_followup_state(
             time.sleep(interval_s)
             continue
         canonical_text = _extract_canonical_text(state)
+        canonical_text_source = _extract_canonical_text_source(state)
+        canonical_text_fallback_reason = _extract_canonical_text_fallback_reason(state)
+        if canonical_text_source:
+            last_canonical_text_source = canonical_text_source
+        if canonical_text_fallback_reason:
+            last_canonical_text_fallback_reason = canonical_text_fallback_reason
         if canonical_text:
             last_canonical_text = canonical_text
         follow_up = state.get("followUp")
@@ -962,6 +999,9 @@ def _poll_followup_state(
                 return {
                     "followup_text": text.strip(),
                     "canonical_text": last_canonical_text,
+                    "followup_text_source": "followup",
+                    "canonical_text_source": last_canonical_text_source,
+                    "canonical_text_fallback_reason": last_canonical_text_fallback_reason,
                 }
 
         parts = _extract_cortex_parts(state.get("cortexParts"))
@@ -981,8 +1021,17 @@ def _poll_followup_state(
             return {
                 "followup_text": _format_insight_fallback(insights),
                 "canonical_text": last_canonical_text,
+                "followup_text_source": "cortex_insight_fallback",
+                "followup_text_fallback_reason": "insight_fallback",
+                "canonical_text_source": last_canonical_text_source,
+                "canonical_text_fallback_reason": last_canonical_text_fallback_reason,
             }
-    return {"followup_text": "", "canonical_text": last_canonical_text}
+    return {
+        "followup_text": "",
+        "canonical_text": last_canonical_text,
+        "canonical_text_source": last_canonical_text_source,
+        "canonical_text_fallback_reason": last_canonical_text_fallback_reason,
+    }
 # === VIVENTIUM END ===
 
 
@@ -1153,12 +1202,15 @@ def _poll_scheduler_followup(
     http_timeout_s: int,
 ) -> Dict[str, str]:
     if not message_id:
-        return {"followup_text": "", "canonical_text": ""}
+        return {"followup_text": "", "canonical_text": "", "canonical_text_source": ""}
 
     poll_config = _scheduler_followup_poll_config(task)
     params = {"userId": str(user_id)}
     if conversation_id:
         params["conversationId"] = str(conversation_id)
+    schedule_id = task.get("id")
+    if schedule_id:
+        params["scheduleId"] = str(schedule_id)
     url = f"{base_url}/api/viventium/scheduler/cortex/{message_id}?{urllib.parse.urlencode(params)}"
     headers = {"X-VIVENTIUM-SCHEDULER-SECRET": secret}
     return _poll_followup_state(
@@ -1215,7 +1267,12 @@ def _run_scheduler_generation(
         stream_timeout_s,
     )
     resolved_conversation_id = _extract_conversation_id(response, conversation_id)
-    polled_state = {"followup_text": "", "canonical_text": ""}
+    polled_state = {"followup_text": "", "canonical_text": "", "canonical_text_source": ""}
+    final_text_source = "stream_final" if str(final_text or "").strip() else ""
+    final_text_fallback_reason = ""
+    followup_text_source = "stream_followup" if str(followup_text or "").strip() else ""
+    followup_text_fallback_reason = ""
+    suppressed_fallback_reason = ""
     if not followup_text:
         polled_state = _poll_scheduler_followup(
             task,
@@ -1227,18 +1284,38 @@ def _run_scheduler_generation(
             timeout_s,
         )
         followup_text = polled_state.get("followup_text", "").strip()
+        if followup_text:
+            followup_text_source = str(polled_state.get("followup_text_source") or "followup").strip()
+            followup_text_fallback_reason = str(
+                polled_state.get("followup_text_fallback_reason") or ""
+            ).strip()
 
     canonical_text = polled_state.get("canonical_text", "").strip()
+    canonical_text_source = str(polled_state.get("canonical_text_source") or "").strip()
+    canonical_text_fallback_reason = str(
+        polled_state.get("canonical_text_fallback_reason") or ""
+    ).strip()
     if canonical_text and _is_suppressed_generated_text(final_text, _sanitize_scheduled_text):
         final_text = canonical_text
+        final_text_source = canonical_text_source or "canonical_parent"
+        final_text_fallback_reason = canonical_text_fallback_reason
+    elif not canonical_text and _is_fallback_text_source(canonical_text_source):
+        suppressed_fallback_reason = _fallback_reason(canonical_text_fallback_reason)
     if _texts_match_after_sanitization(final_text, followup_text, _sanitize_scheduled_text):
         followup_text = ""
+        followup_text_source = ""
+        followup_text_fallback_reason = ""
 
     return {
         "conversation_id": resolved_conversation_id,
         "response_message_id": response_message_id or None,
         "final_text": final_text.strip(),
         "followup_text": followup_text.strip(),
+        "final_text_source": final_text_source,
+        "final_text_fallback_reason": final_text_fallback_reason,
+        "followup_text_source": followup_text_source,
+        "followup_text_fallback_reason": followup_text_fallback_reason,
+        "suppressed_fallback_reason": suppressed_fallback_reason,
     }
 
 
@@ -1250,11 +1327,12 @@ def _poll_telegram_followup(
     telegram_user_id: str,
     telegram_chat_id: str,
     conversation_id: Optional[str],
+    schedule_id: Optional[str],
     secret: str,
     http_timeout_s: int,
 ) -> Dict[str, str]:
     if not message_id:
-        return {"followup_text": "", "canonical_text": ""}
+        return {"followup_text": "", "canonical_text": "", "canonical_text_source": ""}
 
     interval_s = _parse_positive_float(
         os.getenv("SCHEDULER_TELEGRAM_FOLLOWUP_INTERVAL_S")
@@ -1282,6 +1360,8 @@ def _poll_telegram_followup(
     params = {"telegramUserId": telegram_user_id, "telegramChatId": telegram_chat_id}
     if conversation_id and conversation_id != "new":
         params["conversationId"] = conversation_id
+    if schedule_id:
+        params["scheduleId"] = str(schedule_id)
     url = f"{base_url}/api/viventium/telegram/cortex/{message_id}?{urllib.parse.urlencode(params)}"
 
     return _poll_followup_state(
@@ -1614,7 +1694,12 @@ def _dispatch_telegram(
         raw_followup_text = followup_text.strip() if isinstance(followup_text, str) else ""
         followup_text = ""
 
-    polled_state = {"followup_text": "", "canonical_text": ""}
+    polled_state = {"followup_text": "", "canonical_text": "", "canonical_text_source": ""}
+    final_text_source = "stream_final" if str(final_text or "").strip() else ""
+    final_text_fallback_reason = ""
+    followup_text_source = "stream_followup" if str(followup_text or "").strip() else ""
+    followup_text_fallback_reason = ""
+    suppressed_fallback_reason = ""
     if not followup_text and not followup_suppressed:
         polled_state = _poll_telegram_followup(
             base_url,
@@ -1622,6 +1707,7 @@ def _dispatch_telegram(
             str(telegram_user_id),
             str(telegram_chat_id),
             resolved_conversation_id,
+            str(task.get("id") or ""),
             secret,
             timeout_s,
         )
@@ -1629,6 +1715,10 @@ def _dispatch_telegram(
         if isinstance(polled_followup_text, str) and polled_followup_text.strip():
             followup_text = polled_followup_text
             raw_followup_text = polled_followup_text.strip()
+            followup_text_source = str(polled_state.get("followup_text_source") or "followup").strip()
+            followup_text_fallback_reason = str(
+                polled_state.get("followup_text_fallback_reason") or ""
+            ).strip()
     followup_text = strip_trailing_nta(followup_text) if followup_text else followup_text
     followup_text = _sanitize_telegram_text(followup_text) if followup_text else followup_text
     followup_suppressed = followup_suppressed or is_no_response_only(followup_text)
@@ -1638,18 +1728,34 @@ def _dispatch_telegram(
         followup_text = ""
 
     canonical_final_text = polled_state.get("canonical_text", "").strip()
+    canonical_final_source = str(polled_state.get("canonical_text_source") or "").strip()
+    canonical_final_fallback_reason = str(
+        polled_state.get("canonical_text_fallback_reason") or ""
+    ).strip()
     if canonical_final_text and _is_suppressed_generated_text(final_text, _sanitize_telegram_text):
         final_text = _sanitize_telegram_text(strip_trailing_nta(canonical_final_text))
         raw_final_text = final_text.strip()
         suppress_final = False
         final_suppress_reason = ""
+        final_text_source = canonical_final_source or "canonical_parent"
+        final_text_fallback_reason = canonical_final_fallback_reason
+    elif not canonical_final_text and _is_fallback_text_source(canonical_final_source):
+        suppressed_fallback_reason = _fallback_reason(canonical_final_fallback_reason)
     if _texts_match_after_sanitization(final_text, followup_text, _sanitize_telegram_text):
         followup_text = ""
         raw_followup_text = ""
         followup_suppressed = False
         followup_suppress_reason = ""
+        followup_text_source = ""
+        followup_text_fallback_reason = ""
 
     heartbeat_keepalive_sent = False
+    if (
+        suppress_final
+        and suppressed_fallback_reason
+    ):
+        final_suppress_reason = suppressed_fallback_reason
+
     if (
         suppress_final
         and final_suppress_reason == "nta"
@@ -1718,8 +1824,16 @@ def _dispatch_telegram(
             followup_suppress_reason,
         )
     if sent_final or sent_followup:
-        outcome = "sent"
-        reason = "heartbeat_keepalive" if heartbeat_keepalive_sent else "delivered"
+        fallback_delivered = (
+            (sent_final and _is_fallback_text_source(final_text_source))
+            or (sent_followup and _is_fallback_text_source(followup_text_source))
+        )
+        if fallback_delivered:
+            outcome = "fallback_delivered"
+            reason = _fallback_reason(final_text_fallback_reason or followup_text_fallback_reason)
+        else:
+            outcome = "sent"
+            reason = "heartbeat_keepalive" if heartbeat_keepalive_sent else "delivered"
     elif raw_final_text or raw_followup_text:
         outcome = "suppressed"
         if raw_final_text and not sent_final:
@@ -1746,6 +1860,9 @@ def _dispatch_telegram(
             "sent_final": sent_final,
             "sent_followup": sent_followup,
             "response_message_id": response_message_id or None,
+            "final_text_source": final_text_source,
+            "followup_text_source": followup_text_source,
+            "fallback_delivered": outcome == "fallback_delivered",
         },
         # === VIVENTIUM NOTE ===
     }
@@ -1768,6 +1885,11 @@ def _prepare_generated_visibility(
     task: Dict[str, Any],
     final_text: str,
     followup_text: str,
+    final_text_source: str = "",
+    final_text_fallback_reason: str = "",
+    followup_text_source: str = "",
+    followup_text_fallback_reason: str = "",
+    suppressed_fallback_reason: str = "",
 ) -> Dict[str, Any]:
     raw_final_text = final_text.strip() if isinstance(final_text, str) else ""
     raw_followup_text = followup_text.strip() if isinstance(followup_text, str) else ""
@@ -1778,6 +1900,8 @@ def _prepare_generated_visibility(
     final_suppress_reason = "nta" if is_no_response_only(final_text) else "empty"
     if suppress_final:
         final_text = ""
+    if suppress_final and suppressed_fallback_reason:
+        final_suppress_reason = _fallback_reason(suppressed_fallback_reason)
 
     followup_text = strip_trailing_nta(followup_text) if followup_text else followup_text
     followup_text = _sanitize_scheduled_text(followup_text) if followup_text else followup_text
@@ -1807,6 +1931,8 @@ def _prepare_generated_visibility(
             followup_suppressed = False
             followup_suppress_reason = ""
             heartbeat_keepalive_sent = True
+            followup_text_source = "heartbeat_keepalive"
+            followup_text_fallback_reason = ""
             logger.info(
                 "[scheduling-cortex] Heartbeat keepalive override sent: task_id=%s prior_streak=%s threshold=%s",
                 task.get("id") or "unknown",
@@ -1837,6 +1963,13 @@ def _prepare_generated_visibility(
             raw_followup_text,
             followup_suppress_reason,
         )
+    fallback_delivered = (
+        (bool(final_visible_text) and _is_fallback_text_source(final_text_source))
+        or (bool(followup_visible_text) and _is_fallback_text_source(followup_text_source))
+    )
+    fallback_reason = ""
+    if fallback_delivered:
+        fallback_reason = _fallback_reason(final_text_fallback_reason or followup_text_fallback_reason)
 
     return {
         "raw_final_text": raw_final_text,
@@ -1847,6 +1980,10 @@ def _prepare_generated_visibility(
         "followup_suppress_reason": followup_suppress_reason,
         "generated_text": generated_text,
         "heartbeat_keepalive_sent": heartbeat_keepalive_sent,
+        "final_text_source": final_text_source,
+        "followup_text_source": followup_text_source,
+        "fallback_delivered": fallback_delivered,
+        "fallback_reason": fallback_reason,
     }
 
 
@@ -1859,8 +1996,12 @@ def _build_librechat_delivery_detail(visibility: Dict[str, Any]) -> Dict[str, An
     followup_suppress_reason = visibility.get("followup_suppress_reason") or ""
 
     if final_visible_text or followup_visible_text:
-        outcome = "sent"
-        reason = "heartbeat_keepalive" if visibility.get("heartbeat_keepalive_sent") else "delivered"
+        if visibility.get("fallback_delivered"):
+            outcome = "fallback_delivered"
+            reason = _fallback_reason(visibility.get("fallback_reason"))
+        else:
+            outcome = "sent"
+            reason = "heartbeat_keepalive" if visibility.get("heartbeat_keepalive_sent") else "delivered"
     elif raw_final_text or raw_followup_text:
         outcome = "suppressed"
         if raw_final_text:
@@ -1888,6 +2029,9 @@ def _build_librechat_delivery_detail(visibility: Dict[str, Any]) -> Dict[str, An
         or _suppressed_marker(raw_final_text, final_suppress_reason),
         "followup_generated_text": followup_visible_text
         or _suppressed_marker(raw_followup_text, followup_suppress_reason),
+        "final_text_source": visibility.get("final_text_source") or "",
+        "followup_text_source": visibility.get("followup_text_source") or "",
+        "fallback_delivered": bool(visibility.get("fallback_delivered")),
     }
 
 
@@ -1944,8 +2088,12 @@ def _deliver_telegram_generated_text(
         return None
 
     if sent_final or sent_followup:
-        outcome = "sent"
-        reason = "heartbeat_keepalive" if visibility.get("heartbeat_keepalive_sent") else "delivered"
+        if visibility.get("fallback_delivered"):
+            outcome = "fallback_delivered"
+            reason = _fallback_reason(visibility.get("fallback_reason"))
+        else:
+            outcome = "sent"
+            reason = "heartbeat_keepalive" if visibility.get("heartbeat_keepalive_sent") else "delivered"
     elif raw_final_text or raw_followup_text:
         outcome = "suppressed"
         if raw_final_text and not sent_final:
@@ -1968,6 +2116,9 @@ def _deliver_telegram_generated_text(
         "sent_final": sent_final,
         "sent_followup": sent_followup,
         "response_message_id": response_message_id or None,
+        "final_text_source": visibility.get("final_text_source") or "",
+        "followup_text_source": visibility.get("followup_text_source") or "",
+        "fallback_delivered": bool(visibility.get("fallback_delivered")),
     }
 
 
@@ -1991,6 +2142,11 @@ def dispatch_task(task: Dict[str, Any]) -> Dict[str, Any]:
         task,
         str(generation_result.get("final_text") or ""),
         str(generation_result.get("followup_text") or ""),
+        final_text_source=str(generation_result.get("final_text_source") or ""),
+        final_text_fallback_reason=str(generation_result.get("final_text_fallback_reason") or ""),
+        followup_text_source=str(generation_result.get("followup_text_source") or ""),
+        followup_text_fallback_reason=str(generation_result.get("followup_text_fallback_reason") or ""),
+        suppressed_fallback_reason=str(generation_result.get("suppressed_fallback_reason") or ""),
     )
 
     if "librechat" in channels:
@@ -2042,8 +2198,10 @@ def dispatch_task(task: Dict[str, Any]) -> Dict[str, Any]:
     delivery_by_channel: Dict[str, Dict[str, Any]] = {}
     generated_text: Optional[str] = None
     saw_sent = False
+    saw_fallback_delivered = False
     saw_heartbeat_keepalive = False
     suppress_reasons: list[str] = []
+    fallback_reasons: list[str] = []
     saw_non_failed = False
     for channel, result in channel_results.items():
         detail = result.get("delivery") if isinstance(result, dict) else None
@@ -2056,6 +2214,11 @@ def dispatch_task(task: Dict[str, Any]) -> Dict[str, Any]:
                 saw_non_failed = True
                 if reason == "heartbeat_keepalive":
                     saw_heartbeat_keepalive = True
+            elif outcome == "fallback_delivered":
+                saw_fallback_delivered = True
+                saw_non_failed = True
+                if reason:
+                    fallback_reasons.append(f"{channel}:{reason}")
             elif outcome == "suppressed":
                 saw_non_failed = True
                 if reason:
@@ -2069,6 +2232,9 @@ def dispatch_task(task: Dict[str, Any]) -> Dict[str, Any]:
     if saw_sent:
         delivery_outcome = "sent"
         delivery_reason = "heartbeat_keepalive" if saw_heartbeat_keepalive else "delivered"
+    elif saw_fallback_delivered:
+        delivery_outcome = "fallback_delivered"
+        delivery_reason = "; ".join(fallback_reasons) if fallback_reasons else "deferred_fallback"
     elif saw_non_failed:
         delivery_outcome = "suppressed"
         delivery_reason = "; ".join(suppress_reasons) if suppress_reasons else "suppressed"

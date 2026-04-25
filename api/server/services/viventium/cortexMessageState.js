@@ -147,9 +147,32 @@ function resolveDeferredFallbackCanonicalText({
   canonicalText,
   cortexParts,
   configuredHoldTexts = [],
+  scheduleId = '',
+}) {
+  return resolveDeferredFallbackCanonicalTextState({
+    message,
+    followUp,
+    canonicalText,
+    cortexParts,
+    configuredHoldTexts,
+    scheduleId,
+  }).canonicalText;
+}
+
+function resolveDeferredFallbackCanonicalTextState({
+  message,
+  followUp,
+  canonicalText,
+  cortexParts,
+  configuredHoldTexts = [],
+  scheduleId = '',
 }) {
   if (followUp || hasActiveCortexParts(cortexParts)) {
-    return canonicalText || null;
+    return {
+      canonicalText: canonicalText || null,
+      canonicalTextSource: canonicalText ? 'message' : '',
+      canonicalTextFallbackReason: '',
+    };
   }
 
   const runtimeHoldText = hasRuntimeHoldText(message?.content);
@@ -161,7 +184,11 @@ function resolveDeferredFallbackCanonicalText({
     !canonicalText ||
     isPlaceholderCanonicalText(canonicalText);
   if (!needsFallback) {
-    return canonicalText || null;
+    return {
+      canonicalText: canonicalText || null,
+      canonicalTextSource: canonicalText ? 'message' : '',
+      canonicalTextFallbackReason: '',
+    };
   }
 
   const insightCandidates = Array.isArray(cortexParts)
@@ -185,13 +212,21 @@ function resolveDeferredFallbackCanonicalText({
   });
 
   if (!fallbackText) {
-    return getDeferredFallbackErrorText();
+    return {
+      canonicalText: getDeferredFallbackErrorText({ scheduleId }),
+      canonicalTextSource: 'deferred_fallback',
+      canonicalTextFallbackReason: 'empty_deferred_response',
+    };
   }
 
   logger.warn(
     `[cortexMessageState] Resolved deferred fallback canonical text for message ${message?.messageId || ''}`,
   );
-  return fallbackText;
+  return {
+    canonicalText: fallbackText,
+    canonicalTextSource: 'deferred_fallback',
+    canonicalTextFallbackReason: 'insight_fallback',
+  };
 }
 
 async function resolveConfiguredHoldTextsForMessage(message) {
@@ -245,7 +280,7 @@ async function getFollowUpMessageForParent({ userId, conversationId, parentMessa
   };
 }
 
-async function getCortexMessageState({ userId, messageId, conversationId }) {
+async function getCortexMessageState({ userId, messageId, conversationId, scheduleId = '' }) {
   if (typeof userId !== 'string' || userId.length === 0) {
     throw new Error('getCortexMessageState requires userId');
   }
@@ -275,13 +310,15 @@ async function getCortexMessageState({ userId, messageId, conversationId }) {
   }
 
   const configuredHoldTexts = await resolveConfiguredHoldTextsForMessage(message);
-  canonicalText = resolveDeferredFallbackCanonicalText({
+  const canonicalState = resolveDeferredFallbackCanonicalTextState({
     message,
     followUp,
     canonicalText,
     cortexParts,
     configuredHoldTexts,
+    scheduleId,
   });
+  canonicalText = canonicalState.canonicalText;
 
   return {
     messageId: message.messageId,
@@ -289,6 +326,8 @@ async function getCortexMessageState({ userId, messageId, conversationId }) {
     cortexParts,
     followUp,
     canonicalText,
+    canonicalTextSource: canonicalState.canonicalTextSource,
+    canonicalTextFallbackReason: canonicalState.canonicalTextFallbackReason,
   };
 }
 
@@ -300,4 +339,5 @@ module.exports = {
   hasActiveCortexParts,
   isPlaceholderCanonicalText,
   resolveDeferredFallbackCanonicalText,
+  resolveDeferredFallbackCanonicalTextState,
 };

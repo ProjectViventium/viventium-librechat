@@ -194,6 +194,58 @@ describe('viventium-agent-runtime-models', () => {
     ).toBe(false);
   });
 
+  test('buildCanonicalPersistedAgentFields prunes runtime-disabled tools from preserved live tool arrays', () => {
+    const existingAgent = {
+      id: 'agent_viventium_main_95aeb3',
+      provider: 'anthropic',
+      model: 'claude-opus-4-7',
+      tools: [
+        'sys__server__sys_mcp_scheduling-cortex',
+        'file_search',
+        'web_search',
+        'search_gmail_messages_mcp_google_workspace',
+      ],
+      model_parameters: {
+        model: 'claude-opus-4-7',
+      },
+    };
+
+    const runtimeAgent = {
+      id: 'agent_viventium_main_95aeb3',
+      provider: 'anthropic',
+      model: 'claude-opus-4-7',
+      tools: [
+        'sys__server__sys_mcp_scheduling-cortex',
+        'schedule_create_mcp_scheduling-cortex',
+        'file_search',
+        'web_search',
+        'search_gmail_messages_mcp_google_workspace',
+      ],
+      model_parameters: {
+        model: 'claude-opus-4-7',
+      },
+    };
+
+    const patch = buildCanonicalPersistedAgentFields(runtimeAgent, existingAgent, {
+      env: {
+        START_GOOGLE_MCP: 'false',
+        START_MS365_MCP: 'false',
+        START_GLASSHIVE: 'false',
+        START_CODE_INTERPRETER: 'false',
+        VIVENTIUM_WEB_SEARCH_ENABLED: 'false',
+      },
+    });
+
+    expect(patch).toEqual({
+      provider: 'anthropic',
+      model: 'claude-opus-4-7',
+      tools: ['sys__server__sys_mcp_scheduling-cortex', 'file_search'],
+      model_parameters: {
+        model: 'claude-opus-4-7',
+      },
+    });
+  });
+
   test('clears stale voice parameter bags when the runtime bundle removes the voice override', () => {
     const existingAgent = {
       id: 'agent_viventium_main_95aeb3',

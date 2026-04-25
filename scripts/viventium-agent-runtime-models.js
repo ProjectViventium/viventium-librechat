@@ -425,7 +425,22 @@ function rewriteBackgroundCortices(backgroundCortices, { env = process.env } = {
   });
 }
 
-function buildCanonicalPersistedAgentFields(agent, existingAgent = null) {
+function resolveCanonicalRuntimeTools(agent, existingAgent = null, { env = process.env } = {}) {
+  const sourceTools = Array.isArray(existingAgent?.tools)
+    ? deepClone(existingAgent.tools)
+    : Array.isArray(agent?.tools)
+      ? deepClone(agent.tools)
+      : null;
+
+  if (sourceTools == null) {
+    return null;
+  }
+
+  // Preserve the live tool array unless the current runtime cannot back a tool at all.
+  return pruneUnavailableTools({ tools: sourceTools }, { env }).tools;
+}
+
+function buildCanonicalPersistedAgentFields(agent, existingAgent = null, { env = process.env } = {}) {
   if (!agent || typeof agent !== 'object') {
     return null;
   }
@@ -475,6 +490,11 @@ function buildCanonicalPersistedAgentFields(agent, existingAgent = null) {
     if (Object.keys(mergedModelParameters).length > 0) {
       patch.model_parameters = mergedModelParameters;
     }
+  }
+
+  const canonicalTools = resolveCanonicalRuntimeTools(agent, existingAgent, { env });
+  if (canonicalTools !== null) {
+    patch.tools = canonicalTools;
   }
 
   if (Object.prototype.hasOwnProperty.call(agent, 'voice_llm_provider')) {

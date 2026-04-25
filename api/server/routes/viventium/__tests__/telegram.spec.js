@@ -475,18 +475,19 @@ describe('/api/viventium/telegram', () => {
   test('POST existing convo resolves parentMessageId from the latest leaf, not the latest createdAt row', async () => {
     const telegramRouter = require('../telegram');
     const app = createTestApp(telegramRouter);
+    const nowMs = Date.now();
     mockGetConvo.mockResolvedValueOnce({ conversationId: 'conv-1', endpoint: 'agents' });
     mockGetMessages.mockResolvedValueOnce([
       {
         messageId: 'prior-user',
         parentMessageId: '00000000-0000-0000-0000-000000000000',
-        createdAt: '2026-03-26T20:07:52.610Z',
+        createdAt: new Date(nowMs).toISOString(),
         isCreatedByUser: true,
       },
       {
         messageId: 'assistant-leaf',
         parentMessageId: 'prior-user',
-        createdAt: '2026-03-26T20:07:52.602Z',
+        createdAt: new Date(nowMs - 8).toISOString(),
         isCreatedByUser: false,
       },
     ]);

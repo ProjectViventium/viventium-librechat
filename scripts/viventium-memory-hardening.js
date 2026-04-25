@@ -43,7 +43,12 @@ const DEFAULT_VALID_KEYS = [
   'drafts',
 ];
 const DEFAULT_TOKEN_LIMIT = 8000;
-const DEFAULT_MAX_INPUT_CHARS = 120000;
+const DEFAULT_MAX_INPUT_CHARS = 500000;
+
+function parseBool(value, fallback = false) {
+  if (value === undefined || value === null || value === '') return fallback;
+  return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
+}
 
 function parseArgs(argv = process.argv.slice(2)) {
   const options = {
@@ -53,6 +58,10 @@ function parseArgs(argv = process.argv.slice(2)) {
     maxChangesPerUser: Number(process.env.VIVENTIUM_MEMORY_HARDENING_MAX_CHANGES_PER_USER || 3),
     maxInputChars: Number(
       process.env.VIVENTIUM_MEMORY_HARDENING_MAX_INPUT_CHARS || DEFAULT_MAX_INPUT_CHARS,
+    ),
+    requireFullLookback: parseBool(
+      process.env.VIVENTIUM_MEMORY_HARDENING_REQUIRE_FULL_LOOKBACK,
+      true,
     ),
     allowDelete: false,
     ignoreIdleGate: false,
@@ -102,6 +111,7 @@ function parseArgs(argv = process.argv.slice(2)) {
     } else if (arg === '--allow-delete') options.allowDelete = true;
     else if (arg === '--ignore-idle-gate') options.ignoreIdleGate = true;
     else if (arg === '--skip-model-probe') options.skipModelProbe = true;
+    else if (arg === '--allow-partial-lookback') options.requireFullLookback = false;
     else if (arg === '--json') options.json = true;
     else if (arg === '--help' || arg === '-h') options.help = true;
     else throw new Error(`Unknown memory hardening option: ${arg}`);
@@ -125,6 +135,8 @@ Options:
   --lookback-days <n>               Default: 7
   --min-user-idle-minutes <n>       Default: 60
   --max-changes-per-user <n>        Default: 3
+  --max-input-chars <n>             Default: 500000
+  --allow-partial-lookback          Allow oldest messages to be omitted when input cap is hit
   --ignore-idle-gate               Manual QA override only
 `;
 }
@@ -135,12 +147,36 @@ function safeJsonWrite(filePath, payload, mode = 0o600) {
   fs.chmodSync(filePath, mode);
 }
 
+function safeJsonlWrite(filePath, events, mode = 0o600) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(filePath, `${events.map((event) => JSON.stringify(event)).join('\n')}\n`, {
+    mode,
+  });
+  fs.chmodSync(filePath, mode);
+}
+
+function safeJsonlAppend(filePath, events, mode = 0o600) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
+  fs.appendFileSync(filePath, `${events.map((event) => JSON.stringify(event)).join('\n')}\n`, {
+    mode,
+  });
+  fs.chmodSync(filePath, mode);
+}
+
 function readJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, 'utf8'));
 }
 
 function userHash(userId) {
   return crypto.createHash('sha256').update(String(userId)).digest('hex').slice(0, 16);
+}
+
+function contentHash(value) {
+  return crypto
+    .createHash('sha256')
+    .update(String(value || ''))
+    .digest('hex')
+    .slice(0, 16);
 }
 
 function makeRunId(date = new Date()) {
@@ -478,20 +514,76 @@ function invokeModel({ prompt, provider, model }) {
   throw new Error('No supported memory hardening provider is configured');
 }
 
-function clipMessagesForPrompt(messages, maxChars) {
-  let remaining = Number.isFinite(maxChars) && maxChars > 0 ? maxChars : DEFAULT_MAX_INPUT_CHARS;
+function messageInputCost(message) {
+  return String(message.text || '').length + 256;
+}
+
+function selectMessagesForPrompt(messages, maxChars) {
+  const cap = Number.isFinite(maxChars) && maxChars > 0 ? maxChars : DEFAULT_MAX_INPUT_CHARS;
+  let usedChars = 0;
   const selected = [];
   for (const message of messages.slice().reverse()) {
-    const text = String(message.text || '');
-    const cost = text.length + 256;
-    if (selected.length > 0 && remaining - cost < 0) break;
-    selected.push({
-      ...message,
-      text: text.length > remaining ? text.slice(-remaining) : text,
-    });
-    remaining -= Math.min(cost, remaining);
+    const cost = messageInputCost(message);
+    if (selected.length > 0 && usedChars + cost > cap) break;
+    if (selected.length === 0 && cost > cap) {
+      selected.push({
+        ...message,
+        text: String(message.text || '').slice(0, Math.max(cap - 256, 0)),
+      });
+      usedChars = cap;
+      break;
+    }
+    selected.push(message);
+    usedChars += cost;
   }
-  return selected.reverse();
+  return {
+    messages: selected.reverse(),
+    maxInputChars: cap,
+    estimatedInputChars: messages.reduce((total, message) => total + messageInputCost(message), 0),
+    selectedInputChars: usedChars,
+    omittedMessages: Math.max(messages.length - selected.length, 0),
+    complete: selected.length === messages.length,
+  };
+}
+
+function promptTelemetry({ messages, promptSelection, memories, memoryConfig, prompt }) {
+  const conversationIds = new Set(
+    messages.map((message) => message.conversationId).filter(Boolean),
+  );
+  const selectedConversationIds = new Set(
+    promptSelection.messages.map((message) => message.conversationId).filter(Boolean),
+  );
+  const memoryPayload = JSON.stringify(
+    memories
+      .map((entry) => ({
+        key: entry.key,
+        value: entry.value || '',
+        tokenCount: entry.tokenCount || 0,
+      }))
+      .sort((left, right) => String(left.key).localeCompare(String(right.key))),
+  );
+  return {
+    memory_instructions_present: Boolean(memoryConfig.instructions),
+    memory_instructions_chars: String(memoryConfig.instructions || '').length,
+    memory_instructions_hash: contentHash(memoryConfig.instructions || ''),
+    valid_key_count: memoryConfig.validKeys.length,
+    current_memory_key_count: memories.length,
+    current_memory_token_total: memories.reduce(
+      (total, entry) => total + Number(entry.tokenCount || 0),
+      0,
+    ),
+    current_memory_hash: contentHash(memoryPayload),
+    messages_in_lookback: messages.length,
+    messages_fed_to_model: promptSelection.messages.length,
+    messages_omitted_for_input_cap: promptSelection.omittedMessages,
+    lookback_complete: promptSelection.complete,
+    conversation_count_in_lookback: conversationIds.size,
+    conversation_count_fed_to_model: selectedConversationIds.size,
+    estimated_input_chars: promptSelection.estimatedInputChars,
+    selected_input_chars: promptSelection.selectedInputChars,
+    max_input_chars: promptSelection.maxInputChars,
+    prompt_chars: String(prompt || '').length,
+  };
 }
 
 function validateProposal({ proposal, memories, memoryConfig, options }) {
@@ -587,6 +679,7 @@ function redactedUserSummary({
   rejected = [],
   messageCount = 0,
   reason = null,
+  telemetry = null,
 }) {
   return {
     user_id_hash: userHash(user._id),
@@ -595,6 +688,7 @@ function redactedUserSummary({
     rejected_count: rejected.length,
     message_count: messageCount,
     reason,
+    telemetry,
   };
 }
 
@@ -658,18 +752,55 @@ async function buildUserProposal({ db, methods, user, options, memoryConfig, now
   }
 
   const memories = await methods.getAllUserMemories(user._id);
+  const promptSelection = selectMessagesForPrompt(messages, options.maxInputChars);
+  if (!promptSelection.complete && options.requireFullLookback) {
+    const telemetry = promptTelemetry({
+      messages,
+      promptSelection,
+      memories,
+      memoryConfig,
+      prompt: '',
+    });
+    return {
+      status: 'skipped',
+      reason: 'input_cap_exceeded',
+      summary: redactedUserSummary({
+        user,
+        status: 'skipped',
+        reason: 'input_cap_exceeded',
+        messageCount: messages.length,
+        telemetry,
+      }),
+      privateProposal: { userIdHash: userHash(user._id), operations: [] },
+    };
+  }
   let proposal;
+  let telemetry;
   if (options.proposalFile) {
     proposal = readJson(options.proposalFile);
+    telemetry = promptTelemetry({
+      messages,
+      promptSelection,
+      memories,
+      memoryConfig,
+      prompt: '',
+    });
   } else {
     const prompt = buildHardenerPrompt({
       user,
       memoryConfig,
       memories,
-      messages: clipMessagesForPrompt(messages, options.maxInputChars),
+      messages: promptSelection.messages,
       now,
       lookbackDays: options.lookbackDays,
       maxChanges: options.maxChangesPerUser,
+    });
+    telemetry = promptTelemetry({
+      messages,
+      promptSelection,
+      memories,
+      memoryConfig,
+      prompt,
     });
     proposal = invokeModel({ prompt, ...providerInfo });
   }
@@ -685,6 +816,7 @@ async function buildUserProposal({ db, methods, user, options, memoryConfig, now
       changedKeys,
       rejected: validation.rejected,
       messageCount: messages.length,
+      telemetry,
     }),
     privateProposal: {
       userIdHash: userHash(user._id),
@@ -845,8 +977,41 @@ async function runHardening(options) {
       users: summaries,
       apply_results: applyResults,
       private_proposal_file: 'proposal.private.json',
+      redacted_log_file: 'run-log.redacted.jsonl',
     };
     safeJsonWrite(path.join(runDir, 'summary.json'), summary, 0o600);
+    safeJsonlWrite(path.join(runDir, 'run-log.redacted.jsonl'), [
+      {
+        event: 'run_started',
+        run_id: runId,
+        mode: options.mode,
+        provider: providerInfo.provider,
+        model: providerInfo.model,
+        lookback_days: options.lookbackDays,
+        require_full_lookback: options.requireFullLookback,
+        max_input_chars: options.maxInputChars,
+        memory_instructions_present: Boolean(memoryConfig.instructions),
+        memory_instructions_chars: String(memoryConfig.instructions || '').length,
+        memory_instructions_hash: contentHash(memoryConfig.instructions || ''),
+      },
+      ...summaries.map((summaryItem) => ({
+        event: 'user_processed',
+        run_id: runId,
+        user_id_hash: summaryItem.user_id_hash,
+        status: summaryItem.status,
+        reason: summaryItem.reason,
+        changed_keys: summaryItem.changed_keys,
+        rejected_count: summaryItem.rejected_count,
+        telemetry: summaryItem.telemetry,
+      })),
+      {
+        event: 'run_finished',
+        run_id: runId,
+        mode: options.mode,
+        user_count: summaries.length,
+        applied_user_count: applyResults.length,
+      },
+    ]);
     return summary;
   } finally {
     releaseLock();
@@ -882,8 +1047,17 @@ async function applyExistingRun(options) {
       mode: 'apply',
       applied_at: new Date().toISOString(),
       apply_results: applyResults,
+      redacted_log_file: 'run-log.redacted.jsonl',
     };
     safeJsonWrite(summaryPath, nextSummary, 0o600);
+    safeJsonlAppend(path.join(runDir, 'run-log.redacted.jsonl'), [
+      {
+        event: 'apply_existing_run',
+        run_id: options.runId,
+        applied_user_count: applyResults.length,
+        apply_results: applyResults,
+      },
+    ]);
     return nextSummary;
   } finally {
     releaseLock();
@@ -980,9 +1154,11 @@ if (require.main === module) {
 module.exports = {
   DEFAULT_VALID_KEYS,
   buildHardenerPrompt,
+  buildUserProposal,
   parseArgs,
   proposalSchema,
   resolveProvider,
+  selectMessagesForPrompt,
   validateProposal,
   userHash,
 };

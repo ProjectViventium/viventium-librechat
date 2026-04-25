@@ -9,7 +9,7 @@ import logging
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from croniter import croniter
 
@@ -18,6 +18,11 @@ from .utils import ensure_timezone, parse_time, parse_iso, to_utc_iso, normalize
 from .storage import ScheduleStorage
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_CATCH_UP_MAX_LATE_S = 12 * 60 * 60
+HARD_CATCH_UP_MAX_LATE_S = 24 * 60 * 60
+MISFIRE_POLICY_KEY = "misfire_policy"
+SCHEDULER_MISFIRE_KEY = "scheduler_misfire"
 
 DEFERRED_FALLBACK_REASON_MARKERS = (
     "deferred_fallback",
@@ -121,6 +126,140 @@ def _heartbeat_metadata_after_delivery(
     return metadata
 
 
+# === VIVENTIUM NOTE ===
+# Feature: Structured misfire policy and late-reminder catch-up.
+# Purpose: User-created one-time reminders should not disappear silently after
+# a sleeping/local runtime wakes late. This uses task metadata and structural
+# task fields only; it must never inspect prompt text or human-facing labels.
+# === VIVENTIUM NOTE ===
+def _coerce_int(value: object, default: int) -> int:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def _clamp_late_window(value: object, default: int) -> int:
+    parsed = _coerce_int(value, default)
+    if parsed < 0:
+        return 0
+    return min(parsed, HARD_CATCH_UP_MAX_LATE_S)
+
+
+def _schedule_timezone(schedule: Dict[str, object]) -> str:
+    return str(schedule.get("timezone") or "UTC")
+
+
+def _format_local_due(schedule: Dict[str, object], due_at: datetime) -> str:
+    tz_name = _schedule_timezone(schedule)
+    try:
+        tz = ensure_timezone(tz_name)
+    except Exception:
+        tz = timezone.utc
+        tz_name = "UTC"
+    local_due = due_at.astimezone(tz)
+    return f"{local_due.strftime('%Y-%m-%d %H:%M')} {tz_name}"
+
+
+def _late_minutes(late_seconds: int) -> int:
+    if late_seconds <= 0:
+        return 0
+    return max(1, int(round(late_seconds / 60)))
+
+
+def _default_misfire_mode(task: Dict[str, object]) -> str:
+    schedule = task.get("schedule") if isinstance(task.get("schedule"), dict) else {}
+    if _is_heartbeat_task(task):
+        return "strict"
+    if (
+        isinstance(schedule, dict)
+        and schedule.get("type") == "once"
+        and str(task.get("created_source") or "").strip().lower() == "user"
+    ):
+        return "catch_up"
+    return "strict"
+
+
+def _resolve_misfire_policy(task: Dict[str, object], default_catch_up_max_late_s: int) -> Dict[str, Any]:
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    raw_policy = metadata.get(MISFIRE_POLICY_KEY) if isinstance(metadata, dict) else None
+
+    mode = ""
+    max_late_s: Optional[int] = None
+    if isinstance(raw_policy, dict):
+        mode = str(raw_policy.get("mode") or raw_policy.get("action") or "").strip().lower()
+        if raw_policy.get("max_late_s") is not None:
+            max_late_s = _clamp_late_window(
+                raw_policy.get("max_late_s"),
+                default_catch_up_max_late_s,
+            )
+    elif isinstance(raw_policy, str):
+        mode = raw_policy.strip().lower()
+
+    if mode in {"skip", "miss", "missed"}:
+        mode = "strict"
+    if mode not in {"catch_up", "strict"}:
+        mode = _default_misfire_mode(task)
+
+    if max_late_s is None:
+        max_late_s = _clamp_late_window(default_catch_up_max_late_s, DEFAULT_CATCH_UP_MAX_LATE_S)
+
+    return {
+        "mode": mode,
+        "max_late_s": max_late_s,
+    }
+
+
+def _late_delivery_metadata(
+    task: Dict[str, object],
+    due_at: datetime,
+    now: datetime,
+    late_seconds: int,
+    policy: Dict[str, Any],
+) -> Dict[str, object]:
+    schedule = task.get("schedule") if isinstance(task.get("schedule"), dict) else {}
+    schedule_dict = schedule if isinstance(schedule, dict) else {}
+    return {
+        "mode": "catch_up",
+        "policy": policy.get("mode") or "catch_up",
+        "due_at": to_utc_iso(due_at),
+        "due_at_local": _format_local_due(schedule_dict, due_at),
+        "delivered_at": to_utc_iso(now),
+        "late_seconds": late_seconds,
+        "late_minutes": _late_minutes(late_seconds),
+        "max_late_s": policy.get("max_late_s"),
+    }
+
+
+def _with_late_delivery_metadata(
+    task: Dict[str, object],
+    due_at: datetime,
+    now: datetime,
+    late_seconds: int,
+    policy: Dict[str, Any],
+) -> Dict[str, object]:
+    patched = dict(task)
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    patched_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    patched_metadata[SCHEDULER_MISFIRE_KEY] = _late_delivery_metadata(
+        task,
+        due_at,
+        now,
+        late_seconds,
+        policy,
+    )
+    patched["metadata"] = patched_metadata
+    return patched
+
+
+def _scheduler_late_delivery(task: Dict[str, object]) -> Optional[Dict[str, object]]:
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    raw = metadata.get(SCHEDULER_MISFIRE_KEY) if isinstance(metadata, dict) else None
+    if isinstance(raw, dict):
+        return raw
+    return None
+
+
 class SchedulerEngine:
     def __init__(
         self,
@@ -128,11 +267,16 @@ class SchedulerEngine:
         poll_interval_s: int,
         misfire_grace_s: int,
         retry_delay_s: int,
+        catch_up_max_late_s: int = DEFAULT_CATCH_UP_MAX_LATE_S,
     ) -> None:
         self._storage = storage
         self._poll_interval_s = max(1, poll_interval_s)
         self._misfire_grace_s = max(0, misfire_grace_s)
         self._retry_delay_s = max(1, retry_delay_s)
+        self._catch_up_max_late_s = _clamp_late_window(
+            catch_up_max_late_s,
+            DEFAULT_CATCH_UP_MAX_LATE_S,
+        )
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -179,12 +323,37 @@ class SchedulerEngine:
             logger.warning("Invalid next_run_at for task %s", task_id)
             next_run_dt = now
 
-        if now - next_run_dt > timedelta(seconds=self._misfire_grace_s):
-            logger.info("Task %s missed beyond grace window, skipping", task_id)
-            self._update_after_skip(task, now)
-            return
+        late_seconds = max(0, int((now - next_run_dt).total_seconds()))
+        if late_seconds > self._misfire_grace_s:
+            policy = _resolve_misfire_policy(task, self._catch_up_max_late_s)
+            if policy.get("mode") == "catch_up" and late_seconds <= int(policy.get("max_late_s") or 0):
+                logger.info(
+                    "Task %s missed grace by %ss, dispatching catch-up",
+                    task_id,
+                    late_seconds,
+                )
+                task = _with_late_delivery_metadata(task, next_run_dt, now, late_seconds, policy)
+            else:
+                logger.info("Task %s missed beyond grace window, skipping", task_id)
+                reason = (
+                    "catch_up_window_exceeded"
+                    if policy.get("mode") == "catch_up"
+                    else "misfire_grace_exceeded"
+                )
+                self._update_after_skip(
+                    task,
+                    now,
+                    next_run_dt=next_run_dt,
+                    late_seconds=late_seconds,
+                    reason=reason,
+                    policy=policy,
+                )
+                return
 
-        logger.info("Dispatching scheduled task %s", task_id)
+        if late_seconds > self._misfire_grace_s:
+            logger.info("Dispatching scheduled task %s as late catch-up", task_id)
+        else:
+            logger.info("Dispatching scheduled task %s", task_id)
         self._storage.update_task(
             task["user_id"],
             task_id,
@@ -284,6 +453,11 @@ class SchedulerEngine:
                 f"{delivery_reason}; channel_errors: "
                 + "; ".join(f"{ch}: {err}" for ch, err in channel_errors.items())
             )
+        late_delivery = _scheduler_late_delivery(task)
+        if late_delivery is not None:
+            base_delivery["late_delivery"] = late_delivery
+            if updates["last_delivery_reason"] == "delivered":
+                updates["last_delivery_reason"] = "delivered_late"
         updates["last_delivery"] = base_delivery
         # === VIVENTIUM NOTE ===
 
@@ -314,6 +488,9 @@ class SchedulerEngine:
             },
             # === VIVENTIUM NOTE ===
         }
+        late_delivery = _scheduler_late_delivery(task)
+        if late_delivery is not None:
+            updates["last_delivery"]["late_delivery"] = late_delivery
 
         if task["schedule"].get("type") == "once":
             updates["next_run_at"] = to_utc_iso(retry_at)
@@ -325,13 +502,51 @@ class SchedulerEngine:
 
         self._storage.update_task(task["user_id"], task["id"], updates)
 
-    def _update_after_skip(self, task: Dict[str, object], now: datetime) -> None:
+    def _update_after_skip(
+        self,
+        task: Dict[str, object],
+        now: datetime,
+        *,
+        next_run_dt: Optional[datetime] = None,
+        late_seconds: Optional[int] = None,
+        reason: str = "misfire_grace_exceeded",
+        policy: Optional[Dict[str, Any]] = None,
+    ) -> None:
         schedule = task["schedule"]
         next_run = compute_next_run(schedule, now, now)
+        if next_run_dt is None:
+            raw_next = task.get("next_run_at")
+            try:
+                next_run_dt = parse_iso(raw_next, timezone.utc) if raw_next else now
+            except Exception:
+                next_run_dt = now
+        if late_seconds is None:
+            late_seconds = max(0, int((now - next_run_dt).total_seconds()))
+        resolved_policy = policy or _resolve_misfire_policy(task, self._catch_up_max_late_s)
+        delivery = {
+            "outcome": "missed",
+            "reason": reason,
+            "generated_text": None,
+            "due_at": to_utc_iso(next_run_dt),
+            "due_at_local": _format_local_due(schedule, next_run_dt),
+            "missed_at": to_utc_iso(now),
+            "late_seconds": late_seconds,
+            "late_minutes": _late_minutes(late_seconds),
+            "policy": {
+                "mode": resolved_policy.get("mode") or "strict",
+                "max_late_s": resolved_policy.get("max_late_s"),
+            },
+        }
         updates = {
             "last_status": "missed",
+            "last_error": None,
             "updated_at": to_utc_iso(now),
             "next_run_at": to_utc_iso(next_run) if next_run else None,
+            "last_delivery_outcome": "missed",
+            "last_delivery_reason": reason,
+            "last_delivery_at": to_utc_iso(now),
+            "last_generated_text": None,
+            "last_delivery": delivery,
         }
 
         if schedule.get("type") == "once":

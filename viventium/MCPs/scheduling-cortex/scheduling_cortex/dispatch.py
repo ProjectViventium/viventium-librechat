@@ -532,6 +532,40 @@ def _compose_prompt(task: Dict[str, Any]) -> str:
     else:
         composed = f"{prefix}\n\n{base}"
     return _ensure_live_fact_contract(composed)
+
+
+def _scheduler_late_delivery(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    metadata = task.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    late_delivery = metadata.get("scheduler_misfire")
+    if isinstance(late_delivery, dict) and late_delivery.get("mode") == "catch_up":
+        return late_delivery
+    return None
+
+
+def _format_late_delivery_notice(late_delivery: Dict[str, Any]) -> str:
+    due_at = str(late_delivery.get("due_at_local") or late_delivery.get("due_at") or "the original time")
+    try:
+        late_minutes = int(late_delivery.get("late_minutes") or 0)
+    except (TypeError, ValueError):
+        late_minutes = 0
+    if late_minutes <= 0:
+        late_text = "less than a minute late"
+    elif late_minutes == 1:
+        late_text = "1 minute late"
+    else:
+        late_text = f"{late_minutes} minutes late"
+    return f"Late reminder: originally scheduled for {due_at}; delivered {late_text}."
+
+
+def _prepend_late_delivery_notice(text: object, notice: str) -> str:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return ""
+    if cleaned.startswith(notice):
+        return cleaned
+    return f"{notice}\n\n{cleaned}"
 # === VIVENTIUM END ===
 
 
@@ -2016,6 +2050,26 @@ def _prepare_generated_visibility(
     }
 
 
+def _apply_late_delivery_notice(
+    task: Dict[str, Any],
+    visibility: Dict[str, Any],
+) -> Dict[str, Any]:
+    late_delivery = _scheduler_late_delivery(task)
+    if not late_delivery:
+        return visibility
+
+    notice = _format_late_delivery_notice(late_delivery)
+    patched = dict(visibility)
+    if str(patched.get("final_text") or "").strip():
+        patched["final_text"] = _prepend_late_delivery_notice(patched.get("final_text"), notice)
+        patched["generated_text"] = patched["final_text"]
+    elif str(patched.get("followup_text") or "").strip():
+        patched["followup_text"] = _prepend_late_delivery_notice(patched.get("followup_text"), notice)
+        patched["generated_text"] = patched["followup_text"]
+    patched["late_delivery"] = late_delivery
+    return patched
+
+
 def _build_librechat_delivery_detail(visibility: Dict[str, Any]) -> Dict[str, Any]:
     final_visible_text = visibility.get("final_text") or ""
     followup_visible_text = visibility.get("followup_text") or ""
@@ -2049,7 +2103,7 @@ def _build_librechat_delivery_detail(visibility: Dict[str, Any]) -> Dict[str, An
             return cleaned_raw
         return None
 
-    return {
+    detail = {
         "channel": "librechat",
         "outcome": outcome,
         "reason": reason,
@@ -2062,6 +2116,10 @@ def _build_librechat_delivery_detail(visibility: Dict[str, Any]) -> Dict[str, An
         "followup_text_source": visibility.get("followup_text_source") or "",
         "fallback_delivered": bool(visibility.get("fallback_delivered")),
     }
+    late_delivery = visibility.get("late_delivery")
+    if isinstance(late_delivery, dict):
+        detail["late_delivery"] = late_delivery
+    return detail
 
 
 def _deliver_telegram_generated_text(
@@ -2133,7 +2191,7 @@ def _deliver_telegram_generated_text(
         outcome = "suppressed"
         reason = "empty"
 
-    return {
+    detail = {
         "channel": "telegram",
         "outcome": outcome,
         "reason": reason,
@@ -2149,6 +2207,10 @@ def _deliver_telegram_generated_text(
         "followup_text_source": visibility.get("followup_text_source") or "",
         "fallback_delivered": bool(visibility.get("fallback_delivered")),
     }
+    late_delivery = visibility.get("late_delivery")
+    if isinstance(late_delivery, dict):
+        detail["late_delivery"] = late_delivery
+    return detail
 
 
 def dispatch_task(task: Dict[str, Any]) -> Dict[str, Any]:
@@ -2177,6 +2239,7 @@ def dispatch_task(task: Dict[str, Any]) -> Dict[str, Any]:
         followup_text_fallback_reason=str(generation_result.get("followup_text_fallback_reason") or ""),
         suppressed_fallback_reason=str(generation_result.get("suppressed_fallback_reason") or ""),
     )
+    visibility = _apply_late_delivery_notice(task, visibility)
 
     if "librechat" in channels:
         channel_results["librechat"] = {

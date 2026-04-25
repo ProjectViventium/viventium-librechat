@@ -131,6 +131,59 @@ class DispatchTelegramTests(unittest.TestCase):
         self.assertIn('verified tool/cortex result', composed)
         self.assertIn('omit that section', composed)
 
+    def test_late_delivery_notice_is_prepended_to_visible_delivery(self):
+        task = {
+            'id': 'task-late',
+            'user_id': 'user_1',
+            'metadata': {
+                'scheduler_misfire': {
+                    'mode': 'catch_up',
+                    'due_at': '2026-02-13T19:00:00Z',
+                    'due_at_local': '2026-02-13 19:00 UTC',
+                    'delivered_at': '2026-02-13T20:24:52Z',
+                    'late_seconds': 5092,
+                    'late_minutes': 85,
+                    'max_late_s': 43200,
+                },
+            },
+        }
+        visibility = dispatch._prepare_generated_visibility(
+            task,
+            'Meditate before the day runs away.',
+            '',
+        )
+
+        patched = dispatch._apply_late_delivery_notice(task, visibility)
+
+        self.assertTrue(
+            patched['final_text'].startswith(
+                'Late reminder: originally scheduled for 2026-02-13 19:00 UTC; '
+                'delivered 85 minutes late.'
+            )
+        )
+        self.assertEqual(patched['generated_text'], patched['final_text'])
+        librechat_detail = dispatch._build_librechat_delivery_detail(patched)
+        self.assertEqual(librechat_detail.get('late_delivery', {}).get('late_seconds'), 5092)
+
+        with patch.object(dispatch, '_resolve_telegram_identity') as mock_identity, patch.object(
+            dispatch,
+            '_send_telegram_voice_or_text',
+        ) as mock_send:
+            mock_identity.return_value = ('tg-1', 'chat-1', {'voice_responses_enabled': False})
+
+            telegram_detail = dispatch._deliver_telegram_generated_text(
+                task,
+                'http://localhost:3080',
+                10,
+                None,
+                patched,
+            )
+
+        mock_send.assert_called_once()
+        sent_text = mock_send.call_args.args[1]
+        self.assertTrue(sent_text.startswith('Late reminder: originally scheduled for 2026-02-13 19:00 UTC'))
+        self.assertEqual(telegram_detail.get('late_delivery', {}).get('late_minutes'), 85)
+
     def test_dispatch_task_sends_telegram_message(self):
         task = {
             'id': 'task-1',

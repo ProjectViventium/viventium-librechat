@@ -583,8 +583,15 @@ def main() -> None:
     poll_interval_s = int(os.getenv("SCHEDULER_POLL_INTERVAL_S", "30"))
     misfire_grace_s = int(os.getenv("SCHEDULER_MISFIRE_GRACE_S", "900"))
     retry_delay_s = int(os.getenv("SCHEDULER_RETRY_DELAY_S", "300"))
+    catch_up_max_late_s = int(os.getenv("SCHEDULER_CATCH_UP_MAX_LATE_S", "43200"))
 
-    scheduler = SchedulerEngine(storage, poll_interval_s, misfire_grace_s, retry_delay_s)
+    scheduler = SchedulerEngine(
+        storage,
+        poll_interval_s,
+        misfire_grace_s,
+        retry_delay_s,
+        catch_up_max_late_s,
+    )
     scheduler.start()
 
     server = build_server(storage)

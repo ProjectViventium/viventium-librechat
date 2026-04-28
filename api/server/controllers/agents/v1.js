@@ -91,6 +91,24 @@ const createAgentHandler = async (req, res) => {
         true,
       );
     }
+    if (
+      agentData.voice_fallback_llm_model_parameters &&
+      typeof agentData.voice_fallback_llm_model_parameters === 'object'
+    ) {
+      agentData.voice_fallback_llm_model_parameters = removeNullishValues(
+        agentData.voice_fallback_llm_model_parameters,
+        true,
+      );
+    }
+    if (
+      agentData.fallback_llm_model_parameters &&
+      typeof agentData.fallback_llm_model_parameters === 'object'
+    ) {
+      agentData.fallback_llm_model_parameters = removeNullishValues(
+        agentData.fallback_llm_model_parameters,
+        true,
+      );
+    }
 
     const { id: userId } = req.user;
 
@@ -267,6 +285,12 @@ const updateAgentHandler = async (req, res) => {
       voice_llm_model: voiceLlmModelField,
       voice_llm_provider: voiceProviderField,
       voice_llm_model_parameters: voiceModelParametersField,
+      voice_fallback_llm_model: voiceFallbackLlmModelField,
+      voice_fallback_llm_provider: voiceFallbackProviderField,
+      voice_fallback_llm_model_parameters: voiceFallbackModelParametersField,
+      fallback_llm_model: fallbackLlmModelField,
+      fallback_llm_provider: fallbackProviderField,
+      fallback_llm_model_parameters: fallbackModelParametersField,
       /* === VIVENTIUM END === */
       _id,
       ...rest
@@ -278,6 +302,21 @@ const updateAgentHandler = async (req, res) => {
     }
     if (voiceModelParametersField && typeof voiceModelParametersField === 'object') {
       updateData.voice_llm_model_parameters = removeNullishValues(voiceModelParametersField, true);
+    }
+    if (
+      voiceFallbackModelParametersField &&
+      typeof voiceFallbackModelParametersField === 'object'
+    ) {
+      updateData.voice_fallback_llm_model_parameters = removeNullishValues(
+        voiceFallbackModelParametersField,
+        true,
+      );
+    }
+    if (fallbackModelParametersField && typeof fallbackModelParametersField === 'object') {
+      updateData.fallback_llm_model_parameters = removeNullishValues(
+        fallbackModelParametersField,
+        true,
+      );
     }
 
     if (avatarField === null) {
@@ -297,6 +336,26 @@ const updateAgentHandler = async (req, res) => {
       updateData.voice_llm_provider = voiceProviderField;
     } else if (voiceProviderField !== undefined) {
       updateData.voice_llm_provider = voiceProviderField;
+    }
+    if (voiceFallbackLlmModelField === null) {
+      updateData.voice_fallback_llm_model = voiceFallbackLlmModelField;
+    } else if (voiceFallbackLlmModelField !== undefined) {
+      updateData.voice_fallback_llm_model = voiceFallbackLlmModelField;
+    }
+    if (voiceFallbackProviderField === null) {
+      updateData.voice_fallback_llm_provider = voiceFallbackProviderField;
+    } else if (voiceFallbackProviderField !== undefined) {
+      updateData.voice_fallback_llm_provider = voiceFallbackProviderField;
+    }
+    if (fallbackLlmModelField === null) {
+      updateData.fallback_llm_model = fallbackLlmModelField;
+    } else if (fallbackLlmModelField !== undefined) {
+      updateData.fallback_llm_model = fallbackLlmModelField;
+    }
+    if (fallbackProviderField === null) {
+      updateData.fallback_llm_provider = fallbackProviderField;
+    } else if (fallbackProviderField !== undefined) {
+      updateData.fallback_llm_provider = fallbackProviderField;
     }
     /* === VIVENTIUM END === */
 

@@ -163,6 +163,12 @@ const AGENT_FIELDS = [
   'voice_llm_model',
   'voice_llm_provider',
   'voice_llm_model_parameters',
+  'voice_fallback_llm_model',
+  'voice_fallback_llm_provider',
+  'voice_fallback_llm_model_parameters',
+  'fallback_llm_model',
+  'fallback_llm_provider',
+  'fallback_llm_model_parameters',
   'agent_ids',
   'edges',
   'conversation_starters',
@@ -186,6 +192,12 @@ const MODEL_CONFIG_ONLY_FIELDS = [
   'voice_llm_model',
   'voice_llm_provider',
   'voice_llm_model_parameters',
+  'voice_fallback_llm_model',
+  'voice_fallback_llm_provider',
+  'voice_fallback_llm_model_parameters',
+  'fallback_llm_model',
+  'fallback_llm_provider',
+  'fallback_llm_model_parameters',
 ];
 const REVIEW_FIELDS = [
   'name',
@@ -199,6 +211,12 @@ const REVIEW_FIELDS = [
   'voice_llm_model',
   'voice_llm_provider',
   'voice_llm_model_parameters',
+  'voice_fallback_llm_model',
+  'voice_fallback_llm_provider',
+  'voice_fallback_llm_model_parameters',
+  'fallback_llm_model',
+  'fallback_llm_provider',
+  'fallback_llm_model_parameters',
   'conversation_starters',
   'background_cortices',
 ];
@@ -1015,7 +1033,13 @@ function buildCompareRecommendations({
     liveDiffFields.has('model_parameters') ||
     liveDiffFields.has('voice_llm_model') ||
     liveDiffFields.has('voice_llm_provider') ||
-    liveDiffFields.has('voice_llm_model_parameters')
+    liveDiffFields.has('voice_llm_model_parameters') ||
+    liveDiffFields.has('voice_fallback_llm_model') ||
+    liveDiffFields.has('voice_fallback_llm_provider') ||
+    liveDiffFields.has('voice_fallback_llm_model_parameters') ||
+    liveDiffFields.has('fallback_llm_model') ||
+    liveDiffFields.has('fallback_llm_provider') ||
+    liveDiffFields.has('fallback_llm_model_parameters')
   ) {
     recommendations.push(
       'Live model/provider drift exists. Reconcile that explicitly and use --model-config-only only when the reviewed target state is clear.',

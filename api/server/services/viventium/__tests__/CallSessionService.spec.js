@@ -316,6 +316,8 @@ describe('CallSessionService', () => {
       assistantRoute: {
         primary: { provider: 'anthropic', model: 'claude-opus-4-7' },
         voiceCallLlm: null,
+        fallbackLlm: null,
+        voiceFallbackLlm: null,
         effective: { provider: 'anthropic', model: 'claude-opus-4-7' },
         inheritsPrimary: true,
       },
@@ -351,6 +353,10 @@ describe('CallSessionService', () => {
       model_parameters: { model: 'gpt-5.4' },
       voice_llm_provider: 'openAI',
       voice_llm_model: 'gpt-5.4',
+      fallback_llm_provider: 'openAI',
+      fallback_llm_model: 'gpt-5.4-mini',
+      voice_fallback_llm_provider: 'anthropic',
+      voice_fallback_llm_model: 'claude-haiku-4-5',
       author: user._id.toString(),
       versions: [],
     });
@@ -382,6 +388,8 @@ describe('CallSessionService', () => {
       assistantRoute: {
         primary: { provider: 'anthropic', model: 'claude-opus-4-7' },
         voiceCallLlm: { provider: 'openAI', model: 'gpt-5.4' },
+        fallbackLlm: { provider: 'anthropic', model: 'claude-haiku-4-5' },
+        voiceFallbackLlm: { provider: 'anthropic', model: 'claude-haiku-4-5' },
         effective: { provider: 'openAI', model: 'gpt-5.4' },
         inheritsPrimary: false,
       },

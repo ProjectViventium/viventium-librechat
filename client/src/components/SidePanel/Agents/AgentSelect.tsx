@@ -97,6 +97,22 @@ export default function AgentSelect({
           return;
         }
 
+        if (name === 'voice_fallback_llm_model_parameters') {
+          formValues[name] = value;
+          return;
+        }
+
+        /* === VIVENTIUM START ===
+         * Feature: Agent Fallback LLM
+         * Purpose: Preserve fallback-specific parameter bags when loading an agent.
+         * Added: 2026-04-28
+         */
+        if (name === 'fallback_llm_model_parameters') {
+          formValues[name] = value;
+          return;
+        }
+        /* === VIVENTIUM END === */
+
         if (capabilities[name] !== undefined) {
           formValues[name] = value;
           return;

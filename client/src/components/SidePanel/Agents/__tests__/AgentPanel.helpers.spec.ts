@@ -20,6 +20,8 @@ const createForm = (): AgentForm => ({
   model: 'gpt-4',
   model_parameters: {},
   voice_llm_model_parameters: undefined,
+  voice_fallback_llm_model_parameters: undefined,
+  fallback_llm_model_parameters: undefined,
   tools: [],
   provider: 'openai',
   agent_ids: [],
@@ -111,6 +113,73 @@ describe('composeAgentUpdatePayload', () => {
       temperature: 0.2,
       max_output_tokens: 180,
     });
+  });
+
+  it('keeps fallback model parameters separate from primary and voice parameters', () => {
+    const form = createForm();
+    form.provider = 'anthropic';
+    form.model = 'claude-opus-4-7';
+    form.model_parameters = {
+      model: 'claude-opus-4-7',
+      temperature: 0.7,
+    } as AgentForm['model_parameters'];
+    form.fallback_llm_provider = 'openAI';
+    form.fallback_llm_model = 'gpt-5.4';
+    form.fallback_llm_model_parameters = {
+      model: 'gpt-4o-mini',
+      temperature: 0.1,
+      max_output_tokens: 600,
+    } as AgentForm['fallback_llm_model_parameters'];
+
+    const { payload } = composeAgentUpdatePayload(form, 'agent_123');
+
+    expect(payload.model_parameters).toMatchObject({
+      model: 'claude-opus-4-7',
+      temperature: 0.7,
+    });
+    expect(payload.fallback_llm_model).toBe('gpt-5.4');
+    expect(payload.fallback_llm_provider).toBe('openAI');
+    expect(payload.fallback_llm_model_parameters).toMatchObject({
+      model: 'gpt-5.4',
+      temperature: 0.1,
+      max_output_tokens: 600,
+    });
+  });
+
+  it('keeps voice fallback model parameters separate from voice and text fallback parameters', () => {
+    const form = createForm();
+    form.provider = 'anthropic';
+    form.model = 'claude-opus-4-7';
+    form.voice_llm_provider = 'anthropic';
+    form.voice_llm_model = 'claude-haiku-4-5';
+    form.voice_llm_model_parameters = {
+      model: 'claude-haiku-4-5',
+      temperature: 0.2,
+    } as AgentForm['voice_llm_model_parameters'];
+    form.voice_fallback_llm_provider = 'openAI';
+    form.voice_fallback_llm_model = 'gpt-5.4';
+    form.voice_fallback_llm_model_parameters = {
+      model: 'gpt-4o-mini',
+      temperature: 0.1,
+      max_output_tokens: 320,
+    } as AgentForm['voice_fallback_llm_model_parameters'];
+    form.fallback_llm_provider = 'anthropic';
+    form.fallback_llm_model = 'claude-sonnet-4-6';
+
+    const { payload } = composeAgentUpdatePayload(form, 'agent_123');
+
+    expect(payload.voice_llm_model_parameters).toMatchObject({
+      model: 'claude-haiku-4-5',
+      temperature: 0.2,
+    });
+    expect(payload.voice_fallback_llm_model).toBe('gpt-5.4');
+    expect(payload.voice_fallback_llm_provider).toBe('openAI');
+    expect(payload.voice_fallback_llm_model_parameters).toMatchObject({
+      model: 'gpt-5.4',
+      temperature: 0.1,
+      max_output_tokens: 320,
+    });
+    expect(payload.fallback_llm_model).toBe('claude-sonnet-4-6');
   });
 });
 

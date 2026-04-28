@@ -1,0 +1,257 @@
+/* === VIVENTIUM START ===
+ * Feature: Agent Fallback LLM
+ * Purpose: Resolve, validate, and trigger a user-configured secondary model route
+ * when the primary provider fails before producing assistant text.
+ * Added: 2026-04-28
+ * === VIVENTIUM END === */
+
+const { ContentTypes } = require('librechat-data-provider');
+const RUNTIME_HOLD_TEXT_FLAG = 'viventium_runtime_hold';
+
+function normalizeProvider(provider) {
+  const raw = String(provider || '').trim();
+  if (!raw) {
+    return '';
+  }
+  const lowered = raw.toLowerCase();
+  if (lowered === 'openai') {
+    return 'openAI';
+  }
+  if (lowered === 'x_ai') {
+    return 'xai';
+  }
+  return raw;
+}
+
+function clonePlainObject(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+  return { ...value };
+}
+
+const DEFAULT_FALLBACK_FIELDS = Object.freeze({
+  providerField: 'fallback_llm_provider',
+  modelField: 'fallback_llm_model',
+  parametersField: 'fallback_llm_model_parameters',
+  source: 'agent',
+});
+
+const VOICE_FALLBACK_FIELDS = Object.freeze({
+  providerField: 'voice_fallback_llm_provider',
+  modelField: 'voice_fallback_llm_model',
+  parametersField: 'voice_fallback_llm_model_parameters',
+  source: 'voice',
+});
+
+function resolveFallbackAssignment(agent, fieldConfig = DEFAULT_FALLBACK_FIELDS) {
+  if (!agent || typeof agent !== 'object') {
+    return null;
+  }
+
+  const fields = { ...DEFAULT_FALLBACK_FIELDS, ...fieldConfig };
+  const provider = normalizeProvider(agent[fields.providerField]);
+  const explicitModel = String(agent[fields.modelField] || '').trim();
+  const parameterModel = String(agent[fields.parametersField]?.model || '').trim();
+  const model = explicitModel || parameterModel;
+
+  if (!provider || !model) {
+    return null;
+  }
+
+  return {
+    provider,
+    model,
+    source: fields.source,
+    parametersField: fields.parametersField,
+  };
+}
+
+function resolveVoiceFallbackAssignment(agent) {
+  return resolveFallbackAssignment(agent, VOICE_FALLBACK_FIELDS);
+}
+
+function resolveEffectiveFallbackAssignment(agent, { isVoiceCall = false } = {}) {
+  if (isVoiceCall) {
+    return resolveVoiceFallbackAssignment(agent) || resolveFallbackAssignment(agent);
+  }
+  return resolveFallbackAssignment(agent);
+}
+
+function resolveFallbackCandidates(agent, { isVoiceCall = false } = {}) {
+  const general = resolveFallbackAssignment(agent);
+  if (!isVoiceCall) {
+    return general ? [general] : [];
+  }
+
+  const voice = resolveVoiceFallbackAssignment(agent);
+  return [voice, general].filter(Boolean);
+}
+
+function isFallbackModelValid(fallbackModel, fallbackProvider, req, modelsConfig) {
+  const model = String(fallbackModel || '').trim();
+  const provider = normalizeProvider(fallbackProvider);
+  if (!model || !provider) {
+    return false;
+  }
+
+  const allowedProviders = req?.config?.endpoints?.agents?.allowedProviders;
+  if (
+    Array.isArray(allowedProviders) &&
+    allowedProviders.length > 0 &&
+    !allowedProviders.map(normalizeProvider).includes(provider)
+  ) {
+    return false;
+  }
+
+  const providerModels = modelsConfig?.[provider];
+  if (!Array.isArray(providerModels) || providerModels.length === 0) {
+    return false;
+  }
+
+  return providerModels.includes(model);
+}
+
+function resolveFallbackModelParameters(
+  agent,
+  fallbackModel,
+  parametersField = DEFAULT_FALLBACK_FIELDS.parametersField,
+) {
+  const resolved = {
+    ...clonePlainObject(agent?.model_parameters),
+    ...clonePlainObject(agent?.[parametersField]),
+  };
+
+  const model = String(
+    fallbackModel || agent?.fallback_llm_model || agent?.voice_fallback_llm_model || '',
+  ).trim();
+  if (model) {
+    resolved.model = model;
+  }
+
+  return resolved;
+}
+
+function buildFallbackAgent(agent, assignment) {
+  if (!agent || !assignment) {
+    return null;
+  }
+
+  return {
+    ...agent,
+    provider: assignment.provider,
+    model: assignment.model,
+    endpoint: undefined,
+    model_parameters: resolveFallbackModelParameters(
+      agent,
+      assignment.model,
+      assignment.parametersField,
+    ),
+  };
+}
+
+function getAgentModel(agent) {
+  return String(agent?.model || agent?.model_parameters?.model || '').trim();
+}
+
+function isSameAgentRoute(agent, assignment) {
+  if (!agent || !assignment) {
+    return false;
+  }
+  return normalizeProvider(agent.provider) === assignment.provider && getAgentModel(agent) === assignment.model;
+}
+
+function contentPartText(part) {
+  if (!part || typeof part !== 'object') {
+    return '';
+  }
+  if (typeof part[ContentTypes.ERROR] === 'string') {
+    return part[ContentTypes.ERROR];
+  }
+  if (typeof part.error === 'string') {
+    return part.error;
+  }
+  if (typeof part.text === 'string') {
+    return part.text;
+  }
+  return '';
+}
+
+function hasVisibleAssistantText(contentParts) {
+  if (!Array.isArray(contentParts)) {
+    return false;
+  }
+  return contentParts.some((part) => {
+    if (typeof part === 'string') {
+      return part.trim().length > 0;
+    }
+    if (!part || typeof part !== 'object') {
+      return false;
+    }
+    if (part.type === ContentTypes.ERROR) {
+      return false;
+    }
+    if (part[RUNTIME_HOLD_TEXT_FLAG] === true) {
+      return false;
+    }
+    if (part.type === ContentTypes.TEXT && typeof part.text === 'string') {
+      return part.text.trim().length > 0;
+    }
+    return false;
+  });
+}
+
+function isRecoverableProviderErrorText(text) {
+  const lowered = String(text || '').toLowerCase();
+  if (!lowered) {
+    return false;
+  }
+  if (lowered.includes('mcp') || lowered.includes('tool')) {
+    return false;
+  }
+  return (
+    lowered.includes('rate_limit') ||
+    lowered.includes('rate limit') ||
+    lowered.includes('too many requests') ||
+    lowered.includes('status=429') ||
+    lowered.includes('status 429') ||
+    lowered.includes('"status":429') ||
+    lowered.includes(' 429 ') ||
+    lowered.includes('authentication') ||
+    lowered.includes('credential') ||
+    lowered.includes('unauthorized') ||
+    lowered.includes(' 401 ') ||
+    lowered.includes(' 403 ') ||
+    lowered.includes('overloaded') ||
+    lowered.includes('temporarily unavailable') ||
+    lowered.includes(' 503 ') ||
+    lowered.includes(' 529 ')
+  );
+}
+
+function shouldRetryWithFallback(contentParts) {
+  if (!Array.isArray(contentParts) || contentParts.length === 0 || hasVisibleAssistantText(contentParts)) {
+    return false;
+  }
+
+  return contentParts.some((part) => {
+    if (!part || typeof part !== 'object' || part.type !== ContentTypes.ERROR) {
+      return false;
+    }
+    return isRecoverableProviderErrorText(contentPartText(part));
+  });
+}
+
+module.exports = {
+  normalizeProvider,
+  resolveFallbackAssignment,
+  resolveVoiceFallbackAssignment,
+  resolveEffectiveFallbackAssignment,
+  resolveFallbackCandidates,
+  isFallbackModelValid,
+  resolveFallbackModelParameters,
+  buildFallbackAgent,
+  isSameAgentRoute,
+  shouldRetryWithFallback,
+  isRecoverableProviderErrorText,
+};

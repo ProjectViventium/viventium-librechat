@@ -108,6 +108,102 @@ function normalizeVoiceAgentModelFields(agentLike, options = {}) {
   return normalized;
 }
 
+function normalizeFallbackAgentModelFields(agentLike, options = {}) {
+  if (!agentLike || typeof agentLike !== 'object') {
+    return agentLike;
+  }
+
+  const normalized = { ...agentLike };
+  const existingFallbackModelParameters =
+    options.existingFallbackModelParameters &&
+    typeof options.existingFallbackModelParameters === 'object'
+      ? { ...options.existingFallbackModelParameters }
+      : undefined;
+
+  let fallbackModelParameters =
+    normalized.fallback_llm_model_parameters &&
+    typeof normalized.fallback_llm_model_parameters === 'object' &&
+    !Array.isArray(normalized.fallback_llm_model_parameters)
+      ? { ...normalized.fallback_llm_model_parameters }
+      : existingFallbackModelParameters;
+
+  const topLevelFallbackModel =
+    typeof normalized.fallback_llm_model === 'string' &&
+    normalized.fallback_llm_model.trim().length > 0
+      ? normalized.fallback_llm_model.trim()
+      : '';
+  const parameterFallbackModel =
+    typeof fallbackModelParameters?.model === 'string' &&
+    fallbackModelParameters.model.trim().length > 0
+      ? fallbackModelParameters.model.trim()
+      : '';
+
+  if (topLevelFallbackModel && fallbackModelParameters) {
+    fallbackModelParameters.model = topLevelFallbackModel;
+  } else if (!topLevelFallbackModel && parameterFallbackModel) {
+    normalized.fallback_llm_model = parameterFallbackModel;
+  }
+
+  if (fallbackModelParameters) {
+    normalized.fallback_llm_model_parameters = fallbackModelParameters;
+  }
+
+  return normalized;
+}
+
+function normalizeVoiceFallbackAgentModelFields(agentLike, options = {}) {
+  if (!agentLike || typeof agentLike !== 'object') {
+    return agentLike;
+  }
+
+  const normalized = { ...agentLike };
+  const existingVoiceFallbackModelParameters =
+    options.existingVoiceFallbackModelParameters &&
+    typeof options.existingVoiceFallbackModelParameters === 'object'
+      ? { ...options.existingVoiceFallbackModelParameters }
+      : undefined;
+
+  let voiceFallbackModelParameters =
+    normalized.voice_fallback_llm_model_parameters &&
+    typeof normalized.voice_fallback_llm_model_parameters === 'object' &&
+    !Array.isArray(normalized.voice_fallback_llm_model_parameters)
+      ? { ...normalized.voice_fallback_llm_model_parameters }
+      : existingVoiceFallbackModelParameters;
+
+  const topLevelVoiceFallbackModel =
+    typeof normalized.voice_fallback_llm_model === 'string' &&
+    normalized.voice_fallback_llm_model.trim().length > 0
+      ? normalized.voice_fallback_llm_model.trim()
+      : '';
+  const parameterVoiceFallbackModel =
+    typeof voiceFallbackModelParameters?.model === 'string' &&
+    voiceFallbackModelParameters.model.trim().length > 0
+      ? voiceFallbackModelParameters.model.trim()
+      : '';
+
+  if (topLevelVoiceFallbackModel && voiceFallbackModelParameters) {
+    voiceFallbackModelParameters.model = topLevelVoiceFallbackModel;
+  } else if (!topLevelVoiceFallbackModel && parameterVoiceFallbackModel) {
+    normalized.voice_fallback_llm_model = parameterVoiceFallbackModel;
+  }
+
+  if (voiceFallbackModelParameters) {
+    normalized.voice_fallback_llm_model_parameters = voiceFallbackModelParameters;
+  }
+
+  return normalized;
+}
+
+function normalizeAllAgentModelFields(agentLike, options = {}) {
+  return normalizeVoiceFallbackAgentModelFields(
+    normalizeFallbackAgentModelFields(
+      normalizeVoiceAgentModelFields(normalizeAgentModelFields(agentLike, options), options),
+      options,
+    ),
+    options,
+  );
+}
+
 /* === VIVENTIUM START ===
  * Feature: Persist versioned direct field updates via $set
  * Purpose: Keep the live agent document aligned with version history when updateAgent mixes
@@ -250,14 +346,14 @@ const _clearAgentCache = async (agentId) => {
  * @throws {Error} If the agent creation fails.
  */
 const createAgent = async (agentData) => {
-  const normalizedAgentData = normalizeVoiceAgentModelFields(normalizeAgentModelFields(agentData));
+  const normalizedAgentData = normalizeAllAgentModelFields(agentData);
   const { author: _author, ...versionData } = normalizedAgentData;
   const timestamp = new Date();
   const initialAgentData = {
     ...normalizedAgentData,
     versions: [
       {
-        ...normalizeVoiceAgentModelFields(normalizeAgentModelFields(versionData)),
+        ...normalizeAllAgentModelFields(versionData),
         createdAt: timestamp,
         updatedAt: timestamp,
       },
@@ -271,9 +367,7 @@ const createAgent = async (agentData) => {
    * Purpose: Immediately cache the created agent to avoid first-read latency (Telegram/UI).
    * Added: 2026-02-07
    */
-  const created = normalizeVoiceAgentModelFields(
-    normalizeAgentModelFields((await Agent.create(initialAgentData)).toObject()),
-  );
+  const created = normalizeAllAgentModelFields((await Agent.create(initialAgentData)).toObject());
   await _cacheAgent(created);
   return created;
   /* === VIVENTIUM END === */
@@ -312,7 +406,7 @@ const _getAgentWithCache = async (searchParameter) => {
   }
   const agent = await Agent.findOne(searchParameter).lean();
   if (agent) {
-    const normalizedAgent = normalizeVoiceAgentModelFields(normalizeAgentModelFields(agent));
+    const normalizedAgent = normalizeAllAgentModelFields(agent);
     await _cacheAgent(normalizedAgent);
     return normalizedAgent;
   }
@@ -327,9 +421,7 @@ const _getAgentWithCache = async (searchParameter) => {
  * @returns {Promise<Agent[]>} Array of agent documents as plain objects.
  */
 const getAgents = async (searchParameter) =>
-  (await Agent.find(searchParameter).lean()).map((agent) =>
-    normalizeVoiceAgentModelFields(normalizeAgentModelFields(agent)),
-  );
+  (await Agent.find(searchParameter).lean()).map((agent) => normalizeAllAgentModelFields(agent));
 
 /**
  * Load an agent based on the provided ID
@@ -458,7 +550,7 @@ const loadAgent = async ({ req, spec, agent_id, endpoint, model_parameters }) =>
     return null;
   }
 
-  const normalizedAgent = normalizeVoiceAgentModelFields(normalizeAgentModelFields(agent));
+  const normalizedAgent = normalizeAllAgentModelFields(agent);
   normalizedAgent.version = normalizedAgent.versions ? normalizedAgent.versions.length : 0;
   return normalizedAgent;
 };
@@ -655,14 +747,12 @@ const updateAgent = async (searchParameter, updateData, options = {}) => {
       author: _author,
       ...versionData
     } = currentAgent.toObject();
-    updateData = normalizeVoiceAgentModelFields(
-      normalizeAgentModelFields(updateData, {
-        existingModelParameters: versionData.model_parameters,
-      }),
-      {
-        existingVoiceModelParameters: versionData.voice_llm_model_parameters,
-      },
-    );
+    updateData = normalizeAllAgentModelFields(updateData, {
+      existingModelParameters: versionData.model_parameters,
+      existingVoiceModelParameters: versionData.voice_llm_model_parameters,
+      existingFallbackModelParameters: versionData.fallback_llm_model_parameters,
+      existingVoiceFallbackModelParameters: versionData.voice_fallback_llm_model_parameters,
+    });
     const { $push, $pull, $addToSet, ...directUpdates } = updateData;
 
     // Sync mcpServerNames when tools are updated
@@ -713,18 +803,14 @@ const updateAgent = async (searchParameter, updateData, options = {}) => {
       const duplicateVersion = isDuplicateVersion(updateData, versionData, versions, actionsHash);
       if (duplicateVersion && !forceVersion) {
         if (hasDirectUpdateDrift && !$push && !$pull && !$addToSet) {
-          const repaired = normalizeVoiceAgentModelFields(
-            normalizeAgentModelFields(
-              await Agent.findOneAndUpdate(searchParameter, directUpdates, mongoOptions).lean(),
-            ),
+          const repaired = normalizeAllAgentModelFields(
+            await Agent.findOneAndUpdate(searchParameter, directUpdates, mongoOptions).lean(),
           );
           await _cacheAgent(repaired);
           return repaired;
         }
         // No changes detected, return the current agent without creating a new version
-        const agentObj = normalizeVoiceAgentModelFields(
-          normalizeAgentModelFields(currentAgent.toObject()),
-        );
+        const agentObj = normalizeAllAgentModelFields(currentAgent.toObject());
         agentObj.version = versions.length;
         /* === VIVENTIUM START ===
          * Feature: Keep agent cache warm on no-op updates
@@ -766,13 +852,9 @@ const updateAgent = async (searchParameter, updateData, options = {}) => {
    * Purpose: Keep cached agent aligned with the latest DB version after writes.
    * Added: 2026-02-07
    */
-  updateData = normalizeAtomicUpdateDocument(
-    normalizeVoiceAgentModelFields(normalizeAgentModelFields(updateData)),
-  );
-  const updated = normalizeVoiceAgentModelFields(
-    normalizeAgentModelFields(
-      await Agent.findOneAndUpdate(searchParameter, updateData, mongoOptions).lean(),
-    ),
+  updateData = normalizeAtomicUpdateDocument(normalizeAllAgentModelFields(updateData));
+  const updated = normalizeAllAgentModelFields(
+    await Agent.findOneAndUpdate(searchParameter, updateData, mongoOptions).lean(),
   );
   await _cacheAgent(updated);
   return updated;
@@ -1159,10 +1241,8 @@ const revertAgentVersion = async (searchParameter, versionIndex) => {
   delete updateData.author;
   delete updateData.updatedBy;
 
-  return normalizeVoiceAgentModelFields(
-    normalizeAgentModelFields(
-      await Agent.findOneAndUpdate(searchParameter, updateData, { new: true }).lean(),
-    ),
+  return normalizeAllAgentModelFields(
+    await Agent.findOneAndUpdate(searchParameter, updateData, { new: true }).lean(),
   );
 };
 

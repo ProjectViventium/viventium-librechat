@@ -1,6 +1,6 @@
 import React, { useMemo, useEffect, useRef } from 'react';
 import { ControlCombobox } from '@librechat/client';
-import { ChevronLeft } from 'lucide-react';
+import { ChevronLeft, ChevronRight } from 'lucide-react';
 import { useFormContext, useWatch, Controller } from 'react-hook-form';
 import {
   alternateName,
@@ -24,6 +24,8 @@ export default function ModelPanel({
 
   const model = useWatch({ control, name: 'model' });
   const providerOption = useWatch({ control, name: 'provider' });
+  const fallbackModel = useWatch({ control, name: 'fallback_llm_model' });
+  const fallbackProvider = useWatch({ control, name: 'fallback_llm_provider' });
   useWatch({ control, name: 'model_parameters' });
 
   const provider = useMemo(() => {
@@ -183,6 +185,40 @@ export default function ModelPanel({
             }}
           />
         </div>
+        {/* === VIVENTIUM START ===
+         * Feature: Agent Fallback LLM
+         * Purpose: Let users configure the secondary model from the existing Model Parameters page.
+         * Added: 2026-04-28
+         */}
+        <div className="model-panel-section mb-4">
+          <label
+            id="fallback-llm-label"
+            className="text-token-text-primary model-panel-label mb-2 block font-medium"
+          >
+            {localize('com_ui_fallback_llm')}
+          </label>
+          <button
+            type="button"
+            onClick={() => setActivePanel(Panel.fallbackLlmModel)}
+            className="btn btn-neutral border-token-border-light relative h-10 w-full rounded-lg font-medium"
+            aria-haspopup="true"
+            aria-expanded="false"
+            aria-labelledby="fallback-llm-label"
+          >
+            <div className="flex w-full items-center justify-between gap-2">
+              <span className="truncate text-left">
+                {fallbackModel && fallbackProvider
+                  ? `${fallbackModel}`
+                  : localize('com_ui_fallback_llm_empty')}
+              </span>
+              <ChevronRight className="h-4 w-4 flex-shrink-0" aria-hidden="true" />
+            </div>
+          </button>
+          <p className="text-token-text-secondary mt-1 text-xs">
+            {localize('com_ui_fallback_llm_short_description')}
+          </p>
+        </div>
+        {/* === VIVENTIUM END === */}
       </div>
       <ModelParametersSection
         fieldName="model_parameters"

@@ -344,6 +344,22 @@ export type Agent = {
   voice_llm_model?: string | null;
   voice_llm_provider?: string | null;
   voice_llm_model_parameters?: AgentModelParameters;
+  /* === VIVENTIUM START ===
+   * Feature: Voice Fallback LLM
+   * Added: 2026-04-28
+   */
+  voice_fallback_llm_model?: string | null;
+  voice_fallback_llm_provider?: string | null;
+  voice_fallback_llm_model_parameters?: AgentModelParameters;
+  /* === VIVENTIUM END === */
+  /* === VIVENTIUM START ===
+   * Feature: Agent Fallback LLM
+   * Purpose: User-configured secondary route for retryable provider failures.
+   * Added: 2026-04-28
+   */
+  fallback_llm_model?: string | null;
+  fallback_llm_provider?: string | null;
+  fallback_llm_model_parameters?: AgentModelParameters;
   /* === VIVENTIUM END === */
 };
 
@@ -377,6 +393,12 @@ export type AgentCreateParams = {
   | 'voice_llm_model'
   | 'voice_llm_provider'
   | 'voice_llm_model_parameters'
+  | 'voice_fallback_llm_model'
+  | 'voice_fallback_llm_provider'
+  | 'voice_fallback_llm_model_parameters'
+  | 'fallback_llm_model'
+  | 'fallback_llm_provider'
+  | 'fallback_llm_model_parameters'
 >;
 
 export type AgentUpdateParams = {
@@ -411,6 +433,12 @@ export type AgentUpdateParams = {
   | 'voice_llm_model'
   | 'voice_llm_provider'
   | 'voice_llm_model_parameters'
+  | 'voice_fallback_llm_model'
+  | 'voice_fallback_llm_provider'
+  | 'voice_fallback_llm_model_parameters'
+  | 'fallback_llm_model'
+  | 'fallback_llm_provider'
+  | 'fallback_llm_model_parameters'
 >;
 
 export type AgentListParams = {

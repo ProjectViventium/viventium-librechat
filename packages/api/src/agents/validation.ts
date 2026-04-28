@@ -121,6 +121,21 @@ export const agentBaseSchema = z.object({
   voice_llm_model: z.string().nullable().optional(),
   voice_llm_provider: z.string().nullable().optional(),
   voice_llm_model_parameters: z.record(z.unknown()).optional(),
+  /* === VIVENTIUM START ===
+   * Feature: Voice Fallback LLM
+   * Added: 2026-04-28
+   */
+  voice_fallback_llm_model: z.string().nullable().optional(),
+  voice_fallback_llm_provider: z.string().nullable().optional(),
+  voice_fallback_llm_model_parameters: z.record(z.unknown()).optional(),
+  /* === VIVENTIUM END === */
+  /* === VIVENTIUM START ===
+   * Feature: Agent Fallback LLM
+   * Added: 2026-04-28
+   */
+  fallback_llm_model: z.string().nullable().optional(),
+  fallback_llm_provider: z.string().nullable().optional(),
+  fallback_llm_model_parameters: z.record(z.unknown()).optional(),
   /* === VIVENTIUM END === */
 });
 

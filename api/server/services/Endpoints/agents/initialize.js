@@ -50,7 +50,16 @@ const { isDeepTimingEnabled } = require('~/server/services/viventium/telegramTim
  * Purpose: Reuse helper for primary + handoff agents before model validation.
  * Added: 2026-02-24
  */
-const { applyVoiceModelOverride } = require('~/server/services/viventium/voiceLlmOverride');
+const {
+  applyVoiceModelOverride,
+  isVoiceCallActive,
+} = require('~/server/services/viventium/voiceLlmOverride');
+const {
+  resolveFallbackCandidates,
+  isFallbackModelValid,
+  buildFallbackAgent,
+  isSameAgentRoute,
+} = require('~/server/services/viventium/agentLlmFallback');
 /* === VIVENTIUM END === */
 
 /* === VIVENTIUM START ===
@@ -457,6 +466,52 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
   /** @type {string | undefined} */
   const parentMessageId = req.body.parentMessageId;
 
+  /* === VIVENTIUM START ===
+   * Feature: Agent Fallback LLM
+   * Purpose: Prepare a validated secondary route before primary initialization mutates
+   * provider options, then attach the initialized route for one-shot runtime retry.
+   * Voice calls prefer the voice-specific fallback route and inherit the general fallback
+   * when the voice fallback is unset.
+   * Added: 2026-04-28
+   */
+  let fallbackAgent = null;
+  const fallbackCandidates = resolveFallbackCandidates(primaryAgent, {
+    isVoiceCall: isVoiceCallActive(req),
+  });
+  let fallbackAssignment = null;
+  for (const candidate of fallbackCandidates) {
+    if (isSameAgentRoute(primaryAgent, candidate)) {
+      logger.warn(
+        `[agentLlmFallback] Skipping ${candidate.source} fallback for agent ${primaryAgent.id} because it matches the effective primary route ${candidate.provider}/${candidate.model}`,
+      );
+      continue;
+    }
+    if (!isFallbackModelValid(candidate.model, candidate.provider, req, modelsConfig)) {
+      logger.warn(
+        `[agentLlmFallback] Invalid ${candidate.source} fallback model ${candidate.provider}/${candidate.model} for agent ${primaryAgent.id}; trying next fallback candidate`,
+      );
+      continue;
+    }
+    const candidateFallbackAgent = buildFallbackAgent(primaryAgent, candidate);
+    const fallbackValidationResult = await validateAgentModel({
+      req,
+      res,
+      modelsConfig,
+      logViolation,
+      agent: candidateFallbackAgent,
+    });
+    if (!fallbackValidationResult.isValid) {
+      logger.warn(
+        `[agentLlmFallback] ${candidate.source} fallback model ${candidate.provider}/${candidate.model} failed validation for agent ${primaryAgent.id}: ${fallbackValidationResult.error?.message || 'invalid'}; trying next fallback candidate`,
+      );
+      continue;
+    }
+    fallbackAgent = candidateFallbackAgent;
+    fallbackAssignment = candidate;
+    break;
+  }
+  /* === VIVENTIUM END === */
+
   const initPrimaryStart = nowIfDeep();
   const voiceInitPrimaryStart = voiceLatencyEnabled ? Date.now() : null;
   const primaryConfig = await initializeAgent(
@@ -495,6 +550,40 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
   }
   logDeep('initialize_agent_primary', initPrimaryStart);
 
+  /* === VIVENTIUM START === Agent Fallback LLM initialization */
+  if (fallbackAgent && fallbackAssignment) {
+    try {
+      const fallbackConfig = await initializeAgent(
+        {
+          req,
+          res,
+          loadTools,
+          requestFiles,
+          conversationId,
+          parentMessageId,
+          agent: fallbackAgent,
+          endpointOption,
+          allowedProviders,
+          isInitialAgent: false,
+        },
+        dbMethods,
+      );
+      primaryConfig.viventiumFallbackLlm = fallbackConfig;
+      primaryConfig.viventiumFallbackLlmAssignment = {
+        provider: fallbackAssignment.provider,
+        model: fallbackAssignment.model,
+      };
+      logger.info(
+        `[agentLlmFallback] Prepared fallback model for agent ${primaryConfig.id}: ${fallbackAssignment.provider}/${fallbackAssignment.model}`,
+      );
+    } catch (error) {
+      logger.warn(
+        `[agentLlmFallback] Failed to initialize fallback model ${fallbackAssignment.provider}/${fallbackAssignment.model} for agent ${primaryAgent.id}: ${error?.message || error}`,
+      );
+    }
+  }
+  /* === VIVENTIUM END === */
+
   logger.debug(
     `[initializeClient] Tool definitions for primary agent: ${primaryConfig.toolDefinitions?.length ?? 0}`,
   );
@@ -513,6 +602,13 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
 
   const agent_ids = primaryConfig.agent_ids;
   let userMCPAuthMap = primaryConfig.userMCPAuthMap;
+  if (primaryConfig.viventiumFallbackLlm?.userMCPAuthMap) {
+    if (userMCPAuthMap != null) {
+      Object.assign(userMCPAuthMap, primaryConfig.viventiumFallbackLlm.userMCPAuthMap);
+    } else {
+      userMCPAuthMap = primaryConfig.viventiumFallbackLlm.userMCPAuthMap;
+    }
+  }
 
   /** @type {Set<string>} Track agents that failed to load (orphaned references) */
   const skippedAgentIds = new Set();

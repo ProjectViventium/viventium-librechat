@@ -144,6 +144,9 @@ const {
   sanitizeProviderFormattedMessages,
 } = require('~/server/services/viventium/normalizeTextContentParts');
 const {
+  shouldRetryWithFallback,
+} = require('~/server/services/viventium/agentLlmFallback');
+const {
   sanitizeAggregatedContentParts,
 } = require('~/server/services/viventium/sanitizeAggregatedContentParts');
 const {
@@ -1802,19 +1805,48 @@ class AgentClient extends BaseClient {
   }
 
   /** @type {sendCompletion} */
-	  async sendCompletion(payload, opts = {}) {
-	    await this.chatCompletion({
-	      payload,
-	      onProgress: opts.onProgress,
-	      userMCPAuthMap: opts.userMCPAuthMap,
-	      abortController: opts.abortController,
-	    });
+  async sendCompletion(payload, opts = {}) {
+    await this.chatCompletion({
+      payload,
+      onProgress: opts.onProgress,
+      userMCPAuthMap: opts.userMCPAuthMap,
+      abortController: opts.abortController,
+    });
 
-	    const completion = normalizeTextContentParts(
-	      filterMalformedContentParts(this.contentParts),
-	    );
-	    return { completion };
-	  }
+    /* === VIVENTIUM START ===
+     * Feature: Agent Fallback LLM
+     * Purpose: If the primary provider fails before any assistant text is produced,
+     * retry once with the user-configured fallback route.
+     * Added: 2026-04-28
+     */
+    const fallbackAgent = this.options.agent?.viventiumFallbackLlm;
+    if (fallbackAgent && shouldRetryWithFallback(this.contentParts)) {
+      const primaryProvider = this.options.agent?.provider || this.options.agent?.endpoint || 'unknown';
+      const primaryModel =
+        this.options.agent?.model || this.options.agent?.model_parameters?.model || 'unknown';
+      const fallbackProvider = fallbackAgent.provider || fallbackAgent.endpoint || 'unknown';
+      const fallbackModel = fallbackAgent.model || fallbackAgent.model_parameters?.model || 'unknown';
+      logger.warn(
+        `[AgentClient] Primary model ${primaryProvider}/${primaryModel} failed before assistant text; retrying with fallback ${fallbackProvider}/${fallbackModel}`,
+      );
+      this.contentParts.length = 0;
+      this.options.agent = fallbackAgent;
+      this.options.attachments = fallbackAgent.attachments ?? this.options.attachments;
+      this.options.resendFiles = fallbackAgent.resendFiles ?? this.options.resendFiles;
+      this.options.maxContextTokens = fallbackAgent.maxContextTokens ?? this.options.maxContextTokens;
+      this.model = fallbackModel;
+      await this.chatCompletion({
+        payload,
+        onProgress: opts.onProgress,
+        userMCPAuthMap: fallbackAgent.userMCPAuthMap ?? opts.userMCPAuthMap,
+        abortController: opts.abortController,
+      });
+    }
+    /* === VIVENTIUM END === */
+
+    const completion = normalizeTextContentParts(filterMalformedContentParts(this.contentParts));
+    return { completion };
+  }
 
   /**
    * @param {Object} params

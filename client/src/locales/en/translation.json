@@ -1539,5 +1539,15 @@
   "com_ui_voice_chat_llm": "Voice Chat Model",
   "com_ui_voice_chat_llm_description": "Select a faster model for LiveKit voice calls. When empty, the main model is used.",
   "com_ui_voice_chat_llm_fallback": "Using main model",
-  "com_ui_voice_chat_llm_clear": "Clear voice model"
+  "com_ui_voice_chat_llm_clear": "Clear voice model",
+  "com_ui_voice_fallback_llm": "Voice Fallback Model",
+  "com_ui_voice_fallback_llm_description": "Select the secondary model used when the voice-call model fails before producing speech.",
+  "com_ui_voice_fallback_llm_short_description": "Used for voice-call provider limits, credential failures, and temporary outages before speech starts.",
+  "com_ui_voice_fallback_llm_empty": "No voice fallback model configured",
+  "com_ui_voice_fallback_llm_clear": "Clear voice fallback model",
+  "com_ui_fallback_llm": "Fallback Model",
+  "com_ui_fallback_llm_description": "Select the secondary model used when the primary provider fails before producing an answer.",
+  "com_ui_fallback_llm_short_description": "Used for provider limits, credential failures, and temporary outages before any assistant text is produced.",
+  "com_ui_fallback_llm_empty": "No fallback model configured",
+  "com_ui_fallback_llm_clear": "Clear fallback model"
 }

@@ -412,10 +412,21 @@ async function resolveCallSessionAssistantRoute(agentId) {
     voiceAssignment?.provider,
     voiceAssignment?.model,
   );
+  const fallbackLlm = buildAssistantRouteAssignment(
+    runtimeAgent?.fallback_llm_provider,
+    runtimeAgent?.fallback_llm_model || runtimeAgent?.fallback_llm_model_parameters?.model,
+  );
+  const voiceFallbackLlm = buildAssistantRouteAssignment(
+    runtimeAgent?.voice_fallback_llm_provider,
+    runtimeAgent?.voice_fallback_llm_model ||
+      runtimeAgent?.voice_fallback_llm_model_parameters?.model,
+  );
 
   return {
     primary,
     voiceCallLlm,
+    fallbackLlm: voiceFallbackLlm || fallbackLlm,
+    voiceFallbackLlm,
     effective: voiceCallLlm || primary,
     inheritsPrimary: !voiceCallLlm,
   };

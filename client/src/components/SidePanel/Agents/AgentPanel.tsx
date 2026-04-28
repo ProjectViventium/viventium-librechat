@@ -32,6 +32,8 @@ import AgentConfig from './AgentConfig';
 import AgentSelect from './AgentSelect';
 import AgentFooter from './AgentFooter';
 import VoiceLlmPanel from './VoiceLlmPanel';
+import FallbackLlmPanel from './FallbackLlmPanel';
+import VoiceFallbackLlmPanel from './VoiceFallbackLlmPanel';
 import ModelPanel from './ModelPanel';
 import { resolveSelectedAgentIdForApply } from './selection';
 
@@ -96,6 +98,12 @@ export function composeAgentUpdatePayload(data: AgentForm, agent_id?: string | n
     voice_llm_model,
     voice_llm_provider,
     voice_llm_model_parameters,
+    voice_fallback_llm_model,
+    voice_fallback_llm_provider,
+    voice_fallback_llm_model_parameters,
+    fallback_llm_model,
+    fallback_llm_provider,
+    fallback_llm_model_parameters,
     /* === VIVENTIUM END === */
   } = data;
 
@@ -121,6 +129,24 @@ export function composeAgentUpdatePayload(data: AgentForm, agent_id?: string | n
         }
       : voice_llm_model
         ? { model: voice_llm_model }
+        : undefined;
+  const alignedFallbackModelParameters =
+    fallback_llm_model_parameters && typeof fallback_llm_model_parameters === 'object'
+      ? {
+          ...fallback_llm_model_parameters,
+          ...(fallback_llm_model ? { model: fallback_llm_model } : {}),
+        }
+      : fallback_llm_model
+        ? { model: fallback_llm_model }
+        : undefined;
+  const alignedVoiceFallbackModelParameters =
+    voice_fallback_llm_model_parameters && typeof voice_fallback_llm_model_parameters === 'object'
+      ? {
+          ...voice_fallback_llm_model_parameters,
+          ...(voice_fallback_llm_model ? { model: voice_fallback_llm_model } : {}),
+        }
+      : voice_fallback_llm_model
+        ? { model: voice_fallback_llm_model }
         : undefined;
 
   return {
@@ -165,6 +191,27 @@ export function composeAgentUpdatePayload(data: AgentForm, agent_id?: string | n
       voice_llm_provider: voice_llm_provider ?? null,
       ...(alignedVoiceModelParameters !== undefined
         ? { voice_llm_model_parameters: alignedVoiceModelParameters }
+        : {}),
+      /* === VIVENTIUM START ===
+       * Feature: Voice Fallback LLM
+       * Send null when cleared to reset the voice-call fallback fields.
+       * Added: 2026-04-28
+       */
+      voice_fallback_llm_model: voice_fallback_llm_model ?? null,
+      voice_fallback_llm_provider: voice_fallback_llm_provider ?? null,
+      ...(alignedVoiceFallbackModelParameters !== undefined
+        ? { voice_fallback_llm_model_parameters: alignedVoiceFallbackModelParameters }
+        : {}),
+      /* === VIVENTIUM END === */
+      /* === VIVENTIUM START ===
+       * Feature: Agent Fallback LLM
+       * Send null when cleared to reset in DB, or the selected fallback model/provider.
+       * Added: 2026-04-28
+       */
+      fallback_llm_model: fallback_llm_model ?? null,
+      fallback_llm_provider: fallback_llm_provider ?? null,
+      ...(alignedFallbackModelParameters !== undefined
+        ? { fallback_llm_model_parameters: alignedFallbackModelParameters }
         : {}),
       /* === VIVENTIUM END === */
       ...(shouldResetAvatar ? { avatar: null } : {}),
@@ -610,6 +657,18 @@ export default function AgentPanel() {
         {canEditAgent && !agentQuery.isInitialLoading && activePanel === Panel.voiceLlmModel && (
           <VoiceLlmPanel models={models} providers={providers} setActivePanel={setActivePanel} />
         )}
+        {canEditAgent && !agentQuery.isInitialLoading && activePanel === Panel.fallbackLlmModel && (
+          <FallbackLlmPanel models={models} providers={providers} setActivePanel={setActivePanel} />
+        )}
+        {canEditAgent &&
+          !agentQuery.isInitialLoading &&
+          activePanel === Panel.voiceFallbackLlmModel && (
+            <VoiceFallbackLlmPanel
+              models={models}
+              providers={providers}
+              setActivePanel={setActivePanel}
+            />
+          )}
         {/* === VIVENTIUM END === */}
         {canEditAgent && !agentQuery.isInitialLoading && activePanel === Panel.builder && (
           <AgentConfig />

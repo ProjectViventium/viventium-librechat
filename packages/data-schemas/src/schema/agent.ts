@@ -175,6 +175,23 @@ const agentSchema = new Schema<IAgent>(
     voice_llm_model: { type: String, default: null },
     voice_llm_provider: { type: String, default: null },
     voice_llm_model_parameters: { type: Object, default: undefined },
+    /* === VIVENTIUM START ===
+     * Feature: Voice Fallback LLM
+     * Purpose: Store the voice-call secondary provider/model route separately from text fallback.
+     * Added: 2026-04-28
+     */
+    voice_fallback_llm_model: { type: String, default: null },
+    voice_fallback_llm_provider: { type: String, default: null },
+    voice_fallback_llm_model_parameters: { type: Object, default: undefined },
+    /* === VIVENTIUM END === */
+    /* === VIVENTIUM START ===
+     * Feature: Agent Fallback LLM
+     * Purpose: Store the user-visible secondary provider/model route.
+     * Added: 2026-04-28
+     */
+    fallback_llm_model: { type: String, default: null },
+    fallback_llm_provider: { type: String, default: null },
+    fallback_llm_model_parameters: { type: Object, default: undefined },
     /* === VIVENTIUM END === */
   },
   {

@@ -387,6 +387,22 @@ function rewriteAgentForRuntime(agent, { env = process.env } = {}) {
       rewritten.voice_llm_provider = null;
       rewritten.voice_llm_model = null;
     }
+    const voiceFallbackAssignment = readVoiceAssignment({
+      explicitProvider: rewritten.voice_fallback_llm_provider,
+      explicitModel: rewritten.voice_fallback_llm_model,
+      mainProvider: voiceAssignment?.provider || rewritten.provider,
+      mainModel: voiceAssignment?.model || rewritten.model,
+    });
+    if (voiceFallbackAssignment) {
+      rewritten.voice_fallback_llm_provider = voiceFallbackAssignment.provider;
+      rewritten.voice_fallback_llm_model = voiceFallbackAssignment.model;
+    } else if (
+      Object.prototype.hasOwnProperty.call(rewritten, 'voice_fallback_llm_provider') ||
+      Object.prototype.hasOwnProperty.call(rewritten, 'voice_fallback_llm_model')
+    ) {
+      rewritten.voice_fallback_llm_provider = null;
+      rewritten.voice_fallback_llm_model = null;
+    }
   }
   rewritten = pruneUnavailableTools(rewritten, { env });
   return rewritten;
@@ -536,6 +552,88 @@ function buildCanonicalPersistedAgentFields(agent, existingAgent = null, { env =
           };
 
     patch.voice_llm_model_parameters = mergedVoiceModelParameters;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(agent, 'voice_fallback_llm_provider')) {
+    patch.voice_fallback_llm_provider = agent.voice_fallback_llm_provider ?? null;
+  }
+  if (Object.prototype.hasOwnProperty.call(agent, 'voice_fallback_llm_model')) {
+    patch.voice_fallback_llm_model = agent.voice_fallback_llm_model ?? null;
+  }
+
+  const hasIncomingVoiceFallbackModelParameters = Object.prototype.hasOwnProperty.call(
+    agent,
+    'voice_fallback_llm_model_parameters',
+  );
+  const existingVoiceFallbackModelParameters =
+    existingAgent?.voice_fallback_llm_model_parameters &&
+    typeof existingAgent.voice_fallback_llm_model_parameters === 'object' &&
+    !Array.isArray(existingAgent.voice_fallback_llm_model_parameters)
+      ? deepClone(existingAgent.voice_fallback_llm_model_parameters)
+      : {};
+  const incomingVoiceFallbackModelParameters =
+    hasIncomingVoiceFallbackModelParameters &&
+    agent.voice_fallback_llm_model_parameters &&
+    typeof agent.voice_fallback_llm_model_parameters === 'object' &&
+    !Array.isArray(agent.voice_fallback_llm_model_parameters)
+      ? deepClone(agent.voice_fallback_llm_model_parameters)
+      : {};
+
+  if (
+    hasIncomingVoiceFallbackModelParameters ||
+    Object.prototype.hasOwnProperty.call(agent, 'voice_fallback_llm_model')
+  ) {
+    const mergedVoiceFallbackModelParameters =
+      patch.voice_fallback_llm_model === null
+        ? {}
+        : {
+            ...existingVoiceFallbackModelParameters,
+            ...incomingVoiceFallbackModelParameters,
+            ...(patch.voice_fallback_llm_model ? { model: patch.voice_fallback_llm_model } : {}),
+          };
+
+    patch.voice_fallback_llm_model_parameters = mergedVoiceFallbackModelParameters;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(agent, 'fallback_llm_provider')) {
+    patch.fallback_llm_provider = agent.fallback_llm_provider ?? null;
+  }
+  if (Object.prototype.hasOwnProperty.call(agent, 'fallback_llm_model')) {
+    patch.fallback_llm_model = agent.fallback_llm_model ?? null;
+  }
+
+  const hasIncomingFallbackModelParameters = Object.prototype.hasOwnProperty.call(
+    agent,
+    'fallback_llm_model_parameters',
+  );
+  const existingFallbackModelParameters =
+    existingAgent?.fallback_llm_model_parameters &&
+    typeof existingAgent.fallback_llm_model_parameters === 'object' &&
+    !Array.isArray(existingAgent.fallback_llm_model_parameters)
+      ? deepClone(existingAgent.fallback_llm_model_parameters)
+      : {};
+  const incomingFallbackModelParameters =
+    hasIncomingFallbackModelParameters &&
+    agent.fallback_llm_model_parameters &&
+    typeof agent.fallback_llm_model_parameters === 'object' &&
+    !Array.isArray(agent.fallback_llm_model_parameters)
+      ? deepClone(agent.fallback_llm_model_parameters)
+      : {};
+
+  if (
+    hasIncomingFallbackModelParameters ||
+    Object.prototype.hasOwnProperty.call(agent, 'fallback_llm_model')
+  ) {
+    const mergedFallbackModelParameters =
+      patch.fallback_llm_model === null
+        ? {}
+        : {
+            ...existingFallbackModelParameters,
+            ...incomingFallbackModelParameters,
+            ...(patch.fallback_llm_model ? { model: patch.fallback_llm_model } : {}),
+          };
+
+    patch.fallback_llm_model_parameters = mergedFallbackModelParameters;
   }
 
   return Object.keys(patch).length > 0 ? patch : null;

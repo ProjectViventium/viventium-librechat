@@ -17,7 +17,11 @@ import { useLiveAnnouncer } from '~/Providers';
 import { useLocalize } from '~/hooks';
 import type { AgentForm } from '~/common';
 
-type ModelParameterFieldName = 'model_parameters' | 'voice_llm_model_parameters';
+type ModelParameterFieldName =
+  | 'model_parameters'
+  | 'voice_llm_model_parameters'
+  | 'fallback_llm_model_parameters'
+  | 'voice_fallback_llm_model_parameters';
 
 type ModelParametersSectionProps = {
   fieldName: ModelParameterFieldName;

@@ -38,6 +38,12 @@ jest.mock('librechat-data-provider', () => ({
     voice_llm_model: null,
     voice_llm_provider: null,
     voice_llm_model_parameters: undefined,
+    voice_fallback_llm_model: null,
+    voice_fallback_llm_provider: null,
+    voice_fallback_llm_model_parameters: undefined,
+    fallback_llm_model: null,
+    fallback_llm_provider: null,
+    fallback_llm_model_parameters: undefined,
   },
 }));
 
@@ -73,7 +79,7 @@ describe('AgentSelect', () => {
     mockReset.mockReset();
   });
 
-  it('preserves voice-only model parameters when loading an existing agent into the form', async () => {
+  it('preserves voice and fallback model parameters when loading an existing agent into the form', async () => {
     const agent = {
       id: 'agent_123',
       name: 'Voice Agent',
@@ -86,6 +92,20 @@ describe('AgentSelect', () => {
         model: 'claude-haiku-4-5',
         temperature: 0.2,
         max_output_tokens: 220,
+      },
+      voice_fallback_llm_provider: 'openAI',
+      voice_fallback_llm_model: 'gpt-5.4',
+      voice_fallback_llm_model_parameters: {
+        model: 'gpt-5.4',
+        temperature: 0.1,
+        max_output_tokens: 320,
+      },
+      fallback_llm_provider: 'openAI',
+      fallback_llm_model: 'gpt-5.4',
+      fallback_llm_model_parameters: {
+        model: 'gpt-5.4',
+        temperature: 0.1,
+        max_output_tokens: 600,
       },
     };
 
@@ -107,6 +127,20 @@ describe('AgentSelect', () => {
         model: 'claude-haiku-4-5',
         temperature: 0.2,
         max_output_tokens: 220,
+      },
+      voice_fallback_llm_provider: 'openAI',
+      voice_fallback_llm_model: 'gpt-5.4',
+      voice_fallback_llm_model_parameters: {
+        model: 'gpt-5.4',
+        temperature: 0.1,
+        max_output_tokens: 320,
+      },
+      fallback_llm_provider: 'openAI',
+      fallback_llm_model: 'gpt-5.4',
+      fallback_llm_model_parameters: {
+        model: 'gpt-5.4',
+        temperature: 0.1,
+        max_output_tokens: 600,
       },
     });
   });

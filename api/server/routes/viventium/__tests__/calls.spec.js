@@ -54,6 +54,8 @@ jest.mock('~/server/services/viventium/CallSessionService', () => ({
     assistantRoute: {
       primary: { provider: 'anthropic', model: 'claude-opus-4-7' },
       voiceCallLlm: null,
+      fallbackLlm: null,
+      voiceFallbackLlm: null,
       effective: { provider: 'anthropic', model: 'claude-opus-4-7' },
       inheritsPrimary: true,
     },
@@ -76,6 +78,8 @@ jest.mock('~/server/services/viventium/CallSessionService', () => ({
     assistantRoute: {
       primary: { provider: 'anthropic', model: 'claude-opus-4-7' },
       voiceCallLlm: null,
+      fallbackLlm: null,
+      voiceFallbackLlm: null,
       effective: { provider: 'anthropic', model: 'claude-opus-4-7' },
       inheritsPrimary: true,
     },
@@ -230,6 +234,8 @@ describe('/api/viventium/calls', () => {
     expect(res.body.assistantRoute).toEqual({
       primary: { provider: 'anthropic', model: 'claude-opus-4-7' },
       voiceCallLlm: null,
+      fallbackLlm: null,
+      voiceFallbackLlm: null,
       effective: { provider: 'anthropic', model: 'claude-opus-4-7' },
       inheritsPrimary: true,
     });
@@ -264,6 +270,8 @@ describe('/api/viventium/calls', () => {
     expect(res.body.assistantRoute).toEqual({
       primary: { provider: 'anthropic', model: 'claude-opus-4-7' },
       voiceCallLlm: null,
+      fallbackLlm: null,
+      voiceFallbackLlm: null,
       effective: { provider: 'anthropic', model: 'claude-opus-4-7' },
       inheritsPrimary: true,
     });

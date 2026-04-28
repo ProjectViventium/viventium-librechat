@@ -154,6 +154,8 @@ export enum Panel {
   model = 'model',
   version = 'version',
   voiceLlmModel = 'voiceLlmModel',
+  fallbackLlmModel = 'fallbackLlmModel',
+  voiceFallbackLlmModel = 'voiceFallbackLlmModel',
 }
 
 export type FileSetter =

@@ -24,8 +24,19 @@ const TEST_ANTHROPIC_PERFORMANCE_KEY = buildAnthropicToken('performance', 'key')
 const TEST_ANTHROPIC_VARIATION_KEY = buildAnthropicToken('variation', 'key');
 
 describe('getLLMConfig', () => {
+  const originalAnthropicMaxRetries = process.env.VIVENTIUM_ANTHROPIC_MAX_RETRIES;
+
   beforeEach(() => {
     jest.clearAllMocks();
+    delete process.env.VIVENTIUM_ANTHROPIC_MAX_RETRIES;
+  });
+
+  afterAll(() => {
+    if (originalAnthropicMaxRetries == null) {
+      delete process.env.VIVENTIUM_ANTHROPIC_MAX_RETRIES;
+    } else {
+      process.env.VIVENTIUM_ANTHROPIC_MAX_RETRIES = originalAnthropicMaxRetries;
+    }
   });
 
   it('should create a basic configuration with default values', () => {
@@ -35,6 +46,35 @@ describe('getLLMConfig', () => {
     expect(result.llmConfig).toHaveProperty('model', 'claude-3-5-sonnet-latest');
     expect(result.llmConfig).toHaveProperty('stream', true);
     expect(result.llmConfig).toHaveProperty('maxTokens');
+  });
+
+  /* === VIVENTIUM START ===
+   * Feature: Fast Provider-Failure Fallback
+   * Purpose: Anthropic rate-limit retries must not hold fallback-eligible agent routes for
+   * roughly a minute before OpenAI/Codex fallback can respond.
+   * Added: 2026-04-28
+   * === VIVENTIUM END === */
+  it('should default Anthropic maxRetries to zero so provider limits fail fast for fallback routes', () => {
+    const result = getLLMConfig('test-api-key', { modelOptions: {} });
+
+    expect(result.llmConfig).toHaveProperty('maxRetries', 0);
+  });
+
+  it('should allow deployments to override Anthropic maxRetries by environment', () => {
+    process.env.VIVENTIUM_ANTHROPIC_MAX_RETRIES = '1';
+
+    const result = getLLMConfig('test-api-key', { modelOptions: {} });
+
+    expect(result.llmConfig).toHaveProperty('maxRetries', 1);
+  });
+
+  it('should let endpoint addParams override the Viventium Anthropic retry default', () => {
+    const result = getLLMConfig('test-api-key', {
+      modelOptions: {},
+      addParams: { maxRetries: 2 },
+    });
+
+    expect(result.llmConfig).toHaveProperty('maxRetries', 2);
   });
 
   it('should configure authToken + OAuth beta headers for subscription tokens', () => {

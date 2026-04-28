@@ -106,5 +106,20 @@ export interface IAgent extends Omit<Document, 'model'> {
   voice_llm_model?: string | null;
   voice_llm_provider?: string | null;
   voice_llm_model_parameters?: Record<string, unknown>;
+  /* === VIVENTIUM START ===
+   * Feature: Voice Fallback LLM
+   * Added: 2026-04-28
+   */
+  voice_fallback_llm_model?: string | null;
+  voice_fallback_llm_provider?: string | null;
+  voice_fallback_llm_model_parameters?: Record<string, unknown>;
+  /* === VIVENTIUM END === */
+  /* === VIVENTIUM START ===
+   * Feature: Agent Fallback LLM
+   * Added: 2026-04-28
+   */
+  fallback_llm_model?: string | null;
+  fallback_llm_provider?: string | null;
+  fallback_llm_model_parameters?: Record<string, unknown>;
   /* === VIVENTIUM END === */
 }

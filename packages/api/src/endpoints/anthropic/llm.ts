@@ -82,6 +82,21 @@ const OAUTH_REQUIRED_ANTHROPIC_BETAS = [
 ].join(',');
 
 const ANTHROPIC_OAUTH_SYSTEM_TEXT = "You are Claude Code, Anthropic's official CLI for Claude.";
+const DEFAULT_ANTHROPIC_MAX_RETRIES = 0;
+
+function resolveAnthropicMaxRetries(): number {
+  const rawValue = process.env.VIVENTIUM_ANTHROPIC_MAX_RETRIES;
+  if (rawValue == null || rawValue === '') {
+    return DEFAULT_ANTHROPIC_MAX_RETRIES;
+  }
+
+  const parsed = Number.parseInt(rawValue, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return DEFAULT_ANTHROPIC_MAX_RETRIES;
+  }
+
+  return parsed;
+}
 
 function isAnthropicOAuthToken(apiKey: string | null): boolean {
   return typeof apiKey === 'string' && apiKey.includes('sk-ant-oat');
@@ -542,6 +557,17 @@ function getLLMConfig(
         delete (requestOptions.invocationKwargs as Record<string, unknown>)[param];
       }
     });
+  }
+
+  /* === VIVENTIUM START ===
+   * Feature: Fast Provider-Failure Fallback
+   * Purpose: Keep Anthropic rate-limit/outage retries from delaying Agent fallback routes
+   * past real-time surfaces such as voice calls. Deployments can opt back into retries with
+   * VIVENTIUM_ANTHROPIC_MAX_RETRIES or explicit endpoint add/default params.
+   * Added: 2026-04-28
+   * === VIVENTIUM END === */
+  if ((requestOptions as Record<string, unknown>).maxRetries === undefined) {
+    (requestOptions as Record<string, unknown>).maxRetries = resolveAnthropicMaxRetries();
   }
 
   const tools = [];

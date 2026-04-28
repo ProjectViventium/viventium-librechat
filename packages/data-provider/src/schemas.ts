@@ -284,6 +284,16 @@ export const defaultAgentFormValues = {
   voice_llm_model: null,
   voice_llm_provider: null,
   voice_llm_model_parameters: undefined,
+  voice_fallback_llm_model: null,
+  voice_fallback_llm_provider: null,
+  voice_fallback_llm_model_parameters: undefined,
+  /* === VIVENTIUM START ===
+   * Feature: Agent Fallback LLM
+   * Added: 2026-04-28
+   */
+  fallback_llm_model: null,
+  fallback_llm_provider: null,
+  fallback_llm_model_parameters: undefined,
   /* === VIVENTIUM END === */
 };
 

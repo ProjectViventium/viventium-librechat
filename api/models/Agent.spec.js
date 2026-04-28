@@ -2347,6 +2347,78 @@ describe('models/Agent', () => {
           model: 'claude-haiku-4-5',
         });
       });
+
+      test('should persist fallback model parameters on the live agent document when versioning updates', async () => {
+        const agentId = `agent_${uuidv4()}`;
+        const authorId = new mongoose.Types.ObjectId();
+
+        await createAgent({
+          id: agentId,
+          name: 'Fallback Parameter Persistence Agent',
+          provider: 'anthropic',
+          model: 'claude-opus-4-7',
+          fallback_llm_provider: 'openAI',
+          fallback_llm_model: 'gpt-5.4',
+          author: authorId,
+        });
+
+        const updated = await updateAgent(
+          { id: agentId },
+          {
+            fallback_llm_provider: 'openAI',
+            fallback_llm_model: 'gpt-5.4',
+            fallback_llm_model_parameters: {
+              temperature: 0.1,
+            },
+          },
+        );
+
+        expect(updated.fallback_llm_model_parameters).toEqual({
+          temperature: 0.1,
+          model: 'gpt-5.4',
+        });
+        expect(updated.versions.at(-1).fallback_llm_model_parameters).toEqual({
+          temperature: 0.1,
+          model: 'gpt-5.4',
+        });
+      });
+
+      test('should persist voice fallback parameters on the live agent document when versioning updates', async () => {
+        const agentId = `agent_${uuidv4()}`;
+        const authorId = new mongoose.Types.ObjectId();
+
+        await createAgent({
+          id: agentId,
+          name: 'Voice Fallback Parameter Persistence Agent',
+          provider: 'anthropic',
+          model: 'claude-opus-4-7',
+          voice_llm_provider: 'anthropic',
+          voice_llm_model: 'claude-haiku-4-5',
+          voice_fallback_llm_provider: 'openAI',
+          voice_fallback_llm_model: 'gpt-5.4',
+          author: authorId,
+        });
+
+        const updated = await updateAgent(
+          { id: agentId },
+          {
+            voice_fallback_llm_provider: 'openAI',
+            voice_fallback_llm_model: 'gpt-5.4',
+            voice_fallback_llm_model_parameters: {
+              temperature: 0.1,
+            },
+          },
+        );
+
+        expect(updated.voice_fallback_llm_model_parameters).toEqual({
+          temperature: 0.1,
+          model: 'gpt-5.4',
+        });
+        expect(updated.versions.at(-1).voice_fallback_llm_model_parameters).toEqual({
+          temperature: 0.1,
+          model: 'gpt-5.4',
+        });
+      });
     });
   });
 

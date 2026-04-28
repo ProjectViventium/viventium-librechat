@@ -45,7 +45,7 @@ jest.mock('~/server/services/viventium/CallSessionService', () => ({
     expiresAtMs: 123,
     requestedVoiceRoute: {
       stt: { provider: 'openai', variant: 'gpt-4o-transcribe' },
-      tts: { provider: 'cartesia', variant: 'sonic-2' },
+      tts: { provider: 'cartesia', variant: '6ccbfb76-1fc6-48f7-b71d-91ac6298247b' },
     },
     savedVoiceRoute: {
       stt: { provider: 'openai', variant: 'gpt-4o-transcribe' },
@@ -221,7 +221,7 @@ describe('/api/viventium/calls', () => {
 
     expect(res.body.requestedVoiceRoute).toEqual({
       stt: { provider: 'openai', variant: 'gpt-4o-transcribe' },
-      tts: { provider: 'cartesia', variant: 'sonic-2' },
+      tts: { provider: 'cartesia', variant: '6ccbfb76-1fc6-48f7-b71d-91ac6298247b' },
     });
     expect(res.body.savedVoiceRoute).toEqual({
       stt: { provider: 'openai', variant: 'gpt-4o-transcribe' },

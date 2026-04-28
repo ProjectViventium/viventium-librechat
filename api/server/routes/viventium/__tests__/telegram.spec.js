@@ -666,7 +666,7 @@ describe('/api/viventium/telegram', () => {
   test('GET /voice-route returns the linked user voice route', async () => {
     mockResolveUserVoiceRoute.mockResolvedValueOnce({
       stt: { provider: 'assemblyai', variant: 'universal-streaming' },
-      tts: { provider: 'cartesia', variant: 'sonic-3' },
+      tts: { provider: 'cartesia', variant: '6ccbfb76-1fc6-48f7-b71d-91ac6298247b' },
     });
 
     const telegramRouter = require('../telegram');
@@ -685,14 +685,14 @@ describe('/api/viventium/telegram', () => {
     expect(mockResolveUserVoiceRoute).toHaveBeenCalledWith('user_1');
     expect(res.body.voiceRoute).toEqual({
       stt: { provider: 'assemblyai', variant: 'universal-streaming' },
-      tts: { provider: 'cartesia', variant: 'sonic-3' },
+      tts: { provider: 'cartesia', variant: '6ccbfb76-1fc6-48f7-b71d-91ac6298247b' },
     });
   });
 
   test('POST /chat overrides voiceProvider from the resolved voice route and returns it', async () => {
     mockResolveUserVoiceRoute.mockResolvedValueOnce({
       stt: { provider: 'pywhispercpp', variant: 'large-v3-turbo' },
-      tts: { provider: 'cartesia', variant: 'sonic-3' },
+      tts: { provider: 'cartesia', variant: '6ccbfb76-1fc6-48f7-b71d-91ac6298247b' },
     });
 
     const telegramRouter = require('../telegram');
@@ -716,7 +716,7 @@ describe('/api/viventium/telegram', () => {
     expect(lastVoiceProvider).toBe('cartesia');
     expect(res.body.voiceRoute).toEqual({
       stt: { provider: 'pywhispercpp', variant: 'large-v3-turbo' },
-      tts: { provider: 'cartesia', variant: 'sonic-3' },
+      tts: { provider: 'cartesia', variant: '6ccbfb76-1fc6-48f7-b71d-91ac6298247b' },
     });
   });
 

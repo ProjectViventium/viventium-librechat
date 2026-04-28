@@ -27,6 +27,68 @@ function resolveViventiumSurface(req) {
   return '';
 }
 
+const CARTESIA_SONIC3_EMOTIONS = [
+  'happy',
+  'excited',
+  'enthusiastic',
+  'elated',
+  'euphoric',
+  'triumphant',
+  'amazed',
+  'surprised',
+  'flirtatious',
+  'joking/comedic',
+  'curious',
+  'content',
+  'peaceful',
+  'serene',
+  'calm',
+  'grateful',
+  'affectionate',
+  'trust',
+  'sympathetic',
+  'anticipation',
+  'mysterious',
+  'angry',
+  'mad',
+  'outraged',
+  'frustrated',
+  'agitated',
+  'threatened',
+  'disgusted',
+  'contempt',
+  'envious',
+  'sarcastic',
+  'ironic',
+  'sad',
+  'dejected',
+  'melancholic',
+  'disappointed',
+  'hurt',
+  'guilty',
+  'bored',
+  'tired',
+  'rejected',
+  'nostalgic',
+  'wistful',
+  'apologetic',
+  'hesitant',
+  'insecure',
+  'confused',
+  'resigned',
+  'anxious',
+  'panicked',
+  'alarmed',
+  'scared',
+  'neutral',
+  'proud',
+  'confident',
+  'distant',
+  'skeptical',
+  'contemplative',
+  'determined',
+];
+
 function buildVoiceModeInstructions(voiceProvider) {
   const override = (process.env.VIVENTIUM_VOICE_MODE_PROMPT || '').trim();
   if (override) {
@@ -57,19 +119,23 @@ function buildVoiceModeInstructions(voiceProvider) {
   if (provider === 'cartesia') {
     return [
       ...baseRules,
-      '- Allowed nonverbal markers (use exactly these tokens): [laughter], [sigh], [gasp], [breath], [hmm].',
+      '- Cartesia Sonic-3 TTS is selected. You may use Cartesia SSML-like tags in the assistant text when they improve spoken delivery.',
+      '- Allowed nonverbal marker from Cartesia docs: [laughter]. Use it only when actual laughter belongs in the spoken response.',
       '- Put nonverbal markers on their own line or between sentences (do not embed inside a sentence).',
       '- Do NOT invent other bracketed stage directions.',
       /* === VIVENTIUM NOTE ===
        * Feature: Cartesia SSML emotion parity (self-closing tags).
        * Purpose: Align the model-facing contract with Cartesia docs and our adapter parsing.
-       * Updated 2026-02-22: Added recommended emotion list (Cartesia primary set) and <break> guidance.
+       * Updated 2026-04-28: Sonic-3 emotion list, speed/volume tags, and streaming-safe complete tag guidance.
        */
-      '- Optional emotion control (preferred): <emotion value="excited"/> before a sentence to set the tone for subsequent text (until changed).',
+      '- Optional emotion control (preferred): <emotion value="calm"/> before a sentence to set the tone for subsequent text (until changed).',
       '- Optional wrapper form (also supported): <emotion value="excited">TEXT</emotion> to apply emotion to a specific phrase only.',
-      '- Recommended emotions (most reliable): neutral, excited, content, sad, angry, scared, curious, calm, surprised, contemplative.',
+      `- Allowed emotion values: ${CARTESIA_SONIC3_EMOTIONS.join(', ')}.`,
+      '- Primary/highest-reliability emotion values: neutral, angry, excited, content, sad, scared.',
+      '- Optional speed/volume control: use <speed ratio="1.1"/> or <volume ratio="0.9"/> before a sentence; speed must be 0.6-1.5 and volume must be 0.5-2.0.',
       '- Use <break time="1s"/> for natural pauses between thoughts (supports seconds "1s" or milliseconds "500ms").',
-      '- If demoing emotions, change emotion once per sentence and avoid extra preamble.',
+      '- Write every SSML-like tag as one complete tag with the full attribute value. Do not output partial tags or explain the markup.',
+      '- Use emotion, speed, volume, and break tags sparingly; natural wording still matters more than markup.',
       /* === VIVENTIUM NOTE === */
     ].join('\n');
   }

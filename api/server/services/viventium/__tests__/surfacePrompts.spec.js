@@ -126,6 +126,7 @@ describe('buildVoiceModeInstructions', () => {
     const result = buildVoiceModeInstructions('cartesia');
     expect(result).toContain('VOICE MODE:');
     expect(result).toContain('[laughter]');
+    expect(result).not.toContain('[sigh]');
     expect(result).toContain('<emotion value=');
     expect(result).toContain('nonverbal markers');
   });
@@ -186,12 +187,21 @@ describe('buildVoiceModeInstructions', () => {
 
   // === VIVENTIUM START ===
   // Feature: Cartesia emotion list and break tag tests (added 2026-02-22)
-  test('cartesia branch includes recommended emotion list', () => {
+  test('cartesia branch includes complete Sonic-3 emotion list', () => {
     const result = buildVoiceModeInstructions('cartesia');
-    expect(result).toContain('Recommended emotions');
+    expect(result).toContain('Allowed emotion values');
     expect(result).toContain('neutral');
     expect(result).toContain('excited');
     expect(result).toContain('calm');
+    expect(result).toContain('joking/comedic');
+    expect(result).toContain('determined');
+  });
+
+  test('cartesia branch includes speed and volume tag guidance', () => {
+    const result = buildVoiceModeInstructions('cartesia');
+    expect(result).toContain('<speed ratio=');
+    expect(result).toContain('<volume ratio=');
+    expect(result).toContain('complete tag');
   });
 
   test('cartesia branch includes break tag guidance', () => {

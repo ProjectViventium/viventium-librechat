@@ -1,4 +1,7 @@
 import { Types } from 'mongoose';
+import fs from 'fs';
+import path from 'path';
+import yaml from 'js-yaml';
 import { TokenExchangeMethodEnum } from 'librechat-data-provider';
 import type { MCPOptions } from 'librechat-data-provider';
 import type { IUser } from '@librechat/data-schemas';
@@ -1135,6 +1138,134 @@ describe('processMCPEnv', () => {
         'X-Message-Id': 'msg-789',
       },
     });
+  });
+
+  it('should process request-scoped upload body placeholders as encoded JSON headers', () => {
+    const body = {
+      conversationId: 'conv-123',
+      files: [
+        {
+          file_id: 'file-123',
+          filename: 'brief.txt',
+          filepath: '/tmp/librechat/upload/brief.txt',
+          source: 'local',
+        },
+      ],
+      tool_resources: {
+        execute_code: {
+          file_ids: ['file-123'],
+        },
+      },
+    };
+
+    const options: MCPOptions = {
+      type: 'streamable-http',
+      url: 'https://api.example.com/mcp',
+      headers: {
+        'X-Files': '{{LIBRECHAT_BODY_FILES_JSON_B64}}',
+        'X-Tool-Resources': '{{LIBRECHAT_BODY_TOOL_RESOURCES_JSON_B64}}',
+      },
+    };
+
+    const result = processMCPEnv({ options, body });
+
+    const filesHeader = result.headers?.['X-Files'] ?? '';
+    const toolsHeader = result.headers?.['X-Tool-Resources'] ?? '';
+    expect(filesHeader.startsWith('b64:')).toBe(true);
+    expect(toolsHeader.startsWith('b64:')).toBe(true);
+    expect(JSON.parse(Buffer.from(filesHeader.slice(4), 'base64').toString('utf8'))).toEqual(
+      body.files,
+    );
+    expect(JSON.parse(Buffer.from(toolsHeader.slice(4), 'base64').toString('utf8'))).toEqual(
+      body.tool_resources,
+    );
+  });
+
+  it('resolves all source-of-truth GlassHive request-context header placeholders', () => {
+    const sourcePath = path.resolve(
+      __dirname,
+      '../../../../viventium/source_of_truth/local.librechat.yaml',
+    );
+    const source = yaml.load(fs.readFileSync(sourcePath, 'utf8')) as {
+      mcpServers?: Record<
+        string,
+        { dbId?: string; headers?: Record<string, string>; viventiumRequestContext?: boolean }
+      >;
+    };
+    const server = source.mcpServers?.['glasshive-workers-projects'];
+    const headers = server?.headers;
+    expect(headers).toBeTruthy();
+    expect(server?.viventiumRequestContext).toBe(true);
+
+    const body = {
+      conversationId: 'conv-123',
+      parentMessageId: 'parent-456',
+      messageId: 'assistant-789',
+      viventiumSurface: 'telegram',
+      viventiumInputMode: 'voice_note',
+      viventiumStreamId: 'stream-123',
+      viventiumVoiceCallSessionId: 'call-123',
+      viventiumVoiceRequestId: 'voice-req-123',
+      viventiumTelegramChatId: 'chat-123',
+      viventiumTelegramUserId: 'tg-user-123',
+      viventiumTelegramMessageId: 'tg-msg-123',
+      files: [{ file_id: 'file-123', filename: 'brief.txt' }],
+      attachments: [{ file_id: 'file-123', filename: 'brief.txt' }],
+      tool_resources: { code_interpreter: { file_ids: ['file-123'] } },
+      file_ids: ['file-123'],
+    };
+    const options: MCPOptions = {
+      type: 'streamable-http',
+      url: 'https://api.example.com/mcp',
+      headers,
+    };
+
+    const result = processMCPEnv({ options, body, user: createTestUser({ id: 'user-123' }) });
+    if (!isStreamableHTTPOptions(result)) {
+      throw new Error('Expected streamable-http options');
+    }
+
+    for (const value of Object.values(result.headers ?? {})) {
+      expect(value).not.toContain('{{LIBRECHAT_BODY_');
+    }
+    expect(result.headers?.['X-Viventium-Surface']).toBe('telegram');
+    expect(result.headers?.['X-Viventium-Stream-Id']).toBe('stream-123');
+    expect(result.headers?.['X-Viventium-Voice-Call-Session-Id']).toBe('call-123');
+    expect(result.headers?.['X-Viventium-Telegram-Chat-Id']).toBe('chat-123');
+    expect(result.headers?.['X-Viventium-Request-Files']?.startsWith('b64:')).toBe(true);
+    expect(result.headers?.['X-Viventium-Tool-Resources']?.startsWith('b64:')).toBe(true);
+
+    const dbSourcedResult = processMCPEnv({
+      options: { ...options, dbId: 'glasshive-db-server', viventiumRequestContext: true },
+      body,
+      user: createTestUser({ id: 'user-123' }),
+      dbSourced: true,
+    });
+    if (!isStreamableHTTPOptions(dbSourcedResult)) {
+      throw new Error('Expected streamable-http options');
+    }
+    expect(dbSourcedResult.headers?.['X-Viventium-User-Id']).toBe('user-123');
+    expect(dbSourcedResult.headers?.['X-Viventium-Conversation-Id']).toBe('conv-123');
+    expect(dbSourcedResult.headers?.['X-Viventium-Message-Id']).toBe('assistant-789');
+    expect(dbSourcedResult.headers?.['X-Viventium-Request-Files']?.startsWith('b64:')).toBe(true);
+  });
+
+  it('should not process request-scoped upload body placeholders for DB-sourced MCP options', () => {
+    const body = {
+      files: [{ file_id: 'file-123', filename: 'brief.txt' }],
+    };
+    const options: MCPOptions & { dbId?: string } = {
+      dbId: 'server-from-db',
+      type: 'streamable-http',
+      url: 'https://api.example.com/mcp',
+      headers: {
+        'X-Files': '{{LIBRECHAT_BODY_FILES_JSON_B64}}',
+      },
+    };
+
+    const result = processMCPEnv({ options, body });
+
+    expect(result.headers?.['X-Files']).toBe('{{LIBRECHAT_BODY_FILES_JSON_B64}}');
   });
 
   it('should handle mixed placeholders in OAuth configuration', () => {

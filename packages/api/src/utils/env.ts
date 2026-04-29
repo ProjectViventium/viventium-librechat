@@ -107,7 +107,31 @@ export function createSafeUser(
  * List of allowed request body fields that can be used in header placeholders.
  * These are common fields from the request body that are safe to expose in headers.
  */
-const ALLOWED_BODY_FIELDS = ['conversationId', 'parentMessageId', 'messageId'] as const;
+const ALLOWED_BODY_FIELDS = [
+  'conversationId',
+  'parentMessageId',
+  'messageId',
+  /* === VIVENTIUM START ===
+   * Feature: MCP request-scoped upload projection
+   * Purpose: First-party MCP servers such as GlassHive need the same uploaded-file
+   *          references and surface metadata the current agent request already has.
+   *          DB-sourced MCP configs still cannot resolve LIBRECHAT_BODY placeholders.
+   * Added: 2026-04-28
+   */
+  'viventiumSurface',
+  'viventiumInputMode',
+  'viventiumStreamId',
+  'viventiumVoiceRequestId',
+  'viventiumVoiceCallSessionId',
+  'viventiumTelegramChatId',
+  'viventiumTelegramUserId',
+  'viventiumTelegramMessageId',
+  'files',
+  'attachments',
+  'tool_resources',
+  'file_ids',
+  /* === VIVENTIUM END === */
+] as const;
 
 /**
  * Processes a string value to replace user field placeholders.
@@ -173,21 +197,49 @@ function processUserPlaceholders(
  * @param body - The request body object
  * @returns The processed string with placeholders replaced
  */
-function processBodyPlaceholders(value: string, body: RequestBody): string {
+function bodyFieldToString(fieldValue: unknown): string {
+  if (fieldValue == null) {
+    return '';
+  }
+  if (typeof fieldValue === 'string') {
+    return fieldValue;
+  }
+  if (typeof fieldValue === 'object') {
+    return JSON.stringify(fieldValue);
+  }
+  return String(fieldValue);
+}
+
+function processBodyPlaceholders(value: string, body: RequestBody, isHeader: boolean = false): string {
   // Type guard: ensure value is a string
   if (typeof value !== 'string') {
     return value;
   }
 
   for (const field of ALLOWED_BODY_FIELDS) {
-    const placeholder = `{{LIBRECHAT_BODY_${field.toUpperCase()}}}`;
-    if (!value.includes(placeholder)) {
-      continue;
+    const upperField = field.toUpperCase();
+    const fieldValue = body[field];
+    const replacementValue = bodyFieldToString(fieldValue);
+    const jsonB64Placeholder = `{{LIBRECHAT_BODY_${upperField}_JSON_B64}}`;
+    const jsonPlaceholder = `{{LIBRECHAT_BODY_${upperField}_JSON}}`;
+    const placeholder = `{{LIBRECHAT_BODY_${upperField}}}`;
+
+    if (value.includes(jsonB64Placeholder)) {
+      const encoded = replacementValue
+        ? `b64:${Buffer.from(replacementValue, 'utf8').toString('base64')}`
+        : '';
+      value = value.replace(new RegExp(jsonB64Placeholder, 'g'), encoded);
     }
 
-    const fieldValue = body[field];
-    const replacementValue = fieldValue == null ? '' : String(fieldValue);
-    value = value.replace(new RegExp(placeholder, 'g'), replacementValue);
+    if (value.includes(jsonPlaceholder)) {
+      const safeReplacement = isHeader ? encodeHeaderValue(replacementValue) : replacementValue;
+      value = value.replace(new RegExp(jsonPlaceholder, 'g'), safeReplacement);
+    }
+
+    if (value.includes(placeholder)) {
+      const safeReplacement = isHeader ? encodeHeaderValue(replacementValue) : replacementValue;
+      value = value.replace(new RegExp(placeholder, 'g'), safeReplacement);
+    }
   }
 
   return value;
@@ -210,6 +262,7 @@ function processSingleValue({
   body = undefined,
   isHeader = false,
   dbSourced = false,
+  allowTrustedRequestContext = false,
 }: {
   originalValue: string;
   customUserVars?: Record<string, string>;
@@ -218,6 +271,8 @@ function processSingleValue({
   isHeader?: boolean;
   /** When true, only resolve customUserVars — skip env vars, user/OpenID/body placeholders */
   dbSourced?: boolean;
+  /** For trusted first-party MCPs, resolve user/body request context but never env/OpenID tokens */
+  allowTrustedRequestContext?: boolean;
 }): string {
   // Type guard: ensure we're working with a string
   if (typeof originalValue !== 'string') {
@@ -236,6 +291,12 @@ function processSingleValue({
   }
 
   if (dbSourced) {
+    if (allowTrustedRequestContext) {
+      value = processUserPlaceholders(value, user, isHeader);
+      if (body) {
+        value = processBodyPlaceholders(value, body, isHeader);
+      }
+    }
     return value;
   }
 
@@ -247,7 +308,7 @@ function processSingleValue({
   }
 
   if (body) {
-    value = processBodyPlaceholders(value, body);
+    value = processBodyPlaceholders(value, body, isHeader);
   }
 
   value = extractEnvVariable(value);
@@ -280,6 +341,10 @@ export function processMCPEnv(params: {
 
   /** Derive dbSourced from explicit param OR from dbId on the options (failsafe for callers that forget the flag) */
   const dbSourced = params.dbSourced ?? !!options.dbId;
+  const allowTrustedRequestContext =
+    dbSourced === true &&
+    (options as Readonly<MCPOptions> & { viventiumRequestContext?: boolean })
+      .viventiumRequestContext === true;
 
   const newObj: MCPOptions = structuredClone(options);
 
@@ -322,6 +387,7 @@ export function processMCPEnv(params: {
         user,
         body,
         dbSourced,
+        allowTrustedRequestContext,
         originalValue,
         customUserVars,
       });
@@ -333,7 +399,14 @@ export function processMCPEnv(params: {
     const processedArgs: string[] = [];
     for (const originalValue of newObj.args) {
       processedArgs.push(
-        processSingleValue({ originalValue, customUserVars, user, body, dbSourced }),
+        processSingleValue({
+          originalValue,
+          customUserVars,
+          user,
+          body,
+          dbSourced,
+          allowTrustedRequestContext,
+        }),
       );
     }
     newObj.args = processedArgs;
@@ -348,6 +421,7 @@ export function processMCPEnv(params: {
         user,
         body,
         dbSourced,
+        allowTrustedRequestContext,
         originalValue,
         customUserVars,
         isHeader: true, // Important: Enable header encoding
@@ -362,6 +436,7 @@ export function processMCPEnv(params: {
       user,
       body,
       dbSourced,
+      allowTrustedRequestContext,
       customUserVars,
       originalValue: newObj.url,
     });
@@ -378,6 +453,7 @@ export function processMCPEnv(params: {
           user,
           body,
           dbSourced,
+          allowTrustedRequestContext,
           originalValue,
           customUserVars,
         });

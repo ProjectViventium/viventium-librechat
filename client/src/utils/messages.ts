@@ -25,7 +25,7 @@ export const getLatestText = (message?: TMessage | null, includeIndex?: boolean)
   if (message.text) {
     return message.text;
   }
-  if (message.content && message.content.length > 0) {
+  if (Array.isArray(message.content) && message.content.length > 0) {
     for (let i = message.content.length - 1; i >= 0; i--) {
       const part = message.content[i] as TMessageContentParts | undefined;
       if (part && part.type !== ContentTypes.TEXT) {
@@ -56,7 +56,7 @@ export const getAllContentText = (message?: TMessage | null): string => {
     return message.text;
   }
 
-  if (message.content && message.content.length > 0) {
+  if (Array.isArray(message.content) && message.content.length > 0) {
     return message.content
       .filter((part) => part != null && part.type === ContentTypes.TEXT)
       .map((part) => {
@@ -86,7 +86,7 @@ const getLatestContentForKey = (message: TMessage): string => {
     return formatText(message.text, -1);
   }
 
-  if (!message.content || message.content.length === 0) {
+  if (!Array.isArray(message.content) || message.content.length === 0) {
     return '';
   }
 

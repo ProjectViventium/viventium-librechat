@@ -589,6 +589,78 @@ function getActivationFormat(config) {
   return DEFAULT_ACTIVATION_RESPONSE_FORMAT;
 }
 
+function normalizeAgentToolNames(mainAgent) {
+  const tools = Array.isArray(mainAgent?.tools) ? mainAgent.tools : [];
+  return tools
+    .map((tool) => {
+      if (typeof tool === 'string') {
+        return tool.trim();
+      }
+      if (tool && typeof tool === 'object') {
+        return String(tool.name || tool.tool || tool.id || '').trim();
+      }
+      return '';
+    })
+    .filter(Boolean);
+}
+
+function buildActivationPolicySection({ config, mainAgent }) {
+  const policy = config?.viventium?.background_cortices?.activation_policy;
+  if (!policy?.enabled) {
+    return { section: '', connectedSurfaces: [] };
+  }
+
+  const prompt = String(policy.prompt || '').trim();
+  const toolNames = normalizeAgentToolNames(mainAgent);
+  const toolSet = new Set(toolNames);
+  const declaredSurfaces = Array.isArray(policy.direct_action_mcp_servers)
+    ? policy.direct_action_mcp_servers
+    : [];
+  const connectedSurfaces = [];
+
+  for (const surface of declaredSurfaces) {
+    if (!surface || typeof surface !== 'object') {
+      continue;
+    }
+    const exactToolNames = Array.isArray(surface.tool_names)
+      ? surface.tool_names.map((tool) => String(tool || '').trim()).filter(Boolean)
+      : [];
+    const connectedToolNames = exactToolNames.filter((tool) => toolSet.has(tool));
+    if (exactToolNames.length > 0 && connectedToolNames.length === 0) {
+      continue;
+    }
+    connectedSurfaces.push({
+      server: String(surface.server || surface.name || '').trim(),
+      owns: String(surface.owns || surface.description || '').trim(),
+      connectedToolNames,
+    });
+  }
+
+  const directActionRule = String(policy.direct_action_tool_rule || '').trim();
+  const lines = ['## Global Activation Policy:'];
+  if (prompt) {
+    lines.push(prompt);
+  }
+  if (connectedSurfaces.length > 0) {
+    lines.push('', 'Connected main-agent direct-action surfaces:');
+    for (const surface of connectedSurfaces.slice(0, 8)) {
+      const label = surface.server || 'declared direct-action surface';
+      const owns = surface.owns ? ` — owns: ${surface.owns.slice(0, 180)}` : '';
+      lines.push(`- ${label}${owns}`);
+    }
+  }
+  if (directActionRule) {
+    lines.push('', directActionRule);
+  }
+  if (lines.length === 1) {
+    return { section: '', connectedSurfaces };
+  }
+  return {
+    section: `${lines.join('\n')}\n\n`,
+    connectedSurfaces,
+  };
+}
+
 /**
  * Extract text content from message content in a consistent way.
  * @param {string|object|Array} content
@@ -715,6 +787,14 @@ function getLastUserMessageText(messages) {
 
 function normalizeActivationText(text) {
   return String(text || '').replace(/\s+/g, ' ').trim();
+}
+
+function hasVisibleCortexInsight(insight) {
+  if (typeof insight !== 'string') {
+    return false;
+  }
+  const trimmed = insight.trim();
+  return Boolean(trimmed) && !isNoResponseOnly(trimmed);
 }
 
 const RETRYABLE_ACTIVATION_STATUS_CODES = new Set([401, 402, 403, 429, 500, 502, 503, 504]);
@@ -1207,7 +1287,7 @@ async function invokeActivationClassifierAttempt({
  * @param {object} [params.req] - Express request object (required for custom endpoints)
  * @returns {Promise<{ shouldActivate: boolean, confidence: number, reason: string, agentId: string }>}
  */
-async function checkCortexActivation({ cortexConfig, messages, runId, req, timeoutMs = 0 }) {
+async function checkCortexActivation({ cortexConfig, messages, runId, req, mainAgent = null, timeoutMs = 0 }) {
   const { agent_id, activation } = cortexConfig;
 
   if (!activation?.enabled) {
@@ -1276,7 +1356,9 @@ async function checkCortexActivation({ cortexConfig, messages, runId, req, timeo
 
   // Build the activation prompt
   const activationFormat = getActivationFormat(appConfig);
+  const activationPolicy = buildActivationPolicySection({ config: appConfig, mainAgent });
   const fullPrompt = `## Cortex Activation Criteria:
+${activationPolicy.section}
 ${activationPrompt}
 
 ${requestMetaSection}${latestUserIntentSection}## Recent Conversation:
@@ -1380,6 +1462,7 @@ ${activationFormat}`;
           confidence: parsed.confidence,
           reason: parsed.reason,
           agentId: agent_id,
+          directActionSurfaces: activationPolicy.connectedSurfaces.map((surface) => surface.server).filter(Boolean),
           providerUsed: providerName,
           modelUsed: attempt.model,
           providerAttempts,
@@ -2076,6 +2159,7 @@ async function detectActivations({
             messages,
             runId,
             req,
+            mainAgent,
             timeoutMs,
           }),
         ),
@@ -2122,12 +2206,16 @@ async function detectActivations({
       const shouldActivate = Boolean(result.shouldActivate);
       const confidence = Number(result.confidence) || 0;
       const reason = String(result.reason || '');
+      const directActionSurfaces = Array.isArray(result.directActionSurfaces)
+        ? result.directActionSurfaces.map((item) => String(item || '').trim()).filter(Boolean)
+        : [];
       logVoicePhaseAStage(
         req,
         'activation_check_done',
         cortexCheckStartAt,
         `agent_id=${agentId} activate=${shouldActivate} reason=${reason || 'none'} ` +
-          `confidence=${confidence.toFixed(2)} timeout_budget_ms=${timeoutMs}`,
+          `confidence=${confidence.toFixed(2)} timeout_budget_ms=${timeoutMs} ` +
+          `direct_action_surfaces=${directActionSurfaces.join(',') || 'none'}`,
       );
 
       return {
@@ -2136,6 +2224,7 @@ async function detectActivations({
         reason,
         agentId,
         activationScope,
+        directActionSurfaces,
         durationMs,
         timeoutBudgetMs: timeoutMs,
       };
@@ -2355,15 +2444,14 @@ async function executeActivated({
         clearTimeout(timeoutId);
       }
 
-      // Notify UI when individual cortex completes
-      // Fire completion event even if insight is empty (successful execution with no insight is still complete)
-      if (result && !result.error && onCortexComplete) {
+      // Notify UI only when there is a real insight. Empty/{NTA} cortex output is silent success.
+      if (result && !result.error && hasVisibleCortexInsight(result.insight) && onCortexComplete) {
         try {
           onCortexComplete({
             cortex_id: result.agentId,
             cortex_name: sanitizeCortexDisplayName(result.agentName),
             status: 'complete',
-            insight: result.insight || null, // Allow empty/null insight for successful completion
+            insight: result.insight,
             activation_scope: result.activationScope || null,
             configured_tools: result.configuredTools || 0,
             completed_tool_calls: result.completedToolCalls || 0,
@@ -2571,6 +2659,7 @@ async function processBackgroundCortices({
         messages,
         runId,
         req,
+        mainAgent,
       });
       // Attach the name to the result for later use
       return { ...result, cortexName };
@@ -2775,6 +2864,9 @@ module.exports = {
   executeCortex,
   parseActivationResponse,
   formatHistoryForActivation,
+  buildActivationPolicySection,
+  normalizeAgentToolNames,
+  hasVisibleCortexInsight,
   ACTIVATION_SYSTEM_PROMPT,
   // Exported for unit testing only
   createBackgroundRes,

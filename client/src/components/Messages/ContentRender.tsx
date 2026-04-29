@@ -1,7 +1,7 @@
 import { useCallback, useMemo, memo } from 'react';
 import { useAtomValue } from 'jotai';
 import { useRecoilValue } from 'recoil';
-import type { TMessage, TMessageContentParts } from 'librechat-data-provider';
+import type { TMessage } from 'librechat-data-provider';
 import type { TMessageProps, TMessageIcon } from '~/common';
 import { useAttachments, useLocalize, useMessageActions, useContentMetadata } from '~/hooks';
 import ContentParts from '~/components/Chat/Messages/Content/ContentParts';
@@ -158,7 +158,7 @@ const ContentRender = memo(function ContentRender({
               isSubmitting={effectiveIsSubmitting}
               isCreatedByUser={msg.isCreatedByUser}
               conversationId={conversation?.conversationId}
-              content={msg.content as Array<TMessageContentParts | undefined>}
+              content={msg.content}
             />
           </div>
           {hasNoChildren && effectiveIsSubmitting ? (

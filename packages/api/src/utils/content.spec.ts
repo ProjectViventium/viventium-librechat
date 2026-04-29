@@ -158,6 +158,61 @@ describe('filterMalformedContentParts', () => {
       });
     });
 
+    it('should keep only the latest streamed snapshot for a repeated tool_call id', () => {
+      const parts: TMessageContentParts[] = [
+        {
+          type: ContentTypes.TOOL_CALL,
+          tool_call: {
+            id: 'call_projects_list',
+            name: 'projects_list',
+            args: '{}',
+            type: ToolCallTypes.TOOL_CALL,
+            progress: 0.1,
+            output: '',
+          },
+        },
+        {
+          type: ContentTypes.TOOL_CALL,
+          tool_call: {
+            id: 'call_projects_list',
+            name: 'projects_list',
+            args: '',
+            type: ToolCallTypes.TOOL_CALL,
+            progress: 0.1,
+            output: '',
+          },
+        },
+        {
+          type: ContentTypes.TOOL_CALL,
+          tool_call: {
+            id: 'call_projects_list',
+            name: 'projects_list',
+            args: '{}',
+            type: ToolCallTypes.TOOL_CALL,
+            progress: 1,
+            output: '[{"project_id":"prj_public_safe"}]',
+          },
+        },
+        {
+          type: ContentTypes.TOOL_CALL,
+          tool_call: {
+            id: 'call_workers_list',
+            name: 'workers_list',
+            args: '{"project_id":"prj_public_safe"}',
+            type: ToolCallTypes.TOOL_CALL,
+            progress: 1,
+            output: '[{"worker_id":"wrk_public_safe"}]',
+          },
+        },
+      ];
+
+      const result = filterMalformedContentParts(parts);
+
+      expect(result).toHaveLength(2);
+      expect(result[0]).toEqual(parts[2]);
+      expect(result[1]).toEqual(parts[3]);
+    });
+
     it('should handle empty array', () => {
       const result = filterMalformedContentParts([]);
       expect(result).toEqual([]);

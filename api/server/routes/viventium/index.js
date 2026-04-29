@@ -32,6 +32,10 @@ const auth = require('./auth');
  * Feature: Local Skyvern provider bridge routes.
  * === VIVENTIUM NOTE === */
 const skyvern = require('./skyvern');
+/* === VIVENTIUM NOTE ===
+ * Feature: GlassHive host-worker callback receiver.
+ * === VIVENTIUM NOTE === */
+const glasshive = require('./glasshive');
 
 const router = express.Router();
 
@@ -46,5 +50,6 @@ router.use('/registration', registration);
 router.use('/credits', credits);
 router.use('/auth', auth);
 router.use('/skyvern', skyvern);
+router.use('/glasshive', glasshive);
 
 module.exports = router;

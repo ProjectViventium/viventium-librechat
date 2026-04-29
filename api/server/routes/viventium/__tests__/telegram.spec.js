@@ -856,6 +856,47 @@ describe('/api/viventium/telegram', () => {
     });
   });
 
+  test('GET glasshive returns latest worker callback for Telegram polling', async () => {
+    const telegramRouter = require('../telegram');
+    const app = createTestApp(telegramRouter);
+
+    mockGetMessages.mockResolvedValueOnce([
+      {
+        messageId: 'gh-callback-1',
+        parentMessageId: 'assistant-msg-1',
+        text: 'The invoice check is done.',
+        createdAt: '2026-04-28T22:15:00.000Z',
+        metadata: {
+          viventium: {
+            type: 'glasshive_worker_callback',
+            anchorMessageId: 'assistant-msg-1',
+            workerId: 'wrk-1',
+            runId: 'run-1',
+            event: 'run.completed',
+          },
+        },
+      },
+    ]);
+
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/telegram/glasshive/assistant-msg-1?conversationId=conv-1',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      query: { conversationId: 'conv-1', telegramUserId: 'tg-1' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body.latest.text).toBe('The invoice check is done.');
+    expect(mockGetMessages).toHaveBeenCalledWith({
+      user: 'user_1',
+      conversationId: 'conv-1',
+      'metadata.viventium.type': 'glasshive_worker_callback',
+    });
+  });
+
   test('GET cortex resolves deferred fallback canonical text when follow-up is absent', async () => {
     const telegramRouter = require('../telegram');
     const app = createTestApp(telegramRouter);

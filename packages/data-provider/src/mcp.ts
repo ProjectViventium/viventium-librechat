@@ -31,6 +31,13 @@ const BaseOptionsSchema = z.object({
    * - string: Use custom instructions (overrides server-provided)
    */
   serverInstructions: z.union([z.boolean(), z.string()]).optional(),
+  /* === VIVENTIUM START ===
+   * Feature: First-party MCP request context projection.
+   * Purpose: Let trusted Viventium-managed MCP servers receive per-request user/body metadata even
+   * when the server config is persisted in DB, without opening env-token expansion for arbitrary
+   * user-created MCP servers.
+   * === VIVENTIUM END === */
+  viventiumRequestContext: z.boolean().optional(),
   /**
    * Whether this server requires OAuth authentication
    * If not specified, will be auto-detected during construction
@@ -218,6 +225,7 @@ const omitServerManagedFields = <T extends z.ZodObject<z.ZodRawShape>>(schema: T
     initTimeout: true,
     chatMenu: true,
     serverInstructions: true,
+    viventiumRequestContext: true,
     requiresOAuth: true,
     customUserVars: true,
     oauth_headers: true,

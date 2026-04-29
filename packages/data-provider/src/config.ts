@@ -788,6 +788,11 @@ export type TStartupConfig = {
    * Purpose: Expose startup toggle for OAuth-only connected account UI/actions.
    * === VIVENTIUM END === */
   viventiumConnectedAccountsEnabled?: boolean;
+  /* === VIVENTIUM START ===
+   * Feature: GlassHive host worker callbacks.
+   * Purpose: Expose the compiled callback wait window to the web polling hook.
+   * === VIVENTIUM END === */
+  viventiumGlassHiveFollowupTimeoutS?: number;
   customFooter?: string;
   modelSpecs?: TSpecsConfig;
   modelDescriptions?: Record<string, Record<string, string>>;

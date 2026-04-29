@@ -926,6 +926,7 @@ function formatFollowUpPrompt({
       webRules,
       playgroundRules,
       `Prior visible hold text for context only (do NOT repeat it):\n---\n${recentBlock}\n---`,
+      'Background agents provide evidence only. You decide what, if anything, should become visible to the user.',
       'Use the background insights below as your grounding and answer the user directly.',
       'This is not an addendum. This is the main answer that should replace the brief hold.',
       'Be complete enough to satisfy the user request on this surface, while staying grounded in the provided insights.',
@@ -949,6 +950,7 @@ function formatFollowUpPrompt({
     playgroundRules,
     '## CRITICAL: Do Not Repeat',
     `Here is the response you JUST sent to the user:\n---\n${recentBlock}\n---`,
+    'Background agents provide evidence only. You decide whether there is anything worth surfacing.',
     'You MUST NOT repeat, rephrase, re-ask, or echo ANY part of the above. If the background insights below overlap with what you already said, respond with {NTA}.',
     'Only respond if the insights contain genuinely NEW information not covered above.',
     'If an insight contains new factual/contextual material followed by a question, keep the new material and drop the question.',
@@ -1127,6 +1129,7 @@ async function generateFollowUpText({
     ? [
         'You are a conversational AI assistant completing a deferred response after a short holding acknowledgement.',
         'Your sole job: turn the background insights into the primary answer the user should see for this turn.',
+        'Background agents provide evidence only; you decide the user-visible answer.',
         'Use the insights as grounding, answer directly, and stay surface-appropriate.',
         'Do not output {NTA} if the insights contain substantive user-visible information.',
         'Do not re-ask questions, do not mention background processing, and do not introduce yourself.',
@@ -1134,6 +1137,7 @@ async function generateFollowUpText({
     : [
         'You are a conversational AI assistant continuing an ongoing conversation.',
         'Your sole job: if background insights contain genuinely new information that was NOT in your recent response, add it in 1-3 natural sentences. Otherwise respond with exactly {NTA}.',
+        'Background agents provide evidence only; you decide whether to surface a follow-up or stay silent with {NTA}.',
         'Do not re-ask questions, do not repeat topics, do not introduce yourself.',
       ];
   const noResponseInstructions = buildNoResponseInstructions(req);

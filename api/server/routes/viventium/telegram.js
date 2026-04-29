@@ -61,6 +61,9 @@ const {
 } = require('~/server/services/viventium/gatewayConvoDefaults');
 const { getCortexMessageState } = require('~/server/services/viventium/cortexMessageState');
 const {
+  getGlassHiveCallbackStateForMessage,
+} = require('~/server/services/viventium/GlassHiveCallbackMessageService');
+const {
   resolveReusableConversationState,
 } = require('~/server/services/viventium/conversationThreading');
 /* === VIVENTIUM START ===
@@ -1280,6 +1283,47 @@ router.get('/cortex/:messageId', telegramAuth, async (req, res) => {
   } catch (err) {
     logger.error('[VIVENTIUM][telegram/cortex] Failed to load cortex data:', err);
     return res.status(500).json({ error: 'Failed to load cortex data' });
+  }
+});
+
+/* === VIVENTIUM START ===
+ * Feature: Telegram delivery for GlassHive worker completion
+ * Purpose:
+ * - Telegram already polls persisted same-conversation follow-ups.
+ * - GlassHive worker callbacks are their own persisted callback messages, so expose the
+ *   same DB truth without inventing a second upload/result path.
+ * === VIVENTIUM END === */
+router.get('/glasshive/:messageId', telegramAuth, async (req, res) => {
+  const userId = req.user?.id;
+  const messageId = req.params?.messageId;
+  const conversationId =
+    typeof req.query?.conversationId === 'string' ? req.query.conversationId : '';
+
+  if (typeof userId !== 'string' || userId.length === 0) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  if (typeof messageId !== 'string' || messageId.length === 0) {
+    return res.status(400).json({ error: 'messageId is required' });
+  }
+  if (typeof conversationId !== 'string' || conversationId.length === 0) {
+    return res.status(400).json({ error: 'conversationId is required' });
+  }
+
+  try {
+    const state = await getGlassHiveCallbackStateForMessage({
+      userId,
+      messageId,
+      conversationId,
+    });
+    return res.json(state ?? {
+      messageId,
+      conversationId,
+      latest: null,
+      callbacks: [],
+    });
+  } catch (err) {
+    logger.error('[VIVENTIUM][telegram/glasshive] Failed to load GlassHive callback:', err);
+    return res.status(500).json({ error: 'Failed to load GlassHive callback' });
   }
 });
 

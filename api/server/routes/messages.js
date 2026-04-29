@@ -2,7 +2,17 @@ const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 const { logger } = require('@librechat/data-schemas');
 const { ContentTypes } = require('librechat-data-provider');
-const { unescapeLaTeX, countTokens } = require('@librechat/api');
+const {
+  unescapeLaTeX,
+  countTokens,
+  /* === VIVENTIUM START ===
+   * Feature: Tool-call snapshot cleanup
+   * Purpose: Reuse the shared content sanitizer on message reads so historical duplicate streamed
+   * tool snapshots do not render as extra cancelled rows after refresh.
+   * Added: 2026-04-29
+   * === VIVENTIUM END === */
+  filterMalformedContentParts,
+} = require('@librechat/api');
 const {
   saveConvo,
   getMessage,
@@ -18,6 +28,26 @@ const { Message } = require('~/db/models');
 
 const router = express.Router();
 router.use(requireJwtAuth);
+
+/* === VIVENTIUM START ===
+ * Feature: Tool-call snapshot cleanup
+ * Purpose:
+ * - Keep stale partial tool-call snapshots out of user-visible message payloads.
+ * - This is read-side normalization only; the shared sanitizer also runs on final agent persistence.
+ * Added: 2026-04-29
+ * === VIVENTIUM END === */
+const sanitizeMessageForRead = (message) => {
+  if (!message || !Array.isArray(message.content)) {
+    return message;
+  }
+  return {
+    ...message,
+    content: filterMalformedContentParts(message.content),
+  };
+};
+
+const sanitizeMessagesForRead = (messages) =>
+  Array.isArray(messages) ? messages.map(sanitizeMessageForRead) : sanitizeMessageForRead(messages);
 
 router.get('/', async (req, res) => {
   try {
@@ -45,7 +75,7 @@ router.get('/', async (req, res) => {
         messageId,
         user: user,
       }).lean();
-      response = { messages: message ? [message] : [], nextCursor: null };
+      response = { messages: message ? [sanitizeMessageForRead(message)] : [], nextCursor: null };
     } else if (conversationId) {
       const filter = { conversationId, user: user };
       if (cursor) {
@@ -61,7 +91,7 @@ router.get('/', async (req, res) => {
         // Create cursor from the last RETURNED item (not the popped one)
         nextCursor = messages[messages.length - 1][sortField];
       }
-      response = { messages, nextCursor };
+      response = { messages: messages.map(sanitizeMessageForRead), nextCursor };
     } else if (search) {
       const searchResults = await Message.meiliSearch(search, { filter: `user = "${user}"` }, true);
 
@@ -95,7 +125,7 @@ router.get('/', async (req, res) => {
         const dbMessage = dbMessageMap[message.messageId];
 
         activeMessages.push({
-          ...message,
+          ...sanitizeMessageForRead(message),
           title: convo.title,
           conversationId: message.conversationId,
           model: convo.model,
@@ -149,7 +179,8 @@ router.post('/branch', async (req, res) => {
       return res.status(400).json({ error: 'Message does not have content' });
     }
 
-    const hasAgentMetadata = sourceMessage.content.some((part) => part?.agentId);
+    const sanitizedSourceMessage = sanitizeMessageForRead(sourceMessage);
+    const hasAgentMetadata = sanitizedSourceMessage.content.some((part) => part?.agentId);
     if (!hasAgentMetadata) {
       return res
         .status(400)
@@ -158,7 +189,7 @@ router.post('/branch', async (req, res) => {
 
     /** @type {Array<import('librechat-data-provider').TMessageContentParts>} */
     const filteredContent = [];
-    for (const part of sourceMessage.content) {
+    for (const part of sanitizedSourceMessage.content) {
       if (part?.agentId === agentId) {
         const { agentId: _a, groupId: _g, ...cleanPart } = part;
         filteredContent.push(cleanPart);
@@ -284,7 +315,7 @@ router.get('/:conversationId', validateMessageReq, async (req, res) => {
   try {
     const { conversationId } = req.params;
     const messages = await getMessages({ conversationId }, '-_id -__v -user');
-    res.status(200).json(messages);
+    res.status(200).json(sanitizeMessagesForRead(messages));
   } catch (error) {
     logger.error('Error fetching messages:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -317,7 +348,7 @@ router.get('/:conversationId/:messageId', validateMessageReq, async (req, res) =
     if (!message) {
       return res.status(404).json({ error: 'Message not found' });
     }
-    res.status(200).json(message);
+    res.status(200).json(sanitizeMessagesForRead(message));
   } catch (error) {
     logger.error('Error fetching message:', error);
     res.status(500).json({ error: 'Internal server error' });

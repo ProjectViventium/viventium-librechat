@@ -12,6 +12,26 @@ export type RequestBody = {
   conversationId?: string;
   parentMessageId?: string;
   /* === VIVENTIUM START ===
+   * Feature: MCP request-scoped upload projection
+   * Purpose: Allow first-party MCP servers to receive the same uploaded-file references
+   *          and surface metadata available to the agent request, without introducing
+   *          another upload path.
+   * Added: 2026-04-28
+   */
+  viventiumSurface?: string;
+  viventiumInputMode?: string;
+  viventiumStreamId?: string;
+  viventiumVoiceRequestId?: string;
+  viventiumVoiceCallSessionId?: string;
+  viventiumTelegramChatId?: string;
+  viventiumTelegramUserId?: string;
+  viventiumTelegramMessageId?: string;
+  files?: unknown[];
+  attachments?: unknown[];
+  tool_resources?: unknown;
+  file_ids?: unknown[];
+  /* === VIVENTIUM END === */
+  /* === VIVENTIUM START ===
    * Feature: Timezone-aware request metadata
    * Purpose: Allow clients to provide an IANA timezone for downstream time-context rendering ({{current_datetime}}) and scheduling.
    * Added: 2026-02-07

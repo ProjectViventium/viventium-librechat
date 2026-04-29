@@ -7,6 +7,7 @@ const {
   sanitizeFollowUpDisplayText,
   stripCitationArtifacts,
   stripLeadingReasoningArtifacts,
+  stripToolTranscriptArtifacts,
 } = require('../followUpTextSanitizer');
 
 describe('followUpTextSanitizer', () => {
@@ -54,5 +55,16 @@ describe('followUpTextSanitizer', () => {
   test('does not strip normal visible text that merely mentions think tags later', () => {
     const raw = 'Visible answer first. Example code: <think>literal</think>';
     expect(sanitizeFollowUpDisplayText(raw)).toBe(raw);
+  });
+
+  test('strips leaked MCP tool transcript lines from follow-up display text', () => {
+    const raw = [
+      'Tool: worker_live_mcp_glasshive-workers-projects, [{"type":"text","text":"internal"}]',
+      '',
+      'The task finished.',
+    ].join('\n');
+
+    expect(stripToolTranscriptArtifacts(raw)).toBe('The task finished.');
+    expect(sanitizeFollowUpDisplayText(raw)).toBe('The task finished.');
   });
 });

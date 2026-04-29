@@ -37,6 +37,9 @@ const { getUserById } = require('~/models');
 const {
   getCompletedCortexInsightsForMessage,
 } = require('~/server/services/viventium/VoiceCortexInsightsService');
+const {
+  getGlassHiveCallbackStateForMessage,
+} = require('~/server/services/viventium/GlassHiveCallbackMessageService');
 /* === VIVENTIUM NOTE ===
  * Feature: Sidebar parity for gateway-created conversations (title + icon).
  * Purpose: Match web UI behavior for new conversations created via voice gateway.
@@ -777,6 +780,47 @@ router.get('/cortex/:messageId', voiceAuth, async (req, res) => {
   } catch (err) {
     logger.error('[VIVENTIUM][voice/cortex] Failed to load cortex insights:', err);
     return res.status(500).json({ error: 'Failed to load cortex insights' });
+  }
+});
+
+/* === VIVENTIUM START ===
+ * Feature: Voice delivery for GlassHive worker completion
+ * Purpose:
+ * - Voice calls already poll persisted follow-ups after the main stream ends.
+ * - GlassHive worker results are persisted as same-conversation callback messages,
+ *   not cortex follow-ups, so voice needs a DB-backed lookup for that callback type.
+ * === VIVENTIUM END === */
+router.get('/glasshive/:messageId', voiceAuth, async (req, res) => {
+  const session = req.viventiumCallSession;
+  const userId = req.user?.id;
+  const messageId = req.params?.messageId;
+
+  if (!session || typeof session.conversationId !== 'string' || session.conversationId.length === 0) {
+    return res.status(400).json({ error: 'Missing call session conversationId' });
+  }
+  if (typeof userId !== 'string' || userId.length === 0) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  if (typeof messageId !== 'string' || messageId.length === 0) {
+    return res.status(400).json({ error: 'messageId is required' });
+  }
+
+  try {
+    const result = await getGlassHiveCallbackStateForMessage({
+      userId,
+      messageId,
+      conversationId: session.conversationId,
+    });
+
+    return res.json(result ?? {
+      messageId,
+      conversationId: session.conversationId,
+      latest: null,
+      callbacks: [],
+    });
+  } catch (err) {
+    logger.error('[VIVENTIUM][voice/glasshive] Failed to load GlassHive callback:', err);
+    return res.status(500).json({ error: 'Failed to load GlassHive callback' });
   }
 });
 

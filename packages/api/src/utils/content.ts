@@ -6,8 +6,12 @@ import type { TMessageContentParts } from 'librechat-data-provider';
  * This handles edge cases where tool_call content parts may be created with only a type property
  * but missing the actual tool_call data.
  *
+ * It also collapses duplicate streamed snapshots for the same tool_call.id, keeping the latest
+ * snapshot. Tool streams can emit partial argument snapshots before the final output-bearing part;
+ * rendering every snapshot after completion makes stale partials look like separate cancelled calls.
+ *
  * @param contentParts - Array of content parts to filter
- * @returns Filtered array with malformed tool calls removed
+ * @returns Filtered array with malformed tool calls removed and duplicate snapshots collapsed
  *
  * @example
  * // Removes malformed tool_call without the tool_call property
@@ -30,7 +34,7 @@ export function filterMalformedContentParts<T>(
     return contentParts;
   }
 
-  return contentParts.filter((part) => {
+  const filtered = contentParts.filter((part) => {
     if (!part || typeof part !== 'object') {
       return false;
     }
@@ -46,5 +50,32 @@ export function filterMalformedContentParts<T>(
     }
 
     return true;
+  });
+
+  const lastToolCallIndexById = new Map<string, number>();
+  for (let index = 0; index < filtered.length; index++) {
+    const part = filtered[index];
+    if (part?.type !== ContentTypes.TOOL_CALL) {
+      continue;
+    }
+    const toolCallId = part.tool_call?.id;
+    if (typeof toolCallId === 'string' && toolCallId.length > 0) {
+      lastToolCallIndexById.set(toolCallId, index);
+    }
+  }
+
+  if (lastToolCallIndexById.size === 0) {
+    return filtered;
+  }
+
+  return filtered.filter((part, index) => {
+    if (part?.type !== ContentTypes.TOOL_CALL) {
+      return true;
+    }
+    const toolCallId = part.tool_call?.id;
+    if (typeof toolCallId !== 'string' || toolCallId.length === 0) {
+      return true;
+    }
+    return lastToolCallIndexById.get(toolCallId) === index;
   });
 }

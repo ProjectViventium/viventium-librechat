@@ -14,6 +14,7 @@ import MemoryArtifacts from './MemoryArtifacts';
 import Sources from '~/components/Web/Sources';
 import Container from './Container';
 import Part from './Part';
+import { filterRenderableContentParts, type RenderableContentInput } from './contentPartUtils';
 
 /* === VIVENTIUM START ===
  * Feature: Background Cortex content parts rendering (activation/brewing/insights)
@@ -29,7 +30,7 @@ import Part from './Part';
  * Added: 2026-01-05
  */
 type ContentPartsProps = {
-  content: Array<TMessageContentParts | undefined> | undefined;
+  content: RenderableContentInput;
   cortexParts?: Array<TMessageContentParts | undefined> | undefined;
   messageId: string;
   conversationId?: string | null;
@@ -72,6 +73,7 @@ const ContentParts = memo(function ContentParts({
 }: ContentPartsProps) {
   const attachmentMap = useMemo(() => mapAttachments(attachments ?? []), [attachments]);
   const effectiveIsSubmitting = isLatestMessage ? isSubmitting : false;
+  const displayContent = useMemo(() => filterRenderableContentParts(content), [content]);
   const cortexTypes = useMemo(
     () =>
       new Set([
@@ -88,17 +90,17 @@ const ContentParts = memo(function ContentParts({
    * After streaming completes, cortex parts are also persisted into message.content (DB truth).
    */
   const cortexPartsFromContent: PartWithIndex[] = useMemo(() => {
-    if (!content) {
+    if (!displayContent) {
       return [];
     }
     const parts: PartWithIndex[] = [];
-    content.forEach((part, idx) => {
+    displayContent.forEach((part, idx) => {
       if (part && cortexTypes.has(part.type)) {
         parts.push({ part, idx });
       }
     });
     return parts;
-  }, [content, cortexTypes]);
+  }, [displayContent, cortexTypes]);
 
   const cortexPartsEffective: PartWithIndex[] = useMemo(() => {
     if (Array.isArray(cortexParts) && cortexParts.length > 0) {
@@ -129,7 +131,7 @@ const ContentParts = memo(function ContentParts({
             isExpanded: true,
             conversationId,
             partIndex: idx,
-            nextType: content?.[idx + 1]?.type,
+            nextType: displayContent?.[idx + 1]?.type,
             isSubmitting: effectiveIsSubmitting,
             isLatestMessage,
           }}
@@ -148,7 +150,7 @@ const ContentParts = memo(function ContentParts({
     },
     [
       attachmentMap,
-      content,
+      displayContent,
       conversationId,
       effectiveIsSubmitting,
       isCreatedByUser,
@@ -159,7 +161,7 @@ const ContentParts = memo(function ContentParts({
   );
 
   // Early return: no content
-  if (!content) {
+  if (!displayContent) {
     return null;
   }
 
@@ -167,7 +169,7 @@ const ContentParts = memo(function ContentParts({
   if (edit === true && enterEdit && setSiblingIdx) {
     return (
       <>
-        {content.map((part, idx) => {
+        {displayContent.map((part, idx) => {
           if (!part) {
             return null;
           }
@@ -203,16 +205,16 @@ const ContentParts = memo(function ContentParts({
     );
   }
 
-  const showEmptyCursor = content.length === 0 && effectiveIsSubmitting;
+  const showEmptyCursor = displayContent.length === 0 && effectiveIsSubmitting;
 
   // Parallel content: use dedicated renderer with columns (TMessageContentParts includes ContentMetadata)
-  const hasParallelContent = content.some(
+  const hasParallelContent = displayContent.some(
     (part) => part?.groupId != null && (part?.type == null || !cortexTypes.has(part.type)),
   );
   if (hasParallelContent) {
     return (
       <ParallelContentRenderer
-        content={content}
+        content={displayContent}
         messageId={messageId}
         conversationId={conversationId}
         attachments={attachments}
@@ -225,7 +227,7 @@ const ContentParts = memo(function ContentParts({
 
   // Sequential content: render parts in order (90% of cases)
   const sequentialParts: PartWithIndex[] = [];
-  content.forEach((part, idx) => {
+  displayContent.forEach((part, idx) => {
     if (part) {
       if (cortexTypes.has(part.type)) {
         return;

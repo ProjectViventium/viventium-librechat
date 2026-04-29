@@ -56,6 +56,70 @@ viventium:
       response_format: "Respond with a JSON object:\n{\n  \"should_activate\": true,\n\
         \  \"confidence\": 1.0,\n  \"reason\": \"2-4 explanatory words\"\n}\n"
       brew_begin_tag: <!--viv_internal:brew_begin-->
+    activation_policy:
+      enabled: true
+      prompt: |
+        The main agent owns the current turn. Background agents are optional reviewers, not controllers.
+
+        Connected direct-action surfaces listed below are the authoritative owners for live execution, status, approvals, callbacks, files, browser/desktop/OS work, schedules, workers, projects, and run results they cover.
+
+        Use this background agent's configured activation criteria as its only scope. Do not infer a broader scope from the conversation. When this policy and this background agent's own activation criteria disagree, prefer the stricter outcome: do not activate.
+
+        Return should_activate=false when the latest request is primarily asking to perform, start, continue, resume, stop, monitor, approve, check, or report on work owned by a connected direct-action surface.
+
+        Return should_activate=false for follow-ups on live work, including short status/result turns, when the referenced work belongs to a connected direct-action surface.
+
+        Return should_activate=false when the user is asking for proof by execution rather than a separate analysis, critique, plan, or decision.
+
+        Return should_activate=true only when the latest request contains a separate explicit question or decision that this background agent's configured scope clearly owns and can answer without claiming, simulating, or second-guessing direct-action results.
+
+        For mixed requests:
+        - direct-action/status/result part -> main agent/tool path owns it
+        - independent analysis/review/planning part -> activate only if this agent's own scope clearly owns it
+
+        If activated, the insight must stay within that independent scope. It must not narrate worker, browser, runtime, schedule, file, invoice, screenshot, tool, callback, or OS status unless this same background agent received verified evidence in its own allowed context this turn.
+
+        Never activate just to confirm tool availability, provide operational IDs/links, summarize a tool owner's result, or answer from memory when the requested fact belongs to live execution.
+
+        If uncertain, return should_activate=false.
+      direct_action_mcp_servers:
+        - server: glasshive-workers-projects
+          owns: persistent workers, project runs, browser/desktop/local computer execution, worker status, and completion reports
+          tool_names:
+            - sys__server__sys_mcp_glasshive-workers-projects
+            - projects_list_mcp_glasshive-workers-projects
+            - project_create_mcp_glasshive-workers-projects
+            - project_get_mcp_glasshive-workers-projects
+            - project_runs_mcp_glasshive-workers-projects
+            - project_events_mcp_glasshive-workers-projects
+            - workers_list_mcp_glasshive-workers-projects
+            - worker_create_mcp_glasshive-workers-projects
+            - worker_find_or_resume_mcp_glasshive-workers-projects
+            - worker_get_mcp_glasshive-workers-projects
+            - worker_live_mcp_glasshive-workers-projects
+            - worker_run_mcp_glasshive-workers-projects
+            - worker_message_mcp_glasshive-workers-projects
+            - worker_pause_mcp_glasshive-workers-projects
+            - worker_resume_mcp_glasshive-workers-projects
+            - worker_interrupt_mcp_glasshive-workers-projects
+            - worker_terminate_mcp_glasshive-workers-projects
+            - worker_desktop_action_mcp_glasshive-workers-projects
+            - worker_takeover_mcp_glasshive-workers-projects
+            - run_get_mcp_glasshive-workers-projects
+        - server: scheduling-cortex
+          owns: reminders, scheduled follow-ups, same-conversation wakeups, delayed status checks, and schedule management
+          tool_names:
+            - sys__server__sys_mcp_scheduling-cortex
+            - schedule_create_mcp_scheduling-cortex
+            - schedule_get_mcp_scheduling-cortex
+            - schedule_list_mcp_scheduling-cortex
+            - schedule_search_mcp_scheduling-cortex
+            - schedule_last_delivery_mcp_scheduling-cortex
+            - schedule_update_mcp_scheduling-cortex
+            - schedule_delete_mcp_scheduling-cortex
+            - schedule_preview_next_mcp_scheduling-cortex
+      direct_action_tool_rule: |
+        Connected direct-action surfaces are execution owners. Their presence means the main agent has the primary path; background cortices should stay silent unless they add separately scoped value.
   no_response:
     prompt: 'NO RESPONSE TAG:
 
@@ -520,15 +584,39 @@ mcpServers:
   glasshive-workers-projects:
     type: streamable-http
     url: ${GLASSHIVE_MCP_URL}
+    viventiumRequestContext: true
     startup: false
     chatMenu: true
     timeout: 120000
     serverInstructions: GlassHive MCP for persistent projects, resumable workers,
-      workstation sandboxes, and live operator takeover. Use it when work needs delegation,
-      persistence, or a human handoff into a live sandbox.
+      workstation sandboxes, host-native workers, and live operator takeover. Use
+      host-native workers when the user asks for Codex/Claude/OpenClaw on the main
+      computer, local Chrome/browser, desktop apps, OS tools, or host files; a
+      Docker workstation browser is isolated and is not the user's real Chrome
+      profile. For configured worker mentions, create or resume a worker with
+      execution_mode='host' and the matching profile. Current request upload
+      metadata is projected through headers; preserve those existing file
+      references in bootstrap_bundle_json instead of creating a separate upload
+      path. After worker_run, check run_get or worker_live before reporting a
+      terminal result; queued only means the run was accepted.
     headers:
       X-Viventium-User-Id: '{{LIBRECHAT_USER_ID}}'
       X-Viventium-Agent-Id: agent_viventium_main_95aeb3
+      X-Viventium-Conversation-Id: '{{LIBRECHAT_BODY_CONVERSATIONID}}'
+      X-Viventium-Parent-Message-Id: '{{LIBRECHAT_BODY_PARENTMESSAGEID}}'
+      X-Viventium-Message-Id: '{{LIBRECHAT_BODY_MESSAGEID}}'
+      X-Viventium-Surface: '{{LIBRECHAT_BODY_VIVENTIUMSURFACE}}'
+      X-Viventium-Input-Mode: '{{LIBRECHAT_BODY_VIVENTIUMINPUTMODE}}'
+      X-Viventium-Stream-Id: '{{LIBRECHAT_BODY_VIVENTIUMSTREAMID}}'
+      X-Viventium-Voice-Call-Session-Id: '{{LIBRECHAT_BODY_VIVENTIUMVOICECALLSESSIONID}}'
+      X-Viventium-Voice-Request-Id: '{{LIBRECHAT_BODY_VIVENTIUMVOICEREQUESTID}}'
+      X-Viventium-Telegram-Chat-Id: '{{LIBRECHAT_BODY_VIVENTIUMTELEGRAMCHATID}}'
+      X-Viventium-Telegram-User-Id: '{{LIBRECHAT_BODY_VIVENTIUMTELEGRAMUSERID}}'
+      X-Viventium-Telegram-Message-Id: '{{LIBRECHAT_BODY_VIVENTIUMTELEGRAMMESSAGEID}}'
+      X-Viventium-Request-Files: '{{LIBRECHAT_BODY_FILES_JSON_B64}}'
+      X-Viventium-Request-Attachments: '{{LIBRECHAT_BODY_ATTACHMENTS_JSON_B64}}'
+      X-Viventium-Tool-Resources: '{{LIBRECHAT_BODY_TOOL_RESOURCES_JSON_B64}}'
+      X-Viventium-File-Ids: '{{LIBRECHAT_BODY_FILE_IDS_JSON_B64}}'
 speech:
   tts: {}
   stt: {}

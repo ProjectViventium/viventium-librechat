@@ -19,6 +19,8 @@ const {
   stripVoiceControlTagsForDisplay,
 } = require('../surfacePrompts');
 
+const CARTESIA_SONIC3_CAPABILITIES = require('../../../../../../shared/voice/cartesia_sonic3_capabilities.json');
+
 describe('buildTimeContextInstructions', () => {
   const originalDefaultTimezone = process.env.VIVENTIUM_DEFAULT_TIMEZONE;
   const originalDisableFlag = process.env.VIVENTIUM_TIME_CONTEXT_DISABLED;
@@ -190,11 +192,9 @@ describe('buildVoiceModeInstructions', () => {
   test('cartesia branch includes complete Sonic-3 emotion list', () => {
     const result = buildVoiceModeInstructions('cartesia');
     expect(result).toContain('Allowed emotion values');
-    expect(result).toContain('neutral');
-    expect(result).toContain('excited');
-    expect(result).toContain('calm');
-    expect(result).toContain('joking/comedic');
-    expect(result).toContain('determined');
+    for (const emotion of CARTESIA_SONIC3_CAPABILITIES.generation_config.emotion.values) {
+      expect(result).toContain(emotion);
+    }
   });
 
   test('cartesia branch includes speed and volume tag guidance', () => {
@@ -208,6 +208,12 @@ describe('buildVoiceModeInstructions', () => {
     const result = buildVoiceModeInstructions('cartesia');
     expect(result).toContain('<break time=');
     expect(result).toContain('natural pauses');
+  });
+
+  test('cartesia branch includes spell tag guidance from shared capability contract', () => {
+    const result = buildVoiceModeInstructions('cartesia');
+    expect(result).toContain(CARTESIA_SONIC3_CAPABILITIES.ssml_tags.spell.form);
+    expect(result).toContain('identifiers');
   });
   // === VIVENTIUM END ===
 });
@@ -359,10 +365,29 @@ describe('buildWebTextInstructions', () => {
 });
 
 describe('buildCortexOutputInstructions', () => {
+  const requiredProvenanceRules = [
+    'Do NOT claim a tool, worker, browser, email, file, or OS action happened unless this cortex actually received a verified tool result for that action in this run.',
+    'If the main agent is already handling a direct tool/worker execution and you do not have independent verified results, output exactly {NTA}.',
+    'Never fabricate tool-call transcripts, run ids, worker ids, or dispatch confirmations.',
+  ];
+
   test('defaults non-voice, non-telegram, non-playground surfaces to markdown-friendly web output', () => {
     const result = buildCortexOutputInstructions({ voiceMode: false, surface: '', inputMode: '' });
     expect(result).toContain('Use standard Markdown formatting');
     expect(result).toContain('prefer short paragraphs and bullet lists');
+  });
+
+  test.each([
+    ['default web', { voiceMode: false, surface: '', inputMode: '' }],
+    ['voice surface', { voiceMode: true, surface: 'voice', inputMode: 'voice_note' }],
+    ['telegram surface', { voiceMode: false, surface: 'telegram', inputMode: '' }],
+    ['playground surface', { voiceMode: false, surface: 'playground', inputMode: '' }],
+  ])('includes verified-action provenance rules for %s', (_label, args) => {
+    const result = buildCortexOutputInstructions(args);
+    expect(result).toContain('CORTEX OUTPUT RULES:');
+    for (const rule of requiredProvenanceRules) {
+      expect(result).toContain(rule);
+    }
   });
 });
 

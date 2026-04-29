@@ -1002,6 +1002,62 @@ function createMultiAgentMapper(primaryAgent, agentConfigs) {
   };
 }
 
+/* === VIVENTIUM START ===
+ * Feature: GlassHive MCP upload/context propagation
+ * Purpose: Reuse the existing request body projection used by MCP headers so UI,
+ * API, and voice agent runs pass the same attachments/tool resources to GlassHive.
+ * Added: 2026-04-28
+ * === VIVENTIUM END === */
+function buildViventiumMcpRequestBody({
+  messageId,
+  conversationId,
+  parentMessageId,
+  req,
+  attachments,
+  toolResources,
+}) {
+  const files = Array.isArray(attachments)
+    ? attachments.map((file) => {
+        const metadata = file?.metadata?.fileIdentifier
+          ? { fileIdentifier: file.metadata.fileIdentifier }
+          : undefined;
+        return {
+          file_id: file?.file_id,
+          temp_file_id: file?.temp_file_id,
+          filename: file?.filename,
+          filepath: file?.filepath,
+          source: file?.source,
+          context: file?.context,
+          type: file?.type,
+          bytes: file?.bytes,
+          width: file?.width,
+          height: file?.height,
+          ...(metadata ? { metadata } : {}),
+          ...(typeof file?.text === 'string' ? { text: file.text } : {}),
+        };
+      })
+    : [];
+  return {
+    messageId,
+    conversationId,
+    parentMessageId,
+    viventiumSurface: req?.body?.viventiumSurface,
+    viventiumInputMode: req?.body?.viventiumInputMode,
+    viventiumStreamId: req?.body?.streamId || req?._resumableStreamId,
+    viventiumVoiceRequestId: req?.viventiumVoiceRequestId,
+    viventiumVoiceCallSessionId: req?.viventiumCallSession?.callSessionId,
+    viventiumTelegramChatId: req?.body?.telegramChatId,
+    viventiumTelegramUserId: req?.body?.telegramUserId,
+    viventiumTelegramMessageId: req?.body?.telegramMessageId,
+    ...(files.length ? { files, attachments: files, file_ids: files.map((file) => file.file_id).filter(Boolean) } : {}),
+    ...(toolResources ? { tool_resources: toolResources } : {}),
+  };
+}
+/* === VIVENTIUM START ===
+ * Feature: GlassHive MCP upload/context propagation
+ * Added: 2026-04-28
+ * === VIVENTIUM END === */
+
 class AgentClient extends BaseClient {
   constructor(options = {}) {
     super(null, options);
@@ -1989,13 +2045,14 @@ class AgentClient extends BaseClient {
           last_agent_index: this.agentConfigs?.size ?? 0,
           user_id: this.user ?? this.options.req.user?.id,
           hide_sequential_outputs: this.options.agent.hide_sequential_outputs,
-          requestBody: {
+          requestBody: buildViventiumMcpRequestBody({
             messageId: this.responseMessageId,
             conversationId: this.conversationId,
             parentMessageId: this.parentMessageId,
-            viventiumVoiceRequestId: req?.viventiumVoiceRequestId,
-            viventiumVoiceCallSessionId: req?.viventiumCallSession?.callSessionId,
-          },
+            req,
+            attachments: this.options.attachments,
+            toolResources: this.options.agent?.tool_resources,
+          }),
           user: createSafeUser(this.options.req.user),
         },
         recursionLimit: agentsEConfig?.recursionLimit ?? 25,
@@ -3500,5 +3557,6 @@ class AgentClient extends BaseClient {
 }
 
 module.exports = AgentClient;
+module.exports.buildViventiumMcpRequestBody = buildViventiumMcpRequestBody;
 
 /* === VIVENTIUM END === */

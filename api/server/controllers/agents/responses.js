@@ -503,6 +503,18 @@ const createResponse = async (req, res) => {
         requestBody: {
           messageId: responseId,
           conversationId,
+          /* === VIVENTIUM START ===
+           * Feature: GlassHive MCP upload/context propagation
+           * Added: 2026-04-28
+           * === VIVENTIUM END === */
+          files: request.files,
+          attachments: request.attachments,
+          tool_resources: request.tool_resources,
+          file_ids: request.file_ids,
+          /* === VIVENTIUM START ===
+           * Feature: GlassHive MCP upload/context propagation
+           * Added: 2026-04-28
+           * === VIVENTIUM END === */
         },
         user: { id: userId },
       });
@@ -655,6 +667,18 @@ const createResponse = async (req, res) => {
         requestBody: {
           messageId: responseId,
           conversationId,
+          /* === VIVENTIUM START ===
+           * Feature: GlassHive MCP upload/context propagation
+           * Added: 2026-04-28
+           * === VIVENTIUM END === */
+          files: request.files,
+          attachments: request.attachments,
+          tool_resources: request.tool_resources,
+          file_ids: request.file_ids,
+          /* === VIVENTIUM START ===
+           * Feature: GlassHive MCP upload/context propagation
+           * Added: 2026-04-28
+           * === VIVENTIUM END === */
         },
         user: { id: userId },
       });

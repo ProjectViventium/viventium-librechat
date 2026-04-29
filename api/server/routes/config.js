@@ -21,6 +21,19 @@ const publicSharedLinksEnabled =
 
 const sharePointFilePickerEnabled = isEnabled(process.env.ENABLE_SHAREPOINT_FILEPICKER);
 const openidReuseTokens = isEnabled(process.env.OPENID_REUSE_TOKENS);
+// VIVENTIUM START
+// Purpose: Keep web GlassHive callback polling aligned with the compiled runtime setting.
+const glasshiveFollowupTimeoutS = Number.parseInt(
+  process.env.VIVENTIUM_WEB_GLASSHIVE_TIMEOUT_S ||
+    process.env.VIVENTIUM_TELEGRAM_GLASSHIVE_TIMEOUT_S ||
+    '600',
+  10,
+);
+const viventiumGlassHiveFollowupTimeoutS =
+  Number.isFinite(glasshiveFollowupTimeoutS) && glasshiveFollowupTimeoutS > 0
+    ? glasshiveFollowupTimeoutS
+    : 600;
+// VIVENTIUM END
 
 router.get('/', async function (req, res) {
   const cache = getLogStores(CacheKeys.CONFIG_STORE);
@@ -104,6 +117,11 @@ router.get('/', async function (req, res) {
        * Purpose: Gate OAuth-only OpenAI/Anthropic account connection UI to local/self-hosted mode.
        * === VIVENTIUM END === */
       viventiumConnectedAccountsEnabled: isEnabled(process.env.VIVENTIUM_LOCAL_SUBSCRIPTION_AUTH),
+      /* === VIVENTIUM START ===
+       * Feature: GlassHive host worker callbacks.
+       * Purpose: Project the compiled callback wait window into the web client.
+       * === VIVENTIUM END === */
+      viventiumGlassHiveFollowupTimeoutS,
       // VIVENTIUM END
       interface: appConfig?.interfaceConfig,
       turnstile: appConfig?.turnstileConfig,

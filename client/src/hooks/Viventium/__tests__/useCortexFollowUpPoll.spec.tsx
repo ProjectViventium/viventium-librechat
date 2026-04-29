@@ -12,7 +12,7 @@
 import React from 'react';
 import { renderHook, act } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { ContentTypes, QueryKeys } from 'librechat-data-provider';
+import { ContentTypes, QueryKeys, ToolCallTypes } from 'librechat-data-provider';
 import type { TMessage } from 'librechat-data-provider';
 import useCortexFollowUpPoll from '~/hooks/Viventium/useCortexFollowUpPoll';
 
@@ -123,10 +123,9 @@ describe('useCortexFollowUpPoll', () => {
       <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
     );
 
-    renderHook(
-      () => useCortexFollowUpPoll({ conversationId, getMessages, isSubmitting: false }),
-      { wrapper },
-    );
+    renderHook(() => useCortexFollowUpPoll({ conversationId, getMessages, isSubmitting: false }), {
+      wrapper,
+    });
 
     act(() => {
       jest.advanceTimersByTime(1500);
@@ -208,10 +207,9 @@ describe('useCortexFollowUpPoll', () => {
       <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
     );
 
-    renderHook(
-      () => useCortexFollowUpPoll({ conversationId, getMessages, isSubmitting: false }),
-      { wrapper },
-    );
+    renderHook(() => useCortexFollowUpPoll({ conversationId, getMessages, isSubmitting: false }), {
+      wrapper,
+    });
 
     act(() => {
       jest.advanceTimersByTime(1500);
@@ -287,10 +285,9 @@ describe('useCortexFollowUpPoll', () => {
       <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
     );
 
-    renderHook(
-      () => useCortexFollowUpPoll({ conversationId, getMessages, isSubmitting: false }),
-      { wrapper },
-    );
+    renderHook(() => useCortexFollowUpPoll({ conversationId, getMessages, isSubmitting: false }), {
+      wrapper,
+    });
 
     act(() => {
       jest.advanceTimersByTime(1500);
@@ -367,10 +364,9 @@ describe('useCortexFollowUpPoll', () => {
       <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
     );
 
-    renderHook(
-      () => useCortexFollowUpPoll({ conversationId, getMessages, isSubmitting: false }),
-      { wrapper },
-    );
+    renderHook(() => useCortexFollowUpPoll({ conversationId, getMessages, isSubmitting: false }), {
+      wrapper,
+    });
 
     act(() => {
       jest.advanceTimersByTime(1500);
@@ -430,10 +426,9 @@ describe('useCortexFollowUpPoll', () => {
       <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
     );
 
-    renderHook(
-      () => useCortexFollowUpPoll({ conversationId, getMessages, isSubmitting: false }),
-      { wrapper },
-    );
+    renderHook(() => useCortexFollowUpPoll({ conversationId, getMessages, isSubmitting: false }), {
+      wrapper,
+    });
 
     act(() => {
       jest.advanceTimersByTime(1500);
@@ -482,10 +477,9 @@ describe('useCortexFollowUpPoll', () => {
       <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
     );
 
-    renderHook(
-      () => useCortexFollowUpPoll({ conversationId, getMessages, isSubmitting: false }),
-      { wrapper },
-    );
+    renderHook(() => useCortexFollowUpPoll({ conversationId, getMessages, isSubmitting: false }), {
+      wrapper,
+    });
 
     act(() => {
       jest.advanceTimersByTime(1500);
@@ -533,14 +527,350 @@ describe('useCortexFollowUpPoll', () => {
       <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
     );
 
-    renderHook(
-      () => useCortexFollowUpPoll({ conversationId, getMessages, isSubmitting: false }),
-      { wrapper },
-    );
+    renderHook(() => useCortexFollowUpPoll({ conversationId, getMessages, isSubmitting: false }), {
+      wrapper,
+    });
 
     act(() => {
       jest.advanceTimersByTime(1500);
     });
     expect(invalidateSpy).toHaveBeenCalledWith([QueryKeys.messages, conversationId]);
+  });
+
+  it('polls after a recent tool-using response so out-of-band callbacks can appear live', () => {
+    const queryClient = new QueryClient();
+    const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
+
+    const conversationId = 'conv-tool-callback';
+    const assistantMessage = {
+      messageId: 'assistant-tool-owner',
+      conversationId,
+      parentMessageId: 'user-1',
+      isCreatedByUser: false,
+      text: 'Started.',
+      createdAt: new Date().toISOString(),
+      content: [
+        {
+          type: ContentTypes.TOOL_CALL,
+          tool_call: {
+            id: 'toolu_worker_run',
+            name: 'worker_run_mcp_glasshive-workers-projects',
+            args: '{}',
+            type: ToolCallTypes.TOOL_CALL,
+            progress: 1,
+            output: '{"state":"queued"}',
+          },
+        },
+        { type: ContentTypes.TEXT, text: 'Started.' },
+      ] as any,
+    } as any;
+
+    const getMessages = () => [assistantMessage] as TMessage[];
+    const wrapper = ({ children }: { children: React.ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+
+    renderHook(() => useCortexFollowUpPoll({ conversationId, getMessages, isSubmitting: false }), {
+      wrapper,
+    });
+
+    act(() => {
+      jest.advanceTimersByTime(1500);
+    });
+    expect(invalidateSpy).toHaveBeenCalledWith([QueryKeys.messages, conversationId]);
+  });
+
+  it('does not arm GlassHive callback polling for ordinary non-GlassHive tools', () => {
+    const queryClient = new QueryClient();
+    const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
+
+    const conversationId = 'conv-ordinary-tool';
+    const assistantMessage = {
+      messageId: 'assistant-tool-owner',
+      conversationId,
+      parentMessageId: 'user-1',
+      isCreatedByUser: false,
+      text: 'Found it.',
+      createdAt: new Date().toISOString(),
+      content: [
+        {
+          type: ContentTypes.TOOL_CALL,
+          tool_call: {
+            id: 'toolu_web_search',
+            name: 'web_search',
+            args: '{}',
+            type: ToolCallTypes.TOOL_CALL,
+            progress: 1,
+            output: '{"ok":true}',
+          },
+        },
+        { type: ContentTypes.TEXT, text: 'Found it.' },
+      ] as any,
+    } as any;
+
+    const getMessages = () => [assistantMessage] as TMessage[];
+    const wrapper = ({ children }: { children: React.ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+
+    renderHook(() => useCortexFollowUpPoll({ conversationId, getMessages, isSubmitting: false }), {
+      wrapper,
+    });
+
+    act(() => {
+      jest.advanceTimersByTime(30_000);
+    });
+    expect(invalidateSpy).not.toHaveBeenCalled();
+  });
+
+  it('uses startup config to bound web GlassHive callback polling', () => {
+    const queryClient = new QueryClient();
+    queryClient.setQueryData([QueryKeys.startupConfig], {
+      viventiumGlassHiveFollowupTimeoutS: 3,
+    });
+    const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
+
+    const conversationId = 'conv-tool-callback-configured-grace';
+    const assistantMessage = {
+      messageId: 'assistant-tool-owner',
+      conversationId,
+      parentMessageId: 'user-1',
+      isCreatedByUser: false,
+      text: 'Started.',
+      createdAt: new Date().toISOString(),
+      content: [
+        {
+          type: ContentTypes.TOOL_CALL,
+          tool_call: {
+            id: 'toolu_worker_run',
+            name: 'worker_run_mcp_glasshive-workers-projects',
+            args: '{}',
+            type: ToolCallTypes.TOOL_CALL,
+            progress: 1,
+            output: '{"state":"queued"}',
+          },
+        },
+      ] as any,
+    } as any;
+
+    const getMessages = () => [assistantMessage] as TMessage[];
+    const wrapper = ({ children }: { children: React.ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+
+    renderHook(() => useCortexFollowUpPoll({ conversationId, getMessages, isSubmitting: false }), {
+      wrapper,
+    });
+
+    act(() => {
+      jest.advanceTimersByTime(1500);
+    });
+    expect(invalidateSpy).toHaveBeenCalledWith([QueryKeys.messages, conversationId]);
+
+    act(() => {
+      jest.advanceTimersByTime(1500);
+    });
+    expect(invalidateSpy.mock.calls.length).toBe(2);
+
+    const callsAtConfiguredGraceEnd = invalidateSpy.mock.calls.length;
+    act(() => {
+      jest.advanceTimersByTime(4500);
+    });
+    expect(invalidateSpy.mock.calls.length).toBe(callsAtConfiguredGraceEnd);
+  });
+
+  it('keeps tool callback polling after a non-terminal callback for that assistant appears', () => {
+    const queryClient = new QueryClient();
+    const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
+
+    const conversationId = 'conv-tool-callback-started';
+    const assistantMessage = {
+      messageId: 'assistant-tool-owner',
+      conversationId,
+      parentMessageId: 'user-1',
+      isCreatedByUser: false,
+      text: 'Started.',
+      createdAt: new Date().toISOString(),
+      content: [
+        {
+          type: ContentTypes.TOOL_CALL,
+          tool_call: {
+            id: 'toolu_worker_run',
+            name: 'worker_run_mcp_glasshive-workers-projects',
+            args: '{}',
+            type: ToolCallTypes.TOOL_CALL,
+            progress: 1,
+            output: '{"state":"queued"}',
+          },
+        },
+      ] as any,
+    } as any;
+    const callbackMessage = {
+      messageId: 'assistant-tool-callback',
+      conversationId,
+      parentMessageId: 'assistant-tool-owner',
+      isCreatedByUser: false,
+      text: 'Done.',
+      metadata: {
+        viventium: {
+          type: 'glasshive_worker_callback',
+          anchorMessageId: 'assistant-tool-owner',
+          event: 'run.started',
+          events: [{ event: 'run.started' }],
+        },
+      },
+    } as any;
+
+    let messages = [assistantMessage] as TMessage[];
+    const getMessages = () => messages;
+    const wrapper = ({ children }: { children: React.ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+
+    renderHook(() => useCortexFollowUpPoll({ conversationId, getMessages, isSubmitting: false }), {
+      wrapper,
+    });
+
+    act(() => {
+      jest.advanceTimersByTime(1500);
+    });
+    expect(invalidateSpy).toHaveBeenCalledWith([QueryKeys.messages, conversationId]);
+
+    messages = [assistantMessage, callbackMessage] as TMessage[];
+    const callsBeforeStop = invalidateSpy.mock.calls.length;
+    act(() => {
+      jest.advanceTimersByTime(15_000);
+    });
+    expect(invalidateSpy.mock.calls.length).toBeGreaterThan(callsBeforeStop);
+  });
+
+  it('stops tool callback polling after a terminal callback for that assistant appears', () => {
+    const queryClient = new QueryClient();
+    const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
+
+    const conversationId = 'conv-tool-callback-terminal';
+    const assistantMessage = {
+      messageId: 'assistant-tool-owner',
+      conversationId,
+      parentMessageId: 'user-1',
+      isCreatedByUser: false,
+      text: 'Started.',
+      createdAt: new Date().toISOString(),
+      content: [
+        {
+          type: ContentTypes.TOOL_CALL,
+          tool_call: {
+            id: 'toolu_worker_run',
+            name: 'worker_run_mcp_glasshive-workers-projects',
+            args: '{}',
+            type: ToolCallTypes.TOOL_CALL,
+            progress: 1,
+            output: '{"state":"queued"}',
+          },
+        },
+      ] as any,
+    } as any;
+    const callbackMessage = {
+      messageId: 'assistant-tool-callback',
+      conversationId,
+      parentMessageId: 'assistant-tool-owner',
+      isCreatedByUser: false,
+      text: 'Done.',
+      metadata: {
+        viventium: {
+          type: 'glasshive_worker_callback',
+          anchorMessageId: 'assistant-tool-owner',
+          event: 'run.completed',
+          events: [{ event: 'run.started' }, { event: 'run.completed' }],
+        },
+      },
+    } as any;
+
+    let messages = [assistantMessage] as TMessage[];
+    const getMessages = () => messages;
+    const wrapper = ({ children }: { children: React.ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+
+    renderHook(() => useCortexFollowUpPoll({ conversationId, getMessages, isSubmitting: false }), {
+      wrapper,
+    });
+
+    act(() => {
+      jest.advanceTimersByTime(1500);
+    });
+    expect(invalidateSpy).toHaveBeenCalledWith([QueryKeys.messages, conversationId]);
+
+    messages = [assistantMessage, callbackMessage] as TMessage[];
+    const callsBeforeStop = invalidateSpy.mock.calls.length;
+    act(() => {
+      jest.advanceTimersByTime(15_000);
+    });
+    expect(invalidateSpy.mock.calls.length).toBe(callsBeforeStop);
+  });
+
+  it('stops tool callback polling after a checkpoint callback that needs user action', () => {
+    const queryClient = new QueryClient();
+    const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
+
+    const conversationId = 'conv-tool-callback-checkpoint';
+    const assistantMessage = {
+      messageId: 'assistant-tool-owner',
+      conversationId,
+      parentMessageId: 'user-1',
+      isCreatedByUser: false,
+      text: 'Started.',
+      createdAt: new Date().toISOString(),
+      content: [
+        {
+          type: ContentTypes.TOOL_CALL,
+          tool_call: {
+            id: 'toolu_worker_run',
+            name: 'worker_run_mcp_glasshive-workers-projects',
+            args: '{}',
+            type: ToolCallTypes.TOOL_CALL,
+            progress: 1,
+            output: '{"state":"queued"}',
+          },
+        },
+      ] as any,
+    } as any;
+    const callbackMessage = {
+      messageId: 'assistant-tool-callback',
+      conversationId,
+      parentMessageId: 'assistant-tool-owner',
+      isCreatedByUser: false,
+      text: 'I need your approval to continue.',
+      metadata: {
+        viventium: {
+          type: 'glasshive_worker_callback',
+          anchorMessageId: 'assistant-tool-owner',
+          event: 'checkpoint.ready',
+          events: [{ event: 'run.started' }, { event: 'checkpoint.ready' }],
+        },
+      },
+    } as any;
+
+    let messages = [assistantMessage] as TMessage[];
+    const getMessages = () => messages;
+    const wrapper = ({ children }: { children: React.ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+
+    renderHook(() => useCortexFollowUpPoll({ conversationId, getMessages, isSubmitting: false }), {
+      wrapper,
+    });
+
+    act(() => {
+      jest.advanceTimersByTime(1500);
+    });
+    expect(invalidateSpy).toHaveBeenCalledWith([QueryKeys.messages, conversationId]);
+
+    messages = [assistantMessage, callbackMessage] as TMessage[];
+    const callsBeforeStop = invalidateSpy.mock.calls.length;
+    act(() => {
+      jest.advanceTimersByTime(15_000);
+    });
+    expect(invalidateSpy.mock.calls.length).toBe(callsBeforeStop);
   });
 });

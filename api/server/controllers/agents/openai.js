@@ -490,6 +490,18 @@ const OpenAIChatCompletionController = async (req, res) => {
       requestBody: {
         messageId: requestId,
         conversationId,
+        /* === VIVENTIUM START ===
+         * Feature: GlassHive MCP upload/context propagation
+         * Added: 2026-04-28
+         * === VIVENTIUM END === */
+        files: req.body?.files,
+        attachments: req.body?.attachments,
+        tool_resources: req.body?.tool_resources,
+        file_ids: req.body?.file_ids,
+        /* === VIVENTIUM START ===
+         * Feature: GlassHive MCP upload/context propagation
+         * Added: 2026-04-28
+         * === VIVENTIUM END === */
       },
       user: { id: userId },
     });

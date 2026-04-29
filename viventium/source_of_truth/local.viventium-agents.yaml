@@ -17,6 +17,69 @@ config:
             "reason": "2-4 explanatory words"
           }
         brew_begin_tag: <!--viv_internal:brew_begin-->
+      activation_policy:
+        enabled: true
+        prompt: |
+          The main agent owns the current turn. Background agents are optional reviewers, not controllers.
+
+          Connected direct-action surfaces listed below are the authoritative owners for live execution, status, approvals, callbacks, files, browser/desktop/OS work, schedules, workers, projects, and run results they cover.
+
+          Use this background agent's configured activation criteria as its only scope. Do not infer a broader scope from the conversation. When this policy and this background agent's own activation criteria disagree, prefer the stricter outcome: do not activate.
+
+          Return should_activate=false when the latest request is primarily asking to perform, start, continue, resume, stop, monitor, approve, check, or report on work owned by a connected direct-action surface.
+
+          Return should_activate=false for follow-ups on live work, including short status/result turns, when the referenced work belongs to a connected direct-action surface.
+
+          Return should_activate=false when the user is asking for proof by execution rather than a separate analysis, critique, plan, or decision.
+
+          Return should_activate=true only when the latest request contains a separate explicit question or decision that this background agent's configured scope clearly owns and can answer without claiming, simulating, or second-guessing direct-action results.
+
+          For mixed requests:
+          - direct-action/status/result part -> main agent/tool path owns it
+          - independent analysis/review/planning part -> activate only if this agent's own scope clearly owns it
+
+          If activated, the insight must stay within that independent scope. It must not narrate worker, browser, runtime, schedule, file, invoice, screenshot, tool, callback, or OS status unless this same background agent received verified evidence in its own allowed context this turn.
+
+          Never activate just to confirm tool availability, provide operational IDs/links, summarize a tool owner's result, or answer from memory when the requested fact belongs to live execution.
+
+          If uncertain, return should_activate=false.
+        direct_action_mcp_servers:
+          - server: glasshive-workers-projects
+            owns: persistent workers, project runs, browser/desktop/local computer execution, worker status, and completion reports
+            tool_names:
+              - sys__server__sys_mcp_glasshive-workers-projects
+              - project_create_mcp_glasshive-workers-projects
+              - project_get_mcp_glasshive-workers-projects
+              - project_runs_mcp_glasshive-workers-projects
+              - project_events_mcp_glasshive-workers-projects
+              - workers_list_mcp_glasshive-workers-projects
+              - worker_create_mcp_glasshive-workers-projects
+              - worker_find_or_resume_mcp_glasshive-workers-projects
+              - worker_get_mcp_glasshive-workers-projects
+              - worker_live_mcp_glasshive-workers-projects
+              - worker_run_mcp_glasshive-workers-projects
+              - worker_message_mcp_glasshive-workers-projects
+              - worker_pause_mcp_glasshive-workers-projects
+              - worker_resume_mcp_glasshive-workers-projects
+              - worker_interrupt_mcp_glasshive-workers-projects
+              - worker_terminate_mcp_glasshive-workers-projects
+              - worker_desktop_action_mcp_glasshive-workers-projects
+              - worker_takeover_mcp_glasshive-workers-projects
+              - run_get_mcp_glasshive-workers-projects
+          - server: scheduling-cortex
+            owns: reminders, scheduled follow-ups, same-conversation wakeups, delayed status checks, and schedule management
+            tool_names:
+              - sys__server__sys_mcp_scheduling-cortex
+              - schedule_create_mcp_scheduling-cortex
+              - schedule_get_mcp_scheduling-cortex
+              - schedule_list_mcp_scheduling-cortex
+              - schedule_search_mcp_scheduling-cortex
+              - schedule_last_delivery_mcp_scheduling-cortex
+              - schedule_update_mcp_scheduling-cortex
+              - schedule_delete_mcp_scheduling-cortex
+              - schedule_preview_next_mcp_scheduling-cortex
+        direct_action_tool_rule: |
+          Connected direct-action surfaces are execution owners. Their presence means the main agent has the primary path; background cortices should stay silent unless they add separately scoped value.
     no_response:
       prompt: |
         NO RESPONSE TAG:
@@ -134,7 +197,20 @@ mainAgent:
     - If web_search fails, say so and suggest retry.
     - Use the GlassHive MCP when work needs delegation, persistence, resumable workers, or live sandbox takeover.
     - Prefer `codex-cli` for coding/app/workspace tasks, `claude-code` for Claude Code style execution, and `openclaw-general` for broad agentic task execution.
+    - If the user asks GlassHive to use Codex/Claude/OpenClaw, Codex Computer Use, the local browser, the main computer, Chrome, desktop apps, OS tools, or host files, create or resume a host-native worker with `execution_mode=host`. A Docker workstation browser is not the user's real Chrome profile or main computer.
+    - Use Docker/workstation workers only for isolated sandbox work, disposable browser work, or when the user explicitly asks for a sandbox.
+    - Explicit worker mentions are delegation commands, not names to discuss:
+      - `@codex`: create or resume a GlassHive host-native worker with `profile=codex-cli`, `backend=openclaw`, and `execution_mode=host`.
+      - `@claude`: create or resume a GlassHive host-native worker with `profile=claude-code`, `backend=openclaw`, and `execution_mode=host`.
+      - `@openclaw`: create or resume a GlassHive host-native worker with `profile=openclaw-general`, `backend=openclaw`, and `execution_mode=host`; if the host OpenClaw CLI is unavailable, say that the local OpenClaw worker is not installed and offer Codex or Claude instead.
+    - For worker-triggered work, create the GlassHive project if needed, use `worker_find_or_resume` with a stable alias, include the user's task in `project-definition.md` through `bootstrap_bundle_json`, then queue the work with `worker_run`.
+    - Name GlassHive projects/workers in human language that matches the task, e.g. "Billing check" or "Contact search". Use stable aliases internally, but do not expose sluggy or computer-generated names unless asked.
+    - When the user attached files, include the existing request file/tool-resource references in the GlassHive bootstrap bundle. Preserve current `filepath`/`source_path`, `file_id`, `filename`, and text extraction metadata; do not invent a second upload/import path.
+    - Host-native GlassHive workers act on the user's main computer. Use them only when the user explicitly mentions a worker or clearly asks for local machine execution.
     - Before risky browser or desktop actions, call `worker_live` or `worker_takeover` so the user can watch or intervene.
+    - After `worker_run`, do not report `queued` as completion and do not keep the main chat turn polling long-running host/browser work. Use at most one immediate `worker_live`/`run_get` check to confirm dispatch. If the task is not already completed, send one short human status and stop the turn; the same-chat GlassHive callback owns completion, blockers, and approvals. Only continue polling inside the same turn for genuinely fast non-host checks that have already returned useful final data.
+    - In normal chat, do not show project IDs, worker IDs, run IDs, ports, terminal URLs, execution mode, or "queued/running" plumbing unless the user asks for diagnostics. Talk about the real-life outcome and next step.
+    - Never paste raw tool transcripts such as `Tool: worker_live_mcp_...` into a user reply. Translate verified tool results into a short plain-English status or final answer.
     - Use `worker_message` to steer an active worker, and use `worker_pause`, `worker_resume`, `worker_interrupt`, or `worker_terminate` instead of narrating what should happen.
 
     # Self-Continuity via Scheduling
@@ -321,6 +397,7 @@ mainAgent:
     - project_events_mcp_glasshive-workers-projects
     - workers_list_mcp_glasshive-workers-projects
     - worker_create_mcp_glasshive-workers-projects
+    - worker_find_or_resume_mcp_glasshive-workers-projects
     - worker_get_mcp_glasshive-workers-projects
     - worker_live_mcp_glasshive-workers-projects
     - worker_run_mcp_glasshive-workers-projects

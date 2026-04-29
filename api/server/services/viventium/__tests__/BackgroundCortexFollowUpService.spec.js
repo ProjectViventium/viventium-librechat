@@ -68,6 +68,33 @@ describe('formatFollowUpPrompt', () => {
       'If a question seems needed, output {NTA} instead.',
     );
   });
+
+  test('makes the main-agent continuation the adjudicator for background evidence', () => {
+    const prompt = formatFollowUpPrompt({
+      insights: [{ cortexName: 'worker', insight: 'The local worker finished and found a useful result.' }],
+      recentResponse: 'I started the worker.',
+      voiceMode: false,
+      surface: '',
+    });
+
+    expect(prompt).toContain('You are the main AI continuing the same conversation.');
+    expect(prompt).toContain('Background agents provide evidence only. You decide whether there is anything worth surfacing.');
+    expect(prompt).toContain('respond with {NTA}');
+  });
+
+  test('makes primary deferred answers user-visible only through the main-agent continuation', () => {
+    const prompt = formatFollowUpPrompt({
+      insights: [{ cortexName: 'worker', insight: 'The task completed successfully.' }],
+      recentResponse: 'I’m checking.',
+      voiceMode: false,
+      surface: '',
+      primaryResponseMode: true,
+    });
+
+    expect(prompt).toContain('You are generating the primary user-visible answer for this turn.');
+    expect(prompt).toContain('Background agents provide evidence only. You decide what, if anything, should become visible to the user.');
+    expect(prompt).toContain('Do not output {NTA} if the insights contain any substantive user-visible information.');
+  });
 });
 
 describe('resolveFollowUpPersistenceText', () => {

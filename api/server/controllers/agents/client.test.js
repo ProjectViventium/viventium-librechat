@@ -56,6 +56,49 @@ const mockEmitChunk = require('@librechat/api').GenerationJobManager.emitChunk;
 const mockCreateCortexFollowUpMessage =
   require('~/server/services/viventium/BackgroundCortexFollowUpService').createCortexFollowUpMessage;
 
+describe('buildViventiumMcpRequestBody', () => {
+  test('passes surface context and existing upload references to GlassHive MCP', () => {
+    const body = AgentClient.buildViventiumMcpRequestBody({
+      messageId: 'assistant-1',
+      conversationId: 'conv-1',
+      parentMessageId: 'user-1',
+      req: {
+        body: {
+          viventiumSurface: 'telegram',
+          viventiumInputMode: 'voice_note',
+          streamId: 'stream-1',
+          telegramChatId: 'chat-1',
+          telegramUserId: 'tg-user-1',
+          telegramMessageId: 'tg-msg-1',
+        },
+      },
+      attachments: [
+        {
+          file_id: 'file-1',
+          filename: 'brief.txt',
+          filepath: '/uploads/user/brief.txt',
+          source: 'local',
+          text: 'brief text',
+        },
+      ],
+      toolResources: { code_interpreter: { file_ids: ['file-1'] } },
+    });
+
+    expect(body.viventiumSurface).toBe('telegram');
+    expect(body.viventiumStreamId).toBe('stream-1');
+    expect(body.viventiumTelegramChatId).toBe('chat-1');
+    expect(body.files[0]).toMatchObject({
+      file_id: 'file-1',
+      filename: 'brief.txt',
+      filepath: '/uploads/user/brief.txt',
+      text: 'brief text',
+    });
+    expect(body.attachments).toEqual(body.files);
+    expect(body.file_ids).toEqual(['file-1']);
+    expect(body.tool_resources.code_interpreter.file_ids).toEqual(['file-1']);
+  });
+});
+
 describe('AgentClient - titleConvo', () => {
   let client;
   let mockRun;

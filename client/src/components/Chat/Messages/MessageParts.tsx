@@ -1,7 +1,6 @@
 import React, { useMemo } from 'react';
 import { useAtomValue } from 'jotai';
 import { useRecoilValue } from 'recoil';
-import type { TMessageContentParts } from 'librechat-data-provider';
 import type { TMessageProps, TMessageIcon } from '~/common';
 import { useMessageHelpers, useLocalize, useAttachments, useContentMetadata } from '~/hooks';
 import MessageIcon from '~/components/Chat/Messages/MessageIcon';
@@ -45,8 +44,8 @@ export default function Message(props: TMessageProps) {
    * Purpose: Surface background cortex parts attached to messages.
    * Details: docs/requirements_and_learnings/05_Open_Source_Modifications.md#librechat-messageparts-cortex
    */
-  const cortexParts =
-    (message as unknown as { __viventiumCortexParts?: unknown })?.__viventiumCortexParts;
+  const cortexParts = (message as unknown as { __viventiumCortexParts?: unknown })
+    ?.__viventiumCortexParts;
   /* VIVENTIUM END */
 
   const name = useMemo(() => {
@@ -156,7 +155,7 @@ export default function Message(props: TMessageProps) {
                     conversationId={conversation?.conversationId}
                     isLatestMessage={messageId === latestMessage?.messageId}
                     cortexParts={cortexParts}
-                    content={message.content as Array<TMessageContentParts | undefined>}
+                    content={message.content}
                   />
                   {/* === VIVENTIUM END === */}
                 </div>

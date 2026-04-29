@@ -23,6 +23,7 @@ const LEADING_REASONING_BLOCK_RES = [
   /^\s*<think\b[^>]*>[\s\S]*?<\/think>\s*/i,
   /^\s*:::thinking\s*[\r\n]*[\s\S]*?:::\s*/i,
 ];
+const TOOL_TRANSCRIPT_LINE_RE = /^\s*Tool:\s+.*_mcp_[A-Za-z0-9_.-]+.*(?:\r?\n|$)/gim;
 
 function stripCitationArtifacts(text) {
   if (typeof text !== 'string' || text.length === 0) {
@@ -84,6 +85,13 @@ function stripLeadingReasoningArtifacts(text) {
   return cleaned.trim();
 }
 
+function stripToolTranscriptArtifacts(text) {
+  if (typeof text !== 'string' || text.length === 0) {
+    return '';
+  }
+  return text.replace(TOOL_TRANSCRIPT_LINE_RE, '').trim();
+}
+
 function sanitizeFollowUpDisplayText(text) {
   if (typeof text !== 'string') {
     return '';
@@ -94,11 +102,13 @@ function sanitizeFollowUpDisplayText(text) {
 
   const withoutNoResponseLeak = text.replace(LEADING_NTA_RE, '').replace(TRAILING_NTA_RE, '');
   const withoutReasoningLeak = stripLeadingReasoningArtifacts(withoutNoResponseLeak);
-  return stripCitationArtifacts(withoutReasoningLeak);
+  const withoutToolTranscript = stripToolTranscriptArtifacts(withoutReasoningLeak);
+  return stripCitationArtifacts(withoutToolTranscript);
 }
 
 module.exports = {
   stripLeadingReasoningArtifacts,
+  stripToolTranscriptArtifacts,
   stripCitationArtifacts,
   sanitizeFollowUpDisplayText,
 };

@@ -107,10 +107,29 @@ describe('BackgroundCortexService activation policy helpers', () => {
 
     expect(prompt).toContain('Background agents are optional reviewers, not controllers.');
     expect(prompt).toContain('connected direct-action surface');
+    expect(prompt).toContain('Return should_activate=true only when the latest request contains a separate explicit question or decision');
     expect(prompt).toContain('If uncertain, return should_activate=false.');
     expect(prompt).not.toMatch(
       /Emotional Resonance|Confirmation Bias|Red Team|Pattern Recognition|Strategic Planning|Viventium User Help|Deep Research|product-help|user-help/i,
     );
+  });
+
+  test('source-of-truth policy does not declare generic reasoning tools as direct-action blockers', () => {
+    const sourcePath = path.resolve(
+      __dirname,
+      '../../../../viventium/source_of_truth/local.librechat.yaml',
+    );
+    const source = yaml.load(fs.readFileSync(sourcePath, 'utf8'));
+    const directActionServers =
+      source?.viventium?.background_cortices?.activation_policy?.direct_action_mcp_servers || [];
+    const declaredTools = directActionServers.flatMap((server) => server.tool_names || []);
+
+    expect(directActionServers.map((server) => server.server)).toEqual(
+      expect.arrayContaining(['glasshive-workers-projects', 'scheduling-cortex']),
+    );
+    expect(declaredTools).not.toContain('web_search');
+    expect(declaredTools).not.toContain('file_search');
+    expect(declaredTools).not.toContain('sequential-thinking');
   });
 
   test('normalizes string and object tool declarations', () => {

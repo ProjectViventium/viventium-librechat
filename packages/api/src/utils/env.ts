@@ -133,6 +133,60 @@ const ALLOWED_BODY_FIELDS = [
   /* === VIVENTIUM END === */
 ] as const;
 
+const MAX_BODY_JSON_B64_HEADER_BYTES = 6 * 1024;
+const MAX_HEADER_UPLOAD_FILES = 16;
+
+function compactUploadEntryForHeader(value: unknown): unknown {
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+  const entry = value as Record<string, unknown>;
+  const compact: Record<string, unknown> = {};
+  for (const key of [
+    'file_id',
+    'temp_file_id',
+    'filename',
+    'filepath',
+    'source',
+    'context',
+    'type',
+    'bytes',
+    'width',
+    'height',
+    'metadata',
+  ]) {
+    if (entry[key] != null) {
+      compact[key] = entry[key];
+    }
+  }
+  if (typeof entry.text === 'string' && entry.text.length > 0) {
+    compact.text_truncated = true;
+  }
+  return compact;
+}
+
+function compactBodyFieldForHeader(field: string, fieldValue: unknown): unknown {
+  if ((field === 'files' || field === 'attachments') && Array.isArray(fieldValue)) {
+    const limited = fieldValue.slice(0, MAX_HEADER_UPLOAD_FILES).map(compactUploadEntryForHeader);
+    if (fieldValue.length > MAX_HEADER_UPLOAD_FILES) {
+      limited.push({ truncated: true, omitted_count: fieldValue.length - MAX_HEADER_UPLOAD_FILES });
+    }
+    return limited;
+  }
+  if (field === 'tool_resources' && fieldValue && typeof fieldValue === 'object') {
+    const compact: Record<string, unknown> = {};
+    for (const [toolName, resource] of Object.entries(fieldValue as Record<string, unknown>)) {
+      if (!resource || typeof resource !== 'object') {
+        continue;
+      }
+      const fileIds = (resource as Record<string, unknown>).file_ids;
+      compact[toolName] = Array.isArray(fileIds) ? { file_ids: fileIds.slice(0, 64) } : resource;
+    }
+    return compact;
+  }
+  return fieldValue;
+}
+
 /**
  * Processes a string value to replace user field placeholders.
  * When isHeader is true, non-ASCII characters in certain fields are Base64 encoded.
@@ -210,6 +264,30 @@ function bodyFieldToString(fieldValue: unknown): string {
   return String(fieldValue);
 }
 
+function encodeBodyFieldJsonB64Header(field: string, fieldValue: unknown, isHeader: boolean): string {
+  const replacementValue = bodyFieldToString(fieldValue);
+  if (!replacementValue) {
+    return '';
+  }
+  const encoded = `b64:${Buffer.from(replacementValue, 'utf8').toString('base64')}`;
+  if (!isHeader || Buffer.byteLength(encoded, 'utf8') <= MAX_BODY_JSON_B64_HEADER_BYTES) {
+    return encoded;
+  }
+
+  const compactValue = bodyFieldToString(compactBodyFieldForHeader(field, fieldValue));
+  const compactEncoded = `b64:${Buffer.from(compactValue, 'utf8').toString('base64')}`;
+  if (Buffer.byteLength(compactEncoded, 'utf8') <= MAX_BODY_JSON_B64_HEADER_BYTES) {
+    return compactEncoded;
+  }
+
+  const fallback = JSON.stringify({
+    truncated: true,
+    field,
+    reason: 'header_size_limit',
+  });
+  return `b64:${Buffer.from(fallback, 'utf8').toString('base64')}`;
+}
+
 function processBodyPlaceholders(value: string, body: RequestBody, isHeader: boolean = false): string {
   // Type guard: ensure value is a string
   if (typeof value !== 'string') {
@@ -225,9 +303,7 @@ function processBodyPlaceholders(value: string, body: RequestBody, isHeader: boo
     const placeholder = `{{LIBRECHAT_BODY_${upperField}}}`;
 
     if (value.includes(jsonB64Placeholder)) {
-      const encoded = replacementValue
-        ? `b64:${Buffer.from(replacementValue, 'utf8').toString('base64')}`
-        : '';
+      const encoded = encodeBodyFieldJsonB64Header(field, fieldValue, isHeader);
       value = value.replace(new RegExp(jsonB64Placeholder, 'g'), encoded);
     }
 

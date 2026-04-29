@@ -1181,6 +1181,42 @@ describe('processMCPEnv', () => {
     );
   });
 
+  it('compacts oversized upload JSON headers instead of emitting huge file text', () => {
+    const body = {
+      files: [
+        {
+          file_id: 'file-large',
+          filename: 'large.txt',
+          filepath: '/tmp/librechat/upload/large.txt',
+          source: 'local',
+          text: 'x'.repeat(20_000),
+        },
+      ],
+    };
+    const options: MCPOptions = {
+      type: 'streamable-http',
+      url: 'https://api.example.com/mcp',
+      headers: {
+        'X-Files': '{{LIBRECHAT_BODY_FILES_JSON_B64}}',
+      },
+    };
+
+    const result = processMCPEnv({ options, body });
+    const filesHeader = result.headers?.['X-Files'] ?? '';
+    const decoded = JSON.parse(Buffer.from(filesHeader.slice(4), 'base64').toString('utf8'));
+
+    expect(Buffer.byteLength(filesHeader, 'utf8')).toBeLessThanOrEqual(6 * 1024);
+    expect(decoded).toEqual([
+      {
+        file_id: 'file-large',
+        filename: 'large.txt',
+        filepath: '/tmp/librechat/upload/large.txt',
+        source: 'local',
+        text_truncated: true,
+      },
+    ]);
+  });
+
   it('resolves all source-of-truth GlassHive request-context header placeholders', () => {
     const sourcePath = path.resolve(
       __dirname,

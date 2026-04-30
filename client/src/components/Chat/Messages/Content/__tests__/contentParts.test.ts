@@ -1,4 +1,4 @@
-import { ContentTypes, ToolCallTypes } from 'librechat-data-provider';
+import { Constants, ContentTypes, ToolCallTypes } from 'librechat-data-provider';
 import type { TMessageContentParts } from 'librechat-data-provider';
 import { groupParallelContent } from '../ParallelContent';
 import { filterRenderableContentParts } from '../contentPartUtils';
@@ -115,6 +115,130 @@ describe('filterRenderableContentParts', () => {
         text: 'Codex is on it.',
       },
     ]);
+  });
+
+  it('collapses consecutive GlassHive tool rows into the latest status row', () => {
+    const parts: TMessageContentParts[] = [
+      {
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: 'toolu_projects',
+          name: `projects_list${Constants.mcp_delimiter}glasshive-workers-projects`,
+          args: '{}',
+          type: ToolCallTypes.TOOL_CALL,
+          progress: 1,
+          output: '[{"project_id":"prj_public_safe"}]',
+        },
+      },
+      {
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: 'toolu_create',
+          name: `worker_create${Constants.mcp_delimiter}glasshive-workers-projects`,
+          args: '{}',
+          type: ToolCallTypes.TOOL_CALL,
+          progress: 1,
+          output: '{"worker_id":"wrk_public_safe"}',
+        },
+      },
+      {
+        type: ContentTypes.TEXT,
+        text: 'Done.',
+      },
+    ];
+
+    expect(filterRenderableContentParts(parts)).toEqual([parts[1], parts[2]]);
+  });
+
+  it('hides routine GlassHive one-shot delegation rows from chat rendering', () => {
+    const parts: TMessageContentParts[] = [
+      {
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: 'toolu_delegate',
+          name: `worker_delegate_once${Constants.mcp_delimiter}glasshive-workers-projects`,
+          args: '{}',
+          type: ToolCallTypes.TOOL_CALL,
+          progress: 1,
+          output: '{"status":"dispatched","callback_ready":true,"user_status":"On it"}',
+        },
+      },
+      { type: ContentTypes.TEXT, text: 'On ' },
+      { type: ContentTypes.TEXT, text: 'it.' },
+    ];
+
+    expect(filterRenderableContentParts(parts)).toEqual([
+      {
+        type: ContentTypes.TEXT,
+        text: 'On it.',
+      },
+    ]);
+  });
+
+  it('hides routine GlassHive one-shot rows when MCP output is wrapped in text content', () => {
+    const parts: TMessageContentParts[] = [
+      {
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: 'toolu_delegate_wrapped',
+          name: `worker_delegate_once${Constants.mcp_delimiter}glasshive-workers-projects`,
+          args: '{}',
+          type: ToolCallTypes.TOOL_CALL,
+          progress: 1,
+          output:
+            '[{"type":"text","text":"{\\n  \\"status\\": \\"dispatched\\",\\n  \\"callback_ready\\": true,\\n  \\"user_status\\": \\"On it\\"\\n}"}]',
+        },
+      },
+      { type: ContentTypes.TEXT, text: 'On it.' },
+    ];
+
+    expect(filterRenderableContentParts(parts)).toEqual([{ type: ContentTypes.TEXT, text: 'On it.' }]);
+  });
+
+  it('keeps blocked GlassHive one-shot delegation rows visible', () => {
+    const parts: TMessageContentParts[] = [
+      {
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: 'toolu_delegate_blocked',
+          name: `worker_delegate_once${Constants.mcp_delimiter}glasshive-workers-projects`,
+          args: '{}',
+          type: ToolCallTypes.TOOL_CALL,
+          progress: 1,
+          output: '{"status":"blocked","callback_ready":false,"user_status":"Callback is not configured."}',
+        },
+      },
+      { type: ContentTypes.TEXT, text: 'I need callback setup first.' },
+    ];
+
+    expect(filterRenderableContentParts(parts)).toBe(parts);
+  });
+
+  it('does not collapse similarly named non-canonical MCP servers', () => {
+    const parts: TMessageContentParts[] = [
+      {
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: 'toolu_one',
+          name: `worker_create${Constants.mcp_delimiter}not-glasshive-workers-projects`,
+          args: '{}',
+          type: ToolCallTypes.TOOL_CALL,
+          progress: 1,
+        },
+      },
+      {
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: 'toolu_two',
+          name: `worker_run${Constants.mcp_delimiter}not-glasshive-workers-projects`,
+          args: '{}',
+          type: ToolCallTypes.TOOL_CALL,
+          progress: 1,
+        },
+      },
+    ];
+
+    expect(filterRenderableContentParts(parts)).toBe(parts);
   });
 
   it('does not merge text across non-text parts', () => {

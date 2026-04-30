@@ -6,7 +6,7 @@ import FinishedIcon from './FinishedIcon';
 import { cn } from '~/utils';
 
 const wrapperClass =
-  'progress-text-wrapper text-token-text-secondary relative -mt-[0.75px] h-5 w-full leading-5';
+  'progress-text-wrapper text-token-text-secondary relative -mt-[0.75px] min-h-5 w-full min-w-0 leading-5';
 
 const Wrapper = ({ popover, children }: { popover: boolean; children: React.ReactNode }) => {
   if (popover) {
@@ -14,7 +14,7 @@ const Wrapper = ({ popover, children }: { popover: boolean; children: React.Reac
       <div className={wrapperClass}>
         <Popover.Trigger asChild>
           <div
-            className="progress-text-content absolute left-0 top-0 overflow-visible whitespace-nowrap"
+            className="progress-text-content flex w-full min-w-0 overflow-hidden"
             style={{ opacity: 1, transform: 'none' }}
             data-projection-id="78"
           >
@@ -28,7 +28,7 @@ const Wrapper = ({ popover, children }: { popover: boolean; children: React.Reac
   return (
     <div className={wrapperClass}>
       <div
-        className="progress-text-content absolute left-0 top-0 overflow-visible whitespace-nowrap"
+        className="progress-text-content flex w-full min-w-0 overflow-hidden"
         style={{ opacity: 1, transform: 'none' }}
         data-projection-id="78"
       >
@@ -88,7 +88,7 @@ export default function ProgressText({
       <button
         type="button"
         className={cn(
-          'inline-flex w-full items-center gap-2',
+          'inline-flex w-full min-w-0 items-center gap-2 text-left',
           hasInput ? '' : 'pointer-events-none',
         )}
         disabled={!hasInput}
@@ -96,7 +96,7 @@ export default function ProgressText({
         aria-expanded={hasInput ? isExpanded : undefined}
       >
         {icon}
-        <span className={showShimmer ? 'shimmer' : ''}>{text}</span>
+        <span className={cn('min-w-0 truncate', showShimmer ? 'shimmer' : '')}>{text}</span>
         {hasInput &&
           (isExpanded ? (
             <ChevronUp className="size-4 shrink-0 translate-y-[1px]" aria-hidden="true" />

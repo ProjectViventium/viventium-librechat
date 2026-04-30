@@ -1,5 +1,6 @@
-import { ContentTypes } from 'librechat-data-provider';
+import { Constants, ContentTypes } from 'librechat-data-provider';
 import type { Agents, TMessageContentParts } from 'librechat-data-provider';
+import { GLASSHIVE_MCP_SERVER_NAME } from '~/utils/viventiumGlassHive';
 
 export type RenderableContentInput =
   | Array<TMessageContentParts | string | null | undefined>
@@ -104,6 +105,99 @@ function mergeAdjacentTextParts(
   return changed ? merged : content;
 }
 
+function glassHiveToolName(part: TMessageContentParts | undefined): string | undefined {
+  if (part?.type !== ContentTypes.TOOL_CALL) {
+    return undefined;
+  }
+  const toolCall = part[ContentTypes.TOOL_CALL] as Agents.ToolCall | undefined;
+  const name = typeof toolCall?.name === 'string' ? toolCall.name : '';
+  if (!name.includes(Constants.mcp_delimiter)) {
+    return undefined;
+  }
+  const [toolName, serverName] = name.split(Constants.mcp_delimiter);
+  return serverName === GLASSHIVE_MCP_SERVER_NAME ? toolName : undefined;
+}
+
+function isGlassHiveToolCall(part: TMessageContentParts | undefined): boolean {
+  return glassHiveToolName(part) != null;
+}
+
+function isRoutineGlassHiveDelegateToolCall(part: TMessageContentParts | undefined): boolean {
+  return glassHiveToolName(part) === 'worker_delegate_once';
+}
+
+function parseGlassHiveToolOutput(rawOutput: string): Record<string, unknown> | undefined {
+  try {
+    const parsed = JSON.parse(rawOutput) as unknown;
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+    if (Array.isArray(parsed)) {
+      const textEnvelope = parsed.find((item) => {
+        return (
+          item &&
+          typeof item === 'object' &&
+          (item as { type?: unknown; text?: unknown }).type === ContentTypes.TEXT &&
+          typeof (item as { text?: unknown }).text === 'string'
+        );
+      }) as { text?: string } | undefined;
+      if (textEnvelope?.text) {
+        const nested = JSON.parse(textEnvelope.text) as unknown;
+        if (nested && typeof nested === 'object' && !Array.isArray(nested)) {
+          return nested as Record<string, unknown>;
+        }
+      }
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+function routineGlassHiveDelegateCanBeHidden(part: TMessageContentParts | undefined): boolean {
+  if (!isRoutineGlassHiveDelegateToolCall(part)) {
+    return false;
+  }
+  const toolCall = part?.[ContentTypes.TOOL_CALL] as Agents.ToolCall | undefined;
+  const rawOutput = typeof toolCall?.output === 'string' ? toolCall.output.trim() : '';
+  if (!rawOutput) {
+    return false;
+  }
+  const parsed = parseGlassHiveToolOutput(rawOutput);
+  return parsed?.status === 'dispatched' && parsed?.callback_ready === true;
+}
+
+function hideRoutineGlassHiveDelegateToolCalls(
+  content: Array<TMessageContentParts | undefined>,
+): Array<TMessageContentParts | undefined> {
+  let changed = false;
+  const filtered = content.filter((part) => {
+    const keep = !routineGlassHiveDelegateCanBeHidden(part);
+    changed ||= !keep;
+    return keep;
+  });
+  return changed ? filtered : content;
+}
+
+function collapseConsecutiveGlassHiveToolCalls(
+  content: Array<TMessageContentParts | undefined>,
+): Array<TMessageContentParts | undefined> {
+  let changed = false;
+  const collapsed: Array<TMessageContentParts | undefined> = [];
+
+  content.forEach((part) => {
+    const previous = collapsed[collapsed.length - 1];
+    if (isGlassHiveToolCall(part) && isGlassHiveToolCall(previous)) {
+      collapsed[collapsed.length - 1] = part;
+      changed = true;
+      return;
+    }
+    collapsed.push(part);
+  });
+
+  return changed ? collapsed : content;
+}
+
 export function filterRenderableContentParts(
   content: RenderableContentInput,
 ): Array<TMessageContentParts | undefined> | undefined {
@@ -140,7 +234,9 @@ export function filterRenderableContentParts(
   });
 
   const deduped = removedAny ? filtered : normalizedContent;
-  return mergeAdjacentTextParts(deduped);
+  const withoutRoutineDelegation = hideRoutineGlassHiveDelegateToolCalls(deduped);
+  const collapsed = collapseConsecutiveGlassHiveToolCalls(withoutRoutineDelegation);
+  return mergeAdjacentTextParts(collapsed);
 }
 
 // VIVENTIUM START

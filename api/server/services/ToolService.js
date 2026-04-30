@@ -79,6 +79,7 @@ const {
   stripOAuthPendingMcpTools,
 } = require('~/server/services/viventium/mcpOAuthPolicy');
 // === VIVENTIUM END ===
+const VIVENTIUM_GLASSHIVE_MCP_SERVER_NAME = 'glasshive-workers-projects';
 /**
  * Processes the required actions by calling the appropriate tools and returning the outputs.
  * @param {OpenAIClient} client - OpenAI or StreamRunManager Client.
@@ -573,7 +574,10 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
     if (normalized === 'ms-365' && isFalse(process.env.START_MS365_MCP)) {
       return true;
     }
-    if (normalized === 'glasshive-workers-projects' && isFalse(process.env.START_GLASSHIVE)) {
+    if (
+      normalized === VIVENTIUM_GLASSHIVE_MCP_SERVER_NAME &&
+      isFalse(process.env.START_GLASSHIVE)
+    ) {
       return true;
     }
     return false;

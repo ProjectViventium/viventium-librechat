@@ -18,8 +18,9 @@
 
 import { useEffect, useRef } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { ContentTypes, QueryKeys } from 'librechat-data-provider';
+import { Constants, ContentTypes, QueryKeys } from 'librechat-data-provider';
 import type { TMessage, TMessageContentParts } from 'librechat-data-provider';
+import { GLASSHIVE_MCP_SERVER_NAME } from '~/utils/viventiumGlassHive';
 
 /**
  * Keep polling long enough for real-world Phase B completion.
@@ -43,7 +44,7 @@ const TERMINAL_GLASSHIVE_CALLBACK_EVENTS = new Set<string>([
   'checkpoint.ready',
   'takeover.requested',
 ]);
-const GLASSHIVE_MCP_SERVER = 'glasshive-workers-projects';
+const GLASSHIVE_MCP_SERVER = GLASSHIVE_MCP_SERVER_NAME;
 
 function extractCortexParts(message: TMessage): any[] {
   const transient = (message as any)?.__viventiumCortexParts;
@@ -123,7 +124,7 @@ function isGlassHiveToolName(name: string): boolean {
   if (!name) {
     return false;
   }
-  const [, mcpServer] = name.split('_mcp_');
+  const [, mcpServer] = name.split(Constants.mcp_delimiter);
   return mcpServer === GLASSHIVE_MCP_SERVER;
 }
 

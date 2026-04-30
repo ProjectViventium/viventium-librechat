@@ -12,10 +12,11 @@ import { useLocalize, useProgress } from '~/hooks';
 import { AttachmentGroup } from './Parts';
 import ToolCallInfo from './ToolCallInfo';
 import ProgressText from './ProgressText';
+import { GLASSHIVE_MCP_SERVER_NAME } from '~/utils/viventiumGlassHive';
 import { logger, cn } from '~/utils';
 
 // VIVENTIUM START: present GlassHive MCP worker tools with source-of-truth labels.
-const GLASSHIVE_MCP_SERVER_NAMES = new Set(['glasshive-workers-projects']);
+const GLASSHIVE_MCP_SERVER_NAMES = new Set([GLASSHIVE_MCP_SERVER_NAME]);
 const GLASSHIVE_TOOL_LABELS: Record<string, string> = {
   worker_delegate_once: 'GlassHive worker',
   workers_list: 'GlassHive worker',
@@ -239,7 +240,7 @@ export default function ToolCall({
 
   return (
     <>
-      <div className="relative my-2.5 flex h-5 shrink-0 items-center gap-2.5">
+      <div className="relative my-2.5 flex min-h-5 min-w-0 shrink-0 items-center gap-2.5">
         <ProgressText
           progress={progress}
           onClick={() => setShowInfo((prev) => !prev)}

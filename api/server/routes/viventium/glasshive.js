@@ -24,6 +24,15 @@ const CALLBACK_SKEW_SEC = 5 * 60;
 const CALLBACK_REPLAY_TTL_MS = 10 * 60 * 1000;
 const MAX_CALLBACK_TEXT_LENGTH = 2400;
 const MAX_CALLBACK_EVENTS = 20;
+const USER_VISIBLE_CALLBACK_EVENTS = new Set([
+  'run.completed',
+  'run.failed',
+  'run.cancelled',
+  'run.interrupted',
+  'checkpoint.ready',
+  'artifact.created',
+  'takeover.requested',
+]);
 const seenCallbacks = new Map();
 const LOCAL_PATH_PATTERN =
   /(?:~\/|\/Users\/|\/home\/|\/private\/var\/|\/var\/folders\/|\/tmp\/|[A-Za-z]:\\Users\\)[^`'"<>\n\r]*?(?=$|[`'"<>\n\r]|[)\],.;:!?](?:\s|$)|\s+(?:and|or|from|at|with|then|while|because|but|plus|to|in|on)\b)/gi;
@@ -112,8 +121,9 @@ function sanitizeCallbackMessage(value) {
     return '';
   }
   text = text
-    .replace(/https?:\/\/(?:localhost|127\.0\.0\.1):\d+\/[^\s)]*/gi, '[local worker link]')
+    .replace(/https?:\/\/(?:localhost|127\.0\.0\.1):\d+\/[^\s)`'"<>]*/gi, '[local worker link]')
     .replace(LOCAL_PATH_PATTERN, '[local path]')
+    .replace(/\]\(\[local path\](?!\))/g, ']([local path])')
     .replace(/\bwrk[_-][A-Za-z0-9_-]+\b/g, '[worker id]')
     .replace(/\brun[_-][A-Za-z0-9_-]+\b/g, '[run id]')
     .replace(/\bprj[_-][A-Za-z0-9_-]+\b/g, '[project id]');
@@ -138,9 +148,6 @@ function sanitizeCallbackMessage(value) {
 function callbackText(body = {}) {
   const event = String(body.event || '').trim();
   const message = sanitizeCallbackMessage(body.message);
-  if (event === 'run.started') {
-    return 'I’m working on it now.';
-  }
   if (event === 'run.completed') {
     return message || 'Done.';
   }
@@ -157,6 +164,9 @@ function callbackText(body = {}) {
   }
   if (event === 'takeover.requested') {
     return message ? `I need you to take over: ${message}` : 'I need you to take over.';
+  }
+  if (event === 'artifact.created') {
+    return message || 'I saved the artifact.';
   }
   return '';
 }
@@ -214,6 +224,18 @@ function blankAssistantAnchorMessage(messages, anchorMessageId) {
       }
       return typeof message?.text === 'string' && !message.text.trim();
     }) || null
+  );
+}
+
+function messageById(messages, messageId) {
+  const id = String(messageId || '').trim();
+  if (!id) {
+    return null;
+  }
+  return (
+    (Array.isArray(messages) ? messages : []).find(
+      (message) => String(message?.messageId || '') === id,
+    ) || null
   );
 }
 
@@ -290,6 +312,28 @@ function buildCallbackMetadata({
   };
 }
 
+function callbackMessageTimestamps({ messages, requestedParentMessageId, priorStatusMessage }) {
+  const now = new Date();
+  const requestedParent = messageById(messages, requestedParentMessageId);
+  const requestedParentTime = Date.parse(String(requestedParent?.createdAt || ''));
+  const priorTime = Date.parse(String(priorStatusMessage?.createdAt || ''));
+  let createdAt = now;
+  if (Number.isFinite(priorTime) && priorTime > 0) {
+    createdAt = new Date(priorTime);
+  }
+  if (
+    Number.isFinite(requestedParentTime) &&
+    requestedParentTime > 0 &&
+    createdAt.getTime() <= requestedParentTime
+  ) {
+    createdAt = now;
+  }
+  return {
+    createdAt,
+    updatedAt: now,
+  };
+}
+
 router.post('/callback', async (req, res) => {
   if (!verifySignature(req.body || {}, req.get('x-glasshive-signature'))) {
     return res.status(401).json({ error: 'invalid_signature' });
@@ -302,6 +346,10 @@ router.post('/callback', async (req, res) => {
   const conversationId = String(req.body?.conversation_id || '').trim();
   const requestedParentMessageId = String(req.body?.parent_message_id || '').trim();
   const anchorMessageId = String(req.body?.message_id || '').trim();
+  const event = String(req.body?.event || '').trim();
+  if (!USER_VISIBLE_CALLBACK_EVENTS.has(event)) {
+    return res.status(202).json({ status: 'ignored', reason: 'non_user_visible_event' });
+  }
   const text = callbackText(req.body);
   if (!text) {
     return res.status(202).json({ status: 'ignored', reason: 'missing_context_or_text' });
@@ -338,6 +386,9 @@ router.post('/callback', async (req, res) => {
     rememberCallback(req.body || {});
     return res.status(409).json({ error: 'duplicate_callback' });
   }
+  if (!messageById(messages, anchorMessageId)) {
+    return res.status(425).json({ error: 'callback_anchor_not_ready' });
+  }
 
   const priorStatusMessage =
     latestPriorGlassHiveStatusMessage(messages, req.body || {}) ||
@@ -359,6 +410,11 @@ router.post('/callback', async (req, res) => {
     anchorMessageId,
     previousMetadata: priorStatusMessage?.metadata,
   });
+  const timestamps = callbackMessageTimestamps({
+    messages,
+    requestedParentMessageId,
+    priorStatusMessage,
+  });
   const followUpMessage = {
     messageId,
     conversationId,
@@ -371,12 +427,14 @@ router.post('/callback', async (req, res) => {
     content: callbackContent(text),
     isCreatedByUser: false,
     metadata,
+    ...timestamps,
   };
 
   try {
     if (priorStatusMessage && typeof db.updateMessage === 'function') {
       await db.updateMessage({ user: { id: userId } }, followUpMessage, {
         context: 'viventium/routes/glasshive.callback.update',
+        overrideTimestamp: true,
       });
     } else {
       await db.saveMessage({ user: { id: userId } }, followUpMessage, {

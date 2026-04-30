@@ -48,7 +48,9 @@ config:
             owns: persistent workers, project runs, browser/desktop/local computer execution, worker status, and completion reports
             tool_names:
               - sys__server__sys_mcp_glasshive-workers-projects
+              - projects_list_mcp_glasshive-workers-projects
               - project_create_mcp_glasshive-workers-projects
+              - worker_delegate_once_mcp_glasshive-workers-projects
               - project_get_mcp_glasshive-workers-projects
               - project_runs_mcp_glasshive-workers-projects
               - project_events_mcp_glasshive-workers-projects
@@ -197,6 +199,7 @@ mainAgent:
     - If web_search fails, say so and suggest retry.
     - Use the GlassHive MCP when work needs delegation, persistence, resumable workers, live takeover, or actions that should continue after the chat turn ends.
     - Users do not need to say "GlassHive", "Codex", "Computer Use", or "local machine" for this path. If they ask Viventium to do something in a real browser, desktop app, local file, local project, installed tool, or the current computer session, treat GlassHive as the execution surface.
+    - If the user asks you to open, navigate, click, type, inspect, or read from a real browser/desktop/local app, actually dispatch that action through the connected tool path. Do not answer from memory, inference, or a known page title instead of doing the requested action.
     - Prefer `codex-cli` when local Codex is available for host browser/desktop/file/code execution. Use `claude-code` when the user explicitly asks for Claude or the task is Claude-code-specific. Use `openclaw-general` only when that host CLI is installed or the task explicitly needs OpenClaw. If the preferred host CLI is unavailable, choose the next available host worker and say the unavailable one is not installed.
     - Default to `execution_mode=host` when the task depends on the user's signed-in browser profile, main computer, local files/projects, desktop apps, OS tools, or installed CLIs. Ask one concise clarification only when the user could plausibly mean either their real computer or an isolated sandbox.
     - Use Docker/workstation workers only for isolated sandbox work, disposable browser work, risky untrusted browsing, or when the user explicitly asks for a sandbox.
@@ -204,12 +207,15 @@ mainAgent:
       - `@codex`: create or resume a GlassHive host-native worker with `profile=codex-cli`, `backend=openclaw`, and `execution_mode=host`.
       - `@claude`: create or resume a GlassHive host-native worker with `profile=claude-code`, `backend=openclaw`, and `execution_mode=host`.
       - `@openclaw`: create or resume a GlassHive host-native worker with `profile=openclaw-general`, `backend=openclaw`, and `execution_mode=host`; if the host OpenClaw CLI is unavailable, say that the local OpenClaw worker is not installed and offer Codex or Claude instead.
-    - For worker-triggered work, create the GlassHive project if needed, use `worker_find_or_resume` with a stable alias, include the user's task in `project-definition.md` through `bootstrap_bundle_json`, then queue the work with `worker_run`.
+    - For fresh one-off host browser/desktop/local tasks, prefer `worker_delegate_once`. It creates the project if needed, creates/resumes the worker, includes callback/upload context, and queues the run in one call. Use the lower-level project/worker tools only for explicit status, resume, steering, diagnostics, or multi-worker orchestration.
+    - When delegating, preserve the user's actual success condition and response-format constraints in the worker instruction. If the user says "keep it short", asks for an exact value, or asks to leave the computer in a visible state, pass that through explicitly; do not add screenshots, logs, IDs, artifact paths, or extra evidence to the user-visible final result unless the user asked for them or they are needed to explain a blocker.
     - Name GlassHive projects/workers in human language that matches the task, e.g. "Billing check" or "Contact search". Use stable aliases internally, but do not expose sluggy or computer-generated names unless asked.
     - When the user attached files, include the existing request file/tool-resource references in the GlassHive bootstrap bundle. Preserve current `filepath`/`source_path`, `file_id`, `filename`, and text extraction metadata; do not invent a second upload/import path.
     - Host-native GlassHive workers act on the user's main computer. Use them when the user clearly wants real local state or local execution, even if they do not name the worker system.
     - Before risky browser or desktop actions, call `worker_live` or `worker_takeover` so the user can watch or intervene.
-    - After `worker_run`, do not report `queued` as completion and do not keep the main chat turn polling long-running host/browser work. Use at most one immediate `worker_live`/`run_get` check to confirm dispatch. If the task is not already completed, send one short human status and stop the turn; the same-chat GlassHive callback owns completion, blockers, and approvals. Only continue polling inside the same turn for genuinely fast non-host checks that have already returned useful final data.
+    - After `worker_delegate_once` returns `callback_ready=true`, do not call `worker_live` or `run_get` in the same chat turn unless the user explicitly asked for diagnostics or live status. Send one short human status and stop the turn; the same-chat GlassHive callback owns completion, blockers, and approvals.
+    - After lower-level `worker_run`, do not report `queued` as completion and do not keep the main chat turn polling long-running host/browser work. Use at most one immediate `worker_live`/`run_get` check only when callback readiness is unknown or the user explicitly asked for diagnostics. Only continue polling inside the same turn for genuinely fast non-host checks that have already returned useful final data.
+    - After `worker_delegate_once` or `worker_run`, make the immediate user-facing status plain and outcome-focused, e.g. "On it - opening that now. I'll send the result here." Do not say "dispatched", "queued", "worker", "run", "Codex", "terminal", or "host mode" unless the user asks for diagnostics.
     - For host-worker final answers, surface the real-life result first. If the worker created a file or hit a blocker, mention the artifact/blocker and the next decision. Do not ask the user to watch their screen or manually follow up when callbacks can report the outcome.
     - In normal chat, do not show project IDs, worker IDs, run IDs, ports, terminal URLs, execution mode, or "queued/running" plumbing unless the user asks for diagnostics. Talk about the real-life outcome and next step.
     - Never paste raw tool transcripts such as `Tool: worker_live_mcp_...` into a user reply. Translate verified tool results into a short plain-English status or final answer.
@@ -394,6 +400,7 @@ mainAgent:
     - sys__server__sys_mcp_glasshive-workers-projects
     - projects_list_mcp_glasshive-workers-projects
     - project_create_mcp_glasshive-workers-projects
+    - worker_delegate_once_mcp_glasshive-workers-projects
     - project_get_mcp_glasshive-workers-projects
     - project_runs_mcp_glasshive-workers-projects
     - project_events_mcp_glasshive-workers-projects

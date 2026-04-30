@@ -140,6 +140,33 @@ describe('Message Operations', () => {
       });
     });
 
+    it('can override immutable timestamps for callback anchor repair', async () => {
+      await saveMessage(mockReq, mockMessageData);
+      mockScheduleConversationRecallSync.mockClear();
+      const repairedCreatedAt = new Date('2026-04-28T14:00:02.000Z');
+      const repairedUpdatedAt = new Date('2026-04-28T14:00:03.000Z');
+
+      await updateMessage(
+        mockReq,
+        {
+          messageId: 'msg123',
+          text: 'Callback result.',
+          createdAt: repairedCreatedAt,
+          updatedAt: repairedUpdatedAt,
+        },
+        { context: 'test.timestamp-override', overrideTimestamp: true },
+      );
+
+      const updatedMessage = await Message.findOne({ messageId: 'msg123', user: 'user123' });
+      expect(updatedMessage.text).toBe('Callback result.');
+      expect(updatedMessage.createdAt.toISOString()).toBe(repairedCreatedAt.toISOString());
+      expect(updatedMessage.updatedAt.toISOString()).toBe(repairedUpdatedAt.toISOString());
+      expect(mockScheduleConversationRecallSync).toHaveBeenCalledWith({
+        userId: 'user123',
+        conversationId: mockMessageData.conversationId,
+      });
+    });
+
     it('should throw an error if message is not found', async () => {
       await expect(
         updateMessage(mockReq, { messageId: 'nonexistent', text: 'Test' }),

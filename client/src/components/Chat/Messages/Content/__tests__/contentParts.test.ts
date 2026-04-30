@@ -1,5 +1,6 @@
 import { ContentTypes, ToolCallTypes } from 'librechat-data-provider';
 import type { TMessageContentParts } from 'librechat-data-provider';
+import { groupParallelContent } from '../ParallelContent';
 import { filterRenderableContentParts } from '../contentPartUtils';
 
 describe('filterRenderableContentParts', () => {
@@ -150,5 +151,20 @@ describe('filterRenderableContentParts', () => {
     ];
 
     expect(filterRenderableContentParts(parts)).toBe(parts);
+  });
+});
+
+describe('groupParallelContent', () => {
+  it('keeps malformed non-array content empty instead of crashing', () => {
+    expect(groupParallelContent(undefined)).toEqual({ parallelSections: [], sequentialParts: [] });
+    expect(groupParallelContent(null)).toEqual({ parallelSections: [], sequentialParts: [] });
+    expect(groupParallelContent('Legacy text message')).toEqual({
+      parallelSections: [],
+      sequentialParts: [],
+    });
+    expect(groupParallelContent({ type: ContentTypes.TEXT, text: 'Single part' })).toEqual({
+      parallelSections: [],
+      sequentialParts: [],
+    });
   });
 });

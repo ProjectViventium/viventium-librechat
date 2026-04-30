@@ -1,7 +1,7 @@
 import React from 'react';
 import { render, screen, fireEvent } from '@testing-library/react';
 import { RecoilRoot } from 'recoil';
-import { Tools } from 'librechat-data-provider';
+import { Constants, Tools } from 'librechat-data-provider';
 import ToolCall from '../ToolCall';
 
 // Mock dependencies
@@ -238,6 +238,32 @@ describe('ToolCall', () => {
       // Domain is extracted from name and --- are replaced with dots
       expect(props.domain).toBe('test.domain.com');
       expect(props.pendingAuth).toBe(false);
+    });
+
+    it('renders GlassHive worker MCP calls with user-facing wording', () => {
+      const name = `worker_delegate_once${Constants.mcp_delimiter}glasshive-workers-projects`;
+
+      renderWithRecoil(
+        <ToolCall
+          {...mockProps}
+          name={name}
+          output={null}
+          initialProgress={0.5}
+          isSubmitting={true}
+        />,
+      );
+
+      expect(screen.getByText('Completed GlassHive worker')).toBeInTheDocument();
+      expect(screen.queryByText('Completed worker_delegate_once')).not.toBeInTheDocument();
+    });
+
+    it('does not relabel non-canonical MCP servers by substring', () => {
+      const name = `worker_delegate_once${Constants.mcp_delimiter}not-glasshive-workers-projects`;
+
+      renderWithRecoil(<ToolCall {...mockProps} name={name} output={null} />);
+
+      expect(screen.getByText('Completed worker_delegate_once')).toBeInTheDocument();
+      expect(screen.queryByText('Completed GlassHive worker')).not.toBeInTheDocument();
     });
   });
 

@@ -487,4 +487,38 @@ describe('/api/viventium/voice/chat', () => {
       'metadata.viventium.type': 'glasshive_worker_callback',
     });
   });
+
+  test('GET glasshive reads callback text from content parts when text is empty', async () => {
+    mockGetMessages = jest.fn().mockResolvedValue([
+      {
+        messageId: 'gh-callback-content-only',
+        parentMessageId: 'assistant-msg-1',
+        text: '',
+        content: [{ type: 'text', text: 'Worker result from content.' }],
+        createdAt: '2026-04-28T22:16:00.000Z',
+        metadata: {
+          viventium: {
+            type: 'glasshive_worker_callback',
+            anchorMessageId: 'assistant-msg-1',
+            workerId: 'wrk-1',
+            runId: 'run-1',
+            event: 'run.completed',
+          },
+        },
+      },
+    ]);
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/voice/glasshive/assistant-msg-1',
+      headers: { 'x-viventium-call-secret': 'secret' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body.latest.text).toBe('Worker result from content.');
+  });
 });

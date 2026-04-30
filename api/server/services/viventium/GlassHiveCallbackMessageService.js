@@ -18,7 +18,32 @@ function messageTimeValue(message) {
 }
 
 function textOf(message) {
-  return typeof message?.text === 'string' ? message.text.trim() : '';
+  const direct = typeof message?.text === 'string' ? message.text.trim() : '';
+  if (direct) {
+    return direct;
+  }
+  const content = message?.content;
+  const parts = Array.isArray(content) ? content : content && typeof content === 'object' ? [content] : [];
+  return parts
+    .map((part) => {
+      if (typeof part === 'string') {
+        return part;
+      }
+      if (!part || typeof part !== 'object') {
+        return '';
+      }
+      const value = part.text;
+      if (typeof value === 'string') {
+        return value;
+      }
+      if (value && typeof value === 'object' && typeof value.value === 'string') {
+        return value.value;
+      }
+      return '';
+    })
+    .filter(Boolean)
+    .join('')
+    .trim();
 }
 
 function matchesAnchor(message, messageId) {

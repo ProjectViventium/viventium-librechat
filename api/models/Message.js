@@ -87,10 +87,21 @@ async function saveMessage(req, params, metadata) {
       logger.info(`---\`saveMessage\` context: ${metadata?.context}`);
       update.tokenCount = 0;
     }
+    const options = { upsert: true, new: true };
+    /* === VIVENTIUM START ===
+     * Feature: Deterministic timestamp preservation for imported/callback messages
+     * Rationale: callers that explicitly provide timestamps expect ordering-sensitive
+     * operations such as branch deletion and GlassHive callback placement to honor them.
+     */
+    if (params.createdAt != null || params.updatedAt != null) {
+      options.timestamps = false;
+      options.overwriteImmutable = true;
+    }
+    /* === VIVENTIUM END === */
     const message = await Message.findOneAndUpdate(
       { messageId: params.messageId, user: req.user.id },
       update,
-      { upsert: true, new: true },
+      options,
     );
 
     /* === VIVENTIUM START ===
@@ -297,12 +308,17 @@ async function updateMessageText(req, { messageId, text }) {
 async function updateMessage(req, message, metadata) {
   try {
     const { messageId, ...update } = message;
+    const options = {
+      new: true,
+    };
+    if (metadata?.overrideTimestamp === true) {
+      options.timestamps = false;
+      options.overwriteImmutable = true;
+    }
     const updatedMessage = await Message.findOneAndUpdate(
       { messageId, user: req.user.id },
       update,
-      {
-        new: true,
-      },
+      options,
     );
 
     if (!updatedMessage) {

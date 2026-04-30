@@ -28,9 +28,9 @@ export type ParallelSection = {
  * @returns Object containing parallel sections and sequential parts
  */
 export function groupParallelContent(
-  content: Array<TMessageContentParts | undefined> | undefined,
+  content: Array<TMessageContentParts | undefined> | TMessageContentParts | string | null | undefined,
 ): { parallelSections: ParallelSection[]; sequentialParts: PartWithIndex[] } {
-  if (!content) {
+  if (!Array.isArray(content)) {
     return { parallelSections: [], sequentialParts: [] };
   }
 
@@ -218,7 +218,7 @@ export const ParallelContentRenderer = memo(function ParallelContentRenderer({
     [content],
   );
 
-  const lastContentIdx = content.length - 1;
+  const lastContentIdx = Array.isArray(content) ? content.length - 1 : -1;
 
   // Split sequential parts into before/after parallel sections
   const { before, after } = useMemo(() => {

@@ -139,7 +139,22 @@ describe('/api/viventium/glasshive/callback', () => {
     mockSaveMessage = jest.fn().mockResolvedValue({});
     mockUpdateMessage = jest.fn().mockResolvedValue({});
     mockGetConvo = jest.fn().mockResolvedValue({ conversationId: 'conv-1', user: 'user-1' });
-    mockGetMessages = jest.fn().mockResolvedValue([]);
+    mockGetMessages = jest.fn().mockResolvedValue([
+      {
+        messageId: 'msg-parent',
+        parentMessageId: 'previous-assistant',
+        text: 'User request.',
+        isCreatedByUser: true,
+        createdAt: '2026-04-28T14:00:00.000Z',
+      },
+      {
+        messageId: 'msg-anchor',
+        parentMessageId: 'msg-parent',
+        text: 'On it.',
+        isCreatedByUser: false,
+        createdAt: '2026-04-28T14:00:01.000Z',
+      },
+    ]);
     process.env.VIVENTIUM_GLASSHIVE_CALLBACK_SECRET = 'callback-secret';
   });
 
@@ -322,7 +337,7 @@ describe('/api/viventium/glasshive/callback', () => {
     expect(mockUpdateMessage).not.toHaveBeenCalled();
   });
 
-  test('anchors early callbacks to the assistant response message id instead of creating a sibling branch', async () => {
+  test('retries visible callbacks until the assistant anchor exists instead of creating an early branch', async () => {
     mockGetMessages.mockResolvedValueOnce([
       {
         messageId: 'user-msg',
@@ -348,11 +363,10 @@ describe('/api/viventium/glasshive/callback', () => {
 
     await dispatch(app, req, res);
 
-    expect(res.statusCode).toBe(200);
-    const [, message] = mockSaveMessage.mock.calls[0];
-    expect(message.parentMessageId).toBe('assistant-response-msg');
-    expect(message.metadata.viventium.requestedParentMessageId).toBe('user-msg');
-    expect(message.metadata.viventium.anchorMessageId).toBe('assistant-response-msg');
+    expect(res.statusCode).toBe(425);
+    expect(res.body.error).toBe('callback_anchor_not_ready');
+    expect(mockSaveMessage).not.toHaveBeenCalled();
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
   });
 
   test('updates a blank assistant anchor instead of leaving an empty status bubble', async () => {
@@ -367,7 +381,7 @@ describe('/api/viventium/glasshive/callback', () => {
         parentMessageId: 'user-msg',
         text: '',
         isCreatedByUser: false,
-        createdAt: '2026-04-28T14:00:01.000Z',
+        createdAt: '2026-04-28T13:59:59.000Z',
       },
     ]);
     const router = require('../glasshive');
@@ -376,8 +390,8 @@ describe('/api/viventium/glasshive/callback', () => {
       callback_id: 'cb_blank_anchor',
       parent_message_id: 'user-msg',
       message_id: 'assistant-response-msg',
-      event: 'run.started',
-      message: 'Raw worker start text that should not be exposed.',
+      event: 'run.completed',
+      message: 'Finished host worker.',
     });
     const req = createMockReq({
       url: '/api/viventium/glasshive/callback',
@@ -394,14 +408,21 @@ describe('/api/viventium/glasshive/callback', () => {
     const [, message] = mockUpdateMessage.mock.calls[0];
     expect(message.messageId).toBe('assistant-response-msg');
     expect(message.parentMessageId).toBe('user-msg');
-    expect(message.text).toBe('I’m working on it now.');
+    expect(message.text).toBe('Finished host worker.');
     expect(message.content).toEqual([
       {
         type: 'text',
-        text: 'I’m working on it now.',
+        text: 'Finished host worker.',
       },
     ]);
     expect(message.metadata.viventium.anchorMessageId).toBe('assistant-response-msg');
+    expect(new Date(message.createdAt).getTime()).toBeGreaterThan(
+      Date.parse('2026-04-28T14:00:00.000Z'),
+    );
+    expect(new Date(message.updatedAt).getTime()).toBeGreaterThan(
+      Date.parse('2026-04-28T14:00:00.000Z'),
+    );
+    expect(mockUpdateMessage.mock.calls[0][2].overrideTimestamp).toBe(true);
   });
 
   test('updates one GlassHive status message instead of creating callback branches', async () => {
@@ -419,6 +440,13 @@ describe('/api/viventium/glasshive/callback', () => {
         parentMessageId: 'previous-assistant',
         createdAt: '2026-04-28T14:00:00.000Z',
       },
+      {
+        messageId: 'assistant-response-msg',
+        parentMessageId: 'user-msg',
+        text: 'On it.',
+        isCreatedByUser: false,
+        createdAt: '2026-04-28T14:00:01.000Z',
+      },
       ...persistedMessages,
     ]);
     const router = require('../glasshive');
@@ -427,8 +455,8 @@ describe('/api/viventium/glasshive/callback', () => {
       callback_id: 'cb_chain_first',
       parent_message_id: 'user-msg',
       message_id: 'assistant-response-msg',
-      event: 'run.started',
-      message: 'Raw worker start text that should not be exposed.',
+      event: 'checkpoint.ready',
+      message: 'Approve the next step.',
     });
     const firstRes = createMockRes();
 
@@ -485,7 +513,7 @@ describe('/api/viventium/glasshive/callback', () => {
       },
     ]);
     expect(updated.metadata.viventium.events.map((event) => event.event)).toEqual([
-      'run.started',
+      'checkpoint.ready',
       'run.completed',
     ]);
   });
@@ -494,6 +522,7 @@ describe('/api/viventium/glasshive/callback', () => {
     'worker.ready',
     'worker.resumed_by_alias',
     'run.queued',
+    'run.started',
     'worker.paused',
     'worker.interrupted',
     'worker.terminated',
@@ -515,16 +544,32 @@ describe('/api/viventium/glasshive/callback', () => {
     await dispatch(app, req, res);
 
     expect(res.statusCode).toBe(202);
-    expect(res.body.reason).toBe('missing_context_or_text');
+    expect(res.body.reason).toBe('non_user_visible_event');
     expect(mockSaveMessage).not.toHaveBeenCalled();
     expect(mockUpdateMessage).not.toHaveBeenCalled();
   });
 
-  test('persists run.started as one concise status message for long-running workers', async () => {
+  test('does not update a blank assistant anchor for non-terminal run.started callbacks', async () => {
+    mockGetMessages.mockResolvedValueOnce([
+      {
+        messageId: 'user-msg',
+        parentMessageId: 'previous-assistant',
+        createdAt: '2026-04-28T14:00:00.000Z',
+      },
+      {
+        messageId: 'assistant-response-msg',
+        parentMessageId: 'user-msg',
+        text: '',
+        isCreatedByUser: false,
+        createdAt: '2026-04-28T14:00:01.000Z',
+      },
+    ]);
     const router = require('../glasshive');
     const app = createTestApp(router);
     const body = callbackBody({
-      callback_id: 'cb_run_started_visible',
+      callback_id: 'cb_run_started_internal',
+      parent_message_id: 'user-msg',
+      message_id: 'assistant-response-msg',
       event: 'run.started',
       message: 'Raw worker lifecycle text that should stay hidden.',
     });
@@ -537,9 +582,10 @@ describe('/api/viventium/glasshive/callback', () => {
 
     await dispatch(app, req, res);
 
-    expect(res.statusCode).toBe(200);
-    const [, message] = mockSaveMessage.mock.calls[0];
-    expect(message.text).toBe('I’m working on it now.');
+    expect(res.statusCode).toBe(202);
+    expect(res.body.reason).toBe('non_user_visible_event');
+    expect(mockSaveMessage).not.toHaveBeenCalled();
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
   });
 
   test.each([
@@ -606,6 +652,31 @@ describe('/api/viventium/glasshive/callback', () => {
     expect(message.text).not.toContain('run_visual_qa');
     expect(message.text).not.toContain('prj_visual_qa');
     expect(message.text).not.toContain('~/private');
+  });
+
+  test('preserves markdown delimiters when redacting local links and paths', async () => {
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({
+      callback_id: 'cb_sanitize_markdown_links',
+      event: 'run.completed',
+      message:
+        'Opened `http://127.0.0.1:12345/qa` and saved [proof.png](/Users/example/private/proof.png).',
+    });
+    const req = createMockReq({
+      url: '/api/viventium/glasshive/callback',
+      headers: { 'x-glasshive-signature': signature(body) },
+      body,
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    const [, message] = mockSaveMessage.mock.calls[0];
+    expect(message.text).toBe(
+      'Opened `[local worker link]` and saved [proof.png]([local path]).',
+    );
   });
 
   test('redacts common local path forms with spaces before visible persistence', async () => {

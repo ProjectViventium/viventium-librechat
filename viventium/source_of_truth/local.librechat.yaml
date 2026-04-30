@@ -89,6 +89,7 @@ viventium:
             - sys__server__sys_mcp_glasshive-workers-projects
             - projects_list_mcp_glasshive-workers-projects
             - project_create_mcp_glasshive-workers-projects
+            - worker_delegate_once_mcp_glasshive-workers-projects
             - project_get_mcp_glasshive-workers-projects
             - project_runs_mcp_glasshive-workers-projects
             - project_events_mcp_glasshive-workers-projects
@@ -593,18 +594,35 @@ mcpServers:
       user does not have to name GlassHive, Codex, Computer Use, or local machine;
       when they ask Viventium to act in a real browser, desktop app, local file,
       local project, installed tool, or current computer session, this is the
-      execution surface. Default to host-native execution for the user's real
-      Chrome/browser profile, main computer, desktop apps, OS tools, host files,
-      and installed CLIs; ask one concise clarification only when host vs sandbox
-      is genuinely ambiguous. Use Docker/workstation only for isolated sandbox,
-      disposable browser, risky untrusted browsing, or explicit sandbox requests.
-      Prefer codex-cli for available host browser/desktop/file/code execution,
-      claude-code when Claude is explicitly requested, and openclaw-general only
-      when installed or explicitly requested. Current request upload metadata is
-      projected through headers; preserve those existing file references in
-      bootstrap_bundle_json instead of creating a separate upload path. After
-      worker_run, queued only means accepted; final results, blockers, approvals,
-      and artifacts should return through the same-chat callback path.
+      execution surface. If the request is to open, navigate, click, type, inspect,
+      or read from a real browser/desktop/local app, dispatch the action through
+      this tool path instead of answering from memory or inference. Default to
+      host-native execution for the user's real Chrome/browser profile, main computer,
+      desktop apps, OS tools, host files, and installed CLIs; ask one concise
+      clarification only when host vs sandbox is genuinely ambiguous. Use Docker/workstation
+      only for isolated sandbox, disposable browser, risky untrusted browsing,
+      or explicit sandbox requests. Prefer codex-cli for available host browser/desktop/file/code
+      execution, claude-code when Claude is explicitly requested, and openclaw-general
+      only when installed or explicitly requested. For configured mentions @codex,
+      @claude, and @openclaw, create or resume a worker with execution_mode='host'
+      and the matching profile. Current request upload metadata is projected through
+      headers; preserve those existing file references in bootstrap_bundle_json
+      instead of creating a separate upload path. After worker_run, queued only
+      means accepted; final results, blockers, approvals, and artifacts should
+      return through the same-chat callback path. For fresh one-off host browser/desktop/local
+      tasks, prefer worker_delegate_once instead of manually listing projects
+      and chaining low-level project/worker tools. After worker_delegate_once
+      returns callback_ready=true, do not call worker_live or run_get in the same
+      chat turn unless the user explicitly asked for diagnostics or live status;
+      send one short acknowledgement and let the callback deliver completion.
+      Preserve the user's success
+      condition and response-format constraints in the worker instruction; if
+      the user asks for a short or exact answer, do not add screenshots, logs,
+      IDs, artifact paths, or extra evidence to the user-visible final result
+      unless needed to explain a blocker. If acknowledging delegation
+      to the user, use the returned user_status or one similarly short outcome-focused
+      sentence; avoid worker/run/provider/queue jargon unless diagnostics were
+      requested.
     headers:
       X-Viventium-User-Id: '{{LIBRECHAT_USER_ID}}'
       X-Viventium-Agent-Id: agent_viventium_main_95aeb3

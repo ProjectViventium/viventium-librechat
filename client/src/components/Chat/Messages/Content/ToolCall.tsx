@@ -14,6 +14,38 @@ import ToolCallInfo from './ToolCallInfo';
 import ProgressText from './ProgressText';
 import { logger, cn } from '~/utils';
 
+// VIVENTIUM START: present GlassHive MCP worker tools with source-of-truth labels.
+const GLASSHIVE_MCP_SERVER_NAMES = new Set(['glasshive-workers-projects']);
+const GLASSHIVE_TOOL_LABELS: Record<string, string> = {
+  worker_delegate_once: 'GlassHive worker',
+  workers_list: 'GlassHive worker',
+  worker_create: 'GlassHive worker',
+  worker_find_or_resume: 'GlassHive worker',
+  worker_get: 'GlassHive worker',
+  worker_live: 'GlassHive worker',
+  worker_run: 'GlassHive worker',
+  worker_message: 'GlassHive worker',
+  worker_pause: 'GlassHive worker',
+  worker_resume: 'GlassHive worker',
+  worker_interrupt: 'GlassHive worker',
+  worker_terminate: 'GlassHive worker',
+  worker_desktop_action: 'GlassHive worker',
+  worker_takeover: 'GlassHive worker',
+};
+
+function getUserFacingToolName(functionName: string, mcpServerName: string) {
+  if (!functionName) {
+    return '';
+  }
+
+  if (GLASSHIVE_MCP_SERVER_NAMES.has(mcpServerName) && GLASSHIVE_TOOL_LABELS[functionName]) {
+    return GLASSHIVE_TOOL_LABELS[functionName];
+  }
+
+  return functionName;
+}
+// VIVENTIUM END
+
 export default function ToolCall({
   initialProgress = 0.1,
   isLast = false,
@@ -64,6 +96,13 @@ export default function ToolCall({
       mcpServerName: '',
     };
   }, [name]);
+
+  // VIVENTIUM START: avoid exposing raw GlassHive function names in chat UI.
+  const displayFunctionName = useMemo(
+    () => getUserFacingToolName(function_name, mcpServerName),
+    [function_name, mcpServerName],
+  );
+  // VIVENTIUM END
 
   const actionId = useMemo(() => {
     if (isMCPToolCall || !auth) {
@@ -143,12 +182,12 @@ export default function ToolCall({
       return localize('com_ui_cancelled');
     }
     if (isMCPToolCall === true) {
-      return localize('com_assistants_completed_function', { 0: function_name });
+      return localize('com_assistants_completed_function', { 0: displayFunctionName });
     }
     if (domain != null && domain && domain.length !== Constants.ENCODED_DOMAIN_LENGTH) {
       return localize('com_assistants_completed_action', { 0: domain });
     }
-    return localize('com_assistants_completed_function', { 0: function_name });
+    return localize('com_assistants_completed_function', { 0: displayFunctionName });
   };
 
   useLayoutEffect(() => {
@@ -205,8 +244,8 @@ export default function ToolCall({
           progress={progress}
           onClick={() => setShowInfo((prev) => !prev)}
           inProgressText={
-            function_name
-              ? localize('com_assistants_running_var', { 0: function_name })
+            displayFunctionName
+              ? localize('com_assistants_running_var', { 0: displayFunctionName })
               : localize('com_assistants_running_action')
           }
           authText={
@@ -252,7 +291,7 @@ export default function ToolCall({
                 input={args ?? ''}
                 output={output}
                 domain={authDomain || (domain ?? '')}
-                function_name={function_name}
+                function_name={displayFunctionName}
                 pendingAuth={authDomain.length > 0 && !cancelled && progress < 1}
                 attachments={attachments}
               />

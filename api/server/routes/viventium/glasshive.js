@@ -22,9 +22,11 @@ const {
 const router = express.Router();
 const CALLBACK_SKEW_SEC = 5 * 60;
 const CALLBACK_REPLAY_TTL_MS = 10 * 60 * 1000;
-const MAX_CALLBACK_TEXT_LENGTH = 1200;
+const MAX_CALLBACK_TEXT_LENGTH = 2400;
 const MAX_CALLBACK_EVENTS = 20;
 const seenCallbacks = new Map();
+const LOCAL_PATH_PATTERN =
+  /(?:~\/|\/Users\/|\/home\/|\/private\/var\/|\/var\/folders\/|\/tmp\/|[A-Za-z]:\\Users\\)[^`'"<>\n\r]*?(?=$|[`'"<>\n\r]|[)\],.;:!?](?:\s|$)|\s+(?:and|or|from|at|with|then|while|because|but|plus|to|in|on)\b)/gi;
 
 function stableStringify(value) {
   if (value === null || typeof value !== 'object') {
@@ -111,12 +113,21 @@ function sanitizeCallbackMessage(value) {
   }
   text = text
     .replace(/https?:\/\/(?:localhost|127\.0\.0\.1):\d+\/[^\s)]*/gi, '[local worker link]')
-    .replace(/\/Users\/[^\s)]*/g, '[local path]')
-    .replace(/~\/[^\s)]*/g, '[local path]')
+    .replace(LOCAL_PATH_PATTERN, '[local path]')
     .replace(/\bwrk[_-][A-Za-z0-9_-]+\b/g, '[worker id]')
     .replace(/\brun[_-][A-Za-z0-9_-]+\b/g, '[run id]')
-    .replace(/\bprj[_-][A-Za-z0-9_-]+\b/g, '[project id]')
-    .replace(/\s+/g, ' ')
+    .replace(/\bprj[_-][A-Za-z0-9_-]+\b/g, '[project id]');
+  text = text
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .split('\n')
+    .map((line) => {
+      const leadingWhitespace = line.match(/^[ \t]*/)?.[0] ?? '';
+      const body = line.slice(leadingWhitespace.length).replace(/[ \t]+/g, ' ');
+      return `${leadingWhitespace}${body}`.trimEnd();
+    })
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
     .trim();
   if (text.length > MAX_CALLBACK_TEXT_LENGTH) {
     return `${text.slice(0, MAX_CALLBACK_TEXT_LENGTH - 3).trim()}...`;

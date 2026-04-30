@@ -89,6 +89,51 @@ describe('filterRenderableContentParts', () => {
     expect(filterRenderableContentParts(parts)).toEqual([parts[2], parts[3]]);
   });
 
+  it('merges adjacent streamed text parts so words do not render as separate blocks', () => {
+    const parts: TMessageContentParts[] = [
+      {
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: 'toolu_worker_run',
+          name: 'worker_run',
+          args: '{}',
+          type: ToolCallTypes.TOOL_CALL,
+          progress: 1,
+          output: '{"state":"running"}',
+        },
+      },
+      { type: ContentTypes.TEXT, text: 'Cod' },
+      { type: ContentTypes.TEXT, text: 'ex is ' },
+      { type: ContentTypes.TEXT, text: 'on it.' },
+    ];
+
+    expect(filterRenderableContentParts(parts)).toEqual([
+      parts[0],
+      {
+        type: ContentTypes.TEXT,
+        text: 'Codex is on it.',
+      },
+    ]);
+  });
+
+  it('does not merge text across non-text parts', () => {
+    const parts: TMessageContentParts[] = [
+      { type: ContentTypes.TEXT, text: 'Before ' },
+      {
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: 'toolu_worker_run',
+          name: 'worker_run',
+          args: '{}',
+          type: ToolCallTypes.TOOL_CALL,
+        },
+      },
+      { type: ContentTypes.TEXT, text: 'After' },
+    ];
+
+    expect(filterRenderableContentParts(parts)).toEqual(parts);
+  });
+
   it('keeps the original array reference when there are no superseded snapshots', () => {
     const parts: TMessageContentParts[] = [
       {

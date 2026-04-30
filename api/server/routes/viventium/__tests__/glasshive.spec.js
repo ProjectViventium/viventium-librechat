@@ -232,6 +232,77 @@ describe('/api/viventium/glasshive/callback', () => {
     expect(message.text).toBe('Finished — “quoted” café.');
   });
 
+  test('preserves readable callback paragraphs while redacting local details', async () => {
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({
+      callback_id: 'cb_multiline_text',
+      message:
+        'Captured 42 rows.  \n\nCreated `/Users/example/private/results.md`.\n\nNext step: reply continue.',
+    });
+    const req = createMockReq({
+      url: '/api/viventium/glasshive/callback',
+      headers: { 'x-glasshive-signature': signature(body) },
+      body,
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    const [, message] = mockSaveMessage.mock.calls[0];
+    expect(message.text).toBe(
+      'Captured 42 rows.\n\nCreated `[local path]`.\n\nNext step: reply continue.',
+    );
+    expect(message.content[0].text).toBe(message.text);
+  });
+
+  test('keeps long final-result callback text within the shared worker limit', async () => {
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const longResult = `Summary:\n\n${'A'.repeat(1500)}\n\nNext step: none.`;
+    const body = callbackBody({
+      callback_id: 'cb_long_final_result',
+      message: longResult,
+    });
+    const req = createMockReq({
+      url: '/api/viventium/glasshive/callback',
+      headers: { 'x-glasshive-signature': signature(body) },
+      body,
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    const [, message] = mockSaveMessage.mock.calls[0];
+    expect(message.text).toBe(longResult);
+    expect(message.content[0].text).toBe(longResult);
+  });
+
+  test('preserves leading indentation in callback text', async () => {
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const codeBlock = 'Summary:\n\n```json\n  {  "ok":   true  }\n```';
+    const body = callbackBody({
+      callback_id: 'cb_indented_final_result',
+      message: codeBlock,
+    });
+    const req = createMockReq({
+      url: '/api/viventium/glasshive/callback',
+      headers: { 'x-glasshive-signature': signature(body) },
+      body,
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    const [, message] = mockSaveMessage.mock.calls[0];
+    expect(message.text).toContain('\n  { "ok": true }\n');
+    expect(message.content[0].text).toBe(message.text);
+  });
+
   test('rejects visible callbacks without an assistant anchor message id so GlassHive retries or records failure', async () => {
     const router = require('../glasshive');
     const app = createTestApp(router);
@@ -535,6 +606,35 @@ describe('/api/viventium/glasshive/callback', () => {
     expect(message.text).not.toContain('run_visual_qa');
     expect(message.text).not.toContain('prj_visual_qa');
     expect(message.text).not.toContain('~/private');
+  });
+
+  test('redacts common local path forms with spaces before visible persistence', async () => {
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({
+      callback_id: 'cb_sanitize_local_paths',
+      event: 'run.completed',
+      message:
+        'Saved `/Users/example/My Documents/result.md` and copied /private/var/folders/example/state.txt from /home/example/project/output.txt plus C:\\Users\\example\\Desktop\\sample.txt and /users/example/lowercase.txt.',
+    });
+    const req = createMockReq({
+      url: '/api/viventium/glasshive/callback',
+      headers: { 'x-glasshive-signature': signature(body) },
+      body,
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    const [, message] = mockSaveMessage.mock.calls[0];
+    expect(message.text.match(/\[local path\]/g)).toHaveLength(5);
+    expect(message.text).not.toContain('/Users/example');
+    expect(message.text).not.toContain('My Documents');
+    expect(message.text).not.toContain('/private/var');
+    expect(message.text).not.toContain('/home/example');
+    expect(message.text).not.toContain('C:\\Users\\example');
+    expect(message.text).not.toContain('/users/example');
   });
 
   test('rejects stale callbacks before persistence', async () => {

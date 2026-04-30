@@ -589,16 +589,22 @@ mcpServers:
     chatMenu: true
     timeout: 120000
     serverInstructions: GlassHive MCP for persistent projects, resumable workers,
-      workstation sandboxes, host-native workers, and live operator takeover. Use
-      host-native workers when the user asks for Codex/Claude/OpenClaw on the main
-      computer, local Chrome/browser, desktop apps, OS tools, or host files; a
-      Docker workstation browser is isolated and is not the user's real Chrome
-      profile. For configured worker mentions, create or resume a worker with
-      execution_mode='host' and the matching profile. Current request upload
-      metadata is projected through headers; preserve those existing file
-      references in bootstrap_bundle_json instead of creating a separate upload
-      path. After worker_run, check run_get or worker_live before reporting a
-      terminal result; queued only means the run was accepted.
+      workstation sandboxes, host-native workers, and live operator takeover. The
+      user does not have to name GlassHive, Codex, Computer Use, or local machine;
+      when they ask Viventium to act in a real browser, desktop app, local file,
+      local project, installed tool, or current computer session, this is the
+      execution surface. Default to host-native execution for the user's real
+      Chrome/browser profile, main computer, desktop apps, OS tools, host files,
+      and installed CLIs; ask one concise clarification only when host vs sandbox
+      is genuinely ambiguous. Use Docker/workstation only for isolated sandbox,
+      disposable browser, risky untrusted browsing, or explicit sandbox requests.
+      Prefer codex-cli for available host browser/desktop/file/code execution,
+      claude-code when Claude is explicitly requested, and openclaw-general only
+      when installed or explicitly requested. Current request upload metadata is
+      projected through headers; preserve those existing file references in
+      bootstrap_bundle_json instead of creating a separate upload path. After
+      worker_run, queued only means accepted; final results, blockers, approvals,
+      and artifacts should return through the same-chat callback path.
     headers:
       X-Viventium-User-Id: '{{LIBRECHAT_USER_ID}}'
       X-Viventium-Agent-Id: agent_viventium_main_95aeb3

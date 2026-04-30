@@ -104,8 +104,12 @@ const ContentRender = memo(function ContentRender({
     return 'md:max-w-[47rem] xl:max-w-[55rem]';
   };
 
+  /* === VIVENTIUM START ===
+   * Feature: GlassHive callback message layout
+   * Purpose: Keep callback/content-array text readable instead of letting flex sizing collapse it.
+   * === VIVENTIUM END === */
   const baseClasses = {
-    common: 'group mx-auto flex flex-1 gap-3 transition-all duration-300 transform-gpu ',
+    common: 'group mx-auto flex w-full min-w-0 flex-1 gap-3 transition-all duration-300 transform-gpu ',
     chat: getChatWidthClass(),
   };
 
@@ -134,7 +138,7 @@ const ContentRender = memo(function ContentRender({
 
       <div
         className={cn(
-          'relative flex flex-col',
+          'relative flex min-w-0 flex-col',
           hasParallelContent ? 'w-full' : 'w-11/12',
           msg.isCreatedByUser ? 'user-turn' : 'agent-turn',
         )}
@@ -143,8 +147,8 @@ const ContentRender = memo(function ContentRender({
           <h2 className={cn('select-none font-semibold', fontSize)}>{messageLabel}</h2>
         )}
 
-        <div className="flex flex-col gap-1">
-          <div className="flex min-h-[20px] max-w-full flex-grow flex-col gap-0">
+        <div className="flex min-w-0 flex-col gap-1">
+          <div className="flex min-h-[20px] max-w-full min-w-0 flex-grow flex-col gap-0">
             <ContentParts
               edit={edit}
               isLast={isLast}

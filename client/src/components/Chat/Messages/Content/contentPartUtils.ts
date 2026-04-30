@@ -63,6 +63,47 @@ function normalizeRenderableContentParts(
   return changed ? normalized : (content as Array<TMessageContentParts | undefined>);
 }
 
+function plainTextPartValue(part: TMessageContentParts | undefined): string | undefined {
+  if (!part || part.type !== ContentTypes.TEXT || part.tool_call_ids != null) {
+    return undefined;
+  }
+
+  if (typeof part.text === 'string') {
+    return part.text;
+  }
+
+  const textValue = (part as unknown as { text?: { value?: unknown } }).text?.value;
+  return typeof textValue === 'string' ? textValue : undefined;
+}
+
+function mergeAdjacentTextParts(
+  content: Array<TMessageContentParts | undefined>,
+): Array<TMessageContentParts | undefined> {
+  let changed = false;
+  const merged: Array<TMessageContentParts | undefined> = [];
+
+  content.forEach((part) => {
+    const text = plainTextPartValue(part);
+    const previous = merged[merged.length - 1];
+    const previousText = plainTextPartValue(previous);
+
+    if (text != null && previousText != null && previous) {
+      const combined = `${previousText}${text}`;
+      merged[merged.length - 1] = {
+        ...previous,
+        text: combined,
+        [ContentTypes.TEXT]: combined,
+      } as TMessageContentParts;
+      changed = true;
+      return;
+    }
+
+    merged.push(part);
+  });
+
+  return changed ? merged : content;
+}
+
 export function filterRenderableContentParts(
   content: RenderableContentInput,
 ): Array<TMessageContentParts | undefined> | undefined {
@@ -83,10 +124,6 @@ export function filterRenderableContentParts(
     }
   });
 
-  if (lastToolCallIndexById.size === 0) {
-    return normalizedContent;
-  }
-
   let removedAny = false;
   const filtered = normalizedContent.filter((part, index) => {
     if (part?.type !== ContentTypes.TOOL_CALL) {
@@ -102,7 +139,8 @@ export function filterRenderableContentParts(
     return keep;
   });
 
-  return removedAny ? filtered : normalizedContent;
+  const deduped = removedAny ? filtered : normalizedContent;
+  return mergeAdjacentTextParts(deduped);
 }
 
 // VIVENTIUM START

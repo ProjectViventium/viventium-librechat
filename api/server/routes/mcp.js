@@ -100,6 +100,7 @@ function getPersistentMCPServers() {
 /* VIVENTIUM START: persistent MCP warm-up dedupe across status pollers */
 const persistentWarmupInFlight = new Set();
 const persistentWarmupLastAttemptAt = new Map();
+const oauthTokenPresenceCache = new Map();
 
 function getPersistentWarmupKey(userId, serverName) {
   return `${userId}:${serverName}`;
@@ -110,19 +111,92 @@ function getPersistentWarmupCooldownMs() {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 10000;
 }
 
+function getOAuthTokenPresenceCacheMs() {
+  const parsed = Number.parseInt(process.env.MCP_OAUTH_TOKEN_PRESENCE_CACHE_MS ?? '15000', 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 15000;
+}
+
 function clearPersistentWarmupTracking(warmupKey) {
   persistentWarmupInFlight.delete(warmupKey);
   persistentWarmupLastAttemptAt.delete(warmupKey);
 }
+
+async function hasUsableMCPOAuthToken(userId, serverName) {
+  const cacheKey = getPersistentWarmupKey(userId, serverName);
+  const nowMs = Date.now();
+  const cacheMs = getOAuthTokenPresenceCacheMs();
+  const cached = oauthTokenPresenceCache.get(cacheKey);
+
+  if (cached && cacheMs > 0 && nowMs - cached.checkedAt < cacheMs) {
+    return cached.usable;
+  }
+
+  const now = new Date(nowMs);
+  const tokenQueries = [
+    {
+      userId,
+      type: 'mcp_oauth',
+      identifier: `mcp:${serverName}`,
+    },
+    {
+      userId,
+      type: 'mcp_oauth_refresh',
+      identifier: `mcp:${serverName}:refresh`,
+    },
+  ];
+
+  try {
+    const tokens = await Promise.all(tokenQueries.map((query) => findToken(query)));
+    const usable = tokens.some((token) => {
+      if (!token) {
+        return false;
+      }
+      if (!token.expiresAt) {
+        return true;
+      }
+      return new Date(token.expiresAt) >= now;
+    });
+
+    if (cacheMs > 0) {
+      oauthTokenPresenceCache.set(cacheKey, { checkedAt: nowMs, usable });
+    }
+
+    return usable;
+  } catch (error) {
+    oauthTokenPresenceCache.delete(cacheKey);
+    logger.warn(
+      `[MCP Persistent Warmup][User: ${userId}] Could not inspect OAuth token state for "${serverName}": ${error?.message ?? String(error)}`,
+    );
+    return false;
+  }
+}
 /* VIVENTIUM END */
 
 async function warmPersistentUserMCPConnections(user, mcpConfig, oauthServers) {
-  const persistentServers = [...getPersistentMCPServers()].filter(
-    (serverName) => mcpConfig?.[serverName] && !oauthServers?.has?.(serverName),
+  let warmupAttempted = false;
+  const oauthServerSet =
+    oauthServers instanceof Set
+      ? oauthServers
+      : new Set(Array.isArray(oauthServers) ? oauthServers : []);
+  const persistentServerNames = new Set(
+    [...getPersistentMCPServers()].filter(
+      (serverName) => mcpConfig?.[serverName] && !oauthServerSet.has(serverName),
+    ),
   );
 
+  for (const serverName of oauthServerSet) {
+    if (!mcpConfig?.[serverName]) {
+      continue;
+    }
+    if (await hasUsableMCPOAuthToken(user.id, serverName)) {
+      persistentServerNames.add(serverName);
+    }
+  }
+
+  const persistentServers = [...persistentServerNames];
+
   if (!persistentServers.length) {
-    return;
+    return warmupAttempted;
   }
 
   const mcpManager = getMCPManager();
@@ -131,7 +205,7 @@ async function warmPersistentUserMCPConnections(user, mcpConfig, oauthServers) {
     typeof mcpManager.getConnection !== 'function' ||
     typeof mcpManager.getUserConnections !== 'function'
   ) {
-    return;
+    return warmupAttempted;
   }
 
   const flowManager = getFlowStateManager(getLogStores(CacheKeys.FLOWS));
@@ -181,6 +255,7 @@ async function warmPersistentUserMCPConnections(user, mcpConfig, oauthServers) {
 
     persistentWarmupInFlight.add(warmupKey);
     persistentWarmupLastAttemptAt.set(warmupKey, Date.now());
+    warmupAttempted = true;
     try {
       await mcpManager.getConnection({
         user,
@@ -200,6 +275,8 @@ async function warmPersistentUserMCPConnections(user, mcpConfig, oauthServers) {
       persistentWarmupInFlight.delete(warmupKey);
     }
   }
+
+  return warmupAttempted;
 }
 
 function getStatusSettleWindowMs() {
@@ -828,8 +905,16 @@ router.get('/connection/status', requireJwtAuth, async (req, res) => {
       user.id,
     );
 
-    await warmPersistentUserMCPConnections(createSafeUser(user), mcpConfig, oauthServers);
-    ({ mcpConfig, appConnections, userConnections, oauthServers } = await getMCPSetupData(user.id));
+    const warmupAttempted = await warmPersistentUserMCPConnections(
+      createSafeUser(user),
+      mcpConfig,
+      oauthServers,
+    );
+    if (warmupAttempted) {
+      ({ mcpConfig, appConnections, userConnections, oauthServers } = await getMCPSetupData(
+        user.id,
+      ));
+    }
     const connectionStatus = {};
 
     for (const [serverName, config] of Object.entries(mcpConfig)) {
@@ -890,8 +975,16 @@ router.get('/connection/status/:serverName', requireJwtAuth, async (req, res) =>
       user.id,
     );
 
-    await warmPersistentUserMCPConnections(createSafeUser(user), mcpConfig, oauthServers);
-    ({ mcpConfig, appConnections, userConnections, oauthServers } = await getMCPSetupData(user.id));
+    const warmupAttempted = await warmPersistentUserMCPConnections(
+      createSafeUser(user),
+      mcpConfig,
+      oauthServers,
+    );
+    if (warmupAttempted) {
+      ({ mcpConfig, appConnections, userConnections, oauthServers } = await getMCPSetupData(
+        user.id,
+      ));
+    }
 
     if (!mcpConfig[serverName]) {
       return res
@@ -1087,5 +1180,6 @@ module.exports = router;
 module.exports.__resetPersistentWarmupStateForTests = () => {
   persistentWarmupInFlight.clear();
   persistentWarmupLastAttemptAt.clear();
+  oauthTokenPresenceCache.clear();
 };
 /* VIVENTIUM END */

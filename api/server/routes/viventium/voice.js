@@ -185,23 +185,6 @@ function mergeVoiceTurnText(existing, incoming) {
   if (current === next) {
     return current;
   }
-
-  const currentLower = current.toLowerCase();
-  const nextLower = next.toLowerCase();
-  if (currentLower.includes(nextLower)) {
-    return current;
-  }
-  if (nextLower.includes(currentLower)) {
-    return next;
-  }
-
-  const maxOverlap = Math.min(current.length, next.length);
-  for (let size = maxOverlap; size >= 8; size -= 1) {
-    if (currentLower.slice(-size) === nextLower.slice(0, size)) {
-      return `${current}${next.slice(size)}`.replace(/\s+/g, ' ').trim();
-    }
-  }
-
   return `${current} ${next}`.replace(/\s+/g, ' ').trim();
 }
 
@@ -559,10 +542,8 @@ router.post('/chat', voiceAuth, configMiddleware, async (req, _res, next) => {
 
   if (!coalescedTurn.shouldLaunch && coalescedTurn.payload) {
     logger.info(
-      '[VIVENTIUM][voice/chat] Coalesced onto existing stream parentMessageId=%s conversationId=%s streamId=%s',
-      req.body?.parentMessageId,
-      req.body?.conversationId,
-      coalescedTurn.payload.streamId,
+      `[VIVENTIUM][voice/chat] Coalesced onto existing stream parentMessageId=${req.body?.parentMessageId || 'none'} ` +
+        `conversationId=${req.body?.conversationId || 'unknown'} streamId=${coalescedTurn.payload.streamId || 'unknown'}`,
     );
     return res.json(coalescedTurn.payload);
   }
@@ -573,23 +554,18 @@ router.post('/chat', voiceAuth, configMiddleware, async (req, _res, next) => {
     coalescedTurn.mergedText !== req.body?.text
   ) {
     logger.info(
-      '[VIVENTIUM][voice/chat] Coalesced rapid same-parent turn text parentMessageId=%s chars=%s->%s',
-      req.body?.parentMessageId,
-      req.body?.text?.length || 0,
-      coalescedTurn.mergedText.length,
+      `[VIVENTIUM][voice/chat] Coalesced rapid same-parent turn text parentMessageId=${req.body?.parentMessageId || 'none'} ` +
+        `chars=${req.body?.text?.length || 0}->${coalescedTurn.mergedText.length}`,
     );
     req.body.text = coalescedTurn.mergedText;
   }
 
   logger.info(
-    '[VIVENTIUM][voice/chat] user_turn_completed source=route callSessionId=%s conversationId=%s parentMessageId=%s agentId=%s requestId=%s coalesced=%s textChars=%s',
-    session?.callSessionId || 'unknown',
-    req.body?.conversationId || 'unknown',
-    req.body?.parentMessageId || 'none',
-    session?.agentId || 'unknown',
-    req.viventiumVoiceRequestId || req.get('X-VIVENTIUM-REQUEST-ID') || 'unknown',
-    Boolean(coalescedTurn.dedupeKey),
-    req.body?.text?.length || 0,
+    `[VIVENTIUM][voice/chat] user_turn_completed source=route callSessionId=${session?.callSessionId || 'unknown'} ` +
+      `conversationId=${req.body?.conversationId || 'unknown'} parentMessageId=${req.body?.parentMessageId || 'none'} ` +
+      `agentId=${session?.agentId || 'unknown'} requestId=${
+        req.viventiumVoiceRequestId || req.get('X-VIVENTIUM-REQUEST-ID') || 'unknown'
+      } coalesced=${Boolean(coalescedTurn.dedupeKey)} textChars=${req.body?.text?.length || 0}`,
   );
 
   const originalJson = res.json.bind(res);

@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scheduling_cortex.scheduler import SchedulerEngine, SCHEDULER_MISFIRE_KEY
+from scheduling_cortex.scheduler import SchedulerEngine, SCHEDULER_MISFIRE_KEY, _resolve_misfire_policy
 from scheduling_cortex.storage import ScheduleStorage, StorageConfig
 
 
@@ -87,11 +87,15 @@ class SchedulerDeliveryPersistenceTests(unittest.TestCase):
             self.assertEqual(updated.get("last_generated_text"), "{NTA}")
             self.assertEqual(updated.get("last_delivery", {}).get("channels", {}).get("telegram", {}).get("reason"), "nta")
 
-    def test_update_after_success_tracks_heartbeat_quiet_streak(self):
+    def test_update_after_success_keeps_any_scheduled_suppression_silent(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             storage = ScheduleStorage(StorageConfig(db_path=str(Path(tmpdir) / "schedules.db")))
-            task = _seed_task(storage, "task-heartbeat")
-            task["metadata"] = {"name": "Heartbeat", "heartbeat_quiet_streak": 2}
+            task = _seed_task(storage, "task-passive-check")
+            task["metadata"] = {
+                "name": "Passive Check",
+                "heartbeat_quiet_streak": 99,
+                "heartbeat_last_pulse_at": "2026-02-13T18:30:00Z",
+            }
             storage.update_task(task["user_id"], task["id"], {"metadata": task["metadata"]})
             task = storage.get_task(task["user_id"], task["id"])
             engine = SchedulerEngine(storage, poll_interval_s=30, misfire_grace_s=900, retry_delay_s=300)
@@ -110,34 +114,24 @@ class SchedulerDeliveryPersistenceTests(unittest.TestCase):
                 },
             )
 
-            suppressed = storage.get_task("user-1", "task-heartbeat")
-            self.assertEqual(
-                suppressed.get("metadata", {}).get("heartbeat_quiet_streak"),
-                3,
-            )
+            suppressed = storage.get_task("user-1", "task-passive-check")
+            self.assertEqual(suppressed.get("last_status"), "success")
+            self.assertEqual(suppressed.get("last_delivery_outcome"), "suppressed")
+            self.assertEqual(suppressed.get("last_delivery_reason"), "telegram:nta")
+            self.assertEqual(suppressed.get("last_generated_text"), "{NTA}")
+            self.assertEqual(suppressed.get("metadata", {}).get("name"), "Passive Check")
+            self.assertNotIn("heartbeat_quiet_streak", suppressed.get("metadata", {}))
+            self.assertNotIn("heartbeat_last_pulse_at", suppressed.get("metadata", {}))
 
-            engine._update_after_success(
-                suppressed,
-                now,
-                {
-                    "conversation_id": "conv-heartbeat-2",
-                    "delivery": {
-                        "outcome": "sent",
-                        "reason": "heartbeat_keepalive",
-                        "generated_text": "Quick pulse",
-                    },
-                },
-            )
-
-            sent = storage.get_task("user-1", "task-heartbeat")
-            self.assertEqual(sent.get("metadata", {}).get("heartbeat_quiet_streak"), 0)
-            self.assertEqual(sent.get("metadata", {}).get("heartbeat_last_pulse_at"), "2026-02-13T19:30:00Z")
-
-    def test_update_after_success_tracks_heartbeat_quiet_streak_on_empty_suppression(self):
+    def test_update_after_success_keeps_empty_scheduled_suppression_silent(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             storage = ScheduleStorage(StorageConfig(db_path=str(Path(tmpdir) / "schedules.db")))
-            task = _seed_task(storage, "task-heartbeat-empty")
-            task["metadata"] = {"name": "Heartbeat", "heartbeat_quiet_streak": 1}
+            task = _seed_task(storage, "task-passive-empty")
+            task["metadata"] = {
+                "name": "Passive Check",
+                "heartbeat_quiet_streak": 42,
+                "heartbeat_last_pulse_at": "2026-02-13T18:30:00Z",
+            }
             storage.update_task(task["user_id"], task["id"], {"metadata": task["metadata"]})
             task = storage.get_task(task["user_id"], task["id"])
             engine = SchedulerEngine(storage, poll_interval_s=30, misfire_grace_s=900, retry_delay_s=300)
@@ -156,11 +150,14 @@ class SchedulerDeliveryPersistenceTests(unittest.TestCase):
                 },
             )
 
-            suppressed = storage.get_task("user-1", "task-heartbeat-empty")
-            self.assertEqual(
-                suppressed.get("metadata", {}).get("heartbeat_quiet_streak"),
-                2,
-            )
+            suppressed = storage.get_task("user-1", "task-passive-empty")
+            self.assertEqual(suppressed.get("last_status"), "success")
+            self.assertEqual(suppressed.get("last_delivery_outcome"), "suppressed")
+            self.assertEqual(suppressed.get("last_delivery_reason"), "telegram:empty")
+            self.assertIsNone(suppressed.get("last_generated_text"))
+            self.assertEqual(suppressed.get("metadata", {}).get("name"), "Passive Check")
+            self.assertNotIn("heartbeat_quiet_streak", suppressed.get("metadata", {}))
+            self.assertNotIn("heartbeat_last_pulse_at", suppressed.get("metadata", {}))
 
     def test_update_after_failure_records_failed_delivery_metadata(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -386,6 +383,133 @@ class SchedulerDeliveryPersistenceTests(unittest.TestCase):
             self.assertEqual(updated.get("active"), 0)
             self.assertIsNone(updated.get("next_run_at"))
             self.assertEqual(updated.get("last_delivery", {}).get("late_delivery", {}).get("late_seconds"), 5092)
+
+    def test_user_once_misfire_policy_does_not_branch_on_schedule_name(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = ScheduleStorage(StorageConfig(db_path=str(Path(tmpdir) / "schedules.db")))
+            task = _seed_task(
+                storage,
+                "task-user-named-heartbeat",
+                schedule={"type": "once", "run_at": "2026-02-13T19:00:00", "timezone": "UTC"},
+                created_source="user",
+                metadata={"name": "Heartbeat"},
+                next_run_at="2026-02-13T19:00:00Z",
+            )
+            engine = SchedulerEngine(
+                storage,
+                poll_interval_s=30,
+                misfire_grace_s=900,
+                retry_delay_s=300,
+                catch_up_max_late_s=43200,
+            )
+            now = datetime(2026, 2, 13, 20, 0, 0, tzinfo=timezone.utc)
+
+            with patch("scheduling_cortex.scheduler.dispatch_task") as mock_dispatch:
+                mock_dispatch.return_value = {
+                    "conversation_id": "conv-name-proof",
+                    "delivery": {
+                        "outcome": "sent",
+                        "reason": "delivered",
+                        "generated_text": "Named schedule still follows structured policy.",
+                    },
+                }
+
+                engine._process_task(task, now)
+
+            mock_dispatch.assert_called_once()
+            dispatched_task = mock_dispatch.call_args.args[0]
+            self.assertEqual(
+                dispatched_task.get("metadata", {}).get(SCHEDULER_MISFIRE_KEY, {}).get("mode"),
+                "catch_up",
+            )
+
+    def test_agent_once_misfire_defaults_to_strict_without_name_branching(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = ScheduleStorage(StorageConfig(db_path=str(Path(tmpdir) / "schedules.db")))
+            task = _seed_task(
+                storage,
+                "task-agent-once-strict",
+                schedule={"type": "once", "run_at": "2026-02-13T19:00:00", "timezone": "UTC"},
+                created_source="agent",
+                metadata={"name": "Reminder"},
+                next_run_at="2026-02-13T19:00:00Z",
+            )
+            engine = SchedulerEngine(storage, poll_interval_s=30, misfire_grace_s=900, retry_delay_s=300)
+            now = datetime(2026, 2, 13, 20, 0, 0, tzinfo=timezone.utc)
+
+            with patch("scheduling_cortex.scheduler.dispatch_task") as mock_dispatch:
+                engine._process_task(task, now)
+
+            mock_dispatch.assert_not_called()
+            updated = storage.get_task("user-1", "task-agent-once-strict")
+            self.assertEqual(updated.get("last_status"), "missed")
+            self.assertEqual(updated.get("last_delivery_reason"), "misfire_grace_exceeded")
+            self.assertEqual(updated.get("last_delivery", {}).get("policy", {}).get("mode"), "strict")
+
+    def test_recurring_user_misfire_can_catch_up_with_structured_policy(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = ScheduleStorage(StorageConfig(db_path=str(Path(tmpdir) / "schedules.db")))
+            task = _seed_task(
+                storage,
+                "task-recurring-user-catch-up",
+                schedule={"type": "daily", "time": "19:00", "timezone": "UTC"},
+                created_source="user",
+                metadata={"misfire_policy": {"mode": "catch_up", "max_late_s": 7200}},
+                next_run_at="2026-02-13T19:00:00Z",
+            )
+            engine = SchedulerEngine(storage, poll_interval_s=30, misfire_grace_s=900, retry_delay_s=300)
+            now = datetime(2026, 2, 13, 20, 0, 0, tzinfo=timezone.utc)
+
+            with patch("scheduling_cortex.scheduler.dispatch_task") as mock_dispatch:
+                mock_dispatch.return_value = {
+                    "conversation_id": "conv-recurring-catch-up",
+                    "delivery": {
+                        "outcome": "sent",
+                        "reason": "delivered",
+                        "generated_text": "Recurring catch-up.",
+                    },
+                }
+
+                engine._process_task(task, now)
+
+            mock_dispatch.assert_called_once()
+            dispatched_task = mock_dispatch.call_args.args[0]
+            late_delivery = dispatched_task.get("metadata", {}).get(SCHEDULER_MISFIRE_KEY)
+            self.assertEqual(late_delivery.get("mode"), "catch_up")
+            self.assertEqual(late_delivery.get("late_seconds"), 3600)
+            updated = storage.get_task("user-1", "task-recurring-user-catch-up")
+            self.assertEqual(updated.get("last_status"), "success")
+            self.assertEqual(updated.get("last_delivery_reason"), "delivered_late")
+            self.assertEqual(updated.get("active"), 1)
+
+    def test_misfire_policy_mode_normalization(self):
+        base_task = {
+            "id": "task-policy",
+            "created_source": "agent",
+            "schedule": {"type": "daily", "time": "19:00", "timezone": "UTC"},
+        }
+
+        self.assertEqual(
+            _resolve_misfire_policy(
+                {**base_task, "metadata": {"misfire_policy": {"mode": " CATCH_UP "}}},
+                43200,
+            ).get("mode"),
+            "catch_up",
+        )
+        self.assertEqual(
+            _resolve_misfire_policy(
+                {**base_task, "metadata": {"misfire_policy": {"mode": " miss "}}},
+                43200,
+            ).get("mode"),
+            "strict",
+        )
+        self.assertEqual(
+            _resolve_misfire_policy(
+                {**base_task, "metadata": {"misfire_policy": " SKIP "}},
+                43200,
+            ).get("mode"),
+            "strict",
+        )
 
     def test_user_once_misfire_beyond_window_marks_missed_with_ledger(self):
         with tempfile.TemporaryDirectory() as tmpdir:

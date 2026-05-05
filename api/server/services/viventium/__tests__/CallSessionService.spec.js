@@ -244,6 +244,59 @@ describe('CallSessionService', () => {
     expect(claimAgain.status).toBe('already');
   });
 
+  test('claimDispatch reclaims a confirmed dispatch when LiveKit needs recreation', async () => {
+    const user = await User.create({
+      name: 'Call User',
+      email: 'dispatch-reclaim@example.com',
+      provider: 'local',
+    });
+
+    const created = await createCallSession({
+      userId: user._id.toString(),
+      agentId: 'agent_1',
+      conversationId: 'new',
+    });
+
+    const firstClaim = await claimDispatch({
+      callSessionId: created.callSessionId,
+      roomName: created.roomName,
+      agentName: 'librechat-voice-gateway',
+    });
+    expect(firstClaim.status).toBe('claimed');
+
+    await confirmDispatch({
+      callSessionId: created.callSessionId,
+      claimId: firstClaim.claimId,
+      success: true,
+    });
+
+    const normalClaim = await claimDispatch({
+      callSessionId: created.callSessionId,
+      roomName: created.roomName,
+      agentName: 'librechat-voice-gateway',
+    });
+    expect(normalClaim.status).toBe('already');
+
+    const reclaimed = await claimDispatch({
+      callSessionId: created.callSessionId,
+      roomName: created.roomName,
+      agentName: 'librechat-voice-gateway',
+      reclaimConfirmed: true,
+    });
+    expect(reclaimed.status).toBe('claimed');
+    expect(reclaimed.claimId).toBeDefined();
+    expect(reclaimed.claimId).not.toBe(firstClaim.claimId);
+    expect(reclaimed.session.dispatchConfirmedAtMs).toBeUndefined();
+
+    const concurrentReclaim = await claimDispatch({
+      callSessionId: created.callSessionId,
+      roomName: created.roomName,
+      agentName: 'librechat-voice-gateway',
+      reclaimConfirmed: true,
+    });
+    expect(concurrentReclaim.status).toBe('in_flight');
+  });
+
   test('createCallSession hydrates requestedVoiceRoute from saved user defaults', async () => {
     const user = await User.create({
       name: 'Saved Voice Defaults',

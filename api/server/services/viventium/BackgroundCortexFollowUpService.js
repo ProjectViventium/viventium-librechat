@@ -139,10 +139,14 @@ function resolveFollowUpPersistenceText({
   voiceMode = false,
   surface = '',
   scheduleId = '',
+  generationFailed = false,
+  movedOnAfterParent = false,
 }) {
   const decision = {
     replaceParentMessage: replaceParentMessage === true,
     hasInsights: Array.isArray(insightsData?.insights) && insightsData.insights.length > 0,
+    generationFailed: generationFailed === true,
+    movedOnAfterParent: movedOnAfterParent === true,
     llmResult: 'empty',
     selectedStrategy: 'none',
     suppressionReason: '',
@@ -155,12 +159,28 @@ function resolveFollowUpPersistenceText({
     if (replaceParentMessage === true) {
       decision.selectedStrategy = 'replace_parent_forced_fallback';
     } else {
-      decision.selectedStrategy = 'nta_fallback_candidate';
+      decision.selectedStrategy = 'no_response_suppressed';
+      decision.suppressionReason = 'no_response_tag';
+      return { text: '', decision };
     }
     text = '';
   } else if (text) {
     decision.llmResult = 'generated';
     decision.selectedStrategy = 'llm_generated';
+  }
+
+  if (!text && movedOnAfterParent === true && replaceParentMessage !== true) {
+    decision.selectedStrategy = 'moved_on_empty_suppressed';
+    decision.suppressionReason =
+      generationFailed === true ? 'moved_on_followup_generation_failed' : 'moved_on_empty_followup';
+    return { text: '', decision };
+  }
+
+  if (!text && voiceMode && replaceParentMessage !== true) {
+    decision.selectedStrategy = 'voice_empty_suppressed';
+    decision.suppressionReason =
+      generationFailed === true ? 'voice_followup_generation_failed' : 'empty_voice_followup';
+    return { text: '', decision };
   }
 
   if (!text) {
@@ -501,6 +521,158 @@ function resolveConversationLeafMessageId(messages, fallbackMessageId = null) {
 
   return ranked[ranked.length - 1]?.messageId || fallbackMessageId;
 }
+
+/* === VIVENTIUM START ===
+ * Feature: Moved-on follow-up continuity context.
+ *
+ * Why:
+ * - Phase B can complete after the user and assistant have already exchanged newer messages.
+ * - The follow-up LLM must see that newer visible exchange before deciding whether an old
+ *   background insight is still worth surfacing or should resolve to {NTA}.
+ *
+ * Approach:
+ * - Use structured message tree state, not text matching or intent heuristics.
+ * - Keep deferred-primary replacement flows separate; this context is for normal add-on follow-ups.
+ */
+function isUserConversationMessage(message) {
+  if (!message || typeof message !== 'object') {
+    return false;
+  }
+  if (message.isCreatedByUser === true) {
+    return true;
+  }
+  return String(message.sender || '').trim().toLowerCase() === 'user';
+}
+
+function formatContinuationMessageForPrompt(message) {
+  const role = isUserConversationMessage(message) ? 'User' : 'Assistant';
+  const text = extractRecentResponseTextFromMessage(message).replace(/\s+/g, ' ').trim();
+  if (!text) {
+    return '';
+  }
+  const clipped = text.length > 500 ? `${text.slice(0, 500)}...` : text;
+  return `${role}: ${clipped}`;
+}
+
+function clipContinuationContext(lines, maxChars = 1800) {
+  const kept = [];
+  let total = 0;
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index];
+    const nextLength = total + line.length + (kept.length > 0 ? 1 : 0);
+    if (nextLength > maxChars && kept.length > 0) {
+      break;
+    }
+    kept.unshift(line);
+    total = nextLength;
+  }
+  return kept.join('\n');
+}
+
+function createDefaultContinuationContext(parentMessageId, { lookupFailed = false } = {}) {
+  return {
+    hasMovedOn: false,
+    contextText: '',
+    currentLeafMessageId: parentMessageId,
+    messageCount: 0,
+    lookupFailed: lookupFailed === true,
+  };
+}
+
+function resolveFollowUpContinuationContext(messages, parentMessageId, options = {}) {
+  const maxMessages = Number.isFinite(options.maxMessages) ? options.maxMessages : 8;
+  const maxChars = Number.isFinite(options.maxChars) ? options.maxChars : 1800;
+  const candidates = Array.isArray(messages)
+    ? messages.filter((message) => message && typeof message.messageId === 'string' && message.messageId)
+    : [];
+  const byId = new Map(candidates.map((message) => [message.messageId, message]));
+  const parentMessage = byId.get(parentMessageId);
+  const parentTimeline = getMessageTimelineValue(parentMessage);
+  const currentLeafMessageId = resolveConversationLeafMessageId(candidates, parentMessageId);
+
+  const path = [];
+  const seen = new Set();
+  let cursor = currentLeafMessageId;
+  let reachedParent = false;
+  while (cursor && !seen.has(cursor)) {
+    if (cursor === parentMessageId) {
+      reachedParent = true;
+      break;
+    }
+    seen.add(cursor);
+    const message = byId.get(cursor);
+    if (!message) {
+      break;
+    }
+    path.push(message);
+    cursor = message.parentMessageId;
+  }
+
+  if (!reachedParent) {
+    return {
+      ...createDefaultContinuationContext(parentMessageId),
+      currentLeafMessageId,
+    };
+  }
+
+  const orderedContinuation = path.reverse();
+
+  const visibleContinuation = orderedContinuation
+    .filter((message) => message.messageId !== parentMessageId)
+    .filter((message) => {
+      const timeline = getMessageTimelineValue(message);
+      return parentTimeline === 0 || timeline >= parentTimeline;
+    });
+  const hasMovedOn = visibleContinuation.some(isUserConversationMessage);
+  const contextLines = visibleContinuation
+    .slice(-maxMessages)
+    .map(formatContinuationMessageForPrompt)
+    .filter(Boolean);
+  const contextText = clipContinuationContext(contextLines, maxChars);
+
+  return {
+    hasMovedOn,
+    contextText:
+      hasMovedOn && contextText
+        ? contextText
+        : hasMovedOn
+          ? '(The conversation has newer visible turns after the earlier response, but no saved message text was available.)'
+          : '',
+    currentLeafMessageId,
+    messageCount: visibleContinuation.length,
+    lookupFailed: false,
+  };
+}
+
+async function loadFollowUpContinuationContext({ req, conversationId, parentMessageId }) {
+  if (!req?.user?.id || !conversationId) {
+    return {
+      messages: null,
+      context: createDefaultContinuationContext(parentMessageId),
+    };
+  }
+
+  try {
+    const messages = await db.getMessages(
+      { user: req.user.id, conversationId },
+      'messageId parentMessageId createdAt updatedAt text content sender isCreatedByUser metadata',
+    );
+    return {
+      messages,
+      context: resolveFollowUpContinuationContext(messages, parentMessageId),
+    };
+  } catch (err) {
+    logger.warn(
+      '[BackgroundCortexFollowUpService] Failed resolving follow-up continuation context:',
+      err?.message || err,
+    );
+    return {
+      messages: null,
+      context: createDefaultContinuationContext(parentMessageId, { lookupFailed: true }),
+    };
+  }
+}
+/* === VIVENTIUM END === */
 
 async function resolveFollowUpLLMConfig({
   req,
@@ -860,6 +1032,7 @@ function deduplicateInsights(insights) {
 function formatFollowUpPrompt({
   insights = [],
   recentResponse = '',
+  continuationContext = '',
   voiceMode = false,
   surface = '',
   primaryResponseMode = false,
@@ -886,6 +1059,8 @@ function formatFollowUpPrompt({
   }
 
   const cleanRecent = typeof recentResponse === 'string' ? recentResponse.trim() : '';
+  const cleanContinuation =
+    typeof continuationContext === 'string' ? continuationContext.trim() : '';
 
   /* === VIVENTIUM NOTE ===
    * Feature: Voice follow-up prompt rules (speech-safe output).
@@ -949,7 +1124,18 @@ function formatFollowUpPrompt({
     webRules,
     playgroundRules,
     '## CRITICAL: Do Not Repeat',
-    `Here is the response you JUST sent to the user:\n---\n${recentBlock}\n---`,
+    cleanContinuation
+      ? `Here is the earlier response this follow-up belongs to:\n---\n${recentBlock}\n---`
+      : `Here is the response you JUST sent to the user:\n---\n${recentBlock}\n---`,
+    cleanContinuation
+      ? [
+          '## Current Conversation State',
+          'The conversation continued after that earlier response. These newer visible messages were exchanged before this follow-up decision:',
+          `---\n${cleanContinuation.slice(0, 1800)}\n---`,
+          'Use this newer exchange as the current state. If the background insights are stale, redundant, already resolved, or would interrupt the current flow, respond with {NTA}.',
+          'Only surface information that is still useful now and not already addressed by the newer exchange.',
+        ].join('\n\n')
+      : '',
     'Background agents provide evidence only. You decide whether there is anything worth surfacing.',
     'You MUST NOT repeat, rephrase, re-ask, or echo ANY part of the above. If the background insights below overlap with what you already said, respond with {NTA}.',
     'Only respond if the insights contain genuinely NEW information not covered above.',
@@ -1049,6 +1235,7 @@ async function generateFollowUpText({
   agent,
   insightsData,
   recentResponse = '',
+  continuationContext = '',
   runId = '',
   primaryResponseMode = false,
 }) {
@@ -1069,6 +1256,7 @@ async function generateFollowUpText({
   const prompt = formatFollowUpPrompt({
     insights,
     recentResponse,
+    continuationContext,
     voiceMode,
     surface,
     primaryResponseMode,
@@ -1140,6 +1328,11 @@ async function generateFollowUpText({
         'Background agents provide evidence only; you decide whether to surface a follow-up or stay silent with {NTA}.',
         'Do not re-ask questions, do not repeat topics, do not introduce yourself.',
       ];
+  if (!primaryResponseMode && typeof continuationContext === 'string' && continuationContext.trim()) {
+    systemPromptParts.push(
+      'The conversation may have moved on since the earlier response. Use the newer visible exchange as current state and default to {NTA} unless the background insight is still useful now.',
+    );
+  }
   const noResponseInstructions = buildNoResponseInstructions(req);
   if (noResponseInstructions) {
     systemPromptParts.push(noResponseInstructions);
@@ -1219,10 +1412,18 @@ async function createCortexFollowUpMessage({
   replaceParentMessage = false,
 }) {
   let text = '';
+  let generationFailed = false;
   const hasInsights = Array.isArray(insightsData?.insights) && insightsData.insights.length > 0;
   const voiceMode = isVoiceMode(req);
   const surface = resolveViventiumSurface(req);
   const scheduleId = typeof req?.body?.scheduleId === 'string' ? req.body.scheduleId : '';
+  let { messages: conversationMessages, context: continuationContext } =
+    await loadFollowUpContinuationContext({ req, conversationId, parentMessageId });
+  if (continuationContext.hasMovedOn) {
+    logger.info(
+      `[BackgroundCortexFollowUpService] Follow-up conversation moved on: conversationId=${conversationId || ''} parent=${parentMessageId || ''} continuationMessages=${continuationContext.messageCount} currentLeaf=${continuationContext.currentLeafMessageId || ''}`,
+    );
+  }
   const recentResponseResolution = await resolveRecentResponseText({
     req,
     parentMessageId,
@@ -1246,11 +1447,37 @@ async function createCortexFollowUpMessage({
         agent,
         insightsData,
         recentResponse: recentResponseResolution.text,
+        continuationContext:
+          replaceParentMessage === true ? '' : continuationContext.contextText,
         runId: parentMessageId || conversationId || '',
         primaryResponseMode: replaceParentMessage === true,
       });
     } catch (err) {
+      generationFailed = true;
       logger.warn('[BackgroundCortexFollowUpService] Failed to generate LLM follow-up text:', err);
+    }
+  }
+
+  let finalContinuationContext = continuationContext;
+  if (replaceParentMessage !== true && hasInsights) {
+    const refreshed = await loadFollowUpContinuationContext({ req, conversationId, parentMessageId });
+    if (Array.isArray(refreshed.messages)) {
+      conversationMessages = refreshed.messages;
+      finalContinuationContext = refreshed.context;
+    } else if (refreshed.context.lookupFailed) {
+      finalContinuationContext = refreshed.context;
+    }
+    const contextChangedDuringGeneration =
+      finalContinuationContext.hasMovedOn === true &&
+      (finalContinuationContext.currentLeafMessageId !== continuationContext.currentLeafMessageId ||
+        finalContinuationContext.contextText !== continuationContext.contextText ||
+        finalContinuationContext.messageCount !== continuationContext.messageCount);
+    if (contextChangedDuringGeneration) {
+      logger.info(
+        `[BackgroundCortexFollowUpService] Suppressing generated follow-up because conversation moved during follow-up generation: conversationId=${conversationId || ''} parent=${parentMessageId || ''} currentLeaf=${finalContinuationContext.currentLeafMessageId || ''}`,
+      );
+      text = '';
+      generationFailed = false;
     }
   }
 
@@ -1261,19 +1488,16 @@ async function createCortexFollowUpMessage({
     voiceMode,
     surface,
     scheduleId,
+    generationFailed,
+    movedOnAfterParent:
+      replaceParentMessage !== true &&
+      (finalContinuationContext.hasMovedOn || finalContinuationContext.lookupFailed),
   });
   text = resolvedText;
 
-  logger.info('[BackgroundCortexFollowUpService] Follow-up persistence decision', {
-    conversationId,
-    parentMessageId,
-    replaceParentMessage: decision.replaceParentMessage,
-    hasInsights: decision.hasInsights,
-    llmResult: decision.llmResult,
-    selectedStrategy: decision.selectedStrategy,
-    suppressionReason: decision.suppressionReason || null,
-    finalLength: decision.finalLength,
-  });
+  logger.info(
+    `[BackgroundCortexFollowUpService] Follow-up persistence decision conversationId=${conversationId || ''} parent=${parentMessageId || ''} replaceParent=${decision.replaceParentMessage} hasInsights=${decision.hasInsights} generationFailed=${decision.generationFailed} movedOn=${decision.movedOnAfterParent} llmResult=${decision.llmResult} selectedStrategy=${decision.selectedStrategy} suppressionReason=${decision.suppressionReason || 'none'} finalLength=${decision.finalLength}`,
+  );
 
   if (!text || text.trim().length === 0) {
     return null;
@@ -1296,11 +1520,15 @@ async function createCortexFollowUpMessage({
   let treeParentId = parentMessageId;
   if (req?.user?.id && conversationId) {
     try {
-      const messages = await db.getMessages(
-        { user: req.user.id, conversationId },
-        'messageId parentMessageId createdAt updatedAt',
-      );
-      const currentLeafMessageId = resolveConversationLeafMessageId(messages, parentMessageId);
+      const messages = Array.isArray(conversationMessages)
+        ? conversationMessages
+        : await db.getMessages(
+            { user: req.user.id, conversationId },
+            'messageId parentMessageId createdAt updatedAt',
+          );
+      const currentLeafMessageId =
+        finalContinuationContext.currentLeafMessageId ||
+        resolveConversationLeafMessageId(messages, parentMessageId);
       if (currentLeafMessageId) {
         treeParentId = currentLeafMessageId;
       }
@@ -1407,6 +1635,7 @@ module.exports = {
   resolveRecentResponseText,
   resolveFollowUpPersistenceText,
   resolveConversationLeafMessageId,
+  resolveFollowUpContinuationContext,
   sanitizeAnthropicFollowUpLLMConfig,
   stripQuestionSentences,
 };

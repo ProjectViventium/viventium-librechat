@@ -9,14 +9,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
-
-try:
-    from zoneinfo import ZoneInfo
-except Exception:  # pragma: no cover - Python < 3.9 fallback
-    ZoneInfo = None  # type: ignore
 
 # === VIVENTIUM START ===
 # Rationale: ship a default scheduled self-prompt contract so scheduler runs preserve
@@ -24,7 +18,7 @@ except Exception:  # pragma: no cover - Python < 3.9 fallback
 BREW_PROMPT_MARKER = "<!--viv_internal:brew_begin-->"
 BREW_PROMPT_HEADER = "## Background Processing (Brewing)"
 SCHEDULED_SELF_PROMPT_LINE = (
-    "This is a scheduled self-prompt (morning briefing, wake cycle, heartbeat), "
+    "This is a scheduled self-prompt (for example: morning briefing, wake cycle, reminder, or passive check), "
     "not a new user scheduling request."
 )
 LIVE_FACT_CONTRACT_LINE = (
@@ -567,83 +561,6 @@ def _prepend_late_delivery_notice(text: object, notice: str) -> str:
         return cleaned
     return f"{notice}\n\n{cleaned}"
 # === VIVENTIUM END ===
-
-
-# === VIVENTIUM NOTE ===
-# Feature: Heartbeat keepalive guardrail.
-# Purpose: prevent long silent `{NTA}` streaks on high-frequency heartbeat tasks.
-# === VIVENTIUM NOTE ===
-def _parse_utc_iso(value: Any) -> Optional[datetime]:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    raw = value.strip()
-    if raw.endswith("Z"):
-        raw = raw[:-1] + "+00:00"
-    try:
-        parsed = datetime.fromisoformat(raw)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
-
-
-def _is_heartbeat_task(task: Dict[str, Any]) -> bool:
-    metadata = task.get("metadata")
-    if not isinstance(metadata, dict):
-        return False
-    name = str(metadata.get("name") or "").strip().lower()
-    return name == "heartbeat"
-
-
-def _get_heartbeat_quiet_streak(task: Dict[str, Any]) -> int:
-    metadata = task.get("metadata")
-    if not isinstance(metadata, dict):
-        return 0
-    raw = metadata.get("heartbeat_quiet_streak")
-    try:
-        streak = int(raw)
-    except (TypeError, ValueError):
-        return 0
-    return max(0, streak)
-
-
-def _heartbeat_keepalive_threshold() -> int:
-    raw = str(os.getenv("SCHEDULER_HEARTBEAT_KEEPALIVE_STREAK", "3")).strip()
-    try:
-        value = int(raw)
-    except ValueError:
-        value = 3
-    return max(2, value)
-
-
-def _format_heartbeat_next_check(task: Dict[str, Any], now_utc: datetime) -> str:
-    next_run = _parse_utc_iso(task.get("next_run_at"))
-    if not next_run:
-        return "the next cycle"
-    schedule = task.get("schedule") or {}
-    tz_name = schedule.get("timezone") if isinstance(schedule, dict) else None
-    tz_name = str(tz_name or "UTC")
-    if ZoneInfo is None:
-        return f"{next_run.astimezone(timezone.utc).strftime('%H:%M')} UTC"
-    try:
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        tz = timezone.utc
-        tz_name = "UTC"
-    local_next = next_run.astimezone(tz)
-    now_local = now_utc.astimezone(tz)
-    if local_next.date() == now_local.date():
-        return f"{local_next.strftime('%H:%M')} {tz_name}"
-    return f"{local_next.strftime('%a %H:%M')} {tz_name}"
-
-
-def _build_heartbeat_keepalive(task: Dict[str, Any], now_utc: datetime) -> str:
-    next_check = _format_heartbeat_next_check(task, now_utc)
-    return (
-        "Quick pulse: I'm here and tracking things with you. "
-        f"No urgent change this cycle. Next check around {next_check}."
-    )
 
 
 def _coerce_id(value: Any) -> str:
@@ -1713,7 +1630,6 @@ def _dispatch_telegram(
     )
     raw_final_text = final_text.strip() if isinstance(final_text, str) else ""
     raw_followup_text = followup_text.strip() if isinstance(followup_text, str) else ""
-    now_utc = datetime.now(timezone.utc)
     send_timeout_s = int(os.getenv("SCHEDULER_TELEGRAM_SEND_TIMEOUT_S", "15"))
     # === VIVENTIUM NOTE ===
     # Feature: Allow intentional silence for passive/background runs via {NTA}.
@@ -1812,35 +1728,11 @@ def _dispatch_telegram(
         followup_text_source = ""
         followup_text_fallback_reason = ""
 
-    heartbeat_keepalive_sent = False
     if (
         suppress_final
         and suppressed_fallback_reason
     ):
         final_suppress_reason = suppressed_fallback_reason
-
-    if (
-        suppress_final
-        and final_suppress_reason == "nta"
-        and not str(followup_text or "").strip()
-        and _is_heartbeat_task(task)
-    ):
-        prior_streak = _get_heartbeat_quiet_streak(task)
-        threshold = _heartbeat_keepalive_threshold()
-        # Send a concise keepalive after repeated heartbeat no-response suppressions.
-        if prior_streak >= (threshold - 1):
-            keepalive_text = _build_heartbeat_keepalive(task, now_utc)
-            followup_text = keepalive_text
-            raw_followup_text = keepalive_text
-            followup_suppressed = False
-            followup_suppress_reason = ""
-            heartbeat_keepalive_sent = True
-            logger.info(
-                "[scheduling-cortex] Heartbeat keepalive override sent: task_id=%s prior_streak=%s threshold=%s",
-                task.get("id") or "unknown",
-                prior_streak,
-                threshold,
-            )
 
     if final_text and not sent_final_message:
         for part in _split_telegram_message(final_text):
@@ -1896,7 +1788,7 @@ def _dispatch_telegram(
             reason = _fallback_reason(final_text_fallback_reason or followup_text_fallback_reason)
         else:
             outcome = "sent"
-            reason = "heartbeat_keepalive" if heartbeat_keepalive_sent else "delivered"
+            reason = "delivered"
     elif raw_final_text or raw_followup_text:
         outcome = "suppressed"
         if raw_final_text and not sent_final:
@@ -1977,32 +1869,6 @@ def _prepare_generated_visibility(
         "empty" if not str(followup_text or "").strip() else ""
     )
 
-    heartbeat_keepalive_sent = False
-    now_utc = datetime.now(timezone.utc)
-    if (
-        suppress_final
-        and final_suppress_reason == "nta"
-        and not str(followup_text or "").strip()
-        and _is_heartbeat_task(task)
-    ):
-        prior_streak = _get_heartbeat_quiet_streak(task)
-        threshold = _heartbeat_keepalive_threshold()
-        if prior_streak >= (threshold - 1):
-            keepalive_text = _build_heartbeat_keepalive(task, now_utc)
-            followup_text = keepalive_text
-            raw_followup_text = keepalive_text
-            followup_suppressed = False
-            followup_suppress_reason = ""
-            heartbeat_keepalive_sent = True
-            followup_text_source = "heartbeat_keepalive"
-            followup_text_fallback_reason = ""
-            logger.info(
-                "[scheduling-cortex] Heartbeat keepalive override sent: task_id=%s prior_streak=%s threshold=%s",
-                task.get("id") or "unknown",
-                prior_streak,
-                threshold,
-            )
-
     final_visible_text = final_text.strip() if isinstance(final_text, str) and final_text.strip() else ""
     followup_visible_text = (
         followup_text.strip() if isinstance(followup_text, str) and followup_text.strip() else ""
@@ -2042,7 +1908,6 @@ def _prepare_generated_visibility(
         "final_suppress_reason": final_suppress_reason,
         "followup_suppress_reason": followup_suppress_reason,
         "generated_text": generated_text,
-        "heartbeat_keepalive_sent": heartbeat_keepalive_sent,
         "final_text_source": final_text_source,
         "followup_text_source": followup_text_source,
         "fallback_delivered": fallback_delivered,
@@ -2084,7 +1949,7 @@ def _build_librechat_delivery_detail(visibility: Dict[str, Any]) -> Dict[str, An
             reason = _fallback_reason(visibility.get("fallback_reason"))
         else:
             outcome = "sent"
-            reason = "heartbeat_keepalive" if visibility.get("heartbeat_keepalive_sent") else "delivered"
+            reason = "delivered"
     elif raw_final_text or raw_followup_text:
         outcome = "suppressed"
         if raw_final_text:
@@ -2180,7 +2045,7 @@ def _deliver_telegram_generated_text(
             reason = _fallback_reason(visibility.get("fallback_reason"))
         else:
             outcome = "sent"
-            reason = "heartbeat_keepalive" if visibility.get("heartbeat_keepalive_sent") else "delivered"
+            reason = "delivered"
     elif raw_final_text or raw_followup_text:
         outcome = "suppressed"
         if raw_final_text and not sent_final:
@@ -2291,7 +2156,6 @@ def dispatch_task(task: Dict[str, Any]) -> Dict[str, Any]:
     generated_text: Optional[str] = None
     saw_sent = False
     saw_fallback_delivered = False
-    saw_heartbeat_keepalive = False
     suppress_reasons: list[str] = []
     fallback_reasons: list[str] = []
     saw_non_failed = False
@@ -2304,8 +2168,6 @@ def dispatch_task(task: Dict[str, Any]) -> Dict[str, Any]:
             if outcome == "sent":
                 saw_sent = True
                 saw_non_failed = True
-                if reason == "heartbeat_keepalive":
-                    saw_heartbeat_keepalive = True
             elif outcome == "fallback_delivered":
                 saw_fallback_delivered = True
                 saw_non_failed = True
@@ -2323,7 +2185,7 @@ def dispatch_task(task: Dict[str, Any]) -> Dict[str, Any]:
                     generated_text = text.strip()
     if saw_sent:
         delivery_outcome = "sent"
-        delivery_reason = "heartbeat_keepalive" if saw_heartbeat_keepalive else "delivered"
+        delivery_reason = "delivered"
     elif saw_fallback_delivered:
         delivery_outcome = "fallback_delivered"
         delivery_reason = "; ".join(fallback_reasons) if fallback_reasons else "deferred_fallback"

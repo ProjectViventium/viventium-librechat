@@ -10,6 +10,7 @@
 
 const {
   formatFollowUpPrompt,
+  resolveFollowUpContinuationContext,
   resolveFollowUpPersistenceText,
   sanitizeAnthropicFollowUpLLMConfig,
 } = require('../BackgroundCortexFollowUpService');
@@ -82,6 +83,23 @@ describe('formatFollowUpPrompt', () => {
     expect(prompt).toContain('respond with {NTA}');
   });
 
+  test('shows the follow-up model newer conversation context when the thread moved on', () => {
+    const prompt = formatFollowUpPrompt({
+      insights: [{ cortexName: 'worker', insight: 'The venue doors opened at 8 PM.' }],
+      recentResponse: "You're not late.",
+      continuationContext: 'User: I am already getting ready now.\nAssistant: You have time.',
+      voiceMode: false,
+      surface: '',
+    });
+
+    expect(prompt).toContain('Here is the earlier response this follow-up belongs to');
+    expect(prompt).toContain('## Current Conversation State');
+    expect(prompt).toContain('User: I am already getting ready now.');
+    expect(prompt).toContain('If the background insights are stale, redundant, already resolved');
+    expect(prompt).toContain('Only surface information that is still useful now');
+    expect(prompt).toContain('{NTA}');
+  });
+
   test('makes primary deferred answers user-visible only through the main-agent continuation', () => {
     const prompt = formatFollowUpPrompt({
       insights: [{ cortexName: 'worker', insight: 'The task completed successfully.' }],
@@ -125,14 +143,290 @@ describe('resolveFollowUpPersistenceText', () => {
     const result = resolveFollowUpPersistenceText({
       generatedText: '{NTA}',
       insightsData: {
-        insights: [{ cortexName: 'Pattern Recognition', insight: 'Nothing new.' }],
+        insights: [{ cortexName: 'Pattern Recognition', insight: 'That choice is fine. Good call.' }],
       },
       replaceParentMessage: false,
     });
 
     expect(result.text).toBe('');
     expect(result.decision.llmResult).toBe('nta');
-    expect(result.decision.suppressionReason).not.toBe('');
+    expect(result.decision.selectedStrategy).toBe('no_response_suppressed');
+    expect(result.decision.suppressionReason).toBe('no_response_tag');
+  });
+
+  test('keeps voice-mode {NTA} suppressed for non-replacement follow-ups', () => {
+    const result = resolveFollowUpPersistenceText({
+      generatedText: '{NTA}',
+      insightsData: {
+        insights: [{ cortexName: 'Pattern Recognition', insight: 'That choice is fine. Good call.' }],
+      },
+      replaceParentMessage: false,
+      voiceMode: true,
+      surface: 'playground',
+    });
+
+    expect(result.text).toBe('');
+    expect(result.decision.llmResult).toBe('nta');
+    expect(result.decision.selectedStrategy).toBe('no_response_suppressed');
+    expect(result.decision.suppressionReason).toBe('no_response_tag');
+  });
+
+  test('preserves voice-mode generated follow-up text for non-replacement follow-ups', () => {
+    const result = resolveFollowUpPersistenceText({
+      generatedText: 'That still works.',
+      insightsData: {
+        insights: [{ cortexName: 'Pattern Recognition', insight: 'That choice is fine. Good call.' }],
+      },
+      replaceParentMessage: false,
+      voiceMode: true,
+      surface: 'playground',
+    });
+
+    expect(result.text).toBe('That still works.');
+    expect(result.decision.selectedStrategy).toBe('llm_generated');
+    expect(result.decision.suppressionReason).toBe('');
+  });
+
+  test('preserves replacement follow-up fallback when {NTA} has visible insight text', () => {
+    const result = resolveFollowUpPersistenceText({
+      generatedText: '{NTA}',
+      insightsData: {
+        insights: [{ cortexName: 'Pattern Recognition', insight: 'That choice is fine. Good call.' }],
+      },
+      replaceParentMessage: true,
+    });
+
+    expect(result.text).toBe('That choice is fine. Good call.');
+    expect(result.decision.llmResult).toBe('nta');
+    expect(result.decision.selectedStrategy).toBe('deterministic_fallback');
+    expect(result.decision.suppressionReason).toBe('');
+  });
+
+  test('preserves voice-mode replacement fallback when generated follow-up text is empty', () => {
+    const result = resolveFollowUpPersistenceText({
+      generatedText: '',
+      insightsData: {
+        insights: [{ cortexName: 'Pattern Recognition', insight: 'That choice is fine. Good call.' }],
+      },
+      replaceParentMessage: true,
+      voiceMode: true,
+      surface: 'playground',
+    });
+
+    expect(result.text).toBe('That choice is fine. Good call.');
+    expect(result.decision.selectedStrategy).toBe('deterministic_fallback');
+    expect(result.decision.suppressionReason).toBe('');
+  });
+
+  test('keeps voice-mode empty follow-up generation silent instead of speaking raw insights', () => {
+    const result = resolveFollowUpPersistenceText({
+      generatedText: '',
+      insightsData: {
+        insights: [{ cortexName: 'Pattern Recognition', insight: 'That choice is fine. Good call.' }],
+      },
+      replaceParentMessage: false,
+      voiceMode: true,
+      surface: 'playground',
+    });
+
+    expect(result.text).toBe('');
+    expect(result.decision.selectedStrategy).toBe('voice_empty_suppressed');
+    expect(result.decision.suppressionReason).toBe('empty_voice_followup');
+  });
+
+  test('keeps moved-on empty follow-up generation silent on all surfaces', () => {
+    const result = resolveFollowUpPersistenceText({
+      generatedText: '',
+      insightsData: {
+        insights: [{ cortexName: 'Pattern Recognition', insight: 'Old context that may be stale.' }],
+      },
+      replaceParentMessage: false,
+      voiceMode: false,
+      surface: 'web',
+      movedOnAfterParent: true,
+    });
+
+    expect(result.text).toBe('');
+    expect(result.decision.selectedStrategy).toBe('moved_on_empty_suppressed');
+    expect(result.decision.suppressionReason).toBe('moved_on_empty_followup');
+  });
+
+  test('keeps moved-on empty Telegram follow-up generation silent', () => {
+    const result = resolveFollowUpPersistenceText({
+      generatedText: '',
+      insightsData: {
+        insights: [{ cortexName: 'Pattern Recognition', insight: 'Old context that may be stale.' }],
+      },
+      replaceParentMessage: false,
+      voiceMode: false,
+      surface: 'telegram',
+      movedOnAfterParent: true,
+    });
+
+    expect(result.text).toBe('');
+    expect(result.decision.selectedStrategy).toBe('moved_on_empty_suppressed');
+    expect(result.decision.suppressionReason).toBe('moved_on_empty_followup');
+  });
+
+  test('keeps moved-on generated follow-up text when the main agent finds it useful', () => {
+    const result = resolveFollowUpPersistenceText({
+      generatedText: 'One useful new detail: doors are already open.',
+      insightsData: {
+        insights: [{ cortexName: 'Deep Research', insight: 'Doors opened at 8 PM.' }],
+      },
+      replaceParentMessage: false,
+      voiceMode: false,
+      surface: 'web',
+      movedOnAfterParent: true,
+    });
+
+    expect(result.text).toBe('One useful new detail: doors are already open.');
+    expect(result.decision.selectedStrategy).toBe('llm_generated');
+    expect(result.decision.suppressionReason).toBe('');
+  });
+
+  test('preserves replacement fallback even when conversation moved on', () => {
+    const result = resolveFollowUpPersistenceText({
+      generatedText: '',
+      insightsData: {
+        insights: [{ cortexName: 'worker', insight: 'The task completed successfully.' }],
+      },
+      replaceParentMessage: true,
+      voiceMode: false,
+      surface: 'web',
+      movedOnAfterParent: true,
+    });
+
+    expect(result.text).toBe('The task completed successfully.');
+    expect(result.decision.selectedStrategy).toBe('deterministic_fallback');
+    expect(result.decision.suppressionReason).toBe('');
+  });
+
+  test('labels voice-mode empty suppression caused by follow-up generation failure', () => {
+    const result = resolveFollowUpPersistenceText({
+      generatedText: '',
+      insightsData: {
+        insights: [{ cortexName: 'Pattern Recognition', insight: 'That choice is fine. Good call.' }],
+      },
+      replaceParentMessage: false,
+      voiceMode: true,
+      surface: 'playground',
+      generationFailed: true,
+    });
+
+    expect(result.text).toBe('');
+    expect(result.decision.selectedStrategy).toBe('voice_empty_suppressed');
+    expect(result.decision.suppressionReason).toBe('voice_followup_generation_failed');
+    expect(result.decision.generationFailed).toBe(true);
+  });
+});
+
+describe('resolveFollowUpContinuationContext', () => {
+  test('builds current conversation context from newer user and assistant descendants', () => {
+    const result = resolveFollowUpContinuationContext(
+      [
+        {
+          messageId: 'assistant-a',
+          parentMessageId: 'user-a',
+          sender: 'AI',
+          text: "You're not late.",
+          createdAt: '2026-05-03T03:04:20.000Z',
+        },
+        {
+          messageId: 'user-b',
+          parentMessageId: 'assistant-a',
+          sender: 'User',
+          isCreatedByUser: true,
+          text: 'I am already getting ready now.',
+          createdAt: '2026-05-03T03:04:30.000Z',
+        },
+        {
+          messageId: 'assistant-b',
+          parentMessageId: 'user-b',
+          sender: 'AI',
+          text: 'You have time.',
+          createdAt: '2026-05-03T03:04:35.000Z',
+        },
+      ],
+      'assistant-a',
+    );
+
+    expect(result.hasMovedOn).toBe(true);
+    expect(result.currentLeafMessageId).toBe('assistant-b');
+    expect(result.contextText).toContain('User: I am already getting ready now.');
+    expect(result.contextText).toContain('Assistant: You have time.');
+  });
+
+  test('does not mark assistant-only descendants as moved on', () => {
+    const result = resolveFollowUpContinuationContext(
+      [
+        { messageId: 'assistant-a', parentMessageId: 'user-a', sender: 'AI', text: 'Checking.' },
+        {
+          messageId: 'assistant-child',
+          parentMessageId: 'assistant-a',
+          sender: 'AI',
+          text: 'Background card updated.',
+        },
+      ],
+      'assistant-a',
+    );
+
+    expect(result.hasMovedOn).toBe(false);
+    expect(result.contextText).toBe('');
+  });
+
+  test('finds a user continuation through a two-hop descendant path', () => {
+    const result = resolveFollowUpContinuationContext(
+      [
+        { messageId: 'assistant-a', parentMessageId: 'user-a', sender: 'AI', text: 'First.' },
+        {
+          messageId: 'assistant-child',
+          parentMessageId: 'assistant-a',
+          sender: 'AI',
+          text: 'Interim assistant message.',
+        },
+        {
+          messageId: 'user-c',
+          parentMessageId: 'assistant-child',
+          sender: 'User',
+          isCreatedByUser: true,
+          text: 'Actually I already handled that.',
+        },
+      ],
+      'assistant-a',
+    );
+
+    expect(result.hasMovedOn).toBe(true);
+    expect(result.currentLeafMessageId).toBe('user-c');
+    expect(result.contextText).toContain('Actually I already handled that.');
+  });
+
+  test('does not pull sibling-branch text when current leaf is not downstream of parent', () => {
+    const result = resolveFollowUpContinuationContext(
+      [
+        { messageId: 'assistant-a', parentMessageId: 'user-a', sender: 'AI', text: 'Branch A.' },
+        {
+          messageId: 'user-b',
+          parentMessageId: 'user-a',
+          sender: 'User',
+          isCreatedByUser: true,
+          text: 'Sibling branch user text.',
+          createdAt: '2026-05-03T03:04:30.000Z',
+        },
+        {
+          messageId: 'assistant-b',
+          parentMessageId: 'user-b',
+          sender: 'AI',
+          text: 'Sibling branch answer.',
+          createdAt: '2026-05-03T03:04:35.000Z',
+        },
+      ],
+      'assistant-a',
+    );
+
+    expect(result.hasMovedOn).toBe(false);
+    expect(result.contextText).toBe('');
+    expect(result.currentLeafMessageId).toBe('assistant-b');
   });
 });
 

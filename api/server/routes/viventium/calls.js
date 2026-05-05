@@ -70,7 +70,10 @@ router.post('/', requireJwtAuth, async (req, res) => {
       try {
         const convo = await getConvo(userId, normalizedConversationId);
         if (!convo) {
-          console.log('[VIVENTIUM][calls] Conversation not found', { normalizedConversationId, userId });
+          console.log('[VIVENTIUM][calls] Conversation not found', {
+            normalizedConversationId,
+            userId,
+          });
           return res.status(404).json({ error: 'Conversation not found' });
         }
         if (typeof convo.agent_id === 'string' && convo.agent_id.length > 0) {
@@ -85,7 +88,10 @@ router.post('/', requireJwtAuth, async (req, res) => {
         return res.status(500).json({ error: 'Failed to load conversation' });
       }
     }
-    console.log('[VIVENTIUM][calls] Selected agent for voice call', { effectiveAgentId, conversationId: normalizedConversationId });
+    console.log('[VIVENTIUM][calls] Selected agent for voice call', {
+      effectiveAgentId,
+      conversationId: normalizedConversationId,
+    });
 
     if (typeof effectiveAgentId !== 'string' || effectiveAgentId.length === 0) {
       console.log('[VIVENTIUM][calls] Bad request - no agentId');
@@ -130,7 +136,9 @@ router.get('/:callSessionId/voice-settings', dispatchAuth, async (req, res) => {
   } catch (err) {
     const status = err?.status || 500;
     console.error('[VIVENTIUM][calls] Call session voice-settings read failed:', err);
-    return res.status(status).json({ error: err?.message || 'Call session voice-settings read failed' });
+    return res
+      .status(status)
+      .json({ error: err?.message || 'Call session voice-settings read failed' });
   }
 });
 
@@ -153,7 +161,9 @@ router.post('/:callSessionId/voice-settings', dispatchAuth, async (req, res) => 
   } catch (err) {
     const status = err?.status || 500;
     console.error('[VIVENTIUM][calls] Call session voice-settings update failed:', err);
-    return res.status(status).json({ error: err?.message || 'Call session voice-settings update failed' });
+    return res
+      .status(status)
+      .json({ error: err?.message || 'Call session voice-settings update failed' });
   }
 });
 
@@ -164,7 +174,7 @@ router.post('/:callSessionId/voice-settings', dispatchAuth, async (req, res) => 
 router.post('/:callSessionId/dispatch/claim', dispatchAuth, async (req, res) => {
   try {
     const session = req.viventiumCallSession;
-    const { roomName, agentName } = req.body ?? {};
+    const { roomName, agentName, reclaimConfirmed } = req.body ?? {};
 
     const normalizedRoom = typeof roomName === 'string' ? roomName : session.roomName;
     const normalizedAgent = typeof agentName === 'string' ? agentName : '';
@@ -177,6 +187,7 @@ router.post('/:callSessionId/dispatch/claim', dispatchAuth, async (req, res) => 
       callSessionId: session.callSessionId,
       roomName: normalizedRoom,
       agentName: normalizedAgent,
+      reclaimConfirmed: reclaimConfirmed === true,
     });
 
     return res.json({

@@ -23,6 +23,12 @@ DEFAULT_CATCH_UP_MAX_LATE_S = 12 * 60 * 60
 HARD_CATCH_UP_MAX_LATE_S = 24 * 60 * 60
 MISFIRE_POLICY_KEY = "misfire_policy"
 SCHEDULER_MISFIRE_KEY = "scheduler_misfire"
+STALE_INTERNAL_METADATA_KEYS = frozenset(
+    {
+        "heartbeat_quiet_streak",
+        "heartbeat_last_pulse_at",
+    }
+)
 
 DEFERRED_FALLBACK_REASON_MARKERS = (
     "deferred_fallback",
@@ -90,43 +96,6 @@ def _deferred_fallback_degradation(
 
 
 # === VIVENTIUM NOTE ===
-# Feature: Heartbeat quiet-streak metadata tracking.
-# Purpose: allow dispatch layer to send periodic keepalive pulses after repeated NTA suppressions.
-# === VIVENTIUM NOTE ===
-def _is_heartbeat_task(task: Dict[str, object]) -> bool:
-    metadata = task.get("metadata")
-    if not isinstance(metadata, dict):
-        return False
-    return str(metadata.get("name") or "").strip().lower() == "heartbeat"
-
-
-def _heartbeat_metadata_after_delivery(
-    task: Dict[str, object],
-    *,
-    delivery_outcome: str,
-    delivery_reason: str,
-    now: datetime,
-) -> Optional[Dict[str, object]]:
-    if not _is_heartbeat_task(task):
-        return None
-    existing = task.get("metadata")
-    metadata: Dict[str, object] = dict(existing) if isinstance(existing, dict) else {"name": "Heartbeat"}
-    raw_streak = metadata.get("heartbeat_quiet_streak")
-    try:
-        streak = int(raw_streak)
-    except (TypeError, ValueError):
-        streak = 0
-    streak = max(0, streak)
-    lowered_reason = (delivery_reason or "").lower()
-    if delivery_outcome == "suppressed" and ("nta" in lowered_reason or "empty" in lowered_reason):
-        metadata["heartbeat_quiet_streak"] = streak + 1
-    elif delivery_outcome == "sent":
-        metadata["heartbeat_quiet_streak"] = 0
-        metadata["heartbeat_last_pulse_at"] = to_utc_iso(now)
-    return metadata
-
-
-# === VIVENTIUM NOTE ===
 # Feature: Structured misfire policy and late-reminder catch-up.
 # Purpose: User-created one-time reminders should not disappear silently after
 # a sleeping/local runtime wakes late. This uses task metadata and structural
@@ -167,10 +136,17 @@ def _late_minutes(late_seconds: int) -> int:
     return max(1, int(round(late_seconds / 60)))
 
 
+def _pruned_internal_metadata(task: Dict[str, object]) -> Optional[Dict[str, object]]:
+    metadata = task.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    if not any(key in metadata for key in STALE_INTERNAL_METADATA_KEYS):
+        return None
+    return {key: value for key, value in metadata.items() if key not in STALE_INTERNAL_METADATA_KEYS}
+
+
 def _default_misfire_mode(task: Dict[str, object]) -> str:
     schedule = task.get("schedule") if isinstance(task.get("schedule"), dict) else {}
-    if _is_heartbeat_task(task):
-        return "strict"
     if (
         isinstance(schedule, dict)
         and schedule.get("type") == "once"
@@ -418,14 +394,9 @@ class SchedulerEngine:
         updates["last_delivery_outcome"] = delivery_outcome
         updates["last_delivery_reason"] = delivery_reason
         updates["last_generated_text"] = generated_text
-        heartbeat_metadata = _heartbeat_metadata_after_delivery(
-            task,
-            delivery_outcome=delivery_outcome,
-            delivery_reason=delivery_reason,
-            now=now,
-        )
-        if heartbeat_metadata is not None:
-            updates["metadata"] = heartbeat_metadata
+        pruned_internal_metadata = _pruned_internal_metadata(task)
+        if pruned_internal_metadata is not None:
+            updates["metadata"] = pruned_internal_metadata
 
         # === VIVENTIUM NOTE ===
         # Feature: Persist per-channel error ledger for partial dispatch successes.

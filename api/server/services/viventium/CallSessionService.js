@@ -37,7 +37,9 @@ const MAX_VARIANT_LENGTH = 160;
 
 function createRoomName(callSessionId) {
   // LiveKit room name practical max ~64; keep it short & deterministic.
-  const short = String(callSessionId).replace(/[^a-zA-Z0-9]/g, '').slice(0, 12);
+  const short = String(callSessionId)
+    .replace(/[^a-zA-Z0-9]/g, '')
+    .slice(0, 12);
   return `lc-${short || 'call'}`;
 }
 
@@ -220,7 +222,10 @@ function getDefaultVoiceRouteSelection(modality) {
   if (provider === 'xai') {
     return {
       provider,
-      variant: normalizeVoiceRouteText(process.env.VIVENTIUM_XAI_VOICE || 'Sal', MAX_VARIANT_LENGTH),
+      variant: normalizeVoiceRouteText(
+        process.env.VIVENTIUM_XAI_VOICE || 'Sal',
+        MAX_VARIANT_LENGTH,
+      ),
     };
   }
   return {
@@ -270,7 +275,9 @@ function normalizeSession(session) {
   }
   const createdAt = session.createdAt ? new Date(session.createdAt).getTime() : undefined;
   const expiresAt = session.expiresAt ? new Date(session.expiresAt).getTime() : undefined;
-  const leaseExpiresAt = session.leaseExpiresAt ? new Date(session.leaseExpiresAt).getTime() : undefined;
+  const leaseExpiresAt = session.leaseExpiresAt
+    ? new Date(session.leaseExpiresAt).getTime()
+    : undefined;
   const dispatchClaimedAt = session.dispatchClaimedAt
     ? new Date(session.dispatchClaimedAt).getTime()
     : undefined;
@@ -432,13 +439,7 @@ async function resolveCallSessionAssistantRoute(agentId) {
   };
 }
 
-async function createCallSession({
-  userId,
-  agentId,
-  conversationId,
-  ttlMs,
-  requestedVoiceRoute,
-}) {
+async function createCallSession({ userId, agentId, conversationId, ttlMs, requestedVoiceRoute }) {
   if (!userId) {
     throw new Error('createCallSession requires userId');
   }
@@ -603,7 +604,9 @@ async function updateCallSessionVoiceSettings({
     const updatedUser = await updateUserViventiumVoicePreferences(normalizedSession.userId, {
       livekitPlayground: compactVoiceRouteState(requestedVoiceRoute),
     });
-    savedVoiceRoute = normalizeVoiceRouteState(updatedUser?.viventiumVoicePreferences?.livekitPlayground);
+    savedVoiceRoute = normalizeVoiceRouteState(
+      updatedUser?.viventiumVoicePreferences?.livekitPlayground,
+    );
   }
 
   const assistantRoute = await resolveCallSessionAssistantRoute(normalizedSession.agentId);
@@ -618,12 +621,7 @@ async function updateCallSessionVoiceSettings({
   };
 }
 
-async function claimVoiceSession({
-  callSessionId,
-  jobId,
-  workerId,
-  leaseDurationMs,
-}) {
+async function claimVoiceSession({ callSessionId, jobId, workerId, leaseDurationMs }) {
   if (!callSessionId) {
     throw new Error('claimVoiceSession requires callSessionId');
   }
@@ -688,7 +686,9 @@ async function updateCallSessionConversationId(callSessionId, conversationId) {
     return null;
   }
 
-  logger.info(`[CallSessionService] DEBUG UPDATE: Updated session conversationId to ${conversationId}`);
+  logger.info(
+    `[CallSessionService] DEBUG UPDATE: Updated session conversationId to ${conversationId}`,
+  );
   return normalizeSession(session);
 }
 
@@ -755,7 +755,7 @@ async function assertVoiceGatewayAuth(req) {
   return claimed;
 }
 
-async function claimDispatch({ callSessionId, roomName, agentName }) {
+async function claimDispatch({ callSessionId, roomName, agentName, reclaimConfirmed = false }) {
   if (!callSessionId) {
     throw new Error('claimDispatch requires callSessionId');
   }
@@ -785,27 +785,34 @@ async function claimDispatch({ callSessionId, roomName, agentName }) {
     err.status = 409;
     throw err;
   }
-  if (session.dispatchConfirmedAt) {
+  if (session.dispatchConfirmedAt && reclaimConfirmed !== true) {
     return { status: 'already', session: normalizeSession(session) };
   }
 
   const claimId = crypto.randomUUID();
   const claimCutoff = new Date(now.getTime() - getDispatchClaimTtlMs());
-
-  const claimed = await ViventiumCallSession.findOneAndUpdate(
-    {
-      callSessionId: String(callSessionId),
-      expiresAt: { $gt: now },
-      $and: [
-        { $or: [{ dispatchConfirmedAt: { $exists: false } }, { dispatchConfirmedAt: null }] },
-        {
+  const dispatchConfirmationCondition =
+    reclaimConfirmed === true
+      ? { dispatchConfirmedAt: { $exists: true, $ne: null } }
+      : { $or: [{ dispatchConfirmedAt: { $exists: false } }, { dispatchConfirmedAt: null }] };
+  // Reclaims are guarded by dispatchConfirmedAt itself. The first winner unsets that field in the
+  // same atomic update, so concurrent reclaims no longer match and report in_flight.
+  const dispatchClaimAvailabilityCondition =
+    reclaimConfirmed === true
+      ? {}
+      : {
           $or: [
             { dispatchClaimedAt: { $exists: false } },
             { dispatchClaimedAt: null },
             { dispatchClaimedAt: { $lt: claimCutoff } },
           ],
-        },
-      ],
+        };
+
+  const claimed = await ViventiumCallSession.findOneAndUpdate(
+    {
+      callSessionId: String(callSessionId),
+      expiresAt: { $gt: now },
+      $and: [dispatchConfirmationCondition, dispatchClaimAvailabilityCondition],
     },
     {
       $set: {
@@ -815,6 +822,7 @@ async function claimDispatch({ callSessionId, roomName, agentName }) {
         dispatchAgentName: agentName,
       },
       $unset: {
+        dispatchConfirmedAt: '',
         dispatchLastError: '',
         dispatchLastErrorAt: '',
       },
@@ -844,12 +852,7 @@ function normalizeDispatchError(error) {
   return `${text.slice(0, 300)}...`;
 }
 
-async function confirmDispatch({
-  callSessionId,
-  claimId,
-  success,
-  error,
-}) {
+async function confirmDispatch({ callSessionId, claimId, success, error }) {
   if (!callSessionId) {
     throw new Error('confirmDispatch requires callSessionId');
   }
@@ -860,16 +863,16 @@ async function confirmDispatch({
   const now = new Date();
   const update = success
     ? {
-      $set: { dispatchConfirmedAt: now },
-      $unset: { dispatchClaimId: '', dispatchClaimedAt: '' },
-    }
+        $set: { dispatchConfirmedAt: now },
+        $unset: { dispatchClaimId: '', dispatchClaimedAt: '' },
+      }
     : {
-      $set: {
-        dispatchLastError: normalizeDispatchError(error) || 'dispatch failed',
-        dispatchLastErrorAt: now,
-      },
-      $unset: { dispatchClaimId: '', dispatchClaimedAt: '' },
-    };
+        $set: {
+          dispatchLastError: normalizeDispatchError(error) || 'dispatch failed',
+          dispatchLastErrorAt: now,
+        },
+        $unset: { dispatchClaimId: '', dispatchClaimedAt: '' },
+      };
 
   const session = await ViventiumCallSession.findOneAndUpdate(
     {

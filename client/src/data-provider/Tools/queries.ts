@@ -52,6 +52,7 @@ export const useMCPConnectionStatusQuery = (
       refetchOnReconnect: false,
       refetchOnMount: false,
       staleTime: 10000, // 10 seconds
+      refetchInterval: 15000,
       ...config,
     },
   );

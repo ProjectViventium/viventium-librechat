@@ -612,10 +612,9 @@ describe('BackgroundCortexFollowUpService', () => {
     );
   });
 
-  test('createCortexFollowUpMessage persists deterministic fallback when non-deferred synthesis returns NTA but insight is substantive', async () => {
+  test('createCortexFollowUpMessage suppresses non-deferred synthesis that returns NTA', async () => {
     const req = { user: { id: 'u1' } };
     db.getMessages.mockResolvedValueOnce([{ messageId: 'm-parent' }]);
-    db.saveMessage.mockResolvedValueOnce({});
 
     Run.create.mockResolvedValueOnce({
       processStream: jest.fn(async () => '{NTA}'),
@@ -639,18 +638,206 @@ describe('BackgroundCortexFollowUpService', () => {
         'Yeah — you were working through the maintenance schedule. Moving the backup window later is about reducing load overlap.',
     });
 
+    expect(msg).toBeNull();
+    expect(db.saveMessage).not.toHaveBeenCalled();
+  });
+
+  test('createCortexFollowUpMessage gives moved-on context to the follow-up LLM', async () => {
+    const req = { user: { id: 'u1' } };
+    db.getMessages.mockResolvedValueOnce([
+      { messageId: 'm-parent', parentMessageId: 'u-parent', sender: 'AI', text: 'Earlier answer.' },
+      {
+        messageId: 'u-new',
+        parentMessageId: 'm-parent',
+        sender: 'User',
+        isCreatedByUser: true,
+        text: 'I already handled that.',
+      },
+      {
+        messageId: 'm-new',
+        parentMessageId: 'u-new',
+        sender: 'AI',
+        text: 'Good, then leave it alone.',
+      },
+    ]);
+    db.saveMessage.mockResolvedValueOnce({});
+
+    let capturedPrompt = '';
+    Run.create.mockResolvedValueOnce({
+      processStream: jest.fn(async ({ messages }) => {
+        capturedPrompt = messages[0].content;
+        return '{NTA}';
+      }),
+    });
+
+    const msg = await createCortexFollowUpMessage({
+      req,
+      conversationId: 'c-123',
+      parentMessageId: 'm-parent',
+      agent: { id: 'agent_123', provider: 'openai', model: 'gpt-5.4', model_parameters: {} },
+      insightsData: {
+        insights: [{ cortexName: 'Pattern Recognition', insight: 'A now-stale reminder.' }],
+      },
+      recentResponse: 'Earlier answer.',
+    });
+
+    expect(msg).toBeNull();
+    expect(capturedPrompt).toContain('## Current Conversation State');
+    expect(capturedPrompt).toContain('User: I already handled that.');
+    expect(capturedPrompt).toContain('Assistant: Good, then leave it alone.');
+    expect(db.saveMessage).not.toHaveBeenCalled();
+  });
+
+  test('createCortexFollowUpMessage suppresses moved-on empty synthesis instead of raw fallback', async () => {
+    const req = { user: { id: 'u1' } };
+    db.getMessages.mockResolvedValueOnce([
+      { messageId: 'm-parent', parentMessageId: 'u-parent', sender: 'AI', text: 'Earlier answer.' },
+      {
+        messageId: 'u-new',
+        parentMessageId: 'm-parent',
+        sender: 'User',
+        isCreatedByUser: true,
+        text: 'I already handled that.',
+      },
+    ]);
+
+    Run.create.mockResolvedValueOnce({
+      processStream: jest.fn(async () => ''),
+    });
+
+    const msg = await createCortexFollowUpMessage({
+      req,
+      conversationId: 'c-123',
+      parentMessageId: 'm-parent',
+      agent: { id: 'agent_123', provider: 'openai', model: 'gpt-5.4', model_parameters: {} },
+      insightsData: {
+        insights: [{ cortexName: 'Pattern Recognition', insight: 'Old raw fallback text.' }],
+      },
+      recentResponse: 'Earlier answer.',
+    });
+
+    expect(msg).toBeNull();
+    expect(db.saveMessage).not.toHaveBeenCalled();
+  });
+
+  test('createCortexFollowUpMessage suppresses moved-on failed synthesis instead of raw fallback', async () => {
+    const req = { user: { id: 'u1' } };
+    db.getMessages.mockResolvedValueOnce([
+      { messageId: 'm-parent', parentMessageId: 'u-parent', sender: 'AI', text: 'Earlier answer.' },
+      {
+        messageId: 'u-new',
+        parentMessageId: 'm-parent',
+        sender: 'User',
+        isCreatedByUser: true,
+        text: 'I already handled that.',
+      },
+    ]);
+
+    Run.create.mockRejectedValueOnce(new Error('model unavailable'));
+
+    const msg = await createCortexFollowUpMessage({
+      req,
+      conversationId: 'c-123',
+      parentMessageId: 'm-parent',
+      agent: { id: 'agent_123', provider: 'openai', model: 'gpt-5.4', model_parameters: {} },
+      insightsData: {
+        insights: [{ cortexName: 'Pattern Recognition', insight: 'Old raw fallback text.' }],
+      },
+      recentResponse: 'Earlier answer.',
+    });
+
+    expect(msg).toBeNull();
+    expect(db.saveMessage).not.toHaveBeenCalled();
+  });
+
+  test('createCortexFollowUpMessage saves moved-on generated text on the current leaf', async () => {
+    const req = { user: { id: 'u1' } };
+    db.getMessages.mockResolvedValueOnce([
+      { messageId: 'm-parent', parentMessageId: 'u-parent', sender: 'AI', text: 'Earlier answer.' },
+      {
+        messageId: 'u-new',
+        parentMessageId: 'm-parent',
+        sender: 'User',
+        isCreatedByUser: true,
+        text: 'I am still waiting for one concrete detail.',
+      },
+      {
+        messageId: 'm-new',
+        parentMessageId: 'u-new',
+        sender: 'AI',
+        text: 'I have the main answer.',
+      },
+    ]);
+    db.saveMessage.mockResolvedValueOnce({});
+
+    Run.create.mockResolvedValueOnce({
+      processStream: jest.fn(async () => 'One still-useful new detail.'),
+    });
+
+    const msg = await createCortexFollowUpMessage({
+      req,
+      conversationId: 'c-123',
+      parentMessageId: 'm-parent',
+      agent: { id: 'agent_123', provider: 'openai', model: 'gpt-5.4', model_parameters: {} },
+      insightsData: {
+        insights: [{ cortexName: 'Deep Research', insight: 'One still-useful new detail.' }],
+      },
+      recentResponse: 'Earlier answer.',
+    });
+
     expect(msg).toBeTruthy();
-    expect(msg.text).toContain('The overnight batch job was overrunning');
-    expect(msg.text).not.toContain('{NTA}');
+    expect(msg.parentMessageId).toBe('m-new');
+    expect(msg.metadata.viventium.parentMessageId).toBe('m-parent');
     expect(db.saveMessage).toHaveBeenCalledWith(
       req,
       expect.objectContaining({
         conversationId: 'c-123',
-        parentMessageId: 'm-parent',
-        text: expect.stringContaining('The overnight batch job was overrunning'),
+        parentMessageId: 'm-new',
+        text: 'One still-useful new detail.',
+        metadata: expect.objectContaining({
+          viventium: expect.objectContaining({
+            parentMessageId: 'm-parent',
+          }),
+        }),
       }),
       expect.any(Object),
     );
+  });
+
+  test('createCortexFollowUpMessage suppresses output when conversation moves during follow-up generation', async () => {
+    const req = { user: { id: 'u1' } };
+    db.getMessages
+      .mockResolvedValueOnce([
+        { messageId: 'm-parent', parentMessageId: 'u-parent', sender: 'AI', text: 'Earlier answer.' },
+      ])
+      .mockResolvedValueOnce([
+        { messageId: 'm-parent', parentMessageId: 'u-parent', sender: 'AI', text: 'Earlier answer.' },
+        {
+          messageId: 'u-new',
+          parentMessageId: 'm-parent',
+          sender: 'User',
+          isCreatedByUser: true,
+          text: 'I moved on while you were thinking.',
+        },
+      ]);
+
+    Run.create.mockResolvedValueOnce({
+      processStream: jest.fn(async () => 'This would now be stale.'),
+    });
+
+    const msg = await createCortexFollowUpMessage({
+      req,
+      conversationId: 'c-123',
+      parentMessageId: 'm-parent',
+      agent: { id: 'agent_123', provider: 'openai', model: 'gpt-5.4', model_parameters: {} },
+      insightsData: {
+        insights: [{ cortexName: 'Pattern Recognition', insight: 'Potentially stale detail.' }],
+      },
+      recentResponse: 'Earlier answer.',
+    });
+
+    expect(msg).toBeNull();
+    expect(db.saveMessage).not.toHaveBeenCalled();
   });
 
   test('createCortexFollowUpMessage suppresses question-only follow-up as {NTA}', async () => {
@@ -1592,6 +1779,38 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(systemPrompt).not.toContain('deeply personal');
     expect(systemPrompt).toContain('conversational AI assistant');
     expect(systemPrompt).toContain('{NTA}');
+  });
+
+  test('generateFollowUpText adds moved-on system prompt only when continuation context is present', async () => {
+    const req = { user: { id: 'u1' }, body: {} };
+    await generateFollowUpText({
+      req,
+      agent: { id: 'agent_123', provider: 'openai' },
+      insightsData: {
+        insights: [{ cortexName: 'Background Analysis', insight: 'New finding' }],
+      },
+      recentResponse: 'Got it.',
+      continuationContext: 'User: I already handled this.',
+      runId: 'run-moved-on',
+    });
+
+    let runConfig = Run.create.mock.calls[0][0];
+    expect(runConfig.graphConfig.instructions).toContain('The conversation may have moved on');
+
+    jest.clearAllMocks();
+    getAgent.mockResolvedValue(null);
+    await generateFollowUpText({
+      req,
+      agent: { id: 'agent_123', provider: 'openai' },
+      insightsData: {
+        insights: [{ cortexName: 'Background Analysis', insight: 'New finding' }],
+      },
+      recentResponse: 'Got it.',
+      runId: 'run-not-moved',
+    });
+
+    runConfig = Run.create.mock.calls[0][0];
+    expect(runConfig.graphConfig.instructions).not.toContain('The conversation may have moved on');
   });
   // === VIVENTIUM NOTE ===
 });

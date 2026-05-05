@@ -1064,45 +1064,78 @@ Content: <turn timestamp="2026-02-25T00:00:06.441Z" role="AI">Archived text</tur
             self.assertEqual(result.get('delivery', {}).get('reason'), 'telegram:empty')
             self.assertIsNone(result.get('delivery', {}).get('generated_text'))
 
-    def test_dispatch_telegram_heartbeat_keepalive_after_repeated_nta(self):
-        """Heartbeat tasks should send a concise keepalive after repeated NTA suppressions."""
+    def test_dispatch_telegram_any_scheduled_nta_remains_suppressed_with_stale_metadata(self):
+        """Any scheduled prompt with NTA must stay silent, regardless of legacy metadata."""
         task = {
-            'id': 'task-heartbeat',
+            'id': 'task-passive-check',
             'user_id': 'user_1',
             'agent_id': 'agent-1',
-            'prompt': 'heartbeat',
+            'prompt': 'check whether there is anything new worth surfacing',
             'channel': 'telegram',
             'conversation_policy': 'same',
             'next_run_at': '2026-02-13T20:00:00Z',
             'schedule': {'type': 'cron', 'cron': '*/30 9-21 * * *', 'timezone': 'America/Toronto'},
-            'metadata': {'name': 'Heartbeat', 'heartbeat_quiet_streak': 2},
+            'metadata': {'name': 'Passive Check', 'heartbeat_quiet_streak': 99},
         }
 
         with patch.object(
             dispatch,
             '_run_scheduler_generation',
             return_value={
-                'conversation_id': 'conv-hb',
-                'response_message_id': 'msg-hb',
+                'conversation_id': 'conv-passive',
+                'response_message_id': 'msg-passive',
                 'final_text': '{NTA}',
                 'followup_text': '',
             },
         ), patch.object(
             dispatch,
             '_resolve_telegram_identity',
-            return_value=('tg-hb', 'tg-hb', {'always_voice_response': False, 'voice_responses_enabled': True}),
+            return_value=('tg-passive', 'tg-passive', {'always_voice_response': False, 'voice_responses_enabled': True}),
+        ), patch.object(dispatch, '_send_telegram_voice_or_text') as mock_send:
+            result = dispatch.dispatch_task(task)
+
+            mock_send.assert_not_called()
+            self.assertEqual(result.get('delivery', {}).get('outcome'), 'suppressed')
+            self.assertEqual(result.get('delivery', {}).get('reason'), 'telegram:nta')
+            self.assertEqual(result.get('delivery', {}).get('generated_text'), '{NTA}')
+            telegram_detail = result.get('delivery', {}).get('channels', {}).get('telegram', {})
+            self.assertFalse(telegram_detail.get('sent_final'))
+            self.assertFalse(telegram_detail.get('sent_followup'))
+            self.assertEqual(telegram_detail.get('final_generated_text'), '{NTA}')
+
+    def test_dispatch_telegram_explicit_reminder_still_sends_visible_text(self):
+        """Removing synthetic status pings must not silence legitimate visible scheduled output."""
+        task = {
+            'id': 'task-reminder',
+            'user_id': 'user_1',
+            'agent_id': 'agent-1',
+            'prompt': 'remind me to stretch',
+            'channel': 'telegram',
+            'conversation_policy': 'new',
+            'metadata': {'name': 'Reminder'},
+        }
+
+        with patch.object(
+            dispatch,
+            '_run_scheduler_generation',
+            return_value={
+                'conversation_id': 'conv-reminder',
+                'response_message_id': 'msg-reminder',
+                'final_text': 'Stretch now.',
+                'followup_text': '',
+            },
+        ), patch.object(
+            dispatch,
+            '_resolve_telegram_identity',
+            return_value=('tg-reminder', 'tg-reminder', {'always_voice_response': False, 'voice_responses_enabled': True}),
         ), patch.object(dispatch, '_send_telegram_voice_or_text') as mock_send:
             result = dispatch.dispatch_task(task)
 
             self.assertEqual(mock_send.call_count, 1)
-            keepalive_text = mock_send.call_args_list[0].args[1]
-            self.assertIn("Quick pulse:", keepalive_text)
+            self.assertEqual(mock_send.call_args_list[0].args[1], 'Stretch now.')
             self.assertEqual(result.get('delivery', {}).get('outcome'), 'sent')
-            self.assertEqual(result.get('delivery', {}).get('reason'), 'heartbeat_keepalive')
-            self.assertEqual(
-                result.get('delivery', {}).get('channels', {}).get('telegram', {}).get('sent_followup'),
-                True,
-            )
+            self.assertEqual(result.get('delivery', {}).get('reason'), 'delivered')
+            self.assertEqual(result.get('delivery', {}).get('generated_text'), 'Stretch now.')
 
     def test_dispatch_telegram_still_sends_followup_when_final_suppressed(self):
         """Even when final_text is suppressed, a non-empty follow-up should still deliver."""
@@ -1255,6 +1288,43 @@ Content: <turn timestamp="2026-02-25T00:00:06.441Z" role="AI">Archived text</tur
             self.assertEqual(result.get('delivery', {}).get('outcome'), 'suppressed')
             self.assertEqual(result.get('delivery', {}).get('reason'), 'empty_deferred_response')
             self.assertFalse(result.get('delivery', {}).get('fallback_delivered'))
+
+    def test_legacy_dispatch_telegram_any_scheduled_nta_remains_suppressed_with_stale_metadata(self):
+        task = {
+            'id': 'task-legacy-passive-check',
+            'user_id': 'user_1',
+            'agent_id': 'agent-1',
+            'prompt': 'check whether there is anything new worth surfacing',
+            'channel': 'telegram',
+            'conversation_policy': 'new',
+            'metadata': {'name': 'Passive Check', 'heartbeat_quiet_streak': 99},
+        }
+
+        with patch.object(
+            dispatch,
+            '_resolve_telegram_identity',
+            return_value=('tg-legacy-passive', 'tg-legacy-passive', {'always_voice_response': False, 'voice_responses_enabled': True}),
+        ), patch.object(
+            dispatch,
+            '_post_json',
+            return_value={'streamId': 'stream-legacy-passive', 'conversationId': 'conv-legacy-passive'},
+        ), patch.object(
+            dispatch,
+            '_stream_telegram_response',
+            return_value=('{NTA}', 'msg-legacy-passive', ''),
+        ), patch.object(
+            dispatch,
+            '_poll_telegram_followup',
+            return_value={'followup_text': '', 'canonical_text': ''},
+        ), patch.object(dispatch, '_send_telegram_voice_or_text') as mock_send:
+            result = dispatch._dispatch_telegram(task, 'http://localhost:3080', 10, 'new')
+
+            mock_send.assert_not_called()
+            self.assertEqual(result.get('delivery', {}).get('outcome'), 'suppressed')
+            self.assertEqual(result.get('delivery', {}).get('reason'), 'nta')
+            self.assertEqual(result.get('delivery', {}).get('generated_text'), '{NTA}')
+            self.assertFalse(result.get('delivery', {}).get('sent_final'))
+            self.assertFalse(result.get('delivery', {}).get('sent_followup'))
 
     def test_dispatch_telegram_dedupes_matching_followup_text(self):
         task = {

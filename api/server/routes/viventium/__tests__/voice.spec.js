@@ -439,15 +439,12 @@ describe('/api/viventium/voice/chat', () => {
 
     expect(res.statusCode).toBe(200);
     expect(logger.info).toHaveBeenCalledWith(
-      expect.stringContaining('[VIVENTIUM][voice/chat] user_turn_completed source=route'),
-      'call_session_1',
-      expect.any(String),
-      expect.any(String),
-      'agent_voice',
-      'req-log-1',
-      expect.any(Boolean),
-      expect.any(Number),
+      expect.stringContaining(
+        '[VIVENTIUM][voice/chat] user_turn_completed source=route callSessionId=call_session_1',
+      ),
     );
+    expect(logger.info).toHaveBeenCalledWith(expect.stringContaining('agentId=agent_voice'));
+    expect(logger.info).toHaveBeenCalledWith(expect.stringContaining('requestId=req-log-1'));
   });
 
   test('GET glasshive returns latest worker callback for voice speech polling', async () => {

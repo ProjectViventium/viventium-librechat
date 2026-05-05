@@ -1409,6 +1409,207 @@ describe('MCP Routes', () => {
         }
       }
     });
+
+    it('should warm OAuth MCP servers when a usable refresh token exists', async () => {
+      const { findToken } = require('~/models');
+      const mockGetConnection = jest.fn().mockResolvedValue({});
+      const mockGetUserConnections = jest.fn().mockReturnValue(new Map());
+
+      require('~/config').getMCPManager.mockReturnValue({
+        getConnection: mockGetConnection,
+        getUserConnections: mockGetUserConnections,
+      });
+
+      findToken.mockImplementation(({ type, identifier }) => {
+        if (type === 'mcp_oauth_refresh' && identifier === 'mcp:ms-365:refresh') {
+          return Promise.resolve({ expiresAt: new Date(Date.now() + 60_000) });
+        }
+        return Promise.resolve(null);
+      });
+
+      getMCPSetupData.mockResolvedValue({
+        mcpConfig: {
+          'ms-365': { url: 'http://localhost:6274/mcp' },
+        },
+        appConnections: {},
+        userConnections: {},
+        oauthServers: new Set(['ms-365']),
+      });
+
+      getServerConnectionStatus.mockResolvedValue({
+        connectionState: 'connected',
+        requiresOAuth: true,
+      });
+
+      const response = await request(app).get('/api/mcp/connection/status');
+
+      expect(response.status).toBe(200);
+      expect(mockGetConnection).toHaveBeenCalledWith(
+        expect.objectContaining({
+          serverName: 'ms-365',
+          returnOnOAuth: true,
+        }),
+      );
+    });
+
+    it('should not warm OAuth MCP servers when no usable token exists', async () => {
+      const { findToken } = require('~/models');
+      const mockGetConnection = jest.fn().mockResolvedValue({});
+      const mockGetUserConnections = jest.fn().mockReturnValue(new Map());
+
+      require('~/config').getMCPManager.mockReturnValue({
+        getConnection: mockGetConnection,
+        getUserConnections: mockGetUserConnections,
+      });
+
+      findToken.mockResolvedValue(null);
+
+      getMCPSetupData.mockResolvedValue({
+        mcpConfig: {
+          'ms-365': { url: 'http://localhost:6274/mcp' },
+        },
+        appConnections: {},
+        userConnections: {},
+        oauthServers: new Set(['ms-365']),
+      });
+
+      getServerConnectionStatus.mockResolvedValue({
+        connectionState: 'disconnected',
+        requiresOAuth: true,
+      });
+
+      const response = await request(app).get('/api/mcp/connection/status');
+
+      expect(response.status).toBe(200);
+      expect(mockGetConnection).not.toHaveBeenCalled();
+      expect(findToken).toHaveBeenCalledTimes(2);
+      expect(getMCPSetupData).toHaveBeenCalledTimes(1);
+    });
+
+    it('should cache OAuth token presence across rapid status polls', async () => {
+      const { findToken } = require('~/models');
+      const originalWarmupCooldown = process.env.MCP_PERSISTENT_WARMUP_COOLDOWN_MS;
+      const originalTokenCache = process.env.MCP_OAUTH_TOKEN_PRESENCE_CACHE_MS;
+      process.env.MCP_PERSISTENT_WARMUP_COOLDOWN_MS = '60000';
+      process.env.MCP_OAUTH_TOKEN_PRESENCE_CACHE_MS = '60000';
+
+      try {
+        const mockGetConnection = jest.fn().mockResolvedValue({});
+        const mockGetUserConnections = jest.fn().mockReturnValue(new Map());
+
+        require('~/config').getMCPManager.mockReturnValue({
+          getConnection: mockGetConnection,
+          getUserConnections: mockGetUserConnections,
+        });
+
+        findToken.mockImplementation(({ type, identifier }) => {
+          if (type === 'mcp_oauth_refresh' && identifier === 'mcp:ms-365:refresh') {
+            return Promise.resolve({ expiresAt: new Date(Date.now() + 60_000) });
+          }
+          return Promise.resolve(null);
+        });
+
+        getMCPSetupData.mockResolvedValue({
+          mcpConfig: {
+            'ms-365': { url: 'http://localhost:6274/mcp' },
+          },
+          appConnections: {},
+          userConnections: {},
+          oauthServers: new Set(['ms-365']),
+        });
+
+        getServerConnectionStatus.mockResolvedValue({
+          connectionState: 'connected',
+          requiresOAuth: true,
+        });
+
+        const firstResponse = await request(app).get('/api/mcp/connection/status');
+        const secondResponse = await request(app).get('/api/mcp/connection/status');
+
+        expect(firstResponse.status).toBe(200);
+        expect(secondResponse.status).toBe(200);
+        expect(mockGetConnection).toHaveBeenCalledTimes(1);
+        expect(findToken).toHaveBeenCalledTimes(2);
+      } finally {
+        if (originalWarmupCooldown === undefined) {
+          delete process.env.MCP_PERSISTENT_WARMUP_COOLDOWN_MS;
+        } else {
+          process.env.MCP_PERSISTENT_WARMUP_COOLDOWN_MS = originalWarmupCooldown;
+        }
+        if (originalTokenCache === undefined) {
+          delete process.env.MCP_OAUTH_TOKEN_PRESENCE_CACHE_MS;
+        } else {
+          process.env.MCP_OAUTH_TOKEN_PRESENCE_CACHE_MS = originalTokenCache;
+        }
+      }
+    });
+
+    it('should skip OAuth MCP warmup when token lookup fails', async () => {
+      const { findToken } = require('~/models');
+      const mockGetConnection = jest.fn().mockResolvedValue({});
+      const mockGetUserConnections = jest.fn().mockReturnValue(new Map());
+
+      require('~/config').getMCPManager.mockReturnValue({
+        getConnection: mockGetConnection,
+        getUserConnections: mockGetUserConnections,
+      });
+
+      findToken.mockRejectedValue(new Error('token store unavailable'));
+
+      getMCPSetupData.mockResolvedValue({
+        mcpConfig: {
+          'ms-365': { url: 'http://localhost:6274/mcp' },
+        },
+        appConnections: {},
+        userConnections: {},
+        oauthServers: new Set(['ms-365']),
+      });
+
+      getServerConnectionStatus.mockResolvedValue({
+        connectionState: 'disconnected',
+        requiresOAuth: true,
+      });
+
+      const response = await request(app).get('/api/mcp/connection/status');
+
+      expect(response.status).toBe(200);
+      expect(mockGetConnection).not.toHaveBeenCalled();
+    });
+
+    it('should skip OAuth MCP warmup when custom user variables are required', async () => {
+      const { findToken } = require('~/models');
+      const mockGetConnection = jest.fn().mockResolvedValue({});
+      const mockGetUserConnections = jest.fn().mockReturnValue(new Map());
+
+      require('~/config').getMCPManager.mockReturnValue({
+        getConnection: mockGetConnection,
+        getUserConnections: mockGetUserConnections,
+      });
+
+      findToken.mockResolvedValue({ expiresAt: new Date(Date.now() + 60_000) });
+
+      getMCPSetupData.mockResolvedValue({
+        mcpConfig: {
+          'ms-365': {
+            url: 'http://localhost:6274/mcp',
+            customUserVars: { tenant: { title: 'Tenant' } },
+          },
+        },
+        appConnections: {},
+        userConnections: {},
+        oauthServers: new Set(['ms-365']),
+      });
+
+      getServerConnectionStatus.mockResolvedValue({
+        connectionState: 'disconnected',
+        requiresOAuth: true,
+      });
+
+      const response = await request(app).get('/api/mcp/connection/status');
+
+      expect(response.status).toBe(200);
+      expect(mockGetConnection).not.toHaveBeenCalled();
+    });
   });
 
   describe('GET /connection/status/:serverName', () => {

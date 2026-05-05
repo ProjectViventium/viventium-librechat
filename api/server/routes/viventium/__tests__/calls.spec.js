@@ -96,6 +96,7 @@ jest.mock('~/server/middleware', () => ({
 describe('/api/viventium/calls', () => {
   beforeEach(() => {
     jest.resetModules();
+    jest.clearAllMocks();
     process.env.VIVENTIUM_PLAYGROUND_URL = 'http://localhost:3000';
     process.env.VIVENTIUM_PUBLIC_CLIENT_URL = '';
     process.env.VIVENTIUM_PUBLIC_SERVER_URL = '';
@@ -127,9 +128,9 @@ describe('/api/viventium/calls', () => {
   });
 
   test('POST prefers the configured public playground for matching public browser origins', async () => {
-    process.env.VIVENTIUM_PUBLIC_CLIENT_URL = 'https://home-node.tail123.ts.net';
-    process.env.VIVENTIUM_PUBLIC_SERVER_URL = 'https://home-node.tail123.ts.net:8443';
-    process.env.VIVENTIUM_PUBLIC_PLAYGROUND_URL = 'https://home-node.tail123.ts.net:3443';
+    process.env.VIVENTIUM_PUBLIC_CLIENT_URL = 'https://voice-node.example.test';
+    process.env.VIVENTIUM_PUBLIC_SERVER_URL = 'https://voice-node.example.test:8443';
+    process.env.VIVENTIUM_PUBLIC_PLAYGROUND_URL = 'https://voice-node.example.test:3443';
 
     const callsRouter = require('../calls');
 
@@ -139,17 +140,17 @@ describe('/api/viventium/calls', () => {
 
     const res = await request(app)
       .post('/api/viventium/calls')
-      .set('origin', 'https://home-node.tail123.ts.net')
+      .set('origin', 'https://voice-node.example.test')
       .send({ conversationId: 'new', agentId: 'agent_123' })
       .expect(200);
 
-    expect(new URL(res.body.playgroundUrl).origin).toBe('https://home-node.tail123.ts.net:3443');
+    expect(new URL(res.body.playgroundUrl).origin).toBe('https://voice-node.example.test:3443');
   });
 
   test('POST keeps localhost playground links for localhost callers even when public origins exist', async () => {
-    process.env.VIVENTIUM_PUBLIC_CLIENT_URL = 'https://home-node.tail123.ts.net';
-    process.env.VIVENTIUM_PUBLIC_SERVER_URL = 'https://home-node.tail123.ts.net:8443';
-    process.env.VIVENTIUM_PUBLIC_PLAYGROUND_URL = 'https://home-node.tail123.ts.net:3443';
+    process.env.VIVENTIUM_PUBLIC_CLIENT_URL = 'https://voice-node.example.test';
+    process.env.VIVENTIUM_PUBLIC_SERVER_URL = 'https://voice-node.example.test:8443';
+    process.env.VIVENTIUM_PUBLIC_PLAYGROUND_URL = 'https://voice-node.example.test:3443';
 
     const callsRouter = require('../calls');
 
@@ -179,6 +180,7 @@ describe('/api/viventium/calls', () => {
 
   test('POST dispatch/claim returns claimed status', async () => {
     const callsRouter = require('../calls');
+    const { claimDispatch } = require('~/server/services/viventium/CallSessionService');
 
     const app = express();
     app.use(express.json());
@@ -192,6 +194,42 @@ describe('/api/viventium/calls', () => {
 
     expect(res.body.status).toBe('claimed');
     expect(res.body.claimId).toBe('claim_1');
+    expect(claimDispatch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        callSessionId: 'call_session_test',
+        roomName: 'lc-calltest',
+        agentName: 'librechat-voice-gateway',
+        reclaimConfirmed: false,
+      }),
+    );
+  });
+
+  test('POST dispatch/claim can request confirmed-dispatch reclaim', async () => {
+    const callsRouter = require('../calls');
+    const { claimDispatch } = require('~/server/services/viventium/CallSessionService');
+
+    const app = express();
+    app.use(express.json());
+    app.use('/api/viventium/calls', callsRouter);
+
+    await request(app)
+      .post('/api/viventium/calls/call_session_test/dispatch/claim')
+      .set('x-viventium-call-secret', 'secret')
+      .send({
+        roomName: 'lc-calltest',
+        agentName: 'librechat-voice-gateway',
+        reclaimConfirmed: true,
+      })
+      .expect(200);
+
+    expect(claimDispatch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        callSessionId: 'call_session_test',
+        roomName: 'lc-calltest',
+        agentName: 'librechat-voice-gateway',
+        reclaimConfirmed: true,
+      }),
+    );
   });
 
   test('POST dispatch/confirm returns confirmation', async () => {

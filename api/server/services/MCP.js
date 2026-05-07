@@ -28,7 +28,7 @@ const {
   getFlowStateManager,
   getMCPManager,
 } = require('~/config');
-const { findToken, createToken, updateToken } = require('~/models');
+const { findToken, createToken, updateToken, deleteToken } = require('~/models');
 const { getGraphApiToken } = require('./GraphTokenService');
 const { reinitMCPServer } = require('./Tools/mcp');
 const { getAppConfig } = require('./Config');
@@ -564,6 +564,7 @@ function createToolInstance({
           findToken,
           createToken,
           updateToken,
+          deleteToken,
         },
         oauthStart,
         oauthEnd,
@@ -755,9 +756,25 @@ async function getServerConnectionStatus(
 
   // connection state overrides specific to OAuth servers
   if (baseConnectionState === 'disconnected' && oauthServers.has(serverName)) {
-    // check if server is actively being reconnected
-    const oauthReconnectionManager = getOAuthReconnectionManager();
-    if (oauthReconnectionManager.isReconnecting(userId, serverName)) {
+    /* === VIVENTIUM START ===
+     * Root-cause fix: OAuth reconnect manager may not be initialized during startup/reinit races.
+     * Treat that as "not actively reconnecting" and continue to persisted flow-state checks instead
+     * of throwing out of MCP status resolution.
+     */
+    let isActivelyReconnecting = false;
+    try {
+      const oauthReconnectionManager = getOAuthReconnectionManager();
+      isActivelyReconnecting =
+        typeof oauthReconnectionManager?.isReconnecting === 'function' &&
+        oauthReconnectionManager.isReconnecting(userId, serverName);
+    } catch (error) {
+      logger.warn('[MCP] OAuth reconnect manager unavailable while resolving server status', {
+        serverName,
+        error: error?.message || String(error),
+      });
+    }
+    // === VIVENTIUM END ===
+    if (isActivelyReconnecting) {
       finalConnectionState = 'connecting';
     } else {
       const { hasActiveFlow, hasFailedFlow } = await checkOAuthFlowStatus(userId, serverName);

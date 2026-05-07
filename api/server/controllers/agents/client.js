@@ -68,6 +68,9 @@ const { encodeAndFormat } = require('~/server/services/Files/images/encode');
 const { createContextHandlers } = require('~/app/clients/prompts');
 const { getConvoFiles } = require('~/models/Conversation');
 const BaseClient = require('~/app/clients/BaseClient');
+const {
+  isListenOnlyTranscriptMessage,
+} = require('~/server/services/viventium/listenOnlyTranscript');
 const { getRoleByName } = require('~/models/Role');
 const { loadAgent } = require('~/models/Agent');
 const { getMCPManager } = require('~/config');
@@ -102,12 +105,13 @@ const { getCortexFollowupGraceMs } = require('~/server/services/viventium/cortex
  */
 const {
   shouldDeferMainResponse: shouldDeferToolCortexMainResponse,
+  collectDirectActionScopeKeysFromCortices,
   pickHoldText: pickToolCortexHoldText,
+  shouldForcePhaseBFollowUp,
 } = require('~/server/services/viventium/brewingHold');
 const {
   resolveVoicePhaseAAsyncPolicy,
 } = require('~/server/services/viventium/voicePhaseAPolicy');
-const { getLatestUserText } = require('~/server/services/viventium/productivitySpecialistContext');
 /* === VIVENTIUM NOTE END === */
 const {
   getController: getResponseController,
@@ -662,9 +666,9 @@ function formatBrewingAcknowledgment(activatedCortices) {
   return [
     '## Background Processing (Brewing)',
     `The following background agents have activated and are analyzing in parallel: ${cortexNames}${suffix}.`,
-    'Do not wait for their results while answering the user.',
-    'If live/private data was requested (email, calendar, files), give a brief "checking" acknowledgment and do NOT say you cannot access while these agents are brewing.',
-    'Example: "Got it - checking your inbox now."',
+    'Use your own connected tools now for any part of the user request you can directly verify.',
+    'Treat background agents as supplemental reviewers. Do not wait for their results while answering the user.',
+    'For any part only a background agent can verify, acknowledge that part is still being checked and do not guess.',
     '',
   ].join('\n');
 }
@@ -678,13 +682,22 @@ function formatActivationSummary(activatedCortices) {
     .map((c) => {
       const name = c.cortexName || 'Background Agent';
       const desc = c.cortexDescription ? ` — ${c.cortexDescription}` : '';
+      const scope = c.activationScope ? ` [scope: ${c.activationScope}]` : '';
+      const directScopeKeys = Array.isArray(c.directActionSurfaceScopes)
+        ? c.directActionSurfaceScopes
+            .map((surface) => surface?.scopeKey || surface?.scope_key || '')
+            .filter(Boolean)
+        : [];
+      const direct = directScopeKeys.length > 0
+        ? ` [main-direct: ${directScopeKeys.join(', ')}]`
+        : '';
       const reason = c.reason || 'activated';
       const confidence =
         typeof c.confidence === 'number' && c.confidence > 0
           ? ` (${Math.round(c.confidence * 100)}% confidence)`
           : '';
 
-      return `- ${name}${desc}: ${reason}${confidence}`;
+      return `- ${name}${scope}${direct}${desc}: ${reason}${confidence}`;
     })
     .join('\n');
 
@@ -1200,6 +1213,7 @@ class AgentClient extends BaseClient {
       summary: this.shouldSummarize,
       mapMethod: createMultiAgentMapper(this.options.agent, this.agentConfigs),
       mapCondition: (message) => message.addedConvo === true,
+      skipCondition: isListenOnlyTranscriptMessage,
     });
 
     let payload;
@@ -2181,7 +2195,6 @@ class AgentClient extends BaseClient {
 	      );
       const preSanitizeCount = initialMessages.length;
       initialMessages = sanitizeProviderFormattedMessages(this.options.agent?.provider, initialMessages);
-      const latestUserText = getLatestUserText(initialMessages);
       if (initialMessages.length !== preSanitizeCount) {
         logger.warn(
           `[AgentClient] Provider sanitizer adjusted formatted messages: provider=${
@@ -2289,6 +2302,11 @@ class AgentClient extends BaseClient {
 
         // Helper to emit SSE event
         const emitCortexEvent = async (cortexData, { waitForDelivery = false } = {}) => {
+          const statusChangedAt = new Date().toISOString();
+          cortexData = {
+            ...cortexData,
+            status_changed_at: cortexData?.status_changed_at || statusChangedAt,
+          };
           // Sanitize cortex_name to remove internal jargon
           if (cortexData.cortex_name) {
             cortexData = {
@@ -2453,6 +2471,14 @@ class AgentClient extends BaseClient {
                   status: 'activating',
                   confidence: cortex.confidence,
                   reason: cortex.reason,
+                  cortex_description: cortex.cortexDescription || '',
+                  activation_scope: cortex.activationScope || null,
+                  direct_action_surfaces: Array.isArray(cortex.directActionSurfaces)
+                    ? cortex.directActionSurfaces
+                    : [],
+                  direct_action_surface_scopes: Array.isArray(cortex.directActionSurfaceScopes)
+                    ? cortex.directActionSurfaceScopes
+                    : [],
                 }, { waitForDelivery: true });
               }
 
@@ -2467,10 +2493,15 @@ class AgentClient extends BaseClient {
               logger.info(
                 `[AgentClient] Phase B (async): Starting execution of ${activatedCorticesList.length} activated cortices`,
               );
+              const directActionScopeKeys = collectDirectActionScopeKeysFromCortices(activatedCorticesList);
               toolCortexHoldWanted = shouldDeferToolCortexMainResponse({
                 activatedCortices: activatedCorticesList,
-                latestUserText,
+                directActionScopeKeys,
               });
+              logger.info(
+                `[AgentClient] Tool cortex hold decision (async): hold=${toolCortexHoldWanted} ` +
+                  `direct_action_scope_keys=${directActionScopeKeys.join(',') || 'none'}`,
+              );
               let mergedInsightsData = null;
 
               const executionResult = await executeActivated({
@@ -2557,6 +2588,14 @@ class AgentClient extends BaseClient {
             status: 'activating',
             confidence: cortex.confidence,
             reason: cortex.reason,
+            cortex_description: cortex.cortexDescription || '',
+            activation_scope: cortex.activationScope || null,
+            direct_action_surfaces: Array.isArray(cortex.directActionSurfaces)
+              ? cortex.directActionSurfaces
+              : [],
+            direct_action_surface_scopes: Array.isArray(cortex.directActionSurfaceScopes)
+              ? cortex.directActionSurfaceScopes
+              : [],
           }, { waitForDelivery: true });
         }
 
@@ -2591,10 +2630,15 @@ class AgentClient extends BaseClient {
           // If we're going to defer the main response (tool cortex brewing hold), do NOT pass the live
           // Express response object into background cortex execution. Tool/MCP transports can bind to
           // the response lifecycle and get aborted when the main response ends, leaving cortices stuck.
+          const directActionScopeKeys = collectDirectActionScopeKeysFromCortices(activatedCorticesList);
           toolCortexHoldWanted = shouldDeferToolCortexMainResponse({
             activatedCortices: activatedCorticesList,
-            latestUserText,
+            directActionScopeKeys,
           });
+          logger.info(
+            `[AgentClient] Tool cortex hold decision: hold=${toolCortexHoldWanted} ` +
+              `direct_action_scope_keys=${directActionScopeKeys.join(',') || 'none'}`,
+          );
 
           cortexExecutionPromise = executeActivated({
             req: this.options.req,
@@ -3134,6 +3178,28 @@ class AgentClient extends BaseClient {
 
             try {
               const recentResponse = extractTextFromContentParts(this.contentParts);
+              /* === VIVENTIUM START ===
+               * Feature: Scheduled/no-response Phase B follow-up forcing.
+               *
+               * Why:
+               * - Scheduler-style prompts can intentionally make Phase A output exactly {NTA}
+               *   while background agents finish.
+               * - If Phase B later has substantive insights and synthesis still emits {NTA}, the
+               *   no-response tag must not suppress the useful Phase B follow-up.
+               *
+               * Behavior:
+               * - Phase B remains nonblocking and persists as a separate assistant follow-up.
+               * - We never replace or overwrite Phase A here.
+               * - This is structural: it keys off the no-response tag and Phase B output, not prompt
+               *   text, schedule names, user identity, or agent names.
+               * === VIVENTIUM END === */
+              const forcePhaseBFollowUp = shouldForcePhaseBFollowUp({
+                shouldDeferMainResponse,
+                parentText: recentResponse,
+                hasInsights,
+                hasMergedText,
+                allowErrorOnlyFollowUp,
+              });
               /* VIVENTIUM DEBUG — Phase B recentResponse visibility */
               {
                 const cpLen = this.contentParts?.length ?? 0;
@@ -3158,7 +3224,7 @@ class AgentClient extends BaseClient {
                 agent,
                 insightsData: mergedInsightsData,
                 recentResponse,
-                replaceParentMessage: shouldDeferMainResponse === true,
+                forceVisibleFollowUp: forcePhaseBFollowUp,
               });
               try {
                 await finalizeCanonicalCortexMessage({
@@ -3174,9 +3240,9 @@ class AgentClient extends BaseClient {
 
               if (followUpMessage?.text) {
                 logger.info(
-                  '[AgentClient] Background cortex follow-up message saved: id=%s replace_parent=%s',
+                  '[AgentClient] Background cortex follow-up message saved: id=%s phase_b_new_message=%s',
                   followUpMessage.messageId,
-                  followUpMessage.messageId === responseMessageId,
+                  followUpMessage.messageId !== responseMessageId,
                 );
               } else {
                 logger.warn(

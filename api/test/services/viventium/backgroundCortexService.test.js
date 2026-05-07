@@ -82,6 +82,13 @@ jest.mock('~/server/controllers/agents/callbacks', () => ({
   getDefaultHandlers: jest.fn(() => ({})),
 }));
 
+jest.mock('~/server/controllers/ModelController', () => ({
+  getModelsConfig: jest.fn(async () => ({
+    anthropic: ['claude-sonnet-4-6'],
+    openAI: ['gpt-5.4'],
+  })),
+}));
+
 jest.mock('~/config', () => ({
   getMCPManager: jest.fn(() => ({
     formatInstructionsForContext: jest.fn(async () => null),
@@ -127,6 +134,7 @@ const {
 const { Run, createContentAggregator } = require('@librechat/agents');
 const { initializeAgent, initializeAnthropic, createRun } = require('@librechat/api');
 const { getAppConfig } = require('~/server/services/Config/app');
+const { loadAgent } = require('~/models/Agent');
 
 const PRODUCTIVITY_MS365_PROMPT = `You are a classifier. Decide whether to activate the MS365 (Microsoft) productivity tool agent.
 
@@ -1105,6 +1113,173 @@ describe('BackgroundCortexService.executeCortex', () => {
     );
   });
 
+  test('executeActivated emits a silent terminal completion for no-response cortex output', async () => {
+    const processStream = jest.fn(async () => '{NTA}');
+    const onCortexComplete = jest.fn();
+    const onAllComplete = jest.fn();
+    const initializedAgent = {
+      id: 'agent_plain',
+      name: 'Plain Cortex',
+      tools: [],
+      userMCPAuthMap: null,
+      recursion_limit: 11,
+      provider: 'openai',
+    };
+
+    initializeAgent.mockResolvedValueOnce(initializedAgent);
+    createRun.mockResolvedValueOnce({ processStream });
+
+    createContentAggregator.mockReturnValueOnce({
+      contentParts: [{ type: 'text', text: '{NTA}' }],
+      aggregateContent: jest.fn(),
+    });
+
+    await executeActivated({
+      req: {
+        user: { id: 'user-1', role: 'USER' },
+        body: { conversationId: 'c1', parentMessageId: 'p1' },
+      },
+      res: null,
+      mainAgent: { provider: 'openai' },
+      messages: [{ role: 'user', content: 'Check quietly.' }],
+      runId: 'run-silent-cortex-completion',
+      activatedCortices: [
+        {
+          agentId: 'agent_plain',
+          cortexName: 'Plain Cortex',
+          confidence: 1,
+          reason: 'background_check',
+        },
+      ],
+      onCortexComplete,
+      onAllComplete,
+    });
+
+    expect(onCortexComplete).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cortex_id: 'agent_plain',
+        cortex_name: 'Name:agent_plain',
+        status: 'complete',
+        insight: '',
+        silent: true,
+        no_response: true,
+      }),
+    );
+    expect(onAllComplete).toHaveBeenCalledWith(
+      expect.objectContaining({
+        insights: [],
+        mergedPrompt: '',
+        cortexCount: 0,
+        hasErrors: false,
+      }),
+    );
+  });
+
+  test('executeActivated retries a configured fallback model after recoverable provider failure', async () => {
+    const primaryProcessStream = jest.fn(async () => '');
+    const fallbackProcessStream = jest.fn(async () => 'fallback-output');
+    const onCortexComplete = jest.fn();
+    const onAllComplete = jest.fn();
+
+    loadAgent.mockResolvedValueOnce({
+      id: 'agent_retry',
+      name: 'Retry Cortex',
+      provider: 'anthropic',
+      model: 'claude-sonnet-4-6',
+      model_parameters: {
+        model: 'claude-sonnet-4-6',
+        thinking: false,
+      },
+      fallback_llm_provider: 'openAI',
+      fallback_llm_model: 'gpt-5.4',
+      fallback_llm_model_parameters: {
+        model: 'gpt-5.4',
+        reasoning_effort: 'high',
+      },
+      tools: [],
+    });
+    initializeAgent
+      .mockResolvedValueOnce({
+        id: 'agent_retry',
+        name: 'Retry Cortex',
+        tools: [],
+        userMCPAuthMap: null,
+        recursion_limit: 11,
+        provider: 'anthropic',
+      })
+      .mockResolvedValueOnce({
+        id: 'agent_retry',
+        name: 'Retry Cortex',
+        tools: [],
+        userMCPAuthMap: null,
+        recursion_limit: 11,
+        provider: 'openAI',
+      });
+    createRun
+      .mockResolvedValueOnce({ processStream: primaryProcessStream })
+      .mockResolvedValueOnce({ processStream: fallbackProcessStream });
+    createContentAggregator
+      .mockReturnValueOnce({
+        contentParts: [{ type: 'error', error: 'Tool call failed with status 529 overloaded' }],
+        aggregateContent: jest.fn(),
+      })
+      .mockReturnValueOnce({
+        contentParts: [{ type: 'text', text: 'fallback-output' }],
+        aggregateContent: jest.fn(),
+      });
+
+    await executeActivated({
+      req: {
+        user: { id: 'user-1', role: 'USER' },
+        body: { conversationId: 'c1', parentMessageId: 'p1' },
+      },
+      res: null,
+      mainAgent: { provider: 'anthropic' },
+      messages: [{ role: 'user', content: 'Review this.' }],
+      runId: 'run-fallback-retry',
+      activatedCortices: [
+        {
+          agentId: 'agent_retry',
+          cortexName: 'Retry Cortex',
+          confidence: 1,
+          reason: 'provider_recovery',
+        },
+      ],
+      onCortexComplete,
+      onAllComplete,
+    });
+
+    expect(createRun).toHaveBeenCalledTimes(2);
+    expect(initializeAgent.mock.calls[1][0].agent).toEqual(
+      expect.objectContaining({
+        provider: 'openAI',
+        model: 'gpt-5.4',
+        model_parameters: {
+          model: 'gpt-5.4',
+          reasoning_effort: 'high',
+        },
+      }),
+    );
+    expect(onCortexComplete).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cortex_id: 'agent_retry',
+        status: 'complete',
+        insight: 'fallback-output',
+      }),
+    );
+    expect(onAllComplete).toHaveBeenCalledWith(
+      expect.objectContaining({
+        errors: undefined,
+        insights: [
+          expect.objectContaining({
+            cortexName: 'Retry Cortex',
+            insight: 'fallback-output',
+          }),
+        ],
+      }),
+    );
+  });
+
   /* === VIVENTIUM NOTE ===
    * Ensure background cortices see the same "Existing memory about the user" context as the main agent.
    */
@@ -1376,6 +1551,78 @@ describe('BackgroundCortexService.executeCortex', () => {
     expect(createRun).toHaveBeenCalledWith(
       expect.objectContaining({
         requestBody: expect.not.objectContaining({ temperature: expect.anything() }),
+      }),
+    );
+  });
+  /* === VIVENTIUM NOTE === */
+
+  test('removes OpenAI reasoning sampling params before and after Phase B initialization', async () => {
+    const processStream = jest.fn(async () => 'run-output');
+    const initializedAgent = {
+      id: 'agent_parietal',
+      name: 'Parietal Cortex',
+      tools: [],
+      userMCPAuthMap: null,
+      recursion_limit: 11,
+      provider: 'openai',
+      model_parameters: {
+        model: 'gpt-5.4',
+        temperature: 1,
+        topP: 0.9,
+        reasoning_effort: 'high',
+      },
+    };
+
+    initializeAgent.mockResolvedValueOnce(initializedAgent);
+    createRun.mockResolvedValueOnce({ processStream });
+
+    createContentAggregator.mockReturnValueOnce({
+      contentParts: [{ type: 'text', text: 'aggregated insight' }],
+      aggregateContent: jest.fn(),
+    });
+
+    await executeCortex({
+      agent: {
+        id: 'agent_parietal',
+        name: 'Parietal Cortex',
+        provider: 'openAI',
+        model: 'gpt-5.4',
+        instructions: 'You are a cortex.',
+        model_parameters: {
+          model: 'gpt-5.4',
+          temperature: 1,
+          topP: 0.9,
+          reasoning_effort: 'high',
+        },
+      },
+      messages: [{ role: 'user', content: 'check the calculation' }],
+      runId: 'run-openai-reasoning-sampling',
+      req: {
+        user: { id: 'user-1', role: 'USER' },
+        body: {
+          conversationId: 'c1',
+          parentMessageId: 'p1',
+          temperature: 1,
+          top_p: 0.9,
+        },
+      },
+    });
+
+    const initArgs = initializeAgent.mock.calls[0][0];
+    expect(initArgs.agent.model_parameters).toEqual({
+      model: 'gpt-5.4',
+      reasoning_effort: 'high',
+    });
+
+    const runArgs = createRun.mock.calls[0][0];
+    expect(runArgs.agents[0].model_parameters).toEqual({
+      model: 'gpt-5.4',
+      reasoning_effort: 'high',
+    });
+    expect(runArgs.requestBody).toEqual(
+      expect.not.objectContaining({
+        temperature: expect.anything(),
+        top_p: expect.anything(),
       }),
     );
   });

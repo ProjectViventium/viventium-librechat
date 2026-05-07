@@ -2,13 +2,16 @@
  * Feature: Tool Cortex Brewing Hold (v0_3 parity)
  *
  * Purpose:
- * - When a tool-focused cortex (ex: `online_tool_use`) activates, we must avoid a premature
- *   main-agent response that guesses from memory ("I can't access..." / hallucinated facts).
+ * - When a tool-focused cortex activates and the main agent has no matching direct-action surface,
+ *   avoid a premature main-agent response that guesses from memory ("I can't access..." /
+ *   hallucinated facts).
  * - In v0_3, Brewing notices functioned as a STOP signal for answering until tool work completed.
  *
  * v0_4 Architecture:
  * - Phase A (detect) is time-boxed (fast).
  * - Phase B (execute) is asynchronous; results arrive via a single follow-up message.
+ * - When the main agent has a connected direct-action surface for the same activation scope, the
+ *   main agent should run first and use its own tools while Phase B remains supplemental.
  *
  * This module provides a deterministic, server-side "holding acknowledgement" so we do NOT rely
  * on the LLM noticing `## Background Processing (Brewing)` in system instructions.
@@ -26,6 +29,7 @@
 const {
   resolveProductivitySpecialistScope,
 } = require('~/server/services/viventium/productivitySpecialistContext');
+const { isNoResponseOnly } = require('~/server/services/viventium/noResponseTag');
 
 function isEnvDisabled(name) {
   const raw = (process.env[name] || '').trim().toLowerCase();
@@ -72,7 +76,39 @@ function collectConfiguredHoldScopeKeys(cortices) {
   return scopeKeys;
 }
 
-function shouldDeferMainResponse({ activatedCortices } = {}) {
+function collectDirectActionScopeKeysFromCortices(cortices) {
+  if (!Array.isArray(cortices) || cortices.length === 0) {
+    return [];
+  }
+
+  const seen = new Set();
+  const scopeKeys = [];
+  const addScope = (value) => {
+    const scopeKey = String(value || '').trim();
+    if (!scopeKey || seen.has(scopeKey)) {
+      return;
+    }
+    seen.add(scopeKey);
+    scopeKeys.push(scopeKey);
+  };
+
+  for (const cortex of cortices) {
+    const scopedSurfaces = Array.isArray(cortex?.directActionSurfaceScopes)
+      ? cortex.directActionSurfaceScopes
+      : [];
+    for (const surface of scopedSurfaces) {
+      if (typeof surface === 'string') {
+        addScope(surface);
+      } else if (surface && typeof surface === 'object') {
+        addScope(surface.scopeKey || surface.scope_key || surface.intent_scope);
+      }
+    }
+  }
+
+  return scopeKeys;
+}
+
+function shouldDeferMainResponse({ activatedCortices, directActionScopeKeys } = {}) {
   if (isEnvDisabled('VIVENTIUM_TOOL_CORTEX_HOLD_ENABLED')) {
     return false;
   }
@@ -81,12 +117,24 @@ function shouldDeferMainResponse({ activatedCortices } = {}) {
     return false;
   }
 
-  const matchedHoldCortex = activatedCortices.some((cortex) => isToolHoldCandidate(cortex));
-
-  if (!matchedHoldCortex) {
+  const holdScopeKeys = collectConfiguredHoldScopeKeys(activatedCortices);
+  if (holdScopeKeys.length === 0) {
     return false;
   }
-  return true;
+
+  const directScopes = new Set(
+    (Array.isArray(directActionScopeKeys) && directActionScopeKeys.length > 0
+      ? directActionScopeKeys
+      : collectDirectActionScopeKeysFromCortices(activatedCortices)
+    )
+      .map((scopeKey) => String(scopeKey || '').trim())
+      .filter(Boolean),
+  );
+
+  const hasMainDirectOwnerForActivatedScope = holdScopeKeys.some((scopeKey) =>
+    directScopes.has(scopeKey),
+  );
+  return !hasMainDirectOwnerForActivatedScope;
 }
 
 function stableStringHash(input) {
@@ -225,11 +273,31 @@ function pickHoldText({ responseMessageId, agentInstructions, scheduleId } = {})
   return texts[idx];
 }
 
+function shouldForcePhaseBFollowUp({
+  shouldDeferMainResponse: deferred = false,
+  parentText = '',
+  hasInsights = false,
+  hasMergedText = false,
+  allowErrorOnlyFollowUp = false,
+} = {}) {
+  if (deferred === true) {
+    return true;
+  }
+
+  if (!isNoResponseOnly(parentText)) {
+    return false;
+  }
+
+  return hasInsights === true || hasMergedText === true || allowErrorOnlyFollowUp === true;
+}
+
 module.exports = {
   collectConfiguredHoldScopeKeys,
+  collectDirectActionScopeKeysFromCortices,
   extractHoldTextsFromInstructions,
   isToolHoldCandidate,
   pickHoldText,
   resolveConfiguredHoldTexts,
+  shouldForcePhaseBFollowUp,
   shouldDeferMainResponse,
 };

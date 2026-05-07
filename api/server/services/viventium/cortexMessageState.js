@@ -4,8 +4,8 @@
  * Purpose:
  * - Keep scheduler, Telegram, and gateway cortex polling aligned on one MongoDB-backed
  *   source of truth for the assistant message, its cortex parts, and any follow-up node.
- * - Surface canonical parent-message text when Phase B replaces the original assistant
- *   node in place instead of creating a separate follow-up message.
+ * - Surface canonical parent-message text while preserving Phase B as a separate
+ *   nonblocking follow-up message.
  *
  * Added: 2026-03-09
  * === VIVENTIUM END === */

@@ -150,6 +150,40 @@ describe('CallSessionService', () => {
     expect(updated.shadowModeEnabled).toBe(true);
   });
 
+  test('syncCallSessionState makes Listen-Only mutually exclusive with Wing Mode', async () => {
+    const user = await User.create({
+      name: 'Call User',
+      email: 'listen-only-state@example.com',
+      provider: 'local',
+    });
+
+    const created = await createCallSession({
+      userId: user._id.toString(),
+      agentId: 'agent_1',
+      conversationId: 'new',
+    });
+
+    const listenOnly = await syncCallSessionState({
+      callSessionId: created.callSessionId,
+      touch: true,
+      listenOnlyModeEnabled: true,
+    });
+
+    expect(listenOnly.listenOnlyModeEnabled).toBe(true);
+    expect(listenOnly.wingModeEnabled).toBe(false);
+    expect(listenOnly.shadowModeEnabled).toBe(false);
+
+    const wingMode = await syncCallSessionState({
+      callSessionId: created.callSessionId,
+      touch: true,
+      wingModeEnabled: true,
+    });
+
+    expect(wingMode.listenOnlyModeEnabled).toBe(false);
+    expect(wingMode.wingModeEnabled).toBe(true);
+    expect(wingMode.shadowModeEnabled).toBe(true);
+  });
+
   test('claimVoiceSession enforces single active job', async () => {
     const user = await User.create({
       name: 'Call User',

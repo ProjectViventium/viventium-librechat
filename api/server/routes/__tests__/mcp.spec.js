@@ -80,6 +80,7 @@ jest.mock('~/models', () => ({
   findToken: jest.fn(),
   updateToken: jest.fn(),
   createToken: jest.fn(),
+  deleteToken: jest.fn(),
   deleteTokens: jest.fn(),
   findPluginAuthsByKeys: jest.fn(),
   getRoleByName: jest.fn(),

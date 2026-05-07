@@ -8,6 +8,26 @@ const paths = require('~/config/paths');
 
 const BASE_CONFIG_KEY = '_BASE_';
 
+/* === VIVENTIUM START ===
+ * Feature: Preserve Viventium extension config after AppService normalization.
+ *
+ * AppService intentionally returns an app-runtime shape and nests the raw YAML
+ * under `config`. Viventium runtime features read `req.config.viventium`, so
+ * keep that public extension block at the top level after normalization.
+ * === VIVENTIUM END === */
+function attachViventiumExtensions(appConfig, config) {
+  if (!appConfig || typeof appConfig !== 'object') {
+    return appConfig;
+  }
+  if (!config?.viventium || typeof config.viventium !== 'object') {
+    return appConfig;
+  }
+  return {
+    ...appConfig,
+    viventium: config.viventium,
+  };
+}
+
 const loadBaseConfig = async () => {
   /** @type {TCustomConfig} */
   const config = (await loadCustomConfig()) ?? {};
@@ -17,7 +37,8 @@ const loadBaseConfig = async () => {
     adminIncluded: config.includedTools,
     directory: paths.structuredTools,
   });
-  return AppService({ config, paths, systemTools });
+  const appConfig = await AppService({ config, paths, systemTools });
+  return attachViventiumExtensions(appConfig, config);
 };
 
 /**
@@ -81,4 +102,5 @@ async function clearAppConfigCache() {
 module.exports = {
   getAppConfig,
   clearAppConfigCache,
+  attachViventiumExtensions,
 };

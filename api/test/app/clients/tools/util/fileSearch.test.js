@@ -33,6 +33,10 @@ jest.mock('~/db/models', () => ({
 jest.mock('~/server/services/viventium/conversationRecallService', () => ({
   getMessageText: jest.fn((message) => message?.text || ''),
   shouldSkipFromRecallCorpus: jest.fn(({ messageText, hasRecallDerivedChild = false, message }) => {
+    const metadata = message?.metadata?.viventium;
+    if (metadata?.type === 'listen_only_transcript' && metadata?.mode === 'listen_only') {
+      return true;
+    }
     const hasRecallAttachment =
       Array.isArray(message?.attachments) &&
       message.attachments.some(
@@ -75,19 +79,28 @@ describe('fileSearch.js - tuple return validation', () => {
     process.env.RAG_API_URL = 'http://localhost:8000';
     delete process.env.VIVENTIUM_FILE_SEARCH_QUERY_TIMEOUT_MS;
     delete process.env.VIVENTIUM_FILE_SEARCH_QUERY_TIMEOUT_MS_CONVERSATION_RECALL;
+    delete process.env.VIVENTIUM_FILE_SEARCH_QUERY_TIMEOUT_MS_MEETING_TRANSCRIPT;
     delete process.env.VIVENTIUM_FILE_SEARCH_TOP_K;
     delete process.env.VIVENTIUM_FILE_SEARCH_TOP_K_CONVERSATION_RECALL;
+    delete process.env.VIVENTIUM_FILE_SEARCH_TOP_K_MEETING_TRANSCRIPT;
     delete process.env.VIVENTIUM_FILE_SEARCH_MAX_RESULTS;
     delete process.env.VIVENTIUM_FILE_SEARCH_MAX_RESULTS_CONVERSATION_RECALL;
+    delete process.env.VIVENTIUM_FILE_SEARCH_MAX_RESULTS_MEETING_TRANSCRIPT;
     delete process.env.VIVENTIUM_FILE_SEARCH_RESULT_MAX_CHARS;
     delete process.env.VIVENTIUM_FILE_SEARCH_RESULT_MAX_CHARS_CONVERSATION_RECALL;
+    delete process.env.VIVENTIUM_FILE_SEARCH_RESULT_MAX_CHARS_MEETING_TRANSCRIPT;
     delete process.env.VIVENTIUM_FILE_SEARCH_OUTPUT_MAX_CHARS;
     delete process.env.VIVENTIUM_FILE_SEARCH_OUTPUT_MAX_CHARS_CONVERSATION_RECALL;
+    delete process.env.VIVENTIUM_FILE_SEARCH_OUTPUT_MAX_CHARS_MEETING_TRANSCRIPT;
     delete process.env.VIVENTIUM_FILE_SEARCH_LITERAL_FALLBACK_MAX_MATCHES;
     mockMessageFind.mockReturnValue(queryResult([]));
     mockConversationFind.mockReturnValue(queryResult([]));
     shouldSkipFromRecallCorpus.mockImplementation(
       ({ messageText, hasRecallDerivedChild = false, message }) => {
+        const metadata = message?.metadata?.viventium;
+        if (metadata?.type === 'listen_only_transcript' && metadata?.mode === 'listen_only') {
+          return true;
+        }
         const hasRecallAttachment =
           Array.isArray(message?.attachments) &&
           message.attachments.some(
@@ -395,6 +408,41 @@ describe('fileSearch.js - tuple return validation', () => {
       );
     });
 
+    it('uses meeting-transcript timeout override for meeting transcript files', async () => {
+      process.env.VIVENTIUM_FILE_SEARCH_QUERY_TIMEOUT_MS = '4321';
+      process.env.VIVENTIUM_FILE_SEARCH_QUERY_TIMEOUT_MS_MEETING_TRANSCRIPT = '30001';
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      axios.post.mockResolvedValue({
+        data: [
+          [
+            {
+              page_content: 'Meeting transcript content',
+              metadata: { source: '/path/to/meeting-transcript.txt', page: 1 },
+            },
+            0.1,
+          ],
+        ],
+      });
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        files: [
+          {
+            file_id: 'meeting_transcript:user_1:abc',
+            filename: 'meeting-transcript-abc.txt',
+          },
+        ],
+      });
+
+      await fileSearchTool.func({ query: 'Project Lantern checklist' });
+
+      expect(axios.post).toHaveBeenCalledWith(
+        'http://localhost:8000/query',
+        expect.any(Object),
+        expect.objectContaining({ timeout: 30001 }),
+      );
+    });
+
     it('should use conversation-recall top-k override for conversation recall files', async () => {
       process.env.VIVENTIUM_FILE_SEARCH_TOP_K = '5';
       process.env.VIVENTIUM_FILE_SEARCH_TOP_K_CONVERSATION_RECALL = '9';
@@ -423,6 +471,246 @@ describe('fileSearch.js - tuple return validation', () => {
         expect.objectContaining({ k: 9 }),
         expect.any(Object),
       );
+    });
+
+    it('uses meeting-transcript top-k override for meeting summary files', async () => {
+      process.env.VIVENTIUM_FILE_SEARCH_TOP_K = '5';
+      process.env.VIVENTIUM_FILE_SEARCH_TOP_K_MEETING_TRANSCRIPT = '11';
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      axios.post.mockResolvedValue({
+        data: [
+          [
+            {
+              page_content: 'Meeting summary content',
+              metadata: { source: '/path/to/meeting-summary.txt', page: 1 },
+            },
+            0.1,
+          ],
+        ],
+      });
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        files: [{ file_id: 'meeting_summary:user_1:abc', filename: 'meeting-summary-abc.txt' }],
+      });
+
+      await fileSearchTool.func({ query: 'Project Lantern checklist' });
+
+      expect(axios.post).toHaveBeenCalledWith(
+        'http://localhost:8000/query',
+        expect.objectContaining({ k: 11 }),
+        expect.any(Object),
+      );
+    });
+
+    it('adds meeting transcript provenance headers to model output and source artifacts', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      axios.post.mockResolvedValue({
+        data: [
+          [
+            {
+              page_content:
+                '10:02 Sam: Project Lantern keeps the Tuesday launch checklist. 10:08 Lee: The older Monday plan is stale.',
+              metadata: { source: '/path/to/meeting-summary.txt', page: 1 },
+            },
+            0.08,
+          ],
+        ],
+      });
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        files: [
+          {
+            file_id: 'meeting_summary:user_1:abc',
+            filename: 'meeting-transcript-summary-abc.txt',
+            metadata: {
+              meetingTranscriptArtifactId: 'meeting_transcript:abc',
+              meetingTranscriptKind: 'summary',
+              meetingTranscriptOriginalFilename: '2026-05-05-lantern.vtt',
+              meetingTranscriptFileMtime: '2026-05-05T18:30:00.000Z',
+              meetingTranscriptSourceStatus: 'new_or_changed',
+              meetingTranscriptCalendarMatch: {
+                title: 'Project Lantern review',
+                start: '2026-05-05T18:00:00.000Z',
+              },
+            },
+          },
+        ],
+      });
+
+      const [formattedString, artifact] = await fileSearchTool.func({
+        query: 'Project Lantern launch checklist',
+      });
+
+      expect(formattedString).toContain('Transcript artifact ID: meeting_transcript:abc');
+      expect(formattedString).toContain('Transcript artifact kind: summary');
+      expect(formattedString).toContain('Original filename: 2026-05-05-lantern.vtt');
+      expect(formattedString).toContain('File mtime: 2026-05-05T18:30:00.000Z');
+      expect(formattedString).toContain('Source status: new_or_changed');
+      expect(formattedString).toContain('"Project Lantern review"');
+      expect(formattedString).toContain('10:02 Sam:');
+      expect(artifact.file_search.sources[0].content).toContain(
+        'Transcript artifact ID: meeting_transcript:abc',
+      );
+      expect(artifact.file_search.sources[0].content).toContain('10:08 Lee:');
+    });
+
+    it('reranks current meeting transcript evidence above stale assistant recall disclaimers', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      axios.post.mockImplementation((url, body) => {
+        if (body.file_id === 'conversation_recall:user_1:all') {
+          return Promise.resolve({
+            data: [
+              [
+                {
+                  page_content:
+                    '<turn role="assistant">I do not have access to those meeting details yet.</turn>',
+                  metadata: { source: '/path/to/conversation-recall-all.txt', page: 1 },
+                },
+                0.02,
+              ],
+            ],
+          });
+        }
+        if (body.file_id === 'meeting_summary:user_1:qa') {
+          return Promise.resolve({
+            data: [
+              [
+                {
+                  page_content:
+                    '10:00 Speaker Alpha and the user discussed SF customer discovery, onboarding risk, and follow-up product notes.',
+                  metadata: { source: '/path/to/meeting-transcript-summary-qa.txt', page: 1 },
+                },
+                0.3,
+              ],
+            ],
+          });
+        }
+        return Promise.resolve({ data: [] });
+      });
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        files: [
+          {
+            file_id: 'conversation_recall:user_1:all',
+            filename: 'conversation-recall-all.txt',
+          },
+          {
+            file_id: 'meeting_summary:user_1:qa',
+            filename: 'meeting-transcript-summary-qa.txt',
+            metadata: {
+              meetingTranscriptArtifactId: 'meeting_transcript:qa',
+              meetingTranscriptKind: 'summary',
+              meetingTranscriptOriginalFilename: '2026-05-05-qa-meeting.vtt',
+              meetingTranscriptFileMtime: '2026-05-05T19:30:00.000Z',
+              meetingTranscriptSourceStatus: 'new_or_changed',
+            },
+          },
+        ],
+      });
+
+      const [formattedString, artifact] = await fileSearchTool.func({
+        query: 'what did Speaker Alpha and I discuss?',
+      });
+
+      expect(formattedString.indexOf('meeting-transcript-summary-qa.txt')).toBeLessThan(
+        formattedString.indexOf('conversation-recall-all.txt'),
+      );
+      expect(artifact.file_search.sources[0].fileId).toBe('meeting_summary:user_1:qa');
+      expect(artifact.file_search.sources[0].content).toContain(
+        'Speaker Alpha and the user discussed SF customer discovery',
+      );
+    });
+
+    it('uses per-source result budgets when meeting transcript and conversation recall both hit', async () => {
+      process.env.VIVENTIUM_FILE_SEARCH_RESULT_MAX_CHARS_CONVERSATION_RECALL = '80';
+      process.env.VIVENTIUM_FILE_SEARCH_RESULT_MAX_CHARS_MEETING_TRANSCRIPT = '1200';
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      const longTranscriptSummary =
+        '10:00 Speaker Alpha described the customer-discovery context. ' +
+        '10:05 Speaker Beta mapped onboarding risks. '.repeat(20) +
+        '10:45 Speaker Alpha confirmed the follow-up product-note owner and timing.';
+
+      axios.post.mockImplementation((url, body) => {
+        if (body.file_id === 'conversation_recall:user_1:all') {
+          return Promise.resolve({
+            data: [
+              [
+                {
+                  page_content:
+                    '<turn role="assistant">I do not have access to those meeting details yet.</turn>',
+                  metadata: { source: '/path/to/conversation-recall-all.txt', page: 1 },
+                },
+                0.02,
+              ],
+            ],
+          });
+        }
+        return Promise.resolve({
+          data: [
+            [
+              {
+                page_content: longTranscriptSummary,
+                metadata: { source: '/path/to/meeting-transcript-summary-budget.txt', page: 1 },
+              },
+              0.25,
+            ],
+          ],
+        });
+      });
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        files: [
+          {
+            file_id: 'conversation_recall:user_1:all',
+            filename: 'conversation-recall-all.txt',
+          },
+          {
+            file_id: 'meeting_summary:user_1:budget',
+            filename: 'meeting-transcript-summary-budget.txt',
+            metadata: {
+              meetingTranscriptArtifactId: 'meeting_transcript:budget',
+              meetingTranscriptKind: 'summary',
+              meetingTranscriptOriginalFilename: '2026-05-05-budget.vtt',
+              meetingTranscriptFileMtime: '2026-05-05T19:30:00.000Z',
+              meetingTranscriptSourceStatus: 'new_or_changed',
+            },
+          },
+        ],
+      });
+
+      const [, artifact] = await fileSearchTool.func({
+        query: 'Speaker Alpha customer discovery onboarding risks follow-up product-note',
+      });
+
+      expect(artifact.file_search.sources[0].content).toContain(
+        '10:45 Speaker Alpha confirmed the follow-up product-note owner and timing',
+      );
+    });
+
+    it('reports meeting transcript misses as transcript misses, not conversation-history misses', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      axios.post.mockResolvedValue({ data: [] });
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        files: [
+          {
+            file_id: 'meeting_summary:user_1:abc',
+            filename: 'meeting-transcript-summary-abc.txt',
+          },
+        ],
+      });
+
+      const [formattedString, artifact] = await fileSearchTool.func({
+        query: 'missing transcript topic',
+      });
+
+      expect(formattedString).toBe('No matching content found in meeting transcripts for this query.');
+      expect(artifact).toBeUndefined();
     });
 
     it('uses the widened bounded top-k for conversation recall by default', async () => {
@@ -660,6 +948,66 @@ describe('fileSearch.js - tuple return validation', () => {
       expect(artifact.file_search.sources[0].fileId).toBe('conversation_recall:user_1:all');
       expect(artifact.file_search.sources[0].content).toContain(
         'Project Atlas decision: ship the slimmer onboarding flow first.',
+      );
+    });
+
+    it('source-only recall excludes Listen-Only ambient transcript rows', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      const sourceQuery = queryResult([
+        {
+          messageId: 'normal_user_turn',
+          conversationId: 'source_convo',
+          createdAt: '2026-04-09T18:12:00.000Z',
+          isCreatedByUser: true,
+          text: 'Project Atlas decision: the onboarding flow uses the onyx marker.',
+          metadata: {},
+        },
+        {
+          messageId: 'ambient_listen_only_turn',
+          conversationId: 'source_convo',
+          createdAt: '2026-04-09T18:13:00.000Z',
+          isCreatedByUser: false,
+          text: 'Listen-only ambient onyx marker that should not reach live recall.',
+          metadata: {
+            viventium: {
+              type: 'listen_only_transcript',
+              mode: 'listen_only',
+            },
+          },
+        },
+      ]);
+
+      mockMessageFind.mockImplementation((filter) => {
+        if (filter?.parentMessageId) {
+          return queryResult([]);
+        }
+        expect(filter).toMatchObject({
+          'metadata.viventium.type': { $ne: 'listen_only_transcript' },
+          'metadata.viventium.mode': { $ne: 'listen_only' },
+        });
+        return sourceQuery;
+      });
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        conversationId: 'current-convo',
+        files: [
+          {
+            file_id: 'conversation_recall:user_1:all',
+            filename: 'conversation-recall-all.txt',
+            viventiumConversationRecallMode: 'source_only',
+          },
+        ],
+      });
+
+      const [, artifact] = await fileSearchTool.func({ query: 'Project Atlas onyx marker' });
+
+      expect(sourceQuery.select).toHaveBeenCalledWith(expect.stringContaining('metadata'));
+      expect(artifact.file_search.sources[0].content).toContain(
+        'Project Atlas decision: the onboarding flow uses the onyx marker.',
+      );
+      expect(artifact.file_search.sources.map((source) => source.content).join('\n')).not.toContain(
+        'Listen-only ambient onyx marker',
       );
     });
 

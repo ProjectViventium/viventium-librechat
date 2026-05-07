@@ -1,5 +1,6 @@
 const express = require('express');
 const request = require('supertest');
+const jwt = require('jsonwebtoken');
 const { EModelEndpoint } = require('librechat-data-provider');
 
 jest.mock('~/models', () => ({
@@ -51,6 +52,7 @@ describe('Connected Accounts Routes', () => {
     delete process.env.VIVENTIUM_LOCAL_SUBSCRIPTION_AUTH;
     delete process.env.VIVENTIUM_ANTHROPIC_OAUTH_REDIRECT_URI;
     delete process.env.VIVENTIUM_OPENAI_LOCAL_CALLBACK_MANUAL_ONLY;
+    delete process.env.VIVENTIUM_CONNECTED_ACCOUNTS_RETURN_ORIGIN;
   });
 
   it('should return an OAuth authorization URL for OpenAI with local callback flow mode', async () => {
@@ -80,6 +82,19 @@ describe('Connected Accounts Routes', () => {
     expect(response.body.flowMode).toBe('manual_code');
     expect(typeof state).toBe('string');
     expect(state).not.toContain('.');
+  });
+
+  it('should use the configured connected-account return origin without changing DOMAIN_SERVER', async () => {
+    process.env.VIVENTIUM_CONNECTED_ACCOUNTS_RETURN_ORIGIN = 'http://localhost:3190/';
+
+    const response = await request(app).get('/api/connected-accounts/openai/start');
+    const authUrl = new URL(response.body.authUrl);
+    const state = authUrl.searchParams.get('state');
+    const decoded = jwt.decode(state);
+
+    expect(response.status).toBe(200);
+    expect(decoded.serverOrigin).toBe('http://localhost:3190');
+    expect(process.env.DOMAIN_SERVER).toBe('https://chat.viventium.ai');
   });
 
   it('should exchange callback code and store OpenAI credentials', async () => {

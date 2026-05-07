@@ -32,6 +32,9 @@ const { checkMigrations } = require('./services/start/migration');
 const initializeMCPs = require('./services/initializeMCPs');
 const configureSocialLogins = require('./socialLogins');
 const { getAppConfig } = require('./services/Config');
+const {
+  recoverStaleCortexMessages,
+} = require('./services/viventium/staleCortexMessageRecovery');
 const staticCache = require('./utils/staticCache');
 const noIndex = require('./middleware/noIndex');
 const { seedDatabase } = require('~/models');
@@ -243,6 +246,9 @@ const startServer = async () => {
     await initializeMCPs();
     await initializeOAuthReconnectManager();
     await checkMigrations();
+    recoverStaleCortexMessages().catch((error) => {
+      logger.error('[staleCortexMessageRecovery] Startup recovery failed:', error);
+    });
 
     // Configure stream services (auto-detects Redis from USE_REDIS env var)
     const streamServices = createStreamServices();

@@ -27,6 +27,7 @@ const {
   Constants,
   EModelEndpoint,
   Tools,
+  ContentTypes,
   PermissionTypes,
   Permissions,
   supportsAdaptiveThinking,
@@ -61,6 +62,17 @@ const {
   resolveProductivitySpecialistScope,
   shouldIsolateProductivitySpecialistContext,
 } = require('~/server/services/viventium/productivitySpecialistContext');
+const {
+  resolveFallbackAssignment,
+  isFallbackModelValid,
+  buildFallbackAgent,
+  isSameAgentRoute,
+  shouldRetryBackgroundCortexWithFallback,
+  isNonRetryableFallbackErrorClass,
+} = require('~/server/services/viventium/agentLlmFallback');
+const {
+  sanitizeOpenAIReasoningSamplingParams,
+} = require('~/server/services/viventium/openAIReasoningParams');
 
 /* === VIVENTIUM NOTE ===
  * Feature: No Response Tag ({NTA}) prompt injection + suppression for background cortices.
@@ -93,6 +105,108 @@ function getCortexExecutionTimeoutMs() {
   const raw = String(process.env.VIVENTIUM_CORTEX_EXECUTION_TIMEOUT_MS || '').trim();
   const parsed = parseInt(raw, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 180_000;
+}
+
+function getCortexExecutionGuardGraceMs() {
+  const raw = String(process.env.VIVENTIUM_CORTEX_EXECUTION_GUARD_GRACE_MS || '').trim();
+  const parsed = parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return 15_000;
+  }
+  return Math.min(parsed, 60_000);
+}
+
+function getCortexAttemptGuardTimeoutMs(executionTimeoutMs = getCortexExecutionTimeoutMs()) {
+  if (!Number.isFinite(executionTimeoutMs) || executionTimeoutMs <= 0) {
+    return 0;
+  }
+  return executionTimeoutMs + getCortexExecutionGuardGraceMs();
+}
+
+function loadModelsConfigForCortexFallback(req) {
+  const { getModelsConfig } = require('~/server/controllers/ModelController');
+  return getModelsConfig(req);
+}
+
+function extractAggregatedProviderErrorText(contentParts) {
+  if (!Array.isArray(contentParts)) {
+    return '';
+  }
+  for (const part of contentParts) {
+    if (!part || typeof part !== 'object') {
+      continue;
+    }
+    const text =
+      part[ContentTypes.ERROR] ||
+      part.error ||
+      part.text ||
+      '';
+    if (typeof text === 'string' && text.trim()) {
+      return text.trim();
+    }
+  }
+  return '';
+}
+
+function contentPartFallbackErrorClass(part) {
+  if (!part || typeof part !== 'object') {
+    return '';
+  }
+  return part.errorClass || part.error_class || part.errorCode || part.error_code || part.code || '';
+}
+
+function shouldRetryBackgroundCortexContentPartsWithFallback(contentParts) {
+  if (!Array.isArray(contentParts) || contentParts.length === 0) {
+    return false;
+  }
+  const hasNonRetryableErrorClass = contentParts.some((part) =>
+    isNonRetryableFallbackErrorClass(contentPartFallbackErrorClass(part)),
+  );
+  if (hasNonRetryableErrorClass) {
+    return false;
+  }
+  const providerErrorText = extractAggregatedProviderErrorText(contentParts);
+  if (!providerErrorText) {
+    return false;
+  }
+  return shouldRetryBackgroundCortexWithFallback({
+    insight: null,
+    error: providerErrorText,
+  });
+}
+
+async function resolveBackgroundCortexFallbackAgent({ cortexAgent, req, modelsConfig }) {
+  const fallbackAssignment = resolveFallbackAssignment(cortexAgent);
+  if (!fallbackAssignment) {
+    return null;
+  }
+
+  if (isSameAgentRoute(cortexAgent, fallbackAssignment)) {
+    logger.warn(
+      `[BackgroundCortexService] Skipping fallback for ${cortexAgent.id} because it matches primary route ` +
+        `${fallbackAssignment.provider}/${fallbackAssignment.model}`,
+    );
+    return null;
+  }
+
+  let resolvedModelsConfig = modelsConfig || null;
+  if (!resolvedModelsConfig && req) {
+    try {
+      resolvedModelsConfig = await loadModelsConfigForCortexFallback(req);
+    } catch (error) {
+      logger.warn('[BackgroundCortexService] Failed to load models config for cortex fallback:', error);
+      resolvedModelsConfig = null;
+    }
+  }
+  if (!isFallbackModelValid(fallbackAssignment.model, fallbackAssignment.provider, req, resolvedModelsConfig)) {
+    logger.warn(
+      `[BackgroundCortexService] Invalid fallback model for ${cortexAgent.id}: ` +
+        `${fallbackAssignment.provider}/${fallbackAssignment.model}`,
+    );
+    return null;
+  }
+
+  return buildFallbackAgent(cortexAgent, fallbackAssignment);
 }
 /* === VIVENTIUM NOTE === */
 
@@ -264,17 +378,14 @@ const ACTIVATION_SYSTEM_PROMPT = `You are an activation classifier for a multi-a
 
 Your task is to decide if a specialized background agent (cortex) should activate based on conversation context.
 
-Follow the response format requested in the user prompt. Keep it concise and deterministic.`;
+Return only one valid JSON object. Do not include markdown, prose, headings, reasoning, comments, or activation tags outside the JSON object.`;
 
 const DEFAULT_ACTIVATION_RESPONSE_FORMAT = `Respond with a JSON object:
 {
   "should_activate": true,
   "confidence": 1.0,
   "reason": "2-4 explanatory words"
-}
-
-When activated start your response with the following exact tag:
-<!--viv_internal:brew_begin-->`;
+}`;
 
 const ACTIVATION_LOG_CHAR_LIMIT = 2000;
 
@@ -573,15 +684,9 @@ function filterCortexContentFromLangChainMessages(messages) {
 function getActivationFormat(config) {
   const activationFormat = config?.viventium?.background_cortices?.activation_format;
   const responseFormat = activationFormat?.response_format?.trim();
-  const brewBeginTag = activationFormat?.brew_begin_tag?.trim();
   const suffixParts = [];
   if (responseFormat) {
     suffixParts.push(responseFormat);
-  }
-  if (brewBeginTag) {
-    suffixParts.push(
-      `When activated start your response with the following exact tag:\n${brewBeginTag}`,
-    );
   }
   if (suffixParts.length > 0) {
     return suffixParts.join('\n\n');
@@ -602,6 +707,103 @@ function normalizeAgentToolNames(mainAgent) {
       return '';
     })
     .filter(Boolean);
+}
+
+function normalizeDirectActionScopeKey(scopeKey) {
+  const raw = String(scopeKey || '').trim();
+  if (!raw) {
+    return '';
+  }
+  return raw.replace(/\s+/g, '_').toLowerCase();
+}
+
+function applyActivationJsonMode({ providerName, llmConfig }) {
+  if (!llmConfig || typeof llmConfig !== 'object') {
+    return llmConfig;
+  }
+  const normalizedProvider = String(providerName || '').trim().toLowerCase();
+  if (normalizedProvider === 'anthropic' || normalizedProvider === 'perplexity') {
+    return llmConfig;
+  }
+  if (llmConfig.provider !== Providers.OPENAI) {
+    return llmConfig;
+  }
+
+  return {
+    ...llmConfig,
+    modelKwargs: {
+      ...(llmConfig.modelKwargs || {}),
+      response_format: { type: 'json_object' },
+    },
+  };
+}
+
+function normalizeDirectActionSurfaceScopes(surfaces) {
+  if (!Array.isArray(surfaces) || surfaces.length === 0) {
+    return [];
+  }
+
+  const seen = new Set();
+  const normalized = [];
+  for (const surface of surfaces) {
+    if (!surface) {
+      continue;
+    }
+
+    if (typeof surface === 'string') {
+      const scopeKey = normalizeDirectActionScopeKey(surface);
+      if (!scopeKey || seen.has(scopeKey)) {
+        continue;
+      }
+      seen.add(scopeKey);
+      normalized.push({ scopeKey });
+      continue;
+    }
+
+    if (typeof surface !== 'object') {
+      continue;
+    }
+
+    const scopeKey = normalizeDirectActionScopeKey(
+      surface.scopeKey || surface.scope_key || surface.intent_scope || surface.activation_scope,
+    );
+    if (!scopeKey || seen.has(scopeKey)) {
+      continue;
+    }
+    seen.add(scopeKey);
+    normalized.push({
+      server: String(surface.server || surface.name || '').trim(),
+      scopeKey,
+      owns: String(surface.owns || surface.description || '').trim(),
+      sameScopeBackgroundAllowed: surface.sameScopeBackgroundAllowed === true,
+    });
+  }
+
+  return normalized;
+}
+
+function applyDirectActionOwnershipGate(result) {
+  if (!result || result.shouldActivate !== true) {
+    return result;
+  }
+
+  const activationScopeKey = normalizeDirectActionScopeKey(result.activationScope);
+  if (!activationScopeKey) {
+    return result;
+  }
+
+  const matchingSurface = normalizeDirectActionSurfaceScopes(result.directActionSurfaceScopes)
+    .find((surface) => surface.scopeKey === activationScopeKey);
+  if (!matchingSurface || matchingSurface.sameScopeBackgroundAllowed === true) {
+    return result;
+  }
+
+  return {
+    ...result,
+    shouldActivate: false,
+    reason: 'direct_action_owned_by_main_agent',
+    suppressedByDirectActionOwnership: true,
+  };
 }
 
 function buildActivationPolicySection({ config, mainAgent }) {
@@ -632,6 +834,13 @@ function buildActivationPolicySection({ config, mainAgent }) {
     connectedSurfaces.push({
       server: String(surface.server || surface.name || '').trim(),
       owns: String(surface.owns || surface.description || '').trim(),
+      scopeKey: normalizeDirectActionScopeKey(
+        surface.scope_key || surface.scopeKey || surface.intent_scope || surface.activation_scope,
+      ),
+      sameScopeBackgroundAllowed:
+        surface.same_scope_background_allowed === true ||
+        surface.allow_same_scope_background === true ||
+        surface.supplemental_background === true,
       connectedToolNames,
     });
   }
@@ -646,8 +855,18 @@ function buildActivationPolicySection({ config, mainAgent }) {
     for (const surface of connectedSurfaces.slice(0, 8)) {
       const label = surface.server || 'declared direct-action surface';
       const owns = surface.owns ? ` — owns: ${surface.owns.slice(0, 180)}` : '';
-      lines.push(`- ${label}${owns}`);
+      const scope = surface.scopeKey ? ` — scope_key: ${surface.scopeKey}` : '';
+      const supplemental = surface.sameScopeBackgroundAllowed
+        ? ' — same_scope_background_allowed: true'
+        : '';
+      lines.push(`- ${label}${scope}${supplemental}${owns}`);
     }
+  }
+  if (connectedSurfaces.some((surface) => surface.sameScopeBackgroundAllowed)) {
+    lines.push(
+      '',
+      'When a connected direct-action surface is marked same_scope_background_allowed=true, treat it as main-agent ownership for Phase A, not as a blocker for a background agent whose own configured activation scope exactly matches that surface. Same-scope background agents may still activate when their own criteria are clearly met so Phase B can provide supplemental evidence.',
+    );
   }
   if (directActionRule) {
     lines.push('', directActionRule);
@@ -659,6 +878,67 @@ function buildActivationPolicySection({ config, mainAgent }) {
     section: `${lines.join('\n')}\n\n`,
     connectedSurfaces,
   };
+}
+
+function getNormalizedAgentToolCount(agent) {
+  return normalizeAgentToolNames(agent).length;
+}
+
+async function resolveActivationPolicyMainAgent({
+  req,
+  mainAgent,
+  timeoutMs = 250,
+  loadAgentFn = loadAgent,
+} = {}) {
+  if (!mainAgent || typeof mainAgent !== 'object') {
+    return mainAgent;
+  }
+
+  const agentId = mainAgent.id || mainAgent.agent_id;
+  const baseToolCount = getNormalizedAgentToolCount(mainAgent);
+  if (!req || !agentId || typeof loadAgentFn !== 'function') {
+    return mainAgent;
+  }
+
+  const deadlineMs = Number(timeoutMs);
+  if (!Number.isFinite(deadlineMs) || deadlineMs <= 0) {
+    return mainAgent;
+  }
+
+  const timeout = new Promise((resolve) => {
+    setTimeout(() => resolve(null), deadlineMs);
+  });
+
+  try {
+    const canonical = await Promise.race([
+      loadAgentFn({
+        req,
+        agent_id: agentId,
+        endpoint: mainAgent.provider || mainAgent.endpoint,
+      }),
+      timeout,
+    ]);
+    const canonicalToolCount = getNormalizedAgentToolCount(canonical);
+    if (!canonical || canonicalToolCount <= baseToolCount) {
+      return mainAgent;
+    }
+
+    logger.info(
+      `[BackgroundCortexService] Activation policy hydrated main-agent tools: ` +
+        `agent=${agentId} request_tools=${baseToolCount} canonical_tools=${canonicalToolCount}`,
+    );
+    return {
+      ...mainAgent,
+      tools: canonical.tools,
+      tool_resources: mainAgent.tool_resources || canonical.tool_resources,
+    };
+  } catch (error) {
+    logger.warn(
+      `[BackgroundCortexService] Activation policy main-agent hydration failed for ${agentId}: ` +
+        `${error?.message || String(error)}`,
+    );
+    return mainAgent;
+  }
 }
 
 /**
@@ -797,6 +1077,83 @@ function hasVisibleCortexInsight(insight) {
   return Boolean(trimmed) && !isNoResponseOnly(trimmed);
 }
 
+function buildCortexCompletionPayload(result) {
+  if (!result) {
+    return null;
+  }
+
+  const hasVisibleInsight = hasVisibleCortexInsight(result.insight);
+  const basePayload = {
+    cortex_id: result.agentId,
+    cortex_name: sanitizeCortexDisplayName(result.agentName || result.agentId),
+    activation_scope: result.activationScope || null,
+    configured_tools: result.configuredTools || 0,
+    completed_tool_calls: result.completedToolCalls || 0,
+  };
+  const confidence = Number(result.confidence);
+  if (Number.isFinite(confidence)) {
+    basePayload.confidence = confidence;
+  }
+  const reason = String(result.reason || '').trim();
+  if (reason) {
+    basePayload.reason = reason;
+  }
+  const cortexDescription = String(result.cortexDescription || result.cortex_description || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (cortexDescription) {
+    basePayload.cortex_description = cortexDescription.slice(0, 220);
+  }
+  if (Array.isArray(result.directActionSurfaces)) {
+    basePayload.direct_action_surfaces = result.directActionSurfaces;
+  }
+  const directActionSurfaceScopes = normalizeDirectActionSurfaceScopes(result.directActionSurfaceScopes);
+  if (directActionSurfaceScopes.length > 0) {
+    basePayload.direct_action_surface_scopes = directActionSurfaceScopes;
+  }
+
+  if (result.error) {
+    return {
+      ...basePayload,
+      status: 'error',
+      error: result.error,
+    };
+  }
+
+  return {
+    ...basePayload,
+    status: 'complete',
+    insight: hasVisibleInsight ? result.insight : '',
+    silent: !hasVisibleInsight,
+    no_response: !hasVisibleInsight,
+  };
+}
+
+function buildCompletionInputFromActivation({ activationResult, cortexAgent = null, result = null, error = null }) {
+  return {
+    agentId: result?.agentId || activationResult.agentId,
+    agentName:
+      result?.agentName ||
+      cortexAgent?.name ||
+      activationResult.cortexName ||
+      activationResult.agentId,
+    insight: result?.insight ?? null,
+    error: error || result?.error || null,
+    activationScope: result?.activationScope || activationResult.activationScope || null,
+    configuredTools: result?.configuredTools || 0,
+    completedToolCalls: result?.completedToolCalls || 0,
+    confidence: activationResult.confidence,
+    reason: activationResult.reason,
+    cortexDescription: activationResult.cortexDescription,
+    directActionSurfaces: Array.isArray(activationResult.directActionSurfaces)
+      ? activationResult.directActionSurfaces
+      : [],
+    directActionSurfaceScopes: normalizeDirectActionSurfaceScopes(
+      activationResult.directActionSurfaceScopes,
+    ),
+  };
+}
+
 const RETRYABLE_ACTIVATION_STATUS_CODES = new Set([401, 402, 403, 429, 500, 502, 503, 504]);
 const RETRYABLE_ACTIVATION_ERROR_CODES = new Set([
   'ECONNABORTED',
@@ -850,11 +1207,56 @@ function extractActivationErrorStatus(error) {
 }
 
 function summarizeActivationError(error) {
+  const status = extractActivationErrorStatus(error) || null;
+  const code = String(error?.code || '').toUpperCase() || null;
+  const message = String(error?.message || 'activation classifier error');
   return {
-    status: extractActivationErrorStatus(error) || null,
-    code: String(error?.code || '').toUpperCase() || null,
-    message: String(error?.message || 'activation classifier error'),
+    status,
+    code,
+    message,
+    class: classifyActivationError({ status, code, message }),
   };
+}
+
+function classifyActivationError({ status, code, message }) {
+  const normalizedMessage = String(message || '').toLowerCase();
+  const normalizedCode = String(code || '').toUpperCase();
+
+  if (status === 401 || normalizedMessage.includes('unauthorized')) {
+    return 'provider_unauthorized';
+  }
+  if (
+    status === 403 ||
+    normalizedMessage.includes('forbidden') ||
+    normalizedMessage.includes('access denied')
+  ) {
+    return 'provider_access_denied';
+  }
+  if (status === 429 || normalizedMessage.includes('rate limit')) {
+    return 'provider_rate_limited';
+  }
+  if (status === 402 || normalizedMessage.includes('billing') || normalizedMessage.includes('quota')) {
+    return 'provider_quota_or_billing';
+  }
+  if (
+    normalizedCode === 'ECONNABORTED' ||
+    normalizedCode === 'ETIMEDOUT' ||
+    normalizedMessage.includes('timeout')
+  ) {
+    return 'provider_timeout';
+  }
+  if (
+    normalizedCode === 'ECONNREFUSED' ||
+    normalizedCode === 'ECONNRESET' ||
+    normalizedCode === 'EAI_AGAIN'
+  ) {
+    return 'provider_network';
+  }
+  if (status >= 500) {
+    return 'provider_server_error';
+  }
+
+  return 'provider_error';
 }
 
 function isActivationFallbackCandidate(error) {
@@ -1140,6 +1542,35 @@ function sanitizeAnthropicThinkingTemperature(agentForRun, safeReq) {
   }
 }
 
+/* === VIVENTIUM START ===
+ * Feature: OpenAI reasoning-model sampling compatibility guard.
+ *
+ * Why:
+ * - Background cortex execution can bypass the normal endpoint-level OpenAI sanitization shape.
+ * - Reasoning-style OpenAI runs such as gpt-5.* reject sampling controls like temperature.
+ * - This must apply before and after initializeAgent because runtime hydration can materialize
+ *   model_parameters after source-of-truth copying.
+ * === VIVENTIUM END === */
+function sanitizeOpenAIReasoningSampling(agentForRun, safeReq) {
+  const model = typeof agentForRun?.model_parameters?.model === 'string'
+    ? agentForRun.model_parameters.model
+    : typeof agentForRun?.model === 'string'
+      ? agentForRun.model
+      : '';
+
+  const removedFromAgent = sanitizeOpenAIReasoningSamplingParams(agentForRun?.model_parameters, {
+    model,
+  });
+  const removedFromRequest = sanitizeOpenAIReasoningSamplingParams(safeReq?.body, { model });
+  const removed = [...removedFromAgent, ...removedFromRequest];
+
+  if (removed.length > 0) {
+    logger.info(
+      `[BackgroundCortexService] Removed OpenAI reasoning cortex sampling params for model=${model || 'unknown'} keys=${[...new Set(removed)].join(',')}`,
+    );
+  }
+}
+
 async function buildActivationLlmConfig({ providerName, model, req }) {
   const mappedProvider = mapProvider(providerName);
   const usesAdaptiveAnthropicTemperatureRules =
@@ -1219,7 +1650,7 @@ async function buildActivationLlmConfig({ providerName, model, req }) {
     delete llmConfig.temperature;
   }
 
-  return llmConfig;
+  return applyActivationJsonMode({ providerName, llmConfig });
 }
 
 async function invokeActivationClassifierAttempt({
@@ -1463,6 +1894,14 @@ ${activationFormat}`;
           reason: parsed.reason,
           agentId: agent_id,
           directActionSurfaces: activationPolicy.connectedSurfaces.map((surface) => surface.server).filter(Boolean),
+          directActionSurfaceScopes: activationPolicy.connectedSurfaces
+            .filter((surface) => surface.scopeKey)
+            .map((surface) => ({
+              server: surface.server,
+              scopeKey: surface.scopeKey,
+              owns: surface.owns,
+              sameScopeBackgroundAllowed: surface.sameScopeBackgroundAllowed === true,
+            })),
           providerUsed: providerName,
           modelUsed: attempt.model,
           providerAttempts,
@@ -1506,11 +1945,24 @@ ${activationFormat}`;
           continue;
         }
 
+        if (errorSummary.class === 'provider_access_denied') {
+          logger.warn(
+            `[BackgroundCortexService] Activation classifier access denied for ${agent_id}. ` +
+              'Check provider account/network egress before retrying activation.',
+            {
+              provider: providerName,
+              model: attempt.model,
+              status: errorSummary.status,
+              code: errorSummary.code,
+            },
+          );
+        }
+
         logger.error(`[BackgroundCortexService] Activation check failed for ${agent_id}:`, error);
         return {
           shouldActivate: false,
           confidence: 0,
-          reason: 'error',
+          reason: errorSummary.class || 'provider_error',
           agentId: agent_id,
           providerAttempts,
         };
@@ -1701,6 +2153,10 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
       sanitizeAnthropicThinkingTemperature(agentForRun, safeReq);
     }
 
+    if (providerName === 'openai' || providerName === 'open_ai' || providerName === 'azure_openai') {
+      sanitizeOpenAIReasoningSampling(agentForRun, safeReq);
+    }
+
     if (providerName === 'perplexity') {
       if (agentForRun.model_parameters) {
         delete agentForRun.model_parameters.temperature;
@@ -1797,6 +2253,16 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
      * === VIVENTIUM END === */
     if ((initializedAgent.provider || agentForRun.provider || '').toLowerCase() === 'anthropic') {
       sanitizeAnthropicThinkingTemperature(initializedAgent, safeReq);
+    }
+    {
+      const initializedProvider = (initializedAgent.provider || agentForRun.provider || '').toLowerCase();
+      if (
+        initializedProvider === 'openai' ||
+        initializedProvider === 'open_ai' ||
+        initializedProvider === 'azure_openai'
+      ) {
+        sanitizeOpenAIReasoningSampling(initializedAgent, safeReq);
+      }
     }
 
     /* === VIVENTIUM NOTE ===
@@ -2013,6 +2479,26 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
         agentName: agent.name || agent.id,
         insight: null,
         error: 'no_live_tool_execution',
+        errorClass: 'no_live_tool_execution',
+      };
+    }
+
+    if (!insight.trim() && shouldRetryBackgroundCortexContentPartsWithFallback(contentParts)) {
+      const providerErrorText =
+        extractAggregatedProviderErrorText(contentParts) || 'recoverable_provider_error';
+      logger.warn(
+        `[BackgroundCortexService] Cortex ${agent.id} produced recoverable provider error before insight: ` +
+          providerErrorText.slice(0, 200),
+      );
+      return {
+        agentId: agent.id,
+        agentName: agent.name || agent.id,
+        insight: null,
+        error: providerErrorText,
+        recoverableProviderError: true,
+        activationScope,
+        configuredTools: initializedAgent.tools?.length || 0,
+        completedToolCalls: toolExecutionState.completed || 0,
       };
     }
 
@@ -2103,6 +2589,11 @@ async function detectActivations({
   logVoicePhaseAStage(req, 'activation_meta_preload_started', metaLoadStartAt, `cortex_count=${metaById.size}`);
 
   const timeLeftMs = () => Math.max(0, deadline - Date.now());
+  const activationPolicyMainAgent = await resolveActivationPolicyMainAgent({
+    req,
+    mainAgent,
+    timeoutMs: Math.min(250, timeLeftMs()),
+  });
 
   const activationPromises = backgroundCortices.map(async (cortexConfig) => {
     const agentId = cortexConfig.agent_id;
@@ -2159,7 +2650,7 @@ async function detectActivations({
             messages,
             runId,
             req,
-            mainAgent,
+            mainAgent: activationPolicyMainAgent,
             timeoutMs,
           }),
         ),
@@ -2209,13 +2700,20 @@ async function detectActivations({
       const directActionSurfaces = Array.isArray(result.directActionSurfaces)
         ? result.directActionSurfaces.map((item) => String(item || '').trim()).filter(Boolean)
         : [];
+      const directActionSurfaceScopes = normalizeDirectActionSurfaceScopes(
+        result.directActionSurfaceScopes,
+      );
+      const directActionScopeKeys = directActionSurfaceScopes
+        .map((surface) => surface.scopeKey)
+        .filter(Boolean);
       logVoicePhaseAStage(
         req,
         'activation_check_done',
         cortexCheckStartAt,
         `agent_id=${agentId} activate=${shouldActivate} reason=${reason || 'none'} ` +
           `confidence=${confidence.toFixed(2)} timeout_budget_ms=${timeoutMs} ` +
-          `direct_action_surfaces=${directActionSurfaces.join(',') || 'none'}`,
+          `direct_action_surfaces=${directActionSurfaces.join(',') || 'none'} ` +
+          `direct_action_scope_keys=${directActionScopeKeys.join(',') || 'none'}`,
       );
 
       return {
@@ -2225,6 +2723,7 @@ async function detectActivations({
         agentId,
         activationScope,
         directActionSurfaces,
+        directActionSurfaceScopes,
         durationMs,
         timeoutBudgetMs: timeoutMs,
       };
@@ -2250,12 +2749,15 @@ async function detectActivations({
 
   // Collect results (all wrappers resolve by deadline)
   const activationCollectStartAt = Date.now();
-  const activationResults = await Promise.all(activationPromises);
+  const rawActivationResults = await Promise.all(activationPromises);
+  const activationResults = rawActivationResults.map(applyDirectActionOwnershipGate);
   logVoicePhaseAStage(
     req,
     'activation_collect_done',
     activationCollectStartAt,
-    `results=${activationResults.length}`,
+    `results=${activationResults.length} direct_action_suppressed=${
+      activationResults.filter((r) => r?.suppressedByDirectActionOwnership === true).length
+    }`,
   );
   const timedOut = activationResults.some((r) => r.reason === 'global_timeout');
 
@@ -2299,7 +2801,7 @@ async function detectActivations({
           ]);
           if (meta) {
             cortexName = sanitizeCortexDisplayName(meta.name || cortexName);
-            cortexDescription = meta.description || '';
+            cortexDescription = String(meta.description || '').replace(/\s+/g, ' ').trim().slice(0, 220);
           }
         } catch (e) {
           logger.debug('[BackgroundCortexService] Failed to load cortex metadata:', e);
@@ -2311,6 +2813,8 @@ async function detectActivations({
         cortexName,
         cortexDescription,
         activationScope: r.activationScope || null,
+        directActionSurfaces: Array.isArray(r.directActionSurfaces) ? r.directActionSurfaces : [],
+        directActionSurfaceScopes: normalizeDirectActionSurfaceScopes(r.directActionSurfaceScopes),
         confidence: r.confidence,
         reason: r.reason,
         durationMs: Number.isFinite(r.durationMs) ? r.durationMs : null,
@@ -2341,11 +2845,20 @@ async function detectActivations({
     .join(',');
   const timeoutCount = activationResults.filter((r) => r.reason === 'global_timeout').length;
   const activatedCount = activationResults.filter((r) => r.shouldActivate === true).length;
+  const reasonCounts = activationResults.reduce((acc, r) => {
+    const key = r.reason || 'none';
+    acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
+  const reasonSummary = Object.entries(reasonCounts)
+    .map(([reason, count]) => `${reason}:${count}`)
+    .join(',');
   logVoicePhaseAStage(
     req,
     'activation_detect_done',
     startTime,
-    `total=${activationResults.length} activated=${activatedCount} timed_out=${timeoutCount} top_slowest=${topDurations || 'none'}`,
+    `total=${activationResults.length} activated=${activatedCount} timed_out=${timeoutCount} ` +
+      `reasons=${reasonSummary || 'none'} top_slowest=${topDurations || 'none'}`,
   );
 
   logger.info(
@@ -2386,6 +2899,46 @@ async function executeActivated({
   }
 
   const executionTimeoutMs = getCortexExecutionTimeoutMs();
+  let modelsConfigPromise = null;
+  const getModelsConfigOnce = () => {
+    if (!modelsConfigPromise) {
+      modelsConfigPromise = loadModelsConfigForCortexFallback(req).catch((error) => {
+        logger.warn('[BackgroundCortexService] Failed to load models config for cortex fallback:', error);
+        return null;
+      });
+    }
+    return modelsConfigPromise;
+  };
+  const runCortexWithGuard = async ({ agent, activationResult }) => {
+    const cortexPromise = executeCortex({
+      agent,
+      messages,
+      runId,
+      req,
+      res,
+      activationScope: activationResult.activationScope || null,
+    });
+    const guardTimeoutMs = getCortexAttemptGuardTimeoutMs(executionTimeoutMs);
+    if (!guardTimeoutMs) {
+      return cortexPromise;
+    }
+    let timeoutId = null;
+    const timeoutPromise = new Promise((resolve) => {
+      timeoutId = setTimeout(() => {
+        resolve({
+          agentId: activationResult.agentId,
+          agentName: agent.name || activationResult.agentId,
+          insight: null,
+          error: 'timeout',
+        });
+      }, guardTimeoutMs);
+    });
+    const result = await Promise.race([cortexPromise, timeoutPromise]);
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+    return result;
+  };
 
   // Execute all activated cortices in parallel
   const executionPromises = activatedCortices.map(async (activationResult) => {
@@ -2399,6 +2952,20 @@ async function executeActivated({
 
       if (!cortexAgent) {
         logger.warn(`[BackgroundCortexService] Cortex agent not found: ${activationResult.agentId}`);
+        if (onCortexComplete) {
+          try {
+            onCortexComplete(
+              buildCortexCompletionPayload(
+                buildCompletionInputFromActivation({
+                  activationResult,
+                  error: 'Cortex agent not found',
+                }),
+              ),
+            );
+          } catch (e) {
+            logger.warn('[BackgroundCortexService] onCortexComplete missing-agent callback failed:', e);
+          }
+        }
         return null;
       }
 
@@ -2417,60 +2984,47 @@ async function executeActivated({
         }
       }
 
-      // Execute cortex with tools
-      const cortexPromise = executeCortex({
-        agent: cortexAgent,
-        messages,
-        runId,
-        req,
-        res,
-        activationScope: activationResult.activationScope || null,
-      });
-      let timeoutId = null;
-      const timeoutPromise = new Promise((resolve) => {
-        timeoutId = setTimeout(() => {
-          resolve({
-            agentId: activationResult.agentId,
-            agentName: cortexAgent.name || activationResult.agentId,
-            insight: null,
-            error: 'timeout',
-          });
-        }, executionTimeoutMs);
-      });
+      const fallbackAgent = resolveFallbackAssignment(cortexAgent)
+        ? await resolveBackgroundCortexFallbackAgent({
+            cortexAgent,
+            req,
+            modelsConfig: await getModelsConfigOnce(),
+          })
+        : null;
 
       /** @type {any} */
-      const result = await Promise.race([cortexPromise, timeoutPromise]);
-      if (timeoutId) {
-        clearTimeout(timeoutId);
+      let result = await runCortexWithGuard({ agent: cortexAgent, activationResult });
+      if (fallbackAgent && shouldRetryBackgroundCortexWithFallback(result)) {
+        const primaryProvider = cortexAgent.provider || 'unknown';
+        const primaryModel = cortexAgent.model || cortexAgent.model_parameters?.model || 'unknown';
+        const fallbackProvider = fallbackAgent.provider || 'unknown';
+        const fallbackModel = fallbackAgent.model || fallbackAgent.model_parameters?.model || 'unknown';
+        const primaryError = result?.error || 'unknown';
+        logger.warn(
+          `[BackgroundCortexService] Cortex ${activationResult.agentId} primary ` +
+            `${primaryProvider}/${primaryModel} failed before insight (${primaryError}); ` +
+            `retrying fallback ${fallbackProvider}/${fallbackModel}`,
+        );
+        const fallbackResult = await runCortexWithGuard({ agent: fallbackAgent, activationResult });
+        result = {
+          ...fallbackResult,
+          fallbackUsed: true,
+          fallbackProvider,
+          fallbackModel,
+          primaryProvider,
+          primaryModel,
+          primaryError,
+        };
       }
 
-      // Notify UI only when there is a real insight. Empty/{NTA} cortex output is silent success.
-      if (result && !result.error && hasVisibleCortexInsight(result.insight) && onCortexComplete) {
+      const completionPayload = buildCortexCompletionPayload(
+        buildCompletionInputFromActivation({ activationResult, cortexAgent, result }),
+      );
+      if (completionPayload && onCortexComplete) {
         try {
-          onCortexComplete({
-            cortex_id: result.agentId,
-            cortex_name: sanitizeCortexDisplayName(result.agentName),
-            status: 'complete',
-            insight: result.insight,
-            activation_scope: result.activationScope || null,
-            configured_tools: result.configuredTools || 0,
-            completed_tool_calls: result.completedToolCalls || 0,
-          });
+          onCortexComplete(completionPayload);
         } catch (e) {
           logger.warn('[BackgroundCortexService] onCortexComplete callback failed:', e);
-        }
-      } else if (result && result.error && onCortexComplete) {
-        // Handle error case where executeCortex returned error object instead of throwing
-        // This ensures UI updates from "Analyzing..." to "Error" state
-        try {
-          onCortexComplete({
-            cortex_id: result.agentId,
-            cortex_name: sanitizeCortexDisplayName(result.agentName),
-            status: 'error',
-            error: result.error,
-          });
-        } catch (e) {
-          logger.warn('[BackgroundCortexService] onCortexComplete error callback failed:', e);
         }
       }
 
@@ -2481,12 +3035,14 @@ async function executeActivated({
       // Notify UI of error so it doesn't stay stuck on "Analyzing..."
       if (onCortexComplete) {
         try {
-          onCortexComplete({
-            cortex_id: activationResult.agentId,
-            cortex_name: sanitizeCortexDisplayName(activationResult.cortexName || activationResult.agentId),
-            status: 'error',
-            error: error.message,
-          });
+          onCortexComplete(
+            buildCortexCompletionPayload(
+              buildCompletionInputFromActivation({
+                activationResult,
+                error: error?.message || 'Cortex execution failed',
+              }),
+            ),
+          );
         } catch (e) {
           logger.warn('[BackgroundCortexService] onCortexComplete error callback failed:', e);
         }
@@ -2519,7 +3075,7 @@ async function executeActivated({
 
   // Collect and merge insights
   const insights = executionResults
-    .filter(r => r && r.insight)
+    .filter(r => r && hasVisibleCortexInsight(r.insight))
     .map(r => ({
       cortexId: r.agentId,
       cortexName: sanitizeCortexDisplayName(r.agentName),
@@ -2537,9 +3093,12 @@ async function executeActivated({
       cortexName: sanitizeCortexDisplayName(r.agentName),
       error: r.error,
     }));
+  const silentCompletions = executionResults
+    .filter(r => r && !r.error && !hasVisibleCortexInsight(r.insight))
+    .length;
 
   logger.info(
-    `[BackgroundCortexService] Execution complete: ${insights.length}/${activatedCortices.length} insights collected, ${errors.length} errors`
+    `[BackgroundCortexService] Execution complete: ${insights.length}/${activatedCortices.length} visible insights, ${silentCompletions} silent completions, ${errors.length} errors`
   );
 
   // Notify when ALL complete - fire even if no insights (to trigger follow-up with error info)
@@ -2565,9 +3124,10 @@ async function executeActivated({
           hasErrors: true,
         });
       } else {
-        // Edge case: no insights, no errors (shouldn't happen, but handle gracefully)
-        // Still trigger onAllComplete so follow-up logic can decide what to do
-        logger.warn('[BackgroundCortexService] No insights and no errors - this is unexpected');
+        // A cortex may intentionally complete with no user-visible output ({NTA}).
+        logger.info(
+          `[BackgroundCortexService] Background execution finished with no visible insights (${silentCompletions} silent completions)`
+        );
         onAllComplete({
           insights: [],
           mergedPrompt: '', // Empty but defined - follow-up check will handle this
@@ -2711,6 +3271,20 @@ async function processBackgroundCortices({
 
       if (!cortexAgent) {
         logger.warn(`[BackgroundCortexService] Cortex agent not found: ${activationResult.agentId}`);
+        if (onCortexComplete) {
+          try {
+            onCortexComplete(
+              buildCortexCompletionPayload(
+                buildCompletionInputFromActivation({
+                  activationResult,
+                  error: 'Cortex agent not found',
+                }),
+              ),
+            );
+          } catch (e) {
+            logger.warn('[BackgroundCortexService] onCortexComplete missing-agent callback failed:', e);
+          }
+        }
         return null;
       }
 
@@ -2737,29 +3311,14 @@ async function processBackgroundCortices({
         activationScope: activationResult.activationScope || null,
       });
 
-      // Notify UI when cortex completes with insight
-      if (result && result.insight && onCortexComplete) {
+      const completionPayload = buildCortexCompletionPayload(
+        buildCompletionInputFromActivation({ activationResult, cortexAgent, result }),
+      );
+      if (completionPayload && onCortexComplete) {
         try {
-          onCortexComplete({
-            cortex_id: result.agentId,
-            cortex_name: sanitizeCortexDisplayName(result.agentName),
-            status: 'complete',
-            insight: result.insight,
-          });
+          onCortexComplete(completionPayload);
         } catch (e) {
           logger.warn('[BackgroundCortexService] onCortexComplete callback failed:', e);
-        }
-      } else if (result && result.error && onCortexComplete) {
-        // Handle error case where executeCortex returned error object instead of throwing
-        try {
-          onCortexComplete({
-            cortex_id: result.agentId,
-            cortex_name: sanitizeCortexDisplayName(result.agentName),
-            status: 'error',
-            error: result.error,
-          });
-        } catch (e) {
-          logger.warn('[BackgroundCortexService] onCortexComplete error callback failed:', e);
         }
       }
 
@@ -2770,12 +3329,14 @@ async function processBackgroundCortices({
       // Notify UI of error so it doesn't stay stuck on "Analyzing..."
       if (onCortexComplete) {
         try {
-          onCortexComplete({
-            cortex_id: activationResult.agentId,
-            cortex_name: sanitizeCortexDisplayName(activationResult.cortexName || activationResult.agentId),
-            status: 'error',
-            error: error.message,
-          });
+          onCortexComplete(
+            buildCortexCompletionPayload(
+              buildCompletionInputFromActivation({
+                activationResult,
+                error: error?.message || 'Cortex execution failed',
+              }),
+            ),
+          );
         } catch (e) {
           logger.warn('[BackgroundCortexService] onCortexComplete error callback failed:', e);
         }
@@ -2793,7 +3354,7 @@ async function processBackgroundCortices({
 
   // Filter out failed executions and null insights
   const insights = executionResults
-    .filter(r => r && r.insight)
+    .filter(r => r && hasVisibleCortexInsight(r.insight))
     .map(r => ({
       cortexId: r.agentId,
       cortexName: sanitizeCortexDisplayName(r.agentName),
@@ -2818,6 +3379,8 @@ async function processBackgroundCortices({
     activatedCortices: activatedCortices.map(a => ({
       agentId: a.agentId,
       activationScope: a.activationScope || null,
+      directActionSurfaces: Array.isArray(a.directActionSurfaces) ? a.directActionSurfaces : [],
+      directActionSurfaceScopes: normalizeDirectActionSurfaceScopes(a.directActionSurfaceScopes),
       cortexName: a.cortexName,
       confidence: a.confidence,
       reason: a.reason,
@@ -2865,8 +3428,19 @@ module.exports = {
   parseActivationResponse,
   formatHistoryForActivation,
   buildActivationPolicySection,
+  applyActivationJsonMode,
+  resolveActivationPolicyMainAgent,
+  normalizeDirectActionScopeKey,
+  normalizeDirectActionSurfaceScopes,
+  applyDirectActionOwnershipGate,
   normalizeAgentToolNames,
   hasVisibleCortexInsight,
+  buildCortexCompletionPayload,
+  summarizeActivationError,
+  classifyActivationError,
+  getCortexAttemptGuardTimeoutMs,
+  resolveBackgroundCortexFallbackAgent,
+  sanitizeOpenAIReasoningSampling,
   ACTIVATION_SYSTEM_PROMPT,
   // Exported for unit testing only
   createBackgroundRes,

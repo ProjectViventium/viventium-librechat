@@ -130,4 +130,88 @@ describe('cortexPendingBuffer', () => {
     expect(byId.get('c1')).toMatchObject({ status: 'activating' });
     expect(byId.get('c2')).toMatchObject({ status: 'brewing' });
   });
+
+  test('replaces brewing state with silent terminal completion', () => {
+    let messages = [{ messageId: 'user-4_' } as TMessage];
+    const getMessages = () => messages;
+    const setMessages = (next: TMessage[]) => {
+      messages = next;
+    };
+
+    const buffer = createCortexPendingBuffer({
+      getMessages,
+      setMessages,
+    });
+
+    buffer.handleCortexUpdate('user-4_', {
+      type: 'cortex_brewing',
+      cortex_id: 'c1',
+      cortex_name: 'Google Workspace',
+      status: 'brewing',
+      confidence: 0.91,
+      reason: 'gmail request',
+      cortex_description: 'Checks Google Workspace.',
+    });
+    buffer.handleCortexUpdate('user-4_', {
+      type: 'cortex_insight',
+      cortex_id: 'c1',
+      cortex_name: 'Google Workspace',
+      status: 'complete',
+      insight: '',
+      silent: true,
+      no_response: true,
+    });
+
+    const parts = (messages[0] as TMessage & { __viventiumCortexParts?: unknown[] })
+      .__viventiumCortexParts as Array<Record<string, unknown>>;
+    expect(parts).toHaveLength(1);
+    expect(parts[0]).toMatchObject({
+      cortex_id: 'c1',
+      type: 'cortex_insight',
+      status: 'complete',
+      silent: true,
+      no_response: true,
+      confidence: 0.91,
+      reason: 'gmail request',
+      cortex_description: 'Checks Google Workspace.',
+    });
+  });
+
+  test('terminal update does not erase brewing metadata with undefined values', () => {
+    let messages = [{ messageId: 'user-5_' } as TMessage];
+    const buffer = createCortexPendingBuffer({
+      getMessages: () => messages,
+      setMessages: (next) => {
+        messages = next;
+      },
+    });
+
+    buffer.handleCortexUpdate('user-5_', {
+      type: 'cortex_brewing',
+      cortex_id: 'c1',
+      cortex_name: 'Google Workspace',
+      status: 'brewing',
+      confidence: 0.91,
+      reason: 'gmail request',
+    });
+    buffer.handleCortexUpdate('user-5_', {
+      type: 'cortex_insight',
+      cortex_id: 'c1',
+      cortex_name: 'Google Workspace',
+      status: 'complete',
+      insight: 'Done.',
+      confidence: undefined,
+      reason: undefined,
+    });
+
+    const parts = (messages[0] as TMessage & { __viventiumCortexParts?: unknown[] })
+      .__viventiumCortexParts as Array<Record<string, unknown>>;
+    expect(parts[0]).toMatchObject({
+      cortex_id: 'c1',
+      status: 'complete',
+      insight: 'Done.',
+      confidence: 0.91,
+      reason: 'gmail request',
+    });
+  });
 });

@@ -21,7 +21,6 @@ jest.mock(
       debug: jest.fn(),
     },
   }),
-  { virtual: true },
 );
 
 jest.mock('librechat-data-provider', () => ({

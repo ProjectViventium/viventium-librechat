@@ -49,12 +49,40 @@ const DEFAULT_FILE_SEARCH_QUERY_TIMEOUT_MS = 12000;
 const DEFAULT_FILE_SEARCH_QUERY_K = 5;
 const DEFAULT_FILE_SEARCH_QUERY_TIMEOUT_MS_CONVERSATION_RECALL = 8000;
 const DEFAULT_FILE_SEARCH_QUERY_K_CONVERSATION_RECALL = 60;
+/* === VIVENTIUM START ===
+ * Feature: Meeting transcript recall query budget
+ * Purpose: Local transcript files share the RAG/Ollama path with conversation recall. Give
+ * transcript artifacts enough time to survive cold local embeddings without weakening the
+ * normal file-search budget.
+ * Added: 2026-05-05
+ */
+const DEFAULT_FILE_SEARCH_QUERY_TIMEOUT_MS_MEETING_TRANSCRIPT = 30000;
+const DEFAULT_FILE_SEARCH_QUERY_K_MEETING_TRANSCRIPT = 8;
+/* === VIVENTIUM END === */
 const DEFAULT_FILE_SEARCH_MAX_RESULTS = 10;
 const DEFAULT_FILE_SEARCH_MAX_RESULTS_CONVERSATION_RECALL = 6;
+/* === VIVENTIUM START ===
+ * Feature: Meeting transcript recall result budget
+ * Added: 2026-05-05
+ */
+const DEFAULT_FILE_SEARCH_MAX_RESULTS_MEETING_TRANSCRIPT = 6;
+/* === VIVENTIUM END === */
 const DEFAULT_FILE_SEARCH_RESULT_MAX_CHARS = 1600;
 const DEFAULT_FILE_SEARCH_RESULT_MAX_CHARS_CONVERSATION_RECALL = 800;
+/* === VIVENTIUM START ===
+ * Feature: Meeting transcript recall result budget
+ * Added: 2026-05-05
+ */
+const DEFAULT_FILE_SEARCH_RESULT_MAX_CHARS_MEETING_TRANSCRIPT = 2400;
+/* === VIVENTIUM END === */
 const DEFAULT_FILE_SEARCH_OUTPUT_MAX_CHARS = 20000;
 const DEFAULT_FILE_SEARCH_OUTPUT_MAX_CHARS_CONVERSATION_RECALL = 12000;
+/* === VIVENTIUM START ===
+ * Feature: Meeting transcript recall result budget
+ * Added: 2026-05-05
+ */
+const DEFAULT_FILE_SEARCH_OUTPUT_MAX_CHARS_MEETING_TRANSCRIPT = 16000;
+/* === VIVENTIUM END === */
 /* === VIVENTIUM START ===
  * Retrieval: widen the bounded candidate pool for conversation recall before reranking.
  * Reason:
@@ -133,6 +161,17 @@ const getConversationRecallFileSearchTopK = () =>
     DEFAULT_FILE_SEARCH_QUERY_K_CONVERSATION_RECALL,
   );
 
+/* === VIVENTIUM START ===
+ * Feature: Meeting transcript recall query budget
+ * Added: 2026-05-05
+ */
+const getMeetingTranscriptFileSearchTopK = () =>
+  parsePositiveIntEnv(
+    process.env.VIVENTIUM_FILE_SEARCH_TOP_K_MEETING_TRANSCRIPT,
+    DEFAULT_FILE_SEARCH_QUERY_K_MEETING_TRANSCRIPT,
+  );
+/* === VIVENTIUM END === */
+
 const getFileSearchMaxResults = () =>
   parsePositiveIntEnv(process.env.VIVENTIUM_FILE_SEARCH_MAX_RESULTS, DEFAULT_FILE_SEARCH_MAX_RESULTS);
 
@@ -141,6 +180,17 @@ const getConversationRecallFileSearchMaxResults = () =>
     process.env.VIVENTIUM_FILE_SEARCH_MAX_RESULTS_CONVERSATION_RECALL,
     DEFAULT_FILE_SEARCH_MAX_RESULTS_CONVERSATION_RECALL,
   );
+
+/* === VIVENTIUM START ===
+ * Feature: Meeting transcript recall result budget
+ * Added: 2026-05-05
+ */
+const getMeetingTranscriptFileSearchMaxResults = () =>
+  parsePositiveIntEnv(
+    process.env.VIVENTIUM_FILE_SEARCH_MAX_RESULTS_MEETING_TRANSCRIPT,
+    DEFAULT_FILE_SEARCH_MAX_RESULTS_MEETING_TRANSCRIPT,
+  );
+/* === VIVENTIUM END === */
 
 const getFileSearchResultMaxChars = () =>
   parsePositiveIntEnv(
@@ -154,6 +204,17 @@ const getConversationRecallFileSearchResultMaxChars = () =>
     DEFAULT_FILE_SEARCH_RESULT_MAX_CHARS_CONVERSATION_RECALL,
   );
 
+/* === VIVENTIUM START ===
+ * Feature: Meeting transcript recall result budget
+ * Added: 2026-05-05
+ */
+const getMeetingTranscriptFileSearchResultMaxChars = () =>
+  parsePositiveIntEnv(
+    process.env.VIVENTIUM_FILE_SEARCH_RESULT_MAX_CHARS_MEETING_TRANSCRIPT,
+    DEFAULT_FILE_SEARCH_RESULT_MAX_CHARS_MEETING_TRANSCRIPT,
+  );
+/* === VIVENTIUM END === */
+
 const getFileSearchOutputMaxChars = () =>
   parsePositiveIntEnv(
     process.env.VIVENTIUM_FILE_SEARCH_OUTPUT_MAX_CHARS,
@@ -166,21 +227,114 @@ const getConversationRecallFileSearchOutputMaxChars = () =>
     DEFAULT_FILE_SEARCH_OUTPUT_MAX_CHARS_CONVERSATION_RECALL,
   );
 
+/* === VIVENTIUM START ===
+ * Feature: Meeting transcript recall result budget
+ * Added: 2026-05-05
+ */
+const getMeetingTranscriptFileSearchOutputMaxChars = () =>
+  parsePositiveIntEnv(
+    process.env.VIVENTIUM_FILE_SEARCH_OUTPUT_MAX_CHARS_MEETING_TRANSCRIPT,
+    DEFAULT_FILE_SEARCH_OUTPUT_MAX_CHARS_MEETING_TRANSCRIPT,
+  );
+/* === VIVENTIUM END === */
+
+/* === VIVENTIUM START ===
+ * Feature: Meeting transcript recall query budget
+ * Added: 2026-05-05
+ */
+const getMeetingTranscriptFileSearchQueryTimeoutMs = () =>
+  parsePositiveIntEnv(
+    process.env.VIVENTIUM_FILE_SEARCH_QUERY_TIMEOUT_MS_MEETING_TRANSCRIPT,
+    DEFAULT_FILE_SEARCH_QUERY_TIMEOUT_MS_MEETING_TRANSCRIPT,
+  );
+
+const isMeetingTranscriptFileId = (fileId) => {
+  const value = String(fileId || '');
+  return value.startsWith('meeting_transcript:') || value.startsWith('meeting_summary:');
+};
+
+const formatTranscriptMetadataValue = (value) => {
+  if (value === undefined || value === null || value === '') {
+    return null;
+  }
+  if (typeof value === 'string') {
+    return value.replace(/\s+/g, ' ').trim() || null;
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+};
+
+const buildMeetingTranscriptResultHeader = (result) => {
+  if (!isMeetingTranscriptFileId(result?.file_id)) {
+    return '';
+  }
+  const metadata = result?.fileMetadata || {};
+  const rows = [
+    ['Transcript artifact ID', metadata.meetingTranscriptArtifactId],
+    ['Transcript artifact kind', metadata.meetingTranscriptKind],
+    ['Original filename', metadata.meetingTranscriptOriginalFilename || result.filename],
+    ['File mtime', metadata.meetingTranscriptFileMtime],
+    ['Source status', metadata.meetingTranscriptSourceStatus],
+    ['Calendar match', metadata.meetingTranscriptCalendarMatch],
+  ];
+  return rows
+    .map(([label, value]) => {
+      const formatted = formatTranscriptMetadataValue(value);
+      return formatted ? `${label}: ${formatted}` : null;
+    })
+    .filter(Boolean)
+    .join('\n');
+};
+
+const withMeetingTranscriptHeader = (result, content) => {
+  const header = buildMeetingTranscriptResultHeader(result);
+  return header ? `${header}\n${content}` : content;
+};
+
+const getNoMatchingContentOutput = ({ files = [], recallFiles = [] }) => {
+  const hasMeetingTranscriptResource = files.some((file) => isMeetingTranscriptFileId(file?.file_id));
+  const hasConversationRecallResource = recallFiles.length > 0;
+  if (hasMeetingTranscriptResource && hasConversationRecallResource) {
+    return 'No matching content found in conversation history or meeting transcripts for this query.';
+  }
+  if (hasMeetingTranscriptResource) {
+    return 'No matching content found in meeting transcripts for this query.';
+  }
+  if (hasConversationRecallResource) {
+    return 'No matching content found in conversation history for this query.';
+  }
+  return 'No matching content found in attached files for this query.';
+};
+/* === VIVENTIUM END === */
+
 const getConversationRecallLiteralFallbackMaxMatches = () =>
   parsePositiveIntEnv(
     process.env.VIVENTIUM_FILE_SEARCH_LITERAL_FALLBACK_MAX_MATCHES,
     DEFAULT_FILE_SEARCH_LITERAL_FALLBACK_MAX_MATCHES,
   );
 
-const getFileSearchTopKForFile = (file) =>
-  isConversationRecallFileId(file?.file_id)
-    ? getConversationRecallFileSearchTopK()
-    : getFileSearchTopK();
+const getFileSearchTopKForFile = (file) => {
+  if (isConversationRecallFileId(file?.file_id)) {
+    return getConversationRecallFileSearchTopK();
+  }
+  if (isMeetingTranscriptFileId(file?.file_id)) {
+    return getMeetingTranscriptFileSearchTopK();
+  }
+  return getFileSearchTopK();
+};
 
-const getFileSearchQueryTimeoutMsForFile = (file) =>
-  isConversationRecallFileId(file?.file_id)
-    ? getConversationRecallFileSearchQueryTimeoutMs()
-    : getFileSearchQueryTimeoutMs();
+const getFileSearchQueryTimeoutMsForFile = (file) => {
+  if (isConversationRecallFileId(file?.file_id)) {
+    return getConversationRecallFileSearchQueryTimeoutMs();
+  }
+  if (isMeetingTranscriptFileId(file?.file_id)) {
+    return getMeetingTranscriptFileSearchQueryTimeoutMs();
+  }
+  return getFileSearchQueryTimeoutMs();
+};
 
 const clipContent = (content, maxChars) => {
   if (typeof content !== 'string') {
@@ -408,6 +562,8 @@ async function searchConversationRecallSourceMatches({
       user: userId,
       unfinished: { $ne: true },
       error: { $ne: true },
+      'metadata.viventium.type': { $ne: 'listen_only_transcript' },
+      'metadata.viventium.mode': { $ne: 'listen_only' },
       ...(scopedConversationIds ? { conversationId: scopedConversationIds } : {}),
       $or: [{ expiredAt: { $exists: false } }, { expiredAt: null }],
       $and: [
@@ -418,7 +574,9 @@ async function searchConversationRecallSourceMatches({
         },
       ],
     })
-      .select('messageId parentMessageId conversationId createdAt sender isCreatedByUser text content attachments')
+      .select(
+        'messageId parentMessageId conversationId createdAt sender isCreatedByUser text content attachments metadata',
+      )
       .sort({ createdAt: -1 })
       .limit(maxMatches * 6)
       .lean();
@@ -478,12 +636,6 @@ async function searchConversationRecallSourceMatches({
     .slice(0, maxMatches)
     .map(({ sourceRecallScore, createdAt, ...result }) => result);
 }
-
-const shouldUseConversationRecallSourceRescue = ({ query, results, literalCandidates }) => {
-  const queryTerms = tokenizeRecallQuery(query);
-  void results;
-  return literalCandidates.length > 0 || queryTerms.length >= 2;
-};
 
 const getConversationRecallRerankScore = ({ query, result, queryTerms }) => {
   const content = typeof result?.content === 'string' ? result.content : '';
@@ -592,7 +744,19 @@ const primeFiles = async (options) => {
     files.push({
       file_id: file.file_id,
       filename: file.filename,
+      /* === VIVENTIUM START ===
+       * Feature: Meeting transcript retrieval provenance
+       * Reason: The file_search tool needs DB metadata to show transcript artifact headers.
+       */
+      context: file.context,
+      metadata: file.metadata,
+      /* === VIVENTIUM END === */
       viventiumConversationRecallMode: file?.viventiumConversationRecallMode,
+      /* === VIVENTIUM START ===
+       * Feature: Meeting transcript retrieval provenance
+       */
+      viventiumMeetingTranscriptRecall: file?.viventiumMeetingTranscriptRecall,
+      /* === VIVENTIUM END === */
     });
   }
 
@@ -732,6 +896,7 @@ const createFileSearchTool = async ({
               distance,
               file_id: file.file_id,
               page: docInfo?.metadata?.page || null,
+              fileMetadata: file.metadata,
             };
           }),
         )
@@ -745,19 +910,15 @@ const createFileSearchTool = async ({
       let hasConversationRecallResults = formattedResults.some((result) =>
         isConversationRecallFileId(result.file_id),
       );
+      const hasMeetingTranscriptResults = formattedResults.some((result) =>
+        isMeetingTranscriptFileId(result.file_id),
+      );
 
       if (hasConversationRecallResults) {
         formattedResults = rerankConversationRecallResults({ query, results: formattedResults });
       }
 
-      const shouldAttemptSourceRescue =
-        recallFilesNeedSourceFallback ||
-        queryErrorCount > 0 ||
-        shouldUseConversationRecallSourceRescue({
-          query,
-          results: formattedResults,
-          literalCandidates,
-        });
+      const shouldAttemptSourceRescue = recallFiles.length > 0;
 
       if (recallFiles.length > 0 && shouldAttemptSourceRescue) {
         const sourceRescueResults = await searchConversationRecallSourceMatches({
@@ -771,8 +932,6 @@ const createFileSearchTool = async ({
         if (sourceRescueResults.length > 0) {
           logger.info(`[${Tools.file_search}] conversation recall source rescue hit`, {
             recallFileCount: recallFiles.length,
-            queryTerms: tokenizeRecallQuery(query).slice(0, 6),
-            literalCandidates,
             rescueCount: sourceRescueResults.length,
           });
           formattedResults = dedupeRecallResults(formattedResults.concat(sourceRescueResults));
@@ -788,7 +947,7 @@ const createFileSearchTool = async ({
       if (formattedResults.length === 0) {
         const msg = queryErrorCount > 0
           ? getFileSearchFailureOutput()
-          : 'No matching content found in conversation history for this query.';
+          : getNoMatchingContentOutput({ files, recallFiles });
         return [msg, undefined];
       }
 
@@ -803,15 +962,20 @@ const createFileSearchTool = async ({
         ];
       }
 
-      const maxResults = hasConversationRecallResults
-        ? getConversationRecallFileSearchMaxResults()
-        : getFileSearchMaxResults();
-      const resultMaxChars = hasConversationRecallResults
-        ? getConversationRecallFileSearchResultMaxChars()
-        : getFileSearchResultMaxChars();
-      const outputMaxChars = hasConversationRecallResults
-        ? getConversationRecallFileSearchOutputMaxChars()
-        : getFileSearchOutputMaxChars();
+      const maxResults = Math.max(
+        hasConversationRecallResults ? getConversationRecallFileSearchMaxResults() : 0,
+        hasMeetingTranscriptResults ? getMeetingTranscriptFileSearchMaxResults() : 0,
+        !hasConversationRecallResults && !hasMeetingTranscriptResults
+          ? getFileSearchMaxResults()
+          : 0,
+      );
+      const outputMaxChars = Math.max(
+        hasConversationRecallResults ? getConversationRecallFileSearchOutputMaxChars() : 0,
+        hasMeetingTranscriptResults ? getMeetingTranscriptFileSearchOutputMaxChars() : 0,
+        !hasConversationRecallResults && !hasMeetingTranscriptResults
+          ? getFileSearchOutputMaxChars()
+          : 0,
+      );
 
       const limitedResults = formattedResults.slice(0, maxResults);
       const includedResults = [];
@@ -819,18 +983,24 @@ const createFileSearchTool = async ({
 
       for (let index = 0; index < limitedResults.length; index += 1) {
         const result = limitedResults[index];
+        const resultMaxChars = isConversationRecallFileId(result.file_id)
+          ? getConversationRecallFileSearchResultMaxChars()
+          : isMeetingTranscriptFileId(result.file_id)
+            ? getMeetingTranscriptFileSearchResultMaxChars()
+            : getFileSearchResultMaxChars();
         const content = clipContent(result.content, resultMaxChars);
+        const modelContent = withMeetingTranscriptHeader(result, content);
         const displayRelevance = Number.isFinite(result?.recallRerankScore)
           ? result.recallRerankScore
           : 1.0 - result.distance;
         const block = `File: ${result.filename}${
           fileCitations ? `\nAnchor: \\ue202turn0file${index} (${result.filename})` : ''
-        }\nRelevance: ${displayRelevance.toFixed(4)}\nContent: ${content}\n`;
+        }\nRelevance: ${displayRelevance.toFixed(4)}\nContent: ${modelContent}\n`;
         const separator = includedResults.length ? '\n---\n' : '';
         if (usedOutputChars + separator.length + block.length > outputMaxChars) {
           break;
         }
-        includedResults.push({ ...result, content });
+        includedResults.push({ ...result, content, modelContent });
         usedOutputChars += separator.length + block.length;
       }
 
@@ -850,7 +1020,9 @@ const createFileSearchTool = async ({
             return (
             `File: ${result.filename}${
               fileCitations ? `\nAnchor: \\ue202turn0file${index} (${result.filename})` : ''
-            }\nRelevance: ${displayRelevance.toFixed(4)}\nContent: ${result.content}\n`
+            }\nRelevance: ${displayRelevance.toFixed(4)}\nContent: ${
+              result.modelContent || result.content
+            }\n`
             );
           },
         )
@@ -862,7 +1034,7 @@ const createFileSearchTool = async ({
           : 1.0 - result.distance,
         type: 'file',
         fileId: result.file_id,
-        content: result.content,
+        content: result.modelContent || result.content,
         fileName: result.filename,
         pages: result.page ? [result.page] : [],
         pageRelevance: result.page

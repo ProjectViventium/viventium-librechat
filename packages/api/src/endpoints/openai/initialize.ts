@@ -8,6 +8,7 @@ import type {
 } from '~/types';
 import { getAzureCredentials, resolveHeaders, isUserProvided, checkUserKeyExpiry } from '~/utils';
 import { getOpenAIConfig } from './config';
+import { resolveOpenAISubscriptionUserValues } from './oauthSubscription';
 
 /* === VIVENTIUM START ===
  * Feature: Connected Accounts routing policy.
@@ -109,6 +110,7 @@ export async function initializeOpenAI({
   let userValues: UserKeyValues | null = null;
   try {
     userValues = await db.getUserKeyValues({ userId: req.user?.id ?? '', name: endpoint });
+    userValues = await resolveOpenAISubscriptionUserValues(req.user?.id ?? '', userValues, db);
     if (expiresAt) {
       checkUserKeyExpiry(expiresAt, endpoint);
     }

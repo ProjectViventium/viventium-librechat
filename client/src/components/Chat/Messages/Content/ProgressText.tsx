@@ -95,7 +95,9 @@ export default function ProgressText({
         onClick={hasInput ? onClick : undefined}
         aria-expanded={hasInput ? isExpanded : undefined}
       >
-        {icon}
+        <span className="progress-text-icon flex size-5 shrink-0 items-center justify-center">
+          {icon}
+        </span>
         <span className={cn('min-w-0 truncate', showShimmer ? 'shimmer' : '')}>{text}</span>
         {hasInput &&
           (isExpanded ? (

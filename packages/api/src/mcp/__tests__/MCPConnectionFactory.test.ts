@@ -79,12 +79,12 @@ describe('MCPConnectionFactory', () => {
 
       expect(connection).toBe(mockConnectionInstance);
       expect(mockProcessMCPEnv).toHaveBeenCalledWith({ options: mockServerConfig });
-      expect(mockMCPConnection).toHaveBeenCalledWith({
+      expect(mockMCPConnection).toHaveBeenCalledWith(expect.objectContaining({
         serverName: 'test-server',
         serverConfig: mockServerConfig,
         userId: undefined,
         oauthTokens: null,
-      });
+      }));
       expect(mockConnectionInstance.connect).toHaveBeenCalled();
     });
 
@@ -103,6 +103,7 @@ describe('MCPConnectionFactory', () => {
           createToken: jest.fn(),
           updateToken: jest.fn(),
           deleteTokens: jest.fn(),
+          deleteToken: jest.fn(),
         },
       };
 
@@ -120,12 +121,12 @@ describe('MCPConnectionFactory', () => {
 
       expect(connection).toBe(mockConnectionInstance);
       expect(mockProcessMCPEnv).toHaveBeenCalledWith({ options: mockServerConfig, user: mockUser });
-      expect(mockMCPConnection).toHaveBeenCalledWith({
+      expect(mockMCPConnection).toHaveBeenCalledWith(expect.objectContaining({
         serverName: 'test-server',
         serverConfig: mockServerConfig,
         userId: 'user123',
         oauthTokens: mockTokens,
-      });
+      }));
     });
   });
 
@@ -145,6 +146,7 @@ describe('MCPConnectionFactory', () => {
           createToken: jest.fn(),
           updateToken: jest.fn(),
           deleteTokens: jest.fn(),
+          deleteToken: jest.fn(),
         },
       };
 
@@ -170,6 +172,7 @@ describe('MCPConnectionFactory', () => {
           createToken: jest.fn(),
           updateToken: jest.fn(),
           deleteTokens: jest.fn(),
+          deleteToken: jest.fn(),
         },
       };
 
@@ -179,12 +182,12 @@ describe('MCPConnectionFactory', () => {
       const connection = await MCPConnectionFactory.create(basicOptions, oauthOptions);
 
       expect(connection).toBe(mockConnectionInstance);
-      expect(mockMCPConnection).toHaveBeenCalledWith({
+      expect(mockMCPConnection).toHaveBeenCalledWith(expect.objectContaining({
         serverName: 'test-server',
         serverConfig: mockServerConfig,
         userId: 'user123',
         oauthTokens: null,
-      });
+      }));
       expect(mockLogger.debug).toHaveBeenCalledWith(
         expect.stringContaining('No existing tokens found or error loading tokens'),
         expect.any(Error),
@@ -214,6 +217,7 @@ describe('MCPConnectionFactory', () => {
           createToken: jest.fn(),
           updateToken: jest.fn(),
           deleteTokens: jest.fn(),
+          deleteToken: jest.fn(),
         },
       };
 
@@ -374,6 +378,7 @@ describe('MCPConnectionFactory', () => {
           createToken: jest.fn(),
           updateToken: jest.fn(),
           deleteTokens: jest.fn(),
+          deleteToken: jest.fn(),
         },
       };
 
@@ -409,6 +414,7 @@ describe('MCPConnectionFactory', () => {
           createToken: jest.fn(),
           updateToken: jest.fn(),
           deleteTokens: jest.fn(),
+          deleteToken: jest.fn(),
         },
       };
 
@@ -470,6 +476,7 @@ describe('MCPConnectionFactory', () => {
           createToken: jest.fn(),
           updateToken: jest.fn(),
           deleteTokens: jest.fn(),
+          deleteToken: jest.fn(),
         },
       };
 

@@ -347,6 +347,64 @@ describe('BaseClient', () => {
       expect(result).toEqual(['Message 1', 'Message 2', 'Message 3']);
     });
 
+    it('should skip selected messages while continuing traversal through their parent', () => {
+      const messages = [
+        { id: '1', parentMessageId: Constants.NO_PARENT, text: 'User message' },
+        { id: '2', parentMessageId: '1', text: 'Assistant message' },
+        {
+          id: '3',
+          parentMessageId: '2',
+          text: 'Ambient transcript',
+          metadata: {
+            viventium: {
+              type: 'listen_only_transcript',
+              mode: 'listen_only',
+            },
+          },
+        },
+        { id: '4', parentMessageId: '3', text: 'Next user message' },
+      ];
+
+      const result = TestClient.constructor.getMessagesForConversation({
+        messages,
+        parentMessageId: '4',
+        skipCondition: (message) =>
+          message.metadata?.viventium?.type === 'listen_only_transcript' &&
+          message.metadata?.viventium?.mode === 'listen_only',
+      });
+
+      expect(result.map((message) => message.id)).toEqual(['1', '2', '4']);
+    });
+
+    it('should not include a Listen-Only side chain when traversing from the live leaf', () => {
+      const listenOnlyChain = Array.from({ length: 25 }, (_, index) => ({
+        id: `listen-only-${index + 1}`,
+        parentMessageId: index === 0 ? '2' : `listen-only-${index}`,
+        text: `Ambient transcript ${index + 1}`,
+        metadata: {
+          viventium: {
+            type: 'listen_only_transcript',
+            mode: 'listen_only',
+          },
+        },
+      }));
+      const messages = [
+        { id: '1', parentMessageId: Constants.NO_PARENT, text: 'User message' },
+        { id: '2', parentMessageId: '1', text: 'Assistant message' },
+        ...listenOnlyChain,
+      ];
+
+      const result = TestClient.constructor.getMessagesForConversation({
+        messages,
+        parentMessageId: '2',
+        skipCondition: (message) =>
+          message.metadata?.viventium?.type === 'listen_only_transcript' &&
+          message.metadata?.viventium?.mode === 'listen_only',
+      });
+
+      expect(result.map((message) => message.id)).toEqual(['1', '2']);
+    });
+
     let unorderedMessagesWithSummary = [
       { id: '4', parentMessageId: '3', text: 'Message 4' },
       { id: '2', parentMessageId: '1', text: 'Message 2', summary: 'Summary for Message 2' },

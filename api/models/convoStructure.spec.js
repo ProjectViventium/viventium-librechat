@@ -21,7 +21,7 @@ beforeEach(async () => {
 });
 
 describe('Conversation Structure Tests', () => {
-  test('Conversation folding/corrupting with inconsistent timestamps', async () => {
+  test('Conversation structure is stable with inconsistent timestamps', async () => {
     const userId = 'testUser';
     const conversationId = 'testConversation';
 
@@ -77,8 +77,14 @@ describe('Conversation Structure Tests', () => {
     // Build tree
     const tree = buildTree({ messages: retrievedMessages });
 
-    // Check if the tree is incorrect (folded/corrupted)
-    expect(tree.length).toBeGreaterThan(1); // Should have multiple root messages, indicating corruption
+    expect(tree.length).toBe(1);
+    expect(tree[0].messageId).toBe('message0');
+    expect(tree[0].children[0].messageId).toBe('message1');
+    expect(tree[0].children[0].children.map((child) => child.messageId)).toEqual([
+      'message2',
+      'message3',
+    ]);
+    expect(tree[0].children[0].children[0].children[0].messageId).toBe('message4');
   });
 
   test('Fix: Conversation structure maintained with more than 16 messages', async () => {
@@ -115,7 +121,7 @@ describe('Conversation Structure Tests', () => {
     expect(currentNode.children.length).toBe(0); // Last message should have no children
   });
 
-  test('Simulate MongoDB ordering issue with more than 16 messages and close timestamps', async () => {
+  test('Conversation structure is stable with more than 16 messages and close timestamps', async () => {
     const userId = 'testUser';
     const conversationId = 'testConversation';
 
@@ -139,7 +145,13 @@ describe('Conversation Structure Tests', () => {
     await bulkSaveMessages(messages, true);
     const retrievedMessages = await getMessages({ conversationId, user: userId });
     const tree = buildTree({ messages: retrievedMessages });
-    expect(tree.length).toBeGreaterThan(1);
+    expect(tree.length).toBe(1);
+    let currentNode = tree[0];
+    for (let i = 1; i < 20; i++) {
+      expect(currentNode.children).toHaveLength(1);
+      currentNode = currentNode.children[0];
+      expect(currentNode.messageId).toBe(`message${i}`);
+    }
   });
 
   test('Fix: Preserve order with more than 16 messages by maintaining original timestamps', async () => {

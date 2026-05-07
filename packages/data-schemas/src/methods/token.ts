@@ -87,6 +87,43 @@ export function createTokenMethods(mongoose: typeof import('mongoose')) {
   }
 
   /**
+   * Deletes one Token document that matches every provided query field.
+   * Use this when user-scoped OAuth cleanup must be exact. `deleteTokens` intentionally
+   * preserves LibreChat's historical OR semantics for broader cleanup paths.
+   */
+  async function deleteToken(query: TokenQuery): Promise<IToken | null> {
+    try {
+      const Token = mongoose.models.Token;
+      const conditions = [];
+
+      if (query.userId !== undefined) {
+        conditions.push({ userId: query.userId });
+      }
+      if (query.type !== undefined) {
+        conditions.push({ type: query.type });
+      }
+      if (query.token !== undefined) {
+        conditions.push({ token: query.token });
+      }
+      if (query.email !== undefined) {
+        conditions.push({ email: query.email.trim().toLowerCase() });
+      }
+      if (query.identifier !== undefined) {
+        conditions.push({ identifier: query.identifier });
+      }
+
+      if (conditions.length === 0) {
+        throw new Error('At least one query parameter must be provided');
+      }
+
+      return await Token.findOneAndDelete({ $and: conditions });
+    } catch (error) {
+      logger.debug('An error occurred while deleting token:', error);
+      throw error;
+    }
+  }
+
+  /**
    * Finds a Token document that matches the provided query.
    * Email is automatically normalized to lowercase for case-insensitive matching.
    */
@@ -97,6 +134,9 @@ export function createTokenMethods(mongoose: typeof import('mongoose')) {
 
       if (query.userId) {
         conditions.push({ userId: query.userId });
+      }
+      if (query.type) {
+        conditions.push({ type: query.type });
       }
       if (query.token) {
         conditions.push({ token: query.token });
@@ -122,6 +162,7 @@ export function createTokenMethods(mongoose: typeof import('mongoose')) {
     findToken,
     createToken,
     updateToken,
+    deleteToken,
     deleteTokens,
   };
 }

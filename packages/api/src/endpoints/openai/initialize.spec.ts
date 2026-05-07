@@ -40,6 +40,7 @@ const createParams = (
         }),
       ),
     ),
+    updateUserKey: jest.fn(),
     ...overrides.dbOverrides,
   };
 
@@ -60,6 +61,7 @@ describe('initializeOpenAI', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    global.fetch = jest.fn();
     process.env = {
       ...originalEnv,
       OPENAI_API_KEY: 'platform-openai-key',
@@ -72,6 +74,7 @@ describe('initializeOpenAI', () => {
 
   afterEach(() => {
     process.env = originalEnv;
+    jest.restoreAllMocks();
   });
 
   it('should prioritize a connected user key over platform key', async () => {
@@ -130,6 +133,127 @@ describe('initializeOpenAI', () => {
       }),
       EModelEndpoint.openAI,
     );
+  });
+
+  it('should refresh an expired OpenAI subscription credential before use', async () => {
+    const accessTokenPayload = Buffer.from(
+      JSON.stringify({
+        'https://api.openai.com/auth': {
+          chatgpt_account_id: 'acct_refreshed',
+        },
+      }),
+    )
+      .toString('base64url');
+    const refreshedAccessToken = `header.${accessTokenPayload}.signature`;
+    const mockFetch = jest.mocked(global.fetch);
+    mockFetch.mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      text: async () =>
+        JSON.stringify({
+          access_token: refreshedAccessToken,
+          refresh_token: 'refreshed-refresh-token',
+          expires_in: 28800,
+        }),
+    } as Response);
+
+    const params = createParams({
+      dbOverrides: {
+        getUserKeyValues: jest.fn().mockResolvedValue({
+          apiKey: 'expired-openai-oauth-access-token',
+          baseURL: 'https://chatgpt.com/backend-api/codex',
+          headers: {
+            'OpenAI-Beta': 'responses=experimental',
+            originator: 'viventium',
+            'chatgpt-account-id': 'acct_old',
+          },
+          refreshToken: 'refresh-token',
+          oauthProvider: 'openai-codex',
+          oauthType: 'subscription',
+          oauthExpiresAt: Date.now() - 60 * 1000,
+        }),
+      },
+    });
+
+    await initializeOpenAI(params);
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      'https://auth.openai.com/oauth/token',
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({
+          'Content-Type': 'application/x-www-form-urlencoded',
+        }),
+        body: expect.any(URLSearchParams),
+      }),
+    );
+    expect((mockFetch.mock.calls[0]?.[1] as RequestInit | undefined)?.body?.toString()).toContain(
+      'grant_type=refresh_token',
+    );
+    expect(mockGetOpenAIConfig).toHaveBeenCalledWith(
+      refreshedAccessToken,
+      expect.objectContaining({
+        reverseProxyUrl: 'https://chatgpt.com/backend-api/codex',
+        headers: expect.objectContaining({
+          'OpenAI-Beta': 'responses=experimental',
+          originator: 'pi',
+          'chatgpt-account-id': 'acct_refreshed',
+        }),
+        modelOptions: expect.objectContaining({
+          useResponsesApi: true,
+        }),
+      }),
+      EModelEndpoint.openAI,
+    );
+    const updateUserKey = params.db.updateUserKey as jest.Mock;
+    expect(updateUserKey).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId: 'user-123',
+        name: EModelEndpoint.openAI,
+        expiresAt: null,
+      }),
+    );
+    const persistedValue = JSON.parse(updateUserKey.mock.calls[0][0].value);
+    expect(persistedValue).toMatchObject({
+      apiKey: refreshedAccessToken,
+      refreshToken: 'refreshed-refresh-token',
+      oauthProvider: 'openai-codex',
+      oauthType: 'subscription',
+      accountId: 'acct_refreshed',
+    });
+    expect(persistedValue.oauthExpiresAt).toBeGreaterThan(Date.now());
+  });
+
+  it('should surface reconnect guidance when expired OpenAI subscription refresh fails', async () => {
+    const mockFetch = jest.mocked(global.fetch);
+    mockFetch.mockResolvedValue({
+      ok: false,
+      status: 400,
+      statusText: 'Bad Request',
+      text: async () =>
+        JSON.stringify({
+          error: 'invalid_grant',
+          error_description: 'Refresh token not found or invalid',
+        }),
+    } as Response);
+
+    const params = createParams({
+      dbOverrides: {
+        getUserKeyValues: jest.fn().mockResolvedValue({
+          apiKey: 'expired-openai-oauth-access-token',
+          refreshToken: 'broken-refresh-token',
+          oauthProvider: 'openai-codex',
+          oauthType: 'subscription',
+          oauthExpiresAt: Date.now() - 60 * 1000,
+        }),
+      },
+    });
+
+    await expect(initializeOpenAI(params)).rejects.toThrow(
+      'OpenAI connected account needs reconnect in Settings > Account > Connected Accounts.',
+    );
+    expect(mockGetOpenAIConfig).not.toHaveBeenCalled();
   });
 
   it('should fallback to platform key when no connected user key exists', async () => {

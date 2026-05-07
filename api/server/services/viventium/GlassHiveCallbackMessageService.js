@@ -70,6 +70,8 @@ function toPublicCallback(message) {
     workerId: metadata.workerId || null,
     runId: metadata.runId || null,
     surface: metadata.surface || null,
+    callbackId: metadata.callbackId || null,
+    hasFullText: Boolean(metadata.hasFullText),
     createdAt: message?.createdAt || null,
     updatedAt: message?.updatedAt || null,
   };

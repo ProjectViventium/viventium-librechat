@@ -33,6 +33,11 @@ let mockLoadAuthValues;
 let mockCreateCallSession;
 let mockFilterFile;
 let mockProcessAgentFileUpload;
+let mockClaimGlassHiveDeliveries;
+let mockMarkGlassHiveDeliverySent;
+let mockMarkGlassHiveDeliveryFailed;
+let mockMarkGlassHiveDeliverySuppressed;
+let mockDeliveryBacklogSummary;
 
 jest.mock(
   '@librechat/data-schemas',
@@ -119,6 +124,14 @@ jest.mock('~/server/controllers/assistants/helpers', () => ({
 jest.mock('~/server/services/viventium/CallSessionService', () => ({
   createCallSession: (...args) => mockCreateCallSession(...args),
   resolveUserVoiceRoute: (...args) => mockResolveUserVoiceRoute(...args),
+}));
+
+jest.mock('~/server/services/viventium/GlassHiveCallbackDeliveryService', () => ({
+  claimPendingGlassHiveCallbackDeliveries: (...args) => mockClaimGlassHiveDeliveries(...args),
+  markGlassHiveCallbackDeliverySent: (...args) => mockMarkGlassHiveDeliverySent(...args),
+  markGlassHiveCallbackDeliveryFailed: (...args) => mockMarkGlassHiveDeliveryFailed(...args),
+  markGlassHiveCallbackDeliverySuppressed: (...args) => mockMarkGlassHiveDeliverySuppressed(...args),
+  deliveryBacklogSummary: (...args) => mockDeliveryBacklogSummary(...args),
 }));
 
 jest.mock('~/models/Agent', () => ({
@@ -349,6 +362,11 @@ describe('/api/viventium/telegram', () => {
         variant: 'mlx-community/chatterbox-turbo-8bit',
       },
     });
+    mockClaimGlassHiveDeliveries = jest.fn().mockResolvedValue([]);
+    mockMarkGlassHiveDeliverySent = jest.fn().mockResolvedValue({ deliveryId: 'ghcd_1' });
+    mockMarkGlassHiveDeliveryFailed = jest.fn().mockResolvedValue({ deliveryId: 'ghcd_1' });
+    mockMarkGlassHiveDeliverySuppressed = jest.fn().mockResolvedValue({ deliveryId: 'ghcd_1' });
+    mockDeliveryBacklogSummary = jest.fn().mockResolvedValue({ count: 0, oldest: null });
     mockTelegramMappingFindOne = jest.fn().mockReturnValue({
       lean: async () => ({ libreChatUserId: 'user_1' }),
     });
@@ -932,6 +950,77 @@ describe('/api/viventium/telegram', () => {
 
     expect(res.statusCode).toBe(200);
     expect(res.body.latest.text).toBe('Worker result from content.');
+  });
+
+  test('POST glasshive delivery claim uses bridge secret without per-user Telegram id', async () => {
+    const telegramRouter = require('../telegram');
+    const app = createTestApp(telegramRouter);
+    mockClaimGlassHiveDeliveries.mockResolvedValueOnce([
+      {
+        deliveryId: 'ghcd_1',
+        callbackId: 'cb_1',
+        text: 'Worker finished.',
+        telegramChatId: 'chat-1',
+        claimId: 'claim-1',
+      },
+    ]);
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/telegram/glasshive/deliveries/claim',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      body: { limit: 5, dispatcherId: 'test-dispatcher' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body.deliveries).toHaveLength(1);
+    expect(mockClaimGlassHiveDeliveries).toHaveBeenCalledWith(
+      expect.objectContaining({
+        surface: 'telegram',
+        limit: 5,
+        claimOwner: 'test-dispatcher',
+      }),
+    );
+  });
+
+  test('POST glasshive delivery status marks sent by delivery claim id', async () => {
+    const telegramRouter = require('../telegram');
+    const app = createTestApp(telegramRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/telegram/glasshive/deliveries/ghcd_1/status',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      body: { claimId: 'claim-1', status: 'sent' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockMarkGlassHiveDeliverySent).toHaveBeenCalledWith({
+      deliveryId: 'ghcd_1',
+      claimId: 'claim-1',
+    });
+  });
+
+  test('POST glasshive delivery status reports lost claim as conflict', async () => {
+    const telegramRouter = require('../telegram');
+    const app = createTestApp(telegramRouter);
+    mockMarkGlassHiveDeliverySent.mockResolvedValueOnce(null);
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/telegram/glasshive/deliveries/ghcd_1/status',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      body: { claimId: 'claim-stale', status: 'sent' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body.error).toBe('delivery_not_claimed');
   });
 
   test('GET cortex resolves deferred fallback canonical text when follow-up is absent', async () => {

@@ -179,6 +179,12 @@ ensure_local_search_backfill() {
     echo -e "${YELLOW}Ensuring local conversation search is fully indexed...${NC}"
     node "$sync_script"
 }
+
+run_local_search_backfill_nonblocking() {
+    if ! ensure_local_search_backfill; then
+        echo -e "${YELLOW}Local conversation search sync failed; continuing startup with degraded recall/search.${NC}"
+    fi
+}
 # === VIVENTIUM END ===
 
 #==================================================#
@@ -503,11 +509,11 @@ if [ "$FRONTEND_ONLY" = true ]; then
     cd client && BACKEND_PORT="$LC_API_PORT" VIVENTIUM_LC_API_PORT="$LC_API_PORT" npm run dev -- --host "${HOST}" --port "$LC_FRONTEND_PORT"
 elif [ "$BACKEND_ONLY" = true ]; then
     echo -e "${BLUE}Starting backend only...${NC}"
-    ensure_local_search_backfill
+    run_local_search_backfill_nonblocking
     npm run backend:dev
 else
     # Start both backend and frontend
-    ensure_local_search_backfill
+    run_local_search_backfill_nonblocking
     echo -e "${BLUE}Starting backend server...${NC}"
     npm run backend:dev &
     BACKEND_PID=$!

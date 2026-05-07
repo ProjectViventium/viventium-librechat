@@ -18,11 +18,15 @@ const db = require('~/models');
 const {
   GLASSHIVE_CALLBACK_TYPE,
 } = require('~/server/services/viventium/GlassHiveCallbackMessageService');
+const {
+  enqueueGlassHiveCallbackDelivery,
+} = require('~/server/services/viventium/GlassHiveCallbackDeliveryService');
 
 const router = express.Router();
 const CALLBACK_SKEW_SEC = 5 * 60;
 const CALLBACK_REPLAY_TTL_MS = 10 * 60 * 1000;
 const MAX_CALLBACK_TEXT_LENGTH = 2400;
+const MAX_CALLBACK_FULL_TEXT_LENGTH = 64000;
 const MAX_CALLBACK_EVENTS = 20;
 const USER_VISIBLE_CALLBACK_EVENTS = new Set([
   'run.completed',
@@ -115,7 +119,7 @@ function rememberCallback(body = {}, nowMs = Date.now()) {
   seenCallbacks.set(callbackReplayKey(body), nowMs + CALLBACK_REPLAY_TTL_MS);
 }
 
-function sanitizeCallbackMessage(value) {
+function sanitizeCallbackMessage(value, { maxLength = MAX_CALLBACK_TEXT_LENGTH } = {}) {
   let text = String(value || '').trim();
   if (!text) {
     return '';
@@ -139,8 +143,8 @@ function sanitizeCallbackMessage(value) {
     .join('\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
-  if (text.length > MAX_CALLBACK_TEXT_LENGTH) {
-    return `${text.slice(0, MAX_CALLBACK_TEXT_LENGTH - 3).trim()}...`;
+  if (maxLength && text.length > maxLength) {
+    return `${text.slice(0, maxLength - 3).trim()}...`;
   }
   return text;
 }
@@ -169,6 +173,35 @@ function callbackText(body = {}) {
     return message || 'I saved the artifact.';
   }
   return '';
+}
+
+function callbackFullText(body = {}, preview = '') {
+  const full = sanitizeCallbackMessage(body.full_message || '', {
+    maxLength: MAX_CALLBACK_FULL_TEXT_LENGTH,
+  });
+  if (!full || full === preview) {
+    return '';
+  }
+  return full;
+}
+
+function callbackSurface(body = {}) {
+  return String(body.surface || '')
+    .trim()
+    .toLowerCase();
+}
+
+function needsSurfaceDelivery(body = {}) {
+  const surface = callbackSurface(body);
+  if (surface === 'telegram') {
+    return Boolean(
+      String(body.telegram_chat_id || '').trim() || String(body.telegram_user_id || '').trim(),
+    );
+  }
+  if (surface === 'voice') {
+    return Boolean(String(body.voice_call_session_id || '').trim());
+  }
+  return false;
 }
 
 function callbackContent(text) {
@@ -239,27 +272,61 @@ function messageById(messages, messageId) {
   );
 }
 
-function hasPersistedCallback(messages, body = {}) {
+function persistedCallbackMessage(messages, body = {}) {
   const replayKey = callbackReplayKey(body);
   const callbackId = String(body.callback_id || '').trim();
-  return (Array.isArray(messages) ? messages : []).some((message) => {
-    const metadata = message?.metadata?.viventium;
-    if (!metadata || metadata.type !== GLASSHIVE_CALLBACK_TYPE) {
-      return false;
-    }
-    if (callbackId && String(metadata.callbackId || '').trim() === callbackId) {
-      return true;
-    }
-    if (replayKey && String(metadata.callbackKey || '').trim() === replayKey) {
-      return true;
-    }
-    const events = Array.isArray(metadata.events) ? metadata.events : [];
-    return events.some((event) => {
-      if (callbackId && String(event?.callbackId || '').trim() === callbackId) {
+  return (
+    (Array.isArray(messages) ? messages : []).find((message) => {
+      const metadata = message?.metadata?.viventium;
+      if (!metadata || metadata.type !== GLASSHIVE_CALLBACK_TYPE) {
+        return false;
+      }
+      if (callbackId && String(metadata.callbackId || '').trim() === callbackId) {
         return true;
       }
-      return replayKey && String(event?.callbackKey || '').trim() === replayKey;
-    });
+      if (replayKey && String(metadata.callbackKey || '').trim() === replayKey) {
+        return true;
+      }
+      const events = Array.isArray(metadata.events) ? metadata.events : [];
+      return events.some((event) => {
+        if (callbackId && String(event?.callbackId || '').trim() === callbackId) {
+          return true;
+        }
+        return replayKey && String(event?.callbackKey || '').trim() === replayKey;
+      });
+    }) || null
+  );
+}
+
+function hasPersistedCallback(messages, body = {}) {
+  return Boolean(persistedCallbackMessage(messages, body));
+}
+
+async function enqueueSurfaceDeliveryOrThrow({ body, message, text, fullText }) {
+  if (!needsSurfaceDelivery(body)) {
+    return null;
+  }
+  return enqueueGlassHiveCallbackDelivery({
+    body,
+    message,
+    text,
+    fullText,
+  });
+}
+
+async function repairDuplicateSurfaceDelivery({ body, messages, text, fullText }) {
+  if (!needsSurfaceDelivery(body)) {
+    return null;
+  }
+  const persistedMessage = persistedCallbackMessage(messages, body);
+  if (!persistedMessage) {
+    return null;
+  }
+  return enqueueGlassHiveCallbackDelivery({
+    body,
+    message: persistedMessage,
+    text: String(persistedMessage.text || text || '').trim(),
+    fullText,
   });
 }
 
@@ -281,6 +348,7 @@ function buildCallbackMetadata({
   requestedParentMessageId,
   anchorMessageId,
   previousMetadata,
+  hasFullText,
 }) {
   const previousViventium =
     previousMetadata && typeof previousMetadata === 'object' && previousMetadata.viventium
@@ -307,6 +375,7 @@ function buildCallbackMetadata({
       telegramUserId: body?.telegram_user_id,
       callbackId: body?.callback_id || null,
       callbackKey: callbackReplayKey(body || {}),
+      hasFullText: Boolean(hasFullText),
       events: [...previousEvents, eventEntry].slice(-MAX_CALLBACK_EVENTS),
     },
   };
@@ -354,6 +423,7 @@ router.post('/callback', async (req, res) => {
   if (!text) {
     return res.status(202).json({ status: 'ignored', reason: 'missing_context_or_text' });
   }
+  const fullText = callbackFullText(req.body || {}, text);
   if (!userId || !conversationId || !requestedParentMessageId || !anchorMessageId) {
     return res.status(425).json({ error: 'missing_callback_anchor' });
   }
@@ -365,7 +435,8 @@ router.post('/callback', async (req, res) => {
   if (!conversation) {
     return res.status(403).json({ error: 'conversation_not_found' });
   }
-  if (hasSeenCallback(req.body || {})) {
+  const callbackWasRecentlySeen = hasSeenCallback(req.body || {});
+  if (callbackWasRecentlySeen && !needsSurfaceDelivery(req.body || {})) {
     return res.status(409).json({ error: 'duplicate_callback' });
   }
 
@@ -383,7 +454,21 @@ router.post('/callback', async (req, res) => {
   }
 
   if (hasPersistedCallback(messages, req.body || {})) {
+    try {
+      await repairDuplicateSurfaceDelivery({
+        body: req.body || {},
+        messages,
+        text,
+        fullText,
+      });
+    } catch (err) {
+      logger.warn('[VIVENTIUM][glasshive] Failed to repair duplicate callback delivery:', err);
+      return res.status(500).json({ error: 'delivery_enqueue_failed' });
+    }
     rememberCallback(req.body || {});
+    return res.status(409).json({ error: 'duplicate_callback' });
+  }
+  if (callbackWasRecentlySeen) {
     return res.status(409).json({ error: 'duplicate_callback' });
   }
   if (!messageById(messages, anchorMessageId)) {
@@ -409,6 +494,7 @@ router.post('/callback', async (req, res) => {
     requestedParentMessageId,
     anchorMessageId,
     previousMetadata: priorStatusMessage?.metadata,
+    hasFullText: Boolean(fullText),
   });
   const timestamps = callbackMessageTimestamps({
     messages,
@@ -444,6 +530,20 @@ router.post('/callback', async (req, res) => {
   } catch (err) {
     logger.warn('[VIVENTIUM][glasshive] Failed to persist callback message:', err);
     return res.status(500).json({ error: 'persist_failed' });
+  }
+
+  try {
+    await enqueueSurfaceDeliveryOrThrow({
+      body: req.body || {},
+      message: followUpMessage,
+      text,
+      fullText,
+    });
+  } catch (err) {
+    logger.warn('[VIVENTIUM][glasshive] Failed to enqueue callback delivery:', err);
+    if (needsSurfaceDelivery(req.body || {})) {
+      return res.status(500).json({ error: 'delivery_enqueue_failed' });
+    }
   }
 
   rememberCallback(req.body || {});

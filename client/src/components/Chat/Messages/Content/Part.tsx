@@ -229,17 +229,16 @@ const Part = memo(
           }}
         />
       );
-    }
-    /* === VIVENTIUM START ===
-     * Feature: Background Cortex message parts (activation/brewing/insight)
-     * Purpose: Render cortex status rows using the CortexCall UI component.
-     * Added: 2026-01-05
-     */
-    else if (
+    } else if (
       part.type === ContentTypes.CORTEX_ACTIVATION ||
       part.type === ContentTypes.CORTEX_BREWING ||
       part.type === ContentTypes.CORTEX_INSIGHT
     ) {
+      /* === VIVENTIUM START ===
+       * Feature: Background Cortex message parts (activation/brewing/insight)
+       * Purpose: Render cortex status rows using the CortexCall UI component.
+       * Added: 2026-01-05
+       */
       const cortexPart = part as CortexContentPart;
       return (
         <CortexCall
@@ -249,12 +248,13 @@ const Part = memo(
           confidence={cortexPart.confidence}
           reason={cortexPart.reason}
           insight={cortexPart.insight}
+          silent={cortexPart.silent}
+          no_response={cortexPart.no_response}
           isLast={isLast}
-          isSubmitting={isSubmitting}
         />
       );
+      /* === VIVENTIUM END === */
     }
-    /* === VIVENTIUM END === */
 
     return null;
   },

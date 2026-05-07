@@ -82,6 +82,18 @@ const searchEnabled = process.env.SEARCH != null && process.env.SEARCH.toLowerCa
 const meiliEnabled =
   process.env.MEILI_HOST != null && process.env.MEILI_MASTER_KEY != null && searchEnabled;
 
+/* === VIVENTIUM START ===
+ * Feature: Listen-Only Mode
+ * Purpose: Ambient Listen-Only transcript rows are visible conversation history for delayed
+ * memory hardening, not searchable live-recall documents. Keep them out of Meili even when the
+ * generic sync plugin would otherwise index every non-expired message.
+ * === VIVENTIUM END === */
+function isListenOnlyMeiliOptOut(doc: unknown): boolean {
+  const metadata = (doc as { metadata?: { viventium?: { type?: unknown; mode?: unknown } } })
+    ?.metadata?.viventium;
+  return metadata?.type === 'listen_only_transcript' && metadata?.mode === 'listen_only';
+}
+
 /**
  * Get sync configuration from environment variables
  */
@@ -222,6 +234,8 @@ const createMeiliMongooseModel = ({
         const query: FilterQuery<unknown> = {
           expiredAt: null,
           _meiliIndex: { $ne: true },
+          'metadata.viventium.type': { $ne: 'listen_only_transcript' },
+          'metadata.viventium.mode': { $ne: 'listen_only' },
         };
 
         try {
@@ -291,7 +305,11 @@ const createMeiliMongooseModel = ({
 
         // Update MongoDB to mark documents as indexed
         const docsIds = documents.map((doc) => doc._id);
-        await this.updateMany({ _id: { $in: docsIds } }, { $set: { _meiliIndex: true } });
+        await this.updateMany(
+          { _id: { $in: docsIds } },
+          { $set: { _meiliIndex: true } },
+          { timestamps: false },
+        );
       } catch (error) {
         logger.error('[processSyncBatch] Error processing batch:', error);
         throw error;
@@ -322,18 +340,25 @@ const createMeiliMongooseModel = ({
           const meiliIds = batch.results.map((doc) => doc[primaryKey]);
           const query: Record<string, unknown> = {};
           query[primaryKey] = { $in: meiliIds };
+          query['metadata.viventium.type'] = { $ne: 'listen_only_transcript' };
+          query['metadata.viventium.mode'] = { $ne: 'listen_only' };
 
-          // Find which documents exist in MongoDB
+          // Find which documents exist in MongoDB and are still eligible for indexing.
           const existingDocs = await this.find(query).select(primaryKey).lean();
 
           const existingIds = new Set(
             existingDocs.map((doc: Record<string, unknown>) => doc[primaryKey]),
           );
 
-          // Delete documents that don't exist in MongoDB
+          // Delete documents that don't exist in MongoDB or are no longer index-eligible.
           const toDelete = meiliIds.filter((id) => !existingIds.has(id));
           if (toDelete.length > 0) {
             await index.deleteDocuments(toDelete.map(String));
+            await this.updateMany(
+              { [primaryKey]: { $in: toDelete } },
+              { $set: { _meiliIndex: false } },
+              { timestamps: false },
+            );
             logger.debug(`[cleanupMeiliIndex] Deleted ${toDelete.length} orphaned documents`);
           }
           // if fetch documents request returns less documents than limit, all documents are processed
@@ -438,7 +463,7 @@ const createMeiliMongooseModel = ({
       next: CallbackWithoutResultAndOptionalError,
     ): Promise<void> {
       // If this conversation or message has a TTL, don't index it
-      if (!_.isNil(this.expiredAt)) {
+      if (!_.isNil(this.expiredAt) || isListenOnlyMeiliOptOut(this)) {
         return next();
       }
 
@@ -518,6 +543,9 @@ const createMeiliMongooseModel = ({
      * otherwise, it adds the document to the index.
      */
     postSaveHook(this: DocumentWithMeiliIndex, next: CallbackWithoutResultAndOptionalError): void {
+      if (isListenOnlyMeiliOptOut(this)) {
+        return next();
+      }
       if (this._meiliIndex) {
         this.updateObjectToMeili!(next);
       } else {

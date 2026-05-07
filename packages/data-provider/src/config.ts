@@ -999,13 +999,49 @@ const backgroundCortexActivationFormatSchema = z.object({
   brew_begin_tag: z.string().optional(),
 });
 
+const backgroundCortexDirectActionServerSchema = z
+  .object({
+    server: z.string().optional(),
+    name: z.string().optional(),
+    owns: z.string().optional(),
+    description: z.string().optional(),
+    scope_key: z.string().optional(),
+    scopeKey: z.string().optional(),
+    intent_scope: z.string().optional(),
+    activation_scope: z.string().optional(),
+    same_scope_background_allowed: z.boolean().optional(),
+    allow_same_scope_background: z.boolean().optional(),
+    supplemental_background: z.boolean().optional(),
+    tool_names: z.array(z.string()).optional(),
+  })
+  .passthrough();
+
+const backgroundCortexActivationPolicySchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    prompt: z.string().optional(),
+    direct_action_tool_rule: z.string().optional(),
+    direct_action_mcp_servers: z.array(backgroundCortexDirectActionServerSchema).optional(),
+  })
+  .passthrough();
+
 const backgroundCorticesSchema = z.object({
   activation_format: backgroundCortexActivationFormatSchema.optional(),
-});
+  activation_policy: backgroundCortexActivationPolicySchema.optional(),
+}).passthrough();
 
-const viventiumSchema = z.object({
-  background_cortices: backgroundCorticesSchema.optional(),
-});
+const viventiumNoResponseSchema = z
+  .object({
+    prompt: z.string().optional(),
+  })
+  .passthrough();
+
+const viventiumSchema = z
+  .object({
+    background_cortices: backgroundCorticesSchema.optional(),
+    no_response: viventiumNoResponseSchema.optional(),
+  })
+  .passthrough();
 
 const customEndpointsSchema = z.array(endpointSchema.partial()).optional();
 

@@ -216,14 +216,14 @@ describe('loadConfigModels', () => {
     // Assuming fetchModels would be called only for Mistral and OpenRouter
     fetchModels.mockImplementation(({ name }) => {
       switch (name) {
-        case 'Mistral':
+        case 'mistral':
           return Promise.resolve([
             'mistral-tiny',
             'mistral-small',
             'mistral-medium',
             'mistral-large-latest',
           ]);
-        case 'OpenRouter':
+        case 'openrouter':
           return Promise.resolve(['gpt-3.5-turbo']);
         default:
           return Promise.resolve([]);
@@ -233,7 +233,7 @@ describe('loadConfigModels', () => {
     const result = await loadConfigModels(mockRequest);
 
     // Since fetch is true and apiKey is not "user_provided", fetching occurs for Mistral and OpenRouter
-    expect(result.Mistral).toEqual([
+    expect(result.mistral).toEqual([
       'mistral-tiny',
       'mistral-small',
       'mistral-medium',
@@ -241,15 +241,15 @@ describe('loadConfigModels', () => {
     ]);
     expect(fetchModels).toHaveBeenCalledWith(
       expect.objectContaining({
-        name: 'Mistral',
+        name: 'mistral',
         apiKey: process.env.MY_PRECIOUS_MISTRAL_KEY,
       }),
     );
 
-    expect(result.OpenRouter).toEqual(['gpt-3.5-turbo']);
+    expect(result.openrouter).toEqual(['gpt-3.5-turbo']);
     expect(fetchModels).toHaveBeenCalledWith(
       expect.objectContaining({
-        name: 'OpenRouter',
+        name: 'openrouter',
         apiKey: process.env.MY_OPENROUTER_API_KEY,
       }),
     );

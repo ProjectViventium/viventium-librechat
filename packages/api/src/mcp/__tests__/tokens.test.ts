@@ -28,12 +28,14 @@ describe('MCPTokenStorage', () => {
     let mockFindToken: jest.MockedFunction<TokenMethods['findToken']>;
     let mockCreateToken: jest.MockedFunction<TokenMethods['createToken']>;
     let mockUpdateToken: jest.MockedFunction<TokenMethods['updateToken']>;
+    let mockDeleteToken: jest.MockedFunction<TokenMethods['deleteToken']>;
 
     beforeEach(() => {
       jest.clearAllMocks();
       mockFindToken = jest.fn();
       mockCreateToken = jest.fn().mockResolvedValue(undefined);
       mockUpdateToken = jest.fn().mockResolvedValue(undefined);
+      mockDeleteToken = jest.fn().mockResolvedValue(undefined);
     });
 
     it('should force refresh tokens even when access token is not expired', async () => {
@@ -109,6 +111,7 @@ describe('MCPTokenStorage', () => {
         findToken: mockFindToken,
         createToken: mockCreateToken,
         updateToken: mockUpdateToken,
+        deleteToken: mockDeleteToken,
         refreshTokens,
         forceRefresh: true,
       });
@@ -133,6 +136,221 @@ describe('MCPTokenStorage', () => {
       );
 
       storeTokensSpy.mockRestore();
+    });
+
+    it('should clear stale OAuth token set when refresh fails with invalid_grant', async () => {
+      const accessTokenData = {
+        userId: new Types.ObjectId(userId),
+        type: 'mcp_oauth',
+        identifier,
+        token: 'enc-access',
+        createdAt: new Date(Date.now() - 60_000),
+        expiresAt: new Date(Date.now() + 60 * 60_000),
+      } as unknown as IToken;
+
+      const refreshTokenData = {
+        userId: new Types.ObjectId(userId),
+        type: 'mcp_oauth_refresh',
+        identifier: `${identifier}:refresh`,
+        token: 'enc-refresh',
+        createdAt: new Date(Date.now() - 60_000),
+        expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60_000),
+      } as unknown as IToken;
+
+      const clientInfoData = {
+        userId: new Types.ObjectId(userId),
+        type: 'mcp_oauth_client',
+        identifier: `${identifier}:client`,
+        token: 'enc-client',
+        createdAt: new Date(Date.now() - 60_000),
+        expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60_000),
+      } as unknown as IToken;
+
+      mockFindToken.mockImplementation(async ({ type, identifier: id }) => {
+        if (type === 'mcp_oauth' && id === identifier) {
+          return accessTokenData;
+        }
+        if (type === 'mcp_oauth_refresh' && id === `${identifier}:refresh`) {
+          return refreshTokenData;
+        }
+        if (type === 'mcp_oauth_client' && id === `${identifier}:client`) {
+          return clientInfoData;
+        }
+        return null;
+      });
+
+      mockDecryptV2.mockImplementation(async (ciphertext) => {
+        if (ciphertext === 'enc-refresh') {
+          return 'refresh-token';
+        }
+        if (ciphertext === 'enc-client') {
+          return JSON.stringify({ client_id: 'client-123', client_secret: 'secret-123' });
+        }
+        return '';
+      });
+
+      const refreshTokens = jest.fn().mockRejectedValue(
+        new Error(
+          'Token refresh failed: 400 Bad Request - {"error":"invalid_grant","error_description":"expired or revoked"}',
+        ),
+      );
+
+      const result = await MCPTokenStorage.getTokens({
+        userId,
+        serverName,
+        findToken: mockFindToken,
+        createToken: mockCreateToken,
+        updateToken: mockUpdateToken,
+        deleteToken: mockDeleteToken,
+        refreshTokens,
+        forceRefresh: true,
+      });
+
+      expect(result).toBeNull();
+      expect(mockDeleteToken).toHaveBeenCalledTimes(3);
+      expect(mockDeleteToken).toHaveBeenCalledWith({
+        userId,
+        type: 'mcp_oauth_client',
+        identifier: `${identifier}:client`,
+      });
+      expect(mockDeleteToken).toHaveBeenCalledWith({
+        userId,
+        type: 'mcp_oauth',
+        identifier,
+      });
+      expect(mockDeleteToken).toHaveBeenCalledWith({
+        userId,
+        type: 'mcp_oauth_refresh',
+        identifier: `${identifier}:refresh`,
+      });
+    });
+
+    it.each([
+      [
+        'invalid_client JSON body',
+        'Token refresh failed: 401 Unauthorized - {"error":"invalid_client","error_description":"client is no longer valid"}',
+      ],
+      [
+        'consent_required form body',
+        'Token refresh failed: 400 Bad Request - error=consent_required&error_description=consent',
+      ],
+    ])('should clear stale OAuth token set for %s', async (_label, errorMessage) => {
+      const refreshTokenData = {
+        userId: new Types.ObjectId(userId),
+        type: 'mcp_oauth_refresh',
+        identifier: `${identifier}:refresh`,
+        token: 'enc-refresh',
+        createdAt: new Date(Date.now() - 60_000),
+        expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60_000),
+      } as unknown as IToken;
+
+      mockFindToken.mockImplementation(async ({ type, identifier: id }) => {
+        if (type === 'mcp_oauth_refresh' && id === `${identifier}:refresh`) {
+          return refreshTokenData;
+        }
+        return null;
+      });
+      mockDecryptV2.mockResolvedValue('refresh-token');
+
+      const refreshTokens = jest.fn().mockRejectedValue(new Error(errorMessage));
+
+      const result = await MCPTokenStorage.getTokens({
+        userId,
+        serverName,
+        findToken: mockFindToken,
+        createToken: mockCreateToken,
+        updateToken: mockUpdateToken,
+        deleteToken: mockDeleteToken,
+        refreshTokens,
+      });
+
+      expect(result).toBeNull();
+      expect(mockDeleteToken).toHaveBeenCalledTimes(3);
+      expect(mockDeleteToken).toHaveBeenCalledWith({
+        userId,
+        type: 'mcp_oauth_client',
+        identifier: `${identifier}:client`,
+      });
+      expect(mockDeleteToken).toHaveBeenCalledWith({
+        userId,
+        type: 'mcp_oauth',
+        identifier,
+      });
+      expect(mockDeleteToken).toHaveBeenCalledWith({
+        userId,
+        type: 'mcp_oauth_refresh',
+        identifier: `${identifier}:refresh`,
+      });
+    });
+
+    it('should not clear OAuth tokens on transient refresh failures', async () => {
+      const refreshTokenData = {
+        userId: new Types.ObjectId(userId),
+        type: 'mcp_oauth_refresh',
+        identifier: `${identifier}:refresh`,
+        token: 'enc-refresh',
+        createdAt: new Date(Date.now() - 60_000),
+        expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60_000),
+      } as unknown as IToken;
+
+      mockFindToken.mockImplementation(async ({ type, identifier: id }) => {
+        if (type === 'mcp_oauth_refresh' && id === `${identifier}:refresh`) {
+          return refreshTokenData;
+        }
+        return null;
+      });
+      mockDecryptV2.mockResolvedValue('refresh-token');
+
+      const refreshTokens = jest.fn().mockRejectedValue(new Error('fetch failed'));
+
+      const result = await MCPTokenStorage.getTokens({
+        userId,
+        serverName,
+        findToken: mockFindToken,
+        createToken: mockCreateToken,
+        updateToken: mockUpdateToken,
+        deleteToken: mockDeleteToken,
+        refreshTokens,
+      });
+
+      expect(result).toBeNull();
+      expect(mockDeleteToken).not.toHaveBeenCalled();
+    });
+
+    it('should not clear OAuth tokens when a transient error only contains a terminal-code substring', async () => {
+      const refreshTokenData = {
+        userId: new Types.ObjectId(userId),
+        type: 'mcp_oauth_refresh',
+        identifier: `${identifier}:refresh`,
+        token: 'enc-refresh',
+        createdAt: new Date(Date.now() - 60_000),
+        expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60_000),
+      } as unknown as IToken;
+
+      mockFindToken.mockImplementation(async ({ type, identifier: id }) => {
+        if (type === 'mcp_oauth_refresh' && id === `${identifier}:refresh`) {
+          return refreshTokenData;
+        }
+        return null;
+      });
+      mockDecryptV2.mockResolvedValue('refresh-token');
+
+      const refreshTokens = jest
+        .fn()
+        .mockRejectedValue(new Error('fetch failed while reading docs/invalid_client_notes.md'));
+
+      const result = await MCPTokenStorage.getTokens({
+        userId,
+        serverName,
+        findToken: mockFindToken,
+        createToken: mockCreateToken,
+        updateToken: mockUpdateToken,
+        deleteToken: mockDeleteToken,
+        refreshTokens,
+      });
+
+      expect(result).toBeNull();
+      expect(mockDeleteToken).not.toHaveBeenCalled();
     });
   });
   /* === VIVENTIUM END === */

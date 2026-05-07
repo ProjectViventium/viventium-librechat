@@ -31,6 +31,7 @@ interface GetTokensParams {
   ) => Promise<MCPOAuthTokens>;
   createToken?: TokenMethods['createToken'];
   updateToken?: TokenMethods['updateToken'];
+  deleteToken?: TokenMethods['deleteToken'];
   /* === VIVENTIUM START ===
    * Feature: Force token refresh on auth errors.
    * Purpose: Some MCP OAuth servers invalidate access tokens early (or clients store incorrect expiry).
@@ -41,6 +42,50 @@ interface GetTokensParams {
 }
 
 export class MCPTokenStorage {
+  private static readonly NON_REFRESHABLE_OAUTH_GRANT_ERRORS = new Set([
+    'invalid_grant',
+    'unauthorized_client',
+    'invalid_client',
+    'consent_required',
+    'interaction_required',
+    'login_required',
+  ]);
+
+  private static getOAuthErrorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error ?? '');
+  }
+
+  private static extractOAuthErrorCodes(error: unknown): string[] {
+    const message = this.getOAuthErrorMessage(error);
+    const codes = new Set<string>();
+    const jsonErrorMatches = message.matchAll(/"error"\s*:\s*"([^"]+)"/gi);
+    for (const match of jsonErrorMatches) {
+      if (match[1]) {
+        codes.add(match[1].toLowerCase());
+      }
+    }
+    const formErrorMatches = message.matchAll(/(?:^|[?&\s])error=([a-z0-9_:-]+)/gi);
+    for (const match of formErrorMatches) {
+      if (match[1]) {
+        codes.add(match[1].toLowerCase());
+      }
+    }
+    for (const code of this.NON_REFRESHABLE_OAUTH_GRANT_ERRORS) {
+      const escapedCode = code.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const boundedCodePattern = new RegExp(`(?:^|[^a-z0-9_])${escapedCode}(?:$|[^a-z0-9_])`, 'i');
+      if (boundedCodePattern.test(message)) {
+        codes.add(code);
+      }
+    }
+    return [...codes];
+  }
+
+  private static isNonRefreshableOAuthGrantError(error: unknown): boolean {
+    return this.extractOAuthErrorCodes(error).some((code) =>
+      this.NON_REFRESHABLE_OAUTH_GRANT_ERRORS.has(code),
+    );
+  }
+
   static getLogPrefix(userId: string, serverName: string): string {
     return isSystemUserId(userId)
       ? `[MCP][${serverName}]`
@@ -124,10 +169,10 @@ export class MCPTokenStorage {
         const existingToken =
           existingTokens?.accessToken !== undefined
             ? existingTokens.accessToken
-            : await findToken({ userId, identifier });
+            : await findToken({ userId, type: 'mcp_oauth', identifier });
 
         if (existingToken) {
-          await updateToken({ userId, identifier }, accessTokenData);
+          await updateToken({ userId, type: 'mcp_oauth', identifier }, accessTokenData);
           logger.debug(`${logPrefix} Updated existing access token`);
         } else {
           await createToken(accessTokenData);
@@ -169,11 +214,15 @@ export class MCPTokenStorage {
               ? existingTokens.refreshToken
               : await findToken({
                   userId,
+                  type: 'mcp_oauth_refresh',
                   identifier: `${identifier}:refresh`,
                 });
 
           if (existingRefreshToken) {
-            await updateToken({ userId, identifier: `${identifier}:refresh` }, refreshTokenData);
+            await updateToken(
+              { userId, type: 'mcp_oauth_refresh', identifier: `${identifier}:refresh` },
+              refreshTokenData,
+            );
             logger.debug(`${logPrefix} Updated existing refresh token`);
           } else {
             await createToken(refreshTokenData);
@@ -214,11 +263,15 @@ export class MCPTokenStorage {
               ? existingTokens.clientInfoToken
               : await findToken({
                   userId,
+                  type: 'mcp_oauth_client',
                   identifier: `${identifier}:client`,
                 });
 
           if (existingClientInfo) {
-            await updateToken({ userId, identifier: `${identifier}:client` }, clientInfoData);
+            await updateToken(
+              { userId, type: 'mcp_oauth_client', identifier: `${identifier}:client` },
+              clientInfoData,
+            );
             logger.debug(`${logPrefix} Updated existing client info`);
           } else {
             await createToken(clientInfoData);
@@ -251,6 +304,7 @@ export class MCPTokenStorage {
     findToken,
     createToken,
     updateToken,
+    deleteToken,
     refreshTokens,
     /* === VIVENTIUM START === */
     forceRefresh = false,
@@ -373,13 +427,21 @@ export class MCPTokenStorage {
           return newTokens;
         } catch (refreshError) {
           logger.error(`${logPrefix} Failed to refresh tokens`, refreshError);
-          // Check if it's an unauthorized_client error (refresh not supported)
-          const errorMessage =
-            refreshError instanceof Error ? refreshError.message : String(refreshError);
-          if (errorMessage.includes('unauthorized_client')) {
-            logger.info(
-              `${logPrefix} Server does not support refresh tokens for this client. New authentication required.`,
+          if (this.isNonRefreshableOAuthGrantError(refreshError)) {
+            logger.warn(
+              `${logPrefix} Stored OAuth grant is no longer refreshable. Clearing stale token set so the next attempt starts a clean OAuth reconnect.`,
             );
+            if (deleteToken) {
+              try {
+                await this.deleteUserTokens({ userId, serverName, deleteToken });
+              } catch (deleteError) {
+                logger.warn(`${logPrefix} Failed to clear stale OAuth token set`, deleteError);
+              }
+            } else {
+              logger.warn(
+                `${logPrefix} Cannot clear stale OAuth token set because deleteToken was not provided`,
+              );
+            }
           }
           return null;
         }
@@ -474,7 +536,9 @@ export class MCPTokenStorage {
   }: {
     userId: string;
     serverName: string;
-    deleteToken: (filter: { userId: string; type: string; identifier: string }) => Promise<void>;
+    deleteToken: (
+      filter: { userId: string; type: string; identifier: string },
+    ) => Promise<unknown>;
   }): Promise<void> {
     const identifier = `mcp:${serverName}`;
 

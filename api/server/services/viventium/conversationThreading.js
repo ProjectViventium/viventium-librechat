@@ -2,6 +2,9 @@
 
 const { logger } = require('@librechat/data-schemas');
 const { getConvo, getMessages } = require('~/models');
+const {
+  isListenOnlyTranscriptMessage,
+} = require('~/server/services/viventium/listenOnlyTranscript');
 
 function toTimestampMs(value) {
   if (value == null) {
@@ -42,6 +45,9 @@ function resolveLatestLeafMessageId(messages) {
 
   const hasChildren = new Set();
   for (const message of messages) {
+    if (isListenOnlyTranscriptMessage(message)) {
+      continue;
+    }
     const parentMessageId = message?.parentMessageId;
     if (typeof parentMessageId === 'string' && parentMessageId.length > 0) {
       hasChildren.add(parentMessageId);
@@ -51,6 +57,9 @@ function resolveLatestLeafMessageId(messages) {
   let latestLeaf = null;
   let latestLeafMs = NaN;
   for (const message of messages) {
+    if (isListenOnlyTranscriptMessage(message)) {
+      continue;
+    }
     const messageId = message?.messageId ?? message?.id;
     if (typeof messageId !== 'string' || messageId.length === 0) {
       continue;
@@ -85,7 +94,9 @@ function resolveLatestLeafMessageId(messages) {
     return latestLeaf.id;
   }
 
-  const fallback = messages[messages.length - 1];
+  const fallback = [...messages]
+    .reverse()
+    .find((message) => !isListenOnlyTranscriptMessage(message));
   return fallback?.messageId ?? fallback?.id ?? null;
 }
 

@@ -135,6 +135,36 @@ describe('Meilisearch Mongoose plugin', () => {
     expect(mockAddDocuments).not.toHaveBeenCalled();
   });
 
+  test('saving Listen-Only transcript messages does NOT index w/ meilisearch', async () => {
+    const messageModel = createMessageModel(mongoose);
+    const messageId = new mongoose.Types.ObjectId().toString();
+
+    await messageModel.findOneAndUpdate(
+      { messageId },
+      {
+        $set: {
+          messageId,
+          conversationId: new mongoose.Types.ObjectId().toString(),
+          user: new mongoose.Types.ObjectId().toString(),
+          isCreatedByUser: false,
+          sender: 'Listen-Only',
+          text: 'Synthetic Listen-Only transcript should not be indexed.',
+          _meiliIndex: false,
+          metadata: {
+            viventium: {
+              type: 'listen_only_transcript',
+              mode: 'listen_only',
+            },
+          },
+        },
+      },
+      { upsert: true, new: true },
+    );
+
+    expect(mockAddDocuments).not.toHaveBeenCalled();
+    expect(mockUpdateDocuments).not.toHaveBeenCalled();
+  });
+
   test('sync w/ meili does not include TTL documents', async () => {
     const conversationModel = createConversationModel(mongoose) as SchemaWithMeiliMethods;
     await conversationModel.create({
@@ -148,6 +178,50 @@ describe('Meilisearch Mongoose plugin', () => {
     await conversationModel.syncWithMeili();
 
     expect(mockAddDocuments).not.toHaveBeenCalled();
+  });
+
+  test('syncWithMeili skips legacy Listen-Only transcript messages', async () => {
+    const messageModel = createMessageModel(mongoose) as SchemaWithMeiliMethods;
+    await messageModel.deleteMany({});
+    mockAddDocumentsInBatches.mockClear();
+
+    const normalMessageId = new mongoose.Types.ObjectId().toString();
+    const listenOnlyMessageId = new mongoose.Types.ObjectId().toString();
+    await messageModel.collection.insertMany([
+      {
+        messageId: normalMessageId,
+        conversationId: new mongoose.Types.ObjectId().toString(),
+        user: new mongoose.Types.ObjectId().toString(),
+        isCreatedByUser: true,
+        text: 'Normal message should index.',
+        expiredAt: null,
+      },
+      {
+        messageId: listenOnlyMessageId,
+        conversationId: new mongoose.Types.ObjectId().toString(),
+        user: new mongoose.Types.ObjectId().toString(),
+        isCreatedByUser: false,
+        sender: 'Listen-Only',
+        text: 'Synthetic Listen-Only transcript should not sync.',
+        expiredAt: null,
+        _meiliIndex: false,
+        metadata: {
+          viventium: {
+            type: 'listen_only_transcript',
+            mode: 'listen_only',
+          },
+        },
+      },
+    ]);
+
+    await expect(messageModel.syncWithMeili()).resolves.not.toThrow();
+
+    expect(mockAddDocumentsInBatches).toHaveBeenCalledTimes(1);
+    expect(mockAddDocumentsInBatches.mock.calls[0][0]).toEqual([
+      expect.objectContaining({ messageId: normalMessageId }),
+    ]);
+    const listenOnlyDoc = await messageModel.collection.findOne({ messageId: listenOnlyMessageId });
+    expect(listenOnlyDoc?._meiliIndex).toBe(false);
   });
 
   describe('estimatedDocumentCount usage in syncWithMeili', () => {
@@ -806,6 +880,62 @@ describe('Meilisearch Mongoose plugin', () => {
 
       // Should NOT delete any documents
       expect(mockDeleteDocuments).not.toHaveBeenCalled();
+    });
+
+    test('cleanupMeiliIndex removes legacy indexed Listen-Only transcript messages', async () => {
+      const messageModel = createMessageModel(mongoose) as SchemaWithMeiliMethods;
+      await messageModel.deleteMany({});
+
+      const listenOnlyMessageId = new mongoose.Types.ObjectId().toString();
+      const normalMessageId = new mongoose.Types.ObjectId().toString();
+
+      await messageModel.collection.insertMany([
+        {
+          messageId: listenOnlyMessageId,
+          conversationId: new mongoose.Types.ObjectId(),
+          user: new mongoose.Types.ObjectId(),
+          sender: 'Listen-Only',
+          text: 'Synthetic Listen-Only transcript should be cleaned from Meili.',
+          isCreatedByUser: false,
+          _meiliIndex: true,
+          expiredAt: null,
+          metadata: {
+            viventium: {
+              type: 'listen_only_transcript',
+              mode: 'listen_only',
+            },
+          },
+        },
+        {
+          messageId: normalMessageId,
+          conversationId: new mongoose.Types.ObjectId(),
+          user: new mongoose.Types.ObjectId(),
+          text: 'Synthetic normal message remains searchable.',
+          isCreatedByUser: true,
+          _meiliIndex: true,
+          expiredAt: null,
+        },
+      ]);
+
+      mockGetDocuments.mockResolvedValueOnce({
+        results: [{ messageId: listenOnlyMessageId }, { messageId: normalMessageId }],
+      });
+
+      const indexMock = mockIndex();
+      await messageModel.cleanupMeiliIndex(indexMock, 'messageId', 100, 0);
+
+      expect(mockDeleteDocuments).toHaveBeenCalledWith([listenOnlyMessageId]);
+
+      const listenOnlyDoc = await messageModel
+        .findOne({ messageId: listenOnlyMessageId })
+        .select('+_meiliIndex')
+        .lean();
+      const normalDoc = await messageModel
+        .findOne({ messageId: normalMessageId })
+        .select('+_meiliIndex')
+        .lean();
+      expect(listenOnlyDoc?._meiliIndex).toBe(false);
+      expect(normalDoc?._meiliIndex).toBe(true);
     });
 
     test('cleanupMeiliIndex handles empty MeiliSearch index', async () => {

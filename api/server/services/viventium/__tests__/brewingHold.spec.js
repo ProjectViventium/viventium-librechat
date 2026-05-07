@@ -5,7 +5,9 @@
 
 const {
   collectConfiguredHoldScopeKeys,
+  collectDirectActionScopeKeysFromCortices,
   pickHoldText,
+  shouldForcePhaseBFollowUp,
   shouldDeferMainResponse,
 } = require('../brewingHold');
 
@@ -24,7 +26,7 @@ describe('brewingHold', () => {
     }
   });
 
-  test('shouldDeferMainResponse defaults to true for config-driven productivity scope', () => {
+  test('shouldDeferMainResponse defers when a productivity scope has no main direct owner', () => {
     delete process.env.VIVENTIUM_TOOL_CORTEX_HOLD_ENABLED;
 
     expect(
@@ -34,14 +36,20 @@ describe('brewingHold', () => {
     ).toBe(true);
   });
 
-  test('shouldDeferMainResponse defaults to true for Google productivity scope', () => {
+  test('shouldDeferMainResponse lets Phase A run when the main agent owns the activated scope', () => {
     delete process.env.VIVENTIUM_TOOL_CORTEX_HOLD_ENABLED;
 
     expect(
       shouldDeferMainResponse({
-        activatedCortices: [{ cortexName: 'Google', activationScope: 'productivity_google_workspace' }],
+        activatedCortices: [
+          {
+            cortexName: 'Google',
+            activationScope: 'productivity_google_workspace',
+            directActionSurfaceScopes: [{ server: 'google-workspace', scopeKey: 'productivity_google_workspace' }],
+          },
+        ],
       }),
-    ).toBe(true);
+    ).toBe(false);
   });
 
   test('collectConfiguredHoldScopeKeys preserves config-defined scope keys only', () => {
@@ -87,8 +95,41 @@ describe('brewingHold', () => {
     expect(
       shouldDeferMainResponse({
         activatedCortices: [{ cortexName: 'Google', activationScope: 'productivity_google_workspace' }],
+        directActionScopeKeys: [],
       }),
     ).toBe(true);
+  });
+
+  test('collectDirectActionScopeKeysFromCortices preserves activated main-direct scope awareness', () => {
+    expect(
+      collectDirectActionScopeKeysFromCortices([
+        {
+          cortexName: 'Google',
+          directActionSurfaceScopes: [
+            { server: 'google-workspace', scopeKey: 'productivity_google_workspace' },
+            { server: 'duplicate', scope_key: 'productivity_google_workspace' },
+          ],
+        },
+        {
+          cortexName: 'MS365',
+          directActionSurfaceScopes: ['productivity_ms365'],
+        },
+      ]),
+    ).toEqual(['productivity_google_workspace', 'productivity_ms365']);
+  });
+
+  test('shouldDeferMainResponse runs Phase A when any activated productivity scope is directly owned', () => {
+    delete process.env.VIVENTIUM_TOOL_CORTEX_HOLD_ENABLED;
+
+    expect(
+      shouldDeferMainResponse({
+        activatedCortices: [
+          { cortexName: 'Google', activationScope: 'productivity_google_workspace' },
+          { cortexName: 'MS365', activationScope: 'productivity_ms365' },
+        ],
+        directActionScopeKeys: ['productivity_google_workspace'],
+      }),
+    ).toBe(false);
   });
 
   test('shouldDeferMainResponse can be disabled via env', () => {
@@ -179,5 +220,45 @@ describe('brewingHold', () => {
     });
     // Without env or instructions, falls back to default
     expect(text).toBe('Checking now.');
+  });
+
+  test('shouldForcePhaseBFollowUp forces new follow-up when no-response parent has Phase B output', () => {
+    expect(
+      shouldForcePhaseBFollowUp({
+        shouldDeferMainResponse: false,
+        parentText: '{NTA}',
+        hasInsights: true,
+        hasMergedText: false,
+        allowErrorOnlyFollowUp: false,
+      }),
+    ).toBe(true);
+
+    expect(
+      shouldForcePhaseBFollowUp({
+        shouldDeferMainResponse: false,
+        parentText: '{NTA}',
+        hasInsights: false,
+        hasMergedText: true,
+        allowErrorOnlyFollowUp: false,
+      }),
+    ).toBe(true);
+  });
+
+  test('shouldForcePhaseBFollowUp does not force a normal parent unless explicitly deferred', () => {
+    expect(
+      shouldForcePhaseBFollowUp({
+        shouldDeferMainResponse: false,
+        parentText: 'I already answered.',
+        hasInsights: true,
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldForcePhaseBFollowUp({
+        shouldDeferMainResponse: true,
+        parentText: 'Checking now.',
+        hasInsights: false,
+      }),
+    ).toBe(true);
   });
 });

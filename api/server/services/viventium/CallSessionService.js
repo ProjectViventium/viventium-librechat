@@ -293,6 +293,11 @@ function normalizeSession(session) {
       : typeof session.shadowModeEnabled === 'boolean'
         ? session.shadowModeEnabled
         : false;
+  /* === VIVENTIUM START ===
+   * Feature: Listen-Only Mode
+   * Purpose: Make Listen-Only mutually exclusive with Wing Mode at the durable session boundary.
+   * === VIVENTIUM END === */
+  const normalizedListenOnlyModeEnabled = session.listenOnlyModeEnabled === true;
   return {
     callSessionId: session.callSessionId,
     userId: session.userId,
@@ -302,8 +307,9 @@ function normalizeSession(session) {
     createdAtMs: createdAt,
     expiresAtMs: expiresAt,
     requestedVoiceRoute: normalizeVoiceRouteState(session.requestedVoiceRoute),
-    wingModeEnabled: normalizedWingModeEnabled,
-    shadowModeEnabled: normalizedWingModeEnabled,
+    wingModeEnabled: normalizedListenOnlyModeEnabled ? false : normalizedWingModeEnabled,
+    shadowModeEnabled: normalizedListenOnlyModeEnabled ? false : normalizedWingModeEnabled,
+    listenOnlyModeEnabled: normalizedListenOnlyModeEnabled,
     activeJobId: session.activeJobId || null,
     activeWorkerId: session.activeWorkerId || null,
     leaseExpiresAtMs: leaseExpiresAt,
@@ -471,6 +477,7 @@ async function createCallSession({ userId, agentId, conversationId, ttlMs, reque
     expiresAt: new Date(expiresAtMs),
     wingModeEnabled: getDefaultWingModeEnabled(),
     shadowModeEnabled: getDefaultWingModeEnabled(),
+    listenOnlyModeEnabled: false,
     requestedVoiceRoute: normalizedRequestedVoiceRoute,
   };
 
@@ -504,6 +511,7 @@ async function syncCallSessionState({
   touch = true,
   wingModeEnabled,
   shadowModeEnabled,
+  listenOnlyModeEnabled,
 }) {
   if (!callSessionId) {
     throw new Error('syncCallSessionState requires callSessionId');
@@ -524,6 +532,17 @@ async function syncCallSessionState({
   if (typeof normalizedWingMode === 'boolean') {
     set.wingModeEnabled = normalizedWingMode;
     set.shadowModeEnabled = normalizedWingMode;
+    if (normalizedWingMode) {
+      set.listenOnlyModeEnabled = false;
+    }
+  }
+
+  if (typeof listenOnlyModeEnabled === 'boolean') {
+    set.listenOnlyModeEnabled = listenOnlyModeEnabled;
+    if (listenOnlyModeEnabled) {
+      set.wingModeEnabled = false;
+      set.shadowModeEnabled = false;
+    }
   }
 
   const session = await ViventiumCallSession.findOneAndUpdate(
@@ -690,6 +709,44 @@ async function updateCallSessionConversationId(callSessionId, conversationId) {
     `[CallSessionService] DEBUG UPDATE: Updated session conversationId to ${conversationId}`,
   );
   return normalizeSession(session);
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Listen-Only Mode
+ * Purpose: Atomically claim the concrete conversationId for a new call session so concurrent
+ * listen-only transcript saves cannot split one listening session across multiple conversations.
+ * === VIVENTIUM END === */
+async function materializeCallSessionConversationId(callSessionId, candidateConversationId) {
+  if (!callSessionId || !candidateConversationId || candidateConversationId === 'new') {
+    return null;
+  }
+
+  const now = new Date();
+  const claim = await ViventiumCallSession.findOneAndUpdate(
+    {
+      callSessionId: String(callSessionId),
+      expiresAt: { $gt: now },
+      $or: [
+        { conversationId: 'new' },
+        { conversationId: '' },
+        { conversationId: null },
+        { conversationId: { $exists: false } },
+      ],
+    },
+    { $set: { conversationId: candidateConversationId } },
+    { new: true },
+  ).lean();
+
+  if (claim) {
+    return normalizeSession(claim);
+  }
+
+  const existing = await ViventiumCallSession.findOne({
+    callSessionId: String(callSessionId),
+    expiresAt: { $gt: now },
+  }).lean();
+
+  return normalizeSession(existing);
 }
 
 function getRequiredEnvSecret() {
@@ -897,6 +954,7 @@ module.exports = {
   resolveUserVoiceRoute,
   syncCallSessionState,
   updateCallSessionVoiceSettings,
+  materializeCallSessionConversationId,
   updateCallSessionConversationId,
   claimVoiceSession,
   assertCallSessionSecret,

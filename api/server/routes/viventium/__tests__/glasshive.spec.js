@@ -10,6 +10,7 @@ let mockSaveMessage;
 let mockUpdateMessage;
 let mockGetConvo;
 let mockGetMessages;
+let mockEnqueueGlassHiveCallbackDelivery;
 
 jest.mock(
   '@librechat/data-schemas',
@@ -26,6 +27,10 @@ jest.mock('~/models', () => ({
   getMessages: (...args) => mockGetMessages(...args),
   saveMessage: (...args) => mockSaveMessage(...args),
   updateMessage: (...args) => mockUpdateMessage(...args),
+}));
+
+jest.mock('~/server/services/viventium/GlassHiveCallbackDeliveryService', () => ({
+  enqueueGlassHiveCallbackDelivery: (...args) => mockEnqueueGlassHiveCallbackDelivery(...args),
 }));
 
 function stableStringify(value) {
@@ -139,6 +144,7 @@ describe('/api/viventium/glasshive/callback', () => {
     mockSaveMessage = jest.fn().mockResolvedValue({});
     mockUpdateMessage = jest.fn().mockResolvedValue({});
     mockGetConvo = jest.fn().mockResolvedValue({ conversationId: 'conv-1', user: 'user-1' });
+    mockEnqueueGlassHiveCallbackDelivery = jest.fn().mockResolvedValue(null);
     mockGetMessages = jest.fn().mockResolvedValue([
       {
         messageId: 'msg-parent',
@@ -224,6 +230,37 @@ describe('/api/viventium/glasshive/callback', () => {
       },
     ]);
     expect(message.metadata.viventium.workerId).toBe('wrk-1');
+    expect(mockEnqueueGlassHiveCallbackDelivery).not.toHaveBeenCalled();
+  });
+
+  test('enqueues Telegram callbacks with sanitized full report text for durable delivery', async () => {
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({
+      callback_id: 'cb_telegram_full_report',
+      surface: 'telegram',
+      telegram_chat_id: '12345',
+      telegram_user_id: '67890',
+      message: 'Short preview.',
+      full_message: 'Short preview.\n\nFull report section without /Users/example/private/path.md.',
+    });
+    const req = createMockReq({
+      url: '/api/viventium/glasshive/callback',
+      headers: { 'x-glasshive-signature': signature(body) },
+      body,
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockEnqueueGlassHiveCallbackDelivery).toHaveBeenCalledTimes(1);
+    const payload = mockEnqueueGlassHiveCallbackDelivery.mock.calls[0][0];
+    expect(payload.fullText).toContain('Full report section');
+    expect(payload.fullText).toContain('[local path]');
+    expect(payload.fullText).not.toContain('/Users/example');
+    const [, message] = mockSaveMessage.mock.calls[0];
+    expect(message.metadata.viventium.hasFullText).toBe(true);
   });
 
   test('verifies and persists literal UTF-8 callback text', async () => {
@@ -792,6 +829,188 @@ describe('/api/viventium/glasshive/callback', () => {
     expect(res.body.error).toBe('duplicate_callback');
     expect(mockSaveMessage).not.toHaveBeenCalled();
     expect(mockUpdateMessage).not.toHaveBeenCalled();
+    expect(mockEnqueueGlassHiveCallbackDelivery).not.toHaveBeenCalled();
+  });
+
+  test('repairs missing Telegram delivery rows for callbacks already persisted before process restart', async () => {
+    mockGetMessages.mockResolvedValueOnce([
+      {
+        messageId: 'msg-parent',
+        parentMessageId: 'previous-assistant',
+        text: 'User request.',
+        isCreatedByUser: true,
+        createdAt: '2026-04-28T14:00:00.000Z',
+      },
+      {
+        messageId: 'msg-anchor',
+        parentMessageId: 'msg-parent',
+        text: 'On it.',
+        isCreatedByUser: false,
+        createdAt: '2026-04-28T14:00:01.000Z',
+      },
+      {
+        messageId: 'existing-status',
+        parentMessageId: 'msg-anchor',
+        text: 'Previous result.',
+        metadata: {
+          viventium: {
+            type: 'glasshive_worker_callback',
+            workerId: 'wrk-1',
+            runId: 'run-1',
+            callbackId: 'cb_persisted_telegram_replay',
+            callbackKey: 'cb_persisted_telegram_replay',
+            events: [
+              {
+                callbackId: 'cb_persisted_telegram_replay',
+                callbackKey: 'cb_persisted_telegram_replay',
+              },
+            ],
+          },
+        },
+      },
+    ]);
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({
+      callback_id: 'cb_persisted_telegram_replay',
+      surface: 'telegram',
+      telegram_chat_id: '12345',
+      telegram_user_id: '67890',
+      message: 'Updated result.',
+    });
+    const req = createMockReq({
+      url: '/api/viventium/glasshive/callback',
+      headers: { 'x-glasshive-signature': signature(body) },
+      body,
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body.error).toBe('duplicate_callback');
+    expect(mockSaveMessage).not.toHaveBeenCalled();
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+    expect(mockEnqueueGlassHiveCallbackDelivery).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({ callback_id: 'cb_persisted_telegram_replay' }),
+        message: expect.objectContaining({ messageId: 'existing-status' }),
+        text: 'Previous result.',
+      }),
+    );
+  });
+
+  test('repairs missing Telegram delivery rows even while callback id is still in the replay cache', async () => {
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({
+      callback_id: 'cb_seen_telegram_repair',
+      surface: 'telegram',
+      telegram_chat_id: '12345',
+      telegram_user_id: '67890',
+      message: 'First result.',
+    });
+    const first = createMockRes();
+
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/glasshive/callback',
+        headers: { 'x-glasshive-signature': signature(body) },
+        body,
+      }),
+      first,
+    );
+
+    expect(first.statusCode).toBe(200);
+    expect(mockEnqueueGlassHiveCallbackDelivery).toHaveBeenCalledTimes(1);
+    mockSaveMessage.mockClear();
+    mockUpdateMessage.mockClear();
+    mockEnqueueGlassHiveCallbackDelivery.mockClear();
+    mockGetMessages.mockResolvedValueOnce([
+      {
+        messageId: 'msg-parent',
+        parentMessageId: 'previous-assistant',
+        text: 'User request.',
+        isCreatedByUser: true,
+        createdAt: '2026-04-28T14:00:00.000Z',
+      },
+      {
+        messageId: 'msg-anchor',
+        parentMessageId: 'msg-parent',
+        text: 'On it.',
+        isCreatedByUser: false,
+        createdAt: '2026-04-28T14:00:01.000Z',
+      },
+      {
+        messageId: 'existing-status',
+        parentMessageId: 'msg-anchor',
+        text: 'First result.',
+        metadata: {
+          viventium: {
+            type: 'glasshive_worker_callback',
+            workerId: 'wrk-1',
+            runId: 'run-1',
+            callbackId: 'cb_seen_telegram_repair',
+            callbackKey: 'cb_seen_telegram_repair',
+            events: [
+              {
+                callbackId: 'cb_seen_telegram_repair',
+                callbackKey: 'cb_seen_telegram_repair',
+              },
+            ],
+          },
+        },
+      },
+    ]);
+    const second = createMockRes();
+
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/glasshive/callback',
+        headers: { 'x-glasshive-signature': signature(body) },
+        body,
+      }),
+      second,
+    );
+
+    expect(second.statusCode).toBe(409);
+    expect(second.body.error).toBe('duplicate_callback');
+    expect(mockSaveMessage).not.toHaveBeenCalled();
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+    expect(mockEnqueueGlassHiveCallbackDelivery).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({ callback_id: 'cb_seen_telegram_repair' }),
+        message: expect.objectContaining({ messageId: 'existing-status' }),
+        text: 'First result.',
+      }),
+    );
+  });
+
+  test('returns retryable failure when Telegram delivery enqueue fails after message persistence', async () => {
+    mockEnqueueGlassHiveCallbackDelivery.mockRejectedValueOnce(new Error('delivery db down'));
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({
+      callback_id: 'cb_delivery_enqueue_failure',
+      surface: 'telegram',
+      telegram_chat_id: '12345',
+      telegram_user_id: '67890',
+    });
+    const req = createMockReq({
+      url: '/api/viventium/glasshive/callback',
+      headers: { 'x-glasshive-signature': signature(body) },
+      body,
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(500);
+    expect(res.body.error).toBe('delivery_enqueue_failed');
+    expect(mockSaveMessage).toHaveBeenCalledTimes(1);
+    expect(mockEnqueueGlassHiveCallbackDelivery).toHaveBeenCalledTimes(1);
   });
 
   test('allows retry with the same callback id after persistence failure', async () => {

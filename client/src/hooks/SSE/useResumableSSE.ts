@@ -272,6 +272,16 @@ export default function useResumableSSE(
               confidence: cortexData.confidence,
               reason: cortexData.reason,
               insight: cortexData.insight,
+              error: cortexData.error,
+              silent: cortexData.silent,
+              no_response: cortexData.no_response,
+              cortex_description: cortexData.cortex_description,
+              activation_scope: cortexData.activation_scope,
+              direct_action_surfaces: cortexData.direct_action_surfaces,
+              direct_action_surface_scopes: cortexData.direct_action_surface_scopes,
+              configured_tools: cortexData.configured_tools,
+              completed_tool_calls: cortexData.completed_tool_calls,
+              status_changed_at: cortexData.status_changed_at,
             };
 
             if (responseIdx < 0) {

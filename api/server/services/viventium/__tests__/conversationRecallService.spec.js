@@ -280,7 +280,47 @@ describe('conversationRecallService', () => {
       }),
     );
     expect(messageQuery.select).toHaveBeenCalledWith(
-      'messageId parentMessageId conversationId createdAt sender isCreatedByUser text attachments',
+      'messageId parentMessageId conversationId createdAt sender isCreatedByUser text attachments metadata',
+    );
+  });
+
+  test('excludes Listen-Only transcript rows at the corpus query boundary', async () => {
+    mockUserFindById.mockReturnValue(
+      queryResult({
+        personalization: { conversation_recall: true },
+      }),
+    );
+
+    mockMessageFind.mockReturnValue(
+      queryResult([
+        {
+          conversationId: 'conv_real',
+          createdAt: '2026-02-19T00:00:00.000Z',
+          isCreatedByUser: true,
+          text: 'Synthetic user message that should remain in recall.',
+        },
+      ]),
+    );
+
+    mockConversationFind.mockImplementation((filter) => {
+      if (filter?.agent_id?.$exists) {
+        return queryResult([]);
+      }
+      return queryResult([]);
+    });
+
+    mockFileFind.mockReturnValue(queryResult([]));
+    mockFileFindOneAndUpdate.mockReturnValue(queryResult({ _id: 'file_all' }));
+
+    const service = require('../conversationRecallService');
+    await service.refreshConversationRecallForUser({ userId: 'user_1' });
+
+    expect(mockMessageFind).toHaveBeenCalledWith(
+      expect.objectContaining({
+        user: 'user_1',
+        'metadata.viventium.type': { $ne: 'listen_only_transcript' },
+        'metadata.viventium.mode': { $ne: 'listen_only' },
+      }),
     );
   });
 

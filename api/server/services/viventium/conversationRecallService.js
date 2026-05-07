@@ -569,14 +569,16 @@ async function buildConversationRecallCorpus({ userId, agentId }) {
     user: userId,
     ...(conversationIdsFilter != null ? { conversationId: conversationIdsFilter } : {}),
     ...(INCLUDE_ASSISTANT_MESSAGES ? {} : { isCreatedByUser: true }),
+    'metadata.viventium.type': { $ne: 'listen_only_transcript' },
+    'metadata.viventium.mode': { $ne: 'listen_only' },
     unfinished: { $ne: true },
     error: { $ne: true },
     $or: [{ expiredAt: { $exists: false } }, { expiredAt: null }],
   };
 
   const selectFields = CORPUS_TEXT_ONLY
-    ? 'messageId parentMessageId conversationId createdAt sender isCreatedByUser text attachments'
-    : 'messageId parentMessageId conversationId createdAt sender isCreatedByUser text content attachments';
+    ? 'messageId parentMessageId conversationId createdAt sender isCreatedByUser text attachments metadata'
+    : 'messageId parentMessageId conversationId createdAt sender isCreatedByUser text content attachments metadata';
 
   const rawMessageLimit = Math.max(
     Math.max(1, MAX_MESSAGES),

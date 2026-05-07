@@ -64,6 +64,13 @@ const {
   getGlassHiveCallbackStateForMessage,
 } = require('~/server/services/viventium/GlassHiveCallbackMessageService');
 const {
+  claimPendingGlassHiveCallbackDeliveries,
+  markGlassHiveCallbackDeliverySent,
+  markGlassHiveCallbackDeliveryFailed,
+  markGlassHiveCallbackDeliverySuppressed,
+  deliveryBacklogSummary,
+} = require('~/server/services/viventium/GlassHiveCallbackDeliveryService');
+const {
   resolveReusableConversationState,
 } = require('~/server/services/viventium/conversationThreading');
 /* === VIVENTIUM START ===
@@ -442,6 +449,38 @@ async function telegramAuth(req, res, next) {
   } catch (err) {
     const status = err?.status || 401;
     logger.error('[VIVENTIUM][telegramAuth] Auth failed:', err);
+    return res.status(status).json({ error: err?.message || 'Unauthorized' });
+  }
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Durable GlassHive Telegram callback dispatcher auth.
+ * Purpose: The bot must claim pending callback deliveries across linked users without
+ * requiring a per-user Telegram id in the request body. This route is scoped to the
+ * delivery ledger only and uses the existing Telegram gateway shared secret.
+ * Added: 2026-05-06
+ * === VIVENTIUM END === */
+async function telegramBridgeAuth(req, res, next) {
+  try {
+    const secret =
+      req.get('X-VIVENTIUM-TELEGRAM-SECRET') ||
+      req.get(TELEGRAM_SECRET_HEADER) ||
+      '';
+    const expected = getTelegramSecret();
+    if (!expected) {
+      const err = new Error('VIVENTIUM_TELEGRAM_SECRET is not set');
+      err.status = 500;
+      throw err;
+    }
+    if (!secret || secret !== expected) {
+      const err = new Error('Unauthorized telegram gateway');
+      err.status = 401;
+      throw err;
+    }
+    next();
+  } catch (err) {
+    const status = err?.status || 401;
+    logger.error('[VIVENTIUM][telegramBridgeAuth] Auth failed:', err);
     return res.status(status).json({ error: err?.message || 'Unauthorized' });
   }
 }
@@ -1324,6 +1363,79 @@ router.get('/glasshive/:messageId', telegramAuth, async (req, res) => {
   } catch (err) {
     logger.error('[VIVENTIUM][telegram/glasshive] Failed to load GlassHive callback:', err);
     return res.status(500).json({ error: 'Failed to load GlassHive callback' });
+  }
+});
+
+/* === VIVENTIUM START ===
+ * Feature: Durable Telegram dispatch for GlassHive callbacks.
+ * Purpose:
+ * - Let the Telegram bridge claim and send callbacks that arrive after the
+ *   original per-turn poller has ended or after a bridge restart.
+ * - Keep claim/sent/failed state in Mongo for observability and duplicate suppression.
+ * Added: 2026-05-06
+ * === VIVENTIUM END === */
+router.post('/glasshive/deliveries/claim', telegramBridgeAuth, async (req, res) => {
+  try {
+    const deliveries = await claimPendingGlassHiveCallbackDeliveries({
+      surface: 'telegram',
+      limit: req.body?.limit,
+      leaseMs: req.body?.leaseMs,
+      claimOwner: req.body?.dispatcherId || 'telegram-bridge',
+      callbackId: req.body?.callbackId || '',
+    });
+    return res.json({ deliveries });
+  } catch (err) {
+    logger.error('[VIVENTIUM][telegram/glasshive-delivery] Claim failed:', err);
+    return res.status(500).json({ error: 'Failed to claim GlassHive deliveries' });
+  }
+});
+
+router.post('/glasshive/deliveries/:deliveryId/status', telegramBridgeAuth, async (req, res) => {
+  const deliveryId = String(req.params?.deliveryId || '').trim();
+  const claimId = String(req.body?.claimId || '').trim();
+  const status = String(req.body?.status || '').trim();
+  if (!deliveryId || !claimId) {
+    return res.status(400).json({ error: 'deliveryId and claimId are required' });
+  }
+  try {
+    let delivery = null;
+    if (status === 'sent') {
+      delivery = await markGlassHiveCallbackDeliverySent({ deliveryId, claimId });
+    } else if (status === 'failed') {
+      delivery = await markGlassHiveCallbackDeliveryFailed({
+        deliveryId,
+        claimId,
+        error: req.body?.error || '',
+      });
+    } else if (status === 'suppressed') {
+      delivery = await markGlassHiveCallbackDeliverySuppressed({
+        deliveryId,
+        claimId,
+        reason: req.body?.reason || '',
+      });
+    } else {
+      return res.status(400).json({ error: 'Unsupported delivery status' });
+    }
+    if (!delivery) {
+      return res.status(409).json({ error: 'delivery_not_claimed' });
+    }
+    return res.json({ delivery });
+  } catch (err) {
+    logger.error('[VIVENTIUM][telegram/glasshive-delivery] Status update failed:', err);
+    return res.status(500).json({ error: 'Failed to update GlassHive delivery' });
+  }
+});
+
+router.post('/glasshive/deliveries/backlog', telegramBridgeAuth, async (req, res) => {
+  try {
+    const summary = await deliveryBacklogSummary({
+      surface: 'telegram',
+      olderThanMs: Number.parseInt(String(req.body?.olderThanMs || ''), 10) || undefined,
+    });
+    return res.json(summary);
+  } catch (err) {
+    logger.error('[VIVENTIUM][telegram/glasshive-delivery] Backlog summary failed:', err);
+    return res.status(500).json({ error: 'Failed to load GlassHive delivery backlog' });
   }
 });
 

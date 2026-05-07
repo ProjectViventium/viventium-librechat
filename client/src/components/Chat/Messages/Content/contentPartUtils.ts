@@ -1,5 +1,6 @@
 import { Constants, ContentTypes } from 'librechat-data-provider';
 import type { Agents, TMessageContentParts } from 'librechat-data-provider';
+import { isNoResponseOnlyText } from '~/utils/noResponseTag';
 import { GLASSHIVE_MCP_SERVER_NAME } from '~/utils/viventiumGlassHive';
 
 export type RenderableContentInput =
@@ -179,6 +180,40 @@ function hideRoutineGlassHiveDelegateToolCalls(
   return changed ? filtered : content;
 }
 
+const RUNTIME_HOLD_TEXT_FLAG = 'viventium_runtime_hold';
+
+function textPartValue(part: TMessageContentParts | undefined): string {
+  if (!part || part.type !== ContentTypes.TEXT) {
+    return '';
+  }
+  if (typeof part.text === 'string') {
+    return part.text;
+  }
+  const textValue = (part as unknown as { text?: { value?: unknown } }).text?.value;
+  return typeof textValue === 'string' ? textValue : '';
+}
+
+function isRuntimeHoldNoResponsePart(part: TMessageContentParts | undefined): boolean {
+  return (
+    part != null &&
+    part.type === ContentTypes.TEXT &&
+    (part as unknown as Record<string, unknown>)[RUNTIME_HOLD_TEXT_FLAG] === true &&
+    isNoResponseOnlyText(textPartValue(part))
+  );
+}
+
+function hideRuntimeHoldNoResponseParts(
+  content: Array<TMessageContentParts | undefined>,
+): Array<TMessageContentParts | undefined> {
+  let changed = false;
+  const filtered = content.filter((part) => {
+    const keep = !isRuntimeHoldNoResponsePart(part);
+    changed ||= !keep;
+    return keep;
+  });
+  return changed ? filtered : content;
+}
+
 function collapseConsecutiveGlassHiveToolCalls(
   content: Array<TMessageContentParts | undefined>,
 ): Array<TMessageContentParts | undefined> {
@@ -234,7 +269,10 @@ export function filterRenderableContentParts(
   });
 
   const deduped = removedAny ? filtered : normalizedContent;
-  const withoutRoutineDelegation = hideRoutineGlassHiveDelegateToolCalls(deduped);
+  const withoutRuntimeHoldNoResponse = hideRuntimeHoldNoResponseParts(deduped);
+  const withoutRoutineDelegation = hideRoutineGlassHiveDelegateToolCalls(
+    withoutRuntimeHoldNoResponse,
+  );
   const collapsed = collapseConsecutiveGlassHiveToolCalls(withoutRoutineDelegation);
   return mergeAdjacentTextParts(collapsed);
 }

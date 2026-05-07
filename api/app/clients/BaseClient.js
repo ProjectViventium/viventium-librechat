@@ -39,6 +39,9 @@ const {
   isAnthropicProvider,
   enforceAnthropicInlineDocumentLimits,
 } = require('~/server/services/viventium/anthropicPayloadGuard');
+const {
+  isListenOnlyTranscriptMessage,
+} = require('~/server/services/viventium/listenOnlyTranscript');
 const { checkBalance } = require('~/models/balanceMethods');
 const { truncateToolCallOutputs } = require('./prompts');
 const TextStream = require('./TextStream');
@@ -953,6 +956,7 @@ class BaseClient {
       messages,
       parentMessageId,
       mapMethod,
+      skipCondition: isListenOnlyTranscriptMessage,
     });
 
     _messages = await this.addPreviousAttachments(_messages);
@@ -1084,6 +1088,7 @@ class BaseClient {
    * @param {string} options.parentMessageId - The ID of the parent message to start the traversal from.
    * @param {Function} [options.mapMethod] - An optional function to map over the ordered messages. Applied conditionally based on mapCondition.
    * @param {(message: TMessage) => boolean} [options.mapCondition] - An optional function to determine whether mapMethod should be applied to a given message. If not provided and mapMethod is set, mapMethod applies to all messages.
+   * @param {(message: TMessage) => boolean} [options.skipCondition] - An optional function to omit a message from the returned thread while continuing traversal through its parent.
    * @param {boolean} [options.summary=false] - If set to true, the traversal modifies messages with 'summary' and 'summaryTokenCount' properties and stops at the message with a 'summary' property.
    * @returns {TMessage[]} An array containing the messages in the order they should be displayed, starting with the most recent message with a 'summary' property if the 'summary' option is true, and ending with the message identified by 'parentMessageId'.
    */
@@ -1092,6 +1097,7 @@ class BaseClient {
     parentMessageId,
     mapMethod = null,
     mapCondition = null,
+    skipCondition = null,
     summary = false,
   }) {
     if (!messages || messages.length === 0) {
@@ -1115,6 +1121,12 @@ class BaseClient {
 
       if (!message) {
         break;
+      }
+
+      if (typeof skipCondition === 'function' && skipCondition(message)) {
+        currentMessageId =
+          message.parentMessageId === Constants.NO_PARENT ? null : message.parentMessageId;
+        continue;
       }
 
       if (summary && message.summary) {

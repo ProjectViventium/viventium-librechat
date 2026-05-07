@@ -75,12 +75,17 @@ viventium:
 
         Return should_activate=false when the latest request is primarily asking to
         perform, start, continue, resume, stop, monitor, approve, check, or report
-        on work owned by a connected direct-action surface.
+        on work owned by a connected direct-action surface, except when the connected
+        surface is marked same_scope_background_allowed=true and this background agent''s
+        own configured activation scope exactly matches that surface. In that same-scope
+        case, the main agent still owns Phase A execution and this background agent
+        may activate for supplemental Phase B evidence when its own criteria are clearly
+        met.
 
 
         Return should_activate=false for follow-ups on live work, including short
         status/result turns, when the referenced work belongs to a connected direct-action
-        surface.
+        surface, except for the same-scope supplemental case above.
 
 
         Return should_activate=false when the user is asking for proof by execution
@@ -154,9 +159,45 @@ viventium:
         - schedule_update_mcp_scheduling-cortex
         - schedule_delete_mcp_scheduling-cortex
         - schedule_preview_next_mcp_scheduling-cortex
+      - server: google-workspace
+        scope_key: productivity_google_workspace
+        same_scope_background_allowed: true
+        owns: live Gmail, Google Calendar, Google Drive, Docs, Sheets, Slides, Chat,
+          Tasks, and Workspace actions available to the main agent
+        tool_names:
+        - sys__server__sys_mcp_google_workspace
+        - search_gmail_messages_mcp_google_workspace
+        - get_gmail_message_content_mcp_google_workspace
+        - get_gmail_messages_content_batch_mcp_google_workspace
+        - get_gmail_thread_content_mcp_google_workspace
+        - list_calendars_mcp_google_workspace
+        - get_events_mcp_google_workspace
+        - search_drive_files_mcp_google_workspace
+        - get_drive_file_content_mcp_google_workspace
+        - search_docs_mcp_google_workspace
+        - get_doc_content_mcp_google_workspace
+        - read_sheet_values_mcp_google_workspace
+      - server: ms365
+        scope_key: productivity_ms365
+        same_scope_background_allowed: true
+        owns: live Outlook email, Outlook calendar, OneDrive, Excel, OneNote, Planner,
+          To Do, and Microsoft 365 actions available to the main agent
+        tool_names:
+        - sys__server__sys_mcp_ms-365
+        - list-mail-messages_mcp_ms-365
+        - get-mail-message_mcp_ms-365
+        - list-mail-folder-messages_mcp_ms-365
+        - list-calendar-events_mcp_ms-365
+        - get-calendar-event_mcp_ms-365
+        - list-folder-files_mcp_ms-365
+        - download-onedrive-file-content_mcp_ms-365
+        - get-excel-range_mcp_ms-365
+        - search-query_mcp_ms-365
       direct_action_tool_rule: 'Connected direct-action surfaces are execution owners.
         Their presence means the main agent has the primary path; background cortices
-        should stay silent unless they add separately scoped value.
+        should stay silent unless they add separately scoped value or the matching
+        direct-action surface explicitly allows same-scope supplemental background
+        evidence.
 
         '
   no_response:
@@ -346,6 +387,15 @@ modelSpecs:
     preset:
       endpoint: anthropic
       model: claude-opus-4-7
+  - name: grok-4.3
+    label: Grok 4.3
+    description: xAI Grok
+    group: xai
+    groupIcon: xai
+    iconURL: xai
+    preset:
+      endpoint: xai
+      model: grok-4.3
   addedEndpoints:
   - agents
   - anthropic
@@ -452,19 +502,17 @@ endpoints:
   anthropic:
     titleEndpoint: anthropic
     titleModel: claude-sonnet-4-6
-    titlePrompt: >-
-      Generate a concise natural conversation title from the user's request and
-      the assistant's response. Do not browse, fetch, or judge URL accessibility.
-      If the conversation contains a URL, title the user's intended task or
-      outcome instead of whether the URL is accessible.
+    titlePrompt: 'Generate a concise natural conversation title from the user''s request
+      and the assistant''s response. Do not browse, fetch, or judge URL accessibility.
+      If the conversation contains a URL, title the user''s intended task or outcome
+      instead of whether the URL is accessible.
 
-      Conversation:
-      {convo}
+      Conversation: {convo}
 
-      Return only one natural title under 40 characters.
-    titlePromptTemplate: |-
-      User: {input}
-      AI: {output}
+      Return only one natural title under 40 characters.'
+    titlePromptTemplate: 'User: {input}
+
+      AI: {output}'
     summarize: false
     summaryModel: claude-sonnet-4-6
     modelDisplayLabel: Azure AI Foundry (Claude)
@@ -486,19 +534,17 @@ endpoints:
     - tools
     - ocr
     - chain
-    titlePrompt: >-
-      Generate a concise natural conversation title from the user's request and
-      the assistant's response. Do not browse, fetch, or judge URL accessibility.
-      If the conversation contains a URL, title the user's intended task or
-      outcome instead of whether the URL is accessible.
+    titlePrompt: 'Generate a concise natural conversation title from the user''s request
+      and the assistant''s response. Do not browse, fetch, or judge URL accessibility.
+      If the conversation contains a URL, title the user''s intended task or outcome
+      instead of whether the URL is accessible.
 
-      Conversation:
-      {convo}
+      Conversation: {convo}
 
-      Return only one natural title under 40 characters.
-    titlePromptTemplate: |-
-      User: {input}
-      AI: {output}
+      Return only one natural title under 40 characters.'
+    titlePromptTemplate: 'User: {input}
+
+      AI: {output}'
   custom:
   - name: perplexity
     apiKey: ${PERPLEXITY_API_KEY}
@@ -526,24 +572,17 @@ endpoints:
     baseURL: https://api.x.ai/v1
     models:
       default:
-      - grok-4.20-experimental-beta-0304-reasoning
-      - grok-4.20-experimental-beta-0304-non-reasoning
-      - grok-4.20-multi-agent-experimental-beta-0304
-      - grok-4-1-fast-non-reasoning
-      - grok-4-1-fast-reasoning
-      - grok-4-fast-non-reasoning
-      - grok-4-fast-reasoning
-      - grok-4-0709
-      - grok-code-fast-1
-      - grok-3-mini
-      - grok-3
+      - grok-4.3
+      - grok-4.20-multi-agent-0309
+      - grok-4.20-0309-reasoning
+      - grok-4.20-0309-non-reasoning
       - grok-2-vision-1212
       - grok-2-image-1212
       fetch: true
     titleConvo: true
-    titleModel: grok-4-1-fast-non-reasoning
+    titleModel: grok-4.3
     summarize: false
-    summaryModel: grok-4-1-fast-non-reasoning
+    summaryModel: grok-4.3
     modelDisplayLabel: Grok
     titleMethod: completion
     forcePrompt: false

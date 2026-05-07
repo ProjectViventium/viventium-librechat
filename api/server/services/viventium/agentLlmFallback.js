@@ -7,6 +7,14 @@
 
 const { ContentTypes } = require('librechat-data-provider');
 const RUNTIME_HOLD_TEXT_FLAG = 'viventium_runtime_hold';
+const NON_RETRYABLE_FALLBACK_ERROR_CLASSES = new Set([
+  'no_live_tool_execution',
+  'tool_failure',
+  'mcp_failure',
+  'mcp_tool_failure',
+  'missing_tool_auth',
+  'tool_auth_required',
+]);
 
 function normalizeProvider(provider) {
   const raw = String(provider || '').trim();
@@ -132,20 +140,40 @@ function resolveFallbackModelParameters(
   return resolved;
 }
 
+function sanitizeFallbackModelParametersForProvider(parameters, provider) {
+  const sanitized = clonePlainObject(parameters);
+  const normalizedProvider = normalizeProvider(provider);
+
+  if (normalizedProvider !== 'anthropic') {
+    delete sanitized.thinking;
+    delete sanitized.thinkingBudget;
+  }
+  if (normalizedProvider !== 'openAI') {
+    delete sanitized.reasoning_effort;
+  }
+
+  return sanitized;
+}
+
 function buildFallbackAgent(agent, assignment) {
   if (!agent || !assignment) {
     return null;
   }
+
+  const modelParameters = resolveFallbackModelParameters(
+    agent,
+    assignment.model,
+    assignment.parametersField,
+  );
 
   return {
     ...agent,
     provider: assignment.provider,
     model: assignment.model,
     endpoint: undefined,
-    model_parameters: resolveFallbackModelParameters(
-      agent,
-      assignment.model,
-      assignment.parametersField,
+    model_parameters: sanitizeFallbackModelParametersForProvider(
+      modelParameters,
+      assignment.provider,
     ),
   };
 }
@@ -177,6 +205,22 @@ function contentPartText(part) {
   return '';
 }
 
+function normalizeFallbackErrorClass(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function isNonRetryableFallbackErrorClass(value) {
+  const normalized = normalizeFallbackErrorClass(value);
+  return Boolean(normalized) && NON_RETRYABLE_FALLBACK_ERROR_CLASSES.has(normalized);
+}
+
+function contentPartErrorClass(part) {
+  if (!part || typeof part !== 'object') {
+    return '';
+  }
+  return part.errorClass || part.error_class || part.error_code || part.code || '';
+}
+
 function hasVisibleAssistantText(contentParts) {
   if (!Array.isArray(contentParts)) {
     return false;
@@ -201,12 +245,12 @@ function hasVisibleAssistantText(contentParts) {
   });
 }
 
-function isRecoverableProviderErrorText(text) {
+function isRecoverableProviderErrorText(text, { allowToolOrMcpText = false } = {}) {
   const lowered = String(text || '').toLowerCase();
   if (!lowered) {
     return false;
   }
-  if (lowered.includes('mcp') || lowered.includes('tool')) {
+  if (!allowToolOrMcpText && (lowered.includes('mcp') || lowered.includes('tool'))) {
     return false;
   }
   return (
@@ -238,9 +282,63 @@ function shouldRetryWithFallback(contentParts) {
     if (!part || typeof part !== 'object' || part.type !== ContentTypes.ERROR) {
       return false;
     }
+    if (isNonRetryableFallbackErrorClass(contentPartErrorClass(part))) {
+      return false;
+    }
     return isRecoverableProviderErrorText(contentPartText(part));
   });
 }
+
+/* === VIVENTIUM START ===
+ * Feature: Background Cortex LLM Fallback
+ * Purpose: Background Phase B returns structured result objects instead of AgentClient
+ * content parts, so timeout/abort provider failures need a separate retry predicate.
+ * === VIVENTIUM END === */
+function isAbortOrTimeoutErrorText(text) {
+  const lowered = String(text || '').toLowerCase();
+  if (!lowered) {
+    return false;
+  }
+  return (
+    lowered === 'timeout' ||
+    lowered.includes('timeout') ||
+    lowered.includes('timed out') ||
+    lowered.includes('aborterror') ||
+    lowered.includes('aborted') ||
+    lowered.includes('request aborted') ||
+    lowered.includes('operation was aborted')
+  );
+}
+
+function shouldRetryBackgroundCortexWithFallback(result) {
+  if (!result || typeof result !== 'object') {
+    return false;
+  }
+  if (typeof result.insight === 'string' && result.insight.trim().length > 0) {
+    return false;
+  }
+
+  const errorText = String(result.error || result.message || '').trim();
+  if (
+    isNonRetryableFallbackErrorClass(result.errorClass) ||
+    isNonRetryableFallbackErrorClass(result.error_class) ||
+    isNonRetryableFallbackErrorClass(result.errorCode) ||
+    isNonRetryableFallbackErrorClass(result.error_code) ||
+    normalizeFallbackErrorClass(errorText) === 'no_live_tool_execution'
+  ) {
+    return false;
+  }
+  if (!errorText) {
+    return result.recoverableProviderError === true;
+  }
+
+  return (
+    result.recoverableProviderError === true ||
+    isAbortOrTimeoutErrorText(errorText) ||
+    isRecoverableProviderErrorText(errorText, { allowToolOrMcpText: true })
+  );
+}
+/* === VIVENTIUM END === */
 
 module.exports = {
   normalizeProvider,
@@ -250,8 +348,12 @@ module.exports = {
   resolveFallbackCandidates,
   isFallbackModelValid,
   resolveFallbackModelParameters,
+  sanitizeFallbackModelParametersForProvider,
   buildFallbackAgent,
   isSameAgentRoute,
   shouldRetryWithFallback,
+  shouldRetryBackgroundCortexWithFallback,
+  isAbortOrTimeoutErrorText,
   isRecoverableProviderErrorText,
+  isNonRetryableFallbackErrorClass,
 };

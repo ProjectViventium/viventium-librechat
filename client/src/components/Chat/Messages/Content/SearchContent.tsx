@@ -10,8 +10,10 @@ import type {
   TMessageContentParts,
 } from 'librechat-data-provider';
 import { UnfinishedMessage } from './MessageContent';
+import { filterRenderableContentParts } from './contentPartUtils';
 import Sources from '~/components/Web/Sources';
 import { cn, mapAttachments } from '~/utils';
+import { isNoResponseOnlyText } from '~/utils/noResponseTag';
 import { SearchContext } from '~/Providers';
 import MarkdownLite from './MarkdownLite';
 import store from '~/store';
@@ -30,12 +32,16 @@ const SearchContent = ({
   const { messageId } = message;
 
   const attachmentMap = useMemo(() => mapAttachments(attachments ?? []), [attachments]);
+  const displayContent = useMemo(
+    () => filterRenderableContentParts(message.content),
+    [message.content],
+  );
 
-  if (Array.isArray(message.content) && message.content.length > 0) {
+  if (displayContent && displayContent.length > 0) {
     return (
       <SearchContext.Provider value={{ searchResults }}>
         <Sources />
-        {message.content
+        {displayContent
           .filter((part: TMessageContentParts | undefined) => part)
           .map((part: TMessageContentParts | undefined, idx: number) => {
             if (!part) {
@@ -65,6 +71,15 @@ const SearchContent = ({
         )}
       </SearchContext.Provider>
     );
+  }
+
+  if (
+    Array.isArray(message.content) &&
+    message.content.length > 0 &&
+    displayContent?.length === 0 &&
+    isNoResponseOnlyText(message.text)
+  ) {
+    return null;
   }
 
   return (

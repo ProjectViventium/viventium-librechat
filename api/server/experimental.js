@@ -29,6 +29,9 @@ const { checkMigrations } = require('./services/start/migration');
 const initializeMCPs = require('./services/initializeMCPs');
 const configureSocialLogins = require('./socialLogins');
 const { getAppConfig } = require('./services/Config');
+const {
+  recoverStaleCortexMessages,
+} = require('./services/viventium/staleCortexMessageRecovery');
 const staticCache = require('./utils/staticCache');
 const noIndex = require('./middleware/noIndex');
 const { seedDatabase } = require('~/models');
@@ -364,6 +367,9 @@ if (cluster.isMaster) {
       await initializeMCPs();
       await initializeOAuthReconnectManager();
       await checkMigrations();
+      recoverStaleCortexMessages().catch((error) => {
+        logger.error('[staleCortexMessageRecovery] Startup recovery failed:', error);
+      });
     });
 
     /** Handle inter-process messages from master */

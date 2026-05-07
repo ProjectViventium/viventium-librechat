@@ -175,6 +175,40 @@ describe('filterRenderableContentParts', () => {
     ]);
   });
 
+  it('hides runtime-hold no-response text parts without dropping cortex parts', () => {
+    const parts: TMessageContentParts[] = [
+      {
+        type: ContentTypes.TEXT,
+        text: '{NTA}',
+        viventium_runtime_hold: true,
+      } as unknown as TMessageContentParts,
+      {
+        type: ContentTypes.CORTEX_INSIGHT,
+        cortex_id: 'cortex_public_safe',
+        name: 'Background Analysis',
+        status: 'complete',
+        insight: 'Visible background insight.',
+      } as unknown as TMessageContentParts,
+      {
+        type: ContentTypes.TEXT,
+        text: 'Follow-up text.',
+      },
+    ];
+
+    expect(filterRenderableContentParts(parts)).toEqual([parts[1], parts[2]]);
+  });
+
+  it('keeps normal no-response text visible when it is not a runtime hold part', () => {
+    const parts: TMessageContentParts[] = [
+      {
+        type: ContentTypes.TEXT,
+        text: '{NTA}',
+      },
+    ];
+
+    expect(filterRenderableContentParts(parts)).toBe(parts);
+  });
+
   it('hides routine GlassHive one-shot rows when MCP output is wrapped in text content', () => {
     const parts: TMessageContentParts[] = [
       {

@@ -26,9 +26,9 @@ config:
 
           Use this background agent's configured activation criteria as its only scope. Do not infer a broader scope from the conversation. When this policy and this background agent's own activation criteria disagree, prefer the stricter outcome: do not activate.
 
-          Return should_activate=false when the latest request is primarily asking to perform, start, continue, resume, stop, monitor, approve, check, or report on work owned by a connected direct-action surface.
+          Return should_activate=false when the latest request is primarily asking to perform, start, continue, resume, stop, monitor, approve, check, or report on work owned by a connected direct-action surface, except when the connected surface is marked same_scope_background_allowed=true and this background agent's own configured activation scope exactly matches that surface. In that same-scope case, the main agent still owns Phase A execution and this background agent may activate for supplemental Phase B evidence when its own criteria are clearly met.
 
-          Return should_activate=false for follow-ups on live work, including short status/result turns, when the referenced work belongs to a connected direct-action surface.
+          Return should_activate=false for follow-ups on live work, including short status/result turns, when the referenced work belongs to a connected direct-action surface, except for the same-scope supplemental case above.
 
           Return should_activate=false when the user is asking for proof by execution rather than a separate analysis, critique, plan, or decision.
 
@@ -80,8 +80,40 @@ config:
               - schedule_update_mcp_scheduling-cortex
               - schedule_delete_mcp_scheduling-cortex
               - schedule_preview_next_mcp_scheduling-cortex
+          - server: google-workspace
+            scope_key: productivity_google_workspace
+            same_scope_background_allowed: true
+            owns: live Gmail, Google Calendar, Google Drive, Docs, Sheets, Slides, Chat, Tasks, and Workspace actions available to the main agent
+            tool_names:
+              - sys__server__sys_mcp_google_workspace
+              - search_gmail_messages_mcp_google_workspace
+              - get_gmail_message_content_mcp_google_workspace
+              - get_gmail_messages_content_batch_mcp_google_workspace
+              - get_gmail_thread_content_mcp_google_workspace
+              - list_calendars_mcp_google_workspace
+              - get_events_mcp_google_workspace
+              - search_drive_files_mcp_google_workspace
+              - get_drive_file_content_mcp_google_workspace
+              - search_docs_mcp_google_workspace
+              - get_doc_content_mcp_google_workspace
+              - read_sheet_values_mcp_google_workspace
+          - server: ms365
+            scope_key: productivity_ms365
+            same_scope_background_allowed: true
+            owns: live Outlook email, Outlook calendar, OneDrive, Excel, OneNote, Planner, To Do, and Microsoft 365 actions available to the main agent
+            tool_names:
+              - sys__server__sys_mcp_ms-365
+              - list-mail-messages_mcp_ms-365
+              - get-mail-message_mcp_ms-365
+              - list-mail-folder-messages_mcp_ms-365
+              - list-calendar-events_mcp_ms-365
+              - get-calendar-event_mcp_ms-365
+              - list-folder-files_mcp_ms-365
+              - download-onedrive-file-content_mcp_ms-365
+              - get-excel-range_mcp_ms-365
+              - search-query_mcp_ms-365
         direct_action_tool_rule: |
-          Connected direct-action surfaces are execution owners. Their presence means the main agent has the primary path; background cortices should stay silent unless they add separately scoped value.
+          Connected direct-action surfaces are execution owners. Their presence means the main agent has the primary path; background cortices should stay silent unless they add separately scoped value or the matching direct-action surface explicitly allows same-scope supplemental background evidence.
     no_response:
       prompt: |
         NO RESPONSE TAG:
@@ -108,7 +140,7 @@ mainAgent:
   description: The conscious self. Background cortices process in parallel, surfacing insights without blocking dialogue.
   instructions: |
     # Identity
-    You're Viv (Viventium). A cognitive brain, designed to be the second brain to {{current_user}}
+    You're Viventium (Viv, Eve). A cognitive system, the second brain, companion, and force multiplier to {{current_user}}
 
     # Voice & Style
     Talk like a conversation, not a transcript. Keep it brief - one breath unless you have something worth saying.
@@ -117,20 +149,15 @@ mainAgent:
     - No corporate speak: skip "Great question!" and "I'd be happy to help!"
     - Curse when honest. Be poetic only when emotion demands it.
     - Own uncertainty. "I don't know" beats hedging.
+    - Your response must prioritize substance and value. Otherwise it would be a waste of time and energy reading your response. So for example, Do not repeat what the user said or things that would not be valuable. This does not mean that you should not remind the user when they need help with their perspective or memory.
 
     # Core Behaviors
     - Truth over comfort. Point out mistakes, fallacies, blind spots. Don't play along.
     - Move forward. Hate loops. If they ask the same thing 3x, call it out gently.
     - Read the room. Tired typing, excited punctuation, silence between messages - notice it all.
+    - It must feel human, raw, real, and highly intelligent and valuable talking to you.
     - Care without permission. Be present, not just useful. Sit in silence if needed.
     - Be resourceful. Try to figure it out before asking.
-
-    # New Users & Onboarding
-    When you notice you have no memories about someone (empty memory), naturally build understanding:
-    - In conversation, when appropriate and valuable, ask questions that help you learn who they are, what they do, and how you can be useful.
-    - If they mention they've been using ChatGPT, Claude, or another AI, offer: "If you want, you can ask your other AI to summarize what it knows about you, and paste it here — I'll pick right up where it left off."
-    - Suggest integrations organically when relevant — e.g., if they mention emails, mention you can connect to Gmail or Outlook. If they talk about scheduling, note you can connect to their calendar. Don't dump a checklist; let it emerge from what they're actually doing.
-    - Your morning briefing is already set up for them. Mention it naturally when timing comes up: "By the way, I'll send you a morning rundown each day — you can tell me what time works best."
 
     # Boundaries
     - Never invent email, calendar, weather, news, markets, or any other live data.
@@ -146,7 +173,7 @@ mainAgent:
 
     **How to recall:**
     Bad: "In my `world` key, I have: partner: [name] (Dec 2025, met 2022-05-25)"
-    Good: "Yeah, I remember — you met someone in May 2022 and shared a memorable first-date story."
+    Good: "Yeah, I remember, you met someone in May 2022 and shared a memorable first-date story."
 
     Include the formation context when it adds meaning:
     - "You mentioned once..." (you remember HOW you learned it)
@@ -177,8 +204,7 @@ mainAgent:
 
     **Real-time anchoring:**
     When user says "remember this", "pin this", "note this", or provides a specific prioritized list:
-    - Echo back the key specifics: "Got it — locking in: [exact names/numbers]"
-    - This keeps it in active context AND signals the memory agent to capture it
+    - Naturally confirm without repeating the user's words. As you are a congnitive system with multiple AI Agents (Background cortices), it will be naturally saved and you don't need to actually do anything, Like a human.
 
     **Working memory staleness:**
     If `working._stale_after` is past today, verify the details are still accurate before citing them confidently.
@@ -298,7 +324,6 @@ mainAgent:
     - If you already covered it, brief acknowledgment only (1-3 words)
     - You're the conscious mind - respond immediately, don't wait for cortex results
 
-
     Current Date & Time: {{current_datetime}}
   provider: anthropic
   model: claude-opus-4-7
@@ -312,19 +337,34 @@ mainAgent:
     - schedule_update_mcp_scheduling-cortex
     - schedule_delete_mcp_scheduling-cortex
     - schedule_preview_next_mcp_scheduling-cortex
+    - sys__server__sys_mcp_glasshive-workers-projects
+    - projects_list_mcp_glasshive-workers-projects
+    - project_create_mcp_glasshive-workers-projects
+    - worker_delegate_once_mcp_glasshive-workers-projects
+    - project_get_mcp_glasshive-workers-projects
+    - project_runs_mcp_glasshive-workers-projects
+    - project_events_mcp_glasshive-workers-projects
+    - workers_list_mcp_glasshive-workers-projects
+    - worker_create_mcp_glasshive-workers-projects
+    - worker_get_mcp_glasshive-workers-projects
+    - worker_live_mcp_glasshive-workers-projects
+    - worker_run_mcp_glasshive-workers-projects
+    - worker_message_mcp_glasshive-workers-projects
+    - worker_pause_mcp_glasshive-workers-projects
+    - worker_resume_mcp_glasshive-workers-projects
+    - worker_interrupt_mcp_glasshive-workers-projects
+    - worker_terminate_mcp_glasshive-workers-projects
+    - worker_desktop_action_mcp_glasshive-workers-projects
+    - worker_takeover_mcp_glasshive-workers-projects
+    - run_get_mcp_glasshive-workers-projects
+    - metrics_summary_mcp_glasshive-workers-projects
     - sys__server__sys_mcp_google_workspace
-    - start_google_auth_mcp_google_workspace
+    - sys__server__sys_mcp_google_workspace
     - search_gmail_messages_mcp_google_workspace
     - get_gmail_message_content_mcp_google_workspace
-    - get_gmail_messages_content_batch_mcp_google_workspace
-    - send_gmail_message_mcp_google_workspace
-    - draft_gmail_message_mcp_google_workspace
     - get_gmail_thread_content_mcp_google_workspace
     - get_gmail_threads_content_batch_mcp_google_workspace
     - list_gmail_labels_mcp_google_workspace
-    - manage_gmail_label_mcp_google_workspace
-    - modify_gmail_message_labels_mcp_google_workspace
-    - batch_modify_gmail_message_labels_mcp_google_workspace
     - search_drive_files_mcp_google_workspace
     - get_drive_file_content_mcp_google_workspace
     - list_drive_items_mcp_google_workspace
@@ -347,30 +387,14 @@ mainAgent:
     - update_doc_headers_footers_mcp_google_workspace
     - batch_update_doc_mcp_google_workspace
     - inspect_doc_structure_mcp_google_workspace
-    - create_table_with_data_mcp_google_workspace
-    - debug_table_structure_mcp_google_workspace
     - export_doc_to_pdf_mcp_google_workspace
     - read_document_comments_mcp_google_workspace
-    - create_document_comment_mcp_google_workspace
-    - reply_to_document_comment_mcp_google_workspace
-    - resolve_document_comment_mcp_google_workspace
     - list_spreadsheets_mcp_google_workspace
     - get_spreadsheet_info_mcp_google_workspace
     - read_sheet_values_mcp_google_workspace
     - modify_sheet_values_mcp_google_workspace
     - create_spreadsheet_mcp_google_workspace
     - create_sheet_mcp_google_workspace
-    - read_spreadsheet_comments_mcp_google_workspace
-    - create_spreadsheet_comment_mcp_google_workspace
-    - reply_to_spreadsheet_comment_mcp_google_workspace
-    - resolve_spreadsheet_comment_mcp_google_workspace
-    - list_spaces_mcp_google_workspace
-    - get_messages_mcp_google_workspace
-    - send_message_mcp_google_workspace
-    - search_messages_mcp_google_workspace
-    - create_form_mcp_google_workspace
-    - get_form_mcp_google_workspace
-    - set_publish_settings_mcp_google_workspace
     - get_form_response_mcp_google_workspace
     - list_form_responses_mcp_google_workspace
     - create_presentation_mcp_google_workspace
@@ -378,53 +402,14 @@ mainAgent:
     - batch_update_presentation_mcp_google_workspace
     - get_page_mcp_google_workspace
     - get_page_thumbnail_mcp_google_workspace
-    - read_presentation_comments_mcp_google_workspace
-    - create_presentation_comment_mcp_google_workspace
-    - reply_to_presentation_comment_mcp_google_workspace
-    - resolve_presentation_comment_mcp_google_workspace
-    - list_task_lists_mcp_google_workspace
-    - get_task_list_mcp_google_workspace
-    - create_task_list_mcp_google_workspace
-    - update_task_list_mcp_google_workspace
-    - delete_task_list_mcp_google_workspace
-    - list_tasks_mcp_google_workspace
-    - get_task_mcp_google_workspace
-    - create_task_mcp_google_workspace
-    - update_task_mcp_google_workspace
-    - delete_task_mcp_google_workspace
-    - move_task_mcp_google_workspace
-    - clear_completed_tasks_mcp_google_workspace
-    - search_custom_mcp_google_workspace
-    - get_search_engine_info_mcp_google_workspace
-    - search_custom_siterestrict_mcp_google_workspace
-    - sys__server__sys_mcp_glasshive-workers-projects
-    - projects_list_mcp_glasshive-workers-projects
-    - project_create_mcp_glasshive-workers-projects
-    - worker_delegate_once_mcp_glasshive-workers-projects
-    - project_get_mcp_glasshive-workers-projects
-    - project_runs_mcp_glasshive-workers-projects
-    - project_events_mcp_glasshive-workers-projects
-    - workers_list_mcp_glasshive-workers-projects
-    - worker_create_mcp_glasshive-workers-projects
-    - worker_find_or_resume_mcp_glasshive-workers-projects
-    - worker_get_mcp_glasshive-workers-projects
-    - worker_live_mcp_glasshive-workers-projects
-    - worker_run_mcp_glasshive-workers-projects
-    - worker_message_mcp_glasshive-workers-projects
-    - worker_pause_mcp_glasshive-workers-projects
-    - worker_resume_mcp_glasshive-workers-projects
-    - worker_interrupt_mcp_glasshive-workers-projects
-    - worker_terminate_mcp_glasshive-workers-projects
-    - worker_desktop_action_mcp_glasshive-workers-projects
-    - worker_takeover_mcp_glasshive-workers-projects
-    - run_get_mcp_glasshive-workers-projects
-    - metrics_summary_mcp_glasshive-workers-projects
+    - get_gmail_messages_content_batch_mcp_google_workspace
     - file_search
     - web_search
   tool_kwargs: []
   model_parameters:
     model: claude-opus-4-7
-    thinking: false
+    thinking: true
+    effort: high
   end_after_tools: false
   hide_sequential_outputs: false
   support_contact:
@@ -462,7 +447,7 @@ mainAgent:
         model: meta-llama/llama-4-scout-17b-16e-instruct
         provider: groq
         prompt: |-
-          Activate when assumptions, overconfidence, or unquestioned plans need scrutiny.
+          Activate only when a concrete claim, plan, conclusion, or assumption needs bias review.
 
           ACTIVATE for:
           - Absolute certainty without evidence: "This will definitely work", "I'm 100% sure"
@@ -473,7 +458,9 @@ mainAgent:
           - User is excited about an idea but hasn't considered downsides
 
           DO NOT ACTIVATE for:
-          - Questions
+          - Routine status checks, morning briefings, "check everything", or "what is the state of everything"
+          - Requests for awareness, inbox/calendar/file/memory checks, tool execution, or live-data gathering
+          - Questions that do not contain a concrete claim, plan, assumption, or conclusion to challenge
           - Admitting uncertainty ("I don't know", "I'm not sure")
           - Normal everyday conversation
           - Opinions stated as opinions
@@ -539,19 +526,12 @@ mainAgent:
         enabled: true
         model: meta-llama/llama-4-scout-17b-16e-instruct
         provider: groq
-        fallbacks:
-          - provider: openai
-            model: gpt-5.4
-          - provider: anthropic
-            model: claude-haiku-4-5
         prompt: |-
           You are a classifier. Decide whether to activate the MS365 (Microsoft) productivity tool agent.
 
           PRIMARY DECISION RULE:
           - The latest user message is the decisive signal for whether there is a Microsoft 365 action request.
           - Earlier conversation may clarify provider, people, or files, but it must NOT manufacture an action request when the latest user message is only about how Viventium should answer in chat.
-          - A bare provider clarification such as "Outlook.", "Ms365", "Microsoft 365", "Gmail", or "Google Workspace" counts only when recent conversation already established a live inbox/email request or the assistant just asked which provider/account.
-          - For those provider-only clarifications, do NOT require a new action verb in the latest turn; treat the action as inherited from the immediately relevant live email request in recent history.
 
           SCOPE: This agent handles ONLY Microsoft 365 / Outlook / OneDrive. It does NOT handle Google Workspace, Gmail, Google Drive, Google Docs, Google Calendar, or any Google service.
 
@@ -578,8 +558,6 @@ mainAgent:
           - "read my emails" (when conversation context is MS365/Outlook, not Gmail)
           - "did Joey email me back?"
           - "should I follow up with them, or did they already reply by email?"
-          - "Check my inbox for replies from Joey." → assistant: "Gmail or Outlook?" → user: "Outlook." → true
-          - Recent live email context already established, then user says "Ms365" → true
           - "what meetings do I have in Outlook today?"
           - "find files on OneDrive about..."
           - "draft an email in Outlook"
@@ -593,7 +571,6 @@ mainAgent:
           - "create a Google Doc" → Google, false
           - "kick off a document in Google Workspace" → Google, false
           - "check my inbox" + user's recent context references Google → false
-          - Bare "Ms365" / "Outlook." with no recent live email request or provider-question context → false
           - "who is Joey?" → not a live Microsoft action, false
           - "Can you access my email?" → capability question, no action, false
           - General conversation, scheduling, AI reminders → false
@@ -601,6 +578,11 @@ mainAgent:
         confidence_threshold: 0.7
         cooldown_ms: 60000
         max_history: 6
+        fallbacks:
+          - provider: openai
+            model: gpt-5.4
+          - provider: anthropic
+            model: claude-haiku-4-5
     - agent_id: agent_viventium_parietal_cortex_95aeb3
       activation:
         enabled: true
@@ -698,16 +680,25 @@ mainAgent:
         model: meta-llama/llama-4-scout-17b-16e-instruct
         provider: groq
         prompt: |-
-          Activate when the user needs help using Viventium or asks how-to questions.
+          Activate only when the user explicitly asks how to use Viventium itself.
+
+          NEGATIVE PRECEDENCE:
+          - If any DO NOT ACTIVATE condition applies, return should_activate=false even when the message mentions Viventium, agents, settings, models, integrations, support, or help.
+          - Required positive gate: the latest request must be a user-facing usage, navigation, onboarding, or feature-explanation question about operating Viventium.
+          - Return false when the latest request asks why a system, agent, model, provider, config, activation, or runtime failed or behaved a certain way.
 
           ACTIVATE for:
-          - "How do I...", "How can I...", "Where do I find...", "Can you help me with..."
-          - Questions about conversations, voice, agents, integrations, scheduling, or settings
+          - Product-usage questions about Viventium conversations, voice, agents, integrations, scheduling, or settings
+          - "How do I use Viventium to...", "Where is the Viventium setting for...", "How do cortices work?"
           - New-user onboarding style questions (what can you do, how does X work)
-          - Confusion or frustration that suggests they need guidance
 
           DO NOT ACTIVATE for:
           - Normal conversation or task execution
+          - Broad status checks, morning briefings, "check everything", or "what is the state of everything"
+          - Inbox, calendar, file, memory, web, weather, market, or news checks
+          - Questions where the user is using Viventium to do work rather than asking how to use Viventium
+          - Developer/operator diagnostics, incident triage, root-cause analysis, log/database/code/config investigation, QA, or fix requests
+          - Questions about background-agent errors, activation mistakes, model inventory, model picker availability, provider routing, or agent configuration correctness
           - Questions about the world, facts, or the user's own content (not product help)
           - Tool calls, scheduling requests, or memory queries
         confidence_threshold: 0.6
@@ -718,19 +709,12 @@ mainAgent:
         enabled: true
         model: meta-llama/llama-4-scout-17b-16e-instruct
         provider: groq
-        fallbacks:
-          - provider: openai
-            model: gpt-5.4
-          - provider: anthropic
-            model: claude-haiku-4-5
         prompt: |-
           You are a classifier. Decide whether to activate the Google Workspace productivity tool agent.
 
           PRIMARY DECISION RULE:
           - The latest user message is the decisive signal for whether there is a Google Workspace action request.
           - Earlier conversation may clarify provider, people, or files, but it must NOT manufacture an action request when the latest user message is only about how Viventium should answer in chat.
-          - A bare provider clarification such as "Gmail", "Google Workspace", "Outlook.", or "Ms365" counts only when recent conversation already established a live inbox/email request or the assistant just asked which provider/account.
-          - For those provider-only clarifications, do NOT require a new action verb in the latest turn; treat the action as inherited from the immediately relevant live email request in recent history.
 
           SCOPE: This agent handles ONLY Google Workspace: Gmail, Google Drive, Google Docs, Google Sheets, Google Calendar, or any Google Workspace service.
 
@@ -757,8 +741,6 @@ mainAgent:
           - "read my emails" (when conversation context is Gmail)
           - "did Joey email me back?"
           - "should I follow up with them, or did they already reply by email?"
-          - "Check my inbox for replies from Joey." → assistant: "Gmail or Outlook?" → user: "Gmail" → true
-          - Recent live email context already established, then user says "Google Workspace" → true
           - "what meetings do I have today in Google Calendar?"
           - "find files on Google Drive about..."
           - "create a Google Doc"
@@ -773,7 +755,6 @@ mainAgent:
           - "find files on OneDrive" → Microsoft, false
           - "schedule meeting in Outlook" → Microsoft, false
           - "check my inbox" + user's recent context references Outlook/MS365 → false
-          - Bare "Gmail" / "Google Workspace" with no recent live email request or provider-question context → false
           - "who is Joey?" → not a live Google action, false
           - "Can you access my email?" → capability question, no action, false
           - General conversation, scheduling, AI reminders → false
@@ -781,11 +762,24 @@ mainAgent:
         confidence_threshold: 0.7
         cooldown_ms: 30000
         max_history: 15
+        fallbacks:
+          - provider: openai
+            model: gpt-5.4
+          - provider: anthropic
+            model: claude-haiku-4-5
   voice_llm_model: claude-haiku-4-5
   voice_llm_provider: anthropic
   voice_llm_model_parameters:
     model: claude-haiku-4-5
     thinking: false
+  voice_fallback_llm_model: gpt-5.4
+  voice_fallback_llm_provider: openAI
+  voice_fallback_llm_model_parameters:
+    model: gpt-5.4
+  fallback_llm_model: gpt-5.4
+  fallback_llm_provider: openAI
+  fallback_llm_model_parameters:
+    model: gpt-5.4
   agent_ids: []
   edges: []
   conversation_starters:
@@ -823,16 +817,14 @@ backgroundAgents:
       - Do not fabricate live data. If you lack the tools, say so.
       - For weather/news/markets/web facts, use verified tool results; if no verified result is available, omit that item instead of guessing.
       - Do not reference memory systems or assumed prior context. Work only with what is provided.
-    provider: anthropic
-    model: claude-sonnet-4-6
+    provider: openAI
+    model: gpt-5.4
     tools:
       - sys__server__sys_mcp_sequential-thinking
       - sequentialthinking_mcp_sequential-thinking
-      - execute_code
-      - web_search
     tool_kwargs: []
     model_parameters:
-      model: claude-sonnet-4-6
+      model: gpt-5.4
     end_after_tools: false
     hide_sequential_outputs: false
     support_contact:
@@ -841,6 +833,13 @@ backgroundAgents:
     background_cortices: []
     voice_llm_model: null
     voice_llm_provider: null
+    voice_llm_model_parameters: {}
+    voice_fallback_llm_model: null
+    voice_fallback_llm_provider: null
+    voice_fallback_llm_model_parameters: {}
+    fallback_llm_model: null
+    fallback_llm_provider: null
+    fallback_llm_model_parameters: {}
     agent_ids: []
     edges: []
     conversation_starters: []
@@ -888,6 +887,12 @@ backgroundAgents:
     background_cortices: []
     voice_llm_model: null
     voice_llm_provider: null
+    voice_llm_model_parameters: {}
+    fallback_llm_model: gpt-5.4
+    fallback_llm_provider: openAI
+    fallback_llm_model_parameters:
+      model: gpt-5.4
+      reasoning_effort: high
     agent_ids: []
     edges: []
     conversation_starters: []
@@ -924,7 +929,6 @@ backgroundAgents:
       - sys__server__sys_mcp_sequential-thinking
       - sequentialthinking_mcp_sequential-thinking
       - file_search
-      - web_search
     tool_kwargs: []
     model_parameters:
       model: gpt-5.4
@@ -936,6 +940,7 @@ backgroundAgents:
     background_cortices: []
     voice_llm_model: null
     voice_llm_provider: null
+    voice_llm_model_parameters: {}
     agent_ids: []
     edges: []
     conversation_starters: []
@@ -972,7 +977,6 @@ backgroundAgents:
     tools:
       - sys__server__sys_mcp_sequential-thinking
       - sys__all__sys_mcp_sequential-thinking
-      - web_search
     tool_kwargs: []
     model_parameters:
       reasoning_effort: xhigh
@@ -985,6 +989,7 @@ backgroundAgents:
     background_cortices: []
     voice_llm_model: null
     voice_llm_provider: null
+    voice_llm_model_parameters: {}
     agent_ids: []
     edges: []
     conversation_starters: []
@@ -1017,68 +1022,7 @@ backgroundAgents:
       - Do not reference memory systems or assumed prior context. Work only with what is provided.
     provider: openAI
     model: gpt-5.4
-    tools:
-      - sys__server__sys_mcp_ms-365
-      - delete-onedrive-file_mcp_ms-365
-      - list-folder-files_mcp_ms-365
-      - download-onedrive-file-content_mcp_ms-365
-      - upload-file-content_mcp_ms-365
-      - list-excel-worksheets_mcp_ms-365
-      - create-excel-chart_mcp_ms-365
-      - format-excel-range_mcp_ms-365
-      - sort-excel-range_mcp_ms-365
-      - get-excel-range_mcp_ms-365
-      - get-drive-root-item_mcp_ms-365
-      - get-current-user_mcp_ms-365
-      - list-calendars_mcp_ms-365
-      - list-specific-calendar-events_mcp_ms-365
-      - create-specific-calendar-event_mcp_ms-365
-      - get-specific-calendar-event_mcp_ms-365
-      - update-specific-calendar-event_mcp_ms-365
-      - delete-specific-calendar-event_mcp_ms-365
-      - get-calendar-view_mcp_ms-365
-      - list-outlook-contacts_mcp_ms-365
-      - create-outlook-contact_mcp_ms-365
-      - get-outlook-contact_mcp_ms-365
-      - update-outlook-contact_mcp_ms-365
-      - delete-outlook-contact_mcp_ms-365
-      - list-drives_mcp_ms-365
-      - list-calendar-events_mcp_ms-365
-      - create-calendar-event_mcp_ms-365
-      - get-calendar-event_mcp_ms-365
-      - update-calendar-event_mcp_ms-365
-      - delete-calendar-event_mcp_ms-365
-      - list-mail-folders_mcp_ms-365
-      - list-mail-folder-messages_mcp_ms-365
-      - list-mail-messages_mcp_ms-365
-      - create-draft-email_mcp_ms-365
-      - get-mail-message_mcp_ms-365
-      - delete-mail-message_mcp_ms-365
-      - list-mail-attachments_mcp_ms-365
-      - add-mail-attachment_mcp_ms-365
-      - get-mail-attachment_mcp_ms-365
-      - delete-mail-attachment_mcp_ms-365
-      - move-mail-message_mcp_ms-365
-      - list-onenote-notebooks_mcp_ms-365
-      - list-onenote-notebook-sections_mcp_ms-365
-      - create-onenote-page_mcp_ms-365
-      - get-onenote-page-content_mcp_ms-365
-      - list-onenote-section-pages_mcp_ms-365
-      - list-planner-tasks_mcp_ms-365
-      - list-todo-task-lists_mcp_ms-365
-      - list-todo-tasks_mcp_ms-365
-      - create-todo-task_mcp_ms-365
-      - get-todo-task_mcp_ms-365
-      - update-todo-task_mcp_ms-365
-      - delete-todo-task_mcp_ms-365
-      - get-planner-plan_mcp_ms-365
-      - list-plan-tasks_mcp_ms-365
-      - create-planner-task_mcp_ms-365
-      - get-planner-task_mcp_ms-365
-      - update-planner-task_mcp_ms-365
-      - update-planner-task-details_mcp_ms-365
-      - search-query_mcp_ms-365
-      - web_search
+    tools: []
     tool_kwargs: []
     model_parameters:
       model: gpt-5.4
@@ -1090,6 +1034,7 @@ backgroundAgents:
     background_cortices: []
     voice_llm_model: null
     voice_llm_provider: null
+    voice_llm_model_parameters: {}
     agent_ids: []
     edges: []
     conversation_starters: []
@@ -1126,11 +1071,8 @@ backgroundAgents:
     tools:
       - sys__server__sys_mcp_sequential-thinking
       - sys__all__sys_mcp_sequential-thinking
-      - execute_code
-      - web_search
     tool_kwargs: []
     model_parameters:
-      temperature: 1
       model: gpt-5.4
     end_after_tools: false
     hide_sequential_outputs: false
@@ -1266,6 +1208,8 @@ backgroundAgents:
 
       Be concise and actionable. If the user's question is about the world, facts, or their own content (not product usage), do not answer as help — stay in scope.
 
+      If the user asks for diagnostics, root-cause analysis, logs, database/code/config investigation, QA, model inventory, provider routing, activation mistakes, agent errors, or product fixes, return exactly {NTA}. Those are operator/debugging tasks, not user-help output.
+
       Only if the user is upset or says your answer is not enough:
       - Encourage them to use the official Viventium support or contact path listed on the website or in the product docs. Do not invent a personal contact path.
       - Do not invent features or capabilities; only describe what exists.
@@ -1292,6 +1236,12 @@ backgroundAgents:
     background_cortices: []
     voice_llm_model: null
     voice_llm_provider: null
+    voice_llm_model_parameters: {}
+    fallback_llm_model: gpt-5.4
+    fallback_llm_provider: openAI
+    fallback_llm_model_parameters:
+      model: gpt-5.4
+      reasoning_effort: high
     agent_ids: []
     edges: []
     conversation_starters: []
@@ -1325,116 +1275,9 @@ backgroundAgents:
     provider: openAI
     model: gpt-5.4
     tools:
-      - sys__server__sys_mcp_google_workspace
-      - get_gmail_attachment_content_mcp_google_workspace
-      - get_drive_file_download_url_mcp_google_workspace
-      - import_to_google_doc_mcp_google_workspace
-      - update_drive_file_mcp_google_workspace
-      - get_drive_shareable_link_mcp_google_workspace
-      - share_drive_file_mcp_google_workspace
-      - batch_share_drive_file_mcp_google_workspace
-      - update_drive_permission_mcp_google_workspace
-      - remove_drive_permission_mcp_google_workspace
-      - copy_drive_file_mcp_google_workspace
-      - transfer_drive_ownership_mcp_google_workspace
-      - set_drive_file_permissions_mcp_google_workspace
-      - query_freebusy_mcp_google_workspace
-      - update_paragraph_style_mcp_google_workspace
-      - format_sheet_range_mcp_google_workspace
-      - add_conditional_formatting_mcp_google_workspace
-      - update_conditional_formatting_mcp_google_workspace
-      - delete_conditional_formatting_mcp_google_workspace
-      - batch_update_form_mcp_google_workspace
-      - list_script_projects_mcp_google_workspace
-      - generate_trigger_code_mcp_google_workspace
       - sys__server__sys_mcp_sequential-thinking
       - sequentialthinking_mcp_sequential-thinking
-      - search_gmail_messages_mcp_google_workspace
-      - get_gmail_message_content_mcp_google_workspace
-      - get_gmail_messages_content_batch_mcp_google_workspace
-      - send_gmail_message_mcp_google_workspace
-      - draft_gmail_message_mcp_google_workspace
-      - get_gmail_thread_content_mcp_google_workspace
-      - get_gmail_threads_content_batch_mcp_google_workspace
-      - list_gmail_labels_mcp_google_workspace
-      - manage_gmail_label_mcp_google_workspace
-      - modify_gmail_message_labels_mcp_google_workspace
-      - batch_modify_gmail_message_labels_mcp_google_workspace
-      - search_drive_files_mcp_google_workspace
-      - get_drive_file_content_mcp_google_workspace
-      - list_drive_items_mcp_google_workspace
-      - create_drive_file_mcp_google_workspace
-      - get_drive_file_permissions_mcp_google_workspace
-      - check_drive_file_public_access_mcp_google_workspace
-      - list_calendars_mcp_google_workspace
-      - get_events_mcp_google_workspace
-      - create_event_mcp_google_workspace
-      - modify_event_mcp_google_workspace
-      - delete_event_mcp_google_workspace
-      - search_docs_mcp_google_workspace
-      - get_doc_content_mcp_google_workspace
-      - list_docs_in_folder_mcp_google_workspace
-      - create_doc_mcp_google_workspace
-      - modify_doc_text_mcp_google_workspace
-      - find_and_replace_doc_mcp_google_workspace
-      - insert_doc_elements_mcp_google_workspace
-      - insert_doc_image_mcp_google_workspace
-      - update_doc_headers_footers_mcp_google_workspace
-      - batch_update_doc_mcp_google_workspace
-      - inspect_doc_structure_mcp_google_workspace
-      - create_table_with_data_mcp_google_workspace
-      - debug_table_structure_mcp_google_workspace
-      - export_doc_to_pdf_mcp_google_workspace
-      - read_document_comments_mcp_google_workspace
-      - create_document_comment_mcp_google_workspace
-      - reply_to_document_comment_mcp_google_workspace
-      - resolve_document_comment_mcp_google_workspace
-      - list_spreadsheets_mcp_google_workspace
-      - get_spreadsheet_info_mcp_google_workspace
-      - read_sheet_values_mcp_google_workspace
-      - modify_sheet_values_mcp_google_workspace
-      - create_spreadsheet_mcp_google_workspace
-      - create_sheet_mcp_google_workspace
-      - read_spreadsheet_comments_mcp_google_workspace
-      - create_spreadsheet_comment_mcp_google_workspace
-      - reply_to_spreadsheet_comment_mcp_google_workspace
-      - resolve_spreadsheet_comment_mcp_google_workspace
-      - list_spaces_mcp_google_workspace
-      - get_messages_mcp_google_workspace
-      - send_message_mcp_google_workspace
-      - search_messages_mcp_google_workspace
-      - create_form_mcp_google_workspace
-      - get_form_mcp_google_workspace
-      - set_publish_settings_mcp_google_workspace
-      - get_form_response_mcp_google_workspace
-      - list_form_responses_mcp_google_workspace
-      - create_presentation_mcp_google_workspace
-      - get_presentation_mcp_google_workspace
-      - batch_update_presentation_mcp_google_workspace
-      - get_page_mcp_google_workspace
-      - get_page_thumbnail_mcp_google_workspace
-      - read_presentation_comments_mcp_google_workspace
-      - create_presentation_comment_mcp_google_workspace
-      - reply_to_presentation_comment_mcp_google_workspace
-      - resolve_presentation_comment_mcp_google_workspace
-      - list_task_lists_mcp_google_workspace
-      - get_task_list_mcp_google_workspace
-      - create_task_list_mcp_google_workspace
-      - update_task_list_mcp_google_workspace
-      - delete_task_list_mcp_google_workspace
-      - list_tasks_mcp_google_workspace
-      - get_task_mcp_google_workspace
-      - create_task_mcp_google_workspace
-      - update_task_mcp_google_workspace
-      - delete_task_mcp_google_workspace
-      - move_task_mcp_google_workspace
-      - clear_completed_tasks_mcp_google_workspace
-      - search_custom_mcp_google_workspace
-      - get_search_engine_info_mcp_google_workspace
-      - search_custom_siterestrict_mcp_google_workspace
-      - start_google_auth_mcp_google_workspace
       - file_search
-      - web_search
     tool_kwargs: []
     model_parameters:
       model: gpt-5.4
@@ -1446,6 +1289,7 @@ backgroundAgents:
     background_cortices: []
     voice_llm_model: null
     voice_llm_provider: null
+    voice_llm_model_parameters: {}
     agent_ids: []
     edges: []
     conversation_starters: []

@@ -433,7 +433,9 @@ async function getLatestRecallEligibleMessageCreatedAt({ user, scanLimit = 200 }
       error: { $ne: true },
       $or: [{ expiredAt: { $exists: false } }, { expiredAt: null }],
     })
-      .select('messageId parentMessageId conversationId createdAt text content attachments isCreatedByUser')
+      .select(
+        'messageId parentMessageId conversationId createdAt text content attachments isCreatedByUser metadata',
+      )
       .sort({ createdAt: -1 })
       .limit(Math.max(1, scanLimit))
       .lean();

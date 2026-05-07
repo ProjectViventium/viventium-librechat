@@ -11,9 +11,11 @@ const {
   resolveFallbackCandidates,
   isFallbackModelValid,
   resolveFallbackModelParameters,
+  sanitizeFallbackModelParametersForProvider,
   buildFallbackAgent,
   isSameAgentRoute,
   shouldRetryWithFallback,
+  shouldRetryBackgroundCortexWithFallback,
 } = require('../agentLlmFallback');
 
 describe('agentLlmFallback', () => {
@@ -98,6 +100,37 @@ describe('agentLlmFallback', () => {
     expect(primaryParameters).toEqual({ model: 'claude-opus-4-7', temperature: 0.8 });
   });
 
+  test('strips provider-specific parameters from cross-provider fallback routes', () => {
+    expect(
+      sanitizeFallbackModelParametersForProvider(
+        {
+          model: 'gpt-5.4',
+          thinking: false,
+          thinkingBudget: 2000,
+          reasoning_effort: 'high',
+        },
+        'openAI',
+      ),
+    ).toEqual({
+      model: 'gpt-5.4',
+      reasoning_effort: 'high',
+    });
+
+    expect(
+      sanitizeFallbackModelParametersForProvider(
+        {
+          model: 'claude-opus-4-7',
+          thinkingBudget: 2000,
+          reasoning_effort: 'high',
+        },
+        'anthropic',
+      ),
+    ).toEqual({
+      model: 'claude-opus-4-7',
+      thinkingBudget: 2000,
+    });
+  });
+
   test('builds voice fallback parameters from the effective voice model parameters', () => {
     const agent = {
       provider: 'anthropic',
@@ -151,6 +184,73 @@ describe('agentLlmFallback', () => {
           [ContentTypes.ERROR]: 'status 429 rate_limit_error',
         },
       ]),
+    ).toBe(false);
+  });
+
+  test('does not retry main-agent fallback for unstructured tool or MCP failures', () => {
+    expect(
+      shouldRetryWithFallback([
+        {
+          type: ContentTypes.ERROR,
+          [ContentTypes.ERROR]: 'MCP tool returned status 429 rate_limit_error',
+        },
+      ]),
+    ).toBe(false);
+
+    expect(
+      shouldRetryWithFallback([
+        {
+          type: ContentTypes.ERROR,
+          [ContentTypes.ERROR]: 'Tool call failed with status 529 overloaded',
+        },
+      ]),
+    ).toBe(false);
+  });
+
+  test('retries background cortex fallback for abort and timeout result errors', () => {
+    expect(shouldRetryBackgroundCortexWithFallback({ error: 'timeout', insight: null })).toBe(true);
+    expect(
+      shouldRetryBackgroundCortexWithFallback({ error: 'AbortError: operation was aborted', insight: null }),
+    ).toBe(true);
+    expect(
+      shouldRetryBackgroundCortexWithFallback({
+        error: 'status 529 overloaded',
+        insight: null,
+      }),
+    ).toBe(true);
+    expect(
+      shouldRetryBackgroundCortexWithFallback({
+        error: 'request timeout while invoking tool calling endpoint',
+        insight: null,
+      }),
+    ).toBe(true);
+    expect(
+      shouldRetryBackgroundCortexWithFallback({
+        error: 'status 529 overloaded while invoking tool calling endpoint',
+        insight: null,
+      }),
+    ).toBe(true);
+  });
+
+  test('does not retry background cortex fallback for visible output or structured tool failures', () => {
+    expect(
+      shouldRetryBackgroundCortexWithFallback({
+        insight: 'usable answer',
+        error: 'timeout',
+      }),
+    ).toBe(false);
+    expect(
+      shouldRetryBackgroundCortexWithFallback({
+        insight: null,
+        error: 'no_live_tool_execution',
+      }),
+    ).toBe(false);
+    expect(
+      shouldRetryBackgroundCortexWithFallback({
+        insight: null,
+        error: 'MCP tool failed with status 503',
+        errorClass: 'mcp_tool_failure',
+      }),
     ).toBe(false);
   });
 });

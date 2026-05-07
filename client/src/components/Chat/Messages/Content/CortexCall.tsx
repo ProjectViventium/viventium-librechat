@@ -9,23 +9,21 @@
  * Added: 2026-01-03
  */
 import { useMemo, useState, useEffect, useRef, useLayoutEffect } from 'react';
-import { Brain, Sparkles, XCircle } from 'lucide-react';
-import { ChevronDown, ChevronUp } from 'lucide-react';
-import { Spinner } from '@librechat/client';
 import ProgressText from './ProgressText';
 import type { CortexStatus } from 'librechat-data-provider';
 import CortexCallInfo from './CortexCallInfo';
 import { cn } from '~/utils';
 
 export default function CortexCall({
-  cortex_id,
+  cortex_id: _cortex_id,
   cortex_name,
   status,
   confidence,
   reason,
   insight,
+  silent = false,
+  no_response = false,
   isLast = false,
-  isSubmitting,
 }: {
   cortex_id: string;
   cortex_name: string;
@@ -33,8 +31,9 @@ export default function CortexCall({
   confidence?: number;
   reason?: string;
   insight?: string;
+  silent?: boolean;
+  no_response?: boolean;
   isLast?: boolean;
-  isSubmitting: boolean;
 }) {
   const [showInfo, setShowInfo] = useState(false);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -68,8 +67,8 @@ export default function CortexCall({
   const isComplete = status === 'complete';
   const isSkipped = status === 'skipped';
   const isError = status === 'error';
-  const isProcessing = status === 'activating' || status === 'brewing';
-  const cancelled = (!isSubmitting && progress < 1) || isError;
+  const cancelled = isError;
+  const isSilentComplete = isComplete && !hasInfo && (silent || no_response);
 
   // Get display text based on status
   const getText = () => {
@@ -87,24 +86,6 @@ export default function CortexCall({
       default:
         return cortex_name;
     }
-  };
-
-  // Get icon based on status
-  const getIcon = () => {
-    if (isError) {
-      return <XCircle className="size-4 text-red-500" />;
-    }
-    if (isSkipped) {
-      return <XCircle className="size-4 text-text-secondary opacity-50" />;
-    }
-    if (isComplete) {
-      return <Sparkles className="size-4 text-purple-500" />;
-    }
-    if (status === 'brewing') {
-      return <Brain className="size-4 text-purple-500 animate-pulse" />;
-    }
-    // activating
-    return <Spinner className="size-4" />;
   };
 
   // Animation for expandable content
@@ -152,13 +133,11 @@ export default function CortexCall({
   }, [showInfo, isAnimating]);
 
   // Don't show skipped cortices unless they have info to show
-  if (isSkipped && !hasInfo && !isLast) {
+  if (isSilentComplete || (isSkipped && !hasInfo && !isLast)) {
     return null;
   }
 
   const text = getText();
-  const icon = getIcon();
-  const showShimmer = isProcessing && !cancelled;
 
   return (
     <>

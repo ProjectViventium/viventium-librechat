@@ -139,7 +139,7 @@ describe('resolveFollowUpPersistenceText', () => {
     expect(result.decision.suppressionReason).toBe('');
   });
 
-  test('keeps {NTA} suppressed for non-replacement follow-ups', () => {
+  test('keeps {NTA} suppressed for ordinary follow-ups', () => {
     const result = resolveFollowUpPersistenceText({
       generatedText: '{NTA}',
       insightsData: {
@@ -154,7 +154,22 @@ describe('resolveFollowUpPersistenceText', () => {
     expect(result.decision.suppressionReason).toBe('no_response_tag');
   });
 
-  test('keeps voice-mode {NTA} suppressed for non-replacement follow-ups', () => {
+  test('does not treat legacy replaceParentMessage input as permission to edit or force Phase B', () => {
+    const result = resolveFollowUpPersistenceText({
+      generatedText: '{NTA}',
+      insightsData: {
+        insights: [{ cortexName: 'Pattern Recognition', insight: 'That choice is fine. Good call.' }],
+      },
+      replaceParentMessage: true,
+    });
+
+    expect(result.text).toBe('');
+    expect(result.decision.replaceParentMessage).toBe(false);
+    expect(result.decision.forceVisibleFollowUp).toBe(false);
+    expect(result.decision.selectedStrategy).toBe('no_response_suppressed');
+  });
+
+  test('keeps voice-mode {NTA} suppressed for ordinary follow-ups', () => {
     const result = resolveFollowUpPersistenceText({
       generatedText: '{NTA}',
       insightsData: {
@@ -171,7 +186,7 @@ describe('resolveFollowUpPersistenceText', () => {
     expect(result.decision.suppressionReason).toBe('no_response_tag');
   });
 
-  test('preserves voice-mode generated follow-up text for non-replacement follow-ups', () => {
+  test('preserves voice-mode generated follow-up text for ordinary follow-ups', () => {
     const result = resolveFollowUpPersistenceText({
       generatedText: 'That still works.',
       insightsData: {
@@ -187,13 +202,13 @@ describe('resolveFollowUpPersistenceText', () => {
     expect(result.decision.suppressionReason).toBe('');
   });
 
-  test('preserves replacement follow-up fallback when {NTA} has visible insight text', () => {
+  test('preserves forced follow-up fallback when {NTA} has visible insight text', () => {
     const result = resolveFollowUpPersistenceText({
       generatedText: '{NTA}',
       insightsData: {
         insights: [{ cortexName: 'Pattern Recognition', insight: 'That choice is fine. Good call.' }],
       },
-      replaceParentMessage: true,
+      forceVisibleFollowUp: true,
     });
 
     expect(result.text).toBe('That choice is fine. Good call.');
@@ -202,13 +217,39 @@ describe('resolveFollowUpPersistenceText', () => {
     expect(result.decision.suppressionReason).toBe('');
   });
 
-  test('preserves voice-mode replacement fallback when generated follow-up text is empty', () => {
+  test('forces scheduled {NTA} parent into a new visible Phase B follow-up when multiple insights exist', () => {
+    const result = resolveFollowUpPersistenceText({
+      generatedText: '{NTA}',
+      insightsData: {
+        insights: [
+          {
+            cortexName: 'Background Analysis',
+            insight: 'I reviewed the latest context and found one open work loop that can wait.',
+          },
+          {
+            cortexName: 'MS365',
+            insight: 'I found 2 calendar items that need attention today.',
+            completed_tool_calls: 2,
+          },
+        ],
+      },
+      forceVisibleFollowUp: true,
+      scheduleId: 'schedule_123',
+    });
+
+    expect(result.text).toBe('I found 2 calendar items that need attention today.');
+    expect(result.decision.llmResult).toBe('nta');
+    expect(result.decision.selectedStrategy).toBe('best_visible_insight');
+    expect(result.decision.suppressionReason).toBe('');
+  });
+
+  test('preserves voice-mode forced follow-up fallback when generated follow-up text is empty', () => {
     const result = resolveFollowUpPersistenceText({
       generatedText: '',
       insightsData: {
         insights: [{ cortexName: 'Pattern Recognition', insight: 'That choice is fine. Good call.' }],
       },
-      replaceParentMessage: true,
+      forceVisibleFollowUp: true,
       voiceMode: true,
       surface: 'playground',
     });
@@ -285,13 +326,13 @@ describe('resolveFollowUpPersistenceText', () => {
     expect(result.decision.suppressionReason).toBe('');
   });
 
-  test('preserves replacement fallback even when conversation moved on', () => {
+  test('preserves forced follow-up fallback even when conversation moved on', () => {
     const result = resolveFollowUpPersistenceText({
       generatedText: '',
       insightsData: {
         insights: [{ cortexName: 'worker', insight: 'The task completed successfully.' }],
       },
-      replaceParentMessage: true,
+      forceVisibleFollowUp: true,
       voiceMode: false,
       surface: 'web',
       movedOnAfterParent: true,

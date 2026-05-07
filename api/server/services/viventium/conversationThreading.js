@@ -104,6 +104,7 @@ async function resolveReusableConversationState({
   conversationId,
   userId,
   surface = 'unknown',
+  agentId = '',
   maxIdleMs = 0,
 }) {
   if (!conversationId || conversationId === 'new') {
@@ -148,7 +149,15 @@ async function resolveReusableConversationState({
     };
   }
 
-  if (convo.endpoint !== 'agents') {
+  const normalizedAgentId = typeof agentId === 'string' ? agentId.trim() : '';
+  const normalizedConvoAgentId = typeof convo.agent_id === 'string' ? convo.agent_id.trim() : '';
+  const canReuseProviderBackedVoiceConversation =
+    surface === 'voice' &&
+    normalizedAgentId.length > 0 &&
+    normalizedConvoAgentId.length > 0 &&
+    normalizedConvoAgentId === normalizedAgentId;
+
+  if (convo.endpoint !== 'agents' && !canReuseProviderBackedVoiceConversation) {
     logger.warn(
       '[VIVENTIUM][%s] Resetting non-agent conversationId=%s endpoint=%s userId=%s',
       surface,

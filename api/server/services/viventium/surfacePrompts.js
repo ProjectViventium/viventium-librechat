@@ -38,7 +38,18 @@ const CARTESIA_SONIC3_PRIMARY_EMOTIONS = CARTESIA_SONIC3_CAPABILITIES.generation
 const CARTESIA_SONIC3_SPEED = CARTESIA_SONIC3_CAPABILITIES.generation_config.speed;
 const CARTESIA_SONIC3_VOLUME = CARTESIA_SONIC3_CAPABILITIES.generation_config.volume;
 const CARTESIA_SONIC3_NONVERBAL_MARKERS = CARTESIA_SONIC3_CAPABILITIES.nonverbal_markers;
+const XAI_TTS_CAPABILITIES = require('../../../../../shared/voice/xai_tts_capabilities.json');
+const XAI_TTS_INLINE_TAGS = XAI_TTS_CAPABILITIES.speech_tags.inline;
+const XAI_TTS_WRAPPING_TAGS = XAI_TTS_CAPABILITIES.speech_tags.wrapping;
 /* === VIVENTIUM END === */
+
+function normalizeVoiceProvider(voiceProvider) {
+  const provider = (voiceProvider || '').toLowerCase();
+  if (['x_ai', 'grok', 'xai_grok_voice'].includes(provider)) {
+    return 'xai';
+  }
+  return provider;
+}
 
 function buildVoiceModeInstructions(voiceProvider) {
   const override = (process.env.VIVENTIUM_VOICE_MODE_PROMPT || '').trim();
@@ -56,7 +67,7 @@ function buildVoiceModeInstructions(voiceProvider) {
     '- If the user includes [voice], treat it as a strict voice-mode tag.',
   ];
 
-  const provider = (voiceProvider || '').toLowerCase();
+  const provider = normalizeVoiceProvider(voiceProvider);
   if (provider.includes('chatterbox')) {
     return [
       ...baseRules,
@@ -93,20 +104,21 @@ function buildVoiceModeInstructions(voiceProvider) {
   }
 
   /* === VIVENTIUM NOTE ===
-   * Feature: xAI Grok Voice prompt guard.
-   * Purpose: xAI Grok Voice is a conversational voice model that interprets bracket
-   * stage markers as directions to perform (e.g., [laugh] → actually laugh).
-   * Instruct the LLM to generate bracket markers and avoid Cartesia SSML.
-   * Added 2026-02-22.
+   * Feature: xAI standalone TTS prompt guard.
+   * Purpose: xAI TTS has its own speech-tag dialect. Keep it separate from
+   * Cartesia Sonic-3 SSML-like tags and from the older Grok Voice Agent prompt.
    */
   if (provider === 'xai') {
     return [
       ...baseRules,
-      '- Allowed nonverbal markers (use exactly these tokens): [laugh], [sigh], [gasp], [whisper], [hmm], [chuckle].',
-      '- Put nonverbal markers on their own line or between sentences (do not embed inside a sentence).',
-      '- Do NOT invent other bracketed stage directions.',
-      '- Do NOT use <emotion .../> or any XML/SSML-like tags.',
-      '- Express tone naturally and let the voice model interpret the energy of your words.',
+      '- xAI TTS is selected. You may use only documented xAI speech tags when they improve spoken delivery.',
+      `- Allowed xAI inline tags: ${XAI_TTS_INLINE_TAGS.join(', ')}.`,
+      `- Allowed xAI wrapping tags: ${XAI_TTS_WRAPPING_TAGS.map((tag) => `<${tag}>TEXT</${tag}>`).join(', ')}.`,
+      '- Use wrapping tags only on short phrases, include the closing tag, and do not split tag names across streamed chunks.',
+      '- Do NOT invent other bracketed stage directions or XML tags.',
+      '- Do NOT use Cartesia-only controls: <emotion>, <speed>, <volume>, <break>, <spell>, or [laughter].',
+      '- xAI TTS has no Cartesia-style emotion parameter; express tone through natural wording plus the documented xAI speech tags.',
+      '- Use xAI speech tags sparingly; natural wording still matters more than markup.',
     ].join('\n');
   }
   /* === VIVENTIUM NOTE === */
@@ -576,6 +588,10 @@ function buildTimeContextInstructions(req) {
  * in conversation transcripts.
  * Added: 2026-02-22
  * === VIVENTIUM END === */
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 const _DISPLAY_EMOTION_SELF_CLOSING_RE = /<emotion\s+value=["']?[^"'>]+["']?\s*\/>/gi;
 const _DISPLAY_EMOTION_WRAPPER_RE = /<emotion\s+value=["']?[^"'>]+["']?\s*>(.*?)<\/emotion>/gis;
 const _DISPLAY_SPEAK_RE = /<\/?speak[^>]*>/gi;
@@ -583,6 +599,16 @@ const _DISPLAY_BREAK_RE = /<break\s+time=["']?[^"'>]+["']?\s*\/>/gi;
 const _DISPLAY_SPEED_RE = /<speed\s+ratio=["']?[^"'>]+["']?\s*\/>/gi;
 const _DISPLAY_VOLUME_RE = /<volume\s+ratio=["']?[^"'>]+["']?\s*\/>/gi;
 const _DISPLAY_SPELL_RE = /<spell>(.*?)<\/spell>/gis;
+const _DISPLAY_XAI_WRAPPER_RE = new RegExp(
+  `<(${XAI_TTS_WRAPPING_TAGS.map(escapeRegex).join('|')})>(.*?)</\\1>`,
+  'gis',
+);
+const _DISPLAY_XAI_TAG_NAME_PATTERN = XAI_TTS_WRAPPING_TAGS.map(escapeRegex).join('|');
+const _DISPLAY_XAI_ANGLE_TAG_RE = new RegExp(`</?(?:${_DISPLAY_XAI_TAG_NAME_PATTERN})\\s*>`, 'gi');
+const _DISPLAY_XAI_BRACKET_TAG_RE = new RegExp(
+  `\\[\\s*/?\\s*(?:${_DISPLAY_XAI_TAG_NAME_PATTERN})\\s*\\]`,
+  'gi',
+);
 const _DISPLAY_STAGE_DIRECTION_MIN_ALPHA = 3;
 const _DISPLAY_STAGE_DIRECTION_MAX_ALPHA = 24;
 const _DISPLAY_STAGE_DIRECTION_MAX_WORDS = 3;
@@ -657,6 +683,18 @@ function stripBracketStageDirections(text) {
   return out;
 }
 
+function stripXaiWrappingTags(text) {
+  let cleaned = text || '';
+  let previous;
+  do {
+    previous = cleaned;
+    cleaned = cleaned.replace(_DISPLAY_XAI_WRAPPER_RE, '$2');
+  } while (cleaned !== previous);
+  cleaned = cleaned.replace(_DISPLAY_XAI_ANGLE_TAG_RE, '');
+  cleaned = cleaned.replace(_DISPLAY_XAI_BRACKET_TAG_RE, '');
+  return cleaned;
+}
+
 function stripVoiceControlTagsForDisplay(text) {
   if (!text) {
     return '';
@@ -669,6 +707,7 @@ function stripVoiceControlTagsForDisplay(text) {
   cleaned = cleaned.replace(_DISPLAY_SPEED_RE, '');
   cleaned = cleaned.replace(_DISPLAY_VOLUME_RE, '');
   cleaned = cleaned.replace(_DISPLAY_SPELL_RE, '$1');
+  cleaned = stripXaiWrappingTags(cleaned);
   cleaned = stripBracketStageDirections(cleaned);
   cleaned = cleaned.replace(/[ \t]{2,}/g, ' ');
   return cleaned.trim();

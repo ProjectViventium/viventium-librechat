@@ -168,6 +168,57 @@ describe('conversationThreading', () => {
     expect(state.reason).toBe('existing');
   });
 
+  test('resolveReusableConversationState reuses provider-backed voice conversations for the same agent', async () => {
+    mockGetConvo.mockResolvedValueOnce({
+      conversationId: 'conv-xai-voice',
+      endpoint: 'xai',
+      agent_id: 'xai__grok-4.3___Grok 4.3',
+    });
+    mockGetMessages.mockResolvedValueOnce([
+      {
+        messageId: 'voice-user-1',
+        parentMessageId: '00000000-0000-0000-0000-000000000000',
+        createdAt: '2026-05-06T21:59:00.000Z',
+      },
+      {
+        messageId: 'voice-assistant-1',
+        parentMessageId: 'voice-user-1',
+        createdAt: '2026-05-06T21:59:10.000Z',
+      },
+    ]);
+
+    const state = await resolveReusableConversationState({
+      conversationId: 'conv-xai-voice',
+      userId: 'user-1',
+      surface: 'voice',
+      agentId: 'xai__grok-4.3___Grok 4.3',
+    });
+
+    expect(state.conversationId).toBe('conv-xai-voice');
+    expect(state.parentMessageId).toBe('voice-assistant-1');
+    expect(state.reason).toBe('existing');
+  });
+
+  test('resolveReusableConversationState rejects provider-backed voice conversations for a different agent', async () => {
+    mockGetConvo.mockResolvedValueOnce({
+      conversationId: 'conv-xai-other',
+      endpoint: 'xai',
+      agent_id: 'xai__other-model___Other',
+    });
+
+    const state = await resolveReusableConversationState({
+      conversationId: 'conv-xai-other',
+      userId: 'user-1',
+      surface: 'voice',
+      agentId: 'xai__grok-4.3___Grok 4.3',
+    });
+
+    expect(state.conversationId).toBe('new');
+    expect(state.parentMessageId).toBeNull();
+    expect(state.reason).toBe('non_agent');
+    expect(mockGetMessages).not.toHaveBeenCalled();
+  });
+
   test('resolveLatestLeafMessageId falls back to latest createdAt when all messages have children', () => {
     const messages = [
       {

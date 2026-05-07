@@ -42,6 +42,10 @@ function leanResult(value) {
   };
 }
 
+function syntheticLocalPath(...parts) {
+  return ['', 'Users', 'synthetic-user', ...parts].join('/');
+}
+
 describe('GlassHiveCallbackDeliveryService', () => {
   beforeEach(() => {
     mockFindOneAndUpdate = jest.fn();
@@ -67,7 +71,7 @@ describe('GlassHiveCallbackDeliveryService', () => {
         message_id: 'msg_anchor',
         surface: 'telegram',
         telegram_chat_id: 'chat_1',
-        full_message: 'Created /Users/example/private/report.md',
+        full_message: `Created ${syntheticLocalPath('private', 'report.md')}`,
       },
       message: {
         messageId: 'msg_callback',
@@ -83,7 +87,7 @@ describe('GlassHiveCallbackDeliveryService', () => {
     expect(update.$setOnInsert).not.toHaveProperty('text');
     expect(update.$setOnInsert).not.toHaveProperty('expiresAt');
     expect(update.$set.fullText).toBe('');
-    expect(JSON.stringify(update)).not.toContain('/Users/example');
+    expect(JSON.stringify(update)).not.toContain(syntheticLocalPath());
   });
 
   test('claim uses the surface ledger without user-prompt matching', async () => {

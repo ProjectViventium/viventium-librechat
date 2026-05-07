@@ -90,7 +90,7 @@ describe('conversationRecallFilters', () => {
     ).toBe(false);
   });
 
-  test('skips Listen-Only transcript evidence from the normal conversation recall corpus', () => {
+  test('skips Listen-Only ambient transcripts from the normal conversation recall corpus', () => {
     expect(
       shouldSkipRecallMessage({
         message: {
@@ -100,11 +100,11 @@ describe('conversationRecallFilters', () => {
             viventium: {
               type: 'listen_only_transcript',
               mode: 'listen_only',
-              evidenceKind: 'ambient_room_transcript',
+              ambientKind: 'ambient_room_transcript',
             },
           },
         },
-        messageText: 'Ambient room transcript evidence.',
+        messageText: 'Ambient room transcript.',
         isCreatedByUser: false,
       }),
     ).toBe(true);

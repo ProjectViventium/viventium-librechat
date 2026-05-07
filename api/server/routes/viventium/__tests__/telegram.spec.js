@@ -707,6 +707,32 @@ describe('/api/viventium/telegram', () => {
     });
   });
 
+  test('GET /voice-route returns xAI voice variants for Telegram TTS parity', async () => {
+    mockResolveUserVoiceRoute.mockResolvedValueOnce({
+      stt: { provider: 'pywhispercpp', variant: 'large-v3-turbo' },
+      tts: { provider: 'xai', variant: 'Rex' },
+    });
+
+    const telegramRouter = require('../telegram');
+    const app = createTestApp(telegramRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/telegram/voice-route',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      query: { telegramUserId: 'tg-1' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockResolveUserVoiceRoute).toHaveBeenCalledWith('user_1');
+    expect(res.body.voiceRoute).toEqual({
+      stt: { provider: 'pywhispercpp', variant: 'large-v3-turbo' },
+      tts: { provider: 'xai', variant: 'Rex' },
+    });
+  });
+
   test('POST /chat overrides voiceProvider from the resolved voice route and returns it', async () => {
     mockResolveUserVoiceRoute.mockResolvedValueOnce({
       stt: { provider: 'pywhispercpp', variant: 'large-v3-turbo' },
@@ -735,6 +761,37 @@ describe('/api/viventium/telegram', () => {
     expect(res.body.voiceRoute).toEqual({
       stt: { provider: 'pywhispercpp', variant: 'large-v3-turbo' },
       tts: { provider: 'cartesia', variant: '6ccbfb76-1fc6-48f7-b71d-91ac6298247b' },
+    });
+  });
+
+  test('POST /chat overrides voiceProvider to xAI and returns saved xAI voice variant', async () => {
+    mockResolveUserVoiceRoute.mockResolvedValueOnce({
+      stt: { provider: 'pywhispercpp', variant: 'large-v3-turbo' },
+      tts: { provider: 'xai', variant: 'Eve' },
+    });
+
+    const telegramRouter = require('../telegram');
+    const app = createTestApp(telegramRouter);
+    const req = createMockReq({
+      url: '/api/viventium/telegram/chat',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      body: {
+        text: 'hi',
+        conversationId: 'new',
+        telegramUserId: 'tg-1',
+        voiceMode: true,
+        voiceProvider: 'openai',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(lastVoiceProvider).toBe('xai');
+    expect(res.body.voiceRoute).toEqual({
+      stt: { provider: 'pywhispercpp', variant: 'large-v3-turbo' },
+      tts: { provider: 'xai', variant: 'Eve' },
     });
   });
 

@@ -2276,6 +2276,9 @@ class AgentClient extends BaseClient {
       this._phaseBPromise = null;
       // Cache tool-cortex hold decision so Phase B can be configured consistently.
       let toolCortexHoldWanted = false;
+      const responseStream = this.options.res;
+      const canonicalResponseMessageId = this.responseMessageId;
+      const canonicalUserMessageId = this.parentMessageId;
 
 
       /* === VIVENTIUM NOTE ===
@@ -2323,8 +2326,8 @@ class AgentClient extends BaseClient {
             pendingCortexParts.push(cortexData);
           }
 
-          const streamId = this.options.req?._resumableStreamId;
-          const stream = this.options.res;
+          const streamId = req?._resumableStreamId;
+          const stream = responseStream;
           const streamOpen = stream && !stream.writableEnded && !stream.destroyed;
 
             /* === VIVENTIUM NOTE ===
@@ -2340,17 +2343,17 @@ class AgentClient extends BaseClient {
              * The canonical DB messageId remains `this.responseMessageId`.
              */
             const uiMessageId =
-              typeof this.parentMessageId === 'string' && this.parentMessageId.length > 0
-                ? `${this.parentMessageId}_`
-                : this.responseMessageId;
+              typeof canonicalUserMessageId === 'string' && canonicalUserMessageId.length > 0
+                ? `${canonicalUserMessageId}_`
+                : canonicalResponseMessageId;
             /* === VIVENTIUM NOTE END === */
 
             const eventPayload = {
               event: 'on_cortex_update',
               data: {
                 runId: uiMessageId,
-                canonicalMessageId: this.responseMessageId,
-                userMessageId: this.parentMessageId,
+                canonicalMessageId: canonicalResponseMessageId,
+                userMessageId: canonicalUserMessageId,
                 ...cortexData,
               },
             };
@@ -2434,15 +2437,18 @@ class AgentClient extends BaseClient {
             `for ${this.options.agent.background_cortices.length} cortices`,
           );
 
-          const selfRef = this;
+          const asyncReq = req;
+          const asyncRes = responseStream;
+          const asyncAgent = this.options.agent;
+          const asyncRunId = canonicalResponseMessageId;
           cortexExecutionPromise = (async () => {
             try {
               const asyncDetectStart = Date.now();
               const asyncDetectionResult = await detectActivations({
-                req: selfRef.options.req,
-                mainAgent: selfRef.options.agent,
+                req: asyncReq,
+                mainAgent: asyncAgent,
                 messages: initialMessages,
-                runId: selfRef.responseMessageId,
+                runId: asyncRunId,
                 timeBudgetMs: cortexDetectTimeoutMs,
               });
 
@@ -2505,11 +2511,11 @@ class AgentClient extends BaseClient {
               let mergedInsightsData = null;
 
               const executionResult = await executeActivated({
-                req: selfRef.options.req,
-                res: toolCortexHoldWanted ? null : selfRef.options.res,
-                mainAgent: selfRef.options.agent,
+                req: asyncReq,
+                res: toolCortexHoldWanted ? null : asyncRes,
+                mainAgent: asyncAgent,
                 messages: initialMessages,
-                runId: selfRef.responseMessageId,
+                runId: asyncRunId,
                 activatedCortices: activatedCorticesList,
                 onCortexBrewing: (cortexData) => {
                   void emitCortexEvent({ ...cortexData, type: ContentTypes.CORTEX_BREWING });
@@ -3098,6 +3104,7 @@ class AgentClient extends BaseClient {
         const conversationId = this.conversationId;
         const responseMessageId = this.responseMessageId;
         const agent = this.options.agent;
+        const responseContentParts = this.contentParts;
 
         this._phaseBPromise = cortexExecutionPromise
           .then(async (mergedInsightsData) => {
@@ -3177,7 +3184,7 @@ class AgentClient extends BaseClient {
             /* === VIVENTIUM NOTE END === */
 
             try {
-              const recentResponse = extractTextFromContentParts(this.contentParts);
+              const recentResponse = extractTextFromContentParts(responseContentParts);
               /* === VIVENTIUM START ===
                * Feature: Scheduled/no-response Phase B follow-up forcing.
                *
@@ -3202,8 +3209,8 @@ class AgentClient extends BaseClient {
               });
               /* VIVENTIUM DEBUG — Phase B recentResponse visibility */
               {
-                const cpLen = this.contentParts?.length ?? 0;
-                const textParts = (this.contentParts || []).filter((p) => p && p.type === ContentTypes.TEXT).length;
+                const cpLen = responseContentParts?.length ?? 0;
+                const textParts = (responseContentParts || []).filter((p) => p && p.type === ContentTypes.TEXT).length;
                 const rrLen = recentResponse.length;
                 if (process.env.VIVENTIUM_DEBUG_PHASE_B === 'true') {
                   const preview = recentResponse.slice(0, 200);

@@ -32,6 +32,7 @@ import {
   getThreadData,
 } from '~/utils';
 import { filterFilesByEndpointConfig } from '~/files';
+import { ragFileExists } from '~/files/rag';
 import { generateArtifactsPrompt } from '~/prompts';
 import { getProviderConfig } from '~/endpoints';
 import { logger } from '@librechat/data-schemas';
@@ -497,16 +498,47 @@ export async function initializeAgent(
           { userId: req.user.id, agentId: agent.id },
         )) as TFile[]) ?? []) as TFile[];
 
-        if (meetingTranscriptFiles.length > 0) {
+        const verifiedMeetingTranscriptFiles =
+          meetingTranscriptFiles.length > 0
+            ? (
+                await Promise.all(
+                  meetingTranscriptFiles.map(async (file) => ({
+                    file,
+                    exists: await ragFileExists({
+                      userId: req.user.id,
+                      fileId: file.file_id,
+                    }),
+                  })),
+                )
+              )
+                .filter((item) => item.exists)
+                .map((item) => item.file)
+            : [];
+
+        if (
+          meetingTranscriptFiles.length > 0 &&
+          verifiedMeetingTranscriptFiles.length < meetingTranscriptFiles.length
+        ) {
+          logger.warn('[initializeAgent] Meeting transcript Mongo artifacts missing from vector store', {
+            userId: req.user.id,
+            agentId: agent.id,
+            fileCount: meetingTranscriptFiles.length,
+            verifiedFileCount: verifiedMeetingTranscriptFiles.length,
+            mode: getMeetingTranscriptRagMode(),
+            sourceFolderHash: meetingTranscriptSourcePathHash,
+          });
+        }
+
+        if (verifiedMeetingTranscriptFiles.length > 0) {
           agent.tools = ensureMeetingTranscriptTool(agent.tools);
           tool_resources = mergeMeetingTranscriptResources({
             tool_resources,
-            transcriptFiles: meetingTranscriptFiles,
+            transcriptFiles: verifiedMeetingTranscriptFiles,
           });
           logger.debug('[initializeAgent] Attached meeting transcript recall resources', {
             userId: req.user.id,
             agentId: agent.id,
-            fileCount: meetingTranscriptFiles.length,
+            fileCount: verifiedMeetingTranscriptFiles.length,
             mode: getMeetingTranscriptRagMode(),
           });
         } else {

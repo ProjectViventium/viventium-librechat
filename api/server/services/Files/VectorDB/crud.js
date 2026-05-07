@@ -200,6 +200,43 @@ const deleteVectors = async (req, file) => {
   }
 };
 
+/* === VIVENTIUM START ===
+ * Feature: Vector-store presence check for derived recall artifacts.
+ *
+ * Purpose:
+ * - Mongo `embedded=true` is derived state. After a restore or RAG reset it can be stale.
+ * - Callers that want to skip uploads must first prove the vector sidecar still has the file id.
+ *
+ * Added: 2026-05-07
+ * === VIVENTIUM END === */
+const vectorDocumentExists = async (req, fileId) => {
+  if (!fileId || !process.env.RAG_API_URL) {
+    return false;
+  }
+  try {
+    const jwtToken = generateShortLivedToken(req.user.id);
+    await axios.get(
+      `${process.env.RAG_API_URL}/documents/${encodeURIComponent(fileId)}/context`,
+      {
+        headers: {
+          Authorization: `Bearer ${jwtToken}`,
+          accept: 'application/json',
+        },
+      },
+    );
+    return true;
+  } catch (error) {
+    if (error?.response?.status === 404) {
+      return false;
+    }
+    logAxiosError({
+      error: buildSafeUploadError(error),
+      message: 'Error checking vector document presence',
+    });
+    throw new Error(error?.message || 'An error occurred during vector presence check.');
+  }
+};
+
 /**
  * Uploads a file to the configured Vector database
  *
@@ -309,5 +346,6 @@ async function uploadVectors({ req, file, file_id, entity_id, storageMetadata, t
 
 module.exports = {
   deleteVectors,
+  vectorDocumentExists,
   uploadVectors,
 };

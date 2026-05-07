@@ -20,6 +20,7 @@ const {
 } = require('../surfacePrompts');
 
 const CARTESIA_SONIC3_CAPABILITIES = require('../../../../../../shared/voice/cartesia_sonic3_capabilities.json');
+const XAI_TTS_CAPABILITIES = require('../../../../../../shared/voice/xai_tts_capabilities.json');
 
 describe('buildTimeContextInstructions', () => {
   const originalDefaultTimezone = process.env.VIVENTIUM_DEFAULT_TIMEZONE;
@@ -159,15 +160,24 @@ describe('buildVoiceModeInstructions', () => {
 
   // === VIVENTIUM START ===
   // Feature: xAI provider branch test (added 2026-02-22)
-  test('xai branch allows bracket markers and prohibits SSML tags', () => {
+  test('xai branch includes complete standalone TTS speech tag contract', () => {
     const result = buildVoiceModeInstructions('xai');
     expect(result).toContain('VOICE MODE:');
-    expect(result).toContain('[laugh]');
-    expect(result).toContain('[sigh]');
-    expect(result).toContain('[gasp]');
-    expect(result).toContain('Do NOT use <emotion');
-    expect(result).toContain('Do NOT');
-    expect(result).toContain('XML/SSML');
+    expect(result).toContain('xAI TTS is selected');
+    for (const tag of XAI_TTS_CAPABILITIES.speech_tags.inline) {
+      expect(result).toContain(tag);
+    }
+    for (const tag of XAI_TTS_CAPABILITIES.speech_tags.wrapping) {
+      expect(result).toContain(`<${tag}>TEXT</${tag}>`);
+    }
+    expect(result).toContain('no Cartesia-style emotion parameter');
+    expect(result).toContain('Do NOT use Cartesia-only controls');
+  });
+
+  test('xai aliases use the xai standalone TTS prompt branch', () => {
+    const result = buildVoiceModeInstructions('x_ai');
+    expect(result).toContain('xAI TTS is selected');
+    expect(result).toContain('[long-pause]');
   });
   // === VIVENTIUM END ===
 
@@ -482,6 +492,25 @@ describe('stripVoiceControlTagsForDisplay', () => {
     expect(result).not.toContain('[whisper]');
     expect(result).toContain('Hello');
     expect(result).toContain('secrets');
+  });
+
+  test('strips xai wrapping tags while preserving inner text', () => {
+    const result = stripVoiceControlTagsForDisplay(
+      'I need <whisper>this part quiet</whisper> and <slow><soft>this part gentle</soft></slow>.',
+    );
+    expect(result).toBe('I need this part quiet and this part gentle.');
+    expect(result).not.toContain('<whisper>');
+    expect(result).not.toContain('<slow>');
+    expect(result).not.toContain('<soft>');
+  });
+
+  test('strips malformed xai square wrapper tags', () => {
+    const result = stripVoiceControlTagsForDisplay(
+      '<soft>Morning. You have warmth.[/soft] If needed.',
+    );
+    expect(result).toBe('Morning. You have warmth. If needed.');
+    expect(result).not.toContain('<soft>');
+    expect(result).not.toContain('[/soft]');
   });
 
   test('preserves non-stage bracket text', () => {

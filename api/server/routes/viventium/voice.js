@@ -31,6 +31,7 @@ const {
   assertCallSessionSecret,
   claimVoiceSession,
   assertVoiceGatewayAuth,
+  claimOrReplaceCallSessionConversationId,
   materializeCallSessionConversationId,
   updateCallSessionConversationId,
 } = require('~/server/services/viventium/CallSessionService');
@@ -404,7 +405,7 @@ async function coalesceVoiceTurn({
 
 /* === VIVENTIUM START ===
  * Feature: Listen-Only Mode
- * Purpose: Persist ambient call transcript evidence without entering the Agents controller,
+ * Purpose: Persist ambient call transcript records without entering the Agents controller,
  * background cortex, TTS, tools, or live memory writer path.
  * === VIVENTIUM END === */
 function normalizeListenOnlySpeakerLabel(incoming) {
@@ -538,6 +539,7 @@ async function persistListenOnlyTranscript({
   conversationId,
   parentMessageId,
   incoming,
+  sessionConversationRejected = false,
 }) {
   const normalizedText = normalizeVoiceTurnText(text);
   if (!normalizedText) {
@@ -558,18 +560,26 @@ async function persistListenOnlyTranscript({
     throw err;
   }
 
+  const canFallBackToSessionConversation =
+    !sessionConversationRejected && isConcreteConversationId(session?.conversationId);
   let resolvedConversationId = isConcreteConversationId(conversationId)
     ? conversationId
-    : session?.conversationId;
+    : canFallBackToSessionConversation
+      ? session?.conversationId
+      : null;
   if (!isConcreteConversationId(resolvedConversationId)) {
     const candidateConversationId = crypto.randomUUID();
-    const materializedSession = await materializeCallSessionConversationId(
-      session?.callSessionId,
-      candidateConversationId,
-    );
-    resolvedConversationId = isConcreteConversationId(materializedSession?.conversationId)
-      ? materializedSession.conversationId
-      : candidateConversationId;
+    const materializedSession = sessionConversationRejected
+      ? await claimOrReplaceCallSessionConversationId(session?.callSessionId, candidateConversationId, {
+          expectedConversationId: session?.conversationId,
+        })
+      : await materializeCallSessionConversationId(session?.callSessionId, candidateConversationId);
+    if (!isConcreteConversationId(materializedSession?.conversationId)) {
+      const err = new Error('Call session is no longer available for Listen-Only transcript persistence');
+      err.status = 409;
+      throw err;
+    }
+    resolvedConversationId = materializedSession.conversationId;
   }
   const resolvedParentMessageId = await resolveListenOnlyTranscriptParentMessageId({
     userId,
@@ -603,7 +613,7 @@ async function persistListenOnlyTranscript({
             type: 'listen_only_transcript',
             source: 'voice_call',
             mode: 'listen_only',
-            evidenceKind: 'ambient_room_transcript',
+            ambientKind: 'ambient_room_transcript',
             callSessionId: session?.callSessionId || null,
             speakerLabel,
             requestId,
@@ -697,14 +707,29 @@ async function handleListenOnlyVoiceTurn({ req, res, session }) {
       } coalesced=${Boolean(coalescedTurn.dedupeKey)} textChars=${req.body?.text?.length || 0}`,
   );
 
-  const persisted = await persistListenOnlyTranscript({
-    req,
-    session,
-    text: req.body?.text,
-    conversationId: req.body?.conversationId,
-    parentMessageId: req.body?.parentMessageId,
-    incoming: req.body,
-  });
+  let persisted;
+  try {
+    persisted = await persistListenOnlyTranscript({
+      req,
+      session,
+      text: req.body?.text,
+      conversationId: req.body?.conversationId,
+      parentMessageId: req.body?.parentMessageId,
+      incoming: req.body,
+      sessionConversationRejected: req.viventiumVoiceConversationRejected === true,
+    });
+  } catch (err) {
+    const status = Number.isInteger(err?.status) ? err.status : 500;
+    logger.warn(
+      '[VIVENTIUM][voice/chat] Listen-Only transcript persistence failed: %s',
+      err?.message || err,
+    );
+    return res.status(status).json({
+      error: err?.message || 'Listen-Only transcript persistence failed',
+      listenOnly: true,
+      status: 'listen_only_error',
+    });
+  }
 
   if (coalescedTurn.dedupeKey) {
     updateVoiceIngressEvent(
@@ -887,9 +912,15 @@ router.post('/chat', voiceAuth, configMiddleware, async (req, _res, next) => {
     conversationId: requestedConversationId,
     userId: req.user?.id,
     surface: 'voice',
+    agentId: session.agentId,
   });
   const conversationId = conversationState.conversationId;
   let parentMessageId = conversationState.parentMessageId;
+  const conversationRejectedForVoice =
+    isConcreteConversationId(requestedConversationId) &&
+    conversationId === 'new' &&
+    conversationState.reason !== 'new';
+  req.viventiumVoiceConversationRejected = conversationRejectedForVoice;
   logVoiceRouteStage(
     req,
     'resolve_parent_message_done',
@@ -1008,7 +1039,13 @@ router.post('/chat', voiceAuth, configMiddleware, async (req, _res, next) => {
   res.json = (payload) => {
     try {
       const convoId = payload?.conversationId;
-      if (session && session.conversationId === 'new' && typeof convoId === 'string' && convoId.length > 0) {
+      const shouldUpdateSessionConversationId =
+        session &&
+        (session.conversationId === 'new' || req.viventiumVoiceConversationRejected === true) &&
+        typeof convoId === 'string' &&
+        convoId.length > 0 &&
+        convoId !== 'new';
+      if (shouldUpdateSessionConversationId) {
         updateCallSessionConversationId(session.callSessionId, convoId).catch((err) => {
           logger.warn('[VIVENTIUM][voice/chat] Failed to update call session conversationId:', err);
         });

@@ -59,6 +59,11 @@ jest.mock('~/files', () => ({
   filterFilesByEndpointConfig: jest.fn(() => []),
 }));
 
+const mockRagFileExists = jest.fn().mockResolvedValue(true);
+jest.mock('~/files/rag', () => ({
+  ragFileExists: (...args: unknown[]) => mockRagFileExists(...args),
+}));
+
 jest.mock('~/prompts', () => ({
   generateArtifactsPrompt: jest.fn(() => null),
 }));
@@ -360,6 +365,7 @@ describe('initializeAgent — conversation recall resources', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    mockRagFileExists.mockResolvedValue(true);
     recallAvailabilityInternal.resetConversationRecallVectorRuntimeStatusCache();
     global.fetch = jest.fn().mockResolvedValue({
       ok: true,
@@ -806,6 +812,60 @@ describe('initializeAgent — meeting transcript resources', () => {
         expect.objectContaining({
           reason: 'unreachable',
           sourceFolderHash: expect.stringMatching(/^[a-f0-9]{16}$/),
+        }),
+      );
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not attach meeting transcript rows that are missing from the vector store', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-meeting-init-missing-vector-'));
+    try {
+      process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_DIR = tempDir;
+      mockRagFileExists.mockResolvedValue(false);
+      const { agent, req, res, loadTools, db } = createMocks();
+      db.getFiles = jest.fn().mockResolvedValue([
+        {
+          user: 'user-1',
+          file_id: 'meeting_summary:user-1:missing',
+          filename: 'meeting-transcript-summary-missing.txt',
+          embedded: true,
+          context: FileContext.meeting_transcript,
+          metadata: {
+            meetingTranscriptKind: 'summary',
+            meetingTranscriptSourcePathHash: crypto
+              .createHash('sha256')
+              .update(path.resolve(tempDir))
+              .digest('hex')
+              .slice(0, 16),
+          },
+        },
+      ]);
+
+      const result = await initializeAgent(
+        {
+          req,
+          res,
+          agent,
+          loadTools,
+          endpointOption: { endpoint: EModelEndpoint.agents },
+          allowedProviders: new Set([Providers.OPENAI]),
+          isInitialAgent: true,
+        },
+        db,
+      );
+
+      expect(mockRagFileExists).toHaveBeenCalledWith({
+        userId: 'user-1',
+        fileId: 'meeting_summary:user-1:missing',
+      });
+      expect(result.tool_resources?.file_search?.files || []).toEqual([]);
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        '[initializeAgent] Meeting transcript Mongo artifacts missing from vector store',
+        expect.objectContaining({
+          fileCount: 1,
+          verifiedFileCount: 0,
         }),
       );
     } finally {

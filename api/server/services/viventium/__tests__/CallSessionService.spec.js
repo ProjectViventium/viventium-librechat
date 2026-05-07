@@ -14,6 +14,7 @@ const {
   getCallSessionVoiceSettings,
   syncCallSessionState,
   updateCallSessionVoiceSettings,
+  claimOrReplaceCallSessionConversationId,
   updateCallSessionConversationId,
   claimVoiceSession,
   claimDispatch,
@@ -106,6 +107,36 @@ describe('CallSessionService', () => {
 
     const updated = await updateCallSessionConversationId(created.callSessionId, 'convo_123');
     expect(updated.conversationId).toBe('convo_123');
+  });
+
+  test('claimOrReplaceCallSessionConversationId atomically replaces only the expected stale id', async () => {
+    const user = await User.create({
+      name: 'Call User',
+      email: 'call-user-claim@example.com',
+      provider: 'local',
+    });
+
+    const created = await createCallSession({
+      userId: user._id.toString(),
+      agentId: 'agent_1',
+      conversationId: 'stale-provider-convo',
+    });
+
+    const claimed = await claimOrReplaceCallSessionConversationId(
+      created.callSessionId,
+      'fresh-listen-only-convo',
+      { expectedConversationId: 'stale-provider-convo' },
+    );
+    const losingClaim = await claimOrReplaceCallSessionConversationId(
+      created.callSessionId,
+      'split-convo',
+      { expectedConversationId: 'stale-provider-convo' },
+    );
+
+    expect(claimed.conversationId).toBe('fresh-listen-only-convo');
+    expect(losingClaim.conversationId).toBe('fresh-listen-only-convo');
+    const fetched = await getCallSession(created.callSessionId);
+    expect(fetched.conversationId).toBe('fresh-listen-only-convo');
   });
 
   test('createCallSession seeds wing mode from the canonical default env', async () => {

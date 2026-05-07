@@ -716,22 +716,37 @@ async function updateCallSessionConversationId(callSessionId, conversationId) {
  * Purpose: Atomically claim the concrete conversationId for a new call session so concurrent
  * listen-only transcript saves cannot split one listening session across multiple conversations.
  * === VIVENTIUM END === */
-async function materializeCallSessionConversationId(callSessionId, candidateConversationId) {
+async function claimOrReplaceCallSessionConversationId(
+  callSessionId,
+  candidateConversationId,
+  { expectedConversationId } = {},
+) {
   if (!callSessionId || !candidateConversationId || candidateConversationId === 'new') {
     return null;
   }
 
   const now = new Date();
+  const normalizedExpectedConversationId =
+    typeof expectedConversationId === 'string' && expectedConversationId.trim()
+      ? expectedConversationId.trim()
+      : '';
+  const conversationIdCondition =
+    normalizedExpectedConversationId && normalizedExpectedConversationId !== 'new'
+      ? { conversationId: normalizedExpectedConversationId }
+      : {
+          $or: [
+            { conversationId: 'new' },
+            { conversationId: '' },
+            { conversationId: null },
+            { conversationId: { $exists: false } },
+          ],
+        };
+
   const claim = await ViventiumCallSession.findOneAndUpdate(
     {
       callSessionId: String(callSessionId),
       expiresAt: { $gt: now },
-      $or: [
-        { conversationId: 'new' },
-        { conversationId: '' },
-        { conversationId: null },
-        { conversationId: { $exists: false } },
-      ],
+      ...conversationIdCondition,
     },
     { $set: { conversationId: candidateConversationId } },
     { new: true },
@@ -747,6 +762,10 @@ async function materializeCallSessionConversationId(callSessionId, candidateConv
   }).lean();
 
   return normalizeSession(existing);
+}
+
+async function materializeCallSessionConversationId(callSessionId, candidateConversationId) {
+  return claimOrReplaceCallSessionConversationId(callSessionId, candidateConversationId);
 }
 
 function getRequiredEnvSecret() {
@@ -954,6 +973,7 @@ module.exports = {
   resolveUserVoiceRoute,
   syncCallSessionState,
   updateCallSessionVoiceSettings,
+  claimOrReplaceCallSessionConversationId,
   materializeCallSessionConversationId,
   updateCallSessionConversationId,
   claimVoiceSession,

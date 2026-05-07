@@ -118,6 +118,47 @@ LC_FRONTEND_PORT="${VIVENTIUM_LC_FRONTEND_PORT:-3090}"
 LC_API_URL="http://localhost:${LC_API_PORT}"
 LC_FRONTEND_URL="http://localhost:${LC_FRONTEND_PORT}"
 
+# === VIVENTIUM START ===
+# Feature: Direct LibreChat dev starts honor generated Viventium runtime env.
+#
+# Purpose:
+# - `npm run backend:dev` and this wrapper are common local entrypoints.
+# - Meeting transcript recall is opt-in via generated App Support env, so direct starts
+#   must not silently drop VIVENTIUM_MEMORY_TRANSCRIPTS_* while the outer launcher has it.
+load_env_file_preserving_existing() {
+    local env_file="$1"
+    local label="$2"
+    [[ -f "$env_file" ]] || return 1
+    echo -e "${YELLOW}Loading $label environment variables from $env_file...${NC}"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "$line" ]] && continue
+        [[ "$line" =~ ^(UID|GID|EUID|PPID|DOCKER_GID)= ]] && continue
+        if [[ "$line" =~ ^([a-zA-Z_][a-zA-Z0-9_]*)=(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            value="${BASH_REMATCH[2]}"
+            if [[ -z "${!key:-}" ]]; then
+                value="${value%\"}"
+                value="${value#\"}"
+                value="${value%\'}"
+                value="${value#\'}"
+                export "$key=$value"
+            fi
+        fi
+    done < "$env_file"
+    return 0
+}
+
+for generated_env_file in \
+    "${VIVENTIUM_ENV_FILE:-}" \
+    "${HOME}/Library/Application Support/Viventium/runtime/service-env/librechat.env" \
+    "${HOME}/Library/Application Support/Viventium/runtime/runtime.env"
+do
+    [[ -n "$generated_env_file" ]] || continue
+    load_env_file_preserving_existing "$generated_env_file" "generated Viventium" || true
+done
+# === VIVENTIUM END ===
+
 # Load environment variables from .env file if it exists
 if [ -f ".env" ]; then
     echo -e "${YELLOW}Loading environment variables from .env...${NC}"
@@ -145,6 +186,27 @@ if [ -f ".env" ]; then
 else
     echo -e "${YELLOW}Warning: .env file not found. Environment variables may not be loaded correctly.${NC}"
 fi
+
+# === VIVENTIUM START ===
+# Feature: Keep direct LibreChat dev starts aligned with Viventium source-of-truth config.
+# Purpose: `librechat.yaml` is an ignored local runtime file; direct starts must refresh it
+# from the tracked template before the API loads model specs, endpoints, and tools.
+sync_viventium_librechat_config() {
+    local source_config="$PROJECT_DIR/viventium/source_of_truth/local.librechat.yaml"
+    local target_config="$PROJECT_DIR/librechat.yaml"
+
+    if [[ ! -f "$source_config" ]]; then
+        return 0
+    fi
+
+    if [[ ! -f "$target_config" ]] || ! cmp -s "$source_config" "$target_config"; then
+        cp "$source_config" "$target_config"
+        echo -e "${GREEN}LibreChat config synced from Viventium source of truth${NC}"
+    fi
+}
+
+sync_viventium_librechat_config
+# === VIVENTIUM END ===
 
 # === VIVENTIUM START ===
 # Local conversation search defaults. The outer launcher provisions Meilisearch;

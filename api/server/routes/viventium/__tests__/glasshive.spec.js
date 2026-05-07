@@ -73,6 +73,18 @@ function callbackBody(overrides = {}) {
   };
 }
 
+function syntheticLocalPath(...parts) {
+  return ['', 'Users', 'synthetic-user', ...parts].join('/');
+}
+
+function syntheticWindowsPath(...parts) {
+  return ['C:', 'Users', 'synthetic-user', ...parts].join('\\');
+}
+
+function syntheticHomePath(...parts) {
+  return ['', 'home', 'synthetic-user', ...parts].join('/');
+}
+
 function createTestApp(router) {
   const app = express();
   app.use('/api/viventium/glasshive', router);
@@ -242,7 +254,10 @@ describe('/api/viventium/glasshive/callback', () => {
       telegram_chat_id: '12345',
       telegram_user_id: '67890',
       message: 'Short preview.',
-      full_message: 'Short preview.\n\nFull report section without /Users/example/private/path.md.',
+      full_message: `Short preview.\n\nFull report section without ${syntheticLocalPath(
+        'private',
+        'path.md',
+      )}.`,
     });
     const req = createMockReq({
       url: '/api/viventium/glasshive/callback',
@@ -258,7 +273,7 @@ describe('/api/viventium/glasshive/callback', () => {
     const payload = mockEnqueueGlassHiveCallbackDelivery.mock.calls[0][0];
     expect(payload.fullText).toContain('Full report section');
     expect(payload.fullText).toContain('[local path]');
-    expect(payload.fullText).not.toContain('/Users/example');
+    expect(payload.fullText).not.toContain(syntheticLocalPath());
     const [, message] = mockSaveMessage.mock.calls[0];
     expect(message.metadata.viventium.hasFullText).toBe(true);
   });
@@ -290,7 +305,10 @@ describe('/api/viventium/glasshive/callback', () => {
     const body = callbackBody({
       callback_id: 'cb_multiline_text',
       message:
-        'Captured 42 rows.  \n\nCreated `/Users/example/private/results.md`.\n\nNext step: reply continue.',
+        `Captured 42 rows.  \n\nCreated \`${syntheticLocalPath(
+          'private',
+          'results.md',
+        )}\`.\n\nNext step: reply continue.`,
     });
     const req = createMockReq({
       url: '/api/viventium/glasshive/callback',
@@ -698,7 +716,10 @@ describe('/api/viventium/glasshive/callback', () => {
       callback_id: 'cb_sanitize_markdown_links',
       event: 'run.completed',
       message:
-        'Opened `http://127.0.0.1:12345/qa` and saved [proof.png](/Users/example/private/proof.png).',
+        `Opened \`http://127.0.0.1:12345/qa\` and saved [proof.png](${syntheticLocalPath(
+          'private',
+          'proof.png',
+        )}).`,
     });
     const req = createMockReq({
       url: '/api/viventium/glasshive/callback',
@@ -723,7 +744,20 @@ describe('/api/viventium/glasshive/callback', () => {
       callback_id: 'cb_sanitize_local_paths',
       event: 'run.completed',
       message:
-        'Saved `/Users/example/My Documents/result.md` and copied /private/var/folders/example/state.txt from /home/example/project/output.txt plus C:\\Users\\example\\Desktop\\sample.txt and /users/example/lowercase.txt.',
+        `Saved \`${syntheticLocalPath(
+          'My Documents',
+          'result.md',
+        )}\` and copied ${['', 'private', 'var', 'folders', 'synthetic', 'state.txt'].join(
+          '/',
+        )} from ${syntheticHomePath(
+          'project',
+          'output.txt',
+        )} plus ${syntheticWindowsPath('Desktop', 'sample.txt')} and ${[
+          '',
+          'users',
+          'synthetic-user',
+          'lowercase.txt',
+        ].join('/')}.`,
     });
     const req = createMockReq({
       url: '/api/viventium/glasshive/callback',
@@ -737,12 +771,12 @@ describe('/api/viventium/glasshive/callback', () => {
     expect(res.statusCode).toBe(200);
     const [, message] = mockSaveMessage.mock.calls[0];
     expect(message.text.match(/\[local path\]/g)).toHaveLength(5);
-    expect(message.text).not.toContain('/Users/example');
+    expect(message.text).not.toContain(syntheticLocalPath());
     expect(message.text).not.toContain('My Documents');
     expect(message.text).not.toContain('/private/var');
-    expect(message.text).not.toContain('/home/example');
-    expect(message.text).not.toContain('C:\\Users\\example');
-    expect(message.text).not.toContain('/users/example');
+    expect(message.text).not.toContain(syntheticHomePath());
+    expect(message.text).not.toContain(syntheticWindowsPath());
+    expect(message.text).not.toContain('/users/synthetic-user');
   });
 
   test('rejects stale callbacks before persistence', async () => {

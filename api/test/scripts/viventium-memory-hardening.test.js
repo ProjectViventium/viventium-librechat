@@ -7,6 +7,7 @@ const {
   buildHardenerPrompt,
   buildTranscriptSummaryPrompt,
   deferTranscriptLifecycleWhenRagUnavailable,
+  findTranscriptContentHashesMissingVectors,
   invokeModel,
   invokeTranscriptSummaryModel,
   markTranscriptIndexProcessed,
@@ -304,6 +305,77 @@ describe('viventium-memory-hardening', () => {
         action: 'summary',
         reason: 'transcript_summary_failed',
       });
+      expect(spawnSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      spawnSpy.mockRestore();
+      fs.rmSync(tempDir, { recursive: true, force: true });
+      fs.rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  test('recent chat activity does not block scheduled transcript scanning', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-transcript-recent-'));
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-transcript-recent-state-'));
+    const now = new Date('2026-05-05T12:00:00Z');
+    const messageCollection = {
+      find: jest.fn().mockReturnValueOnce({
+        sort: () => ({
+          limit: () => ({
+            next: async () => ({ createdAt: new Date('2026-05-05T11:59:00Z') }),
+          }),
+        }),
+      }),
+    };
+    const spawnSpy = jest
+      .spyOn(childProcess, 'spawnSync')
+      .mockReturnValueOnce({
+        status: 0,
+        stdout: JSON.stringify({
+          summary: 'Detailed summary with speaker and timing context.',
+          createdAt: now.toISOString(),
+        }),
+        stderr: '',
+      })
+      .mockReturnValueOnce({
+        status: 0,
+        stdout: JSON.stringify({
+          operations: [],
+          transcript_summaries: [],
+        }),
+        stderr: '',
+      });
+    try {
+      fs.writeFileSync(path.join(tempDir, 'meeting.txt'), 'Speaker A: transcript detail.', 'utf8');
+      const result = await buildUserProposal({
+        db: { collection: () => messageCollection },
+        methods: { getAllUserMemories: jest.fn().mockResolvedValue([]) },
+        user: { _id: '507f1f77bcf86cd799439011', name: 'Test User' },
+        options: {
+          lookbackDays: 7,
+          minUserIdleMinutes: 60,
+          maxChangesPerUser: 3,
+          maxInputChars: 500000,
+          requireFullLookback: true,
+          ignoreIdleGate: false,
+          transcriptsDir: tempDir,
+          transcriptStateDir: stateDir,
+          transcriptMaxFilesPerRun: 20,
+          transcriptMaxCharsPerFile: 500000,
+          transcriptSummaryMaxChars: 32000,
+        },
+        memoryConfig,
+        now,
+        providerInfo: { provider: 'anthropic', model: 'claude-opus-4-7', effort: 'xhigh' },
+      });
+
+      expect(result.status).toBe('proposed');
+      expect(result.summary.message_count).toBe(0);
+      expect(result.summary.transcript_ingest).toMatchObject({
+        files_seen: 1,
+        files_pending: 1,
+      });
+      expect(result.privateProposal.transcripts).toHaveLength(1);
+      expect(messageCollection.find).toHaveBeenCalledTimes(1);
       expect(spawnSpy).toHaveBeenCalledTimes(2);
     } finally {
       spawnSpy.mockRestore();
@@ -1017,6 +1089,75 @@ describe('viventium-memory-hardening', () => {
     }
   });
 
+  test('transcript scan requeues unchanged processed files when vector repair requests their content hash', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-transcript-vector-repair-'));
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-transcript-vector-repair-state-'));
+    const now = new Date('2026-05-05T12:00:00Z');
+    try {
+      fs.writeFileSync(path.join(tempDir, 'meeting.txt'), 'Speaker A: transcript detail.', 'utf8');
+      const first = scanTranscriptDirectory({
+        user: { _id: '507f1f77bcf86cd799439011' },
+        options: {
+          transcriptsDir: tempDir,
+          transcriptStateDir: stateDir,
+          transcriptMaxFilesPerRun: 20,
+          transcriptMaxCharsPerFile: 500000,
+        },
+        now,
+        transcriptStateDir: stateDir,
+      });
+      expect(first.transcripts).toHaveLength(1);
+      markTranscriptIndexProcessed({
+        userProposal: {
+          transcriptIndexPath: first.indexPath,
+          transcriptIndex: first.index,
+          transcripts: [
+            {
+              ...first.transcripts[0],
+              summary: 'Detailed summary with speaker and timing context.',
+              summary_char_count: 49,
+            },
+          ],
+          transcriptRagMode: 'detailed_summary_only',
+        },
+        now,
+      });
+
+      const unchanged = scanTranscriptDirectory({
+        user: { _id: '507f1f77bcf86cd799439011' },
+        options: {
+          transcriptsDir: tempDir,
+          transcriptStateDir: stateDir,
+          transcriptMaxFilesPerRun: 20,
+          transcriptMaxCharsPerFile: 500000,
+        },
+        now,
+        transcriptStateDir: stateDir,
+      });
+      expect(unchanged.transcripts).toHaveLength(0);
+      expect(unchanged.telemetry.files_unchanged).toBe(1);
+
+      const repair = scanTranscriptDirectory({
+        user: { _id: '507f1f77bcf86cd799439011' },
+        options: {
+          transcriptsDir: tempDir,
+          transcriptStateDir: stateDir,
+          transcriptMaxFilesPerRun: 20,
+          transcriptMaxCharsPerFile: 500000,
+          transcriptForceContentHashes: new Set([first.transcripts[0].contentHash]),
+        },
+        now,
+        transcriptStateDir: stateDir,
+      });
+      expect(repair.transcripts).toHaveLength(1);
+      expect(repair.transcripts[0].contentHash).toBe(first.transcripts[0].contentHash);
+      expect(repair.telemetry.files_requeued_missing_vectors).toBe(1);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+      fs.rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
   test('transcript scan expands tilde source directories before hashing state', () => {
     const oldHome = process.env.HOME;
     const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-home-'));
@@ -1296,6 +1437,169 @@ describe('viventium-memory-hardening', () => {
       jest.dontMock('~/server/services/Files/VectorDB/crud');
       if (oldRag) process.env.RAG_API_URL = oldRag;
       else delete process.env.RAG_API_URL;
+    }
+  });
+
+  test('transcript vector lifecycle reuploads when Mongo says embedded but RAG is missing the file', async () => {
+    jest.resetModules();
+    const oldRag = process.env.RAG_API_URL;
+    process.env.RAG_API_URL = 'http://rag.example.test';
+    const userId = '507f1f77bcf86cd799439011';
+    const header = buildTranscriptArtifactHeader({
+      artifactId: 'meeting_transcript:abc',
+      kind: 'summary',
+      filename: 'meeting.csv',
+      fileMtime: '2026-05-05T10:00:00.000Z',
+      sourceStatus: 'new_or_changed',
+      inputComplete: true,
+      rawCharCount: 19,
+      suppliedCharCount: 19,
+      summaryCharCount: 49,
+    });
+    const indexedText = buildTranscriptArtifactText({
+      header,
+      kind: 'summary',
+      body: 'Detailed summary with speaker and timing context.',
+    });
+    const digest = crypto.createHash('sha256').update(indexedText).digest('hex');
+    const uploadVectors = jest.fn().mockResolvedValue(undefined);
+    const deleteVectors = jest.fn().mockResolvedValue(undefined);
+    const vectorDocumentExists = jest.fn().mockResolvedValue(false);
+    const findOneAndUpdate = jest.fn(() => ({ lean: async () => ({}) }));
+    jest.doMock('~/db/models', () => ({
+      File: {
+        findOne: jest.fn(() => ({
+          lean: async () => ({
+            file_id: 'meeting_summary:summary',
+            embedded: true,
+            metadata: {
+              meetingTranscriptUploadedDigest: digest,
+            },
+          }),
+          select: () => ({
+            lean: async () => ({
+              file_id: 'meeting_summary:summary',
+              embedded: true,
+              metadata: {
+                meetingTranscriptUploadedDigest: digest,
+              },
+            }),
+          }),
+        })),
+        findOneAndUpdate,
+        deleteOne: jest.fn().mockResolvedValue({ deletedCount: 0 }),
+      },
+    }));
+    jest.doMock('~/server/services/Files/VectorDB/crud', () => ({
+      uploadVectors,
+      deleteVectors,
+      vectorDocumentExists,
+    }));
+
+    try {
+      const result = await applyTranscriptVectorLifecycle({
+        userProposal: {
+          userId,
+          transcriptRagMode: 'detailed_summary_only',
+          transcripts: [
+            {
+              artifactId: 'meeting_transcript:abc',
+              contentHash: 'abc1234567890abc',
+              sourcePathHash: 'sourcehash',
+              filename: 'meeting.csv',
+              file_mtime: '2026-05-05T10:00:00.000Z',
+              source_status: 'new_or_changed',
+              calendar_match: null,
+              rawFileId: 'meeting_transcript:raw',
+              summaryFileId: 'meeting_summary:summary',
+              file_content: '<transcript>\nraw transcript text\n</transcript>',
+              input_complete: true,
+              raw_char_count: 19,
+              raw_byte_count: 19,
+              supplied_char_count: 19,
+              summary_char_count: 49,
+              summary: 'Detailed summary with speaker and timing context.',
+            },
+          ],
+          staleTranscriptArtifacts: [],
+        },
+      });
+
+      expect(result.uploaded).toBe(1);
+      expect(vectorDocumentExists).toHaveBeenCalledWith(
+        { user: { id: userId } },
+        'meeting_summary:summary',
+      );
+      expect(deleteVectors).toHaveBeenCalledWith(
+        { user: { id: userId } },
+        { file_id: 'meeting_summary:summary', embedded: true },
+      );
+      expect(uploadVectors).toHaveBeenCalledTimes(1);
+      expect(findOneAndUpdate.mock.calls[0][1].$set).toMatchObject({
+        embedded: false,
+      });
+    } finally {
+      jest.dontMock('~/db/models');
+      jest.dontMock('~/server/services/Files/VectorDB/crud');
+      if (oldRag) process.env.RAG_API_URL = oldRag;
+      else delete process.env.RAG_API_URL;
+    }
+  });
+
+  test('missing transcript vector discovery returns content hashes for reprocessing', async () => {
+    jest.resetModules();
+    const oldRag = process.env.RAG_API_URL;
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-transcript-vector-db-'));
+    process.env.RAG_API_URL = 'http://rag.example.test';
+    const vectorDocumentExists = jest
+      .fn()
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+    jest.doMock('~/server/services/Files/VectorDB/crud', () => ({
+      vectorDocumentExists,
+    }));
+    const files = [
+      {
+        file_id:
+          'meeting_summary:507f1f77bcf86cd799439011:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      },
+      {
+        file_id:
+          'meeting_summary:507f1f77bcf86cd799439011:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      },
+    ];
+    const toArray = jest.fn().mockResolvedValue(files);
+    const project = jest.fn(() => ({ toArray }));
+    const find = jest.fn(() => ({ project }));
+    const collection = jest.fn((name) => {
+      if (name !== 'files') throw new Error(`unexpected collection ${name}`);
+      return { find };
+    });
+
+    try {
+      const result = await findTranscriptContentHashesMissingVectors({
+        db: { collection },
+        user: { _id: '507f1f77bcf86cd799439011' },
+        options: {
+          mode: 'apply',
+          transcriptsDir: tempDir,
+          transcriptRagMode: 'detailed_summary_only',
+        },
+      });
+      expect(Array.from(result)).toEqual([
+        'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      ]);
+      expect(find.mock.calls[0][0]).toMatchObject({
+        context: 'meeting_transcript',
+        embedded: true,
+        'metadata.meetingTranscriptKind': 'summary',
+      });
+      expect(vectorDocumentExists).toHaveBeenCalledTimes(2);
+    } finally {
+      jest.dontMock('~/server/services/Files/VectorDB/crud');
+      if (oldRag) process.env.RAG_API_URL = oldRag;
+      else delete process.env.RAG_API_URL;
+      fs.rmSync(tempDir, { recursive: true, force: true });
     }
   });
 
@@ -1583,7 +1887,7 @@ describe('viventium-memory-hardening', () => {
         ],
         transcripts: [{ artifactId: 'meeting_transcript:one' }],
         staleTranscriptArtifacts: [{ rawFileId: 'meeting_transcript:file' }],
-        transcriptIndexPath: '/tmp/private-index.json',
+        transcriptIndexPath: '<temp>/private-index.json',
         transcriptIndex: { files: {} },
       });
 

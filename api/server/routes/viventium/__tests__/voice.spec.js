@@ -23,6 +23,7 @@ let mockLastAgentId = null;
 let mockLastRequestText = null;
 let mockAgentControllerCallCount = 0;
 let mockAgentControllerResponseDelayMs = 0;
+let mockAgentControllerGeneratedConversationId = null;
 let mockClaimGlassHiveDeliveries;
 let mockMarkGlassHiveDeliverySent;
 let mockMarkGlassHiveDeliveryFailed;
@@ -30,19 +31,16 @@ let mockMarkGlassHiveDeliverySuppressed;
 let mockObservedInfoLogs;
 let mockConsoleLogSpy;
 
-jest.mock(
-  '@librechat/data-schemas',
-  () => ({
-    logger: {
-      debug: jest.fn(),
-      info: jest.fn((...args) => {
-        mockObservedInfoLogs.push(args.map(String).join(' '));
-      }),
-      warn: jest.fn(),
-      error: jest.fn(),
-    },
-  }),
-);
+jest.mock('@librechat/data-schemas', () => ({
+  logger: {
+    debug: jest.fn(),
+    info: jest.fn((...args) => {
+      mockObservedInfoLogs.push(args.map(String).join(' '));
+    }),
+    warn: jest.fn(),
+    error: jest.fn(),
+  },
+}));
 
 jest.mock('~/server/middleware', () => ({
   configMiddleware: (req, _res, next) => {
@@ -79,7 +77,10 @@ jest.mock('~/server/controllers/agents/request', () => (req, res) => {
   const respond = () =>
     res.json({
       streamId: 'stream_voice_1',
-      conversationId: req.body.conversationId || 'new',
+      conversationId:
+        req.body.conversationId === 'new' && mockAgentControllerGeneratedConversationId
+          ? mockAgentControllerGeneratedConversationId
+          : req.body.conversationId || 'new',
     });
   if (mockAgentControllerResponseDelayMs > 0) {
     setTimeout(respond, mockAgentControllerResponseDelayMs);
@@ -94,9 +95,10 @@ jest.mock('~/server/services/viventium/CallSessionService', () => ({
   assertVoiceGatewayAuth: (...args) => mockAssertVoiceGatewayAuth(...args),
   materializeCallSessionConversationId: jest
     .fn()
-    .mockImplementation((_callSessionId, conversationId) =>
-      Promise.resolve({ conversationId }),
-    ),
+    .mockImplementation((_callSessionId, conversationId) => Promise.resolve({ conversationId })),
+  claimOrReplaceCallSessionConversationId: jest
+    .fn()
+    .mockImplementation((_callSessionId, conversationId) => Promise.resolve({ conversationId })),
   updateCallSessionConversationId: jest.fn().mockResolvedValue({}),
 }));
 
@@ -131,7 +133,8 @@ jest.mock('~/server/services/viventium/GlassHiveCallbackDeliveryService', () => 
   claimPendingGlassHiveCallbackDeliveries: (...args) => mockClaimGlassHiveDeliveries(...args),
   markGlassHiveCallbackDeliverySent: (...args) => mockMarkGlassHiveDeliverySent(...args),
   markGlassHiveCallbackDeliveryFailed: (...args) => mockMarkGlassHiveDeliveryFailed(...args),
-  markGlassHiveCallbackDeliverySuppressed: (...args) => mockMarkGlassHiveDeliverySuppressed(...args),
+  markGlassHiveCallbackDeliverySuppressed: (...args) =>
+    mockMarkGlassHiveDeliverySuppressed(...args),
 }));
 
 jest.mock('@librechat/api', () => ({
@@ -274,11 +277,14 @@ describe('/api/viventium/voice/chat', () => {
     mockLastRequestText = null;
     mockAgentControllerCallCount = 0;
     mockAgentControllerResponseDelayMs = 0;
+    mockAgentControllerGeneratedConversationId = null;
     mockMessageFindOne = createMessageFindOneMock(null);
     mockMessageFind = createMessageFindMock([]);
     mockMessageBulkWrite = jest.fn().mockResolvedValue({ modifiedCount: 0 });
     mockMessageFindOneAndUpdate = jest.fn().mockResolvedValue({ _id: 'listen_only_msg_oid' });
-    mockConversationFindOneAndUpdate = jest.fn().mockResolvedValue({ conversationId: 'conv-voice-1' });
+    mockConversationFindOneAndUpdate = jest
+      .fn()
+      .mockResolvedValue({ conversationId: 'conv-voice-1' });
     const voiceIngressStore = new Map();
     mockVoiceIngressCreate = jest.fn().mockImplementation(async (doc) => {
       if (voiceIngressStore.has(doc.dedupeKey)) {
@@ -401,6 +407,169 @@ describe('/api/viventium/voice/chat', () => {
     expect(mockLastParentMessageId).toBe(Constants.NO_PARENT);
   });
 
+  test('updates the call session when a stale concrete conversation resets to new', async () => {
+    const {
+      updateCallSessionConversationId,
+    } = require('~/server/services/viventium/CallSessionService');
+    mockAgentControllerGeneratedConversationId = 'conv-generated-voice';
+    mockGetConvo = jest.fn().mockResolvedValue({
+      conversationId: 'conv-google',
+      endpoint: 'google',
+      agent_id: 'google__gemini___Gemini',
+    });
+    mockAssertVoiceGatewayAuth = jest.fn().mockResolvedValue({
+      callSessionId: 'call_session_1',
+      userId: 'user_1',
+      agentId: 'xai__grok-4.3___Grok 4.3',
+      conversationId: 'conv-google',
+    });
+
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      url: '/api/viventium/voice/chat',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: { text: 'start the voice call in a usable conversation' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+    await Promise.resolve();
+
+    expect(res.statusCode).toBe(200);
+    expect(mockLastConversationId).toBe('new');
+    expect(updateCallSessionConversationId).toHaveBeenCalledWith(
+      'call_session_1',
+      'conv-generated-voice',
+    );
+  });
+
+  test('reuses the generated conversation on the next voice turn after a stale reset', async () => {
+    const {
+      updateCallSessionConversationId,
+    } = require('~/server/services/viventium/CallSessionService');
+    let storedConversationId = 'conv-google';
+    updateCallSessionConversationId.mockImplementation((_callSessionId, conversationId) => {
+      storedConversationId = conversationId;
+      return Promise.resolve({ conversationId });
+    });
+    mockAgentControllerGeneratedConversationId = 'conv-generated-voice';
+    mockGetConvo = jest.fn().mockImplementation((_userId, conversationId) => {
+      if (conversationId === 'conv-google') {
+        return Promise.resolve({
+          conversationId: 'conv-google',
+          endpoint: 'google',
+          agent_id: 'google__gemini___Gemini',
+        });
+      }
+      if (conversationId === 'conv-generated-voice') {
+        return Promise.resolve({
+          conversationId: 'conv-generated-voice',
+          endpoint: 'xai',
+          agent_id: 'xai__grok-4.3___Grok 4.3',
+        });
+      }
+      return Promise.resolve(null);
+    });
+    mockAssertVoiceGatewayAuth = jest.fn().mockImplementation(() =>
+      Promise.resolve({
+        callSessionId: 'call_session_1',
+        userId: 'user_1',
+        agentId: 'xai__grok-4.3___Grok 4.3',
+        conversationId: storedConversationId,
+      }),
+    );
+
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+
+    const firstReq = createMockReq({
+      url: '/api/viventium/voice/chat',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: { text: 'first turn repairs the stale session pointer' },
+    });
+    const firstRes = createMockRes();
+    await dispatch(app, firstReq, firstRes);
+    await Promise.resolve();
+
+    expect(firstRes.statusCode).toBe(200);
+    expect(mockLastConversationId).toBe('new');
+    expect(storedConversationId).toBe('conv-generated-voice');
+
+    const secondReq = createMockReq({
+      url: '/api/viventium/voice/chat',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: { text: 'second turn should continue the repaired conversation' },
+    });
+    const secondRes = createMockRes();
+    await dispatch(app, secondReq, secondRes);
+
+    expect(secondRes.statusCode).toBe(200);
+    expect(mockLastConversationId).toBe('conv-generated-voice');
+    expect(updateCallSessionConversationId).toHaveBeenCalledTimes(1);
+  });
+
+  test('reuses provider-backed voice conversations when the agent_id matches the call session', async () => {
+    const {
+      updateCallSessionConversationId,
+    } = require('~/server/services/viventium/CallSessionService');
+    mockGetConvo = jest.fn().mockResolvedValue({
+      conversationId: 'conv-xai-voice',
+      endpoint: 'xai',
+      agent_id: 'xai__grok-4.3___Grok 4.3',
+    });
+    mockAssertVoiceGatewayAuth = jest.fn().mockResolvedValue({
+      callSessionId: 'call_session_1',
+      userId: 'user_1',
+      agentId: 'xai__grok-4.3___Grok 4.3',
+      conversationId: 'conv-xai-voice',
+    });
+
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      url: '/api/viventium/voice/chat',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: { text: 'continue the same provider-backed voice call' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockLastConversationId).toBe('conv-xai-voice');
+    expect(mockLastParentMessageId).toBe('voice-assistant-leaf');
+    expect(updateCallSessionConversationId).not.toHaveBeenCalled();
+  });
+
+  test('does not replace the call session on transient conversation lookup errors', async () => {
+    const {
+      updateCallSessionConversationId,
+    } = require('~/server/services/viventium/CallSessionService');
+    mockGetConvo = jest.fn().mockRejectedValue(new Error('temporary lookup failure'));
+    mockAssertVoiceGatewayAuth = jest.fn().mockResolvedValue({
+      callSessionId: 'call_session_1',
+      userId: 'user_1',
+      agentId: 'xai__grok-4.3___Grok 4.3',
+      conversationId: 'conv-xai-voice',
+    });
+
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      url: '/api/viventium/voice/chat',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: { text: 'continue during a transient lookup failure' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockLastConversationId).toBe('conv-xai-voice');
+    expect(updateCallSessionConversationId).not.toHaveBeenCalled();
+  });
+
   test('coalesces rapid same-parent voice turns into one launched stream', async () => {
     jest.useFakeTimers();
     process.env.VIVENTIUM_VOICE_TURN_COALESCE_WINDOW_MS = '10';
@@ -489,7 +658,9 @@ describe('/api/viventium/voice/chat', () => {
     expect(res1.body.streamId).toBe('stream_voice_1');
     expect(res2.body.streamId).toBe('stream_voice_1');
     expect(res3.body.streamId).toBe('stream_voice_1');
-    expect([res1.body.coalesced, res2.body.coalesced, res3.body.coalesced].filter(Boolean)).toHaveLength(2);
+    expect(
+      [res1.body.coalesced, res2.body.coalesced, res3.body.coalesced].filter(Boolean),
+    ).toHaveLength(2);
   });
 
   test('logs committed voice turns with callSessionId and requestId', async () => {
@@ -517,7 +688,7 @@ describe('/api/viventium/voice/chat', () => {
     expect(infoText).toContain('requestId=req-log-1');
   });
 
-  test('Listen-Only mode saves transcript evidence without starting an agent stream', async () => {
+  test('Listen-Only mode saves ambient transcripts without starting an agent stream', async () => {
     const { initializeClient } = require('~/server/services/Endpoints/agents');
     const addTitle = require('~/server/services/Endpoints/agents/title');
     const {
@@ -582,7 +753,7 @@ describe('/api/viventium/voice/chat', () => {
             viventium: expect.objectContaining({
               type: 'listen_only_transcript',
               mode: 'listen_only',
-              evidenceKind: 'ambient_room_transcript',
+              ambientKind: 'ambient_room_transcript',
               speakerLabel: 'room',
               requestId: 'req-listen-1',
             }),
@@ -615,6 +786,102 @@ describe('/api/viventium/voice/chat', () => {
       }),
       expect.objectContaining({ upsert: true }),
     );
+  });
+
+  test('Listen-Only mode claims a fresh conversation when the stored session id was rejected', async () => {
+    const {
+      claimOrReplaceCallSessionConversationId,
+      materializeCallSessionConversationId,
+    } = require('~/server/services/viventium/CallSessionService');
+    mockAssertVoiceGatewayAuth = jest.fn().mockResolvedValue({
+      callSessionId: 'call_session_listen_only',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      conversationId: 'conv-google',
+      listenOnlyModeEnabled: true,
+    });
+    mockGetConvo = jest.fn().mockResolvedValue({
+      conversationId: 'conv-google',
+      endpoint: 'google',
+      agent_id: 'google__gemini___Gemini',
+    });
+    mockGetMessages = jest.fn().mockResolvedValue([]);
+
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      url: '/api/viventium/voice/chat',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-request-id': 'req-listen-stale-1',
+      },
+      body: { text: 'ambient transcript after stale session id' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body.listenOnly).toBe(true);
+    expect(res.body.conversationId).not.toBe('conv-google');
+    expect(claimOrReplaceCallSessionConversationId).toHaveBeenCalledWith(
+      'call_session_listen_only',
+      expect.any(String),
+      { expectedConversationId: 'conv-google' },
+    );
+    expect(materializeCallSessionConversationId).not.toHaveBeenCalled();
+    expect(mockMessageFindOneAndUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({ user: 'user_1' }),
+      expect.objectContaining({
+        $set: expect.objectContaining({
+          conversationId: res.body.conversationId,
+          text: 'ambient transcript after stale session id',
+        }),
+      }),
+      expect.objectContaining({ upsert: true }),
+    );
+    expect(mockAgentControllerCallCount).toBe(0);
+  });
+
+  test('Listen-Only mode fails closed when a fresh conversation cannot be claimed', async () => {
+    const {
+      materializeCallSessionConversationId,
+    } = require('~/server/services/viventium/CallSessionService');
+    materializeCallSessionConversationId.mockResolvedValueOnce(null);
+    mockAssertVoiceGatewayAuth = jest.fn().mockResolvedValue({
+      callSessionId: 'call_session_listen_only',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      conversationId: 'new',
+      listenOnlyModeEnabled: true,
+    });
+    mockGetConvo = jest.fn().mockResolvedValue(null);
+    mockGetMessages = jest.fn().mockResolvedValue([]);
+
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      url: '/api/viventium/voice/chat',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-request-id': 'req-listen-unclaimed-1',
+      },
+      body: { text: 'ambient transcript without a live call session claim' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toEqual(
+      expect.objectContaining({
+        listenOnly: true,
+        status: 'listen_only_error',
+      }),
+    );
+    expect(mockMessageFindOneAndUpdate).not.toHaveBeenCalled();
+    expect(mockConversationFindOneAndUpdate).not.toHaveBeenCalled();
+    expect(mockAgentControllerCallCount).toBe(0);
   });
 
   test('Listen-Only mode coalesces rapid parentless transcript duplicates into one saved row', async () => {

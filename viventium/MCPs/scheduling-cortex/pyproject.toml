@@ -10,7 +10,7 @@ description = "Viventium Scheduling Cortex MCP server"
 authors = [{ name = "Viventium" }]
 requires-python = ">=3.10"
 dependencies = [
-  "fastmcp>=2.12.5",
+  "fastmcp>=3.2.0",
   "pydantic>=2.7",
   "croniter>=2.0",
   "md2tgmd>=0.3.10",

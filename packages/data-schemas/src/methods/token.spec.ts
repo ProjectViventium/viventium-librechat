@@ -157,6 +157,42 @@ describe('Token Methods - Detailed Tests', () => {
       expect(found?.identifier).toBe('oauth-123');
     });
 
+    test('should require type to match when type is provided', async () => {
+      const typedUserId = new mongoose.Types.ObjectId();
+      await Token.create([
+        {
+          token: 'typed-access-token',
+          userId: typedUserId,
+          type: 'mcp_oauth',
+          identifier: 'mcp:example',
+          createdAt: new Date(),
+          expiresAt: new Date(Date.now() + 3600000),
+        },
+        {
+          token: 'typed-client-token',
+          userId: typedUserId,
+          type: 'mcp_oauth_client',
+          identifier: 'mcp:example',
+          createdAt: new Date(),
+          expiresAt: new Date(Date.now() + 3600000),
+        },
+      ]);
+
+      const found = await methods.findToken({
+        userId: typedUserId.toString(),
+        type: 'mcp_oauth_client',
+        identifier: 'mcp:example',
+      });
+      const mismatched = await methods.findToken({
+        userId: typedUserId.toString(),
+        type: 'mcp_oauth_refresh',
+        identifier: 'mcp:example',
+      });
+
+      expect(found?.token).toBe('typed-client-token');
+      expect(mismatched).toBeNull();
+    });
+
     test('should find token by multiple criteria (AND condition)', async () => {
       const found = await methods.findToken({
         userId: user1Id.toString(),
@@ -653,6 +689,59 @@ describe('Token Methods - Detailed Tests', () => {
     });
   });
 
+  describe('deleteToken', () => {
+    test('should delete only one token matching all provided fields', async () => {
+      const user1Id = new mongoose.Types.ObjectId();
+      const user2Id = new mongoose.Types.ObjectId();
+
+      await Token.create([
+        {
+          token: 'access-user-1',
+          userId: user1Id,
+          type: 'mcp_oauth',
+          identifier: 'mcp:google_workspace',
+          createdAt: new Date(),
+          expiresAt: new Date(Date.now() + 3600000),
+        },
+        {
+          token: 'refresh-user-1',
+          userId: user1Id,
+          type: 'mcp_oauth_refresh',
+          identifier: 'mcp:google_workspace:refresh',
+          createdAt: new Date(),
+          expiresAt: new Date(Date.now() + 3600000),
+        },
+        {
+          token: 'access-user-2',
+          userId: user2Id,
+          type: 'mcp_oauth',
+          identifier: 'mcp:google_workspace',
+          createdAt: new Date(),
+          expiresAt: new Date(Date.now() + 3600000),
+        },
+      ]);
+
+      const deleted = await methods.deleteToken({
+        userId: user1Id.toString(),
+        type: 'mcp_oauth',
+        identifier: 'mcp:google_workspace',
+      });
+
+      expect(deleted?.token).toBe('access-user-1');
+      const remaining = await Token.find({}).sort({ token: 1 });
+      expect(remaining.map((token) => token.token)).toEqual([
+        'access-user-2',
+        'refresh-user-1',
+      ]);
+    });
+
+    test('should reject empty deleteToken queries', async () => {
+      await expect(methods.deleteToken({})).rejects.toThrow(
+        'At least one query parameter must be provided',
+      );
+    });
+  });
+
   describe('Email Normalization', () => {
     let normUserId: mongoose.Types.ObjectId;
 
@@ -776,13 +865,13 @@ describe('Token Methods - Detailed Tests', () => {
         await Token.create({
           token: 'verification-token',
           userId: userId,
-          email: 'user@company.com',
+          email: 'user@corp.example.com',
           createdAt: new Date(),
           expiresAt: new Date(Date.now() + 86400000),
         });
 
         // OpenID provider returns email with different case
-        const emailFromProvider = 'User@Company.COM';
+        const emailFromProvider = 'User@Corp.Example.COM';
 
         // Should find the token despite case mismatch
         const found = await methods.findToken({ email: emailFromProvider });
@@ -801,13 +890,13 @@ describe('Token Methods - Detailed Tests', () => {
         await Token.create({
           token: 'old-verification',
           userId: userId,
-          email: 'john.smith@enterprise.com',
+          email: 'john.smith@enterprise.example.com',
           createdAt: new Date(Date.now() - 3600000),
           expiresAt: new Date(Date.now() + 82800000),
         });
 
         // User requests resend with different email casing
-        const userInputEmail = '  John.Smith@ENTERPRISE.COM  ';
+        const userInputEmail = '  John.Smith@ENTERPRISE.EXAMPLE.COM  ';
 
         // Delete old tokens for this email
         const deleted = await methods.deleteTokens({ email: userInputEmail });

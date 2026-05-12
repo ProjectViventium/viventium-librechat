@@ -99,6 +99,24 @@ export class RedisEventTransport implements IEventTransport {
   /** Sequence counters per stream for publishing (ensures ordered delivery in cluster mode) */
   private sequenceCounters = new Map<string, number>();
 
+  /* === VIVENTIUM START ===
+   * Purpose: Centralize stream-state construction so reconnect preservation,
+   * abort callbacks, and ordering buffers stay structurally identical.
+   * === VIVENTIUM END === */
+  private createStreamState(): StreamSubscribers {
+    return {
+      count: 0,
+      handlers: new Map(),
+      allSubscribersLeftCallbacks: [],
+      abortCallbacks: [],
+      reorderBuffer: {
+        nextSeq: 0,
+        pending: new Map(),
+        flushTimeout: null,
+      },
+    };
+  }
+
   /**
    * Create a new Redis event transport.
    *
@@ -337,17 +355,11 @@ export class RedisEventTransport implements IEventTransport {
 
     // Initialize stream state if needed
     if (!this.streams.has(streamId)) {
-      this.streams.set(streamId, {
-        count: 0,
-        handlers: new Map(),
-        allSubscribersLeftCallbacks: [],
-        abortCallbacks: [],
-        reorderBuffer: {
-          nextSeq: 0,
-          pending: new Map(),
-          flushTimeout: null,
-        },
-      });
+      /* === VIVENTIUM START ===
+       * Purpose: Use the shared state constructor introduced for reconnect-safe
+       * stream lifecycle handling.
+       * === VIVENTIUM END === */
+      this.streams.set(streamId, this.createStreamState());
     }
 
     const streamState = this.streams.get(streamId)!;
@@ -395,8 +407,11 @@ export class RedisEventTransport implements IEventTransport {
               logger.error(`[RedisEventTransport] Error in allSubscribersLeft callback:`, err);
             }
           }
-
-          this.streams.delete(streamId);
+          /* === VIVENTIUM START ===
+           * Purpose: Preserve per-stream callbacks and reorder state across
+           * reconnect cycles. Cleanup still owns final deletion when the job
+           * ends; deleting here makes later subscribers lose sync/reset hooks.
+           * === VIVENTIUM END === */
         }
       },
     };
@@ -431,6 +446,11 @@ export class RedisEventTransport implements IEventTransport {
       await this.publisher.publish(channel, JSON.stringify(message));
     } catch (err) {
       logger.error(`[RedisEventTransport] Failed to publish done:`, err);
+      /* === VIVENTIUM START ===
+       * Purpose: Terminal event publish failures must reject so callers and CI
+       * can detect that the final stream state was not delivered.
+       * === VIVENTIUM END === */
+      throw err;
     }
   }
 
@@ -447,6 +467,11 @@ export class RedisEventTransport implements IEventTransport {
       await this.publisher.publish(channel, JSON.stringify(message));
     } catch (err) {
       logger.error(`[RedisEventTransport] Failed to publish error:`, err);
+      /* === VIVENTIUM START ===
+       * Purpose: Error event publish failures must reject so callers and CI can
+       * detect that the stream error state was not delivered.
+       * === VIVENTIUM END === */
+      throw err;
     }
   }
 
@@ -476,18 +501,35 @@ export class RedisEventTransport implements IEventTransport {
       state.allSubscribersLeftCallbacks.push(callback);
     } else {
       // Create state just for the callback
-      this.streams.set(streamId, {
-        count: 0,
-        handlers: new Map(),
-        allSubscribersLeftCallbacks: [callback],
-        abortCallbacks: [],
-        reorderBuffer: {
-          nextSeq: 0,
-          pending: new Map(),
-          flushTimeout: null,
-        },
-      });
+      /* === VIVENTIUM START ===
+       * Purpose: Keep callback-only stream state structurally aligned with
+       * reconnect-safe subscriber state.
+       * === VIVENTIUM END === */
+      const newState = this.createStreamState();
+      newState.allSubscribersLeftCallbacks.push(callback);
+      this.streams.set(streamId, newState);
     }
+  }
+
+  /* === VIVENTIUM START ===
+   * Purpose: Align Redis transport with the public IEventTransport contract
+   * and reconnect regression tests. A first subscriber after a disconnect must
+   * not wait for stale sequence numbers that were published while disconnected.
+   * === VIVENTIUM END === */
+  syncReorderBuffer(streamId: string): void {
+    let state = this.streams.get(streamId);
+    if (!state) {
+      state = this.createStreamState();
+      this.streams.set(streamId, state);
+    }
+
+    const buffer = state.reorderBuffer;
+    if (buffer.flushTimeout) {
+      clearTimeout(buffer.flushTimeout);
+      buffer.flushTimeout = null;
+    }
+    buffer.pending.clear();
+    buffer.nextSeq = this.sequenceCounters.get(streamId) ?? buffer.nextSeq;
   }
 
   /**
@@ -516,17 +558,11 @@ export class RedisEventTransport implements IEventTransport {
     let state = this.streams.get(streamId);
 
     if (!state) {
-      state = {
-        count: 0,
-        handlers: new Map(),
-        allSubscribersLeftCallbacks: [],
-        abortCallbacks: [],
-        reorderBuffer: {
-          nextSeq: 0,
-          pending: new Map(),
-          flushTimeout: null,
-        },
-      };
+      /* === VIVENTIUM START ===
+       * Purpose: Keep abort-only stream state structurally aligned with
+       * reconnect-safe subscriber state.
+       * === VIVENTIUM END === */
+      state = this.createStreamState();
       this.streams.set(streamId, state);
     }
 

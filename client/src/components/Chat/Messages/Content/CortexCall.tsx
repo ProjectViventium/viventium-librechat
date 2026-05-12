@@ -9,23 +9,23 @@
  * Added: 2026-01-03
  */
 import { useMemo, useState, useEffect, useRef, useLayoutEffect } from 'react';
-import { Brain, Sparkles, XCircle } from 'lucide-react';
-import { ChevronDown, ChevronUp } from 'lucide-react';
-import { Spinner } from '@librechat/client';
 import ProgressText from './ProgressText';
 import type { CortexStatus } from 'librechat-data-provider';
 import CortexCallInfo from './CortexCallInfo';
 import { cn } from '~/utils';
 
 export default function CortexCall({
-  cortex_id,
+  cortex_id: _cortex_id,
   cortex_name,
   status,
   confidence,
   reason,
   insight,
+  error,
+  error_class,
+  silent = false,
+  no_response = false,
   isLast = false,
-  isSubmitting,
 }: {
   cortex_id: string;
   cortex_name: string;
@@ -33,8 +33,11 @@ export default function CortexCall({
   confidence?: number;
   reason?: string;
   insight?: string;
+  error?: string;
+  error_class?: string;
+  silent?: boolean;
+  no_response?: boolean;
   isLast?: boolean;
-  isSubmitting: boolean;
 }) {
   const [showInfo, setShowInfo] = useState(false);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -42,11 +45,21 @@ export default function CortexCall({
   const [isAnimating, setIsAnimating] = useState(false);
   const prevShowInfoRef = useRef<boolean>(showInfo);
 
-  // Determine if we have expandable content
-  const hasInfo = useMemo(
-    () => (insight?.length ?? 0) > 0 || (reason?.length ?? 0) > 0,
-    [insight, reason],
-  );
+  const hasInsight = (insight?.trim().length ?? 0) > 0;
+  const hasErrorDetail = (error?.trim().length ?? 0) > 0;
+  const isComplete = status === 'complete';
+  const isSkipped = status === 'skipped';
+  const isError = status === 'error';
+  const isSilentComplete = isComplete && (silent || no_response) && !hasInsight && !hasErrorDetail;
+
+  // Determine if we have expandable content. Silent no-response completions may preserve an
+  // activation reason for telemetry, but that reason alone should not create an empty user card.
+  const hasInfo = useMemo(() => {
+    if (isSilentComplete) {
+      return false;
+    }
+    return hasInsight || hasErrorDetail || (reason?.trim().length ?? 0) > 0;
+  }, [hasInsight, hasErrorDetail, isSilentComplete, reason]);
 
   // Progress state: 0-1 based on status
   const progress = useMemo(() => {
@@ -65,11 +78,7 @@ export default function CortexCall({
     }
   }, [status]);
 
-  const isComplete = status === 'complete';
-  const isSkipped = status === 'skipped';
-  const isError = status === 'error';
-  const isProcessing = status === 'activating' || status === 'brewing';
-  const cancelled = (!isSubmitting && progress < 1) || isError;
+  const cancelled = isError;
 
   // Get display text based on status
   const getText = () => {
@@ -79,7 +88,7 @@ export default function CortexCall({
       case 'brewing':
         return `Analyzing with ${cortex_name}...`;
       case 'complete':
-        return `Insight from ${cortex_name}`;
+        return cortex_name;
       case 'skipped':
         return `${cortex_name} skipped`;
       case 'error':
@@ -87,24 +96,6 @@ export default function CortexCall({
       default:
         return cortex_name;
     }
-  };
-
-  // Get icon based on status
-  const getIcon = () => {
-    if (isError) {
-      return <XCircle className="size-4 text-red-500" />;
-    }
-    if (isSkipped) {
-      return <XCircle className="size-4 text-text-secondary opacity-50" />;
-    }
-    if (isComplete) {
-      return <Sparkles className="size-4 text-purple-500" />;
-    }
-    if (status === 'brewing') {
-      return <Brain className="size-4 text-purple-500 animate-pulse" />;
-    }
-    // activating
-    return <Spinner className="size-4" />;
   };
 
   // Animation for expandable content
@@ -152,13 +143,11 @@ export default function CortexCall({
   }, [showInfo, isAnimating]);
 
   // Don't show skipped cortices unless they have info to show
-  if (isSkipped && !hasInfo && !isLast) {
+  if (isSilentComplete || (isSkipped && !hasInfo && !isLast)) {
     return null;
   }
 
   const text = getText();
-  const icon = getIcon();
-  const showShimmer = isProcessing && !cancelled;
 
   return (
     <>
@@ -167,7 +156,7 @@ export default function CortexCall({
           progress={progress}
           onClick={hasInfo ? () => setShowInfo((prev) => !prev) : undefined}
           inProgressText={text}
-          finishedText={isComplete ? `Insight from ${cortex_name}` : text}
+          finishedText={text}
           hasInput={hasInfo}
           isExpanded={showInfo}
           error={cancelled}
@@ -209,6 +198,8 @@ export default function CortexCall({
                 confidence={confidence}
                 reason={reason}
                 insight={insight}
+                error={error}
+                error_class={error_class}
               />
             )}
           </div>

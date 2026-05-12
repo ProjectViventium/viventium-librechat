@@ -1,16 +1,33 @@
 import { Providers } from '@librechat/agents';
-import { EModelEndpoint } from 'librechat-data-provider';
+import fs from 'fs';
+import crypto from 'crypto';
+import { EModelEndpoint, FileContext } from 'librechat-data-provider';
+import os from 'os';
+import path from 'path';
 import type { Agent } from 'librechat-data-provider';
 import type { ServerRequest, InitializeResultBase } from '~/types';
 import type { InitializeAgentDbMethods } from '../initialize';
 
+var mockLogger = {
+  debug: jest.fn(),
+  info: jest.fn(),
+  warn: jest.fn(),
+  error: jest.fn(),
+};
+
+jest.mock('@librechat/data-schemas', () => ({
+  ...jest.requireActual('@librechat/data-schemas'),
+  logger: {
+    debug: (...args: unknown[]) => mockLogger.debug(...args),
+    info: (...args: unknown[]) => mockLogger.info(...args),
+    warn: (...args: unknown[]) => mockLogger.warn(...args),
+    error: (...args: unknown[]) => mockLogger.error(...args),
+  },
+}));
+
 // Mock logger
 jest.mock('winston', () => ({
-  createLogger: jest.fn(() => ({
-    debug: jest.fn(),
-    warn: jest.fn(),
-    error: jest.fn(),
-  })),
+  createLogger: jest.fn(() => mockLogger),
   format: {
     combine: jest.fn(),
     colorize: jest.fn(),
@@ -40,6 +57,11 @@ jest.mock('~/endpoints', () => ({
 
 jest.mock('~/files', () => ({
   filterFilesByEndpointConfig: jest.fn(() => []),
+}));
+
+const mockRagFileExists = jest.fn().mockResolvedValue(true);
+jest.mock('~/files/rag', () => ({
+  ragFileExists: (...args: unknown[]) => mockRagFileExists(...args),
 }));
 
 jest.mock('~/prompts', () => ({
@@ -339,10 +361,15 @@ describe('initializeAgent — custom endpoint init routing', () => {
 
 describe('initializeAgent — conversation recall resources', () => {
   const originalRagApiUrl = process.env.RAG_API_URL;
+  const originalAppSupportDir = process.env.VIVENTIUM_APP_SUPPORT_DIR;
   const originalFetch = global.fetch;
+  let isolatedAppSupportDir: string | null = null;
 
   beforeEach(() => {
     jest.clearAllMocks();
+    isolatedAppSupportDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-app-support-test-'));
+    process.env.VIVENTIUM_APP_SUPPORT_DIR = isolatedAppSupportDir;
+    mockRagFileExists.mockResolvedValue(true);
     recallAvailabilityInternal.resetConversationRecallVectorRuntimeStatusCache();
     global.fetch = jest.fn().mockResolvedValue({
       ok: true,
@@ -357,6 +384,15 @@ describe('initializeAgent — conversation recall resources', () => {
       delete process.env.RAG_API_URL;
     } else {
       process.env.RAG_API_URL = originalRagApiUrl;
+    }
+    if (originalAppSupportDir == null) {
+      delete process.env.VIVENTIUM_APP_SUPPORT_DIR;
+    } else {
+      process.env.VIVENTIUM_APP_SUPPORT_DIR = originalAppSupportDir;
+    }
+    if (isolatedAppSupportDir) {
+      fs.rmSync(isolatedAppSupportDir, { recursive: true, force: true });
+      isolatedAppSupportDir = null;
     }
   });
 
@@ -507,5 +543,395 @@ describe('initializeAgent — conversation recall resources', () => {
         }),
       ]),
     );
+  });
+});
+
+describe('initializeAgent — meeting transcript resources', () => {
+  const originalTranscriptDir = process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_DIR;
+  const originalRagApiUrl = process.env.RAG_API_URL;
+  const originalAppSupportDir = process.env.VIVENTIUM_APP_SUPPORT_DIR;
+  const originalFetch = global.fetch;
+  let isolatedAppSupportDir: string | null = null;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    isolatedAppSupportDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-app-support-test-'));
+    process.env.VIVENTIUM_APP_SUPPORT_DIR = isolatedAppSupportDir;
+    recallAvailabilityInternal.resetConversationRecallVectorRuntimeStatusCache();
+    process.env.RAG_API_URL = 'http://rag.example.test';
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+    } as Response);
+  });
+
+  afterEach(() => {
+    recallAvailabilityInternal.resetConversationRecallVectorRuntimeStatusCache();
+    global.fetch = originalFetch;
+    if (originalTranscriptDir == null) {
+      delete process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_DIR;
+    } else {
+      process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_DIR = originalTranscriptDir;
+    }
+    if (originalRagApiUrl == null) {
+      delete process.env.RAG_API_URL;
+    } else {
+      process.env.RAG_API_URL = originalRagApiUrl;
+    }
+    if (originalAppSupportDir == null) {
+      delete process.env.VIVENTIUM_APP_SUPPORT_DIR;
+    } else {
+      process.env.VIVENTIUM_APP_SUPPORT_DIR = originalAppSupportDir;
+    }
+    if (isolatedAppSupportDir) {
+      fs.rmSync(isolatedAppSupportDir, { recursive: true, force: true });
+      isolatedAppSupportDir = null;
+    }
+  });
+
+  it('attaches user-scoped meeting transcript files only when the local folder exists', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-meeting-init-'));
+    try {
+      process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_DIR = tempDir;
+      delete process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_RAG_MODE;
+      const currentSourceHash = crypto
+        .createHash('sha256')
+        .update(path.resolve(tempDir))
+        .digest('hex')
+        .slice(0, 16);
+      const { agent, req, res, loadTools, db } = createMocks();
+      agent.tools = [];
+      db.getFiles = jest.fn().mockImplementation((query) => {
+        expect(query).toEqual(
+          expect.objectContaining({
+            user: 'user-1',
+            context: FileContext.meeting_transcript,
+            embedded: true,
+            'metadata.meetingTranscriptSourcePathHash': currentSourceHash,
+            'metadata.meetingTranscriptKind': 'summary',
+          }),
+        );
+        if (query?.context === FileContext.meeting_transcript) {
+          return Promise.resolve([
+            {
+              user: 'user-1',
+              file_id: 'meeting_summary:user-1:abc',
+              filename: 'meeting-transcript-summary-abc.txt',
+              filepath: 'vectordb',
+              object: 'file',
+              type: 'text/plain',
+              bytes: 123,
+              embedded: true,
+            usage: 0,
+            context: FileContext.meeting_transcript,
+            metadata: {
+              meetingTranscriptKind: 'summary',
+              meetingTranscriptSourcePathHash: currentSourceHash,
+            },
+          },
+        ]);
+        }
+        return Promise.resolve([]);
+      });
+
+      const result = await initializeAgent(
+        {
+          req,
+          res,
+          agent,
+          loadTools,
+          endpointOption: { endpoint: EModelEndpoint.agents },
+          allowedProviders: new Set([Providers.OPENAI]),
+          isInitialAgent: true,
+        },
+        db,
+      );
+
+      expect(loadTools).toHaveBeenCalledWith(expect.objectContaining({
+        tools: expect.arrayContaining(['file_search']),
+      }));
+      expect(db.getFiles).toHaveBeenCalledWith(
+        expect.objectContaining({
+          'metadata.meetingTranscriptKind': 'summary',
+        }),
+        null,
+        { text: 0 },
+        expect.any(Object),
+      );
+      expect(result.tool_resources?.file_search?.files).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            file_id: 'meeting_summary:user-1:abc',
+            context: FileContext.meeting_transcript,
+            viventiumMeetingTranscriptRecall: true,
+          }),
+        ]),
+      );
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('filters meeting transcript resources by current source folder hash and summary-only mode', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-meeting-init-filter-'));
+    try {
+      process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_DIR = tempDir;
+      process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_RAG_MODE = 'detailed_summary_only';
+      const currentSourceHash = crypto
+        .createHash('sha256')
+        .update(path.resolve(tempDir))
+        .digest('hex')
+        .slice(0, 16);
+      const { agent, req, res, loadTools, db } = createMocks();
+      db.getFiles = jest.fn().mockImplementation((query) => {
+        const rows = [
+          {
+            user: 'user-1',
+            file_id: 'meeting_summary:user-1:current',
+            filename: 'meeting-transcript-summary-current.txt',
+            embedded: true,
+            context: FileContext.meeting_transcript,
+            metadata: {
+              meetingTranscriptKind: 'summary',
+              meetingTranscriptSourcePathHash: currentSourceHash,
+            },
+          },
+          {
+            user: 'user-1',
+            file_id: 'meeting_transcript:user-1:raw-current',
+            filename: 'meeting-transcript-raw-current.txt',
+            embedded: true,
+            context: FileContext.meeting_transcript,
+            metadata: {
+              meetingTranscriptKind: 'raw',
+              meetingTranscriptSourcePathHash: currentSourceHash,
+            },
+          },
+          {
+            user: 'user-1',
+            file_id: 'meeting_summary:user-1:old',
+            filename: 'meeting-transcript-summary-old.txt',
+            embedded: true,
+            context: FileContext.meeting_transcript,
+            metadata: {
+              meetingTranscriptKind: 'summary',
+              meetingTranscriptSourcePathHash: 'oldsourcehash000',
+            },
+          },
+        ];
+        return Promise.resolve(
+          rows.filter(
+            (row) =>
+              row.metadata.meetingTranscriptSourcePathHash ===
+                query['metadata.meetingTranscriptSourcePathHash'] &&
+              row.metadata.meetingTranscriptKind === query['metadata.meetingTranscriptKind'],
+          ),
+        );
+      });
+
+      const result = await initializeAgent(
+        {
+          req,
+          res,
+          agent,
+          loadTools,
+          endpointOption: { endpoint: EModelEndpoint.agents },
+          allowedProviders: new Set([Providers.OPENAI]),
+          isInitialAgent: true,
+        },
+        db,
+      );
+
+      expect(db.getFiles).toHaveBeenCalledWith(
+        expect.objectContaining({
+          'metadata.meetingTranscriptSourcePathHash': currentSourceHash,
+          'metadata.meetingTranscriptKind': 'summary',
+        }),
+        null,
+        { text: 0 },
+        expect.any(Object),
+      );
+      expect(result.tool_resources?.file_search?.file_ids).toEqual([
+        'meeting_summary:user-1:current',
+      ]);
+      expect(loadTools).toHaveBeenCalledWith(expect.objectContaining({
+        tools: expect.arrayContaining(['file_search']),
+      }));
+    } finally {
+      delete process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_RAG_MODE;
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not attach old meeting transcript rows when the local folder is not configured', async () => {
+    delete process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_DIR;
+    const { agent, req, res, loadTools, db } = createMocks();
+    db.getFiles = jest.fn().mockResolvedValue([
+      {
+        file_id: 'meeting_transcript:user-1:abc',
+        context: FileContext.meeting_transcript,
+        embedded: true,
+      },
+    ]);
+
+    const result = await initializeAgent(
+      {
+        req,
+        res,
+        agent,
+        loadTools,
+        endpointOption: { endpoint: EModelEndpoint.agents },
+        allowedProviders: new Set([Providers.OPENAI]),
+        isInitialAgent: true,
+      },
+      db,
+    );
+
+    expect(result.tool_resources?.file_search?.files || []).toEqual([]);
+  });
+
+  it('does not attach meeting transcript vector resources when vector runtime is unavailable', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-meeting-init-rag-down-'));
+    try {
+      process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_DIR = tempDir;
+      process.env.RAG_API_URL = 'http://rag.example.test';
+      global.fetch = jest.fn().mockRejectedValue(new Error('connect ECONNREFUSED'));
+      recallAvailabilityInternal.resetConversationRecallVectorRuntimeStatusCache();
+      const { agent, req, res, loadTools, db } = createMocks();
+      db.getFiles = jest.fn().mockResolvedValue([
+        {
+          user: 'user-1',
+          file_id: 'meeting_summary:user-1:current',
+          filename: 'meeting-transcript-summary-current.txt',
+          embedded: true,
+          context: FileContext.meeting_transcript,
+          metadata: {
+            meetingTranscriptKind: 'summary',
+          },
+        },
+      ]);
+
+      const result = await initializeAgent(
+        {
+          req,
+          res,
+          agent,
+          loadTools,
+          endpointOption: { endpoint: EModelEndpoint.agents },
+          allowedProviders: new Set([Providers.OPENAI]),
+          isInitialAgent: true,
+        },
+        db,
+      );
+
+      expect(db.getFiles).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          context: FileContext.meeting_transcript,
+        }),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(result.tool_resources?.file_search?.files || []).toEqual([]);
+      expect(mockLogger.info).toHaveBeenCalledWith(
+        '[initializeAgent] Meeting transcript recall configured but vector runtime unavailable',
+        expect.objectContaining({
+          reason: 'unreachable',
+          sourceFolderHash: expect.stringMatching(/^[a-f0-9]{16}$/),
+        }),
+      );
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not attach meeting transcript rows that are missing from the vector store', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-meeting-init-missing-vector-'));
+    try {
+      process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_DIR = tempDir;
+      mockRagFileExists.mockResolvedValue(false);
+      const { agent, req, res, loadTools, db } = createMocks();
+      db.getFiles = jest.fn().mockResolvedValue([
+        {
+          user: 'user-1',
+          file_id: 'meeting_summary:user-1:missing',
+          filename: 'meeting-transcript-summary-missing.txt',
+          embedded: true,
+          context: FileContext.meeting_transcript,
+          metadata: {
+            meetingTranscriptKind: 'summary',
+            meetingTranscriptSourcePathHash: crypto
+              .createHash('sha256')
+              .update(path.resolve(tempDir))
+              .digest('hex')
+              .slice(0, 16),
+          },
+        },
+      ]);
+
+      const result = await initializeAgent(
+        {
+          req,
+          res,
+          agent,
+          loadTools,
+          endpointOption: { endpoint: EModelEndpoint.agents },
+          allowedProviders: new Set([Providers.OPENAI]),
+          isInitialAgent: true,
+        },
+        db,
+      );
+
+      expect(mockRagFileExists).toHaveBeenCalledWith({
+        userId: 'user-1',
+        fileId: 'meeting_summary:user-1:missing',
+      });
+      expect(result.tool_resources?.file_search?.files || []).toEqual([]);
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        '[initializeAgent] Meeting transcript Mongo artifacts missing from vector store',
+        expect.objectContaining({
+          fileCount: 1,
+          verifiedFileCount: 0,
+        }),
+      );
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('logs when transcript recall is configured but the active user has no artifacts', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-meeting-init-empty-'));
+    try {
+      process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_DIR = tempDir;
+      const { agent, req, res, loadTools, db } = createMocks();
+      agent.tools = [];
+      db.getFiles = jest.fn().mockResolvedValue([]);
+
+      const result = await initializeAgent(
+        {
+          req,
+          res,
+          agent,
+          loadTools,
+          endpointOption: { endpoint: EModelEndpoint.agents },
+          allowedProviders: new Set([Providers.OPENAI]),
+          isInitialAgent: true,
+        },
+        db,
+      );
+
+      expect(result.tool_resources?.file_search?.files || []).toEqual([]);
+      expect(mockLogger.info).toHaveBeenCalledWith(
+        '[initializeAgent] Meeting transcript recall configured but no artifacts for active user',
+        expect.objectContaining({
+          userId: 'user-1',
+          agentId: 'agent-1',
+          mode: 'detailed_summary_only',
+          sourceFolderHash: expect.stringMatching(/^[a-f0-9]{16}$/),
+        }),
+      );
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 });

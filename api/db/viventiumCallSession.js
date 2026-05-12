@@ -40,6 +40,12 @@ module.exports = function createViventiumCallSession(db) {
       expiresAt: { type: Date, required: true, index: { expireAfterSeconds: 0 } },
       wingModeEnabled: { type: Boolean, default: null },
       shadowModeEnabled: { type: Boolean, default: null },
+      /* === VIVENTIUM START ===
+       * Feature: Listen-Only Mode
+       * Purpose: Persist the listening-only call state separately from Wing Mode so the voice
+       * route can bypass live generation while still saving transcript evidence.
+       * === VIVENTIUM END === */
+      listenOnlyModeEnabled: { type: Boolean, default: null },
       requestedVoiceRoute: { type: voiceRouteStateSchema, default: null },
       // === VIVENTIUM NOTE ===
       // Feature: Voice worker lease + dispatch idempotency fields

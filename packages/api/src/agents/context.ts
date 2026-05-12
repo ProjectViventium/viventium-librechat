@@ -14,6 +14,8 @@ export type AgentWithTools = Pick<Agent, 'id'> &
     tools?: Array<DynamicStructuredTool | string>;
     /** Serializable tool definitions for event-driven mode */
     toolDefinitions?: LCTool[];
+    /** Viventium prompt-frame metadata: server_fetched, config_inline, or missing by MCP server */
+    viventiumMCPInstructionSources?: Record<string, string>;
   };
 
 /**
@@ -81,6 +83,45 @@ export async function getMCPInstructionsForServers(
   }
 }
 
+async function getMCPInstructionsWithSourcesForServers(
+  mcpServers: string[],
+  mcpManager: MCPManager,
+  logger?: Logger,
+): Promise<{ text: string; sources: Record<string, string> }> {
+  if (!mcpServers.length) {
+    return { text: '', sources: {} };
+  }
+  const maybeMetadataFormatter = (
+    mcpManager as unknown as {
+      formatInstructionsForContextWithMetadata?: (
+        serverNames?: string[],
+      ) => Promise<{ text: string; sources: Record<string, string> }>;
+    }
+  ).formatInstructionsForContextWithMetadata;
+
+  if (typeof maybeMetadataFormatter !== 'function') {
+    const text = await getMCPInstructionsForServers(mcpServers, mcpManager, logger);
+    return { text, sources: {} };
+  }
+
+  try {
+    const result = await maybeMetadataFormatter.call(mcpManager, mcpServers);
+    const text = result?.text || '';
+    if (text && logger) {
+      logger.debug('[AgentContext] Fetched MCP instructions for servers:', mcpServers);
+    }
+    return {
+      text,
+      sources: result?.sources && typeof result.sources === 'object' ? result.sources : {},
+    };
+  } catch (error) {
+    if (logger) {
+      logger.error('[AgentContext] Failed to get MCP instructions:', error);
+    }
+    return { text: '', sources: {} };
+  }
+}
+
 /**
  * Builds final instructions for an agent by combining shared run context and agent-specific context.
  * Order: sharedRunContext -> baseInstructions -> mcpInstructions
@@ -137,7 +178,9 @@ export async function applyContextToAgent({
 
   try {
     const mcpServers = ephemeralAgent?.mcp?.length ? ephemeralAgent.mcp : extractMCPServers(agent);
-    const mcpInstructions = await getMCPInstructionsForServers(mcpServers, mcpManager, logger);
+    const { text: mcpInstructions, sources: mcpInstructionSources } =
+      await getMCPInstructionsWithSourcesForServers(mcpServers, mcpManager, logger);
+    agent.viventiumMCPInstructionSources = mcpInstructionSources;
 
     agent.instructions = buildAgentInstructions({
       sharedRunContext,
@@ -149,6 +192,7 @@ export async function applyContextToAgent({
       logger.debug(`[AgentContext] Applied context to agent: ${agentId}`);
     }
   } catch (error) {
+    agent.viventiumMCPInstructionSources = {};
     agent.instructions = buildAgentInstructions({
       sharedRunContext,
       baseInstructions,

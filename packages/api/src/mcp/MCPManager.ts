@@ -1,4 +1,3 @@
-import pick from 'lodash/pick';
 import { logger } from '@librechat/data-schemas';
 import { CallToolResultSchema, ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
 import type { RequestOptions } from '@modelcontextprotocol/sdk/shared/protocol.js';
@@ -19,12 +18,143 @@ import { formatToolContent } from './parsers';
 import { MCPConnection } from './connection';
 import { processMCPEnv } from '~/utils/env';
 
+type ServerInstructionConfig = t.ParsedServerConfig & {
+  viventiumTrustedServerInstructions?: unknown;
+};
+
+function sanitizeMCPManagerErrorForLog(error: unknown): {
+  name: string | null;
+  code: unknown;
+  status: number | null;
+  message: string | null;
+} {
+  const record = error && typeof error === 'object' ? (error as Record<string, unknown>) : {};
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof error === 'string'
+        ? error
+        : typeof record.message === 'string'
+          ? record.message
+          : '';
+  return {
+    name: error instanceof Error ? error.name : null,
+    code: record.code ?? null,
+    status: typeof record.status === 'number' && Number.isFinite(record.status) ? record.status : null,
+    message: message
+      ? message
+          .replace(/https?:\/\/[^\s)]+/gi, '<url>')
+          .replace(/\/Users\/[^\s)]+/g, '<path>')
+          .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/g, 'Bearer <redacted>')
+          .slice(0, 180)
+      : null,
+  };
+}
+
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(',')}]`;
+  }
+  return `{${Object.keys(value as Record<string, unknown>)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableStringify((value as Record<string, unknown>)[key])}`)
+    .join(',')}}`;
+}
+
+function serverInstructionCacheKey(serverName: string, config: t.ParsedServerConfig): string {
+  const relevantConfig = {
+    type: config.type,
+    url: 'url' in config ? config.url : undefined,
+    command: 'command' in config ? config.command : undefined,
+    args: 'args' in config ? config.args : undefined,
+    serverInstructions: config.serverInstructions,
+    requiresOAuth: config.requiresOAuth,
+    oauthMetadata: Boolean(config.oauthMetadata),
+    trusted:
+      (config as ServerInstructionConfig).viventiumTrustedServerInstructions === true,
+  };
+  return `${serverName}:${stableStringify(relevantConfig)}`;
+}
+
+function allowsServerInstructionFetch(config: t.ParsedServerConfig): boolean {
+  return (config as ServerInstructionConfig).viventiumTrustedServerInstructions === true;
+}
+
+const DEFAULT_SERVER_INSTRUCTION_FETCH_TIMEOUT_MS = 1500;
+const MAX_SERVER_INSTRUCTION_FETCH_TIMEOUT_MS = 10_000;
+const DEFAULT_SERVER_INSTRUCTION_FAILURE_TTL_MS = 30_000;
+const MAX_SERVER_INSTRUCTION_FAILURE_TTL_MS = 5 * 60_000;
+
+function parseBoundedPositiveInt(
+  value: string | undefined,
+  fallback: number,
+  max: number,
+): number {
+  const parsed = Number.parseInt(String(value || ''), 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return fallback;
+  }
+  return Math.min(parsed, max);
+}
+
+function serverInstructionFetchTimeoutMs(): number {
+  return parseBoundedPositiveInt(
+    process.env.VIVENTIUM_MCP_SERVER_INSTRUCTIONS_TIMEOUT_MS,
+    DEFAULT_SERVER_INSTRUCTION_FETCH_TIMEOUT_MS,
+    MAX_SERVER_INSTRUCTION_FETCH_TIMEOUT_MS,
+  );
+}
+
+function serverInstructionFailureTtlMs(): number {
+  return parseBoundedPositiveInt(
+    process.env.VIVENTIUM_MCP_SERVER_INSTRUCTIONS_FAILURE_TTL_MS,
+    DEFAULT_SERVER_INSTRUCTION_FAILURE_TTL_MS,
+    MAX_SERVER_INSTRUCTION_FAILURE_TTL_MS,
+  );
+}
+
+function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  onTimeout?: () => void,
+): Promise<T | null> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return promise;
+  }
+  return new Promise<T | null>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      try {
+        onTimeout?.();
+      } catch (_error) {
+        // Timeout cleanup is best-effort; the original promise still owns final cleanup.
+      }
+      resolve(null);
+    }, timeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
 /**
  * Centralized manager for MCP server connections and tool execution.
  * Extends UserConnectionManager to handle both app-level and user-specific connections.
  */
 export class MCPManager extends UserConnectionManager {
   private static instance: MCPManager | null;
+  private readonly serverInstructionCache = new Map<string, string>();
+  private readonly failedServerInstructionCache = new Map<string, number>();
+  private readonly pendingServerInstructionFetches = new Map<string, Promise<string | null>>();
 
   /** Creates and initializes the singleton MCPManager instance */
   public static async createInstance(configs: t.MCPServers): Promise<MCPManager> {
@@ -176,7 +306,7 @@ export class MCPManager extends UserConnectionManager {
     } catch (error) {
       logger.warn(
         `[getServerToolFunctions] Error getting tool functions for server ${serverName}`,
-        error,
+        sanitizeMCPManagerErrorForLog(error),
       );
       return null;
     }
@@ -187,16 +317,196 @@ export class MCPManager extends UserConnectionManager {
    * @param serverNames Optional array of server names. If not provided or empty, returns all servers.
    * @returns Object mapping server names to their instructions
    */
-  private async getInstructions(serverNames?: string[]): Promise<Record<string, string>> {
+  private async getInstructionsWithSources(
+    serverNames?: string[],
+  ): Promise<{ instructions: Record<string, string>; sources: Record<string, string> }> {
     const instructions: Record<string, string> = {};
+    const sources: Record<string, string> = {};
     const configs = await MCPServersRegistry.getInstance().getAllServerConfigs();
-    for (const [serverName, config] of Object.entries(configs)) {
-      if (config.serverInstructions != null) {
-        instructions[serverName] = config.serverInstructions as string;
+    const requestedServers =
+      serverNames && serverNames.length > 0 ? new Set(serverNames) : undefined;
+    const resolvedServers = await Promise.all(
+      Object.entries(configs)
+        .filter(([serverName]) => !requestedServers || requestedServers.has(serverName))
+        .map(([serverName, config]) => this.resolveInstructionsForServer(serverName, config)),
+    );
+    for (const resolved of resolvedServers) {
+      sources[resolved.serverName] = resolved.source;
+      if (resolved.instruction) {
+        instructions[resolved.serverName] = resolved.instruction;
       }
     }
-    if (!serverNames) return instructions;
-    return pick(instructions, serverNames);
+    if (requestedServers) {
+      for (const serverName of requestedServers) {
+        if (!sources[serverName]) {
+          sources[serverName] = 'missing';
+        }
+      }
+    }
+    return { instructions, sources };
+  }
+
+  private async resolveInstructionsForServer(
+    serverName: string,
+    config: t.ParsedServerConfig,
+  ): Promise<{ serverName: string; instruction?: string; source: string }> {
+    if (typeof config.serverInstructions === 'string') {
+      const trimmedInstructions = config.serverInstructions.trim();
+      if (trimmedInstructions && trimmedInstructions.toLowerCase() !== 'true') {
+        return { serverName, instruction: config.serverInstructions, source: 'config_inline' };
+      }
+      if (trimmedInstructions.toLowerCase() !== 'true') {
+        return { serverName, source: 'missing' };
+      }
+    } else if (config.serverInstructions !== true) {
+      return { serverName, source: 'missing' };
+    }
+
+    const serverProvidedInstructions = await this.fetchServerProvidedInstructions(serverName, config);
+    if (serverProvidedInstructions) {
+      return { serverName, instruction: serverProvidedInstructions, source: 'server_fetched' };
+    }
+    if (config.serverInstructions === true || String(config.serverInstructions).trim().toLowerCase() === 'true') {
+      logger.warn(
+        `[MCP][${serverName}] serverInstructions=true was not resolved to server-provided instructions; skipping injection`,
+      );
+    }
+    return { serverName, source: 'missing' };
+  }
+
+  private async fetchServerProvidedInstructions(
+    serverName: string,
+    config: t.ParsedServerConfig,
+  ): Promise<string | null> {
+    if (!allowsServerInstructionFetch(config)) {
+      logger.warn(
+        `[MCP][${serverName}] serverInstructions=true is only allowed for trusted first-party server configs; skipping injection`,
+      );
+      return null;
+    }
+
+    const cacheKey = serverInstructionCacheKey(serverName, config);
+    const cachedInstructions = this.serverInstructionCache.get(cacheKey);
+    if (cachedInstructions) {
+      return cachedInstructions;
+    }
+
+    const failedUntil = this.failedServerInstructionCache.get(cacheKey);
+    if (failedUntil && failedUntil > Date.now()) {
+      return null;
+    }
+    if (failedUntil) {
+      this.failedServerInstructionCache.delete(cacheKey);
+    }
+
+    const pendingFetch = this.pendingServerInstructionFetches.get(cacheKey);
+    if (pendingFetch) {
+      return pendingFetch;
+    }
+
+    if (config.requiresOAuth || config.oauthMetadata) {
+      logger.warn(
+        `[MCP][${serverName}] serverInstructions=true requires server metadata, but OAuth/user-specific instructions cannot be fetched from app-level context`,
+      );
+      return null;
+    }
+
+    const fetchPromise = this.fetchServerProvidedInstructionsOnce(
+      serverName,
+      config,
+      serverInstructionFetchTimeoutMs(),
+    );
+    this.pendingServerInstructionFetches.set(cacheKey, fetchPromise);
+    try {
+      const result = await fetchPromise;
+      if (!result) {
+        const failureTtlMs = serverInstructionFailureTtlMs();
+        if (failureTtlMs > 0) {
+          this.failedServerInstructionCache.set(cacheKey, Date.now() + failureTtlMs);
+        }
+      }
+      return result;
+    } finally {
+      this.pendingServerInstructionFetches.delete(cacheKey);
+    }
+  }
+
+  private async fetchServerProvidedInstructionsOnce(
+    serverName: string,
+    config: t.ParsedServerConfig,
+    timeoutMs = serverInstructionFetchTimeoutMs(),
+  ): Promise<string | null> {
+    let connection: MCPConnection | undefined;
+    let timedOut = false;
+    try {
+      const createConnectionPromise = MCPConnectionFactory.create({
+        serverName,
+        serverConfig: config,
+        dbSourced: !!config.dbId,
+        useSSRFProtection: MCPServersRegistry.getInstance().shouldEnableSSRFProtection(),
+      }).then(async (createdConnection) => {
+        if (timedOut) {
+          try {
+            await createdConnection.disconnect();
+          } catch (disconnectError) {
+            logger.debug(
+              `[MCP][${serverName}] Failed to disconnect late server-instructions connection`,
+              {
+                name: disconnectError instanceof Error ? disconnectError.name : null,
+              },
+            );
+          }
+          return null;
+        }
+        return createdConnection;
+      });
+      const nextConnection = await withTimeout(
+        createConnectionPromise,
+        timeoutMs,
+        () => {
+          timedOut = true;
+        },
+      );
+      if (!nextConnection) {
+        logger.warn(
+          `[MCP][${serverName}] Timed out creating temporary server-instructions connection; skipping injection`,
+        );
+        return null;
+      }
+      connection = nextConnection;
+      const serverProvidedInstructions = connection.client.getInstructions();
+      if (typeof serverProvidedInstructions === 'string' && serverProvidedInstructions.trim()) {
+        this.serverInstructionCache.set(
+          serverInstructionCacheKey(serverName, config),
+          serverProvidedInstructions,
+        );
+        return serverProvidedInstructions;
+      }
+
+      logger.warn(
+        `[MCP][${serverName}] serverInstructions=true resolved to empty server-provided instructions; skipping injection`,
+      );
+      return null;
+    } catch (error) {
+      logger.warn(
+        `[MCP][${serverName}] Failed to fetch server-provided instructions for context injection`,
+        sanitizeMCPManagerErrorForLog(error),
+      );
+      return null;
+    } finally {
+      if (connection) {
+        try {
+          await connection.disconnect();
+        } catch (disconnectError) {
+          logger.debug(
+            `[MCP][${serverName}] Failed to disconnect temporary server-instructions connection`,
+            {
+              name: disconnectError instanceof Error ? disconnectError.name : null,
+            },
+          );
+        }
+      }
+    }
   }
 
   /**
@@ -205,11 +515,19 @@ export class MCPManager extends UserConnectionManager {
    * @returns Formatted instructions string ready for context injection
    */
   public async formatInstructionsForContext(serverNames?: string[]): Promise<string> {
+    const { text } = await this.formatInstructionsForContextWithMetadata(serverNames);
+    return text;
+  }
+
+  public async formatInstructionsForContextWithMetadata(
+    serverNames?: string[],
+  ): Promise<{ text: string; sources: Record<string, string> }> {
     /** Instructions for specified servers or all stored instructions */
-    const instructionsToInclude = await this.getInstructions(serverNames);
+    const { instructions: instructionsToInclude, sources } =
+      await this.getInstructionsWithSources(serverNames);
 
     if (Object.keys(instructionsToInclude).length === 0) {
-      return '';
+      return { text: '', sources };
     }
 
     // Format instructions for context injection
@@ -221,13 +539,14 @@ ${instructions}`;
       })
       .join('\n\n');
 
-    return `# MCP Server Instructions
+    const text = `# MCP Server Instructions
 
 The following MCP servers are available with their specific instructions:
 
 ${formattedInstructions}
 
 Please follow these instructions when using tools from the respective MCP servers.`;
+    return { text, sources };
   }
 
   /**
@@ -340,7 +659,7 @@ Please follow these instructions when using tools from the respective MCP server
       return formatToolContent(result as t.MCPToolCallResponse, provider);
     } catch (error) {
       // Log with context and re-throw or handle as needed
-      logger.error(`${logPrefix}[${toolName}] Tool call failed`, error);
+      logger.error(`${logPrefix}[${toolName}] Tool call failed`, sanitizeMCPManagerErrorForLog(error));
       // Rethrowing allows the caller (createMCPTool) to handle the final user message
       throw error;
     }

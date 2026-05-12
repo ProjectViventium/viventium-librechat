@@ -26,7 +26,9 @@ jest.mock('@librechat/api', () => ({
   initializeAnthropic: jest.fn(async ({ model_parameters }) => ({
     llmConfig: {
       model: model_parameters?.model ?? 'claude-sonnet-4-5',
-      ...(model_parameters?.temperature != null ? { temperature: model_parameters.temperature } : {}),
+      ...(model_parameters?.temperature != null
+        ? { temperature: model_parameters.temperature }
+        : {}),
       maxTokens: model_parameters?.max_output_tokens ?? 400,
       anthropicApiUrl: 'https://anthropic-proxy.example.test',
     },
@@ -163,13 +165,13 @@ describe('BackgroundCortexFollowUpService', () => {
     });
 
     test('salvages declarative prefix before em-dash question clause', () => {
-      expect(stripQuestionSentences('The data shows improvement— isn\'t that great?')).toBe(
+      expect(stripQuestionSentences("The data shows improvement— isn't that great?")).toBe(
         'The data shows improvement.',
       );
     });
 
     test('salvages declarative prefix when em-dash has no trailing space', () => {
-      expect(stripQuestionSentences('The data shows improvement—isn\'t that great?')).toBe(
+      expect(stripQuestionSentences("The data shows improvement—isn't that great?")).toBe(
         'The data shows improvement.',
       );
     });
@@ -192,9 +194,7 @@ describe('BackgroundCortexFollowUpService', () => {
       { type: 'text', text: 'hello' },
       { type: 'cortex_brewing', cortex_id: 'c1', status: 'brewing' },
     ];
-    const next = [
-      { type: 'cortex_insight', cortex_id: 'c1', status: 'complete', insight: 'done' },
-    ];
+    const next = [{ type: 'cortex_insight', cortex_id: 'c1', status: 'complete', insight: 'done' }];
 
     const merged = upsertCortexParts(existing, next);
     expect(merged).toHaveLength(2);
@@ -274,7 +274,9 @@ describe('BackgroundCortexFollowUpService', () => {
     const text = cleanFallbackInsightText(
       'The operations contact sent the project onboarding invite for April 1 at 10 AM Pacific.\n\nGoogle auth is stale, so Gmail could not be verified tonight without reconnect.',
     );
-    expect(text).toBe('The operations contact sent the project onboarding invite for April 1 at 10 AM Pacific.');
+    expect(text).toBe(
+      'The operations contact sent the project onboarding invite for April 1 at 10 AM Pacific.',
+    );
   });
 
   test('cleanFallbackInsightText strips generic no-access live tool chatter', () => {
@@ -808,10 +810,20 @@ describe('BackgroundCortexFollowUpService', () => {
     const req = { user: { id: 'u1' } };
     db.getMessages
       .mockResolvedValueOnce([
-        { messageId: 'm-parent', parentMessageId: 'u-parent', sender: 'AI', text: 'Earlier answer.' },
+        {
+          messageId: 'm-parent',
+          parentMessageId: 'u-parent',
+          sender: 'AI',
+          text: 'Earlier answer.',
+        },
       ])
       .mockResolvedValueOnce([
-        { messageId: 'm-parent', parentMessageId: 'u-parent', sender: 'AI', text: 'Earlier answer.' },
+        {
+          messageId: 'm-parent',
+          parentMessageId: 'u-parent',
+          sender: 'AI',
+          text: 'Earlier answer.',
+        },
         {
           messageId: 'u-new',
           parentMessageId: 'm-parent',
@@ -859,7 +871,9 @@ describe('BackgroundCortexFollowUpService', () => {
       parentMessageId: 'm-parent',
       agent: { id: 'agent_123', provider: 'openai', model: 'gpt-4o-mini', model_parameters: {} },
       insightsData: {
-        insights: [{ cortexName: 'Background Analysis', insight: 'Should I ask another question?' }],
+        insights: [
+          { cortexName: 'Background Analysis', insight: 'Should I ask another question?' },
+        ],
       },
       recentResponse: '',
     });
@@ -903,8 +917,11 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(msg.text).toBe('One new missing detail.');
   });
 
-  test('createCortexFollowUpMessage replaces deferred parent message in place', async () => {
+  test('createCortexFollowUpMessage saves deferred Phase B as a new follow-up message', async () => {
     const req = { user: { id: 'u1' } };
+    db.getMessages.mockResolvedValueOnce([
+      { messageId: 'm-parent', parentMessageId: 'u-message', sender: 'AI', text: 'Checking now.' },
+    ]);
     db.getMessage.mockResolvedValue({
       messageId: 'm-parent',
       parentMessageId: 'u-message',
@@ -925,7 +942,7 @@ describe('BackgroundCortexFollowUpService', () => {
         },
       },
     });
-    db.updateMessage.mockResolvedValue({});
+    db.saveMessage.mockResolvedValue({});
 
     Run.create.mockResolvedValueOnce({
       processStream: jest.fn(async () => 'Final resolved answer'),
@@ -941,38 +958,124 @@ describe('BackgroundCortexFollowUpService', () => {
         insights: [{ cortexName: 'MS365', insight: 'Fresh tool result' }],
       },
       recentResponse: '',
-      replaceParentMessage: true,
+      forceVisibleFollowUp: true,
     });
 
+    expect(db.updateMessage).not.toHaveBeenCalled();
+    expect(db.saveMessage).toHaveBeenCalledWith(
+      req,
+      expect.objectContaining({
+        conversationId: 'c-123',
+        parentMessageId: 'm-parent',
+        text: 'Final resolved answer',
+        metadata: expect.objectContaining({
+          viventium: expect.objectContaining({
+            type: 'cortex_followup',
+            parentMessageId: 'm-parent',
+            replacedParentMessage: false,
+            forceVisibleFollowUp: true,
+          }),
+        }),
+      }),
+      expect.any(Object),
+    );
+    expect(msg).toEqual(
+      expect.objectContaining({
+        conversationId: 'c-123',
+        parentMessageId: 'm-parent',
+        text: 'Final resolved answer',
+      }),
+    );
+    expect(msg.messageId).not.toBe('m-parent');
+  });
+
+  test('createCortexFollowUpMessage promotes forced text onto an empty canonical parent', async () => {
+    const req = { user: { id: 'u1' } };
+    db.getMessages.mockResolvedValueOnce([
+      { messageId: 'm-parent', parentMessageId: 'u-message', sender: 'AI', text: '' },
+    ]);
+    db.getMessage.mockResolvedValue({
+      messageId: 'm-parent',
+      conversationId: 'c-123',
+      parentMessageId: 'u-message',
+      sender: 'Viventium',
+      text: '',
+      unfinished: true,
+      content: [
+        {
+          type: 'cortex_insight',
+          cortex_id: 'agent_123',
+          cortex_name: 'Red Team',
+          status: 'complete',
+          insight: 'Workflow fit is the main risk.',
+        },
+      ],
+      metadata: {
+        viventium: {
+          existing: true,
+        },
+      },
+    });
+    db.updateMessage.mockResolvedValue({});
+
+    Run.create.mockResolvedValueOnce({
+      processStream: jest.fn(
+        async () => 'The real risk is workflow fit, not transcription quality.',
+      ),
+    });
+
+    const msg = await createCortexFollowUpMessage({
+      req,
+      conversationId: 'c-123',
+      parentMessageId: 'm-parent',
+      agent: { id: 'agent_123', provider: 'openai', model: 'gpt-5.4', model_parameters: {} },
+      insightsData: {
+        cortexCount: 1,
+        insights: [{ cortexName: 'Red Team', insight: 'Workflow fit is the main risk.' }],
+      },
+      recentResponse: '',
+      forceVisibleFollowUp: true,
+    });
+
+    expect(db.saveMessage).not.toHaveBeenCalled();
     expect(db.updateMessage).toHaveBeenCalledWith(
       req,
       expect.objectContaining({
         messageId: 'm-parent',
-        text: 'Final resolved answer',
+        text: 'The real risk is workflow fit, not transcription quality.',
         unfinished: false,
-        content: [
-          { type: 'text', text: 'Final resolved answer' },
-          expect.objectContaining({
-            type: 'cortex_insight',
-            cortex_id: 'agent_123',
+        content: expect.arrayContaining([
+          expect.objectContaining({ type: 'cortex_insight', cortex_id: 'agent_123' }),
+          { type: 'text', text: 'The real risk is workflow fit, not transcription quality.' },
+        ]),
+        metadata: expect.objectContaining({
+          viventium: expect.objectContaining({
+            type: 'cortex_followup',
+            parentMessageId: 'u-message',
+            replacedParentMessage: true,
+            forceVisibleFollowUp: true,
+            promotedToEmptyParent: true,
           }),
-        ],
+        }),
       }),
       expect.any(Object),
     );
-    expect(db.saveMessage).not.toHaveBeenCalled();
     expect(msg).toEqual(
       expect.objectContaining({
         messageId: 'm-parent',
+        conversationId: 'c-123',
         parentMessageId: 'u-message',
-        text: 'Final resolved answer',
+        text: 'The real risk is workflow fit, not transcription quality.',
         unfinished: false,
       }),
     );
   });
 
-  test('createCortexFollowUpMessage replaces deferred parent with best insight when follow-up synthesis returns NTA', async () => {
+  test('createCortexFollowUpMessage saves forced follow-up with best insight when synthesis returns NTA', async () => {
     const req = { user: { id: 'u1' } };
+    db.getMessages.mockResolvedValueOnce([
+      { messageId: 'm-parent', parentMessageId: 'u-message', sender: 'AI', text: 'Checking now.' },
+    ]);
     db.getMessage.mockResolvedValue({
       messageId: 'm-parent',
       parentMessageId: 'u-message',
@@ -1002,7 +1105,7 @@ describe('BackgroundCortexFollowUpService', () => {
         },
       },
     });
-    db.updateMessage.mockResolvedValue({});
+    db.saveMessage.mockResolvedValue({});
 
     Run.create.mockResolvedValueOnce({
       processStream: jest.fn(async () => '{NTA}'),
@@ -1029,31 +1132,139 @@ describe('BackgroundCortexFollowUpService', () => {
         ],
       },
       recentResponse: '',
-      replaceParentMessage: true,
+      forceVisibleFollowUp: true,
     });
 
-    expect(db.updateMessage).toHaveBeenCalledWith(
+    expect(db.updateMessage).not.toHaveBeenCalled();
+    expect(db.saveMessage).toHaveBeenCalledWith(
       req,
       expect.objectContaining({
-        messageId: 'm-parent',
-        text:
-          'I read the doc. Short version: the profile is more plausibly O-1A than O-1B if the achievements are framed around business impact and measurable recognition.',
-        unfinished: false,
+        conversationId: 'c-123',
+        parentMessageId: 'm-parent',
+        text: 'I read the doc. Short version: the profile is more plausibly O-1A than O-1B if the achievements are framed around business impact and measurable recognition.',
       }),
       expect.any(Object),
     );
     expect(msg).toEqual(
       expect.objectContaining({
-        messageId: 'm-parent',
-        text:
-          'I read the doc. Short version: the profile is more plausibly O-1A than O-1B if the achievements are framed around business impact and measurable recognition.',
-        unfinished: false,
+        conversationId: 'c-123',
+        parentMessageId: 'm-parent',
+        text: 'I read the doc. Short version: the profile is more plausibly O-1A than O-1B if the achievements are framed around business impact and measurable recognition.',
       }),
     );
+    expect(msg.messageId).not.toBe('m-parent');
   });
 
-  test('createCortexFollowUpMessage replaces deferred scheduler parent with best insight when synthesis fails', async () => {
+  test('createCortexFollowUpMessage saves no-response parent Phase B as a new follow-up with mixed parts', async () => {
     const req = { user: { id: 'u1' }, body: { scheduleId: 'schedule-1' } };
+    db.getMessages.mockResolvedValueOnce([
+      {
+        messageId: 'm-parent',
+        parentMessageId: 'u-message',
+        sender: 'Viventium',
+        text: '{NTA}',
+      },
+    ]);
+    db.getMessage.mockResolvedValue({
+      messageId: 'm-parent',
+      parentMessageId: 'u-message',
+      sender: 'Viventium',
+      text: '{NTA}',
+      unfinished: false,
+      content: [
+        { type: 'text', text: '{NTA}' },
+        {
+          type: 'cortex_insight',
+          cortex_id: 'background-1',
+          cortexName: 'Background Analysis',
+          status: 'complete',
+          insight: 'One internal status item is already resolved and needs no user action.',
+        },
+        {
+          type: 'cortex_insight',
+          cortex_id: 'ms365-1',
+          cortexName: 'MS365',
+          status: 'complete',
+          insight: 'I found one calendar item that needs attention today.',
+          completed_tool_calls: 1,
+        },
+        {
+          type: 'cortex_insight',
+          cortex_id: 'parietal-1',
+          cortexName: 'Parietal Cortex',
+          status: 'error',
+          error: '400 status code (no body)',
+        },
+      ],
+      metadata: {
+        viventium: {
+          existing: true,
+        },
+      },
+    });
+    db.saveMessage.mockResolvedValue({});
+
+    Run.create.mockResolvedValueOnce({
+      processStream: jest.fn(async () => '{NTA}'),
+    });
+
+    const msg = await createCortexFollowUpMessage({
+      req,
+      conversationId: 'c-123',
+      parentMessageId: 'm-parent',
+      agent: { id: 'agent_123', provider: 'openai', model: 'gpt-5.4', model_parameters: {} },
+      insightsData: {
+        cortexCount: 3,
+        hasErrors: true,
+        insights: [
+          {
+            cortexName: 'Background Analysis',
+            insight: 'One internal status item is already resolved and needs no user action.',
+          },
+          {
+            cortexName: 'MS365',
+            insight: 'I found one calendar item that needs attention today.',
+            completed_tool_calls: 1,
+          },
+        ],
+      },
+      recentResponse: '{NTA}',
+      forceVisibleFollowUp: true,
+    });
+
+    expect(db.updateMessage).not.toHaveBeenCalled();
+    expect(db.saveMessage).toHaveBeenCalledWith(
+      req,
+      expect.objectContaining({
+        conversationId: 'c-123',
+        parentMessageId: 'm-parent',
+        text: 'I found one calendar item that needs attention today.',
+        metadata: expect.objectContaining({
+          viventium: expect.objectContaining({
+            type: 'cortex_followup',
+            parentMessageId: 'm-parent',
+            replacedParentMessage: false,
+            forceVisibleFollowUp: true,
+          }),
+        }),
+      }),
+      expect.any(Object),
+    );
+    expect(msg).toEqual(
+      expect.objectContaining({
+        conversationId: 'c-123',
+        parentMessageId: 'm-parent',
+        text: 'I found one calendar item that needs attention today.',
+      }),
+    );
+    expect(msg.messageId).not.toBe('m-parent');
+  });
+
+  test('createCortexFollowUpMessage saves deferred scheduler follow-up with best insight when synthesis fails', async () => {
+    const req = { user: { id: 'u1' }, body: { scheduleId: 'schedule-1' } };
+    db.getMessages.mockResolvedValueOnce([
+      { messageId: 'm-parent', parentMessageId: 'u-message', sender: 'AI', text: '' },
+    ]);
     db.getMessage.mockResolvedValue({
       messageId: 'm-parent',
       parentMessageId: 'u-message',
@@ -1083,7 +1294,7 @@ describe('BackgroundCortexFollowUpService', () => {
         },
       },
     });
-    db.updateMessage.mockResolvedValue({});
+    db.saveMessage.mockResolvedValue({});
 
     Run.create.mockResolvedValueOnce({
       processStream: jest.fn(async () => {
@@ -1113,25 +1324,27 @@ describe('BackgroundCortexFollowUpService', () => {
         hasErrors: true,
       },
       recentResponse: '',
-      replaceParentMessage: true,
+      forceVisibleFollowUp: true,
     });
 
-    expect(db.updateMessage).toHaveBeenCalledWith(
+    expect(db.updateMessage).not.toHaveBeenCalled();
+    expect(db.saveMessage).toHaveBeenCalledWith(
       req,
       expect.objectContaining({
-        messageId: 'm-parent',
+        conversationId: 'c-123',
+        parentMessageId: 'm-parent',
         text: 'The operations contact sent the project onboarding invite for April 1 at 10 AM Pacific. The application thread is moving.',
-        unfinished: false,
       }),
       expect.any(Object),
     );
     expect(msg).toEqual(
       expect.objectContaining({
-        messageId: 'm-parent',
+        conversationId: 'c-123',
+        parentMessageId: 'm-parent',
         text: 'The operations contact sent the project onboarding invite for April 1 at 10 AM Pacific. The application thread is moving.',
-        unfinished: false,
       }),
     );
+    expect(msg.messageId).not.toBe('m-parent');
   });
 
   test('createCortexFollowUpMessage suppresses scheduler deferred persistence when no visible fallback remains', async () => {
@@ -1143,7 +1356,7 @@ describe('BackgroundCortexFollowUpService', () => {
       parentMessageId: 'm-parent',
       agent: { id: 'agent_123' },
       insightsData: { insights: [], mergedPrompt: '', hasErrors: true },
-      replaceParentMessage: true,
+      forceVisibleFollowUp: false,
     });
 
     expect(msg).toBeNull();
@@ -1231,12 +1444,17 @@ describe('BackgroundCortexFollowUpService', () => {
     const callArgs = runInstance.processStream.mock.calls[0][0];
     const prompt = callArgs.messages[0].content;
 
-    expect(prompt).toContain('This is not an addendum. This is the main answer that should replace the brief hold.');
-    expect(prompt).not.toContain('Only respond if the insights contain genuinely NEW information not covered above.');
+    expect(prompt).toContain('This is the visible answer that follows the brief hold.');
+    expect(prompt).not.toContain('replace the brief hold');
+    expect(prompt).not.toContain(
+      'Only respond if the insights contain genuinely NEW information not covered above.',
+    );
     expect(Run.create).toHaveBeenCalledWith(
       expect.objectContaining({
         graphConfig: expect.objectContaining({
-          instructions: expect.stringContaining('completing a deferred response after a short holding acknowledgement'),
+          instructions: expect.stringContaining(
+            'completing a deferred response after a short holding acknowledgement',
+          ),
           llmConfig: expect.objectContaining({
             maxTokens: 2000,
           }),
@@ -1412,7 +1630,9 @@ describe('BackgroundCortexFollowUpService', () => {
           model_parameters: { temperature: 0.3 },
         },
         insightsData: {
-          insights: [{ cortexName: 'Strategic Planning', insight: 'Condense this to one sharp line.' }],
+          insights: [
+            { cortexName: 'Strategic Planning', insight: 'Condense this to one sharp line.' },
+          ],
         },
         recentResponse: 'Checking now.',
         runId: 'run-poisoned-provider',
@@ -1447,7 +1667,7 @@ describe('BackgroundCortexFollowUpService', () => {
       model: 'claude-opus-4-7',
       model_parameters: { thinking: false },
       voice_llm_provider: 'xai',
-      voice_llm_model: 'grok-4-1-fast-non-reasoning',
+      voice_llm_model: 'grok-4.20-non-reasoning',
     });
 
     await generateFollowUpText({
@@ -1668,9 +1888,18 @@ describe('BackgroundCortexFollowUpService', () => {
 
     test('removes duplicate insights with >50% word overlap', () => {
       const insights = [
-        { cortexName: 'Strategic Planning', insight: 'Pancakes are stacked and ready for first bite verdict from Taylor' },
-        { cortexName: 'Background Analysis', insight: 'Pancakes stacked ready - check the first bite from Taylor verdict' },
-        { cortexName: 'Continuity', insight: 'Completely different topic about the philosophy draft' },
+        {
+          cortexName: 'Strategic Planning',
+          insight: 'Pancakes are stacked and ready for first bite verdict from Taylor',
+        },
+        {
+          cortexName: 'Background Analysis',
+          insight: 'Pancakes stacked ready - check the first bite from Taylor verdict',
+        },
+        {
+          cortexName: 'Continuity',
+          insight: 'Completely different topic about the philosophy draft',
+        },
       ];
       const deduped = deduplicateInsights(insights);
       expect(deduped).toHaveLength(2);
@@ -1739,8 +1968,11 @@ describe('BackgroundCortexFollowUpService', () => {
         primaryResponseMode: true,
       });
 
-      expect(prompt).toContain('This is not an addendum. This is the main answer that should replace the brief hold.');
-      expect(prompt).toContain('Do not output {NTA} if the insights contain any substantive user-visible information.');
+      expect(prompt).toContain('This is the visible answer that follows the brief hold.');
+      expect(prompt).not.toContain('replace the brief hold');
+      expect(prompt).toContain(
+        'Do not output {NTA} if the insights contain any substantive user-visible information.',
+      );
       expect(prompt).not.toContain('## CRITICAL: Do Not Repeat');
     });
 
@@ -1749,7 +1981,9 @@ describe('BackgroundCortexFollowUpService', () => {
         insights: [{ cortexName: 'Test', insight: 'Some insight' }],
         recentResponse: 'Test.',
       });
-      expect(prompt).not.toContain('Additional background insights surfaced after your last response');
+      expect(prompt).not.toContain(
+        'Additional background insights surfaced after your last response',
+      );
     });
 
     test('handles missing recentResponse gracefully', () => {
@@ -1765,7 +1999,11 @@ describe('BackgroundCortexFollowUpService', () => {
     const req = { user: { id: 'u1' }, body: {} };
     await generateFollowUpText({
       req,
-      agent: { id: 'agent_123', instructions: 'You are Eve, a deeply personal companion AI.', provider: 'openai' },
+      agent: {
+        id: 'agent_123',
+        instructions: 'You are Eve, a deeply personal companion AI.',
+        provider: 'openai',
+      },
       insightsData: {
         insights: [{ cortexName: 'Background Analysis', insight: 'New finding' }],
       },

@@ -32,6 +32,7 @@ import {
   getThreadData,
 } from '~/utils';
 import { filterFilesByEndpointConfig } from '~/files';
+import { ragFileExists } from '~/files/rag';
 import { generateArtifactsPrompt } from '~/prompts';
 import { getProviderConfig } from '~/endpoints';
 import { logger } from '@librechat/data-schemas';
@@ -42,6 +43,17 @@ import {
   ensureConversationRecallTool,
   type ConversationRecallAttachmentReason,
 } from './conversationRecall';
+/* === VIVENTIUM START ===
+ * Feature: Meeting transcript RAG runtime attachment.
+ * Added: 2026-05-05
+ * === VIVENTIUM END === */
+import {
+  ensureMeetingTranscriptTool,
+  getMeetingTranscriptKindFilter,
+  getMeetingTranscriptRagMode,
+  getMeetingTranscriptSourcePathHash,
+  mergeMeetingTranscriptResources,
+} from './meetingTranscripts';
 /* === VIVENTIUM START ===
  * Feature: Conversation recall runtime health/freshness gating.
  * Purpose: Avoid attaching stale or unreachable recall corpora as if they were live evidence.
@@ -148,7 +160,9 @@ export interface InitializeAgentDbMethods extends EndpointDbMethods {
     files?: Array<{ file_id: string }>;
   }> | null>;
   /** Get the newest recall-eligible message timestamp for a user */
-  getLatestRecallEligibleMessageCreatedAt?: (params: { user: string }) => Promise<Date | string | null>;
+  getLatestRecallEligibleMessageCreatedAt?: (params: {
+    user: string;
+  }) => Promise<Date | string | null>;
 }
 
 /**
@@ -288,17 +302,18 @@ export async function initializeAgent(
     });
   }
 
-  const { attachments: primedAttachments, tool_resources: primedToolResources } = await primeResources({
-    req: req as never,
-    getFiles: db.getFiles as never,
-    appConfig: req.config,
-    agentId: agent.id,
-    attachments: currentFiles
-      ? (Promise.resolve(currentFiles) as unknown as Promise<TFile[]>)
-      : undefined,
-    tool_resources: agent.tool_resources,
-    requestFileSet: new Set(requestFiles?.map((file) => file.file_id)),
-  });
+  const { attachments: primedAttachments, tool_resources: primedToolResources } =
+    await primeResources({
+      req: req as never,
+      getFiles: db.getFiles as never,
+      appConfig: req.config,
+      agentId: agent.id,
+      attachments: currentFiles
+        ? (Promise.resolve(currentFiles) as unknown as Promise<TFile[]>)
+        : undefined,
+      tool_resources: agent.tool_resources,
+      requestFileSet: new Set(requestFiles?.map((file) => file.file_id)),
+    });
 
   let tool_resources = primedToolResources;
 
@@ -336,23 +351,20 @@ export async function initializeAgent(
               scope: ConversationRecallScope.all,
             });
 
-      const conversationRecallFiles =
-        (((await db.getFiles(
-          {
-            user: req.user.id,
-            context: FileContext.conversation_recall,
-            file_id: recallFileId,
-          },
-          null,
-          { text: 0 },
-          { userId: req.user.id, agentId: agent.id },
-        )) as TFile[]) ?? []) as TFile[];
+      const conversationRecallFiles = (((await db.getFiles(
+        {
+          user: req.user.id,
+          context: FileContext.conversation_recall,
+          file_id: recallFileId,
+        },
+        null,
+        { text: 0 },
+        { userId: req.user.id, agentId: agent.id },
+      )) as TFile[]) ?? []) as TFile[];
 
       let recallFilesAreFresh = conversationRecallFiles.length > 0;
       let recallAttachmentReason: ConversationRecallAttachmentReason | undefined;
-      let recallFreshness:
-        | ReturnType<typeof evaluateConversationRecallCorpusFreshness>
-        | undefined;
+      let recallFreshness: ReturnType<typeof evaluateConversationRecallCorpusFreshness> | undefined;
       if (conversationRecallScope === 'all' && db.getLatestRecallEligibleMessageCreatedAt) {
         const latestRecallEligibleMessageCreatedAt =
           await db.getLatestRecallEligibleMessageCreatedAt({ user: req.user.id });
@@ -362,20 +374,25 @@ export async function initializeAgent(
         });
         recallFilesAreFresh = recallFreshness.fresh;
         if (!recallFreshness.fresh) {
-          logger.info('[initializeAgent] Falling back to source-only conversation recall attachment', {
-            userId: req.user.id,
-            agentId: agent.id,
-            scope: conversationRecallScope,
-            reason: 'stale_corpus',
-            recallCorpusUpdatedAt: recallFreshness.corpusUpdatedAt?.toISOString?.() ?? null,
-            latestRecallEligibleMessageCreatedAt:
-              recallFreshness.latestMessageCreatedAt?.toISOString?.() ?? null,
-          });
+          logger.info(
+            '[initializeAgent] Falling back to source-only conversation recall attachment',
+            {
+              userId: req.user.id,
+              agentId: agent.id,
+              scope: conversationRecallScope,
+              reason: 'stale_corpus',
+              recallCorpusUpdatedAt: recallFreshness.corpusUpdatedAt?.toISOString?.() ?? null,
+              latestRecallEligibleMessageCreatedAt:
+                recallFreshness.latestMessageCreatedAt?.toISOString?.() ?? null,
+            },
+          );
         }
       }
 
       const recallAttachmentMode =
-        conversationRecallVectorStatus.available && recallFilesAreFresh && conversationRecallFiles.length > 0
+        conversationRecallVectorStatus.available &&
+        recallFilesAreFresh &&
+        conversationRecallFiles.length > 0
           ? 'vector'
           : 'source_only';
       if (recallAttachmentMode === 'vector') {
@@ -406,12 +423,15 @@ export async function initializeAgent(
       }
 
       if (conversationRecallFiles.length === 0) {
-        logger.info('[initializeAgent] No vector-backed conversation recall corpus found; attached source-only recall resource', {
-          userId: req.user.id,
-          agentId: agent.id,
-          scope: conversationRecallScope,
-          reason: recallAttachmentReason,
-        });
+        logger.info(
+          '[initializeAgent] No vector-backed conversation recall corpus found; attached source-only recall resource',
+          {
+            userId: req.user.id,
+            agentId: agent.id,
+            scope: conversationRecallScope,
+            reason: recallAttachmentReason,
+          },
+        );
       } else if (recallAttachmentMode === 'source_only') {
         logger.info('[initializeAgent] Attached source-only conversation recall resource', {
           userId: req.user.id,
@@ -435,6 +455,103 @@ export async function initializeAgent(
       }
     } catch (error) {
       logger.error('[initializeAgent] Failed to load conversation recall resources', error);
+    }
+  }
+
+  /* === VIVENTIUM START ===
+   * Feature: Meeting transcript RAG resource injection
+   *
+   * Purpose:
+   * - Processed transcript artifacts are user-scoped file_search resources, not synthetic
+   *   conversation history.
+   * - Runtime attachment stays gated by the configured local transcript folder.
+   *
+   * Added: 2026-05-05
+   * === VIVENTIUM END === */
+  const meetingTranscriptSourcePathHash = getMeetingTranscriptSourcePathHash();
+  if (req.user?.id && meetingTranscriptSourcePathHash) {
+    try {
+      const meetingTranscriptVectorStatus = await getConversationRecallVectorRuntimeStatus();
+      if (!meetingTranscriptVectorStatus.available) {
+        logger.info('[initializeAgent] Meeting transcript recall configured but vector runtime unavailable', {
+          userId: req.user.id,
+          agentId: agent.id,
+          mode: getMeetingTranscriptRagMode(),
+          reason: meetingTranscriptVectorStatus.reason,
+          sourceFolderHash: meetingTranscriptSourcePathHash,
+        });
+      } else {
+        const meetingTranscriptKindFilter = getMeetingTranscriptKindFilter();
+        const meetingTranscriptFiles = (((await db.getFiles(
+          {
+            user: req.user.id,
+            context: FileContext.meeting_transcript,
+            embedded: true,
+            'metadata.meetingTranscriptSourcePathHash': meetingTranscriptSourcePathHash,
+            'metadata.meetingTranscriptKind':
+              meetingTranscriptKindFilter.length === 1
+                ? meetingTranscriptKindFilter[0]
+                : { $in: meetingTranscriptKindFilter },
+          },
+          null,
+          { text: 0 },
+          { userId: req.user.id, agentId: agent.id },
+        )) as TFile[]) ?? []) as TFile[];
+
+        const verifiedMeetingTranscriptFiles =
+          meetingTranscriptFiles.length > 0
+            ? (
+                await Promise.all(
+                  meetingTranscriptFiles.map(async (file) => ({
+                    file,
+                    exists: await ragFileExists({
+                      userId: req.user.id,
+                      fileId: file.file_id,
+                    }),
+                  })),
+                )
+              )
+                .filter((item) => item.exists)
+                .map((item) => item.file)
+            : [];
+
+        if (
+          meetingTranscriptFiles.length > 0 &&
+          verifiedMeetingTranscriptFiles.length < meetingTranscriptFiles.length
+        ) {
+          logger.warn('[initializeAgent] Meeting transcript Mongo artifacts missing from vector store', {
+            userId: req.user.id,
+            agentId: agent.id,
+            fileCount: meetingTranscriptFiles.length,
+            verifiedFileCount: verifiedMeetingTranscriptFiles.length,
+            mode: getMeetingTranscriptRagMode(),
+            sourceFolderHash: meetingTranscriptSourcePathHash,
+          });
+        }
+
+        if (verifiedMeetingTranscriptFiles.length > 0) {
+          agent.tools = ensureMeetingTranscriptTool(agent.tools);
+          tool_resources = mergeMeetingTranscriptResources({
+            tool_resources,
+            transcriptFiles: verifiedMeetingTranscriptFiles,
+          });
+          logger.debug('[initializeAgent] Attached meeting transcript recall resources', {
+            userId: req.user.id,
+            agentId: agent.id,
+            fileCount: verifiedMeetingTranscriptFiles.length,
+            mode: getMeetingTranscriptRagMode(),
+          });
+        } else {
+          logger.info('[initializeAgent] Meeting transcript recall configured but no artifacts for active user', {
+            userId: req.user.id,
+            agentId: agent.id,
+            mode: getMeetingTranscriptRagMode(),
+            sourceFolderHash: meetingTranscriptSourcePathHash,
+          });
+        }
+      }
+    } catch (error) {
+      logger.error('[initializeAgent] Failed to load meeting transcript resources', error);
     }
   }
 
@@ -564,7 +681,9 @@ export async function initializeAgent(
   }
 
   const explicitMaxContextTokens =
-    typeof maxContextTokens === 'number' && Number.isFinite(maxContextTokens) && maxContextTokens > 0
+    typeof maxContextTokens === 'number' &&
+    Number.isFinite(maxContextTokens) &&
+    maxContextTokens > 0
       ? maxContextTokens
       : null;
   const agentMaxContextNum = Number(agentMaxContextTokens) || 18000;

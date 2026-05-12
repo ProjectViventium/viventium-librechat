@@ -1,7 +1,7 @@
 const { logger } = require('@librechat/data-schemas');
 const { MCPOAuthHandler } = require('@librechat/api');
 const { CacheKeys, Constants } = require('librechat-data-provider');
-const { findToken, createToken, updateToken, deleteTokens } = require('~/models');
+const { findToken, createToken, updateToken, deleteToken, deleteTokens } = require('~/models');
 const { updateMCPServerTools } = require('~/server/services/Config');
 const { getMCPManager, getFlowStateManager, getMCPServersRegistry } = require('~/config');
 const { getLogStores } = require('~/cache');
@@ -117,7 +117,7 @@ async function reinitMCPServer({
     const customUserVars = userMCPAuthMap?.[`${Constants.mcp_prefix}${serverName}`];
     const flowManager = _flowManager ?? getFlowStateManager(getLogStores(CacheKeys.FLOWS));
     const mcpManager = getMCPManager();
-    const tokenMethods = { findToken, updateToken, createToken, deleteTokens };
+    const tokenMethods = { findToken, updateToken, createToken, deleteToken, deleteTokens };
 
     const oauthStart =
       _oauthStart ??
@@ -158,9 +158,7 @@ async function reinitMCPServer({
         serverConfig?.requiresOAuth || serverConfig?.oauthMetadata,
       );
       const hasStoredOAuthTokens =
-        serverRequiresOAuth && user.id
-          ? await hasUsableOAuthTokens(user.id, serverName)
-          : false;
+        serverRequiresOAuth && user.id ? await hasUsableOAuthTokens(user.id, serverName) : false;
 
       const isOAuthFlowInitiated = err.message === 'OAuth flow initiated - return early';
 

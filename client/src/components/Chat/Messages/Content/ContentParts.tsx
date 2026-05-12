@@ -15,6 +15,7 @@ import Sources from '~/components/Web/Sources';
 import Container from './Container';
 import Part from './Part';
 import { filterRenderableContentParts, type RenderableContentInput } from './contentPartUtils';
+import { isNoResponseOnlyText } from '~/utils/noResponseTag';
 
 /* === VIVENTIUM START ===
  * Feature: Background Cortex content parts rendering (activation/brewing/insights)
@@ -31,6 +32,7 @@ import { filterRenderableContentParts, type RenderableContentInput } from './con
  */
 type ContentPartsProps = {
   content: RenderableContentInput;
+  fallbackText?: string | null;
   cortexParts?: Array<TMessageContentParts | undefined> | undefined;
   messageId: string;
   conversationId?: string | null;
@@ -59,6 +61,7 @@ const ContentParts = memo(function ContentParts({
   edit,
   isLast,
   content,
+  fallbackText,
   cortexParts,
   messageId,
   enterEdit,
@@ -73,7 +76,6 @@ const ContentParts = memo(function ContentParts({
 }: ContentPartsProps) {
   const attachmentMap = useMemo(() => mapAttachments(attachments ?? []), [attachments]);
   const effectiveIsSubmitting = isLatestMessage ? isSubmitting : false;
-  const displayContent = useMemo(() => filterRenderableContentParts(content), [content]);
   const cortexTypes = useMemo(
     () =>
       new Set([
@@ -83,6 +85,30 @@ const ContentParts = memo(function ContentParts({
       ]),
     [],
   );
+  const displayContent = useMemo(() => {
+    const normalizedFallback = typeof fallbackText === 'string' ? fallbackText.trim() : '';
+    const parts =
+      filterRenderableContentParts(content, {
+        visibleFallbackText: normalizedFallback,
+      }) ?? [];
+    const hasNonCortexRenderablePart = parts.some((part) => part && !cortexTypes.has(part.type));
+    if (
+      hasNonCortexRenderablePart ||
+      !normalizedFallback ||
+      isNoResponseOnlyText(normalizedFallback)
+    ) {
+      return parts;
+    }
+
+    return [
+      {
+        type: ContentTypes.TEXT,
+        text: normalizedFallback,
+        [ContentTypes.TEXT]: normalizedFallback,
+      } as TMessageContentParts,
+      ...parts,
+    ];
+  }, [content, cortexTypes, fallbackText]);
 
   /**
    * Cortex parts come from a dedicated transient store during streaming
@@ -90,9 +116,6 @@ const ContentParts = memo(function ContentParts({
    * After streaming completes, cortex parts are also persisted into message.content (DB truth).
    */
   const cortexPartsFromContent: PartWithIndex[] = useMemo(() => {
-    if (!displayContent) {
-      return [];
-    }
     const parts: PartWithIndex[] = [];
     displayContent.forEach((part, idx) => {
       if (part && cortexTypes.has(part.type)) {

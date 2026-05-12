@@ -5,7 +5,10 @@
 
 const {
   collectConfiguredHoldScopeKeys,
+  collectDirectActionScopeKeysFromCortices,
+  collectEffectiveDirectActionScopeKeys,
   pickHoldText,
+  shouldForcePhaseBFollowUp,
   shouldDeferMainResponse,
 } = require('../brewingHold');
 
@@ -24,24 +27,37 @@ describe('brewingHold', () => {
     }
   });
 
-  test('shouldDeferMainResponse defaults to true for config-driven productivity scope', () => {
+  test('shouldDeferMainResponse defers when a productivity scope has no main direct owner', () => {
     delete process.env.VIVENTIUM_TOOL_CORTEX_HOLD_ENABLED;
 
     expect(
       shouldDeferMainResponse({
-        activatedCortices: [{ agentId: 'agent_viventium_online_tool_use_95aeb3', activationScope: 'productivity_ms365' }],
+        activatedCortices: [
+          {
+            agentId: 'agent_viventium_online_tool_use_95aeb3',
+            activationScope: 'productivity_ms365',
+          },
+        ],
       }),
     ).toBe(true);
   });
 
-  test('shouldDeferMainResponse defaults to true for Google productivity scope', () => {
+  test('shouldDeferMainResponse lets Phase A run when the current request effectively owns the activated scope', () => {
     delete process.env.VIVENTIUM_TOOL_CORTEX_HOLD_ENABLED;
 
     expect(
       shouldDeferMainResponse({
-        activatedCortices: [{ cortexName: 'Google', activationScope: 'productivity_google_workspace' }],
+        activatedCortices: [
+          {
+            cortexName: 'Google',
+            activationScope: 'productivity_google_workspace',
+            directActionSurfaceScopes: [
+              { server: 'google-workspace', scopeKey: 'productivity_google_workspace' },
+            ],
+          },
+        ],
       }),
-    ).toBe(true);
+    ).toBe(false);
   });
 
   test('collectConfiguredHoldScopeKeys preserves config-defined scope keys only', () => {
@@ -86,9 +102,124 @@ describe('brewingHold', () => {
 
     expect(
       shouldDeferMainResponse({
-        activatedCortices: [{ cortexName: 'Google', activationScope: 'productivity_google_workspace' }],
+        activatedCortices: [
+          { cortexName: 'Google', activationScope: 'productivity_google_workspace' },
+        ],
+        directActionScopeKeys: [],
       }),
     ).toBe(true);
+  });
+
+  test('collectDirectActionScopeKeysFromCortices preserves activated main-direct scope awareness', () => {
+    expect(
+      collectDirectActionScopeKeysFromCortices([
+        {
+          cortexName: 'Google',
+          directActionSurfaceScopes: [
+            { server: 'google-workspace', scopeKey: 'productivity_google_workspace' },
+            { server: 'duplicate', scope_key: 'productivity_google_workspace' },
+          ],
+        },
+        {
+          cortexName: 'MS365',
+          directActionSurfaceScopes: ['productivity_ms365'],
+        },
+      ]),
+    ).toEqual(['productivity_google_workspace', 'productivity_ms365']);
+  });
+
+  test('collectEffectiveDirectActionScopeKeys derives ownership from configured tools present on the current request', () => {
+    expect(
+      collectEffectiveDirectActionScopeKeys({
+        directActionSurfaces: [
+          {
+            server: 'google-workspace',
+            scope_key: 'productivity_google_workspace',
+            tool_names: ['list_calendars_mcp_google_workspace'],
+          },
+          {
+            server: 'ms365',
+            scope_key: 'productivity_ms365',
+            tool_names: ['list-calendar-events_mcp_ms-365'],
+          },
+        ],
+        agentTools: ['list_calendars_mcp_google_workspace'],
+      }),
+    ).toEqual(['productivity_google_workspace']);
+  });
+
+  test('collectEffectiveDirectActionScopeKeys counts deferred tool definitions as direct-action owners', () => {
+    expect(
+      collectEffectiveDirectActionScopeKeys({
+        directActionSurfaces: [
+          {
+            server: 'google-workspace',
+            scope_key: 'productivity_google_workspace',
+            tool_names: ['list_calendars_mcp_google_workspace'],
+          },
+        ],
+        agentTools: [],
+        toolDefinitions: [{ name: 'list_calendars_mcp_google_workspace' }],
+      }),
+    ).toEqual(['productivity_google_workspace']);
+  });
+
+  test('collectEffectiveDirectActionScopeKeys does not infer ownership from canonical cortex annotations alone', () => {
+    expect(
+      collectEffectiveDirectActionScopeKeys({
+        directActionSurfaces: [
+          {
+            server: 'google-workspace',
+            scope_key: 'productivity_google_workspace',
+            tool_names: ['list_calendars_mcp_google_workspace'],
+          },
+        ],
+        agentTools: [],
+      }),
+    ).toEqual([]);
+  });
+
+  test('shouldDeferMainResponse defers when canonical direct scopes exist but current request owns no matching tools', () => {
+    delete process.env.VIVENTIUM_TOOL_CORTEX_HOLD_ENABLED;
+
+    expect(
+      shouldDeferMainResponse({
+        activatedCortices: [
+          {
+            cortexName: 'Google',
+            activationScope: 'productivity_google_workspace',
+            directActionSurfaceScopes: [
+              { server: 'google-workspace', scopeKey: 'productivity_google_workspace' },
+            ],
+          },
+        ],
+        directActionScopeKeys: [],
+      }),
+    ).toBe(true);
+  });
+
+  test('shouldDeferMainResponse defers unless every activated productivity scope is directly owned', () => {
+    delete process.env.VIVENTIUM_TOOL_CORTEX_HOLD_ENABLED;
+
+    expect(
+      shouldDeferMainResponse({
+        activatedCortices: [
+          { cortexName: 'Google', activationScope: 'productivity_google_workspace' },
+          { cortexName: 'MS365', activationScope: 'productivity_ms365' },
+        ],
+        directActionScopeKeys: ['productivity_google_workspace'],
+      }),
+    ).toBe(true);
+
+    expect(
+      shouldDeferMainResponse({
+        activatedCortices: [
+          { cortexName: 'Google', activationScope: 'productivity_google_workspace' },
+          { cortexName: 'MS365', activationScope: 'productivity_ms365' },
+        ],
+        directActionScopeKeys: ['productivity_google_workspace', 'productivity_ms365'],
+      }),
+    ).toBe(false);
   });
 
   test('shouldDeferMainResponse can be disabled via env', () => {
@@ -103,11 +234,7 @@ describe('brewingHold', () => {
 
   test('pickHoldText returns deterministic text for a given message id', () => {
     delete process.env.VIVENTIUM_TOOL_CORTEX_HOLD_TEXT;
-    process.env.VIVENTIUM_TOOL_CORTEX_HOLD_TEXTS_JSON = JSON.stringify([
-      'A',
-      'B',
-      'C',
-    ]);
+    process.env.VIVENTIUM_TOOL_CORTEX_HOLD_TEXTS_JSON = JSON.stringify(['A', 'B', 'C']);
 
     const first = pickHoldText({ responseMessageId: 'msg_123' });
     const second = pickHoldText({ responseMessageId: 'msg_123' });
@@ -179,5 +306,45 @@ describe('brewingHold', () => {
     });
     // Without env or instructions, falls back to default
     expect(text).toBe('Checking now.');
+  });
+
+  test('shouldForcePhaseBFollowUp forces new follow-up when no-response parent has Phase B output', () => {
+    expect(
+      shouldForcePhaseBFollowUp({
+        shouldDeferMainResponse: false,
+        parentText: '{NTA}',
+        hasInsights: true,
+        hasMergedText: false,
+        allowErrorOnlyFollowUp: false,
+      }),
+    ).toBe(true);
+
+    expect(
+      shouldForcePhaseBFollowUp({
+        shouldDeferMainResponse: false,
+        parentText: '{NTA}',
+        hasInsights: false,
+        hasMergedText: true,
+        allowErrorOnlyFollowUp: false,
+      }),
+    ).toBe(true);
+  });
+
+  test('shouldForcePhaseBFollowUp does not force a normal parent unless explicitly deferred', () => {
+    expect(
+      shouldForcePhaseBFollowUp({
+        shouldDeferMainResponse: false,
+        parentText: 'I already answered.',
+        hasInsights: true,
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldForcePhaseBFollowUp({
+        shouldDeferMainResponse: true,
+        parentText: 'Checking now.',
+        hasInsights: false,
+      }),
+    ).toBe(true);
   });
 });

@@ -2291,10 +2291,10 @@ describe('models/Agent', () => {
 
         const aligned = await updateAgent(
           { id: agentId },
-          { provider: 'xai', model: 'grok-4-1-fast-non-reasoning' },
+          { provider: 'xai', model: 'grok-4.20-non-reasoning' },
         );
         expect(aligned.provider).toBe('xai');
-        expect(aligned.model).toBe('grok-4-1-fast-non-reasoning');
+        expect(aligned.model).toBe('grok-4.20-non-reasoning');
         expect(aligned.versions).toHaveLength(2);
 
         await Agent.findOneAndUpdate(
@@ -2305,11 +2305,11 @@ describe('models/Agent', () => {
 
         const repaired = await updateAgent(
           { id: agentId },
-          { provider: 'xai', model: 'grok-4-1-fast-non-reasoning' },
+          { provider: 'xai', model: 'grok-4.20-non-reasoning' },
         );
 
         expect(repaired.provider).toBe('xai');
-        expect(repaired.model).toBe('grok-4-1-fast-non-reasoning');
+        expect(repaired.model).toBe('grok-4.20-non-reasoning');
         expect(repaired.versions).toHaveLength(2);
       });
 

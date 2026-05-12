@@ -8,6 +8,16 @@ type CortexPart = {
   confidence?: number;
   reason?: string;
   insight?: string | null;
+  error?: string;
+  silent?: boolean;
+  no_response?: boolean;
+  cortex_description?: string;
+  activation_scope?: string | null;
+  direct_action_surfaces?: unknown[];
+  direct_action_surface_scopes?: unknown[];
+  configured_tools?: number;
+  completed_tool_calls?: number;
+  status_changed_at?: string;
 };
 
 type CreateCortexPendingBufferParams = {
@@ -27,7 +37,13 @@ function findMessageIndex(messages: TMessage[], runId: string): number {
 function upsertCortexPart(parts: CortexPart[], cortexPart: CortexPart) {
   const idx = parts.findIndex((p) => p?.cortex_id === cortexPart?.cortex_id);
   if (idx >= 0) {
-    parts[idx] = cortexPart;
+    const merged = { ...parts[idx] };
+    for (const [key, value] of Object.entries(cortexPart)) {
+      if (value !== undefined) {
+        (merged as Record<string, unknown>)[key] = value;
+      }
+    }
+    parts[idx] = merged;
   } else {
     parts.push(cortexPart);
   }

@@ -79,7 +79,6 @@
     "keyv-file": "^5.1.2",
     "klona": "^2.0.6",
     "librechat-data-provider": "*",
-    "livekit-server-sdk": "^2.11.1",
     "lodash": "^4.17.23",
     "mammoth": "^1.11.0",
     "mathjs": "^15.1.0",

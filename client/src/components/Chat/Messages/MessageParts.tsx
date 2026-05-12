@@ -102,7 +102,8 @@ export default function Message(props: TMessageProps) {
    * Purpose: Keep callback/content-array text readable instead of letting flex sizing collapse it.
    * === VIVENTIUM END === */
   const baseClasses = {
-    common: 'group mx-auto flex w-full min-w-0 flex-1 gap-3 transition-all duration-300 transform-gpu',
+    common:
+      'group mx-auto flex w-full min-w-0 flex-1 gap-3 transition-all duration-300 transform-gpu',
     chat: getChatWidthClass(),
   };
 
@@ -139,7 +140,7 @@ export default function Message(props: TMessageProps) {
                 </h2>
               )}
               <div className="flex min-w-0 flex-col gap-1">
-                <div className="flex max-w-full min-w-0 flex-grow flex-col gap-0">
+                <div className="flex min-w-0 max-w-full flex-grow flex-col gap-0">
                   {/* === VIVENTIUM START ===
                    * Feature: Background Cortex parts in ContentParts
                    * Purpose: Pass transient cortex parts to ContentParts so cortex rows render before main message content.
@@ -160,6 +161,7 @@ export default function Message(props: TMessageProps) {
                     isLatestMessage={messageId === latestMessage?.messageId}
                     cortexParts={cortexParts}
                     content={message.content}
+                    fallbackText={message.text}
                   />
                   {/* === VIVENTIUM END === */}
                 </div>

@@ -14,6 +14,7 @@ const {
   getCallSessionVoiceSettings,
   syncCallSessionState,
   updateCallSessionVoiceSettings,
+  claimOrReplaceCallSessionConversationId,
   updateCallSessionConversationId,
   claimVoiceSession,
   claimDispatch,
@@ -108,6 +109,36 @@ describe('CallSessionService', () => {
     expect(updated.conversationId).toBe('convo_123');
   });
 
+  test('claimOrReplaceCallSessionConversationId atomically replaces only the expected stale id', async () => {
+    const user = await User.create({
+      name: 'Call User',
+      email: 'call-user-claim@example.com',
+      provider: 'local',
+    });
+
+    const created = await createCallSession({
+      userId: user._id.toString(),
+      agentId: 'agent_1',
+      conversationId: 'stale-provider-convo',
+    });
+
+    const claimed = await claimOrReplaceCallSessionConversationId(
+      created.callSessionId,
+      'fresh-listen-only-convo',
+      { expectedConversationId: 'stale-provider-convo' },
+    );
+    const losingClaim = await claimOrReplaceCallSessionConversationId(
+      created.callSessionId,
+      'split-convo',
+      { expectedConversationId: 'stale-provider-convo' },
+    );
+
+    expect(claimed.conversationId).toBe('fresh-listen-only-convo');
+    expect(losingClaim.conversationId).toBe('fresh-listen-only-convo');
+    const fetched = await getCallSession(created.callSessionId);
+    expect(fetched.conversationId).toBe('fresh-listen-only-convo');
+  });
+
   test('createCallSession seeds wing mode from the canonical default env', async () => {
     process.env.VIVENTIUM_WING_MODE_DEFAULT_ENABLED = 'true';
     const user = await User.create({
@@ -139,6 +170,8 @@ describe('CallSessionService', () => {
       conversationId: 'new',
     });
 
+    // The service uses millisecond timestamps; keep this assertion stable on fast CI workers.
+    await new Promise((resolve) => setTimeout(resolve, 2));
     const updated = await syncCallSessionState({
       callSessionId: created.callSessionId,
       touch: true,
@@ -148,6 +181,40 @@ describe('CallSessionService', () => {
     expect(updated.expiresAtMs).toBeGreaterThan(created.expiresAtMs);
     expect(updated.wingModeEnabled).toBe(true);
     expect(updated.shadowModeEnabled).toBe(true);
+  });
+
+  test('syncCallSessionState makes Listen-Only mutually exclusive with Wing Mode', async () => {
+    const user = await User.create({
+      name: 'Call User',
+      email: 'listen-only-state@example.com',
+      provider: 'local',
+    });
+
+    const created = await createCallSession({
+      userId: user._id.toString(),
+      agentId: 'agent_1',
+      conversationId: 'new',
+    });
+
+    const listenOnly = await syncCallSessionState({
+      callSessionId: created.callSessionId,
+      touch: true,
+      listenOnlyModeEnabled: true,
+    });
+
+    expect(listenOnly.listenOnlyModeEnabled).toBe(true);
+    expect(listenOnly.wingModeEnabled).toBe(false);
+    expect(listenOnly.shadowModeEnabled).toBe(false);
+
+    const wingMode = await syncCallSessionState({
+      callSessionId: created.callSessionId,
+      touch: true,
+      wingModeEnabled: true,
+    });
+
+    expect(wingMode.listenOnlyModeEnabled).toBe(false);
+    expect(wingMode.wingModeEnabled).toBe(true);
+    expect(wingMode.shadowModeEnabled).toBe(true);
   });
 
   test('claimVoiceSession enforces single active job', async () => {

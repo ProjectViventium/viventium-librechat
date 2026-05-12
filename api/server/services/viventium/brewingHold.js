@@ -2,13 +2,16 @@
  * Feature: Tool Cortex Brewing Hold (v0_3 parity)
  *
  * Purpose:
- * - When a tool-focused cortex (ex: `online_tool_use`) activates, we must avoid a premature
- *   main-agent response that guesses from memory ("I can't access..." / hallucinated facts).
+ * - When a tool-focused cortex activates and the main agent has no matching direct-action surface,
+ *   avoid a premature main-agent response that guesses from memory ("I can't access..." /
+ *   hallucinated facts).
  * - In v0_3, Brewing notices functioned as a STOP signal for answering until tool work completed.
  *
  * v0_4 Architecture:
  * - Phase A (detect) is time-boxed (fast).
  * - Phase B (execute) is asynchronous; results arrive via a single follow-up message.
+ * - When the main agent has a connected direct-action surface for the same activation scope, the
+ *   main agent should run first and use its own tools while Phase B remains supplemental.
  *
  * This module provides a deterministic, server-side "holding acknowledgement" so we do NOT rely
  * on the LLM noticing `## Background Processing (Brewing)` in system instructions.
@@ -26,6 +29,7 @@
 const {
   resolveProductivitySpecialistScope,
 } = require('~/server/services/viventium/productivitySpecialistContext');
+const { isNoResponseOnly } = require('~/server/services/viventium/noResponseTag');
 
 function isEnvDisabled(name) {
   const raw = (process.env[name] || '').trim().toLowerCase();
@@ -72,7 +76,113 @@ function collectConfiguredHoldScopeKeys(cortices) {
   return scopeKeys;
 }
 
-function shouldDeferMainResponse({ activatedCortices } = {}) {
+function collectDirectActionScopeKeysFromCortices(cortices) {
+  if (!Array.isArray(cortices) || cortices.length === 0) {
+    return [];
+  }
+
+  const seen = new Set();
+  const scopeKeys = [];
+  const addScope = (value) => {
+    const scopeKey = String(value || '').trim();
+    if (!scopeKey || seen.has(scopeKey)) {
+      return;
+    }
+    seen.add(scopeKey);
+    scopeKeys.push(scopeKey);
+  };
+
+  for (const cortex of cortices) {
+    const scopedSurfaces = Array.isArray(cortex?.directActionSurfaceScopes)
+      ? cortex.directActionSurfaceScopes
+      : [];
+    for (const surface of scopedSurfaces) {
+      if (typeof surface === 'string') {
+        addScope(surface);
+      } else if (surface && typeof surface === 'object') {
+        addScope(surface.scopeKey || surface.scope_key || surface.intent_scope);
+      }
+    }
+  }
+
+  return scopeKeys;
+}
+
+function normalizeScopeKey(scopeKey) {
+  const raw = String(scopeKey || '').trim();
+  if (!raw) {
+    return '';
+  }
+  return raw.replace(/\s+/g, '_').toLowerCase();
+}
+
+function normalizeToolNames(tools) {
+  if (!Array.isArray(tools)) {
+    return [];
+  }
+  return tools
+    .map((tool) => {
+      if (typeof tool === 'string') {
+        return tool.trim();
+      }
+      if (tool && typeof tool === 'object') {
+        return String(tool.name || tool.tool || tool.id || '').trim();
+      }
+      return '';
+    })
+    .filter(Boolean);
+}
+
+function collectEffectiveDirectActionScopeKeys({
+  directActionSurfaces,
+  agentTools,
+  toolDefinitions,
+} = {}) {
+  const configuredSurfaces = Array.isArray(directActionSurfaces) ? directActionSurfaces : [];
+  if (configuredSurfaces.length === 0) {
+    return [];
+  }
+
+  const toolSet = new Set([
+    ...normalizeToolNames(agentTools),
+    ...normalizeToolNames(toolDefinitions),
+  ]);
+  if (toolSet.size === 0) {
+    return [];
+  }
+
+  const seen = new Set();
+  const scopeKeys = [];
+  for (const surface of configuredSurfaces) {
+    if (!surface || typeof surface !== 'object') {
+      continue;
+    }
+    const scopeKey = normalizeScopeKey(
+      surface.scope_key || surface.scopeKey || surface.intent_scope || surface.activation_scope,
+    );
+    if (!scopeKey || seen.has(scopeKey)) {
+      continue;
+    }
+
+    const declaredTools = Array.isArray(surface.tool_names)
+      ? surface.tool_names.map((tool) => String(tool || '').trim()).filter(Boolean)
+      : [];
+    if (declaredTools.length === 0) {
+      continue;
+    }
+    if (!declaredTools.some((tool) => toolSet.has(tool))) {
+      continue;
+    }
+
+    seen.add(scopeKey);
+    scopeKeys.push(scopeKey);
+  }
+
+  return scopeKeys;
+}
+
+function shouldDeferMainResponse(options = {}) {
+  const { activatedCortices, directActionScopeKeys } = options;
   if (isEnvDisabled('VIVENTIUM_TOOL_CORTEX_HOLD_ENABLED')) {
     return false;
   }
@@ -81,19 +191,34 @@ function shouldDeferMainResponse({ activatedCortices } = {}) {
     return false;
   }
 
-  const matchedHoldCortex = activatedCortices.some((cortex) => isToolHoldCandidate(cortex));
-
-  if (!matchedHoldCortex) {
+  const holdScopeKeys = collectConfiguredHoldScopeKeys(activatedCortices);
+  if (holdScopeKeys.length === 0) {
     return false;
   }
-  return true;
+
+  const hasExplicitDirectActionScopeKeys = Object.prototype.hasOwnProperty.call(
+    options,
+    'directActionScopeKeys',
+  );
+  const directScopeSource = hasExplicitDirectActionScopeKeys
+    ? Array.isArray(directActionScopeKeys)
+      ? directActionScopeKeys
+      : []
+    : collectDirectActionScopeKeysFromCortices(activatedCortices);
+  const directScopes = new Set(
+    directScopeSource.map((scopeKey) => String(scopeKey || '').trim()).filter(Boolean),
+  );
+
+  const hasMainDirectOwnerForEveryActivatedScope = holdScopeKeys.every((scopeKey) =>
+    directScopes.has(scopeKey),
+  );
+  return !hasMainDirectOwnerForEveryActivatedScope;
 }
 
 function stableStringHash(input) {
   const str = String(input || '');
   let hash = 0;
   for (let i = 0; i < str.length; i += 1) {
-    // eslint-disable-next-line no-bitwise
     hash = (hash * 31 + str.charCodeAt(i)) | 0;
   }
   return Math.abs(hash);
@@ -110,9 +235,7 @@ function loadHoldTextsFromEnv() {
     try {
       const parsed = JSON.parse(json);
       if (Array.isArray(parsed)) {
-        const cleaned = parsed
-          .map((v) => (typeof v === 'string' ? v.trim() : ''))
-          .filter(Boolean);
+        const cleaned = parsed.map((v) => (typeof v === 'string' ? v.trim() : '')).filter(Boolean);
         if (cleaned.length > 0) {
           return cleaned;
         }
@@ -225,11 +348,33 @@ function pickHoldText({ responseMessageId, agentInstructions, scheduleId } = {})
   return texts[idx];
 }
 
+function shouldForcePhaseBFollowUp({
+  shouldDeferMainResponse: deferred = false,
+  parentText = '',
+  hasInsights = false,
+  hasMergedText = false,
+  allowErrorOnlyFollowUp = false,
+} = {}) {
+  if (deferred === true) {
+    return true;
+  }
+
+  if (!isNoResponseOnly(parentText)) {
+    return false;
+  }
+
+  return hasInsights === true || hasMergedText === true || allowErrorOnlyFollowUp === true;
+}
+
 module.exports = {
   collectConfiguredHoldScopeKeys,
+  collectDirectActionScopeKeysFromCortices,
+  collectEffectiveDirectActionScopeKeys,
   extractHoldTextsFromInstructions,
   isToolHoldCandidate,
+  normalizeToolNames,
   pickHoldText,
   resolveConfiguredHoldTexts,
+  shouldForcePhaseBFollowUp,
   shouldDeferMainResponse,
 };

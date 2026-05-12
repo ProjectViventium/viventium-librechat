@@ -40,6 +40,75 @@ HEADER_AGENT_ID = "x-viventium-agent-id"
 
 logger = logging.getLogger(__name__)
 
+# === VIVENTIUM START ===
+# Feature: Model-owned Scheduling Cortex instruction surface.
+# Purpose:
+# - Move scheduling cognition into the owning MCP surface before main prompt compaction.
+# - Keep the runtime deterministic: no prompt-text or schedule-name branching.
+SCHEDULING_CORTEX_INSTRUCTIONS = """
+Scheduling Cortex owns reminders, recurring jobs, and schedule management for Viventium.
+
+What it does:
+- Create, update, delete, list, search, inspect, and preview schedules.
+- Run schedules later through the configured Viventium agent and channels.
+- Track last delivery state, including sent, suppressed, failed, and generated text summaries.
+
+When to use:
+- The user asks to remind, follow up later, check back, keep watching, run a recurring task, or change an existing schedule.
+- The user asks what reminders/jobs exist, when one will run, or what happened on the last run.
+- A starter morning briefing exists and should be changed. Its stable template_id is
+  morning_briefing_default_v1.
+
+When not to use:
+- Do not use for immediate live work that should happen now.
+- Do not create duplicate schedules when an existing task can be found and updated.
+- Do not branch on prompt text, schedule name, user identity, or template wording; use declared structured fields, internal task references, filters, and tool evidence.
+
+Inputs and identity:
+- user_id and agent_id are injected from request headers when omitted.
+- Use the user's timezone in schedule payloads when known; otherwise state uncertainty and use an explicit timezone.
+- Channels are "telegram", "librechat", or both.
+
+Output and delivery:
+- Tools return structured task or summary objects.
+- list/search are summary-safe: they return user-facing schedule state plus an internal task reference for follow-up tool calls. They must not return raw prompt text, metadata, user IDs, agent IDs, conversation policy, creator/updater fields, or delivery payloads.
+- Use schedule_get or schedule_last_delivery only when full private verification or diagnostics are needed.
+- Scheduled runs may intentionally produce {NTA}; silent no-response delivery is valid and should not be surfaced as a system announcement.
+- Delivery can be delayed; do not promise completion until a run or last_delivery record says so.
+- User-facing replies must translate tool output into plain outcomes. Do not expose task IDs, raw prompt text, metadata keys/flags, tool function names, channel errors, delivery internals, or server/tool plumbing unless the user explicitly asks for diagnostics.
+- When a full-detail read shows internal prompt text or metadata solely to verify state, use it as private evidence. The user-facing answer should say what is already configured or what changed, without quoting stored prompt text or naming storage fields.
+
+Duplicate prevention and idempotency:
+- For starter morning briefing, use the summary's starter_morning_briefing flag, template_id
+  morning_briefing_default_v1, or a private full-detail read to identify the existing task, then
+  update that internal task reference; do not create another starter task.
+- For user-authored changes, prefer updating a matching existing task over creating a duplicate when the user's intent is to modify an existing reminder/job.
+""".strip()
+
+
+def _tool_description(
+    *,
+    what: str,
+    use_when: str,
+    avoid_when: str,
+    inputs: str,
+    returns: str,
+    failure_modes: str,
+    idempotency: str,
+    delayed_callback: str,
+) -> str:
+    return (
+        f"What it does: {what} "
+        f"When to use: {use_when} "
+        f"When not to use: {avoid_when} "
+        f"Inputs: {inputs} "
+        f"Returns: {returns} "
+        f"Failure modes: {failure_modes} "
+        f"Idempotency and duplicate prevention: {idempotency} "
+        f"Delayed callback behavior: {delayed_callback}"
+    )
+# === VIVENTIUM END ===
+
 
 def _normalize_headers(raw_headers: object) -> Dict[str, str]:
     if raw_headers is None:
@@ -124,35 +193,22 @@ def serialize_task_summary(task: Dict[str, Any]) -> Dict[str, Any]:
         return {}
     payload = ScheduleTask(**task).model_dump()
     metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    schedule = payload.get("schedule") if isinstance(payload.get("schedule"), dict) else payload.get("schedule")
+    channel = payload.get("channel")
+    starter_morning_briefing = metadata.get("template_id") == "morning_briefing_default_v1"
     summary = (
         str(metadata.get("name") or "").strip()
-        or str(metadata.get("template_id") or "").strip()
-        or str(payload.get("prompt") or "").strip().splitlines()[0][:120]
+        or ("Morning briefing" if starter_morning_briefing else "")
         or "scheduled task"
     )
     return {
-        "id": payload.get("id"),
-        "user_id": payload.get("user_id"),
-        "agent_id": payload.get("agent_id"),
-        "channel": payload.get("channel"),
-        "schedule": payload.get("schedule"),
-        "conversation_policy": payload.get("conversation_policy"),
-        "active": payload.get("active"),
-        "created_by": payload.get("created_by"),
-        "created_source": payload.get("created_source"),
-        "created_at": payload.get("created_at"),
-        "updated_at": payload.get("updated_at"),
-        "updated_by": payload.get("updated_by"),
-        "updated_source": payload.get("updated_source"),
-        "last_run_at": payload.get("last_run_at"),
-        "next_run_at": payload.get("next_run_at"),
-        "last_status": payload.get("last_status"),
-        "last_error": payload.get("last_error"),
-        "last_delivery_outcome": payload.get("last_delivery_outcome"),
-        "last_delivery_reason": payload.get("last_delivery_reason"),
-        "last_delivery_at": payload.get("last_delivery_at"),
+        "task_id_internal": payload.get("id"),
         "summary": summary,
-        "metadata": metadata,
+        "schedule": schedule,
+        "channel": channel,
+        "active": payload.get("active"),
+        "starter_morning_briefing": starter_morning_briefing,
+        "next_run_at": payload.get("next_run_at"),
     }
 
 
@@ -187,7 +243,7 @@ def _normalize_channels(value: Optional[ChannelValue], default_all: bool = False
 
 
 def build_server(storage: ScheduleStorage) -> FastMCP:
-    mcp = FastMCP(name="scheduling-cortex")
+    mcp = FastMCP(name="scheduling-cortex", instructions=SCHEDULING_CORTEX_INSTRUCTIONS)
 
     # VIVENTIUM NOTE: Add health endpoint for container app probes.
     @mcp.custom_route("/health", methods=["GET"])
@@ -295,13 +351,25 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
     # === VIVENTIUM NOTE ===
     # Feature: Clarify tool schema defaults and channel behavior.
     @mcp.tool(
-        description=(
-            "Create a scheduled task. Defaults: channel -> all available channels "
-            "(['telegram','librechat']) when omitted; conversation_policy -> 'new'. "
-            "user_id, agent_id, created_by are auto-injected from request headers/env if omitted. "
-            "Write prompt as a note to yourself (the AI agent), i.e., the scheduled self-prompt to perform "
-            "without extra framing; a fixed scheduled self-prompt prefix is injected automatically. "
-            "Example channel: 'telegram' or ['telegram','librechat']."
+        description=_tool_description(
+            what="Create a scheduled task for a future or recurring self-prompt.",
+            use_when="The user asks for a reminder, follow-up, recurring check, or new scheduled job.",
+            avoid_when=(
+                "The request is immediate, or a matching existing schedule should be updated instead."
+            ),
+            inputs=(
+                "prompt, schedule, optional channel, conversation_policy, active, metadata; "
+                "user_id, agent_id, and created_by are auto-injected when omitted."
+            ),
+            returns="success, full task object, and creation message.",
+            failure_modes="Invalid schedule, unsupported channel, missing identity, or past once run_at.",
+            idempotency=(
+                "Search/list before creating when the user means to change an existing schedule; "
+                "for starter briefing, update the existing starter task returned by list/search."
+            ),
+            delayed_callback=(
+                "Creation only schedules future work; later runs may deliver text or {NTA} silently."
+            ),
         )
     )
     # === VIVENTIUM NOTE ===
@@ -374,8 +442,15 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
     # === VIVENTIUM NOTE ===
     # Feature: Clarify tool schema defaults and auto-injected fields.
     @mcp.tool(
-        description=(
-            "Get a scheduled task by id. user_id is auto-injected from request headers if omitted."
+        description=_tool_description(
+            what="Get one scheduled task by id with full prompt, schedule, metadata, and delivery fields for private verification or diagnostics.",
+            use_when="The user asks for details about a specific reminder or job, or you must verify existing stored state before an update.",
+            avoid_when="The user only needs a broad list or search result.",
+            inputs="task_id and optional user_id; user_id is auto-injected when omitted.",
+            returns="task object or null; ordinary user-facing replies must translate the object into plain outcomes and avoid raw prompt text, metadata keys, task references, tool function names, or delivery plumbing unless diagnostics were requested.",
+            failure_modes="Missing identity or unknown task_id returns null.",
+            idempotency="Read-only; does not create, update, or duplicate schedules.",
+            delayed_callback="No delayed callback; this only reads current stored state.",
         )
     )
     # === VIVENTIUM NOTE ===
@@ -387,11 +462,15 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
     # === VIVENTIUM NOTE ===
     # Feature: Clarify tool schema defaults and channel filtering.
     @mcp.tool(
-        description=(
-            "List scheduled tasks. Filters: active_only (default false), channel "
-            "('telegram' | 'librechat' or list; matches any channel in task), agent_id. "
-            "Returns summary fields only; use schedule_get or schedule_last_delivery for full prompt "
-            "or delivery details. user_id is auto-injected from request headers if omitted."
+        description=_tool_description(
+            what="List scheduled tasks with summary-safe fields.",
+            use_when="The user asks what reminders/jobs exist or needs candidates before an update.",
+            avoid_when="The user needs full prompt text or last generated delivery details.",
+            inputs="active_only, channel, agent_id, limit, offset, optional user_id.",
+            returns="summary task list and total count; use schedule_get for full details.",
+            failure_modes="Missing identity or invalid channel.",
+            idempotency="Read-only; use results to prevent duplicate creates.",
+            delayed_callback="No delayed callback; list reflects currently stored schedule state.",
         )
     )
     # === VIVENTIUM NOTE ===
@@ -410,10 +489,15 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
     # === VIVENTIUM NOTE ===
     # Feature: Clarify tool schema defaults and channel filtering.
     @mcp.tool(
-        description=(
-            "Search scheduled tasks by prompt text. Filters: channel ('telegram' | 'librechat' or list), "
-            "agent_id. Returns summary fields only; use schedule_get or schedule_last_delivery for full "
-            "prompt or delivery details. Defaults: limit=50, offset=0. user_id is auto-injected if omitted."
+        description=_tool_description(
+            what="Search existing schedules by query and filters using summary-safe output.",
+            use_when="The user refers to an existing reminder/job by topic, purpose, or wording.",
+            avoid_when="The user already provided a task_id, or no schedule lookup is needed.",
+            inputs="query, channel, agent_id, limit, offset, optional user_id.",
+            returns="summary task list and total count; use schedule_get for full details.",
+            failure_modes="Missing identity or invalid channel.",
+            idempotency="Read-only; search before creating similar schedules to avoid duplicates.",
+            delayed_callback="No delayed callback; search reflects currently stored schedule state.",
         )
     )
     # === VIVENTIUM NOTE ===
@@ -432,10 +516,15 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
     # === VIVENTIUM NOTE ===
     # Feature: Visibility tool for the last generated/suppressed scheduled output.
     @mcp.tool(
-        description=(
-            "Get last delivery details for a scheduled task. If task_id is omitted, returns "
-            "the most recent matching task for this user (optional channel/agent filters). "
-            "Includes whether the run was sent or suppressed and the generated text summary."
+        description=_tool_description(
+            what="Read the most recent generated/sent/suppressed delivery state for a schedule.",
+            use_when="The user asks whether a scheduled run fired, what it sent, or why it stayed silent.",
+            avoid_when="The user only wants schedule configuration or future run previews.",
+            inputs="optional task_id, channel, agent_id, user_id.",
+            returns="full task object with last_delivery fields or null.",
+            failure_modes="Missing identity, unknown task_id, or no matching delivery record.",
+            idempotency="Read-only; does not retry or duplicate a delivery.",
+            delayed_callback="Shows delayed run outcome; {NTA} suppression is a valid silent outcome.",
         )
     )
     # === VIVENTIUM NOTE ===
@@ -457,11 +546,20 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
     # === VIVENTIUM NOTE ===
     # Feature: Clarify tool schema defaults and channel behavior.
     @mcp.tool(
-        description=(
-            "Update a scheduled task. Any provided fields override existing values. "
-            "channel accepts 'telegram' | 'librechat' or list; when omitted, channel is unchanged. "
-            "conversation_policy='same' reuses conversation_id when available (first run may start new). "
-            "user_id, updated_by are auto-injected if omitted."
+        description=_tool_description(
+            what="Update fields on an existing scheduled task.",
+            use_when="The user changes timing, prompt, channel, active state, metadata, or conversation policy.",
+            avoid_when="The user is asking to create a clearly new unrelated schedule.",
+            inputs=(
+                "task_id plus any fields to override: prompt, schedule, agent_id, channel, "
+                "conversation_policy, conversation_id, active, metadata; user_id and updated_by are auto-injected."
+            ),
+            returns="success, updated full task object, and update message.",
+            failure_modes="Missing identity, unknown task_id, invalid channel, or past once run_at.",
+            idempotency=(
+                "Use update rather than create for existing schedules; preserve unchanged fields when omitted."
+            ),
+            delayed_callback="Update changes future behavior only; later runs may deliver text or {NTA} silently.",
         )
     )
     # === VIVENTIUM NOTE ===
@@ -528,8 +626,15 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
     # === VIVENTIUM NOTE ===
     # Feature: Clarify tool schema defaults and auto-injected fields.
     @mcp.tool(
-        description=(
-            "Delete a scheduled task. user_id is auto-injected from request headers if omitted."
+        description=_tool_description(
+            what="Delete one scheduled task.",
+            use_when="The user asks to cancel, remove, or stop a specific reminder/job permanently.",
+            avoid_when="The user only wants to pause or disable temporarily; use schedule_update active=false.",
+            inputs="task_id and optional user_id; user_id is auto-injected when omitted.",
+            returns="success boolean.",
+            failure_modes="Missing identity or unknown task_id returns success false.",
+            idempotency="Deleting the same missing task returns false and does not create side effects.",
+            delayed_callback="No delayed callback; future runs stop once deletion succeeds.",
         )
     )
     # === VIVENTIUM NOTE ===
@@ -541,9 +646,15 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
     # === VIVENTIUM NOTE ===
     # Feature: Clarify tool schema defaults and auto-injected fields.
     @mcp.tool(
-        description=(
-            "Preview upcoming run times for a task. Defaults: count=3. "
-            "user_id is auto-injected if omitted."
+        description=_tool_description(
+            what="Preview upcoming run times for an existing scheduled task.",
+            use_when="The user asks when a reminder/job will run next.",
+            avoid_when="The user needs to modify timing; use schedule_update after preview if requested.",
+            inputs="task_id, count, optional user_id; user_id is auto-injected when omitted.",
+            returns="task_id and next_runs list.",
+            failure_modes="Missing identity, unknown task_id, or invalid schedule.",
+            idempotency="Read-only; does not change next_run_at or create duplicate schedules.",
+            delayed_callback="No delayed callback; preview is informational only.",
         )
     )
     # === VIVENTIUM NOTE ===

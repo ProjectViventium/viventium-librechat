@@ -9,10 +9,10 @@ describe('validateAgentModel', () => {
     const res = {} as Response;
     const agent = {
       provider: 'xai',
-      model: 'grok-4-1-fast-non-reasoning',
+      model: 'grok-4.20-non-reasoning',
     } as Agent;
     const modelsConfig = {
-      xAI: ['grok-4-1-fast-non-reasoning'],
+      xAI: ['grok-4.20-non-reasoning'],
     } as unknown as TModelsConfig;
     const logViolation = jest.fn(async () => undefined);
 
@@ -33,7 +33,7 @@ describe('validateAgentModel', () => {
     const res = {} as Response;
     const agent = {
       provider: 'xai',
-      model: 'grok-4-1-fast-non-reasoning',
+      model: 'grok-4.20-non-reasoning',
     } as Agent;
     const modelsConfig = {
       openai: ['gpt-4o'],

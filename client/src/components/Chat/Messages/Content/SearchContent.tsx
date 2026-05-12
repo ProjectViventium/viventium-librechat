@@ -10,8 +10,10 @@ import type {
   TMessageContentParts,
 } from 'librechat-data-provider';
 import { UnfinishedMessage } from './MessageContent';
+import { filterRenderableContentParts } from './contentPartUtils';
 import Sources from '~/components/Web/Sources';
 import { cn, mapAttachments } from '~/utils';
+import { isNoResponseOnlyText } from '~/utils/noResponseTag';
 import { SearchContext } from '~/Providers';
 import MarkdownLite from './MarkdownLite';
 import store from '~/store';
@@ -30,12 +32,36 @@ const SearchContent = ({
   const { messageId } = message;
 
   const attachmentMap = useMemo(() => mapAttachments(attachments ?? []), [attachments]);
+  const displayContent = useMemo(() => {
+    const fallbackText = typeof message.text === 'string' ? message.text.trim() : '';
+    const parts =
+      filterRenderableContentParts(message.content, {
+        visibleFallbackText: fallbackText,
+      }) ?? [];
+    const cortexTypes = new Set([
+      ContentTypes.CORTEX_ACTIVATION,
+      ContentTypes.CORTEX_BREWING,
+      ContentTypes.CORTEX_INSIGHT,
+    ]);
+    const hasNonCortexRenderablePart = parts.some((part) => part && !cortexTypes.has(part.type));
+    if (hasNonCortexRenderablePart || !fallbackText || isNoResponseOnlyText(fallbackText)) {
+      return parts;
+    }
+    return [
+      {
+        type: ContentTypes.TEXT,
+        text: fallbackText,
+        [ContentTypes.TEXT]: fallbackText,
+      } as TMessageContentParts,
+      ...parts,
+    ];
+  }, [message.content, message.text]);
 
-  if (Array.isArray(message.content) && message.content.length > 0) {
+  if (displayContent && displayContent.length > 0) {
     return (
       <SearchContext.Provider value={{ searchResults }}>
         <Sources />
-        {message.content
+        {displayContent
           .filter((part: TMessageContentParts | undefined) => part)
           .map((part: TMessageContentParts | undefined, idx: number) => {
             if (!part) {
@@ -65,6 +91,15 @@ const SearchContent = ({
         )}
       </SearchContext.Provider>
     );
+  }
+
+  if (
+    Array.isArray(message.content) &&
+    message.content.length > 0 &&
+    displayContent?.length === 0 &&
+    isNoResponseOnlyText(message.text)
+  ) {
+    return null;
   }
 
   return (

@@ -54,10 +54,7 @@ describe('viventium-sync-agents args', () => {
   });
 
   test('parseArgs captures model-config-only flag', () => {
-    const args = parseArgs([
-      'push',
-      '--model-config-only',
-    ]);
+    const args = parseArgs(['push', '--model-config-only']);
 
     expect(args.action).toBe('push');
     expect(args.modelConfigOnly).toBe(true);
@@ -170,11 +167,7 @@ describe('viventium-sync-agents args', () => {
   });
 
   test('parseArgs captures surgical agent id filters', () => {
-    const args = parseArgs([
-      'push',
-      '--model-config-only',
-      '--agent-ids=agent-a,agent-b,agent-a',
-    ]);
+    const args = parseArgs(['push', '--model-config-only', '--agent-ids=agent-a,agent-b,agent-a']);
 
     expect(args.selectedAgentIds).toEqual(['agent-a', 'agent-b']);
   });
@@ -186,13 +179,9 @@ describe('viventium-sync-agents args', () => {
   });
 
   test('parseArgs rejects multiple safe push modes together', () => {
-    expect(() =>
-      parseArgs([
-        'push',
-        '--prompts-only',
-        '--model-config-only',
-      ]),
-    ).toThrow('Choose only one safe push mode');
+    expect(() => parseArgs(['push', '--prompts-only', '--model-config-only'])).toThrow(
+      'Choose only one safe push mode',
+    );
   });
 
   test('resolveSafeActivationFields uses safe defaults for activation-config-only mode', () => {
@@ -206,6 +195,7 @@ describe('viventium-sync-agents args', () => {
       'cooldown_ms',
       'max_history',
       'intent_scope',
+      'activation_failure_visibility',
     ]);
   });
 
@@ -215,6 +205,7 @@ describe('viventium-sync-agents args', () => {
       'prompt',
       'confidence_threshold',
       'fallbacks',
+      'activation_failure_visibility',
     ]);
   });
 

@@ -1,0 +1,7 @@
+data/
+logs/
+appendonlydir/
+nodes-*.conf
+*.aof
+*.rdb
+*.log

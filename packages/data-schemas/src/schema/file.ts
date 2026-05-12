@@ -83,6 +83,27 @@ const file: Schema<IMongoFile> = new Schema(
       conversationRecallTurnCount: Number,
       conversationRecallCharCount: Number,
       /* === VIVENTIUM END === */
+      /* === VIVENTIUM START ===
+       * Feature: Meeting transcript RAG provenance metadata
+       * Added: 2026-05-05
+       */
+      meetingTranscriptArtifactId: String,
+      meetingTranscriptKind: String,
+      meetingTranscriptContentHash: String,
+      meetingTranscriptSourcePathHash: String,
+      meetingTranscriptUploadedDigest: String,
+      meetingTranscriptPromptVersion: Number,
+      meetingTranscriptHeaderVersion: Number,
+      meetingTranscriptCharCount: Number,
+      meetingTranscriptInputComplete: Boolean,
+      meetingTranscriptRawCharCount: Number,
+      meetingTranscriptSuppliedCharCount: Number,
+      meetingTranscriptSummaryCharCount: Number,
+      meetingTranscriptOriginalFilename: String,
+      meetingTranscriptFileMtime: String,
+      meetingTranscriptSourceStatus: String,
+      meetingTranscriptCalendarMatch: Schema.Types.Mixed,
+      /* === VIVENTIUM END === */
     },
     expiresAt: {
       type: Date,

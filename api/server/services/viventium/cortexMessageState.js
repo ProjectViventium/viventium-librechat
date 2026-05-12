@@ -4,8 +4,8 @@
  * Purpose:
  * - Keep scheduler, Telegram, and gateway cortex polling aligned on one MongoDB-backed
  *   source of truth for the assistant message, its cortex parts, and any follow-up node.
- * - Surface canonical parent-message text when Phase B replaces the original assistant
- *   node in place instead of creating a separate follow-up message.
+ * - Surface canonical parent-message text while preserving Phase B as a separate
+ *   nonblocking follow-up message.
  *
  * Added: 2026-03-09
  * === VIVENTIUM END === */
@@ -14,17 +14,15 @@ const { ContentTypes } = require('librechat-data-provider');
 const { logger } = require('@librechat/data-schemas');
 const { getMessage, getMessages } = require('~/models');
 const { getAgent } = require('~/models/Agent');
-const { sanitizeFollowUpDisplayText } = require('~/server/services/viventium/followUpTextSanitizer');
+const {
+  sanitizeFollowUpDisplayText,
+} = require('~/server/services/viventium/followUpTextSanitizer');
 const {
   getDeferredFallbackErrorText,
   getPreferredFallbackInsightText,
 } = require('~/server/services/viventium/cortexFallbackText');
-const {
-  resolveConfiguredHoldTexts,
-} = require('~/server/services/viventium/brewingHold');
-const {
-  isRuntimeHoldTextPart,
-} = require('~/server/services/viventium/runtimeHoldText');
+const { resolveConfiguredHoldTexts } = require('~/server/services/viventium/brewingHold');
+const { isRuntimeHoldTextPart } = require('~/server/services/viventium/runtimeHoldText');
 
 const CORTEX_TYPES = new Set([
   ContentTypes.CORTEX_ACTIVATION,
@@ -68,8 +66,7 @@ function extractCanonicalMessageText(message) {
   const content = Array.isArray(message.content) ? message.content : [];
   const hasRuntimeHold = content.some((part) => isRuntimeHoldTextPart(part));
 
-  const directText =
-    !hasRuntimeHold && typeof message.text === 'string' ? message.text.trim() : '';
+  const directText = !hasRuntimeHold && typeof message.text === 'string' ? message.text.trim() : '';
   if (directText) {
     return sanitizeFollowUpDisplayText(directText);
   }
@@ -81,10 +78,7 @@ function extractCanonicalMessageText(message) {
   const contentText = content
     .filter(
       (part) =>
-        part &&
-        typeof part === 'object' &&
-        part.type === 'text' &&
-        !isRuntimeHoldTextPart(part),
+        part && typeof part === 'object' && part.type === 'text' && !isRuntimeHoldTextPart(part),
     )
     .map((part) => (typeof part.text === 'string' ? part.text.trim() : ''))
     .filter(Boolean)
@@ -232,7 +226,9 @@ function resolveDeferredFallbackCanonicalTextState({
 async function resolveConfiguredHoldTextsForMessage(message) {
   const agentId =
     (typeof message?.agent_id === 'string' && message.agent_id.trim()) ||
-    (typeof message?.model === 'string' && message.model.startsWith('agent_') && message.model.trim()) ||
+    (typeof message?.model === 'string' &&
+      message.model.startsWith('agent_') &&
+      message.model.trim()) ||
     '';
   if (!agentId) {
     return [];

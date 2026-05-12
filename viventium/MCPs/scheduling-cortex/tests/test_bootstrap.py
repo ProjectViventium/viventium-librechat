@@ -155,9 +155,90 @@ class BootstrapEndpointTests(unittest.TestCase):
         })
 
         self.assertEqual(summary["summary"], "Morning Briefing")
+        self.assertEqual(summary["task_id_internal"], "task-1")
+        self.assertTrue(summary["starter_morning_briefing"] is False)
         self.assertNotIn("prompt", summary)
         self.assertNotIn("last_generated_text", summary)
         self.assertNotIn("last_delivery", summary)
+        self.assertNotIn("metadata", summary)
+        self.assertNotIn("user_id", summary)
+        self.assertNotIn("agent_id", summary)
+        self.assertNotIn("conversation_policy", summary)
+        self.assertNotIn("created_by", summary)
+        self.assertNotIn("updated_by", summary)
+        self.assertNotIn("last_error", summary)
+        self.assertNotIn("last_run_at", summary)
+        self.assertNotIn("last_status", summary)
+        self.assertNotIn("last_delivery_outcome", summary)
+        self.assertNotIn("last_delivery_reason", summary)
+        self.assertNotIn("last_delivery_at", summary)
+
+        starter_summary = serialize_task_summary({
+            **{
+                "id": "task-2",
+                "user_id": "user-1",
+                "agent_id": "agent-1",
+                "prompt": "Starter briefing internal prompt",
+                "schedule": {"type": "daily", "time": "08:00", "timezone": "America/Toronto"},
+                "channel": ["telegram", "librechat"],
+                "conversation_policy": "same",
+                "conversation_id": None,
+                "last_conversation_id": None,
+                "active": 1,
+                "created_by": "agent:agent-1",
+                "created_source": "agent",
+                "created_at": "2026-04-08T07:00:00Z",
+                "updated_at": "2026-04-08T07:00:00Z",
+                "updated_by": "agent:agent-1",
+                "updated_source": "agent",
+                "last_run_at": None,
+                "next_run_at": "2026-04-09T08:00:00Z",
+                "last_status": None,
+                "last_error": None,
+                "last_delivery_outcome": None,
+                "last_delivery_reason": None,
+                "last_delivery_at": None,
+                "last_generated_text": None,
+                "last_delivery": None,
+                "metadata": {"template_id": "morning_briefing_default_v1"},
+            }
+        })
+        self.assertEqual(starter_summary["summary"], "Morning briefing")
+        self.assertTrue(starter_summary["starter_morning_briefing"])
+        self.assertNotIn("morning_briefing_default_v1", str(starter_summary))
+
+        unnamed_summary = serialize_task_summary({
+            **{
+                "id": "task-3",
+                "user_id": "user-1",
+                "agent_id": "agent-1",
+                "prompt": "Private internal reminder prompt that must never appear in list output.",
+                "schedule": {"type": "daily", "time": "09:00", "timezone": "America/Toronto"},
+                "channel": ["librechat"],
+                "conversation_policy": "same",
+                "conversation_id": None,
+                "last_conversation_id": None,
+                "active": 1,
+                "created_by": "agent:agent-1",
+                "created_source": "agent",
+                "created_at": "2026-04-08T07:00:00Z",
+                "updated_at": "2026-04-08T07:00:00Z",
+                "updated_by": "agent:agent-1",
+                "updated_source": "agent",
+                "last_run_at": None,
+                "next_run_at": "2026-04-09T09:00:00Z",
+                "last_status": None,
+                "last_error": None,
+                "last_delivery_outcome": None,
+                "last_delivery_reason": None,
+                "last_delivery_at": None,
+                "last_generated_text": None,
+                "last_delivery": None,
+                "metadata": {},
+            }
+        })
+        self.assertEqual(unnamed_summary["summary"], "scheduled task")
+        self.assertNotIn("Private internal reminder prompt", str(unnamed_summary))
 
 
 if __name__ == "__main__":

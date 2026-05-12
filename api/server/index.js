@@ -32,6 +32,7 @@ const { checkMigrations } = require('./services/start/migration');
 const initializeMCPs = require('./services/initializeMCPs');
 const configureSocialLogins = require('./socialLogins');
 const { getAppConfig } = require('./services/Config');
+const { recoverStaleCortexMessages } = require('./services/viventium/staleCortexMessageRecovery');
 const staticCache = require('./utils/staticCache');
 const noIndex = require('./middleware/noIndex');
 const { seedDatabase } = require('~/models');
@@ -99,17 +100,11 @@ const startServer = async () => {
    */
   const baseJsonLimitMb = 3;
   let jsonLimitMb = baseJsonLimitMb;
-  const telegramPayloadLimit = Number.parseInt(
-    process.env.VIVENTIUM_TELEGRAM_PAYLOAD_LIMIT_MB,
-    10,
-  );
+  const telegramPayloadLimit = Number.parseInt(process.env.VIVENTIUM_TELEGRAM_PAYLOAD_LIMIT_MB, 10);
   if (Number.isFinite(telegramPayloadLimit) && telegramPayloadLimit > 0) {
     jsonLimitMb = Math.max(baseJsonLimitMb, telegramPayloadLimit);
   } else {
-    const telegramMaxFileBytes = Number.parseInt(
-      process.env.VIVENTIUM_TELEGRAM_MAX_FILE_SIZE,
-      10,
-    );
+    const telegramMaxFileBytes = Number.parseInt(process.env.VIVENTIUM_TELEGRAM_MAX_FILE_SIZE, 10);
     if (Number.isFinite(telegramMaxFileBytes) && telegramMaxFileBytes > 0) {
       const estimatedMb = Math.ceil((telegramMaxFileBytes * 4) / 3 / (1024 * 1024));
       jsonLimitMb = Math.max(baseJsonLimitMb, estimatedMb + 1);
@@ -243,6 +238,9 @@ const startServer = async () => {
     await initializeMCPs();
     await initializeOAuthReconnectManager();
     await checkMigrations();
+    recoverStaleCortexMessages().catch((error) => {
+      logger.error('[staleCortexMessageRecovery] Startup recovery failed:', error);
+    });
 
     // Configure stream services (auto-detects Redis from USE_REDIS env var)
     const streamServices = createStreamServices();

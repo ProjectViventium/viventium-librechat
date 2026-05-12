@@ -1,5 +1,9 @@
 'use strict';
 
+const {
+  isListenOnlyTranscriptMessage,
+} = require('~/server/services/viventium/listenOnlyTranscript');
+
 /* === VIVENTIUM START ===
  * Feature: Shared conversation-recall filtering rules.
  *
@@ -10,10 +14,8 @@
  * Added: 2026-04-09
  * === VIVENTIUM END === */
 
-const META_MEMORY_TEXT_REGEX =
-  /(<memory_search>|<\/memory_search>|<query>|<\/query>|\bno memories found\b|\bsearch criteria\b|\bmemory tool\b|\bmemory system\b|\bexact results from memory tool\b)/i;
 const INTERNAL_CONTROL_TEXT_REGEX =
-  /<!--\s*viv_internal:|##\s*background processing\s*\(brewing\)|scheduled self-prompt|wake\.\s*check date,\s*time,\s*timezone|conversation_policy|output:\s*\{nta\}|^#\s*current chat:/i;
+  /<!--\s*viv_internal:|<memory_search>|<\/memory_search>|<query>|<\/query>|##\s*background processing\s*\(brewing\)|scheduled self-prompt|wake\.\s*check date,\s*time,\s*timezone|conversation_policy|output:\s*\{nta\}|^#\s*current chat:/i;
 const NTA_ONLY_REGEX = /^\{NTA\}\.?$/i;
 const ASSISTANT_LOW_SIGNAL_REGEX =
   /^(?:hi|hello|hey|yo|thanks|thank you|ok|okay|sure|sounds good|what's up)\b[!.?]*$/i;
@@ -95,7 +97,7 @@ function shouldSkipRecallMessage({
   if (NTA_ONLY_REGEX.test(cleaned)) {
     return true;
   }
-  if (META_MEMORY_TEXT_REGEX.test(cleaned)) {
+  if (isListenOnlyTranscriptMessage(message)) {
     return true;
   }
   if (messageUsesConversationRecallSearch(message)) {
@@ -104,13 +106,7 @@ function shouldSkipRecallMessage({
   if (isCreatedByUser === true && hasRecallDerivedChild) {
     return true;
   }
-  if (
-    isCreatedByUser === false &&
-    isAssistantMemoryDisclaimer(cleaned)
-  ) {
-    return true;
-  }
-  if (!isCreatedByUser && isAssistantRetrievalSummary(cleaned)) {
+  if (isCreatedByUser === false && isAssistantMemoryDisclaimer(cleaned)) {
     return true;
   }
   if (!isCreatedByUser && isAssistantLowSignalText(cleaned)) {
@@ -123,6 +119,7 @@ module.exports = {
   buildRecallDerivedParentIdSet,
   cleanupText,
   getFileSearchSources,
+  isListenOnlyTranscriptMessage,
   isAssistantLowSignalText,
   isAssistantMemoryDisclaimer,
   isConversationRecallFileId,

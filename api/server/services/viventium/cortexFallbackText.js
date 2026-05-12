@@ -71,9 +71,70 @@ const CONCRETE_RESULT_DETAIL_PATTERNS = [
   /\b(?:received|sent|found|scheduled)\b/i,
 ];
 
-function getDeferredFallbackErrorText({ scheduleId = '' } = {}) {
+function normalizeDeferredFallbackErrorClass({
+  errorClass = '',
+  error = '',
+  recoveryReason = '',
+} = {}) {
+  const normalized = String(errorClass || error || recoveryReason || '')
+    .trim()
+    .toLowerCase();
+  if (!normalized) {
+    return '';
+  }
+  if (
+    normalized.includes('stale_cortex_startup_recovery') ||
+    normalized.includes('runtime recovery')
+  ) {
+    return 'restart_recovered';
+  }
+  if (
+    normalized.includes('provider_access_denied') ||
+    normalized.includes('access denied') ||
+    normalized.includes('forbidden')
+  ) {
+    return 'provider_access_denied';
+  }
+  if (normalized.includes('provider_unauthorized') || normalized.includes('unauthorized')) {
+    return 'provider_unauthorized';
+  }
+  if (normalized.includes('provider_rate_limited') || normalized.includes('rate limit')) {
+    return 'provider_rate_limited';
+  }
+  if (normalized.includes('timeout')) {
+    return 'timeout';
+  }
+  return '';
+}
+
+function getDeferredFallbackErrorText({
+  scheduleId = '',
+  errorClass = '',
+  error = '',
+  recoveryReason = '',
+} = {}) {
   if (typeof scheduleId === 'string' && scheduleId.trim()) {
     return '';
+  }
+  const normalizedClass = normalizeDeferredFallbackErrorClass({
+    errorClass,
+    error,
+    recoveryReason,
+  });
+  if (normalizedClass === 'restart_recovered') {
+    return 'That background check was interrupted by a runtime restart before it finished.';
+  }
+  if (normalizedClass === 'provider_access_denied') {
+    return 'I could not reach the configured provider for that check. Please verify provider access or network routing and try again.';
+  }
+  if (normalizedClass === 'provider_unauthorized') {
+    return 'I could not finish that check because the configured provider rejected the credentials.';
+  }
+  if (normalizedClass === 'provider_rate_limited') {
+    return 'That background check was rate-limited by the configured provider.';
+  }
+  if (normalizedClass === 'timeout') {
+    return 'That background check timed out before it could finish.';
   }
   return "I couldn't finish that check just now.";
 }
@@ -250,12 +311,7 @@ function scoreFallbackInsightCandidate({ insight, index = 0 }) {
     10,
   );
   const configuredTools = Number.parseInt(
-    String(
-      insight?.configured_tools ??
-        insight?.configuredTools ??
-        insight?.tools_configured ??
-        0,
-    ),
+    String(insight?.configured_tools ?? insight?.configuredTools ?? insight?.tools_configured ?? 0),
     10,
   );
 
@@ -265,7 +321,11 @@ function scoreFallbackInsightCandidate({ insight, index = 0 }) {
     score += 900 + Math.min(180, completedToolCalls * 45);
   }
 
-  if (Number.isFinite(configuredTools) && configuredTools > 0 && (!Number.isFinite(completedToolCalls) || completedToolCalls === 0)) {
+  if (
+    Number.isFinite(configuredTools) &&
+    configuredTools > 0 &&
+    (!Number.isFinite(completedToolCalls) || completedToolCalls === 0)
+  ) {
     score -= 120;
   }
 
@@ -363,5 +423,6 @@ module.exports = {
   getPreferredFallbackInsightText,
   getVisibleFallbackInsightTexts,
   isOperationalFallbackParagraph,
+  normalizeDeferredFallbackErrorClass,
   stripQuestionSentences,
 };

@@ -27,6 +27,7 @@ jest.mock('~/models', () => ({
   findToken: jest.fn(),
   createToken: jest.fn(),
   updateToken: jest.fn(),
+  deleteToken: jest.fn(),
   deleteTokens: jest.fn(),
 }));
 

@@ -82,6 +82,143 @@ describe('conversationThreading', () => {
     expect(resolveLatestLeafMessageId(messages)).toBe('assistant-phase2');
   });
 
+  test('resolveLatestLeafMessageId ignores Listen-Only transcript chains for live replies', () => {
+    const messages = [
+      {
+        messageId: 'user-1',
+        parentMessageId: '00000000-0000-0000-0000-000000000000',
+        createdAt: '2026-03-26T20:00:00.000Z',
+      },
+      {
+        messageId: 'assistant-1',
+        parentMessageId: 'user-1',
+        createdAt: '2026-03-26T20:00:10.000Z',
+      },
+      {
+        messageId: 'listen-only-1',
+        parentMessageId: 'assistant-1',
+        createdAt: '2026-03-26T20:05:00.000Z',
+        metadata: {
+          viventium: {
+            type: 'listen_only_transcript',
+            mode: 'listen_only',
+          },
+        },
+      },
+      {
+        messageId: 'listen-only-2',
+        parentMessageId: 'listen-only-1',
+        createdAt: '2026-03-26T20:06:00.000Z',
+        metadata: {
+          viventium: {
+            type: 'listen_only_transcript',
+            mode: 'listen_only',
+          },
+        },
+      },
+    ];
+
+    expect(resolveLatestLeafMessageId(messages)).toBe('assistant-1');
+  });
+
+  test('resolveReusableConversationState resumes after the latest non-Listen-Only leaf', async () => {
+    mockGetMessages.mockResolvedValueOnce([
+      {
+        messageId: 'user-1',
+        parentMessageId: '00000000-0000-0000-0000-000000000000',
+        createdAt: '2026-03-26T20:00:00.000Z',
+      },
+      {
+        messageId: 'assistant-1',
+        parentMessageId: 'user-1',
+        createdAt: '2026-03-26T20:00:10.000Z',
+      },
+      {
+        messageId: 'listen-only-1',
+        parentMessageId: 'assistant-1',
+        createdAt: '2026-03-26T20:05:00.000Z',
+        metadata: {
+          viventium: {
+            type: 'listen_only_transcript',
+            mode: 'listen_only',
+          },
+        },
+      },
+      {
+        messageId: 'listen-only-2',
+        parentMessageId: 'listen-only-1',
+        createdAt: '2026-03-26T20:06:00.000Z',
+        metadata: {
+          viventium: {
+            type: 'listen_only_transcript',
+            mode: 'listen_only',
+          },
+        },
+      },
+    ]);
+
+    const state = await resolveReusableConversationState({
+      conversationId: 'conv-1',
+      userId: 'user-1',
+      surface: 'voice',
+    });
+
+    expect(state.conversationId).toBe('conv-1');
+    expect(state.parentMessageId).toBe('assistant-1');
+    expect(state.reason).toBe('existing');
+  });
+
+  test('resolveReusableConversationState reuses provider-backed voice conversations for the same agent', async () => {
+    mockGetConvo.mockResolvedValueOnce({
+      conversationId: 'conv-xai-voice',
+      endpoint: 'xai',
+      agent_id: 'xai__grok-4.3___Grok 4.3',
+    });
+    mockGetMessages.mockResolvedValueOnce([
+      {
+        messageId: 'voice-user-1',
+        parentMessageId: '00000000-0000-0000-0000-000000000000',
+        createdAt: '2026-05-06T21:59:00.000Z',
+      },
+      {
+        messageId: 'voice-assistant-1',
+        parentMessageId: 'voice-user-1',
+        createdAt: '2026-05-06T21:59:10.000Z',
+      },
+    ]);
+
+    const state = await resolveReusableConversationState({
+      conversationId: 'conv-xai-voice',
+      userId: 'user-1',
+      surface: 'voice',
+      agentId: 'xai__grok-4.3___Grok 4.3',
+    });
+
+    expect(state.conversationId).toBe('conv-xai-voice');
+    expect(state.parentMessageId).toBe('voice-assistant-1');
+    expect(state.reason).toBe('existing');
+  });
+
+  test('resolveReusableConversationState rejects provider-backed voice conversations for a different agent', async () => {
+    mockGetConvo.mockResolvedValueOnce({
+      conversationId: 'conv-xai-other',
+      endpoint: 'xai',
+      agent_id: 'xai__other-model___Other',
+    });
+
+    const state = await resolveReusableConversationState({
+      conversationId: 'conv-xai-other',
+      userId: 'user-1',
+      surface: 'voice',
+      agentId: 'xai__grok-4.3___Grok 4.3',
+    });
+
+    expect(state.conversationId).toBe('new');
+    expect(state.parentMessageId).toBeNull();
+    expect(state.reason).toBe('non_agent');
+    expect(mockGetMessages).not.toHaveBeenCalled();
+  });
+
   test('resolveLatestLeafMessageId falls back to latest createdAt when all messages have children', () => {
     const messages = [
       {

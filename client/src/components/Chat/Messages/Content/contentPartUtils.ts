@@ -1,5 +1,6 @@
 import { Constants, ContentTypes } from 'librechat-data-provider';
 import type { Agents, TMessageContentParts } from 'librechat-data-provider';
+import { isNoResponseOnlyText } from '~/utils/noResponseTag';
 import { GLASSHIVE_MCP_SERVER_NAME } from '~/utils/viventiumGlassHive';
 
 export type RenderableContentInput =
@@ -8,6 +9,10 @@ export type RenderableContentInput =
   | string
   | null
   | undefined;
+
+type FilterRenderableContentPartsOptions = {
+  visibleFallbackText?: string | null;
+};
 
 function textContentPart(text: string): TMessageContentParts {
   return {
@@ -118,61 +123,175 @@ function glassHiveToolName(part: TMessageContentParts | undefined): string | und
   return serverName === GLASSHIVE_MCP_SERVER_NAME ? toolName : undefined;
 }
 
-function isGlassHiveToolCall(part: TMessageContentParts | undefined): boolean {
-  return glassHiveToolName(part) != null;
+function toolCallOutput(part: TMessageContentParts | undefined): string {
+  if (part?.type !== ContentTypes.TOOL_CALL) {
+    return '';
+  }
+  const toolCall = part[ContentTypes.TOOL_CALL] as Agents.ToolCall | undefined;
+  return typeof toolCall?.output === 'string' ? toolCall.output : '';
 }
 
-function isRoutineGlassHiveDelegateToolCall(part: TMessageContentParts | undefined): boolean {
-  return glassHiveToolName(part) === 'worker_delegate_once';
-}
-
-function parseGlassHiveToolOutput(rawOutput: string): Record<string, unknown> | undefined {
+function parseJsonObject(value: string): Record<string, unknown> | undefined {
   try {
-    const parsed = JSON.parse(rawOutput) as unknown;
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
-    }
-    if (Array.isArray(parsed)) {
-      const textEnvelope = parsed.find((item) => {
-        return (
-          item &&
-          typeof item === 'object' &&
-          (item as { type?: unknown; text?: unknown }).type === ContentTypes.TEXT &&
-          typeof (item as { text?: unknown }).text === 'string'
-        );
-      }) as { text?: string } | undefined;
-      if (textEnvelope?.text) {
-        const nested = JSON.parse(textEnvelope.text) as unknown;
-        if (nested && typeof nested === 'object' && !Array.isArray(nested)) {
-          return nested as Record<string, unknown>;
-        }
-      }
-    }
-  } catch {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : undefined;
+  } catch (_error) {
     return undefined;
   }
-  return undefined;
 }
 
-function routineGlassHiveDelegateCanBeHidden(part: TMessageContentParts | undefined): boolean {
-  if (!isRoutineGlassHiveDelegateToolCall(part)) {
-    return false;
+function parseGlassHiveToolOutput(part: TMessageContentParts | undefined): Record<string, unknown> {
+  const direct = parseJsonObject(toolCallOutput(part).trim());
+  if (direct) {
+    return direct;
   }
-  const toolCall = part?.[ContentTypes.TOOL_CALL] as Agents.ToolCall | undefined;
-  const rawOutput = typeof toolCall?.output === 'string' ? toolCall.output.trim() : '';
-  if (!rawOutput) {
-    return false;
+
+  try {
+    const wrapped = JSON.parse(toolCallOutput(part).trim());
+    if (!Array.isArray(wrapped)) {
+      return {};
+    }
+    for (const entry of wrapped) {
+      const text = (entry as { text?: unknown })?.text;
+      if (typeof text !== 'string') {
+        continue;
+      }
+      const parsedText = parseJsonObject(text.trim());
+      if (parsedText) {
+        return parsedText;
+      }
+    }
+  } catch (_error) {
+    return {};
   }
-  const parsed = parseGlassHiveToolOutput(rawOutput);
-  return parsed?.status === 'dispatched' && parsed?.callback_ready === true;
+
+  return {};
 }
 
-function hideRoutineGlassHiveDelegateToolCalls(
+function isRoutineGlassHiveDelegatePart(part: TMessageContentParts | undefined): boolean {
+  if (glassHiveToolName(part) !== 'worker_delegate_once') {
+    return false;
+  }
+  const output = parseGlassHiveToolOutput(part);
+  return output.status === 'dispatched' && output.callback_ready === true;
+}
+
+const RUNTIME_HOLD_TEXT_FLAG = 'viventium_runtime_hold';
+const LATE_STREAM_TERMINATION_FLAG = 'viventium_late_stream_termination';
+
+function textPartValue(part: TMessageContentParts | undefined): string {
+  if (!part || part.type !== ContentTypes.TEXT) {
+    return '';
+  }
+  if (typeof part.text === 'string') {
+    return part.text;
+  }
+  const textValue = (part as unknown as { text?: { value?: unknown } }).text?.value;
+  return typeof textValue === 'string' ? textValue : '';
+}
+
+function errorPartValue(part: TMessageContentParts | undefined): string {
+  if (!part || part.type !== ContentTypes.ERROR) {
+    return '';
+  }
+  const errorValue = (part as unknown as Record<string, unknown>)[ContentTypes.ERROR];
+  if (typeof errorValue === 'string') {
+    return errorValue;
+  }
+  const textValue = (part as unknown as { text?: unknown }).text;
+  if (typeof textValue === 'string') {
+    return textValue;
+  }
+  const nestedTextValue = (part as unknown as { text?: { value?: unknown } }).text?.value;
+  return typeof nestedTextValue === 'string' ? nestedTextValue : '';
+}
+
+function isLateStreamTerminationErrorPart(part: TMessageContentParts | undefined): boolean {
+  const record = part as unknown as Record<string, unknown>;
+  if (
+    record?.[LATE_STREAM_TERMINATION_FLAG] === true ||
+    record?.error_class === 'late_stream_termination' ||
+    record?.errorClass === 'late_stream_termination'
+  ) {
+    return true;
+  }
+  const message = errorPartValue(part).trim().toLowerCase();
+  return (
+    message === 'terminated' ||
+    message === 'an error occurred while processing the request: terminated'
+  );
+}
+
+function hasVisibleAssistantTextPart(content: Array<TMessageContentParts | undefined>): boolean {
+  return content.some((part) => {
+    if (!part || part.type !== ContentTypes.TEXT || part.tool_call_ids != null) {
+      return false;
+    }
+    if ((part as unknown as Record<string, unknown>)[RUNTIME_HOLD_TEXT_FLAG] === true) {
+      return false;
+    }
+    return textPartValue(part).trim().length > 0;
+  });
+}
+
+function hasVisibleFallbackAssistantText(value: string | null | undefined): boolean {
+  const text = typeof value === 'string' ? value.trim() : '';
+  return text.length > 0 && !isNoResponseOnlyText(text);
+}
+
+function hideLateTerminationErrorAfterText(
+  content: Array<TMessageContentParts | undefined>,
+  options: FilterRenderableContentPartsOptions = {},
+): Array<TMessageContentParts | undefined> {
+  if (
+    !hasVisibleAssistantTextPart(content) &&
+    !hasVisibleFallbackAssistantText(options.visibleFallbackText)
+  ) {
+    return content;
+  }
+
+  let changed = false;
+  const filtered = content.filter((part) => {
+    const keep = !isLateStreamTerminationErrorPart(part);
+    changed ||= !keep;
+    return keep;
+  });
+  return changed ? filtered : content;
+}
+
+function isRuntimeHoldNoResponsePart(part: TMessageContentParts | undefined): boolean {
+  return (
+    part != null &&
+    part.type === ContentTypes.TEXT &&
+    (part as unknown as Record<string, unknown>)[RUNTIME_HOLD_TEXT_FLAG] === true &&
+    isNoResponseOnlyText(textPartValue(part))
+  );
+}
+
+function hideRuntimeHoldNoResponseParts(
   content: Array<TMessageContentParts | undefined>,
 ): Array<TMessageContentParts | undefined> {
   let changed = false;
   const filtered = content.filter((part) => {
-    const keep = !routineGlassHiveDelegateCanBeHidden(part);
+    const keep = !isRuntimeHoldNoResponsePart(part);
+    changed ||= !keep;
+    return keep;
+  });
+  return changed ? filtered : content;
+}
+
+function hideRoutineGlassHiveDelegateParts(
+  content: Array<TMessageContentParts | undefined>,
+): Array<TMessageContentParts | undefined> {
+  if (!hasVisibleAssistantTextPart(content)) {
+    return content;
+  }
+
+  let changed = false;
+  const filtered = content.filter((part) => {
+    const keep = !isRoutineGlassHiveDelegatePart(part);
     changed ||= !keep;
     return keep;
   });
@@ -187,7 +306,24 @@ function collapseConsecutiveGlassHiveToolCalls(
 
   content.forEach((part) => {
     const previous = collapsed[collapsed.length - 1];
-    if (isGlassHiveToolCall(part) && isGlassHiveToolCall(previous)) {
+    const currentGlassHiveToolName = glassHiveToolName(part);
+    const previousGlassHiveToolName = glassHiveToolName(previous);
+    const currentToolCall = part?.[ContentTypes.TOOL_CALL] as Agents.ToolCall | undefined;
+    const previousToolCall = previous?.[ContentTypes.TOOL_CALL] as Agents.ToolCall | undefined;
+    const currentToolCallId = currentToolCall?.id;
+    const previousToolCallId = previousToolCall?.id;
+    const hasDistinctToolCallIds =
+      typeof currentToolCallId === 'string' &&
+      currentToolCallId.length > 0 &&
+      typeof previousToolCallId === 'string' &&
+      previousToolCallId.length > 0 &&
+      currentToolCallId !== previousToolCallId;
+    if (
+      currentGlassHiveToolName != null &&
+      previousGlassHiveToolName != null &&
+      currentGlassHiveToolName === previousGlassHiveToolName &&
+      !hasDistinctToolCallIds
+    ) {
       collapsed[collapsed.length - 1] = part;
       changed = true;
       return;
@@ -200,6 +336,7 @@ function collapseConsecutiveGlassHiveToolCalls(
 
 export function filterRenderableContentParts(
   content: RenderableContentInput,
+  options: FilterRenderableContentPartsOptions = {},
 ): Array<TMessageContentParts | undefined> | undefined {
   const normalizedContent = normalizeRenderableContentParts(content);
   if (!normalizedContent || normalizedContent.length === 0) {
@@ -234,8 +371,12 @@ export function filterRenderableContentParts(
   });
 
   const deduped = removedAny ? filtered : normalizedContent;
-  const withoutRoutineDelegation = hideRoutineGlassHiveDelegateToolCalls(deduped);
-  const collapsed = collapseConsecutiveGlassHiveToolCalls(withoutRoutineDelegation);
+  const withoutLateTerminationError = hideLateTerminationErrorAfterText(deduped, options);
+  const withoutRuntimeHoldNoResponse = hideRuntimeHoldNoResponseParts(withoutLateTerminationError);
+  const withoutRoutineGlassHiveDelegate = hideRoutineGlassHiveDelegateParts(
+    withoutRuntimeHoldNoResponse,
+  );
+  const collapsed = collapseConsecutiveGlassHiveToolCalls(withoutRoutineGlassHiveDelegate);
   return mergeAdjacentTextParts(collapsed);
 }
 

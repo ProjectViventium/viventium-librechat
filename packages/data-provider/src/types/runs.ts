@@ -35,6 +35,17 @@ export interface CortexContentPart {
   reason?: string;
   insight?: string;
   error?: string;
+  error_class?: string;
+  errorClass?: string;
+  silent?: boolean;
+  no_response?: boolean;
+  cortex_description?: string;
+  activation_scope?: string | null;
+  direct_action_surfaces?: unknown[];
+  direct_action_surface_scopes?: unknown[];
+  configured_tools?: number;
+  completed_tool_calls?: number;
+  status_changed_at?: string;
 }
 /* === VIVENTIUM END === */
 export enum StepTypes {

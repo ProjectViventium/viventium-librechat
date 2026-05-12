@@ -23,7 +23,11 @@ function textOf(message) {
     return direct;
   }
   const content = message?.content;
-  const parts = Array.isArray(content) ? content : content && typeof content === 'object' ? [content] : [];
+  const parts = Array.isArray(content)
+    ? content
+    : content && typeof content === 'object'
+      ? [content]
+      : [];
   return parts
     .map((part) => {
       if (typeof part === 'string') {
@@ -67,9 +71,9 @@ function toPublicCallback(message) {
     messageId: message?.messageId,
     text: textOf(message),
     event: metadata.event || null,
-    workerId: metadata.workerId || null,
-    runId: metadata.runId || null,
     surface: metadata.surface || null,
+    deliverable: metadata.deliverable || null,
+    hasFullText: Boolean(metadata.hasFullText),
     createdAt: message?.createdAt || null,
     updatedAt: message?.updatedAt || null,
   };

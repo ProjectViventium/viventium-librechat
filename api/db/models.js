@@ -38,6 +38,11 @@ const createViventiumTelegramIngressEvent = require('./viventiumTelegramIngressE
 const createGatewayUserMapping = require('./gatewayUserMapping');
 const createGatewayLinkToken = require('./gatewayLinkToken');
 const createViventiumGatewayIngressEvent = require('./viventiumGatewayIngressEvent');
+/* === VIVENTIUM START ===
+ * Feature: Durable GlassHive callback delivery ledger.
+ * Added: 2026-05-06
+ * === VIVENTIUM END === */
+const createViventiumGlassHiveCallbackDelivery = require('./viventiumGlassHiveCallbackDelivery');
 
 /* === VIVENTIUM START ===
  * Feature: Viventium persistence models (Telegram + voice + gateway)
@@ -55,5 +60,6 @@ module.exports = {
   ViventiumCreditsRequest: createViventiumCreditsRequest(mongoose),
   ViventiumTelegramIngressEvent: createViventiumTelegramIngressEvent(mongoose),
   ViventiumGatewayIngressEvent: createViventiumGatewayIngressEvent(mongoose),
+  ViventiumGlassHiveCallbackDelivery: createViventiumGlassHiveCallbackDelivery(mongoose),
 };
 /* === VIVENTIUM END === */

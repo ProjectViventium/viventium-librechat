@@ -22,8 +22,12 @@ const express = require('express');
 const { GenerationJobManager } = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
 const { SystemRoles } = require('librechat-data-provider');
-const { ViventiumVoiceIngressEvent } = require('~/db/models');
-const { configMiddleware, validateConvoAccess, buildEndpointOption } = require('~/server/middleware');
+const { Conversation, Message, ViventiumVoiceIngressEvent } = require('~/db/models');
+const {
+  configMiddleware,
+  validateConvoAccess,
+  buildEndpointOption,
+} = require('~/server/middleware');
 const { initializeClient } = require('~/server/services/Endpoints/agents');
 const addTitle = require('~/server/services/Endpoints/agents/title');
 const AgentController = require('~/server/controllers/agents/request');
@@ -31,6 +35,8 @@ const {
   assertCallSessionSecret,
   claimVoiceSession,
   assertVoiceGatewayAuth,
+  claimOrReplaceCallSessionConversationId,
+  materializeCallSessionConversationId,
   updateCallSessionConversationId,
 } = require('~/server/services/viventium/CallSessionService');
 const { getUserById } = require('~/models');
@@ -40,6 +46,12 @@ const {
 const {
   getGlassHiveCallbackStateForMessage,
 } = require('~/server/services/viventium/GlassHiveCallbackMessageService');
+const {
+  claimPendingGlassHiveCallbackDeliveries,
+  markGlassHiveCallbackDeliverySent,
+  markGlassHiveCallbackDeliveryFailed,
+  markGlassHiveCallbackDeliverySuppressed,
+} = require('~/server/services/viventium/GlassHiveCallbackDeliveryService');
 /* === VIVENTIUM NOTE ===
  * Feature: Sidebar parity for gateway-created conversations (title + icon).
  * Purpose: Match web UI behavior for new conversations created via voice gateway.
@@ -51,6 +63,9 @@ const {
 const {
   resolveReusableConversationState,
 } = require('~/server/services/viventium/conversationThreading');
+const {
+  isListenOnlyTranscriptMessage,
+} = require('~/server/services/viventium/listenOnlyTranscript');
 
 function parseBoolEnv(name, fallback) {
   const raw = process.env[name];
@@ -109,7 +124,8 @@ const logVoiceRouteStage = (req, stage, stageStartAt = null, details = '') => {
     return;
   }
   const now = Date.now();
-  const routeStartAt = typeof req?.viventiumVoiceStartAt === 'number' ? req.viventiumVoiceStartAt : now;
+  const routeStartAt =
+    typeof req?.viventiumVoiceStartAt === 'number' ? req.viventiumVoiceStartAt : now;
   const stageMs = typeof stageStartAt === 'number' ? now - stageStartAt : null;
   const stagePart = stageMs == null ? '' : ` stage_ms=${stageMs}`;
   const detailPart = details ? ` ${details}` : '';
@@ -210,11 +226,31 @@ function combineVoiceTurnSegments(segments) {
   );
 }
 
-function buildVoiceIngressKey({ callSessionId, conversationId, parentMessageId }) {
-  if (!callSessionId || !conversationId || !parentMessageId) {
+function voiceTurnTextAlreadyCaptured(capturedText, incomingText) {
+  const captured = normalizeVoiceTurnText(capturedText);
+  const incoming = normalizeVoiceTurnText(incomingText);
+  return Boolean(captured && incoming && captured.includes(incoming));
+}
+
+function buildVoiceIngressKey({ callSessionId, conversationId, parentMessageId, mode }) {
+  const normalizedMode = mode || 'normal';
+  const normalizedParentMessageId =
+    parentMessageId || (normalizedMode === 'listen_only' ? 'listen-only-root' : '');
+  if (!callSessionId || !normalizedParentMessageId) {
     return '';
   }
-  return `${callSessionId}:${conversationId}:${parentMessageId}`;
+  if (normalizedMode === 'listen_only') {
+    return `${normalizedMode}:${callSessionId}:${normalizedParentMessageId}`;
+  }
+  if (!conversationId) {
+    return '';
+  }
+  return `${normalizedMode}:${callSessionId}:${conversationId}:${normalizedParentMessageId}`;
+}
+
+function voiceIngressEventExpired(doc, nowMs = Date.now()) {
+  const expiresAtMs = doc?.expiresAt ? new Date(doc.expiresAt).getTime() : 0;
+  return Number.isFinite(expiresAtMs) && expiresAtMs > 0 && expiresAtMs <= nowMs;
 }
 
 async function coalesceVoiceTurn({
@@ -225,9 +261,10 @@ async function coalesceVoiceTurn({
   text,
   receivedAtMs,
   requestId,
+  mode = 'normal',
 }) {
   const normalizedText = normalizeVoiceTurnText(text);
-  const dedupeKey = buildVoiceIngressKey({ callSessionId, conversationId, parentMessageId });
+  const dedupeKey = buildVoiceIngressKey({ callSessionId, conversationId, parentMessageId, mode });
   if (!VOICE_TURN_COALESCE_ENABLED || !normalizedText || !dedupeKey) {
     return {
       shouldLaunch: true,
@@ -260,7 +297,8 @@ async function coalesceVoiceTurn({
       await sleep(VOICE_TURN_COALESCE_WINDOW_MS);
     }
     const doc = await findVoiceIngressEvent({ dedupeKey });
-    const mergedText = combineVoiceTurnSegments(doc?.segments || [normalizedText]) || normalizedText;
+    const mergedText =
+      combineVoiceTurnSegments(doc?.segments || [normalizedText]) || normalizedText;
     return {
       shouldLaunch: true,
       mergedText,
@@ -287,6 +325,9 @@ async function coalesceVoiceTurn({
     if (!doc) {
       break;
     }
+    if (voiceIngressEventExpired(doc)) {
+      break;
+    }
     if (doc.streamId) {
       const launchedAtMs = doc.launchedAt ? new Date(doc.launchedAt).getTime() : 0;
       if (!launchedAtMs || Date.now() - launchedAtMs <= VOICE_TURN_COALESCE_RETURN_WINDOW_MS) {
@@ -298,6 +339,58 @@ async function coalesceVoiceTurn({
             status: 'started',
             coalesced: true,
           },
+        };
+      }
+      break;
+    }
+    if (doc.status === 'listen_only') {
+      const savedAtMs = doc.savedAt ? new Date(doc.savedAt).getTime() : 0;
+      const savedText = combineVoiceTurnSegments(doc.segments || []);
+      if (
+        savedAtMs &&
+        Date.now() - savedAtMs <= VOICE_TURN_COALESCE_RETURN_WINDOW_MS &&
+        voiceTurnTextAlreadyCaptured(savedText, normalizedText)
+      ) {
+        return {
+          shouldLaunch: false,
+          payload: {
+            status: 'listen_only',
+            listenOnly: true,
+            saved: doc.saved !== false,
+            conversationId: doc.conversationId || conversationId,
+            messageId: doc.messageId || null,
+            coalesced: true,
+          },
+        };
+      }
+      const recycledDoc = await updateVoiceIngressEvent(
+        { dedupeKey, status: 'listen_only' },
+        {
+          $set: {
+            status: 'buffering',
+            segments: [segment],
+            requestId,
+            conversationId,
+            parentMessageId,
+            saved: false,
+            messageId: '',
+            savedAt: null,
+            expiresAt,
+          },
+        },
+        { new: true },
+      );
+      if (recycledDoc?.status === 'buffering') {
+        if (VOICE_TURN_COALESCE_WINDOW_MS > 0) {
+          await sleep(VOICE_TURN_COALESCE_WINDOW_MS);
+        }
+        const latestDoc = await findVoiceIngressEvent({ dedupeKey });
+        const mergedText =
+          combineVoiceTurnSegments(latestDoc?.segments || [segment]) || normalizedText;
+        return {
+          shouldLaunch: true,
+          mergedText,
+          dedupeKey,
         };
       }
       break;
@@ -314,6 +407,371 @@ async function coalesceVoiceTurn({
     mergedText: normalizedText,
     dedupeKey: '',
   };
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Listen-Only Mode
+ * Purpose: Persist ambient call transcript records without entering the Agents controller,
+ * background cortex, TTS, tools, or live memory writer path.
+ * === VIVENTIUM END === */
+function normalizeListenOnlySpeakerLabel(incoming) {
+  const candidates = [incoming?.participantName, incoming?.participantIdentity, incoming?.trackSid];
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate.trim().slice(0, 120);
+    }
+  }
+  return 'room';
+}
+
+function isConcreteConversationId(conversationId) {
+  return typeof conversationId === 'string' && conversationId.trim() && conversationId !== 'new';
+}
+
+async function repairTrailingListenOnlyFanout({ userId, conversationId }) {
+  try {
+    const messages = await Message.find({
+      user: userId,
+      conversationId,
+    })
+      .sort({ createdAt: 1, _id: 1 })
+      .select({ messageId: 1, parentMessageId: 1, metadata: 1, createdAt: 1, _id: 1 })
+      .lean();
+
+    if (!Array.isArray(messages) || messages.length < 2) {
+      return;
+    }
+
+    let lastNonListenOnlyIndex = -1;
+    for (let index = 0; index < messages.length; index += 1) {
+      if (!isListenOnlyTranscriptMessage(messages[index])) {
+        lastNonListenOnlyIndex = index;
+      }
+    }
+
+    const trailingTranscripts = messages.slice(lastNonListenOnlyIndex + 1);
+    if (trailingTranscripts.length < 2) {
+      return;
+    }
+
+    const ops = [];
+    const anchorMessageId =
+      lastNonListenOnlyIndex >= 0 ? messages[lastNonListenOnlyIndex]?.messageId : null;
+
+    for (let index = 0; index < trailingTranscripts.length; index += 1) {
+      const current = trailingTranscripts[index];
+      const expectedParentMessageId =
+        index === 0 ? anchorMessageId : trailingTranscripts[index - 1]?.messageId;
+
+      if (!expectedParentMessageId || !current?.messageId) {
+        continue;
+      }
+      if (current.parentMessageId === expectedParentMessageId) {
+        continue;
+      }
+      ops.push({
+        updateOne: {
+          filter: { user: userId, conversationId, messageId: current.messageId },
+          update: { $set: { parentMessageId: expectedParentMessageId } },
+        },
+      });
+    }
+
+    if (ops.length === 0) {
+      return;
+    }
+
+    await Message.bulkWrite(ops, { ordered: false });
+    logger.info(
+      '[VIVENTIUM][voice/chat] Repaired trailing Listen-Only transcript fanout conversationId=%s rows=%d',
+      conversationId,
+      ops.length,
+    );
+  } catch (err) {
+    logger.warn(
+      '[VIVENTIUM][voice/chat] Failed to repair trailing Listen-Only transcript fanout conversationId=%s: %s',
+      conversationId,
+      err?.message || err,
+    );
+  }
+}
+
+async function resolveListenOnlyTranscriptParentMessageId({
+  userId,
+  conversationId,
+  fallbackParentMessageId,
+}) {
+  if (!userId || !isConcreteConversationId(conversationId)) {
+    return fallbackParentMessageId;
+  }
+
+  try {
+    const latestMessage = await Message.findOne({ user: userId, conversationId })
+      .sort({ createdAt: -1, _id: -1 })
+      .select({ messageId: 1, parentMessageId: 1, metadata: 1, createdAt: 1, _id: 1 })
+      .lean();
+
+    if (isListenOnlyTranscriptMessage(latestMessage)) {
+      const latestMessageId = latestMessage.messageId ?? latestMessage.id;
+      if (typeof latestMessageId === 'string' && latestMessageId.length > 0) {
+        if (
+          latestMessage.parentMessageId == null ||
+          latestMessage.parentMessageId === fallbackParentMessageId
+        ) {
+          await repairTrailingListenOnlyFanout({ userId, conversationId });
+        }
+        return latestMessageId;
+      }
+    }
+  } catch (err) {
+    logger.warn(
+      '[VIVENTIUM][voice/chat] Failed to resolve Listen-Only transcript parent conversationId=%s: %s',
+      conversationId,
+      err?.message || err,
+    );
+  }
+
+  return fallbackParentMessageId;
+}
+
+async function persistListenOnlyTranscript({
+  req,
+  session,
+  text,
+  conversationId,
+  parentMessageId,
+  incoming,
+  sessionConversationRejected = false,
+}) {
+  const normalizedText = normalizeVoiceTurnText(text);
+  if (!normalizedText) {
+    return {
+      saved: false,
+      conversationId: isConcreteConversationId(conversationId)
+        ? conversationId
+        : session.conversationId,
+      parentMessageId,
+      messageId: null,
+    };
+  }
+
+  const userId = req.user?.id;
+  if (!userId) {
+    const err = new Error('User not found for Listen-Only transcript persistence');
+    err.status = 401;
+    throw err;
+  }
+
+  const canFallBackToSessionConversation =
+    !sessionConversationRejected && isConcreteConversationId(session?.conversationId);
+  let resolvedConversationId = isConcreteConversationId(conversationId)
+    ? conversationId
+    : canFallBackToSessionConversation
+      ? session?.conversationId
+      : null;
+  if (!isConcreteConversationId(resolvedConversationId)) {
+    const candidateConversationId = crypto.randomUUID();
+    const materializedSession = sessionConversationRejected
+      ? await claimOrReplaceCallSessionConversationId(
+          session?.callSessionId,
+          candidateConversationId,
+          {
+            expectedConversationId: session?.conversationId,
+          },
+        )
+      : await materializeCallSessionConversationId(session?.callSessionId, candidateConversationId);
+    if (!isConcreteConversationId(materializedSession?.conversationId)) {
+      const err = new Error(
+        'Call session is no longer available for Listen-Only transcript persistence',
+      );
+      err.status = 409;
+      throw err;
+    }
+    resolvedConversationId = materializedSession.conversationId;
+  }
+  const resolvedParentMessageId = await resolveListenOnlyTranscriptParentMessageId({
+    userId,
+    conversationId: resolvedConversationId,
+    fallbackParentMessageId: parentMessageId,
+  });
+  const messageId = crypto.randomUUID();
+  const now = new Date();
+  const speakerLabel = normalizeListenOnlySpeakerLabel(incoming);
+  const requestId =
+    req.viventiumVoiceRequestId || req.get('X-VIVENTIUM-REQUEST-ID') || crypto.randomUUID();
+
+  const message = await Message.findOneAndUpdate(
+    { user: userId, messageId },
+    {
+      $set: {
+        user: userId,
+        messageId,
+        conversationId: resolvedConversationId,
+        parentMessageId: resolvedParentMessageId,
+        endpoint: 'agents',
+        sender: 'Listen-Only',
+        text: normalizedText,
+        _meiliIndex: false,
+        isCreatedByUser: false,
+        tokenCount: 0,
+        unfinished: false,
+        error: false,
+        metadata: {
+          viventium: {
+            type: 'listen_only_transcript',
+            source: 'voice_call',
+            mode: 'listen_only',
+            ambientKind: 'ambient_room_transcript',
+            callSessionId: session?.callSessionId || null,
+            speakerLabel,
+            requestId,
+          },
+        },
+        createdAt: now,
+        updatedAt: now,
+      },
+    },
+    {
+      upsert: true,
+      new: true,
+      timestamps: false,
+      overwriteImmutable: true,
+    },
+  );
+
+  await Conversation.findOneAndUpdate(
+    { user: userId, conversationId: resolvedConversationId },
+    {
+      $setOnInsert: {
+        user: userId,
+        conversationId: resolvedConversationId,
+        title: 'Listen-Only Session',
+        endpoint: 'agents',
+        agent_id: session?.agentId || null,
+        createdAt: now,
+      },
+      $set: {
+        updatedAt: now,
+      },
+      $addToSet: {
+        messages: message._id,
+      },
+    },
+    {
+      upsert: true,
+      new: true,
+      timestamps: false,
+      overwriteImmutable: true,
+    },
+  );
+
+  return {
+    saved: true,
+    conversationId: resolvedConversationId,
+    parentMessageId: resolvedParentMessageId,
+    messageId,
+    speakerLabel,
+  };
+}
+
+async function handleListenOnlyVoiceTurn({ req, res, session }) {
+  const coalescedTurn = await coalesceVoiceTurn({
+    callSessionId: session?.callSessionId,
+    userId: req.user?.id,
+    conversationId: req.body?.conversationId || session?.conversationId,
+    parentMessageId: req.body?.parentMessageId,
+    text: req.body?.text,
+    receivedAtMs: req.viventiumVoiceIngressReceivedAtMs,
+    requestId:
+      req.viventiumVoiceRequestId || req.get('X-VIVENTIUM-REQUEST-ID') || crypto.randomUUID(),
+    mode: 'listen_only',
+  });
+
+  if (!coalescedTurn.shouldLaunch && coalescedTurn.payload) {
+    logger.info(
+      `[VIVENTIUM][voice/chat] Coalesced onto existing Listen-Only transcript parentMessageId=${req.body?.parentMessageId || 'none'} ` +
+        `conversationId=${req.body?.conversationId || 'unknown'} status=${coalescedTurn.payload.status || 'unknown'}`,
+    );
+    return res.json(coalescedTurn.payload);
+  }
+
+  if (
+    typeof coalescedTurn.mergedText === 'string' &&
+    coalescedTurn.mergedText &&
+    coalescedTurn.mergedText !== req.body?.text
+  ) {
+    logger.info(
+      `[VIVENTIUM][voice/chat] Coalesced rapid same-parent Listen-Only turn text parentMessageId=${req.body?.parentMessageId || 'none'} ` +
+        `chars=${req.body?.text?.length || 0}->${coalescedTurn.mergedText.length}`,
+    );
+    req.body.text = coalescedTurn.mergedText;
+  }
+
+  logger.info(
+    `[VIVENTIUM][voice/chat] user_turn_completed source=listen_only callSessionId=${session?.callSessionId || 'unknown'} ` +
+      `conversationId=${req.body?.conversationId || 'unknown'} parentMessageId=${req.body?.parentMessageId || 'none'} ` +
+      `agentId=${session?.agentId || 'unknown'} requestId=${
+        req.viventiumVoiceRequestId || req.get('X-VIVENTIUM-REQUEST-ID') || 'unknown'
+      } coalesced=${Boolean(coalescedTurn.dedupeKey)} textChars=${req.body?.text?.length || 0}`,
+  );
+
+  let persisted;
+  try {
+    persisted = await persistListenOnlyTranscript({
+      req,
+      session,
+      text: req.body?.text,
+      conversationId: req.body?.conversationId,
+      parentMessageId: req.body?.parentMessageId,
+      incoming: req.body,
+      sessionConversationRejected: req.viventiumVoiceConversationRejected === true,
+    });
+  } catch (err) {
+    const status = Number.isInteger(err?.status) ? err.status : 500;
+    logger.warn(
+      '[VIVENTIUM][voice/chat] Listen-Only transcript persistence failed: %s',
+      err?.message || err,
+    );
+    return res.status(status).json({
+      error: err?.message || 'Listen-Only transcript persistence failed',
+      listenOnly: true,
+      status: 'listen_only_error',
+    });
+  }
+
+  if (coalescedTurn.dedupeKey) {
+    updateVoiceIngressEvent(
+      { dedupeKey: coalescedTurn.dedupeKey },
+      {
+        $set: {
+          status: 'listen_only',
+          saved: persisted.saved,
+          messageId: persisted.messageId || '',
+          conversationId: persisted.conversationId || req.body?.conversationId || '',
+          savedAt: new Date(),
+          expiresAt: new Date(Date.now() + VOICE_TURN_COALESCE_TTL_S * 1000),
+        },
+      },
+      { new: true },
+    ).catch((err) => {
+      logger.warn('[VIVENTIUM][voice/chat] Failed to update Listen-Only coalesced record:', err);
+    });
+  }
+
+  logger.info(
+    `[VIVENTIUM][voice/chat] Listen-Only transcript persisted callSessionId=${session.callSessionId} ` +
+      `conversationId=${persisted.conversationId || 'unknown'} messageId=${persisted.messageId || 'none'} ` +
+      `saved=${persisted.saved === true} textChars=${req.body?.text?.length || 0}`,
+  );
+
+  return res.json({
+    status: 'listen_only',
+    listenOnly: true,
+    saved: persisted.saved === true,
+    conversationId: persisted.conversationId || req.body?.conversationId,
+    parentMessageId: persisted.parentMessageId || req.body?.parentMessageId,
+    messageId: persisted.messageId || null,
+  });
 }
 
 /* === VIVENTIUM NOTE ===
@@ -425,205 +883,248 @@ async function voiceAuth(req, res, next) {
  *   In this mode, `systemPrompt` contains the formatted insight prompt (from v1-style formatting).
  *   The agent should respond naturally with the insight, not as a user question.
  */
-router.post('/chat', voiceAuth, configMiddleware, async (req, _res, next) => {
-  req.viventiumVoiceIngressReceivedAtMs = Date.now();
-  const session = req.viventiumCallSession;
-  const incoming = req.body ?? {};
-  const text = typeof incoming.text === 'string' ? incoming.text : '';
-  const speakInsights = incoming.speakInsights === true;
-  const systemPrompt = typeof incoming.systemPrompt === 'string' ? incoming.systemPrompt : '';
-  /* === VIVENTIUM NOTE ===
-   * Feature: Voice latency logging (request timing)
-   */
-  const logLatency = (process.env.VIVENTIUM_VOICE_LOG_LATENCY || '').trim() === '1';
-  if (logLatency) {
-    req.viventiumVoiceStartAt = Date.now();
-    req.viventiumVoiceRequestId = req.get('X-VIVENTIUM-REQUEST-ID') || '';
-    req.viventiumVoiceLogLatency = true;
+router.post(
+  '/chat',
+  voiceAuth,
+  configMiddleware,
+  async (req, _res, next) => {
+    req.viventiumVoiceIngressReceivedAtMs = Date.now();
+    const session = req.viventiumCallSession;
+    const incoming = req.body ?? {};
+    const text = typeof incoming.text === 'string' ? incoming.text : '';
+    const speakInsights = incoming.speakInsights === true;
+    const systemPrompt = typeof incoming.systemPrompt === 'string' ? incoming.systemPrompt : '';
+    /* === VIVENTIUM NOTE ===
+     * Feature: Voice latency logging (request timing)
+     */
+    const logLatency = (process.env.VIVENTIUM_VOICE_LOG_LATENCY || '').trim() === '1';
+    if (logLatency) {
+      req.viventiumVoiceStartAt = Date.now();
+      req.viventiumVoiceRequestId = req.get('X-VIVENTIUM-REQUEST-ID') || '';
+      req.viventiumVoiceLogLatency = true;
+      logVoiceRouteStage(
+        req,
+        'voice_chat_route_enter',
+        req.viventiumVoiceStartAt,
+        `agent_id=${session?.agentId || 'unknown'} convo_id=${session?.conversationId || 'new'}`,
+      );
+    }
+    /* === VIVENTIUM NOTE === */
+
+    /* === VIVENTIUM NOTE ===
+     * Feature: Voice conversation continuity - parentMessageId tracking
+     *
+     * For existing conversations, fetch the latest message's ID to use as parentMessageId.
+     * This ensures LibreChat's message tree model builds the full conversation chain,
+     * enabling the agent to see previous messages and cortex insights.
+     * === VIVENTIUM NOTE === */
+    const requestedConversationId = session.conversationId || 'new';
+    const parentLookupStartAt = Date.now();
+    const conversationState = await resolveReusableConversationState({
+      conversationId: requestedConversationId,
+      userId: req.user?.id,
+      surface: 'voice',
+      agentId: session.agentId,
+    });
+    const conversationId = conversationState.conversationId;
+    let parentMessageId = conversationState.parentMessageId;
+    const conversationRejectedForVoice =
+      isConcreteConversationId(requestedConversationId) &&
+      conversationId === 'new' &&
+      conversationState.reason !== 'new';
+    req.viventiumVoiceConversationRejected = conversationRejectedForVoice;
     logVoiceRouteStage(
       req,
-      'voice_chat_route_enter',
-      req.viventiumVoiceStartAt,
-      `agent_id=${session?.agentId || 'unknown'} convo_id=${session?.conversationId || 'new'}`,
+      'resolve_parent_message_done',
+      parentLookupStartAt,
+      `requested_conversation_id=${requestedConversationId} conversation_id=${conversationId} parent_message_id=${parentMessageId || 'none'} reason=${conversationState.reason}`,
     );
-  }
-  /* === VIVENTIUM NOTE === */
-
-  /* === VIVENTIUM NOTE ===
-   * Feature: Voice conversation continuity - parentMessageId tracking
-   *
-   * For existing conversations, fetch the latest message's ID to use as parentMessageId.
-   * This ensures LibreChat's message tree model builds the full conversation chain,
-   * enabling the agent to see previous messages and cortex insights.
-   * === VIVENTIUM NOTE === */
-  const requestedConversationId = session.conversationId || 'new';
-  const parentLookupStartAt = Date.now();
-  const conversationState = await resolveReusableConversationState({
-    conversationId: requestedConversationId,
-    userId: req.user?.id,
-    surface: 'voice',
-  });
-  const conversationId = conversationState.conversationId;
-  let parentMessageId = conversationState.parentMessageId;
-  logVoiceRouteStage(
-    req,
-    'resolve_parent_message_done',
-    parentLookupStartAt,
-    `requested_conversation_id=${requestedConversationId} conversation_id=${conversationId} parent_message_id=${parentMessageId || 'none'} reason=${conversationState.reason}`,
-  );
-  if (requestedConversationId !== conversationId) {
-    logger.info(
-      '[VIVENTIUM][voice/chat] Conversation reset: requested=%s resolved=%s reason=%s',
-      requestedConversationId,
-      conversationId,
-      conversationState.reason,
-    );
-  }
-  logger.info(
-    `[VIVENTIUM][voice/chat] Resolved parentMessageId=${parentMessageId} for conversationId=${conversationId}`,
-  );
-
-  /* === VIVENTIUM NOTE ===
-   * Feature: Sidebar parity for gateway-created conversations (title + icon).
-   * === VIVENTIUM NOTE === */
-  parentMessageId = normalizeGatewayParentMessageId({ conversationId, parentMessageId });
-  const resolvedSpec = ensureGatewaySpec({
-    req,
-    existingSpec: incoming?.spec,
-    agentId: session.agentId,
-  });
-
-  // Normalize request body for Agents buildEndpointOption + controller.
-  req.body = {
-    ...incoming,
-    text,
-    endpoint: 'agents',
-    endpointType: 'agents',
-    conversationId,
-    parentMessageId,
-    agent_id: session.agentId,
-  };
-  logVoiceRouteStage(
-    req,
-    'voice_chat_body_normalized',
-    null,
-    `conversation_id=${conversationId} parent_message_id=${parentMessageId || 'none'} ` +
-      `speak_insights=${speakInsights} text_chars=${text.length}`,
-  );
-  if (resolvedSpec) {
-    req.body.spec = resolvedSpec;
-  }
-
-  logger.info(`[VIVENTIUM][voice/chat] Request: conversationId=${conversationId}, parentMessageId=${parentMessageId}, agentId=${session.agentId}`);
-
-  // If this is an insight delivery request, inject the insight prompt as instructions
-  // so the agent speaks the insights naturally (like v1's _speak_proactively pattern)
-  if (speakInsights && systemPrompt) {
-    req.viventiumInsightPrompt = systemPrompt;
-    logger.info('[VIVENTIUM][voice/chat] Insight delivery request received (speakInsights=true)');
-  }
-
-  next();
-}, validateConvoAccess, buildEndpointOption, async (req, res, next) => {
-  // If this call session began from a "new" conversation, capture the real conversationId
-  // returned by ResumableAgentController and update the session store.
-  const session = req.viventiumCallSession;
-
-  const coalescedTurn = await coalesceVoiceTurn({
-    callSessionId: session?.callSessionId,
-    userId: req.user?.id,
-    conversationId: req.body?.conversationId,
-    parentMessageId: req.body?.parentMessageId,
-    text: req.body?.text,
-    receivedAtMs: req.viventiumVoiceIngressReceivedAtMs,
-    requestId:
-      req.viventiumVoiceRequestId || req.get('X-VIVENTIUM-REQUEST-ID') || crypto.randomUUID(),
-  });
-
-  if (!coalescedTurn.shouldLaunch && coalescedTurn.payload) {
-    logger.info(
-      `[VIVENTIUM][voice/chat] Coalesced onto existing stream parentMessageId=${req.body?.parentMessageId || 'none'} ` +
-        `conversationId=${req.body?.conversationId || 'unknown'} streamId=${coalescedTurn.payload.streamId || 'unknown'}`,
-    );
-    return res.json(coalescedTurn.payload);
-  }
-
-  if (
-    typeof coalescedTurn.mergedText === 'string' &&
-    coalescedTurn.mergedText &&
-    coalescedTurn.mergedText !== req.body?.text
-  ) {
-    logger.info(
-      `[VIVENTIUM][voice/chat] Coalesced rapid same-parent turn text parentMessageId=${req.body?.parentMessageId || 'none'} ` +
-        `chars=${req.body?.text?.length || 0}->${coalescedTurn.mergedText.length}`,
-    );
-    req.body.text = coalescedTurn.mergedText;
-  }
-
-  logger.info(
-    `[VIVENTIUM][voice/chat] user_turn_completed source=route callSessionId=${session?.callSessionId || 'unknown'} ` +
-      `conversationId=${req.body?.conversationId || 'unknown'} parentMessageId=${req.body?.parentMessageId || 'none'} ` +
-      `agentId=${session?.agentId || 'unknown'} requestId=${
-        req.viventiumVoiceRequestId || req.get('X-VIVENTIUM-REQUEST-ID') || 'unknown'
-      } coalesced=${Boolean(coalescedTurn.dedupeKey)} textChars=${req.body?.text?.length || 0}`,
-  );
-
-  const originalJson = res.json.bind(res);
-  res.json = (payload) => {
-    try {
-      const convoId = payload?.conversationId;
-      if (session && session.conversationId === 'new' && typeof convoId === 'string' && convoId.length > 0) {
-        updateCallSessionConversationId(session.callSessionId, convoId).catch((err) => {
-          logger.warn('[VIVENTIUM][voice/chat] Failed to update call session conversationId:', err);
-        });
-      }
-      if (coalescedTurn.dedupeKey && typeof payload?.streamId === 'string' && payload.streamId.length > 0) {
-        updateVoiceIngressEvent(
-          { dedupeKey: coalescedTurn.dedupeKey },
-          {
-            $set: {
-              streamId: payload.streamId,
-              status: 'launched',
-              launchedAt: new Date(),
-              conversationId: convoId || req.body?.conversationId || '',
-              expiresAt: new Date(Date.now() + VOICE_TURN_COALESCE_TTL_S * 1000),
-            },
-          },
-          { new: true },
-        ).catch((err) => {
-          logger.warn('[VIVENTIUM][voice/chat] Failed to update coalesced stream record:', err);
-        });
-      }
-      if (req.viventiumVoiceLogLatency && typeof req.viventiumVoiceStartAt === 'number') {
-        const elapsedMs = Date.now() - req.viventiumVoiceStartAt;
-        const requestId = req.viventiumVoiceRequestId || 'unknown';
-        const streamId = payload?.streamId || 'unknown';
-        logger.info(
-          `[VoiceLatency] voice_chat_ready_ms=${elapsedMs} request_id=${requestId} stream_id=${streamId}`,
-        );
-      }
-    } catch (e) {
-      // noop
+    if (requestedConversationId !== conversationId) {
+      logger.info(
+        '[VIVENTIUM][voice/chat] Conversation reset: requested=%s resolved=%s reason=%s',
+        requestedConversationId,
+        conversationId,
+        conversationState.reason,
+      );
     }
-    return originalJson(payload);
-  };
+    logger.info(
+      `[VIVENTIUM][voice/chat] Resolved parentMessageId=${parentMessageId} for conversationId=${conversationId}`,
+    );
 
-  // Handle insight delivery mode (speakInsights=true)
-  // Inject the insight prompt into the request so the agent speaks it naturally
-  // This mirrors v1's ResponseController._speak_proactively() pattern
-  const insightPrompt = req.viventiumInsightPrompt;
-  if (insightPrompt) {
-    // For insight delivery, we use an empty user message and inject the insight as instructions
-    // The agent will respond naturally to the insight prompt
-    req.body.text = '';
-    req.body.viventiumInsightInstructions = insightPrompt;
-    // Prevent recursive cortex activation loops on this synthetic "insight delivery" request.
-    req.body.suppressBackgroundCortices = true;
-    logger.info('[VIVENTIUM][voice/chat] Injected insight instructions (%d chars)', insightPrompt.length);
-  }
+    /* === VIVENTIUM NOTE ===
+     * Feature: Sidebar parity for gateway-created conversations (title + icon).
+     * === VIVENTIUM NOTE === */
+    parentMessageId = normalizeGatewayParentMessageId({ conversationId, parentMessageId });
+    const resolvedSpec = ensureGatewaySpec({
+      req,
+      existingSpec: incoming?.spec,
+      agentId: session.agentId,
+    });
 
-  return AgentController(req, res, next, initializeClient, addTitle);
-});
+    // Normalize request body for Agents buildEndpointOption + controller.
+    req.body = {
+      ...incoming,
+      text,
+      endpoint: 'agents',
+      endpointType: 'agents',
+      conversationId,
+      parentMessageId,
+      agent_id: session.agentId,
+    };
+    logVoiceRouteStage(
+      req,
+      'voice_chat_body_normalized',
+      null,
+      `conversation_id=${conversationId} parent_message_id=${parentMessageId || 'none'} ` +
+        `speak_insights=${speakInsights} text_chars=${text.length}`,
+    );
+    if (resolvedSpec) {
+      req.body.spec = resolvedSpec;
+    }
+
+    logger.info(
+      `[VIVENTIUM][voice/chat] Request: conversationId=${conversationId}, parentMessageId=${parentMessageId}, agentId=${session.agentId}`,
+    );
+
+    /* === VIVENTIUM START ===
+     * Feature: Listen-Only Mode early exit
+     * Purpose: This branch intentionally returns before validateConvoAccess/buildEndpointOption.
+     * voiceAuth has already bound the request to the call-session user, and conversationId is
+     * server-resolved from that session, so no browser-supplied conversation target is trusted.
+     * === VIVENTIUM END === */
+    if (session?.listenOnlyModeEnabled === true) {
+      return handleListenOnlyVoiceTurn({ req, res: _res, session });
+    }
+
+    // If this is an insight delivery request, inject the insight prompt as instructions
+    // so the agent speaks the insights naturally (like v1's _speak_proactively pattern)
+    if (speakInsights && systemPrompt) {
+      req.viventiumInsightPrompt = systemPrompt;
+      logger.info('[VIVENTIUM][voice/chat] Insight delivery request received (speakInsights=true)');
+    }
+
+    next();
+  },
+  validateConvoAccess,
+  buildEndpointOption,
+  async (req, res, next) => {
+    // If this call session began from a "new" conversation, capture the real conversationId
+    // returned by ResumableAgentController and update the session store.
+    const session = req.viventiumCallSession;
+
+    const coalescedTurn = await coalesceVoiceTurn({
+      callSessionId: session?.callSessionId,
+      userId: req.user?.id,
+      conversationId: req.body?.conversationId,
+      parentMessageId: req.body?.parentMessageId,
+      text: req.body?.text,
+      receivedAtMs: req.viventiumVoiceIngressReceivedAtMs,
+      requestId:
+        req.viventiumVoiceRequestId || req.get('X-VIVENTIUM-REQUEST-ID') || crypto.randomUUID(),
+      mode: 'normal',
+    });
+
+    if (!coalescedTurn.shouldLaunch && coalescedTurn.payload) {
+      logger.info(
+        `[VIVENTIUM][voice/chat] Coalesced onto existing stream parentMessageId=${req.body?.parentMessageId || 'none'} ` +
+          `conversationId=${req.body?.conversationId || 'unknown'} streamId=${coalescedTurn.payload.streamId || 'unknown'}`,
+      );
+      return res.json(coalescedTurn.payload);
+    }
+
+    if (
+      typeof coalescedTurn.mergedText === 'string' &&
+      coalescedTurn.mergedText &&
+      coalescedTurn.mergedText !== req.body?.text
+    ) {
+      logger.info(
+        `[VIVENTIUM][voice/chat] Coalesced rapid same-parent turn text parentMessageId=${req.body?.parentMessageId || 'none'} ` +
+          `chars=${req.body?.text?.length || 0}->${coalescedTurn.mergedText.length}`,
+      );
+      req.body.text = coalescedTurn.mergedText;
+    }
+
+    logger.info(
+      `[VIVENTIUM][voice/chat] user_turn_completed source=route callSessionId=${session?.callSessionId || 'unknown'} ` +
+        `conversationId=${req.body?.conversationId || 'unknown'} parentMessageId=${req.body?.parentMessageId || 'none'} ` +
+        `agentId=${session?.agentId || 'unknown'} requestId=${
+          req.viventiumVoiceRequestId || req.get('X-VIVENTIUM-REQUEST-ID') || 'unknown'
+        } coalesced=${Boolean(coalescedTurn.dedupeKey)} textChars=${req.body?.text?.length || 0}`,
+    );
+
+    const originalJson = res.json.bind(res);
+    res.json = (payload) => {
+      try {
+        const convoId = payload?.conversationId;
+        const shouldUpdateSessionConversationId =
+          session &&
+          (session.conversationId === 'new' || req.viventiumVoiceConversationRejected === true) &&
+          typeof convoId === 'string' &&
+          convoId.length > 0 &&
+          convoId !== 'new';
+        if (shouldUpdateSessionConversationId) {
+          updateCallSessionConversationId(session.callSessionId, convoId).catch((err) => {
+            logger.warn(
+              '[VIVENTIUM][voice/chat] Failed to update call session conversationId:',
+              err,
+            );
+          });
+        }
+        if (
+          coalescedTurn.dedupeKey &&
+          typeof payload?.streamId === 'string' &&
+          payload.streamId.length > 0
+        ) {
+          updateVoiceIngressEvent(
+            { dedupeKey: coalescedTurn.dedupeKey },
+            {
+              $set: {
+                streamId: payload.streamId,
+                status: 'launched',
+                launchedAt: new Date(),
+                conversationId: convoId || req.body?.conversationId || '',
+                expiresAt: new Date(Date.now() + VOICE_TURN_COALESCE_TTL_S * 1000),
+              },
+            },
+            { new: true },
+          ).catch((err) => {
+            logger.warn('[VIVENTIUM][voice/chat] Failed to update coalesced stream record:', err);
+          });
+        }
+        if (req.viventiumVoiceLogLatency && typeof req.viventiumVoiceStartAt === 'number') {
+          const elapsedMs = Date.now() - req.viventiumVoiceStartAt;
+          const requestId = req.viventiumVoiceRequestId || 'unknown';
+          const streamId = payload?.streamId || 'unknown';
+          logger.info(
+            `[VoiceLatency] voice_chat_ready_ms=${elapsedMs} request_id=${requestId} stream_id=${streamId}`,
+          );
+        }
+      } catch (e) {
+        // noop
+      }
+      return originalJson(payload);
+    };
+
+    // Handle insight delivery mode (speakInsights=true)
+    // Inject the insight prompt into the request so the agent speaks it naturally
+    // This mirrors v1's ResponseController._speak_proactively() pattern
+    const insightPrompt = req.viventiumInsightPrompt;
+    if (insightPrompt) {
+      // For insight delivery, we use an empty user message and inject the insight as instructions
+      // The agent will respond naturally to the insight prompt
+      req.body.text = '';
+      req.body.viventiumInsightInstructions = insightPrompt;
+      // Prevent recursive cortex activation loops on this synthetic "insight delivery" request.
+      req.body.suppressBackgroundCortices = true;
+      logger.info(
+        '[VIVENTIUM][voice/chat] Injected insight instructions (%d chars)',
+        insightPrompt.length,
+      );
+    }
+
+    return AgentController(req, res, next, initializeClient, addTitle);
+  },
+);
 
 /**
  * SSE subscription endpoint for the voice gateway.
@@ -726,7 +1227,11 @@ router.get('/cortex/:messageId', voiceAuth, async (req, res) => {
   const userId = req.user?.id;
   const messageId = req.params?.messageId;
 
-  if (!session || typeof session.conversationId !== 'string' || session.conversationId.length === 0) {
+  if (
+    !session ||
+    typeof session.conversationId !== 'string' ||
+    session.conversationId.length === 0
+  ) {
     return res.status(400).json({ error: 'Missing call session conversationId' });
   }
   if (typeof userId !== 'string' || userId.length === 0) {
@@ -771,7 +1276,11 @@ router.get('/glasshive/:messageId', voiceAuth, async (req, res) => {
   const userId = req.user?.id;
   const messageId = req.params?.messageId;
 
-  if (!session || typeof session.conversationId !== 'string' || session.conversationId.length === 0) {
+  if (
+    !session ||
+    typeof session.conversationId !== 'string' ||
+    session.conversationId.length === 0
+  ) {
     return res.status(400).json({ error: 'Missing call session conversationId' });
   }
   if (typeof userId !== 'string' || userId.length === 0) {
@@ -788,15 +1297,89 @@ router.get('/glasshive/:messageId', voiceAuth, async (req, res) => {
       conversationId: session.conversationId,
     });
 
-    return res.json(result ?? {
-      messageId,
-      conversationId: session.conversationId,
-      latest: null,
-      callbacks: [],
-    });
+    return res.json(
+      result ?? {
+        messageId,
+        conversationId: session.conversationId,
+        latest: null,
+        callbacks: [],
+      },
+    );
   } catch (err) {
     logger.error('[VIVENTIUM][voice/glasshive] Failed to load GlassHive callback:', err);
     return res.status(500).json({ error: 'Failed to load GlassHive callback' });
+  }
+});
+
+/* === VIVENTIUM START ===
+ * Feature: Voice claim/mark support for durable GlassHive callback delivery.
+ * Purpose:
+ * - Voice may still speak a worker completion while the call is live.
+ * - The claim/mark ledger keeps voice aligned with Telegram duplicate suppression
+ *   and leaves late-after-call callbacks observable instead of silently lost.
+ * Added: 2026-05-06
+ * === VIVENTIUM END === */
+router.post('/glasshive/deliveries/claim', voiceAuth, async (req, res) => {
+  try {
+    const deliveries = await claimPendingGlassHiveCallbackDeliveries({
+      surface: 'voice',
+      limit: 1,
+      leaseMs: req.body?.leaseMs,
+      claimOwner:
+        req.body?.dispatcherId || `voice-${req.viventiumCallSession?.callSessionId || 'gateway'}`,
+      callbackId: req.body?.callbackId || '',
+      userId: req.user?.id || '',
+      voiceCallSessionId: req.viventiumCallSession?.callSessionId || '',
+    });
+    return res.json({ deliveries });
+  } catch (err) {
+    logger.error('[VIVENTIUM][voice/glasshive-delivery] Claim failed:', err);
+    return res.status(500).json({ error: 'Failed to claim GlassHive delivery' });
+  }
+});
+
+router.post('/glasshive/deliveries/:deliveryId/status', voiceAuth, async (req, res) => {
+  const deliveryId = String(req.params?.deliveryId || '').trim();
+  const claimId = String(req.body?.claimId || '').trim();
+  const status = String(req.body?.status || '').trim();
+  if (!deliveryId || !claimId) {
+    return res.status(400).json({ error: 'deliveryId and claimId are required' });
+  }
+  try {
+    let delivery = null;
+    if (status === 'sent') {
+      delivery = await markGlassHiveCallbackDeliverySent({
+        deliveryId,
+        claimId,
+        userId: req.user?.id || '',
+        voiceCallSessionId: req.viventiumCallSession?.callSessionId || '',
+      });
+    } else if (status === 'failed') {
+      delivery = await markGlassHiveCallbackDeliveryFailed({
+        deliveryId,
+        claimId,
+        error: req.body?.error || '',
+        userId: req.user?.id || '',
+        voiceCallSessionId: req.viventiumCallSession?.callSessionId || '',
+      });
+    } else if (status === 'suppressed') {
+      delivery = await markGlassHiveCallbackDeliverySuppressed({
+        deliveryId,
+        claimId,
+        reason: req.body?.reason || '',
+        userId: req.user?.id || '',
+        voiceCallSessionId: req.viventiumCallSession?.callSessionId || '',
+      });
+    } else {
+      return res.status(400).json({ error: 'Unsupported delivery status' });
+    }
+    if (!delivery) {
+      return res.status(409).json({ error: 'delivery_not_claimed' });
+    }
+    return res.json({ delivery });
+  } catch (err) {
+    logger.error('[VIVENTIUM][voice/glasshive-delivery] Status update failed:', err);
+    return res.status(500).json({ error: 'Failed to update GlassHive delivery' });
   }
 });
 

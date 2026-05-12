@@ -31,6 +31,12 @@ const CONNECTED_ACCOUNT_FLOW_MODES = Object.freeze({
   popupCallback: 'popup_callback',
   manualCode: 'manual_code',
 });
+/* === VIVENTIUM START ===
+ * Feature: Configurable connected-account OAuth browser return origin.
+ * Purpose: Keep production public-origin behavior as the default while allowing local/off-network
+ * operator QA to return OAuth completion pages to a localhost browser without mutating DOMAIN_SERVER.
+ * === VIVENTIUM END === */
+const CONNECTED_ACCOUNTS_RETURN_ORIGIN_ENV = 'VIVENTIUM_CONNECTED_ACCOUNTS_RETURN_ORIGIN';
 
 let openAILocalCallbackServerPromise;
 let openAILocalCallbackServerStatus;
@@ -53,8 +59,13 @@ function isConnectedAccountsEnabled() {
 }
 
 function shouldForceOpenAIManualMode() {
+  /* === VIVENTIUM START ===
+   * Purpose: Backend unit tests run under NODE_ENV=CI on GitHub. CI is
+   * non-interactive and must not start the localhost OAuth callback listener.
+   * === VIVENTIUM END === */
   return (
     process.env.NODE_ENV === 'test' ||
+    process.env.NODE_ENV === 'CI' ||
     isEnabled(process.env.VIVENTIUM_OPENAI_LOCAL_CALLBACK_MANUAL_ONLY)
   );
 }
@@ -76,6 +87,15 @@ function getDefaultConnectedAccountsOrigin() {
 }
 
 function getServerOrigin(req) {
+  /* === VIVENTIUM START ===
+   * Feature: Configurable connected-account OAuth browser return origin.
+   * Purpose: Use an explicit browser return override only when configured; otherwise preserve
+   * existing DOMAIN_SERVER/request-host behavior.
+   * === VIVENTIUM END === */
+  const configuredReturnOrigin = process.env[CONNECTED_ACCOUNTS_RETURN_ORIGIN_ENV];
+  if (configuredReturnOrigin && configuredReturnOrigin.trim()) {
+    return configuredReturnOrigin.trim().replace(/\/+$/, '');
+  }
   if (process.env.DOMAIN_SERVER) {
     return process.env.DOMAIN_SERVER.replace(/\/+$/, '');
   }

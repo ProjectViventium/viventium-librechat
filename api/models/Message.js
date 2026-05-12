@@ -17,6 +17,91 @@ const {
 /* === VIVENTIUM END === */
 
 const idSchema = z.string().uuid();
+const TEXT_CONTENT_TYPE = 'text';
+const CORTEX_CONTENT_TYPES = new Set(['cortex_activation', 'cortex_brewing', 'cortex_insight']);
+const PLACEHOLDER_RESPONSE_PATTERNS = [
+  /^(generation in progress|generation interrupted before completion)\.?$/i,
+];
+
+function isPlaceholderAssistantText(text) {
+  const lines = String(text || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length === 0) {
+    return false;
+  }
+  return lines.every((line) => PLACEHOLDER_RESPONSE_PATTERNS.some((pattern) => pattern.test(line)));
+}
+
+function textFromContentParts(content) {
+  if (!Array.isArray(content)) {
+    return '';
+  }
+  return content
+    .filter((part) => part && part.type === TEXT_CONTENT_TYPE)
+    .map((part) => {
+      if (typeof part.text === 'string') {
+        return part.text;
+      }
+      if (typeof part.text?.value === 'string') {
+        return part.text.value;
+      }
+      return '';
+    })
+    .join('')
+    .trim();
+}
+
+function visibleMessageText(message) {
+  const directText = typeof message?.text === 'string' ? message.text.trim() : '';
+  if (directText && !isPlaceholderAssistantText(directText)) {
+    return directText;
+  }
+  const contentText = textFromContentParts(message?.content);
+  return isPlaceholderAssistantText(contentText) ? '' : contentText;
+}
+
+function contentHasCortexPart(content) {
+  return Array.isArray(content) && content.some((part) => CORTEX_CONTENT_TYPES.has(part?.type));
+}
+
+function contentHasTextPart(content) {
+  return Array.isArray(content) && content.some((part) => part?.type === TEXT_CONTENT_TYPE);
+}
+
+function shouldPreserveExistingAssistantText(update) {
+  if (!update || update.isCreatedByUser === true || !Array.isArray(update.content)) {
+    return false;
+  }
+  if (!contentHasCortexPart(update.content) || contentHasTextPart(update.content)) {
+    return false;
+  }
+  const incomingText = typeof update.text === 'string' ? update.text.trim() : '';
+  return incomingText === '' || isPlaceholderAssistantText(incomingText);
+}
+
+function mergeExistingTextIntoCortexOnlyUpdate(update, existing) {
+  if (!shouldPreserveExistingAssistantText(update)) {
+    return update;
+  }
+  const existingText = visibleMessageText(existing);
+  if (!existingText) {
+    return update;
+  }
+  return {
+    ...update,
+    text: existingText,
+    content: [
+      ...update.content,
+      {
+        type: TEXT_CONTENT_TYPE,
+        text: existingText,
+        [TEXT_CONTENT_TYPE]: existingText,
+      },
+    ],
+  };
+}
 
 /**
  * Saves a message in the database.
@@ -61,7 +146,7 @@ async function saveMessage(req, params, metadata) {
   }
 
   try {
-    const update = {
+    let update = {
       ...params,
       user: req.user.id,
       messageId: params.newMessageId || params.messageId,
@@ -86,6 +171,21 @@ async function saveMessage(req, params, metadata) {
       );
       logger.info(`---\`saveMessage\` context: ${metadata?.context}`);
       update.tokenCount = 0;
+    }
+    /* === VIVENTIUM START ===
+     * Feature: Preserve Phase A text when background cortex parts are saved later.
+     *
+     * Why:
+     * Resumable/stream snapshots and final agent saves can touch the same assistant message id.
+     * A later cortex-only write must not erase an already-saved main answer; background cards are
+     * additive and the original Phase A answer remains durable.
+     * === VIVENTIUM END === */
+    if (shouldPreserveExistingAssistantText(update)) {
+      const existing = await Message.findOne({
+        messageId: params.messageId,
+        user: req.user.id,
+      }).lean();
+      update = mergeExistingTextIntoCortexOnlyUpdate(update, existing);
     }
     const options = { upsert: true, new: true };
     /* === VIVENTIUM START ===
@@ -433,7 +533,9 @@ async function getLatestRecallEligibleMessageCreatedAt({ user, scanLimit = 200 }
       error: { $ne: true },
       $or: [{ expiredAt: { $exists: false } }, { expiredAt: null }],
     })
-      .select('messageId parentMessageId conversationId createdAt text content attachments isCreatedByUser')
+      .select(
+        'messageId parentMessageId conversationId createdAt text content attachments isCreatedByUser metadata',
+      )
       .sort({ createdAt: -1 })
       .limit(Math.max(1, scanLimit))
       .lean();
@@ -512,4 +614,10 @@ module.exports = {
   getLatestRecallEligibleMessageCreatedAt,
   getMessage,
   deleteMessages,
+  __testables: {
+    mergeExistingTextIntoCortexOnlyUpdate,
+    shouldPreserveExistingAssistantText,
+    isPlaceholderAssistantText,
+    visibleMessageText,
+  },
 };

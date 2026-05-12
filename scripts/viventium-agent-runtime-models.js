@@ -3,7 +3,7 @@
 const DEFAULT_MODELS = {
   openAI: 'gpt-5.4',
   anthropic: 'claude-sonnet-4-6',
-  xai: 'grok-4-1-fast-non-reasoning',
+  xai: 'grok-4.20-non-reasoning',
   groq: 'meta-llama/llama-4-scout-17b-16e-instruct',
 };
 
@@ -20,6 +20,7 @@ const APPROVED_BACKGROUND_RUNTIME_FAMILIES = new Set([
 
 const APPROVED_BACKGROUND_ACTIVATION_FAMILIES = new Set([
   'groq::meta-llama/llama-4-scout-17b-16e-instruct',
+  'xai::grok-4.20-non-reasoning',
 ]);
 
 /* === VIVENTIUM START ===
@@ -62,7 +63,7 @@ const TOOL_RUNTIME_GATES = Object.freeze([
 const DEFAULT_VOICE_MODELS = {
   openAI: 'gpt-4o-mini',
   anthropic: 'claude-sonnet-4-6',
-  xai: 'grok-4-1-fast-non-reasoning',
+  xai: 'grok-4.20-non-reasoning',
 };
 
 const AGENT_RUNTIME_ENV_BY_ID = {
@@ -137,11 +138,6 @@ const CANONICAL_BUILT_IN_BACKGROUND_MODEL_PARAMETERS = Object.freeze({
     }),
     anthropic: Object.freeze({
       thinkingBudget: 4000,
-    }),
-  }),
-  agent_viventium_parietal_cortex_95aeb3: Object.freeze({
-    openAI: Object.freeze({
-      temperature: 1,
     }),
   }),
   agent_viventium_emotional_resonance_95aeb3: Object.freeze({
@@ -675,6 +671,7 @@ module.exports = {
   APPROVED_MAIN_RUNTIME_FAMILIES,
   APPROVED_BACKGROUND_RUNTIME_FAMILIES,
   APPROVED_BACKGROUND_ACTIVATION_FAMILIES,
+  CANONICAL_BUILT_IN_BACKGROUND_MODEL_PARAMETERS,
   BUILT_IN_BACKGROUND_AGENT_IDS,
   AGENT_RUNTIME_ENV_BY_ID,
   ACTIVATION_RUNTIME_ENV_BY_AGENT_ID,

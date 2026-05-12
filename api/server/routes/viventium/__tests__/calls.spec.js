@@ -38,7 +38,22 @@ jest.mock('~/server/services/viventium/CallSessionService', () => ({
   assertCallSessionSecret: jest.fn(async () => ({
     callSessionId: 'call_session_test',
     roomName: 'lc-calltest',
+    wingModeEnabled: false,
+    shadowModeEnabled: false,
+    listenOnlyModeEnabled: false,
   })),
+  syncCallSessionState: jest.fn(async ({ wingModeEnabled, listenOnlyModeEnabled }) => {
+    const listenOnly = listenOnlyModeEnabled === true;
+    const wing = listenOnly ? false : wingModeEnabled === true;
+    return {
+      callSessionId: 'call_session_test',
+      roomName: 'lc-calltest',
+      expiresAtMs: 123,
+      wingModeEnabled: wing,
+      shadowModeEnabled: wing,
+      listenOnlyModeEnabled: listenOnly,
+    };
+  }),
   getCallSessionVoiceSettings: jest.fn(async () => ({
     callSessionId: 'call_session_test',
     roomName: 'lc-calltest',
@@ -313,5 +328,31 @@ describe('/api/viventium/calls', () => {
       effective: { provider: 'anthropic', model: 'claude-opus-4-7' },
       inheritsPrimary: true,
     });
+  });
+
+  test('POST state can enable Listen-Only Mode and clears Wing Mode', async () => {
+    const callsRouter = require('../calls');
+    const { syncCallSessionState } = require('~/server/services/viventium/CallSessionService');
+
+    const app = express();
+    app.use(express.json());
+    app.use('/api/viventium/calls', callsRouter);
+
+    const res = await request(app)
+      .post('/api/viventium/calls/call_session_test/state')
+      .set('x-viventium-call-secret', 'secret')
+      .send({ wingModeEnabled: true, listenOnlyModeEnabled: true })
+      .expect(200);
+
+    expect(syncCallSessionState).toHaveBeenCalledWith(
+      expect.objectContaining({
+        callSessionId: 'call_session_test',
+        wingModeEnabled: true,
+        listenOnlyModeEnabled: true,
+      }),
+    );
+    expect(res.body.listenOnlyModeEnabled).toBe(true);
+    expect(res.body.wingModeEnabled).toBe(false);
+    expect(res.body.shadowModeEnabled).toBe(false);
   });
 });

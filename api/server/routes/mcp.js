@@ -29,7 +29,7 @@ const {
 } = require('~/config');
 const { getMCPSetupData, getServerConnectionStatus } = require('~/server/services/MCP');
 const { requireJwtAuth, canAccessMCPServerResource } = require('~/server/middleware');
-const { findToken, updateToken, createToken, deleteTokens } = require('~/models');
+const { findToken, updateToken, createToken, deleteToken, deleteTokens } = require('~/models');
 const { getUserPluginAuthValue } = require('~/server/services/PluginService');
 const { updateMCPServerTools } = require('~/server/services/Config/mcp');
 const { reinitMCPServer } = require('~/server/services/Tools/mcp');
@@ -209,7 +209,7 @@ async function warmPersistentUserMCPConnections(user, mcpConfig, oauthServers) {
   }
 
   const flowManager = getFlowStateManager(getLogStores(CacheKeys.FLOWS));
-  const tokenMethods = { findToken, updateToken, createToken, deleteTokens };
+  const tokenMethods = { findToken, updateToken, createToken, deleteToken, deleteTokens };
 
   for (const serverName of persistentServers) {
     const warmupKey = getPersistentWarmupKey(user.id, serverName);
@@ -638,6 +638,7 @@ router.get('/:serverName/oauth/callback', async (req, res) => {
             findToken,
             updateToken,
             createToken,
+            deleteToken,
             deleteTokens,
           },
         });

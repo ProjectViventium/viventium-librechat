@@ -256,6 +256,7 @@ export class MCPConnectionFactory {
             findToken: this.tokenMethods!.findToken!,
             createToken: this.tokenMethods!.createToken,
             updateToken: this.tokenMethods!.updateToken,
+            deleteToken: this.tokenMethods!.deleteToken,
             refreshTokens: this.createRefreshTokensFunction(),
           });
         },
@@ -324,6 +325,7 @@ export class MCPConnectionFactory {
             findToken: this.tokenMethods.findToken,
             createToken: this.tokenMethods.createToken,
             updateToken: this.tokenMethods.updateToken,
+            deleteToken: this.tokenMethods.deleteToken,
             refreshTokens: this.createRefreshTokensFunction(),
             forceRefresh: true,
           });

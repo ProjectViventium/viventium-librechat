@@ -96,12 +96,18 @@ export class MCPServersInitializer {
   // Logs server configuration summary after initialization
   private static logParsedConfig(serverName: string, config: t.ParsedServerConfig): void {
     const prefix = MCPServersInitializer.prefix(serverName);
+    const serverInstructionsSummary =
+      config.serverInstructions === true
+        ? 'enabled; server-provided instructions will be fetched lazily'
+        : config.serverInstructions === 'true'
+          ? 'enabled; server-provided instructions will be fetched lazily'
+          : config.serverInstructions;
     logger.info(`${prefix} -------------------------------------------------┐`);
     logger.info(`${prefix} URL: ${config.url ? sanitizeUrlForLogging(config.url) : 'N/A'}`);
     logger.info(`${prefix} OAuth Required: ${config.requiresOAuth}`);
     logger.info(`${prefix} Capabilities: ${config.capabilities}`);
     logger.info(`${prefix} Tools: ${config.tools}`);
-    logger.info(`${prefix} Server Instructions: ${config.serverInstructions}`);
+    logger.info(`${prefix} Server Instructions: ${serverInstructionsSummary}`);
     logger.info(`${prefix} Initialized in: ${config.initDuration ?? 'N/A'}ms`);
     logger.info(`${prefix} -------------------------------------------------┘`);
   }

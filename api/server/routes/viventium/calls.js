@@ -246,6 +246,7 @@ router.get('/:callSessionId/state', dispatchAuth, async (req, res) => {
     expiresAtMs: session.expiresAtMs || null,
     wingModeEnabled: session.wingModeEnabled === true,
     shadowModeEnabled: session.shadowModeEnabled === true,
+    listenOnlyModeEnabled: session.listenOnlyModeEnabled === true,
   });
 });
 
@@ -259,6 +260,8 @@ router.post('/:callSessionId/state', dispatchAuth, async (req, res) => {
       wingModeEnabled: typeof body.wingModeEnabled === 'boolean' ? body.wingModeEnabled : undefined,
       shadowModeEnabled:
         typeof body.shadowModeEnabled === 'boolean' ? body.shadowModeEnabled : undefined,
+      listenOnlyModeEnabled:
+        typeof body.listenOnlyModeEnabled === 'boolean' ? body.listenOnlyModeEnabled : undefined,
     });
 
     if (!updated) {
@@ -271,6 +274,7 @@ router.post('/:callSessionId/state', dispatchAuth, async (req, res) => {
       expiresAtMs: updated.expiresAtMs || null,
       wingModeEnabled: updated.wingModeEnabled === true,
       shadowModeEnabled: updated.shadowModeEnabled === true,
+      listenOnlyModeEnabled: updated.listenOnlyModeEnabled === true,
     });
   } catch (err) {
     const status = err?.status || 500;

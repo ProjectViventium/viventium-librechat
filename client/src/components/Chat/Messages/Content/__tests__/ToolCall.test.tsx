@@ -240,7 +240,7 @@ describe('ToolCall', () => {
       expect(props.pendingAuth).toBe(false);
     });
 
-    it('renders GlassHive worker MCP calls with user-facing wording', () => {
+    it('renders GlassHive MCP calls with specific user-facing wording', () => {
       const name = `worker_delegate_once${Constants.mcp_delimiter}glasshive-workers-projects`;
 
       renderWithRecoil(
@@ -253,7 +253,7 @@ describe('ToolCall', () => {
         />,
       );
 
-      expect(screen.getByText('Completed GlassHive worker')).toBeInTheDocument();
+      expect(screen.getByText('Completed GlassHive delegate')).toBeInTheDocument();
       expect(screen.queryByText('Completed worker_delegate_once')).not.toBeInTheDocument();
     });
 
@@ -263,7 +263,7 @@ describe('ToolCall', () => {
       renderWithRecoil(<ToolCall {...mockProps} name={name} output={null} />);
 
       expect(screen.getByText('Completed worker_delegate_once')).toBeInTheDocument();
-      expect(screen.queryByText('Completed GlassHive worker')).not.toBeInTheDocument();
+      expect(screen.queryByText('Completed GlassHive delegate')).not.toBeInTheDocument();
     });
   });
 

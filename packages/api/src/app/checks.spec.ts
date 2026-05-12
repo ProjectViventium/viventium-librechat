@@ -129,7 +129,7 @@ describe('checkWebSearchConfig', () => {
         ),
       );
       expect(logger.warn).toHaveBeenCalledWith(
-        expect.stringContaining('Current value: "sk-1234567..."'),
+        expect.stringContaining('Current value: "example-se..."'),
       );
       expect(logger.debug).not.toHaveBeenCalled();
     });

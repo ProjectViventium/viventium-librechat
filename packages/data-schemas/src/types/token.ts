@@ -23,6 +23,7 @@ export interface TokenCreateData {
 
 export interface TokenQuery {
   userId?: Types.ObjectId | string;
+  type?: string;
   token?: string;
   email?: string;
   identifier?: string;

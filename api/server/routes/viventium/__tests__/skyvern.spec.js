@@ -11,18 +11,14 @@ let mockUpdateUserKey;
 let mockFindOne;
 let mockLoggerError;
 
-jest.mock(
-  '@librechat/data-schemas',
-  () => ({
-    logger: {
-      error: (...args) => mockLoggerError(...args),
-      warn: jest.fn(),
-      info: jest.fn(),
-      debug: jest.fn(),
-    },
-  }),
-  { virtual: true },
-);
+jest.mock('@librechat/data-schemas', () => ({
+  logger: {
+    error: (...args) => mockLoggerError(...args),
+    warn: jest.fn(),
+    info: jest.fn(),
+    debug: jest.fn(),
+  },
+}));
 
 jest.mock('librechat-data-provider', () => ({
   EModelEndpoint: {

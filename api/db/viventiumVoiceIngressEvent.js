@@ -39,6 +39,7 @@ module.exports = function createViventiumVoiceIngressEvent(db) {
       segments: { type: [segmentSchema], default: [] },
       streamId: { type: String, default: '' },
       launchedAt: { type: Date, default: null },
+      savedAt: { type: Date, default: null },
       expiresAt: { type: Date, required: true, index: { expireAfterSeconds: 0 } },
     },
     { timestamps: true },

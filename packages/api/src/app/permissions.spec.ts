@@ -818,6 +818,14 @@ describe('updateInterfacePermissions - permissions', () => {
 
     // Should be called with all permissions EXCEPT prompts and agents (which already exist)
     const expectedPermissionsForUser = {
+      [PermissionTypes.PROMPTS]: {
+        [Permissions.SHARE]: false,
+        [Permissions.SHARE_PUBLIC]: false,
+      },
+      [PermissionTypes.AGENTS]: {
+        [Permissions.SHARE]: false,
+        [Permissions.SHARE_PUBLIC]: false,
+      },
       [PermissionTypes.BOOKMARKS]: { [Permissions.USE]: true },
       [PermissionTypes.MEMORIES]: {
         [Permissions.USE]: true,
@@ -853,6 +861,14 @@ describe('updateInterfacePermissions - permissions', () => {
     };
 
     const expectedPermissionsForAdmin = {
+      [PermissionTypes.PROMPTS]: {
+        [Permissions.SHARE]: true,
+        [Permissions.SHARE_PUBLIC]: true,
+      },
+      [PermissionTypes.AGENTS]: {
+        [Permissions.SHARE]: true,
+        [Permissions.SHARE_PUBLIC]: true,
+      },
       [PermissionTypes.BOOKMARKS]: { [Permissions.USE]: true },
       [PermissionTypes.MEMORIES]: {
         [Permissions.USE]: true,
@@ -962,8 +978,13 @@ describe('updateInterfacePermissions - permissions', () => {
     const expectedPermissionsForUser = {
       [PermissionTypes.PROMPTS]: {
         [Permissions.USE]: true,
-        // CREATE/SHARE/SHARE_PUBLIC not included since prompts: true is boolean and PROMPTS already exists
+        [Permissions.SHARE]: false,
+        [Permissions.SHARE_PUBLIC]: false,
       }, // Explicitly configured
+      [PermissionTypes.AGENTS]: {
+        [Permissions.SHARE]: false,
+        [Permissions.SHARE_PUBLIC]: false,
+      },
       // All other permissions that don't exist in the database
       [PermissionTypes.MEMORIES]: {
         [Permissions.USE]: true,
@@ -1001,8 +1022,13 @@ describe('updateInterfacePermissions - permissions', () => {
     const expectedPermissionsForAdmin = {
       [PermissionTypes.PROMPTS]: {
         [Permissions.USE]: true,
-        // CREATE/SHARE/SHARE_PUBLIC not included since prompts: true is boolean and PROMPTS already exists
+        [Permissions.SHARE]: true,
+        [Permissions.SHARE_PUBLIC]: true,
       }, // Explicitly configured
+      [PermissionTypes.AGENTS]: {
+        [Permissions.SHARE]: true,
+        [Permissions.SHARE_PUBLIC]: true,
+      },
       // All other permissions that don't exist in the database
       [PermissionTypes.MEMORIES]: {
         [Permissions.USE]: true,
@@ -1387,8 +1413,11 @@ describe('updateInterfacePermissions - permissions', () => {
       (call) => call[0] === SystemRoles.USER,
     );
 
-    // Should only have permissions for things that don't exist in the role
-    expect(userCall[1]).not.toHaveProperty(PermissionTypes.PROMPTS);
+    // Existing share-capable permissions get missing SHARE fields backfilled.
+    expect(userCall[1][PermissionTypes.PROMPTS]).toEqual({
+      [Permissions.SHARE]: false,
+      [Permissions.SHARE_PUBLIC]: false,
+    });
     expect(userCall[1]).not.toHaveProperty(PermissionTypes.BOOKMARKS);
     expect(userCall[1]).not.toHaveProperty(PermissionTypes.MEMORIES);
     expect(userCall[1]).not.toHaveProperty(PermissionTypes.PEOPLE_PICKER);
@@ -1455,10 +1484,11 @@ describe('updateInterfacePermissions - permissions', () => {
       (call) => call[0] === SystemRoles.USER,
     );
 
-    // Explicitly configured permissions should be updated
-    // CREATE/SHARE/SHARE_PUBLIC not included since prompts: true is boolean and PROMPTS already exists
+    // Explicitly configured permissions should be updated; missing share fields are backfilled.
     expect(userCall[1][PermissionTypes.PROMPTS]).toEqual({
       [Permissions.USE]: true,
+      [Permissions.SHARE]: false,
+      [Permissions.SHARE_PUBLIC]: false,
     });
     expect(userCall[1][PermissionTypes.BOOKMARKS]).toEqual({ [Permissions.USE]: true });
     expect(userCall[1][PermissionTypes.MARKETPLACE]).toEqual({ [Permissions.USE]: true });
@@ -1779,9 +1809,11 @@ describe('updateInterfacePermissions - permissions', () => {
     );
     // Memory permissions should be updated even though they already exist
     expect(userCall[1][PermissionTypes.MEMORIES]).toEqual(expectedMemoryPermissions);
-    // Prompts should be updated (explicitly configured) - CREATE/SHARE/SHARE_PUBLIC not included since prompts: true is boolean and PROMPTS already exists
+    // Prompts should be updated; missing share fields are backfilled.
     expect(userCall[1][PermissionTypes.PROMPTS]).toEqual({
       [Permissions.USE]: true,
+      [Permissions.SHARE]: false,
+      [Permissions.SHARE_PUBLIC]: false,
     });
     // Bookmarks should be updated (explicitly configured)
     expect(userCall[1][PermissionTypes.BOOKMARKS]).toEqual({ [Permissions.USE]: true });
@@ -1792,9 +1824,11 @@ describe('updateInterfacePermissions - permissions', () => {
     );
     // Memory permissions should be updated even though they already exist
     expect(adminCall[1][PermissionTypes.MEMORIES]).toEqual(expectedMemoryPermissions);
-    // CREATE/SHARE/SHARE_PUBLIC not included since prompts: true is boolean and PROMPTS already exists
+    // Missing share fields are backfilled.
     expect(adminCall[1][PermissionTypes.PROMPTS]).toEqual({
       [Permissions.USE]: true,
+      [Permissions.SHARE]: true,
+      [Permissions.SHARE_PUBLIC]: true,
     });
     expect(adminCall[1][PermissionTypes.BOOKMARKS]).toEqual({ [Permissions.USE]: true });
 

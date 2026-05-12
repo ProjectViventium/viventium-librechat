@@ -3,7 +3,7 @@ import { getOpenAIConfig } from './config';
 describe('getOpenAIConfig - Anthropic Compatibility', () => {
   describe('Anthropic via LiteLLM', () => {
     it('should handle basic Anthropic configuration with defaultParamsEndpoint', () => {
-      const apiKey = 'sk-xxxx';
+      const apiKey = 'test-key-basic';
       const endpoint = 'Anthropic (via LiteLLM)';
       const options = {
         modelOptions: {
@@ -27,7 +27,8 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
 
       expect(result).toEqual({
         llmConfig: {
-          apiKey: 'sk-xxxx',
+          apiKey: 'test-key-basic',
+          maxRetries: 0,
           model: 'claude-sonnet-4',
           stream: true,
           maxTokens: 64000,
@@ -53,7 +54,7 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
     });
 
     it('should handle Claude 3.7 model with thinking enabled', () => {
-      const apiKey = 'sk-yyyy';
+      const apiKey = 'test-key-thinking';
       const endpoint = 'Anthropic (via LiteLLM)';
       const options = {
         modelOptions: {
@@ -75,7 +76,8 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
 
       expect(result).toEqual({
         llmConfig: {
-          apiKey: 'sk-yyyy',
+          apiKey: 'test-key-thinking',
+          maxRetries: 0,
           model: 'claude-3.7-sonnet-20241022',
           stream: true,
           maxTokens: 8192,
@@ -101,7 +103,7 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
     });
 
     it('should handle Claude 3.7 model with thinking disabled (topP and topK included)', () => {
-      const apiKey = 'sk-yyyy';
+      const apiKey = 'test-key-thinking';
       const endpoint = 'Anthropic (via LiteLLM)';
       const options = {
         modelOptions: {
@@ -124,7 +126,8 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
 
       expect(result).toEqual({
         llmConfig: {
-          apiKey: 'sk-yyyy',
+          apiKey: 'test-key-thinking',
+          maxRetries: 0,
           model: 'claude-3.7-sonnet-20241022',
           stream: true,
           temperature: 0.7,
@@ -171,6 +174,7 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
       expect(result).toEqual({
         llmConfig: {
           apiKey: 'anthropic-test-key-sonnet46',
+          maxRetries: 0,
           model: 'claude-sonnet-4-6',
           stream: true,
           maxTokens: 64000,
@@ -192,7 +196,7 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
     });
 
     it('should handle Claude 3.5 sonnet with special headers', () => {
-      const apiKey = 'sk-zzzz';
+      const apiKey = 'test-key-legacy';
       const endpoint = 'Anthropic (via LiteLLM)';
       const options = {
         modelOptions: {
@@ -212,7 +216,8 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
 
       expect(result).toEqual({
         llmConfig: {
-          apiKey: 'sk-zzzz',
+          apiKey: 'test-key-legacy',
+          maxRetries: 0,
           model: 'claude-3.5-sonnet-20240620',
           stream: true,
           maxTokens: 4096,
@@ -234,7 +239,7 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
     });
 
     it('should apply custom headers and promptCache for models that support caching', () => {
-      const apiKey = 'sk-custom';
+      const apiKey = 'test-key-custom';
       const endpoint = 'Anthropic (via LiteLLM)';
       const options = {
         modelOptions: {
@@ -256,7 +261,8 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
 
       expect(result).toEqual({
         llmConfig: {
-          apiKey: 'sk-custom',
+          apiKey: 'test-key-custom',
+          maxRetries: 0,
           model: 'claude-3-sonnet',
           stream: true,
           maxTokens: 8192,
@@ -279,7 +285,7 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
     });
 
     it('should handle models that do not match Claude patterns', () => {
-      const apiKey = 'sk-other';
+      const apiKey = 'test-key-other';
       const endpoint = 'Anthropic (via LiteLLM)';
       const options = {
         modelOptions: {
@@ -299,7 +305,8 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
 
       expect(result).toEqual({
         llmConfig: {
-          apiKey: 'sk-other',
+          apiKey: 'test-key-other',
+          maxRetries: 0,
           model: 'gpt-4-turbo',
           stream: true,
           temperature: 0.8,
@@ -318,7 +325,7 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
     });
 
     it('should handle dropParams correctly in Anthropic path', () => {
-      const apiKey = 'sk-drop';
+      const apiKey = 'test-key-drop';
       const endpoint = 'Anthropic (via LiteLLM)';
       const options = {
         modelOptions: {
@@ -342,7 +349,8 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
 
       expect(result).toEqual({
         llmConfig: {
-          apiKey: 'sk-drop',
+          apiKey: 'test-key-drop',
+          maxRetries: 0,
           model: 'claude-3-opus-20240229',
           stream: true,
           topP: 0.9,
@@ -362,7 +370,7 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
     });
 
     it('should handle empty user string', () => {
-      const apiKey = 'sk-edge';
+      const apiKey = 'test-key-edge';
       const endpoint = 'Anthropic (via LiteLLM)';
       const options = {
         modelOptions: {
@@ -382,7 +390,8 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
 
       expect(result).toEqual({
         llmConfig: {
-          apiKey: 'sk-edge',
+          apiKey: 'test-key-edge',
+          maxRetries: 0,
           model: 'claude-2.1',
           stream: true,
           temperature: 0,
@@ -401,7 +410,7 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
     });
 
     it('should handle web_search tool', () => {
-      const apiKey = 'sk-search';
+      const apiKey = 'test-key-search';
       const endpoint = 'Anthropic (via LiteLLM)';
       const options = {
         modelOptions: {
@@ -421,7 +430,8 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
 
       expect(result).toEqual({
         llmConfig: {
-          apiKey: 'sk-search',
+          apiKey: 'test-key-search',
+          maxRetries: 0,
           model: 'claude-3-opus-20240229',
           stream: true,
           maxTokens: 8192,
@@ -445,7 +455,7 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
     });
 
     it('should properly transform Anthropic config with invocationKwargs', () => {
-      const apiKey = 'sk-test';
+      const apiKey = 'test-key-transform';
       const endpoint = 'Anthropic (via LiteLLM)';
       const options = {
         modelOptions: {
@@ -466,7 +476,8 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
 
       expect(result).toEqual({
         llmConfig: {
-          apiKey: 'sk-test',
+          apiKey: 'test-key-transform',
+          maxRetries: 0,
           model: 'claude-3.5-haiku-20241022',
           stream: true,
           topP: 0.9,
@@ -487,7 +498,7 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
     });
 
     it('should handle addParams with Anthropic defaults', () => {
-      const apiKey = 'sk-add';
+      const apiKey = 'test-key-add';
       const endpoint = 'Anthropic (via LiteLLM)';
       const options = {
         modelOptions: {
@@ -512,7 +523,8 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
 
       expect(result).toEqual({
         llmConfig: {
-          apiKey: 'sk-add',
+          apiKey: 'test-key-add',
+          maxRetries: 0,
           model: 'claude-3-opus-20240229',
           stream: true,
           temperature: 0.7,
@@ -535,7 +547,7 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
     });
 
     it('should handle both addParams and dropParams together', () => {
-      const apiKey = 'sk-both';
+      const apiKey = 'test-key-both';
       const endpoint = 'Anthropic (via LiteLLM)';
       const options = {
         modelOptions: {
@@ -562,7 +574,7 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
 
       expect(result).toEqual({
         llmConfig: {
-          apiKey: 'sk-both',
+          apiKey: 'test-key-both',
           model: 'claude-3.5-sonnet-20240620',
           stream: true,
           topP: 0.9,
@@ -590,7 +602,7 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
 
   describe('Web Search Support via addParams', () => {
     it('should enable web_search tool when web_search: true in addParams', () => {
-      const apiKey = 'sk-web-search';
+      const apiKey = 'test-key-web-search';
       const endpoint = 'Anthropic (Custom)';
       const options = {
         modelOptions: {
@@ -620,7 +632,7 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
     });
 
     it('should disable web_search tool when web_search: false in addParams', () => {
-      const apiKey = 'sk-no-search';
+      const apiKey = 'test-key-no-search';
       const endpoint = 'Anthropic (Custom)';
       const options = {
         modelOptions: {
@@ -641,7 +653,7 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
     });
 
     it('should disable web_search when in dropParams', () => {
-      const apiKey = 'sk-drop-search';
+      const apiKey = 'test-key-drop-search';
       const endpoint = 'Anthropic (Custom)';
       const options = {
         modelOptions: {
@@ -660,7 +672,7 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
     });
 
     it('should handle web_search with mixed Anthropic and OpenAI params in addParams', () => {
-      const apiKey = 'sk-mixed';
+      const apiKey = 'test-key-mixed';
       const endpoint = 'Anthropic (Custom)';
       const options = {
         modelOptions: {
@@ -695,7 +707,7 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
     });
 
     it('should handle Anthropic native params in addParams without web_search', () => {
-      const apiKey = 'sk-native';
+      const apiKey = 'test-key-native';
       const endpoint = 'Anthropic (Custom)';
       const options = {
         modelOptions: {
@@ -724,7 +736,7 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
 
     describe('defaultParams Support via customParams', () => {
       it('should apply defaultParams when fields are undefined', () => {
-        const apiKey = 'sk-defaults';
+        const apiKey = 'test-key-defaults';
         const result = getOpenAIConfig(apiKey, {
           modelOptions: {
             model: 'claude-3-5-sonnet-20241022',
@@ -746,7 +758,7 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
       });
 
       it('should not override existing modelOptions with defaultParams', () => {
-        const apiKey = 'sk-override';
+        const apiKey = 'test-key-override';
         const result = getOpenAIConfig(apiKey, {
           modelOptions: {
             model: 'claude-3-5-sonnet-20241022',
@@ -767,7 +779,7 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
       });
 
       it('should allow addParams to override defaultParams', () => {
-        const apiKey = 'sk-add-override';
+        const apiKey = 'test-key-add-override';
         const result = getOpenAIConfig(apiKey, {
           modelOptions: {
             model: 'claude-3-opus-20240229',
@@ -791,7 +803,7 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
       });
 
       it('should handle defaultParams with web_search', () => {
-        const apiKey = 'sk-web-default';
+        const apiKey = 'test-key-web-default';
         const result = getOpenAIConfig(apiKey, {
           modelOptions: {
             model: 'claude-3-5-sonnet-latest',
@@ -812,7 +824,7 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
       });
 
       it('should allow addParams to override defaultParams web_search', () => {
-        const apiKey = 'sk-web-override';
+        const apiKey = 'test-key-web-override';
         const result = getOpenAIConfig(apiKey, {
           modelOptions: {
             model: 'claude-3-opus-20240229',
@@ -831,7 +843,7 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
       });
 
       it('should handle dropParams overriding defaultParams', () => {
-        const apiKey = 'sk-drop';
+        const apiKey = 'test-key-drop';
         const result = getOpenAIConfig(apiKey, {
           modelOptions: {
             model: 'claude-3-opus-20240229',
@@ -854,7 +866,7 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
       });
 
       it('should preserve order: defaultParams < addParams < modelOptions', () => {
-        const apiKey = 'sk-precedence';
+        const apiKey = 'test-key-precedence';
         const result = getOpenAIConfig(apiKey, {
           modelOptions: {
             model: 'claude-3-5-sonnet-20241022',
@@ -903,7 +915,7 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
       });
 
       it('should handle empty paramDefinitions', () => {
-        const apiKey = 'sk-empty';
+        const apiKey = 'anthropic-empty-param-test-key';
         const result = getOpenAIConfig(apiKey, {
           modelOptions: {
             model: 'claude-3-opus-20240229',
@@ -920,7 +932,7 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
       });
 
       it('should handle missing paramDefinitions', () => {
-        const apiKey = 'sk-missing';
+        const apiKey = 'anthropic-missing-param-test-key';
         const result = getOpenAIConfig(apiKey, {
           modelOptions: {
             model: 'claude-3-opus-20240229',
@@ -936,7 +948,7 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
       });
 
       it('should handle mixed Anthropic params in defaultParams', () => {
-        const apiKey = 'sk-mixed';
+        const apiKey = 'test-key-mixed';
         const result = getOpenAIConfig(apiKey, {
           modelOptions: {
             model: 'claude-3-5-sonnet-20241022',

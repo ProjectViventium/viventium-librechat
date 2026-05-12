@@ -10,10 +10,16 @@ const { logger } = require('@librechat/data-schemas');
 /* === VIVENTIUM NOTE ===
  * Feature: Enable token counting for background cortex context pruning.
  * === VIVENTIUM NOTE === */
-const { Run, Providers, createContentAggregator, getTokenCountForMessage } = require('@librechat/agents');
+const {
+  Run,
+  Providers,
+  createContentAggregator,
+  getTokenCountForMessage,
+} = require('@librechat/agents');
 const {
   initializeAgent,
   initializeAnthropic,
+  initializeOpenAI,
   createRun,
   Tokenizer,
   memoryInstructions,
@@ -27,12 +33,16 @@ const {
   Constants,
   EModelEndpoint,
   Tools,
+  ContentTypes,
   PermissionTypes,
   Permissions,
   supportsAdaptiveThinking,
 } = require('librechat-data-provider');
 const { loadAgentTools, loadToolsForExecution } = require('~/server/services/ToolService');
-const { createToolEndCallback, getDefaultHandlers } = require('~/server/controllers/agents/callbacks');
+const {
+  createToolEndCallback,
+  getDefaultHandlers,
+} = require('~/server/controllers/agents/callbacks');
 const { getConvoFiles } = require('~/models/Conversation');
 const { getMCPManager } = require('~/config');
 const db = require('~/models');
@@ -61,6 +71,28 @@ const {
   resolveProductivitySpecialistScope,
   shouldIsolateProductivitySpecialistContext,
 } = require('~/server/services/viventium/productivitySpecialistContext');
+const {
+  resolveFallbackAssignment,
+  isFallbackModelValid,
+  buildFallbackAgent,
+  isSameAgentRoute,
+  shouldRetryBackgroundCortexWithFallback,
+  isNonRetryableFallbackErrorClass,
+} = require('~/server/services/viventium/agentLlmFallback');
+const {
+  isOpenAIReasoningModelWithoutSampling,
+  sanitizeOpenAIReasoningSamplingParams,
+} = require('~/server/services/viventium/openAIReasoningParams');
+/* === VIVENTIUM START ===
+ * Feature: Prompt-frame telemetry (metadata-only prompt architecture observability).
+ * === VIVENTIUM END === */
+const {
+  buildPromptFrame,
+  hashString,
+  logPromptFrame,
+} = require('~/server/services/viventium/promptFrameTelemetry');
+
+const NO_PARENT_MESSAGE_ID = '00000000-0000-0000-0000-000000000000';
 
 /* === VIVENTIUM NOTE ===
  * Feature: No Response Tag ({NTA}) prompt injection + suppression for background cortices.
@@ -77,9 +109,196 @@ const { isNoResponseOnly } = require('~/server/services/viventium/noResponseTag'
 
 // In-memory cooldown tracker to avoid rapid re-activation spam per user+agent.
 const activationCooldowns = new Map();
+const activationProviderHealth = new Map();
+const DEFAULT_ACTIVATION_PROVIDER_HEALTH_TTL_MS = 60 * 1000;
+const MAX_ACTIVATION_PROVIDER_HEALTH_TTL_MS = 5 * 60 * 1000;
+const ACTIVATION_PROVIDER_USER_SCOPED_ERROR_CLASSES = new Set([
+  'provider_unauthorized',
+  'provider_access_denied',
+  'provider_rate_limited',
+  'provider_quota_or_billing',
+]);
+const ACTIVATION_SUPPRESSION_PROBEABLE_ERROR_CLASSES = new Set(['provider_unauthorized']);
+const PUBLIC_CORTEX_ERROR_MESSAGES = {
+  activation_provider_unavailable:
+    'This background agent could not start because every configured activation provider was unavailable.',
+  no_live_tool_execution: 'This background agent could not verify live tool evidence for this run.',
+  timeout: 'This background agent timed out before returning a result.',
+  cortex_agent_not_found: 'This background agent is not available in the current configuration.',
+  recoverable_provider_error:
+    'This background agent hit a recoverable provider issue before returning a result.',
+  background_agent_error:
+    'This background agent hit a runtime issue before it could return a result.',
+};
 
 function clearActivationCooldowns() {
   activationCooldowns.clear();
+}
+
+function clearActivationProviderHealth() {
+  activationProviderHealth.clear();
+}
+
+function getActivationProviderHealthTtlMs() {
+  const raw = process.env.VIVENTIUM_ACTIVATION_PROVIDER_HEALTH_TTL_MS;
+  if (raw == null || raw === '') {
+    return DEFAULT_ACTIVATION_PROVIDER_HEALTH_TTL_MS;
+  }
+  const value = parseInt(raw, 10);
+  if (!Number.isFinite(value) || value < 0) {
+    return DEFAULT_ACTIVATION_PROVIDER_HEALTH_TTL_MS;
+  }
+  return Math.min(value, MAX_ACTIVATION_PROVIDER_HEALTH_TTL_MS);
+}
+
+function normalizeActivationProviderHealthScope(value) {
+  const scope = String(value || '').trim();
+  return scope || 'global';
+}
+
+function buildActivationProviderHealthScope({ req, errorSummary } = {}) {
+  const errorClass = String(errorSummary?.class || '');
+  const userId = String(req?.user?.id || req?.user?._id || '').trim();
+  if (userId && ACTIVATION_PROVIDER_USER_SCOPED_ERROR_CLASSES.has(errorClass)) {
+    return `user:${userId}`;
+  }
+  return 'global';
+}
+
+function buildActivationProviderHealthKey({ provider, model, scope } = {}) {
+  const normalizedProvider = String(provider || '')
+    .trim()
+    .toLowerCase();
+  const normalizedModel = String(model || '').trim();
+  const normalizedScope = normalizeActivationProviderHealthScope(scope);
+  return `${normalizedScope}::${normalizedProvider}::${normalizedModel}`;
+}
+
+function shouldSuppressActivationProvider(errorSummary = {}) {
+  return new Set([
+    'provider_unauthorized',
+    'provider_access_denied',
+    'provider_rate_limited',
+    'provider_quota_or_billing',
+    'provider_network',
+    'provider_server_error',
+  ]).has(errorSummary.class);
+}
+
+function markActivationProviderUnhealthy({ provider, model, errorSummary, req, scope } = {}) {
+  const ttlMs = getActivationProviderHealthTtlMs();
+  if (ttlMs <= 0 || !shouldSuppressActivationProvider(errorSummary)) {
+    return false;
+  }
+
+  const scopeKey = normalizeActivationProviderHealthScope(
+    scope || buildActivationProviderHealthScope({ req, errorSummary }),
+  );
+  const key = buildActivationProviderHealthKey({ provider, model, scope: scopeKey });
+  if (!key || key.endsWith('::::')) {
+    return false;
+  }
+
+  activationProviderHealth.set(key, {
+    until: Date.now() + ttlMs,
+    scope: scopeKey,
+    provider: String(provider || '')
+      .trim()
+      .toLowerCase(),
+    model: String(model || '').trim(),
+    error: sanitizeActivationErrorForLog(errorSummary),
+  });
+  return true;
+}
+
+function getActivationProviderSuppression({ provider, model, req } = {}) {
+  const userId = String(req?.user?.id || req?.user?._id || '').trim();
+  const scopes = userId ? [`user:${userId}`, 'global'] : ['global'];
+
+  for (const scope of scopes) {
+    const key = buildActivationProviderHealthKey({ provider, model, scope });
+    const entry = activationProviderHealth.get(key);
+    if (!entry) {
+      continue;
+    }
+
+    if (!Number.isFinite(entry.until) || entry.until <= Date.now()) {
+      activationProviderHealth.delete(key);
+      continue;
+    }
+
+    return entry;
+  }
+
+  return null;
+}
+
+function shouldProbeSuppressedActivationAttempt({
+  providerSuppression,
+  attempts,
+  allAttemptsSuppressed,
+  probeAlreadyUsed,
+} = {}) {
+  if (
+    probeAlreadyUsed ||
+    !providerSuppression ||
+    !Array.isArray(attempts) ||
+    attempts.length === 0
+  ) {
+    return false;
+  }
+  if (allAttemptsSuppressed !== true) {
+    return false;
+  }
+
+  const errorClass = String(providerSuppression?.error?.class || '');
+  if (!ACTIVATION_SUPPRESSION_PROBEABLE_ERROR_CLASSES.has(errorClass)) {
+    return false;
+  }
+
+  return true;
+}
+
+function shouldAttemptSuppressedActivationProvider({ attempt, providerSuppression } = {}) {
+  if (!providerSuppression) {
+    return true;
+  }
+  return (
+    String(attempt?.source || '')
+      .trim()
+      .toLowerCase() === 'primary'
+  );
+}
+
+function normalizeCooldownKeyPart(value) {
+  const text = String(value || '').trim();
+  if (!text || text === 'new' || text === NO_PARENT_MESSAGE_ID) {
+    return '';
+  }
+  return text;
+}
+
+function buildActivationCooldownKey({ agentId, req, runId } = {}) {
+  const userId = normalizeCooldownKeyPart(req?.user?.id || req?.user?._id);
+  const conversationId = normalizeCooldownKeyPart(req?.body?.conversationId);
+  const messageId = normalizeCooldownKeyPart(
+    req?.body?.messageId ||
+      req?.body?.viventiumUserMessageId ||
+      req?.body?.userMessageId ||
+      req?.body?.parentMessageId,
+  );
+  const runScope = normalizeCooldownKeyPart(runId);
+  const requestScope = [userId || conversationId || runScope || 'global'];
+  if (conversationId) {
+    requestScope.push(conversationId);
+  }
+  if (messageId) {
+    requestScope.push(messageId);
+  }
+  if (!conversationId && !messageId && runScope) {
+    requestScope.push(runScope);
+  }
+  return `${String(agentId || 'unknown_agent')}:${requestScope.join(':')}`;
 }
 
 /* === VIVENTIUM NOTE ===
@@ -93,6 +312,116 @@ function getCortexExecutionTimeoutMs() {
   const raw = String(process.env.VIVENTIUM_CORTEX_EXECUTION_TIMEOUT_MS || '').trim();
   const parsed = parseInt(raw, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 180_000;
+}
+
+function getCortexExecutionGuardGraceMs() {
+  const raw = String(process.env.VIVENTIUM_CORTEX_EXECUTION_GUARD_GRACE_MS || '').trim();
+  const parsed = parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return 15_000;
+  }
+  return Math.min(parsed, 60_000);
+}
+
+function getCortexAttemptGuardTimeoutMs(executionTimeoutMs = getCortexExecutionTimeoutMs()) {
+  if (!Number.isFinite(executionTimeoutMs) || executionTimeoutMs <= 0) {
+    return 0;
+  }
+  return executionTimeoutMs + getCortexExecutionGuardGraceMs();
+}
+
+function loadModelsConfigForCortexFallback(req) {
+  const { getModelsConfig } = require('~/server/controllers/ModelController');
+  return getModelsConfig(req);
+}
+
+function extractAggregatedProviderErrorText(contentParts) {
+  if (!Array.isArray(contentParts)) {
+    return '';
+  }
+  for (const part of contentParts) {
+    if (!part || typeof part !== 'object') {
+      continue;
+    }
+    const text = part[ContentTypes.ERROR] || part.error || part.text || '';
+    if (typeof text === 'string' && text.trim()) {
+      return text.trim();
+    }
+  }
+  return '';
+}
+
+function contentPartFallbackErrorClass(part) {
+  if (!part || typeof part !== 'object') {
+    return '';
+  }
+  return (
+    part.errorClass || part.error_class || part.errorCode || part.error_code || part.code || ''
+  );
+}
+
+function shouldRetryBackgroundCortexContentPartsWithFallback(contentParts) {
+  if (!Array.isArray(contentParts) || contentParts.length === 0) {
+    return false;
+  }
+  const hasNonRetryableErrorClass = contentParts.some((part) =>
+    isNonRetryableFallbackErrorClass(contentPartFallbackErrorClass(part)),
+  );
+  if (hasNonRetryableErrorClass) {
+    return false;
+  }
+  const providerErrorText = extractAggregatedProviderErrorText(contentParts);
+  if (!providerErrorText) {
+    return false;
+  }
+  return shouldRetryBackgroundCortexWithFallback({
+    insight: null,
+    error: providerErrorText,
+  });
+}
+
+async function resolveBackgroundCortexFallbackAgent({ cortexAgent, req, modelsConfig }) {
+  const fallbackAssignment = resolveFallbackAssignment(cortexAgent);
+  if (!fallbackAssignment) {
+    return null;
+  }
+
+  if (isSameAgentRoute(cortexAgent, fallbackAssignment)) {
+    logger.warn(
+      `[BackgroundCortexService] Skipping fallback for ${cortexAgent.id} because it matches primary route ` +
+        `${fallbackAssignment.provider}/${fallbackAssignment.model}`,
+    );
+    return null;
+  }
+
+  let resolvedModelsConfig = modelsConfig || null;
+  if (!resolvedModelsConfig && req) {
+    try {
+      resolvedModelsConfig = await loadModelsConfigForCortexFallback(req);
+    } catch (error) {
+      logger.warn(
+        '[BackgroundCortexService] Failed to load models config for cortex fallback',
+        sanitizeRuntimeErrorForLog(error),
+      );
+      resolvedModelsConfig = null;
+    }
+  }
+  if (
+    !isFallbackModelValid(
+      fallbackAssignment.model,
+      fallbackAssignment.provider,
+      req,
+      resolvedModelsConfig,
+    )
+  ) {
+    logger.warn(
+      `[BackgroundCortexService] Invalid fallback model for ${cortexAgent.id}: ` +
+        `${fallbackAssignment.provider}/${fallbackAssignment.model}`,
+    );
+    return null;
+  }
+
+  return buildFallbackAgent(cortexAgent, fallbackAssignment);
 }
 /* === VIVENTIUM NOTE === */
 
@@ -131,7 +460,10 @@ async function getUserMemoryContextBlock(req) {
     }
   } catch (error) {
     // Fail closed: if access check errors, do not include memory in cortex context.
-    logger.warn('[BackgroundCortexService] Memory access check failed; skipping memory context for cortex', error);
+    logger.warn(
+      '[BackgroundCortexService] Memory access check failed; skipping memory context for cortex',
+      sanitizeRuntimeErrorForLog(error),
+    );
     return '';
   }
 
@@ -143,7 +475,10 @@ async function getUserMemoryContextBlock(req) {
     }
     return `${memoryInstructions}\n\n# Existing memory about the user:\n${memoryText}`;
   } catch (error) {
-    logger.warn('[BackgroundCortexService] Failed to load formatted memories for cortex context', error);
+    logger.warn(
+      '[BackgroundCortexService] Failed to load formatted memories for cortex context',
+      sanitizeRuntimeErrorForLog(error),
+    );
     return '';
   }
 }
@@ -187,7 +522,10 @@ async function getUserFileContextBlock(req) {
       const withoutId = attachments.filter((file) => !file?.file_id);
       attachments = [...byId.values(), ...withoutId];
     } catch (error) {
-      logger.warn('[BackgroundCortexService] Failed to load attached files for cortex context', error);
+      logger.warn(
+        '[BackgroundCortexService] Failed to load attached files for cortex context',
+        sanitizeRuntimeErrorForLog(error),
+      );
     }
   }
 
@@ -200,7 +538,10 @@ async function getUserFileContextBlock(req) {
     const text = typeof fileContext === 'string' ? fileContext.trim() : '';
     return text || '';
   } catch (error) {
-    logger.warn('[BackgroundCortexService] Failed to extract file context for cortex', error);
+    logger.warn(
+      '[BackgroundCortexService] Failed to extract file context for cortex',
+      sanitizeRuntimeErrorForLog(error),
+    );
     return '';
   }
 }
@@ -221,6 +562,45 @@ async function getUserFileContextBlock(req) {
 function sanitizeCortexDisplayName(cortexName) {
   const trimmed = String(cortexName || '').trim();
   return trimmed || 'Background Agent';
+}
+
+function titleCaseCortexName(value) {
+  return String(value || '')
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((word) => `${word.slice(0, 1).toUpperCase()}${word.slice(1)}`)
+    .join(' ');
+}
+
+function deriveCortexDisplayNameFromAgentId(agentId) {
+  const normalized = String(agentId || '')
+    .trim()
+    .replace(/^agent_/, '')
+    .replace(/^viventium_/, '')
+    .replace(/_[a-z0-9]{6,}$/i, '')
+    .replace(/_/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!normalized || normalized === String(agentId || '').trim()) {
+    return '';
+  }
+
+  return titleCaseCortexName(normalized);
+}
+
+function configuredCortexDisplayName(cortexConfig = {}) {
+  const configured =
+    cortexConfig.cortex_name ||
+    cortexConfig.display_name ||
+    cortexConfig.name ||
+    cortexConfig.label ||
+    '';
+  const configuredName = sanitizeCortexDisplayName(configured);
+  if (configuredName !== 'Background Agent') {
+    return configuredName;
+  }
+  return deriveCortexDisplayNameFromAgentId(cortexConfig.agent_id);
 }
 
 function getEnvBackedEndpointConfig(endpointName) {
@@ -263,34 +643,32 @@ function getEnvBackedEndpointConfig(endpointName) {
 const ACTIVATION_SYSTEM_PROMPT = `You are an activation classifier for a multi-agent system.
 
 Your task is to decide if a specialized background agent (cortex) should activate based on conversation context.
+Apply the prompt's Activation Decision Subject rule exactly; the latest user/human message is the decision subject and earlier turns are context only.
 
-Follow the response format requested in the user prompt. Keep it concise and deterministic.`;
+Return only one valid JSON object. Do not include markdown, prose, headings, reasoning, comments, or activation tags outside the JSON object.`;
 
 const DEFAULT_ACTIVATION_RESPONSE_FORMAT = `Respond with a JSON object:
 {
   "should_activate": true,
   "confidence": 1.0,
   "reason": "2-4 explanatory words"
-}
-
-When activated start your response with the following exact tag:
-<!--viv_internal:brew_begin-->`;
-
-const ACTIVATION_LOG_CHAR_LIMIT = 2000;
+}`;
 
 function shouldLogActivationPrompt() {
-  return (
-    (process.env.VIVENTIUM_LOG_ACTIVATION_PROMPT || '').trim() === '1' ||
-    process.env.NODE_ENV === 'development'
-  );
+  return (process.env.VIVENTIUM_LOG_ACTIVATION_PROMPT || '').trim() === '1';
 }
 
-function clampLogText(text) {
+function promptDebugSummaryForLog(text) {
   const value = String(text || '');
-  if (value.length <= ACTIVATION_LOG_CHAR_LIMIT) {
-    return value;
-  }
-  return `${value.slice(0, ACTIVATION_LOG_CHAR_LIMIT)}...`;
+  return {
+    length: value.length,
+    hash: hashString(value, 12),
+  };
+}
+
+function promptDebugSummaryLabel(text) {
+  const summary = promptDebugSummaryForLog(text);
+  return `len=${summary.length} hash=${summary.hash}`;
 }
 
 const isVoiceLatencyEnabled = (req) => req?.viventiumVoiceLogLatency === true;
@@ -308,7 +686,8 @@ const logVoicePhaseAStage = (req, stage, stageStartAt = null, details = '') => {
     return;
   }
   const now = Date.now();
-  const routeStartAt = typeof req?.viventiumVoiceStartAt === 'number' ? req.viventiumVoiceStartAt : now;
+  const routeStartAt =
+    typeof req?.viventiumVoiceStartAt === 'number' ? req.viventiumVoiceStartAt : now;
   const stageMs = typeof stageStartAt === 'number' ? now - stageStartAt : null;
   const stagePart = stageMs == null ? '' : ` stage_ms=${stageMs}`;
   const detailPart = details ? ` ${details}` : '';
@@ -344,14 +723,7 @@ function extractUserFacingInsight(rawText) {
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
       return original;
     }
-    const candidates = [
-      'user_summary',
-      'userSummary',
-      'summary',
-      'insight',
-      'response',
-      'output',
-    ];
+    const candidates = ['user_summary', 'userSummary', 'summary', 'insight', 'response', 'output'];
     for (const key of candidates) {
       const value = parsed[key];
       if (typeof value === 'string' && value.trim()) {
@@ -434,7 +806,10 @@ function parseActivationResponse(response) {
       }
     }
 
-    logger.warn('[BackgroundCortexService] Failed to parse activation response:', response.slice(0, 200));
+    logger.warn('[BackgroundCortexService] Failed to parse activation response', {
+      response_hash: hashString(response, 12),
+      response_length: typeof response === 'string' ? response.length : 0,
+    });
     return { activate: false, confidence: 0, reason: 'parse-error' };
   }
 }
@@ -531,57 +906,53 @@ function filterCortexContentFromLangChainMessages(messages) {
   };
   /* === VIVENTIUM NOTE === */
 
-  return messages.map((msg) => {
-    // Skip if no content or content is a plain string (no filtering needed)
-    if (!msg || !msg.content || typeof msg.content === 'string') {
-      return msg;
-    }
+  return messages
+    .map((msg) => {
+      // Skip if no content or content is a plain string (no filtering needed)
+      if (!msg || !msg.content || typeof msg.content === 'string') {
+        return msg;
+      }
 
-    // If content is an array, filter out cortex content types
-    if (Array.isArray(msg.content)) {
-      const filteredContent = msg.content.filter((part) => {
-        if (part && typeof part === 'object' && CORTEX_TYPES.has(part.type)) {
-          return false; // Remove cortex content types
+      // If content is an array, filter out cortex content types
+      if (Array.isArray(msg.content)) {
+        const filteredContent = msg.content.filter((part) => {
+          if (part && typeof part === 'object' && CORTEX_TYPES.has(part.type)) {
+            return false; // Remove cortex content types
+          }
+          return true;
+        });
+
+        // If all content was filtered out, convert to empty string
+        if (filteredContent.length === 0) {
+          return cloneLangChainMessageWithContent(msg, '');
         }
-        return true;
-      });
 
-      // If all content was filtered out, convert to empty string
-      if (filteredContent.length === 0) {
-        return cloneLangChainMessageWithContent(msg, '');
+        // If content changed, create new message with filtered content
+        if (filteredContent.length !== msg.content.length) {
+          return cloneLangChainMessageWithContent(msg, filteredContent);
+        }
       }
 
-      // If content changed, create new message with filtered content
-      if (filteredContent.length !== msg.content.length) {
-        return cloneLangChainMessageWithContent(msg, filteredContent);
+      return msg;
+    })
+    .filter((msg) => {
+      // Remove messages that became empty after filtering
+      if (!msg) return false;
+      const isEmptyString = typeof msg.content === 'string' && msg.content === '';
+      const isEmptyArray = Array.isArray(msg.content) && msg.content.length === 0;
+      if (isEmptyString || isEmptyArray) {
+        return hasToolContext(msg);
       }
-    }
-
-    return msg;
-  }).filter((msg) => {
-    // Remove messages that became empty after filtering
-    if (!msg) return false;
-    const isEmptyString = typeof msg.content === 'string' && msg.content === '';
-    const isEmptyArray = Array.isArray(msg.content) && msg.content.length === 0;
-    if (isEmptyString || isEmptyArray) {
-      return hasToolContext(msg);
-    }
-    return true;
-  });
+      return true;
+    });
 }
 
 function getActivationFormat(config) {
   const activationFormat = config?.viventium?.background_cortices?.activation_format;
   const responseFormat = activationFormat?.response_format?.trim();
-  const brewBeginTag = activationFormat?.brew_begin_tag?.trim();
   const suffixParts = [];
   if (responseFormat) {
     suffixParts.push(responseFormat);
-  }
-  if (brewBeginTag) {
-    suffixParts.push(
-      `When activated start your response with the following exact tag:\n${brewBeginTag}`,
-    );
   }
   if (suffixParts.length > 0) {
     return suffixParts.join('\n\n');
@@ -602,6 +973,112 @@ function normalizeAgentToolNames(mainAgent) {
       return '';
     })
     .filter(Boolean);
+}
+
+function normalizeDirectActionScopeKey(scopeKey) {
+  const raw = String(scopeKey || '').trim();
+  if (!raw) {
+    return '';
+  }
+  return raw.replace(/\s+/g, '_').toLowerCase();
+}
+
+function applyActivationJsonMode({ providerName, model, llmConfig }) {
+  if (!llmConfig || typeof llmConfig !== 'object') {
+    return llmConfig;
+  }
+  const normalizedProvider = String(providerName || '')
+    .trim()
+    .toLowerCase();
+  if (normalizedProvider === 'anthropic' || normalizedProvider === 'perplexity') {
+    return llmConfig;
+  }
+  if (llmConfig.provider !== Providers.OPENAI) {
+    return llmConfig;
+  }
+  if (
+    normalizedProvider === 'openai' &&
+    isOpenAIReasoningModelWithoutSampling(model || llmConfig.model)
+  ) {
+    return llmConfig;
+  }
+
+  return {
+    ...llmConfig,
+    modelKwargs: {
+      ...(llmConfig.modelKwargs || {}),
+      response_format: { type: 'json_object' },
+    },
+  };
+}
+
+function normalizeDirectActionSurfaceScopes(surfaces) {
+  if (!Array.isArray(surfaces) || surfaces.length === 0) {
+    return [];
+  }
+
+  const seen = new Set();
+  const normalized = [];
+  for (const surface of surfaces) {
+    if (!surface) {
+      continue;
+    }
+
+    if (typeof surface === 'string') {
+      const scopeKey = normalizeDirectActionScopeKey(surface);
+      if (!scopeKey || seen.has(scopeKey)) {
+        continue;
+      }
+      seen.add(scopeKey);
+      normalized.push({ scopeKey });
+      continue;
+    }
+
+    if (typeof surface !== 'object') {
+      continue;
+    }
+
+    const scopeKey = normalizeDirectActionScopeKey(
+      surface.scopeKey || surface.scope_key || surface.intent_scope || surface.activation_scope,
+    );
+    if (!scopeKey || seen.has(scopeKey)) {
+      continue;
+    }
+    seen.add(scopeKey);
+    normalized.push({
+      server: String(surface.server || surface.name || '').trim(),
+      scopeKey,
+      owns: String(surface.owns || surface.description || '').trim(),
+      sameScopeBackgroundAllowed: surface.sameScopeBackgroundAllowed === true,
+    });
+  }
+
+  return normalized;
+}
+
+function applyDirectActionOwnershipGate(result) {
+  if (!result || result.shouldActivate !== true) {
+    return result;
+  }
+
+  const activationScopeKey = normalizeDirectActionScopeKey(result.activationScope);
+  if (!activationScopeKey) {
+    return result;
+  }
+
+  const matchingSurface = normalizeDirectActionSurfaceScopes(result.directActionSurfaceScopes).find(
+    (surface) => surface.scopeKey === activationScopeKey,
+  );
+  if (!matchingSurface || matchingSurface.sameScopeBackgroundAllowed === true) {
+    return result;
+  }
+
+  return {
+    ...result,
+    shouldActivate: false,
+    reason: 'direct_action_owned_by_main_agent',
+    suppressedByDirectActionOwnership: true,
+  };
 }
 
 function buildActivationPolicySection({ config, mainAgent }) {
@@ -632,6 +1109,13 @@ function buildActivationPolicySection({ config, mainAgent }) {
     connectedSurfaces.push({
       server: String(surface.server || surface.name || '').trim(),
       owns: String(surface.owns || surface.description || '').trim(),
+      scopeKey: normalizeDirectActionScopeKey(
+        surface.scope_key || surface.scopeKey || surface.intent_scope || surface.activation_scope,
+      ),
+      sameScopeBackgroundAllowed:
+        surface.same_scope_background_allowed === true ||
+        surface.allow_same_scope_background === true ||
+        surface.supplemental_background === true,
       connectedToolNames,
     });
   }
@@ -646,8 +1130,18 @@ function buildActivationPolicySection({ config, mainAgent }) {
     for (const surface of connectedSurfaces.slice(0, 8)) {
       const label = surface.server || 'declared direct-action surface';
       const owns = surface.owns ? ` — owns: ${surface.owns.slice(0, 180)}` : '';
-      lines.push(`- ${label}${owns}`);
+      const scope = surface.scopeKey ? ` — scope_key: ${surface.scopeKey}` : '';
+      const supplemental = surface.sameScopeBackgroundAllowed
+        ? ' — same_scope_background_allowed: true'
+        : '';
+      lines.push(`- ${label}${scope}${supplemental}${owns}`);
     }
+  }
+  if (connectedSurfaces.some((surface) => surface.sameScopeBackgroundAllowed)) {
+    lines.push(
+      '',
+      'When a connected direct-action surface is marked same_scope_background_allowed=true, treat it as main-agent ownership for Phase A, not as a blocker for a background agent whose own configured activation scope exactly matches that surface. Same-scope background agents may still activate when their own criteria are clearly met so Phase B can provide supplemental evidence.',
+    );
   }
   if (directActionRule) {
     lines.push('', directActionRule);
@@ -659,6 +1153,104 @@ function buildActivationPolicySection({ config, mainAgent }) {
     section: `${lines.join('\n')}\n\n`,
     connectedSurfaces,
   };
+}
+
+const DEFAULT_ACTIVATION_DECISION_SUBJECT_RULE = [
+  'Judge activation only for the latest human/user message shown in "Latest User Intent".',
+  'Use earlier "Recent Conversation" turns only to resolve references in that latest message.',
+  'Never activate only because an older user request appears in history; that older request was already handled by its own turn.',
+  "If the latest user message is a simple reply, acknowledgement, test instruction, correction, thanks, provider clarification, or output-only instruction that does not itself meet this cortex's activation criteria, return should_activate=false even when older history would have activated.",
+].join(' ');
+
+function resolveActivationDecisionSubjectRule(config) {
+  const backgroundCortices = config?.viventium?.background_cortices || {};
+  const candidates = [
+    backgroundCortices.activation_subject_rule,
+    backgroundCortices.latest_user_message_rule,
+    backgroundCortices.activation_policy?.latest_user_message_rule,
+  ];
+
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== 'object') {
+      continue;
+    }
+    const rawPrompt = candidate.prompt || candidate.instructions || candidate.text;
+    if (typeof rawPrompt === 'string' && rawPrompt.trim()) {
+      return rawPrompt.trim();
+    }
+  }
+
+  return DEFAULT_ACTIVATION_DECISION_SUBJECT_RULE;
+}
+
+function buildActivationDecisionSubjectSection({ config } = {}) {
+  const rule = resolveActivationDecisionSubjectRule(config);
+  if (!rule) {
+    return '';
+  }
+  return `## Activation Decision Subject:\n${rule}\n\n`;
+}
+
+function getNormalizedAgentToolCount(agent) {
+  return normalizeAgentToolNames(agent).length;
+}
+
+async function resolveActivationPolicyMainAgent({
+  req,
+  mainAgent,
+  timeoutMs = 250,
+  loadAgentFn = loadAgent,
+} = {}) {
+  if (!mainAgent || typeof mainAgent !== 'object') {
+    return mainAgent;
+  }
+
+  const agentId = mainAgent.id || mainAgent.agent_id;
+  const baseToolCount = getNormalizedAgentToolCount(mainAgent);
+  if (!req || !agentId || typeof loadAgentFn !== 'function') {
+    return mainAgent;
+  }
+
+  const deadlineMs = Number(timeoutMs);
+  if (!Number.isFinite(deadlineMs) || deadlineMs <= 0) {
+    return mainAgent;
+  }
+
+  const timeout = new Promise((resolve) => {
+    setTimeout(() => resolve(null), deadlineMs);
+  });
+
+  try {
+    const canonical = await Promise.race([
+      loadAgentFn({
+        req,
+        agent_id: agentId,
+        endpoint: mainAgent.provider || mainAgent.endpoint,
+      }),
+      timeout,
+    ]);
+    const canonicalToolCount = getNormalizedAgentToolCount(canonical);
+    if (!canonical || canonicalToolCount <= baseToolCount) {
+      return mainAgent;
+    }
+
+    logger.info(
+      `[BackgroundCortexService] Activation policy hydrated main-agent tools: ` +
+        `agent=${agentId} request_tools=${baseToolCount} canonical_tools=${canonicalToolCount}`,
+    );
+    return {
+      ...mainAgent,
+      tools: canonical.tools,
+      tool_resources: mainAgent.tool_resources || canonical.tool_resources,
+    };
+  } catch (error) {
+    logger.warn(
+      `[BackgroundCortexService] Activation policy main-agent hydration failed for ${agentId}: ` +
+        'using request-scoped agent tools',
+      sanitizeRuntimeErrorForLog(error),
+    );
+    return mainAgent;
+  }
 }
 
 /**
@@ -696,9 +1288,15 @@ function getActivationRole(msg) {
     return '';
   }
 
-  if (typeof msg.getType === 'function') {
+  const getType =
+    typeof msg.getType === 'function'
+      ? msg.getType.bind(msg)
+      : typeof msg._getType === 'function'
+        ? msg._getType.bind(msg)
+        : null;
+  if (getType) {
     try {
-      const msgType = String(msg.getType() || '').toLowerCase();
+      const msgType = String(getType() || '').toLowerCase();
       if (msgType === 'human') {
         return 'user';
       }
@@ -786,7 +1384,9 @@ function getLastUserMessageText(messages) {
 }
 
 function normalizeActivationText(text) {
-  return String(text || '').replace(/\s+/g, ' ').trim();
+  return String(text || '')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function hasVisibleCortexInsight(insight) {
@@ -795,6 +1395,93 @@ function hasVisibleCortexInsight(insight) {
   }
   const trimmed = insight.trim();
   return Boolean(trimmed) && !isNoResponseOnly(trimmed);
+}
+
+function buildCortexCompletionPayload(result) {
+  if (!result) {
+    return null;
+  }
+
+  const hasVisibleInsight = hasVisibleCortexInsight(result.insight);
+  const basePayload = {
+    cortex_id: result.agentId,
+    cortex_name: sanitizeCortexDisplayName(result.agentName || result.agentId),
+    activation_scope: result.activationScope || null,
+    configured_tools: result.configuredTools || 0,
+    completed_tool_calls: result.completedToolCalls || 0,
+  };
+  const confidence = Number(result.confidence);
+  if (Number.isFinite(confidence)) {
+    basePayload.confidence = confidence;
+  }
+  const reason = String(result.reason || '').trim();
+  if (reason) {
+    basePayload.reason = reason;
+  }
+  const cortexDescription = String(result.cortexDescription || result.cortex_description || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (cortexDescription) {
+    basePayload.cortex_description = cortexDescription.slice(0, 220);
+  }
+  if (Array.isArray(result.directActionSurfaces)) {
+    basePayload.direct_action_surfaces = result.directActionSurfaces;
+  }
+  const directActionSurfaceScopes = normalizeDirectActionSurfaceScopes(
+    result.directActionSurfaceScopes,
+  );
+  if (directActionSurfaceScopes.length > 0) {
+    basePayload.direct_action_surface_scopes = directActionSurfaceScopes;
+  }
+
+  if (result.error) {
+    const publicError = publicCortexError(result.error, result.errorClass || result.error_class);
+    return {
+      ...basePayload,
+      status: 'error',
+      error: publicError.message,
+      error_class: publicError.errorClass,
+    };
+  }
+
+  return {
+    ...basePayload,
+    status: 'complete',
+    insight: hasVisibleInsight ? result.insight : '',
+    silent: !hasVisibleInsight,
+    no_response: !hasVisibleInsight,
+  };
+}
+
+function buildCompletionInputFromActivation({
+  activationResult,
+  cortexAgent = null,
+  result = null,
+  error = null,
+}) {
+  return {
+    agentId: result?.agentId || activationResult.agentId,
+    agentName:
+      result?.agentName ||
+      cortexAgent?.name ||
+      activationResult.cortexName ||
+      activationResult.agentId,
+    insight: result?.insight ?? null,
+    error: error || result?.error || null,
+    errorClass: result?.errorClass || result?.error_class || activationResult.errorClass || null,
+    activationScope: result?.activationScope || activationResult.activationScope || null,
+    configuredTools: result?.configuredTools || 0,
+    completedToolCalls: result?.completedToolCalls || 0,
+    confidence: activationResult.confidence,
+    reason: activationResult.reason,
+    cortexDescription: activationResult.cortexDescription,
+    directActionSurfaces: Array.isArray(activationResult.directActionSurfaces)
+      ? activationResult.directActionSurfaces
+      : [],
+    directActionSurfaceScopes: normalizeDirectActionSurfaceScopes(
+      activationResult.directActionSurfaceScopes,
+    ),
+  };
 }
 
 const RETRYABLE_ACTIVATION_STATUS_CODES = new Set([401, 402, 403, 429, 500, 502, 503, 504]);
@@ -850,11 +1537,128 @@ function extractActivationErrorStatus(error) {
 }
 
 function summarizeActivationError(error) {
+  const status = extractActivationErrorStatus(error) || null;
+  const code = String(error?.code || '').toUpperCase() || null;
+  const message = String(error?.message || 'activation classifier error');
   return {
-    status: extractActivationErrorStatus(error) || null,
-    code: String(error?.code || '').toUpperCase() || null,
-    message: String(error?.message || 'activation classifier error'),
+    status,
+    code,
+    message,
+    class: classifyActivationError({ status, code, message }),
   };
+}
+
+function formatActivationErrorSummaryForLog(errorSummary = {}) {
+  return (
+    `class=${errorSummary.class || 'provider_error'} ` +
+    `status=${errorSummary.status || 'none'} ` +
+    `code=${errorSummary.code || 'none'}`
+  );
+}
+
+function sanitizeActivationErrorForLog(errorSummary = {}) {
+  return {
+    class: errorSummary.class || 'provider_error',
+    status: errorSummary.status || null,
+    code: errorSummary.code || null,
+  };
+}
+
+function classifyCortexPublicError(error, explicitClass = '') {
+  const rawClass = String(explicitClass || '').trim();
+  if (rawClass) {
+    return rawClass;
+  }
+  const message = String(error || '')
+    .trim()
+    .toLowerCase();
+  if (message === 'timeout' || message.includes('timed out')) {
+    return 'timeout';
+  }
+  if (message === 'activation_provider_unavailable') {
+    return 'activation_provider_unavailable';
+  }
+  if (message === 'no_live_tool_execution') {
+    return 'no_live_tool_execution';
+  }
+  if (message.includes('cortex agent not found') || message.includes('agent not found')) {
+    return 'cortex_agent_not_found';
+  }
+  if (
+    message.includes('provider') ||
+    message.includes('rate limit') ||
+    message.includes('unauthorized') ||
+    message.includes('forbidden')
+  ) {
+    return 'recoverable_provider_error';
+  }
+  return 'background_agent_error';
+}
+
+function publicCortexError(error, explicitClass = '') {
+  const errorClass = classifyCortexPublicError(error, explicitClass);
+  return {
+    errorClass,
+    message:
+      PUBLIC_CORTEX_ERROR_MESSAGES[errorClass] ||
+      PUBLIC_CORTEX_ERROR_MESSAGES.background_agent_error,
+  };
+}
+
+function sanitizeRuntimeErrorForLog(error, explicitClass = '') {
+  const rawError = error?.message || error || '';
+  const publicError = publicCortexError(rawError, explicitClass);
+  return {
+    class: publicError.errorClass,
+    name: error?.name || null,
+    status: Number.isFinite(error?.status) ? error.status : null,
+    code: error?.code || error?.lc_error_code || null,
+  };
+}
+
+function classifyActivationError({ status, code, message }) {
+  const normalizedMessage = String(message || '').toLowerCase();
+  const normalizedCode = String(code || '').toUpperCase();
+
+  if (status === 401 || normalizedMessage.includes('unauthorized')) {
+    return 'provider_unauthorized';
+  }
+  if (
+    status === 403 ||
+    normalizedMessage.includes('forbidden') ||
+    normalizedMessage.includes('access denied')
+  ) {
+    return 'provider_access_denied';
+  }
+  if (status === 429 || normalizedMessage.includes('rate limit')) {
+    return 'provider_rate_limited';
+  }
+  if (
+    status === 402 ||
+    normalizedMessage.includes('billing') ||
+    normalizedMessage.includes('quota')
+  ) {
+    return 'provider_quota_or_billing';
+  }
+  if (
+    normalizedCode === 'ECONNABORTED' ||
+    normalizedCode === 'ETIMEDOUT' ||
+    normalizedMessage.includes('timeout')
+  ) {
+    return 'provider_timeout';
+  }
+  if (
+    normalizedCode === 'ECONNREFUSED' ||
+    normalizedCode === 'ECONNRESET' ||
+    normalizedCode === 'EAI_AGAIN'
+  ) {
+    return 'provider_network';
+  }
+  if (status >= 500) {
+    return 'provider_server_error';
+  }
+
+  return 'provider_error';
 }
 
 function isActivationFallbackCandidate(error) {
@@ -878,6 +1682,54 @@ function isActivationFallbackCandidate(error) {
     message.includes('permission') ||
     message.includes('timeout')
   );
+}
+
+function isUnavailableActivationAttempt(attempt = {}) {
+  const status = String(attempt.status || '');
+  const errorClass = String(attempt.error?.class || '');
+  if (!['error', 'skipped_unhealthy'].includes(status)) {
+    return false;
+  }
+  return shouldSuppressActivationProvider({ class: errorClass });
+}
+
+function activationProviderAttemptsUnavailable(providerAttempts) {
+  return (
+    Array.isArray(providerAttempts) &&
+    providerAttempts.length > 0 &&
+    providerAttempts.every(isUnavailableActivationAttempt)
+  );
+}
+
+function activationFailureVisibility(cortexConfig = {}) {
+  const raw = String(
+    cortexConfig?.activation?.activation_failure_visibility ||
+      cortexConfig?.activation?.failure_visibility ||
+      '',
+  )
+    .trim()
+    .toLowerCase();
+  return raw === 'visible' ? 'visible' : 'silent';
+}
+
+function shouldSurfaceActivationProviderUnavailable({ activationResult, cortexConfig }) {
+  if (!activationProviderAttemptsUnavailable(activationResult?.providerAttempts)) {
+    return false;
+  }
+  return activationFailureVisibility(cortexConfig) === 'visible';
+}
+
+function shouldSurfaceActivationTimeout({ activationResult, cortexConfig }) {
+  void activationResult;
+  void cortexConfig;
+  /*
+   * Activation timeout means the classifier did not finish inside the Phase A budget.
+   * It is not evidence that the background agent activated or executed, so surfacing it
+   * as a user-facing cortex card creates noise such as "Confirmation Bias error" beside
+   * valid completed cards. Keep this in logs/telemetry only. Execution-time cortex
+   * failures still render as cards because those agents did activate.
+   */
+  return false;
 }
 
 function normalizeActivationFallbacks(activation = {}) {
@@ -904,10 +1756,7 @@ function normalizeActivationFallbacks(activation = {}) {
     }
     seen.add(dedupeKey);
 
-    if (
-      provider.toLowerCase() === primaryProvider.toLowerCase() &&
-      model === primaryModel
-    ) {
+    if (provider.toLowerCase() === primaryProvider.toLowerCase() && model === primaryModel) {
       continue;
     }
 
@@ -915,6 +1764,76 @@ function normalizeActivationFallbacks(activation = {}) {
   }
 
   return normalized;
+}
+
+function buildActivationProviderAttempts(activation = {}) {
+  return [
+    {
+      provider: String(activation?.provider || '').trim(),
+      model: String(activation?.model || '').trim(),
+      source: 'primary',
+    },
+    ...normalizeActivationFallbacks(activation).map((entry) => ({
+      ...entry,
+      source: 'fallback',
+    })),
+  ].filter((entry) => entry.provider && entry.model);
+}
+
+function boundedActivationTimeoutEnv(name, defaultValue, maxValue) {
+  const parsed = Number.parseInt(String(process.env[name] || ''), 10);
+  const fallback = Number.isFinite(Number(defaultValue)) ? Number(defaultValue) : 0;
+  const ceiling =
+    Number.isFinite(Number(maxValue)) && Number(maxValue) > 0
+      ? Number(maxValue)
+      : Number.MAX_SAFE_INTEGER;
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return Math.min(fallback, ceiling);
+  }
+  return Math.min(parsed, ceiling);
+}
+
+function activationAttemptTimeoutMs({
+  activationTimeoutMs,
+  activationStartTime,
+  attemptIndex,
+  attemptsLength,
+} = {}) {
+  const globalBudget = Number.isFinite(Number(activationTimeoutMs))
+    ? Math.max(0, Number(activationTimeoutMs))
+    : 0;
+  if (globalBudget <= 0) {
+    return 0;
+  }
+
+  const elapsed = Date.now() - Number(activationStartTime || Date.now());
+  const remaining = Math.max(0, globalBudget - elapsed);
+  if (remaining <= 0) {
+    return 0;
+  }
+
+  if (attemptsLength <= 1 || attemptIndex >= attemptsLength - 1) {
+    return remaining;
+  }
+
+  const defaultAttemptBudget = Math.min(900, globalBudget);
+  const envName =
+    attemptIndex === 0
+      ? 'VIVENTIUM_ACTIVATION_PRIMARY_ATTEMPT_TIMEOUT_MS'
+      : 'VIVENTIUM_ACTIVATION_FALLBACK_ATTEMPT_TIMEOUT_MS';
+  return Math.min(
+    remaining,
+    boundedActivationTimeoutEnv(envName, defaultAttemptBudget, globalBudget),
+  );
+}
+
+function activationTimeoutErrorSummary() {
+  return {
+    status: null,
+    code: 'ABORT_ERR',
+    message: 'activation classifier attempt timeout',
+    class: 'provider_timeout',
+  };
 }
 /* === VIVENTIUM NOTE === */
 
@@ -937,7 +1856,10 @@ function createToolLoader(signal, streamId = null) {
         streamId,
       });
     } catch (error) {
-      logger.error('Error loading tools for background cortex ' + agentId, error);
+      logger.error(
+        'Error loading tools for background cortex ' + agentId,
+        sanitizeRuntimeErrorForLog(error),
+      );
       return {};
     }
   };
@@ -966,10 +1888,14 @@ function createBackgroundRes() {
   stub.destroyed = false;
   stub.headersSent = false;
   stub.statusCode = 200;
-  stub.write = function () { return true; };
+  stub.write = function () {
+    return true;
+  };
   stub.end = function () {};
   stub.setHeader = function () {};
-  stub.getHeader = function () { return undefined; };
+  stub.getHeader = function () {
+    return undefined;
+  };
   stub.writeHead = function () {};
   stub.flushHeaders = function () {};
   return stub;
@@ -983,17 +1909,17 @@ function createBackgroundRes() {
  */
 function mapProvider(provider) {
   const providerMap = {
-    'openai': Providers.OPENAI,
-    'anthropic': Providers.ANTHROPIC,
-    'google': Providers.GOOGLE,
-    'azure': Providers.AZURE_OPENAI,
-    'bedrock': Providers.BEDROCK,
+    openai: Providers.OPENAI,
+    anthropic: Providers.ANTHROPIC,
+    google: Providers.GOOGLE,
+    azure: Providers.AZURE_OPENAI,
+    bedrock: Providers.BEDROCK,
     // Groq uses OpenAI-compatible API, so use OPENAI provider with custom config
-    'groq': Providers.OPENAI,
+    groq: Providers.OPENAI,
     // xAI / Perplexity / other OpenAI-compatible providers are handled as custom endpoints
     // via getCustomEndpointConfig(...) and also use the OPENAI provider.
-    'xai': Providers.OPENAI,
-    'perplexity': Providers.OPENAI,
+    xai: Providers.OPENAI,
+    perplexity: Providers.OPENAI,
   };
   return providerMap[provider?.toLowerCase()] || Providers.OPENAI;
 }
@@ -1037,7 +1963,10 @@ async function getCustomEndpointConfig(endpointName, req) {
 
     return null;
   } catch (error) {
-    logger.warn(`[BackgroundCortexService] Failed to get custom endpoint config for ${endpointName}:`, error);
+    logger.warn(
+      `[BackgroundCortexService] Failed to get custom endpoint config for ${endpointName}`,
+      sanitizeRuntimeErrorForLog(error),
+    );
 
     const envConfig = getEnvBackedEndpointConfig(endpointName);
     if (envConfig) {
@@ -1105,11 +2034,12 @@ function hasActiveAnthropicThinking(thinking) {
 }
 
 function sanitizeAnthropicThinkingTemperature(agentForRun, safeReq) {
-  const model = typeof agentForRun?.model_parameters?.model === 'string'
-    ? agentForRun.model_parameters.model
-    : typeof agentForRun?.model === 'string'
-      ? agentForRun.model
-      : '';
+  const model =
+    typeof agentForRun?.model_parameters?.model === 'string'
+      ? agentForRun.model_parameters.model
+      : typeof agentForRun?.model === 'string'
+        ? agentForRun.model
+        : '';
   const adaptiveModel = model ? supportsAdaptiveThinking(model) : false;
   if (!hasActiveAnthropicThinking(agentForRun?.model_parameters?.thinking) && !adaptiveModel) {
     return;
@@ -1136,6 +2066,36 @@ function sanitizeAnthropicThinkingTemperature(agentForRun, safeReq) {
           ? 'thinking is active'
           : 'the model uses adaptive-thinking-era Anthropic temperature rules'
       }`,
+    );
+  }
+}
+
+/* === VIVENTIUM START ===
+ * Feature: OpenAI reasoning-model sampling compatibility guard.
+ *
+ * Why:
+ * - Background cortex execution can bypass the normal endpoint-level OpenAI sanitization shape.
+ * - Reasoning-style OpenAI runs such as gpt-5.* reject sampling controls like temperature.
+ * - This must apply before and after initializeAgent because runtime hydration can materialize
+ *   model_parameters after source-of-truth copying.
+ * === VIVENTIUM END === */
+function sanitizeOpenAIReasoningSampling(agentForRun, safeReq) {
+  const model =
+    typeof agentForRun?.model_parameters?.model === 'string'
+      ? agentForRun.model_parameters.model
+      : typeof agentForRun?.model === 'string'
+        ? agentForRun.model
+        : '';
+
+  const removedFromAgent = sanitizeOpenAIReasoningSamplingParams(agentForRun?.model_parameters, {
+    model,
+  });
+  const removedFromRequest = sanitizeOpenAIReasoningSamplingParams(safeReq?.body, { model });
+  const removed = [...removedFromAgent, ...removedFromRequest];
+
+  if (removed.length > 0) {
+    logger.info(
+      `[BackgroundCortexService] Removed OpenAI reasoning cortex sampling params for model=${model || 'unknown'} keys=${[...new Set(removed)].join(',')}`,
     );
   }
 }
@@ -1215,11 +2175,70 @@ async function buildActivationLlmConfig({ providerName, model, req }) {
 
     return anthropicLlmConfig;
   }
+  if (providerName === 'openai' && req) {
+    const openAIReq = {
+      ...req,
+      body: {
+        ...(req.body || {}),
+      },
+    };
+
+    if (!openAIReq.config) {
+      openAIReq.config = await getAppConfig({ role: openAIReq.user?.role });
+    }
+
+    const modelParameters = {
+      model,
+      max_output_tokens: 100,
+      ...(isOpenAIReasoningModelWithoutSampling(model) ? {} : { temperature: 0.1 }),
+    };
+    const removedFromModelParameters = sanitizeOpenAIReasoningSamplingParams(modelParameters, {
+      model,
+    });
+    if (removedFromModelParameters.length > 0) {
+      logger.info(
+        `[BackgroundCortexService] Removed OpenAI reasoning activation sampling params before initialization for model=${model || 'unknown'} keys=${[...new Set(removedFromModelParameters)].join(',')}`,
+      );
+    }
+
+    const initialized = await initializeOpenAI({
+      req: openAIReq,
+      endpoint: EModelEndpoint.openAI,
+      model_parameters: modelParameters,
+      db,
+    });
+
+    const openAILlmConfig = {
+      ...initialized.llmConfig,
+      provider: Providers.OPENAI,
+      model,
+      streaming: false,
+      disableStreaming: true,
+    };
+
+    const removedFromInitializedConfig = sanitizeOpenAIReasoningSamplingParams(openAILlmConfig, {
+      model,
+    });
+    if (removedFromInitializedConfig.length > 0) {
+      logger.info(
+        `[BackgroundCortexService] Removed OpenAI reasoning activation sampling params for model=${model || 'unknown'} keys=${[...new Set(removedFromInitializedConfig)].join(',')}`,
+      );
+    }
+
+    return applyActivationJsonMode({ providerName, model, llmConfig: openAILlmConfig });
+  }
   if (providerName === 'perplexity') {
     delete llmConfig.temperature;
   }
 
-  return llmConfig;
+  const removedSamplingParams = sanitizeOpenAIReasoningSamplingParams(llmConfig, { model });
+  if (removedSamplingParams.length > 0) {
+    logger.info(
+      `[BackgroundCortexService] Removed OpenAI reasoning activation sampling params for model=${model || 'unknown'} keys=${[...new Set(removedSamplingParams)].join(',')}`,
+    );
+  }
+
+  return applyActivationJsonMode({ providerName, model, llmConfig });
 }
 
 async function invokeActivationClassifierAttempt({
@@ -1233,6 +2252,29 @@ async function invokeActivationClassifierAttempt({
 }) {
   const llmConfig = await buildActivationLlmConfig({ providerName, model, req });
   const runIdSuffix = `${providerName}-${model}`.replace(/[^a-z0-9_-]+/gi, '_');
+  logPromptFrame(
+    logger,
+    buildPromptFrame({
+      promptFamily: 'cortex_activation',
+      surface: resolveViventiumSurface(req),
+      provider: providerName,
+      model,
+      authClass: 'user_runtime',
+      layers: {
+        activation_system: ACTIVATION_SYSTEM_PROMPT,
+        activation_prompt: fullPrompt,
+      },
+      promptSourceFiles: {
+        background_cortex_service: __filename,
+      },
+      flags: {
+        has_abort_signal: !!abortController?.signal,
+      },
+      decisionState: {
+        agent_id_hash: hashString(agentId, 12),
+      },
+    }),
+  );
 
   const run = await Run.create({
     runId: `${runId}-activation-${agentId}-${runIdSuffix}`,
@@ -1287,7 +2329,14 @@ async function invokeActivationClassifierAttempt({
  * @param {object} [params.req] - Express request object (required for custom endpoints)
  * @returns {Promise<{ shouldActivate: boolean, confidence: number, reason: string, agentId: string }>}
  */
-async function checkCortexActivation({ cortexConfig, messages, runId, req, mainAgent = null, timeoutMs = 0 }) {
+async function checkCortexActivation({
+  cortexConfig,
+  messages,
+  runId,
+  req,
+  mainAgent = null,
+  timeoutMs = 0,
+}) {
   const { agent_id, activation } = cortexConfig;
 
   if (!activation?.enabled) {
@@ -1307,18 +2356,14 @@ async function checkCortexActivation({ cortexConfig, messages, runId, req, mainA
   // Enforce per-user cooldown before spending an LLM call.
   const cooldownMs = Number(cooldown_ms) || 0;
   if (cooldownMs > 0) {
-    const userId = req?.user?.id;
-    const conversationId = req?.body?.conversationId;
-    const cooldownKey = `${agent_id}:${userId || conversationId || runId || 'global'}`;
+    const cooldownKey = buildActivationCooldownKey({ agentId: agent_id, req, runId });
     const lastActivatedAt = activationCooldowns.get(cooldownKey);
     if (typeof lastActivatedAt === 'number' && Date.now() - lastActivatedAt < cooldownMs) {
       return { shouldActivate: false, confidence: 0, reason: 'cooldown', agentId: agent_id };
     }
   }
 
-  const appConfig =
-    req?.config ||
-    (req ? await getAppConfig({ role: req.user?.role }) : null);
+  const appConfig = req?.config || (req ? await getAppConfig({ role: req.user?.role }) : null);
   if (req && appConfig) {
     req.config = appConfig;
   }
@@ -1357,8 +2402,10 @@ async function checkCortexActivation({ cortexConfig, messages, runId, req, mainA
   // Build the activation prompt
   const activationFormat = getActivationFormat(appConfig);
   const activationPolicy = buildActivationPolicySection({ config: appConfig, mainAgent });
+  const activationDecisionSubject = buildActivationDecisionSubjectSection({ config: appConfig });
   const fullPrompt = `## Cortex Activation Criteria:
 ${activationPolicy.section}
+${activationDecisionSubject}
 ${activationPrompt}
 
 ${requestMetaSection}${latestUserIntentSection}## Recent Conversation:
@@ -1368,13 +2415,14 @@ ${activationFormat}`;
 
   if (shouldLogActivationPrompt()) {
     logger.info(
-      `[BackgroundCortexService] Activation prompt for ${agent_id}:\n${clampLogText(fullPrompt)}`,
+      `[BackgroundCortexService] Activation prompt summary for ${agent_id}: ${promptDebugSummaryLabel(fullPrompt)}`,
     );
     logger.info(
       `[BackgroundCortexService] Activation format for ${agent_id}: ` +
-        `response_format=${JSON.stringify(activationFormat)}, ` +
-        `brew_begin_tag=${JSON.stringify(
+        `format_summary=${promptDebugSummaryLabel(JSON.stringify(activationFormat || {}))}, ` +
+        `brew_begin_tag_hash=${hashString(
           appConfig?.viventium?.background_cortices?.activation_format?.brew_begin_tag || '',
+          12,
         )}`,
     );
   }
@@ -1385,34 +2433,101 @@ ${activationFormat}`;
   const activationTimeoutMs = Number.isFinite(Number(timeoutMs))
     ? Math.max(0, Number(timeoutMs))
     : 0;
-  let abortController = null;
-  let abortTimer = null;
-  if (activationTimeoutMs > 0) {
-    abortController = new AbortController();
-    abortTimer = setTimeout(() => {
-      try {
-        abortController.abort();
-      } catch (_) {}
-    }, activationTimeoutMs);
-  }
   // === VIVENTIUM END ===
 
   try {
     const startTime = Date.now();
-    const attempts = [
-      { provider: String(provider || '').trim(), model: String(model || '').trim(), source: 'primary' },
-      ...normalizeActivationFallbacks({ provider, model, fallbacks }).map((entry) => ({
-        ...entry,
-        source: 'fallback',
-      })),
-    ].filter((entry) => entry.provider && entry.model);
+    const attempts = buildActivationProviderAttempts({ provider, model, fallbacks });
     const providerAttempts = [];
+    const suppressionsByAttempt = attempts.map((attempt) =>
+      getActivationProviderSuppression({
+        provider: String(attempt.provider || '')
+          .trim()
+          .toLowerCase(),
+        model: attempt.model,
+        req,
+      }),
+    );
+    const allAttemptsSuppressed =
+      attempts.length > 0 && suppressionsByAttempt.every((entry) => Boolean(entry));
+    let suppressionProbeUsed = false;
 
     for (let i = 0; i < attempts.length; i += 1) {
       const attempt = attempts[i];
       const providerName = attempt.provider.toLowerCase();
+      const providerSuppression = suppressionsByAttempt[i];
 
+      if (providerSuppression) {
+        if (shouldAttemptSuppressedActivationProvider({ attempt, providerSuppression })) {
+          logger.warn(
+            `[BackgroundCortexService] Activation classifier attempting primary provider despite health suppression for ${agent_id}: ` +
+              `provider=${providerName}, model=${attempt.model}, source=${attempt.source}, ` +
+              formatActivationErrorSummaryForLog(providerSuppression.error),
+          );
+        } else {
+          const shouldProbeSuppression = shouldProbeSuppressedActivationAttempt({
+            providerSuppression,
+            attempts,
+            allAttemptsSuppressed,
+            probeAlreadyUsed: suppressionProbeUsed,
+          });
+          if (shouldProbeSuppression) {
+            suppressionProbeUsed = true;
+            logger.warn(
+              `[BackgroundCortexService] Activation classifier probing suppressed provider for ${agent_id}: ` +
+                `provider=${providerName}, model=${attempt.model}, source=${attempt.source}, ` +
+                formatActivationErrorSummaryForLog(providerSuppression.error),
+            );
+          } else {
+            const retryAfterMs = Math.max(0, providerSuppression.until - Date.now());
+            providerAttempts.push({
+              provider: providerName,
+              model: attempt.model,
+              source: attempt.source,
+              status: 'skipped_unhealthy',
+              error: providerSuppression.error,
+              retryAfterMs,
+            });
+            logger.warn(
+              `[BackgroundCortexService] Activation classifier skipped unhealthy provider for ${agent_id}: ` +
+                `provider=${providerName}, model=${attempt.model}, source=${attempt.source}, ` +
+                `retry_after_ms=${retryAfterMs}, ` +
+                formatActivationErrorSummaryForLog(providerSuppression.error),
+            );
+            continue;
+          }
+        }
+      }
+
+      const attemptTimeoutMs = activationAttemptTimeoutMs({
+        activationTimeoutMs,
+        activationStartTime: startTime,
+        attemptIndex: i,
+        attemptsLength: attempts.length,
+      });
+      if (activationTimeoutMs > 0 && attemptTimeoutMs <= 0) {
+        return {
+          shouldActivate: false,
+          confidence: 0,
+          reason: 'global_timeout',
+          agentId: agent_id,
+          providerAttempts,
+        };
+      }
+
+      let attemptAbortController = null;
+      let attemptAbortTimer = null;
       try {
+        if (attemptTimeoutMs > 0) {
+          attemptAbortController = new AbortController();
+          attemptAbortTimer = setTimeout(() => {
+            try {
+              attemptAbortController.abort();
+            } catch (_) {
+              // Ignore abort races; the attempt timeout already records the failure path.
+            }
+          }, attemptTimeoutMs);
+        }
         const { responseText, parsed } = await invokeActivationClassifierAttempt({
           agentId: agent_id,
           providerName,
@@ -1420,13 +2535,13 @@ ${activationFormat}`;
           fullPrompt,
           runId,
           req,
-          abortController,
+          abortController: attemptAbortController,
         });
 
         if (shouldLogActivationPrompt()) {
           logger.info(
             `[BackgroundCortexService] Activation raw response for ${agent_id} ` +
-              `(${providerName}/${attempt.model}): ${clampLogText(responseText)}`,
+              `(${providerName}/${attempt.model}): ${promptDebugSummaryLabel(responseText)}`,
           );
         }
 
@@ -1451,9 +2566,7 @@ ${activationFormat}`;
         );
 
         if (shouldActivate && cooldownMs > 0) {
-          const userId = req?.user?.id;
-          const conversationId = req?.body?.conversationId;
-          const cooldownKey = `${agent_id}:${userId || conversationId || runId || 'global'}`;
+          const cooldownKey = buildActivationCooldownKey({ agentId: agent_id, req, runId });
           activationCooldowns.set(cooldownKey, Date.now());
         }
 
@@ -1462,17 +2575,51 @@ ${activationFormat}`;
           confidence: parsed.confidence,
           reason: parsed.reason,
           agentId: agent_id,
-          directActionSurfaces: activationPolicy.connectedSurfaces.map((surface) => surface.server).filter(Boolean),
+          directActionSurfaces: activationPolicy.connectedSurfaces
+            .map((surface) => surface.server)
+            .filter(Boolean),
+          directActionSurfaceScopes: activationPolicy.connectedSurfaces
+            .filter((surface) => surface.scopeKey)
+            .map((surface) => ({
+              server: surface.server,
+              scopeKey: surface.scopeKey,
+              owns: surface.owns,
+              sameScopeBackgroundAllowed: surface.sameScopeBackgroundAllowed === true,
+            })),
           providerUsed: providerName,
           modelUsed: attempt.model,
           providerAttempts,
         };
       } catch (error) {
-        const isAborted = abortController?.signal?.aborted === true || error?.name === 'AbortError';
+        const isAborted =
+          attemptAbortController?.signal?.aborted === true || error?.name === 'AbortError';
         if (isAborted) {
+          const errorSummary = activationTimeoutErrorSummary();
+          providerAttempts.push({
+            provider: providerName,
+            model: attempt.model,
+            source: attempt.source,
+            status: 'error',
+            error: sanitizeActivationErrorForLog(errorSummary),
+            markedUnhealthy: false,
+            timeoutMs: attemptTimeoutMs,
+          });
           logger.info(
-            `[BackgroundCortexService] Activation check timed out for ${agent_id} after ${activationTimeoutMs}ms`,
+            `[BackgroundCortexService] Activation classifier attempt timed out for ${agent_id}: ` +
+              `provider=${providerName}, model=${attempt.model}, source=${attempt.source}, ` +
+              `attempt_timeout_ms=${attemptTimeoutMs}, global_timeout_ms=${activationTimeoutMs}`,
           );
+          const canTryFallback =
+            i < attempts.length - 1 &&
+            (activationTimeoutMs <= 0 || Date.now() - startTime < activationTimeoutMs);
+          if (canTryFallback) {
+            logger.warn(
+              `[BackgroundCortexService] Activation classifier timed out; trying fallback for ${agent_id}: ` +
+                `provider=${providerName}, model=${attempt.model}, source=${attempt.source}, ` +
+                `next_provider=${attempts[i + 1].provider}, next_model=${attempts[i + 1].model}`,
+            );
+            continue;
+          }
           return {
             shouldActivate: false,
             confidence: 0,
@@ -1483,22 +2630,33 @@ ${activationFormat}`;
         }
 
         const errorSummary = summarizeActivationError(error);
+        const markedUnhealthy = markActivationProviderUnhealthy({
+          provider: providerName,
+          model: attempt.model,
+          errorSummary,
+          req,
+        });
         providerAttempts.push({
           provider: providerName,
           model: attempt.model,
           source: attempt.source,
           status: 'error',
-          error: errorSummary,
+          error: sanitizeActivationErrorForLog(errorSummary),
+          markedUnhealthy,
         });
 
         const shouldRetry = i < attempts.length - 1 && isActivationFallbackCandidate(error);
         if (shouldRetry) {
           logger.warn(
-            `[BackgroundCortexService] Activation classifier failed for ${agent_id}; trying fallback`,
+            `[BackgroundCortexService] Activation classifier failed for ${agent_id}; trying fallback: ` +
+              `provider=${providerName}, model=${attempt.model}, source=${attempt.source}, ` +
+              `${formatActivationErrorSummaryForLog(errorSummary)}, ` +
+              `marked_unhealthy=${markedUnhealthy}, ` +
+              `next_provider=${attempts[i + 1].provider}, next_model=${attempts[i + 1].model}`,
             {
               provider: providerName,
               model: attempt.model,
-              error: errorSummary,
+              error: sanitizeActivationErrorForLog(errorSummary),
               nextProvider: attempts[i + 1].provider,
               nextModel: attempts[i + 1].model,
             },
@@ -1506,28 +2664,64 @@ ${activationFormat}`;
           continue;
         }
 
-        logger.error(`[BackgroundCortexService] Activation check failed for ${agent_id}:`, error);
+        if (errorSummary.class === 'provider_access_denied') {
+          logger.warn(
+            `[BackgroundCortexService] Activation classifier access denied for ${agent_id}. ` +
+              'Check provider account/network egress before retrying activation.',
+            {
+              provider: providerName,
+              model: attempt.model,
+              status: errorSummary.status,
+              code: errorSummary.code,
+            },
+          );
+        }
+
+        if (activationProviderAttemptsUnavailable(providerAttempts)) {
+          logger.error(
+            `[BackgroundCortexService] Activation providers unavailable for ${agent_id}`,
+            sanitizeActivationErrorForLog(errorSummary),
+          );
+          return {
+            shouldActivate: false,
+            confidence: 0,
+            reason: 'provider_unavailable',
+            agentId: agent_id,
+            providerAttempts,
+          };
+        }
+
+        logger.error(
+          `[BackgroundCortexService] Activation check failed for ${agent_id}`,
+          sanitizeActivationErrorForLog(errorSummary),
+        );
         return {
           shouldActivate: false,
           confidence: 0,
-          reason: 'error',
+          reason: errorSummary.class || 'provider_error',
           agentId: agent_id,
           providerAttempts,
         };
+      } finally {
+        if (attemptAbortTimer) {
+          clearTimeout(attemptAbortTimer);
+        }
       }
     }
 
     return {
       shouldActivate: false,
       confidence: 0,
-      reason: 'error',
+      reason: providerAttempts.some((attempt) => attempt.status === 'skipped_unhealthy')
+        ? 'provider_unavailable'
+        : 'error',
       agentId: agent_id,
       providerAttempts,
     };
   } catch (error) {
     // === VIVENTIUM START ===
     // Feature: Normalize aborted activation checks to timeout reason for Phase A accounting.
-    const isAborted = abortController?.signal?.aborted === true || error?.name === 'AbortError';
+    const isAborted = error?.name === 'AbortError';
     if (isAborted) {
       logger.info(
         `[BackgroundCortexService] Activation check timed out for ${agent_id} after ${activationTimeoutMs}ms`,
@@ -1535,15 +2729,11 @@ ${activationFormat}`;
       return { shouldActivate: false, confidence: 0, reason: 'global_timeout', agentId: agent_id };
     }
     // === VIVENTIUM END ===
-    logger.error(`[BackgroundCortexService] Activation check failed for ${agent_id}:`, error);
+    logger.error(
+      `[BackgroundCortexService] Activation check failed for ${agent_id}`,
+      sanitizeRuntimeErrorForLog(error),
+    );
     return { shouldActivate: false, confidence: 0, reason: 'error', agentId: agent_id };
-  } finally {
-    // === VIVENTIUM START ===
-    // Feature: cleanup activation timeout timer.
-    if (abortTimer) {
-      clearTimeout(abortTimer);
-    }
-    // === VIVENTIUM END ===
   }
 }
 
@@ -1657,7 +2847,8 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
      * attached/loaded files in the request context.
      */
     const hasRequestFiles = Array.isArray(safeReq.body?.files) && safeReq.body.files.length > 0;
-    const autoFileSearchEnabled = (process.env.VIVENTIUM_CORTEX_AUTO_FILE_SEARCH || '1').trim() !== '0';
+    const autoFileSearchEnabled =
+      (process.env.VIVENTIUM_CORTEX_AUTO_FILE_SEARCH || '1').trim() !== '0';
     if (autoFileSearchEnabled && hasRequestFiles && Array.isArray(agentForRun.tools)) {
       if (!agentForRun.tools.includes(Tools.file_search)) {
         agentForRun.tools.push(Tools.file_search);
@@ -1673,10 +2864,7 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
     const voiceMode = safeReq.body?.voiceMode === true;
     const cortexOutputRules = buildCortexOutputInstructions({ voiceMode, surface, inputMode });
     if (cortexOutputRules) {
-      agentForRun.instructions = [
-        agentForRun.instructions || '',
-        cortexOutputRules,
-      ]
+      agentForRun.instructions = [agentForRun.instructions || '', cortexOutputRules]
         .filter((part) => typeof part === 'string' && part.trim().length > 0)
         .join('\n\n');
     }
@@ -1699,6 +2887,14 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
 
     if (providerName === 'anthropic') {
       sanitizeAnthropicThinkingTemperature(agentForRun, safeReq);
+    }
+
+    if (
+      providerName === 'openai' ||
+      providerName === 'open_ai' ||
+      providerName === 'azure_openai'
+    ) {
+      sanitizeOpenAIReasoningSampling(agentForRun, safeReq);
     }
 
     if (providerName === 'perplexity') {
@@ -1798,6 +2994,20 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
     if ((initializedAgent.provider || agentForRun.provider || '').toLowerCase() === 'anthropic') {
       sanitizeAnthropicThinkingTemperature(initializedAgent, safeReq);
     }
+    {
+      const initializedProvider = (
+        initializedAgent.provider ||
+        agentForRun.provider ||
+        ''
+      ).toLowerCase();
+      if (
+        initializedProvider === 'openai' ||
+        initializedProvider === 'open_ai' ||
+        initializedProvider === 'azure_openai'
+      ) {
+        sanitizeOpenAIReasoningSampling(initializedAgent, safeReq);
+      }
+    }
 
     /* === VIVENTIUM NOTE ===
      * Feature: Event-driven tool execution for background cortices.
@@ -1878,9 +3088,11 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
     const inputMessages =
       Array.isArray(scopedMessages) && scopedMessages.length > 0
         ? scopedMessages
-        : [new (require('@langchain/core/messages').HumanMessage)(
-            lastUserMessage || 'Analyze the latest conversation and respond.',
-          )];
+        : [
+            new (require('@langchain/core/messages').HumanMessage)(
+              lastUserMessage || 'Analyze the latest conversation and respond.',
+            ),
+          ];
 
     /* === VIVENTIUM START ===
      * Root-cause fix: apply strict-provider sanitization on background inputs.
@@ -1899,6 +3111,47 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
       inputMessages,
     );
     /* === VIVENTIUM NOTE === */
+    logPromptFrame(
+      logger,
+      buildPromptFrame({
+        promptFamily: 'cortex_execution',
+        surface,
+        provider: initializedAgent.provider || agentForRun.provider,
+        model:
+          initializedAgent.model_parameters?.model ||
+          initializedAgent.model ||
+          agentForRun.model_parameters?.model ||
+          agentForRun.model,
+        authClass: initializedAgent.userMCPAuthMap ? 'connected_account_runtime' : 'user_runtime',
+        layers: {
+          cortex_instructions: initializedAgent.instructions || agentForRun.instructions || '',
+          productivity_runtime_instructions: productivityRuntimeInstructions || '',
+          time_context: timeContextInstructions || '',
+          file_context: fileContextBlock || '',
+          memory_context: memoryContextBlock || '',
+          cortex_output_rules: cortexOutputRules || '',
+          no_response_instructions: noResponseInstructions || '',
+          formatted_input_messages: providerSafeInputMessages,
+        },
+        promptSourceFiles: {
+          background_cortex_service: __filename,
+        },
+        flags: {
+          voice_mode: voiceMode,
+          input_mode: inputMode,
+          productivity_context_isolated: isolateProductivityContext,
+          has_request_files: hasRequestFiles,
+          no_response_injected: !!noResponseInstructions,
+          tool_count: Array.isArray(initializedAgent.tools) ? initializedAgent.tools.length : 0,
+        },
+        decisionState: {
+          activation_scope_present: !!activationScope,
+          productivity_scope_present: !!productivityScope,
+          agent_id_hash: hashString(agent?.id, 12),
+        },
+        voiceText: initializedAgent.instructions || agentForRun.instructions || '',
+      }),
+    );
 
     /* === VIVENTIUM NOTE ===
      * Enable built-in Run pruning by providing tokenCounter/indexTokenCountMap.
@@ -2005,7 +3258,7 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
           'no live tools completed in this run',
         {
           agentId: agent.id,
-          latestUserText,
+          latestUserTextHash: hashString(latestUserText, 12),
         },
       );
       return {
@@ -2013,12 +3266,34 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
         agentName: agent.name || agent.id,
         insight: null,
         error: 'no_live_tool_execution',
+        errorClass: 'no_live_tool_execution',
+      };
+    }
+
+    if (!insight.trim() && shouldRetryBackgroundCortexContentPartsWithFallback(contentParts)) {
+      const providerErrorText =
+        extractAggregatedProviderErrorText(contentParts) || 'recoverable_provider_error';
+      const publicProviderError = publicCortexError(providerErrorText);
+      logger.warn(
+        `[BackgroundCortexService] Cortex ${agent.id} produced recoverable provider error before insight: ` +
+          publicProviderError.errorClass,
+      );
+      return {
+        agentId: agent.id,
+        agentName: agent.name || agent.id,
+        insight: null,
+        error: publicProviderError.message,
+        errorClass: publicProviderError.errorClass,
+        recoverableProviderError: true,
+        activationScope,
+        configuredTools: initializedAgent.tools?.length || 0,
+        completedToolCalls: toolExecutionState.completed || 0,
       };
     }
 
     logger.info(
       `[BackgroundCortexService] Cortex ${agent.name || agent.id} executed in ${duration}ms ` +
-      `(configured_tools: ${initializedAgent.tools?.length || 0}, completed_tool_calls: ${toolExecutionState.completed})`
+        `(configured_tools: ${initializedAgent.tools?.length || 0}, completed_tool_calls: ${toolExecutionState.completed})`,
     );
 
     return {
@@ -2030,13 +3305,12 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
       completedToolCalls: toolExecutionState.completed || 0,
     };
   } catch (error) {
-    const isAborted =
-      abortController?.signal?.aborted === true || error?.name === 'AbortError';
+    const isAborted = abortController?.signal?.aborted === true || error?.name === 'AbortError';
     // Log provider/model context for faster diagnosis (do NOT log api keys).
     logger.error(
       `[BackgroundCortexService] Cortex execution failed for ${agent.id} ` +
         `(provider=${agent.provider || 'unknown'}, model=${agent.model || agent.model_parameters?.model || 'unknown'}):`,
-      error,
+      sanitizeRuntimeErrorForLog(error, isAborted ? 'timeout' : ''),
     );
     return {
       agentId: agent.id,
@@ -2093,16 +3367,36 @@ async function detectActivations({
   // We will only wait for metadata up to the remaining global budget.
   const metaLoadStartAt = Date.now();
   const metaById = new Map();
+  const resolvedMetaById = new Map();
+  const cortexConfigById = new Map();
   for (const cortexConfig of backgroundCortices) {
     const agentId = cortexConfig.agent_id;
+    cortexConfigById.set(agentId, cortexConfig);
     metaById.set(
       agentId,
-      loadAgent({ req, agent_id: agentId, endpoint: mainAgent.provider }).catch(() => null),
+      loadAgent({ req, agent_id: agentId, endpoint: mainAgent.provider })
+        .then((meta) => {
+          if (meta) {
+            resolvedMetaById.set(agentId, meta);
+          }
+          return meta;
+        })
+        .catch(() => null),
     );
   }
-  logVoicePhaseAStage(req, 'activation_meta_preload_started', metaLoadStartAt, `cortex_count=${metaById.size}`);
+  logVoicePhaseAStage(
+    req,
+    'activation_meta_preload_started',
+    metaLoadStartAt,
+    `cortex_count=${metaById.size}`,
+  );
 
   const timeLeftMs = () => Math.max(0, deadline - Date.now());
+  const activationPolicyMainAgent = await resolveActivationPolicyMainAgent({
+    req,
+    mainAgent,
+    timeoutMs: Math.min(250, timeLeftMs()),
+  });
 
   const activationPromises = backgroundCortices.map(async (cortexConfig) => {
     const agentId = cortexConfig.agent_id;
@@ -2118,7 +3412,10 @@ async function detectActivations({
           status: 'activating',
         });
       } catch (e) {
-        logger.warn('[BackgroundCortexService] onActivationStart callback failed:', e);
+        logger.warn(
+          '[BackgroundCortexService] onActivationStart callback failed',
+          sanitizeRuntimeErrorForLog(e),
+        );
       }
     }
 
@@ -2159,7 +3456,7 @@ async function detectActivations({
             messages,
             runId,
             req,
-            mainAgent,
+            mainAgent: activationPolicyMainAgent,
             timeoutMs,
           }),
         ),
@@ -2209,13 +3506,20 @@ async function detectActivations({
       const directActionSurfaces = Array.isArray(result.directActionSurfaces)
         ? result.directActionSurfaces.map((item) => String(item || '').trim()).filter(Boolean)
         : [];
+      const directActionSurfaceScopes = normalizeDirectActionSurfaceScopes(
+        result.directActionSurfaceScopes,
+      );
+      const directActionScopeKeys = directActionSurfaceScopes
+        .map((surface) => surface.scopeKey)
+        .filter(Boolean);
       logVoicePhaseAStage(
         req,
         'activation_check_done',
         cortexCheckStartAt,
         `agent_id=${agentId} activate=${shouldActivate} reason=${reason || 'none'} ` +
           `confidence=${confidence.toFixed(2)} timeout_budget_ms=${timeoutMs} ` +
-          `direct_action_surfaces=${directActionSurfaces.join(',') || 'none'}`,
+          `direct_action_surfaces=${directActionSurfaces.join(',') || 'none'} ` +
+          `direct_action_scope_keys=${directActionScopeKeys.join(',') || 'none'}`,
       );
 
       return {
@@ -2225,16 +3529,22 @@ async function detectActivations({
         agentId,
         activationScope,
         directActionSurfaces,
+        directActionSurfaceScopes,
+        providerAttempts: Array.isArray(result.providerAttempts) ? result.providerAttempts : [],
         durationMs,
         timeoutBudgetMs: timeoutMs,
       };
     } catch (error) {
-      logger.error(`[BackgroundCortexService] Activation check failed for ${agentId}:`, error);
+      const publicError = publicCortexError(error?.message || error);
+      logger.error(
+        `[BackgroundCortexService] Activation check failed for ${agentId}`,
+        sanitizeRuntimeErrorForLog(error, publicError.errorClass),
+      );
       logVoicePhaseAStage(
         req,
         'activation_check_error',
         cortexCheckStartAt,
-        `agent_id=${agentId} reason=${String(error?.message || 'unknown').replace(/\s+/g, '_')}`,
+        `agent_id=${agentId} reason=${publicError.errorClass}`,
       );
       return {
         shouldActivate: false,
@@ -2250,48 +3560,38 @@ async function detectActivations({
 
   // Collect results (all wrappers resolve by deadline)
   const activationCollectStartAt = Date.now();
-  const activationResults = await Promise.all(activationPromises);
+  const rawActivationResults = await Promise.all(activationPromises);
+  const activationResults = rawActivationResults.map(applyDirectActionOwnershipGate);
   logVoicePhaseAStage(
     req,
     'activation_collect_done',
     activationCollectStartAt,
-    `results=${activationResults.length}`,
+    `results=${activationResults.length} direct_action_suppressed=${
+      activationResults.filter((r) => r?.suppressedByDirectActionOwnership === true).length
+    }`,
   );
-  const timedOut = activationResults.some((r) => r.reason === 'global_timeout');
 
-  // Notify skipped ones (includes timeouts)
-  if (onCortexSkipped) {
-    for (const r of activationResults) {
-      if (r.shouldActivate) {
-        continue;
-      }
-      try {
-        onCortexSkipped({
-          cortex_id: r.agentId,
-          cortex_name: r.agentId,
-          status: 'skipped',
-          confidence: r.confidence,
-          reason: r.reason,
-        });
-      } catch (e) {
-        logger.warn('[BackgroundCortexService] onCortexSkipped callback failed:', e);
-      }
-    }
-  }
-
-  // Build activated list
-  const activated = activationResults.filter((r) => r.shouldActivate);
-
-  // Attach best-effort metadata for activated cortices (within remaining global budget)
+  // Attach best-effort metadata to every result. When all activation providers
+  // are unavailable, this also lets us surface explicit, user-named configured
+  // agents as terminal error cards instead of silently dropping visibility.
   const remainingForMetaMs = timeLeftMs();
   const metaAttachStartAt = Date.now();
-  const withMeta = await Promise.all(
-    activated.map(async (r) => {
-      let cortexName = r.agentId;
+  const activationResultsWithMeta = await Promise.all(
+    activationResults.map(async (r) => {
+      const cortexConfig = cortexConfigById.get(r.agentId);
+      let cortexName = configuredCortexDisplayName(cortexConfig) || r.agentId;
       let cortexDescription = '';
 
+      const resolvedMeta = resolvedMetaById.get(r.agentId);
+      if (resolvedMeta) {
+        cortexName = sanitizeCortexDisplayName(resolvedMeta.name || cortexName);
+        cortexDescription = String(resolvedMeta.description || '')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, 220);
+      }
       const metaPromise = metaById.get(r.agentId);
-      if (metaPromise && remainingForMetaMs > 0) {
+      if (!resolvedMeta && metaPromise && remainingForMetaMs > 0) {
         try {
           const meta = await Promise.race([
             metaPromise,
@@ -2299,34 +3599,101 @@ async function detectActivations({
           ]);
           if (meta) {
             cortexName = sanitizeCortexDisplayName(meta.name || cortexName);
-            cortexDescription = meta.description || '';
+            cortexDescription = String(meta.description || '')
+              .replace(/\s+/g, ' ')
+              .trim()
+              .slice(0, 220);
           }
         } catch (e) {
-          logger.debug('[BackgroundCortexService] Failed to load cortex metadata:', e);
+          logger.debug(
+            '[BackgroundCortexService] Failed to load cortex metadata',
+            sanitizeRuntimeErrorForLog(e),
+          );
         }
       }
 
+      const shouldSurfaceUnavailable = shouldSurfaceActivationProviderUnavailable({
+        activationResult: r,
+        cortexConfig,
+      });
+      const shouldSurfaceTimeout = shouldSurfaceActivationTimeout({
+        activationResult: r,
+        cortexConfig,
+      });
+      const shouldSurfaceTerminal = shouldSurfaceUnavailable || shouldSurfaceTimeout;
+
       return {
-        agentId: r.agentId,
+        ...r,
+        shouldActivate: shouldSurfaceTerminal ? true : r.shouldActivate,
+        confidence: shouldSurfaceTerminal ? 0 : r.confidence,
+        reason: shouldSurfaceUnavailable ? 'activation_provider_unavailable' : r.reason,
+        activationProviderUnavailable: shouldSurfaceUnavailable === true,
+        activationTimedOut: shouldSurfaceTimeout === true,
+        errorClass: shouldSurfaceUnavailable
+          ? 'activation_provider_unavailable'
+          : shouldSurfaceTimeout
+            ? 'timeout'
+            : r.errorClass,
         cortexName,
         cortexDescription,
-        activationScope: r.activationScope || null,
-        confidence: r.confidence,
-        reason: r.reason,
-        durationMs: Number.isFinite(r.durationMs) ? r.durationMs : null,
-        timeoutBudgetMs: Number.isFinite(r.timeoutBudgetMs) ? r.timeoutBudgetMs : null,
       };
-    })
+    }),
   );
   logVoicePhaseAStage(
     req,
     'activation_meta_attach_done',
     metaAttachStartAt,
-    `activated=${withMeta.length} remaining_budget_ms=${remainingForMetaMs}`,
+    `results=${activationResultsWithMeta.length} activated=${
+      activationResultsWithMeta.filter((r) => r?.shouldActivate === true).length
+    } unavailable_visible=${
+      activationResultsWithMeta.filter((r) => r?.activationProviderUnavailable === true).length
+    } remaining_budget_ms=${remainingForMetaMs}`,
   );
+  const timedOut = activationResultsWithMeta.some((r) => r.reason === 'global_timeout');
+
+  // Notify skipped ones (includes timeouts)
+  if (onCortexSkipped) {
+    for (const r of activationResultsWithMeta) {
+      if (r.shouldActivate) {
+        continue;
+      }
+      try {
+        onCortexSkipped({
+          cortex_id: r.agentId,
+          cortex_name: r.cortexName || r.agentId,
+          status: 'skipped',
+          confidence: r.confidence,
+          reason: r.reason,
+        });
+      } catch (e) {
+        logger.warn(
+          '[BackgroundCortexService] onCortexSkipped callback failed',
+          sanitizeRuntimeErrorForLog(e),
+        );
+      }
+    }
+  }
+
+  // Build activated list
+  const activated = activationResultsWithMeta.filter((r) => r.shouldActivate);
+  const withMeta = activated.map((r) => ({
+    agentId: r.agentId,
+    cortexName: r.cortexName || r.agentId,
+    cortexDescription: r.cortexDescription || '',
+    activationScope: r.activationScope || null,
+    directActionSurfaces: Array.isArray(r.directActionSurfaces) ? r.directActionSurfaces : [],
+    directActionSurfaceScopes: normalizeDirectActionSurfaceScopes(r.directActionSurfaceScopes),
+    confidence: r.confidence,
+    reason: r.reason,
+    activationProviderUnavailable: r.activationProviderUnavailable === true,
+    activationTimedOut: r.activationTimedOut === true,
+    errorClass: r.errorClass || null,
+    durationMs: Number.isFinite(r.durationMs) ? r.durationMs : null,
+    timeoutBudgetMs: Number.isFinite(r.timeoutBudgetMs) ? r.timeoutBudgetMs : null,
+  }));
 
   const duration = Date.now() - startTime;
-  const sortedDurations = activationResults
+  const sortedDurations = activationResultsWithMeta
     .map((r) => ({
       agentId: r.agentId,
       durationMs: Number.isFinite(r.durationMs) ? r.durationMs : null,
@@ -2337,15 +3704,29 @@ async function detectActivations({
     .sort((a, b) => b.durationMs - a.durationMs);
   const topDurations = sortedDurations
     .slice(0, 5)
-    .map((item) => `${item.agentId}:${item.durationMs}:${item.shouldActivate ? 'on' : 'off'}:${item.reason}`)
+    .map(
+      (item) =>
+        `${item.agentId}:${item.durationMs}:${item.shouldActivate ? 'on' : 'off'}:${item.reason}`,
+    )
     .join(',');
-  const timeoutCount = activationResults.filter((r) => r.reason === 'global_timeout').length;
-  const activatedCount = activationResults.filter((r) => r.shouldActivate === true).length;
+  const timeoutCount = activationResultsWithMeta.filter(
+    (r) => r.reason === 'global_timeout',
+  ).length;
+  const activatedCount = activationResultsWithMeta.filter((r) => r.shouldActivate === true).length;
+  const reasonCounts = activationResultsWithMeta.reduce((acc, r) => {
+    const key = r.reason || 'none';
+    acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
+  const reasonSummary = Object.entries(reasonCounts)
+    .map(([reason, count]) => `${reason}:${count}`)
+    .join(',');
   logVoicePhaseAStage(
     req,
     'activation_detect_done',
     startTime,
-    `total=${activationResults.length} activated=${activatedCount} timed_out=${timeoutCount} top_slowest=${topDurations || 'none'}`,
+    `total=${activationResults.length} activated=${activatedCount} timed_out=${timeoutCount} ` +
+      `reasons=${reasonSummary || 'none'} top_slowest=${topDurations || 'none'}`,
   );
 
   logger.info(
@@ -2386,6 +3767,49 @@ async function executeActivated({
   }
 
   const executionTimeoutMs = getCortexExecutionTimeoutMs();
+  let modelsConfigPromise = null;
+  const getModelsConfigOnce = () => {
+    if (!modelsConfigPromise) {
+      modelsConfigPromise = loadModelsConfigForCortexFallback(req).catch((error) => {
+        logger.warn(
+          '[BackgroundCortexService] Failed to load models config for cortex fallback',
+          sanitizeRuntimeErrorForLog(error),
+        );
+        return null;
+      });
+    }
+    return modelsConfigPromise;
+  };
+  const runCortexWithGuard = async ({ agent, activationResult }) => {
+    const cortexPromise = executeCortex({
+      agent,
+      messages,
+      runId,
+      req,
+      res,
+      activationScope: activationResult.activationScope || null,
+    });
+    const guardTimeoutMs = getCortexAttemptGuardTimeoutMs(executionTimeoutMs);
+    if (!guardTimeoutMs) {
+      return cortexPromise;
+    }
+    let timeoutId = null;
+    const timeoutPromise = new Promise((resolve) => {
+      timeoutId = setTimeout(() => {
+        resolve({
+          agentId: activationResult.agentId,
+          agentName: agent.name || activationResult.agentId,
+          insight: null,
+          error: 'timeout',
+        });
+      }, guardTimeoutMs);
+    });
+    const result = await Promise.race([cortexPromise, timeoutPromise]);
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+    return result;
+  };
 
   // Execute all activated cortices in parallel
   const executionPromises = activatedCortices.map(async (activationResult) => {
@@ -2398,7 +3822,26 @@ async function executeActivated({
       });
 
       if (!cortexAgent) {
-        logger.warn(`[BackgroundCortexService] Cortex agent not found: ${activationResult.agentId}`);
+        logger.warn(
+          `[BackgroundCortexService] Cortex agent not found: ${activationResult.agentId}`,
+        );
+        if (onCortexComplete) {
+          try {
+            onCortexComplete(
+              buildCortexCompletionPayload(
+                buildCompletionInputFromActivation({
+                  activationResult,
+                  error: 'Cortex agent not found',
+                }),
+              ),
+            );
+          } catch (e) {
+            logger.warn(
+              '[BackgroundCortexService] onCortexComplete missing-agent callback failed',
+              sanitizeRuntimeErrorForLog(e),
+            );
+          }
+        }
         return null;
       }
 
@@ -2413,82 +3856,157 @@ async function executeActivated({
             reason: activationResult.reason,
           });
         } catch (e) {
-          logger.warn('[BackgroundCortexService] onCortexBrewing callback failed:', e);
+          logger.warn(
+            '[BackgroundCortexService] onCortexBrewing callback failed',
+            sanitizeRuntimeErrorForLog(e),
+          );
         }
       }
 
-      // Execute cortex with tools
-      const cortexPromise = executeCortex({
-        agent: cortexAgent,
-        messages,
-        runId,
-        req,
-        res,
-        activationScope: activationResult.activationScope || null,
-      });
-      let timeoutId = null;
-      const timeoutPromise = new Promise((resolve) => {
-        timeoutId = setTimeout(() => {
-          resolve({
-            agentId: activationResult.agentId,
-            agentName: cortexAgent.name || activationResult.agentId,
-            insight: null,
-            error: 'timeout',
-          });
-        }, executionTimeoutMs);
-      });
+      if (
+        activationResult.activationProviderUnavailable === true ||
+        activationResult.activationTimedOut === true
+      ) {
+        const terminalError =
+          activationResult.activationProviderUnavailable === true
+            ? 'activation_provider_unavailable'
+            : 'timeout';
+        const unavailableResult = {
+          agentId: activationResult.agentId,
+          agentName: cortexAgent.name || activationResult.cortexName || activationResult.agentId,
+          insight: null,
+          error: terminalError,
+          errorClass: activationResult.errorClass || terminalError,
+          activationScope: activationResult.activationScope || null,
+          configuredTools: Array.isArray(cortexAgent.tools) ? cortexAgent.tools.length : 0,
+          completedToolCalls: 0,
+        };
+        if (onCortexComplete) {
+          try {
+            onCortexComplete(
+              buildCortexCompletionPayload(
+                buildCompletionInputFromActivation({
+                  activationResult,
+                  cortexAgent,
+                  result: unavailableResult,
+                }),
+              ),
+            );
+          } catch (e) {
+            logger.warn(
+              '[BackgroundCortexService] onCortexComplete provider-unavailable callback failed',
+              sanitizeRuntimeErrorForLog(e),
+            );
+          }
+        }
+        return unavailableResult;
+      }
+
+      const fallbackAgent = resolveFallbackAssignment(cortexAgent)
+        ? await resolveBackgroundCortexFallbackAgent({
+            cortexAgent,
+            req,
+            modelsConfig: await getModelsConfigOnce(),
+          })
+        : null;
 
       /** @type {any} */
-      const result = await Promise.race([cortexPromise, timeoutPromise]);
-      if (timeoutId) {
-        clearTimeout(timeoutId);
+      let result;
+      try {
+        result = await runCortexWithGuard({ agent: cortexAgent, activationResult });
+      } catch (error) {
+        const publicError = publicCortexError(error?.message || error);
+        logger.error(
+          `[BackgroundCortexService] Cortex execution failed for ${activationResult.agentId} ` +
+            `before fallback: class=${publicError.errorClass}`,
+        );
+        logger.debug(
+          '[BackgroundCortexService] Primary cortex execution failure detail',
+          sanitizeRuntimeErrorForLog(error, publicError.errorClass),
+        );
+        result = {
+          agentId: activationResult.agentId,
+          agentName: cortexAgent.name || activationResult.cortexName || activationResult.agentId,
+          insight: null,
+          error: publicError.message,
+          errorClass: publicError.errorClass,
+          activationScope: activationResult.activationScope || null,
+          configuredTools: Array.isArray(cortexAgent.tools) ? cortexAgent.tools.length : 0,
+          completedToolCalls: 0,
+        };
+      }
+      if (fallbackAgent && shouldRetryBackgroundCortexWithFallback(result)) {
+        const primaryProvider = cortexAgent.provider || 'unknown';
+        const primaryModel = cortexAgent.model || cortexAgent.model_parameters?.model || 'unknown';
+        const fallbackProvider = fallbackAgent.provider || 'unknown';
+        const fallbackModel =
+          fallbackAgent.model || fallbackAgent.model_parameters?.model || 'unknown';
+        const primaryError = result?.error || 'unknown';
+        const publicPrimaryError = publicCortexError(
+          primaryError,
+          result?.errorClass || result?.error_class,
+        );
+        logger.warn(
+          `[BackgroundCortexService] Cortex ${activationResult.agentId} primary ` +
+            `${primaryProvider}/${primaryModel} failed before insight (${publicPrimaryError.errorClass}); ` +
+            `retrying fallback ${fallbackProvider}/${fallbackModel}`,
+        );
+        const fallbackResult = await runCortexWithGuard({ agent: fallbackAgent, activationResult });
+        result = {
+          ...fallbackResult,
+          fallbackUsed: true,
+          fallbackProvider,
+          fallbackModel,
+          primaryProvider,
+          primaryModel,
+          primaryError: publicPrimaryError.message,
+          primaryErrorClass: publicPrimaryError.errorClass,
+        };
       }
 
-      // Notify UI only when there is a real insight. Empty/{NTA} cortex output is silent success.
-      if (result && !result.error && hasVisibleCortexInsight(result.insight) && onCortexComplete) {
+      const completionPayload = buildCortexCompletionPayload(
+        buildCompletionInputFromActivation({ activationResult, cortexAgent, result }),
+      );
+      if (completionPayload && onCortexComplete) {
         try {
-          onCortexComplete({
-            cortex_id: result.agentId,
-            cortex_name: sanitizeCortexDisplayName(result.agentName),
-            status: 'complete',
-            insight: result.insight,
-            activation_scope: result.activationScope || null,
-            configured_tools: result.configuredTools || 0,
-            completed_tool_calls: result.completedToolCalls || 0,
-          });
+          onCortexComplete(completionPayload);
         } catch (e) {
-          logger.warn('[BackgroundCortexService] onCortexComplete callback failed:', e);
-        }
-      } else if (result && result.error && onCortexComplete) {
-        // Handle error case where executeCortex returned error object instead of throwing
-        // This ensures UI updates from "Analyzing..." to "Error" state
-        try {
-          onCortexComplete({
-            cortex_id: result.agentId,
-            cortex_name: sanitizeCortexDisplayName(result.agentName),
-            status: 'error',
-            error: result.error,
-          });
-        } catch (e) {
-          logger.warn('[BackgroundCortexService] onCortexComplete error callback failed:', e);
+          logger.warn(
+            '[BackgroundCortexService] onCortexComplete callback failed',
+            sanitizeRuntimeErrorForLog(e),
+          );
         }
       }
 
       return result;
     } catch (error) {
-      logger.error(`[BackgroundCortexService] Failed to execute cortex ${activationResult.agentId}:`, error);
+      const rawError = error?.message || 'Cortex execution failed';
+      const publicError = publicCortexError(rawError);
+      logger.error(
+        `[BackgroundCortexService] Failed to execute cortex ${activationResult.agentId}: ` +
+          `class=${publicError.errorClass}`,
+      );
+      logger.debug(
+        '[BackgroundCortexService] Cortex execution failure detail',
+        sanitizeRuntimeErrorForLog(error, publicError.errorClass),
+      );
 
       // Notify UI of error so it doesn't stay stuck on "Analyzing..."
       if (onCortexComplete) {
         try {
-          onCortexComplete({
-            cortex_id: activationResult.agentId,
-            cortex_name: sanitizeCortexDisplayName(activationResult.cortexName || activationResult.agentId),
-            status: 'error',
-            error: error.message,
-          });
+          onCortexComplete(
+            buildCortexCompletionPayload(
+              buildCompletionInputFromActivation({
+                activationResult,
+                error: rawError,
+              }),
+            ),
+          );
         } catch (e) {
-          logger.warn('[BackgroundCortexService] onCortexComplete error callback failed:', e);
+          logger.warn(
+            '[BackgroundCortexService] onCortexComplete error callback failed',
+            sanitizeRuntimeErrorForLog(e),
+          );
         }
       }
 
@@ -2496,7 +4014,8 @@ async function executeActivated({
         agentId: activationResult.agentId,
         agentName: activationResult.cortexName || activationResult.agentId,
         insight: null,
-        error: error?.message || 'Cortex execution failed',
+        error: publicError.message,
+        errorClass: publicError.errorClass,
       };
     }
   });
@@ -2513,14 +4032,24 @@ async function executeActivated({
       return s.value;
     }
     // Should never happen (each promise has its own try/catch), but handle gracefully.
-    logger.error('[BackgroundCortexService] Unexpected cortex promise rejection:', s.reason);
-    return { agentId: 'unknown', agentName: 'unknown', insight: null, error: s.reason?.message || 'Unexpected rejection' };
+    logger.error(
+      '[BackgroundCortexService] Unexpected cortex promise rejection',
+      sanitizeRuntimeErrorForLog(s.reason),
+    );
+    const publicError = publicCortexError(s.reason?.message || 'Unexpected rejection');
+    return {
+      agentId: 'unknown',
+      agentName: 'unknown',
+      insight: null,
+      error: publicError.message,
+      errorClass: publicError.errorClass,
+    };
   });
 
   // Collect and merge insights
   const insights = executionResults
-    .filter(r => r && r.insight)
-    .map(r => ({
+    .filter((r) => r && hasVisibleCortexInsight(r.insight))
+    .map((r) => ({
       cortexId: r.agentId,
       cortexName: sanitizeCortexDisplayName(r.agentName),
       insight: r.insight,
@@ -2531,15 +4060,22 @@ async function executeActivated({
 
   // Collect errors for reporting
   const errors = executionResults
-    .filter(r => r && r.error)
-    .map(r => ({
-      cortexId: r.agentId,
-      cortexName: sanitizeCortexDisplayName(r.agentName),
-      error: r.error,
-    }));
+    .filter((r) => r && r.error)
+    .map((r) => {
+      const publicError = publicCortexError(r.error, r.errorClass || r.error_class);
+      return {
+        cortexId: r.agentId,
+        cortexName: sanitizeCortexDisplayName(r.agentName),
+        error: publicError.message,
+        error_class: publicError.errorClass,
+      };
+    });
+  const silentCompletions = executionResults.filter(
+    (r) => r && !r.error && !hasVisibleCortexInsight(r.insight),
+  ).length;
 
   logger.info(
-    `[BackgroundCortexService] Execution complete: ${insights.length}/${activatedCortices.length} insights collected, ${errors.length} errors`
+    `[BackgroundCortexService] Execution complete: ${insights.length}/${activatedCortices.length} visible insights, ${silentCompletions} silent completions, ${errors.length} errors`,
   );
 
   // Notify when ALL complete - fire even if no insights (to trigger follow-up with error info)
@@ -2565,9 +4101,10 @@ async function executeActivated({
           hasErrors: true,
         });
       } else {
-        // Edge case: no insights, no errors (shouldn't happen, but handle gracefully)
-        // Still trigger onAllComplete so follow-up logic can decide what to do
-        logger.warn('[BackgroundCortexService] No insights and no errors - this is unexpected');
+        // A cortex may intentionally complete with no user-visible output ({NTA}).
+        logger.info(
+          `[BackgroundCortexService] Background execution finished with no visible insights (${silentCompletions} silent completions)`,
+        );
         onAllComplete({
           insights: [],
           mergedPrompt: '', // Empty but defined - follow-up check will handle this
@@ -2576,7 +4113,10 @@ async function executeActivated({
         });
       }
     } catch (e) {
-      logger.warn('[BackgroundCortexService] onAllComplete callback failed:', e);
+      logger.warn(
+        '[BackgroundCortexService] onAllComplete callback failed',
+        sanitizeRuntimeErrorForLog(e),
+      );
     }
   }
 
@@ -2613,7 +4153,7 @@ async function processBackgroundCortices({
   }
 
   logger.info(
-    `[BackgroundCortexService] Processing ${backgroundCortices.length} background cortices for agent ${mainAgent.name || mainAgent.id}`
+    `[BackgroundCortexService] Processing ${backgroundCortices.length} background cortices for agent ${mainAgent.name || mainAgent.id}`,
   );
 
   // Phase 0: Pre-load cortex agent names for better UI display
@@ -2630,9 +4170,11 @@ async function processBackgroundCortices({
           cortexNameMap.set(cortexConfig.agent_id, cortexAgent.name || cortexConfig.agent_id);
         }
       } catch (e) {
-        logger.warn(`[BackgroundCortexService] Failed to pre-load cortex name for ${cortexConfig.agent_id}`);
+        logger.warn(
+          `[BackgroundCortexService] Failed to pre-load cortex name for ${cortexConfig.agent_id}`,
+        );
       }
-    })
+    }),
   );
 
   // Phase 1: Run activation detection for all cortices in parallel
@@ -2649,7 +4191,10 @@ async function processBackgroundCortices({
           status: 'activating',
         });
       } catch (e) {
-        logger.warn('[BackgroundCortexService] onActivationStart callback failed:', e);
+        logger.warn(
+          '[BackgroundCortexService] onActivationStart callback failed',
+          sanitizeRuntimeErrorForLog(e),
+        );
       }
     }
 
@@ -2664,8 +4209,17 @@ async function processBackgroundCortices({
       // Attach the name to the result for later use
       return { ...result, cortexName };
     } catch (error) {
-      logger.error(`[BackgroundCortexService] Failed to check activation for ${cortexConfig.agent_id}:`, error);
-      return { shouldActivate: false, confidence: 0, reason: 'error', agentId: cortexConfig.agent_id, cortexName };
+      logger.error(
+        `[BackgroundCortexService] Failed to check activation for ${cortexConfig.agent_id}`,
+        sanitizeRuntimeErrorForLog(error),
+      );
+      return {
+        shouldActivate: false,
+        confidence: 0,
+        reason: 'error',
+        agentId: cortexConfig.agent_id,
+        cortexName,
+      };
     }
   });
 
@@ -2686,13 +4240,16 @@ async function processBackgroundCortices({
           reason: result.reason,
         });
       } catch (e) {
-        logger.warn('[BackgroundCortexService] onCortexSkipped callback failed:', e);
+        logger.warn(
+          '[BackgroundCortexService] onCortexSkipped callback failed',
+          sanitizeRuntimeErrorForLog(e),
+        );
       }
     }
   }
 
   logger.info(
-    `[BackgroundCortexService] Activation results: ${activatedCortices.length}/${backgroundCortices.length} cortices activated`
+    `[BackgroundCortexService] Activation results: ${activatedCortices.length}/${backgroundCortices.length} cortices activated`,
   );
 
   if (!activatedCortices.length) {
@@ -2710,7 +4267,26 @@ async function processBackgroundCortices({
       });
 
       if (!cortexAgent) {
-        logger.warn(`[BackgroundCortexService] Cortex agent not found: ${activationResult.agentId}`);
+        logger.warn(
+          `[BackgroundCortexService] Cortex agent not found: ${activationResult.agentId}`,
+        );
+        if (onCortexComplete) {
+          try {
+            onCortexComplete(
+              buildCortexCompletionPayload(
+                buildCompletionInputFromActivation({
+                  activationResult,
+                  error: 'Cortex agent not found',
+                }),
+              ),
+            );
+          } catch (e) {
+            logger.warn(
+              '[BackgroundCortexService] onCortexComplete missing-agent callback failed',
+              sanitizeRuntimeErrorForLog(e),
+            );
+          }
+        }
         return null;
       }
 
@@ -2725,7 +4301,10 @@ async function processBackgroundCortices({
             reason: activationResult.reason,
           });
         } catch (e) {
-          logger.warn('[BackgroundCortexService] onCortexBrewing callback failed:', e);
+          logger.warn(
+            '[BackgroundCortexService] onCortexBrewing callback failed',
+            sanitizeRuntimeErrorForLog(e),
+          );
         }
       }
 
@@ -2737,47 +4316,49 @@ async function processBackgroundCortices({
         activationScope: activationResult.activationScope || null,
       });
 
-      // Notify UI when cortex completes with insight
-      if (result && result.insight && onCortexComplete) {
+      const completionPayload = buildCortexCompletionPayload(
+        buildCompletionInputFromActivation({ activationResult, cortexAgent, result }),
+      );
+      if (completionPayload && onCortexComplete) {
         try {
-          onCortexComplete({
-            cortex_id: result.agentId,
-            cortex_name: sanitizeCortexDisplayName(result.agentName),
-            status: 'complete',
-            insight: result.insight,
-          });
+          onCortexComplete(completionPayload);
         } catch (e) {
-          logger.warn('[BackgroundCortexService] onCortexComplete callback failed:', e);
-        }
-      } else if (result && result.error && onCortexComplete) {
-        // Handle error case where executeCortex returned error object instead of throwing
-        try {
-          onCortexComplete({
-            cortex_id: result.agentId,
-            cortex_name: sanitizeCortexDisplayName(result.agentName),
-            status: 'error',
-            error: result.error,
-          });
-        } catch (e) {
-          logger.warn('[BackgroundCortexService] onCortexComplete error callback failed:', e);
+          logger.warn(
+            '[BackgroundCortexService] onCortexComplete callback failed',
+            sanitizeRuntimeErrorForLog(e),
+          );
         }
       }
 
       return result;
     } catch (error) {
-      logger.error(`[BackgroundCortexService] Failed to execute cortex ${activationResult.agentId}:`, error);
+      const rawError = error?.message || 'Cortex execution failed';
+      const publicError = publicCortexError(rawError);
+      logger.error(
+        `[BackgroundCortexService] Failed to execute cortex ${activationResult.agentId}: ` +
+          `class=${publicError.errorClass}`,
+      );
+      logger.debug(
+        '[BackgroundCortexService] Cortex execution failure detail',
+        sanitizeRuntimeErrorForLog(error, publicError.errorClass),
+      );
 
       // Notify UI of error so it doesn't stay stuck on "Analyzing..."
       if (onCortexComplete) {
         try {
-          onCortexComplete({
-            cortex_id: activationResult.agentId,
-            cortex_name: sanitizeCortexDisplayName(activationResult.cortexName || activationResult.agentId),
-            status: 'error',
-            error: error.message,
-          });
+          onCortexComplete(
+            buildCortexCompletionPayload(
+              buildCompletionInputFromActivation({
+                activationResult,
+                error: rawError,
+              }),
+            ),
+          );
         } catch (e) {
-          logger.warn('[BackgroundCortexService] onCortexComplete error callback failed:', e);
+          logger.warn(
+            '[BackgroundCortexService] onCortexComplete error callback failed',
+            sanitizeRuntimeErrorForLog(e),
+          );
         }
       }
 
@@ -2787,14 +4368,12 @@ async function processBackgroundCortices({
 
   /* === VIVENTIUM NOTE === Promise.allSettled for defensive safety (mirrors executeActivated) */
   const settledResults = await Promise.allSettled(executionPromises);
-  const executionResults = settledResults.map((s) =>
-    s.status === 'fulfilled' ? s.value : null,
-  );
+  const executionResults = settledResults.map((s) => (s.status === 'fulfilled' ? s.value : null));
 
   // Filter out failed executions and null insights
   const insights = executionResults
-    .filter(r => r && r.insight)
-    .map(r => ({
+    .filter((r) => r && hasVisibleCortexInsight(r.insight))
+    .map((r) => ({
       cortexId: r.agentId,
       cortexName: sanitizeCortexDisplayName(r.agentName),
       insight: r.insight,
@@ -2804,20 +4383,22 @@ async function processBackgroundCortices({
     }));
 
   logger.info(
-    `[BackgroundCortexService] Collected ${insights.length} insights from activated cortices`
+    `[BackgroundCortexService] Collected ${insights.length} insights from activated cortices`,
   );
 
   // Debug: Log actual insight content
   insights.forEach(({ cortexName, insight }) => {
     logger.debug(
-      `[BackgroundCortexService] Insight from ${cortexName}: ${insight.slice(0, 300)}${insight.length > 300 ? '...' : ''}`
+      `[BackgroundCortexService] Insight summary from ${cortexName}: len=${String(insight || '').length} hash=${hashString(insight, 12)}`,
     );
   });
 
   return {
-    activatedCortices: activatedCortices.map(a => ({
+    activatedCortices: activatedCortices.map((a) => ({
       agentId: a.agentId,
       activationScope: a.activationScope || null,
+      directActionSurfaces: Array.isArray(a.directActionSurfaces) ? a.directActionSurfaces : [],
+      directActionSurfaceScopes: normalizeDirectActionSurfaceScopes(a.directActionSurfaceScopes),
       cortexName: a.cortexName,
       confidence: a.confidence,
       reason: a.reason,
@@ -2836,9 +4417,9 @@ function formatInsightsForContext(insights) {
     return '';
   }
 
-  const formattedInsights = insights.map(({ cortexName, insight }) =>
-    `### ${cortexName}\n${insight}`
-  ).join('\n\n');
+  const formattedInsights = insights
+    .map(({ cortexName, insight }) => `### ${cortexName}\n${insight}`)
+    .join('\n\n');
 
   return `
 ## Background Agent Insights
@@ -2856,18 +4437,45 @@ module.exports = {
   mapProvider,
   getCustomEndpointConfig,
   clearActivationCooldowns,
-  detectActivations,        // NEW: Phase A - Activation detection with timeout
-  executeActivated,         // NEW: Phase B - Execute activated cortices with merging
-  processBackgroundCortices,  // Keep for backward compat (deprecated)
+  detectActivations, // NEW: Phase A - Activation detection with timeout
+  executeActivated, // NEW: Phase B - Execute activated cortices with merging
+  processBackgroundCortices, // Keep for backward compat (deprecated)
   formatInsightsForContext,
   checkCortexActivation,
   executeCortex,
   parseActivationResponse,
   formatHistoryForActivation,
   buildActivationPolicySection,
+  buildActivationDecisionSubjectSection,
+  applyActivationJsonMode,
+  resolveActivationPolicyMainAgent,
+  normalizeDirectActionScopeKey,
+  normalizeDirectActionSurfaceScopes,
+  applyDirectActionOwnershipGate,
   normalizeAgentToolNames,
   hasVisibleCortexInsight,
+  buildCortexCompletionPayload,
+  summarizeActivationError,
+  classifyActivationError,
+  buildActivationLlmConfig,
+  buildActivationProviderAttempts,
+  getCortexAttemptGuardTimeoutMs,
+  resolveBackgroundCortexFallbackAgent,
+  sanitizeOpenAIReasoningSampling,
+  buildActivationCooldownKey,
+  clearActivationProviderHealth,
+  getActivationProviderSuppression,
+  markActivationProviderUnhealthy,
+  shouldAttemptSuppressedActivationProvider,
+  shouldProbeSuppressedActivationAttempt,
+  activationProviderAttemptsUnavailable,
+  activationFailureVisibility,
+  shouldSurfaceActivationProviderUnavailable,
+  shouldSurfaceActivationTimeout,
+  deriveCortexDisplayNameFromAgentId,
+  configuredCortexDisplayName,
   ACTIVATION_SYSTEM_PROMPT,
+  DEFAULT_ACTIVATION_DECISION_SUBJECT_RULE,
   // Exported for unit testing only
   createBackgroundRes,
 };

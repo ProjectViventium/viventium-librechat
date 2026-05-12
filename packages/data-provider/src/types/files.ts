@@ -34,6 +34,12 @@ export enum FileContext {
    */
   conversation_recall = 'conversation_recall',
   /* === VIVENTIUM END === */
+  /* === VIVENTIUM START ===
+   * Feature: Meeting transcript memory RAG file context
+   * Added: 2026-05-05
+   */
+  meeting_transcript = 'meeting_transcript',
+  /* === VIVENTIUM END === */
   filename = 'filename',
   updatedAt = 'updatedAt',
   source = 'source',
@@ -121,7 +127,7 @@ export type TFile = {
   height?: number;
   expiresAt?: string | Date;
   preview?: string;
-  metadata?: { fileIdentifier?: string };
+  metadata?: { fileIdentifier?: string; [key: string]: unknown };
   createdAt?: string | Date;
   updatedAt?: string | Date;
 };

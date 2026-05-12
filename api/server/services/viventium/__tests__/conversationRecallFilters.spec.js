@@ -70,4 +70,44 @@ describe('conversationRecallFilters', () => {
       }),
     ).toBe(false);
   });
+
+  test('does not skip normal content just because it discusses memory or chat history', () => {
+    expect(
+      shouldSkipRecallMessage({
+        message: { messageId: 'memory_system_source', isCreatedByUser: true },
+        messageText: 'The memory system design should preserve chat history for QA.',
+        isCreatedByUser: true,
+        hasRecallDerivedChild: false,
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldSkipRecallMessage({
+        message: { messageId: 'assistant_source', isCreatedByUser: false },
+        messageText:
+          'We can design the memory system fallback using chat history as source evidence.',
+        isCreatedByUser: false,
+      }),
+    ).toBe(false);
+  });
+
+  test('skips Listen-Only ambient transcripts from the normal conversation recall corpus', () => {
+    expect(
+      shouldSkipRecallMessage({
+        message: {
+          messageId: 'listen_only_1',
+          isCreatedByUser: false,
+          metadata: {
+            viventium: {
+              type: 'listen_only_transcript',
+              mode: 'listen_only',
+              ambientKind: 'ambient_room_transcript',
+            },
+          },
+        },
+        messageText: 'Ambient room transcript.',
+        isCreatedByUser: false,
+      }),
+    ).toBe(true);
+  });
 });

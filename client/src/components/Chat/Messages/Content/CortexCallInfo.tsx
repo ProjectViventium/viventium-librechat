@@ -5,6 +5,7 @@
  * Porting: Copy this file wholesale when reapplying Viventium changes onto a fresh upstream checkout.
  * Added: 2026-01-03
  * === VIVENTIUM END === */
+/* eslint-disable i18next/no-literal-string */
 import { AlertCircle, Brain, Sparkles, Target } from 'lucide-react';
 import type { CortexStatus } from 'librechat-data-provider';
 import { cn } from '~/utils';
@@ -41,7 +42,9 @@ function publicErrorText(error?: string): string {
 }
 
 function publicErrorClassLabel(errorClass?: string): string {
-  const normalized = String(errorClass || '').trim().toLowerCase();
+  const normalized = String(errorClass || '')
+    .trim()
+    .toLowerCase();
   if (!/^[a-z0-9_:-]{1,80}$/.test(normalized)) {
     return '';
   }
@@ -84,9 +87,7 @@ export default function CortexCallInfo({
               </span>
             )}
           </div>
-          <div className={cn('text-sm text-text-primary', isSkipped && 'opacity-50')}>
-            {reason}
-          </div>
+          <div className={cn('text-sm text-text-primary', isSkipped && 'opacity-50')}>{reason}</div>
         </div>
       )}
 
@@ -115,14 +116,12 @@ export default function CortexCallInfo({
             <Sparkles className="size-3 text-purple-500" />
             <span>Result from {cortex_name}</span>
           </div>
-          <div className="text-sm text-text-primary whitespace-pre-wrap">
-            {insight}
-          </div>
+          <div className="whitespace-pre-wrap text-sm text-text-primary">{insight}</div>
         </div>
       )}
 
       {/* Status footer */}
-      <div className="flex items-center gap-2 px-3 py-2 text-xs text-text-secondary bg-surface-tertiary/50">
+      <div className="bg-surface-tertiary/50 flex items-center gap-2 px-3 py-2 text-xs text-text-secondary">
         <Brain className="size-3" />
         <span>Background agent: {cortex_name}</span>
         <span className="ml-auto">

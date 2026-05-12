@@ -222,7 +222,9 @@ describe('promptFrameTelemetry', () => {
       mcpInstructionSources: sources,
     });
     expect(frame.mcp_instruction_sources).toEqual(sources);
-    expect(JSON.stringify(frame.mcp_instruction_sources)).not.toContain('Private MCP instruction text');
+    expect(JSON.stringify(frame.mcp_instruction_sources)).not.toContain(
+      'Private MCP instruction text',
+    );
   });
 
   test('debug redacted layers require both debug and local gates', () => {

@@ -34,7 +34,8 @@ function resolveViventiumSurface(req) {
  * === VIVENTIUM END === */
 const CARTESIA_SONIC3_CAPABILITIES = require('../../../../../shared/voice/cartesia_sonic3_capabilities.json');
 const CARTESIA_SONIC3_EMOTIONS = CARTESIA_SONIC3_CAPABILITIES.generation_config.emotion.values;
-const CARTESIA_SONIC3_PRIMARY_EMOTIONS = CARTESIA_SONIC3_CAPABILITIES.generation_config.emotion.primary;
+const CARTESIA_SONIC3_PRIMARY_EMOTIONS =
+  CARTESIA_SONIC3_CAPABILITIES.generation_config.emotion.primary;
 const CARTESIA_SONIC3_SPEED = CARTESIA_SONIC3_CAPABILITIES.generation_config.speed;
 const CARTESIA_SONIC3_VOLUME = CARTESIA_SONIC3_CAPABILITIES.generation_config.volume;
 const CARTESIA_SONIC3_NONVERBAL_MARKERS = CARTESIA_SONIC3_CAPABILITIES.nonverbal_markers;
@@ -408,7 +409,8 @@ function resolveTimeContextTimezone({ clientTimezone, defaultTimezone }) {
  *
  * Added: 2026-02-19
  * === VIVENTIUM END === */
-const NAIVE_TIMESTAMP_REGEX = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/;
+const NAIVE_TIMESTAMP_REGEX =
+  /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/;
 const TIMEZONE_PARTS_FORMATTER_CACHE = new Map();
 
 function hasExplicitTimezone(timestamp) {
@@ -680,10 +682,7 @@ function isBracketStageDirection(content) {
     return false;
   }
 
-  const words = candidate
-    .replace(/-/g, ' ')
-    .split(/\s+/)
-    .filter(Boolean);
+  const words = candidate.replace(/-/g, ' ').split(/\s+/).filter(Boolean);
   if (!words.length || words.length > _DISPLAY_STAGE_DIRECTION_MAX_WORDS) {
     return false;
   }
@@ -714,7 +713,11 @@ function stripBracketStageDirections(text) {
     const content = text.slice(index + 1, closing);
     const left = index > 0 ? text[index - 1] : '';
     const right = closing + 1 < text.length ? text[closing + 1] : '';
-    if (isBracketStageDirection(content) && isDisplayStageDirectionBoundary(left) && isDisplayStageDirectionBoundary(right)) {
+    if (
+      isBracketStageDirection(content) &&
+      isDisplayStageDirectionBoundary(left) &&
+      isDisplayStageDirectionBoundary(right)
+    ) {
       index = closing + 1;
       continue;
     }

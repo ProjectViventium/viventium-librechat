@@ -215,15 +215,12 @@ const vectorDocumentExists = async (req, fileId) => {
   }
   try {
     const jwtToken = generateShortLivedToken(req.user.id);
-    await axios.get(
-      `${process.env.RAG_API_URL}/documents/${encodeURIComponent(fileId)}/context`,
-      {
-        headers: {
-          Authorization: `Bearer ${jwtToken}`,
-          accept: 'application/json',
-        },
+    await axios.get(`${process.env.RAG_API_URL}/documents/${encodeURIComponent(fileId)}/context`, {
+      headers: {
+        Authorization: `Bearer ${jwtToken}`,
+        accept: 'application/json',
       },
-    );
+    });
     return true;
   } catch (error) {
     if (error?.response?.status === 404) {

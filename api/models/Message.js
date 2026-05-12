@@ -18,11 +18,7 @@ const {
 
 const idSchema = z.string().uuid();
 const TEXT_CONTENT_TYPE = 'text';
-const CORTEX_CONTENT_TYPES = new Set([
-  'cortex_activation',
-  'cortex_brewing',
-  'cortex_insight',
-]);
+const CORTEX_CONTENT_TYPES = new Set(['cortex_activation', 'cortex_brewing', 'cortex_insight']);
 const PLACEHOLDER_RESPONSE_PATTERNS = [
   /^(generation in progress|generation interrupted before completion)\.?$/i,
 ];

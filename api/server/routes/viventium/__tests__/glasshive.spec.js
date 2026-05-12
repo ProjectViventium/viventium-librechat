@@ -434,11 +434,10 @@ describe('/api/viventium/glasshive/callback', () => {
     const app = createTestApp(router);
     const body = callbackBody({
       callback_id: 'cb_multiline_text',
-      message:
-        `Captured 42 rows.  \n\nCreated \`${syntheticLocalPath(
-          'private',
-          'results.md',
-        )}\`.\n\nNext step: reply continue.`,
+      message: `Captured 42 rows.  \n\nCreated \`${syntheticLocalPath(
+        'private',
+        'results.md',
+      )}\`.\n\nNext step: reply continue.`,
     });
     const req = createMockReq({
       url: '/api/viventium/glasshive/callback',
@@ -932,8 +931,9 @@ describe('/api/viventium/glasshive/callback', () => {
         callback_id: `cb_${event.replaceAll('.', '_')}_visible`,
         event,
         message: rawMessage,
-        failure_code:
-          rawMessage.includes('already has an active worker') ? 'active_worker_conflict' : undefined,
+        failure_code: rawMessage.includes('already has an active worker')
+          ? 'active_worker_conflict'
+          : undefined,
       });
       const req = createMockReq({
         url: '/api/viventium/glasshive/callback',
@@ -1015,11 +1015,10 @@ describe('/api/viventium/glasshive/callback', () => {
     const body = callbackBody({
       callback_id: 'cb_sanitize_markdown_links',
       event: 'run.completed',
-      message:
-        `Opened \`http://127.0.0.1:12345/qa\` and saved [proof.png](${syntheticLocalPath(
-          'private',
-          'proof.png',
-        )}).`,
+      message: `Opened \`http://127.0.0.1:12345/qa\` and saved [proof.png](${syntheticLocalPath(
+        'private',
+        'proof.png',
+      )}).`,
     });
     const req = createMockReq({
       url: '/api/viventium/glasshive/callback',
@@ -1032,9 +1031,7 @@ describe('/api/viventium/glasshive/callback', () => {
 
     expect(res.statusCode).toBe(200);
     const [, message] = mockSaveMessage.mock.calls[0];
-    expect(message.text).toBe(
-      'Opened `[local worker link]` and saved [proof.png]([local path]).',
-    );
+    expect(message.text).toBe('Opened `[local worker link]` and saved [proof.png]([local path]).');
   });
 
   test('redacts common local path forms with spaces before visible persistence', async () => {
@@ -1043,21 +1040,22 @@ describe('/api/viventium/glasshive/callback', () => {
     const body = callbackBody({
       callback_id: 'cb_sanitize_local_paths',
       event: 'run.completed',
-      message:
-        `Saved \`${syntheticLocalPath(
-          'My Documents',
-          'result.md',
-        )}\` and copied ${['', 'private', 'var', 'folders', 'synthetic', 'state.txt'].join(
-          '/',
-        )} from ${syntheticHomePath(
-          'project',
-          'output.txt',
-        )} plus ${syntheticWindowsPath('Desktop', 'sample.txt')} and ${[
-          '',
-          'users',
-          'synthetic-user',
-          'lowercase.txt',
-        ].join('/')}.`,
+      message: `Saved \`${syntheticLocalPath('My Documents', 'result.md')}\` and copied ${[
+        '',
+        'private',
+        'var',
+        'folders',
+        'synthetic',
+        'state.txt',
+      ].join('/')} from ${syntheticHomePath(
+        'project',
+        'output.txt',
+      )} plus ${syntheticWindowsPath('Desktop', 'sample.txt')} and ${[
+        '',
+        'users',
+        'synthetic-user',
+        'lowercase.txt',
+      ].join('/')}.`,
     });
     const req = createMockReq({
       url: '/api/viventium/glasshive/callback',

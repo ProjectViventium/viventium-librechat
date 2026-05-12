@@ -23,7 +23,11 @@ function textOf(message) {
     return direct;
   }
   const content = message?.content;
-  const parts = Array.isArray(content) ? content : content && typeof content === 'object' ? [content] : [];
+  const parts = Array.isArray(content)
+    ? content
+    : content && typeof content === 'object'
+      ? [content]
+      : [];
   return parts
     .map((part) => {
       if (typeof part === 'string') {

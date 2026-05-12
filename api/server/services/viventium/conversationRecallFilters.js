@@ -106,10 +106,7 @@ function shouldSkipRecallMessage({
   if (isCreatedByUser === true && hasRecallDerivedChild) {
     return true;
   }
-  if (
-    isCreatedByUser === false &&
-    isAssistantMemoryDisclaimer(cleaned)
-  ) {
+  if (isCreatedByUser === false && isAssistantMemoryDisclaimer(cleaned)) {
     return true;
   }
   if (!isCreatedByUser && isAssistantLowSignalText(cleaned)) {

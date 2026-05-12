@@ -130,7 +130,8 @@ jest.mock('~/server/services/viventium/GlassHiveCallbackDeliveryService', () => 
   claimPendingGlassHiveCallbackDeliveries: (...args) => mockClaimGlassHiveDeliveries(...args),
   markGlassHiveCallbackDeliverySent: (...args) => mockMarkGlassHiveDeliverySent(...args),
   markGlassHiveCallbackDeliveryFailed: (...args) => mockMarkGlassHiveDeliveryFailed(...args),
-  markGlassHiveCallbackDeliverySuppressed: (...args) => mockMarkGlassHiveDeliverySuppressed(...args),
+  markGlassHiveCallbackDeliverySuppressed: (...args) =>
+    mockMarkGlassHiveDeliverySuppressed(...args),
   deliveryBacklogSummary: (...args) => mockDeliveryBacklogSummary(...args),
 }));
 
@@ -847,7 +848,11 @@ describe('/api/viventium/telegram', () => {
     mockSubscribe.mockImplementation(async (_streamId, onChunk, onDone) => {
       onChunk({
         event: 'attachment',
-        data: { file_id: 'file-1', filename: 'artifact.png', filepath: '/images/user/artifact.png' },
+        data: {
+          file_id: 'file-1',
+          filename: 'artifact.png',
+          filepath: '/images/user/artifact.png',
+        },
       });
       onDone({ final: true });
       return { unsubscribe: jest.fn() };
@@ -903,9 +908,7 @@ describe('/api/viventium/telegram', () => {
       text: 'Canonical telegram response',
       content: [{ type: 'cortex_brewing', status: 'brewing' }],
     });
-    mockGetMessages.mockResolvedValueOnce([
-      { messageId: 'follow-1', text: 'Follow-up text' },
-    ]);
+    mockGetMessages.mockResolvedValueOnce([{ messageId: 'follow-1', text: 'Follow-up text' }]);
 
     const req = createMockReq({
       method: 'GET',

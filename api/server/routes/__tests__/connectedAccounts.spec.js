@@ -224,7 +224,9 @@ describe('Connected Accounts Routes', () => {
         body: expect.any(URLSearchParams),
       }),
     );
-    expect(global.fetch.mock.calls[0][1].body.toString()).toContain('grant_type=authorization_code');
+    expect(global.fetch.mock.calls[0][1].body.toString()).toContain(
+      'grant_type=authorization_code',
+    );
   });
 
   it('should complete Anthropic manual flow using code-only input and explicit state', async () => {

@@ -250,19 +250,19 @@ export default function useResumableSSE(
               typeof cortexData.userMessageId === 'string' && cortexData.userMessageId.length > 0
                 ? `${cortexData.userMessageId}_`
                 : null,
-              typeof cortexData.canonicalMessageId === 'string' ? cortexData.canonicalMessageId : null,
+              typeof cortexData.canonicalMessageId === 'string'
+                ? cortexData.canonicalMessageId
+                : null,
             ].filter((id): id is string => Boolean(id));
             const responseMessageId = candidateMessageIds[0];
 
             // Find the response message
-            const responseIdx = messages.findIndex(
-              (m) =>
-                candidateMessageIds.some(
-                  (id) => m.messageId === id || m.messageId === `${id}` || m.messageId?.startsWith(id),
-                ),
+            const responseIdx = messages.findIndex((m) =>
+              candidateMessageIds.some(
+                (id) =>
+                  m.messageId === id || m.messageId === `${id}` || m.messageId?.startsWith(id),
+              ),
             );
-
-
 
             const cortexPart = {
               type: cortexData.type,
@@ -286,12 +286,15 @@ export default function useResumableSSE(
 
             if (responseIdx < 0) {
               // Message not found yet - store in pending for later flush
-              console.warn('[ResumableSSE] Message not found for cortex update, storing in pending:', {
-                runId: responseMessageId,
-                cortexId: cortexData.cortex_id,
-                status: cortexData.status,
-                availableMessageIds: messages.slice(-3).map((m) => m.messageId),
-              });
+              console.warn(
+                '[ResumableSSE] Message not found for cortex update, storing in pending:',
+                {
+                  runId: responseMessageId,
+                  cortexId: cortexData.cortex_id,
+                  status: cortexData.status,
+                  availableMessageIds: messages.slice(-3).map((m) => m.messageId),
+                },
+              );
               if (responseMessageId) {
                 cortexBuffer.handleCortexUpdate(responseMessageId, cortexPart);
               }

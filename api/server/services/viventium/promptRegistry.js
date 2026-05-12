@@ -66,7 +66,11 @@ function getPromptBundleStatus() {
 function lookupVariable(variables, key) {
   let current = variables || {};
   for (const segment of String(key).split('.')) {
-    if (current && typeof current === 'object' && Object.prototype.hasOwnProperty.call(current, segment)) {
+    if (
+      current &&
+      typeof current === 'object' &&
+      Object.prototype.hasOwnProperty.call(current, segment)
+    ) {
       current = current[segment];
       continue;
     }

@@ -84,7 +84,8 @@ describe('conversationRecallFilters', () => {
     expect(
       shouldSkipRecallMessage({
         message: { messageId: 'assistant_source', isCreatedByUser: false },
-        messageText: 'We can design the memory system fallback using chat history as source evidence.',
+        messageText:
+          'We can design the memory system fallback using chat history as source evidence.',
         isCreatedByUser: false,
       }),
     ).toBe(false);

@@ -15,10 +15,17 @@ const { logger } = require('@librechat/data-schemas');
 const { Run, Providers } = require('@librechat/agents');
 const { initializeAnthropic, initializeOpenAI } = require('@librechat/api');
 const { HumanMessage } = require('@langchain/core/messages');
-const { ContentTypes, EModelEndpoint, supportsAdaptiveThinking } = require('librechat-data-provider');
+const {
+  ContentTypes,
+  EModelEndpoint,
+  supportsAdaptiveThinking,
+} = require('librechat-data-provider');
 const db = require('~/models');
 const { getAgent } = require('~/models/Agent');
-const { getCustomEndpointConfig, mapProvider } = require('~/server/services/BackgroundCortexService');
+const {
+  getCustomEndpointConfig,
+  mapProvider,
+} = require('~/server/services/BackgroundCortexService');
 const {
   DEFAULT_MODELS,
   normalizeProvider: normalizeRuntimeProvider,
@@ -140,7 +147,11 @@ function sanitizeFollowUpErrorForLog(error) {
 }
 
 function hashFollowUpTextForLog(text, length = 12) {
-  return crypto.createHash('sha256').update(String(text || '')).digest('hex').slice(0, length);
+  return crypto
+    .createHash('sha256')
+    .update(String(text || ''))
+    .digest('hex')
+    .slice(0, length);
 }
 
 function sanitizeAnthropicFollowUpLLMConfig(llmConfig = {}) {
@@ -377,7 +388,9 @@ function resolveFollowUpRuntimeAssignment(agent, { useVoiceModel = false } = {})
     : baseRuntimeAgent;
   const effectiveModel = resolveGovernedFollowUpModel(runtimeAgent, { useVoiceModel });
   const rawProvider = String(
-    useVoiceModel ? runtimeAgent?.voice_llm_provider || runtimeAgent?.provider : runtimeAgent?.provider,
+    useVoiceModel
+      ? runtimeAgent?.voice_llm_provider || runtimeAgent?.provider
+      : runtimeAgent?.provider,
   ).trim();
   const effectiveProvider = normalizeFollowUpProvider(rawProvider);
 
@@ -421,21 +434,19 @@ function mergeFollowUpAgentRuntimeState(runtimeAgent, persistedAgent) {
       normalizeFollowUpProvider(runtimeAgent?.provider) ||
       normalizeFollowUpProvider(persistedAgent?.provider) ||
       '',
-    model:
-      String(
-        runtimeAgent?.model ||
-          runtimeAgent?.model_parameters?.model ||
-          persistedAgent?.model ||
-          persistedAgent?.model_parameters?.model ||
-          '',
-      ).trim(),
+    model: String(
+      runtimeAgent?.model ||
+        runtimeAgent?.model_parameters?.model ||
+        persistedAgent?.model ||
+        persistedAgent?.model_parameters?.model ||
+        '',
+    ).trim(),
     voice_llm_provider:
       normalizeFollowUpProvider(runtimeAgent?.voice_llm_provider) ||
       normalizeFollowUpProvider(persistedAgent?.voice_llm_provider) ||
       null,
-    voice_llm_model: String(
-      runtimeAgent?.voice_llm_model || persistedAgent?.voice_llm_model || '',
-    ).trim() || null,
+    voice_llm_model:
+      String(runtimeAgent?.voice_llm_model || persistedAgent?.voice_llm_model || '').trim() || null,
     voice_llm_model_parameters: mergedVoiceModelParameters,
     model_parameters: mergedModelParameters,
   };
@@ -517,7 +528,9 @@ function upsertCortexParts(existingContent, cortexParts, options = {}) {
     if (!part || !part.cortex_id) {
       continue;
     }
-    const idx = content.findIndex((p) => p && p.cortex_id === part.cortex_id && CORTEX_TYPES.has(p.type));
+    const idx = content.findIndex(
+      (p) => p && p.cortex_id === part.cortex_id && CORTEX_TYPES.has(p.type),
+    );
     if (idx >= 0) {
       content[idx] = part;
     } else {
@@ -566,7 +579,9 @@ function getMessageTimelineValue(message) {
 
 function resolveConversationLeafMessageId(messages, fallbackMessageId = null) {
   const candidates = Array.isArray(messages)
-    ? messages.filter((message) => message && typeof message.messageId === 'string' && message.messageId)
+    ? messages.filter(
+        (message) => message && typeof message.messageId === 'string' && message.messageId,
+      )
     : [];
 
   if (candidates.length === 0) {
@@ -613,7 +628,11 @@ function isUserConversationMessage(message) {
   if (message.isCreatedByUser === true) {
     return true;
   }
-  return String(message.sender || '').trim().toLowerCase() === 'user';
+  return (
+    String(message.sender || '')
+      .trim()
+      .toLowerCase() === 'user'
+  );
 }
 
 function formatContinuationMessageForPrompt(message) {
@@ -655,7 +674,9 @@ function resolveFollowUpContinuationContext(messages, parentMessageId, options =
   const maxMessages = Number.isFinite(options.maxMessages) ? options.maxMessages : 8;
   const maxChars = Number.isFinite(options.maxChars) ? options.maxChars : 1800;
   const candidates = Array.isArray(messages)
-    ? messages.filter((message) => message && typeof message.messageId === 'string' && message.messageId)
+    ? messages.filter(
+        (message) => message && typeof message.messageId === 'string' && message.messageId,
+      )
     : [];
   const byId = new Map(candidates.map((message) => [message.messageId, message]));
   const parentMessage = byId.get(parentMessageId);
@@ -811,7 +832,9 @@ async function resolveFollowUpLLMConfig({
   }
 
   const configuredMaxTokens =
-    resolvedAgent.model_parameters?.max_output_tokens ?? resolvedAgent.model_parameters?.max_tokens ?? 0;
+    resolvedAgent.model_parameters?.max_output_tokens ??
+    resolvedAgent.model_parameters?.max_tokens ??
+    0;
   const deferredDefaultMaxTokens = Number.parseInt(
     process.env.VIVENTIUM_DEFERRED_FOLLOWUP_MAX_TOKENS || '',
     10,
@@ -920,10 +943,14 @@ async function persistCortexPartsToCanonicalMessage({
    * Purpose: Trace cortex follow-up persistence flow for debugging.
    * Details: docs/requirements_and_learnings/05_Open_Source_Modifications.md#librechat-cortex-followup-persist
    */
-  logger.debug(`[BackgroundCortexFollowUpService] DEBUG PERSIST: Starting persistence for messageId=${responseMessageId}, cortexParts count=${cortexParts?.length || 0}`);
+  logger.debug(
+    `[BackgroundCortexFollowUpService] DEBUG PERSIST: Starting persistence for messageId=${responseMessageId}, cortexParts count=${cortexParts?.length || 0}`,
+  );
   if (cortexParts?.length > 0) {
     cortexParts.forEach((part, i) => {
-      logger.debug(`[BackgroundCortexFollowUpService] DEBUG PERSIST: Part ${i}: type=${part?.type}, cortex_id=${part?.cortex_id}, has_insight=${!!part?.insight}`);
+      logger.debug(
+        `[BackgroundCortexFollowUpService] DEBUG PERSIST: Part ${i}: type=${part?.type}, cortex_id=${part?.cortex_id}, has_insight=${!!part?.insight}`,
+      );
     });
   }
   /* VIVENTIUM NOTE */
@@ -958,9 +985,14 @@ async function persistCortexPartsToCanonicalMessage({
        * Purpose: Log merge results and insight counts.
        * Details: docs/requirements_and_learnings/05_Open_Source_Modifications.md#librechat-cortex-followup-persist
        */
-      logger.debug(`[BackgroundCortexFollowUpService] DEBUG PERSIST: After merge, content length=${merged?.length || 0}`);
-      const cortexInsightCount = merged?.filter(p => p?.type === ContentTypes.CORTEX_INSIGHT).length || 0;
-      logger.debug(`[BackgroundCortexFollowUpService] DEBUG PERSIST: CORTEX_INSIGHT parts in merged content: ${cortexInsightCount}`);
+      logger.debug(
+        `[BackgroundCortexFollowUpService] DEBUG PERSIST: After merge, content length=${merged?.length || 0}`,
+      );
+      const cortexInsightCount =
+        merged?.filter((p) => p?.type === ContentTypes.CORTEX_INSIGHT).length || 0;
+      logger.debug(
+        `[BackgroundCortexFollowUpService] DEBUG PERSIST: CORTEX_INSIGHT parts in merged content: ${cortexInsightCount}`,
+      );
       /* VIVENTIUM NOTE */
 
       await db.updateMessage(
@@ -976,7 +1008,9 @@ async function persistCortexPartsToCanonicalMessage({
        * Purpose: Confirm persisted content size after update.
        * Details: docs/requirements_and_learnings/05_Open_Source_Modifications.md#librechat-cortex-followup-persist
        */
-      logger.debug(`[BackgroundCortexFollowUpService] DEBUG PERSIST: Successfully persisted ${merged?.length || 0} content parts to messageId=${responseMessageId}`);
+      logger.debug(
+        `[BackgroundCortexFollowUpService] DEBUG PERSIST: Successfully persisted ${merged?.length || 0} content parts to messageId=${responseMessageId}`,
+      );
       /* VIVENTIUM NOTE */
 
       return merged;
@@ -1016,8 +1050,7 @@ async function finalizeCanonicalCortexMessage({ req, messageId }) {
     req,
     { messageId, unfinished: false },
     {
-      context:
-        'viventium/services/BackgroundCortexFollowUpService.finalizeCanonicalCortexMessage',
+      context: 'viventium/services/BackgroundCortexFollowUpService.finalizeCanonicalCortexMessage',
     },
   );
 
@@ -1196,9 +1229,7 @@ function formatFollowUpPrompt({
    * response (cap raised to 2400), (3) make {NTA} the default behavior, (4) explicit
    * "DO NOT repeat" language.
    */
-  const recentBlock = cleanRecent
-    ? cleanRecent.slice(0, 2400)
-    : '(short acknowledgment)';
+  const recentBlock = cleanRecent ? cleanRecent.slice(0, 2400) : '(short acknowledgment)';
 
   if (primaryResponseMode) {
     const fallbackPrompt = [
@@ -1542,11 +1573,13 @@ async function generateFollowUpText({
    * Added: 2026-02-24
    */
   const { isVoiceCallActive } = require('./voiceLlmOverride');
-  const useVoiceModel =
-    isVoiceCallActive(req) && agent.voice_llm_model && agent.voice_llm_provider;
-  const { runtimeAgent, effectiveModel, effectiveProvider } = await resolveCanonicalFollowUpAgent(agent, {
-    useVoiceModel,
-  });
+  const useVoiceModel = isVoiceCallActive(req) && agent.voice_llm_model && agent.voice_llm_provider;
+  const { runtimeAgent, effectiveModel, effectiveProvider } = await resolveCanonicalFollowUpAgent(
+    agent,
+    {
+      useVoiceModel,
+    },
+  );
   /* === VIVENTIUM END === */
 
   const providerName = normalizeFollowUpProvider(effectiveProvider).toLowerCase();
@@ -1759,7 +1792,11 @@ async function createCortexFollowUpMessage({
 
   let finalContinuationContext = continuationContext;
   if (hasInsights) {
-    const refreshed = await loadFollowUpContinuationContext({ req, conversationId, parentMessageId });
+    const refreshed = await loadFollowUpContinuationContext({
+      req,
+      conversationId,
+      parentMessageId,
+    });
     if (Array.isArray(refreshed.messages)) {
       conversationMessages = refreshed.messages;
       finalContinuationContext = refreshed.context;

@@ -170,7 +170,9 @@ describe('BackgroundCortexService activation policy helpers', () => {
     });
 
     expect(result.section).toContain('same_scope_background_allowed: true');
-    expect(result.section).toContain('not as a blocker for a background agent whose own configured activation scope exactly matches');
+    expect(result.section).toContain(
+      'not as a blocker for a background agent whose own configured activation scope exactly matches',
+    );
     expect(result.connectedSurfaces[0]).toEqual(
       expect.objectContaining({
         scopeKey: 'productivity_google_workspace',
@@ -292,7 +294,9 @@ describe('BackgroundCortexService activation policy helpers', () => {
     expect(prompt).toContain('connected direct-action surface');
     expect(prompt).toContain('same_scope_background_allowed=true');
     expect(prompt).toContain('supplemental Phase B evidence');
-    expect(prompt).toContain('Return should_activate=true only when the latest request contains a separate explicit question or decision');
+    expect(prompt).toContain(
+      'Return should_activate=true only when the latest request contains a separate explicit question or decision',
+    );
     expect(prompt).toContain('If uncertain, return should_activate=false.');
     expect(prompt).not.toMatch(
       /Emotional Resonance|Confirmation Bias|Red Team|Pattern Recognition|Strategic Planning|Viventium User Help|Deep Research|product-help|user-help/i,
@@ -319,13 +323,19 @@ describe('BackgroundCortexService activation policy helpers', () => {
     );
     expect(directActionServers).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ server: 'google-workspace', scope_key: 'productivity_google_workspace' }),
+        expect.objectContaining({
+          server: 'google-workspace',
+          scope_key: 'productivity_google_workspace',
+        }),
         expect.objectContaining({ server: 'ms365', scope_key: 'productivity_ms365' }),
       ]),
     );
     expect(directActionServers).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ server: 'google-workspace', same_scope_background_allowed: true }),
+        expect.objectContaining({
+          server: 'google-workspace',
+          same_scope_background_allowed: true,
+        }),
         expect.objectContaining({ server: 'ms365', same_scope_background_allowed: true }),
       ]),
     );
@@ -337,7 +347,11 @@ describe('BackgroundCortexService activation policy helpers', () => {
   test('normalizes string and object tool declarations', () => {
     expect(
       normalizeAgentToolNames({
-        tools: ['web_search', { name: 'worker_run_mcp_glasshive-workers-projects' }, { id: 'schedule_create' }],
+        tools: [
+          'web_search',
+          { name: 'worker_run_mcp_glasshive-workers-projects' },
+          { id: 'schedule_create' },
+        ],
       }),
     ).toEqual(['web_search', 'worker_run_mcp_glasshive-workers-projects', 'schedule_create']);
   });
@@ -497,7 +511,11 @@ describe('BackgroundCortexService activation policy helpers', () => {
       'provider_rate_limited',
     );
     expect(
-      summarizeActivationError({ response: { status: 403 }, code: 'ERR_BAD_REQUEST', message: 'Access denied' }),
+      summarizeActivationError({
+        response: { status: 403 },
+        code: 'ERR_BAD_REQUEST',
+        message: 'Access denied',
+      }),
     ).toEqual(
       expect.objectContaining({
         status: 403,
@@ -683,12 +701,14 @@ describe('BackgroundCortexService activation policy helpers', () => {
     ];
 
     expect(activationProviderAttemptsUnavailable(providerAttempts)).toBe(true);
-    expect(activationFailureVisibility({ activation: { activation_failure_visibility: 'visible' } })).toBe(
-      'visible',
-    );
-    expect(activationFailureVisibility({ activation: { activation_failure_visibility: 'anything_else' } })).toBe(
-      'silent',
-    );
+    expect(
+      activationFailureVisibility({ activation: { activation_failure_visibility: 'visible' } }),
+    ).toBe('visible');
+    expect(
+      activationFailureVisibility({
+        activation: { activation_failure_visibility: 'anything_else' },
+      }),
+    ).toBe('silent');
     expect(
       shouldSurfaceActivationProviderUnavailable({
         activationResult: { providerAttempts },

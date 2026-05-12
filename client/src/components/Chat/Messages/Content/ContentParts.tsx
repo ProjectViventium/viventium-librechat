@@ -87,9 +87,10 @@ const ContentParts = memo(function ContentParts({
   );
   const displayContent = useMemo(() => {
     const normalizedFallback = typeof fallbackText === 'string' ? fallbackText.trim() : '';
-    const parts = filterRenderableContentParts(content, {
-      visibleFallbackText: normalizedFallback,
-    }) ?? [];
+    const parts =
+      filterRenderableContentParts(content, {
+        visibleFallbackText: normalizedFallback,
+      }) ?? [];
     const hasNonCortexRenderablePart = parts.some((part) => part && !cortexTypes.has(part.type));
     if (
       hasNonCortexRenderablePart ||

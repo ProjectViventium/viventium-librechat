@@ -211,15 +211,15 @@ function redactPromptDebugText(value) {
     .replace(/\b[A-Za-z]:\\[^\r\n"'`<>]+/g, '[local_path]')
     .replace(/\\\\[A-Za-z0-9_.-]+\\[^\r\n"'`<>]+/g, '[local_path]')
     .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b/gi, 'Bearer [secret]')
-    .replace(
-      /\b(?:sk|pk|rk|ghp|gho|github_pat|xox[baprs]?)-[A-Za-z0-9_\-]{8,}\b/g,
-      '[secret]',
-    )
+    .replace(/\b(?:sk|pk|rk|ghp|gho|github_pat|xox[baprs]?)-[A-Za-z0-9_-]{8,}\b/g, '[secret]')
     .replace(
       /\b(api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret)=([^&\s"'`<>]+)/gi,
       '$1=[secret]',
     )
-    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/gi, '[uuid]')
+    .replace(
+      /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/gi,
+      '[uuid]',
+    )
     .replace(/\b[0-9a-f]{24}\b/gi, '[object_id]')
     .replace(/\b\d{10,}\b/g, '[numeric_id]');
 
@@ -256,8 +256,7 @@ function countVoiceControlMarkers(value) {
     say_as_tags: countMatches(text, /<\/?say-as\b[^>]*>/gi),
     emotion_tags: countBracketVoiceMarkers(text),
   };
-  counts.total =
-    counts.break_tags + counts.prosody_tags + counts.say_as_tags + counts.emotion_tags;
+  counts.total = counts.break_tags + counts.prosody_tags + counts.say_as_tags + counts.emotion_tags;
   return counts;
 }
 
@@ -295,7 +294,10 @@ function normalizeLayersToContract(layers = {}) {
 
   const rendered = {};
   PROMPT_FRAME_LAYERS.forEach((key) => {
-    rendered[key] = contract[key].map((value) => stableStringify(value)).filter(Boolean).join('\n\n');
+    rendered[key] = contract[key]
+      .map((value) => stableStringify(value))
+      .filter(Boolean)
+      .join('\n\n');
   });
   return { layers: rendered, unknown_layer_names: unknownLayerNames };
 }
@@ -322,7 +324,8 @@ function summarizeLayers(layers = {}) {
 }
 
 function summarizePromptSourceFiles(promptSourceFiles = {}) {
-  const sources = promptSourceFiles && typeof promptSourceFiles === 'object' ? { ...promptSourceFiles } : {};
+  const sources =
+    promptSourceFiles && typeof promptSourceFiles === 'object' ? { ...promptSourceFiles } : {};
   if (process.env.VIVENTIUM_PROMPT_BUNDLE_PATH) {
     sources.compiled_prompt_bundle = process.env.VIVENTIUM_PROMPT_BUNDLE_PATH;
   }
@@ -547,7 +550,10 @@ function writePromptFrameFile(frame) {
 }
 
 function logPromptFrame(targetLogger, frame) {
-  if (process.env[LOG_ENV] === '0' || (process.env.NODE_ENV === 'test' && process.env[LOG_ENV] !== '1')) {
+  if (
+    process.env[LOG_ENV] === '0' ||
+    (process.env.NODE_ENV === 'test' && process.env[LOG_ENV] !== '1')
+  ) {
     return writePromptFrameFile(frame);
   }
   if (!frame || typeof frame !== 'object') {
@@ -555,7 +561,10 @@ function logPromptFrame(targetLogger, frame) {
   }
   let wrote = writePromptFrameFile(frame);
   try {
-    const log = targetLogger && typeof targetLogger.info === 'function' ? targetLogger.info.bind(targetLogger) : null;
+    const log =
+      targetLogger && typeof targetLogger.info === 'function'
+        ? targetLogger.info.bind(targetLogger)
+        : null;
     if (!log) {
       return wrote;
     }

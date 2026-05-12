@@ -43,8 +43,10 @@ jest.mock('~/server/services/viventium/conversationRecallService', () => ({
         (attachment) =>
           attachment?.type === 'file_search' &&
           Array.isArray(attachment?.file_search?.sources) &&
-          attachment.file_search.sources.some((source) =>
-            typeof source?.fileId === 'string' && source.fileId.startsWith('conversation_recall:'),
+          attachment.file_search.sources.some(
+            (source) =>
+              typeof source?.fileId === 'string' &&
+              source.fileId.startsWith('conversation_recall:'),
           ),
       );
     return !messageText || hasRecallDerivedChild || hasRecallAttachment;
@@ -59,7 +61,9 @@ const { createFileSearchTool } = require('~/app/clients/tools/util/fileSearch');
 const { generateShortLivedToken } = require('@librechat/api');
 const { getFiles } = require('~/models');
 const { primeFiles } = require('~/app/clients/tools/util/fileSearch');
-const { shouldSkipFromRecallCorpus } = require('~/server/services/viventium/conversationRecallService');
+const {
+  shouldSkipFromRecallCorpus,
+} = require('~/server/services/viventium/conversationRecallService');
 const {
   FILE_SEARCH_NO_RETRIEVED_EVIDENCE,
 } = require('~/app/clients/tools/util/modelFacingToolOutput');
@@ -107,9 +111,10 @@ describe('fileSearch.js - tuple return validation', () => {
             (attachment) =>
               attachment?.type === 'file_search' &&
               Array.isArray(attachment?.file_search?.sources) &&
-              attachment.file_search.sources.some((source) =>
-                typeof source?.fileId === 'string' &&
-                source.fileId.startsWith('conversation_recall:'),
+              attachment.file_search.sources.some(
+                (source) =>
+                  typeof source?.fileId === 'string' &&
+                  source.fileId.startsWith('conversation_recall:'),
               ),
           );
         return !messageText || hasRecallDerivedChild || hasRecallAttachment;
@@ -396,7 +401,9 @@ describe('fileSearch.js - tuple return validation', () => {
 
       const fileSearchTool = await createFileSearchTool({
         userId: 'user1',
-        files: [{ file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' }],
+        files: [
+          { file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' },
+        ],
       });
 
       await fileSearchTool.func({ query: 'remember my name' });
@@ -461,7 +468,9 @@ describe('fileSearch.js - tuple return validation', () => {
 
       const fileSearchTool = await createFileSearchTool({
         userId: 'user1',
-        files: [{ file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' }],
+        files: [
+          { file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' },
+        ],
       });
 
       await fileSearchTool.func({ query: 'remember my name' });
@@ -709,7 +718,9 @@ describe('fileSearch.js - tuple return validation', () => {
         query: 'missing transcript topic',
       });
 
-      expect(formattedString).toBe('No matching content found in meeting transcripts for this query.');
+      expect(formattedString).toBe(
+        'No matching content found in meeting transcripts for this query.',
+      );
       expect(artifact).toBeUndefined();
     });
 
@@ -729,7 +740,9 @@ describe('fileSearch.js - tuple return validation', () => {
 
       const fileSearchTool = await createFileSearchTool({
         userId: 'user1',
-        files: [{ file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' }],
+        files: [
+          { file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' },
+        ],
       });
 
       await fileSearchTool.func({ query: 'remember my QA synthetic recall marker' });
@@ -759,7 +772,8 @@ describe('fileSearch.js - tuple return validation', () => {
           [
             {
               page_content:
-                'Product planning details and milestones. '.repeat(12) + 'extra text to force truncation',
+                'Product planning details and milestones. '.repeat(12) +
+                'extra text to force truncation',
               metadata: { source: '/path/to/conversation-recall.txt', page: 2 },
             },
             0.2,
@@ -769,10 +783,14 @@ describe('fileSearch.js - tuple return validation', () => {
 
       const fileSearchTool = await createFileSearchTool({
         userId: 'user1',
-        files: [{ file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' }],
+        files: [
+          { file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' },
+        ],
       });
 
-      const [formattedString, artifact] = await fileSearchTool.func({ query: 'remember these notes' });
+      const [formattedString, artifact] = await fileSearchTool.func({
+        query: 'remember these notes',
+      });
 
       expect(formattedString.length).toBeLessThanOrEqual(220);
       expect(formattedString).toContain('...');
@@ -783,19 +801,17 @@ describe('fileSearch.js - tuple return validation', () => {
     it('queries all attached files without runtime recall-intent routing', async () => {
       generateShortLivedToken.mockReturnValue('mock-jwt-token');
 
-      axios.post
-        .mockResolvedValueOnce({ data: [] })
-        .mockResolvedValueOnce({
-          data: [
-            [
-              {
-                page_content: 'Fallback content from regular file.',
-                metadata: { source: '/path/to/manual-notes.txt', page: 1 },
-              },
-              0.1,
-            ],
+      axios.post.mockResolvedValueOnce({ data: [] }).mockResolvedValueOnce({
+        data: [
+          [
+            {
+              page_content: 'Fallback content from regular file.',
+              metadata: { source: '/path/to/manual-notes.txt', page: 1 },
+            },
+            0.1,
           ],
-        });
+        ],
+      });
 
       const fileSearchTool = await createFileSearchTool({
         userId: 'user1',
@@ -840,7 +856,9 @@ describe('fileSearch.js - tuple return validation', () => {
 
       const fileSearchTool = await createFileSearchTool({
         userId: 'user1',
-        files: [{ file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' }],
+        files: [
+          { file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' },
+        ],
       });
 
       const [, artifact] = await fileSearchTool.func({ query: 'do you remember my name?' });
@@ -1057,23 +1075,23 @@ describe('fileSearch.js - tuple return validation', () => {
             conversationId: 'meta_convo',
             createdAt: '2026-04-09T16:26:15.138Z',
             isCreatedByUser: true,
-            text:
-              'Earlier today I told you a QA-only synthetic recall marker in another chat. What exact marker was it? If you can retrieve it, answer with only the exact marker.',
+            text: 'Earlier today I told you a QA-only synthetic recall marker in another chat. What exact marker was it? If you can retrieve it, answer with only the exact marker.',
           },
           {
             messageId: 'source_user_turn',
             conversationId: 'source_convo',
             createdAt: '2026-04-09T16:25:23.880Z',
             isCreatedByUser: true,
-            text:
-              'QA-only synthetic recall marker for testing: VIV-RAG-QA-20260409-1626-ONYX-FJ42. This is not a personal preference or durable memory.',
+            text: 'QA-only synthetic recall marker for testing: VIV-RAG-QA-20260409-1626-ONYX-FJ42. This is not a personal preference or durable memory.',
           },
         ]);
       });
 
       const fileSearchTool = await createFileSearchTool({
         userId: 'user1',
-        files: [{ file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' }],
+        files: [
+          { file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' },
+        ],
       });
 
       const [, artifact] = await fileSearchTool.func({
@@ -1117,8 +1135,7 @@ describe('fileSearch.js - tuple return validation', () => {
             conversationId: 'prior_convo',
             createdAt: '2026-04-09T16:25:23.880Z',
             isCreatedByUser: true,
-            text:
-              'QA-only synthetic recall marker for testing: VIV-RAG-QA-20260409-1626-ONYX-FJ42. This is not a personal preference or durable memory.',
+            text: 'QA-only synthetic recall marker for testing: VIV-RAG-QA-20260409-1626-ONYX-FJ42. This is not a personal preference or durable memory.',
           },
         ]);
       });
@@ -1126,7 +1143,9 @@ describe('fileSearch.js - tuple return validation', () => {
       const fileSearchTool = await createFileSearchTool({
         userId: 'user1',
         conversationId: 'current_convo',
-        files: [{ file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' }],
+        files: [
+          { file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' },
+        ],
       });
 
       const [, artifact] = await fileSearchTool.func({
@@ -1161,8 +1180,7 @@ describe('fileSearch.js - tuple return validation', () => {
             conversationId: 'prior_convo',
             createdAt: '2026-04-09T16:25:23.880Z',
             isCreatedByUser: true,
-            text:
-              'QA-only synthetic recall marker for testing: VIV-RAG-QA-20260409-1626-ONYX-FJ42. This is not a personal preference or durable memory.',
+            text: 'QA-only synthetic recall marker for testing: VIV-RAG-QA-20260409-1626-ONYX-FJ42. This is not a personal preference or durable memory.',
           },
         ]),
       );
@@ -1170,7 +1188,9 @@ describe('fileSearch.js - tuple return validation', () => {
       const fileSearchTool = await createFileSearchTool({
         userId: 'user1',
         conversationId: 'current_convo',
-        files: [{ file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' }],
+        files: [
+          { file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' },
+        ],
       });
 
       const [, artifact] = await fileSearchTool.func({

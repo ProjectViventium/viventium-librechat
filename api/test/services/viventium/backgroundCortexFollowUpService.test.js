@@ -26,7 +26,9 @@ jest.mock('@librechat/api', () => ({
   initializeAnthropic: jest.fn(async ({ model_parameters }) => ({
     llmConfig: {
       model: model_parameters?.model ?? 'claude-sonnet-4-5',
-      ...(model_parameters?.temperature != null ? { temperature: model_parameters.temperature } : {}),
+      ...(model_parameters?.temperature != null
+        ? { temperature: model_parameters.temperature }
+        : {}),
       maxTokens: model_parameters?.max_output_tokens ?? 400,
       anthropicApiUrl: 'https://anthropic-proxy.example.test',
     },
@@ -163,13 +165,13 @@ describe('BackgroundCortexFollowUpService', () => {
     });
 
     test('salvages declarative prefix before em-dash question clause', () => {
-      expect(stripQuestionSentences('The data shows improvement— isn\'t that great?')).toBe(
+      expect(stripQuestionSentences("The data shows improvement— isn't that great?")).toBe(
         'The data shows improvement.',
       );
     });
 
     test('salvages declarative prefix when em-dash has no trailing space', () => {
-      expect(stripQuestionSentences('The data shows improvement—isn\'t that great?')).toBe(
+      expect(stripQuestionSentences("The data shows improvement—isn't that great?")).toBe(
         'The data shows improvement.',
       );
     });
@@ -192,9 +194,7 @@ describe('BackgroundCortexFollowUpService', () => {
       { type: 'text', text: 'hello' },
       { type: 'cortex_brewing', cortex_id: 'c1', status: 'brewing' },
     ];
-    const next = [
-      { type: 'cortex_insight', cortex_id: 'c1', status: 'complete', insight: 'done' },
-    ];
+    const next = [{ type: 'cortex_insight', cortex_id: 'c1', status: 'complete', insight: 'done' }];
 
     const merged = upsertCortexParts(existing, next);
     expect(merged).toHaveLength(2);
@@ -274,7 +274,9 @@ describe('BackgroundCortexFollowUpService', () => {
     const text = cleanFallbackInsightText(
       'The operations contact sent the project onboarding invite for April 1 at 10 AM Pacific.\n\nGoogle auth is stale, so Gmail could not be verified tonight without reconnect.',
     );
-    expect(text).toBe('The operations contact sent the project onboarding invite for April 1 at 10 AM Pacific.');
+    expect(text).toBe(
+      'The operations contact sent the project onboarding invite for April 1 at 10 AM Pacific.',
+    );
   });
 
   test('cleanFallbackInsightText strips generic no-access live tool chatter', () => {
@@ -808,10 +810,20 @@ describe('BackgroundCortexFollowUpService', () => {
     const req = { user: { id: 'u1' } };
     db.getMessages
       .mockResolvedValueOnce([
-        { messageId: 'm-parent', parentMessageId: 'u-parent', sender: 'AI', text: 'Earlier answer.' },
+        {
+          messageId: 'm-parent',
+          parentMessageId: 'u-parent',
+          sender: 'AI',
+          text: 'Earlier answer.',
+        },
       ])
       .mockResolvedValueOnce([
-        { messageId: 'm-parent', parentMessageId: 'u-parent', sender: 'AI', text: 'Earlier answer.' },
+        {
+          messageId: 'm-parent',
+          parentMessageId: 'u-parent',
+          sender: 'AI',
+          text: 'Earlier answer.',
+        },
         {
           messageId: 'u-new',
           parentMessageId: 'm-parent',
@@ -859,7 +871,9 @@ describe('BackgroundCortexFollowUpService', () => {
       parentMessageId: 'm-parent',
       agent: { id: 'agent_123', provider: 'openai', model: 'gpt-4o-mini', model_parameters: {} },
       insightsData: {
-        insights: [{ cortexName: 'Background Analysis', insight: 'Should I ask another question?' }],
+        insights: [
+          { cortexName: 'Background Analysis', insight: 'Should I ask another question?' },
+        ],
       },
       recentResponse: '',
     });
@@ -1005,7 +1019,9 @@ describe('BackgroundCortexFollowUpService', () => {
     db.updateMessage.mockResolvedValue({});
 
     Run.create.mockResolvedValueOnce({
-      processStream: jest.fn(async () => 'The real risk is workflow fit, not transcription quality.'),
+      processStream: jest.fn(
+        async () => 'The real risk is workflow fit, not transcription quality.',
+      ),
     });
 
     const msg = await createCortexFollowUpMessage({
@@ -1125,8 +1141,7 @@ describe('BackgroundCortexFollowUpService', () => {
       expect.objectContaining({
         conversationId: 'c-123',
         parentMessageId: 'm-parent',
-        text:
-          'I read the doc. Short version: the profile is more plausibly O-1A than O-1B if the achievements are framed around business impact and measurable recognition.',
+        text: 'I read the doc. Short version: the profile is more plausibly O-1A than O-1B if the achievements are framed around business impact and measurable recognition.',
       }),
       expect.any(Object),
     );
@@ -1134,8 +1149,7 @@ describe('BackgroundCortexFollowUpService', () => {
       expect.objectContaining({
         conversationId: 'c-123',
         parentMessageId: 'm-parent',
-        text:
-          'I read the doc. Short version: the profile is more plausibly O-1A than O-1B if the achievements are framed around business impact and measurable recognition.',
+        text: 'I read the doc. Short version: the profile is more plausibly O-1A than O-1B if the achievements are framed around business impact and measurable recognition.',
       }),
     );
     expect(msg.messageId).not.toBe('m-parent');
@@ -1432,11 +1446,15 @@ describe('BackgroundCortexFollowUpService', () => {
 
     expect(prompt).toContain('This is the visible answer that follows the brief hold.');
     expect(prompt).not.toContain('replace the brief hold');
-    expect(prompt).not.toContain('Only respond if the insights contain genuinely NEW information not covered above.');
+    expect(prompt).not.toContain(
+      'Only respond if the insights contain genuinely NEW information not covered above.',
+    );
     expect(Run.create).toHaveBeenCalledWith(
       expect.objectContaining({
         graphConfig: expect.objectContaining({
-          instructions: expect.stringContaining('completing a deferred response after a short holding acknowledgement'),
+          instructions: expect.stringContaining(
+            'completing a deferred response after a short holding acknowledgement',
+          ),
           llmConfig: expect.objectContaining({
             maxTokens: 2000,
           }),
@@ -1612,7 +1630,9 @@ describe('BackgroundCortexFollowUpService', () => {
           model_parameters: { temperature: 0.3 },
         },
         insightsData: {
-          insights: [{ cortexName: 'Strategic Planning', insight: 'Condense this to one sharp line.' }],
+          insights: [
+            { cortexName: 'Strategic Planning', insight: 'Condense this to one sharp line.' },
+          ],
         },
         recentResponse: 'Checking now.',
         runId: 'run-poisoned-provider',
@@ -1868,9 +1888,18 @@ describe('BackgroundCortexFollowUpService', () => {
 
     test('removes duplicate insights with >50% word overlap', () => {
       const insights = [
-        { cortexName: 'Strategic Planning', insight: 'Pancakes are stacked and ready for first bite verdict from Taylor' },
-        { cortexName: 'Background Analysis', insight: 'Pancakes stacked ready - check the first bite from Taylor verdict' },
-        { cortexName: 'Continuity', insight: 'Completely different topic about the philosophy draft' },
+        {
+          cortexName: 'Strategic Planning',
+          insight: 'Pancakes are stacked and ready for first bite verdict from Taylor',
+        },
+        {
+          cortexName: 'Background Analysis',
+          insight: 'Pancakes stacked ready - check the first bite from Taylor verdict',
+        },
+        {
+          cortexName: 'Continuity',
+          insight: 'Completely different topic about the philosophy draft',
+        },
       ];
       const deduped = deduplicateInsights(insights);
       expect(deduped).toHaveLength(2);
@@ -1941,7 +1970,9 @@ describe('BackgroundCortexFollowUpService', () => {
 
       expect(prompt).toContain('This is the visible answer that follows the brief hold.');
       expect(prompt).not.toContain('replace the brief hold');
-      expect(prompt).toContain('Do not output {NTA} if the insights contain any substantive user-visible information.');
+      expect(prompt).toContain(
+        'Do not output {NTA} if the insights contain any substantive user-visible information.',
+      );
       expect(prompt).not.toContain('## CRITICAL: Do Not Repeat');
     });
 
@@ -1950,7 +1981,9 @@ describe('BackgroundCortexFollowUpService', () => {
         insights: [{ cortexName: 'Test', insight: 'Some insight' }],
         recentResponse: 'Test.',
       });
-      expect(prompt).not.toContain('Additional background insights surfaced after your last response');
+      expect(prompt).not.toContain(
+        'Additional background insights surfaced after your last response',
+      );
     });
 
     test('handles missing recentResponse gracefully', () => {
@@ -1966,7 +1999,11 @@ describe('BackgroundCortexFollowUpService', () => {
     const req = { user: { id: 'u1' }, body: {} };
     await generateFollowUpText({
       req,
-      agent: { id: 'agent_123', instructions: 'You are Eve, a deeply personal companion AI.', provider: 'openai' },
+      agent: {
+        id: 'agent_123',
+        instructions: 'You are Eve, a deeply personal companion AI.',
+        provider: 'openai',
+      },
       insightsData: {
         insights: [{ cortexName: 'Background Analysis', insight: 'New finding' }],
       },

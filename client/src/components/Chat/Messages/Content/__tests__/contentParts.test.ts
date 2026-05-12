@@ -241,7 +241,8 @@ describe('filterRenderableContentParts', () => {
       { type: ContentTypes.TEXT, text: 'Partial answer.' },
       {
         type: ContentTypes.ERROR,
-        [ContentTypes.ERROR]: 'An error occurred while processing the request: status 429 rate_limit_error',
+        [ContentTypes.ERROR]:
+          'An error occurred while processing the request: status 429 rate_limit_error',
       } as unknown as TMessageContentParts,
     ];
 
@@ -279,7 +280,8 @@ describe('filterRenderableContentParts', () => {
       } as unknown as TMessageContentParts,
       {
         type: ContentTypes.ERROR,
-        [ContentTypes.ERROR]: 'An error occurred while processing the request: TypeError: terminated',
+        [ContentTypes.ERROR]:
+          'An error occurred while processing the request: TypeError: terminated',
         error_class: 'late_stream_termination',
       } as unknown as TMessageContentParts,
     ];
@@ -350,7 +352,8 @@ describe('filterRenderableContentParts', () => {
           args: '{}',
           type: ToolCallTypes.TOOL_CALL,
           progress: 1,
-          output: '{"status":"blocked","callback_ready":false,"user_status":"Callback is not configured."}',
+          output:
+            '{"status":"blocked","callback_ready":false,"user_status":"Callback is not configured."}',
         },
       },
       { type: ContentTypes.TEXT, text: 'I need callback setup first.' },

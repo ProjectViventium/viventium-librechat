@@ -133,13 +133,10 @@ describe('staleCortexMessageRecovery', () => {
 
     await recoverStaleCortexMessages({ now });
 
-    expect(Message.updateOne).toHaveBeenCalledWith(
-      expect.any(Object),
-      {
-        $set: expect.not.objectContaining({
-          text: expect.any(String),
-        }),
-      },
-    );
+    expect(Message.updateOne).toHaveBeenCalledWith(expect.any(Object), {
+      $set: expect.not.objectContaining({
+        text: expect.any(String),
+      }),
+    });
   });
 });

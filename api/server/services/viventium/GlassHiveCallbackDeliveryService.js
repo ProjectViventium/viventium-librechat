@@ -29,10 +29,7 @@ function redactDeliveryError(value) {
   return normalizeText(value)
     .replace(/\/bot\d+:[A-Za-z0-9_-]+/g, '/bot<redacted>')
     .replace(/\bbot\d+:[A-Za-z0-9_-]+/g, 'bot<redacted>')
-    .replace(
-      /\b(authorization\s*[:=]\s*bearer\s+)[A-Za-z0-9._~+/=-]+/gi,
-      '$1<redacted>',
-    )
+    .replace(/\b(authorization\s*[:=]\s*bearer\s+)[A-Za-z0-9._~+/=-]+/gi, '$1<redacted>')
     .replace(/\b((?:access_)?token|api[_-]?key|secret)=([^&\s]+)/gi, '$1=<redacted>');
 }
 
@@ -161,7 +158,12 @@ async function enqueueGlassHiveCallbackDelivery({ body, message, text, fullText 
       },
       { new: true, upsert: true, setDefaultsOnInsert: true },
     ).lean();
-    logger.info('[VIVENTIUM][glasshive-delivery] enqueued surface=%s delivery=%s event=%s', surface, deliveryId, event);
+    logger.info(
+      '[VIVENTIUM][glasshive-delivery] enqueued surface=%s delivery=%s event=%s',
+      surface,
+      deliveryId,
+      event,
+    );
     return updated;
   } catch (err) {
     logger.warn('[VIVENTIUM][glasshive-delivery] enqueue failed:', err);
@@ -254,7 +256,11 @@ async function claimPendingGlassHiveCallbackDeliveries({
     }
   }
   if (claimed.length) {
-    logger.info('[VIVENTIUM][glasshive-delivery] claimed surface=%s count=%s', normalizedSurface, claimed.length);
+    logger.info(
+      '[VIVENTIUM][glasshive-delivery] claimed surface=%s count=%s',
+      normalizedSurface,
+      claimed.length,
+    );
   }
   return claimed;
 }

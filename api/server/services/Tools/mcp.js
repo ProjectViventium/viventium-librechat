@@ -158,9 +158,7 @@ async function reinitMCPServer({
         serverConfig?.requiresOAuth || serverConfig?.oauthMetadata,
       );
       const hasStoredOAuthTokens =
-        serverRequiresOAuth && user.id
-          ? await hasUsableOAuthTokens(user.id, serverName)
-          : false;
+        serverRequiresOAuth && user.id ? await hasUsableOAuthTokens(user.id, serverName) : false;
 
       const isOAuthFlowInitiated = err.message === 'OAuth flow initiated - return early';
 

@@ -373,7 +373,9 @@ export function filterRenderableContentParts(
   const deduped = removedAny ? filtered : normalizedContent;
   const withoutLateTerminationError = hideLateTerminationErrorAfterText(deduped, options);
   const withoutRuntimeHoldNoResponse = hideRuntimeHoldNoResponseParts(withoutLateTerminationError);
-  const withoutRoutineGlassHiveDelegate = hideRoutineGlassHiveDelegateParts(withoutRuntimeHoldNoResponse);
+  const withoutRoutineGlassHiveDelegate = hideRoutineGlassHiveDelegateParts(
+    withoutRuntimeHoldNoResponse,
+  );
   const collapsed = collapseConsecutiveGlassHiveToolCalls(withoutRoutineGlassHiveDelegate);
   return mergeAdjacentTextParts(collapsed);
 }

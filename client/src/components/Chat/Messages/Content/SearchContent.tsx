@@ -34,9 +34,10 @@ const SearchContent = ({
   const attachmentMap = useMemo(() => mapAttachments(attachments ?? []), [attachments]);
   const displayContent = useMemo(() => {
     const fallbackText = typeof message.text === 'string' ? message.text.trim() : '';
-    const parts = filterRenderableContentParts(message.content, {
-      visibleFallbackText: fallbackText,
-    }) ?? [];
+    const parts =
+      filterRenderableContentParts(message.content, {
+        visibleFallbackText: fallbackText,
+      }) ?? [];
     const cortexTypes = new Set([
       ContentTypes.CORTEX_ACTIVATION,
       ContentTypes.CORTEX_BREWING,

@@ -34,11 +34,7 @@ describe('cortexFallbackText deferred errors', () => {
       'provider_rate_limited',
       'That background check was rate-limited by the configured provider.',
     ],
-    [
-      { error: 'timeout' },
-      'timeout',
-      'That background check timed out before it could finish.',
-    ],
+    [{ error: 'timeout' }, 'timeout', 'That background check timed out before it could finish.'],
   ])('maps deferred fallback class %#', (input, expectedClass, expectedText) => {
     expect(normalizeDeferredFallbackErrorClass(input)).toBe(expectedClass);
     expect(getDeferredFallbackErrorText(input)).toBe(expectedText);

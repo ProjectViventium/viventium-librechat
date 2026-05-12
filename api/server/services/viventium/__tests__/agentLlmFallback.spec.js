@@ -55,10 +55,9 @@ describe('agentLlmFallback', () => {
       provider: 'anthropic',
       model: 'claude-sonnet-4-6',
     });
-    expect(resolveFallbackCandidates(agent, { isVoiceCall: true }).map((item) => item.source)).toEqual([
-      'voice',
-      'agent',
-    ]);
+    expect(
+      resolveFallbackCandidates(agent, { isVoiceCall: true }).map((item) => item.source),
+    ).toEqual(['voice', 'agent']);
   });
 
   test('validates fallback model against allowed providers and model config', () => {
@@ -172,7 +171,8 @@ describe('agentLlmFallback', () => {
       shouldRetryWithFallback([
         {
           type: ContentTypes.ERROR,
-          [ContentTypes.ERROR]: 'An error occurred while processing the request: status 429 rate_limit_error',
+          [ContentTypes.ERROR]:
+            'An error occurred while processing the request: status 429 rate_limit_error',
         },
       ]),
     ).toBe(true);
@@ -229,7 +229,10 @@ describe('agentLlmFallback', () => {
   test('retries background cortex fallback for abort and timeout result errors', () => {
     expect(shouldRetryBackgroundCortexWithFallback({ error: 'timeout', insight: null })).toBe(true);
     expect(
-      shouldRetryBackgroundCortexWithFallback({ error: 'AbortError: operation was aborted', insight: null }),
+      shouldRetryBackgroundCortexWithFallback({
+        error: 'AbortError: operation was aborted',
+        insight: null,
+      }),
     ).toBe(true);
     expect(
       shouldRetryBackgroundCortexWithFallback({

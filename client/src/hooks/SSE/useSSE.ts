@@ -160,9 +160,9 @@ export default function useSSE(
           cortexBuffer.handleCreated(createdMessageId);
         }
         /* === VIVENTIUM END === */
-      /* === VIVENTIUM START ===
-       * Feature: Background Cortices - Handle real-time cortex status updates
-       */
+        /* === VIVENTIUM START ===
+         * Feature: Background Cortices - Handle real-time cortex status updates
+         */
       } else if (data.event === 'on_cortex_update' && data.data) {
         const cortexData = data.data;
         console.log('[SSE] Cortex update:', cortexData.cortex_name, cortexData.status);
@@ -179,13 +179,11 @@ export default function useSSE(
         const responseMessageId = candidateMessageIds[0];
 
         // Find the response message
-        const responseIdx = messages.findIndex(
-          (m) =>
-            candidateMessageIds.some(
-              (id) => m.messageId === id || m.messageId === `${id}` || m.messageId?.startsWith(id),
-            ),
+        const responseIdx = messages.findIndex((m) =>
+          candidateMessageIds.some(
+            (id) => m.messageId === id || m.messageId === `${id}` || m.messageId?.startsWith(id),
+          ),
         );
-
 
         const cortexPart = {
           type: cortexData.type,
@@ -226,7 +224,7 @@ export default function useSSE(
         (response as any).__viventiumCortexParts = cortexParts;
         updatedMessages[responseIdx] = response;
         setMessages(updatedMessages);
-      /* === VIVENTIUM END === */
+        /* === VIVENTIUM END === */
       } else if (data.event != null) {
         stepHandler(data, { ...submission, userMessage } as EventSubmission);
       } else if (data.sync != null) {

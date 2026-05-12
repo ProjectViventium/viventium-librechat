@@ -78,7 +78,9 @@ describe('Phase B prompt registry ownership', () => {
     jest.resetModules();
     const getPromptText = jest.fn((_promptId, fallback) => fallback);
     jest.doMock('~/server/services/viventium/promptRegistry', () => ({ getPromptText }));
-    const { formatFollowUpPrompt: registryFormatFollowUpPrompt } = require('../BackgroundCortexFollowUpService');
+    const {
+      formatFollowUpPrompt: registryFormatFollowUpPrompt,
+    } = require('../BackgroundCortexFollowUpService');
 
     registryFormatFollowUpPrompt({
       insights: [{ cortexName: 'worker', insight: 'The worker found a result.' }],
@@ -163,7 +165,9 @@ describe('formatFollowUpPrompt', () => {
     expect(prompt).toContain('Wing Mode follow-up rule:');
     expect(prompt).toContain('silence-first ambient voice context');
     expect(prompt).toContain('Output exactly {NTA}');
-    expect(prompt).toContain('Emotional resonance, general support, or “space to talk” is not enough');
+    expect(prompt).toContain(
+      'Emotional resonance, general support, or “space to talk” is not enough',
+    );
   });
 
   test('tells the follow-up model to keep new facts even when an insight ends with a question', () => {
@@ -189,21 +193,23 @@ describe('formatFollowUpPrompt', () => {
     expect(prompt).toContain(
       'If an insight includes a question, drop the question and keep any accompanying factual material.',
     );
-    expect(prompt).not.toContain(
-      'If a question seems needed, output {NTA} instead.',
-    );
+    expect(prompt).not.toContain('If a question seems needed, output {NTA} instead.');
   });
 
   test('makes the main-agent continuation the adjudicator for background evidence', () => {
     const prompt = formatFollowUpPrompt({
-      insights: [{ cortexName: 'worker', insight: 'The local worker finished and found a useful result.' }],
+      insights: [
+        { cortexName: 'worker', insight: 'The local worker finished and found a useful result.' },
+      ],
       recentResponse: 'I started the worker.',
       voiceMode: false,
       surface: '',
     });
 
     expect(prompt).toContain('You are the main AI continuing the same conversation.');
-    expect(prompt).toContain('Background agents provide evidence only. You decide whether there is anything worth surfacing.');
+    expect(prompt).toContain(
+      'Background agents provide evidence only. You decide whether there is anything worth surfacing.',
+    );
     expect(prompt).toContain('respond with {NTA}');
   });
 
@@ -234,8 +240,12 @@ describe('formatFollowUpPrompt', () => {
     });
 
     expect(prompt).toContain('You are generating the primary user-visible answer for this turn.');
-    expect(prompt).toContain('Background agents provide evidence only. You decide what, if anything, should become visible to the user.');
-    expect(prompt).toContain('Do not output {NTA} if the insights contain any substantive user-visible information.');
+    expect(prompt).toContain(
+      'Background agents provide evidence only. You decide what, if anything, should become visible to the user.',
+    );
+    expect(prompt).toContain(
+      'Do not output {NTA} if the insights contain any substantive user-visible information.',
+    );
   });
 });
 
@@ -290,7 +300,9 @@ describe('resolveFollowUpPersistenceText', () => {
     const result = resolveFollowUpPersistenceText({
       generatedText: '{NTA}',
       insightsData: {
-        insights: [{ cortexName: 'Pattern Recognition', insight: 'That choice is fine. Good call.' }],
+        insights: [
+          { cortexName: 'Pattern Recognition', insight: 'That choice is fine. Good call.' },
+        ],
       },
       replaceParentMessage: false,
     });
@@ -305,7 +317,9 @@ describe('resolveFollowUpPersistenceText', () => {
     const result = resolveFollowUpPersistenceText({
       generatedText: '{NTA}',
       insightsData: {
-        insights: [{ cortexName: 'Pattern Recognition', insight: 'That choice is fine. Good call.' }],
+        insights: [
+          { cortexName: 'Pattern Recognition', insight: 'That choice is fine. Good call.' },
+        ],
       },
       replaceParentMessage: true,
     });
@@ -320,7 +334,9 @@ describe('resolveFollowUpPersistenceText', () => {
     const result = resolveFollowUpPersistenceText({
       generatedText: '{NTA}',
       insightsData: {
-        insights: [{ cortexName: 'Pattern Recognition', insight: 'That choice is fine. Good call.' }],
+        insights: [
+          { cortexName: 'Pattern Recognition', insight: 'That choice is fine. Good call.' },
+        ],
       },
       replaceParentMessage: false,
       voiceMode: true,
@@ -337,7 +353,9 @@ describe('resolveFollowUpPersistenceText', () => {
     const result = resolveFollowUpPersistenceText({
       generatedText: 'That still works.',
       insightsData: {
-        insights: [{ cortexName: 'Pattern Recognition', insight: 'That choice is fine. Good call.' }],
+        insights: [
+          { cortexName: 'Pattern Recognition', insight: 'That choice is fine. Good call.' },
+        ],
       },
       replaceParentMessage: false,
       voiceMode: true,
@@ -356,7 +374,8 @@ describe('resolveFollowUpPersistenceText', () => {
         insights: [
           {
             cortexName: 'Emotional Resonance',
-            insight: 'Ambient speech sounded vulnerable, but the user did not address the assistant.',
+            insight:
+              'Ambient speech sounded vulnerable, but the user did not address the assistant.',
           },
         ],
       },
@@ -373,7 +392,9 @@ describe('resolveFollowUpPersistenceText', () => {
     const result = resolveFollowUpPersistenceText({
       generatedText: '{NTA}',
       insightsData: {
-        insights: [{ cortexName: 'Pattern Recognition', insight: 'That choice is fine. Good call.' }],
+        insights: [
+          { cortexName: 'Pattern Recognition', insight: 'That choice is fine. Good call.' },
+        ],
       },
       forceVisibleFollowUp: true,
     });
@@ -414,7 +435,9 @@ describe('resolveFollowUpPersistenceText', () => {
     const result = resolveFollowUpPersistenceText({
       generatedText: '',
       insightsData: {
-        insights: [{ cortexName: 'Pattern Recognition', insight: 'That choice is fine. Good call.' }],
+        insights: [
+          { cortexName: 'Pattern Recognition', insight: 'That choice is fine. Good call.' },
+        ],
       },
       forceVisibleFollowUp: true,
       voiceMode: true,
@@ -458,7 +481,9 @@ describe('resolveFollowUpPersistenceText', () => {
     const result = resolveFollowUpPersistenceText({
       generatedText: '',
       insightsData: {
-        insights: [{ cortexName: 'Pattern Recognition', insight: 'That choice is fine. Good call.' }],
+        insights: [
+          { cortexName: 'Pattern Recognition', insight: 'That choice is fine. Good call.' },
+        ],
       },
       replaceParentMessage: false,
       voiceMode: true,
@@ -474,7 +499,9 @@ describe('resolveFollowUpPersistenceText', () => {
     const result = resolveFollowUpPersistenceText({
       generatedText: '',
       insightsData: {
-        insights: [{ cortexName: 'Pattern Recognition', insight: 'Old context that may be stale.' }],
+        insights: [
+          { cortexName: 'Pattern Recognition', insight: 'Old context that may be stale.' },
+        ],
       },
       replaceParentMessage: false,
       voiceMode: false,
@@ -491,7 +518,9 @@ describe('resolveFollowUpPersistenceText', () => {
     const result = resolveFollowUpPersistenceText({
       generatedText: '',
       insightsData: {
-        insights: [{ cortexName: 'Pattern Recognition', insight: 'Old context that may be stale.' }],
+        insights: [
+          { cortexName: 'Pattern Recognition', insight: 'Old context that may be stale.' },
+        ],
       },
       replaceParentMessage: false,
       voiceMode: false,
@@ -542,7 +571,9 @@ describe('resolveFollowUpPersistenceText', () => {
     const result = resolveFollowUpPersistenceText({
       generatedText: '',
       insightsData: {
-        insights: [{ cortexName: 'Pattern Recognition', insight: 'That choice is fine. Good call.' }],
+        insights: [
+          { cortexName: 'Pattern Recognition', insight: 'That choice is fine. Good call.' },
+        ],
       },
       replaceParentMessage: false,
       voiceMode: true,

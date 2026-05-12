@@ -21,9 +21,7 @@ const {
 const {
   enqueueGlassHiveCallbackDelivery,
 } = require('~/server/services/viventium/GlassHiveCallbackDeliveryService');
-const {
-  resolveLatestLeafMessageId,
-} = require('~/server/services/viventium/conversationThreading');
+const { resolveLatestLeafMessageId } = require('~/server/services/viventium/conversationThreading');
 
 const router = express.Router();
 const CALLBACK_SKEW_SEC = 5 * 60;
@@ -177,8 +175,11 @@ function sanitizeCallbackErrorForLog(error) {
 
 function isActiveWorkerFailure({ failureCode = '', message = '' } = {}) {
   return (
-    ACTIVE_WORKER_FAILURE_CODES.has(String(failureCode || '').trim().toLowerCase()) ||
-    ACTIVE_WORKER_FAILURE_TEXT_PATTERN.test(String(message || ''))
+    ACTIVE_WORKER_FAILURE_CODES.has(
+      String(failureCode || '')
+        .trim()
+        .toLowerCase(),
+    ) || ACTIVE_WORKER_FAILURE_TEXT_PATTERN.test(String(message || ''))
   );
 }
 
@@ -189,9 +190,9 @@ function callbackText(body = {}) {
     return message || 'Done.';
   }
   if (event === 'run.failed') {
-    const failureCode = String(
-      body.failure_code || body.error_code || body?.error?.code || '',
-    ).trim().toLowerCase();
+    const failureCode = String(body.failure_code || body.error_code || body?.error?.code || '')
+      .trim()
+      .toLowerCase();
     if (isActiveWorkerFailure({ failureCode, message })) {
       return 'I got stuck: another local worker is already running, so I could not start this one yet.';
     }
@@ -286,7 +287,8 @@ function resolveCallbackTreeParentMessageId({
   const currentLeafId = currentLeaf.messageId;
   if (priorStatusMessage && String(priorStatusMessage.messageId || '') === currentLeafId) {
     return {
-      parentMessageId: priorStatusMessage.parentMessageId || anchorMessageId || requestedParentMessageId,
+      parentMessageId:
+        priorStatusMessage.parentMessageId || anchorMessageId || requestedParentMessageId,
       currentLeaf,
       updateMessage: priorStatusMessage,
     };

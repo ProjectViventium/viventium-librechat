@@ -186,7 +186,10 @@ function isSameAgentRoute(agent, assignment) {
   if (!agent || !assignment) {
     return false;
   }
-  return normalizeProvider(agent.provider) === assignment.provider && getAgentModel(agent) === assignment.model;
+  return (
+    normalizeProvider(agent.provider) === assignment.provider &&
+    getAgentModel(agent) === assignment.model
+  );
 }
 
 function contentPartText(part) {
@@ -206,7 +209,9 @@ function contentPartText(part) {
 }
 
 function normalizeFallbackErrorClass(value) {
-  return String(value || '').trim().toLowerCase();
+  return String(value || '')
+    .trim()
+    .toLowerCase();
 }
 
 function isNonRetryableFallbackErrorClass(value) {
@@ -288,7 +293,11 @@ function isRecoverableProviderErrorText(text, { allowToolOrMcpText = false } = {
 }
 
 function shouldRetryWithFallback(contentParts) {
-  if (!Array.isArray(contentParts) || contentParts.length === 0 || hasVisibleAssistantText(contentParts)) {
+  if (
+    !Array.isArray(contentParts) ||
+    contentParts.length === 0 ||
+    hasVisibleAssistantText(contentParts)
+  ) {
     return false;
   }
 

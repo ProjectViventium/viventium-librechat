@@ -252,8 +252,12 @@ describe('buildWingModeInstructions', () => {
     const result = buildWingModeInstructions();
 
     expect(result).toContain('WING MODE:');
-    expect(result).toContain('A live call does not mean every spoken sentence is addressed to you;');
-    expect(result).toContain('If you do not have a clear, useful, additive contribution, output exactly {NTA}.');
+    expect(result).toContain(
+      'A live call does not mean every spoken sentence is addressed to you;',
+    );
+    expect(result).toContain(
+      'If you do not have a clear, useful, additive contribution, output exactly {NTA}.',
+    );
     expect(result).toContain('output exactly {NTA}');
     expect(result).toContain('Err aggressively on the side of silence');
   });
@@ -432,7 +436,9 @@ describe('stripVoiceControlTagsForDisplay', () => {
   });
 
   test('strips wrapper emotion tags but preserves inner text', () => {
-    const result = stripVoiceControlTagsForDisplay('<emotion value="sad">Oh no</emotion> that is bad.');
+    const result = stripVoiceControlTagsForDisplay(
+      '<emotion value="sad">Oh no</emotion> that is bad.',
+    );
     expect(result).toBe('Oh no that is bad.');
   });
 
@@ -452,7 +458,9 @@ describe('stripVoiceControlTagsForDisplay', () => {
   });
 
   test('strips break, speed, volume tags', () => {
-    const result = stripVoiceControlTagsForDisplay('Hello <break time="1s"/> world <speed ratio="1.2"/>fast');
+    const result = stripVoiceControlTagsForDisplay(
+      'Hello <break time="1s"/> world <speed ratio="1.2"/>fast',
+    );
     expect(result).not.toContain('<break');
     expect(result).not.toContain('<speed');
     expect(result).toContain('Hello');
@@ -461,7 +469,9 @@ describe('stripVoiceControlTagsForDisplay', () => {
   });
 
   test('strips spell tags but preserves inner text', () => {
-    const result = stripVoiceControlTagsForDisplay('The code is <spell>ABC123</spell> for reference.');
+    const result = stripVoiceControlTagsForDisplay(
+      'The code is <spell>ABC123</spell> for reference.',
+    );
     expect(result).toBe('The code is ABC123 for reference.');
   });
 

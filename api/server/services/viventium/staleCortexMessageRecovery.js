@@ -30,8 +30,10 @@ function parsePositiveInt(value) {
 }
 
 function getConfiguredCortexExecutionTimeoutMs() {
-  return parsePositiveInt(process.env.VIVENTIUM_CORTEX_EXECUTION_TIMEOUT_MS) ||
-    DEFAULT_CORTEX_EXECUTION_TIMEOUT_MS;
+  return (
+    parsePositiveInt(process.env.VIVENTIUM_CORTEX_EXECUTION_TIMEOUT_MS) ||
+    DEFAULT_CORTEX_EXECUTION_TIMEOUT_MS
+  );
 }
 
 function getStaleCortexRecoveryConfig() {
@@ -54,7 +56,9 @@ function isActiveCortexPart(part) {
   if (!part || typeof part !== 'object' || !CORTEX_TYPES.has(part.type)) {
     return false;
   }
-  const status = String(part.status || '').trim().toLowerCase();
+  const status = String(part.status || '')
+    .trim()
+    .toLowerCase();
   if (status) {
     return ACTIVE_CORTEX_STATUSES.has(status);
   }
@@ -98,10 +102,7 @@ async function recoverStaleCortexMessages({ now = new Date() } = {}) {
   const messages = await Message.find({
     isCreatedByUser: false,
     createdAt: { $lt: cutoff },
-    $or: [
-      { unfinished: true },
-      { 'content.type': { $in: Array.from(CORTEX_TYPES) } },
-    ],
+    $or: [{ unfinished: true }, { 'content.type': { $in: Array.from(CORTEX_TYPES) } }],
   })
     .sort({ createdAt: -1 })
     .limit(limit)
@@ -147,7 +148,14 @@ async function recoverStaleCortexMessages({ now = new Date() } = {}) {
     );
   }
 
-  return { scanned: messages.length, repaired, timeoutMs, limit, cortexExecutionTimeoutMs, graceMs };
+  return {
+    scanned: messages.length,
+    repaired,
+    timeoutMs,
+    limit,
+    cortexExecutionTimeoutMs,
+    graceMs,
+  };
 }
 
 module.exports = {

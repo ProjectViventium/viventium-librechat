@@ -935,11 +935,15 @@ class BaseClient {
 
     const messages = (await getMessages({ conversationId })) ?? [];
 
-    logger.info(`[BaseClient] DEBUG LOAD_HISTORY: Found ${messages.length} messages in DB for conversationId=${conversationId}`);
+    logger.info(
+      `[BaseClient] DEBUG LOAD_HISTORY: Found ${messages.length} messages in DB for conversationId=${conversationId}`,
+    );
     if (messages.length > 0) {
       messages.forEach((msg, i) => {
         const role = msg.isCreatedByUser ? 'user' : 'assistant';
-        logger.info(`[BaseClient] DEBUG LOAD_HISTORY: Message ${i}: messageId=${msg.messageId?.slice(0, 8)}..., role=${role}, hasContent=${!!msg.content}`);
+        logger.info(
+          `[BaseClient] DEBUG LOAD_HISTORY: Message ${i}: messageId=${msg.messageId?.slice(0, 8)}..., role=${role}, hasContent=${!!msg.content}`,
+        );
       });
     }
     /* VIVENTIUM END */

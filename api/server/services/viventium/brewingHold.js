@@ -133,7 +133,11 @@ function normalizeToolNames(tools) {
     .filter(Boolean);
 }
 
-function collectEffectiveDirectActionScopeKeys({ directActionSurfaces, agentTools, toolDefinitions } = {}) {
+function collectEffectiveDirectActionScopeKeys({
+  directActionSurfaces,
+  agentTools,
+  toolDefinitions,
+} = {}) {
   const configuredSurfaces = Array.isArray(directActionSurfaces) ? directActionSurfaces : [];
   if (configuredSurfaces.length === 0) {
     return [];
@@ -197,12 +201,12 @@ function shouldDeferMainResponse(options = {}) {
     'directActionScopeKeys',
   );
   const directScopeSource = hasExplicitDirectActionScopeKeys
-    ? (Array.isArray(directActionScopeKeys) ? directActionScopeKeys : [])
+    ? Array.isArray(directActionScopeKeys)
+      ? directActionScopeKeys
+      : []
     : collectDirectActionScopeKeysFromCortices(activatedCortices);
   const directScopes = new Set(
-    directScopeSource
-      .map((scopeKey) => String(scopeKey || '').trim())
-      .filter(Boolean),
+    directScopeSource.map((scopeKey) => String(scopeKey || '').trim()).filter(Boolean),
   );
 
   const hasMainDirectOwnerForEveryActivatedScope = holdScopeKeys.every((scopeKey) =>
@@ -215,7 +219,6 @@ function stableStringHash(input) {
   const str = String(input || '');
   let hash = 0;
   for (let i = 0; i < str.length; i += 1) {
-    // eslint-disable-next-line no-bitwise
     hash = (hash * 31 + str.charCodeAt(i)) | 0;
   }
   return Math.abs(hash);
@@ -232,9 +235,7 @@ function loadHoldTextsFromEnv() {
     try {
       const parsed = JSON.parse(json);
       if (Array.isArray(parsed)) {
-        const cleaned = parsed
-          .map((v) => (typeof v === 'string' ? v.trim() : ''))
-          .filter(Boolean);
+        const cleaned = parsed.map((v) => (typeof v === 'string' ? v.trim() : '')).filter(Boolean);
         if (cleaned.length > 0) {
           return cleaned;
         }

@@ -519,7 +519,10 @@ describe('viventium-memory-hardening', () => {
   });
 
   test('validator anchors transcript evidence to supplied ids and deterministic mtime', () => {
-    const validTranscriptArtifactIds = new Set(['meeting_transcript:one', 'meeting_transcript:two']);
+    const validTranscriptArtifactIds = new Set([
+      'meeting_transcript:one',
+      'meeting_transcript:two',
+    ]);
     const recentRecencyByArtifactId = new Map([
       ['meeting_transcript:one', '2026-05-05T10:00:00Z'],
       ['meeting_transcript:two', '2026-05-05T11:00:00Z'],
@@ -633,9 +636,7 @@ describe('viventium-memory-hardening', () => {
       },
     });
 
-    expect(fabricated.rejected.map((item) => item.reason)).toEqual([
-      'unknown_transcript_evidence',
-    ]);
+    expect(fabricated.rejected.map((item) => item.reason)).toEqual(['unknown_transcript_evidence']);
   });
 
   test('validator rejects fabricated conversation evidence ids when a prompt message set exists', () => {
@@ -666,9 +667,7 @@ describe('viventium-memory-hardening', () => {
       },
     });
 
-    expect(result.rejected.map((item) => item.reason)).toEqual([
-      'unknown_conversation_evidence',
-    ]);
+    expect(result.rejected.map((item) => item.reason)).toEqual(['unknown_conversation_evidence']);
   });
 
   test('transcript scan passes through csv text and dedupes unchanged files by state', () => {
@@ -950,10 +949,11 @@ describe('viventium-memory-hardening', () => {
       expect(result.telemetry.files_truncated_too_large).toBe(1);
       expect(result.telemetry.files_partial_input).toBe(1);
       expect(result.telemetry.chars_fed_to_model).toBe(0);
-      expect(Object.values(result.index.files).map((record) => record.status).sort()).toEqual([
-        'deferred_oversized',
-        'skipped_non_text',
-      ]);
+      expect(
+        Object.values(result.index.files)
+          .map((record) => record.status)
+          .sort(),
+      ).toEqual(['deferred_oversized', 'skipped_non_text']);
     } finally {
       fs.rmSync(tempDir, { recursive: true, force: true });
       fs.rmSync(stateDir, { recursive: true, force: true });
@@ -980,10 +980,11 @@ describe('viventium-memory-hardening', () => {
 
       expect(result.transcripts).toHaveLength(1);
       expect(result.telemetry.files_skipped_by_cap).toBe(1);
-      expect(Object.values(result.index.files).map((record) => record.status).sort()).toEqual([
-        'deferred_cap',
-        'pending',
-      ]);
+      expect(
+        Object.values(result.index.files)
+          .map((record) => record.status)
+          .sort(),
+      ).toEqual(['deferred_cap', 'pending']);
     } finally {
       fs.rmSync(tempDir, { recursive: true, force: true });
       fs.rmSync(stateDir, { recursive: true, force: true });
@@ -1092,7 +1093,9 @@ describe('viventium-memory-hardening', () => {
 
   test('transcript scan requeues unchanged processed files when vector repair requests their content hash', () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-transcript-vector-repair-'));
-    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-transcript-vector-repair-state-'));
+    const stateDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'viventium-transcript-vector-repair-state-'),
+    );
     const now = new Date('2026-05-05T12:00:00Z');
     try {
       fs.writeFileSync(path.join(tempDir, 'meeting.txt'), 'Speaker A: transcript detail.', 'utf8');
@@ -1554,7 +1557,9 @@ describe('viventium-memory-hardening', () => {
     jest.resetModules();
     const oldRag = process.env.RAG_API_URL;
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-transcript-vector-index-'));
-    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-transcript-vector-index-state-'));
+    const stateDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'viventium-transcript-vector-index-state-'),
+    );
     process.env.RAG_API_URL = 'http://rag.example.test';
     const vectorDocumentExists = jest.fn().mockResolvedValue(false);
     jest.doMock('~/server/services/Files/VectorDB/crud', () => ({
@@ -1629,7 +1634,9 @@ describe('viventium-memory-hardening', () => {
     jest.resetModules();
     const oldRag = process.env.RAG_API_URL;
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-transcript-orphan-db-'));
-    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-transcript-orphan-db-state-'));
+    const stateDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'viventium-transcript-orphan-db-state-'),
+    );
     process.env.RAG_API_URL = 'http://rag.example.test';
     const vectorDocumentExists = jest.fn().mockResolvedValue(true);
     jest.doMock('~/server/services/Files/VectorDB/crud', () => ({
@@ -1713,7 +1720,9 @@ describe('viventium-memory-hardening', () => {
     jest.resetModules();
     const oldRag = process.env.RAG_API_URL;
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-transcript-missing-index-'));
-    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-transcript-missing-index-state-'));
+    const stateDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'viventium-transcript-missing-index-state-'),
+    );
     process.env.RAG_API_URL = 'http://rag.example.test';
     const vectorDocumentExists = jest.fn().mockResolvedValue(true);
     jest.doMock('~/server/services/Files/VectorDB/crud', () => ({
@@ -1906,7 +1915,8 @@ describe('viventium-memory-hardening', () => {
               contentHash: 'ragdown1234567890',
               rawFileId: 'meeting_transcript:user:rag-down',
               summaryFileId: 'meeting_summary:user:rag-down',
-              file_content: '<transcript>\n10:00 Speaker Alpha discussed a meeting-scoped note.\n</transcript>',
+              file_content:
+                '<transcript>\n10:00 Speaker Alpha discussed a meeting-scoped note.\n</transcript>',
               summary: '10:00 Speaker Alpha discussed a meeting-scoped note.',
             },
           ],
@@ -1979,7 +1989,8 @@ describe('viventium-memory-hardening', () => {
       const fixtures = {
         'meeting.csv': 'speaker,timestamp,text\nSam,2026-05-05T10:00:00Z,CSV detail.\n',
         'meeting.txt': '10:01 Sam: TXT detail.',
-        'meeting.json': '{"speaker":"Sam","timestamp":"2026-05-05T10:02:00Z","text":"JSON detail."}',
+        'meeting.json':
+          '{"speaker":"Sam","timestamp":"2026-05-05T10:02:00Z","text":"JSON detail."}',
         'meeting.vtt': 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nSam: VTT detail.\n',
         'meeting.srt': '1\n00:00:01,000 --> 00:00:02,000\nSam: SRT detail.\n',
         'meeting.md': '## Meeting\n\n10:03 Sam: MD detail.',

@@ -186,7 +186,9 @@ describe('ProgressText and background cortex status layout', () => {
     fireEvent.click(screen.getByRole('button'));
 
     expect(
-      screen.getByText('This background agent hit a runtime issue before it could return a result.'),
+      screen.getByText(
+        'This background agent hit a runtime issue before it could return a result.',
+      ),
     ).toBeInTheDocument();
     expect(screen.queryByText(privatePath)).not.toBeInTheDocument();
     expect(screen.queryByText(privateEmail)).not.toBeInTheDocument();

@@ -145,16 +145,18 @@ describe('late completion error content parts', () => {
   });
 
   test('keeps visible errors when there is no assistant text or the error is not stream termination', () => {
-    expect(
-      AgentClient.shouldSuppressCompletionErrorContentPart([], new Error('terminated')),
-    ).toBe(false);
+    expect(AgentClient.shouldSuppressCompletionErrorContentPart([], new Error('terminated'))).toBe(
+      false,
+    );
     expect(
       AgentClient.shouldSuppressCompletionErrorContentPart(
         [{ type: ContentTypes.TEXT, text: 'Partial answer.' }],
         new Error('status 429 rate_limit_error'),
       ),
     ).toBe(false);
-    expect(AgentClient.createCompletionErrorContentPart(new Error('status 429 rate_limit_error'))).toEqual({
+    expect(
+      AgentClient.createCompletionErrorContentPart(new Error('status 429 rate_limit_error')),
+    ).toEqual({
       type: ContentTypes.ERROR,
       [ContentTypes.ERROR]:
         'The model provider rate-limited this request. Please try again shortly.',
@@ -248,7 +250,9 @@ describe('background cortex runtime card guard', () => {
       expect.stringContaining('Runtime may display background-cortex status/result cards'),
     );
     expect(agent.instructions).toContain('Base instructions.');
-    expect(agent.instructions).toContain('Runtime may display background-cortex status/result cards');
+    expect(agent.instructions).toContain(
+      'Runtime may display background-cortex status/result cards',
+    );
     expect(agent.instructions).toContain(
       'Do not offer to start, spin up, launch, or run background agents/cortices',
     );
@@ -1817,7 +1821,8 @@ describe('AgentClient - titleConvo', () => {
           content: [
             {
               type: 'think',
-              think: 'This is the same internal check repeated many times. {NTA} is the correct response.',
+              think:
+                'This is the same internal check repeated many times. {NTA} is the correct response.',
             },
             {
               type: 'text',
@@ -1833,7 +1838,9 @@ describe('AgentClient - titleConvo', () => {
       expect(mockProcessMemory).toHaveBeenCalledTimes(1);
       const processedMessage = mockProcessMemory.mock.calls[0][0][0];
 
-      expect(processedMessage.content).toContain('The user is in a quiet workspace and focused on a planning task today.');
+      expect(processedMessage.content).toContain(
+        'The user is in a quiet workspace and focused on a planning task today.',
+      );
       expect(processedMessage.content).not.toContain('Internal Check:');
       expect(processedMessage.content).not.toContain('{NTA}');
       expect(processedMessage.content).not.toContain('same internal check repeated');
@@ -1850,7 +1857,8 @@ describe('AgentClient - titleConvo', () => {
           content: [
             {
               type: 'think',
-              think: 'This is the same internal check repeated many times. {NTA} is the correct response.',
+              think:
+                'This is the same internal check repeated many times. {NTA} is the correct response.',
             },
             {
               type: 'text',
@@ -1950,7 +1958,9 @@ describe('AgentClient - titleConvo', () => {
       const processedMessage = mockProcessMemory.mock.calls[0][0][0];
 
       // Current chat stays bounded to the last 3-message user-starting window.
-      expect(processedMessage.content).toContain('# Recent User Context Outside Current Chat Window:');
+      expect(processedMessage.content).toContain(
+        '# Recent User Context Outside Current Chat Window:',
+      );
       expect(processedMessage.content).toContain('Message 1');
       expect(processedMessage.content).toContain('Message 3');
       expect(processedMessage.content).toContain('Response 3');
@@ -1975,12 +1985,16 @@ describe('AgentClient - titleConvo', () => {
       expect(mockProcessMemory).toHaveBeenCalledTimes(1);
       const processedMessage = mockProcessMemory.mock.calls[0][0][0];
 
-      expect(processedMessage.content).toContain('# Recent User Context Outside Current Chat Window:');
+      expect(processedMessage.content).toContain(
+        '# Recent User Context Outside Current Chat Window:',
+      );
       expect(processedMessage.content).toContain('I used to work on Project Atlas.');
       expect(processedMessage.content).toContain('The migration was delayed last week.');
       expect(processedMessage.content).toContain('# Current Chat:');
       expect(processedMessage.content).toContain('Current focus is the release checklist.');
-      expect(processedMessage.content).toContain('Actually the release checklist is blocked on vendor approval.');
+      expect(processedMessage.content).toContain(
+        'Actually the release checklist is blocked on vendor approval.',
+      );
       expect(processedMessage.content).not.toContain('Noted.');
       expect(processedMessage.content).not.toContain('Understood.');
     });
@@ -1990,7 +2004,9 @@ describe('AgentClient - titleConvo', () => {
       client.options.req.config.memory.historyContextCharLimit = 45;
 
       const messages = [
-        new HumanMessage('This is a very long earlier correction that should be trimmed before it reaches the memory writer.'),
+        new HumanMessage(
+          'This is a very long earlier correction that should be trimmed before it reaches the memory writer.',
+        ),
         new AIMessage('Acknowledged.'),
         new HumanMessage('Older filler user turn.'),
         new AIMessage('Done with that.'),
@@ -2001,7 +2017,9 @@ describe('AgentClient - titleConvo', () => {
       await client.runMemory(messages);
 
       const processedMessage = mockProcessMemory.mock.calls[0][0][0];
-      expect(processedMessage.content).toContain('# Recent User Context Outside Current Chat Window:');
+      expect(processedMessage.content).toContain(
+        '# Recent User Context Outside Current Chat Window:',
+      );
       expect(processedMessage.content).toContain('...');
     });
 
@@ -2348,8 +2366,7 @@ describe('AgentClient - titleConvo', () => {
     });
 
     it('should inject conversation recall instructions for all participating agents', async () => {
-      const recallPrompt =
-        'CONVERSATION RECALL:\n- Use `file_search` for prior-chat questions.';
+      const recallPrompt = 'CONVERSATION RECALL:\n- Use `file_search` for prior-chat questions.';
       client.useMemory = jest.fn().mockResolvedValue(undefined);
       mockReq.user.personalization.conversation_recall = true;
       mockBuildConversationRecallInstructions.mockReturnValue(recallPrompt);
@@ -3154,7 +3171,9 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
 
     expect(client.chatCompletion).toHaveBeenCalledTimes(2);
     expect(fallbackSawSuppression).toBeUndefined();
-    expect(Object.prototype.hasOwnProperty.call(req.body, 'suppressBackgroundCortices')).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(req.body, 'suppressBackgroundCortices')).toBe(
+      false,
+    );
     expect(result.completion).toEqual([{ type: ContentTypes.TEXT, text: 'Fallback answer.' }]);
   });
 
@@ -3172,7 +3191,8 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
       if (calls === 1) {
         client.contentParts.push({
           type: ContentTypes.ERROR,
-          [ContentTypes.ERROR]: 'The model provider rate-limited this request. Please try again shortly.',
+          [ContentTypes.ERROR]:
+            'The model provider rate-limited this request. Please try again shortly.',
           error_class: 'provider_rate_limited',
         });
         const error = new Error('rate limit');
@@ -3225,7 +3245,9 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
 
     expect(client.chatCompletion).toHaveBeenCalledTimes(2);
     expect(fallbackSawSuppression).toBe(true);
-    expect(Object.prototype.hasOwnProperty.call(req.body, 'suppressBackgroundCortices')).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(req.body, 'suppressBackgroundCortices')).toBe(
+      false,
+    );
     expect(client.contentParts).toEqual([
       expect.objectContaining({
         type: ContentTypes.CORTEX_INSIGHT,
@@ -3258,7 +3280,11 @@ describe('Phase B cortex follow-up SSE emission (integration)', () => {
 
     const req = { _resumableStreamId: 'stream-abc' };
     const responseMessageId = 'resp-123';
-    const mergedInsightsData = { insights: [{ text: 'insight' }], cortexCount: 1, mergedPrompt: 'prompt' };
+    const mergedInsightsData = {
+      insights: [{ text: 'insight' }],
+      cortexCount: 1,
+      mergedPrompt: 'prompt',
+    };
 
     const followUpMessage = await mockCreateCortexFollowUpMessage({
       req,
@@ -3337,7 +3363,11 @@ describe('Phase B cortex follow-up SSE emission (integration)', () => {
 
     const req = { _resumableStreamId: 'stream-abc' };
     const responseMessageId = 'resp-123';
-    const mergedInsightsData = { insights: [{ text: 'insight' }], cortexCount: 2, mergedPrompt: 'prompt' };
+    const mergedInsightsData = {
+      insights: [{ text: 'insight' }],
+      cortexCount: 2,
+      mergedPrompt: 'prompt',
+    };
 
     const followUpMessage = await mockCreateCortexFollowUpMessage({
       req,

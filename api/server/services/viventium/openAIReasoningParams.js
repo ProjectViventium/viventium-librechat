@@ -25,14 +25,18 @@ const OPENAI_REASONING_SAMPLING_PARAMS = Object.freeze([
   'top_logprobs',
 ]);
 
-const OPENAI_REASONING_MODEL_IDS_WITHOUT_SAMPLING = Object.freeze(new Set([
-  // Runtime evidence: the configured Viventium OpenAI reasoning endpoint rejected this model bag
-  // with sampling controls during background cortex execution.
-  'gpt-5.4',
-]));
+const OPENAI_REASONING_MODEL_IDS_WITHOUT_SAMPLING = Object.freeze(
+  new Set([
+    // Runtime evidence: the configured Viventium OpenAI reasoning endpoint rejected this model bag
+    // with sampling controls during background cortex execution.
+    'gpt-5.4',
+  ]),
+);
 
 function isOpenAIReasoningModelWithoutSampling(model) {
-  const normalized = String(model || '').trim().toLowerCase();
+  const normalized = String(model || '')
+    .trim()
+    .toLowerCase();
   if (!normalized) {
     return false;
   }

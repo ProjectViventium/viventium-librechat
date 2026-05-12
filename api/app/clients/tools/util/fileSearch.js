@@ -173,7 +173,10 @@ const getMeetingTranscriptFileSearchTopK = () =>
 /* === VIVENTIUM END === */
 
 const getFileSearchMaxResults = () =>
-  parsePositiveIntEnv(process.env.VIVENTIUM_FILE_SEARCH_MAX_RESULTS, DEFAULT_FILE_SEARCH_MAX_RESULTS);
+  parsePositiveIntEnv(
+    process.env.VIVENTIUM_FILE_SEARCH_MAX_RESULTS,
+    DEFAULT_FILE_SEARCH_MAX_RESULTS,
+  );
 
 const getConversationRecallFileSearchMaxResults = () =>
   parsePositiveIntEnv(
@@ -295,7 +298,9 @@ const withMeetingTranscriptHeader = (result, content) => {
 };
 
 const getNoMatchingContentOutput = ({ files = [], recallFiles = [] }) => {
-  const hasMeetingTranscriptResource = files.some((file) => isMeetingTranscriptFileId(file?.file_id));
+  const hasMeetingTranscriptResource = files.some((file) =>
+    isMeetingTranscriptFileId(file?.file_id),
+  );
   const hasConversationRecallResource = recallFiles.length > 0;
   if (hasMeetingTranscriptResource && hasConversationRecallResource) {
     return 'No matching content found in conversation history or meeting transcripts for this query.';
@@ -832,9 +837,12 @@ const createFileSearchTool = async ({
         const queryPromises = targetFiles.map(async (file) => {
           const isRecall = isConversationRecallFileId(file?.file_id);
           if (isSourceOnlyConversationRecallFile(file)) {
-            logger.debug(`[${Tools.file_search}] skipping vector query for source-only recall file`, {
-              fileId: file.file_id,
-            });
+            logger.debug(
+              `[${Tools.file_search}] skipping vector query for source-only recall file`,
+              {
+                fileId: file.file_id,
+              },
+            );
             return { file, response: { data: [] } };
           }
           const queryStart = Date.now();
@@ -877,12 +885,16 @@ const createFileSearchTool = async ({
         });
 
         const results = await Promise.all(queryPromises);
-        return results.filter((result) => result?.response && Array.isArray(result?.response?.data));
+        return results.filter(
+          (result) => result?.response && Array.isArray(result?.response?.data),
+        );
       };
 
       const hasAnyMatches = (results) =>
         Array.isArray(results) &&
-        results.some((result) => Array.isArray(result?.response?.data) && result.response.data.length > 0);
+        results.some(
+          (result) => Array.isArray(result?.response?.data) && result.response.data.length > 0,
+        );
 
       const validResults = await queryFiles(files);
 
@@ -939,15 +951,19 @@ const createFileSearchTool = async ({
             isConversationRecallFileId(result.file_id),
           );
           if (hasConversationRecallResults) {
-            formattedResults = rerankConversationRecallResults({ query, results: formattedResults });
+            formattedResults = rerankConversationRecallResults({
+              query,
+              results: formattedResults,
+            });
           }
         }
       }
 
       if (formattedResults.length === 0) {
-        const msg = queryErrorCount > 0
-          ? getFileSearchFailureOutput()
-          : getNoMatchingContentOutput({ files, recallFiles });
+        const msg =
+          queryErrorCount > 0
+            ? getFileSearchFailureOutput()
+            : getNoMatchingContentOutput({ files, recallFiles });
         return [msg, undefined];
       }
 
@@ -1012,20 +1028,16 @@ const createFileSearchTool = async ({
       }
 
       const formattedString = includedResults
-        .map(
-          (result, index) => {
-            const displayRelevance = Number.isFinite(result?.recallRerankScore)
-              ? result.recallRerankScore
-              : 1.0 - result.distance;
-            return (
-            `File: ${result.filename}${
-              fileCitations ? `\nAnchor: \\ue202turn0file${index} (${result.filename})` : ''
-            }\nRelevance: ${displayRelevance.toFixed(4)}\nContent: ${
-              result.modelContent || result.content
-            }\n`
-            );
-          },
-        )
+        .map((result, index) => {
+          const displayRelevance = Number.isFinite(result?.recallRerankScore)
+            ? result.recallRerankScore
+            : 1.0 - result.distance;
+          return `File: ${result.filename}${
+            fileCitations ? `\nAnchor: \\ue202turn0file${index} (${result.filename})` : ''
+          }\nRelevance: ${displayRelevance.toFixed(4)}\nContent: ${
+            result.modelContent || result.content
+          }\n`;
+        })
         .join('\n---\n');
 
       const sources = includedResults.map((result) => ({
@@ -1051,9 +1063,7 @@ const createFileSearchTool = async ({
     {
       name: Tools.file_search,
       responseFormat: 'content_and_artifact',
-      description: `Performs semantic search across attached "${Tools.file_search}" documents using natural language queries. This tool analyzes the content of uploaded files to find relevant information, quotes, and passages that best match your query. Use this to extract specific information or find relevant sections within the available documents.${
-        '\n\nPreserve distinctive exact strings from the user when they matter, such as IDs, codes, quoted phrases, names, and email addresses. Do not paraphrase them away in the query.'
-      }${
+      description: `Performs semantic search across attached "${Tools.file_search}" documents using natural language queries. This tool analyzes the content of uploaded files to find relevant information, quotes, and passages that best match your query. Use this to extract specific information or find relevant sections within the available documents.${'\n\nPreserve distinctive exact strings from the user when they matter, such as IDs, codes, quoted phrases, names, and email addresses. Do not paraphrase them away in the query.'}${
         fileCitations
           ? `
 

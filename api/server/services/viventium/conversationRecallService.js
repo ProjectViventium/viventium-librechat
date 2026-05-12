@@ -121,10 +121,7 @@ const UPLOAD_TIMEOUT_PER_100K_CHARS_MS = Math.max(
 );
 const UPLOAD_TIMEOUT_MAX_MS = Math.max(
   UPLOAD_TIMEOUT_MS,
-  Number.parseInt(
-    process.env.VIVENTIUM_CONVERSATION_RECALL_UPLOAD_TIMEOUT_MAX_MS || '180000',
-    10,
-  ),
+  Number.parseInt(process.env.VIVENTIUM_CONVERSATION_RECALL_UPLOAD_TIMEOUT_MAX_MS || '180000', 10),
 );
 const UPLOAD_RETRY_BASE_MS = Math.max(
   0,
@@ -158,11 +155,17 @@ const MAX_PENDING_CONVERSATION_SYNCS = Math.max(
 );
 const FAILURE_COOLDOWN_BASE_MS = Math.max(
   1000,
-  Number.parseInt(process.env.VIVENTIUM_CONVERSATION_RECALL_FAILURE_COOLDOWN_BASE_MS || '30000', 10),
+  Number.parseInt(
+    process.env.VIVENTIUM_CONVERSATION_RECALL_FAILURE_COOLDOWN_BASE_MS || '30000',
+    10,
+  ),
 );
 const FAILURE_COOLDOWN_MAX_MS = Math.max(
   FAILURE_COOLDOWN_BASE_MS,
-  Number.parseInt(process.env.VIVENTIUM_CONVERSATION_RECALL_FAILURE_COOLDOWN_MAX_MS || '300000', 10),
+  Number.parseInt(
+    process.env.VIVENTIUM_CONVERSATION_RECALL_FAILURE_COOLDOWN_MAX_MS || '300000',
+    10,
+  ),
 );
 const MAX_TRANSIENT_SYNC_FAILURES = Math.max(
   1,
@@ -398,8 +401,7 @@ function computeAdaptiveUploadTimeoutMs(charCount) {
   }
 
   const chunksOf100k = Math.ceil(charCount / 100000);
-  const adaptiveTimeout =
-    UPLOAD_TIMEOUT_MS + chunksOf100k * UPLOAD_TIMEOUT_PER_100K_CHARS_MS;
+  const adaptiveTimeout = UPLOAD_TIMEOUT_MS + chunksOf100k * UPLOAD_TIMEOUT_PER_100K_CHARS_MS;
 
   return Math.min(UPLOAD_TIMEOUT_MAX_MS, adaptiveTimeout);
 }
@@ -435,7 +437,10 @@ function renderConversationRecallCorpus({ segments, scope, latestTimestamp }) {
 }
 
 function computeCorpusDigest(corpus) {
-  return crypto.createHash('sha256').update(String(corpus || ''), 'utf8').digest('hex');
+  return crypto
+    .createHash('sha256')
+    .update(String(corpus || ''), 'utf8')
+    .digest('hex');
 }
 
 function getMessageText(message) {
@@ -712,7 +717,8 @@ async function upsertRecallFile({ userId, scope, agentId, corpus }) {
     .select('metadata embedded file_id')
     .lean();
   const existingSourceDigest =
-    existing?.metadata?.conversationRecallSourceDigest || existing?.metadata?.conversationRecallDigest;
+    existing?.metadata?.conversationRecallSourceDigest ||
+    existing?.metadata?.conversationRecallDigest;
   const existingUploadedDigest = existing?.metadata?.conversationRecallUploadedDigest;
   const lastKnownDigest = lastUploadedCorpusDigestByFileId.get(file_id);
 
@@ -725,12 +731,19 @@ async function upsertRecallFile({ userId, scope, agentId, corpus }) {
     return;
   }
 
-  if (existing && existingSourceDigest === sourceDigest && existingUploadedDigest !== sourceDigest) {
-    logger.info('[conversationRecall] Rebuilding corpus because prior upload used a reduced window', {
-      file_id,
-      sourceChars: corpus.length,
-      uploadedChars: existing?.metadata?.conversationRecallCharCount ?? null,
-    });
+  if (
+    existing &&
+    existingSourceDigest === sourceDigest &&
+    existingUploadedDigest !== sourceDigest
+  ) {
+    logger.info(
+      '[conversationRecall] Rebuilding corpus because prior upload used a reduced window',
+      {
+        file_id,
+        sourceChars: corpus.length,
+        uploadedChars: existing?.metadata?.conversationRecallCharCount ?? null,
+      },
+    );
   }
 
   /* === VIVENTIUM START ===
@@ -1128,11 +1141,14 @@ async function runQueuedConversationSync(userId) {
       const failureCount = conversationSyncFailureCountByUser.get(userId) ?? 0;
       if (failureCount >= MAX_TRANSIENT_SYNC_FAILURES) {
         pending.clear();
-        logger.warn('[conversationRecall] Pausing proactive sync after repeated transient failures', {
-          userId,
-          failureCount,
-          maxTransientFailures: MAX_TRANSIENT_SYNC_FAILURES,
-        });
+        logger.warn(
+          '[conversationRecall] Pausing proactive sync after repeated transient failures',
+          {
+            userId,
+            failureCount,
+            maxTransientFailures: MAX_TRANSIENT_SYNC_FAILURES,
+          },
+        );
         return;
       }
       scheduleTask(

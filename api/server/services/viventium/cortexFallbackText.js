@@ -71,12 +71,21 @@ const CONCRETE_RESULT_DETAIL_PATTERNS = [
   /\b(?:received|sent|found|scheduled)\b/i,
 ];
 
-function normalizeDeferredFallbackErrorClass({ errorClass = '', error = '', recoveryReason = '' } = {}) {
-  const normalized = String(errorClass || error || recoveryReason || '').trim().toLowerCase();
+function normalizeDeferredFallbackErrorClass({
+  errorClass = '',
+  error = '',
+  recoveryReason = '',
+} = {}) {
+  const normalized = String(errorClass || error || recoveryReason || '')
+    .trim()
+    .toLowerCase();
   if (!normalized) {
     return '';
   }
-  if (normalized.includes('stale_cortex_startup_recovery') || normalized.includes('runtime recovery')) {
+  if (
+    normalized.includes('stale_cortex_startup_recovery') ||
+    normalized.includes('runtime recovery')
+  ) {
     return 'restart_recovered';
   }
   if (
@@ -107,7 +116,11 @@ function getDeferredFallbackErrorText({
   if (typeof scheduleId === 'string' && scheduleId.trim()) {
     return '';
   }
-  const normalizedClass = normalizeDeferredFallbackErrorClass({ errorClass, error, recoveryReason });
+  const normalizedClass = normalizeDeferredFallbackErrorClass({
+    errorClass,
+    error,
+    recoveryReason,
+  });
   if (normalizedClass === 'restart_recovered') {
     return 'That background check was interrupted by a runtime restart before it finished.';
   }
@@ -298,12 +311,7 @@ function scoreFallbackInsightCandidate({ insight, index = 0 }) {
     10,
   );
   const configuredTools = Number.parseInt(
-    String(
-      insight?.configured_tools ??
-        insight?.configuredTools ??
-        insight?.tools_configured ??
-        0,
-    ),
+    String(insight?.configured_tools ?? insight?.configuredTools ?? insight?.tools_configured ?? 0),
     10,
   );
 
@@ -313,7 +321,11 @@ function scoreFallbackInsightCandidate({ insight, index = 0 }) {
     score += 900 + Math.min(180, completedToolCalls * 45);
   }
 
-  if (Number.isFinite(configuredTools) && configuredTools > 0 && (!Number.isFinite(completedToolCalls) || completedToolCalls === 0)) {
+  if (
+    Number.isFinite(configuredTools) &&
+    configuredTools > 0 &&
+    (!Number.isFinite(completedToolCalls) || completedToolCalls === 0)
+  ) {
     score -= 120;
   }
 

@@ -48,7 +48,7 @@ jest.mock('@librechat/api', () => ({
     if (!first) {
       return undefined;
     }
-    return `Attached document(s):\n# \"${first.filename || 'file'}\"\n${first.text}`;
+    return `Attached document(s):\n# "${first.filename || 'file'}"\n${first.text}`;
   }),
   countTokens: jest.fn(() => 1),
   /* === VIVENTIUM NOTE ===
@@ -180,7 +180,10 @@ describe('BackgroundCortexService.detectActivations', () => {
       mainAgent: {
         provider: 'openai',
         background_cortices: [
-          { agent_id: 'a1', activation: { enabled: true, intent_scope: 'productivity_google_workspace' } },
+          {
+            agent_id: 'a1',
+            activation: { enabled: true, intent_scope: 'productivity_google_workspace' },
+          },
           { agent_id: 'a2', activation: { enabled: true } },
         ],
       },
@@ -204,7 +207,12 @@ describe('BackgroundCortexService.detectActivations', () => {
       if (cortexConfig.agent_id === 'a1') {
         return { shouldActivate: true, confidence: 0.9, reason: 'matched', agentId: 'a1' };
       }
-      return { shouldActivate: false, confidence: 0.1, reason: 'nope', agentId: cortexConfig.agent_id };
+      return {
+        shouldActivate: false,
+        confidence: 0.1,
+        reason: 'nope',
+        agentId: cortexConfig.agent_id,
+      };
     };
 
     const res = await detectActivations({
@@ -212,7 +220,10 @@ describe('BackgroundCortexService.detectActivations', () => {
       mainAgent: {
         provider: 'openai',
         background_cortices: [
-          { agent_id: 'a1', activation: { enabled: true, intent_scope: 'productivity_google_workspace' } },
+          {
+            agent_id: 'a1',
+            activation: { enabled: true, intent_scope: 'productivity_google_workspace' },
+          },
           { agent_id: 'a2', activation: { enabled: true } },
         ],
       },
@@ -305,10 +316,12 @@ describe('BackgroundCortexService config hygiene helpers', () => {
     delete process.env.SAMBANOVA_BASE_URL;
     delete process.env.SAMBANOVA_API_BASE_URL;
 
-    await expect(getCustomEndpointConfig('sambanova', { user: { role: 'USER' } })).resolves.toEqual({
-      apiKey: 'sambanova-test-key',
-      baseURL: 'https://api.sambanova.ai/v1/',
-    });
+    await expect(getCustomEndpointConfig('sambanova', { user: { role: 'USER' } })).resolves.toEqual(
+      {
+        apiKey: 'sambanova-test-key',
+        baseURL: 'https://api.sambanova.ai/v1/',
+      },
+    );
   });
 
   test('uses env fallback when app config loads without a matching custom endpoint', async () => {
@@ -395,7 +408,11 @@ describe('BackgroundCortexService.checkCortexActivation', () => {
       expect(prompt).toContain('[User] Check my inbox for replies from Joey.');
       expect(prompt).toContain('[Assistant] Gmail or Outlook?');
       expect(prompt).toContain('[User] Ms365');
-      return JSON.stringify({ should_activate: true, confidence: 0.95, reason: 'matched clarification' });
+      return JSON.stringify({
+        should_activate: true,
+        confidence: 0.95,
+        reason: 'matched clarification',
+      });
     });
 
     Run.create.mockResolvedValueOnce({ processStream });
@@ -504,7 +521,9 @@ describe('BackgroundCortexService.checkCortexActivation', () => {
           prompt: PRODUCTIVITY_MS365_PROMPT,
         },
       },
-      messages: [{ role: 'user', content: 'Check my Outlook inbox and summarize anything urgent.' }],
+      messages: [
+        { role: 'user', content: 'Check my Outlook inbox and summarize anything urgent.' },
+      ],
       runId: 'run-ms365-fallback-chain',
       req: { body: {}, user: {} },
     });
@@ -565,7 +584,9 @@ describe('BackgroundCortexService.checkCortexActivation', () => {
             prompt: PRODUCTIVITY_MS365_PROMPT,
           },
         },
-        messages: [{ role: 'user', content: 'Check my Outlook inbox and summarize anything urgent.' }],
+        messages: [
+          { role: 'user', content: 'Check my Outlook inbox and summarize anything urgent.' },
+        ],
         runId: 'run-ms365-timeout-fallback-chain',
         req: { body: {}, user: {} },
         timeoutMs: 100,
@@ -622,7 +643,9 @@ describe('BackgroundCortexService.checkCortexActivation', () => {
           prompt: PRODUCTIVITY_MS365_PROMPT,
         },
       },
-      messages: [{ role: 'user', content: 'Please reply with exactly DIRECT_OK and nothing else.' }],
+      messages: [
+        { role: 'user', content: 'Please reply with exactly DIRECT_OK and nothing else.' },
+      ],
       runId: 'run-ms365-no-fallback-after-decision',
       req: { body: {}, user: {} },
     });
@@ -691,7 +714,11 @@ describe('BackgroundCortexService.checkCortexActivation', () => {
 
   test('omits temperature for adaptive Anthropic activation checks on Sonnet 4.6', async () => {
     const processStream = jest.fn(async () =>
-      JSON.stringify({ should_activate: true, confidence: 0.91, reason: 'adaptive anthropic matched' }),
+      JSON.stringify({
+        should_activate: true,
+        confidence: 0.91,
+        reason: 'adaptive anthropic matched',
+      }),
     );
 
     Run.create.mockResolvedValueOnce({ processStream });
@@ -721,7 +748,9 @@ describe('BackgroundCortexService.checkCortexActivation', () => {
         }),
       }),
     );
-    expect(initializeAnthropic.mock.calls.at(-1)[0].model_parameters).not.toHaveProperty('temperature');
+    expect(initializeAnthropic.mock.calls.at(-1)[0].model_parameters).not.toHaveProperty(
+      'temperature',
+    );
     expect(Run.create).toHaveBeenCalledWith(
       expect.objectContaining({
         graphConfig: expect.objectContaining({
@@ -874,7 +903,12 @@ describe('BackgroundCortexService.checkCortexActivation', () => {
           prompt: PRODUCTIVITY_GOOGLE_PROMPT,
         },
       },
-      messages: [{ role: 'user', content: 'Check my Gmail inbox and summarize what happened in the past 10 days.' }],
+      messages: [
+        {
+          role: 'user',
+          content: 'Check my Gmail inbox and summarize what happened in the past 10 days.',
+        },
+      ],
       runId: 'run-google-live-email',
       req: { body: {}, user: {} },
     });
@@ -893,7 +927,9 @@ describe('BackgroundCortexService.checkCortexActivation', () => {
     const processStream = jest.fn(async ({ messages }) => {
       const prompt = messages[0]?.content || '';
       expect(prompt).toContain('## Activation Decision Subject:');
-      expect(prompt).toContain('LatestUserMessage: Please reply with exactly DIRECT_OK and nothing else.');
+      expect(prompt).toContain(
+        'LatestUserMessage: Please reply with exactly DIRECT_OK and nothing else.',
+      );
       expect(prompt).toContain('ActivationScopeKey: productivity_google_workspace');
       expect(prompt).toContain('now, check my gmail as well as my outlook');
       expect(prompt).toContain("I couldn't finish that check just now.");
@@ -940,10 +976,16 @@ describe('BackgroundCortexService.checkCortexActivation', () => {
       const prompt = messages[0]?.content || '';
       expect(prompt).toContain('## Activation Decision Subject:');
       expect(prompt).toContain('LatestUserMessage: say "TEST_OK"');
-      expect(prompt).toContain('Never activate only because an older user request appears in history');
+      expect(prompt).toContain(
+        'Never activate only because an older user request appears in history',
+      );
       expect(prompt).toContain('[User] Please red-team this launch idea.');
       expect(prompt).toContain('[User] say "TEST_OK"');
-      return JSON.stringify({ should_activate: false, confidence: 0.99, reason: 'latest simple test' });
+      return JSON.stringify({
+        should_activate: false,
+        confidence: 0.99,
+        reason: 'latest simple test',
+      });
     });
 
     Run.create.mockResolvedValueOnce({ processStream });
@@ -980,8 +1022,14 @@ describe('BackgroundCortexService.checkCortexActivation', () => {
     const processStream = jest.fn(async ({ messages }) => {
       const prompt = messages[0]?.content || '';
       expect(prompt).toContain('CUSTOM LATEST TURN RULE');
-      expect(prompt).not.toContain('Never activate only because an older user request appears in history');
-      return JSON.stringify({ should_activate: false, confidence: 1, reason: 'custom latest rule' });
+      expect(prompt).not.toContain(
+        'Never activate only because an older user request appears in history',
+      );
+      return JSON.stringify({
+        should_activate: false,
+        confidence: 1,
+        reason: 'custom latest rule',
+      });
     });
 
     Run.create.mockResolvedValueOnce({ processStream });
@@ -1035,7 +1083,9 @@ describe('BackgroundCortexService.checkCortexActivation', () => {
           prompt: 'You are a classifier. Decide whether to activate the productivity specialist.',
         },
       },
-      messages: [{ role: 'user', content: 'Please reply with exactly DIRECT_OK and nothing else.' }],
+      messages: [
+        { role: 'user', content: 'Please reply with exactly DIRECT_OK and nothing else.' },
+      ],
       runId: 'run-google-config-scope',
       req: { body: {}, user: {} },
     });
@@ -1684,11 +1734,7 @@ describe('BackgroundCortexService.executeCortex', () => {
       name: 'web_search',
     });
 
-    const messages = [
-      new HumanMessage({ content: 'check my inbox' }),
-      aiWithTool,
-      toolResult,
-    ];
+    const messages = [new HumanMessage({ content: 'check my inbox' }), aiWithTool, toolResult];
 
     await executeCortex({
       agent: {

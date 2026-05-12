@@ -32,7 +32,12 @@ describe('brewingHold', () => {
 
     expect(
       shouldDeferMainResponse({
-        activatedCortices: [{ agentId: 'agent_viventium_online_tool_use_95aeb3', activationScope: 'productivity_ms365' }],
+        activatedCortices: [
+          {
+            agentId: 'agent_viventium_online_tool_use_95aeb3',
+            activationScope: 'productivity_ms365',
+          },
+        ],
       }),
     ).toBe(true);
   });
@@ -46,7 +51,9 @@ describe('brewingHold', () => {
           {
             cortexName: 'Google',
             activationScope: 'productivity_google_workspace',
-            directActionSurfaceScopes: [{ server: 'google-workspace', scopeKey: 'productivity_google_workspace' }],
+            directActionSurfaceScopes: [
+              { server: 'google-workspace', scopeKey: 'productivity_google_workspace' },
+            ],
           },
         ],
       }),
@@ -95,7 +102,9 @@ describe('brewingHold', () => {
 
     expect(
       shouldDeferMainResponse({
-        activatedCortices: [{ cortexName: 'Google', activationScope: 'productivity_google_workspace' }],
+        activatedCortices: [
+          { cortexName: 'Google', activationScope: 'productivity_google_workspace' },
+        ],
         directActionScopeKeys: [],
       }),
     ).toBe(true);
@@ -179,7 +188,9 @@ describe('brewingHold', () => {
           {
             cortexName: 'Google',
             activationScope: 'productivity_google_workspace',
-            directActionSurfaceScopes: [{ server: 'google-workspace', scopeKey: 'productivity_google_workspace' }],
+            directActionSurfaceScopes: [
+              { server: 'google-workspace', scopeKey: 'productivity_google_workspace' },
+            ],
           },
         ],
         directActionScopeKeys: [],
@@ -223,11 +234,7 @@ describe('brewingHold', () => {
 
   test('pickHoldText returns deterministic text for a given message id', () => {
     delete process.env.VIVENTIUM_TOOL_CORTEX_HOLD_TEXT;
-    process.env.VIVENTIUM_TOOL_CORTEX_HOLD_TEXTS_JSON = JSON.stringify([
-      'A',
-      'B',
-      'C',
-    ]);
+    process.env.VIVENTIUM_TOOL_CORTEX_HOLD_TEXTS_JSON = JSON.stringify(['A', 'B', 'C']);
 
     const first = pickHoldText({ responseMessageId: 'msg_123' });
     const second = pickHoldText({ responseMessageId: 'msg_123' });

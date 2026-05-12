@@ -35,6 +35,8 @@ export interface CortexContentPart {
   reason?: string;
   insight?: string;
   error?: string;
+  error_class?: string;
+  errorClass?: string;
   silent?: boolean;
   no_response?: boolean;
   cortex_description?: string;

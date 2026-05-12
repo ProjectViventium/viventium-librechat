@@ -160,6 +160,7 @@ export default function Message(props: TMessageProps) {
                     isLatestMessage={messageId === latestMessage?.messageId}
                     cortexParts={cortexParts}
                     content={message.content}
+                    fallbackText={message.text}
                   />
                   {/* === VIVENTIUM END === */}
                 </div>

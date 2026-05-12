@@ -46,6 +46,13 @@ const {
   normalizeNoResponseText,
   NO_RESPONSE_TAG,
 } = require('~/server/services/viventium/noResponseTag');
+/* === VIVENTIUM START ===
+ * Feature: Prompt-frame telemetry (metadata-only prompt architecture observability).
+ * === VIVENTIUM END === */
+const {
+  buildPromptFrame,
+  logPromptFrame,
+} = require('~/server/services/viventium/promptFrameTelemetry');
 const {
   sanitizeFollowUpDisplayText,
 } = require('~/server/services/viventium/followUpTextSanitizer');
@@ -60,6 +67,12 @@ const {
 const {
   sanitizeOpenAIReasoningSamplingParams,
 } = require('~/server/services/viventium/openAIReasoningParams');
+/* === VIVENTIUM START ===
+ * Feature: Registry-owned Phase B follow-up prompts.
+ * Purpose: Keep follow-up system/user prompt contracts in the prompt registry while retaining
+ * inline fallbacks for installs that have not loaded the compiled prompt bundle yet.
+ * === VIVENTIUM END === */
+const { getPromptText } = require('~/server/services/viventium/promptRegistry');
 /* === VIVENTIUM NOTE === */
 /* === VIVENTIUM NOTE ===
  * Feature: No Response Tag ({NTA}) prompt injection (env-gated, config-driven).
@@ -74,6 +87,20 @@ const CORTEX_TYPES = new Set([
   ContentTypes.CORTEX_BREWING,
   ContentTypes.CORTEX_INSIGHT,
 ]);
+const PLACEHOLDER_RESPONSE_PATTERNS = [
+  /^(generation in progress|generation interrupted before completion)\.?$/i,
+];
+
+function isPlaceholderRecentResponseText(text) {
+  const lines = String(text || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length === 0) {
+    return false;
+  }
+  return lines.every((line) => PLACEHOLDER_RESPONSE_PATTERNS.some((pattern) => pattern.test(line)));
+}
 
 function hasActiveAnthropicThinking(thinking) {
   if (thinking == null || thinking === false) {
@@ -102,6 +129,18 @@ function normalizeFollowUpProvider(provider) {
     return '';
   }
   return normalized;
+}
+
+function sanitizeFollowUpErrorForLog(error) {
+  return {
+    name: error?.name || null,
+    status: Number.isFinite(error?.status) ? error.status : null,
+    code: error?.code || error?.lc_error_code || null,
+  };
+}
+
+function hashFollowUpTextForLog(text, length = 12) {
+  return crypto.createHash('sha256').update(String(text || '')).digest('hex').slice(0, length);
 }
 
 function sanitizeAnthropicFollowUpLLMConfig(llmConfig = {}) {
@@ -135,6 +174,32 @@ function sanitizeAnthropicFollowUpLLMConfig(llmConfig = {}) {
   return nextConfig;
 }
 
+function shouldForceVisibleFollowUpForEmptyPrimary({
+  configuredForceVisibleFollowUp = false,
+  hasInsights = false,
+  recentResponse = '',
+  voiceMode = false,
+  surface = '',
+} = {}) {
+  if (configuredForceVisibleFollowUp === true) {
+    return true;
+  }
+
+  if (hasInsights !== true) {
+    return false;
+  }
+
+  if (voiceMode === true || surface === 'wing') {
+    return false;
+  }
+
+  const normalizedRecentResponse = String(recentResponse || '').trim();
+  return (
+    normalizedRecentResponse.length === 0 ||
+    isPlaceholderRecentResponseText(normalizedRecentResponse)
+  );
+}
+
 function resolveFollowUpPersistenceText({
   generatedText = '',
   insightsData,
@@ -159,6 +224,12 @@ function resolveFollowUpPersistenceText({
   };
 
   let text = String(generatedText || '').trim();
+  if (surface === 'wing' && shouldForceVisibleFollowUp !== true) {
+    decision.llmResult = isNoResponseOnly(text) ? 'nta' : text ? 'generated' : 'empty';
+    decision.selectedStrategy = 'wing_surface_suppressed';
+    decision.suppressionReason = 'wing_silence_first';
+    return { text: '', decision };
+  }
   if (isNoResponseOnly(text)) {
     decision.llmResult = 'nta';
     if (shouldForceVisibleFollowUp === true) {
@@ -427,14 +498,20 @@ async function resolveCanonicalFollowUpAgent(agent, { useVoiceModel = false } = 
   } catch (err) {
     logger.warn(
       '[BackgroundCortexFollowUpService] Failed to rehydrate canonical agent for follow-up:',
-      err?.message || err,
+      sanitizeFollowUpErrorForLog(err),
     );
     return assignment;
   }
 }
 
-function upsertCortexParts(existingContent, cortexParts) {
-  const content = Array.isArray(existingContent) ? [...existingContent] : [];
+function upsertCortexParts(existingContent, cortexParts, options = {}) {
+  const visibleText = typeof options.visibleText === 'string' ? options.visibleText.trim() : '';
+  const content =
+    visibleText && !isNoResponseOnly(visibleText)
+      ? mergeVisibleTextIntoMessageContent(existingContent, visibleText)
+      : Array.isArray(existingContent)
+        ? [...existingContent]
+        : [];
   const parts = Array.isArray(cortexParts) ? cortexParts : [];
   for (const part of parts) {
     if (!part || !part.cortex_id) {
@@ -659,7 +736,7 @@ async function loadFollowUpContinuationContext({ req, conversationId, parentMess
   } catch (err) {
     logger.warn(
       '[BackgroundCortexFollowUpService] Failed resolving follow-up continuation context:',
-      err?.message || err,
+      sanitizeFollowUpErrorForLog(err),
     );
     return {
       messages: null,
@@ -722,7 +799,7 @@ async function resolveFollowUpLLMConfig({
     } catch (err) {
       logger.warn(
         '[BackgroundCortexFollowUpService] Final follow-up resolution failed to rehydrate canonical agent:',
-        err?.message || err,
+        sanitizeFollowUpErrorForLog(err),
       );
     }
   }
@@ -843,10 +920,10 @@ async function persistCortexPartsToCanonicalMessage({
    * Purpose: Trace cortex follow-up persistence flow for debugging.
    * Details: docs/requirements_and_learnings/05_Open_Source_Modifications.md#librechat-cortex-followup-persist
    */
-  logger.info(`[BackgroundCortexFollowUpService] DEBUG PERSIST: Starting persistence for messageId=${responseMessageId}, cortexParts count=${cortexParts?.length || 0}`);
+  logger.debug(`[BackgroundCortexFollowUpService] DEBUG PERSIST: Starting persistence for messageId=${responseMessageId}, cortexParts count=${cortexParts?.length || 0}`);
   if (cortexParts?.length > 0) {
     cortexParts.forEach((part, i) => {
-      logger.info(`[BackgroundCortexFollowUpService] DEBUG PERSIST: Part ${i}: type=${part?.type}, cortex_id=${part?.cortex_id}, has_insight=${!!part?.insight}`);
+      logger.debug(`[BackgroundCortexFollowUpService] DEBUG PERSIST: Part ${i}: type=${part?.type}, cortex_id=${part?.cortex_id}, has_insight=${!!part?.insight}`);
     });
   }
   /* VIVENTIUM NOTE */
@@ -865,18 +942,25 @@ async function persistCortexPartsToCanonicalMessage({
        * Purpose: Log existing message state before merge.
        * Details: docs/requirements_and_learnings/05_Open_Source_Modifications.md#librechat-cortex-followup-persist
        */
-      logger.info(`[BackgroundCortexFollowUpService] DEBUG PERSIST: Found existing message, existing.content type=${typeof existing.content}, isArray=${Array.isArray(existing.content)}, length=${existing.content?.length || 0}`);
+      const existingVisibleText = extractRecentResponseTextFromMessage(existing);
+      logger.debug(
+        `[BackgroundCortexFollowUpService] DEBUG PERSIST: Found existing message, ` +
+          `existing.content type=${typeof existing.content}, isArray=${Array.isArray(existing.content)}, ` +
+          `length=${existing.content?.length || 0}, visible_text_len=${existingVisibleText.length}`,
+      );
       /* VIVENTIUM NOTE */
 
-      const merged = upsertCortexParts(existing.content, cortexParts);
+      const merged = upsertCortexParts(existing.content, cortexParts, {
+        visibleText: existingVisibleText,
+      });
 
       /* VIVENTIUM NOTE
        * Purpose: Log merge results and insight counts.
        * Details: docs/requirements_and_learnings/05_Open_Source_Modifications.md#librechat-cortex-followup-persist
        */
-      logger.info(`[BackgroundCortexFollowUpService] DEBUG PERSIST: After merge, content length=${merged?.length || 0}`);
+      logger.debug(`[BackgroundCortexFollowUpService] DEBUG PERSIST: After merge, content length=${merged?.length || 0}`);
       const cortexInsightCount = merged?.filter(p => p?.type === ContentTypes.CORTEX_INSIGHT).length || 0;
-      logger.info(`[BackgroundCortexFollowUpService] DEBUG PERSIST: CORTEX_INSIGHT parts in merged content: ${cortexInsightCount}`);
+      logger.debug(`[BackgroundCortexFollowUpService] DEBUG PERSIST: CORTEX_INSIGHT parts in merged content: ${cortexInsightCount}`);
       /* VIVENTIUM NOTE */
 
       await db.updateMessage(
@@ -892,7 +976,7 @@ async function persistCortexPartsToCanonicalMessage({
        * Purpose: Confirm persisted content size after update.
        * Details: docs/requirements_and_learnings/05_Open_Source_Modifications.md#librechat-cortex-followup-persist
        */
-      logger.info(`[BackgroundCortexFollowUpService] DEBUG PERSIST: Successfully persisted ${merged?.length || 0} content parts to messageId=${responseMessageId}`);
+      logger.debug(`[BackgroundCortexFollowUpService] DEBUG PERSIST: Successfully persisted ${merged?.length || 0} content parts to messageId=${responseMessageId}`);
       /* VIVENTIUM NOTE */
 
       return merged;
@@ -906,7 +990,7 @@ async function persistCortexPartsToCanonicalMessage({
       // For other errors, do not keep retrying blindly
       logger.warn(
         `[BackgroundCortexFollowUpService] Failed to persist cortex parts (attempt ${attempt}/${maxAttempts})`,
-        err,
+        sanitizeFollowUpErrorForLog(err),
       );
       throw err;
     }
@@ -977,10 +1061,12 @@ function formatFollowUpText({
   }
 
   if (hasErrors) {
-    const firstError = Array.isArray(errors) ? errors.find((item) => item?.error || item?.errorClass) : null;
+    const firstError = Array.isArray(errors)
+      ? errors.find((item) => item?.error || item?.errorClass || item?.error_class)
+      : null;
     return getDeferredFallbackErrorText({
       scheduleId,
-      errorClass: firstError?.errorClass || '',
+      errorClass: firstError?.errorClass || firstError?.error_class || '',
       error: firstError?.error || '',
     });
   }
@@ -1082,6 +1168,19 @@ function formatFollowUpPrompt({
       : '';
   const playgroundRules =
     surface === 'playground' && !voiceMode ? buildPlaygroundTextInstructions() : '';
+  const wingRules =
+    surface === 'wing'
+      ? [
+          'Wing Mode follow-up rule:',
+          '- This surface is silence-first ambient voice context.',
+          '- A delayed follow-up is more interruptive than the primary reply.',
+          '- Output exactly {NTA} unless the background evidence proves an immediate user-visible intervention is necessary.',
+          '- Emotional resonance, general support, or “space to talk” is not enough to interrupt Wing Mode.',
+        ].join('\n')
+      : '';
+  const surfaceRules = [voiceRules, telegramRules, webRules, playgroundRules, wingRules]
+    .filter(Boolean)
+    .join('\n\n');
   /* === VIVENTIUM NOTE === */
 
   /* === VIVENTIUM START ===
@@ -1102,13 +1201,10 @@ function formatFollowUpPrompt({
     : '(short acknowledgment)';
 
   if (primaryResponseMode) {
-    return [
+    const fallbackPrompt = [
       'You are generating the primary user-visible answer for this turn.',
       'The assistant previously sent only a brief holding acknowledgement while background research/tools ran.',
-      voiceRules,
-      telegramRules,
-      webRules,
-      playgroundRules,
+      surfaceRules,
       `Prior visible hold text for context only (do NOT repeat it):\n---\n${recentBlock}\n---`,
       'Background agents provide evidence only. You decide what, if anything, should become visible to the user.',
       'Use the background insights below as your grounding and answer the user directly.',
@@ -1123,28 +1219,32 @@ function formatFollowUpPrompt({
     ]
       .filter(Boolean)
       .join('\n\n');
+    return getPromptText('cortex.follow_up_phase_b.primary_user_message', fallbackPrompt, {
+      surface_rules: surfaceRules,
+      recent_response: recentBlock,
+      background_insights: summaryLines,
+    });
   }
 
-  return [
+  const recentResponseContext = cleanContinuation
+    ? `Here is the earlier response this follow-up belongs to:\n---\n${recentBlock}\n---`
+    : `Here is the response you JUST sent to the user:\n---\n${recentBlock}\n---`;
+  const continuationBlock = cleanContinuation
+    ? [
+        '## Current Conversation State',
+        'The conversation continued after that earlier response. These newer visible messages were exchanged before this follow-up decision:',
+        `---\n${cleanContinuation.slice(0, 1800)}\n---`,
+        'Use this newer exchange as the current state. If the background insights are stale, redundant, already resolved, or would interrupt the current flow, respond with {NTA}.',
+        'Only surface information that is still useful now and not already addressed by the newer exchange.',
+      ].join('\n\n')
+    : '';
+  const fallbackPrompt = [
     'You are the main AI continuing the same conversation.',
     'This is NOT a new user message. Do NOT start a new turn.',
-    voiceRules,
-    telegramRules,
-    webRules,
-    playgroundRules,
+    surfaceRules,
     '## CRITICAL: Do Not Repeat',
-    cleanContinuation
-      ? `Here is the earlier response this follow-up belongs to:\n---\n${recentBlock}\n---`
-      : `Here is the response you JUST sent to the user:\n---\n${recentBlock}\n---`,
-    cleanContinuation
-      ? [
-          '## Current Conversation State',
-          'The conversation continued after that earlier response. These newer visible messages were exchanged before this follow-up decision:',
-          `---\n${cleanContinuation.slice(0, 1800)}\n---`,
-          'Use this newer exchange as the current state. If the background insights are stale, redundant, already resolved, or would interrupt the current flow, respond with {NTA}.',
-          'Only surface information that is still useful now and not already addressed by the newer exchange.',
-        ].join('\n\n')
-      : '',
+    recentResponseContext,
+    continuationBlock,
     'Background agents provide evidence only. You decide whether there is anything worth surfacing.',
     'You MUST NOT repeat, rephrase, re-ask, or echo ANY part of the above. If the background insights below overlap with what you already said, respond with {NTA}.',
     'Only respond if the insights contain genuinely NEW information not covered above.',
@@ -1166,8 +1266,57 @@ function formatFollowUpPrompt({
   ]
     .filter(Boolean)
     .join('\n\n');
+  return getPromptText('cortex.follow_up_phase_b.user_message', fallbackPrompt, {
+    surface_rules: surfaceRules,
+    recent_response_context: recentResponseContext,
+    continuation_context: continuationBlock,
+    background_insights: summaryLines,
+  });
   /* === VIVENTIUM END === */
 }
+
+/* === VIVENTIUM START ===
+ * Feature: Registry-owned Phase B system prompts.
+ * Purpose: Keep the minimal follow-up system prompt contract in source-of-truth Markdown,
+ * with identical inline fallbacks when the compiled prompt bundle is not available.
+ * === VIVENTIUM END === */
+function buildFollowUpSystemPrompt({
+  primaryResponseMode = false,
+  continuationContext = '',
+  noResponseInstructions = '',
+} = {}) {
+  const continuationContract =
+    !primaryResponseMode && typeof continuationContext === 'string' && continuationContext.trim()
+      ? 'The conversation may have moved on since the earlier response. Use the newer visible exchange as current state and default to {NTA} unless the background insight is still useful now.'
+      : '';
+  const fallbackParts = primaryResponseMode
+    ? [
+        'You are a conversational AI assistant completing a deferred response after a short holding acknowledgement.',
+        'Your sole job: turn the background insights into the primary answer the user should see for this turn.',
+        'Background agents provide evidence only; you decide the user-visible answer.',
+        'Use the insights as grounding, answer directly, and stay surface-appropriate.',
+        'Do not output {NTA} if the insights contain substantive user-visible information.',
+        'Do not re-ask questions, do not mention background processing, and do not introduce yourself.',
+        noResponseInstructions,
+      ]
+    : [
+        'You are a conversational AI assistant continuing an ongoing conversation.',
+        'Your sole job: if background insights contain genuinely new information that was NOT in your recent response, add it in 1-3 natural sentences. Otherwise respond with exactly {NTA}.',
+        'Background agents provide evidence only; you decide whether to surface a follow-up or stay silent with {NTA}.',
+        'Do not re-ask questions, do not repeat topics, do not introduce yourself.',
+        continuationContract,
+        noResponseInstructions,
+      ];
+  const fallback = fallbackParts.filter(Boolean).join('\n\n');
+  const promptId = primaryResponseMode
+    ? 'cortex.follow_up_phase_b.primary_system'
+    : 'cortex.follow_up_phase_b.system';
+  return getPromptText(promptId, fallback, {
+    continuation_contract: continuationContract,
+    no_response_instructions: noResponseInstructions || '',
+  });
+}
+/* === VIVENTIUM END === */
 
 function extractTextFromMessageContent(content) {
   if (!Array.isArray(content)) {
@@ -1206,11 +1355,122 @@ function extractRecentResponseTextFromMessage(message) {
   }
 
   const directText = typeof message.text === 'string' ? message.text.trim() : '';
-  if (directText) {
+  if (directText && !isPlaceholderRecentResponseText(directText)) {
     return directText;
   }
 
-  return extractTextFromMessageContent(message.content).trim();
+  const contentText = extractTextFromMessageContent(message.content).trim();
+  return isPlaceholderRecentResponseText(contentText) ? '' : contentText;
+}
+
+function mergeVisibleTextIntoMessageContent(content, text) {
+  const normalizedText = typeof text === 'string' ? text.trim() : '';
+  if (!normalizedText) {
+    return Array.isArray(content) ? content : [];
+  }
+
+  const existingContent = Array.isArray(content) ? content : [];
+  const nextContent = existingContent.map((part) => ({ ...part }));
+  const textIndex = nextContent.findIndex((part) => part && part.type === ContentTypes.TEXT);
+  if (textIndex >= 0) {
+    nextContent[textIndex] = {
+      ...nextContent[textIndex],
+      text: normalizedText,
+    };
+    return nextContent;
+  }
+
+  return [...nextContent, { type: ContentTypes.TEXT, text: normalizedText }];
+}
+
+async function promoteForcedFollowUpToEmptyParent({
+  req,
+  conversationId,
+  parentMessageId,
+  text,
+  insightsData,
+  forceVisibleFollowUp,
+  scheduleId,
+  continuationContext,
+}) {
+  const normalizedText = typeof text === 'string' ? text.trim() : '';
+  if (!forceVisibleFollowUp || !normalizedText || scheduleId) {
+    return null;
+  }
+  if (continuationContext?.hasMovedOn === true || continuationContext?.lookupFailed === true) {
+    return null;
+  }
+  if (!req?.user?.id || !parentMessageId) {
+    return null;
+  }
+
+  try {
+    const existing = await db.getMessage({ user: req.user.id, messageId: parentMessageId });
+    if (!existing) {
+      return null;
+    }
+
+    const existingVisibleText = extractRecentResponseTextFromMessage(existing).trim();
+    if (existingVisibleText.length > 0) {
+      return null;
+    }
+
+    const existingContent = Array.isArray(existing.content) ? existing.content : [];
+    const hasCortexParts = existingContent.some((part) => part && CORTEX_TYPES.has(part.type));
+    if (!hasCortexParts) {
+      return null;
+    }
+
+    const nextContent = mergeVisibleTextIntoMessageContent(existing.content, normalizedText);
+    const nextMetadata = {
+      ...(existing.metadata || {}),
+      viventium: {
+        ...((existing.metadata || {}).viventium || {}),
+        type: 'cortex_followup',
+        parentMessageId: existing.parentMessageId || undefined,
+        cortexCount: insightsData?.cortexCount ?? undefined,
+        replacedParentMessage: true,
+        forceVisibleFollowUp: true,
+        promotedToEmptyParent: true,
+      },
+    };
+
+    await db.updateMessage(
+      req,
+      {
+        messageId: parentMessageId,
+        text: normalizedText,
+        content: nextContent,
+        metadata: nextMetadata,
+        unfinished: false,
+      },
+      {
+        context:
+          'viventium/services/BackgroundCortexFollowUpService.promoteForcedFollowUpToEmptyParent',
+      },
+    );
+
+    logger.info(
+      `[BackgroundCortexFollowUpService] Promoted forced Phase B follow-up onto empty canonical parent: conversationId=${conversationId || ''} parent=${parentMessageId || ''}`,
+    );
+
+    return {
+      ...existing,
+      conversationId: existing.conversationId || conversationId,
+      messageId: parentMessageId,
+      parentMessageId: existing.parentMessageId,
+      text: normalizedText,
+      content: nextContent,
+      metadata: nextMetadata,
+      unfinished: false,
+    };
+  } catch (err) {
+    logger.warn(
+      '[BackgroundCortexFollowUpService] Failed to promote forced follow-up onto empty parent',
+      sanitizeFollowUpErrorForLog(err),
+    );
+    return null;
+  }
 }
 
 async function resolveRecentResponseText({ req, parentMessageId, recentResponse = '' }) {
@@ -1232,7 +1492,7 @@ async function resolveRecentResponseText({ req, parentMessageId, recentResponse 
   } catch (err) {
     logger.warn(
       '[BackgroundCortexFollowUpService] Failed to load parent message for recent-response fallback:',
-      err?.message || err,
+      sanitizeFollowUpErrorForLog(err),
     );
   }
 
@@ -1262,6 +1522,9 @@ async function generateFollowUpText({
 
   const voiceMode = isVoiceMode(req);
   const surface = resolveViventiumSurface(req);
+  if (surface === 'wing' && primaryResponseMode !== true) {
+    return NO_RESPONSE_TAG;
+  }
   const prompt = formatFollowUpPrompt({
     insights,
     recentResponse,
@@ -1322,31 +1585,43 @@ async function generateFollowUpText({
    * to surface new info or emit {NTA} — it does not need personality or conversation
    * style directives.
    */
-  const systemPromptParts = primaryResponseMode
-    ? [
-        'You are a conversational AI assistant completing a deferred response after a short holding acknowledgement.',
-        'Your sole job: turn the background insights into the primary answer the user should see for this turn.',
-        'Background agents provide evidence only; you decide the user-visible answer.',
-        'Use the insights as grounding, answer directly, and stay surface-appropriate.',
-        'Do not output {NTA} if the insights contain substantive user-visible information.',
-        'Do not re-ask questions, do not mention background processing, and do not introduce yourself.',
-      ]
-    : [
-        'You are a conversational AI assistant continuing an ongoing conversation.',
-        'Your sole job: if background insights contain genuinely new information that was NOT in your recent response, add it in 1-3 natural sentences. Otherwise respond with exactly {NTA}.',
-        'Background agents provide evidence only; you decide whether to surface a follow-up or stay silent with {NTA}.',
-        'Do not re-ask questions, do not repeat topics, do not introduce yourself.',
-      ];
-  if (!primaryResponseMode && typeof continuationContext === 'string' && continuationContext.trim()) {
-    systemPromptParts.push(
-      'The conversation may have moved on since the earlier response. Use the newer visible exchange as current state and default to {NTA} unless the background insight is still useful now.',
-    );
-  }
   const noResponseInstructions = buildNoResponseInstructions(req);
-  if (noResponseInstructions) {
-    systemPromptParts.push(noResponseInstructions);
-  }
-  const systemPrompt = systemPromptParts.join('\n\n');
+  const systemPrompt = buildFollowUpSystemPrompt({
+    primaryResponseMode,
+    continuationContext,
+    noResponseInstructions,
+  });
+  logPromptFrame(
+    logger,
+    buildPromptFrame({
+      promptFamily: 'phase_b_followup',
+      surface,
+      provider: providerName,
+      model: effectiveModel || runtimeAgent?.model_parameters?.model || runtimeAgent?.model,
+      authClass: 'user_runtime',
+      layers: {
+        followup_system: systemPrompt,
+        followup_prompt: prompt,
+        recent_response: recentResponse || '',
+        continuation_context: continuationContext || '',
+        no_response_instructions: noResponseInstructions || '',
+      },
+      promptSourceFiles: {
+        followup_service: __filename,
+      },
+      flags: {
+        voice_mode: voiceMode,
+        primary_response_mode: primaryResponseMode,
+        use_voice_model: useVoiceModel,
+        no_response_injected: !!noResponseInstructions,
+      },
+      decisionState: {
+        raw_insight_count: rawInsights.length,
+        deduped_insight_count: insights.length,
+      },
+      voiceText: systemPrompt,
+    }),
+  );
   /* === VIVENTIUM END === */
 
   const run = await Run.create({
@@ -1402,9 +1677,8 @@ async function generateFollowUpText({
   }
 
   if (process.env.VIVENTIUM_DEBUG_PHASE_B === 'true') {
-    const preview = (value) => String(value || '').slice(0, 220).replace(/\s+/g, ' ');
     logger.info(
-      `[BackgroundCortexFollowUpService] Follow-up text stages: primary=${primaryResponseMode} raw_len=${rawText.length} stripped_len=${strippedText.length} sanitized_len=${sanitizedText.length} normalized_len=${normalizedText.length} raw="${preview(rawText)}" stripped="${preview(strippedText)}" sanitized="${preview(sanitizedText)}" normalized="${preview(normalizedText)}"`,
+      `[BackgroundCortexFollowUpService] Follow-up text stages: primary=${primaryResponseMode} raw_len=${rawText.length} raw_hash=${hashFollowUpTextForLog(rawText)} stripped_len=${strippedText.length} stripped_hash=${hashFollowUpTextForLog(strippedText)} sanitized_len=${sanitizedText.length} sanitized_hash=${hashFollowUpTextForLog(sanitizedText)} normalized_len=${normalizedText.length} normalized_hash=${hashFollowUpTextForLog(normalizedText)}`,
     );
   }
 
@@ -1420,7 +1694,6 @@ async function createCortexFollowUpMessage({
   recentResponse,
   forceVisibleFollowUp = false,
 }) {
-  const shouldForceVisibleFollowUp = forceVisibleFollowUp === true;
   let text = '';
   let generationFailed = false;
   const hasInsights = Array.isArray(insightsData?.insights) && insightsData.insights.length > 0;
@@ -1442,10 +1715,21 @@ async function createCortexFollowUpMessage({
   const followUpRecentResponse = isNoResponseOnly(recentResponseResolution.text)
     ? ''
     : recentResponseResolution.text;
+  const shouldForceVisibleFollowUp = shouldForceVisibleFollowUpForEmptyPrimary({
+    configuredForceVisibleFollowUp: forceVisibleFollowUp === true,
+    hasInsights,
+    recentResponse: followUpRecentResponse,
+    voiceMode,
+    surface,
+  });
+  if (shouldForceVisibleFollowUp === true && forceVisibleFollowUp !== true) {
+    logger.warn(
+      `[BackgroundCortexFollowUpService] Forcing visible Phase B follow-up because the primary response was empty: conversationId=${conversationId || ''} parent=${parentMessageId || ''}`,
+    );
+  }
   if (process.env.VIVENTIUM_DEBUG_PHASE_B === 'true') {
-    const recentPreview = recentResponseResolution.text.slice(0, 160).replace(/\s+/g, ' ');
     logger.info(
-      `[BackgroundCortexFollowUpService] Follow-up context: parent=${parentMessageId || ''} recent_response_source=${recentResponseResolution.source} len=${recentResponseResolution.text.length} preview="${recentPreview}"`,
+      `[BackgroundCortexFollowUpService] Follow-up context: parent=${parentMessageId || ''} recent_response_source=${recentResponseResolution.source} len=${recentResponseResolution.text.length} hash=${hashFollowUpTextForLog(recentResponseResolution.text)}`,
     );
   } else {
     logger.info(
@@ -1466,7 +1750,10 @@ async function createCortexFollowUpMessage({
       });
     } catch (err) {
       generationFailed = true;
-      logger.warn('[BackgroundCortexFollowUpService] Failed to generate LLM follow-up text:', err);
+      logger.warn(
+        '[BackgroundCortexFollowUpService] Failed to generate LLM follow-up text',
+        sanitizeFollowUpErrorForLog(err),
+      );
     }
   }
 
@@ -1514,6 +1801,20 @@ async function createCortexFollowUpMessage({
     return null;
   }
 
+  const promotedParentMessage = await promoteForcedFollowUpToEmptyParent({
+    req,
+    conversationId,
+    parentMessageId,
+    text,
+    insightsData,
+    forceVisibleFollowUp: shouldForceVisibleFollowUp,
+    scheduleId,
+    continuationContext: finalContinuationContext,
+  });
+  if (promotedParentMessage) {
+    return promotedParentMessage;
+  }
+
   /* === VIVENTIUM START ===
    * Feature: Follow-up branch-safe parent resolution.
    * Added: 2026-02-21
@@ -1544,7 +1845,10 @@ async function createCortexFollowUpMessage({
         treeParentId = currentLeafMessageId;
       }
     } catch (err) {
-      logger.warn('[BackgroundCortexFollowUpService] Failed resolving conversation tip:', err?.message);
+      logger.warn(
+        '[BackgroundCortexFollowUpService] Failed resolving conversation tip',
+        sanitizeFollowUpErrorForLog(err),
+      );
     }
   }
   /* === VIVENTIUM END === */
@@ -1595,11 +1899,14 @@ module.exports = {
   generateFollowUpText,
   formatFollowUpText,
   deduplicateInsights,
+  buildFollowUpSystemPrompt,
   formatFollowUpPrompt,
   extractRecentResponseTextFromMessage,
+  isPlaceholderRecentResponseText,
   getPreferredFallbackInsightText,
   resolveRecentResponseText,
   resolveFollowUpPersistenceText,
+  shouldForceVisibleFollowUpForEmptyPrimary,
   resolveConversationLeafMessageId,
   resolveFollowUpContinuationContext,
   sanitizeAnthropicFollowUpLLMConfig,

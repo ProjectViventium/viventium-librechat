@@ -18,20 +18,20 @@ import { logger, cn } from '~/utils';
 // VIVENTIUM START: present GlassHive MCP worker tools with source-of-truth labels.
 const GLASSHIVE_MCP_SERVER_NAMES = new Set([GLASSHIVE_MCP_SERVER_NAME]);
 const GLASSHIVE_TOOL_LABELS: Record<string, string> = {
-  worker_delegate_once: 'GlassHive worker',
-  workers_list: 'GlassHive worker',
-  worker_create: 'GlassHive worker',
-  worker_find_or_resume: 'GlassHive worker',
-  worker_get: 'GlassHive worker',
-  worker_live: 'GlassHive worker',
-  worker_run: 'GlassHive worker',
-  worker_message: 'GlassHive worker',
-  worker_pause: 'GlassHive worker',
-  worker_resume: 'GlassHive worker',
-  worker_interrupt: 'GlassHive worker',
-  worker_terminate: 'GlassHive worker',
-  worker_desktop_action: 'GlassHive worker',
-  worker_takeover: 'GlassHive worker',
+  worker_delegate_once: 'GlassHive delegate',
+  workers_list: 'GlassHive projects',
+  worker_create: 'GlassHive create',
+  worker_find_or_resume: 'GlassHive resume',
+  worker_get: 'GlassHive status',
+  worker_live: 'GlassHive live',
+  worker_run: 'GlassHive run',
+  worker_message: 'GlassHive message',
+  worker_pause: 'GlassHive pause',
+  worker_resume: 'GlassHive resume',
+  worker_interrupt: 'GlassHive interrupt',
+  worker_terminate: 'GlassHive terminate',
+  worker_desktop_action: 'GlassHive desktop',
+  worker_takeover: 'GlassHive takeover',
 };
 
 function getUserFacingToolName(functionName: string, mcpServerName: string) {

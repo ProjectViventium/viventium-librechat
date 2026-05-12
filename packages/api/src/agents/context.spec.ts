@@ -128,6 +128,7 @@ describe('Agent Context Utilities', () => {
     beforeEach(() => {
       mockMCPManager = {
         formatInstructionsForContext: jest.fn(),
+        formatInstructionsForContextWithMetadata: jest.fn(),
       } as unknown as jest.Mocked<MCPManager>;
 
       mockLogger = {
@@ -311,6 +312,14 @@ describe('Agent Context Utilities', () => {
       };
 
       mockMCPManager.formatInstructionsForContext.mockResolvedValue('MCP instructions');
+      (
+        mockMCPManager as jest.Mocked<MCPManager> & {
+          formatInstructionsForContextWithMetadata: jest.Mock;
+        }
+      ).formatInstructionsForContextWithMetadata = jest.fn().mockResolvedValue({
+        text: 'MCP instructions',
+        sources: { server1: 'server_fetched' },
+      });
 
       await applyContextToAgent({
         agent,
@@ -323,9 +332,61 @@ describe('Agent Context Utilities', () => {
       expect(agent.instructions).toBe(
         'Shared context\n\nOriginal instructions\n\nMCP instructions',
       );
+      expect(agent.viventiumMCPInstructionSources).toEqual({ server1: 'server_fetched' });
       expect(mockLogger.debug).toHaveBeenCalledWith(
         '[AgentContext] Applied context to agent: test-agent',
       );
+    });
+
+    it('should record MCP instruction sources from metadata-aware manager', async () => {
+      const agent = {
+        id: 'test-agent',
+        instructions: 'Original instructions',
+        tools: [
+          new DynamicStructuredTool({
+            name: `tool${Constants.mcp_delimiter}scheduling`,
+            description: 'Test tool',
+            schema: testSchema,
+            func: async () => 'result',
+          }),
+          new DynamicStructuredTool({
+            name: `tool${Constants.mcp_delimiter}glasshive`,
+            description: 'Test tool',
+            schema: testSchema,
+            func: async () => 'result',
+          }),
+        ],
+      };
+      (
+        mockMCPManager as jest.Mocked<MCPManager> & {
+          formatInstructionsForContextWithMetadata: jest.Mock;
+        }
+      ).formatInstructionsForContextWithMetadata = jest.fn().mockResolvedValue({
+        text: 'MCP instructions',
+        sources: {
+          scheduling: 'server_fetched',
+          glasshive: 'config_inline',
+        },
+      });
+
+      await applyContextToAgent({
+        agent,
+        sharedRunContext: 'Shared context',
+        mcpManager: mockMCPManager,
+        logger: mockLogger,
+      });
+
+      expect(
+        (
+          mockMCPManager as jest.Mocked<MCPManager> & {
+            formatInstructionsForContextWithMetadata: jest.Mock;
+          }
+        ).formatInstructionsForContextWithMetadata,
+      ).toHaveBeenCalledWith(['scheduling', 'glasshive']);
+      expect(agent.viventiumMCPInstructionSources).toEqual({
+        scheduling: 'server_fetched',
+        glasshive: 'config_inline',
+      });
     });
 
     it('should use ephemeral agent MCP servers when provided', async () => {

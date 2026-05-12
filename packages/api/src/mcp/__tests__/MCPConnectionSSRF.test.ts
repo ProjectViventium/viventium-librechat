@@ -16,7 +16,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { Socket } from 'net';
 import { MCPConnection } from '~/mcp/connection';
-import { resolveHostnameSSRF } from '~/auth';
+import { createSSRFSafeUndiciConnect, resolveHostnameSSRF } from '~/auth';
 
 jest.mock('@librechat/data-schemas', () => ({
   logger: {
@@ -38,6 +38,9 @@ jest.mock('~/mcp/mcpConfig', () => ({
 
 const mockedResolveHostnameSSRF = resolveHostnameSSRF as jest.MockedFunction<
   typeof resolveHostnameSSRF
+>;
+const mockedCreateSSRFSafeUndiciConnect = createSSRFSafeUndiciConnect as jest.MockedFunction<
+  typeof createSSRFSafeUndiciConnect
 >;
 
 async function safeDisconnect(conn: MCPConnection | null): Promise<void> {
@@ -221,6 +224,64 @@ describe('MCP SSRF protection – redirect blocking', () => {
       await realServer.close();
     }
   });
+
+  it('should block streamable-http hosts that resolve to private IPs when SSRF protection is on', async () => {
+    mockedResolveHostnameSSRF.mockResolvedValueOnce(true);
+
+    conn = new MCPConnection({
+      serverName: 'streamable-ssrf-test',
+      serverConfig: { type: 'streamable-http', url: 'http://private.example.com/mcp' },
+      useSSRFProtection: true,
+    });
+
+    await expect(conn.connect()).rejects.toThrow(/SSRF protection/);
+    expect(mockedResolveHostnameSSRF).toHaveBeenCalledWith('private.example.com');
+    expect(mockedCreateSSRFSafeUndiciConnect).not.toHaveBeenCalled();
+  });
+
+  it('should install undici connect-time SSRF protection for streamable-http when enabled', async () => {
+    const realServer = await createStreamableServer();
+    try {
+      mockedResolveHostnameSSRF.mockResolvedValueOnce(false);
+      conn = new MCPConnection({
+        serverName: 'streamable-connect-guard-test',
+        serverConfig: { type: 'streamable-http', url: realServer.url },
+        useSSRFProtection: true,
+      });
+
+      await conn.connect();
+
+      expect(mockedResolveHostnameSSRF).toHaveBeenCalledWith('127.0.0.1');
+      expect(mockedCreateSSRFSafeUndiciConnect).toHaveBeenCalled();
+    } finally {
+      await safeDisconnect(conn);
+      conn = null;
+      await realServer.close();
+    }
+  });
+});
+
+describe('MCP SSRF protection – SSE DNS resolution', () => {
+  let conn: MCPConnection | null;
+
+  afterEach(async () => {
+    await safeDisconnect(conn);
+    conn = null;
+    jest.restoreAllMocks();
+  });
+
+  it('should block SSE hosts that resolve to private IPs when SSRF protection is on', async () => {
+    mockedResolveHostnameSSRF.mockResolvedValueOnce(true);
+
+    conn = new MCPConnection({
+      serverName: 'sse-ssrf-test',
+      serverConfig: { type: 'sse', url: 'http://private-sse.example.com/sse' },
+      useSSRFProtection: true,
+    });
+
+    await expect(conn.connect()).rejects.toThrow(/SSRF protection/);
+    expect(mockedResolveHostnameSSRF).toHaveBeenCalledWith('private-sse.example.com');
+  });
 });
 
 describe('MCP SSRF protection – WebSocket DNS resolution', () => {
@@ -262,7 +323,7 @@ describe('MCP SSRF protection – WebSocket DNS resolution', () => {
     );
   });
 
-  it('should allow WebSocket to host resolving to public IP', async () => {
+  it('should disable WebSocket MCP by default even for public hosts', async () => {
     mockedResolveHostnameSSRF.mockResolvedValueOnce(false);
 
     conn = new MCPConnection({
@@ -271,7 +332,9 @@ describe('MCP SSRF protection – WebSocket DNS resolution', () => {
       useSSRFProtection: true,
     });
 
-    /** Fails on connect (no real server), but the error must not be an SSRF rejection. */
-    await expect(conn.connect()).rejects.not.toThrow(/SSRF protection/);
+    await expect(conn.connect()).rejects.toThrow(/WebSocket MCP transport is disabled/);
+    expect(mockedResolveHostnameSSRF).toHaveBeenCalledWith(
+      expect.stringContaining('public.example.com'),
+    );
   });
 });

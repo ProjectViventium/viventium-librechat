@@ -113,9 +113,9 @@ describe('viventium-agent-runtime-models', () => {
     const normalized = normalizeBundleForRuntime(bundle, {
       env: {
         VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER: 'x_ai',
-        VIVENTIUM_FC_CONSCIOUS_LLM_MODEL: 'grok-4-1-fast-reasoning',
+        VIVENTIUM_FC_CONSCIOUS_LLM_MODEL: 'grok-4.3',
         VIVENTIUM_CORTEX_RED_TEAM_LLM_PROVIDER: 'x_ai',
-        VIVENTIUM_CORTEX_RED_TEAM_LLM_MODEL: 'grok-4-fast-reasoning',
+        VIVENTIUM_CORTEX_RED_TEAM_LLM_MODEL: 'grok-4.3',
         VIVENTIUM_BACKGROUND_ACTIVATION_PROVIDER: 'openai',
         VIVENTIUM_BACKGROUND_ACTIVATION_MODEL: 'gpt-4o-mini',
       },

@@ -564,6 +564,7 @@ function buildTranscriptArtifactHeader({
   sourceStatus,
   calendarMatch,
   inputComplete,
+  contentHash,
   rawCharCount,
   suppliedCharCount,
   summaryCharCount,
@@ -631,6 +632,51 @@ function transcriptContentHashFromFileId(fileId) {
   if (parts.length !== 3) return null;
   if (!parts[0].startsWith('meeting_')) return null;
   return /^[a-f0-9]{32,128}$/i.test(parts[2]) ? parts[2] : null;
+}
+
+function transcriptHashForced(forceContentHashes, digest) {
+  const value = String(digest || '');
+  if (!value) return false;
+  return forceContentHashes.has(value) || forceContentHashes.has(value.slice(0, 32));
+}
+
+function transcriptFullHashForPrefix(processedContent, value) {
+  const digest = String(value || '');
+  if (!digest) return null;
+  if (processedContent[digest]) return digest;
+  if (digest.length >= 32) {
+    return Object.keys(processedContent).find((candidate) => candidate.startsWith(digest)) || null;
+  }
+  return null;
+}
+
+function transcriptStaleArtifactFromFile(file) {
+  const fileId = String(file?.file_id || '');
+  if (!fileId) return null;
+  const kind = String(file?.metadata?.meetingTranscriptKind || '').trim();
+  const contentHash =
+    file?.metadata?.meetingTranscriptContentHash || transcriptContentHashFromFileId(fileId);
+  return {
+    artifactId: file?.metadata?.meetingTranscriptArtifactId || null,
+    contentHash,
+    rawFileId: kind === 'raw' ? fileId : null,
+    summaryFileId: kind === 'summary' ? fileId : null,
+  };
+}
+
+function dedupeTranscriptArtifacts(artifacts) {
+  const seen = new Set();
+  const deduped = [];
+  for (const artifact of artifacts || []) {
+    if (!artifact) continue;
+    const key = [artifact.rawFileId || '', artifact.summaryFileId || '', artifact.contentHash || ''].join(
+      '|',
+    );
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(artifact);
+  }
+  return deduped;
 }
 
 function transcriptSourcePathHashFromOptions(options) {
@@ -783,7 +829,7 @@ function scanTranscriptDirectory({ user, options, now, transcriptStateDir }) {
       prior?.promptVersion === TRANSCRIPT_PROMPT_VERSION &&
       (unchangedProcessed || unchangedTerminalSkip)
     ) {
-      if (!forceContentHashes.has(prior.contentHash)) {
+      if (!transcriptHashForced(forceContentHashes, prior.contentHash)) {
         filesUnchanged += 1;
         nextFiles[pathHash] = prior;
         currentContentHashes.add(prior.contentHash);
@@ -834,7 +880,7 @@ function scanTranscriptDirectory({ user, options, now, transcriptStateDir }) {
     if (
       processed?.status === 'processed' &&
       processed.promptVersion === TRANSCRIPT_PROMPT_VERSION &&
-      !forceContentHashes.has(digest)
+      !transcriptHashForced(forceContentHashes, digest)
     ) {
       filesReusedByContentHash += 1;
       nextFiles[pathHash] = {
@@ -1936,6 +1982,7 @@ async function upsertTranscriptVectorFile({
   sourceStatus,
   calendarMatch,
   inputComplete,
+  contentHash: transcriptContentHash,
   rawCharCount,
   suppliedCharCount,
   summaryCharCount,
@@ -1968,6 +2015,7 @@ async function upsertTranscriptVectorFile({
   const metadata = {
     meetingTranscriptArtifactId: artifactId,
     meetingTranscriptKind: kind,
+    meetingTranscriptContentHash: transcriptContentHash || null,
     meetingTranscriptSourcePathHash: sourcePathHash || null,
     meetingTranscriptUploadedDigest: digest,
     meetingTranscriptPromptVersion: TRANSCRIPT_PROMPT_VERSION,
@@ -2128,6 +2176,7 @@ async function applyTranscriptVectorLifecycle({ userProposal }) {
         sourceStatus: transcript.source_status,
         calendarMatch: transcript.calendar_match,
         inputComplete: transcript.input_complete !== false,
+        contentHash: transcript.contentHash,
         rawCharCount: transcript.raw_char_count,
         suppliedCharCount: transcript.supplied_char_count,
         summaryCharCount: 0,
@@ -2148,6 +2197,7 @@ async function applyTranscriptVectorLifecycle({ userProposal }) {
         sourceStatus: transcript.source_status,
         calendarMatch: transcript.calendar_match,
         inputComplete: transcript.input_complete !== false,
+        contentHash: transcript.contentHash,
         rawCharCount: transcript.raw_char_count,
         suppliedCharCount: transcript.supplied_char_count,
         summaryCharCount: transcript.summary_char_count || summaryText.length,
@@ -2264,10 +2314,11 @@ async function selectUsers(db, options) {
   return users.filter((user) => user?.personalization?.memories !== false);
 }
 
-async function findTranscriptContentHashesMissingVectors({ db, user, options }) {
-  if (options.mode !== 'apply' || !process.env.RAG_API_URL) return new Set();
+async function findTranscriptVectorRepairTargets({ db, user, options }) {
+  const emptyTargets = { contentHashes: new Set(), staleArtifacts: [] };
+  if (options.mode !== 'apply' || !process.env.RAG_API_URL) return emptyTargets;
   const sourcePathHash = transcriptSourcePathHashFromOptions(options);
-  if (!sourcePathHash) return new Set();
+  if (!sourcePathHash) return emptyTargets;
   const ragMode = normalizeTranscriptRagMode(options.transcriptRagMode);
   const kinds =
     ragMode === 'detailed_summary_only'
@@ -2275,6 +2326,53 @@ async function findTranscriptContentHashesMissingVectors({ db, user, options }) 
       : ragMode === 'raw_only'
         ? ['raw']
         : ['raw', 'summary'];
+  const { vectorDocumentExists } = require('~/server/services/Files/VectorDB/crud');
+  const missingContentHashes = new Set();
+  const indexPath = transcriptIndexPath(
+    options.transcriptStateDir || path.join(resolveStatePaths(options).stateDir, 'transcripts'),
+    user._id,
+  );
+  const index = readJsonIfExists(indexPath, null);
+  const processedContent =
+    index?.processedContent && typeof index.processedContent === 'object'
+      ? index.processedContent
+      : {};
+  const processedPrefixes = new Set(
+    Object.keys(processedContent)
+      .filter(
+        (contentHash) =>
+          processedContent[contentHash]?.status === 'processed' &&
+          processedContent[contentHash]?.promptVersion === TRANSCRIPT_PROMPT_VERSION,
+      )
+      .map((contentHash) => contentHash.slice(0, 32)),
+  );
+  const indexMatchesCurrentSource = !index?.sourcePathHash || index.sourcePathHash === sourcePathHash;
+  const hasCurrentProcessedIndex = indexMatchesCurrentSource && processedPrefixes.size > 0;
+  if (indexMatchesCurrentSource) {
+    for (const [contentHash, processed] of Object.entries(processedContent)) {
+      if (
+        !processed ||
+        processed.status !== 'processed' ||
+        processed.promptVersion !== TRANSCRIPT_PROMPT_VERSION
+      ) {
+        continue;
+      }
+      const fileIds = [];
+      if (kinds.includes('raw')) {
+        fileIds.push(processed.rawFileId || stableFileId('meeting_transcript', user._id, contentHash));
+      }
+      if (kinds.includes('summary')) {
+        fileIds.push(processed.summaryFileId || stableFileId('meeting_summary', user._id, contentHash));
+      }
+      for (const fileId of fileIds.filter(Boolean)) {
+        const exists = await vectorDocumentExists({ user: { id: String(user._id) } }, fileId);
+        if (!exists) {
+          missingContentHashes.add(contentHash);
+          break;
+        }
+      }
+    }
+  }
   const files = await db
     .collection('files')
     .find({
@@ -2284,21 +2382,40 @@ async function findTranscriptContentHashesMissingVectors({ db, user, options }) 
       'metadata.meetingTranscriptSourcePathHash': sourcePathHash,
       'metadata.meetingTranscriptKind': kinds.length === 1 ? kinds[0] : { $in: kinds },
     })
-    .project({ file_id: 1 })
+    .project({
+      file_id: 1,
+      'metadata.meetingTranscriptArtifactId': 1,
+      'metadata.meetingTranscriptContentHash': 1,
+      'metadata.meetingTranscriptKind': 1,
+    })
     .toArray();
-  if (files.length === 0) return new Set();
-  const { vectorDocumentExists } = require('~/server/services/Files/VectorDB/crud');
-  const missingContentHashes = new Set();
+  const staleArtifacts = [];
   for (const file of files) {
     const fileId = file?.file_id;
     if (!fileId) continue;
+    const dbHash =
+      file?.metadata?.meetingTranscriptContentHash || transcriptContentHashFromFileId(fileId);
+    const fullContentHash = transcriptFullHashForPrefix(processedContent, dbHash);
+    if (
+      hasCurrentProcessedIndex &&
+      !fullContentHash &&
+      !processedPrefixes.has(String(dbHash || '').slice(0, 32))
+    ) {
+      const staleArtifact = transcriptStaleArtifactFromFile(file);
+      if (staleArtifact) staleArtifacts.push(staleArtifact);
+      continue;
+    }
     const exists = await vectorDocumentExists({ user: { id: String(user._id) } }, fileId);
     if (!exists) {
-      const contentHash = transcriptContentHashFromFileId(fileId);
+      const contentHash = fullContentHash || dbHash;
       if (contentHash) missingContentHashes.add(contentHash);
     }
   }
-  return missingContentHashes;
+  return { contentHashes: missingContentHashes, staleArtifacts: dedupeTranscriptArtifacts(staleArtifacts) };
+}
+
+async function findTranscriptContentHashesMissingVectors({ db, user, options }) {
+  return (await findTranscriptVectorRepairTargets({ db, user, options })).contentHashes;
 }
 
 async function buildUserProposal({ db, methods, user, options, memoryConfig, now, providerInfo }) {
@@ -2319,18 +2436,25 @@ async function buildUserProposal({ db, methods, user, options, memoryConfig, now
       ? 'recent_activity'
       : null;
 
-  const transcriptForceContentHashes = await findTranscriptContentHashesMissingVectors({
+  const transcriptRepairTargets = await findTranscriptVectorRepairTargets({
     db,
     user,
     options,
   });
   const transcriptScan = scanTranscriptDirectory({
     user,
-    options: { ...options, transcriptForceContentHashes },
+    options: { ...options, transcriptForceContentHashes: transcriptRepairTargets.contentHashes },
     now,
     transcriptStateDir:
       options.transcriptStateDir || path.join(resolveStatePaths(options).stateDir, 'transcripts'),
   });
+  transcriptScan.staleArtifacts = dedupeTranscriptArtifacts([
+    ...transcriptScan.staleArtifacts,
+    ...transcriptRepairTargets.staleArtifacts,
+  ]);
+  transcriptScan.telemetry.files_removed =
+    Number(transcriptScan.telemetry.files_removed || 0) +
+    transcriptRepairTargets.staleArtifacts.length;
   let meetingTranscripts = transcriptScan.transcripts;
   let transcriptDeferReason = null;
   if (options.mode === 'apply' && meetingTranscripts.length > 0 && !process.env.RAG_API_URL) {
@@ -3101,6 +3225,7 @@ module.exports = {
   buildUserProposal,
   deferTranscriptLifecycleWhenRagUnavailable,
   findTranscriptContentHashesMissingVectors,
+  findTranscriptVectorRepairTargets,
   getTranscriptVectorRuntimeStatus,
   invokeModel,
   invokeTranscriptSummaryModel,

@@ -214,6 +214,17 @@ function isNonRetryableFallbackErrorClass(value) {
   return Boolean(normalized) && NON_RETRYABLE_FALLBACK_ERROR_CLASSES.has(normalized);
 }
 
+function isRecoverableFallbackErrorClass(value) {
+  const normalized = normalizeFallbackErrorClass(value);
+  return [
+    'provider_rate_limited',
+    'recoverable_provider_error',
+    'provider_unauthorized',
+    'provider_access_denied',
+    'late_stream_termination',
+  ].includes(normalized);
+}
+
 function contentPartErrorClass(part) {
   if (!part || typeof part !== 'object') {
     return '';
@@ -240,6 +251,9 @@ function hasVisibleAssistantText(contentParts) {
     }
     if (part.type === ContentTypes.TEXT && typeof part.text === 'string') {
       return part.text.trim().length > 0;
+    }
+    if (part.type === ContentTypes.TEXT && typeof part.text?.value === 'string') {
+      return part.text.value.trim().length > 0;
     }
     return false;
   });
@@ -282,8 +296,12 @@ function shouldRetryWithFallback(contentParts) {
     if (!part || typeof part !== 'object' || part.type !== ContentTypes.ERROR) {
       return false;
     }
-    if (isNonRetryableFallbackErrorClass(contentPartErrorClass(part))) {
+    const errorClass = contentPartErrorClass(part);
+    if (isNonRetryableFallbackErrorClass(errorClass)) {
       return false;
+    }
+    if (isRecoverableFallbackErrorClass(errorClass)) {
+      return true;
     }
     return isRecoverableProviderErrorText(contentPartText(part));
   });
@@ -352,6 +370,7 @@ module.exports = {
   buildFallbackAgent,
   isSameAgentRoute,
   shouldRetryWithFallback,
+  hasVisibleAssistantText,
   shouldRetryBackgroundCortexWithFallback,
   isAbortOrTimeoutErrorText,
   isRecoverableProviderErrorText,

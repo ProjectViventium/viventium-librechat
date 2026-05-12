@@ -1,0 +1,8 @@
+schema_version: 1
+prompt_root: viventium/source_of_truth/prompts
+managed_scope: viventium_owned_product_prompts
+notes:
+- The compiler discovers .md prompts by frontmatter id.
+- local.*.yaml source files may use promptRef; compiled runtime YAML receives plain
+  strings.
+- Upstream LibreChat/user-managed prompts remain view-only unless explicitly migrated.

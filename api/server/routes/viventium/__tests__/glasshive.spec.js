@@ -216,7 +216,19 @@ describe('/api/viventium/glasshive/callback', () => {
   test('persists a signed completion callback into the originating conversation', async () => {
     const router = require('../glasshive');
     const app = createTestApp(router);
-    const body = callbackBody();
+    const body = callbackBody({
+      operator_url: 'http://127.0.0.1:8780/watch/wrk-1?surface=desktop&project_id=prj-1',
+      watch_url: 'http://127.0.0.1:8780/watch/wrk-1?surface=desktop&project_id=prj-1',
+      deliverable: {
+        kind: 'webpage',
+        state: 'ready',
+        source: `workspace_html ${syntheticLocalPath('private.html')}`,
+        label: 'index.html http://127.0.0.1:8780/watch/wrk-private',
+        browser_url: 'file:///workspace/project/index.html',
+        preferred_surface: 'desktop',
+        workspace_path: 'index.html',
+      },
+    });
     const req = createMockReq({
       url: '/api/viventium/glasshive/callback',
       headers: { 'x-glasshive-signature': signature(body) },
@@ -242,7 +254,125 @@ describe('/api/viventium/glasshive/callback', () => {
       },
     ]);
     expect(message.metadata.viventium.workerId).toBe('wrk-1');
+    expect(message.metadata.viventium.parentMessageId).toBe('msg-parent');
+    expect(message.metadata.viventium.treeParentMessageId).toBe('msg-anchor');
+    expect(message.metadata.viventium.operatorUrl).toBeUndefined();
+    expect(message.metadata.viventium.watchUrl).toBeUndefined();
+    expect(message.metadata.viventium.deliverable).toEqual({
+      kind: 'webpage',
+      state: 'ready',
+      source: 'workspace_html [local path]',
+      label: 'index.html [local worker link]',
+      preferredSurface: 'desktop',
+    });
     expect(mockEnqueueGlassHiveCallbackDelivery).not.toHaveBeenCalled();
+  });
+
+  test('appends late completion callbacks to the current conversation leaf instead of branching from the original anchor', async () => {
+    mockGetMessages.mockResolvedValueOnce([
+      {
+        messageId: 'user-msg',
+        parentMessageId: '00000000-0000-0000-0000-000000000000',
+        text: 'Start worker.',
+        isCreatedByUser: true,
+        createdAt: '2026-04-28T14:00:00.000Z',
+      },
+      {
+        messageId: 'assistant-anchor',
+        parentMessageId: 'user-msg',
+        text: 'On it.',
+        isCreatedByUser: false,
+        createdAt: '2026-04-28T14:00:01.000Z',
+      },
+      {
+        messageId: 'follow-up-user',
+        parentMessageId: 'assistant-anchor',
+        text: 'Can you still answer here?',
+        isCreatedByUser: true,
+        createdAt: '2026-04-28T14:00:02.000Z',
+      },
+      {
+        messageId: 'follow-up-assistant',
+        parentMessageId: 'follow-up-user',
+        text: 'Yes.',
+        isCreatedByUser: false,
+        createdAt: '2026-04-28T14:00:03.000Z',
+      },
+    ]);
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({
+      callback_id: 'cb_late_completion_current_leaf',
+      parent_message_id: 'user-msg',
+      message_id: 'assistant-anchor',
+      event: 'run.completed',
+      message: 'Finished host worker.',
+    });
+    const req = createMockReq({
+      url: '/api/viventium/glasshive/callback',
+      headers: { 'x-glasshive-signature': signature(body) },
+      body,
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+    expect(mockSaveMessage).toHaveBeenCalledTimes(1);
+    const [, message] = mockSaveMessage.mock.calls[0];
+    expect(message.parentMessageId).toBe('follow-up-assistant');
+    expect(message.metadata.viventium.parentMessageId).toBe('user-msg');
+    expect(message.metadata.viventium.treeParentMessageId).toBe('follow-up-assistant');
+    expect(message.metadata.viventium.anchorMessageId).toBe('assistant-anchor');
+  });
+
+  test('retries late callbacks while the current conversation leaf is a moved-on user message', async () => {
+    mockGetMessages.mockResolvedValueOnce([
+      {
+        messageId: 'user-msg',
+        parentMessageId: '00000000-0000-0000-0000-000000000000',
+        text: 'Start worker.',
+        isCreatedByUser: true,
+        createdAt: '2026-04-28T14:00:00.000Z',
+      },
+      {
+        messageId: 'assistant-anchor',
+        parentMessageId: 'user-msg',
+        text: 'On it.',
+        isCreatedByUser: false,
+        createdAt: '2026-04-28T14:00:01.000Z',
+      },
+      {
+        messageId: 'follow-up-user',
+        parentMessageId: 'assistant-anchor',
+        text: 'Can you still answer here?',
+        isCreatedByUser: true,
+        createdAt: '2026-04-28T14:00:02.000Z',
+      },
+    ]);
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({
+      callback_id: 'cb_late_completion_wait_for_leaf',
+      parent_message_id: 'user-msg',
+      message_id: 'assistant-anchor',
+      event: 'run.completed',
+      message: 'Finished host worker.',
+    });
+    const req = createMockReq({
+      url: '/api/viventium/glasshive/callback',
+      headers: { 'x-glasshive-signature': signature(body) },
+      body,
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(425);
+    expect(res.body.error).toBe('callback_conversation_tip_not_ready');
+    expect(mockSaveMessage).not.toHaveBeenCalled();
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
   });
 
   test('enqueues Telegram callbacks with sanitized full report text for durable delivery', async () => {
@@ -573,6 +703,142 @@ describe('/api/viventium/glasshive/callback', () => {
     ]);
   });
 
+  test('appends later runs from the same worker instead of overwriting the prior run result', async () => {
+    mockGetMessages.mockResolvedValueOnce([
+      {
+        messageId: 'user-msg',
+        parentMessageId: '00000000-0000-0000-0000-000000000000',
+        text: 'Start worker.',
+        isCreatedByUser: true,
+        createdAt: '2026-04-28T14:00:00.000Z',
+      },
+      {
+        messageId: 'assistant-anchor',
+        parentMessageId: 'user-msg',
+        text: 'On it.',
+        isCreatedByUser: false,
+        createdAt: '2026-04-28T14:00:01.000Z',
+      },
+      {
+        messageId: 'glasshive-status',
+        parentMessageId: 'assistant-anchor',
+        text: 'Initial run finished.',
+        isCreatedByUser: false,
+        createdAt: '2026-04-28T14:00:02.000Z',
+        metadata: {
+          viventium: {
+            type: 'glasshive_worker_callback',
+            workerId: 'wrk-1',
+            runId: 'run-1',
+            events: [{ event: 'run.completed', runId: 'run-1' }],
+          },
+        },
+      },
+    ]);
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({
+      callback_id: 'cb_same_worker_later_run',
+      parent_message_id: 'user-msg',
+      message_id: 'assistant-anchor',
+      run_id: 'run-2',
+      event: 'run.completed',
+      message: 'Steer run finished.',
+    });
+    const req = createMockReq({
+      url: '/api/viventium/glasshive/callback',
+      headers: { 'x-glasshive-signature': signature(body) },
+      body,
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+    expect(mockSaveMessage).toHaveBeenCalledTimes(1);
+    const [, message] = mockSaveMessage.mock.calls[0];
+    expect(message.parentMessageId).toBe('glasshive-status');
+    expect(message.text).toBe('Steer run finished.');
+    expect(message.metadata.viventium.runId).toBe('run-2');
+    expect(message.metadata.viventium.treeParentMessageId).toBe('glasshive-status');
+    expect(message.metadata.viventium.events.map((event) => event.runId)).toEqual(['run-2']);
+  });
+
+  test('appends later runs under the current leaf when an older status exists off the active branch', async () => {
+    mockGetMessages.mockResolvedValueOnce([
+      {
+        messageId: 'user-msg',
+        parentMessageId: '00000000-0000-0000-0000-000000000000',
+        text: 'Start worker.',
+        isCreatedByUser: true,
+        createdAt: '2026-04-28T14:00:00.000Z',
+      },
+      {
+        messageId: 'assistant-anchor',
+        parentMessageId: 'user-msg',
+        text: 'On it.',
+        isCreatedByUser: false,
+        createdAt: '2026-04-28T14:00:01.000Z',
+      },
+      {
+        messageId: 'glasshive-status',
+        parentMessageId: 'assistant-anchor',
+        text: 'Initial run finished.',
+        isCreatedByUser: false,
+        createdAt: '2026-04-28T14:00:02.000Z',
+        metadata: {
+          viventium: {
+            type: 'glasshive_worker_callback',
+            workerId: 'wrk-1',
+            runId: 'run-1',
+            events: [{ event: 'run.completed', runId: 'run-1' }],
+          },
+        },
+      },
+      {
+        messageId: 'follow-up-user',
+        parentMessageId: 'glasshive-status',
+        text: 'Keep going.',
+        isCreatedByUser: true,
+        createdAt: '2026-04-28T14:00:03.000Z',
+      },
+      {
+        messageId: 'follow-up-assistant',
+        parentMessageId: 'follow-up-user',
+        text: 'Still here.',
+        isCreatedByUser: false,
+        createdAt: '2026-04-28T14:00:04.000Z',
+      },
+    ]);
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({
+      callback_id: 'cb_same_worker_later_run_moved_on',
+      parent_message_id: 'user-msg',
+      message_id: 'assistant-anchor',
+      run_id: 'run-2',
+      event: 'run.completed',
+      message: 'Second run finished.',
+    });
+    const req = createMockReq({
+      url: '/api/viventium/glasshive/callback',
+      headers: { 'x-glasshive-signature': signature(body) },
+      body,
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+    expect(mockSaveMessage).toHaveBeenCalledTimes(1);
+    const [, message] = mockSaveMessage.mock.calls[0];
+    expect(message.parentMessageId).toBe('follow-up-assistant');
+    expect(message.text).toBe('Second run finished.');
+    expect(message.metadata.viventium.treeParentMessageId).toBe('follow-up-assistant');
+  });
+
   test.each([
     'worker.ready',
     'worker.resumed_by_alias',
@@ -645,6 +911,11 @@ describe('/api/viventium/glasshive/callback', () => {
 
   test.each([
     ['run.failed', 'Browser needs attention.', 'I got stuck: Browser needs attention.'],
+    [
+      'run.failed',
+      'Host-native codex-cli already has an active worker (wrk_123); v1 allows one active host worker per CLI family.',
+      'I got stuck: another local worker is already running, so I could not start this one yet.',
+    ],
     ['run.cancelled', 'The task was cancelled.', 'I stopped: The task was cancelled.'],
     ['run.interrupted', 'The run was interrupted.', 'I stopped: The run was interrupted.'],
     [
@@ -661,6 +932,8 @@ describe('/api/viventium/glasshive/callback', () => {
         callback_id: `cb_${event.replaceAll('.', '_')}_visible`,
         event,
         message: rawMessage,
+        failure_code:
+          rawMessage.includes('already has an active worker') ? 'active_worker_conflict' : undefined,
       });
       const req = createMockReq({
         url: '/api/viventium/glasshive/callback',
@@ -676,6 +949,33 @@ describe('/api/viventium/glasshive/callback', () => {
       expect(message.text).toBe(expected);
     },
   );
+
+  test('uses generic active-worker text even when failure_code is missing', async () => {
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({
+      callback_id: 'cb_active_worker_text_only',
+      event: 'run.failed',
+      message:
+        'Host-native worker already has an active worker (wrk_123); v1 allows one active host worker per CLI family.',
+    });
+    const req = createMockReq({
+      url: '/api/viventium/glasshive/callback',
+      headers: { 'x-glasshive-signature': signature(body) },
+      body,
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    const [, message] = mockSaveMessage.mock.calls[0];
+    expect(message.text).toBe(
+      'I got stuck: another local worker is already running, so I could not start this one yet.',
+    );
+    expect(message.text).not.toContain('wrk_123');
+    expect(message.text).not.toContain('CLI family');
+  });
 
   test('sanitizes worker plumbing from visible callback text', async () => {
     const router = require('../glasshive');
@@ -773,7 +1073,7 @@ describe('/api/viventium/glasshive/callback', () => {
     expect(message.text.match(/\[local path\]/g)).toHaveLength(5);
     expect(message.text).not.toContain(syntheticLocalPath());
     expect(message.text).not.toContain('My Documents');
-    expect(message.text).not.toContain('/private/var');
+    expect(message.text).not.toContain(['', 'private', 'var'].join('/'));
     expect(message.text).not.toContain(syntheticHomePath());
     expect(message.text).not.toContain(syntheticWindowsPath());
     expect(message.text).not.toContain('/users/synthetic-user');

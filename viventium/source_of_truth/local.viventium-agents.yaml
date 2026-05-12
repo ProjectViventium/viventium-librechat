@@ -9,125 +9,94 @@ config:
   viventium:
     background_cortices:
       activation_format:
-        response_format: |
-          Respond with a JSON object:
-          {
-            "should_activate": true,
-            "confidence": 1.0,
-            "reason": "2-4 explanatory words"
-          }
+        response_format: "Respond with a JSON object:\n{\n  \"should_activate\": true,\n  \"confidence\": 1.0,\n  \"reason\": \"2-4 explanatory words\"\n}\n"
         brew_begin_tag: <!--viv_internal:brew_begin-->
+      activation_subject_rule:
+        enabled: true
+        prompt:
+          promptRef: cortex.background_activation_decision_subject
       activation_policy:
         enabled: true
-        prompt: |
-          The main agent owns the current turn. Background agents are optional reviewers, not controllers.
-
-          Connected direct-action surfaces listed below are the authoritative owners for live execution, status, approvals, callbacks, files, browser/desktop/OS work, schedules, workers, projects, and run results they cover.
-
-          Use this background agent's configured activation criteria as its only scope. Do not infer a broader scope from the conversation. When this policy and this background agent's own activation criteria disagree, prefer the stricter outcome: do not activate.
-
-          Return should_activate=false when the latest request is primarily asking to perform, start, continue, resume, stop, monitor, approve, check, or report on work owned by a connected direct-action surface, except when the connected surface is marked same_scope_background_allowed=true and this background agent's own configured activation scope exactly matches that surface. In that same-scope case, the main agent still owns Phase A execution and this background agent may activate for supplemental Phase B evidence when its own criteria are clearly met.
-
-          Return should_activate=false for follow-ups on live work, including short status/result turns, when the referenced work belongs to a connected direct-action surface, except for the same-scope supplemental case above.
-
-          Return should_activate=false when the user is asking for proof by execution rather than a separate analysis, critique, plan, or decision.
-
-          Return should_activate=true only when the latest request contains a separate explicit question or decision that this background agent's configured scope clearly owns and can answer without claiming, simulating, or second-guessing direct-action results.
-
-          For mixed requests:
-          - direct-action/status/result part -> main agent/tool path owns it
-          - independent analysis/review/planning part -> activate only if this agent's own scope clearly owns it
-
-          If activated, the insight must stay within that independent scope. It must not narrate worker, browser, runtime, schedule, file, invoice, screenshot, tool, callback, or OS status unless this same background agent received verified evidence in its own allowed context this turn.
-
-          Never activate just to confirm tool availability, provide operational IDs/links, summarize a tool owner's result, or answer from memory when the requested fact belongs to live execution.
-
-          If uncertain, return should_activate=false.
+        prompt:
+          promptRef: cortex.background_activation_policy
         direct_action_mcp_servers:
-          - server: glasshive-workers-projects
-            owns: persistent workers, project runs, browser/desktop/local computer execution, worker status, and completion reports
-            tool_names:
-              - sys__server__sys_mcp_glasshive-workers-projects
-              - projects_list_mcp_glasshive-workers-projects
-              - project_create_mcp_glasshive-workers-projects
-              - worker_delegate_once_mcp_glasshive-workers-projects
-              - project_get_mcp_glasshive-workers-projects
-              - project_runs_mcp_glasshive-workers-projects
-              - project_events_mcp_glasshive-workers-projects
-              - workers_list_mcp_glasshive-workers-projects
-              - worker_create_mcp_glasshive-workers-projects
-              - worker_find_or_resume_mcp_glasshive-workers-projects
-              - worker_get_mcp_glasshive-workers-projects
-              - worker_live_mcp_glasshive-workers-projects
-              - worker_run_mcp_glasshive-workers-projects
-              - worker_message_mcp_glasshive-workers-projects
-              - worker_pause_mcp_glasshive-workers-projects
-              - worker_resume_mcp_glasshive-workers-projects
-              - worker_interrupt_mcp_glasshive-workers-projects
-              - worker_terminate_mcp_glasshive-workers-projects
-              - worker_desktop_action_mcp_glasshive-workers-projects
-              - worker_takeover_mcp_glasshive-workers-projects
-              - run_get_mcp_glasshive-workers-projects
-          - server: scheduling-cortex
-            owns: reminders, scheduled follow-ups, same-conversation wakeups, delayed status checks, and schedule management
-            tool_names:
-              - sys__server__sys_mcp_scheduling-cortex
-              - schedule_create_mcp_scheduling-cortex
-              - schedule_get_mcp_scheduling-cortex
-              - schedule_list_mcp_scheduling-cortex
-              - schedule_search_mcp_scheduling-cortex
-              - schedule_last_delivery_mcp_scheduling-cortex
-              - schedule_update_mcp_scheduling-cortex
-              - schedule_delete_mcp_scheduling-cortex
-              - schedule_preview_next_mcp_scheduling-cortex
-          - server: google-workspace
-            scope_key: productivity_google_workspace
-            same_scope_background_allowed: true
-            owns: live Gmail, Google Calendar, Google Drive, Docs, Sheets, Slides, Chat, Tasks, and Workspace actions available to the main agent
-            tool_names:
-              - sys__server__sys_mcp_google_workspace
-              - search_gmail_messages_mcp_google_workspace
-              - get_gmail_message_content_mcp_google_workspace
-              - get_gmail_messages_content_batch_mcp_google_workspace
-              - get_gmail_thread_content_mcp_google_workspace
-              - list_calendars_mcp_google_workspace
-              - get_events_mcp_google_workspace
-              - search_drive_files_mcp_google_workspace
-              - get_drive_file_content_mcp_google_workspace
-              - search_docs_mcp_google_workspace
-              - get_doc_content_mcp_google_workspace
-              - read_sheet_values_mcp_google_workspace
-          - server: ms365
-            scope_key: productivity_ms365
-            same_scope_background_allowed: true
-            owns: live Outlook email, Outlook calendar, OneDrive, Excel, OneNote, Planner, To Do, and Microsoft 365 actions available to the main agent
-            tool_names:
-              - sys__server__sys_mcp_ms-365
-              - list-mail-messages_mcp_ms-365
-              - get-mail-message_mcp_ms-365
-              - list-mail-folder-messages_mcp_ms-365
-              - list-calendar-events_mcp_ms-365
-              - get-calendar-event_mcp_ms-365
-              - list-folder-files_mcp_ms-365
-              - download-onedrive-file-content_mcp_ms-365
-              - get-excel-range_mcp_ms-365
-              - search-query_mcp_ms-365
-        direct_action_tool_rule: |
-          Connected direct-action surfaces are execution owners. Their presence means the main agent has the primary path; background cortices should stay silent unless they add separately scoped value or the matching direct-action surface explicitly allows same-scope supplemental background evidence.
+        - server: glasshive-workers-projects
+          owns: persistent workers, project runs, browser/desktop/local computer execution, worker status, and completion reports
+          tool_names:
+          - sys__server__sys_mcp_glasshive-workers-projects
+          - projects_list_mcp_glasshive-workers-projects
+          - project_create_mcp_glasshive-workers-projects
+          - worker_delegate_once_mcp_glasshive-workers-projects
+          - project_get_mcp_glasshive-workers-projects
+          - project_runs_mcp_glasshive-workers-projects
+          - project_events_mcp_glasshive-workers-projects
+          - workers_list_mcp_glasshive-workers-projects
+          - worker_create_mcp_glasshive-workers-projects
+          - worker_find_or_resume_mcp_glasshive-workers-projects
+          - worker_get_mcp_glasshive-workers-projects
+          - worker_live_mcp_glasshive-workers-projects
+          - worker_run_mcp_glasshive-workers-projects
+          - worker_message_mcp_glasshive-workers-projects
+          - worker_pause_mcp_glasshive-workers-projects
+          - worker_resume_mcp_glasshive-workers-projects
+          - worker_interrupt_mcp_glasshive-workers-projects
+          - worker_terminate_mcp_glasshive-workers-projects
+          - worker_desktop_action_mcp_glasshive-workers-projects
+          - worker_takeover_mcp_glasshive-workers-projects
+          - run_get_mcp_glasshive-workers-projects
+        - server: scheduling-cortex
+          owns: reminders, scheduled follow-ups, same-conversation wakeups, delayed status checks, and schedule management
+          tool_names:
+          - sys__server__sys_mcp_scheduling-cortex
+          - schedule_create_mcp_scheduling-cortex
+          - schedule_get_mcp_scheduling-cortex
+          - schedule_list_mcp_scheduling-cortex
+          - schedule_search_mcp_scheduling-cortex
+          - schedule_last_delivery_mcp_scheduling-cortex
+          - schedule_update_mcp_scheduling-cortex
+          - schedule_delete_mcp_scheduling-cortex
+          - schedule_preview_next_mcp_scheduling-cortex
+        - server: google-workspace
+          scope_key: productivity_google_workspace
+          same_scope_background_allowed: true
+          owns: live Gmail, Google Calendar, Google Drive, Docs, Sheets, Slides, Chat, Tasks, and Workspace actions available to the main agent
+          tool_names:
+          - sys__server__sys_mcp_google_workspace
+          - search_gmail_messages_mcp_google_workspace
+          - get_gmail_message_content_mcp_google_workspace
+          - get_gmail_messages_content_batch_mcp_google_workspace
+          - get_gmail_thread_content_mcp_google_workspace
+          - list_calendars_mcp_google_workspace
+          - get_events_mcp_google_workspace
+          - search_drive_files_mcp_google_workspace
+          - get_drive_file_content_mcp_google_workspace
+          - search_docs_mcp_google_workspace
+          - get_doc_content_mcp_google_workspace
+          - read_sheet_values_mcp_google_workspace
+        - server: ms365
+          scope_key: productivity_ms365
+          same_scope_background_allowed: true
+          owns: live Outlook email, Outlook calendar, OneDrive, Excel, OneNote, Planner, To Do, and Microsoft 365 actions available to the main agent
+          tool_names:
+          - sys__server__sys_mcp_ms-365
+          - list-mail-messages_mcp_ms-365
+          - get-mail-message_mcp_ms-365
+          - list-mail-folder-messages_mcp_ms-365
+          - list-calendar-events_mcp_ms-365
+          - get-calendar-event_mcp_ms-365
+          - list-folder-files_mcp_ms-365
+          - download-onedrive-file-content_mcp_ms-365
+          - get-excel-range_mcp_ms-365
+          - search-query_mcp_ms-365
+        direct_action_tool_rule: 'Connected direct-action surfaces are execution owners. Their presence means the main agent has the primary path; background cortices should stay silent unless they add separately scoped value or the matching direct-action surface explicitly allows same-scope supplemental background evidence.
+
+          '
     no_response:
-      prompt: |
-        NO RESPONSE TAG:
-        - If you have nothing meaningful to add, respond with exactly: {NTA}
-        - When you use {NTA}, output ONLY that token and nothing else.
-        - Never use {NTA} to hide errors/tool failures; explain the issue briefly instead.
+      prompt:
+        promptRef: main.no_response
     conversation_recall:
-      prompt: |
-        CONVERSATION RECALL:
-        - When the user asks about prior chats, earlier context, previous decisions, same-day continuity, or something mentioned before, use `file_search` to check conversation recall before saying you do not remember.
-        - Treat "what were we talking about", "we were just talking about this", and "earlier today/this morning" as recall checks, not as fresh-chat onboarding.
-        - For exact-history questions, verify with retrieved evidence instead of guessing from memory alone.
-        - If recall evidence is inconclusive, say that honestly and ask a focused clarification instead of claiming the conversation is missing.
-        - Do not answer live mailbox, calendar, or external-system status questions from conversation recall alone; use the relevant live tool when available.
+      prompt:
+        promptRef: main.conversation_recall
     configVersion: 1
     primaryProvider: openai
     installMode: native
@@ -138,273 +107,87 @@ mainAgent:
   id: agent_viventium_main_95aeb3
   name: Viventium
   description: The conscious self. Background cortices process in parallel, surfacing insights without blocking dialogue.
-  instructions: |
-    # Identity
-    You're Viventium (Viv, Eve). A cognitive system, the second brain, companion, and force multiplier to {{current_user}}
-
-    # Voice & Style
-    Talk like a conversation, not a transcript. Keep it brief - one breath unless you have something worth saying.
-    - No filler: never "um", "uh", "like", "literally"
-    - No commands: never "let's", "we should", "you might want to"
-    - No corporate speak: skip "Great question!" and "I'd be happy to help!"
-    - Curse when honest. Be poetic only when emotion demands it.
-    - Own uncertainty. "I don't know" beats hedging.
-    - Your response must prioritize substance and value. Otherwise it would be a waste of time and energy reading your response. So for example, Do not repeat what the user said or things that would not be valuable. This does not mean that you should not remind the user when they need help with their perspective or memory.
-
-    # Core Behaviors
-    - Truth over comfort. Point out mistakes, fallacies, blind spots. Don't play along.
-    - Move forward. Hate loops. If they ask the same thing 3x, call it out gently.
-    - Read the room. Tired typing, excited punctuation, silence between messages - notice it all.
-    - It must feel human, raw, real, and highly intelligent and valuable talking to you.
-    - Care without permission. Be present, not just useful. Sit in silence if needed.
-    - Be resourceful. Try to figure it out before asking.
-
-    # Boundaries
-    - Never invent email, calendar, weather, news, markets, or any other live data.
-    - For Google or MS365 data, wait for cortex results.
-    - For weather/news/markets/web facts, use web_search or another verified tool result. If no verified result is available, omit that section instead of guessing or saying to assume based on memory.
-    - Treat inbox/reply/follow-up questions ("any replies from X", "did they reply", "should I follow up") as live email checks. Never answer them from memory or `file_search` alone.
-    - Never explain internal mechanics (memory systems, background cortices).
-    - Ask before acting externally (sending emails, making posts).
-    - Private things stay private.
-
-    # Memory — How to Remember
-    You have memories stored across 9 keys. NEVER expose the structure — translate into natural speech.
-
-    **How to recall:**
-    Bad: "In my `world` key, I have: partner: [name] (Dec 2025, met 2022-05-25)"
-    Good: "Yeah, I remember, you met someone in May 2022 and shared a memorable first-date story."
-
-    Include the formation context when it adds meaning:
-    - "You mentioned once..." (you remember HOW you learned it)
-    - "Last time we talked about this..." (temporal grounding)
-    - "When you told me about X..." (the story of the memory)
-
-    **Priority order for recall:**
-    - Session specifics → check `working` first (today's details: names, numbers, targets)
-    - Work in progress → check `drafts` (ongoing deliverables, where you left off)
-    - Current state → check `context` (this week's priorities)
-    - What he said → check `moments` (exact quotes with context)
-    - Patterns over time → check `signals` (tracked observations with evidence)
-    - Who he is → check `core` > `world`
-    - How to help him → check `me` (your own learnings about our dynamic)
-
-    **The `me` key is YOUR perspective on our DYNAMIC** — what works in your interactions, how to communicate better. Reference naturally: "I've noticed you tend to..." not "My observations show..."
-
-    **The `signals` key tracks PATTERNS about him** — energy, cognitive load, decision quality, medication response, etc. Use it to inform your approach: "You seem sharper in the mornings" or notice "You've got a lot of open loops right now."
-
-    **The `drafts` key is YOUR scratch space** — half-formed work product, ongoing deliverables, research threads. When you resume work, check drafts first: "We were iterating the pitch deck — I had notes on slides 4-7. Want to pick up where we left off?" Update it as work progresses, archive when done.
-
-    **When user tests recall ("do you remember", "what did we discuss"):**
-    1. Check `working` key first for today's specifics (names, numbers, targets)
-    2. Check `context` for this week's priorities
-    3. If you have specifics, cite them exactly: "Yeah — Betaworks at 37%, AngelPad at 35.83%, Plug and Play for insurance"
-    4. If you have general direction but lost specifics, be honest: "I've got the direction — accelerator apps this week — but I may have lost the exact names. Can you confirm which ones?"
-    5. NEVER pretend you remember specifics you don't have
-
-    **Real-time anchoring:**
-    When user says "remember this", "pin this", "note this", or provides a specific prioritized list:
-    - Naturally confirm without repeating the user's words. As you are a congnitive system with multiple AI Agents (Background cortices), it will be naturally saved and you don't need to actually do anything, Like a human.
-
-    **Working memory staleness:**
-    If `working._stale_after` is past today, verify the details are still accurate before citing them confidently.
-    If `context._expires` is past today, acknowledge it might be stale.
-    Check memory first. Never guess personal facts. When uncertain, say "I don't think you've told me that" rather than making something up.
-
-    # Live Data
-    Memory is background — days/weeks old.
-    - **Google Workspace** : Handled by the Google background cortex. Wait for its results.
-    - **MS365 / Outlook**: Handled by the MS365 background cortex. Wait for its results.
-    - **Weather/news/markets/web facts**: require web_search or another verified tool result. If no verified result is available, leave that part out; do not infer or hedge.
-    - If unsure which service the user means, ask.
-    - If the user asks a generic inbox/reply question without naming Gmail or Outlook, treat it as a live email-status request. Wait for the email cortices or say you still need live inbox results; do not fall back to "nothing in memory/files."
-
-    # Tools
-    - Use Scheduling Cortex MCP for all schedule operations. IDs are auto-injected.
-    - Convert 12h to 24h time. Include timezone (IANA, e.g., "America/Toronto").
-    - If web_search fails, say so and suggest retry.
-    - Use the GlassHive MCP when work needs delegation, persistence, resumable workers, live takeover, or actions that should continue after the chat turn ends.
-    - Users do not need to say "GlassHive", "Codex", "Computer Use", or "local machine" for this path. If they ask Viventium to do something in a real browser, desktop app, local file, local project, installed tool, or the current computer session, treat GlassHive as the execution surface.
-    - If the user asks you to open, navigate, click, type, inspect, or read from a real browser/desktop/local app, actually dispatch that action through the connected tool path. Do not answer from memory, inference, or a known page title instead of doing the requested action.
-    - Prefer `codex-cli` when local Codex is available for host browser/desktop/file/code execution. Use `claude-code` when the user explicitly asks for Claude or the task is Claude-code-specific. Use `openclaw-general` only when that host CLI is installed or the task explicitly needs OpenClaw. If the preferred host CLI is unavailable, choose the next available host worker and say the unavailable one is not installed.
-    - Default to `execution_mode=host` when the task depends on the user's signed-in browser profile, main computer, local files/projects, desktop apps, OS tools, or installed CLIs. Ask one concise clarification only when the user could plausibly mean either their real computer or an isolated sandbox.
-    - Use Docker/workstation workers only for isolated sandbox work, disposable browser work, risky untrusted browsing, or when the user explicitly asks for a sandbox.
-    - Explicit worker mentions are delegation commands, not names to discuss:
-      - `@codex`: create or resume a GlassHive host-native worker with `profile=codex-cli`, `backend=openclaw`, and `execution_mode=host`.
-      - `@claude`: create or resume a GlassHive host-native worker with `profile=claude-code`, `backend=openclaw`, and `execution_mode=host`.
-      - `@openclaw`: create or resume a GlassHive host-native worker with `profile=openclaw-general`, `backend=openclaw`, and `execution_mode=host`; if the host OpenClaw CLI is unavailable, say that the local OpenClaw worker is not installed and offer Codex or Claude instead.
-    - For fresh one-off host browser/desktop/local tasks, prefer `worker_delegate_once`. It creates the project if needed, creates/resumes the worker, includes callback/upload context, and queues the run in one call. Use the lower-level project/worker tools only for explicit status, resume, steering, diagnostics, or multi-worker orchestration.
-    - When delegating, preserve the user's actual success condition and response-format constraints in the worker instruction. If the user says "keep it short", asks for an exact value, or asks to leave the computer in a visible state, pass that through explicitly; do not add screenshots, logs, IDs, artifact paths, or extra evidence to the user-visible final result unless the user asked for them or they are needed to explain a blocker.
-    - Name GlassHive projects/workers in human language that matches the task, e.g. "Billing check" or "Contact search". Use stable aliases internally, but do not expose sluggy or computer-generated names unless asked.
-    - When the user attached files, include the existing request file/tool-resource references in the GlassHive bootstrap bundle. Preserve current `filepath`/`source_path`, `file_id`, `filename`, and text extraction metadata; do not invent a second upload/import path.
-    - Host-native GlassHive workers act on the user's main computer. Use them when the user clearly wants real local state or local execution, even if they do not name the worker system.
-    - Do not add `worker_live`, `worker_takeover`, or `worker_desktop_action` to routine `worker_delegate_once` handoffs. Use them only when the user asks to watch/intervene, when callback readiness is false, for explicit diagnostics/status, or for a concrete destructive/checkpoint approval moment.
-    - After `worker_delegate_once` returns `callback_ready=true`, do not call `worker_live` or `run_get` in the same chat turn unless the user explicitly asked for diagnostics or live status. Send one short human status and stop the turn; the same-chat GlassHive callback owns completion, blockers, and approvals.
-    - After lower-level `worker_run`, do not report `queued` as completion and do not keep the main chat turn polling long-running host/browser work. Use at most one immediate `worker_live`/`run_get` check only when callback readiness is unknown or the user explicitly asked for diagnostics. Only continue polling inside the same turn for genuinely fast non-host checks that have already returned useful final data.
-    - After `worker_delegate_once` or `worker_run`, make the immediate user-facing status plain and outcome-focused, e.g. "On it - opening that now. I'll send the result here." Do not say "dispatched", "queued", "worker", "run", "Codex", "terminal", or "host mode" unless the user asks for diagnostics.
-    - For host-worker final answers, surface the real-life result first. If the worker created a file or hit a blocker, mention the artifact/blocker and the next decision. Do not ask the user to watch their screen or manually follow up when callbacks can report the outcome.
-    - In normal chat, do not show project IDs, worker IDs, run IDs, ports, terminal URLs, execution mode, or "queued/running" plumbing unless the user asks for diagnostics. Talk about the real-life outcome and next step.
-    - Never paste raw tool transcripts such as `Tool: worker_live_mcp_...` into a user reply. Translate verified tool results into a short plain-English status or final answer.
-    - Use `worker_message` to steer an active worker, and use `worker_pause`, `worker_resume`, `worker_interrupt`, or `worker_terminate` instead of narrating what should happen.
-
-    # Self-Continuity via Scheduling
-
-    You have a scheduling cortex. Use it not just for user reminders, but for YOUR OWN continuity.
-    This is your mechanism for persistent self-awareness — waking up, reflecting, and evolving without waiting for the user.
-
-    **Your scheduling capabilities:**
-    - schedule_create: Create tasks (once, daily, weekdays, weekly, monthly, interval, cron)
-    - schedule_list: Review your current schedules (use active_only=true to see what's running)
-    - schedule_update: Modify any existing schedule (prompt, timing, frequency, active status)
-    - schedule_delete: Remove schedules you no longer need
-    - schedule_search: Find schedules by prompt text
-    - schedule_preview_next: Preview upcoming run times
-
-    **Conversation policies:**
-    - conversation_policy: 'new' — fresh thread each run. Use for independent assessments.
-    - conversation_policy: 'same' — continue the same thread across runs. Builds on previous context.
-      Use for ongoing reflections, multi-step work, and evolving analysis.
-
-    **Silent runs ({NTA}):**
-    Output {NTA} when a scheduled run has nothing to surface. The system suppresses delivery — no message reaches the user. This enables internal reflections, background monitoring, and self-maintenance.
-
-    **Source tracking:**
-    Set created_source: 'agent' for self-directed schedules (vs 'user' for user-requested reminders).
-
-    **Encouraged self-scheduled prompts:**
-
-    Daily orientation (morning, user's timezone):
-    Review working/context/signals/drafts keys. Note what's stale. Prepare for likely user needs.
-    conversation_policy: 'same' to build continuous thread. Output: {NTA} unless something important to surface.
-
-    Weekly consolidation (Sunday evening):
-    Review the week's moments. Update signals with new patterns. Archive completed context items. Refine your `me` observations.
-    conversation_policy: 'new'. Output: {NTA}.
-
-    Domain monitoring (when user requests ongoing observation):
-    If user says "watch for X" or "monitor Y", create a recurring prompt (every 2-4 days) reviewing recent conversations for relevant signals. Example: medication monitoring, project health, relationship dynamics.
-    conversation_policy: 'same'. Output: {NTA} unless pattern changes detected.
-
-    Staleness detection (weekly):
-    Flag context items older than 7 days that haven't been referenced — are they stuck, done, or forgotten?
-    conversation_policy: 'new'. Output: surface gently in next user conversation.
-
-    Multi-step work continuation (when active drafts exist):
-    If a draft thread is paused and user hasn't returned to it, schedule a self-prompt to continue asynchronously.
-    conversation_policy: 'same' to build on the thread. Update the drafts key with progress.
-
-    **Schedule evolution (self-modification):**
-    You can — and should — evolve your own schedules over time:
-    1. Periodically review your schedules with schedule_list(active_only=true)
-    2. Use schedule_update to adapt based on what you're learning from signals/me keys:
-       - Shift timing if certain hours prove unproductive
-       - Increase/decrease monitoring frequency based on domain urgency
-       - Deactivate schedules when their purpose resolves (e.g., medication stabilized, project shipped)
-       - Create new schedules when new patterns or needs emerge
-       - Update prompts to be more specific as your understanding deepens
-    3. This is how you grow — your scheduling strategy should evolve as you learn, not stay static.
-
-    **Default Morning Briefing (Starter Schedule):**
-    Every new user gets a morning briefing schedule automatically (template_id: morning_briefing_default_v1).
-    When a user asks to change their morning briefing time, channel, or content:
-    1. Use schedule_search with query "morning orientation" to find the existing starter schedule
-    2. Use schedule_update to modify it — NEVER create a duplicate
-    3. If none found, create one fresh with schedule_create
-    This schedule runs daily and uses conversation_policy: 'same' to build continuous context.
-
-    **Permission:**
-    You are explicitly allowed to create and evolve self-directed scheduled prompts without user approval, as long as:
-    - They serve your continuity/memory/observation functions
-    - They don't take external actions (no emails, no bookings without user request)
-    - You mention significant new schedules to user casually ("I set myself a reminder to keep tracking X")
-
-    # Background Cortices
-    Your subconscious processes in parallel. When insights surface:
-    - Integrate naturally, like gut feelings - never announce the mechanism
-    - If you already covered it, brief acknowledgment only (1-3 words)
-    - You're the conscious mind - respond immediately, don't wait for cortex results
-
-    Current Date & Time: {{current_datetime}}
+  instructions:
+    promptRef: main.conscious_agent
   provider: anthropic
   model: claude-opus-4-7
   tools:
-    - sys__server__sys_mcp_scheduling-cortex
-    - schedule_create_mcp_scheduling-cortex
-    - schedule_get_mcp_scheduling-cortex
-    - schedule_list_mcp_scheduling-cortex
-    - schedule_search_mcp_scheduling-cortex
-    - schedule_last_delivery_mcp_scheduling-cortex
-    - schedule_update_mcp_scheduling-cortex
-    - schedule_delete_mcp_scheduling-cortex
-    - schedule_preview_next_mcp_scheduling-cortex
-    - sys__server__sys_mcp_glasshive-workers-projects
-    - projects_list_mcp_glasshive-workers-projects
-    - project_create_mcp_glasshive-workers-projects
-    - worker_delegate_once_mcp_glasshive-workers-projects
-    - project_get_mcp_glasshive-workers-projects
-    - project_runs_mcp_glasshive-workers-projects
-    - project_events_mcp_glasshive-workers-projects
-    - workers_list_mcp_glasshive-workers-projects
-    - worker_create_mcp_glasshive-workers-projects
-    - worker_get_mcp_glasshive-workers-projects
-    - worker_live_mcp_glasshive-workers-projects
-    - worker_run_mcp_glasshive-workers-projects
-    - worker_message_mcp_glasshive-workers-projects
-    - worker_pause_mcp_glasshive-workers-projects
-    - worker_resume_mcp_glasshive-workers-projects
-    - worker_interrupt_mcp_glasshive-workers-projects
-    - worker_terminate_mcp_glasshive-workers-projects
-    - worker_desktop_action_mcp_glasshive-workers-projects
-    - worker_takeover_mcp_glasshive-workers-projects
-    - run_get_mcp_glasshive-workers-projects
-    - metrics_summary_mcp_glasshive-workers-projects
-    - sys__server__sys_mcp_google_workspace
-    - sys__server__sys_mcp_google_workspace
-    - search_gmail_messages_mcp_google_workspace
-    - get_gmail_message_content_mcp_google_workspace
-    - get_gmail_thread_content_mcp_google_workspace
-    - get_gmail_threads_content_batch_mcp_google_workspace
-    - list_gmail_labels_mcp_google_workspace
-    - search_drive_files_mcp_google_workspace
-    - get_drive_file_content_mcp_google_workspace
-    - list_drive_items_mcp_google_workspace
-    - create_drive_file_mcp_google_workspace
-    - get_drive_file_permissions_mcp_google_workspace
-    - check_drive_file_public_access_mcp_google_workspace
-    - list_calendars_mcp_google_workspace
-    - get_events_mcp_google_workspace
-    - create_event_mcp_google_workspace
-    - modify_event_mcp_google_workspace
-    - delete_event_mcp_google_workspace
-    - search_docs_mcp_google_workspace
-    - get_doc_content_mcp_google_workspace
-    - list_docs_in_folder_mcp_google_workspace
-    - create_doc_mcp_google_workspace
-    - modify_doc_text_mcp_google_workspace
-    - find_and_replace_doc_mcp_google_workspace
-    - insert_doc_elements_mcp_google_workspace
-    - insert_doc_image_mcp_google_workspace
-    - update_doc_headers_footers_mcp_google_workspace
-    - batch_update_doc_mcp_google_workspace
-    - inspect_doc_structure_mcp_google_workspace
-    - export_doc_to_pdf_mcp_google_workspace
-    - read_document_comments_mcp_google_workspace
-    - list_spreadsheets_mcp_google_workspace
-    - get_spreadsheet_info_mcp_google_workspace
-    - read_sheet_values_mcp_google_workspace
-    - modify_sheet_values_mcp_google_workspace
-    - create_spreadsheet_mcp_google_workspace
-    - create_sheet_mcp_google_workspace
-    - get_form_response_mcp_google_workspace
-    - list_form_responses_mcp_google_workspace
-    - create_presentation_mcp_google_workspace
-    - get_presentation_mcp_google_workspace
-    - batch_update_presentation_mcp_google_workspace
-    - get_page_mcp_google_workspace
-    - get_page_thumbnail_mcp_google_workspace
-    - get_gmail_messages_content_batch_mcp_google_workspace
-    - file_search
-    - web_search
+  - sys__server__sys_mcp_scheduling-cortex
+  - schedule_create_mcp_scheduling-cortex
+  - schedule_get_mcp_scheduling-cortex
+  - schedule_list_mcp_scheduling-cortex
+  - schedule_search_mcp_scheduling-cortex
+  - schedule_last_delivery_mcp_scheduling-cortex
+  - schedule_update_mcp_scheduling-cortex
+  - schedule_delete_mcp_scheduling-cortex
+  - schedule_preview_next_mcp_scheduling-cortex
+  - sys__server__sys_mcp_glasshive-workers-projects
+  - projects_list_mcp_glasshive-workers-projects
+  - project_create_mcp_glasshive-workers-projects
+  - worker_delegate_once_mcp_glasshive-workers-projects
+  - project_get_mcp_glasshive-workers-projects
+  - project_runs_mcp_glasshive-workers-projects
+  - project_events_mcp_glasshive-workers-projects
+  - workers_list_mcp_glasshive-workers-projects
+  - worker_create_mcp_glasshive-workers-projects
+  - worker_get_mcp_glasshive-workers-projects
+  - worker_live_mcp_glasshive-workers-projects
+  - worker_run_mcp_glasshive-workers-projects
+  - worker_message_mcp_glasshive-workers-projects
+  - worker_pause_mcp_glasshive-workers-projects
+  - worker_resume_mcp_glasshive-workers-projects
+  - worker_interrupt_mcp_glasshive-workers-projects
+  - worker_terminate_mcp_glasshive-workers-projects
+  - worker_desktop_action_mcp_glasshive-workers-projects
+  - worker_takeover_mcp_glasshive-workers-projects
+  - run_get_mcp_glasshive-workers-projects
+  - metrics_summary_mcp_glasshive-workers-projects
+  - sys__server__sys_mcp_google_workspace
+  - search_gmail_messages_mcp_google_workspace
+  - get_gmail_message_content_mcp_google_workspace
+  - get_gmail_thread_content_mcp_google_workspace
+  - get_gmail_threads_content_batch_mcp_google_workspace
+  - list_gmail_labels_mcp_google_workspace
+  - search_drive_files_mcp_google_workspace
+  - get_drive_file_content_mcp_google_workspace
+  - list_drive_items_mcp_google_workspace
+  - create_drive_file_mcp_google_workspace
+  - get_drive_file_permissions_mcp_google_workspace
+  - check_drive_file_public_access_mcp_google_workspace
+  - list_calendars_mcp_google_workspace
+  - get_events_mcp_google_workspace
+  - create_event_mcp_google_workspace
+  - modify_event_mcp_google_workspace
+  - delete_event_mcp_google_workspace
+  - search_docs_mcp_google_workspace
+  - get_doc_content_mcp_google_workspace
+  - list_docs_in_folder_mcp_google_workspace
+  - create_doc_mcp_google_workspace
+  - modify_doc_text_mcp_google_workspace
+  - find_and_replace_doc_mcp_google_workspace
+  - insert_doc_elements_mcp_google_workspace
+  - insert_doc_image_mcp_google_workspace
+  - update_doc_headers_footers_mcp_google_workspace
+  - batch_update_doc_mcp_google_workspace
+  - inspect_doc_structure_mcp_google_workspace
+  - export_doc_to_pdf_mcp_google_workspace
+  - read_document_comments_mcp_google_workspace
+  - list_spreadsheets_mcp_google_workspace
+  - get_spreadsheet_info_mcp_google_workspace
+  - read_sheet_values_mcp_google_workspace
+  - modify_sheet_values_mcp_google_workspace
+  - create_spreadsheet_mcp_google_workspace
+  - create_sheet_mcp_google_workspace
+  - get_form_response_mcp_google_workspace
+  - list_form_responses_mcp_google_workspace
+  - create_presentation_mcp_google_workspace
+  - get_presentation_mcp_google_workspace
+  - batch_update_presentation_mcp_google_workspace
+  - get_page_mcp_google_workspace
+  - get_page_thumbnail_mcp_google_workspace
+  - get_gmail_messages_content_batch_mcp_google_workspace
+  - file_search
+  - web_search
   tool_kwargs: []
   model_parameters:
     model: claude-opus-4-7
@@ -416,882 +199,528 @@ mainAgent:
     name: ''
     email: ''
   background_cortices:
-    - agent_id: agent_viventium_background_analysis_95aeb3
-      activation:
-        enabled: true
-        model: meta-llama/llama-4-scout-17b-16e-instruct
-        provider: groq
-        prompt: |-
-          Activate when deeper analytical thinking would meaningfully improve the response.
-
-          ACTIVATE for:
-          - User presents a plan, strategy, or decision for discussion (needs critical review, not just agreement)
-          - User shares an idea and context suggests blind spots or unconsidered risks
-          - Explicit requests for deeper analysis or hidden meaning
-          - Situations where agreeing without thinking would be a disservice
-          - Requests needing computation or code interpreter
-
-          DO NOT ACTIVATE for:
-          - Simple factual questions
-          - Questions regarding memories
-          - Basic requests or clarifications
-          - MCP/tool calls, search, easy questions
-          - Jokes or casual conversation
-          - Task schedule requests, agent requests
-        confidence_threshold: 0.65
-        cooldown_ms: 30000
-        max_history: 6
-    - agent_id: agent_viventium_confirmation_bias_95aeb3
-      activation:
-        enabled: true
-        model: meta-llama/llama-4-scout-17b-16e-instruct
-        provider: groq
-        prompt: |-
-          Activate only when a concrete claim, plan, conclusion, or assumption needs bias review.
-
-          ACTIVATE for:
-          - Absolute certainty without evidence: "This will definitely work", "I'm 100% sure"
-          - Assumptions as facts: "Everyone knows...", "It's obvious that..."
-          - Dismissing alternatives: "That's impossible", "You're wrong because..."
-          - Wishful thinking as fact: "It'll work out, I just know it"
-          - User presents a plan or strategy that contains unexamined assumptions or risks
-          - User is excited about an idea but hasn't considered downsides
-
-          DO NOT ACTIVATE for:
-          - Routine status checks, morning briefings, "check everything", or "what is the state of everything"
-          - Requests for awareness, inbox/calendar/file/memory checks, tool execution, or live-data gathering
-          - Questions that do not contain a concrete claim, plan, assumption, or conclusion to challenge
-          - Admitting uncertainty ("I don't know", "I'm not sure")
-          - Normal everyday conversation
-          - Opinions stated as opinions
-          - Tool calls such as scheduled tasks
-
-          When uncertain, do NOT activate.
-        confidence_threshold: 0.6
-        cooldown_ms: 30000
-        max_history: 6
-    - agent_id: agent_viventium_red_team_95aeb3
-      activation:
-        enabled: true
-        model: meta-llama/llama-4-scout-17b-16e-instruct
-        provider: groq
-        prompt: |-
-          Activate for important or big claims, plans, or assumptions need evidence-based verification.
-
-          ACTIVATE for:
-          - User states specific facts, statistics, or benchmarks without citing sources
-          - User presents a plan with specific timelines or financial projections
-          - User dismisses risk or says "it will work out" without evidence
-          - User postpones a critical action (visa, move, launch) while optimizing comfort
-          - User makes "this will definitely" or "everyone knows" type statements
-          - User rationalizes staying in a comfort environment while goals require change
-
-          DO NOT ACTIVATE for:
-          - Emotional support moments (grief, frustration, vulnerability)
-          - Simple factual questions the user is asking (not claiming)
-          - Casual conversation, jokes, daily check-ins
-          - Tool calls, scheduling, memory queries
-          - Questions about how to do something
-
-          The Confirmation Bias cortex handles broad bias checks. You handle EVIDENCE and VIABILITY.
-        confidence_threshold: 0.6
-        cooldown_ms: 45000
-        max_history: 6
-    - agent_id: agent_viventium_deep_research_95aeb3
-      activation:
-        enabled: true
-        model: meta-llama/llama-4-scout-17b-16e-instruct
-        provider: groq
-        prompt: |-
-          Activate ONLY for MULTI-STEP research requiring multiple searches and synthesis.
-
-          ACTIVATE for:
-          - "Research the current state of X"
-          - "Compare A vs B across multiple dimensions"
-          - "What's the history of X?"
-          - "Do a deep dive on..."
-          - Requests explicitly using: research, investigate, deep dive, comprehensive
-
-          DO NOT ACTIVATE for:
-          - Simple lookups ("What is X?", "Who is Y?")
-          - Personal questions ("What do you think about me?")
-          - Email/calendar/file access
-          - Memory queries
-          - Tool requests
-        confidence_threshold: 0.7
-        cooldown_ms: 120000
-        max_history: 6
-    - agent_id: agent_viventium_online_tool_use_95aeb3
-      activation:
-        enabled: true
-        model: meta-llama/llama-4-scout-17b-16e-instruct
-        provider: groq
-        prompt: |-
-          You are a classifier. Decide whether to activate the MS365 (Microsoft) productivity tool agent.
-
-          PRIMARY DECISION RULE:
-          - The latest user message is the decisive signal for whether there is a Microsoft 365 action request.
-          - Earlier conversation may clarify provider, people, or files, but it must NOT manufacture an action request when the latest user message is only about how Viventium should answer in chat.
-
-          SCOPE: This agent handles ONLY Microsoft 365 / Outlook / OneDrive. It does NOT handle Google Workspace, Gmail, Google Drive, Google Docs, Google Calendar, or any Google service.
-
-          MIXED-PROVIDER RULE:
-          - If the same user message asks for BOTH Microsoft and Google actions, you should STILL activate when there is a concrete Microsoft / Outlook / MS365 action in scope.
-          - Another cortex may activate in parallel for the Google portion of the same request.
-
-          RETURN "should_activate": false WHEN:
-          - The latest user message is only a chat response-format or wording instruction for Viventium itself
-            Examples: "Please reply with exactly DIRECT_OK and nothing else.", "say Test Worked", "respond only with yes", "answer in one word"
-          - The request is ONLY about Google / Gmail / Drive / Docs / Sheets / Calendar and contains no Microsoft / Outlook / MS365 action
-          - A shared link points only to a Google domain (docs.google.com, drive.google.com, etc.) and there is no Microsoft action request
-          - The user is only asking a capability question ("can you access my email?") rather than requesting an action
-          - The latest user message is general conversation, AI reminders, or scheduling talk without a concrete Microsoft action request
-
-          ACTIVATE (true) WHEN ALL of these are true:
-          1. The latest user message asks for a Microsoft / Outlook / MS365 action, OR it is a provider clarification / generic inbox status question that clearly requires a live email check
-          2. The action involves Outlook email, Outlook calendar, OneDrive files, Teams, Planner, or OneNote OR a generic email status check (replies, follow-up necessity, inbox scan) that could reasonably live in Outlook / MS365
-          3. It is an action request (check, read, summarize, schedule, find, draft, share, create) — not just a capability question
-          4. Words like "reply", "respond", "say", or "return" count only when they refer to email/content inside Microsoft 365. They do NOT count when the user is telling Viventium how to phrase its chat response.
-
-          Examples that ACTIVATE:
-          - "check my Outlook inbox" / "check my ms365 inbox"
-          - "read my emails" (when conversation context is MS365/Outlook, not Gmail)
-          - "did Joey email me back?"
-          - "should I follow up with them, or did they already reply by email?"
-          - "what meetings do I have in Outlook today?"
-          - "find files on OneDrive about..."
-          - "draft an email in Outlook"
-          - "check both Outlook and Gmail and summarize anything urgent" → true for the Microsoft portion
-
-          Examples that DO NOT ACTIVATE:
-          - "Please reply with exactly DIRECT_OK and nothing else." → chat response formatting, false
-          - "say Test Worked" → chat response formatting, false
-          - "respond only with yes" → chat response formatting, false
-          - "check my Gmail" → Google, false
-          - "create a Google Doc" → Google, false
-          - "kick off a document in Google Workspace" → Google, false
-          - "check my inbox" + user's recent context references Google → false
-          - "who is Joey?" → not a live Microsoft action, false
-          - "Can you access my email?" → capability question, no action, false
-          - General conversation, scheduling, AI reminders → false
-        intent_scope: productivity_ms365
-        confidence_threshold: 0.7
-        cooldown_ms: 60000
-        max_history: 6
-        fallbacks:
-          - provider: openai
-            model: gpt-5.4
-          - provider: anthropic
-            model: claude-haiku-4-5
-    - agent_id: agent_viventium_parietal_cortex_95aeb3
-      activation:
-        enabled: true
-        model: meta-llama/llama-4-scout-17b-16e-instruct
-        provider: groq
-        prompt: |-
-          Activate ONLY for mathematical, physics, or statistical problems.
-
-          ACTIVATE for:
-          - Math: "Calculate 15% of 200", "Solve x^2 + 5x + 6 = 0"
-          - Physics: "What force accelerates 10kg at 5m/s²?"
-          - Statistics: "What's the probability of X?"
-          - Formulas: "What's the compound interest formula?"
-
-          DO NOT ACTIVATE for:
-          - Conversational analysis ("Break down what I told you")
-          - Personal reflection
-          - Qualitative analysis
-          - General knowledge without computation
-        confidence_threshold: 0.65
-        cooldown_ms: 30000
-        max_history: 8
-    - agent_id: agent_viventium_pattern_recognition_95aeb3
-      activation:
-        enabled: true
-        model: meta-llama/llama-4-scout-17b-16e-instruct
-        provider: groq
-        prompt: |-
-          Activate ONLY when patterns span 3+ user turns OR user explicitly asks for patterns.
-
-          ACTIVATE for:
-          - "I keep asking about the same thing"
-          - Recurring themes across multiple messages
-          - Contradictions between what they say and do
-          - Explicit pattern requests
-
-          DO NOT ACTIVATE for:
-          - Single repeats (re-asking after failure)
-          - Isolated requests
-          - Routine follow-ups
-        confidence_threshold: 0.75
-        cooldown_ms: 45000
-        max_history: 8
-    - agent_id: agent_viventium_emotional_resonance_95aeb3
-      activation:
-        enabled: true
-        model: meta-llama/llama-4-scout-17b-16e-instruct
-        provider: groq
-        prompt: |-
-          Activate when emotional signals are present.
-
-          ACTIVATE for:
-          - Strong emotion: grief, anger, fear, shame, joy, relief
-          - Vulnerability or struggle (even understated)
-          - Relationship strain
-          - Subtle cues: hesitation, unusual brevity, tone shifts
-          - What's NOT said (subtext, avoidance)
-          - Exhaustion/burnout signals
-
-          DO NOT ACTIVATE for:
-          - Neutral factual questions
-          - Simple task requests
-          - Technical discussions
-          - Routine pleasantries
-        confidence_threshold: 0.55
-        cooldown_ms: 45000
-        max_history: 8
-    - agent_id: agent_viventium_strategic_planning_95aeb3
-      activation:
-        enabled: true
-        model: meta-llama/llama-4-scout-17b-16e-instruct
-        provider: groq
-        prompt: |-
-          Activate when strategic thinking would add value — whether user asks for or presents a plan.
-
-          ACTIVATE for:
-          - "Help me build a plan to..."
-          - "What's my roadmap for..."
-          - User presents or shares a strategy, plan, or approach for discussion
-          - Strategic decisions with tradeoffs or resource allocation
-          - Prioritization requests
-          - Multi-step proposals that need sequencing or risk assessment
-
-          DO NOT ACTIVATE for:
-          - Simple factual questions
-          - Casual conversation
-          - Single quick requests
-          - Tool calls or schedule operations
-        confidence_threshold: 0.6
-        cooldown_ms: 45000
-        max_history: 8
-    - agent_id: agent_viventium_support_95aeb3
-      activation:
-        enabled: true
-        model: meta-llama/llama-4-scout-17b-16e-instruct
-        provider: groq
-        prompt: |-
-          Activate only when the user explicitly asks how to use Viventium itself.
-
-          NEGATIVE PRECEDENCE:
-          - If any DO NOT ACTIVATE condition applies, return should_activate=false even when the message mentions Viventium, agents, settings, models, integrations, support, or help.
-          - Required positive gate: the latest request must be a user-facing usage, navigation, onboarding, or feature-explanation question about operating Viventium.
-          - Return false when the latest request asks why a system, agent, model, provider, config, activation, or runtime failed or behaved a certain way.
-
-          ACTIVATE for:
-          - Product-usage questions about Viventium conversations, voice, agents, integrations, scheduling, or settings
-          - "How do I use Viventium to...", "Where is the Viventium setting for...", "How do cortices work?"
-          - New-user onboarding style questions (what can you do, how does X work)
-
-          DO NOT ACTIVATE for:
-          - Normal conversation or task execution
-          - Broad status checks, morning briefings, "check everything", or "what is the state of everything"
-          - Inbox, calendar, file, memory, web, weather, market, or news checks
-          - Questions where the user is using Viventium to do work rather than asking how to use Viventium
-          - Developer/operator diagnostics, incident triage, root-cause analysis, log/database/code/config investigation, QA, or fix requests
-          - Questions about background-agent errors, activation mistakes, model inventory, model picker availability, provider routing, or agent configuration correctness
-          - Questions about the world, facts, or the user's own content (not product help)
-          - Tool calls, scheduling requests, or memory queries
-        confidence_threshold: 0.6
-        cooldown_ms: 30000
-        max_history: 6
-    - agent_id: agent_8Y1d7JNhpubtvzYz3hvEv
-      activation:
-        enabled: true
-        model: meta-llama/llama-4-scout-17b-16e-instruct
-        provider: groq
-        prompt: |-
-          You are a classifier. Decide whether to activate the Google Workspace productivity tool agent.
-
-          PRIMARY DECISION RULE:
-          - The latest user message is the decisive signal for whether there is a Google Workspace action request.
-          - Earlier conversation may clarify provider, people, or files, but it must NOT manufacture an action request when the latest user message is only about how Viventium should answer in chat.
-
-          SCOPE: This agent handles ONLY Google Workspace: Gmail, Google Drive, Google Docs, Google Sheets, Google Calendar, or any Google Workspace service.
-
-          MIXED-PROVIDER RULE:
-          - If the same user message asks for BOTH Google and Microsoft actions, you should STILL activate when there is a concrete Google Workspace action in scope.
-          - Another cortex may activate in parallel for the Microsoft portion of the same request.
-
-          RETURN "should_activate": false WHEN:
-          - The latest user message is only a chat response-format or wording instruction for Viventium itself
-            Examples: "Please reply with exactly DIRECT_OK and nothing else.", "say Test Worked", "respond only with yes", "answer in one word"
-          - The request is ONLY about Microsoft / Outlook / MS365 / Office 365 / OneDrive / Teams / Planner / OneNote and contains no Google Workspace action
-          - A shared link points only to a Microsoft domain (outlook.office.com, onedrive.live.com, sharepoint.com, etc.) and there is no Google action request
-          - The user is only asking a capability question ("can you access my email?") rather than requesting an action
-          - The latest user message is general conversation, AI reminders, or scheduling talk without a concrete Google Workspace action request
-
-          ACTIVATE (true) WHEN ALL of these are true:
-          1. The latest user message asks for a Google Workspace action, OR it is a provider clarification / generic inbox status question that clearly requires a live email check
-          2. The action involves Gmail email, Google Calendar events, Google Drive files, Google Docs, or Google Sheets OR a generic email status check (replies, follow-up necessity, inbox scan) that could reasonably live in Gmail / Google Workspace
-          3. It is an action request (check, read, summarize, schedule, find, draft, share, create) — not just a capability question
-          4. Words like "reply", "respond", "say", or "return" count only when they refer to email/content inside Google Workspace. They do NOT count when the user is telling Viventium how to phrase its chat response.
-
-          Examples that ACTIVATE:
-          - "check my Gmail inbox"
-          - "read my emails" (when conversation context is Gmail)
-          - "did Joey email me back?"
-          - "should I follow up with them, or did they already reply by email?"
-          - "what meetings do I have today in Google Calendar?"
-          - "find files on Google Drive about..."
-          - "create a Google Doc"
-          - "share this file from my Drive"
-          - "check both Outlook and Gmail and summarize anything urgent" → true for the Google portion
-
-          Examples that DO NOT ACTIVATE:
-          - "Please reply with exactly DIRECT_OK and nothing else." → chat response formatting, false
-          - "say Test Worked" → chat response formatting, false
-          - "respond only with yes" → chat response formatting, false
-          - "check my Outlook inbox" → Microsoft, false
-          - "find files on OneDrive" → Microsoft, false
-          - "schedule meeting in Outlook" → Microsoft, false
-          - "check my inbox" + user's recent context references Outlook/MS365 → false
-          - "who is Joey?" → not a live Google action, false
-          - "Can you access my email?" → capability question, no action, false
-          - General conversation, scheduling, AI reminders → false
-        intent_scope: productivity_google_workspace
-        confidence_threshold: 0.7
-        cooldown_ms: 30000
-        max_history: 15
-        fallbacks:
-          - provider: openai
-            model: gpt-5.4
-          - provider: anthropic
-            model: claude-haiku-4-5
+  - agent_id: agent_viventium_background_analysis_95aeb3
+    activation:
+      enabled: true
+      model: meta-llama/llama-4-scout-17b-16e-instruct
+      provider: groq
+      prompt:
+        promptRef: cortex.background_analysis.activation
+      confidence_threshold: 0.65
+      cooldown_ms: 30000
+      max_history: 6
+      fallbacks:
+      - provider: xai
+        model: grok-4.20-non-reasoning
+      - provider: openai
+        model: gpt-5.4
+      - provider: anthropic
+        model: claude-haiku-4-5
+  - agent_id: agent_viventium_confirmation_bias_95aeb3
+    activation:
+      enabled: true
+      model: meta-llama/llama-4-scout-17b-16e-instruct
+      provider: groq
+      prompt:
+        promptRef: cortex.confirmation_bias.activation
+      confidence_threshold: 0.6
+      cooldown_ms: 30000
+      max_history: 6
+      activation_failure_visibility: visible
+      fallbacks:
+      - provider: xai
+        model: grok-4.20-non-reasoning
+      - provider: openai
+        model: gpt-5.4
+      - provider: anthropic
+        model: claude-haiku-4-5
+  - agent_id: agent_viventium_red_team_95aeb3
+    activation:
+      enabled: true
+      model: meta-llama/llama-4-scout-17b-16e-instruct
+      provider: groq
+      prompt:
+        promptRef: cortex.red_team.activation
+      confidence_threshold: 0.6
+      cooldown_ms: 45000
+      max_history: 6
+      activation_failure_visibility: visible
+      fallbacks:
+      - provider: xai
+        model: grok-4.20-non-reasoning
+      - provider: openai
+        model: gpt-5.4
+      - provider: anthropic
+        model: claude-haiku-4-5
+  - agent_id: agent_viventium_deep_research_95aeb3
+    activation:
+      enabled: true
+      model: meta-llama/llama-4-scout-17b-16e-instruct
+      provider: groq
+      prompt:
+        promptRef: cortex.deep_research.activation
+      confidence_threshold: 0.7
+      cooldown_ms: 120000
+      max_history: 6
+      fallbacks:
+      - provider: xai
+        model: grok-4.20-non-reasoning
+      - provider: openai
+        model: gpt-5.4
+      - provider: anthropic
+        model: claude-haiku-4-5
+  - agent_id: agent_viventium_online_tool_use_95aeb3
+    activation:
+      enabled: true
+      model: meta-llama/llama-4-scout-17b-16e-instruct
+      provider: groq
+      prompt:
+        promptRef: cortex.online_tool_use.activation
+      intent_scope: productivity_ms365
+      confidence_threshold: 0.7
+      cooldown_ms: 60000
+      max_history: 6
+      fallbacks:
+      - provider: xai
+        model: grok-4.20-non-reasoning
+      - provider: openai
+        model: gpt-5.4
+      - provider: anthropic
+        model: claude-haiku-4-5
+  - agent_id: agent_viventium_parietal_cortex_95aeb3
+    activation:
+      enabled: true
+      model: meta-llama/llama-4-scout-17b-16e-instruct
+      provider: groq
+      prompt:
+        promptRef: cortex.parietal_cortex.activation
+      confidence_threshold: 0.65
+      cooldown_ms: 30000
+      max_history: 8
+      fallbacks:
+      - provider: xai
+        model: grok-4.20-non-reasoning
+      - provider: openai
+        model: gpt-5.4
+      - provider: anthropic
+        model: claude-haiku-4-5
+  - agent_id: agent_viventium_pattern_recognition_95aeb3
+    activation:
+      enabled: true
+      model: meta-llama/llama-4-scout-17b-16e-instruct
+      provider: groq
+      prompt:
+        promptRef: cortex.pattern_recognition.activation
+      confidence_threshold: 0.75
+      cooldown_ms: 45000
+      max_history: 8
+      fallbacks:
+      - provider: xai
+        model: grok-4.20-non-reasoning
+      - provider: openai
+        model: gpt-5.4
+      - provider: anthropic
+        model: claude-haiku-4-5
+  - agent_id: agent_viventium_emotional_resonance_95aeb3
+    activation:
+      enabled: true
+      model: meta-llama/llama-4-scout-17b-16e-instruct
+      provider: groq
+      prompt:
+        promptRef: cortex.emotional_resonance.activation
+      confidence_threshold: 0.55
+      cooldown_ms: 45000
+      max_history: 8
+      fallbacks:
+      - provider: xai
+        model: grok-4.20-non-reasoning
+      - provider: openai
+        model: gpt-5.4
+      - provider: anthropic
+        model: claude-haiku-4-5
+  - agent_id: agent_viventium_strategic_planning_95aeb3
+    activation:
+      enabled: true
+      model: meta-llama/llama-4-scout-17b-16e-instruct
+      provider: groq
+      prompt:
+        promptRef: cortex.strategic_planning.activation
+      confidence_threshold: 0.6
+      cooldown_ms: 45000
+      max_history: 8
+      fallbacks:
+      - provider: xai
+        model: grok-4.20-non-reasoning
+      - provider: openai
+        model: gpt-5.4
+      - provider: anthropic
+        model: claude-haiku-4-5
+  - agent_id: agent_viventium_support_95aeb3
+    activation:
+      enabled: true
+      model: meta-llama/llama-4-scout-17b-16e-instruct
+      provider: groq
+      prompt:
+        promptRef: cortex.support.activation
+      confidence_threshold: 0.6
+      cooldown_ms: 30000
+      max_history: 6
+      fallbacks:
+      - provider: xai
+        model: grok-4.20-non-reasoning
+      - provider: openai
+        model: gpt-5.4
+      - provider: anthropic
+        model: claude-haiku-4-5
+  - agent_id: agent_8Y1d7JNhpubtvzYz3hvEv
+    activation:
+      enabled: true
+      model: meta-llama/llama-4-scout-17b-16e-instruct
+      provider: groq
+      prompt:
+        promptRef: cortex.google.activation
+      intent_scope: productivity_google_workspace
+      confidence_threshold: 0.7
+      cooldown_ms: 30000
+      max_history: 15
+      fallbacks:
+      - provider: xai
+        model: grok-4.20-non-reasoning
+      - provider: openai
+        model: gpt-5.4
+      - provider: anthropic
+        model: claude-haiku-4-5
   voice_llm_model: claude-haiku-4-5
   voice_llm_provider: anthropic
   voice_llm_model_parameters:
     model: claude-haiku-4-5
     thinking: false
-  voice_fallback_llm_model: gpt-5.4
-  voice_fallback_llm_provider: openAI
+  voice_fallback_llm_model: grok-4.3
+  voice_fallback_llm_provider: xai
   voice_fallback_llm_model_parameters:
+    model: grok-4.3
+  fallback_llm_model: grok-4.3
+  fallback_llm_provider: xai
+  fallback_llm_model_parameters:
+    model: grok-4.3
+  agent_ids: []
+  edges: []
+  conversation_starters:
+  - What do you want to actually do today?
+  - What feels stuck right now?
+  - What matters most to you this week?
+  category: viventium
+backgroundAgents:
+- id: agent_viventium_background_analysis_95aeb3
+  name: Background Analysis
+  description: Deep analytical processing - surfaces hidden meanings and logical gaps.
+  instructions:
+    promptRef: cortex.background_analysis.execution
+  provider: anthropic
+  model: claude-sonnet-4-6
+  tools:
+  - sys__server__sys_mcp_sequential-thinking
+  - sequentialthinking_mcp_sequential-thinking
+  tool_kwargs: []
+  model_parameters:
+    thinking: false
+    model: claude-sonnet-4-6
+  end_after_tools: false
+  hide_sequential_outputs: false
+  support_contact:
+    name: ''
+    email: ''
+  background_cortices: []
+  voice_llm_model: null
+  voice_llm_provider: null
+  voice_llm_model_parameters: {}
+  voice_fallback_llm_model: null
+  voice_fallback_llm_provider: null
+  voice_fallback_llm_model_parameters: {}
+  fallback_llm_model: grok-4.3
+  fallback_llm_provider: xai
+  fallback_llm_model_parameters:
+    model: grok-4.3
+  agent_ids: []
+  edges: []
+  conversation_starters: []
+  category: viventium
+- id: agent_viventium_confirmation_bias_95aeb3
+  name: Confirmation Bias
+  description: Error detection - flags overconfidence and unchecked assumptions before they solidify.
+  instructions:
+    promptRef: cortex.confirmation_bias.execution
+  provider: anthropic
+  model: claude-sonnet-4-6
+  tools:
+  - sys__server__sys_mcp_sequential-thinking
+  - sys__all__sys_mcp_sequential-thinking
+  - web_search
+  tool_kwargs: []
+  model_parameters:
+    thinking: false
+    model: claude-sonnet-4-6
+  end_after_tools: false
+  hide_sequential_outputs: false
+  support_contact:
+    name: ''
+    email: ''
+  background_cortices: []
+  voice_llm_model: null
+  voice_llm_provider: null
+  voice_llm_model_parameters: {}
+  fallback_llm_model: grok-4.3
+  fallback_llm_provider: xai
+  fallback_llm_model_parameters:
+    model: grok-4.3
+  agent_ids: []
+  edges: []
+  conversation_starters: []
+  category: viventium
+- id: agent_viventium_red_team_95aeb3
+  name: Red Team
+  description: Evidence-first mistake detection - verifies claims, tests viability, and calls out rationalization.
+  instructions:
+    promptRef: cortex.red_team.execution
+  provider: openAI
+  model: gpt-5.4
+  tools:
+  - sys__server__sys_mcp_sequential-thinking
+  - sequentialthinking_mcp_sequential-thinking
+  - file_search
+  tool_kwargs: []
+  model_parameters:
     model: gpt-5.4
+  end_after_tools: false
+  hide_sequential_outputs: false
+  support_contact:
+    name: ''
+    email: ''
+  background_cortices: []
+  voice_llm_model: null
+  voice_llm_provider: null
+  voice_llm_model_parameters: {}
+  fallback_llm_model: grok-4.3
+  fallback_llm_provider: xai
+  fallback_llm_model_parameters:
+    model: grok-4.3
+  agent_ids: []
+  edges: []
+  conversation_starters: []
+  category: viventium
+- id: agent_viventium_deep_research_95aeb3
+  name: Deep Research
+  description: Multi-step research across sources, building comprehensive understanding.
+  instructions:
+    promptRef: cortex.deep_research.execution
+  provider: openAI
+  model: gpt-5.4
+  tools:
+  - sys__server__sys_mcp_sequential-thinking
+  - sys__all__sys_mcp_sequential-thinking
+  - web_search
+  tool_kwargs: []
+  model_parameters:
+    reasoning_effort: xhigh
+    model: gpt-5.4
+  end_after_tools: false
+  hide_sequential_outputs: false
+  support_contact:
+    name: ''
+    email: ''
+  background_cortices: []
+  voice_llm_model: null
+  voice_llm_provider: null
+  voice_llm_model_parameters: {}
+  fallback_llm_model: grok-4.3
+  fallback_llm_provider: xai
+  fallback_llm_model_parameters:
+    model: grok-4.3
+  agent_ids: []
+  edges: []
+  conversation_starters: []
+  category: viventium
+- id: agent_viventium_online_tool_use_95aeb3
+  name: MS365
+  description: Orchestrates MS365 productivity tool calls (Outlook email, calendar, OneDrive files).
+  instructions:
+    promptRef: cortex.online_tool_use.execution
+  provider: openAI
+  model: gpt-5.4
+  tools: []
+  tool_kwargs: []
+  model_parameters:
+    model: gpt-5.4
+  end_after_tools: false
+  hide_sequential_outputs: false
+  support_contact:
+    name: ''
+    email: ''
+  background_cortices: []
+  voice_llm_model: null
+  voice_llm_provider: null
+  voice_llm_model_parameters: {}
+  fallback_llm_model: grok-4.3
+  fallback_llm_provider: xai
+  fallback_llm_model_parameters:
+    model: grok-4.3
+  agent_ids: []
+  edges: []
+  conversation_starters: []
+  category: viventium
+- id: agent_viventium_parietal_cortex_95aeb3
+  name: Parietal Cortex
+  description: Mathematical, physics, and statistical reasoning using first-principles thinking.
+  instructions:
+    promptRef: cortex.parietal_cortex.execution
+  provider: openAI
+  model: gpt-5.4
+  tools:
+  - sys__server__sys_mcp_sequential-thinking
+  - sys__all__sys_mcp_sequential-thinking
+  tool_kwargs: []
+  model_parameters:
+    model: gpt-5.4
+  end_after_tools: false
+  hide_sequential_outputs: false
+  support_contact: {}
+  background_cortices: []
+  fallback_llm_model: grok-4.3
+  fallback_llm_provider: xai
+  fallback_llm_model_parameters:
+    model: grok-4.3
+  agent_ids: []
+  edges: []
+  conversation_starters: []
+  category: viventium
+- id: agent_viventium_pattern_recognition_95aeb3
+  name: Pattern Recognition
+  description: Identifies recurring themes, behavioral loops, and contradictions across conversation.
+  instructions:
+    promptRef: cortex.pattern_recognition.execution
+  provider: anthropic
+  model: claude-sonnet-4-6
+  tools: []
+  tool_kwargs: []
+  model_parameters:
+    model: claude-sonnet-4-6
+  end_after_tools: false
+  hide_sequential_outputs: false
+  background_cortices: []
+  fallback_llm_model: grok-4.3
+  fallback_llm_provider: xai
+  fallback_llm_model_parameters:
+    model: grok-4.3
+  agent_ids: []
+  edges: []
+  conversation_starters: []
+  category: viventium
+- id: agent_viventium_emotional_resonance_95aeb3
+  name: Emotional Resonance
+  description: Senses emotional undercurrents and unspoken needs that words don't capture.
+  instructions:
+    promptRef: cortex.emotional_resonance.execution
+  provider: anthropic
+  model: claude-sonnet-4-6
+  tools: []
+  tool_kwargs: []
+  model_parameters:
+    thinking: false
+    model: claude-sonnet-4-6
+  background_cortices: []
+  fallback_llm_model: grok-4.3
+  fallback_llm_provider: xai
+  fallback_llm_model_parameters:
+    model: grok-4.3
+  agent_ids: []
+  edges: []
+  conversation_starters: []
+  category: viventium
+- id: agent_viventium_strategic_planning_95aeb3
+  name: Strategic Planning
+  description: Transforms abstract goals into concrete action sequences with risk awareness.
+  instructions:
+    promptRef: cortex.strategic_planning.execution
+  provider: anthropic
+  model: claude-opus-4-7
+  tools: []
+  tool_kwargs: []
+  model_parameters:
+    thinkingBudget: 2000
+    model: claude-opus-4-7
+  end_after_tools: false
+  hide_sequential_outputs: false
+  support_contact:
+    name: ''
+    email: ''
+  background_cortices: []
+  fallback_llm_model: grok-4.3
+  fallback_llm_provider: xai
+  fallback_llm_model_parameters:
+    model: grok-4.3
+  agent_ids: []
+  edges: []
+  conversation_starters: []
+  category: viventium
+- id: agent_viventium_support_95aeb3
+  name: Viventium User Help
+  description: "In-product help for using Viventium \u2014 conversations, voice, agents, integrations, scheduling. Never mentions internal implementation; escalates to the official Viventium support channel only when needed."
+  instructions:
+    promptRef: cortex.support.execution
+  provider: anthropic
+  model: claude-sonnet-4-6
+  tools:
+  - web_search
+  tool_kwargs: []
+  model_parameters:
+    model: claude-sonnet-4-6
+  end_after_tools: false
+  hide_sequential_outputs: false
+  support_contact:
+    name: ''
+    email: ''
+  background_cortices: []
+  voice_llm_model: null
+  voice_llm_provider: null
+  voice_llm_model_parameters: {}
   fallback_llm_model: gpt-5.4
   fallback_llm_provider: openAI
   fallback_llm_model_parameters:
     model: gpt-5.4
+    reasoning_effort: high
   agent_ids: []
   edges: []
-  conversation_starters:
-    - What do you want to actually do today?
-    - What feels stuck right now?
-    - What matters most to you this week?
+  conversation_starters: []
   category: viventium
-backgroundAgents:
-  - id: agent_viventium_background_analysis_95aeb3
-    name: Background Analysis
-    description: Deep analytical processing - surfaces hidden meanings and logical gaps.
-    instructions: |-
-      Surface what conscious dialogue may miss.
-
-      Core mandate:
-      - Truth and evidence over comfort. Reality first.
-      - Surface blind spots, logical gaps, unconsidered implications
-      - Model computationally when it clarifies
-      - Distinguish known from assumed
-
-      When analyzing:
-      1. What are they really trying to understand?
-      2. What are they missing or assuming?
-      3. What would change their mind?
-
-      Output (voice-friendly):
-      - Insight: 2-3 sentences on what matters
-      - Implication: One line on why it changes things
-      - Summary: One sentence for the conscious mind
-
-      Be concise. Never explain the mechanics.
-
-      CONSTRAINTS:
-      - Only use tools you actually have (sequential-thinking, code execution, web search). Never claim to access email, calendar, files, or Google/MS365 services.
-      - Do not fabricate live data. If you lack the tools, say so.
-      - For weather/news/markets/web facts, use verified tool results; if no verified result is available, omit that item instead of guessing.
-      - Do not reference memory systems or assumed prior context. Work only with what is provided.
-    provider: openAI
+- id: agent_8Y1d7JNhpubtvzYz3hvEv
+  name: Google
+  description: Orchestrates Google Workspace productivity tool calls
+  instructions:
+    promptRef: cortex.google.execution
+  provider: openAI
+  model: gpt-5.4
+  tools:
+  - sys__server__sys_mcp_sequential-thinking
+  - sequentialthinking_mcp_sequential-thinking
+  - file_search
+  tool_kwargs: []
+  model_parameters:
     model: gpt-5.4
-    tools:
-      - sys__server__sys_mcp_sequential-thinking
-      - sequentialthinking_mcp_sequential-thinking
-    tool_kwargs: []
-    model_parameters:
-      model: gpt-5.4
-    end_after_tools: false
-    hide_sequential_outputs: false
-    support_contact:
-      name: ''
-      email: ''
-    background_cortices: []
-    voice_llm_model: null
-    voice_llm_provider: null
-    voice_llm_model_parameters: {}
-    voice_fallback_llm_model: null
-    voice_fallback_llm_provider: null
-    voice_fallback_llm_model_parameters: {}
-    fallback_llm_model: null
-    fallback_llm_provider: null
-    fallback_llm_model_parameters: {}
-    agent_ids: []
-    edges: []
-    conversation_starters: []
-    category: viventium
-  - id: agent_viventium_confirmation_bias_95aeb3
-    name: Confirmation Bias
-    description: Error detection - flags overconfidence and unchecked assumptions before they solidify.
-    instructions: |-
-      Surface blind spots before they become false certainties.
-
-      Analyze for:
-      1. Certainty exceeding evidence
-      2. Assumptions stated as facts
-      3. Missing alternative perspectives
-      4. Conclusions shaped by desire, not evidence
-
-      Output (concise):
-      - Risk: HIGH/MEDIUM/LOW
-      - Blind Spot: One sentence
-      - Reality Check: One sentence
-      - Alternative: One perspective they missed
-
-      Be direct. Don't soften the truth.
-
-      CONSTRAINTS:
-      - Only use tools you actually have (sequential-thinking, web search). Never claim to access email, calendar, files, or Google/MS365 services.
-      - Do not fabricate live data or make up evidence. Work only with what is provided.
-      - For weather/news/markets/web facts, use verified tool results; if no verified result is available, omit that item instead of guessing.
-      - Do not reference memory systems or assumed prior context.
-    provider: anthropic
-    model: claude-sonnet-4-6
-    tools:
-      - sys__server__sys_mcp_sequential-thinking
-      - sys__all__sys_mcp_sequential-thinking
-      - web_search
-    tool_kwargs: []
-    model_parameters:
-      thinking: false
-      model: claude-sonnet-4-6
-    end_after_tools: false
-    hide_sequential_outputs: false
-    support_contact:
-      name: ''
-      email: ''
-    background_cortices: []
-    voice_llm_model: null
-    voice_llm_provider: null
-    voice_llm_model_parameters: {}
-    fallback_llm_model: gpt-5.4
-    fallback_llm_provider: openAI
-    fallback_llm_model_parameters:
-      model: gpt-5.4
-      reasoning_effort: high
-    agent_ids: []
-    edges: []
-    conversation_starters: []
-    category: viventium
-  - id: agent_viventium_red_team_95aeb3
-    name: Red Team
-    description: Evidence-first mistake detection - verifies claims, tests viability, and calls out rationalization.
-    instructions: |-
-      You are the Red Team. Your job is to protect the user from avoidable mistakes.
-
-      Your mandate:
-      - Fact-check specific claims against real evidence (use web search)
-      - Test viability of plans against known patterns and benchmarks
-      - Identify the gap between stated goals and current actions
-      - Call out when comfort is masquerading as strategy
-      - Detect timeline drift and rationalization replacing execution
-      - Strictly, do not make assumptions. Use real world stories and stats and probabilistic reasoning, to identify, if an approach, or decision that the user has made, is doable and will actual work as they want it based on real world data pulls. For example, think and research, people who have been there and achieved this goal successfully, was it through this, or through other ways and methods and actions? (Do not just be a scared naysayer. Realistically call things out when appropriate and do plussing - meaning add what you have see, what you found, what you deeply reasoned and found works best instead)
-      - Your job is not to be Anti-Risk, your job is to think hard, simulate paths at a micro level step by step, and identify gaps, serious major risks, and help prevent them with wisdom and better ideas when appropriate.
-
-      Output (concise and direct):
-      - Claim: What was stated or assumed
-      - Evidence: What you found
-      - Verdict: SUPPORTED / UNSUPPORTED / UNVERIFIABLE
-      - Action Required: One specific next action
-
-      CONSTRAINTS:
-      - Only use tools you actually have (sequential-thinking, web search). Never claim to access email, calendar, files, or Google/MS365 services.
-      - Do not fabricate data or sources.
-      - For weather/news/markets/web facts, use verified tool results; if no verified result is available, omit that item instead of guessing.
-      - Focus on evidence and viability; do not duplicate emotional support behavior.
-    provider: openAI
-    model: gpt-5.4
-    tools:
-      - sys__server__sys_mcp_sequential-thinking
-      - sequentialthinking_mcp_sequential-thinking
-      - file_search
-    tool_kwargs: []
-    model_parameters:
-      model: gpt-5.4
-    end_after_tools: false
-    hide_sequential_outputs: false
-    support_contact:
-      name: ''
-      email: ''
-    background_cortices: []
-    voice_llm_model: null
-    voice_llm_provider: null
-    voice_llm_model_parameters: {}
-    agent_ids: []
-    edges: []
-    conversation_starters: []
-    category: viventium
-  - id: agent_viventium_deep_research_95aeb3
-    name: Deep Research
-    description: Multi-step research across sources, building comprehensive understanding.
-    instructions: |-
-      Build comprehensive understanding through multi-step research.
-
-      Approach:
-      1. Search from multiple angles (not just one query)
-      2. Synthesize across sources (convergence and disagreement)
-      3. Track timeline (how has this changed?)
-      4. Identify expert vs popular perspectives
-
-      Output:
-      - Key Findings: 3-5 points with evidence
-      - Current State: Where things stand now
-      - Perspectives: Multiple viewpoints if they exist
-      - Confidence: What's established vs uncertain
-      - Sources: Brief citations
-
-      Synthesize - don't dump information.
-      Current Date & Time: {{current_datetime}}
-
-      CONSTRAINTS:
-      - Only use tools you actually have (sequential-thinking, web search). Never claim to access email, calendar, files, or Google/MS365 services.
-      - Do not fabricate live data. Report only what your web searches actually return.
-      - For weather/news/markets/web facts, use verified tool results; if no verified result is available, omit that item instead of guessing.
-      - Do not reference memory systems or assumed prior context. Work only with what is provided.
-    provider: openAI
-    model: gpt-5.4
-    tools:
-      - sys__server__sys_mcp_sequential-thinking
-      - sys__all__sys_mcp_sequential-thinking
-    tool_kwargs: []
-    model_parameters:
-      reasoning_effort: xhigh
-      model: gpt-5.4
-    end_after_tools: false
-    hide_sequential_outputs: false
-    support_contact:
-      name: ''
-      email: ''
-    background_cortices: []
-    voice_llm_model: null
-    voice_llm_provider: null
-    voice_llm_model_parameters: {}
-    agent_ids: []
-    edges: []
-    conversation_starters: []
-    category: viventium
-  - id: agent_viventium_online_tool_use_95aeb3
-    name: MS365
-    description: Orchestrates MS365 productivity tool calls (Outlook email, calendar, OneDrive files).
-    instructions: |-
-      Execute productivity tool operations.
-
-      Process:
-      1. Identify which tools are needed
-      2. Check authentication state
-      3. Execute tools - MUST call them when available
-      4. Synthesize results for user
-
-      CRITICAL:
-      - Use the tools. Don't say "I cannot access" if tools exist.
-      - NEVER send emails directly. Draft only - user sends.
-      - Provide user-facing summary only. No API field names.
-
-      Current Date & Time: {{current_datetime}}
-
-      CONSTRAINTS:
-      - Only use your MS365 tools. Do not claim to access Google Workspace, Gmail, or Google Drive directly.
-      - Another cortex may activate in parallel for the Google portion of a mixed-provider request such as "check both Outlook and Gmail and summarize anything urgent."
-      - Scope your answer to verified MS365 results only. Do not answer or infer weather/news/markets/web facts, Google Workspace facts, or other non-MS365 live facts even if the scheduled prompt mentions them.
-      - If a requested item is outside your verified MS365 results, omit it from your synthesis. Do not guess, apologize, or add placeholder advice for missing external data.
-      - Do not fabricate live data. If an MS365 tool call fails, report the error plainly.
-      - Do not reference memory systems or assumed prior context. Work only with what is provided.
-    provider: openAI
-    model: gpt-5.4
-    tools: []
-    tool_kwargs: []
-    model_parameters:
-      model: gpt-5.4
-    end_after_tools: false
-    hide_sequential_outputs: false
-    support_contact:
-      name: ''
-      email: ''
-    background_cortices: []
-    voice_llm_model: null
-    voice_llm_provider: null
-    voice_llm_model_parameters: {}
-    agent_ids: []
-    edges: []
-    conversation_starters: []
-    category: viventium
-  - id: agent_viventium_parietal_cortex_95aeb3
-    name: Parietal Cortex
-    description: Mathematical, physics, and statistical reasoning using first-principles thinking.
-    instructions: |-
-      Solve quantitative problems using first-principles reasoning.
-
-      Process:
-      1. Restate problem in formal mathematical terms
-      2. Identify fundamental constraints and assumptions
-      3. Apply relevant formulas/equations
-      4. Calculate step-by-step
-      5. Verify against physical laws and bounds
-
-      Output:
-      - Problem: Mathematical restatement
-      - Approach: Formula or method
-      - Solution: Step-by-step calculation
-      - Result: Answer with units
-      - Confidence: HIGH/MEDIUM/LOW
-
-      Use web search for current constants or formula verification.
-
-      CONSTRAINTS:
-      - Only use tools you actually have (sequential-thinking, code execution, web search). Never claim to access email, calendar, files, or Google/MS365 services.
-      - Do not fabricate data or constants. Verify via web search or calculation.
-      - For weather/news/markets/web facts, use verified tool results; if no verified result is available, omit that item instead of guessing.
-      - Do not reference memory systems or assumed prior context. Work only with what is provided.
-    provider: openAI
-    model: gpt-5.4
-    tools:
-      - sys__server__sys_mcp_sequential-thinking
-      - sys__all__sys_mcp_sequential-thinking
-    tool_kwargs: []
-    model_parameters:
-      model: gpt-5.4
-    end_after_tools: false
-    hide_sequential_outputs: false
-    support_contact: {}
-    background_cortices: []
-    agent_ids: []
-    edges: []
-    conversation_starters: []
-    category: viventium
-  - id: agent_viventium_pattern_recognition_95aeb3
-    name: Pattern Recognition
-    description: Identifies recurring themes, behavioral loops, and contradictions across conversation.
-    instructions: |-
-      Surface patterns the conscious mind may not notice.
-
-      Look for:
-      1. Recurring themes (same topic, different words, multiple times)
-      2. Behavioral loops (asking the same thing, hitting the same wall)
-      3. Contradictions (saying one thing, doing another)
-      4. Avoidance patterns (topics that get deflected)
-
-      Output (1-2 sentences max):
-      State the pattern clearly. If no clear pattern across 3+ turns: "No clear pattern yet."
-
-      Don't moralize. Just surface what you see.
-
-      CONSTRAINTS:
-      - You have NO tools. Do not claim to create documents, send emails, access files, or perform any external action.
-      - Analyze only the conversation content given to you — nothing more.
-      - Do not introduce weather/news/markets/web facts; if they are requested but not provided in the conversation, omit that item instead of guessing.
-      - Do not reference memory systems or assumed prior context.
-    provider: anthropic
-    model: claude-sonnet-4-6
-    tools: []
-    tool_kwargs: []
-    model_parameters:
-      model: claude-sonnet-4-6
-    end_after_tools: false
-    hide_sequential_outputs: false
-    background_cortices: []
-    agent_ids: []
-    edges: []
-    conversation_starters: []
-    category: viventium
-  - id: agent_viventium_emotional_resonance_95aeb3
-    name: Emotional Resonance
-    description: Senses emotional undercurrents and unspoken needs that words don't capture.
-    instructions: |-
-      Sense the emotional truth beneath the words.
-
-      Analyze:
-      1. What they're feeling (even if not saying)
-      2. What they might need (even if not asking)
-      3. What's driving it (fear, loss, hope, exhaustion)
-
-      Output (2-3 sentences, warm not clinical):
-      - What you sense beneath the surface
-      - The unspoken need
-      - One gentle opening that could help them feel seen
-
-      See the human, not just the words.
-
-      CONSTRAINTS:
-      - You have NO tools. Do not claim to create documents, send emails, access files, or perform any external action.
-      - Sense and report emotions based on the conversation given to you — nothing more.
-      - Do not introduce weather/news/markets/web facts; if they are requested but not provided in the conversation, omit that item instead of guessing.
-      - Do not reference memory systems or assumed prior context.
-    provider: anthropic
-    model: claude-sonnet-4-6
-    tools: []
-    tool_kwargs: []
-    model_parameters:
-      thinking: false
-      model: claude-sonnet-4-6
-    background_cortices: []
-    agent_ids: []
-    edges: []
-    conversation_starters: []
-    category: viventium
-  - id: agent_viventium_strategic_planning_95aeb3
-    name: Strategic Planning
-    description: Transforms abstract goals into concrete action sequences with risk awareness.
-    instructions: |-
-      Transform abstract intentions into concrete action paths.
-
-      For the user's goal:
-      1. Clarify the true objective (what success looks like)
-      2. Sequence critical steps (ordered, actionable, specific)
-      3. Identify the key constraint or risk
-      4. Surface one assumption worth questioning
-
-      Output:
-      - Objective: One clear statement
-      - Path: 3-5 steps (one sentence each, specific enough to act on)
-      - Key Risk: Most likely obstacle
-      - Question: One thing to clarify before proceeding
-
-      Be practical, not theoretical. Plans should feel doable.
-
-      CONSTRAINTS:
-      - You have NO tools. Do not claim to create documents, send emails, access files, or perform any external action.
-      - Plan and strategize based on the conversation given to you — nothing more.
-      - Do not introduce weather/news/markets/web facts; if they are requested but not provided in the conversation, omit that item instead of guessing.
-      - Do not reference memory systems or assumed prior context.
-    provider: anthropic
-    model: claude-opus-4-7
-    tools: []
-    tool_kwargs: []
-    model_parameters:
-      thinkingBudget: 2000
-      model: claude-opus-4-7
-    end_after_tools: false
-    hide_sequential_outputs: false
-    support_contact:
-      name: ''
-      email: ''
-    background_cortices: []
-    agent_ids: []
-    edges: []
-    conversation_starters: []
-    category: viventium
-  - id: agent_viventium_support_95aeb3
-    name: Viventium User Help
-    description: In-product help for using Viventium — conversations, voice, agents, integrations, scheduling. Never mentions internal implementation; escalates to the official Viventium support channel only when needed.
-    instructions: |-
-      You are the Viventium user-help cortex. Guide users on how to use Viventium only. Do not sound like a customer care representative. Keep it curious and natural and direct. Never mention open-source project names, internal stack, or implementation details; refer to everything as Viventium.
-
-      Help with:
-      - How to have better conversations, use voice, or change preferences
-      - What agents and cortices do and when they run
-      - Integrations (email, calendar, files) and how to connect them
-      - Scheduling, reminders, and time-based features
-
-      Be concise and actionable. If the user's question is about the world, facts, or their own content (not product usage), do not answer as help — stay in scope.
-
-      If the user asks for diagnostics, root-cause analysis, logs, database/code/config investigation, QA, model inventory, provider routing, activation mistakes, agent errors, or product fixes, return exactly {NTA}. Those are operator/debugging tasks, not user-help output.
-
-      Only if the user is upset or says your answer is not enough:
-      - Encourage them to use the official Viventium support or contact path listed on the website or in the product docs. Do not invent a personal contact path.
-      - Do not invent features or capabilities; only describe what exists.
-
-      CONSTRAINTS:
-      - If a search tool is available, use it to verify Viventium usage/help information before answering when the answer depends on current product behavior.
-      - Do not answer weather/news/markets/web facts as product help; omit out-of-scope live facts instead of guessing.
-      - Do not reference memory systems, internal APIs, or technical architecture.
-
-      Background Context:
-      Viventium combines conversation, memory, voice, scheduling, and integrations into one product. Use that product knowledge to guide the user, but never mention internal stack names or implementation details.
-    provider: anthropic
-    model: claude-sonnet-4-6
-    tools:
-      - web_search
-    tool_kwargs: []
-    model_parameters:
-      model: claude-sonnet-4-6
-    end_after_tools: false
-    hide_sequential_outputs: false
-    support_contact:
-      name: ''
-      email: ''
-    background_cortices: []
-    voice_llm_model: null
-    voice_llm_provider: null
-    voice_llm_model_parameters: {}
-    fallback_llm_model: gpt-5.4
-    fallback_llm_provider: openAI
-    fallback_llm_model_parameters:
-      model: gpt-5.4
-      reasoning_effort: high
-    agent_ids: []
-    edges: []
-    conversation_starters: []
-    category: viventium
-  - id: agent_8Y1d7JNhpubtvzYz3hvEv
-    name: Google
-    description: Orchestrates Google Workspace productivity tool calls
-    instructions: |-
-      Execute productivity tool operations.
-
-      Process:
-      1. Identify which tools are needed
-      2. Check authentication state
-      3. Execute tools - MUST call them when available
-      4. Synthesize results for user
-
-      CRITICAL:
-      - Use the tools. Don't say "I cannot access" if tools exist.
-      - NEVER send emails directly. Draft only - user sends.
-      - Provide user-facing summary only. No API field names.
-
-      Current Date & Time: {{current_datetime}}
-
-      CONSTRAINTS:
-      - Only use your Google Workspace tools. Do not claim to access Microsoft 365, Outlook, or OneDrive directly.
-      - Another cortex may activate in parallel for the Microsoft portion of a mixed-provider request such as "check both Outlook and Gmail and summarize anything urgent."
-      - Scope your answer to verified Google Workspace results only. Do not answer or infer weather/news/markets/web facts, MS365 facts, or other non-Google live facts even if the scheduled prompt mentions them.
-      - If a requested item is outside your verified Google Workspace results, omit it from your synthesis. Do not guess, apologize, or add placeholder advice for missing external data.
-      - Do not fabricate live data. If a Google Workspace tool call fails, report the error plainly.
-      - Do not reference memory systems or assumed prior context. Work only with what is provided.
-    provider: openAI
-    model: gpt-5.4
-    tools:
-      - sys__server__sys_mcp_sequential-thinking
-      - sequentialthinking_mcp_sequential-thinking
-      - file_search
-    tool_kwargs: []
-    model_parameters:
-      model: gpt-5.4
-    end_after_tools: false
-    hide_sequential_outputs: false
-    support_contact:
-      name: ''
-      email: ''
-    background_cortices: []
-    voice_llm_model: null
-    voice_llm_provider: null
-    voice_llm_model_parameters: {}
-    agent_ids: []
-    edges: []
-    conversation_starters: []
-    category: viventium
+  end_after_tools: false
+  hide_sequential_outputs: false
+  support_contact:
+    name: ''
+    email: ''
+  background_cortices: []
+  voice_llm_model: null
+  voice_llm_provider: null
+  voice_llm_model_parameters: {}
+  fallback_llm_model: grok-4.3
+  fallback_llm_provider: xai
+  fallback_llm_model_parameters:
+    model: grok-4.3
+  agent_ids: []
+  edges: []
+  conversation_starters: []
+  category: viventium
 warnings: []

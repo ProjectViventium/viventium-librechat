@@ -170,6 +170,8 @@ describe('CallSessionService', () => {
       conversationId: 'new',
     });
 
+    // The service uses millisecond timestamps; keep this assertion stable on fast CI workers.
+    await new Promise((resolve) => setTimeout(resolve, 2));
     const updated = await syncCallSessionState({
       callSessionId: created.callSessionId,
       touch: true,

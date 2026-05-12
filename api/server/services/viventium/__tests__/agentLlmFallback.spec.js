@@ -15,6 +15,7 @@ const {
   buildFallbackAgent,
   isSameAgentRoute,
   shouldRetryWithFallback,
+  hasVisibleAssistantText,
   shouldRetryBackgroundCortexWithFallback,
 } = require('../agentLlmFallback');
 
@@ -179,6 +180,24 @@ describe('agentLlmFallback', () => {
     expect(
       shouldRetryWithFallback([
         { type: ContentTypes.TEXT, text: 'Partial answer' },
+        {
+          type: ContentTypes.ERROR,
+          [ContentTypes.ERROR]: 'status 429 rate_limit_error',
+        },
+      ]),
+    ).toBe(false);
+  });
+
+  test('treats OpenAI-style text.value parts as visible assistant text', () => {
+    const textValuePart = {
+      type: ContentTypes.TEXT,
+      text: { value: 'Visible fallback answer.' },
+    };
+
+    expect(hasVisibleAssistantText([textValuePart])).toBe(true);
+    expect(
+      shouldRetryWithFallback([
+        textValuePart,
         {
           type: ContentTypes.ERROR,
           [ContentTypes.ERROR]: 'status 429 rate_limit_error',

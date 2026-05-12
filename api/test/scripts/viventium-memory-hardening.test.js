@@ -8,6 +8,7 @@ const {
   buildTranscriptSummaryPrompt,
   deferTranscriptLifecycleWhenRagUnavailable,
   findTranscriptContentHashesMissingVectors,
+  findTranscriptVectorRepairTargets,
   invokeModel,
   invokeTranscriptSummaryModel,
   markTranscriptIndexProcessed,
@@ -1538,6 +1539,9 @@ describe('viventium-memory-hardening', () => {
       expect(findOneAndUpdate.mock.calls[0][1].$set).toMatchObject({
         embedded: false,
       });
+      expect(findOneAndUpdate.mock.calls.at(-1)[1].$set.metadata).toMatchObject({
+        meetingTranscriptContentHash: 'abc1234567890abc',
+      });
     } finally {
       jest.dontMock('~/db/models');
       jest.dontMock('~/server/services/Files/VectorDB/crud');
@@ -1546,29 +1550,44 @@ describe('viventium-memory-hardening', () => {
     }
   });
 
-  test('missing transcript vector discovery returns content hashes for reprocessing', async () => {
+  test('missing transcript vector discovery returns full index content hashes for reprocessing', async () => {
     jest.resetModules();
     const oldRag = process.env.RAG_API_URL;
-    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-transcript-vector-db-'));
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-transcript-vector-index-'));
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-transcript-vector-index-state-'));
     process.env.RAG_API_URL = 'http://rag.example.test';
-    const vectorDocumentExists = jest
-      .fn()
-      .mockResolvedValueOnce(false)
-      .mockResolvedValueOnce(true);
+    const vectorDocumentExists = jest.fn().mockResolvedValue(false);
     jest.doMock('~/server/services/Files/VectorDB/crud', () => ({
       vectorDocumentExists,
     }));
-    const files = [
-      {
-        file_id:
-          'meeting_summary:507f1f77bcf86cd799439011:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    fs.writeFileSync(path.join(tempDir, 'meeting.txt'), 'Speaker A: transcript detail.', 'utf8');
+    const user = { _id: '507f1f77bcf86cd799439011' };
+    const first = scanTranscriptDirectory({
+      user,
+      options: {
+        transcriptsDir: tempDir,
+        transcriptMaxFilesPerRun: 20,
+        transcriptMaxCharsPerFile: 500000,
       },
-      {
-        file_id:
-          'meeting_summary:507f1f77bcf86cd799439011:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      now: new Date('2026-05-05T12:00:00Z'),
+      transcriptStateDir: stateDir,
+    });
+    markTranscriptIndexProcessed({
+      userProposal: {
+        transcriptIndexPath: first.indexPath,
+        transcriptIndex: first.index,
+        transcripts: [
+          {
+            ...first.transcripts[0],
+            summary: 'Detailed summary with speaker and timing context.',
+            summary_char_count: 49,
+          },
+        ],
+        transcriptRagMode: 'detailed_summary_only',
       },
-    ];
-    const toArray = jest.fn().mockResolvedValue(files);
+      now: new Date('2026-05-05T12:01:00Z'),
+    });
+    const toArray = jest.fn().mockResolvedValue([]);
     const project = jest.fn(() => ({ toArray }));
     const find = jest.fn(() => ({ project }));
     const collection = jest.fn((name) => {
@@ -1579,27 +1598,166 @@ describe('viventium-memory-hardening', () => {
     try {
       const result = await findTranscriptContentHashesMissingVectors({
         db: { collection },
-        user: { _id: '507f1f77bcf86cd799439011' },
+        user,
         options: {
           mode: 'apply',
           transcriptsDir: tempDir,
+          transcriptStateDir: stateDir,
           transcriptRagMode: 'detailed_summary_only',
         },
       });
-      expect(Array.from(result)).toEqual([
-        'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-      ]);
+      expect(Array.from(result)).toEqual([first.transcripts[0].contentHash]);
       expect(find.mock.calls[0][0]).toMatchObject({
         context: 'meeting_transcript',
         embedded: true,
         'metadata.meetingTranscriptKind': 'summary',
       });
-      expect(vectorDocumentExists).toHaveBeenCalledTimes(2);
+      expect(vectorDocumentExists).toHaveBeenCalledWith(
+        { user: { id: user._id } },
+        first.transcripts[0].summaryFileId,
+      );
     } finally {
       jest.dontMock('~/server/services/Files/VectorDB/crud');
       if (oldRag) process.env.RAG_API_URL = oldRag;
       else delete process.env.RAG_API_URL;
       fs.rmSync(tempDir, { recursive: true, force: true });
+      fs.rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  test('transcript repair targets mark Mongo summary artifacts outside current index as stale', async () => {
+    jest.resetModules();
+    const oldRag = process.env.RAG_API_URL;
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-transcript-orphan-db-'));
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-transcript-orphan-db-state-'));
+    process.env.RAG_API_URL = 'http://rag.example.test';
+    const vectorDocumentExists = jest.fn().mockResolvedValue(true);
+    jest.doMock('~/server/services/Files/VectorDB/crud', () => ({
+      vectorDocumentExists,
+    }));
+    fs.writeFileSync(path.join(tempDir, 'meeting.txt'), 'Speaker A: transcript detail.', 'utf8');
+    const user = { _id: '507f1f77bcf86cd799439011' };
+    const first = scanTranscriptDirectory({
+      user,
+      options: {
+        transcriptsDir: tempDir,
+        transcriptMaxFilesPerRun: 20,
+        transcriptMaxCharsPerFile: 500000,
+      },
+      now: new Date('2026-05-05T12:00:00Z'),
+      transcriptStateDir: stateDir,
+    });
+    markTranscriptIndexProcessed({
+      userProposal: {
+        transcriptIndexPath: first.indexPath,
+        transcriptIndex: first.index,
+        transcripts: [
+          {
+            ...first.transcripts[0],
+            summary: 'Detailed summary with speaker and timing context.',
+            summary_char_count: 49,
+          },
+        ],
+        transcriptRagMode: 'detailed_summary_only',
+      },
+      now: new Date('2026-05-05T12:01:00Z'),
+    });
+    const orphanFileId = `meeting_summary:${user._id}:cccccccccccccccccccccccccccccccc`;
+    const toArray = jest.fn().mockResolvedValue([
+      {
+        file_id: orphanFileId,
+        metadata: {
+          meetingTranscriptArtifactId: 'meeting_transcript:orphan',
+          meetingTranscriptKind: 'summary',
+        },
+      },
+    ]);
+    const project = jest.fn(() => ({ toArray }));
+    const find = jest.fn(() => ({ project }));
+    const collection = jest.fn((name) => {
+      if (name !== 'files') throw new Error(`unexpected collection ${name}`);
+      return { find };
+    });
+
+    try {
+      const result = await findTranscriptVectorRepairTargets({
+        db: { collection },
+        user,
+        options: {
+          mode: 'apply',
+          transcriptsDir: tempDir,
+          transcriptStateDir: stateDir,
+          transcriptRagMode: 'detailed_summary_only',
+        },
+      });
+      expect(Array.from(result.contentHashes)).toEqual([]);
+      expect(result.staleArtifacts).toEqual([
+        {
+          artifactId: 'meeting_transcript:orphan',
+          contentHash: 'cccccccccccccccccccccccccccccccc',
+          rawFileId: null,
+          summaryFileId: orphanFileId,
+        },
+      ]);
+      expect(vectorDocumentExists).toHaveBeenCalledTimes(1);
+    } finally {
+      jest.dontMock('~/server/services/Files/VectorDB/crud');
+      if (oldRag) process.env.RAG_API_URL = oldRag;
+      else delete process.env.RAG_API_URL;
+      fs.rmSync(tempDir, { recursive: true, force: true });
+      fs.rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  test('transcript repair targets do not delete artifacts when processed index is missing', async () => {
+    jest.resetModules();
+    const oldRag = process.env.RAG_API_URL;
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-transcript-missing-index-'));
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-transcript-missing-index-state-'));
+    process.env.RAG_API_URL = 'http://rag.example.test';
+    const vectorDocumentExists = jest.fn().mockResolvedValue(true);
+    jest.doMock('~/server/services/Files/VectorDB/crud', () => ({
+      vectorDocumentExists,
+    }));
+    fs.writeFileSync(path.join(tempDir, 'meeting.txt'), 'Speaker A: transcript detail.', 'utf8');
+    const user = { _id: '507f1f77bcf86cd799439011' };
+    const existingFileId = `meeting_summary:${user._id}:cccccccccccccccccccccccccccccccc`;
+    const toArray = jest.fn().mockResolvedValue([
+      {
+        file_id: existingFileId,
+        metadata: {
+          meetingTranscriptArtifactId: 'meeting_transcript:existing',
+          meetingTranscriptKind: 'summary',
+        },
+      },
+    ]);
+    const project = jest.fn(() => ({ toArray }));
+    const find = jest.fn(() => ({ project }));
+    const collection = jest.fn((name) => {
+      if (name !== 'files') throw new Error(`unexpected collection ${name}`);
+      return { find };
+    });
+
+    try {
+      const result = await findTranscriptVectorRepairTargets({
+        db: { collection },
+        user,
+        options: {
+          mode: 'apply',
+          transcriptsDir: tempDir,
+          transcriptStateDir: stateDir,
+          transcriptRagMode: 'detailed_summary_only',
+        },
+      });
+      expect(Array.from(result.contentHashes)).toEqual([]);
+      expect(result.staleArtifacts).toEqual([]);
+      expect(vectorDocumentExists).toHaveBeenCalledWith({ user: { id: user._id } }, existingFileId);
+    } finally {
+      jest.dontMock('~/server/services/Files/VectorDB/crud');
+      if (oldRag) process.env.RAG_API_URL = oldRag;
+      else delete process.env.RAG_API_URL;
+      fs.rmSync(tempDir, { recursive: true, force: true });
+      fs.rmSync(stateDir, { recursive: true, force: true });
     }
   });
 

@@ -117,7 +117,7 @@ describe('filterRenderableContentParts', () => {
     ]);
   });
 
-  it('collapses consecutive GlassHive tool rows into the latest status row', () => {
+  it('keeps consecutive distinct GlassHive tool rows inspectable', () => {
     const parts: TMessageContentParts[] = [
       {
         type: ContentTypes.TOOL_CALL,
@@ -147,10 +147,10 @@ describe('filterRenderableContentParts', () => {
       },
     ];
 
-    expect(filterRenderableContentParts(parts)).toEqual([parts[1], parts[2]]);
+    expect(filterRenderableContentParts(parts)).toBe(parts);
   });
 
-  it('hides routine GlassHive one-shot delegation rows from chat rendering', () => {
+  it('hides routine GlassHive one-shot delegation rows when the assistant already acknowledged dispatch', () => {
     const parts: TMessageContentParts[] = [
       {
         type: ContentTypes.TOOL_CALL,
@@ -209,6 +209,99 @@ describe('filterRenderableContentParts', () => {
     expect(filterRenderableContentParts(parts)).toBe(parts);
   });
 
+  it('hides late stream termination errors when assistant text already exists', () => {
+    const parts: TMessageContentParts[] = [
+      {
+        type: ContentTypes.TEXT,
+        text: 'Visible answer before the stream stopped.',
+      },
+      {
+        type: ContentTypes.ERROR,
+        [ContentTypes.ERROR]: 'An error occurred while processing the request: terminated',
+      } as unknown as TMessageContentParts,
+      {
+        type: ContentTypes.CORTEX_INSIGHT,
+        cortex_id: 'cortex_public_safe',
+        status: 'complete',
+        insight: 'Background insight remains renderable.',
+      } as unknown as TMessageContentParts,
+    ];
+
+    expect(filterRenderableContentParts(parts)).toEqual([parts[0], parts[2]]);
+  });
+
+  it('keeps error-only and non-termination error parts visible', () => {
+    const terminatedOnly: TMessageContentParts[] = [
+      {
+        type: ContentTypes.ERROR,
+        [ContentTypes.ERROR]: 'An error occurred while processing the request: terminated',
+      } as unknown as TMessageContentParts,
+    ];
+    const nonTerminationAfterText: TMessageContentParts[] = [
+      { type: ContentTypes.TEXT, text: 'Partial answer.' },
+      {
+        type: ContentTypes.ERROR,
+        [ContentTypes.ERROR]: 'An error occurred while processing the request: status 429 rate_limit_error',
+      } as unknown as TMessageContentParts,
+    ];
+
+    expect(filterRenderableContentParts(terminatedOnly)).toBe(terminatedOnly);
+    expect(filterRenderableContentParts(nonTerminationAfterText)).toBe(nonTerminationAfterText);
+  });
+
+  it('does not count runtime-hold no-response text as visible text for late termination hiding', () => {
+    const parts: TMessageContentParts[] = [
+      {
+        type: ContentTypes.TEXT,
+        text: '{NTA}',
+        viventium_runtime_hold: true,
+      } as unknown as TMessageContentParts,
+      {
+        type: ContentTypes.ERROR,
+        [ContentTypes.ERROR]: 'An error occurred while processing the request: terminated',
+      } as unknown as TMessageContentParts,
+    ];
+
+    expect(filterRenderableContentParts(parts)).toEqual([parts[1]]);
+  });
+
+  it('hides marked late termination errors without dropping surrounding cortex insight rows', () => {
+    const parts: TMessageContentParts[] = [
+      {
+        type: ContentTypes.TEXT,
+        text: 'Visible answer before the stream stopped.',
+      },
+      {
+        type: ContentTypes.CORTEX_INSIGHT,
+        cortex_id: 'cortex_public_safe',
+        status: 'complete',
+        insight: 'Background insight remains renderable.',
+      } as unknown as TMessageContentParts,
+      {
+        type: ContentTypes.ERROR,
+        [ContentTypes.ERROR]: 'An error occurred while processing the request: TypeError: terminated',
+        error_class: 'late_stream_termination',
+      } as unknown as TMessageContentParts,
+    ];
+
+    expect(filterRenderableContentParts(parts)).toEqual([parts[0], parts[1]]);
+  });
+
+  it('keeps unmarked abort shorthand after visible assistant text', () => {
+    const parts: TMessageContentParts[] = [
+      {
+        type: ContentTypes.TEXT,
+        text: 'Visible answer before the stream stopped.',
+      },
+      {
+        type: ContentTypes.ERROR,
+        [ContentTypes.ERROR]: 'AbortError',
+      } as unknown as TMessageContentParts,
+    ];
+
+    expect(filterRenderableContentParts(parts)).toBe(parts);
+  });
+
   it('hides routine GlassHive one-shot rows when MCP output is wrapped in text content', () => {
     const parts: TMessageContentParts[] = [
       {
@@ -226,7 +319,25 @@ describe('filterRenderableContentParts', () => {
       { type: ContentTypes.TEXT, text: 'On it.' },
     ];
 
-    expect(filterRenderableContentParts(parts)).toEqual([{ type: ContentTypes.TEXT, text: 'On it.' }]);
+    expect(filterRenderableContentParts(parts)).toEqual([parts[1]]);
+  });
+
+  it('keeps routine GlassHive one-shot rows visible when no assistant acknowledgement exists', () => {
+    const parts: TMessageContentParts[] = [
+      {
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: 'toolu_delegate_without_ack',
+          name: `worker_delegate_once${Constants.mcp_delimiter}glasshive-workers-projects`,
+          args: '{}',
+          type: ToolCallTypes.TOOL_CALL,
+          progress: 1,
+          output: '{"status":"dispatched","callback_ready":true,"user_status":"On it"}',
+        },
+      },
+    ];
+
+    expect(filterRenderableContentParts(parts)).toBe(parts);
   });
 
   it('keeps blocked GlassHive one-shot delegation rows visible', () => {
@@ -265,6 +376,60 @@ describe('filterRenderableContentParts', () => {
         tool_call: {
           id: 'toolu_two',
           name: `worker_run${Constants.mcp_delimiter}not-glasshive-workers-projects`,
+          args: '{}',
+          type: ToolCallTypes.TOOL_CALL,
+          progress: 1,
+        },
+      },
+    ];
+
+    expect(filterRenderableContentParts(parts)).toBe(parts);
+  });
+
+  it('does not collapse distinct consecutive canonical GlassHive tool calls', () => {
+    const parts: TMessageContentParts[] = [
+      {
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: 'toolu_live',
+          name: `worker_live${Constants.mcp_delimiter}glasshive-workers-projects`,
+          args: '{}',
+          type: ToolCallTypes.TOOL_CALL,
+          progress: 1,
+        },
+      },
+      {
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: 'toolu_takeover',
+          name: `worker_takeover${Constants.mcp_delimiter}glasshive-workers-projects`,
+          args: '{}',
+          type: ToolCallTypes.TOOL_CALL,
+          progress: 1,
+        },
+      },
+    ];
+
+    expect(filterRenderableContentParts(parts)).toBe(parts);
+  });
+
+  it('keeps distinct same-name GlassHive tool calls inspectable', () => {
+    const parts: TMessageContentParts[] = [
+      {
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: 'toolu_takeover_partial',
+          name: `worker_takeover${Constants.mcp_delimiter}glasshive-workers-projects`,
+          args: '{}',
+          type: ToolCallTypes.TOOL_CALL,
+          progress: 0.5,
+        },
+      },
+      {
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: 'toolu_takeover_final',
+          name: `worker_takeover${Constants.mcp_delimiter}glasshive-workers-projects`,
           args: '{}',
           type: ToolCallTypes.TOOL_CALL,
           progress: 1,

@@ -1,5 +1,5 @@
 const { Providers } = require('@librechat/agents');
-const { Constants, EModelEndpoint } = require('librechat-data-provider');
+const { Constants, ContentTypes, EModelEndpoint } = require('librechat-data-provider');
 const db = require('~/models');
 const AgentClient = require('./client');
 
@@ -25,6 +25,7 @@ jest.mock('@librechat/api', () => ({
 
 jest.mock('~/server/services/viventium/BackgroundCortexFollowUpService', () => ({
   persistCortexPartsToCanonicalMessage: jest.fn().mockResolvedValue(undefined),
+  finalizeCanonicalCortexMessage: jest.fn().mockResolvedValue(undefined),
   createCortexFollowUpMessage: jest.fn(),
 }));
 
@@ -53,8 +54,22 @@ jest.mock('~/config', () => ({
 
 // Get references to mocked module functions (resolved after jest.mock hoisting)
 const mockEmitChunk = require('@librechat/api').GenerationJobManager.emitChunk;
+const mockPersistCortexPartsToCanonicalMessage =
+  require('~/server/services/viventium/BackgroundCortexFollowUpService').persistCortexPartsToCanonicalMessage;
+const mockFinalizeCanonicalCortexMessage =
+  require('~/server/services/viventium/BackgroundCortexFollowUpService').finalizeCanonicalCortexMessage;
 const mockCreateCortexFollowUpMessage =
   require('~/server/services/viventium/BackgroundCortexFollowUpService').createCortexFollowUpMessage;
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
 
 describe('buildViventiumMcpRequestBody', () => {
   test('passes surface context and existing upload references to GlassHive MCP', () => {
@@ -96,6 +111,187 @@ describe('buildViventiumMcpRequestBody', () => {
     expect(body.attachments).toEqual(body.files);
     expect(body.file_ids).toEqual(['file-1']);
     expect(body.tool_resources.code_interpreter.file_ids).toEqual(['file-1']);
+  });
+});
+
+describe('late completion error content parts', () => {
+  test.each([
+    'terminated',
+    'TypeError: terminated',
+    'stream terminated',
+    'request terminated',
+    'aborted',
+    'AbortError',
+    'operation was aborted',
+    'request aborted',
+    'ProviderError: aborted',
+  ])('treats late stream wording as suppressible: %s', (message) => {
+    expect(AgentClient.isLateStreamTerminationError(new Error(message))).toBe(true);
+  });
+
+  test.each(['status 429 rate_limit_error', '401 unauthorized', 'context length exceeded'])(
+    'does not treat real provider failures as late stream termination: %s',
+    (message) => {
+      expect(AgentClient.isLateStreamTerminationError(new Error(message))).toBe(false);
+    },
+  );
+
+  test('suppresses terminated stream errors after visible assistant text', () => {
+    const contentParts = [{ type: ContentTypes.TEXT, text: 'Partial but visible answer.' }];
+
+    expect(
+      AgentClient.shouldSuppressCompletionErrorContentPart(contentParts, new Error('terminated')),
+    ).toBe(true);
+  });
+
+  test('keeps visible errors when there is no assistant text or the error is not stream termination', () => {
+    expect(
+      AgentClient.shouldSuppressCompletionErrorContentPart([], new Error('terminated')),
+    ).toBe(false);
+    expect(
+      AgentClient.shouldSuppressCompletionErrorContentPart(
+        [{ type: ContentTypes.TEXT, text: 'Partial answer.' }],
+        new Error('status 429 rate_limit_error'),
+      ),
+    ).toBe(false);
+    expect(AgentClient.createCompletionErrorContentPart(new Error('status 429 rate_limit_error'))).toEqual({
+      type: ContentTypes.ERROR,
+      [ContentTypes.ERROR]:
+        'The model provider rate-limited this request. Please try again shortly.',
+      error_class: 'provider_rate_limited',
+    });
+  });
+
+  test('does not mutate content parts for late stream termination after assistant text', () => {
+    const textPart = { type: ContentTypes.TEXT, text: 'Partial but visible answer.' };
+    const contentParts = [textPart];
+    const log = { warn: jest.fn(), error: jest.fn() };
+
+    const result = AgentClient.handleCompletionErrorContentPart({
+      contentParts,
+      err: new Error('terminated'),
+      abortController: { signal: { aborted: false } },
+      log,
+    });
+
+    expect(result).toBe('suppressed');
+    expect(contentParts).toEqual([textPart]);
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining('Late stream termination'),
+      expect.objectContaining({ class: 'late_stream_termination' }),
+    );
+    expect(log.error).not.toHaveBeenCalled();
+  });
+
+  test('appends visible error content when no assistant text exists', () => {
+    const contentParts = [];
+    const log = { warn: jest.fn(), error: jest.fn() };
+
+    const result = AgentClient.handleCompletionErrorContentPart({
+      contentParts,
+      err: new Error('terminated'),
+      abortController: { signal: { aborted: false } },
+      log,
+    });
+
+    expect(result).toBe('pushed');
+    expect(contentParts).toEqual([
+      {
+        type: ContentTypes.ERROR,
+        [ContentTypes.ERROR]: 'The model stream ended before a response was available.',
+        error_class: 'late_stream_termination',
+      },
+    ]);
+    expect(log.warn).not.toHaveBeenCalled();
+    expect(log.error).toHaveBeenCalled();
+  });
+
+  test('controller abort remains a silent abort even when assistant text exists', () => {
+    const contentParts = [{ type: ContentTypes.TEXT, text: 'Partial answer.' }];
+    const log = { warn: jest.fn(), error: jest.fn() };
+
+    const result = AgentClient.handleCompletionErrorContentPart({
+      contentParts,
+      err: new Error('terminated'),
+      abortController: { signal: { aborted: true } },
+      log,
+    });
+
+    expect(result).toBe('aborted');
+    expect(contentParts).toEqual([{ type: ContentTypes.TEXT, text: 'Partial answer.' }]);
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining('Operation aborted by controller'),
+      expect.objectContaining({ class: 'late_stream_termination' }),
+    );
+    expect(log.error).not.toHaveBeenCalled();
+  });
+});
+
+describe('background cortex runtime card guard', () => {
+  test('marks activated background agents as an exclusive runtime list', () => {
+    const summary = AgentClient.formatActivationSummary([
+      { cortexName: 'Confirmation Bias', reason: 'bias check', confidence: 0.9 },
+    ]);
+
+    expect(summary).toContain('## Activated Background Agents');
+    expect(summary).toContain('Only the background agents listed below activated for this turn');
+    expect(summary).toContain('Confirmation Bias');
+  });
+
+  test('injects the runtime card contract once for agents with background cortices', () => {
+    const agent = {
+      instructions: 'Base instructions.',
+      background_cortices: [{ id: 'agent_background_analysis' }],
+    };
+
+    expect(AgentClient.ensureBackgroundCortexRuntimeCardGuard(agent)).toEqual(
+      expect.stringContaining('Runtime may display background-cortex status/result cards'),
+    );
+    expect(agent.instructions).toContain('Base instructions.');
+    expect(agent.instructions).toContain('Runtime may display background-cortex status/result cards');
+    expect(agent.instructions).toContain(
+      'Do not offer to start, spin up, launch, or run background agents/cortices',
+    );
+    expect(agent.instructions).toContain(
+      'Do not say a specific background agent/cortex ran, is running, activated, completed, or checked the issue unless it appears in the current turn',
+    );
+
+    const afterFirstInjection = agent.instructions;
+    expect(AgentClient.ensureBackgroundCortexRuntimeCardGuard(agent)).toBe(false);
+    expect(agent.instructions).toBe(afterFirstInjection);
+  });
+
+  test('does not inject the runtime card contract for agents without background cortices', () => {
+    const agent = { instructions: 'Base instructions.', background_cortices: [] };
+
+    expect(AgentClient.ensureBackgroundCortexRuntimeCardGuard(agent)).toBe(false);
+    expect(agent.instructions).toBe('Base instructions.');
+    expect(AgentClient.ensureBackgroundCortexRuntimeCardGuard({ instructions: 'Base.' })).toBe(
+      false,
+    );
+  });
+
+  test('normalizes and clamps late activation detection timeout', () => {
+    const previous = process.env.VIVENTIUM_CORTEX_LATE_DETECT_TIMEOUT_MS;
+    try {
+      delete process.env.VIVENTIUM_CORTEX_LATE_DETECT_TIMEOUT_MS;
+      expect(AgentClient.getCortexLateDetectTimeoutMs(2000)).toBe(0);
+
+      process.env.VIVENTIUM_CORTEX_LATE_DETECT_TIMEOUT_MS = '1500';
+      expect(AgentClient.getCortexLateDetectTimeoutMs(2000)).toBe(0);
+
+      process.env.VIVENTIUM_CORTEX_LATE_DETECT_TIMEOUT_MS = '45000';
+      expect(AgentClient.getCortexLateDetectTimeoutMs(2000)).toBe(30000);
+
+      process.env.VIVENTIUM_CORTEX_LATE_DETECT_TIMEOUT_MS = 'not-a-number';
+      expect(AgentClient.getCortexLateDetectTimeoutMs(2000)).toBe(0);
+    } finally {
+      if (previous == null) {
+        delete process.env.VIVENTIUM_CORTEX_LATE_DETECT_TIMEOUT_MS;
+      } else {
+        process.env.VIVENTIUM_CORTEX_LATE_DETECT_TIMEOUT_MS = previous;
+      }
+    }
   });
 });
 
@@ -2510,6 +2706,536 @@ describe('AgentClient - titleConvo', () => {
  * Purpose: Viventium addition in private LibreChat fork (new test block).
  * Porting: Copy this describe block when reapplying Viventium changes.
  * === VIVENTIUM END === */
+
+describe('AgentClient Phase B persistence across main-model fallback', () => {
+  let client;
+  let req;
+  let primaryAgent;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockPersistCortexPartsToCanonicalMessage.mockResolvedValue(undefined);
+    mockFinalizeCanonicalCortexMessage.mockResolvedValue(undefined);
+    mockCreateCortexFollowUpMessage.mockResolvedValue(null);
+
+    req = {
+      user: { id: 'user-1' },
+      body: {},
+      config: { endpoints: {} },
+      _resumableStreamId: 'stream-1',
+    };
+    primaryAgent = {
+      id: 'agent-primary',
+      provider: EModelEndpoint.openAI,
+      model: 'gpt-4',
+      model_parameters: { model: 'gpt-4' },
+      hide_sequential_outputs: false,
+    };
+    client = new AgentClient({
+      req,
+      res: {},
+      agent: primaryAgent,
+      contentParts: [],
+      collectedUsage: [],
+      artifactPromises: [],
+      endpointTokenConfig: {},
+    });
+    client.conversationId = 'conv-1';
+    client.responseMessageId = 'resp-1';
+  });
+
+  test('persists Phase B parts and waits for fallback text before follow-up synthesis', async () => {
+    const phaseB = deferred();
+    const mainReady = deferred();
+    const pendingCortexParts = [
+      {
+        type: ContentTypes.CORTEX_INSIGHT,
+        cortex_id: 'agent-background',
+        cortex_name: 'Background',
+        status: 'complete',
+        insight: 'Background result.',
+      },
+    ];
+    client._phaseBMainResponseReadyPromise = mainReady.promise;
+    mockCreateCortexFollowUpMessage.mockResolvedValue({
+      messageId: 'follow-up-1',
+      parentMessageId: 'resp-1',
+      text: 'Follow-up result.',
+    });
+
+    const attached = client.attachBackgroundCortexCompletionPipeline({
+      cortexExecutionPromise: phaseB.promise,
+      pendingCortexParts,
+      req,
+      conversationId: 'conv-1',
+      responseMessageId: 'resp-1',
+      agent: primaryAgent,
+      getResponseContentParts: () => client.contentParts,
+      responseController: { lastUserInputTime: 10 },
+      turnUserInputTime: 10,
+      followupGraceMs: 0,
+      shouldDeferMainResponse: false,
+      getActivatedCorticesList: () => [{ agentId: 'agent-background' }],
+    });
+
+    phaseB.resolve({
+      insights: [{ cortexName: 'Background', insight: 'Background result.' }],
+      mergedPrompt: 'Background result.',
+      cortexCount: 1,
+    });
+    await Promise.resolve();
+
+    expect(mockPersistCortexPartsToCanonicalMessage).not.toHaveBeenCalled();
+    expect(mockCreateCortexFollowUpMessage).not.toHaveBeenCalled();
+
+    client.contentParts.push({ type: ContentTypes.TEXT, text: 'Fallback answer.' });
+    const fallbackAgent = {
+      id: 'agent-fallback',
+      provider: EModelEndpoint.openAI,
+      model: 'gpt-5.4',
+      model_parameters: { model: 'gpt-5.4' },
+    };
+    client.options.agent = fallbackAgent;
+    mainReady.resolve();
+    await attached;
+
+    expect(mockPersistCortexPartsToCanonicalMessage).toHaveBeenCalledWith({
+      req,
+      responseMessageId: 'resp-1',
+      cortexParts: pendingCortexParts,
+    });
+    expect(mockCreateCortexFollowUpMessage).toHaveBeenCalledTimes(1);
+    expect(mockCreateCortexFollowUpMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        req,
+        conversationId: 'conv-1',
+        parentMessageId: 'resp-1',
+        agent: fallbackAgent,
+        recentResponse: 'Fallback answer.',
+      }),
+    );
+    expect(mockFinalizeCanonicalCortexMessage).toHaveBeenCalledWith({
+      req,
+      messageId: 'resp-1',
+    });
+    expect(mockEmitChunk).toHaveBeenCalledWith(
+      'stream-1',
+      expect.objectContaining({
+        event: 'on_cortex_followup',
+        data: expect.objectContaining({
+          runId: 'resp-1',
+          messageId: 'follow-up-1',
+          text: 'Follow-up result.',
+          cortexCount: 1,
+        }),
+      }),
+    );
+  });
+
+  test('emits promoted forced Phase B text on the canonical parent without self-parenting', async () => {
+    const phaseB = deferred();
+    const pendingCortexParts = [
+      {
+        type: ContentTypes.CORTEX_INSIGHT,
+        cortex_id: 'agent-background',
+        cortex_name: 'Background',
+        status: 'complete',
+        insight: 'Background result.',
+      },
+    ];
+    mockCreateCortexFollowUpMessage.mockResolvedValue({
+      messageId: 'resp-1',
+      parentMessageId: 'user-1',
+      text: 'Promoted final answer.',
+    });
+
+    const attached = client.attachBackgroundCortexCompletionPipeline({
+      cortexExecutionPromise: phaseB.promise,
+      pendingCortexParts,
+      req,
+      conversationId: 'conv-1',
+      responseMessageId: 'resp-1',
+      agent: primaryAgent,
+      getResponseContentParts: () => client.contentParts,
+      responseController: { lastUserInputTime: 10 },
+      turnUserInputTime: 10,
+      followupGraceMs: 0,
+      shouldDeferMainResponse: true,
+      getActivatedCorticesList: () => [{ agentId: 'agent-background' }],
+    });
+
+    phaseB.resolve({
+      insights: [{ cortexName: 'Background', insight: 'Background result.' }],
+      mergedPrompt: 'Background result.',
+      cortexCount: 1,
+    });
+    await attached;
+
+    expect(mockCreateCortexFollowUpMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        parentMessageId: 'resp-1',
+        recentResponse: '',
+        forceVisibleFollowUp: true,
+      }),
+    );
+    expect(mockEmitChunk).toHaveBeenCalledWith(
+      'stream-1',
+      expect.objectContaining({
+        event: 'on_cortex_followup',
+        data: expect.objectContaining({
+          runId: 'resp-1',
+          messageId: 'resp-1',
+          parentMessageId: 'user-1',
+          text: 'Promoted final answer.',
+          cortexCount: 1,
+        }),
+      }),
+    );
+  });
+
+  test('attaches only one Phase B pipeline per response message', async () => {
+    const phaseB = deferred();
+    const pendingCortexParts = [
+      {
+        type: ContentTypes.CORTEX_INSIGHT,
+        cortex_id: 'agent-background',
+        status: 'complete',
+        insight: 'Background result.',
+      },
+    ];
+    client.contentParts.push({ type: ContentTypes.TEXT, text: 'Primary answer.' });
+
+    const first = client.attachBackgroundCortexCompletionPipeline({
+      cortexExecutionPromise: phaseB.promise,
+      pendingCortexParts,
+      req,
+      conversationId: 'conv-1',
+      responseMessageId: 'resp-1',
+      agent: primaryAgent,
+      getResponseContentParts: () => client.contentParts,
+      responseController: null,
+      turnUserInputTime: 0,
+      followupGraceMs: 0,
+      shouldDeferMainResponse: false,
+      getActivatedCorticesList: () => [],
+    });
+    const second = client.attachBackgroundCortexCompletionPipeline({
+      cortexExecutionPromise: phaseB.promise,
+      pendingCortexParts,
+      req,
+      conversationId: 'conv-1',
+      responseMessageId: 'resp-1',
+      agent: primaryAgent,
+      getResponseContentParts: () => client.contentParts,
+      responseController: null,
+      turnUserInputTime: 0,
+      followupGraceMs: 0,
+      shouldDeferMainResponse: false,
+      getActivatedCorticesList: () => [],
+    });
+
+    expect(second).toBe(first);
+    phaseB.resolve({
+      insights: [{ cortexName: 'Background', insight: 'Background result.' }],
+      mergedPrompt: 'Background result.',
+      cortexCount: 1,
+    });
+    await first;
+
+    expect(mockPersistCortexPartsToCanonicalMessage).toHaveBeenCalledTimes(1);
+    expect(mockCreateCortexFollowUpMessage).toHaveBeenCalledTimes(1);
+  });
+
+  test('persists terminal Phase B errors even when no follow-up should be shown', async () => {
+    const phaseB = deferred();
+    const pendingCortexParts = [
+      {
+        type: ContentTypes.CORTEX_INSIGHT,
+        cortex_id: 'agent-background',
+        status: 'error',
+        error: 'provider credentials rejected',
+      },
+    ];
+    client.contentParts.push({ type: ContentTypes.ERROR, error: '401 authentication' });
+
+    const attached = client.attachBackgroundCortexCompletionPipeline({
+      cortexExecutionPromise: phaseB.promise,
+      pendingCortexParts,
+      req,
+      conversationId: 'conv-1',
+      responseMessageId: 'resp-1',
+      agent: primaryAgent,
+      getResponseContentParts: () => client.contentParts,
+      responseController: null,
+      turnUserInputTime: 0,
+      followupGraceMs: 0,
+      shouldDeferMainResponse: false,
+      getActivatedCorticesList: () => [{ agentId: 'agent-background' }],
+    });
+
+    phaseB.resolve({
+      insights: [],
+      mergedPrompt: '',
+      cortexCount: 0,
+      errors: [{ message: 'provider credentials rejected' }],
+      hasErrors: true,
+    });
+    await attached;
+
+    expect(mockPersistCortexPartsToCanonicalMessage).toHaveBeenCalledTimes(1);
+    expect(mockPersistCortexPartsToCanonicalMessage).toHaveBeenCalledWith({
+      req,
+      responseMessageId: 'resp-1',
+      cortexParts: pendingCortexParts,
+    });
+    expect(mockFinalizeCanonicalCortexMessage).toHaveBeenCalledWith({
+      req,
+      messageId: 'resp-1',
+    });
+    expect(mockCreateCortexFollowUpMessage).not.toHaveBeenCalled();
+  });
+
+  test('persists mixed visible, silent, and error terminal Phase B parts together', async () => {
+    const phaseB = deferred();
+    const pendingCortexParts = [
+      {
+        type: ContentTypes.CORTEX_INSIGHT,
+        cortex_id: 'agent-visible',
+        cortex_name: 'Visible',
+        status: 'complete',
+        insight: 'Visible result.',
+      },
+      {
+        type: ContentTypes.CORTEX_INSIGHT,
+        cortex_id: 'agent-silent',
+        cortex_name: 'Silent',
+        status: 'complete',
+        silent: true,
+        no_response: true,
+      },
+      {
+        type: ContentTypes.CORTEX_INSIGHT,
+        cortex_id: 'agent-error',
+        cortex_name: 'Error',
+        status: 'error',
+        error: 'provider credentials rejected',
+      },
+    ];
+    client.contentParts.push({ type: ContentTypes.TEXT, text: 'Primary answer.' });
+    mockCreateCortexFollowUpMessage.mockResolvedValue(null);
+
+    const attached = client.attachBackgroundCortexCompletionPipeline({
+      cortexExecutionPromise: phaseB.promise,
+      pendingCortexParts,
+      req,
+      conversationId: 'conv-1',
+      responseMessageId: 'resp-1',
+      agent: primaryAgent,
+      getResponseContentParts: () => client.contentParts,
+      responseController: null,
+      turnUserInputTime: 0,
+      followupGraceMs: 0,
+      shouldDeferMainResponse: false,
+      getActivatedCorticesList: () => [],
+    });
+
+    phaseB.resolve({
+      insights: [{ cortexName: 'Visible', insight: 'Visible result.' }],
+      mergedPrompt: 'Visible result.',
+      cortexCount: 3,
+      errors: [{ message: 'provider credentials rejected' }],
+      hasErrors: true,
+    });
+    await attached;
+
+    expect(mockPersistCortexPartsToCanonicalMessage).toHaveBeenCalledWith({
+      req,
+      responseMessageId: 'resp-1',
+      cortexParts: pendingCortexParts,
+    });
+    expect(mockCreateCortexFollowUpMessage).toHaveBeenCalledTimes(1);
+  });
+
+  test('persists terminal parts but suppresses follow-up when user moved on during fallback', async () => {
+    const phaseB = deferred();
+    const mainReady = deferred();
+    const responseController = { lastUserInputTime: 10 };
+    const pendingCortexParts = [
+      {
+        type: ContentTypes.CORTEX_INSIGHT,
+        cortex_id: 'agent-background',
+        status: 'complete',
+        insight: 'Late result.',
+      },
+    ];
+    client._phaseBMainResponseReadyPromise = mainReady.promise;
+
+    const attached = client.attachBackgroundCortexCompletionPipeline({
+      cortexExecutionPromise: phaseB.promise,
+      pendingCortexParts,
+      req,
+      conversationId: 'conv-1',
+      responseMessageId: 'resp-1',
+      agent: primaryAgent,
+      getResponseContentParts: () => client.contentParts,
+      responseController,
+      turnUserInputTime: 10,
+      followupGraceMs: 0,
+      shouldDeferMainResponse: false,
+      getActivatedCorticesList: () => [],
+    });
+
+    phaseB.resolve({
+      insights: [{ cortexName: 'Background', insight: 'Late result.' }],
+      mergedPrompt: 'Late result.',
+      cortexCount: 1,
+    });
+    responseController.lastUserInputTime = 20;
+    client.contentParts.push({ type: ContentTypes.TEXT, text: 'Fallback answer.' });
+    mainReady.resolve();
+    await attached;
+
+    expect(mockPersistCortexPartsToCanonicalMessage).toHaveBeenCalledTimes(1);
+    expect(mockFinalizeCanonicalCortexMessage).toHaveBeenCalledWith({
+      req,
+      messageId: 'resp-1',
+    });
+    expect(mockCreateCortexFollowUpMessage).not.toHaveBeenCalled();
+  });
+
+  test('skips DB persistence for empty Phase B completion with no terminal parts', async () => {
+    const phaseB = deferred();
+    const attached = client.attachBackgroundCortexCompletionPipeline({
+      cortexExecutionPromise: phaseB.promise,
+      pendingCortexParts: [],
+      req,
+      conversationId: 'conv-1',
+      responseMessageId: 'resp-1',
+      agent: primaryAgent,
+      getResponseContentParts: () => client.contentParts,
+      responseController: null,
+      turnUserInputTime: 0,
+      followupGraceMs: 0,
+      shouldDeferMainResponse: false,
+      getActivatedCorticesList: () => [],
+    });
+
+    phaseB.resolve(null);
+    await attached;
+
+    expect(mockPersistCortexPartsToCanonicalMessage).not.toHaveBeenCalled();
+    expect(mockCreateCortexFollowUpMessage).not.toHaveBeenCalled();
+  });
+
+  test('allows fallback chatCompletion to run background cortices when primary never started Phase B', async () => {
+    const fallbackAgent = {
+      id: 'agent-fallback',
+      provider: EModelEndpoint.openAI,
+      model: 'gpt-5.4',
+      model_parameters: { model: 'gpt-5.4' },
+    };
+    primaryAgent.viventiumFallbackLlm = fallbackAgent;
+    let fallbackSawSuppression;
+    let calls = 0;
+    client.chatCompletion = jest.fn(async () => {
+      calls += 1;
+      if (calls === 1) {
+        client.contentParts.push({
+          type: ContentTypes.ERROR,
+          [ContentTypes.ERROR]: 'authentication 401 credential failure',
+        });
+        return;
+      }
+      fallbackSawSuppression = req.body.suppressBackgroundCortices;
+      client.contentParts.push({ type: ContentTypes.TEXT, text: 'Fallback answer.' });
+    });
+
+    const result = await client.sendCompletion({ text: 'hello' });
+
+    expect(client.chatCompletion).toHaveBeenCalledTimes(2);
+    expect(fallbackSawSuppression).toBeUndefined();
+    expect(Object.prototype.hasOwnProperty.call(req.body, 'suppressBackgroundCortices')).toBe(false);
+    expect(result.completion).toEqual([{ type: ContentTypes.TEXT, text: 'Fallback answer.' }]);
+  });
+
+  test('retries fallback when primary throws after adding a recoverable error part', async () => {
+    const fallbackAgent = {
+      id: 'agent-fallback',
+      provider: EModelEndpoint.openAI,
+      model: 'gpt-5.4',
+      model_parameters: { model: 'gpt-5.4' },
+    };
+    primaryAgent.viventiumFallbackLlm = fallbackAgent;
+    let calls = 0;
+    client.chatCompletion = jest.fn(async () => {
+      calls += 1;
+      if (calls === 1) {
+        client.contentParts.push({
+          type: ContentTypes.ERROR,
+          [ContentTypes.ERROR]: 'The model provider rate-limited this request. Please try again shortly.',
+          error_class: 'provider_rate_limited',
+        });
+        const error = new Error('rate limit');
+        error.status = 429;
+        throw error;
+      }
+      client.contentParts.push({ type: ContentTypes.TEXT, text: 'Fallback answer.' });
+    });
+
+    const result = await client.sendCompletion({ text: 'hello' });
+
+    expect(client.chatCompletion).toHaveBeenCalledTimes(2);
+    expect(result.completion).toEqual([{ type: ContentTypes.TEXT, text: 'Fallback answer.' }]);
+    expect(client.contentParts).toEqual([{ type: ContentTypes.TEXT, text: 'Fallback answer.' }]);
+  });
+
+  test('suppresses fallback background cortices only when primary Phase B already owns the response', async () => {
+    const fallbackAgent = {
+      id: 'agent-fallback',
+      provider: EModelEndpoint.openAI,
+      model: 'gpt-5.4',
+      model_parameters: { model: 'gpt-5.4' },
+    };
+    primaryAgent.viventiumFallbackLlm = fallbackAgent;
+    let fallbackSawSuppression;
+    let calls = 0;
+    client.chatCompletion = jest.fn(async () => {
+      calls += 1;
+      if (calls === 1) {
+        client._phaseBPromise = Promise.resolve(null);
+        client._phaseBPipelineResponseMessageId = client.responseMessageId;
+        client.contentParts.push({
+          type: ContentTypes.CORTEX_INSIGHT,
+          cortex_id: 'agent-background',
+          cortex_name: 'Background',
+          status: 'error',
+          error: 'This background agent hit a runtime issue before it could return a result.',
+        });
+        client.contentParts.push({
+          type: ContentTypes.ERROR,
+          [ContentTypes.ERROR]: 'authentication 401 credential failure',
+        });
+        return;
+      }
+      fallbackSawSuppression = req.body.suppressBackgroundCortices;
+      client.contentParts.push({ type: ContentTypes.TEXT, text: 'Fallback answer.' });
+    });
+
+    await client.sendCompletion({ text: 'hello' });
+
+    expect(client.chatCompletion).toHaveBeenCalledTimes(2);
+    expect(fallbackSawSuppression).toBe(true);
+    expect(Object.prototype.hasOwnProperty.call(req.body, 'suppressBackgroundCortices')).toBe(false);
+    expect(client.contentParts).toEqual([
+      expect.objectContaining({
+        type: ContentTypes.CORTEX_INSIGHT,
+        cortex_id: 'agent-background',
+        status: 'error',
+      }),
+      { type: ContentTypes.TEXT, text: 'Fallback answer.' },
+    ]);
+  });
+});
 
 /**
  * Integration test for Phase B cortex follow-up SSE emission.

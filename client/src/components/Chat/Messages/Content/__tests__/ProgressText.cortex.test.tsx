@@ -1,5 +1,5 @@
 import React from 'react';
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import CancelledIcon from '../CancelledIcon';
 import CortexCall from '../CortexCall';
 import ProgressText from '../ProgressText';
@@ -66,13 +66,14 @@ describe('ProgressText and background cortex status layout', () => {
     render(
       <CortexCall
         cortex_id="background"
-        cortex_name="Background"
+        cortex_name="Background Analysis"
         status="activating"
         reason="Relevant background check"
       />,
     );
 
-    expect(screen.getByRole('button')).toHaveTextContent('Checking Background...');
+    expect(screen.getByRole('button')).toHaveTextContent('Checking Background Analysis...');
+    expect(screen.getByText(/Background Analysis/)).toBeInTheDocument();
     expect(screen.getByTestId('spinner')).toBeInTheDocument();
   });
 
@@ -80,13 +81,14 @@ describe('ProgressText and background cortex status layout', () => {
     render(
       <CortexCall
         cortex_id="background"
-        cortex_name="Background"
+        cortex_name="Background Analysis"
         status="brewing"
         reason="Relevant background check"
       />,
     );
 
-    expect(screen.getByRole('button')).toHaveTextContent('Analyzing with Background...');
+    expect(screen.getByRole('button')).toHaveTextContent('Analyzing with Background Analysis...');
+    expect(screen.getByText(/Background Analysis/)).toBeInTheDocument();
     expect(screen.getByTestId('spinner')).toBeInTheDocument();
   });
 
@@ -103,20 +105,39 @@ describe('ProgressText and background cortex status layout', () => {
     );
 
     expect(container).toBeEmptyDOMElement();
-    expect(screen.queryByText('Insight from Background')).not.toBeInTheDocument();
+    expect(screen.queryByText(/Additional thought/)).not.toBeInTheDocument();
+  });
+
+  it('hides terminal no-response cortex completions even when an activation reason is preserved', () => {
+    const { container } = render(
+      <CortexCall
+        cortex_id="background"
+        cortex_name="Background"
+        status="complete"
+        reason="It was considered relevant before the cortex returned no response"
+        insight=""
+        silent={true}
+        no_response={true}
+      />,
+    );
+
+    expect(container).toBeEmptyDOMElement();
+    expect(screen.queryByText(/Additional thought/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/considered relevant/)).not.toBeInTheDocument();
   });
 
   it('still renders true cortex errors with the fixed-size cancelled icon', () => {
     const { container } = render(
       <CortexCall
         cortex_id="background"
-        cortex_name="Background"
+        cortex_name="Background Analysis"
         status="error"
         reason="The background check failed"
       />,
     );
 
-    expect(screen.getByRole('button')).toHaveTextContent('Background error');
+    expect(screen.getByRole('button')).toHaveTextContent('Background Analysis error');
+    expect(screen.getByText(/Background Analysis/)).toBeInTheDocument();
     const iconSlot = container.querySelector('.progress-text-icon');
     const iconRoot = container.querySelector('.progress-text-icon > div');
     expect(iconSlot).toHaveClass('size-5');
@@ -124,5 +145,68 @@ describe('ProgressText and background cortex status layout', () => {
     expect(iconRoot).toHaveClass('size-4');
     expect(iconRoot).toHaveClass('shrink-0');
     expect(screen.queryByTestId('spinner')).not.toBeInTheDocument();
+  });
+
+  it('renders terminal cortex error details in the expanded card', () => {
+    render(
+      <CortexCall
+        cortex_id="background"
+        cortex_name="Background Analysis"
+        status="error"
+        reason="The background check failed"
+        error="Provider authentication failed: missing required model scope"
+        error_class="provider_unauthorized"
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button'));
+
+    expect(screen.getByText('Error from Background Analysis')).toBeInTheDocument();
+    expect(
+      screen.getByText('Provider authentication failed: missing required model scope'),
+    ).toBeInTheDocument();
+    expect(screen.getByText('Issue type: Provider authentication issue')).toBeInTheDocument();
+    expect(screen.getByText('Error occurred')).toBeInTheDocument();
+  });
+
+  it('sanitizes private terminal cortex error details in the expanded card', () => {
+    const privateEmail = ['user', 'example.com'].join('@');
+    const privatePath = '/' + ['Users', 'example', 'project'].join('/');
+    const bearerSecret = ['Bearer', 'abcdefghijklmnopqrstuvwxyz'].join(' ');
+    render(
+      <CortexCall
+        cortex_id="background"
+        cortex_name="Background Analysis"
+        status="error"
+        reason="The background check failed"
+        error={`Provider failed for ${privateEmail} at ${privatePath} with ${bearerSecret}`}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button'));
+
+    expect(
+      screen.getByText('This background agent hit a runtime issue before it could return a result.'),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(privatePath)).not.toBeInTheDocument();
+    expect(screen.queryByText(privateEmail)).not.toBeInTheDocument();
+    expect(screen.queryByText(/abcdefghijklmnopqrstuvwxyz/)).not.toBeInTheDocument();
+  });
+
+  it('renders completed cortex insights with the activated cortex name visible', () => {
+    render(
+      <CortexCall
+        cortex_id="confirmation_bias"
+        cortex_name="Confirmation Bias"
+        status="complete"
+        reason="Relevant background check"
+        insight="This adds a genuinely new thought."
+      />,
+    );
+
+    expect(screen.getByRole('button')).toHaveTextContent('Confirmation Bias');
+    expect(screen.queryByText(/Additional thought/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Insight from Confirmation Bias/)).not.toBeInTheDocument();
+    expect(screen.getByText(/Confirmation Bias/)).toBeInTheDocument();
   });
 });

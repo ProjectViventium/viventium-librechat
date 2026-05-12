@@ -41,6 +41,7 @@ const CARTESIA_SONIC3_NONVERBAL_MARKERS = CARTESIA_SONIC3_CAPABILITIES.nonverbal
 const XAI_TTS_CAPABILITIES = require('../../../../../shared/voice/xai_tts_capabilities.json');
 const XAI_TTS_INLINE_TAGS = XAI_TTS_CAPABILITIES.speech_tags.inline;
 const XAI_TTS_WRAPPING_TAGS = XAI_TTS_CAPABILITIES.speech_tags.wrapping;
+const { getPromptText } = require('./promptRegistry');
 /* === VIVENTIUM END === */
 
 function normalizeVoiceProvider(voiceProvider) {
@@ -63,13 +64,17 @@ function buildVoiceModeInstructions(voiceProvider) {
     '- Do not output planning steps or tool instructions.',
     '- Do not read URLs or email addresses aloud; offer to send details instead.',
     '- Use natural language for dates/times (no raw timestamps).',
+    '- Use plain ASCII punctuation for spoken/display text. Do not use Unicode dash punctuation such as U+2013 or U+2014. Use commas, periods, or short sentence breaks instead.',
     '- Keep responses concise (1-4 sentences) unless the user asks for detail.',
+    '- Do not add memory/personality context to simple audio checks or short acknowledgments; answer the spoken need first and stop when no extra value is needed.',
+    '- If the user talks about voice providers, TTS, fallback routes, markup, or audio internals, treat that as a delivery constraint unless they explicitly ask for diagnostics. Do not narrate provider/fallback mechanics; give only the user-facing spoken response.',
+    "- Never claim a voice model/provider/fallback route is down, unavailable, or active from the user's hypothetical wording alone. Only state a delivery outage when verified runtime evidence says so; otherwise answer naturally.",
     '- If the user includes [voice], treat it as a strict voice-mode tag.',
   ];
 
   const provider = normalizeVoiceProvider(voiceProvider);
   if (provider.includes('chatterbox')) {
-    return [
+    const fallback = [
       ...baseRules,
       // Conservative set only: keep markers that reliably render as nonverbal audio in local MLX tests.
       '- Allowed nonverbal markers (use exactly these tokens): [laugh], [sigh], [gasp].',
@@ -77,9 +82,10 @@ function buildVoiceModeInstructions(voiceProvider) {
       '- Do NOT invent other bracketed stage directions.',
       '- Do NOT use <emotion .../> tags (those are Cartesia-only).',
     ].join('\n');
+    return getPromptText('surface.voice.provider.chatterbox', fallback);
   }
   if (provider === 'cartesia') {
-    return [
+    const fallback = [
       ...baseRules,
       `- Cartesia ${CARTESIA_SONIC3_CAPABILITIES.model_id} TTS is selected. You may use documented Cartesia SSML-like tags in the assistant text when they improve spoken delivery.`,
       `- Allowed nonverbal marker from Cartesia docs: ${CARTESIA_SONIC3_NONVERBAL_MARKERS.join(', ')}. Use it only when actual laughter belongs in the spoken response.`,
@@ -101,6 +107,16 @@ function buildVoiceModeInstructions(voiceProvider) {
       '- Use emotion, speed, volume, break, spell, and laughter markers sparingly; natural wording still matters more than markup.',
       /* === VIVENTIUM NOTE === */
     ].join('\n');
+    return getPromptText('surface.voice.provider.cartesia', fallback, {
+      cartesia: {
+        model_id: CARTESIA_SONIC3_CAPABILITIES.model_id,
+        nonverbal_markers: CARTESIA_SONIC3_NONVERBAL_MARKERS,
+        emotions: CARTESIA_SONIC3_EMOTIONS,
+        primary_emotions: CARTESIA_SONIC3_PRIMARY_EMOTIONS,
+        speed: CARTESIA_SONIC3_SPEED,
+        volume: CARTESIA_SONIC3_VOLUME,
+      },
+    });
   }
 
   /* === VIVENTIUM NOTE ===
@@ -109,7 +125,7 @@ function buildVoiceModeInstructions(voiceProvider) {
    * Cartesia Sonic-3 SSML-like tags and from the older Grok Voice Agent prompt.
    */
   if (provider === 'xai') {
-    return [
+    const fallback = [
       ...baseRules,
       '- xAI TTS is selected. You may use only documented xAI speech tags when they improve spoken delivery.',
       `- Allowed xAI inline tags: ${XAI_TTS_INLINE_TAGS.join(', ')}.`,
@@ -120,6 +136,12 @@ function buildVoiceModeInstructions(voiceProvider) {
       '- xAI TTS has no Cartesia-style emotion parameter; express tone through natural wording plus the documented xAI speech tags.',
       '- Use xAI speech tags sparingly; natural wording still matters more than markup.',
     ].join('\n');
+    return getPromptText('surface.voice.provider.xai', fallback, {
+      xai: {
+        inline_tags: XAI_TTS_INLINE_TAGS,
+        wrapping_tags: XAI_TTS_WRAPPING_TAGS.map((tag) => `<${tag}>TEXT</${tag}>`),
+      },
+    });
   }
   /* === VIVENTIUM NOTE === */
 
@@ -130,16 +152,18 @@ function buildVoiceModeInstructions(voiceProvider) {
    * by providers that do not support them.
    */
   if (provider === 'openai' || provider === 'elevenlabs') {
-    return [
+    const fallback = [
       ...baseRules,
       '- Do NOT use <emotion .../> or any XML/SSML-like tags.',
       '- Do NOT use bracketed stage directions like [laugh], [laughter], or [sigh].',
       '- Express tone and emotion through natural word choice and sentence structure only.',
+      '- Do not mention fallback, provider, route, or TTS mechanics in the spoken response unless the user explicitly asks for diagnostics.',
     ].join('\n');
+    return getPromptText('surface.voice.provider.plain_tts', fallback);
   }
   /* === VIVENTIUM NOTE === */
 
-  return baseRules.join('\n');
+  return getPromptText('surface.voice.call', baseRules.join('\n'));
 }
 
 function buildTelegramTextInstructions() {
@@ -147,7 +171,7 @@ function buildTelegramTextInstructions() {
   if (override) {
     return override;
   }
-  return [
+  const fallback = [
     'TELEGRAM TEXT MODE:',
     '- Use standard Markdown formatting (bold, italic, inline code, code blocks, block quotes).',
     '- Do NOT use Telegram MarkdownV2 escaping (no backslash-escaped punctuation like \\. \\- \\!).',
@@ -155,6 +179,7 @@ function buildTelegramTextInstructions() {
     '- Use short bold section titles and bullet lists; keep paragraphs short.',
     '- If sources are helpful, include plain URLs on a "Sources" line (no markdown links, no citation markers).',
   ].join('\n');
+  return getPromptText('surface.telegram.text', fallback);
 }
 
 function buildWebTextInstructions() {
@@ -162,13 +187,14 @@ function buildWebTextInstructions() {
   if (override) {
     return override;
   }
-  return [
+  const fallback = [
     'WEB TEXT MODE:',
     '- Use standard Markdown formatting (bold, italic, inline code, code blocks, block quotes).',
     '- Prefer short paragraphs and bullet lists when they improve scanability.',
     '- Avoid markdown tables, heading syntax (#), and HTML.',
     '- If sources are helpful, include plain URLs on a "Sources" line (no markdown links, no citation markers).',
   ].join('\n');
+  return getPromptText('surface.web', fallback);
 }
 
 function buildPlaygroundTextInstructions() {
@@ -176,11 +202,12 @@ function buildPlaygroundTextInstructions() {
   if (override) {
     return override;
   }
-  return [
+  const fallback = [
     'PLAYGROUND TEXT MODE:',
     '- Respond conversationally in plain text.',
     '- Avoid markdown formatting, lists, tables, and citation markers.',
   ].join('\n');
+  return getPromptText('surface.playground', fallback);
 }
 
 function buildVoiceNoteInputInstructions() {
@@ -188,11 +215,12 @@ function buildVoiceNoteInputInstructions() {
   if (override) {
     return override;
   }
-  return [
+  const fallback = [
     'INPUT MODE: TELEGRAM VOICE NOTE TRANSCRIPTION',
     '- The user spoke this request; transcription may contain minor errors.',
     '- Ask a clarifying question if the wording seems ambiguous.',
   ].join('\n');
+  return getPromptText('surface.telegram.voice_note', fallback);
 }
 
 function buildVoiceCallInputInstructions() {
@@ -200,11 +228,12 @@ function buildVoiceCallInputInstructions() {
   if (override) {
     return override;
   }
-  return [
+  const fallback = [
     'INPUT MODE: LIVE VOICE CALL',
     '- The user is speaking in real time; prioritize quick, spoken responses.',
     '- Avoid long lists, URLs, and email addresses; offer to send details via text.',
   ].join('\n');
+  return getPromptText('surface.voice.call_input', fallback);
 }
 
 function buildWingModeInstructions() {
@@ -214,15 +243,18 @@ function buildWingModeInstructions() {
   if (override) {
     return override;
   }
-  return [
+  const fallback = [
     'WING MODE:',
     '- You are in Wing Mode during a live voice call: quietly aware, helpful, and unobtrusive.',
     '- Treat TV, podcasts, videos, songs, meetings, and nearby chatter as background context unless the user is clearly talking to you.',
     '- A live call does not mean every spoken sentence is addressed to you; a bare spoken question, comment, or thought in the room is background unless the user directly addresses you or it clearly requires your memory, tools, or role in the call.',
+    '- Silence is the default outcome. Speak only when the user directly addresses you, asks you to act, or there is a clear time-sensitive/safety-critical intervention.',
+    '- Do not respond with emotional support, reflection, or "space to talk" just because ambient speech sounds personal, tired, stressed, or vulnerable.',
     '- If you do not have a clear, useful, additive contribution, output exactly {NTA}.',
     '- If you are not sure the user is addressing you, output exactly {NTA}.',
     '- Err aggressively on the side of silence.',
   ].join('\n');
+  return getPromptText('surface.wing', fallback);
 }
 
 function isWingModeEnabledForRequest(req, inputMode) {
@@ -294,7 +326,15 @@ function buildCortexOutputInstructions({ voiceMode, surface, inputMode }) {
     );
   }
 
-  return lines.join('\n');
+  let promptId = 'surface.cortex_output.web';
+  if (voiceInput) {
+    promptId = 'surface.cortex_output.voice';
+  } else if (surface === 'telegram') {
+    promptId = 'surface.cortex_output.telegram';
+  } else if (surface === 'playground') {
+    promptId = 'surface.cortex_output.playground';
+  }
+  return getPromptText(promptId, lines.join('\n'));
 }
 
 /* === VIVENTIUM NOTE ===
@@ -577,7 +617,10 @@ function buildTimeContextInstructions(req) {
     });
   }
 
-  return `Current time: ${formatted} (${resolvedTimezone})`;
+  return getPromptText('surface.time_context', `Current time: ${formatted} (${resolvedTimezone})`, {
+    formatted_time: formatted,
+    timezone: resolvedTimezone,
+  });
 }
 
 /* === VIVENTIUM START ===

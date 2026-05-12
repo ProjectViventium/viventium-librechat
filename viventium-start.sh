@@ -200,12 +200,68 @@ sync_viventium_librechat_config() {
     fi
 
     if [[ ! -f "$target_config" ]] || ! cmp -s "$source_config" "$target_config"; then
-        cp "$source_config" "$target_config"
+        local public_root="${VIVENTIUM_PUBLIC_ROOT:-$(cd "$PROJECT_DIR/../.." && pwd)}"
+        local prompt_registry_script="$public_root/scripts/viventium/prompt_registry.py"
+        if [[ -f "$prompt_registry_script" ]]; then
+            python3 - "$source_config" "$target_config" "$prompt_registry_script" <<'PY'
+import importlib.util
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+target = Path(sys.argv[2])
+registry_script = Path(sys.argv[3])
+spec = importlib.util.spec_from_file_location("viventium_prompt_registry", registry_script)
+if spec is None or spec.loader is None:
+    raise SystemExit(f"Unable to load prompt registry compiler: {registry_script}")
+prompt_registry = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = prompt_registry
+spec.loader.exec_module(prompt_registry)
+
+payload = prompt_registry.yaml.safe_load(source.read_text(encoding="utf-8"))
+resolved = prompt_registry.load_and_resolve_prompt_refs(payload)
+target.write_text(
+    prompt_registry.yaml.safe_dump(resolved, sort_keys=False, allow_unicode=True),
+    encoding="utf-8",
+	)
+PY
+        else
+            if grep -q "promptRef:" "$source_config"; then
+                echo -e "${RED}Error: Viventium prompt registry compiler is required because source config contains promptRef entries.${NC}" >&2
+                return 1
+            fi
+            cp "$source_config" "$target_config"
+        fi
         echo -e "${GREEN}LibreChat config synced from Viventium source of truth${NC}"
     fi
 }
 
 sync_viventium_librechat_config
+# === VIVENTIUM END ===
+
+# === VIVENTIUM START ===
+# Feature: Direct LibreChat dev starts use the prompt registry bundle.
+# Purpose: When developers start LibreChat directly from this wrapper, code-owned
+# Viventium prompt surfaces must exercise the same compiled prompt source of truth
+# as the full launcher, not silently fall back to inline prompt copies.
+ensure_viventium_prompt_bundle() {
+    local public_root="${VIVENTIUM_PUBLIC_ROOT:-$(cd "$PROJECT_DIR/../.." && pwd)}"
+    local prompt_registry_script="$public_root/scripts/viventium/prompt_registry.py"
+    local state_root="${VIVENTIUM_STATE_ROOT:-$HOME/Library/Application Support/Viventium/state/runtime/isolated}"
+    local target="${VIVENTIUM_PROMPT_BUNDLE_PATH:-$state_root/prompt-bundle.json}"
+
+    if [[ ! -f "$prompt_registry_script" ]]; then
+        echo -e "${YELLOW}Warning: prompt registry compiler not found: $prompt_registry_script${NC}"
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$target")"
+    python3 "$prompt_registry_script" --json-out "$target"
+    export VIVENTIUM_PROMPT_BUNDLE_PATH="$target"
+    echo -e "${GREEN}Prompt registry bundle generated at $target${NC}"
+}
+
+ensure_viventium_prompt_bundle
 # === VIVENTIUM END ===
 
 # === VIVENTIUM START ===
@@ -302,7 +358,21 @@ configure_anthropic_env() {
         export ANTHROPIC_API_KEY="${AZURE_AI_FOUNDRY_API_KEY:-}"
         # IMPORTANT: LibreChat Anthropic client appends `/v1/messages` internally.
         # Therefore this reverse proxy must NOT include a trailing `/v1` or you'll get `/v1/v1/messages` 404s.
-        FOUNDRY_REVERSE_PROXY="${VIVENTIUM_FOUNDRY_ANTHROPIC_REVERSE_PROXY:-https://aihubpaisalesi3989106374.services.ai.azure.com/anthropic}"
+        FOUNDRY_REVERSE_PROXY="${VIVENTIUM_FOUNDRY_ANTHROPIC_REVERSE_PROXY:-}"
+        if [ -z "$FOUNDRY_REVERSE_PROXY" ]; then
+            echo -e "${YELLOW}Warning: VIVENTIUM_FOUNDRY_ANTHROPIC_REVERSE_PROXY is not set; falling back to Anthropic direct/user-provided auth.${NC}"
+            if [ -n "$direct_anthropic_key" ]; then
+                export ANTHROPIC_API_KEY="$direct_anthropic_key"
+            elif [ -n "$existing_anthropic_key" ]; then
+                export ANTHROPIC_API_KEY="$existing_anthropic_key"
+            else
+                export ANTHROPIC_API_KEY="user_provided"
+            fi
+            unset ANTHROPIC_REVERSE_PROXY
+            unset ANTHROPIC_MODELS
+            echo -e "${GREEN}Anthropic mode: Direct fallback${NC}"
+            return 0
+        fi
         # Remove trailing /v1 if present (safety check)
         if [[ "$FOUNDRY_REVERSE_PROXY" == */v1 ]]; then
             echo -e "${YELLOW}Warning: Removing trailing /v1 from reverse proxy URL${NC}"
@@ -311,7 +381,7 @@ configure_anthropic_env() {
         export ANTHROPIC_REVERSE_PROXY="$FOUNDRY_REVERSE_PROXY"
         export ANTHROPIC_MODELS="${VIVENTIUM_FOUNDRY_ANTHROPIC_MODELS:-claude-opus-4-5}"
         echo -e "${GREEN}Anthropic mode: Foundry (Opus 4.5)${NC}"
-        echo -e "${GREEN}  ANTHROPIC_REVERSE_PROXY=${ANTHROPIC_REVERSE_PROXY}${NC}"
+        echo -e "${GREEN}  ANTHROPIC_REVERSE_PROXY configured${NC}"
     elif [ "$mode" = "direct" ]; then
         if [ -n "$direct_anthropic_key" ]; then
             export ANTHROPIC_API_KEY="$direct_anthropic_key"

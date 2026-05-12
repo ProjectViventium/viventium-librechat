@@ -41,6 +41,8 @@ describe('meeting transcript runtime helpers', () => {
   const oldEnv = process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_DIR;
   const oldMode = process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_RAG_MODE;
   const oldHome = process.env.HOME;
+  const oldAppSupport = process.env.VIVENTIUM_APP_SUPPORT_DIR;
+  const oldLibreChatDir = process.env.LIBRECHAT_DIR;
 
   afterEach(() => {
     if (oldEnv === undefined) {
@@ -57,6 +59,16 @@ describe('meeting transcript runtime helpers', () => {
       delete process.env.HOME;
     } else {
       process.env.HOME = oldHome;
+    }
+    if (oldAppSupport === undefined) {
+      delete process.env.VIVENTIUM_APP_SUPPORT_DIR;
+    } else {
+      process.env.VIVENTIUM_APP_SUPPORT_DIR = oldAppSupport;
+    }
+    if (oldLibreChatDir === undefined) {
+      delete process.env.LIBRECHAT_DIR;
+    } else {
+      process.env.LIBRECHAT_DIR = oldLibreChatDir;
     }
   });
 
@@ -92,6 +104,86 @@ describe('meeting transcript runtime helpers', () => {
       expect(getMeetingTranscriptSourcePathHash()).toBe(expectedHash);
     } finally {
       fs.rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back to generated App Support env when the launch process missed transcript env', () => {
+    const fakeAppSupport = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-app-support-'));
+    const fakeLibreChat = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-librechat-'));
+    const transcriptDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-transcripts-runtime-'));
+    const serviceEnvDir = path.join(fakeAppSupport, 'runtime', 'service-env');
+    try {
+      delete process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_DIR;
+      delete process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_RAG_MODE;
+      process.env.VIVENTIUM_APP_SUPPORT_DIR = fakeAppSupport;
+      process.env.LIBRECHAT_DIR = fakeLibreChat;
+      fs.mkdirSync(serviceEnvDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(serviceEnvDir, 'librechat.env'),
+        [
+          `VIVENTIUM_MEMORY_TRANSCRIPTS_DIR='${transcriptDir}'`,
+          'VIVENTIUM_MEMORY_TRANSCRIPTS_RAG_MODE=raw_only',
+          '',
+        ].join('\n'),
+        'utf8',
+      );
+
+      const expectedHash = crypto
+        .createHash('sha256')
+        .update(path.resolve(transcriptDir))
+        .digest('hex')
+        .slice(0, 16);
+      expect(getMeetingTranscriptSourcePathHash()).toBe(expectedHash);
+      expect(getMeetingTranscriptRagMode()).toBe('raw_only');
+    } finally {
+      fs.rmSync(fakeAppSupport, { recursive: true, force: true });
+      fs.rmSync(fakeLibreChat, { recursive: true, force: true });
+      fs.rmSync(transcriptDir, { recursive: true, force: true });
+    }
+  });
+
+  it('uses the same runtime env precedence as the memory hardening wrapper', () => {
+    const fakeAppSupport = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-app-support-'));
+    const fakeLibreChat = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-librechat-'));
+    const transcriptDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-transcripts-runtime-'));
+    const serviceEnvDir = path.join(fakeAppSupport, 'runtime', 'service-env');
+    try {
+      delete process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_DIR;
+      delete process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_RAG_MODE;
+      process.env.VIVENTIUM_APP_SUPPORT_DIR = fakeAppSupport;
+      process.env.LIBRECHAT_DIR = fakeLibreChat;
+      fs.mkdirSync(serviceEnvDir, { recursive: true });
+      fs.writeFileSync(path.join(fakeLibreChat, '.env'), 'VIVENTIUM_MEMORY_TRANSCRIPTS_RAG_MODE=raw_only\n', 'utf8');
+      fs.writeFileSync(
+        path.join(fakeAppSupport, 'runtime', 'runtime.env'),
+        [
+          `VIVENTIUM_MEMORY_TRANSCRIPTS_DIR='${transcriptDir}'`,
+          'VIVENTIUM_MEMORY_TRANSCRIPTS_RAG_MODE=detailed_summary_only',
+          '',
+        ].join('\n'),
+        'utf8',
+      );
+      fs.writeFileSync(
+        path.join(serviceEnvDir, 'librechat.env'),
+        [
+          "VIVENTIUM_MEMORY_TRANSCRIPTS_DIR=''",
+          "VIVENTIUM_MEMORY_TRANSCRIPTS_RAG_MODE=''",
+          '',
+        ].join('\n'),
+        'utf8',
+      );
+
+      const expectedHash = crypto
+        .createHash('sha256')
+        .update(path.resolve(transcriptDir))
+        .digest('hex')
+        .slice(0, 16);
+      expect(getMeetingTranscriptSourcePathHash()).toBe(expectedHash);
+      expect(getMeetingTranscriptRagMode()).toBe('detailed_summary_only');
+    } finally {
+      fs.rmSync(fakeAppSupport, { recursive: true, force: true });
+      fs.rmSync(fakeLibreChat, { recursive: true, force: true });
+      fs.rmSync(transcriptDir, { recursive: true, force: true });
     }
   });
 

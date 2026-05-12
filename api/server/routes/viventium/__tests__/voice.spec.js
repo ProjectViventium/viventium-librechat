@@ -1508,6 +1508,9 @@ describe('/api/viventium/voice/chat', () => {
 
     expect(res.statusCode).toBe(200);
     expect(res.body.latest.text).toBe('I finished checking the invoices.');
+    expect(res.body.latest.workerId).toBeUndefined();
+    expect(res.body.latest.runId).toBeUndefined();
+    expect(res.body.latest.callbackId).toBeUndefined();
     expect(mockGetMessages).toHaveBeenCalledWith({
       user: 'user_1',
       conversationId: 'conv-voice-1',

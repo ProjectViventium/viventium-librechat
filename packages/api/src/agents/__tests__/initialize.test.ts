@@ -361,10 +361,14 @@ describe('initializeAgent — custom endpoint init routing', () => {
 
 describe('initializeAgent — conversation recall resources', () => {
   const originalRagApiUrl = process.env.RAG_API_URL;
+  const originalAppSupportDir = process.env.VIVENTIUM_APP_SUPPORT_DIR;
   const originalFetch = global.fetch;
+  let isolatedAppSupportDir: string | null = null;
 
   beforeEach(() => {
     jest.clearAllMocks();
+    isolatedAppSupportDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-app-support-test-'));
+    process.env.VIVENTIUM_APP_SUPPORT_DIR = isolatedAppSupportDir;
     mockRagFileExists.mockResolvedValue(true);
     recallAvailabilityInternal.resetConversationRecallVectorRuntimeStatusCache();
     global.fetch = jest.fn().mockResolvedValue({
@@ -380,6 +384,15 @@ describe('initializeAgent — conversation recall resources', () => {
       delete process.env.RAG_API_URL;
     } else {
       process.env.RAG_API_URL = originalRagApiUrl;
+    }
+    if (originalAppSupportDir == null) {
+      delete process.env.VIVENTIUM_APP_SUPPORT_DIR;
+    } else {
+      process.env.VIVENTIUM_APP_SUPPORT_DIR = originalAppSupportDir;
+    }
+    if (isolatedAppSupportDir) {
+      fs.rmSync(isolatedAppSupportDir, { recursive: true, force: true });
+      isolatedAppSupportDir = null;
     }
   });
 
@@ -536,10 +549,14 @@ describe('initializeAgent — conversation recall resources', () => {
 describe('initializeAgent — meeting transcript resources', () => {
   const originalTranscriptDir = process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_DIR;
   const originalRagApiUrl = process.env.RAG_API_URL;
+  const originalAppSupportDir = process.env.VIVENTIUM_APP_SUPPORT_DIR;
   const originalFetch = global.fetch;
+  let isolatedAppSupportDir: string | null = null;
 
   beforeEach(() => {
     jest.clearAllMocks();
+    isolatedAppSupportDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-app-support-test-'));
+    process.env.VIVENTIUM_APP_SUPPORT_DIR = isolatedAppSupportDir;
     recallAvailabilityInternal.resetConversationRecallVectorRuntimeStatusCache();
     process.env.RAG_API_URL = 'http://rag.example.test';
     global.fetch = jest.fn().mockResolvedValue({
@@ -560,6 +577,15 @@ describe('initializeAgent — meeting transcript resources', () => {
       delete process.env.RAG_API_URL;
     } else {
       process.env.RAG_API_URL = originalRagApiUrl;
+    }
+    if (originalAppSupportDir == null) {
+      delete process.env.VIVENTIUM_APP_SUPPORT_DIR;
+    } else {
+      process.env.VIVENTIUM_APP_SUPPORT_DIR = originalAppSupportDir;
+    }
+    if (isolatedAppSupportDir) {
+      fs.rmSync(isolatedAppSupportDir, { recursive: true, force: true });
+      isolatedAppSupportDir = null;
     }
   });
 

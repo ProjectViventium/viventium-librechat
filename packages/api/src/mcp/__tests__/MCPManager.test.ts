@@ -289,6 +289,274 @@ describe('MCPManager', () => {
       expect(result).not.toContain('database');
     });
 
+    it('should not inject unresolved boolean serverInstructions', async () => {
+      (mockRegistryInstance.getAllServerConfigs as jest.Mock).mockResolvedValue({
+        scheduling: {
+          type: 'streamable-http',
+          url: 'http://127.0.0.1:7010/mcp',
+          startup: false,
+          serverInstructions: true,
+        },
+        glasshive: {
+          type: 'streamable-http',
+          url: 'http://127.0.0.1:8767/mcp',
+          startup: false,
+          serverInstructions: 'Use GlassHive tools from server-owned instructions.',
+        },
+      });
+
+      const manager = await MCPManager.createInstance(newMCPServersConfig());
+      const result = await manager.formatInstructionsForContext();
+
+      expect(result).toContain('## glasshive MCP Server Instructions');
+      expect(result).toContain('Use GlassHive tools from server-owned instructions.');
+      expect(result).not.toContain('## scheduling MCP Server Instructions');
+      expect(result).not.toContain('\ntrue');
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        '[MCP][scheduling] serverInstructions=true was not resolved to server-provided instructions; skipping injection',
+      );
+    });
+
+    it('should fetch server-provided instructions on demand for startup=false app-level servers', async () => {
+      const mockConnection = {
+        client: {
+          getInstructions: jest.fn().mockReturnValue('Server-owned Scheduling instructions.'),
+        },
+        disconnect: jest.fn().mockResolvedValue(undefined),
+      };
+      (MCPConnectionFactory.create as jest.Mock).mockResolvedValue(mockConnection);
+      (mockRegistryInstance.getAllServerConfigs as jest.Mock).mockResolvedValue({
+        scheduling: {
+          type: 'streamable-http',
+          url: 'http://127.0.0.1:7010/mcp',
+          startup: false,
+          serverInstructions: true,
+          requiresOAuth: false,
+          viventiumTrustedServerInstructions: true,
+        },
+      });
+
+      const manager = await MCPManager.createInstance(newMCPServersConfig());
+      const firstResult = await manager.formatInstructionsForContext();
+      const secondResult = await manager.formatInstructionsForContext();
+
+      expect(firstResult).toContain('## scheduling MCP Server Instructions');
+      expect(firstResult).toContain('Server-owned Scheduling instructions.');
+      expect(secondResult).toContain('Server-owned Scheduling instructions.');
+      expect(MCPConnectionFactory.create).toHaveBeenCalledTimes(1);
+      expect(MCPConnectionFactory.create).toHaveBeenCalledWith({
+        serverName: 'scheduling',
+        serverConfig: expect.objectContaining({ serverInstructions: true }),
+        dbSourced: false,
+        useSSRFProtection: false,
+      });
+      expect(mockConnection.disconnect).toHaveBeenCalledTimes(1);
+    });
+
+    it('should expose instruction source metadata for prompt-frame telemetry', async () => {
+      const mockConnection = {
+        client: {
+          getInstructions: jest.fn().mockReturnValue('Server-owned Scheduling instructions.'),
+        },
+        disconnect: jest.fn().mockResolvedValue(undefined),
+      };
+      (MCPConnectionFactory.create as jest.Mock).mockResolvedValue(mockConnection);
+      (mockRegistryInstance.getAllServerConfigs as jest.Mock).mockResolvedValue({
+        scheduling: {
+          type: 'streamable-http',
+          url: 'http://127.0.0.1:7010/mcp',
+          startup: false,
+          serverInstructions: true,
+          requiresOAuth: false,
+          viventiumTrustedServerInstructions: true,
+        },
+        glasshive: {
+          type: 'streamable-http',
+          url: 'http://127.0.0.1:8767/mcp',
+          startup: false,
+          serverInstructions: 'Use GlassHive tools from server-owned instructions.',
+        },
+        missingInstructions: {
+          type: 'stdio',
+          command: 'node',
+          args: ['server.js'],
+        },
+      });
+
+      const manager = await MCPManager.createInstance(newMCPServersConfig());
+      const result = await manager.formatInstructionsForContextWithMetadata([
+        'scheduling',
+        'glasshive',
+        'missingInstructions',
+      ]);
+
+      expect(result.text).toContain('Server-owned Scheduling instructions.');
+      expect(result.text).toContain('Use GlassHive tools from server-owned instructions.');
+      expect(result.sources).toEqual({
+        scheduling: 'server_fetched',
+        glasshive: 'config_inline',
+        missingInstructions: 'missing',
+      });
+    });
+
+    it('should not fetch server-provided instructions for servers excluded by filter', async () => {
+      (mockRegistryInstance.getAllServerConfigs as jest.Mock).mockResolvedValue({
+        scheduling: {
+          type: 'streamable-http',
+          url: 'http://127.0.0.1:7010/mcp',
+          startup: false,
+          serverInstructions: true,
+          requiresOAuth: false,
+          viventiumTrustedServerInstructions: true,
+        },
+        glasshive: {
+          type: 'streamable-http',
+          url: 'http://127.0.0.1:8767/mcp',
+          startup: false,
+          serverInstructions: 'Use GlassHive tools from server-owned instructions.',
+        },
+      });
+
+      const manager = await MCPManager.createInstance(newMCPServersConfig());
+      const result = await manager.formatInstructionsForContext(['glasshive']);
+
+      expect(result).toContain('## glasshive MCP Server Instructions');
+      expect(result).not.toContain('scheduling');
+      expect(MCPConnectionFactory.create).not.toHaveBeenCalled();
+    });
+
+    it('should not fetch server-provided instructions for OAuth servers without user context', async () => {
+      (mockRegistryInstance.getAllServerConfigs as jest.Mock).mockResolvedValue({
+        ms365: {
+          type: 'streamable-http',
+          url: 'http://127.0.0.1:8000/mcp',
+          startup: false,
+          serverInstructions: true,
+          requiresOAuth: true,
+          viventiumTrustedServerInstructions: true,
+        },
+      });
+
+      const manager = await MCPManager.createInstance(newMCPServersConfig());
+      const result = await manager.formatInstructionsForContext();
+
+      expect(result).toBe('');
+      expect(MCPConnectionFactory.create).not.toHaveBeenCalled();
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        '[MCP][ms365] serverInstructions=true requires server metadata, but OAuth/user-specific instructions cannot be fetched from app-level context',
+      );
+    });
+
+    it('should treat string "true" as unresolved serverInstructions and fetch from the server', async () => {
+      const mockConnection = {
+        client: {
+          getInstructions: jest.fn().mockReturnValue('Server-owned GlassHive instructions.'),
+        },
+        disconnect: jest.fn().mockResolvedValue(undefined),
+      };
+      (MCPConnectionFactory.create as jest.Mock).mockResolvedValue(mockConnection);
+      (mockRegistryInstance.getAllServerConfigs as jest.Mock).mockResolvedValue({
+        glasshive: {
+          type: 'streamable-http',
+          url: 'http://127.0.0.1:8767/mcp',
+          startup: false,
+          serverInstructions: 'true',
+          requiresOAuth: false,
+          viventiumTrustedServerInstructions: true,
+        },
+      });
+
+      const manager = await MCPManager.createInstance(newMCPServersConfig());
+      const result = await manager.formatInstructionsForContext();
+
+      expect(result).toContain('Server-owned GlassHive instructions.');
+      expect(result).not.toContain('\ntrue');
+      expect(MCPConnectionFactory.create).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not fetch server-provided instructions for untrusted boolean configs', async () => {
+      (mockRegistryInstance.getAllServerConfigs as jest.Mock).mockResolvedValue({
+        external: {
+          type: 'streamable-http',
+          url: 'http://127.0.0.1:9999/mcp',
+          startup: false,
+          serverInstructions: true,
+          requiresOAuth: false,
+        },
+      });
+
+      const manager = await MCPManager.createInstance(newMCPServersConfig());
+      const result = await manager.formatInstructionsForContextWithMetadata(['external']);
+
+      expect(result.text).toBe('');
+      expect(result.sources).toEqual({ external: 'missing' });
+      expect(MCPConnectionFactory.create).not.toHaveBeenCalled();
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        '[MCP][external] serverInstructions=true is only allowed for trusted first-party server configs; skipping injection',
+      );
+    });
+
+    it('negative-caches failed server-provided instruction fetches', async () => {
+      (MCPConnectionFactory.create as jest.Mock).mockRejectedValue(new Error('server down'));
+      (mockRegistryInstance.getAllServerConfigs as jest.Mock).mockResolvedValue({
+        scheduling: {
+          type: 'streamable-http',
+          url: 'http://127.0.0.1:7010/mcp',
+          startup: false,
+          serverInstructions: true,
+          requiresOAuth: false,
+          viventiumTrustedServerInstructions: true,
+        },
+      });
+
+      const manager = await MCPManager.createInstance(newMCPServersConfig());
+      const first = await manager.formatInstructionsForContextWithMetadata(['scheduling']);
+      const second = await manager.formatInstructionsForContextWithMetadata(['scheduling']);
+
+      expect(first).toEqual({ text: '', sources: { scheduling: 'missing' } });
+      expect(second).toEqual({ text: '', sources: { scheduling: 'missing' } });
+      expect(MCPConnectionFactory.create).toHaveBeenCalledTimes(1);
+    });
+
+    it('disconnects a late temporary server-instructions connection after timeout', async () => {
+      const previousTimeout = process.env.VIVENTIUM_MCP_SERVER_INSTRUCTIONS_TIMEOUT_MS;
+      process.env.VIVENTIUM_MCP_SERVER_INSTRUCTIONS_TIMEOUT_MS = '1';
+      const mockConnection = {
+        client: {
+          getInstructions: jest.fn().mockReturnValue('Late server instructions.'),
+        },
+        disconnect: jest.fn().mockResolvedValue(undefined),
+      };
+      (MCPConnectionFactory.create as jest.Mock).mockImplementation(
+        () => new Promise((resolve) => setTimeout(() => resolve(mockConnection), 20)),
+      );
+      (mockRegistryInstance.getAllServerConfigs as jest.Mock).mockResolvedValue({
+        scheduling: {
+          type: 'streamable-http',
+          url: 'http://127.0.0.1:7010/mcp',
+          startup: false,
+          serverInstructions: true,
+          requiresOAuth: false,
+          viventiumTrustedServerInstructions: true,
+        },
+      });
+
+      try {
+        const manager = await MCPManager.createInstance(newMCPServersConfig());
+        const result = await manager.formatInstructionsForContextWithMetadata(['scheduling']);
+
+        expect(result).toEqual({ text: '', sources: { scheduling: 'missing' } });
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        expect(mockConnection.disconnect).toHaveBeenCalledTimes(1);
+      } finally {
+        if (previousTimeout == null) {
+          delete process.env.VIVENTIUM_MCP_SERVER_INSTRUCTIONS_TIMEOUT_MS;
+        } else {
+          process.env.VIVENTIUM_MCP_SERVER_INSTRUCTIONS_TIMEOUT_MS = previousTimeout;
+        }
+      }
+    });
+
     it('should return empty string when filtered servers have no instructions', async () => {
       (mockRegistryInstance.getAllServerConfigs as jest.Mock).mockResolvedValue({
         github: {
@@ -327,7 +595,10 @@ describe('MCPManager', () => {
       expect(result).toBeNull();
       expect(mockLogger.warn).toHaveBeenCalledWith(
         `[getServerToolFunctions] Error getting tool functions for server ${serverName}`,
-        expect.any(Error),
+        expect.objectContaining({
+          name: 'Error',
+          message: 'Connection failed',
+        }),
       );
     });
 
@@ -349,7 +620,10 @@ describe('MCPManager', () => {
       expect(result).toBeNull();
       expect(mockLogger.warn).toHaveBeenCalledWith(
         `[getServerToolFunctions] Error getting tool functions for server ${serverName}`,
-        expect.any(Error),
+        expect.objectContaining({
+          name: 'Error',
+          message: 'Failed to get user connections',
+        }),
       );
       expect(spy).toHaveBeenCalled();
     });
@@ -400,7 +674,10 @@ describe('MCPManager', () => {
       expect(result).toBeNull();
       expect(mockLogger.warn).toHaveBeenCalledWith(
         `[getServerToolFunctions] Error getting tool functions for server ${specificServerName}`,
-        expect.any(Error),
+        expect.objectContaining({
+          name: 'Error',
+          message: 'Server specific error',
+        }),
       );
     });
   });

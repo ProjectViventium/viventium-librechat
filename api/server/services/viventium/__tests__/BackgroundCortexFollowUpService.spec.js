@@ -13,7 +13,112 @@ const {
   resolveFollowUpContinuationContext,
   resolveFollowUpPersistenceText,
   sanitizeAnthropicFollowUpLLMConfig,
+  shouldForceVisibleFollowUpForEmptyPrimary,
+  extractRecentResponseTextFromMessage,
+  isPlaceholderRecentResponseText,
+  upsertCortexParts,
 } = require('../BackgroundCortexFollowUpService');
+
+describe('upsertCortexParts', () => {
+  test('preserves the parent Phase A text when adding cortex parts', () => {
+    const merged = upsertCortexParts(
+      [],
+      [
+        {
+          type: 'cortex_insight',
+          cortex_id: 'confirmation_bias',
+          cortex_name: 'Confirmation Bias',
+          status: 'complete',
+          insight: 'Check assumptions.',
+        },
+      ],
+      { visibleText: 'TEST_OK' },
+    );
+
+    expect(merged).toEqual([
+      expect.objectContaining({ type: 'text', text: 'TEST_OK' }),
+      expect.objectContaining({
+        type: 'cortex_insight',
+        cortex_id: 'confirmation_bias',
+      }),
+    ]);
+  });
+
+  test('does not turn an internal no-response marker into visible parent text', () => {
+    const merged = upsertCortexParts(
+      [],
+      [
+        {
+          type: 'cortex_insight',
+          cortex_id: 'red_team',
+          cortex_name: 'Red Team',
+          status: 'complete',
+          insight: 'No issue.',
+        },
+      ],
+      { visibleText: '{NTA}' },
+    );
+
+    expect(merged).toEqual([
+      expect.objectContaining({
+        type: 'cortex_insight',
+        cortex_id: 'red_team',
+      }),
+    ]);
+  });
+});
+
+describe('Phase B prompt registry ownership', () => {
+  afterEach(() => {
+    jest.dontMock('~/server/services/viventium/promptRegistry');
+    jest.resetModules();
+  });
+
+  test('routes ordinary follow-up user prompts through the prompt registry', () => {
+    jest.resetModules();
+    const getPromptText = jest.fn((_promptId, fallback) => fallback);
+    jest.doMock('~/server/services/viventium/promptRegistry', () => ({ getPromptText }));
+    const { formatFollowUpPrompt: registryFormatFollowUpPrompt } = require('../BackgroundCortexFollowUpService');
+
+    registryFormatFollowUpPrompt({
+      insights: [{ cortexName: 'worker', insight: 'The worker found a result.' }],
+      recentResponse: 'I am checking.',
+      voiceMode: false,
+      surface: '',
+    });
+
+    expect(getPromptText).toHaveBeenCalledWith(
+      'cortex.follow_up_phase_b.user_message',
+      expect.any(String),
+      expect.objectContaining({
+        background_insights: expect.stringContaining('The worker found a result.'),
+        recent_response_context: expect.stringContaining('Here is the response you JUST sent'),
+      }),
+    );
+  });
+
+  test('routes Phase B system prompts through the prompt registry', () => {
+    jest.resetModules();
+    const getPromptText = jest.fn((_promptId, fallback) => fallback);
+    jest.doMock('~/server/services/viventium/promptRegistry', () => ({ getPromptText }));
+    const {
+      buildFollowUpSystemPrompt: registryBuildFollowUpSystemPrompt,
+    } = require('../BackgroundCortexFollowUpService');
+
+    registryBuildFollowUpSystemPrompt({
+      primaryResponseMode: true,
+      noResponseInstructions: 'Use {NTA} when no reply is needed.',
+    });
+
+    expect(getPromptText).toHaveBeenCalledWith(
+      'cortex.follow_up_phase_b.primary_system',
+      expect.any(String),
+      expect.objectContaining({
+        no_response_instructions: 'Use {NTA} when no reply is needed.',
+      }),
+    );
+  });
+});
 
 describe('formatFollowUpPrompt', () => {
   test('defaults web follow-ups to markdown-friendly web text rules', () => {
@@ -40,6 +145,25 @@ describe('formatFollowUpPrompt', () => {
 
     expect(prompt).toContain('PLAYGROUND TEXT MODE:');
     expect(prompt).not.toContain('WEB TEXT MODE:');
+  });
+
+  test('keeps Wing Mode follow-ups silence-first', () => {
+    const prompt = formatFollowUpPrompt({
+      insights: [
+        {
+          cortexName: 'Emotional Resonance',
+          insight: 'The user may need space to talk, but did not address the assistant directly.',
+        },
+      ],
+      recentResponse: '{NTA}',
+      voiceMode: true,
+      surface: 'wing',
+    });
+
+    expect(prompt).toContain('Wing Mode follow-up rule:');
+    expect(prompt).toContain('silence-first ambient voice context');
+    expect(prompt).toContain('Output exactly {NTA}');
+    expect(prompt).toContain('Emotional resonance, general support, or “space to talk” is not enough');
   });
 
   test('tells the follow-up model to keep new facts even when an insight ends with a question', () => {
@@ -139,6 +263,29 @@ describe('resolveFollowUpPersistenceText', () => {
     expect(result.decision.suppressionReason).toBe('');
   });
 
+  test('preserves snake_case deferred error classes for deterministic fallback text', () => {
+    const result = resolveFollowUpPersistenceText({
+      generatedText: '',
+      insightsData: {
+        insights: [],
+        hasErrors: true,
+        errors: [
+          {
+            error: 'public-safe provider message',
+            error_class: 'provider_rate_limited',
+          },
+        ],
+      },
+      replaceParentMessage: false,
+      voiceMode: false,
+      surface: 'web',
+      scheduleId: '',
+    });
+
+    expect(result.text).toBe('That background check was rate-limited by the configured provider.');
+    expect(result.decision.selectedStrategy).toBe('deterministic_fallback');
+  });
+
   test('keeps {NTA} suppressed for ordinary follow-ups', () => {
     const result = resolveFollowUpPersistenceText({
       generatedText: '{NTA}',
@@ -202,6 +349,26 @@ describe('resolveFollowUpPersistenceText', () => {
     expect(result.decision.suppressionReason).toBe('');
   });
 
+  test('suppresses generated Wing Mode follow-ups unless explicitly forced visible', () => {
+    const result = resolveFollowUpPersistenceText({
+      generatedText: 'You sound like you need space to talk.',
+      insightsData: {
+        insights: [
+          {
+            cortexName: 'Emotional Resonance',
+            insight: 'Ambient speech sounded vulnerable, but the user did not address the assistant.',
+          },
+        ],
+      },
+      voiceMode: true,
+      surface: 'wing',
+    });
+
+    expect(result.text).toBe('');
+    expect(result.decision.selectedStrategy).toBe('wing_surface_suppressed');
+    expect(result.decision.suppressionReason).toBe('wing_silence_first');
+  });
+
   test('preserves forced follow-up fallback when {NTA} has visible insight text', () => {
     const result = resolveFollowUpPersistenceText({
       generatedText: '{NTA}',
@@ -256,6 +423,34 @@ describe('resolveFollowUpPersistenceText', () => {
 
     expect(result.text).toBe('That choice is fine. Good call.');
     expect(result.decision.selectedStrategy).toBe('deterministic_fallback');
+    expect(result.decision.suppressionReason).toBe('');
+  });
+
+  test('uses best visible insight when an empty primary answer leaves multiple completed insights', () => {
+    const result = resolveFollowUpPersistenceText({
+      generatedText: '',
+      insightsData: {
+        insights: [
+          {
+            cortexName: 'Confirmation Bias',
+            insight:
+              'This plan depends on one enthusiastic prospect, so the next move is validation before building.',
+          },
+          {
+            cortexName: 'Red Team',
+            insight:
+              'The strongest risk is workflow fit: generic transcription spend does not prove a PE-specific product budget.',
+          },
+        ],
+      },
+      forceVisibleFollowUp: true,
+      voiceMode: false,
+      surface: 'web',
+      generationFailed: true,
+    });
+
+    expect(result.text).toContain('generic transcription spend');
+    expect(result.decision.selectedStrategy).toBe('best_visible_insight');
     expect(result.decision.suppressionReason).toBe('');
   });
 
@@ -359,6 +554,68 @@ describe('resolveFollowUpPersistenceText', () => {
     expect(result.decision.selectedStrategy).toBe('voice_empty_suppressed');
     expect(result.decision.suppressionReason).toBe('voice_followup_generation_failed');
     expect(result.decision.generationFailed).toBe(true);
+  });
+});
+
+describe('shouldForceVisibleFollowUpForEmptyPrimary', () => {
+  test('forces visible Phase B when the normal text primary answer is empty and insights completed', () => {
+    expect(
+      shouldForceVisibleFollowUpForEmptyPrimary({
+        hasInsights: true,
+        recentResponse: '',
+        voiceMode: false,
+        surface: 'web',
+      }),
+    ).toBe(true);
+  });
+
+  test('treats generation placeholders as empty primary answers', () => {
+    expect(isPlaceholderRecentResponseText('Generation in progress.')).toBe(true);
+    expect(
+      extractRecentResponseTextFromMessage({
+        text: 'Generation in progress.',
+        content: [{ type: 'text', text: 'Generation in progress.' }],
+      }),
+    ).toBe('');
+    expect(
+      shouldForceVisibleFollowUpForEmptyPrimary({
+        hasInsights: true,
+        recentResponse: 'Generation in progress.',
+        voiceMode: false,
+        surface: 'web',
+      }),
+    ).toBe(true);
+  });
+
+  test('does not force ambient voice or Wing Mode follow-ups from an empty primary answer', () => {
+    expect(
+      shouldForceVisibleFollowUpForEmptyPrimary({
+        hasInsights: true,
+        recentResponse: '',
+        voiceMode: true,
+        surface: 'playground',
+      }),
+    ).toBe(false);
+    expect(
+      shouldForceVisibleFollowUpForEmptyPrimary({
+        hasInsights: true,
+        recentResponse: '',
+        voiceMode: false,
+        surface: 'wing',
+      }),
+    ).toBe(false);
+  });
+
+  test('preserves explicit force-visible decisions even when the primary answer is non-empty', () => {
+    expect(
+      shouldForceVisibleFollowUpForEmptyPrimary({
+        configuredForceVisibleFollowUp: true,
+        hasInsights: true,
+        recentResponse: 'Checking now.',
+        voiceMode: false,
+        surface: 'web',
+      }),
+    ).toBe(true);
   });
 });
 

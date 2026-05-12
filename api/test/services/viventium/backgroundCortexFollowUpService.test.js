@@ -975,6 +975,86 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(msg.messageId).not.toBe('m-parent');
   });
 
+  test('createCortexFollowUpMessage promotes forced text onto an empty canonical parent', async () => {
+    const req = { user: { id: 'u1' } };
+    db.getMessages.mockResolvedValueOnce([
+      { messageId: 'm-parent', parentMessageId: 'u-message', sender: 'AI', text: '' },
+    ]);
+    db.getMessage.mockResolvedValue({
+      messageId: 'm-parent',
+      conversationId: 'c-123',
+      parentMessageId: 'u-message',
+      sender: 'Viventium',
+      text: '',
+      unfinished: true,
+      content: [
+        {
+          type: 'cortex_insight',
+          cortex_id: 'agent_123',
+          cortex_name: 'Red Team',
+          status: 'complete',
+          insight: 'Workflow fit is the main risk.',
+        },
+      ],
+      metadata: {
+        viventium: {
+          existing: true,
+        },
+      },
+    });
+    db.updateMessage.mockResolvedValue({});
+
+    Run.create.mockResolvedValueOnce({
+      processStream: jest.fn(async () => 'The real risk is workflow fit, not transcription quality.'),
+    });
+
+    const msg = await createCortexFollowUpMessage({
+      req,
+      conversationId: 'c-123',
+      parentMessageId: 'm-parent',
+      agent: { id: 'agent_123', provider: 'openai', model: 'gpt-5.4', model_parameters: {} },
+      insightsData: {
+        cortexCount: 1,
+        insights: [{ cortexName: 'Red Team', insight: 'Workflow fit is the main risk.' }],
+      },
+      recentResponse: '',
+      forceVisibleFollowUp: true,
+    });
+
+    expect(db.saveMessage).not.toHaveBeenCalled();
+    expect(db.updateMessage).toHaveBeenCalledWith(
+      req,
+      expect.objectContaining({
+        messageId: 'm-parent',
+        text: 'The real risk is workflow fit, not transcription quality.',
+        unfinished: false,
+        content: expect.arrayContaining([
+          expect.objectContaining({ type: 'cortex_insight', cortex_id: 'agent_123' }),
+          { type: 'text', text: 'The real risk is workflow fit, not transcription quality.' },
+        ]),
+        metadata: expect.objectContaining({
+          viventium: expect.objectContaining({
+            type: 'cortex_followup',
+            parentMessageId: 'u-message',
+            replacedParentMessage: true,
+            forceVisibleFollowUp: true,
+            promotedToEmptyParent: true,
+          }),
+        }),
+      }),
+      expect.any(Object),
+    );
+    expect(msg).toEqual(
+      expect.objectContaining({
+        messageId: 'm-parent',
+        conversationId: 'c-123',
+        parentMessageId: 'u-message',
+        text: 'The real risk is workflow fit, not transcription quality.',
+        unfinished: false,
+      }),
+    );
+  });
+
   test('createCortexFollowUpMessage saves forced follow-up with best insight when synthesis returns NTA', async () => {
     const req = { user: { id: 'u1' } };
     db.getMessages.mockResolvedValueOnce([
@@ -1567,7 +1647,7 @@ describe('BackgroundCortexFollowUpService', () => {
       model: 'claude-opus-4-7',
       model_parameters: { thinking: false },
       voice_llm_provider: 'xai',
-      voice_llm_model: 'grok-4-1-fast-non-reasoning',
+      voice_llm_model: 'grok-4.20-non-reasoning',
     });
 
     await generateFollowUpText({

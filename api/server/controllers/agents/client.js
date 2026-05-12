@@ -17,6 +17,7 @@
  * Updated: 2026-02-07
  */
 	require('events').EventEmitter.defaultMaxListeners = 100;
+	const crypto = require('crypto');
 	const { logger } = require('@librechat/data-schemas');
 	const { HumanMessage } = require('@langchain/core/messages');
 	const {
@@ -95,6 +96,7 @@ const {
 const {
   createRuntimeHoldTextPart,
 } = require('~/server/services/viventium/runtimeHoldText');
+const { getPromptText } = require('~/server/services/viventium/promptRegistry');
 /* === VIVENTIUM NOTE ===
  * Feature: Background cortex follow-up grace window
  */
@@ -106,6 +108,7 @@ const { getCortexFollowupGraceMs } = require('~/server/services/viventium/cortex
 const {
   shouldDeferMainResponse: shouldDeferToolCortexMainResponse,
   collectDirectActionScopeKeysFromCortices,
+  collectEffectiveDirectActionScopeKeys,
   pickHoldText: pickToolCortexHoldText,
   shouldForcePhaseBFollowUp,
 } = require('~/server/services/viventium/brewingHold');
@@ -132,6 +135,29 @@ const INTERNAL_CONTENT_TYPES = new Set([
   ContentTypes.THINK,
 ]);
 
+const CORTEX_CONTENT_TYPES = new Set([
+  ContentTypes.CORTEX_ACTIVATION,
+  ContentTypes.CORTEX_BREWING,
+  ContentTypes.CORTEX_INSIGHT,
+]);
+
+function upsertCortexContentPart(parts, cortexPart) {
+  if (!Array.isArray(parts) || !cortexPart?.cortex_id || !CORTEX_CONTENT_TYPES.has(cortexPart.type)) {
+    return false;
+  }
+  const existingIdx = parts.findIndex(
+    (part) =>
+      part?.cortex_id === cortexPart.cortex_id &&
+      CORTEX_CONTENT_TYPES.has(part?.type),
+  );
+  if (existingIdx >= 0) {
+    parts[existingIdx] = cortexPart;
+  } else {
+    parts.push(cortexPart);
+  }
+  return true;
+}
+
 /* === VIVENTIUM NOTE ===
  * Feature: Normalize persisted text content blocks before provider formatting.
  *
@@ -149,6 +175,7 @@ const {
 } = require('~/server/services/viventium/normalizeTextContentParts');
 const {
   shouldRetryWithFallback,
+  hasVisibleAssistantText,
 } = require('~/server/services/viventium/agentLlmFallback');
 const {
   sanitizeAggregatedContentParts,
@@ -169,6 +196,13 @@ const {
   scheduleConversationRecallSync,
 } = require('~/server/services/viventium/conversationRecallService');
 const { resolveMemoryTokenLimit } = require('~/server/services/viventium/memoryTokenLimit');
+/* === VIVENTIUM START ===
+ * Feature: Prompt-frame telemetry (metadata-only prompt architecture observability).
+ * === VIVENTIUM END === */
+const {
+  buildPromptFrame,
+  logPromptFrame,
+} = require('~/server/services/viventium/promptFrameTelemetry');
 /* === VIVENTIUM NOTE END === */
 /* === VIVENTIUM NOTE END === */
 
@@ -203,6 +237,22 @@ const stripInternalContentParts = (payload) => {
   });
 };
 /* === VIVENTIUM NOTE END === */
+
+/* === VIVENTIUM START ===
+ * Feature: Phase B lifecycle ownership across main-model fallback.
+ * Purpose: Keep a single request-wide "main response ready" gate so background
+ * cortex follow-up synthesis waits for the final primary-or-fallback answer.
+ * === VIVENTIUM END === */
+function createDeferredPromise() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+/* === VIVENTIUM END === */
 
 /* === VIVENTIUM NOTE ===
  * Feature: Memory buffer sanitization for internal-control and no-response content.
@@ -703,10 +753,50 @@ function formatActivationSummary(activatedCortices) {
 
   return [
     '## Activated Background Agents',
+    'Only the background agents listed below activated for this turn. Do not say any other named background agent ran, is running, activated, completed, or checked the issue.',
     lines,
     '',
     'A single follow-up response will be generated once ALL activated agents finish.',
   ].join('\n');
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Background cortex card contract guard.
+ * Purpose: Client-sent agent payloads can lag source-of-truth prompt updates. Keep the runtime
+ * instruction contract stable so the main answer does not contradict backend-owned cards/results.
+ * === VIVENTIUM END === */
+const BACKGROUND_CORTEX_RUNTIME_CARD_GUARD_PROMPT_ID = 'main.background_cortex_runtime_card_guard';
+const BACKGROUND_CORTEX_RUNTIME_CARD_GUARD_FALLBACK = [
+  '## Runtime-Owned Background Cards',
+  'Runtime may display background-cortex status/result cards outside your text.',
+  'Do not claim you cannot control those cards, do not say there is nothing to show, and do not narrate UI mechanics.',
+  'Do not offer to start, spin up, launch, or run background agents/cortices when the user already asked for background analysis, red-team review, bias checking, or visible background work; treat that work as already runtime-owned and answer the substantive request.',
+  'Do not say a specific background agent/cortex ran, is running, activated, completed, or checked the issue unless it appears in the current turn\'s "Activated Background Agents" runtime section. If the user asked for a named background agent that is not listed there, do not claim it ran; answer the substantive request and let visible runtime cards provide the proof.',
+  "Answer the user's substantive request and let runtime-owned cards speak for themselves.",
+].join('\n');
+
+const BACKGROUND_CORTEX_RUNTIME_CARD_GUARD_MARKER =
+  'Do not offer to start, spin up, launch, or run background agents/cortices';
+
+function ensureBackgroundCortexRuntimeCardGuard(agent) {
+  if (!agent || typeof agent !== 'object') {
+    return false;
+  }
+  if (!Array.isArray(agent.background_cortices) || agent.background_cortices.length === 0) {
+    return false;
+  }
+  const instructions = typeof agent.instructions === 'string' ? agent.instructions : '';
+  if (instructions.includes(BACKGROUND_CORTEX_RUNTIME_CARD_GUARD_MARKER)) {
+    return false;
+  }
+  const runtimeCardGuard = getPromptText(
+    BACKGROUND_CORTEX_RUNTIME_CARD_GUARD_PROMPT_ID,
+    BACKGROUND_CORTEX_RUNTIME_CARD_GUARD_FALLBACK,
+  );
+  agent.instructions = [instructions, runtimeCardGuard]
+    .filter((part) => typeof part === 'string' && part.trim().length > 0)
+    .join('\n\n');
+  return runtimeCardGuard;
 }
 
 function extractTextFromContentParts(parts) {
@@ -733,6 +823,129 @@ function extractTextFromContentParts(parts) {
 
   return texts.join('');
 }
+
+/* === VIVENTIUM START ===
+ * Feature: Late stream termination handling.
+ * Purpose: If a provider/socket terminates after visible assistant text streamed, keep the authored
+ * answer durable without adding a fatal red error card to the same message.
+ */
+function getCompletionErrorMessage(err) {
+  if (err == null) {
+    return '';
+  }
+  if (typeof err === 'string') {
+    return err;
+  }
+  if (typeof err.message === 'string') {
+    return err.message;
+  }
+  return String(err);
+}
+
+function classifyCompletionErrorForLog(err) {
+  const message = getCompletionErrorMessage(err).trim().toLowerCase();
+  if (isLateStreamTerminationError(err)) {
+    return 'late_stream_termination';
+  }
+  if (message.includes('rate limit') || message.includes('rate_limit') || err?.status === 429) {
+    return 'provider_rate_limited';
+  }
+  if (message.includes('unauthorized') || err?.status === 401) {
+    return 'provider_unauthorized';
+  }
+  if (message.includes('forbidden') || err?.status === 403) {
+    return 'provider_access_denied';
+  }
+  if (message.includes('context length') || message.includes('maximum context')) {
+    return 'context_length_exceeded';
+  }
+  return 'completion_error';
+}
+
+function sanitizeCompletionErrorForLog(err) {
+  return {
+    class: classifyCompletionErrorForLog(err),
+    name: err?.name || null,
+    status: Number.isFinite(err?.status) ? err.status : null,
+    code: err?.code || err?.lc_error_code || null,
+  };
+}
+
+function hashCompletionTextForLog(text, length = 12) {
+  return crypto.createHash('sha256').update(String(text || '')).digest('hex').slice(0, length);
+}
+
+function isLateStreamTerminationError(err) {
+  const message = getCompletionErrorMessage(err).trim().toLowerCase();
+  return (
+    message === 'terminated' ||
+    message.endsWith(': terminated') ||
+    message === 'aborted' ||
+    message.endsWith(': aborted') ||
+    message === 'aborterror' ||
+    message.includes('stream terminated') ||
+    message.includes('request terminated') ||
+    message.includes('operation was aborted') ||
+    message.includes('request aborted')
+  );
+}
+
+function shouldSuppressCompletionErrorContentPart(contentParts, err) {
+  return hasVisibleAssistantText(contentParts) && isLateStreamTerminationError(err);
+}
+
+function createCompletionErrorContentPart(err) {
+  const errorClass = classifyCompletionErrorForLog(err);
+  const publicMessageByClass = {
+    late_stream_termination: 'The model stream ended before a response was available.',
+    provider_rate_limited: 'The model provider rate-limited this request. Please try again shortly.',
+    provider_unauthorized: 'The model provider credentials were rejected.',
+    provider_access_denied: 'The model provider denied access to this request.',
+    context_length_exceeded: 'The request was too large for the model context.',
+    completion_error: 'The model provider could not complete this request.',
+  };
+  return {
+    type: ContentTypes.ERROR,
+    [ContentTypes.ERROR]:
+      publicMessageByClass[errorClass] || publicMessageByClass.completion_error,
+    error_class: errorClass,
+  };
+}
+
+function handleCompletionErrorContentPart({
+  contentParts,
+  err,
+  abortController,
+  log = logger,
+}) {
+  const abortedByController = abortController?.signal?.aborted === true;
+  const suppressVisibleError = shouldSuppressCompletionErrorContentPart(contentParts, err);
+  if (abortedByController) {
+    log.warn(
+      '[api/server/controllers/agents/client.js #sendCompletion] Operation aborted by controller',
+      sanitizeCompletionErrorForLog(err),
+    );
+    return 'aborted';
+  }
+  if (suppressVisibleError) {
+    log.warn(
+      '[api/server/controllers/agents/client.js #sendCompletion] Late stream termination after assistant text; suppressing visible error content part',
+      sanitizeCompletionErrorForLog(err),
+    );
+    return 'suppressed';
+  }
+  log.error(
+    '[api/server/controllers/agents/client.js #sendCompletion] Operation aborted',
+    sanitizeCompletionErrorForLog(err),
+  );
+  log.error(
+    '[api/server/controllers/agents/client.js #sendCompletion] Unhandled error type',
+    sanitizeCompletionErrorForLog(err),
+  );
+  contentParts.push(createCompletionErrorContentPart(err));
+  return 'pushed';
+}
+/* === VIVENTIUM END === */
 
 function parseIntEnv(name, fallback) {
   const raw = process.env[name];
@@ -761,6 +974,18 @@ function getCortexDetectTimeoutMs(voiceMode) {
   }
   /* === VIVENTIUM NOTE END === */
   return parseIntEnv('VIVENTIUM_VOICE_CORTEX_DETECT_TIMEOUT_MS', base);
+}
+
+function getCortexLateDetectTimeoutMs(baseTimeoutMs) {
+  const configured = parseIntEnv('VIVENTIUM_CORTEX_LATE_DETECT_TIMEOUT_MS', 0);
+  const normalizedBase = Number.isFinite(Number(baseTimeoutMs)) ? Math.max(0, Number(baseTimeoutMs)) : 0;
+  const normalizedConfigured = Number.isFinite(Number(configured))
+    ? Math.max(0, Number(configured))
+    : 0;
+  if (normalizedConfigured <= normalizedBase) {
+    return 0;
+  }
+  return Math.min(normalizedConfigured, 30000);
 }
 
 const omitTitleOptions = new Set([
@@ -1009,7 +1234,7 @@ function createMultiAgentMapper(primaryAgent, agentConfigs) {
 
       return { ...message, content: finalContent };
     } catch (error) {
-      logger.error('[AgentClient] Error processing multi-agent message:', error);
+      logger.error('[AgentClient] Error processing multi-agent message', sanitizeCompletionErrorForLog(error));
       return message;
     }
   };
@@ -1120,6 +1345,15 @@ class AgentClient extends BaseClient {
     this.indexTokenCountMap = {};
     /** @type {(messages: BaseMessage[]) => Promise<void>} */
     this.processMemory;
+    /* === VIVENTIUM START ===
+     * Feature: Request-wide Phase B promise preservation.
+     * Purpose: Fallback `chatCompletion` calls must not erase an in-flight
+     * background cortex pipeline started by the primary model attempt.
+     * === VIVENTIUM END === */
+    this._phaseBPromise = null;
+    this._phaseBPipelineResponseMessageId = null;
+    this._phaseBMainResponseReadyPromise = Promise.resolve();
+    /* === VIVENTIUM END === */
   }
 
   /**
@@ -1149,7 +1383,7 @@ class AgentClient extends BaseClient {
     } catch (error) {
       logger.error(
         '[api/server/controllers/agents/client.js #getSaveOptions] Error parsing options',
-        error,
+        sanitizeCompletionErrorForLog(error),
       );
     }
 
@@ -1219,6 +1453,12 @@ class AgentClient extends BaseClient {
     let payload;
     /** @type {number | undefined} */
     let promptTokens;
+    /* === VIVENTIUM START ===
+     * Feature: Prompt-frame telemetry for main prompt assembly.
+     * Purpose: Track layer size/hash metadata only; never log raw prompt text by default.
+     * === VIVENTIUM END === */
+    const promptFrameLayers = {};
+    const recallInstructionTexts = [];
 
     /**
      * Extract base instructions for all agents (combines instructions + additional_instructions).
@@ -1249,6 +1489,18 @@ class AgentClient extends BaseClient {
           }))
         : []),
     ];
+    const injectedBackgroundCardGuard = ensureBackgroundCortexRuntimeCardGuard(this.options.agent);
+    if (injectedBackgroundCardGuard) {
+      promptFrameLayers.background_cortex_runtime_card_guard = injectedBackgroundCardGuard;
+      logger.info('[AgentClient] Injected background cortex runtime-card guard into main instructions');
+    }
+    promptFrameLayers.primary_base_instructions = this.options.agent?.instructions || '';
+    if (allAgents.length > 1) {
+      promptFrameLayers.additional_agent_base_instructions = allAgents
+        .slice(1)
+        .map(({ agent }) => agent?.instructions || '')
+        .join('\n\n');
+    }
 
     if (this.options.attachments) {
       const attachmentsStart = startDeepTiming(req);
@@ -1373,6 +1625,7 @@ class AgentClient extends BaseClient {
     const latestMessage = orderedMessages[orderedMessages.length - 1];
     if (latestMessage?.fileContext) {
       sharedRunContextParts.push(latestMessage.fileContext);
+      promptFrameLayers.latest_file_context = latestMessage.fileContext;
     }
 
     /** Augmented prompt from RAG/context handlers */
@@ -1381,6 +1634,7 @@ class AgentClient extends BaseClient {
       this.augmentedPrompt = await this.contextHandlers.createContext();
       if (this.augmentedPrompt) {
         sharedRunContextParts.push(this.augmentedPrompt);
+        promptFrameLayers.augmented_prompt = this.augmentedPrompt;
       }
       if (isDeepTimingEnabled(req)) {
         logDeepTiming(req, 'build_messages_context', contextStart);
@@ -1397,7 +1651,7 @@ class AgentClient extends BaseClient {
         }
         return withoutKeys || null;
       } catch (error) {
-        logger.error('[AgentClient] Failed to build memory context', error);
+        logger.error('[AgentClient] Failed to build memory context', sanitizeCompletionErrorForLog(error));
         if (isDeepTimingEnabled(req)) {
           logDeepTiming(req, 'build_messages_use_memory', memoryStart, 'error=true');
         }
@@ -1407,6 +1661,7 @@ class AgentClient extends BaseClient {
     if (memoryResult) {
       const memoryContext = `${memoryInstructions}\n\n# Existing memory about the user:\n${memoryResult}`;
       sharedRunContextParts.push(memoryContext);
+      promptFrameLayers.memory_context = memoryContext;
     }
     if (isDeepTimingEnabled(req)) {
       logDeepTiming(
@@ -1440,9 +1695,13 @@ class AgentClient extends BaseClient {
       if (!recallInstructions) {
         continue;
       }
+      recallInstructionTexts.push(recallInstructions);
       agent.instructions = [agent.instructions || '', recallInstructions]
         .filter((part) => typeof part === 'string' && part.trim().length > 0)
         .join('\n\n');
+    }
+    if (recallInstructionTexts.length > 0) {
+      promptFrameLayers.conversation_recall = recallInstructionTexts.join('\n\n');
     }
     /* === VIVENTIUM NOTE END === */
 
@@ -1497,6 +1756,35 @@ class AgentClient extends BaseClient {
         }),
       ),
     );
+    promptFrameLayers.shared_run_context = sharedRunContext;
+    promptFrameLayers.primary_final_instructions = this.options.agent?.instructions || '';
+    if (allAgents.length > 1) {
+      promptFrameLayers.additional_agent_final_instructions = allAgents
+        .slice(1)
+        .map(({ agent }) => agent?.instructions || '')
+        .join('\n\n');
+    }
+    logPromptFrame(
+      logger,
+      buildPromptFrame({
+        promptFamily: 'main_assembly',
+        surface: resolveViventiumSurface(req),
+        provider: this.options.agent?.provider,
+        model: this.options.agent?.model_parameters?.model || this.options.agent?.model,
+        authClass: 'user_runtime',
+        layers: promptFrameLayers,
+        promptSourceFiles: {
+          agent_client: __filename,
+        },
+        flags: {
+          voice_mode: req?.body?.voiceMode === true,
+          listen_only: req?.body?.viventiumListenOnly === true,
+          ephemeral_agent: !!ephemeralAgent,
+          agent_count: allAgents.length,
+        },
+        mcpInstructionSources: this.options.agent?.viventiumMCPInstructionSources || {},
+      }),
+    );
     if (isDeepTimingEnabled(req)) {
       logDeepTiming(req, 'build_messages_apply_context', applyStart, `agents=${allAgents.length}`);
     }
@@ -1542,7 +1830,7 @@ class AgentClient extends BaseClient {
           logDeepTiming(req, 'memory_wait_done', waitStart, 'timeout=true');
         }
       } else {
-        logger.error('[AgentClient] Error processing memory:', error);
+        logger.error('[AgentClient] Error processing memory', sanitizeCompletionErrorForLog(error));
         if (isDeepTimingEnabled(req)) {
           logDeepTiming(req, 'memory_wait_done', waitStart, 'timeout=error');
         }
@@ -1599,10 +1887,10 @@ class AgentClient extends BaseClient {
 	        config: memoryPolicyConfig,
 	      });
 	    } catch (error) {
-	      logger.error(
-	        '[api/server/controllers/agents/client.js #useMemory] Error loading stored memories',
-	        error,
-	      );
+      logger.error(
+        '[api/server/controllers/agents/client.js #useMemory] Error loading stored memories',
+        sanitizeCompletionErrorForLog(error),
+      );
     }
 
     /** @type {Agent} */
@@ -1629,7 +1917,7 @@ class AgentClient extends BaseClient {
     } catch (error) {
       logger.error(
         '[api/server/controllers/agents/client.js #useMemory] Error loading agent for memory',
-        error,
+        sanitizeCompletionErrorForLog(error),
       );
     }
 
@@ -1667,12 +1955,9 @@ class AgentClient extends BaseClient {
       logger.error(
         '[api/server/controllers/agents/client.js #useMemory] Error initializing memory writer',
         {
-          error,
+          error: sanitizeCompletionErrorForLog(error),
           provider: memoryConfig?.agent?.provider,
           model: memoryConfig?.agent?.model,
-          errorMessage: error?.message,
-          errorCode: error?.code,
-          errorType: error?.type,
         },
       );
       return memorySnapshot?.withoutKeys;
@@ -1681,7 +1966,11 @@ class AgentClient extends BaseClient {
     if (!agent) {
       logger.warn(
         '[api/server/controllers/agents/client.js #useMemory] No agent found for memory',
-        memoryConfig,
+        {
+          hasMemoryAgent: Boolean(memoryConfig?.agent),
+          provider: memoryConfig?.agent?.provider || null,
+          model: memoryConfig?.agent?.model || null,
+        },
       );
       return memorySnapshot?.withoutKeys;
     }
@@ -1743,10 +2032,10 @@ class AgentClient extends BaseClient {
 	        snapshot: memorySnapshot,
 	      });
 	    } catch (error) {
-	      logger.error(
-	        '[api/server/controllers/agents/client.js #useMemory] Error creating memory processor',
-	        error,
-	      );
+      logger.error(
+        '[api/server/controllers/agents/client.js #useMemory] Error creating memory processor',
+        sanitizeCompletionErrorForLog(error),
+      );
 	      return memorySnapshot?.withoutKeys;
 	    }
 
@@ -1867,7 +2156,7 @@ class AgentClient extends BaseClient {
       }
       return result;
     } catch (error) {
-      logger.error('Memory Agent failed to process memory', error);
+      logger.error('Memory Agent failed to process memory', sanitizeCompletionErrorForLog(error));
       if (isDeepTimingEnabled(req)) {
         logDeepTiming(req, 'memory_run_done', memStart, 'status=error');
       }
@@ -1876,43 +2165,90 @@ class AgentClient extends BaseClient {
 
   /** @type {sendCompletion} */
   async sendCompletion(payload, opts = {}) {
-    await this.chatCompletion({
-      payload,
-      onProgress: opts.onProgress,
-      userMCPAuthMap: opts.userMCPAuthMap,
-      abortController: opts.abortController,
-    });
+    this._phaseBPromise = null;
+    this._phaseBPipelineResponseMessageId = null;
+    const mainResponseReady = createDeferredPromise();
+    this._phaseBMainResponseReadyPromise = mainResponseReady.promise;
+    try {
+      let primaryError = null;
+      try {
+        await this.chatCompletion({
+          payload,
+          onProgress: opts.onProgress,
+          userMCPAuthMap: opts.userMCPAuthMap,
+          abortController: opts.abortController,
+        });
+      } catch (error) {
+        primaryError = error;
+      }
 
-    /* === VIVENTIUM START ===
-     * Feature: Agent Fallback LLM
-     * Purpose: If the primary provider fails before any assistant text is produced,
-     * retry once with the user-configured fallback route.
-     * Added: 2026-04-28
-     */
-    const fallbackAgent = this.options.agent?.viventiumFallbackLlm;
-    if (fallbackAgent && shouldRetryWithFallback(this.contentParts)) {
-      const primaryProvider = this.options.agent?.provider || this.options.agent?.endpoint || 'unknown';
-      const primaryModel =
-        this.options.agent?.model || this.options.agent?.model_parameters?.model || 'unknown';
-      const fallbackProvider = fallbackAgent.provider || fallbackAgent.endpoint || 'unknown';
-      const fallbackModel = fallbackAgent.model || fallbackAgent.model_parameters?.model || 'unknown';
-      logger.warn(
-        `[AgentClient] Primary model ${primaryProvider}/${primaryModel} failed before assistant text; retrying with fallback ${fallbackProvider}/${fallbackModel}`,
-      );
-      this.contentParts.length = 0;
-      this.options.agent = fallbackAgent;
-      this.options.attachments = fallbackAgent.attachments ?? this.options.attachments;
-      this.options.resendFiles = fallbackAgent.resendFiles ?? this.options.resendFiles;
-      this.options.maxContextTokens = fallbackAgent.maxContextTokens ?? this.options.maxContextTokens;
-      this.model = fallbackModel;
-      await this.chatCompletion({
-        payload,
-        onProgress: opts.onProgress,
-        userMCPAuthMap: fallbackAgent.userMCPAuthMap ?? opts.userMCPAuthMap,
-        abortController: opts.abortController,
-      });
+      /* === VIVENTIUM START ===
+       * Feature: Agent Fallback LLM
+       * Purpose: If the primary provider fails before any assistant text is produced,
+       * retry once with the user-configured fallback route.
+       * Added: 2026-04-28
+       */
+      const fallbackAgent = this.options.agent?.viventiumFallbackLlm;
+      let fallbackAttempted = false;
+      if (fallbackAgent && shouldRetryWithFallback(this.contentParts)) {
+        fallbackAttempted = true;
+        const primaryProvider = this.options.agent?.provider || this.options.agent?.endpoint || 'unknown';
+        const primaryModel =
+          this.options.agent?.model || this.options.agent?.model_parameters?.model || 'unknown';
+        const fallbackProvider = fallbackAgent.provider || fallbackAgent.endpoint || 'unknown';
+        const fallbackModel = fallbackAgent.model || fallbackAgent.model_parameters?.model || 'unknown';
+        logger.warn(
+          `[AgentClient] Primary model ${primaryProvider}/${primaryModel} failed before assistant text; retrying with fallback ${fallbackProvider}/${fallbackModel}`,
+        );
+        const preservedCortexParts = this.contentParts.filter(
+          (part) => part && CORTEX_CONTENT_TYPES.has(part.type),
+        );
+        this.contentParts.length = 0;
+        for (const part of preservedCortexParts) {
+          upsertCortexContentPart(this.contentParts, part);
+        }
+        this.options.agent = fallbackAgent;
+        this.options.attachments = fallbackAgent.attachments ?? this.options.attachments;
+        this.options.resendFiles = fallbackAgent.resendFiles ?? this.options.resendFiles;
+        this.options.maxContextTokens = fallbackAgent.maxContextTokens ?? this.options.maxContextTokens;
+        this.model = fallbackModel;
+        const reqBody = this.options.req?.body;
+        const primaryPhaseBOwnsThisResponse =
+          this._phaseBPromise &&
+          this._phaseBPipelineResponseMessageId === this.responseMessageId;
+        const hadSuppressBackgroundCortices =
+          reqBody && Object.prototype.hasOwnProperty.call(reqBody, 'suppressBackgroundCortices');
+        const previousSuppressBackgroundCortices = reqBody?.suppressBackgroundCortices;
+        if (reqBody && primaryPhaseBOwnsThisResponse) {
+          reqBody.suppressBackgroundCortices = true;
+        }
+        try {
+          await this.chatCompletion({
+            payload,
+            onProgress: opts.onProgress,
+            userMCPAuthMap: fallbackAgent.userMCPAuthMap ?? opts.userMCPAuthMap,
+            abortController: opts.abortController,
+          });
+        } finally {
+          if (reqBody && primaryPhaseBOwnsThisResponse) {
+            if (hadSuppressBackgroundCortices) {
+              reqBody.suppressBackgroundCortices = previousSuppressBackgroundCortices;
+            } else {
+              delete reqBody.suppressBackgroundCortices;
+            }
+          }
+        }
+      }
+      if (primaryError && !fallbackAttempted) {
+        throw primaryError;
+      }
+      /* === VIVENTIUM END === */
+    } finally {
+      mainResponseReady.resolve();
+      if (this._phaseBMainResponseReadyPromise === mainResponseReady.promise) {
+        this._phaseBMainResponseReadyPromise = Promise.resolve();
+      }
     }
-    /* === VIVENTIUM END === */
 
     const completion = normalizeTextContentParts(filterMalformedContentParts(this.contentParts));
     return { completion };
@@ -2006,6 +2342,241 @@ class AgentClient extends BaseClient {
     return currentMessageTokens > 0 ? currentMessageTokens : originalEstimate;
   }
 
+  /* === VIVENTIUM START ===
+   * Feature: Early Phase B completion pipeline attachment.
+   *
+   * Why:
+   * - Background Phase B can start before the main model answers.
+   * - If the primary main model fails before text and `sendCompletion` retries a
+   *   fallback model, the old late attachment site was skipped and Phase B became
+   *   live-SSE-only.
+   * - Attach the DB/follow-up pipeline as soon as Phase B exists, then wait for
+   *   the final primary-or-fallback answer before follow-up synthesis.
+   * === VIVENTIUM END === */
+  attachBackgroundCortexCompletionPipeline({
+    cortexExecutionPromise,
+    pendingCortexParts,
+    req,
+    conversationId,
+    responseMessageId,
+    agent,
+    getResponseContentParts,
+    responseController,
+    turnUserInputTime,
+    followupGraceMs,
+    shouldDeferMainResponse,
+    getActivatedCorticesList,
+  }) {
+    if (!cortexExecutionPromise || typeof cortexExecutionPromise.then !== 'function') {
+      return null;
+    }
+    if (
+      this._phaseBPromise &&
+      this._phaseBPipelineResponseMessageId === responseMessageId
+    ) {
+      return this._phaseBPromise;
+    }
+
+    const capturedAgent = agent;
+    const getShouldDeferMainResponse =
+      typeof shouldDeferMainResponse === 'function'
+        ? shouldDeferMainResponse
+        : () => shouldDeferMainResponse === true;
+    const capturedTurnUserInputTime = turnUserInputTime;
+    const mainResponseReadyPromise =
+      this._phaseBMainResponseReadyPromise && typeof this._phaseBMainResponseReadyPromise.then === 'function'
+        ? this._phaseBMainResponseReadyPromise
+        : Promise.resolve();
+    let canonicalFinalized = false;
+    const finalizeCanonicalParent = async () => {
+      if (canonicalFinalized) {
+        return;
+      }
+      canonicalFinalized = true;
+      try {
+        await finalizeCanonicalCortexMessage({
+          req,
+          messageId: responseMessageId,
+        });
+      } catch (finishErr) {
+        logger.warn(
+          '[AgentClient] Failed to finalize canonical cortex parent message',
+          sanitizeCompletionErrorForLog(finishErr),
+        );
+      }
+    };
+
+    this._phaseBPipelineResponseMessageId = responseMessageId;
+    this._phaseBPromise = cortexExecutionPromise
+      .then(async (mergedInsightsData) => {
+        // Wait for the final primary/fallback answer before DB persistence or follow-up synthesis.
+        await mainResponseReadyPromise.catch((err) => {
+          logger.warn(
+            '[AgentClient] Main response readiness gate failed before Phase B completion pipeline',
+            sanitizeCompletionErrorForLog(err),
+          );
+        });
+
+        // Always persist final cortex parts so refresh/poll clients do not lose Phase B state.
+        if (Array.isArray(pendingCortexParts) && pendingCortexParts.length > 0) {
+          try {
+            await persistCortexPartsToCanonicalMessage({
+              req,
+              responseMessageId,
+              cortexParts: pendingCortexParts,
+            });
+          } catch (e) {
+            logger.warn('[AgentClient] Failed to persist final cortex parts to DB', sanitizeCompletionErrorForLog(e));
+          }
+          await finalizeCanonicalParent();
+        }
+
+        // Suppress follow-up if user sent a newer message before completion.
+        if (responseController && responseController.lastUserInputTime !== capturedTurnUserInputTime) {
+          if (followupGraceMs <= 0) {
+            logger.info('[AgentClient] Suppressing cortex follow-up: user sent newer input');
+            return null;
+          }
+          const ageMs = Date.now() - capturedTurnUserInputTime;
+          if (ageMs > followupGraceMs) {
+            logger.info(
+              '[AgentClient] Suppressing cortex follow-up: user sent newer input (grace expired)',
+            );
+            return null;
+          }
+          logger.info(
+            '[AgentClient] Allowing cortex follow-up within grace window (%sms)',
+            followupGraceMs,
+          );
+        }
+
+        const hasInsights =
+          Array.isArray(mergedInsightsData?.insights) && mergedInsightsData.insights.length > 0;
+        const hasMergedText =
+          typeof mergedInsightsData?.mergedPrompt === 'string' &&
+          mergedInsightsData.mergedPrompt.trim().length > 0;
+        const hasErrors = mergedInsightsData?.hasErrors === true;
+        const effectiveShouldDeferMainResponse = getShouldDeferMainResponse() === true;
+        const allowErrorOnlyFollowUp = hasErrors && effectiveShouldDeferMainResponse === true;
+
+        const phaseBCrashed = mergedInsightsData == null;
+        const phaseBEmpty = !hasInsights && !hasMergedText && !hasErrors;
+        if (effectiveShouldDeferMainResponse && (phaseBCrashed || phaseBEmpty)) {
+          logger.warn(
+            '[AgentClient] Phase B produced no usable output but main response was deferred; forcing error follow-up. crashed=%s empty=%s',
+            phaseBCrashed,
+            phaseBEmpty,
+          );
+          const activatedCorticesList =
+            typeof getActivatedCorticesList === 'function' ? getActivatedCorticesList() : [];
+          mergedInsightsData = {
+            insights: [],
+            mergedPrompt: '',
+            cortexCount: activatedCorticesList?.length ?? 0,
+            errors: [
+              {
+                error: 'Background processing did not return results',
+                errorClass: 'background_agent_error',
+                error_class: 'background_agent_error',
+              },
+            ],
+            hasErrors: true,
+          };
+        } else if (!hasInsights && !hasMergedText && !allowErrorOnlyFollowUp) {
+          return null;
+        }
+
+        try {
+          const responseContentParts =
+            typeof getResponseContentParts === 'function' ? getResponseContentParts() : [];
+          const recentResponse = extractTextFromContentParts(responseContentParts);
+          const forcePhaseBFollowUp = shouldForcePhaseBFollowUp({
+            shouldDeferMainResponse: effectiveShouldDeferMainResponse,
+            parentText: recentResponse,
+            hasInsights,
+            hasMergedText,
+            allowErrorOnlyFollowUp,
+          });
+          {
+            const cpLen = responseContentParts?.length ?? 0;
+            const textParts = (responseContentParts || []).filter((p) => p && p.type === ContentTypes.TEXT).length;
+            const rrLen = recentResponse.length;
+            if (process.env.VIVENTIUM_DEBUG_PHASE_B === 'true') {
+              logger.info(
+                `[AgentClient] Phase B recentResponse extraction: contentParts.length=${cpLen}, textParts=${textParts}, recentResponse.length=${rrLen}, recentResponse.hash=${hashCompletionTextForLog(recentResponse)}`,
+              );
+            } else {
+              logger.info(
+                `[AgentClient] Phase B recentResponse extraction: contentParts.length=${cpLen}, textParts=${textParts}, recentResponse.length=${rrLen}`,
+              );
+            }
+          }
+          const followUpMessage = await createCortexFollowUpMessage({
+            req,
+            conversationId,
+            parentMessageId: responseMessageId,
+            agent: this.options.agent || capturedAgent,
+            insightsData: mergedInsightsData,
+            recentResponse,
+            forceVisibleFollowUp: forcePhaseBFollowUp,
+          });
+          await finalizeCanonicalParent();
+
+          if (followUpMessage?.text) {
+            logger.info(
+              '[AgentClient] Background cortex follow-up message saved: id=%s phase_b_new_message=%s',
+              followUpMessage.messageId,
+              followUpMessage.messageId !== responseMessageId,
+            );
+          } else {
+            logger.info(
+              '[AgentClient] Background cortex follow-up produced no persisted message (suppressed or empty)',
+            );
+          }
+
+          if (followUpMessage?.text && req?._resumableStreamId) {
+            const emittedParentMessageId =
+              followUpMessage.messageId === responseMessageId
+                ? followUpMessage.parentMessageId
+                : responseMessageId;
+            const followUpEvent = {
+              event: 'on_cortex_followup',
+              data: {
+                runId: responseMessageId,
+                messageId: followUpMessage.messageId,
+                parentMessageId: emittedParentMessageId,
+                conversationId,
+                text: followUpMessage.text,
+                cortexCount: mergedInsightsData?.cortexCount ?? undefined,
+              },
+            };
+            const emitPromise = GenerationJobManager.emitChunk(req._resumableStreamId, followUpEvent);
+            if (emitPromise && typeof emitPromise.catch === 'function') {
+              emitPromise.catch((err) => {
+                logger.warn(
+                  '[AgentClient] Failed to emit cortex follow-up SSE event:',
+                  sanitizeCompletionErrorForLog(err),
+                );
+              });
+            }
+          }
+        } catch (e) {
+          logger.error('[AgentClient] Failed to create cortex follow-up message', sanitizeCompletionErrorForLog(e));
+        }
+
+        return null;
+      })
+      .catch((err) => {
+        logger.error(
+          '[AgentClient] Phase B background completion pipeline failed',
+          sanitizeCompletionErrorForLog(err),
+        );
+      });
+
+    return this._phaseBPromise;
+  }
+  /* === VIVENTIUM END === */
+
   /**
    * @param {object} params
    * @param {string | ChatCompletionMessageParam[]} params.payload
@@ -2044,6 +2615,8 @@ class AgentClient extends BaseClient {
     const appConfig = this.options.req.config;
     const balanceConfig = getBalanceConfig(appConfig);
     const transactionsConfig = getTransactionsConfig(appConfig);
+    const directActionPolicySurfaces =
+      appConfig?.viventium?.background_cortices?.activation_policy?.direct_action_mcp_servers;
     try {
       if (!abortController) {
         abortController = new AbortController();
@@ -2079,9 +2652,16 @@ class AgentClient extends BaseClient {
 
       const voiceMode = this.options.req?.body?.voiceMode === true;
       const voiceProvider = this.options.req?.body?.voiceProvider;
+      /* === VIVENTIUM START ===
+       * Feature: Prompt-frame telemetry for surface/runtime prompt injections.
+       * === VIVENTIUM END === */
+      const surfacePromptLayers = {
+        instructions_before_surface_injection: this.options.agent?.instructions || '',
+      };
       /* === VIVENTIUM NOTE === */
       const inputMode = (this.options.req?.body?.viventiumInputMode || '').toString().toLowerCase();
       const surface = resolveViventiumSurface(this.options.req);
+      const wingModeActive = isWingModeEnabledForRequest(this.options.req, inputMode);
       const isTelegramSurface = surface === 'telegram';
       const isPlaygroundSurface = surface === 'playground';
       /* === VIVENTIUM NOTE END === */
@@ -2090,6 +2670,7 @@ class AgentClient extends BaseClient {
       const viventiumInsightInstructions = this.options.req?.body?.viventiumInsightInstructions;
       if (viventiumInsightInstructions) {
         logger.info('[AgentClient] Voice Gateway insight delivery - injecting insight instructions');
+        surfacePromptLayers.voice_gateway_insight_instructions = viventiumInsightInstructions;
         this.options.agent.instructions = [
           this.options.agent.instructions || '',
           viventiumInsightInstructions,
@@ -2100,6 +2681,7 @@ class AgentClient extends BaseClient {
       if (voiceMode) {
         const voiceInstructions = buildVoiceModeInstructions(voiceProvider);
         if (voiceInstructions) {
+          surfacePromptLayers.voice_mode = voiceInstructions;
           this.options.agent.instructions = [
             this.options.agent.instructions || '',
             voiceInstructions,
@@ -2112,6 +2694,7 @@ class AgentClient extends BaseClient {
       if (inputMode === 'voice_note') {
         const voiceNoteInstructions = buildVoiceNoteInputInstructions();
         if (voiceNoteInstructions) {
+          surfacePromptLayers.voice_note_input = voiceNoteInstructions;
           this.options.agent.instructions = [
             this.options.agent.instructions || '',
             voiceNoteInstructions,
@@ -2121,16 +2704,18 @@ class AgentClient extends BaseClient {
       if (inputMode === 'voice_call') {
         const voiceCallInstructions = buildVoiceCallInputInstructions();
         if (voiceCallInstructions) {
+          surfacePromptLayers.voice_call_input = voiceCallInstructions;
           this.options.agent.instructions = [
             this.options.agent.instructions || '',
             voiceCallInstructions,
           ].filter(Boolean).join('\n\n');
         }
 
-        const wingModeInstructions = isWingModeEnabledForRequest(this.options.req, inputMode)
+        const wingModeInstructions = wingModeActive
           ? buildWingModeInstructions()
           : '';
         if (wingModeInstructions) {
+          surfacePromptLayers.wing_mode = wingModeInstructions;
           this.options.agent.instructions = [
             this.options.agent.instructions || '',
             wingModeInstructions,
@@ -2141,6 +2726,7 @@ class AgentClient extends BaseClient {
       if (isTelegramSurface && !voiceMode) {
         const telegramInstructions = buildTelegramTextInstructions();
         if (telegramInstructions) {
+          surfacePromptLayers.telegram_text = telegramInstructions;
           this.options.agent.instructions = [
             this.options.agent.instructions || '',
             telegramInstructions,
@@ -2150,6 +2736,7 @@ class AgentClient extends BaseClient {
       if (isPlaygroundSurface && !voiceMode) {
         const playgroundInstructions = buildPlaygroundTextInstructions();
         if (playgroundInstructions) {
+          surfacePromptLayers.playground_text = playgroundInstructions;
           this.options.agent.instructions = [
             this.options.agent.instructions || '',
             playgroundInstructions,
@@ -2164,12 +2751,38 @@ class AgentClient extends BaseClient {
        */
       const timeContextInstructions = buildTimeContextInstructions(this.options.req);
       if (timeContextInstructions) {
+        surfacePromptLayers.time_context = timeContextInstructions;
         this.options.agent.instructions = [
           this.options.agent.instructions || '',
           timeContextInstructions,
         ].filter(Boolean).join('\n\n');
       }
       /* === VIVENTIUM NOTE END === */
+      surfacePromptLayers.final_runtime_instructions = this.options.agent?.instructions || '';
+      logPromptFrame(
+        logger,
+        buildPromptFrame({
+          promptFamily: 'main_runtime',
+          surface,
+          provider: this.options.agent?.provider,
+          model: this.options.agent?.model_parameters?.model || this.options.agent?.model,
+          authClass: userMCPAuthMap ? 'connected_account_runtime' : 'user_runtime',
+          layers: surfacePromptLayers,
+          promptSourceFiles: {
+            agent_client: __filename,
+          },
+          flags: {
+            voice_mode: voiceMode,
+            input_mode: inputMode,
+            telegram_surface: isTelegramSurface,
+            playground_surface: isPlaygroundSurface,
+            tool_count: Array.isArray(this.options.agent?.tools) ? this.options.agent.tools.length : 0,
+            has_user_mcp_auth_map: !!userMCPAuthMap,
+          },
+          mcpInstructionSources: this.options.agent?.viventiumMCPInstructionSources || {},
+          voiceText: surfacePromptLayers.final_runtime_instructions,
+        }),
+      );
 
 	      /* === VIVENTIUM NOTE ===
 	       * Feature: Sanitize agent payload content parts before formatting.
@@ -2243,6 +2856,7 @@ class AgentClient extends BaseClient {
       const hasBackgroundCortices =
         cortexDetectTimeoutMs > 0 &&
         !suppressBackgroundCortices &&
+        !wingModeActive &&
         this.options.agent.background_cortices?.length > 0;
       if (voiceLatencyEnabled) {
         const cortexCount = Array.isArray(this.options.agent.background_cortices)
@@ -2273,7 +2887,6 @@ class AgentClient extends BaseClient {
       let activatedCorticesList = [];
       let cortexExecutionPromise = null;
       const pendingCortexParts = [];
-      this._phaseBPromise = null;
       // Cache tool-cortex hold decision so Phase B can be configured consistently.
       let toolCortexHoldWanted = false;
       const responseStream = this.options.res;
@@ -2319,12 +2932,8 @@ class AgentClient extends BaseClient {
           }
           // Persist cortex parts onto the main message so they survive refresh/reload.
           // We upsert by cortex_id to keep a single row per cortex.
-          const existingIdx = pendingCortexParts.findIndex((p) => p?.cortex_id === cortexData?.cortex_id);
-          if (existingIdx >= 0) {
-            pendingCortexParts[existingIdx] = cortexData;
-          } else {
-            pendingCortexParts.push(cortexData);
-          }
+          upsertCortexContentPart(pendingCortexParts, cortexData);
+          upsertCortexContentPart(this.contentParts, cortexData);
 
           const streamId = req?._resumableStreamId;
           const stream = responseStream;
@@ -2367,7 +2976,7 @@ class AgentClient extends BaseClient {
               emitPromise.catch((err) => {
                 logger.warn(
                   '[AgentClient] Failed to emit cortex SSE event:',
-                  err?.message ?? String(err),
+                  sanitizeCompletionErrorForLog(err),
                 );
               });
             }
@@ -2384,7 +2993,7 @@ class AgentClient extends BaseClient {
             } catch (err) {
               logger.warn(
                 '[AgentClient] Failed to emit cortex SSE event:',
-                err?.message ?? String(err),
+                sanitizeCompletionErrorForLog(err),
               );
             }
           } else {
@@ -2500,13 +3109,20 @@ class AgentClient extends BaseClient {
                 `[AgentClient] Phase B (async): Starting execution of ${activatedCorticesList.length} activated cortices`,
               );
               const directActionScopeKeys = collectDirectActionScopeKeysFromCortices(activatedCorticesList);
+              const effectiveDirectActionScopeKeys = collectEffectiveDirectActionScopeKeys({
+                directActionSurfaces: directActionPolicySurfaces,
+                agentTools: this.options.agent?.tools,
+                toolDefinitions: this.options.agent?.toolDefinitions,
+              });
               toolCortexHoldWanted = shouldDeferToolCortexMainResponse({
                 activatedCortices: activatedCorticesList,
-                directActionScopeKeys,
+                directActionScopeKeys: effectiveDirectActionScopeKeys,
               });
               logger.info(
                 `[AgentClient] Tool cortex hold decision (async): hold=${toolCortexHoldWanted} ` +
-                  `direct_action_scope_keys=${directActionScopeKeys.join(',') || 'none'}`,
+                  `canonical_direct_action_scope_keys=${directActionScopeKeys.join(',') || 'none'} ` +
+                  `effective_direct_action_scope_keys=${effectiveDirectActionScopeKeys.join(',') || 'none'} ` +
+                  `request_tool_count=${Array.isArray(this.options.agent?.tools) ? this.options.agent.tools.length : 0}`,
               );
               let mergedInsightsData = null;
 
@@ -2530,17 +3146,31 @@ class AgentClient extends BaseClient {
                   );
                 },
               }).then(() => mergedInsightsData).catch((error) => {
-                logger.error('[AgentClient] Phase B execution failed:', error);
+                logger.error('[AgentClient] Phase B execution failed', sanitizeCompletionErrorForLog(error));
                 return null;
               });
 
               return executionResult;
             } catch (error) {
-              logger.error('[AgentClient] Async Phase A/B pipeline failed:', error);
+              logger.error('[AgentClient] Async Phase A/B pipeline failed', sanitizeCompletionErrorForLog(error));
               return null;
-            }
-          })();
-        }
+              }
+            })();
+            this.attachBackgroundCortexCompletionPipeline({
+              cortexExecutionPromise,
+              pendingCortexParts,
+              req: asyncReq,
+              conversationId: this.conversationId,
+              responseMessageId: canonicalResponseMessageId,
+              agent: asyncAgent,
+              getResponseContentParts: () => this.contentParts,
+              responseController,
+              turnUserInputTime,
+              followupGraceMs,
+              shouldDeferMainResponse: () => toolCortexHoldWanted === true,
+              getActivatedCorticesList: () => activatedCorticesList,
+            });
+          }
         /* === VIVENTIUM NOTE END === */
 
         if (!voicePhaseAAsync) {
@@ -2637,13 +3267,20 @@ class AgentClient extends BaseClient {
           // Express response object into background cortex execution. Tool/MCP transports can bind to
           // the response lifecycle and get aborted when the main response ends, leaving cortices stuck.
           const directActionScopeKeys = collectDirectActionScopeKeysFromCortices(activatedCorticesList);
+          const effectiveDirectActionScopeKeys = collectEffectiveDirectActionScopeKeys({
+            directActionSurfaces: directActionPolicySurfaces,
+            agentTools: this.options.agent?.tools,
+            toolDefinitions: this.options.agent?.toolDefinitions,
+          });
           toolCortexHoldWanted = shouldDeferToolCortexMainResponse({
             activatedCortices: activatedCorticesList,
-            directActionScopeKeys,
+            directActionScopeKeys: effectiveDirectActionScopeKeys,
           });
           logger.info(
             `[AgentClient] Tool cortex hold decision: hold=${toolCortexHoldWanted} ` +
-              `direct_action_scope_keys=${directActionScopeKeys.join(',') || 'none'}`,
+              `canonical_direct_action_scope_keys=${directActionScopeKeys.join(',') || 'none'} ` +
+              `effective_direct_action_scope_keys=${effectiveDirectActionScopeKeys.join(',') || 'none'} ` +
+              `request_tool_count=${Array.isArray(this.options.agent?.tools) ? this.options.agent.tools.length : 0}`,
           );
 
           cortexExecutionPromise = executeActivated({
@@ -2681,9 +3318,148 @@ class AgentClient extends BaseClient {
             // Return mergedInsightsData (set by onAllComplete callback) instead of executeActivated return value
             return mergedInsightsData;
           }).catch((error) => {
-            logger.error('[AgentClient] Phase B execution failed:', error);
+            logger.error('[AgentClient] Phase B execution failed', sanitizeCompletionErrorForLog(error));
             return null;
           });
+          this.attachBackgroundCortexCompletionPipeline({
+            cortexExecutionPromise,
+            pendingCortexParts,
+            req: this.options.req,
+            conversationId: this.conversationId,
+            responseMessageId: this.responseMessageId,
+            agent: this.options.agent,
+            getResponseContentParts: () => this.contentParts,
+            responseController,
+            turnUserInputTime,
+            followupGraceMs,
+            shouldDeferMainResponse: toolCortexHoldWanted === true,
+            getActivatedCorticesList: () => activatedCorticesList,
+          });
+        } else if (detectionResult.timedOut === true) {
+          /* === VIVENTIUM START ===
+           * Feature: late non-blocking Phase A recovery.
+           *
+           * Why:
+           * - The fast Phase A window protects main-answer latency.
+           * - When primary activation providers are degraded, the 2s window can expire before the
+           *   configured fallback classifier reaches a decision, leaving the user with no named
+           *   background-agent visibility.
+           * - Continue only after a zero-activation timeout, attached to the same DB/SSE pipeline,
+           *   so the main answer stays fast while cards/results can still arrive.
+           * === VIVENTIUM END === */
+          const lateDetectTimeoutMs = getCortexLateDetectTimeoutMs(cortexDetectTimeoutMs);
+          if (lateDetectTimeoutMs > 0) {
+            logger.warn(
+              `[AgentClient] Phase A timed out with zero activations; starting late non-blocking recovery ` +
+                `(budget=${lateDetectTimeoutMs}ms, initial_budget=${cortexDetectTimeoutMs}ms)`,
+            );
+            cortexExecutionPromise = (async () => {
+              try {
+                const lateDetectStart = Date.now();
+                const lateDetectionResult = await detectActivations({
+                  req: this.options.req,
+                  mainAgent: this.options.agent,
+                  messages: initialMessages,
+                  runId: this.responseMessageId,
+                  timeBudgetMs: lateDetectTimeoutMs,
+                });
+                activatedCorticesList = Array.isArray(lateDetectionResult.activatedCortices)
+                  ? lateDetectionResult.activatedCortices
+                  : [];
+                logger.info(
+                  `[AgentClient] Late Phase A complete: ${activatedCorticesList.length} cortices activated ` +
+                    `(duration: ${Date.now() - lateDetectStart}ms, timedOut: ${lateDetectionResult.timedOut})`,
+                );
+
+                for (const cortex of activatedCorticesList) {
+                  await emitCortexEvent({
+                    type: ContentTypes.CORTEX_ACTIVATION,
+                    cortex_id: cortex.agentId,
+                    cortex_name: sanitizeCortexDisplayName(cortex.cortexName || cortex.agentId),
+                    status: 'activating',
+                    confidence: cortex.confidence,
+                    reason: cortex.reason,
+                    cortex_description: cortex.cortexDescription || '',
+                    activation_scope: cortex.activationScope || null,
+                    direct_action_surfaces: Array.isArray(cortex.directActionSurfaces)
+                      ? cortex.directActionSurfaces
+                      : [],
+                    direct_action_surface_scopes: Array.isArray(cortex.directActionSurfaceScopes)
+                      ? cortex.directActionSurfaceScopes
+                      : [],
+                  });
+                }
+
+                if (activatedCorticesList.length === 0) {
+                  return null;
+                }
+
+                logger.info(
+                  `[AgentClient] Late Phase B: Starting execution of ${activatedCorticesList.length} activated cortices`,
+                );
+                let mergedInsightsData = null;
+                const directActionScopeKeys = collectDirectActionScopeKeysFromCortices(activatedCorticesList);
+                const effectiveDirectActionScopeKeys = collectEffectiveDirectActionScopeKeys({
+                  directActionSurfaces: directActionPolicySurfaces,
+                  agentTools: this.options.agent?.tools,
+                  toolDefinitions: this.options.agent?.toolDefinitions,
+                });
+                toolCortexHoldWanted = shouldDeferToolCortexMainResponse({
+                  activatedCortices: activatedCorticesList,
+                  directActionScopeKeys: effectiveDirectActionScopeKeys,
+                });
+                logger.info(
+                  `[AgentClient] Tool cortex hold decision (late): hold=${toolCortexHoldWanted} ` +
+                    `canonical_direct_action_scope_keys=${directActionScopeKeys.join(',') || 'none'} ` +
+                    `effective_direct_action_scope_keys=${effectiveDirectActionScopeKeys.join(',') || 'none'} ` +
+                    `request_tool_count=${Array.isArray(this.options.agent?.tools) ? this.options.agent.tools.length : 0}`,
+                );
+
+                await executeActivated({
+                  req: this.options.req,
+                  // Late recovery runs after the fast main stream may already be closed. Route late
+                  // cortex output through the persisted/resumable event path instead of binding
+                  // Phase B work to a stale HTTP response.
+                  res: null,
+                  mainAgent: this.options.agent,
+                  messages: initialMessages,
+                  runId: this.responseMessageId,
+                  activatedCortices: activatedCorticesList,
+                  onCortexBrewing: (cortexData) => {
+                    void emitCortexEvent({ ...cortexData, type: ContentTypes.CORTEX_BREWING });
+                  },
+                  onCortexComplete: (cortexData) => {
+                    void emitCortexEvent({ ...cortexData, type: ContentTypes.CORTEX_INSIGHT });
+                  },
+                  onAllComplete: (completeData) => {
+                    mergedInsightsData = completeData;
+                    logger.info(
+                      `[AgentClient] Late Phase B complete: ${completeData.cortexCount} insights merged`,
+                    );
+                  },
+                });
+
+                return mergedInsightsData;
+              } catch (error) {
+                logger.error('[AgentClient] Late Phase A/B recovery failed', sanitizeCompletionErrorForLog(error));
+                return null;
+              }
+            })();
+            this.attachBackgroundCortexCompletionPipeline({
+              cortexExecutionPromise,
+              pendingCortexParts,
+              req: this.options.req,
+              conversationId: this.conversationId,
+              responseMessageId: this.responseMessageId,
+              agent: this.options.agent,
+              getResponseContentParts: () => this.contentParts,
+              responseController,
+              turnUserInputTime,
+              followupGraceMs,
+              shouldDeferMainResponse: () => toolCortexHoldWanted === true,
+              getActivatedCorticesList: () => activatedCorticesList,
+            });
+          }
         }
         } /* === VIVENTIUM NOTE: end sync Phase A/B path (if !voicePhaseAAsync) === */
       }
@@ -2754,7 +3530,7 @@ class AgentClient extends BaseClient {
                 agent.instructions = [agent.instructions || '', voiceCallInstructions]
                   .filter(Boolean).join('\n\n');
               }
-              const wingModeInstructions = isWingModeEnabledForRequest(this.options.req, inputMode)
+              const wingModeInstructions = wingModeActive
                 ? buildWingModeInstructions()
                 : '';
               if (wingModeInstructions) {
@@ -2802,6 +3578,41 @@ class AgentClient extends BaseClient {
           }
         }
         /* === VIVENTIUM NOTE END === */
+        logPromptFrame(
+          logger,
+          buildPromptFrame({
+            promptFamily: 'main_run_create',
+            surface,
+            provider: agents[0]?.provider,
+            model: agents[0]?.model_parameters?.model || agents[0]?.model,
+            authClass: userMCPAuthMap ? 'connected_account_runtime' : 'user_runtime',
+            layers: {
+              primary_run_instructions: agents[0]?.instructions || '',
+              additional_run_instructions: agents
+                .slice(1)
+                .map((agent) => agent?.instructions || '')
+                .join('\n\n'),
+              no_response_instructions: noResponseInstructions || '',
+              formatted_input_messages: messages,
+            },
+            promptSourceFiles: {
+              agent_client: __filename,
+            },
+            flags: {
+              voice_mode: voiceMode,
+              input_mode: inputMode,
+              agent_count: agents.length,
+              background_cortices_enabled: hasBackgroundCortices,
+              activated_cortex_count: activatedCorticesList.length,
+              no_response_injected: !!noResponseInstructions,
+            },
+            decisionState: {
+              tool_cortex_hold_wanted: toolCortexHoldWanted,
+            },
+            mcpInstructionSources: agents[0]?.viventiumMCPInstructionSources || {},
+            voiceText: agents.map((agent) => agent?.instructions || '').join('\n\n'),
+          }),
+        );
 
         // TODO: needs to be added as part of AgentContext initialization
         // const noSystemModelRegex = [/\b(o1-preview|o1-mini|amazon\.titan-text)\b/gi];
@@ -2948,7 +3759,7 @@ class AgentClient extends BaseClient {
                   req,
                   'tool_error',
                   voiceProcessStart,
-                  `tool_id=${toolId || 'unknown'} reason=${error?.message || 'unknown'}`,
+                  `tool_id=${toolId || 'unknown'} reason=${sanitizeCompletionErrorForLog(error).class || 'tool_error'}`,
                 );
               }
               logToolError(graph, error, toolId);
@@ -3084,235 +3895,26 @@ class AgentClient extends BaseClient {
        */
       if (pendingCortexParts.length > 0) {
         for (const part of pendingCortexParts) {
-          this.contentParts.push(part);
+          upsertCortexContentPart(this.contentParts, part);
         }
         logger.debug(`[AgentClient] Persisted ${pendingCortexParts.length} cortex content parts onto main message`);
       }
       /* === VIVENTIUM NOTE END === */
 
       /* === VIVENTIUM NOTE ===
-       * Feature: Background Cortices - Background follow-up (non-blocking)
-       *
-       * IMPORTANT:
-       * - Main agent response must NOT wait on Phase B.
-       * - When Phase B finishes, we persist final cortex status rows onto the canonical assistant
-       *   message (DB truth) and optionally create ONE follow-up assistant message.
-       * - Follow-up is suppressed if user sends newer input before Phase B finishes.
-       */
-      if (cortexExecutionPromise) {
-        const req = this.options.req;
-        const conversationId = this.conversationId;
-        const responseMessageId = this.responseMessageId;
-        const agent = this.options.agent;
-        const responseContentParts = this.contentParts;
-
-        this._phaseBPromise = cortexExecutionPromise
-          .then(async (mergedInsightsData) => {
-            // Always persist final cortex parts so the UI can stop showing "Analyzing..." on refresh/poll.
-            try {
-              await persistCortexPartsToCanonicalMessage({
-                req,
-                responseMessageId,
-                cortexParts: pendingCortexParts,
-              });
-            } catch (e) {
-              logger.warn('[AgentClient] Failed to persist final cortex parts to DB:', e);
-            }
-
-            // Suppress follow-up if user sent a newer message before completion
-            if (responseController && responseController.lastUserInputTime !== turnUserInputTime) {
-              if (followupGraceMs <= 0) {
-                logger.info('[AgentClient] Suppressing cortex follow-up: user sent newer input');
-                return null;
-              }
-              const ageMs = Date.now() - turnUserInputTime;
-              if (ageMs > followupGraceMs) {
-                logger.info(
-                  '[AgentClient] Suppressing cortex follow-up: user sent newer input (grace expired)',
-                );
-                return null;
-              }
-              logger.info(
-                '[AgentClient] Allowing cortex follow-up within grace window (%sms)',
-                followupGraceMs,
-              );
-            }
-
-            // Create a single follow-up message if there is anything meaningful to surface
-            const hasInsights =
-              Array.isArray(mergedInsightsData?.insights) && mergedInsightsData.insights.length > 0;
-            const hasMergedText =
-              typeof mergedInsightsData?.mergedPrompt === 'string' &&
-              mergedInsightsData.mergedPrompt.trim().length > 0;
-            const hasErrors = mergedInsightsData?.hasErrors === true;
-            // Only surface error-only follow-ups when the main response was intentionally deferred
-            // (tool cortex brewing hold). Otherwise this feels like a random system notification.
-            const allowErrorOnlyFollowUp = hasErrors && shouldDeferMainResponse === true;
-
-            /* === VIVENTIUM NOTE ===
-             * Feature: Safety net for deferred-response follow-up.
-             *
-             * Why: When shouldDeferMainResponse is true, the user sees a hold message ("Checking now.")
-             * and waits for a follow-up. If Phase B crashes (mergedInsightsData === null from the
-             * .catch handler) or produces zero insights/errors (toolless silent failure), the
-             * suppression check below would return null — leaving the user hanging indefinitely.
-             *
-             * Fix: When the main response was deferred, always create a follow-up. If there's
-             * genuinely nothing to surface, the follow-up creator generates a short user-safe
-             * error line ("I couldn't finish that check just now.").
-             */
-            const phaseBCrashed = mergedInsightsData == null;
-            const phaseBEmpty = !hasInsights && !hasMergedText && !hasErrors;
-            if (shouldDeferMainResponse && (phaseBCrashed || phaseBEmpty)) {
-              logger.warn(
-                '[AgentClient] Phase B produced no usable output but main response was deferred; forcing error follow-up. crashed=%s empty=%s',
-                phaseBCrashed,
-                phaseBEmpty,
-              );
-              // Synthesize a minimal mergedInsightsData so createCortexFollowUpMessage
-              // enters its error/fallback path.
-              mergedInsightsData = {
-                insights: [],
-                mergedPrompt: '',
-                cortexCount: activatedCorticesList?.length ?? 0,
-                errors: [{ message: 'Background processing did not return results' }],
-                hasErrors: true,
-              };
-            } else if (!hasInsights && !hasMergedText && !allowErrorOnlyFollowUp) {
-              return null;
-            }
-            /* === VIVENTIUM NOTE END === */
-
-            try {
-              const recentResponse = extractTextFromContentParts(responseContentParts);
-              /* === VIVENTIUM START ===
-               * Feature: Scheduled/no-response Phase B follow-up forcing.
-               *
-               * Why:
-               * - Scheduler-style prompts can intentionally make Phase A output exactly {NTA}
-               *   while background agents finish.
-               * - If Phase B later has substantive insights and synthesis still emits {NTA}, the
-               *   no-response tag must not suppress the useful Phase B follow-up.
-               *
-               * Behavior:
-               * - Phase B remains nonblocking and persists as a separate assistant follow-up.
-               * - We never replace or overwrite Phase A here.
-               * - This is structural: it keys off the no-response tag and Phase B output, not prompt
-               *   text, schedule names, user identity, or agent names.
-               * === VIVENTIUM END === */
-              const forcePhaseBFollowUp = shouldForcePhaseBFollowUp({
-                shouldDeferMainResponse,
-                parentText: recentResponse,
-                hasInsights,
-                hasMergedText,
-                allowErrorOnlyFollowUp,
-              });
-              /* VIVENTIUM DEBUG — Phase B recentResponse visibility */
-              {
-                const cpLen = responseContentParts?.length ?? 0;
-                const textParts = (responseContentParts || []).filter((p) => p && p.type === ContentTypes.TEXT).length;
-                const rrLen = recentResponse.length;
-                if (process.env.VIVENTIUM_DEBUG_PHASE_B === 'true') {
-                  const preview = recentResponse.slice(0, 200);
-                  logger.info(
-                    `[AgentClient] Phase B recentResponse extraction: contentParts.length=${cpLen}, textParts=${textParts}, recentResponse.length=${rrLen}, preview="${preview}"`,
-                  );
-                } else {
-                  logger.info(
-                    `[AgentClient] Phase B recentResponse extraction: contentParts.length=${cpLen}, textParts=${textParts}, recentResponse.length=${rrLen}`,
-                  );
-                }
-              }
-              /* VIVENTIUM DEBUG END */
-              const followUpMessage = await createCortexFollowUpMessage({
-                req,
-                conversationId,
-                parentMessageId: responseMessageId,
-                agent,
-                insightsData: mergedInsightsData,
-                recentResponse,
-                forceVisibleFollowUp: forcePhaseBFollowUp,
-              });
-              try {
-                await finalizeCanonicalCortexMessage({
-                  req,
-                  messageId: responseMessageId,
-                });
-              } catch (finishErr) {
-                logger.warn(
-                  '[AgentClient] Failed to finalize canonical cortex parent message:',
-                  finishErr?.message ?? String(finishErr),
-                );
-              }
-
-              if (followUpMessage?.text) {
-                logger.info(
-                  '[AgentClient] Background cortex follow-up message saved: id=%s phase_b_new_message=%s',
-                  followUpMessage.messageId,
-                  followUpMessage.messageId !== responseMessageId,
-                );
-              } else {
-                logger.warn(
-                  '[AgentClient] Background cortex follow-up produced no persisted message (suppressed or empty)',
-                );
-              }
-
-              /* === VIVENTIUM NOTE ===
-               * Telegram must receive a single merged follow-up event after ALL cortices finish.
-               */
-              if (followUpMessage?.text && req?._resumableStreamId) {
-                const emittedParentMessageId =
-                  followUpMessage.messageId === responseMessageId
-                    ? followUpMessage.parentMessageId
-                    : responseMessageId;
-                const followUpEvent = {
-                  event: 'on_cortex_followup',
-                  data: {
-                    runId: responseMessageId,
-                    messageId: followUpMessage.messageId,
-                    parentMessageId: emittedParentMessageId,
-                    conversationId,
-                    text: followUpMessage.text,
-                    cortexCount: mergedInsightsData?.cortexCount ?? undefined,
-                  },
-                };
-                GenerationJobManager.emitChunk(req._resumableStreamId, followUpEvent).catch((err) => {
-                  logger.warn(
-                    '[AgentClient] Failed to emit cortex follow-up SSE event:',
-                    err?.message ?? String(err),
-                  );
-                });
-              }
-              /* === VIVENTIUM NOTE END === */
-            } catch (e) {
-              logger.error('[AgentClient] Failed to create cortex follow-up message:', e);
-            }
-
-            return null;
-          })
-          .catch((err) => {
-            logger.error('[AgentClient] Phase B background completion pipeline failed:', err);
-          });
-      }
-      /* === VIVENTIUM NOTE END === */
+       * Phase B persistence/follow-up is attached immediately when Phase B starts.
+       * Keeping that pipeline above the main-model call prevents primary-model
+       * fallback from orphaning already-started background work.
+       * === VIVENTIUM NOTE END === */
 
 
 
     } catch (err) {
-      logger.error(
-        '[api/server/controllers/agents/client.js #sendCompletion] Operation aborted',
+      handleCompletionErrorContentPart({
+        contentParts: this.contentParts,
         err,
-      );
-      if (!abortController.signal.aborted) {
-        logger.error(
-          '[api/server/controllers/agents/client.js #sendCompletion] Unhandled error type',
-          err,
-        );
-        this.contentParts.push({
-          type: ContentTypes.ERROR,
-          [ContentTypes.ERROR]: `An error occurred while processing the request${err?.message ? `: ${err.message}` : ''}`,
-        });
-      }
+        abortController,
+      });
     } finally {
       try {
         const attachments = await this.awaitMemoryWithTimeout(memoryPromise);
@@ -3331,7 +3933,7 @@ class AgentClient extends BaseClient {
       } catch (err) {
         logger.error(
           '[api/server/controllers/agents/client.js #chatCompletion] Error in cleanup phase',
-          err,
+          sanitizeCompletionErrorForLog(err),
         );
       }
       try {
@@ -3340,7 +3942,7 @@ class AgentClient extends BaseClient {
           conversationId: this.conversationId,
         });
       } catch (error) {
-        logger.warn('[AgentClient] Failed to schedule conversation recall sync', error);
+        logger.warn('[AgentClient] Failed to schedule conversation recall sync', sanitizeCompletionErrorForLog(error));
       }
       run = null;
       config = null;
@@ -3544,15 +4146,15 @@ class AgentClient extends BaseClient {
 	        transactions: transactionsConfig,
 	        messageId: this.responseMessageId,
 	      }).catch((err) => {
-	        logger.error(
-	          '[api/server/controllers/agents/client.js #titleConvo] Error recording collected usage',
-          err,
+        logger.error(
+          '[api/server/controllers/agents/client.js #titleConvo] Error recording collected usage',
+          sanitizeCompletionErrorForLog(err),
         );
       });
 
       return sanitizeTitle(titleResult.title);
     } catch (err) {
-      logger.error('[api/server/controllers/agents/client.js #titleConvo] Error', err);
+      logger.error('[api/server/controllers/agents/client.js #titleConvo] Error', sanitizeCompletionErrorForLog(err));
       return;
     }
   }
@@ -3609,7 +4211,7 @@ class AgentClient extends BaseClient {
     } catch (error) {
       logger.error(
         '[api/server/controllers/agents/client.js #recordTokenUsage] Error recording token usage',
-        error,
+        sanitizeCompletionErrorForLog(error),
       );
     }
   }
@@ -3631,5 +4233,12 @@ class AgentClient extends BaseClient {
 
 module.exports = AgentClient;
 module.exports.buildViventiumMcpRequestBody = buildViventiumMcpRequestBody;
+module.exports.isLateStreamTerminationError = isLateStreamTerminationError;
+module.exports.shouldSuppressCompletionErrorContentPart = shouldSuppressCompletionErrorContentPart;
+module.exports.createCompletionErrorContentPart = createCompletionErrorContentPart;
+module.exports.handleCompletionErrorContentPart = handleCompletionErrorContentPart;
+module.exports.ensureBackgroundCortexRuntimeCardGuard = ensureBackgroundCortexRuntimeCardGuard;
+module.exports.formatActivationSummary = formatActivationSummary;
+module.exports.getCortexLateDetectTimeoutMs = getCortexLateDetectTimeoutMs;
 
 /* === VIVENTIUM END === */

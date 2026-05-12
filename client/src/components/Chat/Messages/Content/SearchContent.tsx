@@ -32,10 +32,29 @@ const SearchContent = ({
   const { messageId } = message;
 
   const attachmentMap = useMemo(() => mapAttachments(attachments ?? []), [attachments]);
-  const displayContent = useMemo(
-    () => filterRenderableContentParts(message.content),
-    [message.content],
-  );
+  const displayContent = useMemo(() => {
+    const fallbackText = typeof message.text === 'string' ? message.text.trim() : '';
+    const parts = filterRenderableContentParts(message.content, {
+      visibleFallbackText: fallbackText,
+    }) ?? [];
+    const cortexTypes = new Set([
+      ContentTypes.CORTEX_ACTIVATION,
+      ContentTypes.CORTEX_BREWING,
+      ContentTypes.CORTEX_INSIGHT,
+    ]);
+    const hasNonCortexRenderablePart = parts.some((part) => part && !cortexTypes.has(part.type));
+    if (hasNonCortexRenderablePart || !fallbackText || isNoResponseOnlyText(fallbackText)) {
+      return parts;
+    }
+    return [
+      {
+        type: ContentTypes.TEXT,
+        text: fallbackText,
+        [ContentTypes.TEXT]: fallbackText,
+      } as TMessageContentParts,
+      ...parts,
+    ];
+  }, [message.content, message.text]);
 
   if (displayContent && displayContent.length > 0) {
     return (

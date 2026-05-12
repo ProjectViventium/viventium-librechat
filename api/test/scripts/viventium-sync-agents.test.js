@@ -206,6 +206,7 @@ describe('viventium-sync-agents args', () => {
       'cooldown_ms',
       'max_history',
       'intent_scope',
+      'activation_failure_visibility',
     ]);
   });
 
@@ -215,6 +216,7 @@ describe('viventium-sync-agents args', () => {
       'prompt',
       'confidence_threshold',
       'fallbacks',
+      'activation_failure_visibility',
     ]);
   });
 
@@ -639,4 +641,5 @@ backgroundAgents: []
     expect(isPlaceholderOwnerEmail('viventium-system@example.com')).toBe(true);
     expect(isPlaceholderOwnerEmail('real-owner@example.com')).toBe(false);
   });
+
 });

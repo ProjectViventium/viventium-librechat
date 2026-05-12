@@ -28,8 +28,67 @@ function expandHomePath(value: string): string {
   return raw;
 }
 
+function unquoteEnvValue(value: string): string {
+  const trimmed = value.trim();
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+function readRuntimeEnvValue(key: string): string {
+  const home = process.env.HOME || os.homedir();
+  const appSupportDir =
+    process.env.VIVENTIUM_APP_SUPPORT_DIR ||
+    path.join(home, 'Library', 'Application Support', 'Viventium');
+  const runtimeDir = path.join(appSupportDir, 'runtime');
+  const librechatDir = process.env.LIBRECHAT_DIR || process.cwd();
+  const candidates = [
+    path.join(librechatDir, '.env'),
+    path.join(runtimeDir, 'local.env'),
+    path.join(runtimeDir, 'librechat.env'),
+    path.join(runtimeDir, 'runtime.env'),
+    path.join(runtimeDir, 'runtime.local.env'),
+    path.join(runtimeDir, 'service-env', 'librechat.env'),
+  ];
+  let resolved = '';
+  for (const candidate of candidates) {
+    let text = '';
+    try {
+      text = fs.readFileSync(candidate, 'utf8');
+    } catch {
+      continue;
+    }
+    for (const line of text.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) {
+        continue;
+      }
+      const equalsAt = trimmed.indexOf('=');
+      if (equalsAt <= 0) {
+        continue;
+      }
+      if (trimmed.slice(0, equalsAt) === key) {
+        const value = unquoteEnvValue(trimmed.slice(equalsAt + 1));
+        if (value === '' && resolved) {
+          continue;
+        }
+        resolved = value;
+      }
+    }
+  }
+  return resolved;
+}
+
+function getRuntimeValue(key: string): string {
+  return String(process.env[key] || readRuntimeEnvValue(key) || '');
+}
+
 export function getMeetingTranscriptSourcePathHash(): string | null {
-  const sourceDir = expandHomePath(process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_DIR || '');
+  const sourceDir = expandHomePath(getRuntimeValue('VIVENTIUM_MEMORY_TRANSCRIPTS_DIR'));
   if (!sourceDir) {
     return null;
   }
@@ -49,7 +108,7 @@ export function meetingTranscriptRuntimeEnabled(): boolean {
 }
 
 export function getMeetingTranscriptRagMode(): MeetingTranscriptRagMode {
-  const value = String(process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_RAG_MODE || '')
+  const value = getRuntimeValue('VIVENTIUM_MEMORY_TRANSCRIPTS_RAG_MODE')
     .trim()
     .toLowerCase();
   if (value === 'raw_and_summary' || value === 'raw+summary' || value === 'all') {

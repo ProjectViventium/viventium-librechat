@@ -10,14 +10,32 @@ const {
   normalizeAgentToolNames,
   resolveActivationPolicyMainAgent,
   summarizeActivationError,
+  formatHistoryForActivation,
   getCortexAttemptGuardTimeoutMs,
   resolveBackgroundCortexFallbackAgent,
+  buildActivationCooldownKey,
+  buildActivationLlmConfig,
+  buildActivationProviderAttempts,
+  clearActivationProviderHealth,
+  getActivationProviderSuppression,
+  markActivationProviderUnhealthy,
+  shouldAttemptSuppressedActivationProvider,
+  shouldProbeSuppressedActivationAttempt,
+  activationProviderAttemptsUnavailable,
+  activationFailureVisibility,
+  shouldSurfaceActivationProviderUnavailable,
+  shouldSurfaceActivationTimeout,
+  configuredCortexDisplayName,
 } = require('../BackgroundCortexService');
 const fs = require('fs');
 const path = require('path');
 const yaml = require('js-yaml');
 
 describe('BackgroundCortexService activation policy helpers', () => {
+  afterEach(() => {
+    clearActivationProviderHealth();
+  });
+
   test('keeps activation classifier output strictly JSON-only', () => {
     expect(ACTIVATION_SYSTEM_PROMPT).toContain('Return only one valid JSON object');
     expect(ACTIVATION_SYSTEM_PROMPT).toContain('Do not include markdown');
@@ -31,6 +49,40 @@ describe('BackgroundCortexService activation policy helpers', () => {
       top_p: 1,
       response_format: { type: 'json_object' },
     });
+  });
+
+  test('does not force provider JSON mode onto OpenAI reasoning activation fallback', () => {
+    const llmConfig = applyActivationJsonMode({
+      providerName: 'openai',
+      model: 'gpt-5.4',
+      llmConfig: { provider: 'openAI', model: 'gpt-5.4' },
+    });
+
+    expect(llmConfig.modelKwargs).toBeUndefined();
+  });
+
+  test('keeps Groq as the primary activation classifier before fallbacks', () => {
+    const attempts = buildActivationProviderAttempts({
+      provider: 'groq',
+      model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+      fallbacks: [
+        { provider: 'groq', model: 'meta-llama/llama-4-scout-17b-16e-instruct' },
+        { provider: 'xai', model: 'grok-4.20-non-reasoning' },
+        { provider: 'openai', model: 'gpt-5.4' },
+        { provider: 'anthropic', model: 'claude-haiku-4-5' },
+      ],
+    });
+
+    expect(attempts).toEqual([
+      {
+        provider: 'groq',
+        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+        source: 'primary',
+      },
+      { provider: 'xai', model: 'grok-4.20-non-reasoning', source: 'fallback' },
+      { provider: 'openai', model: 'gpt-5.4', source: 'fallback' },
+      { provider: 'anthropic', model: 'claude-haiku-4-5', source: 'fallback' },
+    ]);
   });
 
   test('renders configured direct-action surfaces only when exact tools are attached', () => {
@@ -290,6 +342,24 @@ describe('BackgroundCortexService activation policy helpers', () => {
     ).toEqual(['web_search', 'worker_run_mcp_glasshive-workers-projects', 'schedule_create']);
   });
 
+  test('formats LangChain-style _getType messages for activation context', () => {
+    expect(
+      formatHistoryForActivation(
+        [
+          {
+            _getType: () => 'human',
+            content: 'Please let Red Team run visibly.',
+          },
+          {
+            _getType: () => 'ai',
+            content: 'Understood.',
+          },
+        ],
+        5,
+      ),
+    ).toContain('[User] Please let Red Team run visibly.');
+  });
+
   test('hydrates canonical server-side tools for activation policy when request agent is sparse', async () => {
     const requestAgent = {
       id: 'agent_main',
@@ -400,7 +470,8 @@ describe('BackgroundCortexService activation policy helpers', () => {
       cortex_id: 'agent_google',
       cortex_name: 'Google Workspace',
       status: 'error',
-      error: 'timeout',
+      error: 'This background agent timed out before returning a result.',
+      error_class: 'timeout',
       activation_scope: 'productivity_google_workspace',
       configured_tools: 12,
       completed_tool_calls: 3,
@@ -435,6 +506,306 @@ describe('BackgroundCortexService activation policy helpers', () => {
     );
   });
 
+  test('temporarily suppresses unhealthy activation providers without prompt heuristics', () => {
+    expect(
+      markActivationProviderUnhealthy({
+        provider: 'groq',
+        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+        errorSummary: {
+          class: 'provider_access_denied',
+          status: 403,
+          code: 'ERR_BAD_REQUEST',
+          message: 'Access denied',
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      getActivationProviderSuppression({
+        provider: 'Groq',
+        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+      }),
+    ).toEqual(
+      expect.objectContaining({
+        provider: 'groq',
+        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+        error: expect.objectContaining({ class: 'provider_access_denied' }),
+      }),
+    );
+
+    expect(
+      markActivationProviderUnhealthy({
+        provider: 'openai',
+        model: 'gpt-5.4',
+        errorSummary: { class: 'provider_error', message: 'generic bad response' },
+      }),
+    ).toBe(false);
+  });
+
+  test('scopes user-auth activation provider suppression to the affected user', () => {
+    const privateEmail = ['user-one', 'example.com'].join('@');
+    const errorSummary = {
+      class: 'provider_access_denied',
+      status: 403,
+      code: 'ERR_BAD_REQUEST',
+      message: `Access denied for account ${privateEmail}`,
+    };
+
+    expect(
+      markActivationProviderUnhealthy({
+        provider: 'openai',
+        model: 'gpt-5.4',
+        errorSummary,
+        req: { user: { id: 'user-one' } },
+      }),
+    ).toBe(true);
+
+    expect(
+      getActivationProviderSuppression({
+        provider: 'openai',
+        model: 'gpt-5.4',
+        req: { user: { id: 'user-one' } },
+      }),
+    ).toEqual(
+      expect.objectContaining({
+        scope: 'user:user-one',
+        error: { class: 'provider_access_denied', status: 403, code: 'ERR_BAD_REQUEST' },
+      }),
+    );
+    expect(
+      getActivationProviderSuppression({
+        provider: 'openai',
+        model: 'gpt-5.4',
+        req: { user: { id: 'user-two' } },
+      }),
+    ).toBeNull();
+  });
+
+  test('probes one stale auth-class activation suppression only when every attempt is suppressed', () => {
+    const attempts = [
+      { provider: 'groq', model: 'llama', source: 'primary' },
+      { provider: 'openai', model: 'gpt-5.4', source: 'fallback' },
+    ];
+
+    expect(
+      shouldProbeSuppressedActivationAttempt({
+        attempts,
+        allAttemptsSuppressed: true,
+        probeAlreadyUsed: false,
+        providerSuppression: {
+          error: { class: 'provider_unauthorized' },
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      shouldProbeSuppressedActivationAttempt({
+        attempts,
+        allAttemptsSuppressed: true,
+        probeAlreadyUsed: true,
+        providerSuppression: {
+          error: { class: 'provider_unauthorized' },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldProbeSuppressedActivationAttempt({
+        attempts,
+        allAttemptsSuppressed: false,
+        probeAlreadyUsed: false,
+        providerSuppression: {
+          error: { class: 'provider_unauthorized' },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldProbeSuppressedActivationAttempt({
+        attempts,
+        allAttemptsSuppressed: true,
+        probeAlreadyUsed: false,
+        providerSuppression: {
+          error: { class: 'provider_rate_limited' },
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldProbeSuppressedActivationAttempt({
+        attempts,
+        allAttemptsSuppressed: true,
+        probeAlreadyUsed: false,
+        providerSuppression: {
+          error: { class: 'provider_access_denied' },
+        },
+      }),
+    ).toBe(false);
+  });
+
+  test('does not let health suppression skip the primary activation provider', () => {
+    const providerSuppression = {
+      error: { class: 'provider_network' },
+      until: Date.now() + 60000,
+    };
+
+    expect(
+      shouldAttemptSuppressedActivationProvider({
+        attempt: { provider: 'groq', model: 'llama', source: 'primary' },
+        providerSuppression,
+      }),
+    ).toBe(true);
+
+    expect(
+      shouldAttemptSuppressedActivationProvider({
+        attempt: { provider: 'xai', model: 'grok', source: 'fallback' },
+        providerSuppression,
+      }),
+    ).toBe(false);
+  });
+
+  test('surfaces configured terminal cards only from source-owned failure visibility policy', () => {
+    const providerAttempts = [
+      {
+        provider: 'groq',
+        model: 'llama',
+        source: 'primary',
+        status: 'error',
+        error: { class: 'provider_access_denied', status: 403, code: 'ERR_BAD_REQUEST' },
+      },
+      {
+        provider: 'openai',
+        model: 'gpt-5.4',
+        source: 'fallback',
+        status: 'skipped_unhealthy',
+        error: { class: 'provider_unauthorized', status: 401, code: null },
+      },
+    ];
+
+    expect(activationProviderAttemptsUnavailable(providerAttempts)).toBe(true);
+    expect(activationFailureVisibility({ activation: { activation_failure_visibility: 'visible' } })).toBe(
+      'visible',
+    );
+    expect(activationFailureVisibility({ activation: { activation_failure_visibility: 'anything_else' } })).toBe(
+      'silent',
+    );
+    expect(
+      shouldSurfaceActivationProviderUnavailable({
+        activationResult: { providerAttempts },
+        cortexConfig: { activation: { activation_failure_visibility: 'visible' } },
+      }),
+    ).toBe(true);
+    expect(
+      shouldSurfaceActivationProviderUnavailable({
+        activationResult: { providerAttempts },
+        cortexConfig: { activation: { activation_failure_visibility: 'silent' } },
+      }),
+    ).toBe(false);
+    expect(
+      shouldSurfaceActivationTimeout({
+        activationResult: { reason: 'global_timeout' },
+        cortexConfig: { activation: { activation_failure_visibility: 'visible' } },
+      }),
+    ).toBe(false);
+    expect(configuredCortexDisplayName({ agent_id: 'agent_viventium_red_team_95aeb3' })).toBe(
+      'Red Team',
+    );
+    expect(
+      buildCortexCompletionPayload({
+        agentId: 'agent_confirmation_bias',
+        agentName: 'Confirmation Bias',
+        error: 'activation_provider_unavailable',
+        errorClass: 'activation_provider_unavailable',
+        reason: 'activation_provider_unavailable',
+      }),
+    ).toEqual(
+      expect.objectContaining({
+        cortex_name: 'Confirmation Bias',
+        status: 'error',
+        error_class: 'activation_provider_unavailable',
+        error:
+          'This background agent could not start because every configured activation provider was unavailable.',
+      }),
+    );
+  });
+
+  test('cortex completion errors are public-safe before rendering', () => {
+    const privateEmail = ['user-one', 'example.com'].join('@');
+    const privatePath = '/' + ['Users', 'example', 'project'].join('/');
+    const bearerSecret = ['Bearer', 'abcdefghijklmnopqrstuvwxyz'].join(' ');
+    const payload = buildCortexCompletionPayload({
+      agentId: 'agent_private',
+      agentName: 'Private Agent',
+      error: `Provider failed for ${privateEmail} at ${privatePath} with ${bearerSecret}`,
+    });
+
+    expect(payload).toEqual(
+      expect.objectContaining({
+        status: 'error',
+        error_class: 'recoverable_provider_error',
+        error: 'This background agent hit a recoverable provider issue before returning a result.',
+      }),
+    );
+    expect(JSON.stringify(payload)).not.toContain(privatePath);
+    expect(JSON.stringify(payload)).not.toContain(privateEmail);
+    expect(JSON.stringify(payload)).not.toContain('abcdefghijklmnopqrstuvwxyz');
+  });
+
+  test('expires unhealthy activation provider suppression after the configured ttl', () => {
+    const previousTtl = process.env.VIVENTIUM_ACTIVATION_PROVIDER_HEALTH_TTL_MS;
+    const nowSpy = jest.spyOn(Date, 'now');
+    try {
+      process.env.VIVENTIUM_ACTIVATION_PROVIDER_HEALTH_TTL_MS = '100';
+      nowSpy.mockReturnValue(1000);
+
+      expect(
+        markActivationProviderUnhealthy({
+          provider: 'groq',
+          model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+          errorSummary: {
+            class: 'provider_access_denied',
+            status: 403,
+            code: 'ERR_BAD_REQUEST',
+            message: 'Access denied',
+          },
+        }),
+      ).toBe(true);
+
+      expect(
+        getActivationProviderSuppression({
+          provider: 'groq',
+          model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+        }),
+      ).toEqual(expect.objectContaining({ provider: 'groq' }));
+
+      nowSpy.mockReturnValue(1101);
+      expect(
+        getActivationProviderSuppression({
+          provider: 'groq',
+          model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+        }),
+      ).toBeNull();
+    } finally {
+      nowSpy.mockRestore();
+      if (previousTtl == null) {
+        delete process.env.VIVENTIUM_ACTIVATION_PROVIDER_HEALTH_TTL_MS;
+      } else {
+        process.env.VIVENTIUM_ACTIVATION_PROVIDER_HEALTH_TTL_MS = previousTtl;
+      }
+    }
+  });
+
+  test('removes unsupported sampling controls from OpenAI reasoning activation fallback', async () => {
+    const llmConfig = await buildActivationLlmConfig({
+      providerName: 'openai',
+      model: 'gpt-5.4',
+      req: null,
+    });
+
+    expect(llmConfig.temperature).toBeUndefined();
+    expect(llmConfig.modelKwargs).toBeUndefined();
+  });
+
   test('adds a bounded guard grace around each Phase B cortex attempt', () => {
     const previous = process.env.VIVENTIUM_CORTEX_EXECUTION_GUARD_GRACE_MS;
     process.env.VIVENTIUM_CORTEX_EXECUTION_GUARD_GRACE_MS = '5000';
@@ -446,6 +817,65 @@ describe('BackgroundCortexService activation policy helpers', () => {
     } else {
       process.env.VIVENTIUM_CORTEX_EXECUTION_GUARD_GRACE_MS = previous;
     }
+  });
+
+  test('scopes activation cooldowns to the request identity when message metadata is available', () => {
+    const baseReq = {
+      user: { id: 'user_1' },
+      body: {
+        conversationId: 'new',
+        messageId: 'message_calendar',
+      },
+    };
+
+    expect(
+      buildActivationCooldownKey({
+        agentId: 'agent_productivity',
+        req: baseReq,
+        runId: 'run_1',
+      }),
+    ).toBe('agent_productivity:user_1:message_calendar');
+
+    expect(
+      buildActivationCooldownKey({
+        agentId: 'agent_productivity',
+        req: {
+          ...baseReq,
+          body: {
+            conversationId: 'new',
+            messageId: 'message_email',
+          },
+        },
+        runId: 'run_2',
+      }),
+    ).toBe('agent_productivity:user_1:message_email');
+
+    expect(
+      buildActivationCooldownKey({
+        agentId: 'agent_productivity',
+        req: {
+          user: { id: 'user_1' },
+          body: {
+            conversationId: 'conversation_1',
+            messageId: 'message_1',
+          },
+        },
+        runId: 'run_3',
+      }),
+    ).toBe('agent_productivity:user_1:conversation_1:message_1');
+
+    expect(
+      buildActivationCooldownKey({
+        agentId: 'agent_productivity',
+        req: {
+          user: { id: 'user_1' },
+          body: {
+            conversationId: 'new',
+          },
+        },
+        runId: 'run_4',
+      }),
+    ).toBe('agent_productivity:user_1:run_4');
   });
 
   test('builds validated OpenAI fallback agent for background cortex execution', async () => {

@@ -56,8 +56,32 @@ const LEGACY_DEFAULT_OUT_PATH = path.join(ROOT_DIR, 'tmp', 'viventium-agents.yam
 const DEFAULT_OUT_PATH = LEGACY_DEFAULT_OUT_PATH;
 const DEFAULT_ENV_SLUG = sanitizeSlug(process.env.VIVENTIUM_ENV || 'local');
 const SOURCE_OF_TRUTH_DIR = path.join(ROOT_DIR, 'viventium', 'source_of_truth');
+const PROMPT_REGISTRY_DIR = path.join(SOURCE_OF_TRUTH_DIR, 'prompts');
 const SOURCE_OF_TRUTH_OWNER_EMAIL = 'user@viventium.local';
 const SOURCE_OF_TRUTH_OWNER_ID = 'placeholder-owner';
+const PROMPT_VARIABLE_RE = /{{\s*([A-Za-z0-9_.-]+)\s*}}/g;
+const REQUIRED_PROMPT_FRONTMATTER_FIELDS = new Set([
+  'id',
+  'owner_layer',
+  'target',
+  'version',
+  'status',
+  'safety_class',
+  'output_contract',
+]);
+const PUBLIC_PROMPT_SAFETY_CLASSES = new Set(['public_product', 'public_safe']);
+const PRIVATE_PROMPT_PATTERNS = [
+  ['local_absolute_path', /(?:\/Users|\/home|\/private\/var|\/var\/folders)\/[^\s`'"<>]+/],
+  ['email_address', /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i],
+  ['secret_like_token', /\b(?:sk|pk|rk|ghp|gho|github_pat|xox[baprs]?)-[A-Za-z0-9_-]{8,}\b/],
+  ['bearer_token', /\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b/i],
+];
+const KNOWN_RUNTIME_PLACEHOLDERS = new Set([
+  'current_user',
+  'current_date',
+  'current_datetime',
+  'iso_datetime',
+]);
 const NON_RUNTIME_OWNER_EMAILS = new Set([
   '',
   SOURCE_OF_TRUTH_OWNER_EMAIL.toLowerCase(),
@@ -235,6 +259,7 @@ const DEFAULT_PROMPTS_ONLY_ACTIVATION_FIELDS = [
   'prompt',
   'confidence_threshold',
   'fallbacks',
+  'activation_failure_visibility',
 ];
 const DEFAULT_ACTIVATION_CONFIG_FIELDS = [
   'enabled',
@@ -246,6 +271,7 @@ const DEFAULT_ACTIVATION_CONFIG_FIELDS = [
   'cooldown_ms',
   'max_history',
   'intent_scope',
+  'activation_failure_visibility',
 ];
 const SAFE_ACTIVATION_FIELD_SET = new Set(DEFAULT_ACTIVATION_CONFIG_FIELDS);
 
@@ -675,9 +701,180 @@ function loadBundle(filePath, explicitFormat) {
 function loadBundleFromContents({ contents, filePath, explicitFormat }) {
   const format = resolveFormat({ filePath, explicitFormat });
   if (format === 'json') {
-    return JSON.parse(contents);
+    return resolvePromptRefs(JSON.parse(contents));
   }
-  return yaml.load(contents, { schema: yaml.JSON_SCHEMA });
+  return resolvePromptRefs(yaml.load(contents, { schema: yaml.JSON_SCHEMA }));
+}
+
+function parsePromptMarkdown(filePath) {
+  const text = fs.readFileSync(filePath, 'utf8');
+  if (!text.startsWith('---\n')) {
+    throw new Error(`Prompt is missing frontmatter: ${filePath}`);
+  }
+  const end = text.indexOf('\n---\n', 4);
+  if (end === -1) {
+    throw new Error(`Prompt frontmatter is not closed: ${filePath}`);
+  }
+  const metadata = yaml.load(text.slice(4, end), { schema: yaml.JSON_SCHEMA }) || {};
+  const body = text.slice(end + '\n---\n'.length).trimEnd();
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
+    throw new Error(`Prompt frontmatter must be a mapping: ${filePath}`);
+  }
+  const missing = [...REQUIRED_PROMPT_FRONTMATTER_FIELDS].filter(
+    (field) => !Object.prototype.hasOwnProperty.call(metadata, field),
+  );
+  if (missing.length) {
+    throw new Error(`Prompt frontmatter missing ${missing.join(', ')}: ${filePath}`);
+  }
+  const id = String(metadata.id || '').trim();
+  if (!id) {
+    throw new Error(`Prompt id is missing: ${filePath}`);
+  }
+  if (!/^[a-z0-9][a-z0-9_.-]*$/.test(id)) {
+    throw new Error(`Prompt id is invalid: ${id} in ${filePath}`);
+  }
+  if (!['active', 'draft', 'deprecated'].includes(String(metadata.status || '').trim())) {
+    throw new Error(`Prompt status is invalid for ${id}: ${filePath}`);
+  }
+  if (!Number.isInteger(metadata.version) || metadata.version < 1) {
+    throw new Error(`Prompt version must be a positive integer for ${id}: ${filePath}`);
+  }
+  if (!PUBLIC_PROMPT_SAFETY_CLASSES.has(String(metadata.safety_class || '').trim())) {
+    throw new Error(`Prompt safety_class must be public-safe for ${id}: ${filePath}`);
+  }
+  const scanned = `${JSON.stringify(metadata, null, 2)}\n${body}`;
+  for (const [label, pattern] of PRIVATE_PROMPT_PATTERNS) {
+    if (pattern.test(scanned)) {
+      throw new Error(`Private pattern ${label} found in public prompt: ${filePath}`);
+    }
+  }
+  return { id, metadata, body, filePath };
+}
+
+function walkPromptMarkdownFiles(dir) {
+  if (!fs.existsSync(dir)) {
+    return [];
+  }
+  const entries = [];
+  for (const name of fs.readdirSync(dir).sort()) {
+    const fullPath = path.join(dir, name);
+    const stat = fs.statSync(fullPath);
+    if (stat.isDirectory()) {
+      entries.push(...walkPromptMarkdownFiles(fullPath));
+    } else if (name.endsWith('.md')) {
+      entries.push(fullPath);
+    }
+  }
+  return entries;
+}
+
+function loadPromptRegistry() {
+  const registry = new Map();
+  for (const filePath of walkPromptMarkdownFiles(PROMPT_REGISTRY_DIR)) {
+    const entry = parsePromptMarkdown(filePath);
+    if (registry.has(entry.id)) {
+      throw new Error(`Duplicate prompt id ${entry.id}`);
+    }
+    registry.set(entry.id, entry);
+  }
+  return registry;
+}
+
+function lookupPromptVariable(variables, key) {
+  let current = variables || {};
+  for (const segment of String(key).split('.')) {
+    if (current && typeof current === 'object' && Object.prototype.hasOwnProperty.call(current, segment)) {
+      current = current[segment];
+      continue;
+    }
+    throw new Error(`Missing prompt variable: ${key}`);
+  }
+  if (Array.isArray(current)) {
+    return current.map((item) => String(item)).join(', ');
+  }
+  if (current == null) {
+    throw new Error(`Prompt variable is null: ${key}`);
+  }
+  return String(current);
+}
+
+function substitutePromptVariables(text, variables, { strict = false } = {}) {
+  return String(text || '').replace(PROMPT_VARIABLE_RE, (match, key) => {
+    try {
+      return lookupPromptVariable(variables, key);
+    } catch (error) {
+      if (strict) {
+        throw error;
+      }
+      if (!KNOWN_RUNTIME_PLACEHOLDERS.has(String(key))) {
+        throw new Error(
+          `Unknown unfilled prompt variable ${key}; add promptVars or an allowed runtime placeholder`,
+        );
+      }
+      return match;
+    }
+  });
+}
+
+function renderPromptRef(promptId, registry, stack = [], variables = {}) {
+  if (stack.includes(promptId)) {
+    throw new Error(`Prompt include cycle detected: ${[...stack, promptId].join(' -> ')}`);
+  }
+  const entry = registry.get(promptId);
+  if (!entry) {
+    throw new Error(`Unknown promptRef: ${promptId}`);
+  }
+  const includes = Array.isArray(entry.metadata.includes) ? entry.metadata.includes : [];
+  const rendered = includes.map((includeId) =>
+    renderPromptRef(String(includeId), registry, [...stack, promptId], variables).trim(),
+  );
+  rendered.push(entry.body.trim());
+  return substitutePromptVariables(rendered.filter(Boolean).join('\n\n'), variables, {
+    strict: entry.metadata.strict_variables === true,
+  });
+}
+
+function resolvePromptRefs(value, registry = null) {
+  if (Array.isArray(value)) {
+    return value.map((item) => resolvePromptRefs(item, registry));
+  }
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+
+  const keys = Object.keys(value);
+  const onlyPromptRefKeys = keys.every((key) =>
+    ['promptRef', 'promptRefs', 'promptVars', 'separator'].includes(key),
+  );
+  if (value.promptRef && onlyPromptRefKeys) {
+    const loadedRegistry = registry || loadPromptRegistry();
+    const variables = value.promptVars || {};
+    if (!variables || typeof variables !== 'object' || Array.isArray(variables)) {
+      throw new Error(`promptVars must be an object for promptRef ${value.promptRef}`);
+    }
+    return renderPromptRef(String(value.promptRef), loadedRegistry, [], variables).trim();
+  }
+  if (value.promptRefs && onlyPromptRefKeys) {
+    if (!Array.isArray(value.promptRefs)) {
+      throw new Error('promptRefs must be an array');
+    }
+    const loadedRegistry = registry || loadPromptRegistry();
+    const separator = typeof value.separator === 'string' ? value.separator : '\n\n';
+    const variables = value.promptVars || {};
+    if (!variables || typeof variables !== 'object' || Array.isArray(variables)) {
+      throw new Error('promptVars must be an object for promptRefs');
+    }
+    return value.promptRefs
+      .map((promptId) => renderPromptRef(String(promptId), loadedRegistry, [], variables).trim())
+      .join(separator);
+  }
+
+  const loadedRegistry = keys.some((key) => key === 'promptRef' || key === 'promptRefs')
+    ? registry || loadPromptRegistry()
+    : registry;
+  return Object.fromEntries(
+    Object.entries(value).map(([key, nested]) => [key, resolvePromptRefs(nested, loadedRegistry)]),
+  );
 }
 
 function writeBundle(filePath, explicitFormat, bundle) {
@@ -895,7 +1092,7 @@ function loadYamlDocument(filePath) {
     return null;
   }
   const contents = fs.readFileSync(filePath, 'utf8');
-  return yaml.load(contents);
+  return resolvePromptRefs(yaml.load(contents));
 }
 
 function compareBundlesByAgent({
@@ -1794,7 +1991,7 @@ function printUsage() {
   console.log('  --raw-source-of-truth  Push raw bundle values without runtime rewrite (disables local default)');
   console.log('  --agent-ids=...   Optional comma-separated background agent ids to update surgically');
   console.log(
-    '  --activation-fields=...   Comma-separated activation fields for safe modes (enabled,prompt,confidence_threshold,fallbacks,model,provider,cooldown_ms,max_history,intent_scope)',
+    '  --activation-fields=...   Comma-separated activation fields for safe modes (enabled,prompt,confidence_threshold,fallbacks,activation_failure_visibility,model,provider,cooldown_ms,max_history,intent_scope)',
   );
   console.log('  --schedules       Also pull/push Scheduling Cortex tasks for this user (via viv-schedule-sync.js)');
   console.log('');
@@ -1964,6 +2161,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  KNOWN_RUNTIME_PLACEHOLDERS,
   buildPushGuardError,
   compareBundles,
   compareBundlesByAgent,
@@ -1971,9 +2169,11 @@ module.exports = {
   isPlaceholderOwnerEmail,
   LIBRECHAT_REVIEW_FIELDS,
   normalizeBundleForSourceOfTruth,
+  parsePromptMarkdown,
   parseArgs,
   pickAgentFields,
   resolveFormat,
+  resolvePromptRefs,
   buildUpdateData,
   mergeBackgroundCorticesActivationFields,
   resolveSafeActivationFields,

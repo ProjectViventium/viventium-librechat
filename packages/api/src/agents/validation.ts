@@ -73,9 +73,18 @@ export const activationConfigSchema = z.object({
   provider: z.string(),
   prompt: z.string(),
   intent_scope: z.string().optional(),
+  activation_failure_visibility: z.enum(['silent', 'visible']).optional(),
   confidence_threshold: z.number().min(0).max(1),
   cooldown_ms: z.number().min(0),
   max_history: z.number().min(1),
+  fallbacks: z
+    .array(
+      z.object({
+        provider: z.string(),
+        model: z.string(),
+      }),
+    )
+    .optional(),
 });
 
 /** Background cortex schema - an agent with its activation config */

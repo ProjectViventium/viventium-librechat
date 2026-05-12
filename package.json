@@ -186,8 +186,5 @@
       "admin/",
       "packages/"
     ]
-  },
-  "dependencies": {
-    "livekit-server-sdk": "^2.15.0"
   }
 }

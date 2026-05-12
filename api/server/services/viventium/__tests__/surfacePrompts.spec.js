@@ -19,8 +19,8 @@ const {
   stripVoiceControlTagsForDisplay,
 } = require('../surfacePrompts');
 
-const CARTESIA_SONIC3_CAPABILITIES = require('../../../../../../shared/voice/cartesia_sonic3_capabilities.json');
-const XAI_TTS_CAPABILITIES = require('../../../../../../shared/voice/xai_tts_capabilities.json');
+const CARTESIA_SONIC3_CAPABILITIES = require('../../../../../shared/voice/cartesia_sonic3_capabilities.json');
+const XAI_TTS_CAPABILITIES = require('../../../../../shared/voice/xai_tts_capabilities.json');
 
 describe('buildTimeContextInstructions', () => {
   const originalDefaultTimezone = process.env.VIVENTIUM_DEFAULT_TIMEZONE;

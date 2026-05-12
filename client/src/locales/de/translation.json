@@ -1173,7 +1173,6 @@
   "com_ui_misc": "Verschiedenes",
   "com_ui_model": "KI-Modell",
   "com_ui_model_parameters": "Modell-Parameter",
-  "com_ui_model_parameters_reset": "Modellparameter wurden zurückgesetzt.",
   "com_ui_model_selected": "{{0}} ausgewählt",
   "com_ui_more_info": "Mehr Infos",
   "com_ui_my_prompts": "Meine Prompts",

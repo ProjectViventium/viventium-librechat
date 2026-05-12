@@ -32,14 +32,14 @@ function resolveViventiumSurface(req) {
  * Purpose: Keep model-facing prompt instructions aligned with runtime TTS
  * validation and with Cartesia's documented Sonic-3 contract.
  * === VIVENTIUM END === */
-const CARTESIA_SONIC3_CAPABILITIES = require('../../../../../shared/voice/cartesia_sonic3_capabilities.json');
+const CARTESIA_SONIC3_CAPABILITIES = require('../../../../shared/voice/cartesia_sonic3_capabilities.json');
 const CARTESIA_SONIC3_EMOTIONS = CARTESIA_SONIC3_CAPABILITIES.generation_config.emotion.values;
 const CARTESIA_SONIC3_PRIMARY_EMOTIONS =
   CARTESIA_SONIC3_CAPABILITIES.generation_config.emotion.primary;
 const CARTESIA_SONIC3_SPEED = CARTESIA_SONIC3_CAPABILITIES.generation_config.speed;
 const CARTESIA_SONIC3_VOLUME = CARTESIA_SONIC3_CAPABILITIES.generation_config.volume;
 const CARTESIA_SONIC3_NONVERBAL_MARKERS = CARTESIA_SONIC3_CAPABILITIES.nonverbal_markers;
-const XAI_TTS_CAPABILITIES = require('../../../../../shared/voice/xai_tts_capabilities.json');
+const XAI_TTS_CAPABILITIES = require('../../../../shared/voice/xai_tts_capabilities.json');
 const XAI_TTS_INLINE_TAGS = XAI_TTS_CAPABILITIES.speech_tags.inline;
 const XAI_TTS_WRAPPING_TAGS = XAI_TTS_CAPABILITIES.speech_tags.wrapping;
 const { getPromptText } = require('./promptRegistry');

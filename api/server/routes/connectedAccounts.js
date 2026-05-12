@@ -59,8 +59,13 @@ function isConnectedAccountsEnabled() {
 }
 
 function shouldForceOpenAIManualMode() {
+  /* === VIVENTIUM START ===
+   * Purpose: Backend unit tests run under NODE_ENV=CI on GitHub. CI is
+   * non-interactive and must not start the localhost OAuth callback listener.
+   * === VIVENTIUM END === */
   return (
     process.env.NODE_ENV === 'test' ||
+    process.env.NODE_ENV === 'CI' ||
     isEnabled(process.env.VIVENTIUM_OPENAI_LOCAL_CALLBACK_MANUAL_ONLY)
   );
 }

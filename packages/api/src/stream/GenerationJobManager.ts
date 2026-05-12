@@ -759,6 +759,15 @@ class GenerationJobManagerClass {
 
     // First subscriber: replay buffered events and mark as connected
     if (!runtime.hasSubscriber) {
+      /* === VIVENTIUM START ===
+       * Purpose: On reconnect, align Redis subscriber ordering with the
+       * current publisher sequence before new chunks arrive. Without this,
+       * stale expected sequence numbers can buffer fresh chunks until timeout.
+       * === VIVENTIUM END === */
+      if (isFirst) {
+        this.eventTransport.syncReorderBuffer?.(streamId);
+      }
+
       runtime.hasSubscriber = true;
 
       // Replay any events that were emitted before subscriber connected

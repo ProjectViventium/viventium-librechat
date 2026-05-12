@@ -99,6 +99,10 @@ export class RedisEventTransport implements IEventTransport {
   /** Sequence counters per stream for publishing (ensures ordered delivery in cluster mode) */
   private sequenceCounters = new Map<string, number>();
 
+  /* === VIVENTIUM START ===
+   * Purpose: Centralize stream-state construction so reconnect preservation,
+   * abort callbacks, and ordering buffers stay structurally identical.
+   * === VIVENTIUM END === */
   private createStreamState(): StreamSubscribers {
     return {
       count: 0,
@@ -351,6 +355,10 @@ export class RedisEventTransport implements IEventTransport {
 
     // Initialize stream state if needed
     if (!this.streams.has(streamId)) {
+      /* === VIVENTIUM START ===
+       * Purpose: Use the shared state constructor introduced for reconnect-safe
+       * stream lifecycle handling.
+       * === VIVENTIUM END === */
       this.streams.set(streamId, this.createStreamState());
     }
 
@@ -438,6 +446,10 @@ export class RedisEventTransport implements IEventTransport {
       await this.publisher.publish(channel, JSON.stringify(message));
     } catch (err) {
       logger.error(`[RedisEventTransport] Failed to publish done:`, err);
+      /* === VIVENTIUM START ===
+       * Purpose: Terminal event publish failures must reject so callers and CI
+       * can detect that the final stream state was not delivered.
+       * === VIVENTIUM END === */
       throw err;
     }
   }
@@ -455,6 +467,10 @@ export class RedisEventTransport implements IEventTransport {
       await this.publisher.publish(channel, JSON.stringify(message));
     } catch (err) {
       logger.error(`[RedisEventTransport] Failed to publish error:`, err);
+      /* === VIVENTIUM START ===
+       * Purpose: Error event publish failures must reject so callers and CI can
+       * detect that the stream error state was not delivered.
+       * === VIVENTIUM END === */
       throw err;
     }
   }
@@ -485,6 +501,10 @@ export class RedisEventTransport implements IEventTransport {
       state.allSubscribersLeftCallbacks.push(callback);
     } else {
       // Create state just for the callback
+      /* === VIVENTIUM START ===
+       * Purpose: Keep callback-only stream state structurally aligned with
+       * reconnect-safe subscriber state.
+       * === VIVENTIUM END === */
       const newState = this.createStreamState();
       newState.allSubscribersLeftCallbacks.push(callback);
       this.streams.set(streamId, newState);
@@ -538,6 +558,10 @@ export class RedisEventTransport implements IEventTransport {
     let state = this.streams.get(streamId);
 
     if (!state) {
+      /* === VIVENTIUM START ===
+       * Purpose: Keep abort-only stream state structurally aligned with
+       * reconnect-safe subscriber state.
+       * === VIVENTIUM END === */
       state = this.createStreamState();
       this.streams.set(streamId, state);
     }

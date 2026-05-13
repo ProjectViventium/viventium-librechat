@@ -552,6 +552,8 @@ describe('fileSearch.js - tuple return validation', () => {
         query: 'Project Lantern launch checklist',
       });
 
+      expect(formattedString).toContain('File: meeting-transcript-summary-abc.txt');
+      expect(formattedString).not.toContain('File: meeting-summary.txt');
       expect(formattedString).toContain('Transcript artifact ID: meeting_transcript:abc');
       expect(formattedString).toContain('Transcript artifact kind: summary');
       expect(formattedString).toContain('Original filename: 2026-05-05-lantern.vtt');
@@ -563,6 +565,108 @@ describe('fileSearch.js - tuple return validation', () => {
         'Transcript artifact ID: meeting_transcript:abc',
       );
       expect(artifact.file_search.sources[0].content).toContain('10:08 Lee:');
+      expect(artifact.file_search.sources[0].fileName).toBe('meeting-transcript-summary-abc.txt');
+    });
+
+    it('returns the source-backed meeting transcript inventory without relying on vector similarity', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      axios.post.mockResolvedValue({ data: [] });
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        files: [
+          {
+            file_id: 'meeting_inventory:user_1:sourcehash',
+            filename: 'meeting-transcript-inventory-sourcehash.txt',
+            metadata: {
+              meetingTranscriptArtifactId: 'meeting_transcript_inventory:current',
+              meetingTranscriptKind: 'inventory',
+              meetingTranscriptDisplayTitle: 'Meeting transcript inventory',
+              meetingTranscriptOneLineSummary: 'Current transcript list.',
+              meetingTranscriptInventoryText: [
+                'Meeting transcript inventory / table of contents.',
+                'Current processed transcript summaries: 2',
+                '1. Project Lantern review',
+                '   Date/time: 2026-05-05T18:30:00.000Z',
+                '   Participants: Sam, Lee',
+                '   Context: Tuesday launch checklist and stale Monday plan.',
+                '2. Partner discovery call',
+                '   Participants: Avery, Morgan',
+                '   Context: Use-case priorities for a second meeting.',
+              ].join('\n'),
+            },
+          },
+          {
+            file_id: 'meeting_summary:user_1:abc',
+            filename: 'meeting-transcript-summary-abc.txt',
+            metadata: {
+              meetingTranscriptArtifactId: 'meeting_transcript:abc',
+              meetingTranscriptKind: 'summary',
+            },
+          },
+        ],
+      });
+
+      const [formattedString, artifact] = await fileSearchTool.func({
+        query: 'what recent transcripts do you see?',
+      });
+
+      expect(axios.post).toHaveBeenCalledTimes(1);
+      expect(axios.post.mock.calls[0][1].file_id).toBe('meeting_summary:user_1:abc');
+      expect(formattedString).toContain('Transcript artifact kind: inventory');
+      expect(formattedString).toContain('Current processed transcript summaries: 2');
+      expect(formattedString).toContain('Project Lantern review');
+      expect(artifact.file_search.sources[0].fileId).toBe('meeting_inventory:user_1:sourcehash');
+    });
+
+    it('keeps focused transcript summary hits ahead of inventory on narrow questions', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      axios.post.mockResolvedValue({
+        data: [
+          [
+            {
+              page_content:
+                '10:00 Sam said the Tuesday launch checklist is current and the Monday plan is stale.',
+              metadata: { source: '/path/to/meeting-transcript-summary-abc.txt', page: 1 },
+            },
+            0.05,
+          ],
+        ],
+      });
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        files: [
+          {
+            file_id: 'meeting_inventory:user_1:sourcehash',
+            filename: 'meeting-transcript-inventory-sourcehash.txt',
+            metadata: {
+              meetingTranscriptArtifactId: 'meeting_transcript_inventory:current',
+              meetingTranscriptKind: 'inventory',
+              meetingTranscriptInventoryText:
+                '1. Project Lantern review\n   Participants: Sam, Lee\n   Context: Launch checklist.',
+            },
+          },
+          {
+            file_id: 'meeting_summary:user_1:abc',
+            filename: 'meeting-transcript-summary-abc.txt',
+            metadata: {
+              meetingTranscriptArtifactId: 'meeting_transcript:abc',
+              meetingTranscriptKind: 'summary',
+            },
+          },
+        ],
+      });
+
+      const [formattedString, artifact] = await fileSearchTool.func({
+        query: 'what did Sam say about the Tuesday launch checklist?',
+      });
+
+      expect(formattedString.indexOf('meeting-transcript-summary-abc.txt')).toBeLessThan(
+        formattedString.indexOf('meeting-transcript-inventory-sourcehash.txt'),
+      );
+      expect(artifact.file_search.sources[0].fileId).toBe('meeting_summary:user_1:abc');
+      expect(artifact.file_search.sources[0].content).toContain('Sam said the Tuesday launch');
     });
 
     it('reranks current meeting transcript evidence above stale assistant recall disclaimers', async () => {

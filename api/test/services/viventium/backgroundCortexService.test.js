@@ -1,3 +1,7 @@
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
 jest.mock('@librechat/agents', () => ({
   Run: {
     create: jest.fn(async () => ({
@@ -64,7 +68,7 @@ jest.mock('~/server/services/Config/app', () => ({
   getAppConfig: jest.fn(async () => ({
     endpoints: {
       agents: {
-        allowedProviders: ['openai', 'anthropic'],
+        allowedProviders: ['openai', 'anthropic', 'xai'],
       },
       custom: [
         {
@@ -92,8 +96,9 @@ jest.mock('~/server/controllers/agents/callbacks', () => ({
 
 jest.mock('~/server/controllers/ModelController', () => ({
   getModelsConfig: jest.fn(async () => ({
-    anthropic: ['claude-sonnet-4-6'],
+    anthropic: ['claude-sonnet-4-5'],
     openAI: ['gpt-5.4'],
+    xai: ['grok-4.3'],
   })),
 }));
 
@@ -137,13 +142,19 @@ const {
   executeCortex,
   executeActivated,
   formatHistoryForActivation,
+  buildCortexCompletionPayload,
   getCustomEndpointConfig,
   sanitizeCortexDisplayName,
 } = require('~/server/services/BackgroundCortexService');
 const { Run, createContentAggregator } = require('@librechat/agents');
 const { initializeAgent, initializeAnthropic, createRun } = require('@librechat/api');
+const { logger } = require('@librechat/data-schemas');
 const { getAppConfig } = require('~/server/services/Config/app');
 const { loadAgent } = require('~/models/Agent');
+const {
+  PROMPT_BUNDLE_ENV,
+  resetPromptRegistryForTests,
+} = require('~/server/services/viventium/promptRegistry');
 
 const PRODUCTIVITY_MS365_PROMPT = `You are a classifier. Decide whether to activate the MS365 (Microsoft) productivity tool agent.
 
@@ -712,7 +723,7 @@ describe('BackgroundCortexService.checkCortexActivation', () => {
     );
   });
 
-  test('omits temperature for adaptive Anthropic activation checks on Sonnet 4.6', async () => {
+  test('omits temperature for adaptive Anthropic activation checks on Opus 4.7', async () => {
     const processStream = jest.fn(async () =>
       JSON.stringify({
         should_activate: true,
@@ -729,7 +740,7 @@ describe('BackgroundCortexService.checkCortexActivation', () => {
         activation: {
           enabled: true,
           provider: 'anthropic',
-          model: 'claude-sonnet-4-6',
+          model: 'claude-opus-4-7',
           prompt: 'Pattern recognition activation prompt',
         },
       },
@@ -742,7 +753,7 @@ describe('BackgroundCortexService.checkCortexActivation', () => {
       expect.objectContaining({
         endpoint: 'anthropic',
         model_parameters: expect.objectContaining({
-          model: 'claude-sonnet-4-6',
+          model: 'claude-opus-4-7',
           thinking: false,
           maxOutputTokens: 100,
         }),
@@ -756,7 +767,7 @@ describe('BackgroundCortexService.checkCortexActivation', () => {
         graphConfig: expect.objectContaining({
           llmConfig: expect.objectContaining({
             provider: 'anthropic',
-            model: 'claude-sonnet-4-6',
+            model: 'claude-opus-4-7',
           }),
         }),
       }),
@@ -1062,6 +1073,232 @@ describe('BackgroundCortexService.checkCortexActivation', () => {
       },
     });
   });
+
+  test('resolves configured activation decision-subject promptRef objects at runtime', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-prompt-bundle-'));
+    const bundlePath = path.join(tempDir, 'prompt-bundle.json');
+    const previousBundlePath = process.env[PROMPT_BUNDLE_ENV];
+    fs.writeFileSync(
+      bundlePath,
+      JSON.stringify({
+        prompt_count: 1,
+        prompts: {
+          'test.activation_subject_rule': {
+            body: 'CUSTOM PROMPTREF LATEST RULE: classify only the latest user message.',
+            metadata: {},
+          },
+        },
+      }),
+      'utf8',
+    );
+    process.env[PROMPT_BUNDLE_ENV] = bundlePath;
+    resetPromptRegistryForTests();
+
+    const processStream = jest.fn(async ({ messages }) => {
+      const prompt = messages[0]?.content || '';
+      expect(prompt).toContain('CUSTOM PROMPTREF LATEST RULE');
+      expect(prompt).not.toContain(
+        'Never activate only because an older user request appears in history',
+      );
+      expect(prompt).toContain('LatestUserMessage: say "TEST_OK"');
+      return JSON.stringify({
+        should_activate: false,
+        confidence: 1,
+        reason: 'custom promptRef latest rule',
+      });
+    });
+
+    Run.create.mockResolvedValueOnce({ processStream });
+
+    try {
+      await checkCortexActivation({
+        cortexConfig: {
+          agent_id: 'agent_viventium_confirmation_bias_95aeb3',
+          activation: {
+            enabled: true,
+            provider: 'openai',
+            model: 'gpt-5.4',
+            prompt: 'Activate for confirmation bias checks.',
+          },
+        },
+        messages: [
+          { role: 'user', content: 'Please red-team this launch idea.' },
+          { role: 'assistant', content: 'I will challenge the launch assumptions.' },
+          { role: 'user', content: 'say "TEST_OK"' },
+        ],
+        runId: 'run-configured-latest-rule-prompt-ref',
+        req: {
+          body: {},
+          user: {},
+          config: {
+            endpoints: { custom: [] },
+            viventium: {
+              background_cortices: {
+                activation_subject_rule: {
+                  prompt: {
+                    promptRef: 'test.activation_subject_rule',
+                  },
+                },
+              },
+            },
+          },
+        },
+      });
+    } finally {
+      if (previousBundlePath === undefined) {
+        delete process.env[PROMPT_BUNDLE_ENV];
+      } else {
+        process.env[PROMPT_BUNDLE_ENV] = previousBundlePath;
+      }
+      resetPromptRegistryForTests();
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test('falls back to the default activation decision-subject rule when promptRef resolution fails', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-prompt-bundle-'));
+    const bundlePath = path.join(tempDir, 'prompt-bundle.json');
+    const previousBundlePath = process.env[PROMPT_BUNDLE_ENV];
+    const warnSpy = jest.spyOn(logger, 'warn').mockImplementation(() => {});
+    fs.writeFileSync(bundlePath, JSON.stringify({ prompt_count: 0, prompts: {} }), 'utf8');
+    process.env[PROMPT_BUNDLE_ENV] = bundlePath;
+    resetPromptRegistryForTests();
+
+    const processStream = jest.fn(async ({ messages }) => {
+      const prompt = messages[0]?.content || '';
+      expect(prompt).toContain('## Activation Decision Subject:');
+      expect(prompt).toContain(
+        'Never activate only because an older user request appears in history',
+      );
+      expect(prompt).toContain('LatestUserMessage: say "TEST_OK"');
+      return JSON.stringify({
+        should_activate: false,
+        confidence: 1,
+        reason: 'default fallback latest rule',
+      });
+    });
+
+    Run.create.mockResolvedValueOnce({ processStream });
+
+    try {
+      await checkCortexActivation({
+        cortexConfig: {
+          agent_id: 'agent_viventium_confirmation_bias_95aeb3',
+          activation: {
+            enabled: true,
+            provider: 'openai',
+            model: 'gpt-5.4',
+            prompt: 'Activate for confirmation bias checks.',
+          },
+        },
+        messages: [
+          { role: 'user', content: 'Please red-team this launch idea.' },
+          { role: 'assistant', content: 'I will challenge the launch assumptions.' },
+          { role: 'user', content: 'say "TEST_OK"' },
+        ],
+        runId: 'run-configured-latest-rule-missing-prompt-ref',
+        req: {
+          body: {},
+          user: {},
+          config: {
+            endpoints: { custom: [] },
+            viventium: {
+              background_cortices: {
+                activation_subject_rule: {
+                  prompt: {
+                    promptRef: 'test.missing_activation_subject_rule',
+                  },
+                },
+              },
+            },
+          },
+        },
+      });
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining(
+          'Falling back to inline prompt for test.missing_activation_subject_rule',
+        ),
+      );
+    } finally {
+      warnSpy.mockRestore();
+      if (previousBundlePath === undefined) {
+        delete process.env[PROMPT_BUNDLE_ENV];
+      } else {
+        process.env[PROMPT_BUNDLE_ENV] = previousBundlePath;
+      }
+      resetPromptRegistryForTests();
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test.each([
+    [
+      'activation_subject_rule',
+      (disabledRule) => ({
+        activation_subject_rule: disabledRule,
+      }),
+    ],
+    [
+      'latest_user_message_rule',
+      (disabledRule) => ({
+        latest_user_message_rule: disabledRule,
+      }),
+    ],
+    [
+      'activation_policy.latest_user_message_rule',
+      (disabledRule) => ({
+        activation_policy: {
+          latest_user_message_rule: disabledRule,
+        },
+      }),
+    ],
+  ])(
+    'keeps the default activation decision-subject rule when %s disables the override',
+    async (_label, buildBackgroundCortices) => {
+      const processStream = jest.fn(async ({ messages }) => {
+        const prompt = messages[0]?.content || '';
+        expect(prompt).toContain('## Activation Decision Subject:');
+        expect(prompt).toContain(
+          'Never activate only because an older user request appears in history',
+        );
+        expect(prompt).not.toContain('CUSTOM DISABLED LATEST TURN RULE');
+        return JSON.stringify({
+          should_activate: false,
+          confidence: 1,
+          reason: 'default latest rule',
+        });
+      });
+
+      Run.create.mockResolvedValueOnce({ processStream });
+
+      await checkCortexActivation({
+        cortexConfig: {
+          agent_id: 'agent_viventium_confirmation_bias_95aeb3',
+          activation: {
+            enabled: true,
+            provider: 'openai',
+            model: 'gpt-5.4',
+            prompt: 'Activate for confirmation bias checks.',
+          },
+        },
+        messages: [{ role: 'user', content: 'say "TEST_OK"' }],
+        runId: 'run-configured-disabled-latest-rule',
+        req: {
+          body: {},
+          user: {},
+          config: {
+            endpoints: { custom: [] },
+            viventium: {
+              background_cortices: buildBackgroundCortices({
+                enabled: false,
+                prompt: 'CUSTOM DISABLED LATEST TURN RULE',
+              }),
+            },
+          },
+        },
+      });
+    },
+  );
 
   test('uses config-defined productivity scope instead of prompt-title or agent-name matching', async () => {
     const processStream = jest.fn(async ({ messages }) => {
@@ -1396,9 +1633,9 @@ describe('BackgroundCortexService.executeCortex', () => {
       id: 'agent_retry',
       name: 'Retry Cortex',
       provider: 'anthropic',
-      model: 'claude-sonnet-4-6',
+      model: 'claude-sonnet-4-5',
       model_parameters: {
-        model: 'claude-sonnet-4-6',
+        model: 'claude-sonnet-4-5',
         thinking: false,
       },
       fallback_llm_provider: 'openAI',
@@ -1491,6 +1728,325 @@ describe('BackgroundCortexService.executeCortex', () => {
     );
   });
 
+  test('executeActivated retries a configured fallback model after provider authentication failure', async () => {
+    const primaryProcessStream = jest.fn(async () => {
+      const error = new Error(
+        '401 {"type":"error","error":{"type":"authentication_error","message":"Invalid authentication credentials"}}',
+      );
+      error.status = 401;
+      error.lc_error_code = 'MODEL_AUTHENTICATION';
+      throw error;
+    });
+    const fallbackProcessStream = jest.fn(async () => 'fallback-output');
+    const onCortexComplete = jest.fn();
+    const onAllComplete = jest.fn();
+
+    loadAgent.mockResolvedValueOnce({
+      id: 'agent_retry_auth',
+      name: 'Retry Auth Cortex',
+      provider: 'anthropic',
+      model: 'claude-sonnet-4-5',
+      model_parameters: {
+        model: 'claude-sonnet-4-5',
+        thinking: false,
+      },
+      fallback_llm_provider: 'xai',
+      fallback_llm_model: 'grok-4.3',
+      fallback_llm_model_parameters: {
+        model: 'grok-4.3',
+      },
+      tools: [],
+    });
+    initializeAgent
+      .mockResolvedValueOnce({
+        id: 'agent_retry_auth',
+        name: 'Retry Auth Cortex',
+        tools: [],
+        userMCPAuthMap: null,
+        recursion_limit: 11,
+        provider: 'anthropic',
+      })
+      .mockResolvedValueOnce({
+        id: 'agent_retry_auth',
+        name: 'Retry Auth Cortex',
+        tools: [],
+        userMCPAuthMap: null,
+        recursion_limit: 11,
+        provider: 'xai',
+      });
+    createRun
+      .mockResolvedValueOnce({ processStream: primaryProcessStream })
+      .mockResolvedValueOnce({ processStream: fallbackProcessStream });
+    createContentAggregator
+      .mockReturnValueOnce({
+        contentParts: [],
+        aggregateContent: jest.fn(),
+      })
+      .mockReturnValueOnce({
+        contentParts: [{ type: 'text', text: 'fallback-output' }],
+        aggregateContent: jest.fn(),
+      });
+
+    await executeActivated({
+      req: {
+        user: { id: 'user-1', role: 'USER' },
+        body: { conversationId: 'c1', parentMessageId: 'p1' },
+      },
+      res: null,
+      mainAgent: { provider: 'anthropic' },
+      messages: [{ role: 'user', content: 'Review this.' }],
+      runId: 'run-fallback-retry-auth',
+      activatedCortices: [
+        {
+          agentId: 'agent_retry_auth',
+          cortexName: 'Retry Auth Cortex',
+          confidence: 1,
+          reason: 'provider_auth_recovery',
+        },
+      ],
+      onCortexComplete,
+      onAllComplete,
+    });
+
+    expect(createRun).toHaveBeenCalledTimes(2);
+    expect(initializeAgent.mock.calls[1][0].agent).toEqual(
+      expect.objectContaining({
+        provider: 'xai',
+        model: 'grok-4.3',
+        model_parameters: {
+          model: 'grok-4.3',
+        },
+      }),
+    );
+    expect(onCortexComplete).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cortex_id: 'agent_retry_auth',
+        status: 'complete',
+        insight: 'fallback-output',
+      }),
+    );
+    expect(onAllComplete).toHaveBeenCalledWith(
+      expect.objectContaining({
+        errors: undefined,
+        insights: [
+          expect.objectContaining({
+            cortexName: 'Retry Auth Cortex',
+            insight: 'fallback-output',
+          }),
+        ],
+      }),
+    );
+  });
+
+  test('executeActivated preserves provider auth class when primary and fallback both fail auth', async () => {
+    const createAuthError = () => {
+      const error = new Error(
+        '401 {"type":"error","error":{"type":"authentication_error","message":"Invalid authentication credentials"}}',
+      );
+      error.status = 401;
+      error.lc_error_code = 'MODEL_AUTHENTICATION';
+      return error;
+    };
+    const primaryProcessStream = jest.fn(async () => {
+      throw createAuthError();
+    });
+    const fallbackProcessStream = jest.fn(async () => {
+      throw createAuthError();
+    });
+    const onCortexComplete = jest.fn();
+    const onAllComplete = jest.fn();
+
+    loadAgent.mockResolvedValueOnce({
+      id: 'agent_retry_auth_both_fail',
+      name: 'Retry Auth Cortex',
+      provider: 'anthropic',
+      model: 'claude-sonnet-4-5',
+      model_parameters: {
+        model: 'claude-sonnet-4-5',
+        thinking: false,
+      },
+      fallback_llm_provider: 'xai',
+      fallback_llm_model: 'grok-4.3',
+      fallback_llm_model_parameters: {
+        model: 'grok-4.3',
+      },
+      tools: [],
+    });
+    initializeAgent
+      .mockResolvedValueOnce({
+        id: 'agent_retry_auth_both_fail',
+        name: 'Retry Auth Cortex',
+        tools: [],
+        userMCPAuthMap: null,
+        recursion_limit: 11,
+        provider: 'anthropic',
+      })
+      .mockResolvedValueOnce({
+        id: 'agent_retry_auth_both_fail',
+        name: 'Retry Auth Cortex',
+        tools: [],
+        userMCPAuthMap: null,
+        recursion_limit: 11,
+        provider: 'xai',
+      });
+    createRun
+      .mockResolvedValueOnce({ processStream: primaryProcessStream })
+      .mockResolvedValueOnce({ processStream: fallbackProcessStream });
+    createContentAggregator
+      .mockReturnValueOnce({
+        contentParts: [],
+        aggregateContent: jest.fn(),
+      })
+      .mockReturnValueOnce({
+        contentParts: [],
+        aggregateContent: jest.fn(),
+      });
+
+    await executeActivated({
+      req: {
+        user: { id: 'user-1', role: 'USER' },
+        body: { conversationId: 'c1', parentMessageId: 'p1' },
+      },
+      res: null,
+      mainAgent: { provider: 'anthropic' },
+      messages: [{ role: 'user', content: 'Review this.' }],
+      runId: 'run-fallback-auth-both-fail',
+      activatedCortices: [
+        {
+          agentId: 'agent_retry_auth_both_fail',
+          cortexName: 'Retry Auth Cortex',
+          confidence: 1,
+          reason: 'provider_auth_recovery',
+        },
+      ],
+      onCortexComplete,
+      onAllComplete,
+    });
+
+    expect(createRun).toHaveBeenCalledTimes(2);
+    expect(onCortexComplete).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cortex_id: 'agent_retry_auth_both_fail',
+        status: 'error',
+        error_class: 'provider_unauthorized',
+        error:
+          'This background agent could not use the configured provider because provider credentials were rejected.',
+      }),
+    );
+    expect(onAllComplete).toHaveBeenCalledWith(
+      expect.objectContaining({
+        hasErrors: true,
+        errors: [
+          expect.objectContaining({
+            cortexId: 'agent_retry_auth_both_fail',
+            error_class: 'provider_unauthorized',
+          }),
+        ],
+      }),
+    );
+  });
+
+  test('executeActivated preserves provider auth error class when no fallback is configured', async () => {
+    const primaryProcessStream = jest.fn(async () => {
+      const error = new Error(
+        '401 {"type":"error","error":{"type":"authentication_error","message":"Invalid authentication credentials"}}',
+      );
+      error.status = 401;
+      error.lc_error_code = 'MODEL_AUTHENTICATION';
+      throw error;
+    });
+    const onCortexComplete = jest.fn();
+    const onAllComplete = jest.fn();
+
+    loadAgent.mockResolvedValueOnce({
+      id: 'agent_auth_no_fallback',
+      name: 'Auth Cortex',
+      provider: 'anthropic',
+      model: 'claude-sonnet-4-5',
+      model_parameters: {
+        model: 'claude-sonnet-4-5',
+        thinking: false,
+      },
+      tools: [],
+    });
+    initializeAgent.mockResolvedValueOnce({
+      id: 'agent_auth_no_fallback',
+      name: 'Auth Cortex',
+      tools: [],
+      userMCPAuthMap: null,
+      recursion_limit: 11,
+      provider: 'anthropic',
+    });
+    createRun.mockResolvedValueOnce({ processStream: primaryProcessStream });
+    createContentAggregator.mockReturnValueOnce({
+      contentParts: [],
+      aggregateContent: jest.fn(),
+    });
+
+    await executeActivated({
+      req: {
+        user: { id: 'user-1', role: 'USER' },
+        body: { conversationId: 'c1', parentMessageId: 'p1' },
+      },
+      res: null,
+      mainAgent: { provider: 'anthropic' },
+      messages: [{ role: 'user', content: 'Review this.' }],
+      runId: 'run-auth-no-fallback',
+      activatedCortices: [
+        {
+          agentId: 'agent_auth_no_fallback',
+          cortexName: 'Auth Cortex',
+          confidence: 1,
+          reason: 'provider_auth_failure',
+        },
+      ],
+      onCortexComplete,
+      onAllComplete,
+    });
+
+    expect(createRun).toHaveBeenCalledTimes(1);
+    expect(onCortexComplete).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cortex_id: 'agent_auth_no_fallback',
+        status: 'error',
+        error_class: 'provider_unauthorized',
+        error:
+          'This background agent could not use the configured provider because provider credentials were rejected.',
+      }),
+    );
+    expect(onAllComplete).toHaveBeenCalledWith(
+      expect.objectContaining({
+        hasErrors: true,
+        errors: [
+          expect.objectContaining({
+            cortexId: 'agent_auth_no_fallback',
+            error_class: 'provider_unauthorized',
+          }),
+        ],
+      }),
+    );
+  });
+
+  test('buildCortexCompletionPayload maps structured provider auth failures to public auth copy', () => {
+    expect(
+      buildCortexCompletionPayload({
+        agentId: 'agent_auth',
+        agentName: 'Auth Cortex',
+        insight: null,
+        error: 'sanitized',
+        errorStatus: 401,
+        errorCode: 'MODEL_AUTHENTICATION',
+      }),
+    ).toEqual(
+      expect.objectContaining({
+        status: 'error',
+        error_class: 'provider_unauthorized',
+        error:
+          'This background agent could not use the configured provider because provider credentials were rejected.',
+      }),
+    );
+  });
+
   test('executeActivated retries fallback when primary cortex throws before returning a result', async () => {
     const primaryProcessStream = jest.fn(async () => {
       const error = new Error('429 rate limit');
@@ -1505,9 +2061,9 @@ describe('BackgroundCortexService.executeCortex', () => {
       id: 'agent_retry_throw',
       name: 'Retry Throw Cortex',
       provider: 'anthropic',
-      model: 'claude-sonnet-4-6',
+      model: 'claude-sonnet-4-5',
       model_parameters: {
-        model: 'claude-sonnet-4-6',
+        model: 'claude-sonnet-4-5',
         thinking: false,
       },
       fallback_llm_provider: 'openAI',
@@ -1839,7 +2395,7 @@ describe('BackgroundCortexService.executeCortex', () => {
         id: 'agent_confirmation',
         name: 'Confirmation Bias',
         provider: 'anthropic',
-        model: 'claude-sonnet-4-6',
+        model: 'claude-sonnet-4-5',
         instructions: 'You are a cortex.',
         model_parameters: {
           temperature: 0.3,
@@ -2002,7 +2558,7 @@ describe('BackgroundCortexService.executeCortex', () => {
       recursion_limit: 11,
       provider: 'anthropic',
       model_parameters: {
-        model: 'claude-sonnet-4-6',
+        model: 'claude-sonnet-4-5',
         temperature: 0.5,
         thinking: { type: 'enabled', budget_tokens: 2000 },
       },
@@ -2021,7 +2577,7 @@ describe('BackgroundCortexService.executeCortex', () => {
         id: 'agent_user_created',
         name: 'Custom Reviewer',
         provider: 'anthropic',
-        model: 'claude-sonnet-4-6',
+        model: 'claude-sonnet-4-5',
         instructions: 'You are a custom cortex.',
         model_parameters: {
           temperature: 0.5,
@@ -2047,7 +2603,7 @@ describe('BackgroundCortexService.executeCortex', () => {
   });
   /* === VIVENTIUM NOTE === */
 
-  test('removes Anthropic temperature for adaptive-era Sonnet 4.6 even when thinking is explicitly disabled', async () => {
+  test('removes Anthropic temperature for adaptive-era Opus 4.7 even when thinking is explicitly disabled', async () => {
     const processStream = jest.fn(async () => 'run-output');
     const initializedAgent = {
       id: 'agent_user_disabled',
@@ -2057,7 +2613,7 @@ describe('BackgroundCortexService.executeCortex', () => {
       recursion_limit: 11,
       provider: 'anthropic',
       model_parameters: {
-        model: 'claude-sonnet-4-6',
+        model: 'claude-opus-4-7',
         temperature: 0.5,
         thinking: false,
       },
@@ -2076,7 +2632,7 @@ describe('BackgroundCortexService.executeCortex', () => {
         id: 'agent_user_disabled',
         name: 'Custom Reviewer',
         provider: 'anthropic',
-        model: 'claude-sonnet-4-6',
+        model: 'claude-opus-4-7',
         instructions: 'You are a custom cortex.',
         model_parameters: {
           temperature: 0.5,

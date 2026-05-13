@@ -12,6 +12,7 @@ const {
   createCallSession,
   getCallSession,
   getCallSessionVoiceSettings,
+  resolveUserVoiceRoute,
   syncCallSessionState,
   updateCallSessionVoiceSettings,
   claimOrReplaceCallSessionConversationId,
@@ -47,6 +48,10 @@ describe('CallSessionService', () => {
     process.env.VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER = 'anthropic';
     process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL = 'claude-opus-4-7';
     delete process.env.OPENAI_API_KEY;
+    delete process.env.VIVENTIUM_STT_PROVIDER;
+    delete process.env.VIVENTIUM_STT_MODEL;
+    delete process.env.STT_PROVIDER;
+    delete process.env.LOCAL_WHISPER_MODEL_NAME;
     await ViventiumCallSession.deleteMany({});
     await User.deleteMany({});
     await Agent.deleteMany({});
@@ -386,6 +391,38 @@ describe('CallSessionService', () => {
     expect(created.requestedVoiceRoute).toEqual({
       stt: { provider: 'openai', variant: 'gpt-4o-transcribe' },
       tts: { provider: 'cartesia', variant: 'sonic-2' },
+    });
+  });
+
+  test('local whisper defaults preserve selected model and do not silently remap saved routes', async () => {
+    process.env.VIVENTIUM_STT_PROVIDER = 'whisper_local';
+    delete process.env.VIVENTIUM_STT_MODEL;
+    delete process.env.LOCAL_WHISPER_MODEL_NAME;
+
+    const user = await User.create({
+      name: 'Local Whisper User',
+      email: 'local-whisper@example.com',
+      provider: 'local',
+      viventiumVoicePreferences: {
+        livekitPlayground: {
+          stt: { provider: 'pywhispercpp', variant: 'large-v3-turbo' },
+          tts: { provider: 'openai', variant: 'gpt-4o-mini-tts' },
+        },
+      },
+    });
+
+    expect(
+      compactVoiceRouteState({
+        stt: { provider: 'pywhispercpp', variant: 'large-v3-turbo' },
+      }),
+    ).toEqual({
+      stt: { provider: 'pywhispercpp', variant: 'large-v3-turbo' },
+      tts: null,
+    });
+
+    expect(await resolveUserVoiceRoute(user._id.toString())).toMatchObject({
+      stt: { provider: 'pywhispercpp', variant: 'large-v3-turbo' },
+      tts: { provider: 'openai', variant: 'gpt-4o-mini-tts' },
     });
   });
 

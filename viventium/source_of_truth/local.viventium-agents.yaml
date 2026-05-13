@@ -417,14 +417,14 @@ backgroundAgents:
   instructions:
     promptRef: cortex.background_analysis.execution
   provider: anthropic
-  model: claude-sonnet-4-6
+  model: claude-sonnet-4-5
   tools:
   - sys__server__sys_mcp_sequential-thinking
   - sequentialthinking_mcp_sequential-thinking
   tool_kwargs: []
   model_parameters:
     thinking: false
-    model: claude-sonnet-4-6
+    model: claude-sonnet-4-5
   end_after_tools: false
   hide_sequential_outputs: false
   support_contact:
@@ -451,7 +451,7 @@ backgroundAgents:
   instructions:
     promptRef: cortex.confirmation_bias.execution
   provider: anthropic
-  model: claude-sonnet-4-6
+  model: claude-sonnet-4-5
   tools:
   - sys__server__sys_mcp_sequential-thinking
   - sys__all__sys_mcp_sequential-thinking
@@ -459,7 +459,7 @@ backgroundAgents:
   tool_kwargs: []
   model_parameters:
     thinking: false
-    model: claude-sonnet-4-6
+    model: claude-sonnet-4-5
   end_after_tools: false
   hide_sequential_outputs: false
   support_contact:
@@ -599,11 +599,11 @@ backgroundAgents:
   instructions:
     promptRef: cortex.pattern_recognition.execution
   provider: anthropic
-  model: claude-sonnet-4-6
+  model: claude-sonnet-4-5
   tools: []
   tool_kwargs: []
   model_parameters:
-    model: claude-sonnet-4-6
+    model: claude-sonnet-4-5
   end_after_tools: false
   hide_sequential_outputs: false
   background_cortices: []
@@ -621,12 +621,12 @@ backgroundAgents:
   instructions:
     promptRef: cortex.emotional_resonance.execution
   provider: anthropic
-  model: claude-sonnet-4-6
+  model: claude-sonnet-4-5
   tools: []
   tool_kwargs: []
   model_parameters:
     thinking: false
-    model: claude-sonnet-4-6
+    model: claude-sonnet-4-5
   background_cortices: []
   fallback_llm_model: grok-4.3
   fallback_llm_provider: xai
@@ -668,12 +668,12 @@ backgroundAgents:
   instructions:
     promptRef: cortex.support.execution
   provider: anthropic
-  model: claude-sonnet-4-6
+  model: claude-sonnet-4-5
   tools:
   - web_search
   tool_kwargs: []
   model_parameters:
-    model: claude-sonnet-4-6
+    model: claude-sonnet-4-5
   end_after_tools: false
   hide_sequential_outputs: false
   support_contact:

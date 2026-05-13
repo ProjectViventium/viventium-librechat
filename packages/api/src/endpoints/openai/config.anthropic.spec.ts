@@ -151,13 +151,13 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
       });
     });
 
-    it('should omit temperature for Claude Sonnet 4.6 even when thinking is explicitly disabled', () => {
-      const apiKey = 'anthropic-test-key-sonnet46';
+    it('should omit temperature for adaptive Claude Opus 4.7 even when thinking is explicitly disabled', () => {
+      const apiKey = 'anthropic-test-key-opus47';
       const endpoint = 'Anthropic (via LiteLLM)';
       const options = {
         modelOptions: {
-          model: 'claude-sonnet-4-6',
-          user: 'user46',
+          model: 'claude-opus-4-7',
+          user: 'user47',
           temperature: 0.7,
           thinking: false,
         },
@@ -173,14 +173,14 @@ describe('getOpenAIConfig - Anthropic Compatibility', () => {
 
       expect(result).toEqual({
         llmConfig: {
-          apiKey: 'anthropic-test-key-sonnet46',
+          apiKey: 'anthropic-test-key-opus47',
           maxRetries: 0,
-          model: 'claude-sonnet-4-6',
+          model: 'claude-opus-4-7',
           stream: true,
-          maxTokens: 64000,
+          maxTokens: 128000,
           modelKwargs: {
             metadata: {
-              user_id: 'user46',
+              user_id: 'user47',
             },
             promptCache: true,
           },

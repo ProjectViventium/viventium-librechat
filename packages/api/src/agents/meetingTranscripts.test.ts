@@ -219,7 +219,7 @@ describe('meeting transcript runtime helpers', () => {
     };
 
     expect(getMeetingTranscriptRagMode()).toBe('detailed_summary_only');
-    expect(getMeetingTranscriptKindFilter()).toEqual(['summary']);
+    expect(getMeetingTranscriptKindFilter()).toEqual(['summary', 'inventory']);
     expect(meetingTranscriptFileMatchesRagMode(rawFile)).toBe(false);
     expect(meetingTranscriptFileMatchesRagMode(summaryFile)).toBe(true);
 
@@ -251,6 +251,24 @@ describe('meeting transcript runtime helpers', () => {
       'meeting_transcript:user1:abc',
       'meeting_summary:user1:abc',
     ]);
+  });
+
+  it('attaches the transcript inventory with summary recall but not raw-only QA mode', () => {
+    const inventoryFile = {
+      ...transcriptFiles[0],
+      file_id: 'meeting_inventory:user1:sourcehash',
+      metadata: { meetingTranscriptKind: 'inventory' },
+    };
+
+    expect(meetingTranscriptFileMatchesRagMode(inventoryFile)).toBe(true);
+    expect(
+      mergeMeetingTranscriptResources({
+        transcriptFiles: [inventoryFile],
+      })?.[EToolResources.file_search]?.file_ids,
+    ).toEqual(['meeting_inventory:user1:sourcehash']);
+
+    process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_RAG_MODE = 'raw_only';
+    expect(meetingTranscriptFileMatchesRagMode(inventoryFile)).toBe(false);
   });
 
   it('adds file_search when transcript recall resources are attached', () => {

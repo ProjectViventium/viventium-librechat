@@ -1566,7 +1566,7 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(initializeAnthropic).toHaveBeenCalledWith(
       expect.objectContaining({
         model_parameters: expect.objectContaining({
-          model: 'claude-sonnet-4-6',
+          model: 'claude-sonnet-4-5',
         }),
       }),
     );

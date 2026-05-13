@@ -7,7 +7,7 @@ describe('resolveAgentModelForProvider', () => {
       resolveAgentModelForProvider({
         provider: 'anthropic',
         model: 'claude-opus-4-7',
-        availableModels: ['claude-opus-4-1-20250805', 'claude-sonnet-4-6'],
+        availableModels: ['claude-opus-4-1-20250805', 'claude-sonnet-4-5'],
         previousProvider: 'anthropic',
       }),
     ).toBe('claude-opus-4-7');

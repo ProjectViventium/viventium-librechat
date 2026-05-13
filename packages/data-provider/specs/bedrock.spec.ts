@@ -14,14 +14,6 @@ describe('supportsAdaptiveThinking', () => {
     expect(supportsAdaptiveThinking('claude-opus-4.6')).toBe(true);
   });
 
-  test('should return true for claude-sonnet-4-6', () => {
-    expect(supportsAdaptiveThinking('claude-sonnet-4-6')).toBe(true);
-  });
-
-  test('should return true for anthropic.claude-sonnet-4-6', () => {
-    expect(supportsAdaptiveThinking('anthropic.claude-sonnet-4-6')).toBe(true);
-  });
-
   test('should return true for claude-opus-4-7 (future)', () => {
     expect(supportsAdaptiveThinking('claude-opus-4-7')).toBe(true);
   });

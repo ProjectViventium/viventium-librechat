@@ -16,6 +16,7 @@ const {
   buildCanonicalPersistedAgentFields,
   hasCanonicalPersistedAgentFieldDrift,
 } = require('./viventium-agent-runtime-models');
+const { resolvePromptRefs } = require('./viventium-sync-agents');
 
 // App Support runtime env is the canonical local runtime source. Component-local env files are
 // fallback-only and must not override the active generated runtime profile.
@@ -171,7 +172,8 @@ function resolvePublicAccessRoleIds(value) {
 }
 
 function normalizeBundleForRuntimeWithOwner(bundle, { env = process.env } = {}) {
-  const normalized = normalizeBundleForRuntime(bundle, { env });
+  const resolvedBundle = resolvePromptRefs(bundle);
+  const normalized = normalizeBundleForRuntime(resolvedBundle, { env });
   normalized.meta = {
     ...(normalized.meta || {}),
     user: {

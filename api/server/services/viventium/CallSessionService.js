@@ -82,6 +82,10 @@ function normalizeVoiceRouteState(route) {
     tts: normalizeVoiceRouteSelection(route?.tts),
   };
 
+  if (normalizeSavedProviderAlias(normalized.stt.provider, 'stt') === 'pywhispercpp') {
+    normalized.stt.variant = normalizeLocalWhisperModel(normalized.stt.variant);
+  }
+
   return normalized;
 }
 
@@ -115,7 +119,15 @@ async function getUserSavedVoiceRoute(userId) {
  * voice preference as their source of truth, with canonical env defaults only as fallback.
  * === VIVENTIUM END === */
 function getDefaultLocalWhisperModel() {
-  return process.arch === 'x64' ? 'tiny.en' : 'large-v3-turbo';
+  return process.arch === 'x64' ? 'small' : 'large-v3-turbo';
+}
+
+function normalizeLocalWhisperModel(model) {
+  const value = normalizeVoiceRouteText(model, MAX_VARIANT_LENGTH);
+  if (!value) {
+    return getDefaultLocalWhisperModel();
+  }
+  return value;
 }
 
 function normalizeSavedProviderAlias(provider, modality) {
@@ -153,11 +165,10 @@ function getDefaultVoiceRouteSelection(modality) {
     if (provider === 'pywhispercpp') {
       return {
         provider,
-        variant: normalizeVoiceRouteText(
+        variant: normalizeLocalWhisperModel(
           process.env.VIVENTIUM_STT_MODEL ||
             process.env.LOCAL_WHISPER_MODEL_NAME ||
             getDefaultLocalWhisperModel(),
-          MAX_VARIANT_LENGTH,
         ),
       };
     }

@@ -503,7 +503,7 @@ describe('models/Agent', () => {
         provider: 'anthropic',
         model: 'claude-opus-4-7',
         model_parameters: {
-          model: 'claude-sonnet-4-6',
+          model: 'claude-sonnet-4-5',
         },
         author: authorId,
       });
@@ -522,7 +522,7 @@ describe('models/Agent', () => {
         provider: 'anthropic',
         model: 'claude-opus-4-7',
         model_parameters: {
-          model: 'claude-sonnet-4-6',
+          model: 'claude-sonnet-4-5',
         },
         author: authorId,
         versions: [],

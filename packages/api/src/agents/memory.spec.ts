@@ -426,7 +426,7 @@ describe('Memory Agent Header Resolution', () => {
   it('should force the unified memory decision tool for Anthropic memory runs', async () => {
     const llmConfig = {
       provider: Providers.ANTHROPIC,
-      model: 'claude-sonnet-4-6',
+      model: 'claude-sonnet-4-5',
     };
 
     await processMemory({
@@ -468,7 +468,7 @@ describe('Memory Agent Header Resolution', () => {
   it('should set temperature to 1 for Bedrock with thinking enabled', async () => {
     const llmConfig = {
       provider: Providers.BEDROCK,
-      model: 'us.anthropic.claude-sonnet-4-6',
+      model: 'us.anthropic.claude-sonnet-4-5-20250929-v1:0',
       temperature: 0.7,
       additionalModelRequestFields: {
         thinking: {
@@ -530,7 +530,7 @@ describe('Memory Agent Header Resolution', () => {
   it('should remove temperature for Anthropic with thinking enabled', async () => {
     const llmConfig = {
       provider: Providers.ANTHROPIC,
-      model: 'claude-sonnet-4-6',
+      model: 'claude-sonnet-4-5',
       temperature: 0.7,
       thinking: {
         type: 'enabled',
@@ -563,7 +563,7 @@ describe('Memory Agent Header Resolution', () => {
   it('should remove temperature for Anthropic when runtime default thinking applies', async () => {
     const llmConfig = {
       provider: Providers.ANTHROPIC,
-      model: 'claude-sonnet-4-6',
+      model: 'claude-sonnet-4-5',
       temperature: 0.7,
     };
 
@@ -629,10 +629,10 @@ describe('Memory Agent Header Resolution', () => {
     });
   });
 
-  it('should remove temperature for Anthropic adaptive-capable models when thinking is explicitly disabled', async () => {
+  it('should remove temperature for Anthropic adaptive-capable Opus 4.7 when thinking is explicitly disabled', async () => {
     const llmConfig = {
       provider: Providers.ANTHROPIC,
-      model: 'claude-sonnet-4-6',
+      model: 'claude-opus-4-7',
       temperature: 0.7,
       thinking: false,
     };
@@ -691,10 +691,10 @@ describe('Memory Agent Header Resolution', () => {
     expect(runConfig.graphConfig.llmConfig.thinking).toBeUndefined();
   });
 
-  it('should remove temperature for Anthropic adaptive-capable models with disabled thinking config', async () => {
+  it('should remove temperature for Anthropic adaptive-capable Opus 4.7 with disabled thinking config', async () => {
     const llmConfig = {
       provider: Providers.ANTHROPIC,
-      model: 'claude-sonnet-4-6',
+      model: 'claude-opus-4-7',
       temperature: 0.7,
       thinking: {
         type: 'disabled',

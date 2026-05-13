@@ -915,9 +915,9 @@ describe('BackgroundCortexService activation policy helpers', () => {
       cortexAgent: {
         id: 'agent_viventium_confirmation_bias_95aeb3',
         provider: 'anthropic',
-        model: 'claude-sonnet-4-6',
+        model: 'claude-sonnet-4-5',
         model_parameters: {
-          model: 'claude-sonnet-4-6',
+          model: 'claude-sonnet-4-5',
           thinking: false,
         },
         fallback_llm_provider: 'openAI',

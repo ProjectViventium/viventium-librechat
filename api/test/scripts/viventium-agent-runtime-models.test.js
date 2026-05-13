@@ -54,7 +54,7 @@ describe('viventium-agent-runtime-models', () => {
         VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER: 'openai',
         VIVENTIUM_FC_CONSCIOUS_LLM_MODEL: 'gpt-5.4',
         VIVENTIUM_CORTEX_PRODUCTIVITY_LLM_PROVIDER: 'anthropic',
-        VIVENTIUM_CORTEX_PRODUCTIVITY_LLM_MODEL: 'claude-sonnet-4-6',
+        VIVENTIUM_CORTEX_PRODUCTIVITY_LLM_MODEL: 'claude-sonnet-4-5',
         VIVENTIUM_BACKGROUND_ACTIVATION_PROVIDER: 'groq',
         VIVENTIUM_BACKGROUND_ACTIVATION_MODEL: 'meta-llama/llama-4-scout-17b-16e-instruct',
         OTUC_ACTIVATION_PROVIDER: 'groq',
@@ -67,8 +67,8 @@ describe('viventium-agent-runtime-models', () => {
     expect(normalized.mainAgent.voice_llm_provider).toBeNull();
     expect(normalized.mainAgent.voice_llm_model).toBeNull();
     expect(normalized.backgroundAgents[0].provider).toBe('anthropic');
-    expect(normalized.backgroundAgents[0].model).toBe('claude-sonnet-4-6');
-    expect(normalized.backgroundAgents[0].model_parameters.model).toBe('claude-sonnet-4-6');
+    expect(normalized.backgroundAgents[0].model).toBe('claude-sonnet-4-5');
+    expect(normalized.backgroundAgents[0].model_parameters.model).toBe('claude-sonnet-4-5');
     expect(normalized.mainAgent.background_cortices[0].activation.provider).toBe('groq');
     expect(normalized.mainAgent.background_cortices[0].activation.model).toBe(
       'meta-llama/llama-4-scout-17b-16e-instruct',

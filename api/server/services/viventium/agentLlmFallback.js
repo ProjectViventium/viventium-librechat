@@ -292,6 +292,48 @@ function isRecoverableProviderErrorText(text, { allowToolOrMcpText = false } = {
   );
 }
 
+function extractFallbackErrorStatus(value) {
+  const candidates = [value?.status, value?.statusCode, value?.errorStatus, value?.error_status];
+  for (const candidate of candidates) {
+    const status = Number(candidate);
+    if (Number.isFinite(status) && status > 0) {
+      return status;
+    }
+  }
+
+  const text = String(value?.error || value?.message || value || '');
+  const statusMatch =
+    text.match(/^\s*(\d{3})\b/) ||
+    text.match(/\bstatus(?: code)?[ =:]+(\d{3})\b/i) ||
+    text.match(/"status"\s*:\s*(\d{3})/i);
+  return statusMatch?.[1] ? Number(statusMatch[1]) : 0;
+}
+
+function extractFallbackErrorCode(value) {
+  const candidates = [
+    value?.code,
+    value?.errorCode,
+    value?.error_code,
+    value?.lc_error_code,
+    value?.error?.code,
+    value?.error?.type,
+  ];
+  for (const candidate of candidates) {
+    const code = String(candidate || '').trim();
+    if (code) {
+      return code.toUpperCase();
+    }
+  }
+
+  const text = String(value?.error || value?.message || value || '');
+  const codeMatch = text.match(/\b(MODEL_[A-Z_]+|E[A-Z_]+|authentication_error)\b/i);
+  return codeMatch?.[1] ? codeMatch[1].toUpperCase() : '';
+}
+
+function isRecoverableFallbackStatus(status) {
+  return status === 401 || status === 402 || status === 403 || status === 429 || status >= 500;
+}
+
 function shouldRetryWithFallback(contentParts) {
   if (
     !Array.isArray(contentParts) ||
@@ -355,6 +397,23 @@ function shouldRetryBackgroundCortexWithFallback(result) {
   ) {
     return false;
   }
+
+  const structuredClass =
+    result.errorClass || result.error_class || result.errorCode || result.error_code || result.code;
+  if (isRecoverableFallbackErrorClass(structuredClass)) {
+    return true;
+  }
+
+  const structuredStatus = extractFallbackErrorStatus(result);
+  if (isRecoverableFallbackStatus(structuredStatus)) {
+    return true;
+  }
+
+  const structuredCode = extractFallbackErrorCode(result);
+  if (structuredCode === 'MODEL_AUTHENTICATION' || structuredCode === 'MODEL_RATE_LIMIT') {
+    return true;
+  }
+
   if (!errorText) {
     return result.recoverableProviderError === true;
   }

@@ -55,7 +55,7 @@ describe('viventium-seed-agents', () => {
         VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER: 'anthropic',
         VIVENTIUM_FC_CONSCIOUS_LLM_MODEL: 'claude-opus-4-7',
         VIVENTIUM_CORTEX_PRODUCTIVITY_LLM_PROVIDER: 'anthropic',
-        VIVENTIUM_CORTEX_PRODUCTIVITY_LLM_MODEL: 'claude-sonnet-4-6',
+        VIVENTIUM_CORTEX_PRODUCTIVITY_LLM_MODEL: 'claude-sonnet-4-5',
         OTUC_ACTIVATION_PROVIDER: 'groq',
         OTUC_ACTIVATION_LLM: 'meta-llama/llama-4-scout-17b-16e-instruct',
       },
@@ -67,20 +67,57 @@ describe('viventium-seed-agents', () => {
     expect(normalized.mainAgent.voice_llm_provider).toBe('openAI');
     expect(normalized.mainAgent.voice_llm_model).toBe('gpt-5.4');
     expect(normalized.backgroundAgents[0].provider).toBe('anthropic');
-    expect(normalized.backgroundAgents[0].model).toBe('claude-sonnet-4-6');
-    expect(normalized.backgroundAgents[0].model_parameters.model).toBe('claude-sonnet-4-6');
+    expect(normalized.backgroundAgents[0].model).toBe('claude-sonnet-4-5');
+    expect(normalized.backgroundAgents[0].model_parameters.model).toBe('claude-sonnet-4-5');
+  });
+
+  test('resolves promptRef instructions before seed-style persistence', () => {
+    const normalized = normalizeBundleForRuntimeWithOwner(
+      {
+        meta: {
+          user: {
+            email: 'old-owner@example.com',
+            id: 'user-123',
+          },
+        },
+        mainAgent: {
+          id: 'agent_viventium_main_95aeb3',
+          instructions: {
+            promptRef: 'main.no_response',
+          },
+        },
+        backgroundAgents: [
+          {
+            id: 'agent_viventium_red_team_95aeb3',
+            instructions: {
+              promptRef: 'cortex.red_team.execution',
+            },
+          },
+        ],
+      },
+      {
+        env: {
+          VIVENTIUM_AGENT_SEED_OWNER_EMAIL: 'seed-owner@example.com',
+        },
+      },
+    );
+
+    expect(typeof normalized.mainAgent.instructions).toBe('string');
+    expect(normalized.mainAgent.instructions).toContain('NO RESPONSE TAG');
+    expect(typeof normalized.backgroundAgents[0].instructions).toBe('string');
+    expect(normalized.backgroundAgents[0].instructions).toContain('You are the Red Team');
   });
 
   test('preserves live user-managed agent fields from existing agents during reseed', () => {
     const existing = {
       provider: 'anthropic',
-      model: 'claude-sonnet-4-6',
+      model: 'claude-sonnet-4-5',
       name: 'My Viv',
       description: 'custom description',
       instructions: 'keep my live instructions',
       tools: ['sys__server__sys_mcp_sequential-thinking'],
       model_parameters: {
-        model: 'claude-sonnet-4-6',
+        model: 'claude-sonnet-4-5',
       },
       voice_llm_provider: 'anthropic',
       voice_llm_model: 'claude-haiku-4-5',
@@ -130,13 +167,13 @@ describe('viventium-seed-agents', () => {
 
     expect(preserveExistingEditableFields(existing, incoming)).toEqual({
       provider: 'anthropic',
-      model: 'claude-sonnet-4-6',
+      model: 'claude-sonnet-4-5',
       name: 'My Viv',
       description: 'custom description',
       instructions: 'keep my live instructions',
       tools: ['sys__server__sys_mcp_sequential-thinking'],
       model_parameters: {
-        model: 'claude-sonnet-4-6',
+        model: 'claude-sonnet-4-5',
       },
       voice_llm_provider: 'anthropic',
       voice_llm_model: 'claude-haiku-4-5',

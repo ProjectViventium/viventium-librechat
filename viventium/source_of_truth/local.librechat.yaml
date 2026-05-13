@@ -303,15 +303,15 @@ modelSpecs:
     preset:
       endpoint: google
       model: gemini-3.1-pro-preview
-  - name: claude-sonnet-4-6
-    label: Claude Sonnet 4 6
+  - name: claude-sonnet-4-5
+    label: Claude Sonnet 4.5
     description: Anthropic Direct
     group: anthropic
     groupIcon: anthropic
     iconURL: anthropic
     preset:
       endpoint: anthropic
-      model: claude-sonnet-4-6
+      model: claude-sonnet-4-5
   - name: claude-opus-4-7
     label: Claude Opus 4 7
     description: Anthropic Direct
@@ -435,7 +435,7 @@ ocr:
 endpoints:
   anthropic:
     titleEndpoint: anthropic
-    titleModel: claude-sonnet-4-6
+    titleModel: claude-sonnet-4-5
     titlePrompt: 'Generate a concise natural conversation title from the user''s request and the assistant''s response. Do not browse, fetch, or judge URL accessibility. If the conversation contains a URL, title the user''s intended task or outcome instead of whether the URL is accessible.
 
       Conversation: {convo}
@@ -445,7 +445,7 @@ endpoints:
 
       AI: {output}'
     summarize: false
-    summaryModel: claude-sonnet-4-6
+    summaryModel: claude-sonnet-4-5
     modelDisplayLabel: Azure AI Foundry (Claude)
   agents:
     order: -1
@@ -674,7 +674,7 @@ memory:
   personalize: true
   agent:
     provider: anthropic
-    model: claude-sonnet-4-6
+    model: claude-sonnet-4-5
     instructions:
       promptRef: memory.archivist
 registration:

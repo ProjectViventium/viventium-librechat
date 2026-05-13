@@ -36,7 +36,7 @@ describe('agentLlmFallback', () => {
   test('resolves voice fallback separately and prefers it for voice calls', () => {
     const agent = {
       fallback_llm_provider: 'anthropic',
-      fallback_llm_model: 'claude-sonnet-4-6',
+      fallback_llm_model: 'claude-sonnet-4-5',
       voice_fallback_llm_provider: 'openAI',
       voice_fallback_llm_model: 'gpt-5.4',
     };
@@ -53,7 +53,7 @@ describe('agentLlmFallback', () => {
     });
     expect(resolveEffectiveFallbackAssignment(agent, { isVoiceCall: false })).toMatchObject({
       provider: 'anthropic',
-      model: 'claude-sonnet-4-6',
+      model: 'claude-sonnet-4-5',
     });
     expect(
       resolveFallbackCandidates(agent, { isVoiceCall: true }).map((item) => item.source),
@@ -254,6 +254,15 @@ describe('agentLlmFallback', () => {
     ).toBe(true);
   });
 
+  test.each([
+    ['errorClass', { errorClass: 'provider_unauthorized', insight: null }],
+    ['errorStatus', { errorStatus: 401, insight: null }],
+    ['errorCode', { errorCode: 'MODEL_AUTHENTICATION', insight: null }],
+    ['rate-limit code', { errorCode: 'MODEL_RATE_LIMIT', insight: null }],
+  ])('retries background cortex fallback for structured provider %s', (_label, result) => {
+    expect(shouldRetryBackgroundCortexWithFallback(result)).toBe(true);
+  });
+
   test('does not retry background cortex fallback for visible output or structured tool failures', () => {
     expect(
       shouldRetryBackgroundCortexWithFallback({
@@ -272,6 +281,7 @@ describe('agentLlmFallback', () => {
         insight: null,
         error: 'MCP tool failed with status 503',
         errorClass: 'mcp_tool_failure',
+        errorStatus: 401,
       }),
     ).toBe(false);
   });

@@ -762,7 +762,7 @@ describe('resolveFollowUpContinuationContext', () => {
 describe('sanitizeAnthropicFollowUpLLMConfig', () => {
   test('removes temperature when Anthropic follow-up relies on default thinking', () => {
     const result = sanitizeAnthropicFollowUpLLMConfig({
-      model: 'claude-sonnet-4-6',
+      model: 'claude-sonnet-4-5',
       temperature: 0.3,
     });
 
@@ -771,7 +771,7 @@ describe('sanitizeAnthropicFollowUpLLMConfig', () => {
 
   test('removes temperature for Anthropic adaptive-capable models even when thinking is explicitly disabled', () => {
     const result = sanitizeAnthropicFollowUpLLMConfig({
-      model: 'claude-sonnet-4-6',
+      model: 'claude-opus-4-7',
       temperature: 0.3,
       thinking: false,
     });

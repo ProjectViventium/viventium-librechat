@@ -357,7 +357,7 @@ describe('/api/viventium/telegram', () => {
       requestedVoiceRoute: null,
     }));
     mockResolveUserVoiceRoute = jest.fn().mockResolvedValue({
-      stt: { provider: 'pywhispercpp', variant: 'large-v3-turbo' },
+      stt: { provider: 'pywhispercpp', variant: 'base.en' },
       tts: {
         provider: 'local_chatterbox_turbo_mlx_8bit',
         variant: 'mlx-community/chatterbox-turbo-8bit',
@@ -710,7 +710,7 @@ describe('/api/viventium/telegram', () => {
 
   test('GET /voice-route returns xAI voice variants for Telegram TTS parity', async () => {
     mockResolveUserVoiceRoute.mockResolvedValueOnce({
-      stt: { provider: 'pywhispercpp', variant: 'large-v3-turbo' },
+      stt: { provider: 'pywhispercpp', variant: 'base.en' },
       tts: { provider: 'xai', variant: 'Rex' },
     });
 
@@ -729,14 +729,14 @@ describe('/api/viventium/telegram', () => {
     expect(res.statusCode).toBe(200);
     expect(mockResolveUserVoiceRoute).toHaveBeenCalledWith('user_1');
     expect(res.body.voiceRoute).toEqual({
-      stt: { provider: 'pywhispercpp', variant: 'large-v3-turbo' },
+      stt: { provider: 'pywhispercpp', variant: 'base.en' },
       tts: { provider: 'xai', variant: 'Rex' },
     });
   });
 
   test('POST /chat overrides voiceProvider from the resolved voice route and returns it', async () => {
     mockResolveUserVoiceRoute.mockResolvedValueOnce({
-      stt: { provider: 'pywhispercpp', variant: 'large-v3-turbo' },
+      stt: { provider: 'pywhispercpp', variant: 'base.en' },
       tts: { provider: 'cartesia', variant: '6ccbfb76-1fc6-48f7-b71d-91ac6298247b' },
     });
 
@@ -760,14 +760,14 @@ describe('/api/viventium/telegram', () => {
     expect(res.statusCode).toBe(200);
     expect(lastVoiceProvider).toBe('cartesia');
     expect(res.body.voiceRoute).toEqual({
-      stt: { provider: 'pywhispercpp', variant: 'large-v3-turbo' },
+      stt: { provider: 'pywhispercpp', variant: 'base.en' },
       tts: { provider: 'cartesia', variant: '6ccbfb76-1fc6-48f7-b71d-91ac6298247b' },
     });
   });
 
   test('POST /chat overrides voiceProvider to xAI and returns saved xAI voice variant', async () => {
     mockResolveUserVoiceRoute.mockResolvedValueOnce({
-      stt: { provider: 'pywhispercpp', variant: 'large-v3-turbo' },
+      stt: { provider: 'pywhispercpp', variant: 'base.en' },
       tts: { provider: 'xai', variant: 'Eve' },
     });
 
@@ -791,7 +791,7 @@ describe('/api/viventium/telegram', () => {
     expect(res.statusCode).toBe(200);
     expect(lastVoiceProvider).toBe('xai');
     expect(res.body.voiceRoute).toEqual({
-      stt: { provider: 'pywhispercpp', variant: 'large-v3-turbo' },
+      stt: { provider: 'pywhispercpp', variant: 'base.en' },
       tts: { provider: 'xai', variant: 'Eve' },
     });
   });

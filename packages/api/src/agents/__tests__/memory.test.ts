@@ -793,7 +793,7 @@ describe('processMemory - GPT-5+ handling', () => {
       instructions: 'Test instructions',
       llmConfig: {
         provider: Providers.ANTHROPIC,
-        model: 'claude-sonnet-4-6',
+        model: 'claude-sonnet-4-5',
       },
     });
 
@@ -829,7 +829,7 @@ describe('processMemory - GPT-5+ handling', () => {
       instructions: 'Test instructions',
       llmConfig: {
         provider: Providers.ANTHROPIC,
-        model: 'claude-sonnet-4-6',
+        model: 'claude-sonnet-4-5',
         temperature: 0.4,
       },
     });

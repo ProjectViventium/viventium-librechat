@@ -56,6 +56,10 @@ const {
   buildTimeContextInstructions,
 } = require('~/server/services/viventium/surfacePrompts');
 /* === VIVENTIUM NOTE ===
+ * Feature: Source-owned activation policy promptRefs.
+ */
+const { getPromptText } = require('~/server/services/viventium/promptRegistry');
+/* === VIVENTIUM NOTE ===
  * Feature: Strict provider text-part sanitization for background cortex runs.
  */
 const {
@@ -125,6 +129,14 @@ const PUBLIC_CORTEX_ERROR_MESSAGES = {
   no_live_tool_execution: 'This background agent could not verify live tool evidence for this run.',
   timeout: 'This background agent timed out before returning a result.',
   cortex_agent_not_found: 'This background agent is not available in the current configuration.',
+  provider_unauthorized:
+    'This background agent could not use the configured provider because provider credentials were rejected.',
+  provider_access_denied:
+    'This background agent could not use the configured provider because access was denied.',
+  provider_rate_limited:
+    'This background agent could not use the configured provider because it was rate limited.',
+  provider_quota_or_billing:
+    'This background agent could not use the configured provider because of a quota or billing issue.',
   recoverable_provider_error:
     'This background agent hit a recoverable provider issue before returning a result.',
   background_agent_error:
@@ -1162,6 +1174,18 @@ const DEFAULT_ACTIVATION_DECISION_SUBJECT_RULE = [
   "If the latest user message is a simple reply, acknowledgement, test instruction, correction, thanks, provider clarification, or output-only instruction that does not itself meet this cortex's activation criteria, return should_activate=false even when older history would have activated.",
 ].join(' ');
 
+function resolvePromptRefText(value, fallback = DEFAULT_ACTIVATION_DECISION_SUBJECT_RULE) {
+  if (!value || typeof value !== 'object') {
+    return '';
+  }
+  const promptId = typeof value.promptRef === 'string' ? value.promptRef.trim() : '';
+  if (!promptId) {
+    return '';
+  }
+  const variables = value.promptVars && typeof value.promptVars === 'object' ? value.promptVars : {};
+  return getPromptText(promptId, fallback, variables).trim();
+}
+
 function resolveActivationDecisionSubjectRule(config) {
   const backgroundCortices = config?.viventium?.background_cortices || {};
   const candidates = [
@@ -1171,12 +1195,24 @@ function resolveActivationDecisionSubjectRule(config) {
   ];
 
   for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate.trim();
+    }
     if (!candidate || typeof candidate !== 'object') {
+      continue;
+    }
+    if (candidate.enabled === false) {
       continue;
     }
     const rawPrompt = candidate.prompt || candidate.instructions || candidate.text;
     if (typeof rawPrompt === 'string' && rawPrompt.trim()) {
       return rawPrompt.trim();
+    }
+    const promptRefText =
+      resolvePromptRefText(rawPrompt) ||
+      resolvePromptRefText(candidate, DEFAULT_ACTIVATION_DECISION_SUBJECT_RULE);
+    if (promptRefText) {
+      return promptRefText;
     }
   }
 
@@ -1435,7 +1471,7 @@ function buildCortexCompletionPayload(result) {
   }
 
   if (result.error) {
-    const publicError = publicCortexError(result.error, result.errorClass || result.error_class);
+    const publicError = publicCortexError(result, result.errorClass || result.error_class);
     return {
       ...basePayload,
       status: 'error',
@@ -1458,6 +1494,7 @@ function buildCompletionInputFromActivation({
   cortexAgent = null,
   result = null,
   error = null,
+  errorClass = null,
 }) {
   return {
     agentId: result?.agentId || activationResult.agentId,
@@ -1468,7 +1505,7 @@ function buildCompletionInputFromActivation({
       activationResult.agentId,
     insight: result?.insight ?? null,
     error: error || result?.error || null,
-    errorClass: result?.errorClass || result?.error_class || activationResult.errorClass || null,
+    errorClass: errorClass || result?.errorClass || result?.error_class || activationResult.errorClass || null,
     activationScope: result?.activationScope || activationResult.activationScope || null,
     configuredTools: result?.configuredTools || 0,
     completedToolCalls: result?.completedToolCalls || 0,
@@ -1564,14 +1601,138 @@ function sanitizeActivationErrorForLog(errorSummary = {}) {
   };
 }
 
+function safeStringifyForErrorSignal(value) {
+  if (value == null) {
+    return '';
+  }
+  if (typeof value === 'string') {
+    return value;
+  }
+  try {
+    return JSON.stringify(value);
+  } catch (_error) {
+    return String(value);
+  }
+}
+
+function extractCortexErrorMessage(error) {
+  if (typeof error === 'string') {
+    return error;
+  }
+  if (!error || typeof error !== 'object') {
+    return String(error || '');
+  }
+  return (
+    error.message ||
+    error.error ||
+    error.errorMessage ||
+    error.response?.data?.error?.message ||
+    error.response?.data?.message ||
+    error.cause?.message ||
+    safeStringifyForErrorSignal(error.response?.data) ||
+    safeStringifyForErrorSignal(error)
+  );
+}
+
+function extractCortexErrorStatus(error, message = '') {
+  const candidates = [
+    error?.response?.status,
+    error?.status,
+    error?.statusCode,
+    error?.errorStatus,
+    error?.error_status,
+    error?.error?.status,
+    error?.error?.statusCode,
+    error?.cause?.status,
+    error?.cause?.statusCode,
+  ];
+  for (const candidate of candidates) {
+    const status = Number(candidate);
+    if (Number.isFinite(status) && status > 0) {
+      return status;
+    }
+  }
+
+  const text = String(message || '');
+  const statusMatch =
+    text.match(/^\s*(\d{3})\b/) ||
+    text.match(/\bstatus(?: code)?[ =:]+(\d{3})\b/i) ||
+    text.match(/"status"\s*:\s*(\d{3})/i);
+  return statusMatch?.[1] ? Number(statusMatch[1]) : 0;
+}
+
+function extractCortexErrorCode(error, message = '') {
+  const candidates = [
+    error?.code,
+    error?.lc_error_code,
+    error?.errorCode,
+    error?.error_code,
+    error?.error?.code,
+    error?.error?.type,
+    error?.response?.data?.code,
+    error?.response?.data?.type,
+    error?.response?.data?.error?.code,
+    error?.response?.data?.error?.type,
+    error?.cause?.code,
+  ];
+  for (const candidate of candidates) {
+    const code = String(candidate || '').trim();
+    if (code) {
+      return code;
+    }
+  }
+
+  const text = String(message || '');
+  const codeMatch = text.match(/\b(MODEL_[A-Z_]+|E[A-Z_]+|authentication_error)\b/i);
+  return codeMatch?.[1] || '';
+}
+
 function classifyCortexPublicError(error, explicitClass = '') {
   const rawClass = String(explicitClass || '').trim();
-  if (rawClass) {
+  if (rawClass && !['background_agent_error', 'recoverable_provider_error'].includes(rawClass)) {
     return rawClass;
   }
-  const message = String(error || '')
+  const rawMessage = extractCortexErrorMessage(error);
+  const message = String(rawMessage || '')
     .trim()
     .toLowerCase();
+  const status = extractCortexErrorStatus(error, rawMessage);
+  const code = String(extractCortexErrorCode(error, rawMessage) || '').toUpperCase();
+
+  if (
+    status === 401 ||
+    code === 'MODEL_AUTHENTICATION' ||
+    message.includes('authentication_error') ||
+    message.includes('invalid authentication') ||
+    message.includes('invalid api key') ||
+    message.includes('credential')
+  ) {
+    return 'provider_unauthorized';
+  }
+  if (
+    status === 403 ||
+    message.includes('forbidden') ||
+    message.includes('access denied') ||
+    message.includes('permission denied')
+  ) {
+    return 'provider_access_denied';
+  }
+  if (
+    status === 429 ||
+    message.includes('rate limit') ||
+    message.includes('rate_limit') ||
+    message.includes('too many requests')
+  ) {
+    return 'provider_rate_limited';
+  }
+  if (
+    status === 402 ||
+    message.includes('billing') ||
+    message.includes('quota') ||
+    message.includes('insufficient credits')
+  ) {
+    return 'provider_quota_or_billing';
+  }
   if (message === 'timeout' || message.includes('timed out')) {
     return 'timeout';
   }
@@ -1584,13 +1745,14 @@ function classifyCortexPublicError(error, explicitClass = '') {
   if (message.includes('cortex agent not found') || message.includes('agent not found')) {
     return 'cortex_agent_not_found';
   }
-  if (
-    message.includes('provider') ||
-    message.includes('rate limit') ||
-    message.includes('unauthorized') ||
-    message.includes('forbidden')
-  ) {
+  if (status >= 500 || status === 529 || message.includes('overloaded')) {
     return 'recoverable_provider_error';
+  }
+  if (message.includes('provider') || message.includes('unauthorized') || message.includes('forbidden')) {
+    return 'recoverable_provider_error';
+  }
+  if (rawClass) {
+    return rawClass;
   }
   return 'background_agent_error';
 }
@@ -1606,8 +1768,7 @@ function publicCortexError(error, explicitClass = '') {
 }
 
 function sanitizeRuntimeErrorForLog(error, explicitClass = '') {
-  const rawError = error?.message || error || '';
-  const publicError = publicCortexError(rawError, explicitClass);
+  const publicError = publicCortexError(error, explicitClass);
   return {
     class: publicError.errorClass,
     name: error?.name || null,
@@ -3306,17 +3467,21 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
     };
   } catch (error) {
     const isAborted = abortController?.signal?.aborted === true || error?.name === 'AbortError';
+    const publicError = publicCortexError(error, isAborted ? 'timeout' : '');
     // Log provider/model context for faster diagnosis (do NOT log api keys).
     logger.error(
       `[BackgroundCortexService] Cortex execution failed for ${agent.id} ` +
         `(provider=${agent.provider || 'unknown'}, model=${agent.model || agent.model_parameters?.model || 'unknown'}):`,
-      sanitizeRuntimeErrorForLog(error, isAborted ? 'timeout' : ''),
+      sanitizeRuntimeErrorForLog(error, publicError.errorClass),
     );
     return {
       agentId: agent.id,
       agentName: agent.name || agent.id,
       insight: null,
-      error: isAborted ? 'timeout' : error.message,
+      error: publicError.message,
+      errorClass: publicError.errorClass,
+      errorStatus: extractCortexErrorStatus(error, error?.message || ''),
+      errorCode: extractCortexErrorCode(error, error?.message || ''),
     };
   } finally {
     if (abortTimer) {
@@ -3915,7 +4080,7 @@ async function executeActivated({
       try {
         result = await runCortexWithGuard({ agent: cortexAgent, activationResult });
       } catch (error) {
-        const publicError = publicCortexError(error?.message || error);
+        const publicError = publicCortexError(error);
         logger.error(
           `[BackgroundCortexService] Cortex execution failed for ${activationResult.agentId} ` +
             `before fallback: class=${publicError.errorClass}`,
@@ -3981,7 +4146,7 @@ async function executeActivated({
       return result;
     } catch (error) {
       const rawError = error?.message || 'Cortex execution failed';
-      const publicError = publicCortexError(rawError);
+      const publicError = publicCortexError(error || rawError);
       logger.error(
         `[BackgroundCortexService] Failed to execute cortex ${activationResult.agentId}: ` +
           `class=${publicError.errorClass}`,
@@ -3998,7 +4163,8 @@ async function executeActivated({
             buildCortexCompletionPayload(
               buildCompletionInputFromActivation({
                 activationResult,
-                error: rawError,
+                error: publicError.message,
+                errorClass: publicError.errorClass,
               }),
             ),
           );
@@ -4036,7 +4202,7 @@ async function executeActivated({
       '[BackgroundCortexService] Unexpected cortex promise rejection',
       sanitizeRuntimeErrorForLog(s.reason),
     );
-    const publicError = publicCortexError(s.reason?.message || 'Unexpected rejection');
+    const publicError = publicCortexError(s.reason || 'Unexpected rejection');
     return {
       agentId: 'unknown',
       agentName: 'unknown',
@@ -4062,7 +4228,7 @@ async function executeActivated({
   const errors = executionResults
     .filter((r) => r && r.error)
     .map((r) => {
-      const publicError = publicCortexError(r.error, r.errorClass || r.error_class);
+      const publicError = publicCortexError(r, r.errorClass || r.error_class);
       return {
         cortexId: r.agentId,
         cortexName: sanitizeCortexDisplayName(r.agentName),

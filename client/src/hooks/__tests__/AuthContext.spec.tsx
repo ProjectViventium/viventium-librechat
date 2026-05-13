@@ -255,7 +255,7 @@ describe('AuthContextProvider — silentRefresh post-login redirect', () => {
 
   it('navigates to stored sessionStorage redirect after successful token refresh', () => {
     jest.useFakeTimers();
-    sessionStorage.setItem(SESSION_KEY, '/c/new?endpoint=bedrock&model=claude-sonnet-4-6');
+    sessionStorage.setItem(SESSION_KEY, '/c/new?endpoint=bedrock&model=claude-sonnet-4-5');
 
     renderProviderLive();
 
@@ -272,7 +272,7 @@ describe('AuthContextProvider — silentRefresh post-login redirect', () => {
       jest.advanceTimersByTime(100);
     });
 
-    expect(mockNavigate).toHaveBeenCalledWith('/c/new?endpoint=bedrock&model=claude-sonnet-4-6', {
+    expect(mockNavigate).toHaveBeenCalledWith('/c/new?endpoint=bedrock&model=claude-sonnet-4-5', {
       replace: true,
     });
     expect(sessionStorage.getItem(SESSION_KEY)).toBeNull();

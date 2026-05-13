@@ -2,7 +2,7 @@
 
 const DEFAULT_MODELS = {
   openAI: 'gpt-5.4',
-  anthropic: 'claude-sonnet-4-6',
+  anthropic: 'claude-sonnet-4-5',
   xai: 'grok-4.20-non-reasoning',
   groq: 'meta-llama/llama-4-scout-17b-16e-instruct',
 };
@@ -13,7 +13,7 @@ const APPROVED_MAIN_RUNTIME_FAMILIES = new Set([
 ]);
 
 const APPROVED_BACKGROUND_RUNTIME_FAMILIES = new Set([
-  'anthropic::claude-sonnet-4-6',
+  'anthropic::claude-sonnet-4-5',
   'anthropic::claude-opus-4-7',
   'openAI::gpt-5.4',
 ]);
@@ -62,7 +62,7 @@ const TOOL_RUNTIME_GATES = Object.freeze([
  * === VIVENTIUM NOTE === */
 const DEFAULT_VOICE_MODELS = {
   openAI: 'gpt-4o-mini',
-  anthropic: 'claude-sonnet-4-6',
+  anthropic: 'claude-sonnet-4-5',
   xai: 'grok-4.20-non-reasoning',
 };
 

@@ -608,7 +608,7 @@ describe('initializeAgent — meeting transcript resources', () => {
             context: FileContext.meeting_transcript,
             embedded: true,
             'metadata.meetingTranscriptSourcePathHash': currentSourceHash,
-            'metadata.meetingTranscriptKind': 'summary',
+            'metadata.meetingTranscriptKind': { $in: ['summary', 'inventory'] },
           }),
         );
         if (query?.context === FileContext.meeting_transcript) {
@@ -652,7 +652,7 @@ describe('initializeAgent — meeting transcript resources', () => {
       }));
       expect(db.getFiles).toHaveBeenCalledWith(
         expect.objectContaining({
-          'metadata.meetingTranscriptKind': 'summary',
+          'metadata.meetingTranscriptKind': { $in: ['summary', 'inventory'] },
         }),
         null,
         { text: 0 },
@@ -724,7 +724,9 @@ describe('initializeAgent — meeting transcript resources', () => {
             (row) =>
               row.metadata.meetingTranscriptSourcePathHash ===
                 query['metadata.meetingTranscriptSourcePathHash'] &&
-              row.metadata.meetingTranscriptKind === query['metadata.meetingTranscriptKind'],
+              query['metadata.meetingTranscriptKind']?.$in?.includes(
+                row.metadata.meetingTranscriptKind,
+              ),
           ),
         );
       });
@@ -745,7 +747,7 @@ describe('initializeAgent — meeting transcript resources', () => {
       expect(db.getFiles).toHaveBeenCalledWith(
         expect.objectContaining({
           'metadata.meetingTranscriptSourcePathHash': currentSourceHash,
-          'metadata.meetingTranscriptKind': 'summary',
+          'metadata.meetingTranscriptKind': { $in: ['summary', 'inventory'] },
         }),
         null,
         { text: 0 },

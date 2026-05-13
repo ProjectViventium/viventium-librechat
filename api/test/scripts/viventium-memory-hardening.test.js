@@ -16,6 +16,7 @@ const {
   parseArgs,
   probeModel,
   proposalSchema,
+  redactFailureMessage,
   resolveProvider,
   sanitizeTranscriptSummary,
   scanTranscriptDirectory,
@@ -220,6 +221,99 @@ describe('viventium-memory-hardening', () => {
       messages_omitted_for_input_cap: 1,
       lookback_complete: false,
     });
+  });
+
+  test('user proposal preserves transcript vector lifecycle when only chat lookback exceeds input cap', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-transcript-chat-cap-'));
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-transcript-chat-cap-state-'));
+    const now = new Date('2026-05-05T12:00:00Z');
+    const messages = [
+      {
+        messageId: 'm1',
+        conversationId: 'c1',
+        createdAt: new Date('2026-05-05T10:00:00Z'),
+        isCreatedByUser: true,
+        sender: 'User',
+        text: 'older chat detail '.repeat(30),
+      },
+      {
+        messageId: 'm2',
+        conversationId: 'c2',
+        createdAt: new Date('2026-05-05T11:00:00Z'),
+        isCreatedByUser: true,
+        sender: 'User',
+        text: 'latest chat detail '.repeat(30),
+      },
+    ];
+    const messageCollection = {
+      find: jest
+        .fn()
+        .mockReturnValueOnce({
+          sort: () => ({
+            limit: () => ({
+              next: async () => ({ createdAt: new Date('2026-05-05T11:00:00Z') }),
+            }),
+          }),
+        })
+        .mockReturnValueOnce({
+          project: () => ({
+            sort: () => ({
+              toArray: async () => messages,
+            }),
+          }),
+        }),
+    };
+    const spawnSpy = jest.spyOn(childProcess, 'spawnSync').mockReturnValue({
+      status: 0,
+      stdout: JSON.stringify({
+        summary: 'Detailed summary with speaker, context, decisions, and open-loop detail.',
+        createdAt: now.toISOString(),
+      }),
+      stderr: '',
+    });
+
+    try {
+      fs.writeFileSync(path.join(tempDir, 'meeting.txt'), 'Speaker A: transcript detail.', 'utf8');
+      const result = await buildUserProposal({
+        db: { collection: () => messageCollection },
+        methods: { getAllUserMemories: jest.fn().mockResolvedValue([]) },
+        user: { _id: '507f1f77bcf86cd799439011', name: 'Test User' },
+        options: {
+          lookbackDays: 7,
+          minUserIdleMinutes: 60,
+          maxChangesPerUser: 3,
+          maxInputChars: 300,
+          requireFullLookback: true,
+          ignoreIdleGate: true,
+          transcriptsDir: tempDir,
+          transcriptStateDir: stateDir,
+          transcriptMaxFilesPerRun: 20,
+          transcriptMaxCharsPerFile: 500000,
+          transcriptSummaryMaxChars: 32000,
+        },
+        memoryConfig,
+        now,
+        providerInfo: { provider: 'anthropic', model: 'claude-opus-4-7', effort: 'xhigh' },
+      });
+
+      expect(result.status).toBe('proposed');
+      expect(result.reason).toBe('input_cap_exceeded_chat_only');
+      expect(result.summary.telemetry).toMatchObject({
+        messages_in_lookback: 2,
+        messages_fed_to_model: 1,
+        messages_omitted_for_input_cap: 1,
+        lookback_complete: false,
+      });
+      expect(result.privateProposal.accepted).toHaveLength(0);
+      expect(result.privateProposal.transcripts).toHaveLength(1);
+      expect(result.privateProposal.transcripts[0].summary).toContain('Detailed summary');
+      expect(result.privateProposal.transcriptIndexPath).toBeTruthy();
+      expect(spawnSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      spawnSpy.mockRestore();
+      fs.rmSync(tempDir, { recursive: true, force: true });
+      fs.rmSync(stateDir, { recursive: true, force: true });
+    }
   });
 
   test('user proposal isolates transcript summary model failure and continues chat hardening', async () => {
@@ -1201,6 +1295,37 @@ describe('viventium-memory-hardening', () => {
     }
   });
 
+  test('transcript scan ignores configured downloader sidecars by relative glob', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-transcript-ignore-'));
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-transcript-ignore-state-'));
+    try {
+      fs.mkdirSync(path.join(tempDir, 'state'), { recursive: true });
+      fs.writeFileSync(path.join(tempDir, 'meeting.txt'), 'Speaker A: real transcript.', 'utf8');
+      fs.writeFileSync(path.join(tempDir, '.transcript_state.json'), '{"hidden":true}', 'utf8');
+      fs.writeFileSync(path.join(tempDir, 'state', 'index.json'), '{"downloaded":true}', 'utf8');
+
+      const result = scanTranscriptDirectory({
+        user: { _id: '507f1f77bcf86cd799439011', name: 'Test User' },
+        now: new Date('2026-05-05T12:00:00Z'),
+        transcriptStateDir: stateDir,
+        options: {
+          transcriptsDir: tempDir,
+          transcriptIgnoreGlobs: ['state/**'],
+          transcriptMaxFilesPerRun: 20,
+          transcriptMaxCharsPerFile: 500000,
+        },
+      });
+
+      expect(result.transcripts).toHaveLength(1);
+      expect(result.transcripts[0].filename).toBe('meeting.txt');
+      expect(result.telemetry.files_seen).toBe(3);
+      expect(result.telemetry.files_ignored_by_config).toBe(2);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+      fs.rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
   test('transcript scan resets processed content when source directory changes', () => {
     const oldDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-transcript-old-'));
     const newDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-transcript-new-'));
@@ -1441,6 +1566,156 @@ describe('viventium-memory-hardening', () => {
       jest.dontMock('~/server/services/Files/VectorDB/crud');
       if (oldRag) process.env.RAG_API_URL = oldRag;
       else delete process.env.RAG_API_URL;
+    }
+  });
+
+  test('apply preserves chat-cap transcript lifecycle without stable memory writes', async () => {
+    jest.resetModules();
+    const oldRag = process.env.RAG_API_URL;
+    const oldFetch = global.fetch;
+    process.env.RAG_API_URL = 'http://rag.example.test';
+    global.fetch = jest.fn().mockResolvedValue({ ok: true });
+
+    const uploadVectors = jest.fn().mockResolvedValue(undefined);
+    const deleteVectors = jest.fn().mockResolvedValue(undefined);
+    const vectorDocumentExists = jest.fn().mockResolvedValue(true);
+    const contentHash = 'a'.repeat(64);
+    const userId = '507f1f77bcf86cd799439011';
+    const findOneAndUpdate = jest.fn(() => ({ lean: async () => ({}) }));
+    const findOne = jest.fn(() => ({
+      select: () => ({ lean: async () => null }),
+      lean: async () => null,
+    }));
+    const find = jest.fn((query) => ({
+      select: () => ({
+        lean: async () => {
+          if (query?.['metadata.meetingTranscriptKind'] === 'inventory') return [];
+          return [
+            {
+              file_id: `meeting_summary:${userId}:${contentHash}`,
+              filename: 'meeting-transcript-summary-synthetic.txt',
+              metadata: {
+                meetingTranscriptArtifactId: `meeting_transcript:${contentHash.slice(0, 32)}`,
+                meetingTranscriptKind: 'summary',
+                meetingTranscriptSourcePathHash: 'sourcehash',
+                meetingTranscriptOriginalFilename: 'synthetic-meeting.txt',
+                meetingTranscriptFileMtime: '2026-05-05T10:00:00.000Z',
+                meetingTranscriptDisplayTitle: 'Synthetic meeting',
+                meetingTranscriptOneLineSummary: 'Speaker and timing context with follow-up.',
+                meetingTranscriptParticipants: ['Speaker Alpha', 'Test User'],
+              },
+            },
+          ];
+        },
+      }),
+    }));
+    jest.doMock('~/db/models', () => ({
+      File: {
+        find,
+        findOne,
+        findOneAndUpdate,
+        deleteOne: jest.fn().mockResolvedValue({ deletedCount: 0 }),
+      },
+    }));
+    jest.doMock('~/server/services/Files/VectorDB/crud', () => ({
+      uploadVectors,
+      deleteVectors,
+      vectorDocumentExists,
+    }));
+
+    const runDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-transcript-apply-chat-cap-'));
+    const indexPath = path.join(runDir, 'transcripts.private.json');
+    const setMemory = jest.fn();
+    const deleteMemory = jest.fn();
+    const getAllUserMemories = jest.fn().mockResolvedValue([]);
+
+    try {
+      const result = await applyUserProposal({
+        methods: {
+          getAllUserMemories,
+          setMemory,
+          deleteMemory,
+        },
+        user: { _id: userId },
+        memoryConfig,
+        runDir,
+        userProposal: {
+          userIdHash: 'userhash',
+          userId,
+          reason: 'input_cap_exceeded_chat_only',
+          accepted: [],
+          rejected: [],
+          transcriptRagMode: 'detailed_summary_only',
+          transcripts: [
+            {
+              artifactId: `meeting_transcript:${contentHash.slice(0, 32)}`,
+              contentHash,
+              sourcePathHash: 'sourcehash',
+              filename: 'synthetic-meeting.txt',
+              file_mtime: '2026-05-05T10:00:00.000Z',
+              source_status: 'new_or_changed',
+              rawFileId: `meeting_transcript:${userId}:${contentHash}`,
+              summaryFileId: `meeting_summary:${userId}:${contentHash}`,
+              file_content: '<transcript>\nraw transcript text\n</transcript>',
+              input_complete: true,
+              raw_char_count: 19,
+              raw_byte_count: 19,
+              supplied_char_count: 19,
+              summary_char_count: 68,
+              summary: 'Detailed summary with speaker, context, outcome, caveat, and follow-up.',
+            },
+          ],
+          staleTranscriptArtifacts: [],
+          transcriptIndexPath: indexPath,
+          transcriptIndex: {
+            schemaVersion: 1,
+            promptVersion: 2,
+            sourcePathHash: 'sourcehash',
+            files: {
+              pathhash: {
+                contentHash,
+                status: 'pending',
+                artifactId: `meeting_transcript:${contentHash.slice(0, 32)}`,
+                rawFileId: `meeting_transcript:${userId}:${contentHash}`,
+                summaryFileId: `meeting_summary:${userId}:${contentHash}`,
+              },
+            },
+            processedContent: {},
+          },
+        },
+      });
+
+      expect(setMemory).not.toHaveBeenCalled();
+      expect(deleteMemory).not.toHaveBeenCalled();
+      expect(uploadVectors).toHaveBeenCalledTimes(2);
+      expect(deleteVectors).not.toHaveBeenCalled();
+      expect(result.changed).toHaveLength(0);
+      expect(result.transcriptVectors).toMatchObject({
+        uploaded: 2,
+        deleted: 0,
+        rag_mode: 'detailed_summary_only',
+        inventory: {
+          uploaded: 1,
+          file_id: 'meeting_inventory:507f1f77bcf86cd799439011:sourcehash',
+        },
+      });
+      expect(uploadVectors.mock.calls[1][0].file_id).toBe(
+        'meeting_inventory:507f1f77bcf86cd799439011:sourcehash',
+      );
+      const index = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
+      expect(index.files.pathhash.status).toBe('processed');
+      expect(index.processedContent[contentHash]).toMatchObject({
+        status: 'processed',
+        artifactId: `meeting_transcript:${contentHash.slice(0, 32)}`,
+        summaryFileId: `meeting_summary:${userId}:${contentHash}`,
+      });
+    } finally {
+      jest.dontMock('~/db/models');
+      jest.dontMock('~/server/services/Files/VectorDB/crud');
+      if (oldRag) process.env.RAG_API_URL = oldRag;
+      else delete process.env.RAG_API_URL;
+      global.fetch = oldFetch;
+      fs.rmSync(runDir, { recursive: true, force: true });
     }
   });
 
@@ -1886,6 +2161,60 @@ describe('viventium-memory-hardening', () => {
     }
   });
 
+  test('raw-only transcript RAG mode removes source-scoped inventory artifacts', async () => {
+    jest.resetModules();
+    const oldRag = process.env.RAG_API_URL;
+    process.env.RAG_API_URL = 'http://rag.example.test';
+    const deleteVectors = jest.fn().mockResolvedValue(undefined);
+    const deleteOne = jest.fn().mockResolvedValue({ deletedCount: 1 });
+    jest.doMock('~/db/models', () => ({
+      File: {
+        findOne: jest.fn((query) => ({
+          lean: async () => ({
+            _id: `mongo:${query.file_id}`,
+            file_id: query.file_id,
+            embedded: true,
+          }),
+        })),
+        deleteOne,
+      },
+    }));
+    jest.doMock('~/server/services/Files/VectorDB/crud', () => ({
+      deleteVectors,
+    }));
+
+    try {
+      const result = await applyTranscriptVectorLifecycle({
+        userProposal: {
+          userId: '507f1f77bcf86cd799439011',
+          transcriptRagMode: 'raw_only',
+          transcriptSourcePathHash: 'sourcehash',
+          transcriptInventoryRefresh: true,
+          transcripts: [],
+          staleTranscriptArtifacts: [],
+        },
+      });
+
+      expect(result.inventory).toEqual({
+        uploaded: 0,
+        deleted: 1,
+        file_id: 'meeting_inventory:507f1f77bcf86cd799439011:sourcehash',
+      });
+      expect(deleteVectors).toHaveBeenCalledWith(
+        { user: { id: '507f1f77bcf86cd799439011' } },
+        expect.objectContaining({
+          file_id: 'meeting_inventory:507f1f77bcf86cd799439011:sourcehash',
+        }),
+      );
+      expect(deleteOne).toHaveBeenCalledTimes(1);
+    } finally {
+      jest.dontMock('~/db/models');
+      jest.dontMock('~/server/services/Files/VectorDB/crud');
+      if (oldRag) process.env.RAG_API_URL = oldRag;
+      else delete process.env.RAG_API_URL;
+    }
+  });
+
   test('apply defers transcript writes but preserves chat-only memory when vector runtime is unhealthy', async () => {
     const oldRag = process.env.RAG_API_URL;
     const oldFetch = global.fetch;
@@ -1980,6 +2309,76 @@ describe('viventium-memory-hardening', () => {
 
     expect(script).toContain('mode: 0o600');
     expect(script).toContain("flag: 'wx'");
+  });
+
+  test('failed hardening runs persist a redacted failure artifact and summary', () => {
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-hardening-failure-state-'));
+    const runId = 'failure-log-test';
+    try {
+      const scriptPath = path.join(__dirname, '../../../scripts/viventium-memory-hardening.js');
+      const result = childProcess.spawnSync(
+        process.execPath,
+        [
+          scriptPath,
+          '--mode',
+          'dry-run',
+          '--state-dir',
+          stateDir,
+          '--run-id',
+          runId,
+          '--skip-model-probe',
+        ],
+        {
+          encoding: 'utf8',
+          env: { ...process.env, MONGO_URI: '' },
+        },
+      );
+
+      expect(result.status).not.toBe(0);
+      const runDir = path.join(stateDir, 'runs', runId);
+      const summary = JSON.parse(fs.readFileSync(path.join(runDir, 'summary.json'), 'utf8'));
+      const failure = JSON.parse(
+        fs.readFileSync(path.join(runDir, 'failure.redacted.json'), 'utf8'),
+      );
+      const redactedLog = fs.readFileSync(path.join(runDir, 'run-log.redacted.jsonl'), 'utf8');
+
+      expect(summary.status).toBe('failed');
+      expect(summary.failure_file).toBe('failure.redacted.json');
+      expect(failure).toMatchObject({
+        status: 'failed',
+        phase: 'connect_mongo',
+        reason: 'mongo_uri_missing',
+      });
+      expect(failure.message_preview).not.toContain('/Users/');
+      expect(redactedLog).toContain('"event":"run_failed"');
+    } finally {
+      fs.rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  test('failure redaction removes local paths, emails, secrets, mongo ids, and runtime ids', () => {
+    const redacted = redactFailureMessage(
+      [
+        'mongodb://user:pass@example.test/db',
+        ['s', 'k-secretvalue123'].join(''),
+        'qa@example.com',
+        '/Users/example/private/file.txt',
+        '/home/example/private/file.txt',
+        'C:\\Users\\Example\\secret.txt',
+        '507f1f77bcf86cd799439011',
+        'conversationabc123456789',
+      ].join(' '),
+    );
+
+    expect(redacted).toContain('<mongo-uri>');
+    expect(redacted).toContain('<secret>');
+    expect(redacted).toContain('<email>');
+    expect(redacted).toContain('<local-path>');
+    expect(redacted).toContain('<mongo-id>');
+    expect(redacted).toContain('<runtime-id>');
+    expect(redacted).not.toContain('/Users/');
+    expect(redacted).not.toContain('/home/');
+    expect(redacted).not.toContain('qa@example.com');
   });
 
   test('transcript scan passes CSV, TXT, JSON, VTT, SRT, and MD as unparsed text evidence', () => {

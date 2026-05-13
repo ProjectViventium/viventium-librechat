@@ -74,6 +74,8 @@ const DEFAULT_FILE_SEARCH_RESULT_MAX_CHARS_CONVERSATION_RECALL = 800;
  * Added: 2026-05-05
  */
 const DEFAULT_FILE_SEARCH_RESULT_MAX_CHARS_MEETING_TRANSCRIPT = 2400;
+const DEFAULT_FILE_SEARCH_RESULT_MAX_CHARS_MEETING_TRANSCRIPT_INVENTORY = 12000;
+const DEFAULT_FILE_SEARCH_DISTANCE_MEETING_TRANSCRIPT_INVENTORY = 0.65;
 /* === VIVENTIUM END === */
 const DEFAULT_FILE_SEARCH_OUTPUT_MAX_CHARS = 20000;
 const DEFAULT_FILE_SEARCH_OUTPUT_MAX_CHARS_CONVERSATION_RECALL = 12000;
@@ -216,6 +218,12 @@ const getMeetingTranscriptFileSearchResultMaxChars = () =>
     process.env.VIVENTIUM_FILE_SEARCH_RESULT_MAX_CHARS_MEETING_TRANSCRIPT,
     DEFAULT_FILE_SEARCH_RESULT_MAX_CHARS_MEETING_TRANSCRIPT,
   );
+
+const getMeetingTranscriptInventoryFileSearchResultMaxChars = () =>
+  parsePositiveIntEnv(
+    process.env.VIVENTIUM_FILE_SEARCH_RESULT_MAX_CHARS_MEETING_TRANSCRIPT_INVENTORY,
+    DEFAULT_FILE_SEARCH_RESULT_MAX_CHARS_MEETING_TRANSCRIPT_INVENTORY,
+  );
 /* === VIVENTIUM END === */
 
 const getFileSearchOutputMaxChars = () =>
@@ -253,8 +261,16 @@ const getMeetingTranscriptFileSearchQueryTimeoutMs = () =>
 
 const isMeetingTranscriptFileId = (fileId) => {
   const value = String(fileId || '');
-  return value.startsWith('meeting_transcript:') || value.startsWith('meeting_summary:');
+  return (
+    value.startsWith('meeting_transcript:') ||
+    value.startsWith('meeting_summary:') ||
+    value.startsWith('meeting_inventory:')
+  );
 };
+
+const isMeetingTranscriptInventoryFile = (file) =>
+  String(file?.file_id || '').startsWith('meeting_inventory:') ||
+  file?.metadata?.meetingTranscriptKind === 'inventory';
 
 const formatTranscriptMetadataValue = (value) => {
   if (value === undefined || value === null || value === '') {
@@ -278,6 +294,9 @@ const buildMeetingTranscriptResultHeader = (result) => {
   const rows = [
     ['Transcript artifact ID', metadata.meetingTranscriptArtifactId],
     ['Transcript artifact kind', metadata.meetingTranscriptKind],
+    ['Display title', metadata.meetingTranscriptDisplayTitle],
+    ['One-line summary', metadata.meetingTranscriptOneLineSummary],
+    ['Participants', metadata.meetingTranscriptParticipants],
     ['Original filename', metadata.meetingTranscriptOriginalFilename || result.filename],
     ['File mtime', metadata.meetingTranscriptFileMtime],
     ['Source status', metadata.meetingTranscriptSourceStatus],
@@ -295,6 +314,11 @@ const buildMeetingTranscriptResultHeader = (result) => {
 const withMeetingTranscriptHeader = (result, content) => {
   const header = buildMeetingTranscriptResultHeader(result);
   return header ? `${header}\n${content}` : content;
+};
+
+const getMeetingTranscriptInventoryText = (file) => {
+  const text = file?.metadata?.meetingTranscriptInventoryText;
+  return typeof text === 'string' ? text.trim() : '';
 };
 
 const getNoMatchingContentOutput = ({ files = [], recallFiles = [] }) => {
@@ -349,6 +373,14 @@ const clipContent = (content, maxChars) => {
     return content;
   }
   return `${content.slice(0, Math.max(0, maxChars - 3))}...`;
+};
+
+const clipInventoryContent = (content, maxChars) => {
+  if (typeof content !== 'string') return '';
+  if (content.length <= maxChars) return content;
+  const omitted = content.length - maxChars;
+  const marker = `\n[... clipped ${omitted} chars from transcript inventory output ...]`;
+  return `${content.slice(0, Math.max(0, maxChars - marker.length))}${marker}`;
 };
 
 const escapeRegex = (value) => String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -784,6 +816,10 @@ const createFileSearchTool = async ({
   conversationId,
   fileCitations = false,
 }) => {
+  const hasMeetingTranscriptResources = files.some((file) => isMeetingTranscriptFileId(file?.file_id));
+  const meetingTranscriptDescription = hasMeetingTranscriptResources
+    ? '\n\nWhen meeting transcript recall is attached, a meeting transcript inventory/TOC may be returned as source-backed evidence. Use it to orient broad questions about what transcript meetings exist, then use individual detailed transcript summaries for the actual meeting details. Treat transcript evidence as softer than direct chat/saved memory.'
+    : '';
   return tool(
     async ({ query }) => {
       if (files.length === 0) {
@@ -836,6 +872,29 @@ const createFileSearchTool = async ({
       const queryFiles = async (targetFiles) => {
         const queryPromises = targetFiles.map(async (file) => {
           const isRecall = isConversationRecallFileId(file?.file_id);
+          if (isMeetingTranscriptInventoryFile(file)) {
+            const inventoryText = getMeetingTranscriptInventoryText(file);
+            logger.debug(`[${Tools.file_search}] using source-backed meeting transcript inventory`, {
+              fileId: file.file_id,
+              hasInventoryText: Boolean(inventoryText),
+            });
+            return inventoryText
+              ? {
+                  file,
+                  response: {
+                    data: [
+                      [
+                        {
+                          page_content: inventoryText,
+                          metadata: { source: file.filename || 'meeting-transcript-inventory.txt' },
+                        },
+                        DEFAULT_FILE_SEARCH_DISTANCE_MEETING_TRANSCRIPT_INVENTORY,
+                      ],
+                    ],
+                  },
+                }
+              : { file, response: { data: [] } };
+          }
           if (isSourceOnlyConversationRecallFile(file)) {
             logger.debug(
               `[${Tools.file_search}] skipping vector query for source-only recall file`,
@@ -901,7 +960,9 @@ const createFileSearchTool = async ({
       let formattedResults = validResults
         .flatMap(({ file, response }) =>
           response.data.map(([docInfo, distance]) => {
-            const source = docInfo?.metadata?.source || file.filename || 'unknown';
+            const source = isMeetingTranscriptFileId(file?.file_id)
+              ? file.filename || docInfo?.metadata?.source || 'unknown'
+              : docInfo?.metadata?.source || file.filename || 'unknown';
             return {
               filename: source.split('/').pop(),
               content: docInfo?.page_content,
@@ -922,7 +983,7 @@ const createFileSearchTool = async ({
       let hasConversationRecallResults = formattedResults.some((result) =>
         isConversationRecallFileId(result.file_id),
       );
-      const hasMeetingTranscriptResults = formattedResults.some((result) =>
+      let hasMeetingTranscriptResults = formattedResults.some((result) =>
         isMeetingTranscriptFileId(result.file_id),
       );
 
@@ -949,6 +1010,9 @@ const createFileSearchTool = async ({
           formattedResults = dedupeRecallResults(formattedResults.concat(sourceRescueResults));
           hasConversationRecallResults = formattedResults.some((result) =>
             isConversationRecallFileId(result.file_id),
+          );
+          hasMeetingTranscriptResults = formattedResults.some((result) =>
+            isMeetingTranscriptFileId(result.file_id),
           );
           if (hasConversationRecallResults) {
             formattedResults = rerankConversationRecallResults({
@@ -1001,10 +1065,17 @@ const createFileSearchTool = async ({
         const result = limitedResults[index];
         const resultMaxChars = isConversationRecallFileId(result.file_id)
           ? getConversationRecallFileSearchResultMaxChars()
-          : isMeetingTranscriptFileId(result.file_id)
-            ? getMeetingTranscriptFileSearchResultMaxChars()
-            : getFileSearchResultMaxChars();
-        const content = clipContent(result.content, resultMaxChars);
+          : isMeetingTranscriptInventoryFile({ file_id: result.file_id, metadata: result.fileMetadata })
+            ? getMeetingTranscriptInventoryFileSearchResultMaxChars()
+            : isMeetingTranscriptFileId(result.file_id)
+              ? getMeetingTranscriptFileSearchResultMaxChars()
+              : getFileSearchResultMaxChars();
+        const content = isMeetingTranscriptInventoryFile({
+          file_id: result.file_id,
+          metadata: result.fileMetadata,
+        })
+          ? clipInventoryContent(result.content, resultMaxChars)
+          : clipContent(result.content, resultMaxChars);
         const modelContent = withMeetingTranscriptHeader(result, content);
         const displayRelevance = Number.isFinite(result?.recallRerankScore)
           ? result.recallRerankScore
@@ -1063,7 +1134,7 @@ const createFileSearchTool = async ({
     {
       name: Tools.file_search,
       responseFormat: 'content_and_artifact',
-      description: `Performs semantic search across attached "${Tools.file_search}" documents using natural language queries. This tool analyzes the content of uploaded files to find relevant information, quotes, and passages that best match your query. Use this to extract specific information or find relevant sections within the available documents.${'\n\nPreserve distinctive exact strings from the user when they matter, such as IDs, codes, quoted phrases, names, and email addresses. Do not paraphrase them away in the query.'}${
+      description: `Performs semantic search across attached "${Tools.file_search}" documents using natural language queries. This tool analyzes the content of uploaded files to find relevant information, quotes, and passages that best match your query. Use this to extract specific information or find relevant sections within the available documents.${meetingTranscriptDescription}${'\n\nPreserve distinctive exact strings from the user when they matter, such as IDs, codes, quoted phrases, names, and email addresses. Do not paraphrase them away in the query.'}${
         fileCitations
           ? `
 

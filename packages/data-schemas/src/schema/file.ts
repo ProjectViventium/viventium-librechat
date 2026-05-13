@@ -103,6 +103,12 @@ const file: Schema<IMongoFile> = new Schema(
       meetingTranscriptFileMtime: String,
       meetingTranscriptSourceStatus: String,
       meetingTranscriptCalendarMatch: Schema.Types.Mixed,
+      meetingTranscriptDisplayTitle: String,
+      meetingTranscriptOneLineSummary: String,
+      meetingTranscriptMeetingDatetime: String,
+      meetingTranscriptParticipants: [String],
+      meetingTranscriptSummaryExcerpt: String,
+      meetingTranscriptInventoryText: String,
       /* === VIVENTIUM END === */
     },
     expiresAt: {

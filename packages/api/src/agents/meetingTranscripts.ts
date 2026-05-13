@@ -16,6 +16,7 @@ import { EToolResources, FileContext, Tools } from 'librechat-data-provider';
 import type { AgentToolResources, TFile } from 'librechat-data-provider';
 
 type MeetingTranscriptRagMode = 'detailed_summary_only' | 'raw_and_summary' | 'raw_only';
+const MEETING_TRANSCRIPT_INVENTORY_KIND = 'inventory';
 
 function expandHomePath(value: string): string {
   const raw = String(value || '').trim();
@@ -123,12 +124,12 @@ export function getMeetingTranscriptRagMode(): MeetingTranscriptRagMode {
 export function getMeetingTranscriptKindFilter(): string[] {
   const mode = getMeetingTranscriptRagMode();
   if (mode === 'raw_and_summary') {
-    return ['summary', 'raw'];
+    return ['summary', 'raw', MEETING_TRANSCRIPT_INVENTORY_KIND];
   }
   if (mode === 'raw_only') {
     return ['raw'];
   }
-  return ['summary'];
+  return ['summary', MEETING_TRANSCRIPT_INVENTORY_KIND];
 }
 
 export function meetingTranscriptFileMatchesRagMode(file: TFile): boolean {

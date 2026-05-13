@@ -619,6 +619,65 @@ describe('fileSearch.js - tuple return validation', () => {
       expect(artifact.file_search.sources[0].fileId).toBe('meeting_inventory:user_1:sourcehash');
     });
 
+    it('preserves the transcript inventory source when summary chunks would otherwise fill the cap', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      process.env.VIVENTIUM_FILE_SEARCH_MAX_RESULTS_MEETING_TRANSCRIPT = '2';
+      axios.post.mockImplementation((_url, body) =>
+        Promise.resolve({
+          data: [
+            [
+              {
+                page_content: `Summary content for ${body.file_id}`,
+                metadata: { source: `/path/to/${body.file_id}.txt`, page: 1 },
+              },
+              body.file_id.endsWith(':one') ? 0.01 : body.file_id.endsWith(':two') ? 0.02 : 0.03,
+            ],
+          ],
+        }),
+      );
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        files: [
+          {
+            file_id: 'meeting_inventory:user_1:sourcehash',
+            filename: 'meeting-transcript-inventory-sourcehash.txt',
+            metadata: {
+              meetingTranscriptArtifactId: 'meeting_transcript_inventory:current',
+              meetingTranscriptKind: 'inventory',
+              meetingTranscriptInventoryText:
+                'Meeting transcript inventory / table of contents.\n1. Helios launch review\n2. Orion customer review',
+            },
+          },
+          {
+            file_id: 'meeting_summary:user_1:one',
+            filename: 'meeting-transcript-summary-one.txt',
+            metadata: { meetingTranscriptKind: 'summary' },
+          },
+          {
+            file_id: 'meeting_summary:user_1:two',
+            filename: 'meeting-transcript-summary-two.txt',
+            metadata: { meetingTranscriptKind: 'summary' },
+          },
+          {
+            file_id: 'meeting_summary:user_1:three',
+            filename: 'meeting-transcript-summary-three.txt',
+            metadata: { meetingTranscriptKind: 'summary' },
+          },
+        ],
+      });
+
+      const [formattedString, artifact] = await fileSearchTool.func({
+        query: 'what recent transcripts do you see?',
+      });
+
+      expect(artifact.file_search.sources).toHaveLength(2);
+      expect(artifact.file_search.sources[0].fileId).toBe('meeting_summary:user_1:one');
+      expect(artifact.file_search.sources[1].fileId).toBe('meeting_inventory:user_1:sourcehash');
+      expect(formattedString).toContain('Helios launch review');
+      expect(formattedString).not.toContain('meeting_summary:user_1:two');
+    });
+
     it('keeps focused transcript summary hits ahead of inventory on narrow questions', async () => {
       generateShortLivedToken.mockReturnValue('mock-jwt-token');
       axios.post.mockResolvedValue({

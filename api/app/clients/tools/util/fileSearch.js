@@ -272,6 +272,27 @@ const isMeetingTranscriptInventoryFile = (file) =>
   String(file?.file_id || '').startsWith('meeting_inventory:') ||
   file?.metadata?.meetingTranscriptKind === 'inventory';
 
+const isMeetingTranscriptInventoryResult = (result) =>
+  isMeetingTranscriptInventoryFile({
+    file_id: result?.file_id,
+    metadata: result?.fileMetadata,
+  });
+
+const preserveMeetingTranscriptInventoryResult = ({ results = [], maxResults }) => {
+  const limitedResults = results.slice(0, maxResults);
+  const inventoryResult = results.find((result) => isMeetingTranscriptInventoryResult(result));
+  if (
+    !inventoryResult ||
+    limitedResults.some((result) => result?.file_id === inventoryResult.file_id)
+  ) {
+    return limitedResults;
+  }
+  if (limitedResults.length < maxResults) {
+    return limitedResults.concat(inventoryResult);
+  }
+  return limitedResults.slice(0, Math.max(0, maxResults - 1)).concat(inventoryResult);
+};
+
 const formatTranscriptMetadataValue = (value) => {
   if (value === undefined || value === null || value === '') {
     return null;
@@ -1057,7 +1078,10 @@ const createFileSearchTool = async ({
           : 0,
       );
 
-      const limitedResults = formattedResults.slice(0, maxResults);
+      const limitedResults = preserveMeetingTranscriptInventoryResult({
+        results: formattedResults,
+        maxResults,
+      });
       const includedResults = [];
       let usedOutputChars = 0;
 

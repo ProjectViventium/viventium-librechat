@@ -58,6 +58,7 @@ const DEFAULT_TRANSCRIPT_IGNORE_GLOBS = [
   '**/*.tmp',
   '**/*.part',
   '**/*.download',
+  '**/*.log',
 ];
 const TRANSCRIPT_RAG_MODES = new Set(['detailed_summary_only', 'raw_and_summary', 'raw_only']);
 const TRANSCRIPT_MAX_BYTES_PER_CHAR = 16;
@@ -2348,11 +2349,42 @@ async function upsertTranscriptVectorFile({
 
 function sortTranscriptInventoryFiles(files = []) {
   return files.slice().sort((left, right) => {
-    const leftTime = Date.parse(left?.metadata?.meetingTranscriptFileMtime || '') || 0;
-    const rightTime = Date.parse(right?.metadata?.meetingTranscriptFileMtime || '') || 0;
+    const leftMetadata = left?.metadata || {};
+    const rightMetadata = right?.metadata || {};
+    const leftTime =
+      Date.parse(leftMetadata.meetingTranscriptMeetingDatetime || '') ||
+      Date.parse(leftMetadata.meetingTranscriptFileMtime || '') ||
+      0;
+    const rightTime =
+      Date.parse(rightMetadata.meetingTranscriptMeetingDatetime || '') ||
+      Date.parse(rightMetadata.meetingTranscriptFileMtime || '') ||
+      0;
     if (rightTime !== leftTime) return rightTime - leftTime;
     return String(left?.filename || '').localeCompare(String(right?.filename || ''));
   });
+}
+
+function formatTranscriptInventoryRow({ file, index }) {
+  const metadata = file?.metadata || {};
+  const title =
+    metadata.meetingTranscriptDisplayTitle ||
+    metadata.meetingTranscriptOriginalFilename ||
+    file?.filename ||
+    `Transcript ${index + 1}`;
+  const oneLine =
+    metadata.meetingTranscriptOneLineSummary ||
+    metadata.meetingTranscriptSummaryExcerpt ||
+    'Detailed transcript summary is available in the corresponding meeting transcript artifact.';
+  const participants = sanitizeParticipantList(metadata.meetingTranscriptParticipants || []);
+  return [
+    `${index + 1}. ${sanitizeShortText(title, 240) || `Transcript ${index + 1}`}`,
+    `   Date/time: ${sanitizeShortText(metadata.meetingTranscriptMeetingDatetime, 120) || metadata.meetingTranscriptFileMtime || 'unknown'}`,
+    `   Participants: ${participants.length ? participants.join(', ') : 'unknown/unclear'}`,
+    `   Original filename: ${metadata.meetingTranscriptOriginalFilename || file?.filename || 'unknown'}`,
+    `   Artifact ID: ${metadata.meetingTranscriptArtifactId || 'unknown'}`,
+    `   Summary file ID: ${file?.file_id || 'unknown'}`,
+    `   Context: ${sanitizeShortText(oneLine, 800) || 'Detailed summary available.'}`,
+  ].join('\n');
 }
 
 function buildTranscriptInventoryText({ sourcePathHash, summaryFiles }) {
@@ -2371,32 +2403,35 @@ function buildTranscriptInventoryText({ sourcePathHash, summaryFiles }) {
     lines.push('- No processed transcript summaries are currently available for this source folder.');
   }
 
+  let omitted = 0;
   rows.forEach((file, index) => {
-    const metadata = file?.metadata || {};
-    const title =
-      metadata.meetingTranscriptDisplayTitle ||
-      metadata.meetingTranscriptOriginalFilename ||
-      file?.filename ||
-      `Transcript ${index + 1}`;
-    const oneLine =
-      metadata.meetingTranscriptOneLineSummary ||
-      metadata.meetingTranscriptSummaryExcerpt ||
-      'Detailed transcript summary is available in the corresponding meeting transcript artifact.';
-    const participants = sanitizeParticipantList(metadata.meetingTranscriptParticipants || []);
-    lines.push(
-      [
-        `${index + 1}. ${sanitizeShortText(title, 240) || `Transcript ${index + 1}`}`,
-        `   Date/time: ${sanitizeShortText(metadata.meetingTranscriptMeetingDatetime, 120) || metadata.meetingTranscriptFileMtime || 'unknown'}`,
-        `   Participants: ${participants.length ? participants.join(', ') : 'unknown/unclear'}`,
-        `   Original filename: ${metadata.meetingTranscriptOriginalFilename || file?.filename || 'unknown'}`,
-        `   Artifact ID: ${metadata.meetingTranscriptArtifactId || 'unknown'}`,
-        `   Summary file ID: ${file?.file_id || 'unknown'}`,
-        `   Context: ${sanitizeShortText(oneLine, 800) || 'Detailed summary available.'}`,
-      ].join('\n'),
-    );
+    const row = formatTranscriptInventoryRow({ file, index });
+    if ([...lines, row].join('\n').length <= TRANSCRIPT_INVENTORY_MAX_CHARS) {
+      lines.push(row);
+    } else {
+      omitted += 1;
+    }
   });
 
-  return sliceTranscriptText(lines.join('\n'), TRANSCRIPT_INVENTORY_MAX_CHARS).text;
+  if (omitted > 0) {
+    const marker = [
+      '',
+      `Inventory truncated: ${omitted} older transcript entr${omitted === 1 ? 'y was' : 'ies were'} omitted from this compact table of contents because it exceeded the inventory size limit.`,
+      'Ask for a narrower date, person, company, or topic to retrieve detailed summaries for omitted entries.',
+    ];
+    while (
+      lines.length > 7 &&
+      [...lines, ...marker].join('\n').length > TRANSCRIPT_INVENTORY_MAX_CHARS
+    ) {
+      lines.pop();
+      omitted += 1;
+      marker[1] =
+        `Inventory truncated: ${omitted} older transcript entries were omitted from this compact table of contents because it exceeded the inventory size limit.`;
+    }
+    lines.push(...marker);
+  }
+
+  return lines.join('\n');
 }
 
 async function deleteStaleTranscriptInventoryFiles({ userId, sourcePathHash }) {
@@ -3781,6 +3816,7 @@ module.exports = {
   applyTranscriptVectorLifecycle,
   buildTranscriptArtifactHeader,
   buildTranscriptArtifactText,
+  buildTranscriptInventoryText,
   buildHardenerPrompt,
   buildTranscriptSummaryPrompt,
   buildUserProposal,
@@ -3801,6 +3837,7 @@ module.exports = {
   scanTranscriptDirectory,
   selectMessagesForPrompt,
   sliceTranscriptText,
+  sortTranscriptInventoryFiles,
   transcriptSummarySchema,
   transcriptSummaryMap,
   validateProposal,

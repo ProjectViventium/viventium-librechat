@@ -3,6 +3,7 @@ const {
   applyTranscriptVectorLifecycle,
   buildTranscriptArtifactHeader,
   buildTranscriptArtifactText,
+  buildTranscriptInventoryText,
   buildUserProposal,
   buildHardenerPrompt,
   buildTranscriptSummaryPrompt,
@@ -22,6 +23,7 @@ const {
   scanTranscriptDirectory,
   selectMessagesForPrompt,
   sliceTranscriptText,
+  sortTranscriptInventoryFiles,
   transcriptSummarySchema,
   transcriptSummaryMap,
   validateProposal,
@@ -1303,6 +1305,7 @@ describe('viventium-memory-hardening', () => {
       fs.writeFileSync(path.join(tempDir, 'meeting.txt'), 'Speaker A: real transcript.', 'utf8');
       fs.writeFileSync(path.join(tempDir, '.transcript_state.json'), '{"hidden":true}', 'utf8');
       fs.writeFileSync(path.join(tempDir, 'state', 'index.json'), '{"downloaded":true}', 'utf8');
+      fs.writeFileSync(path.join(tempDir, 'download.log'), 'downloader sidecar', 'utf8');
 
       const result = scanTranscriptDirectory({
         user: { _id: '507f1f77bcf86cd799439011', name: 'Test User' },
@@ -1318,12 +1321,75 @@ describe('viventium-memory-hardening', () => {
 
       expect(result.transcripts).toHaveLength(1);
       expect(result.transcripts[0].filename).toBe('meeting.txt');
-      expect(result.telemetry.files_seen).toBe(3);
-      expect(result.telemetry.files_ignored_by_config).toBe(2);
+      expect(result.telemetry.files_seen).toBe(4);
+      expect(result.telemetry.files_ignored_by_config).toBe(3);
     } finally {
       fs.rmSync(tempDir, { recursive: true, force: true });
       fs.rmSync(stateDir, { recursive: true, force: true });
     }
+  });
+
+  test('transcript inventory sorts by meeting datetime before file mtime', () => {
+    const files = [
+      {
+        filename: 'touched-later.txt',
+        file_id: 'meeting_summary:user:older-meeting',
+        metadata: {
+          meetingTranscriptDisplayTitle: 'Older meeting touched later',
+          meetingTranscriptMeetingDatetime: '2026-05-01T09:00:00-04:00',
+          meetingTranscriptFileMtime: '2026-05-10T09:00:00.000Z',
+          meetingTranscriptParticipants: ['Sam'],
+          meetingTranscriptOneLineSummary: 'Older actual meeting.',
+        },
+      },
+      {
+        filename: 'actual-newer.txt',
+        file_id: 'meeting_summary:user:newer-meeting',
+        metadata: {
+          meetingTranscriptDisplayTitle: 'Actual newer meeting',
+          meetingTranscriptMeetingDatetime: '2026-05-09T09:00:00-04:00',
+          meetingTranscriptFileMtime: '2026-05-02T09:00:00.000Z',
+          meetingTranscriptParticipants: ['Lee'],
+          meetingTranscriptOneLineSummary: 'Newer actual meeting.',
+        },
+      },
+    ];
+
+    const sorted = sortTranscriptInventoryFiles(files);
+    expect(sorted[0].metadata.meetingTranscriptDisplayTitle).toBe('Actual newer meeting');
+    const inventory = buildTranscriptInventoryText({
+      sourcePathHash: 'sourcehash',
+      summaryFiles: files,
+    });
+    expect(inventory.indexOf('Actual newer meeting')).toBeLessThan(
+      inventory.indexOf('Older meeting touched later'),
+    );
+  });
+
+  test('transcript inventory truncates by entries with an explicit omitted-count marker', () => {
+    const summaryFiles = Array.from({ length: 150 }, (_, index) => ({
+      filename: `meeting-${index}.txt`,
+      file_id: `meeting_summary:user:${index}`,
+      metadata: {
+        meetingTranscriptArtifactId: `meeting_transcript:${index}`,
+        meetingTranscriptKind: 'summary',
+        meetingTranscriptDisplayTitle: `Long inventory meeting ${index}`,
+        meetingTranscriptMeetingDatetime: `2026-05-${String((index % 28) + 1).padStart(2, '0')}T09:00:00-04:00`,
+        meetingTranscriptOriginalFilename: `meeting-${index}.txt`,
+        meetingTranscriptParticipants: ['Sam', 'Lee', 'QA User'],
+        meetingTranscriptOneLineSummary: `Context ${index}: ${'long summary text '.repeat(30)}`,
+      },
+    }));
+
+    const inventory = buildTranscriptInventoryText({
+      sourcePathHash: 'sourcehash',
+      summaryFiles,
+    });
+    expect(inventory.length).toBeLessThanOrEqual(50000);
+    expect(inventory).toContain('Current processed transcript summaries: 150');
+    expect(inventory).toContain('Inventory truncated:');
+    expect(inventory).toContain('older transcript');
+    expect(inventory).toContain('Ask for a narrower date, person, company, or topic');
   });
 
   test('transcript scan resets processed content when source directory changes', () => {

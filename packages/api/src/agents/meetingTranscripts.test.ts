@@ -14,6 +14,7 @@ import {
   getMeetingTranscriptKindFilter,
   getMeetingTranscriptRagMode,
   getMeetingTranscriptSourcePathHash,
+  isMeetingTranscriptInventoryResource,
   meetingTranscriptFileMatchesRagMode,
   meetingTranscriptRuntimeEnabled,
   mergeMeetingTranscriptResources,
@@ -153,7 +154,11 @@ describe('meeting transcript runtime helpers', () => {
       process.env.VIVENTIUM_APP_SUPPORT_DIR = fakeAppSupport;
       process.env.LIBRECHAT_DIR = fakeLibreChat;
       fs.mkdirSync(serviceEnvDir, { recursive: true });
-      fs.writeFileSync(path.join(fakeLibreChat, '.env'), 'VIVENTIUM_MEMORY_TRANSCRIPTS_RAG_MODE=raw_only\n', 'utf8');
+      fs.writeFileSync(
+        path.join(fakeLibreChat, '.env'),
+        'VIVENTIUM_MEMORY_TRANSCRIPTS_RAG_MODE=raw_only\n',
+        'utf8',
+      );
       fs.writeFileSync(
         path.join(fakeAppSupport, 'runtime', 'runtime.env'),
         [
@@ -261,6 +266,8 @@ describe('meeting transcript runtime helpers', () => {
     };
 
     expect(meetingTranscriptFileMatchesRagMode(inventoryFile)).toBe(true);
+    expect(isMeetingTranscriptInventoryResource(inventoryFile)).toBe(true);
+    expect(isMeetingTranscriptInventoryResource(transcriptFiles[0])).toBe(false);
     expect(
       mergeMeetingTranscriptResources({
         transcriptFiles: [inventoryFile],

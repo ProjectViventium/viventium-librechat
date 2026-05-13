@@ -32,7 +32,7 @@ import {
   getThreadData,
 } from '~/utils';
 import { filterFilesByEndpointConfig } from '~/files';
-import { ragFileExists } from '~/files/rag';
+import { ragFilesExist } from '~/files/rag';
 import { generateArtifactsPrompt } from '~/prompts';
 import { getProviderConfig } from '~/endpoints';
 import { logger } from '@librechat/data-schemas';
@@ -52,6 +52,7 @@ import {
   getMeetingTranscriptKindFilter,
   getMeetingTranscriptRagMode,
   getMeetingTranscriptSourcePathHash,
+  isMeetingTranscriptInventoryResource,
   mergeMeetingTranscriptResources,
 } from './meetingTranscripts';
 /* === VIVENTIUM START ===
@@ -470,21 +471,25 @@ export async function initializeAgent(
    * === VIVENTIUM END === */
   const meetingTranscriptSourcePathHash = getMeetingTranscriptSourcePathHash();
   if (req.user?.id && meetingTranscriptSourcePathHash) {
+    const meetingTranscriptUserId = req.user.id;
     try {
       const meetingTranscriptVectorStatus = await getConversationRecallVectorRuntimeStatus();
       if (!meetingTranscriptVectorStatus.available) {
-        logger.info('[initializeAgent] Meeting transcript recall configured but vector runtime unavailable', {
-          userId: req.user.id,
-          agentId: agent.id,
-          mode: getMeetingTranscriptRagMode(),
-          reason: meetingTranscriptVectorStatus.reason,
-          sourceFolderHash: meetingTranscriptSourcePathHash,
-        });
+        logger.info(
+          '[initializeAgent] Meeting transcript recall configured but vector runtime unavailable',
+          {
+            userId: meetingTranscriptUserId,
+            agentId: agent.id,
+            mode: getMeetingTranscriptRagMode(),
+            reason: meetingTranscriptVectorStatus.reason,
+            sourceFolderHash: meetingTranscriptSourcePathHash,
+          },
+        );
       } else {
         const meetingTranscriptKindFilter = getMeetingTranscriptKindFilter();
         const meetingTranscriptFiles = (((await db.getFiles(
           {
-            user: req.user.id,
+            user: meetingTranscriptUserId,
             context: FileContext.meeting_transcript,
             embedded: true,
             'metadata.meetingTranscriptSourcePathHash': meetingTranscriptSourcePathHash,
@@ -495,38 +500,49 @@ export async function initializeAgent(
           },
           null,
           { text: 0 },
-          { userId: req.user.id, agentId: agent.id },
+          { userId: meetingTranscriptUserId, agentId: agent.id },
         )) as TFile[]) ?? []) as TFile[];
 
+        const meetingTranscriptInventoryFiles = meetingTranscriptFiles.filter(
+          isMeetingTranscriptInventoryResource,
+        );
+        const meetingTranscriptVectorFiles = meetingTranscriptFiles.filter(
+          (file) => !isMeetingTranscriptInventoryResource(file),
+        );
+        const verifiedMeetingTranscriptFileIds =
+          meetingTranscriptVectorFiles.length > 0
+            ? await ragFilesExist({
+                userId: meetingTranscriptUserId,
+                fileIds: meetingTranscriptVectorFiles
+                  .map((file) => file.file_id)
+                  .filter((fileId): fileId is string => Boolean(fileId)),
+              })
+            : new Set<string>();
         const verifiedMeetingTranscriptFiles =
           meetingTranscriptFiles.length > 0
-            ? (
-                await Promise.all(
-                  meetingTranscriptFiles.map(async (file) => ({
-                    file,
-                    exists: await ragFileExists({
-                      userId: req.user.id,
-                      fileId: file.file_id,
-                    }),
-                  })),
-                )
+            ? meetingTranscriptInventoryFiles.concat(
+                meetingTranscriptVectorFiles.filter((file) =>
+                  verifiedMeetingTranscriptFileIds.has(file.file_id),
+                ),
               )
-                .filter((item) => item.exists)
-                .map((item) => item.file)
             : [];
 
         if (
-          meetingTranscriptFiles.length > 0 &&
-          verifiedMeetingTranscriptFiles.length < meetingTranscriptFiles.length
+          meetingTranscriptVectorFiles.length > 0 &&
+          verifiedMeetingTranscriptFileIds.size < meetingTranscriptVectorFiles.length
         ) {
-          logger.warn('[initializeAgent] Meeting transcript Mongo artifacts missing from vector store', {
-            userId: req.user.id,
-            agentId: agent.id,
-            fileCount: meetingTranscriptFiles.length,
-            verifiedFileCount: verifiedMeetingTranscriptFiles.length,
-            mode: getMeetingTranscriptRagMode(),
-            sourceFolderHash: meetingTranscriptSourcePathHash,
-          });
+          logger.warn(
+            '[initializeAgent] Meeting transcript Mongo artifacts missing from vector store',
+            {
+              userId: meetingTranscriptUserId,
+              agentId: agent.id,
+              fileCount: meetingTranscriptVectorFiles.length,
+              verifiedFileCount: verifiedMeetingTranscriptFileIds.size,
+              inventoryFileCount: meetingTranscriptInventoryFiles.length,
+              mode: getMeetingTranscriptRagMode(),
+              sourceFolderHash: meetingTranscriptSourcePathHash,
+            },
+          );
         }
 
         if (verifiedMeetingTranscriptFiles.length > 0) {
@@ -536,18 +552,21 @@ export async function initializeAgent(
             transcriptFiles: verifiedMeetingTranscriptFiles,
           });
           logger.debug('[initializeAgent] Attached meeting transcript recall resources', {
-            userId: req.user.id,
+            userId: meetingTranscriptUserId,
             agentId: agent.id,
             fileCount: verifiedMeetingTranscriptFiles.length,
             mode: getMeetingTranscriptRagMode(),
           });
         } else {
-          logger.info('[initializeAgent] Meeting transcript recall configured but no artifacts for active user', {
-            userId: req.user.id,
-            agentId: agent.id,
-            mode: getMeetingTranscriptRagMode(),
-            sourceFolderHash: meetingTranscriptSourcePathHash,
-          });
+          logger.info(
+            '[initializeAgent] Meeting transcript recall configured but no artifacts for active user',
+            {
+              userId: meetingTranscriptUserId,
+              agentId: agent.id,
+              mode: getMeetingTranscriptRagMode(),
+              sourceFolderHash: meetingTranscriptSourcePathHash,
+            },
+          );
         }
       }
     } catch (error) {

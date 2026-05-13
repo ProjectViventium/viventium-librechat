@@ -87,6 +87,7 @@ describe('fileSearch.js - tuple return validation', () => {
     delete process.env.VIVENTIUM_FILE_SEARCH_TOP_K;
     delete process.env.VIVENTIUM_FILE_SEARCH_TOP_K_CONVERSATION_RECALL;
     delete process.env.VIVENTIUM_FILE_SEARCH_TOP_K_MEETING_TRANSCRIPT;
+    delete process.env.VIVENTIUM_FILE_SEARCH_TOP_K_MEETING_TRANSCRIPT_BATCH_MAX;
     delete process.env.VIVENTIUM_FILE_SEARCH_MAX_RESULTS;
     delete process.env.VIVENTIUM_FILE_SEARCH_MAX_RESULTS_CONVERSATION_RECALL;
     delete process.env.VIVENTIUM_FILE_SEARCH_MAX_RESULTS_MEETING_TRANSCRIPT;
@@ -444,8 +445,8 @@ describe('fileSearch.js - tuple return validation', () => {
       await fileSearchTool.func({ query: 'Project Lantern checklist' });
 
       expect(axios.post).toHaveBeenCalledWith(
-        'http://localhost:8000/query',
-        expect.any(Object),
+        'http://localhost:8000/query_multiple',
+        expect.objectContaining({ file_ids: ['meeting_transcript:user_1:abc'] }),
         expect.objectContaining({ timeout: 30001 }),
       );
     });
@@ -506,8 +507,53 @@ describe('fileSearch.js - tuple return validation', () => {
       await fileSearchTool.func({ query: 'Project Lantern checklist' });
 
       expect(axios.post).toHaveBeenCalledWith(
-        'http://localhost:8000/query',
-        expect.objectContaining({ k: 11 }),
+        'http://localhost:8000/query_multiple',
+        expect.objectContaining({ file_ids: ['meeting_summary:user_1:abc'], k: 11 }),
+        expect.any(Object),
+      );
+    });
+
+    it('scales meeting-transcript query_multiple k with file count under a hard cap', async () => {
+      process.env.VIVENTIUM_FILE_SEARCH_TOP_K_MEETING_TRANSCRIPT = '4';
+      process.env.VIVENTIUM_FILE_SEARCH_TOP_K_MEETING_TRANSCRIPT_BATCH_MAX = '10';
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      axios.post.mockResolvedValue({
+        data: [
+          [
+            {
+              page_content: 'Meeting summary content',
+              metadata: {
+                file_id: 'meeting_summary:user_1:one',
+                source: '/path/to/meeting-summary-one.txt',
+                page: 1,
+              },
+            },
+            0.1,
+          ],
+        ],
+      });
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        files: [
+          { file_id: 'meeting_summary:user_1:one', filename: 'meeting-summary-one.txt' },
+          { file_id: 'meeting_summary:user_1:two', filename: 'meeting-summary-two.txt' },
+          { file_id: 'meeting_summary:user_1:three', filename: 'meeting-summary-three.txt' },
+        ],
+      });
+
+      await fileSearchTool.func({ query: 'Project Lantern checklist' });
+
+      expect(axios.post).toHaveBeenCalledWith(
+        'http://localhost:8000/query_multiple',
+        expect.objectContaining({
+          file_ids: [
+            'meeting_summary:user_1:one',
+            'meeting_summary:user_1:two',
+            'meeting_summary:user_1:three',
+          ],
+          k: 10,
+        }),
         expect.any(Object),
       );
     });
@@ -612,7 +658,8 @@ describe('fileSearch.js - tuple return validation', () => {
       });
 
       expect(axios.post).toHaveBeenCalledTimes(1);
-      expect(axios.post.mock.calls[0][1].file_id).toBe('meeting_summary:user_1:abc');
+      expect(axios.post.mock.calls[0][0]).toBe('http://localhost:8000/query_multiple');
+      expect(axios.post.mock.calls[0][1].file_ids).toEqual(['meeting_summary:user_1:abc']);
       expect(formattedString).toContain('Transcript artifact kind: inventory');
       expect(formattedString).toContain('Current processed transcript summaries: 2');
       expect(formattedString).toContain('Project Lantern review');
@@ -622,19 +669,18 @@ describe('fileSearch.js - tuple return validation', () => {
     it('preserves the transcript inventory source when summary chunks would otherwise fill the cap', async () => {
       generateShortLivedToken.mockReturnValue('mock-jwt-token');
       process.env.VIVENTIUM_FILE_SEARCH_MAX_RESULTS_MEETING_TRANSCRIPT = '2';
-      axios.post.mockImplementation((_url, body) =>
-        Promise.resolve({
-          data: [
-            [
-              {
-                page_content: `Summary content for ${body.file_id}`,
-                metadata: { source: `/path/to/${body.file_id}.txt`, page: 1 },
-              },
-              body.file_id.endsWith(':one') ? 0.01 : body.file_id.endsWith(':two') ? 0.02 : 0.03,
-            ],
-          ],
-        }),
-      );
+      axios.post.mockImplementation((_url, body) => {
+        const fileIds = Array.isArray(body.file_ids) ? body.file_ids : [body.file_id];
+        return Promise.resolve({
+          data: fileIds.map((fileId) => [
+            {
+              page_content: `Summary content for ${fileId}`,
+              metadata: { file_id: fileId, source: `/path/to/${fileId}.txt`, page: 1 },
+            },
+            fileId.endsWith(':one') ? 0.01 : fileId.endsWith(':two') ? 0.02 : 0.03,
+          ]),
+        });
+      });
 
       const fileSearchTool = await createFileSearchTool({
         userId: 'user1',
@@ -745,14 +791,18 @@ describe('fileSearch.js - tuple return validation', () => {
             ],
           });
         }
-        if (body.file_id === 'meeting_summary:user_1:qa') {
+        if (Array.isArray(body.file_ids) && body.file_ids.includes('meeting_summary:user_1:qa')) {
           return Promise.resolve({
             data: [
               [
                 {
                   page_content:
                     '10:00 Speaker Alpha and the user discussed SF customer discovery, onboarding risk, and follow-up product notes.',
-                  metadata: { source: '/path/to/meeting-transcript-summary-qa.txt', page: 1 },
+                  metadata: {
+                    file_id: 'meeting_summary:user_1:qa',
+                    source: '/path/to/meeting-transcript-summary-qa.txt',
+                    page: 1,
+                  },
                 },
                 0.3,
               ],
@@ -764,6 +814,7 @@ describe('fileSearch.js - tuple return validation', () => {
 
       const fileSearchTool = await createFileSearchTool({
         userId: 'user1',
+        activeMessageId: 'active_prompt',
         files: [
           {
             file_id: 'conversation_recall:user_1:all',
@@ -861,6 +912,75 @@ describe('fileSearch.js - tuple return validation', () => {
       expect(artifact.file_search.sources[0].content).toContain(
         '10:45 Speaker Alpha confirmed the follow-up product-note owner and timing',
       );
+    });
+
+    it('keeps matching meeting transcript summaries when conversation recall also fills the cap', async () => {
+      process.env.VIVENTIUM_FILE_SEARCH_MAX_RESULTS_CONVERSATION_RECALL = '3';
+      process.env.VIVENTIUM_FILE_SEARCH_MAX_RESULTS_MEETING_TRANSCRIPT = '2';
+      process.env.VIVENTIUM_FILE_SEARCH_MIN_RESULTS_MEETING_TRANSCRIPT_WHEN_MIXED = '1';
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+
+      axios.post.mockImplementation((url, body) => {
+        if (body.file_id === 'conversation_recall:user_1:all') {
+          return Promise.resolve({
+            data: [0, 1, 2].map((index) => [
+              {
+                page_content: `<turn role="user">Recall echo ${index} about Helios Orion Atlas</turn>`,
+                metadata: { source: '/path/to/conversation-recall-all.txt', page: index + 1 },
+              },
+              0.01 + index * 0.01,
+            ]),
+          });
+        }
+        if (Array.isArray(body.file_ids) && body.file_ids.includes('meeting_summary:user_1:helios')) {
+          return Promise.resolve({
+            data: [
+              [
+                {
+                  page_content:
+                    'MTM marker: Helios launch review. Mira owns the risk register; Atlas migration language is meeting-scoped only.',
+                  metadata: {
+                    file_id: 'meeting_summary:user_1:helios',
+                    source: '/path/to/meeting-transcript-summary-helios.txt',
+                    page: 1,
+                  },
+                },
+                0.75,
+              ],
+            ],
+          });
+        }
+        return Promise.resolve({ data: [] });
+      });
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        files: [
+          { file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' },
+          {
+            file_id: 'meeting_summary:user_1:helios',
+            filename: 'meeting-transcript-summary-helios.txt',
+            metadata: {
+              meetingTranscriptArtifactId: 'meeting_transcript:helios',
+              meetingTranscriptKind: 'summary',
+            },
+          },
+        ],
+      });
+
+      const [, artifact] = await fileSearchTool.func({
+        query: 'Helios Orion Atlas migration owner',
+      });
+
+      expect(artifact.file_search.sources).toHaveLength(3);
+      expect(artifact.file_search.sources.some((source) => source.fileId === 'meeting_summary:user_1:helios')).toBe(
+        true,
+      );
+      expect(
+        artifact.file_search.sources.some((source) =>
+          source.content.includes('Mira owns the risk register'),
+        ),
+      ).toBe(true);
     });
 
     it('reports meeting transcript misses as transcript misses, not conversation-history misses', async () => {
@@ -1127,6 +1247,56 @@ describe('fileSearch.js - tuple return validation', () => {
         'conversation_recall:user_1:all',
       );
       expect(artifact.file_search.sources[0].fileId).toBe('conversation_recall:user_1:all');
+      expect(artifact.file_search.sources[0].content).toContain(
+        'Project Atlas decision: ship the slimmer onboarding flow first.',
+      );
+    });
+
+    it('does not rescue the active prompt echo as conversation recall evidence', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      axios.post.mockResolvedValue({ data: [] });
+      const query = 'Project Atlas onboarding flow';
+      mockMessageFind.mockImplementation((filter) => {
+        if (filter?.parentMessageId) {
+          return queryResult([]);
+        }
+        expect(filter).toMatchObject({ conversationId: { $ne: 'current-convo' } });
+        return queryResult([
+          {
+            messageId: 'active_prompt',
+            conversationId: 'current-convo',
+            createdAt: new Date().toISOString(),
+            isCreatedByUser: true,
+            text: query,
+          },
+          {
+            messageId: 'older_user_turn',
+            conversationId: 'source_convo',
+            createdAt: '2026-04-09T18:12:00.000Z',
+            isCreatedByUser: true,
+            text: 'Project Atlas decision: ship the slimmer onboarding flow first.',
+          },
+        ]);
+      });
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        files: [
+          {
+            file_id: 'conversation_recall:user_1:all',
+            filename: 'conversation-recall-all.txt',
+            viventiumConversationRecallMode: 'source_only',
+          },
+        ],
+      });
+
+      const [, artifact] = await fileSearchTool.func(
+        { query },
+        undefined,
+        { configurable: { thread_id: 'current-convo' } },
+      );
+
+      expect(artifact.file_search.sources[0].content).not.toContain(query);
       expect(artifact.file_search.sources[0].content).toContain(
         'Project Atlas decision: ship the slimmer onboarding flow first.',
       );

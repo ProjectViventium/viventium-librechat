@@ -58,6 +58,7 @@ const DEFAULT_FILE_SEARCH_QUERY_K_CONVERSATION_RECALL = 60;
  */
 const DEFAULT_FILE_SEARCH_QUERY_TIMEOUT_MS_MEETING_TRANSCRIPT = 30000;
 const DEFAULT_FILE_SEARCH_QUERY_K_MEETING_TRANSCRIPT = 8;
+const DEFAULT_FILE_SEARCH_QUERY_K_MEETING_TRANSCRIPT_BATCH_MAX = 80;
 /* === VIVENTIUM END === */
 const DEFAULT_FILE_SEARCH_MAX_RESULTS = 10;
 const DEFAULT_FILE_SEARCH_MAX_RESULTS_CONVERSATION_RECALL = 6;
@@ -66,6 +67,7 @@ const DEFAULT_FILE_SEARCH_MAX_RESULTS_CONVERSATION_RECALL = 6;
  * Added: 2026-05-05
  */
 const DEFAULT_FILE_SEARCH_MAX_RESULTS_MEETING_TRANSCRIPT = 6;
+const DEFAULT_FILE_SEARCH_MIN_RESULTS_MEETING_TRANSCRIPT_WHEN_MIXED = 2;
 /* === VIVENTIUM END === */
 const DEFAULT_FILE_SEARCH_RESULT_MAX_CHARS = 1600;
 const DEFAULT_FILE_SEARCH_RESULT_MAX_CHARS_CONVERSATION_RECALL = 800;
@@ -172,6 +174,12 @@ const getMeetingTranscriptFileSearchTopK = () =>
     process.env.VIVENTIUM_FILE_SEARCH_TOP_K_MEETING_TRANSCRIPT,
     DEFAULT_FILE_SEARCH_QUERY_K_MEETING_TRANSCRIPT,
   );
+
+const getMeetingTranscriptFileSearchBatchMaxK = () =>
+  parsePositiveIntEnv(
+    process.env.VIVENTIUM_FILE_SEARCH_TOP_K_MEETING_TRANSCRIPT_BATCH_MAX,
+    DEFAULT_FILE_SEARCH_QUERY_K_MEETING_TRANSCRIPT_BATCH_MAX,
+  );
 /* === VIVENTIUM END === */
 
 const getFileSearchMaxResults = () =>
@@ -194,6 +202,12 @@ const getMeetingTranscriptFileSearchMaxResults = () =>
   parsePositiveIntEnv(
     process.env.VIVENTIUM_FILE_SEARCH_MAX_RESULTS_MEETING_TRANSCRIPT,
     DEFAULT_FILE_SEARCH_MAX_RESULTS_MEETING_TRANSCRIPT,
+  );
+
+const getMeetingTranscriptFileSearchMinResultsWhenMixed = () =>
+  parsePositiveIntEnv(
+    process.env.VIVENTIUM_FILE_SEARCH_MIN_RESULTS_MEETING_TRANSCRIPT_WHEN_MIXED,
+    DEFAULT_FILE_SEARCH_MIN_RESULTS_MEETING_TRANSCRIPT_WHEN_MIXED,
   );
 /* === VIVENTIUM END === */
 
@@ -278,19 +292,71 @@ const isMeetingTranscriptInventoryResult = (result) =>
     metadata: result?.fileMetadata,
   });
 
-const preserveMeetingTranscriptInventoryResult = ({ results = [], maxResults }) => {
+const isMeetingTranscriptDetailResult = (result) =>
+  isMeetingTranscriptFileId(result?.file_id) && !isMeetingTranscriptInventoryResult(result);
+
+const preserveMeetingTranscriptResults = ({ results = [], maxResults }) => {
   const limitedResults = results.slice(0, maxResults);
-  const inventoryResult = results.find((result) => isMeetingTranscriptInventoryResult(result));
-  if (
-    !inventoryResult ||
-    limitedResults.some((result) => result?.file_id === inventoryResult.file_id)
-  ) {
+  if (!maxResults || !results.some((result) => isMeetingTranscriptFileId(result?.file_id))) {
     return limitedResults;
   }
-  if (limitedResults.length < maxResults) {
-    return limitedResults.concat(inventoryResult);
+
+  const requiredResults = [];
+  const requiredIds = new Set();
+  const addRequiredResult = (result) => {
+    if (!result?.file_id || requiredIds.has(result.file_id)) {
+      return;
+    }
+    requiredIds.add(result.file_id);
+    requiredResults.push(result);
+  };
+
+  addRequiredResult(results.find((result) => isMeetingTranscriptInventoryResult(result)));
+
+  const detailBudget = Math.max(
+    0,
+    Math.min(getMeetingTranscriptFileSearchMinResultsWhenMixed(), maxResults - requiredResults.length),
+  );
+  for (const result of results) {
+    if (requiredResults.filter(isMeetingTranscriptDetailResult).length >= detailBudget) {
+      break;
+    }
+    if (isMeetingTranscriptDetailResult(result)) {
+      addRequiredResult(result);
+    }
   }
-  return limitedResults.slice(0, Math.max(0, maxResults - 1)).concat(inventoryResult);
+
+  if (!requiredResults.length) {
+    return limitedResults;
+  }
+
+  const nextResults = [...limitedResults];
+  const nextIds = new Set(nextResults.map((result) => result?.file_id).filter(Boolean));
+  for (const requiredResult of requiredResults) {
+    if (nextIds.has(requiredResult.file_id)) {
+      continue;
+    }
+    if (nextResults.length < maxResults) {
+      nextResults.push(requiredResult);
+      nextIds.add(requiredResult.file_id);
+      continue;
+    }
+    const replaceIndex = [...nextResults]
+      .map((result, index) => ({ result, index }))
+      .reverse()
+      .find(
+        ({ result }) =>
+          !isMeetingTranscriptFileId(result?.file_id) || !requiredIds.has(result?.file_id),
+      )?.index;
+    if (replaceIndex === undefined) {
+      continue;
+    }
+    nextIds.delete(nextResults[replaceIndex]?.file_id);
+    nextResults[replaceIndex] = requiredResult;
+    nextIds.add(requiredResult.file_id);
+  }
+
+  return nextResults;
 };
 
 const formatTranscriptMetadataValue = (value) => {
@@ -528,6 +594,17 @@ const contentContainsLiteralCandidate = (content, literalCandidates) => {
   return literalCandidates.some((candidate) => contentLower.includes(candidate.toLowerCase()));
 };
 
+const isLikelyActivePromptEcho = ({ message, contentLower, queryLower }) => {
+  if (message?.isCreatedByUser !== true || !queryLower || queryLower.length < 12) {
+    return false;
+  }
+  const createdAtMs = message?.createdAt ? new Date(message.createdAt).getTime() : 0;
+  if (!Number.isFinite(createdAtMs) || Date.now() - createdAtMs > 10 * 60 * 1000) {
+    return false;
+  }
+  return contentLower.includes(queryLower);
+};
+
 const parseConversationRecallAgentIdFromFileId = (fileId) => {
   const match = /^conversation_recall:[^:]+:agent:(.+)$/.exec(String(fileId || ''));
   return match?.[1] || null;
@@ -590,6 +667,7 @@ async function hasRecallDerivedChildMessage({ userId, messageId }) {
 async function searchConversationRecallSourceMatches({
   userId,
   conversationId,
+  activeMessageId,
   recallFiles,
   query,
   literalCandidates,
@@ -640,8 +718,14 @@ async function searchConversationRecallSourceMatches({
       .lean();
 
     for (const message of messages) {
+      if (activeMessageId && message?.messageId === activeMessageId) {
+        continue;
+      }
       const content = getConversationRecallMessageText(message);
       const contentLower = content.toLowerCase();
+      if (!activeMessageId && isLikelyActivePromptEcho({ message, contentLower, queryLower })) {
+        continue;
+      }
       const hasRecallDerivedChild =
         message?.isCreatedByUser === true
           ? await hasRecallDerivedChildMessage({ userId, messageId: message?.messageId })
@@ -835,6 +919,7 @@ const createFileSearchTool = async ({
   files,
   entity_id,
   conversationId,
+  activeMessageId,
   fileCitations = false,
 }) => {
   const hasMeetingTranscriptResources = files.some((file) => isMeetingTranscriptFileId(file?.file_id));
@@ -842,7 +927,7 @@ const createFileSearchTool = async ({
     ? '\n\nWhen meeting transcript recall is attached, a meeting transcript inventory/TOC may be returned as source-backed evidence. Use it to orient broad questions about what transcript meetings exist, then use individual detailed transcript summaries for the actual meeting details. Treat transcript evidence as softer than direct chat/saved memory.'
     : '';
   return tool(
-    async ({ query }) => {
+    async ({ query }, runnableConfig) => {
       if (files.length === 0) {
         return ['No files to search. Instruct the user to add files for the search.', undefined];
       }
@@ -871,9 +956,15 @@ const createFileSearchTool = async ({
 
       const literalCandidates = extractRecallLiteralCandidates(query);
       const recallFiles = files.filter((file) => isConversationRecallFileId(file?.file_id));
-      const recallFilesNeedSourceFallback = recallFiles.some((file) =>
-        isSourceOnlyConversationRecallFile(file),
-      );
+      const effectiveConversationId =
+        conversationId ||
+        runnableConfig?.configurable?.thread_id ||
+        runnableConfig?.configurable?.conversationId ||
+        runnableConfig?.metadata?.conversationId;
+      const effectiveActiveMessageId =
+        activeMessageId ||
+        runnableConfig?.configurable?.messageId ||
+        runnableConfig?.metadata?.messageId;
 
       /* === VIVENTIUM START ===
        * Feature: Structured file_search query observability + error differentiation
@@ -891,31 +982,8 @@ const createFileSearchTool = async ({
       let queryErrorCount = 0;
 
       const queryFiles = async (targetFiles) => {
-        const queryPromises = targetFiles.map(async (file) => {
+        const querySingleFile = async (file) => {
           const isRecall = isConversationRecallFileId(file?.file_id);
-          if (isMeetingTranscriptInventoryFile(file)) {
-            const inventoryText = getMeetingTranscriptInventoryText(file);
-            logger.debug(`[${Tools.file_search}] using source-backed meeting transcript inventory`, {
-              fileId: file.file_id,
-              hasInventoryText: Boolean(inventoryText),
-            });
-            return inventoryText
-              ? {
-                  file,
-                  response: {
-                    data: [
-                      [
-                        {
-                          page_content: inventoryText,
-                          metadata: { source: file.filename || 'meeting-transcript-inventory.txt' },
-                        },
-                        DEFAULT_FILE_SEARCH_DISTANCE_MEETING_TRANSCRIPT_INVENTORY,
-                      ],
-                    ],
-                  },
-                }
-              : { file, response: { data: [] } };
-          }
           if (isSourceOnlyConversationRecallFile(file)) {
             logger.debug(
               `[${Tools.file_search}] skipping vector query for source-only recall file`,
@@ -962,9 +1030,121 @@ const createFileSearchTool = async ({
             });
             return null;
           }
-        });
+        };
 
-        const results = await Promise.all(queryPromises);
+        const sourceBackedResults = [];
+        const meetingTranscriptVectorFiles = [];
+        const singleFilePromises = [];
+
+        for (const file of targetFiles) {
+          if (isMeetingTranscriptInventoryFile(file)) {
+            const inventoryText = getMeetingTranscriptInventoryText(file);
+            logger.debug(`[${Tools.file_search}] using source-backed meeting transcript inventory`, {
+              fileId: file.file_id,
+              hasInventoryText: Boolean(inventoryText),
+            });
+            sourceBackedResults.push(
+              inventoryText
+                ? {
+                    file,
+                    response: {
+                      data: [
+                        [
+                          {
+                            page_content: inventoryText,
+                            metadata: { source: file.filename || 'meeting-transcript-inventory.txt' },
+                          },
+                          DEFAULT_FILE_SEARCH_DISTANCE_MEETING_TRANSCRIPT_INVENTORY,
+                        ],
+                      ],
+                    },
+                  }
+                : { file, response: { data: [] } },
+            );
+            continue;
+          }
+          if (isMeetingTranscriptFileId(file?.file_id)) {
+            meetingTranscriptVectorFiles.push(file);
+            continue;
+          }
+          singleFilePromises.push(querySingleFile(file));
+        }
+
+        const queryMeetingTranscriptFiles = async (batchFiles) => {
+          if (!batchFiles.length) {
+            return [];
+          }
+          const queryStart = Date.now();
+          const fileIds = batchFiles.map((file) => file.file_id).filter(Boolean);
+          const perFileK = getMeetingTranscriptFileSearchTopK();
+          const batchK = Math.min(
+            Math.max(perFileK, perFileK * Math.max(fileIds.length, 1)),
+            getMeetingTranscriptFileSearchBatchMaxK(),
+          );
+          const body = {
+            file_ids: fileIds,
+            query,
+            k: batchK,
+          };
+          try {
+            const response = await axios.post(`${process.env.RAG_API_URL}/query_multiple`, body, {
+              headers: {
+                Authorization: `Bearer ${jwtToken}`,
+                'Content-Type': 'application/json',
+              },
+              timeout: getMeetingTranscriptFileSearchQueryTimeoutMs(),
+            });
+            const rows = Array.isArray(response?.data) ? response.data : [];
+            logger.debug(`[${Tools.file_search}] meeting transcript query_multiple ok`, {
+              fileCount: fileIds.length,
+              latencyMs: Date.now() - queryStart,
+              resultCount: rows.length,
+            });
+            const fileById = new Map(batchFiles.map((file) => [file.file_id, file]));
+            const groupedRows = new Map();
+            for (const [docInfo, distance] of rows) {
+              const rowFileId =
+                docInfo?.metadata?.file_id ||
+                docInfo?.metadata?.fileId ||
+                (batchFiles.length === 1 ? batchFiles[0].file_id : null);
+              const file = fileById.get(rowFileId);
+              if (!file) continue;
+              const existing = groupedRows.get(rowFileId) || [];
+              existing.push([docInfo, distance]);
+              groupedRows.set(rowFileId, existing);
+            }
+            return Array.from(groupedRows.entries()).map(([fileId, data]) => ({
+              file: fileById.get(fileId),
+              response: { data },
+            }));
+          } catch (error) {
+            if (error?.response?.status === 404) {
+              logger.debug(`[${Tools.file_search}] meeting transcript query_multiple empty`, {
+                fileCount: fileIds.length,
+                latencyMs: Date.now() - queryStart,
+              });
+              return [];
+            }
+            const latencyMs = Date.now() - queryStart;
+            const timedOut = error?.code === 'ECONNABORTED' || error?.code === 'ETIMEDOUT';
+            queryErrorCount += 1;
+            logger.error(`[${Tools.file_search}] meeting transcript query_multiple failed`, {
+              fileCount: fileIds.length,
+              latencyMs,
+              timedOut,
+              code: error?.code,
+              status: error?.response?.status,
+              message: error?.message,
+            });
+            return [];
+          }
+        };
+
+        const [meetingResults, singleFileResults] = await Promise.all([
+          queryMeetingTranscriptFiles(meetingTranscriptVectorFiles),
+          Promise.all(singleFilePromises),
+        ]);
+        const results = sourceBackedResults.concat(meetingResults, singleFileResults);
         return results.filter(
           (result) => result?.response && Array.isArray(result?.response?.data),
         );
@@ -1017,7 +1197,8 @@ const createFileSearchTool = async ({
       if (recallFiles.length > 0 && shouldAttemptSourceRescue) {
         const sourceRescueResults = await searchConversationRecallSourceMatches({
           userId,
-          conversationId,
+          conversationId: effectiveConversationId,
+          activeMessageId: effectiveActiveMessageId,
           recallFiles,
           query,
           literalCandidates,
@@ -1078,7 +1259,7 @@ const createFileSearchTool = async ({
           : 0,
       );
 
-      const limitedResults = preserveMeetingTranscriptInventoryResult({
+      const limitedResults = preserveMeetingTranscriptResults({
         results: formattedResults,
         maxResults,
       });

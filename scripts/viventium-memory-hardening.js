@@ -50,6 +50,7 @@ const DEFAULT_TRANSCRIPT_STABLE_EVIDENCE_MAX_AGE_DAYS = 90;
 const DEFAULT_TRANSCRIPT_SUMMARY_MAX_CHARS = 32000;
 const DEFAULT_TRANSCRIPT_RAG_MODE = 'detailed_summary_only';
 const DEFAULT_TRANSCRIPT_VECTOR_HEALTH_TIMEOUT_MS = 1000;
+const DEFAULT_MEMORY_HARDENING_LOCK_STALE_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_TRANSCRIPT_IGNORE_GLOBS = [
   '**/.DS_Store',
   '**/.*',
@@ -475,20 +476,73 @@ function resolveStatePaths(options) {
 
 function acquireLock(lockDir) {
   fs.mkdirSync(path.dirname(lockDir), { recursive: true, mode: 0o700 });
-  try {
-    fs.mkdirSync(lockDir, { mode: 0o700 });
-  } catch (error) {
-    const pidPath = path.join(lockDir, 'pid');
-    const existingPid = fs.existsSync(pidPath)
-      ? fs.readFileSync(pidPath, 'utf8').trim()
-      : 'unknown';
-    throw new Error(`Memory hardening lock is already held by pid ${existingPid}`);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      fs.mkdirSync(lockDir, { mode: 0o700 });
+      fs.writeFileSync(path.join(lockDir, 'pid'), String(process.pid), { mode: 0o600 });
+      fs.writeFileSync(path.join(lockDir, 'started_at'), new Date().toISOString(), {
+        mode: 0o600,
+      });
+      return () => {
+        fs.rmSync(lockDir, { recursive: true, force: true });
+      };
+    } catch (error) {
+      if (error?.code !== 'EEXIST') {
+        throw error;
+      }
+      const lockInfo = readLockInfo(lockDir);
+      if (!shouldClearMemoryHardeningLock(lockInfo)) {
+        throw new Error(`Memory hardening lock is already held by pid ${lockInfo.pidLabel}`);
+      }
+      fs.rmSync(lockDir, { recursive: true, force: true });
+    }
   }
-  fs.writeFileSync(path.join(lockDir, 'pid'), String(process.pid), { mode: 0o600 });
-  fs.writeFileSync(path.join(lockDir, 'started_at'), new Date().toISOString(), { mode: 0o600 });
-  return () => {
-    fs.rmSync(lockDir, { recursive: true, force: true });
+  throw new Error('Memory hardening lock could not be acquired after stale lock recovery');
+}
+
+function readLockInfo(lockDir) {
+  const pidPath = path.join(lockDir, 'pid');
+  const startedAtPath = path.join(lockDir, 'started_at');
+  const pidLabel = fs.existsSync(pidPath) ? fs.readFileSync(pidPath, 'utf8').trim() : 'unknown';
+  const startedAt = fs.existsSync(startedAtPath)
+    ? fs.readFileSync(startedAtPath, 'utf8').trim()
+    : '';
+  const startedAtMs = startedAt ? Date.parse(startedAt) : NaN;
+  const staleMs = positiveNumber(
+    process.env.VIVENTIUM_MEMORY_HARDENING_LOCK_STALE_MS,
+    DEFAULT_MEMORY_HARDENING_LOCK_STALE_MS,
+  );
+  return {
+    pidLabel,
+    pidAlive: isLockPidAlive(pidLabel),
+    lockTooOld:
+      Number.isFinite(startedAtMs) &&
+      staleMs > 0 &&
+      Date.now() - startedAtMs > staleMs,
   };
+}
+
+function shouldClearMemoryHardeningLock(lockInfo) {
+  if (lockInfo.pidAlive === true) {
+    return false;
+  }
+  return lockInfo.pidAlive === false || lockInfo.lockTooOld === true;
+}
+
+function isLockPidAlive(pidValue) {
+  const pid = Number.parseInt(String(pidValue || ''), 10);
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return true;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === 'ESRCH') {
+      return false;
+    }
+    return true;
+  }
 }
 
 function loadRuntimeMemoryConfig(configPath) {
@@ -712,6 +766,9 @@ function buildTranscriptArtifactText({ header, body, kind }) {
       : kind === 'inventory'
         ? 'Meeting transcript inventory for RAG'
         : 'Raw meeting transcript for fallback RAG';
+  if (kind === 'inventory') {
+    return `${title}\n\n${String(body || '').trim()}\n`;
+  }
   return `${title}\n${header}\n\n${String(body || '').trim()}\n`;
 }
 
@@ -1303,7 +1360,9 @@ Output JSON only with:
 Requirements:
 - Summarize the meeting faithfully and densely without inventing facts.
 - The displayTitle, oneLineSummary, meetingDatetime, and participants fields are for a transcript
-  inventory/TOC. Use the same transcript caveats and do not force unknowns.
+  inventory/TOC. Use the same transcript caveats and do not force unknowns. These fields must be
+  human meeting context only: do not place artifact IDs, stable file IDs, vector IDs, content hashes,
+  or other internal identifiers in them.
 - Make it clear who appears to be on the call, who is speaking when speaker labels are visible,
   the subject/purpose when determinable, the date/time context, useful decisions, commitments,
   unresolved questions, follow-ups, caveats, and final outcome when present.
@@ -2381,8 +2440,6 @@ function formatTranscriptInventoryRow({ file, index }) {
     `   Date/time: ${sanitizeShortText(metadata.meetingTranscriptMeetingDatetime, 120) || metadata.meetingTranscriptFileMtime || 'unknown'}`,
     `   Participants: ${participants.length ? participants.join(', ') : 'unknown/unclear'}`,
     `   Original filename: ${metadata.meetingTranscriptOriginalFilename || file?.filename || 'unknown'}`,
-    `   Artifact ID: ${metadata.meetingTranscriptArtifactId || 'unknown'}`,
-    `   Summary file ID: ${file?.file_id || 'unknown'}`,
     `   Context: ${sanitizeShortText(oneLine, 800) || 'Detailed summary available.'}`,
   ].join('\n');
 }
@@ -2393,7 +2450,6 @@ function buildTranscriptInventoryText({ sourcePathHash, summaryFiles }) {
     'Meeting transcript inventory / table of contents.',
     'This is derived metadata for the current local transcript source folder. It is transcript recall evidence, not saved user memory.',
     'Transcript caveat: transcripts may be wrong, incomplete, stale, AI-transcribed, or audience/persona-specific. Use individual transcript summaries for details and do not treat single-meeting content as stable belief.',
-    `Source folder hash: ${sourcePathHash || 'unknown'}`,
     `Current processed transcript summaries: ${rows.length}`,
     '',
     'Entries:',
@@ -3812,6 +3868,7 @@ if (require.main === module) {
 
 module.exports = {
   DEFAULT_VALID_KEYS,
+  acquireLock,
   applyUserProposal,
   applyTranscriptVectorLifecycle,
   buildTranscriptArtifactHeader,
@@ -3821,6 +3878,7 @@ module.exports = {
   buildTranscriptSummaryPrompt,
   buildUserProposal,
   deferTranscriptLifecycleWhenRagUnavailable,
+  deleteTranscriptVectorFile,
   findTranscriptContentHashesMissingVectors,
   findTranscriptVectorRepairTargets,
   getTranscriptVectorRuntimeStatus,

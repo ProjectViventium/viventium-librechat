@@ -295,6 +295,40 @@ const isMeetingTranscriptInventoryResult = (result) =>
 const isMeetingTranscriptDetailResult = (result) =>
   isMeetingTranscriptFileId(result?.file_id) && !isMeetingTranscriptInventoryResult(result);
 
+const frontloadMeetingTranscriptInventory = (results = []) => {
+  const inventoryIndex = results.findIndex((result) => isMeetingTranscriptInventoryResult(result));
+  if (inventoryIndex < 0) {
+    return results;
+  }
+
+  const targetIndex = isMeetingTranscriptDetailResult(results[0]) ? 1 : 0;
+  if (inventoryIndex === targetIndex) {
+    return results;
+  }
+
+  const nextResults = [...results];
+  const [inventoryResult] = nextResults.splice(inventoryIndex, 1);
+  const adjustedTargetIndex = inventoryIndex < targetIndex ? targetIndex - 1 : targetIndex;
+  nextResults.splice(adjustedTargetIndex, 0, inventoryResult);
+  return nextResults;
+};
+
+const frontloadMeetingTranscriptEvidence = (results = []) => {
+  if (!results.some((result) => isMeetingTranscriptFileId(result?.file_id))) {
+    return results;
+  }
+
+  const detailResult = results.find((result) => isMeetingTranscriptDetailResult(result));
+  const inventoryResult = results.find((result) => isMeetingTranscriptInventoryResult(result));
+  const front = [detailResult, inventoryResult].filter(Boolean);
+  const frontIds = new Set(front.map((result) => result?.file_id).filter(Boolean));
+  if (!front.length) {
+    return results;
+  }
+
+  return front.concat(results.filter((result) => !frontIds.has(result?.file_id)));
+};
+
 const preserveMeetingTranscriptResults = ({ results = [], maxResults }) => {
   const limitedResults = results.slice(0, maxResults);
   if (!maxResults || !results.some((result) => isMeetingTranscriptFileId(result?.file_id))) {
@@ -356,7 +390,7 @@ const preserveMeetingTranscriptResults = ({ results = [], maxResults }) => {
     nextIds.add(requiredResult.file_id);
   }
 
-  return nextResults;
+  return frontloadMeetingTranscriptEvidence(frontloadMeetingTranscriptInventory(nextResults));
 };
 
 const formatTranscriptMetadataValue = (value) => {
@@ -605,6 +639,18 @@ const isLikelyActivePromptEcho = ({ message, contentLower, queryLower }) => {
   return contentLower.includes(queryLower);
 };
 
+const isRecentUserPromptCandidate = (message, windowMs = 2 * 60 * 1000) => {
+  if (message?.isCreatedByUser !== true) {
+    return false;
+  }
+  const createdAtMs = message?.createdAt ? new Date(message.createdAt).getTime() : 0;
+  if (!Number.isFinite(createdAtMs)) {
+    return false;
+  }
+  const ageMs = Date.now() - createdAtMs;
+  return ageMs >= 0 && ageMs <= windowMs;
+};
+
 const parseConversationRecallAgentIdFromFileId = (fileId) => {
   const match = /^conversation_recall:[^:]+:agent:(.+)$/.exec(String(fileId || ''));
   return match?.[1] || null;
@@ -724,6 +770,9 @@ async function searchConversationRecallSourceMatches({
       const content = getConversationRecallMessageText(message);
       const contentLower = content.toLowerCase();
       if (!activeMessageId && isLikelyActivePromptEcho({ message, contentLower, queryLower })) {
+        continue;
+      }
+      if (!activeMessageId && !conversationId && isRecentUserPromptCandidate(message)) {
         continue;
       }
       const hasRecallDerivedChild =
@@ -960,6 +1009,7 @@ const createFileSearchTool = async ({
         conversationId ||
         runnableConfig?.configurable?.thread_id ||
         runnableConfig?.configurable?.conversationId ||
+        runnableConfig?.configurable?.requestBody?.conversationId ||
         runnableConfig?.metadata?.conversationId;
       const effectiveActiveMessageId =
         activeMessageId ||
@@ -1192,7 +1242,7 @@ const createFileSearchTool = async ({
         formattedResults = rerankConversationRecallResults({ query, results: formattedResults });
       }
 
-      const shouldAttemptSourceRescue = recallFiles.length > 0;
+      const shouldAttemptSourceRescue = recallFiles.length > 0 && !hasMeetingTranscriptResults;
 
       if (recallFiles.length > 0 && shouldAttemptSourceRescue) {
         const sourceRescueResults = await searchConversationRecallSourceMatches({
@@ -1316,7 +1366,8 @@ const createFileSearchTool = async ({
         })
         .join('\n---\n');
 
-      const sources = includedResults.map((result) => ({
+      const sources = includedResults.map((result, index) => ({
+        sourceOrder: index,
         relevance: Number.isFinite(result?.recallRerankScore)
           ? result.recallRerankScore
           : 1.0 - result.distance,

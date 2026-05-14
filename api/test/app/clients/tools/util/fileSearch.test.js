@@ -666,6 +666,57 @@ describe('fileSearch.js - tuple return validation', () => {
       expect(artifact.file_search.sources[0].fileId).toBe('meeting_inventory:user_1:sourcehash');
     });
 
+    it('does not append source-only conversation recall rescue when transcript evidence is present', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      axios.post.mockResolvedValue({ data: [] });
+      mockMessageFind.mockReturnValue(
+        queryResult([
+          {
+            messageId: 'stale_prompt',
+            conversationId: 'older-convo',
+            createdAt: '2026-05-12T12:00:00.000Z',
+            isCreatedByUser: true,
+            text: 'What recent meeting transcript entries do you see?',
+          },
+        ]),
+      );
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        files: [
+          {
+            file_id: 'conversation_recall:user_1:all',
+            filename: 'conversation-recall-all.txt',
+            viventiumConversationRecallMode: 'source_only',
+          },
+          {
+            file_id: 'meeting_inventory:user_1:sourcehash',
+            filename: 'meeting-transcript-inventory-sourcehash.txt',
+            metadata: {
+              meetingTranscriptArtifactId: 'meeting_transcript_inventory:current',
+              meetingTranscriptKind: 'inventory',
+              meetingTranscriptInventoryText:
+                'Meeting transcript inventory / table of contents.\n1. Helios launch review',
+            },
+          },
+          {
+            file_id: 'meeting_summary:user_1:helios',
+            filename: 'meeting-transcript-summary-helios.txt',
+            metadata: { meetingTranscriptKind: 'summary' },
+          },
+        ],
+      });
+
+      const [, artifact] = await fileSearchTool.func({
+        query: 'what recent meeting transcript entries do you see?',
+      });
+
+      expect(mockMessageFind).not.toHaveBeenCalled();
+      expect(artifact.file_search.sources.map((source) => source.fileId)).toEqual([
+        'meeting_inventory:user_1:sourcehash',
+      ]);
+    });
+
     it('preserves the transcript inventory source when summary chunks would otherwise fill the cap', async () => {
       generateShortLivedToken.mockReturnValue('mock-jwt-token');
       process.env.VIVENTIUM_FILE_SEARCH_MAX_RESULTS_MEETING_TRANSCRIPT = '2';
@@ -722,6 +773,64 @@ describe('fileSearch.js - tuple return validation', () => {
       expect(artifact.file_search.sources[1].fileId).toBe('meeting_inventory:user_1:sourcehash');
       expect(formattedString).toContain('Helios launch review');
       expect(formattedString).not.toContain('meeting_summary:user_1:two');
+    });
+
+    it('front-loads the transcript inventory so the output character budget cannot clip it off', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      process.env.VIVENTIUM_FILE_SEARCH_MAX_RESULTS_MEETING_TRANSCRIPT = '6';
+      process.env.VIVENTIUM_FILE_SEARCH_OUTPUT_MAX_CHARS_MEETING_TRANSCRIPT = '4300';
+      process.env.VIVENTIUM_FILE_SEARCH_RESULT_MAX_CHARS_MEETING_TRANSCRIPT = '1000';
+      process.env.VIVENTIUM_FILE_SEARCH_RESULT_MAX_CHARS_MEETING_TRANSCRIPT_INVENTORY = '2500';
+
+      axios.post.mockImplementation((_url, body) => {
+        const fileIds = Array.isArray(body.file_ids) ? body.file_ids : [body.file_id];
+        return Promise.resolve({
+          data: fileIds.map((fileId, index) => [
+            {
+              page_content: `Detailed summary ${index + 1} for ${fileId}. ${'Summary detail. '.repeat(
+                120,
+              )}`,
+              metadata: { file_id: fileId, source: `/path/to/${fileId}.txt`, page: 1 },
+            },
+            0.01 + index * 0.01,
+          ]),
+        });
+      });
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        files: [
+          {
+            file_id: 'meeting_inventory:user_1:sourcehash',
+            filename: 'meeting-transcript-inventory-sourcehash.txt',
+            metadata: {
+              meetingTranscriptArtifactId: 'meeting_transcript_inventory:current',
+              meetingTranscriptKind: 'inventory',
+              meetingTranscriptInventoryText:
+                'Meeting transcript inventory / table of contents.\n1. Helios launch review\n2. Orion customer review\n' +
+                'Inventory context. '.repeat(180),
+            },
+          },
+          ...['one', 'two', 'three', 'four', 'five'].map((suffix) => ({
+            file_id: `meeting_summary:user_1:${suffix}`,
+            filename: `meeting-transcript-summary-${suffix}.txt`,
+            metadata: {
+              meetingTranscriptArtifactId: `meeting_transcript:${suffix}`,
+              meetingTranscriptKind: 'summary',
+            },
+          })),
+        ],
+      });
+
+      const [formattedString, artifact] = await fileSearchTool.func({
+        query: 'list my recent conversations based on transcripts chronologically',
+      });
+
+      expect(artifact.file_search.sources[0].fileId).toBe('meeting_summary:user_1:one');
+      expect(artifact.file_search.sources[1].fileId).toBe('meeting_inventory:user_1:sourcehash');
+      expect(formattedString).toContain('Transcript artifact kind: inventory');
+      expect(formattedString).toContain('Helios launch review');
+      expect(formattedString).not.toContain('meeting_summary:user_1:three');
     });
 
     it('keeps focused transcript summary hits ahead of inventory on narrow questions', async () => {
@@ -845,6 +954,83 @@ describe('fileSearch.js - tuple return validation', () => {
       expect(artifact.file_search.sources[0].content).toContain(
         'Speaker Alpha and the user discussed SF customer discovery',
       );
+    });
+
+    it('front-loads transcript evidence ahead of matching conversation recall on transcript queries', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      axios.post.mockImplementation((url, body) => {
+        if (body.file_id === 'conversation_recall:user_1:all') {
+          return Promise.resolve({
+            data: [
+              [
+                {
+                  page_content:
+                    '<turn role="user">What recent meeting transcript entries do you see?</turn>',
+                  metadata: { source: '/path/to/conversation-recall-all.txt', page: 1 },
+                },
+                0.02,
+              ],
+            ],
+          });
+        }
+        if (Array.isArray(body.file_ids) && body.file_ids.includes('meeting_summary:user_1:qa')) {
+          return Promise.resolve({
+            data: [
+              [
+                {
+                  page_content:
+                    'Meeting summary: Helios launch review includes date, participants, context, and transcript caveats.',
+                  metadata: {
+                    file_id: 'meeting_summary:user_1:qa',
+                    source: '/path/to/meeting-transcript-summary-qa.txt',
+                    page: 1,
+                  },
+                },
+                0.4,
+              ],
+            ],
+          });
+        }
+        return Promise.resolve({ data: [] });
+      });
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        files: [
+          {
+            file_id: 'conversation_recall:user_1:all',
+            filename: 'conversation-recall-all.txt',
+          },
+          {
+            file_id: 'meeting_inventory:user_1:sourcehash',
+            filename: 'meeting-transcript-inventory-sourcehash.txt',
+            metadata: {
+              meetingTranscriptArtifactId: 'meeting_transcript_inventory:current',
+              meetingTranscriptKind: 'inventory',
+              meetingTranscriptInventoryText:
+                'Meeting transcript inventory / table of contents.\n1. Helios launch review',
+            },
+          },
+          {
+            file_id: 'meeting_summary:user_1:qa',
+            filename: 'meeting-transcript-summary-qa.txt',
+            metadata: {
+              meetingTranscriptArtifactId: 'meeting_transcript:qa',
+              meetingTranscriptKind: 'summary',
+            },
+          },
+        ],
+      });
+
+      const [, artifact] = await fileSearchTool.func({
+        query: 'what recent meeting transcript entries do you see?',
+      });
+
+      expect(artifact.file_search.sources.map((source) => source.fileId).slice(0, 2)).toEqual([
+        'meeting_summary:user_1:qa',
+        'meeting_inventory:user_1:sourcehash',
+      ]);
+      expect(artifact.file_search.sources[2].fileId).toBe('conversation_recall:user_1:all');
     });
 
     it('uses per-source result budgets when meeting transcript and conversation recall both hit', async () => {
@@ -1299,6 +1485,54 @@ describe('fileSearch.js - tuple return validation', () => {
       expect(artifact.file_search.sources[0].content).not.toContain(query);
       expect(artifact.file_search.sources[0].content).toContain(
         'Project Atlas decision: ship the slimmer onboarding flow first.',
+      );
+    });
+
+    it('does not rescue a recent prompt echo when conversation metadata is unavailable', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      axios.post.mockResolvedValue({ data: [] });
+      const activePrompt =
+        'list my recent conversations based on transcripts chronologically and give me a 5 line summary based on the actual context.';
+      mockMessageFind.mockImplementation((filter) => {
+        if (filter?.parentMessageId) {
+          return queryResult([]);
+        }
+        return queryResult([
+          {
+            messageId: 'active_prompt_without_runtime_metadata',
+            conversationId: 'current-convo',
+            createdAt: new Date().toISOString(),
+            isCreatedByUser: true,
+            text: activePrompt,
+          },
+          {
+            messageId: 'older_user_turn',
+            conversationId: 'source_convo',
+            createdAt: '2026-04-09T18:12:00.000Z',
+            isCreatedByUser: true,
+            text: 'Transcript inventory entry: Project Atlas working session covered context and summary decisions.',
+          },
+        ]);
+      });
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        files: [
+          {
+            file_id: 'conversation_recall:user_1:all',
+            filename: 'conversation-recall-all.txt',
+            viventiumConversationRecallMode: 'source_only',
+          },
+        ],
+      });
+
+      const [, artifact] = await fileSearchTool.func({
+        query: 'recent transcript inventory chronology summary context',
+      });
+
+      expect(artifact.file_search.sources[0].content).not.toContain(activePrompt);
+      expect(artifact.file_search.sources[0].content).toContain(
+        'Transcript inventory entry: Project Atlas working session covered context and summary decisions.',
       );
     });
 

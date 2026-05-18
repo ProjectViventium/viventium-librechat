@@ -11,10 +11,13 @@
 const {
   formatFollowUpPrompt,
   resolveFollowUpContinuationContext,
+  resolveFollowUpRuntimeAssignment,
   resolveFollowUpPersistenceText,
   sanitizeAnthropicFollowUpLLMConfig,
+  buildFollowUpModelKwargsForProvider,
   shouldForceVisibleFollowUpForEmptyPrimary,
   extractRecentResponseTextFromMessage,
+  resolveUserRequestTextFromMessages,
   isPlaceholderRecentResponseText,
   upsertCortexParts,
 } = require('../BackgroundCortexFollowUpService');
@@ -117,6 +120,33 @@ describe('Phase B prompt registry ownership', () => {
       expect.any(String),
       expect.objectContaining({
         no_response_instructions: 'Use {NTA} when no reply is needed.',
+      }),
+    );
+  });
+
+  test('routes forced primary follow-up prompts with the user request through the prompt registry', () => {
+    jest.resetModules();
+    const getPromptText = jest.fn((_promptId, fallback) => fallback);
+    jest.doMock('~/server/services/viventium/promptRegistry', () => ({ getPromptText }));
+    const {
+      formatFollowUpPrompt: registryFormatFollowUpPrompt,
+    } = require('../BackgroundCortexFollowUpService');
+
+    registryFormatFollowUpPrompt({
+      insights: [{ cortexName: 'worker', insight: 'Use two bullets.' }],
+      recentResponse: '',
+      userRequest: 'Give me one strength and one improvement.',
+      voiceMode: false,
+      surface: '',
+      primaryResponseMode: true,
+    });
+
+    expect(getPromptText).toHaveBeenCalledWith(
+      'cortex.follow_up_phase_b.primary_user_message',
+      expect.any(String),
+      expect.objectContaining({
+        user_request: 'Give me one strength and one improvement.',
+        background_insights: expect.stringContaining('Use two bullets.'),
       }),
     );
   });
@@ -234,6 +264,7 @@ describe('formatFollowUpPrompt', () => {
     const prompt = formatFollowUpPrompt({
       insights: [{ cortexName: 'worker', insight: 'The task completed successfully.' }],
       recentResponse: 'I’m checking.',
+      userRequest: 'Please summarize the result.',
       voiceMode: false,
       surface: '',
       primaryResponseMode: true,
@@ -246,6 +277,57 @@ describe('formatFollowUpPrompt', () => {
     expect(prompt).toContain(
       'Do not output {NTA} if the insights contain any substantive user-visible information.',
     );
+    expect(prompt).toContain('User request for this turn:');
+    expect(prompt).toContain('Please summarize the result.');
+  });
+});
+
+describe('resolveUserRequestTextFromMessages', () => {
+  test('loads the user request from the assistant parent message tree', () => {
+    const text = resolveUserRequestTextFromMessages(
+      [
+        {
+          messageId: 'user-1',
+          sender: 'User',
+          isCreatedByUser: true,
+          text: 'Answer in two short bullets.',
+        },
+        {
+          messageId: 'assistant-1',
+          parentMessageId: 'user-1',
+          sender: 'Viventium',
+          isCreatedByUser: false,
+          text: '',
+          content: [{ type: 'cortex_insight', insight: 'A useful result.' }],
+        },
+      ],
+      'assistant-1',
+    );
+
+    expect(text).toBe('Answer in two short bullets.');
+  });
+
+  test('returns an empty string when the assistant parent is not a user message', () => {
+    const text = resolveUserRequestTextFromMessages(
+      [
+        {
+          messageId: 'assistant-0',
+          sender: 'Viventium',
+          isCreatedByUser: false,
+          text: 'Earlier answer.',
+        },
+        {
+          messageId: 'assistant-1',
+          parentMessageId: 'assistant-0',
+          sender: 'Viventium',
+          isCreatedByUser: false,
+          text: '',
+        },
+      ],
+      'assistant-1',
+    );
+
+    expect(text).toBe('');
   });
 });
 
@@ -787,5 +869,69 @@ describe('sanitizeAnthropicFollowUpLLMConfig', () => {
     });
 
     expect(result.temperature).toBe(0.3);
+  });
+});
+
+describe('voice follow-up runtime assignment', () => {
+  const originalXaiApiKey = process.env.XAI_API_KEY;
+
+  beforeEach(() => {
+    process.env.XAI_API_KEY = 'test-xai-key';
+  });
+
+  afterEach(() => {
+    if (originalXaiApiKey == null) {
+      delete process.env.XAI_API_KEY;
+    } else {
+      process.env.XAI_API_KEY = originalXaiApiKey;
+    }
+  });
+
+  test('normalizes xAI voice follow-up parameters to no reasoning', () => {
+    const result = resolveFollowUpRuntimeAssignment(
+      {
+        id: 'agent-main',
+        provider: 'anthropic',
+        model: 'claude-opus-4-7',
+        model_parameters: {
+          model: 'claude-opus-4-7',
+          thinking: true,
+          thinkingBudget: 4096,
+          temperature: 0.3,
+        },
+        voice_llm_provider: 'xai',
+        voice_llm_model: 'grok-4.3',
+        voice_llm_model_parameters: {
+          thinking: false,
+        },
+      },
+      { useVoiceModel: true },
+    );
+
+    expect(result.effectiveProvider).toBe('xai');
+    expect(result.effectiveModel).toBe('grok-4.3');
+    expect(result.runtimeAgent.model_parameters.reasoning_effort).toBe('none');
+    expect(result.runtimeAgent.model_parameters).not.toHaveProperty('thinking');
+    expect(result.runtimeAgent.model_parameters).not.toHaveProperty('thinkingBudget');
+  });
+
+  test('passes xAI no-reasoning follow-up knob through OpenAI-compatible kwargs', () => {
+    expect(
+      buildFollowUpModelKwargsForProvider({
+        providerName: 'xai',
+        modelParameters: {
+          reasoning_effort: 'none',
+        },
+      }),
+    ).toEqual({ reasoning_effort: 'none' });
+
+    expect(
+      buildFollowUpModelKwargsForProvider({
+        providerName: 'anthropic',
+        modelParameters: {
+          reasoning_effort: 'none',
+        },
+      }),
+    ).toBeUndefined();
   });
 });

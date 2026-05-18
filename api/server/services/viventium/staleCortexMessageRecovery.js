@@ -23,6 +23,7 @@ const CORTEX_TYPES = new Set([
 ]);
 const DEFAULT_CORTEX_EXECUTION_TIMEOUT_MS = 180_000;
 const DEFAULT_STALE_RECOVERY_GRACE_MS = 60_000;
+const DEFAULT_STALE_RECOVERY_INTERVAL_MS = 60_000;
 
 function parsePositiveInt(value) {
   const parsed = parseInt(String(value || '').trim(), 10);
@@ -50,6 +51,11 @@ function getStaleCortexRecoveryConfig() {
     cortexExecutionTimeoutMs,
     graceMs,
   };
+}
+
+function getStaleCortexRecoveryIntervalMs() {
+  const parsed = parsePositiveInt(process.env.VIVENTIUM_STALE_CORTEX_RECOVERY_INTERVAL_MS);
+  return parsed || DEFAULT_STALE_RECOVERY_INTERVAL_MS;
 }
 
 function isActiveCortexPart(part) {
@@ -161,6 +167,7 @@ async function recoverStaleCortexMessages({ now = new Date() } = {}) {
 module.exports = {
   ACTIVE_CORTEX_STATUSES,
   getConfiguredCortexExecutionTimeoutMs,
+  getStaleCortexRecoveryIntervalMs,
   recoverCortexContent,
   recoverStaleCortexMessages,
   getStaleCortexRecoveryConfig,

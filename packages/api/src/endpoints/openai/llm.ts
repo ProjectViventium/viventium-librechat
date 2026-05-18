@@ -76,6 +76,27 @@ function hasReasoningParams({
   );
 }
 
+/* === VIVENTIUM START ===
+ * Feature: xAI Chat Completions reasoning ownership.
+ * Purpose: xAI's OpenAI-compatible Chat Completions route expects `reasoning_effort`
+ * for Grok 4.3 and aliases, but older xAI non-reasoning slugs reject the parameter.
+ * LangChain's ChatOpenAI only forwards that snake_case field reliably through
+ * modelKwargs for non-OpenAI reasoning models. Generic custom endpoints still
+ * use the Responses-style `reasoning` object when configured that way.
+ * === VIVENTIUM END === */
+function isXAIEndpoint(endpoint?: EModelEndpoint | string | null): boolean {
+  const normalized = String(endpoint || '').trim().toLowerCase();
+  return normalized === 'xai' || normalized === 'x_ai';
+}
+
+function supportsXAIChatCompletionsReasoningEffort(model?: string | null): boolean {
+  const normalized = String(model || '')
+    .trim()
+    .toLowerCase()
+    .replace(/^xai\//, '');
+  return normalized === 'grok-4.3' || normalized === 'grok-4.3-latest' || normalized === 'grok-latest';
+}
+
 /**
  * Extracts default parameters from customParams.paramDefinitions
  * @param paramDefinitions - Array of parameter definitions with key and default values
@@ -235,6 +256,19 @@ export function getOpenAILLMConfig({
     } else {
       /** No explicit effort; fall back to legacy `include_reasoning` for reasoning token inclusion */
       llmConfig.include_reasoning = true;
+    }
+  } else if (
+    isXAIEndpoint(endpoint) &&
+    llmConfig.useResponsesApi !== true &&
+    hasReasoningParams({ reasoning_effort, reasoning_summary })
+  ) {
+    if (
+      reasoning_effort != null &&
+      reasoning_effort !== '' &&
+      supportsXAIChatCompletionsReasoningEffort(String(llmConfig.model || ''))
+    ) {
+      modelKwargs.reasoning_effort = reasoning_effort;
+      hasModelKwargs = true;
     }
   } else if (
     hasReasoningParams({ reasoning_effort, reasoning_summary }) &&

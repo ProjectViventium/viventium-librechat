@@ -180,10 +180,38 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     expect(mockGenerationJobManager.completeJob).not.toHaveBeenCalled();
 
     phaseB.resolve();
+    await jest.advanceTimersByTimeAsync(0);
+    await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
 
     expect(mockGenerationJobManager.completeJob).toHaveBeenCalledWith('conv-1');
+  });
+
+  test('does not complete a replaced job after Phase B wait', async () => {
+    const phaseB = deferred();
+    const client = makeClient(phaseB.promise);
+    const initializeClient = jest.fn(async () => ({ client }));
+    const addTitle = jest.fn();
+
+    mockGenerationJobManager.getJob
+      .mockResolvedValueOnce({ createdAt: 1 })
+      .mockResolvedValueOnce({ createdAt: 2 });
+
+    await AgentController(makeReq(), makeRes(), jest.fn(), initializeClient, addTitle);
+    await jest.advanceTimersByTimeAsync(120);
+    await Promise.resolve();
+
+    expect(mockGenerationJobManager.emitDone).toHaveBeenCalled();
+    expect(mockGenerationJobManager.completeJob).not.toHaveBeenCalled();
+
+    phaseB.resolve();
+    await jest.advanceTimersByTimeAsync(0);
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(mockGenerationJobManager.completeJob).not.toHaveBeenCalled();
   });
 
   test('falls back to timeout and still completes job when Phase B hangs', async () => {

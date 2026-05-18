@@ -92,6 +92,44 @@ describe('staleCortexMessageRecovery', () => {
     );
   });
 
+  test('repairs finished blank messages that still contain active cortex rows', async () => {
+    process.env.VIVENTIUM_STALE_CORTEX_RECOVERY_MS = '1000';
+    process.env.VIVENTIUM_CORTEX_EXECUTION_TIMEOUT_MS = '500';
+    process.env.VIVENTIUM_STALE_CORTEX_RECOVERY_GRACE_MS = '250';
+    const now = new Date('2026-05-06T12:00:00.000Z');
+    mockFindLean([
+      {
+        _id: 'mongo-id-blank',
+        messageId: 'msg-blank',
+        createdAt: new Date('2026-05-06T11:59:00.000Z'),
+        updatedAt: new Date('2026-05-06T11:59:01.000Z'),
+        unfinished: false,
+        error: false,
+        text: '',
+        content: [
+          { type: ContentTypes.CORTEX_BREWING, cortex_id: 'a', status: 'brewing' },
+          { type: ContentTypes.CORTEX_BREWING, cortex_id: 'b', status: 'brewing' },
+        ],
+      },
+    ]);
+
+    const result = await recoverStaleCortexMessages({ now });
+
+    expect(result).toEqual(expect.objectContaining({ scanned: 1, repaired: 1, timeoutMs: 1000 }));
+    expect(Message.updateOne).toHaveBeenCalledWith(
+      { _id: 'mongo-id-blank', updatedAt: new Date('2026-05-06T11:59:01.000Z') },
+      {
+        $set: expect.objectContaining({
+          unfinished: false,
+          content: [
+            expect.objectContaining({ status: 'error', cortex_id: 'a' }),
+            expect.objectContaining({ status: 'error', cortex_id: 'b' }),
+          ],
+        }),
+      },
+    );
+  });
+
   test('keeps stale cutoff beyond the configured cortex execution timeout', async () => {
     process.env.VIVENTIUM_STALE_CORTEX_RECOVERY_MS = '1000';
     process.env.VIVENTIUM_CORTEX_EXECUTION_TIMEOUT_MS = '5000';

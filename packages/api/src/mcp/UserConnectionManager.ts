@@ -64,23 +64,41 @@ export abstract class UserConnectionManager {
     signal,
     returnOnOAuth = false,
     connectionTimeout,
+    serverConfig: providedConfig,
   }: {
     serverName: string;
     forceNew?: boolean;
+    /* === VIVENTIUM START ===
+     * Feature: Upstream-aligned MCP config-server reuse.
+     * Purpose: Avoid fetching the same server config again when a caller already
+     * resolved it for request-scoped MCP reinitialization.
+     */
+    serverConfig?: t.ParsedServerConfig;
+    /* === VIVENTIUM END === */
   } & Omit<t.OAuthConnectionOptions, 'useOAuth'>): Promise<MCPConnection> {
     const userId = user?.id;
     if (!userId) {
       throw new McpError(ErrorCode.InvalidRequest, `[MCP] User object missing id property`);
     }
 
-    if (await this.appConnections!.has(serverName)) {
+    /* === VIVENTIUM START ===
+     * Feature: MCP status and warm-up hardening.
+     * Purpose: During startup/reinit races the manager can route directly to a
+     * user-scoped connection before appConnections is ready. Treat the missing
+     * app repository as "no app-level connection" instead of throwing a null
+     * `.has` TypeError into status polling or chat.
+     */
+    if (await this.appConnections?.has(serverName)) {
+      /* === VIVENTIUM END === */
       throw new McpError(
         ErrorCode.InvalidRequest,
         `[MCP][User: ${userId}] Trying to create user-specific connection for app-level server "${serverName}"`,
       );
     }
 
-    const config = await MCPServersRegistry.getInstance().getServerConfig(serverName, userId);
+    const config =
+      providedConfig ??
+      (await MCPServersRegistry.getInstance().getServerConfig(serverName, userId));
 
     const userServerMap = this.userConnections.get(userId);
     let connection = forceNew ? undefined : userServerMap?.get(serverName);

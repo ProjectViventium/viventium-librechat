@@ -3144,6 +3144,56 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     expect(mockCreateCortexFollowUpMessage).not.toHaveBeenCalled();
   });
 
+  test('does not initialize lazy fallback when primary returns visible assistant text', async () => {
+    primaryAgent.viventiumFallbackLlmInitializer = jest.fn(async () => ({
+      id: 'agent-fallback',
+      provider: EModelEndpoint.openAI,
+      model: 'gpt-5.4',
+      model_parameters: { model: 'gpt-5.4' },
+    }));
+    client.chatCompletion = jest.fn(async () => {
+      client.contentParts.push({ type: ContentTypes.TEXT, text: 'Primary answer.' });
+    });
+
+    const result = await client.sendCompletion({ text: 'hello' });
+
+    expect(primaryAgent.viventiumFallbackLlmInitializer).not.toHaveBeenCalled();
+    expect(client.chatCompletion).toHaveBeenCalledTimes(1);
+    expect(result.completion).toEqual([{ type: ContentTypes.TEXT, text: 'Primary answer.' }]);
+  });
+
+  test('materializes lazy fallback only after primary fails before assistant text', async () => {
+    const fallbackAgent = {
+      id: 'agent-fallback',
+      provider: EModelEndpoint.openAI,
+      model: 'gpt-5.4',
+      model_parameters: { model: 'gpt-5.4' },
+      userMCPAuthMap: { mcp_google_workspace: { oauth: 'pending' } },
+    };
+    primaryAgent.viventiumFallbackLlmInitializer = jest.fn(async () => fallbackAgent);
+    let fallbackSawUserMcpAuthMap;
+    let calls = 0;
+    client.chatCompletion = jest.fn(async (options = {}) => {
+      calls += 1;
+      if (calls === 1) {
+        client.contentParts.push({
+          type: ContentTypes.ERROR,
+          [ContentTypes.ERROR]: 'provider temporarily unavailable',
+        });
+        return;
+      }
+      fallbackSawUserMcpAuthMap = options.userMCPAuthMap;
+      client.contentParts.push({ type: ContentTypes.TEXT, text: 'Fallback answer.' });
+    });
+
+    const result = await client.sendCompletion({ text: 'hello' });
+
+    expect(primaryAgent.viventiumFallbackLlmInitializer).toHaveBeenCalledTimes(1);
+    expect(client.chatCompletion).toHaveBeenCalledTimes(2);
+    expect(fallbackSawUserMcpAuthMap).toEqual(fallbackAgent.userMCPAuthMap);
+    expect(result.completion).toEqual([{ type: ContentTypes.TEXT, text: 'Fallback answer.' }]);
+  });
+
   test('allows fallback chatCompletion to run background cortices when primary never started Phase B', async () => {
     const fallbackAgent = {
       id: 'agent-fallback',
@@ -3255,6 +3305,52 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
         status: 'error',
       }),
       { type: ContentTypes.TEXT, text: 'Fallback answer.' },
+    ]);
+  });
+});
+
+describe('pruneSequentialOutputPartsForPersistence', () => {
+  test('keeps final assistant text when background cortex cards are appended after it', () => {
+    const parts = [
+      { type: ContentTypes.TEXT, text: 'Intermediate handoff.' },
+      { type: ContentTypes.TEXT, text: 'I hear you.' },
+      {
+        type: ContentTypes.CORTEX_INSIGHT,
+        cortex_id: 'agent-background',
+        status: 'complete',
+        insight: "What's going on?",
+      },
+    ];
+
+    expect(AgentClient.pruneSequentialOutputPartsForPersistence(parts)).toEqual([
+      { type: ContentTypes.TEXT, text: 'I hear you.' },
+      {
+        type: ContentTypes.CORTEX_INSIGHT,
+        cortex_id: 'agent-background',
+        status: 'complete',
+        insight: "What's going on?",
+      },
+    ]);
+  });
+
+  test('falls back to previous final-part behavior when no visible text exists', () => {
+    const parts = [
+      { type: ContentTypes.AGENT_UPDATE, agent_update: { index: 0, message: 'thinking' } },
+      {
+        type: ContentTypes.CORTEX_INSIGHT,
+        cortex_id: 'agent-background',
+        status: 'complete',
+        insight: 'Background result.',
+      },
+    ];
+
+    expect(AgentClient.pruneSequentialOutputPartsForPersistence(parts)).toEqual([
+      {
+        type: ContentTypes.CORTEX_INSIGHT,
+        cortex_id: 'agent-background',
+        status: 'complete',
+        insight: 'Background result.',
+      },
     ]);
   });
 });

@@ -86,6 +86,7 @@ const {
   detectActivations, // NEW: Phase A - Activation detection with timeout
   executeActivated, // NEW: Phase B - Execute activated cortices with merging
   formatInsightsForContext,
+  resolveActivationPolicyMainAgent,
   sanitizeCortexDisplayName, // NEW: Sanitize display names to remove jargon
 } = require('~/server/services/BackgroundCortexService');
 const {
@@ -110,7 +111,9 @@ const {
   pickHoldText: pickToolCortexHoldText,
   shouldForcePhaseBFollowUp,
 } = require('~/server/services/viventium/brewingHold');
-const { resolveVoicePhaseAAsyncPolicy } = require('~/server/services/viventium/voicePhaseAPolicy');
+const {
+  resolveVoicePhaseAAsyncPolicyWithHydratedTools,
+} = require('~/server/services/viventium/voicePhaseAPolicy');
 /* === VIVENTIUM NOTE END === */
 const {
   getController: getResponseController,
@@ -817,6 +820,46 @@ function extractTextFromContentParts(parts) {
     .filter((text) => text.length > 0);
 
   return texts.join('');
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Background cortex card parity with hidden sequential outputs.
+ *
+ * Why:
+ * - `hide_sequential_outputs` is meant to hide intermediate agent chatter, not the final main
+ *   assistant text for a turn.
+ * - Background cortex cards are additive internal content parts and can be appended after the
+ *   final text. Treating "last content part" as "final assistant text" can drop the actual answer.
+ * === VIVENTIUM END === */
+function pruneSequentialOutputPartsForPersistence(contentParts) {
+  if (!Array.isArray(contentParts)) {
+    return contentParts;
+  }
+  let lastTextIndex = -1;
+  for (let index = contentParts.length - 1; index >= 0; index -= 1) {
+    const part = contentParts[index];
+    if (part && part.type === ContentTypes.TEXT && extractTextFromContentParts([part]).trim()) {
+      lastTextIndex = index;
+      break;
+    }
+  }
+  const fallbackFinalIndex = contentParts.length - 1;
+  const finalOutputIndex = lastTextIndex >= 0 ? lastTextIndex : fallbackFinalIndex;
+  return contentParts.filter((part, index) => {
+    if (!part) {
+      return false;
+    }
+    if (index === finalOutputIndex) {
+      return true;
+    }
+    if (part.type === ContentTypes.TOOL_CALL || part.tool_call_ids) {
+      return true;
+    }
+    if (CORTEX_CONTENT_TYPES.has(part.type)) {
+      return true;
+    }
+    return false;
+  });
 }
 
 /* === VIVENTIUM START ===
@@ -2198,55 +2241,68 @@ class AgentClient extends BaseClient {
        * retry once with the user-configured fallback route.
        * Added: 2026-04-28
        */
-      const fallbackAgent = this.options.agent?.viventiumFallbackLlm;
+      let fallbackAgent = this.options.agent?.viventiumFallbackLlm;
+      const fallbackInitializer = this.options.agent?.viventiumFallbackLlmInitializer;
       let fallbackAttempted = false;
-      if (fallbackAgent && shouldRetryWithFallback(this.contentParts)) {
-        fallbackAttempted = true;
-        const primaryProvider =
-          this.options.agent?.provider || this.options.agent?.endpoint || 'unknown';
-        const primaryModel =
-          this.options.agent?.model || this.options.agent?.model_parameters?.model || 'unknown';
-        const fallbackProvider = fallbackAgent.provider || fallbackAgent.endpoint || 'unknown';
-        const fallbackModel =
-          fallbackAgent.model || fallbackAgent.model_parameters?.model || 'unknown';
-        logger.warn(
-          `[AgentClient] Primary model ${primaryProvider}/${primaryModel} failed before assistant text; retrying with fallback ${fallbackProvider}/${fallbackModel}`,
-        );
-        const preservedCortexParts = this.contentParts.filter(
-          (part) => part && CORTEX_CONTENT_TYPES.has(part.type),
-        );
-        this.contentParts.length = 0;
-        for (const part of preservedCortexParts) {
-          upsertCortexContentPart(this.contentParts, part);
+      if (
+        (fallbackAgent || typeof fallbackInitializer === 'function') &&
+        shouldRetryWithFallback(this.contentParts)
+      ) {
+        if (!fallbackAgent && typeof fallbackInitializer === 'function') {
+          fallbackAgent = await fallbackInitializer();
         }
-        this.options.agent = fallbackAgent;
-        this.options.attachments = fallbackAgent.attachments ?? this.options.attachments;
-        this.options.resendFiles = fallbackAgent.resendFiles ?? this.options.resendFiles;
-        this.options.maxContextTokens =
-          fallbackAgent.maxContextTokens ?? this.options.maxContextTokens;
-        this.model = fallbackModel;
-        const reqBody = this.options.req?.body;
-        const primaryPhaseBOwnsThisResponse =
-          this._phaseBPromise && this._phaseBPipelineResponseMessageId === this.responseMessageId;
-        const hadSuppressBackgroundCortices =
-          reqBody && Object.prototype.hasOwnProperty.call(reqBody, 'suppressBackgroundCortices');
-        const previousSuppressBackgroundCortices = reqBody?.suppressBackgroundCortices;
-        if (reqBody && primaryPhaseBOwnsThisResponse) {
-          reqBody.suppressBackgroundCortices = true;
-        }
-        try {
-          await this.chatCompletion({
-            payload,
-            onProgress: opts.onProgress,
-            userMCPAuthMap: fallbackAgent.userMCPAuthMap ?? opts.userMCPAuthMap,
-            abortController: opts.abortController,
-          });
-        } finally {
+        if (!fallbackAgent) {
+          if (primaryError) {
+            throw primaryError;
+          }
+        } else {
+          fallbackAttempted = true;
+          const primaryProvider =
+            this.options.agent?.provider || this.options.agent?.endpoint || 'unknown';
+          const primaryModel =
+            this.options.agent?.model || this.options.agent?.model_parameters?.model || 'unknown';
+          const fallbackProvider = fallbackAgent.provider || fallbackAgent.endpoint || 'unknown';
+          const fallbackModel =
+            fallbackAgent.model || fallbackAgent.model_parameters?.model || 'unknown';
+          logger.warn(
+            `[AgentClient] Primary model ${primaryProvider}/${primaryModel} failed before assistant text; retrying with fallback ${fallbackProvider}/${fallbackModel}`,
+          );
+          const preservedCortexParts = this.contentParts.filter(
+            (part) => part && CORTEX_CONTENT_TYPES.has(part.type),
+          );
+          this.contentParts.length = 0;
+          for (const part of preservedCortexParts) {
+            upsertCortexContentPart(this.contentParts, part);
+          }
+          this.options.agent = fallbackAgent;
+          this.options.attachments = fallbackAgent.attachments ?? this.options.attachments;
+          this.options.resendFiles = fallbackAgent.resendFiles ?? this.options.resendFiles;
+          this.options.maxContextTokens =
+            fallbackAgent.maxContextTokens ?? this.options.maxContextTokens;
+          this.model = fallbackModel;
+          const reqBody = this.options.req?.body;
+          const primaryPhaseBOwnsThisResponse =
+            this._phaseBPromise && this._phaseBPipelineResponseMessageId === this.responseMessageId;
+          const hadSuppressBackgroundCortices =
+            reqBody && Object.prototype.hasOwnProperty.call(reqBody, 'suppressBackgroundCortices');
+          const previousSuppressBackgroundCortices = reqBody?.suppressBackgroundCortices;
           if (reqBody && primaryPhaseBOwnsThisResponse) {
-            if (hadSuppressBackgroundCortices) {
-              reqBody.suppressBackgroundCortices = previousSuppressBackgroundCortices;
-            } else {
-              delete reqBody.suppressBackgroundCortices;
+            reqBody.suppressBackgroundCortices = true;
+          }
+          try {
+            await this.chatCompletion({
+              payload,
+              onProgress: opts.onProgress,
+              userMCPAuthMap: fallbackAgent.userMCPAuthMap ?? opts.userMCPAuthMap,
+              abortController: opts.abortController,
+            });
+          } finally {
+            if (reqBody && primaryPhaseBOwnsThisResponse) {
+              if (hadSuppressBackgroundCortices) {
+                reqBody.suppressBackgroundCortices = previousSuppressBackgroundCortices;
+              } else {
+                delete reqBody.suppressBackgroundCortices;
+              }
             }
           }
         }
@@ -3063,11 +3119,26 @@ class AgentClient extends BaseClient {
          * Parity: When disabled or not in voice mode, behavior is identical to standard LibreChat.
          * Added: 2026-03-04
          */
-        const voicePhaseAPolicy = resolveVoicePhaseAAsyncPolicy({
+        const voicePhaseAPolicy = await resolveVoicePhaseAAsyncPolicyWithHydratedTools({
           voiceMode,
           agent: this.options.agent,
+          directActionSurfaces: directActionPolicySurfaces,
+          agentTools: this.options.agent?.tools,
+          toolDefinitions: this.options.agent?.toolDefinitions,
+          hydrateAgentTools: async () =>
+            resolveActivationPolicyMainAgent({
+              req,
+              mainAgent: this.options.agent,
+              timeoutMs: Math.min(150, cortexDetectTimeoutMs),
+            }),
         });
         const voicePhaseAAsync = voicePhaseAPolicy.enabled;
+        if (voicePhaseAPolicy.hydratedToolPolicy) {
+          logger.info(
+            `[AgentClient] Phase A async policy rechecked with hydrated tools: ` +
+              `${voicePhaseAPolicy.initialReason || 'unknown'} -> ${voicePhaseAPolicy.reason}`,
+          );
+        }
         if (voicePhaseAPolicy.forcedOff) {
           logger.info(
             `[AgentClient] Phase A async requested but forced off: reason=${voicePhaseAPolicy.reason}`,
@@ -3077,7 +3148,11 @@ class AgentClient extends BaseClient {
               req,
               'phase_a_async_forced_off',
               voiceChatStartAt,
-              `reason=${voicePhaseAPolicy.reason}`,
+              `reason=${voicePhaseAPolicy.reason} ` +
+                `tool_hold_scopes=${voicePhaseAPolicy.toolHoldScopeKeys?.join(',') || 'none'} ` +
+                `unowned_tool_hold_scopes=${
+                  voicePhaseAPolicy.unownedToolHoldScopeKeys?.join(',') || 'none'
+                }`,
             );
           }
         }
@@ -3090,7 +3165,7 @@ class AgentClient extends BaseClient {
               req,
               'phase_a_async_deferred',
               voiceChatStartAt,
-              `timeout_ms=${cortexDetectTimeoutMs}`,
+              `timeout_ms=${cortexDetectTimeoutMs} reason=${voicePhaseAPolicy.reason}`,
             );
           }
           logger.info(
@@ -3962,16 +4037,7 @@ class AgentClient extends BaseClient {
       sanitizeAggregatedContentParts(this.contentParts);
       /** @deprecated Agent Chain */
       if (hideSequentialOutputs) {
-        this.contentParts = this.contentParts.filter((part, index) => {
-          // Include parts that are either:
-          // 1. At or after the finalContentStart index
-          // 2. Of type tool_call
-          // 3. Have tool_call_ids property
-          return (
-            index >= this.contentParts.length - 1 ||
-            (part && (part.type === ContentTypes.TOOL_CALL || part.tool_call_ids))
-          );
-        });
+        this.contentParts = pruneSequentialOutputPartsForPersistence(this.contentParts);
       }
 
       /* === VIVENTIUM NOTE ===
@@ -4330,5 +4396,6 @@ module.exports.handleCompletionErrorContentPart = handleCompletionErrorContentPa
 module.exports.ensureBackgroundCortexRuntimeCardGuard = ensureBackgroundCortexRuntimeCardGuard;
 module.exports.formatActivationSummary = formatActivationSummary;
 module.exports.getCortexLateDetectTimeoutMs = getCortexLateDetectTimeoutMs;
+module.exports.pruneSequentialOutputPartsForPersistence = pruneSequentialOutputPartsForPersistence;
 
 /* === VIVENTIUM END === */

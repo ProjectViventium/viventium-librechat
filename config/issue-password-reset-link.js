@@ -2,6 +2,7 @@
  * Feature: local operator-only password reset link issuance without enabling the public browser endpoint.
  * === VIVENTIUM END === */
 const path = require('path');
+const mongoose = require('mongoose');
 require('dotenv').config({ path: path.resolve(__dirname, '..', '.env') });
 require('module-alias')({ base: path.resolve(__dirname, '..', 'api') });
 
@@ -56,13 +57,17 @@ async function main() {
   const connect = require('./connect');
   const { issueLocalPasswordResetLink } = require('~/server/services/viventium/localPasswordResetService');
   await connect();
-  const payload = await issueLocalPasswordResetLink({
-    email,
-    clientOrigin: domainClient,
-  });
-  process.stdout.write(
-    JSON.stringify(payload, null, 2) + '\n',
-  );
+  try {
+    const payload = await issueLocalPasswordResetLink({
+      email,
+      clientOrigin: domainClient,
+    });
+    process.stdout.write(
+      JSON.stringify(payload, null, 2) + '\n',
+    );
+  } finally {
+    await mongoose.disconnect();
+  }
 }
 
 main().catch((error) => {

@@ -7,6 +7,7 @@ const express = require('express');
 
 let mockAssertVoiceGatewayAuth;
 let mockGetUserById;
+let mockSaveMessage;
 let mockGetMessages;
 let mockGetConvo;
 let mockVoiceIngressCreate;
@@ -21,6 +22,7 @@ let mockLastParentMessageId = null;
 let mockLastConversationId = null;
 let mockLastAgentId = null;
 let mockLastRequestText = null;
+let mockLastStreamId = null;
 let mockAgentControllerCallCount = 0;
 let mockAgentControllerResponseDelayMs = 0;
 let mockAgentControllerGeneratedConversationId = null;
@@ -74,9 +76,10 @@ jest.mock('~/server/controllers/agents/request', () => (req, res) => {
   mockLastConversationId = req.body.conversationId;
   mockLastAgentId = req.body.agent_id;
   mockLastRequestText = req.body.text;
+  mockLastStreamId = req.body.streamId;
   const respond = () =>
     res.json({
-      streamId: 'stream_voice_1',
+      streamId: req.body.streamId || 'stream_voice_1',
       conversationId:
         req.body.conversationId === 'new' && mockAgentControllerGeneratedConversationId
           ? mockAgentControllerGeneratedConversationId
@@ -104,6 +107,7 @@ jest.mock('~/server/services/viventium/CallSessionService', () => ({
 
 jest.mock('~/models', () => ({
   getUserById: (...args) => mockGetUserById(...args),
+  saveMessage: (...args) => mockSaveMessage(...args),
   getMessages: (...args) => mockGetMessages(...args),
   getConvo: (...args) => mockGetConvo(...args),
 }));
@@ -142,6 +146,7 @@ jest.mock('@librechat/api', () => ({
     getJob: jest.fn(),
     getResumeState: jest.fn(),
     subscribe: jest.fn(),
+    abortJob: jest.fn(),
   },
 }));
 
@@ -271,10 +276,20 @@ describe('/api/viventium/voice/chat', () => {
     logger.info.mockClear();
     logger.warn.mockClear();
     logger.error.mockClear();
+    const { GenerationJobManager } = require('@librechat/api');
+    GenerationJobManager.getJob.mockReset();
+    GenerationJobManager.getResumeState.mockReset();
+    GenerationJobManager.subscribe.mockReset();
+    GenerationJobManager.abortJob.mockReset();
+    GenerationJobManager.getJob.mockResolvedValue(null);
+    GenerationJobManager.getResumeState.mockResolvedValue(null);
+    GenerationJobManager.subscribe.mockResolvedValue(null);
+    GenerationJobManager.abortJob.mockResolvedValue({ success: true });
     mockLastParentMessageId = null;
     mockLastConversationId = null;
     mockLastAgentId = null;
     mockLastRequestText = null;
+    mockLastStreamId = null;
     mockAgentControllerCallCount = 0;
     mockAgentControllerResponseDelayMs = 0;
     mockAgentControllerGeneratedConversationId = null;
@@ -324,6 +339,7 @@ describe('/api/viventium/voice/chat', () => {
       listenOnlyModeEnabled: false,
     });
     mockGetUserById = jest.fn().mockResolvedValue({ _id: 'user_1', role: 'USER' });
+    mockSaveMessage = jest.fn().mockResolvedValue({});
     mockGetConvo = jest.fn().mockResolvedValue({
       conversationId: 'conv-voice-1',
       endpoint: 'agents',
@@ -375,6 +391,27 @@ describe('/api/viventium/voice/chat', () => {
     expect(mockLastConversationId).toBe('conv-voice-1');
     expect(mockLastParentMessageId).toBe('voice-assistant-leaf');
     expect(mockLastAgentId).toBe('agent_voice');
+  });
+
+  test('preserves a gateway-supplied per-turn streamId', async () => {
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      url: '/api/viventium/voice/chat',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-request-id': 'lc_req_1',
+      },
+      body: { text: 'stream this turn', streamId: 'lc_req_1' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockLastStreamId).toBe('lc_req_1');
+    expect(res.body.streamId).toBe('lc_req_1');
+    expect(mockLastConversationId).toBe('conv-voice-1');
   });
 
   test('resets invalid conversations to new and NO_PARENT', async () => {
@@ -686,6 +723,54 @@ describe('/api/viventium/voice/chat', () => {
     );
     expect(infoText).toContain('agentId=agent_voice');
     expect(infoText).toContain('requestId=req-log-1');
+  });
+
+  test('aborts a voice-owned generation stream via call-session auth', async () => {
+    const { GenerationJobManager } = require('@librechat/api');
+    GenerationJobManager.getJob.mockResolvedValue({
+      metadata: { userId: 'user_1' },
+    });
+    GenerationJobManager.abortJob.mockResolvedValue({
+      success: true,
+      text: 'partial response',
+      content: [{ type: 'text', text: 'partial response' }],
+      jobData: {
+        userMessage: { messageId: 'voice_user_abort_1' },
+        responseMessageId: 'voice_assistant_abort_1',
+        conversationId: 'conv-voice-1',
+        endpoint: 'agents',
+        model: 'agent_voice',
+      },
+    });
+
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/stream/lc_req_abort_1/abort',
+      headers: { 'x-viventium-call-secret': 'secret' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({ success: true, aborted: 'lc_req_abort_1' });
+    expect(GenerationJobManager.abortJob).toHaveBeenCalledWith('lc_req_abort_1');
+    expect(mockSaveMessage).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({
+        messageId: 'voice_assistant_abort_1',
+        parentMessageId: 'voice_user_abort_1',
+        conversationId: 'conv-voice-1',
+        text: 'partial response',
+        unfinished: true,
+        isCreatedByUser: false,
+      }),
+      expect.objectContaining({
+        context: 'api/server/routes/viventium/voice.js - voice stream abort endpoint',
+      }),
+    );
   });
 
   test('Listen-Only mode saves ambient transcripts without starting an agent stream', async () => {

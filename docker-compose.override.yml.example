@@ -139,7 +139,7 @@
 #      REDIS_PORT: 6379
 #      REDIS_PASSWORD: RedisChangeMe
 #      LANGFUSE_PUBLIC_KEY: pk-lf-RandomStringFromLangfuseWebInterface
-#      LANGFUSE_SECRET_KEY: sk-lf-RandomStringFromLangfuseWebInterface
+#      LANGFUSE_SECRET_KEY: <langfuse-secret-key>
 #      LANGFUSE_HOST: http://langfuse-server:3000
 
 # # ADD LITELLM CACHING

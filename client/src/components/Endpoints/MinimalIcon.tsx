@@ -1,4 +1,3 @@
-import { Feather } from 'lucide-react';
 import { EModelEndpoint, alternateName } from 'librechat-data-provider';
 import {
   Sparkles,
@@ -9,6 +8,7 @@ import {
   GoogleMinimalIcon,
   CustomMinimalIcon,
 } from '@librechat/client';
+import ViventiumLogoIcon from './ViventiumLogoIcon';
 import UnknownIcon from '~/hooks/Endpoint/UnknownIcon';
 import { IconProps } from '~/common';
 import { cn } from '~/utils';
@@ -43,7 +43,12 @@ const MinimalIcon: React.FC<IconProps> = (props) => {
     [EModelEndpoint.assistants]: { icon: <Sparkles className="icon-sm" />, name: 'Assistant' },
     [EModelEndpoint.azureAssistants]: { icon: <Sparkles className="icon-sm" />, name: 'Assistant' },
     [EModelEndpoint.agents]: {
-      icon: <Feather className="icon-sm" aria-hidden="true" />,
+      /* === VIVENTIUM START ===
+       * Feature: Viventium-branded agent icon fallback
+       * Purpose: Navigation/minimal agent icons use the Viventium mark instead of LibreChat's feather.
+       */
+      icon: <ViventiumLogoIcon className={cn('icon-sm', iconClassName)} />,
+      /* === VIVENTIUM END === */
       name: props.modelLabel ?? alternateName[EModelEndpoint.agents],
     },
     [EModelEndpoint.bedrock]: {

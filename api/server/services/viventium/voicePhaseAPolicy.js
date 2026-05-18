@@ -10,11 +10,14 @@
 
 const {
   collectConfiguredHoldScopeKeys,
+  collectEffectiveDirectActionScopeKeys,
   isToolHoldCandidate,
 } = require('~/server/services/viventium/brewingHold');
 
 const asBool = (value) => {
-  const raw = String(value || '').trim().toLowerCase();
+  const raw = String(value || '')
+    .trim()
+    .toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
 };
 
@@ -36,7 +39,40 @@ const hasToolHoldCandidateConfigured = (agent) =>
 const shouldAllowAsyncWhenToolHoldConfigured = () =>
   asBool(process.env.VIVENTIUM_VOICE_PHASE_A_ASYNC_ALLOW_TOOL_HOLD);
 
-function resolveVoicePhaseAAsyncPolicy({ voiceMode, agent }) {
+const normalizeScopeKey = (scopeKey) =>
+  String(scopeKey || '')
+    .trim()
+    .toLowerCase();
+
+const getUnownedToolHoldScopeKeys = (
+  agent,
+  { directActionSurfaces, agentTools, toolDefinitions } = {},
+) => {
+  const toolHoldScopeKeys = getConfiguredToolHoldScopeKeys(agent);
+  if (toolHoldScopeKeys.length === 0) {
+    return [];
+  }
+
+  const effectiveScopeKeys = new Set(
+    collectEffectiveDirectActionScopeKeys({
+      directActionSurfaces,
+      agentTools,
+      toolDefinitions,
+    }).map(normalizeScopeKey),
+  );
+
+  return toolHoldScopeKeys.filter(
+    (scopeKey) => !effectiveScopeKeys.has(normalizeScopeKey(scopeKey)),
+  );
+};
+
+function resolveVoicePhaseAAsyncPolicy({
+  voiceMode,
+  agent,
+  directActionSurfaces,
+  agentTools,
+  toolDefinitions,
+}) {
   if (!voiceMode) {
     return {
       enabled: false,
@@ -44,6 +80,7 @@ function resolveVoicePhaseAAsyncPolicy({ voiceMode, agent }) {
       forcedOff: false,
       reason: 'not_voice_mode',
       toolHoldScopeKeys: [],
+      unownedToolHoldScopeKeys: [],
     };
   }
 
@@ -55,6 +92,7 @@ function resolveVoicePhaseAAsyncPolicy({ voiceMode, agent }) {
       forcedOff: false,
       reason: 'async_not_requested',
       toolHoldScopeKeys: [],
+      unownedToolHoldScopeKeys: [],
     };
   }
 
@@ -66,6 +104,23 @@ function resolveVoicePhaseAAsyncPolicy({ voiceMode, agent }) {
       forcedOff: false,
       reason: 'enabled',
       toolHoldScopeKeys,
+      unownedToolHoldScopeKeys: [],
+    };
+  }
+
+  const unownedToolHoldScopeKeys = getUnownedToolHoldScopeKeys(agent, {
+    directActionSurfaces,
+    agentTools,
+    toolDefinitions,
+  });
+  if (unownedToolHoldScopeKeys.length === 0) {
+    return {
+      enabled: true,
+      requested: true,
+      forcedOff: false,
+      reason: 'direct_action_owned',
+      toolHoldScopeKeys,
+      unownedToolHoldScopeKeys,
     };
   }
 
@@ -76,6 +131,7 @@ function resolveVoicePhaseAAsyncPolicy({ voiceMode, agent }) {
       forcedOff: false,
       reason: 'tool_hold_override',
       toolHoldScopeKeys,
+      unownedToolHoldScopeKeys,
     };
   }
 
@@ -83,14 +139,75 @@ function resolveVoicePhaseAAsyncPolicy({ voiceMode, agent }) {
     enabled: false,
     requested: true,
     forcedOff: true,
-    reason: 'tool_hold_candidate_configured',
+    reason: 'unowned_tool_hold_candidate_configured',
     toolHoldScopeKeys,
+    unownedToolHoldScopeKeys,
+  };
+}
+
+async function resolveVoicePhaseAAsyncPolicyWithHydratedTools({
+  voiceMode,
+  agent,
+  directActionSurfaces,
+  agentTools,
+  toolDefinitions,
+  hydrateAgentTools,
+}) {
+  const initialPolicy = resolveVoicePhaseAAsyncPolicy({
+    voiceMode,
+    agent,
+    directActionSurfaces,
+    agentTools,
+    toolDefinitions,
+  });
+
+  if (
+    !initialPolicy.forcedOff ||
+    initialPolicy.reason !== 'unowned_tool_hold_candidate_configured' ||
+    typeof hydrateAgentTools !== 'function'
+  ) {
+    return initialPolicy;
+  }
+
+  const hasRequestTools =
+    (Array.isArray(agentTools) && agentTools.length > 0) ||
+    (Array.isArray(toolDefinitions) && toolDefinitions.length > 0) ||
+    (Array.isArray(agent?.tools) && agent.tools.length > 0);
+  if (hasRequestTools) {
+    return initialPolicy;
+  }
+
+  const hydratedAgent = await hydrateAgentTools(agent);
+  if (!hydratedAgent || hydratedAgent === agent) {
+    return initialPolicy;
+  }
+
+  const hydratedTools = Array.isArray(hydratedAgent.tools) ? hydratedAgent.tools : [];
+  if (hydratedTools.length === 0) {
+    return initialPolicy;
+  }
+
+  const hydratedPolicy = resolveVoicePhaseAAsyncPolicy({
+    voiceMode,
+    agent: hydratedAgent,
+    directActionSurfaces,
+    agentTools: hydratedTools,
+    toolDefinitions,
+  });
+
+  return {
+    ...hydratedPolicy,
+    hydratedToolPolicy: true,
+    initialReason: initialPolicy.reason,
+    initialUnownedToolHoldScopeKeys: initialPolicy.unownedToolHoldScopeKeys,
   };
 }
 
 module.exports = {
   resolveVoicePhaseAAsyncPolicy,
+  resolveVoicePhaseAAsyncPolicyWithHydratedTools,
   hasToolHoldCandidateConfigured,
   getConfiguredToolHoldScopeKeys,
+  getUnownedToolHoldScopeKeys,
   shouldAllowAsyncWhenToolHoldConfigured,
 };

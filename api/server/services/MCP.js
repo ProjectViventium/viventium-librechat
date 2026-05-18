@@ -62,6 +62,35 @@ const _logTelegramMcpTiming = (streamId, step, startTs, extra = '') => {
   );
 };
 /* === VIVENTIUM END === */
+
+/* === VIVENTIUM START ===
+ * Feature: MCP config-server resolution for hot-path tool initialization.
+ * Purpose: Mirror upstream LibreChat's request-scoped config resolution hook so
+ * tool-definition loading can pass pre-resolved config-source MCP servers through
+ * reinitialization without repeated registry/config work when available.
+ */
+async function resolveConfigServers(req) {
+  try {
+    const registry = getMCPServersRegistry();
+    if (typeof registry.ensureConfigServers !== 'function') {
+      return {};
+    }
+    const user = req?.user;
+    const appConfig = await getAppConfig({
+      role: user?.role,
+      userId: user?.id,
+    });
+    return await registry.ensureConfigServers(appConfig?.mcpConfig || {});
+  } catch (error) {
+    logger.warn(
+      '[resolveConfigServers] Failed to resolve config servers, degrading to empty:',
+      error,
+    );
+    return {};
+  }
+}
+/* === VIVENTIUM END === */
+
 function isEmptyObjectSchema(jsonSchema) {
   return (
     jsonSchema != null &&
@@ -797,6 +826,7 @@ module.exports = {
   createMCPTool,
   createMCPTools,
   getMCPSetupData,
+  resolveConfigServers,
   checkOAuthFlowStatus,
   getServerConnectionStatus,
 };

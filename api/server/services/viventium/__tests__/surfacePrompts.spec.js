@@ -18,6 +18,10 @@ const {
   buildCortexOutputInstructions,
   stripVoiceControlTagsForDisplay,
 } = require('../surfacePrompts');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { resetPromptRegistryForTests } = require('../promptRegistry');
 
 const CARTESIA_SONIC3_CAPABILITIES = require('../../../../../shared/voice/cartesia_sonic3_capabilities.json');
 const XAI_TTS_CAPABILITIES = require('../../../../../shared/voice/xai_tts_capabilities.json');
@@ -116,6 +120,7 @@ describe('buildTimeContextInstructions', () => {
  * === VIVENTIUM END === */
 describe('buildVoiceModeInstructions', () => {
   const originalOverride = process.env.VIVENTIUM_VOICE_MODE_PROMPT;
+  const originalPromptBundlePath = process.env.VIVENTIUM_PROMPT_BUNDLE_PATH;
 
   afterEach(() => {
     if (originalOverride === undefined) {
@@ -123,6 +128,12 @@ describe('buildVoiceModeInstructions', () => {
     } else {
       process.env.VIVENTIUM_VOICE_MODE_PROMPT = originalOverride;
     }
+    if (originalPromptBundlePath === undefined) {
+      delete process.env.VIVENTIUM_PROMPT_BUNDLE_PATH;
+    } else {
+      process.env.VIVENTIUM_PROMPT_BUNDLE_PATH = originalPromptBundlePath;
+    }
+    resetPromptRegistryForTests();
   });
 
   test('cartesia branch includes emotion tag guidance', () => {
@@ -184,10 +195,43 @@ describe('buildVoiceModeInstructions', () => {
   test('generic fallback returns base rules only', () => {
     const result = buildVoiceModeInstructions('some_unknown_provider');
     expect(result).toContain('VOICE MODE:');
+    expect(result).toContain('outputting exactly {NTA}');
     // Generic has no tag-specific guidance at all.
     expect(result).not.toContain('<emotion');
     expect(result).not.toContain('[laughter]');
     expect(result).not.toContain('[laugh]');
+  });
+
+  test('compiled voice prompt bundle carries cut-off {NTA} rule', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-voice-prompt-bundle-'));
+    const bundlePath = path.join(dir, 'prompt-bundle.json');
+    fs.writeFileSync(
+      bundlePath,
+      JSON.stringify({
+        prompt_count: 2,
+        prompts: {
+          'surface.voice.call': {
+            metadata: {},
+            body: [
+              'VOICE MODE:',
+              '- If a spoken turn clearly sounds unfinished, cut off, or like the user is still gathering the thought, stay silent by outputting exactly {NTA} instead of answering an assumed intent.',
+            ].join('\n'),
+          },
+          'surface.voice.provider.cartesia': {
+            metadata: { includes: ['surface.voice.call'] },
+            body: 'Cartesia provider rules.',
+          },
+        },
+      }),
+      'utf8',
+    );
+    process.env.VIVENTIUM_PROMPT_BUNDLE_PATH = bundlePath;
+    resetPromptRegistryForTests();
+
+    const result = buildVoiceModeInstructions('cartesia');
+
+    expect(result).toContain('outputting exactly {NTA}');
+    expect(result).toContain('Cartesia provider rules.');
   });
 
   test('override env replaces all rules', () => {

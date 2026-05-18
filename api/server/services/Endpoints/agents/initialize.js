@@ -43,6 +43,10 @@ const { logViolation } = require('~/cache');
 const {
   sanitizeAggregatedContentParts,
 } = require('~/server/services/viventium/sanitizeAggregatedContentParts');
+const {
+  extractVisibleTextFromContentParts,
+  repairMissedVoiceMessageDelta,
+} = require('~/server/services/viventium/voiceDeltaAggregation');
 const db = require('~/models');
 const { isDeepTimingEnabled } = require('~/server/services/viventium/telegramTimingDeep');
 /* === VIVENTIUM START ===
@@ -90,7 +94,8 @@ const logVoiceInitLatencyStage = (req, stage, stageStartAt = null, details = '')
     return;
   }
   const now = Date.now();
-  const routeStartAt = typeof req?.viventiumVoiceStartAt === 'number' ? req.viventiumVoiceStartAt : now;
+  const routeStartAt =
+    typeof req?.viventiumVoiceStartAt === 'number' ? req.viventiumVoiceStartAt : now;
   const requestId = getVoiceLatencyRequestId(req);
   const stageMs = calcVoiceStageMs(stageStartAt);
   const stagePart = stageMs == null ? '' : ` stage_ms=${stageMs}`;
@@ -253,6 +258,9 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
         primaryToolRegistry: 0,
         primaryMcpAuthServers: 0,
         primaryToolHash: 'none',
+        fallbackMode: 'none',
+        fallbackProvider: 'none',
+        fallbackModel: 'none',
         handoffToolDefinitions: 0,
         handoffToolRegistry: 0,
         handoffMcpAuthServers: 0,
@@ -288,14 +296,16 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
     );
   };
   const nowIfDeep = () => (deepTimingEnabled ? performance.now() : null);
-  const wrapDb = (name, fn) => async (...args) => {
-    const t = nowIfDeep();
-    try {
-      return await fn(...args);
-    } finally {
-      logDeep(`db_${name}`, t);
-    }
-  };
+  const wrapDb =
+    (name, fn) =>
+    async (...args) => {
+      const t = nowIfDeep();
+      try {
+        return await fn(...args);
+      } finally {
+        logDeep(`db_${name}`, t);
+      }
+    };
   const dbMethods = deepTimingEnabled
     ? {
         getConvoFiles: wrapDb('get_convo_files', getConvoFiles),
@@ -340,8 +350,39 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
   const artifactPromises = [];
   const { contentParts, aggregateContent: rawAggregateContent } = createContentAggregator();
   const aggregateContent = (event) => {
+    /* === VIVENTIUM START ===
+     * Feature: Voice streamed-delta persistence parity.
+     *
+     * Purpose:
+     * - Preserve the same assistant text LiveKit heard in the canonical Mongo message.
+     * - Repair only the upstream aggregation miss where `on_message_delta` was emitted but
+     *   `contentParts` text did not advance.
+     * === VIVENTIUM END === */
+    const shouldRepairVoiceDelta = req?.body?.voiceMode === true;
+    const beforeVoiceText = shouldRepairVoiceDelta
+      ? extractVisibleTextFromContentParts(contentParts)
+      : '';
     rawAggregateContent(event);
     sanitizeAggregatedContentParts(contentParts);
+    if (shouldRepairVoiceDelta) {
+      const afterVoiceText = extractVisibleTextFromContentParts(contentParts);
+      const repaired = repairMissedVoiceMessageDelta({
+        contentParts,
+        event: event?.event,
+        data: event?.data,
+        beforeText: beforeVoiceText,
+        afterText: afterVoiceText,
+      });
+      if (repaired) {
+        sanitizeAggregatedContentParts(contentParts);
+        if (!req._viventiumVoiceDeltaAggregationRepairLogged) {
+          req._viventiumVoiceDeltaAggregationRepairLogged = true;
+          logger.warn(
+            `[VIVENTIUM][VoiceDeltaAggregation] Repaired missed voice message delta streamId=${streamId || 'none'}`,
+          );
+        }
+      }
+    }
   };
   const toolEndCallback = createToolEndCallback({ req, res, artifactPromises, streamId });
 
@@ -550,10 +591,34 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
   }
   logDeep('initialize_agent_primary', initPrimaryStart);
 
-  /* === VIVENTIUM START === Agent Fallback LLM initialization */
+  /* === VIVENTIUM START ===
+   * Feature: Agent Fallback LLM lazy initialization
+   * Purpose: Validate fallback eligibility during agent setup, but avoid loading
+   * fallback tools/MCP state on the healthy primary path. This preserves the
+   * one-shot fallback behavior while removing fallback-only MCP init from voice
+   * first-audio latency.
+   * Updated: 2026-05-14
+   */
   if (fallbackAgent && fallbackAssignment) {
-    try {
-      const fallbackConfig = await initializeAgent(
+    if (voiceLatencyEnabled && voiceInitSummary) {
+      voiceInitSummary.fallbackMode = 'lazy';
+      voiceInitSummary.fallbackProvider = fallbackAssignment.provider;
+      voiceInitSummary.fallbackModel = fallbackAssignment.model;
+    }
+    primaryConfig.viventiumFallbackLlmAssignment = {
+      provider: fallbackAssignment.provider,
+      model: fallbackAssignment.model,
+    };
+    let fallbackConfigPromise = null;
+    const materializeFallbackLlm = async () => {
+      if (primaryConfig.viventiumFallbackLlm) {
+        return primaryConfig.viventiumFallbackLlm;
+      }
+      if (fallbackConfigPromise) {
+        return fallbackConfigPromise;
+      }
+      const voiceFallbackInitStart = voiceLatencyEnabled ? Date.now() : null;
+      fallbackConfigPromise = initializeAgent(
         {
           req,
           res,
@@ -567,20 +632,44 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
           isInitialAgent: false,
         },
         dbMethods,
-      );
-      primaryConfig.viventiumFallbackLlm = fallbackConfig;
-      primaryConfig.viventiumFallbackLlmAssignment = {
-        provider: fallbackAssignment.provider,
-        model: fallbackAssignment.model,
-      };
-      logger.info(
-        `[agentLlmFallback] Prepared fallback model for agent ${primaryConfig.id}: ${fallbackAssignment.provider}/${fallbackAssignment.model}`,
-      );
-    } catch (error) {
-      logger.warn(
-        `[agentLlmFallback] Failed to initialize fallback model ${fallbackAssignment.provider}/${fallbackAssignment.model} for agent ${primaryAgent.id}: ${error?.message || error}`,
-      );
-    }
+      )
+        .then((fallbackConfig) => {
+          primaryConfig.viventiumFallbackLlm = fallbackConfig;
+          if (voiceLatencyEnabled) {
+            const fallbackToolSummary = summarizeInitTools(fallbackConfig);
+            logVoiceInitLatencyStage(
+              req,
+              'initialize_client_fallback_agent_done',
+              voiceFallbackInitStart,
+              `stage_key=initialize_fallback tool_defs=${fallbackToolSummary.toolDefinitionsCount} ` +
+                `tool_registry=${fallbackToolSummary.toolRegistrySize} ` +
+                `mcp_auth_servers=${fallbackToolSummary.mcpAuthServers} ` +
+                `tool_hash=${fallbackToolSummary.toolNamesHash}`,
+            );
+          }
+          logger.info(
+            `[agentLlmFallback] Prepared fallback model for agent ${primaryConfig.id}: ${fallbackAssignment.provider}/${fallbackAssignment.model}`,
+          );
+          return fallbackConfig;
+        })
+        .catch((error) => {
+          fallbackConfigPromise = null;
+          logger.warn(
+            `[agentLlmFallback] Failed to initialize fallback model ${fallbackAssignment.provider}/${fallbackAssignment.model} for agent ${primaryAgent.id}: ${error?.message || error}`,
+          );
+          return null;
+        });
+      return fallbackConfigPromise;
+    };
+    Object.defineProperty(primaryConfig, 'viventiumFallbackLlmInitializer', {
+      value: materializeFallbackLlm,
+      configurable: true,
+      enumerable: false,
+      writable: false,
+    });
+    logger.info(
+      `[agentLlmFallback] Validated lazy fallback model for agent ${primaryConfig.id}: ${fallbackAssignment.provider}/${fallbackAssignment.model}`,
+    );
   }
   /* === VIVENTIUM END === */
 
@@ -877,6 +966,11 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
     summaryParts.push(`primary_tool_registry=${voiceInitSummary.primaryToolRegistry}`);
     summaryParts.push(`primary_mcp_auth_servers=${voiceInitSummary.primaryMcpAuthServers}`);
     summaryParts.push(`primary_tool_hash=${voiceInitSummary.primaryToolHash}`);
+    summaryParts.push(`fallback_mode=${voiceInitSummary.fallbackMode}`);
+    if (voiceInitSummary.fallbackMode !== 'none') {
+      summaryParts.push(`fallback_provider=${voiceInitSummary.fallbackProvider}`);
+      summaryParts.push(`fallback_model=${voiceInitSummary.fallbackModel}`);
+    }
     logger.info(summaryParts.join(' '));
   }
   /* === VIVENTIUM END === */

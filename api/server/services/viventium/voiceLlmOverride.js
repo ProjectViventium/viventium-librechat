@@ -9,9 +9,7 @@
 
 const { logger } = require('@librechat/data-schemas');
 const { resolveViventiumSurface } = require('./surfacePrompts');
-const {
-  readVoiceAssignment,
-} = require('../../../../scripts/viventium-agent-runtime-models');
+const { readVoiceAssignment } = require('../../../../scripts/viventium-agent-runtime-models');
 
 const PROVIDER_ENV_KEYS = Object.freeze({
   anthropic: ['ANTHROPIC_API_KEY'],
@@ -23,7 +21,9 @@ const PROVIDER_ENV_KEYS = Object.freeze({
 });
 
 function normalizeProvider(provider) {
-  const raw = String(provider || '').trim().toLowerCase();
+  const raw = String(provider || '')
+    .trim()
+    .toLowerCase();
   if (!raw) {
     return '';
   }
@@ -61,14 +61,12 @@ function resolveVoiceOverrideAssignment(agent) {
 
   const explicitProvider = normalizeProvider(agent.voice_llm_provider);
   const explicitModel = String(agent.voice_llm_model || '').trim();
-  const assignment = readVoiceAssignment(
-    {
-      explicitProvider,
-      explicitModel,
-      mainProvider: agent.provider,
-      mainModel: agent.model || agent.model_parameters?.model || '',
-    },
-  );
+  const assignment = readVoiceAssignment({
+    explicitProvider,
+    explicitModel,
+    mainProvider: agent.provider,
+    mainModel: agent.model || agent.model_parameters?.model || '',
+  });
 
   if (!assignment) {
     return null;
@@ -137,10 +135,57 @@ function cloneModelParameters(value) {
   return { ...value };
 }
 
-function resolveVoiceModelParameters(agent, voiceLlmModel) {
+/* === VIVENTIUM START ===
+ * Feature: provider-aware voice parameter normalization.
+ * Purpose: A voice model override may intentionally change providers. When it does, provider-
+ * specific thinking fields from the main model must not leak into the voice call request. xAI
+ * Grok 4.3 uses `reasoning_effort: "none"` for no-reasoning Chat Completions, not Anthropic
+ * `thinking: false`.
+ * === VIVENTIUM END === */
+function hasOwn(value, key) {
+  return Object.prototype.hasOwnProperty.call(value || {}, key);
+}
+
+function normalizeVoiceModelParametersForProvider(parameters, voiceParams, provider) {
+  const resolved = cloneModelParameters(parameters);
+  if (normalizeProvider(provider) !== 'xai') {
+    return resolved;
+  }
+
+  const voiceThinkingDisabled = voiceParams?.thinking === false;
+  const voiceReasoningEffortConfigured =
+    hasOwn(voiceParams, 'reasoning_effort') && String(voiceParams.reasoning_effort || '').trim();
+
+  delete resolved.thinking;
+  delete resolved.thinkingBudget;
+  delete resolved.thinkingLevel;
+  delete resolved.effort;
+
+  if (
+    resolved.useResponsesApi !== true &&
+    !resolved.reasoning_effort &&
+    resolved.reasoning &&
+    typeof resolved.reasoning === 'object' &&
+    typeof resolved.reasoning.effort === 'string'
+  ) {
+    resolved.reasoning_effort = resolved.reasoning.effort;
+  }
+  if (resolved.useResponsesApi !== true) {
+    delete resolved.reasoning;
+  }
+
+  if (voiceThinkingDisabled && !voiceReasoningEffortConfigured) {
+    resolved.reasoning_effort = 'none';
+  }
+
+  return resolved;
+}
+
+function resolveVoiceModelParameters(agent, voiceLlmModel, voiceProvider) {
+  const voiceParams = cloneModelParameters(agent?.voice_llm_model_parameters);
   const resolved = {
     ...cloneModelParameters(agent?.model_parameters),
-    ...cloneModelParameters(agent?.voice_llm_model_parameters),
+    ...voiceParams,
   };
 
   const model = String(voiceLlmModel || agent?.voice_llm_model || '').trim();
@@ -148,7 +193,7 @@ function resolveVoiceModelParameters(agent, voiceLlmModel) {
     resolved.model = model;
   }
 
-  return resolved;
+  return normalizeVoiceModelParametersForProvider(resolved, voiceParams, voiceProvider);
 }
 
 /**
@@ -187,7 +232,21 @@ function applyVoiceModelOverride(agent, req, modelsConfig) {
 
   agent.model = voiceLlmModel;
   agent.provider = voiceProvider;
-  agent.model_parameters = resolveVoiceModelParameters(agent, voiceLlmModel);
+  agent.model_parameters = resolveVoiceModelParameters(agent, voiceLlmModel, voiceProvider);
+  /* === VIVENTIUM START ===
+   * Feature: Voice LLM no-reasoning diagnostics.
+   * Purpose: Log only non-secret provider/model reasoning knobs so live voice QA can prove the
+   * DB-level voice profile was applied before the provider request is built.
+   * Added: 2026-05-14
+   */
+  logger.info(
+    `[voiceLlmOverride] Voice model parameters normalized: provider=${voiceProvider} model=${voiceLlmModel} ` +
+      `reasoning_effort=${agent.model_parameters?.reasoning_effort ?? 'unset'} ` +
+      `reasoning.effort=${agent.model_parameters?.reasoning?.effort ?? 'unset'} ` +
+      `include_reasoning=${agent.model_parameters?.include_reasoning ?? 'unset'} ` +
+      `thinking=${agent.model_parameters?.thinking ?? 'unset'}`,
+  );
+  /* === VIVENTIUM END === */
 
   return agent;
 }
@@ -197,5 +256,6 @@ module.exports = {
   isVoiceModelValid,
   resolveVoiceOverrideAssignment,
   resolveVoiceModelParameters,
+  normalizeVoiceModelParametersForProvider,
   applyVoiceModelOverride,
 };

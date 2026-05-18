@@ -76,7 +76,7 @@ const { formatResultsForLLM } = require(
 /* === VIVENTIUM START ===
  * Feature: Evidence-oriented web_search fallback output.
  * === VIVENTIUM END === */
-const { getWebSearchFallbackOutput } = require('./modelFacingToolOutput');
+const { classifyWebSearchFailure, getWebSearchFallbackOutput } = require('./modelFacingToolOutput');
 const { sanitizeSearchResult, sanitizeSearchResultData } = require('./viventiumWebSearchSafety');
 const { createViventiumSearXNGAPI } = require('./viventiumSearxngSearch');
 const { planSearchQueries, rerankSearchResultData } = require('./viventiumSearchStrategy');
@@ -411,7 +411,16 @@ function createTool({ schema, search }) {
       });
 
       const turn = runnableConfig?.toolCall?.turn ?? 0;
-      const formatInput = structuredClone(searchResult);
+      const searchError = searchResult?.error;
+      const failureClass = searchError ? classifyWebSearchFailure(searchError) : undefined;
+      const safeSearchResult = searchError
+        ? {
+            ...searchResult,
+            error: getWebSearchFallbackOutput({ error: searchError, hasError: true }),
+            failureClass,
+          }
+        : searchResult;
+      const formatInput = structuredClone(safeSearchResult);
       const { output, references } = formatResultsForLLM(turn, formatInput);
       const data = {
         turn,
@@ -420,7 +429,12 @@ function createTool({ schema, search }) {
       };
 
       return [
-        output || getWebSearchFallbackOutput({ hasError: Boolean(searchResult?.error) }),
+        output ||
+          getWebSearchFallbackOutput({
+            error: searchError,
+            hasError: Boolean(searchError),
+            failureClass,
+          }),
         { [Constants.WEB_SEARCH]: data },
       ];
     },
@@ -562,6 +576,7 @@ function createViventiumSearchTool(config = {}) {
 
 module.exports = {
   DATE_RANGE,
+  createTool,
   createViventiumSearchTool,
   normalizeFirecrawlApiUrl,
 };

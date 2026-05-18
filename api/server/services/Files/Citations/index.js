@@ -59,7 +59,10 @@ async function processFileCitations({ user, appConfig, toolArtifact, toolCallId,
       appConfig.endpoints?.[EModelEndpoint.agents]?.minRelevanceScore ?? 0.45;
 
     const sources = toolArtifact[Tools.file_search].sources || [];
-    const filteredSources = sources.filter((source) => source.relevance >= minRelevanceScore);
+    const filteredSources = sources.filter(
+      (source) =>
+        source.relevance >= minRelevanceScore || isMeetingTranscriptCitationSource(source),
+    );
     if (filteredSources.length === 0) {
       logger.debug(
         `[processFileCitations] No sources above relevance threshold of ${minRelevanceScore}`,
@@ -90,6 +93,15 @@ async function processFileCitations({ user, appConfig, toolArtifact, toolCallId,
   }
 }
 
+function isMeetingTranscriptCitationSource(source) {
+  const fileId = String(source?.fileId || '');
+  return (
+    fileId.startsWith('meeting_transcript:') ||
+    fileId.startsWith('meeting_summary:') ||
+    fileId.startsWith('meeting_inventory:')
+  );
+}
+
 /**
  * Apply citation limits to sources
  * @param {Array} sources - All sources
@@ -113,7 +125,22 @@ function applyCitationLimits(sources, maxCitations, maxCitationsPerFile) {
     representatives.push(...selectedFromFile);
   }
 
-  return representatives.sort((a, b) => b.relevance - a.relevance).slice(0, maxCitations);
+  return representatives
+    .sort((a, b) => {
+      const aOrder = Number.isFinite(a?.sourceOrder) ? a.sourceOrder : null;
+      const bOrder = Number.isFinite(b?.sourceOrder) ? b.sourceOrder : null;
+      if (aOrder !== null && bOrder !== null && aOrder !== bOrder) {
+        return aOrder - bOrder;
+      }
+      if (aOrder !== null) {
+        return -1;
+      }
+      if (bOrder !== null) {
+        return 1;
+      }
+      return b.relevance - a.relevance;
+    })
+    .slice(0, maxCitations);
 }
 
 /**

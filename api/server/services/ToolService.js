@@ -59,6 +59,7 @@ const { manifestToolMap, toolkits } = require('~/app/clients/tools/manifest');
 const { createOnSearchResults } = require('~/server/services/Tools/search');
 const { loadAuthValues } = require('~/server/services/Tools/credentials');
 const { reinitMCPServer } = require('~/server/services/Tools/mcp');
+const { resolveConfigServers } = require('~/server/services/MCP');
 const { recordUsage } = require('~/server/services/Threads');
 const { loadTools } = require('~/app/clients/tools/util');
 const { redactMessage } = require('~/config/parsers');
@@ -80,6 +81,113 @@ const {
 } = require('~/server/services/viventium/mcpOAuthPolicy');
 // === VIVENTIUM END ===
 const VIVENTIUM_GLASSHIVE_MCP_SERVER_NAME = 'glasshive-workers-projects';
+/* === VIVENTIUM START ===
+ * Feature: Voice/MCP latency guardrails.
+ * Purpose: Avoid repeating OAuth-pending MCP probes on every voice/fallback init
+ * while preserving the same pending-OAuth strip/wait behavior.
+ */
+const MCP_OAUTH_PENDING_MEMO_MAX_SIZE = 1000;
+const DEFAULT_MCP_OAUTH_PENDING_MEMO_TTL_MS = 45_000;
+const MAX_MCP_OAUTH_PENDING_MEMO_TTL_MS = 5 * 60_000;
+const mcpOAuthPendingMemo = new Map();
+
+const parseBoundedPositiveInt = (value, fallback, max) => {
+  const parsed = Number.parseInt(String(value || ''), 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return fallback;
+  }
+  return Math.min(parsed, max);
+};
+
+const getMcpOAuthPendingMemoTtlMs = () =>
+  parseBoundedPositiveInt(
+    process.env.VIVENTIUM_MCP_OAUTH_PENDING_MEMO_TTL_MS,
+    DEFAULT_MCP_OAUTH_PENDING_MEMO_TTL_MS,
+    MAX_MCP_OAUTH_PENDING_MEMO_TTL_MS,
+  );
+
+const getMcpOAuthPendingMemoKey = (userId, serverName) =>
+  `${String(userId || 'unknown')}:${String(serverName || 'unknown')}`;
+
+const evictOldestMcpOAuthPendingMemo = () => {
+  while (mcpOAuthPendingMemo.size > MCP_OAUTH_PENDING_MEMO_MAX_SIZE) {
+    const oldestKey = mcpOAuthPendingMemo.keys().next().value;
+    if (!oldestKey) {
+      return;
+    }
+    mcpOAuthPendingMemo.delete(oldestKey);
+  }
+};
+
+const readMcpOAuthPendingMemo = ({ userId, serverName, now = Date.now() }) => {
+  const key = getMcpOAuthPendingMemoKey(userId, serverName);
+  const entry = mcpOAuthPendingMemo.get(key);
+  if (!entry) {
+    return null;
+  }
+  if (!Number.isFinite(entry.expiresAt) || entry.expiresAt <= now) {
+    mcpOAuthPendingMemo.delete(key);
+    return null;
+  }
+  return entry;
+};
+
+const writeMcpOAuthPendingMemo = ({
+  userId,
+  serverName,
+  reason = 'oauth_pending',
+  now = Date.now(),
+}) => {
+  const ttlMs = getMcpOAuthPendingMemoTtlMs();
+  if (ttlMs <= 0) {
+    return null;
+  }
+  const key = getMcpOAuthPendingMemoKey(userId, serverName);
+  const entry = {
+    reason,
+    createdAt: now,
+    expiresAt: now + ttlMs,
+  };
+  mcpOAuthPendingMemo.set(key, entry);
+  evictOldestMcpOAuthPendingMemo();
+  return entry;
+};
+
+const clearMcpOAuthPendingMemo = ({ userId, serverName } = {}) => {
+  if (userId && serverName) {
+    mcpOAuthPendingMemo.delete(getMcpOAuthPendingMemoKey(userId, serverName));
+    return;
+  }
+  mcpOAuthPendingMemo.clear();
+};
+
+const isVoiceLatencyEnabled = (req) => req?.viventiumVoiceLogLatency === true;
+
+const getVoiceLatencyRequestId = (req) => {
+  const requestId = req?.viventiumVoiceRequestId;
+  if (typeof requestId === 'string' && requestId.length > 0) {
+    return requestId;
+  }
+  return 'unknown';
+};
+
+const logVoiceToolLatencyStage = (req, stage, stageStartAt = null, details = '') => {
+  if (!isVoiceLatencyEnabled(req)) {
+    return;
+  }
+  const now = Date.now();
+  const routeStartAt =
+    typeof req?.viventiumVoiceStartAt === 'number' ? req.viventiumVoiceStartAt : now;
+  const stageMs =
+    typeof stageStartAt === 'number' && now >= stageStartAt
+      ? ` stage_ms=${now - stageStartAt}`
+      : '';
+  const detailPart = details ? ` ${details}` : '';
+  logger.info(
+    `[VoiceLatency][LC] stage=${stage} request_id=${getVoiceLatencyRequestId(req)} total_ms=${now - routeStartAt}${stageMs}${detailPart}`,
+  );
+};
+/* === VIVENTIUM END === */
 /**
  * Processes the required actions by calling the appropriate tools and returning the outputs.
  * @param {OpenAIClient} client - OpenAI or StreamRunManager Client.
@@ -504,6 +612,13 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
 
   const flowsCache = getLogStores(CacheKeys.FLOWS);
   const flowManager = getFlowStateManager(flowsCache);
+  /* === VIVENTIUM START ===
+   * Feature: MCP config-server hot-path plumbing.
+   * Purpose: Follow upstream LibreChat's request-scoped config resolution pattern
+   * so MCP reinit can reuse config-source server state when the registry supports it.
+   */
+  const configServers = await resolveConfigServers(req);
+  /* === VIVENTIUM END === */
   const pendingOAuthServers = new Set();
 
   const createOAuthEmitter = (serverName) => {
@@ -558,12 +673,17 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
   // Feature: Skip MCP reinit for intentionally-disabled local services.
   // Purpose: avoid per-turn latency spikes (reconnect retries) when stack flags skip MCP servers.
   const isMCPServerDisabledByEnv = (serverName) => {
-    const normalized = String(serverName || '').trim().toLowerCase();
+    const normalized = String(serverName || '')
+      .trim()
+      .toLowerCase();
     if (!normalized) {
       return false;
     }
 
-    const isFalse = (value) => String(value || '').trim().toLowerCase() === 'false';
+    const isFalse = (value) =>
+      String(value || '')
+        .trim()
+        .toLowerCase() === 'false';
 
     if (normalized === 'scheduling-cortex' && isFalse(process.env.START_SCHEDULING_MCP)) {
       return true;
@@ -585,22 +705,43 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
   // === VIVENTIUM END ===
 
   const getOrFetchMCPServerTools = async (userId, serverName) => {
+    const fetchStart = Date.now();
+    const logFetchDone = (outcome, extra = '') => {
+      logVoiceToolLatencyStage(
+        req,
+        'mcp_definition_fetch_done',
+        fetchStart,
+        `server=${serverName} outcome=${outcome}${extra ? ` ${extra}` : ''}`,
+      );
+    };
+
     // === VIVENTIUM START ===
     if (isMCPServerDisabledByEnv(serverName)) {
       logger.info(
         `[Tool Definitions] Skipping MCP server ${serverName} because it is disabled by env`,
       );
+      logFetchDone('disabled_by_env');
       return null;
     }
     // === VIVENTIUM END ===
 
     const cached = await getMCPServerTools(userId, serverName);
     if (cached) {
+      clearMcpOAuthPendingMemo({ userId, serverName });
+      logFetchDone('cache_hit', `tools=${Object.keys(cached).length}`);
       return cached;
+    }
+
+    const pendingMemo = readMcpOAuthPendingMemo({ userId, serverName });
+    if (pendingMemo) {
+      pendingOAuthServers.add(serverName);
+      logFetchDone('oauth_pending_memo_hit', `reason=${pendingMemo.reason}`);
+      return null;
     }
 
     const oauthStart = async () => {
       pendingOAuthServers.add(serverName);
+      writeMcpOAuthPendingMemo({ userId, serverName, reason: 'oauth_pending' });
     };
 
     const result = await reinitMCPServer({
@@ -608,10 +749,24 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
       oauthStart,
       flowManager,
       serverName,
+      configServers,
       userMCPAuthMap,
     });
 
-    return result?.availableTools || null;
+    if (result?.availableTools) {
+      clearMcpOAuthPendingMemo({ userId, serverName });
+      logFetchDone('reinit_success', `tools=${Object.keys(result.availableTools).length}`);
+      return result.availableTools;
+    }
+
+    if (pendingOAuthServers.has(serverName) || result?.oauthRequired) {
+      writeMcpOAuthPendingMemo({ userId, serverName, reason: 'oauth_pending' });
+      logFetchDone('oauth_pending', `oauth_required=${Boolean(result?.oauthRequired)}`);
+      return null;
+    }
+
+    logFetchDone('reinit_no_tools', `success=${Boolean(result?.success)}`);
+    return null;
   };
 
   const getActionToolDefinitions = async (agentId, actionToolNames) => {
@@ -715,11 +870,9 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
 
     if (!waitForOAuth) {
       logger.info(
-        `[Tool Definitions] OAuth wait skipped (surface=${surface}, mode=${mode}, specializedAlternatives=${hasSpecializedAlternatives}, relevant=${relevantPendingOAuthServers.join(
-          ', ',
-        ) || 'none'}) for server(s): ${serverNames.join(
-          ', ',
-        )}`,
+        `[Tool Definitions] OAuth wait skipped (surface=${surface}, mode=${mode}, specializedAlternatives=${hasSpecializedAlternatives}, relevant=${
+          relevantPendingOAuthServers.join(', ') || 'none'
+        }) for server(s): ${serverNames.join(', ')}`,
       );
     }
 
@@ -734,6 +887,7 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
           const result = await reinitMCPServer({
             user: req.user,
             serverName,
+            configServers,
             userMCPAuthMap,
             flowManager,
             returnOnOAuth: false,
@@ -742,6 +896,7 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
           });
 
           if (result?.availableTools) {
+            clearMcpOAuthPendingMemo({ userId: req.user.id, serverName });
             logger.info(`[Tool Definitions] OAuth completed for ${serverName}, tools available`);
             return { serverName, success: true };
           }
@@ -1518,4 +1673,10 @@ module.exports = {
   loadAgentTools,
   loadToolsForExecution,
   processRequiredActions,
+  __testables: {
+    readMcpOAuthPendingMemo,
+    writeMcpOAuthPendingMemo,
+    clearMcpOAuthPendingMemo,
+    getMcpOAuthPendingMemoTtlMs,
+  },
 };

@@ -62,6 +62,37 @@ function visibleMessageText(message) {
   return isPlaceholderAssistantText(contentText) ? '' : contentText;
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Durable assistant text mirror for content-part responses.
+ *
+ * Why:
+ * Agent streaming can persist the final visible answer in `content[]` while leaving the legacy
+ * `text` field empty. LibreChat still uses `text` for history, recall, exports, and some reload
+ * paths, so every save path that reaches the Message model must mirror visible text parts without
+ * leaking reasoning/tool-only content.
+ * === VIVENTIUM END === */
+function shouldMirrorContentTextToMessageText(update) {
+  if (!update || update.isCreatedByUser === true || !Array.isArray(update.content)) {
+    return false;
+  }
+  const incomingText = typeof update.text === 'string' ? update.text.trim() : '';
+  return incomingText === '' || isPlaceholderAssistantText(incomingText);
+}
+
+function mirrorContentTextToMessageText(update) {
+  if (!shouldMirrorContentTextToMessageText(update)) {
+    return update;
+  }
+  const contentText = textFromContentParts(update.content);
+  if (!contentText || isPlaceholderAssistantText(contentText)) {
+    return update;
+  }
+  return {
+    ...update,
+    text: contentText,
+  };
+}
+
 function contentHasCortexPart(content) {
   return Array.isArray(content) && content.some((part) => CORTEX_CONTENT_TYPES.has(part?.type));
 }
@@ -180,6 +211,7 @@ async function saveMessage(req, params, metadata) {
      * A later cortex-only write must not erase an already-saved main answer; background cards are
      * additive and the original Phase A answer remains durable.
      * === VIVENTIUM END === */
+    update = mirrorContentTextToMessageText(update);
     if (shouldPreserveExistingAssistantText(update)) {
       const existing = await Message.findOne({
         messageId: params.messageId,
@@ -619,5 +651,7 @@ module.exports = {
     shouldPreserveExistingAssistantText,
     isPlaceholderAssistantText,
     visibleMessageText,
+    shouldMirrorContentTextToMessageText,
+    mirrorContentTextToMessageText,
   },
 };

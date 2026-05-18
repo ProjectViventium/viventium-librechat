@@ -1,15 +1,21 @@
 meta:
   version: 1
-  exportedAt: null
+  exportedAt:
   user:
-    email: user@viventium.local
+    email: user@example.com
     id: placeholder-owner
   mainAgentId: agent_viventium_main_95aeb3
 config:
   viventium:
     background_cortices:
       activation_format:
-        response_format: "Respond with a JSON object:\n{\n  \"should_activate\": true,\n  \"confidence\": 1.0,\n  \"reason\": \"2-4 explanatory words\"\n}\n"
+        response_format: |
+          Respond with a JSON object:
+          {
+            "should_activate": true,
+            "confidence": 1.0,
+            "reason": "2-4 explanatory words"
+          }
         brew_begin_tag: <!--viv_internal:brew_begin-->
       activation_subject_rule:
         enabled: true
@@ -17,86 +23,118 @@ config:
           promptRef: cortex.background_activation_decision_subject
       activation_policy:
         enabled: true
-        prompt:
-          promptRef: cortex.background_activation_policy
-        direct_action_mcp_servers:
-        - server: glasshive-workers-projects
-          owns: persistent workers, project runs, browser/desktop/local computer execution, worker status, and completion reports
-          tool_names:
-          - sys__server__sys_mcp_glasshive-workers-projects
-          - projects_list_mcp_glasshive-workers-projects
-          - project_create_mcp_glasshive-workers-projects
-          - worker_delegate_once_mcp_glasshive-workers-projects
-          - project_get_mcp_glasshive-workers-projects
-          - project_runs_mcp_glasshive-workers-projects
-          - project_events_mcp_glasshive-workers-projects
-          - workers_list_mcp_glasshive-workers-projects
-          - worker_create_mcp_glasshive-workers-projects
-          - worker_find_or_resume_mcp_glasshive-workers-projects
-          - worker_get_mcp_glasshive-workers-projects
-          - worker_live_mcp_glasshive-workers-projects
-          - worker_run_mcp_glasshive-workers-projects
-          - worker_message_mcp_glasshive-workers-projects
-          - worker_pause_mcp_glasshive-workers-projects
-          - worker_resume_mcp_glasshive-workers-projects
-          - worker_interrupt_mcp_glasshive-workers-projects
-          - worker_terminate_mcp_glasshive-workers-projects
-          - worker_desktop_action_mcp_glasshive-workers-projects
-          - worker_takeover_mcp_glasshive-workers-projects
-          - run_get_mcp_glasshive-workers-projects
-        - server: scheduling-cortex
-          owns: reminders, scheduled follow-ups, same-conversation wakeups, delayed status checks, and schedule management
-          tool_names:
-          - sys__server__sys_mcp_scheduling-cortex
-          - schedule_create_mcp_scheduling-cortex
-          - schedule_get_mcp_scheduling-cortex
-          - schedule_list_mcp_scheduling-cortex
-          - schedule_search_mcp_scheduling-cortex
-          - schedule_last_delivery_mcp_scheduling-cortex
-          - schedule_update_mcp_scheduling-cortex
-          - schedule_delete_mcp_scheduling-cortex
-          - schedule_preview_next_mcp_scheduling-cortex
-        - server: google-workspace
-          scope_key: productivity_google_workspace
-          same_scope_background_allowed: true
-          owns: live Gmail, Google Calendar, Google Drive, Docs, Sheets, Slides, Chat, Tasks, and Workspace actions available to the main agent
-          tool_names:
-          - sys__server__sys_mcp_google_workspace
-          - search_gmail_messages_mcp_google_workspace
-          - get_gmail_message_content_mcp_google_workspace
-          - get_gmail_messages_content_batch_mcp_google_workspace
-          - get_gmail_thread_content_mcp_google_workspace
-          - list_calendars_mcp_google_workspace
-          - get_events_mcp_google_workspace
-          - search_drive_files_mcp_google_workspace
-          - get_drive_file_content_mcp_google_workspace
-          - search_docs_mcp_google_workspace
-          - get_doc_content_mcp_google_workspace
-          - read_sheet_values_mcp_google_workspace
-        - server: ms365
-          scope_key: productivity_ms365
-          same_scope_background_allowed: true
-          owns: live Outlook email, Outlook calendar, OneDrive, Excel, OneNote, Planner, To Do, and Microsoft 365 actions available to the main agent
-          tool_names:
-          - sys__server__sys_mcp_ms-365
-          - list-mail-messages_mcp_ms-365
-          - get-mail-message_mcp_ms-365
-          - list-mail-folder-messages_mcp_ms-365
-          - list-calendar-events_mcp_ms-365
-          - get-calendar-event_mcp_ms-365
-          - list-folder-files_mcp_ms-365
-          - download-onedrive-file-content_mcp_ms-365
-          - get-excel-range_mcp_ms-365
-          - search-query_mcp_ms-365
-        direct_action_tool_rule: 'Connected direct-action surfaces are execution owners. Their presence means the main agent has the primary path; background cortices should stay silent unless they add separately scoped value or the matching direct-action surface explicitly allows same-scope supplemental background evidence.
+        prompt: |
+          The main agent owns the current turn. Background agents are optional reviewers, not controllers.
 
-          '
+          Connected direct-action surfaces listed below are the authoritative owners for live execution, status, approvals, callbacks, files, browser/desktop/OS work, schedules, workers, projects, and run results they cover.
+
+          Use this background agent's configured activation criteria as its only scope. Do not infer a broader scope from the conversation. When this policy and this background agent's own activation criteria disagree, prefer the stricter outcome: do not activate.
+
+          Return should_activate=false when the latest request is primarily asking to perform, start, continue, resume, stop, monitor, approve, check, or report on work owned by a connected direct-action surface, except when the connected surface is marked same_scope_background_allowed=true and this background agent's own configured activation scope exactly matches that surface. In that same-scope case, the main agent still owns Phase A execution and this background agent may activate for supplemental Phase B evidence when its own criteria are clearly met.
+
+          Return should_activate=false for follow-ups on live work, including short status/result turns, when the referenced work belongs to a connected direct-action surface, except for the same-scope supplemental case above.
+
+          Return should_activate=false when the user is asking for proof by execution rather than a separate analysis, critique, plan, or decision.
+
+          Return should_activate=true only when the latest request contains a separate explicit question or decision that this background agent's configured scope clearly owns and can answer without claiming, simulating, or second-guessing direct-action results.
+
+          For mixed requests:
+          - direct-action/status/result part -> main agent/tool path owns it
+          - independent analysis/review/planning part -> activate only if this agent's own scope clearly owns it
+
+          If activated, the insight must stay within that independent scope. It must not narrate worker, browser, runtime, schedule, file, invoice, screenshot, tool, callback, or OS status unless this same background agent received verified evidence in its own allowed context this turn.
+
+          Never activate just to confirm tool availability, provide operational IDs/links, summarize a tool owner's result, or answer from memory when the requested fact belongs to live execution.
+
+          If uncertain, return should_activate=false.
+        direct_action_mcp_servers:
+          - server: glasshive-workers-projects
+            owns: persistent workers, project runs, browser/desktop/local computer execution, worker status, and completion reports
+            tool_names:
+              - sys__server__sys_mcp_glasshive-workers-projects
+              - projects_list_mcp_glasshive-workers-projects
+              - project_create_mcp_glasshive-workers-projects
+              - worker_delegate_once_mcp_glasshive-workers-projects
+              - project_get_mcp_glasshive-workers-projects
+              - project_runs_mcp_glasshive-workers-projects
+              - project_events_mcp_glasshive-workers-projects
+              - workers_list_mcp_glasshive-workers-projects
+              - worker_create_mcp_glasshive-workers-projects
+              - worker_find_or_resume_mcp_glasshive-workers-projects
+              - worker_get_mcp_glasshive-workers-projects
+              - worker_live_mcp_glasshive-workers-projects
+              - worker_run_mcp_glasshive-workers-projects
+              - worker_message_mcp_glasshive-workers-projects
+              - worker_pause_mcp_glasshive-workers-projects
+              - worker_resume_mcp_glasshive-workers-projects
+              - worker_interrupt_mcp_glasshive-workers-projects
+              - worker_terminate_mcp_glasshive-workers-projects
+              - worker_desktop_action_mcp_glasshive-workers-projects
+              - worker_takeover_mcp_glasshive-workers-projects
+              - run_get_mcp_glasshive-workers-projects
+          - server: scheduling-cortex
+            owns: reminders, scheduled follow-ups, same-conversation wakeups, delayed status checks, and schedule management
+            tool_names:
+              - sys__server__sys_mcp_scheduling-cortex
+              - schedule_create_mcp_scheduling-cortex
+              - schedule_get_mcp_scheduling-cortex
+              - schedule_list_mcp_scheduling-cortex
+              - schedule_search_mcp_scheduling-cortex
+              - schedule_last_delivery_mcp_scheduling-cortex
+              - schedule_update_mcp_scheduling-cortex
+              - schedule_delete_mcp_scheduling-cortex
+              - schedule_preview_next_mcp_scheduling-cortex
+          - server: google-workspace
+            scope_key: productivity_google_workspace
+            same_scope_background_allowed: true
+            owns: live Gmail, Google Calendar, Google Drive, Docs, Sheets, Slides, Chat, Tasks, and Workspace actions available to the main agent
+            tool_names:
+              - sys__server__sys_mcp_google_workspace
+              - search_gmail_messages_mcp_google_workspace
+              - get_gmail_message_content_mcp_google_workspace
+              - get_gmail_messages_content_batch_mcp_google_workspace
+              - get_gmail_thread_content_mcp_google_workspace
+              - list_calendars_mcp_google_workspace
+              - get_events_mcp_google_workspace
+              - search_drive_files_mcp_google_workspace
+              - get_drive_file_content_mcp_google_workspace
+              - search_docs_mcp_google_workspace
+              - get_doc_content_mcp_google_workspace
+              - read_sheet_values_mcp_google_workspace
+          - server: ms365
+            scope_key: productivity_ms365
+            same_scope_background_allowed: true
+            owns: live Outlook email, Outlook calendar, OneDrive, Excel, OneNote, Planner, To Do, and Microsoft 365 actions available to the main agent
+            tool_names:
+              - sys__server__sys_mcp_ms-365
+              - list-mail-messages_mcp_ms-365
+              - get-mail-message_mcp_ms-365
+              - list-mail-folder-messages_mcp_ms-365
+              - list-calendar-events_mcp_ms-365
+              - get-calendar-event_mcp_ms-365
+              - list-folder-files_mcp_ms-365
+              - download-onedrive-file-content_mcp_ms-365
+              - get-excel-range_mcp_ms-365
+              - search-query_mcp_ms-365
+        direct_action_tool_rule: |
+          Connected direct-action surfaces are execution owners. Their presence means the main agent has the primary path; background cortices should stay silent unless they add separately scoped value or the matching direct-action surface explicitly allows same-scope supplemental background evidence.
     no_response:
-      prompt:
-        promptRef: main.no_response
+      prompt: |-
+        NO RESPONSE TAG:
+        - If you have nothing meaningful to add, respond with exactly: {NTA}
+        - When you use {NTA}, output ONLY that token and nothing else.
+        - Never use {NTA} to hide errors/tool failures; explain the issue briefly instead.
+        - Never use {NTA} to hide a new verified fact, time-sensitive blocker, tool completion, approval need, or meaningful change. Surface it briefly in the user's current channel.
     conversation_recall:
-      prompt:
-        promptRef: main.conversation_recall
+      prompt: |-
+        CONVERSATION RECALL:
+        - When the user asks about prior chats, earlier context, previous decisions, same-day continuity, or something mentioned before, use `file_search` to check conversation recall before saying you do not remember.
+        - When the user asks about prior meeting transcripts, transcriptions, or conversations based on transcripts, use `file_search` to check transcript recall. For broad transcript-list questions, rely on the meeting transcript inventory/table of contents when it is available, then use detailed transcript summaries for narrower follow-ups.
+        - For transcript-list answers, preserve the user's requested level of brevity. Include date/time, participants, and the actual meeting context when visible, and add a short caveat that transcript evidence can be AI-transcribed, stale, audience-specific, or not a stable user belief.
+        - Treat "what were we talking about", "we were just talking about this", and "earlier today/this morning" as recall checks, not as fresh-chat onboarding.
+        - For exact-history questions, verify with retrieved evidence instead of guessing from memory alone.
+        - If recall evidence is inconclusive, say that honestly and ask a focused clarification instead of claiming the conversation is missing.
+        - Do not answer live mailbox, calendar, or external-system status questions from conversation recall alone; use the relevant live tool when available.
     configVersion: 1
     primaryProvider: openai
     installMode: native
@@ -112,82 +150,39 @@ mainAgent:
   provider: anthropic
   model: claude-opus-4-7
   tools:
-  - sys__server__sys_mcp_scheduling-cortex
-  - schedule_create_mcp_scheduling-cortex
-  - schedule_get_mcp_scheduling-cortex
-  - schedule_list_mcp_scheduling-cortex
-  - schedule_search_mcp_scheduling-cortex
-  - schedule_last_delivery_mcp_scheduling-cortex
-  - schedule_update_mcp_scheduling-cortex
-  - schedule_delete_mcp_scheduling-cortex
-  - schedule_preview_next_mcp_scheduling-cortex
-  - sys__server__sys_mcp_glasshive-workers-projects
-  - projects_list_mcp_glasshive-workers-projects
-  - project_create_mcp_glasshive-workers-projects
-  - worker_delegate_once_mcp_glasshive-workers-projects
-  - project_get_mcp_glasshive-workers-projects
-  - project_runs_mcp_glasshive-workers-projects
-  - project_events_mcp_glasshive-workers-projects
-  - workers_list_mcp_glasshive-workers-projects
-  - worker_create_mcp_glasshive-workers-projects
-  - worker_get_mcp_glasshive-workers-projects
-  - worker_live_mcp_glasshive-workers-projects
-  - worker_run_mcp_glasshive-workers-projects
-  - worker_message_mcp_glasshive-workers-projects
-  - worker_pause_mcp_glasshive-workers-projects
-  - worker_resume_mcp_glasshive-workers-projects
-  - worker_interrupt_mcp_glasshive-workers-projects
-  - worker_terminate_mcp_glasshive-workers-projects
-  - worker_desktop_action_mcp_glasshive-workers-projects
-  - worker_takeover_mcp_glasshive-workers-projects
-  - run_get_mcp_glasshive-workers-projects
-  - metrics_summary_mcp_glasshive-workers-projects
-  - sys__server__sys_mcp_google_workspace
-  - search_gmail_messages_mcp_google_workspace
-  - get_gmail_message_content_mcp_google_workspace
-  - get_gmail_thread_content_mcp_google_workspace
-  - get_gmail_threads_content_batch_mcp_google_workspace
-  - list_gmail_labels_mcp_google_workspace
-  - search_drive_files_mcp_google_workspace
-  - get_drive_file_content_mcp_google_workspace
-  - list_drive_items_mcp_google_workspace
-  - create_drive_file_mcp_google_workspace
-  - get_drive_file_permissions_mcp_google_workspace
-  - check_drive_file_public_access_mcp_google_workspace
-  - list_calendars_mcp_google_workspace
-  - get_events_mcp_google_workspace
-  - create_event_mcp_google_workspace
-  - modify_event_mcp_google_workspace
-  - delete_event_mcp_google_workspace
-  - search_docs_mcp_google_workspace
-  - get_doc_content_mcp_google_workspace
-  - list_docs_in_folder_mcp_google_workspace
-  - create_doc_mcp_google_workspace
-  - modify_doc_text_mcp_google_workspace
-  - find_and_replace_doc_mcp_google_workspace
-  - insert_doc_elements_mcp_google_workspace
-  - insert_doc_image_mcp_google_workspace
-  - update_doc_headers_footers_mcp_google_workspace
-  - batch_update_doc_mcp_google_workspace
-  - inspect_doc_structure_mcp_google_workspace
-  - export_doc_to_pdf_mcp_google_workspace
-  - read_document_comments_mcp_google_workspace
-  - list_spreadsheets_mcp_google_workspace
-  - get_spreadsheet_info_mcp_google_workspace
-  - read_sheet_values_mcp_google_workspace
-  - modify_sheet_values_mcp_google_workspace
-  - create_spreadsheet_mcp_google_workspace
-  - create_sheet_mcp_google_workspace
-  - get_form_response_mcp_google_workspace
-  - list_form_responses_mcp_google_workspace
-  - create_presentation_mcp_google_workspace
-  - get_presentation_mcp_google_workspace
-  - batch_update_presentation_mcp_google_workspace
-  - get_page_mcp_google_workspace
-  - get_page_thumbnail_mcp_google_workspace
-  - get_gmail_messages_content_batch_mcp_google_workspace
-  - file_search
-  - web_search
+    - sys__server__sys_mcp_scheduling-cortex
+    - schedule_create_mcp_scheduling-cortex
+    - schedule_get_mcp_scheduling-cortex
+    - schedule_list_mcp_scheduling-cortex
+    - schedule_search_mcp_scheduling-cortex
+    - schedule_last_delivery_mcp_scheduling-cortex
+    - schedule_update_mcp_scheduling-cortex
+    - schedule_delete_mcp_scheduling-cortex
+    - schedule_preview_next_mcp_scheduling-cortex
+    - sys__server__sys_mcp_glasshive-workers-projects
+    - projects_list_mcp_glasshive-workers-projects
+    - project_create_mcp_glasshive-workers-projects
+    - project_get_mcp_glasshive-workers-projects
+    - worker_delegate_once_mcp_glasshive-workers-projects
+    - project_runs_mcp_glasshive-workers-projects
+    - project_events_mcp_glasshive-workers-projects
+    - workers_list_mcp_glasshive-workers-projects
+    - worker_create_mcp_glasshive-workers-projects
+    - worker_get_mcp_glasshive-workers-projects
+    - worker_live_mcp_glasshive-workers-projects
+    - worker_run_mcp_glasshive-workers-projects
+    - worker_message_mcp_glasshive-workers-projects
+    - worker_pause_mcp_glasshive-workers-projects
+    - worker_resume_mcp_glasshive-workers-projects
+    - worker_interrupt_mcp_glasshive-workers-projects
+    - worker_terminate_mcp_glasshive-workers-projects
+    - worker_desktop_action_mcp_glasshive-workers-projects
+    - worker_takeover_mcp_glasshive-workers-projects
+    - run_get_mcp_glasshive-workers-projects
+    - metrics_summary_mcp_glasshive-workers-projects
+    - worker_find_or_resume_mcp_glasshive-workers-projects
+    - file_search
+    - web_search
   tool_kwargs: []
   model_parameters:
     model: claude-opus-4-7
@@ -199,528 +194,530 @@ mainAgent:
     name: ''
     email: ''
   background_cortices:
-  - agent_id: agent_viventium_background_analysis_95aeb3
-    activation:
-      enabled: true
-      model: meta-llama/llama-4-scout-17b-16e-instruct
-      provider: groq
-      prompt:
-        promptRef: cortex.background_analysis.activation
-      confidence_threshold: 0.65
-      cooldown_ms: 30000
-      max_history: 6
-      fallbacks:
-      - provider: xai
-        model: grok-4.20-non-reasoning
-      - provider: openai
-        model: gpt-5.4
-      - provider: anthropic
-        model: claude-haiku-4-5
-  - agent_id: agent_viventium_confirmation_bias_95aeb3
-    activation:
-      enabled: true
-      model: meta-llama/llama-4-scout-17b-16e-instruct
-      provider: groq
-      prompt:
-        promptRef: cortex.confirmation_bias.activation
-      confidence_threshold: 0.6
-      cooldown_ms: 30000
-      max_history: 6
-      activation_failure_visibility: visible
-      fallbacks:
-      - provider: xai
-        model: grok-4.20-non-reasoning
-      - provider: openai
-        model: gpt-5.4
-      - provider: anthropic
-        model: claude-haiku-4-5
-  - agent_id: agent_viventium_red_team_95aeb3
-    activation:
-      enabled: true
-      model: meta-llama/llama-4-scout-17b-16e-instruct
-      provider: groq
-      prompt:
-        promptRef: cortex.red_team.activation
-      confidence_threshold: 0.6
-      cooldown_ms: 45000
-      max_history: 6
-      activation_failure_visibility: visible
-      fallbacks:
-      - provider: xai
-        model: grok-4.20-non-reasoning
-      - provider: openai
-        model: gpt-5.4
-      - provider: anthropic
-        model: claude-haiku-4-5
-  - agent_id: agent_viventium_deep_research_95aeb3
-    activation:
-      enabled: true
-      model: meta-llama/llama-4-scout-17b-16e-instruct
-      provider: groq
-      prompt:
-        promptRef: cortex.deep_research.activation
-      confidence_threshold: 0.7
-      cooldown_ms: 120000
-      max_history: 6
-      fallbacks:
-      - provider: xai
-        model: grok-4.20-non-reasoning
-      - provider: openai
-        model: gpt-5.4
-      - provider: anthropic
-        model: claude-haiku-4-5
-  - agent_id: agent_viventium_online_tool_use_95aeb3
-    activation:
-      enabled: true
-      model: meta-llama/llama-4-scout-17b-16e-instruct
-      provider: groq
-      prompt:
-        promptRef: cortex.online_tool_use.activation
-      intent_scope: productivity_ms365
-      confidence_threshold: 0.7
-      cooldown_ms: 60000
-      max_history: 6
-      fallbacks:
-      - provider: xai
-        model: grok-4.20-non-reasoning
-      - provider: openai
-        model: gpt-5.4
-      - provider: anthropic
-        model: claude-haiku-4-5
-  - agent_id: agent_viventium_parietal_cortex_95aeb3
-    activation:
-      enabled: true
-      model: meta-llama/llama-4-scout-17b-16e-instruct
-      provider: groq
-      prompt:
-        promptRef: cortex.parietal_cortex.activation
-      confidence_threshold: 0.65
-      cooldown_ms: 30000
-      max_history: 8
-      fallbacks:
-      - provider: xai
-        model: grok-4.20-non-reasoning
-      - provider: openai
-        model: gpt-5.4
-      - provider: anthropic
-        model: claude-haiku-4-5
-  - agent_id: agent_viventium_pattern_recognition_95aeb3
-    activation:
-      enabled: true
-      model: meta-llama/llama-4-scout-17b-16e-instruct
-      provider: groq
-      prompt:
-        promptRef: cortex.pattern_recognition.activation
-      confidence_threshold: 0.75
-      cooldown_ms: 45000
-      max_history: 8
-      fallbacks:
-      - provider: xai
-        model: grok-4.20-non-reasoning
-      - provider: openai
-        model: gpt-5.4
-      - provider: anthropic
-        model: claude-haiku-4-5
-  - agent_id: agent_viventium_emotional_resonance_95aeb3
-    activation:
-      enabled: true
-      model: meta-llama/llama-4-scout-17b-16e-instruct
-      provider: groq
-      prompt:
-        promptRef: cortex.emotional_resonance.activation
-      confidence_threshold: 0.55
-      cooldown_ms: 45000
-      max_history: 8
-      fallbacks:
-      - provider: xai
-        model: grok-4.20-non-reasoning
-      - provider: openai
-        model: gpt-5.4
-      - provider: anthropic
-        model: claude-haiku-4-5
-  - agent_id: agent_viventium_strategic_planning_95aeb3
-    activation:
-      enabled: true
-      model: meta-llama/llama-4-scout-17b-16e-instruct
-      provider: groq
-      prompt:
-        promptRef: cortex.strategic_planning.activation
-      confidence_threshold: 0.6
-      cooldown_ms: 45000
-      max_history: 8
-      fallbacks:
-      - provider: xai
-        model: grok-4.20-non-reasoning
-      - provider: openai
-        model: gpt-5.4
-      - provider: anthropic
-        model: claude-haiku-4-5
-  - agent_id: agent_viventium_support_95aeb3
-    activation:
-      enabled: true
-      model: meta-llama/llama-4-scout-17b-16e-instruct
-      provider: groq
-      prompt:
-        promptRef: cortex.support.activation
-      confidence_threshold: 0.6
-      cooldown_ms: 30000
-      max_history: 6
-      fallbacks:
-      - provider: xai
-        model: grok-4.20-non-reasoning
-      - provider: openai
-        model: gpt-5.4
-      - provider: anthropic
-        model: claude-haiku-4-5
-  - agent_id: agent_8Y1d7JNhpubtvzYz3hvEv
-    activation:
-      enabled: true
-      model: meta-llama/llama-4-scout-17b-16e-instruct
-      provider: groq
-      prompt:
-        promptRef: cortex.google.activation
-      intent_scope: productivity_google_workspace
-      confidence_threshold: 0.7
-      cooldown_ms: 30000
-      max_history: 15
-      fallbacks:
-      - provider: xai
-        model: grok-4.20-non-reasoning
-      - provider: openai
-        model: gpt-5.4
-      - provider: anthropic
-        model: claude-haiku-4-5
-  voice_llm_model: claude-haiku-4-5
+    - agent_id: agent_viventium_background_analysis_95aeb3
+      activation:
+        enabled: true
+        model: meta-llama/llama-4-scout-17b-16e-instruct
+        provider: groq
+        prompt:
+          promptRef: cortex.background_analysis.activation
+        confidence_threshold: 0.65
+        cooldown_ms: 30000
+        max_history: 6
+        fallbacks:
+          - provider: xai
+            model: grok-4.20-non-reasoning
+          - provider: openai
+            model: gpt-5.4
+          - provider: anthropic
+            model: claude-haiku-4-5
+    - agent_id: agent_viventium_confirmation_bias_95aeb3
+      activation:
+        enabled: true
+        model: meta-llama/llama-4-scout-17b-16e-instruct
+        provider: groq
+        prompt:
+          promptRef: cortex.confirmation_bias.activation
+        confidence_threshold: 0.6
+        cooldown_ms: 30000
+        max_history: 6
+        fallbacks:
+          - provider: xai
+            model: grok-4.20-non-reasoning
+          - provider: openai
+            model: gpt-5.4
+          - provider: anthropic
+            model: claude-haiku-4-5
+    - agent_id: agent_viventium_red_team_95aeb3
+      activation:
+        enabled: true
+        model: meta-llama/llama-4-scout-17b-16e-instruct
+        provider: groq
+        prompt:
+          promptRef: cortex.red_team.activation
+        confidence_threshold: 0.6
+        cooldown_ms: 45000
+        max_history: 6
+        fallbacks:
+          - provider: xai
+            model: grok-4.20-non-reasoning
+          - provider: openai
+            model: gpt-5.4
+          - provider: anthropic
+            model: claude-haiku-4-5
+    - agent_id: agent_viventium_deep_research_95aeb3
+      activation:
+        enabled: true
+        model: meta-llama/llama-4-scout-17b-16e-instruct
+        provider: groq
+        prompt:
+          promptRef: cortex.deep_research.activation
+        confidence_threshold: 0.7
+        cooldown_ms: 120000
+        max_history: 6
+        fallbacks:
+          - provider: xai
+            model: grok-4.20-non-reasoning
+          - provider: openai
+            model: gpt-5.4
+          - provider: anthropic
+            model: claude-haiku-4-5
+    - agent_id: agent_viventium_online_tool_use_95aeb3
+      activation:
+        enabled: true
+        model: meta-llama/llama-4-scout-17b-16e-instruct
+        provider: groq
+        prompt:
+          promptRef: cortex.online_tool_use.activation
+        intent_scope: productivity_ms365
+        confidence_threshold: 0.7
+        cooldown_ms: 60000
+        max_history: 6
+        fallbacks:
+          - provider: xai
+            model: grok-4.20-non-reasoning
+          - provider: openai
+            model: gpt-5.4
+          - provider: anthropic
+            model: claude-haiku-4-5
+    - agent_id: agent_viventium_parietal_cortex_95aeb3
+      activation:
+        enabled: true
+        model: meta-llama/llama-4-scout-17b-16e-instruct
+        provider: groq
+        prompt:
+          promptRef: cortex.parietal_cortex.activation
+        confidence_threshold: 0.65
+        cooldown_ms: 30000
+        max_history: 8
+        fallbacks:
+          - provider: xai
+            model: grok-4.20-non-reasoning
+          - provider: openai
+            model: gpt-5.4
+          - provider: anthropic
+            model: claude-haiku-4-5
+    - agent_id: agent_viventium_pattern_recognition_95aeb3
+      activation:
+        enabled: true
+        model: meta-llama/llama-4-scout-17b-16e-instruct
+        provider: groq
+        prompt:
+          promptRef: cortex.pattern_recognition.activation
+        confidence_threshold: 0.75
+        cooldown_ms: 45000
+        max_history: 8
+        fallbacks:
+          - provider: xai
+            model: grok-4.20-non-reasoning
+          - provider: openai
+            model: gpt-5.4
+          - provider: anthropic
+            model: claude-haiku-4-5
+    - agent_id: agent_viventium_emotional_resonance_95aeb3
+      activation:
+        enabled: true
+        model: meta-llama/llama-4-scout-17b-16e-instruct
+        provider: groq
+        prompt:
+          promptRef: cortex.emotional_resonance.activation
+        confidence_threshold: 0.55
+        cooldown_ms: 45000
+        max_history: 8
+        fallbacks:
+          - provider: xai
+            model: grok-4.20-non-reasoning
+          - provider: openai
+            model: gpt-5.4
+          - provider: anthropic
+            model: claude-haiku-4-5
+    - agent_id: agent_viventium_strategic_planning_95aeb3
+      activation:
+        enabled: true
+        model: meta-llama/llama-4-scout-17b-16e-instruct
+        provider: groq
+        prompt:
+          promptRef: cortex.strategic_planning.activation
+        confidence_threshold: 0.6
+        cooldown_ms: 45000
+        max_history: 8
+        fallbacks:
+          - provider: xai
+            model: grok-4.20-non-reasoning
+          - provider: openai
+            model: gpt-5.4
+          - provider: anthropic
+            model: claude-haiku-4-5
+    - agent_id: agent_viventium_support_95aeb3
+      activation:
+        enabled: true
+        model: meta-llama/llama-4-scout-17b-16e-instruct
+        provider: groq
+        prompt:
+          promptRef: cortex.support.activation
+        confidence_threshold: 0.6
+        cooldown_ms: 30000
+        max_history: 6
+        fallbacks:
+          - provider: xai
+            model: grok-4.20-non-reasoning
+          - provider: openai
+            model: gpt-5.4
+          - provider: anthropic
+            model: claude-haiku-4-5
+    - agent_id: agent_8Y1d7JNhpubtvzYz3hvEv
+      activation:
+        enabled: true
+        model: meta-llama/llama-4-scout-17b-16e-instruct
+        provider: groq
+        prompt:
+          promptRef: cortex.google.activation
+        intent_scope: productivity_google_workspace
+        confidence_threshold: 0.7
+        cooldown_ms: 30000
+        max_history: 15
+        fallbacks:
+          - provider: xai
+            model: grok-4.20-non-reasoning
+          - provider: openai
+            model: gpt-5.4
+          - provider: anthropic
+            model: claude-haiku-4-5
+  voice_llm_model: claude-sonnet-4-5
   voice_llm_provider: anthropic
   voice_llm_model_parameters:
-    model: claude-haiku-4-5
+    model: claude-sonnet-4-5
     thinking: false
-  voice_fallback_llm_model: grok-4.3
-  voice_fallback_llm_provider: xai
+  voice_fallback_llm_model: gpt-5.4
+  voice_fallback_llm_provider: openAI
   voice_fallback_llm_model_parameters:
-    model: grok-4.3
-  fallback_llm_model: grok-4.3
-  fallback_llm_provider: xai
-  fallback_llm_model_parameters:
-    model: grok-4.3
-  agent_ids: []
-  edges: []
-  conversation_starters:
-  - What do you want to actually do today?
-  - What feels stuck right now?
-  - What matters most to you this week?
-  category: viventium
-backgroundAgents:
-- id: agent_viventium_background_analysis_95aeb3
-  name: Background Analysis
-  description: Deep analytical processing - surfaces hidden meanings and logical gaps.
-  instructions:
-    promptRef: cortex.background_analysis.execution
-  provider: anthropic
-  model: claude-sonnet-4-5
-  tools:
-  - sys__server__sys_mcp_sequential-thinking
-  - sequentialthinking_mcp_sequential-thinking
-  tool_kwargs: []
-  model_parameters:
-    thinking: false
-    model: claude-sonnet-4-5
-  end_after_tools: false
-  hide_sequential_outputs: false
-  support_contact:
-    name: ''
-    email: ''
-  background_cortices: []
-  voice_llm_model: null
-  voice_llm_provider: null
-  voice_llm_model_parameters: {}
-  voice_fallback_llm_model: null
-  voice_fallback_llm_provider: null
-  voice_fallback_llm_model_parameters: {}
-  fallback_llm_model: grok-4.3
-  fallback_llm_provider: xai
-  fallback_llm_model_parameters:
-    model: grok-4.3
-  agent_ids: []
-  edges: []
-  conversation_starters: []
-  category: viventium
-- id: agent_viventium_confirmation_bias_95aeb3
-  name: Confirmation Bias
-  description: Error detection - flags overconfidence and unchecked assumptions before they solidify.
-  instructions:
-    promptRef: cortex.confirmation_bias.execution
-  provider: anthropic
-  model: claude-sonnet-4-5
-  tools:
-  - sys__server__sys_mcp_sequential-thinking
-  - sys__all__sys_mcp_sequential-thinking
-  - web_search
-  tool_kwargs: []
-  model_parameters:
-    thinking: false
-    model: claude-sonnet-4-5
-  end_after_tools: false
-  hide_sequential_outputs: false
-  support_contact:
-    name: ''
-    email: ''
-  background_cortices: []
-  voice_llm_model: null
-  voice_llm_provider: null
-  voice_llm_model_parameters: {}
-  fallback_llm_model: grok-4.3
-  fallback_llm_provider: xai
-  fallback_llm_model_parameters:
-    model: grok-4.3
-  agent_ids: []
-  edges: []
-  conversation_starters: []
-  category: viventium
-- id: agent_viventium_red_team_95aeb3
-  name: Red Team
-  description: Evidence-first mistake detection - verifies claims, tests viability, and calls out rationalization.
-  instructions:
-    promptRef: cortex.red_team.execution
-  provider: openAI
-  model: gpt-5.4
-  tools:
-  - sys__server__sys_mcp_sequential-thinking
-  - sequentialthinking_mcp_sequential-thinking
-  - file_search
-  tool_kwargs: []
-  model_parameters:
     model: gpt-5.4
-  end_after_tools: false
-  hide_sequential_outputs: false
-  support_contact:
-    name: ''
-    email: ''
-  background_cortices: []
-  voice_llm_model: null
-  voice_llm_provider: null
-  voice_llm_model_parameters: {}
-  fallback_llm_model: grok-4.3
-  fallback_llm_provider: xai
-  fallback_llm_model_parameters:
-    model: grok-4.3
-  agent_ids: []
-  edges: []
-  conversation_starters: []
-  category: viventium
-- id: agent_viventium_deep_research_95aeb3
-  name: Deep Research
-  description: Multi-step research across sources, building comprehensive understanding.
-  instructions:
-    promptRef: cortex.deep_research.execution
-  provider: openAI
-  model: gpt-5.4
-  tools:
-  - sys__server__sys_mcp_sequential-thinking
-  - sys__all__sys_mcp_sequential-thinking
-  - web_search
-  tool_kwargs: []
-  model_parameters:
-    reasoning_effort: xhigh
-    model: gpt-5.4
-  end_after_tools: false
-  hide_sequential_outputs: false
-  support_contact:
-    name: ''
-    email: ''
-  background_cortices: []
-  voice_llm_model: null
-  voice_llm_provider: null
-  voice_llm_model_parameters: {}
-  fallback_llm_model: grok-4.3
-  fallback_llm_provider: xai
-  fallback_llm_model_parameters:
-    model: grok-4.3
-  agent_ids: []
-  edges: []
-  conversation_starters: []
-  category: viventium
-- id: agent_viventium_online_tool_use_95aeb3
-  name: MS365
-  description: Orchestrates MS365 productivity tool calls (Outlook email, calendar, OneDrive files).
-  instructions:
-    promptRef: cortex.online_tool_use.execution
-  provider: openAI
-  model: gpt-5.4
-  tools: []
-  tool_kwargs: []
-  model_parameters:
-    model: gpt-5.4
-  end_after_tools: false
-  hide_sequential_outputs: false
-  support_contact:
-    name: ''
-    email: ''
-  background_cortices: []
-  voice_llm_model: null
-  voice_llm_provider: null
-  voice_llm_model_parameters: {}
-  fallback_llm_model: grok-4.3
-  fallback_llm_provider: xai
-  fallback_llm_model_parameters:
-    model: grok-4.3
-  agent_ids: []
-  edges: []
-  conversation_starters: []
-  category: viventium
-- id: agent_viventium_parietal_cortex_95aeb3
-  name: Parietal Cortex
-  description: Mathematical, physics, and statistical reasoning using first-principles thinking.
-  instructions:
-    promptRef: cortex.parietal_cortex.execution
-  provider: openAI
-  model: gpt-5.4
-  tools:
-  - sys__server__sys_mcp_sequential-thinking
-  - sys__all__sys_mcp_sequential-thinking
-  tool_kwargs: []
-  model_parameters:
-    model: gpt-5.4
-  end_after_tools: false
-  hide_sequential_outputs: false
-  support_contact: {}
-  background_cortices: []
-  fallback_llm_model: grok-4.3
-  fallback_llm_provider: xai
-  fallback_llm_model_parameters:
-    model: grok-4.3
-  agent_ids: []
-  edges: []
-  conversation_starters: []
-  category: viventium
-- id: agent_viventium_pattern_recognition_95aeb3
-  name: Pattern Recognition
-  description: Identifies recurring themes, behavioral loops, and contradictions across conversation.
-  instructions:
-    promptRef: cortex.pattern_recognition.execution
-  provider: anthropic
-  model: claude-sonnet-4-5
-  tools: []
-  tool_kwargs: []
-  model_parameters:
-    model: claude-sonnet-4-5
-  end_after_tools: false
-  hide_sequential_outputs: false
-  background_cortices: []
-  fallback_llm_model: grok-4.3
-  fallback_llm_provider: xai
-  fallback_llm_model_parameters:
-    model: grok-4.3
-  agent_ids: []
-  edges: []
-  conversation_starters: []
-  category: viventium
-- id: agent_viventium_emotional_resonance_95aeb3
-  name: Emotional Resonance
-  description: Senses emotional undercurrents and unspoken needs that words don't capture.
-  instructions:
-    promptRef: cortex.emotional_resonance.execution
-  provider: anthropic
-  model: claude-sonnet-4-5
-  tools: []
-  tool_kwargs: []
-  model_parameters:
-    thinking: false
-    model: claude-sonnet-4-5
-  background_cortices: []
-  fallback_llm_model: grok-4.3
-  fallback_llm_provider: xai
-  fallback_llm_model_parameters:
-    model: grok-4.3
-  agent_ids: []
-  edges: []
-  conversation_starters: []
-  category: viventium
-- id: agent_viventium_strategic_planning_95aeb3
-  name: Strategic Planning
-  description: Transforms abstract goals into concrete action sequences with risk awareness.
-  instructions:
-    promptRef: cortex.strategic_planning.execution
-  provider: anthropic
-  model: claude-opus-4-7
-  tools: []
-  tool_kwargs: []
-  model_parameters:
-    thinkingBudget: 2000
-    model: claude-opus-4-7
-  end_after_tools: false
-  hide_sequential_outputs: false
-  support_contact:
-    name: ''
-    email: ''
-  background_cortices: []
-  fallback_llm_model: grok-4.3
-  fallback_llm_provider: xai
-  fallback_llm_model_parameters:
-    model: grok-4.3
-  agent_ids: []
-  edges: []
-  conversation_starters: []
-  category: viventium
-- id: agent_viventium_support_95aeb3
-  name: Viventium User Help
-  description: "In-product help for using Viventium \u2014 conversations, voice, agents, integrations, scheduling. Never mentions internal implementation; escalates to the official Viventium support channel only when needed."
-  instructions:
-    promptRef: cortex.support.execution
-  provider: anthropic
-  model: claude-sonnet-4-5
-  tools:
-  - web_search
-  tool_kwargs: []
-  model_parameters:
-    model: claude-sonnet-4-5
-  end_after_tools: false
-  hide_sequential_outputs: false
-  support_contact:
-    name: ''
-    email: ''
-  background_cortices: []
-  voice_llm_model: null
-  voice_llm_provider: null
-  voice_llm_model_parameters: {}
+    reasoning_effort: none
   fallback_llm_model: gpt-5.4
   fallback_llm_provider: openAI
   fallback_llm_model_parameters:
     model: gpt-5.4
-    reasoning_effort: high
   agent_ids: []
   edges: []
-  conversation_starters: []
+  conversation_starters:
+    - What do you want to actually do today?
+    - What feels stuck right now?
+    - What matters most to you this week?
   category: viventium
-- id: agent_8Y1d7JNhpubtvzYz3hvEv
-  name: Google
-  description: Orchestrates Google Workspace productivity tool calls
-  instructions:
-    promptRef: cortex.google.execution
-  provider: openAI
-  model: gpt-5.4
-  tools:
-  - sys__server__sys_mcp_sequential-thinking
-  - sequentialthinking_mcp_sequential-thinking
-  - file_search
-  tool_kwargs: []
-  model_parameters:
+backgroundAgents:
+  - id: agent_viventium_background_analysis_95aeb3
+    name: Background Analysis
+    description: Deep analytical processing - surfaces hidden meanings and logical gaps.
+    instructions:
+      promptRef: cortex.background_analysis.execution
+    provider: anthropic
+    model: claude-sonnet-4-5
+    tools:
+      - sys__server__sys_mcp_sequential-thinking
+      - sequentialthinking_mcp_sequential-thinking
+      - execute_code
+      - web_search
+    tool_kwargs: []
+    model_parameters:
+      model: claude-sonnet-4-5
+    end_after_tools: false
+    hide_sequential_outputs: false
+    support_contact:
+      name: ''
+      email: ''
+    background_cortices: []
+    voice_llm_model:
+    voice_llm_provider:
+    voice_llm_model_parameters: {}
+    voice_fallback_llm_model:
+    voice_fallback_llm_provider:
+    voice_fallback_llm_model_parameters: {}
+    fallback_llm_model:
+    fallback_llm_provider:
+    fallback_llm_model_parameters: {}
+    agent_ids: []
+    edges: []
+    conversation_starters: []
+    category: viventium
+  - id: agent_viventium_confirmation_bias_95aeb3
+    name: Confirmation Bias
+    description: Error detection - flags overconfidence and unchecked assumptions before they solidify.
+    instructions:
+      promptRef: cortex.confirmation_bias.execution
+    provider: anthropic
+    model: claude-sonnet-4-5
+    tools:
+      - sys__server__sys_mcp_sequential-thinking
+      - sys__all__sys_mcp_sequential-thinking
+      - web_search
+    tool_kwargs: []
+    model_parameters:
+      thinking: false
+      model: claude-sonnet-4-5
+    end_after_tools: false
+    hide_sequential_outputs: false
+    support_contact:
+      name: ''
+      email: ''
+    background_cortices: []
+    voice_llm_model:
+    voice_llm_provider:
+    voice_llm_model_parameters: {}
+    fallback_llm_model: grok-4.3
+    fallback_llm_provider: xai
+    fallback_llm_model_parameters:
+      model: grok-4.3
+    agent_ids: []
+    edges: []
+    conversation_starters: []
+    category: viventium
+  - id: agent_viventium_red_team_95aeb3
+    name: Red Team
+    description: Evidence-first mistake detection - verifies claims, tests viability, and calls out rationalization.
+    instructions:
+      promptRef: cortex.red_team.execution
+    provider: openAI
     model: gpt-5.4
-  end_after_tools: false
-  hide_sequential_outputs: false
-  support_contact:
-    name: ''
-    email: ''
-  background_cortices: []
-  voice_llm_model: null
-  voice_llm_provider: null
-  voice_llm_model_parameters: {}
-  fallback_llm_model: grok-4.3
-  fallback_llm_provider: xai
-  fallback_llm_model_parameters:
-    model: grok-4.3
-  agent_ids: []
-  edges: []
-  conversation_starters: []
-  category: viventium
+    tools:
+      - sys__server__sys_mcp_sequential-thinking
+      - sequentialthinking_mcp_sequential-thinking
+      - file_search
+      - web_search
+    tool_kwargs: []
+    model_parameters:
+      model: gpt-5.4
+    end_after_tools: false
+    hide_sequential_outputs: false
+    support_contact:
+      name: ''
+      email: ''
+    background_cortices: []
+    voice_llm_model:
+    voice_llm_provider:
+    voice_llm_model_parameters: {}
+    fallback_llm_model: grok-4.3
+    fallback_llm_provider: xai
+    fallback_llm_model_parameters:
+      model: grok-4.3
+    agent_ids: []
+    edges: []
+    conversation_starters: []
+    category: viventium
+  - id: agent_viventium_deep_research_95aeb3
+    name: Deep Research
+    description: Multi-step research across sources, building comprehensive understanding.
+    instructions:
+      promptRef: cortex.deep_research.execution
+    provider: openAI
+    model: gpt-5.4
+    tools:
+      - sys__server__sys_mcp_sequential-thinking
+      - sys__all__sys_mcp_sequential-thinking
+      - web_search
+    tool_kwargs: []
+    model_parameters:
+      reasoning_effort: xhigh
+      model: gpt-5.4
+    end_after_tools: false
+    hide_sequential_outputs: false
+    support_contact:
+      name: ''
+      email: ''
+    background_cortices: []
+    voice_llm_model:
+    voice_llm_provider:
+    voice_llm_model_parameters: {}
+    fallback_llm_model: grok-4.3
+    fallback_llm_provider: xai
+    fallback_llm_model_parameters:
+      model: grok-4.3
+    agent_ids: []
+    edges: []
+    conversation_starters: []
+    category: viventium
+  - id: agent_viventium_online_tool_use_95aeb3
+    name: MS365
+    description: Orchestrates MS365 productivity tool calls (Outlook email, calendar, OneDrive files).
+    instructions:
+      promptRef: cortex.online_tool_use.execution
+    provider: openAI
+    model: gpt-5.4
+    tools: []
+    tool_kwargs: []
+    model_parameters:
+      model: gpt-5.4
+    end_after_tools: false
+    hide_sequential_outputs: false
+    support_contact:
+      name: ''
+      email: ''
+    background_cortices: []
+    voice_llm_model:
+    voice_llm_provider:
+    voice_llm_model_parameters: {}
+    fallback_llm_model: grok-4.3
+    fallback_llm_provider: xai
+    fallback_llm_model_parameters:
+      model: grok-4.3
+    agent_ids: []
+    edges: []
+    conversation_starters: []
+    category: viventium
+  - id: agent_viventium_parietal_cortex_95aeb3
+    name: Parietal Cortex
+    description: Mathematical, physics, and statistical reasoning using first-principles thinking.
+    instructions:
+      promptRef: cortex.parietal_cortex.execution
+    provider: openAI
+    model: gpt-5.4
+    tools:
+      - sys__server__sys_mcp_sequential-thinking
+      - sys__all__sys_mcp_sequential-thinking
+      - execute_code
+      - web_search
+    tool_kwargs: []
+    model_parameters:
+      model: gpt-5.4
+    end_after_tools: false
+    hide_sequential_outputs: false
+    support_contact: {}
+    background_cortices: []
+    fallback_llm_model: grok-4.3
+    fallback_llm_provider: xai
+    fallback_llm_model_parameters:
+      model: grok-4.3
+    agent_ids: []
+    edges: []
+    conversation_starters: []
+    category: viventium
+  - id: agent_viventium_pattern_recognition_95aeb3
+    name: Pattern Recognition
+    description: Identifies recurring themes, behavioral loops, and contradictions across conversation.
+    instructions:
+      promptRef: cortex.pattern_recognition.execution
+    provider: anthropic
+    model: claude-sonnet-4-5
+    tools: []
+    tool_kwargs: []
+    model_parameters:
+      model: claude-sonnet-4-5
+    end_after_tools: false
+    hide_sequential_outputs: false
+    background_cortices: []
+    fallback_llm_model: grok-4.3
+    fallback_llm_provider: xai
+    fallback_llm_model_parameters:
+      model: grok-4.3
+    agent_ids: []
+    edges: []
+    conversation_starters: []
+    category: viventium
+  - id: agent_viventium_emotional_resonance_95aeb3
+    name: Emotional Resonance
+    description: Senses emotional undercurrents and unspoken needs that words don't capture.
+    instructions:
+      promptRef: cortex.emotional_resonance.execution
+    provider: anthropic
+    model: claude-sonnet-4-5
+    tools: []
+    tool_kwargs: []
+    model_parameters:
+      thinking: false
+      model: claude-sonnet-4-5
+    background_cortices: []
+    fallback_llm_model: grok-4.3
+    fallback_llm_provider: xai
+    fallback_llm_model_parameters:
+      model: grok-4.3
+    agent_ids: []
+    edges: []
+    conversation_starters: []
+    category: viventium
+  - id: agent_viventium_strategic_planning_95aeb3
+    name: Strategic Planning
+    description: Transforms abstract goals into concrete action sequences with risk awareness.
+    instructions:
+      promptRef: cortex.strategic_planning.execution
+    provider: anthropic
+    model: claude-opus-4-7
+    tools: []
+    tool_kwargs: []
+    model_parameters:
+      thinkingBudget: 2000
+      model: claude-opus-4-7
+    end_after_tools: false
+    hide_sequential_outputs: false
+    support_contact:
+      name: ''
+      email: ''
+    background_cortices: []
+    fallback_llm_model: grok-4.3
+    fallback_llm_provider: xai
+    fallback_llm_model_parameters:
+      model: grok-4.3
+    agent_ids: []
+    edges: []
+    conversation_starters: []
+    category: viventium
+  - id: agent_viventium_support_95aeb3
+    name: Viventium User Help
+    description: In-product help for using Viventium — conversations, voice, agents, integrations, scheduling. Never mentions internal implementation; escalates to the official Viventium support channel only when needed.
+    instructions:
+      promptRef: cortex.support.execution
+    provider: anthropic
+    model: claude-sonnet-4-5
+    tools:
+      - web_search
+    tool_kwargs: []
+    model_parameters:
+      model: claude-sonnet-4-5
+    end_after_tools: false
+    hide_sequential_outputs: false
+    support_contact:
+      name: ''
+      email: ''
+    background_cortices: []
+    voice_llm_model:
+    voice_llm_provider:
+    voice_llm_model_parameters: {}
+    fallback_llm_model: gpt-5.4
+    fallback_llm_provider: openAI
+    fallback_llm_model_parameters:
+      model: gpt-5.4
+      reasoning_effort: high
+    agent_ids: []
+    edges: []
+    conversation_starters: []
+    category: viventium
+  - id: agent_8Y1d7JNhpubtvzYz3hvEv
+    name: Google
+    description: Orchestrates Google Workspace productivity tool calls
+    instructions:
+      promptRef: cortex.google.execution
+    provider: openAI
+    model: gpt-5.4
+    tools:
+      - sys__server__sys_mcp_sequential-thinking
+      - sequentialthinking_mcp_sequential-thinking
+      - file_search
+    tool_kwargs: []
+    model_parameters:
+      model: gpt-5.4
+    end_after_tools: false
+    hide_sequential_outputs: false
+    support_contact:
+      name: ''
+      email: ''
+    background_cortices: []
+    voice_llm_model:
+    voice_llm_provider:
+    voice_llm_model_parameters: {}
+    fallback_llm_model: grok-4.3
+    fallback_llm_provider: xai
+    fallback_llm_model_parameters:
+      model: grok-4.3
+    agent_ids: []
+    edges: []
+    conversation_starters: []
+    category: viventium
 warnings: []

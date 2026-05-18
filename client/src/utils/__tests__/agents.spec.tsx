@@ -4,20 +4,6 @@ import '@testing-library/jest-dom';
 import { getAgentAvatarUrl, renderAgentAvatar, getContactDisplayName } from '../agents';
 import type t from 'librechat-data-provider';
 
-// Mock the Feather icon from lucide-react
-jest.mock('lucide-react', () => ({
-  Feather: ({ className, strokeWidth, ...props }: any) => (
-    <svg
-      data-testid="feather-icon"
-      className={className}
-      data-stroke-width={strokeWidth}
-      {...props}
-    >
-      <title>{/* eslint-disable-line i18next/no-literal-string */}Feather Icon</title>
-    </svg>
-  ),
-}));
-
 describe('Agent Utilities', () => {
   describe('getAgentAvatarUrl', () => {
     it('should return null for null agent', () => {
@@ -77,7 +63,11 @@ describe('Agent Utilities', () => {
       expect(img).toHaveClass('rounded-full', 'object-cover', 'shadow-lg');
     });
 
-    it('should render Feather icon fallback when no avatar', () => {
+    /* === VIVENTIUM START ===
+     * Feature: Viventium-branded agent utility fallback
+     * Purpose: Agent utility renderers must assert the Viventium logo instead of LibreChat's feather.
+     */
+    it('should render Viventium logo fallback when no avatar', () => {
       const agent = {
         id: '1',
         name: 'Test Agent',
@@ -85,10 +75,11 @@ describe('Agent Utilities', () => {
 
       render(<div>{renderAgentAvatar(agent)}</div>);
 
-      const featherIcon = screen.getByTestId('feather-icon');
-      expect(featherIcon).toBeInTheDocument();
-      expect(featherIcon).toHaveAttribute('data-stroke-width', '1.5');
+      const logo = screen.getByAltText('Test Agent avatar');
+      expect(logo).toBeInTheDocument();
+      expect(logo).toHaveAttribute('src', '/assets/logo.svg');
     });
+    /* === VIVENTIUM END === */
 
     it('should apply different size classes', () => {
       const agent = {

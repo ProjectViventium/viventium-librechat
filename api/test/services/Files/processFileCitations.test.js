@@ -146,6 +146,59 @@ describe('processFileCitations', () => {
       expect(result).toBeNull();
     });
 
+    it('keeps low-relevance meeting transcript inventory citations and preserves source order', async () => {
+      const toolArtifact = {
+        [Tools.file_search]: {
+          sources: [
+            {
+              fileId: 'meeting_summary:user:alpha',
+              fileName: 'meeting-transcript-summary-alpha.txt',
+              pages: [],
+              relevance: 0.5,
+              sourceOrder: 0,
+              type: 'file',
+              pageRelevance: {},
+              content: 'Detailed meeting summary.',
+            },
+            {
+              fileId: 'meeting_inventory:user:sourcehash',
+              fileName: 'meeting-transcript-inventory-sourcehash.txt',
+              pages: [],
+              relevance: 0.35,
+              sourceOrder: 1,
+              type: 'file',
+              pageRelevance: {},
+              content: 'Meeting transcript inventory / table of contents.',
+            },
+            {
+              fileId: 'conversation_recall:user:all',
+              fileName: 'conversation-recall-all.txt',
+              pages: [],
+              relevance: 0.99,
+              sourceOrder: 2,
+              type: 'file',
+              pageRelevance: {},
+              content: 'Older conversation recall snippet.',
+            },
+          ],
+        },
+      };
+
+      const result = await processFileCitations({
+        toolArtifact,
+        toolCallId: 'call_123',
+        metadata: mockMetadata,
+        user: mockReq.user,
+        appConfig: mockAppConfig,
+      });
+
+      expect(result.file_search.sources.map((source) => source.fileId)).toEqual([
+        'meeting_summary:user:alpha',
+        'meeting_inventory:user:sourcehash',
+        'conversation_recall:user:all',
+      ]);
+    });
+
     it('should return null when artifact is missing file_search data', async () => {
       const result = await processFileCitations({
         toolArtifact: {},
@@ -175,6 +228,22 @@ describe('processFileCitations', () => {
       expect(result[0].relevance).toBe(0.9);
       expect(result[1].relevance).toBe(0.85);
       expect(result[2].relevance).toBe(0.8);
+    });
+
+    it('preserves explicit tool source order when provided', () => {
+      const sources = [
+        { fileId: 'conversation_recall:user:all', relevance: 0.99, sourceOrder: 2 },
+        { fileId: 'meeting_summary:user:alpha', relevance: 0.5, sourceOrder: 0 },
+        { fileId: 'meeting_inventory:user:source', relevance: 0.45, sourceOrder: 1 },
+      ];
+
+      const result = applyCitationLimits(sources, 3, 2);
+
+      expect(result.map((source) => source.fileId)).toEqual([
+        'meeting_summary:user:alpha',
+        'meeting_inventory:user:source',
+        'conversation_recall:user:all',
+      ]);
     });
   });
 

@@ -187,8 +187,8 @@ describe('/api/viventium/skyvern/openai/v1/chat/completions', () => {
 
   test('uses Anthropic connected account bearer auth for Anthropic models', async () => {
     mockGetUserKeyValues.mockResolvedValue({
-      apiKey: 'sk-ant-oat01-live-token',
-      authToken: 'sk-ant-oat01-live-token',
+      apiKey: 'anthropic-oauth-test-token',
+      authToken: 'anthropic-oauth-test-token',
       oauthProvider: 'anthropic',
       oauthType: 'subscription',
       oauthExpiresAt: Date.now() + 60 * 60 * 1000,
@@ -221,7 +221,7 @@ describe('/api/viventium/skyvern/openai/v1/chat/completions', () => {
 
     const [fetchUrl, fetchInit] = global.fetch.mock.calls[0];
     expect(fetchUrl).toBe('https://api.anthropic.com/v1/messages');
-    expect(fetchInit.headers.authorization).toBe('Bearer sk-ant-oat01-live-token');
+    expect(fetchInit.headers.authorization).toBe('Bearer anthropic-oauth-test-token');
     expect(fetchInit.headers['anthropic-beta']).toContain('oauth-2025-04-20');
     expect(JSON.parse(fetchInit.body).system).toEqual([
       { type: 'text', text: "You are Claude Code, Anthropic's official CLI for Claude." },

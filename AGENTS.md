@@ -13,7 +13,39 @@ LibreChat is a monorepo with the following key workspaces:
 | `/client` | TypeScript/React | Frontend | `packages/data-provider`, `packages/client` | Frontend SPA |
 | `/packages/client` | TypeScript | Frontend | `packages/data-provider` | Shared frontend utilities |
 
-The source code for `@librechat/agents` (major backend dependency, same team) is at `/home/danny/agentus`.
+The source code for `@librechat/agents` is managed as a separate local component repo when present.
+
+---
+
+## Viventium QA Overlay
+
+- Follow the root Viventium `AGENTS.md` and `qa/README.md` before claiming user-visible completion.
+- Jest and mocked hook tests are focused supporting evidence, not acceptance for browser-visible
+  behavior.
+- Browser-visible behavior requires a real browser/user-path pass: user action, visible result,
+  expanded/detail state when relevant, refresh or persistence check when relevant, backend/log/DB
+  confirmation, and final wording that does not contradict the UI.
+- Full-view evidence must tie feature -> requirement -> use case -> QA case -> expected result ->
+  actual evidence -> remaining gap. Inspect owning code, docs and nested docs, scripts/harnesses,
+  logs, DB/state/persistence, generated or shipped artifacts, parent pins, and installed/runtime
+  artifacts when those surfaces apply.
+- Start from the full Viventium feature inventory and natural user use cases, not from a single UI
+  symptom. Use the root `docs/requirements_and_learnings/45_Runtime_Feature_QA_Map.md`,
+  `qa/feature-user-use-case-checklist.md`, and the owning `qa/<feature>/cases.md` to enumerate happy
+  path, first-run/empty state, missing auth/config, degraded dependency, retry/recovery,
+  interruption/cancel/update, persistence/reload/restart, cross-surface parity, generated/shipped
+  artifact verification, and public/private safety.
+- Treat that list as a checklist. Every applicable item must be exercised like a user on the real
+  surface and marked `PASS`, `FAIL`, `BLOCKED`, or `PARTIAL` with evidence.
+- If the real user path cannot be run, mark the result `BLOCKED` or `PARTIAL`. Supporting evidence
+  cannot replace required user-path evidence.
+- For Web Search, never collapse provider failures into no-results wording. Classify provider
+  unavailable, timeout, rate limit, auth/config missing, request rejected, unsupported configuration,
+  and missing local Docker-backed prerequisites separately, then use browser/computer/local
+  delegation fallback for named-entity/contact/date/current-fact lookups when available.
+- For GlassHive/local-delegation tool results, do not force or quote canned acknowledgement text.
+  Preserve the user's exact target and success condition, inspect the returned delegation audit when
+  present, and keep worker/run/project plumbing hidden unless diagnostics were requested.
 
 ---
 

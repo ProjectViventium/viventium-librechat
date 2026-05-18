@@ -415,6 +415,38 @@ async def delete_documents(request: Request, document_ids: List[str] = Body(...)
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# === VIVENTIUM START ===
+# Feature: Batch RAG artifact presence check.
+# Purpose:
+# - Agent initialization may need to verify many transcript summary artifacts.
+# - A batch endpoint avoids one HTTP round-trip per file while preserving the fail-closed
+#   vector-existence invariant.
+# Added: 2026-05-12
+@router.post("/documents/exists")
+async def documents_exist(request: Request, document_ids: List[str] = Body(...)):
+    ids = [id for id in document_ids if isinstance(id, str) and id]
+    try:
+        if not ids:
+            return {"existing_ids": []}
+        if isinstance(vector_store, AsyncPgVector):
+            existing_ids = await vector_store.get_filtered_ids(
+                ids, executor=request.app.state.thread_pool
+            )
+        else:
+            existing_ids = vector_store.get_filtered_ids(ids)
+
+        return {"existing_ids": [id for id in ids if id in existing_ids]}
+    except Exception as e:
+        logger.error(
+            "Error checking document existence | IDs: %s | Error: %s | Traceback: %s",
+            ids,
+            str(e),
+            traceback.format_exc(),
+        )
+        raise HTTPException(status_code=500, detail=str(e))
+# === VIVENTIUM END ===
+
+
 # Cache the embedding function with LRU cache
 @lru_cache(maxsize=128)
 def get_cached_query_embedding(query: str):
@@ -1117,6 +1149,37 @@ async def load_document_context(request: Request, id: str):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=ERROR_MESSAGES.DEFAULT(e),
         )
+
+
+# === VIVENTIUM START ===
+# Feature: Lightweight RAG artifact presence check.
+# Purpose:
+# - LibreChat needs to verify Mongo file rows still have backing vector rows before attaching
+#   runtime file_search resources.
+# - The full /context endpoint loads and processes all document chunks, which is too heavy for
+#   a presence guard and can make transcript recall appear unavailable during normal chat startup.
+# Added: 2026-05-12
+@router.get("/documents/{id}/exists")
+async def document_exists(request: Request, id: str):
+    ids = [id]
+    try:
+        if isinstance(vector_store, AsyncPgVector):
+            existing_ids = await vector_store.get_filtered_ids(
+                ids, executor=request.app.state.thread_pool
+            )
+        else:
+            existing_ids = vector_store.get_filtered_ids(ids)
+
+        return {"exists": id in existing_ids}
+    except Exception as e:
+        logger.error(
+            "Error checking document existence | Document ID: %s | Error: %s | Traceback: %s",
+            id,
+            str(e),
+            traceback.format_exc(),
+        )
+        raise HTTPException(status_code=500, detail=str(e))
+# === VIVENTIUM END ===
 
 
 @router.post("/embed-upload")

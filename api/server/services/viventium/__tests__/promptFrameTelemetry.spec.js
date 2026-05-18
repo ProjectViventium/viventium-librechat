@@ -24,6 +24,7 @@ const {
   buildPromptFrame,
   logPromptFrame,
   writePromptFrameFile,
+  flushPromptFrameFileWrites,
 } = require('../promptFrameTelemetry');
 
 describe('promptFrameTelemetry', () => {
@@ -328,7 +329,7 @@ describe('promptFrameTelemetry', () => {
     });
 
     expect(writePromptFrameFile(frame)).toBe(true);
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await expect(flushPromptFrameFileWrites()).resolves.toBe(true);
 
     const frameLogRoot = path.join(tempDir, 'frame-logs');
     const files = fs

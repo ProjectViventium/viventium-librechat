@@ -109,9 +109,7 @@ export function meetingTranscriptRuntimeEnabled(): boolean {
 }
 
 export function getMeetingTranscriptRagMode(): MeetingTranscriptRagMode {
-  const value = getRuntimeValue('VIVENTIUM_MEMORY_TRANSCRIPTS_RAG_MODE')
-    .trim()
-    .toLowerCase();
+  const value = getRuntimeValue('VIVENTIUM_MEMORY_TRANSCRIPTS_RAG_MODE').trim().toLowerCase();
   if (value === 'raw_and_summary' || value === 'raw+summary' || value === 'all') {
     return 'raw_and_summary';
   }
@@ -136,6 +134,12 @@ export function meetingTranscriptFileMatchesRagMode(file: TFile): boolean {
   const kind = String(file?.metadata?.meetingTranscriptKind || '').trim();
   const allowedKinds = new Set(getMeetingTranscriptKindFilter());
   return Boolean(kind && allowedKinds.has(kind));
+}
+
+export function isMeetingTranscriptInventoryResource(file: TFile): boolean {
+  return (
+    String(file?.metadata?.meetingTranscriptKind || '').trim() === MEETING_TRANSCRIPT_INVENTORY_KIND
+  );
 }
 
 export function mergeMeetingTranscriptResources(params: {

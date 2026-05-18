@@ -197,7 +197,11 @@ describe('AgentCard', () => {
     expect(avatarImg).toHaveAttribute('src', '/string-avatar.png');
   });
 
-  it('displays Feather icon fallback when no avatar is provided', () => {
+  /* === VIVENTIUM START ===
+   * Feature: Viventium-branded agent card fallback
+   * Purpose: Agent cards must assert the Viventium logo fallback instead of LibreChat's feather.
+   */
+  it('displays Viventium logo fallback when no avatar is provided', () => {
     const agentWithoutAvatar = {
       ...mockAgent,
       avatar: undefined,
@@ -209,10 +213,12 @@ describe('AgentCard', () => {
       </Wrapper>,
     );
 
-    // Check for Feather icon presence by looking for the svg with lucide-feather class
-    const featherIcon = document.querySelector('.lucide-feather');
-    expect(featherIcon).toBeInTheDocument();
+    const logo = screen.getByAltText('Test Agent avatar');
+    expect(logo).toBeInTheDocument();
+    expect(logo).toHaveAttribute('src', '/assets/logo.svg');
+    expect(document.querySelector('.lucide-feather')).not.toBeInTheDocument();
   });
+  /* === VIVENTIUM END === */
 
   it('card is clickable and has dialog trigger', () => {
     render(

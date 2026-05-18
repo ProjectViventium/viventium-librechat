@@ -25,11 +25,9 @@ const FETCH_PATCH_FLAG = Symbol.for('viventium.voice.invoke.telemetry.fetch.patc
 const INVOKE_CONTEXT = new AsyncLocalStorage();
 const AGENTS_CJS_DIR = path.dirname(require.resolve('@librechat/agents'));
 
-const requireAgentsCjsModule = (relativePath) =>
-  require(path.join(AGENTS_CJS_DIR, relativePath));
+const requireAgentsCjsModule = (relativePath) => require(path.join(AGENTS_CJS_DIR, relativePath));
 
-const asObject = (value) =>
-  value != null && typeof value === 'object' ? value : null;
+const asObject = (value) => (value != null && typeof value === 'object' ? value : null);
 
 const isVoiceLatencyEnabled = () => process.env.VIVENTIUM_VOICE_LOG_LATENCY === '1';
 
@@ -97,6 +95,50 @@ const isLikelyLlmFetchTarget = (urlObj) => {
     pathName.includes('generatecontent')
   );
 };
+
+/* === VIVENTIUM START ===
+ * Feature: Voice provider request knob telemetry.
+ * Purpose: During live voice QA, prove the no-reasoning setting reaches the outgoing provider
+ * request without logging prompt text, message content, auth headers, or secrets.
+ * Added: 2026-05-14
+ */
+const summarizeProviderRequestKnobs = (body) => {
+  if (typeof body !== 'string' || body.length === 0) {
+    return '';
+  }
+
+  try {
+    const parsed = JSON.parse(body);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return '';
+    }
+
+    const model =
+      typeof parsed.model === 'string' && parsed.model.length > 0 ? parsed.model : 'unset';
+    const reasoning =
+      parsed.reasoning && typeof parsed.reasoning === 'object' && !Array.isArray(parsed.reasoning)
+        ? parsed.reasoning
+        : null;
+    const messagesCount = Array.isArray(parsed.messages) ? parsed.messages.length : 'na';
+    const inputCount = Array.isArray(parsed.input) ? parsed.input.length : 'na';
+    const toolsCount = Array.isArray(parsed.tools) ? parsed.tools.length : 'na';
+    const streamValue = typeof parsed.stream === 'boolean' ? String(parsed.stream) : 'unset';
+
+    return (
+      ` model=${model}` +
+      ` reasoning_effort=${parsed.reasoning_effort ?? 'unset'}` +
+      ` reasoning.effort=${reasoning?.effort ?? 'unset'}` +
+      ` include_reasoning=${parsed.include_reasoning ?? 'unset'}` +
+      ` stream=${streamValue}` +
+      ` messages=${messagesCount}` +
+      ` input=${inputCount}` +
+      ` tools=${toolsCount}`
+    );
+  } catch {
+    return '';
+  }
+};
+/* === VIVENTIUM END === */
 
 const summarizeToolNames = (tools) => {
   if (!Array.isArray(tools) || tools.length === 0) {
@@ -266,11 +308,16 @@ const installFetchTelemetryPatch = () => {
 
     const method =
       (init && typeof init === 'object' && typeof init.method === 'string' ? init.method : null) ||
-      (input && typeof input === 'object' && typeof input.method === 'string' ? input.method : null) ||
+      (input && typeof input === 'object' && typeof input.method === 'string'
+        ? input.method
+        : null) ||
       'GET';
     const host = String(urlObj.hostname || '').toLowerCase();
     const endpoint = String(urlObj.pathname || '');
-    const detailBase = `method=${method.toUpperCase()} host=${host} endpoint=${endpoint}`;
+    const body = init && typeof init === 'object' ? init.body : null;
+    const detailBase =
+      `method=${method.toUpperCase()} host=${host} endpoint=${endpoint}` +
+      summarizeProviderRequestKnobs(body);
     const startedAt = Date.now();
 
     logInvokeStage({
@@ -311,7 +358,13 @@ const installFetchTelemetryPatch = () => {
   return true;
 };
 
-const installTimedModuleFunctionPatch = ({ moduleObj, fnName, stage, wrapResult = null, details = null }) => {
+const installTimedModuleFunctionPatch = ({
+  moduleObj,
+  fnName,
+  stage,
+  wrapResult = null,
+  details = null,
+}) => {
   if (!moduleObj || typeof moduleObj !== 'object') {
     return false;
   }

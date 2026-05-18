@@ -373,6 +373,7 @@ const loadTools = async ({
            * Reason: Source-backed recall rescue must avoid echoing the active prompt turn.
            * === VIVENTIUM END === */
           conversationId: options.req?.body?.conversationId,
+          activeMessageId: options.req?.body?.messageId,
           fileCitations,
         });
       };

@@ -1826,10 +1826,14 @@ describe('viventium-memory-hardening', () => {
       expect(uploadVectors.mock.calls[1][0].file_id).toBe(
         'meeting_inventory:507f1f77bcf86cd799439011:sourcehash',
       );
-      const inventoryUpload = uploadedBodies.find((item) => item.fileId.startsWith('meeting_inventory:'));
+      const inventoryUpload = uploadedBodies.find((item) =>
+        item.fileId.startsWith('meeting_inventory:'),
+      );
       expect(inventoryUpload?.text).toContain('Synthetic meeting');
       expect(inventoryUpload?.text).toContain('Participants: Speaker Alpha, Test User');
-      expect(inventoryUpload?.text).toContain('Context: Speaker and timing context with follow-up.');
+      expect(inventoryUpload?.text).toContain(
+        'Context: Speaker and timing context with follow-up.',
+      );
       expect(inventoryUpload?.text).not.toContain('Artifact ID:');
       expect(inventoryUpload?.text).not.toContain('Summary file ID:');
       expect(inventoryUpload?.text).not.toContain('meeting_transcript:');

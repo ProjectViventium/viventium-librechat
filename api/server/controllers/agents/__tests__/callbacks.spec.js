@@ -399,11 +399,10 @@ describe('getDefaultHandlers voice reasoning guard', () => {
       streamId: null,
     });
 
-    await handlers[GraphEvents.ON_REASONING_DELTA].handle(
-      GraphEvents.ON_REASONING_DELTA,
-      data,
-      { last_agent_id: 'agent-1', langgraph_node: 'node_agent-1' },
-    );
+    await handlers[GraphEvents.ON_REASONING_DELTA].handle(GraphEvents.ON_REASONING_DELTA, data, {
+      last_agent_id: 'agent-1',
+      langgraph_node: 'node_agent-1',
+    });
 
     expect(sendEvent).toHaveBeenCalledWith(res, {
       event: GraphEvents.ON_REASONING_DELTA,

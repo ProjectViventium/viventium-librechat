@@ -56,7 +56,8 @@ const logVoiceLatencyStage = (req, stage, stageStartAt = null, details = '') => 
     return;
   }
   const now = Date.now();
-  const routeStartAt = typeof req?.viventiumVoiceStartAt === 'number' ? req.viventiumVoiceStartAt : now;
+  const routeStartAt =
+    typeof req?.viventiumVoiceStartAt === 'number' ? req.viventiumVoiceStartAt : now;
   const stageMs = typeof stageStartAt === 'number' ? now - stageStartAt : null;
   const requestId = getVoiceLatencyRequestId(req);
   const stagePart = stageMs == null ? '' : ` stage_ms=${stageMs}`;
@@ -646,7 +647,10 @@ function getDefaultHandlers({
             `delta_parts=${deltaCount}`,
           );
         }
-        const shouldEmitLastAgent = checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node);
+        const shouldEmitLastAgent = checkIfLastAgent(
+          metadata?.last_agent_id,
+          metadata?.langgraph_node,
+        );
         const shouldEmit = shouldEmitLastAgent || !metadata?.hide_sequential_outputs;
         const emitStartedAt = shouldEmit ? Date.now() : null;
 
@@ -680,12 +684,7 @@ function getDefaultHandlers({
       handle: async (event, data, metadata) => {
         const reasoningMetric = markVoiceOrchEvent(req, 'on_reasoning_delta');
         if (reasoningMetric?.firstSeen) {
-          logVoiceLatencyStage(
-            req,
-            'first_reasoning_delta',
-            getVoiceProcessStreamStartAt(req),
-            '',
-          );
+          logVoiceLatencyStage(req, 'first_reasoning_delta', getVoiceProcessStreamStartAt(req), '');
         }
         /* === VIVENTIUM START ===
          * Feature: Voice reasoning visibility guard.

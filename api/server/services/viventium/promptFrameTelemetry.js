@@ -549,6 +549,14 @@ function writePromptFrameFile(frame) {
   return true;
 }
 
+async function flushPromptFrameFileWrites({ timeoutMs = 1000 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (pendingFileWrites > 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return pendingFileWrites === 0;
+}
+
 function logPromptFrame(targetLogger, frame) {
   if (
     process.env[LOG_ENV] === '0' ||
@@ -597,4 +605,5 @@ module.exports = {
   logPromptFrame,
   resolvePromptObservabilityDir,
   writePromptFrameFile,
+  flushPromptFrameFileWrites,
 };

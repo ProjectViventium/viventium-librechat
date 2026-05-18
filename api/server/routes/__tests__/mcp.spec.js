@@ -1371,7 +1371,9 @@ describe('MCP Routes', () => {
 
     it('should dedupe persistent warmup across rapid status polls', async () => {
       const originalCooldown = process.env.MCP_PERSISTENT_WARMUP_COOLDOWN_MS;
+      const originalProbeTimeout = process.env.MCP_LOCAL_ENDPOINT_PROBE_TIMEOUT_MS;
       process.env.MCP_PERSISTENT_WARMUP_COOLDOWN_MS = '60000';
+      process.env.MCP_LOCAL_ENDPOINT_PROBE_TIMEOUT_MS = '0';
 
       try {
         const mockGetConnection = jest.fn().mockResolvedValue({});
@@ -1407,6 +1409,11 @@ describe('MCP Routes', () => {
           delete process.env.MCP_PERSISTENT_WARMUP_COOLDOWN_MS;
         } else {
           process.env.MCP_PERSISTENT_WARMUP_COOLDOWN_MS = originalCooldown;
+        }
+        if (originalProbeTimeout === undefined) {
+          delete process.env.MCP_LOCAL_ENDPOINT_PROBE_TIMEOUT_MS;
+        } else {
+          process.env.MCP_LOCAL_ENDPOINT_PROBE_TIMEOUT_MS = originalProbeTimeout;
         }
       }
     });

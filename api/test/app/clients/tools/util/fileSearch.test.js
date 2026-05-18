@@ -1118,7 +1118,10 @@ describe('fileSearch.js - tuple return validation', () => {
             ]),
           });
         }
-        if (Array.isArray(body.file_ids) && body.file_ids.includes('meeting_summary:user_1:helios')) {
+        if (
+          Array.isArray(body.file_ids) &&
+          body.file_ids.includes('meeting_summary:user_1:helios')
+        ) {
           return Promise.resolve({
             data: [
               [
@@ -1159,9 +1162,11 @@ describe('fileSearch.js - tuple return validation', () => {
       });
 
       expect(artifact.file_search.sources).toHaveLength(3);
-      expect(artifact.file_search.sources.some((source) => source.fileId === 'meeting_summary:user_1:helios')).toBe(
-        true,
-      );
+      expect(
+        artifact.file_search.sources.some(
+          (source) => source.fileId === 'meeting_summary:user_1:helios',
+        ),
+      ).toBe(true);
       expect(
         artifact.file_search.sources.some((source) =>
           source.content.includes('Mira owns the risk register'),
@@ -1476,11 +1481,9 @@ describe('fileSearch.js - tuple return validation', () => {
         ],
       });
 
-      const [, artifact] = await fileSearchTool.func(
-        { query },
-        undefined,
-        { configurable: { thread_id: 'current-convo' } },
-      );
+      const [, artifact] = await fileSearchTool.func({ query }, undefined, {
+        configurable: { thread_id: 'current-convo' },
+      });
 
       expect(artifact.file_search.sources[0].content).not.toContain(query);
       expect(artifact.file_search.sources[0].content).toContain(

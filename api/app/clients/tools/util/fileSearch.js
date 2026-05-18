@@ -349,7 +349,10 @@ const preserveMeetingTranscriptResults = ({ results = [], maxResults }) => {
 
   const detailBudget = Math.max(
     0,
-    Math.min(getMeetingTranscriptFileSearchMinResultsWhenMixed(), maxResults - requiredResults.length),
+    Math.min(
+      getMeetingTranscriptFileSearchMinResultsWhenMixed(),
+      maxResults - requiredResults.length,
+    ),
   );
   for (const result of results) {
     if (requiredResults.filter(isMeetingTranscriptDetailResult).length >= detailBudget) {
@@ -971,7 +974,9 @@ const createFileSearchTool = async ({
   activeMessageId,
   fileCitations = false,
 }) => {
-  const hasMeetingTranscriptResources = files.some((file) => isMeetingTranscriptFileId(file?.file_id));
+  const hasMeetingTranscriptResources = files.some((file) =>
+    isMeetingTranscriptFileId(file?.file_id),
+  );
   const meetingTranscriptDescription = hasMeetingTranscriptResources
     ? '\n\nWhen meeting transcript recall is attached, a meeting transcript inventory/TOC may be returned as source-backed evidence. Use it to orient broad questions about what transcript meetings exist, then use individual detailed transcript summaries for the actual meeting details. Treat transcript evidence as softer than direct chat/saved memory.'
     : '';
@@ -1089,10 +1094,13 @@ const createFileSearchTool = async ({
         for (const file of targetFiles) {
           if (isMeetingTranscriptInventoryFile(file)) {
             const inventoryText = getMeetingTranscriptInventoryText(file);
-            logger.debug(`[${Tools.file_search}] using source-backed meeting transcript inventory`, {
-              fileId: file.file_id,
-              hasInventoryText: Boolean(inventoryText),
-            });
+            logger.debug(
+              `[${Tools.file_search}] using source-backed meeting transcript inventory`,
+              {
+                fileId: file.file_id,
+                hasInventoryText: Boolean(inventoryText),
+              },
+            );
             sourceBackedResults.push(
               inventoryText
                 ? {
@@ -1102,7 +1110,9 @@ const createFileSearchTool = async ({
                         [
                           {
                             page_content: inventoryText,
-                            metadata: { source: file.filename || 'meeting-transcript-inventory.txt' },
+                            metadata: {
+                              source: file.filename || 'meeting-transcript-inventory.txt',
+                            },
                           },
                           DEFAULT_FILE_SEARCH_DISTANCE_MEETING_TRANSCRIPT_INVENTORY,
                         ],
@@ -1320,7 +1330,10 @@ const createFileSearchTool = async ({
         const result = limitedResults[index];
         const resultMaxChars = isConversationRecallFileId(result.file_id)
           ? getConversationRecallFileSearchResultMaxChars()
-          : isMeetingTranscriptInventoryFile({ file_id: result.file_id, metadata: result.fileMetadata })
+          : isMeetingTranscriptInventoryFile({
+                file_id: result.file_id,
+                metadata: result.fileMetadata,
+              })
             ? getMeetingTranscriptInventoryFileSearchResultMaxChars()
             : isMeetingTranscriptFileId(result.file_id)
               ? getMeetingTranscriptFileSearchResultMaxChars()

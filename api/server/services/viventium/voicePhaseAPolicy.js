@@ -15,7 +15,9 @@ const {
 } = require('~/server/services/viventium/brewingHold');
 
 const asBool = (value) => {
-  const raw = String(value || '').trim().toLowerCase();
+  const raw = String(value || '')
+    .trim()
+    .toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
 };
 
@@ -37,7 +39,10 @@ const hasToolHoldCandidateConfigured = (agent) =>
 const shouldAllowAsyncWhenToolHoldConfigured = () =>
   asBool(process.env.VIVENTIUM_VOICE_PHASE_A_ASYNC_ALLOW_TOOL_HOLD);
 
-const normalizeScopeKey = (scopeKey) => String(scopeKey || '').trim().toLowerCase();
+const normalizeScopeKey = (scopeKey) =>
+  String(scopeKey || '')
+    .trim()
+    .toLowerCase();
 
 const getUnownedToolHoldScopeKeys = (
   agent,
@@ -56,7 +61,9 @@ const getUnownedToolHoldScopeKeys = (
     }).map(normalizeScopeKey),
   );
 
-  return toolHoldScopeKeys.filter((scopeKey) => !effectiveScopeKeys.has(normalizeScopeKey(scopeKey)));
+  return toolHoldScopeKeys.filter(
+    (scopeKey) => !effectiveScopeKeys.has(normalizeScopeKey(scopeKey)),
+  );
 };
 
 function resolveVoicePhaseAAsyncPolicy({

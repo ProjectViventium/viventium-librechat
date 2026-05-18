@@ -192,8 +192,7 @@ function normalizePersistedAssistantResponse(req, response) {
     persistedResponse.content = sanitizePersistedAssistantContent(req, persistedResponse.content);
   }
 
-  const currentText =
-    typeof persistedResponse.text === 'string' ? persistedResponse.text : '';
+  const currentText = typeof persistedResponse.text === 'string' ? persistedResponse.text : '';
   const sanitizedCurrentText = sanitizePersistedAssistantText(req, currentText);
   const contentText = extractTextFromContentParts(persistedResponse.content);
 
@@ -236,7 +235,12 @@ async function persistAssistantSnapshot({
   let resolvedSender = client?.sender ?? sender ?? null;
   let resumeState = null;
 
-  if (!resolvedUserMessage || !resolvedResponseMessageId || !resolvedConversationId || !resolvedSender) {
+  if (
+    !resolvedUserMessage ||
+    !resolvedResponseMessageId ||
+    !resolvedConversationId ||
+    !resolvedSender
+  ) {
     resumeState = await GenerationJobManager.getResumeState(streamId);
     resolvedUserMessage =
       resolvedUserMessage ??
@@ -1437,12 +1441,12 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
         /* === VIVENTIUM NOTE ===
          * Feature: Strip voice control tags from persisted response text (non-resumable path).
          */
-          const persistedFinalResponse = normalizePersistedAssistantResponse(req, {
-            ...finalResponse,
-            user: userId,
-          });
-          /* === VIVENTIUM NOTE END === */
-          await timedSaveMessage(
+        const persistedFinalResponse = normalizePersistedAssistantResponse(req, {
+          ...finalResponse,
+          user: userId,
+        });
+        /* === VIVENTIUM NOTE END === */
+        await timedSaveMessage(
           req,
           persistedFinalResponse,
           { context: 'api/server/controllers/agents/request.js - response end' },

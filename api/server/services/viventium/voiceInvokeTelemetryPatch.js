@@ -25,11 +25,9 @@ const FETCH_PATCH_FLAG = Symbol.for('viventium.voice.invoke.telemetry.fetch.patc
 const INVOKE_CONTEXT = new AsyncLocalStorage();
 const AGENTS_CJS_DIR = path.dirname(require.resolve('@librechat/agents'));
 
-const requireAgentsCjsModule = (relativePath) =>
-  require(path.join(AGENTS_CJS_DIR, relativePath));
+const requireAgentsCjsModule = (relativePath) => require(path.join(AGENTS_CJS_DIR, relativePath));
 
-const asObject = (value) =>
-  value != null && typeof value === 'object' ? value : null;
+const asObject = (value) => (value != null && typeof value === 'object' ? value : null);
 
 const isVoiceLatencyEnabled = () => process.env.VIVENTIUM_VOICE_LOG_LATENCY === '1';
 
@@ -310,7 +308,9 @@ const installFetchTelemetryPatch = () => {
 
     const method =
       (init && typeof init === 'object' && typeof init.method === 'string' ? init.method : null) ||
-      (input && typeof input === 'object' && typeof input.method === 'string' ? input.method : null) ||
+      (input && typeof input === 'object' && typeof input.method === 'string'
+        ? input.method
+        : null) ||
       'GET';
     const host = String(urlObj.hostname || '').toLowerCase();
     const endpoint = String(urlObj.pathname || '');
@@ -358,7 +358,13 @@ const installFetchTelemetryPatch = () => {
   return true;
 };
 
-const installTimedModuleFunctionPatch = ({ moduleObj, fnName, stage, wrapResult = null, details = null }) => {
+const installTimedModuleFunctionPatch = ({
+  moduleObj,
+  fnName,
+  stage,
+  wrapResult = null,
+  details = null,
+}) => {
   if (!moduleObj || typeof moduleObj !== 'object') {
     return false;
   }

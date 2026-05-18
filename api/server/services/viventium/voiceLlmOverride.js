@@ -9,9 +9,7 @@
 
 const { logger } = require('@librechat/data-schemas');
 const { resolveViventiumSurface } = require('./surfacePrompts');
-const {
-  readVoiceAssignment,
-} = require('../../../../scripts/viventium-agent-runtime-models');
+const { readVoiceAssignment } = require('../../../../scripts/viventium-agent-runtime-models');
 
 const PROVIDER_ENV_KEYS = Object.freeze({
   anthropic: ['ANTHROPIC_API_KEY'],
@@ -23,7 +21,9 @@ const PROVIDER_ENV_KEYS = Object.freeze({
 });
 
 function normalizeProvider(provider) {
-  const raw = String(provider || '').trim().toLowerCase();
+  const raw = String(provider || '')
+    .trim()
+    .toLowerCase();
   if (!raw) {
     return '';
   }
@@ -61,14 +61,12 @@ function resolveVoiceOverrideAssignment(agent) {
 
   const explicitProvider = normalizeProvider(agent.voice_llm_provider);
   const explicitModel = String(agent.voice_llm_model || '').trim();
-  const assignment = readVoiceAssignment(
-    {
-      explicitProvider,
-      explicitModel,
-      mainProvider: agent.provider,
-      mainModel: agent.model || agent.model_parameters?.model || '',
-    },
-  );
+  const assignment = readVoiceAssignment({
+    explicitProvider,
+    explicitModel,
+    mainProvider: agent.provider,
+    mainModel: agent.model || agent.model_parameters?.model || '',
+  });
 
   if (!assignment) {
     return null;

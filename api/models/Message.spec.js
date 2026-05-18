@@ -582,9 +582,7 @@ describe('Message Operations', () => {
       expect(actualExpirationTime.getTime()).toBeGreaterThanOrEqual(
         beforeSave + retentionMs - 1000,
       );
-      expect(actualExpirationTime.getTime()).toBeLessThanOrEqual(
-        afterSave + retentionMs + 1000,
-      );
+      expect(actualExpirationTime.getTime()).toBeLessThanOrEqual(afterSave + retentionMs + 1000);
       /* === VIVENTIUM END === */
     });
 
@@ -612,9 +610,7 @@ describe('Message Operations', () => {
       expect(actualExpirationTime.getTime()).toBeGreaterThanOrEqual(
         beforeSave + retentionMs - 1000,
       );
-      expect(actualExpirationTime.getTime()).toBeLessThanOrEqual(
-        afterSave + retentionMs + 1000,
-      );
+      expect(actualExpirationTime.getTime()).toBeLessThanOrEqual(afterSave + retentionMs + 1000);
       /* === VIVENTIUM END === */
     });
 
@@ -642,9 +638,7 @@ describe('Message Operations', () => {
       expect(actualExpirationTime.getTime()).toBeGreaterThanOrEqual(
         beforeSave + retentionMs - 1000,
       );
-      expect(actualExpirationTime.getTime()).toBeLessThanOrEqual(
-        afterSave + retentionMs + 1000,
-      );
+      expect(actualExpirationTime.getTime()).toBeLessThanOrEqual(afterSave + retentionMs + 1000);
       /* === VIVENTIUM END === */
     });
 

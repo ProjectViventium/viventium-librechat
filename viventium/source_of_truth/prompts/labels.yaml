@@ -1,0 +1,17 @@
+schema_version: 1
+labels:
+  staging:
+    description: Current candidate prompt bundle reviewed in Prompt Workbench.
+    source_commit: null
+    prompt_hashes: {}
+    eval_run_ids: []
+  production:
+    description: Last prompt bundle intentionally pushed to live managed agents.
+    source_commit: null
+    prompt_hashes: {}
+    eval_run_ids: []
+  last-known-good:
+    description: Last evaluated prompt bundle that passed the public-safe regression bank.
+    source_commit: null
+    prompt_hashes: {}
+    eval_run_ids: []

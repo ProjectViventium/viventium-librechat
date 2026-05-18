@@ -1134,9 +1134,21 @@ router.get('/stream/:streamId', voiceAuth, async (req, res) => {
   const { streamId } = req.params;
   const isResume = req.query.resume === 'true';
   const userId = req.user?.id;
+  const callSessionId = req.viventiumCallSession?.callSessionId || 'unknown';
+  const logLatency = parseBoolEnv('VIVENTIUM_VOICE_LOG_LATENCY', false);
 
   const job = await GenerationJobManager.getJob(streamId);
   if (!job) {
+    logger.warn(
+      `[VIVENTIUM][VoiceStream] stream_not_found streamId=${streamId} ` +
+        `callSessionId=${callSessionId} resume=${isResume} userId=${userId || 'unknown'}`,
+    );
+    if (logLatency) {
+      logger.info(
+        `[VoiceLatency][LC][Stream] stage=stream_not_found stream_id=${streamId} ` +
+          `call_session_id=${callSessionId} resume=${isResume}`,
+      );
+    }
     return res.status(404).json({
       error: 'Stream not found',
       message: 'The generation job does not exist or has expired.',
@@ -1155,6 +1167,12 @@ router.get('/stream/:streamId', voiceAuth, async (req, res) => {
   res.flushHeaders();
 
   logger.debug?.(`[VIVENTIUM][VoiceStream] subscribed ${streamId}, resume=${isResume}`);
+  if (logLatency) {
+    logger.info(
+      `[VoiceLatency][LC][Stream] stage=stream_subscribe_start stream_id=${streamId} ` +
+        `call_session_id=${callSessionId} resume=${isResume}`,
+    );
+  }
 
   if (isResume) {
     const resumeState = await GenerationJobManager.getResumeState(streamId);
@@ -1197,7 +1215,26 @@ router.get('/stream/:streamId', voiceAuth, async (req, res) => {
   );
 
   if (!result) {
-    return res.status(404).json({ error: 'Failed to subscribe to stream' });
+    logger.warn(
+      `[VIVENTIUM][VoiceStream] subscribe_failed streamId=${streamId} ` +
+        `callSessionId=${callSessionId} resume=${isResume}`,
+    );
+    if (logLatency) {
+      logger.info(
+        `[VoiceLatency][LC][Stream] stage=stream_subscribe_failed stream_id=${streamId} ` +
+          `call_session_id=${callSessionId} resume=${isResume}`,
+      );
+    }
+    if (!res.headersSent) {
+      return res.status(404).json({ error: 'Failed to subscribe to stream' });
+    }
+    if (!res.writableEnded) {
+      res.write(
+        `event: error\ndata: ${JSON.stringify({ error: 'Failed to subscribe to stream' })}\n\n`,
+      );
+      res.end();
+    }
+    return;
   }
 
   req.on('close', () => {

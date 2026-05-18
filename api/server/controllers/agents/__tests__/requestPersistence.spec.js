@@ -12,6 +12,7 @@ jest.mock('@librechat/data-schemas', () => ({
 
 jest.mock('librechat-data-provider', () => ({
   Constants: {},
+  ContentTypes: { THINK: 'think' },
   ViolationTypes: {},
 }));
 
@@ -131,6 +132,7 @@ describe('request persistence helpers', () => {
       conversationId: 'convo-1',
       aggregatedContent: [
         { type: 'text', text: '<emotion value="content"/>Yeah.' },
+        { type: 'think', think: 'The user said: hello' },
         { type: 'tool_use', id: 'tool-1', name: 'x' },
       ],
       unfinished: true,
@@ -149,6 +151,28 @@ describe('request persistence helpers', () => {
         ],
       }),
       expect.objectContaining({ context: 'test-voice-sanitized-content' }),
+    );
+  });
+
+  it('normalizes final assistant text from visible content parts when text is empty', () => {
+    const req = {
+      body: { voiceMode: true },
+    };
+
+    const response = __testables.normalizePersistedAssistantResponse(req, {
+      messageId: 'assistant-msg-1',
+      text: '',
+      content: [
+        { type: 'think', think: 'The user said: hello' },
+        { type: 'text', text: '<emotion value="warm"/>Alpha. Beta.' },
+      ],
+    });
+
+    expect(response).toEqual(
+      expect.objectContaining({
+        text: 'Alpha. Beta.',
+        content: [{ type: 'text', text: 'Alpha. Beta.' }],
+      }),
     );
   });
 

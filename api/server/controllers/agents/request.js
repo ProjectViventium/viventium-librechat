@@ -17,7 +17,7 @@
  * Updated: 2026-01-31, 2026-02-07
  */
 const { logger } = require('@librechat/data-schemas');
-const { Constants, ViolationTypes } = require('librechat-data-provider');
+const { Constants, ContentTypes, ViolationTypes } = require('librechat-data-provider');
 const {
   sendEvent,
   getViolationInfo,
@@ -112,9 +112,29 @@ function sanitizePersistedAssistantContent(req, content) {
   }
 
   let changed = false;
-  const sanitized = content.map((part) => {
-    if (!part || typeof part !== 'object' || part.type !== 'text') {
-      return part;
+  const sanitized = [];
+
+  for (const part of content) {
+    if (!part || typeof part !== 'object') {
+      sanitized.push(part);
+      continue;
+    }
+
+    /* === VIVENTIUM START ===
+     * Feature: Voice reasoning visibility guard.
+     * Purpose: Provider thinking/reasoning blocks are never audible voice response content, so
+     * do not persist them into the conversation transcript for voice calls.
+     * Added: 2026-05-14
+     */
+    if (part.type === ContentTypes.THINK || part.type === 'reasoning') {
+      changed = true;
+      continue;
+    }
+    /* === VIVENTIUM END === */
+
+    if (part.type !== 'text') {
+      sanitized.push(part);
+      continue;
     }
 
     const rawText =
@@ -125,35 +145,63 @@ function sanitizePersistedAssistantContent(req, content) {
           : '';
     const cleanedText = stripVoiceControlTagsForDisplay(rawText);
     if (cleanedText === rawText) {
-      return part;
+      sanitized.push(part);
+      continue;
     }
 
     changed = true;
     if (typeof part.text === 'string') {
-      return {
+      sanitized.push({
         ...part,
         text: cleanedText,
-      };
+      });
+      continue;
     }
 
     if (part.text && typeof part.text === 'object') {
-      return {
+      sanitized.push({
         ...part,
         text: {
           ...part.text,
           value: cleanedText,
         },
-      };
+      });
+      continue;
     }
 
-    return {
+    sanitized.push({
       ...part,
       text: cleanedText,
-    };
-  });
+    });
+  }
 
   return changed ? sanitized : content;
 }
+
+/* === VIVENTIUM START ===
+ * Feature: Voice/content persistence parity.
+ * Purpose: Some streaming providers return final assistant messages with content parts populated
+ * but legacy `text` empty. LibreChat can render the content parts, but search/export/older paths
+ * still expect `text` to mirror visible assistant speech.
+ * Added: 2026-05-15
+ */
+function normalizePersistedAssistantResponse(req, response) {
+  const persistedResponse = { ...response };
+
+  if (Array.isArray(persistedResponse.content)) {
+    persistedResponse.content = sanitizePersistedAssistantContent(req, persistedResponse.content);
+  }
+
+  const currentText =
+    typeof persistedResponse.text === 'string' ? persistedResponse.text : '';
+  const sanitizedCurrentText = sanitizePersistedAssistantText(req, currentText);
+  const contentText = extractTextFromContentParts(persistedResponse.content);
+
+  persistedResponse.text = sanitizedCurrentText || sanitizePersistedAssistantText(req, contentText);
+
+  return persistedResponse;
+}
+/* === VIVENTIUM END === */
 
 async function persistAssistantSnapshot({
   req,
@@ -411,7 +459,9 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
         req,
         'resumable_ready_sent',
         null,
-        `stream_id=${streamId} conversation_id=${conversationId}`,
+        `stream_id=${streamId} stream_id_source=${
+          reqStreamId ? 'request' : 'conversation'
+        } conversation_id=${conversationId}`,
       );
     }
 
@@ -795,20 +845,11 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
            * that TTS needs, but should not appear in the persisted message text.
            * The SSE stream (consumed by voice gateway for TTS) is unaffected.
            */
-          const persistedResponse = {
+          const persistedResponse = normalizePersistedAssistantResponse(req, {
             ...response,
             user: userId,
             unfinished: wasAbortedBeforeComplete,
-          };
-          if (Array.isArray(persistedResponse.content)) {
-            persistedResponse.content = sanitizePersistedAssistantContent(
-              req,
-              persistedResponse.content,
-            );
-          }
-          if (req.body?.voiceMode === true && typeof persistedResponse.text === 'string') {
-            persistedResponse.text = stripVoiceControlTagsForDisplay(persistedResponse.text);
-          }
+          });
           /* === VIVENTIUM NOTE END === */
           await timedSaveMessage(
             req,
@@ -855,12 +896,13 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           }
           /* === VIVENTIUM NOTE END === */
 
+          const responseMessageForTransmit = normalizePersistedAssistantResponse(req, response);
           const finalEvent = {
             final: true,
             conversation,
             title: conversation.title,
             requestMessage: sanitizeMessageForTransmit(userMessage),
-            responseMessage: { ...response },
+            responseMessage: responseMessageForTransmit,
           };
 
           logger.debug(`[ResumableAgentController] Emitting FINAL event`, {
@@ -890,22 +932,89 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           if (phaseBPromise && typeof phaseBPromise.then === 'function') {
             const rawTimeout = Number(process.env.VIVENTIUM_PHASE_B_STREAM_WAIT_MS);
             const timeoutMs = Number.isFinite(rawTimeout) && rawTimeout > 0 ? rawTimeout : 180_000;
+            const phaseBWaitStartedAt = Date.now();
+            if (voiceLatencyEnabled) {
+              logVoiceLatencyStage(
+                req,
+                'phase_b_wait_start',
+                null,
+                `stream_id=${streamId} timeout_ms=${timeoutMs}`,
+              );
+            }
             try {
+              let phaseBWaitOutcome = 'resolved';
               await Promise.race([
-                phaseBPromise,
-                new Promise((resolve) => setTimeout(resolve, timeoutMs)),
+                phaseBPromise.then(
+                  () => {
+                    phaseBWaitOutcome = 'resolved';
+                  },
+                  (error) => {
+                    phaseBWaitOutcome = 'rejected';
+                    throw error;
+                  },
+                ),
+                new Promise((resolve) =>
+                  setTimeout(() => {
+                    phaseBWaitOutcome = 'timeout';
+                    resolve();
+                  }, timeoutMs),
+                ),
               ]);
+              if (voiceLatencyEnabled) {
+                logVoiceLatencyStage(
+                  req,
+                  'phase_b_wait_done',
+                  phaseBWaitStartedAt,
+                  `stream_id=${streamId} outcome=${phaseBWaitOutcome}`,
+                );
+              }
             } catch (phaseBError) {
+              if (voiceLatencyEnabled) {
+                logVoiceLatencyStage(
+                  req,
+                  'phase_b_wait_error',
+                  phaseBWaitStartedAt,
+                  `stream_id=${streamId}`,
+                );
+              }
               logger.warn(
                 '[ResumableAgentController] Phase B wait failed before completeJob:',
                 phaseBError?.message ?? String(phaseBError),
               );
             }
+          } else if (voiceLatencyEnabled) {
+            logVoiceLatencyStage(req, 'phase_b_wait_skipped', null, `stream_id=${streamId}`);
           }
           /* === VIVENTIUM END === */
 
+          const currentJobAfterPhaseB = await GenerationJobManager.getJob(streamId);
+          const jobWasReplacedAfterPhaseB =
+            !currentJobAfterPhaseB || currentJobAfterPhaseB.createdAt !== jobCreatedAt;
+
           stopPartialCheckpointing();
-          GenerationJobManager.completeJob(streamId);
+          if (jobWasReplacedAfterPhaseB) {
+            logger.warn(
+              '[ResumableAgentController] Skipping completeJob - job was replaced after Phase B wait',
+              {
+                streamId,
+                originalCreatedAt: jobCreatedAt,
+                currentCreatedAt: currentJobAfterPhaseB?.createdAt,
+              },
+            );
+            if (voiceLatencyEnabled) {
+              logVoiceLatencyStage(
+                req,
+                'phase_b_complete_skipped_replaced_job',
+                null,
+                `stream_id=${streamId}`,
+              );
+            }
+          } else {
+            if (voiceLatencyEnabled) {
+              logVoiceLatencyStage(req, 'phase_b_complete_job', null, `stream_id=${streamId}`);
+            }
+            GenerationJobManager.completeJob(streamId);
+          }
         } else {
           const finalEvent = {
             final: true,
@@ -1312,7 +1421,7 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
     // Only send if not aborted
     if (!job.abortController.signal.aborted) {
       // Create a new response object with minimal copies
-      const finalResponse = { ...response };
+      const finalResponse = normalizePersistedAssistantResponse(req, response);
 
       sendEvent(res, {
         final: true,
@@ -1328,20 +1437,12 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
         /* === VIVENTIUM NOTE ===
          * Feature: Strip voice control tags from persisted response text (non-resumable path).
          */
-        const persistedFinalResponse = { ...finalResponse, user: userId };
-        if (Array.isArray(persistedFinalResponse.content)) {
-          persistedFinalResponse.content = sanitizePersistedAssistantContent(
-            req,
-            persistedFinalResponse.content,
-          );
-        }
-        if (req.body?.voiceMode === true && typeof persistedFinalResponse.text === 'string') {
-          persistedFinalResponse.text = stripVoiceControlTagsForDisplay(
-            persistedFinalResponse.text,
-          );
-        }
-        /* === VIVENTIUM NOTE END === */
-        await timedSaveMessage(
+          const persistedFinalResponse = normalizePersistedAssistantResponse(req, {
+            ...finalResponse,
+            user: userId,
+          });
+          /* === VIVENTIUM NOTE END === */
+          await timedSaveMessage(
           req,
           persistedFinalResponse,
           { context: 'api/server/controllers/agents/request.js - response end' },
@@ -1424,6 +1525,7 @@ module.exports.__testables = {
   extractTextFromContentParts,
   sanitizePersistedAssistantContent,
   sanitizePersistedAssistantText,
+  normalizePersistedAssistantResponse,
   persistAssistantSnapshot,
 };
 

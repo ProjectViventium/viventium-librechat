@@ -21,6 +21,7 @@ let mockLastParentMessageId = null;
 let mockLastConversationId = null;
 let mockLastAgentId = null;
 let mockLastRequestText = null;
+let mockLastStreamId = null;
 let mockAgentControllerCallCount = 0;
 let mockAgentControllerResponseDelayMs = 0;
 let mockAgentControllerGeneratedConversationId = null;
@@ -74,9 +75,10 @@ jest.mock('~/server/controllers/agents/request', () => (req, res) => {
   mockLastConversationId = req.body.conversationId;
   mockLastAgentId = req.body.agent_id;
   mockLastRequestText = req.body.text;
+  mockLastStreamId = req.body.streamId;
   const respond = () =>
     res.json({
-      streamId: 'stream_voice_1',
+      streamId: req.body.streamId || 'stream_voice_1',
       conversationId:
         req.body.conversationId === 'new' && mockAgentControllerGeneratedConversationId
           ? mockAgentControllerGeneratedConversationId
@@ -275,6 +277,7 @@ describe('/api/viventium/voice/chat', () => {
     mockLastConversationId = null;
     mockLastAgentId = null;
     mockLastRequestText = null;
+    mockLastStreamId = null;
     mockAgentControllerCallCount = 0;
     mockAgentControllerResponseDelayMs = 0;
     mockAgentControllerGeneratedConversationId = null;
@@ -375,6 +378,27 @@ describe('/api/viventium/voice/chat', () => {
     expect(mockLastConversationId).toBe('conv-voice-1');
     expect(mockLastParentMessageId).toBe('voice-assistant-leaf');
     expect(mockLastAgentId).toBe('agent_voice');
+  });
+
+  test('preserves a gateway-supplied per-turn streamId', async () => {
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      url: '/api/viventium/voice/chat',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-request-id': 'lc_req_1',
+      },
+      body: { text: 'stream this turn', streamId: 'lc_req_1' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockLastStreamId).toBe('lc_req_1');
+    expect(res.body.streamId).toBe('lc_req_1');
+    expect(mockLastConversationId).toBe('conv-voice-1');
   });
 
   test('resets invalid conversations to new and NO_PARENT', async () => {

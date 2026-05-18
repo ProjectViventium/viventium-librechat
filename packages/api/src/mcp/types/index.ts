@@ -154,6 +154,8 @@ export type ParsedServerConfig = MCPOptions & {
   initDuration?: number;
   updatedAt?: number;
   dbId?: string;
+  /** Origin of this server definition when supplied by admin/user config layers */
+  source?: 'yaml' | 'config' | 'user';
   /** True if access is only via agent (not directly shared with user) */
   consumeOnly?: boolean;
   /** True when inspection failed at startup; the server is known but not fully initialized */
@@ -197,6 +199,8 @@ export interface ToolDiscoveryOptions {
   customUserVars?: Record<string, string>;
   requestBody?: RequestBody;
   connectionTimeout?: number;
+  /** Pre-resolved config-source servers for tenant-scoped lookup */
+  configServers?: Record<string, ParsedServerConfig>;
 }
 
 export interface ToolDiscoveryResult {

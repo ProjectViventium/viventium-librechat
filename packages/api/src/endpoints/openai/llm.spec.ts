@@ -4,6 +4,7 @@ import {
   ReasoningEffort,
   ReasoningSummary,
 } from 'librechat-data-provider';
+import { ChatOpenAI } from '@langchain/openai';
 import { getOpenAILLMConfig, extractDefaultParams, applyDefaultParams } from './llm';
 import type * as t from '~/types';
 
@@ -480,6 +481,85 @@ describe('getOpenAILLMConfig', () => {
         effort: ReasoningEffort.high,
         summary: ReasoningSummary.concise,
       });
+    });
+
+    it('should use reasoning_effort for xAI Chat Completions custom endpoint', () => {
+      const result = getOpenAILLMConfig({
+        apiKey: 'test-api-key',
+        streaming: true,
+        endpoint: 'xai',
+        modelOptions: {
+          model: 'grok-4.3',
+          reasoning_effort: ReasoningEffort.none,
+        },
+      });
+
+      expect(result.llmConfig).toHaveProperty('modelKwargs.reasoning_effort', ReasoningEffort.none);
+      expect(result.llmConfig).not.toHaveProperty('reasoning_effort');
+      expect(result.llmConfig).not.toHaveProperty('reasoning');
+
+      const params = new ChatOpenAI(result.llmConfig as ConstructorParameters<typeof ChatOpenAI>[0])
+        .invocationParams();
+
+      expect(params).toHaveProperty('reasoning_effort', ReasoningEffort.none);
+      expect(params).not.toHaveProperty('reasoning');
+    });
+
+    it('should use reasoning_effort for xAI Grok 4.3 aliases', () => {
+      for (const model of ['grok-4.3-latest', 'grok-latest', 'xai/grok-4.3']) {
+        const result = getOpenAILLMConfig({
+          apiKey: 'test-api-key',
+          streaming: true,
+          endpoint: 'xai',
+          modelOptions: {
+            model,
+            reasoning_effort: ReasoningEffort.none,
+          },
+        });
+
+        expect(result.llmConfig).toHaveProperty('modelKwargs.reasoning_effort', ReasoningEffort.none);
+      }
+    });
+
+    it('should not send reasoning_effort to older xAI Chat Completions model slugs', () => {
+      for (const model of ['grok-4-1-fast-non-reasoning', 'grok-4.20-non-reasoning']) {
+        const result = getOpenAILLMConfig({
+          apiKey: 'test-api-key',
+          streaming: true,
+          endpoint: 'xai',
+          modelOptions: {
+            model,
+            reasoning_effort: ReasoningEffort.none,
+          },
+        });
+
+        expect(result.llmConfig).not.toHaveProperty('modelKwargs.reasoning_effort');
+        expect(result.llmConfig).not.toHaveProperty('reasoning_effort');
+        expect(result.llmConfig).not.toHaveProperty('reasoning');
+      }
+    });
+
+    it('should keep xAI reasoning on reasoning object when Responses API is enabled', () => {
+      const result = getOpenAILLMConfig({
+        apiKey: 'test-api-key',
+        streaming: true,
+        endpoint: 'xai',
+        modelOptions: {
+          model: 'grok-4.3',
+          reasoning_effort: ReasoningEffort.none,
+          reasoning_summary: ReasoningSummary.concise,
+        },
+        addParams: {
+          useResponsesApi: true,
+        },
+      });
+
+      expect(result.llmConfig).toHaveProperty('reasoning');
+      expect(result.llmConfig.reasoning).toEqual({
+        effort: ReasoningEffort.none,
+        summary: ReasoningSummary.concise,
+      });
+      expect(result.llmConfig).not.toHaveProperty('modelKwargs.reasoning_effort');
     });
 
     it('should use reasoning object when useResponsesApi is true', () => {

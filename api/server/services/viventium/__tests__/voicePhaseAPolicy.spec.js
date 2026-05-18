@@ -9,6 +9,7 @@ const {
   getConfiguredToolHoldScopeKeys,
   hasToolHoldCandidateConfigured,
   resolveVoicePhaseAAsyncPolicy,
+  resolveVoicePhaseAAsyncPolicyWithHydratedTools,
 } = require('../voicePhaseAPolicy');
 
 describe('voicePhaseAPolicy', () => {
@@ -78,6 +79,108 @@ describe('voicePhaseAPolicy', () => {
       forcedOff: false,
       reason: 'enabled',
       toolHoldScopeKeys: [],
+    });
+  });
+
+  test('keeps voice Phase A async when direct-action scope is owned by current tools', () => {
+    process.env.VIVENTIUM_VOICE_BACKGROUND_AGENT_DETECTION_ASYNC = 'true';
+    process.env.VIVENTIUM_VOICE_PHASE_A_ASYNC_ALLOW_TOOL_HOLD = 'false';
+
+    const agent = {
+      tools: [{ name: 'google_calendar_create_event' }],
+      background_cortices: [
+        {
+          agent_id: 'agent-google',
+          activation: { intent_scope: 'productivity_google_workspace' },
+        },
+      ],
+    };
+    const directActionSurfaces = [
+      {
+        scope_key: 'productivity_google_workspace',
+        tool_names: ['google_calendar_create_event'],
+      },
+    ];
+
+    expect(
+      resolveVoicePhaseAAsyncPolicy({
+        voiceMode: true,
+        agent,
+        directActionSurfaces,
+        agentTools: agent.tools,
+      }),
+    ).toMatchObject({
+      enabled: true,
+      requested: true,
+      forcedOff: false,
+      reason: 'direct_action_owned',
+      toolHoldScopeKeys: ['productivity_google_workspace'],
+      unownedToolHoldScopeKeys: [],
+    });
+  });
+
+  test('forces sync Phase A only for unowned direct-action hold scopes', () => {
+    process.env.VIVENTIUM_VOICE_BACKGROUND_AGENT_DETECTION_ASYNC = 'true';
+    process.env.VIVENTIUM_VOICE_PHASE_A_ASYNC_ALLOW_TOOL_HOLD = 'false';
+
+    const agent = {
+      tools: [],
+      background_cortices: [
+        {
+          agent_id: 'agent-ms365',
+          activation: { intent_scope: 'productivity_ms365' },
+        },
+      ],
+    };
+
+    expect(resolveVoicePhaseAAsyncPolicy({ voiceMode: true, agent })).toMatchObject({
+      enabled: false,
+      requested: true,
+      forcedOff: true,
+      reason: 'unowned_tool_hold_candidate_configured',
+      toolHoldScopeKeys: ['productivity_ms365'],
+      unownedToolHoldScopeKeys: ['productivity_ms365'],
+    });
+  });
+
+  test('rechecks forced-off policy with hydrated canonical tools before forcing sync', async () => {
+    process.env.VIVENTIUM_VOICE_BACKGROUND_AGENT_DETECTION_ASYNC = 'true';
+    process.env.VIVENTIUM_VOICE_PHASE_A_ASYNC_ALLOW_TOOL_HOLD = 'false';
+
+    const agent = {
+      tools: [],
+      background_cortices: [
+        {
+          agent_id: 'agent-google',
+          activation: { intent_scope: 'productivity_google_workspace' },
+        },
+      ],
+    };
+    const directActionSurfaces = [
+      {
+        scope_key: 'productivity_google_workspace',
+        tool_names: ['google_calendar_create_event'],
+      },
+    ];
+
+    await expect(
+      resolveVoicePhaseAAsyncPolicyWithHydratedTools({
+        voiceMode: true,
+        agent,
+        directActionSurfaces,
+        agentTools: agent.tools,
+        hydrateAgentTools: async () => ({
+          ...agent,
+          tools: [{ name: 'google_calendar_create_event' }],
+        }),
+      }),
+    ).resolves.toMatchObject({
+      enabled: true,
+      requested: true,
+      forcedOff: false,
+      reason: 'direct_action_owned',
+      hydratedToolPolicy: true,
+      initialReason: 'unowned_tool_hold_candidate_configured',
     });
   });
 

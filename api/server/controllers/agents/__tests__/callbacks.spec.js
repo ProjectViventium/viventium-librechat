@@ -1,4 +1,5 @@
 const { Tools } = require('librechat-data-provider');
+const { GraphEvents } = require('@librechat/agents');
 
 // Mock all dependencies before requiring the module
 jest.mock('nanoid', () => ({
@@ -7,10 +8,16 @@ jest.mock('nanoid', () => ({
 
 jest.mock('@librechat/api', () => ({
   sendEvent: jest.fn(),
+  GenerationJobManager: {
+    emitChunk: jest.fn(),
+  },
+  writeAttachmentEvent: jest.fn(),
+  createToolExecuteHandler: jest.fn().mockReturnValue({ handle: jest.fn() }),
 }));
 
 jest.mock('@librechat/data-schemas', () => ({
   logger: {
+    info: jest.fn(),
     error: jest.fn(),
   },
 }));
@@ -324,6 +331,87 @@ describe('createToolEndCallback', () => {
 
       expect(artifactPromises).toHaveLength(0);
       expect(res.write).not.toHaveBeenCalled();
+    });
+  });
+});
+
+describe('getDefaultHandlers voice reasoning guard', () => {
+  let getDefaultHandlers;
+  let sendEvent;
+  let GenerationJobManager;
+  let logger;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.resetModules();
+    getDefaultHandlers = require('../callbacks').getDefaultHandlers;
+    ({ sendEvent, GenerationJobManager } = require('@librechat/api'));
+    logger = require('@librechat/data-schemas').logger;
+  });
+
+  it('suppresses reasoning deltas for voice-mode streams before emit and aggregation', async () => {
+    const aggregateContent = jest.fn();
+    const handlers = getDefaultHandlers({
+      req: {
+        body: { voiceMode: true },
+        viventiumVoiceLogLatency: true,
+        viventiumVoiceRequestId: 'lc_voice_test',
+        viventiumVoiceStartAt: Date.now(),
+        _viventiumVoiceProcessStreamStartedAt: Date.now(),
+      },
+      res: {},
+      aggregateContent,
+      toolEndCallback: jest.fn(),
+      collectedUsage: [],
+      streamId: 'stream-voice-test',
+    });
+
+    await handlers[GraphEvents.ON_REASONING_DELTA].handle(
+      GraphEvents.ON_REASONING_DELTA,
+      {
+        id: 'step-1',
+        delta: { content: [{ type: 'think', think: 'internal reasoning' }] },
+      },
+      { last_agent_id: 'agent-1', langgraph_node: 'node_agent-1' },
+    );
+
+    expect(GenerationJobManager.emitChunk).not.toHaveBeenCalled();
+    expect(sendEvent).not.toHaveBeenCalled();
+    expect(aggregateContent).not.toHaveBeenCalled();
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.stringContaining('stage=voice_reasoning_delta_suppressed'),
+    );
+  });
+
+  it('continues to emit reasoning deltas for non-voice streams', async () => {
+    const aggregateContent = jest.fn();
+    const res = {};
+    const data = {
+      id: 'step-1',
+      delta: { content: [{ type: 'think', think: 'visible text-chat reasoning' }] },
+    };
+    const handlers = getDefaultHandlers({
+      req: { body: {} },
+      res,
+      aggregateContent,
+      toolEndCallback: jest.fn(),
+      collectedUsage: [],
+      streamId: null,
+    });
+
+    await handlers[GraphEvents.ON_REASONING_DELTA].handle(
+      GraphEvents.ON_REASONING_DELTA,
+      data,
+      { last_agent_id: 'agent-1', langgraph_node: 'node_agent-1' },
+    );
+
+    expect(sendEvent).toHaveBeenCalledWith(res, {
+      event: GraphEvents.ON_REASONING_DELTA,
+      data,
+    });
+    expect(aggregateContent).toHaveBeenCalledWith({
+      event: GraphEvents.ON_REASONING_DELTA,
+      data,
     });
   });
 });

@@ -65,17 +65,21 @@ async function initiateOAuthFlowFallback({
  * @param {FlowStateManager<any>} [params.flowManager]
  * @param {(authURL: string) => Promise<void>} [params.oauthStart]
  * @param {Record<string, Record<string, string>>} [params.userMCPAuthMap]
+ * @param {Record<string, import('@librechat/api').ParsedServerConfig>} [params.configServers]
+ * @param {import('@librechat/api').ParsedServerConfig} [params.serverConfig]
  */
 async function reinitMCPServer({
   user,
   signal,
   forceNew,
   serverName,
+  configServers,
   userMCPAuthMap,
   connectionTimeout,
   returnOnOAuth = true,
   oauthStart: _oauthStart,
   flowManager: _flowManager,
+  serverConfig: providedConfig,
 }) {
   /** @type {MCPConnection | null} */
   let connection = null;
@@ -88,13 +92,35 @@ async function reinitMCPServer({
 
   try {
     const registry = getMCPServersRegistry();
-    const serverConfig = await registry.getServerConfig(serverName, user?.id);
+    const serverConfig =
+      providedConfig ?? (await registry.getServerConfig(serverName, user?.id, configServers));
     if (serverConfig?.inspectionFailed) {
+      /* === VIVENTIUM START ===
+       * Feature: Upstream-aligned MCP reinit recovery.
+       * Purpose: Config-source failures are already guarded by the config cache;
+       * do not reinspect them synchronously from voice/tool-definition hot paths.
+       */
+      if (serverConfig.source === 'config') {
+        logger.info(
+          `[MCP Reinitialize] Config-source server ${serverName} has inspectionFailed - retry handled by config cache`,
+        );
+        return {
+          availableTools: null,
+          success: false,
+          message: `MCP server '${serverName}' is still unreachable`,
+          oauthRequired: false,
+          serverName,
+          oauthUrl: null,
+          tools: null,
+        };
+      }
+      /* === VIVENTIUM END === */
       logger.info(
         `[MCP Reinitialize] Server ${serverName} had failed inspection, attempting reinspection`,
       );
       try {
-        const storageLocation = serverConfig.dbId ? 'DB' : 'CACHE';
+        const storageLocation =
+          serverConfig.source === 'user' || serverConfig.dbId ? 'DB' : 'CACHE';
         await registry.reinspectServer(serverName, storageLocation, user?.id);
         logger.info(`[MCP Reinitialize] Reinspection succeeded for server: ${serverName}`);
       } catch (reinspectError) {
@@ -139,6 +165,7 @@ async function reinitMCPServer({
         returnOnOAuth,
         customUserVars,
         connectionTimeout,
+        serverConfig,
       });
 
       logger.info(`[MCP Reinitialize] Successfully established connection for ${serverName}`);
@@ -153,7 +180,6 @@ async function reinitMCPServer({
         err.message?.includes('authentication') ||
         err.message?.includes('401');
       const isConnectionTimeout = err.message?.includes('Connection timeout');
-      const serverConfig = await getMCPServersRegistry().getServerConfig(serverName, user.id);
       const serverRequiresOAuth = Boolean(
         serverConfig?.requiresOAuth || serverConfig?.oauthMetadata,
       );
@@ -207,6 +233,7 @@ async function reinitMCPServer({
             oauthStart,
             customUserVars,
             connectionTimeout,
+            configServers,
           });
 
           if (discoveryResult.tools && discoveryResult.tools.length > 0) {

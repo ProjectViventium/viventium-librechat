@@ -89,7 +89,18 @@ export class MCPServersRegistry {
   public async getServerConfig(
     serverName: string,
     userId?: string,
+    configServers?: Record<string, t.ParsedServerConfig>,
   ): Promise<t.ParsedServerConfig | undefined> {
+    /* === VIVENTIUM START ===
+     * Feature: Upstream-aligned MCP config-server reuse.
+     * Purpose: Allow hot-path callers to pass request-scoped config-source
+     * server definitions resolved once, avoiding repeated registry/config work.
+     */
+    if (configServers?.[serverName]) {
+      return configServers[serverName];
+    }
+    /* === VIVENTIUM END === */
+
     const cacheKey = this.getReadThroughCacheKey(serverName, userId);
 
     if (await this.readThroughCache.has(cacheKey)) {
@@ -109,7 +120,23 @@ export class MCPServersRegistry {
     return configFromDB;
   }
 
-  public async getAllServerConfigs(userId?: string): Promise<Record<string, t.ParsedServerConfig>> {
+  public async getAllServerConfigs(
+    userId?: string,
+    configServers?: Record<string, t.ParsedServerConfig>,
+  ): Promise<Record<string, t.ParsedServerConfig>> {
+    /* === VIVENTIUM START ===
+     * Feature: Upstream-aligned MCP config-server reuse.
+     * Purpose: Preserve config-source servers in bulk reads when callers already
+     * resolved them from app config for the current request.
+     */
+    if (configServers && Object.keys(configServers).length > 0) {
+      return {
+        ...configServers,
+        ...(await this.getAllServerConfigs(userId)),
+      };
+    }
+    /* === VIVENTIUM END === */
+
     const cacheKey = userId ?? '__no_user__';
 
     if (await this.readThroughCacheAll.has(cacheKey)) {

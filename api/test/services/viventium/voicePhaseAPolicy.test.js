@@ -49,7 +49,7 @@ describe('voicePhaseAPolicy', () => {
     );
   });
 
-  test('forces sync when async requested and tool-hold candidate is configured', () => {
+  test('forces sync when async requested and unowned tool-hold candidate is configured', () => {
     process.env.VIVENTIUM_VOICE_BACKGROUND_AGENT_DETECTION_ASYNC = '1';
     const policy = resolveVoicePhaseAAsyncPolicy({
       voiceMode: true,
@@ -67,7 +67,9 @@ describe('voicePhaseAPolicy', () => {
         enabled: false,
         requested: true,
         forcedOff: true,
-        reason: 'tool_hold_candidate_configured',
+        reason: 'unowned_tool_hold_candidate_configured',
+        toolHoldScopeKeys: ['productivity_ms365'],
+        unownedToolHoldScopeKeys: ['productivity_ms365'],
       }),
     );
   });

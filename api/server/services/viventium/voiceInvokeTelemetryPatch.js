@@ -98,6 +98,50 @@ const isLikelyLlmFetchTarget = (urlObj) => {
   );
 };
 
+/* === VIVENTIUM START ===
+ * Feature: Voice provider request knob telemetry.
+ * Purpose: During live voice QA, prove the no-reasoning setting reaches the outgoing provider
+ * request without logging prompt text, message content, auth headers, or secrets.
+ * Added: 2026-05-14
+ */
+const summarizeProviderRequestKnobs = (body) => {
+  if (typeof body !== 'string' || body.length === 0) {
+    return '';
+  }
+
+  try {
+    const parsed = JSON.parse(body);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return '';
+    }
+
+    const model =
+      typeof parsed.model === 'string' && parsed.model.length > 0 ? parsed.model : 'unset';
+    const reasoning =
+      parsed.reasoning && typeof parsed.reasoning === 'object' && !Array.isArray(parsed.reasoning)
+        ? parsed.reasoning
+        : null;
+    const messagesCount = Array.isArray(parsed.messages) ? parsed.messages.length : 'na';
+    const inputCount = Array.isArray(parsed.input) ? parsed.input.length : 'na';
+    const toolsCount = Array.isArray(parsed.tools) ? parsed.tools.length : 'na';
+    const streamValue = typeof parsed.stream === 'boolean' ? String(parsed.stream) : 'unset';
+
+    return (
+      ` model=${model}` +
+      ` reasoning_effort=${parsed.reasoning_effort ?? 'unset'}` +
+      ` reasoning.effort=${reasoning?.effort ?? 'unset'}` +
+      ` include_reasoning=${parsed.include_reasoning ?? 'unset'}` +
+      ` stream=${streamValue}` +
+      ` messages=${messagesCount}` +
+      ` input=${inputCount}` +
+      ` tools=${toolsCount}`
+    );
+  } catch {
+    return '';
+  }
+};
+/* === VIVENTIUM END === */
+
 const summarizeToolNames = (tools) => {
   if (!Array.isArray(tools) || tools.length === 0) {
     return {
@@ -270,7 +314,10 @@ const installFetchTelemetryPatch = () => {
       'GET';
     const host = String(urlObj.hostname || '').toLowerCase();
     const endpoint = String(urlObj.pathname || '');
-    const detailBase = `method=${method.toUpperCase()} host=${host} endpoint=${endpoint}`;
+    const body = init && typeof init === 'object' ? init.body : null;
+    const detailBase =
+      `method=${method.toUpperCase()} host=${host} endpoint=${endpoint}` +
+      summarizeProviderRequestKnobs(body);
     const startedAt = Date.now();
 
     logInvokeStage({

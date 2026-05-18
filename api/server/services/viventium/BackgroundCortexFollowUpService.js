@@ -138,6 +138,32 @@ function normalizeFollowUpProvider(provider) {
   return normalized;
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Voice Phase B no-reasoning parity.
+ *
+ * Purpose:
+ * - The main voice turn and the Phase B voice follow-up must use the same provider-specific
+ *   runtime knobs. For xAI Grok voice models, `reasoning_effort: "none"` belongs in the OpenAI-
+ *   compatible request kwargs, not in Anthropic-style `thinking` fields.
+ * - Keep this as structured parameter plumbing, not prompt text.
+ */
+function buildFollowUpModelKwargsForProvider({ providerName, modelParameters } = {}) {
+  const normalizedProvider = normalizeFollowUpProvider(providerName).toLowerCase();
+  if (normalizedProvider !== 'xai') {
+    return undefined;
+  }
+  const kwargs = {};
+  const reasoningEffort = String(modelParameters?.reasoning_effort || '').trim();
+  if (reasoningEffort) {
+    kwargs.reasoning_effort = reasoningEffort;
+  }
+  if (modelParameters?.include_reasoning != null) {
+    kwargs.include_reasoning = modelParameters.include_reasoning;
+  }
+  return Object.keys(kwargs).length > 0 ? kwargs : undefined;
+}
+/* === VIVENTIUM END === */
+
 function sanitizeFollowUpErrorForLog(error) {
   return {
     name: error?.name || null,
@@ -383,7 +409,11 @@ function resolveFollowUpRuntimeAssignment(agent, { useVoiceModel = false } = {})
         ...baseRuntimeAgent,
         voice_llm_provider: voiceAssignment.provider,
         voice_llm_model: voiceAssignment.model,
-        model_parameters: resolveVoiceModelParameters(baseRuntimeAgent, voiceAssignment.model),
+        model_parameters: resolveVoiceModelParameters(
+          baseRuntimeAgent,
+          voiceAssignment.model,
+          voiceAssignment.provider,
+        ),
       }
     : baseRuntimeAgent;
   const effectiveModel = resolveGovernedFollowUpModel(runtimeAgent, { useVoiceModel });
@@ -790,26 +820,31 @@ async function resolveFollowUpLLMConfig({
         const priorProviderName = resolvedProviderName;
         const priorModel = resolvedModel;
         const priorThinking = resolvedAgent?.model_parameters?.thinking;
-        resolvedAgent = rewriteAgentForRuntime(
+        const priorReasoningEffort = resolvedAgent?.model_parameters?.reasoning_effort;
+        const mergedAgent = rewriteAgentForRuntime(
           mergeFollowUpAgentRuntimeState(resolvedAgent, persistedAgent),
         );
+        const hydratedAssignment = resolveFollowUpRuntimeAssignment(mergedAgent, {
+          useVoiceModel,
+        });
+        resolvedAgent = hydratedAssignment.runtimeAgent;
         const hydratedProviderName = normalizeFollowUpProvider(
-          useVoiceModel
-            ? resolvedAgent?.voice_llm_provider || resolvedAgent?.provider
-            : resolvedAgent?.provider,
+          hydratedAssignment.effectiveProvider,
         ).toLowerCase();
-        const hydratedModel = resolveGovernedFollowUpModel(resolvedAgent, { useVoiceModel });
+        const hydratedModel = hydratedAssignment.effectiveModel;
         resolvedProviderName = hydratedProviderName || resolvedProviderName;
         resolvedModel = hydratedModel || resolvedModel;
         const nextThinking = resolvedAgent?.model_parameters?.thinking;
+        const nextReasoningEffort = resolvedAgent?.model_parameters?.reasoning_effort;
 
         if (
           priorProviderName !== resolvedProviderName ||
           priorModel !== resolvedModel ||
-          priorThinking !== nextThinking
+          priorThinking !== nextThinking ||
+          priorReasoningEffort !== nextReasoningEffort
         ) {
           logger.info(
-            `[BackgroundCortexFollowUpService] Hydrated follow-up runtime config from canonical agent at final resolution gate: id=${resolvedAgent.id} provider=${priorProviderName || 'missing'}->${resolvedProviderName || 'missing'} model=${priorModel || 'missing'}->${resolvedModel || 'missing'} thinking=${String(priorThinking)}->${String(nextThinking)}`,
+            `[BackgroundCortexFollowUpService] Hydrated follow-up runtime config from canonical agent at final resolution gate: id=${resolvedAgent.id} provider=${priorProviderName || 'missing'}->${resolvedProviderName || 'missing'} model=${priorModel || 'missing'}->${resolvedModel || 'missing'} thinking=${String(priorThinking)}->${String(nextThinking)} reasoning_effort=${String(priorReasoningEffort)}->${String(nextReasoningEffort)}`,
           );
         }
       } else if (!resolvedProviderName) {
@@ -898,6 +933,10 @@ async function resolveFollowUpLLMConfig({
     };
   }
 
+  const followUpModelKwargs = buildFollowUpModelKwargsForProvider({
+    providerName: resolvedProviderName,
+    modelParameters: baseModelParameters,
+  });
   const mappedProvider = mapProvider(resolvedProviderName);
   const llmConfig = {
     provider: mappedProvider,
@@ -906,6 +945,9 @@ async function resolveFollowUpLLMConfig({
     streaming: false,
     disableStreaming: true,
   };
+  if (followUpModelKwargs) {
+    llmConfig.modelKwargs = followUpModelKwargs;
+  }
 
   if (baseModelParameters.temperature != null) {
     llmConfig.temperature = baseModelParameters.temperature;
@@ -1946,6 +1988,8 @@ module.exports = {
   shouldForceVisibleFollowUpForEmptyPrimary,
   resolveConversationLeafMessageId,
   resolveFollowUpContinuationContext,
+  resolveFollowUpRuntimeAssignment,
+  buildFollowUpModelKwargsForProvider,
   sanitizeAnthropicFollowUpLLMConfig,
   stripQuestionSentences,
 };

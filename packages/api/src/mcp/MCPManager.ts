@@ -40,7 +40,8 @@ function sanitizeMCPManagerErrorForLog(error: unknown): {
   return {
     name: error instanceof Error ? error.name : null,
     code: record.code ?? null,
-    status: typeof record.status === 'number' && Number.isFinite(record.status) ? record.status : null,
+    status:
+      typeof record.status === 'number' && Number.isFinite(record.status) ? record.status : null,
     message: message
       ? message
           .replace(/https?:\/\/[^\s)]+/gi, '<url>')
@@ -60,7 +61,9 @@ function stableStringify(value: unknown): string {
   }
   return `{${Object.keys(value as Record<string, unknown>)
     .sort()
-    .map((key) => `${JSON.stringify(key)}:${stableStringify((value as Record<string, unknown>)[key])}`)
+    .map(
+      (key) => `${JSON.stringify(key)}:${stableStringify((value as Record<string, unknown>)[key])}`,
+    )
     .join(',')}}`;
 }
 
@@ -73,8 +76,7 @@ function serverInstructionCacheKey(serverName: string, config: t.ParsedServerCon
     serverInstructions: config.serverInstructions,
     requiresOAuth: config.requiresOAuth,
     oauthMetadata: Boolean(config.oauthMetadata),
-    trusted:
-      (config as ServerInstructionConfig).viventiumTrustedServerInstructions === true,
+    trusted: (config as ServerInstructionConfig).viventiumTrustedServerInstructions === true,
   };
   return `${serverName}:${stableStringify(relevantConfig)}`;
 }
@@ -88,11 +90,7 @@ const MAX_SERVER_INSTRUCTION_FETCH_TIMEOUT_MS = 10_000;
 const DEFAULT_SERVER_INSTRUCTION_FAILURE_TTL_MS = 30_000;
 const MAX_SERVER_INSTRUCTION_FAILURE_TTL_MS = 5 * 60_000;
 
-function parseBoundedPositiveInt(
-  value: string | undefined,
-  fallback: number,
-  max: number,
-): number {
+function parseBoundedPositiveInt(value: string | undefined, fallback: number, max: number): number {
   const parsed = Number.parseInt(String(value || ''), 10);
   if (!Number.isFinite(parsed) || parsed < 0) {
     return fallback;
@@ -183,6 +181,13 @@ export class MCPManager extends UserConnectionManager {
       user?: IUser;
       forceNew?: boolean;
       flowManager?: FlowStateManager<MCPOAuthTokens | null>;
+      /* === VIVENTIUM START ===
+       * Feature: Upstream-aligned MCP config-server reuse.
+       * Purpose: Let hot-path reinitialization pass a pre-resolved server
+       * config through to the user connection layer.
+       */
+      serverConfig?: t.ParsedServerConfig;
+      /* === VIVENTIUM END === */
     } & Omit<t.OAuthConnectionOptions, 'useOAuth' | 'user' | 'flowManager'>,
   ): Promise<MCPConnection> {
     //the get method checks if the config is still valid as app level
@@ -221,6 +226,7 @@ export class MCPManager extends UserConnectionManager {
     const serverConfig = (await MCPServersRegistry.getInstance().getServerConfig(
       serverName,
       user?.id,
+      args.configServers,
     )) as t.MCPOptions | null;
 
     if (!serverConfig) {
@@ -362,11 +368,17 @@ export class MCPManager extends UserConnectionManager {
       return { serverName, source: 'missing' };
     }
 
-    const serverProvidedInstructions = await this.fetchServerProvidedInstructions(serverName, config);
+    const serverProvidedInstructions = await this.fetchServerProvidedInstructions(
+      serverName,
+      config,
+    );
     if (serverProvidedInstructions) {
       return { serverName, instruction: serverProvidedInstructions, source: 'server_fetched' };
     }
-    if (config.serverInstructions === true || String(config.serverInstructions).trim().toLowerCase() === 'true') {
+    if (
+      config.serverInstructions === true ||
+      String(config.serverInstructions).trim().toLowerCase() === 'true'
+    ) {
       logger.warn(
         `[MCP][${serverName}] serverInstructions=true was not resolved to server-provided instructions; skipping injection`,
       );
@@ -460,13 +472,9 @@ export class MCPManager extends UserConnectionManager {
         }
         return createdConnection;
       });
-      const nextConnection = await withTimeout(
-        createConnectionPromise,
-        timeoutMs,
-        () => {
-          timedOut = true;
-        },
-      );
+      const nextConnection = await withTimeout(createConnectionPromise, timeoutMs, () => {
+        timedOut = true;
+      });
       if (!nextConnection) {
         logger.warn(
           `[MCP][${serverName}] Timed out creating temporary server-instructions connection; skipping injection`,
@@ -659,7 +667,10 @@ Please follow these instructions when using tools from the respective MCP server
       return formatToolContent(result as t.MCPToolCallResponse, provider);
     } catch (error) {
       // Log with context and re-throw or handle as needed
-      logger.error(`${logPrefix}[${toolName}] Tool call failed`, sanitizeMCPManagerErrorForLog(error));
+      logger.error(
+        `${logPrefix}[${toolName}] Tool call failed`,
+        sanitizeMCPManagerErrorForLog(error),
+      );
       // Rethrowing allows the caller (createMCPTool) to handle the final user message
       throw error;
     }

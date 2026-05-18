@@ -99,6 +99,39 @@ describe('MCPServersRegistry', () => {
       expect(configs).toHaveProperty('app_server');
       expect(configs).toHaveProperty('user_server');
     });
+
+    it('should merge pre-resolved config-source servers for request-scoped reads', async () => {
+      await registry['cacheConfigsRepo'].add('app_server', testParsedConfig);
+      const configServer = {
+        ...testParsedConfig,
+        source: 'config' as const,
+        command: 'config-server',
+      };
+
+      const configs = await registry.getAllServerConfigs(undefined, {
+        config_server: configServer,
+      });
+
+      expect(configs).toHaveProperty('app_server');
+      expect(configs.config_server).toEqual(configServer);
+    });
+  });
+
+  describe('getServerConfig with pre-resolved config-source servers', () => {
+    it('should return the request-scoped config before consulting global cache/db state', async () => {
+      const configServer = {
+        ...testParsedConfig,
+        source: 'config' as const,
+        command: 'config-server',
+      };
+
+      const config = await registry.getServerConfig('config_server', 'user-1', {
+        config_server: configServer,
+      });
+
+      expect(config).toEqual(configServer);
+      expect(await registry.getServerConfig('config_server', 'user-1')).toBeUndefined();
+    });
   });
 
   describe('reset', () => {

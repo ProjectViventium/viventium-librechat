@@ -11,8 +11,10 @@
 const {
   formatFollowUpPrompt,
   resolveFollowUpContinuationContext,
+  resolveFollowUpRuntimeAssignment,
   resolveFollowUpPersistenceText,
   sanitizeAnthropicFollowUpLLMConfig,
+  buildFollowUpModelKwargsForProvider,
   shouldForceVisibleFollowUpForEmptyPrimary,
   extractRecentResponseTextFromMessage,
   isPlaceholderRecentResponseText,
@@ -787,5 +789,69 @@ describe('sanitizeAnthropicFollowUpLLMConfig', () => {
     });
 
     expect(result.temperature).toBe(0.3);
+  });
+});
+
+describe('voice follow-up runtime assignment', () => {
+  const originalXaiApiKey = process.env.XAI_API_KEY;
+
+  beforeEach(() => {
+    process.env.XAI_API_KEY = 'test-xai-key';
+  });
+
+  afterEach(() => {
+    if (originalXaiApiKey == null) {
+      delete process.env.XAI_API_KEY;
+    } else {
+      process.env.XAI_API_KEY = originalXaiApiKey;
+    }
+  });
+
+  test('normalizes xAI voice follow-up parameters to no reasoning', () => {
+    const result = resolveFollowUpRuntimeAssignment(
+      {
+        id: 'agent-main',
+        provider: 'anthropic',
+        model: 'claude-opus-4-7',
+        model_parameters: {
+          model: 'claude-opus-4-7',
+          thinking: true,
+          thinkingBudget: 4096,
+          temperature: 0.3,
+        },
+        voice_llm_provider: 'xai',
+        voice_llm_model: 'grok-4.3',
+        voice_llm_model_parameters: {
+          thinking: false,
+        },
+      },
+      { useVoiceModel: true },
+    );
+
+    expect(result.effectiveProvider).toBe('xai');
+    expect(result.effectiveModel).toBe('grok-4.3');
+    expect(result.runtimeAgent.model_parameters.reasoning_effort).toBe('none');
+    expect(result.runtimeAgent.model_parameters).not.toHaveProperty('thinking');
+    expect(result.runtimeAgent.model_parameters).not.toHaveProperty('thinkingBudget');
+  });
+
+  test('passes xAI no-reasoning follow-up knob through OpenAI-compatible kwargs', () => {
+    expect(
+      buildFollowUpModelKwargsForProvider({
+        providerName: 'xai',
+        modelParameters: {
+          reasoning_effort: 'none',
+        },
+      }),
+    ).toEqual({ reasoning_effort: 'none' });
+
+    expect(
+      buildFollowUpModelKwargsForProvider({
+        providerName: 'anthropic',
+        modelParameters: {
+          reasoning_effort: 'none',
+        },
+      }),
+    ).toBeUndefined();
   });
 });

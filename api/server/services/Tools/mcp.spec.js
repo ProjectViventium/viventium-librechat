@@ -51,6 +51,7 @@ jest.mock('librechat-data-provider', () => ({
 const { MCPOAuthHandler } = require('@librechat/api');
 const { getMCPManager, getFlowStateManager } = require('~/config');
 const { findToken } = require('~/models');
+const { updateMCPServerTools } = require('~/server/services/Config');
 const { reinitMCPServer } = require('./mcp');
 
 describe('reinitMCPServer', () => {
@@ -113,6 +114,54 @@ describe('reinitMCPServer', () => {
       oauthRequired: true,
       oauthUrl: 'https://accounts.google.com/o/oauth2/auth',
       serverName: 'google_workspace',
+    });
+  });
+
+  it('uses a provided server config without refetching registry config during hot-path reinit', async () => {
+    const serverConfig = {
+      url: 'http://localhost:8112/mcp',
+      requiresOAuth: false,
+      source: 'config',
+    };
+    const connection = {
+      fetchTools: jest.fn().mockResolvedValue([{ name: 'list_docs', inputSchema: {} }]),
+    };
+    const mcpManager = {
+      getConnection: jest.fn().mockResolvedValue(connection),
+      discoverServerTools: jest.fn(),
+    };
+
+    getMCPManager.mockReturnValue(mcpManager);
+    updateMCPServerTools.mockResolvedValue({
+      list_docs_mcp_google_workspace: {
+        type: 'function',
+        function: { name: 'list_docs_mcp_google_workspace' },
+      },
+    });
+
+    const result = await reinitMCPServer({
+      user: { id: 'user-123' },
+      serverName: 'google_workspace',
+      serverConfig,
+    });
+
+    expect(mockRegistryInstance.getServerConfig).not.toHaveBeenCalled();
+    expect(mcpManager.getConnection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        serverName: 'google_workspace',
+        serverConfig,
+      }),
+    );
+    expect(updateMCPServerTools).toHaveBeenCalledWith({
+      userId: 'user-123',
+      serverName: 'google_workspace',
+      tools: [{ name: 'list_docs', inputSchema: {} }],
+    });
+    expect(result.availableTools).toEqual({
+      list_docs_mcp_google_workspace: {
+        type: 'function',
+        function: { name: 'list_docs_mcp_google_workspace' },
+      },
     });
   });
 });

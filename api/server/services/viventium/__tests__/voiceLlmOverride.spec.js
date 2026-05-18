@@ -122,6 +122,57 @@ describe('voiceLlmOverride', () => {
     }
   });
 
+  test('applyVoiceModelOverride maps xAI voice thinking false to reasoning_effort none', () => {
+    const originalXaiKey = process.env.XAI_API_KEY;
+    process.env.XAI_API_KEY = 'test-xai-key';
+
+    try {
+      const req = {
+        body: {
+          voiceMode: true,
+          viventiumInputMode: 'voice_call',
+          viventiumSurface: 'voice',
+        },
+        config: { endpoints: { agents: { allowedProviders: ['xai', 'anthropic'] } } },
+      };
+      const modelsConfig = {
+        xai: ['grok-4.3'],
+        anthropic: ['claude-opus-4-7'],
+      };
+      const agent = {
+        id: 'agent_xai_reasoning',
+        provider: 'anthropic',
+        model: 'claude-opus-4-7',
+        model_parameters: {
+          model: 'claude-opus-4-7',
+          effort: 'high',
+          thinking: true,
+          thinkingBudget: 4096,
+        },
+        voice_llm_provider: 'xai',
+        voice_llm_model: 'grok-4.3',
+        voice_llm_model_parameters: { thinking: false },
+      };
+
+      const updated = applyVoiceModelOverride(agent, req, modelsConfig);
+      expect(updated.provider).toBe('xai');
+      expect(updated.model).toBe('grok-4.3');
+      expect(updated.model_parameters).toMatchObject({
+        model: 'grok-4.3',
+        reasoning_effort: 'none',
+      });
+      expect(updated.model_parameters).not.toHaveProperty('thinking');
+      expect(updated.model_parameters).not.toHaveProperty('thinkingBudget');
+      expect(updated.model_parameters).not.toHaveProperty('effort');
+    } finally {
+      if (originalXaiKey === undefined) {
+        delete process.env.XAI_API_KEY;
+      } else {
+        process.env.XAI_API_KEY = originalXaiKey;
+      }
+    }
+  });
+
   test('resolveVoiceOverrideAssignment ignores legacy machine fast-voice env when the agent fields are unset', () => {
     const originalXaiKey = process.env.XAI_API_KEY;
     const originalVoiceProvider = process.env.VIVENTIUM_VOICE_FAST_LLM_PROVIDER;

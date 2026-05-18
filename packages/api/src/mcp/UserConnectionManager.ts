@@ -64,9 +64,17 @@ export abstract class UserConnectionManager {
     signal,
     returnOnOAuth = false,
     connectionTimeout,
+    serverConfig: providedConfig,
   }: {
     serverName: string;
     forceNew?: boolean;
+    /* === VIVENTIUM START ===
+     * Feature: Upstream-aligned MCP config-server reuse.
+     * Purpose: Avoid fetching the same server config again when a caller already
+     * resolved it for request-scoped MCP reinitialization.
+     */
+    serverConfig?: t.ParsedServerConfig;
+    /* === VIVENTIUM END === */
   } & Omit<t.OAuthConnectionOptions, 'useOAuth'>): Promise<MCPConnection> {
     const userId = user?.id;
     if (!userId) {
@@ -80,7 +88,9 @@ export abstract class UserConnectionManager {
       );
     }
 
-    const config = await MCPServersRegistry.getInstance().getServerConfig(serverName, userId);
+    const config =
+      providedConfig ??
+      (await MCPServersRegistry.getInstance().getServerConfig(serverName, userId));
 
     const userServerMap = this.userConnections.get(userId);
     let connection = forceNew ? undefined : userServerMap?.get(serverName);

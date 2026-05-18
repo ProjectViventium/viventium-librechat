@@ -67,6 +67,16 @@ const logVoiceLatencyStage = (req, stage, stageStartAt = null, details = '') => 
 };
 
 /* === VIVENTIUM START ===
+ * Feature: Voice reasoning visibility guard.
+ * Purpose: Voice turns must not stream or persist provider thinking blocks; the voice transcript
+ * should carry only audible/user-visible assistant output even if a provider emits reasoning
+ * deltas despite a no-reasoning profile.
+ * Added: 2026-05-14
+ */
+const isVoiceModeRequest = (req) => req?.body?.voiceMode === true;
+/* === VIVENTIUM END === */
+
+/* === VIVENTIUM START ===
  * Feature: Voice orchestration event timeline (compact per-turn telemetry state).
  * Purpose: Capture first-occurrence timestamps and event counts with low log volume.
  * Added: 2026-03-03
@@ -677,6 +687,24 @@ function getDefaultHandlers({
             '',
           );
         }
+        /* === VIVENTIUM START ===
+         * Feature: Voice reasoning visibility guard.
+         * Purpose: In voice mode, reasoning deltas are diagnostic/provider internals, not audible
+         * response content. Do not emit them to the resumable stream and do not aggregate them
+         * into the saved assistant message.
+         */
+        if (isVoiceModeRequest(req)) {
+          if (reasoningMetric?.firstSeen) {
+            logVoiceLatencyStage(
+              req,
+              'voice_reasoning_delta_suppressed',
+              getVoiceProcessStreamStartAt(req),
+              'reason=voice_mode',
+            );
+          }
+          return;
+        }
+        /* === VIVENTIUM END === */
         if (checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node)) {
           await emitEvent(res, streamId, { event, data });
         } else if (!metadata?.hide_sequential_outputs) {

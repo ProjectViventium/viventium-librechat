@@ -99,6 +99,65 @@ describe('Message Operations', () => {
       const result = await saveMessage(mockReq, mockMessageData);
       expect(result).toBeUndefined();
     });
+
+    it('should mirror assistant visible content text into the legacy text field', async () => {
+      const result = await saveMessage(mockReq, {
+        messageId: 'assistant-content-text',
+        conversationId: uuidv4(),
+        text: '',
+        isCreatedByUser: false,
+        content: [
+          { type: 'think', think: 'private reasoning' },
+          { type: 'text', text: 'Visible assistant answer.' },
+        ],
+      });
+
+      expect(result.text).toBe('Visible assistant answer.');
+
+      const savedMessage = await Message.findOne({
+        messageId: 'assistant-content-text',
+        user: 'user123',
+      }).lean();
+
+      expect(savedMessage.text).toBe('Visible assistant answer.');
+      expect(savedMessage.text).not.toContain('private reasoning');
+    });
+
+    it('should preserve existing assistant text when content text is only a placeholder', async () => {
+      const result = await saveMessage(mockReq, {
+        messageId: 'assistant-placeholder-content-text',
+        conversationId: uuidv4(),
+        text: 'Already visible.',
+        isCreatedByUser: false,
+        content: [{ type: 'text', text: 'Generation in progress.' }],
+      });
+
+      expect(result.text).toBe('Already visible.');
+    });
+
+    it('should not overwrite non-voice assistant text when content includes reasoning and text', async () => {
+      const result = await saveMessage(mockReq, {
+        messageId: 'assistant-existing-text-with-content',
+        conversationId: uuidv4(),
+        text: 'Keep the original visible text.',
+        isCreatedByUser: false,
+        content: [
+          { type: 'reasoning', reasoning: 'private reasoning' },
+          { type: 'text', text: 'Different generated content text.' },
+        ],
+      });
+
+      expect(result.text).toBe('Keep the original visible text.');
+
+      const savedMessage = await Message.findOne({
+        messageId: 'assistant-existing-text-with-content',
+        user: 'user123',
+      }).lean();
+
+      expect(savedMessage.text).toBe('Keep the original visible text.');
+      expect(savedMessage.text).not.toContain('private reasoning');
+      expect(savedMessage.text).not.toContain('Different generated content text.');
+    });
   });
 
   describe('updateMessageText', () => {

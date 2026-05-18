@@ -160,7 +160,8 @@ describe('filterRenderableContentParts', () => {
           args: '{}',
           type: ToolCallTypes.TOOL_CALL,
           progress: 1,
-          output: '{"status":"dispatched","callback_ready":true,"user_status":"On it"}',
+          output:
+            '{"status":"dispatched","callback_ready":true,"acknowledgement_guidance":"Write one short acknowledgement in your own voice."}',
         },
       },
       { type: ContentTypes.TEXT, text: 'On ' },
@@ -315,7 +316,7 @@ describe('filterRenderableContentParts', () => {
           type: ToolCallTypes.TOOL_CALL,
           progress: 1,
           output:
-            '[{"type":"text","text":"{\\n  \\"status\\": \\"dispatched\\",\\n  \\"callback_ready\\": true,\\n  \\"user_status\\": \\"On it\\"\\n}"}]',
+            '[{"type":"text","text":"{\\n  \\"status\\": \\"dispatched\\",\\n  \\"callback_ready\\": true,\\n  \\"acknowledgement_guidance\\": \\"Write one short acknowledgement in your own voice.\\"\\n}"}]',
         },
       },
       { type: ContentTypes.TEXT, text: 'On it.' },
@@ -334,7 +335,8 @@ describe('filterRenderableContentParts', () => {
           args: '{}',
           type: ToolCallTypes.TOOL_CALL,
           progress: 1,
-          output: '{"status":"dispatched","callback_ready":true,"user_status":"On it"}',
+          output:
+            '{"status":"dispatched","callback_ready":true,"acknowledgement_guidance":"Write one short acknowledgement in your own voice."}',
         },
       },
     ];

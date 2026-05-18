@@ -1430,7 +1430,7 @@ describe('MCP Routes', () => {
 
       getMCPSetupData.mockResolvedValue({
         mcpConfig: {
-          'ms-365': { url: 'http://localhost:6274/mcp' },
+          'ms-365': { url: 'https://mcp.example.com/mcp' },
         },
         appConnections: {},
         userConnections: {},
@@ -1451,6 +1451,44 @@ describe('MCP Routes', () => {
           returnOnOAuth: true,
         }),
       );
+    });
+
+    it('should skip OAuth MCP warmup when a saved token exists but the local endpoint is down', async () => {
+      const { findToken } = require('~/models');
+      const mockGetConnection = jest.fn().mockResolvedValue({});
+      const mockGetUserConnections = jest.fn().mockReturnValue(new Map());
+
+      require('~/config').getMCPManager.mockReturnValue({
+        getConnection: mockGetConnection,
+        getUserConnections: mockGetUserConnections,
+      });
+
+      findToken.mockImplementation(({ type, identifier }) => {
+        if (type === 'mcp_oauth_refresh' && identifier === 'mcp:ms-365:refresh') {
+          return Promise.resolve({ expiresAt: new Date(Date.now() + 60_000) });
+        }
+        return Promise.resolve(null);
+      });
+
+      getMCPSetupData.mockResolvedValue({
+        mcpConfig: {
+          'ms-365': { url: 'http://localhost:1/mcp' },
+        },
+        appConnections: {},
+        userConnections: {},
+        oauthServers: new Set(['ms-365']),
+      });
+
+      getServerConnectionStatus.mockResolvedValue({
+        connectionState: 'disconnected',
+        requiresOAuth: true,
+      });
+
+      const response = await request(app).get('/api/mcp/connection/status');
+
+      expect(response.status).toBe(200);
+      expect(mockGetConnection).not.toHaveBeenCalled();
+      expect(findToken).toHaveBeenCalledTimes(2);
     });
 
     it('should not warm OAuth MCP servers when no usable token exists', async () => {
@@ -1512,7 +1550,7 @@ describe('MCP Routes', () => {
 
         getMCPSetupData.mockResolvedValue({
           mcpConfig: {
-            'ms-365': { url: 'http://localhost:6274/mcp' },
+            'ms-365': { url: 'https://mcp.example.com/mcp' },
           },
           appConnections: {},
           userConnections: {},

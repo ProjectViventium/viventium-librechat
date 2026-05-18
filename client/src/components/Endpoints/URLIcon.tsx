@@ -1,6 +1,8 @@
-import React, { memo, useEffect, useState } from 'react';
+import React, { memo, useContext, useEffect, useState } from 'react';
+import { ThemeContext } from '@librechat/client';
 import { AlertCircle } from 'lucide-react';
 import { icons } from '~/hooks/Endpoint/Icons';
+import { getViventiumLogoColorScheme, isViventiumLogoIconURL } from './viventiumLogoTheme';
 
 export const URLIcon = memo(
   ({
@@ -19,6 +21,7 @@ export const URLIcon = memo(
     endpoint?: string;
   }) => {
     const [imageError, setImageError] = useState(false);
+    const { theme } = useContext(ThemeContext);
 
     /* === VIVENTIUM START ===
      * Feature: Auto-recover conversation icons after stale URL fallback
@@ -39,6 +42,16 @@ export const URLIcon = memo(
 
     const DefaultIcon: React.ElementType =
       endpoint && icons[endpoint] ? icons[endpoint]! : icons.unknown!;
+    /* === VIVENTIUM START ===
+     * Feature: Theme-aware configured Viventium logo URLs
+     * Purpose: Model specs render through URLIcon, so the SVG must receive the same
+     * app theme bridge as agent fallback icons.
+     */
+    const colorScheme = isViventiumLogoIconURL(iconURL)
+      ? getViventiumLogoColorScheme(theme)
+      : undefined;
+    const themedImageStyle = colorScheme != null ? { ...imageStyle, colorScheme } : imageStyle;
+    /* === VIVENTIUM END === */
 
     if (imageError || !iconURL) {
       return (
@@ -63,7 +76,7 @@ export const URLIcon = memo(
         <img
           src={iconURL}
           alt={altName ?? 'Icon'}
-          style={imageStyle}
+          style={themedImageStyle}
           className="object-cover"
           onError={handleImageError}
           loading="lazy"

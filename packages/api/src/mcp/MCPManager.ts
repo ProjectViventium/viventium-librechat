@@ -191,7 +191,14 @@ export class MCPManager extends UserConnectionManager {
     } & Omit<t.OAuthConnectionOptions, 'useOAuth' | 'user' | 'flowManager'>,
   ): Promise<MCPConnection> {
     //the get method checks if the config is still valid as app level
-    const existingAppConnection = await this.appConnections!.get(args.serverName);
+    /* === VIVENTIUM START ===
+     * Feature: MCP status and warm-up hardening.
+     * Purpose: During startup/reinit races the manager can exist before
+     * appConnections is ready. User-scoped recovery should continue instead
+     * of throwing a null `.get` TypeError into the UI status path.
+     */
+    const existingAppConnection = await this.appConnections?.get(args.serverName);
+    /* === VIVENTIUM END === */
     if (existingAppConnection) {
       return existingAppConnection;
     } else if (args.user?.id) {

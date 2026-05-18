@@ -69,6 +69,7 @@ describe('ProgressText and background cortex status layout', () => {
         cortex_name="Background Analysis"
         status="activating"
         reason="Relevant background check"
+        status_changed_at={new Date().toISOString()}
       />,
     );
 
@@ -84,12 +85,56 @@ describe('ProgressText and background cortex status layout', () => {
         cortex_name="Background Analysis"
         status="brewing"
         reason="Relevant background check"
+        status_changed_at={new Date().toISOString()}
       />,
     );
 
     expect(screen.getByRole('button')).toHaveTextContent('Analyzing with Background Analysis...');
     expect(screen.getByText(/Background Analysis/)).toBeInTheDocument();
     expect(screen.getByTestId('spinner')).toBeInTheDocument();
+  });
+
+  it('marks stale persisted brewing cortex rows as terminal errors instead of spinning forever', () => {
+    const staleStatusChangedAt = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    render(
+      <CortexCall
+        cortex_id="background"
+        cortex_name="Background Analysis"
+        status="brewing"
+        reason="Relevant background check"
+        status_changed_at={staleStatusChangedAt}
+      />,
+    );
+
+    expect(screen.getByRole('button')).toHaveTextContent('Background Analysis error');
+    expect(screen.queryByTestId('spinner')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button'));
+
+    expect(screen.getByText('Error from Background Analysis')).toBeInTheDocument();
+    expect(
+      screen.getByText('Background processing did not finish before the UI safety timeout.'),
+    ).toBeInTheDocument();
+  });
+
+  it('marks active cortex rows without status timestamps as terminal errors', () => {
+    render(
+      <CortexCall
+        cortex_id="background"
+        cortex_name="Background Analysis"
+        status="brewing"
+        reason="Legacy active row without timestamp"
+      />,
+    );
+
+    expect(screen.getByRole('button')).toHaveTextContent('Background Analysis error');
+    expect(screen.queryByTestId('spinner')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button'));
+
+    expect(
+      screen.getByText('Background processing state is missing a status timestamp.'),
+    ).toBeInTheDocument();
   });
 
   it('hides terminal no-response cortex completions instead of leaving a brewing row', () => {

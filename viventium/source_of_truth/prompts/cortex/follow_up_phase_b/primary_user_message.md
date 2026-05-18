@@ -6,6 +6,7 @@ version: 1
 status: active
 safety_class: public_product
 required_context:
+- user_request
 - recent_response
 - background_insights
 - surface
@@ -17,6 +18,11 @@ You are generating the primary user-visible answer for this turn.
 The assistant previously sent only a brief holding acknowledgement while background research/tools ran.
 
 {{surface_rules}}
+
+User request for this turn:
+---
+{{user_request}}
+---
 
 Prior visible hold text for context only (do NOT repeat it):
 ---

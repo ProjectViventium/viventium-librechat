@@ -1,4 +1,5 @@
 const { Router } = require('express');
+const net = require('net');
 const { logger } = require('@librechat/data-schemas');
 const {
   CacheKeys,
@@ -100,6 +101,7 @@ function getPersistentMCPServers() {
 /* VIVENTIUM START: persistent MCP warm-up dedupe across status pollers */
 const persistentWarmupInFlight = new Set();
 const persistentWarmupLastAttemptAt = new Map();
+const localEndpointUnavailableLastLoggedAt = new Map();
 const oauthTokenPresenceCache = new Map();
 
 function getPersistentWarmupKey(userId, serverName) {
@@ -119,6 +121,82 @@ function getOAuthTokenPresenceCacheMs() {
 function clearPersistentWarmupTracking(warmupKey) {
   persistentWarmupInFlight.delete(warmupKey);
   persistentWarmupLastAttemptAt.delete(warmupKey);
+  localEndpointUnavailableLastLoggedAt.delete(warmupKey);
+}
+
+function getLocalEndpointProbeTimeoutMs() {
+  const parsed = Number.parseInt(process.env.MCP_LOCAL_ENDPOINT_PROBE_TIMEOUT_MS ?? '750', 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 750;
+}
+
+function parseLoopbackMCPUrl(serverConfig) {
+  const urlString = typeof serverConfig?.url === 'string' ? serverConfig.url : '';
+  if (!urlString) {
+    return null;
+  }
+
+  try {
+    const parsed = new URL(urlString);
+    const hostname = parsed.hostname.toLowerCase();
+    const isLoopback =
+      hostname === 'localhost' ||
+      hostname === '127.0.0.1' ||
+      hostname === '::1' ||
+      hostname === '[::1]';
+    if (!isLoopback) {
+      return null;
+    }
+    const protocolDefaultPort = parsed.protocol === 'https:' ? 443 : 80;
+    const port = Number.parseInt(parsed.port || String(protocolDefaultPort), 10);
+    if (!Number.isFinite(port) || port <= 0) {
+      return null;
+    }
+    const host = hostname === 'localhost' ? '127.0.0.1' : hostname === '[::1]' ? '::1' : hostname;
+    return { host, port };
+  } catch (_error) {
+    return null;
+  }
+}
+
+async function localLoopbackEndpointReachable(serverConfig) {
+  const endpoint = parseLoopbackMCPUrl(serverConfig);
+  if (!endpoint) {
+    return true;
+  }
+
+  const timeoutMs = getLocalEndpointProbeTimeoutMs();
+  if (timeoutMs === 0) {
+    return true;
+  }
+
+  return new Promise((resolve) => {
+    const socket = net.createConnection(endpoint);
+    let settled = false;
+    const settle = (reachable) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      socket.destroy();
+      resolve(reachable);
+    };
+    socket.setTimeout(timeoutMs, () => settle(false));
+    socket.once('connect', () => settle(true));
+    socket.once('error', () => settle(false));
+  });
+}
+
+function maybeLogLocalEndpointUnavailable(userId, serverName, warmupKey) {
+  const cooldownMs = getPersistentWarmupCooldownMs();
+  const nowMs = Date.now();
+  const lastLoggedAt = localEndpointUnavailableLastLoggedAt.get(warmupKey);
+  if (lastLoggedAt && cooldownMs > 0 && nowMs - lastLoggedAt < cooldownMs) {
+    return;
+  }
+  localEndpointUnavailableLastLoggedAt.set(warmupKey, nowMs);
+  logger.warn(
+    `[MCP Persistent Warmup][User: ${userId}] Skipping "${serverName}" because its local endpoint is not reachable`,
+  );
 }
 
 async function hasUsableMCPOAuthToken(userId, serverName) {
@@ -250,6 +328,12 @@ async function warmPersistentUserMCPConnections(user, mcpConfig, oauthServers) {
       logger.debug(
         `[MCP Persistent Warmup] Skipping server "${serverName}" because custom user vars are required`,
       );
+      continue;
+    }
+
+    if (!(await localLoopbackEndpointReachable(serverConfig))) {
+      maybeLogLocalEndpointUnavailable(user.id, serverName, warmupKey);
+      persistentWarmupLastAttemptAt.set(warmupKey, Date.now());
       continue;
     }
 
@@ -1181,6 +1265,7 @@ module.exports = router;
 module.exports.__resetPersistentWarmupStateForTests = () => {
   persistentWarmupInFlight.clear();
   persistentWarmupLastAttemptAt.clear();
+  localEndpointUnavailableLastLoggedAt.clear();
   oauthTokenPresenceCache.clear();
 };
 /* VIVENTIUM END */

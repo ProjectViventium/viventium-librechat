@@ -1,4 +1,3 @@
-import { Feather } from 'lucide-react';
 import { EModelEndpoint } from 'librechat-data-provider';
 import {
   GPTIcon,
@@ -11,6 +10,8 @@ import {
   CustomMinimalIcon,
 } from '@librechat/client';
 import type { IconMapProps, AgentIconMapProps, IconsRecord } from '~/common';
+import ViventiumLogoIcon from '~/components/Endpoints/ViventiumLogoIcon';
+import { VIVENTIUM_LOGO_ICON_URL } from '~/components/Endpoints/viventiumLogoTheme';
 import UnknownIcon from './UnknownIcon';
 import { cn } from '~/utils';
 
@@ -38,7 +39,13 @@ const AssistantAvatar = ({
   return <Sparkles className={cn(context === 'landing' ? 'icon-2xl' : '', className)} />;
 };
 
-const AgentAvatar = ({ className = '', avatar = '', agentName, size }: AgentIconMapProps) => {
+const AgentAvatar = ({
+  className = '',
+  avatar = '',
+  agentName,
+  size,
+  iconURL = VIVENTIUM_LOGO_ICON_URL,
+}: AgentIconMapProps) => {
   if (agentName != null && agentName && avatar) {
     return (
       <img
@@ -51,7 +58,19 @@ const AgentAvatar = ({ className = '', avatar = '', agentName, size }: AgentIcon
     );
   }
 
-  return <Feather className={cn(agentName === '' ? 'icon-2xl' : '', className)} size={size} />;
+  /* === VIVENTIUM START ===
+   * Feature: Viventium-branded agent icon fallback
+   * Purpose: Missing agent avatars should show the Viventium mark, not LibreChat's feather.
+   */
+  return (
+    <ViventiumLogoIcon
+      src={iconURL}
+      alt={agentName || 'Viventium'}
+      className={cn(agentName === '' ? 'icon-2xl' : '', className)}
+      style={size != null ? { width: size, height: size } : undefined}
+    />
+  );
+  /* === VIVENTIUM END === */
 };
 
 const Bedrock = ({ className = '' }: IconMapProps) => {

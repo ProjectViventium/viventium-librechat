@@ -91,6 +91,64 @@ describe('MCPManager', () => {
     };
   }
 
+  describe('getConnection', () => {
+    it('falls back to the user connection path if appConnections is not initialized yet', async () => {
+      const manager = await MCPManager.createInstance(newMCPServersConfig());
+      const expectedConnection = {
+        connectionState: 'connected',
+      } as unknown as MCPConnection;
+      jest.spyOn(manager, 'getUserConnection').mockResolvedValue(expectedConnection);
+      manager.appConnections = null;
+
+      const result = await manager.getConnection({
+        serverName,
+        user: { id: userId } as IUser,
+      });
+
+      expect(result).toBe(expectedConnection);
+      expect(manager.getUserConnection).toHaveBeenCalledWith(
+        expect.objectContaining({
+          serverName,
+          user: expect.objectContaining({ id: userId }),
+        }),
+      );
+    });
+
+    it('creates a user-scoped connection if appConnections is not initialized inside getUserConnection', async () => {
+      const manager = await MCPManager.createInstance(newMCPServersConfig());
+      const serverConfig = {
+        type: 'streamable-http',
+        url: 'http://127.0.0.1:7000/mcp',
+        requiresOAuth: true,
+      } as t.ParsedServerConfig;
+      const expectedConnection = {
+        isConnected: jest.fn().mockResolvedValue(true),
+        disconnect: jest.fn().mockResolvedValue(undefined),
+      } as unknown as MCPConnection;
+      manager.appConnections = null;
+      (mockRegistryInstance.getServerConfig as jest.Mock).mockResolvedValue(serverConfig);
+      (MCPConnectionFactory.create as jest.Mock).mockResolvedValue(expectedConnection);
+
+      const result = await manager.getUserConnection({
+        serverName,
+        user: { id: userId } as IUser,
+        flowManager: {} as Parameters<typeof manager.getUserConnection>[0]['flowManager'],
+      });
+
+      expect(result).toBe(expectedConnection);
+      expect(MCPConnectionFactory.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          serverName,
+          serverConfig,
+        }),
+        expect.objectContaining({
+          useOAuth: true,
+          user: expect.objectContaining({ id: userId }),
+        }),
+      );
+    });
+  });
+
   describe('getAppToolFunctions', () => {
     it('should return empty object when no servers have tool functions', async () => {
       (mockRegistryInstance.getAllServerConfigs as jest.Mock).mockResolvedValue({

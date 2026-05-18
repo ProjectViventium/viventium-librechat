@@ -12,6 +12,7 @@
  * Endpoints:
  * - POST /api/viventium/voice/chat   -> starts a resumable Agents run; returns { streamId, conversationId }
  * - GET  /api/viventium/voice/stream/:streamId -> SSE subscription to GenerationJobManager stream
+ * - POST /api/viventium/voice/stream/:streamId/abort -> aborts a voice-owned generation stream
  *
  * Added: 2026-01-08
  * Porting: Copy this file wholesale when reapplying Viventium changes onto a fresh upstream checkout.
@@ -39,7 +40,7 @@ const {
   materializeCallSessionConversationId,
   updateCallSessionConversationId,
 } = require('~/server/services/viventium/CallSessionService');
-const { getUserById } = require('~/models');
+const { getUserById, saveMessage } = require('~/models');
 const {
   getCompletedCortexInsightsForMessage,
 } = require('~/server/services/viventium/VoiceCortexInsightsService');
@@ -1240,6 +1241,80 @@ router.get('/stream/:streamId', voiceAuth, async (req, res) => {
   req.on('close', () => {
     result.unsubscribe();
   });
+});
+
+/* === VIVENTIUM START ===
+ * Feature: Voice barge-in cancellation propagation
+ * Purpose: When LiveKit cancels an in-flight voice LLM stream, give the voice gateway
+ * an authenticated path to stop the matching LibreChat generation job as well.
+ * Added: 2026-05-18
+ * === VIVENTIUM END === */
+router.post('/stream/:streamId/abort', voiceAuth, async (req, res) => {
+  const { streamId } = req.params;
+  const userId = req.user?.id;
+  const callSessionId = req.viventiumCallSession?.callSessionId || 'unknown';
+
+  if (typeof streamId !== 'string' || streamId.length === 0) {
+    return res.status(400).json({ error: 'streamId is required' });
+  }
+
+  const job = await GenerationJobManager.getJob(streamId);
+  if (!job) {
+    logger.warn(
+      `[VIVENTIUM][VoiceStream] abort_stream_not_found streamId=${streamId} ` +
+        `callSessionId=${callSessionId}`,
+    );
+    return res.status(404).json({ error: 'Stream not found', streamId });
+  }
+
+  if (job.metadata?.userId && job.metadata.userId !== userId) {
+    logger.warn(
+      `[VIVENTIUM][VoiceStream] abort_unauthorized streamId=${streamId} ` +
+        `callSessionId=${callSessionId}`,
+    );
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
+  const abortResult = await GenerationJobManager.abortJob(streamId);
+
+  if (
+    abortResult?.success &&
+    abortResult.jobData?.userMessage?.messageId &&
+    abortResult.jobData?.responseMessageId
+  ) {
+    const { jobData, content, text } = abortResult;
+    const responseMessage = {
+      messageId: jobData.responseMessageId,
+      parentMessageId: jobData.userMessage.messageId,
+      conversationId: jobData.conversationId,
+      content: content || [],
+      text: text || '',
+      sender: jobData.sender || 'AI',
+      endpoint: jobData.endpoint,
+      model: jobData.model,
+      unfinished: true,
+      error: false,
+      isCreatedByUser: false,
+      user: userId,
+    };
+
+    try {
+      await saveMessage(req, responseMessage, {
+        context: 'api/server/routes/viventium/voice.js - voice stream abort endpoint',
+      });
+    } catch (saveError) {
+      logger.error(
+        `[VIVENTIUM][VoiceStream] failed_to_save_partial_abort streamId=${streamId} ` +
+          `callSessionId=${callSessionId} error=${saveError.message}`,
+      );
+    }
+  }
+
+  logger.info(
+    `[VIVENTIUM][VoiceStream] aborted_stream streamId=${streamId} ` +
+      `callSessionId=${callSessionId} success=${abortResult?.success !== false}`,
+  );
+  return res.json({ success: abortResult?.success !== false, aborted: streamId });
 });
 
 /* === VIVENTIUM NOTE ===

@@ -767,6 +767,70 @@ function resolveFollowUpContinuationContext(messages, parentMessageId, options =
   };
 }
 
+function resolveUserRequestTextFromMessages(messages, assistantMessageId) {
+  if (!Array.isArray(messages) || !assistantMessageId) {
+    return '';
+  }
+
+  const candidates = messages.filter(
+    (message) => message && typeof message.messageId === 'string' && message.messageId,
+  );
+  const byId = new Map(candidates.map((message) => [message.messageId, message]));
+  const parent = byId.get(assistantMessageId);
+  if (!parent) {
+    return '';
+  }
+
+  if (isUserConversationMessage(parent)) {
+    return extractRecentResponseTextFromMessage(parent).trim();
+  }
+
+  const userMessageId = parent.parentMessageId;
+  if (!userMessageId) {
+    return '';
+  }
+  const userMessage = byId.get(userMessageId);
+  if (!isUserConversationMessage(userMessage)) {
+    return '';
+  }
+  return extractRecentResponseTextFromMessage(userMessage).trim();
+}
+
+async function resolveUserRequestTextForAssistantParent({ req, parentMessageId, messages }) {
+  const fromMessages = resolveUserRequestTextFromMessages(messages, parentMessageId);
+  if (fromMessages) {
+    return fromMessages;
+  }
+
+  if (!req?.user?.id || !parentMessageId) {
+    return '';
+  }
+
+  try {
+    const parent = await db.getMessage({ user: req.user.id, messageId: parentMessageId });
+    if (isUserConversationMessage(parent)) {
+      return extractRecentResponseTextFromMessage(parent).trim();
+    }
+
+    const userMessageId = parent?.parentMessageId;
+    if (!userMessageId) {
+      return '';
+    }
+
+    const userMessage = await db.getMessage({ user: req.user.id, messageId: userMessageId });
+    if (!isUserConversationMessage(userMessage)) {
+      return '';
+    }
+    return extractRecentResponseTextFromMessage(userMessage).trim();
+  } catch (err) {
+    logger.warn(
+      '[BackgroundCortexFollowUpService] Failed to load user request for forced primary follow-up:',
+      sanitizeFollowUpErrorForLog(err),
+    );
+    return '';
+  }
+}
+
 async function loadFollowUpContinuationContext({ req, conversationId, parentMessageId }) {
   if (!req?.user?.id || !conversationId) {
     return {
@@ -1202,6 +1266,7 @@ function deduplicateInsights(insights) {
 function formatFollowUpPrompt({
   insights = [],
   recentResponse = '',
+  userRequest = '',
   continuationContext = '',
   voiceMode = false,
   surface = '',
@@ -1229,6 +1294,7 @@ function formatFollowUpPrompt({
   }
 
   const cleanRecent = typeof recentResponse === 'string' ? recentResponse.trim() : '';
+  const cleanUserRequest = typeof userRequest === 'string' ? userRequest.trim() : '';
   const cleanContinuation =
     typeof continuationContext === 'string' ? continuationContext.trim() : '';
 
@@ -1272,12 +1338,16 @@ function formatFollowUpPrompt({
    * "DO NOT repeat" language.
    */
   const recentBlock = cleanRecent ? cleanRecent.slice(0, 2400) : '(short acknowledgment)';
+  const userRequestBlock = cleanUserRequest
+    ? cleanUserRequest.slice(0, 2400)
+    : '(user request unavailable; answer only from the background evidence and state uncertainty)';
 
   if (primaryResponseMode) {
     const fallbackPrompt = [
       'You are generating the primary user-visible answer for this turn.',
       'The assistant previously sent only a brief holding acknowledgement while background research/tools ran.',
       surfaceRules,
+      `User request for this turn:\n---\n${userRequestBlock}\n---`,
       `Prior visible hold text for context only (do NOT repeat it):\n---\n${recentBlock}\n---`,
       'Background agents provide evidence only. You decide what, if anything, should become visible to the user.',
       'Use the background insights below as your grounding and answer the user directly.',
@@ -1294,6 +1364,7 @@ function formatFollowUpPrompt({
       .join('\n\n');
     return getPromptText('cortex.follow_up_phase_b.primary_user_message', fallbackPrompt, {
       surface_rules: surfaceRules,
+      user_request: userRequestBlock,
       recent_response: recentBlock,
       background_insights: summaryLines,
     });
@@ -1577,6 +1648,7 @@ async function generateFollowUpText({
   agent,
   insightsData,
   recentResponse = '',
+  userRequest = '',
   continuationContext = '',
   runId = '',
   primaryResponseMode = false,
@@ -1601,6 +1673,7 @@ async function generateFollowUpText({
   const prompt = formatFollowUpPrompt({
     insights,
     recentResponse,
+    userRequest,
     continuationContext,
     voiceMode,
     surface,
@@ -1678,6 +1751,7 @@ async function generateFollowUpText({
         followup_system: systemPrompt,
         followup_prompt: prompt,
         recent_response: recentResponse || '',
+        user_request: userRequest || '',
         continuation_context: continuationContext || '',
         no_response_instructions: noResponseInstructions || '',
       },
@@ -1787,6 +1861,11 @@ async function createCortexFollowUpMessage({
     parentMessageId,
     recentResponse,
   });
+  const userRequest = await resolveUserRequestTextForAssistantParent({
+    req,
+    parentMessageId,
+    messages: conversationMessages,
+  });
   const followUpRecentResponse = isNoResponseOnly(recentResponseResolution.text)
     ? ''
     : recentResponseResolution.text;
@@ -1819,6 +1898,7 @@ async function createCortexFollowUpMessage({
         agent,
         insightsData,
         recentResponse: followUpRecentResponse,
+        userRequest,
         continuationContext: continuationContext.contextText,
         runId: parentMessageId || conversationId || '',
         primaryResponseMode: shouldForceVisibleFollowUp,
@@ -1981,6 +2061,7 @@ module.exports = {
   buildFollowUpSystemPrompt,
   formatFollowUpPrompt,
   extractRecentResponseTextFromMessage,
+  resolveUserRequestTextFromMessages,
   isPlaceholderRecentResponseText,
   getPreferredFallbackInsightText,
   resolveRecentResponseText,

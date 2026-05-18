@@ -14,6 +14,17 @@ import type { CortexStatus } from 'librechat-data-provider';
 import CortexCallInfo from './CortexCallInfo';
 import { cn } from '~/utils';
 
+const ACTIVE_CORTEX_STATUSES = new Set<CortexStatus>(['activating', 'brewing']);
+const STALE_CORTEX_DISPLAY_TIMEOUT_MS = 4 * 60 * 1000;
+
+function parseStatusChangedAt(value?: string): number | null {
+  if (!value) {
+    return null;
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 export default function CortexCall({
   cortex_id: _cortex_id,
   cortex_name,
@@ -25,6 +36,7 @@ export default function CortexCall({
   error_class,
   silent = false,
   no_response = false,
+  status_changed_at,
   isLast = false,
 }: {
   cortex_id: string;
@@ -37,6 +49,7 @@ export default function CortexCall({
   error_class?: string;
   silent?: boolean;
   no_response?: boolean;
+  status_changed_at?: string;
   isLast?: boolean;
 }) {
   const [showInfo, setShowInfo] = useState(false);
@@ -44,12 +57,32 @@ export default function CortexCall({
   const [contentHeight, setContentHeight] = useState<number | undefined>(0);
   const [isAnimating, setIsAnimating] = useState(false);
   const prevShowInfoRef = useRef<boolean>(showInfo);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  const statusChangedAtMs = useMemo(
+    () => parseStatusChangedAt(status_changed_at),
+    [status_changed_at],
+  );
+  const isActiveStatus = ACTIVE_CORTEX_STATUSES.has(status);
+  const isMissingStatusTimestamp = isActiveStatus && statusChangedAtMs === null;
+  const isStaleActive =
+    isActiveStatus &&
+    (statusChangedAtMs === null
+      ? true
+      : nowMs - statusChangedAtMs >= STALE_CORTEX_DISPLAY_TIMEOUT_MS);
+  const displayStatus: CortexStatus = isStaleActive ? 'error' : status;
+  const displayError =
+    isStaleActive && !error
+      ? isMissingStatusTimestamp
+        ? 'Background processing state is missing a status timestamp.'
+        : 'Background processing did not finish before the UI safety timeout.'
+      : error;
 
   const hasInsight = (insight?.trim().length ?? 0) > 0;
-  const hasErrorDetail = (error?.trim().length ?? 0) > 0;
-  const isComplete = status === 'complete';
-  const isSkipped = status === 'skipped';
-  const isError = status === 'error';
+  const hasErrorDetail = (displayError?.trim().length ?? 0) > 0;
+  const isComplete = displayStatus === 'complete';
+  const isSkipped = displayStatus === 'skipped';
+  const isError = displayStatus === 'error';
   const isSilentComplete = isComplete && (silent || no_response) && !hasInsight && !hasErrorDetail;
 
   // Determine if we have expandable content. Silent no-response completions may preserve an
@@ -61,9 +94,19 @@ export default function CortexCall({
     return hasInsight || hasErrorDetail || (reason?.trim().length ?? 0) > 0;
   }, [hasInsight, hasErrorDetail, isSilentComplete, reason]);
 
+  useEffect(() => {
+    if (!isActiveStatus || statusChangedAtMs === null) {
+      return;
+    }
+    const nextStaleAt = statusChangedAtMs + STALE_CORTEX_DISPLAY_TIMEOUT_MS;
+    const delayMs = Math.max(0, nextStaleAt - Date.now());
+    const timer = window.setTimeout(() => setNowMs(Date.now()), delayMs);
+    return () => window.clearTimeout(timer);
+  }, [isActiveStatus, statusChangedAtMs]);
+
   // Progress state: 0-1 based on status
   const progress = useMemo(() => {
-    switch (status) {
+    switch (displayStatus) {
       case 'activating':
         return 0.2;
       case 'brewing':
@@ -76,13 +119,13 @@ export default function CortexCall({
       default:
         return 0.1;
     }
-  }, [status]);
+  }, [displayStatus]);
 
   const cancelled = isError;
 
   // Get display text based on status
   const getText = () => {
-    switch (status) {
+    switch (displayStatus) {
       case 'activating':
         return `Checking ${cortex_name}...`;
       case 'brewing':
@@ -194,11 +237,11 @@ export default function CortexCall({
               <CortexCallInfo
                 key="cortex-call-info"
                 cortex_name={cortex_name}
-                status={status}
+                status={displayStatus}
                 confidence={confidence}
                 reason={reason}
                 insight={insight}
-                error={error}
+                error={displayError}
                 error_class={error_class}
               />
             )}

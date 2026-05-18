@@ -32,7 +32,10 @@ const { checkMigrations } = require('./services/start/migration');
 const initializeMCPs = require('./services/initializeMCPs');
 const configureSocialLogins = require('./socialLogins');
 const { getAppConfig } = require('./services/Config');
-const { recoverStaleCortexMessages } = require('./services/viventium/staleCortexMessageRecovery');
+const {
+  getStaleCortexRecoveryIntervalMs,
+  recoverStaleCortexMessages,
+} = require('./services/viventium/staleCortexMessageRecovery');
 const staticCache = require('./utils/staticCache');
 const noIndex = require('./middleware/noIndex');
 const { seedDatabase } = require('~/models');
@@ -241,6 +244,14 @@ const startServer = async () => {
     recoverStaleCortexMessages().catch((error) => {
       logger.error('[staleCortexMessageRecovery] Startup recovery failed:', error);
     });
+    const staleCortexRecoveryIntervalMs = getStaleCortexRecoveryIntervalMs();
+    if (staleCortexRecoveryIntervalMs > 0) {
+      setInterval(() => {
+        recoverStaleCortexMessages().catch((error) => {
+          logger.error('[staleCortexMessageRecovery] Periodic recovery failed:', error);
+        });
+      }, staleCortexRecoveryIntervalMs).unref?.();
+    }
 
     // Configure stream services (auto-detects Redis from USE_REDIS env var)
     const streamServices = createStreamServices();

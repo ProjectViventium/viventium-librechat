@@ -252,6 +252,7 @@ const Part = memo(
           error_class={cortexPart.error_class || cortexPart.errorClass}
           silent={cortexPart.silent}
           no_response={cortexPart.no_response}
+          status_changed_at={cortexPart.status_changed_at}
           isLast={isLast}
         />
       );

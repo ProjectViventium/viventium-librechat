@@ -16,6 +16,7 @@ const mockLogger = {
 
 const mockMeiliHealth = jest.fn();
 const mockMeiliIndex = jest.fn();
+const mockMeiliGetTasks = jest.fn();
 const mockBatchResetMeiliFlags = jest.fn();
 const mockIsEnabled = jest.fn();
 const mockGetLogStores = jest.fn();
@@ -26,6 +27,15 @@ const createMockModel = (collectionName) => ({
   getSyncProgress: jest.fn(),
   syncWithMeili: jest.fn(),
   countDocuments: jest.fn(),
+});
+
+const createMockMeiliIndex = (overrides = {}) => ({
+  getRawInfo: jest.fn().mockResolvedValue({ primaryKey: '_meiliId' }),
+  getSettings: jest.fn().mockResolvedValue({ filterableAttributes: ['user'] }),
+  updateSettings: jest.fn().mockResolvedValue({}),
+  getStats: jest.fn().mockResolvedValue({ numberOfDocuments: 10000 }),
+  search: jest.fn().mockResolvedValue({ hits: [] }),
+  ...overrides,
 });
 
 const originalMessageModel = mongoose.models.Message;
@@ -40,6 +50,7 @@ jest.mock('meilisearch', () => ({
   MeiliSearch: jest.fn(() => ({
     health: mockMeiliHealth,
     index: mockMeiliIndex,
+    getTasks: mockMeiliGetTasks,
   })),
 }));
 
@@ -99,12 +110,8 @@ describe('performSync() - syncThreshold logic', () => {
 
     // Mock MeiliSearch client responses
     mockMeiliHealth.mockResolvedValue({ status: 'available' });
-    mockMeiliIndex.mockReturnValue({
-      getSettings: jest.fn().mockResolvedValue({ filterableAttributes: ['user'] }),
-      updateSettings: jest.fn().mockResolvedValue({}),
-      getStats: jest.fn().mockResolvedValue({ numberOfDocuments: 10000 }),
-      search: jest.fn().mockResolvedValue({ hits: [] }),
-    });
+    mockMeiliGetTasks.mockResolvedValue({ results: [] });
+    mockMeiliIndex.mockReturnValue(createMockMeiliIndex());
 
     mockBatchResetMeiliFlags.mockResolvedValue(undefined);
   });
@@ -116,6 +123,37 @@ describe('performSync() - syncThreshold logic', () => {
   afterAll(() => {
     mongoose.models.Message = originalMessageModel;
     mongoose.models.Conversation = originalConversationModel;
+  });
+
+  test('blocks sync when recent Meili tasks show incompatible derived index state', async () => {
+    mockMeiliGetTasks.mockResolvedValue({
+      results: [
+        {
+          uid: 42,
+          type: 'documentAdditionOrUpdate',
+          indexUid: 'messages',
+          error: {
+            message: 'Index messages is in version 1.12.3 but Meilisearch is in version 1.43.0',
+          },
+        },
+      ],
+    });
+    Message.getSyncProgress.mockResolvedValue({
+      totalProcessed: 100,
+      totalDocuments: 1200,
+      isComplete: false,
+    });
+    Conversation.getSyncProgress.mockResolvedValue({
+      totalProcessed: 0,
+      totalDocuments: 0,
+      isComplete: true,
+    });
+
+    const indexSync = require('./indexSync');
+    await expect(indexSync()).rejects.toThrow('Meilisearch recent task health');
+
+    expect(Message.syncWithMeili).not.toHaveBeenCalled();
+    expect(Conversation.syncWithMeili).not.toHaveBeenCalled();
   });
 
   test('triggers sync when unindexed messages exceed syncThreshold', async () => {
@@ -350,11 +388,11 @@ describe('performSync() - syncThreshold logic', () => {
     Message.syncWithMeili.mockResolvedValue(undefined);
 
     // Mock settings update scenario
-    mockMeiliIndex.mockReturnValue({
-      getSettings: jest.fn().mockResolvedValue({ filterableAttributes: [] }), // No user field
-      updateSettings: jest.fn().mockResolvedValue({}),
-      search: jest.fn().mockResolvedValue({ hits: [] }),
-    });
+    mockMeiliIndex.mockReturnValue(
+      createMockMeiliIndex({
+        getSettings: jest.fn().mockResolvedValue({ filterableAttributes: [] }), // No user field
+      }),
+    );
 
     process.env.MEILI_SYNC_THRESHOLD = '1000';
 
@@ -393,11 +431,11 @@ describe('performSync() - syncThreshold logic', () => {
     Conversation.syncWithMeili.mockResolvedValue(undefined);
 
     // Mock settings update scenario
-    mockMeiliIndex.mockReturnValue({
-      getSettings: jest.fn().mockResolvedValue({ filterableAttributes: [] }), // No user field
-      updateSettings: jest.fn().mockResolvedValue({}),
-      search: jest.fn().mockResolvedValue({ hits: [] }),
-    });
+    mockMeiliIndex.mockReturnValue(
+      createMockMeiliIndex({
+        getSettings: jest.fn().mockResolvedValue({ filterableAttributes: [] }), // No user field
+      }),
+    );
 
     process.env.MEILI_SYNC_THRESHOLD = '1000';
 
@@ -438,11 +476,11 @@ describe('performSync() - syncThreshold logic', () => {
     Conversation.syncWithMeili.mockResolvedValue(undefined);
 
     // Mock settings update scenario
-    mockMeiliIndex.mockReturnValue({
-      getSettings: jest.fn().mockResolvedValue({ filterableAttributes: [] }), // No user field
-      updateSettings: jest.fn().mockResolvedValue({}),
-      search: jest.fn().mockResolvedValue({ hits: [] }),
-    });
+    mockMeiliIndex.mockReturnValue(
+      createMockMeiliIndex({
+        getSettings: jest.fn().mockResolvedValue({ filterableAttributes: [] }), // No user field
+      }),
+    );
 
     // Act
     const indexSync = require('./indexSync');
@@ -491,14 +529,13 @@ describe('performSync() - syncThreshold logic', () => {
 
     Message.syncWithMeili.mockResolvedValue(undefined);
 
-    mockMeiliIndex.mockImplementation((indexName) => ({
-      getSettings: jest.fn().mockResolvedValue({ filterableAttributes: ['user'] }),
-      updateSettings: jest.fn().mockResolvedValue({}),
-      getStats: jest.fn().mockResolvedValue({
-        numberOfDocuments: indexName === 'messages' ? 0 : 50,
+    mockMeiliIndex.mockImplementation((indexName) =>
+      createMockMeiliIndex({
+        getStats: jest.fn().mockResolvedValue({
+          numberOfDocuments: indexName === 'messages' ? 0 : 50,
+        }),
       }),
-      search: jest.fn().mockResolvedValue({ hits: [] }),
-    }));
+    );
 
     process.env.MEILI_SYNC_THRESHOLD = '1000';
 
@@ -552,14 +589,13 @@ describe('performSync() - syncThreshold logic', () => {
 
     Message.syncWithMeili.mockResolvedValue(undefined);
 
-    mockMeiliIndex.mockImplementation((indexName) => ({
-      getSettings: jest.fn().mockResolvedValue({ filterableAttributes: ['user'] }),
-      updateSettings: jest.fn().mockResolvedValue({}),
-      getStats: jest.fn().mockResolvedValue({
-        numberOfDocuments: indexName === 'messages' ? 125 : 50,
+    mockMeiliIndex.mockImplementation((indexName) =>
+      createMockMeiliIndex({
+        getStats: jest.fn().mockResolvedValue({
+          numberOfDocuments: indexName === 'messages' ? 125 : 50,
+        }),
       }),
-      search: jest.fn().mockResolvedValue({ hits: [] }),
-    }));
+    );
 
     process.env.MEILI_SYNC_THRESHOLD = '1000';
 

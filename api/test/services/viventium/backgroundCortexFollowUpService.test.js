@@ -1708,7 +1708,7 @@ describe('BackgroundCortexFollowUpService', () => {
       },
       config: { endpoints: { agents: { allowedProviders: ['anthropic', 'openAI'] } } },
     };
-    getAgent.mockResolvedValue({
+    const agentConfig = {
       id: 'agent_viventium_main_95aeb3',
       provider: 'openAI',
       model: 'gpt-5.4',
@@ -1716,20 +1716,13 @@ describe('BackgroundCortexFollowUpService', () => {
       voice_llm_provider: 'anthropic',
       voice_llm_model: 'claude-haiku-4-5',
       voice_llm_model_parameters: { temperature: 0.1, max_output_tokens: 160 },
-    });
+    };
+    getAgent.mockResolvedValue(agentConfig);
 
     try {
       await generateFollowUpText({
         req,
-        agent: {
-          id: 'agent_viventium_main_95aeb3',
-          provider: 'openAI',
-          model: 'gpt-5.4',
-          model_parameters: { reasoning_effort: 'high' },
-          voice_llm_provider: 'anthropic',
-          voice_llm_model: 'claude-haiku-4-5',
-          voice_llm_model_parameters: { temperature: 0.1, max_output_tokens: 160 },
-        },
+        agent: agentConfig,
         insightsData: {
           insights: [{ cortexName: 'Support', insight: 'Let them know the voice path is ready.' }],
         },
@@ -1737,15 +1730,15 @@ describe('BackgroundCortexFollowUpService', () => {
         runId: 'run-voice-followup-params',
       });
 
-      expect(initializeAnthropic).toHaveBeenCalledWith(
+      const anthropicArgs = initializeAnthropic.mock.calls[0][0];
+      expect(anthropicArgs.model_parameters).toEqual(
         expect.objectContaining({
-          model_parameters: expect.objectContaining({
-            model: 'claude-haiku-4-5',
-            reasoning_effort: 'high',
-            max_output_tokens: 400,
-          }),
+          model: 'claude-haiku-4-5',
+          max_output_tokens: 400,
         }),
       );
+      expect(anthropicArgs.model_parameters).not.toHaveProperty('reasoning_effort');
+      expect(agentConfig.model_parameters).toEqual({ reasoning_effort: 'high' });
     } finally {
       if (originalAnthropicKey === undefined) {
         delete process.env.ANTHROPIC_API_KEY;

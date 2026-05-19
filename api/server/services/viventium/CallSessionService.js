@@ -811,35 +811,72 @@ async function assertVoiceGatewayAuth(req) {
   const jobId = req.get('X-VIVENTIUM-JOB-ID') || req.get('x-viventium-job-id') || '';
   const workerId = req.get('X-VIVENTIUM-WORKER-ID') || req.get('x-viventium-worker-id') || '';
 
-  const session = await assertCallSessionSecret(callSessionId, secret);
+  const expected = getRequiredEnvSecret();
+  if (!expected) {
+    throw new Error('VIVENTIUM_CALL_SESSION_SECRET is not set');
+  }
+  if (!secret || secret !== expected) {
+    const err = new Error('Unauthorized voice gateway');
+    err.status = 401;
+    throw err;
+  }
   if (!jobId) {
     const err = new Error('Missing voice job id');
     err.status = 401;
     throw err;
   }
 
-  const claimed = await claimVoiceSession({
-    callSessionId: session.callSessionId,
-    jobId,
-    workerId,
-  });
+  /* === VIVENTIUM START ===
+   * Feature: Voice hot-path auth compression.
+   * Purpose: Combine the "session exists" check and worker lease claim into one atomic
+   * DB query on the successful path. The previous flow performed getCallSession() and
+   * then claimVoiceSession(), adding an avoidable round trip before stream readiness.
+   * === VIVENTIUM END === */
+  const now = new Date();
+  const leaseMs = getCallSessionLeaseMs();
+  const leaseExpiresAt = new Date(now.getTime() + leaseMs);
+  const claimed = await ViventiumCallSession.findOneAndUpdate(
+    {
+      callSessionId: String(callSessionId),
+      expiresAt: { $gt: now },
+      $or: [
+        { activeJobId: String(jobId) },
+        { activeJobId: null },
+        { leaseExpiresAt: { $lt: now } },
+      ],
+    },
+    {
+      $set: {
+        activeJobId: String(jobId),
+        activeWorkerId: workerId ? String(workerId) : null,
+        leaseExpiresAt,
+      },
+    },
+    { new: true },
+  ).lean();
+  if (claimed) {
+    return normalizeSession(claimed);
+  }
+  /* === VIVENTIUM END === */
 
-  if (!claimed) {
-    const now = Date.now();
-    if (session.activeJobId && session.activeJobId !== jobId) {
-      const leaseExpiresAtMs = session.leaseExpiresAtMs || 0;
-      if (leaseExpiresAtMs > now) {
-        const err = new Error('Another worker owns this session');
-        err.status = 403;
-        throw err;
-      }
-    }
-    const err = new Error('Unable to claim voice session');
-    err.status = 403;
+  const session = await getCallSession(callSessionId);
+  if (!session) {
+    const err = new Error('Unknown or expired call session');
+    err.status = 401;
     throw err;
   }
-
-  return claimed;
+  const nowMs = Date.now();
+  if (session.activeJobId && session.activeJobId !== jobId) {
+    const leaseExpiresAtMs = session.leaseExpiresAtMs || 0;
+    if (leaseExpiresAtMs > nowMs) {
+      const err = new Error('Another worker owns this session');
+      err.status = 403;
+      throw err;
+    }
+  }
+  const err = new Error('Unable to claim voice session');
+  err.status = 403;
+  throw err;
 }
 
 async function claimDispatch({ callSessionId, roomName, agentName, reclaimConfirmed = false }) {

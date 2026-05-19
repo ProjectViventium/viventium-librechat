@@ -39,6 +39,10 @@ const {
   startDeepTiming,
   logDeepTiming,
 } = require('~/server/services/viventium/telegramTimingDeep');
+const {
+  formatVoiceLatencyTiming,
+  voiceLatencyNow,
+} = require('~/server/services/viventium/voiceLatencyTiming');
 /* === VIVENTIUM NOTE END === */
 
 /* === VIVENTIUM NOTE ===
@@ -350,15 +354,11 @@ const logVoiceLatencyStage = (req, stage, stageStartAt = null, details = '') => 
     return;
   }
 
-  const now = Date.now();
-  const routeStartAt =
-    typeof req?.viventiumVoiceStartAt === 'number' ? req.viventiumVoiceStartAt : now;
-  const stageMs = typeof stageStartAt === 'number' ? now - stageStartAt : null;
   const requestId = getVoiceLatencyRequestId(req);
-  const stagePart = stageMs == null ? '' : ` stage_ms=${stageMs}`;
+  const timingPart = formatVoiceLatencyTiming(req, stageStartAt);
   const detailPart = details ? ` ${details}` : '';
   logger.info(
-    `[VoiceLatency][LC] stage=${stage} request_id=${requestId} total_ms=${now - routeStartAt}${stagePart}${detailPart}`,
+    `[VoiceLatency][LC] stage=${stage} request_id=${requestId} ${timingPart}${detailPart}`,
   );
 };
 /* === VIVENTIUM NOTE END === */
@@ -451,18 +451,28 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
       userId,
     });
 
+    const voiceJobCreateStart = voiceLatencyEnabled ? voiceLatencyNow() : 0;
     const job = await GenerationJobManager.createJob(streamId, userId, conversationId);
+    if (voiceLatencyEnabled) {
+      logVoiceLatencyStage(
+        req,
+        'job_created',
+        voiceJobCreateStart,
+        `stream_id=${streamId} stream_id_source=${reqStreamId ? 'request' : 'conversation'} conversation_id=${conversationId}`,
+      );
+    }
     const jobCreatedAt = job.createdAt; // Capture creation time to detect job replacement
     req._resumableStreamId = streamId;
 
     // Send JSON response IMMEDIATELY so client can connect to SSE stream
     // This is critical: tool loading (MCP OAuth) may emit events that the client needs to receive
+    const voiceReadyJsonStart = voiceLatencyEnabled ? voiceLatencyNow() : 0;
     res.json({ streamId, conversationId, status: 'started' });
     if (voiceLatencyEnabled) {
       logVoiceLatencyStage(
         req,
         'resumable_ready_sent',
-        null,
+        voiceReadyJsonStart,
         `stream_id=${streamId} stream_id_source=${
           reqStreamId ? 'request' : 'conversation'
         } conversation_id=${conversationId}`,
@@ -550,7 +560,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
 
     /** @type {{ client: TAgentClient; userMCPAuthMap?: Record<string, Record<string, string>> }} */
     const initStart = startDeepTiming(req);
-    const voiceInitStart = voiceLatencyEnabled ? Date.now() : 0;
+    const voiceInitStart = voiceLatencyEnabled ? voiceLatencyNow() : 0;
     if (voiceLatencyEnabled) {
       logVoiceLatencyStage(req, 'initialize_client_start', null, `stream_id=${streamId}`);
     }
@@ -606,7 +616,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
         logVoiceLatencyStage(req, 'start_generation_enter', null, `stream_id=${streamId}`);
       }
       let readyGateTimedOut = false;
-      const voiceReadyGateStart = voiceLatencyEnabled ? Date.now() : 0;
+      const voiceReadyGateStart = voiceLatencyEnabled ? voiceLatencyNow() : 0;
       try {
         // Short timeout as safety net - promise should already be resolved
         await Promise.race([
@@ -780,7 +790,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           },
         };
 
-        const voiceSendMessageStart = voiceLatencyEnabled ? Date.now() : 0;
+        const voiceSendMessageStart = voiceLatencyEnabled ? voiceLatencyNow() : 0;
         if (voiceLatencyEnabled) {
           logVoiceLatencyStage(req, 'send_message_start', null, `stream_id=${streamId}`);
         }

@@ -242,15 +242,29 @@ export async function createRun({
       (providerEndpointMap[
         agent.provider as keyof typeof providerEndpointMap
       ] as unknown as Providers) ?? agent.provider;
+    /* === VIVENTIUM START ===
+     * Feature: Anthropic no-thinking normalization for Agents graph runs.
+     * Purpose: @librechat/agents currently treats any non-null Anthropic `thinking`
+     * value as an active thinking run for pruning. Persisted `thinking:false` is an
+     * input flag meaning disabled, so consume it before creating graph client options.
+     * Added: 2026-05-19
+     * === VIVENTIUM END === */
+    const modelParameters = { ...(agent.model_parameters ?? {}) } as Record<string, unknown>;
+    if (provider === Providers.ANTHROPIC && modelParameters.thinking === false) {
+      delete modelParameters.thinking;
+      delete modelParameters.thinkingBudget;
+      delete modelParameters.thinkingLevel;
+      delete modelParameters.effort;
+    }
 
-    const llmConfig: t.RunLLMConfig = Object.assign(
+    const llmConfig = Object.assign(
       {
         provider,
         streaming,
         streamUsage,
       },
-      agent.model_parameters,
-    );
+      modelParameters,
+    ) as unknown as t.RunLLMConfig;
 
     const systemMessage = Object.values(agent.toolContextMap ?? {})
       .join('\n')

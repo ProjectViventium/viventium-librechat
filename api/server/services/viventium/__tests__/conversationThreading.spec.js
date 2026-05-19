@@ -166,6 +166,10 @@ describe('conversationThreading', () => {
     expect(state.conversationId).toBe('conv-1');
     expect(state.parentMessageId).toBe('assistant-1');
     expect(state.reason).toBe('existing');
+    expect(mockGetMessages).toHaveBeenCalledWith(
+      { conversationId: 'conv-1' },
+      expect.stringContaining('metadata.viventium.mode'),
+    );
   });
 
   test('resolveReusableConversationState reuses provider-backed voice conversations for the same agent', async () => {

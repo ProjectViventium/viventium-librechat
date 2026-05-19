@@ -203,9 +203,52 @@ async function resolveVoicePhaseAAsyncPolicyWithHydratedTools({
   };
 }
 
+function resolvePhaseANoticeToolHoldGuard({
+  requestedPhaseANoticeMode,
+  voiceMode,
+  agent,
+  directActionSurfaces,
+  agentTools,
+  toolDefinitions,
+  asyncPolicy,
+} = {}) {
+  if (!voiceMode || requestedPhaseANoticeMode !== 'first_activation_continue') {
+    return {
+      guarded: false,
+      reason: 'not_applicable',
+      toolHoldScopeKeys: [],
+      unownedToolHoldScopeKeys: [],
+    };
+  }
+
+  const toolHoldScopeKeys = getConfiguredToolHoldScopeKeys(agent);
+  const unownedToolHoldScopeKeys = getUnownedToolHoldScopeKeys(agent, {
+    directActionSurfaces,
+    agentTools,
+    toolDefinitions,
+  });
+
+  if (asyncPolicy?.forcedOff === true || unownedToolHoldScopeKeys.length > 0) {
+    return {
+      guarded: true,
+      reason: asyncPolicy?.reason || 'unowned_tool_hold_candidate_configured',
+      toolHoldScopeKeys,
+      unownedToolHoldScopeKeys,
+    };
+  }
+
+  return {
+    guarded: false,
+    reason: toolHoldScopeKeys.length > 0 ? 'direct_action_owned' : 'no_tool_hold_candidate',
+    toolHoldScopeKeys,
+    unownedToolHoldScopeKeys,
+  };
+}
+
 module.exports = {
   resolveVoicePhaseAAsyncPolicy,
   resolveVoicePhaseAAsyncPolicyWithHydratedTools,
+  resolvePhaseANoticeToolHoldGuard,
   hasToolHoldCandidateConfigured,
   getConfiguredToolHoldScopeKeys,
   getUnownedToolHoldScopeKeys,

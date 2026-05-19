@@ -94,6 +94,12 @@ function isListenOnlyMeiliOptOut(doc: unknown): boolean {
   return metadata?.type === 'listen_only_transcript' && metadata?.mode === 'listen_only';
 }
 
+const getMeiliEligibleQuery = (): FilterQuery<unknown> => ({
+  expiredAt: null,
+  'metadata.viventium.type': { $ne: 'listen_only_transcript' },
+  'metadata.viventium.mode': { $ne: 'listen_only' },
+});
+
 /**
  * Get sync configuration from environment variables
  */
@@ -145,11 +151,66 @@ const waitForMeiliTasks = async (
       continue;
     }
 
-    await index.waitForTask(task.taskUid, {
+    const result = await index.waitForTask(task.taskUid, {
       timeOutMs: parseInt(process.env.MEILI_SYNC_TASK_TIMEOUT_MS || '30000', 10),
       intervalMs: parseInt(process.env.MEILI_SYNC_TASK_INTERVAL_MS || '50', 10),
     });
+
+    if (result.status !== 'succeeded') {
+      const error = result.error;
+      const message =
+        error && typeof error === 'object' && 'message' in error
+          ? String((error as { message?: unknown }).message)
+          : `Meilisearch task ended with status ${result.status}`;
+      throw new Error(`Meilisearch task ${task.taskUid} failed: ${message}`);
+    }
   }
+};
+
+/* === VIVENTIUM START ===
+ * Feature: Meili settings churn guard.
+ * Purpose: Avoid enqueueing a settings update on every model load. Repeated
+ * no-op updates still become Meili tasks and can amplify resource pressure or
+ * hide real task failures.
+ * === VIVENTIUM END === */
+const ensureUserFilterableAttribute = async (
+  index: Index<MeiliIndexable>,
+  indexName: string,
+): Promise<boolean> => {
+  const settings = (await index.getSettings()) as { filterableAttributes?: unknown };
+  const current = Array.isArray(settings.filterableAttributes) ? settings.filterableAttributes : [];
+
+  if (current.some((attribute) => attribute === 'user')) {
+    logger.debug(`[mongoMeili] Index ${indexName} already has 'user' configured as filterable`);
+    return false;
+  }
+
+  await index.updateSettings({
+    filterableAttributes: [...current, 'user'] as string[],
+  });
+  logger.debug(`[mongoMeili] Updated index ${indexName} settings to make 'user' filterable`);
+  return true;
+};
+
+/* === VIVENTIUM START ===
+ * Feature: Stable Meili document ids.
+ * Purpose: Some valid LibreChat conversation/message ids contain characters
+ * Meili rejects for primary document identifiers. Store an encoded internal
+ * Meili id while preserving the real ids for result lookup.
+ * === VIVENTIUM END === */
+const meiliDocumentIdField = '_meiliId';
+
+const getMeiliDocumentId = (value: unknown): string => {
+  if (_.isNil(value) || String(value).length === 0) {
+    throw new Error('Cannot index document without a primary key value');
+  }
+
+  const source = String(value);
+  let encoded = '';
+  for (let index = 0; index < source.length; index++) {
+    encoded += source.charCodeAt(index).toString(16).padStart(4, '0');
+  }
+  return `m_${encoded}`;
 };
 
 /**
@@ -165,14 +226,15 @@ const waitForMeiliTasks = async (
  */
 const createMeiliMongooseModel = ({
   index,
+  primaryKey,
   attributesToIndex,
   syncOptions,
 }: {
   index: Index<MeiliIndexable>;
+  primaryKey: string;
   attributesToIndex: string[];
   syncOptions: { batchSize: number; delayMs: number };
 }) => {
-  const primaryKey = attributesToIndex[0];
   const syncConfig = { ...getSyncConfig(), ...syncOptions };
 
   class MeiliMongooseModel {
@@ -180,8 +242,11 @@ const createMeiliMongooseModel = ({
      * Get the current sync progress
      */
     static async getSyncProgress(this: SchemaWithMeiliMethods): Promise<SyncProgress> {
-      const totalDocuments = await this.countDocuments({ expiredAt: null });
-      const indexedDocuments = await this.countDocuments({ expiredAt: null, _meiliIndex: true });
+      const totalDocuments = await this.countDocuments(getMeiliEligibleQuery());
+      const indexedDocuments = await this.countDocuments({
+        ...getMeiliEligibleQuery(),
+        _meiliIndex: true,
+      });
 
       return {
         totalProcessed: indexedDocuments,
@@ -232,10 +297,8 @@ const createMeiliMongooseModel = ({
          * must be considered syncable.
          * === VIVENTIUM END === */
         const query: FilterQuery<unknown> = {
-          expiredAt: null,
+          ...getMeiliEligibleQuery(),
           _meiliIndex: { $ne: true },
-          'metadata.viventium.type': { $ne: 'listen_only_transcript' },
-          'metadata.viventium.mode': { $ne: 'listen_only' },
         };
 
         try {
@@ -288,9 +351,11 @@ const createMeiliMongooseModel = ({
       }
 
       // Format documents for MeiliSearch
-      const formattedDocs = documents.map((doc) =>
-        _.omitBy(_.pick(doc, attributesToIndex), (_v, k) => k.startsWith('$')),
-      );
+      const formattedDocs = documents.map((doc) => {
+        const object = _.omitBy(_.pick(doc, attributesToIndex), (_v, k) => k.startsWith('$'));
+        object[meiliDocumentIdField] = getMeiliDocumentId(object[primaryKey]);
+        return object;
+      });
 
       try {
         /* === VIVENTIUM START ===
@@ -337,7 +402,21 @@ const createMeiliMongooseModel = ({
             break;
           }
 
-          const meiliIds = batch.results.map((doc) => doc[primaryKey]);
+          const meiliRecords = batch.results
+            .map((doc) => {
+              const primaryValue = doc[primaryKey];
+              if (_.isNil(primaryValue)) {
+                return null;
+              }
+              return {
+                primaryValue,
+                meiliId: doc[meiliDocumentIdField] ?? primaryValue,
+              };
+            })
+            .filter(
+              (record): record is { primaryValue: unknown; meiliId: unknown } => record != null,
+            );
+          const meiliIds = meiliRecords.map((record) => record.primaryValue);
           const query: Record<string, unknown> = {};
           query[primaryKey] = { $in: meiliIds };
           query['metadata.viventium.type'] = { $ne: 'listen_only_transcript' };
@@ -351,11 +430,11 @@ const createMeiliMongooseModel = ({
           );
 
           // Delete documents that don't exist in MongoDB or are no longer index-eligible.
-          const toDelete = meiliIds.filter((id) => !existingIds.has(id));
+          const toDelete = meiliRecords.filter((record) => !existingIds.has(record.primaryValue));
           if (toDelete.length > 0) {
-            await index.deleteDocuments(toDelete.map(String));
+            await index.deleteDocuments(toDelete.map((record) => String(record.meiliId)));
             await this.updateMany(
-              { [primaryKey]: { $in: toDelete } },
+              { [primaryKey]: { $in: toDelete.map((record) => record.primaryValue) } },
               { $set: { _meiliIndex: false } },
               { timestamps: false },
             );
@@ -438,14 +517,7 @@ const createMeiliMongooseModel = ({
       const object = _.omitBy(_.pick(this.toJSON(), attributesToIndex), (v, k) =>
         k.startsWith('$'),
       );
-
-      if (
-        object.conversationId &&
-        typeof object.conversationId === 'string' &&
-        object.conversationId.includes('|')
-      ) {
-        object.conversationId = object.conversationId.replace(/\|/g, '--');
-      }
+      object[meiliDocumentIdField] = getMeiliDocumentId(object[primaryKey]);
 
       if (object.content && Array.isArray(object.content)) {
         object.text = parseTextParts(object.content);
@@ -473,7 +545,8 @@ const createMeiliMongooseModel = ({
 
       while (retryCount < maxRetries) {
         try {
-          await index.addDocuments([object]);
+          const task = await index.addDocuments([object]);
+          await waitForMeiliTasks(index, task);
           break;
         } catch (error) {
           retryCount++;
@@ -507,10 +580,9 @@ const createMeiliMongooseModel = ({
       next: CallbackWithoutResultAndOptionalError,
     ): Promise<void> {
       try {
-        const object = _.omitBy(_.pick(this.toJSON(), attributesToIndex), (v, k) =>
-          k.startsWith('$'),
-        );
-        await index.updateDocuments([object]);
+        const object = this.preprocessObjectForIndex!();
+        const task = await index.updateDocuments([object]);
+        await waitForMeiliTasks(index, task);
         next();
       } catch (error) {
         logger.error('[updateObjectToMeili] Error updating document in Meili:', error);
@@ -528,7 +600,9 @@ const createMeiliMongooseModel = ({
       next: CallbackWithoutResultAndOptionalError,
     ): Promise<void> {
       try {
-        await index.deleteDocument(this._id as string);
+        const primaryValue = (this as unknown as Record<string, unknown>)[primaryKey];
+        const task = await index.deleteDocument(getMeiliDocumentId(primaryValue));
+        await waitForMeiliTasks(index, task);
         next();
       } catch (error) {
         logger.error('[deleteObjectFromMeili] Error deleting document from Meili:', error);
@@ -638,14 +712,19 @@ export default function mongoMeili(schema: Schema, options: MongoMeiliOptions): 
   // Check if index exists and create if needed
   (async () => {
     try {
-      await index.getRawInfo();
+      const info = ((await index.getRawInfo()) ?? {}) as { primaryKey?: string | null };
       logger.debug(`[mongoMeili] Index ${indexName} already exists`);
+      if (info.primaryKey && info.primaryKey !== meiliDocumentIdField) {
+        logger.warn(
+          `[mongoMeili] Index ${indexName} uses legacy primary key ${info.primaryKey}; rebuild the derived Meilisearch index to support all LibreChat ids`,
+        );
+      }
     } catch (error) {
       const errorCode = (error as { code?: string })?.code;
       if (errorCode === 'index_not_found') {
         try {
           logger.info(`[mongoMeili] Creating new index: ${indexName}`);
-          await client.createIndex(indexName, { primaryKey });
+          await client.createIndex(indexName, { primaryKey: meiliDocumentIdField });
           logger.info(`[mongoMeili] Successfully created index: ${indexName}`);
         } catch (createError) {
           // Index might have been created by another instance
@@ -658,10 +737,7 @@ export default function mongoMeili(schema: Schema, options: MongoMeiliOptions): 
 
     // Configure index settings to make 'user' field filterable
     try {
-      await index.updateSettings({
-        filterableAttributes: ['user'],
-      });
-      logger.debug(`[mongoMeili] Updated index ${indexName} settings to make 'user' filterable`);
+      await ensureUserFilterableAttribute(index, indexName);
     } catch (settingsError) {
       logger.error(`[mongoMeili] Error updating index settings for ${indexName}:`, settingsError);
     }
@@ -675,6 +751,10 @@ export default function mongoMeili(schema: Schema, options: MongoMeiliOptions): 
     }, []),
   ];
 
+  if (!attributesToIndex.includes(primaryKey)) {
+    attributesToIndex.unshift(primaryKey);
+  }
+
   // CRITICAL: Always include 'user' field for proper filtering
   // This ensures existing deployments can filter by user after migration
   if (schema.obj.user && !attributesToIndex.includes('user')) {
@@ -682,7 +762,7 @@ export default function mongoMeili(schema: Schema, options: MongoMeiliOptions): 
     logger.debug(`[mongoMeili] Added 'user' field to ${indexName} index attributes`);
   }
 
-  schema.loadClass(createMeiliMongooseModel({ index, attributesToIndex, syncOptions }));
+  schema.loadClass(createMeiliMongooseModel({ index, primaryKey, attributesToIndex, syncOptions }));
 
   // Register Mongoose hooks
   schema.post('save', function (doc: DocumentWithMeiliIndex, next) {
@@ -718,7 +798,7 @@ export default function mongoMeili(schema: Schema, options: MongoMeiliOptions): 
         // Process deletions in batches
         await processBatch(deletedConvos, batchSize, delayMs, async (batch) => {
           const promises = batch.map((convo: Record<string, unknown>) =>
-            convoIndex.deleteDocument(convo.conversationId as string),
+            convoIndex.deleteDocument(getMeiliDocumentId(convo.conversationId)),
           );
           await Promise.all(promises);
         });
@@ -735,7 +815,7 @@ export default function mongoMeili(schema: Schema, options: MongoMeiliOptions): 
         // Process deletions in batches
         await processBatch(deletedMessages, batchSize, delayMs, async (batch) => {
           const promises = batch.map((message: Record<string, unknown>) =>
-            messageIndex.deleteDocument(message.messageId as string),
+            messageIndex.deleteDocument(getMeiliDocumentId(message.messageId)),
           );
           await Promise.all(promises);
         });

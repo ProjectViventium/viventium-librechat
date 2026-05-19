@@ -280,6 +280,58 @@ describe('CallSessionService', () => {
     expect(authed.activeJobId).toBe('job_1');
   });
 
+  test('assertVoiceGatewayAuth rejects a live session owned by another active job', async () => {
+    const user = await User.create({
+      name: 'Call User',
+      email: 'voice-auth-owned@example.com',
+      provider: 'local',
+    });
+
+    const created = await createCallSession({
+      userId: user._id.toString(),
+      agentId: 'agent_1',
+      conversationId: 'new',
+    });
+    await claimVoiceSession({
+      callSessionId: created.callSessionId,
+      jobId: 'job_1',
+      workerId: 'worker_a',
+      leaseDurationMs: 1000,
+    });
+
+    const headers = {
+      'x-viventium-call-session': created.callSessionId,
+      'x-viventium-call-secret': 'secret',
+      'x-viventium-job-id': 'job_2',
+      'x-viventium-worker-id': 'worker_b',
+    };
+    const req = {
+      get: (name) => headers[name.toLowerCase()] || '',
+    };
+
+    await expect(assertVoiceGatewayAuth(req)).rejects.toMatchObject({
+      status: 403,
+      message: 'Another worker owns this session',
+    });
+  });
+
+  test('assertVoiceGatewayAuth rejects missing or expired sessions as unauthorized', async () => {
+    const headers = {
+      'x-viventium-call-session': 'missing-session',
+      'x-viventium-call-secret': 'secret',
+      'x-viventium-job-id': 'job_1',
+      'x-viventium-worker-id': 'worker_a',
+    };
+    const req = {
+      get: (name) => headers[name.toLowerCase()] || '',
+    };
+
+    await expect(assertVoiceGatewayAuth(req)).rejects.toMatchObject({
+      status: 401,
+      message: 'Unknown or expired call session',
+    });
+  });
+
   test('claimDispatch + confirmDispatch finalize dispatch state', async () => {
     const user = await User.create({
       name: 'Call User',

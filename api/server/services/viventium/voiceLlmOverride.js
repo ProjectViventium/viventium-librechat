@@ -61,12 +61,23 @@ function resolveVoiceOverrideAssignment(agent) {
 
   const explicitProvider = normalizeProvider(agent.voice_llm_provider);
   const explicitModel = String(agent.voice_llm_model || '').trim();
-  const assignment = readVoiceAssignment({
+  let assignment = readVoiceAssignment({
     explicitProvider,
     explicitModel,
     mainProvider: agent.provider,
     mainModel: agent.model || agent.model_parameters?.model || '',
   });
+  if (
+    !assignment &&
+    explicitProvider &&
+    explicitModel &&
+    agent.voice_llm_model_parameters &&
+    typeof agent.voice_llm_model_parameters === 'object' &&
+    !Array.isArray(agent.voice_llm_model_parameters) &&
+    Object.keys(agent.voice_llm_model_parameters).length > 0
+  ) {
+    assignment = { provider: explicitProvider, model: explicitModel };
+  }
 
   if (!assignment) {
     return null;
@@ -148,7 +159,22 @@ function hasOwn(value, key) {
 
 function normalizeVoiceModelParametersForProvider(parameters, voiceParams, provider) {
   const resolved = cloneModelParameters(parameters);
-  if (normalizeProvider(provider) !== 'xai') {
+  const normalizedProvider = normalizeProvider(provider);
+  if (normalizedProvider === 'anthropic') {
+    delete resolved.reasoning;
+    delete resolved.reasoning_effort;
+    if (resolved.thinking === false) {
+      delete resolved.thinking;
+    }
+    if (voiceParams?.thinking === false) {
+      delete resolved.thinking;
+      delete resolved.thinkingBudget;
+      delete resolved.thinkingLevel;
+      delete resolved.effort;
+    }
+    return resolved;
+  }
+  if (normalizedProvider !== 'xai') {
     return resolved;
   }
 

@@ -129,6 +129,21 @@ describe('agentLlmFallback', () => {
       model: 'claude-opus-4-7',
       thinkingBudget: 2000,
     });
+
+    expect(
+      sanitizeFallbackModelParametersForProvider(
+        {
+          model: 'grok-4.3',
+          thinking: false,
+          thinkingBudget: 2000,
+          reasoning_effort: 'none',
+        },
+        'xai',
+      ),
+    ).toEqual({
+      model: 'grok-4.3',
+      reasoning_effort: 'none',
+    });
   });
 
   test('builds voice fallback parameters from the effective voice model parameters', () => {

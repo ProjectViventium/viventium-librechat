@@ -66,6 +66,10 @@ const { redactMessage } = require('~/config/parsers');
 const { findPluginAuthsByKeys } = require('~/models');
 const { getFlowStateManager } = require('~/config');
 const { getLogStores } = require('~/cache');
+const {
+  formatVoiceLatencyTiming,
+  voiceLatencyNow,
+} = require('~/server/services/viventium/voiceLatencyTiming');
 // === VIVENTIUM START ===
 // Feature: Telegram tool guard (fast-path for trivial messages).
 const { shouldSkipTelegramTools } = require('~/server/services/viventium/telegramToolGuard');
@@ -175,16 +179,10 @@ const logVoiceToolLatencyStage = (req, stage, stageStartAt = null, details = '')
   if (!isVoiceLatencyEnabled(req)) {
     return;
   }
-  const now = Date.now();
-  const routeStartAt =
-    typeof req?.viventiumVoiceStartAt === 'number' ? req.viventiumVoiceStartAt : now;
-  const stageMs =
-    typeof stageStartAt === 'number' && now >= stageStartAt
-      ? ` stage_ms=${now - stageStartAt}`
-      : '';
+  const timingPart = formatVoiceLatencyTiming(req, stageStartAt);
   const detailPart = details ? ` ${details}` : '';
   logger.info(
-    `[VoiceLatency][LC] stage=${stage} request_id=${getVoiceLatencyRequestId(req)} total_ms=${now - routeStartAt}${stageMs}${detailPart}`,
+    `[VoiceLatency][LC] stage=${stage} request_id=${getVoiceLatencyRequestId(req)} ${timingPart}${detailPart}`,
   );
 };
 /* === VIVENTIUM END === */
@@ -705,7 +703,7 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
   // === VIVENTIUM END ===
 
   const getOrFetchMCPServerTools = async (userId, serverName) => {
-    const fetchStart = Date.now();
+    const fetchStart = voiceLatencyNow();
     const logFetchDone = (outcome, extra = '') => {
       logVoiceToolLatencyStage(
         req,

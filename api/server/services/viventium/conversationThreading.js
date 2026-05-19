@@ -118,7 +118,11 @@ async function resolveReusableConversationState({
 
   let convo = null;
   try {
-    convo = await getConvo(userId, conversationId);
+    convo = await getConvo(
+      userId,
+      conversationId,
+      'conversationId endpoint agent_id user updatedAt',
+    );
   } catch (err) {
     logger.warn(
       '[VIVENTIUM][%s] Failed to validate conversationId=%s: %s',
@@ -175,7 +179,11 @@ async function resolveReusableConversationState({
 
   let messages = [];
   try {
-    messages = (await getMessages({ conversationId })) ?? [];
+    messages =
+      (await getMessages(
+        { conversationId },
+        'messageId parentMessageId createdAt metadata.viventium.type metadata.viventium.mode',
+      )) ?? [];
   } catch (err) {
     logger.warn(
       '[VIVENTIUM][%s] Failed to load messages for conversationId=%s: %s',

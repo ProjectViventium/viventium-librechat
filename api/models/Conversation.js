@@ -31,9 +31,13 @@ const searchConversation = async (conversationId) => {
  * @param {string} conversationId - The conversation's ID.
  * @returns {Promise<TConversation>} The conversation object.
  */
-const getConvo = async (user, conversationId) => {
+const getConvo = async (user, conversationId, select) => {
   try {
-    return await Conversation.findOne({ user, conversationId }).lean();
+    const query = Conversation.findOne({ user, conversationId });
+    if (select) {
+      query.select(select);
+    }
+    return await query.lean();
   } catch (error) {
     logger.error('[getConvo] Error getting single conversation', error);
     throw new Error('Error getting single conversation');

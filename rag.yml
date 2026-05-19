@@ -1,8 +1,17 @@
-version: '3.8'
-
 services:
   vectordb:
     image: pgvector/pgvector:0.8.0-pg15-trixie
+    # === VIVENTIUM START ===
+    # Local-only Conversation Recall guardrails: keep PGVector bounded and avoid unbounded logs.
+    # === VIVENTIUM END ===
+    mem_limit: ${VIVENTIUM_RAG_VECTORDB_MEM_LIMIT:-512m}
+    cpus: ${VIVENTIUM_RAG_VECTORDB_CPUS:-0.50}
+    pids_limit: ${VIVENTIUM_RAG_VECTORDB_PIDS_LIMIT:-96}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "${VIVENTIUM_RAG_LOG_MAX_SIZE:-5m}"
+        max-file: "${VIVENTIUM_RAG_LOG_MAX_FILE:-3}"
     environment:
       POSTGRES_DB: mydatabase
       POSTGRES_USER: myuser
@@ -15,10 +24,21 @@ services:
       # === VIVENTIUM END ===
       - ${VIVENTIUM_RAG_PGDATA_PATH:-./.rag-pgdata}:/var/lib/postgresql/data
     ports:
-      - "5433:5432"
+      - "127.0.0.1:${VIVENTIUM_RAG_VECTORDB_HOST_PORT:-5433}:5432"
 
   rag_api:
     image: registry.librechat.ai/danny-avila/librechat-rag-api-dev:latest
+    # === VIVENTIUM START ===
+    # Local-only Conversation Recall guardrails: cap the RAG sidecar and rotate logs.
+    # === VIVENTIUM END ===
+    mem_limit: ${VIVENTIUM_RAG_API_MEM_LIMIT:-1536m}
+    cpus: ${VIVENTIUM_RAG_API_CPUS:-1.00}
+    pids_limit: ${VIVENTIUM_RAG_API_PIDS_LIMIT:-160}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "${VIVENTIUM_RAG_LOG_MAX_SIZE:-5m}"
+        max-file: "${VIVENTIUM_RAG_LOG_MAX_FILE:-3}"
     environment:
       - DB_HOST=vectordb
       - DB_PORT=5432
@@ -32,13 +52,18 @@ services:
       # Added: 2026-03-11
       # === VIVENTIUM END ===
       - RAG_PORT=${RAG_PORT:-8000}
+      # === VIVENTIUM START ===
+      # Local resource cleanup: keep Ollama's performance-oriented 5-minute residency explicit and
+      # operator-overridable while preventing indefinite local embedding runners by default.
+      # === VIVENTIUM END ===
+      - VIVENTIUM_RAG_OLLAMA_KEEP_ALIVE_SECONDS=${VIVENTIUM_RAG_OLLAMA_KEEP_ALIVE_SECONDS:-300}
     ports:
       # === VIVENTIUM START ===
       # Fix: Provide a default published port so compose does not fail when RAG_PORT
       # was not pre-exported in the shell.
       # Added: 2026-03-11
       # === VIVENTIUM END ===
-      - "${RAG_PORT:-8000}:${RAG_PORT:-8000}"
+      - "127.0.0.1:${RAG_PORT:-8000}:${RAG_PORT:-8000}"
     depends_on:
       - vectordb
     env_file:

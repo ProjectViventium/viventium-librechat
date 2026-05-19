@@ -173,6 +173,55 @@ describe('voiceLlmOverride', () => {
     }
   });
 
+  test('applyVoiceModelOverride consumes Anthropic voice thinking false before agents graph config', () => {
+    const originalAnthropicKey = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = 'test-anthropic-key';
+
+    try {
+      const req = {
+        body: {
+          voiceMode: true,
+          viventiumInputMode: 'voice_call',
+          viventiumSurface: 'voice',
+        },
+        config: { endpoints: { agents: { allowedProviders: ['anthropic'] } } },
+      };
+      const modelsConfig = {
+        anthropic: ['claude-opus-4-7'],
+      };
+      const agent = {
+        id: 'agent_anthropic_no_thinking',
+        provider: 'anthropic',
+        model: 'claude-opus-4-7',
+        model_parameters: {
+          model: 'claude-opus-4-7',
+          effort: 'high',
+          thinking: true,
+          thinkingBudget: 4096,
+        },
+        voice_llm_provider: 'anthropic',
+        voice_llm_model: 'claude-opus-4-7',
+        voice_llm_model_parameters: {
+          thinking: false,
+          reasoning_effort: 'none',
+        },
+      };
+
+      const updated = applyVoiceModelOverride(agent, req, modelsConfig);
+      expect(updated.provider).toBe('anthropic');
+      expect(updated.model).toBe('claude-opus-4-7');
+      expect(updated.model_parameters).toEqual({
+        model: 'claude-opus-4-7',
+      });
+    } finally {
+      if (originalAnthropicKey === undefined) {
+        delete process.env.ANTHROPIC_API_KEY;
+      } else {
+        process.env.ANTHROPIC_API_KEY = originalAnthropicKey;
+      }
+    }
+  });
+
   test('resolveVoiceOverrideAssignment ignores legacy machine fast-voice env when the agent fields are unset', () => {
     const originalXaiKey = process.env.XAI_API_KEY;
     const originalVoiceProvider = process.env.VIVENTIUM_VOICE_FAST_LLM_PROVIDER;

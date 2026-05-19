@@ -100,6 +100,67 @@ REQUEST_SCOPED_OVERRIDE_FALLBACK_TOKENS = (
     "status code 403",
 )
 # === VIVENTIUM END ===
+# === VIVENTIUM START ===
+# Feature: Local Ollama embedding residency guardrail.
+# Purpose:
+# - Ollama's default model residency is 5 minutes after an embedding request.
+# - Conversation Recall should keep that performance-friendly active-chat window explicit and
+#   operator-overridable, while rejecting values that keep multi-GB runners resident indefinitely.
+# - Keep the value operator-overridable for unusually large local rebuilds.
+# Added: 2026-05-19
+VIVENTIUM_RAG_OLLAMA_KEEP_ALIVE_SECONDS_ENV = "VIVENTIUM_RAG_OLLAMA_KEEP_ALIVE_SECONDS"
+DEFAULT_VIVENTIUM_RAG_OLLAMA_KEEP_ALIVE_SECONDS = 300
+
+
+def resolve_ollama_keep_alive_seconds() -> int:
+    raw_value = os.getenv(
+        VIVENTIUM_RAG_OLLAMA_KEEP_ALIVE_SECONDS_ENV,
+        str(DEFAULT_VIVENTIUM_RAG_OLLAMA_KEEP_ALIVE_SECONDS),
+    )
+    try:
+        keep_alive_seconds = int(str(raw_value).strip())
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid %s=%r; using %s seconds",
+            VIVENTIUM_RAG_OLLAMA_KEEP_ALIVE_SECONDS_ENV,
+            raw_value,
+            DEFAULT_VIVENTIUM_RAG_OLLAMA_KEEP_ALIVE_SECONDS,
+        )
+        return DEFAULT_VIVENTIUM_RAG_OLLAMA_KEEP_ALIVE_SECONDS
+
+    if keep_alive_seconds < 0:
+        logger.warning(
+            "Negative %s=%s would keep Ollama models resident indefinitely; using %s seconds",
+            VIVENTIUM_RAG_OLLAMA_KEEP_ALIVE_SECONDS_ENV,
+            keep_alive_seconds,
+            DEFAULT_VIVENTIUM_RAG_OLLAMA_KEEP_ALIVE_SECONDS,
+        )
+        return DEFAULT_VIVENTIUM_RAG_OLLAMA_KEEP_ALIVE_SECONDS
+
+    return keep_alive_seconds
+
+
+def configure_ollama_embedding_keep_alive() -> None:
+    if EMBEDDINGS_PROVIDER != EmbeddingsProvider.OLLAMA:
+        return
+
+    embedding_function = getattr(vector_store, "embedding_function", None)
+    if embedding_function is None or not hasattr(embedding_function, "keep_alive"):
+        logger.warning(
+            "Ollama embedding keep-alive guardrail could not find a compatible embedding function"
+        )
+        return
+
+    keep_alive_seconds = resolve_ollama_keep_alive_seconds()
+    embedding_function.keep_alive = keep_alive_seconds
+    logger.info(
+        "Configured Ollama embedding keep_alive=%s seconds",
+        keep_alive_seconds,
+    )
+
+
+configure_ollama_embedding_keep_alive()
+# === VIVENTIUM END ===
 
 
 def calculate_num_batches(total: int, batch_size: int) -> int:

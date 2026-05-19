@@ -16,6 +16,11 @@ const path = require('path');
 
 const { logger } = require('@librechat/data-schemas');
 const { StandardGraph } = require('@librechat/agents');
+const {
+  calcVoiceLatencyDurationMs,
+  formatVoiceLatencyTiming,
+  voiceLatencyNow,
+} = require('./voiceLatencyTiming');
 
 const PATCH_FLAG = Symbol.for('viventium.voice.invoke.telemetry.patch.v2');
 const CONFIG_CACHE_KEY = Symbol.for('viventium.voice.invoke.telemetry.config');
@@ -46,6 +51,12 @@ const getVoiceRequestId = (config) => {
 const getVoiceStartAtMs = (config) => {
   const requestBody = getRequestBody(config);
   const startedAt = requestBody?.viventiumVoiceStartAtMs;
+  return typeof startedAt === 'number' && Number.isFinite(startedAt) ? startedAt : null;
+};
+
+const getVoiceStartPerfMs = (config) => {
+  const requestBody = getRequestBody(config);
+  const startedAt = requestBody?.viventiumVoiceStartPerfMs;
   return typeof startedAt === 'number' && Number.isFinite(startedAt) ? startedAt : null;
 };
 
@@ -123,16 +134,23 @@ const summarizeProviderRequestKnobs = (body) => {
     const inputCount = Array.isArray(parsed.input) ? parsed.input.length : 'na';
     const toolsCount = Array.isArray(parsed.tools) ? parsed.tools.length : 'na';
     const streamValue = typeof parsed.stream === 'boolean' ? String(parsed.stream) : 'unset';
+    const thinking =
+      parsed.thinking && typeof parsed.thinking === 'object' && !Array.isArray(parsed.thinking)
+        ? parsed.thinking
+        : parsed.thinking;
+    const bodyBytes = Buffer.byteLength(body, 'utf8');
 
     return (
       ` model=${model}` +
       ` reasoning_effort=${parsed.reasoning_effort ?? 'unset'}` +
       ` reasoning.effort=${reasoning?.effort ?? 'unset'}` +
+      ` thinking=${thinking == null ? 'unset' : typeof thinking === 'object' ? thinking.type || 'object' : String(thinking)}` +
       ` include_reasoning=${parsed.include_reasoning ?? 'unset'}` +
       ` stream=${streamValue}` +
       ` messages=${messagesCount}` +
       ` input=${inputCount}` +
-      ` tools=${toolsCount}`
+      ` tools=${toolsCount}` +
+      ` body_bytes=${bodyBytes}`
     );
   } catch {
     return '';
@@ -265,12 +283,18 @@ const logInvokeStage = ({ config = null, stage, stageStartAt = null, details = '
     return;
   }
 
-  const now = Date.now();
-  const stageMs = typeof stageStartAt === 'number' ? now - stageStartAt : null;
-  const routeStartAt = getVoiceStartAtMs(resolvedConfig);
-  const totalPart =
-    routeStartAt != null && Number.isFinite(routeStartAt) ? ` total_ms=${now - routeStartAt}` : '';
-  const stagePart = stageMs == null ? '' : ` stage_ms=${stageMs}`;
+  const routeStartPerfAt = getVoiceStartPerfMs(resolvedConfig);
+  const routeStartWallAt = getVoiceStartAtMs(resolvedConfig);
+  const timingReq =
+    routeStartPerfAt != null
+      ? { viventiumVoicePerfStartAt: routeStartPerfAt }
+      : routeStartWallAt != null
+        ? { viventiumVoiceStartAt: routeStartWallAt }
+        : null;
+  const totalPart = timingReq ? ` ${formatVoiceLatencyTiming(timingReq, null)}` : '';
+  const stageMs = calcVoiceLatencyDurationMs(stageStartAt);
+  const stagePart =
+    stageMs == null ? '' : ` stage_ms=${Math.round(stageMs)} stage_ms_f=${stageMs.toFixed(3)}`;
   const ord = nextStageOrdinal();
   const ordPart = ord > 0 ? ` ord=${ord}` : '';
   const detailPart = details ? ` ${details}` : '';
@@ -318,7 +342,7 @@ const installFetchTelemetryPatch = () => {
     const detailBase =
       `method=${method.toUpperCase()} host=${host} endpoint=${endpoint}` +
       summarizeProviderRequestKnobs(body);
-    const startedAt = Date.now();
+    const startedAt = voiceLatencyNow();
 
     logInvokeStage({
       config: ctx.config,
@@ -383,7 +407,7 @@ const installTimedModuleFunctionPatch = ({
       return original.apply(this, args);
     }
 
-    const startedAt = Date.now();
+    const startedAt = voiceLatencyNow();
     try {
       const out = original.apply(this, args);
       if (out && typeof out.then === 'function') {
@@ -466,7 +490,7 @@ const installCreateCallModelPatch = (proto) => {
         return originalCallModel(state, config);
       }
 
-      const startedAt = Date.now();
+      const startedAt = voiceLatencyNow();
       this[CONFIG_CACHE_KEY] = config;
       this[START_AT_KEY] = startedAt;
 
@@ -530,7 +554,7 @@ const installInitializeModelPatch = (proto) => {
   const originalInitializeModel = proto.initializeModel;
   proto.initializeModel = function patchedInitializeModel(params) {
     const config = this?.[CONFIG_CACHE_KEY] ?? null;
-    const startedAt = Date.now();
+    const startedAt = voiceLatencyNow();
     const provider = params?.provider || 'unknown';
     const toolsCount = Array.isArray(params?.tools) ? params.tools.length : 0;
     logInvokeStage({
@@ -582,7 +606,7 @@ const installPerInvokeModelTelemetry = ({ model, config, provider, toolsCount })
     }
 
     const wrapped = async function timedWrappedMethod(...args) {
-      const startedAt = Date.now();
+      const startedAt = voiceLatencyNow();
       const streamFlag = asObject(args?.[0])?.stream;
       const streamPart = typeof streamFlag === 'boolean' ? ` stream=${streamFlag}` : '';
       const details = `${detailPrefix}${detailPrefix ? ' ' : ''}provider=${provider} tools=${toolsCount}${streamPart}`;
@@ -738,7 +762,7 @@ const installAttemptInvokePatch = (proto) => {
 
   const originalAttemptInvoke = proto.attemptInvoke;
   proto.attemptInvoke = async function patchedAttemptInvoke(args, config) {
-    const startedAt = Date.now();
+    const startedAt = voiceLatencyNow();
     const provider = args?.provider || 'unknown';
     const toolsCount = Array.isArray(args?.tools) ? args.tools.length : 0;
     const messageCount = Array.isArray(args?.finalMessages) ? args.finalMessages.length : 0;
@@ -834,7 +858,7 @@ const installCreateCallModelSubstepPatches = () => {
 
       const pruneFn = result;
       return function patchedPruneMessages(...pruneArgs) {
-        const pruneStart = Date.now();
+        const pruneStart = voiceLatencyNow();
         const input = asObject(pruneArgs?.[0]);
         const inputMessages = Array.isArray(input?.messages) ? input.messages.length : 0;
 

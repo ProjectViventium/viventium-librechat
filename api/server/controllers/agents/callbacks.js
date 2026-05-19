@@ -29,6 +29,10 @@ const {
   isDeepTimingEnabled,
   logDeepTiming,
 } = require('~/server/services/viventium/telegramTimingDeep');
+const {
+  formatVoiceLatencyTiming,
+  voiceLatencyNow,
+} = require('~/server/services/viventium/voiceLatencyTiming');
 /* === VIVENTIUM END === */
 
 /* === VIVENTIUM NOTE ===
@@ -55,15 +59,11 @@ const logVoiceLatencyStage = (req, stage, stageStartAt = null, details = '') => 
   if (!isVoiceLatencyEnabled(req)) {
     return;
   }
-  const now = Date.now();
-  const routeStartAt =
-    typeof req?.viventiumVoiceStartAt === 'number' ? req.viventiumVoiceStartAt : now;
-  const stageMs = typeof stageStartAt === 'number' ? now - stageStartAt : null;
   const requestId = getVoiceLatencyRequestId(req);
-  const stagePart = stageMs == null ? '' : ` stage_ms=${stageMs}`;
+  const timingPart = formatVoiceLatencyTiming(req, stageStartAt);
   const detailPart = details ? ` ${details}` : '';
   logger.info(
-    `[VoiceLatency][LC] stage=${stage} request_id=${requestId} total_ms=${now - routeStartAt}${stagePart}${detailPart}`,
+    `[VoiceLatency][LC] stage=${stage} request_id=${requestId} ${timingPart}${detailPart}`,
   );
 };
 
@@ -103,7 +103,7 @@ const markVoiceOrchEvent = (req, eventKey) => {
   if (!state) {
     return null;
   }
-  const now = Date.now();
+  const now = voiceLatencyNow();
   const prevCount = Number(state.counts[eventKey] || 0);
   state.counts[eventKey] = prevCount + 1;
   const firstSeen = state.firstTs[eventKey] == null;
@@ -652,7 +652,7 @@ function getDefaultHandlers({
           metadata?.langgraph_node,
         );
         const shouldEmit = shouldEmitLastAgent || !metadata?.hide_sequential_outputs;
-        const emitStartedAt = shouldEmit ? Date.now() : null;
+        const emitStartedAt = shouldEmit ? voiceLatencyNow() : null;
 
         if (shouldEmit) {
           await emitEvent(res, streamId, { event, data });

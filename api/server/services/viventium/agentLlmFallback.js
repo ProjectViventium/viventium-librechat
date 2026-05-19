@@ -148,7 +148,7 @@ function sanitizeFallbackModelParametersForProvider(parameters, provider) {
     delete sanitized.thinking;
     delete sanitized.thinkingBudget;
   }
-  if (normalizedProvider !== 'openAI') {
+  if (!['openAI', 'xai'].includes(normalizedProvider)) {
     delete sanitized.reasoning_effort;
   }
 

@@ -17,6 +17,10 @@ const defaultSyncThreshold = 1000;
 const syncThreshold = process.env.MEILI_SYNC_THRESHOLD
   ? parseInt(process.env.MEILI_SYNC_THRESHOLD, 10)
   : defaultSyncThreshold;
+const failedTaskLookback = process.env.VIVENTIUM_MEILI_FAILED_TASK_LOOKBACK
+  ? parseInt(process.env.VIVENTIUM_MEILI_FAILED_TASK_LOOKBACK, 10)
+  : 25;
+const expectedMeiliPrimaryKey = '_meiliId';
 
 class MeiliSearchClient {
   static instance = null;
@@ -33,6 +37,87 @@ class MeiliSearchClient {
     }
     return MeiliSearchClient.instance;
   }
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Meili task-health gate.
+ * Purpose: Do not enqueue settings/document sync tasks when Meili's own recent
+ * task history shows an incompatible index/database. That protects local
+ * machines from repeated doomed backfills while preserving Mongo history.
+ * === VIVENTIUM END === */
+function isCatastrophicMeiliTaskError(task) {
+  const error = task?.error || {};
+  const message = String(error.message || '');
+  return (
+    (message.includes(' is in version ') && message.includes('Meilisearch is in version')) ||
+    message.includes('incompatible with the current Meilisearch') ||
+    message.includes('incompatible with your current engine version')
+  );
+}
+
+async function assertMeiliTaskHealth(client) {
+  const lookback =
+    Number.isFinite(failedTaskLookback) && failedTaskLookback > 0 ? failedTaskLookback : 25;
+  const tasks = await client.getTasks({ statuses: ['failed'], limit: lookback });
+  const offenders = (tasks.results || []).filter(isCatastrophicMeiliTaskError);
+
+  if (offenders.length === 0) {
+    return;
+  }
+
+  const summary = offenders
+    .slice(0, 3)
+    .map((task) => `${task.uid}:${task.type}:${task.indexUid || 'global'}`)
+    .join(', ');
+  throw new Error(
+    `[indexSync] Meilisearch recent task health found incompatible failed tasks (${summary}); refusing to enqueue more local search sync work`,
+  );
+}
+
+async function waitForMeiliTask(client, task) {
+  if (!task?.taskUid || typeof client.waitForTask !== 'function') {
+    return;
+  }
+  const result = await client.waitForTask(task.taskUid, {
+    timeOutMs: parseInt(process.env.MEILI_SYNC_TASK_TIMEOUT_MS || '30000', 10),
+    intervalMs: parseInt(process.env.MEILI_SYNC_TASK_INTERVAL_MS || '50', 10),
+  });
+  if (result.status !== 'succeeded') {
+    throw new Error(`[indexSync] Meilisearch task ${task.taskUid} failed while ensuring index`);
+  }
+}
+
+async function ensureIndexSchema(client, indexName) {
+  try {
+    const info = await client.index(indexName).getRawInfo();
+    if (info.primaryKey && info.primaryKey !== expectedMeiliPrimaryKey) {
+      throw new Error(
+        `[indexSync] Meilisearch index ${indexName} uses legacy primary key ${info.primaryKey}; archive/drop the derived index before rebuilding`,
+      );
+    }
+  } catch (error) {
+    if (error.code !== 'index_not_found') {
+      throw error;
+    }
+    const task = await client.createIndex(indexName, { primaryKey: expectedMeiliPrimaryKey });
+    await waitForMeiliTask(client, task);
+  }
+}
+
+async function ensureSearchIndexSchemas(client) {
+  await Promise.all([ensureIndexSchema(client, 'messages'), ensureIndexSchema(client, 'convos')]);
+}
+
+function filterableAttributesWithUser(settings) {
+  const current = Array.isArray(settings?.filterableAttributes)
+    ? settings.filterableAttributes
+    : [];
+
+  if (current.some((attribute) => attribute === 'user')) {
+    return { changed: false, filterableAttributes: current };
+  }
+
+  return { changed: true, filterableAttributes: [...current, 'user'] };
 }
 
 /**
@@ -57,7 +142,10 @@ async function deleteDocumentsWithoutUserField(index, indexName) {
         break;
       }
 
-      const idsToDelete = searchResult.hits.filter((hit) => !hit.user).map((hit) => hit.id);
+      const idsToDelete = searchResult.hits
+        .filter((hit) => !hit.user)
+        .map((hit) => hit._meiliId || hit.id)
+        .filter(Boolean);
 
       if (idsToDelete.length > 0) {
         logger.info(
@@ -98,11 +186,12 @@ async function ensureFilterableAttributes(client) {
     try {
       const messagesIndex = client.index('messages');
       const settings = await messagesIndex.getSettings();
+      const nextSettings = filterableAttributesWithUser(settings);
 
-      if (!settings.filterableAttributes || !settings.filterableAttributes.includes('user')) {
+      if (nextSettings.changed) {
         logger.info('[indexSync] Configuring messages index to filter by user...');
         await messagesIndex.updateSettings({
-          filterableAttributes: ['user'],
+          filterableAttributes: nextSettings.filterableAttributes,
         });
         logger.info('[indexSync] Messages index configured for user filtering');
         settingsUpdated = true;
@@ -130,11 +219,12 @@ async function ensureFilterableAttributes(client) {
     try {
       const convosIndex = client.index('convos');
       const settings = await convosIndex.getSettings();
+      const nextSettings = filterableAttributesWithUser(settings);
 
-      if (!settings.filterableAttributes || !settings.filterableAttributes.includes('user')) {
+      if (nextSettings.changed) {
         logger.info('[indexSync] Configuring convos index to filter by user...');
         await convosIndex.updateSettings({
-          filterableAttributes: ['user'],
+          filterableAttributes: nextSettings.filterableAttributes,
         });
         logger.info('[indexSync] Convos index configured for user filtering');
         settingsUpdated = true;
@@ -206,6 +296,8 @@ async function performSync(flowManager, flowId, flowType) {
     if (status !== 'available') {
       throw new Error('Meilisearch not available');
     }
+    await assertMeiliTaskHealth(client);
+    await ensureSearchIndexSchemas(client);
 
     /** Ensures indexes have proper filterable attributes configured */
     const { settingsUpdated, orphanedDocsFound: _orphanedDocsFound } =

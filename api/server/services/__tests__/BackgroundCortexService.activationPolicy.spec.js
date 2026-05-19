@@ -26,6 +26,9 @@ const {
   shouldSurfaceActivationProviderUnavailable,
   shouldSurfaceActivationTimeout,
   configuredCortexDisplayName,
+  detectActivations,
+  normalizePhaseANoticeMode,
+  resolvePhaseANoticeModeForRequest,
 } = require('../BackgroundCortexService');
 const fs = require('fs');
 const path = require('path');
@@ -34,6 +37,86 @@ const yaml = require('js-yaml');
 describe('BackgroundCortexService activation policy helpers', () => {
   afterEach(() => {
     clearActivationProviderHealth();
+    delete process.env.VIVENTIUM_CORTEX_PHASE_A_NOTICE_MODE;
+  });
+
+  test('resolves Phase A notice modes from env with voice-only early notice support', () => {
+    expect(normalizePhaseANoticeMode('all_within_budget')).toBe('all_within_budget');
+    expect(normalizePhaseANoticeMode('any_activated')).toBe('first_activation_continue');
+
+    expect(
+      resolvePhaseANoticeModeForRequest({
+        body: { voiceMode: true, viventiumInputMode: 'voice_call' },
+      }),
+    ).toBe('first_activation_continue');
+    expect(resolvePhaseANoticeModeForRequest({ body: { voiceMode: false } })).toBe(
+      'all_within_budget',
+    );
+
+    process.env.VIVENTIUM_CORTEX_PHASE_A_NOTICE_MODE = 'any_activated_on_voice';
+    expect(
+      resolvePhaseANoticeModeForRequest({
+        body: { voiceMode: true, viventiumInputMode: 'voice_call' },
+      }),
+    ).toBe('first_activation_continue');
+    expect(resolvePhaseANoticeModeForRequest({ body: { voiceMode: false } })).toBe(
+      'all_within_budget',
+    );
+  });
+
+  test('first activation notice returns early while final detection continues', async () => {
+    jest.useFakeTimers();
+    const events = [];
+    const detectPromise = detectActivations({
+      req: { body: { voiceMode: true }, viventiumVoiceLogLatency: false },
+      mainAgent: {
+        provider: 'anthropic',
+        tools: [],
+        background_cortices: [{ agent_id: 'agent_fast' }, { agent_id: 'agent_slow' }],
+      },
+      messages: [],
+      runId: 'run_notice',
+      timeBudgetMs: 200,
+      noticeMode: 'first_activation_continue',
+      loadAgentFn: jest.fn().mockImplementation(({ agent_id }) =>
+        Promise.resolve({
+          name: agent_id === 'agent_fast' ? 'Fast Cortex' : 'Slow Cortex',
+          description: `${agent_id} description`,
+        }),
+      ),
+      activationRunner: ({ cortexConfig }) =>
+        new Promise((resolve) => {
+          const isFast = cortexConfig.agent_id === 'agent_fast';
+          setTimeout(
+            () =>
+              resolve({
+                shouldActivate: true,
+                confidence: isFast ? 0.95 : 0.88,
+                reason: isFast ? 'fast_yes' : 'slow_yes',
+              }),
+            isFast ? 10 : 80,
+          );
+        }),
+    });
+
+    await jest.advanceTimersByTimeAsync(15);
+    const early = await detectPromise;
+    expect(early.earlyReturned).toBe(true);
+    expect(early.activatedCortices).toHaveLength(1);
+    expect(early.activatedCortices[0]).toEqual(
+      expect.objectContaining({ agentId: 'agent_fast', cortexName: 'Fast Cortex' }),
+    );
+    expect(typeof early.finalDetectionPromise?.then).toBe('function');
+
+    await jest.advanceTimersByTimeAsync(100);
+    const finalResult = await early.finalDetectionPromise;
+    expect(finalResult.earlyReturned).toBe(false);
+    expect(finalResult.activatedCortices.map((cortex) => cortex.agentId).sort()).toEqual([
+      'agent_fast',
+      'agent_slow',
+    ]);
+    expect(events).toEqual([]);
+    jest.useRealTimers();
   });
 
   test('keeps activation classifier output strictly JSON-only', () => {

@@ -87,6 +87,7 @@ const {
   executeActivated, // NEW: Phase B - Execute activated cortices with merging
   formatInsightsForContext,
   resolveActivationPolicyMainAgent,
+  resolvePhaseANoticeModeForRequest,
   sanitizeCortexDisplayName, // NEW: Sanitize display names to remove jargon
 } = require('~/server/services/BackgroundCortexService');
 const {
@@ -113,6 +114,7 @@ const {
 } = require('~/server/services/viventium/brewingHold');
 const {
   resolveVoicePhaseAAsyncPolicyWithHydratedTools,
+  resolvePhaseANoticeToolHoldGuard,
 } = require('~/server/services/viventium/voicePhaseAPolicy');
 /* === VIVENTIUM NOTE END === */
 const {
@@ -466,6 +468,11 @@ const {
   applyVoiceInvokeTelemetryPatch,
 } = require('~/server/services/viventium/voiceInvokeTelemetryPatch');
 applyVoiceInvokeTelemetryPatch();
+const {
+  calcVoiceLatencyDurationMs,
+  formatVoiceLatencyTiming,
+  voiceLatencyNow,
+} = require('~/server/services/viventium/voiceLatencyTiming');
 /* === VIVENTIUM NOTE END === */
 
 /* === VIVENTIUM NOTE ===
@@ -486,15 +493,11 @@ const logVoiceLatencyStage = (req, stage, stageStartAt = null, details = '') => 
     return;
   }
 
-  const now = Date.now();
-  const routeStartAt =
-    typeof req?.viventiumVoiceStartAt === 'number' ? req.viventiumVoiceStartAt : now;
-  const stageMs = typeof stageStartAt === 'number' ? now - stageStartAt : null;
   const requestId = getVoiceLatencyRequestId(req);
-  const stagePart = stageMs == null ? '' : ` stage_ms=${stageMs}`;
+  const timingPart = formatVoiceLatencyTiming(req, stageStartAt);
   const detailPart = details ? ` ${details}` : '';
   logger.info(
-    `[VoiceLatency][LC] stage=${stage} request_id=${requestId} total_ms=${now - routeStartAt}${stagePart}${detailPart}`,
+    `[VoiceLatency][LC] stage=${stage} request_id=${requestId} ${timingPart}${detailPart}`,
   );
 };
 
@@ -718,6 +721,17 @@ function formatBrewingAcknowledgment(activatedCortices) {
     'Use your own connected tools now for any part of the user request you can directly verify.',
     'Treat background agents as supplemental reviewers. Do not wait for their results while answering the user.',
     'For any part only a background agent can verify, acknowledge that part is still being checked and do not guess.',
+    '',
+  ].join('\n');
+}
+
+function formatEarlyActivationNotice() {
+  return [
+    '## Background Processing (Brewing)',
+    'At least one background agent has already activated for this turn, and activation detection for other configured background agents is still finishing.',
+    'Treat this as a latency hint, not as the final activated-agent list. Do not name specific background agents, do not quote activation reasons, and do not claim the final background scope yet.',
+    'Use your own connected tools now for any part of the user request you can directly verify.',
+    'A single follow-up response will be generated after the full activated background-agent set finishes.',
     '',
   ].join('\n');
 }
@@ -1326,6 +1340,8 @@ function buildViventiumMcpRequestBody({
     viventiumStreamId: req?.body?.streamId || req?._resumableStreamId,
     viventiumVoiceRequestId: req?.viventiumVoiceRequestId,
     viventiumVoiceCallSessionId: req?.viventiumCallSession?.callSessionId,
+    viventiumVoiceStartAtMs: req?.viventiumVoiceStartAt,
+    viventiumVoiceStartPerfMs: req?.viventiumVoicePerfStartAt,
     viventiumTelegramChatId: req?.body?.telegramChatId,
     viventiumTelegramUserId: req?.body?.telegramUserId,
     viventiumTelegramMessageId: req?.body?.telegramMessageId,
@@ -2673,7 +2689,7 @@ class AgentClient extends BaseClient {
     const req = this.options.req;
     const chatStart = startDeepTiming(req);
     const voiceLatencyEnabled = isVoiceLatencyEnabled(req);
-    const voiceChatStartAt = Date.now();
+    const voiceChatStartAt = voiceLatencyNow();
     if (voiceLatencyEnabled) {
       const agentModel =
         this.options.agent?.model_parameters?.model || this.options.agent?.model || 'unknown';
@@ -3156,6 +3172,34 @@ class AgentClient extends BaseClient {
             );
           }
         }
+        const requestedPhaseANoticeMode = resolvePhaseANoticeModeForRequest(req);
+        const phaseANoticeToolHoldGuard = resolvePhaseANoticeToolHoldGuard({
+          requestedPhaseANoticeMode,
+          voiceMode,
+          agent: this.options.agent,
+          directActionSurfaces: directActionPolicySurfaces,
+          agentTools: this.options.agent?.tools,
+          toolDefinitions: this.options.agent?.toolDefinitions,
+          asyncPolicy: voicePhaseAPolicy,
+        });
+        const phaseANoticeMode =
+          requestedPhaseANoticeMode === 'first_activation_continue' &&
+          phaseANoticeToolHoldGuard.guarded
+            ? 'all_within_budget'
+            : requestedPhaseANoticeMode;
+        if (voiceLatencyEnabled) {
+          logVoiceLatencyStage(
+            req,
+            'phase_a_notice_mode',
+            voiceChatStartAt,
+            `requested=${requestedPhaseANoticeMode} effective=${phaseANoticeMode} ` +
+              `guarded_by_tool_hold=${phaseANoticeToolHoldGuard.guarded === true} ` +
+              `guard_reason=${phaseANoticeToolHoldGuard.reason || 'none'} ` +
+              `unowned_tool_hold_scopes=${
+                phaseANoticeToolHoldGuard.unownedToolHoldScopeKeys?.join(',') || 'none'
+              }`,
+          );
+        }
 
         if (voicePhaseAAsync) {
           // ASYNC VOICE MODE: run Phase A + Phase B in background and keep follow-up delivery
@@ -3179,17 +3223,20 @@ class AgentClient extends BaseClient {
           const asyncRunId = canonicalResponseMessageId;
           cortexExecutionPromise = (async () => {
             try {
-              const asyncDetectStart = Date.now();
-              const asyncDetectionResult = await detectActivations({
-                req: asyncReq,
-                mainAgent: asyncAgent,
-                messages: initialMessages,
-                runId: asyncRunId,
-                timeBudgetMs: cortexDetectTimeoutMs,
-              });
+              const asyncDetectStart = voiceLatencyNow();
+	              const asyncDetectionResult = await detectActivations({
+	                req: asyncReq,
+	                mainAgent: asyncAgent,
+	                messages: initialMessages,
+	                runId: asyncRunId,
+	                timeBudgetMs: cortexDetectTimeoutMs,
+	                // Fully async voice starts the main model immediately, so Phase B should wait for
+	                // the complete background detection set instead of early-returning on one signal.
+	                noticeMode: 'all_within_budget',
+	              });
 
               activatedCorticesList = asyncDetectionResult.activatedCortices;
-              const asyncDetectDuration = Date.now() - asyncDetectStart;
+              const asyncDetectDuration = calcVoiceLatencyDurationMs(asyncDetectStart) || 0;
 
               if (voiceLatencyEnabled) {
                 logVoiceLatencyStage(
@@ -3318,8 +3365,8 @@ class AgentClient extends BaseClient {
           logger.info(
             `[AgentClient] Phase A: Detecting activations (${cortexDetectTimeoutMs}ms timeout)`,
           );
-          const detectionStartTime = Date.now();
-          const voicePhaseAStartedAt = voiceLatencyEnabled ? Date.now() : 0;
+          const detectionStartTime = voiceLatencyNow();
+          const voicePhaseAStartedAt = voiceLatencyEnabled ? detectionStartTime : 0;
           const detectStart = startDeepTiming(req);
 
           const detectionResult = await detectActivations({
@@ -3328,9 +3375,10 @@ class AgentClient extends BaseClient {
             messages: initialMessages,
             runId: this.responseMessageId,
             timeBudgetMs: cortexDetectTimeoutMs,
+            noticeMode: phaseANoticeMode,
           });
 
-          const detectionDuration = Date.now() - detectionStartTime;
+          const detectionDuration = calcVoiceLatencyDurationMs(detectionStartTime) || 0;
           activatedCorticesList = detectionResult.activatedCortices;
           if (isDeepTimingEnabled(req)) {
             logDeepTiming(
@@ -3350,7 +3398,11 @@ class AgentClient extends BaseClient {
               req,
               'phase_a_detect_done',
               voicePhaseAStartedAt,
-              `activated=${activatedCorticesList.length} timed_out=${detectionResult.timedOut === true}`,
+              `activated=${activatedCorticesList.length} timed_out=${
+                detectionResult.timedOut === true
+              } notice_mode=${detectionResult.phaseANoticeMode || phaseANoticeMode} early_returned=${
+                detectionResult.earlyReturned === true
+              }`,
             );
           }
 
@@ -3380,9 +3432,11 @@ class AgentClient extends BaseClient {
 
           // Inject activation awareness into agent instructions (single source of truth)
           if (activatedCorticesList.length > 0) {
-            const brewingText = formatBrewingAcknowledgment(activatedCorticesList);
-            const activationSummary = formatActivationSummary(activatedCorticesList);
-            const activationContext = brewingText + activationSummary;
+            const activationContext =
+              detectionResult.earlyReturned === true
+                ? formatEarlyActivationNotice()
+                : formatBrewingAcknowledgment(activatedCorticesList) +
+                  formatActivationSummary(activatedCorticesList);
 
             /* === VIVENTIUM FIX ===
              * Append to agent.instructions instead of creating system message in filteredPayload.
@@ -3406,76 +3460,143 @@ class AgentClient extends BaseClient {
           // PHASE B: Execute activated cortices (non-blocking, fire-and-forget)
           if (activatedCorticesList.length > 0) {
             logger.info(
-              `[AgentClient] Phase B: Starting execution of ${activatedCorticesList.length} activated cortices (non-blocking)`,
+              `[AgentClient] Phase B: Starting execution of ${
+                detectionResult.earlyReturned === true ? 'final' : activatedCorticesList.length
+              } activated cortices (non-blocking)`,
+            );
+            const phaseASeenCortexIds = new Set(
+              activatedCorticesList.map((cortex) => cortex.agentId).filter(Boolean),
             );
 
-            // Track merged insights for follow-up
-            let mergedInsightsData = null;
-
-            // If we're going to defer the main response (tool cortex brewing hold), do NOT pass the live
-            // Express response object into background cortex execution. Tool/MCP transports can bind to
-            // the response lifecycle and get aborted when the main response ends, leaving cortices stuck.
-            const directActionScopeKeys =
-              collectDirectActionScopeKeysFromCortices(activatedCorticesList);
-            const effectiveDirectActionScopeKeys = collectEffectiveDirectActionScopeKeys({
-              directActionSurfaces: directActionPolicySurfaces,
-              agentTools: this.options.agent?.tools,
-              toolDefinitions: this.options.agent?.toolDefinitions,
-            });
-            toolCortexHoldWanted = shouldDeferToolCortexMainResponse({
-              activatedCortices: activatedCorticesList,
-              directActionScopeKeys: effectiveDirectActionScopeKeys,
-            });
-            logger.info(
-              `[AgentClient] Tool cortex hold decision: hold=${toolCortexHoldWanted} ` +
-                `canonical_direct_action_scope_keys=${directActionScopeKeys.join(',') || 'none'} ` +
-                `effective_direct_action_scope_keys=${effectiveDirectActionScopeKeys.join(',') || 'none'} ` +
-                `request_tool_count=${Array.isArray(this.options.agent?.tools) ? this.options.agent.tools.length : 0}`,
-            );
-
-            cortexExecutionPromise = executeActivated({
-              req: this.options.req,
-              res: toolCortexHoldWanted ? null : this.options.res,
-              mainAgent: this.options.agent,
-              messages: initialMessages,
-              runId: this.responseMessageId,
-              activatedCortices: activatedCorticesList,
-
-              onCortexBrewing: (cortexData) => {
-                // Emit SSE for brewing status
-                void emitCortexEvent({
-                  ...cortexData,
-                  type: ContentTypes.CORTEX_BREWING,
-                });
-              },
-
-              onCortexComplete: (cortexData) => {
-                // Emit SSE for individual completion (UI shows tool-call-like indicator)
-                void emitCortexEvent({
-                  ...cortexData,
-                  type: ContentTypes.CORTEX_INSIGHT,
-                });
-              },
-
-              onAllComplete: (completeData) => {
-                // Store merged insights for follow-up
-                mergedInsightsData = completeData;
-                logger.info(
-                  `[AgentClient] Phase B complete: ${completeData.cortexCount} insights merged, ready for follow-up`,
+            cortexExecutionPromise = (async () => {
+              let phaseBActivatedCorticesList = activatedCorticesList;
+              if (
+                detectionResult.earlyReturned === true &&
+                detectionResult.finalDetectionPromise &&
+                typeof detectionResult.finalDetectionPromise.then === 'function'
+              ) {
+                const finalDetectionResult = await detectionResult.finalDetectionPromise.catch(
+                  (error) => {
+                    logger.error(
+                      '[AgentClient] Final Phase A detection after early notice failed',
+                      sanitizeCompletionErrorForLog(error),
+                    );
+                    return null;
+                  },
                 );
-              },
-            })
-              .then(() => {
-                // Return mergedInsightsData (set by onAllComplete callback) instead of executeActivated return value
-                return mergedInsightsData;
-              })
-              .catch((error) => {
-                logger.error(
-                  '[AgentClient] Phase B execution failed',
-                  sanitizeCompletionErrorForLog(error),
+                if (Array.isArray(finalDetectionResult?.activatedCortices)) {
+                  phaseBActivatedCorticesList = finalDetectionResult.activatedCortices;
+                  activatedCorticesList = phaseBActivatedCorticesList;
+                }
+                const lateActivations = phaseBActivatedCorticesList.filter(
+                  (cortex) => cortex?.agentId && !phaseASeenCortexIds.has(cortex.agentId),
                 );
+                if (voiceLatencyEnabled) {
+                  logVoiceLatencyStage(
+                    req,
+                    'phase_a_final_detection_ready',
+                    voicePhaseAStartedAt,
+                    `phase_a_seen=${phaseASeenCortexIds.size} final_activated=${
+                      phaseBActivatedCorticesList.length
+                    } late_activated=${lateActivations.length}`,
+                  );
+                }
+                for (const cortex of lateActivations) {
+                  await emitCortexEvent({
+                    type: ContentTypes.CORTEX_ACTIVATION,
+                    cortex_id: cortex.agentId,
+                    cortex_name: sanitizeCortexDisplayName(cortex.cortexName || cortex.agentId),
+                    status: 'activating',
+                    confidence: cortex.confidence,
+                    reason: cortex.reason,
+                    cortex_description: cortex.cortexDescription || '',
+                    activation_scope: cortex.activationScope || null,
+                    direct_action_surfaces: Array.isArray(cortex.directActionSurfaces)
+                      ? cortex.directActionSurfaces
+                      : [],
+                    direct_action_surface_scopes: Array.isArray(cortex.directActionSurfaceScopes)
+                      ? cortex.directActionSurfaceScopes
+                      : [],
+                    phase_a_seen: false,
+                  });
+                }
+              }
+
+              if (phaseBActivatedCorticesList.length === 0) {
                 return null;
+              }
+
+              let mergedInsightsData = null;
+
+              // If we're going to defer the main response (tool cortex brewing hold), do NOT pass the live
+              // Express response object into background cortex execution. Tool/MCP transports can bind to
+              // the response lifecycle and get aborted when the main response ends, leaving cortices stuck.
+              const directActionScopeKeys =
+                collectDirectActionScopeKeysFromCortices(phaseBActivatedCorticesList);
+              const effectiveDirectActionScopeKeys = collectEffectiveDirectActionScopeKeys({
+                directActionSurfaces: directActionPolicySurfaces,
+                agentTools: this.options.agent?.tools,
+                toolDefinitions: this.options.agent?.toolDefinitions,
               });
+              toolCortexHoldWanted = shouldDeferToolCortexMainResponse({
+                activatedCortices: phaseBActivatedCorticesList,
+                directActionScopeKeys: effectiveDirectActionScopeKeys,
+              });
+              logger.info(
+                `[AgentClient] Tool cortex hold decision: hold=${toolCortexHoldWanted} ` +
+                  `canonical_direct_action_scope_keys=${
+                    directActionScopeKeys.join(',') || 'none'
+                  } ` +
+                  `effective_direct_action_scope_keys=${
+                    effectiveDirectActionScopeKeys.join(',') || 'none'
+                  } ` +
+                  `request_tool_count=${
+                    Array.isArray(this.options.agent?.tools) ? this.options.agent.tools.length : 0
+                  } phase_a_notice_mode=${detectionResult.phaseANoticeMode || phaseANoticeMode} ` +
+                  `early_returned=${detectionResult.earlyReturned === true}`,
+              );
+
+              await executeActivated({
+                req: this.options.req,
+                res: toolCortexHoldWanted ? null : this.options.res,
+                mainAgent: this.options.agent,
+                messages: initialMessages,
+                runId: this.responseMessageId,
+                activatedCortices: phaseBActivatedCorticesList,
+
+                onCortexBrewing: (cortexData) => {
+                  // Emit SSE for brewing status
+                  void emitCortexEvent({
+                    ...cortexData,
+                    type: ContentTypes.CORTEX_BREWING,
+                  });
+                },
+
+                onCortexComplete: (cortexData) => {
+                  // Emit SSE for individual completion (UI shows tool-call-like indicator)
+                  void emitCortexEvent({
+                    ...cortexData,
+                    type: ContentTypes.CORTEX_INSIGHT,
+                  });
+                },
+
+                onAllComplete: (completeData) => {
+                  // Store merged insights for follow-up
+                  mergedInsightsData = completeData;
+                  logger.info(
+                    `[AgentClient] Phase B complete: ${completeData.cortexCount} insights merged, ready for follow-up`,
+                  );
+                },
+              });
+
+              return mergedInsightsData;
+            })().catch((error) => {
+              logger.error(
+                '[AgentClient] Phase B execution failed',
+                sanitizeCompletionErrorForLog(error),
+              );
+              return null;
+            });
             this.attachBackgroundCortexCompletionPipeline({
               cortexExecutionPromise,
               pendingCortexParts,
@@ -3510,7 +3631,7 @@ class AgentClient extends BaseClient {
               );
               cortexExecutionPromise = (async () => {
                 try {
-                  const lateDetectStart = Date.now();
+                  const lateDetectStart = voiceLatencyNow();
                   const lateDetectionResult = await detectActivations({
                     req: this.options.req,
                     mainAgent: this.options.agent,
@@ -3523,7 +3644,7 @@ class AgentClient extends BaseClient {
                     : [];
                   logger.info(
                     `[AgentClient] Late Phase A complete: ${activatedCorticesList.length} cortices activated ` +
-                      `(duration: ${Date.now() - lateDetectStart}ms, timedOut: ${lateDetectionResult.timedOut})`,
+                      `(duration: ${Math.round(calcVoiceLatencyDurationMs(lateDetectStart) || 0)}ms, timedOut: ${lateDetectionResult.timedOut})`,
                   );
 
                   for (const cortex of activatedCorticesList) {
@@ -3820,7 +3941,7 @@ class AgentClient extends BaseClient {
          */
         /* === VIVENTIUM NOTE END === */
 
-        const voiceCreateRunStart = voiceLatencyEnabled ? Date.now() : 0;
+        const voiceCreateRunStart = voiceLatencyEnabled ? voiceLatencyNow() : 0;
         const createRunStart = startDeepTiming(req);
         run = await createRun({
           agents,
@@ -3861,7 +3982,7 @@ class AgentClient extends BaseClient {
 
         /** @deprecated Agent Chain */
         config.configurable.last_agent_id = agents[agents.length - 1].id;
-        const voiceProcessStart = voiceLatencyEnabled ? Date.now() : 0;
+        const voiceProcessStart = voiceLatencyEnabled ? voiceLatencyNow() : 0;
         const processStart = startDeepTiming(req);
         if (isDeepTimingEnabled(req)) {
           logDeepTiming(req, 'process_stream_start', null, `agents=${agents.length}`);
@@ -3883,7 +4004,7 @@ class AgentClient extends BaseClient {
                 return;
               }
               const tool = extractToolTelemetry(callbackArgs);
-              const startedAt = Date.now();
+              const startedAt = voiceLatencyNow();
               if (voiceToolStartTimes && tool.id !== 'unknown') {
                 voiceToolStartTimes.set(tool.id, startedAt);
               }
@@ -3906,7 +4027,9 @@ class AgentClient extends BaseClient {
               }
               const detailParts = [`tool_name=${tool.name}`, `tool_id=${tool.id}`];
               if (toolStartAt != null) {
-                detailParts.push(`tool_exec_ms=${Date.now() - toolStartAt}`);
+                detailParts.push(
+                  `tool_exec_ms=${Math.round(calcVoiceLatencyDurationMs(toolStartAt) || 0)}`,
+                );
               }
               logVoiceLatencyStage(
                 req,

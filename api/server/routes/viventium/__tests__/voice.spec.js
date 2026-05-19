@@ -322,6 +322,9 @@ describe('/api/viventium/voice/chat', () => {
       if (query.status && doc.status !== query.status) {
         return { lean: async () => null };
       }
+      if (query.messageId && doc.messageId !== query.messageId) {
+        return { lean: async () => null };
+      }
       if (update.$push?.segments) {
         doc.segments = [...(doc.segments || []), update.$push.segments];
       }
@@ -370,9 +373,37 @@ describe('/api/viventium/voice/chat', () => {
     mockConsoleLogSpy = null;
     jest.useRealTimers();
     delete process.env.VIVENTIUM_VOICE_TURN_COALESCE_WINDOW_MS;
+    delete process.env.VIVENTIUM_VOICE_LIVE_TURN_COALESCE_WINDOW_MS;
+    delete process.env.VIVENTIUM_VOICE_LISTEN_ONLY_TURN_COALESCE_WINDOW_MS;
     delete process.env.VIVENTIUM_VOICE_TURN_COALESCE_WAIT_MS;
     delete process.env.VIVENTIUM_VOICE_TURN_COALESCE_POLL_MS;
     delete process.env.VIVENTIUM_VOICE_TURN_COALESCE_RETURN_WINDOW_MS;
+    delete process.env.VIVENTIUM_VOICE_TURN_CONTINUATION_WINDOW_MS;
+    delete process.env.VIVENTIUM_VOICE_LOG_LATENCY;
+  });
+
+  test('voice ingress schema keeps Listen-Only continuation audit fields under strict mode', async () => {
+    const mongoose = require('mongoose');
+    const createViventiumVoiceIngressEvent = require('../../../../db/viventiumVoiceIngressEvent');
+    const connection = mongoose.createConnection();
+    try {
+      const VoiceIngressEvent = createViventiumVoiceIngressEvent(connection);
+      const doc = new VoiceIngressEvent({
+        dedupeKey: 'listen-only:call-schema:listen-only-root',
+        callSessionId: 'call-schema',
+        userId: 'user-schema',
+        status: 'listen_only',
+        messageId: 'message-schema',
+        saved: true,
+        expiresAt: new Date(Date.now() + 30000),
+      });
+      const serialized = doc.toObject();
+
+      expect(serialized.messageId).toBe('message-schema');
+      expect(serialized.saved).toBe(true);
+    } finally {
+      await connection.close().catch(() => {});
+    }
   });
 
   test('reuses the latest assistant leaf as parentMessageId', async () => {
@@ -412,6 +443,32 @@ describe('/api/viventium/voice/chat', () => {
     expect(mockLastStreamId).toBe('lc_req_1');
     expect(res.body.streamId).toBe('lc_req_1');
     expect(mockLastConversationId).toBe('conv-voice-1');
+  });
+
+  test('normal voice launches with a zero live coalescing window by default', async () => {
+    process.env.VIVENTIUM_VOICE_LOG_LATENCY = '1';
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      url: '/api/viventium/voice/chat',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-request-id': 'lc_req_latency',
+      },
+      body: { text: 'launch this turn immediately', streamId: 'lc_req_latency' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockLastStreamId).toBe('lc_req_latency');
+    expect(
+      mockObservedInfoLogs.some(
+        (line) =>
+          line.includes('stage=voice_coalesce_done') && line.includes('coalesce_window_ms=0'),
+      ),
+    ).toBe(true);
   });
 
   test('resets invalid conversations to new and NO_PARENT', async () => {
@@ -1028,6 +1085,7 @@ describe('/api/viventium/voice/chat', () => {
     process.env.VIVENTIUM_VOICE_TURN_COALESCE_WAIT_MS = '200';
     process.env.VIVENTIUM_VOICE_TURN_COALESCE_POLL_MS = '5';
     process.env.VIVENTIUM_VOICE_TURN_COALESCE_RETURN_WINDOW_MS = '100';
+    process.env.VIVENTIUM_VOICE_TURN_CONTINUATION_WINDOW_MS = '100';
     mockAssertVoiceGatewayAuth = jest.fn().mockResolvedValue({
       callSessionId: 'call_session_listen_only',
       userId: 'user_1',
@@ -1073,14 +1131,69 @@ describe('/api/viventium/voice/chat', () => {
       'second saved listen only turn',
     );
     expect(secondRes.body.coalesced).toBeUndefined();
+    expect(secondRes.body.messageId).not.toBe(firstRes.body.messageId);
   });
 
-  test('Listen-Only mode saves a new parentless transcript inside the return window when text differs', async () => {
+  test('Listen-Only mode appends resumed speech after the return window inside the continuation window', async () => {
+    jest.useFakeTimers();
+    process.env.VIVENTIUM_VOICE_TURN_COALESCE_WINDOW_MS = '0';
+    process.env.VIVENTIUM_VOICE_TURN_COALESCE_WAIT_MS = '200';
+    process.env.VIVENTIUM_VOICE_TURN_COALESCE_POLL_MS = '5';
+    process.env.VIVENTIUM_VOICE_TURN_COALESCE_RETURN_WINDOW_MS = '100';
+    process.env.VIVENTIUM_VOICE_TURN_CONTINUATION_WINDOW_MS = '1000';
+    mockAssertVoiceGatewayAuth = jest.fn().mockResolvedValue({
+      callSessionId: 'call_session_listen_only',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      conversationId: 'conv-listen-only-coalesce',
+      listenOnlyModeEnabled: true,
+    });
+
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const firstReq = createMockReq({
+      url: '/api/viventium/voice/chat',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-request-id': 'req-listen-continue-1',
+      },
+      body: { text: 'first ambient turn' },
+    });
+    const secondReq = createMockReq({
+      url: '/api/viventium/voice/chat',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-request-id': 'req-listen-continue-2',
+      },
+      body: { text: 'second ambient turn' },
+    });
+    const firstRes = createMockRes();
+    const secondRes = createMockRes();
+
+    const firstPromise = dispatch(app, firstReq, firstRes);
+    await advanceVoiceRouteTimers(20);
+    await firstPromise;
+    await advanceVoiceRouteTimers(150);
+    const secondPromise = dispatch(app, secondReq, secondRes);
+    await advanceVoiceRouteTimers(250);
+    await secondPromise;
+
+    expect(mockMessageFindOneAndUpdate).toHaveBeenCalledTimes(2);
+    expect(mockMessageFindOneAndUpdate.mock.calls[0][1].$set.text).toBe('first ambient turn');
+    expect(mockMessageFindOneAndUpdate.mock.calls[1][0].messageId).toBe(firstRes.body.messageId);
+    expect(mockMessageFindOneAndUpdate.mock.calls[1][1].$set.text).toBe(
+      'first ambient turn second ambient turn',
+    );
+    expect(secondRes.body.messageId).toBe(firstRes.body.messageId);
+  });
+
+  test('Listen-Only mode dedupes repeated continuation text after appending resumed speech', async () => {
     jest.useFakeTimers();
     process.env.VIVENTIUM_VOICE_TURN_COALESCE_WINDOW_MS = '0';
     process.env.VIVENTIUM_VOICE_TURN_COALESCE_WAIT_MS = '200';
     process.env.VIVENTIUM_VOICE_TURN_COALESCE_POLL_MS = '5';
     process.env.VIVENTIUM_VOICE_TURN_COALESCE_RETURN_WINDOW_MS = '1000';
+    process.env.VIVENTIUM_VOICE_TURN_CONTINUATION_WINDOW_MS = '1000';
     mockAssertVoiceGatewayAuth = jest.fn().mockResolvedValue({
       callSessionId: 'call_session_listen_only',
       userId: 'user_1',
@@ -1132,8 +1245,11 @@ describe('/api/viventium/voice/chat', () => {
 
     expect(mockMessageFindOneAndUpdate).toHaveBeenCalledTimes(2);
     expect(mockMessageFindOneAndUpdate.mock.calls[0][1].$set.text).toBe('first ambient turn');
-    expect(mockMessageFindOneAndUpdate.mock.calls[1][1].$set.text).toBe('second ambient turn');
+    expect(mockMessageFindOneAndUpdate.mock.calls[1][1].$set.text).toBe(
+      'first ambient turn second ambient turn',
+    );
     expect(secondRes.body.coalesced).toBeUndefined();
+    expect(secondRes.body.messageId).toBe(firstRes.body.messageId);
     expect(thirdRes.body).toMatchObject({
       status: 'listen_only',
       listenOnly: true,

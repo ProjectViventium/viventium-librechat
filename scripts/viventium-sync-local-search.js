@@ -14,6 +14,16 @@ const { createModels } = require('@librechat/data-schemas');
 const { connectDb } = require('../api/db/connect');
 const { batchResetMeiliFlags } = require('../api/db/utils');
 
+const failedTaskLookback = process.env.VIVENTIUM_MEILI_FAILED_TASK_LOOKBACK
+  ? parseInt(process.env.VIVENTIUM_MEILI_FAILED_TASK_LOOKBACK, 10)
+  : 25;
+const expectedMeiliPrimaryKey = '_meiliId';
+const meiliEligibleQuery = {
+  expiredAt: null,
+  'metadata.viventium.type': { $ne: 'listen_only_transcript' },
+  'metadata.viventium.mode': { $ne: 'listen_only' },
+};
+
 const isTruthy = (value) => {
   if (typeof value !== 'string') {
     return false;
@@ -30,6 +40,70 @@ const isTruthy = (value) => {
   }
 };
 
+const isCatastrophicMeiliTaskError = (task) => {
+  const error = task?.error || {};
+  const message = String(error.message || '');
+  return (
+    (message.includes(' is in version ') && message.includes('Meilisearch is in version')) ||
+    message.includes('incompatible with the current Meilisearch') ||
+    message.includes('incompatible with your current engine version')
+  );
+};
+
+const assertMeiliTaskHealth = async (client) => {
+  const lookback =
+    Number.isFinite(failedTaskLookback) && failedTaskLookback > 0 ? failedTaskLookback : 25;
+  const tasks = await client.getTasks({ statuses: ['failed'], limit: lookback });
+  const offenders = (tasks.results || []).filter(isCatastrophicMeiliTaskError);
+
+  if (offenders.length === 0) {
+    return;
+  }
+
+  const summary = offenders
+    .slice(0, 3)
+    .map((task) => `${task.uid}:${task.type}:${task.indexUid || 'global'}`)
+    .join(', ');
+
+  throw new Error(
+    `Meilisearch recent task health found incompatible failed tasks (${summary}); refusing to enqueue more local search sync work`,
+  );
+};
+
+const waitForMeiliTask = async (client, task) => {
+  if (!task?.taskUid || typeof client.waitForTask !== 'function') {
+    return;
+  }
+  const result = await client.waitForTask(task.taskUid, {
+    timeOutMs: parseInt(process.env.MEILI_SYNC_TASK_TIMEOUT_MS || '30000', 10),
+    intervalMs: parseInt(process.env.MEILI_SYNC_TASK_INTERVAL_MS || '50', 10),
+  });
+  if (result.status !== 'succeeded') {
+    throw new Error(`Meilisearch task ${task.taskUid} failed while ensuring local search index`);
+  }
+};
+
+const ensureIndexSchema = async (client, indexName) => {
+  try {
+    const info = await client.index(indexName).getRawInfo();
+    if (info.primaryKey && info.primaryKey !== expectedMeiliPrimaryKey) {
+      throw new Error(
+        `Meilisearch index ${indexName} uses legacy primary key ${info.primaryKey}; archive/drop the derived index before rebuilding`,
+      );
+    }
+  } catch (error) {
+    if (error.code !== 'index_not_found') {
+      throw error;
+    }
+    const task = await client.createIndex(indexName, { primaryKey: expectedMeiliPrimaryKey });
+    await waitForMeiliTask(client, task);
+  }
+};
+
+const ensureSearchIndexSchemas = async (client) => {
+  await Promise.all([ensureIndexSchema(client, 'messages'), ensureIndexSchema(client, 'convos')]);
+};
+
 const getIndexCount = async (client, indexName) => {
   try {
     const stats = await client.index(indexName).getStats();
@@ -44,10 +118,10 @@ const getIndexCount = async (client, indexName) => {
 
 const getState = async (Message, Conversation, client) => {
   const [msgTotal, msgIndexed, convoTotal, convoIndexed, msgMeili, convoMeili] = await Promise.all([
-    Message.countDocuments({ expiredAt: null }),
-    Message.countDocuments({ expiredAt: null, _meiliIndex: true }),
-    Conversation.countDocuments({ expiredAt: null }),
-    Conversation.countDocuments({ expiredAt: null, _meiliIndex: true }),
+    Message.countDocuments(meiliEligibleQuery),
+    Message.countDocuments({ ...meiliEligibleQuery, _meiliIndex: true }),
+    Conversation.countDocuments(meiliEligibleQuery),
+    Conversation.countDocuments({ ...meiliEligibleQuery, _meiliIndex: true }),
     getIndexCount(client, 'messages'),
     getIndexCount(client, 'convos'),
   ]);
@@ -111,6 +185,8 @@ async function main() {
   if (health.status !== 'available') {
     throw new Error(`Meilisearch is not available at ${process.env.MEILI_HOST}`);
   }
+  await assertMeiliTaskHealth(client);
+  await ensureSearchIndexSchemas(client);
 
   await connectDb();
   createModels(mongoose);
@@ -127,8 +203,7 @@ async function main() {
     logState('After parity reset', state);
   }
 
-  const messageNeedsSync =
-    state.msgIndexed !== state.msgTotal || state.msgMeili !== state.msgTotal;
+  const messageNeedsSync = state.msgIndexed !== state.msgTotal || state.msgMeili !== state.msgTotal;
   const convoNeedsSync =
     state.convoIndexed !== state.convoTotal || state.convoMeili !== state.convoTotal;
 
@@ -152,8 +227,7 @@ async function main() {
 
   const mongoParity =
     after.msgIndexed === after.msgTotal && after.convoIndexed === after.convoTotal;
-  const meiliCoverage =
-    after.msgMeili >= after.msgTotal && after.convoMeili >= after.convoTotal;
+  const meiliCoverage = after.msgMeili >= after.msgTotal && after.convoMeili >= after.convoTotal;
 
   if (!mongoParity || !meiliCoverage) {
     throw new Error('Local search sync finished without reaching full parity');

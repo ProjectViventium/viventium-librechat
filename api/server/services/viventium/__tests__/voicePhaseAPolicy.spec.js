@@ -8,6 +8,7 @@
 const {
   getConfiguredToolHoldScopeKeys,
   hasToolHoldCandidateConfigured,
+  resolvePhaseANoticeToolHoldGuard,
   resolveVoicePhaseAAsyncPolicy,
   resolveVoicePhaseAAsyncPolicyWithHydratedTools,
 } = require('../voicePhaseAPolicy');
@@ -140,6 +141,64 @@ describe('voicePhaseAPolicy', () => {
       reason: 'unowned_tool_hold_candidate_configured',
       toolHoldScopeKeys: ['productivity_ms365'],
       unownedToolHoldScopeKeys: ['productivity_ms365'],
+    });
+  });
+
+  test('guards early Phase A notice when an unowned tool-hold cortex is configured', () => {
+    const agent = {
+      tools: [],
+      background_cortices: [
+        {
+          agent_id: 'agent-ms365',
+          activation: { intent_scope: 'productivity_ms365' },
+        },
+      ],
+    };
+
+    expect(
+      resolvePhaseANoticeToolHoldGuard({
+        requestedPhaseANoticeMode: 'first_activation_continue',
+        voiceMode: true,
+        agent,
+        asyncPolicy: { forcedOff: false },
+      }),
+    ).toMatchObject({
+      guarded: true,
+      reason: 'unowned_tool_hold_candidate_configured',
+      toolHoldScopeKeys: ['productivity_ms365'],
+      unownedToolHoldScopeKeys: ['productivity_ms365'],
+    });
+  });
+
+  test('keeps early Phase A notice when configured tool-hold scope is owned', () => {
+    const agent = {
+      tools: [{ name: 'google_calendar_create_event' }],
+      background_cortices: [
+        {
+          agent_id: 'agent-google',
+          activation: { intent_scope: 'productivity_google_workspace' },
+        },
+      ],
+    };
+
+    expect(
+      resolvePhaseANoticeToolHoldGuard({
+        requestedPhaseANoticeMode: 'first_activation_continue',
+        voiceMode: true,
+        agent,
+        directActionSurfaces: [
+          {
+            scope_key: 'productivity_google_workspace',
+            tool_names: ['google_calendar_create_event'],
+          },
+        ],
+        agentTools: agent.tools,
+      }),
+    ).toMatchObject({
+      guarded: false,
+      reason: 'direct_action_owned',
+      toolHoldScopeKeys: ['productivity_google_workspace'],
+      unownedToolHoldScopeKeys: [],
     });
   });
 

@@ -60,8 +60,11 @@ describe('Meilisearch Mongoose plugin', () => {
     mockDeleteDocument.mockClear();
     mockDeleteDocuments.mockClear();
     mockGetDocument.mockClear();
+    mockAddDocuments.mockResolvedValue({ taskUid: 1 });
+    mockUpdateDocuments.mockResolvedValue({ taskUid: 1 });
+    mockDeleteDocument.mockResolvedValue({ taskUid: 1 });
     mockAddDocumentsInBatches.mockResolvedValue([{ taskUid: 1 }]);
-    mockWaitForTask.mockResolvedValue({});
+    mockWaitForTask.mockResolvedValue({ status: 'succeeded' });
   });
 
   afterAll(async () => {
@@ -222,6 +225,28 @@ describe('Meilisearch Mongoose plugin', () => {
     ]);
     const listenOnlyDoc = await messageModel.collection.findOne({ messageId: listenOnlyMessageId });
     expect(listenOnlyDoc?._meiliIndex).toBe(false);
+  });
+
+  test('syncWithMeili uses an internal Meili id for primary keys containing colons', async () => {
+    const conversationModel = createConversationModel(mongoose) as SchemaWithMeiliMethods;
+    await conversationModel.deleteMany({});
+    mockAddDocumentsInBatches.mockClear();
+
+    const conversationId = 'qa_clone:test-user:conversation-1';
+    await conversationModel.collection.insertOne({
+      conversationId,
+      user: new mongoose.Types.ObjectId().toString(),
+      title: 'Colon primary key should still index',
+      endpoint: EModelEndpoint.openAI,
+      expiredAt: null,
+    });
+
+    await expect(conversationModel.syncWithMeili()).resolves.not.toThrow();
+
+    const indexedDoc = mockAddDocumentsInBatches.mock.calls[0][0][0];
+    expect(indexedDoc.conversationId).toBe(conversationId);
+    expect(indexedDoc._meiliId).toContain('m_');
+    expect(indexedDoc._meiliId).not.toContain(':');
   });
 
   describe('estimatedDocumentCount usage in syncWithMeili', () => {
@@ -515,6 +540,42 @@ describe('Meilisearch Mongoose plugin', () => {
       expect(progress.isComplete).toBe(false);
     });
 
+    test('getSyncProgress excludes Listen-Only transcript messages from counts', async () => {
+      const messageModel = createMessageModel(mongoose) as SchemaWithMeiliMethods;
+      await messageModel.deleteMany({});
+
+      await messageModel.collection.insertMany([
+        {
+          messageId: new mongoose.Types.ObjectId(),
+          conversationId: new mongoose.Types.ObjectId(),
+          user: new mongoose.Types.ObjectId(),
+          isCreatedByUser: true,
+          _meiliIndex: true,
+          expiredAt: null,
+        },
+        {
+          messageId: new mongoose.Types.ObjectId(),
+          conversationId: new mongoose.Types.ObjectId(),
+          user: new mongoose.Types.ObjectId(),
+          isCreatedByUser: false,
+          _meiliIndex: false,
+          expiredAt: null,
+          metadata: {
+            viventium: {
+              type: 'listen_only_transcript',
+              mode: 'listen_only',
+            },
+          },
+        },
+      ]);
+
+      const progress = await messageModel.getSyncProgress();
+
+      expect(progress.totalDocuments).toBe(1);
+      expect(progress.totalProcessed).toBe(1);
+      expect(progress.isComplete).toBe(true);
+    });
+
     test('getSyncProgress shows completion when all syncable documents are indexed', async () => {
       const messageModel = createMessageModel(mongoose) as SchemaWithMeiliMethods;
       await messageModel.deleteMany({});
@@ -619,6 +680,31 @@ describe('Meilisearch Mongoose plugin', () => {
 
       // Restore original implementation
       updateManySpy.mockRestore();
+    });
+
+    test('syncWithMeili fails when Meilisearch reports a failed task', async () => {
+      const conversationModel = createConversationModel(mongoose) as SchemaWithMeiliMethods;
+      await conversationModel.deleteMany({});
+      mockAddDocumentsInBatches.mockClear();
+
+      await conversationModel.collection.insertOne({
+        conversationId: new mongoose.Types.ObjectId(),
+        user: new mongoose.Types.ObjectId(),
+        title: 'Failed Meili task',
+        endpoint: EModelEndpoint.openAI,
+        _meiliIndex: false,
+        expiredAt: null,
+      });
+
+      mockWaitForTask.mockResolvedValueOnce({
+        status: 'failed',
+        error: { message: 'invalid document id' },
+      });
+
+      await expect(conversationModel.syncWithMeili()).rejects.toThrow('invalid document id');
+
+      const indexedCount = await conversationModel.countDocuments({ _meiliIndex: true });
+      expect(indexedCount).toBe(0);
     });
 
     test('processSyncBatch logs error and throws when addDocumentsInBatches fails', async () => {

@@ -13,6 +13,11 @@ const { logger } = require('@librechat/data-schemas');
  * Added: 2026-02-07
  */
 const { performance } = require('perf_hooks');
+const {
+  calcVoiceLatencyDurationMs,
+  formatVoiceLatencyTiming,
+  voiceLatencyNow,
+} = require('~/server/services/viventium/voiceLatencyTiming');
 const { createContentAggregator } = require('@librechat/agents');
 const {
   initializeAgent,
@@ -82,26 +87,18 @@ const getVoiceLatencyRequestId = (req) => {
 };
 
 const calcVoiceStageMs = (startedAt) => {
-  if (typeof startedAt !== 'number') {
-    return null;
-  }
-  const delta = Date.now() - startedAt;
-  return delta >= 0 ? delta : null;
+  return calcVoiceLatencyDurationMs(startedAt);
 };
 
 const logVoiceInitLatencyStage = (req, stage, stageStartAt = null, details = '') => {
   if (!isVoiceLatencyEnabled(req)) {
     return;
   }
-  const now = Date.now();
-  const routeStartAt =
-    typeof req?.viventiumVoiceStartAt === 'number' ? req.viventiumVoiceStartAt : now;
   const requestId = getVoiceLatencyRequestId(req);
-  const stageMs = calcVoiceStageMs(stageStartAt);
-  const stagePart = stageMs == null ? '' : ` stage_ms=${stageMs}`;
+  const timingPart = formatVoiceLatencyTiming(req, stageStartAt);
   const detailPart = details ? ` ${details}` : '';
   logger.info(
-    `[VoiceLatency][LC] stage=${stage} request_id=${requestId} total_ms=${now - routeStartAt}${stagePart}${detailPart}`,
+    `[VoiceLatency][LC] stage=${stage} request_id=${requestId} ${timingPart}${detailPart}`,
   );
 };
 
@@ -247,7 +244,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
    * Feature: Voice init-layer latency instrumentation (compact summary).
    */
   const voiceLatencyEnabled = isVoiceLatencyEnabled(req);
-  const initVoiceStartAt = voiceLatencyEnabled ? Date.now() : null;
+  const initVoiceStartAt = voiceLatencyEnabled ? voiceLatencyNow() : null;
   const voiceInitSummary = voiceLatencyEnabled
     ? {
         stageMs: Object.create(null),
@@ -442,7 +439,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
    * validateAgentModel depends on both, so it runs after the parallel await.
    */
   const parallelInitStart = nowIfDeep();
-  const voiceAgentAndModelsStart = voiceLatencyEnabled ? Date.now() : null;
+  const voiceAgentAndModelsStart = voiceLatencyEnabled ? voiceLatencyNow() : null;
   const [primaryAgent, modelsConfig] = await Promise.all([
     endpointOption.agent,
     getModelsConfig(req),
@@ -472,7 +469,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
   /* === VIVENTIUM END === */
 
   const validateStart = nowIfDeep();
-  const voiceValidatePrimaryStart = voiceLatencyEnabled ? Date.now() : null;
+  const voiceValidatePrimaryStart = voiceLatencyEnabled ? voiceLatencyNow() : null;
   const validationResult = await validateAgentModel({
     req,
     res,
@@ -554,7 +551,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
   /* === VIVENTIUM END === */
 
   const initPrimaryStart = nowIfDeep();
-  const voiceInitPrimaryStart = voiceLatencyEnabled ? Date.now() : null;
+  const voiceInitPrimaryStart = voiceLatencyEnabled ? voiceLatencyNow() : null;
   const primaryConfig = await initializeAgent(
     {
       req,
@@ -617,7 +614,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
       if (fallbackConfigPromise) {
         return fallbackConfigPromise;
       }
-      const voiceFallbackInitStart = voiceLatencyEnabled ? Date.now() : null;
+      const voiceFallbackInitStart = voiceLatencyEnabled ? voiceLatencyNow() : null;
       fallbackConfigPromise = initializeAgent(
         {
           req,
@@ -723,7 +720,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
     /* === VIVENTIUM END === */
 
     const validateStart = nowIfDeep();
-    const voiceHandoffValidateStart = voiceLatencyEnabled ? Date.now() : null;
+    const voiceHandoffValidateStart = voiceLatencyEnabled ? voiceLatencyNow() : null;
     const validationResult = await validateAgentModel({
       req,
       res,
@@ -744,7 +741,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
     }
 
     const initStart = nowIfDeep();
-    const voiceHandoffInitStart = voiceLatencyEnabled ? Date.now() : null;
+    const voiceHandoffInitStart = voiceLatencyEnabled ? voiceLatencyNow() : null;
     const config = await initializeAgent(
       {
         req,
@@ -839,7 +836,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
 
   /** Multi-Convo: Process addedConvo for parallel agent execution */
   const addedConvoStart = nowIfDeep();
-  const voiceAddedConvoStart = voiceLatencyEnabled ? Date.now() : null;
+  const voiceAddedConvoStart = voiceLatencyEnabled ? voiceLatencyNow() : null;
   const { userMCPAuthMap: updatedMCPAuthMap } = await processAddedConvo({
     req,
     res,

@@ -55,6 +55,11 @@ const {
   resolveViventiumSurface,
   buildTimeContextInstructions,
 } = require('~/server/services/viventium/surfacePrompts');
+const {
+  calcVoiceLatencyDurationMs,
+  formatVoiceLatencyTiming,
+  voiceLatencyNow,
+} = require('~/server/services/viventium/voiceLatencyTiming');
 /* === VIVENTIUM NOTE ===
  * Feature: Source-owned activation policy promptRefs.
  */
@@ -685,6 +690,55 @@ function promptDebugSummaryLabel(text) {
 
 const isVoiceLatencyEnabled = (req) => req?.viventiumVoiceLogLatency === true;
 
+/* === VIVENTIUM START ===
+ * Rationale: Voice turns need fast Phase A awareness without weakening the full detection contract
+ * for web, Telegram, scheduler, or Phase B.
+ */
+const DEFAULT_PHASE_A_NOTICE_ENV_MODE = 'any_activated_on_voice';
+
+const PHASE_A_NOTICE_MODES = Object.freeze({
+  ALL_WITHIN_BUDGET: 'all_within_budget',
+  FIRST_ACTIVATION_CONTINUE: 'first_activation_continue',
+});
+
+function normalizePhaseANoticeMode(value) {
+  const normalized = String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, '_');
+  if (
+    [
+      'any_activated',
+      'first_activated',
+      'first_activation',
+      'first_activation_continue',
+      'one_any_activated',
+      'on_any_activated',
+      'voice_first_activation_continue',
+    ].includes(normalized)
+  ) {
+    return PHASE_A_NOTICE_MODES.FIRST_ACTIVATION_CONTINUE;
+  }
+  return PHASE_A_NOTICE_MODES.ALL_WITHIN_BUDGET;
+}
+
+function resolvePhaseANoticeModeForRequest(req) {
+  const raw = String(
+    process.env.VIVENTIUM_CORTEX_PHASE_A_NOTICE_MODE || DEFAULT_PHASE_A_NOTICE_ENV_MODE,
+  )
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, '_');
+  const isVoice = req?.body?.voiceMode === true || req?.body?.viventiumInputMode === 'voice_call';
+  if (raw === 'any_activated_on_voice' || raw === 'on_any_activated_on_voice') {
+    return isVoice
+      ? PHASE_A_NOTICE_MODES.FIRST_ACTIVATION_CONTINUE
+      : PHASE_A_NOTICE_MODES.ALL_WITHIN_BUDGET;
+  }
+  return normalizePhaseANoticeMode(raw);
+}
+/* === VIVENTIUM END === */
+
 const getVoiceLatencyRequestId = (req) => {
   const requestId = req?.viventiumVoiceRequestId;
   if (typeof requestId === 'string' && requestId.length > 0) {
@@ -697,14 +751,10 @@ const logVoicePhaseAStage = (req, stage, stageStartAt = null, details = '') => {
   if (!isVoiceLatencyEnabled(req)) {
     return;
   }
-  const now = Date.now();
-  const routeStartAt =
-    typeof req?.viventiumVoiceStartAt === 'number' ? req.viventiumVoiceStartAt : now;
-  const stageMs = typeof stageStartAt === 'number' ? now - stageStartAt : null;
-  const stagePart = stageMs == null ? '' : ` stage_ms=${stageMs}`;
+  const timingPart = formatVoiceLatencyTiming(req, stageStartAt);
   const detailPart = details ? ` ${details}` : '';
   logger.info(
-    `[VoiceLatency][LC][PhaseA] stage=${stage} request_id=${getVoiceLatencyRequestId(req)} total_ms=${now - routeStartAt}${stagePart}${detailPart}`,
+    `[VoiceLatency][LC][PhaseA] stage=${stage} request_id=${getVoiceLatencyRequestId(req)} ${timingPart}${detailPart}`,
   );
 };
 
@@ -3510,27 +3560,36 @@ async function detectActivations({
   onActivationStart,
   onCortexSkipped,
   timeBudgetMs = 2000,
+  noticeMode = PHASE_A_NOTICE_MODES.ALL_WITHIN_BUDGET,
   activationRunner = checkCortexActivation,
+  loadAgentFn = loadAgent,
 }) {
   const backgroundCortices = mainAgent.background_cortices || [];
+  const phaseANoticeMode = normalizePhaseANoticeMode(noticeMode);
 
   if (!backgroundCortices.length) {
     logVoicePhaseAStage(req, 'activation_detect_skipped', null, 'reason=no_background_cortices');
-    return { activatedCortices: [], timedOut: false, duration: 0 };
+    return {
+      activatedCortices: [],
+      timedOut: false,
+      duration: 0,
+      phaseANoticeMode,
+      earlyReturned: false,
+    };
   }
 
-  const startTime = Date.now();
-  const deadline = startTime + timeBudgetMs;
+  const startTime = voiceLatencyNow();
+  const deadline = Date.now() + timeBudgetMs;
   logVoicePhaseAStage(
     req,
     'activation_detect_start',
     startTime,
-    `cortex_count=${backgroundCortices.length} budget_ms=${timeBudgetMs}`,
+    `cortex_count=${backgroundCortices.length} budget_ms=${timeBudgetMs} notice_mode=${phaseANoticeMode}`,
   );
 
   // Best-effort: start loading cortex agent metadata (name/description) without blocking Phase A.
   // We will only wait for metadata up to the remaining global budget.
-  const metaLoadStartAt = Date.now();
+  const metaLoadStartAt = voiceLatencyNow();
   const metaById = new Map();
   const resolvedMetaById = new Map();
   const cortexConfigById = new Map();
@@ -3539,7 +3598,7 @@ async function detectActivations({
     cortexConfigById.set(agentId, cortexConfig);
     metaById.set(
       agentId,
-      loadAgent({ req, agent_id: agentId, endpoint: mainAgent.provider })
+      loadAgentFn({ req, agent_id: agentId, endpoint: mainAgent.provider })
         .then((meta) => {
           if (meta) {
             resolvedMetaById.set(agentId, meta);
@@ -3561,12 +3620,13 @@ async function detectActivations({
     req,
     mainAgent,
     timeoutMs: Math.min(250, timeLeftMs()),
+    loadAgentFn,
   });
 
   const activationPromises = backgroundCortices.map(async (cortexConfig) => {
     const agentId = cortexConfig.agent_id;
     const activationScope = resolveConfiguredProductivityActivationScopeKey(cortexConfig);
-    const cortexCheckStartAt = Date.now();
+    const cortexCheckStartAt = voiceLatencyNow();
 
     // Emit activation check started (UI)
     if (onActivationStart) {
@@ -3595,14 +3655,14 @@ async function detectActivations({
     };
 
     if (timeoutMs <= 0) {
-      const doneAt = Date.now();
+      const durationMs = calcVoiceLatencyDurationMs(cortexCheckStartAt) || 0;
       logVoicePhaseAStage(
         req,
         'activation_check_done',
         cortexCheckStartAt,
         `agent_id=${agentId} activate=false reason=global_timeout confidence=0.00 timeout_budget_ms=0`,
       );
-      return { ...timeoutResult, durationMs: doneAt - cortexCheckStartAt, timeoutBudgetMs: 0 };
+      return { ...timeoutResult, durationMs, timeoutBudgetMs: 0 };
     }
 
     try {
@@ -3634,7 +3694,7 @@ async function detectActivations({
       }
 
       if (result === timeoutSentinel) {
-        const doneAt = Date.now();
+        const durationMs = calcVoiceLatencyDurationMs(cortexCheckStartAt) || 0;
         logVoicePhaseAStage(
           req,
           'activation_check_done',
@@ -3643,13 +3703,13 @@ async function detectActivations({
         );
         return {
           ...timeoutResult,
-          durationMs: doneAt - cortexCheckStartAt,
+          durationMs,
           timeoutBudgetMs: timeoutMs,
         };
       }
 
       if (!result || typeof result !== 'object') {
-        const doneAt = Date.now();
+        const durationMs = calcVoiceLatencyDurationMs(cortexCheckStartAt) || 0;
         logVoicePhaseAStage(
           req,
           'activation_check_done',
@@ -3659,12 +3719,12 @@ async function detectActivations({
         return {
           ...timeoutResult,
           reason: 'invalid_result',
-          durationMs: doneAt - cortexCheckStartAt,
+          durationMs,
           timeoutBudgetMs: timeoutMs,
         };
       }
 
-      const durationMs = Date.now() - cortexCheckStartAt;
+      const durationMs = calcVoiceLatencyDurationMs(cortexCheckStartAt) || 0;
       const shouldActivate = Boolean(result.shouldActivate);
       const confidence = Number(result.confidence) || 0;
       const reason = String(result.reason || '');
@@ -3717,189 +3777,270 @@ async function detectActivations({
         reason: 'error',
         agentId,
         activationScope,
-        durationMs: Date.now() - cortexCheckStartAt,
+        durationMs: calcVoiceLatencyDurationMs(cortexCheckStartAt) || 0,
         timeoutBudgetMs: timeoutMs,
       };
     }
   });
 
-  // Collect results (all wrappers resolve by deadline)
-  const activationCollectStartAt = Date.now();
-  const rawActivationResults = await Promise.all(activationPromises);
-  const activationResults = rawActivationResults.map(applyDirectActionOwnershipGate);
-  logVoicePhaseAStage(
-    req,
-    'activation_collect_done',
-    activationCollectStartAt,
-    `results=${activationResults.length} direct_action_suppressed=${
-      activationResults.filter((r) => r?.suppressedByDirectActionOwnership === true).length
-    }`,
-  );
+  const finalizeActivationResults = async (
+    rawActivationResults,
+    {
+      collectStage = 'activation_collect_done',
+      collectStartAt = voiceLatencyNow(),
+      metaStage = 'activation_meta_attach_done',
+      doneStage = 'activation_detect_done',
+      emitSkipped = true,
+      emitDoneLog = true,
+    } = {},
+  ) => {
+    const activationResults = rawActivationResults.map(applyDirectActionOwnershipGate);
+    logVoicePhaseAStage(
+      req,
+      collectStage,
+      collectStartAt,
+      `results=${activationResults.length} direct_action_suppressed=${
+        activationResults.filter((r) => r?.suppressedByDirectActionOwnership === true).length
+      }`,
+    );
 
-  // Attach best-effort metadata to every result. When all activation providers
-  // are unavailable, this also lets us surface explicit, user-named configured
-  // agents as terminal error cards instead of silently dropping visibility.
-  const remainingForMetaMs = timeLeftMs();
-  const metaAttachStartAt = Date.now();
-  const activationResultsWithMeta = await Promise.all(
-    activationResults.map(async (r) => {
-      const cortexConfig = cortexConfigById.get(r.agentId);
-      let cortexName = configuredCortexDisplayName(cortexConfig) || r.agentId;
-      let cortexDescription = '';
+    // Attach best-effort metadata to every result. When all activation providers
+    // are unavailable, this also lets us surface explicit, user-named configured
+    // agents as terminal error cards instead of silently dropping visibility.
+    const remainingForMetaMs = timeLeftMs();
+    const metaAttachStartAt = voiceLatencyNow();
+    const activationResultsWithMeta = await Promise.all(
+      activationResults.map(async (r) => {
+        const cortexConfig = cortexConfigById.get(r.agentId);
+        let cortexName = configuredCortexDisplayName(cortexConfig) || r.agentId;
+        let cortexDescription = '';
 
-      const resolvedMeta = resolvedMetaById.get(r.agentId);
-      if (resolvedMeta) {
-        cortexName = sanitizeCortexDisplayName(resolvedMeta.name || cortexName);
-        cortexDescription = String(resolvedMeta.description || '')
-          .replace(/\s+/g, ' ')
-          .trim()
-          .slice(0, 220);
-      }
-      const metaPromise = metaById.get(r.agentId);
-      if (!resolvedMeta && metaPromise && remainingForMetaMs > 0) {
-        try {
-          const meta = await Promise.race([
-            metaPromise,
-            new Promise((resolve) => setTimeout(() => resolve(null), remainingForMetaMs)),
-          ]);
-          if (meta) {
-            cortexName = sanitizeCortexDisplayName(meta.name || cortexName);
-            cortexDescription = String(meta.description || '')
-              .replace(/\s+/g, ' ')
-              .trim()
-              .slice(0, 220);
+        const resolvedMeta = resolvedMetaById.get(r.agentId);
+        if (resolvedMeta) {
+          cortexName = sanitizeCortexDisplayName(resolvedMeta.name || cortexName);
+          cortexDescription = String(resolvedMeta.description || '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 220);
+        }
+        const metaPromise = metaById.get(r.agentId);
+        if (!resolvedMeta && metaPromise && remainingForMetaMs > 0) {
+          try {
+            const meta = await Promise.race([
+              metaPromise,
+              new Promise((resolve) => setTimeout(() => resolve(null), remainingForMetaMs)),
+            ]);
+            if (meta) {
+              cortexName = sanitizeCortexDisplayName(meta.name || cortexName);
+              cortexDescription = String(meta.description || '')
+                .replace(/\s+/g, ' ')
+                .trim()
+                .slice(0, 220);
+            }
+          } catch (e) {
+            logger.debug(
+              '[BackgroundCortexService] Failed to load cortex metadata',
+              sanitizeRuntimeErrorForLog(e),
+            );
           }
+        }
+
+        const shouldSurfaceUnavailable = shouldSurfaceActivationProviderUnavailable({
+          activationResult: r,
+          cortexConfig,
+        });
+        const shouldSurfaceTimeout = shouldSurfaceActivationTimeout({
+          activationResult: r,
+          cortexConfig,
+        });
+        const shouldSurfaceTerminal = shouldSurfaceUnavailable || shouldSurfaceTimeout;
+
+        return {
+          ...r,
+          shouldActivate: shouldSurfaceTerminal ? true : r.shouldActivate,
+          confidence: shouldSurfaceTerminal ? 0 : r.confidence,
+          reason: shouldSurfaceUnavailable ? 'activation_provider_unavailable' : r.reason,
+          activationProviderUnavailable: shouldSurfaceUnavailable === true,
+          activationTimedOut: shouldSurfaceTimeout === true,
+          errorClass: shouldSurfaceUnavailable
+            ? 'activation_provider_unavailable'
+            : shouldSurfaceTimeout
+              ? 'timeout'
+              : r.errorClass,
+          cortexName,
+          cortexDescription,
+        };
+      }),
+    );
+    logVoicePhaseAStage(
+      req,
+      metaStage,
+      metaAttachStartAt,
+      `results=${activationResultsWithMeta.length} activated=${
+        activationResultsWithMeta.filter((r) => r?.shouldActivate === true).length
+      } unavailable_visible=${
+        activationResultsWithMeta.filter((r) => r?.activationProviderUnavailable === true).length
+      } remaining_budget_ms=${remainingForMetaMs}`,
+    );
+    const timedOut = activationResultsWithMeta.some((r) => r.reason === 'global_timeout');
+
+    if (emitSkipped && onCortexSkipped) {
+      for (const r of activationResultsWithMeta) {
+        if (r.shouldActivate) {
+          continue;
+        }
+        try {
+          onCortexSkipped({
+            cortex_id: r.agentId,
+            cortex_name: r.cortexName || r.agentId,
+            status: 'skipped',
+            confidence: r.confidence,
+            reason: r.reason,
+          });
         } catch (e) {
-          logger.debug(
-            '[BackgroundCortexService] Failed to load cortex metadata',
+          logger.warn(
+            '[BackgroundCortexService] onCortexSkipped callback failed',
             sanitizeRuntimeErrorForLog(e),
           );
         }
       }
+    }
 
-      const shouldSurfaceUnavailable = shouldSurfaceActivationProviderUnavailable({
-        activationResult: r,
-        cortexConfig,
-      });
-      const shouldSurfaceTimeout = shouldSurfaceActivationTimeout({
-        activationResult: r,
-        cortexConfig,
-      });
-      const shouldSurfaceTerminal = shouldSurfaceUnavailable || shouldSurfaceTimeout;
+    const activated = activationResultsWithMeta.filter((r) => r.shouldActivate);
+    const withMeta = activated.map((r) => ({
+      agentId: r.agentId,
+      cortexName: r.cortexName || r.agentId,
+      cortexDescription: r.cortexDescription || '',
+      activationScope: r.activationScope || null,
+      directActionSurfaces: Array.isArray(r.directActionSurfaces) ? r.directActionSurfaces : [],
+      directActionSurfaceScopes: normalizeDirectActionSurfaceScopes(r.directActionSurfaceScopes),
+      confidence: r.confidence,
+      reason: r.reason,
+      activationProviderUnavailable: r.activationProviderUnavailable === true,
+      activationTimedOut: r.activationTimedOut === true,
+      errorClass: r.errorClass || null,
+      durationMs: Number.isFinite(r.durationMs) ? r.durationMs : null,
+      timeoutBudgetMs: Number.isFinite(r.timeoutBudgetMs) ? r.timeoutBudgetMs : null,
+    }));
 
+    const duration = calcVoiceLatencyDurationMs(startTime) || 0;
+    const sortedDurations = activationResultsWithMeta
+      .map((r) => ({
+        agentId: r.agentId,
+        durationMs: Number.isFinite(r.durationMs) ? r.durationMs : null,
+        reason: r.reason || 'none',
+        shouldActivate: r.shouldActivate === true,
+      }))
+      .filter((item) => Number.isFinite(item.durationMs))
+      .sort((a, b) => b.durationMs - a.durationMs);
+    const topDurations = sortedDurations
+      .slice(0, 5)
+      .map(
+        (item) =>
+          `${item.agentId}:${Number(item.durationMs).toFixed(3)}:${
+            item.shouldActivate ? 'on' : 'off'
+          }:${item.reason}`,
+      )
+      .join(',');
+    const timeoutCount = activationResultsWithMeta.filter(
+      (r) => r.reason === 'global_timeout',
+    ).length;
+    const activatedCount = activationResultsWithMeta.filter((r) => r.shouldActivate === true).length;
+    const reasonCounts = activationResultsWithMeta.reduce((acc, r) => {
+      const key = r.reason || 'none';
+      acc[key] = (acc[key] || 0) + 1;
+      return acc;
+    }, {});
+    const reasonSummary = Object.entries(reasonCounts)
+      .map(([reason, count]) => `${reason}:${count}`)
+      .join(',');
+
+    if (emitDoneLog) {
+      logVoicePhaseAStage(
+        req,
+        doneStage,
+        startTime,
+        `total=${activationResults.length} activated=${activatedCount} timed_out=${timeoutCount} ` +
+          `notice_mode=${phaseANoticeMode} reasons=${reasonSummary || 'none'} top_slowest=${
+            topDurations || 'none'
+          }`,
+      );
+
+      logger.info(
+        `[BackgroundCortexService] Activation detection complete: ${withMeta.length}/${backgroundCortices.length} activated ` +
+          `(duration: ${Math.round(duration)}ms, timedOut: ${timedOut}, noticeMode: ${phaseANoticeMode})`,
+      );
+    }
+
+    return {
+      activatedCortices: withMeta,
+      timedOut,
+      duration,
+      phaseANoticeMode,
+      earlyReturned: false,
+    };
+  };
+
+  const fullActivationCollectStartAt = voiceLatencyNow();
+  const fullDetectionPromise = Promise.all(activationPromises).then((rawActivationResults) =>
+    finalizeActivationResults(rawActivationResults, { collectStartAt: fullActivationCollectStartAt }),
+  );
+
+  if (phaseANoticeMode === PHASE_A_NOTICE_MODES.FIRST_ACTIVATION_CONTINUE) {
+    let firstResolved = false;
+    let remaining = activationPromises.length;
+    const noEarlyActivation = Symbol('no_early_activation');
+    const firstActivationPromise = new Promise((resolve) => {
+      for (const promise of activationPromises) {
+        promise
+          .then((result) => {
+            if (firstResolved) {
+              return;
+            }
+            const gated = applyDirectActionOwnershipGate(result);
+            if (gated?.shouldActivate === true) {
+              firstResolved = true;
+              resolve(gated);
+            }
+          })
+          .finally(() => {
+            remaining -= 1;
+            if (!firstResolved && remaining <= 0) {
+              firstResolved = true;
+              resolve(noEarlyActivation);
+            }
+          });
+      }
+    });
+
+    const earlyResult = await Promise.race([
+      firstActivationPromise,
+      fullDetectionPromise.then(() => noEarlyActivation),
+    ]);
+
+    if (earlyResult && earlyResult !== noEarlyActivation) {
+      const earlyDetection = await finalizeActivationResults([earlyResult], {
+        collectStage: 'activation_early_collect_done',
+        metaStage: 'activation_early_meta_attach_done',
+        emitSkipped: false,
+        emitDoneLog: false,
+      });
+      logVoicePhaseAStage(
+        req,
+        'activation_detect_early_return',
+        startTime,
+        `notice_mode=${phaseANoticeMode} activated=${earlyDetection.activatedCortices.length} ` +
+          `pending_checks=${Math.max(0, backgroundCortices.length - 1)}`,
+      );
       return {
-        ...r,
-        shouldActivate: shouldSurfaceTerminal ? true : r.shouldActivate,
-        confidence: shouldSurfaceTerminal ? 0 : r.confidence,
-        reason: shouldSurfaceUnavailable ? 'activation_provider_unavailable' : r.reason,
-        activationProviderUnavailable: shouldSurfaceUnavailable === true,
-        activationTimedOut: shouldSurfaceTimeout === true,
-        errorClass: shouldSurfaceUnavailable
-          ? 'activation_provider_unavailable'
-          : shouldSurfaceTimeout
-            ? 'timeout'
-            : r.errorClass,
-        cortexName,
-        cortexDescription,
+        ...earlyDetection,
+        earlyReturned: true,
+        finalDetectionPromise: fullDetectionPromise,
       };
-    }),
-  );
-  logVoicePhaseAStage(
-    req,
-    'activation_meta_attach_done',
-    metaAttachStartAt,
-    `results=${activationResultsWithMeta.length} activated=${
-      activationResultsWithMeta.filter((r) => r?.shouldActivate === true).length
-    } unavailable_visible=${
-      activationResultsWithMeta.filter((r) => r?.activationProviderUnavailable === true).length
-    } remaining_budget_ms=${remainingForMetaMs}`,
-  );
-  const timedOut = activationResultsWithMeta.some((r) => r.reason === 'global_timeout');
-
-  // Notify skipped ones (includes timeouts)
-  if (onCortexSkipped) {
-    for (const r of activationResultsWithMeta) {
-      if (r.shouldActivate) {
-        continue;
-      }
-      try {
-        onCortexSkipped({
-          cortex_id: r.agentId,
-          cortex_name: r.cortexName || r.agentId,
-          status: 'skipped',
-          confidence: r.confidence,
-          reason: r.reason,
-        });
-      } catch (e) {
-        logger.warn(
-          '[BackgroundCortexService] onCortexSkipped callback failed',
-          sanitizeRuntimeErrorForLog(e),
-        );
-      }
     }
   }
 
-  // Build activated list
-  const activated = activationResultsWithMeta.filter((r) => r.shouldActivate);
-  const withMeta = activated.map((r) => ({
-    agentId: r.agentId,
-    cortexName: r.cortexName || r.agentId,
-    cortexDescription: r.cortexDescription || '',
-    activationScope: r.activationScope || null,
-    directActionSurfaces: Array.isArray(r.directActionSurfaces) ? r.directActionSurfaces : [],
-    directActionSurfaceScopes: normalizeDirectActionSurfaceScopes(r.directActionSurfaceScopes),
-    confidence: r.confidence,
-    reason: r.reason,
-    activationProviderUnavailable: r.activationProviderUnavailable === true,
-    activationTimedOut: r.activationTimedOut === true,
-    errorClass: r.errorClass || null,
-    durationMs: Number.isFinite(r.durationMs) ? r.durationMs : null,
-    timeoutBudgetMs: Number.isFinite(r.timeoutBudgetMs) ? r.timeoutBudgetMs : null,
-  }));
-
-  const duration = Date.now() - startTime;
-  const sortedDurations = activationResultsWithMeta
-    .map((r) => ({
-      agentId: r.agentId,
-      durationMs: Number.isFinite(r.durationMs) ? r.durationMs : null,
-      reason: r.reason || 'none',
-      shouldActivate: r.shouldActivate === true,
-    }))
-    .filter((item) => Number.isFinite(item.durationMs))
-    .sort((a, b) => b.durationMs - a.durationMs);
-  const topDurations = sortedDurations
-    .slice(0, 5)
-    .map(
-      (item) =>
-        `${item.agentId}:${item.durationMs}:${item.shouldActivate ? 'on' : 'off'}:${item.reason}`,
-    )
-    .join(',');
-  const timeoutCount = activationResultsWithMeta.filter(
-    (r) => r.reason === 'global_timeout',
-  ).length;
-  const activatedCount = activationResultsWithMeta.filter((r) => r.shouldActivate === true).length;
-  const reasonCounts = activationResultsWithMeta.reduce((acc, r) => {
-    const key = r.reason || 'none';
-    acc[key] = (acc[key] || 0) + 1;
-    return acc;
-  }, {});
-  const reasonSummary = Object.entries(reasonCounts)
-    .map(([reason, count]) => `${reason}:${count}`)
-    .join(',');
-  logVoicePhaseAStage(
-    req,
-    'activation_detect_done',
-    startTime,
-    `total=${activationResults.length} activated=${activatedCount} timed_out=${timeoutCount} ` +
-      `reasons=${reasonSummary || 'none'} top_slowest=${topDurations || 'none'}`,
-  );
-
-  logger.info(
-    `[BackgroundCortexService] Activation detection complete: ${withMeta.length}/${backgroundCortices.length} activated ` +
-      `(duration: ${duration}ms, timedOut: ${timedOut})`,
-  );
-
-  return { activatedCortices: withMeta, timedOut, duration };
+  return fullDetectionPromise;
 }
 
 /**
@@ -4613,6 +4754,8 @@ module.exports = {
   formatHistoryForActivation,
   buildActivationPolicySection,
   buildActivationDecisionSubjectSection,
+  normalizePhaseANoticeMode,
+  resolvePhaseANoticeModeForRequest,
   applyActivationJsonMode,
   resolveActivationPolicyMainAgent,
   normalizeDirectActionScopeKey,

@@ -1232,7 +1232,8 @@ function resolvePromptRefText(value, fallback = DEFAULT_ACTIVATION_DECISION_SUBJ
   if (!promptId) {
     return '';
   }
-  const variables = value.promptVars && typeof value.promptVars === 'object' ? value.promptVars : {};
+  const variables =
+    value.promptVars && typeof value.promptVars === 'object' ? value.promptVars : {};
   return getPromptText(promptId, fallback, variables).trim();
 }
 
@@ -1555,7 +1556,12 @@ function buildCompletionInputFromActivation({
       activationResult.agentId,
     insight: result?.insight ?? null,
     error: error || result?.error || null,
-    errorClass: errorClass || result?.errorClass || result?.error_class || activationResult.errorClass || null,
+    errorClass:
+      errorClass ||
+      result?.errorClass ||
+      result?.error_class ||
+      activationResult.errorClass ||
+      null,
     activationScope: result?.activationScope || activationResult.activationScope || null,
     configuredTools: result?.configuredTools || 0,
     completedToolCalls: result?.completedToolCalls || 0,
@@ -1798,7 +1804,11 @@ function classifyCortexPublicError(error, explicitClass = '') {
   if (status >= 500 || status === 529 || message.includes('overloaded')) {
     return 'recoverable_provider_error';
   }
-  if (message.includes('provider') || message.includes('unauthorized') || message.includes('forbidden')) {
+  if (
+    message.includes('provider') ||
+    message.includes('unauthorized') ||
+    message.includes('forbidden')
+  ) {
     return 'recoverable_provider_error';
   }
   if (rawClass) {
@@ -3945,7 +3955,9 @@ async function detectActivations({
     const timeoutCount = activationResultsWithMeta.filter(
       (r) => r.reason === 'global_timeout',
     ).length;
-    const activatedCount = activationResultsWithMeta.filter((r) => r.shouldActivate === true).length;
+    const activatedCount = activationResultsWithMeta.filter(
+      (r) => r.shouldActivate === true,
+    ).length;
     const reasonCounts = activationResultsWithMeta.reduce((acc, r) => {
       const key = r.reason || 'none';
       acc[key] = (acc[key] || 0) + 1;
@@ -3983,7 +3995,9 @@ async function detectActivations({
 
   const fullActivationCollectStartAt = voiceLatencyNow();
   const fullDetectionPromise = Promise.all(activationPromises).then((rawActivationResults) =>
-    finalizeActivationResults(rawActivationResults, { collectStartAt: fullActivationCollectStartAt }),
+    finalizeActivationResults(rawActivationResults, {
+      collectStartAt: fullActivationCollectStartAt,
+    }),
   );
 
   if (phaseANoticeMode === PHASE_A_NOTICE_MODES.FIRST_ACTIVATION_CONTINUE) {

@@ -167,12 +167,7 @@ function initializeVoiceChatLatency(req, _res, next) {
 function timedConfigMiddleware(req, res, next) {
   const stageStartAt = voiceLatencyNow();
   configMiddleware(req, res, (err) => {
-    logVoiceRouteStage(
-      req,
-      'voice_config_done',
-      stageStartAt,
-      `status=${err ? 'error' : 'ok'}`,
-    );
+    logVoiceRouteStage(req, 'voice_config_done', stageStartAt, `status=${err ? 'error' : 'ok'}`);
     next(err);
   });
 }
@@ -189,12 +184,7 @@ function timedValidateConvoAccess(req, res, next) {
     return;
   }
   validateConvoAccess(req, res, (err) => {
-    logVoiceRouteStage(
-      req,
-      'validate_convo_done',
-      stageStartAt,
-      `status=${err ? 'error' : 'ok'}`,
-    );
+    logVoiceRouteStage(req, 'validate_convo_done', stageStartAt, `status=${err ? 'error' : 'ok'}`);
     next(err);
   });
 }
@@ -1088,7 +1078,12 @@ async function voiceAuth(req, res, next) {
     );
     next();
   } catch (err) {
-    logVoiceRouteStage(req, 'voice_auth_done', authStartAt, `status=error reason=${err?.status || 401}`);
+    logVoiceRouteStage(
+      req,
+      'voice_auth_done',
+      authStartAt,
+      `status=error reason=${err?.status || 401}`,
+    );
     const status = err?.status || 401;
     logger.error('[VIVENTIUM][voiceAuth] Auth failed:', err);
     return res.status(status).json({ error: err?.message || 'Unauthorized' });
@@ -1353,7 +1348,12 @@ router.post(
       );
     }
 
-    logVoiceRouteStage(req, 'agent_controller_enter', null, `stream_id=${req.body?.streamId || 'pending'}`);
+    logVoiceRouteStage(
+      req,
+      'agent_controller_enter',
+      null,
+      `stream_id=${req.body?.streamId || 'pending'}`,
+    );
     return AgentController(req, res, next, initializeClient, addTitle);
   },
 );

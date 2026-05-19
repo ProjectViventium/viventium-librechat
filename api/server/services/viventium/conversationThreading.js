@@ -118,7 +118,11 @@ async function resolveReusableConversationState({
 
   let convo = null;
   try {
-    convo = await getConvo(userId, conversationId, 'conversationId endpoint agent_id user updatedAt');
+    convo = await getConvo(
+      userId,
+      conversationId,
+      'conversationId endpoint agent_id user updatedAt',
+    );
   } catch (err) {
     logger.warn(
       '[VIVENTIUM][%s] Failed to validate conversationId=%s: %s',

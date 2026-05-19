@@ -3224,16 +3224,16 @@ class AgentClient extends BaseClient {
           cortexExecutionPromise = (async () => {
             try {
               const asyncDetectStart = voiceLatencyNow();
-	              const asyncDetectionResult = await detectActivations({
-	                req: asyncReq,
-	                mainAgent: asyncAgent,
-	                messages: initialMessages,
-	                runId: asyncRunId,
-	                timeBudgetMs: cortexDetectTimeoutMs,
-	                // Fully async voice starts the main model immediately, so Phase B should wait for
-	                // the complete background detection set instead of early-returning on one signal.
-	                noticeMode: 'all_within_budget',
-	              });
+              const asyncDetectionResult = await detectActivations({
+                req: asyncReq,
+                mainAgent: asyncAgent,
+                messages: initialMessages,
+                runId: asyncRunId,
+                timeBudgetMs: cortexDetectTimeoutMs,
+                // Fully async voice starts the main model immediately, so Phase B should wait for
+                // the complete background detection set instead of early-returning on one signal.
+                noticeMode: 'all_within_budget',
+              });
 
               activatedCorticesList = asyncDetectionResult.activatedCortices;
               const asyncDetectDuration = calcVoiceLatencyDurationMs(asyncDetectStart) || 0;
@@ -3531,8 +3531,9 @@ class AgentClient extends BaseClient {
               // If we're going to defer the main response (tool cortex brewing hold), do NOT pass the live
               // Express response object into background cortex execution. Tool/MCP transports can bind to
               // the response lifecycle and get aborted when the main response ends, leaving cortices stuck.
-              const directActionScopeKeys =
-                collectDirectActionScopeKeysFromCortices(phaseBActivatedCorticesList);
+              const directActionScopeKeys = collectDirectActionScopeKeysFromCortices(
+                phaseBActivatedCorticesList,
+              );
               const effectiveDirectActionScopeKeys = collectEffectiveDirectActionScopeKeys({
                 directActionSurfaces: directActionPolicySurfaces,
                 agentTools: this.options.agent?.tools,

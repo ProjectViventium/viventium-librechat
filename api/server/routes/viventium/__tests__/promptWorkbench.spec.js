@@ -120,7 +120,9 @@ describe('/api/viventium/prompt-workbench', () => {
   });
 
   test('requires admin authorization after JWT authentication', async () => {
-    mockCheckAdmin.mockImplementation((_req, res) => res.status(403).json({ message: 'Forbidden' }));
+    mockCheckAdmin.mockImplementation((_req, res) =>
+      res.status(403).json({ message: 'Forbidden' }),
+    );
 
     const response = await request(createApp())
       .post('/api/viventium/prompt-workbench/start')

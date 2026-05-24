@@ -34,12 +34,7 @@ describe('viventium-memory-proposal-apply', () => {
 
   test('detects duplicate live memory keys and builds governed merge plans', () => {
     expect(
-      duplicateKeys([
-        { key: 'core' },
-        { key: 'context' },
-        { key: 'core' },
-        { key: '' },
-      ]),
+      duplicateKeys([{ key: 'core' }, { key: 'context' }, { key: 'core' }, { key: '' }]),
     ).toEqual(['core']);
 
     expect(
@@ -70,9 +65,9 @@ describe('viventium-memory-proposal-apply', () => {
     expect(parseArgs(['--proposal', '/tmp/proposal.json', '--user-id', 'user-1'])).toEqual(
       expect.objectContaining({ apply: false, proposal: '/tmp/proposal.json', userId: 'user-1' }),
     );
-    expect(parseArgs(['--proposal', '/tmp/proposal.json', '--user-id', 'user-1', '--apply'])).toEqual(
-      expect.objectContaining({ apply: true }),
-    );
+    expect(
+      parseArgs(['--proposal', '/tmp/proposal.json', '--user-id', 'user-1', '--apply']),
+    ).toEqual(expect.objectContaining({ apply: true }));
   });
 
   test('applyProposalWithMethods dedupes duplicate keys and applies through governed methods', async () => {
@@ -133,7 +128,9 @@ describe('viventium-memory-proposal-apply', () => {
     expect(calls.some(([, key]) => key === 'core')).toBe(false);
     expect(memories.filter((memory) => memory.key === 'context')).toHaveLength(1);
     expect(memories.filter((memory) => memory.key === 'core')).toHaveLength(2);
-    expect(memories.find((memory) => memory.key === 'context').value).toBe('Synthetic governed update');
+    expect(memories.find((memory) => memory.key === 'context').value).toBe(
+      'Synthetic governed update',
+    );
   });
 
   test('applyProposalWithMethods does not block on unrelated duplicate keys', async () => {

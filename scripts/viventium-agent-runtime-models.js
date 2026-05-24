@@ -7,10 +7,7 @@ const DEFAULT_MODELS = {
   groq: 'meta-llama/llama-4-scout-17b-16e-instruct',
 };
 
-const APPROVED_MAIN_RUNTIME_FAMILIES = new Set([
-  'anthropic::claude-opus-4-7',
-  'openAI::gpt-5.4',
-]);
+const APPROVED_MAIN_RUNTIME_FAMILIES = new Set(['anthropic::claude-opus-4-7', 'openAI::gpt-5.4']);
 
 const APPROVED_BACKGROUND_RUNTIME_FAMILIES = new Set([
   'anthropic::claude-sonnet-4-5',
@@ -118,7 +115,9 @@ const AGENT_RUNTIME_ENV_BY_ID = {
 };
 
 const BUILT_IN_BACKGROUND_AGENT_IDS = Object.freeze(
-  Object.keys(AGENT_RUNTIME_ENV_BY_ID).filter((agentId) => agentId !== 'agent_viventium_main_95aeb3'),
+  Object.keys(AGENT_RUNTIME_ENV_BY_ID).filter(
+    (agentId) => agentId !== 'agent_viventium_main_95aeb3',
+  ),
 );
 
 const CANONICAL_BUILT_IN_BACKGROUND_MODEL_PARAMETERS = Object.freeze({
@@ -200,7 +199,9 @@ function deepClone(value) {
 }
 
 function normalizeProvider(provider) {
-  const raw = String(provider || '').trim().toLowerCase();
+  const raw = String(provider || '')
+    .trim()
+    .toLowerCase();
   if (!raw) {
     return '';
   }
@@ -260,16 +261,11 @@ function readRuntimeAssignment({
   const fallback = {
     provider: normalizeProvider(fallbackProvider),
     model: String(
-      fallbackModel ||
-        DEFAULT_MODELS[normalizeProvider(fallbackProvider)] ||
-        '',
+      fallbackModel || DEFAULT_MODELS[normalizeProvider(fallbackProvider)] || '',
     ).trim(),
   };
 
-  const candidates = [
-    { provider, model },
-    fallback,
-  ];
+  const candidates = [{ provider, model }, fallback];
 
   for (const candidate of candidates) {
     if (!candidate.provider || !candidate.model) {
@@ -301,14 +297,12 @@ function approvedRuntimeFamiliesForAgent(agentId, { env = process.env } = {}) {
     : APPROVED_BACKGROUND_RUNTIME_FAMILIES;
 }
 
-function readVoiceAssignment(
-  {
-    explicitProvider = '',
-    explicitModel = '',
-    mainProvider = '',
-    mainModel = '',
-  },
-) {
+function readVoiceAssignment({
+  explicitProvider = '',
+  explicitModel = '',
+  mainProvider = '',
+  mainModel = '',
+}) {
   const provider = normalizeProvider(explicitProvider);
   const model = String(explicitModel || '').trim();
 
@@ -462,14 +456,20 @@ function resolveCanonicalRuntimeTools(agent, existingAgent = null, { env = proce
   return pruneUnavailableTools({ tools: sourceTools }, { env }).tools;
 }
 
-function buildCanonicalPersistedAgentFields(agent, existingAgent = null, { env = process.env } = {}) {
+function buildCanonicalPersistedAgentFields(
+  agent,
+  existingAgent = null,
+  { env = process.env } = {},
+) {
   if (!agent || typeof agent !== 'object') {
     return null;
   }
 
   const patch = {};
   const provider = normalizeProvider(agent.provider || existingAgent?.provider);
-  const model = String(agent.model || agent.model_parameters?.model || existingAgent?.model || '').trim();
+  const model = String(
+    agent.model || agent.model_parameters?.model || existingAgent?.model || '',
+  ).trim();
 
   if (provider) {
     patch.provider = provider;

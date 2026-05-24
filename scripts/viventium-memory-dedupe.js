@@ -240,7 +240,10 @@ async function main() {
 
 if (require.main === module) {
   main().catch((error) => {
-    const message = String(error?.message || error).replace(/mongodb(?:\+srv)?:\/\/[^\s]+/gi, '<mongo-uri>');
+    const message = String(error?.message || error).replace(
+      /mongodb(?:\+srv)?:\/\/[^\s]+/gi,
+      '<mongo-uri>',
+    );
     console.error(message);
     process.exit(1);
   });

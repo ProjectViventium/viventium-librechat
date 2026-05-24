@@ -235,9 +235,7 @@ function isLateStreamTerminationErrorPart(part: TMessageContentParts | undefined
  * Purpose: When a provider failure is already represented by visible assistant text, the chat UI
  * should not render a second fatal error card in the same assistant message.
  * === VIVENTIUM END === */
-function isStructuredRecoverableProviderErrorPart(
-  part: TMessageContentParts | undefined,
-): boolean {
+function isStructuredRecoverableProviderErrorPart(part: TMessageContentParts | undefined): boolean {
   if (!part || part.type !== ContentTypes.ERROR) {
     return false;
   }

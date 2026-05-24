@@ -456,8 +456,7 @@ export function getMemoryWriterHealthGate({
     return { blocked: false };
   }
   const shouldLog =
-    entry.lastLoggedAt == null ||
-    now - entry.lastLoggedAt >= MEMORY_WRITER_HEALTH_LOG_INTERVAL_MS;
+    entry.lastLoggedAt == null || now - entry.lastLoggedAt >= MEMORY_WRITER_HEALTH_LOG_INTERVAL_MS;
   if (shouldLog) {
     entry.lastLoggedAt = now;
   }
@@ -531,9 +530,10 @@ function describeAnthropicThinkingMode(thinking: unknown): string {
     return 'nonstandard';
   }
 
-  const type = typeof (thinking as { type?: unknown }).type === 'string'
-    ? String((thinking as { type?: unknown }).type)
-    : '';
+  const type =
+    typeof (thinking as { type?: unknown }).type === 'string'
+      ? String((thinking as { type?: unknown }).type)
+      : '';
   return type || 'object';
 }
 
@@ -560,7 +560,8 @@ function sanitizeAnthropicMemoryConfig(config: ClientOptions): ClientOptions {
   const hasForcedToolChoice =
     sanitized.tool_choice != null || sanitized.invocationKwargs?.tool_choice != null;
   const hasActiveThinkingForForcedToolUse =
-    hasActiveAnthropicThinking(effectiveThinking) || sanitized.invocationKwargs?.output_config != null;
+    hasActiveAnthropicThinking(effectiveThinking) ||
+    sanitized.invocationKwargs?.output_config != null;
 
   if (hasForcedToolChoice && hasActiveThinkingForForcedToolUse) {
     delete sanitized.thinking;
@@ -885,21 +886,18 @@ const createDeleteMemoryTool = ({
 };
 
 const createNoopMemoryTool = () =>
-  tool(
-    async () => ['No durable memory update needed for this turn', undefined],
-    {
-      name: 'noop_memory',
-      description:
-        'Use this when the current chat does not require any durable memory changes. If the user explicitly asked you to remember, store, forget, delete, or update memory, do not use this tool.',
-      responseFormat: 'content_and_artifact',
-      schema: z.object({
-        reason: z
-          .string()
-          .optional()
-          .describe('Optional short reason why no durable memory update is needed.'),
-      }),
-    },
-  );
+  tool(async () => ['No durable memory update needed for this turn', undefined], {
+    name: 'noop_memory',
+    description:
+      'Use this when the current chat does not require any durable memory changes. If the user explicitly asked you to remember, store, forget, delete, or update memory, do not use this tool.',
+    responseFormat: 'content_and_artifact',
+    schema: z.object({
+      reason: z
+        .string()
+        .optional()
+        .describe('Optional short reason why no durable memory update is needed.'),
+    }),
+  });
 
 export const createApplyMemoryChangesTool = ({
   userId,
@@ -958,9 +956,7 @@ export const createApplyMemoryChangesTool = ({
 
       for (const operation of normalizedOperations) {
         const action = operation?.action;
-        let result:
-          | [string, Record<Tools.memory, MemoryArtifact> | undefined]
-          | undefined;
+        let result: [string, Record<Tools.memory, MemoryArtifact> | undefined] | undefined;
 
         if (action === 'set') {
           if (
@@ -1057,10 +1053,7 @@ export const createApplyMemoryChangesTool = ({
                 .describe(
                   'For set operations, the full memory value to store for this key. May be multi-line.',
                 ),
-              reason: z
-                .string()
-                .optional()
-                .describe('Optional short reason for noop operations.'),
+              reason: z.string().optional().describe('Optional short reason for noop operations.'),
             }),
           )
           .min(1)
@@ -1070,10 +1063,10 @@ export const createApplyMemoryChangesTool = ({
   );
 };
 
-const resolveMemoryToolChoice = (
-  provider?: string,
-): string | undefined => {
-  const normalized = String(provider ?? '').trim().toLowerCase();
+const resolveMemoryToolChoice = (provider?: string): string | undefined => {
+  const normalized = String(provider ?? '')
+    .trim()
+    .toLowerCase();
 
   switch (normalized) {
     case 'openai':
@@ -1096,7 +1089,9 @@ const preserveForcedToolChoice = ({
   llmConfig: ClientOptions;
   toolChoice: string;
 }): void => {
-  const normalized = String(provider ?? '').trim().toLowerCase();
+  const normalized = String(provider ?? '')
+    .trim()
+    .toLowerCase();
 
   if (normalized === 'openai' || normalized === 'azureopenai') {
     const openAIConfig = llmConfig as OpenAIClientOptions;
@@ -1271,8 +1266,7 @@ ${memory ?? 'No existing memories'}`;
       disableStreaming: true,
     };
 
-    const memoryProvider =
-      (finalLLMConfig as Partial<LLMConfig>).provider ?? llmConfig?.provider;
+    const memoryProvider = (finalLLMConfig as Partial<LLMConfig>).provider ?? llmConfig?.provider;
     const toolChoice = resolveMemoryToolChoice(memoryProvider);
     if (toolChoice != null) {
       (finalLLMConfig as Record<string, unknown>).tool_choice = toolChoice;
@@ -1324,7 +1318,10 @@ ${memory ?? 'No existing memories'}`;
         hadTemperature &&
         (sanitizedAnthropicConfig as { temperature?: number }).temperature == null;
       const clearedThinking =
-        Object.prototype.hasOwnProperty.call(finalLLMConfig as Record<string, unknown>, 'thinking') &&
+        Object.prototype.hasOwnProperty.call(
+          finalLLMConfig as Record<string, unknown>,
+          'thinking',
+        ) &&
         !Object.prototype.hasOwnProperty.call(
           sanitizedAnthropicConfig as Record<string, unknown>,
           'thinking',
@@ -1444,7 +1441,9 @@ ${memory ?? 'No existing memories'}`;
         messageId,
         provider: llmConfig?.provider,
         model:
-          llmConfig != null && 'model' in llmConfig ? (llmConfig.model as string | undefined) : undefined,
+          llmConfig != null && 'model' in llmConfig
+            ? (llmConfig.model as string | undefined)
+            : undefined,
       });
       content = await run.processStream(inputs, config);
     }
@@ -1470,7 +1469,9 @@ ${memory ?? 'No existing memories'}`;
   } catch (error) {
     const typedError = error as { message?: string; code?: string; type?: string } | undefined;
     const configuredModel =
-      llmConfig != null && 'model' in llmConfig ? (llmConfig.model as string | undefined) : undefined;
+      llmConfig != null && 'model' in llmConfig
+        ? (llmConfig.model as string | undefined)
+        : undefined;
     const anthropicThinking =
       llmConfig?.provider === Providers.ANTHROPIC
         ? ((llmConfig as Record<string, unknown>).thinking ?? ANTHROPIC_MEMORY_DEFAULT_THINKING)
@@ -1482,7 +1483,11 @@ ${memory ?? 'No existing memories'}`;
       error,
     });
     logger.error(
-      `[MemoryAgent] Failed to process memory | userId: ${userId} | conversationId: ${conversationId} | messageId: ${messageId} | provider=${String(llmConfig?.provider ?? 'unknown')} | model=${configuredModel ?? 'unknown'} | thinkingMode=${anthropicThinking == null ? 'n/a' : describeAnthropicThinkingMode(anthropicThinking)} | temperature=${String((llmConfig as { temperature?: unknown } | undefined)?.temperature ?? 'unset')} | errorType=${typedError?.type ?? 'unknown'} | errorCode=${typedError?.code ?? 'unknown'} | errorMessage=${String(typedError?.message ?? 'unknown').replace(/\s+/g, ' ').slice(0, 300)}`,
+      `[MemoryAgent] Failed to process memory | userId: ${userId} | conversationId: ${conversationId} | messageId: ${messageId} | provider=${String(llmConfig?.provider ?? 'unknown')} | model=${configuredModel ?? 'unknown'} | thinkingMode=${anthropicThinking == null ? 'n/a' : describeAnthropicThinkingMode(anthropicThinking)} | temperature=${String((llmConfig as { temperature?: unknown } | undefined)?.temperature ?? 'unset')} | errorType=${typedError?.type ?? 'unknown'} | errorCode=${typedError?.code ?? 'unknown'} | errorMessage=${String(
+        typedError?.message ?? 'unknown',
+      )
+        .replace(/\s+/g, ' ')
+        .slice(0, 300)}`,
       {
         error,
         provider: llmConfig?.provider,

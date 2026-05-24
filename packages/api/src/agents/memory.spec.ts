@@ -860,10 +860,22 @@ describe('Memory snapshot loading', () => {
       validKeys: ['core'],
       readProfile: { tokenLimit: 200, cacheTtlMs: 10_000 },
     };
-    const first = await loadMemoryReadContext({ userId: 'user-123', memoryMethods: methods, config });
-    const second = await loadMemoryReadContext({ userId: 'user-123', memoryMethods: methods, config });
+    const first = await loadMemoryReadContext({
+      userId: 'user-123',
+      memoryMethods: methods,
+      config,
+    });
+    const second = await loadMemoryReadContext({
+      userId: 'user-123',
+      memoryMethods: methods,
+      config,
+    });
     clearMemoryReadContextCache('user-123');
-    const third = await loadMemoryReadContext({ userId: 'user-123', memoryMethods: methods, config });
+    const third = await loadMemoryReadContext({
+      userId: 'user-123',
+      memoryMethods: methods,
+      config,
+    });
 
     expect(first.cacheHit).toBe(false);
     expect(second.cacheHit).toBe(true);

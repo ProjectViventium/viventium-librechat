@@ -983,7 +983,9 @@ function isLateStreamTerminationError(err) {
 
 function isLocalRetrievalTimeoutError(err) {
   const message = getCompletionErrorMessage(err).trim().toLowerCase();
-  const code = String(err?.code || '').trim().toUpperCase();
+  const code = String(err?.code || '')
+    .trim()
+    .toUpperCase();
   const source = [err?.toolName, err?.tool, err?.source, err?.lc_error_code, err?.name]
     .filter(Boolean)
     .join(' ')
@@ -1039,8 +1041,7 @@ function createCompletionErrorContentPart(err) {
     late_stream_termination: 'The model stream ended before a response was available.',
     local_retrieval_timeout:
       'Local retrieval timed out before the model response could be completed.',
-    post_stream_finalization:
-      'The response completed, but post-response finalization failed.',
+    post_stream_finalization: 'The response completed, but post-response finalization failed.',
     tool_cortex_deferred_main_response:
       'Background tool work is continuing in a follow-up response.',
     provider_rate_limited:
@@ -2527,9 +2528,12 @@ class AgentClient extends BaseClient {
           if (Array.isArray(artifactPromises)) {
             artifactPromises.push(...attachments.filter(Boolean));
           } else {
-            logger.warn('[AgentClient] Memory writer produced attachments after artifact sink closed', {
-              attachments: attachments.filter(Boolean).length,
-            });
+            logger.warn(
+              '[AgentClient] Memory writer produced attachments after artifact sink closed',
+              {
+                attachments: attachments.filter(Boolean).length,
+              },
+            );
           }
         }
         if (isDeepTimingEnabled(req)) {
@@ -4452,7 +4456,7 @@ class AgentClient extends BaseClient {
         logger.info(
           `[AgentClient] Tool cortex brewing hold: deferred main response (activated=${activatedCorticesList.length})`,
         );
-        this.scheduleMemoryWriter(messages);
+        this.scheduleMemoryWriter(mainAgentMessages);
       } else {
         /* === VIVENTIUM START ===
          * Feature: Anthropic overflow recovery retry.
@@ -4495,7 +4499,7 @@ class AgentClient extends BaseClient {
         if (isDeepTimingEnabled(req)) {
           logDeepTiming(req, 'chat_completion_done', chatStart);
         }
-        this.scheduleMemoryWriter(messages);
+        this.scheduleMemoryWriter(mainAgentMessages);
       }
       /* === VIVENTIUM NOTE END === */
       if (voiceLatencyEnabled) {

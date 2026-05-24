@@ -1,10 +1,9 @@
 const { Types } = require('mongoose');
 const path = require('path');
 
-const { buildDuplicateGroups, parseArgs } = require(path.join(
-  __dirname,
-  '../../../scripts/viventium-memory-dedupe.js',
-));
+const { buildDuplicateGroups, parseArgs } = require(
+  path.join(__dirname, '../../../scripts/viventium-memory-dedupe.js'),
+);
 
 describe('viventium-memory-dedupe', () => {
   test('plans to keep the newest saved-memory document per user/key', () => {

@@ -2193,8 +2193,7 @@ describe('AgentClient - titleConvo', () => {
 
     it('clears only the captured user cache when the client options are disposed mid-writer', async () => {
       const { HumanMessage } = require('@langchain/core/messages');
-      const mockClearMemoryReadContextCache =
-        require('@librechat/api').clearMemoryReadContextCache;
+      const mockClearMemoryReadContextCache = require('@librechat/api').clearMemoryReadContextCache;
       client.initializeMemoryWriter = jest.fn().mockImplementation(async () => {
         client.options = null;
         return { ok: true };
@@ -2238,8 +2237,7 @@ describe('AgentClient - titleConvo', () => {
 
     it('does not clear the global memory read cache when detached writer lacks a user id', async () => {
       const { HumanMessage } = require('@langchain/core/messages');
-      const mockClearMemoryReadContextCache =
-        require('@librechat/api').clearMemoryReadContextCache;
+      const mockClearMemoryReadContextCache = require('@librechat/api').clearMemoryReadContextCache;
       client.options = {
         ...client.options,
         req: {
@@ -3569,9 +3567,9 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
       throw error;
     });
 
-    await expect(
-      client.sendCompletion({ text: 'hello' }, { abortController }),
-    ).rejects.toThrow('operation was aborted');
+    await expect(client.sendCompletion({ text: 'hello' }, { abortController })).rejects.toThrow(
+      'operation was aborted',
+    );
 
     expect(client.chatCompletion).toHaveBeenCalledTimes(1);
   });
@@ -3593,7 +3591,10 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
         client.contentParts.push(AgentClient.createCompletionErrorContentPart(error));
         throw error;
       }
-      client.contentParts.push({ type: ContentTypes.TEXT, text: 'Fallback answer after overload.' });
+      client.contentParts.push({
+        type: ContentTypes.TEXT,
+        text: 'Fallback answer after overload.',
+      });
     });
 
     const result = await client.sendCompletion({ text: 'hello' });

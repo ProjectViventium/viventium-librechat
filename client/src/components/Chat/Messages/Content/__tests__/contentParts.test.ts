@@ -259,7 +259,8 @@ describe('filterRenderableContentParts', () => {
       },
       {
         type: ContentTypes.ERROR,
-        [ContentTypes.ERROR]: 'The model provider is temporarily overloaded. Please try again shortly.',
+        [ContentTypes.ERROR]:
+          'The model provider is temporarily overloaded. Please try again shortly.',
         error_class: 'provider_temporarily_unavailable',
       } as unknown as TMessageContentParts,
     ];
@@ -271,7 +272,8 @@ describe('filterRenderableContentParts', () => {
     const parts: TMessageContentParts[] = [
       {
         type: ContentTypes.ERROR,
-        [ContentTypes.ERROR]: 'The model provider is temporarily overloaded. Please try again shortly.',
+        [ContentTypes.ERROR]:
+          'The model provider is temporarily overloaded. Please try again shortly.',
         error_class: 'provider_temporarily_unavailable',
       } as unknown as TMessageContentParts,
     ];

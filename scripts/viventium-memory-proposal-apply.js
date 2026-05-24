@@ -34,7 +34,11 @@ const DEFAULT_LIBRECHAT_YAML = path.resolve(
 );
 
 function sha(value) {
-  return require('crypto').createHash('sha256').update(String(value ?? '')).digest('hex').slice(0, 16);
+  return require('crypto')
+    .createHash('sha256')
+    .update(String(value ?? ''))
+    .digest('hex')
+    .slice(0, 16);
 }
 
 function resolveDefaultMongoUri() {
@@ -111,7 +115,8 @@ function loadMemoryPolicy(configPath) {
   return {
     validKeys: Array.isArray(memory.validKeys) ? memory.validKeys : undefined,
     tokenLimit: Number.isFinite(Number(memory.tokenLimit)) ? Number(memory.tokenLimit) : undefined,
-    keyLimits: memory.keyLimits && typeof memory.keyLimits === 'object' ? memory.keyLimits : undefined,
+    keyLimits:
+      memory.keyLimits && typeof memory.keyLimits === 'object' ? memory.keyLimits : undefined,
     maintenanceThresholdPercent: Number.isFinite(Number(memory.maintenanceThresholdPercent))
       ? Number(memory.maintenanceThresholdPercent)
       : undefined,
@@ -261,11 +266,17 @@ async function applyProposal(options) {
   return applyProposalWithMethods(options, memoryMethods, policy);
 }
 
-async function applyProposalWithMethods(options, memoryMethods, policy = loadMemoryPolicy(options.config)) {
+async function applyProposalWithMethods(
+  options,
+  memoryMethods,
+  policy = loadMemoryPolicy(options.config),
+) {
   const actions = normalizeProposal(options.proposal);
   let before = await memoryMethods.getAllUserMemories(options.userId);
   const proposalKeys = new Set(actions.map((action) => action.key));
-  const duplicatePlans = duplicateMergePlans(before, policy).filter((plan) => proposalKeys.has(plan.key));
+  const duplicatePlans = duplicateMergePlans(before, policy).filter((plan) =>
+    proposalKeys.has(plan.key),
+  );
   const rejectedDuplicatePlan = duplicatePlans.find((plan) => !plan.ok);
   if (rejectedDuplicatePlan) {
     return {
@@ -365,7 +376,13 @@ async function applyProposalWithMethods(options, memoryMethods, policy = loadMem
       key: action.key,
       valueHash: sha(prepared.value),
       tokenCount: prepared.tokenCount,
-      status: options.apply ? (existing ? 'updated' : 'created') : existing ? 'would_update' : 'would_create',
+      status: options.apply
+        ? existing
+          ? 'updated'
+          : 'created'
+        : existing
+          ? 'would_update'
+          : 'would_create',
     });
   }
 
@@ -390,7 +407,9 @@ async function applyProposalWithMethods(options, memoryMethods, policy = loadMem
     mode: options.apply ? 'apply' : 'dry-run',
     reason: rejected.length === 0 ? 'ok' : 'policy_rejected',
     actionCount: actions.length,
-    appliedCount: options.apply ? results.filter((result) => ['created', 'updated', 'deleted'].includes(result.status)).length : 0,
+    appliedCount: options.apply
+      ? results.filter((result) => ['created', 'updated', 'deleted'].includes(result.status)).length
+      : 0,
     dedupeCount: duplicatePlans.length,
     dedupe: dedupeResults,
     actions: results,
@@ -422,7 +441,10 @@ async function main() {
 
 if (require.main === module) {
   main().catch((error) => {
-    const message = String(error?.message || error).replace(/mongodb(?:\+srv)?:\/\/[^\s]+/gi, '<mongo-uri>');
+    const message = String(error?.message || error).replace(
+      /mongodb(?:\+srv)?:\/\/[^\s]+/gi,
+      '<mongo-uri>',
+    );
     console.error(message);
     process.exit(1);
   });

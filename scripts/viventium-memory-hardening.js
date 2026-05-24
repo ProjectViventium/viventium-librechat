@@ -29,10 +29,7 @@ const {
   prepareMemoryValueForWrite,
   runMemoryMaintenance,
 } = require('@librechat/api');
-const {
-  getPromptMetadata,
-  getPromptText,
-} = require('~/server/services/viventium/promptRegistry');
+const { getPromptMetadata, getPromptText } = require('~/server/services/viventium/promptRegistry');
 
 const VALID_ACTIONS = new Set(['set', 'delete', 'noop']);
 const DEFAULT_VALID_KEYS = [
@@ -120,7 +117,8 @@ function listenOnlyEvidenceSourceId(message) {
   if (callSessionId) {
     return `call:${callSessionId}`;
   }
-  const conversationId = typeof message?.conversationId === 'string' ? message.conversationId.trim() : '';
+  const conversationId =
+    typeof message?.conversationId === 'string' ? message.conversationId.trim() : '';
   if (conversationId) {
     return `conversation:${conversationId}`;
   }
@@ -169,7 +167,9 @@ function parseList(value) {
 }
 
 function uniqueList(values) {
-  return Array.from(new Set((values || []).map((value) => String(value || '').trim()).filter(Boolean)));
+  return Array.from(
+    new Set((values || []).map((value) => String(value || '').trim()).filter(Boolean)),
+  );
 }
 
 function globToRegExp(glob) {
@@ -331,7 +331,10 @@ function parseArgs(argv = process.argv.slice(2)) {
     else if (arg.startsWith('--transcripts-dir=')) {
       options.transcriptsDir = arg.slice('--transcripts-dir='.length);
     } else if (arg === '--transcript-ignore-glob') {
-      options.transcriptIgnoreGlobs = uniqueList([...(options.transcriptIgnoreGlobs || []), next()]);
+      options.transcriptIgnoreGlobs = uniqueList([
+        ...(options.transcriptIgnoreGlobs || []),
+        next(),
+      ]);
     } else if (arg.startsWith('--transcript-ignore-glob=')) {
       options.transcriptIgnoreGlobs = uniqueList([
         ...(options.transcriptIgnoreGlobs || []),
@@ -573,10 +576,7 @@ function readLockInfo(lockDir) {
   return {
     pidLabel,
     pidAlive: isLockPidAlive(pidLabel),
-    lockTooOld:
-      Number.isFinite(startedAtMs) &&
-      staleMs > 0 &&
-      Date.now() - startedAtMs > staleMs,
+    lockTooOld: Number.isFinite(startedAtMs) && staleMs > 0 && Date.now() - startedAtMs > staleMs,
   };
 }
 
@@ -900,9 +900,11 @@ function dedupeTranscriptArtifacts(artifacts) {
   const deduped = [];
   for (const artifact of artifacts || []) {
     if (!artifact) continue;
-    const key = [artifact.rawFileId || '', artifact.summaryFileId || '', artifact.contentHash || ''].join(
-      '|',
-    );
+    const key = [
+      artifact.rawFileId || '',
+      artifact.summaryFileId || '',
+      artifact.contentHash || '',
+    ].join('|');
     if (seen.has(key)) continue;
     seen.add(key);
     deduped.push(artifact);
@@ -1286,7 +1288,9 @@ function buildHardenerPrompt({
       : message.isCreatedByUser
         ? 'user'
         : 'assistant',
-    sender: isListenOnlyTranscriptMessage(message) ? listenOnlySpeakerLabel(message) : message.sender,
+    sender: isListenOnlyTranscriptMessage(message)
+      ? listenOnlySpeakerLabel(message)
+      : message.sender,
     text: message.text || '',
   }));
 
@@ -1319,7 +1323,8 @@ function buildHardenerPrompt({
       truncated_bytes: transcript.truncated_bytes,
     })),
   };
-  const liveMemoryInstructions = memoryConfig.instructions || '(no runtime memory instructions found)';
+  const liveMemoryInstructions =
+    memoryConfig.instructions || '(no runtime memory instructions found)';
   const localWorkpackJson = JSON.stringify(workpack);
 
   const fallback = `You are Viventium's Memory Hardener, a batch consolidation reviewer for saved memory.
@@ -1407,7 +1412,10 @@ function sliceReferenceText(text, maxChars) {
   };
 }
 
-function buildTranscriptReferenceMemory(memories = [], maxChars = DEFAULT_TRANSCRIPT_REFERENCE_MEMORY_MAX_CHARS) {
+function buildTranscriptReferenceMemory(
+  memories = [],
+  maxChars = DEFAULT_TRANSCRIPT_REFERENCE_MEMORY_MAX_CHARS,
+) {
   const cap = positiveNumber(maxChars, DEFAULT_TRANSCRIPT_REFERENCE_MEMORY_MAX_CHARS);
   const ordered = memories
     .slice()
@@ -1418,12 +1426,14 @@ function buildTranscriptReferenceMemory(memories = [], maxChars = DEFAULT_TRANSC
   for (const entry of ordered) {
     const key = String(entry.key || '').trim();
     if (!key) continue;
-    const overhead = key.length + JSON.stringify({
-      value: '',
-      tokenCount: entry.tokenCount || 0,
-      updated_at: entry.updated_at || entry.updatedAt || null,
-      truncated_chars: 0,
-    }).length;
+    const overhead =
+      key.length +
+      JSON.stringify({
+        value: '',
+        tokenCount: entry.tokenCount || 0,
+        updated_at: entry.updated_at || entry.updatedAt || null,
+        truncated_chars: 0,
+      }).length;
     const remaining = cap - usedChars - overhead;
     if (remaining <= 0) {
       omittedKeys += 1;
@@ -1736,7 +1746,7 @@ function uniqueModelCandidates(candidates = []) {
 function parseModelFallbackCandidate(raw) {
   const value = String(raw || '').trim();
   if (!value) return null;
-  const match = value.match(/^([^:\/]+)[:\/]([^:\/]+)(?:[:\/]([^:\/]+))?$/);
+  const match = value.match(/^([^:/]+)[:/]([^:/]+)(?:[:/]([^:/]+))?$/);
   if (!match) return null;
   return normalizeModelCandidate(
     {
@@ -1790,7 +1800,8 @@ function withResolvedCandidates(primary, extra = []) {
       ? fallbackCandidates
       : fallbackCandidates.filter((candidate) => allowedProviders.has(candidate.provider));
   const candidates = uniqueModelCandidates([primary, ...extra, ...filteredFallbacks]);
-  const selected = normalizeModelCandidate(primary, primary?.source || 'selected') || candidates[0] || null;
+  const selected =
+    normalizeModelCandidate(primary, primary?.source || 'selected') || candidates[0] || null;
   if (!selected) return { provider: '', model: '', effort: '', candidates: [] };
   return { ...selected, candidates };
 }
@@ -1851,14 +1862,26 @@ function resolveProvider(options = {}) {
 function classifyModelCallFailure(error) {
   const message = error?.message || String(error || '');
   const reason = error?.reason || '';
-  if (reason === 'model_call_timeout' || error?.code === 'ETIMEDOUT' || /timed out/i.test(message)) {
+  if (
+    reason === 'model_call_timeout' ||
+    error?.code === 'ETIMEDOUT' ||
+    /timed out/i.test(message)
+  ) {
     return 'model_call_timeout';
   }
   if (/transcript_summary_empty/i.test(message)) return 'transcript_summary_empty';
-  if (/No supported memory hardening provider|No launch-ready memory hardening provider/i.test(message)) {
+  if (
+    /No supported memory hardening provider|No launch-ready memory hardening provider/i.test(
+      message,
+    )
+  ) {
     return 'model_provider_unconfigured';
   }
-  if (/unauthorized|invalid[_\s-]?api[_\s-]?key|401|permission denied|not authenticated/i.test(message)) {
+  if (
+    /unauthorized|invalid[_\s-]?api[_\s-]?key|401|permission denied|not authenticated/i.test(
+      message,
+    )
+  ) {
     return 'model_auth_error';
   }
   if (/rate limit|too many requests|429/i.test(message)) return 'model_rate_limited';
@@ -1875,7 +1898,11 @@ function classifyVectorPresenceFailure(error) {
   if (error?.code === 'ETIMEDOUT' || /timed out|timeout/i.test(message)) {
     return 'vector_presence_timeout';
   }
-  if (/unauthorized|invalid[_\s-]?api[_\s-]?key|401|permission denied|not authenticated/i.test(message)) {
+  if (
+    /unauthorized|invalid[_\s-]?api[_\s-]?key|401|permission denied|not authenticated/i.test(
+      message,
+    )
+  ) {
     return 'vector_presence_auth_error';
   }
   if (/rate limit|too many requests|429/i.test(message)) return 'vector_presence_rate_limited';
@@ -1885,7 +1912,13 @@ function classifyVectorPresenceFailure(error) {
   return 'vector_presence_check_failed';
 }
 
-function modelAttemptRecord({ candidate, error = null, ok = false, startedAt = null, finishedAt = null }) {
+function modelAttemptRecord({
+  candidate,
+  error = null,
+  ok = false,
+  startedAt = null,
+  finishedAt = null,
+}) {
   return {
     provider: normalizeProvider(candidate?.provider),
     model: String(candidate?.model || ''),
@@ -1905,7 +1938,10 @@ function modelAttemptRecord({ candidate, error = null, ok = false, startedAt = n
 }
 
 function reorderProviderCandidates(providerInfo, selectedCandidate) {
-  const selected = normalizeModelCandidate(selectedCandidate, selectedCandidate?.source || 'selected');
+  const selected = normalizeModelCandidate(
+    selectedCandidate,
+    selectedCandidate?.source || 'selected',
+  );
   if (!selected) return providerInfo;
   const candidates = uniqueModelCandidates([
     selected,
@@ -1996,9 +2032,7 @@ function runCodexStructured({ prompt, model, effort, schema, timeoutMs }) {
         prompt,
         timeoutMs,
       );
-      const finalMessage = fs.existsSync(outputPath)
-        ? fs.readFileSync(outputPath, 'utf8')
-        : stdout;
+      const finalMessage = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, 'utf8') : stdout;
       return parseCliJson(finalMessage || stdout);
     } finally {
       fs.rmSync(outputPath, { force: true });
@@ -2006,7 +2040,12 @@ function runCodexStructured({ prompt, model, effort, schema, timeoutMs }) {
   });
 }
 
-function probeModel(provider, model, effort = defaultEffortForProvider(provider), timeoutMs = null) {
+function probeModel(
+  provider,
+  model,
+  effort = defaultEffortForProvider(provider),
+  timeoutMs = null,
+) {
   const prompt = 'Return JSON only: {"ok":true}';
   const schema = {
     type: 'object',
@@ -2030,20 +2069,26 @@ function probeModel(provider, model, effort = defaultEffortForProvider(provider)
         JSON.stringify(schema),
       ],
       prompt,
-      Number(timeoutMs || process.env.VIVENTIUM_MEMORY_HARDENING_PROBE_TIMEOUT_MS || DEFAULT_MEMORY_HARDENING_PROBE_TIMEOUT_MS),
+      Number(
+        timeoutMs ||
+          process.env.VIVENTIUM_MEMORY_HARDENING_PROBE_TIMEOUT_MS ||
+          DEFAULT_MEMORY_HARDENING_PROBE_TIMEOUT_MS,
+      ),
     );
     return parseCliJson(output).ok === true;
   }
   if (provider === 'openai') {
-    const output = runCodexStructured(
-      {
-        prompt,
-        model,
-        effort,
-        schema,
-        timeoutMs: Number(timeoutMs || process.env.VIVENTIUM_MEMORY_HARDENING_PROBE_TIMEOUT_MS || DEFAULT_MEMORY_HARDENING_PROBE_TIMEOUT_MS),
-      },
-    );
+    const output = runCodexStructured({
+      prompt,
+      model,
+      effort,
+      schema,
+      timeoutMs: Number(
+        timeoutMs ||
+          process.env.VIVENTIUM_MEMORY_HARDENING_PROBE_TIMEOUT_MS ||
+          DEFAULT_MEMORY_HARDENING_PROBE_TIMEOUT_MS,
+      ),
+    });
     return output.ok === true;
   }
   return false;
@@ -2104,7 +2149,12 @@ function invokeStructuredModelWithFallback({
 }) {
   const candidates = uniqueModelCandidates([
     ...(Array.isArray(providerInfo?.candidates) ? providerInfo.candidates : []),
-    { provider: provider || providerInfo?.provider, model: model || providerInfo?.model, effort: effort || providerInfo?.effort, source: 'selected' },
+    {
+      provider: provider || providerInfo?.provider,
+      model: model || providerInfo?.model,
+      effort: effort || providerInfo?.effort,
+      source: 'selected',
+    },
   ]);
   const attempts = [];
   let lastError = null;
@@ -2140,7 +2190,9 @@ function invokeStructuredModelWithFallback({
       );
     }
   }
-  const error = new Error(`All memory hardening model candidates failed: ${lastError?.message || 'unknown'}`);
+  const error = new Error(
+    `All memory hardening model candidates failed: ${lastError?.message || 'unknown'}`,
+  );
   error.reason = classifyModelCallFailure(lastError);
   error.attempts = attempts;
   throw error;
@@ -2428,7 +2480,9 @@ function transcriptEvidenceGate({ key, evidence, options, now }) {
   }
 
   const conversationEvidence = evidence.filter((item) => item.source === 'conversation');
-  const validUserConversationMessageIds = normalizeStringSet(options.validUserConversationMessageIds);
+  const validUserConversationMessageIds = normalizeStringSet(
+    options.validUserConversationMessageIds,
+  );
   const userConversationEvidence = validUserConversationMessageIds
     ? conversationEvidence.filter((item) => validUserConversationMessageIds.has(item.messageId))
     : [];
@@ -2497,7 +2551,9 @@ function listenOnlyEvidenceGate({ key, evidence, options, now }) {
   const nonListenOnlyConversationEvidence = conversationEvidence.filter(
     (item) => !listenOnlyMessageIds.has(item.messageId),
   );
-  const validUserConversationMessageIds = normalizeStringSet(options.validUserConversationMessageIds);
+  const validUserConversationMessageIds = normalizeStringSet(
+    options.validUserConversationMessageIds,
+  );
   const nonListenOnlyUserConversationEvidence = validUserConversationMessageIds
     ? nonListenOnlyConversationEvidence.filter((item) =>
         validUserConversationMessageIds.has(item.messageId),
@@ -2833,11 +2889,11 @@ async function upsertTranscriptVectorFile({
     meetingTranscriptOneLineSummary: oneLineSummary || null,
     meetingTranscriptMeetingDatetime: meetingDatetime || null,
     meetingTranscriptParticipants: sanitizeParticipantList(participants),
-    meetingTranscriptSummaryExcerpt:
-      kind === 'summary' ? sanitizeShortText(text, 1200) : null,
+    meetingTranscriptSummaryExcerpt: kind === 'summary' ? sanitizeShortText(text, 1200) : null,
     meetingTranscriptInventoryText:
       kind === 'inventory'
-        ? sliceTranscriptText(String(inventoryText || indexedText), TRANSCRIPT_INVENTORY_MAX_CHARS).text
+        ? sliceTranscriptText(String(inventoryText || indexedText), TRANSCRIPT_INVENTORY_MAX_CHARS)
+            .text
         : null,
   };
   const existing = await File.findOne({ user: userId, file_id: fileId })
@@ -2845,8 +2901,7 @@ async function upsertTranscriptVectorFile({
     .lean();
   if (existing?.metadata?.meetingTranscriptUploadedDigest === digest) {
     const vectorPresent =
-      existing.embedded !== false &&
-      (await vectorDocumentExists({ user: { id: userId } }, fileId));
+      existing.embedded !== false && (await vectorDocumentExists({ user: { id: userId } }, fileId));
     if (!vectorPresent) {
       await File.findOneAndUpdate(
         { user: userId, file_id: fileId },
@@ -3012,7 +3067,9 @@ function buildTranscriptInventoryText({ sourcePathHash, summaryFiles, transcript
   ].filter((line) => line !== null);
 
   if (rows.length === 0) {
-    lines.push('- No processed transcript summaries are currently available for this source folder.');
+    lines.push(
+      '- No processed transcript summaries are currently available for this source folder.',
+    );
   }
 
   let omitted = 0;
@@ -3037,8 +3094,7 @@ function buildTranscriptInventoryText({ sourcePathHash, summaryFiles, transcript
     ) {
       lines.pop();
       omitted += 1;
-      marker[1] =
-        `Inventory truncated: ${omitted} older transcript entries were omitted from this compact table of contents because it exceeded the inventory size limit.`;
+      marker[1] = `Inventory truncated: ${omitted} older transcript entries were omitted from this compact table of contents because it exceeded the inventory size limit.`;
     }
     lines.push(...marker);
   }
@@ -3070,7 +3126,11 @@ async function deleteStaleTranscriptInventoryFiles({ userId, sourcePathHash }) {
   return deleted;
 }
 
-async function upsertTranscriptInventoryVectorFile({ userId, sourcePathHash, transcriptIndex = null }) {
+async function upsertTranscriptInventoryVectorFile({
+  userId,
+  sourcePathHash,
+  transcriptIndex = null,
+}) {
   if (!userId || !sourcePathHash) return { uploaded: 0, deleted: 0, file_id: null };
   const { File } = require('~/db/models');
   const deleted = await deleteStaleTranscriptInventoryFiles({ userId, sourcePathHash });
@@ -3083,7 +3143,11 @@ async function upsertTranscriptInventoryVectorFile({ userId, sourcePathHash, tra
   })
     .select('file_id filename metadata')
     .lean();
-  const inventoryText = buildTranscriptInventoryText({ sourcePathHash, summaryFiles, transcriptIndex });
+  const inventoryText = buildTranscriptInventoryText({
+    sourcePathHash,
+    summaryFiles,
+    transcriptIndex,
+  });
   const fileId = stableTranscriptInventoryFileId(userId, sourcePathHash);
   const uploaded = await upsertTranscriptVectorFile({
     userId,
@@ -3119,7 +3183,8 @@ async function applyTranscriptVectorLifecycle({ userProposal }) {
   const uploadSummary = transcriptRagModeUsesSummary(ragMode);
   const sourcePathHash =
     userProposal.transcriptSourcePathHash ||
-    (userProposal.transcripts || []).find((transcript) => transcript?.sourcePathHash)?.sourcePathHash ||
+    (userProposal.transcripts || []).find((transcript) => transcript?.sourcePathHash)
+      ?.sourcePathHash ||
     userProposal.transcriptIndex?.sourcePathHash ||
     null;
   let deleted = 0;
@@ -3400,7 +3465,8 @@ async function findTranscriptVectorRepairTargets({ db, user, options }) {
       )
       .map((contentHash) => contentHash.slice(0, 32)),
   );
-  const indexMatchesCurrentSource = !index?.sourcePathHash || index.sourcePathHash === sourcePathHash;
+  const indexMatchesCurrentSource =
+    !index?.sourcePathHash || index.sourcePathHash === sourcePathHash;
   const hasCurrentProcessedIndex = indexMatchesCurrentSource && processedPrefixes.size > 0;
   if (indexMatchesCurrentSource) {
     for (const [contentHash, processed] of Object.entries(processedContent)) {
@@ -3413,10 +3479,14 @@ async function findTranscriptVectorRepairTargets({ db, user, options }) {
       }
       const fileIds = [];
       if (kinds.includes('raw')) {
-        fileIds.push(processed.rawFileId || stableFileId('meeting_transcript', user._id, contentHash));
+        fileIds.push(
+          processed.rawFileId || stableFileId('meeting_transcript', user._id, contentHash),
+        );
       }
       if (kinds.includes('summary')) {
-        fileIds.push(processed.summaryFileId || stableFileId('meeting_summary', user._id, contentHash));
+        fileIds.push(
+          processed.summaryFileId || stableFileId('meeting_summary', user._id, contentHash),
+        );
       }
       for (const fileId of fileIds.filter(Boolean)) {
         const exists = await safeVectorDocumentExists(fileId);
@@ -3540,9 +3610,7 @@ async function buildUserProposal({ db, methods, user, options, memoryConfig, now
       : [];
   const messages = shouldFetchHardenerMessages ? recentMessages : [];
   const memories =
-    meetingTranscripts.length > 0 ||
-    messages.length > 0 ||
-    transcriptScan.staleArtifacts.length > 0
+    meetingTranscripts.length > 0 || messages.length > 0 || transcriptScan.staleArtifacts.length > 0
       ? await methods.getAllUserMemories(user._id)
       : [];
   const transcriptReferenceContext =
@@ -3733,15 +3801,15 @@ async function buildUserProposal({ db, methods, user, options, memoryConfig, now
         telemetry,
         transcriptTelemetry: transcriptScan.telemetry,
       }),
-        privateProposal: {
-          userIdHash: userHash(user._id),
-          userId,
-          provider: activeProviderInfo.provider,
-          model: activeProviderInfo.model,
-          effort: activeProviderInfo.effort,
-          accepted: [],
-          rejected: [],
-          transcripts: [],
+      privateProposal: {
+        userIdHash: userHash(user._id),
+        userId,
+        provider: activeProviderInfo.provider,
+        model: activeProviderInfo.model,
+        effort: activeProviderInfo.effort,
+        accepted: [],
+        rejected: [],
+        transcripts: [],
         staleTranscriptArtifacts: transcriptScan.staleArtifacts,
         transcriptRagMode: normalizeTranscriptRagMode(options.transcriptRagMode),
         transcriptIndexPath: transcriptScan.indexPath,
@@ -3766,11 +3834,7 @@ async function buildUserProposal({ db, methods, user, options, memoryConfig, now
       normalizeTranscriptRagMode(options.transcriptRagMode),
     )
       ? transcriptPayloads
-          .filter(
-            (transcript) =>
-              transcript.artifactId &&
-              !String(transcript.summary || '').trim(),
-          )
+          .filter((transcript) => transcript.artifactId && !String(transcript.summary || '').trim())
           .map((transcript) => transcript.artifactId)
       : [];
     if (
@@ -3898,10 +3962,7 @@ async function buildUserProposal({ db, methods, user, options, memoryConfig, now
       listenOnlyConversationSourceIds: new Map(
         promptSelection.messages
           .filter((message) => isListenOnlyTranscriptMessage(message))
-          .map((message) => [
-            String(message.messageId || ''),
-            listenOnlyEvidenceSourceId(message),
-          ])
+          .map((message) => [String(message.messageId || ''), listenOnlyEvidenceSourceId(message)])
           .filter(([messageId, sourceId]) => messageId && sourceId),
       ),
       validTranscriptArtifactIds: new Set(
@@ -4140,7 +4201,8 @@ function classifyRunFailure(error) {
   if (modelReason && modelReason !== 'unknown') return modelReason;
   if (error?.code === 'ETIMEDOUT' || /timed out/i.test(message)) return 'model_call_timeout';
   if (/Missing Mongo URI|MONGO_URI/i.test(message)) return 'mongo_uri_missing';
-  if (/No launch-ready memory hardening provider/i.test(message)) return 'model_provider_unconfigured';
+  if (/No launch-ready memory hardening provider/i.test(message))
+    return 'model_provider_unconfigured';
   if (/Model probe failed/i.test(message)) return 'model_probe_failed';
   if (/transcript_vector_upload_failed/i.test(message)) return 'transcript_vector_upload_failed';
   if (/transcript_vector_delete_failed/i.test(message)) return 'transcript_vector_delete_failed';
@@ -4258,9 +4320,7 @@ async function runHardening(options) {
       modelProbe = probeProviderCandidates(providerInfo);
       providerInfo = modelProbe.providerInfo || providerInfo;
       if (!modelProbe.ok && modelProbe.required) {
-        const error = new Error(
-          `Model probe failed for configured memory hardening candidates`,
-        );
+        const error = new Error(`Model probe failed for configured memory hardening candidates`);
         error.reason = 'model_probe_failed';
         error.attempts = modelProbe.attempts;
         throw error;
@@ -4357,7 +4417,8 @@ async function runHardening(options) {
         transcript_max_chars_per_file: effectiveOptions.transcriptMaxCharsPerFile,
         transcript_summary_max_chars: effectiveOptions.transcriptSummaryMaxChars,
         transcript_reference_memory_max_chars: effectiveOptions.transcriptReferenceMemoryMaxChars,
-        transcript_reference_messages_max_chars: effectiveOptions.transcriptReferenceMessagesMaxChars,
+        transcript_reference_messages_max_chars:
+          effectiveOptions.transcriptReferenceMessagesMaxChars,
         transcript_rag_mode: normalizeTranscriptRagMode(effectiveOptions.transcriptRagMode),
         memory_instructions_present: Boolean(memoryConfig.instructions),
         memory_instructions_chars: String(memoryConfig.instructions || '').length,
@@ -4508,7 +4569,9 @@ function status(options) {
         })
         .sort()
     : [];
-  const runs = runDirs.filter((name) => fs.existsSync(path.join(paths.runsDir, name, 'summary.json')));
+  const runs = runDirs.filter((name) =>
+    fs.existsSync(path.join(paths.runsDir, name, 'summary.json')),
+  );
   const failedRuns = runs
     .map((name) => readJsonIfExists(path.join(paths.runsDir, name, 'summary.json'), null))
     .filter((run) => run?.status === 'failed');

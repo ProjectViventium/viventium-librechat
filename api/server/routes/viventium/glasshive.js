@@ -145,19 +145,25 @@ function isSafeGlassHiveActionUrl(value = '') {
 
 function protectSafeGlassHiveLinks(text = '') {
   const links = [];
-  const protectedText = String(text || '').replace(SAFE_GLASSHIVE_LINK_PATTERN, (match, _label, url) => {
-    if (!isSafeGlassHiveActionUrl(url)) {
-      return match;
-    }
-    const token = `__VIVENTIUM_SAFE_GLASSHIVE_LINK_${links.length}__`;
-    links.push({ token, value: match });
-    return token;
-  });
+  const protectedText = String(text || '').replace(
+    SAFE_GLASSHIVE_LINK_PATTERN,
+    (match, _label, url) => {
+      if (!isSafeGlassHiveActionUrl(url)) {
+        return match;
+      }
+      const token = `__VIVENTIUM_SAFE_GLASSHIVE_LINK_${links.length}__`;
+      links.push({ token, value: match });
+      return token;
+    },
+  );
   return { protectedText, links };
 }
 
 function restoreSafeGlassHiveLinks(text = '', links = []) {
-  return links.reduce((current, { token, value }) => current.replace(token, value), String(text || ''));
+  return links.reduce(
+    (current, { token, value }) => current.replace(token, value),
+    String(text || ''),
+  );
 }
 
 function sanitizeCallbackMessage(value, { maxLength = MAX_CALLBACK_TEXT_LENGTH } = {}) {

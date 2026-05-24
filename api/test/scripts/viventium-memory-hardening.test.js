@@ -148,7 +148,8 @@ describe('viventium-memory-hardening', () => {
         memories: [
           {
             key: 'context',
-            value: 'Test User recently corrected that Project Atlas and Project Boreal are separate.',
+            value:
+              'Test User recently corrected that Project Atlas and Project Boreal are separate.',
             tokenCount: 12,
           },
         ],
@@ -760,7 +761,8 @@ describe('viventium-memory-hardening', () => {
           {
             key: 'core',
             action: 'set',
-            value: 'Assistant restatement must not corroborate a transcript-derived identity claim.',
+            value:
+              'Assistant restatement must not corroborate a transcript-derived identity claim.',
             rationale: 'bad',
             evidence: [
               singleTranscript,
@@ -2590,7 +2592,9 @@ describe('viventium-memory-hardening', () => {
       path.join(os.tmpdir(), 'viventium-transcript-vector-error-state-'),
     );
     process.env.RAG_API_URL = 'http://rag.example.test';
-    const vectorDocumentExists = jest.fn().mockRejectedValue(new Error('connect ECONNREFUSED /Users/private/path'));
+    const vectorDocumentExists = jest
+      .fn()
+      .mockRejectedValue(new Error('connect ECONNREFUSED /Users/private/path'));
     jest.doMock('~/server/services/Files/VectorDB/crud', () => ({
       vectorDocumentExists,
     }));
@@ -3191,7 +3195,9 @@ describe('viventium-memory-hardening', () => {
   });
 
   test('model fallback configuration is explicit, ordered, and redacted in attempts', () => {
-    const parsed = parseModelFallbacks('openai:gpt-5.5:high; openai:gpt-5.4:high, anthropic:claude-opus-4-7:xhigh');
+    const parsed = parseModelFallbacks(
+      'openai:gpt-5.5:high; openai:gpt-5.4:high, anthropic:claude-opus-4-7:xhigh',
+    );
     expect(parsed).toEqual([
       expect.objectContaining({ provider: 'openai', model: 'gpt-5.5', effort: 'high' }),
       expect.objectContaining({ provider: 'openai', model: 'gpt-5.4', effort: 'high' }),
@@ -3199,12 +3205,12 @@ describe('viventium-memory-hardening', () => {
     ]);
     expect(classifyModelCallFailure(new Error('529 overloaded'))).toBe('model_overloaded');
     expect(classifyModelCallFailure(new Error('401 invalid_api_key'))).toBe('model_auth_error');
-    expect(classifyModelCallFailure(Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }))).toBe(
-      'model_call_timeout',
-    );
-    expect(classifyVectorPresenceFailure(Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }))).toBe(
-      'vector_presence_timeout',
-    );
+    expect(
+      classifyModelCallFailure(Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' })),
+    ).toBe('model_call_timeout');
+    expect(
+      classifyVectorPresenceFailure(Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' })),
+    ).toBe('vector_presence_timeout');
   });
 
   test('structured model fallback tries GPT 5.5 high before GPT 5.4 high when first candidate fails', () => {

@@ -1048,10 +1048,12 @@ const backgroundCortexActivationPolicySchema = z
   })
   .passthrough();
 
-const backgroundCorticesSchema = z.object({
-  activation_format: backgroundCortexActivationFormatSchema.optional(),
-  activation_policy: backgroundCortexActivationPolicySchema.optional(),
-}).passthrough();
+const backgroundCorticesSchema = z
+  .object({
+    activation_format: backgroundCortexActivationFormatSchema.optional(),
+    activation_policy: backgroundCortexActivationPolicySchema.optional(),
+  })
+  .passthrough();
 
 const viventiumNoResponseSchema = z
   .object({

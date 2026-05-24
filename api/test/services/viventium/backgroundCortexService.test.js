@@ -46,6 +46,17 @@ jest.mock('@librechat/api', () => ({
   })),
   createRun: jest.fn(),
   checkAccess: jest.fn(async () => true),
+  loadMemoryReadContext: jest.fn(async ({ userId, memoryMethods }) => {
+    const formatted = await memoryMethods.getFormattedMemories({ userId });
+    return {
+      text: formatted?.withoutKeys || formatted?.withKeys || '',
+      totalTokens: formatted?.totalTokens || 0,
+      includedKeys: [],
+      omittedKeys: [],
+      duplicateKeys: [],
+      cacheHit: false,
+    };
+  }),
   memoryInstructions: 'The system automatically stores important user information.',
   extractFileContext: jest.fn(async ({ attachments }) => {
     const first = Array.isArray(attachments) ? attachments.find((f) => f && f.text) : null;

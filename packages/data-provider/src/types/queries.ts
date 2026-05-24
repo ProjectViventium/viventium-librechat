@@ -132,6 +132,12 @@ export type ToolCallResults = a.ToolCallResult[];
 
 /* Memories */
 export type TUserMemory = {
+  /* === VIVENTIUM START ===
+   * Feature: Duplicate memory-key tolerance
+   * Purpose: Existing runtimes can contain duplicate keys until the dedupe migration is applied, so
+   * the client needs a stable document id for rendering and optimistic updates.
+   * === VIVENTIUM END === */
+  _id?: string;
   key: string;
   value: string;
   updated_at: string;

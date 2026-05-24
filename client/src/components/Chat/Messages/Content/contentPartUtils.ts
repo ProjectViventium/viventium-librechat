@@ -180,6 +180,12 @@ function isRoutineGlassHiveDelegatePart(part: TMessageContentParts | undefined):
 
 const RUNTIME_HOLD_TEXT_FLAG = 'viventium_runtime_hold';
 const LATE_STREAM_TERMINATION_FLAG = 'viventium_late_stream_termination';
+const RECOVERABLE_PROVIDER_ERROR_CLASSES = new Set([
+  'late_stream_termination',
+  'provider_rate_limited',
+  'provider_temporarily_unavailable',
+  'recoverable_provider_error',
+]);
 
 function textPartValue(part: TMessageContentParts | undefined): string {
   if (!part || part.type !== ContentTypes.TEXT) {
@@ -224,6 +230,22 @@ function isLateStreamTerminationErrorPart(part: TMessageContentParts | undefined
   );
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Recovered provider-error card rendering.
+ * Purpose: When a provider failure is already represented by visible assistant text, the chat UI
+ * should not render a second fatal error card in the same assistant message.
+ * === VIVENTIUM END === */
+function isStructuredRecoverableProviderErrorPart(part: TMessageContentParts | undefined): boolean {
+  if (!part || part.type !== ContentTypes.ERROR) {
+    return false;
+  }
+  const record = part as unknown as Record<string, unknown>;
+  const errorClass = String(record.error_class || record.errorClass || record.code || '')
+    .trim()
+    .toLowerCase();
+  return RECOVERABLE_PROVIDER_ERROR_CLASSES.has(errorClass);
+}
+
 function hasVisibleAssistantTextPart(content: Array<TMessageContentParts | undefined>): boolean {
   return content.some((part) => {
     if (!part || part.type !== ContentTypes.TEXT || part.tool_call_ids != null) {
@@ -255,6 +277,26 @@ function hideLateTerminationErrorAfterText(
   let changed = false;
   const filtered = content.filter((part) => {
     const keep = !isLateStreamTerminationErrorPart(part);
+    changed ||= !keep;
+    return keep;
+  });
+  return changed ? filtered : content;
+}
+
+function hideRecoverableProviderErrorsAfterText(
+  content: Array<TMessageContentParts | undefined>,
+  options: FilterRenderableContentPartsOptions = {},
+): Array<TMessageContentParts | undefined> {
+  if (
+    !hasVisibleAssistantTextPart(content) &&
+    !hasVisibleFallbackAssistantText(options.visibleFallbackText)
+  ) {
+    return content;
+  }
+
+  let changed = false;
+  const filtered = content.filter((part) => {
+    const keep = !isStructuredRecoverableProviderErrorPart(part);
     changed ||= !keep;
     return keep;
   });
@@ -372,7 +414,13 @@ export function filterRenderableContentParts(
 
   const deduped = removedAny ? filtered : normalizedContent;
   const withoutLateTerminationError = hideLateTerminationErrorAfterText(deduped, options);
-  const withoutRuntimeHoldNoResponse = hideRuntimeHoldNoResponseParts(withoutLateTerminationError);
+  const withoutRecoverableProviderErrors = hideRecoverableProviderErrorsAfterText(
+    withoutLateTerminationError,
+    options,
+  );
+  const withoutRuntimeHoldNoResponse = hideRuntimeHoldNoResponseParts(
+    withoutRecoverableProviderErrors,
+  );
   const withoutRoutineGlassHiveDelegate = hideRoutineGlassHiveDelegateParts(
     withoutRuntimeHoldNoResponse,
   );

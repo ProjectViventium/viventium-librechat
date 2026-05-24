@@ -1,5 +1,5 @@
 const { Providers } = require('@librechat/agents');
-const { Constants, ContentTypes, EModelEndpoint } = require('librechat-data-provider');
+const { Constants, ContentTypes, EModelEndpoint, Tools } = require('librechat-data-provider');
 const db = require('~/models');
 const AgentClient = require('./client');
 
@@ -17,6 +17,10 @@ jest.mock('@librechat/api', () => ({
   initializeAgent: jest.fn(),
   createMemoryProcessor: jest.fn(),
   loadMemorySnapshot: jest.fn(),
+  loadMemoryReadContext: jest.fn(),
+  clearMemoryReadContextCache: jest.fn(),
+  markMemoryWriterFailure: jest.fn(),
+  getMemoryWriterHealthGate: jest.fn(() => ({ blocked: false })),
   GenerationJobManager: {
     emitChunk: jest.fn(),
     setGraph: jest.fn(),
@@ -144,10 +148,24 @@ describe('late completion error content parts', () => {
     ).toBe(true);
   });
 
-  test('keeps visible errors when there is no assistant text or the error is not stream termination', () => {
+  test('suppresses local retrieval tail timeouts after visible assistant text', () => {
+    const contentParts = [{ type: ContentTypes.TEXT, text: 'Complete visible answer.' }];
+    const err = new Error('timeout of 8000ms exceeded');
+    err.code = 'ECONNABORTED';
+
+    expect(AgentClient.shouldSuppressCompletionErrorContentPart(contentParts, err)).toBe(true);
+  });
+
+  test('keeps visible errors when there is no assistant text or the error is not suppressible', () => {
     expect(AgentClient.shouldSuppressCompletionErrorContentPart([], new Error('terminated'))).toBe(
       false,
     );
+    expect(
+      AgentClient.shouldSuppressCompletionErrorContentPart(
+        [{ type: ContentTypes.TEXT, text: 'Final answer.' }],
+        new Error('provider stream ended after final text'),
+      ),
+    ).toBe(false);
     expect(
       AgentClient.shouldSuppressCompletionErrorContentPart(
         [{ type: ContentTypes.TEXT, text: 'Partial answer.' }],
@@ -161,6 +179,14 @@ describe('late completion error content parts', () => {
       [ContentTypes.ERROR]:
         'The model provider rate-limited this request. Please try again shortly.',
       error_class: 'provider_rate_limited',
+    });
+    const overloaded = new Error('Our servers are currently overloaded. Please try again later.');
+    overloaded.code = 'server_is_overloaded';
+    expect(AgentClient.createCompletionErrorContentPart(overloaded)).toEqual({
+      type: ContentTypes.ERROR,
+      [ContentTypes.ERROR]:
+        'The model provider is temporarily overloaded. Please try again shortly.',
+      error_class: 'provider_temporarily_unavailable',
     });
   });
 
@@ -179,10 +205,141 @@ describe('late completion error content parts', () => {
     expect(result).toBe('suppressed');
     expect(contentParts).toEqual([textPart]);
     expect(log.warn).toHaveBeenCalledWith(
-      expect.stringContaining('Late stream termination'),
+      expect.stringContaining('suppressing visible error content part'),
       expect.objectContaining({ class: 'late_stream_termination' }),
     );
     expect(log.error).not.toHaveBeenCalled();
+  });
+
+  test('does not mutate content parts for local retrieval tail timeouts after assistant text', () => {
+    const textPart = { type: ContentTypes.TEXT, text: 'Final answer.' };
+    const contentParts = [textPart];
+    const log = { warn: jest.fn(), error: jest.fn() };
+    const err = new Error('timeout of 8000ms exceeded');
+    err.code = 'ECONNABORTED';
+    err.toolName = 'file_search';
+
+    const result = AgentClient.handleCompletionErrorContentPart({
+      contentParts,
+      err,
+      abortController: { signal: { aborted: false } },
+      log,
+    });
+
+    expect(result).toBe('suppressed');
+    expect(contentParts).toEqual([textPart]);
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining('suppressing visible error content part'),
+      expect.objectContaining({ class: 'local_retrieval_timeout' }),
+    );
+    expect(log.error).not.toHaveBeenCalled();
+  });
+
+  test('appends visible error content for generic post-text completion errors', () => {
+    const textPart = { type: ContentTypes.TEXT, text: 'Partial answer.' };
+    const contentParts = [textPart];
+    const log = { warn: jest.fn(), error: jest.fn() };
+
+    const result = AgentClient.handleCompletionErrorContentPart({
+      contentParts,
+      err: new Error('unexpected post-processing failure'),
+      abortController: { signal: { aborted: false } },
+      log,
+    });
+
+    expect(result).toBe('pushed');
+    expect(contentParts).toEqual([
+      textPart,
+      {
+        type: ContentTypes.ERROR,
+        [ContentTypes.ERROR]: 'The model provider could not complete this request.',
+        error_class: 'completion_error',
+      },
+    ]);
+    expect(log.warn).not.toHaveBeenCalled();
+    expect(log.error).toHaveBeenCalled();
+  });
+
+  test('suppresses post-stream finalization errors after completed assistant text', () => {
+    const textPart = { type: ContentTypes.TEXT, text: 'Complete answer.' };
+    const contentParts = [textPart];
+    const log = { warn: jest.fn(), error: jest.fn() };
+    const err = new Error('unexpected post-processing failure');
+    err.viventiumCompletionPhase = 'post_stream_finalization';
+
+    const result = AgentClient.handleCompletionErrorContentPart({
+      contentParts,
+      err,
+      abortController: { signal: { aborted: false } },
+      log,
+    });
+
+    expect(result).toBe('suppressed');
+    expect(contentParts).toEqual([textPart]);
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining('suppressing visible error content part'),
+      expect.objectContaining({ class: 'post_stream_finalization' }),
+    );
+    expect(log.error).not.toHaveBeenCalled();
+  });
+
+  test('suppresses intentional tool-cortex deferred-response errors after runtime hold text', () => {
+    const holdPart = {
+      type: ContentTypes.TEXT,
+      text: 'Checking now.',
+      viventium_runtime_hold: true,
+    };
+    const contentParts = [holdPart];
+    const log = { warn: jest.fn(), error: jest.fn() };
+    const err = new Error('Run not initialized because main response was deferred');
+    err.viventiumCompletionPhase = 'tool_cortex_deferred_main_response';
+
+    expect(AgentClient.hasRuntimeHoldAssistantText(contentParts)).toBe(true);
+    expect(AgentClient.shouldSuppressCompletionErrorContentPart(contentParts, err)).toBe(true);
+
+    const result = AgentClient.handleCompletionErrorContentPart({
+      contentParts,
+      err,
+      abortController: { signal: { aborted: false } },
+      log,
+    });
+
+    expect(result).toBe('suppressed');
+    expect(contentParts).toEqual([holdPart]);
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining('suppressing visible error content part'),
+      expect.objectContaining({ class: 'tool_cortex_deferred_main_response' }),
+    );
+    expect(log.error).not.toHaveBeenCalled();
+  });
+
+  test('does not hide generic completion errors merely because runtime hold text exists', () => {
+    const holdPart = {
+      type: ContentTypes.TEXT,
+      text: 'Checking now.',
+      viventium_runtime_hold: true,
+    };
+    const contentParts = [holdPart];
+    const log = { warn: jest.fn(), error: jest.fn() };
+
+    const result = AgentClient.handleCompletionErrorContentPart({
+      contentParts,
+      err: new Error('unexpected controller failure'),
+      abortController: { signal: { aborted: false } },
+      log,
+    });
+
+    expect(result).toBe('pushed');
+    expect(contentParts).toEqual([
+      holdPart,
+      {
+        type: ContentTypes.ERROR,
+        [ContentTypes.ERROR]: 'The model provider could not complete this request.',
+        error_class: 'completion_error',
+      },
+    ]);
+    expect(log.warn).not.toHaveBeenCalled();
+    expect(log.error).toHaveBeenCalled();
   });
 
   test('appends visible error content when no assistant text exists', () => {
@@ -1733,6 +1890,7 @@ describe('AgentClient - titleConvo', () => {
 
       client = new AgentClient(mockOptions);
       client.processMemory = mockProcessMemory;
+      client.initializeMemoryWriter = jest.fn().mockResolvedValue({ ok: true });
       client.conversationId = 'convo-123';
       client.responseMessageId = 'response-123';
     });
@@ -2031,6 +2189,80 @@ describe('AgentClient - titleConvo', () => {
 
       expect(result).toBeUndefined();
       expect(mockProcessMemory).not.toHaveBeenCalled();
+    });
+
+    it('clears only the captured user cache when the client options are disposed mid-writer', async () => {
+      const { HumanMessage } = require('@langchain/core/messages');
+      const mockClearMemoryReadContextCache = require('@librechat/api').clearMemoryReadContextCache;
+      client.initializeMemoryWriter = jest.fn().mockImplementation(async () => {
+        client.options = null;
+        return { ok: true };
+      });
+
+      await client.runMemory([new HumanMessage('Remember the release note.')], {
+        req: mockReq,
+        res: mockRes,
+        userId: 'captured-user',
+        appConfig: mockReq.config,
+        agent: mockAgent,
+      });
+
+      expect(mockProcessMemory).toHaveBeenCalledTimes(1);
+      expect(mockClearMemoryReadContextCache).toHaveBeenCalledWith('captured-user');
+      expect(mockClearMemoryReadContextCache).not.toHaveBeenCalledWith(undefined);
+    });
+
+    it('uses the captured artifact sink when detached writer completes after client cleanup', async () => {
+      const { HumanMessage } = require('@langchain/core/messages');
+      const artifactPromises = [];
+      const attachment = { type: Tools.memory, messageId: 'response-123' };
+      client.artifactPromises = artifactPromises;
+      client.runMemory = jest.fn().mockImplementation(async (_messages, writerContext) => {
+        expect(writerContext.userId).toBe('user-123');
+        expect(writerContext.appConfig).toBe(mockReq.config);
+        expect(writerContext.agent).toBe(mockAgent);
+        client.artifactPromises = null;
+        client.options = null;
+        return [attachment];
+      });
+
+      const promise = client.scheduleMemoryWriter([new HumanMessage('Remember the test.')]);
+      await promise;
+
+      expect(artifactPromises).toContain(attachment);
+      expect(require('@librechat/api').clearMemoryReadContextCache).toHaveBeenCalledWith(
+        'user-123',
+      );
+    });
+
+    it('does not clear the global memory read cache when detached writer lacks a user id', async () => {
+      const { HumanMessage } = require('@langchain/core/messages');
+      const mockClearMemoryReadContextCache = require('@librechat/api').clearMemoryReadContextCache;
+      client.options = {
+        ...client.options,
+        req: {
+          ...mockReq,
+          user: {},
+        },
+      };
+      client.runMemory = jest.fn().mockResolvedValue(undefined);
+
+      await client.scheduleMemoryWriter([new HumanMessage('Remember the test.')]);
+
+      expect(mockClearMemoryReadContextCache).not.toHaveBeenCalled();
+    });
+
+    it('does not schedule duplicate detached memory writers for the same client lifecycle', async () => {
+      const { HumanMessage } = require('@langchain/core/messages');
+      client.runMemory = jest.fn().mockResolvedValue(undefined);
+
+      const firstPromise = client.scheduleMemoryWriter([new HumanMessage('Remember this once.')]);
+      const secondPromise = client.scheduleMemoryWriter([new HumanMessage('Remember this once.')]);
+
+      expect(secondPromise).toBe(firstPromise);
+      await firstPromise;
+      expect(client.runMemory).toHaveBeenCalledTimes(1);
+      expect(client.memoryWriterPromise).toBeNull();
     });
   });
 
@@ -2531,7 +2763,7 @@ describe('AgentClient - titleConvo', () => {
     let mockLoadAgent;
     let mockInitializeAgent;
     let mockCreateMemoryProcessor;
-    let mockLoadMemorySnapshot;
+    let mockLoadMemoryReadContext;
 
     beforeEach(() => {
       jest.clearAllMocks();
@@ -2580,13 +2812,37 @@ describe('AgentClient - titleConvo', () => {
       mockLoadAgent = require('~/models/Agent').loadAgent;
       mockInitializeAgent = require('@librechat/api').initializeAgent;
       mockCreateMemoryProcessor = require('@librechat/api').createMemoryProcessor;
-      mockLoadMemorySnapshot = require('@librechat/api').loadMemorySnapshot;
-      mockLoadMemorySnapshot.mockResolvedValue({
-        withKeys: 'stored memories with keys',
-        withoutKeys: 'stored memories',
+      mockLoadMemoryReadContext = require('@librechat/api').loadMemoryReadContext;
+      mockLoadMemoryReadContext.mockResolvedValue({
+        text: 'stored memories',
         totalTokens: 12,
-        memoryTokenMap: { core: 12 },
+        includedKeys: ['core'],
+        omittedKeys: [],
+        duplicateKeys: [],
+        cacheHit: false,
       });
+    });
+
+    it('should read memory without initializing the writer on the chat critical path', async () => {
+      mockCheckAccess.mockResolvedValue(true);
+
+      client = new AgentClient(mockOptions);
+      client.conversationId = 'convo-123';
+      client.responseMessageId = 'response-123';
+
+      const result = await client.useMemory();
+
+      expect(result).toBe('stored memories');
+      expect(mockLoadMemoryReadContext).toHaveBeenCalledWith(
+        expect.objectContaining({
+          userId: 'user-123',
+          config: expect.objectContaining({
+            validKeys: mockReq.config.memory.validKeys,
+          }),
+        }),
+      );
+      expect(mockInitializeAgent).not.toHaveBeenCalled();
+      expect(mockCreateMemoryProcessor).not.toHaveBeenCalled();
     });
 
     it('should use current agent when memory config agent.id matches current agent id', async () => {
@@ -2602,6 +2858,7 @@ describe('AgentClient - titleConvo', () => {
       client.responseMessageId = 'response-123';
 
       await client.useMemory();
+      await client.initializeMemoryWriter();
 
       expect(mockLoadAgent).not.toHaveBeenCalled();
       expect(mockInitializeAgent).toHaveBeenCalledWith(
@@ -2636,6 +2893,7 @@ describe('AgentClient - titleConvo', () => {
       client.responseMessageId = 'response-123';
 
       await client.useMemory();
+      await client.initializeMemoryWriter();
 
       expect(mockLoadAgent).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -2689,6 +2947,7 @@ describe('AgentClient - titleConvo', () => {
       client.responseMessageId = 'response-123';
 
       await client.useMemory();
+      await client.initializeMemoryWriter();
 
       expect(mockLoadAgent).not.toHaveBeenCalled();
       expect(mockInitializeAgent).toHaveBeenCalledWith(
@@ -2712,8 +2971,10 @@ describe('AgentClient - titleConvo', () => {
       client.responseMessageId = 'response-123';
 
       const result = await client.useMemory();
+      const writerResult = await client.initializeMemoryWriter();
 
       expect(result).toBe('stored memories');
+      expect(writerResult.ok).toBe(false);
       expect(mockCreateMemoryProcessor).not.toHaveBeenCalled();
     });
   });
@@ -3257,6 +3518,94 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     expect(client.chatCompletion).toHaveBeenCalledTimes(2);
     expect(result.completion).toEqual([{ type: ContentTypes.TEXT, text: 'Fallback answer.' }]);
     expect(client.contentParts).toEqual([{ type: ContentTypes.TEXT, text: 'Fallback answer.' }]);
+  });
+
+  test('retries fallback when primary auth throws before adding an error part', async () => {
+    const fallbackAgent = {
+      id: 'agent-fallback',
+      provider: EModelEndpoint.openAI,
+      model: 'gpt-5.4',
+      model_parameters: { model: 'gpt-5.4' },
+    };
+    primaryAgent.viventiumFallbackLlm = fallbackAgent;
+    let calls = 0;
+    client.chatCompletion = jest.fn(async () => {
+      calls += 1;
+      if (calls === 1) {
+        const error = new Error('Anthropic connected account needs reconnect.');
+        error.status = 401;
+        error.code = 'MODEL_AUTHENTICATION';
+        throw error;
+      }
+      client.contentParts.push({ type: ContentTypes.TEXT, text: 'Fallback answer after auth.' });
+    });
+
+    const result = await client.sendCompletion({ text: 'hello' });
+
+    expect(client.chatCompletion).toHaveBeenCalledTimes(2);
+    expect(result.completion).toEqual([
+      { type: ContentTypes.TEXT, text: 'Fallback answer after auth.' },
+    ]);
+    expect(client.contentParts).toEqual([
+      { type: ContentTypes.TEXT, text: 'Fallback answer after auth.' },
+    ]);
+  });
+
+  test('does not retry fallback when primary is aborted by the user before assistant text', async () => {
+    const fallbackAgent = {
+      id: 'agent-fallback',
+      provider: EModelEndpoint.openAI,
+      model: 'gpt-5.4',
+      model_parameters: { model: 'gpt-5.4' },
+    };
+    const abortController = new AbortController();
+    abortController.abort();
+    primaryAgent.viventiumFallbackLlm = fallbackAgent;
+    client.chatCompletion = jest.fn(async () => {
+      const error = new Error('operation was aborted');
+      error.name = 'AbortError';
+      throw error;
+    });
+
+    await expect(client.sendCompletion({ text: 'hello' }, { abortController })).rejects.toThrow(
+      'operation was aborted',
+    );
+
+    expect(client.chatCompletion).toHaveBeenCalledTimes(1);
+  });
+
+  test('retries fallback when primary overloads before assistant text', async () => {
+    const fallbackAgent = {
+      id: 'agent-fallback',
+      provider: EModelEndpoint.openAI,
+      model: 'gpt-5.4',
+      model_parameters: { model: 'gpt-5.4' },
+    };
+    primaryAgent.viventiumFallbackLlm = fallbackAgent;
+    let calls = 0;
+    client.chatCompletion = jest.fn(async () => {
+      calls += 1;
+      if (calls === 1) {
+        const error = new Error('Our servers are currently overloaded. Please try again later.');
+        error.code = 'server_is_overloaded';
+        client.contentParts.push(AgentClient.createCompletionErrorContentPart(error));
+        throw error;
+      }
+      client.contentParts.push({
+        type: ContentTypes.TEXT,
+        text: 'Fallback answer after overload.',
+      });
+    });
+
+    const result = await client.sendCompletion({ text: 'hello' });
+
+    expect(client.chatCompletion).toHaveBeenCalledTimes(2);
+    expect(result.completion).toEqual([
+      { type: ContentTypes.TEXT, text: 'Fallback answer after overload.' },
+    ]);
+    expect(client.contentParts).toEqual([
+      { type: ContentTypes.TEXT, text: 'Fallback answer after overload.' },
+    ]);
   });
 
   test('suppresses fallback background cortices only when primary Phase B already owns the response', async () => {

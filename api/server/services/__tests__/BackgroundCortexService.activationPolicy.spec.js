@@ -8,6 +8,7 @@ const {
   normalizeDirectActionSurfaceScopes,
   applyDirectActionOwnershipGate,
   normalizeAgentToolNames,
+  countConfiguredCortexTools,
   resolveActivationPolicyMainAgent,
   summarizeActivationError,
   formatHistoryForActivation,
@@ -487,6 +488,35 @@ describe('BackgroundCortexService activation policy helpers', () => {
       }),
     );
     expect(hydrated.background_cortices).toEqual(requestAgent.background_cortices);
+  });
+
+  test('counts event-driven cortex tool definitions before falling back to source tool strings', () => {
+    expect(
+      countConfiguredCortexTools(
+        {
+          tools: [],
+          toolDefinitions: [
+            { name: 'search_gmail_messages_mcp_google_workspace' },
+            { name: 'get_gmail_message_content_mcp_google_workspace' },
+            { name: 'search_gmail_messages_mcp_google_workspace' },
+          ],
+        },
+        { tools: ['sys__server__sys_mcp_google_workspace'] },
+      ),
+    ).toBe(2);
+
+    expect(
+      countConfiguredCortexTools(
+        { tools: [] },
+        {
+          tools: [
+            'sys__server__sys_mcp_ms-365',
+            'list-mail-messages_mcp_ms-365',
+            'list-mail-messages_mcp_ms-365',
+          ],
+        },
+      ),
+    ).toBe(2);
   });
 
   test('suppresses empty and no-response cortex output', () => {

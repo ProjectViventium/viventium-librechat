@@ -23,6 +23,7 @@ const {
   createRun,
   Tokenizer,
   memoryInstructions,
+  loadMemoryReadContext,
   extractFileContext,
   countTokens,
   checkAccess,
@@ -485,15 +486,27 @@ async function getUserMemoryContextBlock(req) {
   }
 
   try {
-    const { withoutKeys } = await db.getFormattedMemories({ userId: String(req.user.id) });
-    const memoryText = typeof withoutKeys === 'string' ? withoutKeys.trim() : '';
+    const readContext = await loadMemoryReadContext({
+      userId: String(req.user.id),
+      memoryMethods: {
+        setMemory: db.setMemory,
+        deleteMemory: db.deleteMemory,
+        getFormattedMemories: db.getFormattedMemories,
+        getAllUserMemories: db.getAllUserMemories,
+      },
+      config: {
+        validKeys: memoryConfig.validKeys,
+        readProfile: memoryConfig.readProfile,
+      },
+    });
+    const memoryText = typeof readContext.text === 'string' ? readContext.text.trim() : '';
     if (!memoryText) {
       return '';
     }
     return `${memoryInstructions}\n\n# Existing memory about the user:\n${memoryText}`;
   } catch (error) {
     logger.warn(
-      '[BackgroundCortexService] Failed to load formatted memories for cortex context',
+      '[BackgroundCortexService] Failed to load memory read profile for cortex context',
       sanitizeRuntimeErrorForLog(error),
     );
     return '';
@@ -1035,6 +1048,26 @@ function normalizeAgentToolNames(mainAgent) {
       return '';
     })
     .filter(Boolean);
+}
+
+function countConfiguredCortexTools(initializedAgent, sourceAgent) {
+  /* === VIVENTIUM START ===
+   * Feature: Event-driven cortex tool telemetry.
+   * Purpose: initializeAgent intentionally leaves `tools` empty in definitions-only mode, so
+   * telemetry must count model-visible definitions and fall back to configured source tool names.
+   * === VIVENTIUM END === */
+  const definitionNames = Array.isArray(initializedAgent?.toolDefinitions)
+    ? initializedAgent.toolDefinitions
+        .map((tool) => String(tool?.name || '').trim())
+        .filter(Boolean)
+    : [];
+  const runtimeToolNames = normalizeAgentToolNames(initializedAgent);
+  const sourceToolNames = normalizeAgentToolNames(sourceAgent);
+  return Math.max(
+    new Set(definitionNames).size,
+    new Set(runtimeToolNames).size,
+    new Set(sourceToolNames).size,
+  );
 }
 
 function normalizeDirectActionScopeKey(scopeKey) {
@@ -3252,6 +3285,7 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
      *   registered and tools actually execute in background cortex mode.
      */
     const agentToolContexts = new Map();
+    const configuredToolCount = countConfiguredCortexTools(initializedAgent, agentForRun);
     agentToolContexts.set(initializedAgent.id, {
       agent: agentForRun,
       toolRegistry: initializedAgent.toolRegistry,
@@ -3363,7 +3397,7 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
           productivity_context_isolated: isolateProductivityContext,
           has_request_files: hasRequestFiles,
           no_response_injected: !!noResponseInstructions,
-          tool_count: Array.isArray(initializedAgent.tools) ? initializedAgent.tools.length : 0,
+          tool_count: configuredToolCount,
         },
         decisionState: {
           activation_scope_present: !!activationScope,
@@ -3507,14 +3541,14 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
         errorClass: publicProviderError.errorClass,
         recoverableProviderError: true,
         activationScope,
-        configuredTools: initializedAgent.tools?.length || 0,
+        configuredTools: configuredToolCount,
         completedToolCalls: toolExecutionState.completed || 0,
       };
     }
 
     logger.info(
       `[BackgroundCortexService] Cortex ${agent.name || agent.id} executed in ${duration}ms ` +
-        `(configured_tools: ${initializedAgent.tools?.length || 0}, completed_tool_calls: ${toolExecutionState.completed})`,
+        `(configured_tools: ${configuredToolCount}, completed_tool_calls: ${toolExecutionState.completed})`,
     );
 
     return {
@@ -3522,7 +3556,7 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
       agentName: agent.name || agent.id,
       insight: insight.trim(),
       activationScope,
-      configuredTools: initializedAgent.tools?.length || 0,
+      configuredTools: configuredToolCount,
       completedToolCalls: toolExecutionState.completed || 0,
     };
   } catch (error) {
@@ -4772,6 +4806,7 @@ module.exports = {
   resolvePhaseANoticeModeForRequest,
   applyActivationJsonMode,
   resolveActivationPolicyMainAgent,
+  countConfiguredCortexTools,
   normalizeDirectActionScopeKey,
   normalizeDirectActionSurfaceScopes,
   applyDirectActionOwnershipGate,

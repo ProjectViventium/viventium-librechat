@@ -63,6 +63,12 @@ function getPromptBundleStatus() {
   };
 }
 
+function getPromptMetadata(promptId) {
+  const bundle = loadPromptBundle();
+  const metadata = bundle?.prompts?.[promptId]?.metadata;
+  return metadata && typeof metadata === 'object' ? metadata : null;
+}
+
 function lookupVariable(variables, key) {
   let current = variables || {};
   for (const segment of String(key).split('.')) {
@@ -159,6 +165,7 @@ module.exports = {
   PROMPT_BUNDLE_ENV,
   KNOWN_RUNTIME_PLACEHOLDERS,
   getPromptBundleStatus,
+  getPromptMetadata,
   getPromptText,
   resetPromptRegistryForTests,
 };

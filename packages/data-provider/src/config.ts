@@ -789,6 +789,11 @@ export type TStartupConfig = {
    * === VIVENTIUM END === */
   viventiumConnectedAccountsEnabled?: boolean;
   /* === VIVENTIUM START ===
+   * Feature: Prompt Workbench local launcher.
+   * Purpose: Expose the server-side workbench link gate to the web client.
+   * === VIVENTIUM END === */
+  viventiumPromptWorkbenchLinkEnabled?: boolean;
+  /* === VIVENTIUM START ===
    * Feature: GlassHive host worker callbacks.
    * Purpose: Expose the compiled callback wait window to the web polling hook.
    * === VIVENTIUM END === */
@@ -958,6 +963,24 @@ export const memorySchema = z.object({
    * === VIVENTIUM END === */
   keyLimits: z.record(z.number()).optional(),
   maintenanceThresholdPercent: z.number().optional(),
+  /* === VIVENTIUM START ===
+   * Feature: Bounded saved-memory read profile
+   *
+   * Purpose:
+   * - Keep chat-time memory reads fast and predictable.
+   * - Let source-of-truth config choose which keys get injected into the main prompt and how much
+   *   of each key can occupy the critical path.
+   *
+   * Added: 2026-05-20
+   * === VIVENTIUM END === */
+  readProfile: z
+    .object({
+      tokenLimit: z.number().optional().default(1800),
+      keyLimits: z.record(z.number()).optional(),
+      keyOrder: z.array(z.string()).optional(),
+      cacheTtlMs: z.number().optional().default(30000),
+    })
+    .optional(),
   charLimit: z.number().optional().default(10000),
   personalize: z.boolean().default(true),
   messageWindowSize: z.number().optional().default(5),
@@ -1025,10 +1048,12 @@ const backgroundCortexActivationPolicySchema = z
   })
   .passthrough();
 
-const backgroundCorticesSchema = z.object({
-  activation_format: backgroundCortexActivationFormatSchema.optional(),
-  activation_policy: backgroundCortexActivationPolicySchema.optional(),
-}).passthrough();
+const backgroundCorticesSchema = z
+  .object({
+    activation_format: backgroundCortexActivationFormatSchema.optional(),
+    activation_policy: backgroundCortexActivationPolicySchema.optional(),
+  })
+  .passthrough();
 
 const viventiumNoResponseSchema = z
   .object({
@@ -1197,6 +1222,7 @@ export const alternateName = {
 };
 
 const sharedOpenAIModels = [
+  'gpt-5.4',
   'gpt-5.1',
   'gpt-5.1-chat-latest',
   'gpt-5.1-codex',

@@ -100,6 +100,203 @@ function recoverCortexContent(content, nowIso) {
   return { changed, content: recovered };
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Recovered follow-up error-card cleanup.
+ * Purpose: If Phase B already promoted useful visible text onto an empty primary answer, stale
+ * provider error parts must be removed from that same message so the UI does not show both
+ * recovery text and a fatal "Something went wrong" card.
+ * === VIVENTIUM END === */
+function stripErrorPartsFromRecoveredFollowUpContent(content) {
+  if (!Array.isArray(content)) {
+    return { changed: false, content, errorClasses: [] };
+  }
+
+  const errorClasses = [];
+  const nextContent = [];
+  let changed = false;
+  for (const part of content) {
+    if (part?.type === ContentTypes.ERROR) {
+      changed = true;
+      errorClasses.push(
+        String(part.error_class || part.errorClass || part.code || 'completion_error'),
+      );
+      continue;
+    }
+    nextContent.push(part);
+  }
+
+  return { changed, content: nextContent, errorClasses };
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Deferred tool-cortex hold error cleanup.
+ * Purpose: A deterministic runtime hold plus a later cortex follow-up is a successful async handoff,
+ * not a failed provider response. If an older runtime persisted a generic completion error onto
+ * that parent message, remove only that stale parent error after the follow-up exists.
+ * === VIVENTIUM END === */
+function stripDeferredHoldParentErrorParts(content) {
+  if (!Array.isArray(content)) {
+    return { changed: false, content, errorClasses: [] };
+  }
+
+  const hasRuntimeHold = content.some((part) => isRuntimeHoldTextPart(part));
+  const hasCortexPart = content.some(
+    (part) => part && typeof part === 'object' && CORTEX_TYPES.has(part.type),
+  );
+  if (!hasRuntimeHold || !hasCortexPart) {
+    return { changed: false, content, errorClasses: [] };
+  }
+
+  let changed = false;
+  const errorClasses = [];
+  const nextContent = [];
+  for (const part of content) {
+    const errorClass = String(part?.error_class || part?.errorClass || part?.code || '').trim();
+    const isStaleDeferredHoldError =
+      part?.type === ContentTypes.ERROR &&
+      (errorClass === 'completion_error' || errorClass === 'late_stream_termination');
+    if (isStaleDeferredHoldError) {
+      changed = true;
+      errorClasses.push(errorClass);
+      continue;
+    }
+    nextContent.push(part);
+  }
+
+  return { changed, content: nextContent, errorClasses };
+}
+
+async function recoverVisibleFollowUpErrorCards({ limit = 100 } = {}) {
+  const messages = await Message.find({
+    isCreatedByUser: false,
+    text: { $type: 'string', $ne: '' },
+    'metadata.viventium.type': 'cortex_followup',
+    'metadata.viventium.promotedToEmptyParent': true,
+    'content.type': ContentTypes.ERROR,
+  })
+    .sort({ updatedAt: -1 })
+    .limit(limit)
+    .lean();
+
+  let repaired = 0;
+  for (const message of messages) {
+    const cleanup = stripErrorPartsFromRecoveredFollowUpContent(message.content);
+    if (!cleanup.changed) {
+      continue;
+    }
+
+    const existingViventium = message?.metadata?.viventium || {};
+    const existingClasses = Array.isArray(existingViventium.recoveredPrimaryErrorClasses)
+      ? existingViventium.recoveredPrimaryErrorClasses
+      : [];
+    const recoveredPrimaryErrorClasses = Array.from(
+      new Set([...existingClasses, ...cleanup.errorClasses].filter(Boolean)),
+    );
+
+    const metadata = {
+      ...(message.metadata || {}),
+      viventium: {
+        ...existingViventium,
+        recoveredPrimaryErrorClasses,
+      },
+    };
+
+    const result = await Message.updateOne(
+      { _id: message._id, updatedAt: message.updatedAt },
+      {
+        $set: {
+          content: cleanup.content,
+          metadata,
+          unfinished: false,
+          error: false,
+        },
+      },
+    );
+    if (result?.modifiedCount > 0) {
+      repaired += 1;
+    }
+  }
+
+  if (repaired > 0) {
+    logger.warn(
+      `[staleCortexMessageRecovery] Removed stale visible error cards from ${repaired} recovered follow-up message(s)`,
+    );
+  }
+
+  return { scanned: messages.length, repaired };
+}
+
+async function recoverDeferredHoldParentErrorCards({ limit = 100 } = {}) {
+  const parents = await Message.find({
+    isCreatedByUser: false,
+    'content.viventium_runtime_hold': true,
+    'content.type': ContentTypes.ERROR,
+  })
+    .sort({ updatedAt: -1 })
+    .limit(limit)
+    .lean();
+
+  let repaired = 0;
+  for (const parent of parents) {
+    const cleanup = stripDeferredHoldParentErrorParts(parent.content);
+    if (!cleanup.changed || !parent?.messageId) {
+      continue;
+    }
+
+    const followUp = await Message.findOne(
+      {
+        isCreatedByUser: false,
+        text: { $type: 'string', $ne: '' },
+        error: { $ne: true },
+        'metadata.viventium.type': 'cortex_followup',
+        'metadata.viventium.parentMessageId': parent.messageId,
+      },
+      { _id: 1 },
+    ).lean();
+    if (!followUp) {
+      continue;
+    }
+
+    const existingViventium = parent?.metadata?.viventium || {};
+    const existingClasses = Array.isArray(existingViventium.recoveredDeferredHoldErrorClasses)
+      ? existingViventium.recoveredDeferredHoldErrorClasses
+      : [];
+    const recoveredDeferredHoldErrorClasses = Array.from(
+      new Set([...existingClasses, ...cleanup.errorClasses].filter(Boolean)),
+    );
+    const metadata = {
+      ...(parent.metadata || {}),
+      viventium: {
+        ...existingViventium,
+        recoveredDeferredHoldErrorClasses,
+      },
+    };
+
+    const result = await Message.updateOne(
+      { _id: parent._id, updatedAt: parent.updatedAt },
+      {
+        $set: {
+          content: cleanup.content,
+          metadata,
+          unfinished: false,
+          error: false,
+        },
+      },
+    );
+    if (result?.modifiedCount > 0) {
+      repaired += 1;
+    }
+  }
+
+  if (repaired > 0) {
+    logger.warn(
+      `[staleCortexMessageRecovery] Removed stale deferred-hold parent error cards from ${repaired} message(s)`,
+    );
+  }
+
+  return { scanned: parents.length, repaired };
+}
+
 async function recoverStaleCortexMessages({ now = new Date() } = {}) {
   const { timeoutMs, limit, cortexExecutionTimeoutMs, graceMs } = getStaleCortexRecoveryConfig();
   const cutoff = new Date(now.getTime() - timeoutMs);
@@ -154,9 +351,14 @@ async function recoverStaleCortexMessages({ now = new Date() } = {}) {
     );
   }
 
+  const recoveredErrorCards = await recoverVisibleFollowUpErrorCards({ limit });
+  const deferredHoldParentErrorCards = await recoverDeferredHoldParentErrorCards({ limit });
+
   return {
     scanned: messages.length,
     repaired,
+    recoveredErrorCards,
+    deferredHoldParentErrorCards,
     timeoutMs,
     limit,
     cortexExecutionTimeoutMs,
@@ -169,7 +371,11 @@ module.exports = {
   getConfiguredCortexExecutionTimeoutMs,
   getStaleCortexRecoveryIntervalMs,
   recoverCortexContent,
+  recoverDeferredHoldParentErrorCards,
+  recoverVisibleFollowUpErrorCards,
   recoverStaleCortexMessages,
   getStaleCortexRecoveryConfig,
   isActiveCortexPart,
+  stripDeferredHoldParentErrorParts,
+  stripErrorPartsFromRecoveredFollowUpContent,
 };

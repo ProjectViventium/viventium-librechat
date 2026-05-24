@@ -148,6 +148,7 @@ const tokenValues = Object.assign(
     'gpt-4o-2024-05-13': { prompt: 5, completion: 15 },
     'gpt-4o-mini': { prompt: 0.15, completion: 0.6 },
     'gpt-5': { prompt: 1.25, completion: 10 },
+    'gpt-5.4': { prompt: 2.5, completion: 15 },
     'gpt-5.1': { prompt: 1.25, completion: 10 },
     'gpt-5.2': { prompt: 1.75, completion: 14 },
     'gpt-5-nano': { prompt: 0.05, completion: 0.4 },

@@ -41,6 +41,8 @@ const USER_VISIBLE_CALLBACK_EVENTS = new Set([
 const seenCallbacks = new Map();
 const LOCAL_PATH_PATTERN =
   /(?:~\/|\/Users\/|\/home\/|\/private\/var\/|\/var\/folders\/|\/tmp\/|[A-Za-z]:\\Users\\)[^`'"<>\n\r]*?(?=$|[`'"<>\n\r]|[)\],.;:!?](?:\s|$)|\s+(?:and|or|from|at|with|then|while|because|but|plus|to|in|on)\b)/gi;
+const SAFE_GLASSHIVE_LINK_PATTERN =
+  /\[(Download artifact|Open GlassHive workspace)\]\((https?:\/\/[^)\s]+)\)/g;
 const ACTIVE_WORKER_FAILURE_CODES = new Set([
   'active_worker_conflict',
   'active_worker_limit',
@@ -125,8 +127,48 @@ function rememberCallback(body = {}, nowMs = Date.now()) {
   seenCallbacks.set(callbackReplayKey(body), nowMs + CALLBACK_REPLAY_TTL_MS);
 }
 
+function isSafeGlassHiveActionUrl(value = '') {
+  try {
+    const url = new URL(String(value || ''));
+    const hostname = url.hostname.toLowerCase();
+    if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1') {
+      return false;
+    }
+    return (
+      (url.pathname.includes('/watch/') && url.searchParams.has('gh_token')) ||
+      url.pathname.includes('/v1/signed-links/')
+    );
+  } catch {
+    return false;
+  }
+}
+
+function protectSafeGlassHiveLinks(text = '') {
+  const links = [];
+  const protectedText = String(text || '').replace(
+    SAFE_GLASSHIVE_LINK_PATTERN,
+    (match, _label, url) => {
+      if (!isSafeGlassHiveActionUrl(url)) {
+        return match;
+      }
+      const token = `__VIVENTIUM_SAFE_GLASSHIVE_LINK_${links.length}__`;
+      links.push({ token, value: match });
+      return token;
+    },
+  );
+  return { protectedText, links };
+}
+
+function restoreSafeGlassHiveLinks(text = '', links = []) {
+  return links.reduce(
+    (current, { token, value }) => current.replace(token, value),
+    String(text || ''),
+  );
+}
+
 function sanitizeCallbackMessage(value, { maxLength = MAX_CALLBACK_TEXT_LENGTH } = {}) {
-  let text = String(value || '').trim();
+  const { protectedText, links } = protectSafeGlassHiveLinks(String(value || '').trim());
+  let text = protectedText;
   if (!text) {
     return '';
   }
@@ -149,6 +191,7 @@ function sanitizeCallbackMessage(value, { maxLength = MAX_CALLBACK_TEXT_LENGTH }
     .join('\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+  text = restoreSafeGlassHiveLinks(text, links);
   if (maxLength && text.length > maxLength) {
     return `${text.slice(0, maxLength - 3).trim()}...`;
   }

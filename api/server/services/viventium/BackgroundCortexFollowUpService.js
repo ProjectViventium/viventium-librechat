@@ -164,6 +164,28 @@ function buildFollowUpModelKwargsForProvider({ providerName, modelParameters } =
 }
 /* === VIVENTIUM END === */
 
+function cloneFollowUpAgent(agent) {
+  if (!agent || typeof agent !== 'object') {
+    return agent || {};
+  }
+  return JSON.parse(JSON.stringify(agent));
+}
+
+function hasExplicitFollowUpRoute(agent, { useVoiceModel = false } = {}) {
+  if (!agent || typeof agent !== 'object') {
+    return false;
+  }
+  const provider = normalizeFollowUpProvider(
+    useVoiceModel ? agent.voice_llm_provider || agent.provider : agent.provider,
+  );
+  const model = String(
+    useVoiceModel
+      ? agent.voice_llm_model || agent.model || agent.model_parameters?.model || ''
+      : agent.model || agent.model_parameters?.model || '',
+  ).trim();
+  return !!provider && !!model;
+}
+
 function sanitizeFollowUpErrorForLog(error) {
   return {
     name: error?.name || null,
@@ -397,7 +419,15 @@ function resolveGovernedFollowUpModel(agent, { useVoiceModel = false } = {}) {
 /* === VIVENTIUM NOTE === */
 
 function resolveFollowUpRuntimeAssignment(agent, { useVoiceModel = false } = {}) {
-  const baseRuntimeAgent = rewriteAgentForRuntime(agent || {});
+  /* === VIVENTIUM START ===
+   * Feature: Follow-up LLM route preservation.
+   * Purpose: Phase B follows the live main agent route that produced the parent turn. The compiled
+   * runtime defaults are only a fallback for incomplete agent payloads; they must not override a
+   * user-managed live provider/model and accidentally route follow-ups through Anthropic.
+   * === VIVENTIUM END === */
+  const baseRuntimeAgent = hasExplicitFollowUpRoute(agent, { useVoiceModel })
+    ? cloneFollowUpAgent(agent)
+    : rewriteAgentForRuntime(agent || {});
   /* === VIVENTIUM NOTE ===
    * Voice follow-ups should respect the same machine-level fast voice override contract as the
    * main voice turn, but only at runtime. Keep the canonical built-in bundle unset by default and
@@ -1507,14 +1537,32 @@ function extractRecentResponseTextFromMessage(message) {
   return isPlaceholderRecentResponseText(contentText) ? '' : contentText;
 }
 
-function mergeVisibleTextIntoMessageContent(content, text) {
+/* === VIVENTIUM START ===
+ * Feature: Recovered primary-response error cleanup.
+ * Purpose: When Phase B promotes a visible fallback onto an empty primary answer, the old provider
+ * error card must not remain in the same user-visible assistant message.
+ * === VIVENTIUM END === */
+function summarizeErrorContentParts(content) {
+  if (!Array.isArray(content)) {
+    return [];
+  }
+  return content
+    .filter((part) => part && part.type === ContentTypes.ERROR)
+    .map((part) => String(part.error_class || part.errorClass || part.code || 'completion_error'))
+    .filter(Boolean);
+}
+
+function mergeVisibleTextIntoMessageContent(content, text, options = {}) {
   const normalizedText = typeof text === 'string' ? text.trim() : '';
   if (!normalizedText) {
     return Array.isArray(content) ? content : [];
   }
 
   const existingContent = Array.isArray(content) ? content : [];
-  const nextContent = existingContent.map((part) => ({ ...part }));
+  const dropErrorParts = options.dropErrorParts === true;
+  const nextContent = existingContent
+    .filter((part) => !(dropErrorParts && part?.type === ContentTypes.ERROR))
+    .map((part) => ({ ...part }));
   const textIndex = nextContent.findIndex((part) => part && part.type === ContentTypes.TEXT);
   if (textIndex >= 0) {
     nextContent[textIndex] = {
@@ -1565,7 +1613,10 @@ async function promoteForcedFollowUpToEmptyParent({
       return null;
     }
 
-    const nextContent = mergeVisibleTextIntoMessageContent(existing.content, normalizedText);
+    const recoveredPrimaryErrorClasses = summarizeErrorContentParts(existing.content);
+    const nextContent = mergeVisibleTextIntoMessageContent(existing.content, normalizedText, {
+      dropErrorParts: true,
+    });
     const nextMetadata = {
       ...(existing.metadata || {}),
       viventium: {
@@ -1576,6 +1627,8 @@ async function promoteForcedFollowUpToEmptyParent({
         replacedParentMessage: true,
         forceVisibleFollowUp: true,
         promotedToEmptyParent: true,
+        recoveredPrimaryErrorClasses:
+          recoveredPrimaryErrorClasses.length > 0 ? recoveredPrimaryErrorClasses : undefined,
       },
     };
 
@@ -2051,6 +2104,7 @@ module.exports = {
   cleanFallbackInsightText,
   getVisibleFallbackInsightTexts,
   isOperationalFallbackParagraph,
+  mergeVisibleTextIntoMessageContent,
   upsertCortexParts,
   persistCortexPartsToCanonicalMessage,
   finalizeCanonicalCortexMessage,

@@ -223,6 +223,7 @@ const MODEL_CONFIG_ONLY_FIELDS = [
   'fallback_llm_provider',
   'fallback_llm_model_parameters',
 ];
+const TOOLS_ONLY_FIELDS = ['id', 'tools', 'tool_kwargs'];
 const REVIEW_FIELDS = [
   'name',
   'description',
@@ -352,11 +353,9 @@ async function resolveSyncUser({ explicitEmail, agentId = null, bundle = null } 
     }
   }
 
-  const agentIdCandidates = [
-    agentId,
-    bundle?.mainAgent?.id,
-    bundle?.meta?.mainAgentId,
-  ].filter((candidate, index, values) => candidate && values.indexOf(candidate) === index);
+  const agentIdCandidates = [agentId, bundle?.mainAgent?.id, bundle?.meta?.mainAgentId].filter(
+    (candidate, index, values) => candidate && values.indexOf(candidate) === index,
+  );
 
   for (const candidate of agentIdCandidates) {
     const user = await resolveUserByAgentAuthor(candidate);
@@ -416,6 +415,7 @@ function parseArgs(argv) {
     promptsOnly: false, // Safe mode: only update prompts/instructions, not tools
     activationConfigOnly: false, // Safe mode: only update selected background cortex activation fields
     modelConfigOnly: false, // Safe mode: only update agent model/provider fields
+    toolsOnly: false, // Safe mode: only update agent tool arrays/kwargs
     runtimeAware: null, // Apply canonical runtime model/activation overrides before push
     activationFields: null,
     selectedAgentIds: null,
@@ -469,6 +469,10 @@ function parseArgs(argv) {
     }
     if (arg === '--model-config-only') {
       args.modelConfigOnly = true;
+      continue;
+    }
+    if (arg === '--tools-only') {
+      args.toolsOnly = true;
       continue;
     }
     if (arg === '--runtime-aware') {
@@ -601,9 +605,13 @@ function parseArgs(argv) {
     }
   }
 
-  if ([args.promptsOnly, args.activationConfigOnly, args.modelConfigOnly].filter(Boolean).length > 1) {
+  if (
+    [args.promptsOnly, args.activationConfigOnly, args.modelConfigOnly, args.toolsOnly].filter(
+      Boolean,
+    ).length > 1
+  ) {
     throw new Error(
-      'Choose only one safe push mode: --prompts-only, --activation-config-only, or --model-config-only',
+      'Choose only one safe push mode: --prompts-only, --activation-config-only, --model-config-only, or --tools-only',
     );
   }
   if (args.activationFields && !args.promptsOnly && !args.activationConfigOnly) {
@@ -614,11 +622,7 @@ function parseArgs(argv) {
   return args;
 }
 
-function shouldApplyRuntimeOverrides({
-  action,
-  env = DEFAULT_ENV_SLUG,
-  runtimeAware = null,
-} = {}) {
+function shouldApplyRuntimeOverrides({ action, env = DEFAULT_ENV_SLUG, runtimeAware = null } = {}) {
   if (action !== 'push') {
     return false;
   }
@@ -783,7 +787,11 @@ function loadPromptRegistry() {
 function lookupPromptVariable(variables, key) {
   let current = variables || {};
   for (const segment of String(key).split('.')) {
-    if (current && typeof current === 'object' && Object.prototype.hasOwnProperty.call(current, segment)) {
+    if (
+      current &&
+      typeof current === 'object' &&
+      Object.prototype.hasOwnProperty.call(current, segment)
+    ) {
       current = current[segment];
       continue;
     }
@@ -984,7 +992,11 @@ function summarizeBackgroundCorticesDiff(leftValue, rightValue) {
         continue;
       }
       activationChangedFields.push(field);
-      activationDetails[field] = summarizeFieldDiff(field, leftActivation[field], rightActivation[field]);
+      activationDetails[field] = summarizeFieldDiff(
+        field,
+        leftActivation[field],
+        rightActivation[field],
+      );
     }
 
     const entryFieldNames = Array.from(
@@ -1058,11 +1070,7 @@ function getNestedValue(value, pathSegments) {
   }, value);
 }
 
-function compareNamedFields({
-  leftValue,
-  rightValue,
-  fields,
-}) {
+function compareNamedFields({ leftValue, rightValue, fields }) {
   const diffs = [];
 
   for (const field of fields || []) {
@@ -1095,11 +1103,7 @@ function loadYamlDocument(filePath) {
   return resolvePromptRefs(yaml.load(contents));
 }
 
-function compareBundlesByAgent({
-  leftBundle,
-  rightBundle,
-  fields = REVIEW_FIELDS,
-}) {
+function compareBundlesByAgent({ leftBundle, rightBundle, fields = REVIEW_FIELDS }) {
   const leftMap = buildBundleAgentIndex(leftBundle);
   const rightMap = buildBundleAgentIndex(rightBundle);
   const ids = Array.from(new Set([...leftMap.keys(), ...rightMap.keys()])).sort();
@@ -1247,9 +1251,10 @@ function buildCompareRecommendations({
       'Background cortex config drift exists. Reconcile it with --prompts-only or --activation-config-only plus --agent-ids instead of a broad rewrite.',
     );
     const hasMissingLiveFallbacks = liveVsSource?.changedAgents?.some((agentDiff) =>
-      agentDiff?.backgroundCortices?.changedAgents?.some((cortexDiff) =>
-        Array.isArray(cortexDiff?.activationChangedFields) &&
-        cortexDiff.activationChangedFields.includes('fallbacks'),
+      agentDiff?.backgroundCortices?.changedAgents?.some(
+        (cortexDiff) =>
+          Array.isArray(cortexDiff?.activationChangedFields) &&
+          cortexDiff.activationChangedFields.includes('fallbacks'),
       ),
     );
     if (hasMissingLiveFallbacks) {
@@ -1346,7 +1351,9 @@ async function pullBundle({ email, agentId, outPath, format }) {
   }
 
   const backgroundIds = Array.isArray(mainAgent.background_cortices)
-    ? Array.from(new Set(mainAgent.background_cortices.map((entry) => entry.agent_id).filter(Boolean)))
+    ? Array.from(
+        new Set(mainAgent.background_cortices.map((entry) => entry.agent_id).filter(Boolean)),
+      )
     : [];
 
   const backgroundAgents = backgroundIds.length
@@ -1447,6 +1454,7 @@ function buildUpdateData(
     promptsOnly = false,
     activationConfigOnly = false,
     modelConfigOnly = false,
+    toolsOnly = false,
     activationFields = null,
     existingAgent = null,
     selectedAgentIds = null,
@@ -1459,7 +1467,9 @@ function buildUpdateData(
       ? ['background_cortices']
       : modelConfigOnly
         ? MODEL_CONFIG_ONLY_FIELDS
-      : AGENT_FIELDS;
+        : toolsOnly
+          ? TOOLS_ONLY_FIELDS
+          : AGENT_FIELDS;
   const safeActivationFields = resolveSafeActivationFields({
     promptsOnly,
     activationConfigOnly,
@@ -1518,12 +1528,13 @@ async function repairPersistedAgentRuntimeFields({ agentData, dryRun }) {
 function shouldRepairRuntimeFieldsForPushMode({
   promptsOnly = false,
   activationConfigOnly = false,
+  toolsOnly = false,
   runtimeAware = false,
 }) {
   if (!runtimeAware) {
     return false;
   }
-  if (promptsOnly || activationConfigOnly) {
+  if (promptsOnly || activationConfigOnly || toolsOnly) {
     return false;
   }
   return true;
@@ -1552,6 +1563,7 @@ async function pushAgent({
   promptsOnly = false,
   activationConfigOnly = false,
   modelConfigOnly = false,
+  toolsOnly = false,
   runtimeAware = false,
   activationFields = null,
   selectedAgentIds = null,
@@ -1563,6 +1575,7 @@ async function pushAgent({
   const shouldRepairRuntimeFields = shouldRepairRuntimeFieldsForPushMode({
     promptsOnly,
     activationConfigOnly,
+    toolsOnly,
     runtimeAware,
   });
   /* === VIVENTIUM START ===
@@ -1572,12 +1585,14 @@ async function pushAgent({
    * Fix: When an agent is missing, create it from the YAML data (safe — YAML is canonical).
    * === VIVENTIUM END === */
   if (!existing) {
-    if (promptsOnly || activationConfigOnly || modelConfigOnly) {
+    if (promptsOnly || activationConfigOnly || modelConfigOnly || toolsOnly) {
       const modeLabel = promptsOnly
         ? 'prompts-only'
         : activationConfigOnly
           ? 'activation-config-only'
-          : 'model-config-only';
+          : modelConfigOnly
+            ? 'model-config-only'
+            : 'tools-only';
       return {
         id: agentData.id,
         status: 'missing',
@@ -1618,7 +1633,10 @@ async function pushAgent({
         );
       }
     } catch (permErr) {
-      console.warn(`[pushAgent] Created agent ${agentData.id} but failed to grant ACL:`, permErr.message);
+      console.warn(
+        `[pushAgent] Created agent ${agentData.id} but failed to grant ACL:`,
+        permErr.message,
+      );
     }
     return {
       id: agentData.id,
@@ -1634,6 +1652,7 @@ async function pushAgent({
     promptsOnly,
     activationConfigOnly,
     modelConfigOnly,
+    toolsOnly,
     activationFields,
     existingAgent: existing,
     selectedAgentIds,
@@ -1659,7 +1678,9 @@ async function pushAgent({
         ? 'activation-config-only'
         : modelConfigOnly
           ? 'model-config-only'
-          : 'full',
+          : toolsOnly
+            ? 'tools-only'
+            : 'full',
     fieldsUpdated,
     runtimeRepair,
   };
@@ -1674,6 +1695,7 @@ async function pushBundle({
   promptsOnly = false,
   activationConfigOnly = false,
   modelConfigOnly = false,
+  toolsOnly = false,
   runtimeAware = false,
   activationFields = null,
   selectedAgentIds = null,
@@ -1742,6 +1764,7 @@ async function pushBundle({
         promptsOnly,
         activationConfigOnly,
         modelConfigOnly,
+        toolsOnly,
         runtimeAware,
         activationFields,
         selectedAgentIds,
@@ -1785,6 +1808,7 @@ async function pushBundle({
           promptsOnly,
           activationConfigOnly,
           modelConfigOnly,
+          toolsOnly,
           runtimeAware,
           activationFields,
           selectedAgentIds,
@@ -1801,7 +1825,9 @@ async function pushBundle({
         ? 'activation-config-only'
         : modelConfigOnly
           ? 'model-config-only'
-          : 'full',
+          : toolsOnly
+            ? 'tools-only'
+            : 'full',
     runtimeAwareApplied: runtimeAware,
     results,
     userId: user._id.toString(),
@@ -1809,14 +1835,7 @@ async function pushBundle({
   };
 }
 
-async function compareBundles({
-  email,
-  agentId,
-  env,
-  livePath = null,
-  sourcePath = null,
-  format,
-}) {
+async function compareBundles({ email, agentId, env, livePath = null, sourcePath = null, format }) {
   void format;
   const compareInputFormat = null;
   let resolvedLivePath = livePath;
@@ -1842,14 +1861,18 @@ async function compareBundles({
 
   const liveBundle = loadBundle(resolvedLivePath, compareInputFormat);
   const sourceBundle = sourceExists ? loadBundle(resolvedSourcePath, compareInputFormat) : null;
-  const headBundle = sourceExists ? loadBundleFromGitHead(resolvedSourcePath, compareInputFormat) : null;
+  const headBundle = sourceExists
+    ? loadBundleFromGitHead(resolvedSourcePath, compareInputFormat)
+    : null;
   const liveLibrechatPath = path.join(ROOT_DIR, 'librechat.yaml');
   const sourceLibrechatPath = resolveSourceOfTruthLibrechatYamlPath(env);
   const liveLibrechatExists = fs.existsSync(liveLibrechatPath);
   const sourceLibrechatExists = fs.existsSync(sourceLibrechatPath);
   const liveLibrechat = liveLibrechatExists ? loadYamlDocument(liveLibrechatPath) : null;
   const sourceLibrechat = sourceLibrechatExists ? loadYamlDocument(sourceLibrechatPath) : null;
-  const headLibrechat = sourceLibrechatExists ? loadBundleFromGitHead(sourceLibrechatPath, 'yaml') : null;
+  const headLibrechat = sourceLibrechatExists
+    ? loadBundleFromGitHead(sourceLibrechatPath, 'yaml')
+    : null;
 
   const liveVsSource = sourceBundle
     ? compareBundlesByAgent({
@@ -1960,8 +1983,12 @@ function printUsage() {
   console.log(
     '  --email=...       User email (optional; otherwise resolve from runtime env or existing main agent)',
   );
-  console.log('  --agent-id=...    Main agent id (default: env VIVENTIUM_MAIN_AGENT_ID or agent_viventium_main_95aeb3)');
-  console.log('  --env=...         Environment slug for git-tracked source-of-truth files (default: env VIVENTIUM_ENV or "local")');
+  console.log(
+    '  --agent-id=...    Main agent id (default: env VIVENTIUM_MAIN_AGENT_ID or agent_viventium_main_95aeb3)',
+  );
+  console.log(
+    '  --env=...         Environment slug for git-tracked source-of-truth files (default: env VIVENTIUM_ENV or "local")',
+  );
   console.log(
     '  --out=...         Output path for pull (default: .viventium/artifacts/agents-sync/runs/<timestamp>/viventium-agents.yaml)',
   );
@@ -1978,43 +2005,85 @@ function printUsage() {
   console.log('  --json            Force JSON format (default is YAML)');
   console.log('  --yaml            Force YAML format');
   console.log('  --mongo-uri=...   Override MONGO_URI for this run');
-  console.log('  env: VIVENTIUM_ARTIFACTS_DIR overrides artifacts root (default: <core>/.viventium/artifacts)');
-  console.log('  --no-sot          Skip writing git-tracked source-of-truth copies (viventium/source_of_truth/*.yaml)');
+  console.log(
+    '  env: VIVENTIUM_ARTIFACTS_DIR overrides artifacts root (default: <core>/.viventium/artifacts)',
+  );
+  console.log(
+    '  --no-sot          Skip writing git-tracked source-of-truth copies (viventium/source_of_truth/*.yaml)',
+  );
   console.log('  --dry-run         Show push results without updating');
-  console.log('  --compare-reviewed  Confirm you already reviewed compare output and accept live-vs-source drift');
+  console.log(
+    '  --compare-reviewed  Confirm you already reviewed compare output and accept live-vs-source drift',
+  );
   console.log(
     '  --prompts-only    Safe merge mode: update prompts/instructions plus any explicitly reviewed activation reliability fields present in the safe allowlist (for example fallbacks); this still changes live failover behavior, so review compare output first',
   );
-  console.log('  --activation-config-only  Safe mode: only update background cortex activation config');
+  console.log(
+    '  --activation-config-only  Safe mode: only update background cortex activation config',
+  );
   console.log('  --model-config-only  Safe mode: only update agent model/provider fields');
-  console.log('  --runtime-aware   Rewrite built-in model/provider fields from canonical runtime env before push');
-  console.log('  --raw-source-of-truth  Push raw bundle values without runtime rewrite (disables local default)');
-  console.log('  --agent-ids=...   Optional comma-separated background agent ids to update surgically');
+  console.log('  --tools-only  Safe mode: only update agent tools/tool_kwargs fields');
+  console.log(
+    '  --runtime-aware   Rewrite built-in model/provider fields from canonical runtime env before push',
+  );
+  console.log(
+    '  --raw-source-of-truth  Push raw bundle values without runtime rewrite (disables local default)',
+  );
+  console.log(
+    '  --agent-ids=...   Optional comma-separated background agent ids to update surgically',
+  );
   console.log(
     '  --activation-fields=...   Comma-separated activation fields for safe modes (enabled,prompt,confidence_threshold,fallbacks,activation_failure_visibility,model,provider,cooldown_ms,max_history,intent_scope)',
   );
-  console.log('  --schedules       Also pull/push Scheduling Cortex tasks for this user (via viv-schedule-sync.js)');
+  console.log(
+    '  --schedules       Also pull/push Scheduling Cortex tasks for this user (via viv-schedule-sync.js)',
+  );
   console.log('');
   console.log('Schedules options (with --schedules):');
-  console.log('  --schedules-db=...               Path to schedules.db for pull (default: ~/.viventium/scheduling/schedules.db)');
-  console.log('  --schedules-out=...              Output file for schedules on pull (default: scheduled_tasks.yaml next to bundle)');
-  console.log('  --schedules-in=...               Input file for schedules on push (default: scheduled_tasks.yaml next to bundle)');
-  console.log('  --schedules-user-id=...          Override the schedules user_id filter (advanced; default uses Mongo user id)');
-  console.log('  --schedules-resolve-users        Add user_email by resolving ids via Mongo (requires MONGO_URI)');
+  console.log(
+    '  --schedules-db=...               Path to schedules.db for pull (default: ~/.viventium/scheduling/schedules.db)',
+  );
+  console.log(
+    '  --schedules-out=...              Output file for schedules on pull (default: scheduled_tasks.yaml next to bundle)',
+  );
+  console.log(
+    '  --schedules-in=...               Input file for schedules on push (default: scheduled_tasks.yaml next to bundle)',
+  );
+  console.log(
+    '  --schedules-user-id=...          Override the schedules user_id filter (advanced; default uses Mongo user id)',
+  );
+  console.log(
+    '  --schedules-resolve-users        Add user_email by resolving ids via Mongo (requires MONGO_URI)',
+  );
   console.log('  --schedules-mcp-url=...          Scheduling MCP URL for push (streamable-http)');
-  console.log('  --schedules-librechat-yaml=...   Deployed librechat.yaml path (to discover scheduling MCP URL)');
-  console.log('  --schedules-prune                Delete server tasks not present in input (user-scoped)');
-  console.log('  --schedules-create-missing       Recreate missing tasks (new ids) instead of failing');
+  console.log(
+    '  --schedules-librechat-yaml=...   Deployed librechat.yaml path (to discover scheduling MCP URL)',
+  );
+  console.log(
+    '  --schedules-prune                Delete server tasks not present in input (user-scoped)',
+  );
+  console.log(
+    '  --schedules-create-missing       Recreate missing tasks (new ids) instead of failing',
+  );
   console.log('');
   console.log('Safe Push Example:');
-  console.log('  node scripts/viventium-sync-agents.js compare --env=local           # Pull live state and review A/B/C drift');
-  console.log('  node scripts/viventium-sync-agents.js push --prompts-only --dry-run  # Preview changes');
-  console.log('  node scripts/viventium-sync-agents.js push --prompts-only            # Apply prompt changes only');
+  console.log(
+    '  node scripts/viventium-sync-agents.js compare --env=local           # Pull live state and review A/B/C drift',
+  );
+  console.log(
+    '  node scripts/viventium-sync-agents.js push --prompts-only --dry-run  # Preview changes',
+  );
+  console.log(
+    '  node scripts/viventium-sync-agents.js push --prompts-only            # Apply prompt changes only',
+  );
   console.log(
     '  node scripts/viventium-sync-agents.js push --activation-config-only --activation-fields=prompt,model,provider,intent_scope --dry-run',
   );
   console.log(
     '  node scripts/viventium-sync-agents.js push --model-config-only --dry-run  # Preview provider/model changes only',
+  );
+  console.log(
+    '  node scripts/viventium-sync-agents.js push --tools-only --agent-ids=agent_a --dry-run  # Preview tool-array changes only',
   );
 }
 
@@ -2092,6 +2161,7 @@ async function run() {
       promptsOnly: args.promptsOnly,
       activationConfigOnly: args.activationConfigOnly,
       modelConfigOnly: args.modelConfigOnly,
+      toolsOnly: args.toolsOnly,
       runtimeAware: shouldApplyRuntimeOverrides(args),
       activationFields: args.activationFields,
       selectedAgentIds: args.selectedAgentIds,
@@ -2126,7 +2196,9 @@ async function run() {
       } else if (args.schedulesLibrechatYamlPath) {
         schedArgs.push(`--librechat-yaml=${args.schedulesLibrechatYamlPath}`);
       } else {
-        throw new Error('Using --schedules with push requires --schedules-mcp-url or --schedules-librechat-yaml');
+        throw new Error(
+          'Using --schedules with push requires --schedules-mcp-url or --schedules-librechat-yaml',
+        );
       }
       schedules = runVivScheduleSync(schedArgs);
     }

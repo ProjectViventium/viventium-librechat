@@ -1,27 +1,46 @@
 import { useState, memo, useRef, useCallback, useEffect } from 'react';
 import * as Select from '@ariakit/react/select';
-import { FileText, LogOut, Plug2 } from 'lucide-react';
-import { SettingsTabValues } from 'librechat-data-provider';
-import { LinkIcon, GearIcon, DropdownMenuSeparator, Avatar } from '@librechat/client';
+import { FileText, FlaskConical, LogOut, Plug2 } from 'lucide-react';
+import { SettingsTabValues, SystemRoles, apiBaseUrl, request } from 'librechat-data-provider';
+import {
+  LinkIcon,
+  GearIcon,
+  DropdownMenuSeparator,
+  Avatar,
+  Spinner,
+  useToastContext,
+} from '@librechat/client';
 import { MyFilesModal } from '~/components/Chat/Input/Files/MyFilesModal';
 import { useGetStartupConfig, useGetUserBalance } from '~/data-provider';
 import { useAuthContext } from '~/hooks/AuthContext';
+import { NotificationSeverity } from '~/common';
 import { useLocalize } from '~/hooks';
 import { CONNECTED_ACCOUNTS_OPEN_EVENT } from '~/common/connectedAccounts';
 import Settings from './Settings';
 
+type PromptWorkbenchStartResponse = {
+  started?: boolean;
+  status?: 'running' | 'stopped';
+  url?: string;
+};
+
 function AccountSettings() {
   const localize = useLocalize();
+  const { showToast } = useToastContext();
   const { user, isAuthenticated, logout } = useAuthContext();
   const { data: startupConfig } = useGetStartupConfig();
   const connectedAccountsEnabled =
     (startupConfig as { viventiumConnectedAccountsEnabled?: boolean } | undefined)
       ?.viventiumConnectedAccountsEnabled === true;
+  const promptWorkbenchLinkEnabled =
+    (startupConfig as { viventiumPromptWorkbenchLinkEnabled?: boolean } | undefined)
+      ?.viventiumPromptWorkbenchLinkEnabled === true && user?.role === SystemRoles.ADMIN;
   const balanceQuery = useGetUserBalance({
     enabled: !!isAuthenticated && startupConfig?.balance?.enabled,
   });
   const [showSettings, setShowSettings] = useState(false);
   const [showFiles, setShowFiles] = useState(false);
+  const [isOpeningPromptWorkbench, setIsOpeningPromptWorkbench] = useState(false);
   const [settingsInitialTab, setSettingsInitialTab] = useState<SettingsTabValues>(
     SettingsTabValues.GENERAL,
   );
@@ -35,6 +54,35 @@ function AccountSettings() {
     setSettingsInitialTab(initialTab);
     setShowSettings(true);
   }, []);
+
+  /* === VIVENTIUM START ===
+   * Feature: Prompt Workbench account-menu entry.
+   * Purpose: Open the managed local Prompt Workbench directly from the account dropdown.
+   * === VIVENTIUM END === */
+  const openPromptWorkbench = useCallback(async () => {
+    if (isOpeningPromptWorkbench) {
+      return;
+    }
+
+    setIsOpeningPromptWorkbench(true);
+    try {
+      const response = await request.post<PromptWorkbenchStartResponse>(
+        `${apiBaseUrl()}/api/viventium/prompt-workbench/start`,
+        {},
+      );
+      if (!response?.url) {
+        throw new Error('missing_prompt_workbench_url');
+      }
+      window.open(response.url, '_blank', 'noopener,noreferrer');
+    } catch (_error) {
+      showToast({
+        message: localize('com_ui_prompt_workbench_open_error'),
+        status: NotificationSeverity.ERROR,
+      });
+    } finally {
+      setIsOpeningPromptWorkbench(false);
+    }
+  }, [isOpeningPromptWorkbench, localize, showToast]);
 
   useEffect(() => {
     if (!connectedAccountsEnabled) {
@@ -119,6 +167,22 @@ function AccountSettings() {
           >
             <Plug2 className="icon-md" aria-hidden="true" />
             {localize('com_nav_connected_accounts')}
+          </Select.SelectItem>
+        )}
+        {promptWorkbenchLinkEnabled && (
+          <Select.SelectItem
+            value=""
+            onClick={() => void openPromptWorkbench()}
+            className="select-item text-sm"
+            aria-disabled={isOpeningPromptWorkbench}
+            disabled={isOpeningPromptWorkbench}
+          >
+            {isOpeningPromptWorkbench ? (
+              <Spinner className="icon-md" />
+            ) : (
+              <FlaskConical className="icon-md" aria-hidden="true" />
+            )}
+            {localize('com_ui_prompt_workbench')}
           </Select.SelectItem>
         )}
         <Select.SelectItem

@@ -1,7 +1,7 @@
 import type { TEndpointsConfig } from './types';
 import { EModelEndpoint, isDocumentSupportedProvider } from './schemas';
 import { getEndpointFileConfig, mergeFileConfig } from './file-config';
-import { getEndpointField, resolveEndpointType } from './config';
+import { getEndpointField, memorySchema, resolveEndpointType } from './config';
 
 const endpointsConfig: TEndpointsConfig = {
   [EModelEndpoint.openAI]: { userProvide: false, order: 0 },
@@ -124,6 +124,25 @@ describe('getEndpointField', () => {
   it('matches custom endpoint keys case-insensitively', () => {
     expect(getEndpointField(endpointsConfig, 'xai', 'type')).toBe(EModelEndpoint.custom);
     expect(getEndpointField(endpointsConfig, 'XAI', 'type')).toBe(EModelEndpoint.custom);
+  });
+});
+
+describe('memorySchema', () => {
+  it('accepts the bounded read profile config used by Viventium memory reads', () => {
+    const parsed = memorySchema.parse({
+      agent: { provider: 'anthropic', model: 'claude-sonnet-4-5' },
+      readProfile: {
+        tokenLimit: 1800,
+        keyOrder: ['core', 'context'],
+        keyLimits: { core: 220, context: 320 },
+        cacheTtlMs: 30000,
+      },
+    });
+
+    expect(parsed.readProfile?.tokenLimit).toBe(1800);
+    expect(parsed.readProfile?.keyOrder).toEqual(['core', 'context']);
+    expect(parsed.readProfile?.keyLimits?.core).toBe(220);
+    expect(parsed.readProfile?.cacheTtlMs).toBe(30000);
   });
 });
 

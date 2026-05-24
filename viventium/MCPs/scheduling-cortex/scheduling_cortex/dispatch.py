@@ -4,11 +4,14 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -44,7 +47,9 @@ DEFAULT_SCHEDULER_PROMPT_PREFIX = "\n".join(
 
 # === VIVENTIUM START ===
 # Feature: Multi-channel dispatch support.
-from .models import AVAILABLE_CHANNELS
+from .models import AVAILABLE_CHANNELS, DEFAULT_DELIVERY_CHANNELS
+from .storage import ScheduleStorage, StorageConfig
+from .utils import to_utc_iso
 # === VIVENTIUM END ===
 
 # === VIVENTIUM NOTE ===
@@ -1501,7 +1506,7 @@ def _parse_channel_value(value: Any) -> Any:
 
 def _normalize_dispatch_channels(value: Any) -> list[str]:
     if value is None:
-        return list(AVAILABLE_CHANNELS)
+        return list(DEFAULT_DELIVERY_CHANNELS)
     normalized_value = _parse_channel_value(value)
     if isinstance(normalized_value, str):
         raw_values = [normalized_value]
@@ -1836,6 +1841,526 @@ def _select_conversation_id(channel_results: Dict[str, Dict[str, Any]]) -> Optio
 # === VIVENTIUM NOTE ===
 
 
+# === VIVENTIUM START ===
+# Feature: Prompt Workbench scheduled prompts execute GlassHive directly.
+def _sha256_prefix(value: str, length: int = 16) -> str:
+    import hashlib
+
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:length]
+
+
+def _scheduler_storage() -> ScheduleStorage:
+    db_path = os.getenv("SCHEDULING_DB_PATH")
+    if not db_path:
+        db_path = str(
+            _app_support_dir()
+            / "state"
+            / "runtime"
+            / "isolated"
+            / "scheduling"
+            / "schedules.db"
+        )
+    mirror_path = os.getenv("SCHEDULING_DB_MIRROR_PATH")
+    return ScheduleStorage(StorageConfig(db_path=db_path, mirror_db_path=mirror_path))
+
+
+def _app_support_dir() -> Path:
+    return Path(
+        os.getenv("VIVENTIUM_APP_SUPPORT_DIR")
+        or (Path.home() / "Library" / "Application Support" / "Viventium")
+    ).expanduser()
+
+
+def _private_workbench_run_dir() -> Path:
+    root = Path(os.getenv("VIVENTIUM_PRIVATE_USER_DATA_DIR") or (_app_support_dir() / "private-user-data"))
+    path = root.expanduser() / "prompt-workbench" / "scheduled-runs"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _glasshive_base_url() -> str:
+    return (
+        os.getenv("GLASSHIVE_RUNTIME_URL")
+        or os.getenv("WPR_API_URL")
+        or "http://127.0.0.1:8766"
+    ).rstrip("/")
+
+
+def _glasshive_headers() -> Dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    token = (os.getenv("WPR_API_TOKEN") or os.getenv("GLASSHIVE_API_TOKEN") or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+        headers["X-WPR-Token"] = token
+    return headers
+
+
+def _glasshive_callback_secret() -> str:
+    return (
+        os.getenv("SCHEDULING_GLASSHIVE_CALLBACK_SECRET")
+        or os.getenv("VIVENTIUM_GLASSHIVE_CALLBACK_SECRET")
+        or os.getenv("SCHEDULER_LIBRECHAT_SECRET")
+        or os.getenv("VIVENTIUM_SCHEDULER_SECRET")
+        or ""
+    ).strip()
+
+
+def _glasshive_callback_url() -> str:
+    explicit = (os.getenv("SCHEDULING_GLASSHIVE_CALLBACK_URL") or "").strip()
+    if explicit:
+        return explicit
+    scheduling_mcp_url = (os.getenv("SCHEDULING_MCP_URL") or "").strip()
+    if scheduling_mcp_url:
+        parsed = urllib.parse.urlsplit(scheduling_mcp_url)
+        path = parsed.path.rstrip("/")
+        if path.endswith("/mcp"):
+            path = path[:-4]
+        path = f"{path}/internal/scheduled-prompts/glasshive-callback"
+        return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+    port = (
+        os.getenv("VIVENTIUM_SCHEDULING_MCP_PORT")
+        or os.getenv("SCHEDULING_MCP_PORT")
+        or os.getenv("SCHEDULER_PORT")
+        or "7010"
+    ).strip()
+    return f"http://127.0.0.1:{port}/internal/scheduled-prompts/glasshive-callback"
+
+
+def _workbench_metadata(task: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = task.get("metadata")
+    if not isinstance(metadata, dict):
+        return {}
+    nested = metadata.get("workbench_scheduled_prompt")
+    return nested if isinstance(nested, dict) else {}
+
+
+def _import_workbench_scheduled_prompts() -> Any:
+    current = Path(__file__).resolve()
+    for parent in current.parents:
+        backend_root = parent / "viventium_v0_4" / "prompt-workbench" / "backend"
+        if backend_root.is_dir():
+            if str(parent) not in sys.path:
+                sys.path.insert(0, str(parent))
+            if str(backend_root) not in sys.path:
+                sys.path.insert(0, str(backend_root))
+            from prompt_workbench import scheduled_prompts as workbench_scheduled_prompts
+
+            return workbench_scheduled_prompts
+    raise RuntimeError("Prompt Workbench backend is unavailable for scheduled prompt rendering")
+
+
+def _refresh_workbench_rendered_prompt(
+    storage: ScheduleStorage,
+    task: Dict[str, Any],
+    wb: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    definition_id = str(wb.get("definition_id") or "").strip()
+    if not definition_id:
+        raise RuntimeError("Workbench scheduled prompt metadata missing definition_id; refusing stale dispatch")
+    definition = storage.get_scheduled_prompt_definition(definition_id)
+    if not definition:
+        raise RuntimeError(
+            f"Workbench scheduled prompt definition {definition_id} unavailable; refusing stale dispatch"
+        )
+    prompt_text = str(definition.get("prompt_text") or "")
+    if "{{" not in prompt_text:
+        return task, wb
+
+    renderer = _import_workbench_scheduled_prompts()
+    user_id = str(task.get("user_id") or definition.get("user_id") or "")
+    render_payload = renderer.render_variables(prompt_text, user_id=user_id, email=None)
+    rendered = str(render_payload.get("rendered") or "")
+    if not rendered:
+        raise RuntimeError("Prompt Workbench scheduled prompt rendered empty at dispatch time")
+
+    now_iso = to_utc_iso(datetime.now(timezone.utc))
+    latest_version = storage.latest_scheduled_prompt_version(definition_id)
+    rendered_hash = str(render_payload.get("renderedHash") or _sha256_prefix(rendered))
+    snapshot_json = str(render_payload.get("variableSnapshotJson") or "{}")
+    snapshot_hash = str(render_payload.get("variableSnapshotHash") or _sha256_prefix(snapshot_json))
+    rendered_marker = f"<private-rendered-prompt hash=\"{rendered_hash}\" />"
+    snapshot_marker = json.dumps(
+        {
+            "kind": "private-variable-snapshot",
+            "hash": snapshot_hash,
+            "privateDetail": f"private://scheduled-prompt-variable-snapshot/{snapshot_hash}",
+        },
+        sort_keys=True,
+    )
+    version = latest_version
+    if not latest_version or str(latest_version.get("rendered_hash") or "") != rendered_hash:
+        version_number = int((latest_version or {}).get("version_number") or 0) + 1
+        version = {
+            "id": f"spv_{uuid.uuid4().hex}",
+            "definition_id": definition_id,
+            "version_number": version_number,
+            "prompt_text": prompt_text,
+            "rendered_text": rendered_marker,
+            "rendered_hash": rendered_hash,
+            "variable_snapshot_json": snapshot_marker,
+            "variable_snapshot_hash": snapshot_hash,
+            "created_at": now_iso,
+        }
+        storage.create_scheduled_prompt_version(version)
+
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    definition_metadata = definition.get("metadata") if isinstance(definition.get("metadata"), dict) else {}
+    execution_metadata = definition_metadata.get("execution") if isinstance(definition_metadata.get("execution"), dict) else {}
+    patched_metadata = dict(metadata)
+    if execution_metadata:
+        patched_metadata["execution"] = execution_metadata
+    patched_wb = dict(wb)
+    patched_wb.update(
+        {
+            "definition_id": definition_id,
+            "version_id": (version or {}).get("id"),
+            "title": definition.get("title") or wb.get("title"),
+            "template_id": definition.get("template_id") or wb.get("template_id"),
+            "source_prompt_id": definition.get("source_prompt_id") or wb.get("source_prompt_id"),
+            "rendered_hash": rendered_hash,
+            "variable_snapshot_hash": snapshot_hash,
+            "variable_snapshot_json": snapshot_json,
+            "variable_snapshot_pointer": f"private://scheduled-prompt-variable-snapshot/{snapshot_hash}",
+            "memory_write_mode": definition.get("memory_write_mode") or wb.get("memory_write_mode") or "off",
+            "workspace_alias": definition.get("workspace_alias") or wb.get("workspace_alias"),
+            "my_folder": definition.get("my_folder") or wb.get("my_folder"),
+            "executor": execution_metadata.get("executor") or wb.get("executor") or task.get("executor"),
+            "glasshive_worker_strategy": execution_metadata.get("glasshive_worker_strategy") or wb.get("glasshive_worker_strategy") or "same_worker",
+            "execution_profile": execution_metadata.get("execution_profile") or wb.get("execution_profile") or "codex-cli",
+            "execution_mode": execution_metadata.get("execution_mode") or wb.get("execution_mode") or "host",
+            "workspace_root": execution_metadata.get("workspace_root") or wb.get("workspace_root"),
+        }
+    )
+    persisted_wb = dict(patched_wb)
+    persisted_wb.pop("variable_snapshot_json", None)
+    patched_metadata["workbench_scheduled_prompt"] = persisted_wb
+    updated_task = storage.update_task(
+        user_id,
+        str(task.get("id") or ""),
+        {
+            "prompt": prompt_text,
+            "metadata": patched_metadata,
+            "updated_at": now_iso,
+            "updated_by": "agent:scheduling-cortex",
+            "updated_source": "runtime",
+        },
+    )
+    runtime_metadata = dict(patched_metadata)
+    runtime_metadata["workbench_scheduled_prompt"] = patched_wb
+    if updated_task:
+        patched_task = dict(updated_task)
+        patched_task["prompt"] = rendered
+        patched_task["metadata"] = runtime_metadata
+        return patched_task, patched_wb
+    patched_task = dict(task)
+    patched_task["prompt"] = rendered
+    patched_task["metadata"] = runtime_metadata
+    return patched_task, patched_wb
+
+
+def _write_private_run_detail(run_id: str, payload: Dict[str, Any]) -> str:
+    path = _private_workbench_run_dir() / f"{run_id}.json"
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return str(path)
+
+
+_LOCAL_PATH_RE = re.compile(r"(?:/Users|/home|/private/var|/var/folders)/[^\s`'\"<>]+")
+_URL_RE = re.compile(r"https?:\/\/[^\s`'\"<>)]*", re.IGNORECASE)
+_MONGO_URI_RE = re.compile(r"mongodb(?:\+srv)?:\/\/[^\s`'\"<>]+", re.IGNORECASE)
+_BEARER_RE = re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}", re.IGNORECASE)
+
+
+def _safe_result_summary(text: Any, limit: int = 2000) -> str:
+    value = str(text or "").strip()
+    value = _MONGO_URI_RE.sub("<mongo-uri>", value)
+    value = _BEARER_RE.sub("Bearer <redacted>", value)
+    value = _URL_RE.sub("<url>", value)
+    value = _LOCAL_PATH_RE.sub("<local-path>", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    if len(value) <= limit:
+        return value
+    return value[: limit - 1].rstrip() + "..."
+
+
+def _glasshive_instruction(task: Dict[str, Any], wb: Dict[str, Any]) -> str:
+    memory_mode = str(wb.get("memory_write_mode") or "off").strip()
+    my_folder = str(wb.get("my_folder") or "").strip()
+    rendered = str(task.get("prompt") or "").strip()
+    governance = [
+        "You are executing a Prompt Workbench scheduled prompt through GlassHive.",
+        "Use the rendered prompt and provided snapshot files as the source of truth.",
+        "Do not request or use raw Mongo credentials. Database-facing context has already been resolved server-side.",
+        f"Memory write mode: {memory_mode}.",
+        "If memory write mode is off, do not modify account memory.",
+        "If memory write mode is propose, write governed memory proposals only.",
+        "If memory write mode is apply_governed, write structured proposals; Scheduling Cortex/Workbench applies them through governed Viventium/LibreChat memory methods. Never direct-write memory collections.",
+    ]
+    if my_folder:
+        governance.append(f"Private scratchpad folder: {my_folder}")
+        governance.append(
+            "For memory proposals, write UTF-8 JSON under that folder named memory-proposals-yyyymmddHHmm.json with an actions array of set/delete objects."
+        )
+    governance.append("End every run with a concise `FINAL REPORT:` section.")
+    return "\n".join(governance).strip() + "\n\n" + rendered + "\n"
+
+
+def _glasshive_bootstrap_bundle(task: Dict[str, Any], wb: Dict[str, Any], run_id: str) -> Dict[str, Any]:
+    rendered = str(task.get("prompt") or "")
+    snapshot_json = str(wb.get("variable_snapshot_json") or "{}")
+    callbacks = {
+        "events_webhook_url": _glasshive_callback_url(),
+        "hmac_secret": _glasshive_callback_secret(),
+        "user_id": str(task.get("user_id") or ""),
+        "conversation_id": f"workbench-scheduled-prompt:{task.get('id')}",
+        "parent_message_id": f"scheduled-prompt:{task.get('id')}",
+        "message_id": run_id,
+        "surface": "workbench",
+        "scheduled_prompt_run_id": run_id,
+        "scheduled_prompt_task_id": str(task.get("id") or ""),
+    }
+    return {
+        "callbacks": callbacks,
+        "agents_md": (
+            "This is a Viventium Prompt Workbench scheduled prompt worker. "
+            "Keep raw prompt/result details inside the private GlassHive workspace and end with FINAL REPORT."
+        ),
+        "codex_md": (
+            "Use full local capabilities available to this GlassHive workspace. "
+            "Respect governed memory writeback and do not direct-write parent databases."
+        ),
+        "files": [
+            {
+                "scope": "workspace",
+                "path": "scheduled-prompt/rendered-prompt.md",
+                "content": rendered,
+            },
+            {
+                "scope": "workspace",
+                "path": "scheduled-prompt/variable-snapshot.json",
+                "content": snapshot_json,
+            },
+            {
+                "scope": "workspace",
+                "path": "scheduled-prompt/run-contract.md",
+                "content": (
+                    "# Run Contract\n\n"
+                    "- Execute the rendered prompt.\n"
+                    "- Use `work-log.md` for private notes.\n"
+                    "- Write text files as UTF-8. If browser-checking markdown, serve it through `python3 scheduled-prompt/utf8_static_server.py` so the browser receives an explicit UTF-8 charset.\n"
+                    "- If you produce memory changes, write `memory-proposals-yyyymmddHHmm.json` in my_folder with `{ \"actions\": [{ \"action\": \"set\", \"key\": \"context\", \"value\": \"...\", \"reason\": \"...\" }] }`.\n"
+                    "- End with `FINAL REPORT:` containing outcome, artifacts, blockers, and next decision.\n"
+                ),
+            },
+            {
+                "scope": "workspace",
+                "path": "scheduled-prompt/utf8_static_server.py",
+                "content": (
+                    "from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer\n\n"
+                    "class Handler(SimpleHTTPRequestHandler):\n"
+                    "    extensions_map = {**SimpleHTTPRequestHandler.extensions_map, '.md': 'text/markdown; charset=utf-8', '.txt': 'text/plain; charset=utf-8', '.json': 'application/json; charset=utf-8'}\n\n"
+                    "if __name__ == '__main__':\n"
+                    "    ThreadingHTTPServer(('127.0.0.1', 8765), Handler).serve_forever()\n"
+                ),
+            },
+        ],
+    }
+
+
+def _ensure_glasshive_project(storage: ScheduleStorage, task: Dict[str, Any], wb: Dict[str, Any]) -> str:
+    project_id = str(wb.get("glasshive_project_id") or "").strip()
+    if project_id:
+        return project_id
+    definition_id = str(wb.get("definition_id") or "").strip()
+    definition = storage.get_scheduled_prompt_definition(definition_id) if definition_id else None
+    definition_metadata = definition.get("metadata") if isinstance(definition, dict) and isinstance(definition.get("metadata"), dict) else {}
+    project_id = str(definition_metadata.get("glasshive_project_id") or "").strip()
+    if project_id:
+        return project_id
+    base_url = _glasshive_base_url()
+    title = str(wb.get("title") or "Workbench Scheduled Prompt").strip()
+    project = _post_json(
+        f"{base_url}/v1/projects",
+        {
+            "owner_id": str(task.get("user_id") or "workbench"),
+            "title": title,
+            "goal": "Execute private Prompt Workbench scheduled prompts.",
+            "default_worker_profile": "codex-cli",
+        },
+        _glasshive_headers(),
+        int(os.getenv("SCHEDULER_GLASSHIVE_HTTP_TIMEOUT_S", "20")),
+    )
+    project_id = str(project.get("project_id") or "").strip()
+    if not project_id:
+        raise RuntimeError("GlassHive project creation did not return project_id")
+    if definition_id:
+        if definition:
+            patched_metadata = dict(definition_metadata)
+            patched_metadata["glasshive_project_id"] = project_id
+            storage.update_scheduled_prompt_definition(
+                definition_id,
+                {"metadata": patched_metadata, "updated_at": to_utc_iso(datetime.now(timezone.utc))},
+            )
+    return project_id
+
+
+def _dispatch_glasshive_task(task: Dict[str, Any]) -> Dict[str, Any]:
+    wb = _workbench_metadata(task)
+    if not wb:
+        raise RuntimeError("glasshive_host executor requires workbench_scheduled_prompt metadata")
+    if not _glasshive_callback_secret():
+        raise RuntimeError("SCHEDULING_GLASSHIVE_CALLBACK_SECRET is required for signed GlassHive callbacks")
+
+    storage = _scheduler_storage()
+    task, wb = _refresh_workbench_rendered_prompt(storage, task, wb)
+    now = datetime.now(timezone.utc)
+    now_iso = to_utc_iso(now)
+    run_id = f"sp_run_{uuid.uuid4().hex}"
+    rendered_text = str(task.get("prompt") or "")
+    rendered_hash = str(wb.get("rendered_hash") or _sha256_prefix(rendered_text))
+    snapshot_hash = str(wb.get("variable_snapshot_hash") or "")
+    private_detail_path = _write_private_run_detail(
+        run_id,
+        {
+            "run_id": run_id,
+            "task_id": task.get("id"),
+            "definition_id": wb.get("definition_id"),
+            "version_id": wb.get("version_id"),
+            "created_at": now_iso,
+            "user_id": str(task.get("user_id") or ""),
+            "memory_write_mode": wb.get("memory_write_mode") or "off",
+            "my_folder": wb.get("my_folder"),
+            "rendered_prompt": rendered_text,
+            "variable_snapshot_json": wb.get("variable_snapshot_json"),
+        },
+    )
+    storage.create_scheduled_prompt_run(
+        {
+            "run_id": run_id,
+            "task_id": str(task.get("id") or ""),
+            "definition_id": wb.get("definition_id"),
+            "user_id": str(task.get("user_id") or ""),
+            "version_id": wb.get("version_id"),
+            "due_at": str(task.get("next_run_at") or now_iso),
+            "started_at": now_iso,
+            "completed_at": None,
+            "status": "dispatching",
+            "executor": "glasshive_host",
+            "rendered_hash": rendered_hash,
+            "variable_snapshot_hash": snapshot_hash,
+            "glasshive_project_id": None,
+            "glasshive_worker_id": None,
+            "glasshive_run_id": None,
+            "result_summary": None,
+            "error_class": None,
+            "private_detail_path": private_detail_path,
+            "callback_payload_json": None,
+            "created_at": now_iso,
+            "updated_at": now_iso,
+        }
+    )
+
+    if (os.getenv("SCHEDULER_GLASSHIVE_DISABLE_DISPATCH") or "").strip() == "1":
+        storage.update_scheduled_prompt_run(
+            run_id,
+            {
+                "status": "queued",
+                "result_summary": "GlassHive dispatch disabled by test environment.",
+                "updated_at": to_utc_iso(datetime.now(timezone.utc)),
+            },
+        )
+        return {
+            "delivery": {
+                "outcome": "queued",
+                "reason": "glasshive_dispatch_disabled",
+                "generated_text": None,
+                "channels": {"workbench": {"outcome": "queued", "reason": "test_disabled"}},
+            },
+            "scheduled_prompt_run_id": run_id,
+        }
+
+    try:
+        base_url = _glasshive_base_url()
+        timeout_s = int(os.getenv("SCHEDULER_GLASSHIVE_HTTP_TIMEOUT_S", "20"))
+        project_id = _ensure_glasshive_project(storage, task, wb)
+        alias = str(wb.get("workspace_alias") or f"workbench-scheduled-{str(wb.get('definition_id') or task.get('id'))[:12]}")
+        if str(wb.get("glasshive_worker_strategy") or "same_worker").strip() == "new_worker_each_run":
+            alias = f"{alias}-{run_id[-8:]}"
+        worker = _post_json(
+            f"{base_url}/v1/projects/{urllib.parse.quote(project_id)}/workers/find-or-resume",
+            {
+                "owner_id": str(task.get("user_id") or "workbench"),
+                "name": str(wb.get("title") or "Workbench Scheduled Prompt"),
+                "role": "Execute private Prompt Workbench scheduled prompts for Viventium.",
+                "profile": "codex-cli",
+                "backend": "openclaw",
+                "execution_mode": "host",
+                "alias": alias,
+                "workspace_root": str(wb.get("workspace_root") or ""),
+                "bootstrap_profile": "prompt-workbench-scheduled-v1",
+                "bootstrap_bundle": _glasshive_bootstrap_bundle(task, wb, run_id),
+            },
+            _glasshive_headers(),
+            timeout_s,
+        )
+        worker_id = str(worker.get("worker_id") or "").strip()
+        if not worker_id:
+            raise RuntimeError("GlassHive worker find-or-resume did not return worker_id")
+        run = _post_json(
+            f"{base_url}/v1/workers/{urllib.parse.quote(worker_id)}/assign",
+            {"instruction": _glasshive_instruction(task, wb)},
+            _glasshive_headers(),
+            timeout_s,
+        )
+        glasshive_run_id = str(run.get("run_id") or "").strip()
+        if not glasshive_run_id:
+            raise RuntimeError("GlassHive assign did not return run_id")
+        storage.update_scheduled_prompt_run(
+            run_id,
+            {
+                "status": "queued",
+                "glasshive_project_id": project_id,
+                "glasshive_worker_id": worker_id,
+                "glasshive_run_id": glasshive_run_id,
+                "result_summary": "GlassHive host run queued.",
+                "updated_at": to_utc_iso(datetime.now(timezone.utc)),
+            },
+        )
+        return {
+            "delivery": {
+                "outcome": "queued",
+                "reason": "glasshive_host_run_queued",
+                "generated_text": None,
+                "channels": {
+                    "workbench": {
+                        "outcome": "queued",
+                        "reason": "glasshive_host_run_queued",
+                        "scheduled_prompt_run_id": run_id,
+                        "glasshive_run_id": glasshive_run_id,
+                    }
+                },
+            },
+            "scheduled_prompt_run_id": run_id,
+            "glasshive_run_id": glasshive_run_id,
+        }
+    except Exception as exc:
+        storage.update_scheduled_prompt_run(
+            run_id,
+            {
+                "status": "failed",
+                "completed_at": to_utc_iso(datetime.now(timezone.utc)),
+                "error_class": exc.__class__.__name__,
+                "result_summary": _safe_result_summary(str(exc)),
+                "updated_at": to_utc_iso(datetime.now(timezone.utc)),
+            },
+        )
+        raise
+# === VIVENTIUM END ===
+
+
 def _prepare_generated_visibility(
     task: Dict[str, Any],
     final_text: str,
@@ -2079,6 +2604,16 @@ def _deliver_telegram_generated_text(
 
 
 def dispatch_task(task: Dict[str, Any]) -> Dict[str, Any]:
+    executor = str(task.get("executor") or "viventium_agent").strip()
+    wb = _workbench_metadata(task)
+    if wb and executor != "glasshive_host":
+        storage = _scheduler_storage()
+        task, wb = _refresh_workbench_rendered_prompt(storage, task, wb)
+    if executor == "glasshive_host":
+        return _dispatch_glasshive_task(task)
+    if executor != "viventium_agent":
+        raise RuntimeError(f"Unsupported schedule executor: {executor}")
+
     # === VIVENTIUM NOTE ===
     # Feature: Single-run scheduled generation with multi-channel fan-out.
     # Purpose: One scheduler tick must produce one canonical agent run, then fan the same

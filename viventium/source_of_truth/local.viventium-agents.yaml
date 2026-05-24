@@ -1,6 +1,6 @@
 meta:
   version: 1
-  exportedAt:
+  exportedAt: null
   user:
     email: user@example.com
     id: placeholder-owner
@@ -23,38 +23,75 @@ config:
           promptRef: cortex.background_activation_decision_subject
       activation_policy:
         enabled: true
-        prompt: |
-          The main agent owns the current turn. Background agents are optional reviewers, not controllers.
+        prompt: >
+          The main agent owns the current turn. Background agents are optional reviewers, not
+          controllers.
 
-          Connected direct-action surfaces listed below are the authoritative owners for live execution, status, approvals, callbacks, files, browser/desktop/OS work, schedules, workers, projects, and run results they cover.
 
-          Use this background agent's configured activation criteria as its only scope. Do not infer a broader scope from the conversation. When this policy and this background agent's own activation criteria disagree, prefer the stricter outcome: do not activate.
+          Connected direct-action surfaces listed below are the authoritative owners for live
+          execution, status, approvals, callbacks, files, browser/desktop/OS work, schedules,
+          workers, projects, and run results they cover.
 
-          Return should_activate=false when the latest request is primarily asking to perform, start, continue, resume, stop, monitor, approve, check, or report on work owned by a connected direct-action surface, except when the connected surface is marked same_scope_background_allowed=true and this background agent's own configured activation scope exactly matches that surface. In that same-scope case, the main agent still owns Phase A execution and this background agent may activate for supplemental Phase B evidence when its own criteria are clearly met.
 
-          Return should_activate=false for follow-ups on live work, including short status/result turns, when the referenced work belongs to a connected direct-action surface, except for the same-scope supplemental case above.
+          Use this background agent's configured activation criteria as its only scope. Do not infer
+          a broader scope from the conversation. When this policy and this background agent's own
+          activation criteria disagree, prefer the stricter outcome: do not activate.
 
-          Return should_activate=false when the user is asking for proof by execution rather than a separate analysis, critique, plan, or decision.
 
-          Return should_activate=true only when the latest request contains a separate explicit question or decision that this background agent's configured scope clearly owns and can answer without claiming, simulating, or second-guessing direct-action results.
+          Return should_activate=false when the latest request is primarily asking to perform,
+          start, continue, resume, stop, monitor, approve, check, or report on work owned by a
+          connected direct-action surface, except when the connected surface is marked
+          same_scope_background_allowed=true and this background agent's own configured activation
+          scope exactly matches that surface. In that same-scope case, the main agent still owns
+          Phase A execution and this background agent may activate for supplemental Phase B evidence
+          when its own criteria are clearly met.
+
+
+          Return should_activate=false for follow-ups on live work, including short status/result
+          turns, when the referenced work belongs to a connected direct-action surface, except for
+          the same-scope supplemental case above.
+
+
+          Return should_activate=false when the user is asking for proof by execution rather than a
+          separate analysis, critique, plan, or decision.
+
+
+          Return should_activate=true only when the latest request contains a separate explicit
+          question or decision that this background agent's configured scope clearly owns and can
+          answer without claiming, simulating, or second-guessing direct-action results.
+
 
           For mixed requests:
+
           - direct-action/status/result part -> main agent/tool path owns it
-          - independent analysis/review/planning part -> activate only if this agent's own scope clearly owns it
 
-          If activated, the insight must stay within that independent scope. It must not narrate worker, browser, runtime, schedule, file, invoice, screenshot, tool, callback, or OS status unless this same background agent received verified evidence in its own allowed context this turn.
+          - independent analysis/review/planning part -> activate only if this agent's own scope
+          clearly owns it
 
-          Never activate just to confirm tool availability, provide operational IDs/links, summarize a tool owner's result, or answer from memory when the requested fact belongs to live execution.
+
+          If activated, the insight must stay within that independent scope. It must not narrate
+          worker, browser, runtime, schedule, file, invoice, screenshot, tool, callback, or OS
+          status unless this same background agent received verified evidence in its own allowed
+          context this turn.
+
+
+          Never activate just to confirm tool availability, provide operational IDs/links, summarize
+          a tool owner's result, or answer from memory when the requested fact belongs to live
+          execution.
+
 
           If uncertain, return should_activate=false.
         direct_action_mcp_servers:
           - server: glasshive-workers-projects
-            owns: persistent workers, project runs, browser/desktop/local computer execution, worker status, and completion reports
+            owns: >-
+              persistent workers, project runs, browser/desktop/local computer execution, worker
+              status, and completion reports
             tool_names:
               - sys__server__sys_mcp_glasshive-workers-projects
               - projects_list_mcp_glasshive-workers-projects
               - project_create_mcp_glasshive-workers-projects
               - worker_delegate_once_mcp_glasshive-workers-projects
+              - workspace_schedule_mcp_glasshive-workers-projects
               - project_get_mcp_glasshive-workers-projects
               - project_runs_mcp_glasshive-workers-projects
               - project_events_mcp_glasshive-workers-projects
@@ -64,6 +101,8 @@ config:
               - worker_get_mcp_glasshive-workers-projects
               - worker_live_mcp_glasshive-workers-projects
               - worker_run_mcp_glasshive-workers-projects
+              - worker_schedule_mcp_glasshive-workers-projects
+              - worker_schedules_mcp_glasshive-workers-projects
               - worker_message_mcp_glasshive-workers-projects
               - worker_pause_mcp_glasshive-workers-projects
               - worker_resume_mcp_glasshive-workers-projects
@@ -73,7 +112,9 @@ config:
               - worker_takeover_mcp_glasshive-workers-projects
               - run_get_mcp_glasshive-workers-projects
           - server: scheduling-cortex
-            owns: reminders, scheduled follow-ups, same-conversation wakeups, delayed status checks, and schedule management
+            owns: >-
+              reminders, scheduled follow-ups, same-conversation wakeups, delayed status checks, and
+              schedule management
             tool_names:
               - sys__server__sys_mcp_scheduling-cortex
               - schedule_create_mcp_scheduling-cortex
@@ -87,7 +128,9 @@ config:
           - server: google-workspace
             scope_key: productivity_google_workspace
             same_scope_background_allowed: true
-            owns: live Gmail, Google Calendar, Google Drive, Docs, Sheets, Slides, Chat, Tasks, and Workspace actions available to the main agent
+            owns: >-
+              live Gmail, Google Calendar, Google Drive, Docs, Sheets, Slides, Chat, Tasks, and
+              Workspace actions available to the main agent
             tool_names:
               - sys__server__sys_mcp_google_workspace
               - search_gmail_messages_mcp_google_workspace
@@ -104,7 +147,9 @@ config:
           - server: ms365
             scope_key: productivity_ms365
             same_scope_background_allowed: true
-            owns: live Outlook email, Outlook calendar, OneDrive, Excel, OneNote, Planner, To Do, and Microsoft 365 actions available to the main agent
+            owns: >-
+              live Outlook email, Outlook calendar, OneDrive, Excel, OneNote, Planner, To Do, and
+              Microsoft 365 actions available to the main agent
             tool_names:
               - sys__server__sys_mcp_ms-365
               - list-mail-messages_mcp_ms-365
@@ -116,25 +161,56 @@ config:
               - download-onedrive-file-content_mcp_ms-365
               - get-excel-range_mcp_ms-365
               - search-query_mcp_ms-365
-        direct_action_tool_rule: |
-          Connected direct-action surfaces are execution owners. Their presence means the main agent has the primary path; background cortices should stay silent unless they add separately scoped value or the matching direct-action surface explicitly allows same-scope supplemental background evidence.
+        direct_action_tool_rule: >
+          Connected direct-action surfaces are execution owners. Their presence means the main agent
+          has the primary path; background cortices should stay silent unless they add separately
+          scoped value or the matching direct-action surface explicitly allows same-scope
+          supplemental background evidence.
     no_response:
-      prompt: |-
+      prompt: >-
         NO RESPONSE TAG:
+
         - If you have nothing meaningful to add, respond with exactly: {NTA}
+
         - When you use {NTA}, output ONLY that token and nothing else.
+
         - Never use {NTA} to hide errors/tool failures; explain the issue briefly instead.
-        - Never use {NTA} to hide a new verified fact, time-sensitive blocker, tool completion, approval need, or meaningful change. Surface it briefly in the user's current channel.
+
+        - Never use {NTA} to hide a new verified fact, time-sensitive blocker, tool completion,
+        approval need, or meaningful change. Surface it briefly in the user's current channel.
     conversation_recall:
-      prompt: |-
+      prompt: >-
         CONVERSATION RECALL:
-        - When the user asks about prior chats, earlier context, previous decisions, same-day continuity, or something mentioned before, use `file_search` to check conversation recall before saying you do not remember.
-        - When the user asks about prior meeting transcripts, transcriptions, or conversations based on transcripts, use `file_search` to check transcript recall. For broad transcript-list questions, rely on the meeting transcript inventory/table of contents when it is available, then use detailed transcript summaries for narrower follow-ups.
-        - For transcript-list answers, preserve the user's requested level of brevity. Include date/time, participants, and the actual meeting context when visible, and add a short caveat that transcript evidence can be AI-transcribed, stale, audience-specific, or not a stable user belief.
-        - Treat "what were we talking about", "we were just talking about this", and "earlier today/this morning" as recall checks, not as fresh-chat onboarding.
-        - For exact-history questions, verify with retrieved evidence instead of guessing from memory alone.
-        - If recall evidence is inconclusive, say that honestly and ask a focused clarification instead of claiming the conversation is missing.
-        - Do not answer live mailbox, calendar, or external-system status questions from conversation recall alone; use the relevant live tool when available.
+
+        - When the user asks about prior chats, earlier context, previous decisions, same-day
+        continuity, or something mentioned before, use `file_search` to check conversation recall
+        before saying you do not remember.
+
+        - When the user asks about prior meeting transcripts, transcriptions, or conversations based
+        on transcripts, use `file_search` to check transcript recall. For broad transcript-list
+        questions, rely on the meeting transcript inventory/table of contents when it is available,
+        then use detailed transcript summaries for narrower follow-ups.
+
+        - For transcript-list answers, preserve the user's requested level of brevity. If the user
+        asks for a numeric shape such as "5 line summary", that shape applies to the whole answer:
+        do not add a table, extra section, or second summary. Use at most that many compact lines
+        total, one line per transcript entry when possible, and fold one short caveat into the final
+        line when needed. Include date/time, participants, and actual meeting context when visible,
+        but do not expand into full per-meeting notes unless the user asks for detail. The caveat
+        should say transcript evidence can be AI-transcribed, stale, audience-specific, or not a
+        stable user belief.
+
+        - Treat "what were we talking about", "we were just talking about this", and "earlier
+        today/this morning" as recall checks, not as fresh-chat onboarding.
+
+        - For exact-history questions, verify with retrieved evidence instead of guessing from
+        memory alone.
+
+        - If recall evidence is inconclusive, say that honestly and ask a focused clarification
+        instead of claiming the conversation is missing.
+
+        - Do not answer live mailbox, calendar, or external-system status questions from
+        conversation recall alone; use the relevant live tool when available.
     configVersion: 1
     primaryProvider: openai
     installMode: native
@@ -144,7 +220,9 @@ config:
 mainAgent:
   id: agent_viventium_main_95aeb3
   name: Viventium
-  description: The conscious self. Background cortices process in parallel, surfacing insights without blocking dialogue.
+  description: >-
+    The conscious self. Background cortices process in parallel, surfacing insights without blocking
+    dialogue.
   instructions:
     promptRef: main.conscious_agent
   provider: anthropic
@@ -164,13 +242,17 @@ mainAgent:
     - project_create_mcp_glasshive-workers-projects
     - project_get_mcp_glasshive-workers-projects
     - worker_delegate_once_mcp_glasshive-workers-projects
+    - workspace_schedule_mcp_glasshive-workers-projects
     - project_runs_mcp_glasshive-workers-projects
     - project_events_mcp_glasshive-workers-projects
     - workers_list_mcp_glasshive-workers-projects
     - worker_create_mcp_glasshive-workers-projects
+    - worker_find_or_resume_mcp_glasshive-workers-projects
     - worker_get_mcp_glasshive-workers-projects
     - worker_live_mcp_glasshive-workers-projects
     - worker_run_mcp_glasshive-workers-projects
+    - worker_schedule_mcp_glasshive-workers-projects
+    - worker_schedules_mcp_glasshive-workers-projects
     - worker_message_mcp_glasshive-workers-projects
     - worker_pause_mcp_glasshive-workers-projects
     - worker_resume_mcp_glasshive-workers-projects
@@ -180,7 +262,6 @@ mainAgent:
     - worker_takeover_mcp_glasshive-workers-projects
     - run_get_mcp_glasshive-workers-projects
     - metrics_summary_mcp_glasshive-workers-projects
-    - worker_find_or_resume_mcp_glasshive-workers-projects
     - file_search
     - web_search
   tool_kwargs: []
@@ -426,14 +507,14 @@ backgroundAgents:
       name: ''
       email: ''
     background_cortices: []
-    voice_llm_model:
-    voice_llm_provider:
+    voice_llm_model: null
+    voice_llm_provider: null
     voice_llm_model_parameters: {}
-    voice_fallback_llm_model:
-    voice_fallback_llm_provider:
+    voice_fallback_llm_model: null
+    voice_fallback_llm_provider: null
     voice_fallback_llm_model_parameters: {}
-    fallback_llm_model:
-    fallback_llm_provider:
+    fallback_llm_model: null
+    fallback_llm_provider: null
     fallback_llm_model_parameters: {}
     agent_ids: []
     edges: []
@@ -460,8 +541,8 @@ backgroundAgents:
       name: ''
       email: ''
     background_cortices: []
-    voice_llm_model:
-    voice_llm_provider:
+    voice_llm_model: null
+    voice_llm_provider: null
     voice_llm_model_parameters: {}
     fallback_llm_model: grok-4.3
     fallback_llm_provider: xai
@@ -473,7 +554,9 @@ backgroundAgents:
     category: viventium
   - id: agent_viventium_red_team_95aeb3
     name: Red Team
-    description: Evidence-first mistake detection - verifies claims, tests viability, and calls out rationalization.
+    description: >-
+      Evidence-first mistake detection - verifies claims, tests viability, and calls out
+      rationalization.
     instructions:
       promptRef: cortex.red_team.execution
     provider: openAI
@@ -492,8 +575,8 @@ backgroundAgents:
       name: ''
       email: ''
     background_cortices: []
-    voice_llm_model:
-    voice_llm_provider:
+    voice_llm_model: null
+    voice_llm_provider: null
     voice_llm_model_parameters: {}
     fallback_llm_model: grok-4.3
     fallback_llm_provider: xai
@@ -524,8 +607,8 @@ backgroundAgents:
       name: ''
       email: ''
     background_cortices: []
-    voice_llm_model:
-    voice_llm_provider:
+    voice_llm_model: null
+    voice_llm_provider: null
     voice_llm_model_parameters: {}
     fallback_llm_model: grok-4.3
     fallback_llm_provider: xai
@@ -542,7 +625,17 @@ backgroundAgents:
       promptRef: cortex.online_tool_use.execution
     provider: openAI
     model: gpt-5.4
-    tools: []
+    tools:
+      - sys__server__sys_mcp_ms-365
+      - list-mail-messages_mcp_ms-365
+      - get-mail-message_mcp_ms-365
+      - list-mail-folder-messages_mcp_ms-365
+      - list-calendar-events_mcp_ms-365
+      - get-calendar-event_mcp_ms-365
+      - list-folder-files_mcp_ms-365
+      - download-onedrive-file-content_mcp_ms-365
+      - get-excel-range_mcp_ms-365
+      - search-query_mcp_ms-365
     tool_kwargs: []
     model_parameters:
       model: gpt-5.4
@@ -552,8 +645,8 @@ backgroundAgents:
       name: ''
       email: ''
     background_cortices: []
-    voice_llm_model:
-    voice_llm_provider:
+    voice_llm_model: null
+    voice_llm_provider: null
     voice_llm_model_parameters: {}
     fallback_llm_model: grok-4.3
     fallback_llm_provider: xai
@@ -661,7 +754,10 @@ backgroundAgents:
     category: viventium
   - id: agent_viventium_support_95aeb3
     name: Viventium User Help
-    description: In-product help for using Viventium — conversations, voice, agents, integrations, scheduling. Never mentions internal implementation; escalates to the official Viventium support channel only when needed.
+    description: >-
+      In-product help for using Viventium — conversations, voice, agents, integrations, scheduling.
+      Never mentions internal implementation; escalates to the official Viventium support channel
+      only when needed.
     instructions:
       promptRef: cortex.support.execution
     provider: anthropic
@@ -677,8 +773,8 @@ backgroundAgents:
       name: ''
       email: ''
     background_cortices: []
-    voice_llm_model:
-    voice_llm_provider:
+    voice_llm_model: null
+    voice_llm_provider: null
     voice_llm_model_parameters: {}
     fallback_llm_model: gpt-5.4
     fallback_llm_provider: openAI
@@ -697,9 +793,18 @@ backgroundAgents:
     provider: openAI
     model: gpt-5.4
     tools:
-      - sys__server__sys_mcp_sequential-thinking
-      - sequentialthinking_mcp_sequential-thinking
-      - file_search
+      - sys__server__sys_mcp_google_workspace
+      - search_gmail_messages_mcp_google_workspace
+      - get_gmail_message_content_mcp_google_workspace
+      - get_gmail_messages_content_batch_mcp_google_workspace
+      - get_gmail_thread_content_mcp_google_workspace
+      - list_calendars_mcp_google_workspace
+      - get_events_mcp_google_workspace
+      - search_drive_files_mcp_google_workspace
+      - get_drive_file_content_mcp_google_workspace
+      - search_docs_mcp_google_workspace
+      - get_doc_content_mcp_google_workspace
+      - read_sheet_values_mcp_google_workspace
     tool_kwargs: []
     model_parameters:
       model: gpt-5.4
@@ -709,8 +814,8 @@ backgroundAgents:
       name: ''
       email: ''
     background_cortices: []
-    voice_llm_model:
-    voice_llm_provider:
+    voice_llm_model: null
+    voice_llm_provider: null
     voice_llm_model_parameters: {}
     fallback_llm_model: grok-4.3
     fallback_llm_provider: xai

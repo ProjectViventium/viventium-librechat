@@ -60,6 +60,33 @@ describe('viventium-sync-agents args', () => {
     expect(args.modelConfigOnly).toBe(true);
   });
 
+  test('parseArgs captures tools-only flag', () => {
+    const args = parseArgs(['push', '--tools-only', '--agent-ids=agent-a']);
+
+    expect(args.action).toBe('push');
+    expect(args.toolsOnly).toBe(true);
+    expect(args.selectedAgentIds).toEqual(['agent-a']);
+  });
+
+  test('buildUpdateData only updates tools in tools-only mode', () => {
+    const update = buildUpdateData(
+      {
+        id: 'agent-a',
+        instructions: 'new prompt',
+        provider: 'openAI',
+        model: 'gpt-5.4',
+        tools: ['search_gmail_messages_mcp_google_workspace'],
+        tool_kwargs: [{ name: 'search_gmail_messages_mcp_google_workspace' }],
+      },
+      { toolsOnly: true },
+    );
+
+    expect(update).toEqual({
+      tools: ['search_gmail_messages_mcp_google_workspace'],
+      tool_kwargs: [{ name: 'search_gmail_messages_mcp_google_workspace' }],
+    });
+  });
+
   test('buildUpdateData keeps the dedicated voice parameter bag in model-config-only mode', () => {
     const update = buildUpdateData(
       {
@@ -128,6 +155,15 @@ describe('viventium-sync-agents args', () => {
     expect(
       shouldRepairRuntimeFieldsForPushMode({
         activationConfigOnly: true,
+        runtimeAware: true,
+      }),
+    ).toBe(false);
+  });
+
+  test('safe tools pushes do not run runtime repair', () => {
+    expect(
+      shouldRepairRuntimeFieldsForPushMode({
+        toolsOnly: true,
         runtimeAware: true,
       }),
     ).toBe(false);

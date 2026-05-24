@@ -118,6 +118,14 @@ router.get('/', async function (req, res) {
        * === VIVENTIUM END === */
       viventiumConnectedAccountsEnabled: isEnabled(process.env.VIVENTIUM_LOCAL_SUBSCRIPTION_AUTH),
       /* === VIVENTIUM START ===
+       * Feature: Prompt Workbench local launcher.
+       * Purpose: Keep the Connected Accounts workbench entry in sync with the server-side local
+       * lifecycle route and its kill switch.
+       * === VIVENTIUM END === */
+      viventiumPromptWorkbenchLinkEnabled:
+        isEnabled(process.env.VIVENTIUM_LOCAL_SUBSCRIPTION_AUTH) &&
+        !isEnabled(process.env.VIVENTIUM_PROMPT_WORKBENCH_LINK_DISABLED),
+      /* === VIVENTIUM START ===
        * Feature: GlassHive host worker callbacks.
        * Purpose: Project the compiled callback wait window into the web client.
        * === VIVENTIUM END === */

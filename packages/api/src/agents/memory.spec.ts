@@ -2,7 +2,16 @@ import { Types } from 'mongoose';
 import { Run, Providers } from '@librechat/agents';
 import type { IUser } from '@librechat/data-schemas';
 import type { Response } from 'express';
-import { createMemoryProcessor, loadMemorySnapshot, processMemory } from './memory';
+import {
+  clearMemoryReadContextCache,
+  clearMemoryWriterHealth,
+  createMemoryProcessor,
+  getMemoryWriterHealthGate,
+  loadMemoryReadContext,
+  loadMemorySnapshot,
+  markMemoryWriterFailure,
+  processMemory,
+} from './memory';
 
 jest.mock('~/stream/GenerationJobManager');
 
@@ -753,6 +762,137 @@ describe('Memory Agent Header Resolution', () => {
 });
 
 describe('Memory snapshot loading', () => {
+  beforeEach(() => {
+    clearMemoryReadContextCache();
+    clearMemoryWriterHealth({
+      userId: 'user-123',
+      provider: Providers.ANTHROPIC,
+      model: 'claude-sonnet-4-5',
+    });
+  });
+
+  it('loads a bounded deduped read context without running writer maintenance or formatted memory', async () => {
+    const userId = new Types.ObjectId();
+    const methods = {
+      setMemory: jest.fn().mockResolvedValue({ ok: true }),
+      deleteMemory: jest.fn(),
+      getFormattedMemories: jest.fn(),
+      getAllUserMemories: jest.fn().mockResolvedValue([
+        {
+          _id: new Types.ObjectId(),
+          userId,
+          key: 'core',
+          value: 'Old core memory.',
+          tokenCount: 5,
+          updated_at: new Date('2026-01-01T00:00:00Z'),
+        },
+        {
+          _id: new Types.ObjectId(),
+          userId,
+          key: 'core',
+          value: 'New core memory.',
+          tokenCount: 5,
+          updated_at: new Date('2026-05-01T00:00:00Z'),
+        },
+        {
+          _id: new Types.ObjectId(),
+          userId,
+          key: 'world',
+          value: 'World memory '.repeat(40),
+          tokenCount: 120,
+          updated_at: new Date('2026-04-01T00:00:00Z'),
+        },
+        {
+          _id: new Types.ObjectId(),
+          userId,
+          key: 'legacy',
+          value: 'Legacy key should not be injected.',
+          tokenCount: 8,
+          updated_at: new Date('2026-05-02T00:00:00Z'),
+        },
+      ]),
+    };
+
+    const context = await loadMemoryReadContext({
+      userId,
+      memoryMethods: methods,
+      config: {
+        validKeys: ['core', 'world'],
+        readProfile: {
+          tokenLimit: 40,
+          keyOrder: ['core', 'world'],
+          keyLimits: { core: 20, world: 12 },
+          cacheTtlMs: 10_000,
+        },
+      },
+    });
+
+    expect(context.text).toContain('New core memory.');
+    expect(context.text).not.toContain('Old core memory.');
+    expect(context.text).not.toContain('Legacy key should not be injected.');
+    expect(context.text).toContain('## world');
+    expect(context.text).toContain('...');
+    expect(context.includedKeys).toEqual(['core', 'world']);
+    expect(context.duplicateKeys).toEqual(['core']);
+    expect(methods.getAllUserMemories).toHaveBeenCalledWith(userId);
+    expect(methods.getFormattedMemories).not.toHaveBeenCalled();
+    expect(methods.setMemory).not.toHaveBeenCalled();
+  });
+
+  it('caches the read context by user and read profile until explicitly cleared', async () => {
+    const methods = {
+      setMemory: jest.fn(),
+      deleteMemory: jest.fn(),
+      getFormattedMemories: jest.fn(),
+      getAllUserMemories: jest.fn().mockResolvedValue([
+        {
+          _id: new Types.ObjectId(),
+          userId: 'user-123',
+          key: 'core',
+          value: 'Cached core memory.',
+          tokenCount: 5,
+          updated_at: new Date('2026-05-01T00:00:00Z'),
+        },
+      ]),
+    };
+
+    const config = {
+      validKeys: ['core'],
+      readProfile: { tokenLimit: 200, cacheTtlMs: 10_000 },
+    };
+    const first = await loadMemoryReadContext({ userId: 'user-123', memoryMethods: methods, config });
+    const second = await loadMemoryReadContext({ userId: 'user-123', memoryMethods: methods, config });
+    clearMemoryReadContextCache('user-123');
+    const third = await loadMemoryReadContext({ userId: 'user-123', memoryMethods: methods, config });
+
+    expect(first.cacheHit).toBe(false);
+    expect(second.cacheHit).toBe(true);
+    expect(third.cacheHit).toBe(false);
+    expect(methods.getAllUserMemories).toHaveBeenCalledTimes(2);
+  });
+
+  it('gates repeated memory writer runs after provider authentication failure', () => {
+    const status = markMemoryWriterFailure({
+      userId: 'user-123',
+      provider: Providers.ANTHROPIC,
+      model: 'claude-sonnet-4-5',
+      error: { status: 401, message: 'Invalid authentication credentials' },
+    });
+
+    const gate = getMemoryWriterHealthGate({
+      userId: 'user-123',
+      provider: Providers.ANTHROPIC,
+      model: 'claude-sonnet-4-5',
+    });
+
+    expect(status?.reason).toBe('auth');
+    expect(gate.blocked).toBe(true);
+    if (gate.blocked) {
+      expect(gate.message).toContain('Reconnect');
+      expect(gate.shouldLog).toBe(true);
+    }
+  });
+
   it('loads stored memory without requiring a writer agent', async () => {
     const methods = {
       setMemory: jest.fn().mockResolvedValue({ ok: true }),

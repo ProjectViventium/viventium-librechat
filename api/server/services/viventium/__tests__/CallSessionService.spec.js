@@ -563,7 +563,7 @@ describe('CallSessionService', () => {
       voice_llm_provider: 'openAI',
       voice_llm_model: 'gpt-5.4',
       fallback_llm_provider: 'openAI',
-      fallback_llm_model: 'gpt-5.4-mini',
+      fallback_llm_model: 'gpt-5.4',
       voice_fallback_llm_provider: 'anthropic',
       voice_fallback_llm_model: 'claude-haiku-4-5',
       author: user._id.toString(),

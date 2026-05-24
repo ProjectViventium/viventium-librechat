@@ -223,6 +223,7 @@ function isRecoverableFallbackErrorClass(value) {
   const normalized = normalizeFallbackErrorClass(value);
   return [
     'provider_rate_limited',
+    'provider_temporarily_unavailable',
     'recoverable_provider_error',
     'provider_unauthorized',
     'provider_access_denied',

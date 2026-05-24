@@ -288,6 +288,19 @@ function readRuntimeAssignment({
   return null;
 }
 
+function runtimeModelOverridesAllowed({ env = process.env } = {}) {
+  return envFlagEnabled('VIVENTIUM_ALLOW_RUNTIME_MODEL_OVERRIDES', { env });
+}
+
+function approvedRuntimeFamiliesForAgent(agentId, { env = process.env } = {}) {
+  if (runtimeModelOverridesAllowed({ env })) {
+    return null;
+  }
+  return agentId === 'agent_viventium_main_95aeb3'
+    ? APPROVED_MAIN_RUNTIME_FAMILIES
+    : APPROVED_BACKGROUND_RUNTIME_FAMILIES;
+}
+
 function readVoiceAssignment(
   {
     explicitProvider = '',
@@ -337,10 +350,7 @@ function rewriteAgentForRuntime(agent, { env = process.env } = {}) {
       ...envMap,
       fallbackProvider: rewritten.provider,
       fallbackModel: rewritten.model,
-      approvedFamilies:
-        rewritten.id === 'agent_viventium_main_95aeb3'
-          ? APPROVED_MAIN_RUNTIME_FAMILIES
-          : APPROVED_BACKGROUND_RUNTIME_FAMILIES,
+      approvedFamilies: approvedRuntimeFamiliesForAgent(rewritten.id, { env }),
     });
     if (assignment) {
       rewritten.provider = assignment.provider;

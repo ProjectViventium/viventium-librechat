@@ -203,6 +203,31 @@ describe('agentLlmFallback', () => {
     ).toBe(false);
   });
 
+  test('retries provider overload errors only when no assistant text was produced', () => {
+    expect(
+      shouldRetryWithFallback([
+        {
+          type: ContentTypes.ERROR,
+          [ContentTypes.ERROR]:
+            'The model provider is temporarily overloaded. Please try again shortly.',
+          error_class: 'provider_temporarily_unavailable',
+        },
+      ]),
+    ).toBe(true);
+
+    expect(
+      shouldRetryWithFallback([
+        { type: ContentTypes.TEXT, text: 'Partial answer' },
+        {
+          type: ContentTypes.ERROR,
+          [ContentTypes.ERROR]:
+            'The model provider is temporarily overloaded. Please try again shortly.',
+          error_class: 'provider_temporarily_unavailable',
+        },
+      ]),
+    ).toBe(false);
+  });
+
   test('treats OpenAI-style text.value parts as visible assistant text', () => {
     const textValuePart = {
       type: ContentTypes.TEXT,

@@ -36,6 +36,10 @@ const skyvern = require('./skyvern');
  * Feature: GlassHive host-worker callback receiver.
  * === VIVENTIUM NOTE === */
 const glasshive = require('./glasshive');
+/* === VIVENTIUM NOTE ===
+ * Feature: Prompt Workbench local launcher route.
+ * === VIVENTIUM NOTE === */
+const promptWorkbench = require('./promptWorkbench');
 
 const router = express.Router();
 
@@ -51,5 +55,6 @@ router.use('/credits', credits);
 router.use('/auth', auth);
 router.use('/skyvern', skyvern);
 router.use('/glasshive', glasshive);
+router.use('/prompt-workbench', promptWorkbench);
 
 module.exports = router;

@@ -849,6 +849,8 @@
   "com_ui_connected_account_manual_ready": "{{provider}} sign-in opened. Paste the code here when finished.",
   "com_ui_connected_accounts": "Connected Accounts",
   "com_ui_connected_accounts_description": "Sign in once to OpenAI or Anthropic. No API keys required.",
+  "com_ui_prompt_workbench": "Prompt Workbench",
+  "com_ui_prompt_workbench_open_error": "Prompt Workbench could not be opened. Check local runtime status and try again.",
   "com_ui_contact_admin_if_issue_persists": "Contact the Admin if the issue persists",
   "com_ui_context": "Context",
   "com_ui_context_filter_sort": "Filter and Sort by Context",

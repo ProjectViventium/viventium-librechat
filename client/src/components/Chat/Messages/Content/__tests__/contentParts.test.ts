@@ -251,6 +251,34 @@ describe('filterRenderableContentParts', () => {
     expect(filterRenderableContentParts(nonTerminationAfterText)).toBe(nonTerminationAfterText);
   });
 
+  it('hides structured recoverable provider errors after visible assistant text', () => {
+    const parts: TMessageContentParts[] = [
+      {
+        type: ContentTypes.TEXT,
+        text: 'Visible recovered answer.',
+      },
+      {
+        type: ContentTypes.ERROR,
+        [ContentTypes.ERROR]: 'The model provider is temporarily overloaded. Please try again shortly.',
+        error_class: 'provider_temporarily_unavailable',
+      } as unknown as TMessageContentParts,
+    ];
+
+    expect(filterRenderableContentParts(parts)).toEqual([parts[0]]);
+  });
+
+  it('keeps structured recoverable provider errors visible when no assistant text exists', () => {
+    const parts: TMessageContentParts[] = [
+      {
+        type: ContentTypes.ERROR,
+        [ContentTypes.ERROR]: 'The model provider is temporarily overloaded. Please try again shortly.',
+        error_class: 'provider_temporarily_unavailable',
+      } as unknown as TMessageContentParts,
+    ];
+
+    expect(filterRenderableContentParts(parts)).toBe(parts);
+  });
+
   it('does not count runtime-hold no-response text as visible text for late termination hiding', () => {
     const parts: TMessageContentParts[] = [
       {

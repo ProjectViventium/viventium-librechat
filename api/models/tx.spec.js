@@ -52,6 +52,11 @@ describe('getValueKey', () => {
     expect(getValueKey('openai/gpt-5.2')).toBe('gpt-5.2');
   });
 
+  it('should return the exact gpt-5.4 value key before the generic gpt-5 key', () => {
+    expect(getValueKey('gpt-5.4')).toBe('gpt-5.4');
+    expect(getValueKey('openai/gpt-5.4')).toBe('gpt-5.4');
+  });
+
   it('should return "gpt-3.5-turbo-1106" for model name containing "gpt-3.5-turbo-1106"', () => {
     expect(getValueKey('gpt-3.5-turbo-1106-some-other-info')).toBe('gpt-3.5-turbo-1106');
     expect(getValueKey('openai/gpt-3.5-turbo-1106')).toBe('gpt-3.5-turbo-1106');

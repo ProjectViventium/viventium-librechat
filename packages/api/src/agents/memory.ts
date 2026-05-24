@@ -49,6 +49,7 @@ export interface MemoryConfig {
   tokenLimit?: number;
   keyLimits?: MemoryKeyLimits;
   maintenanceThresholdPercent?: number;
+  readProfile?: MemoryReadProfileConfig;
 }
 
 export interface MemorySnapshot {
@@ -58,11 +59,410 @@ export interface MemorySnapshot {
   memoryTokenMap: Record<string, number>;
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Bounded saved-memory read profile and writer health gate
+ * Purpose: Keep chat-time memory reads small/cached/deduped and prevent repeated
+ * provider-auth failures from running on every chat turn.
+ * === VIVENTIUM END === */
+export interface MemoryReadProfileConfig {
+  tokenLimit?: number;
+  keyLimits?: Record<string, number>;
+  keyOrder?: string[];
+  cacheTtlMs?: number;
+}
+
+export interface MemoryReadContext {
+  text: string;
+  totalTokens: number;
+  includedKeys: string[];
+  omittedKeys: string[];
+  duplicateKeys: string[];
+  cacheHit: boolean;
+}
+
 export const memoryInstructions =
   'The system automatically stores important user information and can update or delete memories based on user requests, enabling dynamic memory management.';
 
 const MEMORY_DECISION_TOOL_NAME = 'apply_memory_changes';
 const ANTHROPIC_MEMORY_DEFAULT_THINKING = true;
+const DEFAULT_MEMORY_READ_TOKEN_LIMIT = 1800;
+const DEFAULT_MEMORY_READ_CACHE_TTL_MS = 30_000;
+const DEFAULT_MEMORY_READ_KEY_ORDER = [
+  'core',
+  'preferences',
+  'world',
+  'context',
+  'working',
+  'drafts',
+  'signals',
+  'moments',
+  'me',
+];
+const DEFAULT_MEMORY_READ_KEY_LIMITS: Record<string, number> = {
+  core: 220,
+  preferences: 180,
+  world: 320,
+  context: 320,
+  working: 180,
+  drafts: 220,
+  signals: 200,
+  moments: 180,
+  me: 160,
+};
+const MEMORY_WRITER_AUTH_SUPPRESSION_MS = 10 * 60 * 1000;
+const MEMORY_WRITER_HEALTH_LOG_INTERVAL_MS = 60 * 1000;
+
+type MemoryEntryLeanLike = {
+  _id?: unknown;
+  key?: string;
+  value?: string;
+  tokenCount?: number;
+  updated_at?: Date | string;
+};
+
+type MemoryReadCacheEntry = MemoryReadContext & {
+  expiresAt: number;
+};
+
+type MemoryWriterHealthEntry = {
+  blockedUntil: number;
+  reason: 'auth';
+  message: string;
+  provider?: string;
+  model?: string;
+  lastLoggedAt?: number;
+};
+
+const memoryReadContextCache = new Map<string, MemoryReadCacheEntry>();
+const memoryWriterHealth = new Map<string, MemoryWriterHealthEntry>();
+
+function stableStringify(value: unknown): string {
+  if (value == null || typeof value !== 'object') {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(',')}]`;
+  }
+  return `{${Object.entries(value as Record<string, unknown>)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, item]) => `${JSON.stringify(key)}:${stableStringify(item)}`)
+    .join(',')}}`;
+}
+
+function approximateTokenCount(value: unknown): number {
+  if (typeof value !== 'string' || !value.trim()) {
+    return 0;
+  }
+  return Math.max(1, Math.ceil(value.length / 4));
+}
+
+function sanitizePositiveNumber(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function resolveMemoryReadProfile(config: MemoryConfig = {}): Required<MemoryReadProfileConfig> {
+  const profile = config.readProfile ?? {};
+  return {
+    tokenLimit: sanitizePositiveNumber(profile.tokenLimit, DEFAULT_MEMORY_READ_TOKEN_LIMIT),
+    keyLimits: {
+      ...DEFAULT_MEMORY_READ_KEY_LIMITS,
+      ...(profile.keyLimits ?? {}),
+    },
+    keyOrder:
+      Array.isArray(profile.keyOrder) && profile.keyOrder.length > 0
+        ? profile.keyOrder.filter((key) => typeof key === 'string' && key.trim())
+        : DEFAULT_MEMORY_READ_KEY_ORDER,
+    cacheTtlMs: sanitizePositiveNumber(profile.cacheTtlMs, DEFAULT_MEMORY_READ_CACHE_TTL_MS),
+  };
+}
+
+function getUpdatedAtMs(memory: MemoryEntryLeanLike): number {
+  const value = memory.updated_at;
+  const ms = value instanceof Date ? value.getTime() : new Date(value ?? 0).getTime();
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function getMemoryEntryId(memory: MemoryEntryLeanLike): string {
+  const value = memory._id;
+  if (value == null) {
+    return '';
+  }
+  return typeof value === 'string' ? value : String(value);
+}
+
+function dedupeMemoriesByKey(memories: MemoryEntryLeanLike[]): {
+  memories: MemoryEntryLeanLike[];
+  duplicateKeys: string[];
+} {
+  const sorted = [...memories].sort((a, b) => {
+    const updatedDiff = getUpdatedAtMs(b) - getUpdatedAtMs(a);
+    if (updatedDiff !== 0) {
+      return updatedDiff;
+    }
+    return getMemoryEntryId(b).localeCompare(getMemoryEntryId(a));
+  });
+  const byKey = new Map<string, MemoryEntryLeanLike>();
+  const duplicateKeys = new Set<string>();
+  for (const memory of sorted) {
+    const key = typeof memory.key === 'string' ? memory.key.trim() : '';
+    if (!key) {
+      continue;
+    }
+    if (byKey.has(key)) {
+      duplicateKeys.add(key);
+      continue;
+    }
+    byKey.set(key, memory);
+  }
+  return { memories: Array.from(byKey.values()), duplicateKeys: Array.from(duplicateKeys).sort() };
+}
+
+function trimMemoryValueToBudget(value: string, tokenBudget: number): string {
+  if (approximateTokenCount(value) <= tokenBudget) {
+    return value.trim();
+  }
+  const charBudget = Math.max(16, tokenBudget * 4 - 3);
+  return `${value.slice(0, charBudget).trimEnd()}...`;
+}
+
+function formatMemoryReadProfile({
+  memories,
+  config,
+}: {
+  memories: MemoryEntryLeanLike[];
+  config?: MemoryConfig;
+}): MemoryReadContext {
+  const readProfile = resolveMemoryReadProfile(config);
+  const validKeys = new Set(config?.validKeys ?? []);
+  const hasValidKeyFilter = validKeys.size > 0;
+  const { memories: dedupedMemories, duplicateKeys } = dedupeMemoriesByKey(memories);
+  const keyOrderIndex = new Map(readProfile.keyOrder.map((key, index) => [key, index]));
+  const eligibleMemories = dedupedMemories
+    .filter((memory) => {
+      const key = typeof memory.key === 'string' ? memory.key.trim() : '';
+      return key && (!hasValidKeyFilter || validKeys.has(key));
+    })
+    .sort((a, b) => {
+      const aKey = String(a.key);
+      const bKey = String(b.key);
+      const aOrder = keyOrderIndex.get(aKey) ?? Number.MAX_SAFE_INTEGER;
+      const bOrder = keyOrderIndex.get(bKey) ?? Number.MAX_SAFE_INTEGER;
+      if (aOrder !== bOrder) {
+        return aOrder - bOrder;
+      }
+      return getUpdatedAtMs(b) - getUpdatedAtMs(a);
+    });
+
+  const includedKeys: string[] = [];
+  const omittedKeys: string[] = [];
+  const sections: string[] = [];
+  let remainingTokens = readProfile.tokenLimit;
+
+  for (const memory of eligibleMemories) {
+    const key = String(memory.key);
+    const rawValue = typeof memory.value === 'string' ? memory.value.trim() : '';
+    if (!rawValue) {
+      continue;
+    }
+    const keyLimit = sanitizePositiveNumber(
+      readProfile.keyLimits[key],
+      Math.min(readProfile.tokenLimit, remainingTokens),
+    );
+    const budget = Math.min(keyLimit, remainingTokens);
+    if (budget <= 0) {
+      omittedKeys.push(key);
+      continue;
+    }
+    const trimmedValue = trimMemoryValueToBudget(rawValue, budget);
+    const usedTokens = Math.min(budget, memory.tokenCount ?? approximateTokenCount(trimmedValue));
+    sections.push(`## ${key}\n${trimmedValue}`);
+    includedKeys.push(key);
+    remainingTokens -= Math.max(1, usedTokens);
+    if (approximateTokenCount(rawValue) > budget) {
+      omittedKeys.push(`${key}:truncated`);
+    }
+  }
+
+  const includedSet = new Set(includedKeys);
+  for (const memory of eligibleMemories) {
+    const key = String(memory.key);
+    if (!includedSet.has(key) && !omittedKeys.includes(key)) {
+      omittedKeys.push(key);
+    }
+  }
+
+  return {
+    text: sections.join('\n\n'),
+    totalTokens: readProfile.tokenLimit - remainingTokens,
+    includedKeys,
+    omittedKeys,
+    duplicateKeys,
+    cacheHit: false,
+  };
+}
+
+function getMemoryReadCacheKey({
+  userId,
+  config,
+}: {
+  userId: string | ObjectId;
+  config?: MemoryConfig;
+}) {
+  return `${String(userId)}:${stableStringify({
+    validKeys: config?.validKeys,
+    readProfile: resolveMemoryReadProfile(config),
+  })}`;
+}
+
+export function clearMemoryReadContextCache(userId?: string | ObjectId) {
+  if (userId == null) {
+    memoryReadContextCache.clear();
+    return;
+  }
+  const prefix = `${String(userId)}:`;
+  for (const key of memoryReadContextCache.keys()) {
+    if (key.startsWith(prefix)) {
+      memoryReadContextCache.delete(key);
+    }
+  }
+}
+
+export async function loadMemoryReadContext({
+  userId,
+  memoryMethods,
+  config = {},
+}: {
+  userId: string | ObjectId;
+  memoryMethods: RequiredMemoryMethods;
+  config?: MemoryConfig;
+}): Promise<MemoryReadContext> {
+  const readProfile = resolveMemoryReadProfile(config);
+  const cacheKey = getMemoryReadCacheKey({ userId, config });
+  const now = Date.now();
+  const cached = memoryReadContextCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) {
+    return { ...cached, cacheHit: true };
+  }
+
+  const memories = await memoryMethods.getAllUserMemories(userId);
+  const context = formatMemoryReadProfile({
+    memories: memories as MemoryEntryLeanLike[],
+    config: { ...config, readProfile },
+  });
+  memoryReadContextCache.set(cacheKey, {
+    ...context,
+    expiresAt: now + readProfile.cacheTtlMs,
+  });
+  return context;
+}
+
+function getErrorField(error: unknown, key: string): unknown {
+  if (error == null || typeof error !== 'object') {
+    return undefined;
+  }
+  return (error as Record<string, unknown>)[key];
+}
+
+function errorContainsAuthFailure(error: unknown): boolean {
+  const status = getErrorField(error, 'status') ?? getErrorField(error, 'statusCode');
+  const code = String(getErrorField(error, 'code') ?? '').toLowerCase();
+  const type = String(getErrorField(error, 'type') ?? '').toLowerCase();
+  const message = String(
+    getErrorField(error, 'message') ??
+      getErrorField(getErrorField(error, 'error'), 'message') ??
+      '',
+  ).toLowerCase();
+
+  if (status === 401 || status === '401') {
+    return true;
+  }
+  return (
+    code.includes('auth') ||
+    type.includes('auth') ||
+    message.includes('invalid authentication') ||
+    message.includes('authentication') ||
+    message.includes('api key')
+  );
+}
+
+function getMemoryWriterHealthKey({
+  userId,
+  provider,
+  model,
+}: {
+  userId: string | ObjectId;
+  provider?: string;
+  model?: string;
+}) {
+  return [String(userId), provider || 'unknown', model || 'unknown'].join(':');
+}
+
+export function clearMemoryWriterHealth({
+  userId,
+  provider,
+  model,
+}: {
+  userId: string | ObjectId;
+  provider?: string;
+  model?: string;
+}) {
+  memoryWriterHealth.delete(getMemoryWriterHealthKey({ userId, provider, model }));
+}
+
+export function markMemoryWriterFailure({
+  userId,
+  provider,
+  model,
+  error,
+}: {
+  userId: string | ObjectId;
+  provider?: string;
+  model?: string;
+  error: unknown;
+}): MemoryWriterHealthEntry | undefined {
+  if (!errorContainsAuthFailure(error)) {
+    return undefined;
+  }
+  const key = getMemoryWriterHealthKey({ userId, provider, model });
+  const entry: MemoryWriterHealthEntry = {
+    blockedUntil: Date.now() + MEMORY_WRITER_AUTH_SUPPRESSION_MS,
+    reason: 'auth',
+    message:
+      'Saved memory writer authentication failed. Reconnect the memory provider account before retrying durable memory writes.',
+    provider,
+    model,
+  };
+  memoryWriterHealth.set(key, entry);
+  return entry;
+}
+
+export function getMemoryWriterHealthGate({
+  userId,
+  provider,
+  model,
+}: {
+  userId: string | ObjectId;
+  provider?: string;
+  model?: string;
+}): (MemoryWriterHealthEntry & { blocked: true; shouldLog: boolean }) | { blocked: false } {
+  const key = getMemoryWriterHealthKey({ userId, provider, model });
+  const entry = memoryWriterHealth.get(key);
+  if (!entry) {
+    return { blocked: false };
+  }
+  const now = Date.now();
+  if (entry.blockedUntil <= now) {
+    memoryWriterHealth.delete(key);
+    return { blocked: false };
+  }
+  const shouldLog =
+    entry.lastLoggedAt == null ||
+    now - entry.lastLoggedAt >= MEMORY_WRITER_HEALTH_LOG_INTERVAL_MS;
+  if (shouldLog) {
+    entry.lastLoggedAt = now;
+  }
+  return { ...entry, blocked: true, shouldLog };
+}
 
 const getDefaultInstructions = (
   validKeys?: string[],
@@ -1049,6 +1449,14 @@ ${memory ?? 'No existing memories'}`;
       content = await run.processStream(inputs, config);
     }
     if (content) {
+      clearMemoryWriterHealth({
+        userId,
+        provider: llmConfig?.provider,
+        model:
+          llmConfig != null && 'model' in llmConfig
+            ? (llmConfig.model as string | undefined)
+            : undefined,
+      });
       logger.debug('[MemoryAgent] Processed successfully', {
         userId,
         conversationId,
@@ -1067,6 +1475,12 @@ ${memory ?? 'No existing memories'}`;
       llmConfig?.provider === Providers.ANTHROPIC
         ? ((llmConfig as Record<string, unknown>).thinking ?? ANTHROPIC_MEMORY_DEFAULT_THINKING)
         : undefined;
+    const healthEntry = markMemoryWriterFailure({
+      userId,
+      provider: llmConfig?.provider,
+      model: configuredModel,
+      error,
+    });
     logger.error(
       `[MemoryAgent] Failed to process memory | userId: ${userId} | conversationId: ${conversationId} | messageId: ${messageId} | provider=${String(llmConfig?.provider ?? 'unknown')} | model=${configuredModel ?? 'unknown'} | thinkingMode=${anthropicThinking == null ? 'n/a' : describeAnthropicThinkingMode(anthropicThinking)} | temperature=${String((llmConfig as { temperature?: unknown } | undefined)?.temperature ?? 'unset')} | errorType=${typedError?.type ?? 'unknown'} | errorCode=${typedError?.code ?? 'unknown'} | errorMessage=${String(typedError?.message ?? 'unknown').replace(/\s+/g, ' ').slice(0, 300)}`,
       {
@@ -1076,6 +1490,12 @@ ${memory ?? 'No existing memories'}`;
         errorMessage: typedError?.message,
         errorCode: typedError?.code,
         errorType: typedError?.type,
+        memoryWriterHealth: healthEntry
+          ? {
+              reason: healthEntry.reason,
+              blockedUntil: new Date(healthEntry.blockedUntil).toISOString(),
+            }
+          : undefined,
       },
     );
   }

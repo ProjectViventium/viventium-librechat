@@ -1009,6 +1009,42 @@ describe('/api/viventium/glasshive/callback', () => {
     expect(message.text).not.toContain('~/private');
   });
 
+  test('preserves signed GlassHive action link targets while redacting raw worker plumbing', async () => {
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({
+      callback_id: 'cb_preserve_signed_action_links',
+      event: 'run.completed',
+      message:
+        'Worker wrk_raw_qa run_raw_qa prj_raw_qa completed.\n\n' +
+        'Download: [Download artifact](http://glasshive.localtest.me:8875/v1/signed-links/signed_file_token)\n' +
+        'View / Steer: [Open GlassHive workspace](http://glasshive.localtest.me:8875/watch/wrk_link_qa?surface=desktop&project_id=prj_link_qa&gh_token=signed_view_token)',
+    });
+    const req = createMockReq({
+      url: '/api/viventium/glasshive/callback',
+      headers: { 'x-glasshive-signature': signature(body) },
+      body,
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    const [, message] = mockSaveMessage.mock.calls[0];
+    expect(message.text).toContain('[worker id]');
+    expect(message.text).toContain('[run id]');
+    expect(message.text).toContain('[project id]');
+    expect(message.text).not.toContain('wrk_raw_qa');
+    expect(message.text).not.toContain('run_raw_qa');
+    expect(message.text).not.toContain('prj_raw_qa');
+    expect(message.text).toContain(
+      '[Download artifact](http://glasshive.localtest.me:8875/v1/signed-links/signed_file_token)',
+    );
+    expect(message.text).toContain(
+      '[Open GlassHive workspace](http://glasshive.localtest.me:8875/watch/wrk_link_qa?surface=desktop&project_id=prj_link_qa&gh_token=signed_view_token)',
+    );
+  });
+
   test('preserves markdown delimiters when redacting local links and paths', async () => {
     const router = require('../glasshive');
     const app = createTestApp(router);

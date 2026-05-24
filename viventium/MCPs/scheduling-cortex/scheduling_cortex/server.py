@@ -6,10 +6,16 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
+import json
 import logging
 import os
+import re
+import subprocess
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastmcp import FastMCP
@@ -19,6 +25,7 @@ from starlette.responses import JSONResponse, Response
 
 from .models import (
     AVAILABLE_CHANNELS,
+    DEFAULT_DELIVERY_CHANNELS,
     ChannelValue,
     CreateScheduleArgs,
     UpdateScheduleArgs,
@@ -216,7 +223,7 @@ def serialize_task_summary(task: Dict[str, Any]) -> Dict[str, Any]:
 # Feature: Normalize channel inputs and default to all when omitted.
 def _normalize_channels(value: Optional[ChannelValue], default_all: bool = False) -> list[str]:
     if value is None:
-        return list(AVAILABLE_CHANNELS) if default_all else []
+        return list(DEFAULT_DELIVERY_CHANNELS) if default_all else []
     if isinstance(value, str):
         raw_values = [value]
     else:
@@ -250,6 +257,216 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
     async def health(_: Request) -> Response:
         return JSONResponse({"status": "ok"})
     # VIVENTIUM NOTE
+
+    # === VIVENTIUM START ===
+    # Feature: Signed GlassHive completion callback for Workbench scheduled prompts.
+    def _glasshive_callback_secret() -> str:
+        return (
+            os.getenv("SCHEDULING_GLASSHIVE_CALLBACK_SECRET")
+            or os.getenv("VIVENTIUM_GLASSHIVE_CALLBACK_SECRET")
+            or os.getenv("SCHEDULER_LIBRECHAT_SECRET")
+            or os.getenv("VIVENTIUM_SCHEDULER_SECRET")
+            or ""
+        ).strip()
+
+    def _verify_glasshive_signature(payload: bytes, signature: str, worker_id: str, run_id: str) -> bool:
+        secret = _glasshive_callback_secret()
+        if not secret or not signature or not worker_id:
+            return False
+        binding = f"{worker_id}:{run_id}".encode("utf-8")
+        derived_secret = hmac.new(secret.encode("utf-8"), binding, hashlib.sha256).hexdigest().encode("utf-8")
+        expected = "sha256=" + hmac.new(derived_secret, payload, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, signature)
+
+    _local_path_re = re.compile(r"(?:/Users|/home|/private/var|/var/folders)/[^\s`'\"<>]+")
+    _url_re = re.compile(r"https?:\/\/[^\s`'\"<>)]*", re.IGNORECASE)
+    _mongo_uri_re = re.compile(r"mongodb(?:\+srv)?:\/\/[^\s`'\"<>]+", re.IGNORECASE)
+    _bearer_re = re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}", re.IGNORECASE)
+
+    def _safe_callback_summary(payload: Dict[str, Any], status: str, error_class: str | None) -> str:
+        event = str(payload.get("event") or "").strip()
+        if status == "completed":
+            return "GlassHive run completed. Private details are stored in the run detail file."
+        if status == "failed":
+            raw = str(payload.get("error") or error_class or event or "GlassHive run failed").strip()
+        elif status == "running":
+            raw = "GlassHive run started."
+        else:
+            raw = event or "GlassHive callback received."
+        raw = _mongo_uri_re.sub("<mongo-uri>", raw)
+        raw = _bearer_re.sub("Bearer <redacted>", raw)
+        raw = _url_re.sub("<url>", raw)
+        raw = _local_path_re.sub("<local-path>", raw)
+        raw = re.sub(r"\s+", " ", raw).strip()
+        return raw[:240] + ("..." if len(raw) > 240 else "")
+
+    def _hash_payload_text(payload: Dict[str, Any]) -> str | None:
+        text = str(payload.get("message") or payload.get("full_message") or payload.get("error") or "")
+        if not text:
+            return None
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+    def _append_private_callback(run: Dict[str, Any], payload: Dict[str, Any], received_at: str) -> Dict[str, Any]:
+        path_value = str(run.get("private_detail_path") or "").strip()
+        if not path_value:
+            return {}
+        path = Path(path_value).expanduser()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        except Exception:
+            data = {}
+        callbacks = data.get("callbacks") if isinstance(data.get("callbacks"), list) else []
+        callbacks.append({"received_at": received_at, "payload": payload})
+        data["callbacks"] = callbacks[-20:]
+        try:
+            path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        return data if isinstance(data, dict) else {}
+
+    def _proposal_files(my_folder: str, started_at: str | None) -> list[Path]:
+        root = Path(my_folder).expanduser()
+        if not root.is_dir():
+            return []
+        try:
+            started_ts = datetime.fromisoformat(str(started_at).replace("Z", "+00:00")).timestamp() if started_at else 0
+        except Exception:
+            started_ts = 0
+        paths = []
+        for path in root.glob("*.json"):
+            lowered = path.name.lower()
+            if "memory" not in lowered or "proposal" not in lowered:
+                continue
+            try:
+                if path.stat().st_mtime + 2 < started_ts:
+                    continue
+            except OSError:
+                continue
+            paths.append(path)
+        return sorted(paths, key=lambda item: item.stat().st_mtime if item.exists() else 0, reverse=True)
+
+    def _find_memory_proposal_helper() -> Path | None:
+        for parent in Path(__file__).resolve().parents:
+            candidate = parent / "scripts" / "viventium-memory-proposal-apply.js"
+            if candidate.exists():
+                return candidate
+        return None
+
+    def _maybe_apply_governed_memory(run: Dict[str, Any], private_detail: Dict[str, Any]) -> dict[str, Any] | None:
+        if str(private_detail.get("memory_write_mode") or "").strip() != "apply_governed":
+            return None
+        my_folder = str(private_detail.get("my_folder") or "").strip()
+        user_id = str(private_detail.get("user_id") or run.get("user_id") or "").strip()
+        if not my_folder or not user_id:
+            return {"ok": False, "reason": "missing_my_folder_or_user"}
+        proposal = next(iter(_proposal_files(my_folder, run.get("started_at"))), None)
+        if not proposal:
+            return {"ok": False, "reason": "no_structured_memory_proposal"}
+        helper = _find_memory_proposal_helper()
+        if not helper:
+            return {"ok": False, "reason": "helper_unavailable"}
+        completed = subprocess.run(
+            ["node", str(helper), "--proposal", str(proposal), "--user-id", user_id, "--apply", "--json"],
+            cwd=str(helper.parents[1]),
+            text=True,
+            capture_output=True,
+            timeout=45,
+            check=False,
+        )
+        try:
+            result = json.loads(completed.stdout.strip() or "{}")
+        except json.JSONDecodeError:
+            result = {"ok": False, "reason": "invalid_helper_json"}
+        if completed.returncode not in {0, 2}:
+            result = {"ok": False, "reason": "helper_failed"}
+        private_detail["memory_apply"] = result
+        try:
+            detail_path = Path(str(run.get("private_detail_path") or "")).expanduser()
+            if detail_path:
+                detail_path.write_text(json.dumps(private_detail, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                os.chmod(detail_path, 0o600)
+        except OSError:
+            pass
+        return result
+
+    @mcp.custom_route("/internal/scheduled-prompts/glasshive-callback", methods=["POST"])
+    async def glasshive_scheduled_prompt_callback(request: Request) -> Response:
+        raw = await request.body()
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except Exception:
+            return JSONResponse({"status": "error", "reason": "invalid_json"}, status_code=400)
+        if not isinstance(payload, dict):
+            return JSONResponse({"status": "error", "reason": "invalid_payload"}, status_code=400)
+
+        worker_id = str(payload.get("worker_id") or "").strip()
+        run_id = str(payload.get("run_id") or "").strip()
+        signature = request.headers.get("x-glasshive-signature", "")
+        if not _verify_glasshive_signature(raw, signature, worker_id, run_id):
+            return JSONResponse({"status": "error", "reason": "invalid_signature"}, status_code=401)
+
+        event = str(payload.get("event") or "").strip()
+        if event.startswith("worker.") and not run_id:
+            return JSONResponse({"status": "ok", "ignored": event})
+
+        run = storage.get_scheduled_prompt_run_by_glasshive_run(run_id)
+        callback_run_id = str(payload.get("message_id") or payload.get("scheduled_prompt_run_id") or "").strip()
+        if not run and callback_run_id:
+            run = storage.get_scheduled_prompt_run(callback_run_id)
+        if not run:
+            return JSONResponse({"status": "error", "reason": "unknown_run"}, status_code=404)
+
+        now = _now_iso()
+        if event == "run.completed":
+            status = "completed"
+            completed_at = now
+            error_class = None
+        elif event in {"run.failed", "run.cancelled", "run.interrupted"}:
+            status = "failed"
+            completed_at = now
+            error_class = event.replace("run.", "")
+        elif event == "run.started":
+            status = "running"
+            completed_at = run.get("completed_at")
+            error_class = run.get("error_class")
+        else:
+            status = str(run.get("status") or "queued")
+            completed_at = run.get("completed_at")
+            error_class = run.get("error_class")
+
+        private_detail = _append_private_callback(run, payload, now)
+        memory_apply = _maybe_apply_governed_memory(run, private_detail) if event == "run.completed" else None
+        if memory_apply and not memory_apply.get("ok"):
+            error_class = str(memory_apply.get("reason") or "memory_apply_blocked")
+            result_summary = f"GlassHive run completed; governed memory apply blocked: {error_class}."
+        elif memory_apply and memory_apply.get("ok"):
+            result_summary = "GlassHive run completed; governed memory proposal applied."
+        else:
+            result_summary = _safe_callback_summary(payload, status, error_class)
+
+        callback_summary = {
+            "event": event,
+            "received_at": now,
+            "status": status,
+            "message_hash": _hash_payload_text(payload),
+            "has_private_payload": bool(payload.get("message") or payload.get("full_message") or payload.get("error")),
+            "memory_apply_reason": memory_apply.get("reason") if isinstance(memory_apply, dict) else None,
+        }
+
+        storage.update_scheduled_prompt_run(
+            str(run["run_id"]),
+            {
+                "status": status,
+                "completed_at": completed_at,
+                "result_summary": result_summary or run.get("result_summary"),
+                "error_class": error_class,
+                "callback_payload_json": json.dumps(callback_summary),
+                "updated_at": now,
+            },
+        )
+        return JSONResponse({"status": "ok", "run_id": run["run_id"]})
+    # === VIVENTIUM END ===
 
     # === VIVENTIUM NOTE ===
     # Feature: Internal bootstrap endpoint for idempotent starter schedule provisioning.
@@ -296,7 +513,7 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
         elif isinstance(channels, str):
             channel_value = channels
         else:
-            channel_value = list(AVAILABLE_CHANNELS)
+            channel_value = list(DEFAULT_DELIVERY_CHANNELS)
 
         task = {
             "id": str(uuid.uuid4()),
@@ -305,6 +522,7 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             "prompt": prompt,
             "schedule": schedule,
             "channel": channel_value,
+            "executor": "viventium_agent",
             "conversation_policy": body.get("conversation_policy") or "same",
             "conversation_id": None,
             "last_conversation_id": None,
@@ -406,6 +624,7 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             # === VIVENTIUM NOTE ===
             # Feature: Store normalized channel(s) for dispatch fan-out.
             "channel": channel_value,
+            "executor": args.executor,
             # === VIVENTIUM NOTE ===
             "conversation_policy": args.conversation_policy,
             "conversation_id": args.conversation_id,
@@ -601,6 +820,8 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             channels = _normalize_channels(args.channel)
             updates["channel"] = channels[0] if len(channels) == 1 else channels
             # === VIVENTIUM NOTE ===
+        if args.executor is not None:
+            updates["executor"] = args.executor
         if args.conversation_policy is not None:
             updates["conversation_policy"] = args.conversation_policy
             if args.conversation_policy == "same" and not args.conversation_id:

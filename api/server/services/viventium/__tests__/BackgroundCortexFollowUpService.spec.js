@@ -19,6 +19,7 @@ const {
   extractRecentResponseTextFromMessage,
   resolveUserRequestTextFromMessages,
   isPlaceholderRecentResponseText,
+  mergeVisibleTextIntoMessageContent,
   upsertCortexParts,
 } = require('../BackgroundCortexFollowUpService');
 
@@ -67,6 +68,57 @@ describe('upsertCortexParts', () => {
         type: 'cortex_insight',
         cortex_id: 'red_team',
       }),
+    ]);
+  });
+});
+
+describe('mergeVisibleTextIntoMessageContent', () => {
+  test('drops stale provider error parts when recovered visible text replaces an empty primary', () => {
+    const merged = mergeVisibleTextIntoMessageContent(
+      [
+        {
+          type: 'cortex_insight',
+          cortex_id: 'emotional_resonance',
+          status: 'complete',
+          insight: 'A useful recovered observation.',
+        },
+        {
+          type: 'error',
+          error: 'The model provider is temporarily overloaded. Please try again shortly.',
+          error_class: 'provider_temporarily_unavailable',
+        },
+      ],
+      'Recovered visible answer.',
+      { dropErrorParts: true },
+    );
+
+    expect(merged).toEqual([
+      expect.objectContaining({
+        type: 'cortex_insight',
+        cortex_id: 'emotional_resonance',
+      }),
+      { type: 'text', text: 'Recovered visible answer.' },
+    ]);
+  });
+
+  test('preserves error parts when callers are only merging ordinary visible text', () => {
+    const merged = mergeVisibleTextIntoMessageContent(
+      [
+        {
+          type: 'error',
+          error: 'The model provider is temporarily overloaded. Please try again shortly.',
+          error_class: 'provider_temporarily_unavailable',
+        },
+      ],
+      'Visible answer.',
+    );
+
+    expect(merged).toEqual([
+      expect.objectContaining({
+        type: 'error',
+        error_class: 'provider_temporarily_unavailable',
+      }),
+      { type: 'text', text: 'Visible answer.' },
     ]);
   });
 });
@@ -884,6 +936,44 @@ describe('voice follow-up runtime assignment', () => {
       delete process.env.XAI_API_KEY;
     } else {
       process.env.XAI_API_KEY = originalXaiApiKey;
+    }
+  });
+
+  test('preserves the live main-agent route over compiled Anthropic defaults for text follow-ups', () => {
+    const originalProvider = process.env.VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER;
+    const originalModel = process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL;
+    process.env.VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER = 'anthropic';
+    process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL = 'claude-opus-4-7';
+
+    try {
+      const result = resolveFollowUpRuntimeAssignment(
+        {
+          id: 'agent_viventium_main_95aeb3',
+          provider: 'openAI',
+          model: 'gpt-5.4',
+          model_parameters: {
+            model: 'gpt-5.4',
+            reasoning_effort: 'high',
+          },
+        },
+        { useVoiceModel: false },
+      );
+
+      expect(result.effectiveProvider).toBe('openAI');
+      expect(result.effectiveModel).toBe('gpt-5.4');
+      expect(result.runtimeAgent.model_parameters.model).toBe('gpt-5.4');
+      expect(result.runtimeAgent.model_parameters).not.toHaveProperty('thinkingBudget');
+    } finally {
+      if (originalProvider == null) {
+        delete process.env.VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER;
+      } else {
+        process.env.VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER = originalProvider;
+      }
+      if (originalModel == null) {
+        delete process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL;
+      } else {
+        process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL = originalModel;
+      }
     }
   });
 

@@ -38,7 +38,10 @@ const {
   GenerationJobManager,
   getTransactionsConfig,
   createMemoryProcessor,
-  loadMemorySnapshot,
+  loadMemoryReadContext,
+  clearMemoryReadContextCache,
+  markMemoryWriterFailure,
+  getMemoryWriterHealthGate,
   filterMalformedContentParts,
 } = require('@librechat/api');
 const {
@@ -57,6 +60,7 @@ const {
   VisionModes,
   ContentTypes,
   EModelEndpoint,
+  Tools,
   PermissionTypes,
   isAgentsEndpoint,
   isEphemeralAgentId,
@@ -95,7 +99,10 @@ const {
   finalizeCanonicalCortexMessage,
   createCortexFollowUpMessage,
 } = require('~/server/services/viventium/BackgroundCortexFollowUpService');
-const { createRuntimeHoldTextPart } = require('~/server/services/viventium/runtimeHoldText');
+const {
+  createRuntimeHoldTextPart,
+  isRuntimeHoldTextPart,
+} = require('~/server/services/viventium/runtimeHoldText');
 const { getPromptText } = require('~/server/services/viventium/promptRegistry');
 /* === VIVENTIUM NOTE ===
  * Feature: Background cortex follow-up grace window
@@ -896,11 +903,39 @@ function getCompletionErrorMessage(err) {
 
 function classifyCompletionErrorForLog(err) {
   const message = getCompletionErrorMessage(err).trim().toLowerCase();
+  const code = String(err?.code || err?.lc_error_code || err?.error?.code || '')
+    .trim()
+    .toLowerCase();
+  /* === VIVENTIUM START ===
+   * Feature: Post-stream finalization error handling.
+   * Purpose: Distinguish provider/stream failures from deterministic cleanup work that runs only
+   * after the model stream has already completed and visible assistant text exists.
+   * === VIVENTIUM END === */
+  if (err?.viventiumCompletionPhase === 'post_stream_finalization') {
+    return 'post_stream_finalization';
+  }
+  if (err?.viventiumCompletionPhase === 'tool_cortex_deferred_main_response') {
+    return 'tool_cortex_deferred_main_response';
+  }
   if (isLateStreamTerminationError(err)) {
     return 'late_stream_termination';
   }
+  if (isLocalRetrievalTimeoutError(err)) {
+    return 'local_retrieval_timeout';
+  }
   if (message.includes('rate limit') || message.includes('rate_limit') || err?.status === 429) {
     return 'provider_rate_limited';
+  }
+  if (
+    code === 'server_is_overloaded' ||
+    message.includes('server_is_overloaded') ||
+    message.includes('server is overloaded') ||
+    message.includes('servers are currently overloaded') ||
+    message.includes('temporarily unavailable') ||
+    err?.status === 503 ||
+    err?.status === 529
+  ) {
+    return 'provider_temporarily_unavailable';
   }
   if (message.includes('unauthorized') || err?.status === 401) {
     return 'provider_unauthorized';
@@ -946,16 +981,72 @@ function isLateStreamTerminationError(err) {
   );
 }
 
+function isLocalRetrievalTimeoutError(err) {
+  const message = getCompletionErrorMessage(err).trim().toLowerCase();
+  const code = String(err?.code || '').trim().toUpperCase();
+  const source = [err?.toolName, err?.tool, err?.source, err?.lc_error_code, err?.name]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+  const timedOut =
+    code === 'ECONNABORTED' ||
+    code === 'ETIMEDOUT' ||
+    message.includes('timeout of 8000ms exceeded') ||
+    message.includes('timeout of 12000ms exceeded') ||
+    message.includes('timeout of 30000ms exceeded');
+  if (!timedOut) {
+    return false;
+  }
+
+  return (
+    source.includes('file_search') ||
+    source.includes('rag') ||
+    message.includes('file_search') ||
+    message.includes('rag') ||
+    message.includes('documents/exists') ||
+    message.includes('/query') ||
+    message.includes('timeout of 8000ms exceeded') ||
+    message.includes('timeout of 12000ms exceeded') ||
+    message.includes('timeout of 30000ms exceeded')
+  );
+}
+
+function hasRuntimeHoldAssistantText(contentParts) {
+  return Array.isArray(contentParts) && contentParts.some((part) => isRuntimeHoldTextPart(part));
+}
+
+function isSuppressibleTailCompletionError(err) {
+  const errorClass = classifyCompletionErrorForLog(err);
+  return (
+    errorClass === 'late_stream_termination' ||
+    errorClass === 'local_retrieval_timeout' ||
+    errorClass === 'post_stream_finalization' ||
+    errorClass === 'tool_cortex_deferred_main_response'
+  );
+}
+
 function shouldSuppressCompletionErrorContentPart(contentParts, err) {
-  return hasVisibleAssistantText(contentParts) && isLateStreamTerminationError(err);
+  const errorClass = classifyCompletionErrorForLog(err);
+  if (errorClass === 'tool_cortex_deferred_main_response') {
+    return hasRuntimeHoldAssistantText(contentParts);
+  }
+  return hasVisibleAssistantText(contentParts) && isSuppressibleTailCompletionError(err);
 }
 
 function createCompletionErrorContentPart(err) {
   const errorClass = classifyCompletionErrorForLog(err);
   const publicMessageByClass = {
     late_stream_termination: 'The model stream ended before a response was available.',
+    local_retrieval_timeout:
+      'Local retrieval timed out before the model response could be completed.',
+    post_stream_finalization:
+      'The response completed, but post-response finalization failed.',
+    tool_cortex_deferred_main_response:
+      'Background tool work is continuing in a follow-up response.',
     provider_rate_limited:
       'The model provider rate-limited this request. Please try again shortly.',
+    provider_temporarily_unavailable:
+      'The model provider is temporarily overloaded. Please try again shortly.',
     provider_unauthorized: 'The model provider credentials were rejected.',
     provider_access_denied: 'The model provider denied access to this request.',
     context_length_exceeded: 'The request was too large for the model context.',
@@ -980,7 +1071,7 @@ function handleCompletionErrorContentPart({ contentParts, err, abortController, 
   }
   if (suppressVisibleError) {
     log.warn(
-      '[api/server/controllers/agents/client.js #sendCompletion] Late stream termination after assistant text; suppressing visible error content part',
+      '[api/server/controllers/agents/client.js #sendCompletion] Tail completion error after assistant text; suppressing visible error content part',
       sanitizeCompletionErrorForLog(err),
     );
     return 'suppressed';
@@ -1405,6 +1496,8 @@ class AgentClient extends BaseClient {
     this.indexTokenCountMap = {};
     /** @type {(messages: BaseMessage[]) => Promise<void>} */
     this.processMemory;
+    this.memoryWriterState = null;
+    this.memoryWriterPromise = null;
     /* === VIVENTIUM START ===
      * Feature: Request-wide Phase B promise preservation.
      * Purpose: Fallback `chatCompletion` calls must not erase an in-flight
@@ -1706,11 +1799,19 @@ class AgentClient extends BaseClient {
       try {
         const withoutKeys = await this.useMemory();
         if (isDeepTimingEnabled(req)) {
+          const readContext = this.memoryReadContext;
           logDeepTiming(
             req,
             'build_messages_use_memory',
             memoryStart,
-            `hasMemory=${!!withoutKeys}`,
+            [
+              `hasMemory=${!!withoutKeys}`,
+              `readTokens=${readContext?.totalTokens ?? 0}`,
+              `includedKeys=${readContext?.includedKeys?.length ?? 0}`,
+              `omittedKeys=${readContext?.omittedKeys?.length ?? 0}`,
+              `duplicateKeys=${readContext?.duplicateKeys?.length ?? 0}`,
+              `cacheHit=${readContext?.cacheHit === true}`,
+            ].join(' '),
           );
         }
         return withoutKeys || null;
@@ -1912,6 +2013,7 @@ class AgentClient extends BaseClient {
   async useMemory() {
     const user = this.options.req.user;
     if (user.personalization?.memories === false) {
+      this.memoryWriterState = null;
       return;
     }
     const hasAccess = await checkAccess({
@@ -1925,11 +2027,13 @@ class AgentClient extends BaseClient {
       logger.debug(
         `[api/server/controllers/agents/client.js #useMemory] User ${user.id} does not have USE permission for memories`,
       );
+      this.memoryWriterState = null;
       return;
     }
     const appConfig = this.options.req.config;
     const memoryConfig = appConfig.memory;
     if (!memoryConfig || memoryConfig.disabled === true) {
+      this.memoryWriterState = null;
       return;
     }
 
@@ -1945,35 +2049,118 @@ class AgentClient extends BaseClient {
       tokenLimit: resolveMemoryTokenLimit(memoryConfig.tokenLimit),
       keyLimits: memoryConfig.keyLimits,
       maintenanceThresholdPercent: memoryConfig.maintenanceThresholdPercent,
+      readProfile: memoryConfig.readProfile,
     };
-    let memorySnapshot;
+    this.memoryReadContext = null;
+
+    /* === VIVENTIUM START ===
+     * Feature: Fast bounded saved-memory read profile.
+     *
+     * Why:
+     * - Chat-time "Use memory" should not initialize the memory writer or run deterministic
+     *   maintenance before the main model starts.
+     * - The critical path only needs a bounded, deduped read profile. The writer initializes
+     *   later, after the main response is produced.
+     *
+     * Added: 2026-05-20
+     * === VIVENTIUM END === */
+    this.memoryWriterState = {
+      appConfig,
+      userId,
+      memoryConfig,
+      memoryMethods,
+      memoryPolicyConfig,
+    };
+
     try {
-      memorySnapshot = await loadMemorySnapshot({
+      const readContext = await loadMemoryReadContext({
         userId,
         memoryMethods,
         config: memoryPolicyConfig,
       });
+      this.memoryReadContext = readContext;
+      return readContext.text || undefined;
     } catch (error) {
       logger.error(
-        '[api/server/controllers/agents/client.js #useMemory] Error loading stored memories',
+        '[api/server/controllers/agents/client.js #useMemory] Error loading memory read profile',
         sanitizeCompletionErrorForLog(error),
       );
+      return;
+    }
+  }
+
+  createMemoryWriterStatusAttachment({ message, errorType = 'provider_auth' }) {
+    return {
+      type: Tools.memory,
+      messageId: this.responseMessageId + '',
+      conversationId: this.conversationId + '',
+      [Tools.memory]: {
+        type: 'error',
+        key: 'system',
+        value: JSON.stringify({
+          errorType,
+          message,
+        }),
+      },
+    };
+  }
+
+  async initializeMemoryWriter(writerContext = {}) {
+    if (this.processMemory != null) {
+      return { ok: true };
     }
 
+    if (!this.memoryWriterState) {
+      await this.useMemory();
+    }
+
+    const state = this.memoryWriterState;
+    if (!state) {
+      return { ok: false };
+    }
+
+    const req = writerContext.req || this.options?.req;
+    const res = writerContext.res || this.options?.res;
+    const activeAgent = writerContext.agent || this.options?.agent;
     /** @type {Agent} */
     let prelimAgent;
+    const { appConfig, userId, memoryConfig, memoryMethods, memoryPolicyConfig } = state;
     const allowedProviders = new Set(
       appConfig?.endpoints?.[EModelEndpoint.agents]?.allowedProviders,
     );
+    const configuredProvider = memoryConfig?.agent?.provider;
+    const configuredModel = memoryConfig?.agent?.model;
+    if (configuredProvider || configuredModel) {
+      const gate = getMemoryWriterHealthGate({
+        userId,
+        provider: configuredProvider,
+        model: configuredModel,
+      });
+      if (gate.blocked) {
+        if (gate.shouldLog) {
+          logger.warn('[AgentClient] Saved memory writer degraded; provider reconnect required', {
+            provider: configuredProvider || null,
+            model: configuredModel || null,
+            retryAt: new Date(gate.blockedUntil).toISOString(),
+            reason: gate.reason,
+          });
+        }
+        return {
+          ok: false,
+          attachment: this.createMemoryWriterStatusAttachment({ message: gate.message }),
+        };
+      }
+    }
+
     try {
-      if (memoryConfig.agent?.id != null && memoryConfig.agent.id !== this.options.agent.id) {
+      if (memoryConfig.agent?.id != null && memoryConfig.agent.id !== activeAgent?.id) {
         prelimAgent = await loadAgent({
-          req: this.options.req,
+          req,
           agent_id: memoryConfig.agent.id,
           endpoint: EModelEndpoint.agents,
         });
       } else if (memoryConfig.agent?.id != null) {
-        prelimAgent = this.options.agent;
+        prelimAgent = activeAgent;
       } else if (
         memoryConfig.agent?.id == null &&
         memoryConfig.agent?.model != null &&
@@ -1983,21 +2170,21 @@ class AgentClient extends BaseClient {
       }
     } catch (error) {
       logger.error(
-        '[api/server/controllers/agents/client.js #useMemory] Error loading agent for memory',
+        '[api/server/controllers/agents/client.js #initializeMemoryWriter] Error loading agent for memory',
         sanitizeCompletionErrorForLog(error),
       );
     }
 
     if (!prelimAgent) {
-      return memorySnapshot?.withoutKeys;
+      return { ok: false };
     }
 
     let agent;
     try {
       agent = await initializeAgent(
         {
-          req: this.options.req,
-          res: this.options.res,
+          req,
+          res,
           agent: prelimAgent,
           allowedProviders,
           endpointOption: {
@@ -2019,27 +2206,44 @@ class AgentClient extends BaseClient {
         },
       );
     } catch (error) {
+      const healthEntry = markMemoryWriterFailure({
+        userId,
+        provider: configuredProvider,
+        model: configuredModel,
+        error,
+      });
       logger.error(
-        '[api/server/controllers/agents/client.js #useMemory] Error initializing memory writer',
+        '[api/server/controllers/agents/client.js #initializeMemoryWriter] Error initializing memory writer',
         {
           error: sanitizeCompletionErrorForLog(error),
           provider: memoryConfig?.agent?.provider,
           model: memoryConfig?.agent?.model,
+          memoryWriterHealth: healthEntry
+            ? {
+                reason: healthEntry.reason,
+                blockedUntil: new Date(healthEntry.blockedUntil).toISOString(),
+              }
+            : undefined,
         },
       );
-      return memorySnapshot?.withoutKeys;
+      return {
+        ok: false,
+        attachment: healthEntry
+          ? this.createMemoryWriterStatusAttachment({ message: healthEntry.message })
+          : undefined,
+      };
     }
 
     if (!agent) {
       logger.warn(
-        '[api/server/controllers/agents/client.js #useMemory] No agent found for memory',
+        '[api/server/controllers/agents/client.js #initializeMemoryWriter] No agent found for memory',
         {
           hasMemoryAgent: Boolean(memoryConfig?.agent),
           provider: memoryConfig?.agent?.provider || null,
           model: memoryConfig?.agent?.model || null,
         },
       );
-      return memorySnapshot?.withoutKeys;
+      return { ok: false };
     }
 
     const llmConfig = Object.assign(
@@ -2050,18 +2254,38 @@ class AgentClient extends BaseClient {
       agent.model_parameters,
     );
 
+    const gate = getMemoryWriterHealthGate({
+      userId,
+      provider: llmConfig.provider,
+      model: llmConfig.model,
+    });
+    if (gate.blocked) {
+      if (gate.shouldLog) {
+        logger.warn('[AgentClient] Saved memory writer degraded; skipping background writer', {
+          provider: llmConfig.provider || null,
+          model: llmConfig.model || null,
+          retryAt: new Date(gate.blockedUntil).toISOString(),
+          reason: gate.reason,
+        });
+      }
+      return {
+        ok: false,
+        attachment: this.createMemoryWriterStatusAttachment({ message: gate.message }),
+      };
+    }
+
     /** @type {import('@librechat/api').MemoryConfig} */
     const config = {
       validKeys: memoryConfig.validKeys,
       instructions: agent.instructions,
       llmConfig,
-      tokenLimit: resolveMemoryTokenLimit(memoryConfig.tokenLimit),
+      tokenLimit: memoryPolicyConfig.tokenLimit,
       /* === VIVENTIUM START ===
        * Feature: Memory per-key budgets and maintenance threshold
        * Added: 2026-03-09
        * === VIVENTIUM END === */
-      keyLimits: memoryConfig.keyLimits,
-      maintenanceThresholdPercent: memoryConfig.maintenanceThresholdPercent,
+      keyLimits: memoryPolicyConfig.keyLimits,
+      maintenanceThresholdPercent: memoryPolicyConfig.maintenanceThresholdPercent,
     };
 
     /* === VIVENTIUM NOTE ===
@@ -2074,40 +2298,59 @@ class AgentClient extends BaseClient {
      *
      * Added: 2026-02-07
      * === VIVENTIUM NOTE END === */
-    const memoryTimeContextInstructions = buildTimeContextInstructions(this.options.req);
+    const memoryTimeContextInstructions = buildTimeContextInstructions(req);
     if (memoryTimeContextInstructions) {
       config.instructions = [config.instructions || '', memoryTimeContextInstructions]
         .filter(Boolean)
         .join('\n\n');
     }
 
-    const messageId = this.responseMessageId + '';
-    const conversationId = this.conversationId + '';
-    const streamId = this.options.req?._resumableStreamId || null;
-    let withoutKeys;
+    const messageId = writerContext.responseMessageId || this.responseMessageId + '';
+    const conversationId = writerContext.conversationId || this.conversationId + '';
+    const streamId = req?._resumableStreamId || null;
     let processMemory;
     try {
-      [withoutKeys, processMemory] = await createMemoryProcessor({
+      [, processMemory] = await createMemoryProcessor({
         userId,
         config,
         messageId,
         streamId,
         conversationId,
         memoryMethods,
-        res: this.options.res,
-        user: createSafeUser(this.options.req.user),
-        snapshot: memorySnapshot,
+        res,
+        user: req?.user ? createSafeUser(req.user) : undefined,
       });
     } catch (error) {
+      const healthEntry = markMemoryWriterFailure({
+        userId,
+        provider: llmConfig.provider,
+        model: llmConfig.model,
+        error,
+      });
       logger.error(
-        '[api/server/controllers/agents/client.js #useMemory] Error creating memory processor',
-        sanitizeCompletionErrorForLog(error),
+        '[api/server/controllers/agents/client.js #initializeMemoryWriter] Error creating memory processor',
+        {
+          error: sanitizeCompletionErrorForLog(error),
+          provider: llmConfig.provider,
+          model: llmConfig.model,
+          memoryWriterHealth: healthEntry
+            ? {
+                reason: healthEntry.reason,
+                blockedUntil: new Date(healthEntry.blockedUntil).toISOString(),
+              }
+            : undefined,
+        },
       );
-      return memorySnapshot?.withoutKeys;
+      return {
+        ok: false,
+        attachment: healthEntry
+          ? this.createMemoryWriterStatusAttachment({ message: healthEntry.message })
+          : undefined,
+      };
     }
 
     this.processMemory = processMemory;
-    return withoutKeys ?? memorySnapshot?.withoutKeys;
+    return { ok: true };
   }
 
   /**
@@ -2160,18 +2403,16 @@ class AgentClient extends BaseClient {
    * @param {BaseMessage[]} messages
    * @returns {Promise<void | (TAttachment | null)[]>}
    */
-  async runMemory(messages) {
-    const req = this.options?.req;
+  async runMemory(messages, writerContext = {}) {
+    const req = writerContext.req || this.options?.req;
+    const userId = writerContext.userId || this.memoryWriterState?.userId || req?.user?.id;
     const memStart = startDeepTiming(req);
     if (isDeepTimingEnabled(req)) {
       logDeepTiming(req, 'memory_run_start', null, `count=${messages?.length ?? 0}`);
     }
     try {
-      if (this.processMemory == null) {
-        return;
-      }
-      const appConfig = this.options.req.config;
-      const memoryConfig = appConfig.memory;
+      const appConfig = writerContext.appConfig || this.memoryWriterState?.appConfig || req?.config;
+      const memoryConfig = appConfig?.memory;
       const messageWindowSize = memoryConfig?.messageWindowSize ?? 5;
       const historyContextMessageScanLimit = memoryConfig?.historyContextMessageScanLimit ?? 40;
       const historyContextUserTurnLimit = memoryConfig?.historyContextUserTurnLimit ?? 4;
@@ -2219,6 +2460,24 @@ class AgentClient extends BaseClient {
       }
       sections.push(`# Current Chat:\n\n${bufferString}`);
       const bufferMessage = new HumanMessage(sections.join('\n\n'));
+
+      const writerInitStart = startDeepTiming(req);
+      const writerInit = await this.initializeMemoryWriter(writerContext);
+      if (isDeepTimingEnabled(req)) {
+        logDeepTiming(
+          req,
+          'memory_writer_initialize',
+          writerInitStart,
+          `ok=${writerInit?.ok === true}`,
+        );
+      }
+      if (!writerInit?.ok || this.processMemory == null) {
+        if (isDeepTimingEnabled(req)) {
+          logDeepTiming(req, 'memory_run_done', memStart, 'status=skipped writer_unavailable=true');
+        }
+        return writerInit?.attachment ? [writerInit.attachment] : undefined;
+      }
+
       const result = await this.processMemory([bufferMessage]);
       if (isDeepTimingEnabled(req)) {
         logDeepTiming(req, 'memory_run_done', memStart, 'status=ok');
@@ -2229,7 +2488,81 @@ class AgentClient extends BaseClient {
       if (isDeepTimingEnabled(req)) {
         logDeepTiming(req, 'memory_run_done', memStart, 'status=error');
       }
+    } finally {
+      if (userId != null) {
+        clearMemoryReadContextCache(userId);
+      }
     }
+  }
+
+  scheduleMemoryWriter(messages) {
+    const req = this.options?.req;
+    const scheduleStart = startDeepTiming(req);
+    if (this.memoryWriterPromise) {
+      if (isDeepTimingEnabled(req)) {
+        logDeepTiming(req, 'memory_writer_already_scheduled', scheduleStart);
+      }
+      return this.memoryWriterPromise;
+    }
+    const userId = req?.user?.id;
+    /* === VIVENTIUM START ===
+     * Feature: Detached saved-memory writer lifecycle safety.
+     * Purpose: The post-response writer can outlive request cleanup; capture the needed request
+     * context now so it never reads nulled client options or clears another user's cache.
+     * === VIVENTIUM END === */
+    const writerContext = {
+      req,
+      res: this.options?.res,
+      userId,
+      appConfig: req?.config,
+      agent: this.options?.agent,
+      artifactPromises: this.artifactPromises,
+      responseMessageId: this.responseMessageId + '',
+      conversationId: this.conversationId + '',
+    };
+    const promise = this.runMemory(messages, writerContext)
+      .then((attachments) => {
+        if (attachments && attachments.length > 0) {
+          const artifactPromises = writerContext.artifactPromises;
+          if (Array.isArray(artifactPromises)) {
+            artifactPromises.push(...attachments.filter(Boolean));
+          } else {
+            logger.warn('[AgentClient] Memory writer produced attachments after artifact sink closed', {
+              attachments: attachments.filter(Boolean).length,
+            });
+          }
+        }
+        if (isDeepTimingEnabled(req)) {
+          logDeepTiming(
+            req,
+            'memory_writer_background_done',
+            scheduleStart,
+            `attachments=${attachments?.filter(Boolean).length ?? 0}`,
+          );
+        }
+      })
+      .catch((error) => {
+        logger.error(
+          '[AgentClient] Error in detached memory writer',
+          sanitizeCompletionErrorForLog(error),
+        );
+        if (isDeepTimingEnabled(req)) {
+          logDeepTiming(req, 'memory_writer_background_done', scheduleStart, 'status=error');
+        }
+      })
+      .finally(() => {
+        if (userId != null) {
+          clearMemoryReadContextCache(userId);
+        }
+        if (this.memoryWriterPromise === promise) {
+          this.memoryWriterPromise = null;
+        }
+      });
+    this.memoryWriterPromise = promise;
+    if (isDeepTimingEnabled(req)) {
+      logDeepTiming(req, 'memory_writer_scheduled_after_main', scheduleStart);
+    }
+    return promise;
   }
 
   /** @type {sendCompletion} */
@@ -2260,9 +2593,16 @@ class AgentClient extends BaseClient {
       let fallbackAgent = this.options.agent?.viventiumFallbackLlm;
       const fallbackInitializer = this.options.agent?.viventiumFallbackLlmInitializer;
       let fallbackAttempted = false;
+      const fallbackAborted = opts.abortController?.signal?.aborted === true;
+      const shouldRetryPrimaryErrorWithFallback =
+        !fallbackAborted &&
+        primaryError &&
+        !hasVisibleAssistantText(this.contentParts) &&
+        shouldRetryWithFallback([createCompletionErrorContentPart(primaryError)]);
       if (
+        !fallbackAborted &&
         (fallbackAgent || typeof fallbackInitializer === 'function') &&
-        shouldRetryWithFallback(this.contentParts)
+        (shouldRetryWithFallback(this.contentParts) || shouldRetryPrimaryErrorWithFallback)
       ) {
         if (!fallbackAgent && typeof fallbackInitializer === 'function') {
           fallbackAgent = await fallbackInitializer();
@@ -2684,8 +3024,6 @@ class AgentClient extends BaseClient {
     let config;
     /** @type {ReturnType<createRun>} */
     let run;
-    /** @type {Promise<(TAttachment | null)[] | undefined>} */
-    let memoryPromise;
     const req = this.options.req;
     const chatStart = startDeepTiming(req);
     const voiceLatencyEnabled = isVoiceLatencyEnabled(req);
@@ -2714,6 +3052,14 @@ class AgentClient extends BaseClient {
     const transactionsConfig = getTransactionsConfig(appConfig);
     const directActionPolicySurfaces =
       appConfig?.viventium?.background_cortices?.activation_policy?.direct_action_mcp_servers;
+    /* === VIVENTIUM START ===
+     * Feature: Post-stream finalization error handling.
+     * Purpose: Once the provider stream has resolved, later exceptions are deterministic
+     * finalization/maintenance failures and must not be rendered as provider failures on top of a
+     * completed answer.
+     * === VIVENTIUM END === */
+    let processStreamCompleted = false;
+    let deferredToolCortexMainResponse = false;
     try {
       if (!abortController) {
         abortController = new AbortController();
@@ -3925,8 +4271,6 @@ class AgentClient extends BaseClient {
         //   messages = addCacheControl(messages);
         // }
 
-        memoryPromise = this.runMemory(messages);
-
         /* === VIVENTIUM NOTE ===
          * Feature: Background Cortices (Multi-Agent Brain Architecture)
          * Updated: 2026-01-03
@@ -4052,6 +4396,7 @@ class AgentClient extends BaseClient {
             },
           },
         });
+        processStreamCompleted = true;
         if (isDeepTimingEnabled(req)) {
           logDeepTiming(req, 'process_stream_done', processStart);
         }
@@ -4103,9 +4448,11 @@ class AgentClient extends BaseClient {
          * - Persist hold text as plain string on both `text` and `ContentTypes.TEXT`.
          * === VIVENTIUM END === */
         this.contentParts.push(createRuntimeHoldTextPart(holdText));
+        deferredToolCortexMainResponse = true;
         logger.info(
           `[AgentClient] Tool cortex brewing hold: deferred main response (activated=${activatedCorticesList.length})`,
         );
+        this.scheduleMemoryWriter(messages);
       } else {
         /* === VIVENTIUM START ===
          * Feature: Anthropic overflow recovery retry.
@@ -4148,6 +4495,7 @@ class AgentClient extends BaseClient {
         if (isDeepTimingEnabled(req)) {
           logDeepTiming(req, 'chat_completion_done', chatStart);
         }
+        this.scheduleMemoryWriter(messages);
       }
       /* === VIVENTIUM NOTE END === */
       if (voiceLatencyEnabled) {
@@ -4184,6 +4532,26 @@ class AgentClient extends BaseClient {
        * fallback from orphaning already-started background work.
        * === VIVENTIUM NOTE END === */
     } catch (err) {
+      /* === VIVENTIUM START ===
+       * Feature: Post-stream finalization error handling.
+       * Purpose: Preserve the completed response when cleanup after a resolved provider stream
+       * fails; pre-resolution stream/provider failures keep their original classification.
+       * === VIVENTIUM END === */
+      if (
+        processStreamCompleted === true &&
+        hasVisibleAssistantText(this.contentParts) &&
+        err &&
+        typeof err === 'object'
+      ) {
+        err.viventiumCompletionPhase = 'post_stream_finalization';
+      } else if (
+        deferredToolCortexMainResponse === true &&
+        hasRuntimeHoldAssistantText(this.contentParts) &&
+        err &&
+        typeof err === 'object'
+      ) {
+        err.viventiumCompletionPhase = 'tool_cortex_deferred_main_response';
+      }
       handleCompletionErrorContentPart({
         contentParts: this.contentParts,
         err,
@@ -4191,11 +4559,6 @@ class AgentClient extends BaseClient {
       });
     } finally {
       try {
-        const attachments = await this.awaitMemoryWithTimeout(memoryPromise);
-        if (attachments && attachments.length > 0) {
-          this.artifactPromises.push(...attachments);
-        }
-
         await this.recordCollectedUsage({
           context: 'message',
           balance: balanceConfig,
@@ -4223,7 +4586,6 @@ class AgentClient extends BaseClient {
       }
       run = null;
       config = null;
-      memoryPromise = null;
     }
   }
 
@@ -4514,6 +4876,7 @@ class AgentClient extends BaseClient {
 module.exports = AgentClient;
 module.exports.buildViventiumMcpRequestBody = buildViventiumMcpRequestBody;
 module.exports.isLateStreamTerminationError = isLateStreamTerminationError;
+module.exports.hasRuntimeHoldAssistantText = hasRuntimeHoldAssistantText;
 module.exports.shouldSuppressCompletionErrorContentPart = shouldSuppressCompletionErrorContentPart;
 module.exports.createCompletionErrorContentPart = createCompletionErrorContentPart;
 module.exports.handleCompletionErrorContentPart = handleCompletionErrorContentPart;

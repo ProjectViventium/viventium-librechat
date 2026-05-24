@@ -7,11 +7,14 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from .utils import ensure_timezone, parse_time, normalize_days
 
 # === VIVENTIUM START ===
-# Feature: Multi-channel scheduling support.
-ChannelLiteral = Literal["telegram", "librechat"]
+# Feature: Multi-channel scheduling support and Workbench-owned GlassHive executor.
+ChannelLiteral = Literal["telegram", "librechat", "workbench"]
 ChannelList = List[ChannelLiteral]
 ChannelValue = Union[ChannelLiteral, ChannelList]
-AVAILABLE_CHANNELS: tuple[ChannelLiteral, ...] = ("telegram", "librechat")
+ExecutorLiteral = Literal["viventium_agent", "glasshive_host"]
+AVAILABLE_CHANNELS: tuple[ChannelLiteral, ...] = ("telegram", "librechat", "workbench")
+DEFAULT_DELIVERY_CHANNELS: tuple[ChannelLiteral, ...] = ("telegram", "librechat")
+AVAILABLE_EXECUTORS: tuple[ExecutorLiteral, ...] = ("viventium_agent", "glasshive_host")
 # === VIVENTIUM END ===
 
 
@@ -93,8 +96,15 @@ class CreateScheduleArgs(BaseModel):
     channel: Optional[ChannelValue] = Field(
         None,
         description=(
-            "Delivery channel(s): 'telegram' | 'librechat' or a list of both. "
+            "Delivery channel(s): 'telegram' | 'librechat' | 'workbench' or a list. "
             "Defaults to all available channels when omitted. Example: ['telegram', 'librechat']"
+        ),
+    )
+    executor: ExecutorLiteral = Field(
+        "viventium_agent",
+        description=(
+            "Runtime executor. Existing conversational schedules use 'viventium_agent'; "
+            "Prompt Workbench scheduled prompts use 'glasshive_host'."
         ),
     )
     conversation_policy: Literal["new", "same"] = Field(
@@ -151,9 +161,13 @@ class UpdateScheduleArgs(BaseModel):
     channel: Optional[ChannelValue] = Field(
         None,
         description=(
-            "Delivery channel(s) override: 'telegram' | 'librechat' or list. "
+            "Delivery channel(s) override: 'telegram' | 'librechat' | 'workbench' or list. "
             "Example: ['telegram']"
         ),
+    )
+    executor: Optional[ExecutorLiteral] = Field(
+        None,
+        description="Optional executor override: 'viventium_agent' | 'glasshive_host'",
     )
     conversation_policy: Optional[Literal["new", "same"]] = Field(
         None,
@@ -225,7 +239,7 @@ class ListScheduleArgs(BaseModel):
     active_only: bool = False
     channel: Optional[ChannelValue] = Field(
         None,
-        description="Filter by channel(s): 'telegram' | 'librechat' or list",
+        description="Filter by channel(s): 'telegram' | 'librechat' | 'workbench' or list",
     )
     # === VIVENTIUM NOTE ===
     agent_id: Optional[str] = None
@@ -253,7 +267,7 @@ class SearchScheduleArgs(BaseModel):
     query: str = Field(..., min_length=1)
     channel: Optional[ChannelValue] = Field(
         None,
-        description="Filter by channel(s): 'telegram' | 'librechat' or list",
+        description="Filter by channel(s): 'telegram' | 'librechat' | 'workbench' or list",
     )
     # === VIVENTIUM NOTE ===
     agent_id: Optional[str] = None
@@ -297,7 +311,7 @@ class LastDeliveryArgs(BaseModel):
     )
     channel: Optional[ChannelValue] = Field(
         None,
-        description="Optional channel filter: 'telegram' | 'librechat' or list",
+        description="Optional channel filter: 'telegram' | 'librechat' | 'workbench' or list",
     )
     agent_id: Optional[str] = None
 
@@ -319,6 +333,7 @@ class ScheduleTask(BaseModel):
     # Feature: Tasks may target one or multiple channels.
     channel: ChannelValue
     # === VIVENTIUM NOTE ===
+    executor: ExecutorLiteral = "viventium_agent"
     conversation_policy: Literal["new", "same"]
     conversation_id: Optional[str] = None
     last_conversation_id: Optional[str] = None

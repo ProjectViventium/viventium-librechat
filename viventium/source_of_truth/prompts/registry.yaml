@@ -6,3 +6,35 @@ notes:
 - local.*.yaml source files may use promptRef; compiled runtime YAML receives plain
   strings.
 - Upstream LibreChat/user-managed prompts remain view-only unless explicitly migrated.
+related_config:
+  prompts:
+    main.scheduling_self_continuity:
+      - scheduling.direct_action_owner
+      - scheduling.main_agent_tools
+      - scheduling.mcp_server
+    mcp.scheduling_cortex.server:
+      - scheduling.direct_action_owner
+      - scheduling.main_agent_tools
+      - scheduling.mcp_server
+  refs:
+    scheduling.direct_action_owner:
+      title: Scheduling Direct-Action Owner
+      summary: Scheduling Cortex is the direct-action owner for reminders, follow-ups, wakeups, delayed checks, and schedule management.
+      path: local.viventium-agents.yaml
+      selector: config.viventium.background_cortices.activation_policy.direct_action_mcp_servers[scheduling-cortex]
+      source: agents.direct_action_mcp_server
+      server: scheduling-cortex
+    scheduling.main_agent_tools:
+      title: Main Agent Scheduling Tools
+      summary: The conscious agent can create, inspect, update, delete, and preview schedules through Scheduling Cortex.
+      path: local.viventium-agents.yaml
+      selector: mainAgent.tools[scheduling-cortex]
+      source: agents.main_agent_tools
+      server: scheduling-cortex
+    scheduling.mcp_server:
+      title: Scheduling MCP Server
+      summary: LibreChat connects to the local Scheduling Cortex MCP as a trusted server-instructions source.
+      path: local.librechat.yaml
+      selector: mcpServers.scheduling-cortex
+      source: librechat.mcp_server
+      server: scheduling-cortex

@@ -223,6 +223,7 @@ const MODEL_CONFIG_ONLY_FIELDS = [
   'fallback_llm_provider',
   'fallback_llm_model_parameters',
 ];
+const TOOLS_ONLY_FIELDS = ['id', 'tools', 'tool_kwargs'];
 const REVIEW_FIELDS = [
   'name',
   'description',
@@ -416,6 +417,7 @@ function parseArgs(argv) {
     promptsOnly: false, // Safe mode: only update prompts/instructions, not tools
     activationConfigOnly: false, // Safe mode: only update selected background cortex activation fields
     modelConfigOnly: false, // Safe mode: only update agent model/provider fields
+    toolsOnly: false, // Safe mode: only update agent tool arrays/kwargs
     runtimeAware: null, // Apply canonical runtime model/activation overrides before push
     activationFields: null,
     selectedAgentIds: null,
@@ -469,6 +471,10 @@ function parseArgs(argv) {
     }
     if (arg === '--model-config-only') {
       args.modelConfigOnly = true;
+      continue;
+    }
+    if (arg === '--tools-only') {
+      args.toolsOnly = true;
       continue;
     }
     if (arg === '--runtime-aware') {
@@ -601,9 +607,13 @@ function parseArgs(argv) {
     }
   }
 
-  if ([args.promptsOnly, args.activationConfigOnly, args.modelConfigOnly].filter(Boolean).length > 1) {
+  if (
+    [args.promptsOnly, args.activationConfigOnly, args.modelConfigOnly, args.toolsOnly].filter(
+      Boolean,
+    ).length > 1
+  ) {
     throw new Error(
-      'Choose only one safe push mode: --prompts-only, --activation-config-only, or --model-config-only',
+      'Choose only one safe push mode: --prompts-only, --activation-config-only, --model-config-only, or --tools-only',
     );
   }
   if (args.activationFields && !args.promptsOnly && !args.activationConfigOnly) {
@@ -1447,6 +1457,7 @@ function buildUpdateData(
     promptsOnly = false,
     activationConfigOnly = false,
     modelConfigOnly = false,
+    toolsOnly = false,
     activationFields = null,
     existingAgent = null,
     selectedAgentIds = null,
@@ -1459,6 +1470,8 @@ function buildUpdateData(
       ? ['background_cortices']
       : modelConfigOnly
         ? MODEL_CONFIG_ONLY_FIELDS
+        : toolsOnly
+          ? TOOLS_ONLY_FIELDS
       : AGENT_FIELDS;
   const safeActivationFields = resolveSafeActivationFields({
     promptsOnly,
@@ -1518,12 +1531,13 @@ async function repairPersistedAgentRuntimeFields({ agentData, dryRun }) {
 function shouldRepairRuntimeFieldsForPushMode({
   promptsOnly = false,
   activationConfigOnly = false,
+  toolsOnly = false,
   runtimeAware = false,
 }) {
   if (!runtimeAware) {
     return false;
   }
-  if (promptsOnly || activationConfigOnly) {
+  if (promptsOnly || activationConfigOnly || toolsOnly) {
     return false;
   }
   return true;
@@ -1552,6 +1566,7 @@ async function pushAgent({
   promptsOnly = false,
   activationConfigOnly = false,
   modelConfigOnly = false,
+  toolsOnly = false,
   runtimeAware = false,
   activationFields = null,
   selectedAgentIds = null,
@@ -1563,6 +1578,7 @@ async function pushAgent({
   const shouldRepairRuntimeFields = shouldRepairRuntimeFieldsForPushMode({
     promptsOnly,
     activationConfigOnly,
+    toolsOnly,
     runtimeAware,
   });
   /* === VIVENTIUM START ===
@@ -1572,12 +1588,14 @@ async function pushAgent({
    * Fix: When an agent is missing, create it from the YAML data (safe — YAML is canonical).
    * === VIVENTIUM END === */
   if (!existing) {
-    if (promptsOnly || activationConfigOnly || modelConfigOnly) {
+    if (promptsOnly || activationConfigOnly || modelConfigOnly || toolsOnly) {
       const modeLabel = promptsOnly
         ? 'prompts-only'
         : activationConfigOnly
           ? 'activation-config-only'
-          : 'model-config-only';
+          : modelConfigOnly
+            ? 'model-config-only'
+            : 'tools-only';
       return {
         id: agentData.id,
         status: 'missing',
@@ -1634,6 +1652,7 @@ async function pushAgent({
     promptsOnly,
     activationConfigOnly,
     modelConfigOnly,
+    toolsOnly,
     activationFields,
     existingAgent: existing,
     selectedAgentIds,
@@ -1659,6 +1678,8 @@ async function pushAgent({
         ? 'activation-config-only'
         : modelConfigOnly
           ? 'model-config-only'
+          : toolsOnly
+            ? 'tools-only'
           : 'full',
     fieldsUpdated,
     runtimeRepair,
@@ -1674,6 +1695,7 @@ async function pushBundle({
   promptsOnly = false,
   activationConfigOnly = false,
   modelConfigOnly = false,
+  toolsOnly = false,
   runtimeAware = false,
   activationFields = null,
   selectedAgentIds = null,
@@ -1742,6 +1764,7 @@ async function pushBundle({
         promptsOnly,
         activationConfigOnly,
         modelConfigOnly,
+        toolsOnly,
         runtimeAware,
         activationFields,
         selectedAgentIds,
@@ -1785,6 +1808,7 @@ async function pushBundle({
           promptsOnly,
           activationConfigOnly,
           modelConfigOnly,
+          toolsOnly,
           runtimeAware,
           activationFields,
           selectedAgentIds,
@@ -1801,6 +1825,8 @@ async function pushBundle({
         ? 'activation-config-only'
         : modelConfigOnly
           ? 'model-config-only'
+          : toolsOnly
+            ? 'tools-only'
           : 'full',
     runtimeAwareApplied: runtimeAware,
     results,
@@ -1987,6 +2013,7 @@ function printUsage() {
   );
   console.log('  --activation-config-only  Safe mode: only update background cortex activation config');
   console.log('  --model-config-only  Safe mode: only update agent model/provider fields');
+  console.log('  --tools-only  Safe mode: only update agent tools/tool_kwargs fields');
   console.log('  --runtime-aware   Rewrite built-in model/provider fields from canonical runtime env before push');
   console.log('  --raw-source-of-truth  Push raw bundle values without runtime rewrite (disables local default)');
   console.log('  --agent-ids=...   Optional comma-separated background agent ids to update surgically');
@@ -2015,6 +2042,9 @@ function printUsage() {
   );
   console.log(
     '  node scripts/viventium-sync-agents.js push --model-config-only --dry-run  # Preview provider/model changes only',
+  );
+  console.log(
+    '  node scripts/viventium-sync-agents.js push --tools-only --agent-ids=agent_a --dry-run  # Preview tool-array changes only',
   );
 }
 
@@ -2092,6 +2122,7 @@ async function run() {
       promptsOnly: args.promptsOnly,
       activationConfigOnly: args.activationConfigOnly,
       modelConfigOnly: args.modelConfigOnly,
+      toolsOnly: args.toolsOnly,
       runtimeAware: shouldApplyRuntimeOverrides(args),
       activationFields: args.activationFields,
       selectedAgentIds: args.selectedAgentIds,

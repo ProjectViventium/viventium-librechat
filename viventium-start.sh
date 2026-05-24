@@ -22,6 +22,8 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Script is in LibreChat root, so PROJECT_DIR is the same as SCRIPT_DIR
 PROJECT_DIR="$SCRIPT_DIR"
+VIVENTIUM_PARENT_REPO_ROOT="$(cd "$PROJECT_DIR/../.." && pwd)"
+export VIVENTIUM_REPO_ROOT="${VIVENTIUM_REPO_ROOT:-$VIVENTIUM_PARENT_REPO_ROOT}"
 
 # Colors for output
 RED='\033[0;31m'

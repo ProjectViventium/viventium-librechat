@@ -41,8 +41,7 @@ const USER_VISIBLE_CALLBACK_EVENTS = new Set([
 const seenCallbacks = new Map();
 const LOCAL_PATH_PATTERN =
   /(?:~\/|\/Users\/|\/home\/|\/private\/var\/|\/var\/folders\/|\/tmp\/|[A-Za-z]:\\Users\\)[^`'"<>\n\r]*?(?=$|[`'"<>\n\r]|[)\],.;:!?](?:\s|$)|\s+(?:and|or|from|at|with|then|while|because|but|plus|to|in|on)\b)/gi;
-const SAFE_GLASSHIVE_LINK_PATTERN =
-  /\[[^\]\n]{1,160}\]\((https?:\/\/[^)\s]+)\)/g;
+const SAFE_GLASSHIVE_LINK_PATTERN = /\[[^\]\n]{1,160}\]\((https?:\/\/[^)\s]+)\)/g;
 const ACTIVE_WORKER_FAILURE_CODES = new Set([
   'active_worker_conflict',
   'active_worker_limit',
@@ -132,12 +131,17 @@ function isSafeGlassHiveActionUrl(value = '') {
     const url = new URL(String(value || ''));
     const hostname = url.hostname.toLowerCase();
     const isLocalHost =
-      hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || hostname === '[::1]';
+      hostname === 'localhost' ||
+      hostname === '127.0.0.1' ||
+      hostname === '::1' ||
+      hostname === '[::1]';
     const safeId = '[A-Za-z0-9_-]{1,128}';
     const isWatchLink =
       new RegExp(`^/watch/${safeId}$`).test(url.pathname) &&
       new RegExp(`^${safeId}$`).test(String(url.searchParams.get('project_id') || ''));
-    const isSignedLink = new RegExp(`^/v1/signed-links/[A-Za-z0-9._-]{10,4096}$`).test(url.pathname);
+    const isSignedLink = new RegExp(`^/v1/signed-links/[A-Za-z0-9._-]{10,4096}$`).test(
+      url.pathname,
+    );
     const artifactPath = String(url.searchParams.get('path') || '').replace(/\\/g, '/');
     const artifactSegments = artifactPath.split('/').filter(Boolean);
     const artifactPathIsSafe =
@@ -153,10 +157,7 @@ function isSafeGlassHiveActionUrl(value = '') {
     if (isLocalHost) {
       return isWatchLink || isSignedLink || isLocalArtifactDownload;
     }
-    return (
-      (isWatchLink && url.searchParams.has('gh_token')) ||
-      isSignedLink
-    );
+    return (isWatchLink && url.searchParams.has('gh_token')) || isSignedLink;
   } catch {
     return false;
   }
@@ -164,17 +165,14 @@ function isSafeGlassHiveActionUrl(value = '') {
 
 function protectSafeGlassHiveLinks(text = '') {
   const links = [];
-  const protectedText = String(text || '').replace(
-    SAFE_GLASSHIVE_LINK_PATTERN,
-    (match, url) => {
-      if (!isSafeGlassHiveActionUrl(url)) {
-        return match;
-      }
-      const token = `__VIVENTIUM_SAFE_GLASSHIVE_LINK_${links.length}__`;
-      links.push({ token, value: match });
-      return token;
-    },
-  );
+  const protectedText = String(text || '').replace(SAFE_GLASSHIVE_LINK_PATTERN, (match, url) => {
+    if (!isSafeGlassHiveActionUrl(url)) {
+      return match;
+    }
+    const token = `__VIVENTIUM_SAFE_GLASSHIVE_LINK_${links.length}__`;
+    links.push({ token, value: match });
+    return token;
+  });
   return { protectedText, links };
 }
 

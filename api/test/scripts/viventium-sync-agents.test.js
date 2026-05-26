@@ -95,7 +95,9 @@ describe('viventium-sync-agents args', () => {
       },
     });
 
-    expect(resolved.instructions).toContain('exact GlassHive tool id exposed by the host application');
+    expect(resolved.instructions).toContain(
+      'exact GlassHive tool id exposed by the host application',
+    );
     expect(resolved.instructions).toContain('workspace_launch_mcp_glasshive-workers-projects');
     expect(resolved.instructions).toContain('not in the available tool list');
     expect(resolved.instructions).toContain('Do not shorten, summarize, paraphrase, or water down');

@@ -1082,7 +1082,9 @@ describe('/api/viventium/glasshive/callback', () => {
     expect(message.text).toContain('Bogus: [Open GlassHive workspace]([local worker link])');
     expect(message.text).toContain('Traversal: [Download file]([local worker link])');
     expect(message.text).toContain('Bad watch: [View / Steer]([local worker link])');
-    expect(message.text).toContain('Odd label: [<img src=x onerror=alert(1)>]([local worker link])');
+    expect(message.text).toContain(
+      'Odd label: [<img src=x onerror=alert(1)>]([local worker link])',
+    );
     expect(message.text).not.toContain('127.0.0.1:8766/ui/workers');
     expect(message.text).not.toContain('127.0.0.1:9999/not-glass/watch');
     expect(message.text).not.toContain('..%2Fsecret.txt');

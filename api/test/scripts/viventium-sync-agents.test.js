@@ -15,6 +15,7 @@ const {
   mergeBackgroundCorticesActivationFields,
   normalizeBundleForSourceOfTruth,
   buildUpdateData,
+  resolvePromptRefs,
   resolveSafeActivationFields,
   shouldApplyRuntimeOverrides,
   shouldRepairRuntimeFieldsForPushMode,
@@ -85,6 +86,25 @@ describe('viventium-sync-agents args', () => {
       tools: ['search_gmail_messages_mcp_google_workspace'],
       tool_kwargs: [{ name: 'search_gmail_messages_mcp_google_workspace' }],
     });
+  });
+
+  test('GlassHive MCP prompt tells models to use namespaced callable tool ids', () => {
+    const resolved = resolvePromptRefs({
+      instructions: {
+        promptRef: 'mcp.glasshive_workers.server',
+      },
+    });
+
+    expect(resolved.instructions).toContain(
+      'exact GlassHive tool id exposed by the host application',
+    );
+    expect(resolved.instructions).toContain('workspace_launch_mcp_glasshive-workers-projects');
+    expect(resolved.instructions).toContain('not in the available tool list');
+    expect(resolved.instructions).toContain('Do not shorten, summarize, paraphrase, or water down');
+    expect(resolved.instructions).toContain(
+      'Preserve host-side GlassHive orchestration requirements as context',
+    );
+    expect(resolved.instructions).toContain('not by the worker running inside the workspace');
   });
 
   test('buildUpdateData keeps the dedicated voice parameter bag in model-config-only mode', () => {

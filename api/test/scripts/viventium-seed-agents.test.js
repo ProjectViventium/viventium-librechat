@@ -6,6 +6,7 @@
 const {
   normalizeBundleForRuntimeWithOwner,
   normalizePublicAccessRole,
+  buildSeedAgentUpdatePlan,
   pickAgentFields,
   preserveExistingEditableFields,
   resolvePublicAccessRoleIds,
@@ -192,6 +193,51 @@ describe('viventium-seed-agents', () => {
           },
         },
       ],
+    });
+  });
+
+  test('repairs runtime-owned model fields from source while preserving editable reseed fields', () => {
+    const existing = {
+      provider: 'openAI',
+      model: 'gpt-5.2-chat',
+      name: 'My Viv',
+      instructions: 'keep my live instructions',
+      model_parameters: {
+        model: 'gpt-5.2-chat',
+        reasoning_effort: 'high',
+      },
+    };
+    const incoming = {
+      id: 'agent_viventium_main_95aeb3',
+      provider: 'anthropic',
+      model: 'claude-opus-4-7',
+      name: 'Bundle Viv',
+      instructions: 'replace me',
+      model_parameters: {
+        model: 'claude-opus-4-7',
+        thinking: true,
+        effort: 'high',
+      },
+    };
+
+    const plan = buildSeedAgentUpdatePlan(existing, incoming);
+
+    expect(plan.updateData).toMatchObject({
+      provider: 'openAI',
+      model: 'gpt-5.2-chat',
+      name: 'My Viv',
+      instructions: 'keep my live instructions',
+      model_parameters: {
+        model: 'gpt-5.2-chat',
+      },
+    });
+    expect(plan.runtimeRepairAgentData).toMatchObject({
+      id: 'agent_viventium_main_95aeb3',
+      provider: 'anthropic',
+      model: 'claude-opus-4-7',
+      model_parameters: {
+        model: 'claude-opus-4-7',
+      },
     });
   });
 

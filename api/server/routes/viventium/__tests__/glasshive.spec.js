@@ -1045,6 +1045,52 @@ describe('/api/viventium/glasshive/callback', () => {
     );
   });
 
+  test('preserves local GlassHive action links while redacting arbitrary local links', async () => {
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({
+      callback_id: 'cb_preserve_local_action_links',
+      event: 'run.completed',
+      message:
+        'Done.\n\n' +
+        'Download: [Generated memo](http://127.0.0.1:8780/v1/workers/wrk_local_qa/artifacts/download?path=result.md)\n' +
+        'View / Steer: [View / Steer GlassHive workspace](http://127.0.0.1:8780/watch/wrk_local_qa?surface=desktop&project_id=prj_local_qa)\n' +
+        'Bogus: [Open GlassHive workspace](http://127.0.0.1:9999/not-glass/watch/wrk_local_qa?project_id=prj_local_qa)\n' +
+        'Traversal: [Download file](http://127.0.0.1:8780/v1/workers/wrk_local_qa/artifacts/download?path=..%2Fsecret.txt)\n' +
+        'Bad watch: [View / Steer](http://127.0.0.1:8780/watch/../../etc?project_id=prj_local_qa)\n' +
+        'Odd label: [<img src=x onerror=alert(1)>](http://127.0.0.1:8780/not-glass/watch/wrk_local_qa?project_id=prj_local_qa)\n' +
+        'Raw diagnostic: http://127.0.0.1:8766/ui/workers/wrk_local_qa/terminal',
+    });
+    const req = createMockReq({
+      url: '/api/viventium/glasshive/callback',
+      headers: { 'x-glasshive-signature': signature(body) },
+      body,
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    const [, message] = mockSaveMessage.mock.calls[0];
+    expect(message.text).toContain(
+      '[Generated memo](http://127.0.0.1:8780/v1/workers/wrk_local_qa/artifacts/download?path=result.md)',
+    );
+    expect(message.text).toContain(
+      '[View / Steer GlassHive workspace](http://127.0.0.1:8780/watch/wrk_local_qa?surface=desktop&project_id=prj_local_qa)',
+    );
+    expect(message.text).toContain('Raw diagnostic: [local worker link]');
+    expect(message.text).toContain('Bogus: [Open GlassHive workspace]([local worker link])');
+    expect(message.text).toContain('Traversal: [Download file]([local worker link])');
+    expect(message.text).toContain('Bad watch: [View / Steer]([local worker link])');
+    expect(message.text).toContain(
+      'Odd label: [<img src=x onerror=alert(1)>]([local worker link])',
+    );
+    expect(message.text).not.toContain('127.0.0.1:8766/ui/workers');
+    expect(message.text).not.toContain('127.0.0.1:9999/not-glass/watch');
+    expect(message.text).not.toContain('..%2Fsecret.txt');
+    expect(message.text).not.toContain('/watch/../../etc');
+  });
+
   test('preserves markdown delimiters when redacting local links and paths', async () => {
     const router = require('../glasshive');
     const app = createTestApp(router);

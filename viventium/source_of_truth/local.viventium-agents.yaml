@@ -91,7 +91,15 @@ config:
               - projects_list_mcp_glasshive-workers-projects
               - project_create_mcp_glasshive-workers-projects
               - worker_delegate_once_mcp_glasshive-workers-projects
+              - workspace_launch_mcp_glasshive-workers-projects
               - workspace_schedule_mcp_glasshive-workers-projects
+              - workspace_status_mcp_glasshive-workers-projects
+              - workspace_wait_mcp_glasshive-workers-projects
+              - workspace_continue_mcp_glasshive-workers-projects
+              - workspace_artifacts_mcp_glasshive-workers-projects
+              - workspace_artifact_download_mcp_glasshive-workers-projects
+              - workspace_preferences_get_mcp_glasshive-workers-projects
+              - workspace_preferences_set_mcp_glasshive-workers-projects
               - project_get_mcp_glasshive-workers-projects
               - project_runs_mcp_glasshive-workers-projects
               - project_events_mcp_glasshive-workers-projects
@@ -110,7 +118,7 @@ config:
               - worker_terminate_mcp_glasshive-workers-projects
               - worker_desktop_action_mcp_glasshive-workers-projects
               - worker_takeover_mcp_glasshive-workers-projects
-              - run_get_mcp_glasshive-workers-projects
+              - metrics_summary_mcp_glasshive-workers-projects
           - server: scheduling-cortex
             owns: >-
               reminders, scheduled follow-ups, same-conversation wakeups, delayed status checks, and
@@ -242,7 +250,15 @@ mainAgent:
     - project_create_mcp_glasshive-workers-projects
     - project_get_mcp_glasshive-workers-projects
     - worker_delegate_once_mcp_glasshive-workers-projects
+    - workspace_launch_mcp_glasshive-workers-projects
     - workspace_schedule_mcp_glasshive-workers-projects
+    - workspace_status_mcp_glasshive-workers-projects
+    - workspace_wait_mcp_glasshive-workers-projects
+    - workspace_continue_mcp_glasshive-workers-projects
+    - workspace_artifacts_mcp_glasshive-workers-projects
+    - workspace_artifact_download_mcp_glasshive-workers-projects
+    - workspace_preferences_get_mcp_glasshive-workers-projects
+    - workspace_preferences_set_mcp_glasshive-workers-projects
     - project_runs_mcp_glasshive-workers-projects
     - project_events_mcp_glasshive-workers-projects
     - workers_list_mcp_glasshive-workers-projects
@@ -260,7 +276,6 @@ mainAgent:
     - worker_terminate_mcp_glasshive-workers-projects
     - worker_desktop_action_mcp_glasshive-workers-projects
     - worker_takeover_mcp_glasshive-workers-projects
-    - run_get_mcp_glasshive-workers-projects
     - metrics_summary_mcp_glasshive-workers-projects
     - file_search
     - web_search

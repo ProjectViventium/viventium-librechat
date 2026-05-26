@@ -494,4 +494,72 @@ describe('viventium-agent-runtime-models', () => {
       },
     });
   });
+
+  test('buildCanonicalPersistedAgentFields drops stale OpenAI reasoning keys when Main rewrites to Anthropic', () => {
+    const existingAgent = {
+      id: 'agent_viventium_main_95aeb3',
+      provider: 'openAI',
+      model: 'gpt-5.2-chat',
+      model_parameters: {
+        model: 'gpt-5.2-chat',
+        reasoning_effort: 'high',
+      },
+    };
+
+    const runtimeAgent = {
+      id: 'agent_viventium_main_95aeb3',
+      provider: 'anthropic',
+      model: 'claude-opus-4-7',
+      model_parameters: {
+        model: 'claude-opus-4-7',
+        thinking: true,
+        effort: 'high',
+      },
+    };
+
+    const patch = buildCanonicalPersistedAgentFields(runtimeAgent, existingAgent);
+
+    expect(patch).toEqual({
+      provider: 'anthropic',
+      model: 'claude-opus-4-7',
+      model_parameters: {
+        model: 'claude-opus-4-7',
+        thinking: true,
+        effort: 'high',
+      },
+    });
+  });
+
+  test('buildCanonicalPersistedAgentFields drops stale runtime keys when Main already has the target family', () => {
+    const existingAgent = {
+      id: 'agent_viventium_main_95aeb3',
+      provider: 'anthropic',
+      model: 'claude-opus-4-7',
+      model_parameters: {
+        model: 'claude-opus-4-7',
+        reasoning_effort: 'high',
+        thinking: true,
+        effort: 'high',
+      },
+    };
+
+    const runtimeAgent = {
+      id: 'agent_viventium_main_95aeb3',
+      provider: 'anthropic',
+      model: 'claude-opus-4-7',
+      model_parameters: {
+        model: 'claude-opus-4-7',
+        thinking: true,
+        effort: 'high',
+      },
+    };
+
+    const patch = buildCanonicalPersistedAgentFields(runtimeAgent, existingAgent);
+
+    expect(patch.model_parameters).toEqual({
+      model: 'claude-opus-4-7',
+      thinking: true,
+      effort: 'high',
+    });
+  });
 });

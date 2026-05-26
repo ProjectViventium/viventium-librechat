@@ -249,13 +249,43 @@ def _normalize_channels(value: Optional[ChannelValue], default_all: bool = False
 # === VIVENTIUM NOTE ===
 
 
+def _identity_hash(value: str) -> str:
+    normalized = str(Path(value).expanduser().resolve()) if value else ""
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest() if normalized else ""
+
+
+def _env_text_hash(value: str) -> str:
+    normalized = str(value or "").strip()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest() if normalized else ""
+
+
+def _env_truthy(value: str) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def build_health_payload(storage: ScheduleStorage) -> Dict[str, Any]:
+    """Return a public-safe runtime identity for local launcher ownership checks."""
+    state_root = os.getenv("VIVENTIUM_STATE_ROOT", "")
+    dev_env_name = os.getenv("VIVENTIUM_DEV_ENV_NAME", "")
+    return {
+        "status": "ok",
+        "service": "scheduling-cortex",
+        "pid": os.getpid(),
+        "db_path_sha256": _identity_hash(storage.db_path),
+        "state_root_sha256": _identity_hash(state_root),
+        "runtime_profile": os.getenv("VIVENTIUM_RUNTIME_PROFILE", ""),
+        "dev_env_enabled": _env_truthy(os.getenv("VIVENTIUM_DEV_ENV_ENABLED", "")),
+        "dev_env_name_sha256": _env_text_hash(dev_env_name),
+    }
+
+
 def build_server(storage: ScheduleStorage) -> FastMCP:
     mcp = FastMCP(name="scheduling-cortex", instructions=SCHEDULING_CORTEX_INSTRUCTIONS)
 
-    # VIVENTIUM NOTE: Add health endpoint for container app probes.
+    # VIVENTIUM NOTE: Add public-safe runtime identity for launcher probes.
     @mcp.custom_route("/health", methods=["GET"])
     async def health(_: Request) -> Response:
-        return JSONResponse({"status": "ok"})
+        return JSONResponse(build_health_payload(storage))
     # VIVENTIUM NOTE
 
     # === VIVENTIUM START ===

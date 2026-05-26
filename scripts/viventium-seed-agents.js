@@ -211,6 +211,14 @@ function buildUpdateData(agentData) {
   return updateData;
 }
 
+function buildSeedAgentUpdatePlan(existing, agentData) {
+  const effectiveAgentData = preserveExistingEditableFields(existing, agentData);
+  return {
+    updateData: buildUpdateData(effectiveAgentData),
+    runtimeRepairAgentData: agentData,
+  };
+}
+
 function preserveExistingEditableFields(existing, agentData) {
   if (!existing || !agentData) {
     return agentData;
@@ -286,13 +294,12 @@ async function upsertAgent({ agentData, userId, dryRun }) {
     };
   }
 
-  const effectiveAgentData = preserveExistingEditableFields(existing, agentData);
-  const updateData = buildUpdateData(effectiveAgentData);
+  const { updateData, runtimeRepairAgentData } = buildSeedAgentUpdatePlan(existing, agentData);
   if (!dryRun && Object.keys(updateData).length > 0) {
     await updateAgent({ id: agentData.id }, updateData, { updatingUserId: userId });
   }
   const runtimeRepair = await repairPersistedAgentRuntimeFields({
-    agentData: effectiveAgentData,
+    agentData: runtimeRepairAgentData,
     dryRun,
   });
   return {
@@ -475,6 +482,7 @@ module.exports = {
   loadBundle,
   normalizeBundleForRuntimeWithOwner,
   normalizePublicAccessRole,
+  buildSeedAgentUpdatePlan,
   pickAgentFields,
   resolvePublicAccessRoleIds,
   preserveExistingEditableFields,

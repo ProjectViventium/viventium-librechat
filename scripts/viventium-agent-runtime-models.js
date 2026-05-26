@@ -491,6 +491,12 @@ function buildCanonicalPersistedAgentFields(
       ? deepClone(agent.model_parameters)
       : {};
   const canonicalBuiltInParameters = canonicalBuiltInBackgroundModelParameters(agent.id, provider);
+  const existingProvider = normalizeProvider(existingAgent?.provider);
+  const existingModel = String(existingAgent?.model || existingAgent?.model_parameters?.model || '').trim();
+  const runtimeFamilyChanged =
+    (existingProvider && provider && existingProvider !== provider) ||
+    (existingModel && model && existingModel !== model);
+  const runtimeManagedBuiltIn = Boolean(agent.id && AGENT_RUNTIME_ENV_BY_ID[agent.id]);
 
   if (canonicalBuiltInParameters !== null) {
     patch.model_parameters = patch.model
@@ -501,7 +507,7 @@ function buildCanonicalPersistedAgentFields(
       : canonicalBuiltInParameters;
   } else {
     const mergedModelParameters = {
-      ...existingModelParameters,
+      ...(runtimeManagedBuiltIn || runtimeFamilyChanged ? {} : existingModelParameters),
       ...incomingModelParameters,
     };
 

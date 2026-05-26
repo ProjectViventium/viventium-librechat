@@ -38,6 +38,10 @@ python -m scheduling_cortex.server --transport stdio
 ## Notes
 
 - The scheduler is designed to run persistently in HTTP mode.
+- `/health` is intentionally unauthenticated for local launcher probes, but it must include a
+  public-safe runtime identity. The launcher matches `db_path_sha256` against its expected
+  `SCHEDULING_DB_PATH`; raw DB paths, App Support paths, schedule content, tokens, and operator
+  names are never returned.
 - Tools are called by the main Viventium agent to create/update schedules.
 - LibreChat injects `X-Viventium-User-Id` and `X-Viventium-Agent-Id` headers for auto scoping.
 - Scheduled tasks carry `executor`. Existing user-level schedules normally use

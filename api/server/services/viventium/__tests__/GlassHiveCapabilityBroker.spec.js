@@ -211,6 +211,44 @@ describe('GlassHive capability broker', () => {
     expect(serialized).not.toContain('provider-secret');
   });
 
+  test('injects the run memory into the worker bundle when provided, and omits it when absent (Quality parity)', async () => {
+    const { maybeInjectGlassHiveCapabilityBroker } = require('../GlassHiveCapabilityBootstrapService');
+    mockGetMCPServersRegistry.mockReturnValue({
+      getAllServerConfigs: jest.fn().mockResolvedValue({
+        'ms-365': {
+          source: 'config',
+          viventiumGlassHive: { version: 1, permitsAutonomousWorker: true, sandboxAllowed: true },
+        },
+      }),
+    });
+    const memory = '- Prefers concise summaries\n- Key people: Nilay (Bryter), Sumeet (intro)';
+
+    const withMemory = await maybeInjectGlassHiveCapabilityBroker({
+      serverName: 'glasshive-workers-projects',
+      toolName: 'workspace_launch',
+      toolArguments: { description: 'Check inbox', success_criteria: 'x', execution_mode: 'docker' },
+      config: {
+        configurable: {
+          user: { id: 'user-1', role: 'USER' },
+          requestBody: {},
+          glasshive_worker_memory: memory,
+        },
+      },
+    });
+    expect(withMemory.bootstrap_bundle_json.agents_md).toContain('saved memory');
+    expect(withMemory.bootstrap_bundle_json.agents_md).toContain('Nilay (Bryter)');
+    expect(withMemory.bootstrap_bundle_json.claude_md).toContain('Sumeet (intro)');
+    expect(withMemory.bootstrap_bundle_json.codex_md).toContain('Prefers concise summaries');
+
+    const withoutMemory = await maybeInjectGlassHiveCapabilityBroker({
+      serverName: 'glasshive-workers-projects',
+      toolName: 'workspace_launch',
+      toolArguments: { description: 'Check inbox', success_criteria: 'x', execution_mode: 'docker' },
+      config: { configurable: { user: { id: 'user-1', role: 'USER' }, requestBody: {} } },
+    });
+    expect(withoutMemory.bootstrap_bundle_json.agents_md || '').not.toContain('saved memory');
+  });
+
   test('injects broker MCP config into GlassHive continue calls without replacing user instructions', async () => {
     const { maybeInjectGlassHiveCapabilityBroker } = require('../GlassHiveCapabilityBootstrapService');
     mockGetMCPServersRegistry.mockReturnValue({

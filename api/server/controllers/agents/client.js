@@ -1832,6 +1832,9 @@ class AgentClient extends BaseClient {
       const memoryContext = `${memoryInstructions}\n\n# Existing memory about the user:\n${memoryResult}`;
       sharedRunContextParts.push(memoryContext);
       promptFrameLayers.memory_context = memoryContext;
+      // Carry the (already permission-gated + token-limited) memory content so a GlassHive worker
+      // launched during this run receives the same user context the main agent has (Quality parity).
+      this.glasshiveWorkerMemory = memoryResult;
     }
     if (isDeepTimingEnabled(req)) {
       logDeepTiming(
@@ -3089,6 +3092,9 @@ class AgentClient extends BaseClient {
             toolResources: this.options.agent?.tool_resources,
           }),
           user: createSafeUser(this.options.req.user),
+          // VIVENTIUM: pass the run's gated memory so a GlassHive worker launched via the broker
+          // can be given the same user context the main agent has (see GlassHiveCapabilityBootstrapService).
+          glasshive_worker_memory: this.glasshiveWorkerMemory,
         },
         recursionLimit: agentsEConfig?.recursionLimit ?? 25,
         signal: abortController.signal,

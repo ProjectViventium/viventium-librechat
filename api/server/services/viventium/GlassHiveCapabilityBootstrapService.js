@@ -185,6 +185,18 @@ function brokerContextBrief(allowedServers, { contentReadIntent = false } = {}) 
   ].join('\n');
 }
 
+function workerMemoryBlock(memory) {
+  const text = String(memory || '').trim();
+  if (!text) {
+    return '';
+  }
+  return [
+    'What you already know about the user (saved memory — the same user context the main assistant has):',
+    text,
+    'Use this to judge relevance, priority, and alignment for this user. It is background context, not live provider evidence — verify current facts via the broker/tools.',
+  ].join('\n');
+}
+
 function contentReadIntentForArgs(args = {}) {
   return (
     truthyFlag(args.connected_account_content_intent) ||
@@ -201,6 +213,7 @@ function mergeBrokerBundle({
   grantPayload,
   allowedServers,
   contentReadIntent = false,
+  workerMemory = '',
 }) {
   const bundle = { ...existingBundle };
   const codexTokenEnvVar = 'GLASSHIVE_CAPABILITY_BROKER_TOKEN';
@@ -246,6 +259,12 @@ function mergeBrokerBundle({
   bundle.agents_md = appendText(bundle.agents_md, instruction);
   bundle.claude_md = appendText(bundle.claude_md, instruction);
   bundle.codex_md = appendText(bundle.codex_md, instruction);
+  const memoryBlock = workerMemoryBlock(workerMemory);
+  if (memoryBlock) {
+    bundle.agents_md = appendText(bundle.agents_md, memoryBlock);
+    bundle.claude_md = appendText(bundle.claude_md, memoryBlock);
+    bundle.codex_md = appendText(bundle.codex_md, memoryBlock);
+  }
   return bundle;
 }
 
@@ -316,6 +335,7 @@ async function maybeInjectGlassHiveCapabilityBroker({ serverName, toolName, tool
     return toolArguments;
   }
   const { token, payload } = mintedGrant;
+  const workerMemory = String(config?.configurable?.glasshive_worker_memory || '').trim();
   args.bootstrap_bundle_json = mergeBrokerBundle({
     existingBundle,
     brokerUrl: resolveBrokerUrl(executionMode),
@@ -323,6 +343,7 @@ async function maybeInjectGlassHiveCapabilityBroker({ serverName, toolName, tool
     grantPayload: payload,
     allowedServers,
     contentReadIntent,
+    workerMemory,
   });
   applyContextBrief(args, toolName, allowedServers, { contentReadIntent });
   return typeof toolArguments === 'string' ? JSON.stringify(args) : args;

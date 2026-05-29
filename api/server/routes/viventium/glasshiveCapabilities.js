@@ -99,17 +99,26 @@ async function handleRpc(req, res) {
         args: body.params?.arguments || {},
         signal: req.signal,
       });
-      return res.json(
-        rpcResult(id, {
-          content: [
-            {
-              type: 'text',
-              text: typeof result === 'string' ? result : JSON.stringify(result),
-            },
-          ],
-          structuredContent: result,
-        }),
-      );
+      // MCP requires structuredContent to be a JSON object. Some underlying tools
+      // (e.g. MS365 list_mail_messages) return arrays; emitting an array here makes
+      // strict MCP clients (claude-code workers) reject the result with
+      // "expected record, received array". No broker tool advertises an outputSchema,
+      // so structuredContent is optional — emit it only for plain objects; the text
+      // content always carries the full result (lenient clients like codex use it).
+      const isRecord =
+        result !== null && typeof result === 'object' && !Array.isArray(result);
+      const payload = {
+        content: [
+          {
+            type: 'text',
+            text: typeof result === 'string' ? result : JSON.stringify(result),
+          },
+        ],
+      };
+      if (isRecord) {
+        payload.structuredContent = result;
+      }
+      return res.json(rpcResult(id, payload));
     }
     if (id === null || id === undefined) {
       return res.status(202).end();

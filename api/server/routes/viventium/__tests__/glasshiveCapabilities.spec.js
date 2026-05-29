@@ -182,4 +182,32 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
 
     expect(response.body.result.structuredContent.servers[0].name).toBe('google_workspace');
   });
+
+  test('omits structuredContent for array tool results so strict MCP clients accept them', async () => {
+    // MS365 list_mail_messages returns an array. structuredContent must be a JSON
+    // object per MCP, so emitting an array makes strict clients (claude-code workers)
+    // reject the result with "expected record, received array". The array must still
+    // reach the worker via the text content block.
+    const { mintBrokerGrant } = require('~/server/services/viventium/GlassHiveCapabilityBrokerAuth');
+    const { token } = mintBrokerGrant({
+      user: { id: 'user-1', role: 'USER' },
+      allowedServers: ['ms-365'],
+    });
+    const arrayResult = [{ subject: 'Hello' }, { subject: 'World' }];
+    mockHandleToolCall.mockResolvedValue(arrayResult);
+
+    const response = await request(appWithRoute())
+      .post('/api/viventium/glasshive/capabilities/mcp')
+      .set('Authorization', `Bearer ${token}`)
+      .send({
+        jsonrpc: '2.0',
+        id: 7,
+        method: 'tools/call',
+        params: { name: 'list_mail_messages', arguments: {} },
+      })
+      .expect(200);
+
+    expect(response.body.result).not.toHaveProperty('structuredContent');
+    expect(JSON.parse(response.body.result.content[0].text)).toEqual(arrayResult);
+  });
 });

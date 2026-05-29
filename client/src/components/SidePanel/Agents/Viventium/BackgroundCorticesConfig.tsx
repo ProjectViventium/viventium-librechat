@@ -17,6 +17,7 @@ import { Brain, ChevronDown, Plus, Trash2 } from 'lucide-react';
 import {
   Label,
   Input,
+  Switch,
   Slider,
   Textarea,
   HoverCard,
@@ -92,7 +93,7 @@ const MODEL_OPTIONS: OptionWithIcon[] = [
 interface CortexCardProps {
   cortex: BackgroundCortex;
   index: number;
-  agentsMap: Record<string, any> | null;
+  agentsMap: Record<string, any> | null | undefined;
   onUpdate: (index: number, updates: Partial<BackgroundCortex>) => void;
   onRemove: (index: number) => void;
 }
@@ -106,6 +107,7 @@ const CortexCard: React.FC<CortexCardProps> = ({
 }) => {
   const [isExpanded, setIsExpanded] = useState(false);
   const agent = agentsMap?.[cortex.agent_id];
+  const isActivationEnabled = cortex.activation?.enabled !== false;
 
   const selectedModelValue = `${cortex.activation.model}|${cortex.activation.provider}`;
 
@@ -123,10 +125,16 @@ const CortexCard: React.FC<CortexCardProps> = ({
   };
 
   return (
-    <div className="rounded-md border border-border-light bg-surface-secondary p-3">
+    <div
+      className={`rounded-md border p-3 transition-colors ${
+        isActivationEnabled
+          ? 'border-border-light bg-surface-secondary'
+          : 'border-border-light bg-surface-primary opacity-75'
+      }`}
+    >
       {/* Cortex Header */}
       <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
+        <div className="flex min-w-0 items-center gap-2">
           {agent && (
             <MessageIcon
               message={{
@@ -136,11 +144,25 @@ const CortexCard: React.FC<CortexCardProps> = ({
               agent={agent}
             />
           )}
-          <span className="font-medium text-text-primary">
+          <span className="truncate font-medium text-text-primary">
             {agent?.name || 'Unknown Agent'}
+          </span>
+          <span
+            className={`shrink-0 rounded-full px-2 py-0.5 text-xs font-medium ${
+              isActivationEnabled
+                ? 'bg-green-500/10 text-green-700 dark:text-green-400'
+                : 'bg-surface-tertiary text-text-secondary'
+            }`}
+          >
+            {isActivationEnabled ? 'Auto-on' : 'Auto-off'}
           </span>
         </div>
         <div className="flex items-center gap-2">
+          <Switch
+            checked={isActivationEnabled}
+            onCheckedChange={(checked) => updateActivation({ enabled: checked })}
+            aria-label={`Toggle automatic activation for ${agent?.name || 'background cortex'}`}
+          />
           <button
             type="button"
             onClick={() => setIsExpanded(!isExpanded)}
@@ -184,6 +206,19 @@ const CortexCard: React.FC<CortexCardProps> = ({
               }
               className="h-9 w-full border-border-heavy text-sm"
               containerClassName="px-0"
+            />
+          </div>
+
+          {/* Auto Activation */}
+          <div className="flex items-center justify-between">
+            <Label htmlFor={`enabled-${index}`} className="text-xs text-text-secondary">
+              Automatic activation
+            </Label>
+            <Switch
+              id={`enabled-${index}`}
+              checked={isActivationEnabled}
+              onCheckedChange={(checked) => updateActivation({ enabled: checked })}
+              aria-label={`Automatic activation for ${agent?.name || 'background cortex'}`}
             />
           </div>
 
@@ -269,6 +304,7 @@ const BackgroundCorticesConfig: React.FC<BackgroundCorticesConfigProps> = ({
   const agentsMap = useAgentsMapContext();
 
   const cortices = field.value || [];
+  const activeCortexCount = cortices.filter((cortex) => cortex.activation?.enabled !== false).length;
 
   // Get list of available agents (exclude self and already-added cortices)
   const agents = useMemo(() => (agentsMap ? Object.values(agentsMap) : []), [agentsMap]);
@@ -333,7 +369,7 @@ const BackgroundCorticesConfig: React.FC<BackgroundCorticesConfigProps> = ({
             <CircleHelpIcon className="h-4 w-4 text-text-tertiary" />
           </HoverCardTrigger>
           <span className="ml-auto text-xs text-text-tertiary">
-            {cortices.length} cortex{cortices.length !== 1 ? 'es' : ''}
+            {activeCortexCount} active / {cortices.length} attached
           </span>
         </div>
 
@@ -387,6 +423,10 @@ const BackgroundCorticesConfig: React.FC<BackgroundCorticesConfigProps> = ({
             <p className="text-sm text-text-secondary">
               Each cortex has its own activation settings - customize when each one should
               run based on confidence threshold and activation prompts.
+            </p>
+            <p className="text-sm text-text-secondary">
+              Cortices marked Auto-off stay attached for direct use or future re-enablement, but
+              they do not run automatically for main-agent turns.
             </p>
           </div>
         </HoverCardContent>

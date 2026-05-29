@@ -1295,6 +1295,7 @@ function deduplicateInsights(insights) {
 
 function formatFollowUpPrompt({
   insights = [],
+  errors = [],
   recentResponse = '',
   userRequest = '',
   continuationContext = '',
@@ -1306,7 +1307,7 @@ function formatFollowUpPrompt({
     return '';
   }
 
-  const summaryLines = insights
+  const insightLines = insights
     .map((i) => {
       const name = i.cortexName || i.cortex_name || 'Background Agent';
       const text = typeof i.insight === 'string' ? i.insight.trim() : '';
@@ -1318,6 +1319,23 @@ function formatFollowUpPrompt({
     })
     .filter(Boolean)
     .join('\n');
+  const limitationLines = Array.isArray(errors)
+    ? errors
+        .map((error) => {
+          const name = error?.cortexName || error?.cortex_name || 'Background Agent';
+          const text = getDeferredFallbackErrorText({
+            errorClass: error?.errorClass || error?.error_class || '',
+            error: error?.error || '',
+          });
+          if (!text) {
+            return null;
+          }
+          return `- ${sanitizeFollowUpDisplayText(String(name)).trim() || 'Background Agent'}: ${text}`;
+        })
+        .filter(Boolean)
+        .join('\n')
+    : '';
+  const summaryLines = [insightLines, limitationLines].filter(Boolean).join('\n');
 
   if (!summaryLines) {
     return '';
@@ -1381,14 +1399,15 @@ function formatFollowUpPrompt({
       `Prior visible hold text for context only (do NOT repeat it):\n---\n${recentBlock}\n---`,
       'Background agents provide evidence only. You decide what, if anything, should become visible to the user.',
       'Use the background insights below as your grounding and answer the user directly.',
+      'If a listed background limitation says a check could not finish, report that specific check as unverified or unavailable; do not claim it is outside your scope.',
       'This is the visible answer that follows the brief hold. Do not imply the prior message will be edited or replaced.',
       'Be complete enough to satisfy the user request on this surface, while staying grounded in the provided insights.',
       'If the insights still leave uncertainty, say what is uncertain instead of inventing details.',
       'Do not mention internal systems, background processing, or that the answer came later.',
       'Do not output {NTA} if the insights contain any substantive user-visible information.',
       '',
-      'Background insights:',
-      summaryLines,
+      insightLines ? `Background insights:\n${insightLines}` : '',
+      limitationLines ? `Background limitations:\n${limitationLines}` : '',
     ]
       .filter(Boolean)
       .join('\n\n');
@@ -1396,7 +1415,8 @@ function formatFollowUpPrompt({
       surface_rules: surfaceRules,
       user_request: userRequestBlock,
       recent_response: recentBlock,
-      background_insights: summaryLines,
+      background_insights: insightLines,
+      background_limitations: limitationLines,
     });
   }
 
@@ -1425,8 +1445,8 @@ function formatFollowUpPrompt({
     'If an insight contains new factual/contextual material followed by a question, keep the new material and drop the question.',
     'Use {NTA} only when there is truly no new user-visible content beyond a question or repetition.',
     '',
-    'Background insights that surfaced after your response:',
-    summaryLines,
+    insightLines ? `Background insights that surfaced after your response:\n${insightLines}` : '',
+    limitationLines ? `Background limitations that surfaced after your response:\n${limitationLines}` : '',
     '',
     'Decision:',
     '- If these insights are redundant or already covered by your recent response -> {NTA}',
@@ -1444,7 +1464,8 @@ function formatFollowUpPrompt({
     surface_rules: surfaceRules,
     recent_response_context: recentResponseContext,
     continuation_context: continuationBlock,
-    background_insights: summaryLines,
+    background_insights: insightLines,
+    background_limitations: limitationLines,
   });
   /* === VIVENTIUM END === */
 }
@@ -1725,6 +1746,7 @@ async function generateFollowUpText({
   }
   const prompt = formatFollowUpPrompt({
     insights,
+    errors: Array.isArray(insightsData?.errors) ? insightsData.errors : [],
     recentResponse,
     userRequest,
     continuationContext,

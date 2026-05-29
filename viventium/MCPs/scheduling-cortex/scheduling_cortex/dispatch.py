@@ -359,7 +359,15 @@ def render_telegram_markdown(text: str) -> str:
 # === VIVENTIUM NOTE ===
 
 
-def _format_http_error(method: str, url: str, error: urllib.error.HTTPError) -> RuntimeError:
+class HttpJsonError(RuntimeError):
+    def __init__(self, message: str, *, status: int, method: str, path: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.method = method
+        self.path = path
+
+
+def _format_http_error(method: str, url: str, error: urllib.error.HTTPError) -> HttpJsonError:
     body_text = ""
     try:
         raw_body = error.read()
@@ -383,7 +391,12 @@ def _format_http_error(method: str, url: str, error: urllib.error.HTTPError) -> 
     parsed = urllib.parse.urlparse(url)
     path = parsed.path or url
     reason_suffix = f" ({reason})" if reason else ""
-    return RuntimeError(f"{method} {path} failed: HTTP {error.code}{reason_suffix}: {error_message}")
+    return HttpJsonError(
+        f"{method} {path} failed: HTTP {error.code}{reason_suffix}: {error_message}",
+        status=error.code,
+        method=method,
+        path=path,
+    )
 
 
 def _post_json(url: str, payload: Dict[str, Any], headers: Dict[str, str], timeout_s: int) -> Dict[str, Any]:
@@ -2171,16 +2184,58 @@ def _glasshive_bootstrap_bundle(task: Dict[str, Any], wb: Dict[str, Any], run_id
 
 
 def _ensure_glasshive_project(storage: ScheduleStorage, task: Dict[str, Any], wb: Dict[str, Any]) -> str:
-    project_id = str(wb.get("glasshive_project_id") or "").strip()
-    if project_id:
-        return project_id
+    base_url = _glasshive_base_url()
+    timeout_s = int(os.getenv("SCHEDULER_GLASSHIVE_HTTP_TIMEOUT_S", "20"))
+
+    def project_exists(candidate_id: str) -> bool:
+        try:
+            _get_json(
+                f"{base_url}/v1/projects/{urllib.parse.quote(candidate_id)}",
+                _glasshive_headers(),
+                timeout_s,
+            )
+        except HttpJsonError as exc:
+            if exc.status == 404:
+                return False
+            raise
+        except urllib.error.URLError:
+            raise
+        return True
+
     definition_id = str(wb.get("definition_id") or "").strip()
     definition = storage.get_scheduled_prompt_definition(definition_id) if definition_id else None
     definition_metadata = definition.get("metadata") if isinstance(definition, dict) and isinstance(definition.get("metadata"), dict) else {}
-    project_id = str(definition_metadata.get("glasshive_project_id") or "").strip()
-    if project_id:
+    task_metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    wb_metadata = task_metadata.get("workbench_scheduled_prompt") if isinstance(task_metadata.get("workbench_scheduled_prompt"), dict) else {}
+
+    def persist_project_id(project_id: str) -> None:
+        if definition_id and definition:
+            patched_metadata = dict(definition_metadata)
+            if patched_metadata.get("glasshive_project_id") != project_id:
+                patched_metadata["glasshive_project_id"] = project_id
+                storage.update_scheduled_prompt_definition(
+                    definition_id,
+                    {"metadata": patched_metadata, "updated_at": to_utc_iso(datetime.now(timezone.utc))},
+                )
+        if wb_metadata and wb_metadata.get("glasshive_project_id") != project_id:
+            patched_task_metadata = dict(task_metadata)
+            patched_wb_metadata = dict(wb_metadata)
+            patched_wb_metadata["glasshive_project_id"] = project_id
+            patched_task_metadata["workbench_scheduled_prompt"] = patched_wb_metadata
+            storage.update_task(
+                str(task.get("user_id") or ""),
+                str(task.get("id") or ""),
+                {"metadata": patched_task_metadata, "updated_at": to_utc_iso(datetime.now(timezone.utc))},
+            )
+
+    project_id = str(wb.get("glasshive_project_id") or "").strip()
+    if project_id and project_exists(project_id):
+        persist_project_id(project_id)
         return project_id
-    base_url = _glasshive_base_url()
+    project_id = str(definition_metadata.get("glasshive_project_id") or "").strip()
+    if project_id and project_exists(project_id):
+        persist_project_id(project_id)
+        return project_id
     title = str(wb.get("title") or "Workbench Scheduled Prompt").strip()
     project = _post_json(
         f"{base_url}/v1/projects",
@@ -2196,14 +2251,7 @@ def _ensure_glasshive_project(storage: ScheduleStorage, task: Dict[str, Any], wb
     project_id = str(project.get("project_id") or "").strip()
     if not project_id:
         raise RuntimeError("GlassHive project creation did not return project_id")
-    if definition_id:
-        if definition:
-            patched_metadata = dict(definition_metadata)
-            patched_metadata["glasshive_project_id"] = project_id
-            storage.update_scheduled_prompt_definition(
-                definition_id,
-                {"metadata": patched_metadata, "updated_at": to_utc_iso(datetime.now(timezone.utc))},
-            )
+    persist_project_id(project_id)
     return project_id
 
 

@@ -1969,6 +1969,25 @@ describe('BackgroundCortexFollowUpService', () => {
       expect(prompt).not.toContain('## CRITICAL: Do Not Repeat');
     });
 
+    test('includes sanitized limitations beside successful primary insights', () => {
+      const prompt = formatFollowUpPrompt({
+        insights: [{ cortexName: 'Google', insight: 'Gmail: reachable' }],
+        errors: [
+          {
+            cortexName: 'MS365',
+            error: 'no_live_tool_execution',
+            error_class: 'no_live_tool_execution',
+          },
+        ],
+        recentResponse: 'Checking now.',
+        primaryResponseMode: true,
+      });
+
+      expect(prompt).toContain('Google: Gmail: reachable');
+      expect(prompt).toContain('MS365: I could not verify live tool evidence for that check.');
+      expect(prompt).toContain('do not claim it is outside your scope');
+    });
+
     test('does not contain old weak instruction', () => {
       const prompt = formatFollowUpPrompt({
         insights: [{ cortexName: 'Test', insight: 'Some insight' }],

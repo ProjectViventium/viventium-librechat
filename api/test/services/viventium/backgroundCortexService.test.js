@@ -1517,6 +1517,114 @@ describe('BackgroundCortexService.executeCortex', () => {
     );
   });
 
+  test('marks empty productivity runs without live tool calls as no-live-tool errors', async () => {
+    const processStream = jest.fn(async () => '');
+    const initializedAgent = {
+      id: 'agent_ms365',
+      name: 'MS365',
+      provider: 'openai',
+      model: 'gpt-5.4',
+      instructions: 'Use the tools.',
+      tools: ['search_mail_mcp_ms-365', 'list_messages_mcp_ms-365'],
+    };
+
+    initializeAgent.mockResolvedValueOnce(initializedAgent);
+    createRun.mockResolvedValueOnce({ processStream });
+    createContentAggregator.mockReturnValueOnce({
+      contentParts: [],
+      aggregateContent: jest.fn(),
+    });
+
+    const result = await executeCortex({
+      agent: {
+        id: 'agent_ms365',
+        name: 'MS365',
+        provider: 'openai',
+        model: 'gpt-5.4',
+        activation: { intent_scope: 'productivity_ms365' },
+        instructions: 'Execute productivity tool operations.',
+        tools: ['search_mail_mcp_ms-365', 'list_messages_mcp_ms-365'],
+      },
+      messages: [{ role: 'user', content: 'Check my Outlook inbox.' }],
+      runId: 'run-empty-productivity',
+      activationScope: 'productivity_ms365',
+      req: {
+        user: { id: 'user-1', role: 'USER' },
+        body: { conversationId: 'c1', parentMessageId: 'p1' },
+      },
+    });
+
+    expect(result).toEqual(
+      expect.objectContaining({
+        agentId: 'agent_ms365',
+        insight: null,
+        errorClass: 'no_live_tool_execution',
+        activationScope: 'productivity_ms365',
+        configuredTools: 2,
+        completedToolCalls: 0,
+      }),
+    );
+  });
+
+  test('marks generic stream failures recoverable and preserves productivity tool metadata', async () => {
+    const processStream = jest.fn(async () => {
+      throw new Error('');
+    });
+    const initializedAgent = {
+      id: 'agent_google',
+      name: 'Google',
+      tools: [
+        'sys__server__sys_mcp_google_workspace',
+        'search_gmail_messages_mcp_google_workspace',
+      ],
+      userMCPAuthMap: null,
+      recursion_limit: 11,
+      provider: 'openai',
+    };
+
+    initializeAgent.mockResolvedValueOnce(initializedAgent);
+    createRun.mockResolvedValueOnce({ processStream });
+
+    createContentAggregator.mockReturnValueOnce({
+      contentParts: [],
+      aggregateContent: jest.fn(),
+    });
+
+    const result = await executeCortex({
+      agent: {
+        id: 'agent_google',
+        name: 'Google',
+        provider: 'openai',
+        model: 'gpt-5.4',
+        activation: { intent_scope: 'productivity_google_workspace' },
+        instructions: 'Execute productivity tool operations.',
+        tools: [
+          'sys__server__sys_mcp_google_workspace',
+          'search_gmail_messages_mcp_google_workspace',
+        ],
+      },
+      messages: [{ role: 'user', content: 'Check my Gmail inbox.' }],
+      runId: 'run-generic-provider-failure',
+      activationScope: 'productivity_google_workspace',
+      req: {
+        user: { id: 'user-1', role: 'USER' },
+        body: { conversationId: 'c1', parentMessageId: 'p1' },
+      },
+    });
+
+    expect(result).toEqual(
+      expect.objectContaining({
+        agentId: 'agent_google',
+        insight: null,
+        errorClass: 'recoverable_provider_error',
+        recoverableProviderError: true,
+        activationScope: 'productivity_google_workspace',
+        configuredTools: 2,
+        completedToolCalls: 0,
+      }),
+    );
+  });
+
   test('executeActivated propagates config-defined activation scope into productivity execution guards', async () => {
     const processStream = jest.fn(async () => 'run-output');
     const onAllComplete = jest.fn();
@@ -2058,6 +2166,35 @@ describe('BackgroundCortexService.executeCortex', () => {
     );
   });
 
+  test('buildCortexCompletionPayload maps bare provider auth text to auth classes', () => {
+    expect(
+      buildCortexCompletionPayload({
+        agentId: 'agent_auth',
+        agentName: 'Auth Cortex',
+        insight: null,
+        error: 'Unauthorized',
+      }),
+    ).toEqual(
+      expect.objectContaining({
+        status: 'error',
+        error_class: 'provider_unauthorized',
+      }),
+    );
+    expect(
+      buildCortexCompletionPayload({
+        agentId: 'agent_forbidden',
+        agentName: 'Forbidden Cortex',
+        insight: null,
+        error: 'Forbidden',
+      }),
+    ).toEqual(
+      expect.objectContaining({
+        status: 'error',
+        error_class: 'provider_access_denied',
+      }),
+    );
+  });
+
   test('executeActivated retries fallback when primary cortex throws before returning a result', async () => {
     const primaryProcessStream = jest.fn(async () => {
       const error = new Error('429 rate limit');
@@ -2157,6 +2294,187 @@ describe('BackgroundCortexService.executeCortex', () => {
           expect.objectContaining({
             cortexName: 'Retry Throw Cortex',
             insight: 'fallback-output',
+          }),
+        ],
+      }),
+    );
+  });
+
+  test('executeActivated retries fallback for generic provider stream failures before insight', async () => {
+    const primaryProcessStream = jest.fn(async () => {
+      throw new Error('');
+    });
+    const fallbackProcessStream = jest.fn(async () => 'fallback-output');
+    const onCortexComplete = jest.fn();
+    const onAllComplete = jest.fn();
+
+    loadAgent.mockResolvedValueOnce({
+      id: 'agent_retry_generic',
+      name: 'Retry Generic Cortex',
+      provider: 'openAI',
+      model: 'gpt-5.4',
+      model_parameters: {
+        model: 'gpt-5.4',
+      },
+      fallback_llm_provider: 'xai',
+      fallback_llm_model: 'grok-4.3',
+      fallback_llm_model_parameters: {
+        model: 'grok-4.3',
+      },
+      tools: [],
+    });
+    initializeAgent
+      .mockResolvedValueOnce({
+        id: 'agent_retry_generic',
+        name: 'Retry Generic Cortex',
+        tools: [],
+        userMCPAuthMap: null,
+        recursion_limit: 11,
+        provider: 'openAI',
+      })
+      .mockResolvedValueOnce({
+        id: 'agent_retry_generic',
+        name: 'Retry Generic Cortex',
+        tools: [],
+        userMCPAuthMap: null,
+        recursion_limit: 11,
+        provider: 'xai',
+      });
+    createRun
+      .mockResolvedValueOnce({ processStream: primaryProcessStream })
+      .mockResolvedValueOnce({ processStream: fallbackProcessStream });
+    createContentAggregator
+      .mockReturnValueOnce({
+        contentParts: [],
+        aggregateContent: jest.fn(),
+      })
+      .mockReturnValueOnce({
+        contentParts: [{ type: 'text', text: 'fallback-output' }],
+        aggregateContent: jest.fn(),
+      });
+
+    await executeActivated({
+      req: {
+        user: { id: 'user-1', role: 'USER' },
+        body: { conversationId: 'c1', parentMessageId: 'p1' },
+      },
+      res: null,
+      mainAgent: { provider: 'anthropic' },
+      messages: [{ role: 'user', content: 'Review this.' }],
+      runId: 'run-fallback-retry-generic',
+      activatedCortices: [
+        {
+          agentId: 'agent_retry_generic',
+          cortexName: 'Retry Generic Cortex',
+          confidence: 1,
+          reason: 'provider_recovery',
+        },
+      ],
+      onCortexComplete,
+      onAllComplete,
+    });
+
+    expect(createRun).toHaveBeenCalledTimes(2);
+    expect(initializeAgent.mock.calls[1][0].agent).toEqual(
+      expect.objectContaining({
+        provider: 'xai',
+        model: 'grok-4.3',
+      }),
+    );
+    expect(onCortexComplete).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cortex_id: 'agent_retry_generic',
+        status: 'complete',
+        insight: 'fallback-output',
+      }),
+    );
+    expect(onAllComplete).toHaveBeenCalledWith(
+      expect.objectContaining({
+        errors: undefined,
+        insights: [
+          expect.objectContaining({
+            cortexName: 'Retry Generic Cortex',
+            insight: 'fallback-output',
+          }),
+        ],
+      }),
+    );
+  });
+
+  test('executeActivated does not retry fallback for generic MCP/tool failures', async () => {
+    const primaryProcessStream = jest.fn(async () => {
+      throw new Error('MCP tool failed before result');
+    });
+    const onCortexComplete = jest.fn();
+    const onAllComplete = jest.fn();
+
+    loadAgent.mockResolvedValueOnce({
+      id: 'agent_no_retry_tool',
+      name: 'No Retry Tool Cortex',
+      provider: 'openAI',
+      model: 'gpt-5.4',
+      model_parameters: {
+        model: 'gpt-5.4',
+      },
+      fallback_llm_provider: 'xai',
+      fallback_llm_model: 'grok-4.3',
+      fallback_llm_model_parameters: {
+        model: 'grok-4.3',
+      },
+      tools: ['sys__server__sys_mcp_google_workspace'],
+      activation: { intent_scope: 'productivity_google_workspace' },
+    });
+    initializeAgent.mockResolvedValueOnce({
+      id: 'agent_no_retry_tool',
+      name: 'No Retry Tool Cortex',
+      tools: ['sys__server__sys_mcp_google_workspace'],
+      userMCPAuthMap: null,
+      recursion_limit: 11,
+      provider: 'openAI',
+    });
+    createRun.mockResolvedValueOnce({ processStream: primaryProcessStream });
+    createContentAggregator.mockReturnValueOnce({
+      contentParts: [],
+      aggregateContent: jest.fn(),
+    });
+
+    await executeActivated({
+      req: {
+        user: { id: 'user-1', role: 'USER' },
+        body: { conversationId: 'c1', parentMessageId: 'p1' },
+      },
+      res: null,
+      mainAgent: { provider: 'anthropic' },
+      messages: [{ role: 'user', content: 'Check my inbox.' }],
+      runId: 'run-no-fallback-tool',
+      activatedCortices: [
+        {
+          agentId: 'agent_no_retry_tool',
+          cortexName: 'No Retry Tool Cortex',
+          confidence: 1,
+          reason: 'tool_failure',
+          activationScope: 'productivity_google_workspace',
+        },
+      ],
+      onCortexComplete,
+      onAllComplete,
+    });
+
+    expect(createRun).toHaveBeenCalledTimes(1);
+    expect(onCortexComplete).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cortex_id: 'agent_no_retry_tool',
+        status: 'error',
+        error_class: 'background_agent_error',
+      }),
+    );
+    expect(onAllComplete).toHaveBeenCalledWith(
+      expect.objectContaining({
+        hasErrors: true,
+        errors: [
+          expect.objectContaining({
+            cortexId: 'agent_no_retry_tool',
+            error_class: 'background_agent_error',
           }),
         ],
       }),

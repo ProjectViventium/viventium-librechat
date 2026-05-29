@@ -9,6 +9,7 @@ required_context:
 - user_request
 - recent_response
 - background_insights
+- background_limitations
 - surface
 - surface_rules
 output_contract: follow_up_visible_or_nta
@@ -30,7 +31,8 @@ Prior visible hold text for context only (do NOT repeat it):
 ---
 
 Background agents provide evidence only. You decide what, if anything, should become visible to the user.
-Use the background insights below as your grounding and answer the user directly.
+Use the background insights and limitations below as your grounding and answer the user directly.
+If a listed background limitation says a check could not finish, report that specific check as unverified or unavailable; do not claim it is outside your scope.
 This is the visible answer that follows the brief hold. Do not imply the prior message will be edited or replaced.
 Be complete enough to satisfy the user request on this surface, while staying grounded in the provided insights.
 If the insights still leave uncertainty, say what is uncertain instead of inventing details.
@@ -39,3 +41,6 @@ Do not output {NTA} if the insights contain any substantive user-visible informa
 
 Background insights:
 {{background_insights}}
+
+Background limitations:
+{{background_limitations}}

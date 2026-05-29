@@ -38,6 +38,36 @@ const BaseOptionsSchema = z.object({
    * user-created MCP servers.
    * === VIVENTIUM END === */
   viventiumRequestContext: z.boolean().optional(),
+  /* === VIVENTIUM START ===
+   * Feature: GlassHive autonomous MCP capability broker policy.
+   * Purpose: Let reviewed Viventium-managed MCP server configs opt into projection through the
+   * GlassHive capability broker without allowing user-created MCP configs to self-authorize.
+   * === VIVENTIUM END === */
+  viventiumGlassHive: z
+    .object({
+      version: z.literal(1),
+      permitsAutonomousWorker: z.boolean().optional(),
+      hostAllowed: z.boolean().optional(),
+      sandboxAllowed: z.boolean().optional(),
+      defaultToolAccess: z
+        .enum(['none', 'read_metadata', 'content_read', 'write'])
+        .optional(),
+      contentReadPolicy: z.enum(['deny', 'require_explicit_intent', 'allow']).optional(),
+      writePolicy: z.enum(['deny', 'confirm', 'allow']).optional(),
+      riskClass: z.string().optional(),
+      reexportNativeTools: z.boolean().optional(),
+      toolPolicies: z
+        .record(
+          z.string(),
+          z.object({
+            access: z.enum(['none', 'read_metadata', 'content_read', 'write']).optional(),
+            confirmation: z.enum(['none', 'content_intent', 'write_confirm']).optional(),
+            description: z.string().optional(),
+          }),
+        )
+        .optional(),
+    })
+    .optional(),
   /**
    * Whether this server requires OAuth authentication
    * If not specified, will be auto-detected during construction
@@ -226,6 +256,7 @@ const omitServerManagedFields = <T extends z.ZodObject<z.ZodRawShape>>(schema: T
     chatMenu: true,
     serverInstructions: true,
     viventiumRequestContext: true,
+    viventiumGlassHive: true,
     requiresOAuth: true,
     customUserVars: true,
     oauth_headers: true,

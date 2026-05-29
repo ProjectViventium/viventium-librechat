@@ -367,6 +367,31 @@ mainAgent:
     - workspace_artifacts_mcp_glasshive-workers-projects
     - workspace_artifact_download_mcp_glasshive-workers-projects
     - metrics_summary_mcp_glasshive-workers-projects
+    # Direct connected-account READ tools: lets the main agent answer simple inbox/calendar/drive
+    # checks inline without spinning up a GlassHive worker. Background MS365/Google cortices stay
+    # auto-off; writes (send/draft/delete/move) intentionally remain on the broker/worker path.
+    - sys__server__sys_mcp_google_workspace
+    - search_gmail_messages_mcp_google_workspace
+    - get_gmail_message_content_mcp_google_workspace
+    - get_gmail_messages_content_batch_mcp_google_workspace
+    - get_gmail_thread_content_mcp_google_workspace
+    - list_calendars_mcp_google_workspace
+    - get_events_mcp_google_workspace
+    - search_drive_files_mcp_google_workspace
+    - get_drive_file_content_mcp_google_workspace
+    - search_docs_mcp_google_workspace
+    - get_doc_content_mcp_google_workspace
+    - read_sheet_values_mcp_google_workspace
+    - sys__server__sys_mcp_ms-365
+    - list-mail-messages_mcp_ms-365
+    - get-mail-message_mcp_ms-365
+    - list-mail-folder-messages_mcp_ms-365
+    - list-calendar-events_mcp_ms-365
+    - get-calendar-event_mcp_ms-365
+    - list-folder-files_mcp_ms-365
+    - download-onedrive-file-content_mcp_ms-365
+    - get-excel-range_mcp_ms-365
+    - search-query_mcp_ms-365
     - file_search
     - web_search
   tool_kwargs: []

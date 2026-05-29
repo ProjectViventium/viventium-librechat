@@ -41,6 +41,13 @@ function brokerDiscoveryRetryDelayMs() {
   return Number.isFinite(raw) && raw >= 0 ? raw : 500;
 }
 
+function brokerProviderTimeoutMs() {
+  const raw = Number(process.env.VIVENTIUM_GLASSHIVE_BROKER_PROVIDER_TIMEOUT_MS);
+  // Bound a single underlying provider call below the per-server MCP timeout (ms-365 = 120000)
+  // so a slow/unavailable provider becomes a clean blocker rather than a hang.
+  return Number.isFinite(raw) && raw > 0 ? raw : 45000;
+}
+
 async function userForGrant(grant) {
   const userId = String(grant?.user_id || '').trim();
   if (!userId) {
@@ -322,31 +329,92 @@ async function invokeUnderlyingTool({ grant, catalog, nativeTool, args = {}, sig
   }
   const mcpManager = getMCPManager(catalog.user.id);
   const flowManager = getFlowStateManager(getLogStores(CacheKeys.FLOWS));
-  const result = await mcpManager.callTool({
-    serverName: nativeTool.serverName,
-    toolName: nativeTool.toolName,
-    provider: DEFAULT_PROVIDER,
-    toolArguments,
-    options: { signal },
-    user: catalog.user,
-    requestBody: {
-      conversationId: grant.conversation_id,
-      parentMessageId: grant.parent_message_id,
-      messageId: grant.message_id,
-    },
-    flowManager,
-    tokenMethods: {
-      findToken,
-      createToken,
-      updateToken,
-      deleteToken,
-    },
-    oauthStart: async () => {
-      throw new Error('OAuth authentication required for this MCP server');
-    },
-    oauthEnd: async () => {},
-    graphTokenResolver: getGraphApiToken,
-  });
+  /* === VIVENTIUM START ===
+   * Feature: bounded provider-call timeout + structured degraded blocker
+   * Purpose: A slow/unavailable underlying MCP (e.g. MS365) must surface a structured
+   *   `provider_degraded` blocker the worker reports per its completion contract, not hang or
+   *   bubble an opaque RPC error that nudges the worker into a browser fallback. */
+  const providerTimeoutMs = brokerProviderTimeoutMs();
+  const abortController = new AbortController();
+  const onParentAbort = () => abortController.abort();
+  if (signal) {
+    if (signal.aborted) {
+      abortController.abort();
+    } else if (typeof signal.addEventListener === 'function') {
+      signal.addEventListener('abort', onParentAbort, { once: true });
+    }
+  }
+  let timedOut = false;
+  let timeoutHandle = null;
+  let result;
+  try {
+    result = await Promise.race([
+      mcpManager.callTool({
+        serverName: nativeTool.serverName,
+        toolName: nativeTool.toolName,
+        provider: DEFAULT_PROVIDER,
+        toolArguments,
+        options: { signal: abortController.signal },
+        user: catalog.user,
+        requestBody: {
+          conversationId: grant.conversation_id,
+          parentMessageId: grant.parent_message_id,
+          messageId: grant.message_id,
+        },
+        flowManager,
+        tokenMethods: {
+          findToken,
+          createToken,
+          updateToken,
+          deleteToken,
+        },
+        oauthStart: async () => {
+          throw new Error('OAuth authentication required for this MCP server');
+        },
+        oauthEnd: async () => {},
+        graphTokenResolver: getGraphApiToken,
+      }),
+      new Promise((_resolve, reject) => {
+        timeoutHandle = setTimeout(() => {
+          timedOut = true;
+          abortController.abort();
+          reject(new Error(`broker provider call timed out after ${providerTimeoutMs}ms`));
+        }, providerTimeoutMs);
+      }),
+    ]);
+  } catch (error) {
+    const message = String((error && error.message) || '');
+    const isTimeout =
+      timedOut || /timed out|timeout|ETIMEDOUT|ESOCKETTIMEDOUT|abort/i.test(message);
+    logger.warn('[VIVENTIUM][glasshive-capability-broker] Provider tool call failed', {
+      userId: catalog.user.id,
+      grantId: grant.grant_id,
+      serverName: nativeTool.serverName,
+      toolName: nativeTool.toolName,
+      timedOut: isTimeout,
+      timeoutMs: providerTimeoutMs,
+      message,
+    });
+    return {
+      status: 'blocked',
+      reason: isTimeout ? 'provider_degraded' : 'provider_error',
+      server: nativeTool.serverName,
+      tool: nativeTool.toolName,
+      retryable: isTimeout,
+      detail: isTimeout
+        ? `Connected-account provider ${nativeTool.serverName} did not respond within ${Math.round(
+            providerTimeoutMs / 1000,
+          )}s. Report this as a temporary provider issue; do not fall back to browser automation.`
+        : `Connected-account provider ${nativeTool.serverName} returned an error for ${nativeTool.toolName}.`,
+    };
+  } finally {
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
+    if (signal && typeof signal.removeEventListener === 'function') {
+      signal.removeEventListener('abort', onParentAbort);
+    }
+  }
   logger.info('[VIVENTIUM][glasshive-capability-broker] MCP tool invoked', {
     userId: catalog.user.id,
     grantId: grant.grant_id,
@@ -355,6 +423,7 @@ async function invokeUnderlyingTool({ grant, catalog, nativeTool, args = {}, sig
     outcome: 'success',
   });
   return result;
+  /* === VIVENTIUM END === */
 }
 
 async function handleToolCall({ grant, toolName, args = {}, signal } = {}) {

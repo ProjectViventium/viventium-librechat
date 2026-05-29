@@ -674,6 +674,87 @@ describe('GlassHive capability broker', () => {
     );
   });
 
+  test('surfaces a slow/erroring underlying provider as a structured blocker, not an opaque error', async () => {
+    const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
+    const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
+    mockGetMCPServersRegistry.mockReturnValue({
+      getServerConfig: jest.fn().mockResolvedValue({
+        source: 'config',
+        viventiumGlassHive: {
+          version: 1,
+          permitsAutonomousWorker: true,
+          sandboxAllowed: true,
+          defaultToolAccess: 'content_read',
+          contentReadPolicy: 'require_explicit_intent',
+        },
+      }),
+    });
+    mockReinitMCPServer.mockResolvedValue({
+      success: true,
+      oauthRequired: false,
+      tools: [
+        {
+          name: 'mail_search',
+          description: 'Search mail',
+          inputSchema: { type: 'object', properties: { query: { type: 'string' } } },
+          annotations: { readOnlyHint: true },
+        },
+      ],
+    });
+    const scopedGrant = mintBrokerGrant({
+      user: { id: 'user-1', role: 'USER' },
+      allowedServers: ['ms-365'],
+      scopes: { content_read: true },
+    }).payload;
+
+    // (1) underlying call rejects with a timeout-class error -> provider_degraded, retryable
+    mockGetMCPManager.mockReturnValue({
+      callTool: jest.fn().mockRejectedValue(new Error('socket hang up: ETIMEDOUT')),
+    });
+    const timedOutReject = await handleToolCall({
+      grant: scopedGrant,
+      toolName: 'gh_ms_365__mail_search',
+      args: { query: 'today' },
+    });
+    expect(timedOutReject).toEqual(
+      expect.objectContaining({
+        status: 'blocked',
+        reason: 'provider_degraded',
+        server: 'ms-365',
+        tool: 'mail_search',
+        retryable: true,
+      }),
+    );
+
+    // (2) underlying call hangs -> bounded broker timeout fires -> provider_degraded
+    process.env.VIVENTIUM_GLASSHIVE_BROKER_PROVIDER_TIMEOUT_MS = '20';
+    mockGetMCPManager.mockReturnValue({
+      callTool: jest.fn().mockImplementation(() => new Promise(() => {})),
+    });
+    const hung = await handleToolCall({
+      grant: scopedGrant,
+      toolName: 'gh_ms_365__mail_search',
+      args: { query: 'today' },
+    });
+    delete process.env.VIVENTIUM_GLASSHIVE_BROKER_PROVIDER_TIMEOUT_MS;
+    expect(hung).toEqual(
+      expect.objectContaining({ status: 'blocked', reason: 'provider_degraded', retryable: true }),
+    );
+
+    // (3) non-timeout error -> provider_error, not retryable
+    mockGetMCPManager.mockReturnValue({
+      callTool: jest.fn().mockRejectedValue(new Error('bad request: invalid argument')),
+    });
+    const genericErr = await handleToolCall({
+      grant: scopedGrant,
+      toolName: 'gh_ms_365__mail_search',
+      args: { query: 'today' },
+    });
+    expect(genericErr).toEqual(
+      expect.objectContaining({ status: 'blocked', reason: 'provider_error', retryable: false }),
+    );
+  });
+
   test('reports policy-approved servers with no usable tools as unavailable instead of silently healthy', async () => {
     const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
     const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');

@@ -1600,6 +1600,7 @@ router.get('/cortex/:messageId', voiceAuth, async (req, res) => {
       conversationId: result.conversationId,
       insights: result.insights,
       followUp: result.followUp ?? null,
+      followUpDecision: result.followUpDecision ?? null,
     });
   } catch (err) {
     logger.error('[VIVENTIUM][voice/cortex] Failed to load cortex insights:', err);

@@ -31,6 +31,16 @@ jest.mock('~/server/services/viventium/BackgroundCortexFollowUpService', () => (
   persistCortexPartsToCanonicalMessage: jest.fn().mockResolvedValue(undefined),
   finalizeCanonicalCortexMessage: jest.fn().mockResolvedValue(undefined),
   createCortexFollowUpMessage: jest.fn(),
+  buildFollowUpDecisionRecord: jest.fn(({ decision = {}, parentMessageId } = {}) => ({
+    tag: 'CortexFollowupDecision',
+    result: decision.result || 'skipped',
+    parentMessageId,
+    suppressionReason: decision.suppressionReason || '',
+    selectedStrategy: decision.selectedStrategy || 'none',
+    llmResult: decision.llmResult || 'skipped',
+  })),
+  logFollowUpDecisionRecord: jest.fn(),
+  persistFollowUpDecisionToParentMessage: jest.fn().mockResolvedValue(undefined),
 }));
 
 jest.mock('~/models/Agent', () => ({
@@ -64,6 +74,12 @@ const mockFinalizeCanonicalCortexMessage =
   require('~/server/services/viventium/BackgroundCortexFollowUpService').finalizeCanonicalCortexMessage;
 const mockCreateCortexFollowUpMessage =
   require('~/server/services/viventium/BackgroundCortexFollowUpService').createCortexFollowUpMessage;
+const mockBuildFollowUpDecisionRecord =
+  require('~/server/services/viventium/BackgroundCortexFollowUpService').buildFollowUpDecisionRecord;
+const mockLogFollowUpDecisionRecord =
+  require('~/server/services/viventium/BackgroundCortexFollowUpService').logFollowUpDecisionRecord;
+const mockPersistFollowUpDecisionToParentMessage =
+  require('~/server/services/viventium/BackgroundCortexFollowUpService').persistFollowUpDecisionToParentMessage;
 
 function deferred() {
   let resolve;
@@ -2995,6 +3011,7 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     mockPersistCortexPartsToCanonicalMessage.mockResolvedValue(undefined);
     mockFinalizeCanonicalCortexMessage.mockResolvedValue(undefined);
     mockCreateCortexFollowUpMessage.mockResolvedValue(null);
+    mockPersistFollowUpDecisionToParentMessage.mockResolvedValue(undefined);
 
     req = {
       user: { id: 'user-1' },
@@ -3271,6 +3288,35 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
       messageId: 'resp-1',
     });
     expect(mockCreateCortexFollowUpMessage).not.toHaveBeenCalled();
+    expect(mockBuildFollowUpDecisionRecord).toHaveBeenCalledWith(
+      expect.objectContaining({
+        req,
+        conversationId: 'conv-1',
+        parentMessageId: 'resp-1',
+        insightsData: expect.objectContaining({ hasErrors: true }),
+        decision: expect.objectContaining({
+          result: 'skipped',
+          suppressionReason: 'error_only_followup_not_deferred',
+          selectedStrategy: 'error_only_not_deferred',
+          generationFailed: true,
+        }),
+      }),
+    );
+    expect(mockLogFollowUpDecisionRecord).toHaveBeenCalledWith(
+      req,
+      expect.objectContaining({
+        tag: 'CortexFollowupDecision',
+        result: 'skipped',
+      }),
+    );
+    expect(mockPersistFollowUpDecisionToParentMessage).toHaveBeenCalledWith({
+      req,
+      parentMessageId: 'resp-1',
+      decisionRecord: expect.objectContaining({
+        tag: 'CortexFollowupDecision',
+        result: 'skipped',
+      }),
+    });
   });
 
   test('persists mixed visible, silent, and error terminal Phase B parts together', async () => {
@@ -3379,9 +3425,31 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
       messageId: 'resp-1',
     });
     expect(mockCreateCortexFollowUpMessage).not.toHaveBeenCalled();
+    expect(mockBuildFollowUpDecisionRecord).toHaveBeenCalledWith(
+      expect.objectContaining({
+        req,
+        conversationId: 'conv-1',
+        parentMessageId: 'resp-1',
+        insightsData: expect.objectContaining({ cortexCount: 1 }),
+        decision: expect.objectContaining({
+          result: 'suppressed',
+          suppressionReason: 'newer_user_input',
+          selectedStrategy: 'newer_input_suppressed',
+          movedOnAfterParent: true,
+        }),
+      }),
+    );
+    expect(mockPersistFollowUpDecisionToParentMessage).toHaveBeenCalledWith({
+      req,
+      parentMessageId: 'resp-1',
+      decisionRecord: expect.objectContaining({
+        tag: 'CortexFollowupDecision',
+        result: 'suppressed',
+      }),
+    });
   });
 
-  test('skips DB persistence for empty Phase B completion with no terminal parts', async () => {
+  test('records skipped decision for empty Phase B completion with no terminal parts', async () => {
     const phaseB = deferred();
     const attached = client.attachBackgroundCortexCompletionPipeline({
       cortexExecutionPromise: phaseB.promise,
@@ -3403,6 +3471,26 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
 
     expect(mockPersistCortexPartsToCanonicalMessage).not.toHaveBeenCalled();
     expect(mockCreateCortexFollowUpMessage).not.toHaveBeenCalled();
+    expect(mockBuildFollowUpDecisionRecord).toHaveBeenCalledWith(
+      expect.objectContaining({
+        req,
+        conversationId: 'conv-1',
+        parentMessageId: 'resp-1',
+        decision: expect.objectContaining({
+          result: 'skipped',
+          suppressionReason: 'no_usable_phase_b_output',
+          selectedStrategy: 'no_usable_output',
+        }),
+      }),
+    );
+    expect(mockPersistFollowUpDecisionToParentMessage).toHaveBeenCalledWith({
+      req,
+      parentMessageId: 'resp-1',
+      decisionRecord: expect.objectContaining({
+        tag: 'CortexFollowupDecision',
+        result: 'skipped',
+      }),
+    });
   });
 
   test('does not initialize lazy fallback when primary returns visible assistant text', async () => {
@@ -3850,5 +3938,54 @@ describe('Phase B cortex follow-up SSE emission (integration)', () => {
         cortexCount: 2,
       },
     });
+  });
+});
+
+describe('Phase B follow-up input recovery', () => {
+  test('reconstructs merged insight data from persisted pending cortex parts', () => {
+    const result = AgentClient.buildMergedInsightsDataFromCortexParts([
+      {
+        type: ContentTypes.CORTEX_ACTIVATION,
+        cortex_id: 'pattern',
+        status: 'activating',
+      },
+      {
+        type: ContentTypes.CORTEX_INSIGHT,
+        cortex_id: 'pattern',
+        cortex_name: 'Pattern Recognition',
+        status: 'complete',
+        insight: 'This is a useful late background result.',
+      },
+      {
+        type: ContentTypes.CORTEX_INSIGHT,
+        cortex_id: 'red_team',
+        cortex_name: 'Red Team',
+        status: 'error',
+        error: 'Provider timed out',
+        error_class: 'provider_timeout',
+      },
+    ]);
+
+    expect(result).toEqual(
+      expect.objectContaining({
+        cortexCount: 2,
+        hasErrors: true,
+        recoveredFromPendingCortexParts: true,
+        mergedPrompt: 'This is a useful late background result.',
+      }),
+    );
+    expect(result.insights).toEqual([
+      expect.objectContaining({
+        cortexId: 'pattern',
+        cortexName: 'Pattern Recognition',
+        insight: 'This is a useful late background result.',
+      }),
+    ]);
+    expect(result.errors).toEqual([
+      expect.objectContaining({
+        cortexId: 'red_team',
+        errorClass: 'provider_timeout',
+      }),
+    ]);
   });
 });

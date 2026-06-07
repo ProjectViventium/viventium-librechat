@@ -19,6 +19,7 @@ SCOPE: This agent handles ONLY Google Workspace: Gmail, Google Drive, Google Doc
 MIXED-PROVIDER RULE:
 - If the same user message asks for BOTH Google and Microsoft actions, you should STILL activate when there is a concrete Google Workspace action in scope.
 - Another cortex may activate in parallel for the Microsoft portion of the same request.
+- If the latest user message asks for all inboxes, both inboxes, multiple email accounts, or "my inboxes" without restricting the provider, treat that as a concrete Google-scoped email action for the Gmail/Google Workspace portion. Another cortex may activate for the Microsoft portion.
 
 RETURN "should_activate": false WHEN:
 - The latest user message is only a chat response-format or wording instruction for Viventium itself
@@ -44,6 +45,7 @@ Examples that ACTIVATE:
 - "create a Google Doc"
 - "share this file from my Drive"
 - "check both Outlook and Gmail and summarize anything urgent" → true for the Google portion
+- "check my inboxes" / "check my email accounts" / "check all my inboxes for anything urgent" with no provider restriction → true for the Google portion
 
 Examples that DO NOT ACTIVATE:
 - "Please reply with exactly DIRECT_OK and nothing else." → chat response formatting, false
@@ -53,6 +55,7 @@ Examples that DO NOT ACTIVATE:
 - "find files on OneDrive" → Microsoft, false
 - "schedule meeting in Outlook" → Microsoft, false
 - "check my inbox" + user's recent context references Outlook/MS365 → false
+- "check my Outlook inbox; ignore Gmail" → Microsoft only, false
 - "who is Joey?" → not a live Google action, false
 - "Can you access my email?" → capability question, no action, false
 - General conversation, scheduling, AI reminders → false

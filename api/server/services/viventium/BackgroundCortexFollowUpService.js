@@ -202,6 +202,221 @@ function hashFollowUpTextForLog(text, length = 12) {
     .slice(0, length);
 }
 
+function parseBooleanEnv(name, fallback = false) {
+  const raw = process.env[name];
+  if (raw == null) {
+    return fallback;
+  }
+  const normalized = String(raw).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) {
+    return true;
+  }
+  if (['0', 'false', 'no', 'off'].includes(normalized)) {
+    return false;
+  }
+  return fallback;
+}
+
+function isFollowUpDecisionContextLoggingEnabled(req, { voiceMode = false } = {}) {
+  if (process.env.VIVENTIUM_DEBUG_PHASE_B === 'true') {
+    return true;
+  }
+  if (req?.viventiumVoiceLogLatency === true) {
+    return true;
+  }
+  if (voiceMode && parseBooleanEnv('VIVENTIUM_VOICE_LOG_LATENCY', false)) {
+    return true;
+  }
+  if (req?._viventiumTelegram === true) {
+    return (
+      parseBooleanEnv('VIVENTIUM_TELEGRAM_TIMING_ENABLED', false) ||
+      parseBooleanEnv('VIVENTIUM_TELEGRAM_TIMING_DEEP', false) ||
+      parseBooleanEnv('VIVENTIUM_TELEGRAM_TRACE', false)
+    );
+  }
+  return false;
+}
+
+function compactDecisionRecordForMetadata(record) {
+  if (!record || typeof record !== 'object') {
+    return null;
+  }
+  const compact = { ...record };
+  delete compact.callSessionId;
+  delete compact.streamId;
+  delete compact.requestId;
+  return Object.fromEntries(Object.entries(compact).filter(([, value]) => value !== undefined));
+}
+
+function resolveFollowUpDecisionResult({ finalText = '', decision } = {}) {
+  const explicitResult = typeof decision?.result === 'string' ? decision.result.trim() : '';
+  if (['persisted', 'suppressed', 'empty', 'skipped'].includes(explicitResult)) {
+    return explicitResult;
+  }
+  if (typeof finalText === 'string' && finalText.trim().length > 0) {
+    return 'persisted';
+  }
+  if (decision?.suppressionReason) {
+    return 'suppressed';
+  }
+  if (decision?.selectedStrategy && decision.selectedStrategy !== 'none') {
+    return 'empty';
+  }
+  return 'skipped';
+}
+
+function buildFollowUpDecisionRecord({
+  req,
+  conversationId,
+  parentMessageId,
+  insightsData,
+  generatedText = '',
+  finalText = '',
+  decision,
+  recentResponseResolution,
+  userRequest = '',
+  initialContinuationContext,
+  finalContinuationContext,
+} = {}) {
+  const voiceMode = isVoiceMode(req);
+  const surface = resolveViventiumSurface(req);
+  const generated = String(generatedText || '');
+  const final = String(finalText || '');
+  const recentText = String(recentResponseResolution?.text || '');
+  const continuationText = String(finalContinuationContext?.contextText || '');
+  const userRequestText = String(userRequest || '');
+  const result = resolveFollowUpDecisionResult({ finalText: final, decision });
+
+  const record = {
+    tag: 'CortexFollowupDecision',
+    schemaVersion: 1,
+    result,
+    surface: surface || (voiceMode ? 'voice' : 'web'),
+    voiceMode,
+    conversationId: conversationId || '',
+    parentMessageId: parentMessageId || '',
+    streamId: req?._resumableStreamId || req?.body?.streamId || '',
+    requestId: req?.viventiumVoiceRequestId || req?.body?.traceId || '',
+    callSessionId: req?.viventiumCallSession?.callSessionId || '',
+    hasInsights: decision?.hasInsights === true,
+    insightCount: Array.isArray(insightsData?.insights) ? insightsData.insights.length : 0,
+    cortexCount: insightsData?.cortexCount ?? undefined,
+    hasMergedPrompt:
+      typeof insightsData?.mergedPrompt === 'string' && insightsData.mergedPrompt.trim().length > 0,
+    hasErrors: insightsData?.hasErrors === true,
+    generationFailed: decision?.generationFailed === true,
+    movedOnAfterParent: decision?.movedOnAfterParent === true,
+    llmResult: decision?.llmResult || 'empty',
+    selectedStrategy: decision?.selectedStrategy || 'none',
+    suppressionReason: decision?.suppressionReason || '',
+    forceVisibleFollowUp: decision?.forceVisibleFollowUp === true,
+    finalLength: decision?.finalLength ?? final.trim().length,
+    generatedLength: generated.trim().length,
+    generatedHash: generated ? hashFollowUpTextForLog(generated) : '',
+    finalHash: final ? hashFollowUpTextForLog(final) : '',
+    recentResponseSource: recentResponseResolution?.source || 'unknown',
+    recentResponseLength: recentText.length,
+    recentResponseHash: recentText ? hashFollowUpTextForLog(recentText) : '',
+    userRequestLength: userRequestText.length,
+    userRequestHash: userRequestText ? hashFollowUpTextForLog(userRequestText) : '',
+    continuationBeforeMessages: initialContinuationContext?.messageCount ?? 0,
+    continuationAfterMessages: finalContinuationContext?.messageCount ?? 0,
+    continuationCurrentLeafMessageId: finalContinuationContext?.currentLeafMessageId || '',
+    continuationLookupFailed: finalContinuationContext?.lookupFailed === true,
+    continuationContextLength: continuationText.length,
+    decidedAt: new Date().toISOString(),
+  };
+
+  return record;
+}
+
+function logFollowUpDecisionRecord(req, record) {
+  if (!record) {
+    return;
+  }
+  const contextLogging = isFollowUpDecisionContextLoggingEnabled(req, {
+    voiceMode: record.voiceMode === true,
+  });
+  const base = {
+    tag: record.tag,
+    schemaVersion: record.schemaVersion,
+    result: record.result,
+    surface: record.surface,
+    voiceMode: record.voiceMode,
+    conversationId: record.conversationId,
+    parentMessageId: record.parentMessageId,
+    streamId: record.streamId,
+    callSessionId: record.callSessionId,
+    hasInsights: record.hasInsights,
+    insightCount: record.insightCount,
+    cortexCount: record.cortexCount,
+    generationFailed: record.generationFailed,
+    movedOnAfterParent: record.movedOnAfterParent,
+    llmResult: record.llmResult,
+    selectedStrategy: record.selectedStrategy,
+    suppressionReason: record.suppressionReason || 'none',
+    forceVisibleFollowUp: record.forceVisibleFollowUp,
+    finalLength: record.finalLength,
+  };
+  const payload = contextLogging
+    ? record
+    : {
+        ...base,
+        recentResponseLength: record.recentResponseLength,
+        continuationAfterMessages: record.continuationAfterMessages,
+      };
+  logger.info(`[CortexFollowupDecision] ${JSON.stringify(payload)}`);
+}
+
+async function persistFollowUpDecisionToParentMessage({ req, parentMessageId, decisionRecord }) {
+  const metadataRecord = compactDecisionRecordForMetadata(decisionRecord);
+  if (!metadataRecord || !req?.user?.id || !parentMessageId) {
+    return null;
+  }
+
+  try {
+    const existing = await db.getMessage({ user: req.user.id, messageId: parentMessageId });
+    if (!existing) {
+      return null;
+    }
+    const existingMetadata =
+      existing.metadata &&
+      typeof existing.metadata === 'object' &&
+      !Array.isArray(existing.metadata)
+        ? existing.metadata
+        : {};
+    const existingViventium =
+      existingMetadata.viventium &&
+      typeof existingMetadata.viventium === 'object' &&
+      !Array.isArray(existingMetadata.viventium)
+        ? existingMetadata.viventium
+        : {};
+    const metadata = {
+      ...existingMetadata,
+      viventium: {
+        ...existingViventium,
+        cortexFollowUpDecision: metadataRecord,
+      },
+    };
+
+    await db.updateMessage(
+      req,
+      { messageId: parentMessageId, metadata },
+      {
+        context:
+          'viventium/services/BackgroundCortexFollowUpService.persistFollowUpDecisionToParentMessage',
+      },
+    );
+    return metadataRecord;
+  } catch (err) {
+    logger.warn(
+      '[BackgroundCortexFollowUpService] Failed to persist follow-up decision metadata',
+      sanitizeFollowUpErrorForLog(err),
+    );
+    return null;
+  }
+}
+
 function sanitizeAnthropicFollowUpLLMConfig(llmConfig = {}) {
   if (!llmConfig || typeof llmConfig !== 'object') {
     return llmConfig;
@@ -1295,6 +1510,7 @@ function deduplicateInsights(insights) {
 
 function formatFollowUpPrompt({
   insights = [],
+  errors = [],
   recentResponse = '',
   userRequest = '',
   continuationContext = '',
@@ -1306,7 +1522,7 @@ function formatFollowUpPrompt({
     return '';
   }
 
-  const summaryLines = insights
+  const insightLines = insights
     .map((i) => {
       const name = i.cortexName || i.cortex_name || 'Background Agent';
       const text = typeof i.insight === 'string' ? i.insight.trim() : '';
@@ -1318,6 +1534,23 @@ function formatFollowUpPrompt({
     })
     .filter(Boolean)
     .join('\n');
+  const limitationLines = Array.isArray(errors)
+    ? errors
+        .map((error) => {
+          const name = error?.cortexName || error?.cortex_name || 'Background Agent';
+          const text = getDeferredFallbackErrorText({
+            errorClass: error?.errorClass || error?.error_class || '',
+            error: error?.error || '',
+          });
+          if (!text) {
+            return null;
+          }
+          return `- ${sanitizeFollowUpDisplayText(String(name)).trim() || 'Background Agent'}: ${text}`;
+        })
+        .filter(Boolean)
+        .join('\n')
+    : '';
+  const summaryLines = [insightLines, limitationLines].filter(Boolean).join('\n');
 
   if (!summaryLines) {
     return '';
@@ -1381,14 +1614,15 @@ function formatFollowUpPrompt({
       `Prior visible hold text for context only (do NOT repeat it):\n---\n${recentBlock}\n---`,
       'Background agents provide evidence only. You decide what, if anything, should become visible to the user.',
       'Use the background insights below as your grounding and answer the user directly.',
+      'If a listed background limitation says a check could not finish, report that specific check as unverified or unavailable; do not claim it is outside your scope.',
       'This is the visible answer that follows the brief hold. Do not imply the prior message will be edited or replaced.',
       'Be complete enough to satisfy the user request on this surface, while staying grounded in the provided insights.',
       'If the insights still leave uncertainty, say what is uncertain instead of inventing details.',
       'Do not mention internal systems, background processing, or that the answer came later.',
       'Do not output {NTA} if the insights contain any substantive user-visible information.',
       '',
-      'Background insights:',
-      summaryLines,
+      insightLines ? `Background insights:\n${insightLines}` : '',
+      limitationLines ? `Background limitations:\n${limitationLines}` : '',
     ]
       .filter(Boolean)
       .join('\n\n');
@@ -1396,7 +1630,8 @@ function formatFollowUpPrompt({
       surface_rules: surfaceRules,
       user_request: userRequestBlock,
       recent_response: recentBlock,
-      background_insights: summaryLines,
+      background_insights: insightLines,
+      background_limitations: limitationLines,
     });
   }
 
@@ -1425,8 +1660,10 @@ function formatFollowUpPrompt({
     'If an insight contains new factual/contextual material followed by a question, keep the new material and drop the question.',
     'Use {NTA} only when there is truly no new user-visible content beyond a question or repetition.',
     '',
-    'Background insights that surfaced after your response:',
-    summaryLines,
+    insightLines ? `Background insights that surfaced after your response:\n${insightLines}` : '',
+    limitationLines
+      ? `Background limitations that surfaced after your response:\n${limitationLines}`
+      : '',
     '',
     'Decision:',
     '- If these insights are redundant or already covered by your recent response -> {NTA}',
@@ -1444,7 +1681,8 @@ function formatFollowUpPrompt({
     surface_rules: surfaceRules,
     recent_response_context: recentResponseContext,
     continuation_context: continuationBlock,
-    background_insights: summaryLines,
+    background_insights: insightLines,
+    background_limitations: limitationLines,
   });
   /* === VIVENTIUM END === */
 }
@@ -1725,6 +1963,7 @@ async function generateFollowUpText({
   }
   const prompt = formatFollowUpPrompt({
     insights,
+    errors: Array.isArray(insightsData?.errors) ? insightsData.errors : [],
     recentResponse,
     userRequest,
     continuationContext,
@@ -1992,8 +2231,9 @@ async function createCortexFollowUpMessage({
     }
   }
 
+  const generatedText = text;
   const { text: resolvedText, decision } = resolveFollowUpPersistenceText({
-    generatedText: text,
+    generatedText,
     insightsData,
     forceVisibleFollowUp: shouldForceVisibleFollowUp,
     voiceMode,
@@ -2005,9 +2245,25 @@ async function createCortexFollowUpMessage({
   });
   text = resolvedText;
 
-  logger.info(
-    `[BackgroundCortexFollowUpService] Follow-up persistence decision conversationId=${conversationId || ''} parent=${parentMessageId || ''} replaceParent=false forceVisible=${decision.forceVisibleFollowUp} hasInsights=${decision.hasInsights} generationFailed=${decision.generationFailed} movedOn=${decision.movedOnAfterParent} llmResult=${decision.llmResult} selectedStrategy=${decision.selectedStrategy} suppressionReason=${decision.suppressionReason || 'none'} finalLength=${decision.finalLength}`,
-  );
+  const followUpDecisionRecord = buildFollowUpDecisionRecord({
+    req,
+    conversationId,
+    parentMessageId,
+    insightsData,
+    generatedText,
+    finalText: text,
+    decision,
+    recentResponseResolution,
+    userRequest,
+    initialContinuationContext: continuationContext,
+    finalContinuationContext,
+  });
+  logFollowUpDecisionRecord(req, followUpDecisionRecord);
+  await persistFollowUpDecisionToParentMessage({
+    req,
+    parentMessageId,
+    decisionRecord: followUpDecisionRecord,
+  });
 
   if (!text || text.trim().length === 0) {
     return null;
@@ -2077,6 +2333,7 @@ async function createCortexFollowUpMessage({
       cortexCount: insightsData?.cortexCount ?? undefined,
       replacedParentMessage: false,
       forceVisibleFollowUp: shouldForceVisibleFollowUp,
+      cortexFollowUpDecision: compactDecisionRecordForMetadata(followUpDecisionRecord),
     },
   };
 
@@ -2125,6 +2382,10 @@ module.exports = {
   resolveFollowUpContinuationContext,
   resolveFollowUpRuntimeAssignment,
   buildFollowUpModelKwargsForProvider,
+  buildFollowUpDecisionRecord,
+  compactDecisionRecordForMetadata,
+  logFollowUpDecisionRecord,
+  persistFollowUpDecisionToParentMessage,
   sanitizeAnthropicFollowUpLLMConfig,
   stripQuestionSentences,
 };

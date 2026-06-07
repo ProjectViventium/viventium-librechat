@@ -319,6 +319,8 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             return "GlassHive run completed. Private details are stored in the run detail file."
         if status == "failed":
             raw = str(payload.get("error") or error_class or event or "GlassHive run failed").strip()
+        elif event == "run.waiting_on_capacity":
+            raw = "GlassHive run is waiting for host worker capacity and will retry."
         elif status == "running":
             raw = "GlassHive run started."
         else:
@@ -354,6 +356,47 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
         except OSError:
             pass
         return data if isinstance(data, dict) else {}
+
+    def _update_parent_task_for_glasshive_callback(
+        run: Dict[str, Any],
+        *,
+        status: str,
+        result_summary: str,
+        error_class: str | None,
+        payload: Dict[str, Any],
+        received_at: str,
+    ) -> None:
+        task_id = str(run.get("task_id") or "").strip()
+        user_id = str(run.get("user_id") or "").strip()
+        if not task_id or not user_id:
+            return
+        event = str(payload.get("event") or "").strip()
+        delivery = {
+            "outcome": "failed" if status == "failed" else ("sent" if status == "completed" else "queued"),
+            "reason": error_class or event or status,
+            "generated_text": None,
+            "scheduled_prompt_run_id": run.get("run_id"),
+            "glasshive_run_id": run.get("glasshive_run_id"),
+        }
+        updates: Dict[str, Any] = {
+            "updated_at": received_at,
+            "last_run_at": run.get("started_at") or run.get("due_at") or received_at,
+            "last_delivery_at": received_at,
+            "last_delivery_outcome": delivery["outcome"],
+            "last_delivery_reason": result_summary,
+            "last_generated_text": None,
+            "last_delivery": delivery,
+        }
+        if status == "completed":
+            updates["last_status"] = "success"
+            updates["last_error"] = None
+        elif status == "failed":
+            updates["last_status"] = "error"
+            updates["last_error"] = result_summary
+        else:
+            updates["last_status"] = "running"
+            updates["last_error"] = None
+        storage.update_task(user_id, task_id, updates)
 
     def _proposal_files(my_folder: str, started_at: str | None) -> list[Path]:
         root = Path(my_folder).expanduser()
@@ -456,6 +499,15 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             status = "failed"
             completed_at = now
             error_class = event.replace("run.", "")
+        elif event == "run.queued":
+            current_status = str(run.get("status") or "queued")
+            status = current_status if current_status in {"running", "completed", "failed"} else "queued"
+            completed_at = run.get("completed_at")
+            error_class = run.get("error_class") if status != "queued" else None
+        elif event in {"run.waiting_on_capacity", "run.requeued"}:
+            status = "queued"
+            completed_at = run.get("completed_at")
+            error_class = None
         elif event == "run.started":
             status = "running"
             completed_at = run.get("completed_at")
@@ -494,6 +546,14 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
                 "callback_payload_json": json.dumps(callback_summary),
                 "updated_at": now,
             },
+        )
+        _update_parent_task_for_glasshive_callback(
+            run,
+            status=status,
+            result_summary=result_summary or str(run.get("result_summary") or ""),
+            error_class=error_class,
+            payload=payload,
+            received_at=now,
         )
         return JSONResponse({"status": "ok", "run_id": run["run_id"]})
     # === VIVENTIUM END ===

@@ -46,6 +46,7 @@ const DEFAULT_VALID_KEYS = [
 const DEFAULT_TOKEN_LIMIT = 8000;
 const DEFAULT_MAX_INPUT_CHARS = 500000;
 const DEFAULT_TRANSCRIPT_MAX_FILES_PER_RUN = 20;
+const DEFAULT_TRANSCRIPT_MIN_FILES_PER_RUN = 5;
 const DEFAULT_TRANSCRIPT_MAX_CHARS_PER_FILE = 500000;
 const DEFAULT_TRANSCRIPT_STABLE_EVIDENCE_MAX_AGE_DAYS = 90;
 const DEFAULT_TRANSCRIPT_SUMMARY_MAX_CHARS = 32000;
@@ -53,7 +54,9 @@ const DEFAULT_TRANSCRIPT_REFERENCE_MEMORY_MAX_CHARS = 24000;
 const DEFAULT_TRANSCRIPT_REFERENCE_MESSAGES_MAX_CHARS = 36000;
 const DEFAULT_TRANSCRIPT_RAG_MODE = 'detailed_summary_only';
 const DEFAULT_TRANSCRIPT_VECTOR_HEALTH_TIMEOUT_MS = 5000;
+const DEFAULT_MEMORY_HARDENING_MIN_APPLY_INTERVAL_SECONDS = 5 * 60;
 const DEFAULT_MEMORY_HARDENING_PROBE_TIMEOUT_MS = 30000;
+const DEFAULT_MEMORY_HARDENING_MODEL_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_MEMORY_HARDENING_LOCK_STALE_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_TRANSCRIPT_IGNORE_GLOBS = [
   '**/.DS_Store',
@@ -91,6 +94,7 @@ const DEFAULT_MEMORY_HARDENING_MODEL_FALLBACKS = [
   { provider: 'openai', model: 'gpt-5.5', effort: 'high', source: 'default' },
   { provider: 'openai', model: 'gpt-5.4', effort: 'high', source: 'default' },
 ];
+const MEMORY_HARDENING_EFFICIENCY_MARKER = 'last-model-apply.public.json';
 
 function isListenOnlyTranscriptMessage(message) {
   const metadata = message?.metadata?.viventium;
@@ -261,6 +265,10 @@ function parseArgs(argv = process.argv.slice(2)) {
       process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_MAX_FILES_PER_RUN,
       DEFAULT_TRANSCRIPT_MAX_FILES_PER_RUN,
     ),
+    transcriptMinFilesPerRun: positiveNumber(
+      process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_MIN_FILES_PER_RUN,
+      DEFAULT_TRANSCRIPT_MIN_FILES_PER_RUN,
+    ),
     transcriptMaxCharsPerFile: positiveNumber(
       process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_MAX_CHARS_PER_FILE,
       DEFAULT_TRANSCRIPT_MAX_CHARS_PER_FILE,
@@ -284,6 +292,12 @@ function parseArgs(argv = process.argv.slice(2)) {
     transcriptRagMode: normalizeTranscriptRagMode(
       process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_RAG_MODE,
     ),
+    minApplyIntervalSeconds: positiveNumber(
+      process.env.VIVENTIUM_MEMORY_HARDENING_MIN_APPLY_INTERVAL_SECONDS,
+      DEFAULT_MEMORY_HARDENING_MIN_APPLY_INTERVAL_SECONDS,
+    ),
+    ignoreEfficiencyGate: false,
+    interactiveMaintenance: false,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -346,6 +360,12 @@ function parseArgs(argv = process.argv.slice(2)) {
       options.transcriptMaxFilesPerRun = Number(
         arg.slice('--transcript-max-files-per-run='.length),
       );
+    } else if (arg === '--transcript-min-files-per-run') {
+      options.transcriptMinFilesPerRun = Number(next());
+    } else if (arg.startsWith('--transcript-min-files-per-run=')) {
+      options.transcriptMinFilesPerRun = Number(
+        arg.slice('--transcript-min-files-per-run='.length),
+      );
     } else if (arg === '--transcript-max-chars-per-file') {
       options.transcriptMaxCharsPerFile = Number(next());
     } else if (arg.startsWith('--transcript-max-chars-per-file=')) {
@@ -389,11 +409,29 @@ function parseArgs(argv = process.argv.slice(2)) {
       );
     } else if (arg === '--allow-delete') options.allowDelete = true;
     else if (arg === '--ignore-idle-gate') options.ignoreIdleGate = true;
+    else if (arg === '--ignore-efficiency-gate') options.ignoreEfficiencyGate = true;
+    else if (arg === '--interactive-maintenance') options.interactiveMaintenance = true;
     else if (arg === '--skip-model-probe') options.skipModelProbe = true;
     else if (arg === '--allow-partial-lookback') options.requireFullLookback = false;
     else if (arg === '--json') options.json = true;
     else if (arg === '--help' || arg === '-h') options.help = true;
     else throw new Error(`Unknown memory hardening option: ${arg}`);
+  }
+
+  options.transcriptMinFilesPerRun = positiveNumber(
+    options.transcriptMinFilesPerRun,
+    DEFAULT_TRANSCRIPT_MIN_FILES_PER_RUN,
+  );
+  options.transcriptMaxFilesPerRun = positiveNumber(
+    options.transcriptMaxFilesPerRun,
+    DEFAULT_TRANSCRIPT_MAX_FILES_PER_RUN,
+  );
+  if (
+    options.mode === 'apply' &&
+    options.transcriptsOnly &&
+    options.transcriptMaxFilesPerRun < options.transcriptMinFilesPerRun
+  ) {
+    options.transcriptMaxFilesPerRun = options.transcriptMinFilesPerRun;
   }
 
   return options;
@@ -419,6 +457,7 @@ Options:
   --transcripts-only                Skip chat lookback and process only new/changed transcripts
   --transcript-ignore-glob <glob>   Ignore downloader bookkeeping/temp files by relative path glob
   --transcript-max-files-per-run <n>         Default: 20
+  --transcript-min-files-per-run <n>         Floor for apply transcript batches. Default: 5
   --transcript-max-chars-per-file <n>        Default: 500000
   --transcript-summary-max-chars <n>         Default: 32000
   --transcript-reference-memory-max-chars <n>   Default: 24000
@@ -426,6 +465,8 @@ Options:
   --transcript-rag-mode <mode>      detailed_summary_only, raw_and_summary, or raw_only
   --allow-partial-lookback          Allow oldest messages to be omitted when input cap is hit
   --ignore-idle-gate               Manual QA override only
+  --ignore-efficiency-gate          Requires VIVENTIUM_MEMORY_HARDENING_ALLOW_EFFICIENCY_OVERRIDE=1
+  --interactive-maintenance         Operator-triggered maintenance; bypasses cooldown only
 `;
 }
 
@@ -532,6 +573,151 @@ function resolveStatePaths(options) {
     runsDir: path.join(stateDir, 'runs'),
     lockDir: path.join(stateDir, 'lock'),
     transcriptStateDir: path.join(stateDir, 'transcripts'),
+  };
+}
+
+function efficiencyMarkerPath(paths) {
+  return path.join(paths.stateDir, MEMORY_HARDENING_EFFICIENCY_MARKER);
+}
+
+function readEfficiencyMarker(paths) {
+  return readJsonIfExists(efficiencyMarkerPath(paths), null);
+}
+
+function writeEfficiencyMarker(paths, payload) {
+  const publicPayload = {
+    schemaVersion: 1,
+    status: payload.status,
+    run_id: payload.run_id || null,
+    mode: payload.mode || null,
+    started_at: payload.started_at || null,
+    finished_at: payload.finished_at || null,
+    next_allowed_at: payload.next_allowed_at || null,
+    min_apply_interval_seconds: payload.min_apply_interval_seconds || null,
+    transcript_max_files_per_run: payload.transcript_max_files_per_run || null,
+    transcript_min_files_per_run: payload.transcript_min_files_per_run || null,
+    transcripts_only: Boolean(payload.transcripts_only),
+    aggregate: payload.aggregate || {},
+  };
+  safeJsonWrite(efficiencyMarkerPath(paths), publicPayload, 0o600);
+  return publicPayload;
+}
+
+function efficiencyOverrideAllowed(options) {
+  return (
+    Boolean(options.ignoreEfficiencyGate) &&
+    parseBool(process.env.VIVENTIUM_MEMORY_HARDENING_ALLOW_EFFICIENCY_OVERRIDE, false)
+  );
+}
+
+function isCooldownGatedModelRun(options) {
+  return ['apply', 'dry-run'].includes(options.mode) && !options.proposalFile && !options.runId;
+}
+
+function modelApplyCooldownDecision(options, paths, now = new Date()) {
+  const minApplyIntervalSeconds = positiveNumber(
+    options.minApplyIntervalSeconds,
+    DEFAULT_MEMORY_HARDENING_MIN_APPLY_INTERVAL_SECONDS,
+  );
+  if (!isCooldownGatedModelRun(options) || minApplyIntervalSeconds <= 0) {
+    return { allowed: true, reason: null, minApplyIntervalSeconds };
+  }
+  if (options.interactiveMaintenance) {
+    return {
+      allowed: true,
+      reason: 'interactive_maintenance',
+      minApplyIntervalSeconds,
+      bypassed: true,
+    };
+  }
+  if (efficiencyOverrideAllowed(options)) {
+    return {
+      allowed: true,
+      reason: 'efficiency_override',
+      minApplyIntervalSeconds,
+      bypassed: true,
+    };
+  }
+  const marker = readEfficiencyMarker(paths);
+  const finishedAtValue = marker?.finished_at || marker?.started_at;
+  const finishedAt = finishedAtValue ? new Date(finishedAtValue) : null;
+  if (!finishedAt || Number.isNaN(finishedAt.getTime())) {
+    return { allowed: true, reason: null, minApplyIntervalSeconds, marker };
+  }
+  const nextAllowedAt = new Date(finishedAt.getTime() + minApplyIntervalSeconds * 1000);
+  if (now < nextAllowedAt) {
+    return {
+      allowed: false,
+      reason: 'maintenance_cooldown',
+      marker,
+      minApplyIntervalSeconds,
+      lastFinishedAt: finishedAt.toISOString(),
+      nextAllowedAt: nextAllowedAt.toISOString(),
+    };
+  }
+  return {
+    allowed: true,
+    reason: null,
+    marker,
+    minApplyIntervalSeconds,
+    lastFinishedAt: finishedAt.toISOString(),
+    nextAllowedAt: nextAllowedAt.toISOString(),
+  };
+}
+
+function buildCooldownSkipSummary({ options, runId, now, decision }) {
+  return {
+    schemaVersion: 1,
+    status: 'skipped',
+    reason: 'maintenance_cooldown',
+    run_id: runId,
+    mode: options.mode,
+    started_at: now.toISOString(),
+    finished_at: now.toISOString(),
+    users: [
+      {
+        status: 'skipped',
+        reason: 'maintenance_cooldown',
+      },
+    ],
+    apply_results: [],
+    efficiency_gate: {
+      min_apply_interval_seconds: decision.minApplyIntervalSeconds,
+      last_finished_at: decision.lastFinishedAt || null,
+      next_allowed_at: decision.nextAllowedAt || null,
+      override_required_env: 'VIVENTIUM_MEMORY_HARDENING_ALLOW_EFFICIENCY_OVERRIDE',
+    },
+  };
+}
+
+function aggregateMaintenanceSummary(summary) {
+  const users = Array.isArray(summary?.users) ? summary.users : [];
+  const applyResults = Array.isArray(summary?.apply_results) ? summary.apply_results : [];
+  const transcriptIngest = users.reduce(
+    (totals, user) => {
+      const ingest = user?.transcript_ingest || {};
+      totals.files_seen += Number(ingest.files_seen || 0);
+      totals.files_pending += Number(ingest.files_pending || 0);
+      totals.files_skipped_by_cap += Number(ingest.files_skipped_by_cap || 0);
+      return totals;
+    },
+    { files_seen: 0, files_pending: 0, files_skipped_by_cap: 0 },
+  );
+  const transcriptVectors = applyResults.reduce(
+    (totals, result) => {
+      const vectors = result?.transcript_vectors || {};
+      totals.uploaded += Number(vectors.uploaded || 0);
+      totals.deleted += Number(vectors.deleted || 0);
+      totals.deferred += Number(vectors.deferred || 0);
+      return totals;
+    },
+    { uploaded: 0, deleted: 0, deferred: 0 },
+  );
+  return {
+    user_count: users.length,
+    applied_user_count: applyResults.length,
+    transcript_ingest: transcriptIngest,
+    transcript_vectors: transcriptVectors,
   };
 }
 
@@ -1337,6 +1523,7 @@ Hard constraints:
 - Output JSON only, matching the schema implied by:
   { "operations": [{ "key", "action", "value", "rationale", "evidence" }], "transcript_summaries": [] }.
 - Valid actions are set, delete, noop.
+- Every operation must include a string value field; use "" for noop/delete when no replacement value applies.
 - Never edit the "working" key in this batch job.
 - Do not delete non-empty keys unless the operator explicitly enabled deletion. Prefer set with a compact corrected value.
 - Preserve unrelated memory. Do not rewrite a whole key just to change style.
@@ -2007,12 +2194,38 @@ function withTempJsonFile(prefix, payload, callback) {
   }
 }
 
+function codexOutputSchema(schema) {
+  if (!schema || typeof schema !== 'object') return schema;
+  if (Array.isArray(schema)) return schema.map(codexOutputSchema);
+
+  const output = { ...schema };
+  if (output.oneOf) {
+    // Codex/OpenAI structured outputs reject oneOf, while anyOf preserves the same
+    // model-facing union shape. The runtime validator still owns the final evidence contract.
+    output.anyOf = codexOutputSchema(output.oneOf);
+    delete output.oneOf;
+  }
+  for (const key of ['items', 'anyOf', 'allOf']) {
+    if (output[key]) output[key] = codexOutputSchema(output[key]);
+  }
+  if (output.properties && typeof output.properties === 'object' && !Array.isArray(output.properties)) {
+    output.properties = Object.fromEntries(
+      Object.entries(output.properties).map(([key, value]) => [key, codexOutputSchema(value)]),
+    );
+    output.required = Object.keys(output.properties);
+    if (output.type === 'object' && output.additionalProperties === undefined) {
+      output.additionalProperties = false;
+    }
+  }
+  return output;
+}
+
 function runCodexStructured({ prompt, model, effort, schema, timeoutMs }) {
   const outputPath = path.join(
     os.tmpdir(),
     `viventium-codex-output-${Date.now()}-${Math.random().toString(36).slice(2)}.json`,
   );
-  return withTempJsonFile('viventium-codex-schema', schema, (schemaPath) => {
+  return withTempJsonFile('viventium-codex-schema', codexOutputSchema(schema), (schemaPath) => {
     try {
       const stdout = runCommand(
         'codex',
@@ -2134,7 +2347,10 @@ function invokeModel({ prompt, provider, model, effort }) {
     model,
     effort,
     schema: proposalSchema(),
-    timeoutMs: Number(process.env.VIVENTIUM_MEMORY_HARDENING_MODEL_TIMEOUT_MS || 900000),
+    timeoutMs: Number(
+      process.env.VIVENTIUM_MEMORY_HARDENING_MODEL_TIMEOUT_MS ||
+        DEFAULT_MEMORY_HARDENING_MODEL_TIMEOUT_MS,
+    ),
   });
 }
 
@@ -2203,7 +2419,10 @@ function invokeModelWithFallback({ prompt, providerInfo }) {
     prompt,
     providerInfo,
     schema: proposalSchema(),
-    timeoutMs: Number(process.env.VIVENTIUM_MEMORY_HARDENING_MODEL_TIMEOUT_MS || 900000),
+    timeoutMs: Number(
+      process.env.VIVENTIUM_MEMORY_HARDENING_MODEL_TIMEOUT_MS ||
+        DEFAULT_MEMORY_HARDENING_MODEL_TIMEOUT_MS,
+    ),
   });
   return {
     proposal: result.output,
@@ -2228,7 +2447,10 @@ function invokeTranscriptSummaryModel({
     model,
     effort,
     schema: transcriptSummarySchema(maxChars),
-    timeoutMs: Number(process.env.VIVENTIUM_MEMORY_HARDENING_MODEL_TIMEOUT_MS || 900000),
+    timeoutMs: Number(
+      process.env.VIVENTIUM_MEMORY_HARDENING_MODEL_TIMEOUT_MS ||
+        DEFAULT_MEMORY_HARDENING_MODEL_TIMEOUT_MS,
+    ),
   });
   const summary = sanitizeTranscriptSummary(output?.summary || '', maxChars);
   if (!summary) {
@@ -2254,7 +2476,10 @@ function invokeTranscriptSummaryModelWithFallback({
     prompt,
     providerInfo,
     schema: transcriptSummarySchema(maxChars),
-    timeoutMs: Number(process.env.VIVENTIUM_MEMORY_HARDENING_MODEL_TIMEOUT_MS || 900000),
+    timeoutMs: Number(
+      process.env.VIVENTIUM_MEMORY_HARDENING_MODEL_TIMEOUT_MS ||
+        DEFAULT_MEMORY_HARDENING_MODEL_TIMEOUT_MS,
+    ),
   });
   const output = result.output;
   const summary = sanitizeTranscriptSummary(output?.summary || '', maxChars);
@@ -4291,8 +4516,7 @@ async function runHardening(options) {
   const releaseLock = acquireLock(paths.lockDir);
   const now = new Date();
   const runId = options.runId || makeRunId(now);
-  const runDir = path.join(paths.runsDir, runId);
-  fs.mkdirSync(runDir, { recursive: true, mode: 0o700 });
+  let runDir = null;
   let phase = 'initializing';
   let providerInfo = null;
   let effectiveOptions = { ...options, transcriptStateDir: paths.transcriptStateDir };
@@ -4306,6 +4530,24 @@ async function runHardening(options) {
   const summaries = [];
   const applyResults = [];
   try {
+    const cooldownDecision = modelApplyCooldownDecision(options, paths, now);
+    if (!cooldownDecision.allowed) {
+      return buildCooldownSkipSummary({ options, runId, now, decision: cooldownDecision });
+    }
+    if (isCooldownGatedModelRun(options)) {
+      writeEfficiencyMarker(paths, {
+        status: 'running',
+        run_id: runId,
+        mode: options.mode,
+        started_at: now.toISOString(),
+        min_apply_interval_seconds: cooldownDecision.minApplyIntervalSeconds,
+        transcript_max_files_per_run: effectiveOptions.transcriptMaxFilesPerRun,
+        transcript_min_files_per_run: effectiveOptions.transcriptMinFilesPerRun,
+        transcripts_only: effectiveOptions.transcriptsOnly,
+      });
+    }
+    runDir = path.join(paths.runsDir, runId);
+    fs.mkdirSync(runDir, { recursive: true, mode: 0o700 });
     phase = 'connect_mongo';
     const { db, methods } = await connect(options);
     phase = 'load_memory_config';
@@ -4399,6 +4641,31 @@ async function runHardening(options) {
       redacted_log_file: 'run-log.redacted.jsonl',
     };
     safeJsonWrite(path.join(runDir, 'summary.json'), summary, 0o600);
+    if (isCooldownGatedModelRun(options)) {
+      writeEfficiencyMarker(paths, {
+        status: 'finished',
+        run_id: runId,
+        mode: options.mode,
+        started_at: summary.started_at,
+        finished_at: summary.finished_at,
+        next_allowed_at: new Date(
+          new Date(summary.finished_at).getTime() +
+            positiveNumber(
+              options.minApplyIntervalSeconds,
+              DEFAULT_MEMORY_HARDENING_MIN_APPLY_INTERVAL_SECONDS,
+            ) *
+              1000,
+        ).toISOString(),
+        min_apply_interval_seconds: positiveNumber(
+          options.minApplyIntervalSeconds,
+          DEFAULT_MEMORY_HARDENING_MIN_APPLY_INTERVAL_SECONDS,
+        ),
+        transcript_max_files_per_run: effectiveOptions.transcriptMaxFilesPerRun,
+        transcript_min_files_per_run: effectiveOptions.transcriptMinFilesPerRun,
+        transcripts_only: effectiveOptions.transcriptsOnly,
+        aggregate: aggregateMaintenanceSummary(summary),
+      });
+    }
     safeJsonlWrite(path.join(runDir, 'run-log.redacted.jsonl'), [
       {
         event: 'run_started',
@@ -4444,19 +4711,38 @@ async function runHardening(options) {
     ]);
     return summary;
   } catch (error) {
-    writeRunFailureArtifacts({
-      runDir,
-      runId,
-      options,
-      providerInfo,
-      effectiveOptions,
-      memoryConfig,
-      startedAt: now,
-      phase,
-      error,
-      summaries,
-      applyResults,
-    });
+    if (runDir) {
+      writeRunFailureArtifacts({
+        runDir,
+        runId,
+        options,
+        providerInfo,
+        effectiveOptions,
+        memoryConfig,
+        startedAt: now,
+        phase,
+        error,
+        summaries,
+        applyResults,
+      });
+    }
+    if (isCooldownGatedModelRun(options)) {
+      writeEfficiencyMarker(paths, {
+        status: 'failed',
+        run_id: runId,
+        mode: options.mode,
+        started_at: now.toISOString(),
+        finished_at: new Date().toISOString(),
+        min_apply_interval_seconds: positiveNumber(
+          options.minApplyIntervalSeconds,
+          DEFAULT_MEMORY_HARDENING_MIN_APPLY_INTERVAL_SECONDS,
+        ),
+        transcript_max_files_per_run: effectiveOptions.transcriptMaxFilesPerRun,
+        transcript_min_files_per_run: effectiveOptions.transcriptMinFilesPerRun,
+        transcripts_only: effectiveOptions.transcriptsOnly,
+        aggregate: { failure_phase: phase, failure_reason: error?.reason || 'runtime_error' },
+      });
+    }
     throw error;
   } finally {
     releaseLock();
@@ -4521,6 +4807,31 @@ async function applyExistingRun(options) {
   }
 }
 
+function recordRollbackResult({ runDir, runId, result }) {
+  safeJsonWrite(path.join(runDir, 'rollback-summary.json'), result, 0o600);
+
+  const summaryPath = path.join(runDir, 'summary.json');
+  const summary = fs.existsSync(summaryPath) ? readJson(summaryPath) : {};
+  const restoredCount = Array.isArray(result.restored) ? result.restored.length : 0;
+  const nextSummary = {
+    ...summary,
+    rolled_back_at: result.rolled_back_at,
+    rollback_summary_file: 'rollback-summary.json',
+    rollback_restored_count: restoredCount,
+  };
+  safeJsonWrite(summaryPath, nextSummary, 0o600);
+
+  safeJsonlAppend(path.join(runDir, 'run-log.redacted.jsonl'), [
+    {
+      event: 'rollback_run',
+      run_id: runId,
+      restored_user_count: restoredCount,
+      rolled_back_at: result.rolled_back_at,
+    },
+  ]);
+  return nextSummary;
+}
+
 async function rollbackRun(options) {
   if (!options.runId) throw new Error('rollback requires --run-id');
   const paths = resolveStatePaths(options);
@@ -4547,7 +4858,7 @@ async function rollbackRun(options) {
       restored,
       rolled_back_at: new Date().toISOString(),
     };
-    safeJsonWrite(path.join(runDir, 'rollback-summary.json'), result, 0o600);
+    recordRollbackResult({ runDir, runId: options.runId, result });
     return result;
   } finally {
     releaseLock();
@@ -4557,6 +4868,7 @@ async function rollbackRun(options) {
 
 function status(options) {
   const paths = resolveStatePaths(options);
+  const efficiencyMarker = readEfficiencyMarker(paths);
   const runDirs = fs.existsSync(paths.runsDir)
     ? fs
         .readdirSync(paths.runsDir)
@@ -4609,6 +4921,19 @@ function status(options) {
       file_count: transcriptFileCounts.total,
       by_status: transcriptFileCounts.by_status,
     },
+    efficiency_gate: efficiencyMarker
+      ? {
+          status: efficiencyMarker.status || null,
+          last_run_id: efficiencyMarker.run_id || null,
+          started_at: efficiencyMarker.started_at || null,
+          finished_at: efficiencyMarker.finished_at || null,
+          next_allowed_at: efficiencyMarker.next_allowed_at || null,
+          min_apply_interval_seconds: efficiencyMarker.min_apply_interval_seconds || null,
+          transcript_max_files_per_run: efficiencyMarker.transcript_max_files_per_run || null,
+          transcript_min_files_per_run: efficiencyMarker.transcript_min_files_per_run || null,
+          aggregate: efficiencyMarker.aggregate || {},
+        }
+      : null,
     latest_run: latest
       ? {
           run_id: latest.run_id,
@@ -4618,6 +4943,10 @@ function status(options) {
           status: latest.status || 'success',
           failure_reason: latest.failure?.reason || null,
           failure_phase: latest.failure?.phase || null,
+          applied_at: latest.applied_at || (latest.mode === 'apply' ? latest.finished_at || null : null),
+          rolled_back_at: latest.rolled_back_at || null,
+          rollback_summary_file: latest.rollback_summary_file || null,
+          rollback_restored_count: latest.rollback_restored_count ?? null,
           finished_at: latest.finished_at || latest.applied_at || null,
           user_count: Array.isArray(latest.users) ? latest.users.length : 0,
         }
@@ -4650,6 +4979,7 @@ if (require.main === module) {
 
 module.exports = {
   DEFAULT_VALID_KEYS,
+  DEFAULT_MEMORY_HARDENING_MODEL_TIMEOUT_MS,
   acquireLock,
   applyUserProposal,
   applyTranscriptVectorLifecycle,
@@ -4660,6 +4990,7 @@ module.exports = {
   buildTranscriptReferenceContext,
   buildTranscriptSummaryPrompt,
   classifyVectorPresenceFailure,
+  codexOutputSchema,
   buildUserProposal,
   classifyModelCallFailure,
   deferTranscriptLifecycleWhenRagUnavailable,
@@ -4667,6 +4998,11 @@ module.exports = {
   findTranscriptContentHashesMissingVectors,
   findTranscriptVectorRepairTargets,
   getTranscriptVectorRuntimeStatus,
+  aggregateMaintenanceSummary,
+  buildCooldownSkipSummary,
+  efficiencyMarkerPath,
+  efficiencyOverrideAllowed,
+  isCooldownGatedModelRun,
   invokeModel,
   invokeModelWithFallback,
   invokeTranscriptSummaryModel,
@@ -4675,6 +5011,8 @@ module.exports = {
   normalizeTranscriptRagMode,
   parseModelFallbacks,
   parseArgs,
+  modelApplyCooldownDecision,
+  readEfficiencyMarker,
   probeModel,
   probeProviderCandidates,
   proposalSchema,
@@ -4686,11 +5024,14 @@ module.exports = {
   sliceTranscriptText,
   sortTranscriptInventoryFiles,
   STABLE_TRANSCRIPT_MEMORY_KEYS,
+  status,
   TRANSCRIPT_IDENTITY_MEMORY_KEYS,
   transcriptSummarySchema,
   transcriptSummaryMap,
   transcriptCaveatPrompt,
   transcriptPromptVersion,
   validateProposal,
+  recordRollbackResult,
+  writeEfficiencyMarker,
   userHash,
 };

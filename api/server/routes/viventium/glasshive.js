@@ -26,7 +26,7 @@ const { resolveLatestLeafMessageId } = require('~/server/services/viventium/conv
 const router = express.Router();
 const CALLBACK_SKEW_SEC = 5 * 60;
 const CALLBACK_REPLAY_TTL_MS = 10 * 60 * 1000;
-const MAX_CALLBACK_TEXT_LENGTH = 2400;
+const MAX_CALLBACK_TEXT_LENGTH = 4000;
 const MAX_CALLBACK_FULL_TEXT_LENGTH = 64000;
 const MAX_CALLBACK_EVENTS = 20;
 const USER_VISIBLE_CALLBACK_EVENTS = new Set([
@@ -42,6 +42,24 @@ const seenCallbacks = new Map();
 const LOCAL_PATH_PATTERN =
   /(?:~\/|\/Users\/|\/home\/|\/private\/var\/|\/var\/folders\/|\/tmp\/|[A-Za-z]:\\Users\\)[^`'"<>\n\r]*?(?=$|[`'"<>\n\r]|[)\],.;:!?](?:\s|$)|\s+(?:and|or|from|at|with|then|while|because|but|plus|to|in|on)\b)/gi;
 const SAFE_GLASSHIVE_LINK_PATTERN = /\[[^\]\n]{1,160}\]\((https?:\/\/[^)\s]+)\)/g;
+const NON_USER_ARTIFACT_DIRS = new Set([
+  '.codex',
+  '.git',
+  '.glasshive',
+  '.venv',
+  '__pycache__',
+  'glasshive-host-tools',
+  'node_modules',
+]);
+const NON_USER_ARTIFACT_FILES = new Set([
+  '.mcp.json',
+  'agents.md',
+  'claude.md',
+  'codex.md',
+  'harness-prompt.md',
+  'project-definition.md',
+  'work-log.md',
+]);
 const ACTIVE_WORKER_FAILURE_CODES = new Set([
   'active_worker_conflict',
   'active_worker_limit',
@@ -144,18 +162,28 @@ function isSafeGlassHiveActionUrl(value = '') {
     );
     const artifactPath = String(url.searchParams.get('path') || '').replace(/\\/g, '/');
     const artifactSegments = artifactPath.split('/').filter(Boolean);
+    const artifactPathIsUserVisible =
+      artifactSegments.length > 0 &&
+      artifactSegments.every((segment) => !segment.startsWith('.')) &&
+      !artifactSegments.some((segment) => NON_USER_ARTIFACT_DIRS.has(segment.toLowerCase())) &&
+      !NON_USER_ARTIFACT_FILES.has(artifactSegments[artifactSegments.length - 1]?.toLowerCase());
     const artifactPathIsSafe =
       Boolean(artifactPath) &&
       artifactPath.length <= 1024 &&
       !artifactPath.startsWith('/') &&
       artifactSegments.length > 0 &&
-      artifactSegments.every((segment) => segment !== '.' && segment !== '..');
+      artifactSegments.every((segment) => segment !== '.' && segment !== '..') &&
+      artifactPathIsUserVisible;
+    const isLocalArtifactOpen =
+      isLocalHost &&
+      new RegExp(`^/v1/workers/${safeId}/artifacts/open$`).test(url.pathname) &&
+      artifactPathIsSafe;
     const isLocalArtifactDownload =
       isLocalHost &&
       new RegExp(`^/v1/workers/${safeId}/artifacts/download$`).test(url.pathname) &&
       artifactPathIsSafe;
     if (isLocalHost) {
-      return isWatchLink || isSignedLink || isLocalArtifactDownload;
+      return isWatchLink || isSignedLink || isLocalArtifactOpen || isLocalArtifactDownload;
     }
     return (isWatchLink && url.searchParams.has('gh_token')) || isSignedLink;
   } catch {

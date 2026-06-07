@@ -1053,7 +1053,9 @@ describe('/api/viventium/glasshive/callback', () => {
       event: 'run.completed',
       message:
         'Done.\n\n' +
+        'File: [Open GlassHive file](http://127.0.0.1:8780/v1/workers/wrk_local_qa/artifacts/open?path=result.md)\n' +
         'Download: [Generated memo](http://127.0.0.1:8780/v1/workers/wrk_local_qa/artifacts/download?path=result.md)\n' +
+        'Hidden: [Open hidden config](http://127.0.0.1:8780/v1/workers/wrk_local_qa/artifacts/open?path=.codex%2Fconfig.toml)\n' +
         'View / Steer: [View / Steer GlassHive workspace](http://127.0.0.1:8780/watch/wrk_local_qa?surface=desktop&project_id=prj_local_qa)\n' +
         'Bogus: [Open GlassHive workspace](http://127.0.0.1:9999/not-glass/watch/wrk_local_qa?project_id=prj_local_qa)\n' +
         'Traversal: [Download file](http://127.0.0.1:8780/v1/workers/wrk_local_qa/artifacts/download?path=..%2Fsecret.txt)\n' +
@@ -1073,12 +1075,16 @@ describe('/api/viventium/glasshive/callback', () => {
     expect(res.statusCode).toBe(200);
     const [, message] = mockSaveMessage.mock.calls[0];
     expect(message.text).toContain(
+      '[Open GlassHive file](http://127.0.0.1:8780/v1/workers/wrk_local_qa/artifacts/open?path=result.md)',
+    );
+    expect(message.text).toContain(
       '[Generated memo](http://127.0.0.1:8780/v1/workers/wrk_local_qa/artifacts/download?path=result.md)',
     );
     expect(message.text).toContain(
       '[View / Steer GlassHive workspace](http://127.0.0.1:8780/watch/wrk_local_qa?surface=desktop&project_id=prj_local_qa)',
     );
     expect(message.text).toContain('Raw diagnostic: [local worker link]');
+    expect(message.text).toContain('Hidden: [Open hidden config]([local worker link])');
     expect(message.text).toContain('Bogus: [Open GlassHive workspace]([local worker link])');
     expect(message.text).toContain('Traversal: [Download file]([local worker link])');
     expect(message.text).toContain('Bad watch: [View / Steer]([local worker link])');

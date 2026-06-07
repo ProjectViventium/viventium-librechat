@@ -20,8 +20,17 @@ jest.mock('axios', () => ({
 	},
 }));
 
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import axios from 'axios';
-import { deleteRagFile, ragFileExists, ragFilesExist } from './rag';
+import {
+	__internal,
+	deleteRagFile,
+	ragFileExists,
+	ragFilesExist,
+	ragFilesExistNonBlocking,
+} from './rag';
 import { logger } from '@librechat/data-schemas';
 import { generateShortLivedToken } from '~/crypto/jwt';
 
@@ -30,6 +39,103 @@ const mockedLogger = logger as jest.Mocked<typeof logger>;
 const mockedGenerateShortLivedToken = generateShortLivedToken as jest.MockedFunction<
 	typeof generateShortLivedToken
 >;
+
+describe('ragFilesExistNonBlocking — non-blocking vector verification', () => {
+	const originalEnv = process.env;
+
+	beforeEach(() => {
+		jest.clearAllMocks();
+		__internal.clearRagVerifyCache();
+		process.env = { ...originalEnv };
+		process.env.RAG_API_URL = 'http://localhost:8000';
+		process.env.VIVENTIUM_RAG_VERIFY_TIMEOUT_MS = '50';
+		delete process.env.VIVENTIUM_RECALL_VERIFY_NONBLOCKING;
+		delete process.env.VIVENTIUM_RECALL_REBUILD_REQUIRED_FILE;
+	});
+
+	afterEach(() => {
+		process.env = originalEnv;
+	});
+
+	it('returns within the short deadline when the sidecar hangs (no multi-second block)', async () => {
+		mockedAxios.post.mockImplementation((() => new Promise(() => {})) as never); // never resolves
+		const start = Date.now();
+		const result = await ragFilesExistNonBlocking({
+			userId: 'u-hang',
+			fileIds: ['f1', 'f2'],
+			cacheKey: 'k-hang',
+		});
+		expect(Date.now() - start).toBeLessThan(1000); // did NOT wait the 5s ragFilesExist timeout
+		expect(result).toEqual(new Set()); // source-only fallback (no last-known set yet)
+	});
+
+	it('verifies synchronously when the sidecar is fast and caches the result', async () => {
+		mockedAxios.post.mockResolvedValue({ data: { existing_ids: ['f1'] } });
+		const r1 = await ragFilesExistNonBlocking({
+			userId: 'u-fast',
+			fileIds: ['f1', 'f2'],
+			cacheKey: 'k-fast',
+		});
+		expect(r1).toEqual(new Set(['f1']));
+		const callsAfterFirst = mockedAxios.post.mock.calls.length;
+		const r2 = await ragFilesExistNonBlocking({
+			userId: 'u-fast',
+			fileIds: ['f1', 'f2'],
+			cacheKey: 'k-fast',
+		});
+		expect(r2).toEqual(new Set(['f1']));
+		expect(mockedAxios.post.mock.calls.length).toBe(callsAfterFirst); // served from cache, no re-fetch
+	});
+
+	it('falls back to blocking verification when VIVENTIUM_RECALL_VERIFY_NONBLOCKING=0', async () => {
+		process.env.VIVENTIUM_RECALL_VERIFY_NONBLOCKING = '0';
+		mockedAxios.post.mockResolvedValue({ data: { existing_ids: ['f1'] } });
+		const r = await ragFilesExistNonBlocking({
+			userId: 'u-legacy',
+			fileIds: ['f1'],
+			cacheKey: 'k-legacy',
+		});
+		expect(r).toEqual(new Set(['f1']));
+	});
+
+	it('does not serve cached verified ids while a recall rebuild marker exists', async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-rag-restore-'));
+		const markerPath = path.join(tempDir, 'recall-rebuild-required');
+		try {
+			mockedAxios.post.mockResolvedValueOnce({ data: { existing_ids: ['f1'] } });
+			const cached = await ragFilesExistNonBlocking({
+				userId: 'u-restore',
+				fileIds: ['f1'],
+				cacheKey: 'k-restore',
+			});
+			expect(cached).toEqual(new Set(['f1']));
+			expect(mockedAxios.post).toHaveBeenCalledTimes(1);
+
+			fs.writeFileSync(markerPath, 'required\n', 'utf8');
+			process.env.VIVENTIUM_RECALL_REBUILD_REQUIRED_FILE = markerPath;
+			const staleRestore = await ragFilesExistNonBlocking({
+				userId: 'u-restore',
+				fileIds: ['f1'],
+				cacheKey: 'k-restore',
+			});
+			expect(staleRestore).toEqual(new Set());
+			expect(mockedAxios.post).toHaveBeenCalledTimes(1);
+
+			fs.unlinkSync(markerPath);
+			mockedAxios.post.mockResolvedValueOnce({ data: { existing_ids: ['f2'] } });
+			const afterClear = await ragFilesExistNonBlocking({
+				userId: 'u-restore',
+				fileIds: ['f1', 'f2'],
+				cacheKey: 'k-restore',
+			});
+			expect(afterClear).toEqual(new Set(['f2']));
+			expect(mockedAxios.post).toHaveBeenCalledTimes(2);
+		} finally {
+			delete process.env.VIVENTIUM_RECALL_REBUILD_REQUIRED_FILE;
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+});
 
 describe('deleteRagFile', () => {
 	const originalEnv = process.env;
@@ -55,7 +161,7 @@ describe('deleteRagFile', () => {
 			expect(mockedGenerateShortLivedToken).toHaveBeenCalledWith('user123');
 			expect(mockedAxios.delete).toHaveBeenCalledWith('http://localhost:8000/documents', {
 				headers: {
-					Authorization: 'Bearer mock-jwt-token',
+					Authorization: `Bearer ${'mock-jwt-token'}`,
 					'Content-Type': 'application/json',
 					accept: 'application/json',
 				},
@@ -174,7 +280,7 @@ describe('ragFileExists', () => {
 		expect(mockedAxios.get).toHaveBeenCalledTimes(1);
 		expect(mockedAxios.get).toHaveBeenCalledWith('http://localhost:8000/documents/file-123/exists', {
 			headers: {
-				Authorization: 'Bearer mock-jwt-token',
+				Authorization: `Bearer ${'mock-jwt-token'}`,
 				accept: 'application/json',
 			},
 			timeout: 5000,
@@ -280,7 +386,7 @@ describe('ragFilesExist', () => {
 			['file-1', 'file-2', 'file-3'],
 			{
 				headers: {
-					Authorization: 'Bearer mock-jwt-token',
+					Authorization: `Bearer ${'mock-jwt-token'}`,
 					accept: 'application/json',
 					'Content-Type': 'application/json',
 				},

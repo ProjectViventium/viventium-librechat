@@ -1254,7 +1254,10 @@ const DEFAULT_ACTIVATION_DECISION_SUBJECT_RULE = [
   'Judge activation only for the latest human/user message shown in "Latest User Intent".',
   'Use earlier "Recent Conversation" turns only to resolve references in that latest message.',
   'Never activate only because an older user request appears in history; that older request was already handled by its own turn.',
-  "If the latest user message is a simple reply, acknowledgement, test instruction, correction, thanks, provider clarification, or output-only instruction that does not itself meet this cortex's activation criteria, return should_activate=false even when older history would have activated.",
+  'Before deciding, ask: "Does LatestUserMessage itself ask this cortex to do work, or does it explicitly refer to continuing that same work?"',
+  "If LatestUserMessage is only a simple reply, acknowledgement, test instruction, correction, thanks, provider clarification, or output-only instruction, return should_activate=false unless that latest message itself meets this cortex's activation criteria.",
+  'Output-only instructions include requests to reply with exact text, markers, labels, acknowledgements, confirmations, or test tokens. Older history cannot turn an output-only latest message into a new activation.',
+  'Ignore activation words that appear only in Recent Conversation. Words such as red-team, pressure-test, challenge, plan, launch, pattern, strategy, or bias count only when they appear in LatestUserMessage or when LatestUserMessage explicitly refers back to them.',
 ].join(' ');
 
 function resolvePromptRefText(value, fallback = DEFAULT_ACTIVATION_DECISION_SUBJECT_RULE) {
@@ -1723,6 +1726,40 @@ function extractCortexErrorMessage(error) {
   );
 }
 
+/* === VIVENTIUM START ===
+ * Fix: Keep generic pre-tool provider-route failures eligible for configured fallback without
+ * masking MCP, tool, or auth failures that need to surface as real execution problems.
+ * === VIVENTIUM END === */
+function hasToolMcpOrAuthErrorSignal(error) {
+  const signal = [
+    extractCortexErrorMessage(error),
+    error?.name,
+    error?.code,
+    error?.lc_error_code,
+    error?.errorCode,
+    error?.error_code,
+    error?.toolName,
+    error?.tool,
+    error?.source,
+    error?.response?.data?.error?.type,
+    error?.response?.data?.error?.code,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+
+  return (
+    signal.includes('mcp') ||
+    signal.includes('tool') ||
+    signal.includes('oauth') ||
+    signal.includes('auth') ||
+    signal.includes('credential') ||
+    signal.includes('permission') ||
+    signal.includes('forbidden') ||
+    signal.includes('unauthorized')
+  );
+}
+
 function extractCortexErrorStatus(error, message = '') {
   const candidates = [
     error?.response?.status,
@@ -1792,6 +1829,7 @@ function classifyCortexPublicError(error, explicitClass = '') {
     status === 401 ||
     code === 'MODEL_AUTHENTICATION' ||
     message.includes('authentication_error') ||
+    message.includes('unauthorized') ||
     message.includes('invalid authentication') ||
     message.includes('invalid api key') ||
     message.includes('credential')
@@ -1837,11 +1875,7 @@ function classifyCortexPublicError(error, explicitClass = '') {
   if (status >= 500 || status === 529 || message.includes('overloaded')) {
     return 'recoverable_provider_error';
   }
-  if (
-    message.includes('provider') ||
-    message.includes('unauthorized') ||
-    message.includes('forbidden')
-  ) {
+  if (message.includes('provider')) {
     return 'recoverable_provider_error';
   }
   if (rawClass) {
@@ -3007,6 +3041,13 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
   let abortController = null;
   /** @type {NodeJS.Timeout | null} */
   let abortTimer = null;
+  /* === VIVENTIUM START ===
+   * Fix: Preserve Phase B metadata through provider failures so UI cards, DB parts, and fallback
+   * routing can distinguish provider-stage failures from missing tools or auth.
+   * === VIVENTIUM END === */
+  let executionStage = 'setup';
+  let configuredToolCount = countConfiguredCortexTools(agent, agent);
+  let completedToolCalls = 0;
 
   try {
     const safeReq = req || { body: {}, user: {} };
@@ -3191,6 +3232,7 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
       const output = data?.output;
       if (output?.tool_call_id || output?.name) {
         toolExecutionState.completed += 1;
+        completedToolCalls = toolExecutionState.completed;
         if (output?.name) {
           toolExecutionState.names.add(String(output.name));
         }
@@ -3214,6 +3256,7 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
       safeReq.config?.endpoints?.[EModelEndpoint.agents]?.allowedProviders,
     );
 
+    executionStage = 'initialize_agent';
     const initializedAgent = await initializeAgent(
       {
         req: safeReq,
@@ -3284,8 +3327,9 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
      * - Pass toolExecuteOptions to getDefaultHandlers so ON_TOOL_EXECUTE is
      *   registered and tools actually execute in background cortex mode.
      */
+    executionStage = 'post_initialize';
     const agentToolContexts = new Map();
-    const configuredToolCount = countConfiguredCortexTools(initializedAgent, agentForRun);
+    configuredToolCount = countConfiguredCortexTools(initializedAgent, agentForRun);
     agentToolContexts.set(initializedAgent.id, {
       agent: agentForRun,
       toolRegistry: initializedAgent.toolRegistry,
@@ -3436,6 +3480,7 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
       runOptions.streaming = false;
       runOptions.streamUsage = false;
     }
+    executionStage = 'create_run';
     const run = await createRun(runOptions);
     /* === VIVENTIUM NOTE === */
 
@@ -3465,7 +3510,9 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
       config.configurable.userMCPAuthMap = initializedAgent.userMCPAuthMap;
     }
 
+    executionStage = 'stream';
     const content = await run.processStream({ messages: providerSafeInputMessages }, config);
+    executionStage = 'postprocess';
     const duration = Date.now() - startTime;
 
     const aggregatedText = contentParts
@@ -3507,13 +3554,17 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
     }
     /* === VIVENTIUM NOTE === */
 
-    if (isolateProductivityContext && insight.trim() && toolExecutionState.completed === 0) {
+    if (isolateProductivityContext && toolExecutionState.completed === 0) {
       logger.warn(
-        `[BackgroundCortexService] Suppressing unverified productivity insight for ${agent.id}; ` +
-          'no live tools completed in this run',
+        insight.trim()
+          ? `[BackgroundCortexService] Suppressing unverified productivity insight for ${agent.id}; ` +
+              'no live tools completed in this run'
+          : `[BackgroundCortexService] Productivity cortex ${agent.id} completed without live tool evidence`,
         {
           agentId: agent.id,
           latestUserTextHash: hashString(latestUserText, 12),
+          configuredTools: configuredToolCount,
+          completedToolCalls: toolExecutionState.completed || 0,
         },
       );
       return {
@@ -3522,6 +3573,9 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
         insight: null,
         error: 'no_live_tool_execution',
         errorClass: 'no_live_tool_execution',
+        activationScope,
+        configuredTools: configuredToolCount,
+        completedToolCalls: toolExecutionState.completed || 0,
       };
     }
 
@@ -3561,12 +3615,27 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
     };
   } catch (error) {
     const isAborted = abortController?.signal?.aborted === true || error?.name === 'AbortError';
-    const publicError = publicCortexError(error, isAborted ? 'timeout' : '');
+    let publicError = publicCortexError(error, isAborted ? 'timeout' : '');
+    const providerRouteStage = executionStage === 'create_run' || executionStage === 'stream';
+    if (
+      !isAborted &&
+      providerRouteStage &&
+      publicError.errorClass === 'background_agent_error' &&
+      completedToolCalls === 0 &&
+      !hasToolMcpOrAuthErrorSignal(error)
+    ) {
+      publicError = publicCortexError('recoverable_provider_error');
+    }
     // Log provider/model context for faster diagnosis (do NOT log api keys).
     logger.error(
       `[BackgroundCortexService] Cortex execution failed for ${agent.id} ` +
         `(provider=${agent.provider || 'unknown'}, model=${agent.model || agent.model_parameters?.model || 'unknown'}):`,
-      sanitizeRuntimeErrorForLog(error, publicError.errorClass),
+      {
+        ...sanitizeRuntimeErrorForLog(error, publicError.errorClass),
+        stage: executionStage,
+        configuredTools: configuredToolCount,
+        completedToolCalls,
+      },
     );
     return {
       agentId: agent.id,
@@ -3576,6 +3645,10 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
       errorClass: publicError.errorClass,
       errorStatus: extractCortexErrorStatus(error, error?.message || ''),
       errorCode: extractCortexErrorCode(error, error?.message || ''),
+      recoverableProviderError: publicError.errorClass === 'recoverable_provider_error',
+      activationScope,
+      configuredTools: configuredToolCount,
+      completedToolCalls,
     };
   } finally {
     if (abortTimer) {
@@ -4423,6 +4496,9 @@ async function executeActivated({
         cortexName: sanitizeCortexDisplayName(r.agentName),
         error: publicError.message,
         error_class: publicError.errorClass,
+        activationScope: r.activationScope || null,
+        configured_tools: r.configuredTools || 0,
+        completed_tool_calls: r.completedToolCalls || 0,
       };
     });
   const silentCompletions = executionResults.filter(

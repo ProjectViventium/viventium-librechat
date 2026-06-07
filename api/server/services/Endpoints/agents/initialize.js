@@ -353,7 +353,8 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
      * Purpose:
      * - Preserve the same assistant text LiveKit heard in the canonical Mongo message.
      * - Repair only the upstream aggregation miss where `on_message_delta` was emitted but
-     *   `contentParts` text did not advance.
+     *   `contentParts` text did not advance. Cumulative snapshot normalization happens earlier
+     *   at the stream event boundary before emit/replay/persistence fan-out.
      * === VIVENTIUM END === */
     const shouldRepairVoiceDelta = req?.body?.voiceMode === true;
     const beforeVoiceText = shouldRepairVoiceDelta

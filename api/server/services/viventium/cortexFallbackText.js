@@ -88,6 +88,9 @@ function normalizeDeferredFallbackErrorClass({
   ) {
     return 'restart_recovered';
   }
+  if (normalized.includes('no_live_tool_execution') || normalized.includes('live tool evidence')) {
+    return 'live_tool_unverified';
+  }
   if (
     normalized.includes('provider_access_denied') ||
     normalized.includes('access denied') ||
@@ -123,6 +126,9 @@ function getDeferredFallbackErrorText({
   });
   if (normalizedClass === 'restart_recovered') {
     return 'That background check was interrupted by a runtime restart before it finished.';
+  }
+  if (normalizedClass === 'live_tool_unverified') {
+    return 'I could not verify live tool evidence for that check.';
   }
   if (normalizedClass === 'provider_access_denied') {
     return 'I could not reach the configured provider for that check. Please verify provider access or network routing and try again.';

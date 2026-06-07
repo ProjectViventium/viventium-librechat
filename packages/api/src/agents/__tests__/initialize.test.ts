@@ -62,6 +62,7 @@ jest.mock('~/files', () => ({
 const mockRagFilesExist = jest.fn(async ({ fileIds }: { fileIds: string[] }) => new Set(fileIds));
 jest.mock('~/files/rag', () => ({
   ragFilesExist: (...args: unknown[]) => mockRagFilesExist(...args),
+  ragFilesExistNonBlocking: (...args: unknown[]) => mockRagFilesExist(...args),
 }));
 
 jest.mock('~/prompts', () => ({
@@ -604,8 +605,12 @@ describe('initializeAgent — meeting transcript resources', () => {
         .digest('hex')
         .slice(0, 16);
       const { agent, req, res, loadTools, db } = createMocks();
+      req.user.personalization = { conversation_recall: true };
       agent.tools = [];
       db.getFiles = jest.fn().mockImplementation((query) => {
+        if (query?.context === FileContext.conversation_recall) {
+          return Promise.resolve([]);
+        }
         expect(query).toEqual(
           expect.objectContaining({
             user: 'user-1',
@@ -689,7 +694,11 @@ describe('initializeAgent — meeting transcript resources', () => {
         .digest('hex')
         .slice(0, 16);
       const { agent, req, res, loadTools, db } = createMocks();
+      req.user.personalization = { conversation_recall: true };
       db.getFiles = jest.fn().mockImplementation((query) => {
+        if (query?.context === FileContext.conversation_recall) {
+          return Promise.resolve([]);
+        }
         const rows = [
           {
             user: 'user-1',
@@ -759,9 +768,9 @@ describe('initializeAgent — meeting transcript resources', () => {
         { text: 0 },
         expect.any(Object),
       );
-      expect(result.tool_resources?.file_search?.file_ids).toEqual([
-        'meeting_summary:user-1:current',
-      ]);
+      expect(result.tool_resources?.file_search?.file_ids).toEqual(
+        expect.arrayContaining(['meeting_summary:user-1:current']),
+      );
       expect(loadTools).toHaveBeenCalledWith(
         expect.objectContaining({
           tools: expect.arrayContaining(['file_search']),
@@ -800,14 +809,12 @@ describe('initializeAgent — meeting transcript resources', () => {
     expect(result.tool_resources?.file_search?.files || []).toEqual([]);
   });
 
-  it('does not attach meeting transcript vector resources when vector runtime is unavailable', async () => {
-    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-meeting-init-rag-down-'));
+  it('does not attach meeting transcript resources when user conversation recall is disabled', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-meeting-init-disabled-'));
     try {
       process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_DIR = tempDir;
-      process.env.RAG_API_URL = 'http://rag.example.test';
-      global.fetch = jest.fn().mockRejectedValue(new Error('connect ECONNREFUSED'));
-      recallAvailabilityInternal.resetConversationRecallVectorRuntimeStatusCache();
       const { agent, req, res, loadTools, db } = createMocks();
+      req.user.personalization = { conversation_recall: false };
       db.getFiles = jest.fn().mockResolvedValue([
         {
           user: 'user-1',
@@ -842,7 +849,130 @@ describe('initializeAgent — meeting transcript resources', () => {
         expect.anything(),
         expect.anything(),
       );
-      expect(result.tool_resources?.file_search?.files || []).toEqual([]);
+      expect(loadTools).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          tools: expect.arrayContaining(['file_search']),
+        }),
+      );
+      expect(
+        (result.tool_resources?.file_search?.files || []).filter(
+          (file) => file.context === FileContext.meeting_transcript,
+        ),
+      ).toEqual([]);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not attach all-user meeting transcript resources for agent-only recall', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-meeting-init-agent-only-'));
+    try {
+      process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_DIR = tempDir;
+      const { agent, req, res, loadTools, db } = createMocks();
+      req.user.personalization = { conversation_recall: false };
+      agent.conversation_recall_agent_only = true;
+      db.getFiles = jest.fn().mockImplementation((query) => {
+        if (query?.context === FileContext.conversation_recall) {
+          return Promise.resolve([]);
+        }
+        return Promise.resolve([
+          {
+            user: 'user-1',
+            file_id: 'meeting_summary:user-1:current',
+            filename: 'meeting-transcript-summary-current.txt',
+            embedded: true,
+            context: FileContext.meeting_transcript,
+            metadata: {
+              meetingTranscriptKind: 'summary',
+            },
+          },
+        ]);
+      });
+
+      const result = await initializeAgent(
+        {
+          req,
+          res,
+          agent,
+          loadTools,
+          endpointOption: { endpoint: EModelEndpoint.agents },
+          allowedProviders: new Set([Providers.OPENAI]),
+          isInitialAgent: true,
+        },
+        db,
+      );
+
+      expect(db.getFiles).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          context: FileContext.meeting_transcript,
+        }),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(
+        (result.tool_resources?.file_search?.files || []).filter(
+          (file) => file.context === FileContext.meeting_transcript,
+        ),
+      ).toEqual([]);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not attach meeting transcript vector resources when vector runtime is unavailable', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-meeting-init-rag-down-'));
+    try {
+      process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_DIR = tempDir;
+      process.env.RAG_API_URL = 'http://rag.example.test';
+      global.fetch = jest.fn().mockRejectedValue(new Error('connect ECONNREFUSED'));
+      recallAvailabilityInternal.resetConversationRecallVectorRuntimeStatusCache();
+      const { agent, req, res, loadTools, db } = createMocks();
+      req.user.personalization = { conversation_recall: true };
+      db.getFiles = jest.fn().mockImplementation((query) => {
+        if (query?.context === FileContext.conversation_recall) {
+          return Promise.resolve([]);
+        }
+        return Promise.resolve([
+          {
+            user: 'user-1',
+            file_id: 'meeting_summary:user-1:current',
+            filename: 'meeting-transcript-summary-current.txt',
+            embedded: true,
+            context: FileContext.meeting_transcript,
+            metadata: {
+              meetingTranscriptKind: 'summary',
+            },
+          },
+        ]);
+      });
+
+      const result = await initializeAgent(
+        {
+          req,
+          res,
+          agent,
+          loadTools,
+          endpointOption: { endpoint: EModelEndpoint.agents },
+          allowedProviders: new Set([Providers.OPENAI]),
+          isInitialAgent: true,
+        },
+        db,
+      );
+
+      expect(db.getFiles).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          context: FileContext.meeting_transcript,
+        }),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(
+        (result.tool_resources?.file_search?.files || []).filter(
+          (file) => file.context === FileContext.meeting_transcript,
+        ),
+      ).toEqual([]);
       expect(mockLogger.info).toHaveBeenCalledWith(
         '[initializeAgent] Meeting transcript recall configured but vector runtime unavailable',
         expect.objectContaining({
@@ -863,23 +993,29 @@ describe('initializeAgent — meeting transcript resources', () => {
       process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_DIR = tempDir;
       mockRagFilesExist.mockResolvedValue(new Set());
       const { agent, req, res, loadTools, db } = createMocks();
-      db.getFiles = jest.fn().mockResolvedValue([
-        {
-          user: 'user-1',
-          file_id: 'meeting_summary:user-1:missing',
-          filename: 'meeting-transcript-summary-missing.txt',
-          embedded: true,
-          context: FileContext.meeting_transcript,
-          metadata: {
-            meetingTranscriptKind: 'summary',
-            meetingTranscriptSourcePathHash: crypto
-              .createHash('sha256')
-              .update(path.resolve(tempDir))
-              .digest('hex')
-              .slice(0, 16),
+      req.user.personalization = { conversation_recall: true };
+      db.getFiles = jest.fn().mockImplementation((query) => {
+        if (query?.context === FileContext.conversation_recall) {
+          return Promise.resolve([]);
+        }
+        return Promise.resolve([
+          {
+            user: 'user-1',
+            file_id: 'meeting_summary:user-1:missing',
+            filename: 'meeting-transcript-summary-missing.txt',
+            embedded: true,
+            context: FileContext.meeting_transcript,
+            metadata: {
+              meetingTranscriptKind: 'summary',
+              meetingTranscriptSourcePathHash: crypto
+                .createHash('sha256')
+                .update(path.resolve(tempDir))
+                .digest('hex')
+                .slice(0, 16),
+            },
           },
-        },
-      ]);
+        ]);
+      });
 
       const result = await initializeAgent(
         {
@@ -894,11 +1030,15 @@ describe('initializeAgent — meeting transcript resources', () => {
         db,
       );
 
-      expect(mockRagFilesExist).toHaveBeenCalledWith({
+      expect(mockRagFilesExist).toHaveBeenCalledWith(expect.objectContaining({
         userId: 'user-1',
         fileIds: ['meeting_summary:user-1:missing'],
-      });
-      expect(result.tool_resources?.file_search?.files || []).toEqual([]);
+      }));
+      expect(
+        (result.tool_resources?.file_search?.files || []).filter(
+          (file) => file.context === FileContext.meeting_transcript,
+        ),
+      ).toEqual([]);
       expect(mockLogger.warn).toHaveBeenCalledWith(
         '[initializeAgent] Meeting transcript Mongo artifacts missing from vector store',
         expect.objectContaining({
@@ -922,31 +1062,37 @@ describe('initializeAgent — meeting transcript resources', () => {
         .slice(0, 16);
       mockRagFilesExist.mockResolvedValue(new Set());
       const { agent, req, res, loadTools, db } = createMocks();
-      db.getFiles = jest.fn().mockResolvedValue([
-        {
-          user: 'user-1',
-          file_id: 'meeting_inventory:user-1:current',
-          filename: 'meeting-transcript-inventory-current.txt',
-          embedded: true,
-          context: FileContext.meeting_transcript,
-          metadata: {
-            meetingTranscriptKind: 'inventory',
-            meetingTranscriptSourcePathHash: currentSourceHash,
-            meetingTranscriptInventoryText: 'Meeting transcript inventory / table of contents.',
+      req.user.personalization = { conversation_recall: true };
+      db.getFiles = jest.fn().mockImplementation((query) => {
+        if (query?.context === FileContext.conversation_recall) {
+          return Promise.resolve([]);
+        }
+        return Promise.resolve([
+          {
+            user: 'user-1',
+            file_id: 'meeting_inventory:user-1:current',
+            filename: 'meeting-transcript-inventory-current.txt',
+            embedded: true,
+            context: FileContext.meeting_transcript,
+            metadata: {
+              meetingTranscriptKind: 'inventory',
+              meetingTranscriptSourcePathHash: currentSourceHash,
+              meetingTranscriptInventoryText: 'Meeting transcript inventory / table of contents.',
+            },
           },
-        },
-        {
-          user: 'user-1',
-          file_id: 'meeting_summary:user-1:missing',
-          filename: 'meeting-transcript-summary-missing.txt',
-          embedded: true,
-          context: FileContext.meeting_transcript,
-          metadata: {
-            meetingTranscriptKind: 'summary',
-            meetingTranscriptSourcePathHash: currentSourceHash,
+          {
+            user: 'user-1',
+            file_id: 'meeting_summary:user-1:missing',
+            filename: 'meeting-transcript-summary-missing.txt',
+            embedded: true,
+            context: FileContext.meeting_transcript,
+            metadata: {
+              meetingTranscriptKind: 'summary',
+              meetingTranscriptSourcePathHash: currentSourceHash,
+            },
           },
-        },
-      ]);
+        ]);
+      });
 
       const result = await initializeAgent(
         {
@@ -961,13 +1107,13 @@ describe('initializeAgent — meeting transcript resources', () => {
         db,
       );
 
-      expect(mockRagFilesExist).toHaveBeenCalledWith({
+      expect(mockRagFilesExist).toHaveBeenCalledWith(expect.objectContaining({
         userId: 'user-1',
         fileIds: ['meeting_summary:user-1:missing'],
-      });
-      expect(result.tool_resources?.file_search?.file_ids).toEqual([
-        'meeting_inventory:user-1:current',
-      ]);
+      }));
+      expect(result.tool_resources?.file_search?.file_ids).toEqual(
+        expect.arrayContaining(['meeting_inventory:user-1:current']),
+      );
       expect(result.tool_resources?.file_search?.files).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
@@ -1000,6 +1146,7 @@ describe('initializeAgent — meeting transcript resources', () => {
     try {
       process.env.VIVENTIUM_MEMORY_TRANSCRIPTS_DIR = tempDir;
       const { agent, req, res, loadTools, db } = createMocks();
+      req.user.personalization = { conversation_recall: true };
       agent.tools = [];
       db.getFiles = jest.fn().mockResolvedValue([]);
 
@@ -1016,7 +1163,11 @@ describe('initializeAgent — meeting transcript resources', () => {
         db,
       );
 
-      expect(result.tool_resources?.file_search?.files || []).toEqual([]);
+      expect(
+        (result.tool_resources?.file_search?.files || []).filter(
+          (file) => file.context === FileContext.meeting_transcript,
+        ),
+      ).toEqual([]);
       expect(mockLogger.info).toHaveBeenCalledWith(
         '[initializeAgent] Meeting transcript recall configured but no artifacts for active user',
         expect.objectContaining({

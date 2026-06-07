@@ -1,5 +1,10 @@
 import axios from 'axios';
 import { logger } from '@librechat/data-schemas';
+/* === VIVENTIUM START ===
+ * Feature: Non-blocking vector existence verification.
+ * Purpose: Read the restore/rebuild marker before serving cached vector-existence results.
+ * === VIVENTIUM END === */
+import fs from 'node:fs';
 import { generateShortLivedToken } from '~/crypto/jwt';
 
 interface DeleteRagFileParams {
@@ -196,3 +201,114 @@ export async function ragFilesExist({
 		fallbackResults.filter((result) => result.exists).map((result) => result.fileId),
 	);
 }
+
+/* === VIVENTIUM START ===
+ * Feature: Non-blocking vector existence verification.
+ * Purpose: The transcript/recall hot path must never wait the full ragFilesExist timeout when the
+ * RAG sidecar is slow or hung. A fresh cached verified-id set is used immediately; otherwise the
+ * verification races a short deadline and, on timeout, returns the last-known-good set (or empty =>
+ * source-only) while the real check completes in the background to refresh the cache for the next
+ * turn. A healthy sidecar (tens of ms) still verifies synchronously, preserving the "never advertise
+ * a vector id we have not verified present" invariant in the common case.
+ * Revert with VIVENTIUM_RECALL_VERIFY_NONBLOCKING=0.
+ * Added: 2026-05-29
+ * === VIVENTIUM END === */
+interface RagFilesExistNonBlockingParams extends RagFilesExistParams {
+	/** Stable cache key for this (user, file-set); when omitted the call is fully blocking. */
+	cacheKey?: string;
+}
+
+const vivVerifiedVectorIdsCache = new Map<string, { ids: Set<string>; expiresAt: number }>();
+const vivVerifyInFlight = new Set<string>();
+
+function clearRagVerifyCache(): void {
+	vivVerifiedVectorIdsCache.clear();
+	vivVerifyInFlight.clear();
+}
+
+function getRagVerifyTimeoutMs(): number {
+	const value = Number.parseInt(process.env.VIVENTIUM_RAG_VERIFY_TIMEOUT_MS ?? '', 10);
+	return Number.isFinite(value) && value > 0 ? value : 1000;
+}
+
+function getRagVerifyCacheTtlMs(): number {
+	const value = Number.parseInt(process.env.VIVENTIUM_RAG_VERIFY_CACHE_TTL_MS ?? '', 10);
+	return Number.isFinite(value) && value > 0 ? value : 60000;
+}
+
+function isRagVerifyNonBlocking(): boolean {
+	const raw = process.env.VIVENTIUM_RECALL_VERIFY_NONBLOCKING;
+	if (raw == null || raw === '') {
+		return true;
+	}
+	return !['0', 'false', 'no', 'off'].includes(String(raw).trim().toLowerCase());
+}
+
+function isRecallRebuildRequired(): boolean {
+	const markerPath = process.env.VIVENTIUM_RECALL_REBUILD_REQUIRED_FILE;
+	if (!markerPath) {
+		return false;
+	}
+	try {
+		return fs.existsSync(markerPath);
+	} catch (error) {
+		logger.debug('[ragFilesExistNonBlocking] Failed to read recall rebuild marker', {
+			markerPath,
+			message: error instanceof Error ? error.message : String(error),
+		});
+		return false;
+	}
+}
+
+export async function ragFilesExistNonBlocking({
+	userId,
+	fileIds,
+	cacheKey,
+}: RagFilesExistNonBlockingParams): Promise<Set<string>> {
+	if (!isRagVerifyNonBlocking() || !cacheKey) {
+		return ragFilesExist({ userId, fileIds });
+	}
+
+	if (isRecallRebuildRequired()) {
+		clearRagVerifyCache();
+		return new Set();
+	}
+
+	const cached = vivVerifiedVectorIdsCache.get(cacheKey);
+	if (cached && cached.expiresAt > Date.now()) {
+		return new Set(cached.ids);
+	}
+
+	const lastKnown = cached?.ids ?? new Set<string>();
+	if (vivVerifyInFlight.has(cacheKey)) {
+		// A verification is already running for this set; do not block, use last-known/source-only.
+		return new Set(lastKnown);
+	}
+
+	vivVerifyInFlight.add(cacheKey);
+	const verifyPromise = ragFilesExist({ userId, fileIds })
+		.then((ids) => {
+			vivVerifiedVectorIdsCache.set(cacheKey, {
+				ids,
+				expiresAt: Date.now() + getRagVerifyCacheTtlMs(),
+			});
+			return ids;
+		})
+		.catch(() => lastKnown)
+		.finally(() => {
+			vivVerifyInFlight.delete(cacheKey);
+		});
+
+	// Race a short deadline so a slow/hung sidecar cannot stall init; a healthy sidecar wins easily
+	// and the background verifyPromise still refreshes the cache for the next turn.
+	return Promise.race([
+		verifyPromise,
+		new Promise<Set<string>>((resolve) => {
+			setTimeout(() => resolve(new Set(lastKnown)), getRagVerifyTimeoutMs());
+		}),
+	]);
+}
+
+export const __internal = {
+	clearRagVerifyCache,
+};

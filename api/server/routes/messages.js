@@ -25,6 +25,9 @@ const { findAllArtifacts, replaceArtifactContent } = require('~/server/services/
 const { requireJwtAuth, validateMessageReq } = require('~/server/middleware');
 const { getConvosQueried } = require('~/models/Conversation');
 const { Message } = require('~/db/models');
+const {
+  normalizeHistoricalVoiceMessageForRead,
+} = require('~/server/services/viventium/historicalVoiceTextRepair');
 
 const router = express.Router();
 router.use(requireJwtAuth);
@@ -37,12 +40,13 @@ router.use(requireJwtAuth);
  * Added: 2026-04-29
  * === VIVENTIUM END === */
 const sanitizeMessageForRead = (message) => {
-  if (!message || !Array.isArray(message.content)) {
-    return message;
+  const normalizedMessage = normalizeHistoricalVoiceMessageForRead(message);
+  if (!normalizedMessage || !Array.isArray(normalizedMessage.content)) {
+    return normalizedMessage;
   }
   return {
-    ...message,
-    content: filterMalformedContentParts(message.content),
+    ...normalizedMessage,
+    content: filterMalformedContentParts(normalizedMessage.content),
   };
 };
 

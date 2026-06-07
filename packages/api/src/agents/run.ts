@@ -297,9 +297,8 @@ export async function createRun({
     const requestMeta = requestBody as
       | { viventiumSurface?: string; viventiumInputMode?: string }
       | undefined;
-    const voiceSurface =
-      requestMeta?.viventiumSurface === 'voice' ||
-      (requestMeta?.viventiumInputMode ?? '').startsWith('voice');
+    const inputMode = (requestMeta?.viventiumInputMode ?? '').toString().toLowerCase();
+    const voiceSurface = requestMeta?.viventiumSurface === 'voice' || inputMode === 'voice_call';
     const forceDisableStreamUsage = disableStreamUsageEnv || voiceSurface;
     if (
       forceDisableStreamUsage ||

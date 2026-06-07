@@ -35,6 +35,14 @@ export interface StreamServicesConfig {
     ttlAfterComplete?: number;
     maxJobs?: number;
   };
+
+  /**
+   * Whether GenerationJobManager should delete successful jobs immediately.
+   *
+   * Runtime stream services default this to false so a client that reconnects or
+   * resumes right after completion can still receive the cached final event.
+   */
+  cleanupOnComplete?: boolean;
 }
 
 /**
@@ -44,6 +52,7 @@ export interface StreamServices {
   jobStore: IJobStore;
   eventTransport: IEventTransport;
   isRedis: boolean;
+  cleanupOnComplete: boolean;
 }
 
 /**
@@ -72,6 +81,7 @@ export function createStreamServices(config: StreamServicesConfig = {}): StreamS
   const useRedis = config.useRedis ?? cacheConfig.USE_REDIS_STREAMS;
   const redisClient = config.redisClient ?? ioredisClient;
   const { redisSubscriber, inMemoryOptions } = config;
+  const cleanupOnComplete = config.cleanupOnComplete ?? false;
 
   // Check if we should and can use Redis
   if (useRedis && redisClient) {
@@ -87,7 +97,7 @@ export function createStreamServices(config: StreamServicesConfig = {}): StreamS
 
       if (!subscriber) {
         logger.warn('[StreamServices] No subscriber client available, falling back to in-memory');
-        return createInMemoryServices(inMemoryOptions);
+        return createInMemoryServices(inMemoryOptions, cleanupOnComplete);
       }
 
       const jobStore = new RedisJobStore(redisClient);
@@ -99,23 +109,27 @@ export function createStreamServices(config: StreamServicesConfig = {}): StreamS
         jobStore,
         eventTransport,
         isRedis: true,
+        cleanupOnComplete,
       };
     } catch (err) {
       logger.error(
         '[StreamServices] Failed to create Redis services, falling back to in-memory:',
         err,
       );
-      return createInMemoryServices(inMemoryOptions);
+      return createInMemoryServices(inMemoryOptions, cleanupOnComplete);
     }
   }
 
-  return createInMemoryServices(inMemoryOptions);
+  return createInMemoryServices(inMemoryOptions, cleanupOnComplete);
 }
 
 /**
  * Create in-memory stream services
  */
-function createInMemoryServices(options?: StreamServicesConfig['inMemoryOptions']): StreamServices {
+function createInMemoryServices(
+  options?: StreamServicesConfig['inMemoryOptions'],
+  cleanupOnComplete = false,
+): StreamServices {
   const jobStore = new InMemoryJobStore({
     ttlAfterComplete: options?.ttlAfterComplete ?? 300000, // 5 minutes
     maxJobs: options?.maxJobs ?? 1000,
@@ -129,5 +143,6 @@ function createInMemoryServices(options?: StreamServicesConfig['inMemoryOptions'
     jobStore,
     eventTransport,
     isRedis: false,
+    cleanupOnComplete,
   };
 }

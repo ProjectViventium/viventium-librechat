@@ -98,6 +98,9 @@ const {
   persistCortexPartsToCanonicalMessage,
   finalizeCanonicalCortexMessage,
   createCortexFollowUpMessage,
+  buildFollowUpDecisionRecord,
+  logFollowUpDecisionRecord,
+  persistFollowUpDecisionToParentMessage,
 } = require('~/server/services/viventium/BackgroundCortexFollowUpService');
 const {
   createRuntimeHoldTextPart,
@@ -166,6 +169,53 @@ function upsertCortexContentPart(parts, cortexPart) {
     parts.push(cortexPart);
   }
   return true;
+}
+
+function buildMergedInsightsDataFromCortexParts(cortexParts) {
+  const parts = Array.isArray(cortexParts) ? cortexParts : [];
+  const insights = parts
+    .filter((part) => part?.type === ContentTypes.CORTEX_INSIGHT)
+    .filter((part) => {
+      const status = String(part?.status || '')
+        .trim()
+        .toLowerCase();
+      return status === 'complete' || status === 'completed' || status === 'done';
+    })
+    .map((part) => ({
+      cortexId: part.cortex_id || part.cortexId || '',
+      cortexName: part.cortex_name || part.cortexName || part.cortex_id || 'Background Agent',
+      insight: typeof part.insight === 'string' ? part.insight.trim() : '',
+      completed_tool_calls: part.completed_tool_calls,
+      errorClass: part.errorClass || part.error_class || '',
+    }))
+    .filter((part) => part.insight.length > 0);
+
+  const errors = parts
+    .filter((part) => {
+      const status = String(part?.status || '')
+        .trim()
+        .toLowerCase();
+      return status === 'error' || status === 'failed';
+    })
+    .map((part) => ({
+      cortexId: part.cortex_id || part.cortexId || '',
+      cortexName: part.cortex_name || part.cortexName || part.cortex_id || 'Background Agent',
+      error: part.error || part.errorMessage || '',
+      errorClass: part.errorClass || part.error_class || 'background_agent_error',
+    }));
+
+  if (insights.length === 0 && errors.length === 0) {
+    return null;
+  }
+
+  return {
+    insights,
+    errors,
+    hasErrors: errors.length > 0,
+    cortexCount: insights.length + errors.length,
+    mergedPrompt: insights.map((part) => part.insight).join('\n\n'),
+    recoveredFromPendingCortexParts: true,
+  };
 }
 
 /* === VIVENTIUM NOTE ===
@@ -786,11 +836,12 @@ function formatActivationSummary(activatedCortices) {
  * === VIVENTIUM END === */
 const BACKGROUND_CORTEX_RUNTIME_CARD_GUARD_PROMPT_ID = 'main.background_cortex_runtime_card_guard';
 const BACKGROUND_CORTEX_RUNTIME_CARD_GUARD_FALLBACK = [
-  '## Runtime-Owned Background Cards',
+  '# Runtime-Owned Background Cards',
   'Runtime may display background-cortex status/result cards outside your text.',
   'Do not claim you cannot control those cards, do not say there is nothing to show, and do not narrate UI mechanics.',
   'Do not offer to start, spin up, launch, or run background agents/cortices when the user already asked for background analysis, red-team review, bias checking, or visible background work; treat that work as already runtime-owned and answer the substantive request.',
   'Do not say a specific background agent/cortex ran, is running, activated, completed, or checked the issue unless it appears in the current turn\'s "Activated Background Agents" runtime section. If the user asked for a named background agent that is not listed there, do not claim it ran; answer the substantive request and let visible runtime cards provide the proof.',
+  'Do not tell the user that background cortices will check Gmail, Outlook, MS365, Google Workspace, the web, or any live connector. For live data, use verified current-run tool evidence, a brokered worker, or state the limitation plainly.',
   "Answer the user's substantive request and let runtime-owned cards speak for themselves.",
 ].join('\n');
 
@@ -1077,8 +1128,9 @@ function handleCompletionErrorContentPart({ contentParts, err, abortController, 
     );
     return 'suppressed';
   }
+  const errorClass = classifyCompletionErrorForLog(err);
   log.error(
-    '[api/server/controllers/agents/client.js #sendCompletion] Operation aborted',
+    `[api/server/controllers/agents/client.js #sendCompletion] Completion failed class=${errorClass}`,
     sanitizeCompletionErrorForLog(err),
   );
   log.error(
@@ -1102,6 +1154,17 @@ function parseIntEnv(name, fallback) {
 function getCortexDetectTimeoutMs(voiceMode) {
   const base = parseIntEnv('VIVENTIUM_CORTEX_DETECT_TIMEOUT_MS', 2000);
   if (!voiceMode) {
+    /* === VIVENTIUM NOTE ===
+     * TEXT mode detection budget override, symmetric with the voice override below.
+     * VIVENTIUM_TEXT_PHASE_A_AWAIT_MS (>= 0) owns the TEXT Phase A detection budget; otherwise it
+     * inherits the shared base (VIVENTIUM_CORTEX_DETECT_TIMEOUT_MS, default 2000). This gives text
+     * its own clearly-named budget knob that mirrors VIVENTIUM_VOICE_PHASE_A_AWAIT_MS, so neither
+     * mode's budget bleeds into the other. Added: 2026-05-30.
+     * === VIVENTIUM NOTE END === */
+    const textPhaseAAwait = parseIntEnv('VIVENTIUM_TEXT_PHASE_A_AWAIT_MS', -1);
+    if (textPhaseAAwait >= 0) {
+      return textPhaseAAwait;
+    }
     return base;
   }
   /* === VIVENTIUM NOTE ===
@@ -1133,6 +1196,191 @@ function getCortexLateDetectTimeoutMs(baseTimeoutMs) {
   return Math.min(normalizedConfigured, 30000);
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Speculative parallel cortex detection (TEXT chat) — config gate + fail-closed decision.
+ *
+ * Why:
+ * - Phase A activation detection currently BLOCKS the main answer (~0.6-1.3s). The intent of
+ *   `VIVENTIUM_CORTEX_SPECULATIVE_PARALLEL_DETECT` is to run the main answer in parallel with
+ *   detection and commit the speculative output when no cortex activates within budget, saving the
+ *   detect wait.
+ * - These are the pure, side-effect-free primitives that own the ON/OFF gate and the
+ *   commit-vs-abort decision so they can be unit-tested at the smallest seam and so the default-OFF
+ *   path stays byte-identical (the flag must be explicitly truthy to ever enter the new path).
+ *
+ * Scope guard (IMPORTANT):
+ * - These helpers own testable eligibility and commit/abort decisions. The production live-reuse
+ *   speculative branch is wired later in AgentClient because that branch must stream through the
+ *   real GenerationJobManager sink and reuse the request's live handlers.
+ * - Keep this section side-effect-free. Live execution must still pass through the policy-safe gate
+ *   below so direct-action/tool-hold fail-closed cases cannot accidentally enter speculation.
+ * === VIVENTIUM END === */
+
+/** Truthy env values that opt a flag ON. Mirrors the flag-parsing convention used elsewhere. */
+const VIVENTIUM_TRUTHY_FLAG_VALUES = new Set(['1', 'true', 'yes', 'on']);
+
+/**
+ * Whether speculative parallel cortex detection is eligible for this request.
+ *
+ * Eligible only when:
+ *  - the default-OFF env flag `VIVENTIUM_CORTEX_SPECULATIVE_PARALLEL_DETECT` is explicitly one of
+ *    1/true/yes/on, AND
+ *  - the request is NOT voice mode (voice has its own Phase A async policy; TEXT only here).
+ *
+ * @param {ServerRequest} [req]
+ * @returns {boolean}
+ */
+function getCortexSpeculativeParallelEnabled(req) {
+  const raw = (
+    process.env.VIVENTIUM_TEXT_BACKGROUND_AGENT_DETECTION_ASYNC ??
+    process.env.VIVENTIUM_CORTEX_SPECULATIVE_PARALLEL_DETECT ?? // legacy alias (pre-2026-05-30)
+    ''
+  )
+    .toString()
+    .trim()
+    .toLowerCase();
+  if (!VIVENTIUM_TRUTHY_FLAG_VALUES.has(raw)) {
+    return false;
+  }
+  const voiceMode = req?.body?.voiceMode === true;
+  return !voiceMode;
+}
+
+/**
+ * Fail-closed gate for speculative parallel detection.
+ *
+ * Speculation is only safe when NO configured/candidate cortex can take a direct action (its output
+ * is otherwise purely informational and discardable). If ANY cortex declares a non-empty
+ * direct-action surface/scope — either intrinsically (per-cortex `directActionSurfaceScopes`) or via
+ * the main agent's configured direct-action surfaces matched against its hydrated tools — we must use
+ * today's blocking path so a real side-effecting cortex is never raced/aborted.
+ *
+ * @param {object} [params]
+ * @param {Array<object>} [params.cortices] Configured/candidate cortices for this turn.
+ * @param {Array<object>} [params.directActionSurfaces] Activation-policy direct-action surfaces (config).
+ * @param {Array<*>} [params.agentTools] Main agent tools.
+ * @param {Array<*>} [params.toolDefinitions] Main agent tool definitions (hydrated).
+ * @returns {boolean} true when a direct-action surface/scope is present and speculation MUST be disabled.
+ */
+function speculativeParallelDirectActionBlocked({
+  cortices,
+  directActionSurfaces,
+  agentTools,
+  toolDefinitions,
+} = {}) {
+  const perCortexScopeKeys = collectDirectActionScopeKeysFromCortices(
+    Array.isArray(cortices) ? cortices : [],
+  );
+  if (perCortexScopeKeys.length > 0) {
+    return true;
+  }
+  const effectiveScopeKeys = collectEffectiveDirectActionScopeKeys({
+    directActionSurfaces,
+    agentTools,
+    toolDefinitions,
+  });
+  return effectiveScopeKeys.length > 0;
+}
+
+/**
+ * Commit-vs-abort decision for a speculative parallel run, keyed ONLY on detection outcome.
+ *
+ * - Commit (keep the buffered speculative answer) when detection finished with ZERO activations,
+ *   including the timed-out case (no cortex needs to influence the answer).
+ * - Abort (discard the speculative answer and fall back to the blocking inject + re-run) when one or
+ *   more cortices activated, because their awareness must be injected before the main answer.
+ *
+ * @param {object} [params]
+ * @param {Array<*>} [params.activatedCortices] Cortices that activated within budget.
+ * @param {boolean} [params.timedOut] Whether detection hit its time budget.
+ * @returns {'commit'|'abort'}
+ */
+function decideSpeculativeParallelOutcome({ activatedCortices, timedOut } = {}) {
+  const activatedCount = Array.isArray(activatedCortices) ? activatedCortices.length : 0;
+  if (activatedCount > 0) {
+    return 'abort';
+  }
+  // No activation: commit the speculative output. `timedOut` is informational here — a zero-activation
+  // timeout still commits (the user gets the fast answer; late recovery, if configured, runs async).
+  void timedOut;
+  return 'commit';
+}
+
+function shouldRunLiveSpeculativePhaseA({ policy } = {}) {
+  return policy?.enabled === true;
+}
+
+function shouldSuppressSpeculativeRunError(err, { aborted = false } = {}) {
+  return aborted === true && isLateStreamTerminationError(err);
+}
+
+/**
+ * Speculative parallel cortex detection — control-flow orchestrator (smallest test seam).
+ * Starts the speculative main run in parallel with activation detection, then COMMITS the buffered
+ * answer (exactly once, via the caller's commit closure) when no cortex activated, or ABORTS +
+ * discards it (never delivered/billed/persisted) when a cortex activated. Detection failure aborts
+ * (we cannot prove "no activation"). The caller's commit/discard closures own delivery + billing, so
+ * single-delivery / no-double-bill is structurally guaranteed (commit and discard are mutually
+ * exclusive and each fires at most once).
+ * @param {{ startSpeculativeRun: () => Promise<void>, detect: () => Promise<{activatedCortices?: unknown[], timedOut?: boolean}>, abortSpeculative: () => void, commit: () => Promise<void>|void, discard: () => void, logger?: { warn?: Function } }} deps
+ * @returns {Promise<{ outcome: 'commit'|'abort', committed: boolean, detection: object|null, detectFailed?: boolean }>}
+ */
+async function runSpeculativeParallelMainRun({
+  startSpeculativeRun,
+  detect,
+  abortSpeculative,
+  commit,
+  discard,
+  logger,
+}) {
+  let specRunError = null;
+  const specRunPromise = Promise.resolve()
+    .then(startSpeculativeRun)
+    .catch((err) => {
+      logger?.warn?.('[AgentClient][spec] speculative run failed', err);
+      specRunError = err;
+      return undefined;
+    });
+
+  let detection;
+  try {
+    detection = await detect();
+  } catch (err) {
+    abortSpeculative();
+    try {
+      discard();
+    } catch (e) {
+      void e;
+    }
+    await specRunPromise;
+    return { outcome: 'abort', committed: false, detection: null, detectFailed: true };
+  }
+
+  const outcome = decideSpeculativeParallelOutcome({
+    activatedCortices: detection?.activatedCortices,
+    timedOut: detection?.timedOut === true,
+  });
+
+  if (outcome === 'abort') {
+    abortSpeculative();
+    try {
+      discard();
+    } catch (e) {
+      void e;
+    }
+    await specRunPromise; // ensure the aborted run unwinds before the real (post-inject) run starts
+    return { outcome, committed: false, detection };
+  }
+
+  await specRunPromise; // commit: take the full speculative answer
+  if (specRunError) {
+    throw specRunError;
+  }
+  await commit();
+  return { outcome, committed: true, detection };
+}
+/* === VIVENTIUM END === */
+
 const omitTitleOptions = new Set([
   'stream',
   'thinking',
@@ -1148,15 +1396,17 @@ const omitTitleOptions = new Set([
 /* === VIVENTIUM NOTE ===
  * Background Cortices UX (Two-phase)
  *
- * By default, we do NOT delay the main response for background cortices.
+ * The first response timing is policy-driven: text mode blocks by default for its Phase A detection
+ * budget, while voice mode speculates by default and re-runs only when activation arrives in time.
  *
  * However, when a tool-focused cortex activates (ex: `online_tool_use`), we may return a
  * deterministic holding acknowledgement ("checking...") to prevent premature memory-based
  * answers while tools/MCPs are still brewing (v0_3 parity).
  *
  * Flow:
- * - Phase A (≤2s): activation detection for all configured background agents.
- *   The main agent receives a system-only awareness block (who activated + why).
+ * - Phase A: activation detection for configured background agents, bounded by the per-mode budget.
+ *   The main agent receives a system-only awareness block when detection wins the race or when the
+ *   mode is blocking.
  * - Phase B (async): activated background agents execute; UI receives real-time
  *   `on_cortex_update` status events (activating → brewing → complete).
  * - When ALL activated agents finish, we trigger exactly one same-turn follow-up
@@ -1831,6 +2081,9 @@ class AgentClient extends BaseClient {
       const memoryContext = `${memoryInstructions}\n\n# Existing memory about the user:\n${memoryResult}`;
       sharedRunContextParts.push(memoryContext);
       promptFrameLayers.memory_context = memoryContext;
+      // Carry the (already permission-gated + token-limited) memory content so a GlassHive worker
+      // launched during this run receives the same user context the main agent has (Quality parity).
+      this.glasshiveWorkerMemory = memoryResult;
     }
     if (isDeepTimingEnabled(req)) {
       logDeepTiming(
@@ -2860,6 +3113,97 @@ class AgentClient extends BaseClient {
           await finalizeCanonicalParent();
         }
 
+        if (
+          (!mergedInsightsData ||
+            (!(
+              Array.isArray(mergedInsightsData?.insights) && mergedInsightsData.insights.length > 0
+            ) &&
+              !(
+                typeof mergedInsightsData?.mergedPrompt === 'string' &&
+                mergedInsightsData.mergedPrompt.trim().length > 0
+              ) &&
+              mergedInsightsData?.hasErrors !== true)) &&
+          Array.isArray(pendingCortexParts) &&
+          pendingCortexParts.length > 0
+        ) {
+          const recoveredInsightsData = buildMergedInsightsDataFromCortexParts(pendingCortexParts);
+          if (recoveredInsightsData) {
+            mergedInsightsData = recoveredInsightsData;
+            logger.info(
+              '[AgentClient] Recovered Phase B follow-up input from persisted cortex parts: insights=%s errors=%s parent=%s',
+              recoveredInsightsData.insights.length,
+              recoveredInsightsData.errors.length,
+              responseMessageId,
+            );
+          }
+        }
+
+        const recordTerminalPhaseBDecision = async ({
+          result = 'skipped',
+          suppressionReason = '',
+          selectedStrategy = 'none',
+          llmResult = 'skipped',
+          insightsData = mergedInsightsData,
+          movedOnAfterParent = false,
+          generationFailed = false,
+        } = {}) => {
+          try {
+            const responseContentParts =
+              typeof getResponseContentParts === 'function' ? getResponseContentParts() : [];
+            const recentResponse = extractTextFromContentParts(responseContentParts);
+            const hasDecisionInsights =
+              Array.isArray(insightsData?.insights) && insightsData.insights.length > 0;
+            const decisionRecord = buildFollowUpDecisionRecord({
+              req,
+              conversationId,
+              parentMessageId: responseMessageId,
+              insightsData,
+              generatedText: '',
+              finalText: '',
+              decision: {
+                result,
+                hasInsights: hasDecisionInsights,
+                generationFailed,
+                movedOnAfterParent,
+                llmResult,
+                selectedStrategy,
+                suppressionReason,
+                forceVisibleFollowUp: false,
+                finalLength: 0,
+              },
+              recentResponseResolution: {
+                source: 'runtime_content_parts',
+                text: recentResponse,
+              },
+              initialContinuationContext: {
+                hasMovedOn: movedOnAfterParent === true,
+                messageCount: 0,
+                currentLeafMessageId: responseMessageId,
+                lookupFailed: false,
+                contextText: '',
+              },
+              finalContinuationContext: {
+                hasMovedOn: movedOnAfterParent === true,
+                messageCount: 0,
+                currentLeafMessageId: responseMessageId,
+                lookupFailed: false,
+                contextText: '',
+              },
+            });
+            logFollowUpDecisionRecord(req, decisionRecord);
+            await persistFollowUpDecisionToParentMessage({
+              req,
+              parentMessageId: responseMessageId,
+              decisionRecord,
+            });
+          } catch (err) {
+            logger.warn(
+              '[AgentClient] Failed to record terminal Phase B follow-up decision',
+              sanitizeCompletionErrorForLog(err),
+            );
+          }
+        };
+
         // Suppress follow-up if user sent a newer message before completion.
         if (
           responseController &&
@@ -2867,6 +3211,13 @@ class AgentClient extends BaseClient {
         ) {
           if (followupGraceMs <= 0) {
             logger.info('[AgentClient] Suppressing cortex follow-up: user sent newer input');
+            await recordTerminalPhaseBDecision({
+              result: 'suppressed',
+              suppressionReason: 'newer_user_input',
+              selectedStrategy: 'newer_input_suppressed',
+              llmResult: 'not_requested',
+              movedOnAfterParent: true,
+            });
             return null;
           }
           const ageMs = Date.now() - capturedTurnUserInputTime;
@@ -2874,6 +3225,13 @@ class AgentClient extends BaseClient {
             logger.info(
               '[AgentClient] Suppressing cortex follow-up: user sent newer input (grace expired)',
             );
+            await recordTerminalPhaseBDecision({
+              result: 'suppressed',
+              suppressionReason: 'newer_user_input_grace_expired',
+              selectedStrategy: 'newer_input_suppressed',
+              llmResult: 'not_requested',
+              movedOnAfterParent: true,
+            });
             return null;
           }
           logger.info(
@@ -2915,6 +3273,15 @@ class AgentClient extends BaseClient {
             hasErrors: true,
           };
         } else if (!hasInsights && !hasMergedText && !allowErrorOnlyFollowUp) {
+          await recordTerminalPhaseBDecision({
+            result: 'skipped',
+            suppressionReason: hasErrors
+              ? 'error_only_followup_not_deferred'
+              : 'no_usable_phase_b_output',
+            selectedStrategy: hasErrors ? 'error_only_not_deferred' : 'no_usable_output',
+            llmResult: 'skipped',
+            generationFailed: hasErrors,
+          });
           return null;
         }
 
@@ -3088,6 +3455,9 @@ class AgentClient extends BaseClient {
             toolResources: this.options.agent?.tool_resources,
           }),
           user: createSafeUser(this.options.req.user),
+          // VIVENTIUM: pass the run's gated memory so a GlassHive worker launched via the broker
+          // can be given the same user context the main agent has (see GlassHiveCapabilityBootstrapService).
+          glasshive_worker_memory: this.glasshiveWorkerMemory,
         },
         recursionLimit: agentsEConfig?.recursionLimit ?? 25,
         signal: abortController.signal,
@@ -3365,6 +3735,14 @@ class AgentClient extends BaseClient {
       const pendingCortexParts = [];
       // Cache tool-cortex hold decision so Phase B can be configured consistently.
       let toolCortexHoldWanted = false;
+      /* === VIVENTIUM START === Async-ON speculative parallel main run (nevermind+redo) state.
+       * Declared at method scope so the run-site orchestration below the detection block can see them. */
+      let speculativeMode = false;
+      let speculativeDetectionPromise = null;
+      // emitCortexEvent is assigned inside the hasBackgroundCortices block below but is also needed at
+      // the run site (outside that block) by the speculative orchestration; declare it at method scope.
+      let emitCortexEvent = null;
+      /* === VIVENTIUM END === */
       const responseStream = this.options.res;
       const canonicalResponseMessageId = this.responseMessageId;
       const canonicalUserMessageId = this.parentMessageId;
@@ -3390,8 +3768,9 @@ class AgentClient extends BaseClient {
         responseController.onUserInput();
         turnUserInputTime = responseController.lastUserInputTime;
 
-        // Helper to emit SSE event
-        const emitCortexEvent = async (cortexData, { waitForDelivery = false } = {}) => {
+        // Helper to emit SSE event (assigned to the method-scope binding declared above so the
+        // speculative run-site orchestration outside this block can reuse it).
+        emitCortexEvent = async (cortexData, { waitForDelivery = false } = {}) => {
           const statusChangedAt = new Date().toISOString();
           cortexData = {
             ...cortexData,
@@ -3551,165 +3930,37 @@ class AgentClient extends BaseClient {
           );
         }
 
-        if (voicePhaseAAsync) {
-          // ASYNC VOICE MODE: run Phase A + Phase B in background and keep follow-up delivery
-          // on the shared completion pipeline later in this method.
+        /* === VIVENTIUM START === Async-ON speculative parallel (nevermind+redo) eligibility.
+         * speculativeMode = async ON for this mode after the policy resolver has applied direct-action
+         * safety gates. Voice async remains the desired default, but unowned tool-hold/direct-action
+         * cases must use the blocking path unless explicitly overridden; otherwise a speculative main
+         * run could reach a real tool side effect before the nevermind decision.
+         * === */
+        speculativeMode = shouldRunLiveSpeculativePhaseA({ policy: voicePhaseAPolicy });
+        if (speculativeMode) {
+          speculativeDetectionPromise = detectActivations({
+            req,
+            mainAgent: this.options.agent,
+            messages: initialMessages,
+            runId: this.responseMessageId,
+            timeBudgetMs: cortexDetectTimeoutMs,
+            noticeMode:
+              phaseANoticeMode === 'first_activation_continue'
+                ? 'all_within_budget'
+                : phaseANoticeMode,
+          });
           if (voiceLatencyEnabled) {
             logVoiceLatencyStage(
               req,
-              'phase_a_async_deferred',
+              'phase_a_speculative_detect_kickoff',
               voiceChatStartAt,
-              `timeout_ms=${cortexDetectTimeoutMs} reason=${voicePhaseAPolicy.reason}`,
+              `budget_ms=${cortexDetectTimeoutMs} notice_mode=${phaseANoticeMode}`,
             );
           }
-          logger.info(
-            `[AgentClient] Phase A async mode: deferring detection (${cortexDetectTimeoutMs}ms budget) ` +
-              `for ${this.options.agent.background_cortices.length} cortices`,
-          );
-
-          const asyncReq = req;
-          const asyncRes = responseStream;
-          const asyncAgent = this.options.agent;
-          const asyncRunId = canonicalResponseMessageId;
-          cortexExecutionPromise = (async () => {
-            try {
-              const asyncDetectStart = voiceLatencyNow();
-              const asyncDetectionResult = await detectActivations({
-                req: asyncReq,
-                mainAgent: asyncAgent,
-                messages: initialMessages,
-                runId: asyncRunId,
-                timeBudgetMs: cortexDetectTimeoutMs,
-                // Fully async voice starts the main model immediately, so Phase B should wait for
-                // the complete background detection set instead of early-returning on one signal.
-                noticeMode: 'all_within_budget',
-              });
-
-              activatedCorticesList = asyncDetectionResult.activatedCortices;
-              const asyncDetectDuration = calcVoiceLatencyDurationMs(asyncDetectStart) || 0;
-
-              if (voiceLatencyEnabled) {
-                logVoiceLatencyStage(
-                  req,
-                  'phase_a_async_detect_done',
-                  asyncDetectStart,
-                  `activated=${activatedCorticesList.length} timed_out=${asyncDetectionResult.timedOut === true} detect_ms=${asyncDetectDuration}`,
-                );
-              }
-              logger.info(
-                `[AgentClient] Phase A async complete: ${activatedCorticesList.length} cortices activated ` +
-                  `(duration: ${asyncDetectDuration}ms, timedOut: ${asyncDetectionResult.timedOut})`,
-              );
-
-              // Emit activation cards (main response may already be in progress)
-              for (const cortex of activatedCorticesList) {
-                await emitCortexEvent(
-                  {
-                    type: ContentTypes.CORTEX_ACTIVATION,
-                    cortex_id: cortex.agentId,
-                    cortex_name: sanitizeCortexDisplayName(cortex.cortexName || cortex.agentId),
-                    status: 'activating',
-                    confidence: cortex.confidence,
-                    reason: cortex.reason,
-                    cortex_description: cortex.cortexDescription || '',
-                    activation_scope: cortex.activationScope || null,
-                    direct_action_surfaces: Array.isArray(cortex.directActionSurfaces)
-                      ? cortex.directActionSurfaces
-                      : [],
-                    direct_action_surface_scopes: Array.isArray(cortex.directActionSurfaceScopes)
-                      ? cortex.directActionSurfaceScopes
-                      : [],
-                  },
-                  { waitForDelivery: true },
-                );
-              }
-
-              // NOTE: In async mode, activation awareness is NOT injected into agent.instructions
-              // because the main model invoke has already started or completed.
-
-              if (activatedCorticesList.length === 0) {
-                return null;
-              }
-
-              // Phase B: Execute activated cortices (non-blocking follow-up)
-              logger.info(
-                `[AgentClient] Phase B (async): Starting execution of ${activatedCorticesList.length} activated cortices`,
-              );
-              const directActionScopeKeys =
-                collectDirectActionScopeKeysFromCortices(activatedCorticesList);
-              const effectiveDirectActionScopeKeys = collectEffectiveDirectActionScopeKeys({
-                directActionSurfaces: directActionPolicySurfaces,
-                agentTools: this.options.agent?.tools,
-                toolDefinitions: this.options.agent?.toolDefinitions,
-              });
-              toolCortexHoldWanted = shouldDeferToolCortexMainResponse({
-                activatedCortices: activatedCorticesList,
-                directActionScopeKeys: effectiveDirectActionScopeKeys,
-              });
-              logger.info(
-                `[AgentClient] Tool cortex hold decision (async): hold=${toolCortexHoldWanted} ` +
-                  `canonical_direct_action_scope_keys=${directActionScopeKeys.join(',') || 'none'} ` +
-                  `effective_direct_action_scope_keys=${effectiveDirectActionScopeKeys.join(',') || 'none'} ` +
-                  `request_tool_count=${Array.isArray(this.options.agent?.tools) ? this.options.agent.tools.length : 0}`,
-              );
-              let mergedInsightsData = null;
-
-              const executionResult = await executeActivated({
-                req: asyncReq,
-                res: toolCortexHoldWanted ? null : asyncRes,
-                mainAgent: asyncAgent,
-                messages: initialMessages,
-                runId: asyncRunId,
-                activatedCortices: activatedCorticesList,
-                onCortexBrewing: (cortexData) => {
-                  void emitCortexEvent({ ...cortexData, type: ContentTypes.CORTEX_BREWING });
-                },
-                onCortexComplete: (cortexData) => {
-                  void emitCortexEvent({ ...cortexData, type: ContentTypes.CORTEX_INSIGHT });
-                },
-                onAllComplete: (completeData) => {
-                  mergedInsightsData = completeData;
-                  logger.info(
-                    `[AgentClient] Phase B (async) complete: ${completeData.cortexCount} insights merged`,
-                  );
-                },
-              })
-                .then(() => mergedInsightsData)
-                .catch((error) => {
-                  logger.error(
-                    '[AgentClient] Phase B execution failed',
-                    sanitizeCompletionErrorForLog(error),
-                  );
-                  return null;
-                });
-
-              return executionResult;
-            } catch (error) {
-              logger.error(
-                '[AgentClient] Async Phase A/B pipeline failed',
-                sanitizeCompletionErrorForLog(error),
-              );
-              return null;
-            }
-          })();
-          this.attachBackgroundCortexCompletionPipeline({
-            cortexExecutionPromise,
-            pendingCortexParts,
-            req: asyncReq,
-            conversationId: this.conversationId,
-            responseMessageId: canonicalResponseMessageId,
-            agent: asyncAgent,
-            getResponseContentParts: () => this.contentParts,
-            responseController,
-            turnUserInputTime,
-            followupGraceMs,
-            shouldDeferMainResponse: () => toolCortexHoldWanted === true,
-            getActivatedCorticesList: () => activatedCorticesList,
-          });
         }
-        /* === VIVENTIUM NOTE END === */
+        /* === VIVENTIUM END === */
 
-        if (!voicePhaseAAsync) {
+        if (!voicePhaseAAsync && !speculativeMode) {
           // SYNC MODE (default, parity): Phase A blocks before model invoke
           // PHASE A: Detect activations (≤2s timeout)
           logger.info(
@@ -4109,7 +4360,13 @@ class AgentClient extends BaseClient {
       /**
        * @param {BaseMessage[]} messages
        */
-      const runAgents = async (messages) => {
+      const runAgents = async (messages, signalOverride = null) => {
+        /* === VIVENTIUM START === Async-ON speculative parallel: allow a dedicated abort signal so the
+         * speculative main run can be cancelled ("nevermind") independently of the shared controller.
+         * Default (no override) is byte-identical: activeRunSignal === abortController.signal. === */
+        const activeRunSignal = signalOverride || abortController.signal;
+        config.signal = activeRunSignal;
+        /* === VIVENTIUM END === */
         const agents = [this.options.agent];
         // Include additional agents when:
         // - agentConfigs has agents (from addedConvo parallel execution or agent handoffs)
@@ -4296,7 +4553,7 @@ class AgentClient extends BaseClient {
           agents,
           indexTokenCountMap,
           runId: this.responseMessageId,
-          signal: abortController.signal,
+          signal: activeRunSignal,
           customHandlers: this.options.eventHandlers,
           requestBody: config.configurable.requestBody,
           user: createSafeUser(this.options.req?.user),
@@ -4433,7 +4690,221 @@ class AgentClient extends BaseClient {
       const hideSequentialOutputs = config.configurable.hide_sequential_outputs;
       const shouldDeferMainResponse =
         cortexExecutionPromise != null && toolCortexHoldWanted === true;
-      if (shouldDeferMainResponse) {
+      /* VIVENTIUM: Anthropic overflow recovery (hoisted so the speculative + redo runs reuse it).
+       * signalOverride lets the speculative ("nevermind") run use a dedicated abort controller. */
+      const runWithAnthropicRecovery = async (signalOverride = null) => {
+        if (!isAnthropicProvider(this.options.agent?.provider)) {
+          await runAgents(mainAgentMessages, signalOverride);
+          return;
+        }
+        let recovered = false;
+        while (true) {
+          try {
+            await runAgents(mainAgentMessages, signalOverride);
+            return;
+          } catch (error) {
+            if (recovered || !isAnthropicRequestTooLargeError(error)) {
+              throw error;
+            }
+            const guard = getAnthropicPayloadGuardConfig();
+            const recovery = compactAnthropicMessagesForSize(mainAgentMessages, {
+              aggressive: true,
+              maxRequestBytes: Math.max(1, Math.floor(guard.maxRequestBytes * 0.82)),
+            });
+            if (!recovery.changed) {
+              throw error;
+            }
+            logger.warn(
+              `[AgentClient] Anthropic overflow recovery retry applied bytes=${recovery.bytesBefore}->${recovery.bytesAfter} docParts=${recovery.docPartsCompacted} toolParts=${recovery.toolMessagesTruncated} textParts=${recovery.textPartsTruncated}`,
+            );
+            recovered = true;
+          }
+        }
+      };
+
+      /* VIVENTIUM: Async-ON nevermind+redo orchestration (canonical 2026-05-30, docs 02). Run the main
+       * answer (streams LIVE) under a dedicated abort signal, in parallel with the already-running
+       * Activation Detection. Cortex activates within budget AND nothing streamed yet (budget < TTFT)
+       * => "nevermind": abort + clear (empty) buffers + inject awareness + Phase B + re-run as Phase A.
+       * Else (no activation, or already streamed = TTFT guard) => the speculative answer stands. */
+      if (speculativeMode) {
+        const emitSpeculativeActivationCards = async () => {
+          for (const cortex of activatedCorticesList) {
+            await emitCortexEvent(
+              {
+                type: ContentTypes.CORTEX_ACTIVATION,
+                cortex_id: cortex.agentId,
+                cortex_name: sanitizeCortexDisplayName(cortex.cortexName || cortex.agentId),
+                status: 'activating',
+                confidence: cortex.confidence,
+                reason: cortex.reason,
+                cortex_description: cortex.cortexDescription || '',
+                activation_scope: cortex.activationScope || null,
+                direct_action_surfaces: Array.isArray(cortex.directActionSurfaces)
+                  ? cortex.directActionSurfaces
+                  : [],
+                direct_action_surface_scopes: Array.isArray(cortex.directActionSurfaceScopes)
+                  ? cortex.directActionSurfaceScopes
+                  : [],
+              },
+              { waitForDelivery: true },
+            );
+          }
+        };
+        const startSpeculativePhaseB = () => {
+          const effectiveDirectActionScopeKeys = collectEffectiveDirectActionScopeKeys({
+            directActionSurfaces: directActionPolicySurfaces,
+            agentTools: this.options.agent?.tools,
+            toolDefinitions: this.options.agent?.toolDefinitions,
+          });
+          toolCortexHoldWanted = shouldDeferToolCortexMainResponse({
+            activatedCortices: activatedCorticesList,
+            directActionScopeKeys: effectiveDirectActionScopeKeys,
+          });
+          let mergedInsightsData = null;
+          cortexExecutionPromise = executeActivated({
+            req: this.options.req,
+            res: toolCortexHoldWanted ? null : this.options.res,
+            mainAgent: this.options.agent,
+            messages: initialMessages,
+            runId: this.responseMessageId,
+            activatedCortices: activatedCorticesList,
+            onCortexBrewing: (cortexData) => {
+              void emitCortexEvent({ ...cortexData, type: ContentTypes.CORTEX_BREWING });
+            },
+            onCortexComplete: (cortexData) => {
+              void emitCortexEvent({ ...cortexData, type: ContentTypes.CORTEX_INSIGHT });
+            },
+            onAllComplete: (completeData) => {
+              mergedInsightsData = completeData;
+            },
+          })
+            .then(() => mergedInsightsData)
+            .catch((error) => {
+              logger.error(
+                '[AgentClient] Phase B execution failed (speculative)',
+                sanitizeCompletionErrorForLog(error),
+              );
+              return null;
+            });
+          this.attachBackgroundCortexCompletionPipeline({
+            cortexExecutionPromise,
+            pendingCortexParts,
+            req: this.options.req,
+            conversationId: this.conversationId,
+            responseMessageId: this.responseMessageId,
+            agent: this.options.agent,
+            getResponseContentParts: () => this.contentParts,
+            responseController,
+            turnUserInputTime,
+            followupGraceMs,
+            shouldDeferMainResponse: () => toolCortexHoldWanted === true,
+            getActivatedCorticesList: () => activatedCorticesList,
+          });
+        };
+
+        const specController = new AbortController();
+        let speculativeRunError = null;
+        const specRunPromise = Promise.resolve()
+          .then(() => runWithAnthropicRecovery(specController.signal))
+          .catch((err) => {
+            const suppressed = shouldSuppressSpeculativeRunError(err, {
+              aborted: specController.signal.aborted,
+            });
+            logger.warn(
+              suppressed
+                ? '[AgentClient][spec] speculative main run aborted'
+                : '[AgentClient][spec] speculative main run failed',
+              sanitizeCompletionErrorForLog(err),
+            );
+            if (!suppressed) {
+              speculativeRunError = err;
+            }
+          });
+
+        let speculativeDetection = null;
+        try {
+          speculativeDetection = await speculativeDetectionPromise;
+        } catch (err) {
+          logger.error(
+            '[AgentClient][spec] detection failed; committing speculative answer',
+            sanitizeCompletionErrorForLog(err),
+          );
+        }
+        activatedCorticesList = Array.isArray(speculativeDetection?.activatedCortices)
+          ? speculativeDetection.activatedCortices
+          : [];
+        const specAlreadyStreamed = hasVisibleAssistantText(this.contentParts);
+        const shouldNevermind = activatedCorticesList.length > 0 && !specAlreadyStreamed;
+        if (voiceLatencyEnabled) {
+          logVoiceLatencyStage(
+            req,
+            'phase_a_speculative_decision',
+            voiceChatStartAt,
+            `activated=${activatedCorticesList.length} already_streamed=${specAlreadyStreamed} outcome=${
+              shouldNevermind ? 'nevermind_redo' : 'commit'
+            }`,
+          );
+        }
+
+        if (shouldNevermind) {
+          specController.abort();
+          try {
+            await specRunPromise;
+          } catch (e) {
+            void e;
+          }
+          this.contentParts.length = 0;
+          this.collectedUsage.length = 0;
+          await emitSpeculativeActivationCards();
+          const activationContext =
+            formatBrewingAcknowledgment(activatedCorticesList) +
+            formatActivationSummary(activatedCorticesList);
+          this.options.agent.instructions = [
+            this.options.agent.instructions || '',
+            activationContext,
+          ]
+            .filter(Boolean)
+            .join('\n\n');
+          logger.info(
+            `[AgentClient] Speculative nevermind: injected activation awareness (${activatedCorticesList.length} cortices); re-running Phase A`,
+          );
+          startSpeculativePhaseB();
+          if (toolCortexHoldWanted) {
+            // A tool-owning cortex activated: defer the main response with a deterministic hold
+            // ("checking...") instead of re-running, exactly like the blocking tool-cortex path.
+            // Phase B brews the tool/MCP work and delivers via the follow-up pipeline.
+            this.contentParts.push(
+              createRuntimeHoldTextPart(
+                pickToolCortexHoldText({
+                  responseMessageId: this.responseMessageId,
+                  agentInstructions: this.options.agent.instructions,
+                  scheduleId: this.options.req?.body?.scheduleId,
+                }),
+              ),
+            );
+            deferredToolCortexMainResponse = true;
+            logger.info(
+              `[AgentClient] Speculative nevermind -> tool cortex hold (deferred main response, activated=${activatedCorticesList.length})`,
+            );
+          } else {
+            await runWithAnthropicRecovery();
+          }
+        } else {
+          await specRunPromise;
+          if (speculativeRunError) {
+            throw speculativeRunError;
+          }
+          if (activatedCorticesList.length > 0) {
+            await emitSpeculativeActivationCards();
+            startSpeculativePhaseB();
+          }
+        }
+        if (isDeepTimingEnabled(req)) {
+          logDeepTiming(req, 'chat_completion_done', chatStart);
+        }
+        this.scheduleMemoryWriter(mainAgentMessages);
+      } else if (shouldDeferMainResponse) {
         const holdText = pickToolCortexHoldText({
           responseMessageId: this.responseMessageId,
           agentInstructions: this.options.agent.instructions,
@@ -4458,44 +4929,7 @@ class AgentClient extends BaseClient {
         );
         this.scheduleMemoryWriter(mainAgentMessages);
       } else {
-        /* === VIVENTIUM START ===
-         * Feature: Anthropic overflow recovery retry.
-         * Why: Even after token checks, request byte overflow may still happen (413 request_too_large).
-         * Behavior: On first Anthropic overflow, aggressively compact payload and retry once.
-         * === VIVENTIUM END === */
-        const runWithAnthropicRecovery = async () => {
-          if (!isAnthropicProvider(this.options.agent?.provider)) {
-            await runAgents(mainAgentMessages);
-            return;
-          }
-
-          let recovered = false;
-          while (true) {
-            try {
-              await runAgents(mainAgentMessages);
-              return;
-            } catch (error) {
-              if (recovered || !isAnthropicRequestTooLargeError(error)) {
-                throw error;
-              }
-              const guard = getAnthropicPayloadGuardConfig();
-              const recovery = compactAnthropicMessagesForSize(mainAgentMessages, {
-                aggressive: true,
-                maxRequestBytes: Math.max(1, Math.floor(guard.maxRequestBytes * 0.82)),
-              });
-              if (!recovery.changed) {
-                throw error;
-              }
-              logger.warn(
-                `[AgentClient] Anthropic overflow recovery retry applied bytes=${recovery.bytesBefore}->${recovery.bytesAfter} docParts=${recovery.docPartsCompacted} toolParts=${recovery.toolMessagesTruncated} textParts=${recovery.textPartsTruncated}`,
-              );
-              recovered = true;
-            }
-          }
-        };
-
         await runWithAnthropicRecovery();
-        /* === VIVENTIUM END === */
         if (isDeepTimingEnabled(req)) {
           logDeepTiming(req, 'chat_completion_done', chatStart);
         }
@@ -4888,5 +5322,16 @@ module.exports.ensureBackgroundCortexRuntimeCardGuard = ensureBackgroundCortexRu
 module.exports.formatActivationSummary = formatActivationSummary;
 module.exports.getCortexLateDetectTimeoutMs = getCortexLateDetectTimeoutMs;
 module.exports.pruneSequentialOutputPartsForPersistence = pruneSequentialOutputPartsForPersistence;
+/* === VIVENTIUM START ===
+ * Export speculative-parallel-detection primitives for focused unit testing. The pure helpers cover
+ * commit/abort and policy eligibility; the live AgentClient branch owns the streaming reuse path.
+ * === VIVENTIUM END === */
+module.exports.getCortexSpeculativeParallelEnabled = getCortexSpeculativeParallelEnabled;
+module.exports.speculativeParallelDirectActionBlocked = speculativeParallelDirectActionBlocked;
+module.exports.decideSpeculativeParallelOutcome = decideSpeculativeParallelOutcome;
+module.exports.runSpeculativeParallelMainRun = runSpeculativeParallelMainRun;
+module.exports.shouldRunLiveSpeculativePhaseA = shouldRunLiveSpeculativePhaseA;
+module.exports.shouldSuppressSpeculativeRunError = shouldSuppressSpeculativeRunError;
+module.exports.buildMergedInsightsDataFromCortexParts = buildMergedInsightsDataFromCortexParts;
 
 /* === VIVENTIUM END === */

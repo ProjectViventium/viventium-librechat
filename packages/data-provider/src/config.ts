@@ -177,6 +177,13 @@ export enum Capabilities {
 export enum AgentCapabilities {
   hide_sequential_outputs = 'hide_sequential_outputs',
   programmatic_tools = 'programmatic_tools',
+  /* VIVENTIUM START
+   * Feature: Enterprise config compatibility
+   * Purpose: Accept existing enterprise agent capability labels without enabling them by default.
+   */
+  subagents = 'subagents',
+  skills = 'skills',
+  /* VIVENTIUM END */
   end_after_tools = 'end_after_tools',
   deferred_tools = 'deferred_tools',
   execute_code = 'execute_code',
@@ -1076,6 +1083,7 @@ export const configSchema = z.object({
   ocr: ocrSchema.optional(),
   webSearch: webSearchSchema.optional(),
   memory: memorySchema.optional(),
+  summarization: z.record(z.any()).optional(),
   viventium: viventiumSchema.optional(),
   /* VIVENTIUM END */
   secureImageLinks: z.boolean().optional(),
@@ -1256,6 +1264,7 @@ const sharedOpenAIModels = [
 ];
 
 const sharedAnthropicModels = [
+  'claude-opus-4-8', // VIVENTIUM: opus-4.8 support (2026-05-29 eval; subscription-granted)
   'claude-opus-4-7',
   'claude-opus-4-6',
   'claude-sonnet-4-5',

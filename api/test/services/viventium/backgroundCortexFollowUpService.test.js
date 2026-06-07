@@ -961,7 +961,25 @@ describe('BackgroundCortexFollowUpService', () => {
       forceVisibleFollowUp: true,
     });
 
-    expect(db.updateMessage).not.toHaveBeenCalled();
+    expect(db.updateMessage).toHaveBeenCalledWith(
+      req,
+      expect.objectContaining({
+        messageId: 'm-parent',
+        metadata: expect.objectContaining({
+          viventium: expect.objectContaining({
+            existing: true,
+            cortexFollowUpDecision: expect.objectContaining({
+              parentMessageId: 'm-parent',
+              result: 'persisted',
+            }),
+          }),
+        }),
+      }),
+      expect.objectContaining({
+        context:
+          'viventium/services/BackgroundCortexFollowUpService.persistFollowUpDecisionToParentMessage',
+      }),
+    );
     expect(db.saveMessage).toHaveBeenCalledWith(
       req,
       expect.objectContaining({
@@ -1135,7 +1153,25 @@ describe('BackgroundCortexFollowUpService', () => {
       forceVisibleFollowUp: true,
     });
 
-    expect(db.updateMessage).not.toHaveBeenCalled();
+    expect(db.updateMessage).toHaveBeenCalledWith(
+      req,
+      expect.objectContaining({
+        messageId: 'm-parent',
+        metadata: expect.objectContaining({
+          viventium: expect.objectContaining({
+            existing: true,
+            cortexFollowUpDecision: expect.objectContaining({
+              parentMessageId: 'm-parent',
+              result: 'persisted',
+            }),
+          }),
+        }),
+      }),
+      expect.objectContaining({
+        context:
+          'viventium/services/BackgroundCortexFollowUpService.persistFollowUpDecisionToParentMessage',
+      }),
+    );
     expect(db.saveMessage).toHaveBeenCalledWith(
       req,
       expect.objectContaining({
@@ -1232,7 +1268,25 @@ describe('BackgroundCortexFollowUpService', () => {
       forceVisibleFollowUp: true,
     });
 
-    expect(db.updateMessage).not.toHaveBeenCalled();
+    expect(db.updateMessage).toHaveBeenCalledWith(
+      req,
+      expect.objectContaining({
+        messageId: 'm-parent',
+        metadata: expect.objectContaining({
+          viventium: expect.objectContaining({
+            existing: true,
+            cortexFollowUpDecision: expect.objectContaining({
+              parentMessageId: 'm-parent',
+              result: 'persisted',
+            }),
+          }),
+        }),
+      }),
+      expect.objectContaining({
+        context:
+          'viventium/services/BackgroundCortexFollowUpService.persistFollowUpDecisionToParentMessage',
+      }),
+    );
     expect(db.saveMessage).toHaveBeenCalledWith(
       req,
       expect.objectContaining({
@@ -1327,7 +1381,25 @@ describe('BackgroundCortexFollowUpService', () => {
       forceVisibleFollowUp: true,
     });
 
-    expect(db.updateMessage).not.toHaveBeenCalled();
+    expect(db.updateMessage).toHaveBeenCalledWith(
+      req,
+      expect.objectContaining({
+        messageId: 'm-parent',
+        metadata: expect.objectContaining({
+          viventium: expect.objectContaining({
+            existing: true,
+            cortexFollowUpDecision: expect.objectContaining({
+              parentMessageId: 'm-parent',
+              result: 'persisted',
+            }),
+          }),
+        }),
+      }),
+      expect.objectContaining({
+        context:
+          'viventium/services/BackgroundCortexFollowUpService.persistFollowUpDecisionToParentMessage',
+      }),
+    );
     expect(db.saveMessage).toHaveBeenCalledWith(
       req,
       expect.objectContaining({
@@ -1349,6 +1421,14 @@ describe('BackgroundCortexFollowUpService', () => {
 
   test('createCortexFollowUpMessage suppresses scheduler deferred persistence when no visible fallback remains', async () => {
     const req = { user: { id: 'u1' }, body: { scheduleId: 'schedule-1' } };
+    db.getMessage.mockResolvedValueOnce({
+      messageId: 'm-parent',
+      metadata: {
+        viventium: {
+          existing: true,
+        },
+      },
+    });
 
     const msg = await createCortexFollowUpMessage({
       req,
@@ -1360,7 +1440,25 @@ describe('BackgroundCortexFollowUpService', () => {
     });
 
     expect(msg).toBeNull();
-    expect(db.updateMessage).not.toHaveBeenCalled();
+    expect(db.updateMessage).toHaveBeenCalledWith(
+      req,
+      expect.objectContaining({
+        messageId: 'm-parent',
+        metadata: expect.objectContaining({
+          viventium: expect.objectContaining({
+            existing: true,
+            cortexFollowUpDecision: expect.objectContaining({
+              parentMessageId: 'm-parent',
+              result: 'suppressed',
+            }),
+          }),
+        }),
+      }),
+      expect.objectContaining({
+        context:
+          'viventium/services/BackgroundCortexFollowUpService.persistFollowUpDecisionToParentMessage',
+      }),
+    );
     expect(db.saveMessage).not.toHaveBeenCalled();
   });
 
@@ -1967,6 +2065,25 @@ describe('BackgroundCortexFollowUpService', () => {
         'Do not output {NTA} if the insights contain any substantive user-visible information.',
       );
       expect(prompt).not.toContain('## CRITICAL: Do Not Repeat');
+    });
+
+    test('includes sanitized limitations beside successful primary insights', () => {
+      const prompt = formatFollowUpPrompt({
+        insights: [{ cortexName: 'Google', insight: 'Gmail: reachable' }],
+        errors: [
+          {
+            cortexName: 'MS365',
+            error: 'no_live_tool_execution',
+            error_class: 'no_live_tool_execution',
+          },
+        ],
+        recentResponse: 'Checking now.',
+        primaryResponseMode: true,
+      });
+
+      expect(prompt).toContain('Google: Gmail: reachable');
+      expect(prompt).toContain('MS365: I could not verify live tool evidence for that check.');
+      expect(prompt).toContain('do not claim it is outside your scope');
     });
 
     test('does not contain old weak instruction', () => {

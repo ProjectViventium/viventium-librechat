@@ -67,6 +67,36 @@ export interface LoadToolDefinitionsResult {
 }
 
 const mcpToolPattern = /_mcp_/;
+/* === VIVENTIUM START ===
+ * Feature: Parallel MCP definition hydration.
+ * Purpose: Keep independent MCP cold-starts off the hot path without unbounded fan-out.
+ */
+const MCP_DEFINITION_HYDRATION_CONCURRENCY = 4;
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  mapper: (item: T) => Promise<R>,
+): Promise<R[]> {
+  if (items.length === 0) {
+    return [];
+  }
+
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(Math.max(1, limit), items.length);
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (nextIndex < items.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        results[index] = await mapper(items[index]);
+      }
+    }),
+  );
+  return results;
+}
+/* === VIVENTIUM END === */
 
 /**
  * Loads tool definitions without creating tool instances.
@@ -91,6 +121,8 @@ export async function loadToolDefinitions(
   }
 
   const mcpServerToolsCache = new Map<string, MCPServerTools>();
+  const mcpServerNames = new Set<string>();
+  const mcpRequests: { toolName: string; serverName: string }[] = [];
   const mcpToolDefs: ToolDefinition[] = [];
   const builtInToolDefs: ToolDefinition[] = [];
   let actionToolDefs: ToolDefinition[] = [];
@@ -136,12 +168,28 @@ export async function loadToolDefinitions(
 
     const parts = toolName.split(Constants.mcp_delimiter);
     const serverName = parts[parts.length - 1];
+    mcpServerNames.add(serverName);
+    mcpRequests.push({ toolName, serverName });
+  }
 
-    if (!mcpServerToolsCache.has(serverName)) {
+  /* === VIVENTIUM START ===
+   * Feature: Parallel MCP definition hydration.
+   * Purpose: Avoid stacking independent MCP server cold-starts on the chat/voice/Telegram hot path.
+   */
+  const mcpServerEntries = await mapWithConcurrency(
+    Array.from(mcpServerNames),
+    MCP_DEFINITION_HYDRATION_CONCURRENCY,
+    async (serverName) => {
       const serverTools = await getOrFetchMCPServerTools(userId, serverName);
-      mcpServerToolsCache.set(serverName, serverTools || {});
-    }
+      return [serverName, serverTools || {}] as const;
+    },
+  );
+  for (const [serverName, serverTools] of mcpServerEntries) {
+    mcpServerToolsCache.set(serverName, serverTools);
+  }
+  /* === VIVENTIUM END === */
 
+  for (const { toolName, serverName } of mcpRequests) {
     const serverTools = mcpServerToolsCache.get(serverName);
     if (!serverTools) {
       continue;

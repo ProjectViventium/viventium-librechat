@@ -246,6 +246,59 @@ describe('RedisJobStore Integration Tests', () => {
       await instance2.destroy();
     });
 
+    test('should reconstruct normalized voice message chunks without cumulative duplication', async () => {
+      if (!ioredisClient) {
+        return;
+      }
+
+      const { RedisJobStore } = await import('../implementations/RedisJobStore');
+
+      const instance1 = new RedisJobStore(ioredisClient);
+      const instance2 = new RedisJobStore(ioredisClient);
+
+      await instance1.initialize();
+      await instance2.initialize();
+
+      const streamId = `voice-normalized-chunks-${Date.now()}`;
+      await instance1.createJob(streamId, 'user-1', streamId);
+
+      const chunks = [
+        {
+          event: 'on_run_step',
+          data: {
+            id: 'step-1',
+            runId: 'run-1',
+            index: 0,
+            stepDetails: { type: 'message_creation' },
+          },
+        },
+        {
+          event: 'on_message_delta',
+          data: { id: 'step-1', delta: { content: { type: 'text', text: 'I' } } },
+        },
+        {
+          event: 'on_message_delta',
+          data: { id: 'step-1', delta: { content: { type: 'text', text: ' hear' } } },
+        },
+        {
+          event: 'on_message_delta',
+          data: { id: 'step-1', delta: { content: { type: 'text', text: ' you.' } } },
+        },
+      ];
+
+      for (const chunk of chunks) {
+        await instance1.appendChunk(streamId, chunk);
+      }
+
+      const result = await instance2.getContentParts(streamId);
+
+      expect(result).not.toBeNull();
+      expect(result!.content).toEqual([{ type: 'text', text: 'I hear you.' }]);
+
+      await instance1.destroy();
+      await instance2.destroy();
+    });
+
     test('should share run steps between instances', async () => {
       if (!ioredisClient) {
         return;

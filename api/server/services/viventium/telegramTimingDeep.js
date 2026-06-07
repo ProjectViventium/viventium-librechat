@@ -1,7 +1,11 @@
 /* === VIVENTIUM START ===
- * Feature: Deep Telegram timing instrumentation (toggleable)
+ * Feature: Deep timing instrumentation (toggleable, surface-neutral)
  * Purpose: Provide microstep timing across LC internals without always-on overhead.
- * Toggle via env: VIVENTIUM_TELEGRAM_TIMING_DEEP=true
+ *   Works for any surface (web chat, voice, Telegram) so latency sub-steps stay observable
+ *   at parity instead of being visible only on the Telegram path.
+ * Toggle via env:
+ *   - VIVENTIUM_TIMING_DEEP=true           enables deep marks for ALL surfaces
+ *   - VIVENTIUM_TELEGRAM_TIMING_DEEP=true   legacy Telegram-only gate (kept for back-compat)
  * === VIVENTIUM END === */
 
 const { performance } = require('perf_hooks');
@@ -16,8 +20,14 @@ const parseBoolEnv = (name, fallback = false) => {
   return fallback;
 };
 
-const isDeepTimingEnabled = (req) =>
-  !!req?._viventiumTelegram && parseBoolEnv('VIVENTIUM_TELEGRAM_TIMING_DEEP', false);
+const isDeepTimingEnabled = (req) => {
+  // Surface-neutral global switch: deep marks fire for web chat, voice, and Telegram alike.
+  if (parseBoolEnv('VIVENTIUM_TIMING_DEEP', false)) {
+    return true;
+  }
+  // Legacy Telegram-only gate, preserved for back-compat.
+  return !!req?._viventiumTelegram && parseBoolEnv('VIVENTIUM_TELEGRAM_TIMING_DEEP', false);
+};
 
 const setTimingBase = (req, baseTs) => {
   if (!req) return;

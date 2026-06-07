@@ -43,6 +43,7 @@ const XAI_TTS_CAPABILITIES = require('../../../../shared/voice/xai_tts_capabilit
 const XAI_TTS_INLINE_TAGS = XAI_TTS_CAPABILITIES.speech_tags.inline;
 const XAI_TTS_WRAPPING_TAGS = XAI_TTS_CAPABILITIES.speech_tags.wrapping;
 const { getPromptText } = require('./promptRegistry');
+const { sanitizeVoiceSurfaceTextForDisplay } = require('./voiceArtifactText');
 /* === VIVENTIUM END === */
 
 function normalizeVoiceProvider(voiceProvider) {
@@ -283,11 +284,7 @@ function buildCortexOutputInstructions({ voiceMode, surface, inputMode }) {
     return override;
   }
 
-  const voiceInput =
-    voiceMode === true ||
-    surface === 'voice' ||
-    inputMode === 'voice_note' ||
-    inputMode === 'voice_call';
+  const voiceInput = voiceMode === true || surface === 'voice' || inputMode === 'voice_call';
 
   const lines = [
     'CORTEX OUTPUT RULES:',
@@ -743,21 +740,7 @@ function stripXaiWrappingTags(text) {
 }
 
 function stripVoiceControlTagsForDisplay(text) {
-  if (!text) {
-    return '';
-  }
-  let cleaned = text;
-  cleaned = cleaned.replace(_DISPLAY_SPEAK_RE, '');
-  cleaned = cleaned.replace(_DISPLAY_EMOTION_SELF_CLOSING_RE, '');
-  cleaned = cleaned.replace(_DISPLAY_EMOTION_WRAPPER_RE, '$1');
-  cleaned = cleaned.replace(_DISPLAY_BREAK_RE, '');
-  cleaned = cleaned.replace(_DISPLAY_SPEED_RE, '');
-  cleaned = cleaned.replace(_DISPLAY_VOLUME_RE, '');
-  cleaned = cleaned.replace(_DISPLAY_SPELL_RE, '$1');
-  cleaned = stripXaiWrappingTags(cleaned);
-  cleaned = stripBracketStageDirections(cleaned);
-  cleaned = cleaned.replace(/[ \t]{2,}/g, ' ');
-  return cleaned.trim();
+  return sanitizeVoiceSurfaceTextForDisplay(text);
 }
 
 module.exports = {
@@ -773,4 +756,5 @@ module.exports = {
   buildCortexOutputInstructions,
   buildTimeContextInstructions,
   stripVoiceControlTagsForDisplay,
+  sanitizeVoiceSurfaceTextForDisplay,
 };

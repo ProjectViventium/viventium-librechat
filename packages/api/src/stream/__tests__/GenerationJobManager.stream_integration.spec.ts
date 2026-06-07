@@ -1367,5 +1367,52 @@ describe('GenerationJobManager Integration Tests', () => {
 
       expect(services.isRedis).toBe(false);
     });
+
+    test('should retain completed jobs for late resume by default', async () => {
+      const { GenerationJobManager } = await import('../GenerationJobManager');
+      const { createStreamServices } = await import('../createStreamServices');
+
+      const services = createStreamServices({
+        useRedis: false,
+        inMemoryOptions: { ttlAfterComplete: 60000 },
+      });
+
+      expect(services.cleanupOnComplete).toBe(false);
+
+      GenerationJobManager.configure(services);
+      await GenerationJobManager.initialize();
+
+      const streamId = `services-late-success-${Date.now()}`;
+      await GenerationJobManager.createJob(streamId, 'user-1');
+
+      const finalEvent = {
+        event: 'final',
+        final: true,
+        data: { text: 'done' },
+      };
+
+      await GenerationJobManager.emitDone(streamId, finalEvent as never);
+      await GenerationJobManager.completeJob(streamId);
+
+      const retainedJob = await GenerationJobManager.getJob(streamId);
+      expect(retainedJob?.status).toBe('complete');
+
+      let receivedDone: unknown;
+      const subscription = await GenerationJobManager.subscribe(
+        streamId,
+        () => {},
+        (event) => {
+          receivedDone = event;
+        },
+      );
+
+      expect(subscription).not.toBeNull();
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(receivedDone).toEqual(finalEvent);
+
+      subscription?.unsubscribe();
+      await GenerationJobManager.destroy();
+    });
   });
 });

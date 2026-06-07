@@ -20,6 +20,11 @@ describe('cortexFallbackText deferred errors', () => {
       'That background check was interrupted by a runtime restart before it finished.',
     ],
     [
+      { errorClass: 'no_live_tool_execution' },
+      'live_tool_unverified',
+      'I could not verify live tool evidence for that check.',
+    ],
+    [
       { errorClass: 'provider_access_denied' },
       'provider_access_denied',
       'I could not reach the configured provider for that check. Please verify provider access or network routing and try again.',

@@ -413,4 +413,157 @@ describe('getDefaultHandlers voice reasoning guard', () => {
       data,
     });
   });
+
+  it('normalizes cumulative voice message snapshots before resumable emit and aggregation', async () => {
+    const aggregateContent = jest.fn();
+    const handlers = getDefaultHandlers({
+      req: { body: { voiceMode: true, viventiumTextDeltaMode: 'auto' } },
+      res: {},
+      aggregateContent,
+      toolEndCallback: jest.fn(),
+      collectedUsage: [],
+      streamId: 'stream-voice-test',
+    });
+    const metadata = { last_agent_id: 'agent-1', langgraph_node: 'node_agent-1' };
+
+    await handlers[GraphEvents.ON_MESSAGE_DELTA].handle(
+      GraphEvents.ON_MESSAGE_DELTA,
+      {
+        id: 'step-1',
+        delta: { content: [{ type: 'text', text: 'I' }] },
+      },
+      metadata,
+    );
+    await handlers[GraphEvents.ON_MESSAGE_DELTA].handle(
+      GraphEvents.ON_MESSAGE_DELTA,
+      {
+        id: 'step-1',
+        delta: { content: [{ type: 'text', text: 'I hear you.' }] },
+      },
+      metadata,
+    );
+
+    expect(GenerationJobManager.emitChunk).toHaveBeenNthCalledWith(
+      1,
+      'stream-voice-test',
+      expect.objectContaining({
+        data: expect.objectContaining({
+          delta: { content: [{ type: 'text', text: 'I' }] },
+        }),
+      }),
+    );
+    expect(GenerationJobManager.emitChunk).toHaveBeenNthCalledWith(
+      2,
+      'stream-voice-test',
+      expect.objectContaining({
+        data: expect.objectContaining({
+          delta: { content: [{ type: 'text', text: ' hear you.' }] },
+        }),
+      }),
+    );
+    expect(aggregateContent).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        data: expect.objectContaining({
+          delta: { content: [{ type: 'text', text: ' hear you.' }] },
+        }),
+      }),
+    );
+  });
+
+  it('leaves non-voice message deltas unchanged at the boundary', async () => {
+    const aggregateContent = jest.fn();
+    const handlers = getDefaultHandlers({
+      req: { body: {} },
+      res: {},
+      aggregateContent,
+      toolEndCallback: jest.fn(),
+      collectedUsage: [],
+      streamId: 'stream-chat-test',
+    });
+    const metadata = { last_agent_id: 'agent-1', langgraph_node: 'node_agent-1' };
+
+    await handlers[GraphEvents.ON_MESSAGE_DELTA].handle(
+      GraphEvents.ON_MESSAGE_DELTA,
+      {
+        id: 'step-1',
+        delta: { content: [{ type: 'text', text: 'I' }] },
+      },
+      metadata,
+    );
+    await handlers[GraphEvents.ON_MESSAGE_DELTA].handle(
+      GraphEvents.ON_MESSAGE_DELTA,
+      {
+        id: 'step-1',
+        delta: { content: [{ type: 'text', text: 'I hear you.' }] },
+      },
+      metadata,
+    );
+
+    expect(GenerationJobManager.emitChunk).toHaveBeenNthCalledWith(
+      2,
+      'stream-chat-test',
+      expect.objectContaining({
+        data: expect.objectContaining({
+          delta: { content: [{ type: 'text', text: 'I hear you.' }] },
+        }),
+      }),
+    );
+    expect(aggregateContent).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        data: expect.objectContaining({
+          delta: { content: [{ type: 'text', text: 'I hear you.' }] },
+        }),
+      }),
+    );
+  });
+
+  it('preserves repeated incremental text in voice auto mode', async () => {
+    const aggregateContent = jest.fn();
+    const handlers = getDefaultHandlers({
+      req: { body: { voiceMode: true, viventiumTextDeltaMode: 'auto' } },
+      res: {},
+      aggregateContent,
+      toolEndCallback: jest.fn(),
+      collectedUsage: [],
+      streamId: null,
+    });
+    const metadata = { last_agent_id: 'agent-1', langgraph_node: 'node_agent-1' };
+
+    await handlers[GraphEvents.ON_MESSAGE_DELTA].handle(
+      GraphEvents.ON_MESSAGE_DELTA,
+      {
+        id: 'step-1',
+        delta: { content: [{ type: 'text', text: 'ha' }] },
+      },
+      metadata,
+    );
+    await handlers[GraphEvents.ON_MESSAGE_DELTA].handle(
+      GraphEvents.ON_MESSAGE_DELTA,
+      {
+        id: 'step-1',
+        delta: { content: [{ type: 'text', text: 'haha' }] },
+      },
+      metadata,
+    );
+
+    expect(sendEvent).toHaveBeenNthCalledWith(
+      2,
+      {},
+      expect.objectContaining({
+        data: expect.objectContaining({
+          delta: { content: [{ type: 'text', text: 'haha' }] },
+        }),
+      }),
+    );
+    expect(aggregateContent).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        data: expect.objectContaining({
+          delta: { content: [{ type: 'text', text: 'haha' }] },
+        }),
+      }),
+    );
+  });
 });

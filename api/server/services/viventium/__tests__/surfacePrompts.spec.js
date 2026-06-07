@@ -17,6 +17,7 @@ const {
   buildWebTextInstructions,
   buildCortexOutputInstructions,
   stripVoiceControlTagsForDisplay,
+  sanitizeVoiceSurfaceTextForDisplay,
 } = require('../surfacePrompts');
 const fs = require('fs');
 const os = require('os');
@@ -464,6 +465,16 @@ describe('buildCortexOutputInstructions – telegram surface', () => {
     const result = buildCortexOutputInstructions({ surface: 'telegram' });
     expect(result).toMatch(/MarkdownV2.*escap/i);
   });
+
+  test('keeps Telegram voice-note input in Telegram text-output mode', () => {
+    const result = buildCortexOutputInstructions({
+      voiceMode: false,
+      surface: 'telegram',
+      inputMode: 'voice_note',
+    });
+    expect(result).toContain('standard Markdown');
+    expect(result).not.toContain('no markdown, no lists, no tables');
+  });
 });
 
 /* === VIVENTIUM START ===
@@ -571,6 +582,44 @@ describe('stripVoiceControlTagsForDisplay', () => {
     expect(stripVoiceControlTagsForDisplay('Choose [A] or [ok] for the label.')).toBe(
       'Choose [A] or [ok] for the label.',
     );
+  });
+
+  test('strips markdown emphasis markers while preserving words', () => {
+    expect(stripVoiceControlTagsForDisplay('**bold** _italic_ *** rule *** Done')).toBe(
+      'bold italic rule Done',
+    );
+  });
+
+  test('strips citation, source, and link artifacts for voice display persistence', () => {
+    const result = stripVoiceControlTagsForDisplay(
+      'Sources: https://example.com/report Read [brief](https://example.com/brief). Email qa@example.com. Answer [12].',
+    );
+    expect(result).toBe('link available Read brief. Email email available. Answer.');
+    expect(result).not.toContain('Sources:');
+    expect(result).not.toContain('https://');
+    expect(result).not.toContain('[12]');
+  });
+
+  test('preserves math multiplication instead of treating it as emphasis', () => {
+    expect(stripVoiceControlTagsForDisplay('Five times three is 5 * 3.')).toBe(
+      'Five times three is 5 * 3.',
+    );
+  });
+
+  test('preserves dot-heavy technical tokens while spacing normal sentences', () => {
+    expect(
+      stripVoiceControlTagsForDisplay('Use .NET, asp.net, v1.2A, U.S.A., and node.js. Done.Next.'),
+    ).toBe('Use .NET, asp.net, v1.2A, U.S.A., and node.js. Done. Next.');
+  });
+
+  test('strips malformed no-response artifacts without stripping template variables', () => {
+    expect(stripVoiceControlTagsForDisplay('Useful {N{NTATA}} context {N{N{NTA}}} ${NTA}')).toBe(
+      'Useful context ${NTA}',
+    );
+  });
+
+  test('exports explicit voice surface sanitizer alias', () => {
+    expect(sanitizeVoiceSurfaceTextForDisplay('<custom>Hi</custom> **there**')).toBe('Hi there');
   });
   // === VIVENTIUM END ===
 });

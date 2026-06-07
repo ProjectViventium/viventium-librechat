@@ -17,6 +17,7 @@ import { Brain, ChevronDown, Plus, Trash2 } from 'lucide-react';
 import {
   Label,
   Input,
+  Switch,
   Slider,
   Textarea,
   HoverCard,
@@ -30,6 +31,7 @@ import type { TMessage, BackgroundCortex, ActivationConfig } from 'librechat-dat
 import type { ControllerRenderProps } from 'react-hook-form';
 import type { AgentForm, OptionWithIcon } from '~/common';
 import MessageIcon from '~/components/Share/MessageIcon';
+import { useLocalize } from '~/hooks';
 import { useAgentsMapContext } from '~/Providers';
 import { ESide } from '~/common';
 
@@ -77,7 +79,10 @@ const MODEL_OPTIONS: OptionWithIcon[] = [
 
   // Latest Llama 4 Models (2025)
   { label: 'Llama 4 Scout 17B (Groq) 🆕', value: 'meta-llama/llama-4-scout-17b-16e-instruct|groq' },
-  { label: 'Llama 4 Maverick 17B (Groq) 🆕', value: 'meta-llama/llama-4-maverick-17b-128e-instruct|groq' },
+  {
+    label: 'Llama 4 Maverick 17B (Groq) 🆕',
+    value: 'meta-llama/llama-4-maverick-17b-128e-instruct|groq',
+  },
 
   // High-Performance Options
   { label: 'Llama 3.3 70B Versatile (Groq)', value: 'llama-3.3-70b-versatile|groq' },
@@ -92,7 +97,7 @@ const MODEL_OPTIONS: OptionWithIcon[] = [
 interface CortexCardProps {
   cortex: BackgroundCortex;
   index: number;
-  agentsMap: Record<string, any> | null;
+  agentsMap: Record<string, any> | null | undefined;
   onUpdate: (index: number, updates: Partial<BackgroundCortex>) => void;
   onRemove: (index: number) => void;
 }
@@ -104,8 +109,10 @@ const CortexCard: React.FC<CortexCardProps> = ({
   onUpdate,
   onRemove,
 }) => {
+  const localize = useLocalize();
   const [isExpanded, setIsExpanded] = useState(false);
   const agent = agentsMap?.[cortex.agent_id];
+  const isActivationEnabled = cortex.activation?.enabled !== false;
 
   const selectedModelValue = `${cortex.activation.model}|${cortex.activation.provider}`;
 
@@ -123,24 +130,48 @@ const CortexCard: React.FC<CortexCardProps> = ({
   };
 
   return (
-    <div className="rounded-md border border-border-light bg-surface-secondary p-3">
+    <div
+      className={`rounded-md border p-3 transition-colors ${
+        isActivationEnabled
+          ? 'border-border-light bg-surface-secondary'
+          : 'border-border-light bg-surface-primary opacity-75'
+      }`}
+    >
       {/* Cortex Header */}
       <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
+        <div className="flex min-w-0 items-center gap-2">
           {agent && (
             <MessageIcon
-              message={{
-                endpoint: EModelEndpoint.agents,
-                isCreatedByUser: false,
-              } as TMessage}
+              message={
+                {
+                  endpoint: EModelEndpoint.agents,
+                  isCreatedByUser: false,
+                } as TMessage
+              }
               agent={agent}
             />
           )}
-          <span className="font-medium text-text-primary">
-            {agent?.name || 'Unknown Agent'}
+          <span className="truncate font-medium text-text-primary">
+            {agent?.name || localize('com_ui_unknown_agent')}
+          </span>
+          <span
+            className={`shrink-0 rounded-full px-2 py-0.5 text-xs font-medium ${
+              isActivationEnabled
+                ? 'bg-green-500/10 text-green-700 dark:text-green-400'
+                : 'bg-surface-tertiary text-text-secondary'
+            }`}
+          >
+            {isActivationEnabled ? localize('com_ui_auto_on') : localize('com_ui_auto_off')}
           </span>
         </div>
         <div className="flex items-center gap-2">
+          <Switch
+            checked={isActivationEnabled}
+            onCheckedChange={(checked) => updateActivation({ enabled: checked })}
+            aria-label={localize('com_ui_toggle_automatic_activation_for', {
+              0: agent?.name || localize('com_ui_background_cortex'),
+            })}
+          />
           <button
             type="button"
             onClick={() => setIsExpanded(!isExpanded)}
@@ -169,28 +200,43 @@ const CortexCard: React.FC<CortexCardProps> = ({
           {/* Model Selection */}
           <div>
             <Label className="mb-1 text-xs text-text-secondary">
-              Activation Model (Fast/Low-cost recommended)
+              {localize('com_ui_activation_model_recommended')}
             </Label>
             <ControlCombobox
               isCollapsed={false}
-              ariaLabel="Select activation model"
+              ariaLabel={localize('com_ui_select_activation_model')}
               selectedValue={selectedModelValue}
               setValue={handleModelChange}
-              selectPlaceholder="Select model..."
-              searchPlaceholder="Search models..."
+              selectPlaceholder={localize('com_ui_select_model')}
+              searchPlaceholder={localize('com_ui_search_models')}
               items={MODEL_OPTIONS}
-              displayValue={
-                MODEL_OPTIONS.find((m) => m.value === selectedModelValue)?.label ?? ''
-              }
+              displayValue={MODEL_OPTIONS.find((m) => m.value === selectedModelValue)?.label ?? ''}
               className="h-9 w-full border-border-heavy text-sm"
               containerClassName="px-0"
+            />
+          </div>
+
+          {/* Auto Activation */}
+          <div className="flex items-center justify-between">
+            <Label htmlFor={`enabled-${index}`} className="text-xs text-text-secondary">
+              {localize('com_ui_automatic_activation')}
+            </Label>
+            <Switch
+              id={`enabled-${index}`}
+              checked={isActivationEnabled}
+              onCheckedChange={(checked) => updateActivation({ enabled: checked })}
+              aria-label={localize('com_ui_automatic_activation_for', {
+                0: agent?.name || localize('com_ui_background_cortex'),
+              })}
             />
           </div>
 
           {/* Confidence Threshold */}
           <div>
             <div className="mb-2 flex items-center justify-between">
-              <Label className="text-xs text-text-secondary">Confidence Threshold</Label>
+              <Label className="text-xs text-text-secondary">
+                {localize('com_ui_confidence_threshold')}
+              </Label>
               <span className="text-xs font-medium text-text-primary">
                 {Math.round(cortex.activation.confidence_threshold * 100)}%
               </span>
@@ -209,7 +255,7 @@ const CortexCard: React.FC<CortexCardProps> = ({
           {/* Cooldown */}
           <div>
             <Label htmlFor={`cooldown-${index}`} className="mb-1 text-xs text-text-secondary">
-              Cooldown (seconds)
+              {localize('com_ui_cooldown_seconds')}
             </Label>
             <Input
               id={`cooldown-${index}`}
@@ -217,9 +263,7 @@ const CortexCard: React.FC<CortexCardProps> = ({
               min={0}
               max={3600}
               value={cortex.activation.cooldown_ms / 1000}
-              onChange={(e) =>
-                updateActivation({ cooldown_ms: Number(e.target.value) * 1000 })
-              }
+              onChange={(e) => updateActivation({ cooldown_ms: Number(e.target.value) * 1000 })}
               className="h-8 text-sm"
             />
           </div>
@@ -227,7 +271,7 @@ const CortexCard: React.FC<CortexCardProps> = ({
           {/* Max History */}
           <div>
             <Label htmlFor={`history-${index}`} className="mb-1 text-xs text-text-secondary">
-              History Context (messages)
+              {localize('com_ui_history_context_messages')}
             </Label>
             <Input
               id={`history-${index}`}
@@ -243,17 +287,17 @@ const CortexCard: React.FC<CortexCardProps> = ({
           {/* Activation Prompt */}
           <div>
             <Label htmlFor={`prompt-${index}`} className="mb-1 text-xs text-text-secondary">
-              Activation Prompt
+              {localize('com_ui_activation_prompt')}
             </Label>
             <Textarea
               id={`prompt-${index}`}
               value={cortex.activation.prompt}
               onChange={(e) => updateActivation({ prompt: e.target.value })}
               className="h-32 resize-none text-xs"
-              placeholder="System prompt for deciding when to activate..."
+              placeholder={localize('com_ui_activation_prompt_placeholder')}
             />
             <p className="mt-1 text-xs text-text-tertiary">
-              Customize when this cortex should activate for this agent
+              {localize('com_ui_activation_prompt_hint')}
             </p>
           </div>
         </div>
@@ -266,16 +310,17 @@ const BackgroundCorticesConfig: React.FC<BackgroundCorticesConfigProps> = ({
   field,
   currentAgentId,
 }) => {
+  const localize = useLocalize();
   const agentsMap = useAgentsMapContext();
 
   const cortices = field.value || [];
+  const activeCortexCount = cortices.filter(
+    (cortex) => cortex.activation?.enabled !== false,
+  ).length;
 
   // Get list of available agents (exclude self and already-added cortices)
   const agents = useMemo(() => (agentsMap ? Object.values(agentsMap) : []), [agentsMap]);
-  const addedCortexIds = useMemo(
-    () => new Set(cortices.map((c) => c.agent_id)),
-    [cortices],
-  );
+  const addedCortexIds = useMemo(() => new Set(cortices.map((c) => c.agent_id)), [cortices]);
 
   const selectableAgents = useMemo(
     () =>
@@ -288,10 +333,12 @@ const BackgroundCorticesConfig: React.FC<BackgroundCorticesConfigProps> = ({
               value: agent?.id || '',
               icon: (
                 <MessageIcon
-                  message={{
-                    endpoint: EModelEndpoint.agents,
-                    isCreatedByUser: false,
-                  } as TMessage}
+                  message={
+                    {
+                      endpoint: EModelEndpoint.agents,
+                      isCreatedByUser: false,
+                    } as TMessage
+                  }
                   agent={agent}
                 />
               ),
@@ -328,12 +375,17 @@ const BackgroundCorticesConfig: React.FC<BackgroundCorticesConfigProps> = ({
         {/* Header */}
         <div className="flex items-center gap-2">
           <Brain className="h-4 w-4 text-purple-500" />
-          <label className="font-semibold text-text-primary">Background Cortices</label>
+          <label className="font-semibold text-text-primary">
+            {localize('com_ui_background_cortices')}
+          </label>
           <HoverCardTrigger>
             <CircleHelpIcon className="h-4 w-4 text-text-tertiary" />
           </HoverCardTrigger>
           <span className="ml-auto text-xs text-text-tertiary">
-            {cortices.length} cortex{cortices.length !== 1 ? 'es' : ''}
+            {localize('com_ui_background_cortices_count', {
+              0: activeCortexCount,
+              1: cortices.length,
+            })}
           </span>
         </div>
 
@@ -355,14 +407,16 @@ const BackgroundCorticesConfig: React.FC<BackgroundCorticesConfigProps> = ({
 
         {/* Add Cortex */}
         <div className="rounded-md border border-dashed border-border-light p-3">
-          <Label className="mb-2 text-xs text-text-secondary">Add Background Cortex</Label>
+          <Label className="mb-2 text-xs text-text-secondary">
+            {localize('com_ui_add_background_cortex')}
+          </Label>
           <ControlCombobox
             isCollapsed={false}
-            ariaLabel="Select agent to add as cortex"
+            ariaLabel={localize('com_ui_select_agent_to_add_as_cortex')}
             selectedValue=""
             setValue={handleAddCortex}
-            selectPlaceholder="Select an agent..."
-            searchPlaceholder="Search agents..."
+            selectPlaceholder={localize('com_ui_select_agent')}
+            searchPlaceholder={localize('com_ui_search_agents')}
             items={selectableAgents}
             displayValue=""
             SelectIcon={<Plus className="h-4 w-4" />}
@@ -370,8 +424,7 @@ const BackgroundCorticesConfig: React.FC<BackgroundCorticesConfigProps> = ({
             containerClassName="px-0"
           />
           <p className="mt-2 text-xs text-text-tertiary">
-            Add agents as background cortices. Each will run in parallel, independently
-            deciding whether to activate based on conversation context.
+            {localize('com_ui_add_background_cortex_hint')}
           </p>
         </div>
       </div>
@@ -379,14 +432,15 @@ const BackgroundCorticesConfig: React.FC<BackgroundCorticesConfigProps> = ({
       <HoverCardPortal>
         <HoverCardContent side={ESide.Top} className="w-80">
           <div className="space-y-2">
-            <p className="text-sm font-medium">Background Cortices</p>
+            <p className="text-sm font-medium">{localize('com_ui_background_cortices')}</p>
             <p className="text-sm text-text-secondary">
-              Background cortices are agents that run in parallel, analyzing conversations
-              and surfacing insights to this main agent.
+              {localize('com_ui_background_cortices_description')}
             </p>
             <p className="text-sm text-text-secondary">
-              Each cortex has its own activation settings - customize when each one should
-              run based on confidence threshold and activation prompts.
+              {localize('com_ui_background_cortices_settings_description')}
+            </p>
+            <p className="text-sm text-text-secondary">
+              {localize('com_ui_background_cortices_auto_off_description')}
             </p>
           </div>
         </HoverCardContent>

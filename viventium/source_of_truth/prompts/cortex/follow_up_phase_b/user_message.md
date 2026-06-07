@@ -8,6 +8,7 @@ safety_class: public_product
 required_context:
 - recent_response
 - background_insights
+- background_limitations
 - surface
 - surface_rules
 - continuation_context
@@ -42,6 +43,9 @@ Critical decision contract:
 
 Background insights that surfaced after your response:
 {{background_insights}}
+
+Background limitations that surfaced after your response:
+{{background_limitations}}
 
 Decision:
 - If these insights are redundant or already covered by your recent response -> {NTA}

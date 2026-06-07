@@ -69,6 +69,14 @@ async function getFollowUpMessageForParent({ userId, conversationId, parentMessa
   };
 }
 
+function getFollowUpDecisionForMessage(message) {
+  const decision = message?.metadata?.viventium?.cortexFollowUpDecision;
+  if (!decision || typeof decision !== 'object' || Array.isArray(decision)) {
+    return null;
+  }
+  return decision;
+}
+
 /**
  * Get completed cortex insights for a message, validating that it belongs to the user
  * (and optionally that it belongs to the expected conversation).
@@ -109,11 +117,13 @@ async function getCompletedCortexInsightsForMessage({ userId, messageId, convers
     conversationId: msg.conversationId,
     insights,
     followUp,
+    followUpDecision: getFollowUpDecisionForMessage(msg),
   };
 }
 
 module.exports = {
   extractCompletedCortexInsights,
+  getFollowUpDecisionForMessage,
   getCompletedCortexInsightsForMessage,
 };
 

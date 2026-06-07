@@ -33,6 +33,14 @@ const { getGraphApiToken } = require('./GraphTokenService');
 const { reinitMCPServer } = require('./Tools/mcp');
 const { getAppConfig } = require('./Config');
 const { getLogStores } = require('~/cache');
+/* === VIVENTIUM START ===
+ * Feature: GlassHive capability broker bootstrap injection.
+ * Purpose: Structurally attach the user/run MCP capability broker to GlassHive worker launches
+ * without relying on the chat model to choose connected-account tools.
+ * === VIVENTIUM END === */
+const {
+  maybeInjectGlassHiveCapabilityBroker,
+} = require('~/server/services/viventium/GlassHiveCapabilityBootstrapService');
 
 /* === VIVENTIUM START ===
  * Feature: Deep Telegram timing instrumentation (toggleable)
@@ -577,11 +585,18 @@ function createToolInstance({
       const customUserVars =
         config?.configurable?.userMCPAuthMap?.[`${Constants.mcp_prefix}${serverName}`];
 
+      const effectiveToolArguments = await maybeInjectGlassHiveCapabilityBroker({
+        serverName,
+        toolName,
+        toolArguments,
+        config,
+      });
+
       const result = await mcpManager.callTool({
         serverName,
         toolName,
         provider,
-        toolArguments,
+        toolArguments: effectiveToolArguments,
         options: {
           signal: derivedSignal,
         },

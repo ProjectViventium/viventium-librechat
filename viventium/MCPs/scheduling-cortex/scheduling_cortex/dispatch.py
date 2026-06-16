@@ -1278,8 +1278,10 @@ def _poll_followup_state(
         if isinstance(follow_up, dict):
             text = follow_up.get("text")
             if isinstance(text, str) and text.strip():
+                followup_message_id = follow_up.get("messageId") or follow_up.get("message_id")
                 return {
                     "followup_text": text.strip(),
+                    "followup_message_id": str(followup_message_id or "").strip(),
                     "canonical_text": last_canonical_text,
                     "followup_text_source": "followup",
                     "canonical_text_source": last_canonical_text_source,
@@ -1302,6 +1304,7 @@ def _poll_followup_state(
         if insights:
             return {
                 "followup_text": _format_insight_fallback(insights),
+                "followup_message_id": "",
                 "canonical_text": last_canonical_text,
                 "followup_text_source": "cortex_insight_fallback",
                 "followup_text_fallback_reason": "insight_fallback",
@@ -1310,6 +1313,7 @@ def _poll_followup_state(
             }
     return {
         "followup_text": "",
+        "followup_message_id": "",
         "canonical_text": last_canonical_text,
         "canonical_text_source": last_canonical_text_source,
         "canonical_text_fallback_reason": last_canonical_text_fallback_reason,
@@ -1464,7 +1468,12 @@ def _poll_scheduler_followup(
     http_timeout_s: int,
 ) -> Dict[str, str]:
     if not message_id:
-        return {"followup_text": "", "canonical_text": "", "canonical_text_source": ""}
+        return {
+            "followup_text": "",
+            "followup_message_id": "",
+            "canonical_text": "",
+            "canonical_text_source": "",
+        }
 
     poll_config = _scheduler_followup_poll_config(task)
     params = {"userId": str(user_id)}
@@ -1533,7 +1542,12 @@ def _run_scheduler_generation(
         stream_timeout_s,
     )
     resolved_conversation_id = _extract_conversation_id(response, conversation_id)
-    polled_state = {"followup_text": "", "canonical_text": "", "canonical_text_source": ""}
+    polled_state = {
+        "followup_text": "",
+        "followup_message_id": "",
+        "canonical_text": "",
+        "canonical_text_source": "",
+    }
     final_text_source = "stream_final" if str(final_text or "").strip() else ""
     final_text_fallback_reason = ""
     followup_text_source = "stream_followup" if str(followup_text or "").strip() else ""
@@ -1555,6 +1569,7 @@ def _run_scheduler_generation(
             followup_text_fallback_reason = str(
                 polled_state.get("followup_text_fallback_reason") or ""
             ).strip()
+    followup_message_id = str(polled_state.get("followup_message_id") or "").strip()
 
     canonical_text = polled_state.get("canonical_text", "").strip()
     canonical_text_source = str(polled_state.get("canonical_text_source") or "").strip()
@@ -1586,10 +1601,32 @@ def _run_scheduler_generation(
             final_text,
             date_guard,
         )
+    if date_guard.get("followup", {}).get("status") == "corrected":
+        if not followup_message_id and followup_text:
+            followup_state_for_patch = _poll_scheduler_followup(
+                task,
+                base_url,
+                response_message_id,
+                str(task.get("user_id") or ""),
+                resolved_conversation_id,
+                secret,
+                timeout_s,
+            )
+            followup_message_id = str(followup_state_for_patch.get("followup_message_id") or "").strip()
+        date_guard["persisted_followup_message"] = _patch_scheduler_visible_message(
+            task,
+            base_url,
+            timeout_s,
+            followup_message_id,
+            resolved_conversation_id,
+            followup_text,
+            date_guard,
+        )
 
     return {
         "conversation_id": resolved_conversation_id,
         "response_message_id": response_message_id or None,
+        "followup_message_id": followup_message_id or None,
         "final_text": final_text.strip(),
         "followup_text": followup_text.strip(),
         "final_text_source": final_text_source,
@@ -1605,14 +1642,14 @@ def _patch_scheduler_visible_message(
     task: Dict[str, Any],
     base_url: str,
     timeout_s: int,
-    response_message_id: Optional[str],
+    message_id: Optional[str],
     conversation_id: str,
     text: str,
     date_guard: Dict[str, Any],
 ) -> Dict[str, Any]:
-    message_id = str(response_message_id or "").strip()
-    if not message_id:
-        raise RuntimeError("Scheduler date guard corrected generated text but response message id is missing")
+    clean_message_id = str(message_id or "").strip()
+    if not clean_message_id:
+        raise RuntimeError("Scheduler date guard corrected generated text but message id is missing")
     clean_text = str(text or "")
     if not clean_text.strip():
         raise RuntimeError("Scheduler date guard corrected generated text but corrected text is empty")
@@ -1634,7 +1671,7 @@ def _patch_scheduler_visible_message(
         {
             "userId": task.get("user_id"),
             "conversationId": conversation_id,
-            "messageId": message_id,
+            "messageId": clean_message_id,
             "scheduleId": task.get("id"),
             "text": clean_text,
             "dateGuard": date_guard,
@@ -1644,7 +1681,7 @@ def _patch_scheduler_visible_message(
     )
     return {
         "status": str(response.get("status") or "patched"),
-        "message_id": str(response.get("messageId") or message_id),
+        "message_id": str(response.get("messageId") or clean_message_id),
         "conversation_id": str(response.get("conversationId") or conversation_id or ""),
         "content_patched": bool(response.get("contentPatched")),
     }

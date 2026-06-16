@@ -437,7 +437,7 @@ class DispatchTelegramTests(unittest.TestCase):
         self.assertIn('Scheduled Run Context (Deterministic)', payload['text'])
         self.assertEqual(result['date_guard']['final']['status'], 'passed')
 
-    def test_run_scheduler_generation_corrects_delivery_without_persisting_history(self):
+    def test_run_scheduler_generation_corrects_persisted_history_message(self):
         task = {
             'id': 'task-run-context-corrected',
             'user_id': 'user_1',
@@ -455,6 +455,16 @@ class DispatchTelegramTests(unittest.TestCase):
             seen_posts.append((url, payload))
             if url.endswith('/api/viventium/scheduler/chat'):
                 return {'streamId': 'stream-run-context', 'conversationId': 'conv-run-context'}
+            if url.endswith('/api/viventium/scheduler/message/patch'):
+                self.assertEqual(payload['messageId'], 'msg-run-context')
+                self.assertEqual(payload['conversationId'], 'conv-run-context')
+                self.assertEqual(payload['text'], 'Monday, June 15, 2026. Wrong day.')
+                return {
+                    'status': 'patched',
+                    'messageId': payload['messageId'],
+                    'conversationId': payload['conversationId'],
+                    'contentPatched': True,
+                }
             self.fail(f'unexpected post url: {url}')
 
         with patch.object(
@@ -476,11 +486,13 @@ class DispatchTelegramTests(unittest.TestCase):
         ):
             result = dispatch._run_scheduler_generation(task, 'http://localhost:3080', 10, 'conv-1')
 
-        self.assertEqual(len(seen_posts), 1)
+        self.assertEqual(len(seen_posts), 2)
         self.assertTrue(seen_posts[0][0].endswith('/api/viventium/scheduler/chat'))
+        self.assertTrue(seen_posts[1][0].endswith('/api/viventium/scheduler/message/patch'))
         self.assertEqual(result['final_text'], 'Monday, June 15, 2026. Wrong day.')
         self.assertEqual(result['date_guard']['final']['status'], 'corrected')
-        self.assertNotIn('persisted_message', result['date_guard'])
+        self.assertEqual(result['date_guard']['persisted_message']['status'], 'patched')
+        self.assertEqual(result['date_guard']['persisted_message']['message_id'], 'msg-run-context')
 
     def test_scheduler_stream_returns_on_final_event_without_linger(self):
         seen = {}

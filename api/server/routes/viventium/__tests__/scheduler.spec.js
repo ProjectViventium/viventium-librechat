@@ -9,6 +9,7 @@ let mockGetUserById;
 let mockGetMessage;
 let mockGetMessages;
 let mockGetConvo;
+let mockUpdateMessage;
 let mockResolveTelegramMappingByUserId;
 let mockGetAgent;
 let mockGetJob;
@@ -69,6 +70,7 @@ jest.mock('~/models', () => ({
   getMessage: (...args) => mockGetMessage(...args),
   getMessages: (...args) => mockGetMessages(...args),
   getConvo: (...args) => mockGetConvo(...args),
+  updateMessage: (...args) => mockUpdateMessage(...args),
 }));
 
 jest.mock('~/models/Agent', () => ({
@@ -179,6 +181,7 @@ describe('/api/viventium/scheduler/telegram/resolve', () => {
     mockGetMessage = jest.fn().mockResolvedValue(null);
     mockGetMessages = jest.fn().mockResolvedValue([]);
     mockGetConvo = jest.fn().mockResolvedValue(null);
+    mockUpdateMessage = jest.fn();
     mockResolveTelegramMappingByUserId = jest.fn().mockResolvedValue({ telegramUserId: 'tg-1' });
     mockGetAgent = jest.fn().mockResolvedValue({
       avatar: { filepath: '/images/viventium.png' },
@@ -276,6 +279,104 @@ describe('/api/viventium/scheduler/telegram/resolve', () => {
   });
 });
 
+describe('/api/viventium/scheduler/message/patch', () => {
+  beforeEach(() => {
+    jest.resetModules();
+    lastParentMessageId = null;
+    lastSpec = null;
+    lastAgentId = null;
+    mockGetUserById = jest.fn().mockResolvedValue({ _id: 'user_1', role: 'USER' });
+    mockGetMessage = jest.fn().mockResolvedValue({
+      messageId: 'msg-run-context',
+      conversationId: 'conv-run-context',
+      isCreatedByUser: false,
+      content: [
+        { type: 'think', think: 'kept thinking text' },
+        { type: 'text', text: 'Monday, June 16. Wrong day.' },
+      ],
+    });
+    mockGetMessages = jest.fn().mockResolvedValue([]);
+    mockGetConvo = jest.fn().mockResolvedValue(null);
+    mockUpdateMessage = jest.fn().mockResolvedValue({
+      messageId: 'msg-run-context',
+      conversationId: 'conv-run-context',
+      text: 'Monday, June 15, 2026. Wrong day.',
+      isCreatedByUser: false,
+    });
+    mockResolveTelegramMappingByUserId = jest.fn().mockResolvedValue({ telegramUserId: 'tg-1' });
+    mockGetAgent = jest.fn().mockResolvedValue({ avatar: { filepath: '/images/viventium.png' } });
+    mockGetJob = jest.fn().mockResolvedValue({ metadata: { userId: 'user_1' } });
+    mockGetResumeState = jest.fn().mockResolvedValue(null);
+    mockSubscribe = jest.fn().mockResolvedValue({ unsubscribe: jest.fn() });
+    process.env.VIVENTIUM_SCHEDULER_SECRET = 'scheduler_secret';
+    process.env.DOMAIN_SERVER = 'http://example.com';
+  });
+
+  test('patches the persisted assistant message text and visible content part', async () => {
+    const schedulerRouter = require('../scheduler');
+    const app = createTestApp(schedulerRouter);
+    const req = createMockReq({
+      url: '/api/viventium/scheduler/message/patch',
+      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+      body: {
+        userId: 'user_1',
+        conversationId: 'conv-run-context',
+        messageId: 'msg-run-context',
+        text: 'Monday, June 15, 2026. Wrong day.',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({
+      status: 'patched',
+      messageId: 'msg-run-context',
+      conversationId: 'conv-run-context',
+      contentPatched: true,
+    });
+    expect(mockUpdateMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ user: expect.objectContaining({ id: 'user_1' }) }),
+      {
+        messageId: 'msg-run-context',
+        text: 'Monday, June 15, 2026. Wrong day.',
+        content: [
+          { type: 'think', think: 'kept thinking text' },
+          { type: 'text', text: 'Monday, June 15, 2026. Wrong day.' },
+        ],
+      },
+      { context: 'schedulerDateGuardPatch' },
+    );
+  });
+
+  test('refuses to patch a user-authored message', async () => {
+    mockGetMessage = jest.fn().mockResolvedValue({
+      messageId: 'msg-user',
+      conversationId: 'conv-run-context',
+      isCreatedByUser: true,
+    });
+    const schedulerRouter = require('../scheduler');
+    const app = createTestApp(schedulerRouter);
+    const req = createMockReq({
+      url: '/api/viventium/scheduler/message/patch',
+      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+      body: {
+        userId: 'user_1',
+        conversationId: 'conv-run-context',
+        messageId: 'msg-user',
+        text: 'Monday, June 15, 2026. Wrong day.',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(400);
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+  });
+});
+
 describe('/api/viventium/scheduler/chat', () => {
   beforeEach(() => {
     jest.resetModules();
@@ -286,6 +387,7 @@ describe('/api/viventium/scheduler/chat', () => {
     mockGetMessage = jest.fn().mockResolvedValue(null);
     mockGetMessages = jest.fn().mockResolvedValue([]);
     mockGetConvo = jest.fn().mockResolvedValue(null);
+    mockUpdateMessage = jest.fn();
     mockResolveTelegramMappingByUserId = jest.fn().mockResolvedValue({ telegramUserId: 'tg-1' });
     mockGetAgent = jest.fn().mockResolvedValue({
       avatar: { filepath: '/images/viventium.png' },
@@ -447,6 +549,7 @@ describe('/api/viventium/scheduler/cortex', () => {
     });
     mockGetMessages = jest.fn().mockResolvedValue([{ messageId: 'fu-1', text: 'Follow-up text' }]);
     mockGetConvo = jest.fn().mockResolvedValue(null);
+    mockUpdateMessage = jest.fn();
     mockResolveTelegramMappingByUserId = jest.fn().mockResolvedValue({ telegramUserId: 'tg-1' });
     mockGetAgent = jest.fn().mockResolvedValue({ avatar: { filepath: '/images/viventium.png' } });
     mockGetJob = jest.fn().mockResolvedValue({ metadata: { userId: 'user_1' } });

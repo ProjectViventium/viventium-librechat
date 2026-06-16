@@ -41,13 +41,13 @@ const mongoose = require('mongoose');
 const { Agent, User } = require('../api/db/models');
 const { updateAgent, createAgent } = require('../api/models/Agent');
 /* === VIVENTIUM START ===
- * Feature: Grant ACL when sync script creates new agents.
+ * Feature: Grant canonical ACLs when sync creates agents.
  * Root cause: Agent.create() alone is insufficient — LibreChat's agent list is filtered by ACL.
- * Without grantPermission + AclEntry, agents are invisible in the UI despite existing in MongoDB.
- * Note: PermissionService cannot be used in standalone scripts (depends on GraphApiService
- * which requires the full app server context). Use raw AclEntry instead.
+ * Use PermissionService so user principals are stored as ObjectId and remote-agent ownership stays
+ * in sync with normal agent-controller creation.
  * === VIVENTIUM END === */
-const { ResourceType, PrincipalType, PrincipalModel } = require('librechat-data-provider');
+const { ResourceType, PrincipalType, AccessRoleIds } = require('librechat-data-provider');
+const { grantPermission } = require('../api/server/services/PermissionService');
 
 const DEFAULT_EMAIL = (process.env.VIVENTIUM_AGENT_SYNC_EMAIL || '').trim();
 const DEFAULT_MAIN_AGENT_ID = process.env.VIVENTIUM_MAIN_AGENT_ID || 'agent_viventium_main_95aeb3';
@@ -679,6 +679,25 @@ function pickAgentFields(agent) {
   return picked;
 }
 
+function collectEdgeTargetAgentIds(agent) {
+  if (!Array.isArray(agent?.edges)) {
+    return [];
+  }
+
+  const targetIds = [];
+  for (const edge of agent.edges) {
+    const rawTarget = edge?.to;
+    const targets = Array.isArray(rawTarget) ? rawTarget : [rawTarget];
+    for (const target of targets) {
+      if (typeof target === 'string' && target.trim()) {
+        targetIds.push(target.trim());
+      }
+    }
+  }
+
+  return Array.from(new Set(targetIds));
+}
+
 function ensureDirForFile(filePath) {
   const dir = path.dirname(filePath);
   fs.mkdirSync(dir, { recursive: true });
@@ -913,6 +932,13 @@ function buildBundleAgentIndex(bundle) {
       continue;
     }
     map.set(agent.id, { kind: 'backgroundAgent', data: agent });
+  }
+
+  for (const agent of bundle.handoffAgents || []) {
+    if (!agent || typeof agent !== 'object' || !agent.id) {
+      continue;
+    }
+    map.set(agent.id, { kind: 'handoffAgent', data: agent });
   }
 
   return map;
@@ -1356,16 +1382,23 @@ async function pullBundle({ email, agentId, outPath, format }) {
         new Set(mainAgent.background_cortices.map((entry) => entry.agent_id).filter(Boolean)),
       )
     : [];
+  const handoffIds = collectEdgeTargetAgentIds(mainAgent).filter((id) => id !== mainAgent.id);
+  const relatedAgentIds = Array.from(new Set([...backgroundIds, ...handoffIds]));
 
-  const backgroundAgents = backgroundIds.length
-    ? await Agent.find({ id: { $in: backgroundIds } }).lean()
+  const relatedAgents = relatedAgentIds.length
+    ? await Agent.find({ id: { $in: relatedAgentIds } }).lean()
     : [];
-  const backgroundById = new Map(backgroundAgents.map((agent) => [agent.id, agent]));
+  const relatedById = new Map(relatedAgents.map((agent) => [agent.id, agent]));
 
   const warnings = [];
   for (const id of backgroundIds) {
-    if (!backgroundById.has(id)) {
+    if (!relatedById.has(id)) {
       warnings.push(`Background agent missing: ${id}`);
+    }
+  }
+  for (const id of handoffIds) {
+    if (!relatedById.has(id)) {
+      warnings.push(`Handoff agent missing: ${id}`);
     }
   }
 
@@ -1381,7 +1414,14 @@ async function pullBundle({ email, agentId, outPath, format }) {
     },
     mainAgent: pickAgentFields(mainAgent),
     backgroundAgents: backgroundIds.map((id) => {
-      const agent = backgroundById.get(id);
+      const agent = relatedById.get(id);
+      if (!agent) {
+        return { id, missing: true };
+      }
+      return pickAgentFields(agent);
+    }),
+    handoffAgents: handoffIds.map((id) => {
+      const agent = relatedById.get(id);
       if (!agent) {
         return { id, missing: true };
       }
@@ -1613,26 +1653,24 @@ async function pushAgent({
     }
     const created = await createAgent(createData);
     try {
-      const AclEntry = mongoose.models.AclEntry || mongoose.model('AclEntry');
-      const AccessRole = mongoose.models.AccessRole || mongoose.model('AccessRole');
-      const ownerRole = await AccessRole.findOne({ resourceType: 'agent', permBits: 15 }).lean();
-      if (ownerRole) {
-        await AclEntry.findOneAndUpdate(
-          { principalId: userId, resourceType: ResourceType.AGENT, resourceId: created._id },
-          {
-            principalType: PrincipalType.USER,
-            principalModel: PrincipalModel.USER,
-            principalId: userId,
-            resourceType: ResourceType.AGENT,
-            resourceId: created._id,
-            permBits: ownerRole.permBits,
-            roleId: ownerRole._id,
-            grantedBy: userId,
-            grantedAt: new Date(),
-          },
-          { upsert: true, new: true },
-        );
-      }
+      await Promise.all([
+        grantPermission({
+          principalType: PrincipalType.USER,
+          principalId: userId,
+          resourceType: ResourceType.AGENT,
+          resourceId: created._id,
+          accessRoleId: AccessRoleIds.AGENT_OWNER,
+          grantedBy: userId,
+        }),
+        grantPermission({
+          principalType: PrincipalType.USER,
+          principalId: userId,
+          resourceType: ResourceType.REMOTE_AGENT,
+          resourceId: created._id,
+          accessRoleId: AccessRoleIds.REMOTE_AGENT_OWNER,
+          grantedBy: userId,
+        }),
+      ]);
     } catch (permErr) {
       console.warn(
         `[pushAgent] Created agent ${agentData.id} but failed to grant ACL:`,
@@ -1781,6 +1819,45 @@ async function pushBundle({
 
   if (Array.isArray(bundle.backgroundAgents)) {
     for (const agentData of bundle.backgroundAgents) {
+      if (agentData && agentData.missing) {
+        results.push({ id: agentData.id || null, status: 'missing', reason: 'marked missing' });
+        continue;
+      }
+      if (
+        !shouldPushStandaloneBackgroundAgent({
+          agentId: agentData.id,
+          selectedAgentIds,
+          activationConfigOnly,
+        })
+      ) {
+        results.push({
+          id: agentData.id,
+          status: 'skipped',
+          reason: activationConfigOnly
+            ? 'activation-config-only does not update standalone handoff agents'
+            : 'filtered out by --agent-ids',
+        });
+        continue;
+      }
+      results.push(
+        await pushAgent({
+          agentData,
+          userId: user._id,
+          dryRun,
+          promptsOnly,
+          activationConfigOnly,
+          modelConfigOnly,
+          toolsOnly,
+          runtimeAware,
+          activationFields,
+          selectedAgentIds,
+        }),
+      );
+    }
+  }
+
+  if (Array.isArray(bundle.handoffAgents)) {
+    for (const agentData of bundle.handoffAgents) {
       if (agentData && agentData.missing) {
         results.push({ id: agentData.id || null, status: 'missing', reason: 'marked missing' });
         continue;
@@ -2248,6 +2325,7 @@ module.exports = {
   resolveFormat,
   resolvePromptRefs,
   buildUpdateData,
+  collectEdgeTargetAgentIds,
   mergeBackgroundCorticesActivationFields,
   resolveSafeActivationFields,
   shouldApplyRuntimeOverrides,

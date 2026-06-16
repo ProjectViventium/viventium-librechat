@@ -18,6 +18,19 @@ import { logger, cn } from '~/utils';
 // VIVENTIUM START: present GlassHive MCP worker tools with source-of-truth labels.
 const GLASSHIVE_MCP_SERVER_NAMES = new Set([GLASSHIVE_MCP_SERVER_NAME]);
 const GLASSHIVE_TOOL_LABELS: Record<string, string> = {
+  projects_list: 'GlassHive projects',
+  workspace_launch: 'GlassHive workspace',
+  workspace_schedule: 'GlassHive schedule',
+  workspace_status: 'GlassHive status',
+  workspace_wait: 'GlassHive wait',
+  workspace_continue: 'GlassHive continue',
+  workspace_pause: 'GlassHive pause',
+  workspace_resume: 'GlassHive resume',
+  workspace_terminate: 'GlassHive terminate',
+  workspace_artifacts: 'GlassHive artifacts',
+  workspace_artifact_download: 'GlassHive artifact',
+  workspace_preferences_get: 'GlassHive preferences',
+  workspace_preferences_set: 'GlassHive preferences',
   worker_delegate_once: 'GlassHive delegate',
   workers_list: 'GlassHive projects',
   worker_create: 'GlassHive create',
@@ -32,6 +45,8 @@ const GLASSHIVE_TOOL_LABELS: Record<string, string> = {
   worker_terminate: 'GlassHive terminate',
   worker_desktop_action: 'GlassHive desktop',
   worker_takeover: 'GlassHive takeover',
+  run_get: 'GlassHive run status',
+  metrics_summary: 'GlassHive metrics',
 };
 
 function getUserFacingToolName(functionName: string, mcpServerName: string) {
@@ -42,8 +57,245 @@ function getUserFacingToolName(functionName: string, mcpServerName: string) {
   if (GLASSHIVE_MCP_SERVER_NAMES.has(mcpServerName) && GLASSHIVE_TOOL_LABELS[functionName]) {
     return GLASSHIVE_TOOL_LABELS[functionName];
   }
+  if (GLASSHIVE_MCP_SERVER_NAMES.has(mcpServerName)) {
+    return `GlassHive ${functionName.replace(/_/g, ' ')}`;
+  }
 
   return functionName;
+}
+
+function safeGlassHiveText(value: unknown, maxLength = 240) {
+  const text = typeof value === 'string' ? value.trim() : '';
+  if (!text) {
+    return '';
+  }
+  const cleaned = text
+    .replace(/https?:\/\/[^\s<>)]+/gi, '[link]')
+    .replace(/(?:\/Users|\/home|\/private\/var|\/var\/folders|\/tmp)\/[^\s`'"<>]+/g, '<local path>');
+  return cleaned.length > maxLength ? `${cleaned.slice(0, maxLength - 1).trimEnd()}...` : cleaned;
+}
+
+function safeGlassHiveFileLabel(value: unknown) {
+  const text = typeof value === 'string' ? value.trim() : '';
+  if (!text) {
+    return '';
+  }
+  const withoutQuery = text.split(/[?#]/, 1)[0] ?? text;
+  const parts = withoutQuery.split(/[\\/]/).filter(Boolean);
+  return safeGlassHiveText(parts[parts.length - 1] || withoutQuery, 120);
+}
+
+function glassHiveProgressLabel(...values: unknown[]) {
+  for (const value of values) {
+    const text = typeof value === 'string' ? value.trim().toLowerCase() : '';
+    if (!text) {
+      continue;
+    }
+    if (['complete', 'completed', 'success', 'succeeded', 'ready', 'done'].includes(text)) {
+      return 'Completed';
+    }
+    if (
+      [
+        'accepted',
+        'active',
+        'created',
+        'dispatched',
+        'in_progress',
+        'pending',
+        'queued',
+        'running',
+        'scheduled',
+        'started',
+        'working',
+      ].includes(text)
+    ) {
+      return 'In progress';
+    }
+    if (['blocked', 'error', 'failed', 'failure', 'needs_attention'].includes(text)) {
+      return 'Needs attention';
+    }
+    if (['cancelled', 'canceled', 'stopped', 'terminated'].includes(text)) {
+      return 'Stopped';
+    }
+    if (text === 'paused') {
+      return 'Paused';
+    }
+  }
+  return '';
+}
+
+function glassHiveArtifactLabels(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map((item) => {
+      if (!item || typeof item !== 'object') {
+        return '';
+      }
+      const record = item as Record<string, unknown>;
+      return safeGlassHiveFileLabel(record.label ?? record.name ?? record.path ?? record.workspace_path);
+    })
+    .filter(Boolean)
+    .slice(0, 3);
+}
+
+function parseJsonObject(value: string): Record<string, unknown> | undefined {
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function parseGlassHiveStructuredValue(value?: string | null): Record<string, unknown> | undefined {
+  const trimmed = value?.trim() ?? '';
+  if (!trimmed) {
+    return undefined;
+  }
+  const direct = parseJsonObject(trimmed);
+  if (direct) {
+    return direct;
+  }
+  try {
+    const wrapped = JSON.parse(trimmed);
+    if (!Array.isArray(wrapped)) {
+      return undefined;
+    }
+    for (const entry of wrapped) {
+      const text = (entry as { text?: unknown })?.text;
+      if (typeof text !== 'string') {
+        continue;
+      }
+      const parsedText = parseJsonObject(text.trim());
+      if (parsedText) {
+        return parsedText;
+      }
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+function plainGlassHiveOutputText(value?: string | null) {
+  const trimmed = value?.trim() ?? '';
+  if (!trimmed) {
+    return '';
+  }
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (Array.isArray(parsed)) {
+      const text = parsed
+        .map((entry) => {
+          const entryText = (entry as { text?: unknown })?.text;
+          if (typeof entryText !== 'string') {
+            return '';
+          }
+          return parseJsonObject(entryText.trim()) ? '' : entryText.trim();
+        })
+        .filter(Boolean)
+        .join('\n');
+      return safeGlassHiveText(text, 800);
+    }
+    return '';
+  } catch {
+    return safeGlassHiveText(trimmed, 800);
+  }
+}
+
+function objectValue(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function firstGlassHiveText(...values: unknown[]) {
+  for (const value of values) {
+    const text = safeGlassHiveText(value);
+    if (text) {
+      return text;
+    }
+  }
+  return '';
+}
+
+function summarizeGlassHiveToolOutput(output?: string | null, input?: string | null) {
+  const parsed = parseGlassHiveStructuredValue(output);
+  const inputPayload = parseGlassHiveStructuredValue(input);
+  const delegationAudit = objectValue(parsed?.delegation_audit);
+  const followUpContext = objectValue(parsed?.follow_up_context);
+  const viewSteer = objectValue(parsed?.view_steer);
+  const lines: string[] = [];
+
+  const taskTitle = firstGlassHiveText(
+    delegationAudit?.title,
+    parsed?.title,
+    inputPayload?.description,
+    inputPayload?.title,
+    inputPayload?.goal,
+    inputPayload?.request,
+    inputPayload?.user_request,
+  );
+  if (taskTitle) {
+    lines.push(`Task: ${taskTitle}`);
+  }
+
+  const progressLabel = glassHiveProgressLabel(
+    parsed?.status,
+    parsed?.state,
+    parsed?.run_state,
+    followUpContext?.run_state,
+  );
+  if (progressLabel) {
+    lines.push(`Progress: ${progressLabel}`);
+  }
+
+  const resultText = firstGlassHiveText(
+    parsed?.output_text,
+    parsed?.message,
+    parsed?.failure_user_message,
+    parsed?.error,
+  );
+  if (resultText) {
+    lines.push(resultText);
+  }
+
+  const viewUrl = firstGlassHiveText(parsed?.view_steer_url, viewSteer?.url, parsed?.view_url);
+  if (viewUrl) {
+    lines.push('View / Steer link available.');
+  }
+
+  const deliverable = objectValue(parsed?.deliverable);
+  const deliverableLabel = safeGlassHiveFileLabel(
+    deliverable?.label ?? deliverable?.name ?? deliverable?.path ?? deliverable?.workspace_path,
+  );
+  if (deliverableLabel) {
+    lines.push(`Artifact: ${deliverableLabel}`);
+  }
+
+  const artifactLinks = objectValue(parsed?.artifact_links);
+  const artifacts = objectValue(parsed?.artifacts);
+  const artifactLabels = glassHiveArtifactLabels(artifactLinks?.items ?? artifacts?.items);
+  if (artifactLabels.length > 0) {
+    lines.push(`Artifacts: ${artifactLabels.join(', ')}`);
+  }
+
+  const plainText = plainGlassHiveOutputText(output);
+  if (plainText) {
+    lines.push(plainText);
+  }
+
+  if (lines.length > 0) {
+    return lines.join('\n');
+  }
+  if (output?.trim()) {
+    return 'GlassHive returned a result.';
+  }
+  return '';
 }
 // VIVENTIUM END
 
@@ -99,6 +351,7 @@ export default function ToolCall({
   }, [name]);
 
   // VIVENTIUM START: avoid exposing raw GlassHive function names in chat UI.
+  const isGlassHiveToolCall = GLASSHIVE_MCP_SERVER_NAMES.has(mcpServerName);
   const displayFunctionName = useMemo(
     () => getUserFacingToolName(function_name, mcpServerName),
     [function_name, mcpServerName],
@@ -153,9 +406,17 @@ export default function ToolCall({
     }
   }, [_args]) as string | undefined;
 
+  const glassHiveSummary = useMemo(
+    () => (isGlassHiveToolCall ? summarizeGlassHiveToolOutput(output, args) : ''),
+    [args, output, isGlassHiveToolCall],
+  );
+
   const hasInfo = useMemo(
-    () => (args?.length ?? 0) > 0 || (output?.length ?? 0) > 0,
-    [args, output],
+    () =>
+      isGlassHiveToolCall
+        ? glassHiveSummary.length > 0
+        : (args?.length ?? 0) > 0 || (output?.length ?? 0) > 0,
+    [args, output, isGlassHiveToolCall, glassHiveSummary],
   );
 
   const authDomain = useMemo(() => {
@@ -289,8 +550,8 @@ export default function ToolCall({
             {showInfo && hasInfo && (
               <ToolCallInfo
                 key="tool-call-info"
-                input={args ?? ''}
-                output={output}
+                input={isGlassHiveToolCall ? '' : (args ?? '')}
+                output={isGlassHiveToolCall ? glassHiveSummary : output}
                 domain={authDomain || (domain ?? '')}
                 function_name={displayFunctionName}
                 pendingAuth={authDomain.length > 0 && !cancelled && progress < 1}

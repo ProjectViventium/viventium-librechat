@@ -681,6 +681,7 @@ function getDefaultHandlers({
         const emitStartedAt = shouldEmit ? voiceLatencyNow() : null;
         const normalizedEvent = normalizeMessageDeltaAtBoundary({ event, data });
         const eventData = { event: normalizedEvent.event, data: normalizedEvent.data };
+        const aggregateEventData = { ...eventData, visibleToUser: shouldEmit };
 
         if (shouldEmit) {
           await emitEvent(res, streamId, eventData);
@@ -699,7 +700,7 @@ function getDefaultHandlers({
             );
           }
         }
-        aggregateContent(eventData);
+        aggregateContent(aggregateEventData);
       },
     },
     [GraphEvents.ON_REASONING_DELTA]: {

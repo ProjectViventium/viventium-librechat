@@ -50,6 +50,7 @@ const {
 } = require('~/server/services/viventium/sanitizeAggregatedContentParts');
 const {
   extractVisibleTextFromContentParts,
+  repairMissedVisibleMessageDelta,
   repairMissedVoiceMessageDelta,
 } = require('~/server/services/viventium/voiceDeltaAggregation');
 const db = require('~/models');
@@ -348,18 +349,23 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
   const { contentParts, aggregateContent: rawAggregateContent } = createContentAggregator();
   const aggregateContent = (event) => {
     /* === VIVENTIUM START ===
-     * Feature: Voice streamed-delta persistence parity.
+     * Feature: Streamed-delta persistence parity.
      *
      * Purpose:
-     * - Preserve the same assistant text LiveKit heard in the canonical Mongo message.
-     * - Repair only the upstream aggregation miss where `on_message_delta` was emitted but
-     *   `contentParts` text did not advance. Cumulative snapshot normalization happens earlier
-     *   at the stream event boundary before emit/replay/persistence fan-out.
+     * - Preserve the same assistant text the user surface saw in the canonical Mongo message.
+     * - Repair only the upstream aggregation miss where a visible `on_message_delta` was emitted
+     *   but `contentParts` text did not advance. Cumulative snapshot normalization happens
+     *   earlier at the stream event boundary before emit/replay/persistence fan-out.
      * === VIVENTIUM END === */
     const shouldRepairVoiceDelta = req?.body?.voiceMode === true;
+    const shouldRepairVisibleDelta = event?.visibleToUser === true;
     const beforeVoiceText = shouldRepairVoiceDelta
       ? extractVisibleTextFromContentParts(contentParts)
       : '';
+    const beforeVisibleText =
+      shouldRepairVisibleDelta && !shouldRepairVoiceDelta
+        ? extractVisibleTextFromContentParts(contentParts)
+        : '';
     rawAggregateContent(event);
     sanitizeAggregatedContentParts(contentParts);
     if (shouldRepairVoiceDelta) {
@@ -377,6 +383,28 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
           req._viventiumVoiceDeltaAggregationRepairLogged = true;
           logger.warn(
             `[VIVENTIUM][VoiceDeltaAggregation] Repaired missed voice message delta streamId=${streamId || 'none'}`,
+          );
+        }
+      }
+    } else if (shouldRepairVisibleDelta) {
+      const afterVisibleText = extractVisibleTextFromContentParts(contentParts);
+      const repaired = repairMissedVisibleMessageDelta({
+        contentParts,
+        event: event?.event,
+        data: event?.data,
+        beforeText: beforeVisibleText,
+        afterText: afterVisibleText,
+      });
+      if (repaired) {
+        sanitizeAggregatedContentParts(contentParts);
+        req._viventiumVisibleDeltaAggregationRepaired = true;
+        req._viventiumVisibleDeltaAggregationRecoveredText = extractVisibleTextFromContentParts(
+          contentParts,
+        );
+        if (!req._viventiumVisibleDeltaAggregationRepairLogged) {
+          req._viventiumVisibleDeltaAggregationRepairLogged = true;
+          logger.warn(
+            `[VIVENTIUM][VisibleDeltaAggregation] Repaired missed visible message delta streamId=${streamId || 'none'}`,
           );
         }
       }
@@ -616,6 +644,9 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
         return fallbackConfigPromise;
       }
       const voiceFallbackInitStart = voiceLatencyEnabled ? voiceLatencyNow() : null;
+      const previousOpenAIPlatformFallbackFlag =
+        req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure;
+      req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure = true;
       fallbackConfigPromise = initializeAgent(
         {
           req,
@@ -633,6 +664,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
       )
         .then((fallbackConfig) => {
           primaryConfig.viventiumFallbackLlm = fallbackConfig;
+          primaryConfig.viventiumFallbackLlmInitializationError = null;
           if (voiceLatencyEnabled) {
             const fallbackToolSummary = summarizeInitTools(fallbackConfig);
             logVoiceInitLatencyStage(
@@ -652,10 +684,23 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
         })
         .catch((error) => {
           fallbackConfigPromise = null;
+          if (error && typeof error === 'object') {
+            error.viventiumFallbackProvider = fallbackAssignment.provider;
+            error.viventiumFallbackModel = fallbackAssignment.model;
+          }
+          primaryConfig.viventiumFallbackLlmInitializationError = error;
           logger.warn(
             `[agentLlmFallback] Failed to initialize fallback model ${fallbackAssignment.provider}/${fallbackAssignment.model} for agent ${primaryAgent.id}: ${error?.message || error}`,
           );
           return null;
+        })
+        .finally(() => {
+          if (previousOpenAIPlatformFallbackFlag === undefined) {
+            delete req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure;
+          } else {
+            req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure =
+              previousOpenAIPlatformFallbackFlag;
+          }
         });
       return fallbackConfigPromise;
     };

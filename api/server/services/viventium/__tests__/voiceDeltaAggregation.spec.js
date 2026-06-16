@@ -2,6 +2,7 @@ const { ContentTypes } = require('librechat-data-provider');
 const {
   createMessageDeltaBoundaryNormalizer,
   extractVisibleTextFromContentParts,
+  repairMissedVisibleMessageDelta,
   repairMissedVoiceMessageDelta,
 } = require('../voiceDeltaAggregation');
 
@@ -95,6 +96,22 @@ describe('voiceDeltaAggregation', () => {
     expect(repaired).toBe(true);
     expect(contentParts).toEqual([{ type: ContentTypes.TEXT, text: 'I hear you.' }]);
     expect(extractVisibleTextFromContentParts(contentParts)).toBe('I hear you.');
+  });
+
+  test('repairs an emitted visible delta for non-voice surfaces when aggregation did not advance', () => {
+    const contentParts = [];
+
+    const repaired = repairMissedVisibleMessageDelta({
+      contentParts,
+      event: 'on_message_delta',
+      data: { delta: { content: [{ type: ContentTypes.TEXT, text: 'Already visible answer.' }] } },
+      beforeText: '',
+      afterText: '',
+    });
+
+    expect(repaired).toBe(true);
+    expect(contentParts).toEqual([{ type: ContentTypes.TEXT, text: 'Already visible answer.' }]);
+    expect(extractVisibleTextFromContentParts(contentParts)).toBe('Already visible answer.');
   });
 
   test('does not duplicate text when upstream aggregation already advanced', () => {

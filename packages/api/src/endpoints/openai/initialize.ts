@@ -19,6 +19,26 @@ const OPENAI_CONNECTED_ACCOUNT_RECONNECT_MESSAGE =
   'OpenAI connected account needs reconnect in Settings > Account > Connected Accounts.';
 const OPENAI_CONNECTED_ACCOUNT_REQUIRED_MESSAGE =
   'OpenAI connected account is required in Settings > Account > Connected Accounts.';
+const OPENAI_CONNECTED_ACCOUNT_REFRESH_FAILED_PREFIX = 'OpenAI connected account refresh failed:';
+
+type ViventiumOpenAIRequest = BaseInitializeParams['req'] & {
+  viventiumAllowOpenAIPlatformFallbackOnOAuthFailure?: boolean;
+};
+type ViventiumConnectedAccountReconnectError = Error & {
+  code?: string;
+  viventiumConnectedAccountReconnectRequired?: boolean;
+  viventiumConnectedAccountProvider?: string;
+};
+
+function openAIConnectedAccountReconnectError(): ViventiumConnectedAccountReconnectError {
+  const error = new Error(
+    OPENAI_CONNECTED_ACCOUNT_RECONNECT_MESSAGE,
+  ) as ViventiumConnectedAccountReconnectError;
+  error.code = 'MODEL_AUTHENTICATION';
+  error.viventiumConnectedAccountReconnectRequired = true;
+  error.viventiumConnectedAccountProvider = 'openAI';
+  return error;
+}
 
 const isNoUserKeyError = (error: unknown): boolean => {
   if (!(error instanceof Error)) {
@@ -63,6 +83,17 @@ const isOpenAIConnectedAccountReadError = (error: unknown): boolean => {
   );
 };
 
+const isOpenAIConnectedAccountOAuthFailure = (error: unknown): boolean => {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  return (
+    error.message === OPENAI_CONNECTED_ACCOUNT_RECONNECT_MESSAGE ||
+    error.message.startsWith(OPENAI_CONNECTED_ACCOUNT_REFRESH_FAILED_PREFIX)
+  );
+};
+
 const isConnectedAccountAuthMode = (): boolean => {
   const values = [
     process.env.VIVENTIUM_OPENAI_AUTH_MODE,
@@ -71,6 +102,9 @@ const isConnectedAccountAuthMode = (): boolean => {
 
   return values.some((value) => value?.trim().toLowerCase() === 'connected_account');
 };
+
+const allowPlatformFallbackOnOAuthFailure = (req: BaseInitializeParams['req']): boolean =>
+  (req as ViventiumOpenAIRequest).viventiumAllowOpenAIPlatformFallbackOnOAuthFailure === true;
 
 /**
  * Initializes OpenAI options for agent usage. This function always returns configuration
@@ -119,7 +153,12 @@ export async function initializeOpenAI({
       userValues = null;
     } else if (isOpenAIConnectedAccountReadError(error)) {
       if (isConnectedAccountAuthMode()) {
-        throw new Error(OPENAI_CONNECTED_ACCOUNT_RECONNECT_MESSAGE);
+        throw openAIConnectedAccountReconnectError();
+      }
+      userValues = null;
+    } else if (isOpenAIConnectedAccountOAuthFailure(error)) {
+      if (isConnectedAccountAuthMode() || !allowPlatformFallbackOnOAuthFailure(req)) {
+        throw openAIConnectedAccountReconnectError();
       }
       userValues = null;
     } else {

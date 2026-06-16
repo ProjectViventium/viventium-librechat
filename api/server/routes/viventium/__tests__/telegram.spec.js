@@ -948,6 +948,7 @@ describe('/api/viventium/telegram', () => {
           viventium: {
             type: 'glasshive_worker_callback',
             anchorMessageId: 'assistant-msg-1',
+            callbackId: 'cb-telegram-1',
             workerId: 'wrk-1',
             runId: 'run-1',
             event: 'run.completed',

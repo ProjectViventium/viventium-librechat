@@ -111,6 +111,41 @@ describe('buildTimeContextInstructions', () => {
     expect(result).toContain('(UTC)');
     expect(result).toMatch(/9:09 PM/);
   });
+
+  test('appends deterministic scheduler run context when provided', () => {
+    const req = {
+      body: {
+        clientTimestamp: '2026-06-15T15:00:26Z',
+        clientTimezone: 'America/Los_Angeles',
+        scheduledDueAt: '2026-06-15T15:00:00Z',
+        schedulerRunContext: {
+          run_started_at_utc: '2026-06-15T15:00:26Z',
+          scheduled_due_at_utc: '2026-06-15T15:00:00Z',
+          scheduled_due_local: '2026-06-15T08:00:00-07:00',
+          scheduled_due_local_date: 'Monday, June 15, 2026',
+          scheduled_due_local_date_iso: '2026-06-15',
+          schedule_timezone: 'America/Los_Angeles',
+          current_schedule_local_time: '2026-06-15T08:00:26-07:00',
+          calendar_window_local_start: '2026-06-15T00:00:00-07:00',
+          calendar_window_local_end_exclusive: '2026-06-16T00:00:00-07:00',
+          calendar_window_utc_start: '2026-06-15T07:00:00Z',
+          calendar_window_utc_end_exclusive: '2026-06-16T07:00:00Z',
+        },
+      },
+    };
+
+    const result = buildTimeContextInstructions(req);
+
+    expect(result).toContain('Current time: Monday, June 15, 2026');
+    expect(result).toContain('Scheduled run context:');
+    expect(result).toContain('Anchor date for this scheduled run: Monday, June 15, 2026');
+    expect(result).toContain('Anchor date tag: scheduled_due_local_date_iso=2026-06-15');
+    expect(result).toContain('Calendar window UTC: 2026-06-15T07:00:00Z to 2026-06-16T07:00:00Z');
+    expect(result).toContain('Do not infer the day from prior scheduled briefings');
+    expect(result).toContain(
+      'Calendar, email, task, and current-day claims require verified tool/cortex evidence',
+    );
+  });
 });
 
 /* === VIVENTIUM START ===

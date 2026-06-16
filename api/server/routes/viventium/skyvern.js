@@ -789,7 +789,7 @@ router.get('/openai/v1/models', (_req, res) => {
     'openai/gpt-5.4',
     'openai/gpt-4o',
     'anthropic/claude-sonnet-4-5',
-    'anthropic/claude-opus-4-7',
+    'anthropic/claude-opus-4-8',
   ];
 
   res.json({

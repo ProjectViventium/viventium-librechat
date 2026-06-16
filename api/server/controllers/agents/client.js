@@ -974,6 +974,9 @@ function classifyCompletionErrorForLog(err) {
   if (isLocalRetrievalTimeoutError(err)) {
     return 'local_retrieval_timeout';
   }
+  if (isConnectedAccountReconnectError(err)) {
+    return 'provider_connected_account_reconnect_required';
+  }
   if (message.includes('rate limit') || message.includes('rate_limit') || err?.status === 429) {
     return 'provider_rate_limited';
   }
@@ -1000,13 +1003,100 @@ function classifyCompletionErrorForLog(err) {
   return 'completion_error';
 }
 
+function getConnectedAccountReconnectProvider(err) {
+  const explicitProvider = String(
+    err?.viventiumConnectedAccountProvider || err?.viventiumFallbackProvider || '',
+  ).trim();
+  if (explicitProvider) {
+    return explicitProvider === 'openAI' ? 'OpenAI' : explicitProvider;
+  }
+  return 'AI provider';
+}
+
+function isConnectedAccountReconnectError(err) {
+  return err?.viventiumConnectedAccountReconnectRequired === true;
+}
+
+function getPublicConnectedAccountReconnectMessage(err) {
+  const message = getCompletionErrorMessage(err).trim();
+  if (
+    message.includes('primary model provider was rate-limited') ||
+    message.includes('configured fallback model could not start')
+  ) {
+    return message;
+  }
+  const provider = getConnectedAccountReconnectProvider(err);
+  return `${provider} connected account needs reconnect in Settings > Account > Connected Accounts. Reconnect ${provider}, then try again.`;
+}
+
+function contentPartsContainRecoverableProviderFailure(contentParts) {
+  if (!Array.isArray(contentParts)) {
+    return false;
+  }
+  return contentParts.some((part) => {
+    if (!part || typeof part !== 'object') {
+      return false;
+    }
+    return [
+      'provider_rate_limited',
+      'provider_temporarily_unavailable',
+      'provider_unauthorized',
+      'provider_access_denied',
+      'provider_connected_account_reconnect_required',
+      'recoverable_provider_error',
+    ].includes(part.error_class || part.errorClass || part.error_code || part.code || '');
+  });
+}
+
+function createFallbackInitializationError(fallbackError, contentParts) {
+  if (!fallbackError) {
+    return null;
+  }
+  if (!isConnectedAccountReconnectError(fallbackError)) {
+    return null;
+  }
+  const provider = getConnectedAccountReconnectProvider(fallbackError);
+  const primaryWasRateLimited = Array.isArray(contentParts)
+    ? contentParts.some(
+        (part) =>
+          part?.error_class === 'provider_rate_limited' ||
+          String(part?.[ContentTypes.ERROR] || part?.error || '')
+            .toLowerCase()
+            .includes('rate-limit') ||
+          String(part?.[ContentTypes.ERROR] || part?.error || '')
+            .toLowerCase()
+            .includes('rate limited'),
+      )
+    : false;
+  const reason = `${provider} connected account needs reconnect in Settings > Account > Connected Accounts.`;
+  const message = primaryWasRateLimited
+    ? `The primary model provider was rate-limited, and the configured fallback model could not start because ${reason} Reconnect ${provider}, then try again.`
+    : `The configured fallback model could not start because ${reason} Reconnect ${provider}, then try again.`;
+  const error = new Error(message);
+  error.name = fallbackError.name || 'FallbackInitializationError';
+  error.status = fallbackError.status;
+  error.code = fallbackError.code || fallbackError.lc_error_code || 'MODEL_AUTHENTICATION';
+  error.viventiumConnectedAccountReconnectRequired = true;
+  error.viventiumConnectedAccountProvider = provider;
+  error.viventiumFallbackProvider = fallbackError.viventiumFallbackProvider;
+  error.viventiumFallbackModel = fallbackError.viventiumFallbackModel;
+  error.cause = fallbackError;
+  return error;
+}
+
 function sanitizeCompletionErrorForLog(err) {
-  return {
-    class: classifyCompletionErrorForLog(err),
+  const errorClass = classifyCompletionErrorForLog(err);
+  const sanitized = {
+    class: errorClass,
     name: err?.name || null,
     status: Number.isFinite(err?.status) ? err.status : null,
     code: err?.code || err?.lc_error_code || null,
   };
+  if (errorClass === 'provider_connected_account_reconnect_required') {
+    sanitized.action = 'reconnect_connected_account';
+    sanitized.provider = getConnectedAccountReconnectProvider(err);
+  }
+  return sanitized;
 }
 
 function hashCompletionTextForLog(text, length = 12) {
@@ -1099,6 +1189,7 @@ function createCompletionErrorContentPart(err) {
       'The model provider rate-limited this request. Please try again shortly.',
     provider_temporarily_unavailable:
       'The model provider is temporarily overloaded. Please try again shortly.',
+    provider_connected_account_reconnect_required: getPublicConnectedAccountReconnectMessage(err),
     provider_unauthorized: 'The model provider credentials were rejected.',
     provider_access_denied: 'The model provider denied access to this request.',
     context_length_exceeded: 'The request was too large for the model context.',
@@ -2865,7 +2956,27 @@ class AgentClient extends BaseClient {
           fallbackAgent = await fallbackInitializer();
         }
         if (!fallbackAgent) {
-          if (primaryError) {
+          const fallbackInitializationError =
+            this.options.agent?.viventiumFallbackLlmInitializationError;
+          const terminalFallbackError = createFallbackInitializationError(
+            fallbackInitializationError,
+            this.contentParts,
+          );
+          if (
+            terminalFallbackError &&
+            !hasVisibleAssistantText(this.contentParts) &&
+            contentPartsContainRecoverableProviderFailure(this.contentParts)
+          ) {
+            const preservedCortexParts = this.contentParts.filter(
+              (part) => part && CORTEX_CONTENT_TYPES.has(part.type),
+            );
+            this.contentParts.length = 0;
+            for (const part of preservedCortexParts) {
+              upsertCortexContentPart(this.contentParts, part);
+            }
+            this.contentParts.push(createCompletionErrorContentPart(terminalFallbackError));
+          }
+          if (primaryError && !terminalFallbackError) {
             throw primaryError;
           }
         } else {
@@ -3311,6 +3422,24 @@ class AgentClient extends BaseClient {
                 `[AgentClient] Phase B recentResponse extraction: contentParts.length=${cpLen}, textParts=${textParts}, recentResponse.length=${rrLen}`,
               );
             }
+          }
+          if (
+            req?._viventiumVisibleDeltaAggregationRepaired === true &&
+            !effectiveShouldDeferMainResponse &&
+            recentResponse.trim().length > 0
+          ) {
+            logger.warn(
+              '[AgentClient] Suppressing cortex follow-up after repairing a visible/canonical text mismatch for parent=%s',
+              responseMessageId,
+            );
+            await recordTerminalPhaseBDecision({
+              result: 'suppressed',
+              suppressionReason: 'visible_delta_aggregation_repaired',
+              selectedStrategy: 'visible_primary_recovered_suppressed',
+              llmResult: 'not_requested',
+            });
+            await finalizeCanonicalParent();
+            return null;
           }
           const followUpMessage = await createCortexFollowUpMessage({
             req,

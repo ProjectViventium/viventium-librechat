@@ -681,7 +681,13 @@ function getDefaultHandlers({
         const emitStartedAt = shouldEmit ? voiceLatencyNow() : null;
         const normalizedEvent = normalizeMessageDeltaAtBoundary({ event, data });
         const eventData = { event: normalizedEvent.event, data: normalizedEvent.data };
+        /* === VIVENTIUM START ===
+         * Feature: Visible delta aggregation.
+         * Purpose: Track whether a streamed delta was actually visible to the user so later repair
+         * logic can avoid duplicate Telegram/voice/chat callback delivery.
+         */
         const aggregateEventData = { ...eventData, visibleToUser: shouldEmit };
+        /* === VIVENTIUM END === */
 
         if (shouldEmit) {
           await emitEvent(res, streamId, eventData);

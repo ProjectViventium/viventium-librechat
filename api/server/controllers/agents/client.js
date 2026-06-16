@@ -1003,6 +1003,11 @@ function classifyCompletionErrorForLog(err) {
   return 'completion_error';
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Structured connected-account reconnect errors.
+ * Purpose: Preserve provider reconnect guidance from endpoint initialization metadata without
+ * relying on brittle provider-name or error-message regex matching.
+ */
 function getConnectedAccountReconnectProvider(err) {
   const explicitProvider = String(
     err?.viventiumConnectedAccountProvider || err?.viventiumFallbackProvider || '',
@@ -1083,6 +1088,7 @@ function createFallbackInitializationError(fallbackError, contentParts) {
   error.cause = fallbackError;
   return error;
 }
+/* === VIVENTIUM END === */
 
 function sanitizeCompletionErrorForLog(err) {
   const errorClass = classifyCompletionErrorForLog(err);
@@ -2956,6 +2962,12 @@ class AgentClient extends BaseClient {
           fallbackAgent = await fallbackInitializer();
         }
         if (!fallbackAgent) {
+          /* === VIVENTIUM START ===
+           * Feature: User-visible fallback initialization guidance.
+           * Purpose: When a fallback cannot start because its connected account needs reconnect,
+           * show one actionable user-safe error instead of leaking provider plumbing or leaving only
+           * the primary recoverable failure.
+           */
           const fallbackInitializationError =
             this.options.agent?.viventiumFallbackLlmInitializationError;
           const terminalFallbackError = createFallbackInitializationError(
@@ -2979,6 +2991,7 @@ class AgentClient extends BaseClient {
           if (primaryError && !terminalFallbackError) {
             throw primaryError;
           }
+          /* === VIVENTIUM END === */
         } else {
           fallbackAttempted = true;
           const primaryProvider =
@@ -3423,6 +3436,12 @@ class AgentClient extends BaseClient {
               );
             }
           }
+          /* === VIVENTIUM START ===
+           * Feature: Visible/canonical callback repair.
+           * Purpose: After repairing a mismatch between streamed visible text and persisted
+           * canonical text, suppress a secondary follow-up so users do not receive duplicate
+           * callback responses.
+           */
           if (
             req?._viventiumVisibleDeltaAggregationRepaired === true &&
             !effectiveShouldDeferMainResponse &&
@@ -3441,6 +3460,7 @@ class AgentClient extends BaseClient {
             await finalizeCanonicalParent();
             return null;
           }
+          /* === VIVENTIUM END === */
           const followUpMessage = await createCortexFollowUpMessage({
             req,
             conversationId,

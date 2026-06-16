@@ -69,6 +69,7 @@ function toPublicCallback(message) {
   const metadata = message?.metadata?.viventium || {};
   return {
     messageId: message?.messageId,
+    callbackId: metadata.callbackId || null,
     text: textOf(message),
     event: metadata.event || null,
     surface: metadata.surface || null,

@@ -971,7 +971,7 @@ describe('/api/viventium/telegram', () => {
     expect(res.body.latest.text).toBe('The invoice check is done.');
     expect(res.body.latest.workerId).toBeUndefined();
     expect(res.body.latest.runId).toBeUndefined();
-    expect(res.body.latest.callbackId).toBeUndefined();
+    expect(res.body.latest.callbackId).toBe('cb-telegram-1');
     expect(mockGetMessages).toHaveBeenCalledWith({
       user: 'user_1',
       conversationId: 'conv-1',

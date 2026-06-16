@@ -19,20 +19,8 @@ config:
         brew_begin_tag: <!--viv_internal:brew_begin-->
       activation_subject_rule:
         enabled: true
-        prompt: |-
-          Judge activation only for the latest human/user message shown in "Latest User Intent".
-
-          Use earlier "Recent Conversation" turns only to resolve references in that latest message.
-
-          Never activate only because an older user request appears in history; that older request was already handled by its own turn.
-
-          Before deciding, ask: "Does LatestUserMessage itself ask this cortex to do work, or does it explicitly refer to continuing that same work?"
-
-          If LatestUserMessage is only a simple reply, acknowledgement, test instruction, correction, thanks, provider clarification, or output-only instruction, return should_activate=false unless that latest message itself meets this cortex's activation criteria.
-
-          Output-only instructions include requests to reply with exact text, markers, labels, acknowledgements, confirmations, or test tokens. Older history cannot turn an output-only latest message into a new activation.
-
-          Ignore activation words that appear only in Recent Conversation. Words such as red-team, pressure-test, challenge, plan, launch, pattern, strategy, or bias count only when they appear in LatestUserMessage or when LatestUserMessage explicitly refers back to them.
+        prompt:
+          promptRef: cortex.background_activation_decision_subject
       activation_policy:
         enabled: true
         prompt: |
@@ -434,6 +422,8 @@ mainAgent:
         prompt: |-
           Activate when assumptions, overconfidence, or unquestioned plans need scrutiny.
 
+          Required positive gate: activate only when the latest user message contains a concrete claim, plan, conclusion, or assumption that could be biased or under-evidenced.
+
           ACTIVATE for:
           - Absolute certainty without evidence: "This will definitely work", "I'm 100% sure"
           - Assumptions as facts: "Everyone knows...", "It's obvious that..."
@@ -444,6 +434,7 @@ mainAgent:
 
           DO NOT ACTIVATE for:
           - Questions
+          - Routine status checks, "check everything", "what is the state of everything", live-data gathering, inbox/workspace checks, worker status, browser status, or runtime status
           - Admitting uncertainty ("I don't know", "I'm not sure")
           - Normal everyday conversation
           - Opinions stated as opinions
@@ -721,6 +712,8 @@ mainAgent:
         prompt: |-
           Activate when the user needs help using Viventium or asks how-to questions.
 
+          Required positive gate: activate only when the latest user message explicitly asks how to use Viventium itself, asks about Viventium behavior, or says Viventium failed or behaved a certain way.
+
           ACTIVATE for:
           - "How do I...", "How can I...", "Where do I find...", "Can you help me with..."
           - Questions about conversations, voice, agents, integrations, scheduling, or settings
@@ -728,6 +721,7 @@ mainAgent:
           - Confusion or frustration that suggests they need guidance
 
           DO NOT ACTIVATE for:
+          - Broad status checks, "check everything", "what is the state of everything", live-data gathering, developer/operator diagnostics, background-agent errors, model picker availability, or using Viventium to do work rather than asking how to use Viventium
           - Normal conversation or task execution
           - Questions about the world, facts, or the user's own content (not product help)
           - Tool calls, scheduling requests, or memory queries
@@ -932,10 +926,10 @@ backgroundAgents:
     voice_llm_model: null
     voice_llm_provider: null
     voice_llm_model_parameters: {}
-    fallback_llm_model: gpt-5.4
-    fallback_llm_provider: openAI
+    fallback_llm_model: grok-4.3
+    fallback_llm_provider: xai
     fallback_llm_model_parameters:
-      model: gpt-5.4
+      model: grok-4.3
     agent_ids: []
     edges: []
     conversation_starters: []

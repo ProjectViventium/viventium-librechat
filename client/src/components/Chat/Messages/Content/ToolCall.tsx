@@ -71,7 +71,10 @@ function safeGlassHiveText(value: unknown, maxLength = 240) {
   }
   const cleaned = text
     .replace(/https?:\/\/[^\s<>)]+/gi, '[link]')
-    .replace(/(?:\/Users|\/home|\/private\/var|\/var\/folders|\/tmp)\/[^\s`'"<>]+/g, '<local path>');
+    .replace(
+      /(?:\/Users|\/home|\/private\/var|\/var\/folders|\/tmp)\/[^\s`'"<>]+/g,
+      '<local path>',
+    );
   return cleaned.length > maxLength ? `${cleaned.slice(0, maxLength - 1).trimEnd()}...` : cleaned;
 }
 
@@ -134,7 +137,9 @@ function glassHiveArtifactLabels(value: unknown): string[] {
         return '';
       }
       const record = item as Record<string, unknown>;
-      return safeGlassHiveFileLabel(record.label ?? record.name ?? record.path ?? record.workspace_path);
+      return safeGlassHiveFileLabel(
+        record.label ?? record.name ?? record.path ?? record.workspace_path,
+      );
     })
     .filter(Boolean)
     .slice(0, 3);

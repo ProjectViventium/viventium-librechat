@@ -398,9 +398,8 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
       if (repaired) {
         sanitizeAggregatedContentParts(contentParts);
         req._viventiumVisibleDeltaAggregationRepaired = true;
-        req._viventiumVisibleDeltaAggregationRecoveredText = extractVisibleTextFromContentParts(
-          contentParts,
-        );
+        req._viventiumVisibleDeltaAggregationRecoveredText =
+          extractVisibleTextFromContentParts(contentParts);
         if (!req._viventiumVisibleDeltaAggregationRepairLogged) {
           req._viventiumVisibleDeltaAggregationRepairLogged = true;
           logger.warn(

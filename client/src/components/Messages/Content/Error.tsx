@@ -41,6 +41,7 @@ type TGenericError = {
  * Purpose: Give users a one-click path to request additional credits from chat errors.
  * === VIVENTIUM END === */
 function TokenBalanceAction({ json }: { json: TTokenBalance }) {
+  const localize = useLocalize();
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [feedback, setFeedback] = useState('');
@@ -56,12 +57,16 @@ function TokenBalanceAction({ json }: { json: TTokenBalance }) {
       });
       const body = await response.json().catch(() => ({}));
       if (!response.ok || body?.success === false) {
-        throw new Error(body?.message || 'Could not submit your credits request.');
+        throw new Error(body?.message || localize('com_error_credits_request_submit_failed'));
       }
-      setFeedback(body?.message || "Thank you! We've received your request and will review it shortly.");
+      setFeedback(body?.message || localize('com_error_credits_request_success'));
       setIsModalOpen(false);
     } catch (error) {
-      setFeedback(error instanceof Error ? error.message : 'Could not submit your credits request.');
+      setFeedback(
+        error instanceof Error
+          ? error.message
+          : localize('com_error_credits_request_submit_failed'),
+      );
     } finally {
       setIsSubmitting(false);
     }
@@ -69,7 +74,11 @@ function TokenBalanceAction({ json }: { json: TTokenBalance }) {
 
   return (
     <>
-      {`You've used all your monthly credits. Current balance: ${balance}. Prompt tokens: ${promptTokens}. Cost: ${tokenCost}.`}
+      {localize('com_error_credits_exhausted', {
+        0: String(balance),
+        1: String(promptTokens),
+        2: String(tokenCost),
+      })}
       <br />
       <br />
       <button
@@ -77,7 +86,7 @@ function TokenBalanceAction({ json }: { json: TTokenBalance }) {
         className="rounded bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-500"
         onClick={() => setIsModalOpen(true)}
       >
-        Request More Credits
+        {localize('com_error_credits_request_button')}
       </button>
       {feedback ? (
         <>
@@ -88,10 +97,7 @@ function TokenBalanceAction({ json }: { json: TTokenBalance }) {
       ) : null}
       {isModalOpen ? (
         <div className="mt-3 rounded border border-gray-300 bg-white p-3 text-black dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100">
-          <p className="mb-3 text-sm">
-            Send a request for additional credits to the Viventium team. We will review it and get
-            back to you shortly.
-          </p>
+          <p className="mb-3 text-sm">{localize('com_error_credits_request_description')}</p>
           <div className="flex gap-2">
             <button
               type="button"
@@ -99,7 +105,7 @@ function TokenBalanceAction({ json }: { json: TTokenBalance }) {
               onClick={submitCreditsRequest}
               disabled={isSubmitting}
             >
-              {isSubmitting ? 'Submitting...' : 'Confirm Request'}
+              {isSubmitting ? localize('com_ui_submit') : localize('com_ui_confirm')}
             </button>
             <button
               type="button"
@@ -107,7 +113,7 @@ function TokenBalanceAction({ json }: { json: TTokenBalance }) {
               onClick={() => setIsModalOpen(false)}
               disabled={isSubmitting}
             >
-              Cancel
+              {localize('com_ui_cancel')}
             </button>
           </div>
         </div>

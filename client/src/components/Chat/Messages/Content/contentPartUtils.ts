@@ -14,12 +14,12 @@ type FilterRenderableContentPartsOptions = {
   visibleFallbackText?: string | null;
 };
 
-const RAW_TOOL_TRANSCRIPT_LINE_RE = /^\s*Tool:\s+(.*)$/i;
 /* === VIVENTIUM START ===
  * Feature: User-facing GlassHive plumbing hygiene.
  * Purpose: Strip accidental raw GlassHive tool transcripts from assistant text while preserving
  * normal examples and visible product-language tool rows.
  * === VIVENTIUM END === */
+const RAW_TOOL_TRANSCRIPT_LINE_RE = /^\s*Tool:\s+(.*)$/i;
 const RAW_TOOL_XML_INVOKE_BLOCK_RE =
   /<(?:invoke|tool_call)\b[^>]*>[\s\S]*?<\/(?:invoke|tool_call)>/gi;
 const RAW_TOOL_JSON_FENCE_RE =

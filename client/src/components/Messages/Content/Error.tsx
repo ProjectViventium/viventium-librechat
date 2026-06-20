@@ -215,6 +215,10 @@ const Error = ({ text }: { text: string }) => {
   const defaultResponse = `Something went wrong. Here's the specific error message we encountered: ${errorMessage}`;
 
   if (!isJson(jsonString)) {
+    /* === VIVENTIUM START ===
+     * Feature: Actionable provider recovery messages.
+     * Purpose: Preserve known reconnect/fallback guidance as direct user-facing text.
+     * === VIVENTIUM END === */
     if (isActionablePlainError(errorMessage)) {
       return errorMessage;
     }

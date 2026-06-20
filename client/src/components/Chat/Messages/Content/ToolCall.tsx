@@ -411,6 +411,7 @@ export default function ToolCall({
     }
   }, [_args]) as string | undefined;
 
+  // VIVENTIUM START: show concise GlassHive tool summaries instead of raw MCP payloads.
   const glassHiveSummary = useMemo(
     () => (isGlassHiveToolCall ? summarizeGlassHiveToolOutput(output, args) : ''),
     [args, output, isGlassHiveToolCall],
@@ -423,6 +424,7 @@ export default function ToolCall({
         : (args?.length ?? 0) > 0 || (output?.length ?? 0) > 0,
     [args, output, isGlassHiveToolCall, glassHiveSummary],
   );
+  // VIVENTIUM END
 
   const authDomain = useMemo(() => {
     const authURL = auth ?? '';
@@ -552,6 +554,7 @@ export default function ToolCall({
           }}
         >
           <div ref={contentRef}>
+            {/* VIVENTIUM START: keep expanded GlassHive details concise and token-safe. */}
             {showInfo && hasInfo && (
               <ToolCallInfo
                 key="tool-call-info"
@@ -563,6 +566,7 @@ export default function ToolCall({
                 attachments={attachments}
               />
             )}
+            {/* VIVENTIUM END */}
           </div>
         </div>
       </div>

@@ -13,7 +13,7 @@ import { resolveAnthropicSubscriptionUserValues } from './oauthSubscription';
 /* === VIVENTIUM START ===
  * Feature: Connected-account credential recovery.
  * Purpose: Convert unreadable stored Anthropic credentials into reconnect guidance or safe fallback.
- * === VIVENTIUM END === */
+ */
 const ANTHROPIC_CONNECTED_ACCOUNT_RECONNECT_MESSAGE =
   'Anthropic connected account needs reconnect in Settings > Account > Connected Accounts.';
 
@@ -32,6 +32,7 @@ function anthropicConnectedAccountReconnectError(): ViventiumConnectedAccountRec
   error.viventiumConnectedAccountProvider = 'Anthropic';
   return error;
 }
+/* === VIVENTIUM END === */
 
 const isNoUserKeyError = (error: unknown): boolean => {
   if (!(error instanceof Error)) {

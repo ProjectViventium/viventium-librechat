@@ -14,7 +14,7 @@ import { resolveOpenAISubscriptionUserValues } from './oauthSubscription';
  * Feature: Connected Accounts routing policy.
  * Purpose: Attempt user credential first for OpenAI-family endpoints, then fallback to
  * platform credential when user credential is missing (while preserving invalid/expired failures).
- * === VIVENTIUM END === */
+ */
 const OPENAI_CONNECTED_ACCOUNT_RECONNECT_MESSAGE =
   'OpenAI connected account needs reconnect in Settings > Account > Connected Accounts.';
 const OPENAI_CONNECTED_ACCOUNT_REQUIRED_MESSAGE =
@@ -39,6 +39,7 @@ function openAIConnectedAccountReconnectError(): ViventiumConnectedAccountReconn
   error.viventiumConnectedAccountProvider = 'openAI';
   return error;
 }
+/* === VIVENTIUM END === */
 
 const isNoUserKeyError = (error: unknown): boolean => {
   if (!(error instanceof Error)) {
@@ -95,10 +96,7 @@ const isOpenAIConnectedAccountOAuthFailure = (error: unknown): boolean => {
 };
 
 const isConnectedAccountAuthMode = (): boolean => {
-  const values = [
-    process.env.VIVENTIUM_OPENAI_AUTH_MODE,
-    process.env.VIVENTIUM_PRIMARY_AUTH_MODE,
-  ];
+  const values = [process.env.VIVENTIUM_OPENAI_AUTH_MODE, process.env.VIVENTIUM_PRIMARY_AUTH_MODE];
 
   return values.some((value) => value?.trim().toLowerCase() === 'connected_account');
 };
@@ -296,8 +294,9 @@ export async function initializeOpenAI({
         oauthType: userValues?.oauthType ?? null,
         resolvedBaseURL: baseURL ?? null,
         useResponsesApi:
-          (typeof modelOptions.useResponsesApi === 'boolean' ? modelOptions.useResponsesApi : null) ??
-          null,
+          (typeof modelOptions.useResponsesApi === 'boolean'
+            ? modelOptions.useResponsesApi
+            : null) ?? null,
       }),
     );
   }

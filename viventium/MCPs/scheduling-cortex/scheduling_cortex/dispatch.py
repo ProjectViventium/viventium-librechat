@@ -1591,37 +1591,6 @@ def _run_scheduler_generation(
         followup_text,
         run_context,
     )
-    if date_guard.get("final", {}).get("status") == "corrected":
-        date_guard["persisted_message"] = _patch_scheduler_visible_message(
-            task,
-            base_url,
-            timeout_s,
-            response_message_id,
-            resolved_conversation_id,
-            final_text,
-            date_guard,
-        )
-    if date_guard.get("followup", {}).get("status") == "corrected":
-        if not followup_message_id and followup_text:
-            followup_state_for_patch = _poll_scheduler_followup(
-                task,
-                base_url,
-                response_message_id,
-                str(task.get("user_id") or ""),
-                resolved_conversation_id,
-                secret,
-                timeout_s,
-            )
-            followup_message_id = str(followup_state_for_patch.get("followup_message_id") or "").strip()
-        date_guard["persisted_followup_message"] = _patch_scheduler_visible_message(
-            task,
-            base_url,
-            timeout_s,
-            followup_message_id,
-            resolved_conversation_id,
-            followup_text,
-            date_guard,
-        )
 
     return {
         "conversation_id": resolved_conversation_id,
@@ -1635,55 +1604,6 @@ def _run_scheduler_generation(
         "followup_text_fallback_reason": followup_text_fallback_reason,
         "suppressed_fallback_reason": suppressed_fallback_reason,
         "date_guard": date_guard,
-    }
-
-
-def _patch_scheduler_visible_message(
-    task: Dict[str, Any],
-    base_url: str,
-    timeout_s: int,
-    message_id: Optional[str],
-    conversation_id: str,
-    text: str,
-    date_guard: Dict[str, Any],
-) -> Dict[str, Any]:
-    clean_message_id = str(message_id or "").strip()
-    if not clean_message_id:
-        raise RuntimeError("Scheduler date guard corrected generated text but message id is missing")
-    clean_text = str(text or "")
-    if not clean_text.strip():
-        raise RuntimeError("Scheduler date guard corrected generated text but corrected text is empty")
-    secret = (
-        os.getenv("SCHEDULER_LIBRECHAT_SECRET")
-        or os.getenv("VIVENTIUM_SCHEDULER_SECRET")
-        or ""
-    )
-    if not secret:
-        raise RuntimeError(
-            "SCHEDULER_LIBRECHAT_SECRET or VIVENTIUM_SCHEDULER_SECRET is required for scheduler dispatch"
-        )
-    headers = {
-        "Content-Type": "application/json",
-        "X-VIVENTIUM-SCHEDULER-SECRET": secret,
-    }
-    response = _post_json(
-        f"{base_url}/api/viventium/scheduler/message/patch",
-        {
-            "userId": task.get("user_id"),
-            "conversationId": conversation_id,
-            "messageId": clean_message_id,
-            "scheduleId": task.get("id"),
-            "text": clean_text,
-            "dateGuard": date_guard,
-        },
-        headers,
-        timeout_s,
-    )
-    return {
-        "status": str(response.get("status") or "patched"),
-        "message_id": str(response.get("messageId") or clean_message_id),
-        "conversation_id": str(response.get("conversationId") or conversation_id or ""),
-        "content_patched": bool(response.get("contentPatched")),
     }
 
 

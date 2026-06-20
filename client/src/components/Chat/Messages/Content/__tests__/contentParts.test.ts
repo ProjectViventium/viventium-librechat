@@ -567,6 +567,36 @@ describe('filterRenderableContentParts', () => {
     expect(filterRenderableContentParts(parts)).toBe(parts);
   });
 
+  it('collapses consecutive GlassHive launch retries to the latest user-facing row', () => {
+    const parts: TMessageContentParts[] = [
+      {
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: 'toolu_workspace_launch_host_failed',
+          name: `workspace_launch${Constants.mcp_delimiter}glasshive-workers-projects`,
+          args: '{"execution_mode":"host"}',
+          type: ToolCallTypes.TOOL_CALL,
+          progress: 1,
+          output: 'Error executing tool workspace_launch: host-native GlassHive workers are disabled',
+        },
+      },
+      {
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: 'toolu_workspace_launch_workspace_dispatched',
+          name: `workspace_launch${Constants.mcp_delimiter}glasshive-workers-projects`,
+          args: '{"execution_mode":"docker"}',
+          type: ToolCallTypes.TOOL_CALL,
+          progress: 1,
+          output: '{"status":"dispatched","view_steer_url":"https://example.com/watch/public-safe"}',
+        },
+      },
+      { type: ContentTypes.TEXT, text: 'Started in GlassHive.' },
+    ];
+
+    expect(filterRenderableContentParts(parts)).toEqual([parts[1], parts[2]]);
+  });
+
   it('keeps distinct same-name GlassHive tool calls inspectable', () => {
     const parts: TMessageContentParts[] = [
       {

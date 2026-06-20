@@ -1,4 +1,5 @@
 import React from 'react';
+import { sanitizeLiveAnnouncementText } from './sanitizeLiveAnnouncementText';
 
 const offScreenStyle: React.CSSProperties = {
   border: 0,
@@ -19,7 +20,11 @@ interface MessageBlockProps {
 
 const MessageBlock: React.FC<MessageBlockProps> = ({ message, 'aria-live': ariaLive }) => (
   <div style={offScreenStyle} role="log" aria-live={ariaLive}>
-    {message}
+    {/* === VIVENTIUM START ===
+     * Feature: User-facing GlassHive signed-link hygiene.
+     * Purpose: Offscreen log text is user-facing for privacy; strip signed links/tokens.
+     * === VIVENTIUM END === */}
+    {sanitizeLiveAnnouncementText(message)}
   </div>
 );
 

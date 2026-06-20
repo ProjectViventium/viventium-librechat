@@ -57,6 +57,15 @@ const GLASSHIVE_RAW_TOOL_NAMES = new Set([
 ]);
 const GLASSHIVE_RAW_TOOL_TOKEN_RE = /\b[A-Za-z0-9_.-]+\b/g;
 const GLASSHIVE_MCP_SERVER_TOKEN = '_mcp_glasshive-workers-projects';
+/* === VIVENTIUM START ===
+ * Feature: User-facing GlassHive tool-row hygiene.
+ * Purpose: Collapse retry/replay rows for high-level launch tools even when retry ids differ.
+ * === VIVENTIUM END === */
+const COLLAPSIBLE_GLASSHIVE_TOOL_NAMES = new Set([
+  'workspace_launch',
+  'workspace_schedule',
+  'worker_delegate_once',
+]);
 
 function textContentPart(text: string): TMessageContentParts {
   return {
@@ -413,11 +422,18 @@ function collapseConsecutiveGlassHiveToolCalls(
       typeof previousToolCallId === 'string' &&
       previousToolCallId.length > 0 &&
       currentToolCallId !== previousToolCallId;
+    const currentIsCollapsibleLaunchTool =
+      currentGlassHiveToolName != null &&
+      COLLAPSIBLE_GLASSHIVE_TOOL_NAMES.has(currentGlassHiveToolName);
+    /* === VIVENTIUM START ===
+     * Feature: User-facing GlassHive tool-row hygiene.
+     * Purpose: Keep one concise launch/schedule/delegate row visible across retry ids.
+     * === VIVENTIUM END === */
     if (
       currentGlassHiveToolName != null &&
       previousGlassHiveToolName != null &&
       currentGlassHiveToolName === previousGlassHiveToolName &&
-      !hasDistinctToolCallIds
+      (currentIsCollapsibleLaunchTool || !hasDistinctToolCallIds)
     ) {
       collapsed[collapsed.length - 1] = part;
       changed = true;

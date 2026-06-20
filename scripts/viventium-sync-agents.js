@@ -81,6 +81,7 @@ const KNOWN_RUNTIME_PLACEHOLDERS = new Set([
   'current_date',
   'current_datetime',
   'glasshive_worker_capability_summary',
+  'glasshive_worker_execution_instruction',
   'iso_datetime',
 ]);
 const NON_RUNTIME_OWNER_EMAILS = new Set([

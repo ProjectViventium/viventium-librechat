@@ -227,6 +227,7 @@ function isRecoverableFallbackErrorClass(value) {
     'recoverable_provider_error',
     'provider_unauthorized',
     'provider_access_denied',
+    'provider_connected_account_reconnect_required',
     'late_stream_termination',
   ].includes(normalized);
 }

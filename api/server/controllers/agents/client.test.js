@@ -206,6 +206,35 @@ describe('late completion error content parts', () => {
     });
   });
 
+  test('surfaces connected-account reconnect guidance before generic provider classes', () => {
+    const error = new Error(
+      'OpenAI connected account needs reconnect in Settings > Account > Connected Accounts.',
+    );
+    error.status = 401;
+    error.code = 'MODEL_AUTHENTICATION';
+    error.viventiumConnectedAccountReconnectRequired = true;
+    error.viventiumConnectedAccountProvider = 'openAI';
+
+    expect(AgentClient.createCompletionErrorContentPart(error)).toEqual({
+      type: ContentTypes.ERROR,
+      [ContentTypes.ERROR]:
+        'OpenAI connected account needs reconnect in Settings > Account > Connected Accounts. Reconnect OpenAI, then try again.',
+      error_class: 'provider_connected_account_reconnect_required',
+    });
+  });
+
+  test('does not infer connected-account reconnect from model authentication code alone', () => {
+    const error = new Error('Model authentication failed.');
+    error.status = 401;
+    error.code = 'MODEL_AUTHENTICATION';
+
+    expect(AgentClient.createCompletionErrorContentPart(error)).toEqual({
+      type: ContentTypes.ERROR,
+      [ContentTypes.ERROR]: 'The model provider credentials were rejected.',
+      error_class: 'provider_unauthorized',
+    });
+  });
+
   test('does not mutate content parts for late stream termination after assistant text', () => {
     const textPart = { type: ContentTypes.TEXT, text: 'Partial but visible answer.' };
     const contentParts = [textPart];
@@ -3127,6 +3156,70 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     );
   });
 
+  test('suppresses Phase B synthesis when visible text was repaired from emitted deltas', async () => {
+    const phaseB = deferred();
+    const pendingCortexParts = [
+      {
+        type: ContentTypes.CORTEX_INSIGHT,
+        cortex_id: 'agent-background',
+        cortex_name: 'Background',
+        status: 'complete',
+        insight: 'Background result.',
+      },
+    ];
+    req._viventiumVisibleDeltaAggregationRepaired = true;
+    client.contentParts.push({ type: ContentTypes.TEXT, text: 'Already visible answer.' });
+
+    const attached = client.attachBackgroundCortexCompletionPipeline({
+      cortexExecutionPromise: phaseB.promise,
+      pendingCortexParts,
+      req,
+      conversationId: 'conv-1',
+      responseMessageId: 'resp-1',
+      agent: primaryAgent,
+      getResponseContentParts: () => client.contentParts,
+      responseController: { lastUserInputTime: 10 },
+      turnUserInputTime: 10,
+      followupGraceMs: 0,
+      shouldDeferMainResponse: false,
+      getActivatedCorticesList: () => [{ agentId: 'agent-background' }],
+    });
+
+    phaseB.resolve({
+      insights: [{ cortexName: 'Background', insight: 'Background result.' }],
+      mergedPrompt: 'Background result.',
+      cortexCount: 1,
+    });
+    await attached;
+
+    expect(mockPersistCortexPartsToCanonicalMessage).toHaveBeenCalledWith({
+      req,
+      responseMessageId: 'resp-1',
+      cortexParts: pendingCortexParts,
+    });
+    expect(mockCreateCortexFollowUpMessage).not.toHaveBeenCalled();
+    expect(mockBuildFollowUpDecisionRecord).toHaveBeenCalledWith(
+      expect.objectContaining({
+        parentMessageId: 'resp-1',
+        decision: expect.objectContaining({
+          result: 'suppressed',
+          selectedStrategy: 'visible_primary_recovered_suppressed',
+          suppressionReason: 'visible_delta_aggregation_repaired',
+        }),
+        recentResponseResolution: {
+          source: 'runtime_content_parts',
+          text: 'Already visible answer.',
+        },
+      }),
+    );
+    expect(mockPersistFollowUpDecisionToParentMessage).toHaveBeenCalledTimes(1);
+    expect(mockFinalizeCanonicalCortexMessage).toHaveBeenCalledWith({
+      req,
+      messageId: 'resp-1',
+    });
+    expect(mockEmitChunk).not.toHaveBeenCalled();
+  });
+
   test('emits promoted forced Phase B text on the canonical parent without self-parenting', async () => {
     const phaseB = deferred();
     const pendingCortexParts = [
@@ -3543,6 +3636,43 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     expect(result.completion).toEqual([{ type: ContentTypes.TEXT, text: 'Fallback answer.' }]);
   });
 
+  test('replaces stale primary rate-limit part when lazy fallback needs reconnect', async () => {
+    const fallbackError = new Error(
+      'OpenAI connected account needs reconnect in Settings > Account > Connected Accounts.',
+    );
+    fallbackError.status = 401;
+    fallbackError.code = 'MODEL_AUTHENTICATION';
+    fallbackError.viventiumConnectedAccountReconnectRequired = true;
+    fallbackError.viventiumConnectedAccountProvider = 'openAI';
+    fallbackError.viventiumFallbackProvider = 'openAI';
+    fallbackError.viventiumFallbackModel = 'gpt-5.4';
+    primaryAgent.viventiumFallbackLlmInitializer = jest.fn(async () => {
+      primaryAgent.viventiumFallbackLlmInitializationError = fallbackError;
+      return null;
+    });
+    client.chatCompletion = jest.fn(async () => {
+      client.contentParts.push({
+        type: ContentTypes.ERROR,
+        [ContentTypes.ERROR]:
+          'The model provider rate-limited this request. Please try again shortly.',
+        error_class: 'provider_rate_limited',
+      });
+    });
+
+    const result = await client.sendCompletion({ text: 'hello' });
+
+    expect(primaryAgent.viventiumFallbackLlmInitializer).toHaveBeenCalledTimes(1);
+    expect(client.chatCompletion).toHaveBeenCalledTimes(1);
+    expect(result.completion).toEqual([
+      {
+        type: ContentTypes.ERROR,
+        [ContentTypes.ERROR]:
+          'The primary model provider was rate-limited, and the configured fallback model could not start because OpenAI connected account needs reconnect in Settings > Account > Connected Accounts. Reconnect OpenAI, then try again.',
+        error_class: 'provider_connected_account_reconnect_required',
+      },
+    ]);
+  });
+
   test('allows fallback chatCompletion to run background cortices when primary never started Phase B', async () => {
     const fallbackAgent = {
       id: 'agent-fallback',
@@ -3623,6 +3753,8 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
         const error = new Error('Anthropic connected account needs reconnect.');
         error.status = 401;
         error.code = 'MODEL_AUTHENTICATION';
+        error.viventiumConnectedAccountReconnectRequired = true;
+        error.viventiumConnectedAccountProvider = 'Anthropic';
         throw error;
       }
       client.contentParts.push({ type: ContentTypes.TEXT, text: 'Fallback answer after auth.' });

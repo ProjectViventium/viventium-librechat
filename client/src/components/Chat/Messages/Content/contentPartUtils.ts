@@ -14,6 +14,59 @@ type FilterRenderableContentPartsOptions = {
   visibleFallbackText?: string | null;
 };
 
+/* === VIVENTIUM START ===
+ * Feature: User-facing GlassHive plumbing hygiene.
+ * Purpose: Strip accidental raw GlassHive tool transcripts from assistant text while preserving
+ * normal examples and visible product-language tool rows.
+ * === VIVENTIUM END === */
+const RAW_TOOL_TRANSCRIPT_LINE_RE = /^\s*Tool:\s+(.*)$/i;
+const RAW_TOOL_XML_INVOKE_BLOCK_RE =
+  /<(?:invoke|tool_call)\b[^>]*>[\s\S]*?<\/(?:invoke|tool_call)>/gi;
+const RAW_TOOL_JSON_FENCE_RE =
+  /```(?:json|tool|tool_call)?\s*\n\s*\{[\s\S]*?"(?:tool_call|tool|arguments|args)"[\s\S]*?\}\s*```/gi;
+const GLASSHIVE_RAW_TOOL_NAMES = new Set([
+  'workspace_launch',
+  'workspace_schedule',
+  'workspace_status',
+  'workspace_wait',
+  'workspace_continue',
+  'workspace_pause',
+  'workspace_resume',
+  'workspace_terminate',
+  'worker_delegate_once',
+  'worker_create',
+  'worker_find_or_resume',
+  'worker_get',
+  'worker_live',
+  'worker_run',
+  'worker_message',
+  'worker_pause',
+  'worker_resume',
+  'worker_interrupt',
+  'worker_terminate',
+  'worker_desktop_action',
+  'worker_takeover',
+  'run_get',
+  'projects_list',
+  'workers_list',
+  'workspace_artifacts',
+  'workspace_artifact_download',
+  'workspace_preferences_get',
+  'workspace_preferences_set',
+  'metrics_summary',
+]);
+const GLASSHIVE_RAW_TOOL_TOKEN_RE = /\b[A-Za-z0-9_.-]+\b/g;
+const GLASSHIVE_MCP_SERVER_TOKEN = '_mcp_glasshive-workers-projects';
+/* === VIVENTIUM START ===
+ * Feature: User-facing GlassHive tool-row hygiene.
+ * Purpose: Collapse retry/replay rows for high-level launch tools even when retry ids differ.
+ * === VIVENTIUM END === */
+const COLLAPSIBLE_GLASSHIVE_TOOL_NAMES = new Set([
+  'workspace_launch',
+  'workspace_schedule',
+  'worker_delegate_once',
+]);
+
 function textContentPart(text: string): TMessageContentParts {
   return {
     type: ContentTypes.TEXT,
@@ -123,61 +176,6 @@ function glassHiveToolName(part: TMessageContentParts | undefined): string | und
   return serverName === GLASSHIVE_MCP_SERVER_NAME ? toolName : undefined;
 }
 
-function toolCallOutput(part: TMessageContentParts | undefined): string {
-  if (part?.type !== ContentTypes.TOOL_CALL) {
-    return '';
-  }
-  const toolCall = part[ContentTypes.TOOL_CALL] as Agents.ToolCall | undefined;
-  return typeof toolCall?.output === 'string' ? toolCall.output : '';
-}
-
-function parseJsonObject(value: string): Record<string, unknown> | undefined {
-  try {
-    const parsed = JSON.parse(value);
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : undefined;
-  } catch (_error) {
-    return undefined;
-  }
-}
-
-function parseGlassHiveToolOutput(part: TMessageContentParts | undefined): Record<string, unknown> {
-  const direct = parseJsonObject(toolCallOutput(part).trim());
-  if (direct) {
-    return direct;
-  }
-
-  try {
-    const wrapped = JSON.parse(toolCallOutput(part).trim());
-    if (!Array.isArray(wrapped)) {
-      return {};
-    }
-    for (const entry of wrapped) {
-      const text = (entry as { text?: unknown })?.text;
-      if (typeof text !== 'string') {
-        continue;
-      }
-      const parsedText = parseJsonObject(text.trim());
-      if (parsedText) {
-        return parsedText;
-      }
-    }
-  } catch (_error) {
-    return {};
-  }
-
-  return {};
-}
-
-function isRoutineGlassHiveDelegatePart(part: TMessageContentParts | undefined): boolean {
-  if (glassHiveToolName(part) !== 'worker_delegate_once') {
-    return false;
-  }
-  const output = parseGlassHiveToolOutput(part);
-  return output.status === 'dispatched' && output.callback_ready === true;
-}
-
 const RUNTIME_HOLD_TEXT_FLAG = 'viventium_runtime_hold';
 const LATE_STREAM_TERMINATION_FLAG = 'viventium_late_stream_termination';
 const RECOVERABLE_PROVIDER_ERROR_CLASSES = new Set([
@@ -196,6 +194,86 @@ function textPartValue(part: TMessageContentParts | undefined): string {
   }
   const textValue = (part as unknown as { text?: { value?: unknown } }).text?.value;
   return typeof textValue === 'string' ? textValue : '';
+}
+
+function sanitizeRawToolTranscriptText(value: string): string {
+  if (!value) {
+    return '';
+  }
+  let cleaned = value;
+  cleaned = stripRawToolTranscriptLines(cleaned);
+  cleaned = cleaned.replace(RAW_TOOL_XML_INVOKE_BLOCK_RE, (block) =>
+    containsGlassHiveRawToolName(block) ? '' : block,
+  );
+  cleaned = cleaned.replace(RAW_TOOL_JSON_FENCE_RE, (block) =>
+    containsGlassHiveRawToolName(block) ? '' : block,
+  );
+  if (cleaned === value) {
+    return value;
+  }
+  return cleaned
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{2,}/g, '\n')
+    .trim();
+}
+
+function containsGlassHiveRawToolName(value: string): boolean {
+  const lower = value.toLowerCase();
+  if (lower.includes(GLASSHIVE_MCP_SERVER_TOKEN)) {
+    return true;
+  }
+  GLASSHIVE_RAW_TOOL_TOKEN_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = GLASSHIVE_RAW_TOOL_TOKEN_RE.exec(value)) != null) {
+    if (GLASSHIVE_RAW_TOOL_NAMES.has(match[0].toLowerCase())) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function stripRawToolTranscriptLines(value: string): string {
+  const segments = value.match(/[^\r\n]*(?:\r?\n|$)/g) ?? [];
+  const kept: string[] = [];
+  for (const segment of segments) {
+    if (!segment) {
+      continue;
+    }
+    const newline = segment.match(/\r?\n$/)?.[0] ?? '';
+    const line = newline ? segment.slice(0, -newline.length) : segment;
+    const match = RAW_TOOL_TRANSCRIPT_LINE_RE.exec(line);
+    if (match && containsGlassHiveRawToolName(match[1] ?? '')) {
+      continue;
+    }
+    kept.push(segment);
+  }
+  return kept.join('');
+}
+
+function sanitizeRawToolTranscriptTextParts(
+  content: Array<TMessageContentParts | undefined>,
+): Array<TMessageContentParts | undefined> {
+  let changed = false;
+  const sanitized = content.map((part) => {
+    const text = plainTextPartValue(part);
+    if (text == null || !part) {
+      return part;
+    }
+    const cleaned = sanitizeRawToolTranscriptText(text);
+    if (cleaned === text) {
+      return part;
+    }
+    changed = true;
+    if (!cleaned.trim()) {
+      return undefined;
+    }
+    return {
+      ...part,
+      text: cleaned,
+      [ContentTypes.TEXT]: cleaned,
+    } as TMessageContentParts;
+  });
+  return changed ? sanitized : content;
 }
 
 function errorPartValue(part: TMessageContentParts | undefined): string {
@@ -324,22 +402,6 @@ function hideRuntimeHoldNoResponseParts(
   return changed ? filtered : content;
 }
 
-function hideRoutineGlassHiveDelegateParts(
-  content: Array<TMessageContentParts | undefined>,
-): Array<TMessageContentParts | undefined> {
-  if (!hasVisibleAssistantTextPart(content)) {
-    return content;
-  }
-
-  let changed = false;
-  const filtered = content.filter((part) => {
-    const keep = !isRoutineGlassHiveDelegatePart(part);
-    changed ||= !keep;
-    return keep;
-  });
-  return changed ? filtered : content;
-}
-
 function collapseConsecutiveGlassHiveToolCalls(
   content: Array<TMessageContentParts | undefined>,
 ): Array<TMessageContentParts | undefined> {
@@ -360,11 +422,18 @@ function collapseConsecutiveGlassHiveToolCalls(
       typeof previousToolCallId === 'string' &&
       previousToolCallId.length > 0 &&
       currentToolCallId !== previousToolCallId;
+    const currentIsCollapsibleLaunchTool =
+      currentGlassHiveToolName != null &&
+      COLLAPSIBLE_GLASSHIVE_TOOL_NAMES.has(currentGlassHiveToolName);
+    /* === VIVENTIUM START ===
+     * Feature: User-facing GlassHive tool-row hygiene.
+     * Purpose: Keep one concise launch/schedule/delegate row visible across retry ids.
+     * === VIVENTIUM END === */
     if (
       currentGlassHiveToolName != null &&
       previousGlassHiveToolName != null &&
       currentGlassHiveToolName === previousGlassHiveToolName &&
-      !hasDistinctToolCallIds
+      (currentIsCollapsibleLaunchTool || !hasDistinctToolCallIds)
     ) {
       collapsed[collapsed.length - 1] = part;
       changed = true;
@@ -413,7 +482,11 @@ export function filterRenderableContentParts(
   });
 
   const deduped = removedAny ? filtered : normalizedContent;
-  const withoutLateTerminationError = hideLateTerminationErrorAfterText(deduped, options);
+  const withoutRawToolTranscriptText = sanitizeRawToolTranscriptTextParts(deduped);
+  const withoutLateTerminationError = hideLateTerminationErrorAfterText(
+    withoutRawToolTranscriptText,
+    options,
+  );
   const withoutRecoverableProviderErrors = hideRecoverableProviderErrorsAfterText(
     withoutLateTerminationError,
     options,
@@ -421,10 +494,7 @@ export function filterRenderableContentParts(
   const withoutRuntimeHoldNoResponse = hideRuntimeHoldNoResponseParts(
     withoutRecoverableProviderErrors,
   );
-  const withoutRoutineGlassHiveDelegate = hideRoutineGlassHiveDelegateParts(
-    withoutRuntimeHoldNoResponse,
-  );
-  const collapsed = collapseConsecutiveGlassHiveToolCalls(withoutRoutineGlassHiveDelegate);
+  const collapsed = collapseConsecutiveGlassHiveToolCalls(withoutRuntimeHoldNoResponse);
   return mergeAdjacentTextParts(collapsed);
 }
 

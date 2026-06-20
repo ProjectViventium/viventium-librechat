@@ -948,6 +948,7 @@ describe('/api/viventium/telegram', () => {
           viventium: {
             type: 'glasshive_worker_callback',
             anchorMessageId: 'assistant-msg-1',
+            callbackId: 'cb-telegram-1',
             workerId: 'wrk-1',
             runId: 'run-1',
             event: 'run.completed',
@@ -970,7 +971,7 @@ describe('/api/viventium/telegram', () => {
     expect(res.body.latest.text).toBe('The invoice check is done.');
     expect(res.body.latest.workerId).toBeUndefined();
     expect(res.body.latest.runId).toBeUndefined();
-    expect(res.body.latest.callbackId).toBeUndefined();
+    expect(res.body.latest.callbackId).toBe('cb-telegram-1');
     expect(mockGetMessages).toHaveBeenCalledWith({
       user: 'user_1',
       conversationId: 'conv-1',

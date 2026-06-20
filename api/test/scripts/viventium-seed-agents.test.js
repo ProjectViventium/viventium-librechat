@@ -54,7 +54,7 @@ describe('viventium-seed-agents', () => {
       env: {
         VIVENTIUM_AGENT_SEED_OWNER_EMAIL: 'seed-owner@example.com',
         VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER: 'anthropic',
-        VIVENTIUM_FC_CONSCIOUS_LLM_MODEL: 'claude-opus-4-7',
+        VIVENTIUM_FC_CONSCIOUS_LLM_MODEL: 'claude-opus-4-8',
         VIVENTIUM_CORTEX_PRODUCTIVITY_LLM_PROVIDER: 'anthropic',
         VIVENTIUM_CORTEX_PRODUCTIVITY_LLM_MODEL: 'claude-sonnet-4-5',
         OTUC_ACTIVATION_PROVIDER: 'groq',
@@ -64,7 +64,7 @@ describe('viventium-seed-agents', () => {
 
     expect(normalized.meta.user).toEqual({ email: 'seed-owner@example.com' });
     expect(normalized.mainAgent.provider).toBe('anthropic');
-    expect(normalized.mainAgent.model).toBe('claude-opus-4-7');
+    expect(normalized.mainAgent.model).toBe('claude-opus-4-8');
     expect(normalized.mainAgent.voice_llm_provider).toBe('openAI');
     expect(normalized.mainAgent.voice_llm_model).toBe('gpt-5.4');
     expect(normalized.backgroundAgents[0].provider).toBe('anthropic');
@@ -286,18 +286,18 @@ describe('viventium-seed-agents', () => {
       env: {
         VIVENTIUM_AGENT_SEED_OWNER_EMAIL: 'seed-owner@example.com',
         VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER: 'anthropic',
-        VIVENTIUM_FC_CONSCIOUS_LLM_MODEL: 'claude-opus-4-7',
+        VIVENTIUM_FC_CONSCIOUS_LLM_MODEL: 'claude-opus-4-8',
         VIVENTIUM_CORTEX_DEEP_RESEARCH_LLM_PROVIDER: 'anthropic',
-        VIVENTIUM_CORTEX_DEEP_RESEARCH_LLM_MODEL: 'claude-opus-4-7',
+        VIVENTIUM_CORTEX_DEEP_RESEARCH_LLM_MODEL: 'claude-opus-4-8',
       },
     });
 
     expect(normalized.backgroundAgents[0]).toMatchObject({
       id: 'agent_viventium_deep_research_95aeb3',
       provider: 'anthropic',
-      model: 'claude-opus-4-7',
+      model: 'claude-opus-4-8',
       model_parameters: {
-        model: 'claude-opus-4-7',
+        model: 'claude-opus-4-8',
         thinkingBudget: 4000,
       },
     });

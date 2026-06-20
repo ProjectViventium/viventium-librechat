@@ -15,12 +15,16 @@ const express = require('express');
 const crypto = require('crypto');
 const { GenerationJobManager } = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
-const { SystemRoles } = require('librechat-data-provider');
-const { configMiddleware, validateConvoAccess, buildEndpointOption } = require('~/server/middleware');
+const { ContentTypes, SystemRoles } = require('librechat-data-provider');
+const {
+  configMiddleware,
+  validateConvoAccess,
+  buildEndpointOption,
+} = require('~/server/middleware');
 const { initializeClient } = require('~/server/services/Endpoints/agents');
 const addTitle = require('~/server/services/Endpoints/agents/title');
 const AgentController = require('~/server/controllers/agents/request');
-const { getUserById, getMessages, getConvo } = require('~/models');
+const { getUserById, getMessages, getConvo, getMessage, updateMessage } = require('~/models');
 /* === VIVENTIUM NOTE ===
  * Feature: Scheduler <-> Telegram mapping helper import.
  * === VIVENTIUM NOTE === */
@@ -171,11 +175,7 @@ async function schedulerAuth(req, res, next) {
       );
     }
     if (!secret || secret !== expected) {
-      throw createSchedulerAuthError(
-        'Unauthorized scheduler gateway',
-        401,
-        'secret_mismatch',
-      );
+      throw createSchedulerAuthError('Unauthorized scheduler gateway', 401, 'secret_mismatch');
     }
 
     if (!userId) {
@@ -216,81 +216,161 @@ async function schedulerAuth(req, res, next) {
   }
 }
 
-router.post('/chat', schedulerAuth, configMiddleware, async (req, _res, next) => {
-  const incoming = req.body ?? {};
-  const text = typeof incoming.text === 'string' ? incoming.text : '';
-  const requestedConversationId =
-    typeof incoming.conversationId === 'string' ? incoming.conversationId : 'new';
-  const requestedAgentId =
-    typeof incoming.agentId === 'string'
-      ? incoming.agentId
-      : typeof incoming.agent_id === 'string'
-        ? incoming.agent_id
-        : '';
-  const scheduleId = typeof incoming.scheduleId === 'string' ? incoming.scheduleId : '';
-  const streamId = `scheduler-${crypto.randomUUID()}`;
-  const validatedConversationId = await normalizeSchedulerConversationId({
-    conversationId: requestedConversationId,
-    userId: req.user?.id,
-  });
-  const conversationState = await resolveReusableConversationState({
-    conversationId: validatedConversationId,
-    userId: req.user?.id,
-    surface: 'scheduler',
-  });
-  const conversationId = conversationState.conversationId;
-  let parentMessageId = conversationState.parentMessageId;
-
-  const agentId = await resolveAgentId({
-    req,
-    conversationId,
-    requestedAgentId,
-    userId: req.user?.id,
-  });
-
-  if (!agentId) {
-    return _res.status(400).json({ error: 'agentId is required' });
+function patchFirstVisibleTextPart(content, text) {
+  if (!Array.isArray(content)) {
+    return null;
   }
-
-  /* === VIVENTIUM NOTE ===
-   * Feature: Sidebar parity for gateway-created conversations (title + icon).
-   * === VIVENTIUM NOTE === */
-  parentMessageId = normalizeGatewayParentMessageId({ conversationId, parentMessageId });
-  const resolvedSpec = ensureGatewaySpec({
-    req,
-    existingSpec: incoming?.spec,
-    agentId,
+  let patched = false;
+  const nextContent = content.map((part) => {
+    if (patched || !part || typeof part !== 'object') {
+      return part;
+    }
+    if (part.type !== ContentTypes.TEXT && part.type !== 'text') {
+      return part;
+    }
+    if (typeof part.text === 'string') {
+      patched = true;
+      return { ...part, text };
+    }
+    if (part.text && typeof part.text === 'object' && typeof part.text.value === 'string') {
+      patched = true;
+      return { ...part, text: { ...part.text, value: text } };
+    }
+    return part;
   });
+  return patched ? nextContent : null;
+}
 
-  req.body = {
-    ...incoming,
-    text,
-    endpoint: 'agents',
-    endpointType: 'agents',
-    conversationId,
-    parentMessageId,
-    agent_id: agentId,
-    streamId,
-    scheduleId,
-  };
-  if (resolvedSpec) {
-    req.body.spec = resolvedSpec;
+router.post(
+  '/chat',
+  schedulerAuth,
+  configMiddleware,
+  async (req, _res, next) => {
+    const incoming = req.body ?? {};
+    const text = typeof incoming.text === 'string' ? incoming.text : '';
+    const requestedConversationId =
+      typeof incoming.conversationId === 'string' ? incoming.conversationId : 'new';
+    const requestedAgentId =
+      typeof incoming.agentId === 'string'
+        ? incoming.agentId
+        : typeof incoming.agent_id === 'string'
+          ? incoming.agent_id
+          : '';
+    const scheduleId = typeof incoming.scheduleId === 'string' ? incoming.scheduleId : '';
+    const streamId = `scheduler-${crypto.randomUUID()}`;
+    const validatedConversationId = await normalizeSchedulerConversationId({
+      conversationId: requestedConversationId,
+      userId: req.user?.id,
+    });
+    const conversationState = await resolveReusableConversationState({
+      conversationId: validatedConversationId,
+      userId: req.user?.id,
+      surface: 'scheduler',
+    });
+    const conversationId = conversationState.conversationId;
+    let parentMessageId = conversationState.parentMessageId;
+
+    const agentId = await resolveAgentId({
+      req,
+      conversationId,
+      requestedAgentId,
+      userId: req.user?.id,
+    });
+
+    if (!agentId) {
+      return _res.status(400).json({ error: 'agentId is required' });
+    }
+
+    /* === VIVENTIUM NOTE ===
+     * Feature: Sidebar parity for gateway-created conversations (title + icon).
+     * === VIVENTIUM NOTE === */
+    parentMessageId = normalizeGatewayParentMessageId({ conversationId, parentMessageId });
+    const resolvedSpec = ensureGatewaySpec({
+      req,
+      existingSpec: incoming?.spec,
+      agentId,
+    });
+
+    req.body = {
+      ...incoming,
+      text,
+      endpoint: 'agents',
+      endpointType: 'agents',
+      conversationId,
+      parentMessageId,
+      agent_id: agentId,
+      streamId,
+      scheduleId,
+    };
+    if (resolvedSpec) {
+      req.body.spec = resolvedSpec;
+    }
+    /* === VIVENTIUM NOTE ===
+     * Keep scheduled runs aligned with normal LibreChat prompts by avoiding a custom surface
+     * unless the caller explicitly set one.
+     * === VIVENTIUM NOTE === */
+    if (typeof incoming.viventiumSurface === 'string' && incoming.viventiumSurface.trim()) {
+      req.body.viventiumSurface = incoming.viventiumSurface;
+    }
+
+    logger.info(
+      `[VIVENTIUM][scheduler/chat] Request: conversationId=${conversationId} requestedConversationId=${requestedConversationId} parentMessageId=${parentMessageId || ''} agentId=${agentId} streamId=${streamId} scheduleId=${scheduleId || ''} userId=${req.user?.id || ''}`,
+    );
+
+    next();
+  },
+  validateConvoAccess,
+  buildEndpointOption,
+  async (req, res, next) => {
+    return AgentController(req, res, next, initializeClient, addTitle);
+  },
+);
+
+/* === VIVENTIUM START ===
+ * Feature: Scheduler visible-message correction
+ * Purpose:
+ * - The Scheduling Cortex date guard runs after the agent stream completes.
+ * - When it corrects a generated opening date, patch the already-persisted assistant message
+ *   through the scheduler-owned auth path so LibreChat history matches delivered metadata.
+ * === VIVENTIUM END === */
+router.post('/message/patch', schedulerAuth, async (req, res) => {
+  try {
+    const messageId = typeof req.body?.messageId === 'string' ? req.body.messageId.trim() : '';
+    const conversationId =
+      typeof req.body?.conversationId === 'string' ? req.body.conversationId.trim() : '';
+    const text = typeof req.body?.text === 'string' ? req.body.text : '';
+    if (!messageId || !text.trim()) {
+      return res.status(400).json({ error: 'messageId and non-empty text are required' });
+    }
+
+    const existing = await getMessage({ user: req.user.id, messageId });
+    if (!existing) {
+      return res.status(404).json({ error: 'Message not found' });
+    }
+    if (conversationId && String(existing.conversationId || '') !== conversationId) {
+      return res.status(409).json({ error: 'Message conversation mismatch' });
+    }
+    if (existing.isCreatedByUser === true) {
+      return res.status(400).json({ error: 'Cannot patch a user-authored message' });
+    }
+
+    const update = { messageId, text };
+    const patchedContent = patchFirstVisibleTextPart(existing.content, text);
+    if (patchedContent) {
+      update.content = patchedContent;
+    }
+    const updated = await updateMessage(req, update, { context: 'schedulerDateGuardPatch' });
+
+    return res.json({
+      status: 'patched',
+      messageId: updated.messageId || messageId,
+      conversationId: updated.conversationId || existing.conversationId || conversationId || null,
+      contentPatched: Boolean(patchedContent),
+    });
+  } catch (err) {
+    logger.error('[VIVENTIUM][scheduler/message/patch] Failed to patch scheduled message:', err);
+    return res.status(500).json({ error: 'Failed to patch scheduled message' });
   }
-  /* === VIVENTIUM NOTE ===
-   * Keep scheduled runs aligned with normal LibreChat prompts by avoiding a custom surface
-   * unless the caller explicitly set one.
-   * === VIVENTIUM NOTE === */
-  if (typeof incoming.viventiumSurface === 'string' && incoming.viventiumSurface.trim()) {
-    req.body.viventiumSurface = incoming.viventiumSurface;
-  }
-
-  logger.info(
-    `[VIVENTIUM][scheduler/chat] Request: conversationId=${conversationId} requestedConversationId=${requestedConversationId} parentMessageId=${parentMessageId || ''} agentId=${agentId} streamId=${streamId} scheduleId=${scheduleId || ''} userId=${req.user?.id || ''}`,
-  );
-
-  next();
-}, validateConvoAccess, buildEndpointOption, async (req, res, next) => {
-  return AgentController(req, res, next, initializeClient, addTitle);
 });
 
 /* === VIVENTIUM NOTE ===

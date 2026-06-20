@@ -63,14 +63,21 @@ export default function ToolCallInfo({
       .flatMap((attachment) => {
         return attachment[Tools.ui_resources] as UIResource[];
       }) ?? [];
+  /* === VIVENTIUM START ===
+   * Feature: GlassHive product-language tool rows.
+   * Purpose: Allow GlassHive calls to hide raw invocation input while still showing safe results.
+   * === VIVENTIUM END === */
+  const hasInput = input.trim().length > 0;
 
   return (
     <div className="w-full p-2">
       <div style={{ opacity: 1 }}>
         <div className="mb-2 text-sm font-medium text-text-primary">{title}</div>
-        <div>
-          <OptimizedCodeBlock text={formatText(input)} maxHeight={250} />
-        </div>
+        {hasInput && (
+          <div>
+            <OptimizedCodeBlock text={formatText(input)} maxHeight={250} />
+          </div>
+        )}
         {output && (
           <>
             <div className="my-2 text-sm font-medium text-text-primary">

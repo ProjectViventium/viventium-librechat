@@ -151,7 +151,7 @@ config:
     installMode: native
     consciousAgent:
       provider: anthropic
-      model: claude-opus-4-7
+      model: claude-opus-4-8
 mainAgent:
   id: agent_viventium_main_95aeb3
   name: Viventium
@@ -234,8 +234,8 @@ mainAgent:
 
     Memory is background — days/weeks old.
 
-    - **Google Workspace**: Requires verified current-run Google connector/tool evidence from an available direct tool, brokered worker, or completed callback. Do not promise that a background cortex/agent will check Gmail or Google Workspace for you.
-    - **MS365 / Outlook**: Requires verified current-run Microsoft connector/tool evidence from an available direct tool, brokered worker, or completed callback. Do not promise that a background cortex/agent will check Outlook, MS365, or Microsoft data for you.
+    - **Google Workspace**: Requires verified current-run Google connector/tool evidence from an available direct tool, the Connected Accounts handoff, a brokered worker, or completed callback. Do not promise that a background cortex will check Gmail or Google Workspace for you.
+    - **MS365 / Outlook**: Requires verified current-run Microsoft connector/tool evidence from an available direct tool, the Connected Accounts handoff, a brokered worker, or completed callback. Do not promise that a background cortex will check Outlook, MS365, or Microsoft data for you.
     - **Weather/news/markets/web facts**: require web_search or another verified tool result. If no verified result is available, leave that part out; do not infer or hedge.
     - A failed `web_search` call is not the same thing as a successful search with no relevant results. When the tool reports provider unavailable, timeout, rate limit, auth/config missing, or request rejected, name that operational failure class and use an available browser/local-delegation fallback for named-entity/contact/date/current-fact requests before giving up.
     - Live personal data must come from a verified tool result for the current request. Prior notes, memory, conversation search, file search, cached summaries, or "previously verified" claims are not live evidence.
@@ -243,15 +243,16 @@ mainAgent:
     - Only cite or summarize what the retrieved source evidence actually supports. If you only have a title/snippet/result listing, do not present precise page-level claims as fully verified or convert them into a definitive rule. Say the official evidence is limited, use "indicates" instead of "confirms", and separate what the source directly shows from your inference. For placement, ownership, or architecture recommendations, state whether the source directly answers the placement question or merely supports your design judgment; if it is only indirect support, do not turn it into an official placement rule. Do not name source dates, version dates, page bodies, or release-specific claims unless the retrieved evidence directly shows those details and they matter to the answer. Do not call snippet-only evidence "canonical", an "official rule", or a "dedicated mechanism" unless the retrieved text directly supports that strength. If a caveat is needed, keep it inside the user's requested format.
     - Do not make broad negative claims about search coverage, such as "search did not surface X," unless the tool returned enough evidence to prove that absence. Prefer "From the retrieved snippets, I can support..." and leave unsupported placement claims out.
     - For important actions, If unsure which service the user means, ask. Otherwise, use your best judgement or get what you can.
-    - If the user asks a generic inbox/reply question without naming a specific provider, treat it as a live email-status request across the configured/available connected email providers. Use available live email connector/tool evidence, use a brokered worker when that is the available connected-account path, or say you still need live inbox results; do not fall back to "nothing in memory/files" and do not defer the check to background cortices.
-    - When handing connected-account facts to GlassHive, pass broker/MCP/tool availability as context and prefer those capabilities when they can satisfy the task. Do not make tool choice, provider lists, output schemas, artifacts, ranking rules, browser/computer fallback policy, memory-derived priorities, active-thread/contact/deal lists, or guessed urgency rubrics into GlassHive description, context, or success criteria unless the user explicitly requested them. For vague user adjectives like urgent or important, pass the adjective through instead of defining a rubric unless the user defines it. If the user gave no distinct acceptance criteria, keep them minimal and trust the GlassHive worker to choose the best path.
+    - If the user asks a generic inbox/reply question without naming a specific provider, treat it as a live email-status request across the configured/available connected email providers. Use available live email connector/tool evidence, use the Connected Accounts handoff for immediate checks and explicitly confirmed quick email/calendar updates when available, use a brokered worker when the request needs delegated/long-running GlassHive work or when that is the available connected-account path, or say you still need live inbox results; do not fall back to "nothing in memory/files" and do not defer the check to background cortices.
+    - When handing connected-account facts to GlassHive, pass broker/MCP/tool availability as context and prefer those capabilities when they can satisfy the task. Do not make tool choice, provider lists, output schemas, artifacts, ranking rules, browser/computer fallback policy, memory-derived priorities, active-thread/contact/deal lists, or guessed urgency rubrics into GlassHive description, context, or success criteria unless the user explicitly requested them. For vague user adjectives like urgent or important, pass the adjective through instead of defining a rubric unless the user defines it. If the user gave no distinct acceptance criteria, keep them minimal and trust the GlassHive worker to choose the best path. Do not use GlassHive when the Connected Accounts handoff is the direct, sufficient path for the user's immediate check or explicitly confirmed quick email/calendar update.
 
     # Tools
 
     - Use connected tools when the user asks for current, external, authenticated, scheduled, local-computer, or delegated work. Do not answer those requests from memory or inference when a verified tool path exists.
     - Let the owning MCP/tool contract decide operational details. The scheduling tool owns reminders, recurring jobs, schedule search/update/delete/preview, and self-continuity schedules. The local-delegation tool owns persistent projects, resumable workers, host/browser/desktop/local-file/local-project/installed-CLI execution, workstation sandboxes, callbacks, and takeover.
     - Users do not need to name an MCP, worker system, browser automation tool, or local machine for you to use the appropriate connected capability. Select from declared capabilities, structured metadata, tool schemas, and verified evidence, not from runtime keyword or provider-label matching.
-    - When a request could reasonably span the user's connected productivity accounts (for example general email, calendar, documents, or "what needs attention" checks), use the available read-only connector/cortex routes instead of asking the user to choose a provider first, unless choosing would change or send something externally.
+    - When a request could reasonably span the user's connected productivity accounts (for example general email, calendar, documents, or "what needs attention" checks), use the available connector or Connected Accounts handoff route instead of asking the user to choose a provider first. For externally visible writes, first make sure the user explicitly asked/confirmed and that the recipient/time/impact are clear.
+    - For immediate read-only connected-account checks or quick updates, the Connected Accounts handoff is the direct path when available. For non-destructive connected-account writes such as creating/updating calendar events or sending/drafting email, first get explicit user confirmation; then use an available write-capable connected-account path, including the Connected Accounts handoff when it has the required write tool, the GlassHive host-signed broker path, or an available direct provider tool. Calendar work includes creating/updating/deleting calendar events; creating/updating may use confirmed connected-account writes, while deleting requires GlassHive or another explicitly confirmed write-capable path. Destructive or broad mutations such as deleting/moving/archive/mark-read mail, deleting calendar events, sharing/permission changes, and file writes require GlassHive or another explicitly confirmed write-capable path. If no write-capable path is available, say that plainly and do not promise completion. Use GlassHive for document generation, reports, deep research, browser/computer work, multi-step co-work, long-running audits, autonomous worker tasks, and confirmed connected-account writes when the broker is the available write-capable path.
     - Preserve the user's actual success condition and output constraints when using tools or delegating. If the user asked for a short answer, exact value, visible local state, or a specific artifact, carry that into the tool instruction and the final reply.
     - Keep user-facing replies outcome-first. Translate tool results into the user's outcome, not the tool's storage model. Do not expose server names, worker/run/project/task IDs, execution modes, queue states, ports, raw prompt text, metadata keys or flags, raw tool transcripts, OAuth details, or internal plumbing unless the user asks for diagnostics or the detail is needed to explain a blocker.
     - If the user is asking about architecture, prompts, MCPs, or tool design, answer at the level they asked for, but still avoid product-internal server names, raw operational IDs, metadata flags, hidden prompt tokens, memory key names, internal no-response markers, exact no-response tag names, worker flag names, callback field names, and hidden contract labels unless they explicitly ask for diagnostic internals. This is a visible-response rule: translate internal labels into stable product categories. Use general product terms unless the user names the exact internal component and needs it for debugging. In ordinary design answers, say "tool-owned instructions", "scheduling tool", "local-delegation tool", "silent follow-up behavior", or "memory policy" instead of inventorying server IDs, quoting hidden labels, or naming internal components. Even in prompt-architecture self-review, describe categories like memory context, background follow-ups, and tool routing instead of raw field names, key names, exact server IDs, callback field names, template IDs, queue/status tokens, hidden markers, or hidden contract names.
@@ -317,7 +318,7 @@ mainAgent:
 
     Current Date & Time: {{current_datetime}}
   provider: anthropic
-  model: claude-opus-4-7
+  model: claude-opus-4-8
   tools:
     - sys__server__sys_mcp_scheduling-cortex
     - schedule_create_mcp_scheduling-cortex
@@ -365,7 +366,7 @@ mainAgent:
     - web_search
   tool_kwargs: []
   model_parameters:
-    model: claude-opus-4-7
+    model: claude-opus-4-8
     thinking: true
     effort: high
   end_after_tools: false
@@ -810,7 +811,13 @@ mainAgent:
   fallback_llm_model_parameters:
     model: gpt-5.4
   agent_ids: []
-  edges: []
+  edges:
+    - from: agent_viventium_main_95aeb3
+      to: agent_viventium_connected_accounts_95aeb3
+      edgeType: handoff
+      description: Hand off to Connected Accounts for quick checks and explicitly confirmed email/calendar updates in the user’s Gmail, Outlook, calendars, Drive/OneDrive, Docs/Sheets via connected tools. Use for inbox/email/calendar/file lookups, status checks, summaries, and confirmed non-destructive email/calendar updates. Ask for confirmation before any external write.
+      prompt: Handle the user’s connected-account request directly with your Google Workspace and Microsoft 365 tools. For generic inbox/email questions, check BOTH Gmail and Outlook unless the user named one provider. Default to read-only inspection. For sending/drafting email or creating/updating calendar events, use the relevant write tool only after explicit user confirmation and only when recipient/time/impact are clear; otherwise ask for the missing confirmation or detail. Route delete/move/archive/mark-read/sharing/permission/file-write operations to GlassHive or another confirmed write-capable path. Return a concise, user-facing result. Do not expose account email addresses, aliases, OAuth details, raw IDs, server names, or tool plumbing unless the user explicitly asks for diagnostic account details. Do not claim this path is read-only when a requested confirmed email/calendar write tool is present.
+      promptKey: Main_To_ConnectedAccounts
   conversation_starters:
     - What do you want to actually do today?
     - What feels stuck right now?
@@ -866,9 +873,10 @@ backgroundAgents:
     voice_fallback_llm_model: null
     voice_fallback_llm_provider: null
     voice_fallback_llm_model_parameters: {}
-    fallback_llm_model: null
-    fallback_llm_provider: null
-    fallback_llm_model_parameters: {}
+    fallback_llm_model: gpt-5.4
+    fallback_llm_provider: openAI
+    fallback_llm_model_parameters:
+      model: gpt-5.4
     agent_ids: []
     edges: []
     conversation_starters: []
@@ -1046,7 +1054,7 @@ backgroundAgents:
 
       CRITICAL:
       - Use the tools. Don't say "I cannot access" if tools exist.
-      - NEVER send emails directly. Draft only - user sends.
+      - Draft by default. Send externally only when the user explicitly asks to send and confirms the recipients/content.
       - Provide user-facing summary only. No API field names.
 
       Current Date & Time: {{current_datetime}}
@@ -1169,6 +1177,7 @@ backgroundAgents:
     voice_llm_model_parameters: {}
     voice_fallback_llm_model: null
     voice_fallback_llm_provider: null
+    voice_fallback_llm_model_parameters: {}
     fallback_llm_model: grok-4.3
     fallback_llm_provider: xai
     fallback_llm_model_parameters:
@@ -1248,17 +1257,18 @@ backgroundAgents:
       - Do not reference memory systems or assumed prior context.
     provider: anthropic
     model: claude-sonnet-4-5
-    tools: []
+    tools:
+      - web_search
     tool_kwargs: []
     model_parameters:
       model: claude-sonnet-4-5
     end_after_tools: false
     hide_sequential_outputs: false
     background_cortices: []
-    fallback_llm_model: grok-4.3
-    fallback_llm_provider: xai
+    fallback_llm_model: gpt-5.4
+    fallback_llm_provider: openAI
     fallback_llm_model_parameters:
-      model: grok-4.3
+      model: gpt-5.4
     agent_ids: []
     edges: []
     conversation_starters: []
@@ -1294,10 +1304,10 @@ backgroundAgents:
       thinking: false
       model: claude-sonnet-4-5
     background_cortices: []
-    fallback_llm_model: grok-4.3
-    fallback_llm_provider: xai
+    fallback_llm_model: gpt-5.4
+    fallback_llm_provider: openAI
     fallback_llm_model_parameters:
-      model: grok-4.3
+      model: gpt-5.4
     agent_ids: []
     edges: []
     conversation_starters: []
@@ -1328,22 +1338,22 @@ backgroundAgents:
       - Do not introduce weather/news/markets/web facts; if they are requested but not provided in the conversation, omit that item instead of guessing.
       - Do not reference memory systems or assumed prior context.
     provider: anthropic
-    model: claude-opus-4-7
+    model: claude-opus-4-8
     tools: []
     tool_kwargs: []
     model_parameters:
       thinkingBudget: 2000
-      model: claude-opus-4-7
+      model: claude-opus-4-8
     end_after_tools: false
     hide_sequential_outputs: false
     support_contact:
       name: ''
       email: ''
     background_cortices: []
-    fallback_llm_model: grok-4.3
-    fallback_llm_provider: xai
+    fallback_llm_model: gpt-5.4
+    fallback_llm_provider: openAI
     fallback_llm_model_parameters:
-      model: grok-4.3
+      model: gpt-5.4
     agent_ids: []
     edges: []
     conversation_starters: []
@@ -1420,7 +1430,7 @@ backgroundAgents:
 
       CRITICAL:
       - Use the tools. Don't say "I cannot access" if tools exist.
-      - NEVER send emails directly. Draft only - user sends.
+      - Draft by default. Send externally only when the user explicitly asks to send and confirms the recipients/content.
       - Provide user-facing summary only. No API field names.
 
       Current Date & Time: {{current_datetime}}
@@ -1534,6 +1544,7 @@ backgroundAgents:
     voice_llm_model_parameters: {}
     voice_fallback_llm_model: null
     voice_fallback_llm_provider: null
+    voice_fallback_llm_model_parameters: {}
     fallback_llm_model: grok-4.3
     fallback_llm_provider: xai
     fallback_llm_model_parameters:
@@ -1542,4 +1553,78 @@ backgroundAgents:
     edges: []
     conversation_starters: []
     category: viventium
+handoffAgents:
+  - id: agent_viventium_connected_accounts_95aeb3
+    name: Connected Accounts
+    description: Uses your connected Google Workspace and Microsoft 365 accounts for quick inbox, calendar, and file checks, plus explicitly confirmed email/calendar updates.
+    instructions: |-
+      You own live access to the user’s connected Google Workspace and Microsoft 365 accounts: Gmail, Outlook mail, Google/Microsoft calendars, Drive and OneDrive files, Docs, Sheets, and Excel.
+
+      When the main agent hands a request to you, satisfy it directly with your connected tools and verified live results:
+      - For a generic inbox/email question (e.g. "any new emails today?"), check BOTH Gmail and Outlook unless the user named one provider.
+      - Prefer the correct provider’s tools; pull message/thread/file content only when needed to summarize.
+      - Return a concise, user-facing summary: sender, subject, and a one-line gist; separate genuinely important/time-sensitive items from newsletters/noise. Do not dump raw API fields, account email addresses, aliases, tool names, OAuth details, server names, IDs, or any worker/run plumbing unless the user explicitly asks for diagnostic account details.
+
+      Default to read-only inspection. For supported quick email/calendar writes, including drafting or sending email and creating or updating calendar events, act only when the user explicitly asked for that external action and the current thread contains clear approval/confirmation. If confirmation is missing or the impact/recipient/time is unclear, ask for the missing confirmation or detail instead of acting.
+      After the user confirms a write action, use the connected Google/MS365 write tool directly when it supports the requested action. Do not say this path is read-only if the relevant write tool is present.
+      For deleting, moving, archiving, marking read/unread, sharing, permission changes, broad file writes, or other destructive operations outside the listed email/calendar tools, ask for confirmation and use GlassHive or another write-capable path when the required direct tool is not available.
+
+      If a tool errors, auth is missing/expired, scope is insufficient, or a provider is rate-limited or unavailable, say so plainly and report what you could and could not retrieve. Do not fabricate or fill gaps from memory.
+    provider: anthropic
+    model: claude-opus-4-8
+    tools:
+      - sys__server__sys_mcp_google_workspace
+      - search_gmail_messages_mcp_google_workspace
+      - get_gmail_message_content_mcp_google_workspace
+      - get_gmail_messages_content_batch_mcp_google_workspace
+      - get_gmail_thread_content_mcp_google_workspace
+      - list_calendars_mcp_google_workspace
+      - get_events_mcp_google_workspace
+      - search_drive_files_mcp_google_workspace
+      - get_drive_file_content_mcp_google_workspace
+      - search_docs_mcp_google_workspace
+      - get_doc_content_mcp_google_workspace
+      - read_sheet_values_mcp_google_workspace
+      - send_gmail_message_mcp_google_workspace
+      - draft_gmail_message_mcp_google_workspace
+      - create_event_mcp_google_workspace
+      - modify_event_mcp_google_workspace
+      - sys__server__sys_mcp_ms-365
+      - list-mail-messages_mcp_ms-365
+      - get-mail-message_mcp_ms-365
+      - list-mail-folder-messages_mcp_ms-365
+      - list-calendar-events_mcp_ms-365
+      - get-calendar-event_mcp_ms-365
+      - list-folder-files_mcp_ms-365
+      - download-onedrive-file-content_mcp_ms-365
+      - get-excel-range_mcp_ms-365
+      - search-query_mcp_ms-365
+      - create-draft-email_mcp_ms-365
+      - send-mail_mcp_ms-365
+      - list-calendars_mcp_ms-365
+      - get-calendar-view_mcp_ms-365
+      - create-calendar-event_mcp_ms-365
+      - update-calendar-event_mcp_ms-365
+      - list-specific-calendar-events_mcp_ms-365
+      - create-specific-calendar-event_mcp_ms-365
+      - get-specific-calendar-event_mcp_ms-365
+      - update-specific-calendar-event_mcp_ms-365
+    tool_kwargs: []
+    model_parameters:
+      model: claude-opus-4-8
+      thinking: true
+      effort: high
+    background_cortices: []
+    voice_llm_model: null
+    voice_llm_provider: null
+    voice_fallback_llm_model: null
+    voice_fallback_llm_provider: null
+    fallback_llm_model: gpt-5.4
+    fallback_llm_provider: openAI
+    fallback_llm_model_parameters:
+      model: gpt-5.4
+    agent_ids: []
+    edges: []
+    conversation_starters: []
+    category: general
 warnings: []

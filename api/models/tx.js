@@ -176,6 +176,11 @@ const tokenValues = Object.assign(
     'claude-opus-4': { prompt: 15, completion: 75 },
     'claude-opus-4-5': { prompt: 5, completion: 25 },
     'claude-opus-4-7': { prompt: 5, completion: 25 },
+    /* === VIVENTIUM START ===
+     * Feature: Launch-ready Anthropic model accounting.
+     * Purpose: Keep Opus 4.8 source-owned agents from falling through pricing/token accounting.
+     * === VIVENTIUM END === */
+    'claude-opus-4-8': { prompt: 5, completion: 25 },
     'claude-sonnet-4': { prompt: 3, completion: 15 },
     'command-r': { prompt: 0.5, completion: 1.5 },
     'command-r-plus': { prompt: 3, completion: 15 },
@@ -313,6 +318,11 @@ const cacheTokenValues = {
   'claude-opus-4': { write: 18.75, read: 1.5 },
   'claude-opus-4-5': { write: 6.25, read: 0.5 },
   'claude-opus-4-7': { write: 6.25, read: 0.5 },
+  /* === VIVENTIUM START ===
+   * Feature: Launch-ready Anthropic model accounting.
+   * Purpose: Match cache accounting for source-owned Opus 4.8 agents.
+   * === VIVENTIUM END === */
+  'claude-opus-4-8': { write: 6.25, read: 0.5 },
   // DeepSeek models - cache hit: $0.028/1M, cache miss: $0.28/1M
   deepseek: { write: 0.28, read: 0.028 },
   'deepseek-chat': { write: 0.28, read: 0.028 },
@@ -338,6 +348,11 @@ const cacheTokenValues = {
  */
 const premiumTokenValues = {
   'claude-opus-4-7': { threshold: 200000, prompt: 10, completion: 37.5 },
+  /* === VIVENTIUM START ===
+   * Feature: Launch-ready Anthropic model accounting.
+   * Purpose: Preserve premium-token threshold behavior for Opus 4.8.
+   * === VIVENTIUM END === */
+  'claude-opus-4-8': { threshold: 200000, prompt: 10, completion: 37.5 },
 };
 
 /**

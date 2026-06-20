@@ -77,12 +77,14 @@ describe('promptRegistry', () => {
       prompts: {
         child: {
           metadata: {},
-          body: 'Hello {{current_user}}',
+          body: 'Hello {{current_user}} {{glasshive_worker_execution_instruction}}',
         },
       },
     });
 
-    expect(getPromptText('child', 'fallback')).toBe('Hello {{current_user}}');
+    expect(getPromptText('child', 'fallback')).toBe(
+      'Hello {{current_user}} {{glasshive_worker_execution_instruction}}',
+    );
   });
 
   test('falls back on unknown non-strict placeholders instead of leaking typos to the model', () => {

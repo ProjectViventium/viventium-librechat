@@ -256,6 +256,88 @@ describe('initializeOpenAI', () => {
     expect(mockGetOpenAIConfig).not.toHaveBeenCalled();
   });
 
+  it('should use platform key for fallback LLM recovery when expired OpenAI subscription refresh fails', async () => {
+    const mockFetch = jest.mocked(global.fetch);
+    mockFetch.mockResolvedValue({
+      ok: false,
+      status: 400,
+      statusText: 'Bad Request',
+      text: async () =>
+        JSON.stringify({
+          error: 'invalid_grant',
+          error_description: 'Refresh token not found or invalid',
+        }),
+    } as Response);
+
+    const params = createParams({
+      dbOverrides: {
+        getUserKeyValues: jest.fn().mockResolvedValue({
+          apiKey: 'expired-openai-oauth-access-token',
+          refreshToken: 'broken-refresh-token',
+          oauthProvider: 'openai-codex',
+          oauthType: 'subscription',
+          oauthExpiresAt: Date.now() - 60 * 1000,
+        }),
+      },
+    });
+    (
+      params.req as BaseInitializeParams['req'] & {
+        viventiumAllowOpenAIPlatformFallbackOnOAuthFailure?: boolean;
+      }
+    ).viventiumAllowOpenAIPlatformFallbackOnOAuthFailure = true;
+
+    await initializeOpenAI(params);
+
+    expect(mockFetch).toHaveBeenCalled();
+    expect(mockGetOpenAIConfig).toHaveBeenCalledWith(
+      'platform-openai-key',
+      expect.objectContaining({
+        modelOptions: expect.objectContaining({
+          model: 'gpt-4o-mini',
+        }),
+      }),
+      EModelEndpoint.openAI,
+    );
+    expect(params.db.updateUserKey).not.toHaveBeenCalled();
+  });
+
+  it('should still require reconnect in connected-account auth mode even for fallback LLM recovery', async () => {
+    process.env.VIVENTIUM_OPENAI_AUTH_MODE = 'connected_account';
+    const mockFetch = jest.mocked(global.fetch);
+    mockFetch.mockResolvedValue({
+      ok: false,
+      status: 400,
+      statusText: 'Bad Request',
+      text: async () =>
+        JSON.stringify({
+          error: 'invalid_grant',
+          error_description: 'Refresh token not found or invalid',
+        }),
+    } as Response);
+
+    const params = createParams({
+      dbOverrides: {
+        getUserKeyValues: jest.fn().mockResolvedValue({
+          apiKey: 'expired-openai-oauth-access-token',
+          refreshToken: 'broken-refresh-token',
+          oauthProvider: 'openai-codex',
+          oauthType: 'subscription',
+          oauthExpiresAt: Date.now() - 60 * 1000,
+        }),
+      },
+    });
+    (
+      params.req as BaseInitializeParams['req'] & {
+        viventiumAllowOpenAIPlatformFallbackOnOAuthFailure?: boolean;
+      }
+    ).viventiumAllowOpenAIPlatformFallbackOnOAuthFailure = true;
+
+    await expect(initializeOpenAI(params)).rejects.toThrow(
+      'OpenAI connected account needs reconnect in Settings > Account > Connected Accounts.',
+    );
+    expect(mockGetOpenAIConfig).not.toHaveBeenCalled();
+  });
+
   it('should fallback to platform key when no connected user key exists', async () => {
     const params = createParams();
 

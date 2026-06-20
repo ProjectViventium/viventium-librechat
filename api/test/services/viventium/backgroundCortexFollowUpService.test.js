@@ -1675,7 +1675,7 @@ describe('BackgroundCortexFollowUpService', () => {
     const originalProvider = process.env.VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER;
     const originalModel = process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL;
     process.env.VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER = 'anthropic';
-    process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL = 'claude-opus-4-7';
+    process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL = 'claude-opus-4-8';
 
     try {
       await generateFollowUpText({
@@ -1706,7 +1706,7 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(initializeAnthropic).toHaveBeenCalledWith(
       expect.objectContaining({
         model_parameters: expect.objectContaining({
-          model: 'claude-opus-4-7',
+          model: 'claude-opus-4-8',
         }),
       }),
     );
@@ -1717,7 +1717,7 @@ describe('BackgroundCortexFollowUpService', () => {
     const originalProvider = process.env.VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER;
     const originalModel = process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL;
     process.env.VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER = 'anthropic';
-    process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL = 'claude-opus-4-7';
+    process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL = 'claude-opus-4-8';
 
     try {
       await generateFollowUpText({
@@ -1751,7 +1751,7 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(initializeAnthropic).toHaveBeenCalledWith(
       expect.objectContaining({
         model_parameters: expect.objectContaining({
-          model: 'claude-opus-4-7',
+          model: 'claude-opus-4-8',
         }),
       }),
     );

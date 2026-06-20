@@ -13,9 +13,26 @@ import { resolveAnthropicSubscriptionUserValues } from './oauthSubscription';
 /* === VIVENTIUM START ===
  * Feature: Connected-account credential recovery.
  * Purpose: Convert unreadable stored Anthropic credentials into reconnect guidance or safe fallback.
- * === VIVENTIUM END === */
+ */
 const ANTHROPIC_CONNECTED_ACCOUNT_RECONNECT_MESSAGE =
   'Anthropic connected account needs reconnect in Settings > Account > Connected Accounts.';
+
+type ViventiumConnectedAccountReconnectError = Error & {
+  code?: string;
+  viventiumConnectedAccountReconnectRequired?: boolean;
+  viventiumConnectedAccountProvider?: string;
+};
+
+function anthropicConnectedAccountReconnectError(): ViventiumConnectedAccountReconnectError {
+  const error = new Error(
+    ANTHROPIC_CONNECTED_ACCOUNT_RECONNECT_MESSAGE,
+  ) as ViventiumConnectedAccountReconnectError;
+  error.code = 'MODEL_AUTHENTICATION';
+  error.viventiumConnectedAccountReconnectRequired = true;
+  error.viventiumConnectedAccountProvider = 'Anthropic';
+  return error;
+}
+/* === VIVENTIUM END === */
 
 const isNoUserKeyError = (error: unknown): boolean => {
   if (!(error instanceof Error)) {
@@ -144,7 +161,7 @@ export async function initializeAnthropic({
         } catch (legacyError) {
           if (isAnthropicConnectedAccountReadError(legacyError)) {
             if (isConnectedAccountAuthMode()) {
-              throw new Error(ANTHROPIC_CONNECTED_ACCOUNT_RECONNECT_MESSAGE);
+              throw anthropicConnectedAccountReconnectError();
             }
           } else if (!isNoUserKeyError(legacyError)) {
             throw legacyError;
@@ -152,7 +169,7 @@ export async function initializeAnthropic({
         }
       } else if (isAnthropicConnectedAccountReadError(error)) {
         if (isConnectedAccountAuthMode()) {
-          throw new Error(ANTHROPIC_CONNECTED_ACCOUNT_RECONNECT_MESSAGE);
+          throw anthropicConnectedAccountReconnectError();
         }
       } else if (!isNoUserKeyError(error)) {
         throw error;
@@ -166,7 +183,7 @@ export async function initializeAnthropic({
     if (!anthropicApiKey) {
       if (isUserProvided) {
         if (isConnectedAccountAuthMode()) {
-          throw new Error(ANTHROPIC_CONNECTED_ACCOUNT_RECONNECT_MESSAGE);
+          throw anthropicConnectedAccountReconnectError();
         }
         throw new Error(
           JSON.stringify({

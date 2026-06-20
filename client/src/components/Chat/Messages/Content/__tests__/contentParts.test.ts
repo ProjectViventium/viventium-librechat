@@ -117,7 +117,7 @@ describe('filterRenderableContentParts', () => {
     ]);
   });
 
-  it('keeps consecutive distinct GlassHive tool rows inspectable', () => {
+  it('keeps GlassHive worker orchestration rows visible when assistant text is present', () => {
     const parts: TMessageContentParts[] = [
       {
         type: ContentTypes.TOOL_CALL,
@@ -147,10 +147,17 @@ describe('filterRenderableContentParts', () => {
       },
     ];
 
-    expect(filterRenderableContentParts(parts)).toBe(parts);
+    expect(filterRenderableContentParts(parts)).toEqual([
+      parts[0],
+      parts[1],
+      {
+        type: ContentTypes.TEXT,
+        text: 'Done.',
+      },
+    ]);
   });
 
-  it('hides routine GlassHive one-shot delegation rows when the assistant already acknowledged dispatch', () => {
+  it('keeps routine GlassHive one-shot delegation rows visible when the assistant already acknowledged dispatch', () => {
     const parts: TMessageContentParts[] = [
       {
         type: ContentTypes.TOOL_CALL,
@@ -169,6 +176,7 @@ describe('filterRenderableContentParts', () => {
     ];
 
     expect(filterRenderableContentParts(parts)).toEqual([
+      parts[0],
       {
         type: ContentTypes.TEXT,
         text: 'On it.',
@@ -335,7 +343,7 @@ describe('filterRenderableContentParts', () => {
     expect(filterRenderableContentParts(parts)).toBe(parts);
   });
 
-  it('hides routine GlassHive one-shot rows when MCP output is wrapped in text content', () => {
+  it('keeps routine GlassHive one-shot rows visible when MCP output is wrapped in text content', () => {
     const parts: TMessageContentParts[] = [
       {
         type: ContentTypes.TOOL_CALL,
@@ -352,7 +360,7 @@ describe('filterRenderableContentParts', () => {
       { type: ContentTypes.TEXT, text: 'On it.' },
     ];
 
-    expect(filterRenderableContentParts(parts)).toEqual([parts[1]]);
+    expect(filterRenderableContentParts(parts)).toEqual(parts);
   });
 
   it('keeps routine GlassHive one-shot rows visible when no assistant acknowledgement exists', () => {
@@ -374,7 +382,7 @@ describe('filterRenderableContentParts', () => {
     expect(filterRenderableContentParts(parts)).toBe(parts);
   });
 
-  it('keeps blocked GlassHive one-shot delegation rows visible', () => {
+  it('keeps blocked GlassHive one-shot delegation rows inspectable', () => {
     const parts: TMessageContentParts[] = [
       {
         type: ContentTypes.TOOL_CALL,
@@ -389,6 +397,117 @@ describe('filterRenderableContentParts', () => {
         },
       },
       { type: ContentTypes.TEXT, text: 'I need callback setup first.' },
+    ];
+
+    expect(filterRenderableContentParts(parts)).toBe(parts);
+  });
+
+  it('keeps GlassHive workspace orchestration rows visible when assistant text is present', () => {
+    const parts: TMessageContentParts[] = [
+      {
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: 'toolu_workspace_launch',
+          name: `workspace_launch${Constants.mcp_delimiter}glasshive-workers-projects`,
+          args: '{}',
+          type: ToolCallTypes.TOOL_CALL,
+          progress: 1,
+          output: '{"workspace_id":"wrk_public_safe","status":"running"}',
+        },
+      },
+      { type: ContentTypes.TEXT, text: 'I started the workspace.' },
+    ];
+
+    expect(filterRenderableContentParts(parts)).toBe(parts);
+  });
+
+  it('keeps GlassHive browser/computer delegated task calls visible beside the final result', () => {
+    const parts: TMessageContentParts[] = [
+      {
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: 'toolu_delegate_browser_task',
+          name: `worker_delegate_once${Constants.mcp_delimiter}glasshive-workers-projects`,
+          args: '{"goal":"Open a public profile and report the follower count."}',
+          type: ToolCallTypes.TOOL_CALL,
+          progress: 1,
+          output:
+            '{"status":"completed","callback_ready":true,"output_text":"@example - 11.7K followers."}',
+        },
+      },
+      {
+        type: ContentTypes.TEXT,
+        text: '@example - 11.7K followers. Profile is open in your browser.',
+      },
+    ];
+
+    expect(filterRenderableContentParts(parts)).toBe(parts);
+  });
+
+  it('keeps result-bearing GlassHive workspace wait rows inspectable when assistant text is skeletal', () => {
+    const parts: TMessageContentParts[] = [
+      {
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: 'toolu_workspace_wait',
+          name: `workspace_wait${Constants.mcp_delimiter}glasshive-workers-projects`,
+          args: '{}',
+          type: ToolCallTypes.TOOL_CALL,
+          progress: 1,
+          output:
+            '{"terminal":true,"run_state":"completed","output_text":"Final worker answer with public-safe details."}',
+        },
+      },
+      { type: ContentTypes.TEXT, text: 'Done.' },
+    ];
+
+    expect(filterRenderableContentParts(parts)).toBe(parts);
+  });
+
+  it('sanitizes leaked raw GlassHive tool transcripts from assistant text', () => {
+    const parts: TMessageContentParts[] = [
+      {
+        type: ContentTypes.TEXT,
+        text:
+          'I started the workspace.\n' +
+          'Tool: workspace_status {"workspace_id":"wrk_public_safe"}\n' +
+          '<invoke name="workspace_wait"><parameter name="workspace_id">wrk_public_safe</parameter></invoke>\n' +
+          '```json\n{"tool_call":{"name":"workspace_status","arguments":{"workspace_id":"wrk_public_safe"}}}\n```\n' +
+          'I will report back when it finishes.',
+      },
+    ];
+
+    expect(filterRenderableContentParts(parts)).toEqual([
+      {
+        type: ContentTypes.TEXT,
+        text: 'I started the workspace.\nI will report back when it finishes.',
+      },
+    ]);
+  });
+
+  it('preserves ordinary JSON and XML examples that are not GlassHive tool transcripts', () => {
+    const parts: TMessageContentParts[] = [
+      {
+        type: ContentTypes.TEXT,
+        text:
+          'Example payload:\n' +
+          '```json\n{"tool":"calculator","arguments":{"value":2}}\n```\n' +
+          '<invoke name="example"><parameter name="value">2</parameter></invoke>',
+      },
+    ];
+
+    expect(filterRenderableContentParts(parts)).toBe(parts);
+  });
+
+  it('preserves non-GlassHive tool examples with run and project prefixes', () => {
+    const parts: TMessageContentParts[] = [
+      {
+        type: ContentTypes.TEXT,
+        text:
+          'Tool: run_pipeline {"dryRun":true}\n' +
+          '```json\n{"tool_call":{"name":"project_init","arguments":{"name":"demo"}}}\n```\n' +
+          '<invoke name="project_init"><parameter name="name">demo</parameter></invoke>',
+      },
     ];
 
     expect(filterRenderableContentParts(parts)).toBe(parts);
@@ -446,6 +565,38 @@ describe('filterRenderableContentParts', () => {
     ];
 
     expect(filterRenderableContentParts(parts)).toBe(parts);
+  });
+
+  it('collapses consecutive GlassHive launch retries to the latest user-facing row', () => {
+    const parts: TMessageContentParts[] = [
+      {
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: 'toolu_workspace_launch_host_failed',
+          name: `workspace_launch${Constants.mcp_delimiter}glasshive-workers-projects`,
+          args: '{"execution_mode":"host"}',
+          type: ToolCallTypes.TOOL_CALL,
+          progress: 1,
+          output:
+            'Error executing tool workspace_launch: host-native GlassHive workers are disabled',
+        },
+      },
+      {
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: 'toolu_workspace_launch_workspace_dispatched',
+          name: `workspace_launch${Constants.mcp_delimiter}glasshive-workers-projects`,
+          args: '{"execution_mode":"docker"}',
+          type: ToolCallTypes.TOOL_CALL,
+          progress: 1,
+          output:
+            '{"status":"dispatched","view_steer_url":"https://example.com/watch/public-safe"}',
+        },
+      },
+      { type: ContentTypes.TEXT, text: 'Started in GlassHive.' },
+    ];
+
+    expect(filterRenderableContentParts(parts)).toEqual([parts[1], parts[2]]);
   });
 
   it('keeps distinct same-name GlassHive tool calls inspectable', () => {

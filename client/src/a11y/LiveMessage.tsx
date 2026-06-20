@@ -1,5 +1,6 @@
 import React, { useEffect, useContext } from 'react';
 import AnnouncerContext from '~/Providers/AnnouncerContext';
+import { sanitizeLiveAnnouncementText } from './sanitizeLiveAnnouncementText';
 
 interface LiveMessageProps {
   message: string;
@@ -13,20 +14,25 @@ const LiveMessage: React.FC<LiveMessageProps> = ({
   clearOnUnmount,
 }) => {
   const { announceAssertive, announcePolite } = useContext(AnnouncerContext);
+  /* === VIVENTIUM START ===
+   * Feature: User-facing GlassHive signed-link hygiene.
+   * Purpose: LiveMessage forwards into accessibility announcements, so sanitize signed links first.
+   * === VIVENTIUM END === */
+  const announcement = sanitizeLiveAnnouncementText(message);
 
   useEffect(() => {
     if (ariaLive === 'assertive') {
-      announceAssertive(message);
+      announceAssertive({ message: announcement });
     } else if (ariaLive === 'polite') {
-      announcePolite(message);
+      announcePolite({ message: announcement });
     }
-  }, [message, ariaLive, announceAssertive, announcePolite]);
+  }, [announcement, ariaLive, announceAssertive, announcePolite]);
 
   useEffect(() => {
     return () => {
       if (clearOnUnmount === true || clearOnUnmount === 'true') {
-        announceAssertive('');
-        announcePolite('');
+        announceAssertive({ message: '' });
+        announcePolite({ message: '' });
       }
     };
   }, [clearOnUnmount, announceAssertive, announcePolite]);

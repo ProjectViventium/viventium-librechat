@@ -225,7 +225,7 @@ function createMessageDeltaBoundaryNormalizer({ mode = 'incremental' } = {}) {
   };
 }
 
-function repairMissedVoiceMessageDelta({ contentParts, event, data, beforeText, afterText }) {
+function repairMissedVisibleMessageDelta({ contentParts, event, data, beforeText, afterText }) {
   if (event !== 'on_message_delta') {
     return false;
   }
@@ -239,10 +239,15 @@ function repairMissedVoiceMessageDelta({ contentParts, event, data, beforeText, 
   return appendTextToContentParts(contentParts, deltaText);
 }
 
+function repairMissedVoiceMessageDelta(params) {
+  return repairMissedVisibleMessageDelta(params);
+}
+
 module.exports = {
   appendTextToContentParts,
   collectTextParts,
   createMessageDeltaBoundaryNormalizer,
   extractVisibleTextFromContentParts,
+  repairMissedVisibleMessageDelta,
   repairMissedVoiceMessageDelta,
 };

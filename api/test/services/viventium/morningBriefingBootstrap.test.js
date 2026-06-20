@@ -2,7 +2,10 @@
  * Purpose: Tests for the morningBriefingBootstrap service.
  * === VIVENTIUM END === */
 
-const { ensureMorningBriefing, TEMPLATE_ID } = require('~/server/services/viventium/morningBriefingBootstrap');
+const {
+  ensureMorningBriefing,
+  TEMPLATE_ID,
+} = require('~/server/services/viventium/morningBriefingBootstrap');
 
 describe('morningBriefingBootstrap', () => {
   const originalEnv = { ...process.env };
@@ -67,6 +70,9 @@ describe('morningBriefingBootstrap', () => {
     expect(body.template_id).toBe('morning_briefing_default_v1');
     expect(body.timezone).toBe('America/Toronto');
     expect(body.channels).toBeNull();
+    expect(body.prompt).toContain('deterministic scheduled-run date');
+    expect(body.prompt).toContain('verified tool/cortex results');
+    expect(body.prompt).toContain('instead of guessing');
     expect(body.metadata.bootstrap_surface).toBe('web');
   });
 
@@ -94,8 +100,6 @@ describe('morningBriefingBootstrap', () => {
     const mod = require('~/server/services/viventium/morningBriefingBootstrap');
     global.fetch = jest.fn().mockRejectedValue(new Error('Network error'));
 
-    await expect(
-      mod.ensureMorningBriefing({ userId: 'user-fail' }),
-    ).resolves.toBeUndefined();
+    await expect(mod.ensureMorningBriefing({ userId: 'user-fail' })).resolves.toBeUndefined();
   });
 });

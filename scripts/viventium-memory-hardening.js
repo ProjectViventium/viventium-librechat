@@ -89,7 +89,7 @@ const STABLE_TRANSCRIPT_MEMORY_KEYS = new Set([
 ]);
 const MODEL_FALLBACK_SEPARATOR = /[,;]/;
 const DEFAULT_MEMORY_HARDENING_MODEL_FALLBACKS = [
-  { provider: 'anthropic', model: 'claude-opus-4-7', effort: 'xhigh', source: 'default' },
+  { provider: 'anthropic', model: 'claude-opus-4-8', effort: 'xhigh', source: 'default' },
   { provider: 'anthropic', model: 'opus', effort: 'xhigh', source: 'default' },
   { provider: 'openai', model: 'gpt-5.5', effort: 'high', source: 'default' },
   { provider: 'openai', model: 'gpt-5.4', effort: 'high', source: 'default' },
@@ -2007,7 +2007,7 @@ function resolveProvider(options = {}) {
         options.model ||
         selectedModelFromCompiler ||
         (explicit === 'anthropic'
-          ? process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_MODEL || 'claude-opus-4-7'
+          ? process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_MODEL || 'claude-opus-4-8'
           : process.env.VIVENTIUM_MEMORY_HARDENING_OPENAI_MODEL || 'gpt-5.5'),
       effort:
         explicit === 'anthropic'
@@ -2024,7 +2024,7 @@ function resolveProvider(options = {}) {
   if (providers.includes('anthropic')) {
     return withResolvedCandidates({
       provider: 'anthropic',
-      model: process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_MODEL || 'claude-opus-4-7',
+      model: process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_MODEL || 'claude-opus-4-8',
       effort:
         process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_EFFORT ||
         process.env.VIVENTIUM_MEMORY_HARDENING_EFFORT ||

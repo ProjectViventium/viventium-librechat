@@ -24,7 +24,7 @@ const {
 const { initializeClient } = require('~/server/services/Endpoints/agents');
 const addTitle = require('~/server/services/Endpoints/agents/title');
 const AgentController = require('~/server/controllers/agents/request');
-const { getUserById, getMessages, getConvo } = require('~/models');
+const { getUserById, getConvo } = require('~/models');
 /* === VIVENTIUM NOTE ===
  * Feature: Scheduler <-> Telegram mapping helper import.
  * === VIVENTIUM NOTE === */

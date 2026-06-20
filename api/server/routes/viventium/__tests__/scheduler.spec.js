@@ -283,9 +283,7 @@ describe('/api/viventium/scheduler persisted message mutation', () => {
   test('does not expose a scheduler-owned message patch route', () => {
     jest.resetModules();
     const schedulerRouter = require('../scheduler');
-    const routePaths = schedulerRouter.stack
-      .map((layer) => layer.route?.path)
-      .filter(Boolean);
+    const routePaths = schedulerRouter.stack.map((layer) => layer.route?.path).filter(Boolean);
 
     expect(routePaths).not.toContain('/message/patch');
   });

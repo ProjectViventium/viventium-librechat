@@ -1,0 +1,20 @@
+const MARKDOWN_LINK_PATTERN = /\[([^\]]+)\]\(([^)\s]+(?:\s+"[^"]*")?)\)/g;
+const SIGNED_GLASSHIVE_URL_PATTERN =
+  /https?:\/\/[^\s<>)"']*(?:\/v1\/signed-links\/|[?&](?:gh_token|ghtoken|token)=)[^\s<>)"']*/gi;
+const SIGNED_PATH_PATTERN =
+  /\/v1\/signed-links\/[^\s<>)"']+|([?&](?:gh_token|ghtoken|token)=)[^\s<>)"']+/gi;
+
+const isSensitiveGlassHiveUrl = (url: string) =>
+  /\/v1\/signed-links\//i.test(url) || /[?&](?:gh_token|ghtoken|token)=/i.test(url);
+
+export const sanitizeLiveAnnouncementText = (message: string) =>
+  message
+    // VIVENTIUM START: accessibility live regions are user-facing; keep link labels but never signed URLs/tokens.
+    .replace(MARKDOWN_LINK_PATTERN, (_match, label: string, url: string) =>
+      isSensitiveGlassHiveUrl(url) ? label : _match,
+    )
+    .replace(SIGNED_GLASSHIVE_URL_PATTERN, '[signed link]')
+    .replace(SIGNED_PATH_PATTERN, (_match, tokenPrefix: string | undefined) =>
+      tokenPrefix ? `${tokenPrefix}[redacted]` : '/v1/signed-links/[redacted]',
+    );
+// VIVENTIUM END

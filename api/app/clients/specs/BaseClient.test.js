@@ -38,7 +38,7 @@ jest.mock('~/models', () => ({
   updateFileUsage: jest.fn(),
 }));
 
-const { getConvo, saveConvo } = require('~/models');
+const { getConvo, saveConvo, saveMessage } = require('~/models');
 
 jest.mock('@librechat/agents', () => {
   const actual = jest.requireActual('@librechat/agents');
@@ -707,6 +707,96 @@ describe('BaseClient', () => {
         saveOptions,
         user,
       );
+    });
+
+    test('attaches voice call metadata to persisted user and assistant messages', async () => {
+      const user = { id: 'user-id' };
+      saveMessage.mockClear();
+      saveConvo.mockClear();
+      getConvo.mockClear();
+      getConvo.mockResolvedValue(null);
+      saveConvo.mockResolvedValue({ conversationId: 'voice-convo' });
+      saveMessage.mockResolvedValue({});
+      TestClient = initializeFakeClient(
+        apiKey,
+        {
+          ...options,
+          endpoint: 'agents',
+          endpointType: 'agents',
+          req: {
+            user,
+            body: {
+              viventiumSurface: 'voice',
+              viventiumInputMode: 'voice_call',
+            },
+            viventiumCallSession: { callSessionId: 'call-session-1' },
+            viventiumVoiceRequestId: 'voice-request-1',
+          },
+        },
+        [],
+      );
+
+      await TestClient.sendMessage('Hello from voice', {
+        user,
+        conversationId: 'voice-convo',
+      });
+
+      const savedMessages = saveMessage.mock.calls.map((call) => call[1]);
+      expect(savedMessages).toHaveLength(2);
+      for (const saved of savedMessages) {
+        expect(saved.metadata).toEqual(
+          expect.objectContaining({
+            viventium: expect.objectContaining({
+              callSessionId: 'call-session-1',
+              voiceRequestId: 'voice-request-1',
+              surface: 'voice',
+              inputMode: 'voice_call',
+            }),
+          }),
+        );
+      }
+    });
+
+    test('sanitizes voice assistant text before the first BaseClient database save', async () => {
+      const user = { id: 'user-id' };
+      saveMessage.mockClear();
+      saveConvo.mockClear();
+      getConvo.mockClear();
+      getConvo.mockResolvedValue(null);
+      saveConvo.mockResolvedValue({ conversationId: 'voice-convo' });
+      saveMessage.mockResolvedValue({});
+      TestClient = initializeFakeClient(
+        apiKey,
+        {
+          ...options,
+          endpoint: 'agents',
+          endpointType: 'agents',
+          req: {
+            user,
+            body: {
+              voiceMode: true,
+              viventiumSurface: 'voice',
+              viventiumInputMode: 'voice_call',
+            },
+            viventiumCallSession: { callSessionId: 'call-session-1' },
+          },
+        },
+        [],
+      );
+      TestClient.sendCompletion = jest.fn(async () => ({
+        completion: '**bold** _italic_ *** rule *** Done',
+        metadata: undefined,
+      }));
+
+      await TestClient.sendMessage('Hello from voice', {
+        user,
+        conversationId: 'voice-convo',
+      });
+
+      const assistantSave = saveMessage.mock.calls
+        .map((call) => call[1])
+        .find((message) => message.isCreatedByUser === false);
+      expect(assistantSave.text).toBe('bold italic rule Done');
     });
 
     test('should handle existing conversation when getConvo retrieves one', async () => {

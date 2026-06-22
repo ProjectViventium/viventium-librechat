@@ -153,6 +153,7 @@ const anthropicModels = {
   'claude-opus-4': 200000,
   'claude-opus-4-5': 200000,
   'claude-opus-4-7': 1000000,
+  'claude-opus-4-8': 1000000, // VIVENTIUM: opus-4.8 context window
 };
 
 const deepseekModels = {
@@ -398,6 +399,7 @@ const anthropicMaxOutputs = {
   'claude-opus-4': 32000,
   'claude-opus-4-5': 64000,
   'claude-opus-4-7': 128000,
+  'claude-opus-4-8': 128000, // VIVENTIUM: opus-4.8 max output
   'claude-3.5-sonnet': 8192,
   'claude-3-5-sonnet': 8192,
   'claude-3.7-sonnet': 128000,

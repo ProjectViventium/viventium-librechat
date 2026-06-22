@@ -472,6 +472,112 @@ describe('definitions.ts', () => {
         expect(toolDef.name).toBe('list_items_mcp_my-server');
         expect((toolDef as { serverName?: string }).serverName).toBe('my-server');
       });
+
+      it('hydrates independent MCP server definitions concurrently', async () => {
+        const calls: string[] = [];
+        const resolvers: Record<string, (value: Record<string, unknown>) => void> = {};
+        let bothCalledResolve: (() => void) | undefined;
+        const bothCalled = new Promise<void>((resolve) => {
+          bothCalledResolve = resolve;
+        });
+
+        mockGetOrFetchMCPServerTools.mockImplementation((_userId, serverName) => {
+          calls.push(serverName);
+          if (calls.length === 2) {
+            bothCalledResolve?.();
+          }
+          return new Promise((resolve) => {
+            resolvers[serverName] = resolve as (value: Record<string, unknown>) => void;
+          });
+        });
+
+        const params: LoadToolDefinitionsParams = {
+          userId: 'user-123',
+          agentId: 'agent-123',
+          tools: ['sys__all__sys_mcp_slow-one', 'sys__all__sys_mcp_slow-two'],
+        };
+
+        const deps: LoadToolDefinitionsDeps = {
+          getOrFetchMCPServerTools: mockGetOrFetchMCPServerTools,
+          isBuiltInTool: mockIsBuiltInTool,
+          loadAuthValues: mockLoadAuthValues,
+        };
+
+        const resultPromise = loadToolDefinitions(params, deps);
+        const concurrent = await Promise.race([
+          bothCalled.then(() => true),
+          new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 50)),
+        ]);
+
+        expect(concurrent).toBe(true);
+        expect(calls).toEqual(['slow-one', 'slow-two']);
+
+        resolvers['slow-one']({
+          'list_items_mcp_slow-one': {
+            function: {
+              name: 'list_items_mcp_slow-one',
+              description: 'List slow one',
+              parameters: { type: 'object', properties: {} },
+            },
+          },
+        });
+        resolvers['slow-two']({
+          'list_items_mcp_slow-two': {
+            function: {
+              name: 'list_items_mcp_slow-two',
+              description: 'List slow two',
+              parameters: { type: 'object', properties: {} },
+            },
+          },
+        });
+
+        const result = await resultPromise;
+        expect(result.toolDefinitions.map((tool) => tool.name)).toEqual([
+          'list_items_mcp_slow-one',
+          'list_items_mcp_slow-two',
+        ]);
+      });
+
+      it('caps independent MCP server definition hydration fan-out', async () => {
+        let inFlight = 0;
+        let maxInFlight = 0;
+        const serverNames = ['one', 'two', 'three', 'four', 'five', 'six'];
+
+        mockGetOrFetchMCPServerTools.mockImplementation(async (_userId, serverName) => {
+          inFlight += 1;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          inFlight -= 1;
+          return {
+            [`list_items_mcp_${serverName}`]: {
+              function: {
+                name: `list_items_mcp_${serverName}`,
+                description: `List ${serverName}`,
+                parameters: { type: 'object', properties: {} },
+              },
+            },
+          };
+        });
+
+        const params: LoadToolDefinitionsParams = {
+          userId: 'user-123',
+          agentId: 'agent-123',
+          tools: serverNames.map((serverName) => `sys__all__sys_mcp_${serverName}`),
+        };
+
+        const deps: LoadToolDefinitionsDeps = {
+          getOrFetchMCPServerTools: mockGetOrFetchMCPServerTools,
+          isBuiltInTool: mockIsBuiltInTool,
+          loadAuthValues: mockLoadAuthValues,
+        };
+
+        const result = await loadToolDefinitions(params, deps);
+        expect(maxInFlight).toBeGreaterThan(1);
+        expect(maxInFlight).toBeLessThanOrEqual(4);
+        expect(result.toolDefinitions.map((tool) => tool.name)).toEqual(
+          serverNames.map((serverName) => `list_items_mcp_${serverName}`),
+        );
+      });
     });
 
     describe('tool registry metadata', () => {

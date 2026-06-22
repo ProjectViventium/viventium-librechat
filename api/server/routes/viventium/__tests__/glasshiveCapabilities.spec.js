@@ -67,7 +67,9 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
   });
 
   test('returns MCP tools/list for a valid broker grant', async () => {
-    const { mintBrokerGrant } = require('~/server/services/viventium/GlassHiveCapabilityBrokerAuth');
+    const {
+      mintBrokerGrant,
+    } = require('~/server/services/viventium/GlassHiveCapabilityBrokerAuth');
     const { token } = mintBrokerGrant({
       user: { id: 'user-1', role: 'USER' },
       allowedServers: ['google_workspace'],
@@ -94,7 +96,9 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
   test('rate limits repeated broker requests for the same grant', async () => {
     process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_RATE_LIMIT_PER_WINDOW = '1';
     process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_RATE_LIMIT_WINDOW_MS = '60000';
-    const { mintBrokerGrant } = require('~/server/services/viventium/GlassHiveCapabilityBrokerAuth');
+    const {
+      mintBrokerGrant,
+    } = require('~/server/services/viventium/GlassHiveCapabilityBrokerAuth');
     const { token } = mintBrokerGrant({
       user: { id: 'user-1', role: 'USER' },
       allowedServers: ['google_workspace'],
@@ -119,7 +123,9 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
   });
 
   test('accepts an expired grant inside its bounded renewal window', async () => {
-    const { mintBrokerGrant } = require('~/server/services/viventium/GlassHiveCapabilityBrokerAuth');
+    const {
+      mintBrokerGrant,
+    } = require('~/server/services/viventium/GlassHiveCapabilityBrokerAuth');
     const { token } = mintBrokerGrant({
       user: { id: 'user-1', role: 'USER' },
       allowedServers: ['google_workspace'],
@@ -146,7 +152,9 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
   });
 
   test('accepts MCP initialized notifications without a JSON-RPC response body', async () => {
-    const { mintBrokerGrant } = require('~/server/services/viventium/GlassHiveCapabilityBrokerAuth');
+    const {
+      mintBrokerGrant,
+    } = require('~/server/services/viventium/GlassHiveCapabilityBrokerAuth');
     const { token } = mintBrokerGrant({
       user: { id: 'user-1', role: 'USER' },
       allowedServers: ['google_workspace'],
@@ -162,7 +170,9 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
   });
 
   test('returns structured content for tools/call', async () => {
-    const { mintBrokerGrant } = require('~/server/services/viventium/GlassHiveCapabilityBrokerAuth');
+    const {
+      mintBrokerGrant,
+    } = require('~/server/services/viventium/GlassHiveCapabilityBrokerAuth');
     const { token } = mintBrokerGrant({
       user: { id: 'user-1', role: 'USER' },
       allowedServers: ['google_workspace'],
@@ -188,7 +198,9 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
     // object per MCP, so emitting an array makes strict clients (claude-code workers)
     // reject the result with "expected record, received array". The array must still
     // reach the worker via the text content block.
-    const { mintBrokerGrant } = require('~/server/services/viventium/GlassHiveCapabilityBrokerAuth');
+    const {
+      mintBrokerGrant,
+    } = require('~/server/services/viventium/GlassHiveCapabilityBrokerAuth');
     const { token } = mintBrokerGrant({
       user: { id: 'user-1', role: 'USER' },
       allowedServers: ['ms-365'],

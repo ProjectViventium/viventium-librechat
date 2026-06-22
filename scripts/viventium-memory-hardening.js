@@ -56,6 +56,7 @@ const DEFAULT_TRANSCRIPT_RAG_MODE = 'detailed_summary_only';
 const DEFAULT_TRANSCRIPT_VECTOR_HEALTH_TIMEOUT_MS = 5000;
 const DEFAULT_MEMORY_HARDENING_MIN_APPLY_INTERVAL_SECONDS = 5 * 60;
 const DEFAULT_MEMORY_HARDENING_PROBE_TIMEOUT_MS = 30000;
+const DEFAULT_MEMORY_HARDENING_MODEL_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_MEMORY_HARDENING_LOCK_STALE_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_TRANSCRIPT_IGNORE_GLOBS = [
   '**/.DS_Store',
@@ -88,7 +89,7 @@ const STABLE_TRANSCRIPT_MEMORY_KEYS = new Set([
 ]);
 const MODEL_FALLBACK_SEPARATOR = /[,;]/;
 const DEFAULT_MEMORY_HARDENING_MODEL_FALLBACKS = [
-  { provider: 'anthropic', model: 'claude-opus-4-7', effort: 'xhigh', source: 'default' },
+  { provider: 'anthropic', model: 'claude-opus-4-8', effort: 'xhigh', source: 'default' },
   { provider: 'anthropic', model: 'opus', effort: 'xhigh', source: 'default' },
   { provider: 'openai', model: 'gpt-5.5', effort: 'high', source: 'default' },
   { provider: 'openai', model: 'gpt-5.4', effort: 'high', source: 'default' },
@@ -1522,6 +1523,7 @@ Hard constraints:
 - Output JSON only, matching the schema implied by:
   { "operations": [{ "key", "action", "value", "rationale", "evidence" }], "transcript_summaries": [] }.
 - Valid actions are set, delete, noop.
+- Every operation must include a string value field; use "" for noop/delete when no replacement value applies.
 - Never edit the "working" key in this batch job.
 - Do not delete non-empty keys unless the operator explicitly enabled deletion. Prefer set with a compact corrected value.
 - Preserve unrelated memory. Do not rewrite a whole key just to change style.
@@ -2005,7 +2007,7 @@ function resolveProvider(options = {}) {
         options.model ||
         selectedModelFromCompiler ||
         (explicit === 'anthropic'
-          ? process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_MODEL || 'claude-opus-4-7'
+          ? process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_MODEL || 'claude-opus-4-8'
           : process.env.VIVENTIUM_MEMORY_HARDENING_OPENAI_MODEL || 'gpt-5.5'),
       effort:
         explicit === 'anthropic'
@@ -2022,7 +2024,7 @@ function resolveProvider(options = {}) {
   if (providers.includes('anthropic')) {
     return withResolvedCandidates({
       provider: 'anthropic',
-      model: process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_MODEL || 'claude-opus-4-7',
+      model: process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_MODEL || 'claude-opus-4-8',
       effort:
         process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_EFFORT ||
         process.env.VIVENTIUM_MEMORY_HARDENING_EFFORT ||
@@ -2192,12 +2194,38 @@ function withTempJsonFile(prefix, payload, callback) {
   }
 }
 
+function codexOutputSchema(schema) {
+  if (!schema || typeof schema !== 'object') return schema;
+  if (Array.isArray(schema)) return schema.map(codexOutputSchema);
+
+  const output = { ...schema };
+  if (output.oneOf) {
+    // Codex/OpenAI structured outputs reject oneOf, while anyOf preserves the same
+    // model-facing union shape. The runtime validator still owns the final evidence contract.
+    output.anyOf = codexOutputSchema(output.oneOf);
+    delete output.oneOf;
+  }
+  for (const key of ['items', 'anyOf', 'allOf']) {
+    if (output[key]) output[key] = codexOutputSchema(output[key]);
+  }
+  if (output.properties && typeof output.properties === 'object' && !Array.isArray(output.properties)) {
+    output.properties = Object.fromEntries(
+      Object.entries(output.properties).map(([key, value]) => [key, codexOutputSchema(value)]),
+    );
+    output.required = Object.keys(output.properties);
+    if (output.type === 'object' && output.additionalProperties === undefined) {
+      output.additionalProperties = false;
+    }
+  }
+  return output;
+}
+
 function runCodexStructured({ prompt, model, effort, schema, timeoutMs }) {
   const outputPath = path.join(
     os.tmpdir(),
     `viventium-codex-output-${Date.now()}-${Math.random().toString(36).slice(2)}.json`,
   );
-  return withTempJsonFile('viventium-codex-schema', schema, (schemaPath) => {
+  return withTempJsonFile('viventium-codex-schema', codexOutputSchema(schema), (schemaPath) => {
     try {
       const stdout = runCommand(
         'codex',
@@ -2319,7 +2347,10 @@ function invokeModel({ prompt, provider, model, effort }) {
     model,
     effort,
     schema: proposalSchema(),
-    timeoutMs: Number(process.env.VIVENTIUM_MEMORY_HARDENING_MODEL_TIMEOUT_MS || 900000),
+    timeoutMs: Number(
+      process.env.VIVENTIUM_MEMORY_HARDENING_MODEL_TIMEOUT_MS ||
+        DEFAULT_MEMORY_HARDENING_MODEL_TIMEOUT_MS,
+    ),
   });
 }
 
@@ -2388,7 +2419,10 @@ function invokeModelWithFallback({ prompt, providerInfo }) {
     prompt,
     providerInfo,
     schema: proposalSchema(),
-    timeoutMs: Number(process.env.VIVENTIUM_MEMORY_HARDENING_MODEL_TIMEOUT_MS || 900000),
+    timeoutMs: Number(
+      process.env.VIVENTIUM_MEMORY_HARDENING_MODEL_TIMEOUT_MS ||
+        DEFAULT_MEMORY_HARDENING_MODEL_TIMEOUT_MS,
+    ),
   });
   return {
     proposal: result.output,
@@ -2413,7 +2447,10 @@ function invokeTranscriptSummaryModel({
     model,
     effort,
     schema: transcriptSummarySchema(maxChars),
-    timeoutMs: Number(process.env.VIVENTIUM_MEMORY_HARDENING_MODEL_TIMEOUT_MS || 900000),
+    timeoutMs: Number(
+      process.env.VIVENTIUM_MEMORY_HARDENING_MODEL_TIMEOUT_MS ||
+        DEFAULT_MEMORY_HARDENING_MODEL_TIMEOUT_MS,
+    ),
   });
   const summary = sanitizeTranscriptSummary(output?.summary || '', maxChars);
   if (!summary) {
@@ -2439,7 +2476,10 @@ function invokeTranscriptSummaryModelWithFallback({
     prompt,
     providerInfo,
     schema: transcriptSummarySchema(maxChars),
-    timeoutMs: Number(process.env.VIVENTIUM_MEMORY_HARDENING_MODEL_TIMEOUT_MS || 900000),
+    timeoutMs: Number(
+      process.env.VIVENTIUM_MEMORY_HARDENING_MODEL_TIMEOUT_MS ||
+        DEFAULT_MEMORY_HARDENING_MODEL_TIMEOUT_MS,
+    ),
   });
   const output = result.output;
   const summary = sanitizeTranscriptSummary(output?.summary || '', maxChars);
@@ -4767,6 +4807,31 @@ async function applyExistingRun(options) {
   }
 }
 
+function recordRollbackResult({ runDir, runId, result }) {
+  safeJsonWrite(path.join(runDir, 'rollback-summary.json'), result, 0o600);
+
+  const summaryPath = path.join(runDir, 'summary.json');
+  const summary = fs.existsSync(summaryPath) ? readJson(summaryPath) : {};
+  const restoredCount = Array.isArray(result.restored) ? result.restored.length : 0;
+  const nextSummary = {
+    ...summary,
+    rolled_back_at: result.rolled_back_at,
+    rollback_summary_file: 'rollback-summary.json',
+    rollback_restored_count: restoredCount,
+  };
+  safeJsonWrite(summaryPath, nextSummary, 0o600);
+
+  safeJsonlAppend(path.join(runDir, 'run-log.redacted.jsonl'), [
+    {
+      event: 'rollback_run',
+      run_id: runId,
+      restored_user_count: restoredCount,
+      rolled_back_at: result.rolled_back_at,
+    },
+  ]);
+  return nextSummary;
+}
+
 async function rollbackRun(options) {
   if (!options.runId) throw new Error('rollback requires --run-id');
   const paths = resolveStatePaths(options);
@@ -4793,7 +4858,7 @@ async function rollbackRun(options) {
       restored,
       rolled_back_at: new Date().toISOString(),
     };
-    safeJsonWrite(path.join(runDir, 'rollback-summary.json'), result, 0o600);
+    recordRollbackResult({ runDir, runId: options.runId, result });
     return result;
   } finally {
     releaseLock();
@@ -4878,6 +4943,10 @@ function status(options) {
           status: latest.status || 'success',
           failure_reason: latest.failure?.reason || null,
           failure_phase: latest.failure?.phase || null,
+          applied_at: latest.applied_at || (latest.mode === 'apply' ? latest.finished_at || null : null),
+          rolled_back_at: latest.rolled_back_at || null,
+          rollback_summary_file: latest.rollback_summary_file || null,
+          rollback_restored_count: latest.rollback_restored_count ?? null,
           finished_at: latest.finished_at || latest.applied_at || null,
           user_count: Array.isArray(latest.users) ? latest.users.length : 0,
         }
@@ -4910,6 +4979,7 @@ if (require.main === module) {
 
 module.exports = {
   DEFAULT_VALID_KEYS,
+  DEFAULT_MEMORY_HARDENING_MODEL_TIMEOUT_MS,
   acquireLock,
   applyUserProposal,
   applyTranscriptVectorLifecycle,
@@ -4920,6 +4990,7 @@ module.exports = {
   buildTranscriptReferenceContext,
   buildTranscriptSummaryPrompt,
   classifyVectorPresenceFailure,
+  codexOutputSchema,
   buildUserProposal,
   classifyModelCallFailure,
   deferTranscriptLifecycleWhenRagUnavailable,
@@ -4953,12 +5024,14 @@ module.exports = {
   sliceTranscriptText,
   sortTranscriptInventoryFiles,
   STABLE_TRANSCRIPT_MEMORY_KEYS,
+  status,
   TRANSCRIPT_IDENTITY_MEMORY_KEYS,
   transcriptSummarySchema,
   transcriptSummaryMap,
   transcriptCaveatPrompt,
   transcriptPromptVersion,
   validateProposal,
+  recordRollbackResult,
   writeEfficiencyMarker,
   userHash,
 };

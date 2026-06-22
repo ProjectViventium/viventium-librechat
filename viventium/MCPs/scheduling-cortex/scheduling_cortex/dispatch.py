@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import calendar
 import subprocess
 import sys
 import time
@@ -11,7 +12,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -25,9 +26,16 @@ SCHEDULED_SELF_PROMPT_LINE = (
     "not a new user scheduling request."
 )
 LIVE_FACT_CONTRACT_LINE = (
-    "For live external facts such as weather, news, markets, or web facts, include them only "
-    "when a verified tool/cortex result is present; otherwise omit that section instead of "
-    "guessing, inferring from memory, or apologizing about missing data."
+    "For live external facts such as weather, news, markets, web facts, calendar, email, tasks, "
+    "current-day plans, or connected-account facts, include them only when a verified tool/cortex "
+    "result or the deterministic scheduled-run context below supports the claim; otherwise omit "
+    "that section instead of guessing, inferring from memory, or apologizing about missing data."
+)
+SCHEDULED_RUN_CONTEXT_HEADER = "## Scheduled Run Context (Deterministic)"
+SCHEDULED_RUN_CONTEXT_CONTRACT_LINE = (
+    "Use `scheduled_due_local_date` as the anchor date for this run. Do not carry forward dates "
+    "or day labels from earlier messages in the conversation, and do not use the next recurrence "
+    "as today's date."
 )
 DEFAULT_SCHEDULER_PROMPT_PREFIX = "\n".join(
     [
@@ -49,7 +57,7 @@ DEFAULT_SCHEDULER_PROMPT_PREFIX = "\n".join(
 # Feature: Multi-channel dispatch support.
 from .models import AVAILABLE_CHANNELS, DEFAULT_DELIVERY_CHANNELS
 from .storage import ScheduleStorage, StorageConfig
-from .utils import to_utc_iso
+from .utils import ensure_timezone, parse_iso, to_utc_iso
 # === VIVENTIUM END ===
 
 # === VIVENTIUM NOTE ===
@@ -360,15 +368,61 @@ def render_telegram_markdown(text: str) -> str:
 
 
 class HttpJsonError(RuntimeError):
-    def __init__(self, message: str, *, status: int, method: str, path: str) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int,
+        method: str,
+        path: str,
+        payload: Optional[Dict[str, Any]] = None,
+        reason: str = "",
+        detail: str = "",
+        failure_class: str = "",
+        failure_retryable: Optional[bool] = None,
+    ) -> None:
         super().__init__(message)
         self.status = status
         self.method = method
         self.path = path
+        self.payload = payload or {}
+        self.reason = reason
+        self.detail = detail
+        self.failure_class = failure_class
+        self.failure_retryable = failure_retryable
+
+
+def _http_payload_text(payload: Dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, (dict, list, tuple, set)):
+            continue
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _http_payload_retryable(payload: Dict[str, Any]) -> Optional[bool]:
+    if "failure_retryable" not in payload:
+        return None
+    value = payload.get("failure_retryable")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off", ""}:
+            return False
+    return None
 
 
 def _format_http_error(method: str, url: str, error: urllib.error.HTTPError) -> HttpJsonError:
     body_text = ""
+    payload: Optional[Dict[str, Any]] = None
     try:
         raw_body = error.read()
     except Exception:
@@ -379,23 +433,39 @@ def _format_http_error(method: str, url: str, error: urllib.error.HTTPError) -> 
 
     error_message = error.reason or error.msg or "Request failed"
     reason = ""
+    detail = ""
+    failure_class = ""
+    failure_retryable: Optional[bool] = None
     if body_text:
         try:
-            payload = json.loads(body_text)
+            parsed_payload = json.loads(body_text)
         except json.JSONDecodeError:
             error_message = body_text
         else:
-            error_message = str(payload.get("error") or error_message)
-            reason = str(payload.get("reason") or "")
+            if isinstance(parsed_payload, dict):
+                payload = parsed_payload
+                detail = _http_payload_text(payload, "detail", "message", "error")
+                failure_class = _http_payload_text(payload, "failure_class")
+                reason = _http_payload_text(payload, "reason", "status")
+                failure_retryable = _http_payload_retryable(payload)
+                error_message = detail or _http_payload_text(payload, "error") or error_message
+            else:
+                error_message = body_text
 
     parsed = urllib.parse.urlparse(url)
     path = parsed.path or url
-    reason_suffix = f" ({reason})" if reason else ""
+    classification = failure_class or reason
+    reason_suffix = f" ({classification})" if classification else ""
     return HttpJsonError(
         f"{method} {path} failed: HTTP {error.code}{reason_suffix}: {error_message}",
         status=error.code,
         method=method,
         path=path,
+        payload=payload,
+        reason=reason,
+        detail=detail,
+        failure_class=failure_class,
+        failure_retryable=failure_retryable,
     )
 
 
@@ -533,16 +603,230 @@ def _ensure_live_fact_contract(text: str) -> str:
     return f"{cleaned}\n\n{LIVE_FACT_CONTRACT_LINE}"
 
 
-def _compose_prompt(task: Dict[str, Any]) -> str:
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _task_schedule_timezone(task: Dict[str, Any]) -> str:
+    schedule = task.get("schedule") if isinstance(task.get("schedule"), dict) else {}
+    raw_timezone = str(schedule.get("timezone") or "UTC").strip() or "UTC"
+    try:
+        ensure_timezone(raw_timezone)
+    except Exception:
+        return "UTC"
+    return raw_timezone
+
+
+def _parse_scheduled_due_at(task: Dict[str, Any], now_utc: datetime) -> datetime:
+    raw_due_at = str(task.get("next_run_at") or "").strip()
+    if raw_due_at:
+        try:
+            return parse_iso(raw_due_at, timezone.utc).astimezone(timezone.utc)
+        except Exception:
+            logger.warning(
+                "[scheduling-cortex] Invalid next_run_at for scheduled run context: task_id=%s",
+                task.get("id"),
+            )
+    return now_utc.astimezone(timezone.utc)
+
+
+def _format_local_date_label(value: datetime) -> str:
+    return f"{value.strftime('%A, %B')} {value.day}, {value.year}"
+
+
+def _build_scheduled_run_context(
+    task: Dict[str, Any],
+    *,
+    now_utc: Optional[datetime] = None,
+) -> Dict[str, str]:
+    now = (now_utc or _utc_now()).astimezone(timezone.utc)
+    schedule = task.get("schedule") if isinstance(task.get("schedule"), dict) else {}
+    timezone_name = _task_schedule_timezone(task)
+    tz = ensure_timezone(timezone_name)
+    due_at_utc = _parse_scheduled_due_at(task, now)
+    due_local = due_at_utc.astimezone(tz)
+    current_local = now.astimezone(tz)
+    window_start_local = datetime(
+        due_local.year,
+        due_local.month,
+        due_local.day,
+        tzinfo=tz,
+    )
+    window_end_local = window_start_local + timedelta(days=1)
+
+    return {
+        "run_started_at_utc": to_utc_iso(now),
+        "scheduled_due_at_utc": to_utc_iso(due_at_utc),
+        "scheduled_due_local": due_local.isoformat(),
+        "scheduled_due_local_date": _format_local_date_label(due_local),
+        "scheduled_due_local_date_iso": due_local.date().isoformat(),
+        "schedule_timezone": timezone_name,
+        "current_schedule_local_time": current_local.isoformat(),
+        "calendar_window_local_start": window_start_local.isoformat(),
+        "calendar_window_local_end_exclusive": window_end_local.isoformat(),
+        "calendar_window_utc_start": to_utc_iso(window_start_local),
+        "calendar_window_utc_end_exclusive": to_utc_iso(window_end_local),
+        "schedule_type": str(schedule.get("type") or "").strip(),
+        "schedule_time": str(schedule.get("time") or "").strip(),
+    }
+
+
+def _has_scheduled_run_context(text: str) -> bool:
+    return isinstance(text, str) and SCHEDULED_RUN_CONTEXT_HEADER.lower() in text.lower()
+
+
+def _format_scheduled_run_context_block(run_context: Dict[str, str]) -> str:
+    fields = [
+        "run_started_at_utc",
+        "scheduled_due_at_utc",
+        "scheduled_due_local",
+        "scheduled_due_local_date",
+        "scheduled_due_local_date_iso",
+        "schedule_timezone",
+        "current_schedule_local_time",
+        "calendar_window_local_start",
+        "calendar_window_local_end_exclusive",
+        "calendar_window_utc_start",
+        "calendar_window_utc_end_exclusive",
+        "schedule_type",
+        "schedule_time",
+    ]
+    lines = [SCHEDULED_RUN_CONTEXT_HEADER]
+    for field in fields:
+        value = str(run_context.get(field) or "").strip()
+        if value:
+            lines.append(f"- {field}: {value}")
+    lines.append(SCHEDULED_RUN_CONTEXT_CONTRACT_LINE)
+    lines.append(
+        "For calendar/email/task sections, use the calendar window above and verified tool/cortex "
+        "results. If those results are unavailable, do not invent events, tasks, or day-specific plans."
+    )
+    return "\n".join(lines)
+
+
+_WEEKDAY_NAME_TO_INDEX = {calendar.day_name[index].lower(): index for index in range(7)}
+_MONTH_NAME_TO_INDEX = {calendar.month_name[index].lower(): index for index in range(1, 13)}
+_MONTH_NAME_TO_INDEX.update({calendar.month_abbr[index].lower(): index for index in range(1, 13)})
+_OPENING_DATE_CLAIM_RE = re.compile(
+    r"""
+    (?P<weekday>Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)
+    [,\s]+
+    (?P<month>January|February|March|April|May|June|July|August|September|October|November|December|
+       Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)
+    \s+
+    (?P<day>\d{1,2})
+    (?:,?\s+(?P<year>\d{4}))?
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _opening_date_window(text: str) -> Tuple[str, int]:
+    if not isinstance(text, str) or not text.strip():
+        return "", 0
+    left_stripped = text.lstrip()
+    offset = len(text) - len(left_stripped)
+    first_line = left_stripped.splitlines()[0]
+    return first_line[:220], offset
+
+
+def _expected_due_local_date(run_context: Dict[str, str]) -> Optional[datetime]:
+    raw_due_local = str(run_context.get("scheduled_due_local") or "").strip()
+    if not raw_due_local:
+        return None
+    try:
+        return datetime.fromisoformat(raw_due_local)
+    except ValueError:
+        return None
+
+
+def _scheduled_date_guard_for_text(
+    text: str,
+    run_context: Dict[str, str],
+) -> Tuple[str, Dict[str, str]]:
+    due_local = _expected_due_local_date(run_context)
+    if due_local is None or not isinstance(text, str) or not text.strip():
+        return text, {"status": "not_applicable"}
+
+    window, offset = _opening_date_window(text)
+    match = _OPENING_DATE_CLAIM_RE.search(window)
+    expected_label = str(run_context.get("scheduled_due_local_date") or "").strip()
+    if not match:
+        return text, {"status": "no_opening_date_claim", "expected": expected_label}
+
+    original_claim = match.group(0).strip()
+    if match.start() != 0:
+        return text, {
+            "status": "mismatch_unmodified",
+            "expected": expected_label,
+            "claim": original_claim,
+            "reason": "opening_date_not_leading",
+        }
+
+    weekday = match.group("weekday")
+    month = match.group("month")
+    day = int(match.group("day"))
+    year = int(match.group("year") or due_local.year)
+    claimed_weekday = _WEEKDAY_NAME_TO_INDEX.get(weekday.lower())
+    claimed_month = _MONTH_NAME_TO_INDEX.get(month.lower())
+    expected_tuple = (due_local.year, due_local.month, due_local.day, due_local.weekday())
+    claimed_tuple = (year, claimed_month, day, claimed_weekday)
+
+    if claimed_tuple == expected_tuple:
+        return text, {"status": "passed", "expected": expected_label, "claim": original_claim}
+
+    if not expected_label:
+        return text, {"status": "mismatch_unmodified", "claim": original_claim}
+
+    corrected = text[: offset + match.start()] + expected_label + text[offset + match.end() :]
+    return corrected, {
+        "status": "corrected",
+        "expected": expected_label,
+        "claim": original_claim,
+    }
+
+
+def _apply_scheduled_date_guard(
+    final_text: str,
+    followup_text: str,
+    run_context: Dict[str, str],
+) -> Tuple[str, str, Dict[str, str]]:
+    final_text, final_guard = _scheduled_date_guard_for_text(final_text, run_context)
+    followup_text, followup_guard = _scheduled_date_guard_for_text(followup_text, run_context)
+    if final_guard.get("status") == "corrected" or followup_guard.get("status") == "corrected":
+        logger.warning(
+            "[scheduling-cortex] Corrected scheduled generated opening date claim: expected=%s final_status=%s followup_status=%s",
+            final_guard.get("expected") or followup_guard.get("expected"),
+            final_guard.get("status"),
+            followup_guard.get("status"),
+        )
+    return final_text, followup_text, {
+        "final": final_guard,
+        "followup": followup_guard,
+    }
+
+
+def _compose_prompt(
+    task: Dict[str, Any],
+    *,
+    run_context: Optional[Dict[str, str]] = None,
+    now_utc: Optional[datetime] = None,
+) -> str:
     base = (task.get("prompt") or "").strip()
     prefix = _get_prompt_prefix()
-    composed = base
-    if not prefix or _looks_like_scheduled_self_prompt(base):
-        return _ensure_live_fact_contract(composed)
-    if not base:
-        composed = prefix
-    else:
-        composed = f"{prefix}\n\n{base}"
+    context = run_context or _build_scheduled_run_context(task, now_utc=now_utc)
+    context_block = "" if _has_scheduled_run_context(base) else _format_scheduled_run_context_block(context)
+    parts: list[str] = []
+    base_has_scheduler_prefix = _looks_like_scheduled_self_prompt(base)
+    if prefix and not base_has_scheduler_prefix:
+        parts.append(prefix)
+    if base and base_has_scheduler_prefix:
+        parts.append(base)
+    if context_block:
+        parts.append(context_block)
+    if base and not base_has_scheduler_prefix:
+        parts.append(base)
+    composed = "\n\n".join(part for part in parts if part).strip()
     return _ensure_live_fact_contract(composed)
 
 
@@ -1093,17 +1377,11 @@ def _stream_telegram_response(
     timeout_s: int,
 ) -> Tuple[str, str, str]:
     # === VIVENTIUM NOTE ===
-    # Feature: Extend stream for follow-ups and capture response metadata.
+    # Feature: Capture final response metadata from Telegram streams.
+    # Follow-ups are polled after the final event so a successful delivery never waits
+    # on an open SSE stream.
     # === VIVENTIUM NOTE ===
     params_data = {"telegramUserId": telegram_user_id, "telegramChatId": telegram_chat_id}
-    linger_grace_s = _parse_positive_float(
-        os.getenv("SCHEDULER_TELEGRAM_FOLLOWUP_GRACE_S")
-        or os.getenv("VIVENTIUM_TELEGRAM_FOLLOWUP_GRACE_S"),
-        8.0,
-    )
-    if linger_grace_s > 0:
-        params_data["linger"] = "true"
-        params_data["lingerMs"] = str(int(linger_grace_s * 1000))
     params = urllib.parse.urlencode(params_data)
     url = f"{base_url}/api/viventium/telegram/stream/{stream_id}?{params}"
     headers = {"X-VIVENTIUM-TELEGRAM-SECRET": secret}
@@ -1111,7 +1389,6 @@ def _stream_telegram_response(
     final_text = ""
     response_message_id = ""
     followup_text = ""
-    saw_final = False
     for raw in _iter_sse_payloads(url, headers, timeout_s):
         try:
             payload = json.loads(raw)
@@ -1130,8 +1407,6 @@ def _stream_telegram_response(
         if not final_text:
             chunks.extend([c for c in _extract_text_deltas(payload) if c])
         if payload.get("final"):
-            saw_final = True
-        if saw_final and followup_text:
             break
     if not final_text:
         final_text = "".join(chunks).strip()
@@ -1148,14 +1423,6 @@ def _stream_scheduler_response(
     timeout_s: int,
 ) -> Tuple[str, str, str]:
     params_data = {"userId": str(user_id)}
-    linger_grace_s = _parse_positive_float(
-        os.getenv("SCHEDULER_FOLLOWUP_GRACE_S")
-        or os.getenv("VIVENTIUM_SCHEDULER_FOLLOWUP_GRACE_S"),
-        8.0,
-    )
-    if linger_grace_s > 0:
-        params_data["linger"] = "true"
-        params_data["lingerMs"] = str(int(linger_grace_s * 1000))
     params = urllib.parse.urlencode(params_data)
     url = f"{base_url}/api/viventium/scheduler/stream/{stream_id}?{params}"
     headers = {"X-VIVENTIUM-SCHEDULER-SECRET": secret}
@@ -1163,7 +1430,6 @@ def _stream_scheduler_response(
     final_text = ""
     response_message_id = ""
     followup_text = ""
-    saw_final = False
     for raw in _iter_sse_payloads(url, headers, timeout_s):
         try:
             payload = json.loads(raw)
@@ -1182,8 +1448,6 @@ def _stream_scheduler_response(
         if not final_text:
             chunks.extend([c for c in _extract_text_deltas(payload) if c])
         if payload.get("final"):
-            saw_final = True
-        if saw_final and followup_text:
             break
     if not final_text:
         final_text = "".join(chunks).strip()
@@ -1240,13 +1504,17 @@ def _run_scheduler_generation(
         )
 
     schedule = task.get("schedule") or {}
+    run_context = _build_scheduled_run_context(task)
     payload = {
         "userId": task.get("user_id"),
         "agentId": task.get("agent_id"),
-        "text": _compose_prompt(task),
+        "text": _compose_prompt(task, run_context=run_context),
         "conversationId": conversation_id,
         "scheduleId": task.get("id"),
         "clientTimezone": schedule.get("timezone") or "UTC",
+        "clientTimestamp": run_context.get("run_started_at_utc"),
+        "scheduledDueAt": run_context.get("scheduled_due_at_utc"),
+        "schedulerRunContext": run_context,
     }
     headers = {
         "Content-Type": "application/json",
@@ -1303,6 +1571,11 @@ def _run_scheduler_generation(
         followup_text = ""
         followup_text_source = ""
         followup_text_fallback_reason = ""
+    final_text, followup_text, date_guard = _apply_scheduled_date_guard(
+        final_text,
+        followup_text,
+        run_context,
+    )
 
     return {
         "conversation_id": resolved_conversation_id,
@@ -1314,6 +1587,7 @@ def _run_scheduler_generation(
         "followup_text_source": followup_text_source,
         "followup_text_fallback_reason": followup_text_fallback_reason,
         "suppressed_fallback_reason": suppressed_fallback_reason,
+        "date_guard": date_guard,
     }
 
 
@@ -2099,6 +2373,41 @@ def _safe_result_summary(text: Any, limit: int = 2000) -> str:
     return value[: limit - 1].rstrip() + "..."
 
 
+def _scheduled_prompt_error_class(exc: Exception) -> str:
+    if isinstance(exc, HttpJsonError) and exc.failure_class:
+        return _safe_result_summary(exc.failure_class, limit=128)
+    return exc.__class__.__name__
+
+
+def _glasshive_execution_profile(wb: Dict[str, Any]) -> str:
+    return str(wb.get("execution_profile") or "codex-cli").strip() or "codex-cli"
+
+
+def _glasshive_execution_mode(wb: Dict[str, Any]) -> str:
+    return str(wb.get("execution_mode") or "host").strip() or "host"
+
+
+def _glasshive_execution_backend(wb: Dict[str, Any]) -> str:
+    return str(wb.get("execution_backend") or wb.get("backend") or "openclaw").strip() or "openclaw"
+
+
+def _can_recover_workbench_host_dependency_to_docker(
+    exc: Exception,
+    *,
+    execution_mode: str,
+    workspace_root: str,
+) -> bool:
+    if not isinstance(exc, HttpJsonError):
+        return False
+    if exc.failure_class != "runtime_dependency_missing":
+        return False
+    if execution_mode != "host":
+        return False
+    if workspace_root:
+        return False
+    return True
+
+
 def _glasshive_instruction(task: Dict[str, Any], wb: Dict[str, Any]) -> str:
     memory_mode = str(wb.get("memory_write_mode") or "off").strip()
     my_folder = str(wb.get("my_folder") or "").strip()
@@ -2243,7 +2552,7 @@ def _ensure_glasshive_project(storage: ScheduleStorage, task: Dict[str, Any], wb
             "owner_id": str(task.get("user_id") or "workbench"),
             "title": title,
             "goal": "Execute private Prompt Workbench scheduled prompts.",
-            "default_worker_profile": "codex-cli",
+            "default_worker_profile": _glasshive_execution_profile(wb),
         },
         _glasshive_headers(),
         int(os.getenv("SCHEDULER_GLASSHIVE_HTTP_TIMEOUT_S", "20")),
@@ -2337,23 +2646,51 @@ def _dispatch_glasshive_task(task: Dict[str, Any]) -> Dict[str, Any]:
         alias = str(wb.get("workspace_alias") or f"workbench-scheduled-{str(wb.get('definition_id') or task.get('id'))[:12]}")
         if str(wb.get("glasshive_worker_strategy") or "same_worker").strip() == "new_worker_each_run":
             alias = f"{alias}-{run_id[-8:]}"
-        worker = _post_json(
-            f"{base_url}/v1/projects/{urllib.parse.quote(project_id)}/workers/find-or-resume",
-            {
-                "owner_id": str(task.get("user_id") or "workbench"),
-                "name": str(wb.get("title") or "Workbench Scheduled Prompt"),
-                "role": "Execute private Prompt Workbench scheduled prompts for Viventium.",
-                "profile": "codex-cli",
-                "backend": "openclaw",
-                "execution_mode": "host",
-                "alias": alias,
-                "workspace_root": str(wb.get("workspace_root") or ""),
-                "bootstrap_profile": "prompt-workbench-scheduled-v1",
-                "bootstrap_bundle": _glasshive_bootstrap_bundle(task, wb, run_id),
-            },
-            _glasshive_headers(),
-            timeout_s,
-        )
+        execution_profile = _glasshive_execution_profile(wb)
+        execution_mode = _glasshive_execution_mode(wb)
+        workspace_root = str(wb.get("workspace_root") or "").strip()
+        worker_payload = {
+            "owner_id": str(task.get("user_id") or "workbench"),
+            "name": str(wb.get("title") or "Workbench Scheduled Prompt"),
+            "role": "Execute private Prompt Workbench scheduled prompts for Viventium.",
+            "profile": execution_profile,
+            "backend": _glasshive_execution_backend(wb),
+            "execution_mode": execution_mode,
+            "alias": alias,
+            "workspace_root": workspace_root,
+            "bootstrap_profile": "prompt-workbench-scheduled-v1",
+            "bootstrap_bundle": _glasshive_bootstrap_bundle(task, wb, run_id),
+        }
+        runtime_recovery: Dict[str, Any] | None = None
+        find_or_resume_url = f"{base_url}/v1/projects/{urllib.parse.quote(project_id)}/workers/find-or-resume"
+        try:
+            worker = _post_json(
+                find_or_resume_url,
+                worker_payload,
+                _glasshive_headers(),
+                timeout_s,
+            )
+        except HttpJsonError as exc:
+            if not _can_recover_workbench_host_dependency_to_docker(
+                exc,
+                execution_mode=execution_mode,
+                workspace_root=workspace_root,
+            ):
+                raise
+            runtime_recovery = {
+                "from_execution_mode": "host",
+                "to_execution_mode": "docker",
+                "reason_class": exc.failure_class,
+            }
+            worker_payload = dict(worker_payload)
+            worker_payload["execution_mode"] = "docker"
+            worker = _post_json(
+                find_or_resume_url,
+                worker_payload,
+                _glasshive_headers(),
+                timeout_s,
+            )
+            execution_mode = "docker"
         worker_id = str(worker.get("worker_id") or "").strip()
         if not worker_id:
             raise RuntimeError("GlassHive worker find-or-resume did not return worker_id")
@@ -2373,21 +2710,29 @@ def _dispatch_glasshive_task(task: Dict[str, Any]) -> Dict[str, Any]:
                 "glasshive_project_id": project_id,
                 "glasshive_worker_id": worker_id,
                 "glasshive_run_id": glasshive_run_id,
-                "result_summary": "GlassHive host run queued.",
+                "result_summary": "GlassHive run queued after host runtime recovery to docker."
+                if runtime_recovery
+                else "GlassHive host run queued.",
                 "updated_at": to_utc_iso(datetime.now(timezone.utc)),
             },
+        )
+        delivery_reason = (
+            "glasshive_runtime_recovered_run_queued"
+            if runtime_recovery
+            else "glasshive_host_run_queued"
         )
         return {
             "delivery": {
                 "outcome": "queued",
-                "reason": "glasshive_host_run_queued",
+                "reason": delivery_reason,
                 "generated_text": None,
                 "channels": {
                     "workbench": {
                         "outcome": "queued",
-                        "reason": "glasshive_host_run_queued",
+                        "reason": delivery_reason,
                         "scheduled_prompt_run_id": run_id,
                         "glasshive_run_id": glasshive_run_id,
+                        **({"runtime_recovery": runtime_recovery} if runtime_recovery else {}),
                     }
                 },
             },
@@ -2400,7 +2745,7 @@ def _dispatch_glasshive_task(task: Dict[str, Any]) -> Dict[str, Any]:
             {
                 "status": "failed",
                 "completed_at": to_utc_iso(datetime.now(timezone.utc)),
-                "error_class": exc.__class__.__name__,
+                "error_class": _scheduled_prompt_error_class(exc),
                 "result_summary": _safe_result_summary(str(exc)),
                 "updated_at": to_utc_iso(datetime.now(timezone.utc)),
             },
@@ -2418,6 +2763,7 @@ def _prepare_generated_visibility(
     followup_text_source: str = "",
     followup_text_fallback_reason: str = "",
     suppressed_fallback_reason: str = "",
+    date_guard: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     raw_final_text = final_text.strip() if isinstance(final_text, str) else ""
     raw_followup_text = followup_text.strip() if isinstance(followup_text, str) else ""
@@ -2485,6 +2831,7 @@ def _prepare_generated_visibility(
         "followup_text_source": followup_text_source,
         "fallback_delivered": fallback_delivered,
         "fallback_reason": fallback_reason,
+        "date_guard": date_guard or {},
     }
 
 
@@ -2557,6 +2904,9 @@ def _build_librechat_delivery_detail(visibility: Dict[str, Any]) -> Dict[str, An
     late_delivery = visibility.get("late_delivery")
     if isinstance(late_delivery, dict):
         detail["late_delivery"] = late_delivery
+    date_guard = visibility.get("date_guard")
+    if isinstance(date_guard, dict) and date_guard:
+        detail["date_guard"] = date_guard
     return detail
 
 
@@ -2648,6 +2998,9 @@ def _deliver_telegram_generated_text(
     late_delivery = visibility.get("late_delivery")
     if isinstance(late_delivery, dict):
         detail["late_delivery"] = late_delivery
+    date_guard = visibility.get("date_guard")
+    if isinstance(date_guard, dict) and date_guard:
+        detail["date_guard"] = date_guard
     return detail
 
 
@@ -2686,6 +3039,7 @@ def dispatch_task(task: Dict[str, Any]) -> Dict[str, Any]:
         followup_text_source=str(generation_result.get("followup_text_source") or ""),
         followup_text_fallback_reason=str(generation_result.get("followup_text_fallback_reason") or ""),
         suppressed_fallback_reason=str(generation_result.get("suppressed_fallback_reason") or ""),
+        date_guard=generation_result.get("date_guard") if isinstance(generation_result.get("date_guard"), dict) else None,
     )
     visibility = _apply_late_delivery_notice(task, visibility)
 

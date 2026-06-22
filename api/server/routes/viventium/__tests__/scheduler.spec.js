@@ -402,7 +402,10 @@ describe('/api/viventium/scheduler/stream', () => {
     mockGetJob = jest.fn().mockResolvedValue({ metadata: { userId: 'user_1' } });
     mockGetResumeState = jest.fn().mockResolvedValue(null);
     mockSubscribe = jest.fn().mockImplementation(async (_streamId, onChunk, onDone) => {
-      onChunk({ event: 'on_message_delta', data: { delta: { content: [{ type: 'text', text: 'Hello ' }] } } });
+      onChunk({
+        event: 'on_message_delta',
+        data: { delta: { content: [{ type: 'text', text: 'Hello ' }] } },
+      });
       onDone({
         final: true,
         responseMessage: { text: 'Hello world', messageId: 'msg-1' },
@@ -442,9 +445,7 @@ describe('/api/viventium/scheduler/cortex', () => {
       text: 'Canonical response',
       content: [{ type: 'cortex_insight', status: 'complete', insight: 'done' }],
     });
-    mockGetMessages = jest.fn().mockResolvedValue([
-      { messageId: 'fu-1', text: 'Follow-up text' },
-    ]);
+    mockGetMessages = jest.fn().mockResolvedValue([{ messageId: 'fu-1', text: 'Follow-up text' }]);
     mockGetConvo = jest.fn().mockResolvedValue(null);
     mockResolveTelegramMappingByUserId = jest.fn().mockResolvedValue({ telegramUserId: 'tg-1' });
     mockGetAgent = jest.fn().mockResolvedValue({ avatar: { filepath: '/images/viventium.png' } });
@@ -548,9 +549,9 @@ Holding Examples
       text: 'Canonical replacement text',
       content: [{ type: 'cortex_insight', status: 'complete', insight: 'done' }],
     });
-    mockGetMessages = jest.fn().mockResolvedValue([
-      { messageId: 'msg-3', text: 'Canonical replacement text' },
-    ]);
+    mockGetMessages = jest
+      .fn()
+      .mockResolvedValue([{ messageId: 'msg-3', text: 'Canonical replacement text' }]);
 
     const schedulerRouter = require('../scheduler');
     const app = createTestApp(schedulerRouter);

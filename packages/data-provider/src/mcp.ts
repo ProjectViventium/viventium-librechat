@@ -52,7 +52,9 @@ const BaseOptionsSchema = z.object({
       defaultToolAccess: z
         .enum(['none', 'read_metadata', 'content_read', 'write'])
         .optional(),
-      contentReadPolicy: z.enum(['deny', 'require_explicit_intent', 'allow']).optional(),
+      contentReadPolicy: z
+        .enum(['deny', 'require_broker_grant', 'require_explicit_intent', 'allow'])
+        .optional(),
       writePolicy: z.enum(['deny', 'confirm', 'allow']).optional(),
       riskClass: z.string().optional(),
       reexportNativeTools: z.boolean().optional(),

@@ -2,7 +2,7 @@
 id: memory.hardener_consolidation
 owner_layer: viventium_memory_hardening
 target: memory_hardening.batch_consolidation.prompt
-version: 4
+version: 5
 status: active
 safety_class: public_product
 required_context:
@@ -22,6 +22,7 @@ Hard constraints:
 - Output JSON only, matching the schema implied by:
   { "operations": [{ "key", "action", "value", "rationale", "evidence" }], "transcript_summaries": [] }.
 - Valid actions are set, delete, noop.
+- Every operation must include a string value field; use "" for noop/delete when no replacement value applies.
 - Never edit the "working" key in this batch job.
 - Do not delete non-empty keys unless the operator explicitly enabled deletion. Prefer set with a compact corrected value.
 - Preserve unrelated memory. Do not rewrite a whole key just to change style.

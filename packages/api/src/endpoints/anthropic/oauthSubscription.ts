@@ -146,6 +146,63 @@ async function refreshAccessToken(
   return refreshedValues;
 }
 
+const VIV_FAILED_REFRESH_TTL_MS = 60 * 1000;
+const vivRefreshFailureCache = new Map<string, number>();
+const vivInFlightBackgroundRefresh = new Set<string>();
+
+/* === VIVENTIUM START ===
+ * Feature: Connected-account Anthropic OAuth fast path (non-blocking refresh + negative cache).
+ * Purpose: Keep subscription-token refresh off the chat critical path. A still-valid (near-expiry)
+ * token is used immediately while a background refresh updates it for the next turn; an expired or
+ * missing token is refreshed at most once per failure TTL so a broken refresh_token cannot fan out
+ * into multiple blocking failing fetches across main + cortex inits (the observed multi-second spike).
+ * Revert to the original blocking behavior with VIVENTIUM_ANTHROPIC_OAUTH_FAST_PATH=0.
+ * Added: 2026-05-29
+ * === VIVENTIUM END === */
+function isOAuthFastPathEnabled(): boolean {
+  const raw = process.env.VIVENTIUM_ANTHROPIC_OAUTH_FAST_PATH;
+  if (raw == null || raw === '') {
+    return true;
+  }
+  return !['0', 'false', 'no', 'off'].includes(String(raw).trim().toLowerCase());
+}
+
+function isRefreshNegativeCached(cacheKey: string): boolean {
+  const retryAfter = vivRefreshFailureCache.get(cacheKey);
+  if (retryAfter == null) {
+    return false;
+  }
+  if (retryAfter <= Date.now()) {
+    vivRefreshFailureCache.delete(cacheKey);
+    return false;
+  }
+  return true;
+}
+
+function scheduleBackgroundRefresh(
+  cacheKey: string,
+  userId: string,
+  userValues: AnthropicSubscriptionUserValues,
+  db: EndpointDbMethods,
+): void {
+  if (vivInFlightBackgroundRefresh.has(cacheKey) || isRefreshNegativeCached(cacheKey)) {
+    return;
+  }
+  vivInFlightBackgroundRefresh.add(cacheKey);
+  Promise.resolve()
+    .then(() => refreshAccessToken(userId, userValues, db))
+    .then(() => {
+      vivRefreshFailureCache.delete(cacheKey);
+    })
+    .catch((error) => {
+      vivRefreshFailureCache.set(cacheKey, Date.now() + VIV_FAILED_REFRESH_TTL_MS);
+      logger.warn('[Anthropic OAuth] Background refresh failed; will retry after TTL', error);
+    })
+    .finally(() => {
+      vivInFlightBackgroundRefresh.delete(cacheKey);
+    });
+}
+
 export async function resolveAnthropicSubscriptionUserValues(
   userId: string,
   userValues: UserKeyValues | null | undefined,
@@ -155,6 +212,48 @@ export async function resolveAnthropicSubscriptionUserValues(
     return userValues ?? null;
   }
 
+  if (isOAuthFastPathEnabled()) {
+    const cacheKey = buildPersistenceCacheKey(userId, userValues);
+    const hasToken = Boolean(userValues.authToken || userValues.apiKey);
+    const expired =
+      typeof userValues.oauthExpiresAt === 'number' &&
+      Number.isFinite(userValues.oauthExpiresAt) &&
+      userValues.oauthExpiresAt <= Date.now();
+
+    if (!hasToken || expired) {
+      // Cannot proceed on a missing/expired token; refresh synchronously, but at most once per
+      // failure TTL so a broken refresh_token does not stall every agent init in the turn.
+      if (isRefreshNegativeCached(cacheKey)) {
+        // Preserve the current token (legacy contract); the persistence cache makes repeat
+        // writes within the turn no-ops, so this does not reintroduce the fan-out cost.
+        await persistNonExpiringKey(userId, userValues, db);
+        return userValues;
+      }
+      try {
+        const refreshed = await refreshAccessToken(userId, userValues, db);
+        vivRefreshFailureCache.delete(cacheKey);
+        return refreshed;
+      } catch (error) {
+        vivRefreshFailureCache.set(cacheKey, Date.now() + VIV_FAILED_REFRESH_TTL_MS);
+        logger.warn(
+          '[Anthropic OAuth] Refresh failed for connected account; preserving current access token',
+          error,
+        );
+        await persistNonExpiringKey(userId, userValues, db);
+        return userValues;
+      }
+    }
+
+    if (shouldRefresh(userValues)) {
+      // Near-expiry but valid: use the current token now, refresh for the next turn off-path.
+      scheduleBackgroundRefresh(cacheKey, userId, userValues, db);
+    }
+
+    await persistNonExpiringKey(userId, userValues, db);
+    return userValues;
+  }
+
+  // Legacy blocking behavior (VIVENTIUM_ANTHROPIC_OAUTH_FAST_PATH=0)
   if (shouldRefresh(userValues)) {
     try {
       return await refreshAccessToken(userId, userValues, db);

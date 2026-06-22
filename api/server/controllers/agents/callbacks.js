@@ -33,6 +33,9 @@ const {
   formatVoiceLatencyTiming,
   voiceLatencyNow,
 } = require('~/server/services/viventium/voiceLatencyTiming');
+const {
+  createMessageDeltaBoundaryNormalizer,
+} = require('~/server/services/viventium/voiceDeltaAggregation');
 /* === VIVENTIUM END === */
 
 /* === VIVENTIUM NOTE ===
@@ -75,6 +78,14 @@ const logVoiceLatencyStage = (req, stage, stageStartAt = null, details = '') => 
  * Added: 2026-05-14
  */
 const isVoiceModeRequest = (req) => req?.body?.voiceMode === true;
+
+const getTextDeltaMode = (req) => {
+  const configured = req?.body?.viventiumTextDeltaMode ?? req?.body?.viventiumStreamTextDeltaMode;
+  if (configured === 'snapshot' || configured === 'auto' || configured === 'incremental') {
+    return configured;
+  }
+  return isVoiceModeRequest(req) ? 'auto' : 'incremental';
+};
 /* === VIVENTIUM END === */
 
 /* === VIVENTIUM START ===
@@ -334,8 +345,23 @@ function getDefaultHandlers({
    * Added: 2026-02-07
    */
   const timingEnabled = isDeepTimingEnabled(req);
+  /* === VIVENTIUM START ===
+   * Feature: Voice streamed-delta boundary normalization.
+   * Purpose: Normalize cumulative text snapshots before SSE/resumable fan-out and aggregation so
+   * every consumer sees the same incremental event contract.
+   * === VIVENTIUM END === */
+  const normalizeMessageDeltaAtBoundary = createMessageDeltaBoundaryNormalizer({
+    mode: getTextDeltaMode(req),
+  });
   if (timingEnabled && req && req._viventiumFirstDeltaLogged == null) {
     req._viventiumFirstDeltaLogged = false;
+  }
+  /* === VIVENTIUM START ===
+   * Feature: thinking-vs-text first-delta separation. model_first_thinking_delta marks the first
+   * reasoning token so a long time-to-first-SPEAKABLE-text reads as reasoning time, not a stall.
+   * === VIVENTIUM END === */
+  if (timingEnabled && req && req._viventiumFirstThinkingDeltaLogged == null) {
+    req._viventiumFirstThinkingDeltaLogged = false;
   }
   const voiceLatencyEnabled = isVoiceLatencyEnabled(req);
   if (voiceLatencyEnabled && req) {
@@ -653,9 +679,12 @@ function getDefaultHandlers({
         );
         const shouldEmit = shouldEmitLastAgent || !metadata?.hide_sequential_outputs;
         const emitStartedAt = shouldEmit ? voiceLatencyNow() : null;
+        const normalizedEvent = normalizeMessageDeltaAtBoundary({ event, data });
+        const eventData = { event: normalizedEvent.event, data: normalizedEvent.data };
+        const aggregateEventData = { ...eventData, visibleToUser: shouldEmit };
 
         if (shouldEmit) {
-          await emitEvent(res, streamId, { event, data });
+          await emitEvent(res, streamId, eventData);
           if (
             voiceLatencyEnabled &&
             req &&
@@ -671,7 +700,7 @@ function getDefaultHandlers({
             );
           }
         }
-        aggregateContent({ event, data });
+        aggregateContent(aggregateEventData);
       },
     },
     [GraphEvents.ON_REASONING_DELTA]: {
@@ -685,6 +714,19 @@ function getDefaultHandlers({
         const reasoningMetric = markVoiceOrchEvent(req, 'on_reasoning_delta');
         if (reasoningMetric?.firstSeen) {
           logVoiceLatencyStage(req, 'first_reasoning_delta', getVoiceProcessStreamStartAt(req), '');
+        }
+        /* === VIVENTIUM START ===
+         * Surface-neutral deep mark for the first reasoning token (pairs with model_first_delta so
+         * the gap = time spent reasoning before the first speakable token).
+         * === VIVENTIUM END === */
+        if (
+          timingEnabled &&
+          req &&
+          req._viventiumFirstThinkingDeltaLogged === false &&
+          checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node)
+        ) {
+          req._viventiumFirstThinkingDeltaLogged = true;
+          logDeepTiming(req, 'model_first_thinking_delta');
         }
         /* === VIVENTIUM START ===
          * Feature: Voice reasoning visibility guard.

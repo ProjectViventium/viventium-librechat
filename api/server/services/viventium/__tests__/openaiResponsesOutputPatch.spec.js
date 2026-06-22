@@ -17,11 +17,14 @@ describe('openaiResponsesOutputPatch', () => {
   test('response.completed without response.output does not throw (gpt-5.4 shape)', () => {
     const chunk = {
       type: 'response.completed',
-      response: { id: 'resp_1', model: 'gpt-5.4', status: 'completed', usage: { output_tokens: 3 } },
+      response: {
+        id: 'resp_1',
+        model: 'gpt-5.4',
+        status: 'completed',
+        usage: { output_tokens: 3 },
+      },
     };
-    expect(() =>
-      agentsUtils._convertOpenAIResponsesDeltaToBaseMessageChunk(chunk),
-    ).not.toThrow();
+    expect(() => agentsUtils._convertOpenAIResponsesDeltaToBaseMessageChunk(chunk)).not.toThrow();
     // The guard normalizes the missing field to an empty array.
     expect(Array.isArray(chunk.response.output)).toBe(true);
   });
@@ -32,11 +35,15 @@ describe('openaiResponsesOutputPatch', () => {
     ];
     const chunk = {
       type: 'response.completed',
-      response: { id: 'resp_2', model: 'gpt-5.4', status: 'completed', output: realOutput, usage: {} },
+      response: {
+        id: 'resp_2',
+        model: 'gpt-5.4',
+        status: 'completed',
+        output: realOutput,
+        usage: {},
+      },
     };
-    expect(() =>
-      agentsUtils._convertOpenAIResponsesDeltaToBaseMessageChunk(chunk),
-    ).not.toThrow();
+    expect(() => agentsUtils._convertOpenAIResponsesDeltaToBaseMessageChunk(chunk)).not.toThrow();
     expect(chunk.response.output).toBe(realOutput);
   });
 });

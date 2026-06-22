@@ -43,6 +43,7 @@ const XAI_TTS_CAPABILITIES = require('../../../../shared/voice/xai_tts_capabilit
 const XAI_TTS_INLINE_TAGS = XAI_TTS_CAPABILITIES.speech_tags.inline;
 const XAI_TTS_WRAPPING_TAGS = XAI_TTS_CAPABILITIES.speech_tags.wrapping;
 const { getPromptText } = require('./promptRegistry');
+const { sanitizeVoiceSurfaceTextForDisplay } = require('./voiceArtifactText');
 /* === VIVENTIUM END === */
 
 function normalizeVoiceProvider(voiceProvider) {
@@ -283,11 +284,7 @@ function buildCortexOutputInstructions({ voiceMode, surface, inputMode }) {
     return override;
   }
 
-  const voiceInput =
-    voiceMode === true ||
-    surface === 'voice' ||
-    inputMode === 'voice_note' ||
-    inputMode === 'voice_call';
+  const voiceInput = voiceMode === true || surface === 'voice' || inputMode === 'voice_call';
 
   const lines = [
     'CORTEX OUTPUT RULES:',
@@ -561,6 +558,64 @@ function parseClientTimestamp(clientTimestamp, timeZone) {
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
+function safeSchedulerContextValue(value) {
+  if (typeof value !== 'string') {
+    return '';
+  }
+  return value.trim();
+}
+
+function buildSchedulerRunContextInstructions(body = {}) {
+  const context =
+    body.schedulerRunContext && typeof body.schedulerRunContext === 'object'
+      ? body.schedulerRunContext
+      : null;
+  if (!context) {
+    return '';
+  }
+
+  const scheduledDueAtUtc =
+    safeSchedulerContextValue(context.scheduled_due_at_utc) ||
+    safeSchedulerContextValue(body.scheduledDueAt);
+  const scheduledDueLocal = safeSchedulerContextValue(context.scheduled_due_local);
+  const scheduledDueLocalDate = safeSchedulerContextValue(context.scheduled_due_local_date);
+  const scheduledDueLocalDateIso = safeSchedulerContextValue(context.scheduled_due_local_date_iso);
+  const scheduleTimezone = safeSchedulerContextValue(context.schedule_timezone);
+  const runStartedAtUtc = safeSchedulerContextValue(context.run_started_at_utc);
+  const currentScheduleLocalTime = safeSchedulerContextValue(context.current_schedule_local_time);
+  const calendarWindowLocalStart = safeSchedulerContextValue(context.calendar_window_local_start);
+  const calendarWindowLocalEnd = safeSchedulerContextValue(
+    context.calendar_window_local_end_exclusive,
+  );
+  const calendarWindowUtcStart = safeSchedulerContextValue(context.calendar_window_utc_start);
+  const calendarWindowUtcEnd = safeSchedulerContextValue(context.calendar_window_utc_end_exclusive);
+
+  const lines = [
+    'Scheduled run context:',
+    scheduledDueLocalDate ? `- Anchor date for this scheduled run: ${scheduledDueLocalDate}` : '',
+    scheduledDueLocalDateIso
+      ? `- Anchor date tag: scheduled_due_local_date_iso=${scheduledDueLocalDateIso}`
+      : '',
+    scheduledDueAtUtc ? `- Scheduled due at UTC: ${scheduledDueAtUtc}` : '',
+    scheduledDueLocal ? `- Scheduled due local time: ${scheduledDueLocal}` : '',
+    scheduleTimezone ? `- Schedule timezone: ${scheduleTimezone}` : '',
+    runStartedAtUtc ? `- Run started at UTC: ${runStartedAtUtc}` : '',
+    currentScheduleLocalTime
+      ? `- Current time in schedule timezone: ${currentScheduleLocalTime}`
+      : '',
+    calendarWindowLocalStart && calendarWindowLocalEnd
+      ? `- Calendar window local: ${calendarWindowLocalStart} to ${calendarWindowLocalEnd} (end exclusive)`
+      : '',
+    calendarWindowUtcStart && calendarWindowUtcEnd
+      ? `- Calendar window UTC: ${calendarWindowUtcStart} to ${calendarWindowUtcEnd} (end exclusive)`
+      : '',
+    'Use the anchor date above for day/date labels. Do not infer the day from prior scheduled briefings or from the next recurrence.',
+    'Calendar, email, task, and current-day claims require verified tool/cortex evidence or this deterministic context; otherwise omit them.',
+  ];
+
+  return lines.filter(Boolean).join('\n');
+}
+
 /* === VIVENTIUM NOTE ===
  * Feature: Time context injection for scheduling awareness
  *
@@ -574,17 +629,18 @@ function parseClientTimestamp(clientTimestamp, timeZone) {
  * Updated: 2026-02-01
  * === VIVENTIUM NOTE === */
 function buildTimeContextInstructions(req) {
-  const override = (process.env.VIVENTIUM_TIME_CONTEXT_PROMPT || '').trim();
-  if (override) {
-    return override;
-  }
-
   // Skip if explicitly disabled
   if (process.env.VIVENTIUM_TIME_CONTEXT_DISABLED === '1') {
     return '';
   }
 
   const body = req?.body || {};
+  const schedulerContextInstructions = buildSchedulerRunContextInstructions(body);
+  const override = (process.env.VIVENTIUM_TIME_CONTEXT_PROMPT || '').trim();
+  if (override) {
+    return [override, schedulerContextInstructions].filter(Boolean).join('\n\n');
+  }
+
   const clientTimestamp = body.clientTimestamp;
   const resolvedTimezone = resolveTimeContextTimezone({
     clientTimezone: body.clientTimezone,
@@ -620,10 +676,15 @@ function buildTimeContextInstructions(req) {
     });
   }
 
-  return getPromptText('surface.time_context', `Current time: ${formatted} (${resolvedTimezone})`, {
-    formatted_time: formatted,
-    timezone: resolvedTimezone,
-  });
+  const baseInstructions = getPromptText(
+    'surface.time_context',
+    `Current time: ${formatted} (${resolvedTimezone})`,
+    {
+      formatted_time: formatted,
+      timezone: resolvedTimezone,
+    },
+  );
+  return [baseInstructions, schedulerContextInstructions].filter(Boolean).join('\n\n');
 }
 
 /* === VIVENTIUM START ===
@@ -743,21 +804,7 @@ function stripXaiWrappingTags(text) {
 }
 
 function stripVoiceControlTagsForDisplay(text) {
-  if (!text) {
-    return '';
-  }
-  let cleaned = text;
-  cleaned = cleaned.replace(_DISPLAY_SPEAK_RE, '');
-  cleaned = cleaned.replace(_DISPLAY_EMOTION_SELF_CLOSING_RE, '');
-  cleaned = cleaned.replace(_DISPLAY_EMOTION_WRAPPER_RE, '$1');
-  cleaned = cleaned.replace(_DISPLAY_BREAK_RE, '');
-  cleaned = cleaned.replace(_DISPLAY_SPEED_RE, '');
-  cleaned = cleaned.replace(_DISPLAY_VOLUME_RE, '');
-  cleaned = cleaned.replace(_DISPLAY_SPELL_RE, '$1');
-  cleaned = stripXaiWrappingTags(cleaned);
-  cleaned = stripBracketStageDirections(cleaned);
-  cleaned = cleaned.replace(/[ \t]{2,}/g, ' ');
-  return cleaned.trim();
+  return sanitizeVoiceSurfaceTextForDisplay(text);
 }
 
 module.exports = {
@@ -773,4 +820,5 @@ module.exports = {
   buildCortexOutputInstructions,
   buildTimeContextInstructions,
   stripVoiceControlTagsForDisplay,
+  sanitizeVoiceSurfaceTextForDisplay,
 };

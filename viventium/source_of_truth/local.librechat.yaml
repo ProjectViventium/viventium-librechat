@@ -70,10 +70,25 @@ viventium:
         older request was already handled by its own turn.
 
 
-        If the latest user message is a simple reply, acknowledgement, test instruction,
-        correction, thanks, provider clarification, or output-only instruction that
-        does not itself meet this cortex''s activation criteria, return should_activate=false
-        even when older history would have activated.'
+        Before deciding, ask: "Does LatestUserMessage itself ask this cortex to do
+        work, or does it explicitly refer to continuing that same work?"
+
+
+        If LatestUserMessage is only a simple reply, acknowledgement, test instruction,
+        correction, thanks, provider clarification, or output-only instruction, return
+        should_activate=false unless that latest message itself meets this cortex''s
+        activation criteria.
+
+
+        Output-only instructions include requests to reply with exact text, markers,
+        labels, acknowledgements, confirmations, or test tokens. Older history cannot
+        turn an output-only latest message into a new activation.
+
+
+        Ignore activation words that appear only in Recent Conversation. Words such
+        as red-team, pressure-test, challenge, plan, launch, pattern, strategy, or
+        bias count only when they appear in LatestUserMessage or when LatestUserMessage
+        explicitly refers back to them.'
     activation_policy:
       enabled: true
       prompt: 'The main agent owns the current turn. Background agents are optional
@@ -281,7 +296,7 @@ viventium:
   installMode: native
   consciousAgent:
     provider: anthropic
-    model: claude-opus-4-7
+    model: claude-opus-4-8
 balance:
   enabled: false
   startBalance: 200000
@@ -433,15 +448,15 @@ modelSpecs:
     preset:
       endpoint: anthropic
       model: claude-sonnet-4-5
-  - name: claude-opus-4-7
-    label: Claude Opus 4 7
+  - name: claude-opus-4-8
+    label: Claude Opus 4 8
     description: Anthropic Direct
     group: anthropic
     groupIcon: anthropic
     iconURL: anthropic
     preset:
       endpoint: anthropic
-      model: claude-opus-4-7
+      model: claude-opus-4-8
   addedEndpoints:
   - agents
   - anthropic
@@ -937,7 +952,7 @@ mcpServers:
       hostAllowed: true
       sandboxAllowed: true
       defaultToolAccess: content_read
-      contentReadPolicy: require_explicit_intent
+      contentReadPolicy: require_broker_grant
       writePolicy: confirm
       riskClass: productivity
       reexportNativeTools: true
@@ -979,7 +994,7 @@ mcpServers:
       hostAllowed: true
       sandboxAllowed: true
       defaultToolAccess: content_read
-      contentReadPolicy: require_explicit_intent
+      contentReadPolicy: require_broker_grant
       writePolicy: confirm
       riskClass: productivity
       reexportNativeTools: true

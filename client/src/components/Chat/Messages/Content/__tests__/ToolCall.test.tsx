@@ -257,6 +257,122 @@ describe('ToolCall', () => {
       expect(screen.queryByText('Completed worker_delegate_once')).not.toBeInTheDocument();
     });
 
+    it('renders GlassHive workspace MCP calls without raw function names', () => {
+      const name = `workspace_launch${Constants.mcp_delimiter}glasshive-workers-projects`;
+
+      renderWithRecoil(<ToolCall {...mockProps} name={name} output={null} />);
+
+      expect(screen.getByText('Completed GlassHive workspace')).toBeInTheDocument();
+      expect(screen.queryByText('Completed workspace_launch')).not.toBeInTheDocument();
+    });
+
+    it('summarizes GlassHive tool details instead of rendering raw args and output JSON', () => {
+      const name = `workspace_launch${Constants.mcp_delimiter}glasshive-workers-projects`;
+      const output = JSON.stringify({
+        status: 'queued',
+        message: 'Workspace started.',
+        view_steer_url: 'http://127.0.0.1:8780/watch/synthetic',
+        follow_up_context: {
+          worker_id: 'wrk_secret_plumbing',
+          run_id: 'run_secret_plumbing',
+        },
+        artifact_links: {
+          items: [{ path: 'artifacts/client-report.docx' }],
+        },
+      });
+
+      renderWithRecoil(
+        <ToolCall
+          {...mockProps}
+          name={name}
+          args='{"instruction":"raw worker prompt","profile":"codex-cli"}'
+          output={output}
+        />,
+      );
+
+      fireEvent.click(screen.getByText('Completed GlassHive workspace'));
+
+      const props = JSON.parse(screen.getByTestId('tool-call-info').textContent!);
+      expect(props.input).toBe('');
+      expect(props.output).toContain('Status: queued');
+      expect(props.output).toContain('Workspace started.');
+      expect(props.output).toContain('View / Steer: http://127.0.0.1:8780/watch/synthetic');
+      expect(props.output).toContain('Artifacts: artifacts/client-report.docx');
+      expect(props.output).not.toContain('follow_up_context');
+      expect(props.output).not.toContain('worker_id');
+      expect(props.output).not.toContain('raw worker prompt');
+    });
+
+    it('summarizes MCP text-wrapped GlassHive dispatch output with task and status', () => {
+      const name = `workspace_launch${Constants.mcp_delimiter}glasshive-workers-projects`;
+      const output = JSON.stringify([
+        {
+          type: 'text',
+          text: JSON.stringify({
+            status: 'dispatched',
+            acknowledgement_guidance: 'Internal acknowledgement guidance.',
+            follow_up_context: {
+              worker_id: 'wrk_public_safe_internal',
+              run_id: 'run_public_safe_internal',
+              run_state: 'queued',
+            },
+            delegation_audit: {
+              title: 'Open a public profile and report the follower count.',
+              instruction_preview: 'Private worker bootstrap context.',
+            },
+          }),
+        },
+      ]);
+
+      renderWithRecoil(
+        <ToolCall
+          {...mockProps}
+          name={name}
+          args='{"description":"Fallback task text","execution_mode":"host"}'
+          output={output}
+        />,
+      );
+
+      fireEvent.click(screen.getByText('Completed GlassHive workspace'));
+
+      const props = JSON.parse(screen.getByTestId('tool-call-info').textContent!);
+      expect(props.output).toContain('Task: Open a public profile and report the follower count.');
+      expect(props.output).toContain('Status: dispatched');
+      expect(props.output).not.toContain('acknowledgement_guidance');
+      expect(props.output).not.toContain('Internal acknowledgement guidance');
+      expect(props.output).not.toContain('worker_id');
+      expect(props.output).not.toContain('Private worker bootstrap context');
+    });
+
+    it('keeps plain-text GlassHive output inspectable instead of replacing it with a stub', () => {
+      const name = `workspace_wait${Constants.mcp_delimiter}glasshive-workers-projects`;
+
+      renderWithRecoil(
+        <ToolCall
+          {...mockProps}
+          name={name}
+          args='{"description":"Wait for the worker result"}'
+          output="The worker completed the public-safe research summary."
+        />,
+      );
+
+      fireEvent.click(screen.getByText('Completed GlassHive wait'));
+
+      const props = JSON.parse(screen.getByTestId('tool-call-info').textContent!);
+      expect(props.output).toContain('Task: Wait for the worker result');
+      expect(props.output).toContain('The worker completed the public-safe research summary.');
+      expect(props.output).not.toBe('GlassHive returned a result.');
+    });
+
+    it('uses a GlassHive fallback label for canonical tools missing a bespoke label', () => {
+      const name = `project_public_safe_probe${Constants.mcp_delimiter}glasshive-workers-projects`;
+
+      renderWithRecoil(<ToolCall {...mockProps} name={name} output={null} />);
+
+      expect(screen.getByText('Completed GlassHive project public safe probe')).toBeInTheDocument();
+      expect(screen.queryByText('Completed project_public_safe_probe')).not.toBeInTheDocument();
+    });
+
     it('does not relabel non-canonical MCP servers by substring', () => {
       const name = `worker_delegate_once${Constants.mcp_delimiter}not-glasshive-workers-projects`;
 

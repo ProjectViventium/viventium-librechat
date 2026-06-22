@@ -118,6 +118,48 @@ describe('request persistence helpers', () => {
     );
   });
 
+  it('attaches voice call metadata to direct assistant snapshots', async () => {
+    const req = {
+      user: { id: 'user-1' },
+      body: {
+        agent_id: 'agent-123',
+        viventiumSurface: 'voice',
+        viventiumInputMode: 'voice_call',
+      },
+      viventiumCallSession: { callSessionId: 'call-session-1' },
+      viventiumVoiceRequestId: 'voice-request-1',
+    };
+
+    const result = await __testables.persistAssistantSnapshot({
+      req,
+      streamId: 'stream-1',
+      userId: 'user-1',
+      client: { sender: 'AI', options: { endpoint: 'agents' }, model: 'test-model' },
+      conversationId: 'convo-1',
+      aggregatedContent: [{ type: 'text', text: 'Partial answer' }],
+      unfinished: true,
+      error: false,
+      context: 'test-voice-metadata',
+    });
+
+    expect(result.persisted).toBe(true);
+    expect(mockSaveMessage).toHaveBeenCalledWith(
+      req,
+      expect.objectContaining({
+        messageId: 'assistant-msg-1',
+        metadata: {
+          viventium: expect.objectContaining({
+            callSessionId: 'call-session-1',
+            voiceRequestId: 'voice-request-1',
+            surface: 'voice',
+            inputMode: 'voice_call',
+          }),
+        },
+      }),
+      expect.objectContaining({ context: 'test-voice-metadata' }),
+    );
+  });
+
   it('sanitizes persisted voice-mode content parts as well as top-level text', async () => {
     const req = {
       user: { id: 'user-1' },
@@ -172,6 +214,31 @@ describe('request persistence helpers', () => {
       expect.objectContaining({
         text: 'Alpha. Beta.',
         content: [{ type: 'text', text: 'Alpha. Beta.' }],
+      }),
+    );
+  });
+
+  it('preserves non-voice content-to-text parity when final text is empty', () => {
+    const req = {
+      body: { voiceMode: false },
+    };
+
+    const response = __testables.normalizePersistedAssistantResponse(req, {
+      messageId: 'assistant-msg-1',
+      text: '',
+      content: [
+        { type: 'think', think: 'Internal reasoning should remain content-only.' },
+        { type: 'text', text: 'Plain web answer.' },
+      ],
+    });
+
+    expect(response).toEqual(
+      expect.objectContaining({
+        text: 'Plain web answer.',
+        content: [
+          { type: 'think', think: 'Internal reasoning should remain content-only.' },
+          { type: 'text', text: 'Plain web answer.' },
+        ],
       }),
     );
   });

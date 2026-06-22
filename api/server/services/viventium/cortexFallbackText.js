@@ -88,10 +88,7 @@ function normalizeDeferredFallbackErrorClass({
   ) {
     return 'restart_recovered';
   }
-  if (
-    normalized.includes('no_live_tool_execution') ||
-    normalized.includes('live tool evidence')
-  ) {
+  if (normalized.includes('no_live_tool_execution') || normalized.includes('live tool evidence')) {
     return 'live_tool_unverified';
   }
   if (

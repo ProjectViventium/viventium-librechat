@@ -11,6 +11,7 @@ let mockUpdateMessage;
 let mockGetConvo;
 let mockGetMessages;
 let mockEnqueueGlassHiveCallbackDelivery;
+let mockConversationFindOneAndUpdate;
 
 jest.mock(
   '@librechat/data-schemas',
@@ -27,6 +28,12 @@ jest.mock('~/models', () => ({
   getMessages: (...args) => mockGetMessages(...args),
   saveMessage: (...args) => mockSaveMessage(...args),
   updateMessage: (...args) => mockUpdateMessage(...args),
+}));
+
+jest.mock('~/db/models', () => ({
+  Conversation: {
+    findOneAndUpdate: (...args) => mockConversationFindOneAndUpdate(...args),
+  },
 }));
 
 jest.mock('~/server/services/viventium/GlassHiveCallbackDeliveryService', () => ({
@@ -157,6 +164,7 @@ describe('/api/viventium/glasshive/callback', () => {
     mockUpdateMessage = jest.fn().mockResolvedValue({});
     mockGetConvo = jest.fn().mockResolvedValue({ conversationId: 'conv-1', user: 'user-1' });
     mockEnqueueGlassHiveCallbackDelivery = jest.fn().mockResolvedValue(null);
+    mockConversationFindOneAndUpdate = jest.fn().mockResolvedValue({});
     mockGetMessages = jest.fn().mockResolvedValue([
       {
         messageId: 'msg-parent',
@@ -266,6 +274,32 @@ describe('/api/viventium/glasshive/callback', () => {
       preferredSurface: 'desktop',
     });
     expect(mockEnqueueGlassHiveCallbackDelivery).not.toHaveBeenCalled();
+  });
+
+  test('touches the conversation after persisting a visible callback so web chat can surface it', async () => {
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({
+      callback_id: 'cb_touch_conversation',
+      event: 'run.completed',
+      message: 'Finished host worker.',
+    });
+    const req = createMockReq({
+      url: '/api/viventium/glasshive/callback',
+      headers: { 'x-glasshive-signature': signature(body) },
+      body,
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockConversationFindOneAndUpdate).toHaveBeenCalledTimes(1);
+    const [filter, update, options] = mockConversationFindOneAndUpdate.mock.calls[0];
+    expect(filter).toEqual({ user: 'user-1', conversationId: 'conv-1' });
+    expect(update.$set.updatedAt).toBeInstanceOf(Date);
+    expect(Array.isArray(update.$set.messages)).toBe(true);
+    expect(options).toMatchObject({ upsert: false, timestamps: false });
   });
 
   test('appends late completion callbacks to the current conversation leaf instead of branching from the original anchor', async () => {

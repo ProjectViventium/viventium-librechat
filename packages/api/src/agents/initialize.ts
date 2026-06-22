@@ -32,7 +32,7 @@ import {
   getThreadData,
 } from '~/utils';
 import { filterFilesByEndpointConfig } from '~/files';
-import { ragFilesExist } from '~/files/rag';
+import { ragFilesExistNonBlocking } from '~/files/rag';
 import { generateArtifactsPrompt } from '~/prompts';
 import { getProviderConfig } from '~/endpoints';
 import { logger } from '@librechat/data-schemas';
@@ -319,6 +319,20 @@ export async function initializeAgent(
   let tool_resources = primedToolResources;
 
   /* === VIVENTIUM START ===
+   * Feature: Deep init sub-step timing (toggleable via VIVENTIUM_TIMING_DEEP).
+   * Purpose: Surface where agent initialization spends time (recall health/attach, transcript
+   *   vector verification, tool load, provider/options) so latency is observable at parity across
+   *   web chat, voice, and Telegram instead of being a black box before the first token.
+   * === VIVENTIUM END === */
+  const vivInitTimings: Record<string, number> = {};
+  const vivInitTimingStart = Date.now();
+  const vivInitDeepTiming = ['1', 'true', 'yes', 'on'].includes(
+    String(process.env.VIVENTIUM_TIMING_DEEP ?? '')
+      .trim()
+      .toLowerCase(),
+  );
+
+  /* === VIVENTIUM START ===
    * Feature: Conversation Recall runtime file_search resource injection
    *
    * Purpose:
@@ -333,10 +347,12 @@ export async function initializeAgent(
     user: (req.user ?? null) as unknown as TUser | null,
     agent,
   });
+  const vivRecallStart = Date.now();
   const conversationRecallVectorStatus =
     conversationRecallScope !== 'none' && req.user?.id
       ? await getConversationRecallVectorRuntimeStatus()
       : { available: false, reason: 'unconfigured' as const };
+  vivInitTimings.recall_health_ms = Date.now() - vivRecallStart;
 
   if (conversationRecallScope !== 'none' && req.user?.id) {
     try {
@@ -458,6 +474,7 @@ export async function initializeAgent(
       logger.error('[initializeAgent] Failed to load conversation recall resources', error);
     }
   }
+  vivInitTimings.recall_attach_ms = Date.now() - vivRecallStart;
 
   /* === VIVENTIUM START ===
    * Feature: Meeting transcript RAG resource injection
@@ -470,7 +487,9 @@ export async function initializeAgent(
    * Added: 2026-05-05
    * === VIVENTIUM END === */
   const meetingTranscriptSourcePathHash = getMeetingTranscriptSourcePathHash();
-  if (req.user?.id && meetingTranscriptSourcePathHash) {
+  const meetingTranscriptRecallEnabled = conversationRecallScope === 'all';
+  const vivTranscriptStart = Date.now();
+  if (req.user?.id && meetingTranscriptSourcePathHash && meetingTranscriptRecallEnabled) {
     const meetingTranscriptUserId = req.user.id;
     try {
       const meetingTranscriptVectorStatus = await getConversationRecallVectorRuntimeStatus();
@@ -509,15 +528,21 @@ export async function initializeAgent(
         const meetingTranscriptVectorFiles = meetingTranscriptFiles.filter(
           (file) => !isMeetingTranscriptInventoryResource(file),
         );
+        const vivRagExistsStart = Date.now();
+        const meetingTranscriptVectorFileIds = meetingTranscriptVectorFiles
+          .map((file) => file.file_id)
+          .filter((fileId): fileId is string => Boolean(fileId));
         const verifiedMeetingTranscriptFileIds =
-          meetingTranscriptVectorFiles.length > 0
-            ? await ragFilesExist({
+          meetingTranscriptVectorFileIds.length > 0
+            ? await ragFilesExistNonBlocking({
                 userId: meetingTranscriptUserId,
-                fileIds: meetingTranscriptVectorFiles
-                  .map((file) => file.file_id)
-                  .filter((fileId): fileId is string => Boolean(fileId)),
+                fileIds: meetingTranscriptVectorFileIds,
+                cacheKey: `${meetingTranscriptUserId}:transcript:${[...meetingTranscriptVectorFileIds]
+                  .sort()
+                  .join(',')}`,
               })
             : new Set<string>();
+        vivInitTimings.transcript_ragexists_ms = Date.now() - vivRagExistsStart;
         const verifiedMeetingTranscriptFiles =
           meetingTranscriptFiles.length > 0
             ? meetingTranscriptInventoryFiles.concat(
@@ -572,8 +597,20 @@ export async function initializeAgent(
     } catch (error) {
       logger.error('[initializeAgent] Failed to load meeting transcript resources', error);
     }
+  } else if (req.user?.id && meetingTranscriptSourcePathHash && vivInitDeepTiming) {
+    logger.info(
+      '[initializeAgent] Meeting transcript recall configured but all-conversation recall is disabled',
+      {
+        userId: req.user.id,
+        agentId: agent.id,
+        recallScope: conversationRecallScope,
+        sourceFolderHash: meetingTranscriptSourcePathHash,
+      },
+    );
   }
+  vivInitTimings.transcript_attach_ms = Date.now() - vivTranscriptStart;
 
+  const vivLoadToolsStart = Date.now();
   const {
     toolRegistry,
     toolContextMap,
@@ -598,6 +635,7 @@ export async function initializeAgent(
     toolDefinitions: [],
     hasDeferredTools: false,
   };
+  vivInitTimings.loadtools_ms = Date.now() - vivLoadToolsStart;
 
   const { getOptions, overrideProvider, initEndpoint } = getProviderConfig({
     provider,
@@ -613,12 +651,14 @@ export async function initializeAgent(
     model: agent.model,
   };
 
+  const vivGetOptionsStart = Date.now();
   const options: InitializeResultBase = await getOptions({
     req,
     endpoint: initEndpoint,
     model_parameters: finalModelOptions,
     db,
   });
+  vivInitTimings.getoptions_ms = Date.now() - vivGetOptionsStart;
 
   const llmConfig = options.llmConfig as Record<string, unknown>;
   const tokensModel =
@@ -673,6 +713,20 @@ export async function initializeAgent(
   }
 
   agent.model_parameters = { ...options.llmConfig } as Agent['model_parameters'];
+
+  /* === VIVENTIUM START ===
+   * Feature: Emit one deep init-timing line per agent initialization (gated, public-safe).
+   * Tagged by agent id so main-agent vs memory-agent inits are distinguishable; recall/transcript
+   * flags show which heavy paths were active. Ids and counts only, never user content.
+   * === VIVENTIUM END === */
+  if (vivInitDeepTiming) {
+    vivInitTimings.total_ms = Date.now() - vivInitTimingStart;
+    logger.info(
+      `[VIV_INIT_TIMING] agent=${agent.id ?? 'na'} provider=${agent.provider ?? 'na'} ` +
+        `recall_scope=${conversationRecallScope} transcript=${meetingTranscriptRecallEnabled && meetingTranscriptSourcePathHash ? 1 : 0} ` +
+        `tools=${tools.length} timings=${JSON.stringify(vivInitTimings)}`,
+    );
+  }
   if (options.configOptions) {
     (agent.model_parameters as Record<string, unknown>).configuration = options.configOptions;
   }

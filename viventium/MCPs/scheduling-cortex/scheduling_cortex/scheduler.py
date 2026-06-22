@@ -95,6 +95,16 @@ def _deferred_fallback_degradation(
     return None
 
 
+def _is_orphaned_user_failure(error: object) -> bool:
+    path = str(getattr(error, "path", "") or "").strip().lower()
+    status = getattr(error, "status", None)
+    if path != "/api/viventium/scheduler/chat" or status != 404:
+        return False
+    failure_class = str(getattr(error, "failure_class", "") or "").strip().lower()
+    reason = str(getattr(error, "reason", "") or "").strip().lower()
+    return failure_class == "user_not_found" or reason == "user_not_found"
+
+
 # === VIVENTIUM NOTE ===
 # Feature: Structured misfire policy and late-reminder catch-up.
 # Purpose: User-created one-time reminders should not disappear silently after
@@ -346,7 +356,7 @@ class SchedulerEngine:
             self._update_after_success(task, now, dispatch_result)
         except Exception as exc:
             logger.exception("Task %s failed: %s", task_id, exc)
-            self._update_after_failure(task, now, str(exc))
+            self._update_after_failure(task, now, exc)
 
     def _update_after_success(
         self,
@@ -440,36 +450,44 @@ class SchedulerEngine:
 
         self._storage.update_task(task["user_id"], task["id"], updates)
 
-    def _update_after_failure(self, task: Dict[str, object], now: datetime, error: str) -> None:
+    def _update_after_failure(self, task: Dict[str, object], now: datetime, error: object) -> None:
         retry_at = now + timedelta(seconds=self._retry_delay_s)
+        orphaned_user = _is_orphaned_user_failure(error)
+        error_message = str(error)
+        delivery_reason = "orphaned_user_not_found" if orphaned_user else error_message
         updates = {
             "last_status": "error",
-            "last_error": error,
+            "last_error": error_message,
             "updated_at": to_utc_iso(now),
             # === VIVENTIUM NOTE ===
             # Feature: Record failed delivery attempts for agent visibility.
             "last_delivery_outcome": "failed",
-            "last_delivery_reason": error,
+            "last_delivery_reason": delivery_reason,
             "last_delivery_at": to_utc_iso(now),
             "last_generated_text": None,
             "last_delivery": {
                 "outcome": "failed",
-                "reason": error,
+                "reason": delivery_reason,
                 "generated_text": None,
             },
             # === VIVENTIUM NOTE ===
         }
+        if orphaned_user:
+            updates["active"] = 0
+            updates["next_run_at"] = None
+            updates["last_delivery"]["failure_class"] = "orphaned_user_not_found"
         late_delivery = _scheduler_late_delivery(task)
         if late_delivery is not None:
             updates["last_delivery"]["late_delivery"] = late_delivery
 
-        if task["schedule"].get("type") == "once":
-            updates["next_run_at"] = to_utc_iso(retry_at)
-        else:
-            next_run = compute_next_run(task["schedule"], now, now)
-            if not next_run or next_run <= now:
-                next_run = retry_at
-            updates["next_run_at"] = to_utc_iso(next_run)
+        if not orphaned_user:
+            if task["schedule"].get("type") == "once":
+                updates["next_run_at"] = to_utc_iso(retry_at)
+            else:
+                next_run = compute_next_run(task["schedule"], now, now)
+                if not next_run or next_run <= now:
+                    next_run = retry_at
+                updates["next_run_at"] = to_utc_iso(next_run)
 
         self._storage.update_task(task["user_id"], task["id"], updates)
 

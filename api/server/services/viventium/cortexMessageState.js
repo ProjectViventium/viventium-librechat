@@ -58,6 +58,14 @@ function extractCortexParts(content) {
   return content.filter((part) => part && typeof part === 'object' && CORTEX_TYPES.has(part.type));
 }
 
+function getFollowUpDecisionForMessage(message) {
+  const decision = message?.metadata?.viventium?.cortexFollowUpDecision;
+  if (!decision || typeof decision !== 'object' || Array.isArray(decision)) {
+    return null;
+  }
+  return decision;
+}
+
 function extractCanonicalMessageText(message) {
   if (!message || typeof message !== 'object') {
     return '';
@@ -321,6 +329,7 @@ async function getCortexMessageState({ userId, messageId, conversationId, schedu
     conversationId: message.conversationId,
     cortexParts,
     followUp,
+    followUpDecision: getFollowUpDecisionForMessage(message),
     canonicalText,
     canonicalTextSource: canonicalState.canonicalTextSource,
     canonicalTextFallbackReason: canonicalState.canonicalTextFallbackReason,
@@ -331,6 +340,7 @@ module.exports = {
   extractCanonicalMessageText,
   extractCortexParts,
   getCortexMessageState,
+  getFollowUpDecisionForMessage,
   getFollowUpMessageForParent,
   hasActiveCortexParts,
   isPlaceholderCanonicalText,

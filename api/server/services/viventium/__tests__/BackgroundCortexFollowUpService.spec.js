@@ -21,6 +21,8 @@ const {
   isPlaceholderRecentResponseText,
   mergeVisibleTextIntoMessageContent,
   upsertCortexParts,
+  buildFollowUpDecisionRecord,
+  compactDecisionRecordForMetadata,
 } = require('../BackgroundCortexFollowUpService');
 
 describe('upsertCortexParts', () => {
@@ -719,6 +721,111 @@ describe('resolveFollowUpPersistenceText', () => {
     expect(result.decision.selectedStrategy).toBe('voice_empty_suppressed');
     expect(result.decision.suppressionReason).toBe('voice_followup_generation_failed');
     expect(result.decision.generationFailed).toBe(true);
+  });
+});
+
+describe('CortexFollowupDecision observability', () => {
+  test('records no-response suppression context without raw prompt text', () => {
+    const persistence = resolveFollowUpPersistenceText({
+      generatedText: '{NTA}',
+      insightsData: {
+        insights: [{ cortexName: 'Pattern Recognition', insight: 'Useful internal context.' }],
+        cortexCount: 1,
+      },
+      voiceMode: true,
+      surface: 'voice',
+    });
+    const record = buildFollowUpDecisionRecord({
+      req: {
+        body: { voiceMode: true, streamId: 'stream-1', viventiumSurface: 'voice' },
+        viventiumCallSession: { callSessionId: 'call-1' },
+      },
+      conversationId: 'conv-1',
+      parentMessageId: 'parent-1',
+      insightsData: {
+        insights: [{ cortexName: 'Pattern Recognition', insight: 'Useful internal context.' }],
+        cortexCount: 1,
+      },
+      generatedText: '{NTA}',
+      finalText: persistence.text,
+      decision: persistence.decision,
+      recentResponseResolution: { source: 'db_parent_message', text: 'I already covered this.' },
+      userRequest: 'Please analyze this.',
+      finalContinuationContext: {
+        hasMovedOn: false,
+        messageCount: 0,
+        currentLeafMessageId: 'parent-1',
+        lookupFailed: false,
+        contextText: '',
+      },
+    });
+
+    expect(record).toEqual(
+      expect.objectContaining({
+        tag: 'CortexFollowupDecision',
+        result: 'suppressed',
+        surface: 'voice',
+        voiceMode: true,
+        conversationId: 'conv-1',
+        parentMessageId: 'parent-1',
+        llmResult: 'nta',
+        selectedStrategy: 'no_response_suppressed',
+        suppressionReason: 'no_response_tag',
+        insightCount: 1,
+        generatedLength: 5,
+        finalLength: 0,
+      }),
+    );
+    expect(JSON.stringify(record)).not.toContain('I already covered this');
+    expect(record.recentResponseHash).toHaveLength(12);
+  });
+
+  test('compacts decision metadata for DB endpoints by removing volatile request ids', () => {
+    const compact = compactDecisionRecordForMetadata({
+      tag: 'CortexFollowupDecision',
+      result: 'suppressed',
+      callSessionId: 'call-1',
+      streamId: 'stream-1',
+      requestId: 'req-1',
+      parentMessageId: 'parent-1',
+    });
+
+    expect(compact).toEqual({
+      tag: 'CortexFollowupDecision',
+      result: 'suppressed',
+      parentMessageId: 'parent-1',
+    });
+  });
+
+  test('honors explicit skipped result for terminal Phase B decisions', () => {
+    const record = buildFollowUpDecisionRecord({
+      req: {
+        body: { viventiumSurface: 'web' },
+      },
+      conversationId: 'conv-1',
+      parentMessageId: 'parent-1',
+      insightsData: {
+        insights: [],
+        mergedPrompt: '',
+        cortexCount: 0,
+      },
+      decision: {
+        result: 'skipped',
+        selectedStrategy: 'no_usable_output',
+        suppressionReason: 'no_usable_phase_b_output',
+        llmResult: 'skipped',
+      },
+    });
+
+    expect(record).toEqual(
+      expect.objectContaining({
+        result: 'skipped',
+        selectedStrategy: 'no_usable_output',
+        suppressionReason: 'no_usable_phase_b_output',
+        llmResult: 'skipped',
+        finalLength: 0,
+      }),
+    );
   });
 });
 

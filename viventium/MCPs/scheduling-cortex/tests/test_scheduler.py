@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from scheduling_cortex.dispatch import HttpJsonError
 from scheduling_cortex.scheduler import SchedulerEngine, SCHEDULER_MISFIRE_KEY, _resolve_misfire_policy
 from scheduling_cortex.storage import ScheduleStorage, StorageConfig
 
@@ -175,6 +176,35 @@ class SchedulerDeliveryPersistenceTests(unittest.TestCase):
             self.assertEqual(updated.get("last_delivery_reason"), "telegram:timeout")
             self.assertIsNone(updated.get("last_generated_text"))
             self.assertEqual(updated.get("last_delivery", {}).get("outcome"), "failed")
+            self.assertEqual(updated.get("active"), 1)
+            self.assertIsNotNone(updated.get("next_run_at"))
+
+    def test_update_after_failure_deactivates_orphaned_user_schedule(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = ScheduleStorage(StorageConfig(db_path=str(Path(tmpdir) / "schedules.db")))
+            task = _seed_task(storage, "task-orphaned-user")
+            engine = SchedulerEngine(storage, poll_interval_s=30, misfire_grace_s=900, retry_delay_s=300)
+            now = datetime(2026, 2, 13, 19, 0, 0, tzinfo=timezone.utc)
+
+            engine._update_after_failure(
+                task,
+                now,
+                HttpJsonError(
+                    "POST /api/viventium/scheduler/chat failed: HTTP 404 (user_not_found): User not found",
+                    status=404,
+                    method="POST",
+                    path="/api/viventium/scheduler/chat",
+                    reason="user_not_found",
+                ),
+            )
+
+            updated = storage.get_task("user-1", "task-orphaned-user")
+            self.assertEqual(updated.get("active"), 0)
+            self.assertIsNone(updated.get("next_run_at"))
+            self.assertEqual(updated.get("last_status"), "error")
+            self.assertEqual(updated.get("last_delivery_outcome"), "failed")
+            self.assertEqual(updated.get("last_delivery_reason"), "orphaned_user_not_found")
+            self.assertEqual(updated.get("last_delivery", {}).get("failure_class"), "orphaned_user_not_found")
 
     def test_update_after_success_records_fallback_delivery_as_degraded_outcome(self):
         with tempfile.TemporaryDirectory() as tmpdir:

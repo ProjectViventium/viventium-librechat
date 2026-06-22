@@ -213,6 +213,16 @@ describe('ToolCallInfo', () => {
       expect(screen.queryByText('UI Resources')).not.toBeInTheDocument();
     });
 
+    it('omits the input code block when input is intentionally hidden', () => {
+      const { container } = render(
+        <ToolCallInfo input="" function_name="GlassHive workspace" output="Status: queued" />,
+      );
+
+      const codeBlocks = container.querySelectorAll('code');
+      expect(codeBlocks).toHaveLength(1);
+      expect(codeBlocks[0]?.textContent).toBe('Status: queued');
+    });
+
     it('should pass correct props to UIResourceRenderer', () => {
       const uiResource = {
         type: 'form',

@@ -4,8 +4,10 @@
 # === VIVENTIUM END ===
 
 import os
+import json
 import sys
 import unittest
+from datetime import datetime, timezone
 from io import BytesIO
 from urllib.error import HTTPError
 from unittest.mock import patch
@@ -110,11 +112,80 @@ class DispatchTelegramTests(unittest.TestCase):
         composed = dispatch._compose_prompt(task)
         self.assertIn('Background Processing (Brewing)', composed)
         self.assertIn('scheduled self-prompt', composed)
+        self.assertIn('Scheduled Run Context (Deterministic)', composed)
+        self.assertIn('scheduled_due_local_date', composed)
         self.assertIn('live external facts', composed)
         self.assertIn('verified tool/cortex result', composed)
         self.assertIn('omit that section', composed)
         self.assertIn('Take vitamin C', composed)
         self.assertTrue(composed.startswith('<!--viv_internal:brew_begin-->'))
+
+    def test_compose_prompt_injects_due_local_date_and_calendar_window(self):
+        task = {
+            'id': 'task-context',
+            'prompt': 'Prepare the morning briefing.',
+            'schedule': {'type': 'daily', 'time': '08:00', 'timezone': 'America/Los_Angeles'},
+            'next_run_at': '2026-06-15T15:00:00Z',
+        }
+
+        composed = dispatch._compose_prompt(
+            task,
+            now_utc=datetime(2026, 6, 15, 15, 0, 26, tzinfo=timezone.utc),
+        )
+
+        self.assertIn('Scheduled Run Context (Deterministic)', composed)
+        self.assertIn('scheduled_due_at_utc: 2026-06-15T15:00:00Z', composed)
+        self.assertIn('scheduled_due_local_date: Monday, June 15, 2026', composed)
+        self.assertIn('scheduled_due_local_date_iso: 2026-06-15', composed)
+        self.assertIn('schedule_timezone: America/Los_Angeles', composed)
+        self.assertIn('calendar_window_utc_start: 2026-06-15T07:00:00Z', composed)
+        self.assertIn('calendar_window_utc_end_exclusive: 2026-06-16T07:00:00Z', composed)
+        self.assertIn('Do not carry forward dates', composed)
+        self.assertIn('calendar, email, tasks', composed)
+
+    def test_scheduled_date_guard_corrects_opening_wrong_day(self):
+        task = {
+            'schedule': {'type': 'daily', 'time': '08:00', 'timezone': 'America/Los_Angeles'},
+            'next_run_at': '2026-06-15T15:00:00Z',
+        }
+        context = dispatch._build_scheduled_run_context(
+            task,
+            now_utc=datetime(2026, 6, 15, 15, 0, 26, tzinfo=timezone.utc),
+        )
+
+        final_text, followup_text, guard = dispatch._apply_scheduled_date_guard(
+            'Monday, June 16. Here is the briefing.',
+            '',
+            context,
+        )
+
+        self.assertIn('Monday, June 15, 2026. Here is the briefing.', final_text)
+        self.assertEqual(followup_text, '')
+        self.assertEqual(guard['final']['status'], 'corrected')
+        self.assertEqual(guard['final']['expected'], 'Monday, June 15, 2026')
+        self.assertEqual(guard['final']['claim'], 'Monday, June 16')
+
+    def test_scheduled_date_guard_does_not_rewrite_event_date_in_opening_sentence(self):
+        task = {
+            'schedule': {'type': 'daily', 'time': '08:00', 'timezone': 'America/Los_Angeles'},
+            'next_run_at': '2026-06-15T15:00:00Z',
+        }
+        context = dispatch._build_scheduled_run_context(
+            task,
+            now_utc=datetime(2026, 6, 15, 15, 0, 26, tzinfo=timezone.utc),
+        )
+        original = 'Good morning. Your flight Tuesday, June 16 is confirmed.'
+
+        final_text, followup_text, guard = dispatch._apply_scheduled_date_guard(
+            original,
+            '',
+            context,
+        )
+
+        self.assertEqual(final_text, original)
+        self.assertEqual(followup_text, '')
+        self.assertEqual(guard['final']['status'], 'mismatch_unmodified')
+        self.assertEqual(guard['final']['reason'], 'opening_date_not_leading')
 
     def test_compose_prompt_does_not_double_prefix_existing_scheduled_prompt(self):
         existing = (
@@ -320,6 +391,175 @@ class DispatchTelegramTests(unittest.TestCase):
             self.assertEqual(result.get('final_text'), 'Fresh canonical summary')
             self.assertEqual(result.get('final_text_source'), 'canonical_parent')
             self.assertEqual(result.get('followup_text'), '')
+
+    def test_run_scheduler_generation_posts_scheduler_run_context(self):
+        task = {
+            'id': 'task-run-context',
+            'user_id': 'user_1',
+            'agent_id': 'agent-1',
+            'prompt': 'prepare morning briefing',
+            'channel': 'telegram',
+            'conversation_policy': 'same',
+            'schedule': {'type': 'daily', 'time': '08:00', 'timezone': 'America/Los_Angeles'},
+            'next_run_at': '2026-06-15T15:00:00Z',
+            'metadata': None,
+        }
+        seen_payloads = []
+
+        def fake_post(_url, payload, _headers, _timeout_s):
+            seen_payloads.append(payload)
+            return {'streamId': 'stream-run-context', 'conversationId': 'conv-run-context'}
+
+        with patch.object(
+            dispatch,
+            '_utc_now',
+            return_value=datetime(2026, 6, 15, 15, 0, 26, tzinfo=timezone.utc),
+        ), patch.object(
+            dispatch,
+            '_post_json',
+            side_effect=fake_post,
+        ), patch.object(
+            dispatch,
+            '_stream_scheduler_response',
+            return_value=('Monday, June 15, 2026. Clear.', 'msg-run-context', ''),
+        ), patch.object(
+            dispatch,
+            '_poll_scheduler_followup',
+            return_value={'followup_text': '', 'canonical_text': ''},
+        ):
+            result = dispatch._run_scheduler_generation(task, 'http://localhost:3080', 10, 'conv-1')
+
+        payload = seen_payloads[0]
+        self.assertEqual(payload['clientTimestamp'], '2026-06-15T15:00:26Z')
+        self.assertEqual(payload['scheduledDueAt'], '2026-06-15T15:00:00Z')
+        self.assertEqual(payload['schedulerRunContext']['scheduled_due_local_date'], 'Monday, June 15, 2026')
+        self.assertEqual(payload['schedulerRunContext']['scheduled_due_local_date_iso'], '2026-06-15')
+        self.assertIn('Scheduled Run Context (Deterministic)', payload['text'])
+        self.assertEqual(result['date_guard']['final']['status'], 'passed')
+
+    def test_run_scheduler_generation_corrects_delivery_without_persisting_history(self):
+        task = {
+            'id': 'task-run-context-corrected',
+            'user_id': 'user_1',
+            'agent_id': 'agent-1',
+            'prompt': 'prepare morning briefing',
+            'channel': 'telegram',
+            'conversation_policy': 'same',
+            'schedule': {'type': 'daily', 'time': '08:00', 'timezone': 'America/Los_Angeles'},
+            'next_run_at': '2026-06-15T15:00:00Z',
+            'metadata': None,
+        }
+        seen_posts = []
+
+        def fake_post(url, payload, _headers, _timeout_s):
+            seen_posts.append((url, payload))
+            if url.endswith('/api/viventium/scheduler/chat'):
+                return {'streamId': 'stream-run-context', 'conversationId': 'conv-run-context'}
+            self.fail(f'unexpected post url: {url}')
+
+        with patch.object(
+            dispatch,
+            '_utc_now',
+            return_value=datetime(2026, 6, 15, 15, 0, 26, tzinfo=timezone.utc),
+        ), patch.object(
+            dispatch,
+            '_post_json',
+            side_effect=fake_post,
+        ), patch.object(
+            dispatch,
+            '_stream_scheduler_response',
+            return_value=('Monday, June 16. Wrong day.', 'msg-run-context', ''),
+        ), patch.object(
+            dispatch,
+            '_poll_scheduler_followup',
+            return_value={'followup_text': '', 'canonical_text': ''},
+        ):
+            result = dispatch._run_scheduler_generation(task, 'http://localhost:3080', 10, 'conv-1')
+
+        self.assertEqual(len(seen_posts), 1)
+        self.assertTrue(seen_posts[0][0].endswith('/api/viventium/scheduler/chat'))
+        self.assertEqual(result['final_text'], 'Monday, June 15, 2026. Wrong day.')
+        self.assertEqual(result['date_guard']['final']['status'], 'corrected')
+        self.assertNotIn('persisted_message', result['date_guard'])
+
+    def test_scheduler_stream_returns_on_final_event_without_linger(self):
+        seen = {}
+
+        def fake_payloads(url, headers, timeout_s):
+            seen['url'] = url
+            seen['headers'] = headers
+            seen['timeout_s'] = timeout_s
+            yield json.dumps(
+                {
+                    'event': 'on_message_delta',
+                    'data': {'delta': {'content': [{'text': 'partial'}]}},
+                }
+            )
+            yield json.dumps(
+                {
+                    'final': True,
+                    'responseMessage': {
+                        'messageId': 'msg-final',
+                        'text': 'Final scheduled text',
+                    },
+                }
+            )
+            raise AssertionError('stream reader should stop after final event')
+
+        with patch.object(dispatch, '_iter_sse_payloads', side_effect=fake_payloads):
+            final_text, response_message_id, followup_text = dispatch._stream_scheduler_response(
+                'http://localhost:3080',
+                'stream-final',
+                'user_1',
+                'secret',
+                120,
+            )
+
+        self.assertEqual(final_text, 'Final scheduled text')
+        self.assertEqual(response_message_id, 'msg-final')
+        self.assertEqual(followup_text, '')
+        self.assertNotIn('linger=', seen['url'])
+        self.assertIn('/api/viventium/scheduler/stream/stream-final', seen['url'])
+
+    def test_telegram_stream_returns_on_final_event_without_linger(self):
+        seen = {}
+
+        def fake_payloads(url, headers, timeout_s):
+            seen['url'] = url
+            seen['headers'] = headers
+            seen['timeout_s'] = timeout_s
+            yield json.dumps(
+                {
+                    'event': 'on_message_delta',
+                    'data': {'delta': {'content': [{'text': 'partial'}]}},
+                }
+            )
+            yield json.dumps(
+                {
+                    'final': True,
+                    'responseMessage': {
+                        'messageId': 'msg-telegram-final',
+                        'text': 'Final Telegram text',
+                    },
+                }
+            )
+            raise AssertionError('telegram stream reader should stop after final event')
+
+        with patch.object(dispatch, '_iter_sse_payloads', side_effect=fake_payloads):
+            final_text, response_message_id, followup_text = dispatch._stream_telegram_response(
+                'http://localhost:3080',
+                'stream-telegram-final',
+                'tg-user',
+                'tg-chat',
+                'secret',
+                120,
+            )
+
+        self.assertEqual(final_text, 'Final Telegram text')
+        self.assertEqual(response_message_id, 'msg-telegram-final')
+        self.assertEqual(followup_text, '')
+        self.assertNotIn('linger=', seen['url'])
+        self.assertIn('/api/viventium/telegram/stream/stream-telegram-final', seen['url'])
 
     def test_run_scheduler_generation_marks_promoted_deferred_fallback_source(self):
         task = {

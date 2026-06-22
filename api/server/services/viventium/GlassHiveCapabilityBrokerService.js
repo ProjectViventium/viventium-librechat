@@ -8,13 +8,7 @@
 const { logger } = require('@librechat/data-schemas');
 const { CacheKeys } = require('librechat-data-provider');
 const { getMCPManager, getMCPServersRegistry, getFlowStateManager } = require('~/config');
-const {
-  findToken,
-  createToken,
-  updateToken,
-  deleteToken,
-  getUserById,
-} = require('~/models');
+const { findToken, createToken, updateToken, deleteToken, getUserById } = require('~/models');
 const { getLogStores } = require('~/cache');
 const { getGraphApiToken } = require('~/server/services/GraphTokenService');
 const { reinitMCPServer } = require('~/server/services/Tools/mcp');
@@ -53,7 +47,9 @@ async function userForGrant(grant) {
   if (!userId) {
     throw new Error('GlassHive capability broker grant is missing user id');
   }
-  const user = await getUserById(userId, '-password -__v -totpSecret -backupCodes').catch(() => null);
+  const user = await getUserById(userId, '-password -__v -totpSecret -backupCodes').catch(
+    () => null,
+  );
   if (!user) {
     throw new Error('GlassHive capability broker user no longer exists');
   }
@@ -66,12 +62,17 @@ async function userForGrant(grant) {
 }
 
 async function requestedServersFromGrant(grant, user, registry) {
-  const servers = new Set((grant?.allowed_servers || []).map((server) => String(server || '').trim()).filter(Boolean));
+  const servers = new Set(
+    (grant?.allowed_servers || []).map((server) => String(server || '').trim()).filter(Boolean),
+  );
   if (grant?.allow_dynamic_policy_servers === true && registry?.getAllServerConfigs) {
     const mcpConfig = await registry.getAllServerConfigs(user.id).catch((error) => {
-      logger.warn('[VIVENTIUM][glasshive-capability-broker] Failed to resolve dynamic policy servers', {
-        message: error?.message,
-      });
+      logger.warn(
+        '[VIVENTIUM][glasshive-capability-broker] Failed to resolve dynamic policy servers',
+        {
+          message: error?.message,
+        },
+      );
       return null;
     });
     for (const serverName of collectAllowedServers({
@@ -85,24 +86,23 @@ async function requestedServersFromGrant(grant, user, registry) {
 }
 
 async function discoverServerTools({ user, serverName, serverConfig, signal } = {}) {
-  const discoverOnce = () => reinitMCPServer({
-    user,
-    signal,
-    forceNew: true,
-    serverName,
-    serverConfig,
-    returnOnOAuth: true,
-    oauthStart: async () => {
-      // Worker-side OAuth starts are intentionally not launched from the sandbox.
-    },
-  });
+  const discoverOnce = () =>
+    reinitMCPServer({
+      user,
+      signal,
+      forceNew: true,
+      serverName,
+      serverConfig,
+      returnOnOAuth: true,
+      oauthStart: async () => {
+        // Worker-side OAuth starts are intentionally not launched from the sandbox.
+      },
+    });
 
   let result = await discoverOnce();
   const toolCount = () => (Array.isArray(result?.tools) ? result.tools.length : 0);
   const shouldRetry =
-    !signal?.aborted &&
-    !result?.oauthRequired &&
-    (!result?.success || toolCount() === 0);
+    !signal?.aborted && !result?.oauthRequired && (!result?.success || toolCount() === 0);
 
   if (shouldRetry) {
     const delayMs = brokerDiscoveryRetryDelayMs();
@@ -245,7 +245,11 @@ function extractIntentFlags(args = {}) {
     explicitContentIntent: meta.explicitContentIntent === true,
     invocationId: String(meta.invocation_id || args.invocation_id || '').trim(),
     writeConfirmationToken: String(
-      meta.write_confirmation_token || meta.confirmation_token || args.write_confirmation_token || args.confirmation_token || '',
+      meta.write_confirmation_token ||
+        meta.confirmation_token ||
+        args.write_confirmation_token ||
+        args.confirmation_token ||
+        '',
     ).trim(),
   };
 }

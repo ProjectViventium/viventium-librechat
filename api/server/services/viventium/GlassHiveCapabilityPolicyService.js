@@ -12,6 +12,11 @@ const BROKER_HELPER_TOOLS = new Set([
   'capability_describe',
   'capability_invoke',
 ]);
+const CONTENT_READ_GRANT_REQUIRED_POLICIES = new Set([
+  'require_broker_grant',
+  // Legacy name kept as a compatibility alias for older local configs.
+  'require_explicit_intent',
+]);
 
 function isEnabledFlag(value, defaultValue = true) {
   if (value == null || value === '') {
@@ -56,7 +61,9 @@ function isTrustedServerConfig(serverConfig = {}) {
 }
 
 function policyAllowsExecutionMode(policy, executionMode = '') {
-  const mode = String(executionMode || '').trim().toLowerCase();
+  const mode = String(executionMode || '')
+    .trim()
+    .toLowerCase();
   if (mode === 'host') {
     return policy.hostAllowed !== false;
   }
@@ -66,17 +73,45 @@ function policyAllowsExecutionMode(policy, executionMode = '') {
   return policy.hostAllowed !== false || policy.sandboxAllowed !== false;
 }
 
-function collectAllowedServers({ mcpConfig = {}, executionMode = '' } = {}) {
+function collectAllowedServerEntries({ mcpConfig = {}, executionMode = '' } = {}) {
   if (!isBrokerProjectionEnabled()) {
     return [];
   }
   return Object.entries(mcpConfig)
-    .filter(([, serverConfig]) => {
+    .map(([serverName, serverConfig]) => {
       const policy = getPolicy(serverConfig);
-      return policy && isTrustedServerConfig(serverConfig) && policyAllowsExecutionMode(policy, executionMode);
+      return { serverName, serverConfig, policy };
     })
-    .map(([serverName]) => serverName)
-    .sort();
+    .filter(({ serverConfig, policy }) => {
+      return (
+        policy &&
+        isTrustedServerConfig(serverConfig) &&
+        policyAllowsExecutionMode(policy, executionMode)
+      );
+    })
+    .sort((left, right) => left.serverName.localeCompare(right.serverName));
+}
+
+function collectAllowedServers({ mcpConfig = {}, executionMode = '' } = {}) {
+  return collectAllowedServerEntries({ mcpConfig, executionMode }).map(
+    ({ serverName }) => serverName,
+  );
+}
+
+function policyCanReceiveContentReadGrant(policy = {}) {
+  if (!policy || policy.contentReadPolicy === 'deny') {
+    return false;
+  }
+  if (policy.defaultToolAccess === 'content_read') {
+    return true;
+  }
+  return Object.values(policy.toolPolicies || {}).some(
+    (toolPolicy) => toolPolicy?.access === 'content_read',
+  );
+}
+
+function shouldGrantContentReadScope(allowedServerEntries = []) {
+  return allowedServerEntries.some(({ policy }) => policyCanReceiveContentReadGrant(policy));
 }
 
 function brokerToolName(serverName, toolName) {
@@ -163,10 +198,10 @@ function evaluateToolCallPolicy({
   }
   if (
     toolPolicy.access === 'content_read' &&
-    policy.contentReadPolicy === 'require_explicit_intent' &&
+    CONTENT_READ_GRANT_REQUIRED_POLICIES.has(policy.contentReadPolicy) &&
     !contentReadIntent
   ) {
-    return { allowed: false, reason: 'content_read_requires_user_intent_scope', toolPolicy };
+    return { allowed: false, reason: 'content_read_requires_broker_grant_scope', toolPolicy };
   }
   if (toolPolicy.access === 'write' && policy.writePolicy === 'deny') {
     return { allowed: false, reason: 'write_denied', toolPolicy };
@@ -177,7 +212,15 @@ function evaluateToolCallPolicy({
   return { allowed: true, reason: 'allowed', toolPolicy };
 }
 
-function auditSafeToolSummary({ serverName, toolName, brokerName, description, inputSchema, policy, tool } = {}) {
+function auditSafeToolSummary({
+  serverName,
+  toolName,
+  brokerName,
+  description,
+  inputSchema,
+  policy,
+  tool,
+} = {}) {
   return {
     name: brokerName,
     title: `${serverName}:${toolName}`,
@@ -205,6 +248,7 @@ module.exports = {
   BROKER_HELPER_TOOLS,
   auditSafeToolSummary,
   brokerToolName,
+  collectAllowedServerEntries,
   collectAllowedServers,
   evaluateToolCallPolicy,
   getPolicy,
@@ -212,4 +256,6 @@ module.exports = {
   isBrokerProjectionEnabled,
   isTrustedServerConfig,
   logOmission,
+  policyCanReceiveContentReadGrant,
+  shouldGrantContentReadScope,
 };

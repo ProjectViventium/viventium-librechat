@@ -83,8 +83,10 @@ async function ensureMorningBriefing({ userId, clientTimezone, surface }) {
       time: getDefaultTime(),
       conversation_policy: 'same',
       prompt:
-        'Morning orientation: review my memories, calendar, pending tasks, ' +
-        'and any overnight signals. Prepare a concise morning briefing for the user.',
+        'Morning orientation: use the deterministic scheduled-run date as the anchor, ' +
+        'review my memories, connected calendar, pending tasks, email or overnight signals when ' +
+        'verified tool/cortex results are available, and prepare a concise morning briefing. ' +
+        'Omit unsupported live/current-day sections instead of guessing.',
       metadata: {
         template_id: TEMPLATE_ID,
         bootstrap_source: 'morningBriefingBootstrap',
@@ -114,10 +116,7 @@ async function ensureMorningBriefing({ userId, clientTimezone, surface }) {
         `[VIVENTIUM][bootstrap] Morning briefing already exists: userId=${userId} taskId=${result.task_id}`,
       );
     } else {
-      logger.warn(
-        `[VIVENTIUM][bootstrap] Unexpected bootstrap response: userId=${userId}`,
-        result,
-      );
+      logger.warn(`[VIVENTIUM][bootstrap] Unexpected bootstrap response: userId=${userId}`, result);
     }
   } catch (err) {
     logger.warn(

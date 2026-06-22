@@ -26,9 +26,27 @@ describe('VoiceCortexInsightsService', () => {
     test('returns only completed cortex insights with non-empty insight text', () => {
       const content = [
         { type: ContentTypes.CORTEX_BREWING, cortex_id: 'c1', status: 'brewing' },
-        { type: ContentTypes.CORTEX_INSIGHT, cortex_id: 'c1', cortex_name: 'Subconscious', status: 'complete', insight: ' Secret code: 27. ' },
-        { type: ContentTypes.CORTEX_INSIGHT, cortex_id: 'c2', cortex_name: 'Other', status: 'complete', insight: '   ' },
-        { type: ContentTypes.CORTEX_INSIGHT, cortex_id: 'c3', cortex_name: 'Other', status: 'error', insight: 'nope' },
+        {
+          type: ContentTypes.CORTEX_INSIGHT,
+          cortex_id: 'c1',
+          cortex_name: 'Subconscious',
+          status: 'complete',
+          insight: ' Secret code: 27. ',
+        },
+        {
+          type: ContentTypes.CORTEX_INSIGHT,
+          cortex_id: 'c2',
+          cortex_name: 'Other',
+          status: 'complete',
+          insight: '   ',
+        },
+        {
+          type: ContentTypes.CORTEX_INSIGHT,
+          cortex_id: 'c3',
+          cortex_name: 'Other',
+          status: 'error',
+          insight: 'nope',
+        },
         { type: 'text', text: 'hello' },
       ];
 
@@ -96,9 +114,14 @@ describe('VoiceCortexInsightsService', () => {
         messageId: 'm1',
         conversationId: 'c1',
         insights: [
-          { cortex_id: 'cortex-1', cortex_name: 'Background Analysis', insight: 'Secret code: 27.' },
+          {
+            cortex_id: 'cortex-1',
+            cortex_name: 'Background Analysis',
+            insight: 'Secret code: 27.',
+          },
         ],
         followUp: null,
+        followUpDecision: null,
       });
     });
   });

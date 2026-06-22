@@ -1,4 +1,5 @@
 import React from 'react';
+import { sanitizeLiveAnnouncementText } from './sanitizeLiveAnnouncementText';
 
 const offScreenStyle: React.CSSProperties = {
   border: 0,
@@ -19,7 +20,7 @@ interface MessageBlockProps {
 
 const MessageBlock: React.FC<MessageBlockProps> = ({ message, 'aria-live': ariaLive }) => (
   <div style={offScreenStyle} role="log" aria-live={ariaLive}>
-    {message}
+    {sanitizeLiveAnnouncementText(message)}
   </div>
 );
 

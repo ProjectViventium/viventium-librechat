@@ -94,7 +94,7 @@ describe('GlassHive capability broker', () => {
     expect(() => verifyBrokerGrant(tampered)).toThrow(/signature/);
   });
 
-  test('binds content-read intent and bounded renewal to the signed broker grant', () => {
+  test('binds content-read scope and bounded renewal to the signed broker grant', () => {
     const {
       grantReplayTtlMs,
       mintBrokerGrant,
@@ -159,7 +159,9 @@ describe('GlassHive capability broker', () => {
   });
 
   test('injects broker MCP config into GlassHive launch bootstrap without provider secrets', async () => {
-    const { maybeInjectGlassHiveCapabilityBroker } = require('../GlassHiveCapabilityBootstrapService');
+    const {
+      maybeInjectGlassHiveCapabilityBroker,
+    } = require('../GlassHiveCapabilityBootstrapService');
     mockGetMCPServersRegistry.mockReturnValue({
       getAllServerConfigs: jest.fn().mockResolvedValue({
         'ms-365': {
@@ -169,6 +171,8 @@ describe('GlassHive capability broker', () => {
             version: 1,
             permitsAutonomousWorker: true,
             sandboxAllowed: true,
+            defaultToolAccess: 'content_read',
+            contentReadPolicy: 'require_broker_grant',
           },
         },
       }),
@@ -181,7 +185,6 @@ describe('GlassHive capability broker', () => {
         description: 'Check my workspace',
         success_criteria: 'Use live connected evidence',
         context: 'Original context',
-        connected_account_content_intent: true,
         execution_mode: 'docker',
       },
       config: {
@@ -195,6 +198,7 @@ describe('GlassHive capability broker', () => {
     expect(result.context).toContain('glasshive-user-capabilities');
     expect(result.context).toContain('Prefer MCP/tools');
     expect(result.context).toContain('non-broker host connector');
+    expect(result.context).toContain('authorized by reviewed host policy');
     expect(result.success_criteria).toBe('Use live connected evidence');
     expect(result.bootstrap_bundle_json.codex_md).toContain('glasshive-user-capabilities');
     expect(result.bootstrap_bundle_json.glasshive_capability_broker.allowed_servers).toEqual([
@@ -212,21 +216,33 @@ describe('GlassHive capability broker', () => {
   });
 
   test('injects the run memory into the worker bundle when provided, and omits it when absent (Quality parity)', async () => {
-    const { maybeInjectGlassHiveCapabilityBroker } = require('../GlassHiveCapabilityBootstrapService');
+    const {
+      maybeInjectGlassHiveCapabilityBroker,
+    } = require('../GlassHiveCapabilityBootstrapService');
     mockGetMCPServersRegistry.mockReturnValue({
       getAllServerConfigs: jest.fn().mockResolvedValue({
         'ms-365': {
           source: 'config',
-          viventiumGlassHive: { version: 1, permitsAutonomousWorker: true, sandboxAllowed: true },
+          viventiumGlassHive: {
+            version: 1,
+            permitsAutonomousWorker: true,
+            sandboxAllowed: true,
+            defaultToolAccess: 'content_read',
+            contentReadPolicy: 'require_broker_grant',
+          },
         },
       }),
     });
-    const memory = '- Prefers concise summaries\n- Key people: Nilay (Bryter), Sumeet (intro)';
+    const memory = '- Prefers concise summaries\n- Key people: Alex (ExampleCo), Sam (intro)';
 
     const withMemory = await maybeInjectGlassHiveCapabilityBroker({
       serverName: 'glasshive-workers-projects',
       toolName: 'workspace_launch',
-      toolArguments: { description: 'Check inbox', success_criteria: 'x', execution_mode: 'docker' },
+      toolArguments: {
+        description: 'Check inbox',
+        success_criteria: 'x',
+        execution_mode: 'docker',
+      },
       config: {
         configurable: {
           user: { id: 'user-1', role: 'USER' },
@@ -236,21 +252,27 @@ describe('GlassHive capability broker', () => {
       },
     });
     expect(withMemory.bootstrap_bundle_json.agents_md).toContain('saved memory');
-    expect(withMemory.bootstrap_bundle_json.agents_md).toContain('Nilay (Bryter)');
-    expect(withMemory.bootstrap_bundle_json.claude_md).toContain('Sumeet (intro)');
+    expect(withMemory.bootstrap_bundle_json.agents_md).toContain('Alex (ExampleCo)');
+    expect(withMemory.bootstrap_bundle_json.claude_md).toContain('Sam (intro)');
     expect(withMemory.bootstrap_bundle_json.codex_md).toContain('Prefers concise summaries');
 
     const withoutMemory = await maybeInjectGlassHiveCapabilityBroker({
       serverName: 'glasshive-workers-projects',
       toolName: 'workspace_launch',
-      toolArguments: { description: 'Check inbox', success_criteria: 'x', execution_mode: 'docker' },
+      toolArguments: {
+        description: 'Check inbox',
+        success_criteria: 'x',
+        execution_mode: 'docker',
+      },
       config: { configurable: { user: { id: 'user-1', role: 'USER' }, requestBody: {} } },
     });
     expect(withoutMemory.bootstrap_bundle_json.agents_md || '').not.toContain('saved memory');
   });
 
   test('injects broker MCP config into GlassHive continue calls without replacing user instructions', async () => {
-    const { maybeInjectGlassHiveCapabilityBroker } = require('../GlassHiveCapabilityBootstrapService');
+    const {
+      maybeInjectGlassHiveCapabilityBroker,
+    } = require('../GlassHiveCapabilityBootstrapService');
     mockGetMCPServersRegistry.mockReturnValue({
       getAllServerConfigs: jest.fn().mockResolvedValue({
         google_workspace: {
@@ -259,6 +281,8 @@ describe('GlassHive capability broker', () => {
             version: 1,
             permitsAutonomousWorker: true,
             sandboxAllowed: true,
+            defaultToolAccess: 'content_read',
+            contentReadPolicy: 'require_broker_grant',
           },
         },
       }),
@@ -270,7 +294,6 @@ describe('GlassHive capability broker', () => {
       toolArguments: {
         run_id: 'run-1',
         additional_instructions: 'Continue the same public-safe connected-account check.',
-        connected_account_content_intent: true,
         execution_mode: 'docker',
       },
       config: {
@@ -292,7 +315,9 @@ describe('GlassHive capability broker', () => {
   });
 
   test('skips bootstrap injection instead of breaking GlassHive launch when broker secret is missing', async () => {
-    const { maybeInjectGlassHiveCapabilityBroker } = require('../GlassHiveCapabilityBootstrapService');
+    const {
+      maybeInjectGlassHiveCapabilityBroker,
+    } = require('../GlassHiveCapabilityBootstrapService');
     process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = '';
     process.env.VIVENTIUM_GLASSHIVE_CALLBACK_SECRET = '';
     mockGetMCPServersRegistry.mockReturnValue({
@@ -303,6 +328,8 @@ describe('GlassHive capability broker', () => {
             version: 1,
             permitsAutonomousWorker: true,
             sandboxAllowed: true,
+            defaultToolAccess: 'content_read',
+            contentReadPolicy: 'require_broker_grant',
           },
         },
       }),
@@ -378,6 +405,8 @@ describe('GlassHive capability broker', () => {
             version: 1,
             permitsAutonomousWorker: true,
             sandboxAllowed: true,
+            defaultToolAccess: 'content_read',
+            contentReadPolicy: 'require_broker_grant',
           },
         },
       }),
@@ -390,7 +419,6 @@ describe('GlassHive capability broker', () => {
       toolArguments: {
         description: 'Check connected inbox',
         success_criteria: 'Use broker tools',
-        connected_account_content_intent: true,
       },
       config: {
         configurable: {
@@ -423,7 +451,7 @@ describe('GlassHive capability broker', () => {
     expect(result.success_criteria).toBe('Use broker tools');
   });
 
-  test('does not trust bootstrap bundle metadata to authorize content-read scope', () => {
+  test('does not trust worker metadata to authorize content-read scope', () => {
     const { contentReadIntentForArgs } = require('../GlassHiveCapabilityBootstrapService');
 
     expect(
@@ -435,6 +463,56 @@ describe('GlassHive capability broker', () => {
     ).toBe(false);
     expect(contentReadIntentForArgs({ connected_account_content_intent: true })).toBe(true);
     expect(contentReadIntentForArgs({ contentReadIntent: 'true' })).toBe(true);
+  });
+
+  test('does not mint content-read scope from a host flag when reviewed policy lacks read access', async () => {
+    const {
+      maybeInjectGlassHiveCapabilityBroker,
+    } = require('../GlassHiveCapabilityBootstrapService');
+    const { logger } = require('@librechat/data-schemas');
+    mockGetMCPServersRegistry.mockReturnValue({
+      getAllServerConfigs: jest.fn().mockResolvedValue({
+        admin_tools: {
+          source: 'config',
+          viventiumGlassHive: {
+            version: 1,
+            permitsAutonomousWorker: true,
+            sandboxAllowed: true,
+            defaultToolAccess: 'none',
+            contentReadPolicy: 'deny',
+          },
+        },
+      }),
+    });
+
+    const result = await maybeInjectGlassHiveCapabilityBroker({
+      serverName: 'glasshive-workers-projects',
+      toolName: 'workspace_launch',
+      toolArguments: {
+        description: 'Inspect connected account data',
+        success_criteria: 'Use real evidence',
+        connected_account_content_intent: true,
+        execution_mode: 'docker',
+      },
+      config: {
+        configurable: {
+          user: { id: 'user-1', role: 'USER' },
+          requestBody: { conversationId: 'conv-1', messageId: 'msg-1' },
+        },
+      },
+    });
+
+    expect(result.bootstrap_bundle_json.glasshive_capability_broker.allowed_servers).toEqual([
+      'admin_tools',
+    ]);
+    expect(result.bootstrap_bundle_json.glasshive_capability_broker.scopes.content_read).toBe(
+      false,
+    );
+    expect(result.context).toContain('Content-read broker scope for this run is not authorized');
+    expect(logger.warn).toHaveBeenCalledWith(
+      '[VIVENTIUM][glasshive-capability-broker] Host requested connected-account content scope but reviewed policy did not grant it',
+      { allowedServers: ['admin_tools'] },
+    );
   });
 
   test('fails closed when shared replay cache is unavailable unless local fallback is explicit', async () => {
@@ -470,7 +548,9 @@ describe('GlassHive capability broker', () => {
   });
 
   test('does not append broker instructions to worker label fields', async () => {
-    const { maybeInjectGlassHiveCapabilityBroker } = require('../GlassHiveCapabilityBootstrapService');
+    const {
+      maybeInjectGlassHiveCapabilityBroker,
+    } = require('../GlassHiveCapabilityBootstrapService');
     mockGetMCPServersRegistry.mockReturnValue({
       getAllServerConfigs: jest.fn().mockResolvedValue({
         'ms-365': {
@@ -608,7 +688,7 @@ describe('GlassHive capability broker', () => {
     );
   });
 
-  test('requires explicit content intent by default and escalates destructive annotations to write policy', async () => {
+  test('requires signed content-read grant scope and escalates destructive annotations to write policy', async () => {
     const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
     const {
       buildCapabilityCatalog,
@@ -623,7 +703,7 @@ describe('GlassHive capability broker', () => {
           permitsAutonomousWorker: true,
           sandboxAllowed: true,
           defaultToolAccess: 'content_read',
-          contentReadPolicy: 'require_explicit_intent',
+          contentReadPolicy: 'require_broker_grant',
           writePolicy: 'confirm',
         },
       }),
@@ -671,7 +751,7 @@ describe('GlassHive capability broker', () => {
     expect(readBlocked).toEqual(
       expect.objectContaining({
         status: 'blocked',
-        reason: 'content_read_requires_user_intent_scope',
+        reason: 'content_read_requires_broker_grant_scope',
       }),
     );
 
@@ -686,7 +766,7 @@ describe('GlassHive capability broker', () => {
     expect(workerSelfAssertedRead).toEqual(
       expect.objectContaining({
         status: 'blocked',
-        reason: 'content_read_requires_user_intent_scope',
+        reason: 'content_read_requires_broker_grant_scope',
       }),
     );
 
@@ -723,7 +803,7 @@ describe('GlassHive capability broker', () => {
           permitsAutonomousWorker: true,
           sandboxAllowed: true,
           defaultToolAccess: 'content_read',
-          contentReadPolicy: 'require_explicit_intent',
+          contentReadPolicy: 'require_broker_grant',
         },
       }),
     });
@@ -840,7 +920,10 @@ describe('GlassHive capability broker', () => {
 
   test('uses a fresh MCP connection and retries stale empty broker discovery once', async () => {
     const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
-    const { buildCapabilityCatalog, toolDefinitionsForMcp } = require('../GlassHiveCapabilityBrokerService');
+    const {
+      buildCapabilityCatalog,
+      toolDefinitionsForMcp,
+    } = require('../GlassHiveCapabilityBrokerService');
     const policyConfig = {
       source: 'config',
       viventiumGlassHive: {

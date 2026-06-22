@@ -11,7 +11,7 @@ describe('MCP Viventium server-managed fields', () => {
         sandboxAllowed: true,
         hostAllowed: true,
         defaultToolAccess: 'read_metadata',
-        contentReadPolicy: 'require_explicit_intent',
+        contentReadPolicy: 'require_broker_grant',
         writePolicy: 'confirm',
         reexportNativeTools: true,
       },

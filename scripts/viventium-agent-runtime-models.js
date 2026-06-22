@@ -7,11 +7,11 @@ const DEFAULT_MODELS = {
   groq: 'meta-llama/llama-4-scout-17b-16e-instruct',
 };
 
-const APPROVED_MAIN_RUNTIME_FAMILIES = new Set(['anthropic::claude-opus-4-7', 'openAI::gpt-5.4']);
+const APPROVED_MAIN_RUNTIME_FAMILIES = new Set(['anthropic::claude-opus-4-8', 'openAI::gpt-5.4']);
 
 const APPROVED_BACKGROUND_RUNTIME_FAMILIES = new Set([
   'anthropic::claude-sonnet-4-5',
-  'anthropic::claude-opus-4-7',
+  'anthropic::claude-opus-4-8',
   'openAI::gpt-5.4',
 ]);
 

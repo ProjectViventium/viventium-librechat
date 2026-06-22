@@ -55,7 +55,9 @@ async function handleRpc(req, res) {
     const rateLimit = await rememberBrokerRequest({ grant });
     if (!rateLimit.accepted) {
       res.set('Retry-After', String(Math.ceil(Number(rateLimit.retryAfterMs || 1000) / 1000)));
-      return res.status(429).json(rpcError(id, -32029, 'GlassHive capability broker rate limit exceeded'));
+      return res
+        .status(429)
+        .json(rpcError(id, -32029, 'GlassHive capability broker rate limit exceeded'));
     }
     if (rateLimit.remaining !== undefined) {
       res.set('x-glasshive-capability-rate-limit-remaining', String(rateLimit.remaining));
@@ -64,7 +66,9 @@ async function handleRpc(req, res) {
     logger.warn('[VIVENTIUM][glasshive-capability-broker] Rejected broker request', {
       message: error?.message,
     });
-    return res.status(401).json(rpcError(id, -32001, 'Unauthorized GlassHive capability broker request'));
+    return res
+      .status(401)
+      .json(rpcError(id, -32001, 'Unauthorized GlassHive capability broker request'));
   }
 
   try {
@@ -105,8 +109,7 @@ async function handleRpc(req, res) {
       // "expected record, received array". No broker tool advertises an outputSchema,
       // so structuredContent is optional — emit it only for plain objects; the text
       // content always carries the full result (lenient clients like codex use it).
-      const isRecord =
-        result !== null && typeof result === 'object' && !Array.isArray(result);
+      const isRecord = result !== null && typeof result === 'object' && !Array.isArray(result);
       const payload = {
         content: [
           {

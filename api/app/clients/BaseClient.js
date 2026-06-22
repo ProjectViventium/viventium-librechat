@@ -42,6 +42,16 @@ const {
 const {
   isListenOnlyTranscriptMessage,
 } = require('~/server/services/viventium/listenOnlyTranscript');
+/* === VIVENTIUM START ===
+ * Feature: Voice message correlation metadata.
+ * Purpose: Normal BaseClient message persistence is the hot path for voice user and
+ * assistant rows; attach call-session metadata here so logs/DB/QA can correlate them.
+ * Added: 2026-05-30
+ * === VIVENTIUM END === */
+const { attachVoiceMessageMetadata } = require('~/server/services/viventium/voiceMessageMetadata');
+const {
+  sanitizeVoiceAssistantMessageForPersistence,
+} = require('~/server/services/viventium/voiceArtifactText');
 const { checkBalance } = require('~/models/balanceMethods');
 const { truncateToolCallOutputs } = require('./prompts');
 const TextStream = require('./TextStream');
@@ -1002,17 +1012,16 @@ class BaseClient {
     }
 
     const hasAddedConvo = this.options?.req?.body?.addedConvo != null;
-    const savedMessage = await saveMessage(
-      this.options?.req,
-      {
-        ...message,
-        endpoint: this.options.endpoint,
-        unfinished: false,
-        user,
-        ...(hasAddedConvo && { addedConvo: true }),
-      },
-      { context: 'api/app/clients/BaseClient.js - saveMessageToDatabase #saveMessage' },
-    );
+    const messageToSave = attachVoiceMessageMetadata(this.options?.req, {
+      ...sanitizeVoiceAssistantMessageForPersistence(this.options?.req, message),
+      endpoint: this.options.endpoint,
+      unfinished: false,
+      user,
+      ...(hasAddedConvo && { addedConvo: true }),
+    });
+    const savedMessage = await saveMessage(this.options?.req, messageToSave, {
+      context: 'api/app/clients/BaseClient.js - saveMessageToDatabase #saveMessage',
+    });
 
     if (this.skipSaveConvo) {
       return { message: savedMessage };

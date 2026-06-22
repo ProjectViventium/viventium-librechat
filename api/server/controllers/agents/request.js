@@ -43,6 +43,7 @@ const {
   formatVoiceLatencyTiming,
   voiceLatencyNow,
 } = require('~/server/services/viventium/voiceLatencyTiming');
+const { attachVoiceMessageMetadata } = require('~/server/services/viventium/voiceMessageMetadata');
 /* === VIVENTIUM NOTE END === */
 
 /* === VIVENTIUM NOTE ===
@@ -61,17 +62,21 @@ const { ensureMorningBriefing } = require('~/server/services/viventium/morningBr
  * Added: 2026-02-22
  */
 const { stripVoiceControlTagsForDisplay } = require('~/server/services/viventium/surfacePrompts');
+const {
+  sanitizeVoiceAssistantMessageForPersistence,
+} = require('~/server/services/viventium/voiceArtifactText');
 /* === VIVENTIUM NOTE END === */
 
 /* === VIVENTIUM NOTE ===
  * Feature: Timed message persistence for Telegram deep timing.
  */
 const timedSaveMessage = async (req, message, options, step) => {
+  const messageToSave = attachVoiceMessageMetadata(req, message);
   if (!isDeepTimingEnabled(req)) {
-    return saveMessage(req, message, options);
+    return saveMessage(req, messageToSave, options);
   }
   const t = startDeepTiming(req);
-  const result = await saveMessage(req, message, options);
+  const result = await saveMessage(req, messageToSave, options);
   logDeepTiming(req, step, t, `messageId=${message?.messageId || 'na'}`);
   return result;
 };
@@ -190,18 +195,19 @@ function sanitizePersistedAssistantContent(req, content) {
  * Added: 2026-05-15
  */
 function normalizePersistedAssistantResponse(req, response) {
-  const persistedResponse = { ...response };
-
-  if (Array.isArray(persistedResponse.content)) {
-    persistedResponse.content = sanitizePersistedAssistantContent(req, persistedResponse.content);
+  const persistedResponse = sanitizeVoiceAssistantMessageForPersistence(req, response);
+  if (req?.body?.voiceMode === true) {
+    return persistedResponse;
   }
 
   const currentText = typeof persistedResponse.text === 'string' ? persistedResponse.text : '';
-  const sanitizedCurrentText = sanitizePersistedAssistantText(req, currentText);
   const contentText = extractTextFromContentParts(persistedResponse.content);
-
-  persistedResponse.text = sanitizedCurrentText || sanitizePersistedAssistantText(req, contentText);
-
+  if (!currentText && contentText) {
+    return {
+      ...persistedResponse,
+      text: contentText,
+    };
+  }
   return persistedResponse;
 }
 /* === VIVENTIUM END === */

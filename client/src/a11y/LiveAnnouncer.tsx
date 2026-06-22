@@ -3,6 +3,7 @@ import type { AnnounceOptions } from '~/common';
 import AnnouncerContext from '~/Providers/AnnouncerContext';
 import { useLocalize } from '~/hooks';
 import Announcer from './Announcer';
+import { sanitizeLiveAnnouncementText } from './sanitizeLiveAnnouncementText';
 
 interface LiveAnnouncerProps {
   children: React.ReactNode;
@@ -43,7 +44,10 @@ const LiveAnnouncer: React.FC<LiveAnnouncerProps> = ({ children }) => {
 
   const announcePolite = useCallback(
     ({ message, isStatus = false }: AnnounceOptions) => {
-      const finalMessage = (events[message] ?? message).replace(/[*`_]/g, '');
+      const finalMessage = sanitizeLiveAnnouncementText(events[message] ?? message).replace(
+        /[*`_]/g,
+        '',
+      );
 
       if (isStatus) {
         announceStatus(finalMessage);

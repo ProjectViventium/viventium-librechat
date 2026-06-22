@@ -1,7 +1,13 @@
 import type { TEndpointsConfig } from './types';
 import { EModelEndpoint, isDocumentSupportedProvider } from './schemas';
 import { getEndpointFileConfig, mergeFileConfig } from './file-config';
-import { getEndpointField, memorySchema, resolveEndpointType } from './config';
+import {
+  AgentCapabilities,
+  configSchema,
+  getEndpointField,
+  memorySchema,
+  resolveEndpointType,
+} from './config';
 
 const endpointsConfig: TEndpointsConfig = {
   [EModelEndpoint.openAI]: { userProvide: false, order: 0 },
@@ -143,6 +149,30 @@ describe('memorySchema', () => {
     expect(parsed.readProfile?.keyOrder).toEqual(['core', 'context']);
     expect(parsed.readProfile?.keyLimits?.core).toBe(220);
     expect(parsed.readProfile?.cacheTtlMs).toBe(30000);
+  });
+});
+
+describe('configSchema enterprise compatibility', () => {
+  it('accepts legacy enterprise agent capabilities and root summarization config', () => {
+    const parsed = configSchema.strict().parse({
+      version: '1.2.3',
+      summarization: {
+        enabled: true,
+        provider: 'anthropic',
+        model: 'claude-sonnet-4-6',
+      },
+      endpoints: {
+        [EModelEndpoint.agents]: {
+          capabilities: [AgentCapabilities.subagents, AgentCapabilities.skills],
+        },
+      },
+    });
+
+    expect(parsed.summarization?.enabled).toBe(true);
+    expect(parsed.endpoints?.[EModelEndpoint.agents]?.capabilities).toEqual([
+      AgentCapabilities.subagents,
+      AgentCapabilities.skills,
+    ]);
   });
 });
 

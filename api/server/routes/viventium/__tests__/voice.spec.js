@@ -1689,6 +1689,7 @@ describe('/api/viventium/voice/chat', () => {
           viventium: {
             type: 'glasshive_worker_callback',
             anchorMessageId: 'assistant-msg-1',
+            callbackId: 'cb-voice-1',
             workerId: 'wrk-1',
             runId: 'run-1',
             event: 'run.completed',
@@ -1711,7 +1712,7 @@ describe('/api/viventium/voice/chat', () => {
     expect(res.body.latest.text).toBe('I finished checking the invoices.');
     expect(res.body.latest.workerId).toBeUndefined();
     expect(res.body.latest.runId).toBeUndefined();
-    expect(res.body.latest.callbackId).toBeUndefined();
+    expect(res.body.latest.callbackId).toBe('cb-voice-1');
     expect(mockGetMessages).toHaveBeenCalledWith({
       user: 'user_1',
       conversationId: 'conv-voice-1',

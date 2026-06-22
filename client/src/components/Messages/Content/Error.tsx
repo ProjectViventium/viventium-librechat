@@ -186,6 +186,17 @@ const errorMessages = {
   token_balance: (json: TTokenBalance) => <TokenBalanceAction json={json} />,
 };
 
+const actionablePlainErrorPatterns = [
+  /connected account needs reconnect/i,
+  /configured fallback model could not start/i,
+  /reconnect the ai provider/i,
+  /provider billing issue/i,
+  /response stream expired during reconnect/i,
+];
+
+const isActionablePlainError = (message: string) =>
+  actionablePlainErrorPatterns.some((pattern) => pattern.test(message));
+
 const Error = ({ text }: { text: string }) => {
   const localize = useLocalize();
   const jsonString = extractJson(text);
@@ -193,6 +204,9 @@ const Error = ({ text }: { text: string }) => {
   const defaultResponse = `Something went wrong. Here's the specific error message we encountered: ${errorMessage}`;
 
   if (!isJson(jsonString)) {
+    if (isActionablePlainError(errorMessage)) {
+      return errorMessage;
+    }
     return defaultResponse;
   }
 

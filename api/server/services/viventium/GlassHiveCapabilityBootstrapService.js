@@ -9,8 +9,9 @@
 const { logger } = require('@librechat/data-schemas');
 const { getMCPServersRegistry } = require('~/config');
 const {
-  collectAllowedServers,
+  collectAllowedServerEntries,
   isBrokerProjectionEnabled,
+  shouldGrantContentReadScope,
 } = require('./GlassHiveCapabilityPolicyService');
 const { mintBrokerGrant } = require('./GlassHiveCapabilityBrokerAuth');
 
@@ -98,13 +99,17 @@ function truthyFlag(value) {
 }
 
 function normalizeExecutionMode(value) {
-  const mode = String(value || '').trim().toLowerCase();
+  const mode = String(value || '')
+    .trim()
+    .toLowerCase();
   return mode === 'host' || mode === 'docker' ? mode : '';
 }
 
 function defaultExecutionModeForBroker() {
   return (
-    normalizeExecutionMode(process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_DEFAULT_EXECUTION_MODE) ||
+    normalizeExecutionMode(
+      process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_DEFAULT_EXECUTION_MODE,
+    ) ||
     normalizeExecutionMode(process.env.VIVENTIUM_GLASSHIVE_DEFAULT_EXECUTION_MODE) ||
     normalizeExecutionMode(process.env.WPR_DEFAULT_EXECUTION_MODE) ||
     normalizeExecutionMode(process.env.GLASSHIVE_DEFAULT_EXECUTION_MODE) ||
@@ -113,7 +118,10 @@ function defaultExecutionModeForBroker() {
 }
 
 function executionModeForBroker(args = {}) {
-  return normalizeExecutionMode(args.execution_mode || args.executionMode) || defaultExecutionModeForBroker();
+  return (
+    normalizeExecutionMode(args.execution_mode || args.executionMode) ||
+    defaultExecutionModeForBroker()
+  );
 }
 
 function resolveBrokerUrl(executionMode = '') {
@@ -146,8 +154,14 @@ function grantTtlSecondsForTool(toolName, args = {}) {
   if (!GLASSHIVE_SCHEDULE_TOOLS.has(String(toolName || '').trim())) {
     return intEnv('VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_TTL_SECONDS', 10 * 60);
   }
-  const scheduleDefault = intEnv('VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SCHEDULE_TTL_SECONDS', 60 * 60);
-  const scheduleMax = intEnv('VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_MAX_SCHEDULE_TTL_SECONDS', 24 * 60 * 60);
+  const scheduleDefault = intEnv(
+    'VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SCHEDULE_TTL_SECONDS',
+    60 * 60,
+  );
+  const scheduleMax = intEnv(
+    'VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_MAX_SCHEDULE_TTL_SECONDS',
+    24 * 60 * 60,
+  );
   let desired = scheduleDefault;
   const delaySeconds = Number(args.delay_seconds ?? args.delaySeconds);
   if (Number.isFinite(delaySeconds) && delaySeconds >= 0) {
@@ -162,8 +176,14 @@ function grantTtlSecondsForTool(toolName, args = {}) {
 
 function grantRenewableTtlSecondsForTool(toolName, args = {}) {
   const base = grantTtlSecondsForTool(toolName, args);
-  const defaultRenewable = intEnv('VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_RENEWABLE_TTL_SECONDS', 60 * 60);
-  const maxRenewable = intEnv('VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_MAX_SCHEDULE_TTL_SECONDS', 24 * 60 * 60);
+  const defaultRenewable = intEnv(
+    'VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_RENEWABLE_TTL_SECONDS',
+    60 * 60,
+  );
+  const maxRenewable = intEnv(
+    'VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_MAX_SCHEDULE_TTL_SECONDS',
+    24 * 60 * 60,
+  );
   return Math.max(base, Math.min(Math.max(base, defaultRenewable), maxRenewable));
 }
 
@@ -171,7 +191,7 @@ function tomlString(value) {
   return JSON.stringify(String(value || ''));
 }
 
-function brokerContextBrief(allowedServers, { contentReadIntent = false } = {}) {
+function brokerContextBrief(allowedServers, { contentReadScope = false } = {}) {
   const serverList = allowedServers.length ? allowedServers.join(', ') : 'none';
   return [
     'GlassHive connected capability broker [v2]:',
@@ -180,7 +200,7 @@ function brokerContextBrief(allowedServers, { contentReadIntent = false } = {}) 
     '- Prefer MCP/tools for connected-account facts and actions when they can satisfy the task. Use browser or computer UI when MCP/tools are missing, unavailable, auth-blocked, explicitly required, or when visual/manual QA is genuinely the better route.',
     '- If a non-broker host connector is also available, including a built-in Codex app connector, prefer the brokered `glasshive-user-capabilities` tool when it covers the same connected-account provider. Use non-broker connectors only after the broker path is missing, unavailable, auth-blocked, or explicitly required.',
     '- Do not treat memory, recall, or prior chat text as live Google/MS365 evidence. Ask the broker when current provider truth is needed.',
-    `- Content-read intent for this run is ${contentReadIntent ? 'host-authorized' : 'not host-authorized'}. If a needed content read is blocked by broker policy, report that blocker instead of self-authorizing with worker-authored flags.`,
+    `- Content-read broker scope for this run is ${contentReadScope ? 'authorized by reviewed host policy' : 'not authorized'}. If a needed content read is blocked by broker policy, report that blocker instead of self-authorizing with worker-authored flags.`,
     `- Authorized capability servers for this run: ${serverList}. If a needed server is missing, report the broker omission/auth limitation rather than fabricating.`,
   ].join('\n');
 }
@@ -212,7 +232,7 @@ function mergeBrokerBundle({
   grantToken,
   grantPayload,
   allowedServers,
-  contentReadIntent = false,
+  contentReadScope = false,
   workerMemory = '',
 }) {
   const bundle = { ...existingBundle };
@@ -239,7 +259,7 @@ function mergeBrokerBundle({
   };
   bundle.glasshive_capability_intent = {
     ...(bundle.glasshive_capability_intent || {}),
-    content_read: contentReadIntent,
+    content_read: contentReadScope,
   };
   bundle.claude_project_mcp = {
     ...(bundle.claude_project_mcp || {}),
@@ -255,7 +275,7 @@ function mergeBrokerBundle({
     ...(bundle.env || {}),
     [codexTokenEnvVar]: grantToken,
   };
-  const instruction = brokerContextBrief(allowedServers, { contentReadIntent });
+  const instruction = brokerContextBrief(allowedServers, { contentReadScope });
   bundle.agents_md = appendText(bundle.agents_md, instruction);
   bundle.claude_md = appendText(bundle.claude_md, instruction);
   bundle.codex_md = appendText(bundle.codex_md, instruction);
@@ -268,18 +288,27 @@ function mergeBrokerBundle({
   return bundle;
 }
 
-function applyContextBrief(args, toolName, allowedServers, { contentReadIntent = false } = {}) {
-  const brief = brokerContextBrief(allowedServers, { contentReadIntent });
+function applyContextBrief(args, toolName, allowedServers, { contentReadScope = false } = {}) {
+  const brief = brokerContextBrief(allowedServers, { contentReadScope });
   if (toolName === 'workspace_launch' || toolName === 'workspace_schedule') {
     args.context = appendText(args.context, brief);
   } else if (toolName === 'workspace_continue') {
     args.additional_instructions = appendText(args.additional_instructions, brief);
-  } else if (toolName === 'worker_delegate_once' || toolName === 'worker_run' || toolName === 'worker_schedule') {
+  } else if (
+    toolName === 'worker_delegate_once' ||
+    toolName === 'worker_run' ||
+    toolName === 'worker_schedule'
+  ) {
     args.instruction = appendText(args.instruction, brief);
   }
 }
 
-async function maybeInjectGlassHiveCapabilityBroker({ serverName, toolName, toolArguments, config } = {}) {
+async function maybeInjectGlassHiveCapabilityBroker({
+  serverName,
+  toolName,
+  toolArguments,
+  config,
+} = {}) {
   if (!shouldInjectForTool({ serverName, toolName })) {
     return toolArguments;
   }
@@ -294,22 +323,27 @@ async function maybeInjectGlassHiveCapabilityBroker({ serverName, toolName, tool
   }
   const registry = getMCPServersRegistry();
   const mcpConfig = await registry.getAllServerConfigs(userId).catch((error) => {
-    logger.warn('[VIVENTIUM][glasshive-capability-broker] Failed to load MCP config for bootstrap', {
-      message: error?.message,
-    });
+    logger.warn(
+      '[VIVENTIUM][glasshive-capability-broker] Failed to load MCP config for bootstrap',
+      {
+        message: error?.message,
+      },
+    );
     return null;
   });
   if (!mcpConfig) {
     return toolArguments;
   }
   const executionMode = executionModeForBroker(args);
-  const allowedServers = collectAllowedServers({ mcpConfig, executionMode });
+  const allowedServerEntries = collectAllowedServerEntries({ mcpConfig, executionMode });
+  const allowedServers = allowedServerEntries.map(({ serverName }) => serverName);
   if (allowedServers.length === 0) {
     return toolArguments;
   }
   const requestBody = config?.configurable?.requestBody || {};
   const existingBundle = normalizeBootstrapBundle(args.bootstrap_bundle_json);
-  const contentReadIntent = contentReadIntentForArgs(args);
+  const hostContentReadIntent = contentReadIntentForArgs(args);
+  const contentReadScope = shouldGrantContentReadScope(allowedServerEntries);
   const requestContext = {
     conversation_id: requestBody.conversationId,
     parent_message_id: requestBody.parentMessageId,
@@ -325,7 +359,7 @@ async function maybeInjectGlassHiveCapabilityBroker({ serverName, toolName, tool
       executionMode,
       ttlSeconds: grantTtlSecondsForTool(toolName, args),
       renewableTtlSeconds: grantRenewableTtlSecondsForTool(toolName, args),
-      scopes: { content_read: contentReadIntent },
+      scopes: { content_read: contentReadScope },
     });
   } catch (error) {
     logger.warn('[VIVENTIUM][glasshive-capability-broker] Skipping bootstrap injection', {
@@ -342,10 +376,16 @@ async function maybeInjectGlassHiveCapabilityBroker({ serverName, toolName, tool
     grantToken: token,
     grantPayload: payload,
     allowedServers,
-    contentReadIntent,
+    contentReadScope,
     workerMemory,
   });
-  applyContextBrief(args, toolName, allowedServers, { contentReadIntent });
+  if (hostContentReadIntent && !contentReadScope) {
+    logger.warn(
+      '[VIVENTIUM][glasshive-capability-broker] Host requested connected-account content scope but reviewed policy did not grant it',
+      { allowedServers },
+    );
+  }
+  applyContextBrief(args, toolName, allowedServers, { contentReadScope });
   return typeof toolArguments === 'string' ? JSON.stringify(args) : args;
 }
 

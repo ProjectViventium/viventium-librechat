@@ -53,7 +53,10 @@ function signPayload(payload, secret = getBrokerSecret()) {
 }
 
 function argsHash(args = {}) {
-  return crypto.createHash('sha256').update(stableJson(args || {})).digest('base64url');
+  return crypto
+    .createHash('sha256')
+    .update(stableJson(args || {}))
+    .digest('base64url');
 }
 
 function timingSafeEqualString(a, b) {
@@ -63,7 +66,9 @@ function timingSafeEqualString(a, b) {
 }
 
 function sanitizeAllowedServers(servers) {
-  return Array.from(new Set((servers || []).map((server) => String(server || '').trim()).filter(Boolean))).sort();
+  return Array.from(
+    new Set((servers || []).map((server) => String(server || '').trim()).filter(Boolean)),
+  ).sort();
 }
 
 function normalizeBrokerScopes(scopes = {}) {
@@ -96,17 +101,21 @@ function mintBrokerGrant({
   }
   const iat = Math.floor(nowMs / 1000);
   const exp = iat + Math.max(60, Number(ttlSeconds) || DEFAULT_TTL_SECONDS);
-  const renewableUntil = iat + Math.max(
-    Math.max(60, Number(ttlSeconds) || DEFAULT_TTL_SECONDS),
-    Math.max(60, Number(renewableTtlSeconds) || Number(ttlSeconds) || DEFAULT_TTL_SECONDS),
-  );
+  const renewableUntil =
+    iat +
+    Math.max(
+      Math.max(60, Number(ttlSeconds) || DEFAULT_TTL_SECONDS),
+      Math.max(60, Number(renewableTtlSeconds) || Number(ttlSeconds) || DEFAULT_TTL_SECONDS),
+    );
   const payload = {
     aud: BROKER_AUDIENCE,
     grant_id: `ghcb_${crypto.randomBytes(16).toString('hex')}`,
     user_id: userId,
     user_role: String(user?.role || requestContext.user_role || ''),
     conversation_id: String(requestContext.conversation_id || requestContext.conversationId || ''),
-    parent_message_id: String(requestContext.parent_message_id || requestContext.parentMessageId || ''),
+    parent_message_id: String(
+      requestContext.parent_message_id || requestContext.parentMessageId || '',
+    ),
     message_id: String(requestContext.message_id || requestContext.messageId || ''),
     worker_id: String(requestContext.worker_id || requestContext.workerId || ''),
     run_id: String(requestContext.run_id || requestContext.runId || ''),
@@ -127,7 +136,10 @@ function mintBrokerGrant({
   };
 }
 
-function verifyBrokerGrant(token, { nowMs = Date.now(), expectedUserId, allowRenewal = false } = {}) {
+function verifyBrokerGrant(
+  token,
+  { nowMs = Date.now(), expectedUserId, allowRenewal = false } = {},
+) {
   const secret = getBrokerSecret();
   if (!secret) {
     throw new Error('GlassHive capability broker secret is not configured');
@@ -155,7 +167,10 @@ function verifyBrokerGrant(token, { nowMs = Date.now(), expectedUserId, allowRen
   }
   const expired = !Number.isFinite(Number(payload.exp)) || Number(payload.exp) < nowSeconds;
   const renewableUntil = Number(payload.renewable_until || payload.exp);
-  if (expired && (!allowRenewal || !Number.isFinite(renewableUntil) || renewableUntil < nowSeconds)) {
+  if (
+    expired &&
+    (!allowRenewal || !Number.isFinite(renewableUntil) || renewableUntil < nowSeconds)
+  ) {
     throw new Error('GlassHive capability broker grant expired');
   }
   return {
@@ -169,17 +184,24 @@ function verifyBrokerGrant(token, { nowMs = Date.now(), expectedUserId, allowRen
 function grantReplayTtlMs(grant, nowMs = Date.now()) {
   const expMs = Number(grant?.exp) * 1000;
   const renewableMs = Number(grant?.renewable_until || grant?.exp) * 1000;
-  const until = Math.max(Number.isFinite(expMs) ? expMs : 0, Number.isFinite(renewableMs) ? renewableMs : 0);
+  const until = Math.max(
+    Number.isFinite(expMs) ? expMs : 0,
+    Number.isFinite(renewableMs) ? renewableMs : 0,
+  );
   return Math.max(60_000, until - nowMs);
 }
 
 function brokerRateLimitWindowMs() {
-  const configured = Number(process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_RATE_LIMIT_WINDOW_MS || 60_000);
+  const configured = Number(
+    process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_RATE_LIMIT_WINDOW_MS || 60_000,
+  );
   return Math.max(1_000, Number.isFinite(configured) ? configured : 60_000);
 }
 
 function brokerRateLimitMaxRequests() {
-  const configured = Number(process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_RATE_LIMIT_PER_WINDOW || 120);
+  const configured = Number(
+    process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_RATE_LIMIT_PER_WINDOW || 120,
+  );
   if (!Number.isFinite(configured)) {
     return 120;
   }
@@ -278,9 +300,12 @@ async function rememberBrokerRequest({ grant, nowMs = Date.now() } = {}) {
     };
   }
   if (!allowInMemoryRateLimitCache()) {
-    logger.warn('[VIVENTIUM][glasshive-capability-broker] Blocking request because rate-limit cache is unavailable', {
-      grantId,
-    });
+    logger.warn(
+      '[VIVENTIUM][glasshive-capability-broker] Blocking request because rate-limit cache is unavailable',
+      {
+        grantId,
+      },
+    );
     return {
       accepted: false,
       rateLimited: true,
@@ -418,9 +443,12 @@ async function rememberInvocation({ grantId, invocationId, ttlMs = 10 * 60 * 100
     return { accepted: true, replayChecked: true };
   }
   if (!allowInMemoryReplayCache()) {
-    logger.warn('[VIVENTIUM][glasshive-capability-broker] Blocking invocation because replay cache is unavailable', {
-      grantId: cleanGrantId,
-    });
+    logger.warn(
+      '[VIVENTIUM][glasshive-capability-broker] Blocking invocation because replay cache is unavailable',
+      {
+        grantId: cleanGrantId,
+      },
+    );
     return { accepted: false, replayChecked: false, reason: 'replay_cache_unavailable' };
   }
   const now = Date.now();

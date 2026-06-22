@@ -19,8 +19,20 @@ config:
         brew_begin_tag: <!--viv_internal:brew_begin-->
       activation_subject_rule:
         enabled: true
-        prompt:
-          promptRef: cortex.background_activation_decision_subject
+        prompt: |-
+          Judge activation only for the latest human/user message shown in "Latest User Intent".
+
+          Use earlier "Recent Conversation" turns only to resolve references in that latest message.
+
+          Never activate only because an older user request appears in history; that older request was already handled by its own turn.
+
+          Before deciding, ask: "Does LatestUserMessage itself ask this cortex to do work, or does it explicitly refer to continuing that same work?"
+
+          If LatestUserMessage is only a simple reply, acknowledgement, test instruction, correction, thanks, provider clarification, or output-only instruction, return should_activate=false unless that latest message itself meets this cortex's activation criteria.
+
+          Output-only instructions include requests to reply with exact text, markers, labels, acknowledgements, confirmations, or test tokens. Older history cannot turn an output-only latest message into a new activation.
+
+          Ignore activation words that appear only in Recent Conversation. Words such as red-team, pressure-test, challenge, plan, launch, pattern, strategy, or bias count only when they appear in LatestUserMessage or when LatestUserMessage explicitly refers back to them.
       activation_policy:
         enabled: true
         prompt: |
@@ -926,10 +938,10 @@ backgroundAgents:
     voice_llm_model: null
     voice_llm_provider: null
     voice_llm_model_parameters: {}
-    fallback_llm_model: grok-4.3
-    fallback_llm_provider: xai
+    fallback_llm_model: gpt-5.4
+    fallback_llm_provider: openAI
     fallback_llm_model_parameters:
-      model: grok-4.3
+      model: gpt-5.4
     agent_ids: []
     edges: []
     conversation_starters: []

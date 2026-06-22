@@ -14,6 +14,7 @@ const express = require('express');
 const crypto = require('crypto');
 const { logger } = require('@librechat/data-schemas');
 const { ContentTypes } = require('librechat-data-provider');
+const { Conversation } = require('~/db/models');
 const db = require('~/models');
 const {
   GLASSHIVE_CALLBACK_TYPE,
@@ -589,6 +590,27 @@ function callbackMessageTimestamps({ messages, requestedParentMessageId, priorSt
   };
 }
 
+async function touchCallbackConversation({ userId, conversationId, updatedAt }) {
+  if (!Conversation?.findOneAndUpdate || typeof db.getMessages !== 'function') {
+    return;
+  }
+  const messages = (await db.getMessages({ user: userId, conversationId }, '_id')) ?? [];
+  await Conversation.findOneAndUpdate(
+    { user: userId, conversationId },
+    {
+      $set: {
+        messages,
+        updatedAt: updatedAt || new Date(),
+      },
+    },
+    {
+      new: false,
+      upsert: false,
+      timestamps: false,
+    },
+  );
+}
+
 router.post('/callback', async (req, res) => {
   if (!verifySignature(req.body || {}, req.get('x-glasshive-signature'))) {
     return res.status(401).json({ error: 'invalid_signature' });
@@ -643,12 +665,18 @@ router.post('/callback', async (req, res) => {
   }
 
   if (hasPersistedCallback(messages, req.body || {})) {
+    const persistedMessage = persistedCallbackMessage(messages, req.body || {});
     try {
       await repairDuplicateSurfaceDelivery({
         body: req.body || {},
         messages,
         text,
         fullText,
+      });
+      await touchCallbackConversation({
+        userId,
+        conversationId,
+        updatedAt: persistedMessage?.updatedAt || persistedMessage?.createdAt || new Date(),
       });
     } catch (err) {
       logger.warn(
@@ -726,6 +754,11 @@ router.post('/callback', async (req, res) => {
         context: 'viventium/routes/glasshive.callback',
       });
     }
+    await touchCallbackConversation({
+      userId,
+      conversationId,
+      updatedAt: timestamps.updatedAt,
+    });
   } catch (err) {
     logger.warn(
       '[VIVENTIUM][glasshive] Failed to persist callback message:',

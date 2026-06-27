@@ -19,9 +19,9 @@ type FilterRenderableContentPartsOptions = {
  * Purpose: Strip accidental raw GlassHive tool transcripts from assistant text while preserving
  * normal examples and visible product-language tool rows.
  * === VIVENTIUM END === */
-const RAW_TOOL_TRANSCRIPT_LINE_RE = /^\s*Tool:\s+(.*)$/i;
-const RAW_TOOL_XML_INVOKE_BLOCK_RE =
-  /<(?:invoke|tool_call)\b[^>]*>[\s\S]*?<\/(?:invoke|tool_call)>/gi;
+const RAW_TOOL_TRANSCRIPT_LINE_RE =
+  /^\s*Tool:\s+(.*)$/i;
+const RAW_TOOL_XML_INVOKE_BLOCK_RE = /<(?:invoke|tool_call)\b[^>]*>[\s\S]*?<\/(?:invoke|tool_call)>/gi;
 const RAW_TOOL_JSON_FENCE_RE =
   /```(?:json|tool|tool_call)?\s*\n\s*\{[\s\S]*?"(?:tool_call|tool|arguments|args)"[\s\S]*?\}\s*```/gi;
 const GLASSHIVE_RAW_TOOL_NAMES = new Set([
@@ -211,10 +211,7 @@ function sanitizeRawToolTranscriptText(value: string): string {
   if (cleaned === value) {
     return value;
   }
-  return cleaned
-    .replace(/[ \t]+\n/g, '\n')
-    .replace(/\n{2,}/g, '\n')
-    .trim();
+  return cleaned.replace(/[ \t]+\n/g, '\n').replace(/\n{2,}/g, '\n').trim();
 }
 
 function containsGlassHiveRawToolName(value: string): boolean {
@@ -423,8 +420,7 @@ function collapseConsecutiveGlassHiveToolCalls(
       previousToolCallId.length > 0 &&
       currentToolCallId !== previousToolCallId;
     const currentIsCollapsibleLaunchTool =
-      currentGlassHiveToolName != null &&
-      COLLAPSIBLE_GLASSHIVE_TOOL_NAMES.has(currentGlassHiveToolName);
+      currentGlassHiveToolName != null && COLLAPSIBLE_GLASSHIVE_TOOL_NAMES.has(currentGlassHiveToolName);
     /* === VIVENTIUM START ===
      * Feature: User-facing GlassHive tool-row hygiene.
      * Purpose: Keep one concise launch/schedule/delegate row visible across retry ids.

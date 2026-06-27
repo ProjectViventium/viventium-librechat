@@ -294,15 +294,46 @@ describe('ToolCall', () => {
 
       const props = JSON.parse(screen.getByTestId('tool-call-info').textContent!);
       expect(props.input).toBe('');
-      expect(props.output).toContain('Progress: In progress');
+      expect(props.output).toContain('Status: queued');
       expect(props.output).toContain('Workspace started.');
-      expect(props.output).toContain('View / Steer link available.');
+      expect(props.output).toContain('View / Steer: [local link]');
       expect(props.output).toContain('Artifacts: client-report.docx');
       expect(props.output).not.toContain('127.0.0.1');
       expect(props.output).not.toContain('artifacts/client-report.docx');
       expect(props.output).not.toContain('follow_up_context');
       expect(props.output).not.toContain('worker_id');
       expect(props.output).not.toContain('raw worker prompt');
+    });
+
+    it('redacts signed GlassHive links from expanded tool details', () => {
+      const name = `workspace_wait${Constants.mcp_delimiter}glasshive-workers-projects`;
+      const output = JSON.stringify({
+        status: 'completed',
+        message:
+          'Delivered at https://glasshive.example.com/v1/signed-links/download?gh_token=secret-token',
+        view_steer_url: 'https://glasshive.example.com/watch/wrk_public',
+        artifact_links: {
+          items: [
+            {
+              path: '/Users/example/private/workspace/output/final-report.pdf',
+              signed_download_url:
+                'https://glasshive.example.com/v1/signed-links/download?gh_token=artifact-secret',
+            },
+          ],
+        },
+      });
+
+      renderWithRecoil(<ToolCall {...mockProps} name={name} output={output} />);
+
+      fireEvent.click(screen.getByText('Completed GlassHive wait'));
+
+      const props = JSON.parse(screen.getByTestId('tool-call-info').textContent!);
+      expect(props.output).toContain('Delivered at [signed link]');
+      expect(props.output).toContain('View / Steer: https://glasshive.example.com/watch/wrk_public');
+      expect(props.output).toContain('Artifacts: final-report.pdf');
+      expect(props.output).not.toContain('gh_token');
+      expect(props.output).not.toContain('artifact-secret');
+      expect(props.output).not.toContain('/Users/example');
     });
 
     it('summarizes MCP text-wrapped GlassHive dispatch output with task and status', () => {
@@ -339,7 +370,7 @@ describe('ToolCall', () => {
 
       const props = JSON.parse(screen.getByTestId('tool-call-info').textContent!);
       expect(props.output).toContain('Task: Open a public profile and report the follower count.');
-      expect(props.output).toContain('Progress: In progress');
+      expect(props.output).toContain('Status: dispatched');
       expect(props.output).not.toContain('acknowledgement_guidance');
       expect(props.output).not.toContain('Internal acknowledgement guidance');
       expect(props.output).not.toContain('worker_id');

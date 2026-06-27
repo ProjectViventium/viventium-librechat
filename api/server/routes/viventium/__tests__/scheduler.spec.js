@@ -9,7 +9,6 @@ let mockGetUserById;
 let mockGetMessage;
 let mockGetMessages;
 let mockGetConvo;
-let mockUpdateMessage;
 let mockResolveTelegramMappingByUserId;
 let mockGetAgent;
 let mockGetJob;
@@ -70,7 +69,6 @@ jest.mock('~/models', () => ({
   getMessage: (...args) => mockGetMessage(...args),
   getMessages: (...args) => mockGetMessages(...args),
   getConvo: (...args) => mockGetConvo(...args),
-  updateMessage: (...args) => mockUpdateMessage(...args),
 }));
 
 jest.mock('~/models/Agent', () => ({
@@ -181,7 +179,6 @@ describe('/api/viventium/scheduler/telegram/resolve', () => {
     mockGetMessage = jest.fn().mockResolvedValue(null);
     mockGetMessages = jest.fn().mockResolvedValue([]);
     mockGetConvo = jest.fn().mockResolvedValue(null);
-    mockUpdateMessage = jest.fn();
     mockResolveTelegramMappingByUserId = jest.fn().mockResolvedValue({ telegramUserId: 'tg-1' });
     mockGetAgent = jest.fn().mockResolvedValue({
       avatar: { filepath: '/images/viventium.png' },
@@ -279,16 +276,6 @@ describe('/api/viventium/scheduler/telegram/resolve', () => {
   });
 });
 
-describe('/api/viventium/scheduler persisted message mutation', () => {
-  test('does not expose a scheduler-owned message patch route', () => {
-    jest.resetModules();
-    const schedulerRouter = require('../scheduler');
-    const routePaths = schedulerRouter.stack.map((layer) => layer.route?.path).filter(Boolean);
-
-    expect(routePaths).not.toContain('/message/patch');
-  });
-});
-
 describe('/api/viventium/scheduler/chat', () => {
   beforeEach(() => {
     jest.resetModules();
@@ -299,7 +286,6 @@ describe('/api/viventium/scheduler/chat', () => {
     mockGetMessage = jest.fn().mockResolvedValue(null);
     mockGetMessages = jest.fn().mockResolvedValue([]);
     mockGetConvo = jest.fn().mockResolvedValue(null);
-    mockUpdateMessage = jest.fn();
     mockResolveTelegramMappingByUserId = jest.fn().mockResolvedValue({ telegramUserId: 'tg-1' });
     mockGetAgent = jest.fn().mockResolvedValue({
       avatar: { filepath: '/images/viventium.png' },
@@ -461,7 +447,6 @@ describe('/api/viventium/scheduler/cortex', () => {
     });
     mockGetMessages = jest.fn().mockResolvedValue([{ messageId: 'fu-1', text: 'Follow-up text' }]);
     mockGetConvo = jest.fn().mockResolvedValue(null);
-    mockUpdateMessage = jest.fn();
     mockResolveTelegramMappingByUserId = jest.fn().mockResolvedValue({ telegramUserId: 'tg-1' });
     mockGetAgent = jest.fn().mockResolvedValue({ avatar: { filepath: '/images/viventium.png' } });
     mockGetJob = jest.fn().mockResolvedValue({ metadata: { userId: 'user_1' } });

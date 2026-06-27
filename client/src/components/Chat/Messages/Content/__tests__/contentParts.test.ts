@@ -577,8 +577,7 @@ describe('filterRenderableContentParts', () => {
           args: '{"execution_mode":"host"}',
           type: ToolCallTypes.TOOL_CALL,
           progress: 1,
-          output:
-            'Error executing tool workspace_launch: host-native GlassHive workers are disabled',
+          output: 'Error executing tool workspace_launch: host-native GlassHive workers are disabled',
         },
       },
       {
@@ -589,8 +588,7 @@ describe('filterRenderableContentParts', () => {
           args: '{"execution_mode":"docker"}',
           type: ToolCallTypes.TOOL_CALL,
           progress: 1,
-          output:
-            '{"status":"dispatched","view_steer_url":"https://example.com/watch/public-safe"}',
+          output: '{"status":"dispatched","view_steer_url":"https://example.com/watch/public-safe"}',
         },
       },
       { type: ContentTypes.TEXT, text: 'Started in GlassHive.' },

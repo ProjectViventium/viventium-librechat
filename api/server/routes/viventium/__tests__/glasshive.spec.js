@@ -4,6 +4,8 @@
  * === VIVENTIUM END === */
 
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
 
 let mockSaveMessage;
@@ -182,6 +184,17 @@ describe('/api/viventium/glasshive/callback', () => {
       },
     ]);
     process.env.VIVENTIUM_GLASSHIVE_CALLBACK_SECRET = 'callback-secret';
+  });
+
+  test('keeps GlassHive placeholder text aligned with the agent fallback placeholder', () => {
+    const glasshiveSource = fs.readFileSync(path.join(__dirname, '../glasshive.js'), 'utf8');
+    const agentRequestSource = fs.readFileSync(
+      path.join(__dirname, '../../../controllers/agents/request.js'),
+      'utf8',
+    );
+
+    expect(glasshiveSource).toContain("'generation in progress.'");
+    expect(agentRequestSource).toMatch(/fallbackText(?:\s*=|:)\s*'Generation in progress\.'/);
   });
 
   test('rejects callbacks with an invalid HMAC signature', async () => {
@@ -442,6 +455,82 @@ describe('/api/viventium/glasshive/callback', () => {
     expect(message.metadata.viventium.hasFullText).toBe(true);
   });
 
+  test('enqueues evidence-failed deliverable wording for Telegram delivery parity', async () => {
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({
+      callback_id: 'cb_telegram_evidence_failed_deliverable',
+      event: 'run.failed',
+      failure_code: 'glasshive_evidence_check_failed',
+      surface: 'telegram',
+      telegram_chat_id: '12345',
+      telegram_user_id: '67890',
+      message: 'GlassHive evidence check failed: constraint compliance failed.',
+      deliverable: {
+        kind: 'file',
+        state: 'ready',
+        source: 'workspace_file',
+        label: 'result.md',
+        preferred_surface: 'download',
+        workspace_path: 'artifacts/result.md',
+      },
+    });
+    const req = createMockReq({
+      url: '/api/viventium/glasshive/callback',
+      headers: { 'x-glasshive-signature': signature(body) },
+      body,
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockEnqueueGlassHiveCallbackDelivery).toHaveBeenCalledTimes(1);
+    const payload = mockEnqueueGlassHiveCallbackDelivery.mock.calls[0][0];
+    expect(payload.text).toBe(
+      'I found a worker output, but final verification failed: GlassHive evidence check failed: constraint compliance failed.',
+    );
+    expect(payload.body.surface).toBe('telegram');
+  });
+
+  test('enqueues evidence-failed deliverable wording for voice delivery parity', async () => {
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({
+      callback_id: 'cb_voice_evidence_failed_deliverable',
+      event: 'run.failed',
+      failure_code: 'glasshive_evidence_check_failed',
+      surface: 'voice',
+      voice_call_session_id: 'call-session-1',
+      voice_request_id: 'voice-request-1',
+      message: 'GlassHive evidence check failed: completion compliance failed.',
+      deliverable: {
+        kind: 'file',
+        state: 'ready',
+        source: 'workspace_file',
+        label: 'voice-result.md',
+        preferred_surface: 'download',
+        workspace_path: 'artifacts/voice-result.md',
+      },
+    });
+    const req = createMockReq({
+      url: '/api/viventium/glasshive/callback',
+      headers: { 'x-glasshive-signature': signature(body) },
+      body,
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockEnqueueGlassHiveCallbackDelivery).toHaveBeenCalledTimes(1);
+    const payload = mockEnqueueGlassHiveCallbackDelivery.mock.calls[0][0];
+    expect(payload.text).toBe(
+      'I found a worker output, but final verification failed: GlassHive evidence check failed: completion compliance failed.',
+    );
+    expect(payload.body.surface).toBe('voice');
+  });
+
   test('verifies and persists literal UTF-8 callback text', async () => {
     const router = require('../glasshive');
     const app = createTestApp(router);
@@ -641,6 +730,161 @@ describe('/api/viventium/glasshive/callback', () => {
       Date.parse('2026-04-28T14:00:00.000Z'),
     );
     expect(mockUpdateMessage.mock.calls[0][2].overrideTimestamp).toBe(true);
+  });
+
+  test('updates its own unfinished generation placeholder when a worker callback arrives', async () => {
+    mockGetMessages.mockResolvedValueOnce([
+      {
+        messageId: 'user-msg',
+        parentMessageId: 'previous-assistant',
+        text: 'Start worker.',
+        isCreatedByUser: true,
+        createdAt: '2026-04-28T14:00:00.000Z',
+      },
+      {
+        messageId: 'generation-placeholder',
+        parentMessageId: 'user-msg',
+        text: 'Generation in progress.',
+        content: [{ type: 'text', text: 'Generation in progress.' }],
+        unfinished: true,
+        isCreatedByUser: false,
+        createdAt: '2026-04-28T14:00:01.000Z',
+      },
+    ]);
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({
+      callback_id: 'cb_generation_placeholder',
+      parent_message_id: 'user-msg',
+      message_id: 'generation-placeholder',
+      event: 'run.completed',
+      message: 'Finished host worker.',
+    });
+    const req = createMockReq({
+      url: '/api/viventium/glasshive/callback',
+      headers: { 'x-glasshive-signature': signature(body) },
+      body,
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockSaveMessage).not.toHaveBeenCalled();
+    expect(mockUpdateMessage).toHaveBeenCalledTimes(1);
+    const [, message] = mockUpdateMessage.mock.calls[0];
+    expect(message.messageId).toBe('generation-placeholder');
+    expect(message.parentMessageId).toBe('user-msg');
+    expect(message.text).toBe('Finished host worker.');
+    expect(message.unfinished).toBe(false);
+    expect(message.error).toBe(false);
+    expect(message.content).toEqual([{ type: 'text', text: 'Finished host worker.' }]);
+    expect(message.metadata.viventium.treeParentMessageId).toBe('user-msg');
+  });
+
+  test('does not overwrite an unrelated active generation placeholder', async () => {
+    mockGetMessages.mockResolvedValueOnce([
+      {
+        messageId: 'user-msg',
+        parentMessageId: 'previous-assistant',
+        text: 'Start worker.',
+        isCreatedByUser: true,
+        createdAt: '2026-04-28T14:00:00.000Z',
+      },
+      {
+        messageId: 'assistant-anchor',
+        parentMessageId: 'user-msg',
+        text: 'Worker is running.',
+        isCreatedByUser: false,
+        createdAt: '2026-04-28T14:00:01.000Z',
+      },
+      {
+        messageId: 'unrelated-user',
+        parentMessageId: 'assistant-anchor',
+        text: 'Different question.',
+        isCreatedByUser: true,
+        createdAt: '2026-04-28T14:00:02.000Z',
+      },
+      {
+        messageId: 'unrelated-placeholder',
+        parentMessageId: 'unrelated-user',
+        text: 'Generation in progress.',
+        content: [{ type: 'text', text: 'Generation in progress.' }],
+        unfinished: true,
+        isCreatedByUser: false,
+        createdAt: '2026-04-28T14:00:03.000Z',
+      },
+    ]);
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({
+      callback_id: 'cb_unrelated_generation_placeholder',
+      parent_message_id: 'user-msg',
+      message_id: 'assistant-anchor',
+      event: 'run.completed',
+      message: 'Finished host worker.',
+    });
+    const req = createMockReq({
+      url: '/api/viventium/glasshive/callback',
+      headers: { 'x-glasshive-signature': signature(body) },
+      body,
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(425);
+    expect(res.body.error).toBe('callback_conversation_tip_not_ready');
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+    expect(mockSaveMessage).not.toHaveBeenCalled();
+  });
+
+  test('updates an unfinished generation placeholder for failed worker callbacks', async () => {
+    mockGetMessages.mockResolvedValueOnce([
+      {
+        messageId: 'user-msg',
+        parentMessageId: 'previous-assistant',
+        text: 'Start worker.',
+        isCreatedByUser: true,
+        createdAt: '2026-04-28T14:00:00.000Z',
+      },
+      {
+        messageId: 'generation-placeholder',
+        parentMessageId: 'user-msg',
+        text: 'Generation in progress.',
+        unfinished: true,
+        isCreatedByUser: false,
+        createdAt: '2026-04-28T14:00:01.000Z',
+      },
+    ]);
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({
+      callback_id: 'cb_generation_placeholder_failed',
+      parent_message_id: 'user-msg',
+      message_id: 'generation-placeholder',
+      event: 'run.failed',
+      message: 'The worker hit a synthetic blocker.',
+    });
+    const req = createMockReq({
+      url: '/api/viventium/glasshive/callback',
+      headers: { 'x-glasshive-signature': signature(body) },
+      body,
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockSaveMessage).not.toHaveBeenCalled();
+    expect(mockUpdateMessage).toHaveBeenCalledTimes(1);
+    const [, message] = mockUpdateMessage.mock.calls[0];
+    expect(message.messageId).toBe('generation-placeholder');
+    expect(message.parentMessageId).toBe('user-msg');
+    expect(message.text).toBe('I got stuck: The worker hit a synthetic blocker.');
+    expect(message.unfinished).toBe(false);
+    expect(message.error).toBe(false);
+    expect(message.metadata.viventium.event).toBe('run.failed');
   });
 
   test('updates one GlassHive status message instead of creating callback branches', async () => {
@@ -983,6 +1227,84 @@ describe('/api/viventium/glasshive/callback', () => {
       expect(message.text).toBe(expected);
     },
   );
+
+  test('describes failed evidence callbacks with deliverables as output plus verification failure', async () => {
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({
+      callback_id: 'cb_failed_evidence_with_deliverable',
+      event: 'run.failed',
+      failure_code: 'glasshive_evidence_check_failed',
+      message:
+        'GlassHive evidence check failed: constraint compliance failed.\n\nPreview: [Open GlassHive file](http://127.0.0.1:8766/v1/workers/wrk-1/artifacts/open?path=artifacts/result.md)',
+      deliverable: {
+        kind: 'file',
+        state: 'ready',
+        source: 'workspace_file',
+        label: 'result.md',
+        preferred_surface: 'download',
+        workspace_path: 'artifacts/result.md',
+      },
+    });
+    const req = createMockReq({
+      url: '/api/viventium/glasshive/callback',
+      headers: { 'x-glasshive-signature': signature(body) },
+      body,
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    const [, message] = mockSaveMessage.mock.calls[0];
+    expect(message.text).toContain(
+      'I found a worker output, but final verification failed: GlassHive evidence check failed',
+    );
+    expect(message.text).toContain('Preview: [Open GlassHive file]');
+    expect(message.text).not.toMatch(/^I got stuck:/);
+    expect(message.metadata.viventium.deliverable).toEqual(
+      expect.objectContaining({
+        kind: 'file',
+        state: 'ready',
+        source: 'workspace_file',
+        label: 'result.md',
+        preferredSurface: 'download',
+      }),
+    );
+  });
+
+  test('does not soften total failures just because a deliverable object is present', async () => {
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({
+      callback_id: 'cb_provider_auth_with_deliverable',
+      event: 'run.failed',
+      failure_code: 'provider_auth_missing',
+      message: 'The worker could not use the configured model provider credentials.',
+      deliverable: {
+        kind: 'file',
+        state: 'available',
+        source: 'workspace_file',
+        label: 'scratch.md',
+        preferred_surface: 'download',
+        workspace_path: 'artifacts/scratch.md',
+      },
+    });
+    const req = createMockReq({
+      url: '/api/viventium/glasshive/callback',
+      headers: { 'x-glasshive-signature': signature(body) },
+      body,
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    const [, message] = mockSaveMessage.mock.calls[0];
+    expect(message.text).toBe(
+      'I got stuck: The worker could not use the configured model provider credentials.',
+    );
+  });
 
   test('uses generic active-worker text even when failure_code is missing', async () => {
     const router = require('../glasshive');

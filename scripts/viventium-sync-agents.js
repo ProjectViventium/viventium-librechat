@@ -244,8 +244,6 @@ const REVIEW_FIELDS = [
   'fallback_llm_model',
   'fallback_llm_provider',
   'fallback_llm_model_parameters',
-  'agent_ids',
-  'edges',
   'conversation_starters',
   'background_cortices',
 ];
@@ -1600,39 +1598,6 @@ function shouldPushStandaloneBackgroundAgent({
   return true;
 }
 
-function shouldPushMainAgentForSelectedIds({
-  mainAgent,
-  selectedAgentIds = null,
-  promptsOnly = false,
-  activationConfigOnly = false,
-  modelConfigOnly = false,
-  toolsOnly = false,
-}) {
-  const selectedIdSet =
-    Array.isArray(selectedAgentIds) && selectedAgentIds.length > 0
-      ? new Set(selectedAgentIds)
-      : null;
-  if (!selectedIdSet) {
-    return true;
-  }
-  if (selectedIdSet.has(mainAgent?.id)) {
-    return true;
-  }
-  const backgroundIds = Array.isArray(mainAgent?.background_cortices)
-    ? mainAgent.background_cortices.map((entry) => entry?.agent_id).filter(Boolean)
-    : [];
-  if (
-    (promptsOnly || activationConfigOnly) &&
-    backgroundIds.some((agentId) => selectedIdSet.has(agentId))
-  ) {
-    return true;
-  }
-  if (promptsOnly || activationConfigOnly || modelConfigOnly || toolsOnly) {
-    return false;
-  }
-  return collectEdgeTargetAgentIds(mainAgent).some((agentId) => selectedIdSet.has(agentId));
-}
-
 async function pushAgent({
   agentData,
   userId,
@@ -1817,14 +1782,18 @@ async function pushBundle({
   }
 
   const results = [];
-  const shouldPushMainAgent = shouldPushMainAgentForSelectedIds({
-    mainAgent: bundle.mainAgent,
-    selectedAgentIds,
-    promptsOnly,
-    activationConfigOnly,
-    modelConfigOnly,
-    toolsOnly,
-  });
+  const selectedIdSet =
+    Array.isArray(selectedAgentIds) && selectedAgentIds.length > 0
+      ? new Set(selectedAgentIds)
+      : null;
+  const mainAgentBackgroundIds = Array.isArray(bundle.mainAgent.background_cortices)
+    ? bundle.mainAgent.background_cortices.map((entry) => entry?.agent_id).filter(Boolean)
+    : [];
+  const shouldPushMainAgent =
+    !selectedIdSet ||
+    selectedIdSet.has(bundle.mainAgent.id) ||
+    ((promptsOnly || activationConfigOnly) &&
+      mainAgentBackgroundIds.some((agentId) => selectedIdSet.has(agentId)));
 
   if (shouldPushMainAgent) {
     results.push(
@@ -2362,6 +2331,5 @@ module.exports = {
   resolveSafeActivationFields,
   shouldApplyRuntimeOverrides,
   shouldRepairRuntimeFieldsForPushMode,
-  shouldPushMainAgentForSelectedIds,
   shouldPushStandaloneBackgroundAgent,
 };

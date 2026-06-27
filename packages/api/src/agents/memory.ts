@@ -217,13 +217,24 @@ function dedupeMemoriesByKey(memories: MemoryEntryLeanLike[]): {
   return { memories: Array.from(byKey.values()), duplicateKeys: Array.from(duplicateKeys).sort() };
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Memory recall context preservation.
+ * Purpose: Keep both the beginning and end of long memory values when applying prompt budgets.
+ */
 function trimMemoryValueToBudget(value: string, tokenBudget: number): string {
-  if (approximateTokenCount(value) <= tokenBudget) {
-    return value.trim();
+  const trimmed = value.trim();
+  if (approximateTokenCount(trimmed) <= tokenBudget) {
+    return trimmed;
   }
-  const charBudget = Math.max(16, tokenBudget * 4 - 3);
-  return `${value.slice(0, charBudget).trimEnd()}...`;
+  const separator = '\n...\n';
+  const charBudget = Math.max(16, tokenBudget * 4 - separator.length);
+  const headChars = Math.ceil(charBudget / 2);
+  const tailChars = Math.floor(charBudget / 2);
+  return `${trimmed.slice(0, headChars).trimEnd()}${separator}${trimmed
+    .slice(Math.max(0, trimmed.length - tailChars))
+    .trimStart()}`;
 }
+/* === VIVENTIUM END === */
 
 function formatMemoryReadProfile({
   memories,

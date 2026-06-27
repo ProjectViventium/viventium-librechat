@@ -839,6 +839,45 @@ describe('Memory snapshot loading', () => {
     expect(methods.setMemory).not.toHaveBeenCalled();
   });
 
+  it('preserves the tail of truncated memory entries so recent durable facts stay visible', async () => {
+    const userId = new Types.ObjectId();
+    const tailFact = 'QA_TAIL_FACT fictional cousin Marnie uses codeword MEMCANARY-TORONTO.';
+    const methods = {
+      setMemory: jest.fn(),
+      deleteMemory: jest.fn(),
+      getFormattedMemories: jest.fn(),
+      getAllUserMemories: jest.fn().mockResolvedValue([
+        {
+          _id: new Types.ObjectId(),
+          userId,
+          key: 'world',
+          value: `${'Older world context. '.repeat(80)}${tailFact}`,
+          tokenCount: 420,
+          updated_at: new Date('2026-06-25T00:00:00Z'),
+        },
+      ]),
+    };
+
+    const context = await loadMemoryReadContext({
+      userId,
+      memoryMethods: methods,
+      config: {
+        validKeys: ['world'],
+        readProfile: {
+          tokenLimit: 80,
+          keyOrder: ['world'],
+          keyLimits: { world: 48 },
+          cacheTtlMs: 10_000,
+        },
+      },
+    });
+
+    expect(context.text).toContain('Older world context.');
+    expect(context.text).toContain('...');
+    expect(context.text).toContain(tailFact);
+    expect(context.omittedKeys).toContain('world:truncated');
+  });
+
   it('caches the read context by user and read profile until explicitly cleared', async () => {
     const methods = {
       setMemory: jest.fn(),

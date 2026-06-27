@@ -5,6 +5,7 @@ require('module-alias')({ base: path.resolve(__dirname, '..') });
 require('./services/viventium/anthropicOAuthPatch');
 require('./services/viventium/anthropicThinkingPatch');
 require('./services/viventium/openaiResponsesOutputPatch');
+require('./services/viventium/agentSchemaToolBindingPatch');
 const cors = require('cors');
 const axios = require('axios');
 const express = require('express');

@@ -58,6 +58,8 @@ const DEFAULT_MEMORY_HARDENING_MIN_APPLY_INTERVAL_SECONDS = 5 * 60;
 const DEFAULT_MEMORY_HARDENING_PROBE_TIMEOUT_MS = 30000;
 const DEFAULT_MEMORY_HARDENING_MODEL_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_MEMORY_HARDENING_LOCK_STALE_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_MEMORY_HARDENING_SCHEDULE = '0 3 * * *';
+const DEFAULT_MEMORY_HARDENING_TIMEZONE = 'America/Toronto';
 const DEFAULT_TRANSCRIPT_IGNORE_GLOBS = [
   '**/.DS_Store',
   '**/.*',
@@ -573,6 +575,7 @@ function resolveStatePaths(options) {
     runsDir: path.join(stateDir, 'runs'),
     lockDir: path.join(stateDir, 'lock'),
     transcriptStateDir: path.join(stateDir, 'transcripts'),
+    scheduleEventsDir: path.join(stateDir, 'schedule-events'),
   };
 }
 
@@ -582,6 +585,159 @@ function efficiencyMarkerPath(paths) {
 
 function readEfficiencyMarker(paths) {
   return readJsonIfExists(efficiencyMarkerPath(paths), null);
+}
+
+function parseDailyCronSchedule(value) {
+  const parts = String(value || DEFAULT_MEMORY_HARDENING_SCHEDULE)
+    .trim()
+    .split(/\s+/);
+  if (parts.length !== 5) {
+    return null;
+  }
+  const [minute, hour, day, month, weekday] = parts;
+  if (day !== '*' || month !== '*' || weekday !== '*') {
+    return null;
+  }
+  const hourValue = Number(hour);
+  const minuteValue = Number(minute);
+  if (
+    !Number.isInteger(hourValue) ||
+    !Number.isInteger(minuteValue) ||
+    hourValue < 0 ||
+    hourValue > 23 ||
+    minuteValue < 0 ||
+    minuteValue > 59
+  ) {
+    return null;
+  }
+  return { hour: hourValue, minute: minuteValue };
+}
+
+function timeZoneParts(date, timeZone) {
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hourCycle: 'h23',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+  const parts = {};
+  for (const part of formatter.formatToParts(date)) {
+    if (part.type !== 'literal') {
+      parts[part.type] = Number(part.value);
+    }
+  }
+  return parts;
+}
+
+function timeZoneOffsetMs(date, timeZone) {
+  const parts = timeZoneParts(date, timeZone);
+  const asUtc = Date.UTC(
+    parts.year,
+    parts.month - 1,
+    parts.day,
+    parts.hour,
+    parts.minute,
+    parts.second,
+  );
+  return asUtc - date.getTime();
+}
+
+function zonedTimeToUtcMs(parts, timeZone) {
+  const wallClockUtc = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, 0);
+  let candidate = wallClockUtc - timeZoneOffsetMs(new Date(wallClockUtc), timeZone);
+  candidate = wallClockUtc - timeZoneOffsetMs(new Date(candidate), timeZone);
+  return candidate;
+}
+
+function previousCalendarDateParts(parts) {
+  const previous = new Date(Date.UTC(parts.year, parts.month - 1, parts.day - 1, 12, 0, 0));
+  return {
+    year: previous.getUTCFullYear(),
+    month: previous.getUTCMonth() + 1,
+    day: previous.getUTCDate(),
+  };
+}
+
+function latestExpectedDailyRunUtc({ schedule, timeZone, now = new Date() }) {
+  const parsed = parseDailyCronSchedule(schedule);
+  if (!parsed) {
+    return null;
+  }
+  try {
+    const nowParts = timeZoneParts(now, timeZone);
+    const today = {
+      year: nowParts.year,
+      month: nowParts.month,
+      day: nowParts.day,
+      hour: parsed.hour,
+      minute: parsed.minute,
+    };
+    let expectedMs = zonedTimeToUtcMs(today, timeZone);
+    if (expectedMs > now.getTime()) {
+      const previous = previousCalendarDateParts(today);
+      expectedMs = zonedTimeToUtcMs({ ...previous, hour: parsed.hour, minute: parsed.minute }, timeZone);
+    }
+    return new Date(expectedMs).toISOString();
+  } catch {
+    return null;
+  }
+}
+
+function readScheduleEvents(paths) {
+  if (!fs.existsSync(paths.scheduleEventsDir)) {
+    return [];
+  }
+  return fs
+    .readdirSync(paths.scheduleEventsDir)
+    .filter((name) => name.endsWith('.json'))
+    .map((name) => readJsonIfExists(path.join(paths.scheduleEventsDir, name), null))
+    .filter((event) => event && typeof event === 'object')
+    .sort((a, b) => {
+      const aMs = Date.parse(a.fired_at_utc || a.finished_at_utc || 0);
+      const bMs = Date.parse(b.fired_at_utc || b.finished_at_utc || 0);
+      return (aMs || 0) - (bMs || 0);
+    });
+}
+
+function buildScheduleHealth(paths) {
+  const schedule = process.env.VIVENTIUM_MEMORY_HARDENING_SCHEDULE || DEFAULT_MEMORY_HARDENING_SCHEDULE;
+  const timeZone =
+    process.env.VIVENTIUM_MEMORY_HARDENING_TIMEZONE ||
+    process.env.VIVENTIUM_DEFAULT_TIMEZONE ||
+    DEFAULT_MEMORY_HARDENING_TIMEZONE;
+  const events = readScheduleEvents(paths);
+  const scheduledEvents = events.filter(
+    (event) => event.scheduled_invocation === true || event.trigger_source === 'launchd',
+  );
+  const latestEvent = scheduledEvents.length ? scheduledEvents[scheduledEvents.length - 1] : null;
+  const expectedLatestFireAtUtc = latestExpectedDailyRunUtc({ schedule, timeZone });
+  const latestFiredMs = latestEvent ? Date.parse(latestEvent.fired_at_utc || '') : 0;
+  const expectedMs = expectedLatestFireAtUtc ? Date.parse(expectedLatestFireAtUtc) : 0;
+  const missedWindow = Boolean(expectedMs && (!latestFiredMs || latestFiredMs + 60 * 60 * 1000 < expectedMs));
+
+  return {
+    schedule,
+    timezone: timeZone,
+    expected_latest_fire_at_utc: expectedLatestFireAtUtc,
+    latest_scheduled_trigger: latestEvent
+      ? {
+          status: latestEvent.status || null,
+          trigger_source: latestEvent.trigger_source || null,
+          fired_at_utc: latestEvent.fired_at_utc || null,
+          fired_at_local: latestEvent.fired_at_local || null,
+          finished_at_utc: latestEvent.finished_at_utc || null,
+          exit_code: latestEvent.exit_code ?? null,
+          run_id: latestEvent.run_id || null,
+          run_status: latestEvent.run_status || null,
+        }
+      : null,
+    missed_expected_window: missedWindow,
+    trigger_receipt_count: scheduledEvents.length,
+  };
 }
 
 function writeEfficiencyMarker(paths, payload) {
@@ -4921,6 +5077,7 @@ function status(options) {
       file_count: transcriptFileCounts.total,
       by_status: transcriptFileCounts.by_status,
     },
+    schedule_health: buildScheduleHealth(paths),
     efficiency_gate: efficiencyMarker
       ? {
           status: efficiencyMarker.status || null,

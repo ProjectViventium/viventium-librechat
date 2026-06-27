@@ -1278,10 +1278,8 @@ def _poll_followup_state(
         if isinstance(follow_up, dict):
             text = follow_up.get("text")
             if isinstance(text, str) and text.strip():
-                followup_message_id = follow_up.get("messageId") or follow_up.get("message_id")
                 return {
                     "followup_text": text.strip(),
-                    "followup_message_id": str(followup_message_id or "").strip(),
                     "canonical_text": last_canonical_text,
                     "followup_text_source": "followup",
                     "canonical_text_source": last_canonical_text_source,
@@ -1304,7 +1302,6 @@ def _poll_followup_state(
         if insights:
             return {
                 "followup_text": _format_insight_fallback(insights),
-                "followup_message_id": "",
                 "canonical_text": last_canonical_text,
                 "followup_text_source": "cortex_insight_fallback",
                 "followup_text_fallback_reason": "insight_fallback",
@@ -1313,7 +1310,6 @@ def _poll_followup_state(
             }
     return {
         "followup_text": "",
-        "followup_message_id": "",
         "canonical_text": last_canonical_text,
         "canonical_text_source": last_canonical_text_source,
         "canonical_text_fallback_reason": last_canonical_text_fallback_reason,
@@ -1468,12 +1464,7 @@ def _poll_scheduler_followup(
     http_timeout_s: int,
 ) -> Dict[str, str]:
     if not message_id:
-        return {
-            "followup_text": "",
-            "followup_message_id": "",
-            "canonical_text": "",
-            "canonical_text_source": "",
-        }
+        return {"followup_text": "", "canonical_text": "", "canonical_text_source": ""}
 
     poll_config = _scheduler_followup_poll_config(task)
     params = {"userId": str(user_id)}
@@ -1542,12 +1533,7 @@ def _run_scheduler_generation(
         stream_timeout_s,
     )
     resolved_conversation_id = _extract_conversation_id(response, conversation_id)
-    polled_state = {
-        "followup_text": "",
-        "followup_message_id": "",
-        "canonical_text": "",
-        "canonical_text_source": "",
-    }
+    polled_state = {"followup_text": "", "canonical_text": "", "canonical_text_source": ""}
     final_text_source = "stream_final" if str(final_text or "").strip() else ""
     final_text_fallback_reason = ""
     followup_text_source = "stream_followup" if str(followup_text or "").strip() else ""
@@ -1569,7 +1555,6 @@ def _run_scheduler_generation(
             followup_text_fallback_reason = str(
                 polled_state.get("followup_text_fallback_reason") or ""
             ).strip()
-    followup_message_id = str(polled_state.get("followup_message_id") or "").strip()
 
     canonical_text = polled_state.get("canonical_text", "").strip()
     canonical_text_source = str(polled_state.get("canonical_text_source") or "").strip()
@@ -1595,7 +1580,6 @@ def _run_scheduler_generation(
     return {
         "conversation_id": resolved_conversation_id,
         "response_message_id": response_message_id or None,
-        "followup_message_id": followup_message_id or None,
         "final_text": final_text.strip(),
         "followup_text": followup_text.strip(),
         "final_text_source": final_text_source,

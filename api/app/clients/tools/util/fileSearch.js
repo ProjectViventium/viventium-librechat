@@ -642,6 +642,30 @@ const isLikelyActivePromptEcho = ({ message, contentLower, queryLower }) => {
   return contentLower.includes(queryLower);
 };
 
+/* === VIVENTIUM START ===
+ * Feature: Conversation recall source-first rescue.
+ * Purpose: Avoid returning a user's exact long prompt as recall evidence when no derived assistant
+ * response has been written yet.
+ */
+const normalizeRecallPromptEchoText = (value) =>
+  String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .replace(/\s+/g, ' ');
+
+const isLongExactPromptEchoWithoutEvidence = ({ message, content, query, hasRecallDerivedChild }) => {
+  if (message?.isCreatedByUser !== true || hasRecallDerivedChild) {
+    return false;
+  }
+  const normalizedQuery = normalizeRecallPromptEchoText(query);
+  if (normalizedQuery.length < 40) {
+    return false;
+  }
+  return normalizeRecallPromptEchoText(content) === normalizedQuery;
+};
+/* === VIVENTIUM END === */
+
 const isRecentUserPromptCandidate = (message, windowMs = 2 * 60 * 1000) => {
   if (message?.isCreatedByUser !== true) {
     return false;
@@ -783,6 +807,12 @@ async function searchConversationRecallSourceMatches({
           ? await hasRecallDerivedChildMessage({ userId, messageId: message?.messageId })
           : false;
       if (
+        isLongExactPromptEchoWithoutEvidence({
+          message,
+          content,
+          query,
+          hasRecallDerivedChild,
+        }) ||
         shouldSkipFromRecallCorpus({
           message,
           messageText: content,
@@ -1020,6 +1050,39 @@ const createFileSearchTool = async ({
         activeMessageId ||
         runnableConfig?.configurable?.messageId ||
         runnableConfig?.metadata?.messageId;
+      /* === VIVENTIUM START ===
+       * Feature: Conversation recall source-first rescue.
+       * Reason:
+       * - Exact prior-chat questions should not wait on a cold vector sidecar when Mongo already
+       *   has the source turns.
+       * - If source-backed recall evidence is found, skip the slow vector query for that recall
+       *   resource only; regular files and meeting transcripts still use their normal paths.
+       * Added: 2026-06-25
+       * === VIVENTIUM END === */
+      let earlySourceRescueResults = [];
+      const recallFileIdsWithSourceFirstHit = new Set();
+      if (recallFiles.length > 0) {
+        earlySourceRescueResults = await searchConversationRecallSourceMatches({
+          userId,
+          conversationId: effectiveConversationId,
+          activeMessageId: effectiveActiveMessageId,
+          recallFiles,
+          query,
+          literalCandidates,
+        });
+        for (const result of earlySourceRescueResults) {
+          if (result?.file_id) {
+            recallFileIdsWithSourceFirstHit.add(result.file_id);
+          }
+        }
+        if (earlySourceRescueResults.length > 0) {
+          logger.info(`[${Tools.file_search}] conversation recall source-first hit`, {
+            recallFileCount: recallFiles.length,
+            rescueCount: earlySourceRescueResults.length,
+            skippedVectorRecallFiles: recallFileIdsWithSourceFirstHit.size,
+          });
+        }
+      }
 
       /* === VIVENTIUM START ===
        * Feature: Structured file_search query observability + error differentiation
@@ -1216,9 +1279,17 @@ const createFileSearchTool = async ({
           (result) => Array.isArray(result?.response?.data) && result.response.data.length > 0,
         );
 
-      const validResults = await queryFiles(files);
+      const vectorFiles = files.filter(
+        (file) =>
+          !(
+            isConversationRecallFileId(file?.file_id) &&
+            recallFileIdsWithSourceFirstHit.has(file.file_id)
+          ),
+      );
+      const validResults = await queryFiles(vectorFiles);
 
-      let formattedResults = validResults
+      let formattedResults = earlySourceRescueResults.concat(
+        validResults
         .flatMap(({ file, response }) =>
           response.data.map(([docInfo, distance]) => {
             const source = isMeetingTranscriptFileId(file?.file_id)
@@ -1239,7 +1310,8 @@ const createFileSearchTool = async ({
             Number.isFinite(result?.distance) &&
             typeof result?.content === 'string' &&
             result.content.trim().length > 0,
-        );
+        ),
+      );
 
       let hasConversationRecallResults = formattedResults.some((result) =>
         isConversationRecallFileId(result.file_id),
@@ -1254,19 +1326,23 @@ const createFileSearchTool = async ({
 
       const shouldAttemptSourceRescue = recallFiles.length > 0 && !hasMeetingTranscriptResults;
 
-      if (recallFiles.length > 0 && shouldAttemptSourceRescue) {
+      const lateRecallFiles = recallFiles.filter(
+        (file) => !recallFileIdsWithSourceFirstHit.has(file?.file_id),
+      );
+
+      if (lateRecallFiles.length > 0 && shouldAttemptSourceRescue) {
         const sourceRescueResults = await searchConversationRecallSourceMatches({
           userId,
           conversationId: effectiveConversationId,
           activeMessageId: effectiveActiveMessageId,
-          recallFiles,
+          recallFiles: lateRecallFiles,
           query,
           literalCandidates,
         });
 
         if (sourceRescueResults.length > 0) {
           logger.info(`[${Tools.file_search}] conversation recall source rescue hit`, {
-            recallFileCount: recallFiles.length,
+            recallFileCount: lateRecallFiles.length,
             rescueCount: sourceRescueResults.length,
           });
           formattedResults = dedupeRecallResults(formattedResults.concat(sourceRescueResults));

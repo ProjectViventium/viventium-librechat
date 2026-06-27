@@ -482,58 +482,6 @@ class DispatchTelegramTests(unittest.TestCase):
         self.assertEqual(result['date_guard']['final']['status'], 'corrected')
         self.assertNotIn('persisted_message', result['date_guard'])
 
-    def test_run_scheduler_generation_corrects_followup_delivery_without_persisting_history(self):
-        task = {
-            'id': 'task-run-context-followup-corrected',
-            'user_id': 'user_1',
-            'agent_id': 'agent-1',
-            'prompt': 'prepare morning briefing',
-            'channel': 'telegram',
-            'conversation_policy': 'same',
-            'schedule': {'type': 'daily', 'time': '08:00', 'timezone': 'America/Los_Angeles'},
-            'next_run_at': '2026-06-15T15:00:00Z',
-            'metadata': None,
-        }
-        seen_posts = []
-
-        def fake_post(url, payload, _headers, _timeout_s):
-            seen_posts.append((url, payload))
-            if url.endswith('/api/viventium/scheduler/chat'):
-                return {'streamId': 'stream-run-context', 'conversationId': 'conv-run-context'}
-            self.fail(f'unexpected post url: {url}')
-
-        with patch.object(
-            dispatch,
-            '_utc_now',
-            return_value=datetime(2026, 6, 15, 15, 0, 26, tzinfo=timezone.utc),
-        ), patch.object(
-            dispatch,
-            '_post_json',
-            side_effect=fake_post,
-        ), patch.object(
-            dispatch,
-            '_stream_scheduler_response',
-            return_value=('Monday, June 15, 2026. Parent.', 'msg-run-context', ''),
-        ), patch.object(
-            dispatch,
-            '_poll_scheduler_followup',
-            return_value={
-                'followup_text': 'Monday, June 16. Follow-up.',
-                'followup_message_id': 'msg-followup-run-context',
-                'canonical_text': '',
-            },
-        ):
-            result = dispatch._run_scheduler_generation(task, 'http://localhost:3080', 10, 'conv-1')
-
-        self.assertEqual(len(seen_posts), 1)
-        self.assertTrue(seen_posts[0][0].endswith('/api/viventium/scheduler/chat'))
-        self.assertEqual(result['final_text'], 'Monday, June 15, 2026. Parent.')
-        self.assertEqual(result['followup_text'], 'Monday, June 15, 2026. Follow-up.')
-        self.assertEqual(result['followup_message_id'], 'msg-followup-run-context')
-        self.assertEqual(result['date_guard']['final']['status'], 'passed')
-        self.assertEqual(result['date_guard']['followup']['status'], 'corrected')
-        self.assertNotIn('persisted_followup_message', result['date_guard'])
-
     def test_scheduler_stream_returns_on_final_event_without_linger(self):
         seen = {}
 

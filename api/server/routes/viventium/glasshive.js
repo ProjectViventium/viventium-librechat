@@ -66,6 +66,7 @@ const ACTIVE_WORKER_FAILURE_CODES = new Set([
   'active_worker_limit',
   'host_worker_already_active',
 ]);
+const GENERATION_PLACEHOLDER_TEXTS = new Set(['generation in progress.']);
 
 function stableStringify(value) {
   if (value === null || typeof value !== 'object') {
@@ -272,6 +273,29 @@ function isActiveWorkerFailure({ failureCode = '', message = '' } = {}) {
   );
 }
 
+function hasCallbackDeliverable(body = {}) {
+  const deliverable = body?.deliverable;
+  if (!deliverable || typeof deliverable !== 'object' || Array.isArray(deliverable)) {
+    return false;
+  }
+  return Boolean(
+    String(deliverable.workspace_path || deliverable.workspacePath || '').trim() ||
+      String(deliverable.open_url || deliverable.openUrl || '').trim() ||
+      String(deliverable.download_url || deliverable.downloadUrl || '').trim() ||
+      String(deliverable.label || '').trim(),
+  );
+}
+
+function isEvidenceGateFailure({ failureCode = '', message = '' } = {}) {
+  const code = String(failureCode || '').trim().toLowerCase();
+  if (code === 'glasshive_evidence_check_failed') {
+    return true;
+  }
+  return /\b(?:evidence check|completion compliance|constraint compliance|coverage compliance)\s+failed\b/i.test(
+    String(message || ''),
+  );
+}
+
 function callbackText(body = {}) {
   const event = String(body.event || '').trim();
   const message = sanitizeCallbackMessage(body.message);
@@ -279,11 +303,18 @@ function callbackText(body = {}) {
     return message || 'Done.';
   }
   if (event === 'run.failed') {
-    const failureCode = String(body.failure_code || body.error_code || body?.error?.code || '')
+    const failureCode = String(
+      body.failure_code || body.failure_class || body.error_code || body?.error?.code || '',
+    )
       .trim()
       .toLowerCase();
     if (isActiveWorkerFailure({ failureCode, message })) {
       return 'I got stuck: another local worker is already running, so I could not start this one yet.';
+    }
+    if (hasCallbackDeliverable(body) && isEvidenceGateFailure({ failureCode, message })) {
+      return message
+        ? `I found a worker output, but final verification failed: ${message}`
+        : 'I found a worker output, but final verification failed.';
     }
     return message ? `I got stuck: ${message}` : 'I got stuck and need attention.';
   }
@@ -358,6 +389,28 @@ function sameGlassHiveRun(message, body = {}) {
   return metadataWorkerId === workerId && (!runId || metadataRunId === runId);
 }
 
+function messageVisibleText(message) {
+  const text = String(message?.text || '').trim();
+  if (text) {
+    return text;
+  }
+  const content = Array.isArray(message?.content) ? message.content : [];
+  for (const item of content) {
+    const itemText = String(item?.text || item?.[ContentTypes.TEXT] || '').trim();
+    if (itemText) {
+      return itemText;
+    }
+  }
+  return '';
+}
+
+function isGenerationPlaceholderMessage(message) {
+  if (!message || message.isCreatedByUser === true || message.unfinished !== true) {
+    return false;
+  }
+  return GENERATION_PLACEHOLDER_TEXTS.has(messageVisibleText(message).toLowerCase());
+}
+
 function latestLeafMessage(messages) {
   const leafId = resolveLatestLeafMessageId(messages);
   return {
@@ -371,6 +424,7 @@ function resolveCallbackTreeParentMessageId({
   requestedParentMessageId,
   anchorMessageId,
   priorStatusMessage,
+  body,
 }) {
   const currentLeaf = latestLeafMessage(messages);
   const currentLeafId = currentLeaf.messageId;
@@ -388,6 +442,21 @@ function resolveCallbackTreeParentMessageId({
       parentMessageId: requestedParentMessageId || blankAnchor.parentMessageId || '',
       currentLeaf,
       updateMessage: blankAnchor,
+    };
+  }
+  if (isGenerationPlaceholderMessage(currentLeaf.message)) {
+    if (currentLeafId !== anchorMessageId && !sameGlassHiveRun(currentLeaf.message, body)) {
+      return {
+        parentMessageId: currentLeafId || anchorMessageId || requestedParentMessageId,
+        currentLeaf,
+        updateMessage: null,
+        blockedByActivePlaceholder: true,
+      };
+    }
+    return {
+      parentMessageId: currentLeaf.message.parentMessageId || requestedParentMessageId || anchorMessageId || '',
+      currentLeaf,
+      updateMessage: currentLeaf.message,
     };
   }
   return {
@@ -654,7 +723,7 @@ router.post('/callback', async (req, res) => {
       messages =
         (await db.getMessages(
           { user: userId, conversationId },
-          'messageId parentMessageId text isCreatedByUser createdAt updatedAt metadata',
+          'messageId parentMessageId text content unfinished error isCreatedByUser createdAt updatedAt metadata',
         )) ?? [];
     }
   } catch (err) {
@@ -701,9 +770,13 @@ router.post('/callback', async (req, res) => {
     requestedParentMessageId,
     anchorMessageId,
     priorStatusMessage: priorStatusCandidate,
+    body: req.body || {},
   });
   const currentLeafMessage = parentResolution.currentLeaf?.message;
   const currentLeafId = String(parentResolution.currentLeaf?.messageId || '');
+  if (parentResolution.blockedByActivePlaceholder) {
+    return res.status(425).json({ error: 'callback_conversation_tip_not_ready' });
+  }
   if (
     currentLeafMessage?.isCreatedByUser === true &&
     currentLeafId !== requestedParentMessageId &&
@@ -739,6 +812,8 @@ router.post('/callback', async (req, res) => {
     text,
     content: callbackContent(text),
     isCreatedByUser: false,
+    unfinished: false,
+    error: false,
     metadata,
     ...timestamps,
   };

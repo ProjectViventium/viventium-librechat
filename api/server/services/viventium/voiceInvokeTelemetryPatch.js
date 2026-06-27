@@ -496,6 +496,11 @@ const installCreateCallModelPatch = (proto) => {
 
       const agentContext = this?.agentContexts?.get?.(agentId);
       const toolNames = summarizeToolNames(agentContext?.tools);
+      const bindingToolNames = summarizeToolNames(
+        typeof agentContext?.getToolsForBinding === 'function'
+          ? agentContext.getToolsForBinding()
+          : undefined,
+      );
       const discoveredCount = agentContext?.discoveredToolNames?.size ?? 0;
       const messageCount = Array.isArray(state?.messages) ? state.messages.length : 0;
       const messageChars = estimateMessageContentChars(state?.messages);
@@ -505,8 +510,10 @@ const installCreateCallModelPatch = (proto) => {
         stage: 'call_model_enter',
         details:
           `agent_id=${agentId} messages=${messageCount} message_chars=${messageChars} ` +
-          `tools=${toolNames.count} discovered_tools=${discoveredCount} ` +
-          `tool_sample=${toolNames.sample} tool_hash=${toolNames.hash}`,
+          `tools=${toolNames.count} binding_tools=${bindingToolNames.count} ` +
+          `discovered_tools=${discoveredCount} tool_sample=${toolNames.sample} ` +
+          `binding_tool_sample=${bindingToolNames.sample} tool_hash=${toolNames.hash} ` +
+          `binding_tool_hash=${bindingToolNames.hash}`,
       });
 
       const context = {

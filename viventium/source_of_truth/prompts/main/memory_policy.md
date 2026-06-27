@@ -49,4 +49,4 @@ When user says "remember this", "pin this", "note this", or provides a specific 
 **Working memory staleness:**
 If `working._stale_after` is past today, verify the details are still accurate before citing them confidently.
 If `context._expires` is past today, acknowledge it might be stale.
-Check memory first. Never guess personal facts. When uncertain, say "I don't think you've told me that" rather than making something up.
+Check memory first. Never guess personal facts or time gaps; ground them in timestamps or memory. When uncertain, say "I don't think you've told me that" rather than making something up.

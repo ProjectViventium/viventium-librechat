@@ -48,6 +48,15 @@ const GLASSHIVE_TOOL_LABELS: Record<string, string> = {
   run_get: 'GlassHive run status',
   metrics_summary: 'GlassHive metrics',
 };
+/* === VIVENTIUM START ===
+ * Feature: User-facing GlassHive signed-link hygiene.
+ * Purpose: Redact signed delivery URLs and local paths before tool payloads render in chat.
+ */
+const GLASSHIVE_SENSITIVE_URL_RE =
+  /https?:\/\/[^\s<>)"']*(?:\/v1\/signed-links\/|[?&](?:gh_token|ghtoken|token)=)[^\s<>)"']*/gi;
+const LOCAL_URL_RE = /https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0)(?::\d+)?[^\s<>)"']*/gi;
+const LOCAL_PATH_RE = /(?:\/Users|\/home|\/private\/var|\/var\/folders|\/tmp)\/[^\s`'"<>]+/g;
+/* === VIVENTIUM END === */
 
 function getUserFacingToolName(functionName: string, mcpServerName: string) {
   if (!functionName) {
@@ -70,11 +79,9 @@ function safeGlassHiveText(value: unknown, maxLength = 240) {
     return '';
   }
   const cleaned = text
-    .replace(/https?:\/\/[^\s<>)]+/gi, '[link]')
-    .replace(
-      /(?:\/Users|\/home|\/private\/var|\/var\/folders|\/tmp)\/[^\s`'"<>]+/g,
-      '<local path>',
-    );
+    .replace(GLASSHIVE_SENSITIVE_URL_RE, '[signed link]')
+    .replace(LOCAL_URL_RE, '[local link]')
+    .replace(LOCAL_PATH_RE, '<local path>');
   return cleaned.length > maxLength ? `${cleaned.slice(0, maxLength - 1).trimEnd()}...` : cleaned;
 }
 
@@ -86,45 +93,6 @@ function safeGlassHiveFileLabel(value: unknown) {
   const withoutQuery = text.split(/[?#]/, 1)[0] ?? text;
   const parts = withoutQuery.split(/[\\/]/).filter(Boolean);
   return safeGlassHiveText(parts[parts.length - 1] || withoutQuery, 120);
-}
-
-function glassHiveProgressLabel(...values: unknown[]) {
-  for (const value of values) {
-    const text = typeof value === 'string' ? value.trim().toLowerCase() : '';
-    if (!text) {
-      continue;
-    }
-    if (['complete', 'completed', 'success', 'succeeded', 'ready', 'done'].includes(text)) {
-      return 'Completed';
-    }
-    if (
-      [
-        'accepted',
-        'active',
-        'created',
-        'dispatched',
-        'in_progress',
-        'pending',
-        'queued',
-        'running',
-        'scheduled',
-        'started',
-        'working',
-      ].includes(text)
-    ) {
-      return 'In progress';
-    }
-    if (['blocked', 'error', 'failed', 'failure', 'needs_attention'].includes(text)) {
-      return 'Needs attention';
-    }
-    if (['cancelled', 'canceled', 'stopped', 'terminated'].includes(text)) {
-      return 'Stopped';
-    }
-    if (text === 'paused') {
-      return 'Paused';
-    }
-  }
-  return '';
 }
 
 function glassHiveArtifactLabels(value: unknown): string[] {
@@ -249,14 +217,14 @@ function summarizeGlassHiveToolOutput(output?: string | null, input?: string | n
     lines.push(`Task: ${taskTitle}`);
   }
 
-  const progressLabel = glassHiveProgressLabel(
+  const status = firstGlassHiveText(
     parsed?.status,
     parsed?.state,
     parsed?.run_state,
     followUpContext?.run_state,
   );
-  if (progressLabel) {
-    lines.push(`Progress: ${progressLabel}`);
+  if (status) {
+    lines.push(`Status: ${status}`);
   }
 
   const resultText = firstGlassHiveText(
@@ -271,15 +239,21 @@ function summarizeGlassHiveToolOutput(output?: string | null, input?: string | n
 
   const viewUrl = firstGlassHiveText(parsed?.view_steer_url, viewSteer?.url, parsed?.view_url);
   if (viewUrl) {
-    lines.push('View / Steer link available.');
+    lines.push(`View / Steer: ${viewUrl}`);
   }
 
   const deliverable = objectValue(parsed?.deliverable);
-  const deliverableLabel = safeGlassHiveFileLabel(
-    deliverable?.label ?? deliverable?.name ?? deliverable?.path ?? deliverable?.workspace_path,
+  const deliverablePath = safeGlassHiveFileLabel(
+    deliverable?.label,
+  ) || safeGlassHiveFileLabel(
+    deliverable?.name,
+  ) || safeGlassHiveFileLabel(
+    deliverable?.workspace_path,
+  ) || safeGlassHiveFileLabel(
+    deliverable?.path,
   );
-  if (deliverableLabel) {
-    lines.push(`Artifact: ${deliverableLabel}`);
+  if (deliverablePath) {
+    lines.push(`Artifact: ${deliverablePath}`);
   }
 
   const artifactLinks = objectValue(parsed?.artifact_links);

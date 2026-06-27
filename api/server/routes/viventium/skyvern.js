@@ -48,7 +48,11 @@ function normalizeLowerString(value) {
 }
 
 function getBridgeSecret() {
-  return (process.env.VIVENTIUM_SKYVERN_BRIDGE_API_KEY || process.env.SKYVERN_API_KEY || '').trim();
+  return (
+    process.env.VIVENTIUM_SKYVERN_BRIDGE_API_KEY ||
+    process.env.SKYVERN_API_KEY ||
+    ''
+  ).trim();
 }
 
 function getBearerToken(req) {
@@ -193,11 +197,7 @@ async function refreshOpenAIConnectedAccount(userId, userValues) {
 
   const rawBody = await response.text();
   const tokenData = parseJson(rawBody);
-  if (
-    !response.ok ||
-    typeof tokenData?.access_token !== 'string' ||
-    tokenData.access_token.length === 0
-  ) {
+  if (!response.ok || typeof tokenData?.access_token !== 'string' || tokenData.access_token.length === 0) {
     throw new Error(
       `[Skyvern Bridge] OpenAI connected-account refresh failed: ${rawBody || response.statusText}`,
     );
@@ -249,28 +249,21 @@ async function refreshAnthropicConnectedAccount(userId, userValues) {
     return userValues;
   }
 
-  const response = await fetch(
-    process.env.VIVENTIUM_ANTHROPIC_OAUTH_TOKEN_URL || ANTHROPIC_TOKEN_URL,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        grant_type: 'refresh_token',
-        client_id: process.env.VIVENTIUM_ANTHROPIC_OAUTH_CLIENT_ID || ANTHROPIC_CLIENT_ID,
-        refresh_token: refreshToken,
-      }),
+  const response = await fetch(process.env.VIVENTIUM_ANTHROPIC_OAUTH_TOKEN_URL || ANTHROPIC_TOKEN_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
     },
-  );
+    body: JSON.stringify({
+      grant_type: 'refresh_token',
+      client_id: process.env.VIVENTIUM_ANTHROPIC_OAUTH_CLIENT_ID || ANTHROPIC_CLIENT_ID,
+      refresh_token: refreshToken,
+    }),
+  });
 
   const rawBody = await response.text();
   const tokenData = parseJson(rawBody);
-  if (
-    !response.ok ||
-    typeof tokenData?.access_token !== 'string' ||
-    tokenData.access_token.length === 0
-  ) {
+  if (!response.ok || typeof tokenData?.access_token !== 'string' || tokenData.access_token.length === 0) {
     throw new Error(
       `[Skyvern Bridge] Anthropic connected-account refresh failed: ${rawBody || response.statusText}`,
     );
@@ -307,10 +300,7 @@ async function resolveOpenAICredentials() {
 
   if (typeof userValues?.apiKey === 'string' && userValues.apiKey.length > 0) {
     return {
-      mode:
-        normalizeLowerString(userValues?.oauthProvider) === 'openai-codex'
-          ? 'connected'
-          : 'user_key',
+      mode: normalizeLowerString(userValues?.oauthProvider) === 'openai-codex' ? 'connected' : 'user_key',
       apiKey: userValues.apiKey,
       baseURL:
         typeof userValues?.baseURL === 'string' && userValues.baseURL.length > 0
@@ -329,10 +319,7 @@ async function resolveOpenAICredentials() {
     return {
       mode: 'server_key',
       apiKey: directApiKey,
-      baseURL: (process.env.OPENAI_REVERSE_PROXY || 'https://api.openai.com/v1').replace(
-        /\/+$/,
-        '',
-      ),
+      baseURL: (process.env.OPENAI_REVERSE_PROXY || 'https://api.openai.com/v1').replace(/\/+$/, ''),
       headers: {},
       userId: '',
       oauthProvider: null,
@@ -340,9 +327,7 @@ async function resolveOpenAICredentials() {
     };
   }
 
-  throw new Error(
-    'No OpenAI connected account or direct API key is available for the Skyvern bridge.',
-  );
+  throw new Error('No OpenAI connected account or direct API key is available for the Skyvern bridge.');
 }
 
 async function resolveAnthropicCredentials() {
@@ -582,9 +567,7 @@ function buildAnthropicPayload(body) {
 }
 
 function ensureAnthropicOAuthSystemBlocks(system) {
-  const blocks = Array.isArray(system)
-    ? system.filter((block) => block && typeof block === 'object')
-    : [];
+  const blocks = Array.isArray(system) ? system.filter((block) => block && typeof block === 'object') : [];
   if (
     blocks.length > 0 &&
     blocks[0]?.type === 'text' &&
@@ -609,11 +592,7 @@ function extractCodexResponseObject(raw) {
     if (!payload) {
       continue;
     }
-    if (
-      payload.type === 'response.completed' &&
-      payload.response &&
-      typeof payload.response === 'object'
-    ) {
+    if (payload.type === 'response.completed' && payload.response && typeof payload.response === 'object') {
       return payload.response;
     }
     if (payload.response && typeof payload.response === 'object') {
@@ -652,7 +631,8 @@ function buildChatCompletionResponse({ model, content, usage }) {
   const normalizedUsage =
     usage && typeof usage === 'object'
       ? {
-          prompt_tokens: usage.input_tokens ?? usage.prompt_tokens ?? usage.promptTokens ?? 0,
+          prompt_tokens:
+            usage.input_tokens ?? usage.prompt_tokens ?? usage.promptTokens ?? 0,
           completion_tokens:
             usage.output_tokens ?? usage.completion_tokens ?? usage.completionTokens ?? 0,
         }
@@ -750,14 +730,11 @@ async function invokeAnthropic(body, credentials) {
     headers['x-api-key'] = credentials.apiKey;
   }
 
-  const response = await fetch(
-    process.env.VIVENTIUM_SKYVERN_ANTHROPIC_MESSAGES_URL || ANTHROPIC_MESSAGES_URL,
-    {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(upstreamBody),
-    },
-  );
+  const response = await fetch(process.env.VIVENTIUM_SKYVERN_ANTHROPIC_MESSAGES_URL || ANTHROPIC_MESSAGES_URL, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(upstreamBody),
+  });
 
   const rawBody = await response.text();
   const parsed = parseJson(rawBody);

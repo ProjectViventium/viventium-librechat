@@ -1031,6 +1031,7 @@ mcpServers:
     url: ${SCHEDULING_MCP_URL}
     headers:
       X-Viventium-User-Id: '{{LIBRECHAT_USER_ID}}'
+      X-Viventium-Storage-User-Id: '{{LIBRECHAT_USER_ID}}'
       X-Viventium-Agent-Id: agent_viventium_main_95aeb3
     startup: false
     chatMenu: true

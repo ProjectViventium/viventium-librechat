@@ -711,7 +711,7 @@ describe('fileSearch.js - tuple return validation', () => {
         query: 'what recent meeting transcript entries do you see?',
       });
 
-      expect(mockMessageFind).not.toHaveBeenCalled();
+      expect(mockMessageFind).toHaveBeenCalled();
       expect(artifact.file_search.sources.map((source) => source.fileId)).toEqual([
         'meeting_inventory:user_1:sourcehash',
       ]);
@@ -1228,6 +1228,104 @@ describe('fileSearch.js - tuple return validation', () => {
       );
     });
 
+    it('uses source-backed recall before a slow recall vector query when source evidence matches', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      axios.post.mockResolvedValue({ data: [] });
+      mockMessageFind.mockImplementation((filter) => {
+        if (filter?.parentMessageId === 'source_user_turn') {
+          return queryResult([]);
+        }
+        return queryResult([
+          {
+            messageId: 'source_user_turn',
+            conversationId: 'prior_skyline_convo',
+            createdAt: '2026-06-23T22:19:44.960Z',
+            isCreatedByUser: true,
+            text: 'Canopy restaurant North Pier, right before mentioning Lina and Sora.',
+          },
+        ]);
+      });
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        conversationId: 'current_convo',
+        files: [
+          { file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' },
+          { file_id: 'manual-file-1', filename: 'manual.pdf' },
+        ],
+      });
+
+      const [, artifact] = await fileSearchTool.func({
+        query: 'Skyline deck restaurant Lina Sora',
+      });
+
+      expect(axios.post.mock.calls.map(([, body]) => body.file_id)).toEqual(['manual-file-1']);
+      expect(artifact.file_search.sources[0].fileId).toBe('conversation_recall:user_1:all');
+      expect(artifact.file_search.sources[0].content).toContain('Canopy restaurant North Pier');
+    });
+
+    it('uses source-backed recall before recall vector even when transcript resources are attached', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      axios.post.mockImplementation((url, body) => {
+        if (url === 'http://localhost:8000/query_multiple') {
+          return Promise.resolve({
+            data: [
+              [
+                {
+                  page_content: 'Transcript chunk mentioning unrelated North Pier coffee.',
+                  metadata: { file_id: 'meeting_summary:user_1:coffee', source: 'coffee.txt' },
+                },
+                0.35,
+              ],
+            ],
+          });
+        }
+        return Promise.resolve({ data: [] });
+      });
+      mockMessageFind.mockImplementation((filter) => {
+        if (filter?.parentMessageId === 'source_user_turn') {
+          return queryResult([]);
+        }
+        return queryResult([
+          {
+            messageId: 'source_user_turn',
+            conversationId: 'prior_skyline_convo',
+            createdAt: '2026-06-23T22:19:44.960Z',
+            isCreatedByUser: true,
+            text: 'Canopy restaurant North Pier, right before mentioning Lina and Sora.',
+          },
+        ]);
+      });
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        conversationId: 'current_convo',
+        files: [
+          { file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' },
+          {
+            file_id: 'meeting_summary:user_1:coffee',
+            filename: 'meeting-transcript-summary-coffee.txt',
+            metadata: { meetingTranscriptKind: 'summary' },
+          },
+        ],
+      });
+
+      const [, artifact] = await fileSearchTool.func({
+        query: 'Skyline deck restaurant Lina Sora',
+      });
+
+      expect(axios.post.mock.calls.map(([url, body]) => [url, body.file_id || body.file_ids])).toEqual([
+        ['http://localhost:8000/query_multiple', ['meeting_summary:user_1:coffee']],
+      ]);
+      const sourceBackedRecall = artifact.file_search.sources.find(
+        (source) => source.fileId === 'conversation_recall:user_1:all',
+      );
+      expect(sourceBackedRecall?.content).toContain('Canopy restaurant North Pier');
+      expect(artifact.file_search.sources.map((source) => source.fileId)).toContain(
+        'meeting_summary:user_1:coffee',
+      );
+    });
+
     it('clips oversized conversation-recall output to stay within output budget', async () => {
       process.env.VIVENTIUM_FILE_SEARCH_MAX_RESULTS_CONVERSATION_RECALL = '10';
       process.env.VIVENTIUM_FILE_SEARCH_RESULT_MAX_CHARS_CONVERSATION_RECALL = '60';
@@ -1673,9 +1771,8 @@ describe('fileSearch.js - tuple return validation', () => {
         'VIV-RAG-QA-20260409-1626-ONYX-FJ42',
       );
       expect(artifact.file_search.sources[0].content).toContain('conversation="source_convo"');
-      expect(artifact.file_search.sources[0].relevance).toBeGreaterThan(
-        artifact.file_search.sources[1].relevance,
-      );
+      expect(artifact.file_search.sources).toHaveLength(1);
+      expect(axios.post).not.toHaveBeenCalled();
     });
 
     it('rescues exact literal recall misses from source messages and excludes the active conversation', async () => {

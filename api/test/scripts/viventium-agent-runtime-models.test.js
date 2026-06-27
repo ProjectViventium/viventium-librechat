@@ -450,16 +450,16 @@ describe('viventium-agent-runtime-models', () => {
     const normalized = normalizeBundleForRuntime(bundle, {
       env: {
         VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER: 'anthropic',
-        VIVENTIUM_FC_CONSCIOUS_LLM_MODEL: 'claude-opus-4-8',
+        VIVENTIUM_FC_CONSCIOUS_LLM_MODEL: 'claude-opus-4-7',
         VIVENTIUM_CORTEX_DEEP_RESEARCH_LLM_PROVIDER: 'anthropic',
-        VIVENTIUM_CORTEX_DEEP_RESEARCH_LLM_MODEL: 'claude-opus-4-8',
+        VIVENTIUM_CORTEX_DEEP_RESEARCH_LLM_MODEL: 'claude-opus-4-7',
       },
     });
 
     expect(normalized.backgroundAgents[0].provider).toBe('anthropic');
-    expect(normalized.backgroundAgents[0].model).toBe('claude-opus-4-8');
+    expect(normalized.backgroundAgents[0].model).toBe('claude-opus-4-7');
     expect(normalized.backgroundAgents[0].model_parameters).toEqual({
-      model: 'claude-opus-4-8',
+      model: 'claude-opus-4-7',
       thinkingBudget: 4000,
     });
   });

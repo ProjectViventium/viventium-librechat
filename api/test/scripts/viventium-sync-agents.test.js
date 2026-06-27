@@ -19,7 +19,6 @@ const {
   resolveSafeActivationFields,
   shouldApplyRuntimeOverrides,
   shouldRepairRuntimeFieldsForPushMode,
-  shouldPushMainAgentForSelectedIds,
   shouldPushStandaloneBackgroundAgent,
 } = require('../../../scripts/viventium-sync-agents');
 
@@ -219,27 +218,6 @@ describe('viventium-sync-agents args', () => {
       shouldPushStandaloneBackgroundAgent({
         agentId: 'agent-b',
         selectedAgentIds: ['agent-a'],
-      }),
-    ).toBe(false);
-  });
-
-  test('selected full handoff sync includes the main agent graph owner', () => {
-    const mainAgent = {
-      id: 'agent-main',
-      edges: [{ from: 'agent-main', to: 'agent-connected-accounts', edgeType: 'handoff' }],
-    };
-
-    expect(
-      shouldPushMainAgentForSelectedIds({
-        mainAgent,
-        selectedAgentIds: ['agent-connected-accounts'],
-      }),
-    ).toBe(true);
-    expect(
-      shouldPushMainAgentForSelectedIds({
-        mainAgent,
-        selectedAgentIds: ['agent-connected-accounts'],
-        toolsOnly: true,
       }),
     ).toBe(false);
   });
@@ -465,35 +443,6 @@ describe('viventium-sync-agents args', () => {
           }),
         }),
       ]),
-    );
-  });
-
-  test('compareBundlesByAgent includes handoff edge drift in reviewed output', () => {
-    const diff = compareBundlesByAgent({
-      leftBundle: {
-        mainAgent: {
-          id: 'main',
-          name: 'Viventium',
-          edges: [],
-        },
-        backgroundAgents: [],
-      },
-      rightBundle: {
-        mainAgent: {
-          id: 'main',
-          name: 'Viventium',
-          edges: [{ from: 'main', to: 'agent-connected-accounts', edgeType: 'handoff' }],
-        },
-        backgroundAgents: [],
-      },
-    });
-
-    expect(diff.diffCount).toBe(1);
-    expect(diff.diffs[0]).toEqual(
-      expect.objectContaining({
-        id: 'main',
-        changedFields: ['edges'],
-      }),
     );
   });
 

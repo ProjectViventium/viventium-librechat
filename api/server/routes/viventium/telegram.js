@@ -840,6 +840,14 @@ router.post(
       incoming.voiceResponsesEnabled ?? incoming.voice_responses_enabled,
       null,
     );
+    const voiceMode = parseOptionalBoolean(incoming.voiceMode ?? incoming.voice_mode, null);
+    const telegramAudioRequested = parseOptionalBoolean(
+      incoming.telegramAudioRequested ??
+        incoming.viventiumAudioRequested ??
+        incoming.audioRequested ??
+        incoming.audio_requested,
+      null,
+    );
 
     /* === VIVENTIUM START ===
      * Feature: Telegram ingress de-duplication (defense-in-depth).
@@ -1011,7 +1019,16 @@ router.post(
     if (traceId) {
       req.body.traceId = traceId;
     }
-    if (incoming.voiceMode === true && resolvedVoiceRoute?.tts?.provider) {
+    if (telegramAudioRequested !== null) {
+      req.body.telegramAudioRequested = telegramAudioRequested;
+    }
+    if (voiceMode !== null) {
+      req.body.voiceMode = voiceMode;
+    }
+    if (
+      (voiceMode === true || telegramAudioRequested === true) &&
+      resolvedVoiceRoute?.tts?.provider
+    ) {
       req.body.voiceProvider = resolvedVoiceRoute.tts.provider;
     }
     req.viventiumTelegramVoiceRoute = resolvedVoiceRoute;

@@ -483,6 +483,7 @@ const buildHistoricalUserContextBuffer = ({
 const {
   resolveViventiumSurface,
   buildVoiceModeInstructions,
+  buildTelegramAudioOutputInstructions,
   buildTelegramTextInstructions,
   buildPlaygroundTextInstructions,
   buildVoiceNoteInputInstructions,
@@ -977,7 +978,13 @@ function classifyCompletionErrorForLog(err) {
   if (isConnectedAccountReconnectError(err)) {
     return 'provider_connected_account_reconnect_required';
   }
-  if (message.includes('rate limit') || message.includes('rate_limit') || err?.status === 429) {
+  if (
+    message.includes('rate limit') ||
+    message.includes('rate_limit') ||
+    message.includes('rate-limited') ||
+    message.includes('rate limited') ||
+    err?.status === 429
+  ) {
     return 'provider_rate_limited';
   }
   if (
@@ -3630,6 +3637,15 @@ class AgentClient extends BaseClient {
       const wingModeActive = isWingModeEnabledForRequest(this.options.req, inputMode);
       const isTelegramSurface = surface === 'telegram';
       const isPlaygroundSurface = surface === 'playground';
+      const telegramAudioRequestRaw =
+        this.options.req?.body?.telegramAudioRequested ??
+        this.options.req?.body?.viventiumAudioRequested ??
+        this.options.req?.body?.audioRequested;
+      const telegramAudioRequested =
+        telegramAudioRequestRaw === true ||
+        telegramAudioRequestRaw === 1 ||
+        telegramAudioRequestRaw === '1' ||
+        String(telegramAudioRequestRaw).toLowerCase() === 'true';
       /* === VIVENTIUM NOTE END === */
 
       // Handle Voice Gateway insight delivery requests.
@@ -3706,6 +3722,18 @@ class AgentClient extends BaseClient {
           this.options.agent.instructions = [
             this.options.agent.instructions || '',
             telegramInstructions,
+          ]
+            .filter(Boolean)
+            .join('\n\n');
+        }
+      }
+      if (isTelegramSurface && !voiceMode && telegramAudioRequested) {
+        const telegramAudioInstructions = buildTelegramAudioOutputInstructions(voiceProvider);
+        if (telegramAudioInstructions) {
+          surfacePromptLayers.telegram_audio_output = telegramAudioInstructions;
+          this.options.agent.instructions = [
+            this.options.agent.instructions || '',
+            telegramAudioInstructions,
           ]
             .filter(Boolean)
             .join('\n\n');
@@ -4588,6 +4616,14 @@ class AgentClient extends BaseClient {
               const telegramInstructions = buildTelegramTextInstructions();
               if (telegramInstructions) {
                 agent.instructions = [agent.instructions || '', telegramInstructions]
+                  .filter(Boolean)
+                  .join('\n\n');
+              }
+            }
+            if (isTelegramSurface && !voiceMode && telegramAudioRequested) {
+              const telegramAudioInstructions = buildTelegramAudioOutputInstructions(voiceProvider);
+              if (telegramAudioInstructions) {
+                agent.instructions = [agent.instructions || '', telegramAudioInstructions]
                   .filter(Boolean)
                   .join('\n\n');
               }

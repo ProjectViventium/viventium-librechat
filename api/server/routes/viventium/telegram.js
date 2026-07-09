@@ -996,10 +996,21 @@ router.post(
     const resolvedVoiceRoute = await resolveUserVoiceRoute(req.user?.id);
 
     const uploadStartTs = performance.now();
-    const uploadedFiles = TELEGRAM_FILE_UPLOAD_ENABLED
-      ? await uploadTelegramFiles({ req, files: telegramNonImageFiles, agentId })
-      : [];
-    logTelegramTiming(traceId, 'upload_files', uploadStartTs, `count=${uploadedFiles.length}`);
+    let uploadedFiles = [];
+    try {
+      uploadedFiles = TELEGRAM_FILE_UPLOAD_ENABLED
+        ? await uploadTelegramFiles({ req, files: telegramNonImageFiles, agentId })
+        : [];
+      logTelegramTiming(traceId, 'upload_files', uploadStartTs, `count=${uploadedFiles.length}`);
+    } catch (err) {
+      const reason =
+        typeof err?.message === 'string' && err.message.trim().length > 0
+          ? err.message.trim()
+          : 'Attachment processing failed';
+      logger.warn('[VIVENTIUM][telegram/chat] Attachment processing failed: %s', reason);
+      logTelegramTiming(traceId, 'upload_files', uploadStartTs, 'failed=1');
+      return _res.status(422).json({ attachmentProcessingError: true, error: reason });
+    }
     const { files: _unusedFiles, iconURL: _unusedIconURL, ...safeIncoming } = incoming;
 
     req.body = {

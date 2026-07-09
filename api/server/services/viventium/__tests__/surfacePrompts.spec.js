@@ -13,6 +13,7 @@ const {
   buildVoiceModeInstructions,
   buildWingModeInstructions,
   isWingModeEnabledForRequest,
+  buildTelegramAudioOutputInstructions,
   buildTelegramTextInstructions,
   buildWebTextInstructions,
   buildCortexOutputInstructions,
@@ -455,6 +456,73 @@ describe('buildWebTextInstructions', () => {
   test('override env replaces default web rules', () => {
     process.env.VIVENTIUM_WEB_TEXT_MODE_PROMPT = 'Custom web output rules.';
     expect(buildWebTextInstructions()).toBe('Custom web output rules.');
+  });
+});
+
+describe('buildTelegramAudioOutputInstructions', () => {
+  test('Telegram text mode and audio output overlay can be combined without voice-call rules', () => {
+    const telegramText = buildTelegramTextInstructions();
+    const telegramAudio = buildTelegramAudioOutputInstructions('xai');
+    const combined = [telegramText, telegramAudio].join('\n\n');
+
+    expect(combined).toContain('TELEGRAM TEXT MODE:');
+    expect(combined).toContain('TELEGRAM AUDIO OUTPUT:');
+    expect(combined).toContain('Telegram text-mode answer');
+    expect(combined).toContain('no markdown tables');
+    expect(combined).not.toContain('VOICE CALL MODE:');
+    expect(combined).not.toContain('No markdown, lists, or code blocks');
+    expect(combined).not.toContain('Respond as spoken audio only');
+  });
+
+  test('xai branch keeps Telegram in text mode while exposing the xAI speech tag contract', () => {
+    const result = buildTelegramAudioOutputInstructions('xai');
+    expect(result).toContain('TELEGRAM AUDIO OUTPUT:');
+    expect(result).toContain('Telegram text-mode answer');
+    expect(result).toContain('xAI TTS is selected');
+    expect(result).toContain('no markdown tables');
+    expect(result).not.toContain('No markdown, lists, or code blocks');
+    for (const tag of XAI_TTS_CAPABILITIES.speech_tags.inline) {
+      expect(result).toContain(tag);
+    }
+    for (const tag of XAI_TTS_CAPABILITIES.speech_tags.wrapping) {
+      expect(result).toContain(`<${tag}>TEXT</${tag}>`);
+    }
+    expect(result).toContain('use appropriate documented xAI tags');
+    expect(result).toContain('Do NOT use Cartesia-only controls');
+  });
+
+  test('cartesia branch exposes only documented Cartesia controls', () => {
+    const result = buildTelegramAudioOutputInstructions('cartesia');
+    expect(result).toContain(`Cartesia ${CARTESIA_SONIC3_CAPABILITIES.model_id} TTS is selected`);
+    expect(result).toContain('Allowed emotion values:');
+    expect(result).toContain('Allowed nonverbal marker from Cartesia docs: [laughter]');
+    expect(result).toContain('<break time="1s"/>');
+    expect(result).toContain('Do NOT use xAI-only speech tags');
+  });
+
+  test('chatterbox branch limits bracketed nonverbal markers', () => {
+    const result = buildTelegramAudioOutputInstructions('chatterbox');
+    expect(result).toContain('Chatterbox TTS is selected');
+    expect(result).toContain('[laugh], [sigh], [gasp]');
+    expect(result).toContain('Do NOT invent other bracketed stage directions');
+    expect(result).toContain('Do NOT use <emotion .../> tags');
+  });
+
+  test.each(['openai', 'elevenlabs'])('%s branch keeps audio prompt plain text only', (provider) => {
+    const result = buildTelegramAudioOutputInstructions(provider);
+    expect(result).toContain('TELEGRAM AUDIO OUTPUT:');
+    expect(result).toContain('Express tone and emotion through natural word choice');
+    expect(result).toContain('Do NOT use <emotion .../> or any XML/SSML-like tags');
+    expect(result).toContain('Do NOT use bracketed stage directions');
+  });
+
+  test('unknown provider gets the generic audio-output overlay only', () => {
+    const result = buildTelegramAudioOutputInstructions('unknown-provider');
+    expect(result).toContain('TELEGRAM AUDIO OUTPUT:');
+    expect(result).toContain('Telegram text-mode answer');
+    expect(result).not.toContain('xAI TTS is selected');
+    expect(result).not.toContain('Cartesia');
+    expect(result).not.toContain('Chatterbox');
   });
 });
 

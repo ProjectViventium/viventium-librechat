@@ -101,7 +101,13 @@ function normalizeDeferredFallbackErrorClass({
   if (normalized.includes('provider_unauthorized') || normalized.includes('unauthorized')) {
     return 'provider_unauthorized';
   }
-  if (normalized.includes('provider_rate_limited') || normalized.includes('rate limit')) {
+  if (
+    normalized.includes('provider_rate_limited') ||
+    normalized.includes('rate_limit') ||
+    normalized.includes('rate limit') ||
+    normalized.includes('rate-limited') ||
+    normalized.includes('rate limited')
+  ) {
     return 'provider_rate_limited';
   }
   if (normalized.includes('timeout')) {

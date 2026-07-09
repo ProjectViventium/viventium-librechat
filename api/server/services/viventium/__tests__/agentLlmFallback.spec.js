@@ -191,6 +191,15 @@ describe('agentLlmFallback', () => {
         },
       ]),
     ).toBe(true);
+    expect(
+      shouldRetryWithFallback([
+        {
+          type: ContentTypes.ERROR,
+          [ContentTypes.ERROR]:
+            'The model provider rate-limited this request. Please try again shortly.',
+        },
+      ]),
+    ).toBe(true);
 
     expect(
       shouldRetryWithFallback([

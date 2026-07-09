@@ -196,6 +196,16 @@ describe('late completion error content parts', () => {
         'The model provider rate-limited this request. Please try again shortly.',
       error_class: 'provider_rate_limited',
     });
+    expect(
+      AgentClient.createCompletionErrorContentPart(
+        new Error('The model provider rate-limited this request. Please try again shortly.'),
+      ),
+    ).toEqual({
+      type: ContentTypes.ERROR,
+      [ContentTypes.ERROR]:
+        'The model provider rate-limited this request. Please try again shortly.',
+      error_class: 'provider_rate_limited',
+    });
     const overloaded = new Error('Our servers are currently overloaded. Please try again later.');
     overloaded.code = 'server_is_overloaded';
     expect(AgentClient.createCompletionErrorContentPart(overloaded)).toEqual({
@@ -3727,6 +3737,32 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
         const error = new Error('rate limit');
         error.status = 429;
         throw error;
+      }
+      client.contentParts.push({ type: ContentTypes.TEXT, text: 'Fallback answer.' });
+    });
+
+    const result = await client.sendCompletion({ text: 'hello' });
+
+    expect(client.chatCompletion).toHaveBeenCalledTimes(2);
+    expect(result.completion).toEqual([{ type: ContentTypes.TEXT, text: 'Fallback answer.' }]);
+    expect(client.contentParts).toEqual([{ type: ContentTypes.TEXT, text: 'Fallback answer.' }]);
+  });
+
+  test('retries fallback when primary throws public hyphenated rate-limit text', async () => {
+    const fallbackAgent = {
+      id: 'agent-fallback',
+      provider: EModelEndpoint.openAI,
+      model: 'gpt-5.4',
+      model_parameters: { model: 'gpt-5.4' },
+    };
+    primaryAgent.viventiumFallbackLlm = fallbackAgent;
+    let calls = 0;
+    client.chatCompletion = jest.fn(async () => {
+      calls += 1;
+      if (calls === 1) {
+        throw new Error(
+          'The model provider rate-limited this request. Please try again shortly.',
+        );
       }
       client.contentParts.push({ type: ContentTypes.TEXT, text: 'Fallback answer.' });
     });

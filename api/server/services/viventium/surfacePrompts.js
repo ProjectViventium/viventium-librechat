@@ -169,6 +169,100 @@ function buildVoiceModeInstructions(voiceProvider) {
   return getPromptText('surface.voice.call', baseRules.join('\n'));
 }
 
+function buildTelegramAudioOutputInstructions(voiceProvider) {
+  const override = (process.env.VIVENTIUM_TELEGRAM_AUDIO_OUTPUT_PROMPT || '').trim();
+  if (override) {
+    return override;
+  }
+
+  const baseRules = [
+    'TELEGRAM AUDIO OUTPUT:',
+    '- This Telegram text-mode answer will also be synthesized as audio.',
+    '- Keep the visible Telegram answer readable: short paragraphs, bullets when useful, and no markdown tables.',
+    '- Voice-control markup is allowed only when it improves the spoken audio. Telegram display strips supported voice markup while TTS receives it.',
+    '- Do not mention provider, fallback, route, or TTS mechanics unless the user explicitly asks for diagnostics.',
+  ];
+
+  const provider = normalizeVoiceProvider(voiceProvider);
+  if (provider.includes('chatterbox')) {
+    return getPromptText(
+      'surface.telegram.audio_provider.chatterbox',
+      [
+        ...baseRules,
+        '- Chatterbox TTS is selected. You may use exactly these nonverbal markers when they improve spoken delivery: [laugh], [sigh], [gasp].',
+        '- Put nonverbal markers on their own line or between sentences.',
+        '- Do NOT invent other bracketed stage directions.',
+        '- Do NOT use <emotion .../> tags or other XML/SSML-like controls.',
+      ].join('\n'),
+    );
+  }
+
+  if (provider === 'cartesia') {
+    return getPromptText(
+      'surface.telegram.audio_provider.cartesia',
+      [
+        ...baseRules,
+        `- Cartesia ${CARTESIA_SONIC3_CAPABILITIES.model_id} TTS is selected. You may use documented Cartesia SSML-like tags when they improve spoken delivery.`,
+        `- Allowed nonverbal marker from Cartesia docs: ${CARTESIA_SONIC3_NONVERBAL_MARKERS.join(', ')}. Use it only when actual laughter belongs in the spoken response.`,
+        `- Allowed emotion values: ${CARTESIA_SONIC3_EMOTIONS.join(', ')}.`,
+        `- Primary/highest-reliability emotion values: ${CARTESIA_SONIC3_PRIMARY_EMOTIONS.join(', ')}.`,
+        `- Optional speed/volume control: use <speed ratio="1.1"/> or <volume ratio="0.9"/> before a sentence; speed must be ${CARTESIA_SONIC3_SPEED.min}-${CARTESIA_SONIC3_SPEED.max} and volume must be ${CARTESIA_SONIC3_VOLUME.min}-${CARTESIA_SONIC3_VOLUME.max}.`,
+        '- Use <break time="1s"/> for natural pauses and <spell>ABC123</spell> only for identifiers that should be spelled out.',
+        '- Do NOT use xAI-only speech tags.',
+        '- Use voice controls sparingly; natural wording still matters more than markup.',
+      ].join('\n'),
+      {
+        cartesia: {
+          model_id: CARTESIA_SONIC3_CAPABILITIES.model_id,
+          nonverbal_markers: CARTESIA_SONIC3_NONVERBAL_MARKERS,
+          emotions: CARTESIA_SONIC3_EMOTIONS,
+          primary_emotions: CARTESIA_SONIC3_PRIMARY_EMOTIONS,
+          speed: CARTESIA_SONIC3_SPEED,
+          volume: CARTESIA_SONIC3_VOLUME,
+        },
+      },
+    );
+  }
+
+  if (provider === 'xai') {
+    return getPromptText(
+      'surface.telegram.audio_provider.xai',
+      [
+        ...baseRules,
+        '- xAI TTS is selected. You may use only documented xAI speech tags when they improve spoken delivery.',
+        `- Allowed xAI inline tags: ${XAI_TTS_INLINE_TAGS.join(', ')}.`,
+        `- Allowed xAI wrapping tags: ${XAI_TTS_WRAPPING_TAGS.map((tag) => `<${tag}>TEXT</${tag}>`).join(', ')}.`,
+        '- Use wrapping tags only on short phrases, include the closing tag, and do not split tag names across streamed chunks.',
+        '- When the user explicitly asks for more emotion or speech markers in a voice note, use appropriate documented xAI tags instead of only describing emotion.',
+        '- Do NOT invent other bracketed stage directions or XML tags.',
+        '- Do NOT use Cartesia-only controls: <emotion>, <speed>, <volume>, <break>, <spell>, or [laughter].',
+        '- xAI TTS has no Cartesia-style emotion parameter; express tone through natural wording plus the documented xAI speech tags.',
+        '- Use xAI speech tags sparingly; natural wording still matters more than markup.',
+      ].join('\n'),
+      {
+        xai: {
+          inline_tags: XAI_TTS_INLINE_TAGS,
+          wrapping_tags: XAI_TTS_WRAPPING_TAGS.map((tag) => `<${tag}>TEXT</${tag}>`),
+        },
+      },
+    );
+  }
+
+  if (provider === 'openai' || provider === 'elevenlabs') {
+    return getPromptText(
+      'surface.telegram.audio_provider.plain_tts',
+      [
+        ...baseRules,
+        '- Do NOT use <emotion .../> or any XML/SSML-like tags.',
+        '- Do NOT use bracketed stage directions like [laugh], [laughter], or [sigh].',
+        '- Express tone and emotion through natural word choice and sentence structure only.',
+      ].join('\n'),
+    );
+  }
+
+  return getPromptText('surface.telegram.audio_output', baseRules.join('\n'));
+}
+
 function buildTelegramTextInstructions() {
   const override = (process.env.VIVENTIUM_TELEGRAM_TEXT_MODE_PROMPT || '').trim();
   if (override) {
@@ -810,6 +904,7 @@ function stripVoiceControlTagsForDisplay(text) {
 module.exports = {
   resolveViventiumSurface,
   buildVoiceModeInstructions,
+  buildTelegramAudioOutputInstructions,
   buildTelegramTextInstructions,
   buildWebTextInstructions,
   buildPlaygroundTextInstructions,

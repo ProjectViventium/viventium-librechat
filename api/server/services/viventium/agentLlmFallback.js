@@ -277,6 +277,8 @@ function isRecoverableProviderErrorText(text, { allowToolOrMcpText = false } = {
   return (
     lowered.includes('rate_limit') ||
     lowered.includes('rate limit') ||
+    lowered.includes('rate-limited') ||
+    lowered.includes('rate limited') ||
     lowered.includes('too many requests') ||
     lowered.includes('status=429') ||
     lowered.includes('status 429') ||

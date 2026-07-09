@@ -12,6 +12,8 @@ let lastStreamId = null;
 let lastParentMessageId = null;
 let lastSpec = null;
 let lastVoiceProvider = null;
+let lastVoiceMode = null;
+let lastTelegramAudioRequested = null;
 let mockUserFindOne;
 let mockUserCountDocuments;
 let mockSubscribe;
@@ -80,6 +82,8 @@ jest.mock('~/server/controllers/agents/request', () => (req, res) => {
   lastParentMessageId = req.body.parentMessageId;
   lastSpec = req.body.spec;
   lastVoiceProvider = req.body.voiceProvider || null;
+  lastVoiceMode = req.body.voiceMode ?? null;
+  lastTelegramAudioRequested = req.body.telegramAudioRequested ?? null;
   res.json({ streamId: 'stream_1', conversationId: req.body.conversationId || 'new' });
 });
 
@@ -316,6 +320,8 @@ describe('/api/viventium/telegram', () => {
     lastParentMessageId = null;
     lastSpec = null;
     lastVoiceProvider = null;
+    lastVoiceMode = null;
+    lastTelegramAudioRequested = null;
     jest.resetModules();
     mockUserFindOne = jest.fn();
     mockUserCountDocuments = jest.fn().mockResolvedValue(0);
@@ -789,6 +795,67 @@ describe('/api/viventium/telegram', () => {
     await dispatch(app, req, res);
 
     expect(res.statusCode).toBe(200);
+    expect(lastVoiceProvider).toBe('xai');
+    expect(res.body.voiceRoute).toEqual({
+      stt: { provider: 'pywhispercpp', variant: 'base.en' },
+      tts: { provider: 'xai', variant: 'Eve' },
+    });
+  });
+
+  test('POST /chat normalizes string voiceMode before saved voice provider injection', async () => {
+    mockResolveUserVoiceRoute.mockResolvedValueOnce({
+      stt: { provider: 'pywhispercpp', variant: 'base.en' },
+      tts: { provider: 'xai', variant: 'Eve' },
+    });
+
+    const telegramRouter = require('../telegram');
+    const app = createTestApp(telegramRouter);
+    const req = createMockReq({
+      url: '/api/viventium/telegram/chat',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      body: {
+        text: 'hi',
+        conversationId: 'new',
+        telegramUserId: 'tg-1',
+        voiceMode: 'true',
+        voiceProvider: 'openai',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(lastVoiceMode).toBe(true);
+    expect(lastVoiceProvider).toBe('xai');
+  });
+
+  test('POST /chat injects saved voice provider for Telegram text turns that request audio', async () => {
+    mockResolveUserVoiceRoute.mockResolvedValueOnce({
+      stt: { provider: 'pywhispercpp', variant: 'base.en' },
+      tts: { provider: 'xai', variant: 'Eve' },
+    });
+
+    const telegramRouter = require('../telegram');
+    const app = createTestApp(telegramRouter);
+    const req = createMockReq({
+      url: '/api/viventium/telegram/chat',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      body: {
+        text: 'hi',
+        conversationId: 'new',
+        telegramUserId: 'tg-1',
+        voiceMode: false,
+        telegramAudioRequested: true,
+        voiceProvider: 'openai',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(lastTelegramAudioRequested).toBe(true);
     expect(lastVoiceProvider).toBe('xai');
     expect(res.body.voiceRoute).toEqual({
       stt: { provider: 'pywhispercpp', variant: 'base.en' },

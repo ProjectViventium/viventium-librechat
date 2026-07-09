@@ -508,13 +508,16 @@ describe('buildTelegramAudioOutputInstructions', () => {
     expect(result).toContain('Do NOT use <emotion .../> tags');
   });
 
-  test.each(['openai', 'elevenlabs'])('%s branch keeps audio prompt plain text only', (provider) => {
-    const result = buildTelegramAudioOutputInstructions(provider);
-    expect(result).toContain('TELEGRAM AUDIO OUTPUT:');
-    expect(result).toContain('Express tone and emotion through natural word choice');
-    expect(result).toContain('Do NOT use <emotion .../> or any XML/SSML-like tags');
-    expect(result).toContain('Do NOT use bracketed stage directions');
-  });
+  test.each(['openai', 'elevenlabs'])(
+    '%s branch keeps audio prompt plain text only',
+    (provider) => {
+      const result = buildTelegramAudioOutputInstructions(provider);
+      expect(result).toContain('TELEGRAM AUDIO OUTPUT:');
+      expect(result).toContain('Express tone and emotion through natural word choice');
+      expect(result).toContain('Do NOT use <emotion .../> or any XML/SSML-like tags');
+      expect(result).toContain('Do NOT use bracketed stage directions');
+    },
+  );
 
   test('unknown provider gets the generic audio-output overlay only', () => {
     const result = buildTelegramAudioOutputInstructions('unknown-provider');

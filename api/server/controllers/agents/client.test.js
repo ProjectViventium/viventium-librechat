@@ -3760,9 +3760,7 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     client.chatCompletion = jest.fn(async () => {
       calls += 1;
       if (calls === 1) {
-        throw new Error(
-          'The model provider rate-limited this request. Please try again shortly.',
-        );
+        throw new Error('The model provider rate-limited this request. Please try again shortly.');
       }
       client.contentParts.push({ type: ContentTypes.TEXT, text: 'Fallback answer.' });
     });

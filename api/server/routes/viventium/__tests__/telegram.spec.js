@@ -556,8 +556,14 @@ describe('/api/viventium/telegram', () => {
     });
     const res = createMockRes();
 
-    await expect(dispatch(app, req, res)).rejects.toThrow(
-      /Telegram attachment upload failed for "archive\.zip"/,
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(422);
+    expect(res.body).toEqual(
+      expect.objectContaining({
+        attachmentProcessingError: true,
+        error: expect.stringMatching(/Telegram attachment upload failed for "archive\.zip"/),
+      }),
     );
   });
 

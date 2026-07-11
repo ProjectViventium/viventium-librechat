@@ -97,7 +97,7 @@
     "@modelcontextprotocol/sdk": "^1.27.1",
     "@smithy/node-http-handler": "^4.4.5",
     "@xmldom/xmldom": "^0.8.10",
-    "axios": "^1.13.5",
+    "axios": "^1.16.0",
     "connect-redis": "^8.1.0",
     "eventsource": "^3.0.2",
     "express": "^5.1.0",

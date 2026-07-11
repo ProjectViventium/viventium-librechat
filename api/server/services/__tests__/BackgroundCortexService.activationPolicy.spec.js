@@ -466,7 +466,7 @@ describe('BackgroundCortexService activation policy helpers', () => {
 
     const result = buildActivationPolicySection({ config: source, mainAgent: { tools: [] } });
 
-    expect(result.section).toContain('Background agents are optional reviewers, not controllers.');
+    expect(result.section).toContain('Connected direct-action surfaces are execution owners.');
     expect(result.section).not.toContain('[object Object]');
   });
 

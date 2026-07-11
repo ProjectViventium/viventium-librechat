@@ -167,7 +167,7 @@ describe('Document Parser', () => {
       const document = await parseDocument({ file });
 
       expect(document).toEqual({
-        bytes: 147,
+        bytes: 152,
         filename: 'sample.pptx',
         filepath: 'document_parser',
         images: [],

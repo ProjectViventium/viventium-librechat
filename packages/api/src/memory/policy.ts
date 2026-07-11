@@ -17,6 +17,7 @@ export type MemoryEntryLike = {
   value: string;
   tokenCount?: number;
   updated_at?: Date | string | null;
+  __v?: number;
 };
 
 export type MemoryKeyLimits = Record<string, number>;
@@ -42,6 +43,7 @@ export interface MemoryMaintenanceUpdate {
   tokenCount: number;
   previousTokenCount: number;
   reason: string;
+  expectedRevision?: number | null;
 }
 
 export interface MemoryMaintenancePlan {
@@ -50,6 +52,9 @@ export interface MemoryMaintenancePlan {
   updates: MemoryMaintenanceUpdate[];
   totalTokensBefore: number;
   totalTokensAfter: number;
+  appliedKeys?: string[];
+  appliedRevisions?: Record<string, number>;
+  conflictKeys?: string[];
 }
 
 export const DEFAULT_MEMORY_MAINTENANCE_THRESHOLD_PERCENT = 80;
@@ -484,6 +489,7 @@ export function createMemoryMaintenancePlan({
       tokenCount: countTokens(next.value),
       previousTokenCount: sanitizeTokenCount(memory.tokenCount),
       reason: nextReason(memory.key),
+      expectedRevision: memory.__v == null ? 0 : Number(memory.__v),
     });
   }
 
@@ -512,7 +518,8 @@ export async function runMemoryMaintenance({
     key: string;
     value: string;
     tokenCount: number;
-  }) => Promise<{ ok: boolean }>;
+    expectedRevision?: number | null;
+  }) => Promise<{ ok: boolean; conflict?: boolean; revision?: number }>;
   policy: MemoryPolicyConfig;
   now?: Date;
 }): Promise<MemoryMaintenancePlan> {
@@ -523,16 +530,28 @@ export async function runMemoryMaintenance({
     return plan;
   }
 
+  const appliedKeys: string[] = [];
+  const appliedRevisions: Record<string, number> = {};
+  const conflictKeys: string[] = [];
   for (const update of plan.updates) {
-    await setMemory({
+    const result = await setMemory({
       userId,
       key: update.key,
       value: update.value,
       tokenCount: update.tokenCount,
+      expectedRevision: update.expectedRevision,
     });
+    if (result.conflict) {
+      conflictKeys.push(update.key);
+    } else if (result.ok) {
+      appliedKeys.push(update.key);
+      if (Number.isInteger(result.revision) && Number(result.revision) >= 0) {
+        appliedRevisions[update.key] = Number(result.revision);
+      }
+    }
   }
 
-  return plan;
+  return { ...plan, appliedKeys, appliedRevisions, conflictKeys };
 }
 
 function nextReason(key: string): string {
@@ -778,8 +797,11 @@ function buildDraftsValue(
     const lastWorked = record.lastWorked || record.started || 'unknown';
     if (record.archived) {
       const archivedSummary =
-        compactSentence(record.archiveSummary || `${record.thread}: ${summarySource || nextSource || record.status || 'done'}`, 16) ||
-        `${record.thread}: ${record.status || 'done'}`;
+        compactSentence(
+          record.archiveSummary ||
+            `${record.thread}: ${summarySource || nextSource || record.status || 'done'}`,
+          16,
+        ) || `${record.thread}: ${record.status || 'done'}`;
       archived.push(
         `- ${record.thread} | ${record.status || 'done'} | last_worked: ${lastWorked} | ${archivedSummary}`,
       );
@@ -1705,7 +1727,9 @@ function hasExpiredWorkingSnapshot(value: string | undefined, now: Date): boolea
   if (!value) {
     return false;
   }
-  return isDateMarkerBefore(value, '_stale_after', now) || isDateMarkerBefore(value, '_expires', now);
+  return (
+    isDateMarkerBefore(value, '_stale_after', now) || isDateMarkerBefore(value, '_expires', now)
+  );
 }
 
 function hasLongIdleActiveDrafts(value: string | undefined, now: Date): boolean {
@@ -1713,7 +1737,10 @@ function hasLongIdleActiveDrafts(value: string | undefined, now: Date): boolean 
     return false;
   }
   return parseDrafts(value).some(
-    (record) => !record.archived && (record.status || '').toLowerCase() === 'in_progress' && isLongIdleActiveDraft(record, now),
+    (record) =>
+      !record.archived &&
+      (record.status || '').toLowerCase() === 'in_progress' &&
+      isLongIdleActiveDraft(record, now),
   );
 }
 

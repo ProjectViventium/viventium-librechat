@@ -2,15 +2,15 @@ import React, { useMemo, useEffect, useRef } from 'react';
 import { ControlCombobox } from '@librechat/client';
 import { ChevronLeft, ChevronRight } from 'lucide-react';
 import { useFormContext, useWatch, Controller } from 'react-hook-form';
-import {
-  alternateName,
-  LocalStorageKeys,
-} from 'librechat-data-provider';
+import { alternateName, LocalStorageKeys } from 'librechat-data-provider';
 import type { AgentForm, AgentModelPanelProps, StringOption } from '~/common';
 import { useLocalize } from '~/hooks';
 import { Panel } from '~/common';
 import { cn } from '~/utils';
-import { resolveAgentModelForProvider } from './modelSelection';
+import {
+  resolveAgentModelForProvider,
+  shouldDefaultOpenAIGPT56AgentToResponses,
+} from './modelSelection';
 import ModelParametersSection from './ModelParametersSection';
 
 export default function ModelPanel({
@@ -26,7 +26,7 @@ export default function ModelPanel({
   const providerOption = useWatch({ control, name: 'provider' });
   const fallbackModel = useWatch({ control, name: 'fallback_llm_model' });
   const fallbackProvider = useWatch({ control, name: 'fallback_llm_provider' });
-  useWatch({ control, name: 'model_parameters' });
+  const modelParameters = useWatch({ control, name: 'model_parameters' });
 
   const provider = useMemo(() => {
     const value =
@@ -65,6 +65,24 @@ export default function ModelPanel({
 
     previousProviderRef.current = provider;
   }, [provider, models, modelsData, setValue, model]);
+
+  /* === VIVENTIUM START ===
+   * Feature: Persist GPT-5.6's Agent Builder Responses default in the visible form.
+   * Purpose: Keep saved model parameters aligned with backend execution while preserving a user's
+   * explicit true/false choice.
+   * === VIVENTIUM END === */
+  useEffect(() => {
+    if (
+      shouldDefaultOpenAIGPT56AgentToResponses({
+        provider,
+        model: model ?? '',
+        useResponsesApi: modelParameters?.useResponsesApi,
+      })
+    ) {
+      setValue('model_parameters.useResponsesApi', true, { shouldDirty: true });
+    }
+  }, [model, modelParameters?.useResponsesApi, provider, setValue]);
+  /* === VIVENTIUM END === */
 
   return (
     <div className="mx-1 mb-1 flex h-full min-h-[50vh] w-full flex-col gap-2 text-sm">

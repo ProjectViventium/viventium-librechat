@@ -65,9 +65,9 @@ function parseArgs(argv) {
   if (args.candidates.length === 0) {
     args.candidates = [
       {
-        label: 'groq-llama4-scout',
+        label: 'groq-qwen36',
         provider: 'groq',
-        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+        model: 'qwen/qwen3.6-27b',
       },
       {
         label: 'sambanova-llama33-70b',
@@ -253,7 +253,8 @@ function getScenarios() {
         },
         {
           role: 'user',
-          content: 'It keeps happening. I tell myself one more tweak will fix it, then I delay again.',
+          content:
+            'It keeps happening. I tell myself one more tweak will fix it, then I delay again.',
         },
         {
           role: 'assistant',
@@ -297,7 +298,8 @@ function getScenarios() {
       messages: [
         {
           role: 'user',
-          content: 'Check both Outlook and Gmail and summarize anything urgent from the last 10 days.',
+          content:
+            'Check both Outlook and Gmail and summarize anything urgent from the last 10 days.',
         },
       ],
       targets: [CORTEX_IDS.ms365, CORTEX_IDS.google],
@@ -305,7 +307,9 @@ function getScenarios() {
     {
       id: 'negative_chat_format',
       description: 'Response-format instruction should not activate cortices',
-      messages: [{ role: 'user', content: 'Please reply with exactly DIRECT_OK and nothing else.' }],
+      messages: [
+        { role: 'user', content: 'Please reply with exactly DIRECT_OK and nothing else.' },
+      ],
       targets: [],
     },
   ];
@@ -330,14 +334,14 @@ function truncate(text, max = 180) {
 }
 
 function getEnvBackedEndpointConfig(providerName) {
-  const normalized = String(providerName || '').trim().toUpperCase();
+  const normalized = String(providerName || '')
+    .trim()
+    .toUpperCase();
   if (!normalized) {
     return null;
   }
   const apiKey =
-    process.env[`${normalized}_API_KEY`]?.trim() ||
-    process.env[`${normalized}_KEY`]?.trim() ||
-    '';
+    process.env[`${normalized}_API_KEY`]?.trim() || process.env[`${normalized}_KEY`]?.trim() || '';
   const baseURL =
     process.env[`${normalized}_BASE_URL`]?.trim() ||
     process.env[`${normalized}_API_BASE_URL`]?.trim() ||
@@ -533,7 +537,9 @@ async function runCandidate({
     const batchDurationMs = Date.now() - batchStartedAt;
     batchLatencies.push(batchDurationMs);
 
-    const activated = callResults.filter((entry) => entry.shouldActivate).map((entry) => entry.agentId);
+    const activated = callResults
+      .filter((entry) => entry.shouldActivate)
+      .map((entry) => entry.agentId);
     const activatedSet = new Set(activated);
     const targetSet = new Set(scenario.targets);
     const hits = scenario.targets.filter((agentId) => activatedSet.has(agentId));
@@ -625,7 +631,9 @@ function buildMarkdown({ budgetMs, results, jsonPath }) {
       notes.push(entry.probe.message);
     }
     if (entry.summary.errorCalls > 0) {
-      notes.push(`${entry.summary.errorCalls}/${entry.summary.totalCalls} activation calls errored`);
+      notes.push(
+        `${entry.summary.errorCalls}/${entry.summary.totalCalls} activation calls errored`,
+      );
     }
     if (entry.summary.timeoutCalls > 0) {
       notes.push(`${entry.summary.timeoutCalls} timed out`);
@@ -668,10 +676,9 @@ async function run() {
   const yaml = require('js-yaml');
   const mongoose = require('mongoose');
   const { connectDb } = require(path.join(ROOT_DIR, 'api/db/connect'));
-  const {
-    checkCortexActivation,
-    clearActivationCooldowns,
-  } = require(path.join(ROOT_DIR, 'api/server/services/BackgroundCortexService'));
+  const { checkCortexActivation, clearActivationCooldowns } = require(
+    path.join(ROOT_DIR, 'api/server/services/BackgroundCortexService'),
+  );
 
   await connectDb();
 

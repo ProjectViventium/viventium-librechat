@@ -19,6 +19,7 @@ const {
   buildCortexOutputInstructions,
   stripVoiceControlTagsForDisplay,
   sanitizeVoiceSurfaceTextForDisplay,
+  FEELING_AWARE_VOICE_EXPRESSION_RULES,
 } = require('../surfacePrompts');
 const fs = require('fs');
 const os = require('os');
@@ -228,6 +229,35 @@ describe('buildVoiceModeInstructions', () => {
     expect(result).toContain('[long-pause]');
   });
   // === VIVENTIUM END ===
+
+  test.each(['cartesia', 'xai', 'local_chatterbox_turbo_mlx_8bit', 'openai', 'unknown'])(
+    '%s lets an injected feeling state shape spoken delivery without forcing a performance',
+    (provider) => {
+      const result = buildVoiceModeInstructions(provider);
+      expect(result).toContain('If a <viventium_feeling_state> is present');
+      expect(result).toContain(
+        'silently appraise whether the current state and moment call for expressive or restrained delivery',
+      );
+      expect(result).toContain(
+        'the raw voice-capable response is incomplete unless it contains a fitting documented control',
+      );
+      expect(result).toContain('Natural wording alone does not satisfy expressive spoken delivery');
+      expect(result).toContain('Do not add voice controls merely to prove that a feeling exists');
+      expect(result).toContain('private cause');
+    },
+  );
+
+  test('inline feeling-expression fallback exactly matches the registered prompt source', () => {
+    const source = fs.readFileSync(
+      path.resolve(
+        __dirname,
+        '../../../../../viventium/source_of_truth/prompts/surface/voice_feeling_expression.md',
+      ),
+      'utf8',
+    );
+    const registeredBody = source.replace(/^---[\s\S]*?\n---\s*\n/, '').trim();
+    expect(FEELING_AWARE_VOICE_EXPRESSION_RULES.join('\n')).toBe(registeredBody);
+  });
 
   test('generic fallback returns base rules only', () => {
     const result = buildVoiceModeInstructions('some_unknown_provider');
@@ -487,9 +517,29 @@ describe('buildTelegramAudioOutputInstructions', () => {
     for (const tag of XAI_TTS_CAPABILITIES.speech_tags.wrapping) {
       expect(result).toContain(`<${tag}>TEXT</${tag}>`);
     }
-    expect(result).toContain('use appropriate documented xAI tags');
+    expect(result).toContain('without waiting for the user to ask');
+    expect(result).toContain(
+      'verify that the raw response contains at least one exact tag from the allowed xAI lists',
+    );
+    expect(result).not.toContain('When the user explicitly asks for more emotion');
     expect(result).toContain('Do NOT use Cartesia-only controls');
   });
+
+  test.each(['cartesia', 'xai', 'chatterbox', 'openai', 'unknown-provider'])(
+    '%s audio output treats Feelings as a delivery cause while preserving natural restraint',
+    (provider) => {
+      const result = buildTelegramAudioOutputInstructions(provider);
+      expect(result).toContain('If a <viventium_feeling_state> is present');
+      expect(result).toContain(
+        'silently appraise whether the current state and moment call for expressive or restrained delivery',
+      );
+      expect(result).toContain(
+        'the raw voice-capable response is incomplete unless it contains a fitting documented control',
+      );
+      expect(result).toContain('Do not add voice controls merely to prove that a feeling exists');
+      expect(result).toContain('unmarked speech is correct');
+    },
+  );
 
   test('cartesia branch exposes only documented Cartesia controls', () => {
     const result = buildTelegramAudioOutputInstructions('cartesia');

@@ -34,6 +34,17 @@ function isPlaceholderAssistantText(text) {
   return lines.every((line) => PLACEHOLDER_RESPONSE_PATTERNS.some((pattern) => pattern.test(line)));
 }
 
+/* === VIVENTIUM START ===
+ * QA/eval isolation: avoid scheduling derived recall work for a request that explicitly isolates
+ * conversation recall. The same structured gate is used by AgentClient; normal requests remain
+ * unchanged when the fields are absent.
+ * === VIVENTIUM END === */
+function shouldSkipConversationRecallSync(req) {
+  const body = req?.body;
+  const isolationAllowed = body?.isTemporary === true || body?.viventiumQaRun === true;
+  return isolationAllowed && body?.viventiumEvalIsolation?.conversationRecall === true;
+}
+
 function textFromContentParts(content) {
   if (!Array.isArray(content)) {
     return '';
@@ -196,6 +207,31 @@ async function saveMessage(req, params, metadata) {
       update.expiredAt = null;
     }
 
+    /* === VIVENTIUM START ===
+     * QA provenance: persist the structured run marker consumed by memory, recall, and Meili
+     * exclusion layers. This is request metadata only; prompt text and agent names are irrelevant.
+     * === VIVENTIUM END === */
+    if (req?.body?.viventiumQaRun === true) {
+      const existingMetadata =
+        update.metadata && typeof update.metadata === 'object' ? update.metadata : {};
+      const existingViventium =
+        existingMetadata.viventium && typeof existingMetadata.viventium === 'object'
+          ? existingMetadata.viventium
+          : {};
+      const qaRunId = String(req?.body?.viventiumQaRunId || '')
+        .trim()
+        .slice(0, 128);
+      update.metadata = {
+        ...existingMetadata,
+        viventium: {
+          ...existingViventium,
+          qaRun: true,
+          memoryEligible: false,
+          ...(qaRunId ? { qaRunId } : {}),
+        },
+      };
+    }
+
     if (update.tokenCount != null && isNaN(update.tokenCount)) {
       logger.warn(
         `Resetting invalid \`tokenCount\` for message \`${params.messageId}\`: ${update.tokenCount}`,
@@ -240,10 +276,12 @@ async function saveMessage(req, params, metadata) {
      * Feature: Conversation Recall RAG proactive sync on message upsert
      * Added: 2026-02-19
      */
-    scheduleConversationRecallSync({
-      userId: req.user.id,
-      conversationId: update.conversationId,
-    });
+    if (!shouldSkipConversationRecallSync(req)) {
+      scheduleConversationRecallSync({
+        userId: req.user.id,
+        conversationId: update.conversationId,
+      });
+    }
     /* === VIVENTIUM END === */
 
     return message.toObject();
@@ -653,5 +691,6 @@ module.exports = {
     visibleMessageText,
     shouldMirrorContentTextToMessageText,
     mirrorContentTextToMessageText,
+    shouldSkipConversationRecallSync,
   },
 };

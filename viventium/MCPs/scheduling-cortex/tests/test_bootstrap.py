@@ -3,22 +3,65 @@
 # === VIVENTIUM END ===
 
 import json
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scheduling_cortex.storage import ScheduleStorage, StorageConfig
-from scheduling_cortex.server import build_server, serialize_task_summary
+from scheduling_cortex.server import (
+    _default_scheduling_db_path,
+    build_server,
+    serialize_task_summary,
+)
 
 try:
     from starlette.testclient import TestClient
 except ImportError:
     TestClient = None
+
+
+class SchedulingDatabasePathTests(unittest.TestCase):
+    def test_default_db_path_uses_canonical_app_support_state(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                os.environ,
+                {"VIVENTIUM_APP_SUPPORT_DIR": tmpdir},
+                clear=False,
+            ):
+                self.assertEqual(
+                    _default_scheduling_db_path(),
+                    str(Path(tmpdir) / "state" / "scheduling" / "schedules.db"),
+                )
+
+    def test_macos_default_never_uses_legacy_hidden_fallback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {}, clear=False), patch(
+                "scheduling_cortex.server.Path.home",
+                return_value=Path(tmpdir),
+            ), patch("scheduling_cortex.server.sys.platform", "darwin"):
+                os.environ.pop("VIVENTIUM_APP_SUPPORT_DIR", None)
+                resolved = _default_scheduling_db_path()
+
+        self.assertEqual(
+            resolved,
+            str(
+                Path(tmpdir)
+                / "Library"
+                / "Application Support"
+                / "Viventium"
+                / "state"
+                / "scheduling"
+                / "schedules.db"
+            ),
+        )
+        self.assertNotIn(".viventium", resolved)
 
 
 @unittest.skipIf(TestClient is None, "starlette[testclient] not installed")

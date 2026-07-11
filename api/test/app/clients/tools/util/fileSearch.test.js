@@ -88,6 +88,7 @@ describe('fileSearch.js - tuple return validation', () => {
     delete process.env.VIVENTIUM_FILE_SEARCH_TOP_K_CONVERSATION_RECALL;
     delete process.env.VIVENTIUM_FILE_SEARCH_TOP_K_MEETING_TRANSCRIPT;
     delete process.env.VIVENTIUM_FILE_SEARCH_TOP_K_MEETING_TRANSCRIPT_BATCH_MAX;
+    delete process.env.VIVENTIUM_FILE_SEARCH_FOCUSED_MEETING_TRANSCRIPT_FILES;
     delete process.env.VIVENTIUM_FILE_SEARCH_MAX_RESULTS;
     delete process.env.VIVENTIUM_FILE_SEARCH_MAX_RESULTS_CONVERSATION_RECALL;
     delete process.env.VIVENTIUM_FILE_SEARCH_MAX_RESULTS_MEETING_TRANSCRIPT;
@@ -883,6 +884,96 @@ describe('fileSearch.js - tuple return validation', () => {
       expect(artifact.file_search.sources[0].content).toContain('Sam said the Tuesday launch');
     });
 
+    it('recovers an exact metadata-matched summary when the global vector batch misses it', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      axios.post.mockImplementation((url, body) => {
+        if (
+          url === 'http://localhost:8000/query' &&
+          body.file_id === 'meeting_summary:user_1:target'
+        ) {
+          return Promise.resolve({
+            data: [
+              [
+                {
+                  page_content:
+                    'The example program screening covered customer pull, recurring revenue, defensibility, and the internal debrief.',
+                  metadata: {
+                    source: '/path/to/meeting-transcript-summary-target.txt',
+                    page: 1,
+                  },
+                },
+                0.24,
+              ],
+            ],
+          });
+        }
+        if (url === 'http://localhost:8000/query_multiple') {
+          return Promise.resolve({
+            data: [
+              [
+                {
+                  page_content:
+                    'A separate strategy offsite discussed synthetic product positioning.',
+                  metadata: {
+                    file_id: 'meeting_summary:user_1:distractor',
+                    source: '/path/to/meeting-transcript-summary-distractor.txt',
+                    page: 1,
+                  },
+                },
+                0.12,
+              ],
+            ],
+          });
+        }
+        return Promise.resolve({ data: [] });
+      });
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        files: [
+          {
+            file_id: 'meeting_inventory:user_1:sourcehash',
+            filename: 'meeting-transcript-inventory-sourcehash.txt',
+            metadata: {
+              meetingTranscriptKind: 'inventory',
+              meetingTranscriptInventoryText:
+                '2026-07-10 Example Program Screening: customer pull and internal debrief.',
+            },
+          },
+          {
+            file_id: 'meeting_summary:user_1:target',
+            filename: 'meeting-transcript-summary-target.txt',
+            metadata: {
+              meetingTranscriptKind: 'summary',
+              meetingTranscriptDisplayTitle: 'Example Program Screening',
+              meetingTranscriptOriginalFilename: '2026-07-10_1400_Example_Program_Screening.txt',
+              meetingTranscriptOneLineSummary: 'Formal screening followed by an internal debrief.',
+            },
+          },
+          {
+            file_id: 'meeting_summary:user_1:distractor',
+            filename: 'meeting-transcript-summary-distractor.txt',
+            metadata: {
+              meetingTranscriptKind: 'summary',
+              meetingTranscriptDisplayTitle: 'Synthetic product strategy offsite',
+              meetingTranscriptOriginalFilename: '2026-07-07_synthetic_strategy_offsite.txt',
+            },
+          },
+        ],
+      });
+
+      const [, artifact] = await fileSearchTool.func({
+        query: 'July 10 example program screening formal review and internal debrief',
+      });
+
+      expect(axios.post).toHaveBeenCalledWith(
+        'http://localhost:8000/query',
+        expect.objectContaining({ file_id: 'meeting_summary:user_1:target' }),
+        expect.any(Object),
+      );
+      expect(artifact.file_search.sources[0].fileId).toBe('meeting_summary:user_1:target');
+    });
+
     it('reranks current meeting transcript evidence above stale assistant recall disclaimers', async () => {
       generateShortLivedToken.mockReturnValue('mock-jwt-token');
       axios.post.mockImplementation((url, body) => {
@@ -1228,9 +1319,25 @@ describe('fileSearch.js - tuple return validation', () => {
       );
     });
 
-    it('uses source-backed recall before a slow recall vector query when source evidence matches', async () => {
+    it('fuses source-backed and vector recall when source evidence matches', async () => {
       generateShortLivedToken.mockReturnValue('mock-jwt-token');
-      axios.post.mockResolvedValue({ data: [] });
+      axios.post.mockImplementation((url, body) => {
+        if (body.file_id === 'conversation_recall:user_1:all') {
+          return Promise.resolve({
+            data: [
+              [
+                {
+                  page_content:
+                    '<turn role="assistant">The cousins visit was a warm family evening.</turn>',
+                  metadata: { source: '/path/to/conversation-recall.txt', page: 3 },
+                },
+                0.2,
+              ],
+            ],
+          });
+        }
+        return Promise.resolve({ data: [] });
+      });
       mockMessageFind.mockImplementation((filter) => {
         if (filter?.parentMessageId === 'source_user_turn') {
           return queryResult([]);
@@ -1259,12 +1366,95 @@ describe('fileSearch.js - tuple return validation', () => {
         query: 'Skyline deck restaurant Lina Sora',
       });
 
-      expect(axios.post.mock.calls.map(([, body]) => body.file_id)).toEqual(['manual-file-1']);
-      expect(artifact.file_search.sources[0].fileId).toBe('conversation_recall:user_1:all');
-      expect(artifact.file_search.sources[0].content).toContain('Canopy restaurant North Pier');
+      expect(axios.post.mock.calls.map(([, body]) => body.file_id)).toEqual(
+        expect.arrayContaining(['conversation_recall:user_1:all', 'manual-file-1']),
+      );
+      const recallContents = artifact.file_search.sources
+        .filter((source) => source.fileId === 'conversation_recall:user_1:all')
+        .map((source) => source.content);
+      expect(
+        recallContents.some((content) => content.includes('Canopy restaurant North Pier')),
+      ).toBe(true);
+      expect(recallContents.some((content) => content.includes('cousins visit'))).toBe(true);
     });
 
-    it('uses source-backed recall before recall vector even when transcript resources are attached', async () => {
+    it('keeps vector recall results when lexical Mongo retrieval fails', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      axios.post.mockResolvedValue({
+        data: [
+          [
+            {
+              page_content: '<turn role="user">Vector-only cousins evidence.</turn>',
+              metadata: { source: '/path/to/conversation-recall.txt', page: 1 },
+            },
+            0.1,
+          ],
+        ],
+      });
+      mockMessageFind.mockReturnValue({
+        select: jest.fn().mockReturnThis(),
+        sort: jest.fn().mockReturnThis(),
+        limit: jest.fn().mockReturnThis(),
+        lean: jest.fn().mockRejectedValue(new Error('synthetic mongo unavailable')),
+      });
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        conversationId: 'current_convo',
+        files: [
+          { file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' },
+        ],
+      });
+
+      const [, artifact] = await fileSearchTool.func({ query: 'remember cousins evidence' });
+
+      expect(artifact.file_search.sources).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            content: expect.stringContaining('Vector-only cousins evidence'),
+          }),
+        ]),
+      );
+    });
+
+    it('keeps lexical recall results when vector retrieval fails', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      axios.post.mockRejectedValue(new Error('synthetic rag unavailable'));
+      mockMessageFind.mockImplementation((filter) => {
+        if (filter?.parentMessageId === 'source_user_turn') {
+          return queryResult([]);
+        }
+        return queryResult([
+          {
+            messageId: 'source_user_turn',
+            conversationId: 'prior_convo',
+            createdAt: '2026-07-10T22:00:00.000Z',
+            isCreatedByUser: true,
+            text: 'Lexical-only cousins evidence from last night.',
+          },
+        ]);
+      });
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        conversationId: 'current_convo',
+        files: [
+          { file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' },
+        ],
+      });
+
+      const [, artifact] = await fileSearchTool.func({ query: 'remember cousins evidence' });
+
+      expect(artifact.file_search.sources).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            content: expect.stringContaining('Lexical-only cousins evidence'),
+          }),
+        ]),
+      );
+    });
+
+    it('keeps recall vector active when source-backed recall and transcript resources are attached', async () => {
       generateShortLivedToken.mockReturnValue('mock-jwt-token');
       axios.post.mockImplementation((url, body) => {
         if (url === 'http://localhost:8000/query_multiple') {
@@ -1314,7 +1504,10 @@ describe('fileSearch.js - tuple return validation', () => {
         query: 'Skyline deck restaurant Lina Sora',
       });
 
-      expect(axios.post.mock.calls.map(([url, body]) => [url, body.file_id || body.file_ids])).toEqual([
+      expect(
+        axios.post.mock.calls.map(([url, body]) => [url, body.file_id || body.file_ids]),
+      ).toEqual([
+        ['http://localhost:8000/query', 'conversation_recall:user_1:all'],
         ['http://localhost:8000/query_multiple', ['meeting_summary:user_1:coffee']],
       ]);
       const sourceBackedRecall = artifact.file_search.sources.find(
@@ -1771,8 +1964,15 @@ describe('fileSearch.js - tuple return validation', () => {
         'VIV-RAG-QA-20260409-1626-ONYX-FJ42',
       );
       expect(artifact.file_search.sources[0].content).toContain('conversation="source_convo"');
-      expect(artifact.file_search.sources).toHaveLength(1);
-      expect(axios.post).not.toHaveBeenCalled();
+      expect(artifact.file_search.sources).toHaveLength(3);
+      expect(artifact.file_search.sources.slice(1).some((source) => source.pages.length > 0)).toBe(
+        true,
+      );
+      expect(axios.post).toHaveBeenCalledWith(
+        'http://localhost:8000/query',
+        expect.objectContaining({ file_id: 'conversation_recall:user_1:all' }),
+        expect.any(Object),
+      );
     });
 
     it('rescues exact literal recall misses from source messages and excludes the active conversation', async () => {

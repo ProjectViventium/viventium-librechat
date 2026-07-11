@@ -101,8 +101,25 @@ const {
   hashString,
   logPromptFrame,
 } = require('~/server/services/viventium/promptFrameTelemetry');
+const { logFeelingsEvent } = require('~/server/services/viventium/feelingsTelemetry');
 
 const NO_PARENT_MESSAGE_ID = '00000000-0000-0000-0000-000000000000';
+
+/* === VIVENTIUM START ===
+ * Feature: Request-pinned feeling state for all background agents.
+ * Purpose: Keep the same decayed snapshot across every participant in one turn.
+ * === VIVENTIUM END === */
+function feelingTailForBackgroundAgent(snapshot) {
+  if (
+    !snapshot?.available ||
+    !snapshot?.enabled ||
+    snapshot?.agentScope !== 'all_agents' ||
+    !String(snapshot?.capsule || '').trim()
+  ) {
+    return '';
+  }
+  return String(snapshot.capsule).trim();
+}
 
 /* === VIVENTIUM NOTE ===
  * Feature: No Response Tag ({NTA}) prompt injection + suppression for background cortices.
@@ -1107,6 +1124,41 @@ function applyActivationJsonMode({ providerName, model, llmConfig }) {
   };
 }
 
+function applyGroqActivationModelDefaults({ providerName, model, llmConfig }) {
+  if (!llmConfig || typeof llmConfig !== 'object') {
+    return llmConfig;
+  }
+  if (
+    String(providerName || '')
+      .trim()
+      .toLowerCase() !== 'groq'
+  ) {
+    return llmConfig;
+  }
+
+  const normalizedModel = String(model || llmConfig.model || '')
+    .trim()
+    .toLowerCase();
+  const modelKwargs = {
+    ...(llmConfig.modelKwargs || {}),
+    seed: 0,
+  };
+
+  if (normalizedModel.startsWith('openai/gpt-oss-')) {
+    delete llmConfig.temperature;
+    modelKwargs.reasoning_effort = 'low';
+    modelKwargs.reasoning_format = 'hidden';
+  } else if (normalizedModel.startsWith('qwen/qwen3.6-')) {
+    modelKwargs.reasoning_effort = 'none';
+    modelKwargs.reasoning_format = 'hidden';
+  }
+
+  return {
+    ...llmConfig,
+    modelKwargs,
+  };
+}
+
 function normalizeDirectActionSurfaceScopes(surfaces) {
   if (!Array.isArray(surfaces) || surfaces.length === 0) {
     return [];
@@ -1182,7 +1234,14 @@ function buildActivationPolicySection({ config, mainAgent }) {
     return { section: '', connectedSurfaces: [] };
   }
 
-  const prompt = String(policy.prompt || '').trim();
+  // === VIVENTIUM START ===
+  // Rationale: source configs may carry promptRef objects before compiler preprocessing. Resolve
+  // them through the canonical prompt registry instead of rendering "[object Object]".
+  const prompt =
+    typeof policy.prompt === 'string'
+      ? policy.prompt.trim()
+      : resolvePromptRefText(policy.prompt, '');
+  // === VIVENTIUM END ===
   const toolNames = normalizeAgentToolNames(mainAgent);
   const toolSet = new Set(toolNames);
   const declaredSurfaces = Array.isArray(policy.direct_action_mcp_servers)
@@ -1620,6 +1679,11 @@ const RETRYABLE_ACTIVATION_ERROR_CODES = new Set([
   'ECONNRESET',
   'EAI_AGAIN',
   'ETIMEDOUT',
+  'JSON_VALIDATE_FAILED',
+  'MODEL_DECOMMISSIONED',
+  'MODEL_DEPRECATED',
+  'MODEL_NOT_FOUND',
+  'MODEL_UNAVAILABLE',
 ]);
 
 function resolveConfiguredProductivityActivationScopeKey(cortexConfig) {
@@ -2526,7 +2590,11 @@ async function buildActivationLlmConfig({ providerName, model, req }) {
     );
   }
 
-  return applyActivationJsonMode({ providerName, model, llmConfig });
+  return applyActivationJsonMode({
+    providerName,
+    model,
+    llmConfig: applyGroqActivationModelDefaults({ providerName, model, llmConfig }),
+  });
 }
 
 async function invokeActivationClassifierAttempt({
@@ -2633,7 +2701,7 @@ async function checkCortexActivation({
 
   const {
     prompt: activationPrompt,
-    model = 'meta-llama/llama-4-scout-17b-16e-instruct', // Default to Llama 4 Scout on Groq (750 tps, best speed/instruction-following)
+    model = 'qwen/qwen3.6-27b', // Evaluated Groq classifier default; thinking is disabled in buildActivationLlmConfig.
     provider = 'groq', // Default to Groq for cost-effectiveness
     fallbacks = [],
     confidence_threshold = 0.7,
@@ -2806,17 +2874,28 @@ ${activationFormat}`;
       let attemptAbortController = null;
       let attemptAbortTimer = null;
       try {
+        let attemptDeadlinePromise = null;
         if (attemptTimeoutMs > 0) {
           attemptAbortController = new AbortController();
-          attemptAbortTimer = setTimeout(() => {
-            try {
-              attemptAbortController.abort();
-            } catch (_) {
-              // Ignore abort races; the attempt timeout already records the failure path.
-            }
-          }, attemptTimeoutMs);
+          // === VIVENTIUM START ===
+          // Rationale: some provider clients do not settle their stream promise after abort. Race
+          // the request against our own deadline so one non-cooperative provider cannot consume
+          // the full Phase A budget and prevent configured fallbacks from running.
+          attemptDeadlinePromise = new Promise((_, reject) => {
+            attemptAbortTimer = setTimeout(() => {
+              try {
+                attemptAbortController.abort();
+              } catch (_) {
+                // Ignore abort races; the local deadline remains authoritative.
+              }
+              const timeoutError = new Error('activation classifier attempt timeout');
+              timeoutError.name = 'AbortError';
+              reject(timeoutError);
+            }, attemptTimeoutMs);
+          });
+          // === VIVENTIUM END ===
         }
-        const { responseText, parsed } = await invokeActivationClassifierAttempt({
+        const classifierAttemptPromise = invokeActivationClassifierAttempt({
           agentId: agent_id,
           providerName,
           model: attempt.model,
@@ -2825,6 +2904,9 @@ ${activationFormat}`;
           req,
           abortController: attemptAbortController,
         });
+        const { responseText, parsed } = await (attemptDeadlinePromise
+          ? Promise.race([classifierAttemptPromise, attemptDeadlinePromise])
+          : classifierAttemptPromise);
 
         if (shouldLogActivationPrompt()) {
           logger.info(
@@ -3033,9 +3115,20 @@ ${activationFormat}`;
  * @param {string} params.runId - Unique run ID
  * @param {object} [params.req] - Express request object (required for custom endpoints and tool loading)
  * @param {object} [params.res] - Express response object (for tool streaming if needed)
+ * @param {'full'|'minimal'} [params.contextMode='full'] - Minimal mode is for compact internal workers.
+ * @param {number|null} [params.executionTimeoutMs=null] - Optional bounded timeout override.
  * @returns {Promise<{ agentId: string, agentName: string, insight: string }>}
  */
-async function executeCortex({ agent, messages, runId, req, res, activationScope = null }) {
+async function executeCortexOnce({
+  agent,
+  messages,
+  runId,
+  req,
+  res,
+  activationScope = null,
+  contextMode = 'full',
+  executionTimeoutMs = null,
+}) {
   const startTime = Date.now();
   /** @type {AbortController | null} */
   let abortController = null;
@@ -3054,6 +3147,7 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
     safeReq.body = safeReq.body || {};
     safeReq.user = safeReq.user || {};
     safeReq.config = safeReq.config || (await getAppConfig({ role: safeReq.user?.role }));
+    const minimalContext = contextMode === 'minimal';
 
     const providerName = (agent.provider || '').toLowerCase();
     const agentForRun = {
@@ -3067,7 +3161,9 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
         intent_scope: activationScope,
       };
     }
-    const productivityScope = resolveProductivitySpecialistScope(agentForRun) || null;
+    const productivityScope = minimalContext
+      ? null
+      : resolveProductivitySpecialistScope(agentForRun) || null;
     const isolateProductivityContext = shouldIsolateProductivitySpecialistContext(agentForRun, {
       scope: productivityScope,
     });
@@ -3081,11 +3177,13 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
      * - When the latest user turn already contains Google Docs/Drive links, surface extracted file IDs
      *   so the specialist prefers direct retrieval instead of brittle search-by-ID guesses.
      */
-    const productivityRuntimeInstructions = buildProductivitySpecialistRuntimeInstructions({
-      agent: agentForRun,
-      latestUserText,
-      scope: productivityScope,
-    });
+    const productivityRuntimeInstructions = minimalContext
+      ? ''
+      : buildProductivitySpecialistRuntimeInstructions({
+          agent: agentForRun,
+          latestUserText,
+          scope: productivityScope,
+        });
     if (productivityRuntimeInstructions) {
       agentForRun.instructions = [agentForRun.instructions || '', productivityRuntimeInstructions]
         .filter((part) => typeof part === 'string' && part.trim().length > 0)
@@ -3097,7 +3195,7 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
      * Feature: Time context parity for background cortices
      * Purpose: Provide the same canonical local time context to cortices as the main agent.
      */
-    const timeContextInstructions = buildTimeContextInstructions(safeReq);
+    const timeContextInstructions = minimalContext ? '' : buildTimeContextInstructions(safeReq);
     if (timeContextInstructions) {
       agentForRun.instructions = [agentForRun.instructions || '', timeContextInstructions]
         .filter((part) => typeof part === 'string' && part.trim().length > 0)
@@ -3110,7 +3208,7 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
      * Purpose: If the request contains extracted text attachments (FileSources.text),
      *          inject the same file context that the main agent receives via BaseClient.
      */
-    const fileContextBlock = await getUserFileContextBlock(safeReq);
+    const fileContextBlock = minimalContext ? '' : await getUserFileContextBlock(safeReq);
     if (fileContextBlock) {
       agentForRun.instructions = [agentForRun.instructions || '', fileContextBlock]
         .filter((part) => typeof part === 'string' && part.trim().length > 0)
@@ -3124,9 +3222,11 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
      * Note: This mirrors the main agent behavior (AgentClient.buildMessages → useMemory()) but
      * does NOT run memory updates for cortex outputs (only reads existing memory for context).
      */
-    const memoryContextBlock = isolateProductivityContext
+    const memoryContextBlock = minimalContext
       ? ''
-      : await getUserMemoryContextBlock(safeReq);
+      : isolateProductivityContext
+        ? ''
+        : await getUserMemoryContextBlock(safeReq);
     if (memoryContextBlock) {
       agentForRun.instructions = [agentForRun.instructions || '', memoryContextBlock]
         .filter((part) => typeof part === 'string' && part.trim().length > 0)
@@ -3144,7 +3244,12 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
     const hasRequestFiles = Array.isArray(safeReq.body?.files) && safeReq.body.files.length > 0;
     const autoFileSearchEnabled =
       (process.env.VIVENTIUM_CORTEX_AUTO_FILE_SEARCH || '1').trim() !== '0';
-    if (autoFileSearchEnabled && hasRequestFiles && Array.isArray(agentForRun.tools)) {
+    if (
+      !minimalContext &&
+      autoFileSearchEnabled &&
+      hasRequestFiles &&
+      Array.isArray(agentForRun.tools)
+    ) {
       if (!agentForRun.tools.includes(Tools.file_search)) {
         agentForRun.tools.push(Tools.file_search);
       }
@@ -3157,7 +3262,9 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
     const surface = resolveViventiumSurface(safeReq);
     const inputMode = (safeReq.body?.viventiumInputMode || '').toString().toLowerCase();
     const voiceMode = safeReq.body?.voiceMode === true;
-    const cortexOutputRules = buildCortexOutputInstructions({ voiceMode, surface, inputMode });
+    const cortexOutputRules = minimalContext
+      ? ''
+      : buildCortexOutputInstructions({ voiceMode, surface, inputMode });
     if (cortexOutputRules) {
       agentForRun.instructions = [agentForRun.instructions || '', cortexOutputRules]
         .filter((part) => typeof part === 'string' && part.trim().length > 0)
@@ -3172,7 +3279,7 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
      * - Give background cortices a consistent, global instruction block so they can respond with
      *   `{NTA}` when they intentionally have nothing to add.
      */
-    const noResponseInstructions = buildNoResponseInstructions(safeReq);
+    const noResponseInstructions = minimalContext ? '' : buildNoResponseInstructions(safeReq);
     if (noResponseInstructions) {
       agentForRun.instructions = [agentForRun.instructions || '', noResponseInstructions]
         .filter((part) => typeof part === 'string' && part.trim().length > 0)
@@ -3241,15 +3348,18 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
     };
 
     abortController = new AbortController();
-    const executionTimeoutMs = getCortexExecutionTimeoutMs();
-    if (executionTimeoutMs > 0) {
+    const effectiveExecutionTimeoutMs =
+      Number.isFinite(executionTimeoutMs) && executionTimeoutMs > 0
+        ? Math.floor(executionTimeoutMs)
+        : getCortexExecutionTimeoutMs();
+    if (effectiveExecutionTimeoutMs > 0) {
       abortTimer = setTimeout(() => {
         try {
           abortController?.abort();
         } catch (_e) {
           // Ignore abort errors; we just need the run to unwind.
         }
-      }, executionTimeoutMs);
+      }, effectiveExecutionTimeoutMs);
     }
     const loadTools = createToolLoader(abortController.signal, streamId);
     const allowedProviders = new Set(
@@ -3282,6 +3392,18 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
         getLatestRecallEligibleMessageCreatedAt: db.getLatestRecallEligibleMessageCreatedAt,
       },
     );
+
+    const backgroundFeelingTail = feelingTailForBackgroundAgent(safeReq._viventiumFeelingSnapshot);
+    if (backgroundFeelingTail) {
+      initializedAgent.instructions = [initializedAgent.instructions || '', backgroundFeelingTail]
+        .filter((part) => typeof part === 'string' && part.trim().length > 0)
+        .join('\n\n');
+    }
+    logFeelingsEvent(logger, safeReq, 'feelings.inject.background', {
+      injected: Boolean(backgroundFeelingTail),
+      snapshotHash: safeReq._viventiumFeelingSnapshot?.snapshotHash || null,
+      agentIdHash: hashString(initializedAgent.id || agentForRun.id, 12),
+    });
 
     /* === VIVENTIUM START ===
      * Feature: Post-hydration Anthropic temperature stripping for background cortices.
@@ -3430,6 +3552,7 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
           memory_context: memoryContextBlock || '',
           cortex_output_rules: cortexOutputRules || '',
           no_response_instructions: noResponseInstructions || '',
+          viventium_feeling_state: backgroundFeelingTail,
           formatted_input_messages: providerSafeInputMessages,
         },
         promptSourceFiles: {
@@ -3441,6 +3564,8 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
           productivity_context_isolated: isolateProductivityContext,
           has_request_files: hasRequestFiles,
           no_response_injected: !!noResponseInstructions,
+          feeling_state_injected: !!backgroundFeelingTail,
+          minimal_context: minimalContext,
           tool_count: configuredToolCount,
         },
         decisionState: {
@@ -3499,6 +3624,10 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
           parentMessageId: safeReq.body.parentMessageId,
         },
         user: safeReq.user,
+        glasshive_worker_feelings: backgroundFeelingTail,
+        glasshive_worker_feelings_hash: backgroundFeelingTail
+          ? safeReq._viventiumFeelingSnapshot?.snapshotHash || ''
+          : '',
       },
       recursionLimit: initializedAgent.recursion_limit || 25,
       signal: abortController.signal,
@@ -3655,6 +3784,64 @@ async function executeCortex({ agent, messages, runId, req, res, activationScope
       clearTimeout(abortTimer);
     }
   }
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Shared direct-cortex fallback execution.
+ * Purpose: Direct callers, including the detached Emotional Reaction Cortex, must use the same
+ * declared provider/model recovery route as batched activated cortices.
+ * === VIVENTIUM END === */
+async function executeCortex(params) {
+  const primaryAgent = params?.agent;
+  const primaryResult = await executeCortexOnce(params);
+  if (
+    !resolveFallbackAssignment(primaryAgent) ||
+    !shouldRetryBackgroundCortexWithFallback(primaryResult)
+  ) {
+    return primaryResult;
+  }
+
+  const fallbackAgent = await resolveBackgroundCortexFallbackAgent({
+    cortexAgent: primaryAgent,
+    req: params?.req,
+  });
+  if (!fallbackAgent) {
+    return primaryResult;
+  }
+
+  const primaryProvider = primaryAgent?.provider || 'unknown';
+  const primaryModel = primaryAgent?.model || primaryAgent?.model_parameters?.model || 'unknown';
+  const fallbackProvider = fallbackAgent.provider || 'unknown';
+  const fallbackModel = fallbackAgent.model || fallbackAgent.model_parameters?.model || 'unknown';
+  const fallbackServiceTier =
+    fallbackAgent.model_parameters?.service_tier ||
+    fallbackAgent.model_parameters?.serviceTier ||
+    null;
+  const publicPrimaryError = publicCortexError(
+    primaryResult?.error || 'unknown',
+    primaryResult?.errorClass || primaryResult?.error_class,
+  );
+  logger.warn(
+    `[BackgroundCortexService] Direct cortex ${primaryAgent?.id || 'unknown'} primary ` +
+      `${primaryProvider}/${primaryModel} failed before insight (${publicPrimaryError.errorClass}); ` +
+      `retrying fallback ${fallbackProvider}/${fallbackModel}`,
+  );
+
+  const fallbackResult = await executeCortexOnce({
+    ...params,
+    agent: fallbackAgent,
+  });
+  return {
+    ...fallbackResult,
+    fallbackUsed: true,
+    fallbackProvider,
+    fallbackModel,
+    fallbackServiceTier,
+    primaryProvider,
+    primaryModel,
+    primaryError: publicPrimaryError.message,
+    primaryErrorClass: publicPrimaryError.errorClass,
+  };
 }
 
 /**
@@ -4362,12 +4549,20 @@ async function executeActivated({
           completedToolCalls: 0,
         };
       }
-      if (fallbackAgent && shouldRetryBackgroundCortexWithFallback(result)) {
+      if (
+        fallbackAgent &&
+        result?.fallbackUsed !== true &&
+        shouldRetryBackgroundCortexWithFallback(result)
+      ) {
         const primaryProvider = cortexAgent.provider || 'unknown';
         const primaryModel = cortexAgent.model || cortexAgent.model_parameters?.model || 'unknown';
         const fallbackProvider = fallbackAgent.provider || 'unknown';
         const fallbackModel =
           fallbackAgent.model || fallbackAgent.model_parameters?.model || 'unknown';
+        const fallbackServiceTier =
+          fallbackAgent.model_parameters?.service_tier ||
+          fallbackAgent.model_parameters?.serviceTier ||
+          null;
         const primaryError = result?.error || 'unknown';
         const publicPrimaryError = publicCortexError(
           primaryError,
@@ -4384,6 +4579,7 @@ async function executeActivated({
           fallbackUsed: true,
           fallbackProvider,
           fallbackModel,
+          fallbackServiceTier,
           primaryProvider,
           primaryModel,
           primaryError: publicPrimaryError.message,
@@ -4903,11 +5099,13 @@ module.exports = {
   shouldAttemptSuppressedActivationProvider,
   shouldProbeSuppressedActivationAttempt,
   activationProviderAttemptsUnavailable,
+  isActivationFallbackCandidate,
   activationFailureVisibility,
   shouldSurfaceActivationProviderUnavailable,
   shouldSurfaceActivationTimeout,
   deriveCortexDisplayNameFromAgentId,
   configuredCortexDisplayName,
+  feelingTailForBackgroundAgent,
   ACTIVATION_SYSTEM_PROMPT,
   DEFAULT_ACTIVATION_DECISION_SUBJECT_RULE,
   // Exported for unit testing only

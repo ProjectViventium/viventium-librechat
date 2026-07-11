@@ -12,6 +12,12 @@ import request from './request';
 import * as s from './schemas';
 import * as r from './roles';
 import * as permissions from './accessPermissions';
+import type {
+  FeelingBandId,
+  FeelingsResponse,
+  UpdateFeelingBand,
+  UpdateFeelingsProfile,
+} from './types/feelings';
 
 export function revokeUserKey(name: string): Promise<unknown> {
   return request.delete(endpoints.revokeUserKey(name));
@@ -1034,6 +1040,34 @@ export const createMemory = (data: {
 }): Promise<{ created: boolean; memory: q.TUserMemory }> => {
   return request.post(endpoints.memories(), data);
 };
+
+/* === VIVENTIUM START === Feelings instrument === */
+export const getFeelings = (): Promise<FeelingsResponse> => {
+  return request.get(endpoints.feelings());
+};
+
+export const updateFeelingsProfile = (data: UpdateFeelingsProfile): Promise<FeelingsResponse> => {
+  return request.patch(endpoints.feelingsProfile(), data);
+};
+
+export const updateFeelingBand = ({
+  bandId,
+  data,
+}: {
+  bandId: FeelingBandId;
+  data: UpdateFeelingBand;
+}): Promise<FeelingsResponse> => {
+  return request.patch(endpoints.feelingBand(bandId), data);
+};
+
+export const resetFeelings = (expectedVersion: number): Promise<FeelingsResponse> => {
+  return request.post(endpoints.resetFeelings(), { expectedVersion });
+};
+
+export const deleteFeelings = (expectedVersion: number): Promise<{ deleted: boolean }> => {
+  return request.deleteWithOptions(endpoints.feelings(), { data: { expectedVersion } });
+};
+/* === VIVENTIUM END === */
 
 export function searchPrincipals(
   params: q.PrincipalSearchParams,

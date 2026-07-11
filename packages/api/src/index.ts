@@ -27,6 +27,9 @@ export * from './flow/manager';
 export * from './middleware';
 /* Memory */
 export * from './memory';
+/* === VIVENTIUM START === Feelings / Emotional Cortex === */
+export * from './feelings';
+/* === VIVENTIUM END === */
 /* Agents */
 export * from './agents';
 /* Prompts */

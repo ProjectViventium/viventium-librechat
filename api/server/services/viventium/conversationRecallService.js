@@ -576,6 +576,8 @@ async function buildConversationRecallCorpus({ userId, agentId }) {
     ...(INCLUDE_ASSISTANT_MESSAGES ? {} : { isCreatedByUser: true }),
     'metadata.viventium.type': { $ne: 'listen_only_transcript' },
     'metadata.viventium.mode': { $ne: 'listen_only' },
+    'metadata.viventium.memoryEligible': { $ne: false },
+    'metadata.viventium.qaRun': { $ne: true },
     unfinished: { $ne: true },
     error: { $ne: true },
     $or: [{ expiredAt: { $exists: false } }, { expiredAt: null }],
@@ -762,6 +764,23 @@ async function upsertRecallFile({ userId, scope, agentId, corpus }) {
         embedded: existing.embedded !== false,
       },
     );
+    /* === VIVENTIUM START ===
+     * Integrity: make the vector replacement state truthful before uploading.
+     * If the upload fails after the delete, the next refresh must rebuild instead of trusting
+     * a stale uploaded digest whose vectors no longer exist.
+     * === VIVENTIUM END === */
+    await File.findOneAndUpdate(
+      { user: userId, file_id },
+      {
+        $set: { embedded: false },
+        $unset: {
+          'metadata.conversationRecallUploadedDigest': '',
+          'metadata.conversationRecallDigest': '',
+        },
+      },
+      { new: true },
+    ).lean();
+    lastUploadedCorpusDigestByFileId.delete(file_id);
   }
 
   let uploadCorpus = corpus;

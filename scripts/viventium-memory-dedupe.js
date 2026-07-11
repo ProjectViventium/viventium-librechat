@@ -180,7 +180,9 @@ async function run(options) {
     throw new Error('--create-indexes requires --apply.');
   }
 
-  await mongoose.connect(options.mongoUri);
+  // Do not let Mongoose race this explicit migration by creating the new
+  // unique indexes before duplicate rows have been inspected.
+  await mongoose.connect(options.mongoUri, { autoIndex: false });
   createModels(mongoose);
   const db = mongoose.connection.db;
 

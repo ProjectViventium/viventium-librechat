@@ -5,9 +5,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
-from scheduling_cortex.server import SCHEDULING_CORTEX_INSTRUCTIONS, build_server
+from scheduling_cortex.server import (
+    SCHEDULING_CORTEX_INSTRUCTIONS,
+    _serialize_periphery_list_for_agent,
+    _serialize_periphery_read_for_agent,
+    build_server,
+)
 from scheduling_cortex.storage import ScheduleStorage, StorageConfig
 
 
@@ -38,6 +44,8 @@ def test_server_instructions_cover_prompt_ownership_contract() -> None:
         "morning_briefing_default_v1",
         "do not branch on prompt text",
         "structured fields",
+        "private periphery",
+        "do not inspect periphery by default",
     ]
 
     for phrase in expected:
@@ -79,6 +87,8 @@ def test_tool_descriptions_cover_mcp_checklist(tmp_path: Path) -> None:
         "schedule_update",
         "schedule_delete",
         "schedule_preview_next",
+        "periphery_list",
+        "periphery_read",
     }.issubset(tools.keys())
 
     checklist = [
@@ -121,3 +131,150 @@ def test_full_detail_read_description_keeps_raw_fields_private(tmp_path: Path) -
     assert "ordinary user-facing replies must translate" in description
     assert "avoid raw prompt text" in description
     assert "metadata keys" in description
+
+
+def test_periphery_list_is_compact_and_hides_storage_details() -> None:
+    raw = {
+        "index": {
+            "artifactCount": 9,
+            "invalidArtifactCount": 1,
+            "qualityCounts": {"passed": 2, "legacy": 7},
+        },
+        "artifacts": [
+            {
+                "artifactId": "artifact-current",
+                "moduleId": "risk_radar",
+                "generatedAt": "2026-07-11T07:00:00Z",
+                "confidence": "medium",
+                "severity": "high",
+                "timeSensitivity": "high",
+                "stale": False,
+                "qualityStatus": "passed",
+                "sourceRefCount": 3,
+                "sourceRefsResolvedCount": 3,
+                "sourceRefsUnresolvedCount": 0,
+                "claimsGroundedCount": 7,
+                "claimsUngroundedCount": 0,
+                "relativePath": "risk_radar/2026/07/private.json",
+                "scheduledRunRefHash": "private-run-hash",
+            },
+            {
+                "artifactId": "artifact-history",
+                "moduleId": "risk_radar",
+                "generatedAt": "2026-06-11T07:00:00Z",
+                "stale": True,
+                "qualityStatus": "legacy",
+                "relativePath": "risk_radar/2026/06/private.json",
+            },
+            {
+                "artifactId": "artifact-current-older",
+                "moduleId": "risk_radar",
+                "generatedAt": "2026-07-10T07:00:00Z",
+                "stale": False,
+                "qualityStatus": "passed",
+            },
+            {
+                "artifactId": "artifact-health-current",
+                "moduleId": "health_pressure",
+                "generatedAt": "2026-07-11T06:00:00Z",
+                "stale": False,
+                "qualityStatus": "passed",
+            },
+        ],
+        "invalidArtifacts": [{"relativePath": "private-invalid.json", "reason": "invalid_json"}],
+    }
+
+    result = _serialize_periphery_list_for_agent(raw)
+    encoded = json.dumps(result)
+
+    assert result["currentInsights"][0]["insightRef"] == "artifact-current"
+    assert result["currentInsights"][1]["insightRef"] == "artifact-health-current"
+    assert len(result["currentInsights"]) == 2
+    assert result["historicalInsights"][0]["insightRef"] == "artifact-history"
+    assert result["totals"] == {
+        "insights": 9,
+        "invalid": 1,
+        "quality": {"passed": 2, "legacy": 7},
+    }
+    assert "relativePath" not in encoded
+    assert "scheduledRunRef" not in encoded
+    assert "private-run-hash" not in encoded
+    assert "private-invalid.json" not in encoded
+    assert "artifact-current-older" not in encoded
+
+
+def test_periphery_read_keeps_evidence_but_hides_internal_references() -> None:
+    raw = {
+        "artifact": {
+            "artifactId": "artifact-current",
+            "relativePath": "risk_radar/2026/07/private.json",
+            "stale": False,
+            "qualityStatus": "passed",
+            "sourceRefCount": 2,
+            "sourceRefsResolvedCount": 2,
+            "sourceRefsUnresolvedCount": 0,
+            "claimsGroundedCount": 2,
+            "claimsUngroundedCount": 0,
+            "qualityReasons": [],
+            "snapshotRefHash": "private-snapshot-hash",
+            "scheduledRunRefHash": "private-run-hash",
+        },
+        "sidecar": {
+            "schemaVersion": 2,
+            "moduleId": "risk_radar",
+            "generatedAt": "2026-07-11T07:00:00Z",
+            "snapshotRef": "snapshot:private",
+            "scheduledRunRef": {"runId": "private-run-id"},
+            "sourceRefs": ["message:private-one", "schedule:private-two"],
+            "confidence": "medium",
+            "severity": "high",
+            "timeSensitivity": "high",
+            "staleAfter": "2026-07-13T07:00:00Z",
+            "observations": [
+                {
+                    "kind": "observation",
+                    "text": "A recent action remains unverified.",
+                    "sourceRefs": ["message:private-one"],
+                }
+            ],
+            "risks": [
+                {
+                    "kind": "inference",
+                    "text": "Delay may compound.",
+                    "sourceRefs": ["message:private-one", "schedule:private-two"],
+                }
+            ],
+            "blindSpots": [],
+            "opportunityCosts": [],
+            "opportunities": [],
+            "whatWouldMakeThisWrong": [],
+            "whenToSurface": [],
+            "proposedActions": [],
+            "memoryProposalRefs": [],
+        },
+        "markdown": "# Private duplicate body",
+    }
+
+    result = _serialize_periphery_read_for_agent(raw)
+    encoded = json.dumps(result)
+
+    assert result["insight"]["observations"] == [
+        {
+            "kind": "observation",
+            "text": "A recent action remains unverified.",
+            "evidenceCount": 1,
+        }
+    ]
+    assert result["insight"]["risks"][0]["evidenceCount"] == 2
+    assert result["insight"]["evidenceQuality"]["resolvedEvidence"] == 2
+    assert result["insight"]["qualityReasons"] == []
+    for forbidden in (
+        "relativePath",
+        "snapshotRef",
+        "scheduledRunRef",
+        "message:private-one",
+        "schedule:private-two",
+        "private-run-id",
+        "Private duplicate body",
+    ):
+        assert forbidden not in encoded

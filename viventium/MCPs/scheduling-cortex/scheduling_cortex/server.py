@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,8 @@ from .models import (
     SearchScheduleArgs,
     PreviewScheduleArgs,
     LastDeliveryArgs,
+    PeripheryListArgs,
+    PeripheryReadArgs,
     ScheduleTask,
 )
 from .scheduler import SchedulerEngine, compute_next_run, compute_next_runs
@@ -47,6 +50,29 @@ HEADER_AGENT_ID = "x-viventium-agent-id"
 
 logger = logging.getLogger(__name__)
 
+
+def _default_scheduling_db_path() -> str:
+    configured_root = str(os.getenv("VIVENTIUM_APP_SUPPORT_DIR") or "").strip()
+    if configured_root:
+        app_support_root = Path(configured_root).expanduser()
+    elif sys.platform == "darwin":
+        app_support_root = Path.home() / "Library" / "Application Support" / "Viventium"
+    elif sys.platform == "win32":
+        local_app_data = str(os.getenv("LOCALAPPDATA") or "").strip()
+        app_support_root = (
+            Path(local_app_data) / "Viventium"
+            if local_app_data
+            else Path.home() / "AppData" / "Local" / "Viventium"
+        )
+    else:
+        xdg_data_home = str(os.getenv("XDG_DATA_HOME") or "").strip()
+        app_support_root = (
+            Path(xdg_data_home) / "Viventium"
+            if xdg_data_home
+            else Path.home() / ".local" / "share" / "Viventium"
+        )
+    return str(app_support_root / "state" / "scheduling" / "schedules.db")
+
 # === VIVENTIUM START ===
 # Feature: Model-owned Scheduling Cortex instruction surface.
 # Purpose:
@@ -56,27 +82,39 @@ SCHEDULING_CORTEX_INSTRUCTIONS = """
 Scheduling Cortex owns reminders, recurring jobs, and schedule management for Viventium.
 
 What it does:
+
 - Create, update, delete, list, search, inspect, and preview schedules.
 - Run schedules later through the configured Viventium agent and channels.
 - Track last delivery state, including sent, suppressed, failed, and generated text summaries.
 
 When to use:
+
 - The user asks to remind, follow up later, check back, keep watching, run a recurring task, or change an existing schedule.
 - The user asks what reminders/jobs exist, when one will run, or what happened on the last run.
 - A starter morning briefing exists and should be changed. Its stable template_id is
   morning_briefing_default_v1.
 
+Private periphery:
+
+- Viventium may have private nightly risk, blind-spot, opportunity-cost, and opportunity artifacts.
+- Use periphery_list, then periphery_read, when the user asks what Viventium noticed or when a deep planning/review task genuinely needs that evidence.
+- Do not inspect periphery by default, do not imply an artifact exists before listing it, and treat stale or failed-quality artifacts as historical hypotheses rather than current facts.
+- Periphery tools return a compact agent view; storage paths, raw record references, run identifiers, and duplicate bodies stay behind the tool boundary.
+
 When not to use:
+
 - Do not use for immediate live work that should happen now.
 - Do not create duplicate schedules when an existing task can be found and updated.
 - Do not branch on prompt text, schedule name, user identity, or template wording; use declared structured fields, internal task references, filters, and tool evidence.
 
 Inputs and identity:
+
 - user_id and agent_id are injected from request headers when omitted.
 - Use the user's timezone in schedule payloads when known; otherwise state uncertainty and use an explicit timezone.
 - Channels are "telegram", "librechat", or both.
 
 Output and delivery:
+
 - Tools return structured task or summary objects.
 - list/search are summary-safe: they return user-facing schedule state plus an internal task reference for follow-up tool calls. They must not return raw prompt text, metadata, user IDs, agent IDs, conversation policy, creator/updater fields, or delivery payloads.
 - Use schedule_get or schedule_last_delivery only when full private verification or diagnostics are needed.
@@ -86,6 +124,7 @@ Output and delivery:
 - When a full-detail read shows internal prompt text or metadata solely to verify state, use it as private evidence. The user-facing answer should say what is already configured or what changed, without quoting stored prompt text or naming storage fields.
 
 Duplicate prevention and idempotency:
+
 - For starter morning briefing, use the summary's starter_morning_briefing flag, template_id
   morning_briefing_default_v1, or a private full-detail read to identify the existing task, then
   update that internal task reference; do not create another starter task.
@@ -115,6 +154,140 @@ def _tool_description(
         f"Delayed callback behavior: {delayed_callback}"
     )
 # === VIVENTIUM END ===
+
+
+_PERIPHERY_CLAIM_FIELDS = (
+    "observations",
+    "risks",
+    "blindSpots",
+    "opportunityCosts",
+    "opportunities",
+    "whatWouldMakeThisWrong",
+    "whenToSurface",
+    "proposedActions",
+)
+
+
+def _periphery_insight_summary(artifact: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "insightRef": artifact.get("artifactId"),
+        "module": artifact.get("moduleId"),
+        "generatedAt": artifact.get("generatedAt"),
+        "confidence": artifact.get("confidence"),
+        "severity": artifact.get("severity"),
+        "timeSensitivity": artifact.get("timeSensitivity"),
+        "stale": bool(artifact.get("stale")),
+        "quality": artifact.get("qualityStatus"),
+        "qualityReasons": artifact.get("qualityReasons") or [],
+        "evidenceQuality": {
+            "declaredEvidence": artifact.get("sourceRefCount", 0),
+            "resolvedEvidence": artifact.get("sourceRefsResolvedCount", 0),
+            "unresolvedEvidence": artifact.get("sourceRefsUnresolvedCount", 0),
+            "groundedClaims": artifact.get("claimsGroundedCount", 0),
+            "ungroundedClaims": artifact.get("claimsUngroundedCount", 0),
+        },
+    }
+
+
+def _serialize_periphery_list_for_agent(payload: Dict[str, Any]) -> Dict[str, Any]:
+    artifacts = [item for item in payload.get("artifacts", []) if isinstance(item, dict)]
+
+    def latest_per_module(*, current_only: bool, limit: int) -> list[Dict[str, Any]]:
+        selected: list[Dict[str, Any]] = []
+        seen_modules: set[str] = set()
+        for item in artifacts:
+            is_current = item.get("qualityStatus") == "passed" and not item.get("stale")
+            if is_current != current_only:
+                continue
+            module = str(item.get("moduleId") or item.get("artifactId") or "unknown")
+            if module in seen_modules:
+                continue
+            seen_modules.add(module)
+            selected.append(_periphery_insight_summary(item))
+            if len(selected) >= limit:
+                break
+        return selected
+
+    current = latest_per_module(current_only=True, limit=5)
+    historical = latest_per_module(current_only=False, limit=3)
+    index = payload.get("index") if isinstance(payload.get("index"), dict) else {}
+    return {
+        "currentInsights": current,
+        "historicalInsights": historical,
+        "totals": {
+            "insights": index.get("artifactCount", len(artifacts)),
+            "invalid": index.get("invalidArtifactCount", 0),
+            "quality": index.get("qualityCounts", {}),
+        },
+        "usage": (
+            "Prefer the newest current insight. Read historical insight only when explicitly useful, "
+            "and describe stale or legacy material as historical uncertainty."
+        ),
+    }
+
+
+def _periphery_claim_for_agent(item: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(item, str):
+        text = item.strip()
+        return {"text": text, "evidenceCount": 0} if text else None
+    if not isinstance(item, dict):
+        return None
+    text = str(
+        item.get("text")
+        or item.get("summary")
+        or item.get("claim")
+        or item.get("description")
+        or ""
+    ).strip()
+    if not text:
+        return None
+    source_refs = item.get("sourceRefs")
+    result: Dict[str, Any] = {
+        "text": text,
+        "evidenceCount": len(source_refs) if isinstance(source_refs, list) else 0,
+    }
+    kind = str(item.get("kind") or "").strip()
+    if kind:
+        result = {"kind": kind, **result}
+    return result
+
+
+def _serialize_periphery_read_for_agent(payload: Dict[str, Any]) -> Dict[str, Any]:
+    artifact = payload.get("artifact") if isinstance(payload.get("artifact"), dict) else {}
+    sidecar = payload.get("sidecar") if isinstance(payload.get("sidecar"), dict) else {}
+    insight: Dict[str, Any] = {
+        "module": sidecar.get("moduleId") or artifact.get("moduleId"),
+        "generatedAt": sidecar.get("generatedAt") or artifact.get("generatedAt"),
+        "confidence": sidecar.get("confidence") or artifact.get("confidence"),
+        "severity": sidecar.get("severity") or artifact.get("severity"),
+        "timeSensitivity": sidecar.get("timeSensitivity") or artifact.get("timeSensitivity"),
+        "staleAfter": sidecar.get("staleAfter") or artifact.get("staleAfter"),
+        "stale": bool(artifact.get("stale")),
+        "quality": artifact.get("qualityStatus"),
+        "qualityReasons": artifact.get("qualityReasons") or [],
+        "evidenceQuality": {
+            "declaredEvidence": artifact.get("sourceRefCount", len(sidecar.get("sourceRefs") or [])),
+            "resolvedEvidence": artifact.get("sourceRefsResolvedCount", 0),
+            "unresolvedEvidence": artifact.get("sourceRefsUnresolvedCount", 0),
+            "groundedClaims": artifact.get("claimsGroundedCount", 0),
+            "ungroundedClaims": artifact.get("claimsUngroundedCount", 0),
+        },
+        "memoryProposalCount": len(sidecar.get("memoryProposalRefs") or []),
+    }
+    for field in _PERIPHERY_CLAIM_FIELDS:
+        claims = sidecar.get(field) if isinstance(sidecar.get(field), list) else []
+        insight[field] = [
+            serialized
+            for serialized in (_periphery_claim_for_agent(item) for item in claims[:12])
+            if serialized
+        ]
+    return {
+        "insight": insight,
+        "usage": (
+            "Use observations as evidence and label inferences or hypotheses honestly. "
+            "Caveat stale, legacy, unresolved, or ungrounded material. Do not expose tool plumbing."
+        ),
+    }
 
 
 def _normalize_headers(raw_headers: object) -> Dict[str, str]:
@@ -189,6 +362,37 @@ def _resolve_actor_id(explicit_actor: Optional[str], agent_id: str) -> str:
     if not agent_id:
         raise ValueError("agent_id is required to derive actor id")
     return f"agent:{agent_id}"
+
+
+def _import_workbench_scheduled_prompts() -> Any:
+    current = Path(__file__).resolve()
+    for parent in current.parents:
+        backend_root = parent / "viventium_v0_4" / "prompt-workbench" / "backend"
+        if not backend_root.is_dir():
+            continue
+        if str(parent) not in sys.path:
+            sys.path.insert(0, str(parent))
+        if str(backend_root) not in sys.path:
+            sys.path.insert(0, str(backend_root))
+        from prompt_workbench import scheduled_prompts as workbench_scheduled_prompts
+
+        return workbench_scheduled_prompts
+    raise RuntimeError("Prompt Workbench periphery reader is unavailable")
+
+
+def _refresh_workbench_periphery_index(run: Dict[str, Any]) -> None:
+    definition_id = str(run.get("definition_id") or "").strip()
+    user_id = str(run.get("user_id") or "").strip()
+    if not definition_id or not user_id:
+        return
+    try:
+        reader = _import_workbench_scheduled_prompts()
+        reader.list_periphery_artifacts(definition_id, user_id=user_id)
+    except Exception as exc:
+        logger.warning(
+            "[scheduling-cortex] Periphery index refresh failed after scheduled run",
+            extra={"run_id": str(run.get("run_id") or ""), "error_class": exc.__class__.__name__},
+        )
 
 
 # === VIVENTIUM NOTE ===
@@ -498,7 +702,14 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
         elif event in {"run.failed", "run.cancelled", "run.interrupted"}:
             status = "failed"
             completed_at = now
-            error_class = event.replace("run.", "")
+            callback_failure_class = str(
+                payload.get("failure_class") or payload.get("failure_code") or ""
+            ).strip()
+            error_class = (
+                callback_failure_class
+                if re.fullmatch(r"[a-z0-9_.:-]{1,128}", callback_failure_class)
+                else event.replace("run.", "")
+            )
         elif event == "run.queued":
             current_status = str(run.get("status") or "queued")
             status = current_status if current_status in {"running", "completed", "failed"} else "queued"
@@ -534,6 +745,15 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             "message_hash": _hash_payload_text(payload),
             "has_private_payload": bool(payload.get("message") or payload.get("full_message") or payload.get("error")),
             "memory_apply_reason": memory_apply.get("reason") if isinstance(memory_apply, dict) else None,
+            "effort_projection": {
+                "requested": str((payload.get("effort_projection") or {}).get("requested") or "")[:32],
+                "effective": str((payload.get("effort_projection") or {}).get("effective") or "")[:32],
+                "fallback_reason": str(
+                    (payload.get("effort_projection") or {}).get("fallback_reason") or ""
+                )[:64],
+            }
+            if isinstance(payload.get("effort_projection"), dict)
+            else None,
         }
 
         storage.update_scheduled_prompt_run(
@@ -555,6 +775,8 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             payload=payload,
             received_at=now,
         )
+        if event == "run.completed":
+            _refresh_workbench_periphery_index(run)
         return JSONResponse({"status": "ok", "run_id": run["run_id"]})
     # === VIVENTIUM END ===
 
@@ -655,6 +877,45 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
 
     def _now_iso() -> str:
         return to_utc_iso(datetime.now(timezone.utc))
+
+    @mcp.tool(
+        description=_tool_description(
+            what="List metadata for this user's validated private periphery modules and artifacts without loading their bodies.",
+            use_when="The user asks what Viventium noticed overnight, asks for risks or blind spots, or a deep planning/review task may benefit from optional nightly evidence.",
+            avoid_when="Ordinary conversation does not need periphery evidence, or the user has not asked for reflective/risk/opportunity review.",
+            inputs="Optional user_id; it is auto-injected from the authenticated request when omitted.",
+            returns="A bounded current/historical insight index with opaque references, freshness, quality, and evidence counts; no insight body or storage metadata.",
+            failure_modes="Missing identity, Workbench reader unavailable, or no artifacts; an empty list is a valid result and must not be described as hidden insight.",
+            idempotency="Read-only; list before read and do not create, modify, or duplicate artifacts.",
+            delayed_callback="No delayed callback; this reads the current private index.",
+        )
+    )
+    def periphery_list(args: PeripheryListArgs) -> Dict[str, Any]:
+        user_id = _resolve_user_id(args.user_id)
+        reader = _import_workbench_scheduled_prompts()
+        return _serialize_periphery_list_for_agent(reader.list_user_periphery(user_id=user_id))
+
+    @mcp.tool(
+        description=_tool_description(
+            what="Read one private periphery insight selected from periphery_list through a compact evidence and uncertainty view.",
+            use_when="A listed artifact is relevant to the user's explicit blind-spot, risk, opportunity-cost, opportunity, or deep-review request.",
+            avoid_when="No prior list result exists, the artifact is irrelevant, or ordinary chat does not need private nightly evidence.",
+            inputs="The opaque artifact_id from periphery_list and optional user_id; user_id is auto-injected when omitted.",
+            returns="A compact evidence view with claim text, uncertainty, freshness, and grounding counts; storage paths, run references, source-record ids, and duplicate markdown remain private.",
+            failure_modes="Missing identity, unknown/foreign artifact, invalid sidecar, missing markdown, or unavailable Workbench reader.",
+            idempotency="Read-only; use the exact artifact reference returned by periphery_list and do not guess paths or ids.",
+            delayed_callback="No delayed callback; this reads one current private artifact.",
+        )
+    )
+    def periphery_read(args: PeripheryReadArgs) -> Dict[str, Any]:
+        user_id = _resolve_user_id(args.user_id)
+        reader = _import_workbench_scheduled_prompts()
+        return _serialize_periphery_read_for_agent(
+            reader.read_user_periphery_artifact(
+                user_id=user_id,
+                artifact_id=args.artifact_id,
+            )
+        )
 
     # === VIVENTIUM NOTE ===
     # Feature: Clarify tool schema defaults and channel behavior.
@@ -992,10 +1253,7 @@ def main() -> None:
     log_level = os.getenv("SCHEDULER_LOG_LEVEL", "INFO").upper()
     logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
 
-    db_path = os.getenv(
-        "SCHEDULING_DB_PATH",
-        os.path.expanduser("~/.viventium/scheduling/schedules.db"),
-    )
+    db_path = os.getenv("SCHEDULING_DB_PATH") or _default_scheduling_db_path()
     # === VIVENTIUM NOTE ===
     # Feature: Mirror DB to durable storage when configured.
     mirror_path = os.getenv("SCHEDULING_DB_MIRROR_PATH")

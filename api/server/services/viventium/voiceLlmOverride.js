@@ -161,6 +161,7 @@ function normalizeVoiceModelParametersForProvider(parameters, voiceParams, provi
   const resolved = cloneModelParameters(parameters);
   const normalizedProvider = normalizeProvider(provider);
   if (normalizedProvider === 'anthropic') {
+    delete resolved.useResponsesApi;
     delete resolved.reasoning;
     delete resolved.reasoning_effort;
     if (resolved.thinking === false) {
@@ -186,6 +187,20 @@ function normalizeVoiceModelParametersForProvider(parameters, voiceParams, provi
   delete resolved.thinkingBudget;
   delete resolved.thinkingLevel;
   delete resolved.effort;
+
+  /* === VIVENTIUM START ===
+   * Feature: Voice transport parameter provenance.
+   * Purpose: A GPT-5.6 primary may select OpenAI Responses, but that transport choice must not
+   * silently become the xAI voice route. Keep xAI Responses available when the voice profile
+   * explicitly selects it; otherwise use xAI Chat Completions and its reasoning_effort field.
+   * Added: 2026-07-09
+   * === VIVENTIUM END === */
+  if (!hasOwn(voiceParams, 'useResponsesApi')) {
+    delete resolved.useResponsesApi;
+  }
+  if (!hasOwn(voiceParams, 'reasoning')) {
+    delete resolved.reasoning;
+  }
 
   if (
     resolved.useResponsesApi !== true &&
@@ -270,7 +285,8 @@ function applyVoiceModelOverride(agent, req, modelsConfig) {
       `reasoning_effort=${agent.model_parameters?.reasoning_effort ?? 'unset'} ` +
       `reasoning.effort=${agent.model_parameters?.reasoning?.effort ?? 'unset'} ` +
       `include_reasoning=${agent.model_parameters?.include_reasoning ?? 'unset'} ` +
-      `thinking=${agent.model_parameters?.thinking ?? 'unset'}`,
+      `thinking=${agent.model_parameters?.thinking ?? 'unset'} ` +
+      `useResponsesApi=${agent.model_parameters?.useResponsesApi ?? 'unset'}`,
   );
   /* === VIVENTIUM END === */
 

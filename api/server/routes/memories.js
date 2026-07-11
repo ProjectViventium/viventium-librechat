@@ -72,12 +72,13 @@ async function runRouteMemoryMaintenance({ userId, policy }) {
   await runMemoryMaintenance({
     userId: String(userId),
     getAllUserMemories: async (resolvedUserId) => getAllUserMemories(resolvedUserId),
-    setMemory: async ({ userId: maintenanceUserId, key, value, tokenCount }) =>
+    setMemory: async ({ userId: maintenanceUserId, key, value, tokenCount, expectedRevision }) =>
       setMemory({
         userId: maintenanceUserId,
         key,
         value,
         tokenCount,
+        expectedRevision,
       }),
     policy,
   });

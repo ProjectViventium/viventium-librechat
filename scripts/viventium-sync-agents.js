@@ -181,6 +181,7 @@ const AGENT_FIELDS = [
   'model',
   'tools',
   'tool_kwargs',
+  'tool_options',
   'model_parameters',
   'end_after_tools',
   'hide_sequential_outputs',
@@ -225,13 +226,14 @@ const MODEL_CONFIG_ONLY_FIELDS = [
   'fallback_llm_provider',
   'fallback_llm_model_parameters',
 ];
-const TOOLS_ONLY_FIELDS = ['id', 'tools', 'tool_kwargs'];
+const TOOLS_ONLY_FIELDS = ['id', 'tools', 'tool_kwargs', 'tool_options'];
 const REVIEW_FIELDS = [
   'name',
   'description',
   'instructions',
   'tools',
   'tool_kwargs',
+  'tool_options',
   'provider',
   'model',
   'model_parameters',

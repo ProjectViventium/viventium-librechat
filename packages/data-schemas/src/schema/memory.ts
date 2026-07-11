@@ -30,4 +30,9 @@ const MemoryEntrySchema: Schema<IMemoryEntry> = new Schema({
   },
 });
 
+MemoryEntrySchema.index(
+  { userId: 1, key: 1 },
+  { unique: true, name: 'viventium_unique_memory_user_key' },
+);
+
 export default MemoryEntrySchema;

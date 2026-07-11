@@ -405,6 +405,13 @@ export const memories = () => `${BASE_URL}/api/memories`;
 export const memory = (key: string) => `${memories()}/${encodeURIComponent(key)}`;
 export const memoryPreferences = () => `${memories()}/preferences`;
 
+/* === VIVENTIUM START === Feelings instrument === */
+export const feelings = () => `${BASE_URL}/api/viventium/feelings`;
+export const feelingsProfile = () => `${feelings()}/profile`;
+export const feelingBand = (bandId: string) => `${feelings()}/bands/${encodeURIComponent(bandId)}`;
+export const resetFeelings = () => `${feelings()}/reset`;
+/* === VIVENTIUM END === */
+
 export const searchPrincipals = (params: q.PrincipalSearchParams) => {
   const { q: query, limit, types } = params;
   let url = `${BASE_URL}/api/permissions/search-principals?q=${encodeURIComponent(query)}`;

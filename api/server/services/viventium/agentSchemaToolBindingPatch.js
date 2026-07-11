@@ -8,17 +8,64 @@
  *   fallback model binding. In event-driven schema-only mode, `agentContext.tools`
  *   can be empty while recall/MCP schemas are present in `toolsForBinding`, which
  *   makes diagnostics report `tools=0` and drops schema-only tools on fallback.
- * - For the duration of one model call, expose the already-computed unified list
- *   through `agentContext.tools` and `getToolsForBinding()` so primary invoke
- *   metadata and fallback binding use the same tool set.
+ * - For the duration of one async model invocation, expose the already-computed
+ *   unified list through `agentContext.tools` so fallback binding uses the same
+ *   tool set without mutating shared state seen by overlapping requests.
  * Added: 2026-06-25
  * === VIVENTIUM END === */
 'use strict';
 
+const { AsyncLocalStorage } = require('node:async_hooks');
 const { logger } = require('@librechat/data-schemas');
 const { StandardGraph } = require('@librechat/agents');
 
-const PATCH_FLAG = Symbol.for('viventium.agent.schema.tool.binding.patch.v1');
+const PATCH_FLAG = Symbol.for('viventium.agent.schema.tool.binding.patch.v2');
+const SCOPED_TOOLS_FLAG = Symbol.for('viventium.agent.schema.tool.binding.accessor.v1');
+const scopedTools = new AsyncLocalStorage();
+
+function installScopedToolsAccessor(agentContext) {
+  if (agentContext?.[SCOPED_TOOLS_FLAG] === true) {
+    return true;
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(agentContext, 'tools');
+  if (descriptor?.configurable === false) {
+    return false;
+  }
+
+  let baseTools = agentContext.tools;
+  let resolvingScopedValue = false;
+  Object.defineProperty(agentContext, 'tools', {
+    configurable: true,
+    enumerable: descriptor?.enumerable ?? true,
+    get() {
+      const scopedValue = scopedTools.getStore()?.get(agentContext);
+      if (typeof scopedValue !== 'function') {
+        return scopedValue ?? baseTools;
+      }
+      if (resolvingScopedValue) {
+        return baseTools;
+      }
+      // getToolsForBinding is synchronous. This guard only breaks its immediate
+      // `this.tools` re-entry; it must never span an await boundary.
+      resolvingScopedValue = true;
+      try {
+        return scopedValue();
+      } finally {
+        resolvingScopedValue = false;
+      }
+    },
+    set(value) {
+      baseTools = value;
+    },
+  });
+  Object.defineProperty(agentContext, SCOPED_TOOLS_FLAG, {
+    value: true,
+    enumerable: false,
+    configurable: false,
+    writable: false,
+  });
+  return true;
+}
 
 function toolName(tool) {
   if (!tool || typeof tool !== 'object') {
@@ -43,7 +90,9 @@ function sameToolList(left, right) {
   if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
     return false;
   }
-  return left.every((tool, index) => tool === right[index] || toolName(tool) === toolName(right[index]));
+  return left.every(
+    (tool, index) => tool === right[index] || toolName(tool) === toolName(right[index]),
+  );
 }
 
 function summarizeTools(tools) {
@@ -75,51 +124,44 @@ function installUnifiedSchemaToolBindingPatch(proto = StandardGraph?.prototype) 
 
     return async (state, config) => {
       const agentContext = this?.agentContexts?.get?.(agentId);
-      const originalGetToolsForBinding =
+      const getToolsForBinding =
         agentContext && typeof agentContext.getToolsForBinding === 'function'
           ? agentContext.getToolsForBinding
           : null;
-      const originalTools = agentContext?.tools;
-      const hadOwnGetToolsForBinding =
-        agentContext != null &&
-        Object.prototype.hasOwnProperty.call(agentContext, 'getToolsForBinding');
-      const hadOwnTools =
-        agentContext != null && Object.prototype.hasOwnProperty.call(agentContext, 'tools');
-      let restoreAgentContext = null;
+      const baseTools = agentContext?.tools;
 
-      if (agentContext && originalGetToolsForBinding) {
-        const unifiedTools = originalGetToolsForBinding.call(agentContext);
-        if (Array.isArray(unifiedTools) && unifiedTools.length > 0 && !sameToolList(originalTools, unifiedTools)) {
-          const beforeSummary = summarizeTools(originalTools);
+      if (agentContext && getToolsForBinding) {
+        const unifiedTools = getToolsForBinding.call(agentContext);
+        if (
+          Array.isArray(unifiedTools) &&
+          unifiedTools.length > 0 &&
+          !sameToolList(baseTools, unifiedTools)
+        ) {
+          const beforeSummary = summarizeTools(baseTools);
           const unifiedSummary = summarizeTools(unifiedTools);
-          agentContext.tools = unifiedTools;
-          agentContext.getToolsForBinding = () => unifiedTools;
+          if (!installScopedToolsAccessor(agentContext)) {
+            logger.error(
+              `[Agent Schema Tool Binding Patch] tools accessor unavailable agent=${agentId}`,
+            );
+            return originalCallModel(state, config);
+          }
           logger.info(
-            '[Agent Schema Tool Binding Patch] exposed unified schema tools ' +
+            '[Agent Schema Tool Binding Patch] scoped unified schema tools ' +
               `agent=${agentId} previous_tools=${beforeSummary.count} ` +
               `binding_tools=${unifiedSummary.count} has_file_search=${unifiedSummary.hasFileSearch} ` +
               `sample=${unifiedSummary.sample}`,
           );
-          restoreAgentContext = () => {
-            if (hadOwnTools) {
-              agentContext.tools = originalTools;
-            } else {
-              delete agentContext.tools;
-            }
-            if (hadOwnGetToolsForBinding) {
-              agentContext.getToolsForBinding = originalGetToolsForBinding;
-            } else {
-              delete agentContext.getToolsForBinding;
-            }
-          };
+          const scopedValue =
+            Array.isArray(agentContext.toolDefinitions) && agentContext.toolDefinitions.length > 0
+              ? () => getToolsForBinding.call(agentContext)
+              : unifiedTools;
+          return scopedTools.run(new Map([[agentContext, scopedValue]]), () =>
+            originalCallModel(state, config),
+          );
         }
       }
 
-      try {
-        return await originalCallModel(state, config);
-      } finally {
-        restoreAgentContext?.();
-      }
+      return originalCallModel(state, config);
     };
   };
 

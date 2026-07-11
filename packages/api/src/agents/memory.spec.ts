@@ -968,8 +968,13 @@ describe('Memory snapshot loading', () => {
       withoutKeys: 'without keys',
       totalTokens: 42,
       memoryTokenMap: { core: 42 },
+      memoryRevisionMap: {},
+      memoryValueHashMap: {},
     });
-    expect(methods.getFormattedMemories).toHaveBeenCalledWith({ userId: 'user-123' });
+    expect(methods.getFormattedMemories).toHaveBeenCalledWith({
+      userId: 'user-123',
+      memories: [],
+    });
   });
 
   it('reuses a preloaded snapshot when creating the memory processor', async () => {
@@ -985,6 +990,8 @@ describe('Memory snapshot loading', () => {
       withoutKeys: 'without keys',
       totalTokens: 42,
       memoryTokenMap: { core: 42 },
+      memoryRevisionMap: {},
+      memoryValueHashMap: {},
     };
 
     const [withoutKeys] = await createMemoryProcessor({

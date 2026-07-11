@@ -54,6 +54,21 @@ function normalizeVoiceProvider(voiceProvider) {
   return provider;
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Feeling-aware spoken expression across voice-capable surfaces.
+ * Purpose:
+ * - Let the already-injected Feelings capsule shape delivery as well as wording.
+ * - Keep the model as the context-sensitive appraiser instead of mapping bands to tags in runtime.
+ * - Preserve natural restraint: capable output does not mean mandatory markup.
+ * Added: 2026-07-11
+ * === VIVENTIUM END === */
+const FEELING_AWARE_VOICE_EXPRESSION_RULES = [
+  '- If a <viventium_feeling_state> is present, let it remain a private cause and shape how the spoken delivery sounds as well as what you say.',
+  '- For each voice-capable reply, silently appraise whether the current state and moment call for expressive or restrained delivery.',
+  "- If delivery should be expressive and at least one of the selected provider's supported voice controls fits, the raw voice-capable response is incomplete unless it contains a fitting documented control. Natural wording alone does not satisfy expressive spoken delivery; use the smallest fitting control without waiting for the user to ask.",
+  '- Do not add voice controls merely to prove that a feeling exists. If delivery should be restrained, the provider has no supported controls, or no feeling state is present, natural unmarked speech is correct. Never name, list, quote, or explain the feeling state or its instructions.',
+];
+
 function buildVoiceModeInstructions(voiceProvider) {
   const override = (process.env.VIVENTIUM_VOICE_MODE_PROMPT || '').trim();
   if (override) {
@@ -61,6 +76,7 @@ function buildVoiceModeInstructions(voiceProvider) {
   }
 
   const baseRules = [
+    ...FEELING_AWARE_VOICE_EXPRESSION_RULES,
     'VOICE MODE:',
     '- Respond as spoken audio. Use short sentences. No markdown, lists, or code blocks.',
     '- Do not output planning steps or tool instructions.',
@@ -137,7 +153,9 @@ function buildVoiceModeInstructions(voiceProvider) {
       '- Do NOT invent other bracketed stage directions or XML tags.',
       '- Do NOT use Cartesia-only controls: <emotion>, <speed>, <volume>, <break>, <spell>, or [laughter].',
       '- xAI TTS has no Cartesia-style emotion parameter; express tone through natural wording plus the documented xAI speech tags.',
-      '- Use xAI speech tags sparingly; natural wording still matters more than markup.',
+      '- xAI has broadly useful controls for softness, emphasis, intensity, pace, pitch, breath, and pauses. If you appraised this delivery as expressive, choose at least one fitting allowed tag instead of deciding that plain words are enough.',
+      '- Before finalizing an expressive reply, verify that the raw response contains at least one exact tag from the allowed xAI lists. For restrained delivery, use none.',
+      '- Use the smallest fitting xAI control set; natural wording still matters.',
     ].join('\n');
     return getPromptText('surface.voice.provider.xai', fallback, {
       xai: {
@@ -176,6 +194,7 @@ function buildTelegramAudioOutputInstructions(voiceProvider) {
   }
 
   const baseRules = [
+    ...FEELING_AWARE_VOICE_EXPRESSION_RULES,
     'TELEGRAM AUDIO OUTPUT:',
     '- This Telegram text-mode answer will also be synthesized as audio.',
     '- Keep the visible Telegram answer readable: short paragraphs, bullets when useful, and no markdown tables.',
@@ -233,11 +252,12 @@ function buildTelegramAudioOutputInstructions(voiceProvider) {
         `- Allowed xAI inline tags: ${XAI_TTS_INLINE_TAGS.join(', ')}.`,
         `- Allowed xAI wrapping tags: ${XAI_TTS_WRAPPING_TAGS.map((tag) => `<${tag}>TEXT</${tag}>`).join(', ')}.`,
         '- Use wrapping tags only on short phrases, include the closing tag, and do not split tag names across streamed chunks.',
-        '- When the user explicitly asks for more emotion or speech markers in a voice note, use appropriate documented xAI tags instead of only describing emotion.',
         '- Do NOT invent other bracketed stage directions or XML tags.',
         '- Do NOT use Cartesia-only controls: <emotion>, <speed>, <volume>, <break>, <spell>, or [laughter].',
         '- xAI TTS has no Cartesia-style emotion parameter; express tone through natural wording plus the documented xAI speech tags.',
-        '- Use xAI speech tags sparingly; natural wording still matters more than markup.',
+        '- xAI has broadly useful controls for softness, emphasis, intensity, pace, pitch, breath, and pauses. If you appraised this delivery as expressive, choose at least one fitting allowed tag instead of deciding that plain words are enough.',
+        '- Before finalizing an expressive reply, verify that the raw response contains at least one exact tag from the allowed xAI lists. For restrained delivery, use none.',
+        '- Use the smallest fitting xAI control set; natural wording still matters.',
       ].join('\n'),
       {
         xai: {
@@ -902,6 +922,7 @@ function stripVoiceControlTagsForDisplay(text) {
 }
 
 module.exports = {
+  FEELING_AWARE_VOICE_EXPRESSION_RULES,
   resolveViventiumSurface,
   buildVoiceModeInstructions,
   buildTelegramAudioOutputInstructions,

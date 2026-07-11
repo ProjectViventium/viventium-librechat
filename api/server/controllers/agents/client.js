@@ -43,6 +43,7 @@ const {
   markMemoryWriterFailure,
   getMemoryWriterHealthGate,
   filterMalformedContentParts,
+  loadFeelingsReadContext,
 } = require('@librechat/api');
 const {
   Callback,
@@ -81,6 +82,46 @@ const { loadAgent } = require('~/models/Agent');
 const { getMCPManager } = require('~/config');
 const db = require('~/models');
 const { updateBalance, bulkInsertTransactions } = require('~/models');
+const { logFeelingsEvent } = require('~/server/services/viventium/feelingsTelemetry');
+const {
+  scheduleEmotionalReaction,
+} = require('~/server/services/viventium/EmotionalReactionService');
+const { enqueueUserMemoryWriter } = require('~/server/services/viventium/memoryWriterCoordinator');
+
+/* === VIVENTIUM START ===
+ * Feature: Scope-aware Feelings dynamic tail.
+ * Purpose: `all_agents` is the natural default; `conscious_agent` remains an operator option.
+ * This helper uses structured scope/state only—never names, prompt text, or provider labels.
+ * === VIVENTIUM END === */
+function feelingTailForAgent({ snapshot, agentId, primaryAgentId }) {
+  if (!snapshot?.enabled || !snapshot?.capsule) return '';
+  if (snapshot.agentScope === 'conscious_agent' && agentId !== primaryAgentId) return '';
+  return snapshot.capsule;
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Prompt Workbench request isolation.
+ * Purpose: Temporary eval turns and explicit local QA runs can isolate only the product layers
+ * they are not grading. The flags are structured request metadata; prompt text and agent names are
+ * never inspected. Feelings evals leave `feelings` false while semantic judges set it true.
+ * === VIVENTIUM END === */
+function evalIsolationForRequest(req) {
+  const requested = req?.body?.viventiumEvalIsolation;
+  const isolationAllowed = req?.body?.isTemporary === true || req?.body?.viventiumQaRun === true;
+  if (!isolationAllowed || !requested || typeof requested !== 'object') {
+    return {};
+  }
+  return {
+    savedMemory: requested.savedMemory === true,
+    conversationRecall: requested.conversationRecall === true,
+    feelings: requested.feelings === true,
+  };
+}
+
+function externalUserStimulusForReaction(req, payload) {
+  const candidates = [req?.body?.text, req?.body?.prompt, req?.body?.message?.text, payload?.text];
+  return String(candidates.find((value) => typeof value === 'string' && value.trim()) || '').trim();
+}
 
 /* === VIVENTIUM NOTE ===
  * Feature: Background Cortices (Multi-Agent Brain Architecture)
@@ -169,6 +210,57 @@ function upsertCortexContentPart(parts, cortexPart) {
     parts.push(cortexPart);
   }
   return true;
+}
+
+/* === VIVENTIUM START ===
+ * Feature: interruption-safe background cortex persistence.
+ *
+ * Cortex status updates can arrive faster than Mongo writes. Keep the first in-flight write and
+ * coalesce everything queued behind it into the latest full snapshot. This preserves visible
+ * activation/running/terminal cards without allowing an older async write to overwrite the final
+ * state after the completion pipeline persists it.
+ * === VIVENTIUM END === */
+function createCortexPersistenceCoordinator({ persistSnapshot, onError } = {}) {
+  if (typeof persistSnapshot !== 'function') {
+    throw new TypeError('persistSnapshot must be a function');
+  }
+
+  let queuedSnapshot = null;
+  let workerPromise = null;
+
+  const startWorker = () => {
+    if (workerPromise) {
+      return workerPromise;
+    }
+
+    workerPromise = (async () => {
+      while (queuedSnapshot) {
+        const snapshot = queuedSnapshot;
+        queuedSnapshot = null;
+        try {
+          await persistSnapshot(snapshot);
+        } catch (error) {
+          if (typeof onError === 'function') {
+            onError(error);
+          }
+        }
+      }
+    })().finally(() => {
+      workerPromise = null;
+    });
+
+    return workerPromise;
+  };
+
+  return {
+    enqueue(parts) {
+      queuedSnapshot = Array.isArray(parts) ? parts.map((part) => ({ ...part })) : [];
+      return startWorker();
+    },
+    wait() {
+      return workerPromise || Promise.resolve();
+    },
+  };
 }
 
 function buildMergedInsightsDataFromCortexParts(cortexParts) {
@@ -998,7 +1090,15 @@ function classifyCompletionErrorForLog(err) {
   ) {
     return 'provider_temporarily_unavailable';
   }
-  if (message.includes('unauthorized') || err?.status === 401) {
+  if (
+    message.includes('unauthorized') ||
+    message.includes('invalid x-api-key') ||
+    message.includes('invalid api key') ||
+    message.includes('authentication_error') ||
+    code === 'authentication_error' ||
+    code === 'invalid_api_key' ||
+    err?.status === 401
+  ) {
     return 'provider_unauthorized';
   }
   if (message.includes('forbidden') || err?.status === 403) {
@@ -1298,6 +1398,19 @@ function getCortexLateDetectTimeoutMs(baseTimeoutMs) {
     return 0;
   }
   return Math.min(normalizedConfigured, 30000);
+}
+
+function mergeLateActivationCandidates(initialActivations, lateActivations) {
+  const all = Array.isArray(initialActivations) ? [...initialActivations] : [];
+  const seen = new Set(all.map((cortex) => cortex?.agentId).filter(Boolean));
+  const recovered = [];
+  for (const cortex of Array.isArray(lateActivations) ? lateActivations : []) {
+    if (!cortex?.agentId || seen.has(cortex.agentId)) continue;
+    seen.add(cortex.agentId);
+    recovered.push(cortex);
+    all.push(cortex);
+  }
+  return { all, recovered };
 }
 
 /* === VIVENTIUM START ===
@@ -1853,6 +1966,7 @@ class AgentClient extends BaseClient {
     this.processMemory;
     this.memoryWriterState = null;
     this.memoryWriterPromise = null;
+    this.feelingsReactionPromise = null;
     /* === VIVENTIUM START ===
      * Feature: Request-wide Phase B promise preservation.
      * Purpose: Fallback `chatCompletion` calls must not erase an in-flight
@@ -2010,6 +2124,84 @@ class AgentClient extends BaseClient {
         .slice(1)
         .map(({ agent }) => agent?.instructions || '')
         .join('\n\n');
+    }
+
+    /* === VIVENTIUM START ===
+     * Feature: Turn-pinned Feelings snapshot.
+     * Purpose:
+     * - One bounded state read per request, reused by every agent path in the turn.
+     * - No model/network appraisal on the response-critical path.
+     * - Fail open to ordinary Viventium if local state is unavailable or slow.
+     * === VIVENTIUM END === */
+    let feelingSnapshot = null;
+    const feelingReadStartedAt = Date.now();
+    const evalIsolation = evalIsolationForRequest(req);
+    if (evalIsolation.feelings) {
+      req._viventiumFeelingSnapshot = null;
+      this.feelingSnapshot = null;
+      this.feelingsCapsule = '';
+      logFeelingsEvent(logger, req, 'feelings.read.skip', {
+        reason: 'temporary_eval_isolation',
+        durationMs: Date.now() - feelingReadStartedAt,
+      });
+    } else {
+      try {
+        if (!req._viventiumFeelingSnapshotPromise) {
+          req._viventiumFeelingSnapshotPromise = loadFeelingsReadContext({
+            userId: String(req.user?.id || this.user || ''),
+            getFeelingState: db.getFeelingState,
+          });
+        }
+        const configuredTimeout = Number(process.env.VIVENTIUM_FEELINGS_READ_TIMEOUT_MS || 250);
+        const readTimeoutMs = Number.isFinite(configuredTimeout)
+          ? Math.min(2000, Math.max(25, configuredTimeout))
+          : 250;
+        let feelingReadTimer;
+        try {
+          feelingSnapshot = await Promise.race([
+            req._viventiumFeelingSnapshotPromise,
+            new Promise((_, reject) => {
+              feelingReadTimer = setTimeout(
+                () => reject(new Error('feelings_read_timeout')),
+                readTimeoutMs,
+              );
+            }),
+          ]);
+        } finally {
+          if (feelingReadTimer) clearTimeout(feelingReadTimer);
+        }
+        req._viventiumFeelingSnapshot = feelingSnapshot;
+        this.feelingSnapshot = feelingSnapshot;
+        this.feelingsCapsule = feelingSnapshot?.capsule || '';
+        if (feelingSnapshot?.capsule) {
+          promptFrameLayers.viventium_feeling_state = feelingSnapshot.capsule;
+        }
+        logFeelingsEvent(logger, req, 'feelings.read.complete', {
+          enabled: feelingSnapshot?.enabled === true,
+          scope: feelingSnapshot?.agentScope || 'unknown',
+          version: feelingSnapshot?.version ?? 0,
+          snapshotHash: feelingSnapshot?.snapshotHash || 'none',
+          cacheHit: feelingSnapshot?.cacheHit === true,
+          durationMs: Date.now() - feelingReadStartedAt,
+        });
+      } catch (error) {
+        req._viventiumFeelingSnapshot = null;
+        this.feelingSnapshot = null;
+        this.feelingsCapsule = '';
+        logFeelingsEvent(
+          logger,
+          req,
+          'feelings.read.failure',
+          {
+            errorClass:
+              error?.message === 'feelings_read_timeout'
+                ? 'state_read_timeout'
+                : 'state_read_failed',
+            durationMs: Date.now() - feelingReadStartedAt,
+          },
+          'warn',
+        );
+      }
     }
 
     if (this.options.attachments) {
@@ -2209,7 +2401,7 @@ class AgentClient extends BaseClient {
      * - Keep the recall-use rule in YAML/system prompt space instead of runtime prompt-text
      *   classifiers.
      */
-    for (const { agent } of allAgents) {
+    for (const { agent } of evalIsolation.conversationRecall ? [] : allAgents) {
       if (!agent || typeof agent !== 'object') {
         continue;
       }
@@ -2278,10 +2470,33 @@ class AgentClient extends BaseClient {
           logger,
           mcpManager,
           sharedRunContext,
+          dynamicTailContext: feelingTailForAgent({
+            snapshot: feelingSnapshot,
+            agentId,
+            primaryAgentId: this.options.agent.id,
+          }),
           ephemeralAgent: agentId === this.options.agent.id ? ephemeralAgent : undefined,
         }),
       ),
     );
+    const feelingsInjectedAgentCount = feelingSnapshot?.enabled
+      ? allAgents.filter(
+          ({ agentId }) =>
+            feelingTailForAgent({
+              snapshot: feelingSnapshot,
+              agentId,
+              primaryAgentId: this.options.agent.id,
+            }).length > 0,
+        ).length
+      : 0;
+    logFeelingsEvent(logger, req, 'feelings.inject.complete', {
+      enabled: feelingSnapshot?.enabled === true,
+      scope: feelingSnapshot?.agentScope || 'unknown',
+      snapshotHash: feelingSnapshot?.snapshotHash || 'none',
+      participatingAgentCount: allAgents.length,
+      injectedAgentCount: feelingsInjectedAgentCount,
+      skippedAgentCount: allAgents.length - feelingsInjectedAgentCount,
+    });
     promptFrameLayers.shared_run_context = sharedRunContext;
     promptFrameLayers.primary_final_instructions = this.options.agent?.instructions || '';
     if (allAgents.length > 1) {
@@ -2369,6 +2584,11 @@ class AgentClient extends BaseClient {
    * @returns {Promise<string | undefined>}
    */
   async useMemory() {
+    if (evalIsolationForRequest(this.options.req).savedMemory) {
+      this.memoryWriterState = null;
+      logger.debug('[VIVENTIUM][EvalIsolation] Saved memory read/write skipped');
+      return;
+    }
     const user = this.options.req.user;
     if (user.personalization?.memories === false) {
       this.memoryWriterState = null;
@@ -2677,6 +2897,7 @@ class AgentClient extends BaseClient {
         memoryMethods,
         res,
         user: req?.user ? createSafeUser(req.user) : undefined,
+        auditSource: resolveViventiumSurface(req) || 'chat',
       });
     } catch (error) {
       const healthEntry = markMemoryWriterFailure({
@@ -2878,51 +3099,103 @@ class AgentClient extends BaseClient {
       responseMessageId: this.responseMessageId + '',
       conversationId: this.conversationId + '',
     };
-    const promise = this.runMemory(messages, writerContext)
-      .then((attachments) => {
-        if (attachments && attachments.length > 0) {
-          const artifactPromises = writerContext.artifactPromises;
-          if (Array.isArray(artifactPromises)) {
-            artifactPromises.push(...attachments.filter(Boolean));
-          } else {
-            logger.warn(
-              '[AgentClient] Memory writer produced attachments after artifact sink closed',
-              {
-                attachments: attachments.filter(Boolean).length,
-              },
+    const runDetachedWriter = () =>
+      this.runMemory(messages, writerContext)
+        .then((attachments) => {
+          if (attachments && attachments.length > 0) {
+            const artifactPromises = writerContext.artifactPromises;
+            if (Array.isArray(artifactPromises)) {
+              artifactPromises.push(...attachments.filter(Boolean));
+            } else {
+              logger.warn(
+                '[AgentClient] Memory writer produced attachments after artifact sink closed',
+                {
+                  attachments: attachments.filter(Boolean).length,
+                },
+              );
+            }
+          }
+          if (isDeepTimingEnabled(req)) {
+            logDeepTiming(
+              req,
+              'memory_writer_background_done',
+              scheduleStart,
+              `attachments=${attachments?.filter(Boolean).length ?? 0}`,
             );
           }
-        }
-        if (isDeepTimingEnabled(req)) {
-          logDeepTiming(
-            req,
-            'memory_writer_background_done',
-            scheduleStart,
-            `attachments=${attachments?.filter(Boolean).length ?? 0}`,
+        })
+        .catch((error) => {
+          logger.error(
+            '[AgentClient] Error in detached memory writer',
+            sanitizeCompletionErrorForLog(error),
           );
-        }
-      })
-      .catch((error) => {
-        logger.error(
-          '[AgentClient] Error in detached memory writer',
-          sanitizeCompletionErrorForLog(error),
-        );
-        if (isDeepTimingEnabled(req)) {
-          logDeepTiming(req, 'memory_writer_background_done', scheduleStart, 'status=error');
-        }
-      })
-      .finally(() => {
-        if (userId != null) {
-          clearMemoryReadContextCache(userId);
-        }
-        if (this.memoryWriterPromise === promise) {
-          this.memoryWriterPromise = null;
-        }
-      });
+          if (isDeepTimingEnabled(req)) {
+            logDeepTiming(req, 'memory_writer_background_done', scheduleStart, 'status=error');
+          }
+        })
+        .finally(() => {
+          if (userId != null) {
+            clearMemoryReadContextCache(userId);
+          }
+        });
+    const promise = enqueueUserMemoryWriter({
+      userId,
+      run: runDetachedWriter,
+    }).finally(() => {
+      if (this.memoryWriterPromise === promise) {
+        this.memoryWriterPromise = null;
+      }
+    });
     this.memoryWriterPromise = promise;
     if (isDeepTimingEnabled(req)) {
       logDeepTiming(req, 'memory_writer_scheduled_after_main', scheduleStart);
     }
+    return promise;
+  }
+
+  scheduleFeelingsReaction(payload) {
+    const req = this.options?.req;
+    const snapshot = req?._viventiumFeelingSnapshot;
+    const userText = externalUserStimulusForReaction(req, payload);
+    if (!snapshot?.enabled || !userText) {
+      logFeelingsEvent(logger, req, 'feelings.reaction.schedule_skip', {
+        reason: !snapshot?.enabled ? 'disabled' : 'empty_stimulus',
+      });
+      return null;
+    }
+    if (this.feelingsReactionPromise) {
+      return this.feelingsReactionPromise;
+    }
+    const stimulusId = String(
+      req?.body?.messageId ||
+        req?.body?.userMessageId ||
+        req?.body?.parentMessageId ||
+        this.responseMessageId ||
+        'turn',
+    );
+    const promise = scheduleEmotionalReaction({
+      req,
+      userText,
+      stimulusId,
+      scheduledSnapshot: snapshot,
+    })
+      .catch((error) => {
+        logFeelingsEvent(
+          logger,
+          req,
+          'feelings.reaction.detached_failure',
+          {
+            errorClass: error?.errorClass || 'reaction_failed',
+          },
+          'error',
+        );
+      })
+      .finally(() => {
+        if (this.feelingsReactionPromise === promise) {
+          this.feelingsReactionPromise = null;
+        }
+      });
+    this.feelingsReactionPromise = promise;
     return promise;
   }
 
@@ -3063,6 +3336,13 @@ class AgentClient extends BaseClient {
     }
 
     const completion = normalizeTextContentParts(filterMalformedContentParts(this.contentParts));
+    if (hasVisibleAssistantText(completion)) {
+      this.scheduleFeelingsReaction(payload);
+    } else {
+      logFeelingsEvent(logger, this.options?.req, 'feelings.reaction.schedule_skip', {
+        reason: 'no_visible_reply',
+      });
+    }
     return { completion };
   }
 
@@ -3178,6 +3458,7 @@ class AgentClient extends BaseClient {
     followupGraceMs,
     shouldDeferMainResponse,
     getActivatedCorticesList,
+    waitForIncrementalCortexPersistence,
   }) {
     if (!cortexExecutionPromise || typeof cortexExecutionPromise.then !== 'function') {
       return null;
@@ -3226,6 +3507,17 @@ class AgentClient extends BaseClient {
             sanitizeCompletionErrorForLog(err),
           );
         });
+
+        // Drain any coalesced status writes before the authoritative final snapshot. Otherwise a
+        // slower intermediate write could race and overwrite a terminal state after completion.
+        if (typeof waitForIncrementalCortexPersistence === 'function') {
+          await waitForIncrementalCortexPersistence().catch((err) => {
+            logger.warn(
+              '[AgentClient] Failed while draining incremental cortex persistence',
+              sanitizeCompletionErrorForLog(err),
+            );
+          });
+        }
 
         // Always persist final cortex parts so refresh/poll clients do not lose Phase B state.
         if (Array.isArray(pendingCortexParts) && pendingCortexParts.length > 0) {
@@ -3614,6 +3906,12 @@ class AgentClient extends BaseClient {
           // VIVENTIUM: pass the run's gated memory so a GlassHive worker launched via the broker
           // can be given the same user context the main agent has (see GlassHiveCapabilityBootstrapService).
           glasshive_worker_memory: this.glasshiveWorkerMemory,
+          glasshive_worker_feelings:
+            this.feelingSnapshot?.agentScope === 'all_agents' ? this.feelingsCapsule : '',
+          glasshive_worker_feelings_hash:
+            this.feelingSnapshot?.agentScope === 'all_agents'
+              ? this.feelingSnapshot?.snapshotHash || ''
+              : '',
         },
         recursionLimit: agentsEConfig?.recursionLimit ?? 25,
         signal: abortController.signal,
@@ -3910,6 +4208,20 @@ class AgentClient extends BaseClient {
       let activatedCorticesList = [];
       let cortexExecutionPromise = null;
       const pendingCortexParts = [];
+      const cortexPersistenceCoordinator = createCortexPersistenceCoordinator({
+        persistSnapshot: (cortexParts) =>
+          persistCortexPartsToCanonicalMessage({
+            req,
+            responseMessageId: this.responseMessageId,
+            cortexParts,
+          }),
+        onError: (error) => {
+          logger.warn(
+            '[AgentClient] Failed to persist incremental cortex parts to DB',
+            sanitizeCompletionErrorForLog(error),
+          );
+        },
+      });
       // Cache tool-cortex hold decision so Phase B can be configured consistently.
       let toolCortexHoldWanted = false;
       /* === VIVENTIUM START === Async-ON speculative parallel main run (nevermind+redo) state.
@@ -3964,6 +4276,7 @@ class AgentClient extends BaseClient {
           // We upsert by cortex_id to keep a single row per cortex.
           upsertCortexContentPart(pendingCortexParts, cortexData);
           upsertCortexContentPart(this.contentParts, cortexData);
+          void cortexPersistenceCoordinator.enqueue(pendingCortexParts);
 
           const streamId = req?._resumableStreamId;
           const stream = responseStream;
@@ -4389,8 +4702,10 @@ class AgentClient extends BaseClient {
               followupGraceMs,
               shouldDeferMainResponse: toolCortexHoldWanted === true,
               getActivatedCorticesList: () => activatedCorticesList,
+              waitForIncrementalCortexPersistence: () => cortexPersistenceCoordinator.wait(),
             });
-          } else if (detectionResult.timedOut === true) {
+          }
+          if (detectionResult.timedOut === true) {
             /* === VIVENTIUM START ===
              * Feature: late non-blocking Phase A recovery.
              *
@@ -4399,16 +4714,19 @@ class AgentClient extends BaseClient {
              * - When primary activation providers are degraded, the 2s window can expire before the
              *   configured fallback classifier reaches a decision, leaving the user with no named
              *   background-agent visibility.
-             * - Continue only after a zero-activation timeout, attached to the same DB/SSE pipeline,
-             *   so the main answer stays fast while cards/results can still arrive.
+             * - Retry after any partial or zero-activation timeout. Deduplicate fast-pass results so
+             *   only newly recovered cortices execute while the main answer stays fast.
              * === VIVENTIUM END === */
             const lateDetectTimeoutMs = getCortexLateDetectTimeoutMs(cortexDetectTimeoutMs);
             if (lateDetectTimeoutMs > 0) {
+              const initialActivatedCortices = [...activatedCorticesList];
+              const hadInitialActivations = initialActivatedCortices.length > 0;
               logger.warn(
-                `[AgentClient] Phase A timed out with zero activations; starting late non-blocking recovery ` +
+                `[AgentClient] Phase A timed out with ${initialActivatedCortices.length} activation(s); starting late non-blocking recovery ` +
                   `(budget=${lateDetectTimeoutMs}ms, initial_budget=${cortexDetectTimeoutMs}ms)`,
               );
               cortexExecutionPromise = (async () => {
+                let recoveredCortices = [];
                 try {
                   const lateDetectStart = voiceLatencyNow();
                   const lateDetectionResult = await detectActivations({
@@ -4418,15 +4736,20 @@ class AgentClient extends BaseClient {
                     runId: this.responseMessageId,
                     timeBudgetMs: lateDetectTimeoutMs,
                   });
-                  activatedCorticesList = Array.isArray(lateDetectionResult.activatedCortices)
-                    ? lateDetectionResult.activatedCortices
-                    : [];
+                  const lateMerge = mergeLateActivationCandidates(
+                    initialActivatedCortices,
+                    lateDetectionResult.activatedCortices,
+                  );
+                  recoveredCortices = lateMerge.recovered;
+                  if (!hadInitialActivations) {
+                    activatedCorticesList = lateMerge.all;
+                  }
                   logger.info(
-                    `[AgentClient] Late Phase A complete: ${activatedCorticesList.length} cortices activated ` +
+                    `[AgentClient] Late Phase A complete: ${recoveredCortices.length} newly recovered, ${lateMerge.all.length} total activated ` +
                       `(duration: ${Math.round(calcVoiceLatencyDurationMs(lateDetectStart) || 0)}ms, timedOut: ${lateDetectionResult.timedOut})`,
                   );
 
-                  for (const cortex of activatedCorticesList) {
+                  for (const cortex of recoveredCortices) {
                     await emitCortexEvent({
                       type: ContentTypes.CORTEX_ACTIVATION,
                       cortex_id: cortex.agentId,
@@ -4445,23 +4768,23 @@ class AgentClient extends BaseClient {
                     });
                   }
 
-                  if (activatedCorticesList.length === 0) {
+                  if (recoveredCortices.length === 0) {
                     return null;
                   }
 
                   logger.info(
-                    `[AgentClient] Late Phase B: Starting execution of ${activatedCorticesList.length} activated cortices`,
+                    `[AgentClient] Late Phase B: Starting execution of ${recoveredCortices.length} newly recovered cortices`,
                   );
                   let mergedInsightsData = null;
                   const directActionScopeKeys =
-                    collectDirectActionScopeKeysFromCortices(activatedCorticesList);
+                    collectDirectActionScopeKeysFromCortices(recoveredCortices);
                   const effectiveDirectActionScopeKeys = collectEffectiveDirectActionScopeKeys({
                     directActionSurfaces: directActionPolicySurfaces,
                     agentTools: this.options.agent?.tools,
                     toolDefinitions: this.options.agent?.toolDefinitions,
                   });
                   toolCortexHoldWanted = shouldDeferToolCortexMainResponse({
-                    activatedCortices: activatedCorticesList,
+                    activatedCortices: recoveredCortices,
                     directActionScopeKeys: effectiveDirectActionScopeKeys,
                   });
                   logger.info(
@@ -4480,7 +4803,7 @@ class AgentClient extends BaseClient {
                     mainAgent: this.options.agent,
                     messages: initialMessages,
                     runId: this.responseMessageId,
-                    activatedCortices: activatedCorticesList,
+                    activatedCortices: recoveredCortices,
                     onCortexBrewing: (cortexData) => {
                       void emitCortexEvent({ ...cortexData, type: ContentTypes.CORTEX_BREWING });
                     },
@@ -4497,6 +4820,18 @@ class AgentClient extends BaseClient {
 
                   return mergedInsightsData;
                 } catch (error) {
+                  if (hadInitialActivations) {
+                    for (const cortex of recoveredCortices) {
+                      await emitCortexEvent({
+                        type: ContentTypes.CORTEX_INSIGHT,
+                        cortex_id: cortex.agentId,
+                        cortex_name: sanitizeCortexDisplayName(cortex.cortexName || cortex.agentId),
+                        status: 'error',
+                        error: 'late_partial_recovery_failed',
+                        recovery_reason: 'late_partial_recovery_failed',
+                      }).catch(() => {});
+                    }
+                  }
                   logger.error(
                     '[AgentClient] Late Phase A/B recovery failed',
                     sanitizeCompletionErrorForLog(error),
@@ -4504,20 +4839,22 @@ class AgentClient extends BaseClient {
                   return null;
                 }
               })();
-              this.attachBackgroundCortexCompletionPipeline({
-                cortexExecutionPromise,
-                pendingCortexParts,
-                req: this.options.req,
-                conversationId: this.conversationId,
-                responseMessageId: this.responseMessageId,
-                agent: this.options.agent,
-                getResponseContentParts: () => this.contentParts,
-                responseController,
-                turnUserInputTime,
-                followupGraceMs,
-                shouldDeferMainResponse: () => toolCortexHoldWanted === true,
-                getActivatedCorticesList: () => activatedCorticesList,
-              });
+              if (!hadInitialActivations)
+                this.attachBackgroundCortexCompletionPipeline({
+                  cortexExecutionPromise,
+                  pendingCortexParts,
+                  req: this.options.req,
+                  conversationId: this.conversationId,
+                  responseMessageId: this.responseMessageId,
+                  agent: this.options.agent,
+                  getResponseContentParts: () => this.contentParts,
+                  responseController,
+                  turnUserInputTime,
+                  followupGraceMs,
+                  shouldDeferMainResponse: () => toolCortexHoldWanted === true,
+                  getActivatedCorticesList: () => activatedCorticesList,
+                  waitForIncrementalCortexPersistence: () => cortexPersistenceCoordinator.wait(),
+                });
             }
           }
         } /* === VIVENTIUM NOTE: end sync Phase A/B path (if !voicePhaseAAsync) === */
@@ -4985,6 +5322,7 @@ class AgentClient extends BaseClient {
             followupGraceMs,
             shouldDeferMainResponse: () => toolCortexHoldWanted === true,
             getActivatedCorticesList: () => activatedCorticesList,
+            waitForIncrementalCortexPersistence: () => cortexPersistenceCoordinator.wait(),
           });
         };
 
@@ -5197,10 +5535,14 @@ class AgentClient extends BaseClient {
         );
       }
       try {
-        scheduleConversationRecallSync({
-          userId: req?.user?.id,
-          conversationId: this.conversationId,
-        });
+        if (!evalIsolationForRequest(req).conversationRecall) {
+          scheduleConversationRecallSync({
+            userId: req?.user?.id,
+            conversationId: this.conversationId,
+          });
+        } else {
+          logger.debug('[VIVENTIUM][EvalIsolation] Conversation recall sync skipped');
+        }
       } catch (error) {
         logger.warn(
           '[AgentClient] Failed to schedule conversation recall sync',
@@ -5506,6 +5848,7 @@ module.exports.handleCompletionErrorContentPart = handleCompletionErrorContentPa
 module.exports.ensureBackgroundCortexRuntimeCardGuard = ensureBackgroundCortexRuntimeCardGuard;
 module.exports.formatActivationSummary = formatActivationSummary;
 module.exports.getCortexLateDetectTimeoutMs = getCortexLateDetectTimeoutMs;
+module.exports.mergeLateActivationCandidates = mergeLateActivationCandidates;
 module.exports.pruneSequentialOutputPartsForPersistence = pruneSequentialOutputPartsForPersistence;
 /* === VIVENTIUM START ===
  * Export speculative-parallel-detection primitives for focused unit testing. The pure helpers cover
@@ -5518,5 +5861,9 @@ module.exports.runSpeculativeParallelMainRun = runSpeculativeParallelMainRun;
 module.exports.shouldRunLiveSpeculativePhaseA = shouldRunLiveSpeculativePhaseA;
 module.exports.shouldSuppressSpeculativeRunError = shouldSuppressSpeculativeRunError;
 module.exports.buildMergedInsightsDataFromCortexParts = buildMergedInsightsDataFromCortexParts;
+module.exports.createCortexPersistenceCoordinator = createCortexPersistenceCoordinator;
+module.exports.feelingTailForAgent = feelingTailForAgent;
+module.exports.externalUserStimulusForReaction = externalUserStimulusForReaction;
+module.exports.evalIsolationForRequest = evalIsolationForRequest;
 
 /* === VIVENTIUM END === */

@@ -1,7 +1,7 @@
 jest.mock('uuid', () => ({ v4: jest.fn(() => 'mock-uuid') }));
 
 jest.mock('@librechat/data-schemas', () => ({
-  logger: { warn: jest.fn(), debug: jest.fn(), error: jest.fn() },
+  logger: { warn: jest.fn(), debug: jest.fn(), info: jest.fn(), error: jest.fn() },
 }));
 
 jest.mock('@librechat/agents', () => ({
@@ -85,6 +85,7 @@ const PDF_MIME = 'application/pdf';
 const DOC_MIME = 'application/msword';
 const DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
 const PPT_MIME = 'application/vnd.ms-powerpoint';
+const PPTX_MIME = 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
 const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 const XLS_MIME = 'application/vnd.ms-excel';
 const ODS_MIME = 'application/vnd.oasis.opendocument.spreadsheet';
@@ -150,6 +151,7 @@ describe('processAgentFileUpload', () => {
     test.each([
       ['PDF', PDF_MIME],
       ['DOCX', DOCX_MIME],
+      ['PPTX', PPTX_MIME],
       ['XLSX', XLSX_MIME],
       ['XLS', XLS_MIME],
       ['ODS', ODS_MIME],
@@ -272,7 +274,7 @@ describe('processAgentFileUpload', () => {
 
       await expect(
         processAgentFileUpload({ req, res: mockRes, metadata: makeMetadata() }),
-      ).rejects.toThrow(/image-based and requires an OCR service/);
+      ).rejects.toThrow(/No readable text was found/);
 
       expect(parseText).not.toHaveBeenCalled();
     });
@@ -312,7 +314,7 @@ describe('processAgentFileUpload', () => {
 
       await expect(
         processAgentFileUpload({ req, res: mockRes, metadata: makeMetadata() }),
-      ).rejects.toThrow(/image-based and requires an OCR service/);
+      ).rejects.toThrow(/configured OCR\/document parser failed/);
 
       expect(parseText).not.toHaveBeenCalled();
     });
@@ -555,9 +557,7 @@ describe('processAgentFileUpload', () => {
       const { processAudioFile } = require('@librechat/api');
       createFile.mockClear();
       processAudioFile.mockClear();
-      mergeFileConfig.mockReturnValue(
-        makeFileConfig({ sttSupportedMimeTypes: ['audio/mpeg'] }),
-      );
+      mergeFileConfig.mockReturnValue(makeFileConfig({ sttSupportedMimeTypes: ['audio/mpeg'] }));
       getStrategyFunctions.mockReturnValueOnce({
         handleFileUpload: jest.fn().mockResolvedValue({
           bytes: 2048,
@@ -660,6 +660,103 @@ describe('processAgentFileUpload', () => {
           text: 'slide summary',
         }),
         true,
+      );
+    });
+
+    test('auto-promotes provider-non-native PPTX message attachments into document_parser context', async () => {
+      const { createFile } = require('~/models');
+      mergeFileConfig.mockReturnValue(makeFileConfig());
+      const req = makeReq({ mimetype: PPTX_MIME, ocrConfig: null });
+      req.file.originalname = 'deck.pptx';
+      req.body.endpoint = 'agents';
+      req.body.endpointType = 'agents';
+      getAgent.mockResolvedValueOnce({ provider: 'anthropic', model_parameters: {} });
+
+      await processAgentFileUpload({
+        req,
+        res: mockRes,
+        metadata: makeMetadata({
+          agent_id: 'agent-abc',
+          tool_resource: undefined,
+          message_file: true,
+        }),
+      });
+
+      expect(getStrategyFunctions).toHaveBeenCalledWith(FileSources.document_parser);
+      expect(createFile).toHaveBeenCalledWith(
+        expect.objectContaining({
+          file_id: 'file-uuid-123',
+          context: 'message_attachment',
+          source: FileSources.text,
+          filename: 'deck.pptx',
+          text: 'extracted text',
+        }),
+        true,
+      );
+    });
+
+    test('does not return extracted document images to ordinary web upload clients', async () => {
+      mergeFileConfig.mockReturnValue(makeFileConfig());
+      getStrategyFunctions.mockReturnValueOnce({
+        handleFileUpload: jest.fn().mockResolvedValue({
+          text: 'deck text',
+          bytes: 9,
+          filepath: 'doc://result',
+          images: ['data:image/png;base64,cG5n'],
+        }),
+      });
+      const req = makeReq({ mimetype: PPTX_MIME, ocrConfig: null });
+      req.file.originalname = 'deck.pptx';
+      req.body.endpoint = 'agents';
+      req.body.endpointType = 'agents';
+      getAgent.mockResolvedValueOnce({ provider: 'anthropic', model_parameters: {} });
+
+      await processAgentFileUpload({
+        req,
+        res: mockRes,
+        metadata: makeMetadata({
+          agent_id: 'agent-abc',
+          tool_resource: undefined,
+          message_file: true,
+        }),
+      });
+
+      expect(mockRes.json).toHaveBeenCalled();
+      const payload = mockRes.json.mock.calls.at(-1)[0];
+      expect(payload).not.toHaveProperty('viventiumExtractedImages');
+    });
+
+    test('returns extracted document images only to an explicit internal bridge upload', async () => {
+      mergeFileConfig.mockReturnValue(makeFileConfig());
+      getStrategyFunctions.mockReturnValueOnce({
+        handleFileUpload: jest.fn().mockResolvedValue({
+          text: 'deck text',
+          bytes: 9,
+          filepath: 'doc://result',
+          images: ['data:image/png;base64,cG5n'],
+        }),
+      });
+      const req = makeReq({ mimetype: PPTX_MIME, ocrConfig: null });
+      req.file.originalname = 'deck.pptx';
+      req.body.endpoint = 'agents';
+      req.body.endpointType = 'agents';
+      req._viventiumBridgeDocumentImageExtraction = true;
+      getAgent.mockResolvedValueOnce({ provider: 'anthropic', model_parameters: {} });
+
+      await processAgentFileUpload({
+        req,
+        res: mockRes,
+        metadata: makeMetadata({
+          agent_id: 'agent-abc',
+          tool_resource: undefined,
+          message_file: true,
+        }),
+      });
+
+      expect(mockRes.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          viventiumExtractedImages: ['data:image/png;base64,cG5n'],
+        }),
       );
     });
 

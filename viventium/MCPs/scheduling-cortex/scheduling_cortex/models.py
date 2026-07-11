@@ -218,6 +218,25 @@ class GetScheduleArgs(BaseModel):
     task_id: str
 
 
+class PeripheryListArgs(BaseModel):
+    user_id: Optional[str] = Field(
+        None,
+        description="LibreChat user id (auto-injected from X-Viventium-User-Id if omitted)",
+    )
+
+
+class PeripheryReadArgs(BaseModel):
+    user_id: Optional[str] = Field(
+        None,
+        description="LibreChat user id (auto-injected from X-Viventium-User-Id if omitted)",
+    )
+    artifact_id: str = Field(
+        ...,
+        min_length=8,
+        description="Opaque insight reference returned by periphery_list.",
+    )
+
+
 class DeleteScheduleArgs(BaseModel):
     # === VIVENTIUM NOTE ===
     # Feature: Clarify auto-injected user_id.

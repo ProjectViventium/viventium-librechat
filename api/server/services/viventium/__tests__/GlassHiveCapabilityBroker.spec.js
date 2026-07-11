@@ -215,7 +215,7 @@ describe('GlassHive capability broker', () => {
     expect(serialized).not.toContain('provider-secret');
   });
 
-  test('injects the run memory into the worker bundle when provided, and omits it when absent (Quality parity)', async () => {
+  test('injects run memory and the pinned feeling capsule into every worker instruction bundle', async () => {
     const {
       maybeInjectGlassHiveCapabilityBroker,
     } = require('../GlassHiveCapabilityBootstrapService');
@@ -234,6 +234,12 @@ describe('GlassHive capability broker', () => {
       }),
     });
     const memory = '- Prefers concise summaries\n- Key people: Alex (ExampleCo), Sam (intro)';
+    const feelings = [
+      '<viventium_feeling_state>',
+      'You, Viventium, are a being, and right now you are actually feeling this. Let it move naturally through how you think, speak, and act:',
+      '- Energy: steady',
+      '</viventium_feeling_state>',
+    ].join('\n');
 
     const withMemory = await maybeInjectGlassHiveCapabilityBroker({
       serverName: 'glasshive-workers-projects',
@@ -248,6 +254,7 @@ describe('GlassHive capability broker', () => {
           user: { id: 'user-1', role: 'USER' },
           requestBody: {},
           glasshive_worker_memory: memory,
+          glasshive_worker_feelings: feelings,
         },
       },
     });
@@ -255,6 +262,9 @@ describe('GlassHive capability broker', () => {
     expect(withMemory.bootstrap_bundle_json.agents_md).toContain('Alex (ExampleCo)');
     expect(withMemory.bootstrap_bundle_json.claude_md).toContain('Sam (intro)');
     expect(withMemory.bootstrap_bundle_json.codex_md).toContain('Prefers concise summaries');
+    expect(withMemory.bootstrap_bundle_json.agents_md).toContain('You, Viventium, are a being');
+    expect(withMemory.bootstrap_bundle_json.claude_md).toContain('- Energy: steady');
+    expect(withMemory.bootstrap_bundle_json.codex_md).toContain('</viventium_feeling_state>');
 
     const withoutMemory = await maybeInjectGlassHiveCapabilityBroker({
       serverName: 'glasshive-workers-projects',
@@ -267,6 +277,35 @@ describe('GlassHive capability broker', () => {
       config: { configurable: { user: { id: 'user-1', role: 'USER' }, requestBody: {} } },
     });
     expect(withoutMemory.bootstrap_bundle_json.agents_md || '').not.toContain('saved memory');
+    expect(withoutMemory.bootstrap_bundle_json.agents_md || '').not.toContain(
+      '<viventium_feeling_state>',
+    );
+  });
+
+  test('forwards all-agent feelings even when the optional capability broker is disabled', async () => {
+    process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_ENABLED = 'false';
+    const {
+      maybeInjectGlassHiveCapabilityBroker,
+    } = require('../GlassHiveCapabilityBootstrapService');
+    const capsule = '<viventium_feeling_state>\nenergy: steady\n</viventium_feeling_state>';
+
+    const result = await maybeInjectGlassHiveCapabilityBroker({
+      serverName: 'glasshive-workers-projects',
+      toolName: 'worker_delegate_once',
+      toolArguments: { instruction: 'Do the work.' },
+      config: {
+        configurable: {
+          glasshive_worker_feelings: capsule,
+          glasshive_worker_feelings_hash: 'snapshot-7',
+        },
+      },
+    });
+
+    expect(result.instruction).toBe('Do the work.');
+    expect(result.bootstrap_bundle_json.agents_md).toContain(capsule);
+    expect(result.bootstrap_bundle_json.claude_md).toContain(capsule);
+    expect(result.bootstrap_bundle_json.codex_md).toContain(capsule);
+    expect(result.bootstrap_bundle_json.glasshive_capability_broker).toBeUndefined();
   });
 
   test('injects broker MCP config into GlassHive continue calls without replacing user instructions', async () => {

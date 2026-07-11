@@ -173,6 +173,80 @@ describe('voiceLlmOverride', () => {
     }
   });
 
+  test('applyVoiceModelOverride does not inherit GPT-5.6 Responses transport into xAI voice', () => {
+    const originalXaiKey = process.env.XAI_API_KEY;
+    process.env.XAI_API_KEY = 'test-xai-key';
+
+    try {
+      const req = {
+        body: {
+          voiceMode: true,
+          viventiumInputMode: 'voice_call',
+          viventiumSurface: 'voice',
+        },
+        config: { endpoints: { agents: { allowedProviders: ['xai', 'openAI'] } } },
+      };
+      const modelsConfig = {
+        xai: ['grok-4.3'],
+        openAI: ['gpt-5.6-sol'],
+      };
+      const agent = {
+        id: 'agent_xai_from_gpt_56',
+        provider: 'openAI',
+        model: 'gpt-5.6-sol',
+        model_parameters: {
+          model: 'gpt-5.6-sol',
+          reasoning_effort: 'medium',
+          useResponsesApi: true,
+        },
+        voice_llm_provider: 'xai',
+        voice_llm_model: 'grok-4.3',
+        voice_llm_model_parameters: {
+          model: 'grok-4.3',
+          reasoning_effort: 'none',
+        },
+      };
+
+      const updated = applyVoiceModelOverride(agent, req, modelsConfig);
+
+      expect(updated.provider).toBe('xai');
+      expect(updated.model_parameters).toEqual({
+        model: 'grok-4.3',
+        reasoning_effort: 'none',
+      });
+    } finally {
+      if (originalXaiKey === undefined) {
+        delete process.env.XAI_API_KEY;
+      } else {
+        process.env.XAI_API_KEY = originalXaiKey;
+      }
+    }
+  });
+
+  test('resolveVoiceModelParameters preserves an explicit xAI voice Responses selection', () => {
+    const resolved = resolveVoiceModelParameters(
+      {
+        model_parameters: {
+          model: 'gpt-5.6-sol',
+          reasoning: { effort: 'medium' },
+          useResponsesApi: true,
+        },
+        voice_llm_model_parameters: {
+          reasoning_effort: 'low',
+          useResponsesApi: true,
+        },
+      },
+      'grok-4.3',
+      'xai',
+    );
+
+    expect(resolved).toEqual({
+      model: 'grok-4.3',
+      reasoning_effort: 'low',
+      useResponsesApi: true,
+    });
+  });
+
   test('applyVoiceModelOverride consumes Anthropic voice thinking false before agents graph config', () => {
     const originalAnthropicKey = process.env.ANTHROPIC_API_KEY;
     process.env.ANTHROPIC_API_KEY = 'test-anthropic-key';

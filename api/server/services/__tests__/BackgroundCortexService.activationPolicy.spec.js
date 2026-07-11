@@ -23,10 +23,12 @@ const {
   shouldAttemptSuppressedActivationProvider,
   shouldProbeSuppressedActivationAttempt,
   activationProviderAttemptsUnavailable,
+  isActivationFallbackCandidate,
   activationFailureVisibility,
   shouldSurfaceActivationProviderUnavailable,
   shouldSurfaceActivationTimeout,
   configuredCortexDisplayName,
+  feelingTailForBackgroundAgent,
   detectActivations,
   normalizePhaseANoticeMode,
   resolvePhaseANoticeModeForRequest,
@@ -34,11 +36,40 @@ const {
 const fs = require('fs');
 const path = require('path');
 const yaml = require('js-yaml');
+const { resolvePromptRefs } = require('../../../../scripts/viventium-sync-agents');
 
 describe('BackgroundCortexService activation policy helpers', () => {
   afterEach(() => {
     clearActivationProviderHealth();
     delete process.env.VIVENTIUM_CORTEX_PHASE_A_NOTICE_MODE;
+  });
+
+  test('injects a pinned feeling capsule only into the configured all-agent scope', () => {
+    const capsule = '<viventium_feeling_state>\n- Energy: steady\n</viventium_feeling_state>';
+    expect(
+      feelingTailForBackgroundAgent({
+        available: true,
+        enabled: true,
+        agentScope: 'all_agents',
+        capsule,
+      }),
+    ).toBe(capsule);
+    expect(
+      feelingTailForBackgroundAgent({
+        available: true,
+        enabled: true,
+        agentScope: 'conscious_agent',
+        capsule,
+      }),
+    ).toBe('');
+    expect(
+      feelingTailForBackgroundAgent({
+        available: true,
+        enabled: false,
+        agentScope: 'all_agents',
+        capsule,
+      }),
+    ).toBe('');
   });
 
   test('resolves Phase A notice modes from env with voice-only early notice support', () => {
@@ -135,6 +166,38 @@ describe('BackgroundCortexService activation policy helpers', () => {
     });
   });
 
+  test('uses JSON mode and low hidden reasoning for Groq GPT-OSS activation', async () => {
+    const llmConfig = await buildActivationLlmConfig({
+      providerName: 'groq',
+      model: 'openai/gpt-oss-120b',
+      req: null,
+    });
+
+    expect(llmConfig.temperature).toBeUndefined();
+    expect(llmConfig.modelKwargs).toEqual({
+      reasoning_effort: 'low',
+      reasoning_format: 'hidden',
+      seed: 0,
+      response_format: { type: 'json_object' },
+    });
+  });
+
+  test('disables Qwen thinking for low-latency Groq activation classification', async () => {
+    const llmConfig = await buildActivationLlmConfig({
+      providerName: 'groq',
+      model: 'qwen/qwen3.6-27b',
+      req: null,
+    });
+
+    expect(llmConfig.temperature).toBe(0.1);
+    expect(llmConfig.modelKwargs).toEqual({
+      reasoning_effort: 'none',
+      reasoning_format: 'hidden',
+      seed: 0,
+      response_format: { type: 'json_object' },
+    });
+  });
+
   test('does not force provider JSON mode onto OpenAI reasoning activation fallback', () => {
     const llmConfig = applyActivationJsonMode({
       providerName: 'openai',
@@ -148,9 +211,9 @@ describe('BackgroundCortexService activation policy helpers', () => {
   test('keeps Groq as the primary activation classifier before fallbacks', () => {
     const attempts = buildActivationProviderAttempts({
       provider: 'groq',
-      model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+      model: 'qwen/qwen3.6-27b',
       fallbacks: [
-        { provider: 'groq', model: 'meta-llama/llama-4-scout-17b-16e-instruct' },
+        { provider: 'groq', model: 'qwen/qwen3.6-27b' },
         { provider: 'xai', model: 'grok-4.20-non-reasoning' },
         { provider: 'openai', model: 'gpt-5.4' },
         { provider: 'anthropic', model: 'claude-haiku-4-5' },
@@ -160,13 +223,20 @@ describe('BackgroundCortexService activation policy helpers', () => {
     expect(attempts).toEqual([
       {
         provider: 'groq',
-        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+        model: 'qwen/qwen3.6-27b',
         source: 'primary',
       },
       { provider: 'xai', model: 'grok-4.20-non-reasoning', source: 'fallback' },
       { provider: 'openai', model: 'gpt-5.4', source: 'fallback' },
       { provider: 'anthropic', model: 'claude-haiku-4-5', source: 'fallback' },
     ]);
+  });
+
+  test('retries activation fallbacks when the selected model is removed or rejects JSON output', () => {
+    expect(isActivationFallbackCandidate({ code: 'MODEL_NOT_FOUND', status: 404 })).toBe(true);
+    expect(isActivationFallbackCandidate({ code: 'MODEL_DECOMMISSIONED', status: 404 })).toBe(true);
+    expect(isActivationFallbackCandidate({ code: 'JSON_VALIDATE_FAILED', status: 400 })).toBe(true);
+    expect(isActivationFallbackCandidate({ code: 'INVALID_REQUEST', status: 400 })).toBe(false);
   });
 
   test('renders configured direct-action surfaces only when exact tools are attached', () => {
@@ -371,7 +441,7 @@ describe('BackgroundCortexService activation policy helpers', () => {
       __dirname,
       '../../../../viventium/source_of_truth/local.librechat.yaml',
     );
-    const source = yaml.load(fs.readFileSync(sourcePath, 'utf8'));
+    const source = resolvePromptRefs(yaml.load(fs.readFileSync(sourcePath, 'utf8')));
     const prompt = source?.viventium?.background_cortices?.activation_policy?.prompt || '';
 
     expect(prompt).toContain('Background agents are optional reviewers, not controllers.');
@@ -385,6 +455,19 @@ describe('BackgroundCortexService activation policy helpers', () => {
     expect(prompt).not.toMatch(
       /Emotional Resonance|Confirmation Bias|Red Team|Pattern Recognition|Strategic Planning|Viventium User Help|Deep Research|product-help|user-help/i,
     );
+  });
+
+  test('resolves a source-owned activation policy promptRef without compiler preprocessing', () => {
+    const sourcePath = path.resolve(
+      __dirname,
+      '../../../../viventium/source_of_truth/local.librechat.yaml',
+    );
+    const source = yaml.load(fs.readFileSync(sourcePath, 'utf8'));
+
+    const result = buildActivationPolicySection({ config: source, mainAgent: { tools: [] } });
+
+    expect(result.section).toContain('Background agents are optional reviewers, not controllers.');
+    expect(result.section).not.toContain('[object Object]');
   });
 
   test('source-of-truth policy does not declare generic reasoning tools as direct-action blockers', () => {
@@ -641,7 +724,7 @@ describe('BackgroundCortexService activation policy helpers', () => {
     expect(
       markActivationProviderUnhealthy({
         provider: 'groq',
-        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+        model: 'qwen/qwen3.6-27b',
         errorSummary: {
           class: 'provider_access_denied',
           status: 403,
@@ -654,12 +737,12 @@ describe('BackgroundCortexService activation policy helpers', () => {
     expect(
       getActivationProviderSuppression({
         provider: 'Groq',
-        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+        model: 'qwen/qwen3.6-27b',
       }),
     ).toEqual(
       expect.objectContaining({
         provider: 'groq',
-        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+        model: 'qwen/qwen3.6-27b',
         error: expect.objectContaining({ class: 'provider_access_denied' }),
       }),
     );
@@ -894,7 +977,7 @@ describe('BackgroundCortexService activation policy helpers', () => {
       expect(
         markActivationProviderUnhealthy({
           provider: 'groq',
-          model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+          model: 'qwen/qwen3.6-27b',
           errorSummary: {
             class: 'provider_access_denied',
             status: 403,
@@ -907,7 +990,7 @@ describe('BackgroundCortexService activation policy helpers', () => {
       expect(
         getActivationProviderSuppression({
           provider: 'groq',
-          model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+          model: 'qwen/qwen3.6-27b',
         }),
       ).toEqual(expect.objectContaining({ provider: 'groq' }));
 
@@ -915,7 +998,7 @@ describe('BackgroundCortexService activation policy helpers', () => {
       expect(
         getActivationProviderSuppression({
           provider: 'groq',
-          model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+          model: 'qwen/qwen3.6-27b',
         }),
       ).toBeNull();
     } finally {

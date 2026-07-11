@@ -151,6 +151,19 @@ function sanitizeFallbackModelParametersForProvider(parameters, provider) {
   if (!['openAI', 'xai'].includes(normalizedProvider)) {
     delete sanitized.reasoning_effort;
   }
+  /* === VIVENTIUM START ===
+   * Feature: Cross-provider fallback parameter hygiene
+   * Purpose: Responses API selection is OpenAI-only and must not leak from a GPT primary bag
+   * into an Anthropic fallback request.
+   * Updated: 2026-07-09
+   * === VIVENTIUM END === */
+  if (normalizedProvider !== 'openAI') {
+    delete sanitized.useResponsesApi;
+    delete sanitized.service_tier;
+  }
+  if (!['openAI', 'xai'].includes(normalizedProvider)) {
+    delete sanitized.response_format;
+  }
 
   return sanitized;
 }

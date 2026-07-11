@@ -78,6 +78,9 @@ describe('viventium-sync-agents args', () => {
         model: 'gpt-5.4',
         tools: ['search_gmail_messages_mcp_google_workspace'],
         tool_kwargs: [{ name: 'search_gmail_messages_mcp_google_workspace' }],
+        tool_options: {
+          search_gmail_messages_mcp_google_workspace: { defer_loading: true },
+        },
       },
       { toolsOnly: true },
     );
@@ -85,6 +88,9 @@ describe('viventium-sync-agents args', () => {
     expect(update).toEqual({
       tools: ['search_gmail_messages_mcp_google_workspace'],
       tool_kwargs: [{ name: 'search_gmail_messages_mcp_google_workspace' }],
+      tool_options: {
+        search_gmail_messages_mcp_google_workspace: { defer_loading: true },
+      },
     });
   });
 
@@ -372,7 +378,7 @@ describe('viventium-sync-agents args', () => {
     ]);
   });
 
-  test('compareBundlesByAgent includes tool_kwargs and activation field diffs in reviewed output', () => {
+  test('compareBundlesByAgent includes tool options, tool kwargs, and activation diffs', () => {
     const diff = compareBundlesByAgent({
       leftBundle: {
         mainAgent: {
@@ -393,6 +399,7 @@ describe('viventium-sync-agents args', () => {
             id: 'agent-support',
             name: 'Support',
             tool_kwargs: [{ name: 'web_search', throttle: 1 }],
+            tool_options: { web_search: { defer_loading: false } },
           },
         ],
       },
@@ -415,6 +422,7 @@ describe('viventium-sync-agents args', () => {
             id: 'agent-support',
             name: 'Support',
             tool_kwargs: [{ name: 'web_search', throttle: 2 }],
+            tool_options: { web_search: { defer_loading: true } },
           },
         ],
       },
@@ -425,7 +433,7 @@ describe('viventium-sync-agents args', () => {
       expect.arrayContaining([
         expect.objectContaining({
           id: 'agent-support',
-          changedFields: ['tool_kwargs'],
+          changedFields: ['tool_kwargs', 'tool_options'],
         }),
         expect.objectContaining({
           id: 'main',

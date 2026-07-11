@@ -6,6 +6,8 @@
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
+from unittest.mock import patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -158,6 +160,127 @@ class StorageTemplateMetadataTests(unittest.TestCase):
 
             found_u1 = storage.find_by_metadata_template("user-1", "morning_briefing_default_v1")
             self.assertIsNotNone(found_u1)
+
+
+class StorageScheduledPromptLifecycleTests(unittest.TestCase):
+    def test_delete_definition_removes_private_versions_and_runs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = ScheduleStorage(StorageConfig(db_path=str(Path(tmpdir) / "schedules.db")))
+            now = "2026-07-11T15:00:00Z"
+            storage.create_scheduled_prompt_definition(
+                {
+                    "id": "definition-1",
+                    "user_id": "user-1",
+                    "task_id": "task-1",
+                    "title": "Synthetic scheduled prompt",
+                    "source_prompt_id": None,
+                    "template_id": None,
+                    "prompt_text": "Synthetic prompt",
+                    "schedule": {"type": "daily", "time": "03:00", "timezone": "UTC"},
+                    "timezone": "UTC",
+                    "active": 0,
+                    "memory_write_mode": "off",
+                    "workspace_alias": "synthetic-workspace",
+                    "my_folder": None,
+                    "metadata": {},
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
+            storage.create_scheduled_prompt_version(
+                {
+                    "id": "version-1",
+                    "definition_id": "definition-1",
+                    "version_number": 1,
+                    "prompt_text": "Synthetic prompt",
+                    "rendered_text": '<private-rendered-prompt hash="rendered" />',
+                    "rendered_hash": "rendered",
+                    "variable_snapshot_json": '{"hash":"snapshot"}',
+                    "variable_snapshot_hash": "snapshot",
+                    "created_at": now,
+                }
+            )
+            storage.create_scheduled_prompt_run(
+                {
+                    "run_id": "run-1",
+                    "task_id": "task-1",
+                    "definition_id": "definition-1",
+                    "user_id": "user-1",
+                    "version_id": "version-1",
+                    "due_at": now,
+                    "started_at": now,
+                    "completed_at": now,
+                    "status": "completed",
+                    "executor": "glasshive_host",
+                    "rendered_hash": "rendered",
+                    "variable_snapshot_hash": "snapshot",
+                    "glasshive_project_id": None,
+                    "glasshive_worker_id": None,
+                    "glasshive_run_id": None,
+                    "result_summary": "Synthetic completion",
+                    "error_class": None,
+                    "private_detail_path": None,
+                    "callback_payload_json": None,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
+
+            self.assertTrue(storage.delete_scheduled_prompt_definition("definition-1"))
+            self.assertIsNone(storage.get_scheduled_prompt_definition("definition-1"))
+            self.assertIsNone(storage.latest_scheduled_prompt_version("definition-1"))
+            self.assertEqual(storage.list_scheduled_prompt_runs(definition_id="definition-1"), [])
+
+    def test_startup_reconciles_abandoned_runs_without_deleting_audit_rows(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "schedules.db"
+            storage = ScheduleStorage(StorageConfig(db_path=str(db_path)))
+            old = "2020-01-01T00:00:00Z"
+            run = {
+                "run_id": "abandoned-run",
+                "task_id": "task-1",
+                "definition_id": "definition-1",
+                "user_id": "user-1",
+                "version_id": None,
+                "due_at": old,
+                "started_at": old,
+                "completed_at": None,
+                "status": "queued",
+                "executor": "glasshive_host",
+                "rendered_hash": None,
+                "variable_snapshot_hash": None,
+                "glasshive_project_id": None,
+                "glasshive_worker_id": None,
+                "glasshive_run_id": None,
+                "result_summary": None,
+                "error_class": None,
+                "private_detail_path": None,
+                "callback_payload_json": None,
+                "created_at": old,
+                "updated_at": old,
+            }
+            storage.create_scheduled_prompt_run(run)
+            fresh = dict(run)
+            fresh_now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            fresh.update(
+                {
+                    "run_id": "fresh-run",
+                    "due_at": fresh_now,
+                    "started_at": fresh_now,
+                    "created_at": fresh_now,
+                    "updated_at": fresh_now,
+                }
+            )
+            storage.create_scheduled_prompt_run(fresh)
+
+            with patch.dict("os.environ", {"SCHEDULING_STALE_PROMPT_RUN_SECONDS": "60"}):
+                restarted = ScheduleStorage(StorageConfig(db_path=str(db_path)))
+
+            reconciled = restarted.get_scheduled_prompt_run("abandoned-run")
+            self.assertEqual(reconciled["status"], "failed")
+            self.assertEqual(reconciled["error_class"], "stale_run_reconciled")
+            self.assertIsNotNone(reconciled["completed_at"])
+            self.assertEqual(restarted.get_scheduled_prompt_run("fresh-run")["status"], "queued")
 
 
 if __name__ == "__main__":

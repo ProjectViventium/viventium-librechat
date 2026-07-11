@@ -8,6 +8,7 @@ import { createKeyMethods, type KeyMethods } from './key';
 import { createFileMethods, type FileMethods } from './file';
 /* Memories */
 import { createMemoryMethods, type MemoryMethods } from './memory';
+import { createFeelingStateMethods, type FeelingStateMethods } from './feelingState';
 /* Agent Categories */
 import { createAgentCategoryMethods, type AgentCategoryMethods } from './agentCategory';
 /* Agent API Keys */
@@ -30,6 +31,7 @@ export type AllMethods = UserMethods &
   KeyMethods &
   FileMethods &
   MemoryMethods &
+  FeelingStateMethods &
   AgentCategoryMethods &
   AgentApiKeyMethods &
   MCPServerMethods &
@@ -53,6 +55,7 @@ export function createMethods(mongoose: typeof import('mongoose')): AllMethods {
     ...createKeyMethods(mongoose),
     ...createFileMethods(mongoose),
     ...createMemoryMethods(mongoose),
+    ...createFeelingStateMethods(mongoose),
     ...createAgentCategoryMethods(mongoose),
     ...createAgentApiKeyMethods(mongoose),
     ...createMCPServerMethods(mongoose),
@@ -73,6 +76,7 @@ export type {
   KeyMethods,
   FileMethods,
   MemoryMethods,
+  FeelingStateMethods,
   AgentCategoryMethods,
   AgentApiKeyMethods,
   MCPServerMethods,

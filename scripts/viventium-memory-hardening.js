@@ -59,7 +59,7 @@ const DEFAULT_MEMORY_HARDENING_PROBE_TIMEOUT_MS = 30000;
 const DEFAULT_MEMORY_HARDENING_MODEL_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_MEMORY_HARDENING_LOCK_STALE_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_MEMORY_HARDENING_SCHEDULE = '0 3 * * *';
-const DEFAULT_MEMORY_HARDENING_TIMEZONE = 'America/Toronto';
+const DEFAULT_MEMORY_HARDENING_TIMEZONE = 'local';
 const DEFAULT_TRANSCRIPT_IGNORE_GLOBS = [
   '**/.DS_Store',
   '**/.*',
@@ -91,10 +91,9 @@ const STABLE_TRANSCRIPT_MEMORY_KEYS = new Set([
 ]);
 const MODEL_FALLBACK_SEPARATOR = /[,;]/;
 const DEFAULT_MEMORY_HARDENING_MODEL_FALLBACKS = [
+  { provider: 'openai', model: 'gpt-5.6-sol', effort: 'xhigh', source: 'default' },
   { provider: 'anthropic', model: 'claude-opus-4-8', effort: 'xhigh', source: 'default' },
   { provider: 'anthropic', model: 'opus', effort: 'xhigh', source: 'default' },
-  { provider: 'openai', model: 'gpt-5.5', effort: 'high', source: 'default' },
-  { provider: 'openai', model: 'gpt-5.4', effort: 'high', source: 'default' },
 ];
 const MEMORY_HARDENING_EFFICIENCY_MARKER = 'last-model-apply.public.json';
 
@@ -647,7 +646,14 @@ function timeZoneOffsetMs(date, timeZone) {
 }
 
 function zonedTimeToUtcMs(parts, timeZone) {
-  const wallClockUtc = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, 0);
+  const wallClockUtc = Date.UTC(
+    parts.year,
+    parts.month - 1,
+    parts.day,
+    parts.hour,
+    parts.minute,
+    0,
+  );
   let candidate = wallClockUtc - timeZoneOffsetMs(new Date(wallClockUtc), timeZone);
   candidate = wallClockUtc - timeZoneOffsetMs(new Date(candidate), timeZone);
   return candidate;
@@ -679,7 +685,10 @@ function latestExpectedDailyRunUtc({ schedule, timeZone, now = new Date() }) {
     let expectedMs = zonedTimeToUtcMs(today, timeZone);
     if (expectedMs > now.getTime()) {
       const previous = previousCalendarDateParts(today);
-      expectedMs = zonedTimeToUtcMs({ ...previous, hour: parsed.hour, minute: parsed.minute }, timeZone);
+      expectedMs = zonedTimeToUtcMs(
+        { ...previous, hour: parsed.hour, minute: parsed.minute },
+        timeZone,
+      );
     }
     return new Date(expectedMs).toISOString();
   } catch {
@@ -703,12 +712,27 @@ function readScheduleEvents(paths) {
     });
 }
 
+function resolveScheduleTimezone(value) {
+  const configured = String(value || '').trim();
+  if (!configured || ['local', 'system', 'auto'].includes(configured.toLowerCase())) {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  }
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: configured }).format(new Date());
+    return configured;
+  } catch {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  }
+}
+
 function buildScheduleHealth(paths) {
-  const schedule = process.env.VIVENTIUM_MEMORY_HARDENING_SCHEDULE || DEFAULT_MEMORY_HARDENING_SCHEDULE;
-  const timeZone =
+  const schedule =
+    process.env.VIVENTIUM_MEMORY_HARDENING_SCHEDULE || DEFAULT_MEMORY_HARDENING_SCHEDULE;
+  const configuredTimeZone =
     process.env.VIVENTIUM_MEMORY_HARDENING_TIMEZONE ||
     process.env.VIVENTIUM_DEFAULT_TIMEZONE ||
     DEFAULT_MEMORY_HARDENING_TIMEZONE;
+  const timeZone = resolveScheduleTimezone(configuredTimeZone);
   const events = readScheduleEvents(paths);
   const scheduledEvents = events.filter(
     (event) => event.scheduled_invocation === true || event.trigger_source === 'launchd',
@@ -717,10 +741,26 @@ function buildScheduleHealth(paths) {
   const expectedLatestFireAtUtc = latestExpectedDailyRunUtc({ schedule, timeZone });
   const latestFiredMs = latestEvent ? Date.parse(latestEvent.fired_at_utc || '') : 0;
   const expectedMs = expectedLatestFireAtUtc ? Date.parse(expectedLatestFireAtUtc) : 0;
-  const missedWindow = Boolean(expectedMs && (!latestFiredMs || latestFiredMs + 60 * 60 * 1000 < expectedMs));
+  const missedWindow = Boolean(
+    expectedMs && (!latestFiredMs || latestFiredMs + 60 * 60 * 1000 < expectedMs),
+  );
+  const latestStatus = latestEvent?.status || null;
+  const latestExitCode = latestEvent?.exit_code ?? null;
+  const state = missedWindow
+    ? 'missed'
+    : latestStatus === 'failed' || (latestExitCode != null && latestExitCode !== 0)
+      ? 'failed'
+      : latestStatus === 'started'
+        ? 'running'
+        : latestStatus === 'skipped'
+          ? 'retry_pending'
+          : latestStatus === 'success'
+            ? 'healthy'
+            : 'awaiting_first_run';
 
   return {
     schedule,
+    configured_timezone: configuredTimeZone,
     timezone: timeZone,
     expected_latest_fire_at_utc: expectedLatestFireAtUtc,
     latest_scheduled_trigger: latestEvent
@@ -736,6 +776,8 @@ function buildScheduleHealth(paths) {
         }
       : null,
     missed_expected_window: missedWindow,
+    state,
+    healthy: state === 'healthy',
     trigger_receipt_count: scheduledEvents.length,
   };
 }
@@ -2164,7 +2206,7 @@ function resolveProvider(options = {}) {
         selectedModelFromCompiler ||
         (explicit === 'anthropic'
           ? process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_MODEL || 'claude-opus-4-8'
-          : process.env.VIVENTIUM_MEMORY_HARDENING_OPENAI_MODEL || 'gpt-5.5'),
+          : process.env.VIVENTIUM_MEMORY_HARDENING_OPENAI_MODEL || 'gpt-5.6-sol'),
       effort:
         explicit === 'anthropic'
           ? process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_EFFORT ||
@@ -2172,11 +2214,22 @@ function resolveProvider(options = {}) {
             'xhigh'
           : process.env.VIVENTIUM_MEMORY_HARDENING_OPENAI_REASONING_EFFORT ||
             process.env.VIVENTIUM_MEMORY_HARDENING_EFFORT ||
-            'high',
+            'xhigh',
       source: options.provider || options.model ? 'explicit' : 'configured',
     });
   }
   const providers = configuredProviders();
+  if (providers.includes('openai')) {
+    return withResolvedCandidates({
+      provider: 'openai',
+      model: process.env.VIVENTIUM_MEMORY_HARDENING_OPENAI_MODEL || 'gpt-5.6-sol',
+      effort:
+        process.env.VIVENTIUM_MEMORY_HARDENING_OPENAI_REASONING_EFFORT ||
+        process.env.VIVENTIUM_MEMORY_HARDENING_EFFORT ||
+        'xhigh',
+      source: 'configured',
+    });
+  }
   if (providers.includes('anthropic')) {
     return withResolvedCandidates({
       provider: 'anthropic',
@@ -2185,17 +2238,6 @@ function resolveProvider(options = {}) {
         process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_EFFORT ||
         process.env.VIVENTIUM_MEMORY_HARDENING_EFFORT ||
         'xhigh',
-      source: 'configured',
-    });
-  }
-  if (providers.includes('openai')) {
-    return withResolvedCandidates({
-      provider: 'openai',
-      model: process.env.VIVENTIUM_MEMORY_HARDENING_OPENAI_MODEL || 'gpt-5.5',
-      effort:
-        process.env.VIVENTIUM_MEMORY_HARDENING_OPENAI_REASONING_EFFORT ||
-        process.env.VIVENTIUM_MEMORY_HARDENING_EFFORT ||
-        'high',
       source: 'configured',
     });
   }
@@ -2364,7 +2406,11 @@ function codexOutputSchema(schema) {
   for (const key of ['items', 'anyOf', 'allOf']) {
     if (output[key]) output[key] = codexOutputSchema(output[key]);
   }
-  if (output.properties && typeof output.properties === 'object' && !Array.isArray(output.properties)) {
+  if (
+    output.properties &&
+    typeof output.properties === 'object' &&
+    !Array.isArray(output.properties)
+  ) {
     output.properties = Object.fromEntries(
       Object.entries(output.properties).map(([key, value]) => [key, codexOutputSchema(value)]),
     );
@@ -3783,8 +3829,11 @@ async function fetchRecentMemoryMessages({ db, userId, since }) {
     .find({
       user: userId,
       createdAt: { $gte: since },
+      'metadata.viventium.memoryEligible': { $ne: false },
+      'metadata.viventium.qaRun': { $ne: true },
       unfinished: { $ne: true },
       error: { $ne: true },
+      $or: [{ expiredAt: { $exists: false } }, { expiredAt: null }],
     })
     .project({
       _id: 0,
@@ -3935,7 +3984,12 @@ async function buildUserProposal({ db, methods, user, options, memoryConfig, now
   const since = new Date(now.getTime() - options.lookbackDays * 24 * 60 * 60 * 1000);
   const latestMessage = await db
     .collection('messages')
-    .find({ user: userId })
+    .find({
+      user: userId,
+      'metadata.viventium.memoryEligible': { $ne: false },
+      'metadata.viventium.qaRun': { $ne: true },
+      $or: [{ expiredAt: { $exists: false } }, { expiredAt: null }],
+    })
     .sort({ createdAt: -1, _id: -1 })
     .limit(1)
     .next();
@@ -4357,6 +4411,15 @@ async function buildUserProposal({ db, methods, user, options, memoryConfig, now
   const changedKeys = validation.accepted
     .filter((operation) => operation.action !== 'noop')
     .map((operation) => operation.key);
+  const proposalRevisionByKey = new Map(
+    memories.map((memory) => [memory.key, Number(memory.__v ?? 0)]),
+  );
+  const revisionProtectedOperations = validation.accepted.map((operation) => ({
+    ...operation,
+    expectedRevision: proposalRevisionByKey.has(operation.key)
+      ? proposalRevisionByKey.get(operation.key)
+      : null,
+  }));
   const summaries = transcriptSummaryMap(
     proposal,
     new Set(meetingTranscripts.map((transcript) => transcript.artifactId).filter(Boolean)),
@@ -4432,7 +4495,7 @@ async function buildUserProposal({ db, methods, user, options, memoryConfig, now
       provider: activeProviderInfo.provider,
       model: activeProviderInfo.model,
       effort: activeProviderInfo.effort,
-      accepted: validation.accepted,
+      accepted: revisionProtectedOperations,
       rejected: [...validation.rejected, ...transcriptSummaryFailures],
       transcripts: transcriptPayloads,
       staleTranscriptArtifacts: transcriptScan.staleArtifacts,
@@ -4449,17 +4512,21 @@ async function applyUserProposal({ methods, userProposal, user, memoryConfig, ru
   const userId = String(user._id);
   const before = await methods.getAllUserMemories(user._id);
   const rollbackPath = path.join(runDir, `${userProposal.userIdHash}.rollback.private.json`);
-  safeJsonWrite(rollbackPath, {
-    schemaVersion: 1,
-    userIdHash: userProposal.userIdHash,
-    createdAt: new Date().toISOString(),
-    memories: before.map((entry) => ({
-      key: entry.key,
-      value: entry.value || '',
-      tokenCount: entry.tokenCount || 0,
-      updated_at: entry.updated_at || entry.updatedAt || null,
-    })),
-  });
+  if (!fs.existsSync(rollbackPath)) {
+    safeJsonWrite(rollbackPath, {
+      schemaVersion: 2,
+      userIdHash: userProposal.userIdHash,
+      createdAt: new Date().toISOString(),
+      memories: before.map((entry) => ({
+        key: entry.key,
+        value: entry.value || '',
+        tokenCount: entry.tokenCount || 0,
+        updated_at: entry.updated_at || entry.updatedAt || null,
+        revision: Number(entry.__v ?? 0),
+      })),
+      applied: [],
+    });
+  }
 
   const hasTranscriptLifecycle =
     (userProposal.transcripts || []).length > 0 ||
@@ -4504,17 +4571,55 @@ async function applyUserProposal({ methods, userProposal, user, memoryConfig, ru
   }
 
   const changed = [];
+  const conflicts = [];
+  const appliedState = new Map();
   for (const operation of acceptedOperations) {
+    if (!Object.prototype.hasOwnProperty.call(operation, 'expectedRevision')) {
+      conflicts.push({ key: operation.key, action: operation.action, reason: 'revision_missing' });
+      continue;
+    }
     if (operation.action === 'set') {
-      await methods.setMemory({
+      const result = await methods.setMemory({
         userId,
         key: operation.key,
         value: operation.value,
         tokenCount: operation.tokenCount,
+        expectedRevision: operation.expectedRevision,
       });
-      changed.push({ key: operation.key, action: 'set', after_tokens: operation.tokenCount });
+      if (result?.conflict) {
+        conflicts.push({ key: operation.key, action: 'set', reason: 'revision_conflict' });
+        continue;
+      }
+      if (result?.ok !== true || !Number.isInteger(result.revision)) {
+        conflicts.push({ key: operation.key, action: 'set', reason: 'write_rejected' });
+        continue;
+      }
+      appliedState.set(operation.key, {
+        key: operation.key,
+        exists: true,
+        revision: Number(result.revision),
+      });
+      changed.push({
+        key: operation.key,
+        action: 'set',
+        after_tokens: operation.tokenCount,
+        after_revision: Number(result.revision),
+      });
     } else if (operation.action === 'delete') {
-      await methods.deleteMemory({ userId, key: operation.key });
+      const result = await methods.deleteMemory({
+        userId,
+        key: operation.key,
+        expectedRevision: operation.expectedRevision,
+      });
+      if (result?.conflict) {
+        conflicts.push({ key: operation.key, action: 'delete', reason: 'revision_conflict' });
+        continue;
+      }
+      if (result?.ok !== true) {
+        conflicts.push({ key: operation.key, action: 'delete', reason: 'write_rejected' });
+        continue;
+      }
+      appliedState.set(operation.key, { key: operation.key, exists: false });
       changed.push({ key: operation.key, action: 'delete' });
     }
   }
@@ -4531,22 +4636,112 @@ async function applyUserProposal({ methods, userProposal, user, memoryConfig, ru
           },
         })
       : { shouldApply: false };
-  return { changed, maintenanceApplied: maintenance.shouldApply, rollbackPath, transcriptVectors };
+  for (const key of maintenance.conflictKeys || []) {
+    conflicts.push({ key, action: 'maintenance', reason: 'revision_conflict' });
+  }
+  for (const [key, revision] of Object.entries(maintenance.appliedRevisions || {})) {
+    appliedState.set(key, { key, exists: true, revision: Number(revision) });
+  }
+  const rollback = readJson(rollbackPath);
+  const mergedAppliedState = new Map(
+    (rollback.applied || []).filter((entry) => entry?.key).map((entry) => [entry.key, entry]),
+  );
+  for (const [key, state] of appliedState) mergedAppliedState.set(key, state);
+  safeJsonWrite(
+    rollbackPath,
+    {
+      ...rollback,
+      finalizedAt: new Date().toISOString(),
+      applied: Array.from(mergedAppliedState.values()),
+    },
+    0o600,
+  );
+  return {
+    changed,
+    conflicts,
+    maintenanceApplied: (maintenance.appliedKeys || []).length > 0,
+    rollbackPath,
+    transcriptVectors,
+  };
 }
 
 async function restoreRollback({ methods, rollback }) {
-  const current = await methods.getAllUserMemories(rollback.userId);
-  for (const entry of current) {
-    await methods.deleteMemory({ userId: rollback.userId, key: entry.key });
+  if (Number(rollback.schemaVersion || 0) < 2 || !Array.isArray(rollback.applied)) {
+    return {
+      restoredKeys: [],
+      conflicts: [{ key: null, reason: 'rollback_revision_state_missing' }],
+    };
   }
-  for (const entry of rollback.memories || []) {
-    await methods.setMemory({
-      userId: rollback.userId,
-      key: entry.key,
-      value: entry.value || '',
-      tokenCount: Number(entry.tokenCount || 0),
-    });
+
+  const beforeByKey = new Map((rollback.memories || []).map((entry) => [entry.key, entry]));
+  const currentByKey = new Map(
+    (await methods.getAllUserMemories(rollback.userId)).map((entry) => [entry.key, entry]),
+  );
+  const restoredKeys = [];
+  const conflicts = [];
+
+  for (const applied of rollback.applied) {
+    const key = applied?.key;
+    if (!key) {
+      conflicts.push({ key: null, reason: 'rollback_key_missing' });
+      continue;
+    }
+    const before = beforeByKey.get(key);
+    const current = currentByKey.get(key);
+    let result;
+
+    if (applied.exists === true) {
+      const expectedRevision = Number(applied.revision);
+      const currentRevision = current ? Number(current.__v ?? 0) : null;
+      if (!Number.isInteger(expectedRevision) || currentRevision !== expectedRevision) {
+        conflicts.push({ key, reason: 'revision_conflict' });
+        continue;
+      }
+      result = before
+        ? await methods.setMemory({
+            userId: rollback.userId,
+            key,
+            value: before.value || '',
+            tokenCount: Number(before.tokenCount || 0),
+            expectedRevision,
+          })
+        : await methods.deleteMemory({
+            userId: rollback.userId,
+            key,
+            expectedRevision,
+          });
+    } else if (applied.exists === false) {
+      if (current) {
+        conflicts.push({ key, reason: 'revision_conflict' });
+        continue;
+      }
+      if (!before) {
+        restoredKeys.push(key);
+        continue;
+      }
+      result = await methods.setMemory({
+        userId: rollback.userId,
+        key,
+        value: before.value || '',
+        tokenCount: Number(before.tokenCount || 0),
+        expectedRevision: null,
+      });
+    } else {
+      conflicts.push({ key, reason: 'rollback_state_invalid' });
+      continue;
+    }
+
+    if (result?.ok === true) {
+      restoredKeys.push(key);
+    } else {
+      conflicts.push({
+        key,
+        reason: result?.conflict ? 'revision_conflict' : 'write_rejected',
+      });
+    }
   }
+
+  return { restoredKeys, conflicts };
 }
 
 async function connect(options) {
@@ -4770,6 +4965,11 @@ async function runHardening(options) {
         applyResults.push({
           user_id_hash: proposal.userIdHash,
           changed: result.changed.map((item) => ({ key: item.key, action: item.action })),
+          conflicts: result.conflicts.map((item) => ({
+            key: item.key,
+            action: item.action,
+            reason: item.reason,
+          })),
           maintenance_applied: result.maintenanceApplied,
           transcript_vectors: result.transcriptVectors,
           transcript_deferred_reason: deferredTranscriptProposal.deferred
@@ -4931,6 +5131,11 @@ async function applyExistingRun(options) {
       applyResults.push({
         user_id_hash: userProposal.userIdHash,
         changed: result.changed.map((item) => ({ key: item.key, action: item.action })),
+        conflicts: result.conflicts.map((item) => ({
+          key: item.key,
+          action: item.action,
+          reason: item.reason,
+        })),
         maintenance_applied: result.maintenanceApplied,
         transcript_vectors: result.transcriptVectors,
         transcript_deferred_reason: deferredTranscriptProposal.deferred
@@ -4969,11 +5174,13 @@ function recordRollbackResult({ runDir, runId, result }) {
   const summaryPath = path.join(runDir, 'summary.json');
   const summary = fs.existsSync(summaryPath) ? readJson(summaryPath) : {};
   const restoredCount = Array.isArray(result.restored) ? result.restored.length : 0;
+  const conflictCount = Array.isArray(result.conflicts) ? result.conflicts.length : 0;
   const nextSummary = {
     ...summary,
     rolled_back_at: result.rolled_back_at,
     rollback_summary_file: 'rollback-summary.json',
     rollback_restored_count: restoredCount,
+    rollback_conflict_count: conflictCount,
   };
   safeJsonWrite(summaryPath, nextSummary, 0o600);
 
@@ -4982,6 +5189,7 @@ function recordRollbackResult({ runDir, runId, result }) {
       event: 'rollback_run',
       run_id: runId,
       restored_user_count: restoredCount,
+      conflict_count: conflictCount,
       rolled_back_at: result.rolled_back_at,
     },
   ]);
@@ -5001,17 +5209,35 @@ async function rollbackRun(options) {
       .map((name) => path.join(runDir, name));
     const users = await db.collection('users').find({}).toArray();
     const restored = [];
+    const partial = [];
+    const conflicts = [];
     for (const filePath of rollbackFiles) {
       const rollback = readJson(filePath);
       const user = users.find((candidate) => userHash(candidate._id) === rollback.userIdHash);
       if (!user) continue;
-      await restoreRollback({ methods, rollback: { ...rollback, userId: String(user._id) } });
-      restored.push(rollback.userIdHash);
+      const restoreResult = await restoreRollback({
+        methods,
+        rollback: { ...rollback, userId: String(user._id) },
+      });
+      if (restoreResult.conflicts.length === 0) {
+        restored.push(rollback.userIdHash);
+      } else {
+        if (restoreResult.restoredKeys.length > 0) partial.push(rollback.userIdHash);
+        conflicts.push(
+          ...restoreResult.conflicts.map((conflict) => ({
+            user_id_hash: rollback.userIdHash,
+            key: conflict.key,
+            reason: conflict.reason,
+          })),
+        );
+      }
     }
     const result = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       run_id: options.runId,
       restored,
+      partial,
+      conflicts,
       rolled_back_at: new Date().toISOString(),
     };
     recordRollbackResult({ runDir, runId: options.runId, result });
@@ -5100,10 +5326,12 @@ function status(options) {
           status: latest.status || 'success',
           failure_reason: latest.failure?.reason || null,
           failure_phase: latest.failure?.phase || null,
-          applied_at: latest.applied_at || (latest.mode === 'apply' ? latest.finished_at || null : null),
+          applied_at:
+            latest.applied_at || (latest.mode === 'apply' ? latest.finished_at || null : null),
           rolled_back_at: latest.rolled_back_at || null,
           rollback_summary_file: latest.rollback_summary_file || null,
           rollback_restored_count: latest.rollback_restored_count ?? null,
+          rollback_conflict_count: latest.rollback_conflict_count ?? null,
           finished_at: latest.finished_at || latest.applied_at || null,
           user_count: Array.isArray(latest.users) ? latest.users.length : 0,
         }
@@ -5154,6 +5382,7 @@ module.exports = {
   deleteTranscriptVectorFile,
   findTranscriptContentHashesMissingVectors,
   findTranscriptVectorRepairTargets,
+  fetchRecentMemoryMessages,
   getTranscriptVectorRuntimeStatus,
   aggregateMaintenanceSummary,
   buildCooldownSkipSummary,
@@ -5189,6 +5418,7 @@ module.exports = {
   transcriptPromptVersion,
   validateProposal,
   recordRollbackResult,
+  restoreRollback,
   writeEfficiencyMarker,
   userHash,
 };

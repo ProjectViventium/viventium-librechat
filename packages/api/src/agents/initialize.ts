@@ -5,7 +5,6 @@ import {
   EModelEndpoint,
   EToolResources,
   FileContext,
-  Tools,
   buildConversationRecallFileId,
   ConversationRecallScope,
   paramEndpoints,
@@ -165,6 +164,49 @@ export interface InitializeAgentDbMethods extends EndpointDbMethods {
     user: string;
   }) => Promise<Date | string | null>;
 }
+
+/* === VIVENTIUM START ===
+ * Feature: GPT-5.6 Agent Builder compatibility defaults.
+ * Purpose: OpenAI recommends Responses for reasoning, tools, and multi-turn GPT-5.6 workflows.
+ * New GPT-5.6 agents therefore use LibreChat's existing Responses path unless the user explicitly
+ * chose otherwise. This is model/provider metadata handling, not user-intent routing.
+ * Source: https://developers.openai.com/api/docs/guides/latest-model
+ * === VIVENTIUM END === */
+const OPENAI_GPT_56_AGENT_MODELS = new Set([
+  'gpt-5.6',
+  'gpt-5.6-sol',
+  'gpt-5.6-terra',
+  'gpt-5.6-luna',
+]);
+
+export function applyOpenAIGPT56AgentDefaults({
+  provider,
+  model,
+  modelOptions,
+}: {
+  provider?: string | null;
+  model?: string | null;
+  modelOptions: Record<string, unknown>;
+}): Record<string, unknown> {
+  const nextModelOptions = { ...modelOptions };
+  const normalizedProvider = String(provider ?? '')
+    .trim()
+    .toLowerCase();
+  const normalizedModel = String(model ?? '')
+    .trim()
+    .toLowerCase();
+
+  if (
+    normalizedProvider === 'openai' &&
+    OPENAI_GPT_56_AGENT_MODELS.has(normalizedModel) &&
+    nextModelOptions.useResponsesApi == null
+  ) {
+    nextModelOptions.useResponsesApi = true;
+  }
+
+  return nextModelOptions;
+}
+/* === VIVENTIUM END === */
 
 /**
  * Initializes an agent for use in requests.
@@ -537,7 +579,9 @@ export async function initializeAgent(
             ? await ragFilesExistNonBlocking({
                 userId: meetingTranscriptUserId,
                 fileIds: meetingTranscriptVectorFileIds,
-                cacheKey: `${meetingTranscriptUserId}:transcript:${[...meetingTranscriptVectorFileIds]
+                cacheKey: `${meetingTranscriptUserId}:transcript:${[
+                  ...meetingTranscriptVectorFileIds,
+                ]
                   .sort()
                   .join(',')}`,
               })
@@ -646,10 +690,14 @@ export async function initializeAgent(
     agent.provider = resolvedProvider;
   }
 
-  const finalModelOptions = {
-    ...modelOptions,
+  const finalModelOptions = applyOpenAIGPT56AgentDefaults({
+    provider,
     model: agent.model,
-  };
+    modelOptions: {
+      ...modelOptions,
+      model: agent.model,
+    },
+  });
 
   const vivGetOptionsStart = Date.now();
   const options: InitializeResultBase = await getOptions({

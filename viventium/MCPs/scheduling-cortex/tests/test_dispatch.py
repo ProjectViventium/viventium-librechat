@@ -20,6 +20,69 @@ if str(ROOT) not in sys.path:
 from scheduling_cortex import dispatch
 
 
+class DispatchWorkbenchTests(unittest.TestCase):
+    def setUp(self):
+        os.environ['WPR_MODEL_HOST_CODEX_CLI'] = 'gpt-managed-test'
+        os.environ['WPR_CODEX_CLI_REASONING_EFFORT'] = 'xhigh'
+
+    def tearDown(self):
+        os.environ.pop('WPR_CODEX_CLI_REASONING_EFFORT', None)
+        os.environ.pop('WPR_MODEL_HOST_CODEX_CLI', None)
+
+    def test_glasshive_bootstrap_normalizes_legacy_max_codex_effort(self):
+        bundle = dispatch._glasshive_bootstrap_bundle(
+            {'id': 'task-1', 'user_id': 'user-1', 'prompt': 'Synthetic prompt'},
+            {'reasoning_effort': 'max'},
+            'run-1',
+        )
+
+        self.assertEqual(bundle['env']['WPR_CODEX_CLI_REASONING_EFFORT'], 'xhigh')
+
+    def test_glasshive_bootstrap_prefers_compiled_codex_effort(self):
+        bundle = dispatch._glasshive_bootstrap_bundle(
+            {'id': 'task-1', 'user_id': 'user-1', 'prompt': 'Synthetic prompt'},
+            {'reasoning_effort': 'high'},
+            'run-1',
+        )
+
+        self.assertEqual(bundle['env']['WPR_CODEX_CLI_REASONING_EFFORT'], 'xhigh')
+
+    def test_glasshive_bootstrap_isolates_managed_codex_from_ambient_user_config(self):
+        os.environ['WPR_MODEL_HOST_CODEX_CLI'] = 'gpt-managed-test'
+        bundle = dispatch._glasshive_bootstrap_bundle(
+            {'id': 'task-1', 'user_id': 'user-1', 'prompt': 'Synthetic prompt'},
+            {'reasoning_effort': 'high'},
+            'run-1',
+        )
+
+        self.assertEqual(bundle['env']['WPR_MODEL_HOST_CODEX_CLI'], 'gpt-managed-test')
+        self.assertEqual(bundle['env']['WPR_CODEX_CLI_REASONING_EFFORT'], 'xhigh')
+        self.assertEqual(bundle['env']['WPR_CODEX_CLI_IGNORE_USER_CONFIG'], 'true')
+
+    def test_glasshive_bootstrap_uses_persisted_tuple_when_compiled_policy_is_absent(self):
+        os.environ.pop('WPR_MODEL_HOST_CODEX_CLI', None)
+        os.environ.pop('WPR_CODEX_CLI_REASONING_EFFORT', None)
+        bundle = dispatch._glasshive_bootstrap_bundle(
+            {'id': 'task-1', 'user_id': 'user-1', 'prompt': 'Synthetic prompt'},
+            {'execution_model': 'gpt-stale', 'reasoning_effort': 'high'},
+            'run-1',
+        )
+
+        self.assertEqual(bundle['env']['WPR_MODEL_HOST_CODEX_CLI'], 'gpt-stale')
+        self.assertEqual(bundle['env']['WPR_CODEX_CLI_REASONING_EFFORT'], 'high')
+
+    def test_glasshive_bootstrap_fails_closed_when_codex_tuple_is_absent(self):
+        os.environ.pop('WPR_MODEL_HOST_CODEX_CLI', None)
+        os.environ.pop('WPR_CODEX_CLI_REASONING_EFFORT', None)
+
+        with self.assertRaisesRegex(RuntimeError, 'requires WPR_MODEL_HOST_CODEX_CLI'):
+            dispatch._glasshive_bootstrap_bundle(
+                {'id': 'task-1', 'user_id': 'user-1', 'prompt': 'Synthetic prompt'},
+                {},
+                'run-1',
+            )
+
+
 class DispatchTelegramTests(unittest.TestCase):
     def setUp(self):
         os.environ['SCHEDULER_LIBRECHAT_SECRET'] = 'scheduler_secret'

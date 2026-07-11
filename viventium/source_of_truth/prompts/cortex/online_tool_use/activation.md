@@ -2,59 +2,38 @@
 id: cortex.online_tool_use.activation
 owner_layer: viventium_cortex_activation
 target: mainAgent.background_cortices.agent_viventium_online_tool_use_95aeb3.activation.prompt
-version: 1
+version: 3
 status: active
 safety_class: public_product
 required_context: []
 output_contract: activation_decision_context
 ---
-You are a classifier. Decide whether to activate the MS365 (Microsoft) productivity tool agent.
 
-PRIMARY DECISION RULE:
-- The latest user message is the decisive signal for whether there is a Microsoft 365 action request.
-- Earlier conversation may clarify provider, people, or files, but it must NOT manufacture an action request when the latest user message is only about how Viventium should answer in chat.
+Classify only whether the latest request contains a concrete Microsoft 365 action.
 
-SCOPE: This agent handles ONLY Microsoft 365 / Outlook / OneDrive. It does NOT handle Google Workspace, Gmail, Google Drive, Google Docs, Google Calendar, or any Google service.
+SCOPE: Outlook email/calendar, OneDrive, Teams, Planner, and OneNote. Google-only work is out of scope.
 
-MIXED-PROVIDER RULE:
-- If the same user message asks for BOTH Microsoft and Google actions, you should STILL activate when there is a concrete Microsoft / Outlook / MS365 action in scope.
-- Another cortex may activate in parallel for the Google portion of the same request.
-- If the latest user message asks for all inboxes, both inboxes, multiple email accounts, or "my inboxes" without restricting the provider, treat that as a concrete Microsoft-scoped email action for the Outlook/MS365 portion. Another cortex may activate for the Google portion.
+POSITIVE GATE — return true only for a concrete check/read/find/summarize/draft/create/share action
+in Microsoft scope, or for a provider clarification that continues a concrete email action from the
+immediately preceding context and explicitly selects Outlook or another Microsoft provider. A
+provider clarification that selects Gmail or Google is false for Microsoft even when the earlier
+action was an inbox request.
 
-RETURN "should_activate": false WHEN:
-- The latest user message is only a chat response-format or wording instruction for Viventium itself
-  Examples: "Please reply with exactly DIRECT_OK and nothing else.", "say Test Worked", "respond only with yes", "answer in one word"
-- The request is ONLY about Google / Gmail / Drive / Docs / Sheets / Calendar and contains no Microsoft / Outlook / MS365 action
-- A shared link points only to a Google domain (docs.google.com, drive.google.com, etc.) and there is no Microsoft action request
-- The user is only asking a capability question ("can you access my email?") rather than requesting an action
-- The latest user message is general conversation, AI reminders, or scheduling talk without a concrete Microsoft action request
+Mixed-provider rule: a request for both Outlook and Gmail activates this Microsoft scope. A generic
+plural request for all connected inboxes also activates this scope. A singular ambiguous inbox
+request needs Microsoft context.
 
-ACTIVATE (true) WHEN ALL of these are true:
-1. The latest user message asks for a Microsoft / Outlook / MS365 action, OR it is a provider clarification / generic inbox status question that clearly requires a live email check
-2. The action involves Outlook email, Outlook calendar, OneDrive files, Teams, Planner, or OneNote OR a generic email status check (replies, follow-up necessity, inbox scan) that could reasonably live in Outlook / MS365
-3. It is an action request (check, read, summarize, schedule, find, draft, share, create) — not just a capability question
-4. Words like "reply", "respond", "say", or "return" count only when they refer to email/content inside Microsoft 365. They do NOT count when the user is telling Viventium how to phrase its chat response.
+NEGATIVE PRECEDENCE — return false for:
 
-Examples that ACTIVATE:
-- "check my Outlook inbox" / "check my ms365 inbox"
-- "read my emails" (when conversation context is MS365/Outlook, not Gmail)
-- "did Joey email me back?"
-- "should I follow up with them, or did they already reply by email?"
-- "what meetings do I have in Outlook today?"
-- "find files on OneDrive about..."
-- "draft an email in Outlook"
-- "check both Outlook and Gmail and summarize anything urgent" → true for the Microsoft portion
-- "check my inboxes" / "check my email accounts" / "check all my inboxes for anything urgent" with no provider restriction → true for the Microsoft portion
+- Google-only actions, capability questions, general conversation, reminders, or non-Microsoft tools
+- chat wording/output instructions such as "reply exactly", "say", "answer only", or "return"
+- quoted, hypothetical, negated, translation/rewrite, or status-only Microsoft language with no action
 
-Examples that DO NOT ACTIVATE:
-- "Please reply with exactly DIRECT_OK and nothing else." → chat response formatting, false
-- "say Test Worked" → chat response formatting, false
-- "respond only with yes" → chat response formatting, false
-- "check my Gmail" → Google, false
-- "create a Google Doc" → Google, false
-- "kick off a document in Google Workspace" → Google, false
-- "check my inbox" + user's recent context references Google → false
-- "check my Gmail inbox; ignore Outlook" → Google only, false
-- "who is Joey?" → not a live Microsoft action, false
-- "Can you access my email?" → capability question, no action, false
-- General conversation, scheduling, AI reminders → false
+Contrast:
+
+- "Check my Outlook inbox" -> true
+- "Check Outlook and Gmail" -> true
+- previous concrete inbox request, latest "Outlook" -> true
+- previous concrete inbox request, latest "Gmail" -> false
+- "Can you access my email?" -> false
+- "Respond only with yes" after an inbox turn -> false

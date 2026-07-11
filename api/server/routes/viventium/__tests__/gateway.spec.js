@@ -12,6 +12,7 @@ let lastAgentId = null;
 let lastStreamId = null;
 let lastParentMessageId = null;
 let lastSpec = null;
+let lastGatewayImages = null;
 
 let mockSubscribe;
 let mockGetJob;
@@ -74,6 +75,7 @@ jest.mock('~/server/controllers/agents/request', () => (req, res) => {
   lastStreamId = req.body.streamId;
   lastParentMessageId = req.body.parentMessageId;
   lastSpec = req.body.spec;
+  lastGatewayImages = req._gatewayImages || null;
   res.json({ streamId: 'stream_1', conversationId: req.body.conversationId || 'new' });
 });
 
@@ -96,6 +98,15 @@ jest.mock('~/server/middleware/accessResources/fileAccess', () => ({
 
 jest.mock('~/server/services/Files/strategies', () => ({
   getStrategyFunctions: (...args) => mockGetStrategyFunctions(...args),
+}));
+
+jest.mock('~/server/services/Files/images', () => ({
+  resizeImageBuffer: jest.fn(async (buffer) => ({
+    buffer,
+    bytes: buffer.length,
+    width: 1,
+    height: 1,
+  })),
 }));
 
 jest.mock('~/server/services/Tools/credentials', () => ({
@@ -339,6 +350,7 @@ describe('/api/viventium/gateway', () => {
     lastStreamId = null;
     lastParentMessageId = null;
     lastSpec = null;
+    lastGatewayImages = null;
 
     jest.resetModules();
 
@@ -359,7 +371,9 @@ describe('/api/viventium/gateway', () => {
     mockGatewayIngressDeleteOne = jest.fn().mockResolvedValue({});
 
     mockTelegramLinkTokenFindOneAndUpdate = jest.fn().mockResolvedValue(null);
-    mockTelegramMappingFindOne = jest.fn().mockReturnValue({ lean: async () => ({ libreChatUserId: 'user_1' }) });
+    mockTelegramMappingFindOne = jest
+      .fn()
+      .mockReturnValue({ lean: async () => ({ libreChatUserId: 'user_1' }) });
     mockTelegramMappingUpdateOne = jest.fn().mockResolvedValue({});
 
     mockFileAccess = jest.fn((_req, _res, next) => next());
@@ -462,7 +476,9 @@ describe('/api/viventium/gateway', () => {
   test('POST suppresses duplicate ingress replay with no-op response', async () => {
     const duplicateError = new Error('duplicate key');
     duplicateError.code = 11000;
-    mockGatewayIngressCreate.mockResolvedValueOnce({ _id: 'ingress_1' }).mockRejectedValueOnce(duplicateError);
+    mockGatewayIngressCreate
+      .mockResolvedValueOnce({ _id: 'ingress_1' })
+      .mockRejectedValueOnce(duplicateError);
 
     const gatewayRouter = require('../gateway');
     const app = createTestApp(gatewayRouter);
@@ -633,6 +649,65 @@ describe('/api/viventium/gateway', () => {
     );
   });
 
+  test('POST injects extracted document images from file uploads into the vision payload', async () => {
+    const gatewayRouter = require('../gateway');
+    const { resizeImageBuffer } = require('~/server/services/Files/images');
+    const app = createTestApp(gatewayRouter);
+    mockProcessAgentFileUpload.mockImplementationOnce(async ({ req, res, metadata }) => {
+      res.status(200).json({
+        message: 'Agent file uploaded and processed successfully',
+        file_id: metadata.file_id,
+        temp_file_id: metadata.temp_file_id,
+        filename: req.file?.originalname ?? 'deck.pptx',
+        filepath: '/uploads/mock/deck.pptx',
+        type: req.file?.mimetype,
+        source: 'text',
+        viventiumExtractedImages: ['data:image/png;base64,cG5n'],
+      });
+    });
+    const body = {
+      text: 'review this deck',
+      conversationId: 'new',
+      channel: 'discord',
+      accountId: 'acct-1',
+      externalUserId: 'ext-1',
+      attachments: [
+        {
+          filename: 'deck.pptx',
+          mime_type: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+          data: Buffer.from('pptx-bytes').toString('base64'),
+        },
+      ],
+    };
+    const headers = signedGatewayHeaders({
+      secret: 'gateway_secret',
+      method: 'POST',
+      path: '/api/viventium/gateway/chat',
+      body,
+    });
+    const req = createMockReq({
+      url: '/api/viventium/gateway/chat',
+      headers,
+      body,
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(resizeImageBuffer).toHaveBeenCalledTimes(1);
+    expect(resizeImageBuffer.mock.calls[0][1]).toEqual({ px: 768 });
+    expect(lastGatewayImages).toEqual([
+      {
+        type: 'image_url',
+        image_url: {
+          url: 'data:image/png;base64,cG5n',
+          detail: 'auto',
+        },
+      },
+    ]);
+  });
+
   test('POST new convo persists iconURL spec parity', async () => {
     const gatewayRouter = require('../gateway');
     const app = createTestApp(gatewayRouter);
@@ -698,7 +773,10 @@ describe('/api/viventium/gateway', () => {
 
     mockSubscribe.mockImplementation(async (_streamId, onChunk, onDone) => {
       onChunk({ event: 'attachment', data: { file_id: 'file-1', filename: 'artifact.png' } });
-      onChunk({ event: 'on_message_delta', data: { delta: { content: [{ type: 'text', text: 'hello' }] } } });
+      onChunk({
+        event: 'on_message_delta',
+        data: { delta: { content: [{ type: 'text', text: 'hello' }] } },
+      });
       onDone({ final: true, responseMessage: { messageId: 'msg-1', text: 'world' } });
       return { unsubscribe: jest.fn() };
     });

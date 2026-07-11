@@ -203,6 +203,12 @@ describe('getOpenAIModels', () => {
   it('returns default models when no environment configurations are provided (and fetch fails)', async () => {
     const models = await getOpenAIModels({ user: 'user456' });
     expect(models).toContain('gpt-4');
+    // === VIVENTIUM START ===
+    // Regression: GPT-5.6 must remain available when live model discovery is unavailable.
+    expect(models).toEqual(
+      expect.arrayContaining(['gpt-5.6', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']),
+    );
+    // === VIVENTIUM END ===
   });
 
   it('returns `AZURE_OPENAI_MODELS` with `azure` flag (and fetch fails)', async () => {

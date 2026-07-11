@@ -121,10 +121,16 @@ async function resolveMessageAttachmentSurface({ req, agent_id }) {
       : '';
 
   let provider =
-    typeof req.body?.provider === 'string' && req.body.provider.trim() ? req.body.provider.trim() : '';
+    typeof req.body?.provider === 'string' && req.body.provider.trim()
+      ? req.body.provider.trim()
+      : '';
   let useResponsesApi = parseBooleanFlag(req.body?.useResponsesApi);
 
-  if ((requestedEndpoint === EModelEndpoint.agents || requestedEndpointType === EModelEndpoint.agents) && agent_id) {
+  if (
+    (requestedEndpoint === EModelEndpoint.agents ||
+      requestedEndpointType === EModelEndpoint.agents) &&
+    agent_id
+  ) {
     const agent = await getAgent({ id: agent_id });
     if (agent?.provider) {
       provider = agent.provider;
@@ -149,7 +155,12 @@ async function resolveMessageAttachmentSurface({ req, agent_id }) {
   };
 }
 
-function isProviderNativeMessageAttachment({ mimetype, endpointType, currentProvider, useResponsesApi }) {
+function isProviderNativeMessageAttachment({
+  mimetype,
+  endpointType,
+  currentProvider,
+  useResponsesApi,
+}) {
   const isAzureWithResponsesApi =
     currentProvider === EModelEndpoint.azureOpenAI && useResponsesApi === true;
   const isBedrock =
@@ -652,10 +663,11 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
   const supportsContextExtraction =
     supportsOCRExtraction || shouldUseDocumentParser || shouldUseSTT || shouldUseDirectText;
   if (messageAttachment && !resolvedToolResource) {
-    const { currentProvider, endpointType, useResponsesApi } = await resolveMessageAttachmentSurface({
-      req,
-      agent_id,
-    });
+    const { currentProvider, endpointType, useResponsesApi } =
+      await resolveMessageAttachmentSurface({
+        req,
+        agent_id,
+      });
     const providerNativeAttachment = isProviderNativeMessageAttachment({
       mimetype: file.mimetype,
       endpointType,
@@ -743,15 +755,24 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
      * @param {number} params.bytes
      * @param {string} params.filepath
      * @param {string} params.type
+     * @param {string[]} params.images
      * @return {Promise<void>}
      */
-    const createTextFile = async ({ text, bytes, filepath, type = 'text/plain' }) => {
+    const createTextFile = async ({ text, bytes, filepath, type = 'text/plain', images = [] }) => {
       const textBytes = Buffer.byteLength(text, 'utf8');
       if (textBytes > 15 * megabyte) {
         throw new Error(
           `Extracted text from "${file.originalname}" exceeds the 15MB storage limit (${Math.round(textBytes / megabyte)}MB). Try a shorter document.`,
         );
       }
+      /* === VIVENTIUM START ===
+       * Feature: Preserve visual payloads extracted from document-parser/OCR message attachments.
+       * Purpose: Let Telegram/gateway attach mixed documents as text context plus vision inputs
+       * instead of dropping document images after text extraction.
+       * === VIVENTIUM END === */
+      const extractedImages = Array.isArray(images)
+        ? images.filter((image) => typeof image === 'string' && image.trim().length > 0)
+        : [];
       const fileInfo = removeNullishValues({
         text,
         bytes,
@@ -775,34 +796,66 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
         });
       }
       const result = await createFile(fileInfo, true);
-      return res
-        .status(200)
-        .json({ message: 'Agent file uploaded and processed successfully', ...result });
+      const payload = { message: 'Agent file uploaded and processed successfully', ...result };
+      if (
+        messageAttachment &&
+        req._viventiumBridgeDocumentImageExtraction === true &&
+        extractedImages.length > 0
+      ) {
+        logger.info(
+          '[processAgentFileUpload] Prepared %d extracted document image(s) for message attachment "%s"',
+          extractedImages.length,
+          file.originalname,
+        );
+        payload.viventiumExtractedImages = extractedImages;
+      }
+      return res.status(200).json(payload);
     };
     const shouldUseOCR = shouldUseConfiguredOCR || shouldUseDocumentParser;
 
+    const documentExtractionErrors = [];
     const resolveDocumentText = async () => {
+      const attemptedStrategies = new Set();
       if (shouldUseConfiguredOCR) {
+        const ocrStrategy = appConfig?.ocr?.strategy ?? FileSources.document_parser;
+        attemptedStrategies.add(ocrStrategy);
         try {
-          const ocrStrategy = appConfig?.ocr?.strategy ?? FileSources.document_parser;
           const { handleFileUpload } = getStrategyFunctions(ocrStrategy);
           return await handleFileUpload({ req, file, loadAuthValues });
         } catch (err) {
+          documentExtractionErrors.push(err);
+          const fallbackSuffix =
+            ocrStrategy === FileSources.document_parser ? '' : ', falling back to document_parser';
           logger.error(
-            `[processAgentFileUpload] Configured OCR failed for "${file.originalname}", falling back to document_parser:`,
+            `[processAgentFileUpload] Configured OCR failed for "${file.originalname}"${fallbackSuffix}:`,
             err,
           );
         }
+      }
+      if (attemptedStrategies.has(FileSources.document_parser)) {
+        return;
       }
       try {
         const { handleFileUpload } = getStrategyFunctions(FileSources.document_parser);
         return await handleFileUpload({ req, file, loadAuthValues });
       } catch (err) {
+        documentExtractionErrors.push(err);
         logger.error(
           `[processAgentFileUpload] Document parser failed for "${file.originalname}":`,
           err,
         );
       }
+    };
+
+    const documentExtractionFailureMessage = () => {
+      const messages = documentExtractionErrors.map((err) => String(err?.message || err || ''));
+      if (messages.some((message) => /No text found in document/i.test(message))) {
+        return `No readable text was found in "${file.originalname}". This file may be visual-heavy and needs OCR, vision, or worker analysis.`;
+      }
+      if (messages.some((message) => /Unsupported file type in document parser/i.test(message))) {
+        return `Unable to extract text from "${file.originalname}". The configured document parser does not support ${file.mimetype}. Configure OCR, vision, or a tool path that supports this file.`;
+      }
+      return `Unable to extract text from "${file.originalname}". The configured OCR/document parser failed to produce readable text.`;
     };
 
     if (shouldUseConfiguredOCR && !(await checkCapability(req, AgentCapabilities.ocr))) {
@@ -812,12 +865,10 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
     if (shouldUseOCR) {
       const ocrResult = await resolveDocumentText();
       if (ocrResult) {
-        const { text, bytes, filepath: ocrFileURL } = ocrResult;
-        return await createTextFile({ text, bytes, filepath: ocrFileURL });
+        const { text, bytes, filepath: ocrFileURL, images = [] } = ocrResult;
+        return await createTextFile({ text, bytes, filepath: ocrFileURL, images });
       }
-      throw new Error(
-        `Unable to extract text from "${file.originalname}". The document may be image-based and requires an OCR service to process.`,
-      );
+      throw new Error(documentExtractionFailureMessage());
     }
 
     if (shouldUseSTT) {

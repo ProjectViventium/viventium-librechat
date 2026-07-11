@@ -88,16 +88,33 @@ const meiliEnabled =
  * memory hardening, not searchable live-recall documents. Keep them out of Meili even when the
  * generic sync plugin would otherwise index every non-expired message.
  * === VIVENTIUM END === */
-function isListenOnlyMeiliOptOut(doc: unknown): boolean {
-  const metadata = (doc as { metadata?: { viventium?: { type?: unknown; mode?: unknown } } })
-    ?.metadata?.viventium;
-  return metadata?.type === 'listen_only_transcript' && metadata?.mode === 'listen_only';
+function isViventiumMeiliOptOut(doc: unknown): boolean {
+  const row = doc as {
+    expiredAt?: unknown;
+    metadata?: {
+      viventium?: {
+        type?: unknown;
+        mode?: unknown;
+        qaRun?: unknown;
+        memoryEligible?: unknown;
+      };
+    };
+  };
+  const metadata = row?.metadata?.viventium;
+  return (
+    !_.isNil(row?.expiredAt) ||
+    (metadata?.type === 'listen_only_transcript' && metadata?.mode === 'listen_only') ||
+    metadata?.qaRun === true ||
+    metadata?.memoryEligible === false
+  );
 }
 
 const getMeiliEligibleQuery = (): FilterQuery<unknown> => ({
   expiredAt: null,
   'metadata.viventium.type': { $ne: 'listen_only_transcript' },
   'metadata.viventium.mode': { $ne: 'listen_only' },
+  'metadata.viventium.qaRun': { $ne: true },
+  'metadata.viventium.memoryEligible': { $ne: false },
 });
 
 /**
@@ -421,6 +438,8 @@ const createMeiliMongooseModel = ({
           query[primaryKey] = { $in: meiliIds };
           query['metadata.viventium.type'] = { $ne: 'listen_only_transcript' };
           query['metadata.viventium.mode'] = { $ne: 'listen_only' };
+          query['metadata.viventium.qaRun'] = { $ne: true };
+          query['metadata.viventium.memoryEligible'] = { $ne: false };
 
           // Find which documents exist in MongoDB and are still eligible for indexing.
           const existingDocs = await this.find(query).select(primaryKey).lean();
@@ -535,7 +554,7 @@ const createMeiliMongooseModel = ({
       next: CallbackWithoutResultAndOptionalError,
     ): Promise<void> {
       // If this conversation or message has a TTL, don't index it
-      if (!_.isNil(this.expiredAt) || isListenOnlyMeiliOptOut(this)) {
+      if (isViventiumMeiliOptOut(this)) {
         return next();
       }
 
@@ -617,8 +636,16 @@ const createMeiliMongooseModel = ({
      * otherwise, it adds the document to the index.
      */
     postSaveHook(this: DocumentWithMeiliIndex, next: CallbackWithoutResultAndOptionalError): void {
-      if (isListenOnlyMeiliOptOut(this)) {
-        return next();
+      if (isViventiumMeiliOptOut(this)) {
+        if (!this._meiliIndex) return next();
+        return this.deleteObjectFromMeili!(async (error?: Error) => {
+          if (error) return next(error);
+          await this.collection.updateMany(
+            { _id: this._id as Types.ObjectId },
+            { $set: { _meiliIndex: false } },
+          );
+          next();
+        });
       }
       if (this._meiliIndex) {
         this.updateObjectToMeili!(next);
@@ -637,6 +664,17 @@ const createMeiliMongooseModel = ({
       this: DocumentWithMeiliIndex,
       next: CallbackWithoutResultAndOptionalError,
     ): void {
+      if (isViventiumMeiliOptOut(this)) {
+        if (!this._meiliIndex) return next();
+        return this.deleteObjectFromMeili!(async (error?: Error) => {
+          if (error) return next(error);
+          await this.collection.updateMany(
+            { _id: this._id as Types.ObjectId },
+            { $set: { _meiliIndex: false } },
+          );
+          next();
+        });
+      }
       if (this._meiliIndex) {
         this.updateObjectToMeili!(next);
       } else {

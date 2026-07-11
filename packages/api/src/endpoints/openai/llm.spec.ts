@@ -498,8 +498,9 @@ describe('getOpenAILLMConfig', () => {
       expect(result.llmConfig).not.toHaveProperty('reasoning_effort');
       expect(result.llmConfig).not.toHaveProperty('reasoning');
 
-      const params = new ChatOpenAI(result.llmConfig as ConstructorParameters<typeof ChatOpenAI>[0])
-        .invocationParams();
+      const params = new ChatOpenAI(
+        result.llmConfig as ConstructorParameters<typeof ChatOpenAI>[0],
+      ).invocationParams();
 
       expect(params).toHaveProperty('reasoning_effort', ReasoningEffort.none);
       expect(params).not.toHaveProperty('reasoning');
@@ -517,7 +518,10 @@ describe('getOpenAILLMConfig', () => {
           },
         });
 
-        expect(result.llmConfig).toHaveProperty('modelKwargs.reasoning_effort', ReasoningEffort.none);
+        expect(result.llmConfig).toHaveProperty(
+          'modelKwargs.reasoning_effort',
+          ReasoningEffort.none,
+        );
       }
     });
 
@@ -582,6 +586,29 @@ describe('getOpenAILLMConfig', () => {
         effort: ReasoningEffort.medium,
         summary: ReasoningSummary.detailed,
       });
+    });
+
+    it('preserves the GPT-5.6 Fast priority tier with none reasoning on Responses', () => {
+      const result = getOpenAILLMConfig({
+        apiKey: 'test-api-key',
+        streaming: false,
+        endpoint: EModelEndpoint.openAI,
+        modelOptions: {
+          model: 'gpt-5.6-terra',
+          reasoning_effort: ReasoningEffort.none,
+          useResponsesApi: true,
+          service_tier: 'priority',
+        },
+      });
+
+      expect(result.llmConfig).toEqual(
+        expect.objectContaining({
+          model: 'gpt-5.6-terra',
+          useResponsesApi: true,
+          service_tier: 'priority',
+          reasoning: { effort: ReasoningEffort.none },
+        }),
+      );
     });
   });
 

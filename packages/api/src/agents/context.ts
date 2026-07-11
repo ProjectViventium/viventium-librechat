@@ -130,18 +130,28 @@ async function getMCPInstructionsWithSourcesForServers(
  * @param {string} [params.sharedRunContext] - Run-level context shared by all agents (file context, RAG, memory)
  * @param {string} [params.baseInstructions] - Agent's base instructions
  * @param {string} [params.mcpInstructions] - Agent's MCP server instructions
+ * @param {string} [params.dynamicTailContext] - Per-turn state appended after stable instructions
  * @returns {string | undefined} Combined instructions, or undefined if empty
  */
 export function buildAgentInstructions({
   sharedRunContext,
   baseInstructions,
   mcpInstructions,
+  dynamicTailContext,
 }: {
   sharedRunContext?: string;
   baseInstructions?: string;
   mcpInstructions?: string;
+  dynamicTailContext?: string;
 }): string | undefined {
-  const parts = [sharedRunContext, baseInstructions, mcpInstructions].filter(Boolean);
+  /* === VIVENTIUM START ===
+   * Feature: Dynamic tail context for Feelings and other per-turn state.
+   * Purpose: Preserve the stable instruction prefix and place changing state at the final system
+   * boundary, where it remains high-priority without invalidating upstream prompt-cache prefixes.
+   * === VIVENTIUM END === */
+  const parts = [sharedRunContext, baseInstructions, mcpInstructions, dynamicTailContext].filter(
+    Boolean,
+  );
   const combined = parts.join('\n\n').trim();
   return combined || undefined;
 }
@@ -164,6 +174,7 @@ export async function applyContextToAgent({
   sharedRunContext,
   mcpManager,
   ephemeralAgent,
+  dynamicTailContext,
   agentId,
   logger,
 }: {
@@ -171,6 +182,7 @@ export async function applyContextToAgent({
   sharedRunContext: string;
   mcpManager: MCPManager;
   ephemeralAgent?: TEphemeralAgent;
+  dynamicTailContext?: string;
   agentId?: string;
   logger?: Logger;
 }): Promise<void> {
@@ -186,6 +198,7 @@ export async function applyContextToAgent({
       sharedRunContext,
       baseInstructions,
       mcpInstructions,
+      dynamicTailContext,
     });
 
     if (agentId && logger) {
@@ -197,6 +210,7 @@ export async function applyContextToAgent({
       sharedRunContext,
       baseInstructions,
       mcpInstructions: '',
+      dynamicTailContext,
     });
 
     if (logger) {

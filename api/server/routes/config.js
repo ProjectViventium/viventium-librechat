@@ -126,6 +126,13 @@ router.get('/', async function (req, res) {
         isEnabled(process.env.VIVENTIUM_LOCAL_SUBSCRIPTION_AUTH) &&
         !isEnabled(process.env.VIVENTIUM_PROMPT_WORKBENCH_LINK_DISABLED),
       /* === VIVENTIUM START ===
+       * Feature: Feelings instrument availability.
+       * Purpose: Keep navigation aligned with the operator-level feature gate.
+       * === VIVENTIUM END === */
+      viventiumFeelingsAvailable:
+        process.env.VIVENTIUM_FEELINGS_AVAILABLE == null ||
+        isEnabled(process.env.VIVENTIUM_FEELINGS_AVAILABLE),
+      /* === VIVENTIUM START ===
        * Feature: GlassHive host worker callbacks.
        * Purpose: Project the compiled callback wait window into the web client.
        * === VIVENTIUM END === */

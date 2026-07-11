@@ -187,6 +187,14 @@ describe('conversationRecallService', () => {
     const service = require('../conversationRecallService');
     await service.refreshConversationRecallForUser({ userId: 'user_1' });
 
+    expect(mockMessageFind).toHaveBeenCalledWith(
+      expect.objectContaining({
+        'metadata.viventium.memoryEligible': { $ne: false },
+        'metadata.viventium.qaRun': { $ne: true },
+        $or: [{ expiredAt: { $exists: false } }, { expiredAt: null }],
+      }),
+    );
+
     expect(mockUploadVectors).toHaveBeenCalledTimes(1);
     expect(mockUploadVectors.mock.calls[0][0].file_id).toBe('conversation_recall:user_1:all');
     expect(mockUploadVectors.mock.calls[0][0].file.originalname).toBe(
@@ -477,7 +485,7 @@ describe('conversationRecallService', () => {
     await service.refreshConversationRecallForUser({ userId: 'user_1' });
 
     expect(mockUploadVectors).toHaveBeenCalledTimes(1);
-    expect(mockFileFindOneAndUpdate).toHaveBeenCalledTimes(1);
+    expect(mockFileFindOneAndUpdate).toHaveBeenCalledTimes(2);
   });
 
   test('does not skip refresh when prior upload digest differs from the current source digest', async () => {
@@ -824,6 +832,91 @@ describe('conversationRecallService', () => {
     ).rejects.toMatchObject({ message: 'bad request' });
     expect(mockUploadVectors).toHaveBeenCalledTimes(1);
     expect(mockFileFindOneAndUpdate).not.toHaveBeenCalled();
+  });
+
+  test('marks replaced recall metadata unembedded before upload so failures cannot look current', async () => {
+    mockUserFindById.mockReturnValue(
+      queryResult({ personalization: { conversation_recall: true } }),
+    );
+    mockMessageFind.mockReturnValue(
+      queryResult([
+        {
+          conversationId: 'conv_1',
+          createdAt: '2026-02-19T00:00:00.000Z',
+          isCreatedByUser: true,
+          text: 'changed clean corpus',
+        },
+      ]),
+    );
+    mockConversationFind.mockReturnValue(queryResult([]));
+    mockFileFind.mockReturnValue(queryResult([]));
+    mockFileFindOne.mockReturnValue(
+      queryResult({
+        _id: 'existing_file',
+        file_id: 'conversation_recall:user_1:all',
+        embedded: true,
+        metadata: {
+          conversationRecallUploadedDigest: 'old-digest',
+          conversationRecallSourceDigest: 'old-digest',
+        },
+      }),
+    );
+    mockFileFindOneAndUpdate.mockReturnValue(queryResult({ _id: 'existing_file' }));
+    mockUploadVectors.mockRejectedValue({ response: { status: 400 }, message: 'bad request' });
+
+    const service = require('../conversationRecallService');
+    await expect(
+      service.refreshConversationRecallForUser({ userId: 'user_1' }),
+    ).rejects.toMatchObject({ message: 'bad request' });
+
+    expect(mockFileFindOneAndUpdate).toHaveBeenCalledWith(
+      { user: 'user_1', file_id: 'conversation_recall:user_1:all' },
+      expect.objectContaining({
+        $set: { embedded: false },
+        $unset: expect.objectContaining({
+          'metadata.conversationRecallUploadedDigest': '',
+        }),
+      }),
+      { new: true },
+    );
+  });
+
+  test('same-process refresh rebuilds after a failed replacement instead of trusting cached digest', async () => {
+    let messageText = 'corpus-a';
+    mockUserFindById.mockReturnValue(
+      queryResult({ personalization: { conversation_recall: true } }),
+    );
+    mockMessageFind.mockImplementation(() =>
+      queryResult([
+        {
+          conversationId: 'conv_1',
+          createdAt: '2026-02-19T00:00:00.000Z',
+          isCreatedByUser: true,
+          text: messageText,
+        },
+      ]),
+    );
+    mockConversationFind.mockReturnValue(queryResult([]));
+    mockFileFind.mockReturnValue(queryResult([]));
+    mockFileFindOne.mockReturnValue(
+      queryResult({ _id: 'existing_file', embedded: true, metadata: {} }),
+    );
+    mockFileFindOneAndUpdate.mockReturnValue(queryResult({ _id: 'existing_file' }));
+    mockUploadVectors
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce({ response: { status: 400 }, message: 'bad request' })
+      .mockResolvedValueOnce(undefined);
+
+    const service = require('../conversationRecallService');
+    await service.refreshConversationRecallForUser({ userId: 'user_1' });
+    messageText = 'corpus-b';
+    await expect(
+      service.refreshConversationRecallForUser({ userId: 'user_1' }),
+    ).rejects.toMatchObject({ message: 'bad request' });
+    messageText = 'corpus-a';
+    await service.refreshConversationRecallForUser({ userId: 'user_1' });
+
+    expect(mockUploadVectors).toHaveBeenCalledTimes(3);
   });
 
   test('self-heals duplicate vector write errors by deleting stale vectors and retrying upload', async () => {

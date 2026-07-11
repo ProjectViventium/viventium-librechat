@@ -327,13 +327,24 @@ async function applyProposalWithMethods(
     const memories = await memoryMethods.getAllUserMemories(options.userId);
     const existing = memories.find((memory) => memory.key === action.key);
     if (action.action === 'delete') {
+      let deleteResult = null;
       if (options.apply && existing) {
-        await memoryMethods.deleteMemory({ userId: options.userId, key: action.key });
+        deleteResult = await memoryMethods.deleteMemory({
+          userId: options.userId,
+          key: action.key,
+          expectedRevision: Number(existing.__v ?? 0),
+        });
       }
       results.push({
         action: 'delete',
         key: action.key,
-        status: existing ? (options.apply ? 'deleted' : 'would_delete') : 'already_absent',
+        status: deleteResult?.conflict
+          ? 'rejected_revision_conflict'
+          : existing
+            ? options.apply
+              ? 'deleted'
+              : 'would_delete'
+            : 'already_absent',
       });
       continue;
     }
@@ -364,12 +375,22 @@ async function applyProposalWithMethods(
       continue;
     }
     if (options.apply) {
-      await memoryMethods.setMemory({
+      const writeResult = await memoryMethods.setMemory({
         userId: options.userId,
         key: action.key,
         value: prepared.value,
         tokenCount: prepared.tokenCount,
+        expectedRevision: existing ? Number(existing.__v ?? 0) : null,
       });
+      if (writeResult?.conflict) {
+        results.push({
+          action: 'set',
+          key: action.key,
+          valueHash: sha(prepared.value),
+          status: 'rejected_revision_conflict',
+        });
+        continue;
+      }
     }
     results.push({
       action: 'set',
@@ -392,11 +413,11 @@ async function applyProposalWithMethods(
     await runMemoryMaintenance({
       userId: options.userId,
       getAllUserMemories: async (userId) => memoryMethods.getAllUserMemories(userId),
-      setMemory: async ({ userId, key, value, tokenCount }) => {
+      setMemory: async ({ userId, key, value, tokenCount, expectedRevision }) => {
         if (!governedKeys.has(key)) {
           return { ok: true, skipped: true, reason: 'outside_proposal_scope' };
         }
-        return memoryMethods.setMemory({ userId, key, value, tokenCount });
+        return memoryMethods.setMemory({ userId, key, value, tokenCount, expectedRevision });
       },
       policy,
     });

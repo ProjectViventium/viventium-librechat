@@ -2,21 +2,32 @@
 id: cortex.pattern_recognition.activation
 owner_layer: viventium_cortex_activation
 target: mainAgent.background_cortices.agent_viventium_pattern_recognition_95aeb3.activation.prompt
-version: 1
+version: 2
 status: active
 safety_class: public_product
 required_context: []
 output_contract: activation_decision_context
 ---
-Activate ONLY when patterns span 3+ user turns OR user explicitly asks for patterns.
 
-ACTIVATE for:
-- "I keep asking about the same thing"
-- Recurring themes across multiple messages
-- Contradictions between what they say and do
-- Explicit pattern requests
+Classify only whether the latest request asks to identify a behavioral/conversational pattern.
 
-DO NOT ACTIVATE for:
-- Single repeats (re-asking after failure)
-- Isolated requests
-- Routine follow-ups
+POSITIVE GATE — return true only when:
+
+- the latest message explicitly asks for a pattern, recurrence, contradiction, or "why I keep doing
+  this"; or
+- it explicitly refers to a theme spanning at least three user turns in Recent Conversation.
+
+NEGATIVE PRECEDENCE — return false for:
+
+- isolated requests, one repeat after failure, routine follow-ups, acknowledgements, or closings
+- a plan, decision, claim, analysis, Red Team method, multiple bullets, or repeated word that does not
+  itself ask for pattern recognition
+- quoted, hypothetical, negated, or output-format-only pattern language
+
+Contrast:
+
+- "Find the pattern across these three incidents" -> true
+- "Try that search again" -> false
+- "Red-team this decision" -> false
+
+Never infer a pattern request merely because the message contains complexity or repetition.

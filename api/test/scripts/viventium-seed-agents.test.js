@@ -33,7 +33,7 @@ describe('viventium-seed-agents', () => {
             agent_id: 'agent_viventium_online_tool_use_95aeb3',
             activation: {
               provider: 'groq',
-              model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+              model: 'qwen/qwen3.6-27b',
             },
           },
         ],
@@ -56,9 +56,9 @@ describe('viventium-seed-agents', () => {
         VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER: 'anthropic',
         VIVENTIUM_FC_CONSCIOUS_LLM_MODEL: 'claude-opus-4-8',
         VIVENTIUM_CORTEX_PRODUCTIVITY_LLM_PROVIDER: 'anthropic',
-        VIVENTIUM_CORTEX_PRODUCTIVITY_LLM_MODEL: 'claude-sonnet-4-5',
+        VIVENTIUM_CORTEX_PRODUCTIVITY_LLM_MODEL: 'claude-opus-4-8',
         OTUC_ACTIVATION_PROVIDER: 'groq',
-        OTUC_ACTIVATION_LLM: 'meta-llama/llama-4-scout-17b-16e-instruct',
+        OTUC_ACTIVATION_LLM: 'qwen/qwen3.6-27b',
       },
     });
 
@@ -68,8 +68,8 @@ describe('viventium-seed-agents', () => {
     expect(normalized.mainAgent.voice_llm_provider).toBe('openAI');
     expect(normalized.mainAgent.voice_llm_model).toBe('gpt-5.4');
     expect(normalized.backgroundAgents[0].provider).toBe('anthropic');
-    expect(normalized.backgroundAgents[0].model).toBe('claude-sonnet-4-5');
-    expect(normalized.backgroundAgents[0].model_parameters.model).toBe('claude-sonnet-4-5');
+    expect(normalized.backgroundAgents[0].model).toBe('claude-opus-4-8');
+    expect(normalized.backgroundAgents[0].model_parameters.model).toBe('claude-opus-4-8');
   });
 
   test('resolves promptRef instructions before seed-style persistence', () => {

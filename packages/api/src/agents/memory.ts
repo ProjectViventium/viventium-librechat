@@ -1,5 +1,6 @@
 /** Memories */
 import { z } from 'zod';
+import { createHmac, randomBytes } from 'crypto';
 import { tool } from '@langchain/core/tools';
 import { Tools, supportsAdaptiveThinking } from 'librechat-data-provider';
 import { logger } from '@librechat/data-schemas';
@@ -57,6 +58,14 @@ export interface MemorySnapshot {
   withoutKeys: string;
   totalTokens: number;
   memoryTokenMap: Record<string, number>;
+  memoryRevisionMap: Record<string, number>;
+  memoryValueHashMap: Record<string, string>;
+}
+
+export interface MemoryWriteAuditContext {
+  source?: string;
+  conversationId?: string;
+  messageId?: string;
 }
 
 /* === VIVENTIUM START ===
@@ -672,14 +681,72 @@ function buildGenericMemoryErrorArtifact(
 type MemoryRuntimeState = {
   tokenCounts: Record<string, number>;
   runningTotalTokens: number;
+  revisions: Record<string, number>;
+  valueHashes: Record<string, string>;
+  revisionProtected: boolean;
 };
+
+const memoryAuditHashKey = randomBytes(32);
+const hashMemoryAuditValue = (value: unknown): string =>
+  createHmac('sha256', memoryAuditHashKey)
+    .update(String(value ?? ''))
+    .digest('hex')
+    .slice(0, 16);
+
+function logMemoryWriteAudit({
+  userId,
+  key,
+  action,
+  status,
+  beforeHash,
+  afterHash,
+  auditContext,
+}: {
+  userId: string | ObjectId;
+  key: string;
+  action: 'set' | 'delete';
+  status: 'applied' | 'conflict' | 'failed';
+  beforeHash?: string;
+  afterHash?: string;
+  auditContext?: MemoryWriteAuditContext;
+}) {
+  logger.info('[MemoryAgent] write audit', {
+    event: 'memory_writer_write',
+    userHash: hashMemoryAuditValue(userId),
+    conversationHash: auditContext?.conversationId
+      ? hashMemoryAuditValue(auditContext.conversationId)
+      : undefined,
+    messageHash: auditContext?.messageId ? hashMemoryAuditValue(auditContext.messageId) : undefined,
+    source: auditContext?.source ?? 'chat',
+    key,
+    action,
+    status,
+    beforeHash,
+    afterHash,
+  });
+}
+
+function memoryErrorMetadata(error: unknown): Record<string, unknown> {
+  const typed = error as
+    | { name?: string; code?: string | number; status?: number; statusCode?: number }
+    | undefined;
+  return {
+    errorType: typed?.name ?? 'unknown',
+    errorCode: typed?.code,
+    errorStatus: typed?.status ?? typed?.statusCode,
+  };
+}
 
 function createMemoryRuntimeState({
   memoryTokenMap,
   totalTokens = 0,
+  memoryRevisionMap,
+  memoryValueHashMap,
 }: {
   memoryTokenMap?: Record<string, number>;
   totalTokens?: number;
+  memoryRevisionMap?: Record<string, number>;
+  memoryValueHashMap?: Record<string, string>;
 }): MemoryRuntimeState {
   const tokenCounts: Record<string, number> = { ...(memoryTokenMap ?? {}) };
   let runningTotalTokens = totalTokens;
@@ -694,6 +761,9 @@ function createMemoryRuntimeState({
   return {
     tokenCounts,
     runningTotalTokens,
+    revisions: { ...(memoryRevisionMap ?? {}) },
+    valueHashes: { ...(memoryValueHashMap ?? {}) },
+    revisionProtected: memoryRevisionMap !== undefined,
   };
 }
 
@@ -707,6 +777,9 @@ export const createMemoryTool = ({
   tokenLimit,
   keyLimits,
   memoryTokenMap,
+  memoryRevisionMap,
+  memoryValueHashMap,
+  auditContext,
   totalTokens = 0,
   state,
 }: {
@@ -716,6 +789,9 @@ export const createMemoryTool = ({
   tokenLimit?: number;
   keyLimits?: MemoryKeyLimits;
   memoryTokenMap?: Record<string, number>;
+  memoryRevisionMap?: Record<string, number>;
+  memoryValueHashMap?: Record<string, string>;
+  auditContext?: MemoryWriteAuditContext;
   totalTokens?: number;
   state?: MemoryRuntimeState;
 }) => {
@@ -738,6 +814,8 @@ export const createMemoryTool = ({
     createMemoryRuntimeState({
       memoryTokenMap,
       totalTokens,
+      memoryRevisionMap,
+      memoryValueHashMap,
     });
 
   return tool(
@@ -775,17 +853,77 @@ export const createMemoryTool = ({
           },
         };
 
-        const result = await setMemory({ userId, key, value: nextValue, tokenCount });
+        const beforeHash = runtimeState.valueHashes[key];
+        const writeParams = {
+          userId,
+          key,
+          value: nextValue,
+          tokenCount,
+          ...(runtimeState.revisionProtected
+            ? { expectedRevision: runtimeState.revisions[key] ?? null }
+            : {}),
+        };
+        const result = await setMemory(writeParams);
         if (result.ok) {
           runtimeState.tokenCounts[key] = tokenCount;
           runtimeState.runningTotalTokens += tokenDelta;
-          logger.debug(`Memory set for key "${key}" (${tokenCount} tokens) for user "${userId}"`);
+          runtimeState.valueHashes[key] = hashMemoryAuditValue(nextValue);
+          if (result.revision != null) {
+            runtimeState.revisions[key] = result.revision;
+          }
+          logMemoryWriteAudit({
+            userId,
+            key,
+            action: 'set',
+            status: 'applied',
+            beforeHash,
+            afterHash: runtimeState.valueHashes[key],
+            auditContext,
+          });
+          logger.debug(`Memory set for key "${key}" (${tokenCount} tokens)`);
           return [`Memory set for key "${key}" (${tokenCount} tokens)`, artifact];
         }
-        logger.warn(`Failed to set memory for key "${key}" for user "${userId}"`);
+        if (result.conflict) {
+          const message = `Memory key "${key}" changed while this memory update was running; the stale update was not applied.`;
+          logMemoryWriteAudit({
+            userId,
+            key,
+            action: 'set',
+            status: 'conflict',
+            beforeHash,
+            afterHash: hashMemoryAuditValue(nextValue),
+            auditContext,
+          });
+          return [
+            message,
+            buildGenericMemoryErrorArtifact(message, runtimeState.runningTotalTokens, {
+              errorType: 'revision_conflict',
+              key,
+            }),
+          ];
+        }
+        logMemoryWriteAudit({
+          userId,
+          key,
+          action: 'set',
+          status: 'failed',
+          beforeHash,
+          afterHash: hashMemoryAuditValue(nextValue),
+          auditContext,
+        });
+        logger.warn(`Failed to set memory for key "${key}"`);
         return [`Failed to set memory for key "${key}"`, undefined];
       } catch (error) {
-        logger.error('Memory Agent failed to set memory', error);
+        logMemoryWriteAudit({
+          userId,
+          key,
+          action: 'set',
+          status: 'failed',
+          beforeHash: runtimeState.valueHashes[key],
+          afterHash: hashMemoryAuditValue(value),
+          auditContext,
+        });
+        logger.error('Memory Agent failed to set memory', memoryErrorMetadata(error));
         return [`Error setting memory for key "${key}"`, undefined];
       }
     },
@@ -824,6 +962,9 @@ const createDeleteMemoryTool = ({
   deleteMemory,
   validKeys,
   memoryTokenMap,
+  memoryRevisionMap,
+  memoryValueHashMap,
+  auditContext,
   totalTokens = 0,
   state,
 }: {
@@ -831,6 +972,9 @@ const createDeleteMemoryTool = ({
   deleteMemory: MemoryMethods['deleteMemory'];
   validKeys?: string[];
   memoryTokenMap?: Record<string, number>;
+  memoryRevisionMap?: Record<string, number>;
+  memoryValueHashMap?: Record<string, string>;
+  auditContext?: MemoryWriteAuditContext;
   totalTokens?: number;
   state?: MemoryRuntimeState;
 }) => {
@@ -839,6 +983,8 @@ const createDeleteMemoryTool = ({
     createMemoryRuntimeState({
       memoryTokenMap,
       totalTokens,
+      memoryRevisionMap,
+      memoryValueHashMap,
     });
 
   return tool(
@@ -860,21 +1006,72 @@ const createDeleteMemoryTool = ({
           },
         };
 
-        const result = await deleteMemory({ userId, key });
+        const beforeHash = runtimeState.valueHashes[key];
+        const result = await deleteMemory({
+          userId,
+          key,
+          ...(runtimeState.revisionProtected
+            ? { expectedRevision: runtimeState.revisions[key] ?? null }
+            : {}),
+        });
         if (result.ok) {
           const previousTokenCount = runtimeState.tokenCounts[key] ?? 0;
           delete runtimeState.tokenCounts[key];
+          delete runtimeState.revisions[key];
+          delete runtimeState.valueHashes[key];
           runtimeState.runningTotalTokens = Math.max(
             0,
             runtimeState.runningTotalTokens - previousTokenCount,
           );
-          logger.debug(`Memory deleted for key "${key}" for user "${userId}"`);
+          logMemoryWriteAudit({
+            userId,
+            key,
+            action: 'delete',
+            status: 'applied',
+            beforeHash,
+            auditContext,
+          });
+          logger.debug(`Memory deleted for key "${key}"`);
           return [`Memory deleted for key "${key}"`, artifact];
         }
-        logger.warn(`Failed to delete memory for key "${key}" for user "${userId}"`);
+        if (result.conflict) {
+          const message = `Memory key "${key}" changed while this memory update was running; the stale delete was not applied.`;
+          logMemoryWriteAudit({
+            userId,
+            key,
+            action: 'delete',
+            status: 'conflict',
+            beforeHash,
+            auditContext,
+          });
+          return [
+            message,
+            buildGenericMemoryErrorArtifact(message, runtimeState.runningTotalTokens, {
+              errorType: 'revision_conflict',
+              key,
+            }),
+          ];
+        }
+        logMemoryWriteAudit({
+          userId,
+          key,
+          action: 'delete',
+          status: 'failed',
+          beforeHash,
+          auditContext,
+        });
+        logger.warn(`Failed to delete memory for key "${key}"`);
         return [`Failed to delete memory for key "${key}"`, undefined];
       } catch (error) {
-        logger.error('Memory Agent failed to delete memory', error);
+        logMemoryWriteAudit({
+          userId,
+          key,
+          action: 'delete',
+          status: 'failed',
+          beforeHash: runtimeState.valueHashes[key],
+          auditContext,
+        });
+        logger.error('Memory Agent failed to delete memory', memoryErrorMetadata(error));
         return [`Error deleting memory for key "${key}"`, undefined];
       }
     },
@@ -918,6 +1115,9 @@ export const createApplyMemoryChangesTool = ({
   tokenLimit,
   keyLimits,
   memoryTokenMap,
+  memoryRevisionMap,
+  memoryValueHashMap,
+  auditContext,
   totalTokens = 0,
 }: {
   userId: string | ObjectId;
@@ -927,11 +1127,16 @@ export const createApplyMemoryChangesTool = ({
   tokenLimit?: number;
   keyLimits?: MemoryKeyLimits;
   memoryTokenMap?: Record<string, number>;
+  memoryRevisionMap?: Record<string, number>;
+  memoryValueHashMap?: Record<string, string>;
+  auditContext?: MemoryWriteAuditContext;
   totalTokens?: number;
 }) => {
   const runtimeState = createMemoryRuntimeState({
     memoryTokenMap,
     totalTokens,
+    memoryRevisionMap,
+    memoryValueHashMap,
   });
   const setMemoryTool = createMemoryTool({
     userId,
@@ -940,12 +1145,14 @@ export const createApplyMemoryChangesTool = ({
     tokenLimit,
     keyLimits,
     state: runtimeState,
+    auditContext,
   });
   const deleteMemoryTool = createDeleteMemoryTool({
     userId,
     deleteMemory,
     validKeys,
     state: runtimeState,
+    auditContext,
   });
   const noopMemoryTool = createNoopMemoryTool();
 
@@ -1180,6 +1387,9 @@ export async function processMemory({
   tokenLimit,
   keyLimits,
   memoryTokenMap,
+  memoryRevisionMap,
+  memoryValueHashMap,
+  auditContext,
   totalTokens = 0,
   streamId = null,
   user,
@@ -1197,6 +1407,9 @@ export async function processMemory({
   tokenLimit?: number;
   keyLimits?: MemoryKeyLimits;
   memoryTokenMap?: Record<string, number>;
+  memoryRevisionMap?: Record<string, number>;
+  memoryValueHashMap?: Record<string, string>;
+  auditContext?: MemoryWriteAuditContext;
   totalTokens?: number;
   llmConfig?: Partial<LLMConfig>;
   streamId?: string | null;
@@ -1211,6 +1424,9 @@ export async function processMemory({
       setMemory,
       validKeys,
       memoryTokenMap,
+      memoryRevisionMap,
+      memoryValueHashMap,
+      auditContext,
       totalTokens,
     });
     const deleteMemoryTool = createDeleteMemoryTool({
@@ -1218,6 +1434,9 @@ export async function processMemory({
       validKeys,
       deleteMemory,
       memoryTokenMap,
+      memoryRevisionMap,
+      memoryValueHashMap,
+      auditContext,
       totalTokens,
     });
     const noopMemoryTool = createNoopMemoryTool();
@@ -1229,6 +1448,9 @@ export async function processMemory({
       tokenLimit,
       keyLimits: resolvedKeyLimits,
       memoryTokenMap,
+      memoryRevisionMap,
+      memoryValueHashMap,
+      auditContext,
       totalTokens,
     });
 
@@ -1494,16 +1716,10 @@ ${memory ?? 'No existing memories'}`;
       error,
     });
     logger.error(
-      `[MemoryAgent] Failed to process memory | userId: ${userId} | conversationId: ${conversationId} | messageId: ${messageId} | provider=${String(llmConfig?.provider ?? 'unknown')} | model=${configuredModel ?? 'unknown'} | thinkingMode=${anthropicThinking == null ? 'n/a' : describeAnthropicThinkingMode(anthropicThinking)} | temperature=${String((llmConfig as { temperature?: unknown } | undefined)?.temperature ?? 'unset')} | errorType=${typedError?.type ?? 'unknown'} | errorCode=${typedError?.code ?? 'unknown'} | errorMessage=${String(
-        typedError?.message ?? 'unknown',
-      )
-        .replace(/\s+/g, ' ')
-        .slice(0, 300)}`,
+      `[MemoryAgent] Failed to process memory | userHash=${hashMemoryAuditValue(userId)} | conversationHash=${hashMemoryAuditValue(conversationId)} | messageHash=${hashMemoryAuditValue(messageId)} | provider=${String(llmConfig?.provider ?? 'unknown')} | model=${configuredModel ?? 'unknown'} | thinkingMode=${anthropicThinking == null ? 'n/a' : describeAnthropicThinkingMode(anthropicThinking)} | temperature=${String((llmConfig as { temperature?: unknown } | undefined)?.temperature ?? 'unset')} | errorType=${typedError?.type ?? 'unknown'} | errorCode=${typedError?.code ?? 'unknown'}`,
       {
-        error,
         provider: llmConfig?.provider,
         model: configuredModel,
-        errorMessage: typedError?.message,
         errorCode: typedError?.code,
         errorType: typedError?.type,
         memoryWriterHealth: healthEntry
@@ -1541,12 +1757,13 @@ export async function loadMemorySnapshot({
   await runMemoryMaintenance({
     userId: String(userId),
     getAllUserMemories: async (resolvedUserId) => memoryMethods.getAllUserMemories(resolvedUserId),
-    setMemory: async ({ userId: maintenanceUserId, key, value, tokenCount }) =>
+    setMemory: async ({ userId: maintenanceUserId, key, value, tokenCount, expectedRevision }) =>
       memoryMethods.setMemory({
         userId: maintenanceUserId,
         key,
         value,
         tokenCount,
+        expectedRevision,
       }),
     policy: {
       validKeys,
@@ -1556,12 +1773,24 @@ export async function loadMemorySnapshot({
     },
   });
 
-  const formatted = await memoryMethods.getFormattedMemories({ userId });
+  const entries = await memoryMethods.getAllUserMemories(userId);
+  const formatted = await memoryMethods.getFormattedMemories({ userId, memories: entries });
+  const memoryRevisionMap: Record<string, number> = {};
+  const memoryValueHashMap: Record<string, string> = {};
+  for (const entry of entries ?? []) {
+    if (!entry?.key) {
+      continue;
+    }
+    memoryRevisionMap[entry.key] = Number(entry.__v ?? 0);
+    memoryValueHashMap[entry.key] = hashMemoryAuditValue(entry.value);
+  }
   return {
     withKeys: formatted.withKeys ?? '',
     withoutKeys: formatted.withoutKeys ?? '',
     totalTokens: formatted.totalTokens ?? 0,
     memoryTokenMap: formatted.memoryTokenMap ?? {},
+    memoryRevisionMap,
+    memoryValueHashMap,
   };
 }
 
@@ -1575,6 +1804,7 @@ export async function createMemoryProcessor({
   streamId = null,
   user,
   snapshot,
+  auditSource = 'chat',
 }: {
   res: ServerResponse;
   messageId: string;
@@ -1585,6 +1815,7 @@ export async function createMemoryProcessor({
   streamId?: string | null;
   user?: IUser;
   snapshot?: MemorySnapshot;
+  auditSource?: string;
 }): Promise<[string, (messages: BaseMessage[]) => Promise<(TAttachment | null)[] | undefined>]> {
   const { validKeys, instructions, llmConfig, tokenLimit, keyLimits } = config;
   const finalInstructions = [
@@ -1600,7 +1831,14 @@ export async function createMemoryProcessor({
       memoryMethods,
       config,
     }));
-  const { withKeys, withoutKeys, totalTokens, memoryTokenMap } = preparedSnapshot;
+  const {
+    withKeys,
+    withoutKeys,
+    totalTokens,
+    memoryTokenMap,
+    memoryRevisionMap,
+    memoryValueHashMap,
+  } = preparedSnapshot;
 
   return [
     withoutKeys,
@@ -1616,6 +1854,13 @@ export async function createMemoryProcessor({
           messageId,
           tokenLimit,
           memoryTokenMap: memoryTokenMap ?? {},
+          memoryRevisionMap: memoryRevisionMap ?? {},
+          memoryValueHashMap: memoryValueHashMap ?? {},
+          auditContext: {
+            source: auditSource,
+            conversationId,
+            messageId,
+          },
           streamId,
           conversationId,
           memory: withKeys,

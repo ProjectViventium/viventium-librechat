@@ -27,6 +27,7 @@ export {
   openAISettings,
 } from './schemas';
 export * from './schemas';
+export * from './types/feelings';
 
 export type TMessages = TMessage[];
 

@@ -2221,6 +2221,26 @@ def _workbench_metadata(task: Dict[str, Any]) -> Dict[str, Any]:
     return nested if isinstance(nested, dict) else {}
 
 
+_CODEX_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
+
+
+def _workbench_codex_reasoning_effort(value: Any = None) -> str:
+    configured = str(os.getenv("WPR_CODEX_CLI_REASONING_EFFORT") or "").strip().lower()
+    if configured in _CODEX_REASONING_EFFORTS:
+        return configured
+    requested = str(value or "").strip().lower()
+    return requested if requested in _CODEX_REASONING_EFFORTS else ""
+
+
+def _workbench_codex_model(value: Any = None) -> str:
+    return str(
+        os.getenv("WPR_MODEL_HOST_CODEX_CLI")
+        or os.getenv("WPR_MODEL_CODEX_CLI")
+        or value
+        or ""
+    ).strip()
+
+
 def _import_workbench_scheduled_prompts() -> Any:
     current = Path(__file__).resolve()
     for parent in current.parents:
@@ -2255,7 +2275,12 @@ def _refresh_workbench_rendered_prompt(
 
     renderer = _import_workbench_scheduled_prompts()
     user_id = str(task.get("user_id") or definition.get("user_id") or "")
-    render_payload = renderer.render_variables(prompt_text, user_id=user_id, email=None)
+    render_payload = renderer.render_variables(
+        prompt_text,
+        user_id=user_id,
+        email=None,
+        snapshot_mode="create",
+    )
     rendered = str(render_payload.get("rendered") or "")
     if not rendered:
         raise RuntimeError("Prompt Workbench scheduled prompt rendered empty at dispatch time")
@@ -2297,6 +2322,21 @@ def _refresh_workbench_rendered_prompt(
     if execution_metadata:
         patched_metadata["execution"] = execution_metadata
     patched_wb = dict(wb)
+    execution_profile = str(
+        execution_metadata.get("execution_profile")
+        or wb.get("execution_profile")
+        or "codex-cli"
+    ).strip()
+    execution_model = str(
+        execution_metadata.get("execution_model") or wb.get("execution_model") or ""
+    ).strip()
+    reasoning_effort = str(
+        execution_metadata.get("reasoning_effort") or wb.get("reasoning_effort") or ""
+    ).strip()
+    if execution_profile == "codex-cli":
+        execution_model = _workbench_codex_model(execution_model)
+        reasoning_effort = _workbench_codex_reasoning_effort(reasoning_effort)
+
     patched_wb.update(
         {
             "definition_id": definition_id,
@@ -2308,18 +2348,25 @@ def _refresh_workbench_rendered_prompt(
             "variable_snapshot_hash": snapshot_hash,
             "variable_snapshot_json": snapshot_json,
             "variable_snapshot_pointer": f"private://scheduled-prompt-variable-snapshot/{snapshot_hash}",
+            "periphery_snapshot_ref": str(
+                (render_payload.get("peripherySnapshotManifest") or {}).get("snapshotRef") or ""
+            ),
+            "periphery_snapshot_json": render_payload.get("privatePeripherySnapshotJson"),
             "memory_write_mode": definition.get("memory_write_mode") or wb.get("memory_write_mode") or "off",
             "workspace_alias": definition.get("workspace_alias") or wb.get("workspace_alias"),
             "my_folder": definition.get("my_folder") or wb.get("my_folder"),
             "executor": execution_metadata.get("executor") or wb.get("executor") or task.get("executor"),
             "glasshive_worker_strategy": execution_metadata.get("glasshive_worker_strategy") or wb.get("glasshive_worker_strategy") or "same_worker",
-            "execution_profile": execution_metadata.get("execution_profile") or wb.get("execution_profile") or "codex-cli",
+            "execution_profile": execution_profile,
             "execution_mode": execution_metadata.get("execution_mode") or wb.get("execution_mode") or "host",
+            "execution_model": execution_model,
+            "reasoning_effort": reasoning_effort,
             "workspace_root": execution_metadata.get("workspace_root") or wb.get("workspace_root"),
         }
     )
     persisted_wb = dict(patched_wb)
     persisted_wb.pop("variable_snapshot_json", None)
+    persisted_wb.pop("periphery_snapshot_json", None)
     patched_metadata["workbench_scheduled_prompt"] = persisted_wb
     updated_task = storage.update_task(
         user_id,
@@ -2433,6 +2480,17 @@ def _glasshive_instruction(task: Dict[str, Any], wb: Dict[str, Any]) -> str:
 def _glasshive_bootstrap_bundle(task: Dict[str, Any], wb: Dict[str, Any], run_id: str) -> Dict[str, Any]:
     rendered = str(task.get("prompt") or "")
     snapshot_json = str(wb.get("variable_snapshot_json") or "{}")
+    execution_profile = str(wb.get("execution_profile") or "codex-cli").strip()
+    execution_model = _workbench_codex_model(wb.get("execution_model"))
+    reasoning_effort = _workbench_codex_reasoning_effort(wb.get("reasoning_effort"))
+    if execution_profile == "codex-cli" and not execution_model:
+        raise RuntimeError(
+            "Prompt Workbench Codex automation requires WPR_MODEL_HOST_CODEX_CLI or execution_model"
+        )
+    if execution_profile == "codex-cli" and not reasoning_effort:
+        raise RuntimeError(
+            "Prompt Workbench Codex automation requires WPR_CODEX_CLI_REASONING_EFFORT or reasoning_effort"
+        )
     callbacks = {
         "events_webhook_url": _glasshive_callback_url(),
         "hmac_secret": _glasshive_callback_secret(),
@@ -2444,27 +2502,45 @@ def _glasshive_bootstrap_bundle(task: Dict[str, Any], wb: Dict[str, Any], run_id
         "scheduled_prompt_run_id": run_id,
         "scheduled_prompt_task_id": str(task.get("id") or ""),
     }
-    return {
-        "callbacks": callbacks,
-        "agents_md": (
-            "This is a Viventium Prompt Workbench scheduled prompt worker. "
-            "Keep raw prompt/result details inside the private GlassHive workspace and end with FINAL REPORT."
-        ),
-        "codex_md": (
-            "Use full local capabilities available to this GlassHive workspace. "
-            "Respect governed memory writeback and do not direct-write parent databases."
-        ),
-        "files": [
+    projected_files: list[Dict[str, Any]] = [
+        {
+            "scope": "workspace",
+            "path": "scheduled-prompt/rendered-prompt.md",
+            "content": rendered,
+        },
+        {
+            "scope": "workspace",
+            "path": "scheduled-prompt/variable-snapshot.json",
+            "content": snapshot_json,
+        },
+        {
+            "scope": "workspace",
+            "path": "scheduled-prompt/run-context.json",
+            "content": json.dumps(
+                {
+                    "scheduledRunRef": {
+                        "runId": run_id,
+                        "taskId": str(task.get("id") or ""),
+                        "definitionId": str(wb.get("definition_id") or ""),
+                    },
+                    "snapshotRef": str(wb.get("periphery_snapshot_ref") or ""),
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+        },
+    ]
+    periphery_snapshot_json = str(wb.get("periphery_snapshot_json") or "").strip()
+    if periphery_snapshot_json:
+        projected_files.append(
             {
                 "scope": "workspace",
-                "path": "scheduled-prompt/rendered-prompt.md",
-                "content": rendered,
-            },
-            {
-                "scope": "workspace",
-                "path": "scheduled-prompt/variable-snapshot.json",
-                "content": snapshot_json,
-            },
+                "path": "scheduled-prompt/periphery-snapshot.json",
+                "content": periphery_snapshot_json,
+            }
+        )
+    projected_files.extend(
+        [
             {
                 "scope": "workspace",
                 "path": "scheduled-prompt/run-contract.md",
@@ -2488,7 +2564,27 @@ def _glasshive_bootstrap_bundle(task: Dict[str, Any], wb: Dict[str, Any], run_id
                     "    ThreadingHTTPServer(('127.0.0.1', 8765), Handler).serve_forever()\n"
                 ),
             },
-        ],
+        ]
+    )
+    bootstrap_env: Dict[str, str] = {}
+    if execution_profile == "codex-cli":
+        bootstrap_env = {
+            "WPR_MODEL_HOST_CODEX_CLI": execution_model,
+            "WPR_CODEX_CLI_REASONING_EFFORT": reasoning_effort,
+            "WPR_CODEX_CLI_IGNORE_USER_CONFIG": "true",
+        }
+    return {
+        "callbacks": callbacks,
+        "env": bootstrap_env,
+        "agents_md": (
+            "This is a Viventium Prompt Workbench scheduled prompt worker. "
+            "Keep raw prompt/result details inside the private GlassHive workspace and end with FINAL REPORT."
+        ),
+        "codex_md": (
+            "Use full local capabilities available to this GlassHive workspace. "
+            "Respect governed memory writeback and do not direct-write parent databases."
+        ),
+        "files": projected_files,
     }
 
 
@@ -2592,6 +2688,7 @@ def _dispatch_glasshive_task(task: Dict[str, Any]) -> Dict[str, Any]:
             "my_folder": wb.get("my_folder"),
             "rendered_prompt": rendered_text,
             "variable_snapshot_json": wb.get("variable_snapshot_json"),
+            "periphery_snapshot_ref": wb.get("periphery_snapshot_ref"),
         },
     )
     storage.create_scheduled_prompt_run(

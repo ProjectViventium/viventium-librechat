@@ -53,6 +53,43 @@ describe('createMemoryTool', () => {
   });
 
   describe('overflow handling', () => {
+    it('passes the snapshot revision to the storage layer', async () => {
+      const expectedRevision = 7;
+      const tool = createMemoryTool({
+        userId: 'test-user',
+        setMemory: mockSetMemory,
+        memoryRevisionMap: { world: expectedRevision },
+      });
+
+      await tool.func({ key: 'world', value: 'Fresh fact' });
+
+      expect(mockSetMemory).toHaveBeenCalledWith({
+        userId: 'test-user',
+        key: 'world',
+        value: 'Fresh fact',
+        tokenCount: 10,
+        expectedRevision,
+      });
+    });
+
+    it('surfaces a revision conflict without reporting a successful update artifact', async () => {
+      mockSetMemory.mockResolvedValue({ ok: false, conflict: true });
+      const tool = createMemoryTool({
+        userId: 'test-user',
+        setMemory: mockSetMemory,
+        memoryRevisionMap: { world: 7 },
+      });
+
+      const result = await tool.func({ key: 'world', value: 'Fresh fact' });
+
+      expect(result[0]).toContain('changed while this memory update was running');
+      const artifacts = result[1] as Record<Tools.memory, MemoryArtifact>;
+      expect(artifacts[Tools.memory].type).toBe('error');
+      expect(JSON.parse(artifacts[Tools.memory].value as string)).toEqual(
+        expect.objectContaining({ errorType: 'revision_conflict', key: 'world' }),
+      );
+    });
+
     it('should return error artifact when memory is already overflowing', async () => {
       const tool = createMemoryTool({
         userId: 'test-user',

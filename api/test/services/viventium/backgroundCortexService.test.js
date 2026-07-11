@@ -537,7 +537,7 @@ describe('BackgroundCortexService.checkCortexActivation', () => {
         activation: {
           enabled: true,
           provider: 'groq',
-          model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+          model: 'qwen/qwen3.6-27b',
           fallbacks: [{ provider: 'openai', model: 'gpt-5.4' }],
           intent_scope: 'productivity_ms365',
           prompt: PRODUCTIVITY_MS365_PROMPT,
@@ -600,7 +600,7 @@ describe('BackgroundCortexService.checkCortexActivation', () => {
           activation: {
             enabled: true,
             provider: 'groq',
-            model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+            model: 'qwen/qwen3.6-27b',
             fallbacks: [{ provider: 'xai', model: 'grok-4.20-non-reasoning' }],
             intent_scope: 'productivity_ms365',
             prompt: PRODUCTIVITY_MS365_PROMPT,
@@ -643,6 +643,75 @@ describe('BackgroundCortexService.checkCortexActivation', () => {
     }
   });
 
+  test('tries activation fallback when a timed-out primary ignores the abort signal', async () => {
+    const previousPrimaryTimeout = process.env.VIVENTIUM_ACTIVATION_PRIMARY_ATTEMPT_TIMEOUT_MS;
+    process.env.VIVENTIUM_ACTIVATION_PRIMARY_ATTEMPT_TIMEOUT_MS = '5';
+
+    const primaryProcessStream = jest.fn(async () => new Promise(() => {}));
+    const fallbackProcessStream = jest.fn(async () =>
+      JSON.stringify({
+        should_activate: true,
+        confidence: 0.92,
+        reason: 'fallback after non-cooperative timeout',
+      }),
+    );
+
+    Run.create
+      .mockResolvedValueOnce({ processStream: primaryProcessStream })
+      .mockResolvedValueOnce({ processStream: fallbackProcessStream });
+
+    try {
+      const result = await Promise.race([
+        checkCortexActivation({
+          cortexConfig: {
+            agent_id: 'agent_viventium_online_tool_use_95aeb3',
+            activation: {
+              enabled: true,
+              provider: 'groq',
+              model: 'qwen/qwen3.6-27b',
+              fallbacks: [{ provider: 'xai', model: 'grok-4.20-non-reasoning' }],
+              intent_scope: 'productivity_ms365',
+              prompt: PRODUCTIVITY_MS365_PROMPT,
+            },
+          },
+          messages: [
+            { role: 'user', content: 'Check my Outlook inbox and summarize anything urgent.' },
+          ],
+          runId: 'run-ms365-non-cooperative-timeout-fallback-chain',
+          req: { body: {}, user: {} },
+          timeoutMs: 500,
+        }),
+        new Promise((resolve) => setTimeout(() => resolve({ reason: 'test_guard_timeout' }), 1000)),
+      ]);
+
+      expect(result).toEqual(
+        expect.objectContaining({
+          shouldActivate: true,
+          reason: 'fallback after non-cooperative timeout',
+          providerUsed: 'xai',
+        }),
+      );
+      expect(result.providerAttempts).toEqual([
+        expect.objectContaining({
+          provider: 'groq',
+          status: 'error',
+          error: expect.objectContaining({ class: 'provider_timeout' }),
+        }),
+        expect.objectContaining({
+          provider: 'xai',
+          status: 'completed',
+          shouldActivate: true,
+        }),
+      ]);
+    } finally {
+      if (previousPrimaryTimeout == null) {
+        delete process.env.VIVENTIUM_ACTIVATION_PRIMARY_ATTEMPT_TIMEOUT_MS;
+      } else {
+        process.env.VIVENTIUM_ACTIVATION_PRIMARY_ATTEMPT_TIMEOUT_MS = previousPrimaryTimeout;
+      }
+    }
+  });
+
   test('does not invoke fallback providers after a completed classifier decision', async () => {
     const processStream = jest.fn(async () =>
       JSON.stringify({ should_activate: false, confidence: 0.99, reason: 'chat_format' }),
@@ -656,7 +725,7 @@ describe('BackgroundCortexService.checkCortexActivation', () => {
         activation: {
           enabled: true,
           provider: 'groq',
-          model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+          model: 'qwen/qwen3.6-27b',
           fallbacks: [
             { provider: 'openai', model: 'gpt-5.4' },
             { provider: 'anthropic', model: 'claude-haiku-4-5' },
@@ -1466,6 +1535,78 @@ describe('BackgroundCortexService.executeCortex', () => {
         agentId: 'agent_general',
         agentName: 'Background Analysis',
         insight: 'aggregated insight',
+      }),
+    );
+  });
+
+  test('direct executeCortex uses a validated configured fallback after provider failure', async () => {
+    const primaryProcessStream = jest.fn(async () => '');
+    const fallbackProcessStream = jest.fn(async () => 'fallback-output');
+    initializeAgent
+      .mockResolvedValueOnce({
+        id: 'agent_direct_retry',
+        name: 'Direct Retry Cortex',
+        tools: [],
+        userMCPAuthMap: null,
+        recursion_limit: 11,
+        provider: 'openAI',
+      })
+      .mockResolvedValueOnce({
+        id: 'agent_direct_retry',
+        name: 'Direct Retry Cortex',
+        tools: [],
+        userMCPAuthMap: null,
+        recursion_limit: 11,
+        provider: 'anthropic',
+      });
+    createRun
+      .mockResolvedValueOnce({ processStream: primaryProcessStream })
+      .mockResolvedValueOnce({ processStream: fallbackProcessStream });
+    createContentAggregator
+      .mockReturnValueOnce({
+        contentParts: [{ type: 'error', error: 'Provider status 529 overloaded' }],
+        aggregateContent: jest.fn(),
+      })
+      .mockReturnValueOnce({
+        contentParts: [{ type: 'text', text: 'fallback-output' }],
+        aggregateContent: jest.fn(),
+      });
+
+    const result = await executeCortex({
+      agent: {
+        id: 'agent_direct_retry',
+        name: 'Direct Retry Cortex',
+        provider: 'openAI',
+        model: 'gpt-5.4',
+        model_parameters: { model: 'gpt-5.4', useResponsesApi: true },
+        fallback_llm_provider: 'anthropic',
+        fallback_llm_model: 'claude-sonnet-4-5',
+        fallback_llm_model_parameters: { model: 'claude-sonnet-4-5' },
+        tools: [],
+      },
+      messages: [{ role: 'user', content: 'Return a typed result.' }],
+      runId: 'run-direct-fallback',
+      req: {
+        user: { id: 'user-1', role: 'USER' },
+        body: { conversationId: 'c1', parentMessageId: 'p1' },
+      },
+      contextMode: 'minimal',
+      executionTimeoutMs: 8000,
+    });
+
+    expect(createRun).toHaveBeenCalledTimes(2);
+    expect(initializeAgent.mock.calls[1][0].agent).toEqual(
+      expect.objectContaining({ provider: 'anthropic', model: 'claude-sonnet-4-5' }),
+    );
+    expect(result).toEqual(
+      expect.objectContaining({
+        insight: 'fallback-output',
+        fallbackUsed: true,
+        fallbackProvider: 'anthropic',
+        fallbackModel: 'claude-sonnet-4-5',
+        fallbackServiceTier: null,
+        primaryProvider: 'openAI',
+        primaryModel: 'gpt-5.4',
       }),
     );
   });

@@ -1,6 +1,7 @@
 import { useState, memo, useRef, useCallback, useEffect } from 'react';
 import * as Select from '@ariakit/react/select';
-import { FileText, FlaskConical, LogOut, Plug2 } from 'lucide-react';
+import { FileText, FlaskConical, HeartPulse, LogOut, Plug2 } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
 import { SettingsTabValues, SystemRoles, apiBaseUrl, request } from 'librechat-data-provider';
 import {
   LinkIcon,
@@ -25,6 +26,7 @@ type PromptWorkbenchStartResponse = {
 };
 
 function AccountSettings() {
+  const navigate = useNavigate();
   const localize = useLocalize();
   const { showToast } = useToastContext();
   const { user, isAuthenticated, logout } = useAuthContext();
@@ -35,6 +37,7 @@ function AccountSettings() {
   const promptWorkbenchLinkEnabled =
     (startupConfig as { viventiumPromptWorkbenchLinkEnabled?: boolean } | undefined)
       ?.viventiumPromptWorkbenchLinkEnabled === true && user?.role === SystemRoles.ADMIN;
+  const feelingsAvailable = startupConfig?.viventiumFeelingsAvailable !== false;
   const balanceQuery = useGetUserBalance({
     enabled: !!isAuthenticated && startupConfig?.balance?.enabled,
   });
@@ -167,6 +170,16 @@ function AccountSettings() {
           >
             <Plug2 className="icon-md" aria-hidden="true" />
             {localize('com_nav_connected_accounts')}
+          </Select.SelectItem>
+        )}
+        {feelingsAvailable && (
+          <Select.SelectItem
+            value=""
+            onClick={() => navigate('/feelings')}
+            className="select-item text-sm"
+          >
+            <HeartPulse className="icon-md" aria-hidden="true" />
+            {localize('com_nav_feelings')}
           </Select.SelectItem>
         )}
         {promptWorkbenchLinkEnabled && (

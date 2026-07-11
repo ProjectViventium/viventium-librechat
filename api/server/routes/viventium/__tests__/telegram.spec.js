@@ -14,6 +14,7 @@ let lastSpec = null;
 let lastVoiceProvider = null;
 let lastVoiceMode = null;
 let lastTelegramAudioRequested = null;
+let lastTelegramImages = null;
 let mockUserFindOne;
 let mockUserCountDocuments;
 let mockSubscribe;
@@ -84,6 +85,7 @@ jest.mock('~/server/controllers/agents/request', () => (req, res) => {
   lastVoiceProvider = req.body.voiceProvider || null;
   lastVoiceMode = req.body.voiceMode ?? null;
   lastTelegramAudioRequested = req.body.telegramAudioRequested ?? null;
+  lastTelegramImages = req._telegramImages || null;
   res.json({ streamId: 'stream_1', conversationId: req.body.conversationId || 'new' });
 });
 
@@ -106,6 +108,15 @@ jest.mock('~/server/middleware/accessResources/fileAccess', () => ({
 
 jest.mock('~/server/services/Files/strategies', () => ({
   getStrategyFunctions: (...args) => mockGetStrategyFunctions(...args),
+}));
+
+jest.mock('~/server/services/Files/images', () => ({
+  resizeImageBuffer: jest.fn(async (buffer) => ({
+    buffer,
+    bytes: buffer.length,
+    width: 1,
+    height: 1,
+  })),
 }));
 
 jest.mock('~/server/services/Tools/credentials', () => ({
@@ -322,6 +333,7 @@ describe('/api/viventium/telegram', () => {
     lastVoiceProvider = null;
     lastVoiceMode = null;
     lastTelegramAudioRequested = null;
+    lastTelegramImages = null;
     jest.resetModules();
     mockUserFindOne = jest.fn();
     mockUserCountDocuments = jest.fn().mockResolvedValue(0);
@@ -565,6 +577,56 @@ describe('/api/viventium/telegram', () => {
         error: expect.stringMatching(/Telegram attachment upload failed for "archive\.zip"/),
       }),
     );
+  });
+
+  test('POST injects extracted document images from Telegram file uploads into the vision payload', async () => {
+    const telegramRouter = require('../telegram');
+    const { resizeImageBuffer } = require('~/server/services/Files/images');
+    const app = createTestApp(telegramRouter);
+    mockProcessAgentFileUpload.mockImplementationOnce(async ({ req, res, metadata }) => {
+      res.status(200).json({
+        message: 'Agent file uploaded and processed successfully',
+        file_id: metadata.file_id,
+        temp_file_id: metadata.temp_file_id,
+        filename: req.file?.originalname ?? 'deck.pptx',
+        filepath: '/uploads/mock/deck.pptx',
+        type: req.file?.mimetype,
+        source: 'text',
+        viventiumExtractedImages: ['data:image/png;base64,cG5n'],
+      });
+    });
+    const req = createMockReq({
+      url: '/api/viventium/telegram/chat',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      body: {
+        text: 'review this deck',
+        conversationId: 'new',
+        telegramUserId: 'tg-1',
+        files: [
+          {
+            filename: 'deck.pptx',
+            mime_type: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+            data: Buffer.from('pptx-bytes').toString('base64'),
+          },
+        ],
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(resizeImageBuffer).toHaveBeenCalledTimes(1);
+    expect(resizeImageBuffer.mock.calls[0][1]).toEqual({ px: 768 });
+    expect(lastTelegramImages).toEqual([
+      {
+        type: 'image_url',
+        image_url: {
+          url: 'data:image/png;base64,cG5n',
+          detail: 'auto',
+        },
+      },
+    ]);
   });
 
   test('POST stale existing convo resets to new for Telegram hidden conversation reuse', async () => {

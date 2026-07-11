@@ -1,4 +1,8 @@
 const {
+  DEFAULT_MODELS,
+  APPROVED_MAIN_RUNTIME_FAMILIES,
+  APPROVED_BACKGROUND_RUNTIME_FAMILIES,
+  CANONICAL_BUILT_IN_BACKGROUND_MODEL_PARAMETERS,
   normalizeProvider,
   normalizeBundleForRuntime,
   buildCanonicalPersistedAgentFields,
@@ -6,6 +10,39 @@ const {
 } = require('../../../scripts/viventium-agent-runtime-models');
 
 describe('viventium-agent-runtime-models', () => {
+  test('keeps the GPT-5.6 workload profile and Responses parameters as runtime truth', () => {
+    expect(DEFAULT_MODELS.openAI).toBe('gpt-5.6-sol');
+    expect([...APPROVED_MAIN_RUNTIME_FAMILIES]).toEqual([
+      'openAI::gpt-5.6-sol',
+      'anthropic::claude-opus-4-8',
+    ]);
+    expect([...APPROVED_BACKGROUND_RUNTIME_FAMILIES]).toEqual([
+      'openAI::gpt-5.6-sol',
+      'openAI::gpt-5.6-terra',
+      'anthropic::claude-opus-4-8',
+    ]);
+
+    const expectedEffortByAgent = {
+      agent_viventium_background_analysis_95aeb3: 'medium',
+      agent_viventium_confirmation_bias_95aeb3: 'medium',
+      agent_viventium_red_team_95aeb3: 'xhigh',
+      agent_viventium_deep_research_95aeb3: 'xhigh',
+      agent_viventium_online_tool_use_95aeb3: 'low',
+      agent_viventium_parietal_cortex_95aeb3: 'medium',
+      agent_viventium_pattern_recognition_95aeb3: 'medium',
+      agent_viventium_emotional_resonance_95aeb3: 'low',
+      agent_viventium_strategic_planning_95aeb3: 'high',
+      agent_viventium_support_95aeb3: 'low',
+      agent_8Y1d7JNhpubtvzYz3hvEv: 'low',
+    };
+    for (const [agentId, reasoningEffort] of Object.entries(expectedEffortByAgent)) {
+      expect(CANONICAL_BUILT_IN_BACKGROUND_MODEL_PARAMETERS[agentId].openAI).toEqual({
+        reasoning_effort: reasoningEffort,
+        useResponsesApi: true,
+      });
+    }
+  });
+
   test('treats poisoned string provider values as missing', () => {
     expect(normalizeProvider('undefined')).toBe('');
     expect(normalizeProvider(' null ')).toBe('');
@@ -19,20 +56,20 @@ describe('viventium-agent-runtime-models', () => {
         provider: 'anthropic',
         model: 'claude-opus-4-7',
         voice_llm_provider: 'openAI',
-        voice_llm_model: 'gpt-5.4',
+        voice_llm_model: 'gpt-5.6-sol',
         background_cortices: [
           {
             agent_id: 'agent_viventium_red_team_95aeb3',
             activation: {
               provider: 'groq',
-              model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+              model: 'qwen/qwen3.6-27b',
             },
           },
           {
             agent_id: 'agent_viventium_online_tool_use_95aeb3',
             activation: {
               provider: 'groq',
-              model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+              model: 'qwen/qwen3.6-27b',
             },
           },
         ],
@@ -41,9 +78,9 @@ describe('viventium-agent-runtime-models', () => {
         {
           id: 'agent_viventium_online_tool_use_95aeb3',
           provider: 'openAI',
-          model: 'gpt-5.4',
+          model: 'gpt-5.6-terra',
           model_parameters: {
-            model: 'gpt-5.4',
+            model: 'gpt-5.6-terra',
           },
         },
       ],
@@ -52,31 +89,27 @@ describe('viventium-agent-runtime-models', () => {
     const normalized = normalizeBundleForRuntime(bundle, {
       env: {
         VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER: 'openai',
-        VIVENTIUM_FC_CONSCIOUS_LLM_MODEL: 'gpt-5.4',
+        VIVENTIUM_FC_CONSCIOUS_LLM_MODEL: 'gpt-5.6-sol',
         VIVENTIUM_CORTEX_PRODUCTIVITY_LLM_PROVIDER: 'anthropic',
-        VIVENTIUM_CORTEX_PRODUCTIVITY_LLM_MODEL: 'claude-sonnet-4-5',
+        VIVENTIUM_CORTEX_PRODUCTIVITY_LLM_MODEL: 'claude-opus-4-8',
         VIVENTIUM_BACKGROUND_ACTIVATION_PROVIDER: 'groq',
-        VIVENTIUM_BACKGROUND_ACTIVATION_MODEL: 'meta-llama/llama-4-scout-17b-16e-instruct',
+        VIVENTIUM_BACKGROUND_ACTIVATION_MODEL: 'qwen/qwen3.6-27b',
         OTUC_ACTIVATION_PROVIDER: 'groq',
-        OTUC_ACTIVATION_LLM: 'meta-llama/llama-4-scout-17b-16e-instruct',
+        OTUC_ACTIVATION_LLM: 'qwen/qwen3.6-27b',
       },
     });
 
     expect(normalized.mainAgent.provider).toBe('openAI');
-    expect(normalized.mainAgent.model).toBe('gpt-5.4');
+    expect(normalized.mainAgent.model).toBe('gpt-5.6-sol');
     expect(normalized.mainAgent.voice_llm_provider).toBeNull();
     expect(normalized.mainAgent.voice_llm_model).toBeNull();
     expect(normalized.backgroundAgents[0].provider).toBe('anthropic');
-    expect(normalized.backgroundAgents[0].model).toBe('claude-sonnet-4-5');
-    expect(normalized.backgroundAgents[0].model_parameters.model).toBe('claude-sonnet-4-5');
+    expect(normalized.backgroundAgents[0].model).toBe('claude-opus-4-8');
+    expect(normalized.backgroundAgents[0].model_parameters.model).toBe('claude-opus-4-8');
     expect(normalized.mainAgent.background_cortices[0].activation.provider).toBe('groq');
-    expect(normalized.mainAgent.background_cortices[0].activation.model).toBe(
-      'meta-llama/llama-4-scout-17b-16e-instruct',
-    );
+    expect(normalized.mainAgent.background_cortices[0].activation.model).toBe('qwen/qwen3.6-27b');
     expect(normalized.mainAgent.background_cortices[1].activation.provider).toBe('groq');
-    expect(normalized.mainAgent.background_cortices[1].activation.model).toBe(
-      'meta-llama/llama-4-scout-17b-16e-instruct',
-    );
+    expect(normalized.mainAgent.background_cortices[1].activation.model).toBe('qwen/qwen3.6-27b');
   });
 
   test('rejects non-approved built-in runtime assignments and preserves shipped launch bundle families', () => {
@@ -84,16 +117,16 @@ describe('viventium-agent-runtime-models', () => {
       mainAgent: {
         id: 'agent_viventium_main_95aeb3',
         provider: 'anthropic',
-        model: 'claude-opus-4-7',
+        model: 'claude-opus-4-8',
         model_parameters: {
-          model: 'claude-opus-4-7',
+          model: 'claude-opus-4-8',
         },
         background_cortices: [
           {
             agent_id: 'agent_viventium_red_team_95aeb3',
             activation: {
               provider: 'groq',
-              model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+              model: 'qwen/qwen3.6-27b',
             },
           },
         ],
@@ -102,9 +135,9 @@ describe('viventium-agent-runtime-models', () => {
         {
           id: 'agent_viventium_red_team_95aeb3',
           provider: 'openAI',
-          model: 'gpt-5.4',
+          model: 'gpt-5.6-sol',
           model_parameters: {
-            model: 'gpt-5.4',
+            model: 'gpt-5.6-sol',
           },
         },
       ],
@@ -122,14 +155,16 @@ describe('viventium-agent-runtime-models', () => {
     });
 
     expect(normalized.mainAgent.provider).toBe('anthropic');
-    expect(normalized.mainAgent.model).toBe('claude-opus-4-7');
+    expect(normalized.mainAgent.model).toBe('claude-opus-4-8');
     expect(normalized.backgroundAgents[0].provider).toBe('openAI');
-    expect(normalized.backgroundAgents[0].model).toBe('gpt-5.4');
-    expect(normalized.backgroundAgents[0].model_parameters.model).toBe('gpt-5.4');
+    expect(normalized.backgroundAgents[0].model).toBe('gpt-5.6-sol');
+    expect(normalized.backgroundAgents[0].model_parameters).toEqual({
+      model: 'gpt-5.6-sol',
+      reasoning_effort: 'xhigh',
+      useResponsesApi: true,
+    });
     expect(normalized.mainAgent.background_cortices[0].activation.provider).toBe('groq');
-    expect(normalized.mainAgent.background_cortices[0].activation.model).toBe(
-      'meta-llama/llama-4-scout-17b-16e-instruct',
-    );
+    expect(normalized.mainAgent.background_cortices[0].activation.model).toBe('qwen/qwen3.6-27b');
   });
 
   test('builds a canonical persisted patch that repairs half-updated built-in runtime records', () => {
@@ -397,10 +432,10 @@ describe('viventium-agent-runtime-models', () => {
         {
           id: 'agent_viventium_deep_research_95aeb3',
           provider: 'openAI',
-          model: 'gpt-5.4',
+          model: 'gpt-5.6-sol',
           tools: ['sys__server__sys_mcp_sequential-thinking', 'web_search'],
           model_parameters: {
-            model: 'gpt-5.4',
+            model: 'gpt-5.6-sol',
             reasoning_effort: 'xhigh',
           },
         },
@@ -412,7 +447,7 @@ describe('viventium-agent-runtime-models', () => {
         VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER: 'anthropic',
         VIVENTIUM_FC_CONSCIOUS_LLM_MODEL: 'claude-opus-4-7',
         VIVENTIUM_CORTEX_DEEP_RESEARCH_LLM_PROVIDER: 'openAI',
-        VIVENTIUM_CORTEX_DEEP_RESEARCH_LLM_MODEL: 'gpt-5.4',
+        VIVENTIUM_CORTEX_DEEP_RESEARCH_LLM_MODEL: 'gpt-5.6-sol',
         VIVENTIUM_WEB_SEARCH_ENABLED: 'true',
       },
     });
@@ -422,8 +457,51 @@ describe('viventium-agent-runtime-models', () => {
       'web_search',
     ]);
     expect(normalized.backgroundAgents[0].model_parameters).toEqual({
-      model: 'gpt-5.4',
+      model: 'gpt-5.6-sol',
       reasoning_effort: 'xhigh',
+      useResponsesApi: true,
+    });
+  });
+
+  test('keeps Red Team web_search and xhigh reasoning effort when runtime web search is enabled', () => {
+    const bundle = {
+      mainAgent: {
+        id: 'agent_viventium_main_95aeb3',
+        provider: 'anthropic',
+        model: 'claude-opus-4-7',
+      },
+      backgroundAgents: [
+        {
+          id: 'agent_viventium_red_team_95aeb3',
+          provider: 'openAI',
+          model: 'gpt-5.6-sol',
+          tools: ['sys__server__sys_mcp_sequential-thinking', 'web_search'],
+          model_parameters: {
+            model: 'gpt-5.6-sol',
+            thinkingBudget: 4000,
+          },
+        },
+      ],
+    };
+
+    const normalized = normalizeBundleForRuntime(bundle, {
+      env: {
+        VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER: 'anthropic',
+        VIVENTIUM_FC_CONSCIOUS_LLM_MODEL: 'claude-opus-4-7',
+        VIVENTIUM_CORTEX_RED_TEAM_LLM_PROVIDER: 'openAI',
+        VIVENTIUM_CORTEX_RED_TEAM_LLM_MODEL: 'gpt-5.6-sol',
+        VIVENTIUM_WEB_SEARCH_ENABLED: 'true',
+      },
+    });
+
+    expect(normalized.backgroundAgents[0].tools).toEqual([
+      'sys__server__sys_mcp_sequential-thinking',
+      'web_search',
+    ]);
+    expect(normalized.backgroundAgents[0].model_parameters).toEqual({
+      model: 'gpt-5.6-sol',
+      reasoning_effort: 'xhigh',
+      useResponsesApi: true,
     });
   });
 
@@ -478,9 +556,9 @@ describe('viventium-agent-runtime-models', () => {
     const runtimeAgent = {
       id: 'agent_viventium_strategic_planning_95aeb3',
       provider: 'openAI',
-      model: 'gpt-5.4',
+      model: 'gpt-5.6-sol',
       model_parameters: {
-        model: 'gpt-5.4',
+        model: 'gpt-5.6-sol',
       },
     };
 
@@ -488,9 +566,11 @@ describe('viventium-agent-runtime-models', () => {
 
     expect(patch).toEqual({
       provider: 'openAI',
-      model: 'gpt-5.4',
+      model: 'gpt-5.6-sol',
       model_parameters: {
-        model: 'gpt-5.4',
+        model: 'gpt-5.6-sol',
+        reasoning_effort: 'high',
+        useResponsesApi: true,
       },
     });
   });

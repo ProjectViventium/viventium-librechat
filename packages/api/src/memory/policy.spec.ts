@@ -4,6 +4,7 @@ import {
   DEFAULT_VIVENTIUM_MEMORY_KEY_LIMITS,
   evaluateMemoryWrite,
   prepareMemoryValueForWrite,
+  runMemoryMaintenance,
 } from './policy';
 
 jest.mock('~/utils', () => ({
@@ -13,6 +14,41 @@ jest.mock('~/utils', () => ({
 }));
 
 describe('memory policy', () => {
+  describe('runMemoryMaintenance', () => {
+    it('carries each snapshot revision into deterministic maintenance writes', async () => {
+      const setMemory = jest.fn().mockResolvedValue({ ok: true, revision: 8 });
+
+      const result = await runMemoryMaintenance({
+        userId: 'user-1',
+        getAllUserMemories: async () => [
+          {
+            key: 'me',
+            value: 'Stable preference;;;;;;;;;;;;;;;;;;;;;;;; concise wins',
+            tokenCount: 55,
+            updated_at: new Date('2026-07-10T10:00:00.000Z'),
+            __v: 7,
+          },
+        ],
+        setMemory,
+        policy: {
+          tokenLimit: 8000,
+          keyLimits: DEFAULT_VIVENTIUM_MEMORY_KEY_LIMITS,
+          maintenanceThresholdPercent: 80,
+        },
+        now: new Date('2026-07-11T10:00:00.000Z'),
+      });
+
+      expect(setMemory).toHaveBeenCalledWith(
+        expect.objectContaining({
+          userId: 'user-1',
+          key: 'me',
+          expectedRevision: 7,
+        }),
+      );
+      expect(result.appliedRevisions).toEqual({ me: 8 });
+    });
+  });
+
   describe('prepareMemoryValueForWrite', () => {
     it('collapses repeated semicolon corruption before storing structured memory', () => {
       const prepared = prepareMemoryValueForWrite({

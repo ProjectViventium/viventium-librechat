@@ -12,6 +12,7 @@ import { MarketplaceProvider } from '~/components/Agents/MarketplaceContext';
 import AgentMarketplace from '~/components/Agents/Marketplace';
 import { OAuthSuccess, OAuthError } from '~/components/OAuth';
 import { AuthContextProvider } from '~/hooks/AuthContext';
+import { useAuthContext } from '~/hooks';
 import RouteErrorBoundary from './RouteErrorBoundary';
 import StartupLayout from './Layouts/Startup';
 import LoginLayout from './Layouts/Login';
@@ -20,6 +21,7 @@ import ShareRoute from './ShareRoute';
 import ChatRoute from './ChatRoute';
 import Search from './Search';
 import Root from './Root';
+import FeelingsView from '~/components/Feelings/FeelingsView';
 
 const AuthLayout = () => (
   <AuthContextProvider>
@@ -27,6 +29,11 @@ const AuthLayout = () => (
     <ApiErrorWatcher />
   </AuthContextProvider>
 );
+
+const FeelingsRoute = () => {
+  const { isAuthenticated } = useAuthContext();
+  return isAuthenticated ? <FeelingsView /> : null;
+};
 
 const baseEl = document.querySelector('base');
 const baseHref = baseEl?.getAttribute('href') || '/';
@@ -95,6 +102,10 @@ export const router = createBrowserRouter(
           ],
         },
         dashboardRoutes,
+        {
+          path: 'feelings',
+          element: <FeelingsRoute />,
+        },
         {
           path: '/',
           element: <Root />,

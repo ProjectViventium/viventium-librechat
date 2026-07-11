@@ -558,6 +558,40 @@ describe('Message Operations', () => {
       expect(result.expiredAt).toBeNull();
     });
 
+    it('persists explicit QA-run provenance as memory-ineligible structured metadata', async () => {
+      mockReq.body = {
+        viventiumQaRun: true,
+        viventiumQaRunId: 'qa-run-123',
+        viventiumEvalIsolation: { conversationRecall: true },
+      };
+
+      const result = await saveMessage(mockReq, {
+        ...mockMessageData,
+        metadata: { existing: 'preserved' },
+      });
+
+      expect(result.metadata).toMatchObject({
+        existing: 'preserved',
+        viventium: {
+          qaRun: true,
+          qaRunId: 'qa-run-123',
+          memoryEligible: false,
+        },
+      });
+      expect(mockScheduleConversationRecallSync).not.toHaveBeenCalled();
+    });
+
+    it('keeps proactive recall scheduling enabled for ordinary messages', async () => {
+      mockReq.body = {};
+
+      await saveMessage(mockReq, mockMessageData);
+
+      expect(mockScheduleConversationRecallSync).toHaveBeenCalledWith({
+        userId: mockReq.user.id,
+        conversationId: mockMessageData.conversationId,
+      });
+    });
+
     it('should use custom retention period from config', async () => {
       // Mock app config with 48 hour retention
       mockReq.config.interfaceConfig.temporaryChatRetention = 48;

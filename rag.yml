@@ -8,14 +8,20 @@ services:
     cpus: ${VIVENTIUM_RAG_VECTORDB_CPUS:-0.50}
     pids_limit: ${VIVENTIUM_RAG_VECTORDB_PIDS_LIMIT:-96}
     logging:
-      driver: "json-file"
+      driver: 'json-file'
       options:
-        max-size: "${VIVENTIUM_RAG_LOG_MAX_SIZE:-5m}"
-        max-file: "${VIVENTIUM_RAG_LOG_MAX_FILE:-3}"
+        max-size: '${VIVENTIUM_RAG_LOG_MAX_SIZE:-5m}'
+        max-file: '${VIVENTIUM_RAG_LOG_MAX_FILE:-3}'
     environment:
       POSTGRES_DB: mydatabase
       POSTGRES_USER: myuser
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-CHANGE_ME_LOCAL_POSTGRES_PASSWORD}
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U myuser -d mydatabase']
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
     volumes:
       # === VIVENTIUM START ===
       # Keep local RAG vector data on the host filesystem instead of a Docker-managed
@@ -24,7 +30,7 @@ services:
       # === VIVENTIUM END ===
       - ${VIVENTIUM_RAG_PGDATA_PATH:-./.rag-pgdata}:/var/lib/postgresql/data
     ports:
-      - "127.0.0.1:${VIVENTIUM_RAG_VECTORDB_HOST_PORT:-5433}:5432"
+      - '127.0.0.1:${VIVENTIUM_RAG_VECTORDB_HOST_PORT:-5433}:5432'
 
   rag_api:
     image: registry.librechat.ai/danny-avila/librechat-rag-api-dev:latest
@@ -35,10 +41,10 @@ services:
     cpus: ${VIVENTIUM_RAG_API_CPUS:-1.00}
     pids_limit: ${VIVENTIUM_RAG_API_PIDS_LIMIT:-160}
     logging:
-      driver: "json-file"
+      driver: 'json-file'
       options:
-        max-size: "${VIVENTIUM_RAG_LOG_MAX_SIZE:-5m}"
-        max-file: "${VIVENTIUM_RAG_LOG_MAX_FILE:-3}"
+        max-size: '${VIVENTIUM_RAG_LOG_MAX_SIZE:-5m}'
+        max-file: '${VIVENTIUM_RAG_LOG_MAX_FILE:-3}'
     environment:
       - DB_HOST=vectordb
       - DB_PORT=5432
@@ -63,9 +69,20 @@ services:
       # was not pre-exported in the shell.
       # Added: 2026-03-11
       # === VIVENTIUM END ===
-      - "127.0.0.1:${RAG_PORT:-8000}:${RAG_PORT:-8000}"
+      - '127.0.0.1:${RAG_PORT:-8000}:${RAG_PORT:-8000}'
     depends_on:
-      - vectordb
+      vectordb:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          'python -c "import urllib.request; urllib.request.urlopen(''http://127.0.0.1:$${RAG_PORT:-8000}/health'', timeout=3)"',
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
     env_file:
       - .env
     volumes:

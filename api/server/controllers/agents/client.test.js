@@ -2,6 +2,13 @@ const { Providers } = require('@librechat/agents');
 const { Constants, ContentTypes, EModelEndpoint, Tools } = require('librechat-data-provider');
 const db = require('~/models');
 const AgentClient = require('./client');
+const {
+  createCortexPersistenceCoordinator,
+  feelingTailForAgent,
+  externalUserStimulusForReaction,
+  evalIsolationForRequest,
+  mergeLateActivationCandidates,
+} = AgentClient;
 
 jest.mock('@librechat/agents', () => ({
   ...jest.requireActual('@librechat/agents'),
@@ -21,6 +28,13 @@ jest.mock('@librechat/api', () => ({
   clearMemoryReadContextCache: jest.fn(),
   markMemoryWriterFailure: jest.fn(),
   getMemoryWriterHealthGate: jest.fn(() => ({ blocked: false })),
+  loadFeelingsReadContext: jest.fn().mockResolvedValue({
+    enabled: false,
+    agentScope: 'all_agents',
+    capsule: '',
+    version: 0,
+    snapshotHash: 'test-disabled',
+  }),
   GenerationJobManager: {
     emitChunk: jest.fn(),
     setGraph: jest.fn(),
@@ -57,6 +71,9 @@ jest.mock('~/server/services/viventium/conversationRecallPrompt', () => ({
 jest.mock('~/server/services/viventium/conversationRecallService', () => ({
   scheduleConversationRecallSync: jest.fn(),
 }));
+jest.mock('~/server/services/viventium/EmotionalReactionService', () => ({
+  scheduleEmotionalReaction: jest.fn().mockResolvedValue({ status: 'healthy' }),
+}));
 
 // Mock getMCPManager
 const mockFormatInstructions = jest.fn();
@@ -80,6 +97,8 @@ const mockLogFollowUpDecisionRecord =
   require('~/server/services/viventium/BackgroundCortexFollowUpService').logFollowUpDecisionRecord;
 const mockPersistFollowUpDecisionToParentMessage =
   require('~/server/services/viventium/BackgroundCortexFollowUpService').persistFollowUpDecisionToParentMessage;
+const mockScheduleEmotionalReaction =
+  require('~/server/services/viventium/EmotionalReactionService').scheduleEmotionalReaction;
 
 function deferred() {
   let resolve;
@@ -90,6 +109,179 @@ function deferred() {
   });
   return { promise, resolve, reject };
 }
+
+/* === VIVENTIUM START ===
+ * Feature: interruption-safe background cortex persistence regression tests.
+ * Porting: keep with createCortexPersistenceCoordinator in AgentClient.
+ * === VIVENTIUM END === */
+describe('Background cortex incremental persistence coordinator', () => {
+  test('persists the first snapshot, coalesces queued updates, and remains reusable', async () => {
+    const firstWrite = deferred();
+    const persistSnapshot = jest
+      .fn()
+      .mockImplementationOnce(() => firstWrite.promise)
+      .mockResolvedValue(undefined);
+    const onError = jest.fn();
+    const coordinator = createCortexPersistenceCoordinator({ persistSnapshot, onError });
+
+    const first = [{ cortex_id: 'analysis', status: 'activated' }];
+    const second = [{ cortex_id: 'analysis', status: 'running' }];
+    const third = [{ cortex_id: 'analysis', status: 'complete', insight: 'Ready.' }];
+
+    void coordinator.enqueue(first);
+    void coordinator.enqueue(second);
+    void coordinator.enqueue(third);
+
+    expect(persistSnapshot).toHaveBeenCalledTimes(1);
+    expect(persistSnapshot).toHaveBeenNthCalledWith(1, first);
+
+    firstWrite.resolve();
+    await coordinator.wait();
+
+    expect(persistSnapshot).toHaveBeenCalledTimes(2);
+    expect(persistSnapshot).toHaveBeenNthCalledWith(2, third);
+    expect(onError).not.toHaveBeenCalled();
+
+    const fourth = [{ cortex_id: 'analysis', status: 'error', error: 'Unavailable.' }];
+    await coordinator.enqueue(fourth);
+
+    expect(persistSnapshot).toHaveBeenCalledTimes(3);
+    expect(persistSnapshot).toHaveBeenNthCalledWith(3, fourth);
+  });
+
+  test('reports a failed write and continues with the latest queued snapshot', async () => {
+    const persistSnapshot = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('temporary write failure'))
+      .mockResolvedValue(undefined);
+    const onError = jest.fn();
+    const coordinator = createCortexPersistenceCoordinator({ persistSnapshot, onError });
+
+    await coordinator.enqueue([{ cortex_id: 'analysis', status: 'activated' }]);
+    await coordinator.enqueue([{ cortex_id: 'analysis', status: 'complete' }]);
+
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(persistSnapshot).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('Feelings agent scope', () => {
+  const snapshot = {
+    enabled: true,
+    agentScope: 'all_agents',
+    capsule: '<viventium_feeling_state>felt</viventium_feeling_state>',
+  };
+
+  it('injects every agent by default', () => {
+    expect(feelingTailForAgent({ snapshot, agentId: 'handoff', primaryAgentId: 'main' })).toBe(
+      snapshot.capsule,
+    );
+  });
+
+  it('injects only the conscious agent when configured', () => {
+    const consciousOnly = { ...snapshot, agentScope: 'conscious_agent' };
+    expect(
+      feelingTailForAgent({ snapshot: consciousOnly, agentId: 'main', primaryAgentId: 'main' }),
+    ).toBe(snapshot.capsule);
+    expect(
+      feelingTailForAgent({ snapshot: consciousOnly, agentId: 'handoff', primaryAgentId: 'main' }),
+    ).toBe('');
+  });
+
+  it('omits the tail when Feelings is disabled', () => {
+    expect(
+      feelingTailForAgent({
+        snapshot: { ...snapshot, enabled: false },
+        agentId: 'main',
+        primaryAgentId: 'main',
+      }),
+    ).toBe('');
+  });
+
+  it('captures only the external user stimulus for the detached reaction', () => {
+    expect(
+      externalUserStimulusForReaction(
+        { body: { text: 'user text' } },
+        { text: 'fallback input', completion: 'assistant text' },
+      ),
+    ).toBe('user text');
+    expect(
+      externalUserStimulusForReaction(
+        { body: {} },
+        { text: 'fallback input', completion: 'assistant text' },
+      ),
+    ).toBe('fallback input');
+  });
+
+  it('accepts structured eval isolation only on temporary or explicit QA-run requests', () => {
+    const requested = {
+      savedMemory: true,
+      conversationRecall: true,
+      feelings: true,
+    };
+    expect(
+      evalIsolationForRequest({
+        body: { isTemporary: true, viventiumEvalIsolation: requested },
+      }),
+    ).toEqual(requested);
+    expect(
+      evalIsolationForRequest({
+        body: { isTemporary: false, viventiumEvalIsolation: requested },
+      }),
+    ).toEqual({});
+    expect(
+      evalIsolationForRequest({
+        body: { viventiumQaRun: true, viventiumEvalIsolation: requested },
+      }),
+    ).toEqual(requested);
+  });
+
+  it('late activation recovery keeps fast-pass activations and returns only newly recovered work', () => {
+    const initial = [{ agentId: 'confirmation', reason: 'fast' }];
+    const late = [
+      { agentId: 'confirmation', reason: 'duplicate' },
+      { agentId: 'red-team', reason: 'recovered' },
+    ];
+    expect(mergeLateActivationCandidates(initial, late)).toEqual({
+      all: [initial[0], late[1]],
+      recovered: [late[1]],
+    });
+  });
+
+  it('schedules one detached reaction with the pinned snapshot and never assistant output', async () => {
+    mockScheduleEmotionalReaction.mockClear();
+    const pinned = { ...snapshot, version: 7, snapshotHash: 'snapshot-7' };
+    const client = new AgentClient({
+      agent: { model_parameters: { model: 'gpt-test' } },
+      req: {
+        user: { id: 'user-1' },
+        body: { text: 'external user stimulus', messageId: 'user-message-1' },
+        _viventiumFeelingSnapshot: pinned,
+      },
+      res: {},
+      contentParts: [],
+      collectedUsage: [],
+      artifactPromises: [],
+    });
+    const first = client.scheduleFeelingsReaction({
+      text: 'payload fallback',
+      assistantResponse: 'must not be appraised',
+    });
+    const second = client.scheduleFeelingsReaction({ text: 'another fallback' });
+    expect(second).toBe(first);
+    await first;
+    expect(mockScheduleEmotionalReaction).toHaveBeenCalledTimes(1);
+    expect(mockScheduleEmotionalReaction).toHaveBeenCalledWith({
+      req: expect.any(Object),
+      userText: 'external user stimulus',
+      stimulusId: 'user-message-1',
+      scheduledSnapshot: pinned,
+    });
+    expect(JSON.stringify(mockScheduleEmotionalReaction.mock.calls[0][0])).not.toContain(
+      'must not be appraised',
+    );
+  });
+});
 
 describe('buildViventiumMcpRequestBody', () => {
   test('passes surface context and existing upload references to GlassHive MCP', () => {
@@ -243,6 +435,21 @@ describe('late completion error content parts', () => {
       [ContentTypes.ERROR]: 'The model provider credentials were rejected.',
       error_class: 'provider_unauthorized',
     });
+  });
+
+  test('classifies provider SDK authentication errors without an HTTP status', () => {
+    const invalidKey = new Error('invalid x-api-key');
+    expect(AgentClient.createCompletionErrorContentPart(invalidKey)).toEqual({
+      type: ContentTypes.ERROR,
+      [ContentTypes.ERROR]: 'The model provider credentials were rejected.',
+      error_class: 'provider_unauthorized',
+    });
+
+    const structured = new Error('authentication_error');
+    structured.code = 'authentication_error';
+    expect(AgentClient.createCompletionErrorContentPart(structured).error_class).toBe(
+      'provider_unauthorized',
+    );
   });
 
   test('does not mutate content parts for late stream termination after assistant text', () => {
@@ -3164,6 +3371,57 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
         }),
       }),
     );
+  });
+
+  test('drains incremental writes before persisting the authoritative final snapshot', async () => {
+    const phaseB = deferred();
+    const incrementalWrite = deferred();
+    const pendingCortexParts = [
+      {
+        type: ContentTypes.CORTEX_INSIGHT,
+        cortex_id: 'agent-background',
+        cortex_name: 'Background',
+        status: 'complete',
+        insight: 'Background result.',
+      },
+    ];
+    client.contentParts.push({ type: ContentTypes.TEXT, text: 'Primary answer.' });
+
+    const attached = client.attachBackgroundCortexCompletionPipeline({
+      cortexExecutionPromise: phaseB.promise,
+      pendingCortexParts,
+      req,
+      conversationId: 'conv-1',
+      responseMessageId: 'resp-1',
+      agent: primaryAgent,
+      getResponseContentParts: () => client.contentParts,
+      responseController: null,
+      turnUserInputTime: 0,
+      followupGraceMs: 0,
+      shouldDeferMainResponse: false,
+      getActivatedCorticesList: () => [{ agentId: 'agent-background' }],
+      waitForIncrementalCortexPersistence: () => incrementalWrite.promise,
+    });
+
+    phaseB.resolve({
+      insights: [{ cortexName: 'Background', insight: 'Background result.' }],
+      mergedPrompt: 'Background result.',
+      cortexCount: 1,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(mockPersistCortexPartsToCanonicalMessage).not.toHaveBeenCalled();
+
+    incrementalWrite.resolve();
+    await attached;
+
+    expect(mockPersistCortexPartsToCanonicalMessage).toHaveBeenCalledTimes(1);
+    expect(mockPersistCortexPartsToCanonicalMessage).toHaveBeenCalledWith({
+      req,
+      responseMessageId: 'resp-1',
+      cortexParts: pendingCortexParts,
+    });
   });
 
   test('suppresses Phase B synthesis when visible text was repaired from emitted deltas', async () => {

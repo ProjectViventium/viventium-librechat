@@ -43,6 +43,13 @@ function shouldInjectForTool({ serverName, toolName } = {}) {
   );
 }
 
+function isGlassHiveLaunchTool({ serverName, toolName } = {}) {
+  return (
+    configuredGlassHiveServerNames().includes(String(serverName || '').trim()) &&
+    GLASSHIVE_LAUNCH_TOOLS.has(String(toolName || '').trim())
+  );
+}
+
 function parseToolArguments(toolArguments) {
   if (typeof toolArguments === 'string') {
     try {
@@ -217,6 +224,10 @@ function workerMemoryBlock(memory) {
   ].join('\n');
 }
 
+function workerFeelingBlock(feelings) {
+  return String(feelings || '').trim();
+}
+
 function contentReadIntentForArgs(args = {}) {
   return (
     truthyFlag(args.connected_account_content_intent) ||
@@ -224,6 +235,23 @@ function contentReadIntentForArgs(args = {}) {
     truthyFlag(args.content_read_intent) ||
     truthyFlag(args.contentReadIntent)
   );
+}
+
+function mergeWorkerContextBundle({ existingBundle, workerMemory = '', workerFeelings = '' }) {
+  const bundle = { ...existingBundle };
+  const memoryBlock = workerMemoryBlock(workerMemory);
+  if (memoryBlock) {
+    bundle.agents_md = appendText(bundle.agents_md, memoryBlock);
+    bundle.claude_md = appendText(bundle.claude_md, memoryBlock);
+    bundle.codex_md = appendText(bundle.codex_md, memoryBlock);
+  }
+  const feelingBlock = workerFeelingBlock(workerFeelings);
+  if (feelingBlock) {
+    bundle.agents_md = appendText(bundle.agents_md, feelingBlock);
+    bundle.claude_md = appendText(bundle.claude_md, feelingBlock);
+    bundle.codex_md = appendText(bundle.codex_md, feelingBlock);
+  }
+  return bundle;
 }
 
 function mergeBrokerBundle({
@@ -234,8 +262,9 @@ function mergeBrokerBundle({
   allowedServers,
   contentReadScope = false,
   workerMemory = '',
+  workerFeelings = '',
 }) {
-  const bundle = { ...existingBundle };
+  const bundle = mergeWorkerContextBundle({ existingBundle, workerMemory, workerFeelings });
   const codexTokenEnvVar = 'GLASSHIVE_CAPABILITY_BROKER_TOKEN';
   const serverConfig = {
     type: 'http',
@@ -279,12 +308,6 @@ function mergeBrokerBundle({
   bundle.agents_md = appendText(bundle.agents_md, instruction);
   bundle.claude_md = appendText(bundle.claude_md, instruction);
   bundle.codex_md = appendText(bundle.codex_md, instruction);
-  const memoryBlock = workerMemoryBlock(workerMemory);
-  if (memoryBlock) {
-    bundle.agents_md = appendText(bundle.agents_md, memoryBlock);
-    bundle.claude_md = appendText(bundle.claude_md, memoryBlock);
-    bundle.codex_md = appendText(bundle.codex_md, memoryBlock);
-  }
   return bundle;
 }
 
@@ -309,17 +332,44 @@ async function maybeInjectGlassHiveCapabilityBroker({
   toolArguments,
   config,
 } = {}) {
-  if (!shouldInjectForTool({ serverName, toolName })) {
+  if (!isGlassHiveLaunchTool({ serverName, toolName })) {
     return toolArguments;
   }
   const args = parseToolArguments(toolArguments);
   if (!args) {
     return toolArguments;
   }
+  const workerMemory = String(config?.configurable?.glasshive_worker_memory || '').trim();
+  const workerFeelings = String(config?.configurable?.glasshive_worker_feelings || '').trim();
+  const workerFeelingsHash = String(
+    config?.configurable?.glasshive_worker_feelings_hash || '',
+  ).trim();
+  const originalWasString = typeof toolArguments === 'string';
+  const returnWorkerContextOnly = (reason) => {
+    if (!workerMemory && !workerFeelings) {
+      return toolArguments;
+    }
+    args.bootstrap_bundle_json = mergeWorkerContextBundle({
+      existingBundle: normalizeBootstrapBundle(args.bootstrap_bundle_json),
+      workerMemory,
+      workerFeelings,
+    });
+    logger.info('[VIVENTIUM][Feelings]', {
+      event: 'feelings.worker.inject',
+      injected: Boolean(workerFeelings),
+      snapshotHash: workerFeelingsHash || null,
+      toolName,
+      brokerStatus: reason,
+    });
+    return originalWasString ? JSON.stringify(args) : args;
+  };
+  if (!shouldInjectForTool({ serverName, toolName })) {
+    return returnWorkerContextOnly('broker_disabled');
+  }
   const user = config?.configurable?.user;
   const userId = String(user?.id || user?._id || '').trim();
   if (!userId) {
-    return toolArguments;
+    return returnWorkerContextOnly('missing_user');
   }
   const registry = getMCPServersRegistry();
   const mcpConfig = await registry.getAllServerConfigs(userId).catch((error) => {
@@ -332,13 +382,13 @@ async function maybeInjectGlassHiveCapabilityBroker({
     return null;
   });
   if (!mcpConfig) {
-    return toolArguments;
+    return returnWorkerContextOnly('broker_config_unavailable');
   }
   const executionMode = executionModeForBroker(args);
   const allowedServerEntries = collectAllowedServerEntries({ mcpConfig, executionMode });
   const allowedServers = allowedServerEntries.map(({ serverName }) => serverName);
   if (allowedServers.length === 0) {
-    return toolArguments;
+    return returnWorkerContextOnly('no_broker_servers');
   }
   const requestBody = config?.configurable?.requestBody || {};
   const existingBundle = normalizeBootstrapBundle(args.bootstrap_bundle_json);
@@ -366,10 +416,9 @@ async function maybeInjectGlassHiveCapabilityBroker({
       reason: 'grant_mint_failed',
       message: error?.message,
     });
-    return toolArguments;
+    return returnWorkerContextOnly('grant_mint_failed');
   }
   const { token, payload } = mintedGrant;
-  const workerMemory = String(config?.configurable?.glasshive_worker_memory || '').trim();
   args.bootstrap_bundle_json = mergeBrokerBundle({
     existingBundle,
     brokerUrl: resolveBrokerUrl(executionMode),
@@ -378,6 +427,14 @@ async function maybeInjectGlassHiveCapabilityBroker({
     allowedServers,
     contentReadScope,
     workerMemory,
+    workerFeelings,
+  });
+  logger.info('[VIVENTIUM][Feelings]', {
+    event: 'feelings.worker.inject',
+    injected: Boolean(workerFeelings),
+    snapshotHash: workerFeelingsHash || null,
+    toolName,
+    brokerStatus: 'injected',
   });
   if (hostContentReadIntent && !contentReadScope) {
     logger.warn(
@@ -398,6 +455,8 @@ module.exports = {
   grantRenewableTtlSecondsForTool,
   maybeInjectGlassHiveCapabilityBroker,
   mergeBrokerBundle,
+  mergeWorkerContextBundle,
+  isGlassHiveLaunchTool,
   executionModeForBroker,
   resolveBrokerUrl,
   shouldInjectForTool,

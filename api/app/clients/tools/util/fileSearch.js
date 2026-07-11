@@ -59,6 +59,7 @@ const DEFAULT_FILE_SEARCH_QUERY_K_CONVERSATION_RECALL = 60;
 const DEFAULT_FILE_SEARCH_QUERY_TIMEOUT_MS_MEETING_TRANSCRIPT = 30000;
 const DEFAULT_FILE_SEARCH_QUERY_K_MEETING_TRANSCRIPT = 8;
 const DEFAULT_FILE_SEARCH_QUERY_K_MEETING_TRANSCRIPT_BATCH_MAX = 80;
+const DEFAULT_FILE_SEARCH_FOCUSED_MEETING_TRANSCRIPT_FILES = 3;
 /* === VIVENTIUM END === */
 const DEFAULT_FILE_SEARCH_MAX_RESULTS = 10;
 const DEFAULT_FILE_SEARCH_MAX_RESULTS_CONVERSATION_RECALL = 6;
@@ -135,6 +136,13 @@ const RECALL_QUERY_STOP_WORDS = new Set([
   'your',
   'you',
 ]);
+const MEETING_TRANSCRIPT_METADATA_STOP_WORDS = new Set([
+  'file',
+  'inventory',
+  'meeting',
+  'summary',
+  'transcript',
+]);
 
 const parsePositiveIntEnv = (value, fallbackValue) => {
   const parsed = Number.parseInt(value ?? '', 10);
@@ -179,6 +187,12 @@ const getMeetingTranscriptFileSearchBatchMaxK = () =>
   parsePositiveIntEnv(
     process.env.VIVENTIUM_FILE_SEARCH_TOP_K_MEETING_TRANSCRIPT_BATCH_MAX,
     DEFAULT_FILE_SEARCH_QUERY_K_MEETING_TRANSCRIPT_BATCH_MAX,
+  );
+
+const getFocusedMeetingTranscriptFileLimit = () =>
+  parsePositiveIntEnv(
+    process.env.VIVENTIUM_FILE_SEARCH_FOCUSED_MEETING_TRANSCRIPT_FILES,
+    DEFAULT_FILE_SEARCH_FOCUSED_MEETING_TRANSCRIPT_FILES,
   );
 /* === VIVENTIUM END === */
 
@@ -539,6 +553,45 @@ const dedupeRecallResults = (results = []) => {
   });
 };
 
+const fuseConversationRecallResults = ({ lexicalResults = [], vectorResults = [] }) => {
+  const fused = new Map();
+  const addChannel = (results, channel, weight) => {
+    results.forEach((result, index) => {
+      if (!result?.content) {
+        return;
+      }
+      const key = `${result.file_id || ''}::${String(result.content)
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase()}`;
+      const contribution = weight / (60 + index + 1);
+      const existing = fused.get(key);
+      if (!existing) {
+        fused.set(key, {
+          ...result,
+          recallChannels: [channel],
+          recallFusionScore: contribution,
+        });
+        return;
+      }
+      existing.recallFusionScore += contribution;
+      if (!existing.recallChannels.includes(channel)) {
+        existing.recallChannels.push(channel);
+      }
+      if (Number(result.distance) < Number(existing.distance)) {
+        existing.distance = result.distance;
+      }
+      if (!existing.sourceKind && result.sourceKind) {
+        existing.sourceKind = result.sourceKind;
+      }
+    });
+  };
+
+  addChannel(lexicalResults, 'lexical', 1.1);
+  addChannel(vectorResults, 'vector', 1.0);
+  return Array.from(fused.values());
+};
+
 const tokenizeRecallQuery = (query) => {
   const tokens = String(query || '')
     .toLowerCase()
@@ -573,6 +626,57 @@ const countTermMatches = (contentLower, terms) => {
     }
   }
   return matchCount;
+};
+
+const meetingTranscriptMetadataText = ({ filename, metadata = {} } = {}) =>
+  [
+    filename,
+    metadata.meetingTranscriptDisplayTitle,
+    metadata.meetingTranscriptOriginalFilename,
+    metadata.meetingTranscriptOneLineSummary,
+    metadata.meetingTranscriptParticipants,
+    metadata.meetingTranscriptCalendarMatch,
+    metadata.meetingTranscriptFileMtime,
+  ]
+    .map((value) => formatTranscriptMetadataValue(value))
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+
+const meetingTranscriptMetadataMatchCount = ({ queryTerms, filename, metadata }) =>
+  countTermMatches(
+    meetingTranscriptMetadataText({ filename, metadata }),
+    queryTerms.filter((term) => !MEETING_TRANSCRIPT_METADATA_STOP_WORDS.has(term)),
+  );
+
+const selectFocusedMeetingTranscriptFiles = ({ files = [], query }) => {
+  const queryTerms = tokenizeRecallQuery(query);
+  if (!queryTerms.length) {
+    return [];
+  }
+
+  return files
+    .filter(
+      (file) => isMeetingTranscriptFileId(file?.file_id) && !isMeetingTranscriptInventoryFile(file),
+    )
+    .map((file, index) => ({
+      file,
+      index,
+      matchCount: meetingTranscriptMetadataMatchCount({
+        queryTerms,
+        filename: file.filename,
+        metadata: file.metadata,
+      }),
+    }))
+    .filter((candidate) => candidate.matchCount > 0)
+    .sort((left, right) => {
+      if (right.matchCount !== left.matchCount) {
+        return right.matchCount - left.matchCount;
+      }
+      return left.index - right.index;
+    })
+    .slice(0, getFocusedMeetingTranscriptFileLimit())
+    .map((candidate) => candidate.file);
 };
 
 const isCodeLikeLiteralCandidate = (token) => {
@@ -654,7 +758,12 @@ const normalizeRecallPromptEchoText = (value) =>
     .trim()
     .replace(/\s+/g, ' ');
 
-const isLongExactPromptEchoWithoutEvidence = ({ message, content, query, hasRecallDerivedChild }) => {
+const isLongExactPromptEchoWithoutEvidence = ({
+  message,
+  content,
+  query,
+  hasRecallDerivedChild,
+}) => {
   if (message?.isCreatedByUser !== true || hasRecallDerivedChild) {
     return false;
   }
@@ -870,6 +979,15 @@ const getConversationRecallRerankScore = ({ query, result, queryTerms }) => {
   const termMatches = countTermMatches(contentLower, queryTerms);
   score += Math.min(0.9, termMatches * 0.18);
 
+  if (isMeetingTranscriptDetailResult(result)) {
+    const metadataMatches = meetingTranscriptMetadataMatchCount({
+      queryTerms,
+      filename: result.filename,
+      metadata: result.fileMetadata,
+    });
+    score += Math.min(1.8, metadataMatches * 0.3);
+  }
+
   if (queryLower.length >= 8 && contentLower.includes(queryLower)) {
     score += 0.45;
   }
@@ -880,6 +998,10 @@ const getConversationRecallRerankScore = ({ query, result, queryTerms }) => {
 
   if (result?.sourceKind === 'raw_message') {
     score += 0.9;
+  }
+
+  if (Number.isFinite(result?.recallFusionScore)) {
+    score += Math.min(0.8, Number(result.recallFusionScore) * 24);
   }
 
   if (isAssistantMemoryDisclaimer(contentLower)) {
@@ -1051,38 +1173,21 @@ const createFileSearchTool = async ({
         runnableConfig?.configurable?.messageId ||
         runnableConfig?.metadata?.messageId;
       /* === VIVENTIUM START ===
-       * Feature: Conversation recall source-first rescue.
-       * Reason:
-       * - Exact prior-chat questions should not wait on a cold vector sidecar when Mongo already
-       *   has the source turns.
-       * - If source-backed recall evidence is found, skip the slow vector query for that recall
-       *   resource only; regular files and meeting transcripts still use their normal paths.
-       * Added: 2026-06-25
+       * Feature: Hybrid conversation recall retrieval.
+       * Purpose: Run source-backed lexical retrieval and vector retrieval together. Lexical hits
+       * must never suppress semantic recall; source-only resources remain explicitly source-only.
        * === VIVENTIUM END === */
-      let earlySourceRescueResults = [];
-      const recallFileIdsWithSourceFirstHit = new Set();
-      if (recallFiles.length > 0) {
-        earlySourceRescueResults = await searchConversationRecallSourceMatches({
-          userId,
-          conversationId: effectiveConversationId,
-          activeMessageId: effectiveActiveMessageId,
-          recallFiles,
-          query,
-          literalCandidates,
-        });
-        for (const result of earlySourceRescueResults) {
-          if (result?.file_id) {
-            recallFileIdsWithSourceFirstHit.add(result.file_id);
-          }
-        }
-        if (earlySourceRescueResults.length > 0) {
-          logger.info(`[${Tools.file_search}] conversation recall source-first hit`, {
-            recallFileCount: recallFiles.length,
-            rescueCount: earlySourceRescueResults.length,
-            skippedVectorRecallFiles: recallFileIdsWithSourceFirstHit.size,
-          });
-        }
-      }
+      const sourceRescuePromise =
+        recallFiles.length > 0
+          ? searchConversationRecallSourceMatches({
+              userId,
+              conversationId: effectiveConversationId,
+              activeMessageId: effectiveActiveMessageId,
+              recallFiles,
+              query,
+              literalCandidates,
+            })
+          : Promise.resolve([]);
 
       /* === VIVENTIUM START ===
        * Feature: Structured file_search query observability + error differentiation
@@ -1263,33 +1368,53 @@ const createFileSearchTool = async ({
           }
         };
 
-        const [meetingResults, singleFileResults] = await Promise.all([
+        const focusedMeetingFiles = selectFocusedMeetingTranscriptFiles({
+          files: meetingTranscriptVectorFiles,
+          query,
+        });
+        const [meetingResults, focusedMeetingResults, singleFileResults] = await Promise.all([
           queryMeetingTranscriptFiles(meetingTranscriptVectorFiles),
+          Promise.all(focusedMeetingFiles.map((file) => querySingleFile(file))),
           Promise.all(singleFilePromises),
         ]);
-        const results = sourceBackedResults.concat(meetingResults, singleFileResults);
+        const results = sourceBackedResults.concat(
+          focusedMeetingResults.filter(Boolean),
+          meetingResults,
+          singleFileResults,
+        );
         return results.filter(
           (result) => result?.response && Array.isArray(result?.response?.data),
         );
       };
 
-      const hasAnyMatches = (results) =>
-        Array.isArray(results) &&
-        results.some(
-          (result) => Array.isArray(result?.response?.data) && result.response.data.length > 0,
-        );
+      const [sourceOutcome, vectorOutcome] = await Promise.allSettled([
+        sourceRescuePromise,
+        queryFiles(files),
+      ]);
+      const earlySourceRescueResults =
+        sourceOutcome.status === 'fulfilled' ? sourceOutcome.value : [];
+      const validResults = vectorOutcome.status === 'fulfilled' ? vectorOutcome.value : [];
+      if (sourceOutcome.status === 'rejected') {
+        logger.error(`[${Tools.file_search}] conversation recall lexical query failed`, {
+          message: sourceOutcome.reason?.message,
+          code: sourceOutcome.reason?.code,
+        });
+      }
+      if (vectorOutcome.status === 'rejected') {
+        queryErrorCount += 1;
+        logger.error(`[${Tools.file_search}] vector query orchestration failed`, {
+          message: vectorOutcome.reason?.message,
+          code: vectorOutcome.reason?.code,
+        });
+      }
+      if (earlySourceRescueResults.length > 0) {
+        logger.info(`[${Tools.file_search}] conversation recall lexical hit`, {
+          recallFileCount: recallFiles.length,
+          lexicalResultCount: earlySourceRescueResults.length,
+        });
+      }
 
-      const vectorFiles = files.filter(
-        (file) =>
-          !(
-            isConversationRecallFileId(file?.file_id) &&
-            recallFileIdsWithSourceFirstHit.has(file.file_id)
-          ),
-      );
-      const validResults = await queryFiles(vectorFiles);
-
-      let formattedResults = earlySourceRescueResults.concat(
-        validResults
+      const vectorFormattedResults = validResults
         .flatMap(({ file, response }) =>
           response.data.map(([docInfo, distance]) => {
             const source = isMeetingTranscriptFileId(file?.file_id)
@@ -1310,55 +1435,29 @@ const createFileSearchTool = async ({
             Number.isFinite(result?.distance) &&
             typeof result?.content === 'string' &&
             result.content.trim().length > 0,
-        ),
-      );
-
-      let hasConversationRecallResults = formattedResults.some((result) =>
+        );
+      const vectorRecallResults = vectorFormattedResults.filter((result) =>
         isConversationRecallFileId(result.file_id),
       );
-      let hasMeetingTranscriptResults = formattedResults.some((result) =>
+      let formattedResults = vectorFormattedResults
+        .filter((result) => !isConversationRecallFileId(result.file_id))
+        .concat(
+          fuseConversationRecallResults({
+            lexicalResults: earlySourceRescueResults,
+            vectorResults: vectorRecallResults,
+          }),
+        );
+      formattedResults = dedupeRecallResults(formattedResults);
+
+      const hasConversationRecallResults = formattedResults.some((result) =>
+        isConversationRecallFileId(result.file_id),
+      );
+      const hasMeetingTranscriptResults = formattedResults.some((result) =>
         isMeetingTranscriptFileId(result.file_id),
       );
 
-      if (hasConversationRecallResults) {
+      if (hasConversationRecallResults || hasMeetingTranscriptResults) {
         formattedResults = rerankConversationRecallResults({ query, results: formattedResults });
-      }
-
-      const shouldAttemptSourceRescue = recallFiles.length > 0 && !hasMeetingTranscriptResults;
-
-      const lateRecallFiles = recallFiles.filter(
-        (file) => !recallFileIdsWithSourceFirstHit.has(file?.file_id),
-      );
-
-      if (lateRecallFiles.length > 0 && shouldAttemptSourceRescue) {
-        const sourceRescueResults = await searchConversationRecallSourceMatches({
-          userId,
-          conversationId: effectiveConversationId,
-          activeMessageId: effectiveActiveMessageId,
-          recallFiles: lateRecallFiles,
-          query,
-          literalCandidates,
-        });
-
-        if (sourceRescueResults.length > 0) {
-          logger.info(`[${Tools.file_search}] conversation recall source rescue hit`, {
-            recallFileCount: lateRecallFiles.length,
-            rescueCount: sourceRescueResults.length,
-          });
-          formattedResults = dedupeRecallResults(formattedResults.concat(sourceRescueResults));
-          hasConversationRecallResults = formattedResults.some((result) =>
-            isConversationRecallFileId(result.file_id),
-          );
-          hasMeetingTranscriptResults = formattedResults.some((result) =>
-            isMeetingTranscriptFileId(result.file_id),
-          );
-          if (hasConversationRecallResults) {
-            formattedResults = rerankConversationRecallResults({
-              query,
-              results: formattedResults,
-            });
-          }
-        }
       }
 
       if (formattedResults.length === 0) {
@@ -1369,7 +1468,7 @@ const createFileSearchTool = async ({
         return [msg, undefined];
       }
 
-      if (!hasConversationRecallResults) {
+      if (!hasConversationRecallResults && !hasMeetingTranscriptResults) {
         formattedResults.sort((a, b) => a.distance - b.distance);
       }
 

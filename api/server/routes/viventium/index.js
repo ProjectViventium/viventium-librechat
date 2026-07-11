@@ -44,6 +44,8 @@ const glasshiveCapabilities = require('./glasshiveCapabilities');
  * Feature: Prompt Workbench local launcher route.
  * === VIVENTIUM NOTE === */
 const promptWorkbench = require('./promptWorkbench');
+/* === VIVENTIUM NOTE === Feelings / Emotional Cortex */
+const feelings = require('./feelings');
 
 const router = express.Router();
 
@@ -61,5 +63,6 @@ router.use('/skyvern', skyvern);
 router.use('/glasshive', glasshive);
 router.use('/glasshive/capabilities', glasshiveCapabilities);
 router.use('/prompt-workbench', promptWorkbench);
+router.use('/feelings', feelings);
 
 module.exports = router;

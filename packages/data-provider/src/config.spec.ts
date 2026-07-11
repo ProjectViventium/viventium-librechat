@@ -174,6 +174,26 @@ describe('configSchema enterprise compatibility', () => {
       AgentCapabilities.skills,
     ]);
   });
+
+  it('accepts source-owned Viventium activation policy prompt references', () => {
+    const parsed = configSchema.strict().parse({
+      version: '1.2.3',
+      viventium: {
+        background_cortices: {
+          activation_policy: {
+            enabled: true,
+            prompt: {
+              promptRef: 'cortex.background_activation_policy',
+            },
+          },
+        },
+      },
+    });
+
+    expect(parsed.viventium?.background_cortices?.activation_policy?.prompt).toEqual({
+      promptRef: 'cortex.background_activation_policy',
+    });
+  });
 });
 
 describe('resolveEndpointType + getEndpointFileConfig integration', () => {

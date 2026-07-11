@@ -800,6 +800,8 @@ export type TStartupConfig = {
    * Purpose: Expose the server-side workbench link gate to the web client.
    * === VIVENTIUM END === */
   viventiumPromptWorkbenchLinkEnabled?: boolean;
+  /** Operator-level Feelings instrument availability. */
+  viventiumFeelingsAvailable?: boolean;
   /* === VIVENTIUM START ===
    * Feature: GlassHive host worker callbacks.
    * Purpose: Expose the compiled callback wait window to the web polling hook.
@@ -1046,10 +1048,20 @@ const backgroundCortexDirectActionServerSchema = z
   })
   .passthrough();
 
+const viventiumPromptValueSchema = z.union([
+  z.string(),
+  z
+    .object({
+      promptRef: z.string(),
+      promptVars: z.record(z.any()).optional(),
+    })
+    .passthrough(),
+]);
+
 const backgroundCortexActivationPolicySchema = z
   .object({
     enabled: z.boolean().optional(),
-    prompt: z.string().optional(),
+    prompt: viventiumPromptValueSchema.optional(),
     direct_action_tool_rule: z.string().optional(),
     direct_action_mcp_servers: z.array(backgroundCortexDirectActionServerSchema).optional(),
   })
@@ -1230,6 +1242,14 @@ export const alternateName = {
 };
 
 const sharedOpenAIModels = [
+  // === VIVENTIUM START ===
+  // Feature: GPT-5.6 fallback inventory for chat, Assistants, and Agent Builder.
+  // Source: https://developers.openai.com/api/docs/guides/latest-model
+  'gpt-5.6',
+  'gpt-5.6-sol',
+  'gpt-5.6-terra',
+  'gpt-5.6-luna',
+  // === VIVENTIUM END ===
   'gpt-5.4',
   'gpt-5.1',
   'gpt-5.1-chat-latest',

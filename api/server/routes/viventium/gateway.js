@@ -35,13 +35,18 @@ const {
   EModelEndpoint,
   checkOpenAIStorage,
 } = require('librechat-data-provider');
-const { configMiddleware, validateConvoAccess, buildEndpointOption } = require('~/server/middleware');
+const {
+  configMiddleware,
+  validateConvoAccess,
+  buildEndpointOption,
+} = require('~/server/middleware');
 const { initializeClient } = require('~/server/services/Endpoints/agents');
 const addTitle = require('~/server/services/Endpoints/agents/title');
 const AgentController = require('~/server/controllers/agents/request');
 const { fileAccess } = require('~/server/middleware/accessResources/fileAccess');
 const { loadAuthValues } = require('~/server/services/Tools/credentials');
 const { getStrategyFunctions } = require('~/server/services/Files/strategies');
+const { resizeImageBuffer } = require('~/server/services/Files/images');
 const { cleanFileName } = require('~/server/utils/files');
 const { getOpenAIClient } = require('~/server/controllers/assistants/helpers');
 const { getUserById, getMessages, getConvo } = require('~/models');
@@ -66,6 +71,8 @@ const {
 const {
   resolveReusableConversationState,
 } = require('~/server/services/viventium/conversationThreading');
+
+const EXTRACTED_DOCUMENT_IMAGE_MAX_DIMENSION = 768;
 const {
   GATEWAY_SECRET_HEADER,
   parseBoolEnv,
@@ -257,11 +264,7 @@ function extractAttachmentBase64(payload) {
     return '';
   }
   const raw =
-    payload.data ||
-    payload.buffer ||
-    payload.base64 ||
-    payload.bufferBase64 ||
-    payload.content;
+    payload.data || payload.buffer || payload.base64 || payload.bufferBase64 || payload.content;
   if (typeof raw !== 'string') {
     return '';
   }
@@ -349,6 +352,54 @@ function formatGatewayImagesForVision(attachments) {
     .filter(Boolean);
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Mixed-document visual parity for generic gateway uploads.
+ * Purpose: Reuse the same vision injection path for images extracted from PPTX/OCR document
+ * attachments so channel bridges see deck visuals plus extracted text and notes.
+ * === VIVENTIUM END === */
+async function formatExtractedImagesForVision(images) {
+  if (!Array.isArray(images) || images.length === 0) {
+    return [];
+  }
+
+  const formatted = [];
+  for (const image of images) {
+    try {
+      if (typeof image !== 'string' || !image.trim()) {
+        continue;
+      }
+      const trimmed = image.trim();
+      const match = trimmed.match(/^data:([^;]+);base64,(.*)$/);
+      const mimeType = match ? match[1] : 'image/png';
+      const base64Data = match ? match[2] : extractAttachmentBase64({ data: trimmed });
+      if (!mimeType.startsWith('image/') || !base64Data) {
+        continue;
+      }
+      const inputBuffer = Buffer.from(base64Data, 'base64');
+      const { buffer } = await resizeImageBuffer(
+        inputBuffer,
+        { px: EXTRACTED_DOCUMENT_IMAGE_MAX_DIMENSION },
+        EModelEndpoint.anthropic,
+      );
+      const resizedBase64 = buffer.toString('base64');
+      formatted.push({
+        type: ContentTypes.IMAGE_URL,
+        image_url: {
+          url: `data:${mimeType};base64,${resizedBase64}`,
+          detail: 'auto',
+        },
+      });
+    } catch (err) {
+      logger.warn(
+        '[VIVENTIUM][gateway/chat] Failed to prepare extracted document image for vision: %s',
+        err?.message || err,
+      );
+    }
+  }
+
+  return formatted;
+}
+
 async function uploadGatewayFiles({ req, attachments, agentId }) {
   if (!GATEWAY_FILE_UPLOAD_ENABLED) {
     return [];
@@ -363,6 +414,7 @@ async function uploadGatewayFiles({ req, attachments, agentId }) {
   ({ filterFile, processAgentFileUpload } = require('~/server/services/Files/process'));
 
   const uploaded = [];
+  req._gatewayUploadedDocumentImages = [];
   const originalFile = req.file;
   const originalBody = req.body;
 
@@ -429,6 +481,7 @@ async function uploadGatewayFiles({ req, attachments, agentId }) {
 
     try {
       req.file = tempFile;
+      req._viventiumBridgeDocumentImageExtraction = true;
       const model =
         originalBody && typeof originalBody === 'object' ? originalBody.model : undefined;
       req.body = {
@@ -457,6 +510,17 @@ async function uploadGatewayFiles({ req, attachments, agentId }) {
       await processAgentFileUpload({ req, res, metadata });
       if (result) {
         uploaded.push(result);
+        const extractedImages = await formatExtractedImagesForVision(
+          result.viventiumExtractedImages,
+        );
+        if (extractedImages.length > 0) {
+          req._gatewayUploadedDocumentImages.push(...extractedImages);
+          logger.info(
+            '[VIVENTIUM][gateway/chat] Prepared %d extracted document image(s) for vision from %s',
+            extractedImages.length,
+            safeName,
+          );
+        }
       }
     } catch (err) {
       logger.error('[VIVENTIUM][gateway/chat] Attachment upload failed:', err);
@@ -716,13 +780,15 @@ router.post(
         if (_res.statusCode < 400) {
           return;
         }
-        ViventiumGatewayIngressEvent.deleteOne({ _id: ingressReservation.recordId }).catch((err) => {
-          logger.warn(
-            '[VIVENTIUM][gateway/chat] Failed to release ingress reservation %s: %s',
-            ingressReservation.recordId,
-            err?.message,
-          );
-        });
+        ViventiumGatewayIngressEvent.deleteOne({ _id: ingressReservation.recordId }).catch(
+          (err) => {
+            logger.warn(
+              '[VIVENTIUM][gateway/chat] Failed to release ingress reservation %s: %s',
+              ingressReservation.recordId,
+              err?.message,
+            );
+          },
+        );
       });
     }
 
@@ -793,6 +859,10 @@ router.post(
       GATEWAY_FILE_UPLOAD_ENABLED && nonImageAttachments.length > 0
         ? await uploadGatewayFiles({ req, attachments: nonImageAttachments, agentId })
         : [];
+    const extractedDocumentImages = Array.isArray(req._gatewayUploadedDocumentImages)
+      ? req._gatewayUploadedDocumentImages
+      : [];
+    const allFormattedImages = [...formattedImages, ...extractedDocumentImages];
 
     const { attachments: _ignoredAttachments, files: _ignoredFiles, ...safeIncoming } = incoming;
 
@@ -833,11 +903,11 @@ router.post(
       req.body.viventiumSurface = identity.channel;
     }
 
-    if (formattedImages.length > 0) {
-      req._gatewayImages = formattedImages;
+    if (allFormattedImages.length > 0) {
+      req._gatewayImages = allFormattedImages;
       logger.info(
         '[VIVENTIUM][gateway/chat] Images prepared for vision: count=%d channel=%s',
-        formattedImages.length,
+        allFormattedImages.length,
         identity.channel,
       );
     }
@@ -1038,95 +1108,112 @@ router.get('/cortex/:messageId', gatewayAuth, async (req, res) => {
   }
 });
 
-router.get('/files/download/:file_id', gatewayAuth, configMiddleware, fileAccess, async (req, res) => {
-  try {
-    const file = req.fileAccess?.file;
-    if (!file) {
-      return res.status(404).json({ error: 'File not found' });
-    }
+router.get(
+  '/files/download/:file_id',
+  gatewayAuth,
+  configMiddleware,
+  fileAccess,
+  async (req, res) => {
+    try {
+      const file = req.fileAccess?.file;
+      if (!file) {
+        return res.status(404).json({ error: 'File not found' });
+      }
 
-    if (checkOpenAIStorage(file.source) && !file.model) {
-      return res.status(400).send('The model used when creating this file is not available');
-    }
+      if (checkOpenAIStorage(file.source) && !file.model) {
+        return res.status(400).send('The model used when creating this file is not available');
+      }
 
-    const { getDownloadStream } = getStrategyFunctions(file.source);
-    if (!getDownloadStream) {
-      logger.warn(
-        '[VIVENTIUM][gateway/files/download] No getDownloadStream for source=%s file_id=%s',
-        file.source,
-        file.file_id,
-      );
-      return res.status(501).send('Not Implemented');
-    }
+      const { getDownloadStream } = getStrategyFunctions(file.source);
+      if (!getDownloadStream) {
+        logger.warn(
+          '[VIVENTIUM][gateway/files/download] No getDownloadStream for source=%s file_id=%s',
+          file.source,
+          file.file_id,
+        );
+        return res.status(501).send('Not Implemented');
+      }
 
-    const cleanedFilename = cleanFileName(file.filename);
-    res.setHeader('Content-Disposition', `attachment; filename="${cleanedFilename}"`);
-    res.setHeader('Content-Type', file.type || 'application/octet-stream');
-    res.setHeader('X-File-Metadata', JSON.stringify(file));
+      const cleanedFilename = cleanFileName(file.filename);
+      res.setHeader('Content-Disposition', `attachment; filename="${cleanedFilename}"`);
+      res.setHeader('Content-Type', file.type || 'application/octet-stream');
+      res.setHeader('X-File-Metadata', JSON.stringify(file));
 
-    if (checkOpenAIStorage(file.source)) {
-      req.body = { model: file.model };
-      const endpointMap = {
-        [FileSources.openai]: EModelEndpoint.assistants,
-        [FileSources.azure]: EModelEndpoint.azureAssistants,
-      };
-      const { openai } = await getOpenAIClient({
-        req,
-        res,
-        overrideEndpoint: endpointMap[file.source],
+      if (checkOpenAIStorage(file.source)) {
+        req.body = { model: file.model };
+        const endpointMap = {
+          [FileSources.openai]: EModelEndpoint.assistants,
+          [FileSources.azure]: EModelEndpoint.azureAssistants,
+        };
+        const { openai } = await getOpenAIClient({
+          req,
+          res,
+          overrideEndpoint: endpointMap[file.source],
+        });
+        const passThrough = await getDownloadStream(file.file_id, openai);
+        const stream =
+          passThrough.body && typeof passThrough.body.getReader === 'function'
+            ? Readable.fromWeb(passThrough.body)
+            : passThrough.body;
+        stream.pipe(res);
+        return;
+      }
+
+      const fileStream = await getDownloadStream(req, file.filepath);
+      fileStream.on('error', (streamError) => {
+        logger.error('[VIVENTIUM][gateway/files/download] Stream error:', streamError);
       });
-      const passThrough = await getDownloadStream(file.file_id, openai);
-      const stream =
-        passThrough.body && typeof passThrough.body.getReader === 'function'
-          ? Readable.fromWeb(passThrough.body)
-          : passThrough.body;
-      stream.pipe(res);
-      return;
+      fileStream.pipe(res);
+    } catch (error) {
+      logger.error('[VIVENTIUM][gateway/files/download] Error downloading file:', error);
+      res.status(500).send('Error downloading file');
     }
-
-    const fileStream = await getDownloadStream(req, file.filepath);
-    fileStream.on('error', (streamError) => {
-      logger.error('[VIVENTIUM][gateway/files/download] Stream error:', streamError);
-    });
-    fileStream.pipe(res);
-  } catch (error) {
-    logger.error('[VIVENTIUM][gateway/files/download] Error downloading file:', error);
-    res.status(500).send('Error downloading file');
-  }
-});
+  },
+);
 
 function isValidCodeFileId(str) {
   return /^[A-Za-z0-9_-]{21}$/.test(str);
 }
 
-router.get('/files/code/download/:session_id/:fileId', gatewayAuth, configMiddleware, async (req, res) => {
-  try {
-    const { session_id, fileId } = req.params;
-    const logPrefix = `[VIVENTIUM][gateway/files/code/download] session=${session_id} file=${fileId}`;
+router.get(
+  '/files/code/download/:session_id/:fileId',
+  gatewayAuth,
+  configMiddleware,
+  async (req, res) => {
+    try {
+      const { session_id, fileId } = req.params;
+      const logPrefix = `[VIVENTIUM][gateway/files/code/download] session=${session_id} file=${fileId}`;
 
-    if (!session_id || !fileId) {
-      return res.status(400).send('Bad request');
+      if (!session_id || !fileId) {
+        return res.status(400).send('Bad request');
+      }
+
+      if (!isValidCodeFileId(session_id) || !isValidCodeFileId(fileId)) {
+        logger.debug('%s invalid session_id or fileId', logPrefix);
+        return res.status(400).send('Bad request');
+      }
+
+      const { getDownloadStream } = getStrategyFunctions(FileSources.execute_code);
+      if (!getDownloadStream) {
+        logger.warn('%s missing execute_code getDownloadStream', logPrefix);
+        return res.status(501).send('Not Implemented');
+      }
+
+      const result = await loadAuthValues({
+        userId: req.user.id,
+        authFields: [EnvVar.CODE_API_KEY],
+      });
+      const response = await getDownloadStream(
+        `${session_id}/${fileId}`,
+        result[EnvVar.CODE_API_KEY],
+      );
+      res.set(response.headers);
+      response.data.pipe(res);
+    } catch (error) {
+      logger.error('[VIVENTIUM][gateway/files/code/download] Error downloading file:', error);
+      res.status(500).send('Error downloading file');
     }
-
-    if (!isValidCodeFileId(session_id) || !isValidCodeFileId(fileId)) {
-      logger.debug('%s invalid session_id or fileId', logPrefix);
-      return res.status(400).send('Bad request');
-    }
-
-    const { getDownloadStream } = getStrategyFunctions(FileSources.execute_code);
-    if (!getDownloadStream) {
-      logger.warn('%s missing execute_code getDownloadStream', logPrefix);
-      return res.status(501).send('Not Implemented');
-    }
-
-    const result = await loadAuthValues({ userId: req.user.id, authFields: [EnvVar.CODE_API_KEY] });
-    const response = await getDownloadStream(`${session_id}/${fileId}`, result[EnvVar.CODE_API_KEY]);
-    res.set(response.headers);
-    response.data.pipe(res);
-  } catch (error) {
-    logger.error('[VIVENTIUM][gateway/files/code/download] Error downloading file:', error);
-    res.status(500).send('Error downloading file');
-  }
-});
+  },
+);
 
 module.exports = router;

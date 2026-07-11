@@ -246,6 +246,102 @@ def _scheduler_late_delivery(task: Dict[str, object]) -> Optional[Dict[str, obje
     return None
 
 
+def _latest_due_occurrence(
+    schedule: Dict[str, object],
+    stored_due: datetime,
+    now: datetime,
+) -> datetime:
+    sched_type = str(schedule.get("type") or "")
+    if sched_type == "once" or stored_due > now:
+        return stored_due
+
+    try:
+        tz = ensure_timezone(str(schedule.get("timezone") or "UTC"))
+        now_local = now.astimezone(tz)
+        candidate: Optional[datetime] = None
+
+        if sched_type in {"daily", "weekdays", "weekly", "monthly"}:
+            hour, minute = parse_time(str(schedule.get("time") or ""))
+
+        if sched_type == "daily":
+            candidate = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if candidate > now_local:
+                candidate -= timedelta(days=1)
+        elif sched_type == "weekdays":
+            candidate = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            while candidate > now_local or candidate.weekday() >= 5:
+                candidate -= timedelta(days=1)
+        elif sched_type == "weekly":
+            days = normalize_days(schedule.get("days_of_week") or [])
+            for offset in range(0, 8):
+                possible = (now_local - timedelta(days=offset)).replace(
+                    hour=hour,
+                    minute=minute,
+                    second=0,
+                    microsecond=0,
+                )
+                if possible.weekday() in days and possible <= now_local:
+                    candidate = possible
+                    break
+        elif sched_type == "monthly":
+            day_of_month = int(schedule.get("day_of_month") or 0)
+            if day_of_month <= 0:
+                return stored_due
+            year = now_local.year
+            month = now_local.month
+            day = min(day_of_month, last_day_of_month(year, month))
+            candidate = now_local.replace(
+                day=day,
+                hour=hour,
+                minute=minute,
+                second=0,
+                microsecond=0,
+            )
+            if candidate > now_local:
+                month = 12 if month == 1 else month - 1
+                year = year - 1 if now_local.month == 1 else year
+                day = min(day_of_month, last_day_of_month(year, month))
+                candidate = candidate.replace(year=year, month=month, day=day)
+        elif sched_type == "interval":
+            interval = schedule.get("interval") if isinstance(schedule.get("interval"), dict) else {}
+            every = int(interval.get("every") or 0)
+            unit = str(interval.get("unit") or "")
+            units = {
+                "minute": timedelta(minutes=every),
+                "hour": timedelta(hours=every),
+                "day": timedelta(days=every),
+                "week": timedelta(weeks=every),
+            }
+            delta = units.get(unit)
+            if every <= 0 or delta is None:
+                return stored_due
+            anchor_value = schedule.get("start_at")
+            anchor = (
+                parse_iso(str(anchor_value), tz).astimezone(timezone.utc)
+                if anchor_value
+                else stored_due.astimezone(timezone.utc)
+            )
+            if anchor > now:
+                return stored_due
+            steps = int((now - anchor).total_seconds() // delta.total_seconds())
+            candidate = (anchor + (delta * steps)).astimezone(tz)
+        elif sched_type == "cron":
+            expression = str(schedule.get("cron") or "").strip()
+            if not expression:
+                return stored_due
+            candidate = croniter(expression, now_local + timedelta(microseconds=1)).get_prev(datetime)
+            if candidate.tzinfo is None:
+                candidate = candidate.replace(tzinfo=tz)
+
+        if candidate is None:
+            return stored_due
+        candidate_utc = candidate.astimezone(timezone.utc)
+        return candidate_utc if candidate_utc >= stored_due else stored_due
+    except Exception as exc:
+        logger.warning("Could not resolve latest due occurrence; using persisted due time: %s", exc)
+        return stored_due
+
+
 class SchedulerEngine:
     def __init__(
         self,
@@ -308,6 +404,8 @@ class SchedulerEngine:
         except Exception:
             logger.warning("Invalid next_run_at for task %s", task_id)
             next_run_dt = now
+
+        next_run_dt = _latest_due_occurrence(schedule, next_run_dt, now)
 
         late_seconds = max(0, int((now - next_run_dt).total_seconds()))
         if late_seconds > self._misfire_grace_s:

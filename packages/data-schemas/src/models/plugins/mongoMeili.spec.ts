@@ -138,6 +138,68 @@ describe('Meilisearch Mongoose plugin', () => {
     expect(mockAddDocuments).not.toHaveBeenCalled();
   });
 
+  test('making an indexed message ineligible removes its existing Meili document', async () => {
+    const messageModel = createMessageModel(mongoose);
+    const messageId = new mongoose.Types.ObjectId().toString();
+    await messageModel.create({
+      messageId,
+      conversationId: new mongoose.Types.ObjectId().toString(),
+      user: new mongoose.Types.ObjectId().toString(),
+      isCreatedByUser: true,
+      text: 'Initially searchable.',
+      expiredAt: null,
+    });
+    const indexed = await messageModel.findOne({ messageId }).select('+_meiliIndex');
+    expect(indexed?._meiliIndex).toBe(true);
+    mockUpdateDocuments.mockClear();
+    mockDeleteDocument.mockClear();
+
+    indexed!.expiredAt = new Date();
+    await indexed!.save();
+
+    expect(mockDeleteDocument).toHaveBeenCalledTimes(1);
+    expect(mockUpdateDocuments).not.toHaveBeenCalled();
+    const stored = await messageModel.findOne({ messageId }).select('+_meiliIndex').lean();
+    expect(stored?._meiliIndex).toBe(false);
+  });
+
+  test('structured QA-ineligible messages do not index', async () => {
+    await createMessageModel(mongoose).create({
+      messageId: new mongoose.Types.ObjectId().toString(),
+      conversationId: new mongoose.Types.ObjectId().toString(),
+      user: new mongoose.Types.ObjectId().toString(),
+      isCreatedByUser: true,
+      text: 'Structured synthetic run.',
+      metadata: { viventium: { qaRun: true, memoryEligible: false } },
+    });
+    expect(mockAddDocuments).not.toHaveBeenCalled();
+    expect(mockUpdateDocuments).not.toHaveBeenCalled();
+  });
+
+  test('marking an indexed message as a structured QA run removes it from Meili', async () => {
+    const messageModel = createMessageModel(mongoose);
+    const messageId = new mongoose.Types.ObjectId().toString();
+    await messageModel.create({
+      messageId,
+      conversationId: new mongoose.Types.ObjectId().toString(),
+      user: new mongoose.Types.ObjectId().toString(),
+      isCreatedByUser: true,
+      text: 'Initially searchable QA candidate.',
+    });
+    const indexed = await messageModel.findOne({ messageId }).select('+_meiliIndex');
+    expect(indexed?._meiliIndex).toBe(true);
+    mockDeleteDocument.mockClear();
+    mockUpdateDocuments.mockClear();
+
+    indexed!.metadata = { viventium: { qaRun: true, memoryEligible: false } };
+    await indexed!.save();
+
+    expect(mockDeleteDocument).toHaveBeenCalledTimes(1);
+    expect(mockUpdateDocuments).not.toHaveBeenCalled();
+    const stored = await messageModel.findOne({ messageId }).select('+_meiliIndex').lean();
+    expect(stored?._meiliIndex).toBe(false);
+  });
+
   test('saving Listen-Only transcript messages does NOT index w/ meilisearch', async () => {
     const messageModel = createMessageModel(mongoose);
     const messageId = new mongoose.Types.ObjectId().toString();

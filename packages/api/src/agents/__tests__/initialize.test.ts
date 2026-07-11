@@ -8,7 +8,7 @@ import type { Agent } from 'librechat-data-provider';
 import type { ServerRequest, InitializeResultBase } from '~/types';
 import type { InitializeAgentDbMethods } from '../initialize';
 
-var mockLogger = {
+const mockLogger = {
   debug: jest.fn(),
   info: jest.fn(),
   warn: jest.fn(),
@@ -76,8 +76,55 @@ jest.mock('../resources', () => ({
   }),
 }));
 
-import { initializeAgent } from '../initialize';
+import { applyOpenAIGPT56AgentDefaults, initializeAgent } from '../initialize';
 import { __internal as recallAvailabilityInternal } from '../conversationRecallAvailability';
+
+/* === VIVENTIUM START ===
+ * Regression: GPT-5.6 Agent Builder defaults.
+ * Purpose: Tool-using and multi-turn GPT-5.6 agents should use the Responses path by default while
+ * preserving an explicit operator choice to keep Chat Completions.
+ * === VIVENTIUM END === */
+describe('applyOpenAIGPT56AgentDefaults', () => {
+  it.each(['gpt-5.6', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'])(
+    'defaults OpenAI %s agents to Responses API',
+    (model) => {
+      expect(
+        applyOpenAIGPT56AgentDefaults({
+          provider: EModelEndpoint.openAI,
+          model,
+          modelOptions: { model },
+        }),
+      ).toEqual({ model, useResponsesApi: true });
+    },
+  );
+
+  it('preserves an explicit Chat Completions choice', () => {
+    expect(
+      applyOpenAIGPT56AgentDefaults({
+        provider: EModelEndpoint.openAI,
+        model: 'gpt-5.6',
+        modelOptions: { model: 'gpt-5.6', useResponsesApi: false },
+      }),
+    ).toEqual({ model: 'gpt-5.6', useResponsesApi: false });
+  });
+
+  it('does not alter other models or providers', () => {
+    expect(
+      applyOpenAIGPT56AgentDefaults({
+        provider: EModelEndpoint.openAI,
+        model: 'gpt-5.4',
+        modelOptions: { model: 'gpt-5.4' },
+      }),
+    ).toEqual({ model: 'gpt-5.4' });
+    expect(
+      applyOpenAIGPT56AgentDefaults({
+        provider: EModelEndpoint.anthropic,
+        model: 'gpt-5.6',
+        modelOptions: { model: 'gpt-5.6' },
+      }),
+    ).toEqual({ model: 'gpt-5.6' });
+  });
+});
 
 /**
  * Creates minimal mock objects for initializeAgent tests.
@@ -1030,10 +1077,12 @@ describe('initializeAgent — meeting transcript resources', () => {
         db,
       );
 
-      expect(mockRagFilesExist).toHaveBeenCalledWith(expect.objectContaining({
-        userId: 'user-1',
-        fileIds: ['meeting_summary:user-1:missing'],
-      }));
+      expect(mockRagFilesExist).toHaveBeenCalledWith(
+        expect.objectContaining({
+          userId: 'user-1',
+          fileIds: ['meeting_summary:user-1:missing'],
+        }),
+      );
       expect(
         (result.tool_resources?.file_search?.files || []).filter(
           (file) => file.context === FileContext.meeting_transcript,
@@ -1107,10 +1156,12 @@ describe('initializeAgent — meeting transcript resources', () => {
         db,
       );
 
-      expect(mockRagFilesExist).toHaveBeenCalledWith(expect.objectContaining({
-        userId: 'user-1',
-        fileIds: ['meeting_summary:user-1:missing'],
-      }));
+      expect(mockRagFilesExist).toHaveBeenCalledWith(
+        expect.objectContaining({
+          userId: 'user-1',
+          fileIds: ['meeting_summary:user-1:missing'],
+        }),
+      );
       expect(result.tool_resources?.file_search?.file_ids).toEqual(
         expect.arrayContaining(['meeting_inventory:user-1:current']),
       );

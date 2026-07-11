@@ -1628,7 +1628,7 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(initializeOpenAI).toHaveBeenCalledWith(
       expect.objectContaining({
         model_parameters: expect.objectContaining({
-          model: 'gpt-5.4',
+          model: 'gpt-5.6-sol',
         }),
       }),
     );
@@ -1637,7 +1637,7 @@ describe('BackgroundCortexFollowUpService', () => {
         graphConfig: expect.objectContaining({
           llmConfig: expect.objectContaining({
             provider: 'openai',
-            model: 'gpt-5.4',
+            model: 'gpt-5.6-sol',
           }),
         }),
       }),

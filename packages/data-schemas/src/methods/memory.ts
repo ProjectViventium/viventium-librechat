@@ -27,8 +27,8 @@ const formatDate = (date: Date): string => {
 
 // Factory function that takes mongoose instance and returns the methods
 export function createMemoryMethods(mongoose: typeof import('mongoose')) {
-	  /* === VIVENTIUM NOTE ===
-	   * Feature: Guardrail for destructive `moments` rewrites
+  /* === VIVENTIUM NOTE ===
+   * Feature: Guardrail for destructive `moments` rewrites
    *
    * Observed failure mode (managed cloud):
    * - Memory agent sometimes writes `moments` with a placeholder like "[previous moments preserved]"
@@ -36,17 +36,14 @@ export function createMemoryMethods(mongoose: typeof import('mongoose')) {
    *
    * This helper merges the existing moments list with any newly provided moments when that placeholder
    * is present, producing a clean multi-line list. This is intentionally conservative and only
-	   * activates for the explicit placeholder token.
-	   *
-	   * Added: 2026-02-07
-	   */
-	  const PREVIOUS_MOMENTS_PLACEHOLDER_RE = /\[previous moments preserved\]/gi;
+   * activates for the explicit placeholder token.
+   *
+   * Added: 2026-02-07
+   */
+  const PREVIOUS_MOMENTS_PLACEHOLDER_RE = /\[previous moments preserved\]/gi;
 
   const normalizeMomentEntry = (entry: string): string =>
-    (entry || '')
-      .trim()
-      .replace(/\s+/g, ' ')
-      .toLowerCase();
+    (entry || '').trim().replace(/\s+/g, ' ').toLowerCase();
 
   const extractMomentEntries = (raw: string): string[] => {
     const text = (raw || '').replace(PREVIOUS_MOMENTS_PLACEHOLDER_RE, '').trim();
@@ -56,7 +53,9 @@ export function createMemoryMethods(mongoose: typeof import('mongoose')) {
 
     // Preferred: split by repeated "- YYYY-MM..." markers (handles the one-line, multi-entry failure mode).
     const markerRe = /-\s*\d{4}-\d{2}(?:-\d{2})?\s*\|/g;
-    const matches = Array.from(text.matchAll(markerRe)).map((m) => m.index).filter((i) => i != null) as number[];
+    const matches = Array.from(text.matchAll(markerRe))
+      .map((m) => m.index)
+      .filter((i) => i != null) as number[];
 
     const entries: string[] = [];
     if (matches.length > 0) {
@@ -132,7 +131,7 @@ export function createMemoryMethods(mongoose: typeof import('mongoose')) {
     return final;
   };
 
-	  const mergeMomentsValue = (existingValue: string, incomingValue: string): string => {
+  const mergeMomentsValue = (existingValue: string, incomingValue: string): string => {
     const existingEntries = extractMomentEntries(existingValue);
     const incomingEntries = extractMomentEntries(incomingValue);
 
@@ -157,14 +156,14 @@ export function createMemoryMethods(mongoose: typeof import('mongoose')) {
       merged.push(entry);
     }
 
-	    return trimMoments(merged).join('\n');
-	  };
-	  /* === VIVENTIUM NOTE END === */
+    return trimMoments(merged).join('\n');
+  };
+  /* === VIVENTIUM NOTE END === */
 
-	  /**
-	   * Creates a new memory entry for a user
-	   * Throws an error if a memory with the same key already exists
-	   */
+  /**
+   * Creates a new memory entry for a user
+   * Throws an error if a memory with the same key already exists
+   */
   async function createMemory({
     userId,
     key,
@@ -201,61 +200,143 @@ export function createMemoryMethods(mongoose: typeof import('mongoose')) {
   /**
    * Sets or updates a memory entry for a user
    */
-	  async function setMemory({
-	    userId,
-	    key,
-	    value,
-	    tokenCount = 0,
-	  }: t.SetMemoryParams): Promise<t.MemoryResult> {
-	    try {
-	      if (key?.toLowerCase() === 'nothing') {
-	        return { ok: false };
-	      }
+  async function setMemory({
+    userId,
+    key,
+    value,
+    tokenCount = 0,
+    expectedRevision,
+  }: t.SetMemoryParams): Promise<t.MemoryResult> {
+    try {
+      if (key?.toLowerCase() === 'nothing') {
+        return { ok: false };
+      }
 
-	      const MemoryEntry = mongoose.models.MemoryEntry;
+      const MemoryEntry = mongoose.models.MemoryEntry;
 
-	      /* === VIVENTIUM NOTE ===
-	       * Feature: Prevent placeholder-based `moments` data loss
-	       *
-	       * Purpose:
-	       * - If the incoming value contains the placeholder token, merge in the existing moments list
-	       *   to ensure the stored value is additive (no "[previous moments preserved]" destructive rewrites).
-	       *
-	       * Added: 2026-02-07
-	       */
-	      let finalValue = value;
-	      if (
-	        typeof finalValue === 'string' &&
-	        typeof key === 'string' &&
-	        key.toLowerCase() === 'moments' &&
-	        PREVIOUS_MOMENTS_PLACEHOLDER_RE.test(finalValue)
-	      ) {
-	        const existing = await MemoryEntry.findOne({ userId, key }).lean();
-	        if (existing?.value && typeof existing.value === 'string') {
-	          finalValue = mergeMomentsValue(existing.value, finalValue);
-	        } else {
-	          finalValue = finalValue.replace(PREVIOUS_MOMENTS_PLACEHOLDER_RE, '').trim();
-	        }
-	      }
+      /* === VIVENTIUM NOTE ===
+       * Feature: Prevent placeholder-based `moments` data loss
+       *
+       * Purpose:
+       * - If the incoming value contains the placeholder token, merge in the existing moments list
+       *   to ensure the stored value is additive (no "[previous moments preserved]" destructive rewrites).
+       *
+       * Added: 2026-02-07
+       */
+      const revisionProtected = expectedRevision !== undefined;
+      const needsExistingValue =
+        typeof value === 'string' &&
+        typeof key === 'string' &&
+        key.toLowerCase() === 'moments' &&
+        PREVIOUS_MOMENTS_PLACEHOLDER_RE.test(value);
+      const existing =
+        revisionProtected || needsExistingValue
+          ? await MemoryEntry.findOne({ userId, key }).lean()
+          : null;
+      const currentRevision = existing ? Number(existing.__v ?? 0) : null;
+      if (
+        revisionProtected &&
+        expectedRevision !== null &&
+        (!Number.isInteger(expectedRevision) || expectedRevision < 0)
+      ) {
+        return { ok: false, conflict: true, currentRevision: currentRevision ?? undefined };
+      }
+      if (
+        revisionProtected &&
+        ((expectedRevision === null && existing) ||
+          (expectedRevision !== null && currentRevision !== expectedRevision))
+      ) {
+        return { ok: false, conflict: true, currentRevision: currentRevision ?? undefined };
+      }
 
-	      await MemoryEntry.findOneAndUpdate(
-	        { userId, key },
-	        {
-	          value: finalValue,
-	          tokenCount,
-	          updated_at: new Date(),
-	        },
-	        {
-	          upsert: true,
-	          new: true,
-	        },
-	      );
-	      /* === VIVENTIUM NOTE END === */
+      let finalValue = value;
+      if (
+        typeof finalValue === 'string' &&
+        typeof key === 'string' &&
+        key.toLowerCase() === 'moments' &&
+        PREVIOUS_MOMENTS_PLACEHOLDER_RE.test(finalValue)
+      ) {
+        const momentsExisting = existing ?? (await MemoryEntry.findOne({ userId, key }).lean());
+        if (momentsExisting?.value && typeof momentsExisting.value === 'string') {
+          finalValue = mergeMomentsValue(momentsExisting.value, finalValue);
+        } else {
+          finalValue = finalValue.replace(PREVIOUS_MOMENTS_PLACEHOLDER_RE, '').trim();
+        }
+      }
 
-	      return { ok: true };
-	    } catch (error) {
-	      throw new Error(
-	        `Failed to set memory: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      const updatedAt = new Date();
+      if (revisionProtected && expectedRevision === null) {
+        try {
+          const created = await MemoryEntry.create({
+            userId,
+            key,
+            value: finalValue,
+            tokenCount,
+            updated_at: updatedAt,
+          });
+          return { ok: true, updatedAt: created.updated_at, revision: Number(created.__v ?? 0) };
+        } catch (error) {
+          if ((error as { code?: number })?.code === 11000) {
+            const current = await MemoryEntry.findOne({ userId, key }).lean();
+            return {
+              ok: false,
+              conflict: true,
+              currentRevision: current ? Number(current.__v ?? 0) : undefined,
+            };
+          }
+          throw error;
+        }
+      }
+
+      const revisionFilter =
+        revisionProtected && expectedRevision === 0
+          ? { $or: [{ __v: 0 }, { __v: { $exists: false } }] }
+          : revisionProtected
+            ? { __v: expectedRevision }
+            : {};
+      const updateFilter = { userId, key, ...revisionFilter };
+      let updated;
+      try {
+        updated = await MemoryEntry.findOneAndUpdate(
+          updateFilter,
+          {
+            $set: { value: finalValue, tokenCount, updated_at: updatedAt },
+            $inc: { __v: 1 },
+          },
+          { upsert: !revisionProtected, new: true, setDefaultsOnInsert: true },
+        );
+      } catch (error) {
+        if (!revisionProtected && (error as { code?: number })?.code === 11000) {
+          updated = await MemoryEntry.findOneAndUpdate(
+            { userId, key },
+            {
+              $set: { value: finalValue, tokenCount, updated_at: updatedAt },
+              $inc: { __v: 1 },
+            },
+            { new: true },
+          );
+        } else {
+          throw error;
+        }
+      }
+      /* === VIVENTIUM NOTE END === */
+      if (!updated) {
+        const current = await MemoryEntry.findOne({ userId, key }).lean();
+        return {
+          ok: false,
+          conflict: true,
+          currentRevision: current ? Number(current.__v ?? 0) : undefined,
+        };
+      }
+
+      return {
+        ok: true,
+        updatedAt: updated.updated_at,
+        revision: Number(updated.__v ?? 0),
+      };
+    } catch (error) {
+      throw new Error(
+        `Failed to set memory: ${error instanceof Error ? error.message : 'Unknown error'}`,
       );
     }
   }
@@ -263,11 +344,41 @@ export function createMemoryMethods(mongoose: typeof import('mongoose')) {
   /**
    * Deletes a specific memory entry for a user
    */
-  async function deleteMemory({ userId, key }: t.DeleteMemoryParams): Promise<t.MemoryResult> {
+  async function deleteMemory({
+    userId,
+    key,
+    expectedRevision,
+  }: t.DeleteMemoryParams): Promise<t.MemoryResult> {
     try {
       const MemoryEntry = mongoose.models.MemoryEntry;
-      const result = await MemoryEntry.findOneAndDelete({ userId, key });
-      return { ok: !!result };
+      const filter: Record<string, unknown> = { userId, key };
+      if (expectedRevision !== undefined) {
+        if (expectedRevision == null) {
+          const existing = await MemoryEntry.findOne({ userId, key }).lean();
+          return existing
+            ? { ok: false, conflict: true, currentRevision: Number(existing.__v ?? 0) }
+            : { ok: false };
+        }
+        if (!Number.isInteger(expectedRevision) || expectedRevision < 0) {
+          return { ok: false, conflict: true };
+        }
+        if (expectedRevision === 0) {
+          filter.$or = [{ __v: 0 }, { __v: { $exists: false } }];
+        } else {
+          filter.__v = expectedRevision;
+        }
+      }
+      const result = await MemoryEntry.findOneAndDelete(filter);
+      if (result) {
+        return { ok: true };
+      }
+      if (expectedRevision !== undefined) {
+        const current = await MemoryEntry.findOne({ userId, key }).lean();
+        if (current) {
+          return { ok: false, conflict: true, currentRevision: Number(current.__v ?? 0) };
+        }
+      }
+      return { ok: false };
     } catch (error) {
       throw new Error(
         `Failed to delete memory: ${error instanceof Error ? error.message : 'Unknown error'}`,
@@ -294,57 +405,58 @@ export function createMemoryMethods(mongoose: typeof import('mongoose')) {
   /**
    * Gets and formats all memories for a user in two different formats
    */
-	  async function getFormattedMemories({
-	    userId,
-	  }: t.GetFormattedMemoriesParams): Promise<t.FormattedMemoriesResult> {
-	    try {
-	      const memories = await getAllUserMemories(userId);
+  async function getFormattedMemories({
+    userId,
+    memories,
+  }: t.GetFormattedMemoriesParams): Promise<t.FormattedMemoriesResult> {
+    try {
+      const snapshotMemories = memories ?? (await getAllUserMemories(userId));
 
-      if (!memories || memories.length === 0) {
+      if (!snapshotMemories || snapshotMemories.length === 0) {
         return { withKeys: '', withoutKeys: '', totalTokens: 0, memoryTokenMap: {} };
       }
 
-      const sortedMemories = memories.sort(
+      const sortedMemories = [...snapshotMemories].sort(
         (a, b) => new Date(a.updated_at!).getTime() - new Date(b.updated_at!).getTime(),
       );
 
-	      const totalTokens = sortedMemories.reduce((sum, memory) => {
-	        return sum + (memory.tokenCount || 0);
-	      }, 0);
+      const totalTokens = sortedMemories.reduce((sum, memory) => {
+        return sum + (memory.tokenCount || 0);
+      }, 0);
 
-	      /* === VIVENTIUM START ===
-	       * Fix: Expose per-key token counts to prevent memory tokenLimit double-counting.
-	       *
-	       * Why:
-	       * - The memory agent writes full replacement values per key.
-	       * - Token limit checks must account for overwrites (delta = new - old), not treat them as append-only.
-	       *
-	       * Added: 2026-02-09
-	       * === VIVENTIUM END === */
-	      const memoryTokenMap = sortedMemories.reduce(
-	        (acc, memory) => {
-	          acc[memory.key] = memory.tokenCount ?? 0;
-	          return acc;
-	        },
-	        {} as Record<string, number>,
-	      );
+      /* === VIVENTIUM START ===
+       * Fix: Expose per-key token counts to prevent memory tokenLimit double-counting.
+       *
+       * Why:
+       * - The memory agent writes full replacement values per key.
+       * - Token limit checks must account for overwrites (delta = new - old), not treat them as append-only.
+       *
+       * Added: 2026-02-09
+       * === VIVENTIUM END === */
+      const memoryTokenMap = sortedMemories.reduce(
+        (acc, memory) => {
+          acc[memory.key] = memory.tokenCount ?? 0;
+          return acc;
+        },
+        {} as Record<string, number>,
+      );
 
-		      /* === VIVENTIUM NOTE ===
-		       * Feature: LLM-parseable memory formatting (no quoted multi-line values)
-	       *
-	       * These strings are consumed by LLMs:
+      /* === VIVENTIUM NOTE ===
+       * Feature: LLM-parseable memory formatting (no quoted multi-line values)
+       *
+       * These strings are consumed by LLMs:
        * - Main agent context injection
        * - Memory agent "existing memory" context for additive updates
        *
        * Avoid wrapping values in quotes: memories are frequently multi-line and can contain quotes,
-	       * which makes quoted formats ambiguous/unparseable and increases the chance of "rewrite" bugs.
-	       *
-	       * Added: 2026-02-07
-	       */
-	      const withKeys = sortedMemories
-	        .map((memory) => {
-	          const date = formatDate(new Date(memory.updated_at!));
-	          const tokenCount = memory.tokenCount ?? 0;
+       * which makes quoted formats ambiguous/unparseable and increases the chance of "rewrite" bugs.
+       *
+       * Added: 2026-02-07
+       */
+      const withKeys = sortedMemories
+        .map((memory) => {
+          const date = formatDate(new Date(memory.updated_at!));
+          const tokenCount = memory.tokenCount ?? 0;
           const header = `## ${memory.key}\n(updated_at: ${date}, tokens: ${tokenCount})`;
           return `${header}\n${memory.value}`;
         })

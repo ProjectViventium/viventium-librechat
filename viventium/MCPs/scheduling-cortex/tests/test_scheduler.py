@@ -15,7 +15,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scheduling_cortex.dispatch import HttpJsonError
-from scheduling_cortex.scheduler import SchedulerEngine, SCHEDULER_MISFIRE_KEY, _resolve_misfire_policy
+from scheduling_cortex.scheduler import (
+    SchedulerEngine,
+    SCHEDULER_MISFIRE_KEY,
+    _latest_due_occurrence,
+    _resolve_misfire_policy,
+)
 from scheduling_cortex.storage import ScheduleStorage, StorageConfig
 
 
@@ -55,6 +60,103 @@ def _seed_task(
     created = storage.get_task("user-1", task_id)
     assert created is not None
     return created
+
+
+class LatestDueOccurrenceTests(unittest.TestCase):
+    def test_latest_due_occurrence_covers_supported_recurring_types(self):
+        default_stored = datetime(2026, 7, 1, 3, 0, tzinfo=timezone.utc)
+        cases = (
+            (
+                {"type": "daily", "time": "03:00", "timezone": "UTC"},
+                default_stored,
+                datetime(2026, 7, 11, 7, 0, tzinfo=timezone.utc),
+                datetime(2026, 7, 11, 3, 0, tzinfo=timezone.utc),
+            ),
+            (
+                {"type": "weekdays", "time": "03:00", "timezone": "UTC"},
+                default_stored,
+                datetime(2026, 7, 12, 7, 0, tzinfo=timezone.utc),
+                datetime(2026, 7, 10, 3, 0, tzinfo=timezone.utc),
+            ),
+            (
+                {
+                    "type": "weekly",
+                    "time": "03:00",
+                    "timezone": "UTC",
+                    "days_of_week": ["tue", "fri"],
+                },
+                default_stored,
+                datetime(2026, 7, 11, 7, 0, tzinfo=timezone.utc),
+                datetime(2026, 7, 10, 3, 0, tzinfo=timezone.utc),
+            ),
+            (
+                {
+                    "type": "monthly",
+                    "time": "03:00",
+                    "timezone": "UTC",
+                    "day_of_month": 15,
+                },
+                datetime(2026, 5, 15, 3, 0, tzinfo=timezone.utc),
+                datetime(2026, 7, 11, 7, 0, tzinfo=timezone.utc),
+                datetime(2026, 6, 15, 3, 0, tzinfo=timezone.utc),
+            ),
+            (
+                {
+                    "type": "interval",
+                    "timezone": "UTC",
+                    "start_at": "2026-07-01T03:00:00Z",
+                    "interval": {"every": 2, "unit": "day"},
+                },
+                default_stored,
+                datetime(2026, 7, 11, 7, 0, tzinfo=timezone.utc),
+                datetime(2026, 7, 11, 3, 0, tzinfo=timezone.utc),
+            ),
+            (
+                {"type": "cron", "timezone": "UTC", "cron": "0 3 * * *"},
+                default_stored,
+                datetime(2026, 7, 11, 7, 0, tzinfo=timezone.utc),
+                datetime(2026, 7, 11, 3, 0, tzinfo=timezone.utc),
+            ),
+        )
+
+        for schedule, stored, now, expected in cases:
+            with self.subTest(schedule_type=schedule["type"]):
+                self.assertEqual(_latest_due_occurrence(schedule, stored, now), expected)
+
+    def test_latest_daily_occurrence_uses_schedule_timezone_across_dst(self):
+        schedule = {"type": "daily", "time": "03:00", "timezone": "America/Toronto"}
+        stored = datetime(2026, 3, 7, 8, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 3, 8, 12, 0, tzinfo=timezone.utc)
+
+        self.assertEqual(
+            _latest_due_occurrence(schedule, stored, now),
+            datetime(2026, 3, 8, 7, 0, tzinfo=timezone.utc),
+        )
+
+    def test_latest_daily_occurrence_does_not_use_host_timezone(self):
+        schedule = {"type": "daily", "time": "03:00", "timezone": "Asia/Tokyo"}
+        stored = datetime(2026, 7, 1, 18, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 7, 11, 0, 0, tzinfo=timezone.utc)
+
+        self.assertEqual(
+            _latest_due_occurrence(schedule, stored, now),
+            datetime(2026, 7, 10, 18, 0, tzinfo=timezone.utc),
+        )
+
+    def test_latest_day_interval_remains_elapsed_utc_across_dst(self):
+        schedule = {
+            "type": "interval",
+            "timezone": "America/Toronto",
+            "start_at": "2026-03-07T08:00:00Z",
+            "interval": {"every": 1, "unit": "day"},
+        }
+        stored = datetime(2026, 3, 7, 8, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 3, 9, 12, 0, tzinfo=timezone.utc)
+
+        self.assertEqual(
+            _latest_due_occurrence(schedule, stored, now),
+            datetime(2026, 3, 9, 8, 0, tzinfo=timezone.utc),
+        )
 
 
 class SchedulerDeliveryPersistenceTests(unittest.TestCase):
@@ -511,6 +613,64 @@ class SchedulerDeliveryPersistenceTests(unittest.TestCase):
             self.assertEqual(updated.get("last_status"), "success")
             self.assertEqual(updated.get("last_delivery_reason"), "delivered_late")
             self.assertEqual(updated.get("active"), 1)
+
+    def test_stale_recurring_task_judges_latest_due_occurrence_for_catch_up(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = ScheduleStorage(StorageConfig(db_path=str(Path(tmpdir) / "schedules.db")))
+            task = _seed_task(
+                storage,
+                "task-stale-recurring-catch-up",
+                schedule={"type": "daily", "time": "03:00", "timezone": "UTC"},
+                created_source="user",
+                metadata={"misfire_policy": {"mode": "catch_up", "max_late_s": 43200}},
+                next_run_at="2026-07-01T03:00:00Z",
+            )
+            engine = SchedulerEngine(storage, poll_interval_s=30, misfire_grace_s=900, retry_delay_s=300)
+            now = datetime(2026, 7, 11, 7, 0, 0, tzinfo=timezone.utc)
+
+            with patch("scheduling_cortex.scheduler.dispatch_task") as mock_dispatch:
+                mock_dispatch.return_value = {
+                    "conversation_id": "conv-latest-occurrence",
+                    "delivery": {
+                        "outcome": "sent",
+                        "reason": "delivered",
+                        "generated_text": "Latest occurrence catch-up.",
+                    },
+                }
+                engine._process_task(task, now)
+
+            mock_dispatch.assert_called_once()
+            dispatched_task = mock_dispatch.call_args.args[0]
+            late_delivery = dispatched_task.get("metadata", {}).get(SCHEDULER_MISFIRE_KEY)
+            self.assertEqual(late_delivery.get("due_at"), "2026-07-11T03:00:00Z")
+            self.assertEqual(late_delivery.get("late_seconds"), 4 * 60 * 60)
+            updated = storage.get_task("user-1", "task-stale-recurring-catch-up")
+            self.assertEqual(updated.get("last_status"), "success")
+            self.assertEqual(updated.get("next_run_at"), "2026-07-12T03:00:00Z")
+
+    def test_stale_recurring_task_skip_ledger_names_latest_due_occurrence(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = ScheduleStorage(StorageConfig(db_path=str(Path(tmpdir) / "schedules.db")))
+            task = _seed_task(
+                storage,
+                "task-stale-recurring-too-late",
+                schedule={"type": "daily", "time": "03:00", "timezone": "UTC"},
+                created_source="user",
+                metadata={"misfire_policy": {"mode": "catch_up", "max_late_s": 43200}},
+                next_run_at="2026-07-01T03:00:00Z",
+            )
+            engine = SchedulerEngine(storage, poll_interval_s=30, misfire_grace_s=900, retry_delay_s=300)
+            now = datetime(2026, 7, 11, 16, 0, 0, tzinfo=timezone.utc)
+
+            with patch("scheduling_cortex.scheduler.dispatch_task") as mock_dispatch:
+                engine._process_task(task, now)
+
+            mock_dispatch.assert_not_called()
+            updated = storage.get_task("user-1", "task-stale-recurring-too-late")
+            self.assertEqual(updated.get("last_status"), "missed")
+            self.assertEqual(updated.get("last_delivery", {}).get("due_at"), "2026-07-11T03:00:00Z")
+            self.assertEqual(updated.get("last_delivery", {}).get("late_seconds"), 13 * 60 * 60)
+            self.assertEqual(updated.get("next_run_at"), "2026-07-12T03:00:00Z")
 
     def test_misfire_policy_mode_normalization(self):
         base_task = {

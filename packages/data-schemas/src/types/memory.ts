@@ -7,6 +7,7 @@ export interface IMemoryEntry extends Document {
   value: string;
   tokenCount?: number;
   updated_at?: Date;
+  __v?: number;
 }
 
 export interface IMemoryEntryLean {
@@ -25,20 +26,28 @@ export interface SetMemoryParams {
   key: string;
   value: string;
   tokenCount?: number;
+  /** Undefined preserves legacy last-write behavior; null means the key was absent in the snapshot. */
+  expectedRevision?: number | null;
 }
 
 export interface DeleteMemoryParams {
   userId: string | Types.ObjectId;
   key: string;
+  expectedRevision?: number | null;
 }
 
 export interface GetFormattedMemoriesParams {
   userId: string | Types.ObjectId;
+  memories?: IMemoryEntryLean[];
 }
 
 // Result interfaces
 export interface MemoryResult {
   ok: boolean;
+  conflict?: boolean;
+  updatedAt?: Date;
+  revision?: number;
+  currentRevision?: number;
 }
 
 export interface FormattedMemoriesResult {

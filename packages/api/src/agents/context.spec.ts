@@ -218,6 +218,19 @@ describe('Agent Context Utilities', () => {
       expect(result).toBe('Shared context\n\nBase instructions\n\nMCP instructions');
     });
 
+    it('should append per-turn dynamic state after stable and MCP instructions', () => {
+      const result = buildAgentInstructions({
+        sharedRunContext: 'Shared context',
+        baseInstructions: 'Base instructions',
+        mcpInstructions: 'MCP instructions',
+        dynamicTailContext: '<viventium_feeling_state>felt</viventium_feeling_state>',
+      });
+
+      expect(result).toBe(
+        'Shared context\n\nBase instructions\n\nMCP instructions\n\n<viventium_feeling_state>felt</viventium_feeling_state>',
+      );
+    });
+
     it('should filter out empty parts', () => {
       const result = buildAgentInstructions({
         sharedRunContext: 'Shared context',
@@ -324,13 +337,14 @@ describe('Agent Context Utilities', () => {
       await applyContextToAgent({
         agent,
         sharedRunContext: 'Shared context',
+        dynamicTailContext: '<viventium_feeling_state>felt</viventium_feeling_state>',
         mcpManager: mockMCPManager,
         agentId: 'test-agent',
         logger: mockLogger,
       });
 
       expect(agent.instructions).toBe(
-        'Shared context\n\nOriginal instructions\n\nMCP instructions',
+        'Shared context\n\nOriginal instructions\n\nMCP instructions\n\n<viventium_feeling_state>felt</viventium_feeling_state>',
       );
       expect(agent.viventiumMCPInstructionSources).toEqual({ server1: 'server_fetched' });
       expect(mockLogger.debug).toHaveBeenCalledWith(

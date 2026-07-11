@@ -20,6 +20,7 @@ from fastapi import (
     Query,
     status,
 )
+from fastapi.responses import JSONResponse
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from functools import lru_cache
@@ -69,6 +70,7 @@ from app.utils.document_loader import (
 from app.utils.health import is_health_ok
 
 router = APIRouter()
+VIVENTIUM_HEALTH_PROBE_FILE_ID = "__viventium_health_probe__"
 # === VIVENTIUM START ===
 # Feature: RAG override compatibility across shipped image config variants.
 # Purpose:
@@ -380,20 +382,34 @@ async def get_all_ids(request: Request):
 
 
 @router.get("/health")
-async def health_check():
+async def health_check(request: Request):
     try:
+        if isinstance(vector_store, AsyncPgVector):
+            await vector_store.get_filtered_ids(
+                [VIVENTIUM_HEALTH_PROBE_FILE_ID],
+                executor=request.app.state.thread_pool,
+            )
+        else:
+            vector_store.get_filtered_ids([VIVENTIUM_HEALTH_PROBE_FILE_ID])
+
         if await is_health_ok():
             return {"status": "UP"}
         else:
             logger.error("Health check failed")
-            return {"status": "DOWN"}, 503
+            return JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content={"status": "DOWN"},
+            )
     except Exception as e:
         logger.error(
             "Error during health check | Error: %s | Traceback: %s",
             str(e),
             traceback.format_exc(),
         )
-        return {"status": "DOWN", "error": str(e)}, 503
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"status": "DOWN", "error": "vector_store_unavailable"},
+        )
 
 
 @router.get("/documents", response_model=list[DocumentResponse])

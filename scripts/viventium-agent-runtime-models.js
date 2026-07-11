@@ -1,22 +1,25 @@
 'use strict';
 
 const DEFAULT_MODELS = {
-  openAI: 'gpt-5.4',
+  openAI: 'gpt-5.6-sol',
   anthropic: 'claude-sonnet-4-5',
   xai: 'grok-4.20-non-reasoning',
-  groq: 'meta-llama/llama-4-scout-17b-16e-instruct',
+  groq: 'qwen/qwen3.6-27b',
 };
 
-const APPROVED_MAIN_RUNTIME_FAMILIES = new Set(['anthropic::claude-opus-4-8', 'openAI::gpt-5.4']);
+const APPROVED_MAIN_RUNTIME_FAMILIES = new Set([
+  'openAI::gpt-5.6-sol',
+  'anthropic::claude-opus-4-8',
+]);
 
 const APPROVED_BACKGROUND_RUNTIME_FAMILIES = new Set([
-  'anthropic::claude-sonnet-4-5',
+  'openAI::gpt-5.6-sol',
+  'openAI::gpt-5.6-terra',
   'anthropic::claude-opus-4-8',
-  'openAI::gpt-5.4',
 ]);
 
 const APPROVED_BACKGROUND_ACTIVATION_FAMILIES = new Set([
-  'groq::meta-llama/llama-4-scout-17b-16e-instruct',
+  'groq::qwen/qwen3.6-27b',
   'xai::grok-4.20-non-reasoning',
 ]);
 
@@ -121,12 +124,26 @@ const BUILT_IN_BACKGROUND_AGENT_IDS = Object.freeze(
 );
 
 const CANONICAL_BUILT_IN_BACKGROUND_MODEL_PARAMETERS = Object.freeze({
+  agent_viventium_background_analysis_95aeb3: Object.freeze({
+    openAI: Object.freeze({
+      reasoning_effort: 'medium',
+      useResponsesApi: true,
+    }),
+  }),
   agent_viventium_confirmation_bias_95aeb3: Object.freeze({
+    openAI: Object.freeze({
+      reasoning_effort: 'medium',
+      useResponsesApi: true,
+    }),
     anthropic: Object.freeze({
       thinking: false,
     }),
   }),
   agent_viventium_red_team_95aeb3: Object.freeze({
+    openAI: Object.freeze({
+      reasoning_effort: 'xhigh',
+      useResponsesApi: true,
+    }),
     anthropic: Object.freeze({
       thinkingBudget: 4000,
     }),
@@ -134,19 +151,58 @@ const CANONICAL_BUILT_IN_BACKGROUND_MODEL_PARAMETERS = Object.freeze({
   agent_viventium_deep_research_95aeb3: Object.freeze({
     openAI: Object.freeze({
       reasoning_effort: 'xhigh',
+      useResponsesApi: true,
     }),
     anthropic: Object.freeze({
       thinkingBudget: 4000,
     }),
   }),
+  agent_viventium_online_tool_use_95aeb3: Object.freeze({
+    openAI: Object.freeze({
+      reasoning_effort: 'low',
+      useResponsesApi: true,
+    }),
+  }),
+  agent_viventium_parietal_cortex_95aeb3: Object.freeze({
+    openAI: Object.freeze({
+      reasoning_effort: 'medium',
+      useResponsesApi: true,
+    }),
+  }),
+  agent_viventium_pattern_recognition_95aeb3: Object.freeze({
+    openAI: Object.freeze({
+      reasoning_effort: 'medium',
+      useResponsesApi: true,
+    }),
+  }),
   agent_viventium_emotional_resonance_95aeb3: Object.freeze({
+    openAI: Object.freeze({
+      reasoning_effort: 'low',
+      useResponsesApi: true,
+    }),
     anthropic: Object.freeze({
       thinking: false,
     }),
   }),
   agent_viventium_strategic_planning_95aeb3: Object.freeze({
+    openAI: Object.freeze({
+      reasoning_effort: 'high',
+      useResponsesApi: true,
+    }),
     anthropic: Object.freeze({
       thinkingBudget: 2000,
+    }),
+  }),
+  agent_viventium_support_95aeb3: Object.freeze({
+    openAI: Object.freeze({
+      reasoning_effort: 'low',
+      useResponsesApi: true,
+    }),
+  }),
+  agent_8Y1d7JNhpubtvzYz3hvEv: Object.freeze({
+    openAI: Object.freeze({
+      reasoning_effort: 'low',
+      useResponsesApi: true,
     }),
   }),
 });
@@ -492,7 +548,9 @@ function buildCanonicalPersistedAgentFields(
       : {};
   const canonicalBuiltInParameters = canonicalBuiltInBackgroundModelParameters(agent.id, provider);
   const existingProvider = normalizeProvider(existingAgent?.provider);
-  const existingModel = String(existingAgent?.model || existingAgent?.model_parameters?.model || '').trim();
+  const existingModel = String(
+    existingAgent?.model || existingAgent?.model_parameters?.model || '',
+  ).trim();
   const runtimeFamilyChanged =
     (existingProvider && provider && existingProvider !== provider) ||
     (existingModel && model && existingModel !== model);

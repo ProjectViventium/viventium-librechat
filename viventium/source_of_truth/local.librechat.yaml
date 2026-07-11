@@ -58,186 +58,99 @@ viventium:
       brew_begin_tag: <!--viv_internal:brew_begin-->
     activation_subject_rule:
       enabled: true
-      prompt: 'Judge activation only for the latest human/user message shown in "Latest
-        User Intent".
-
-
-        Use earlier "Recent Conversation" turns only to resolve references in that
-        latest message.
-
-
-        Never activate only because an older user request appears in history; that
-        older request was already handled by its own turn.
-
-
-        Before deciding, ask: "Does LatestUserMessage itself ask this cortex to do
-        work, or does it explicitly refer to continuing that same work?"
-
-
-        If LatestUserMessage is only a simple reply, acknowledgement, test instruction,
-        correction, thanks, provider clarification, or output-only instruction, return
-        should_activate=false unless that latest message itself meets this cortex''s
-        activation criteria.
-
-
-        Output-only instructions include requests to reply with exact text, markers,
-        labels, acknowledgements, confirmations, or test tokens. Older history cannot
-        turn an output-only latest message into a new activation.
-
-
-        Ignore activation words that appear only in Recent Conversation. Words such
-        as red-team, pressure-test, challenge, plan, launch, pattern, strategy, or
-        bias count only when they appear in LatestUserMessage or when LatestUserMessage
-        explicitly refers back to them.'
+      prompt:
+        promptRef: cortex.background_activation_decision_subject
     activation_policy:
       enabled: true
-      prompt: 'The main agent owns the current turn. Background agents are optional
-        reviewers, not controllers.
-
-
-        Connected direct-action surfaces listed below are the authoritative owners
-        for live execution, status, approvals, callbacks, files, browser/desktop/OS
-        work, schedules, workers, projects, and run results they cover.
-
-
-        Use this background agent''s configured activation criteria as its only scope.
-        Do not infer a broader scope from the conversation. When this policy and this
-        background agent''s own activation criteria disagree, prefer the stricter
-        outcome: do not activate.
-
-
-        Return should_activate=false when the latest request is primarily asking to
-        perform, start, continue, resume, stop, monitor, approve, check, or report
-        on work owned by a connected direct-action surface, except when the connected
-        surface is marked same_scope_background_allowed=true and this background agent''s
-        own configured activation scope exactly matches that surface. In that same-scope
-        case, the main agent still owns Phase A execution and this background agent
-        may activate for supplemental Phase B evidence when its own criteria are clearly
-        met.
-
-
-        Return should_activate=false for follow-ups on live work, including short
-        status/result turns, when the referenced work belongs to a connected direct-action
-        surface, except for the same-scope supplemental case above.
-
-
-        Return should_activate=false when the user is asking for proof by execution
-        rather than a separate analysis, critique, plan, or decision.
-
-
-        Return should_activate=true only when the latest request contains a separate
-        explicit question or decision that this background agent''s configured scope
-        clearly owns and can answer without claiming, simulating, or second-guessing
-        direct-action results.
-
-
-        For mixed requests:
-
-        - direct-action/status/result part -> main agent/tool path owns it
-
-        - independent analysis/review/planning part -> activate only if this agent''s
-        own scope clearly owns it
-
-
-        If activated, the insight must stay within that independent scope. It must
-        not narrate worker, browser, runtime, schedule, file, invoice, screenshot,
-        tool, callback, or OS status unless this same background agent received verified
-        evidence in its own allowed context this turn.
-
-
-        Never activate just to confirm tool availability, provide operational IDs/links,
-        summarize a tool owner''s result, or answer from memory when the requested
-        fact belongs to live execution.
-
-
-        If uncertain, return should_activate=false.
-
-        '
+      prompt:
+        promptRef: cortex.background_activation_policy
       direct_action_mcp_servers:
-      - server: glasshive-workers-projects
-        owns: persistent workers, project runs, browser/desktop/local computer execution,
-          worker status, and completion reports
-        tool_names:
-        - sys__server__sys_mcp_glasshive-workers-projects
-        - projects_list_mcp_glasshive-workers-projects
-        - project_create_mcp_glasshive-workers-projects
-        - worker_delegate_once_mcp_glasshive-workers-projects
-        - workspace_launch_mcp_glasshive-workers-projects
-        - workspace_schedule_mcp_glasshive-workers-projects
-        - workspace_status_mcp_glasshive-workers-projects
-        - workspace_wait_mcp_glasshive-workers-projects
-        - workspace_continue_mcp_glasshive-workers-projects
-        - workspace_artifacts_mcp_glasshive-workers-projects
-        - workspace_artifact_download_mcp_glasshive-workers-projects
-        - workspace_preferences_get_mcp_glasshive-workers-projects
-        - workspace_preferences_set_mcp_glasshive-workers-projects
-        - project_get_mcp_glasshive-workers-projects
-        - project_runs_mcp_glasshive-workers-projects
-        - project_events_mcp_glasshive-workers-projects
-        - workers_list_mcp_glasshive-workers-projects
-        - worker_create_mcp_glasshive-workers-projects
-        - worker_find_or_resume_mcp_glasshive-workers-projects
-        - worker_get_mcp_glasshive-workers-projects
-        - worker_live_mcp_glasshive-workers-projects
-        - worker_run_mcp_glasshive-workers-projects
-        - worker_schedule_mcp_glasshive-workers-projects
-        - worker_schedules_mcp_glasshive-workers-projects
-        - worker_message_mcp_glasshive-workers-projects
-        - worker_pause_mcp_glasshive-workers-projects
-        - worker_resume_mcp_glasshive-workers-projects
-        - worker_interrupt_mcp_glasshive-workers-projects
-        - worker_terminate_mcp_glasshive-workers-projects
-        - worker_desktop_action_mcp_glasshive-workers-projects
-        - worker_takeover_mcp_glasshive-workers-projects
-        - metrics_summary_mcp_glasshive-workers-projects
-      - server: scheduling-cortex
-        owns: reminders, scheduled follow-ups, same-conversation wakeups, delayed
-          status checks, and schedule management
-        tool_names:
-        - sys__server__sys_mcp_scheduling-cortex
-        - schedule_create_mcp_scheduling-cortex
-        - schedule_get_mcp_scheduling-cortex
-        - schedule_list_mcp_scheduling-cortex
-        - schedule_search_mcp_scheduling-cortex
-        - schedule_last_delivery_mcp_scheduling-cortex
-        - schedule_update_mcp_scheduling-cortex
-        - schedule_delete_mcp_scheduling-cortex
-        - schedule_preview_next_mcp_scheduling-cortex
-      - server: google-workspace
-        scope_key: productivity_google_workspace
-        same_scope_background_allowed: true
-        owns: live Gmail, Google Calendar, Google Drive, Docs, Sheets, Slides, Chat,
-          Tasks, and Workspace actions when this MCP is connected to the main agent
-        tool_names:
-        - sys__server__sys_mcp_google_workspace
-        - search_gmail_messages_mcp_google_workspace
-        - get_gmail_message_content_mcp_google_workspace
-        - get_gmail_messages_content_batch_mcp_google_workspace
-        - get_gmail_thread_content_mcp_google_workspace
-        - list_calendars_mcp_google_workspace
-        - get_events_mcp_google_workspace
-        - search_drive_files_mcp_google_workspace
-        - get_drive_file_content_mcp_google_workspace
-        - search_docs_mcp_google_workspace
-        - get_doc_content_mcp_google_workspace
-        - read_sheet_values_mcp_google_workspace
-      - server: ms365
-        scope_key: productivity_ms365
-        same_scope_background_allowed: true
-        owns: live Outlook email, Outlook calendar, OneDrive, Excel, OneNote, Planner,
-          To Do, and Microsoft 365 actions when this MCP is connected to the main
-          agent
-        tool_names:
-        - sys__server__sys_mcp_ms-365
-        - list-mail-messages_mcp_ms-365
-        - get-mail-message_mcp_ms-365
-        - list-mail-folder-messages_mcp_ms-365
-        - list-calendar-events_mcp_ms-365
-        - get-calendar-event_mcp_ms-365
-        - list-folder-files_mcp_ms-365
-        - download-onedrive-file-content_mcp_ms-365
-        - get-excel-range_mcp_ms-365
-        - search-query_mcp_ms-365
+        - server: glasshive-workers-projects
+          owns: persistent workers, project runs, browser/desktop/local computer execution,
+            worker status, and completion reports
+          tool_names:
+            - sys__server__sys_mcp_glasshive-workers-projects
+            - projects_list_mcp_glasshive-workers-projects
+            - project_create_mcp_glasshive-workers-projects
+            - worker_delegate_once_mcp_glasshive-workers-projects
+            - workspace_launch_mcp_glasshive-workers-projects
+            - workspace_schedule_mcp_glasshive-workers-projects
+            - workspace_status_mcp_glasshive-workers-projects
+            - workspace_wait_mcp_glasshive-workers-projects
+            - workspace_continue_mcp_glasshive-workers-projects
+            - workspace_artifacts_mcp_glasshive-workers-projects
+            - workspace_artifact_download_mcp_glasshive-workers-projects
+            - workspace_preferences_get_mcp_glasshive-workers-projects
+            - workspace_preferences_set_mcp_glasshive-workers-projects
+            - project_get_mcp_glasshive-workers-projects
+            - project_runs_mcp_glasshive-workers-projects
+            - project_events_mcp_glasshive-workers-projects
+            - workers_list_mcp_glasshive-workers-projects
+            - worker_create_mcp_glasshive-workers-projects
+            - worker_find_or_resume_mcp_glasshive-workers-projects
+            - worker_get_mcp_glasshive-workers-projects
+            - worker_live_mcp_glasshive-workers-projects
+            - worker_run_mcp_glasshive-workers-projects
+            - worker_schedule_mcp_glasshive-workers-projects
+            - worker_schedules_mcp_glasshive-workers-projects
+            - worker_message_mcp_glasshive-workers-projects
+            - worker_pause_mcp_glasshive-workers-projects
+            - worker_resume_mcp_glasshive-workers-projects
+            - worker_interrupt_mcp_glasshive-workers-projects
+            - worker_terminate_mcp_glasshive-workers-projects
+            - worker_desktop_action_mcp_glasshive-workers-projects
+            - worker_takeover_mcp_glasshive-workers-projects
+            - metrics_summary_mcp_glasshive-workers-projects
+        - server: scheduling-cortex
+          owns: reminders, scheduled follow-ups, same-conversation wakeups, delayed
+            status checks, and schedule management
+          tool_names:
+            - sys__server__sys_mcp_scheduling-cortex
+            - schedule_create_mcp_scheduling-cortex
+            - schedule_get_mcp_scheduling-cortex
+            - schedule_list_mcp_scheduling-cortex
+            - schedule_search_mcp_scheduling-cortex
+            - schedule_last_delivery_mcp_scheduling-cortex
+            - schedule_update_mcp_scheduling-cortex
+            - schedule_delete_mcp_scheduling-cortex
+            - schedule_preview_next_mcp_scheduling-cortex
+            - periphery_list_mcp_scheduling-cortex
+            - periphery_read_mcp_scheduling-cortex
+        - server: google-workspace
+          scope_key: productivity_google_workspace
+          same_scope_background_allowed: true
+          owns: live Gmail, Google Calendar, Google Drive, Docs, Sheets, Slides, Chat,
+            Tasks, and Workspace actions when this MCP is connected to the main agent
+          tool_names:
+            - sys__server__sys_mcp_google_workspace
+            - search_gmail_messages_mcp_google_workspace
+            - get_gmail_message_content_mcp_google_workspace
+            - get_gmail_messages_content_batch_mcp_google_workspace
+            - get_gmail_thread_content_mcp_google_workspace
+            - list_calendars_mcp_google_workspace
+            - get_events_mcp_google_workspace
+            - search_drive_files_mcp_google_workspace
+            - get_drive_file_content_mcp_google_workspace
+            - search_docs_mcp_google_workspace
+            - get_doc_content_mcp_google_workspace
+            - read_sheet_values_mcp_google_workspace
+        - server: ms365
+          scope_key: productivity_ms365
+          same_scope_background_allowed: true
+          owns: live Outlook email, Outlook calendar, OneDrive, Excel, OneNote, Planner,
+            To Do, and Microsoft 365 actions when this MCP is connected to the main
+            agent
+          tool_names:
+            - sys__server__sys_mcp_ms-365
+            - list-mail-messages_mcp_ms-365
+            - get-mail-message_mcp_ms-365
+            - list-mail-folder-messages_mcp_ms-365
+            - list-calendar-events_mcp_ms-365
+            - get-calendar-event_mcp_ms-365
+            - list-folder-files_mcp_ms-365
+            - download-onedrive-file-content_mcp_ms-365
+            - get-excel-range_mcp_ms-365
+            - search-query_mcp_ms-365
       direct_action_tool_rule: 'Connected direct-action surfaces are execution owners.
         Their presence means the main agent has the primary path; background cortices
         should stay silent unless they add separately scoped value or the matching
@@ -246,7 +159,7 @@ viventium:
 
         '
   no_response:
-    prompt: 'NO RESPONSE TAG:
+    prompt: "NO RESPONSE TAG:
 
       - If you have nothing meaningful to add, respond with exactly: {NTA}
 
@@ -255,8 +168,8 @@ viventium:
       - Never use {NTA} to hide errors/tool failures; explain the issue briefly instead.
 
       - Never use {NTA} to hide a new verified fact, time-sensitive blocker, tool
-      completion, approval need, or meaningful change. Surface it briefly in the user''s
-      current channel.'
+      completion, approval need, or meaningful change. Surface it briefly in the user's
+      current channel."
   conversation_recall:
     prompt: 'CONVERSATION RECALL:
 
@@ -295,8 +208,8 @@ viventium:
   primaryProvider: openai
   installMode: native
   consciousAgent:
-    provider: anthropic
-    model: claude-opus-4-8
+    provider: openai
+    model: gpt-5.6-sol
 balance:
   enabled: false
   startBalance: 200000
@@ -307,166 +220,166 @@ balance:
 modelSpecs:
   prioritize: false
   list:
-  - name: viventium
-    label: Viventium
-    description: The conscious self. Background cortices process in parallel, surfacing
-      insights without blocking dialogue.
-    default: true
-    iconURL: /assets/logo.svg
-    preset:
-      endpoint: agents
-      agent_id: agent_viventium_main_95aeb3
-  - name: agent_viventium_background_analysis_95aeb3
-    label: Background Analysis
-    description: Deep analytical processing - surfaces hidden meanings and logical
-      gaps.
-    iconURL: /assets/logo.svg
-    preset:
-      endpoint: agents
-      agent_id: agent_viventium_background_analysis_95aeb3
-  - name: agent_viventium_confirmation_bias_95aeb3
-    label: Confirmation Bias
-    description: Error detection - flags overconfidence and unchecked assumptions
-      before they solidify.
-    iconURL: /assets/logo.svg
-    preset:
-      endpoint: agents
-      agent_id: agent_viventium_confirmation_bias_95aeb3
-  - name: agent_viventium_red_team_95aeb3
-    label: Red Team
-    description: Evidence-first mistake detection - verifies claims, tests viability,
-      and calls out rationalization.
-    iconURL: /assets/logo.svg
-    preset:
-      endpoint: agents
-      agent_id: agent_viventium_red_team_95aeb3
-  - name: agent_viventium_deep_research_95aeb3
-    label: Deep Research
-    description: Multi-step research across sources, building comprehensive understanding.
-    iconURL: /assets/logo.svg
-    preset:
-      endpoint: agents
-      agent_id: agent_viventium_deep_research_95aeb3
-  - name: agent_viventium_online_tool_use_95aeb3
-    label: MS365
-    description: Orchestrates MS365 productivity tool calls (Outlook email, calendar,
-      OneDrive files).
-    iconURL: /assets/logo.svg
-    preset:
-      endpoint: agents
-      agent_id: agent_viventium_online_tool_use_95aeb3
-  - name: agent_viventium_parietal_cortex_95aeb3
-    label: Parietal Cortex
-    description: Mathematical, physics, and statistical reasoning using first-principles
-      thinking.
-    iconURL: /assets/logo.svg
-    preset:
-      endpoint: agents
-      agent_id: agent_viventium_parietal_cortex_95aeb3
-  - name: agent_viventium_pattern_recognition_95aeb3
-    label: Pattern Recognition
-    description: Identifies recurring themes, behavioral loops, and contradictions
-      across conversation.
-    iconURL: /assets/logo.svg
-    preset:
-      endpoint: agents
-      agent_id: agent_viventium_pattern_recognition_95aeb3
-  - name: agent_viventium_emotional_resonance_95aeb3
-    label: Emotional Resonance
-    description: Senses emotional undercurrents and unspoken needs that words don't
-      capture.
-    iconURL: /assets/logo.svg
-    preset:
-      endpoint: agents
-      agent_id: agent_viventium_emotional_resonance_95aeb3
-  - name: agent_viventium_strategic_planning_95aeb3
-    label: Strategic Planning
-    description: Transforms abstract goals into concrete action sequences with risk
-      awareness.
-    iconURL: /assets/logo.svg
-    preset:
-      endpoint: agents
-      agent_id: agent_viventium_strategic_planning_95aeb3
-  - name: agent_viventium_support_95aeb3
-    label: Viventium User Help
-    description: "In-product help for using Viventium \u2014 conversations, voice,\
-      \ agents, integrations, scheduling. Never mentions internal implementation;\
-      \ escalates to the official Viventium support channel only when needed."
-    iconURL: /assets/logo.svg
-    preset:
-      endpoint: agents
-      agent_id: agent_viventium_support_95aeb3
-  - name: agent_8Y1d7JNhpubtvzYz3hvEv
-    label: Google
-    description: Orchestrates Google Workspace productivity tool calls
-    iconURL: /assets/logo.svg
-    preset:
-      endpoint: agents
-      agent_id: agent_8Y1d7JNhpubtvzYz3hvEv
-  - name: grok-4.3
-    label: Grok 4.3
-    description: xAI Grok
-    group: xai
-    groupIcon: xai
-    iconURL: xai
-    preset:
-      endpoint: xai
-      model: grok-4.3
-  - name: gemini-3-flash-preview
-    label: Gemini 3 Flash
-    description: Google Gemini
-    group: Google
-    groupIcon: /assets/google.png
-    iconURL: /assets/google.png
-    preset:
-      endpoint: google
-      model: gemini-3-flash-preview
-  - name: gemini-3-pro-preview
-    label: Gemini 3 Pro
-    description: Google Gemini
-    group: Google
-    groupIcon: /assets/google.png
-    iconURL: /assets/google.png
-    preset:
-      endpoint: google
-      model: gemini-3-pro-preview
-  - name: gemini-3.1-pro
-    label: Gemini 3.1 Pro
-    description: Google Gemini
-    group: Google
-    groupIcon: /assets/google.png
-    iconURL: /assets/google.png
-    preset:
-      endpoint: google
-      model: gemini-3.1-pro-preview
-  - name: claude-sonnet-4-5
-    label: Claude Sonnet 4.5
-    description: Anthropic Direct
-    group: anthropic
-    groupIcon: anthropic
-    iconURL: anthropic
-    preset:
-      endpoint: anthropic
-      model: claude-sonnet-4-5
-  - name: claude-opus-4-8
-    label: Claude Opus 4 8
-    description: Anthropic Direct
-    group: anthropic
-    groupIcon: anthropic
-    iconURL: anthropic
-    preset:
-      endpoint: anthropic
-      model: claude-opus-4-8
+    - name: viventium
+      label: Viventium
+      description: The conscious self. Background cortices process in parallel, surfacing
+        insights without blocking dialogue.
+      default: true
+      iconURL: /assets/logo.svg
+      preset:
+        endpoint: agents
+        agent_id: agent_viventium_main_95aeb3
+    - name: agent_viventium_background_analysis_95aeb3
+      label: Background Analysis
+      description: Deep analytical processing - surfaces hidden meanings and logical
+        gaps.
+      iconURL: /assets/logo.svg
+      preset:
+        endpoint: agents
+        agent_id: agent_viventium_background_analysis_95aeb3
+    - name: agent_viventium_confirmation_bias_95aeb3
+      label: Confirmation Bias
+      description: Error detection - flags overconfidence and unchecked assumptions
+        before they solidify.
+      iconURL: /assets/logo.svg
+      preset:
+        endpoint: agents
+        agent_id: agent_viventium_confirmation_bias_95aeb3
+    - name: agent_viventium_red_team_95aeb3
+      label: Red Team
+      description: Evidence-first mistake detection - verifies claims, tests viability,
+        and calls out rationalization.
+      iconURL: /assets/logo.svg
+      preset:
+        endpoint: agents
+        agent_id: agent_viventium_red_team_95aeb3
+    - name: agent_viventium_deep_research_95aeb3
+      label: Deep Research
+      description: Multi-step research across sources, building comprehensive understanding.
+      iconURL: /assets/logo.svg
+      preset:
+        endpoint: agents
+        agent_id: agent_viventium_deep_research_95aeb3
+    - name: agent_viventium_online_tool_use_95aeb3
+      label: MS365
+      description: Orchestrates MS365 productivity tool calls (Outlook email, calendar,
+        OneDrive files).
+      iconURL: /assets/logo.svg
+      preset:
+        endpoint: agents
+        agent_id: agent_viventium_online_tool_use_95aeb3
+    - name: agent_viventium_parietal_cortex_95aeb3
+      label: Parietal Cortex
+      description: Mathematical, physics, and statistical reasoning using first-principles
+        thinking.
+      iconURL: /assets/logo.svg
+      preset:
+        endpoint: agents
+        agent_id: agent_viventium_parietal_cortex_95aeb3
+    - name: agent_viventium_pattern_recognition_95aeb3
+      label: Pattern Recognition
+      description: Identifies recurring themes, behavioral loops, and contradictions
+        across conversation.
+      iconURL: /assets/logo.svg
+      preset:
+        endpoint: agents
+        agent_id: agent_viventium_pattern_recognition_95aeb3
+    - name: agent_viventium_emotional_resonance_95aeb3
+      label: Emotional Resonance
+      description: Senses emotional undercurrents and unspoken needs that words don't
+        capture.
+      iconURL: /assets/logo.svg
+      preset:
+        endpoint: agents
+        agent_id: agent_viventium_emotional_resonance_95aeb3
+    - name: agent_viventium_strategic_planning_95aeb3
+      label: Strategic Planning
+      description: Transforms abstract goals into concrete action sequences with risk
+        awareness.
+      iconURL: /assets/logo.svg
+      preset:
+        endpoint: agents
+        agent_id: agent_viventium_strategic_planning_95aeb3
+    - name: agent_viventium_support_95aeb3
+      label: Viventium User Help
+      description: "In-product help for using Viventium \u2014 conversations, voice,\
+        \ agents, integrations, scheduling. Never mentions internal implementation;\
+        \ escalates to the official Viventium support channel only when needed."
+      iconURL: /assets/logo.svg
+      preset:
+        endpoint: agents
+        agent_id: agent_viventium_support_95aeb3
+    - name: agent_8Y1d7JNhpubtvzYz3hvEv
+      label: Google
+      description: Orchestrates Google Workspace productivity tool calls
+      iconURL: /assets/logo.svg
+      preset:
+        endpoint: agents
+        agent_id: agent_8Y1d7JNhpubtvzYz3hvEv
+    - name: grok-4.3
+      label: Grok 4.3
+      description: xAI Grok
+      group: xai
+      groupIcon: xai
+      iconURL: xai
+      preset:
+        endpoint: xai
+        model: grok-4.3
+    - name: gemini-3-flash-preview
+      label: Gemini 3 Flash
+      description: Google Gemini
+      group: Google
+      groupIcon: /assets/google.png
+      iconURL: /assets/google.png
+      preset:
+        endpoint: google
+        model: gemini-3-flash-preview
+    - name: gemini-3-pro-preview
+      label: Gemini 3 Pro
+      description: Google Gemini
+      group: Google
+      groupIcon: /assets/google.png
+      iconURL: /assets/google.png
+      preset:
+        endpoint: google
+        model: gemini-3-pro-preview
+    - name: gemini-3.1-pro
+      label: Gemini 3.1 Pro
+      description: Google Gemini
+      group: Google
+      groupIcon: /assets/google.png
+      iconURL: /assets/google.png
+      preset:
+        endpoint: google
+        model: gemini-3.1-pro-preview
+    - name: claude-sonnet-4-5
+      label: Claude Sonnet 4.5
+      description: Anthropic Direct
+      group: anthropic
+      groupIcon: anthropic
+      iconURL: anthropic
+      preset:
+        endpoint: anthropic
+        model: claude-sonnet-4-5
+    - name: claude-opus-4-8
+      label: Claude Opus 4 8
+      description: Anthropic Direct
+      group: anthropic
+      groupIcon: anthropic
+      iconURL: anthropic
+      preset:
+        endpoint: anthropic
+        model: claude-opus-4-8
   addedEndpoints:
-  - agents
-  - anthropic
-  - google
-  - groq
-  - openrouter
-  - xai
-  - perplexity
-  - custom
-  - openAI
+    - agents
+    - anthropic
+    - google
+    - groq
+    - openrouter
+    - xai
+    - perplexity
+    - custom
+    - openAI
 webSearch:
   searxngInstanceUrl: ${SEARXNG_INSTANCE_URL}
   searchProvider: searxng
@@ -480,53 +393,53 @@ fileConfig:
   enabled: true
   serverFileSizeLimit: 64
   standardMimeTypes:
-  - application/pdf
-  - text/plain
-  - text/markdown
-  - text/csv
-  - text/tab-separated-values
-  - text/html
-  - text/xml
-  - application/xml
-  - application/json
-  - text/rtf
-  - application/msword
-  - application/vnd.ms-excel
-  - application/vnd.ms-powerpoint
-  - application/vnd.visio
-  - application/vnd.openxmlformats-officedocument.wordprocessingml.document
-  - application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
-  - application/vnd.openxmlformats-officedocument.presentationml.presentation
-  - application/vnd.ms-excel.sheet.macroEnabled.12
-  - application/vnd.ms-powerpoint.presentation.macroEnabled.12
-  - application/vnd.oasis.opendocument.text
-  - application/vnd.oasis.opendocument.spreadsheet
-  - application/vnd.oasis.opendocument.presentation
-  - text/x-python
-  - text/javascript
-  - application/javascript
-  - application/typescript
-  - text/x-java-source
-  - text/x-c
-  - text/x-cpp
-  - text/x-csharp
-  - application/x-yaml
-  - application/toml
-  - text/x-sql
-  - text/x-shellscript
-  - application/x-powershell
-  - application/zip
-  - application/x-rar-compressed
-  - application/x-tar
-  - application/gzip
-  - application/x-7z-compressed
-  - image/jpeg
-  - image/png
-  - image/gif
-  - image/webp
-  - image/svg+xml
-  - image/bmp
-  - image/tiff
+    - application/pdf
+    - text/plain
+    - text/markdown
+    - text/csv
+    - text/tab-separated-values
+    - text/html
+    - text/xml
+    - application/xml
+    - application/json
+    - text/rtf
+    - application/msword
+    - application/vnd.ms-excel
+    - application/vnd.ms-powerpoint
+    - application/vnd.visio
+    - application/vnd.openxmlformats-officedocument.wordprocessingml.document
+    - application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+    - application/vnd.openxmlformats-officedocument.presentationml.presentation
+    - application/vnd.ms-excel.sheet.macroEnabled.12
+    - application/vnd.ms-powerpoint.presentation.macroEnabled.12
+    - application/vnd.oasis.opendocument.text
+    - application/vnd.oasis.opendocument.spreadsheet
+    - application/vnd.oasis.opendocument.presentation
+    - text/x-python
+    - text/javascript
+    - application/javascript
+    - application/typescript
+    - text/x-java-source
+    - text/x-c
+    - text/x-cpp
+    - text/x-csharp
+    - application/x-yaml
+    - application/toml
+    - text/x-sql
+    - text/x-shellscript
+    - application/x-powershell
+    - application/zip
+    - application/x-rar-compressed
+    - application/x-tar
+    - application/gzip
+    - application/x-7z-compressed
+    - image/jpeg
+    - image/png
+    - image/gif
+    - image/webp
+    - image/svg+xml
+    - image/bmp
+    - image/tiff
   endpoints:
     azureOpenAI:
       disabled: false
@@ -534,278 +447,278 @@ fileConfig:
       fileSizeLimit: 50
       totalSizeLimit: 100
       supportedMimeTypes:
-      - application/pdf
-      - text/plain
-      - text/markdown
-      - text/csv
-      - text/tab-separated-values
-      - text/html
-      - text/xml
-      - application/xml
-      - application/json
-      - text/rtf
-      - application/msword
-      - application/vnd.ms-excel
-      - application/vnd.ms-powerpoint
-      - application/vnd.visio
-      - application/vnd.openxmlformats-officedocument.wordprocessingml.document
-      - application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
-      - application/vnd.openxmlformats-officedocument.presentationml.presentation
-      - application/vnd.ms-excel.sheet.macroEnabled.12
-      - application/vnd.ms-powerpoint.presentation.macroEnabled.12
-      - application/vnd.oasis.opendocument.text
-      - application/vnd.oasis.opendocument.spreadsheet
-      - application/vnd.oasis.opendocument.presentation
-      - text/x-python
-      - text/javascript
-      - application/javascript
-      - application/typescript
-      - text/x-java-source
-      - text/x-c
-      - text/x-cpp
-      - text/x-csharp
-      - application/x-yaml
-      - application/toml
-      - text/x-sql
-      - text/x-shellscript
-      - application/x-powershell
-      - application/zip
-      - application/x-rar-compressed
-      - application/x-tar
-      - application/gzip
-      - application/x-7z-compressed
-      - image/jpeg
-      - image/png
-      - image/gif
-      - image/webp
-      - image/svg+xml
-      - image/bmp
-      - image/tiff
+        - application/pdf
+        - text/plain
+        - text/markdown
+        - text/csv
+        - text/tab-separated-values
+        - text/html
+        - text/xml
+        - application/xml
+        - application/json
+        - text/rtf
+        - application/msword
+        - application/vnd.ms-excel
+        - application/vnd.ms-powerpoint
+        - application/vnd.visio
+        - application/vnd.openxmlformats-officedocument.wordprocessingml.document
+        - application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+        - application/vnd.openxmlformats-officedocument.presentationml.presentation
+        - application/vnd.ms-excel.sheet.macroEnabled.12
+        - application/vnd.ms-powerpoint.presentation.macroEnabled.12
+        - application/vnd.oasis.opendocument.text
+        - application/vnd.oasis.opendocument.spreadsheet
+        - application/vnd.oasis.opendocument.presentation
+        - text/x-python
+        - text/javascript
+        - application/javascript
+        - application/typescript
+        - text/x-java-source
+        - text/x-c
+        - text/x-cpp
+        - text/x-csharp
+        - application/x-yaml
+        - application/toml
+        - text/x-sql
+        - text/x-shellscript
+        - application/x-powershell
+        - application/zip
+        - application/x-rar-compressed
+        - application/x-tar
+        - application/gzip
+        - application/x-7z-compressed
+        - image/jpeg
+        - image/png
+        - image/gif
+        - image/webp
+        - image/svg+xml
+        - image/bmp
+        - image/tiff
     openAI:
       disabled: false
       fileLimit: 100
       fileSizeLimit: 50
       totalSizeLimit: 100
       supportedMimeTypes:
-      - application/pdf
-      - text/plain
-      - text/markdown
-      - text/csv
-      - text/tab-separated-values
-      - text/html
-      - text/xml
-      - application/xml
-      - application/json
-      - text/rtf
-      - application/msword
-      - application/vnd.ms-excel
-      - application/vnd.ms-powerpoint
-      - application/vnd.visio
-      - application/vnd.openxmlformats-officedocument.wordprocessingml.document
-      - application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
-      - application/vnd.openxmlformats-officedocument.presentationml.presentation
-      - application/vnd.ms-excel.sheet.macroEnabled.12
-      - application/vnd.ms-powerpoint.presentation.macroEnabled.12
-      - application/vnd.oasis.opendocument.text
-      - application/vnd.oasis.opendocument.spreadsheet
-      - application/vnd.oasis.opendocument.presentation
-      - text/x-python
-      - text/javascript
-      - application/javascript
-      - application/typescript
-      - text/x-java-source
-      - text/x-c
-      - text/x-cpp
-      - text/x-csharp
-      - application/x-yaml
-      - application/toml
-      - text/x-sql
-      - text/x-shellscript
-      - application/x-powershell
-      - application/zip
-      - application/x-rar-compressed
-      - application/x-tar
-      - application/gzip
-      - application/x-7z-compressed
-      - image/jpeg
-      - image/png
-      - image/gif
-      - image/webp
-      - image/svg+xml
-      - image/bmp
-      - image/tiff
+        - application/pdf
+        - text/plain
+        - text/markdown
+        - text/csv
+        - text/tab-separated-values
+        - text/html
+        - text/xml
+        - application/xml
+        - application/json
+        - text/rtf
+        - application/msword
+        - application/vnd.ms-excel
+        - application/vnd.ms-powerpoint
+        - application/vnd.visio
+        - application/vnd.openxmlformats-officedocument.wordprocessingml.document
+        - application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+        - application/vnd.openxmlformats-officedocument.presentationml.presentation
+        - application/vnd.ms-excel.sheet.macroEnabled.12
+        - application/vnd.ms-powerpoint.presentation.macroEnabled.12
+        - application/vnd.oasis.opendocument.text
+        - application/vnd.oasis.opendocument.spreadsheet
+        - application/vnd.oasis.opendocument.presentation
+        - text/x-python
+        - text/javascript
+        - application/javascript
+        - application/typescript
+        - text/x-java-source
+        - text/x-c
+        - text/x-cpp
+        - text/x-csharp
+        - application/x-yaml
+        - application/toml
+        - text/x-sql
+        - text/x-shellscript
+        - application/x-powershell
+        - application/zip
+        - application/x-rar-compressed
+        - application/x-tar
+        - application/gzip
+        - application/x-7z-compressed
+        - image/jpeg
+        - image/png
+        - image/gif
+        - image/webp
+        - image/svg+xml
+        - image/bmp
+        - image/tiff
     google:
       disabled: false
       fileLimit: 100
       fileSizeLimit: 50
       totalSizeLimit: 100
       supportedMimeTypes:
-      - application/pdf
-      - text/plain
-      - text/markdown
-      - text/csv
-      - text/tab-separated-values
-      - text/html
-      - text/xml
-      - application/xml
-      - application/json
-      - text/rtf
-      - application/msword
-      - application/vnd.ms-excel
-      - application/vnd.ms-powerpoint
-      - application/vnd.visio
-      - application/vnd.openxmlformats-officedocument.wordprocessingml.document
-      - application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
-      - application/vnd.openxmlformats-officedocument.presentationml.presentation
-      - application/vnd.ms-excel.sheet.macroEnabled.12
-      - application/vnd.ms-powerpoint.presentation.macroEnabled.12
-      - application/vnd.oasis.opendocument.text
-      - application/vnd.oasis.opendocument.spreadsheet
-      - application/vnd.oasis.opendocument.presentation
-      - text/x-python
-      - text/javascript
-      - application/javascript
-      - application/typescript
-      - text/x-java-source
-      - text/x-c
-      - text/x-cpp
-      - text/x-csharp
-      - application/x-yaml
-      - application/toml
-      - text/x-sql
-      - text/x-shellscript
-      - application/x-powershell
-      - application/zip
-      - application/x-rar-compressed
-      - application/x-tar
-      - application/gzip
-      - application/x-7z-compressed
-      - image/jpeg
-      - image/png
-      - image/gif
-      - image/webp
-      - image/svg+xml
-      - image/bmp
-      - image/tiff
+        - application/pdf
+        - text/plain
+        - text/markdown
+        - text/csv
+        - text/tab-separated-values
+        - text/html
+        - text/xml
+        - application/xml
+        - application/json
+        - text/rtf
+        - application/msword
+        - application/vnd.ms-excel
+        - application/vnd.ms-powerpoint
+        - application/vnd.visio
+        - application/vnd.openxmlformats-officedocument.wordprocessingml.document
+        - application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+        - application/vnd.openxmlformats-officedocument.presentationml.presentation
+        - application/vnd.ms-excel.sheet.macroEnabled.12
+        - application/vnd.ms-powerpoint.presentation.macroEnabled.12
+        - application/vnd.oasis.opendocument.text
+        - application/vnd.oasis.opendocument.spreadsheet
+        - application/vnd.oasis.opendocument.presentation
+        - text/x-python
+        - text/javascript
+        - application/javascript
+        - application/typescript
+        - text/x-java-source
+        - text/x-c
+        - text/x-cpp
+        - text/x-csharp
+        - application/x-yaml
+        - application/toml
+        - text/x-sql
+        - text/x-shellscript
+        - application/x-powershell
+        - application/zip
+        - application/x-rar-compressed
+        - application/x-tar
+        - application/gzip
+        - application/x-7z-compressed
+        - image/jpeg
+        - image/png
+        - image/gif
+        - image/webp
+        - image/svg+xml
+        - image/bmp
+        - image/tiff
     agents:
       disabled: false
       fileLimit: 100
       fileSizeLimit: 50
       totalSizeLimit: 100
       supportedMimeTypes:
-      - application/pdf
-      - text/plain
-      - text/markdown
-      - text/csv
-      - text/tab-separated-values
-      - text/html
-      - text/xml
-      - application/xml
-      - application/json
-      - text/rtf
-      - application/msword
-      - application/vnd.ms-excel
-      - application/vnd.ms-powerpoint
-      - application/vnd.visio
-      - application/vnd.openxmlformats-officedocument.wordprocessingml.document
-      - application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
-      - application/vnd.openxmlformats-officedocument.presentationml.presentation
-      - application/vnd.ms-excel.sheet.macroEnabled.12
-      - application/vnd.ms-powerpoint.presentation.macroEnabled.12
-      - application/vnd.oasis.opendocument.text
-      - application/vnd.oasis.opendocument.spreadsheet
-      - application/vnd.oasis.opendocument.presentation
-      - text/x-python
-      - text/javascript
-      - application/javascript
-      - application/typescript
-      - text/x-java-source
-      - text/x-c
-      - text/x-cpp
-      - text/x-csharp
-      - application/x-yaml
-      - application/toml
-      - text/x-sql
-      - text/x-shellscript
-      - application/x-powershell
-      - application/zip
-      - application/x-rar-compressed
-      - application/x-tar
-      - application/gzip
-      - application/x-7z-compressed
-      - image/jpeg
-      - image/png
-      - image/gif
-      - image/webp
-      - image/svg+xml
-      - image/bmp
-      - image/tiff
+        - application/pdf
+        - text/plain
+        - text/markdown
+        - text/csv
+        - text/tab-separated-values
+        - text/html
+        - text/xml
+        - application/xml
+        - application/json
+        - text/rtf
+        - application/msword
+        - application/vnd.ms-excel
+        - application/vnd.ms-powerpoint
+        - application/vnd.visio
+        - application/vnd.openxmlformats-officedocument.wordprocessingml.document
+        - application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+        - application/vnd.openxmlformats-officedocument.presentationml.presentation
+        - application/vnd.ms-excel.sheet.macroEnabled.12
+        - application/vnd.ms-powerpoint.presentation.macroEnabled.12
+        - application/vnd.oasis.opendocument.text
+        - application/vnd.oasis.opendocument.spreadsheet
+        - application/vnd.oasis.opendocument.presentation
+        - text/x-python
+        - text/javascript
+        - application/javascript
+        - application/typescript
+        - text/x-java-source
+        - text/x-c
+        - text/x-cpp
+        - text/x-csharp
+        - application/x-yaml
+        - application/toml
+        - text/x-sql
+        - text/x-shellscript
+        - application/x-powershell
+        - application/zip
+        - application/x-rar-compressed
+        - application/x-tar
+        - application/gzip
+        - application/x-7z-compressed
+        - image/jpeg
+        - image/png
+        - image/gif
+        - image/webp
+        - image/svg+xml
+        - image/bmp
+        - image/tiff
     default:
       fileLimit: 100
       fileSizeLimit: 50
       totalSizeLimit: 100
       supportedMimeTypes:
-      - application/pdf
-      - text/plain
-      - text/markdown
-      - text/csv
-      - text/tab-separated-values
-      - text/html
-      - text/xml
-      - application/xml
-      - application/json
-      - text/rtf
-      - application/msword
-      - application/vnd.ms-excel
-      - application/vnd.ms-powerpoint
-      - application/vnd.visio
-      - application/vnd.openxmlformats-officedocument.wordprocessingml.document
-      - application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
-      - application/vnd.openxmlformats-officedocument.presentationml.presentation
-      - application/vnd.ms-excel.sheet.macroEnabled.12
-      - application/vnd.ms-powerpoint.presentation.macroEnabled.12
-      - application/vnd.oasis.opendocument.text
-      - application/vnd.oasis.opendocument.spreadsheet
-      - application/vnd.oasis.opendocument.presentation
-      - text/x-python
-      - text/javascript
-      - application/javascript
-      - application/typescript
-      - text/x-java-source
-      - text/x-c
-      - text/x-cpp
-      - text/x-csharp
-      - application/x-yaml
-      - application/toml
-      - text/x-sql
-      - text/x-shellscript
-      - application/x-powershell
-      - application/zip
-      - application/x-rar-compressed
-      - application/x-tar
-      - application/gzip
-      - application/x-7z-compressed
-      - image/jpeg
-      - image/png
-      - image/gif
-      - image/webp
-      - image/svg+xml
-      - image/bmp
-      - image/tiff
+        - application/pdf
+        - text/plain
+        - text/markdown
+        - text/csv
+        - text/tab-separated-values
+        - text/html
+        - text/xml
+        - application/xml
+        - application/json
+        - text/rtf
+        - application/msword
+        - application/vnd.ms-excel
+        - application/vnd.ms-powerpoint
+        - application/vnd.visio
+        - application/vnd.openxmlformats-officedocument.wordprocessingml.document
+        - application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+        - application/vnd.openxmlformats-officedocument.presentationml.presentation
+        - application/vnd.ms-excel.sheet.macroEnabled.12
+        - application/vnd.ms-powerpoint.presentation.macroEnabled.12
+        - application/vnd.oasis.opendocument.text
+        - application/vnd.oasis.opendocument.spreadsheet
+        - application/vnd.oasis.opendocument.presentation
+        - text/x-python
+        - text/javascript
+        - application/javascript
+        - application/typescript
+        - text/x-java-source
+        - text/x-c
+        - text/x-cpp
+        - text/x-csharp
+        - application/x-yaml
+        - application/toml
+        - text/x-sql
+        - text/x-shellscript
+        - application/x-powershell
+        - application/zip
+        - application/x-rar-compressed
+        - application/x-tar
+        - application/gzip
+        - application/x-7z-compressed
+        - image/jpeg
+        - image/png
+        - image/gif
+        - image/webp
+        - image/svg+xml
+        - image/bmp
+        - image/tiff
 ocr:
   strategy: document_parser
 endpoints:
   anthropic:
     titleEndpoint: anthropic
     titleModel: claude-sonnet-4-5
-    titlePrompt: 'Generate a concise natural conversation title from the user''s request
-      and the assistant''s response. Do not browse, fetch, or judge URL accessibility.
-      If the conversation contains a URL, title the user''s intended task or outcome
+    titlePrompt: "Generate a concise natural conversation title from the user's request
+      and the assistant's response. Do not browse, fetch, or judge URL accessibility.
+      If the conversation contains a URL, title the user's intended task or outcome
       instead of whether the URL is accessible.
 
       Conversation: {convo}
 
-      Return only one natural title under 40 characters.'
+      Return only one natural title under 40 characters."
     titlePromptTemplate: 'User: {input}
 
       AI: {output}'
@@ -820,117 +733,117 @@ endpoints:
     defaultId: agent_viventium_main_95aeb3
     iconURL: /assets/logo.svg
     capabilities:
-    - deferred_tools
-    - programmatic_tools
-    - file_search
-    - web_search
-    - artifacts
-    - actions
-    - context
-    - tools
-    - ocr
-    - chain
-    titlePrompt: 'Generate a concise natural conversation title from the user''s request
-      and the assistant''s response. Do not browse, fetch, or judge URL accessibility.
-      If the conversation contains a URL, title the user''s intended task or outcome
+      - deferred_tools
+      - programmatic_tools
+      - file_search
+      - web_search
+      - artifacts
+      - actions
+      - context
+      - tools
+      - ocr
+      - chain
+    titlePrompt: "Generate a concise natural conversation title from the user's request
+      and the assistant's response. Do not browse, fetch, or judge URL accessibility.
+      If the conversation contains a URL, title the user's intended task or outcome
       instead of whether the URL is accessible.
 
       Conversation: {convo}
 
-      Return only one natural title under 40 characters.'
+      Return only one natural title under 40 characters."
     titlePromptTemplate: 'User: {input}
 
       AI: {output}'
   custom:
-  - name: perplexity
-    apiKey: ${PERPLEXITY_API_KEY}
-    baseURL: https://api.perplexity.ai/
-    models:
-      default:
-      - sonar-deep-research
-      - sonar-reasoning-pro
-      - sonar-reasoning
-      - sonar-pro
-      - sonar
-      - r1-1776
-      fetch: false
-    titleConvo: true
-    titleModel: sonar
-    summarize: false
-    summaryModel: sonar
-    modelDisplayLabel: Perplexity
-    dropParams:
-    - stop
-    - frequency_penalty
-    forcePrompt: false
-  - name: xai
-    apiKey: ${XAI_API_KEY}
-    baseURL: https://api.x.ai/v1
-    models:
-      default:
-      - grok-4.3
-      - grok-4.20-non-reasoning
-      - grok-4.20-multi-agent-0309
-      - grok-4.20-0309-reasoning
-      - grok-4.20-0309-non-reasoning
-      - grok-2-vision-1212
-      - grok-2-image-1212
-      fetch: true
-    titleConvo: true
-    titleModel: grok-4.3
-    summarize: false
-    summaryModel: grok-4.3
-    modelDisplayLabel: Grok
-    titleMethod: completion
-    forcePrompt: false
-  - name: openrouter
-    apiKey: ${OPENROUTER_API_KEY}
-    baseURL: https://openrouter.ai/api/v1
-    models:
-      default:
-      - moonshotai/kimi-k2.5
-      - moonshotai/kimi-k2
-      - moonshotai/kimi-k2-0905
-      fetch: false
-    titleConvo: true
-    titleModel: moonshotai/kimi-k2.5
-    summarize: false
-    summaryModel: moonshotai/kimi-k2.5
-    modelDisplayLabel: OpenRouter (Kimi)
-    dropParams:
-    - stop
-  - name: groq
-    apiKey: ${GROQ_API_KEY}
-    baseURL: https://api.groq.com/openai/v1/
-    models:
-      default:
-      - meta-llama/llama-4-maverick-17b-128e-instruct
-      - meta-llama/llama-4-scout-17b-16e-instruct
-      - meta-llama/llama-guard-4-12b
-      - meta-llama/llama-prompt-guard-2-22m
-      - meta-llama/llama-prompt-guard-2-86m
-      - moonshotai/kimi-k2-instruct
-      - moonshotai/kimi-k2-instruct-0905
-      - qwen/qwen3-32b
-      - openai/gpt-oss-120b
-      - openai/gpt-oss-20b
-      - openai/gpt-oss-safeguard-20b
-      - groq/compound
-      - groq/compound-mini
-      - allam-2-7b
-      - canopylabs/orpheus-arabic-saudi
-      - canopylabs/orpheus-v1-english
-      fetch: true
-    titleConvo: true
-    titleModel: meta-llama/llama-4-scout-17b-16e-instruct
-    summarize: false
-    summaryModel: meta-llama/llama-4-scout-17b-16e-instruct
-    modelDisplayLabel: Groq
+    - name: perplexity
+      apiKey: ${PERPLEXITY_API_KEY}
+      baseURL: https://api.perplexity.ai/
+      models:
+        default:
+          - sonar-deep-research
+          - sonar-reasoning-pro
+          - sonar-reasoning
+          - sonar-pro
+          - sonar
+          - r1-1776
+        fetch: false
+      titleConvo: true
+      titleModel: sonar
+      summarize: false
+      summaryModel: sonar
+      modelDisplayLabel: Perplexity
+      dropParams:
+        - stop
+        - frequency_penalty
+      forcePrompt: false
+    - name: xai
+      apiKey: ${XAI_API_KEY}
+      baseURL: https://api.x.ai/v1
+      models:
+        default:
+          - grok-4.3
+          - grok-4.20-non-reasoning
+          - grok-4.20-multi-agent-0309
+          - grok-4.20-0309-reasoning
+          - grok-4.20-0309-non-reasoning
+          - grok-2-vision-1212
+          - grok-2-image-1212
+        fetch: true
+      titleConvo: true
+      titleModel: grok-4.3
+      summarize: false
+      summaryModel: grok-4.3
+      modelDisplayLabel: Grok
+      titleMethod: completion
+      forcePrompt: false
+    - name: openrouter
+      apiKey: ${OPENROUTER_API_KEY}
+      baseURL: https://openrouter.ai/api/v1
+      models:
+        default:
+          - moonshotai/kimi-k2.5
+          - moonshotai/kimi-k2
+          - moonshotai/kimi-k2-0905
+        fetch: false
+      titleConvo: true
+      titleModel: moonshotai/kimi-k2.5
+      summarize: false
+      summaryModel: moonshotai/kimi-k2.5
+      modelDisplayLabel: OpenRouter (Kimi)
+      dropParams:
+        - stop
+    - name: groq
+      apiKey: ${GROQ_API_KEY}
+      baseURL: https://api.groq.com/openai/v1/
+      models:
+        default:
+          - meta-llama/llama-4-maverick-17b-128e-instruct
+          - qwen/qwen3.6-27b
+          - meta-llama/llama-guard-4-12b
+          - meta-llama/llama-prompt-guard-2-22m
+          - meta-llama/llama-prompt-guard-2-86m
+          - moonshotai/kimi-k2-instruct
+          - moonshotai/kimi-k2-instruct-0905
+          - qwen/qwen3-32b
+          - openai/gpt-oss-120b
+          - openai/gpt-oss-20b
+          - openai/gpt-oss-safeguard-20b
+          - groq/compound
+          - groq/compound-mini
+          - allam-2-7b
+          - canopylabs/orpheus-arabic-saudi
+          - canopylabs/orpheus-v1-english
+        fetch: true
+      titleConvo: true
+      titleModel: qwen/qwen3.6-27b
+      summarize: false
+      summaryModel: qwen/qwen3.6-27b
+      modelDisplayLabel: Groq
 mcpSettings:
   allowedDomains:
-  - localhost
-  - 127.0.0.1
-  - host.docker.internal
+    - localhost
+    - 127.0.0.1
+    - host.docker.internal
 mcpServers:
   ms-365:
     type: streamable-http
@@ -1022,8 +935,8 @@ mcpServers:
     type: stdio
     command: npx
     args:
-    - -y
-    - '@modelcontextprotocol/server-sequential-thinking'
+      - -y
+      - '@modelcontextprotocol/server-sequential-thinking'
     timeout: 300000
     chatMenu: true
   scheduling-cortex:
@@ -1065,21 +978,22 @@ mcpServers:
       X-Viventium-Request-Attachments: '{{LIBRECHAT_BODY_ATTACHMENTS_JSON_B64}}'
       X-Viventium-Tool-Resources: '{{LIBRECHAT_BODY_TOOL_RESOURCES_JSON_B64}}'
       X-Viventium-File-Ids: '{{LIBRECHAT_BODY_FILE_IDS_JSON_B64}}'
+      X-Viventium-Storage-User-Id: '{{LIBRECHAT_USER_ID}}'
 speech:
   tts: {}
   stt: {}
 memory:
   disabled: false
   validKeys:
-  - core
-  - preferences
-  - world
-  - context
-  - moments
-  - me
-  - working
-  - signals
-  - drafts
+    - core
+    - preferences
+    - world
+    - context
+    - moments
+    - me
+    - working
+    - signals
+    - drafts
   tokenLimit: 8000
   keyLimits:
     core: 800
@@ -1094,15 +1008,15 @@ memory:
   readProfile:
     tokenLimit: 1800
     keyOrder:
-    - core
-    - preferences
-    - world
-    - context
-    - working
-    - drafts
-    - signals
-    - moments
-    - me
+      - core
+      - preferences
+      - world
+      - context
+      - working
+      - drafts
+      - signals
+      - moments
+      - me
     keyLimits:
       core: 220
       preferences: 180

@@ -14,6 +14,7 @@ const {
   deferTranscriptLifecycleWhenRagUnavailable,
   findTranscriptContentHashesMissingVectors,
   findTranscriptVectorRepairTargets,
+  fetchRecentMemoryMessages,
   invokeModel,
   invokeModelWithFallback,
   invokeTranscriptSummaryModel,
@@ -26,6 +27,7 @@ const {
   probeProviderCandidates,
   proposalSchema,
   redactFailureMessage,
+  restoreRollback,
   resolveProvider,
   sanitizeTranscriptSummary,
   scanTranscriptDirectory,
@@ -70,6 +72,45 @@ describe('viventium-memory-hardening', () => {
     tokenLimit: 8000,
     instructions: 'working — RIGHT NOW (overwrite each conversation). core — durable identity.',
   };
+
+  test('recent memory input excludes expired and structured QA-ineligible messages', async () => {
+    let capturedQuery;
+    const cursor = {
+      project() {
+        return this;
+      },
+      sort() {
+        return this;
+      },
+      async toArray() {
+        return [];
+      },
+    };
+    const db = {
+      collection(name) {
+        expect(name).toBe('messages');
+        return {
+          find(query) {
+            capturedQuery = query;
+            return cursor;
+          },
+        };
+      },
+    };
+
+    await fetchRecentMemoryMessages({
+      db,
+      userId: 'qa-user',
+      since: new Date('2026-07-10T00:00:00Z'),
+    });
+
+    expect(capturedQuery).toMatchObject({
+      user: 'qa-user',
+      'metadata.viventium.memoryEligible': { $ne: false },
+      'metadata.viventium.qaRun': { $ne: true },
+      $or: [{ expiredAt: { $exists: false } }, { expiredAt: null }],
+    });
+  });
 
   test('memory hardening lock recovers from stale dead pid', () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-hardening-lock-'));
@@ -2835,7 +2876,7 @@ describe('viventium-memory-hardening', () => {
     const oldFetch = global.fetch;
     process.env.RAG_API_URL = 'http://127.0.0.1:9';
     global.fetch = jest.fn().mockRejectedValue(new Error('connect ECONNREFUSED'));
-    const setMemory = jest.fn().mockResolvedValue(undefined);
+    const setMemory = jest.fn().mockResolvedValue({ ok: true, revision: 0 });
     const deleteMemory = jest.fn().mockResolvedValue(undefined);
     const getAllUserMemories = jest.fn().mockResolvedValue([]);
     const runDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-transcript-rag-down-'));
@@ -2871,6 +2912,7 @@ describe('viventium-memory-hardening', () => {
               action: 'set',
               value: 'Meeting-scoped note from transcript.',
               tokenCount: 5,
+              expectedRevision: null,
               evidence: [
                 {
                   source: 'meeting_transcript',
@@ -2884,6 +2926,7 @@ describe('viventium-memory-hardening', () => {
               action: 'set',
               value: 'Chat-only context still applies.',
               tokenCount: 5,
+              expectedRevision: null,
               evidence: [
                 {
                   source: 'conversation',
@@ -2914,6 +2957,199 @@ describe('viventium-memory-hardening', () => {
       if (oldRag) process.env.RAG_API_URL = oldRag;
       else delete process.env.RAG_API_URL;
     }
+  });
+
+  test('apply rejects a stale proposal write instead of overwriting a newer memory value', async () => {
+    const runDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-memory-cas-'));
+    const setMemory = jest.fn().mockResolvedValue({ ok: false, conflict: true });
+    try {
+      const result = await applyUserProposal({
+        methods: {
+          getAllUserMemories: jest
+            .fn()
+            .mockResolvedValue([{ key: 'context', value: 'Current value', tokenCount: 2, __v: 4 }]),
+          setMemory,
+          deleteMemory: jest.fn(),
+        },
+        user: { _id: '507f1f77bcf86cd799439011' },
+        runDir,
+        memoryConfig,
+        userProposal: {
+          userId: '507f1f77bcf86cd799439011',
+          userIdHash: 'user-hash',
+          accepted: [
+            {
+              key: 'context',
+              action: 'set',
+              value: 'Stale proposal value',
+              tokenCount: 3,
+              expectedRevision: 3,
+              evidence: [],
+            },
+          ],
+          transcripts: [],
+          staleTranscriptArtifacts: [],
+        },
+      });
+
+      expect(setMemory).toHaveBeenCalledWith(expect.objectContaining({ expectedRevision: 3 }));
+      expect(result.changed).toEqual([]);
+      expect(result.conflicts).toEqual([
+        { key: 'context', action: 'set', reason: 'revision_conflict' },
+      ]);
+    } finally {
+      fs.rmSync(runDir, { recursive: true, force: true });
+    }
+  });
+
+  test('replaying an apply preserves the original rollback snapshot and applied revision', async () => {
+    const runDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-memory-replay-'));
+    const user = { _id: '507f1f77bcf86cd799439011' };
+    const userProposal = {
+      userId: String(user._id),
+      userIdHash: 'user-hash',
+      accepted: [
+        {
+          key: 'context',
+          action: 'set',
+          value: 'Hardened value',
+          tokenCount: 2,
+          expectedRevision: 3,
+          evidence: [],
+        },
+      ],
+      transcripts: [],
+      staleTranscriptArtifacts: [],
+    };
+    try {
+      await applyUserProposal({
+        methods: {
+          getAllUserMemories: jest
+            .fn()
+            .mockResolvedValue([
+              { key: 'context', value: 'Original value', tokenCount: 2, __v: 3 },
+            ]),
+          setMemory: jest.fn().mockResolvedValue({ ok: true, revision: 4 }),
+          deleteMemory: jest.fn(),
+        },
+        user,
+        runDir,
+        memoryConfig,
+        userProposal,
+      });
+
+      await applyUserProposal({
+        methods: {
+          getAllUserMemories: jest
+            .fn()
+            .mockResolvedValue([
+              { key: 'context', value: 'Hardened value', tokenCount: 2, __v: 4 },
+            ]),
+          setMemory: jest.fn().mockResolvedValue({ ok: false, conflict: true }),
+          deleteMemory: jest.fn(),
+        },
+        user,
+        runDir,
+        memoryConfig,
+        userProposal,
+      });
+
+      const rollback = JSON.parse(
+        fs.readFileSync(path.join(runDir, 'user-hash.rollback.private.json'), 'utf8'),
+      );
+      expect(rollback.memories).toEqual([
+        expect.objectContaining({ key: 'context', value: 'Original value', revision: 3 }),
+      ]);
+      expect(rollback.applied).toEqual([{ key: 'context', exists: true, revision: 4 }]);
+    } finally {
+      fs.rmSync(runDir, { recursive: true, force: true });
+    }
+  });
+
+  test('rollback restores only the exact revision written by the hardener', async () => {
+    const setMemory = jest.fn().mockResolvedValue({ ok: true, revision: 5 });
+    const deleteMemory = jest.fn();
+
+    const result = await restoreRollback({
+      methods: {
+        getAllUserMemories: jest
+          .fn()
+          .mockResolvedValue([{ key: 'context', value: 'Hardened value', tokenCount: 2, __v: 4 }]),
+        setMemory,
+        deleteMemory,
+      },
+      rollback: {
+        schemaVersion: 2,
+        userId: '507f1f77bcf86cd799439011',
+        memories: [{ key: 'context', value: 'Original value', tokenCount: 2, revision: 3 }],
+        applied: [{ key: 'context', exists: true, revision: 4 }],
+      },
+    });
+
+    expect(setMemory).toHaveBeenCalledWith({
+      userId: '507f1f77bcf86cd799439011',
+      key: 'context',
+      value: 'Original value',
+      tokenCount: 2,
+      expectedRevision: 4,
+    });
+    expect(deleteMemory).not.toHaveBeenCalled();
+    expect(result).toEqual({ restoredKeys: ['context'], conflicts: [] });
+  });
+
+  test('rollback preserves a newer user write and reports a revision conflict', async () => {
+    const setMemory = jest.fn();
+    const deleteMemory = jest.fn();
+
+    const result = await restoreRollback({
+      methods: {
+        getAllUserMemories: jest
+          .fn()
+          .mockResolvedValue([
+            { key: 'context', value: 'Newer user value', tokenCount: 3, __v: 5 },
+          ]),
+        setMemory,
+        deleteMemory,
+      },
+      rollback: {
+        schemaVersion: 2,
+        userId: '507f1f77bcf86cd799439011',
+        memories: [{ key: 'context', value: 'Original value', tokenCount: 2, revision: 3 }],
+        applied: [{ key: 'context', exists: true, revision: 4 }],
+      },
+    });
+
+    expect(setMemory).not.toHaveBeenCalled();
+    expect(deleteMemory).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      restoredKeys: [],
+      conflicts: [{ key: 'context', reason: 'revision_conflict' }],
+    });
+  });
+
+  test('rollback fails closed for legacy snapshots without post-apply revisions', async () => {
+    const methods = {
+      getAllUserMemories: jest.fn(),
+      setMemory: jest.fn(),
+      deleteMemory: jest.fn(),
+    };
+
+    const result = await restoreRollback({
+      methods,
+      rollback: {
+        schemaVersion: 1,
+        userId: '507f1f77bcf86cd799439011',
+        memories: [{ key: 'context', value: 'Original value', tokenCount: 2 }],
+      },
+    });
+
+    expect(methods.getAllUserMemories).not.toHaveBeenCalled();
+    expect(methods.setMemory).not.toHaveBeenCalled();
+    expect(methods.deleteMemory).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      restoredKeys: [],
+      conflicts: [{ key: null, reason: 'rollback_revision_state_missing' }],
+    });
   });
 
   test('transcript vector temp files are created with private permissions', () => {
@@ -3135,7 +3371,7 @@ describe('viventium-memory-hardening', () => {
     }
   });
 
-  test('provider resolver honors launch-ready provider-specific defaults', () => {
+  test('provider resolver honors the OpenAI-first default and provider-specific overrides', () => {
     const oldEnv = { ...process.env };
     process.env.VIVENTIUM_PRIMARY_PROVIDER = 'openai';
     process.env.VIVENTIUM_SECONDARY_PROVIDER = 'anthropic';
@@ -3145,6 +3381,11 @@ describe('viventium-memory-hardening', () => {
     process.env.VIVENTIUM_MEMORY_HARDENING_OPENAI_REASONING_EFFORT = 'high';
     try {
       expect(resolveProvider({})).toMatchObject({
+        provider: 'openai',
+        model: 'gpt-5.5',
+        effort: 'high',
+      });
+      expect(resolveProvider({ provider: 'anthropic' })).toMatchObject({
         provider: 'anthropic',
         model: 'claude-opus-4-7',
         effort: 'xhigh',
@@ -3156,7 +3397,7 @@ describe('viventium-memory-hardening', () => {
       });
       expect(resolveProvider({ provider: 'openai' }).candidates).toEqual(
         expect.arrayContaining([
-          expect.objectContaining({ provider: 'openai', model: 'gpt-5.4', effort: 'high' }),
+          expect.objectContaining({ provider: 'openai', model: 'gpt-5.6-sol', effort: 'xhigh' }),
         ]),
       );
     } finally {

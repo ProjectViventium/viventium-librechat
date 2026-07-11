@@ -8,7 +8,7 @@ import re
 import shutil
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Union
 
@@ -226,6 +226,7 @@ class ScheduleStorage:
         )
         self._sanitize_existing_scheduled_prompt_runs(conn)
         self._sanitize_existing_scheduled_prompt_snapshots(conn)
+        self._reconcile_stale_scheduled_prompt_runs(conn)
         # === VIVENTIUM NOTE ===
 
     @staticmethod
@@ -404,6 +405,34 @@ class ScheduleStorage:
                     f"UPDATE scheduled_tasks SET {assignments} WHERE id = :id",
                     {**updates, "id": row["id"]},
                 )
+
+    @staticmethod
+    def _reconcile_stale_scheduled_prompt_runs(conn: sqlite3.Connection) -> None:
+        try:
+            stale_seconds = int(os.getenv("SCHEDULING_STALE_PROMPT_RUN_SECONDS") or 24 * 60 * 60)
+        except ValueError:
+            stale_seconds = 24 * 60 * 60
+        if stale_seconds <= 0:
+            return
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(seconds=stale_seconds)
+        now_iso = now.isoformat().replace("+00:00", "Z")
+        cutoff_iso = cutoff.isoformat().replace("+00:00", "Z")
+        cursor = conn.execute(
+            """
+            UPDATE scheduled_prompt_runs
+            SET status = 'failed',
+                completed_at = COALESCE(completed_at, ?),
+                error_class = 'stale_run_reconciled',
+                result_summary = 'Run did not reach a terminal callback before the recovery window.',
+                updated_at = ?
+            WHERE status IN ('queued', 'running')
+              AND COALESCE(updated_at, started_at, created_at) < ?
+            """,
+            (now_iso, now_iso, cutoff_iso),
+        )
+        if cursor.rowcount:
+            logger.info("Reconciled %s stale scheduled prompt run(s)", cursor.rowcount)
 
     # === VIVENTIUM NOTE ===
     # Feature: Serialize multi-channel values for storage and filter support.
@@ -760,6 +789,14 @@ class ScheduleStorage:
 
     def delete_scheduled_prompt_definition(self, definition_id: str) -> bool:
         with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM scheduled_prompt_runs WHERE definition_id = ?",
+                (definition_id,),
+            )
+            conn.execute(
+                "DELETE FROM scheduled_prompt_versions WHERE definition_id = ?",
+                (definition_id,),
+            )
             cur = conn.execute(
                 "DELETE FROM scheduled_prompt_definitions WHERE id = ?",
                 (definition_id,),

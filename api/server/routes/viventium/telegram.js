@@ -41,6 +41,7 @@ const AgentController = require('~/server/controllers/agents/request');
 const { loadAuthValues } = require('~/server/services/Tools/credentials');
 const { fileAccess } = require('~/server/middleware/accessResources/fileAccess');
 const { getStrategyFunctions } = require('~/server/services/Files/strategies');
+const { resizeImageBuffer } = require('~/server/services/Files/images');
 const { cleanFileName } = require('~/server/utils/files');
 const { getOpenAIClient } = require('~/server/controllers/assistants/helpers');
 const { getUserById, getMessages, getConvo } = require('~/models');
@@ -77,6 +78,8 @@ const {
 const {
   resolveReusableConversationState,
 } = require('~/server/services/viventium/conversationThreading');
+
+const EXTRACTED_DOCUMENT_IMAGE_MAX_DIMENSION = 768;
 /* === VIVENTIUM START ===
  * Feature: Telegram quick-call launch
  * Purpose: Reuse the same call-session creation contract as the web call button.
@@ -522,6 +525,54 @@ function formatTelegramImagesForVision(files) {
     }));
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Mixed-document visual parity for Telegram uploads.
+ * Purpose: Reuse the same vision injection path for images extracted from PPTX/OCR document
+ * attachments so the agent sees deck visuals along with extracted text and notes.
+ * === VIVENTIUM END === */
+async function formatExtractedImagesForVision(images) {
+  if (!Array.isArray(images) || images.length === 0) {
+    return [];
+  }
+
+  const formatted = [];
+  for (const image of images) {
+    try {
+      if (typeof image !== 'string' || !image.trim()) {
+        continue;
+      }
+      const trimmed = image.trim();
+      const match = trimmed.match(/^data:([^;]+);base64,(.*)$/);
+      const mimeType = match ? match[1] : 'image/png';
+      const base64Data = match ? match[2] : extractBase64Payload(trimmed);
+      if (!mimeType.startsWith('image/') || !base64Data) {
+        continue;
+      }
+      const inputBuffer = Buffer.from(base64Data, 'base64');
+      const { buffer } = await resizeImageBuffer(
+        inputBuffer,
+        { px: EXTRACTED_DOCUMENT_IMAGE_MAX_DIMENSION },
+        EModelEndpoint.anthropic,
+      );
+      const resizedBase64 = buffer.toString('base64');
+      formatted.push({
+        type: ContentTypes.IMAGE_URL,
+        image_url: {
+          url: `data:${mimeType};base64,${resizedBase64}`,
+          detail: 'auto',
+        },
+      });
+    } catch (err) {
+      logger.warn(
+        '[VIVENTIUM][telegram/chat] Failed to prepare extracted document image for vision: %s',
+        err?.message || err,
+      );
+    }
+  }
+
+  return formatted;
+}
+
 /* === VIVENTIUM NOTE ===
  * Feature: Telegram non-image file uploads (Option B: upload to provider/storage)
  * === VIVENTIUM NOTE === */
@@ -572,6 +623,7 @@ async function uploadTelegramFiles({ req, files, agentId }) {
   ({ filterFile, processAgentFileUpload } = require('~/server/services/Files/process'));
 
   const uploaded = [];
+  req._telegramUploadedDocumentImages = [];
   const originalFile = req.file;
   const originalBody = req.body;
 
@@ -646,6 +698,7 @@ async function uploadTelegramFiles({ req, files, agentId }) {
 
     try {
       req.file = tempFile;
+      req._viventiumBridgeDocumentImageExtraction = true;
       const model =
         originalBody && typeof originalBody === 'object' ? originalBody.model : undefined;
       req.body = {
@@ -674,6 +727,17 @@ async function uploadTelegramFiles({ req, files, agentId }) {
       await processAgentFileUpload({ req, res, metadata });
       if (result) {
         uploaded.push(result);
+        const extractedImages = await formatExtractedImagesForVision(
+          result.viventiumExtractedImages,
+        );
+        if (extractedImages.length > 0) {
+          req._telegramUploadedDocumentImages.push(...extractedImages);
+          logger.info(
+            '[VIVENTIUM][telegram/chat] Prepared %d extracted document image(s) for vision from %s',
+            extractedImages.length,
+            safeName,
+          );
+        }
       }
     } catch (err) {
       logger.error('[VIVENTIUM][telegram/chat] File upload failed:', err);
@@ -992,7 +1056,6 @@ router.post(
       imageFormatStartTs,
       `count=${formattedImages.length}`,
     );
-    const hasImages = formattedImages.length > 0;
     const resolvedVoiceRoute = await resolveUserVoiceRoute(req.user?.id);
 
     const uploadStartTs = performance.now();
@@ -1011,6 +1074,11 @@ router.post(
       logTelegramTiming(traceId, 'upload_files', uploadStartTs, 'failed=1');
       return _res.status(422).json({ attachmentProcessingError: true, error: reason });
     }
+    const extractedDocumentImages = Array.isArray(req._telegramUploadedDocumentImages)
+      ? req._telegramUploadedDocumentImages
+      : [];
+    const allFormattedImages = [...formattedImages, ...extractedDocumentImages];
+    const hasImages = allFormattedImages.length > 0;
     const { files: _unusedFiles, iconURL: _unusedIconURL, ...safeIncoming } = incoming;
 
     req.body = {
@@ -1049,10 +1117,10 @@ router.post(
      * The AgentClient.buildMessages() will check req._telegramImages and inject into message.image_urls
      * === VIVENTIUM NOTE === */
     if (hasImages) {
-      req._telegramImages = formattedImages;
+      req._telegramImages = allFormattedImages;
       logger.info(
         '[VIVENTIUM][telegram/chat] Images prepared for vision: count=%d',
-        formattedImages.length,
+        allFormattedImages.length,
       );
     }
 

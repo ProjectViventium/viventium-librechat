@@ -1,4 +1,10 @@
+jest.mock('@librechat/data-schemas', () => ({
+  ...jest.requireActual('@librechat/data-schemas'),
+  logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+}));
+
 const { buildFeelingCapsule, createDefaultFeelingBands } = require('@librechat/api');
+const { logger } = require('@librechat/data-schemas');
 const {
   buildEmotionalReactionAgent,
   buildEmotionalReactionInput,
@@ -78,6 +84,11 @@ describe('EmotionalReactionService', () => {
     const agent = buildEmotionalReactionAgent(config, state);
     expect(agent.instructions).not.toContain('manual_adjustment');
     expect(agent.instructions).not.toContain('reset_to_nature');
+    expect(agent.instructions).not.toContain('smallest accurate strength');
+    expect(agent.instructions).toContain('Slight means a subtle but real movement');
+    expect(agent.instructions).toContain('Clear means an unmistakable movement');
+    expect(agent.instructions).toContain('Strong means a pronounced movement');
+    expect(agent.instructions).toContain('Do not default to slight');
     expect(agent.model_parameters).toEqual(
       expect.objectContaining({
         model: 'gpt-5.6-terra',
@@ -169,6 +180,18 @@ describe('EmotionalReactionService', () => {
         }),
       }),
     );
+    const chunks = logger.info.mock.calls
+      .map(([, envelope]) => envelope)
+      .filter((envelope) => envelope && typeof envelope === 'object');
+    const writeStart = chunks.find((envelope) => envelope.event === 'feelings.reaction.write');
+    expect(writeStart).toBeDefined();
+    const writeEvent = Object.assign(
+      {},
+      ...chunks.filter((envelope) => envelope.i === writeStart.i),
+    );
+    expect(writeEvent.strengthCounts).toEqual({ clear: 1 });
+    expect(writeEvent.absoluteDeltaCounts).toEqual({ 8: 1 });
+    expect(writeEvent).not.toHaveProperty('userText');
   });
 
   test('classified mode reuses activation detection and can skip the model call', async () => {

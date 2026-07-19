@@ -20,6 +20,7 @@ const MAX_SERIALIZED_EVENT_CHARS = 90;
 /* This is deliberately a positive allowlist, not a blacklist. A new telemetry field must be
  * reviewed here before it can reach either the structured transport or the formatted log line. */
 const SAFE_FEELINGS_TELEMETRY_FIELDS = new Set([
+  'absoluteDeltaCounts',
   'activationMode',
   'agentIdHash',
   'attempt',
@@ -60,6 +61,7 @@ const SAFE_FEELINGS_TELEMETRY_FIELDS = new Set([
   'skippedAgentCount',
   'snapshotHash',
   'stimulusKey',
+  'strengthCounts',
   'usedModel',
   'usedProvider',
   'usedServiceTier',

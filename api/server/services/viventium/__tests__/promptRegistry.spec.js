@@ -43,6 +43,19 @@ describe('promptRegistry', () => {
     expect(getPromptBundleStatus().loaded).toBe(false);
   });
 
+  test('authoritative emotional-reaction prompt defines proportional strengths without minimum bias', () => {
+    const promptPath = path.resolve(
+      __dirname,
+      '../../../../../viventium/source_of_truth/prompts/cortex/emotional_reaction/execution.md',
+    );
+    const prompt = fs.readFileSync(promptPath, 'utf8');
+    expect(prompt).not.toContain('smallest accurate strength');
+    expect(prompt).toContain('Slight means a subtle but real movement');
+    expect(prompt).toContain('Clear means an unmistakable movement');
+    expect(prompt).toContain('Strong means a pronounced movement');
+    expect(prompt).toContain('Do not default to `slight`');
+  });
+
   test('renders compiled prompt with includes and variables from memory only', () => {
     writeBundle({
       schema_version: 1,

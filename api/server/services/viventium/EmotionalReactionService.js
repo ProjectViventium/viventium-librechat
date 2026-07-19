@@ -56,7 +56,9 @@ function reactionParseIssues(error) {
 
 const DEFAULT_EXECUTION_PROMPT = `Appraise how the latest external user stimulus moves Viventium's present feeling state.
 
-Use the current values, each feeling's nature (baseline), its persistence, and the recent typed trail. Apply Viventium's configured reaction preference. Prefer no change over an invented change. When the stimulus genuinely touches a feeling, choose the smallest accurate strength.
+Use the current values, each feeling's nature (baseline), its persistence, and the recent typed trail. Apply Viventium's configured reaction preference. Prefer no change over an invented change. When the stimulus genuinely touches a feeling, choose strength in proportion to how much that specific feeling is moved.
+
+Slight means a subtle but real movement. Clear means an unmistakable movement that is neither subtle nor overwhelming. Strong means a pronounced movement with correspondingly high felt impact. Do not default to slight. Choose the category that most faithfully matches the movement; reserve strong for pronounced impact, but do not suppress it when it is accurate.
 
 Write innerState as one natural first-person sentence describing the resulting felt state. Do not use numbers or state-field names, address the user, quote the stimulus, or explain the appraisal.
 
@@ -66,7 +68,23 @@ const DEFAULT_ACTIVATION_PROMPT = `Activate when the latest external user stimul
 
 function buildReactionOutputContract() {
   return `Return exactly one JSON object with this shape and no other text:
-{"changes":[{"band":"${FEELING_BAND_IDS.join('|')}","direction":"up|down","strength":"slight|clear|strong","cause":"${FEELING_MODEL_REACTION_CAUSES.join('|')}"}],"innerState":"one first-person sentence, 1-${MAX_FEELING_INNER_STATE_CHARS} characters"}`;
+{"changes":[{"band":"${FEELING_BAND_IDS.join('|')}","direction":"up|down","strength":"slight|clear|strong","cause":"${FEELING_MODEL_REACTION_CAUSES.join('|')}"}],"innerState":"one first-person sentence, 1-${MAX_FEELING_INNER_STATE_CHARS} characters"}
+Strength semantics: slight = subtle but real movement; clear = unmistakable movement; strong = pronounced movement with high felt impact. Select proportionally; do not default to slight.`;
+}
+
+function reactionDistribution(trail) {
+  const strengthCounts = {};
+  const absoluteDeltaCounts = {};
+  for (const entry of trail) {
+    const strength = String(entry?.strength || '');
+    if (strength) strengthCounts[strength] = (strengthCounts[strength] || 0) + 1;
+    const rawDelta = Math.abs(Number(entry?.after) - Number(entry?.before));
+    if (Number.isFinite(rawDelta)) {
+      const key = String(Math.round(rawDelta * 1000) / 1000);
+      absoluteDeltaCounts[key] = (absoluteDeltaCounts[key] || 0) + 1;
+    }
+  }
+  return { strengthCounts, absoluteDeltaCounts };
 }
 
 function buildEmotionalReactionAgent(config, snapshot) {
@@ -504,10 +522,13 @@ async function runEmotionalReaction(
         continue;
       }
       clearFeelingsReadCache(userId);
+      const distribution = reactionDistribution(applied.trail);
       logFeelingsEvent(logger, req, 'feelings.reaction.write', {
         changedBandCount: changedBandIds.length,
         operationCount: applied.trail.length,
         causes: [...new Set(applied.trail.map((entry) => entry.cause))],
+        strengthCounts: distribution.strengthCounts,
+        absoluteDeltaCounts: distribution.absoluteDeltaCounts,
         innerStateUpdated,
         innerStateLength: innerStateUpdated ? parsed.innerState.length : 0,
         innerStateSkipReason: innerStateUpdated ? null : 'state_changed_after_appraisal_started',

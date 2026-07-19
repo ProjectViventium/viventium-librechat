@@ -27,6 +27,30 @@ describe('Feelings state service', () => {
     expect(snapshot.innerState).toBeNull();
     expect(snapshot.reactionActivationMode).toBe('always');
     expect(snapshot.reactionInstruction).toContain('React to what genuinely moves Viventium');
+    expect(snapshot.reactionInstruction).toContain('match how much the moment matters');
+    expect(snapshot.reactionInstruction).not.toContain('Prefer small natural changes');
+  });
+
+  it('upgrades the exact previously shipped reaction default without replacing user instructions', async () => {
+    const legacyDefault =
+      'React to what genuinely moves Viventium. Prefer small natural changes. Move only the feelings the moment actually touches, and leave nature unchanged.';
+    const legacySnapshot = await loadFeelingsReadContext({
+      userId: 'legacy-default-user',
+      getFeelingState: jest.fn().mockResolvedValue({ reactionInstruction: legacyDefault }),
+      env: {},
+      bypassCache: true,
+    });
+    expect(legacySnapshot.reactionInstruction).toContain('match how much the moment matters');
+    expect(legacySnapshot.reactionInstruction).not.toContain('Prefer small natural changes');
+
+    const customInstruction = 'React rarely, but follow the actual meaning of the moment.';
+    const customSnapshot = await loadFeelingsReadContext({
+      userId: 'custom-instruction-user',
+      getFeelingState: jest.fn().mockResolvedValue({ reactionInstruction: customInstruction }),
+      env: {},
+      bypassCache: true,
+    });
+    expect(customSnapshot.reactionInstruction).toBe(customInstruction);
   });
 
   it('caches reads briefly and clears the user entry after writes', async () => {

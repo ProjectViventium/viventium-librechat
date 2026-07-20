@@ -410,6 +410,12 @@ export const uploadFile = (data: FormData, signal?: AbortSignal | null): Promise
   return request.postMultiPart(endpoints.files(), data, requestConfig);
 };
 
+/* VIVENTIUM START — local-only Native HEIC conversion fallback. */
+export const convertNativeHeic = (data: FormData): Promise<Blob> => {
+  return request.postMultiPart(endpoints.nativeHeicConvert(), data, { responseType: 'blob' });
+};
+/* VIVENTIUM END */
+
 /* actions */
 
 export const updateAction = (data: m.UpdateActionVariables): Promise<m.UpdateActionResponse> => {

@@ -66,6 +66,7 @@ jest.mock('../useDelayedUploadToast', () => ({
 }));
 
 jest.mock('~/utils/heicConverter', () => ({
+  HeicConversionError: class HeicConversionError extends Error {},
   processFileForUpload: jest.fn(async (file: File) => file),
 }));
 

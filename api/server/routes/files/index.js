@@ -1,4 +1,8 @@
 const express = require('express');
+const multer = require('multer');
+/* VIVENTIUM START — local-only Native HEIC conversion boundary. */
+const { createNativeHeicHandler, NATIVE_HEIC_INPUT_LIMIT_BYTES } = require('@librechat/api');
+/* VIVENTIUM END */
 const {
   createFileLimiters,
   configMiddleware,
@@ -42,6 +46,28 @@ const initialize = async () => {
     }
     next();
   });
+
+  /* VIVENTIUM START — authenticated, rate-limited in-memory upload for Native macOS only. */
+  const nativeHeicHandler = createNativeHeicHandler();
+  const nativeHeicUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: {
+      fields: 0,
+      files: 1,
+      fileSize: NATIVE_HEIC_INPUT_LIMIT_BYTES,
+      parts: 1,
+    },
+  }).single('file');
+  router.post('/native-heic-convert', (req, res, next) => {
+    nativeHeicUpload(req, res, (error) => {
+      if (error) {
+        const status = error.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
+        return res.status(status).json({ code: 'invalid_heic' });
+      }
+      return nativeHeicHandler(req, res).catch(next);
+    });
+  });
+  /* VIVENTIUM END */
 
   router.post('/', upload.single('file'));
   router.post('/images', upload.single('file'));

@@ -1,0 +1,678 @@
+{
+  "schemaVersion": 1,
+  "sources": [
+    {
+      "id": "adobe-react-spectrum-notice",
+      "repository": "https://github.com/adobe/react-spectrum",
+      "revision": "1c84a49a1faf50b571c84e00bcf9c60b22ddd03e",
+      "sourcePath": "NOTICE.txt",
+      "localFile": "adobe-react-spectrum-NOTICE.txt",
+      "sha256": "378e1af1aac41d8383e9da1b2acbd2adca2ff8a4c4ad5fdecc8fbffff831eaf7",
+      "contentRole": "notice",
+      "provenance": "exact-package-revision"
+    },
+    {
+      "id": "asn1.js-readme",
+      "repository": "https://github.com/indutny/asn1.js",
+      "revision": "91e2bd0c36ba3cb5b50a4f97e5760757cd80e0dc",
+      "sourcePath": "README.md",
+      "localFile": "asn1.js-README.md",
+      "sha256": "d370e2963b49b85d9a321d5c9973c372f0d212e87ba10009ab2c78683fb0cec3",
+      "contentRole": "license-text-in-readme",
+      "provenance": "exact-package-revision"
+    },
+    {
+      "id": "brorand-readme",
+      "repository": "https://github.com/indutny/brorand",
+      "revision": "ddc4f9344287769d7e2c2ea987d26bbeec5456b4",
+      "sourcePath": "README.md",
+      "localFile": "brorand-README.md",
+      "sha256": "d506a235e27d2912c7c93be50beaaffaa9cd11e5c3852acc08362005108b61dc",
+      "contentRole": "license-text-in-readme",
+      "provenance": "exact-package-revision"
+    },
+    {
+      "id": "des.js-readme",
+      "repository": "https://github.com/indutny/des.js",
+      "revision": "78b64c2ead71740e99a42124274b84f8a41abbdf",
+      "sourcePath": "README.md",
+      "localFile": "des.js-README.md",
+      "sha256": "7bd8e5c11d17eac3766b25d421e158cdb7bacb0bcc520ac4a614520b7fd56c08",
+      "contentRole": "license-text-in-readme",
+      "provenance": "exact-package-revision"
+    },
+    {
+      "id": "elliptic-readme",
+      "repository": "https://github.com/indutny/elliptic",
+      "revision": "9b77436a59cc35eccf4ffb848259c8762a492ee7",
+      "sourcePath": "README.md",
+      "localFile": "elliptic-README.md",
+      "sha256": "361389f7c5c5e493c2af0e89333b4dce12cf6f4c8901b30f035475d2c0215473",
+      "contentRole": "license-text-in-readme",
+      "provenance": "exact-package-revision"
+    },
+    {
+      "id": "flip-toolkit",
+      "repository": "https://github.com/aholachek/react-flip-toolkit",
+      "revision": "cd72b6b0cee32b4f4037a0ffa0b3ba5805759480",
+      "sourcePath": "LICENSE",
+      "localFile": "flip-toolkit-LICENSE.txt",
+      "sha256": "eef1bea69a0f3ec2f9971e0799fcab69fd59644a6fcc7a808becc96e4f93679c",
+      "contentRole": "license",
+      "provenance": "exact-package-revision"
+    },
+    {
+      "id": "hash.js-readme",
+      "repository": "https://github.com/indutny/hash.js",
+      "revision": "fcd35edcc4e30145be4b7a737477ad54e83afc25",
+      "sourcePath": "README.md",
+      "localFile": "hash.js-README.md",
+      "sha256": "5df660fe115c8ddcdb81c5d733c117b94abb706b91c26dac3ab7dc817dd9ba71",
+      "contentRole": "license-text-in-readme",
+      "provenance": "exact-package-revision"
+    },
+    {
+      "id": "hmac-drbg-readme",
+      "repository": "https://github.com/indutny/hmac-drbg",
+      "revision": "2592375270a7a689d3752a6ba7235a47eb234d15",
+      "sourcePath": "README.md",
+      "localFile": "hmac-drbg-README.md",
+      "sha256": "31de905f4580f7a7f0eef6f2f09be85b261c64560bd072bc58d9b61ae225551f",
+      "contentRole": "license-text-in-readme",
+      "provenance": "exact-package-revision"
+    },
+    {
+      "id": "input-otp",
+      "repository": "https://github.com/guilhermerodz/input-otp",
+      "revision": "81ccdb48c010d800b24942aa231909f0c971b1ca",
+      "sourcePath": "LICENSE",
+      "localFile": "input-otp-LICENSE.txt",
+      "sha256": "079031192fea535a245aa64a637d8433c406b82a14f91c3606b1d63e41c00152",
+      "contentRole": "license",
+      "provenance": "exact-package-revision"
+    },
+    {
+      "id": "isarray-readme",
+      "repository": "https://github.com/juliangruber/isarray",
+      "revision": "2a23a281f369e9ae06394c0fb4d2381355a6ba33",
+      "sourcePath": "README.md",
+      "localFile": "isarray-README.md",
+      "sha256": "ff138e683771b187f3629c383db72ee7d632009010a36d08e18e8d2a34222ec7",
+      "contentRole": "license-text-in-readme",
+      "provenance": "exact-package-revision"
+    },
+    {
+      "id": "khroma",
+      "repository": "https://github.com/fabiospampinato/khroma",
+      "revision": "4968165afb0d3d09be66497e7985a34f7bfe6d42",
+      "sourcePath": "license",
+      "localFile": "khroma-license.txt",
+      "sha256": "66b333b0f66759a0b710459e03f7029abe17f4358114a128d2c972e642961b49",
+      "contentRole": "license",
+      "provenance": "exact-package-revision"
+    },
+    {
+      "id": "mcp-ui",
+      "repository": "https://github.com/MCP-UI-Org/mcp-ui",
+      "revision": "fd89e2942eb7148d83245397be0b6ad34ce538b0",
+      "sourcePath": "LICENSE",
+      "localFile": "mcp-ui-LICENSE.txt",
+      "sha256": "6d14625d8e9d5f273b6cb08db8c81180594a4fcb9f0103f384b685b8c0e52e6e",
+      "contentRole": "license",
+      "provenance": "exact-package-revision"
+    },
+    {
+      "id": "miller-rabin-readme",
+      "repository": "https://github.com/indutny/miller-rabin",
+      "revision": "bda17a34d3b33a84a0dbb120ff7f662adea05c01",
+      "sourcePath": "README.md",
+      "localFile": "miller-rabin-README.md",
+      "sha256": "cca039d99212195a60c68f10f717c22fb53089df8eefca0aaab77515e858019a",
+      "contentRole": "license-text-in-readme",
+      "provenance": "exact-package-revision"
+    },
+    {
+      "id": "minimalistic-crypto-utils-readme",
+      "repository": "https://github.com/indutny/minimalistic-crypto-utils",
+      "revision": "f4f2b13a3ac78d8ee6991994bae89ec93304d225",
+      "sourcePath": "README.md",
+      "localFile": "minimalistic-crypto-utils-README.md",
+      "sha256": "64608431631207282f74532d8b9eeda5cb42fced09c663f21e1462987270950c",
+      "contentRole": "license-text-in-readme",
+      "provenance": "exact-package-revision"
+    },
+    {
+      "id": "radix-ui-primitives",
+      "repository": "https://github.com/radix-ui/primitives",
+      "revision": "5b4941e7b1c37deb8daf2f5fc4d6119b0e2fabed",
+      "sourcePath": "LICENSE",
+      "localFile": "radix-ui-primitives-LICENSE.txt",
+      "sha256": "0e80a2d229d2fd4fc7e8636142ec5d0ff0bc031f14c15b682e2ac01dfd5b5138",
+      "contentRole": "license",
+      "provenance": "exact-package-revision"
+    },
+    {
+      "id": "react-dnd",
+      "repository": "https://github.com/react-dnd/react-dnd",
+      "revision": "641fd36c130e42c3cf08987924151efa1452bca7",
+      "sourcePath": "LICENSE",
+      "localFile": "react-dnd-LICENSE.txt",
+      "sha256": "10c8da64ecfa3067cf9231e0ba19b8d7730e7fed3ac5eaa37ccb97c3c5e71336",
+      "contentRole": "license",
+      "provenance": "exact-package-revision"
+    },
+    {
+      "id": "react-flip-toolkit",
+      "repository": "https://github.com/aholachek/react-flip-toolkit",
+      "revision": "2d00d4517d926598122242c8f40d05ae48553044",
+      "sourcePath": "LICENSE",
+      "localFile": "react-flip-toolkit-LICENSE.txt",
+      "sha256": "eef1bea69a0f3ec2f9971e0799fcab69fd59644a6fcc7a808becc96e4f93679c",
+      "contentRole": "license",
+      "provenance": "exact-package-revision"
+    },
+    {
+      "id": "react-resizable-panels",
+      "repository": "https://github.com/bvaughn/react-resizable-panels",
+      "revision": "43a071df6bb96d54e8b81a6be0e2d453af45cc4b",
+      "sourcePath": "LICENSE",
+      "localFile": "react-resizable-panels-LICENSE.txt",
+      "sha256": "8b21167f99f3c016b39473b2984ceb03b54bf796dd9a7c74fcb80cfd513fe8a8",
+      "contentRole": "license",
+      "provenance": "exact-package-revision"
+    },
+    {
+      "id": "rehype-katex",
+      "repository": "https://github.com/remarkjs/remark-math",
+      "revision": "e18d024ce76f90bd6b89366091aa2a5dda771864",
+      "sourcePath": "license",
+      "localFile": "rehype-katex-license.txt",
+      "sha256": "cb992262f361a5359e6771c28740d33c7041e15332ae8537fae40538992591a9",
+      "contentRole": "license",
+      "provenance": "exact-package-revision"
+    },
+    {
+      "id": "remark-math",
+      "repository": "https://github.com/remarkjs/remark-math",
+      "revision": "d5d0660b150810a535bbb07eac6cc96a4510aa24",
+      "sourcePath": "license",
+      "localFile": "remark-math-license.txt",
+      "sha256": "cb992262f361a5359e6771c28740d33c7041e15332ae8537fae40538992591a9",
+      "contentRole": "license",
+      "provenance": "exact-package-revision"
+    }
+  ],
+  "packageOverrides": [
+    {
+      "lockPath": "node_modules/@mcp-ui/client",
+      "name": "@mcp-ui/client",
+      "version": "5.17.3",
+      "resolved": "https://registry.npmjs.org/@mcp-ui/client/-/client-5.17.3.tgz",
+      "integrity": "sha512-Xxi8d5NYbCBUdBEqhwnm7PgJE6+F1wOV2sPA0AWnfLoudpiq8iomovL/AMFI+alVZwhSBxzqJKqUdbPD2yz5tQ==",
+      "license": "Apache-2.0",
+      "legalSourceId": "mcp-ui"
+    },
+    {
+      "lockPath": "node_modules/@radix-ui/react-alert-dialog",
+      "name": "@radix-ui/react-alert-dialog",
+      "version": "1.0.2",
+      "resolved": "https://registry.npmjs.org/@radix-ui/react-alert-dialog/-/react-alert-dialog-1.0.2.tgz",
+      "integrity": "sha512-0MtxV53FaEEBOKRgyLnEqHZKKDS5BldQ9oUBsKVXWI5FHbl2jp35qs+0aJET+K5hJDsc40kQUzP7g+wC7tqrqA==",
+      "license": "MIT",
+      "legalSourceId": "radix-ui-primitives"
+    },
+    {
+      "lockPath": "node_modules/@radix-ui/react-alert-dialog/node_modules/@radix-ui/primitive",
+      "name": "@radix-ui/primitive",
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/@radix-ui/primitive/-/primitive-1.0.0.tgz",
+      "integrity": "sha512-3e7rn8FDMin4CgeL7Z/49smCA3rFYY3Ha2rUQ7HRWFadS5iCRw08ZgVT1LaNTCNqgvrUiyczLflrVrF0SRQtNA==",
+      "license": "MIT",
+      "legalSourceId": "radix-ui-primitives"
+    },
+    {
+      "lockPath": "node_modules/@radix-ui/react-alert-dialog/node_modules/@radix-ui/react-compose-refs",
+      "name": "@radix-ui/react-compose-refs",
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/@radix-ui/react-compose-refs/-/react-compose-refs-1.0.0.tgz",
+      "integrity": "sha512-0KaSv6sx787/hK3eF53iOkiSLwAGlFMx5lotrqD2pTjB18KbybKoEIgkNZTKC60YECDQTKGTRcDBILwZVqVKvA==",
+      "license": "MIT",
+      "legalSourceId": "radix-ui-primitives"
+    },
+    {
+      "lockPath": "node_modules/@radix-ui/react-alert-dialog/node_modules/@radix-ui/react-context",
+      "name": "@radix-ui/react-context",
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/@radix-ui/react-context/-/react-context-1.0.0.tgz",
+      "integrity": "sha512-1pVM9RfOQ+n/N5PJK33kRSKsr1glNxomxONs5c49MliinBY6Yw2Q995qfBUUo0/Mbg05B/sGA0gkgPI7kmSHBg==",
+      "license": "MIT",
+      "legalSourceId": "radix-ui-primitives"
+    },
+    {
+      "lockPath": "node_modules/@radix-ui/react-alert-dialog/node_modules/@radix-ui/react-slot",
+      "name": "@radix-ui/react-slot",
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/@radix-ui/react-slot/-/react-slot-1.0.1.tgz",
+      "integrity": "sha512-avutXAFL1ehGvAXtPquu0YK5oz6ctS474iM3vNGQIkswrVhdrS52e3uoMQBzZhNRAIE0jBnUyXWNmSjGHhCFcw==",
+      "license": "MIT",
+      "legalSourceId": "radix-ui-primitives"
+    },
+    {
+      "lockPath": "node_modules/@radix-ui/react-dialog",
+      "name": "@radix-ui/react-dialog",
+      "version": "1.0.2",
+      "resolved": "https://registry.npmjs.org/@radix-ui/react-dialog/-/react-dialog-1.0.2.tgz",
+      "integrity": "sha512-EKxxp2WNSmUPkx4trtWNmZ4/vAYEg7JkAfa1HKBUnaubw9eHzf1Orr9B472lJYaYz327RHDrd4R95fsw7VR8DA==",
+      "license": "MIT",
+      "legalSourceId": "radix-ui-primitives"
+    },
+    {
+      "lockPath": "node_modules/@radix-ui/react-dialog/node_modules/@radix-ui/primitive",
+      "name": "@radix-ui/primitive",
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/@radix-ui/primitive/-/primitive-1.0.0.tgz",
+      "integrity": "sha512-3e7rn8FDMin4CgeL7Z/49smCA3rFYY3Ha2rUQ7HRWFadS5iCRw08ZgVT1LaNTCNqgvrUiyczLflrVrF0SRQtNA==",
+      "license": "MIT",
+      "legalSourceId": "radix-ui-primitives"
+    },
+    {
+      "lockPath": "node_modules/@radix-ui/react-dialog/node_modules/@radix-ui/react-compose-refs",
+      "name": "@radix-ui/react-compose-refs",
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/@radix-ui/react-compose-refs/-/react-compose-refs-1.0.0.tgz",
+      "integrity": "sha512-0KaSv6sx787/hK3eF53iOkiSLwAGlFMx5lotrqD2pTjB18KbybKoEIgkNZTKC60YECDQTKGTRcDBILwZVqVKvA==",
+      "license": "MIT",
+      "legalSourceId": "radix-ui-primitives"
+    },
+    {
+      "lockPath": "node_modules/@radix-ui/react-dialog/node_modules/@radix-ui/react-context",
+      "name": "@radix-ui/react-context",
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/@radix-ui/react-context/-/react-context-1.0.0.tgz",
+      "integrity": "sha512-1pVM9RfOQ+n/N5PJK33kRSKsr1glNxomxONs5c49MliinBY6Yw2Q995qfBUUo0/Mbg05B/sGA0gkgPI7kmSHBg==",
+      "license": "MIT",
+      "legalSourceId": "radix-ui-primitives"
+    },
+    {
+      "lockPath": "node_modules/@radix-ui/react-dialog/node_modules/@radix-ui/react-id",
+      "name": "@radix-ui/react-id",
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/@radix-ui/react-id/-/react-id-1.0.0.tgz",
+      "integrity": "sha512-Q6iAB/U7Tq3NTolBBQbHTgclPmGWE3OlktGGqrClPozSw4vkQ1DfQAOtzgRPecKsMdJINE05iaoDUG8tRzCBjw==",
+      "license": "MIT",
+      "legalSourceId": "radix-ui-primitives"
+    },
+    {
+      "lockPath": "node_modules/@radix-ui/react-dialog/node_modules/@radix-ui/react-presence",
+      "name": "@radix-ui/react-presence",
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/@radix-ui/react-presence/-/react-presence-1.0.0.tgz",
+      "integrity": "sha512-A+6XEvN01NfVWiKu38ybawfHsBjWum42MRPnEuqPsBZ4eV7e/7K321B5VgYMPv3Xx5An6o1/l9ZuDBgmcmWK3w==",
+      "license": "MIT",
+      "legalSourceId": "radix-ui-primitives"
+    },
+    {
+      "lockPath": "node_modules/@radix-ui/react-dialog/node_modules/@radix-ui/react-primitive",
+      "name": "@radix-ui/react-primitive",
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/@radix-ui/react-primitive/-/react-primitive-1.0.1.tgz",
+      "integrity": "sha512-fHbmislWVkZaIdeF6GZxF0A/NH/3BjrGIYj+Ae6eTmTCr7EB0RQAAVEiqsXK6p3/JcRqVSBQoceZroj30Jj3XA==",
+      "license": "MIT",
+      "legalSourceId": "radix-ui-primitives"
+    },
+    {
+      "lockPath": "node_modules/@radix-ui/react-dialog/node_modules/@radix-ui/react-slot",
+      "name": "@radix-ui/react-slot",
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/@radix-ui/react-slot/-/react-slot-1.0.1.tgz",
+      "integrity": "sha512-avutXAFL1ehGvAXtPquu0YK5oz6ctS474iM3vNGQIkswrVhdrS52e3uoMQBzZhNRAIE0jBnUyXWNmSjGHhCFcw==",
+      "license": "MIT",
+      "legalSourceId": "radix-ui-primitives"
+    },
+    {
+      "lockPath": "node_modules/@radix-ui/react-dialog/node_modules/@radix-ui/react-use-controllable-state",
+      "name": "@radix-ui/react-use-controllable-state",
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/@radix-ui/react-use-controllable-state/-/react-use-controllable-state-1.0.0.tgz",
+      "integrity": "sha512-FohDoZvk3mEXh9AWAVyRTYR4Sq7/gavuofglmiXB2g1aKyboUD4YtgWxKj8O5n+Uak52gXQ4wKz5IFST4vtJHg==",
+      "license": "MIT",
+      "legalSourceId": "radix-ui-primitives"
+    },
+    {
+      "lockPath": "node_modules/@radix-ui/react-dialog/node_modules/@radix-ui/react-use-layout-effect",
+      "name": "@radix-ui/react-use-layout-effect",
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/@radix-ui/react-use-layout-effect/-/react-use-layout-effect-1.0.0.tgz",
+      "integrity": "sha512-6Tpkq+R6LOlmQb1R5NNETLG0B4YP0wc+klfXafpUCj6JGyaUc8il7/kUZ7m59rGbXGczE9Bs+iz2qloqsZBduQ==",
+      "license": "MIT",
+      "legalSourceId": "radix-ui-primitives"
+    },
+    {
+      "lockPath": "node_modules/@radix-ui/react-dismissable-layer",
+      "name": "@radix-ui/react-dismissable-layer",
+      "version": "1.0.2",
+      "resolved": "https://registry.npmjs.org/@radix-ui/react-dismissable-layer/-/react-dismissable-layer-1.0.2.tgz",
+      "integrity": "sha512-WjJzMrTWROozDqLB0uRWYvj4UuXsM/2L19EmQ3Au+IJWqwvwq9Bwd+P8ivo0Deg9JDPArR1I6MbWNi1CmXsskg==",
+      "license": "MIT",
+      "legalSourceId": "radix-ui-primitives"
+    },
+    {
+      "lockPath": "node_modules/@radix-ui/react-dismissable-layer/node_modules/@radix-ui/primitive",
+      "name": "@radix-ui/primitive",
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/@radix-ui/primitive/-/primitive-1.0.0.tgz",
+      "integrity": "sha512-3e7rn8FDMin4CgeL7Z/49smCA3rFYY3Ha2rUQ7HRWFadS5iCRw08ZgVT1LaNTCNqgvrUiyczLflrVrF0SRQtNA==",
+      "license": "MIT",
+      "legalSourceId": "radix-ui-primitives"
+    },
+    {
+      "lockPath": "node_modules/@radix-ui/react-dismissable-layer/node_modules/@radix-ui/react-compose-refs",
+      "name": "@radix-ui/react-compose-refs",
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/@radix-ui/react-compose-refs/-/react-compose-refs-1.0.0.tgz",
+      "integrity": "sha512-0KaSv6sx787/hK3eF53iOkiSLwAGlFMx5lotrqD2pTjB18KbybKoEIgkNZTKC60YECDQTKGTRcDBILwZVqVKvA==",
+      "license": "MIT",
+      "legalSourceId": "radix-ui-primitives"
+    },
+    {
+      "lockPath": "node_modules/@radix-ui/react-dismissable-layer/node_modules/@radix-ui/react-primitive",
+      "name": "@radix-ui/react-primitive",
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/@radix-ui/react-primitive/-/react-primitive-1.0.1.tgz",
+      "integrity": "sha512-fHbmislWVkZaIdeF6GZxF0A/NH/3BjrGIYj+Ae6eTmTCr7EB0RQAAVEiqsXK6p3/JcRqVSBQoceZroj30Jj3XA==",
+      "license": "MIT",
+      "legalSourceId": "radix-ui-primitives"
+    },
+    {
+      "lockPath": "node_modules/@radix-ui/react-dismissable-layer/node_modules/@radix-ui/react-slot",
+      "name": "@radix-ui/react-slot",
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/@radix-ui/react-slot/-/react-slot-1.0.1.tgz",
+      "integrity": "sha512-avutXAFL1ehGvAXtPquu0YK5oz6ctS474iM3vNGQIkswrVhdrS52e3uoMQBzZhNRAIE0jBnUyXWNmSjGHhCFcw==",
+      "license": "MIT",
+      "legalSourceId": "radix-ui-primitives"
+    },
+    {
+      "lockPath": "node_modules/@radix-ui/react-focus-guards",
+      "name": "@radix-ui/react-focus-guards",
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/@radix-ui/react-focus-guards/-/react-focus-guards-1.0.0.tgz",
+      "integrity": "sha512-UagjDk4ijOAnGu4WMUPj9ahi7/zJJqNZ9ZAiGPp7waUWJO0O1aWXi/udPphI0IUjvrhBsZJGSN66dR2dsueLWQ==",
+      "license": "MIT",
+      "legalSourceId": "radix-ui-primitives"
+    },
+    {
+      "lockPath": "node_modules/@radix-ui/react-focus-scope",
+      "name": "@radix-ui/react-focus-scope",
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/@radix-ui/react-focus-scope/-/react-focus-scope-1.0.1.tgz",
+      "integrity": "sha512-Ej2MQTit8IWJiS2uuujGUmxXjF/y5xZptIIQnyd2JHLwtV0R2j9NRVoRj/1j/gJ7e3REdaBw4Hjf4a1ImhkZcQ==",
+      "license": "MIT",
+      "legalSourceId": "radix-ui-primitives"
+    },
+    {
+      "lockPath": "node_modules/@radix-ui/react-focus-scope/node_modules/@radix-ui/react-compose-refs",
+      "name": "@radix-ui/react-compose-refs",
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/@radix-ui/react-compose-refs/-/react-compose-refs-1.0.0.tgz",
+      "integrity": "sha512-0KaSv6sx787/hK3eF53iOkiSLwAGlFMx5lotrqD2pTjB18KbybKoEIgkNZTKC60YECDQTKGTRcDBILwZVqVKvA==",
+      "license": "MIT",
+      "legalSourceId": "radix-ui-primitives"
+    },
+    {
+      "lockPath": "node_modules/@radix-ui/react-focus-scope/node_modules/@radix-ui/react-primitive",
+      "name": "@radix-ui/react-primitive",
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/@radix-ui/react-primitive/-/react-primitive-1.0.1.tgz",
+      "integrity": "sha512-fHbmislWVkZaIdeF6GZxF0A/NH/3BjrGIYj+Ae6eTmTCr7EB0RQAAVEiqsXK6p3/JcRqVSBQoceZroj30Jj3XA==",
+      "license": "MIT",
+      "legalSourceId": "radix-ui-primitives"
+    },
+    {
+      "lockPath": "node_modules/@radix-ui/react-focus-scope/node_modules/@radix-ui/react-slot",
+      "name": "@radix-ui/react-slot",
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/@radix-ui/react-slot/-/react-slot-1.0.1.tgz",
+      "integrity": "sha512-avutXAFL1ehGvAXtPquu0YK5oz6ctS474iM3vNGQIkswrVhdrS52e3uoMQBzZhNRAIE0jBnUyXWNmSjGHhCFcw==",
+      "license": "MIT",
+      "legalSourceId": "radix-ui-primitives"
+    },
+    {
+      "lockPath": "node_modules/@radix-ui/react-portal",
+      "name": "@radix-ui/react-portal",
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/@radix-ui/react-portal/-/react-portal-1.0.1.tgz",
+      "integrity": "sha512-NY2vUWI5WENgAT1nfC6JS7RU5xRYBfjZVLq0HmgEN1Ezy3rk/UruMV4+Rd0F40PEaFC5SrLS1ixYvcYIQrb4Ig==",
+      "license": "MIT",
+      "legalSourceId": "radix-ui-primitives"
+    },
+    {
+      "lockPath": "node_modules/@radix-ui/react-portal/node_modules/@radix-ui/react-compose-refs",
+      "name": "@radix-ui/react-compose-refs",
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/@radix-ui/react-compose-refs/-/react-compose-refs-1.0.0.tgz",
+      "integrity": "sha512-0KaSv6sx787/hK3eF53iOkiSLwAGlFMx5lotrqD2pTjB18KbybKoEIgkNZTKC60YECDQTKGTRcDBILwZVqVKvA==",
+      "license": "MIT",
+      "legalSourceId": "radix-ui-primitives"
+    },
+    {
+      "lockPath": "node_modules/@radix-ui/react-portal/node_modules/@radix-ui/react-primitive",
+      "name": "@radix-ui/react-primitive",
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/@radix-ui/react-primitive/-/react-primitive-1.0.1.tgz",
+      "integrity": "sha512-fHbmislWVkZaIdeF6GZxF0A/NH/3BjrGIYj+Ae6eTmTCr7EB0RQAAVEiqsXK6p3/JcRqVSBQoceZroj30Jj3XA==",
+      "license": "MIT",
+      "legalSourceId": "radix-ui-primitives"
+    },
+    {
+      "lockPath": "node_modules/@radix-ui/react-portal/node_modules/@radix-ui/react-slot",
+      "name": "@radix-ui/react-slot",
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/@radix-ui/react-slot/-/react-slot-1.0.1.tgz",
+      "integrity": "sha512-avutXAFL1ehGvAXtPquu0YK5oz6ctS474iM3vNGQIkswrVhdrS52e3uoMQBzZhNRAIE0jBnUyXWNmSjGHhCFcw==",
+      "license": "MIT",
+      "legalSourceId": "radix-ui-primitives"
+    },
+    {
+      "lockPath": "node_modules/@radix-ui/react-use-callback-ref",
+      "name": "@radix-ui/react-use-callback-ref",
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/@radix-ui/react-use-callback-ref/-/react-use-callback-ref-1.0.0.tgz",
+      "integrity": "sha512-GZtyzoHz95Rhs6S63D2t/eqvdFCm7I+yHMLVQheKM7nBD8mbZIt+ct1jz4536MDnaOGKIxynJ8eHTkVGVVkoTg==",
+      "license": "MIT",
+      "legalSourceId": "radix-ui-primitives"
+    },
+    {
+      "lockPath": "node_modules/@radix-ui/react-use-escape-keydown",
+      "name": "@radix-ui/react-use-escape-keydown",
+      "version": "1.0.2",
+      "resolved": "https://registry.npmjs.org/@radix-ui/react-use-escape-keydown/-/react-use-escape-keydown-1.0.2.tgz",
+      "integrity": "sha512-DXGim3x74WgUv+iMNCF+cAo8xUHHeqvjx8zs7trKf+FkQKPQXLk2sX7Gx1ysH7Q76xCpZuxIJE7HLPxRE+Q+GA==",
+      "license": "MIT",
+      "legalSourceId": "radix-ui-primitives"
+    },
+    {
+      "lockPath": "node_modules/@react-dnd/invariant",
+      "name": "@react-dnd/invariant",
+      "version": "4.0.2",
+      "resolved": "https://registry.npmjs.org/@react-dnd/invariant/-/invariant-4.0.2.tgz",
+      "integrity": "sha512-xKCTqAK/FFauOM9Ta2pswIyT3D8AQlfrYdOi/toTPEhqCuAs1v5tcJ3Y08Izh1cJ5Jchwy9SeAXmMg6zrKs2iw==",
+      "license": "MIT",
+      "legalSourceId": "react-dnd"
+    },
+    {
+      "lockPath": "node_modules/@react-dnd/shallowequal",
+      "name": "@react-dnd/shallowequal",
+      "version": "4.0.2",
+      "resolved": "https://registry.npmjs.org/@react-dnd/shallowequal/-/shallowequal-4.0.2.tgz",
+      "integrity": "sha512-/RVXdLvJxLg4QKvMoM5WlwNR9ViO9z8B/qPcc+C0Sa/teJY7QG7kJ441DwzOjMYEY7GmU4dj5EcGHIkKZiQZCA==",
+      "license": "MIT",
+      "legalSourceId": "react-dnd"
+    },
+    {
+      "lockPath": "node_modules/asn1.js",
+      "name": "asn1.js",
+      "version": "4.10.1",
+      "resolved": "https://registry.npmjs.org/asn1.js/-/asn1.js-4.10.1.tgz",
+      "integrity": "sha512-p32cOF5q0Zqs9uBiONKYLm6BClCoBCM5O9JfeUSlnQLBTxYdTK+pW+nXflm8UkKd2UYlEbYz5qEi0JuZR9ckSw==",
+      "license": "MIT",
+      "legalSourceId": "asn1.js-readme"
+    },
+    {
+      "lockPath": "node_modules/brorand",
+      "name": "brorand",
+      "version": "1.1.0",
+      "resolved": "https://registry.npmjs.org/brorand/-/brorand-1.1.0.tgz",
+      "integrity": "sha512-cKV8tMCEpQs4hK/ik71d6LrPOnpkpGBR0wzxqr68g2m/LB2GxVYQroAjMJZRVM1Y4BCjCKc3vAamxSzOY2RP+w==",
+      "license": "MIT",
+      "legalSourceId": "brorand-readme"
+    },
+    {
+      "lockPath": "node_modules/des.js",
+      "name": "des.js",
+      "version": "1.1.0",
+      "resolved": "https://registry.npmjs.org/des.js/-/des.js-1.1.0.tgz",
+      "integrity": "sha512-r17GxjhUCjSRy8aiJpr8/UadFIzMzJGexI3Nmz4ADi9LYSFx4gTBp80+NaX/YsXWWLhpZ7v/v/ubEc/bCNfKwg==",
+      "license": "MIT",
+      "legalSourceId": "des.js-readme"
+    },
+    {
+      "lockPath": "node_modules/elliptic",
+      "name": "elliptic",
+      "version": "6.6.1",
+      "resolved": "https://registry.npmjs.org/elliptic/-/elliptic-6.6.1.tgz",
+      "integrity": "sha512-RaddvvMatK2LJHqFJ+YA4WysVN5Ita9E35botqIYspQ4TkRAlCicdzKOjlyv/1Za5RyTNn7di//eEV0uTAfe3g==",
+      "license": "MIT",
+      "legalSourceId": "elliptic-readme"
+    },
+    {
+      "lockPath": "node_modules/flip-toolkit",
+      "name": "flip-toolkit",
+      "version": "7.2.4",
+      "resolved": "https://registry.npmjs.org/flip-toolkit/-/flip-toolkit-7.2.4.tgz",
+      "integrity": "sha512-NT81ikyHPk72riMe1U01x698YIMSypMF5mQBhRklWVgf2xgWH3EPfrrVRAkz/+TSCq0rLPsr/uKIYkwHrowKZQ==",
+      "license": "MIT",
+      "legalSourceId": "flip-toolkit"
+    },
+    {
+      "lockPath": "node_modules/hash.js",
+      "name": "hash.js",
+      "version": "1.1.7",
+      "resolved": "https://registry.npmjs.org/hash.js/-/hash.js-1.1.7.tgz",
+      "integrity": "sha512-taOaskGt4z4SOANNseOviYDvjEJinIkRgmp7LbKP2YTTmVxWBl87s/uzK9r+44BclBSp2X7K1hqeNfz9JbBeXA==",
+      "license": "MIT",
+      "legalSourceId": "hash.js-readme"
+    },
+    {
+      "lockPath": "node_modules/hmac-drbg",
+      "name": "hmac-drbg",
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/hmac-drbg/-/hmac-drbg-1.0.1.tgz",
+      "integrity": "sha512-Tti3gMqLdZfhOQY1Mzf/AanLiqh1WTiJgEj26ZuYQ9fbkLomzGchCws4FyrSd4VkpBfiNhaE1On+lOz894jvXg==",
+      "license": "MIT",
+      "legalSourceId": "hmac-drbg-readme"
+    },
+    {
+      "lockPath": "node_modules/input-otp",
+      "name": "input-otp",
+      "version": "1.4.2",
+      "resolved": "https://registry.npmjs.org/input-otp/-/input-otp-1.4.2.tgz",
+      "integrity": "sha512-l3jWwYNvrEa6NTCt7BECfCm48GvwuZzkoeG3gBL2w4CHeOXW3eKFmf9UNYkNfYc3mxMrthMnxjIE07MT0zLBQA==",
+      "license": "MIT",
+      "legalSourceId": "input-otp"
+    },
+    {
+      "lockPath": "node_modules/khroma",
+      "name": "khroma",
+      "version": "2.1.0",
+      "resolved": "https://registry.npmjs.org/khroma/-/khroma-2.1.0.tgz",
+      "integrity": "sha512-Ls993zuzfayK269Svk9hzpeGUKob/sIgZzyHYdjQoAdQetRKpOLj+k/QQQ/6Qi0Yz65mlROrfd+Ev+1+7dz9Kw==",
+      "license": "MIT",
+      "legalSourceId": "khroma"
+    },
+    {
+      "lockPath": "node_modules/miller-rabin",
+      "name": "miller-rabin",
+      "version": "4.0.1",
+      "resolved": "https://registry.npmjs.org/miller-rabin/-/miller-rabin-4.0.1.tgz",
+      "integrity": "sha512-115fLhvZVqWwHPbClyntxEVfVDfl9DLLTuJvq3g2O/Oxi8AiNouAHvDSzHS0viUJc+V5vm3eq91Xwqn9dp4jRA==",
+      "license": "MIT",
+      "legalSourceId": "miller-rabin-readme"
+    },
+    {
+      "lockPath": "node_modules/minimalistic-crypto-utils",
+      "name": "minimalistic-crypto-utils",
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/minimalistic-crypto-utils/-/minimalistic-crypto-utils-1.0.1.tgz",
+      "integrity": "sha512-JIYlbt6g8i5jKfJ3xz7rF0LXmv2TkDxBLUkiBeZ7bAx4GnnNMr8xFpGnOxn6GhTEHx3SjRrZEoU+j04prX1ktg==",
+      "license": "MIT",
+      "legalSourceId": "minimalistic-crypto-utils-readme"
+    },
+    {
+      "lockPath": "node_modules/react-flip-toolkit",
+      "name": "react-flip-toolkit",
+      "version": "7.2.4",
+      "resolved": "https://registry.npmjs.org/react-flip-toolkit/-/react-flip-toolkit-7.2.4.tgz",
+      "integrity": "sha512-+aZBZwzHBDfJzMRLjAAOKiBkrk8PV0YFVE0k1x85+UsykApLwg8a0LlQ5H80uFltFZmGtrQ7EE1krhiZ1jI5ig==",
+      "license": "MIT",
+      "legalSourceId": "react-flip-toolkit"
+    },
+    {
+      "lockPath": "node_modules/react-resizable-panels",
+      "name": "react-resizable-panels",
+      "version": "3.0.6",
+      "resolved": "https://registry.npmjs.org/react-resizable-panels/-/react-resizable-panels-3.0.6.tgz",
+      "integrity": "sha512-b3qKHQ3MLqOgSS+FRYKapNkJZf5EQzuf6+RLiq1/IlTHw99YrZ2NJZLk4hQIzTnnIkRg2LUqyVinu6YWWpUYew==",
+      "license": "MIT",
+      "legalSourceId": "react-resizable-panels"
+    },
+    {
+      "lockPath": "node_modules/readable-stream/node_modules/isarray",
+      "name": "isarray",
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/isarray/-/isarray-1.0.0.tgz",
+      "integrity": "sha512-VLghIWNM6ELQzo7zwmcg0NmTVyWKYjvIeM83yjp0wRDTmUnrM678fQbcKBo6n2CJEF0szoG//ytg+TKla89ALQ==",
+      "license": "MIT",
+      "legalSourceId": "isarray-readme"
+    },
+    {
+      "lockPath": "node_modules/rehype-katex",
+      "name": "rehype-katex",
+      "version": "6.0.3",
+      "resolved": "https://registry.npmjs.org/rehype-katex/-/rehype-katex-6.0.3.tgz",
+      "integrity": "sha512-ByZlRwRUcWegNbF70CVRm2h/7xy7jQ3R9LaY4VVSvjnoVWwWVhNL60DiZsBpC5tSzYQOCvDbzncIpIjPZWodZA==",
+      "license": "MIT",
+      "legalSourceId": "rehype-katex"
+    },
+    {
+      "lockPath": "node_modules/remark-math",
+      "name": "remark-math",
+      "version": "6.0.0",
+      "resolved": "https://registry.npmjs.org/remark-math/-/remark-math-6.0.0.tgz",
+      "integrity": "sha512-MMqgnP74Igy+S3WwnhQ7kqGlEerTETXMvJhrUzDikVZ2/uogJCb+WHUg97hK9/jcfc0dkD73s3LN8zU49cTEtA==",
+      "license": "MIT",
+      "legalSourceId": "remark-math"
+    }
+  ],
+  "supplementalNotices": [
+    {
+      "sourceId": "adobe-react-spectrum-notice",
+      "packageBindings": [
+        {
+          "lockPath": "node_modules/react-aria",
+          "name": "react-aria",
+          "version": "3.50.0",
+          "resolved": "https://registry.npmjs.org/react-aria/-/react-aria-3.50.0.tgz",
+          "integrity": "sha512-S0Os6QZk33fzUAKu1QLT9afoUaCBt1ZNdoiq0n2YMVgKIdNIQS8zxiZ8O9hYE6QyDkHKjD6q39LQZ+qaSAIgjw=="
+        },
+        {
+          "lockPath": "node_modules/react-stately",
+          "name": "react-stately",
+          "version": "3.48.0",
+          "resolved": "https://registry.npmjs.org/react-stately/-/react-stately-3.48.0.tgz",
+          "integrity": "sha512-ImicSAG+lTotAe5izcs1fz49Zk48w7pDusqYg04WaPhCoej8BJ24soMu3iLXIrsi273s4P1gZrYGrqReMfgEEA=="
+        }
+      ]
+    }
+  ]
+}

@@ -24,6 +24,8 @@ const {
   GenerationJobManager,
   createStreamServices,
   initializeFileStorage,
+  startSandpackBundlerServer,
+  resolveSandpackBundlerServerConfig,
 } = require('@librechat/api');
 const { connectDb, indexSync } = require('~/db');
 const initializeOAuthReconnectManager = require('./services/initializeOAuthReconnectManager');
@@ -42,6 +44,15 @@ const staticCache = require('./utils/staticCache');
 const noIndex = require('./middleware/noIndex');
 const { seedDatabase } = require('~/models');
 const routes = require('./routes');
+/* === VIVENTIUM START ===
+ * Feature: Process-private native API transport.
+ * Purpose: Prevent the native proxy from following an unrelated process that acquires the TCP port.
+ */
+const {
+  resolveNativeApiListenTarget,
+  secureNativeApiSocket,
+} = require('./services/viventium/nativeApiListen');
+// === VIVENTIUM END ===
 
 const { PORT, HOST, ALLOW_SOCIAL_LOGIN, DISABLE_COMPRESSION, TRUST_PROXY } = process.env ?? {};
 
@@ -49,6 +60,16 @@ const { PORT, HOST, ALLOW_SOCIAL_LOGIN, DISABLE_COMPRESSION, TRUST_PROXY } = pro
 const port = isNaN(Number(PORT)) ? 3080 : Number(PORT);
 const host = HOST || 'localhost';
 const trusted_proxy = Number(TRUST_PROXY) || 1; /* trust first proxy by default */
+/* === VIVENTIUM START ===
+ * Feature: Process-private native API transport.
+ * Purpose: Preserve upstream TCP behavior unless the native runtime explicitly supplies a socket.
+ */
+const apiListenTarget = resolveNativeApiListenTarget({
+  socketPath: process.env.VIVENTIUM_NATIVE_API_SOCKET,
+  port,
+  host,
+});
+// === VIVENTIUM END ===
 
 const app = express();
 
@@ -71,6 +92,30 @@ const startServer = async () => {
   initializeFileStorage(appConfig);
   await performStartupChecks(appConfig);
   await updateInterfacePermissions(appConfig);
+
+  /* === VIVENTIUM START ===
+   * Feature: Isolated local Sandpack runtime.
+   * Purpose: Source and Docker profiles can serve the verified browser runtime from a separate
+   * origin without another dependency. Native deliberately leaves this disabled because its
+   * hardened frontend proxy owns the isolated listener.
+   */
+  try {
+    const sandpackServerConfig = resolveSandpackBundlerServerConfig({
+      distPath: appConfig.paths.dist,
+      env: process.env,
+    });
+    if (sandpackServerConfig) {
+      await startSandpackBundlerServer(sandpackServerConfig);
+      logger.info(
+        `Isolated Sandpack runtime listening at http://${sandpackServerConfig.host}:${sandpackServerConfig.port}`,
+      );
+    }
+  } catch (sandpackServerError) {
+    logger.error('Failed to start isolated Sandpack runtime:', sandpackServerError);
+    process.exit(1);
+    return;
+  }
+  // === VIVENTIUM END ===
 
   const indexPath = path.join(appConfig.paths.dist, 'index.html');
   let indexHTML = fs.readFileSync(indexPath, 'utf8');
@@ -226,19 +271,33 @@ const startServer = async () => {
   /** Error handler (must be last - Express identifies error middleware by its 4-arg signature) */
   app.use(ErrorController);
 
-  app.listen(port, host, async (err) => {
+  /* === VIVENTIUM START ===
+   * Feature: Process-private native API transport.
+   * Purpose: A private Unix socket binds this server instance to its owning native proxy.
+   */
+  app.listen(...apiListenTarget.args, async (err) => {
     if (err) {
       logger.error('Failed to start server:', err);
       process.exit(1);
     }
 
-    if (host === '0.0.0.0') {
+    if (apiListenTarget.socketPath) {
+      try {
+        secureNativeApiSocket(apiListenTarget.socketPath);
+      } catch (socketSecurityError) {
+        logger.error('Failed to secure native API socket:', socketSecurityError);
+        process.exit(1);
+        return;
+      }
+      logger.info(`Server listening on native API socket ${apiListenTarget.socketPath}`);
+    } else if (host === '0.0.0.0') {
       logger.info(
         `Server listening on all interfaces at port ${port}. Use http://localhost:${port} to access it`,
       );
     } else {
       logger.info(`Server listening at http://${host == '0.0.0.0' ? 'localhost' : host}:${port}`);
     }
+    // === VIVENTIUM END ===
 
     await initializeMCPs();
     await initializeOAuthReconnectManager();

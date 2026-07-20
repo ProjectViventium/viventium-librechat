@@ -20,7 +20,9 @@ import { logger, validateFiles, cachePreview, getCachedPreview, removePreviewEnt
 import { useGetFileConfig, useUploadFileMutation } from '~/data-provider';
 import useLocalize, { TranslationKeys } from '~/hooks/useLocalize';
 import { useDelayedUploadToast } from './useDelayedUploadToast';
-import { processFileForUpload } from '~/utils/heicConverter';
+/* VIVENTIUM START — typed Native/browser HEIC recovery messages. */
+import { HeicConversionError, processFileForUpload } from '~/utils/heicConverter';
+/* VIVENTIUM END */
 import { useChatContext } from '~/Providers/ChatContext';
 import { ephemeralAgentByConvoId } from '~/store';
 import useClientResize from './useClientResize';
@@ -427,11 +429,17 @@ const useFileHandlingCore = (params: UseFileHandling | undefined, fileState: Fil
       } catch (error) {
         deleteFileById(file_id);
         console.log('file handling error', error);
-        if (error instanceof Error && error.message.includes('HEIC')) {
+        /* VIVENTIUM START — actionable HEIC failure states. */
+        if (error instanceof HeicConversionError && error.code === 'unsupported') {
+          setError('com_error_heic_unsupported');
+        } else if (error instanceof HeicConversionError && error.code === 'busy') {
+          setError('com_error_heic_busy');
+        } else if (error instanceof HeicConversionError) {
           setError('com_error_heic_conversion');
         } else {
           setError('com_error_files_process');
         }
+        /* VIVENTIUM END */
       }
     }
   };

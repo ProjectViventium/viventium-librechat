@@ -1,4 +1,5 @@
 import react from '@vitejs/plugin-react';
+import fs from 'fs';
 import path from 'path';
 import { defineConfig, loadEnv } from 'vite';
 import { createRequire } from 'module';
@@ -28,6 +29,29 @@ const NODE_POLYFILL_SHIMS: Record<string, string> = {
     'vite-plugin-node-polyfills/shims/global',
   ),
 };
+
+/* === VIVENTIUM START ===
+ * Feature: Browser-only dependency adapters and compiled compliance inventory.
+ *
+ * sandpack-react imports the aggregate sandpack-client entry, whose template switch makes Rollup
+ * retain the Node client and @codesandbox/nodebox even though Viventium only creates static and
+ * browser-runtime artifacts. Route that exact aggregate import through a browser-only adapter.
+ * Static artifacts also use SandpackRuntime: the published static-browser-server package omits the
+ * license file declared by its package metadata, so it cannot satisfy Viventium's fail-closed
+ * shipped-notice gate. A package upgrade must review whether that upstream defect has been fixed.
+ * Small compatibility adapters also preserve the browser contracts of transitive packages whose
+ * published tarballs have no exact legal text, without redistributing those package bytes.
+ */
+const SANDPACK_BROWSER_ADAPTER = path.resolve(__dirname, 'src/utils/sandpackClientAdapter.ts');
+const SANDPACK_COMPLIANCE_DIRECTORY = path.resolve(__dirname, 'dist-compliance');
+const HTML_AST_ADAPTER = path.resolve(__dirname, 'src/utils/htmlAstAdapter.ts');
+const NATIVE_INTERSECTION_OBSERVER = path.resolve(
+  __dirname,
+  'src/utils/nativeIntersectionObserver.ts',
+);
+const SCROLL_BAR_ADAPTER = path.resolve(__dirname, 'src/utils/scrollBarAdapter.tsx');
+const USE_COMPOSED_REF_ADAPTER = path.resolve(__dirname, 'src/utils/useComposedRefAdapter.ts');
+/* === VIVENTIUM END === */
 
 /* === VIVENTIUM START ===
  * Feature: Launcher-aware frontend proxy target resolution.
@@ -162,6 +186,7 @@ export default defineConfig(({ command, mode }) => {
       compression({
         threshold: 10240,
       }),
+      browserModuleClosure(),
     ],
     publicDir: './public',
     build: {
@@ -281,10 +306,6 @@ export default defineConfig(({ command, mode }) => {
               if (normalizedId.includes('react-select') || normalizedId.includes('downshift')) {
                 return 'advanced-inputs';
               }
-              if (normalizedId.includes('heic-to')) {
-                return 'heic-converter';
-              }
-
               // Existing chunks
               if (normalizedId.includes('@radix-ui')) {
                 return 'radix-ui';
@@ -354,11 +375,40 @@ export default defineConfig(({ command, mode }) => {
       chunkSizeWarningLimit: 4000,
     },
     resolve: {
-      alias: {
-        '~': path.join(__dirname, 'src/'),
-        $fonts: path.resolve(__dirname, 'public/fonts'),
-        'micromark-extension-math': 'micromark-extension-llm-math',
-      },
+      alias: [
+        /* === VIVENTIUM START ===
+         * The exact alias intentionally leaves the official runtime and other Sandpack subpaths
+         * untouched. The adapter rejects `node` and imports only the browser runtime client.
+         */
+        {
+          find: /^@codesandbox\/sandpack-client$/,
+          replacement: SANDPACK_BROWSER_ADAPTER,
+        },
+        /* Project-owned implementations of the narrow browser contracts used by upstream. */
+        {
+          find: /^html-parse-stringify$/,
+          replacement: HTML_AST_ADAPTER,
+        },
+        {
+          find: /^intersection-observer$/,
+          replacement: NATIVE_INTERSECTION_OBSERVER,
+        },
+        {
+          find: /^react-remove-scroll-bar(?:\/constants)?$/,
+          replacement: SCROLL_BAR_ADAPTER,
+        },
+        {
+          find: /^use-composed-ref$/,
+          replacement: USE_COMPOSED_REF_ADAPTER,
+        },
+        /* === VIVENTIUM END === */
+        { find: '~', replacement: path.join(__dirname, 'src/') },
+        { find: '$fonts', replacement: path.resolve(__dirname, 'public/fonts') },
+        {
+          find: 'micromark-extension-math',
+          replacement: 'micromark-extension-llm-math',
+        },
+      ],
     },
   };
 });
@@ -381,3 +431,85 @@ export function sourcemapExclude(opts?: SourcemapExclude): Plugin {
     },
   };
 }
+
+/* === VIVENTIUM START ===
+ * Feature: Fail-closed compiled-browser dependency/license closure.
+ * Purpose: Preserve a normalized package-lock inventory for every package contributing bytes to
+ * emitted client chunks, outside the served frontend, before production dependency pruning removes
+ * browser-only package roots.
+ */
+export function browserModuleClosure(): Plugin {
+  function packageLockPathForModule(moduleId: string) {
+    const normalizedId = moduleId.replace(/^\0+/, '').replace(/\\/g, '/').split('?')[0];
+    const marker = '/node_modules/';
+    const markerIndex = normalizedId.lastIndexOf(marker);
+    if (markerIndex < 0) {
+      return null;
+    }
+
+    const packageSegments = normalizedId.slice(markerIndex + marker.length).split('/');
+    const packageSegmentCount = packageSegments[0]?.startsWith('@') ? 2 : 1;
+    if (packageSegments.length < packageSegmentCount) {
+      throw new Error(`Unable to resolve package root for rendered module: ${moduleId}`);
+    }
+
+    const packageRoot = normalizedId
+      .slice(0, markerIndex + marker.length)
+      .concat(packageSegments.slice(0, packageSegmentCount).join('/'));
+    const lockPath = path.relative(path.resolve(__dirname, '..'), packageRoot).replace(/\\/g, '/');
+    if (
+      !lockPath.split('/').includes('node_modules') ||
+      path.isAbsolute(lockPath) ||
+      lockPath.split('/').includes('..')
+    ) {
+      throw new Error('Rendered browser dependency did not map to a safe package-lock path');
+    }
+    return lockPath;
+  }
+
+  return {
+    name: 'viventium-browser-module-closure',
+    apply: 'build',
+    buildStart() {
+      fs.rmSync(SANDPACK_COMPLIANCE_DIRECTORY, { recursive: true, force: true });
+    },
+    generateBundle(_outputOptions, bundle) {
+      const renderedPackageLockPaths = new Set<string>();
+      for (const output of Object.values(bundle)) {
+        if (output.type === 'chunk') {
+          for (const [moduleId, renderedModule] of Object.entries(output.modules)) {
+            if (renderedModule.renderedLength > 0) {
+              const lockPath = packageLockPathForModule(moduleId);
+              if (lockPath) {
+                renderedPackageLockPaths.add(lockPath);
+              }
+            }
+          }
+        }
+      }
+
+      const packageLockPaths = [...renderedPackageLockPaths].sort();
+      if (!packageLockPaths.includes('node_modules/@codesandbox/sandpack-client')) {
+        throw new Error('Sandpack runtime package was absent from its rendered module closure');
+      }
+      if (
+        packageLockPaths.some(
+          (lockPath) =>
+            lockPath.includes('@codesandbox/nodebox') || lockPath.includes('static-browser-server'),
+        )
+      ) {
+        throw new Error(
+          'A forbidden Node/static Sandpack package entered the browser module closure',
+        );
+      }
+
+      fs.mkdirSync(SANDPACK_COMPLIANCE_DIRECTORY, { recursive: true });
+      fs.writeFileSync(
+        path.join(SANDPACK_COMPLIANCE_DIRECTORY, 'module-closure.json'),
+        `${JSON.stringify({ schemaVersion: 1, packageLockPaths }, null, 2)}\n`,
+        { encoding: 'utf8', mode: 0o644 },
+      );
+    },
+  };
+}
+/* === VIVENTIUM END === */

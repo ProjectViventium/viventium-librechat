@@ -280,6 +280,9 @@ export const mcpServer = (serverName: string) => `${BASE_URL}/api/mcp/servers/${
 export const revertAgentVersion = (agent_id: string) => `${agents({ path: `${agent_id}/revert` })}`;
 
 export const files = () => `${BASE_URL}/api/files`;
+/* VIVENTIUM START — local-only Native HEIC conversion fallback. */
+export const nativeHeicConvert = () => `${files()}/native-heic-convert`;
+/* VIVENTIUM END */
 export const fileUpload = () => `${BASE_URL}/api/files`;
 export const fileDelete = () => `${BASE_URL}/api/files`;
 export const fileDownload = (userId: string, fileId: string) =>

@@ -9,3 +9,12 @@ interface ImportMetaEnv {
 interface ImportMeta {
   readonly env: ImportMetaEnv;
 }
+
+/* VIVENTIUM START
+ * The published Sandpack package exposes runtime declarations through an exports subpath, but this
+ * client's legacy `moduleResolution: node` cannot resolve that conditional `types` entry.
+ */
+declare module '@codesandbox/sandpack-client/clients/runtime' {
+  export const SandpackRuntime: unknown;
+}
+/* VIVENTIUM END */

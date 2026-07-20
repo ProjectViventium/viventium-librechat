@@ -1,6 +1,10 @@
-const { ToolMessage } = require('@langchain/core/messages');
 const { EModelEndpoint, ContentTypes } = require('librechat-data-provider');
-const { HumanMessage, AIMessage, SystemMessage } = require('@langchain/core/messages');
+const {
+  AIMessage,
+  ToolMessage,
+  HumanMessage,
+  SystemMessage,
+} = require('@librechat/agents/langchain/messages');
 /* === VIVENTIUM START ===
  * Feature: Normalize legacy search-tool diagnostics before they re-enter model context.
  * === VIVENTIUM END === */
@@ -222,7 +226,7 @@ const formatAgentMessages = (payload) => {
         let args = _args;
         try {
           args = JSON.parse(_args);
-        } catch (e) {
+        } catch (_e) {
           if (typeof _args === 'string') {
             args = { input: _args };
           }

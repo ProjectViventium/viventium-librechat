@@ -12,6 +12,9 @@ const {
   updateUserPersonalization,
   createMemory,
   deleteMemory,
+  /* === VIVENTIUM START === Atomic memory-key rename. === */
+  renameMemory,
+  /* === VIVENTIUM END === */
   setMemory,
 } = require('~/models');
 const { requireJwtAuth, configMiddleware } = require('~/server/middleware');
@@ -68,6 +71,24 @@ function getMemoryPolicy(config) {
   };
 }
 
+/* === VIVENTIUM START ===
+ * Expose the CAS revision while keeping internal ownership and Mongoose state private.
+ */
+function serializeMemory(memory) {
+  if (!memory) {
+    return null;
+  }
+  return {
+    _id: memory._id != null ? String(memory._id) : undefined,
+    key: memory.key,
+    value: memory.value,
+    updated_at: memory.updated_at,
+    tokenCount: memory.tokenCount || 0,
+    revision: Number(memory.__v ?? 0),
+  };
+}
+/* === VIVENTIUM END === */
+
 async function runRouteMemoryMaintenance({ userId, policy }) {
   await runMemoryMaintenance({
     userId: String(userId),
@@ -112,7 +133,9 @@ router.get('/', checkMemoryRead, configMiddleware, async (req, res) => {
     }
 
     res.json({
-      memories: sortedMemories,
+      /* === VIVENTIUM START === Return the public revision-safe shape. === */
+      memories: sortedMemories.map(serializeMemory),
+      /* === VIVENTIUM END === */
       totalTokens,
       tokenLimit: tokenLimit || null,
       charLimit,
@@ -203,7 +226,9 @@ router.post('/', memoryPayloadLimit, checkMemoryCreate, configMiddleware, async 
     const updatedMemories = await getAllUserMemories(req.user.id);
     const newMemory = updatedMemories.find((m) => m.key === key.trim());
 
-    res.status(201).json({ created: true, memory: newMemory });
+    /* === VIVENTIUM START === Return the public revision-safe shape. === */
+    res.status(201).json({ created: true, memory: serializeMemory(newMemory) });
+    /* === VIVENTIUM END === */
   } catch (error) {
     if (error.message && error.message.includes('already exists')) {
       return res.status(409).json({ error: 'Memory with this key already exists.' });
@@ -269,7 +294,16 @@ router.patch('/preferences', checkMemoryOptOut, async (req, res) => {
  */
 router.patch('/:key', memoryPayloadLimit, checkMemoryUpdate, configMiddleware, async (req, res) => {
   const { key: urlKey } = req.params;
-  const { key: bodyKey, value } = req.body || {};
+  /* === VIVENTIUM START ===
+   * Require compare-and-swap state for edits and compensate a conflicted rename without data loss.
+   */
+  const { key: bodyKey, value, expectedRevision } = req.body || {};
+
+  if (!Number.isInteger(expectedRevision) || expectedRevision < 0) {
+    return res.status(409).json({
+      error: 'Memory changed or is missing revision state. Refresh memories and try again.',
+    });
+  }
 
   if (typeof value !== 'string' || value.trim() === '') {
     return res.status(400).json({ error: 'Value is required and must be a non-empty string.' });
@@ -332,20 +366,23 @@ router.patch('/:key', memoryPayloadLimit, checkMemoryUpdate, configMiddleware, a
         });
       }
 
-      const createResult = await createMemory({
+      const renameResult = await renameMemory({
         userId: req.user.id,
-        key: newKey,
+        key: urlKey,
+        newKey,
         value: nextValue,
         tokenCount,
+        expectedRevision,
       });
-
-      if (!createResult.ok) {
-        return res.status(500).json({ error: 'Failed to create new memory.' });
-      }
-
-      const deleteResult = await deleteMemory({ userId: req.user.id, key: urlKey });
-      if (!deleteResult.ok) {
-        return res.status(500).json({ error: 'Failed to delete old memory.' });
+      if (!renameResult.ok) {
+        if (renameResult.conflictReason === 'target_key_reserved') {
+          return res.status(409).json({
+            error: 'That memory key is already reserved. Choose a different key.',
+          });
+        }
+        return res.status(409).json({
+          error: 'Memory changed while it was being renamed. Refresh memories and try again.',
+        });
       }
     } else {
       const updateEvaluation = evaluateMemoryWrite({
@@ -370,9 +407,15 @@ router.patch('/:key', memoryPayloadLimit, checkMemoryUpdate, configMiddleware, a
         key: newKey,
         value: nextValue,
         tokenCount,
+        expectedRevision,
       });
 
       if (!result.ok) {
+        if (result.conflict) {
+          return res.status(409).json({
+            error: 'Memory changed while it was being edited. Refresh memories and try again.',
+          });
+        }
         return res.status(500).json({ error: 'Failed to update memory.' });
       }
     }
@@ -385,10 +428,14 @@ router.patch('/:key', memoryPayloadLimit, checkMemoryUpdate, configMiddleware, a
     const updatedMemories = await getAllUserMemories(req.user.id);
     const updatedMemory = updatedMemories.find((m) => m.key === newKey);
 
-    res.json({ updated: true, memory: updatedMemory });
+    res.json({ updated: true, memory: serializeMemory(updatedMemory) });
   } catch (error) {
+    if (error.message && error.message.includes('already exists')) {
+      return res.status(409).json({ error: 'Memory with this key already exists.' });
+    }
     res.status(500).json({ error: error.message });
   }
+  /* === VIVENTIUM END === */
 });
 
 /**
@@ -398,11 +445,24 @@ router.patch('/:key', memoryPayloadLimit, checkMemoryUpdate, configMiddleware, a
  */
 router.delete('/:key', checkMemoryDelete, async (req, res) => {
   const { key } = req.params;
+  /* === VIVENTIUM START === Require compare-and-swap state for saved-memory deletion. === */
+  const expectedRevision = Number(req.query?.revision);
+
+  if (!Number.isInteger(expectedRevision) || expectedRevision < 0) {
+    return res.status(409).json({
+      error: 'Memory changed or is missing revision state. Refresh memories and try again.',
+    });
+  }
 
   try {
-    const result = await deleteMemory({ userId: req.user.id, key });
+    const result = await deleteMemory({ userId: req.user.id, key, expectedRevision });
 
     if (!result.ok) {
+      if (result.conflict) {
+        return res.status(409).json({
+          error: 'Memory changed while it was being deleted. Refresh memories and try again.',
+        });
+      }
       return res.status(404).json({ error: 'Memory not found.' });
     }
 
@@ -410,6 +470,7 @@ router.delete('/:key', checkMemoryDelete, async (req, res) => {
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
+  /* === VIVENTIUM END === */
 });
 
 module.exports = router;

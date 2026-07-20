@@ -19,7 +19,7 @@
 require('events').EventEmitter.defaultMaxListeners = 100;
 const crypto = require('crypto');
 const { logger } = require('@librechat/data-schemas');
-const { HumanMessage } = require('@langchain/core/messages');
+const { getBufferString, HumanMessage } = require('@librechat/agents/langchain/messages');
 const {
   createRun,
   recordCollectedUsage: recordCollectedUsageWithDeps,
@@ -82,11 +82,43 @@ const { loadAgent } = require('~/models/Agent');
 const { getMCPManager } = require('~/config');
 const db = require('~/models');
 const { updateBalance, bulkInsertTransactions } = require('~/models');
-const { logFeelingsEvent } = require('~/server/services/viventium/feelingsTelemetry');
+const {
+  logFeelingsEvent,
+  summarizeFeelingCapsulePlacement,
+} = require('~/server/services/viventium/feelingsTelemetry');
+const {
+  pinFeelingCapsuleLast,
+} = require('~/server/services/viventium/feelingPromptTail');
 const {
   scheduleEmotionalReaction,
 } = require('~/server/services/viventium/EmotionalReactionService');
 const { enqueueUserMemoryWriter } = require('~/server/services/viventium/memoryWriterCoordinator');
+
+/* === VIVENTIUM START ===
+ * Classify the detached writer from its structured memory artifact. A completed provider call is
+ * not a successful memory run when storage policy rejected the write.
+ */
+function classifyMemoryWriterResult(result) {
+  if (result == null) {
+    return 'processor_failed';
+  }
+  for (const attachment of result) {
+    const artifact = attachment?.[Tools.memory];
+    if (artifact?.type !== 'error') {
+      continue;
+    }
+    try {
+      const details = JSON.parse(String(artifact.value ?? ''));
+      return typeof details?.errorType === 'string' && details.errorType
+        ? details.errorType
+        : 'memory_error';
+    } catch {
+      return 'memory_error';
+    }
+  }
+  return null;
+}
+/* === VIVENTIUM END === */
 
 /* === VIVENTIUM START ===
  * Feature: Scope-aware Feelings dynamic tail.
@@ -1045,11 +1077,55 @@ function getCompletionErrorMessage(err) {
   return String(err);
 }
 
+function getCompletionErrorChain(err, maxNodes = 8) {
+  const chain = [];
+  const queue = [err];
+  const seen = new Set();
+  while (queue.length > 0 && chain.length < maxNodes) {
+    const current = queue.shift();
+    if (current == null || seen.has(current)) {
+      continue;
+    }
+    if (typeof current !== 'object') {
+      chain.push(current);
+      continue;
+    }
+    seen.add(current);
+    chain.push(current);
+    for (const nested of [
+      current.cause,
+      current.error,
+      current.originalError,
+      current.reason,
+      current.response?.data,
+      current.response?.data?.error,
+      current.body,
+      current.body?.error,
+    ]) {
+      if (nested != null && !seen.has(nested)) {
+        queue.push(nested);
+      }
+    }
+  }
+  return chain;
+}
+
 function classifyCompletionErrorForLog(err) {
-  const message = getCompletionErrorMessage(err).trim().toLowerCase();
-  const code = String(err?.code || err?.lc_error_code || err?.error?.code || '')
-    .trim()
-    .toLowerCase();
+  const errorChain = getCompletionErrorChain(err);
+  const message = errorChain
+    .map((candidate) => getCompletionErrorMessage(candidate).trim().toLowerCase())
+    .filter(Boolean)
+    .join('\n');
+  const codes = errorChain.map((candidate) =>
+    String(candidate?.code || candidate?.lc_error_code || '')
+      .trim()
+      .toLowerCase(),
+  );
+  const statuses = errorChain.flatMap((candidate) => [
+    candidate?.status,
+    candidate?.statusCode,
+    candidate?.response?.status,
+  ]);
   /* === VIVENTIUM START ===
    * Feature: Post-stream finalization error handling.
    * Purpose: Distinguish provider/stream failures from deterministic cleanup work that runs only
@@ -1067,7 +1143,7 @@ function classifyCompletionErrorForLog(err) {
   if (isLocalRetrievalTimeoutError(err)) {
     return 'local_retrieval_timeout';
   }
-  if (isConnectedAccountReconnectError(err)) {
+  if (errorChain.some((candidate) => isConnectedAccountReconnectError(candidate))) {
     return 'provider_connected_account_reconnect_required';
   }
   if (
@@ -1075,18 +1151,18 @@ function classifyCompletionErrorForLog(err) {
     message.includes('rate_limit') ||
     message.includes('rate-limited') ||
     message.includes('rate limited') ||
-    err?.status === 429
+    statuses.includes(429)
   ) {
     return 'provider_rate_limited';
   }
   if (
-    code === 'server_is_overloaded' ||
+    codes.includes('server_is_overloaded') ||
     message.includes('server_is_overloaded') ||
     message.includes('server is overloaded') ||
     message.includes('servers are currently overloaded') ||
     message.includes('temporarily unavailable') ||
-    err?.status === 503 ||
-    err?.status === 529
+    statuses.includes(503) ||
+    statuses.includes(529)
   ) {
     return 'provider_temporarily_unavailable';
   }
@@ -1094,14 +1170,17 @@ function classifyCompletionErrorForLog(err) {
     message.includes('unauthorized') ||
     message.includes('invalid x-api-key') ||
     message.includes('invalid api key') ||
+    message.includes('incorrect api key') ||
+    /^\s*(401|403)\b/.test(message) ||
     message.includes('authentication_error') ||
-    code === 'authentication_error' ||
-    code === 'invalid_api_key' ||
-    err?.status === 401
+    codes.includes('authentication_error') ||
+    codes.includes('invalid_api_key') ||
+    codes.includes('model_authentication') ||
+    statuses.includes(401)
   ) {
     return 'provider_unauthorized';
   }
-  if (message.includes('forbidden') || err?.status === 403) {
+  if (message.includes('forbidden') || statuses.includes(403)) {
     return 'provider_access_denied';
   }
   if (message.includes('context length') || message.includes('maximum context')) {
@@ -1197,13 +1276,29 @@ function createFallbackInitializationError(fallbackError, contentParts) {
 }
 /* === VIVENTIUM END === */
 
+/* === VIVENTIUM START ===
+ * Feature: Safe nested completion-error diagnostics.
+ * Purpose: Preserve structured classification from wrapped provider failures without logging
+ * credential-bearing messages or stacks.
+ */
 function sanitizeCompletionErrorForLog(err) {
   const errorClass = classifyCompletionErrorForLog(err);
+  const errorChain = getCompletionErrorChain(err);
+  const structured = errorChain.find((candidate) => candidate && typeof candidate === 'object');
+  const status = errorChain
+    .flatMap((candidate) => [candidate?.status, candidate?.statusCode, candidate?.response?.status])
+    .find((value) => Number.isFinite(value));
+  const code = errorChain
+    .map((candidate) => candidate?.code || candidate?.lc_error_code)
+    .find((value) => value != null && value !== '');
+  const diagnosticText = errorChain.map(getCompletionErrorMessage).filter(Boolean).join('\n');
   const sanitized = {
     class: errorClass,
-    name: err?.name || null,
-    status: Number.isFinite(err?.status) ? err.status : null,
-    code: err?.code || err?.lc_error_code || null,
+    name: structured?.name || null,
+    status: status ?? null,
+    code: code || null,
+    chainDepth: errorChain.length,
+    messageHash: diagnosticText ? hashCompletionTextForLog(diagnosticText) : null,
   };
   if (errorClass === 'provider_connected_account_reconnect_required') {
     sanitized.action = 'reconnect_connected_account';
@@ -1211,6 +1306,7 @@ function sanitizeCompletionErrorForLog(err) {
   }
   return sanitized;
 }
+/* === VIVENTIUM END === */
 
 function hashCompletionTextForLog(text, length = 12) {
   return crypto
@@ -2182,6 +2278,10 @@ class AgentClient extends BaseClient {
           version: feelingSnapshot?.version ?? 0,
           snapshotHash: feelingSnapshot?.snapshotHash || 'none',
           cacheHit: feelingSnapshot?.cacheHit === true,
+          rangePromptOverrideCount: feelingSnapshot?.rangePromptOverrideCount ?? 0,
+          activeRangePromptOverrideCount:
+            feelingSnapshot?.activeRangePromptOverrideCount ?? 0,
+          activeRangePromptOverrideChars: feelingSnapshot?.activeRangePromptOverrideChars ?? 0,
           durationMs: Date.now() - feelingReadStartedAt,
         });
       } catch (error) {
@@ -2496,6 +2596,9 @@ class AgentClient extends BaseClient {
       participatingAgentCount: allAgents.length,
       injectedAgentCount: feelingsInjectedAgentCount,
       skippedAgentCount: allAgents.length - feelingsInjectedAgentCount,
+      rangePromptOverrideCount: feelingSnapshot?.rangePromptOverrideCount ?? 0,
+      activeRangePromptOverrideCount: feelingSnapshot?.activeRangePromptOverrideCount ?? 0,
+      activeRangePromptOverrideChars: feelingSnapshot?.activeRangePromptOverrideChars ?? 0,
     });
     promptFrameLayers.shared_run_context = sharedRunContext;
     promptFrameLayers.primary_final_instructions = this.options.agent?.instructions || '';
@@ -2621,6 +2724,10 @@ class AgentClient extends BaseClient {
       deleteMemory: db.deleteMemory,
       getFormattedMemories: db.getFormattedMemories,
       getAllUserMemories: db.getAllUserMemories,
+      /* === VIVENTIUM START ===
+       * The detached writer snapshot needs tombstone revisions for atomic compare-and-set writes.
+       * === VIVENTIUM END === */
+      getAllUserMemoryStates: db.getAllUserMemoryStates,
     };
     const memoryPolicyConfig = {
       validKeys: memoryConfig.validKeys,
@@ -3058,8 +3165,14 @@ class AgentClient extends BaseClient {
       }
 
       const result = await this.processMemory([bufferMessage]);
+      const memoryFailure = classifyMemoryWriterResult(result);
       if (isDeepTimingEnabled(req)) {
-        logDeepTiming(req, 'memory_run_done', memStart, 'status=ok');
+        logDeepTiming(
+          req,
+          'memory_run_done',
+          memStart,
+          memoryFailure ? `status=error failure=${memoryFailure}` : 'status=ok',
+        );
       }
       return result;
     } catch (error) {
@@ -3912,6 +4025,13 @@ class AgentClient extends BaseClient {
             this.feelingSnapshot?.agentScope === 'all_agents'
               ? this.feelingSnapshot?.snapshotHash || ''
               : '',
+          glasshive_worker_feelings_scope: this.feelingSnapshot?.agentScope || 'unknown',
+          glasshive_worker_feelings_range_prompt_override_count:
+            this.feelingSnapshot?.rangePromptOverrideCount ?? 0,
+          glasshive_worker_feelings_active_range_prompt_override_count:
+            this.feelingSnapshot?.activeRangePromptOverrideCount ?? 0,
+          glasshive_worker_feelings_active_range_prompt_override_chars:
+            this.feelingSnapshot?.activeRangePromptOverrideChars ?? 0,
         },
         recursionLimit: agentsEConfig?.recursionLimit ?? 25,
         signal: abortController.signal,
@@ -4991,6 +5111,51 @@ class AgentClient extends BaseClient {
           }
         }
         /* === VIVENTIUM NOTE END === */
+        /* === VIVENTIUM START ===
+         * Feature: Final Feeling authority after surface assembly.
+         * Purpose: Surface/no-response contracts are assembled first; the exact pinned capsule is
+         * then moved (not copied) to the final instruction layer for every in-scope speaking agent.
+         * === VIVENTIUM END === */
+        for (const agent of agents) {
+          if (!agent || typeof agent !== 'object') continue;
+          const capsule = feelingTailForAgent({
+            snapshot: this.feelingSnapshot,
+            agentId: agent.id,
+            primaryAgentId: this.options.agent.id,
+          });
+          if (capsule) {
+            agent.instructions = pinFeelingCapsuleLast({
+              instructions: agent.instructions || '',
+              capsule,
+            });
+          }
+          const placement = summarizeFeelingCapsulePlacement({
+            instructions: agent.instructions || '',
+            capsule,
+          });
+          logFeelingsEvent(logger, req, 'feelings.inject.final_run', {
+            route:
+              agent.id === this.options.agent.id
+                ? 'main_conscious_agent'
+                : 'in_process_participant',
+            agentIdHash: hashCompletionTextForLog(agent.id || 'unknown'),
+            enabled: this.feelingSnapshot?.enabled === true,
+            scope: this.feelingSnapshot?.agentScope || 'unknown',
+            snapshotHash: this.feelingSnapshot?.snapshotHash || 'none',
+            rangePromptOverrideCount: this.feelingSnapshot?.rangePromptOverrideCount ?? 0,
+            activeRangePromptOverrideCount:
+              this.feelingSnapshot?.activeRangePromptOverrideCount ?? 0,
+            activeRangePromptOverrideChars:
+              this.feelingSnapshot?.activeRangePromptOverrideChars ?? 0,
+            injected: placement.presentInFinalRun,
+            ...placement,
+          });
+        }
+        const finalFeelingCapsule = feelingTailForAgent({
+          snapshot: this.feelingSnapshot,
+          agentId: agents[0]?.id,
+          primaryAgentId: this.options.agent.id,
+        });
         logPromptFrame(
           logger,
           buildPromptFrame({
@@ -5001,6 +5166,7 @@ class AgentClient extends BaseClient {
             authClass: userMCPAuthMap ? 'connected_account_runtime' : 'user_runtime',
             layers: {
               primary_run_instructions: agents[0]?.instructions || '',
+              viventium_feeling_state: finalFeelingCapsule,
               additional_run_instructions: agents
                 .slice(1)
                 .map((agent) => agent?.instructions || '')
@@ -5865,5 +6031,6 @@ module.exports.createCortexPersistenceCoordinator = createCortexPersistenceCoord
 module.exports.feelingTailForAgent = feelingTailForAgent;
 module.exports.externalUserStimulusForReaction = externalUserStimulusForReaction;
 module.exports.evalIsolationForRequest = evalIsolationForRequest;
+module.exports.classifyMemoryWriterResult = classifyMemoryWriterResult;
 
 /* === VIVENTIUM END === */

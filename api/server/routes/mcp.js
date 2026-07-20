@@ -950,7 +950,12 @@ router.post('/:serverName/reinitialize', requireJwtAuth, setOAuthSession, async 
       userMCPAuthMap,
     });
 
-    if (!result) {
+    /* === VIVENTIUM START ===
+     * Feature: Stable MCP reinitialization HTTP failure semantics.
+     * Purpose: Structured service failures remain observable internally while
+     * preserving the existing non-success HTTP contract for clients.
+     * === VIVENTIUM END === */
+    if (!result || result.failureClass) {
       return res.status(500).json({ error: 'Failed to reinitialize MCP server for user' });
     }
 

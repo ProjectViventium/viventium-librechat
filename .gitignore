@@ -188,12 +188,17 @@ claude-flow
 hive-mind-prompt-*.txt
 
 # Viventium public-release hardening
-        .env
-        .env.*
-        !.env.example
-        node_modules/
-        .venv*/
-        __pycache__/
-        .local_artifacts/
-        tmp/
-        backups/
+.env
+.env.*
+!.env.example
+node_modules/
+.venv*/
+__pycache__/
+.local_artifacts/
+tmp/
+backups/
+artifacts/
+*.mp4
+*.mov
+*.webm
+*.har

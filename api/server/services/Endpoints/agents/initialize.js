@@ -69,7 +69,14 @@ const {
   isFallbackModelValid,
   buildFallbackAgent,
   isSameAgentRoute,
+  initializePrimaryAgentWithFallback,
 } = require('~/server/services/viventium/agentLlmFallback');
+const {
+  markOptionalAgentInitializationFailed,
+} = require('~/server/services/viventium/agentGraphResilience');
+const {
+  applyScheduledAgentOverride,
+} = require('~/server/services/viventium/scheduledAgentOverride');
 /* === VIVENTIUM END === */
 
 /* === VIVENTIUM START ===
@@ -490,6 +497,20 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
   /* === VIVENTIUM NOTE END === */
 
   /* === VIVENTIUM START ===
+   * Feature: Scheduled-agent execution policy
+   * Purpose: Authenticated scheduled runs use their compiled automation tuple while
+   * ordinary conscious chat keeps its independent latency/effort setting.
+   * === VIVENTIUM END === */
+  applyScheduledAgentOverride(primaryAgent, req);
+  if (req.viventiumScheduledAgentExecution) {
+    const { provider, model, reasoning_effort: reasoningEffort } =
+      req.viventiumScheduledAgentExecution;
+    logger.info(
+      `[scheduledAgent] Applied authenticated execution tuple provider=${provider} model=${model} effort=${reasoningEffort}`,
+    );
+  }
+
+  /* === VIVENTIUM START ===
    * Feature: Voice Chat LLM Override
    * Apply voice model swap BEFORE validateAgentModel so the voice model gets validated.
    * Added: 2026-02-24
@@ -581,21 +602,66 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
 
   const initPrimaryStart = nowIfDeep();
   const voiceInitPrimaryStart = voiceLatencyEnabled ? voiceLatencyNow() : null;
-  const primaryConfig = await initializeAgent(
-    {
-      req,
-      res,
-      loadTools,
-      requestFiles,
-      conversationId,
-      parentMessageId,
-      agent: primaryAgent,
-      endpointOption,
-      allowedProviders,
-      isInitialAgent: true,
-    },
-    dbMethods,
-  );
+  /* === VIVENTIUM START ===
+   * Feature: Provider fallback during agent initialization
+   * Purpose: Provider auth is resolved inside initializeAgent. If it fails before AgentClient
+   * exists, recover once through the already validated, user-configured fallback route so web,
+   * Telegram, and voice share the same fallback contract.
+   * Added: 2026-07-13
+   */
+  const initializeConfiguredPrimary = (agent) =>
+    initializeAgent(
+      {
+        req,
+        res,
+        loadTools,
+        requestFiles,
+        conversationId,
+        parentMessageId,
+        agent,
+        endpointOption,
+        allowedProviders,
+        isInitialAgent: true,
+      },
+      dbMethods,
+    );
+  const initializeConfiguredFallback = async () => {
+    const previousOpenAIPlatformFallbackFlag =
+      req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure;
+    req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure = true;
+    try {
+      return await initializeConfiguredPrimary(fallbackAgent);
+    } finally {
+      if (previousOpenAIPlatformFallbackFlag === undefined) {
+        delete req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure;
+      } else {
+        req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure =
+          previousOpenAIPlatformFallbackFlag;
+      }
+    }
+  };
+  const primaryInitialization = await initializePrimaryAgentWithFallback({
+    primaryAgent,
+    fallbackAgent,
+    fallbackAssignment,
+    initializePrimary: () => initializeConfiguredPrimary(primaryAgent),
+    initializeFallback: initializeConfiguredFallback,
+    signal,
+  });
+  const primaryConfig = primaryInitialization.config;
+  const effectivePrimaryAgent = primaryInitialization.effectiveAgent;
+  const primaryInitializationFallbackUsed = primaryInitialization.fallbackUsed;
+  if (primaryInitializationFallbackUsed) {
+    logger.warn(
+      `[agentLlmFallback] Primary provider initialization failed before AgentClient; recovered agent ${primaryConfig.id} with configured fallback ${fallbackAssignment.provider}/${fallbackAssignment.model}`,
+    );
+    if (voiceLatencyEnabled && voiceInitSummary) {
+      voiceInitSummary.fallbackMode = 'initialization_recovery';
+      voiceInitSummary.fallbackProvider = fallbackAssignment.provider;
+      voiceInitSummary.fallbackModel = fallbackAssignment.model;
+    }
+  }
+  /* === VIVENTIUM END === */
   const initializePrimaryMs = setVoiceStageMs('initialize_primary', voiceInitPrimaryStart);
   const primaryToolSummary = summarizeInitTools(primaryConfig);
   if (voiceLatencyEnabled && voiceInitSummary) {
@@ -625,7 +691,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
    * first-audio latency.
    * Updated: 2026-05-14
    */
-  if (fallbackAgent && fallbackAssignment) {
+  if (!primaryInitializationFallbackUsed && fallbackAgent && fallbackAssignment) {
     if (voiceLatencyEnabled && voiceInitSummary) {
       voiceInitSummary.fallbackMode = 'lazy';
       voiceInitSummary.fallbackProvider = fallbackAssignment.provider;
@@ -726,7 +792,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
     `[initializeClient] toolRegistry size: ${primaryConfig.toolRegistry?.size ?? 'undefined'}`,
   );
   agentToolContexts.set(primaryConfig.id, {
-    agent: primaryAgent,
+    agent: effectivePrimaryAgent,
     toolRegistry: primaryConfig.toolRegistry,
     userMCPAuthMap: primaryConfig.userMCPAuthMap,
     tool_resources: primaryConfig.tool_resources,
@@ -862,6 +928,13 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
         collectEdges(agent.edges);
       }
     } catch (err) {
+      /* === VIVENTIUM START ===
+       * Feature: Optional agent graph resilience
+       * Purpose: A failed optional handoff must be marked before orphan filtering; otherwise its
+       * edge survives and LangGraph aborts the whole web, Telegram, or voice turn at compile time.
+       * Added: 2026-07-13
+       * === VIVENTIUM END === */
+      markOptionalAgentInitializationFailed(skippedAgentIds, agentId);
       logger.error(`[initializeClient] Error processing agent ${agentId}:`, err);
     }
   }
@@ -891,7 +964,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
     modelsConfig,
     requestFiles,
     agentConfigs,
-    primaryAgent,
+    primaryAgent: effectivePrimaryAgent,
     endpointOption,
     userMCPAuthMap,
     conversationId,
@@ -941,7 +1014,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
   }
 
   const sender =
-    primaryAgent.name ??
+    effectivePrimaryAgent.name ??
     getResponseSender({
       ...endpointOption,
       model: endpointOption.model_parameters.model,

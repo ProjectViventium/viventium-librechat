@@ -106,19 +106,15 @@ const { logFeelingsEvent } = require('~/server/services/viventium/feelingsTeleme
 const NO_PARENT_MESSAGE_ID = '00000000-0000-0000-0000-000000000000';
 
 /* === VIVENTIUM START ===
- * Feature: Request-pinned feeling state for all background agents.
- * Purpose: Keep the same decayed snapshot across every participant in one turn.
+ * Feature: Specialist-cortex affect independence.
+ * Purpose: Background cortices observe, verify, and surface evidence for the conscious agent.
+ * The embodiment capsule addresses Viventium as the speaker, so appending it here would turn an
+ * epistemic specialist into a second persona and can bias Red Team, research, or EQ observations.
+ * User-visible Phase-B synthesis is a separate conscious speaking boundary and handles the pinned
+ * capsule there. Keep this explicit helper as a regression seam for all configured agent scopes.
  * === VIVENTIUM END === */
-function feelingTailForBackgroundAgent(snapshot) {
-  if (
-    !snapshot?.available ||
-    !snapshot?.enabled ||
-    snapshot?.agentScope !== 'all_agents' ||
-    !String(snapshot?.capsule || '').trim()
-  ) {
-    return '';
-  }
-  return String(snapshot.capsule).trim();
+function feelingTailForBackgroundAgent(_snapshot) {
+  return '';
 }
 
 /* === VIVENTIUM NOTE ===
@@ -217,6 +213,7 @@ function shouldSuppressActivationProvider(errorSummary = {}) {
     'provider_quota_or_billing',
     'provider_network',
     'provider_server_error',
+    'provider_invalid_response',
   ]).has(errorSummary.class);
 }
 
@@ -863,7 +860,45 @@ function buildIndexTokenCountMap(messages, tokenCounter) {
  * @param {string} response - Raw LLM response
  * @returns {{ activate: boolean, confidence: number, reason: string }}
  */
+function activationResponseError(code) {
+  const error = new Error(
+    code === 'JSON_VALIDATE_FAILED'
+      ? 'activation classifier returned schema-invalid JSON'
+      : 'activation classifier returned unparseable JSON',
+  );
+  error.code = code;
+  return error;
+}
+
+function activationDecisionFromData(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw activationResponseError('JSON_VALIDATE_FAILED');
+  }
+
+  const activationKey = ['activate', 'should_activate', 'shouldActivate'].find((key) =>
+    Object.prototype.hasOwnProperty.call(data, key),
+  );
+  const activationValue = activationKey ? data[activationKey] : undefined;
+  const confidence = data.confidence;
+  if (
+    typeof activationValue !== 'boolean' ||
+    typeof confidence !== 'number' ||
+    !Number.isFinite(confidence) ||
+    confidence < 0 ||
+    confidence > 1
+  ) {
+    throw activationResponseError('JSON_VALIDATE_FAILED');
+  }
+
+  return {
+    activate: activationValue,
+    confidence,
+    reason: typeof data.reason === 'string' ? data.reason : '',
+  };
+}
+
 function parseActivationResponse(response) {
+  let terminalError = null;
   try {
     let cleaned = String(response || '').trim();
     if (cleaned) {
@@ -875,12 +910,9 @@ function parseActivationResponse(response) {
     }
     // Try direct JSON parse
     const data = JSON.parse(cleaned);
-    return {
-      activate: Boolean(data.activate ?? data.should_activate ?? data.shouldActivate),
-      confidence: Number(data.confidence) || 0,
-      reason: String(data.reason || ''),
-    };
-  } catch {
+    return activationDecisionFromData(data);
+  } catch (error) {
+    terminalError = error;
     // Try to extract JSON from response
     const jsonMatch = String(response || '').match(
       /\{[^{}]*("activate"|"should_activate"|"shouldActivate")[^{}]*\}/,
@@ -888,21 +920,27 @@ function parseActivationResponse(response) {
     if (jsonMatch) {
       try {
         const data = JSON.parse(jsonMatch[0]);
-        return {
-          activate: Boolean(data.activate ?? data.should_activate ?? data.shouldActivate),
-          confidence: Number(data.confidence) || 0,
-          reason: String(data.reason || ''),
-        };
-      } catch {
-        // Fall through
+        return activationDecisionFromData(data);
+      } catch (extractedError) {
+        terminalError = extractedError;
       }
     }
 
-    logger.warn('[BackgroundCortexService] Failed to parse activation response', {
+    const errorCode =
+      terminalError?.code === 'JSON_VALIDATE_FAILED'
+        ? 'JSON_VALIDATE_FAILED'
+        : 'JSON_PARSE_FAILED';
+    logger.warn('[BackgroundCortexService] Invalid activation response', {
       response_hash: hashString(response, 12),
       response_length: typeof response === 'string' ? response.length : 0,
+      error_code: errorCode,
     });
-    return { activate: false, confidence: 0, reason: 'parse-error' };
+    // === VIVENTIUM START ===
+    // Rationale: malformed or schema-invalid classifier output is provider failure evidence, not a
+    // trustworthy decision. Throwing lets the configured fallback chain recover without prompt-
+    // text heuristics and keeps terminal unavailability explicit in activation telemetry.
+    throw activationResponseError(errorCode);
+    // === VIVENTIUM END ===
   }
 }
 
@@ -1679,6 +1717,7 @@ const RETRYABLE_ACTIVATION_ERROR_CODES = new Set([
   'ECONNRESET',
   'EAI_AGAIN',
   'ETIMEDOUT',
+  'JSON_PARSE_FAILED',
   'JSON_VALIDATE_FAILED',
   'MODEL_DECOMMISSIONED',
   'MODEL_DEPRECATED',
@@ -1972,6 +2011,10 @@ function classifyActivationError({ status, code, message }) {
   const normalizedMessage = String(message || '').toLowerCase();
   const normalizedCode = String(code || '').toUpperCase();
 
+  if (normalizedCode === 'JSON_PARSE_FAILED' || normalizedCode === 'JSON_VALIDATE_FAILED') {
+    return 'provider_invalid_response';
+  }
+
   if (status === 401 || normalizedMessage.includes('unauthorized')) {
     return 'provider_unauthorized';
   }
@@ -2013,7 +2056,7 @@ function classifyActivationError({ status, code, message }) {
   return 'provider_error';
 }
 
-function isActivationFallbackCandidate(error) {
+function isActivationFallbackCandidate(error, classifiedError = null) {
   const status = extractActivationErrorStatus(error);
   if (RETRYABLE_ACTIVATION_STATUS_CODES.has(status)) {
     return true;
@@ -2025,6 +2068,10 @@ function isActivationFallbackCandidate(error) {
   }
 
   const message = String(error?.message || '').toLowerCase();
+  const classified = String(classifiedError?.class || '').toLowerCase();
+  if (classified === 'provider_error' && (!Number.isFinite(status) || status <= 0)) {
+    return true;
+  }
   return (
     message.includes('billing') ||
     message.includes('quota') ||
@@ -2654,7 +2701,7 @@ async function invokeActivationClassifierAttempt({
     signal: abortController?.signal,
   };
 
-  const { HumanMessage } = require('@langchain/core/messages');
+  const { HumanMessage } = require('@librechat/agents/langchain/messages');
   const inputMessages = [new HumanMessage(fullPrompt)];
   const content = await run.processStream({ messages: inputMessages }, config);
 
@@ -3015,7 +3062,8 @@ ${activationFormat}`;
           markedUnhealthy,
         });
 
-        const shouldRetry = i < attempts.length - 1 && isActivationFallbackCandidate(error);
+        const shouldRetry =
+          i < attempts.length - 1 && isActivationFallbackCandidate(error, errorSummary);
         if (shouldRetry) {
           logger.warn(
             `[BackgroundCortexService] Activation classifier failed for ${agent_id}; trying fallback: ` +
@@ -3401,6 +3449,9 @@ async function executeCortexOnce({
     }
     logFeelingsEvent(logger, safeReq, 'feelings.inject.background', {
       injected: Boolean(backgroundFeelingTail),
+      reason: 'specialist_cortex_independent',
+      enabled: safeReq._viventiumFeelingSnapshot?.enabled === true,
+      scope: safeReq._viventiumFeelingSnapshot?.agentScope || 'unknown',
       snapshotHash: safeReq._viventiumFeelingSnapshot?.snapshotHash || null,
       agentIdHash: hashString(initializedAgent.id || agentForRun.id, 12),
     });
@@ -3510,7 +3561,7 @@ async function executeCortexOnce({
       Array.isArray(scopedMessages) && scopedMessages.length > 0
         ? scopedMessages
         : [
-            new (require('@langchain/core/messages').HumanMessage)(
+            new (require('@librechat/agents/langchain/messages').HumanMessage)(
               lastUserMessage || 'Analyze the latest conversation and respond.',
             ),
           ];
@@ -3628,6 +3679,14 @@ async function executeCortexOnce({
         glasshive_worker_feelings_hash: backgroundFeelingTail
           ? safeReq._viventiumFeelingSnapshot?.snapshotHash || ''
           : '',
+        glasshive_worker_feelings_scope:
+          safeReq._viventiumFeelingSnapshot?.agentScope || 'unknown',
+        glasshive_worker_feelings_range_prompt_override_count:
+          safeReq._viventiumFeelingSnapshot?.rangePromptOverrideCount ?? 0,
+        glasshive_worker_feelings_active_range_prompt_override_count:
+          safeReq._viventiumFeelingSnapshot?.activeRangePromptOverrideCount ?? 0,
+        glasshive_worker_feelings_active_range_prompt_override_chars:
+          safeReq._viventiumFeelingSnapshot?.activeRangePromptOverrideChars ?? 0,
       },
       recursionLimit: initializedAgent.recursion_limit || 25,
       signal: abortController.signal,

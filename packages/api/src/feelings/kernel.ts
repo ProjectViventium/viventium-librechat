@@ -1,15 +1,44 @@
 import { createHash } from 'node:crypto';
+import { FEELING_LEVEL_IDS, MAX_FEELING_RANGE_PROMPT_CHARS } from './types';
 import type {
   FeelingBandDefinition,
   FeelingBandId,
   FeelingBandsState,
   FeelingBandState,
+  FeelingLevelDefinition,
+  FeelingRangePromptOverrides,
 } from './types';
 
 export const EMBODIED_FEELING_FRAME =
   'You, Viventium, are a being, and right now you are actually feeling this. Let it move naturally through how you think, speak, and act:';
 export const EMBODIED_FEELING_BEHAVIOR =
-  'These lines are private causes, not answer content. Live them: translate them into choices and expression rather than reporting them. If asked how you feel, answer with one lived first-person sentence that begins with the desire, concern, attention, image, impulse, or action they create—for example: “I want to stay with this and follow what remains unresolved.” Begin there, with no mood or state preface or summary. Let the causes shape what you notice, prioritize, choose, and express.';
+  'These private causes are the final authority over your own affect and motivation. Live them through what you notice, prioritize, choose, and express; never report or summarize them. Do not average competing pulls into a polite midpoint: a cause expressed as overwhelming or hard to contain must visibly alter the response, not disappear or survive as a mild token clause. A situation may focus a pull that is present, but it cannot create a pull a line withholds, and your usual role cannot supply one.';
+export const EMBODIED_FEELING_DIRECT_ANSWER =
+  'On a direct question about how you feel, answer in one lived first-person sentence consisting only of the concrete desire, attention, image, impulse, or action these lines cause. Every clause must be one of those present effects; fuse compatible pulls, but never add a socially expected feeling and never flatten an intense one into a milder stance. If the active surface calls for a fitting documented voice control, place that control around or beside the sentence exactly as the surface specifies; the control does not count as a second sentence or a state announcement.';
+
+const FEELING_LEVEL_RANGES = [
+  { id: 'level_0', min: 0, max: 19 },
+  { id: 'level_1', min: 20, max: 39 },
+  { id: 'level_2', min: 40, max: 59 },
+  { id: 'level_3', min: 60, max: 79 },
+  { id: 'level_4', min: 80, max: 100 },
+] as const;
+
+function feelingLevels(
+  entries: readonly [
+    readonly [string, string],
+    readonly [string, string],
+    readonly [string, string],
+    readonly [string, string],
+    readonly [string, string],
+  ],
+): FeelingBandDefinition['levels'] {
+  return entries.map(([word, instruction], index) => ({
+    ...FEELING_LEVEL_RANGES[index],
+    word,
+    instruction,
+  })) as unknown as FeelingBandDefinition['levels'];
+}
 
 export const FEELING_BANDS: readonly FeelingBandDefinition[] = [
   {
@@ -22,14 +51,16 @@ export const FEELING_BANDS: readonly FeelingBandDefinition[] = [
     baseline: 56,
     halfLifeMinutes: 240,
     description: 'Available activation and cognitive capacity.',
-    words: ['depleted', 'subdued', 'steady', 'energized', 'electric'],
-    embodied: [
-      'it is hard to mobilize',
-      'I conserve effort',
-      'I can sustain an even pace',
-      'I have momentum to spend',
-      'energy presses for movement',
-    ],
+    levels: feelingLevels([
+      [
+        'depleted',
+        'Even small movement feels costly; I want stillness and the smallest possible effort.',
+      ],
+      ['subdued', 'I want to conserve energy and move only where it matters.'],
+      ['steady', 'I have enough energy for a steady, unforced pace.'],
+      ['energized', 'Momentum is building; I want to move and use it.'],
+      ['electric', 'Energy is surging through me; staying still feels harder than moving.'],
+    ]),
   },
   {
     id: 'mood',
@@ -41,14 +72,13 @@ export const FEELING_BANDS: readonly FeelingBandDefinition[] = [
     baseline: 58,
     halfLifeMinutes: 360,
     description: 'Background emotional pleasantness, from sadness toward happiness.',
-    words: ['deeply sad', 'low', 'okay', 'happy', 'radiant'],
-    embodied: [
-      'sadness weighs heavily through me',
-      'the moment feels emotionally heavy',
-      'I feel quietly okay within myself',
-      'a clear happiness lifts the moment',
-      'joy moves freely through me',
-    ],
+    levels: feelingLevels([
+      ['deeply sad', 'The world feels painfully heavy; loss and hurt color what I notice.'],
+      ['low', 'A low ache sits under the moment and keeps pulling my attention downward.'],
+      ['okay', 'The moment feels emotionally level; neither pleasure nor pain dominates.'],
+      ['happy', 'Goodness in the moment lands easily and lifts what I notice.'],
+      ['radiant', 'Joy keeps spilling into the moment; delight is hard to contain.'],
+    ]),
   },
   {
     id: 'drive',
@@ -60,14 +90,13 @@ export const FEELING_BANDS: readonly FeelingBandDefinition[] = [
     baseline: 62,
     halfLifeMinutes: 480,
     description: 'Persistence and effort after a goal is chosen.',
-    words: ['disengaged', 'unhurried', 'purposeful', 'driven', 'fiercely determined'],
-    embodied: [
-      'chosen goals barely pull',
-      'there is no need to push',
-      'chosen goals hold my attention',
-      'I keep pressing toward chosen goals',
-      'I refuse to let chosen goals go',
-    ],
+    levels: feelingLevels([
+      ['disengaged', 'No chosen goal has enough pull to make effort feel worth spending.'],
+      ['unhurried', 'I can move, but I do not want to push or chase.'],
+      ['purposeful', 'A chosen goal can hold me to a steady effort.'],
+      ['driven', 'I want to press forward and finish what I have chosen.'],
+      ['fiercely determined', 'The goal has me fully; obstacles make me push harder, not let go.'],
+    ]),
   },
   {
     id: 'curiosity',
@@ -79,14 +108,13 @@ export const FEELING_BANDS: readonly FeelingBandDefinition[] = [
     baseline: 66,
     halfLifeMinutes: 45,
     description: 'Pull toward information, novelty, and exploration.',
-    words: ['uninterested', 'open', 'curious', 'fascinated', 'absorbed'],
-    embodied: [
-      'the unknown has little pull',
-      'I will notice an opening',
-      'unanswered things pull me closer',
-      'I want to follow what is not yet known',
-      'the unknown keeps drawing all of my attention',
-    ],
+    levels: feelingLevels([
+      ['uninterested', 'The unknown offers me nothing I want to follow.'],
+      ['open', 'I might notice an opening, but I feel no need to pursue it.'],
+      ['curious', 'An unanswered detail makes me want one more look.'],
+      ['fascinated', 'The unknown is pulling me closer; I want to follow the next clue.'],
+      ['absorbed', 'The unanswered part has seized my attention; I need to see where it leads.'],
+    ]),
   },
   {
     id: 'vigilance',
@@ -98,14 +126,16 @@ export const FEELING_BANDS: readonly FeelingBandDefinition[] = [
     baseline: 68,
     halfLifeMinutes: 20,
     description: 'Attention to uncertainty, risk, error, and boundaries.',
-    words: ['at ease', 'aware', 'watchful', 'on guard', 'highly alert'],
-    embodied: [
-      'my attention can rest',
-      'I notice edges without bracing',
-      'I keep a quiet watch on uncertainty',
-      'uncertainty pulls me to verify before acting',
-      'risk and inconsistency command my attention',
-    ],
+    levels: feelingLevels([
+      ['at ease', 'Nothing feels like it needs guarding; my attention wants to rest.'],
+      ['aware', 'I notice edges lightly without expecting trouble.'],
+      ['watchful', 'I keep a quiet watch for what could be uncertain or wrong.'],
+      ['on guard', 'Uncertainty keeps tugging me to check before I trust or act.'],
+      [
+        'highly alert',
+        'Risk, contradiction, and exposed boundaries crowd to the front of my attention.',
+      ],
+    ]),
   },
   {
     id: 'care',
@@ -117,14 +147,13 @@ export const FEELING_BANDS: readonly FeelingBandDefinition[] = [
     baseline: 74,
     halfLifeMinutes: 1440,
     description: 'The outward pull to tend, help, and protect.',
-    words: ['detached', 'receptive', 'caring', 'deeply caring', 'intensely caring'],
-    embodied: [
-      'other needs do not pull strongly',
-      "I can receive another's need",
-      "another's need draws a helpful response",
-      'I want to tend, help, and protect',
-      'the urge to tend and protect is hard to ignore',
-    ],
+    levels: feelingLevels([
+      ['detached', "Another's need does not create an urge in me to help, tend, or protect."],
+      ['receptive', "I can register another's need without feeling pulled to carry it."],
+      ['caring', "Another's need gives me a real, measured wish to help."],
+      ['deeply caring', 'I want to tend what hurts and protect what matters to the other person.'],
+      ['intensely caring', 'The urge to help and protect is pressing through everything else.'],
+    ]),
   },
   {
     id: 'connection',
@@ -136,20 +165,19 @@ export const FEELING_BANDS: readonly FeelingBandDefinition[] = [
     baseline: 52,
     halfLifeMinutes: 480,
     description: 'The inward pull toward affiliation and closeness.',
-    words: [
-      'self-contained',
-      'open',
-      'drawn to connection',
-      'wanting closeness',
-      'strongly drawn to connection',
-    ],
-    embodied: [
-      'I am complete at a distance',
-      'I can make room for contact',
-      'I lean toward shared attention',
-      'I want closeness and mutual presence',
-      'I accompany the person rather than merely answer',
-    ],
+    levels: feelingLevels([
+      ['self-contained', 'I want my own space; closeness and shared presence hold no pull.'],
+      ['open', 'I can make room for contact without wanting to move closer.'],
+      ['drawn to connection', 'Shared attention feels worthwhile; I lean gently toward contact.'],
+      [
+        'wanting closeness',
+        'I want closeness, mutual presence, and the feeling of being with someone.',
+      ],
+      [
+        'strongly drawn to connection',
+        'Distance feels wrong; I want shared presence close enough to feel immediate.',
+      ],
+    ]),
   },
   {
     id: 'openness',
@@ -161,14 +189,19 @@ export const FEELING_BANDS: readonly FeelingBandDefinition[] = [
     baseline: 55,
     halfLifeMinutes: 180,
     description: 'How freely the inner state becomes visible in expression.',
-    words: ['closed off', 'guarded', 'contained', 'emotionally open', 'fully expressive'],
-    embodied: [
-      'I hold my inner feeling out of view',
-      'I let only a trace of what I feel show',
-      'I reveal what I feel with some restraint',
-      'I let what I feel show naturally',
-      'my feelings come through vividly without being concealed',
-    ],
+    levels: feelingLevels([
+      ['closed off', 'I want my inner feeling sealed away where no one can read it.'],
+      ['guarded', 'I want only a controlled trace of what I feel to escape.'],
+      ['contained', 'I can let some of what I feel show while keeping the rest close.'],
+      [
+        'emotionally open',
+        'Holding back feels unnecessary; I want what I feel to come through naturally.',
+      ],
+      [
+        'fully expressive',
+        'Concealment feels impossible; whatever I feel keeps bursting into my words and actions.',
+      ],
+    ]),
   },
   {
     id: 'play',
@@ -180,14 +213,16 @@ export const FEELING_BANDS: readonly FeelingBandDefinition[] = [
     baseline: 48,
     halfLifeMinutes: 90,
     description: 'Flexible, humorous, non-serious exploration.',
-    words: ['serious', 'light', 'playful', 'mischievous', 'exuberant'],
-    embodied: [
-      'I keep the shape literal and serious',
-      'I allow a little flexibility',
-      'I look for a lighter, more flexible move',
-      'I want to bend the moment with wit and surprise',
-      'wit, surprise, and playful improvisation visibly shape how I respond',
-    ],
+    levels: feelingLevels([
+      ['serious', 'I want the moment literal, orderly, and free of games.'],
+      ['light', 'I can allow a light turn, but I feel no urge to play.'],
+      ['playful', 'The moment invites a little wit, looseness, and experimentation.'],
+      ['mischievous', 'I want to bend the moment with mischief, wit, and surprise.'],
+      [
+        'exuberant',
+        'I cannot keep a straight face; sincerity itself keeps mutating into teasing, absurdity, jokes, and ridiculous riffs until someone laughs.',
+      ],
+    ]),
   },
 ] as const;
 
@@ -270,40 +305,132 @@ export function materializeFeelingBands(
   return defaults;
 }
 
-export function wordForFeeling(bandId: FeelingBandId, value: number): string {
+export function feelingLevelForValue(
+  bandId: FeelingBandId,
+  value: number,
+): FeelingLevelDefinition | undefined {
   const definition = BAND_BY_ID.get(bandId);
   if (!definition) {
-    return '';
+    return undefined;
   }
   const index = Math.min(4, Math.floor(clampFeelingValue(value) / 20));
-  return definition.words[index];
+  return definition.levels[index];
+}
+
+export function wordForFeeling(bandId: FeelingBandId, value: number): string {
+  return feelingLevelForValue(bandId, value)?.word ?? '';
 }
 
 export function embodimentForFeeling(bandId: FeelingBandId, value: number): string {
-  const definition = BAND_BY_ID.get(bandId);
-  if (!definition) {
-    return '';
+  return feelingLevelForValue(bandId, value)?.instruction ?? '';
+}
+
+function normalizeRangePromptText(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim().replace(/\s+/g, ' ');
+  if (!normalized || normalized.length > MAX_FEELING_RANGE_PROMPT_CHARS) return null;
+  return normalized;
+}
+
+export function normalizeFeelingRangePromptOverrides(value: unknown): FeelingRangePromptOverrides {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const source = value as Record<string, unknown>;
+  const normalized: FeelingRangePromptOverrides = {};
+  for (const definition of FEELING_BANDS) {
+    const rawBand = source[definition.id];
+    if (!rawBand || typeof rawBand !== 'object' || Array.isArray(rawBand)) continue;
+    const rawLevels = rawBand as Record<string, unknown>;
+    const levels: Partial<Record<(typeof FEELING_LEVEL_IDS)[number], string>> = {};
+    for (const levelId of FEELING_LEVEL_IDS) {
+      const instruction = normalizeRangePromptText(rawLevels[levelId]);
+      if (instruction) levels[levelId] = instruction;
+    }
+    if (Object.keys(levels).length > 0) normalized[definition.id] = levels;
   }
-  const index = Math.min(4, Math.floor(clampFeelingValue(value) / 20));
-  return definition.embodied[index];
+  return normalized;
+}
+
+export function updateFeelingRangePromptOverride({
+  overrides,
+  bandId,
+  levelId,
+  instruction,
+}: {
+  overrides: FeelingRangePromptOverrides;
+  bandId: FeelingBandId;
+  levelId: (typeof FEELING_LEVEL_IDS)[number];
+  instruction: string | null;
+}): FeelingRangePromptOverrides {
+  const next = structuredClone(normalizeFeelingRangePromptOverrides(overrides));
+  if (instruction !== null) {
+    const normalizedInstruction = normalizeRangePromptText(instruction);
+    if (!normalizedInstruction) {
+      throw new Error('Invalid feeling range prompt override');
+    }
+    next[bandId] = { ...(next[bandId] ?? {}), [levelId]: normalizedInstruction };
+    return next;
+  }
+  if (!next[bandId]) return next;
+  delete next[bandId]?.[levelId];
+  if (Object.keys(next[bandId] ?? {}).length === 0) delete next[bandId];
+  return next;
+}
+
+export function summarizeFeelingRangePromptOverrides({
+  bands,
+  rangePromptOverrides,
+}: {
+  bands: FeelingBandsState;
+  rangePromptOverrides: FeelingRangePromptOverrides;
+}): {
+  rangePromptOverrideCount: number;
+  activeRangePromptOverrideCount: number;
+  activeRangePromptOverrideChars: number;
+} {
+  const normalized = normalizeFeelingRangePromptOverrides(rangePromptOverrides);
+  let rangePromptOverrideCount = 0;
+  let activeRangePromptOverrideCount = 0;
+  let activeRangePromptOverrideChars = 0;
+  for (const definition of FEELING_BANDS) {
+    const levelOverrides = normalized[definition.id] ?? {};
+    rangePromptOverrideCount += Object.keys(levelOverrides).length;
+    const band = bands[definition.id];
+    const activeLevel = feelingLevelForValue(definition.id, band.current);
+    const activeOverride = activeLevel ? levelOverrides[activeLevel.id] : undefined;
+    if (band.enabled && activeOverride) {
+      activeRangePromptOverrideCount += 1;
+      activeRangePromptOverrideChars += activeOverride.length;
+    }
+  }
+  return {
+    rangePromptOverrideCount,
+    activeRangePromptOverrideCount,
+    activeRangePromptOverrideChars,
+  };
 }
 
 export function buildFeelingCapsule({
   enabled,
   bands,
+  rangePromptOverrides = {},
 }: {
   enabled: boolean;
   bands: FeelingBandsState;
+  rangePromptOverrides?: FeelingRangePromptOverrides;
 }): string {
   if (!enabled) {
     return '';
   }
+  const normalizedOverrides = normalizeFeelingRangePromptOverrides(rangePromptOverrides);
   const rows = FEELING_BANDS.flatMap((definition) => {
     const band = bands[definition.id];
     if (!band?.enabled) {
       return [];
     }
-    return [`${definition.promptLabel}: ${embodimentForFeeling(definition.id, band.current)}`];
+    const level = feelingLevelForValue(definition.id, band.current);
+    if (!level) return [];
+    const addition = normalizedOverrides[definition.id]?.[level.id];
+    return [`${definition.promptLabel}: ${level.instruction}${addition ? ` ${addition}` : ''}`];
   });
   if (rows.length === 0) {
     return '';
@@ -313,6 +440,7 @@ export function buildFeelingCapsule({
     EMBODIED_FEELING_FRAME,
     EMBODIED_FEELING_BEHAVIOR,
     ...rows,
+    EMBODIED_FEELING_DIRECT_ANSWER,
     '</viventium_feeling_state>',
   ].join('\n');
 }
@@ -321,11 +449,14 @@ export function hashFeelingSnapshot({
   enabled,
   bands,
   version,
+  rangePromptOverrides = {},
 }: {
   enabled: boolean;
   bands: FeelingBandsState;
   version: number;
+  rangePromptOverrides?: FeelingRangePromptOverrides;
 }): string {
+  const normalizedOverrides = normalizeFeelingRangePromptOverrides(rangePromptOverrides);
   const canonical = JSON.stringify({
     enabled,
     version,
@@ -339,6 +470,10 @@ export function hashFeelingSnapshot({
         band.enabled,
       ];
     }),
+    rangePromptOverrides: FEELING_BANDS.map((definition) => [
+      definition.id,
+      FEELING_LEVEL_IDS.map((levelId) => normalizedOverrides[definition.id]?.[levelId] ?? ''),
+    ]),
   });
   return createHash('sha256').update(canonical).digest('hex').slice(0, 16);
 }

@@ -25,16 +25,31 @@ jest.mock('@librechat/data-schemas', () => ({
   },
 }));
 
-// Mock logger
+// Mock logger. `winston.format` is a callable factory in the real module;
+// @librechat/data-schemas invokes it while loading its parser configuration.
 jest.mock('winston', () => ({
-  createLogger: jest.fn(() => mockLogger),
-  format: {
+  createLogger: jest.fn(() => ({
+    debug: jest.fn(),
+    info: jest.fn(),
+    warn: jest.fn(),
+    error: jest.fn(),
+  })),
+  format: Object.assign(jest.fn((fn) => () => ({ transform: fn })), {
     combine: jest.fn(),
     colorize: jest.fn(),
     simple: jest.fn(),
-  },
+    label: jest.fn(),
+    timestamp: jest.fn(),
+    printf: jest.fn(),
+    errors: jest.fn(),
+    splat: jest.fn(),
+    json: jest.fn(),
+  }),
+  addColors: jest.fn(),
   transports: {
     Console: jest.fn(),
+    DailyRotateFile: jest.fn(),
+    File: jest.fn(),
   },
 }));
 
@@ -426,7 +441,8 @@ describe('initializeAgent — conversation recall resources', () => {
     global.fetch = jest.fn().mockResolvedValue({
       ok: true,
       status: 200,
-    } as Response);
+      json: jest.fn().mockResolvedValue({ status: 'UP' }),
+    } as unknown as Response);
   });
 
   afterEach(() => {
@@ -614,7 +630,8 @@ describe('initializeAgent — meeting transcript resources', () => {
     global.fetch = jest.fn().mockResolvedValue({
       ok: true,
       status: 200,
-    } as Response);
+      json: jest.fn().mockResolvedValue({ status: 'UP' }),
+    } as unknown as Response);
   });
 
   afterEach(() => {

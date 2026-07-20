@@ -25,10 +25,48 @@ describe('Feelings state service', () => {
     expect(snapshot.capsule).toBe('');
     expect(snapshot.version).toBe(0);
     expect(snapshot.innerState).toBeNull();
+    expect(snapshot.rangePromptOverrides).toEqual({});
+    expect(snapshot.rangePromptOverrideCount).toBe(0);
+    expect(snapshot.activeRangePromptOverrideCount).toBe(0);
     expect(snapshot.reactionActivationMode).toBe('always');
     expect(snapshot.reactionInstruction).toContain('React to what genuinely moves Viventium');
     expect(snapshot.reactionInstruction).toContain('match how much the moment matters');
     expect(snapshot.reactionInstruction).not.toContain('Prefer small natural changes');
+  });
+
+  it('caches reads briefly and clears the user entry after writes', async () => {
+    const getFeelingState = jest.fn().mockResolvedValue(null);
+    const args = { userId: 'synthetic-user', getFeelingState, env: {} };
+    await loadFeelingsReadContext(args);
+    const cached = await loadFeelingsReadContext(args);
+    expect(getFeelingState).toHaveBeenCalledTimes(1);
+    expect(cached.cacheHit).toBe(true);
+    clearFeelingsReadCache('synthetic-user');
+    await loadFeelingsReadContext(args);
+    expect(getFeelingState).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not repopulate a cleared cache from an older in-flight read', async () => {
+    let resolveOlderRead: ((value: { version: number }) => void) | undefined;
+    const olderRead = new Promise<{ version: number }>((resolve) => {
+      resolveOlderRead = resolve;
+    });
+    const getFeelingState = jest
+      .fn()
+      .mockImplementationOnce(() => olderRead)
+      .mockResolvedValueOnce({ version: 2 });
+    const args = { userId: 'synthetic-race-user', getFeelingState, env: {} };
+
+    const inFlight = loadFeelingsReadContext(args);
+    await Promise.resolve();
+    clearFeelingsReadCache('synthetic-race-user');
+    resolveOlderRead?.({ version: 1 });
+    expect((await inFlight).version).toBe(1);
+
+    const fresh = await loadFeelingsReadContext(args);
+    expect(fresh.version).toBe(2);
+    expect(fresh.cacheHit).toBe(false);
+    expect(getFeelingState).toHaveBeenCalledTimes(2);
   });
 
   it('upgrades the exact previously shipped reaction default without replacing user instructions', async () => {
@@ -51,18 +89,6 @@ describe('Feelings state service', () => {
       bypassCache: true,
     });
     expect(customSnapshot.reactionInstruction).toBe(customInstruction);
-  });
-
-  it('caches reads briefly and clears the user entry after writes', async () => {
-    const getFeelingState = jest.fn().mockResolvedValue(null);
-    const args = { userId: 'synthetic-user', getFeelingState, env: {} };
-    await loadFeelingsReadContext(args);
-    const cached = await loadFeelingsReadContext(args);
-    expect(getFeelingState).toHaveBeenCalledTimes(1);
-    expect(cached.cacheHit).toBe(true);
-    clearFeelingsReadCache('synthetic-user');
-    await loadFeelingsReadContext(args);
-    expect(getFeelingState).toHaveBeenCalledTimes(2);
   });
 
   it('materializes elapsed decay even when the feature and band are disabled', async () => {
@@ -104,6 +130,54 @@ describe('Feelings state service', () => {
     expect(initial.version).toBe(0);
     expect(initial.bands.care.baseline).toBe(74);
     expect(initial.trail).toEqual([]);
+    expect(initial.rangePromptOverrides).toEqual({});
+  });
+
+  it('materializes only active range additions and includes saved additions in snapshot identity', async () => {
+    const baseState = {
+      enabled: true,
+      version: 4,
+      bands: {
+        play: {
+          baseline: 87,
+          current: 87,
+          halfLifeMinutes: 90,
+          enabled: true,
+          updatedAt: new Date('2026-07-09T12:00:00.000Z'),
+        },
+      },
+    };
+    const withoutOverride = await loadFeelingsReadContext({
+      userId: 'range-base-user',
+      getFeelingState: jest.fn().mockResolvedValue(baseState),
+      now: new Date('2026-07-09T12:00:00.000Z'),
+      env: {},
+      bypassCache: true,
+    });
+    const withOverride = await loadFeelingsReadContext({
+      userId: 'range-custom-user',
+      getFeelingState: jest.fn().mockResolvedValue({
+        ...baseState,
+        rangePromptOverrides: {
+          play: {
+            level_3: 'Saved but inactive.',
+            level_4: 'Every straight line is begging for a ridiculous turn.',
+          },
+        },
+      }),
+      now: new Date('2026-07-09T12:00:00.000Z'),
+      env: {},
+      bypassCache: true,
+    });
+
+    expect(withOverride.capsule).toContain(
+      'Every straight line is begging for a ridiculous turn.',
+    );
+    expect(withOverride.capsule).not.toContain('Saved but inactive.');
+    expect(withOverride.rangePromptOverrideCount).toBe(2);
+    expect(withOverride.activeRangePromptOverrideCount).toBe(1);
+    expect(withOverride.activeRangePromptOverrideChars).toBe(53);
+    expect(withOverride.snapshotHash).not.toBe(withoutOverride.snapshotHash);
   });
 
   it('parses only typed reaction operations from fenced or plain JSON', () => {

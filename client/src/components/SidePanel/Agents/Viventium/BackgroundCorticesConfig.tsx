@@ -13,6 +13,7 @@
 
 import React, { useMemo, useState } from 'react';
 import { EModelEndpoint } from 'librechat-data-provider';
+import { useGetModelsQuery } from 'librechat-data-provider/react-query';
 import { Brain, ChevronDown, Plus, Trash2 } from 'lucide-react';
 import {
   Label,
@@ -34,6 +35,12 @@ import MessageIcon from '~/components/Share/MessageIcon';
 import { useLocalize } from '~/hooks';
 import { useAgentsMapContext } from '~/Providers';
 import { ESide } from '~/common';
+import {
+  activationModelKey,
+  buildActivationModelOptions,
+  parseActivationModelKey,
+  resolveDefaultActivationRoute,
+} from './activationModelOptions';
 
 interface BackgroundCorticesConfigProps {
   field: ControllerRenderProps<AgentForm, 'background_cortices'>;
@@ -49,55 +56,24 @@ Consider:
 
 Respond with a JSON object:
 {
-  "activate": true/false,
+  "should_activate": true/false,
   "confidence": 0.0-1.0,
   "reason": "brief explanation"
 }`;
 
-const DEFAULT_ACTIVATION_CONFIG: ActivationConfig = {
+const DEFAULT_ACTIVATION_CONFIG: Omit<ActivationConfig, 'model' | 'provider'> = {
   enabled: true,
-  model: 'meta-llama/llama-4-scout-17b-16e-instruct', // Fast and cost-effective Groq model
-  provider: 'groq',
   prompt: DEFAULT_ACTIVATION_PROMPT,
   confidence_threshold: 0.7,
   cooldown_ms: 5000,
   max_history: 10,
 };
 
-// Model options for activation detection (fast/cheap models recommended)
-// Updated 2026-01-06: Based on latest Groq API models and web research
-const MODEL_OPTIONS: OptionWithIcon[] = [
-  // Standard Providers
-  { label: 'GPT-4o Mini (OpenAI)', value: 'gpt-4o-mini|openai' },
-  { label: 'Claude 3 Haiku (Anthropic)', value: 'claude-3-haiku-20240307|anthropic' },
-  { label: 'Gemini 1.5 Flash (Google)', value: 'gemini-1.5-flash|google' },
-
-  // Groq Models - Fast & Cost-Effective (Recommended for Activation)
-  // Ultra-Fast & Budget-Friendly
-  { label: 'Llama 3.1 8B Instant (Groq) ⚡', value: 'llama-3.1-8b-instant|groq' },
-  { label: 'Groq Compound Mini (Groq) ⚡', value: 'groq/compound-mini|groq' },
-
-  // Latest Llama 4 Models (2025)
-  { label: 'Llama 4 Scout 17B (Groq) 🆕', value: 'meta-llama/llama-4-scout-17b-16e-instruct|groq' },
-  {
-    label: 'Llama 4 Maverick 17B (Groq) 🆕',
-    value: 'meta-llama/llama-4-maverick-17b-128e-instruct|groq',
-  },
-
-  // High-Performance Options
-  { label: 'Llama 3.3 70B Versatile (Groq)', value: 'llama-3.3-70b-versatile|groq' },
-  { label: 'Groq Compound (Groq)', value: 'groq/compound|groq' },
-
-  // Specialized Models
-  { label: 'Qwen 3 32B (Groq)', value: 'qwen/qwen3-32b|groq' },
-  { label: 'Kimi K2 Instruct (Groq)', value: 'moonshotai/kimi-k2-instruct|groq' },
-  { label: 'Kimi K2 Instruct 0905 (Groq)', value: 'moonshotai/kimi-k2-instruct-0905|groq' },
-];
-
 interface CortexCardProps {
   cortex: BackgroundCortex;
   index: number;
   agentsMap: Record<string, any> | null | undefined;
+  models: Record<string, string[]>;
   onUpdate: (index: number, updates: Partial<BackgroundCortex>) => void;
   onRemove: (index: number) => void;
 }
@@ -106,6 +82,7 @@ const CortexCard: React.FC<CortexCardProps> = ({
   cortex,
   index,
   agentsMap,
+  models,
   onUpdate,
   onRemove,
 }) => {
@@ -114,10 +91,15 @@ const CortexCard: React.FC<CortexCardProps> = ({
   const agent = agentsMap?.[cortex.agent_id];
   const isActivationEnabled = cortex.activation?.enabled !== false;
 
-  const selectedModelValue = `${cortex.activation.model}|${cortex.activation.provider}`;
+  const selectedModelValue = activationModelKey(cortex.activation);
+  const modelOptions = useMemo(
+    () => buildActivationModelOptions(models, cortex.activation),
+    [cortex.activation, models],
+  );
 
   const handleModelChange = (value: string) => {
-    const [model, provider] = value.split('|');
+    const { model, provider } = parseActivationModelKey(value);
+    if (!model || !provider) return;
     onUpdate(index, {
       activation: { ...cortex.activation, model, provider },
     });
@@ -176,6 +158,10 @@ const CortexCard: React.FC<CortexCardProps> = ({
             type="button"
             onClick={() => setIsExpanded(!isExpanded)}
             className="rounded p-1 hover:bg-surface-tertiary"
+            aria-label={`${
+              isExpanded ? localize('com_ui_collapse') : localize('com_ui_expand')
+            } ${agent?.name || localize('com_ui_background_cortex')}`}
+            aria-expanded={isExpanded}
           >
             <ChevronDown
               size={16}
@@ -188,6 +174,9 @@ const CortexCard: React.FC<CortexCardProps> = ({
             type="button"
             onClick={() => onRemove(index)}
             className="rounded p-1 text-red-500 hover:bg-red-500/10"
+            aria-label={`${localize('com_ui_delete')} ${
+              agent?.name || localize('com_ui_background_cortex')
+            }`}
           >
             <Trash2 size={16} />
           </button>
@@ -209,8 +198,11 @@ const CortexCard: React.FC<CortexCardProps> = ({
               setValue={handleModelChange}
               selectPlaceholder={localize('com_ui_select_model')}
               searchPlaceholder={localize('com_ui_search_models')}
-              items={MODEL_OPTIONS}
-              displayValue={MODEL_OPTIONS.find((m) => m.value === selectedModelValue)?.label ?? ''}
+              items={modelOptions}
+              displayValue={
+                modelOptions.find((option) => option.value === selectedModelValue)?.label ??
+                selectedModelValue
+              }
               className="h-9 w-full border-border-heavy text-sm"
               containerClassName="px-0"
             />
@@ -312,8 +304,15 @@ const BackgroundCorticesConfig: React.FC<BackgroundCorticesConfigProps> = ({
 }) => {
   const localize = useLocalize();
   const agentsMap = useAgentsMapContext();
+  const modelsQuery = useGetModelsQuery({ refetchOnMount: 'always' });
+  const models = useMemo(() => modelsQuery.data ?? {}, [modelsQuery.data]);
 
-  const cortices = field.value || [];
+  const cortices = useMemo(() => field.value || [], [field.value]);
+  const defaultActivationRoute = useMemo(
+    () => resolveDefaultActivationRoute(cortices, models),
+    [cortices, models],
+  );
+  const canAddCortex = Boolean(activationModelKey(defaultActivationRoute));
   const activeCortexCount = cortices.filter(
     (cortex) => cortex.activation?.enabled !== false,
   ).length;
@@ -350,9 +349,23 @@ const BackgroundCorticesConfig: React.FC<BackgroundCorticesConfigProps> = ({
   const handleAddCortex = (agentId: string) => {
     if (!agentId || addedCortexIds.has(agentId)) return;
 
+    const route = defaultActivationRoute;
+    if (!route.model || !route.provider) return;
+    const routeTemplate = cortices.find(
+      (cortex) => activationModelKey(cortex.activation) === activationModelKey(route),
+    );
+    const fallbacks = routeTemplate?.activation?.fallbacks?.map((fallback) => ({ ...fallback }));
+    const activationFailureVisibility = routeTemplate?.activation?.activation_failure_visibility;
     const newCortex: BackgroundCortex = {
       agent_id: agentId,
-      activation: { ...DEFAULT_ACTIVATION_CONFIG },
+      activation: {
+        ...DEFAULT_ACTIVATION_CONFIG,
+        ...route,
+        ...(fallbacks?.length ? { fallbacks } : {}),
+        ...(activationFailureVisibility
+          ? { activation_failure_visibility: activationFailureVisibility }
+          : {}),
+      },
     };
 
     field.onChange([...cortices, newCortex]);
@@ -398,6 +411,7 @@ const BackgroundCorticesConfig: React.FC<BackgroundCorticesConfigProps> = ({
                 cortex={cortex}
                 index={index}
                 agentsMap={agentsMap}
+                models={models}
                 onUpdate={handleUpdateCortex}
                 onRemove={handleRemoveCortex}
               />
@@ -420,6 +434,7 @@ const BackgroundCorticesConfig: React.FC<BackgroundCorticesConfigProps> = ({
             items={selectableAgents}
             displayValue=""
             SelectIcon={<Plus className="h-4 w-4" />}
+            disabled={!canAddCortex}
             className="h-10 w-full border-border-heavy"
             containerClassName="px-0"
           />

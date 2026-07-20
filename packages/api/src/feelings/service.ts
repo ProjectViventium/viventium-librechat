@@ -5,6 +5,8 @@ import {
   FEELING_BANDS,
   hashFeelingSnapshot,
   materializeFeelingBands,
+  normalizeFeelingRangePromptOverrides,
+  summarizeFeelingRangePromptOverrides,
 } from './kernel';
 import { resolveFeelingsRuntimeConfig } from './config';
 import {
@@ -22,12 +24,14 @@ import type {
   FeelingsReadSnapshot,
   FeelingInnerState,
   FeelingsReactionActivationMode,
+  FeelingRangePromptOverrides,
 } from './types';
 
 type Env = Record<string, string | undefined>;
 type StoredFeelingState = {
   enabled?: boolean;
   bands?: Partial<Record<FeelingBandId, Record<string, unknown>>>;
+  rangePromptOverrides?: FeelingRangePromptOverrides;
   reactionInstruction?: string;
   reactionActivationMode?: FeelingsReactionActivationMode;
   innerState?: FeelingInnerState | null;
@@ -46,6 +50,15 @@ const LEGACY_DEFAULT_REACTION_INSTRUCTIONS = new Set([
 
 const DEFAULT_READ_CACHE_TTL_MS = 5000;
 const readCache = new Map<string, { expiresAt: number; value: FeelingsReadSnapshot }>();
+const readCacheGenerationTokens = new Map<string, object>();
+
+function readCacheGenerationToken(key: string): object {
+  const existing = readCacheGenerationTokens.get(key);
+  if (existing) return existing;
+  const token = {};
+  readCacheGenerationTokens.set(key, token);
+  return token;
+}
 
 const reactionChangeSchema = z
   .object({
@@ -89,10 +102,13 @@ export type FeelingReactionChange = z.infer<typeof reactionChangeSchema>;
 
 export function clearFeelingsReadCache(userId?: string): void {
   if (userId) {
-    readCache.delete(String(userId));
+    const key = String(userId);
+    readCache.delete(key);
+    readCacheGenerationTokens.set(key, {});
     return;
   }
   readCache.clear();
+  readCacheGenerationTokens.clear();
 }
 
 function mergedStoredBands(
@@ -122,6 +138,7 @@ export function createInitialFeelingState({
   return {
     enabled: config.defaultEnabled,
     bands,
+    rangePromptOverrides: {} as FeelingRangePromptOverrides,
     reactionInstruction: DEFAULT_REACTION_INSTRUCTION,
     reactionActivationMode: config.reaction.activationMode,
     innerState: null as FeelingInnerState | null,
@@ -189,6 +206,9 @@ export async function loadFeelingsReadContext({
   if (cached && cached.expiresAt > nowMs) {
     return { ...cached.value, cacheHit: true };
   }
+  // A mutation can invalidate this user while the database read is still in flight. Retain the
+  // snapshot for this caller, but only cache it if its generation is still current afterward.
+  const cacheGeneration = !bypassCache ? readCacheGenerationToken(key) : null;
 
   const config = resolveFeelingsRuntimeConfig(env);
   const stored = config.available ? await getFeelingState(key) : null;
@@ -196,7 +216,12 @@ export async function loadFeelingsReadContext({
   const bands = materializeFeelingBands(mergedStoredBands(config.bands, stored?.bands), now);
   const enabled = config.available && (stored?.enabled ?? initial.enabled);
   const version = Number.isInteger(stored?.version) ? Number(stored?.version) : 0;
-  const capsule = buildFeelingCapsule({ enabled, bands });
+  const rangePromptOverrides = normalizeFeelingRangePromptOverrides(stored?.rangePromptOverrides);
+  const rangePromptSummary = summarizeFeelingRangePromptOverrides({
+    bands,
+    rangePromptOverrides,
+  });
+  const capsule = buildFeelingCapsule({ enabled, bands, rangePromptOverrides });
   const snapshot: FeelingsReadSnapshot = {
     available: config.available,
     enabled,
@@ -204,8 +229,10 @@ export async function loadFeelingsReadContext({
     version,
     asOf: now.toISOString(),
     bands,
+    rangePromptOverrides,
+    ...rangePromptSummary,
     capsule,
-    snapshotHash: hashFeelingSnapshot({ enabled, bands, version }),
+    snapshotHash: hashFeelingSnapshot({ enabled, bands, version, rangePromptOverrides }),
     reactionInstruction: normalizedReactionInstruction(stored?.reactionInstruction),
     reactionActivationMode: stored?.reactionActivationMode ?? config.reaction.activationMode,
     innerState: normalizedInnerState(stored?.innerState),
@@ -213,7 +240,11 @@ export async function loadFeelingsReadContext({
     reactionHealth: stored?.reactionHealth ?? initial.reactionHealth,
     cacheHit: false,
   };
-  if (!bypassCache) {
+  if (
+    !bypassCache &&
+    cacheGeneration != null &&
+    readCacheGenerationTokens.get(key) === cacheGeneration
+  ) {
     readCache.set(key, {
       expiresAt: nowMs + DEFAULT_READ_CACHE_TTL_MS,
       value: snapshot,

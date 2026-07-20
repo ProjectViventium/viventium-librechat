@@ -3,6 +3,7 @@
 const {
   feelingsRequestId,
   logFeelingsEvent,
+  summarizeFeelingCapsulePlacement,
   splitEventPayload,
 } = require('~/server/services/viventium/feelingsTelemetry');
 
@@ -42,6 +43,39 @@ describe('Feelings telemetry', () => {
     expect(feelingsRequestId({ body: { text: 'private' } })).toBe('unknown');
   });
 
+  test('summarizes final-run capsule placement without exposing prompt text', () => {
+    const capsule = '<viventium_feeling_state>synthetic</viventium_feeling_state>';
+
+    expect(
+      summarizeFeelingCapsulePlacement({
+        instructions: `base\n\n${capsule}\n\nstructural output contract`,
+        capsule,
+      }),
+    ).toEqual({
+      presentInFinalRun: true,
+      capsuleOccurrenceCount: 1,
+      placement: 'followed_by_runtime_contracts',
+      trailingInstructionChars: 26,
+    });
+    expect(
+      summarizeFeelingCapsulePlacement({
+        instructions: `base\n\n${capsule}`,
+        capsule,
+      }),
+    ).toEqual({
+      presentInFinalRun: true,
+      capsuleOccurrenceCount: 1,
+      placement: 'final_instruction_layer',
+      trailingInstructionChars: 0,
+    });
+    expect(summarizeFeelingCapsulePlacement({ instructions: 'base only', capsule })).toEqual({
+      presentInFinalRun: false,
+      capsuleOccurrenceCount: 0,
+      placement: 'absent',
+      trailingInstructionChars: 0,
+    });
+  });
+
   test('drops undeclared fields so raw prompts, prose, and identifiers cannot enter Feelings logs', () => {
     const logger = { info: jest.fn() };
     const privateCanary = 'PRIVATE-FEELINGS-CANARY-9271';
@@ -71,6 +105,47 @@ describe('Feelings telemetry', () => {
     ]) {
       expect(messages).not.toContain(`"${forbiddenField}"`);
     }
+  });
+
+  test('retains bounded reaction-calibration counts without raw model or user content', () => {
+    const logger = { info: jest.fn() };
+    logFeelingsEvent(logger, { id: 'request-calibration' }, 'feelings.reaction.write', {
+      strengthCounts: { slight: 1, clear: 2, strong: 1 },
+      deltaMagnitudeCounts: { 3: 1, 8: 2, 11: 1 },
+    });
+
+    const messages = logger.info.mock.calls.map(([message]) => message).join('\n');
+    expect(messages).toContain('strengthCounts');
+    expect(messages).toContain('deltaMagnitudeCounts');
+    expect(messages).not.toContain('request-calibration');
+  });
+
+  test('retains range-prompt counts and identifiers but never the custom instruction', () => {
+    const logger = { info: jest.fn() };
+    const privateCanary = 'PRIVATE-RANGE-FEELING-CANARY';
+    logFeelingsEvent(logger, { id: 'request-range' }, 'feelings.api.write', {
+      bandId: 'play',
+      rangeLevelId: 'level_4',
+      rangePromptOverrideChanged: true,
+      rangePromptOverridePresent: true,
+      rangePromptOverrideCount: 3,
+      activeRangePromptOverrideCount: 1,
+      activeRangePromptOverrideChars: 44,
+      rangePromptInstruction: privateCanary,
+    });
+
+    const messages = logger.info.mock.calls.map(([message]) => message).join('\n');
+    for (const value of [
+      'bandId',
+      'rangeLevelId',
+      'rangePromptOverrideChanged',
+      'rangePromptOverrideCount',
+      'activeRangePromptOverrideChars',
+    ]) {
+      expect(messages).toContain(value);
+    }
+    expect(messages).not.toContain(privateCanary);
+    expect(messages).not.toContain('rangePromptInstruction');
   });
 
   test('splits long events into complete parseable log envelopes before formatter truncation', () => {

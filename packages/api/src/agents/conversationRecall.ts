@@ -26,6 +26,8 @@ export type ConversationRecallAttachmentReason =
   | 'stale_corpus'
   | 'runtime_unconfigured'
   | 'runtime_http_error'
+  | 'runtime_unhealthy'
+  | 'runtime_invalid_response'
   | 'runtime_timeout'
   | 'runtime_unreachable'
   | 'runtime_stale_restore';

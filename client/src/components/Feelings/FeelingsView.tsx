@@ -6,10 +6,14 @@ import { Dialog, DialogPanel, DialogTitle } from '@headlessui/react';
 import type {
   FeelingBandId,
   FeelingBandDefinition,
+  FeelingLevelId,
   FeelingTrailEntry,
   UpdateFeelingBand,
 } from 'librechat-data-provider';
-import { VISIBLE_FEELING_TRAIL_LIMIT } from 'librechat-data-provider';
+import {
+  MAX_FEELING_RANGE_PROMPT_CHARS,
+  VISIBLE_FEELING_TRAIL_LIMIT,
+} from 'librechat-data-provider';
 import {
   useDeleteFeelingsMutation,
   useFeelingsQuery,
@@ -57,8 +61,23 @@ const REACTION_CAUSE_LABELS: Record<string, string> = {
   reset_to_nature: 'Reset to Nature',
 };
 
+const RANGE_COMMIT_KEYS = new Set([
+  'ArrowUp',
+  'ArrowRight',
+  'ArrowDown',
+  'ArrowLeft',
+  'Home',
+  'End',
+  'PageUp',
+  'PageDown',
+]);
+
 function feelingWord(definition: FeelingBandDefinition, value: number) {
-  return definition.words[Math.min(4, Math.floor(Math.max(0, Math.min(100, value)) / 20))];
+  return feelingLevel(definition, value).word;
+}
+
+function feelingLevel(definition: FeelingBandDefinition, value: number) {
+  return definition.levels[Math.min(4, Math.floor(Math.max(0, Math.min(100, value)) / 20))];
 }
 
 function halfLifeLabel(minutes: number) {
@@ -169,6 +188,8 @@ export default function FeelingsView() {
   const [draftCurrent, setDraftCurrent] = useState(0);
   const [draftBaseline, setDraftBaseline] = useState(0);
   const [draftHalfLife, setDraftHalfLife] = useState(20);
+  const [selectedRangeLevelId, setSelectedRangeLevelId] = useState<FeelingLevelId>('level_2');
+  const [rangePromptDraft, setRangePromptDraft] = useState('');
   const [notice, setNotice] = useState('');
   const [laneDrafts, setLaneDrafts] = useState<
     Partial<Record<FeelingBandId, { current?: number; baseline?: number }>>
@@ -182,44 +203,103 @@ export default function FeelingsView() {
   const definition = definitions.find((band) => band.id === selectedId) ?? definitions[0];
   const selectedBand = definition ? state?.bands[definition.id] : undefined;
   const stateRef = useRef(state);
-  const previousCurrentsRef = useRef<Partial<Record<FeelingBandId, number>>>({});
+  const draggingBandIdRef = useRef(draggingBandId);
+  const trailEffectMountedRef = useRef(false);
+  const lastAnimatedTrailRef = useRef('');
+  const rangePromptDraftRef = useRef(rangePromptDraft);
+  const rangePromptSyncRef = useRef({ key: '', saved: '' });
   const mutationPending =
     profileMutation.isLoading ||
     bandMutation.isLoading ||
     resetMutation.isLoading ||
     deleteMutation.isLoading;
+  draggingBandIdRef.current = draggingBandId;
+  rangePromptDraftRef.current = rangePromptDraft;
+  const bandSyncSignature = state
+    ? definitions
+        .map((band) => {
+          const value = state.bands[band.id];
+          return `${band.id}:${value.current}:${value.baseline}:${value.halfLifeMinutes}:${value.enabled}`;
+        })
+        .join('|')
+    : '';
+  const latestTrailEntry = state?.trail[state.trail.length - 1];
+  const latestTrailKey = latestTrailEntry
+    ? `${latestTrailEntry.timestamp}:${latestTrailEntry.band}:${latestTrailEntry.after}:${latestTrailEntry.sourceType}`
+    : '';
+  const selectedSavedRangePrompt =
+    definition && state
+      ? (state.rangePromptOverrides[definition.id]?.[selectedRangeLevelId] ?? '')
+      : '';
+  const rangePromptContextKey = definition ? `${definition.id}:${selectedRangeLevelId}` : '';
 
   useEffect(() => {
     stateRef.current = state;
   }, [state]);
 
   useEffect(() => {
-    if (!state) return;
-    const previous = previousCurrentsRef.current;
-    const bandIds = Object.keys(state.bands) as FeelingBandId[];
-    const changed = bandIds
-      .filter((bandId) => {
-        const before = previous[bandId];
-        return before != null && Math.abs(before - state.bands[bandId].current) >= 0.5;
-      })
-      .map((bandId) => bandId);
-    const latestTrail = state.trail[state.trail.length - 1];
-    previousCurrentsRef.current = Object.fromEntries(
-      bandIds.map((bandId) => [bandId, state.bands[bandId].current]),
-    );
+    if (!bandSyncSignature || draggingBandIdRef.current) return;
     setLaneDrafts({});
-    if (!changed.length || latestTrail?.sourceType !== 'user_turn') return;
+  }, [bandSyncSignature]);
+
+  useEffect(() => {
+    if (!trailEffectMountedRef.current) {
+      trailEffectMountedRef.current = true;
+      lastAnimatedTrailRef.current = latestTrailKey;
+      return;
+    }
+    if (!latestTrailKey || latestTrailKey === lastAnimatedTrailRef.current) return;
+    lastAnimatedTrailRef.current = latestTrailKey;
+    const latest = stateRef.current?.trail[stateRef.current.trail.length - 1];
+    if (!latest || latest.sourceType !== 'user_turn') return;
+    const timestamp = String(latest.timestamp);
+    const changed = Array.from(
+      new Set(
+        (stateRef.current?.trail ?? [])
+          .filter(
+            (entry) => entry.sourceType === 'user_turn' && String(entry.timestamp) === timestamp,
+          )
+          .map((entry) => entry.band),
+      ),
+    );
+    if (!changed.length) return;
     setReactingBandIds(changed);
     const timeout = window.setTimeout(() => setReactingBandIds([]), 1500);
     return () => window.clearTimeout(timeout);
-  }, [state]);
+  }, [latestTrailKey]);
 
   useEffect(() => {
     if (!selectedBand) return;
+    if (draggingBandIdRef.current === selectedId) return;
     setDraftCurrent(Math.round(selectedBand.current));
     setDraftBaseline(Math.round(selectedBand.baseline));
     setDraftHalfLife(selectedBand.halfLifeMinutes);
-  }, [selectedBand, selectedId]);
+  }, [
+    definition?.id,
+    selectedBand?.baseline,
+    selectedBand?.current,
+    selectedBand?.halfLifeMinutes,
+    selectedId,
+  ]);
+
+  useEffect(() => {
+    if (!definition || !selectedBand) return;
+    setSelectedRangeLevelId(feelingLevel(definition, selectedBand.current).id);
+  }, [definition?.id]);
+
+  useEffect(() => {
+    if (!definition || !state) return;
+    const previous = rangePromptSyncRef.current;
+    const contextChanged = previous.key !== rangePromptContextKey;
+    const hasUnsavedLocalEdit = rangePromptDraftRef.current !== previous.saved;
+    if (contextChanged || !hasUnsavedLocalEdit) {
+      setRangePromptDraft(selectedSavedRangePrompt);
+    }
+    rangePromptSyncRef.current = {
+      key: rangePromptContextKey,
+      saved: selectedSavedRangePrompt,
+    };
+  }, [definition?.id, rangePromptContextKey, selectedSavedRangePrompt, state]);
 
   useEffect(() => {
     if (!state) return;
@@ -403,6 +483,10 @@ export default function FeelingsView() {
   }
 
   const selectedColorStyle = { '--selected-color': definition.color } as React.CSSProperties;
+  const activeLevel = feelingLevel(definition, draftCurrent);
+  const selectedRangeLevel =
+    definition.levels.find((level) => level.id === selectedRangeLevelId) ?? activeLevel;
+  const savedRangePrompt = state.rangePromptOverrides[definition.id]?.[selectedRangeLevel.id] ?? '';
   const health = state.reactionHealth;
   const healthLabel =
     health.status === 'running'
@@ -441,6 +525,7 @@ export default function FeelingsView() {
             <button
               className="feelings-utility reset-label"
               type="button"
+              aria-label="Reset state"
               disabled={mutationPending}
               onClick={() =>
                 void runMutation(
@@ -449,7 +534,8 @@ export default function FeelingsView() {
                 )
               }
             >
-              Reset state
+              <RotateCcw size={14} aria-hidden="true" />
+              <span>Reset state</span>
             </button>
             <button
               className="feelings-master-toggle"
@@ -642,6 +728,72 @@ export default function FeelingsView() {
               )}
             </div>
 
+            <div className="feelings-state-details">
+              <section className="feelings-capsule" aria-labelledby="capsule-title">
+                <div>
+                  <h3 id="capsule-title">What Viv feels</h3>
+                  <span>
+                    {activeBands} of {definitions.length} felt
+                  </span>
+                </div>
+                {state.capsule ? (
+                  <pre>{state.capsule}</pre>
+                ) : (
+                  <p>No feeling-state block exists while Feelings are off.</p>
+                )}
+              </section>
+
+              <section className="feelings-trail" aria-labelledby="trail-title">
+                <div>
+                  <div>
+                    <h3 id="trail-title">Reaction trail</h3>
+                    <p>What moved the state · message text is not stored</p>
+                  </div>
+                  <span>last 10</span>
+                </div>
+                <div className="feelings-trail-list">
+                  {state.trail.length === 0 && <p>No reactions yet.</p>}
+                  {[...state.trail]
+                    .slice(-VISIBLE_FEELING_TRAIL_LIMIT)
+                    .reverse()
+                    .map((entry, index) => {
+                      const entryDefinition = definitions.find((band) => band.id === entry.band);
+                      return (
+                        <div
+                          className="feelings-trail-entry"
+                          key={`${entry.timestamp}-${entry.band}-${index}`}
+                        >
+                          <time>
+                            {new Date(entry.timestamp).toLocaleString([], {
+                              month: 'short',
+                              day: 'numeric',
+                              hour: '2-digit',
+                              minute: '2-digit',
+                            })}
+                          </time>
+                          <div>
+                            <em>
+                              {REACTION_CAUSE_LABELS[entry.cause] ||
+                                (entry.sourceType === 'user_turn'
+                                  ? 'The user moment'
+                                  : 'Manual change')}
+                            </em>
+                            <strong>
+                              {entryDefinition?.name || entry.band}{' '}
+                              {trailVerb(entry.direction, entry.strength)}
+                            </strong>
+                            <span>
+                              {Math.round(entry.before)} → {Math.round(entry.after)} ·{' '}
+                              {entry.sourceType.replace('_', ' ')}
+                            </span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                </div>
+              </section>
+            </div>
+
             <details className="feelings-research">
               <summary>
                 <span>Future feeling research · visible here, never injected</span>
@@ -710,6 +862,7 @@ export default function FeelingsView() {
               <input
                 id="feeling-current"
                 aria-label="Current feeling"
+                aria-valuetext={`${feelingWord(definition, draftCurrent)}, ${draftCurrent}; ${definition.lowLabel} to ${definition.highLabel}`}
                 type="range"
                 min="0"
                 max="100"
@@ -722,14 +875,15 @@ export default function FeelingsView() {
                     `${definition.name} moved.`,
                   )
                 }
-                onKeyUp={() =>
+                onKeyUp={(event) => {
+                  if (!RANGE_COMMIT_KEYS.has(event.key)) return;
                   void runMutation(
                     () => updateBand({ current: draftCurrent }),
                     `${definition.name} moved.`,
-                  )
-                }
+                  );
+                }}
               />
-              <div className="feelings-control-poles" aria-hidden="true">
+              <div className="feelings-control-poles">
                 <span>{definition.lowLabel}</span>
                 <span>{definition.highLabel}</span>
               </div>
@@ -745,6 +899,7 @@ export default function FeelingsView() {
               <input
                 id="feeling-nature"
                 aria-label="Nature / resting point"
+                aria-valuetext={`${feelingWord(definition, draftBaseline)}, ${draftBaseline}; ${definition.lowLabel} to ${definition.highLabel}`}
                 className="is-nature"
                 type="range"
                 min="0"
@@ -758,14 +913,15 @@ export default function FeelingsView() {
                     `${definition.name} nature changed.`,
                   )
                 }
-                onKeyUp={() =>
+                onKeyUp={(event) => {
+                  if (!RANGE_COMMIT_KEYS.has(event.key)) return;
                   void runMutation(
                     () => updateBand({ baseline: draftBaseline }),
                     `${definition.name} nature changed.`,
-                  )
-                }
+                  );
+                }}
               />
-              <div className="feelings-control-poles" aria-hidden="true">
+              <div className="feelings-control-poles">
                 <span>{definition.lowLabel}</span>
                 <span>{definition.highLabel}</span>
               </div>
@@ -801,65 +957,141 @@ export default function FeelingsView() {
               </select>
             </div>
 
-            <section className="feelings-capsule" aria-labelledby="capsule-title">
-              <div>
-                <h3 id="capsule-title">What Viv feels</h3>
-                <span>
-                  {activeBands} of {definitions.length} felt
-                </span>
-              </div>
-              {state.capsule ? (
-                <pre>{state.capsule}</pre>
-              ) : (
-                <p>No feeling-state block exists while Feelings are off.</p>
-              )}
-            </section>
-
-            <section className="feelings-trail" aria-labelledby="trail-title">
-              <div>
+            <section className="feelings-range-editor" aria-labelledby="range-editor-title">
+              <div className="feelings-range-heading">
                 <div>
-                  <h3 id="trail-title">Reaction trail</h3>
-                  <p>What moved the state · message text is not stored</p>
+                  <h3 id="range-editor-title">Feeling ranges</h3>
+                  <p>Shape how each depth is felt. Only the current range reaches Viv.</p>
                 </div>
-                <span>last 10</span>
+                <span>{state.rangePromptOverrideCount} customized</span>
               </div>
-              <div className="feelings-trail-list">
-                {state.trail.length === 0 && <p>No reactions yet.</p>}
-                {[...state.trail]
-                  .slice(-VISIBLE_FEELING_TRAIL_LIMIT)
-                  .reverse()
-                  .map((entry, index) => {
-                    const entryDefinition = definitions.find((band) => band.id === entry.band);
-                    return (
-                      <div
-                        className="feelings-trail-entry"
-                        key={`${entry.timestamp}-${entry.band}-${index}`}
-                      >
-                        <time>
-                          {new Date(entry.timestamp).toLocaleTimeString([], {
-                            hour: '2-digit',
-                            minute: '2-digit',
-                          })}
-                        </time>
-                        <div>
-                          <em>
-                            {REACTION_CAUSE_LABELS[entry.cause] ||
-                              (entry.sourceType === 'user_turn'
-                                ? 'The user moment'
-                                : 'Manual change')}
-                          </em>
-                          <strong>
-                            {entryDefinition?.name || entry.band}{' '}
-                            {trailVerb(entry.direction, entry.strength)}
-                          </strong>
-                          <span>
-                            {Math.round(entry.before)} → {Math.round(entry.after)} ·{' '}
-                            {entry.sourceType.replace('_', ' ')}
-                          </span>
-                        </div>
-                      </div>
-                    );
-                  })}
+              <div
+                className="feelings-range-tabs"
+                role="tablist"
+                aria-label={`${definition.name} feeling ranges`}
+              >
+                {definition.levels.map((level, levelIndex) => {
+                  const isActive = level.id === activeLevel.id;
+                  const isSelected = level.id === selectedRangeLevel.id;
+                  const isCustomized = Boolean(
+                    state.rangePromptOverrides[definition.id]?.[level.id],
+                  );
+                  return (
+                    <button
+                      key={level.id}
+                      id={`feeling-range-tab-${definition.id}-${level.id}`}
+                      type="button"
+                      role="tab"
+                      className={`${isSelected ? 'is-selected' : ''} ${isActive ? 'is-active' : ''}`}
+                      aria-selected={isSelected}
+                      aria-controls={`feeling-range-panel-${definition.id}-${level.id}`}
+                      tabIndex={isSelected ? 0 : -1}
+                      aria-label={`${level.min}–${level.max}: ${level.word}${isActive ? ', current range' : ''}${isCustomized ? ', customized' : ''}`}
+                      onClick={() => setSelectedRangeLevelId(level.id)}
+                      onKeyDown={(event) => {
+                        const lastIndex = definition.levels.length - 1;
+                        const nextIndex =
+                          event.key === 'ArrowRight' || event.key === 'ArrowDown'
+                            ? (levelIndex + 1) % definition.levels.length
+                            : event.key === 'ArrowLeft' || event.key === 'ArrowUp'
+                              ? (levelIndex - 1 + definition.levels.length) %
+                                definition.levels.length
+                              : event.key === 'Home'
+                                ? 0
+                                : event.key === 'End'
+                                  ? lastIndex
+                                  : null;
+                        if (nextIndex === null) return;
+                        event.preventDefault();
+                        const tabs =
+                          event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>(
+                            '[role="tab"]',
+                          );
+                        setSelectedRangeLevelId(definition.levels[nextIndex].id);
+                        tabs?.[nextIndex]?.focus();
+                      }}
+                    >
+                      <i>
+                        {level.min}–{level.max}
+                      </i>
+                      <strong>{level.word}</strong>
+                      <span>
+                        {isActive && <b>NOW</b>}
+                        {isCustomized && <b>CUSTOM</b>}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+              <div
+                id={`feeling-range-panel-${definition.id}-${selectedRangeLevel.id}`}
+                className="feelings-range-panel"
+                role="tabpanel"
+                aria-labelledby={`feeling-range-tab-${definition.id}-${selectedRangeLevel.id}`}
+              >
+                <div className="feelings-range-default">
+                  <span>Default felt cause</span>
+                  <p>{selectedRangeLevel.instruction}</p>
+                </div>
+                <label className="feelings-range-addition" htmlFor="feeling-range-addition">
+                  <span>Your optional addition</span>
+                  <textarea
+                    id="feeling-range-addition"
+                    aria-label={`Your added feeling for ${selectedRangeLevel.word}`}
+                    maxLength={MAX_FEELING_RANGE_PROMPT_CHARS}
+                    value={rangePromptDraft}
+                    placeholder="Add a more personal felt pull for this range…"
+                    disabled={mutationPending}
+                    onChange={(event) => setRangePromptDraft(event.target.value)}
+                  />
+                  <small>
+                    Added after the default · {rangePromptDraft.length}/
+                    {MAX_FEELING_RANGE_PROMPT_CHARS}
+                  </small>
+                </label>
+                <div className="feelings-range-actions">
+                  <button
+                    type="button"
+                    disabled={mutationPending || !savedRangePrompt}
+                    onClick={() =>
+                      void runMutation(
+                        () =>
+                          updateBand({
+                            rangePromptOverride: {
+                              levelId: selectedRangeLevel.id,
+                              instruction: null,
+                            },
+                          }),
+                        `${definition.name} ${selectedRangeLevel.word} restored.`,
+                      )
+                    }
+                  >
+                    Restore default range feeling
+                  </button>
+                  <button
+                    className="is-primary"
+                    type="button"
+                    disabled={
+                      mutationPending ||
+                      !rangePromptDraft.trim() ||
+                      rangePromptDraft.trim() === savedRangePrompt
+                    }
+                    onClick={() =>
+                      void runMutation(
+                        () =>
+                          updateBand({
+                            rangePromptOverride: {
+                              levelId: selectedRangeLevel.id,
+                              instruction: rangePromptDraft.trim(),
+                            },
+                          }),
+                        `${definition.name} ${selectedRangeLevel.word} customized.`,
+                      )
+                    }
+                  >
+                    Save range feeling
+                  </button>
+                </div>
               </div>
             </section>
           </aside>

@@ -1,8 +1,8 @@
 import { z } from 'zod';
 import { openAISchema } from 'librechat-data-provider';
-import type { TConfig } from 'librechat-data-provider';
+import type { BindToolsInput } from '@librechat/agents/langchain/language_models/chat_models';
 import type { OpenAIClientOptions, Providers } from '@librechat/agents';
-import type { BindToolsInput } from '@langchain/core/language_models/chat_models';
+import type { TConfig } from 'librechat-data-provider';
 import type { AzureOptions } from './azure';
 
 export type OpenAIParameters = z.infer<typeof openAISchema>;
@@ -24,6 +24,15 @@ export interface OpenAIConfigOptions {
   addParams?: Record<string, unknown>;
   dropParams?: string[];
   customParams?: Partial<TConfig['customParams']>;
+  /* === VIVENTIUM START ===
+   * Feature: Connected-account early-401 recovery
+   * Purpose: Keep refresh ownership outside the generic fetch adapter.
+   */
+  connectedAccountAuthRefresh?: () => Promise<{
+    apiKey: string;
+    headers?: Record<string, string>;
+  }>;
+  /* === VIVENTIUM END === */
 }
 
 export type OpenAIConfiguration = OpenAIClientOptions['configuration'];

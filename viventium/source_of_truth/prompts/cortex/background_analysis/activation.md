@@ -2,7 +2,7 @@
 id: cortex.background_analysis.activation
 owner_layer: viventium_cortex_activation
 target: mainAgent.background_cortices.agent_viventium_background_analysis_95aeb3.activation.prompt
-version: 2
+version: 3
 status: active
 safety_class: public_product
 required_context: []
@@ -23,6 +23,9 @@ NEGATIVE PRECEDENCE — return false for:
 - direct tool, search, inbox, file, scheduling, worker, agent, or status actions
 - an explicit Red Team/bias/pattern/emotional/product-help request unless the latest message also asks
   for a distinct general analysis
+- interpreting another person's feelings, emotional subtext, relational tension, or a mismatch between
+  words and communication style; Emotional Resonance owns that lens unless the latest message also asks
+  for a distinct decision, tradeoff, risk, or general-analysis deliverable
 - quoted, hypothetical, negated, or output-format-only analysis language
 
 Contrast:

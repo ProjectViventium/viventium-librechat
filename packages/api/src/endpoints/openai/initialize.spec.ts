@@ -225,6 +225,110 @@ describe('initializeOpenAI', () => {
     expect(persistedValue.oauthExpiresAt).toBeGreaterThan(Date.now());
   });
 
+  it('should expose a bounded refresh callback for an early connected-account 401', async () => {
+    const currentValues = {
+      apiKey: 'not-yet-expired-but-rejected-token',
+      baseURL: 'https://chatgpt.com/backend-api/codex',
+      headers: { 'chatgpt-account-id': 'acct_old' },
+      refreshToken: 'refresh-token',
+      oauthProvider: 'openai-codex',
+      oauthType: 'subscription',
+      oauthExpiresAt: Date.now() + 60 * 60 * 1000,
+    };
+    const accessTokenPayload = Buffer.from(
+      JSON.stringify({
+        'https://api.openai.com/auth': { chatgpt_account_id: 'acct_refreshed' },
+      }),
+    ).toString('base64url');
+    const refreshedAccessToken = `header.${accessTokenPayload}.signature`;
+    jest.mocked(global.fetch).mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      text: async () =>
+        JSON.stringify({
+          access_token: refreshedAccessToken,
+          refresh_token: 'rotated-refresh-token',
+          expires_in: 28800,
+        }),
+    } as Response);
+    const getUserKeyValues = jest.fn().mockResolvedValue(currentValues);
+    const params = createParams({ dbOverrides: { getUserKeyValues } });
+
+    await initializeOpenAI(params);
+
+    const options = mockGetOpenAIConfig.mock.calls[0]?.[1] as {
+      connectedAccountAuthRefresh?: () => Promise<{
+        apiKey: string;
+        headers?: Record<string, string>;
+      }>;
+    };
+    expect(options.connectedAccountAuthRefresh).toBeDefined();
+    const refreshedAuth = await options.connectedAccountAuthRefresh?.();
+    expect(refreshedAuth).toEqual({
+      apiKey: refreshedAccessToken,
+      headers: expect.objectContaining({
+        'chatgpt-account-id': 'acct_refreshed',
+      }),
+    });
+    expect(getUserKeyValues).toHaveBeenCalledTimes(2);
+    expect(params.db.updateUserKey).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId: 'user-123',
+        name: EModelEndpoint.openAI,
+        expiresAt: null,
+      }),
+    );
+  });
+
+  it('should deduplicate concurrent early-401 refreshes for the same user', async () => {
+    const currentValues = {
+      apiKey: 'concurrently-rejected-token',
+      baseURL: 'https://chatgpt.com/backend-api/codex',
+      headers: { 'chatgpt-account-id': 'acct_old' },
+      refreshToken: 'concurrent-refresh-token',
+      oauthProvider: 'openai-codex',
+      oauthType: 'subscription',
+      oauthExpiresAt: Date.now() + 60 * 60 * 1000,
+    };
+    const accessTokenPayload = Buffer.from(
+      JSON.stringify({
+        'https://api.openai.com/auth': { chatgpt_account_id: 'acct_concurrent' },
+      }),
+    ).toString('base64url');
+    const refreshedAccessToken = `header.${accessTokenPayload}.signature`;
+    const mockFetch = jest.mocked(global.fetch).mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      text: async () =>
+        JSON.stringify({
+          access_token: refreshedAccessToken,
+          refresh_token: 'rotated-concurrent-refresh-token',
+          expires_in: 28800,
+        }),
+    } as Response);
+    const params = createParams({
+      dbOverrides: { getUserKeyValues: jest.fn().mockResolvedValue(currentValues) },
+    });
+
+    await initializeOpenAI(params);
+    const options = mockGetOpenAIConfig.mock.calls[0]?.[1] as {
+      connectedAccountAuthRefresh?: () => Promise<{ apiKey: string }>;
+    };
+
+    const [first, second] = await Promise.all([
+      options.connectedAccountAuthRefresh?.(),
+      options.connectedAccountAuthRefresh?.(),
+    ]);
+
+    expect(first?.apiKey).toBe(refreshedAccessToken);
+    expect(second?.apiKey).toBe(refreshedAccessToken);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    // One normal non-expiring persistence during initialization, then one rotated-token write.
+    expect(params.db.updateUserKey).toHaveBeenCalledTimes(2);
+  });
+
   it('should surface reconnect guidance when expired OpenAI subscription refresh fails', async () => {
     const mockFetch = jest.mocked(global.fetch);
     mockFetch.mockResolvedValue({

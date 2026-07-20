@@ -10,6 +10,14 @@ export const FEELING_BAND_IDS = [
   'play',
 ] as const;
 
+export const FEELING_LEVEL_IDS = [
+  'level_0',
+  'level_1',
+  'level_2',
+  'level_3',
+  'level_4',
+] as const;
+
 export const FEELING_MODEL_REACTION_CAUSES = [
   'playful_exchange',
   'connection_bid',
@@ -34,9 +42,19 @@ export const FEELING_REACTION_CAUSES = [
 ] as const;
 
 export const VISIBLE_FEELING_TRAIL_LIMIT = 10;
+export const MAX_FEELING_RANGE_PROMPT_CHARS = 1200;
 
 export type FeelingBandId = (typeof FEELING_BAND_IDS)[number];
+export type FeelingLevelId = (typeof FEELING_LEVEL_IDS)[number];
 export type FeelingReactionCause = (typeof FEELING_REACTION_CAUSES)[number];
+
+export type FeelingLevelDefinition = {
+  id: FeelingLevelId;
+  min: number;
+  max: number;
+  word: string;
+  instruction: string;
+};
 
 export type FeelingBandDefinition = {
   id: FeelingBandId;
@@ -48,7 +66,13 @@ export type FeelingBandDefinition = {
   highLabel: string;
   baseline: number;
   halfLifeMinutes: number;
-  words: [string, string, string, string, string];
+  levels: [
+    FeelingLevelDefinition,
+    FeelingLevelDefinition,
+    FeelingLevelDefinition,
+    FeelingLevelDefinition,
+    FeelingLevelDefinition,
+  ];
 };
 
 export type FeelingBandState = {
@@ -77,6 +101,12 @@ export type FeelingsState = {
   version: number;
   asOf: string;
   bands: Record<FeelingBandId, FeelingBandState>;
+  rangePromptOverrides: Partial<
+    Record<FeelingBandId, Partial<Record<FeelingLevelId, string>>>
+  >;
+  rangePromptOverrideCount: number;
+  activeRangePromptOverrideCount: number;
+  activeRangePromptOverrideChars: number;
   capsule: string;
   snapshotHash: string;
   reactionInstruction: string;
@@ -140,4 +170,8 @@ export type UpdateFeelingBand = {
   halfLifeMinutes?: number;
   enabled?: boolean;
   reset?: boolean;
+  rangePromptOverride?: {
+    levelId: FeelingLevelId;
+    instruction: string | null;
+  };
 };

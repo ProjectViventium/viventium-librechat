@@ -47,6 +47,42 @@ describe('memory policy', () => {
       );
       expect(result.appliedRevisions).toEqual({ me: 8 });
     });
+
+    it('leaves protected conversation-owned keys untouched', async () => {
+      const setMemory = jest.fn().mockResolvedValue({ ok: true, revision: 8 });
+
+      const result = await runMemoryMaintenance({
+        userId: 'user-1',
+        getAllUserMemories: async () => [
+          {
+            key: 'working',
+            value: 'Current critical event that must survive.\n_stale_after: 2026-07-10',
+            tokenCount: 68,
+            updated_at: new Date('2026-07-10T10:00:00.000Z'),
+            __v: 7,
+          },
+          {
+            key: 'me',
+            value: 'Stable preference;;;;;;;;;;;;;;;;;;;;;;;; concise wins',
+            tokenCount: 55,
+            updated_at: new Date('2026-07-10T10:00:00.000Z'),
+            __v: 7,
+          },
+        ],
+        setMemory,
+        policy: {
+          tokenLimit: 8000,
+          keyLimits: DEFAULT_VIVENTIUM_MEMORY_KEY_LIMITS,
+          maintenanceThresholdPercent: 80,
+        },
+        protectedKeys: ['working'],
+        now: new Date('2026-07-11T10:00:00.000Z'),
+      });
+
+      expect(setMemory).toHaveBeenCalledWith(expect.objectContaining({ key: 'me' }));
+      expect(setMemory).not.toHaveBeenCalledWith(expect.objectContaining({ key: 'working' }));
+      expect(result.updates.map((update) => update.key)).toEqual(['me']);
+    });
   });
 
   describe('prepareMemoryValueForWrite', () => {

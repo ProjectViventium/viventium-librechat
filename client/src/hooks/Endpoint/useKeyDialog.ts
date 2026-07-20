@@ -25,6 +25,7 @@ type ConnectedAccountStartResponse = {
 
 type UseKeyDialogParams = {
   connectedAccountsEnabled?: boolean;
+  experimentalDirectSubscriptionAuth?: boolean;
 };
 
 function getStateFromAuthUrl(authUrl: string): string | undefined {
@@ -60,7 +61,10 @@ const getProviderEndpoint = (provider: ProviderSlug): EModelEndpoint => {
   return provider === 'openai' ? EModelEndpoint.openAI : EModelEndpoint.anthropic;
 };
 
-export const useKeyDialog = ({ connectedAccountsEnabled = false }: UseKeyDialogParams = {}) => {
+export const useKeyDialog = ({
+  connectedAccountsEnabled = false,
+  experimentalDirectSubscriptionAuth = false,
+}: UseKeyDialogParams = {}) => {
   /* === VIVENTIUM START ===
    * Feature: Connected Accounts provider-auth flows from model selector.
    * Purpose: Open provider-specific sign-in flows without falling back to misleading API key prompts.
@@ -271,7 +275,7 @@ export const useKeyDialog = ({ connectedAccountsEnabled = false }: UseKeyDialogP
       e.stopPropagation();
 
       const provider = getProviderFromEndpoint(ep);
-      if (provider && connectedAccountsEnabled) {
+      if (provider && connectedAccountsEnabled && experimentalDirectSubscriptionAuth) {
         void connectProvider(provider);
         return;
       }
@@ -279,7 +283,7 @@ export const useKeyDialog = ({ connectedAccountsEnabled = false }: UseKeyDialogP
       setKeyDialogEndpoint(ep);
       setKeyDialogOpen(true);
     },
-    [connectProvider, connectedAccountsEnabled],
+    [connectProvider, connectedAccountsEnabled, experimentalDirectSubscriptionAuth],
   );
 
   const onOpenChange = (open: boolean) => {

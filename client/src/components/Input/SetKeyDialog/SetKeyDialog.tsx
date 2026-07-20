@@ -60,20 +60,29 @@ const RevokeKeysButton = ({
   endpoint,
   disabled,
   setDialogOpen,
+  removalMode = 'revoke',
 }: {
   endpoint: string;
   disabled: boolean;
   setDialogOpen: (open: boolean) => void;
+  /* === VIVENTIUM START ===
+   * Feature: Truthful local credential removal.
+   * Purpose: A local database deletion must never claim to revoke provider-side access.
+   * === VIVENTIUM END === */
+  removalMode?: 'revoke' | 'disconnect';
 }) => {
   const localize = useLocalize();
   const [open, setOpen] = useState(false);
   const { showToast } = useToastContext();
   const revokeKeyMutation = useRevokeUserKeyMutation(endpoint);
   const revokeKeysMutation = useRevokeAllUserKeysMutation();
+  const disconnectOnly = removalMode === 'disconnect';
 
   const handleSuccess = () => {
     showToast({
-      message: localize('com_ui_revoke_key_success'),
+      message: localize(
+        disconnectOnly ? 'com_ui_disconnect_key_success' : 'com_ui_revoke_key_success',
+      ),
       status: NotificationSeverity.SUCCESS,
     });
 
@@ -86,7 +95,7 @@ const RevokeKeysButton = ({
 
   const handleError = () => {
     showToast({
-      message: localize('com_ui_revoke_key_error'),
+      message: localize(disconnectOnly ? 'com_ui_disconnect_key_error' : 'com_ui_revoke_key_error'),
       status: NotificationSeverity.ERROR,
     });
   };
@@ -113,16 +122,23 @@ const RevokeKeysButton = ({
             onClick={() => setOpen(true)}
             disabled={disabled}
           >
-            {localize('com_ui_revoke')}
+            {localize(disconnectOnly ? 'com_ui_connected_accounts_disconnect' : 'com_ui_revoke')}
           </Button>
         </OGDialogTrigger>
         <OGDialogContent className="max-w-[450px]">
           <OGDialogHeader>
-            <OGDialogTitle>{localize('com_ui_revoke_key_endpoint', { 0: endpoint })}</OGDialogTitle>
+            <OGDialogTitle>
+              {localize(
+                disconnectOnly ? 'com_ui_disconnect_key_endpoint' : 'com_ui_revoke_key_endpoint',
+                { 0: endpoint },
+              )}
+            </OGDialogTitle>
           </OGDialogHeader>
           <div className="py-4">
             <Label className="text-left text-sm font-medium">
-              {localize('com_ui_revoke_key_confirm')}
+              {localize(
+                disconnectOnly ? 'com_ui_disconnect_key_confirm' : 'com_ui_revoke_key_confirm',
+              )}
             </Label>
           </div>
           <OGDialogFooter>
@@ -135,7 +151,11 @@ const RevokeKeysButton = ({
               disabled={isLoading}
               className="bg-destructive text-white transition-all duration-200 hover:bg-destructive/80"
             >
-              {isLoading ? <Spinner /> : localize('com_ui_revoke')}
+              {isLoading ? (
+                <Spinner />
+              ) : (
+                localize(disconnectOnly ? 'com_ui_connected_accounts_disconnect' : 'com_ui_revoke')
+              )}
             </Button>
           </OGDialogFooter>
         </OGDialogContent>
@@ -150,10 +170,13 @@ const SetKeyDialog = ({
   endpoint,
   endpointType,
   userProvideURL,
+  removalMode = 'revoke',
 }: Pick<TDialogProps, 'open' | 'onOpenChange'> & {
   endpoint: EModelEndpoint | string;
   endpointType?: EModelEndpoint;
   userProvideURL?: boolean | null;
+  /** Viventium local-only removal wording for Connected Accounts. */
+  removalMode?: 'revoke' | 'disconnect';
 }) => {
   const methods = useForm({
     defaultValues: {
@@ -182,7 +205,7 @@ const SetKeyDialog = ({
     setExpiresAtLabel(label);
   };
 
-  const submit = () => {
+  const submit = async () => {
     const selectedOption = expirationOptions.find((option) => option.label === expiresAtLabel);
     let expiresAt: number | null;
 
@@ -192,26 +215,33 @@ const SetKeyDialog = ({
       expiresAt = Date.now() + (selectedOption ? selectedOption.value : 0);
     }
 
-    const saveKey = (key: string) => {
+    const saveKey = async (key: string): Promise<boolean> => {
       try {
-        saveUserKey(key, expiresAt);
+        /* === VIVENTIUM START ===
+         * Feature: Recoverable Connected Accounts key save.
+         * Purpose: Close and clear the dialog only after encrypted storage confirms success.
+         */
+        await saveUserKey(key, expiresAt);
         showToast({
           message: localize('com_ui_save_key_success'),
           status: NotificationSeverity.SUCCESS,
         });
         onOpenChange(false);
+        return true;
+        /* === VIVENTIUM END === */
       } catch (error) {
         logger.error('Error saving user key:', error);
         showToast({
           message: localize('com_ui_save_key_error'),
           status: NotificationSeverity.ERROR,
         });
+        return false;
       }
     };
 
     if (formSet.has(endpoint) || formSet.has(endpointType ?? '')) {
       // TODO: handle other user provided options besides baseURL and apiKey
-      methods.handleSubmit((data) => {
+      await methods.handleSubmit(async (data) => {
         const isAzure = endpoint === EModelEndpoint.azureOpenAI;
         const isOpenAIBase =
           isAzure || endpoint === EModelEndpoint.openAI || isAssistantsEndpoint(endpoint);
@@ -252,8 +282,9 @@ const SetKeyDialog = ({
           });
         }
 
-        saveKey(JSON.stringify(userProvidedData));
-        methods.reset();
+        if (await saveKey(JSON.stringify(userProvidedData))) {
+          methods.reset();
+        }
       })();
       return;
     }
@@ -266,8 +297,9 @@ const SetKeyDialog = ({
       return;
     }
 
-    saveKey(userKey);
-    setUserKey('');
+    if (await saveKey(userKey)) {
+      setUserKey('');
+    }
   };
 
   const EndpointComponent =
@@ -314,8 +346,9 @@ const SetKeyDialog = ({
             endpoint={endpoint}
             disabled={!(expiryTime ?? '')}
             setDialogOpen={onOpenChange}
+            removalMode={removalMode}
           />
-          <Button variant="submit" onClick={submit}>
+          <Button variant="submit" onClick={() => void submit()}>
             {localize('com_ui_submit')}
           </Button>
         </OGDialogFooter>

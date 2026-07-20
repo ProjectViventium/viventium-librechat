@@ -712,33 +712,96 @@ function readScheduleEvents(paths) {
     });
 }
 
-function resolveScheduleTimezone(value) {
-  const configured = String(value || '').trim();
-  if (!configured || ['local', 'system', 'auto'].includes(configured.toLowerCase())) {
-    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+function validTimeZone(value) {
+  const candidate = String(value || '').trim();
+  if (!candidate) {
+    return false;
   }
   try {
-    new Intl.DateTimeFormat('en-US', { timeZone: configured }).format(new Date());
-    return configured;
+    new Intl.DateTimeFormat('en-US', { timeZone: candidate }).format(new Date());
+    return true;
   } catch {
-    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+    return false;
   }
 }
 
-function buildScheduleHealth(paths) {
+function resolveSystemTimezone() {
+  for (const candidatePath of ['/etc/localtime', '/var/db/timezone/localtime']) {
+    try {
+      const resolved = fs.realpathSync(candidatePath);
+      const marker = '/zoneinfo/';
+      if (resolved.includes(marker)) {
+        const candidate = resolved.split(marker, 2)[1];
+        if (validTimeZone(candidate)) {
+          return candidate;
+        }
+      }
+    } catch {
+      // Continue through portable system-timezone sources.
+    }
+  }
+
+  try {
+    const candidate = fs.readFileSync('/etc/timezone', 'utf8').trim();
+    if (validTimeZone(candidate)) {
+      return candidate;
+    }
+  } catch {
+    // /etc/timezone is not present on macOS and some other platforms.
+  }
+
+  if (process.platform === 'darwin') {
+    try {
+      const output = childProcess.execFileSync('/usr/sbin/systemsetup', ['-gettimezone'], {
+        encoding: 'utf8',
+        timeout: 2000,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      const match = output.match(/Time Zone:\s*(\S+)/);
+      if (match && validTimeZone(match[1])) {
+        return match[1];
+      }
+    } catch {
+      // The localtime symlink normally resolves first; systemsetup is best-effort only.
+    }
+  }
+
+  const priorTz = process.env.TZ;
+  try {
+    delete process.env.TZ;
+    const candidate = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    if (validTimeZone(candidate)) {
+      return candidate;
+    }
+  } finally {
+    if (priorTz === undefined) {
+      delete process.env.TZ;
+    } else {
+      process.env.TZ = priorTz;
+    }
+  }
+  return 'UTC';
+}
+
+function buildScheduleHealth(paths, options = {}) {
   const schedule =
     process.env.VIVENTIUM_MEMORY_HARDENING_SCHEDULE || DEFAULT_MEMORY_HARDENING_SCHEDULE;
   const configuredTimeZone =
     process.env.VIVENTIUM_MEMORY_HARDENING_TIMEZONE ||
     process.env.VIVENTIUM_DEFAULT_TIMEZONE ||
     DEFAULT_MEMORY_HARDENING_TIMEZONE;
-  const timeZone = resolveScheduleTimezone(configuredTimeZone);
+  const systemTimeZone = validTimeZone(options.systemTimeZone)
+    ? String(options.systemTimeZone).trim()
+    : resolveSystemTimezone();
+  const now = options.now instanceof Date ? options.now : new Date();
   const events = readScheduleEvents(paths);
-  const scheduledEvents = events.filter(
-    (event) => event.scheduled_invocation === true || event.trigger_source === 'launchd',
-  );
+  const scheduledEvents = events.filter((event) => event.trigger_source === 'launchd');
   const latestEvent = scheduledEvents.length ? scheduledEvents[scheduledEvents.length - 1] : null;
-  const expectedLatestFireAtUtc = latestExpectedDailyRunUtc({ schedule, timeZone });
+  const expectedLatestFireAtUtc = latestExpectedDailyRunUtc({
+    schedule,
+    timeZone: systemTimeZone,
+    now,
+  });
   const latestFiredMs = latestEvent ? Date.parse(latestEvent.fired_at_utc || '') : 0;
   const expectedMs = expectedLatestFireAtUtc ? Date.parse(expectedLatestFireAtUtc) : 0;
   const missedWindow = Boolean(
@@ -746,22 +809,63 @@ function buildScheduleHealth(paths) {
   );
   const latestStatus = latestEvent?.status || null;
   const latestExitCode = latestEvent?.exit_code ?? null;
-  const state = missedWindow
-    ? 'missed'
-    : latestStatus === 'failed' || (latestExitCode != null && latestExitCode !== 0)
-      ? 'failed'
-      : latestStatus === 'started'
-        ? 'running'
-        : latestStatus === 'skipped'
-          ? 'retry_pending'
-          : latestStatus === 'success'
-            ? 'healthy'
-            : 'awaiting_first_run';
+  const requestedProvider = normalizeProvider(latestEvent?.requested_provider);
+  const effectiveProvider = normalizeProvider(latestEvent?.effective_provider);
+  const requestedModel = String(latestEvent?.requested_model || '').trim();
+  const effectiveModel = String(latestEvent?.effective_model || '').trim();
+  const requestedEffort = String(latestEvent?.requested_effort || '')
+    .trim()
+    .toLowerCase();
+  const effectiveEffort = String(latestEvent?.effective_effort || '')
+    .trim()
+    .toLowerCase();
+  const executionTupleComplete = Boolean(
+    requestedProvider &&
+      effectiveProvider &&
+      requestedModel &&
+      effectiveModel &&
+      requestedEffort &&
+      effectiveEffort,
+  );
+  const providerMismatch = Boolean(
+    latestStatus === 'success' &&
+      requestedProvider &&
+      effectiveProvider &&
+      requestedProvider !== effectiveProvider,
+  );
+  const modelMismatch = Boolean(
+    latestStatus === 'success' && requestedModel && effectiveModel && requestedModel !== effectiveModel,
+  );
+  const effortMismatch = Boolean(
+    latestStatus === 'success' &&
+      requestedEffort &&
+      effectiveEffort &&
+      requestedEffort !== effectiveEffort,
+  );
+  const executionMismatch = providerMismatch || modelMismatch || effortMismatch;
+  const executionUnverified = latestStatus === 'success' && !executionTupleComplete;
+  let state = 'awaiting_first_run';
+  if (missedWindow) {
+    state = 'missed';
+  } else if (latestStatus === 'failed' || (latestExitCode != null && latestExitCode !== 0)) {
+    state = 'failed';
+  } else if (executionMismatch) {
+    state = 'execution_mismatch';
+  } else if (executionUnverified) {
+    state = 'execution_unverified';
+  } else if (latestStatus === 'started') {
+    state = 'running';
+  } else if (latestStatus === 'skipped') {
+    state = 'retry_pending';
+  } else if (latestStatus === 'success') {
+    state = 'healthy';
+  }
 
   return {
     schedule,
     configured_timezone: configuredTimeZone,
-    timezone: timeZone,
+    system_timezone: systemTimeZone,
+    timezone: systemTimeZone,
     expected_latest_fire_at_utc: expectedLatestFireAtUtc,
     latest_scheduled_trigger: latestEvent
       ? {
@@ -773,9 +877,21 @@ function buildScheduleHealth(paths) {
           exit_code: latestEvent.exit_code ?? null,
           run_id: latestEvent.run_id || null,
           run_status: latestEvent.run_status || null,
+          requested_provider: requestedProvider || null,
+          requested_model: requestedModel || null,
+          requested_effort: requestedEffort || null,
+          effective_provider: effectiveProvider || null,
+          effective_model: effectiveModel || null,
+          effective_effort: effectiveEffort || null,
         }
       : null,
     missed_expected_window: missedWindow,
+    execution_tuple_complete: executionTupleComplete,
+    execution_mismatch: executionMismatch,
+    execution_unverified: executionUnverified,
+    provider_mismatch: providerMismatch,
+    model_mismatch: modelMismatch,
+    effort_mismatch: effortMismatch,
     state,
     healthy: state === 'healthy',
     trigger_receipt_count: scheduledEvents.length,
@@ -2423,6 +2539,7 @@ function codexOutputSchema(schema) {
 }
 
 function runCodexStructured({ prompt, model, effort, schema, timeoutMs }) {
+  const codexCommand = String(process.env.WPR_CODEX_BIN || 'codex').trim() || 'codex';
   const outputPath = path.join(
     os.tmpdir(),
     `viventium-codex-output-${Date.now()}-${Math.random().toString(36).slice(2)}.json`,
@@ -2430,7 +2547,7 @@ function runCodexStructured({ prompt, model, effort, schema, timeoutMs }) {
   return withTempJsonFile('viventium-codex-schema', codexOutputSchema(schema), (schemaPath) => {
     try {
       const stdout = runCommand(
-        'codex',
+        codexCommand,
         [
           'exec',
           '--model',
@@ -3202,7 +3319,7 @@ async function getTranscriptVectorRuntimeStatus() {
     return { available: false, reason: 'unconfigured' };
   }
   if (typeof fetch !== 'function') {
-    return { available: true, reason: 'unknown' };
+    return { available: false, reason: 'fetch_unavailable' };
   }
   const controller = new AbortController();
   const timeoutMs = Number(
@@ -3215,9 +3332,17 @@ async function getTranscriptVectorRuntimeStatus() {
     const response = await fetch(`${ragApiUrl.replace(/\/+$/, '')}/health`, {
       signal: controller.signal,
     });
-    return response?.ok
-      ? { available: true, reason: 'ok' }
-      : { available: false, reason: 'http_error' };
+    if (!response?.ok) {
+      return { available: false, reason: 'http_error' };
+    }
+    try {
+      const payload = await response.json();
+      return payload?.status === 'UP'
+        ? { available: true, reason: 'ok' }
+        : { available: false, reason: 'unhealthy' };
+    } catch {
+      return { available: false, reason: 'invalid_response' };
+    }
   } catch (error) {
     return {
       available: false,
@@ -4044,10 +4169,11 @@ async function buildUserProposal({ db, methods, user, options, memoryConfig, now
       ? await fetchRecentMemoryMessages({ db, userId, since })
       : [];
   const messages = shouldFetchHardenerMessages ? recentMessages : [];
-  const memories =
+  const memoryStates =
     meetingTranscripts.length > 0 || messages.length > 0 || transcriptScan.staleArtifacts.length > 0
-      ? await methods.getAllUserMemories(user._id)
+      ? await (methods.getAllUserMemoryStates || methods.getAllUserMemories)(user._id)
       : [];
+  const memories = memoryStates.filter((memory) => !memory.deletedAt);
   const transcriptReferenceContext =
     meetingTranscripts.length > 0
       ? buildTranscriptReferenceContext({
@@ -4412,7 +4538,7 @@ async function buildUserProposal({ db, methods, user, options, memoryConfig, now
     .filter((operation) => operation.action !== 'noop')
     .map((operation) => operation.key);
   const proposalRevisionByKey = new Map(
-    memories.map((memory) => [memory.key, Number(memory.__v ?? 0)]),
+    memoryStates.map((memory) => [memory.key, Number(memory.__v ?? 0)]),
   );
   const revisionProtectedOperations = validation.accepted.map((operation) => ({
     ...operation,
@@ -4514,7 +4640,7 @@ async function applyUserProposal({ methods, userProposal, user, memoryConfig, ru
   const rollbackPath = path.join(runDir, `${userProposal.userIdHash}.rollback.private.json`);
   if (!fs.existsSync(rollbackPath)) {
     safeJsonWrite(rollbackPath, {
-      schemaVersion: 2,
+      schemaVersion: 3,
       userIdHash: userProposal.userIdHash,
       createdAt: new Date().toISOString(),
       memories: before.map((entry) => ({
@@ -4619,7 +4745,15 @@ async function applyUserProposal({ methods, userProposal, user, memoryConfig, ru
         conflicts.push({ key: operation.key, action: 'delete', reason: 'write_rejected' });
         continue;
       }
-      appliedState.set(operation.key, { key: operation.key, exists: false });
+      if (!Number.isInteger(result.revision)) {
+        conflicts.push({ key: operation.key, action: 'delete', reason: 'write_rejected' });
+        continue;
+      }
+      appliedState.set(operation.key, {
+        key: operation.key,
+        exists: false,
+        revision: Number(result.revision),
+      });
       changed.push({ key: operation.key, action: 'delete' });
     }
   }
@@ -4634,6 +4768,12 @@ async function applyUserProposal({ methods, userProposal, user, memoryConfig, ru
             tokenLimit: memoryConfig.tokenLimit,
             keyLimits: memoryConfig.keyLimits,
           },
+          /* === VIVENTIUM START ===
+           * Keep conversation-owned short-term state and freshly reviewed proposal writes out of
+           * generic maintenance. Accepted writes are already policy-validated and budgeted; an
+           * immediate second compaction can discard the evidence-backed detail just consolidated.
+           * === VIVENTIUM END === */
+          protectedKeys: Array.from(new Set(['working', ...changed.map(({ key }) => key)])),
         })
       : { shouldApply: false };
   for (const key of maintenance.conflictKeys || []) {
@@ -4666,16 +4806,48 @@ async function applyUserProposal({ methods, userProposal, user, memoryConfig, ru
 }
 
 async function restoreRollback({ methods, rollback }) {
-  if (Number(rollback.schemaVersion || 0) < 2 || !Array.isArray(rollback.applied)) {
+  const schemaVersion = Number(rollback.schemaVersion || 0);
+  if (schemaVersion < 2 || !Array.isArray(rollback.applied)) {
     return {
       restoredKeys: [],
       conflicts: [{ key: null, reason: 'rollback_revision_state_missing' }],
     };
   }
 
+  /* === VIVENTIUM START ===
+   * Schema v2 recorded revision-protected writes but did not safely describe delete/tombstone
+   * transitions. Preserve compatibility for its provably safe write-only shape and reject the
+   * entire snapshot before any DB access when a v2 entry claims a delete or malformed revision.
+   * === VIVENTIUM END === */
+  if (schemaVersion === 2) {
+    const unsafeEntry = rollback.applied.find(
+      (entry) =>
+        !entry?.key ||
+        entry.exists !== true ||
+        !Number.isInteger(entry.revision) ||
+        entry.revision < 0,
+    );
+    if (unsafeEntry) {
+      return {
+        restoredKeys: [],
+        conflicts: [
+          {
+            key: unsafeEntry?.key || null,
+            reason:
+              unsafeEntry?.exists === false
+                ? 'rollback_v2_delete_state_unsafe'
+                : 'rollback_revision_state_missing',
+          },
+        ],
+      };
+    }
+  }
+
   const beforeByKey = new Map((rollback.memories || []).map((entry) => [entry.key, entry]));
   const currentByKey = new Map(
-    (await methods.getAllUserMemories(rollback.userId)).map((entry) => [entry.key, entry]),
+    (await (methods.getAllUserMemoryStates || methods.getAllUserMemories)(rollback.userId)).map(
+      (entry) => [entry.key, entry],
+    ),
   );
   const restoredKeys = [];
   const conflicts = [];
@@ -4693,7 +4865,11 @@ async function restoreRollback({ methods, rollback }) {
     if (applied.exists === true) {
       const expectedRevision = Number(applied.revision);
       const currentRevision = current ? Number(current.__v ?? 0) : null;
-      if (!Number.isInteger(expectedRevision) || currentRevision !== expectedRevision) {
+      if (
+        !Number.isInteger(expectedRevision) ||
+        currentRevision !== expectedRevision ||
+        current?.deletedAt
+      ) {
         conflicts.push({ key, reason: 'revision_conflict' });
         continue;
       }
@@ -4711,7 +4887,13 @@ async function restoreRollback({ methods, rollback }) {
             expectedRevision,
           });
     } else if (applied.exists === false) {
-      if (current) {
+      const expectedRevision = Number(applied.revision);
+      const currentRevision = current ? Number(current.__v ?? 0) : null;
+      if (
+        !Number.isInteger(expectedRevision) ||
+        currentRevision !== expectedRevision ||
+        !current?.deletedAt
+      ) {
         conflicts.push({ key, reason: 'revision_conflict' });
         continue;
       }
@@ -4724,7 +4906,7 @@ async function restoreRollback({ methods, rollback }) {
         key,
         value: before.value || '',
         tokenCount: Number(before.tokenCount || 0),
-        expectedRevision: null,
+        expectedRevision,
       });
     } else {
       conflicts.push({ key, reason: 'rollback_state_invalid' });
@@ -4763,6 +4945,9 @@ function redactFailureMessage(value) {
     .replace(/\/Users\/[^/\s]+(?:\/[^\s'")]+)*/g, '<local-path>')
     .replace(/\/home\/[^/\s]+(?:\/[^\s'")]+)*/g, '<local-path>')
     .replace(/\/private\/var\/[^\s'")]+/g, '<local-path>')
+    /* === VIVENTIUM START === Redact public-safe generic absolute Unix paths. === */
+    .replace(/(^|[\s"'(=:[])(\/(?!\/)[^\s'")]+)/g, '$1<local-path>')
+    /* === VIVENTIUM END === */
     .replace(/[A-Za-z]:\\(?:[^\\\s'"]+\\?)+/g, '<local-path>')
     .replace(/\b(?:[a-f0-9]{24})\b/gi, '<mongo-id>')
     .replace(/\b(?:conversation|message|session|call)[_-]?[A-Za-z0-9]{8,}\b/gi, '<runtime-id>')
@@ -5386,6 +5571,7 @@ module.exports = {
   getTranscriptVectorRuntimeStatus,
   aggregateMaintenanceSummary,
   buildCooldownSkipSummary,
+  buildScheduleHealth,
   efficiencyMarkerPath,
   efficiencyOverrideAllowed,
   isCooldownGatedModelRun,
@@ -5404,6 +5590,7 @@ module.exports = {
   proposalSchema,
   redactFailureMessage,
   resolveProvider,
+  resolveSystemTimezone,
   sanitizeTranscriptSummary,
   scanTranscriptDirectory,
   selectMessagesForPrompt,

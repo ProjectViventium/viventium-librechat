@@ -65,7 +65,12 @@ describe('useKeyDialog', () => {
     const openSpy = jest.spyOn(window, 'open').mockImplementation(() => popup);
     const dispatchEventSpy = jest.spyOn(window, 'dispatchEvent');
 
-    const { result } = renderHook(() => useKeyDialog({ connectedAccountsEnabled: true }));
+    const { result } = renderHook(() =>
+      useKeyDialog({
+        connectedAccountsEnabled: true,
+        experimentalDirectSubscriptionAuth: true,
+      }),
+    );
     const event = {
       preventDefault: jest.fn(),
       stopPropagation: jest.fn(),
@@ -95,5 +100,23 @@ describe('useKeyDialog', () => {
 
     openSpy.mockRestore();
     dispatchEventSpy.mockRestore();
+  });
+
+  it('opens the stable API-key dialog when direct subscription auth is not explicitly enabled', () => {
+    const openSpy = jest.spyOn(window, 'open');
+    const { result } = renderHook(() => useKeyDialog({ connectedAccountsEnabled: true }));
+    const event = {
+      preventDefault: jest.fn(),
+      stopPropagation: jest.fn(),
+    } as never;
+
+    act(() => {
+      result.current.handleOpenKeyDialog(EModelEndpoint.openAI, event);
+    });
+
+    expect(result.current.keyDialogOpen).toBe(true);
+    expect(result.current.keyDialogEndpoint).toBe(EModelEndpoint.openAI);
+    expect(openSpy).not.toHaveBeenCalled();
+    expect(mockRequestGet).not.toHaveBeenCalled();
   });
 });

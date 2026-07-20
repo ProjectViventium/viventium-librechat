@@ -17,7 +17,10 @@ const {
   sanitizeAnthropicFormattedMessages,
   sanitizeProviderFormattedMessages,
 } = require('../normalizeTextContentParts');
-const { HumanMessage, coerceMessageLikeToMessage } = require('@langchain/core/messages');
+const {
+  HumanMessage,
+  isBaseMessage,
+} = require('@librechat/agents/langchain/messages');
 const { formatAgentMessages } = require('@librechat/agents');
 const { filterMalformedContentParts } = require('@librechat/api');
 const { ContentTypes } = require('librechat-data-provider');
@@ -182,7 +185,7 @@ describe('normalizeTextContentParts', () => {
     expect(typeof result[0].getType).toBe('function');
     expect(result[0]._getType()).toBe('human');
     expect(result[0].content).toEqual([{ type: ContentTypes.TEXT, text: 'Hi', [ContentTypes.TEXT]: 'Hi' }]);
-    expect(() => coerceMessageLikeToMessage(result[0])).not.toThrow();
+    expect(isBaseMessage(result[0])).toBe(true);
   });
 
   test('sanitizeAnthropicFormattedMessages keeps unchanged LangChain messages as-is', () => {
@@ -192,7 +195,7 @@ describe('normalizeTextContentParts', () => {
     expect(result).toHaveLength(1);
     expect(result[0]).toBe(messages[0]);
     expect(typeof result[0]._getType).toBe('function');
-    expect(() => coerceMessageLikeToMessage(result[0])).not.toThrow();
+    expect(isBaseMessage(result[0])).toBe(true);
   });
 
   test('providerNeedsStrictTextSanitizer defaults to anthropic only', () => {
@@ -252,7 +255,7 @@ describe('normalizeTextContentParts', () => {
     expect(hardened.length).toBeGreaterThan(0);
     for (const message of hardened) {
       expect(typeof message._getType).toBe('function');
-      expect(() => coerceMessageLikeToMessage(message)).not.toThrow();
+      expect(isBaseMessage(message)).toBe(true);
       if (typeof message.content === 'string') {
         expect(message.content.trim().length).toBeGreaterThan(0);
       }
@@ -298,7 +301,7 @@ describe('normalizeTextContentParts', () => {
     expect(hardened.length).toBeGreaterThan(0);
     for (const message of hardened) {
       expect(typeof message._getType).toBe('function');
-      expect(() => coerceMessageLikeToMessage(message)).not.toThrow();
+      expect(isBaseMessage(message)).toBe(true);
       if (typeof message.content === 'string') {
         expect(message.content.trim().length).toBeGreaterThan(0);
         continue;

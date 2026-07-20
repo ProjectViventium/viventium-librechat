@@ -1,6 +1,6 @@
 import { Run, Providers, Constants } from '@librechat/agents';
 import { providerEndpointMap, KnownEndpoints } from 'librechat-data-provider';
-import type { BaseMessage } from '@langchain/core/messages';
+import type { BaseMessage } from '@librechat/agents/langchain/messages';
 import type {
   MultiAgentGraphConfig,
   OpenAIClientOptions,
@@ -13,7 +13,7 @@ import type {
   LCTool,
 } from '@librechat/agents';
 import type { IUser } from '@librechat/data-schemas';
-import type { Agent } from 'librechat-data-provider';
+import type { Agent, AgentModelParameters } from 'librechat-data-provider';
 import type * as t from '~/types';
 import { resolveHeaders, createSafeUser } from '~/utils/env';
 
@@ -181,6 +181,31 @@ type RunAgent = Omit<Agent, 'tools'> & {
   hasDeferredTools?: boolean;
 };
 
+const nullableAgentModelParameterKeys = [
+  'temperature',
+  'maxContextTokens',
+  'max_context_tokens',
+  'max_output_tokens',
+  'top_p',
+  'frequency_penalty',
+  'presence_penalty',
+] satisfies Array<keyof AgentModelParameters>;
+
+function normalizeAgentModelParameters(
+  modelParameters: AgentModelParameters | undefined,
+): Partial<AgentModelParameters> | undefined {
+  if (!modelParameters) {
+    return undefined;
+  }
+  const normalized: Partial<AgentModelParameters> = { ...modelParameters };
+  for (const key of nullableAgentModelParameterKeys) {
+    if (normalized[key] === null) {
+      delete normalized[key];
+    }
+  }
+  return normalized;
+}
+
 /**
  * Creates a new Run instance with custom handlers and configuration.
  *
@@ -249,7 +274,9 @@ export async function createRun({
      * input flag meaning disabled, so consume it before creating graph client options.
      * Added: 2026-05-19
      * === VIVENTIUM END === */
-    const modelParameters = { ...(agent.model_parameters ?? {}) } as Record<string, unknown>;
+    const modelParameters = {
+      ...(normalizeAgentModelParameters(agent.model_parameters) ?? {}),
+    } as Record<string, unknown>;
     if (provider === Providers.ANTHROPIC && modelParameters.thinking === false) {
       delete modelParameters.thinking;
       delete modelParameters.thinkingBudget;

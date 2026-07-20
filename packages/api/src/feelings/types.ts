@@ -1,16 +1,24 @@
 import {
   FEELING_BAND_IDS,
+  FEELING_LEVEL_IDS,
   FEELING_MODEL_REACTION_CAUSES,
   FEELING_REACTION_CAUSES,
 } from 'librechat-data-provider';
 
-export { FEELING_BAND_IDS, FEELING_MODEL_REACTION_CAUSES, FEELING_REACTION_CAUSES };
+export {
+  FEELING_BAND_IDS,
+  FEELING_LEVEL_IDS,
+  FEELING_MODEL_REACTION_CAUSES,
+  FEELING_REACTION_CAUSES,
+};
 
 export const MAX_FEELING_TRAIL_ENTRIES = 90;
 export const REACTION_TRAIL_CONTEXT_LIMIT = 10;
 export const MAX_FEELING_INNER_STATE_CHARS = 280;
+export const MAX_FEELING_RANGE_PROMPT_CHARS = 1200;
 
 export type FeelingBandId = (typeof FEELING_BAND_IDS)[number];
+export type FeelingLevelId = (typeof FEELING_LEVEL_IDS)[number];
 export type FeelingsAgentScope = 'all_agents' | 'conscious_agent';
 export type FeelingsReactionActivationMode = 'always' | 'classified' | 'disabled';
 export type FeelingDirection = 'up' | 'down';
@@ -27,8 +35,21 @@ export type FeelingBandDefinition = {
   highLabel: string;
   baseline: number;
   halfLifeMinutes: number;
-  words: readonly [string, string, string, string, string];
-  embodied: readonly [string, string, string, string, string];
+  levels: readonly [
+    FeelingLevelDefinition,
+    FeelingLevelDefinition,
+    FeelingLevelDefinition,
+    FeelingLevelDefinition,
+    FeelingLevelDefinition,
+  ];
+};
+
+export type FeelingLevelDefinition = {
+  id: FeelingLevelId;
+  min: number;
+  max: number;
+  word: string;
+  instruction: string;
 };
 
 export type FeelingBandState = {
@@ -40,6 +61,9 @@ export type FeelingBandState = {
 };
 
 export type FeelingBandsState = Record<FeelingBandId, FeelingBandState>;
+export type FeelingRangePromptOverrides = Partial<
+  Record<FeelingBandId, Partial<Record<FeelingLevelId, string>>>
+>;
 
 export type FeelingTrailEntry = {
   timestamp: string | Date;
@@ -105,6 +129,10 @@ export type FeelingsReadSnapshot = {
   version: number;
   asOf: string;
   bands: FeelingBandsState;
+  rangePromptOverrides: FeelingRangePromptOverrides;
+  rangePromptOverrideCount: number;
+  activeRangePromptOverrideCount: number;
+  activeRangePromptOverrideChars: number;
   capsule: string;
   snapshotHash: string;
   reactionInstruction: string;

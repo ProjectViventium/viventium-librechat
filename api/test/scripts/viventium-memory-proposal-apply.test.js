@@ -70,7 +70,7 @@ describe('viventium-memory-proposal-apply', () => {
     ).toEqual(expect.objectContaining({ apply: true }));
   });
 
-  test('applyProposalWithMethods dedupes duplicate keys and applies through governed methods', async () => {
+  test('applyProposalWithMethods fails closed on duplicate keys that require offline migration', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-memory-proposal-apply-'));
     const proposal = path.join(dir, 'memory-proposals-apply.json');
     fs.writeFileSync(
@@ -81,8 +81,20 @@ describe('viventium-memory-proposal-apply', () => {
       'utf8',
     );
     const memories = [
-      { key: 'context', value: 'Older context', tokenCount: 1, updated_at: '2026-05-22T03:00:00Z' },
-      { key: 'context', value: 'Newer context', tokenCount: 1, updated_at: '2026-05-22T04:00:00Z' },
+      {
+        key: 'context',
+        value: 'Older context',
+        tokenCount: 1,
+        __v: 3,
+        updated_at: '2026-05-22T03:00:00Z',
+      },
+      {
+        key: 'context',
+        value: 'Newer context',
+        tokenCount: 1,
+        __v: 4,
+        updated_at: '2026-05-22T04:00:00Z',
+      },
       { key: 'core', value: 'Older core', tokenCount: 1, updated_at: '2026-05-22T03:30:00Z' },
       { key: 'core', value: 'Stable core', tokenCount: 1, updated_at: '2026-05-22T04:30:00Z' },
     ];
@@ -115,22 +127,26 @@ describe('viventium-memory-proposal-apply', () => {
       { validKeys: ['context', 'core'], tokenLimit: 10000 },
     );
 
-    expect(result.ok).toBe(true);
+    expect(result.ok).toBe(false);
     expect(result.mode).toBe('apply');
+    expect(result.reason).toBe('duplicate_memory_merge_requires_offline_migration');
     expect(result.dedupe).toEqual([
-      expect.objectContaining({ key: 'context', originalCount: 2, status: 'merged_duplicate_key' }),
+      expect.objectContaining({
+        key: 'context',
+        originalCount: 2,
+        status: 'requires_offline_migration',
+      }),
     ]);
     expect(result.actions).toEqual([
-      expect.objectContaining({ action: 'set', key: 'context', status: 'updated' }),
+      expect.objectContaining({
+        action: 'set',
+        key: 'context',
+        status: 'blocked_duplicate_key_migration',
+      }),
     ]);
-    expect(calls.filter(([name]) => name === 'delete')).toHaveLength(2);
-    expect(calls.some(([name, key]) => name === 'set' && key === 'context')).toBe(true);
-    expect(calls.some(([, key]) => key === 'core')).toBe(false);
-    expect(memories.filter((memory) => memory.key === 'context')).toHaveLength(1);
+    expect(calls).toEqual([]);
+    expect(memories.filter((memory) => memory.key === 'context')).toHaveLength(2);
     expect(memories.filter((memory) => memory.key === 'core')).toHaveLength(2);
-    expect(memories.find((memory) => memory.key === 'context').value).toBe(
-      'Synthetic governed update',
-    );
   });
 
   test('applyProposalWithMethods does not block on unrelated duplicate keys', async () => {
@@ -157,7 +173,7 @@ describe('viventium-memory-proposal-apply', () => {
           existing.value = value;
           existing.tokenCount = tokenCount;
         }
-        return { ok: true };
+        return { ok: true, revision: 1 };
       }),
     };
 
@@ -175,5 +191,84 @@ describe('viventium-memory-proposal-apply', () => {
     expect(methods.deleteMemory).not.toHaveBeenCalled();
     expect(methods.setMemory).toHaveBeenCalledWith(expect.objectContaining({ key: 'context' }));
     expect(methods.setMemory).not.toHaveBeenCalledWith(expect.objectContaining({ key: 'core' }));
+  });
+
+  test('post-apply maintenance preserves the reviewed proposal value', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-memory-proposal-protected-'));
+    const proposal = path.join(dir, 'memory-proposals-apply.json');
+    const proposedContext =
+      'Project Atlas has a complete reviewed outcome and a deliberately detailed set of follow-up commitments that must remain intact after the proposal is applied, even when deterministic maintenance is already due for the account.';
+    fs.writeFileSync(
+      proposal,
+      JSON.stringify({
+        actions: [{ action: 'set', key: 'context', value: proposedContext }],
+      }),
+      'utf8',
+    );
+    let memories = [
+      { key: 'context', value: 'Previous context', tokenCount: 2, __v: 4 },
+    ];
+    const methods = {
+      getAllUserMemories: jest.fn(async () => memories.map((memory) => ({ ...memory }))),
+      setMemory: jest.fn(async ({ key, value, tokenCount, expectedRevision }) => {
+        const revision = Number(expectedRevision) + 1;
+        memories = [
+          ...memories.filter((memory) => memory.key !== key),
+          { key, value, tokenCount, __v: revision },
+        ];
+        return { ok: true, revision };
+      }),
+      deleteMemory: jest.fn(),
+    };
+
+    try {
+      const result = await applyProposalWithMethods(
+        { proposal, userId: 'user-1', apply: true },
+        methods,
+        {
+          validKeys: ['context', 'working'],
+          tokenLimit: 100,
+          keyLimits: { context: 100, working: 100 },
+          maintenanceThresholdPercent: 1,
+        },
+      );
+
+      expect(result.ok).toBe(true);
+      expect(methods.setMemory.mock.calls.filter(([write]) => write.key === 'context')).toHaveLength(
+        1,
+      );
+      expect(memories.find((memory) => memory.key === 'context')?.value).toBe(proposedContext);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test.each([
+    ['set', { action: 'set', key: 'context', value: 'Rejected update' }],
+    ['delete', { action: 'delete', key: 'context' }],
+  ])('applyProposalWithMethods rejects an unsuccessful %s storage result', async (kind, action) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-memory-proposal-rejected-'));
+    const proposal = path.join(dir, 'memory-proposals-apply.json');
+    fs.writeFileSync(proposal, JSON.stringify({ actions: [action] }), 'utf8');
+    const memories = [
+      { key: 'context', value: 'Existing context', tokenCount: 1, __v: 3 },
+    ];
+    const methods = {
+      getAllUserMemories: async () => memories.map((memory) => ({ ...memory })),
+      getAllUserMemoryStates: async () => memories.map((memory) => ({ ...memory })),
+      deleteMemory: jest.fn(async () => ({ ok: false })),
+      setMemory: jest.fn(async () => ({ ok: false })),
+    };
+
+    const result = await applyProposalWithMethods(
+      { proposal, userId: 'user-1', apply: true },
+      methods,
+      { validKeys: ['context'], tokenLimit: 10000 },
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.actions).toEqual([
+      expect.objectContaining({ action: kind, key: 'context', status: 'rejected_storage_failure' }),
+    ]);
   });
 });

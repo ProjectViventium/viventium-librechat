@@ -69,14 +69,17 @@ export default function MemoryEditDialog({
         if (axiosError.response?.data?.error) {
           errorMessage = axiosError.response.data.error;
 
-          // Check for duplicate key error
-          if (axiosError.response?.status === 409 || errorMessage.includes('already exists')) {
+          /* === VIVENTIUM START ===
+           * A 409 can also be a stale revision; preserve that refresh-and-retry message.
+           */
+          if (errorMessage.includes('already exists')) {
             errorMessage = localize('com_ui_memory_key_exists');
           }
           // Check for key validation error (lowercase and underscores only)
           else if (errorMessage.includes('lowercase letters and underscores')) {
             errorMessage = localize('com_ui_memory_key_validation');
           }
+          /* === VIVENTIUM END === */
         }
       } else if (error.message) {
         errorMessage = error.message;
@@ -117,6 +120,9 @@ export default function MemoryEditDialog({
     updateMemory({
       key: key.trim(),
       value: value.trim(),
+      /* === VIVENTIUM START === Revision-safe saved-memory editing. === */
+      expectedRevision: memory.revision,
+      /* === VIVENTIUM END === */
       ...(originalKey !== key.trim() && { originalKey }),
     });
   };

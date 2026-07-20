@@ -28,6 +28,14 @@ const MemoryEntrySchema: Schema<IMemoryEntry> = new Schema({
     type: Date,
     default: Date.now,
   },
+  /* === VIVENTIUM START ===
+   * Retained tombstones keep each user/key revision monotonic across delete/recreate cycles.
+   * User-facing reads exclude these rows; CAS snapshots include them.
+   * === VIVENTIUM END === */
+  deletedAt: {
+    type: Date,
+    default: undefined,
+  },
 });
 
 MemoryEntrySchema.index(

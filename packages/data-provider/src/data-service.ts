@@ -1007,17 +1007,22 @@ export const getMemories = (): Promise<q.MemoriesResponse> => {
   return request.get(endpoints.memories());
 };
 
-export const deleteMemory = (key: string): Promise<void> => {
-  return request.delete(endpoints.memory(key));
+/* === VIVENTIUM START === Revision-safe saved-memory API requests. === */
+export const deleteMemory = (key: string, expectedRevision: number): Promise<void> => {
+  return request.delete(
+    `${endpoints.memory(key)}?revision=${encodeURIComponent(String(expectedRevision))}`,
+  );
 };
 
 export const updateMemory = (
   key: string,
   value: string,
+  expectedRevision: number,
   originalKey?: string,
 ): Promise<q.TUserMemory> => {
-  return request.patch(endpoints.memory(originalKey || key), { key, value });
+  return request.patch(endpoints.memory(originalKey || key), { key, value, expectedRevision });
 };
+/* === VIVENTIUM END === */
 
 export const updateMemoryPreferences = (preferences: {
   memories?: boolean;

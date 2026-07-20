@@ -176,20 +176,21 @@ export function createMemoryMethods(mongoose: typeof import('mongoose')) {
       }
 
       const MemoryEntry = mongoose.models.MemoryEntry;
-      const existingMemory = await MemoryEntry.findOne({ userId, key });
-      if (existingMemory) {
+      const existingMemory = await MemoryEntry.findOne({ userId, key }).lean();
+      if (existingMemory && !existingMemory.deletedAt) {
         throw new Error('Memory with this key already exists');
       }
-
-      await MemoryEntry.create({
+      const result = await setMemory({
         userId,
         key,
         value,
         tokenCount,
-        updated_at: new Date(),
+        expectedRevision: existingMemory ? Number(existingMemory.__v ?? 0) : null,
       });
-
-      return { ok: true };
+      if (!result.ok) {
+        throw new Error('Memory with this key already exists');
+      }
+      return result;
     } catch (error) {
       throw new Error(
         `Failed to create memory: ${error instanceof Error ? error.message : 'Unknown error'}`,
@@ -301,6 +302,7 @@ export function createMemoryMethods(mongoose: typeof import('mongoose')) {
           updateFilter,
           {
             $set: { value: finalValue, tokenCount, updated_at: updatedAt },
+            $unset: { deletedAt: 1 },
             $inc: { __v: 1 },
           },
           { upsert: !revisionProtected, new: true, setDefaultsOnInsert: true },
@@ -311,6 +313,7 @@ export function createMemoryMethods(mongoose: typeof import('mongoose')) {
             { userId, key },
             {
               $set: { value: finalValue, tokenCount, updated_at: updatedAt },
+              $unset: { deletedAt: 1 },
               $inc: { __v: 1 },
             },
             { new: true },
@@ -351,7 +354,7 @@ export function createMemoryMethods(mongoose: typeof import('mongoose')) {
   }: t.DeleteMemoryParams): Promise<t.MemoryResult> {
     try {
       const MemoryEntry = mongoose.models.MemoryEntry;
-      const filter: Record<string, unknown> = { userId, key };
+      const filter: Record<string, unknown> = { userId, key, deletedAt: null };
       if (expectedRevision !== undefined) {
         if (expectedRevision == null) {
           const existing = await MemoryEntry.findOne({ userId, key }).lean();
@@ -368,9 +371,20 @@ export function createMemoryMethods(mongoose: typeof import('mongoose')) {
           filter.__v = expectedRevision;
         }
       }
-      const result = await MemoryEntry.findOneAndDelete(filter);
+      const result = await MemoryEntry.findOneAndUpdate(
+        filter,
+        {
+          $set: { value: '', tokenCount: 0, deletedAt: new Date(), updated_at: new Date() },
+          $inc: { __v: 1 },
+        },
+        { new: true },
+      );
       if (result) {
-        return { ok: true };
+        return {
+          ok: true,
+          updatedAt: result.updated_at,
+          revision: Number(result.__v ?? 0),
+        };
       }
       if (expectedRevision !== undefined) {
         const current = await MemoryEntry.findOne({ userId, key }).lean();
@@ -386,6 +400,77 @@ export function createMemoryMethods(mongoose: typeof import('mongoose')) {
     }
   }
 
+  /** Atomically renames and updates one active memory row under revision protection. */
+  async function renameMemory({
+    userId,
+    key,
+    newKey,
+    value,
+    tokenCount = 0,
+    expectedRevision,
+  }: t.RenameMemoryParams): Promise<t.MemoryResult> {
+    try {
+      if (!Number.isInteger(expectedRevision) || Number(expectedRevision) < 0) {
+        return { ok: false, conflict: true };
+      }
+
+      const MemoryEntry = mongoose.models.MemoryEntry;
+      const revisionFilter =
+        expectedRevision === 0
+          ? { $or: [{ __v: 0 }, { __v: { $exists: false } }] }
+          : { __v: expectedRevision };
+      let updated;
+      try {
+        updated = await MemoryEntry.findOneAndUpdate(
+          { userId, key, deletedAt: null, ...revisionFilter },
+          {
+            $set: {
+              key: newKey,
+              value,
+              tokenCount,
+              updated_at: new Date(),
+            },
+            $inc: { __v: 1 },
+          },
+          { new: true },
+        );
+      } catch (error) {
+        if ((error as { code?: number })?.code === 11000) {
+          /* === VIVENTIUM START ===
+           * A retained tombstone is intentionally hidden from normal memory lists, so refreshing
+           * cannot make this rename succeed. Classify the durable target-key reservation without
+           * mutating either row; the route can tell the user to choose another key while ordinary
+           * stale-source conflicts keep their refresh-and-retry action.
+           * === VIVENTIUM END === */
+          const target = await MemoryEntry.findOne({ userId, key: newKey }).lean();
+          if (target) {
+            return { ok: false, conflict: true, conflictReason: 'target_key_reserved' };
+          }
+          return { ok: false, conflict: true };
+        }
+        throw error;
+      }
+
+      if (!updated) {
+        const current = await MemoryEntry.findOne({ userId, key }).lean();
+        return {
+          ok: false,
+          conflict: true,
+          currentRevision: current ? Number(current.__v ?? 0) : undefined,
+        };
+      }
+      return {
+        ok: true,
+        updatedAt: updated.updated_at,
+        revision: Number(updated.__v ?? 0),
+      };
+    } catch (error) {
+      throw new Error(
+        `Failed to rename memory: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      );
+    }
+  }
+
   /**
    * Gets all memory entries for a user
    */
@@ -394,10 +479,27 @@ export function createMemoryMethods(mongoose: typeof import('mongoose')) {
   ): Promise<t.IMemoryEntryLean[]> {
     try {
       const MemoryEntry = mongoose.models.MemoryEntry;
-      return (await MemoryEntry.find({ userId }).lean()) as t.IMemoryEntryLean[];
+      return (await MemoryEntry.find({
+        userId,
+        deletedAt: null,
+      }).lean()) as t.IMemoryEntryLean[];
     } catch (error) {
       throw new Error(
         `Failed to get all memories: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      );
+    }
+  }
+
+  /** Returns active rows and retained tombstones for revision-safe internal snapshots. */
+  async function getAllUserMemoryStates(
+    userId: string | Types.ObjectId,
+  ): Promise<t.IMemoryEntryLean[]> {
+    try {
+      const MemoryEntry = mongoose.models.MemoryEntry;
+      return (await MemoryEntry.find({ userId }).lean()) as t.IMemoryEntryLean[];
+    } catch (error) {
+      throw new Error(
+        `Failed to get memory states: ${error instanceof Error ? error.message : 'Unknown error'}`,
       );
     }
   }
@@ -410,7 +512,9 @@ export function createMemoryMethods(mongoose: typeof import('mongoose')) {
     memories,
   }: t.GetFormattedMemoriesParams): Promise<t.FormattedMemoriesResult> {
     try {
-      const snapshotMemories = memories ?? (await getAllUserMemories(userId));
+      const snapshotMemories = (memories ?? (await getAllUserMemories(userId))).filter(
+        (memory) => !memory.deletedAt,
+      );
 
       if (!snapshotMemories || snapshotMemories.length === 0) {
         return { withKeys: '', withoutKeys: '', totalTokens: 0, memoryTokenMap: {} };
@@ -481,7 +585,9 @@ export function createMemoryMethods(mongoose: typeof import('mongoose')) {
     setMemory,
     createMemory,
     deleteMemory,
+    renameMemory,
     getAllUserMemories,
+    getAllUserMemoryStates,
     getFormattedMemories,
   };
 }

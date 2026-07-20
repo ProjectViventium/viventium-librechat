@@ -1,5 +1,5 @@
 const { logger } = require('@librechat/data-schemas');
-const { tool: toolFn, DynamicStructuredTool } = require('@langchain/core/tools');
+const { tool: toolFn, DynamicStructuredTool } = require('@librechat/agents/langchain/tools');
 const {
   sleep,
   EnvVar,
@@ -71,8 +71,6 @@ const {
   voiceLatencyNow,
 } = require('~/server/services/viventium/voiceLatencyTiming');
 // === VIVENTIUM START ===
-// Feature: Telegram tool guard (fast-path for trivial messages).
-const { shouldSkipTelegramTools } = require('~/server/services/viventium/telegramToolGuard');
 // Feature: Deep Telegram timing instrumentation (toggleable).
 const {
   isDeepTimingEnabled,
@@ -763,6 +761,19 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
       return null;
     }
 
+    /* === VIVENTIUM START ===
+     * Feature: Explicit MCP reinitialization failure observability.
+     * Purpose: Keep a failed server reinitialization distinct from a healthy
+     * no-tools result without failing unrelated tools or exposing provider detail.
+     * === VIVENTIUM END === */
+    if (result?.failureClass) {
+      logger.warn(`[Tool Definitions] MCP reinitialization failed for ${serverName}`, {
+        failureClass: result.failureClass,
+      });
+      logFetchDone('reinit_error', `failure_class=${result.failureClass}`);
+      return null;
+    }
+
     logFetchDone('reinit_no_tools', `success=${Boolean(result?.success)}`);
     return null;
   };
@@ -1045,20 +1056,10 @@ async function loadAgentTools({
   definitionsOnly = true,
 }) {
   // === VIVENTIUM START ===
-  // Feature: Skip tool loading for trivial Telegram messages to avoid MCP stalls.
+  // Feature: Deep tool-loading timing for Telegram diagnostics.
   const toolLoadStart = startDeepTiming(req);
   if (isDeepTimingEnabled(req)) {
     logDeepTiming(req, 'tool_load_start', toolLoadStart, `tools=${agent?.tools?.length ?? 0}`);
-  }
-  if (shouldSkipTelegramTools(req)) {
-    const traceId = req?.body?.traceId || 'na';
-    logger.info(
-      `[VIVENTIUM][telegram] Tool guard: skipping tools for short message (trace=${traceId})`,
-    );
-    if (isDeepTimingEnabled(req)) {
-      logDeepTiming(req, 'tool_load_skip', toolLoadStart, 'reason=guard');
-    }
-    return {};
   }
   // === VIVENTIUM END ===
   if (definitionsOnly) {

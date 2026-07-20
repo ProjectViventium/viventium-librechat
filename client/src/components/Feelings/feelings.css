@@ -4,7 +4,7 @@
   --feelings-raised: #121615;
   --feelings-ink: #f4f5f2;
   --feelings-muted: #929a98;
-  --feelings-quiet: #626a69;
+  --feelings-quiet: #858e8b;
   --feelings-line: rgba(221, 231, 226, 0.12);
   --feelings-line-strong: rgba(221, 231, 226, 0.22);
   --feelings-mint: #7bf0ca;
@@ -146,6 +146,11 @@
   border-color: var(--feelings-line-strong) !important;
   background: rgba(255, 255, 255, 0.055);
   color: var(--feelings-ink);
+}
+.reset-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
 }
 .feelings-master-toggle,
 .feelings-band-toggle {
@@ -614,7 +619,7 @@
   display: block;
   color: var(--feelings-live);
   font-family: var(--feelings-mono);
-  font-size: 6px;
+  font-size: 8px;
   transform: rotate(-45deg);
 }
 .feelings-current-marker {
@@ -785,6 +790,20 @@
   color: var(--feelings-quiet);
   font-size: 9px;
   text-align: center;
+}
+
+.feelings-state-details {
+  display: grid;
+  grid-template-columns: minmax(0, 1.08fr) minmax(320px, 0.92fr);
+  gap: 14px;
+  margin-top: 14px;
+}
+.feelings-state-details > section {
+  min-width: 0;
+  padding: 17px;
+  border: 1px solid var(--feelings-line);
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.012);
 }
 
 .feelings-inspector-header {
@@ -973,9 +992,179 @@
   color: var(--feelings-ink);
   font-size: 11px;
 }
+.feelings-range-editor {
+  margin-top: 20px;
+  padding-top: 19px;
+  border-top: 1px solid var(--feelings-line);
+}
+.feelings-range-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.feelings-range-heading h3 {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 620;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.feelings-range-heading p {
+  margin: 5px 0 0;
+  color: var(--feelings-quiet);
+  font-size: 9px;
+  line-height: 1.45;
+}
+.feelings-range-heading > span {
+  flex: 0 0 auto;
+  color: var(--feelings-quiet);
+  font-family: var(--feelings-mono);
+  font-size: 8px;
+}
+.feelings-range-tabs {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 4px;
+  margin-top: 13px;
+}
+.feelings-range-tabs button {
+  position: relative;
+  display: grid;
+  min-width: 0;
+  min-height: 61px;
+  align-content: center;
+  justify-items: center;
+  padding: 6px 3px;
+  border: 1px solid var(--feelings-line) !important;
+  border-radius: 7px;
+  background: #090c0b;
+  color: var(--feelings-quiet);
+  cursor: pointer;
+}
+.feelings-range-tabs button:hover,
+.feelings-range-tabs button.is-selected {
+  border-color: color-mix(in srgb, var(--selected-color) 42%, transparent) !important;
+  background: color-mix(in srgb, var(--selected-color) 7%, #090c0b);
+}
+.feelings-range-tabs button.is-active::after {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--selected-color);
+  box-shadow: 0 0 7px var(--selected-color);
+  content: '';
+}
+.feelings-range-tabs i {
+  font-family: var(--feelings-mono);
+  font-size: 7px;
+  font-style: normal;
+}
+.feelings-range-tabs strong {
+  max-width: 100%;
+  overflow: hidden;
+  margin-top: 4px;
+  color: #c5cbc8;
+  font-size: 8px;
+  font-weight: 520;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.feelings-range-tabs span {
+  display: flex;
+  min-width: 0;
+  min-height: 8px;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  margin-top: 3px;
+  color: var(--selected-color);
+  font-family: var(--feelings-mono);
+  font-size: 8px;
+  letter-spacing: 0.08em;
+}
+.feelings-range-tabs span b {
+  font-weight: 650;
+}
+.feelings-range-panel {
+  min-width: 0;
+}
+.feelings-range-default {
+  margin-top: 11px;
+  padding: 11px;
+  border-left: 2px solid color-mix(in srgb, var(--selected-color) 56%, transparent);
+  background: color-mix(in srgb, var(--selected-color) 5%, transparent);
+}
+.feelings-range-default span,
+.feelings-range-addition > span {
+  color: var(--feelings-quiet);
+  font-family: var(--feelings-mono);
+  font-size: 7px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.feelings-range-default p {
+  margin: 6px 0 0;
+  color: #d3d8d5;
+  font-size: 10px;
+  line-height: 1.5;
+}
+.feelings-range-addition {
+  display: block;
+  margin-top: 12px;
+}
+.feelings-range-addition textarea {
+  width: 100%;
+  min-height: 86px;
+  margin-top: 7px;
+  resize: vertical;
+  padding: 10px;
+  border: 1px solid var(--feelings-line);
+  border-radius: 8px;
+  background: #080a0a;
+  color: #d4d9d6;
+  font-size: 10px;
+  line-height: 1.5;
+}
+.feelings-range-addition small {
+  display: block;
+  margin-top: 5px;
+  color: var(--feelings-quiet);
+  font-family: var(--feelings-mono);
+  font-size: 7px;
+  text-align: right;
+}
+.feelings-range-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 7px;
+  margin-top: 10px;
+}
+.feelings-range-actions button {
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--feelings-line) !important;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.02);
+  color: #bec5c2;
+  font-size: 8px !important;
+  cursor: pointer;
+}
+.feelings-range-actions button.is-primary {
+  border-color: color-mix(in srgb, var(--selected-color) 38%, transparent) !important;
+  background: color-mix(in srgb, var(--selected-color) 10%, transparent);
+  color: var(--selected-color);
+}
 .feelings-capsule,
 .feelings-trail {
   padding-top: 22px;
+}
+.feelings-state-details .feelings-capsule,
+.feelings-state-details .feelings-trail {
+  padding-top: 17px;
 }
 .feelings-capsule > div,
 .feelings-trail > div:first-child {
@@ -1309,6 +1498,9 @@
   .feelings-track {
     width: 40px;
   }
+  .feelings-state-details {
+    grid-template-columns: 1fr;
+  }
 }
 @media (max-width: 860px) {
   .feelings-shell {
@@ -1329,8 +1521,7 @@
     border-top: 1px solid var(--feelings-line);
   }
   .feelings-inspector-header,
-  .feelings-capsule,
-  .feelings-trail {
+  .feelings-range-editor {
     grid-column: span 2;
   }
   .feelings-spectrum {
@@ -1347,7 +1538,17 @@
     padding-bottom: 13px;
   }
   .reset-label {
-    display: none;
+    width: 38px;
+    justify-content: center;
+    padding: 0;
+  }
+  .reset-label span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
   }
   .feelings-master-toggle > span:first-child {
     position: absolute;
@@ -1362,7 +1563,7 @@
     padding: 0;
     font-size: 0 !important;
   }
-  .feelings-utility::after {
+  .feelings-utility:not(.reset-label)::after {
     content: 'Cortex';
     font-family: var(--feelings-mono);
     font-size: 9px;
@@ -1410,6 +1611,9 @@
   .feelings-inspector {
     display: block;
   }
+  .feelings-state-details {
+    grid-template-columns: 1fr;
+  }
   .feelings-research > div {
     grid-template-columns: repeat(2, 1fr);
   }
@@ -1424,7 +1628,7 @@
     justify-content: center;
   }
 }
-@media (max-width: 360px) {
+@media (max-width: 420px) {
   .feelings-topbar {
     display: grid;
     grid-template-columns: minmax(0, 1fr);

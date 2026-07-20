@@ -300,6 +300,8 @@ function isRecoverableProviderErrorText(text, { allowToolOrMcpText = false } = {
     lowered.includes('authentication') ||
     lowered.includes('credential') ||
     lowered.includes('unauthorized') ||
+    lowered.includes('incorrect api key') ||
+    /^\s*(401|403)\b/.test(lowered) ||
     lowered.includes(' 401 ') ||
     lowered.includes(' 403 ') ||
     lowered.includes('overloaded') ||
@@ -350,6 +352,64 @@ function extractFallbackErrorCode(value) {
 function isRecoverableFallbackStatus(status) {
   return status === 401 || status === 402 || status === 403 || status === 429 || status >= 500;
 }
+
+/* === VIVENTIUM START ===
+ * Feature: Provider fallback during agent initialization
+ * Purpose: Connected-account authentication can fail while the provider client is being built,
+ * before AgentClient exists. Recognize only structured provider failures and invoke the same
+ * configured fallback once; never hide tool/runtime invariants or user cancellation.
+ * Added: 2026-07-13
+ */
+function isRecoverableProviderInitializationError(error) {
+  if (!error || typeof error !== 'object') {
+    return false;
+  }
+  if (error.viventiumConnectedAccountReconnectRequired === true) {
+    return true;
+  }
+  if (error.viventiumRecoverableProviderError === true) {
+    return true;
+  }
+  const code = extractFallbackErrorCode(error);
+  return code === 'MODEL_AUTHENTICATION' || code === 'MODEL_RATE_LIMIT';
+}
+
+async function initializePrimaryAgentWithFallback({
+  primaryAgent,
+  fallbackAgent,
+  fallbackAssignment,
+  initializePrimary,
+  initializeFallback,
+  signal,
+}) {
+  try {
+    return {
+      config: await initializePrimary(),
+      effectiveAgent: primaryAgent,
+      fallbackUsed: false,
+      primaryError: null,
+    };
+  } catch (primaryError) {
+    const cancelled = signal?.aborted === true;
+    const canFallback =
+      !cancelled &&
+      fallbackAgent != null &&
+      fallbackAssignment != null &&
+      typeof initializeFallback === 'function' &&
+      isRecoverableProviderInitializationError(primaryError);
+    if (!canFallback) {
+      throw primaryError;
+    }
+
+    return {
+      config: await initializeFallback(primaryError),
+      effectiveAgent: fallbackAgent,
+      fallbackUsed: true,
+      primaryError,
+    };
+  }
+}
+/* === VIVENTIUM END === */
 
 function shouldRetryWithFallback(contentParts) {
   if (
@@ -460,4 +520,6 @@ module.exports = {
   isAbortOrTimeoutErrorText,
   isRecoverableProviderErrorText,
   isNonRetryableFallbackErrorClass,
+  isRecoverableProviderInitializationError,
+  initializePrimaryAgentWithFallback,
 };

@@ -7,6 +7,9 @@ export interface IMemoryEntry extends Document {
   value: string;
   tokenCount?: number;
   updated_at?: Date;
+  /* === VIVENTIUM START === Retained tombstone for monotonic memory revisions. === */
+  deletedAt?: Date;
+  /* === VIVENTIUM END === */
   __v?: number;
 }
 
@@ -17,6 +20,9 @@ export interface IMemoryEntryLean {
   value: string;
   tokenCount?: number;
   updated_at?: Date;
+  /* === VIVENTIUM START === Retained tombstone for monotonic memory revisions. === */
+  deletedAt?: Date;
+  /* === VIVENTIUM END === */
   __v?: number;
 }
 
@@ -36,6 +42,12 @@ export interface DeleteMemoryParams {
   expectedRevision?: number | null;
 }
 
+/* === VIVENTIUM START === Atomic memory-key rename contract. === */
+export interface RenameMemoryParams extends SetMemoryParams {
+  newKey: string;
+}
+/* === VIVENTIUM END === */
+
 export interface GetFormattedMemoriesParams {
   userId: string | Types.ObjectId;
   memories?: IMemoryEntryLean[];
@@ -45,6 +57,9 @@ export interface GetFormattedMemoriesParams {
 export interface MemoryResult {
   ok: boolean;
   conflict?: boolean;
+  /* === VIVENTIUM START === Stable conflict class for truthful memory rename recovery. === */
+  conflictReason?: 'target_key_reserved';
+  /* === VIVENTIUM END === */
   updatedAt?: Date;
   revision?: number;
   currentRevision?: number;

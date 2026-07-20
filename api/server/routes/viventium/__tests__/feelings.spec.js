@@ -8,6 +8,7 @@ const mockDeleteFeelingState = jest.fn();
 const mockLoadFeelingsReadContext = jest.fn();
 const mockCreateInitialFeelingState = jest.fn();
 const mockPrepareManualFeelingPatch = jest.fn();
+const mockUpdateFeelingRangePromptOverride = jest.fn();
 const mockClearFeelingsReadCache = jest.fn();
 const mockResolveConfig = jest.fn();
 
@@ -35,6 +36,10 @@ const snapshot = {
   reactionActivationMode: 'always',
   innerState: null,
   bands: { energy: { baseline: 56, current: 56, halfLifeMinutes: 240, enabled: true } },
+  rangePromptOverrides: {},
+  rangePromptOverrideCount: 0,
+  activeRangePromptOverrideCount: 0,
+  activeRangePromptOverrideChars: 0,
   trail: [],
   reactionHealth: { status: 'never' },
 };
@@ -42,10 +47,13 @@ const snapshot = {
 jest.mock('@librechat/api', () => ({
   FEELING_BANDS: definitions,
   FEELING_BAND_IDS: definitions.map((definition) => definition.id),
+  FEELING_LEVEL_IDS: ['level_0', 'level_1', 'level_2', 'level_3', 'level_4'],
+  MAX_FEELING_RANGE_PROMPT_CHARS: 1200,
   DEFAULT_REACTION_INSTRUCTION: 'React naturally from the current state.',
   loadFeelingsReadContext: (...args) => mockLoadFeelingsReadContext(...args),
   createInitialFeelingState: (...args) => mockCreateInitialFeelingState(...args),
   prepareManualFeelingPatch: (...args) => mockPrepareManualFeelingPatch(...args),
+  updateFeelingRangePromptOverride: (...args) => mockUpdateFeelingRangePromptOverride(...args),
   clearFeelingsReadCache: (...args) => mockClearFeelingsReadCache(...args),
   resolveFeelingsRuntimeConfig: (...args) => mockResolveConfig(...args),
 }));
@@ -89,6 +97,9 @@ describe('/api/viventium/feelings', () => {
     mockPrepareManualFeelingPatch.mockReturnValue({
       band: { baseline: 56, current: 80, halfLifeMinutes: 240, enabled: true },
       trail: [],
+    });
+    mockUpdateFeelingRangePromptOverride.mockReturnValue({
+      play: { level_4: 'Everything keeps turning into a ridiculous game.' },
     });
   });
 
@@ -165,6 +176,70 @@ describe('/api/viventium/feelings', () => {
       .patch('/api/viventium/feelings/bands/unknown')
       .send({ expectedVersion: 0, current: 80 })
       .expect(404);
+  });
+
+  test('saves and restores a typed range instruction without touching numeric band time', async () => {
+    await request(createApp())
+      .patch('/api/viventium/feelings/bands/play')
+      .send({
+        expectedVersion: 0,
+        rangePromptOverride: {
+          levelId: 'level_4',
+          instruction: 'Everything keeps turning into a ridiculous game.',
+        },
+      })
+      .expect(200);
+
+    expect(mockPrepareManualFeelingPatch).not.toHaveBeenCalled();
+    expect(mockUpdateFeelingRangePromptOverride).toHaveBeenCalledWith({
+      overrides: {},
+      bandId: 'play',
+      levelId: 'level_4',
+      instruction: 'Everything keeps turning into a ridiculous game.',
+    });
+    expect(mockUpdateFeelingState).toHaveBeenCalledWith({
+      userId: '507f191e810c19729de860ea',
+      expectedVersion: 0,
+      set: {
+        rangePromptOverrides: {
+          play: { level_4: 'Everything keeps turning into a ridiculous game.' },
+        },
+        innerState: null,
+      },
+      trailEntries: [],
+    });
+
+    await request(createApp())
+      .patch('/api/viventium/feelings/bands/play')
+      .send({
+        expectedVersion: 0,
+        rangePromptOverride: { levelId: 'level_4', instruction: null },
+      })
+      .expect(200);
+  });
+
+  test('rejects unknown or oversized range instructions', async () => {
+    await request(createApp())
+      .patch('/api/viventium/feelings/bands/play')
+      .send({
+        expectedVersion: 0,
+        rangePromptOverride: { levelId: 'level_9', instruction: 'nope' },
+      })
+      .expect(422);
+    await request(createApp())
+      .patch('/api/viventium/feelings/bands/play')
+      .send({
+        expectedVersion: 0,
+        rangePromptOverride: { levelId: 'level_4', instruction: 'x'.repeat(1201) },
+      })
+      .expect(422);
+    await request(createApp())
+      .patch('/api/viventium/feelings/bands/play')
+      .send({
+        expectedVersion: 0,
+        rangePromptOverride: { levelId: 'level_4', instruction: '   ' },
+      })
+      .expect(422);
   });
 
   test('returns structured 409 when the expected version is stale', async () => {

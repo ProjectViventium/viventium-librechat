@@ -1,24 +1,24 @@
 /** Memories */
 import { z } from 'zod';
 import { createHmac, randomBytes } from 'crypto';
-import { tool } from '@langchain/core/tools';
 import { Tools, supportsAdaptiveThinking } from 'librechat-data-provider';
 import { logger } from '@librechat/data-schemas';
-import { HumanMessage } from '@langchain/core/messages';
+import { tool } from '@librechat/agents/langchain/tools';
 import { Run, Providers, GraphEvents } from '@librechat/agents';
+import { HumanMessage } from '@librechat/agents/langchain/messages';
 import type { MemoryKeyLimits } from '~/memory';
 import type {
   OpenAIClientOptions,
   StreamEventData,
   ToolEndCallback,
-  ClientOptions,
   EventHandler,
   ToolEndData,
   LLMConfig,
 } from '@librechat/agents';
+import type { BaseMessage, ToolMessage } from '@librechat/agents/langchain/messages';
+import type { DynamicStructuredTool } from '@librechat/agents/langchain/tools';
 import type { ObjectId, MemoryMethods, IUser } from '@librechat/data-schemas';
 import type { TAttachment, MemoryArtifact } from 'librechat-data-provider';
-import type { BaseMessage, ToolMessage } from '@langchain/core/messages';
 import type { Response as ServerResponse } from 'express';
 import { GenerationJobManager } from '~/stream/GenerationJobManager';
 import {
@@ -33,15 +33,31 @@ import {
 } from '~/endpoints/anthropic/helpers';
 import { resolveHeaders, createSafeUser } from '~/utils';
 
+/* === VIVENTIUM START === Include tombstone-aware state in revision-safe snapshots. === */
 type RequiredMemoryMethods = Pick<
   MemoryMethods,
-  'setMemory' | 'deleteMemory' | 'getFormattedMemories' | 'getAllUserMemories'
+  | 'setMemory'
+  | 'deleteMemory'
+  | 'getFormattedMemories'
+  | 'getAllUserMemories'
+  | 'getAllUserMemoryStates'
 >;
+/* === VIVENTIUM END === */
 
 type ToolEndMetadata = Record<string, unknown> & {
   run_id?: string;
   thread_id?: string;
 };
+
+type SanitizedMemoryLLMConfig = Omit<Partial<LLMConfig>, 'apiKey'> & { apiKey?: string };
+
+function normalizeMemoryLLMConfig(llmConfig?: Partial<LLMConfig>): SanitizedMemoryLLMConfig {
+  const config = { ...(llmConfig ?? {}) } as Record<string, unknown>;
+  if (typeof config.apiKey !== 'string') {
+    delete config.apiKey;
+  }
+  return config as SanitizedMemoryLLMConfig;
+}
 
 export interface MemoryConfig {
   validKeys?: string[];
@@ -94,7 +110,7 @@ export const memoryInstructions =
 
 const MEMORY_DECISION_TOOL_NAME = 'apply_memory_changes';
 const ANTHROPIC_MEMORY_DEFAULT_THINKING = true;
-const DEFAULT_MEMORY_READ_TOKEN_LIMIT = 1800;
+const DEFAULT_MEMORY_READ_TOKEN_LIMIT = 2200;
 const DEFAULT_MEMORY_READ_CACHE_TTL_MS = 30_000;
 const DEFAULT_MEMORY_READ_KEY_ORDER = [
   'core',
@@ -109,7 +125,7 @@ const DEFAULT_MEMORY_READ_KEY_ORDER = [
 ];
 const DEFAULT_MEMORY_READ_KEY_LIMITS: Record<string, number> = {
   core: 220,
-  preferences: 180,
+  preferences: 600,
   world: 320,
   context: 320,
   working: 180,
@@ -557,7 +573,7 @@ function describeAnthropicThinkingMode(thinking: unknown): string {
   return type || 'object';
 }
 
-function sanitizeAnthropicMemoryConfig(config: ClientOptions): ClientOptions {
+function sanitizeAnthropicMemoryConfig(config: LLMConfig): LLMConfig {
   if ((config as Partial<LLMConfig>).provider !== Providers.ANTHROPIC) {
     return config;
   }
@@ -571,7 +587,7 @@ function sanitizeAnthropicMemoryConfig(config: ClientOptions): ClientOptions {
   const sanitized = sanitizeAnthropicTemperatureForThinking({
     ...config,
     thinking: effectiveThinking,
-  }) as ClientOptions & {
+  }) as LLMConfig & {
     thinking?: unknown;
     temperature?: number;
     tool_choice?: unknown;
@@ -678,12 +694,113 @@ function buildGenericMemoryErrorArtifact(
   };
 }
 
+/* === VIVENTIUM START ===
+ * A model-correctable storage proposal gets one bounded retry only when no write from the batch
+ * applied. Keep the retry signal structured so policy failures cannot be mistaken for provider
+ * success or inferred from human-facing text.
+ */
+type MemoryErrorDetails = {
+  errorType: string;
+  message?: string;
+  key?: string;
+  keyLimit?: number;
+  projectedKeyTokens?: number;
+  tokenLimit?: number;
+  projectedTotalTokens?: number;
+  partialApplied?: boolean;
+};
+
+const RETRYABLE_MEMORY_POLICY_ERRORS = new Set([
+  'already_exceeded',
+  'would_exceed',
+  'key_limit_exceeded',
+  'key_already_exceeded',
+]);
+
+function parseMemoryErrorDetails(artifact?: MemoryArtifact): MemoryErrorDetails | null {
+  if (artifact?.type !== 'error' || typeof artifact.value !== 'string') {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(artifact.value) as Partial<MemoryErrorDetails>;
+    if (typeof parsed.errorType !== 'string' || !parsed.errorType) {
+      return null;
+    }
+    return parsed as MemoryErrorDetails;
+  } catch {
+    return null;
+  }
+}
+
+function markMemoryErrorPartialApply(
+  artifact: Record<Tools.memory, MemoryArtifact>,
+  partialApplied: boolean,
+) {
+  const details = parseMemoryErrorDetails(artifact[Tools.memory]);
+  if (details) {
+    artifact[Tools.memory].value = JSON.stringify({ ...details, partialApplied });
+  }
+  return artifact;
+}
+
+function getRetryableMemoryPolicyErrors(
+  attachments?: (TAttachment | null)[],
+): MemoryErrorDetails[] | null {
+  const artifacts = (attachments ?? [])
+    .map((attachment) => attachment?.[Tools.memory] as MemoryArtifact | undefined)
+    .filter((artifact): artifact is MemoryArtifact => artifact != null);
+  const errors = artifacts
+    .map((artifact) => parseMemoryErrorDetails(artifact))
+    .filter((details): details is MemoryErrorDetails => details != null);
+  if (
+    errors.length === 0 ||
+    artifacts.some((artifact) => artifact.type !== 'error') ||
+    errors.some(
+      (details) =>
+        details.partialApplied === true || !RETRYABLE_MEMORY_POLICY_ERRORS.has(details.errorType),
+    )
+  ) {
+    return null;
+  }
+  return errors;
+}
+
+function buildMemoryPolicyRetryInstruction(errors: MemoryErrorDetails[]): string {
+  const limits = errors.map((error) => {
+    const fields = [
+      `error=${error.errorType}`,
+      error.key ? `key=${error.key}` : null,
+      Number.isFinite(error.keyLimit) ? `key_limit=${error.keyLimit}` : null,
+      Number.isFinite(error.projectedKeyTokens)
+        ? `proposed_key_tokens=${error.projectedKeyTokens}`
+        : null,
+      Number.isFinite(error.tokenLimit) ? `total_limit=${error.tokenLimit}` : null,
+      Number.isFinite(error.projectedTotalTokens)
+        ? `proposed_total_tokens=${error.projectedTotalTokens}`
+        : null,
+    ].filter(Boolean);
+    return `- ${fields.join(' ')}`;
+  });
+  return `# Internal memory storage correction
+This is runtime policy feedback, not user-authored content. Do not store or quote it.
+The previous proposal was rejected before any write applied. Retry exactly once using the original
+user request and existing memory. Preserve every unrelated durable fact, remove duplicates and
+compress wording as needed, and return full replacement values within every stated limit. Do not
+truncate, use placeholders, or invent facts.
+${limits.join('\n')}`;
+}
+/* === VIVENTIUM END === */
+
 type MemoryRuntimeState = {
   tokenCounts: Record<string, number>;
   runningTotalTokens: number;
   revisions: Record<string, number>;
   valueHashes: Record<string, string>;
   revisionProtected: boolean;
+};
+
+type MemoryProcessingAttemptState = {
+  storageApplied: boolean;
 };
 
 const memoryAuditHashKey = randomBytes(32);
@@ -693,6 +810,9 @@ const hashMemoryAuditValue = (value: unknown): string =>
     .digest('hex')
     .slice(0, 16);
 
+/* === VIVENTIUM START ===
+ * Persist a privacy-safe structured write audit even under the local text logger formatter.
+ */
 function logMemoryWriteAudit({
   userId,
   key,
@@ -710,7 +830,7 @@ function logMemoryWriteAudit({
   afterHash?: string;
   auditContext?: MemoryWriteAuditContext;
 }) {
-  logger.info('[MemoryAgent] write audit', {
+  const event = {
     event: 'memory_writer_write',
     userHash: hashMemoryAuditValue(userId),
     conversationHash: auditContext?.conversationId
@@ -723,8 +843,11 @@ function logMemoryWriteAudit({
     status,
     beforeHash,
     afterHash,
-  });
+  };
+  // The local non-JSON formatter retains message text but may discard metadata objects.
+  logger.info(`[MemoryAgent] write audit ${JSON.stringify(event)}`);
 }
+/* === VIVENTIUM END === */
 
 function memoryErrorMetadata(error: unknown): Record<string, unknown> {
   const typed = error as
@@ -782,6 +905,7 @@ export const createMemoryTool = ({
   auditContext,
   totalTokens = 0,
   state,
+  attemptState,
 }: {
   userId: string | ObjectId;
   setMemory: MemoryMethods['setMemory'];
@@ -794,7 +918,8 @@ export const createMemoryTool = ({
   auditContext?: MemoryWriteAuditContext;
   totalTokens?: number;
   state?: MemoryRuntimeState;
-}) => {
+  attemptState?: MemoryProcessingAttemptState;
+}): DynamicStructuredTool => {
   /* === VIVENTIUM START ===
    * Fix: Prevent tokenLimit double-counting for per-key overwrites.
    *
@@ -865,11 +990,15 @@ export const createMemoryTool = ({
         };
         const result = await setMemory(writeParams);
         if (result.ok) {
+          if (attemptState) {
+            attemptState.storageApplied = true;
+          }
           runtimeState.tokenCounts[key] = tokenCount;
           runtimeState.runningTotalTokens += tokenDelta;
           runtimeState.valueHashes[key] = hashMemoryAuditValue(nextValue);
           if (result.revision != null) {
             runtimeState.revisions[key] = result.revision;
+            artifact[Tools.memory].revision = result.revision;
           }
           logMemoryWriteAudit({
             userId,
@@ -967,6 +1096,7 @@ const createDeleteMemoryTool = ({
   auditContext,
   totalTokens = 0,
   state,
+  attemptState,
 }: {
   userId: string | ObjectId;
   deleteMemory: MemoryMethods['deleteMemory'];
@@ -977,6 +1107,7 @@ const createDeleteMemoryTool = ({
   auditContext?: MemoryWriteAuditContext;
   totalTokens?: number;
   state?: MemoryRuntimeState;
+  attemptState?: MemoryProcessingAttemptState;
 }) => {
   const runtimeState =
     state ??
@@ -1015,9 +1146,17 @@ const createDeleteMemoryTool = ({
             : {}),
         });
         if (result.ok) {
+          if (attemptState) {
+            attemptState.storageApplied = true;
+          }
           const previousTokenCount = runtimeState.tokenCounts[key] ?? 0;
           delete runtimeState.tokenCounts[key];
-          delete runtimeState.revisions[key];
+          /* === VIVENTIUM START === Keep the tombstone revision for later same-run CAS writes. === */
+          if (result.revision != null) {
+            runtimeState.revisions[key] = result.revision;
+            artifact[Tools.memory].revision = result.revision;
+          }
+          /* === VIVENTIUM END === */
           delete runtimeState.valueHashes[key];
           runtimeState.runningTotalTokens = Math.max(
             0,
@@ -1119,6 +1258,7 @@ export const createApplyMemoryChangesTool = ({
   memoryValueHashMap,
   auditContext,
   totalTokens = 0,
+  attemptState,
 }: {
   userId: string | ObjectId;
   setMemory: MemoryMethods['setMemory'];
@@ -1131,6 +1271,7 @@ export const createApplyMemoryChangesTool = ({
   memoryValueHashMap?: Record<string, string>;
   auditContext?: MemoryWriteAuditContext;
   totalTokens?: number;
+  attemptState?: MemoryProcessingAttemptState;
 }) => {
   const runtimeState = createMemoryRuntimeState({
     memoryTokenMap,
@@ -1146,6 +1287,7 @@ export const createApplyMemoryChangesTool = ({
     keyLimits,
     state: runtimeState,
     auditContext,
+    attemptState,
   });
   const deleteMemoryTool = createDeleteMemoryTool({
     userId,
@@ -1153,6 +1295,7 @@ export const createApplyMemoryChangesTool = ({
     validKeys,
     state: runtimeState,
     auditContext,
+    attemptState,
   });
   const noopMemoryTool = createNoopMemoryTool();
 
@@ -1171,6 +1314,8 @@ export const createApplyMemoryChangesTool = ({
 
       const summaries: string[] = [];
       let primaryArtifact: Record<Tools.memory, MemoryArtifact> | undefined;
+      let errorArtifact: Record<Tools.memory, MemoryArtifact> | undefined;
+      let appliedCount = 0;
 
       for (const operation of normalizedOperations) {
         const action = operation?.action;
@@ -1237,14 +1382,32 @@ export const createApplyMemoryChangesTool = ({
           summaries.push(result[0]);
         }
 
-        if (primaryArtifact == null && result[1] != null) {
-          primaryArtifact = result[1];
+        const memoryArtifact = result[1]?.[Tools.memory];
+        if (memoryArtifact?.type === 'error') {
+          errorArtifact ??= result[1];
+          break;
+        } else if (memoryArtifact?.type === 'update' || memoryArtifact?.type === 'delete') {
+          appliedCount += 1;
+          primaryArtifact ??= result[1];
+        } else if ((action === 'set' || action === 'delete') && result[1] == null) {
+          errorArtifact ??= buildGenericMemoryErrorArtifact(
+            result[0] || `Failed to ${action} memory`,
+            runtimeState.runningTotalTokens,
+            {
+              errorType: 'write_failed',
+              action,
+              key: operation?.key,
+            },
+          );
+          break;
         }
       }
 
       return [
         summaries.filter(Boolean).join('\n') || 'No durable memory update needed for this turn',
-        primaryArtifact,
+        errorArtifact != null
+          ? markMemoryErrorPartialApply(errorArtifact, appliedCount > 0)
+          : primaryArtifact,
       ];
     },
     {
@@ -1304,7 +1467,7 @@ const preserveForcedToolChoice = ({
   toolChoice,
 }: {
   provider?: string;
-  llmConfig: ClientOptions;
+  llmConfig: LLMConfig;
   toolChoice: string;
 }): void => {
   const normalized = String(provider ?? '')
@@ -1392,6 +1555,7 @@ export async function processMemory({
   auditContext,
   totalTokens = 0,
   streamId = null,
+  deferArtifactDelivery = false,
   user,
 }: {
   res: ServerResponse;
@@ -1413,9 +1577,11 @@ export async function processMemory({
   totalTokens?: number;
   llmConfig?: Partial<LLMConfig>;
   streamId?: string | null;
+  deferArtifactDelivery?: boolean;
   user?: IUser;
 }): Promise<(TAttachment | null)[] | undefined> {
   try {
+    const attemptState: MemoryProcessingAttemptState = { storageApplied: false };
     const resolvedKeyLimits = resolveMemoryKeyLimits(keyLimits);
     const memoryTool = createMemoryTool({
       userId,
@@ -1428,6 +1594,7 @@ export async function processMemory({
       memoryValueHashMap,
       auditContext,
       totalTokens,
+      attemptState,
     });
     const deleteMemoryTool = createDeleteMemoryTool({
       userId,
@@ -1438,6 +1605,7 @@ export async function processMemory({
       memoryValueHashMap,
       auditContext,
       totalTokens,
+      attemptState,
     });
     const noopMemoryTool = createNoopMemoryTool();
     const applyMemoryChangesTool = createApplyMemoryChangesTool({
@@ -1452,6 +1620,7 @@ export async function processMemory({
       memoryValueHashMap,
       auditContext,
       totalTokens,
+      attemptState,
     });
 
     const currentMemoryTokens = totalTokens;
@@ -1489,15 +1658,15 @@ ${memory ?? 'No existing memories'}`;
       disableStreaming: true,
     };
 
-    const finalLLMConfig: ClientOptions = {
+    const finalLLMConfig = {
       ...defaultLLMConfig,
-      ...llmConfig,
+      ...normalizeMemoryLLMConfig(llmConfig),
       /**
        * Ensure streaming is always disabled for memory processing
        */
       streaming: false,
       disableStreaming: true,
-    };
+    } as LLMConfig;
 
     const memoryProvider = (finalLLMConfig as Partial<LLMConfig>).provider ?? llmConfig?.provider;
     const toolChoice = resolveMemoryToolChoice(memoryProvider);
@@ -1568,9 +1737,11 @@ ${memory ?? 'No existing memories'}`;
       Object.assign(finalLLMConfig as Record<string, unknown>, sanitizedAnthropicConfig);
       if (removedTemperature) {
         logger.info('[MemoryAgent] Removed Anthropic temperature for memory run', {
-          userId,
-          conversationId,
-          messageId,
+          /* === VIVENTIUM START === Hash private identifiers in memory-agent telemetry. === */
+          userHash: hashMemoryAuditValue(userId),
+          conversationHash: hashMemoryAuditValue(conversationId),
+          messageHash: hashMemoryAuditValue(messageId),
+          /* === VIVENTIUM END === */
           model:
             'model' in sanitizedAnthropicConfig
               ? (sanitizedAnthropicConfig.model as string | undefined)
@@ -1589,7 +1760,12 @@ ${memory ?? 'No existing memories'}`;
     }
 
     const artifactPromises: Promise<TAttachment | null>[] = [];
-    const memoryCallback = createMemoryCallback({ res, artifactPromises, streamId });
+    const memoryCallback = createMemoryCallback({
+      res,
+      artifactPromises,
+      streamId,
+      deferDelivery: deferArtifactDelivery,
+    });
     const customHandlers = {
       [GraphEvents.TOOL_END]: new BasicToolEndHandler(memoryCallback),
     };
@@ -1664,14 +1840,16 @@ ${memory ?? 'No existing memories'}`;
     try {
       content = await run.processStream(inputs, config);
     } catch (error) {
-      if (!isRetryableMemoryProcessingError(error)) {
+      if (!isRetryableMemoryProcessingError(error) || attemptState.storageApplied) {
         throw error;
       }
 
       logger.warn('[MemoryAgent] Retrying memory run after retryable upstream error', {
-        userId,
-        conversationId,
-        messageId,
+        /* === VIVENTIUM START === Hash private identifiers in memory-agent telemetry. === */
+        userHash: hashMemoryAuditValue(userId),
+        conversationHash: hashMemoryAuditValue(conversationId),
+        messageHash: hashMemoryAuditValue(messageId),
+        /* === VIVENTIUM END === */
         provider: llmConfig?.provider,
         model:
           llmConfig != null && 'model' in llmConfig
@@ -1689,14 +1867,22 @@ ${memory ?? 'No existing memories'}`;
             ? (llmConfig.model as string | undefined)
             : undefined,
       });
-      logger.debug('[MemoryAgent] Processed successfully', {
-        userId,
-        conversationId,
-        messageId,
+      logger.debug('[MemoryAgent] Provider run completed', {
+        /* === VIVENTIUM START === Hash private identifiers in memory-agent telemetry. === */
+        userHash: hashMemoryAuditValue(userId),
+        conversationHash: hashMemoryAuditValue(conversationId),
+        messageHash: hashMemoryAuditValue(messageId),
+        /* === VIVENTIUM END === */
         provider: llmConfig?.provider,
       });
     } else {
-      logger.debug('[MemoryAgent] Returned no content', { userId, conversationId, messageId });
+      logger.debug('[MemoryAgent] Returned no content', {
+        /* === VIVENTIUM START === Hash private identifiers in memory-agent telemetry. === */
+        userHash: hashMemoryAuditValue(userId),
+        conversationHash: hashMemoryAuditValue(conversationId),
+        messageHash: hashMemoryAuditValue(messageId),
+        /* === VIVENTIUM END === */
+      });
     }
     return await Promise.all(artifactPromises);
   } catch (error) {
@@ -1773,16 +1959,22 @@ export async function loadMemorySnapshot({
     },
   });
 
-  const entries = await memoryMethods.getAllUserMemories(userId);
+  /* === VIVENTIUM START ===
+   * User prompt text sees active rows only; writer CAS state also retains deleted-key revisions.
+   */
+  const states = await memoryMethods.getAllUserMemoryStates(userId);
+  const entries = (states ?? []).filter((entry) => !entry.deletedAt);
   const formatted = await memoryMethods.getFormattedMemories({ userId, memories: entries });
   const memoryRevisionMap: Record<string, number> = {};
   const memoryValueHashMap: Record<string, string> = {};
-  for (const entry of entries ?? []) {
+  for (const entry of states ?? []) {
     if (!entry?.key) {
       continue;
     }
     memoryRevisionMap[entry.key] = Number(entry.__v ?? 0);
-    memoryValueHashMap[entry.key] = hashMemoryAuditValue(entry.value);
+    if (!entry.deletedAt) {
+      memoryValueHashMap[entry.key] = hashMemoryAuditValue(entry.value);
+    }
   }
   return {
     withKeys: formatted.withKeys ?? '',
@@ -1792,6 +1984,7 @@ export async function loadMemorySnapshot({
     memoryRevisionMap,
     memoryValueHashMap,
   };
+  /* === VIVENTIUM END === */
 }
 
 export async function createMemoryProcessor({
@@ -1844,32 +2037,59 @@ export async function createMemoryProcessor({
     withoutKeys,
     async function (messages: BaseMessage[]): Promise<(TAttachment | null)[] | undefined> {
       try {
-        return await processMemory({
-          res,
-          userId,
-          messages,
-          validKeys,
-          llmConfig,
-          keyLimits,
-          messageId,
-          tokenLimit,
-          memoryTokenMap: memoryTokenMap ?? {},
-          memoryRevisionMap: memoryRevisionMap ?? {},
-          memoryValueHashMap: memoryValueHashMap ?? {},
-          auditContext: {
-            source: auditSource,
-            conversationId,
+        const runAttempt = (attemptMessages: BaseMessage[]) =>
+          processMemory({
+            res,
+            userId,
+            messages: attemptMessages,
+            validKeys,
+            llmConfig,
+            keyLimits,
             messageId,
-          },
-          streamId,
-          conversationId,
-          memory: withKeys,
-          totalTokens: totalTokens || 0,
-          instructions: finalInstructions,
-          setMemory: memoryMethods.setMemory,
-          deleteMemory: memoryMethods.deleteMemory,
-          user,
-        });
+            tokenLimit,
+            memoryTokenMap: memoryTokenMap ?? {},
+            memoryRevisionMap: memoryRevisionMap ?? {},
+            memoryValueHashMap: memoryValueHashMap ?? {},
+            auditContext: {
+              source: auditSource,
+              conversationId,
+              messageId,
+            },
+            streamId,
+            deferArtifactDelivery: true,
+            conversationId,
+            memory: withKeys,
+            totalTokens: totalTokens || 0,
+            instructions: finalInstructions,
+            setMemory: memoryMethods.setMemory,
+            deleteMemory: memoryMethods.deleteMemory,
+            user,
+          });
+
+        let attachments = await runAttempt(messages);
+        const retryableErrors = getRetryableMemoryPolicyErrors(attachments);
+        if (retryableErrors) {
+          logger.warn(
+            `[MemoryAgent] Retrying rejected storage proposal | userHash=${hashMemoryAuditValue(userId)} | conversationHash=${hashMemoryAuditValue(conversationId)} | messageHash=${hashMemoryAuditValue(messageId)} | errors=${retryableErrors.map((error) => error.errorType).join(',')}`,
+          );
+          const correctedAttachments = await runAttempt([
+            ...messages,
+            new HumanMessage(buildMemoryPolicyRetryInstruction(retryableErrors)),
+          ]);
+          const correctionHasFinalOutcome = (correctedAttachments ?? []).some((attachment) => {
+            const type = attachment?.[Tools.memory]?.type;
+            return type === 'update' || type === 'delete' || type === 'error';
+          });
+          if (correctionHasFinalOutcome) {
+            attachments = correctedAttachments;
+          } else {
+            logger.warn(
+              `[MemoryAgent] Correction returned no durable outcome; preserving rejection | userHash=${hashMemoryAuditValue(userId)} | conversationHash=${hashMemoryAuditValue(conversationId)} | messageHash=${hashMemoryAuditValue(messageId)}`,
+            );
+          }
+        }
+        deliverDeferredMemoryAttachments({ res, streamId, attachments });
+        return attachments;
       } catch (error) {
         logger.error('Memory Agent failed to process memory', error);
       }
@@ -1882,11 +2102,13 @@ async function handleMemoryArtifact({
   data,
   metadata,
   streamId = null,
+  deferDelivery = false,
 }: {
   res: ServerResponse;
   data: ToolEndData;
   metadata?: ToolEndMetadata;
   streamId?: string | null;
+  deferDelivery?: boolean;
 }) {
   const output = data?.output as ToolMessage | undefined;
   if (!output) {
@@ -1909,7 +2131,7 @@ async function handleMemoryArtifact({
     conversationId: metadata?.thread_id ?? '',
     [Tools.memory]: memoryArtifact,
   };
-  if (!res.headersSent) {
+  if (deferDelivery || !res.headersSent) {
     return attachment;
   }
   if (streamId) {
@@ -1918,6 +2140,30 @@ async function handleMemoryArtifact({
     res.write(`event: attachment\ndata: ${JSON.stringify(attachment)}\n\n`);
   }
   return attachment;
+}
+
+function deliverDeferredMemoryAttachments({
+  res,
+  streamId,
+  attachments,
+}: {
+  res: ServerResponse;
+  streamId?: string | null;
+  attachments?: (TAttachment | null)[];
+}) {
+  if (!res.headersSent) {
+    return;
+  }
+  for (const attachment of attachments ?? []) {
+    if (!attachment) {
+      continue;
+    }
+    if (streamId) {
+      GenerationJobManager.emitChunk(streamId, { event: 'attachment', data: attachment });
+    } else {
+      res.write(`event: attachment\ndata: ${JSON.stringify(attachment)}\n\n`);
+    }
+  }
 }
 
 /**
@@ -1932,10 +2178,12 @@ export function createMemoryCallback({
   res,
   artifactPromises,
   streamId = null,
+  deferDelivery = false,
 }: {
   res: ServerResponse;
   artifactPromises: Promise<Partial<TAttachment> | null>[];
   streamId?: string | null;
+  deferDelivery?: boolean;
 }): ToolEndCallback {
   return async (data: ToolEndData, metadata?: Record<string, unknown>) => {
     const output = data?.output as ToolMessage | undefined;
@@ -1944,7 +2192,7 @@ export function createMemoryCallback({
       return;
     }
     artifactPromises.push(
-      handleMemoryArtifact({ res, data, metadata, streamId }).catch((error) => {
+      handleMemoryArtifact({ res, data, metadata, streamId, deferDelivery }).catch((error) => {
         logger.error('Error processing memory artifact content:', error);
         return null;
       }),

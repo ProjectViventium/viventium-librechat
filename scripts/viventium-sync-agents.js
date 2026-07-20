@@ -1505,6 +1505,17 @@ function buildUpdateData(
   } = {},
 ) {
   const updateData = {};
+  /* === VIVENTIUM START ===
+   * Feature: Surgical background-agent sync isolation.
+   * Purpose: The main document owns background activation links, so a background-only selection
+   * must still merge that selected activation record without also overwriting top-level live main
+   * instructions, name, description, or starters from the tracked scaffold.
+   * === VIVENTIUM END === */
+  const selectedIdSet =
+    Array.isArray(selectedAgentIds) && selectedAgentIds.length > 0
+      ? new Set(selectedAgentIds)
+      : null;
+  const topLevelAgentSelected = !selectedIdSet || selectedIdSet.has(agentData?.id);
   const fieldsToUse = promptsOnly
     ? PROMPTS_ONLY_FIELDS
     : activationConfigOnly
@@ -1522,6 +1533,9 @@ function buildUpdateData(
 
   for (const field of fieldsToUse) {
     if (field === 'id') {
+      continue;
+    }
+    if (field !== 'background_cortices' && !topLevelAgentSelected) {
       continue;
     }
     if (!Object.prototype.hasOwnProperty.call(agentData, field)) {

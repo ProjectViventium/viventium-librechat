@@ -39,11 +39,16 @@ const useUserKey = (endpoint: string) => {
   const saveUserKey = useCallback(
     (userKey: string, expiresAt: number | null) => {
       const dateStr = expiresAt ? new Date(expiresAt).toISOString() : '';
-      updateKey.mutate({
+      /* === VIVENTIUM START ===
+       * Feature: Recoverable Connected Accounts key save.
+       * Purpose: Let the dialog await storage so network/backend failures retain the user's input for retry.
+       */
+      return updateKey.mutateAsync({
         name: keyName,
         value: userKey,
         expiresAt: dateStr,
       });
+      /* === VIVENTIUM END === */
     },
     [updateKey, keyName],
   );

@@ -229,25 +229,6 @@ function totalTokens(memories) {
   return memories.reduce((sum, memory) => sum + (Number(memory.tokenCount) || 0), 0);
 }
 
-async function applyDuplicateMergePlan(plan, methods, userId) {
-  let deleted = 0;
-  const maxDeletes = plan.originalCount + 5;
-  for (let index = 0; index < maxDeletes; index += 1) {
-    const current = await methods.getAllUserMemories(userId);
-    if (!current.some((memory) => memory.key === plan.key)) break;
-    const result = await methods.deleteMemory({ userId, key: plan.key });
-    if (!result?.ok) break;
-    deleted += 1;
-  }
-  await methods.setMemory({
-    userId,
-    key: plan.key,
-    value: plan.mergedValue,
-    tokenCount: plan.mergedTokenCount,
-  });
-  return deleted;
-}
-
 async function applyProposal(options) {
   if (!options.proposal) {
     throw new Error('Missing --proposal.');
@@ -303,19 +284,45 @@ async function applyProposalWithMethods(
     };
   }
 
+  /* === VIVENTIUM START ===
+   * Duplicate rows predate the unique key constraint and cannot be rewritten safely through
+   * key-scoped CAS methods. Fail closed so a stale online merge cannot erase a concurrent write.
+   */
+  if (options.apply && duplicatePlans.length > 0) {
+    return {
+      ok: false,
+      mode: 'apply',
+      reason: 'duplicate_memory_merge_requires_offline_migration',
+      duplicateKeys: duplicatePlans.map((plan) => plan.key),
+      actionCount: actions.length,
+      appliedCount: 0,
+      dedupeCount: duplicatePlans.length,
+      dedupe: duplicatePlans.map((plan) => ({
+        key: plan.key,
+        originalCount: plan.originalCount,
+        mergedValueHash: plan.mergedValueHash,
+        status: 'requires_offline_migration',
+        reason: 'duplicate rows cannot be merged safely through key-scoped online CAS',
+      })),
+      actions: actions.map((action) => ({
+        action: action.action,
+        key: action.key,
+        valueHash: action.action === 'set' ? sha(action.value) : null,
+        status: 'blocked_duplicate_key_migration',
+      })),
+    };
+  }
+  /* === VIVENTIUM END === */
+
   const dedupeResults = [];
   for (const plan of duplicatePlans) {
-    let deletedCount = 0;
-    if (options.apply) {
-      deletedCount = await applyDuplicateMergePlan(plan, memoryMethods, options.userId);
-    }
     dedupeResults.push({
       key: plan.key,
       originalCount: plan.originalCount,
       mergedValueHash: plan.mergedValueHash,
       tokenCount: plan.mergedTokenCount,
-      deletedCount: options.apply ? deletedCount : 0,
-      status: options.apply ? 'merged_duplicate_key' : 'would_merge_duplicate_key',
+      deletedCount: 0,
+      status: 'would_merge_duplicate_key',
     });
   }
   if (duplicatePlans.length > 0) {
@@ -324,8 +331,12 @@ async function applyProposalWithMethods(
 
   const results = [];
   for (const action of actions) {
-    const memories = await memoryMethods.getAllUserMemories(options.userId);
+    const [memories, memoryStates] = await Promise.all([
+      memoryMethods.getAllUserMemories(options.userId),
+      (memoryMethods.getAllUserMemoryStates || memoryMethods.getAllUserMemories)(options.userId),
+    ]);
     const existing = memories.find((memory) => memory.key === action.key);
+    const existingState = memoryStates.find((memory) => memory.key === action.key);
     if (action.action === 'delete') {
       let deleteResult = null;
       if (options.apply && existing) {
@@ -335,6 +346,8 @@ async function applyProposalWithMethods(
           expectedRevision: Number(existing.__v ?? 0),
         });
       }
+      const deleteSucceeded =
+        deleteResult?.ok === true && Number.isInteger(deleteResult?.revision);
       results.push({
         action: 'delete',
         key: action.key,
@@ -342,7 +355,9 @@ async function applyProposalWithMethods(
           ? 'rejected_revision_conflict'
           : existing
             ? options.apply
-              ? 'deleted'
+              ? deleteSucceeded
+                ? 'deleted'
+                : 'rejected_storage_failure'
               : 'would_delete'
             : 'already_absent',
       });
@@ -380,7 +395,7 @@ async function applyProposalWithMethods(
         key: action.key,
         value: prepared.value,
         tokenCount: prepared.tokenCount,
-        expectedRevision: existing ? Number(existing.__v ?? 0) : null,
+        expectedRevision: existingState ? Number(existingState.__v ?? 0) : null,
       });
       if (writeResult?.conflict) {
         results.push({
@@ -388,6 +403,15 @@ async function applyProposalWithMethods(
           key: action.key,
           valueHash: sha(prepared.value),
           status: 'rejected_revision_conflict',
+        });
+        continue;
+      }
+      if (writeResult?.ok !== true || !Number.isInteger(writeResult?.revision)) {
+        results.push({
+          action: 'set',
+          key: action.key,
+          valueHash: sha(prepared.value),
+          status: 'rejected_storage_failure',
         });
         continue;
       }
@@ -420,6 +444,7 @@ async function applyProposalWithMethods(
         return memoryMethods.setMemory({ userId, key, value, tokenCount, expectedRevision });
       },
       policy,
+      protectedKeys: Array.from(new Set(['working', ...proposalKeys])),
     });
   }
 

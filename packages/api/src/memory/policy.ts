@@ -338,10 +338,12 @@ export function evaluateMemoryWrite({
 export function createMemoryMaintenancePlan({
   memories,
   policy,
+  protectedKeys = [],
   now = new Date(),
 }: {
   memories: MemoryEntryLike[];
   policy: MemoryPolicyConfig;
+  protectedKeys?: string[];
   now?: Date;
 }): MemoryMaintenancePlan {
   const memoryMap = new Map<string, MemoryEntryLike>();
@@ -356,6 +358,7 @@ export function createMemoryMaintenancePlan({
       ? Number(policy.tokenLimit)
       : null;
   const keyLimits = resolveMemoryKeyLimits(policy.keyLimits);
+  const protectedKeySet = new Set(protectedKeys);
   const thresholdPercent = resolveMaintenanceThresholdPercent(policy.maintenanceThresholdPercent);
   const totalTokensBefore = getTotalTokens(Array.from(memoryMap.values()));
   const thresholdTokens =
@@ -443,37 +446,43 @@ export function createMemoryMaintenancePlan({
     reason.push(`keys at maintenance threshold: ${keysNearLimit.join(', ')}`);
   }
 
-  applyTransform(
-    memoryMap,
+  const applyAllowedTransform = (
+    key: string,
+    reason: string,
+    transform: (entry: MemoryEntryLike) => string,
+  ) => {
+    if (!protectedKeySet.has(key)) {
+      applyTransform(memoryMap, key, reason, transform);
+    }
+  };
+
+  applyAllowedTransform(
     'me',
     'Removed operational residue from relationship observations',
     (entry) => compactMeValue(entry.value, keyLimits?.me, now),
   );
-  applyTransform(
-    memoryMap,
+  applyAllowedTransform(
     'signals',
     'Pruned operational residue and overlong evidence from signals',
     (entry) => compactSignalsValue(entry.value, now, keyLimits?.signals),
   );
-  applyTransform(memoryMap, 'drafts', 'Compressed drafts into a compact project index', (entry) =>
+  applyAllowedTransform('drafts', 'Compressed drafts into a compact project index', (entry) =>
     compactDraftsValue(entry.value, now, keyLimits?.drafts),
   );
-  applyTransform(
-    memoryMap,
+  applyAllowedTransform(
     'world',
     'Compacted world to durable relationships and venture identity',
     (entry) => compactWorldValue(entry.value, now, keyLimits?.world),
   );
-  applyTransform(
-    memoryMap,
+  applyAllowedTransform(
     'context',
     'Trimmed context to active state and removed operational chatter',
     (entry) => compactContextValue(entry.value, now, keyLimits?.context),
   );
-  applyTransform(memoryMap, 'working', 'Compacted stale working memory snapshot', (entry) =>
+  applyAllowedTransform('working', 'Compacted stale working memory snapshot', (entry) =>
     compactWorkingValue(entry.value, now, keyLimits?.working),
   );
-  applyTransform(memoryMap, 'moments', 'Pruned moments to the active episodic window', (entry) =>
+  applyAllowedTransform('moments', 'Pruned moments to the active episodic window', (entry) =>
     compactMomentsValue(entry.value, now, keyLimits?.moments),
   );
 
@@ -509,6 +518,7 @@ export async function runMemoryMaintenance({
   getAllUserMemories,
   setMemory,
   policy,
+  protectedKeys = [],
   now = new Date(),
 }: {
   userId: string;
@@ -521,10 +531,11 @@ export async function runMemoryMaintenance({
     expectedRevision?: number | null;
   }) => Promise<{ ok: boolean; conflict?: boolean; revision?: number }>;
   policy: MemoryPolicyConfig;
+  protectedKeys?: string[];
   now?: Date;
 }): Promise<MemoryMaintenancePlan> {
   const memories = await getAllUserMemories(userId);
-  const plan = createMemoryMaintenancePlan({ memories, policy, now });
+  const plan = createMemoryMaintenancePlan({ memories, policy, protectedKeys, now });
 
   if (!plan.shouldApply) {
     return plan;

@@ -413,7 +413,10 @@ function ensureCodexReasoningEncryptedContentInclude(payload: Record<string, unk
   return true;
 }
 
-function createCodexResponsesFetch(baseFetch: Fetch): Fetch {
+function createCodexResponsesFetch(
+  baseFetch: Fetch,
+  connectedAccountAuthRefresh?: t.OpenAIConfigOptions['connectedAccountAuthRefresh'],
+): Fetch {
   return async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
     const requestUrl = getRequestUrl(input);
     const method = init?.method?.toUpperCase() ?? 'GET';
@@ -484,7 +487,33 @@ function createCodexResponsesFetch(baseFetch: Fetch): Fetch {
       }
     }
 
+    /* === VIVENTIUM START ===
+     * Feature: Connected-account early-401 recovery
+     * Purpose: A provider can invalidate an otherwise unexpired access token. Refresh and replay
+     * once, then preserve the existing fallback/error path if recovery cannot complete.
+     */
+    const retryInput = input instanceof Request ? input.clone() : input;
     let response = await baseFetch(input, nextInit);
+
+    if (isResponsesRequest && response.status === 401 && connectedAccountAuthRefresh) {
+      try {
+        const refreshedAuth = await connectedAccountAuthRefresh();
+        const retryHeaders = new Headers(input instanceof Request ? input.headers : undefined);
+        const nextHeaders = new Headers(nextInit?.headers);
+        nextHeaders.forEach((value, name) => retryHeaders.set(name, value));
+        retryHeaders.set('authorization', `Bearer ${refreshedAuth.apiKey}`);
+        Object.entries(refreshedAuth.headers ?? {}).forEach(([name, value]) => {
+          retryHeaders.set(name, value);
+        });
+        response = await baseFetch(retryInput, {
+          ...nextInit,
+          headers: retryHeaders,
+        });
+      } catch {
+        // Preserve the original 401 so existing provider fallback and error classification still run.
+      }
+    }
+    /* === VIVENTIUM END === */
 
     if (isResponsesRequest && originalStream === false && response.ok) {
       const rawBody = await response.text();
@@ -738,7 +767,10 @@ export function getOpenAIConfig(
    * === VIVENTIUM END === */
   if (isCodexResponsesBaseURL(configOptions.baseURL)) {
     const baseFetch = (configOptions.fetch as Fetch | undefined) ?? (fetch as Fetch);
-    configOptions.fetch = createCodexResponsesFetch(baseFetch);
+    configOptions.fetch = createCodexResponsesFetch(
+      baseFetch,
+      options.connectedAccountAuthRefresh,
+    );
   }
 
   const result: t.OpenAIConfigResult = {

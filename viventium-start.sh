@@ -25,6 +25,13 @@ PROJECT_DIR="$SCRIPT_DIR"
 VIVENTIUM_PARENT_REPO_ROOT="$(cd "$PROJECT_DIR/../.." && pwd)"
 export VIVENTIUM_REPO_ROOT="${VIVENTIUM_REPO_ROOT:-$VIVENTIUM_PARENT_REPO_ROOT}"
 
+# === VIVENTIUM START ===
+# Feature: Shared launcher Python ownership.
+# Purpose: Direct and full-stack starts must use the caller-selected interpreter so a host
+# `python3` upgrade cannot silently drop the prompt compiler's PyYAML dependency.
+PYTHON_BIN="${VIVENTIUM_PYTHON_BIN:-${PYTHON_BIN:-python3}}"
+# === VIVENTIUM END ===
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -205,7 +212,7 @@ sync_viventium_librechat_config() {
         local public_root="${VIVENTIUM_PUBLIC_ROOT:-$(cd "$PROJECT_DIR/../.." && pwd)}"
         local prompt_registry_script="$public_root/scripts/viventium/prompt_registry.py"
         if [[ -f "$prompt_registry_script" ]]; then
-            python3 - "$source_config" "$target_config" "$prompt_registry_script" <<'PY'
+            "$PYTHON_BIN" - "$source_config" "$target_config" "$prompt_registry_script" <<'PY'
 import importlib.util
 import sys
 from pathlib import Path
@@ -258,7 +265,7 @@ ensure_viventium_prompt_bundle() {
     fi
 
     mkdir -p "$(dirname "$target")"
-    python3 "$prompt_registry_script" --json-out "$target"
+    "$PYTHON_BIN" "$prompt_registry_script" --json-out "$target"
     export VIVENTIUM_PROMPT_BUNDLE_PATH="$target"
     echo -e "${GREEN}Prompt registry bundle generated at $target${NC}"
 }

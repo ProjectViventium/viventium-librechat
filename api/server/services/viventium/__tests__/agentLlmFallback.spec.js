@@ -17,6 +17,7 @@ const {
   shouldRetryWithFallback,
   hasVisibleAssistantText,
   shouldRetryBackgroundCortexWithFallback,
+  initializePrimaryAgentWithFallback,
 } = require('../agentLlmFallback');
 
 describe('agentLlmFallback', () => {
@@ -184,6 +185,80 @@ describe('agentLlmFallback', () => {
     ).toBe(true);
   });
 
+  test('recovers a structured primary initialization auth failure through the configured fallback', async () => {
+    const primaryAgent = { id: 'main', provider: 'openAI', model: 'gpt-primary' };
+    const fallbackAgent = { id: 'main', provider: 'xai', model: 'grok-fallback' };
+    const primaryError = new Error('connected account unavailable');
+    primaryError.code = 'MODEL_AUTHENTICATION';
+    primaryError.viventiumConnectedAccountReconnectRequired = true;
+    const initializePrimary = jest.fn(async () => {
+      throw primaryError;
+    });
+    const initializeFallback = jest.fn(async () => ({
+      id: 'main',
+      provider: 'xai',
+      model: 'grok-fallback',
+    }));
+
+    await expect(
+      initializePrimaryAgentWithFallback({
+        primaryAgent,
+        fallbackAgent,
+        fallbackAssignment: { provider: 'xai', model: 'grok-fallback' },
+        initializePrimary,
+        initializeFallback,
+      }),
+    ).resolves.toMatchObject({
+      effectiveAgent: fallbackAgent,
+      fallbackUsed: true,
+      primaryError,
+      config: { provider: 'xai', model: 'grok-fallback' },
+    });
+    expect(initializePrimary).toHaveBeenCalledTimes(1);
+    expect(initializeFallback).toHaveBeenCalledTimes(1);
+  });
+
+  test('does not hide a non-provider primary initialization failure behind model fallback', async () => {
+    const primaryError = new Error('tool registry invariant failed');
+    primaryError.code = 'TOOL_REGISTRY_FAILURE';
+    const initializeFallback = jest.fn();
+
+    await expect(
+      initializePrimaryAgentWithFallback({
+        primaryAgent: { id: 'main', provider: 'openAI', model: 'gpt-primary' },
+        fallbackAgent: { id: 'main', provider: 'xai', model: 'grok-fallback' },
+        fallbackAssignment: { provider: 'xai', model: 'grok-fallback' },
+        initializePrimary: async () => {
+          throw primaryError;
+        },
+        initializeFallback,
+      }),
+    ).rejects.toBe(primaryError);
+    expect(initializeFallback).not.toHaveBeenCalled();
+  });
+
+  test('does not start initialization fallback after cancellation', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const primaryError = new Error('connected account unavailable');
+    primaryError.code = 'MODEL_AUTHENTICATION';
+    const initializeFallback = jest.fn();
+
+    await expect(
+      initializePrimaryAgentWithFallback({
+        primaryAgent: { id: 'main', provider: 'openAI', model: 'gpt-primary' },
+        fallbackAgent: { id: 'main', provider: 'xai', model: 'grok-fallback' },
+        fallbackAssignment: { provider: 'xai', model: 'grok-fallback' },
+        initializePrimary: async () => {
+          throw primaryError;
+        },
+        initializeFallback,
+        signal: controller.signal,
+      }),
+    ).rejects.toBe(primaryError);
+    expect(initializeFallback).not.toHaveBeenCalled();
+  });
+
   test('retries provider rate-limit errors only when no assistant text was produced', () => {
     expect(
       shouldRetryWithFallback([
@@ -238,6 +313,17 @@ describe('agentLlmFallback', () => {
         },
       ]),
     ).toBe(false);
+  });
+
+  test('retries wrapped provider authentication errors that begin with an HTTP status', () => {
+    expect(
+      shouldRetryWithFallback([
+        {
+          type: ContentTypes.ERROR,
+          [ContentTypes.ERROR]: '401 Incorrect API key provided.',
+        },
+      ]),
+    ).toBe(true);
   });
 
   test('treats OpenAI-style text.value parts as visible assistant text', () => {

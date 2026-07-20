@@ -8,6 +8,12 @@ import type {
 } from '@tanstack/react-query';
 import type { TUserMemory, MemoriesResponse } from 'librechat-data-provider';
 
+const isMemoryConflict = (error: unknown): boolean =>
+  typeof error === 'object' &&
+  error !== null &&
+  'response' in error &&
+  (error as { response?: { status?: number } }).response?.status === 409;
+
 export const useMemoriesQuery = (
   config?: UseQueryOptions<MemoriesResponse>,
 ): QueryObserverResult<MemoriesResponse> => {
@@ -21,29 +27,55 @@ export const useMemoriesQuery = (
 
 export const useDeleteMemoryMutation = () => {
   const queryClient = useQueryClient();
-  return useMutation((key: string) => dataService.deleteMemory(key), {
-    onSuccess: () => {
-      queryClient.invalidateQueries([QueryKeys.memories]);
+  /* === VIVENTIUM START === Revision-safe saved-memory mutations. === */
+  return useMutation(
+    ({ key, expectedRevision }: { key: string; expectedRevision: number }) =>
+      dataService.deleteMemory(key, expectedRevision),
+    {
+      onSuccess: () => {
+        queryClient.invalidateQueries([QueryKeys.memories]);
+      },
+      onError: (error) => {
+        if (isMemoryConflict(error)) {
+          queryClient.invalidateQueries([QueryKeys.memories]);
+        }
+      },
     },
-  });
+  );
+  /* === VIVENTIUM END === */
 };
 
-export type UpdateMemoryParams = { key: string; value: string; originalKey?: string };
+/* === VIVENTIUM START === Revision-safe saved-memory mutations. === */
+export type UpdateMemoryParams = {
+  key: string;
+  value: string;
+  expectedRevision: number;
+  originalKey?: string;
+};
+/* === VIVENTIUM END === */
 export const useUpdateMemoryMutation = (
   options?: UseMutationOptions<TUserMemory, Error, UpdateMemoryParams>,
 ) => {
   const queryClient = useQueryClient();
+  /* === VIVENTIUM START === Revision-safe saved-memory mutations. === */
   return useMutation(
-    ({ key, value, originalKey }: UpdateMemoryParams) =>
-      dataService.updateMemory(key, value, originalKey),
+    ({ key, value, expectedRevision, originalKey }: UpdateMemoryParams) =>
+      dataService.updateMemory(key, value, expectedRevision, originalKey),
     {
       ...options,
       onSuccess: (...params) => {
         queryClient.invalidateQueries([QueryKeys.memories]);
         options?.onSuccess?.(...params);
       },
+      onError: (...params) => {
+        if (isMemoryConflict(params[0])) {
+          queryClient.invalidateQueries([QueryKeys.memories]);
+        }
+        options?.onError?.(...params);
+      },
     },
   );
+  /* === VIVENTIUM END === */
 };
 
 export type UpdateMemoryPreferencesParams = {

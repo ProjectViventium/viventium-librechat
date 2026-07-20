@@ -2734,7 +2734,11 @@ describe('BackgroundCortexService.executeCortex', () => {
    * Ensure tool call messages are preserved when content is empty.
    */
   test('preserves tool call sequences with empty assistant content', async () => {
-    const { AIMessage, HumanMessage, ToolMessage } = require('@langchain/core/messages');
+    const {
+      AIMessage,
+      HumanMessage,
+      ToolMessage,
+    } = require('@librechat/agents/langchain/messages');
     const processStream = jest.fn(async () => 'run-output');
     const initializedAgent = {
       id: 'agent_tool',
@@ -2794,7 +2798,7 @@ describe('BackgroundCortexService.executeCortex', () => {
    * before processStream for Anthropic.
    * === VIVENTIUM END === */
   test('sanitizes malformed empty text content for strict providers before processStream', async () => {
-    const { HumanMessage } = require('@langchain/core/messages');
+    const { HumanMessage } = require('@librechat/agents/langchain/messages');
     const processStream = jest.fn(async () => 'run-output');
     const initializedAgent = {
       id: 'agent_tool',
@@ -3130,7 +3134,7 @@ describe('BackgroundCortexService.executeCortex', () => {
    * Productivity specialist cortices must ignore stale long-term context and prefer direct Google file IDs.
    */
   test('isolates productivity specialist cortices to the latest request and skips memory injection', async () => {
-    const { HumanMessage, AIMessage } = require('@langchain/core/messages');
+    const { HumanMessage, AIMessage } = require('@librechat/agents/langchain/messages');
     const processStream = jest.fn(async () => 'run-output');
     const initializedAgent = {
       id: 'agent_google',

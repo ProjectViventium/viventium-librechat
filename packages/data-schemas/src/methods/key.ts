@@ -78,10 +78,25 @@ export function createKeyMethods(mongoose: typeof import('mongoose')) {
     const Key = mongoose.models.Key;
     const keyValue = (await Key.findOne({ userId, name }).lean()) as {
       expiresAt?: Date;
+      value?: string;
     } | null;
     if (!keyValue) {
       return { expiresAt: null };
     }
+
+    /* === VIVENTIUM START ===
+     * Feature: Truthful connected-account status
+     * Purpose: Row presence is not connectivity when the active runtime cannot decrypt the value.
+     */
+    try {
+      await decrypt(keyValue.value ?? '');
+    } catch {
+      logger.warn('[getUserKeyExpiry] Stored user key is unreadable; reporting disconnected', {
+        name,
+      });
+      return { expiresAt: null };
+    }
+    /* === VIVENTIUM END === */
     return { expiresAt: keyValue.expiresAt || 'never' };
   }
 

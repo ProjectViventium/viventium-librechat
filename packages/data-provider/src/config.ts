@@ -791,10 +791,17 @@ export type TStartupConfig = {
   showBirthdayIcon: boolean;
   helpAndFaqURL: string;
   /* === VIVENTIUM START ===
-   * Feature: Connected Accounts local gating.
-   * Purpose: Expose startup toggle for OAuth-only connected account UI/actions.
+   * Feature: Connected Accounts local credential setup.
+   * Purpose: Expose the novice-facing OpenAI/Anthropic credential setup surface.
    * === VIVENTIUM END === */
   viventiumConnectedAccountsEnabled?: boolean;
+  /** Explicit opt-in for legacy direct provider subscription OAuth. Defaults false. */
+  viventiumExperimentalDirectSubscriptionAuth?: boolean;
+  /* === VIVENTIUM START ===
+   * Feature: Express browser-first onboarding.
+   * Purpose: Expose only the bounded install experience needed for the first-user handoff.
+   * === VIVENTIUM END === */
+  viventiumInstallExperience?: 'express' | 'custom' | 'legacy';
   /* === VIVENTIUM START ===
    * Feature: Prompt Workbench local launcher.
    * Purpose: Expose the server-side workbench link gate to the web client.
@@ -2050,7 +2057,7 @@ export type TSpecialVarLabel = `com_ui_special_var_${keyof typeof specialVariabl
  * Does not infer or default any endpoint type when absent.
  */
 export function getEndpointField<
-  K extends TConfig[keyof TConfig] extends never ? never : keyof TConfig,
+  K extends (TConfig[keyof TConfig] extends never ? never : keyof TConfig),
 >(
   endpointsConfig: TEndpointsConfig | undefined | null,
   endpoint: EModelEndpoint | string | null | undefined,

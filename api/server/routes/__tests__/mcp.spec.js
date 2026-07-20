@@ -1144,7 +1144,16 @@ describe('MCP Routes', () => {
       require('~/config').getMCPManager.mockReturnValue(mockMcpManager);
       require('~/config').getFlowStateManager.mockReturnValue({});
       require('~/cache').getLogStores.mockReturnValue({});
-      require('~/server/services/Tools/mcp').reinitMCPServer.mockResolvedValue(null);
+      require('~/server/services/Tools/mcp').reinitMCPServer.mockResolvedValue({
+        availableTools: null,
+        success: false,
+        failureClass: 'reinitialization_error',
+        message: "Failed to reinitialize MCP server 'error-server'",
+        oauthRequired: false,
+        serverName: 'error-server',
+        oauthUrl: null,
+        tools: null,
+      });
 
       const response = await request(app).post('/api/mcp/error-server/reinitialize');
 

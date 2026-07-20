@@ -130,6 +130,37 @@ describe('agentSchemaToolBindingPatch', () => {
     expect(agentContext.tools).toBe(originalTools);
   });
 
+  it('does not feed scoped schema tools back into the event-driven binding merge', async () => {
+    const originalTools = [];
+    const schemaTools = [{ name: 'schedule_create_mcp_scheduling-cortex' }];
+    const agentContext = {
+      tools: originalTools,
+      toolDefinitions: [{ name: 'schedule_create_mcp_scheduling-cortex' }],
+      getToolsForBinding() {
+        return [...schemaTools, ...(this.tools ?? [])];
+      },
+    };
+    const observed = {};
+    const fakeProto = {
+      createCallModel(agentId = 'default') {
+        const graph = this;
+        return async function fakeCallModel() {
+          observed.bindingTools = graph.agentContexts.get(agentId).getToolsForBinding();
+          return { messages: [] };
+        };
+      },
+    };
+
+    expect(installUnifiedSchemaToolBindingPatch(fakeProto)).toBe(true);
+    const fakeGraph = { agentContexts: new Map([['default', agentContext]]) };
+    const callModel = fakeProto.createCallModel.call(fakeGraph, 'default');
+
+    await callModel({ messages: [] }, {});
+
+    expect(observed.bindingTools).toEqual(schemaTools);
+    expect(agentContext.tools).toBe(originalTools);
+  });
+
   it('keeps dynamic unified tools scoped across overlapping calls', async () => {
     const originalTools = [];
     const dynamicTools = [{ name: 'file_search' }, { name: 'newly_discovered' }];

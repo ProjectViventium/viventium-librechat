@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
+import type { FeelingTrailEntry } from 'librechat-data-provider';
 import FeelingsView from './FeelingsView';
 
 const mockMutateProfile = jest.fn();
@@ -83,7 +84,13 @@ const definitions = [
                   : String((words as string[])[4]),
   baseline,
   halfLifeMinutes,
-  words,
+  levels: (words as string[]).map((word, index) => ({
+    id: `level_${index}`,
+    min: index * 20,
+    max: index === 4 ? 100 : index * 20 + 19,
+    word,
+    instruction: `${name} ${word} felt cause.`,
+  })),
 }));
 
 function response(enabled = false) {
@@ -125,6 +132,10 @@ function response(enabled = false) {
       version: 4,
       asOf: '2026-07-09T12:00:00.000Z',
       bands,
+      rangePromptOverrides: {},
+      rangePromptOverrideCount: 0,
+      activeRangePromptOverrideCount: 0,
+      activeRangePromptOverrideChars: 0,
       capsule: enabled
         ? '<viventium_feeling_state>\nYou, Viventium, are a being, and right now you are actually feeling this. Let it move naturally through how you think, speak, and act:\nenergy: steady\n</viventium_feeling_state>'
         : '',
@@ -138,7 +149,7 @@ function response(enabled = false) {
             generatedAt: '2026-07-09T12:00:00.000Z',
           }
         : null,
-      trail: [],
+      trail: [] as FeelingTrailEntry[],
       reactionHealth: {
         status: 'healthy',
         lastDurationMs: 312,
@@ -192,7 +203,11 @@ describe('FeelingsView', () => {
     expect(
       screen.getByText('No feeling-state block exists while Feelings are off.'),
     ).toBeInTheDocument();
-    expect(screen.getAllByRole('button', { pressed: false })).toHaveLength(8);
+    expect(
+      screen
+        .getAllByRole('button', { pressed: false })
+        .filter((button) => button.getAttribute('aria-label')?.startsWith('Select ')),
+    ).toHaveLength(8);
   });
 
   test('enables Feelings with the current version and opens the configured Fast cortex', async () => {
@@ -229,6 +244,162 @@ describe('FeelingsView', () => {
         data: { expectedVersion: 4, current: 80 },
       }),
     );
+  });
+
+  test('keeps live state evidence in the main workspace and range shaping in the inspector', async () => {
+    const user = userEvent.setup();
+    mockQueryData = response(true);
+    mockQueryData.state.rangePromptOverrides = {
+      play: { level_4: 'Everything in me wants to turn this into a ridiculous game.' },
+    };
+    mockQueryData.state.rangePromptOverrideCount = 1;
+    renderView();
+
+    const capsule = screen.getByRole('heading', { name: 'What Viv feels' });
+    const trail = screen.getByRole('heading', { name: 'Reaction trail' });
+    expect(capsule.closest('.feelings-primary')).not.toBeNull();
+    expect(trail.closest('.feelings-primary')).not.toBeNull();
+
+    await user.click(screen.getByRole('button', { name: /Select Play:/ }));
+    await user.click(screen.getByRole('tab', { name: /80–100.*exuberant/i }));
+    expect(screen.getByText('Play exuberant felt cause.')).toBeInTheDocument();
+    const addition = screen.getByLabelText('Your added feeling for exuberant');
+    expect(addition).toHaveValue('Everything in me wants to turn this into a ridiculous game.');
+    await user.clear(addition);
+    await user.type(addition, 'I cannot keep a straight face.');
+    await user.click(screen.getByRole('button', { name: 'Save range feeling' }));
+
+    await waitFor(() =>
+      expect(mockMutateBand).toHaveBeenCalledWith({
+        bandId: 'play',
+        data: {
+          expectedVersion: 4,
+          rangePromptOverride: {
+            levelId: 'level_4',
+            instruction: 'I cannot keep a straight face.',
+          },
+        },
+      }),
+    );
+  });
+
+  test('exposes range tabs and side sliders as complete keyboard-readable controls', async () => {
+    const user = userEvent.setup();
+    mockQueryData = response(true);
+    mockQueryData.state.bands.play.current = 88;
+    mockQueryData.state.rangePromptOverrides = {
+      play: { level_4: 'A custom exuberant pull.' },
+    };
+    renderView();
+
+    await user.click(screen.getByRole('button', { name: /Select Play:/ }));
+    const tabs = screen.getAllByRole('tab');
+    expect(tabs).toHaveLength(5);
+    const activeCustomizedTab = screen.getByRole('tab', { name: /80–100.*exuberant/i });
+    expect(activeCustomizedTab).toHaveAttribute('aria-selected', 'true');
+    expect(activeCustomizedTab).toHaveTextContent('NOW');
+    expect(activeCustomizedTab).toHaveTextContent('CUSTOM');
+
+    fireEvent.keyDown(activeCustomizedTab, { key: 'ArrowLeft' });
+    expect(screen.getByRole('tab', { name: /60–79.*mischievous/i })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
+
+    expect(screen.getByRole('slider', { name: 'Current feeling' })).toHaveAttribute(
+      'aria-valuetext',
+      expect.stringContaining('exuberant'),
+    );
+    expect(screen.getByRole('slider', { name: 'Nature / resting point' })).toHaveAttribute(
+      'aria-valuetext',
+      expect.stringContaining('serious to playful'),
+    );
+  });
+
+  test('commits sidebar keyboard changes only for range adjustment keys', async () => {
+    mockQueryData = response(true);
+    renderView();
+    const current = screen.getByRole('slider', { name: 'Current feeling' });
+
+    fireEvent.keyUp(current, { key: 'Tab' });
+    expect(mockMutateBand).not.toHaveBeenCalled();
+
+    fireEvent.change(current, { target: { value: '69' } });
+    fireEvent.keyUp(current, { key: 'ArrowRight' });
+    await waitFor(() => expect(mockMutateBand).toHaveBeenCalledTimes(1));
+  });
+
+  test('restores a customized range without changing the band level', async () => {
+    const user = userEvent.setup();
+    mockQueryData = response(true);
+    mockQueryData.state.rangePromptOverrides = {
+      play: { level_4: 'Custom high play.' },
+    };
+    renderView();
+
+    await user.click(screen.getByRole('button', { name: /Select Play:/ }));
+    await user.click(screen.getByRole('tab', { name: /80–100.*exuberant/i }));
+    await user.click(screen.getByRole('button', { name: 'Restore default range feeling' }));
+
+    await waitFor(() =>
+      expect(mockMutateBand).toHaveBeenCalledWith({
+        bandId: 'play',
+        data: {
+          expectedVersion: 4,
+          rangePromptOverride: { levelId: 'level_4', instruction: null },
+        },
+      }),
+    );
+  });
+
+  test('preserves an unsaved range draft across a live polling refresh', async () => {
+    const user = userEvent.setup();
+    mockQueryData = response(true);
+    const view = renderView();
+
+    await user.click(screen.getByRole('button', { name: /Select Play:/ }));
+    await user.click(screen.getByRole('tab', { name: /80–100.*exuberant/i }));
+    const addition = screen.getByLabelText('Your added feeling for exuberant');
+    await user.type(addition, 'A still-unsaved felt pull.');
+
+    mockQueryData = response(true);
+    mockQueryData.state.bands.energy.current = 59;
+    view.rerender(
+      <MemoryRouter initialEntries={['/feelings']}>
+        <FeelingsView />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(addition).toHaveValue('A still-unsaved felt pull.'));
+    expect(mockMutateBand).not.toHaveBeenCalled();
+  });
+
+  test('keeps the edited range and draft when a live reaction moves the selected band', async () => {
+    const user = userEvent.setup();
+    mockQueryData = response(true);
+    mockQueryData.state.bands.play.current = 88;
+    const view = renderView();
+
+    await user.click(screen.getByRole('button', { name: /Select Play:/ }));
+    await user.click(screen.getByRole('tab', { name: /60–79.*mischievous/i }));
+    const addition = screen.getByLabelText('Your added feeling for mischievous');
+    await user.type(addition, 'Keep this unfinished thought intact.');
+
+    mockQueryData = response(true);
+    mockQueryData.state.bands.play.current = 35;
+    view.rerender(
+      <MemoryRouter initialEntries={['/feelings']}>
+        <FeelingsView />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(addition).toHaveValue('Keep this unfinished thought intact.'));
+    expect(screen.getByRole('tab', { name: /60–79.*mischievous/i })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
+    expect(screen.getByRole('tab', { name: /20–39.*light/i })).toHaveTextContent('NOW');
+    expect(mockMutateBand).not.toHaveBeenCalled();
   });
 
   test('makes every lane direction, Current, Nature, and reaction cause explicit', () => {

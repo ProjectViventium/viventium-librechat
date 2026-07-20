@@ -22,9 +22,12 @@ const MAX_SERIALIZED_EVENT_CHARS = 90;
 const SAFE_FEELINGS_TELEMETRY_FIELDS = new Set([
   'absoluteDeltaCounts',
   'activationMode',
+  'activeRangePromptOverrideChars',
+  'activeRangePromptOverrideCount',
   'agentIdHash',
   'attempt',
   'cacheHit',
+  'capsuleOccurrenceCount',
   'causeCounts',
   'changedBandCount',
   'commitAttempt',
@@ -38,6 +41,7 @@ const SAFE_FEELINGS_TELEMETRY_FIELDS = new Set([
   'fallbackProvider',
   'fallbackUsed',
   'fast',
+  'bandId',
   'hasInnerState',
   'injected',
   'injectedAgentCount',
@@ -49,10 +53,16 @@ const SAFE_FEELINGS_TELEMETRY_FIELDS = new Set([
   'ok',
   'operationCount',
   'participatingAgentCount',
+  'placement',
+  'presentInFinalRun',
   'primaryErrorClass',
   'provider',
   'reason',
   'reasoningEffort',
+  'rangeLevelId',
+  'rangePromptOverrideChanged',
+  'rangePromptOverrideCount',
+  'rangePromptOverridePresent',
   'retrying',
   'route',
   'scope',
@@ -60,8 +70,12 @@ const SAFE_FEELINGS_TELEMETRY_FIELDS = new Set([
   'shouldActivate',
   'skippedAgentCount',
   'snapshotHash',
-  'stimulusKey',
   'strengthCounts',
+  // Legacy input is still accepted by the public-safe logger, but runtime emitters use
+  // `absoluteDeltaCounts` as the canonical field.
+  'deltaMagnitudeCounts',
+  'stimulusKey',
+  'trailingInstructionChars',
   'usedModel',
   'usedProvider',
   'usedServiceTier',
@@ -69,6 +83,45 @@ const SAFE_FEELINGS_TELEMETRY_FIELDS = new Set([
   'causes',
 ]);
 let eventSequence = 0;
+
+function summarizeFeelingCapsulePlacement({ instructions, capsule }) {
+  const finalInstructions = typeof instructions === 'string' ? instructions : '';
+  const feelingCapsule = typeof capsule === 'string' ? capsule : '';
+  if (!feelingCapsule) {
+    return {
+      presentInFinalRun: false,
+      capsuleOccurrenceCount: 0,
+      placement: 'absent',
+      trailingInstructionChars: 0,
+    };
+  }
+
+  let capsuleOccurrenceCount = 0;
+  let searchFrom = 0;
+  let lastEnd = -1;
+  while (searchFrom <= finalInstructions.length) {
+    const index = finalInstructions.indexOf(feelingCapsule, searchFrom);
+    if (index < 0) break;
+    capsuleOccurrenceCount += 1;
+    lastEnd = index + feelingCapsule.length;
+    searchFrom = lastEnd;
+  }
+
+  const presentInFinalRun = capsuleOccurrenceCount > 0;
+  const trailingInstructionChars = presentInFinalRun
+    ? finalInstructions.slice(lastEnd).trim().length
+    : 0;
+  return {
+    presentInFinalRun,
+    capsuleOccurrenceCount,
+    placement: presentInFinalRun
+      ? trailingInstructionChars > 0
+        ? 'followed_by_runtime_contracts'
+        : 'final_instruction_layer'
+      : 'absent',
+    trailingInstructionChars,
+  };
+}
 
 function requestHash(requestId) {
   return crypto
@@ -128,4 +181,9 @@ function logFeelingsEvent(logger, req, event, fields = {}, level = 'info') {
   }
 }
 
-module.exports = { feelingsRequestId, logFeelingsEvent, splitEventPayload };
+module.exports = {
+  feelingsRequestId,
+  logFeelingsEvent,
+  splitEventPayload,
+  summarizeFeelingCapsulePlacement,
+};

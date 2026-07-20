@@ -7,7 +7,7 @@
 'use strict';
 
 const crypto = require('crypto');
-const { HumanMessage } = require('@langchain/core/messages');
+const { HumanMessage } = require('@librechat/agents/langchain/messages');
 const { logger } = require('@librechat/data-schemas');
 const {
   applyFeelingOperations,
@@ -52,6 +52,16 @@ function reactionParseIssues(error) {
     });
   }
   return [error?.cause?.name === 'SyntaxError' ? 'invalid_json:root' : 'invalid_shape:root'];
+}
+
+function countReactionStrengths(changes) {
+  return (Array.isArray(changes) ? changes : []).reduce((counts, change) => {
+    const strength = ['slight', 'clear', 'strong'].includes(change?.strength)
+      ? change.strength
+      : 'unknown';
+    counts[strength] = (counts[strength] || 0) + 1;
+    return counts;
+  }, {});
 }
 
 const DEFAULT_EXECUTION_PROMPT = `Appraise how the latest external user stimulus moves Viventium's present feeling state.
@@ -419,6 +429,7 @@ async function runEmotionalReaction(
             counts[change.cause] = (counts[change.cause] || 0) + 1;
             return counts;
           }, {}),
+          strengthCounts: countReactionStrengths(parsed.changes),
           attempt,
         });
         break;

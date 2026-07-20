@@ -1,5 +1,6 @@
 import { Types } from 'mongoose';
 import { Run, Providers } from '@librechat/agents';
+import { Tools } from 'librechat-data-provider';
 import type { IUser } from '@librechat/data-schemas';
 import type { Response } from 'express';
 import {
@@ -336,7 +337,7 @@ describe('Memory Agent Header Resolution', () => {
       model: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
     };
 
-    const { HumanMessage } = await import('@langchain/core/messages');
+    const { HumanMessage } = await import('@librechat/agents/langchain/messages');
     const testMessage = new HumanMessage('test chat content');
 
     await processMemory({
@@ -878,6 +879,38 @@ describe('Memory snapshot loading', () => {
     expect(context.omittedKeys).toContain('world:truncated');
   });
 
+  it('keeps the governed preferences key intact so middle facts remain available without RAG', async () => {
+    const userId = new Types.ObjectId();
+    const middleFact = 'Synthetic tea preference = amber juniper.';
+    const value = `${'Older preference context. '.repeat(40)}${middleFact}${'Newer preference context. '.repeat(40)}`;
+    const methods = {
+      setMemory: jest.fn(),
+      deleteMemory: jest.fn(),
+      getFormattedMemories: jest.fn(),
+      getAllUserMemories: jest.fn().mockResolvedValue([
+        {
+          _id: new Types.ObjectId(),
+          userId,
+          key: 'preferences',
+          value,
+          tokenCount: 471,
+          updated_at: new Date('2026-07-14T00:00:00Z'),
+        },
+      ]),
+    };
+
+    const context = await loadMemoryReadContext({
+      userId,
+      memoryMethods: methods,
+      config: { validKeys: ['preferences'] },
+    });
+
+    expect(context.text).toContain(middleFact);
+    expect(context.text).not.toContain('\n...\n');
+    expect(context.totalTokens).toBe(471);
+    expect(context.omittedKeys).not.toContain('preferences:truncated');
+  });
+
   it('caches the read context by user and read profile until explicitly cleared', async () => {
     const methods = {
       setMemory: jest.fn(),
@@ -949,6 +982,7 @@ describe('Memory snapshot loading', () => {
       setMemory: jest.fn().mockResolvedValue({ ok: true }),
       deleteMemory: jest.fn(),
       getAllUserMemories: jest.fn().mockResolvedValue([]),
+      getAllUserMemoryStates: jest.fn().mockResolvedValue([]),
       getFormattedMemories: jest.fn().mockResolvedValue({
         withKeys: 'with keys',
         withoutKeys: 'without keys',
@@ -974,6 +1008,54 @@ describe('Memory snapshot loading', () => {
     expect(methods.getFormattedMemories).toHaveBeenCalledWith({
       userId: 'user-123',
       memories: [],
+    });
+  });
+
+  it('derives prompt content and CAS revisions from the same state query', async () => {
+    const methods = {
+      setMemory: jest.fn().mockResolvedValue({ ok: true }),
+      deleteMemory: jest.fn(),
+      getAllUserMemories: jest.fn().mockResolvedValue([
+        {
+          key: 'context',
+          value: 'Older context that must not be paired with a newer revision.',
+          tokenCount: 12,
+          __v: 3,
+        },
+      ]),
+      getAllUserMemoryStates: jest.fn().mockResolvedValue([
+        {
+          key: 'context',
+          value: 'Current context from the revision-bearing state row.',
+          tokenCount: 11,
+          __v: 4,
+        },
+      ]),
+      getFormattedMemories: jest.fn(async ({ memories }) => ({
+        withKeys: `context: ${memories[0]?.value ?? ''}`,
+        withoutKeys: memories[0]?.value ?? '',
+        totalTokens: memories[0]?.tokenCount ?? 0,
+        memoryTokenMap: { context: memories[0]?.tokenCount ?? 0 },
+      })),
+    };
+
+    const snapshot = await loadMemorySnapshot({
+      userId: 'user-123',
+      memoryMethods: methods,
+      config: { validKeys: ['context'] },
+    });
+
+    expect(snapshot.withKeys).toContain('Current context from the revision-bearing state row.');
+    expect(snapshot.withKeys).not.toContain('Older context');
+    expect(snapshot.memoryRevisionMap).toEqual({ context: 4 });
+    expect(snapshot.memoryValueHashMap.context).toEqual(expect.any(String));
+    expect(methods.getFormattedMemories).toHaveBeenCalledWith({
+      userId: 'user-123',
+      memories: [
+        expect.objectContaining({
+          value: 'Current context from the revision-bearing state row.',
+        }),
+      ],
     });
   });
 
@@ -1011,5 +1093,340 @@ describe('Memory snapshot loading', () => {
 
     expect(withoutKeys).toBe('without keys');
     expect(methods.getFormattedMemories).not.toHaveBeenCalled();
+  });
+});
+
+describe('Memory policy retry contract', () => {
+  const Tokenizer = jest.requireMock('~/utils').Tokenizer as { getTokenCount: jest.Mock };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    Tokenizer.getTokenCount.mockImplementation((text: string) => text.length);
+  });
+
+  afterEach(() => {
+    Tokenizer.getTokenCount.mockImplementation(() => 10);
+  });
+
+  function installMemoryRunMock(
+    operationsByAttempt: Array<
+      Array<{
+        action: 'set' | 'delete' | 'noop';
+        key?: string;
+        value?: string;
+        reason?: string;
+      }>
+    >,
+  ) {
+    let attempt = 0;
+    (Run.create as jest.Mock).mockImplementation((runConfig) => {
+      const currentAttempt = attempt++;
+      return {
+        processStream: jest.fn(async () => {
+          const decisionTool = runConfig.graphConfig.tools.find(
+            (candidate: { name: string }) => candidate.name === 'apply_memory_changes',
+          );
+          const result = await decisionTool.func({
+            operations: operationsByAttempt[currentAttempt] ?? operationsByAttempt.at(-1),
+          });
+          const handler = Object.values(runConfig.customHandlers)[0] as {
+            handle: (event: string, data: unknown, metadata: unknown) => void;
+          };
+          handler.handle(
+            'tool_end',
+            {
+              output: {
+                artifact: result[1],
+                tool_call_id: `memory-call-${currentAttempt}`,
+              },
+            },
+            { run_id: 'msg-123', thread_id: 'conv-123' },
+          );
+          return 'processed';
+        }),
+      };
+    });
+  }
+
+  async function createWriter({
+    keyLimits,
+    memoryTokenMap,
+    totalTokens,
+    tokenLimit = 100,
+    setMemory,
+  }: {
+    keyLimits: Record<string, number>;
+    memoryTokenMap: Record<string, number>;
+    totalTokens: number;
+    tokenLimit?: number;
+    setMemory: jest.Mock;
+  }) {
+    const memoryMethods = {
+      setMemory,
+      deleteMemory: jest.fn().mockResolvedValue({ ok: true }),
+      getFormattedMemories: jest.fn(),
+      getAllUserMemories: jest.fn(),
+      getAllUserMemoryStates: jest.fn(),
+    };
+    const [, writer] = await createMemoryProcessor({
+      res: {
+        write: jest.fn(),
+        end: jest.fn(),
+        headersSent: false,
+      } as unknown as Response,
+      userId: 'user-123',
+      messageId: 'msg-123',
+      conversationId: 'conv-123',
+      memoryMethods,
+      config: {
+        validKeys: Object.keys(keyLimits),
+        keyLimits,
+        tokenLimit,
+        instructions: 'Preserve existing memory and apply explicit memory requests.',
+        llmConfig: { provider: Providers.OPENAI, model: 'gpt-5.4' },
+      },
+      snapshot: {
+        withKeys: 'Existing synthetic memory',
+        withoutKeys: 'Existing synthetic memory',
+        totalTokens,
+        memoryTokenMap,
+        memoryRevisionMap: Object.fromEntries(Object.keys(keyLimits).map((key) => [key, 0])),
+        memoryValueHashMap: {},
+      },
+      user: createTestUser(),
+    });
+    return writer;
+  }
+
+  it('retries one rejected budget proposal and returns only the successful attachment', async () => {
+    installMemoryRunMock([
+      [{ action: 'set', key: 'preferences', value: '12345678901' }],
+      [{ action: 'set', key: 'preferences', value: '123456789' }],
+    ]);
+    const setMemory = jest.fn().mockResolvedValue({ ok: true, revision: 1 });
+    const writer = await createWriter({
+      keyLimits: { preferences: 10 },
+      memoryTokenMap: { preferences: 9 },
+      totalTokens: 9,
+      setMemory,
+    });
+
+    const { HumanMessage } = await import('@langchain/core/messages');
+    const attachments = await writer([new HumanMessage('Remember the synthetic preference.')]);
+
+    expect(Run.create).toHaveBeenCalledTimes(2);
+    expect(setMemory).toHaveBeenCalledTimes(1);
+    expect(setMemory).toHaveBeenCalledWith(
+      expect.objectContaining({ key: 'preferences', value: '123456789', expectedRevision: 0 }),
+    );
+    expect(attachments).toHaveLength(1);
+    expect(attachments?.[0]?.[Tools.memory]).toEqual(
+      expect.objectContaining({ type: 'update', key: 'preferences', revision: 1 }),
+    );
+    expect((Run.create as jest.Mock).mock.calls[1][0].graphConfig.additional_instructions).toContain(
+      'preferences',
+    );
+  });
+
+  it('stops after one correction attempt and returns the final structured budget error', async () => {
+    installMemoryRunMock([
+      [{ action: 'set', key: 'preferences', value: '12345678901' }],
+      [{ action: 'set', key: 'preferences', value: 'abcdefghijk' }],
+    ]);
+    const setMemory = jest.fn().mockResolvedValue({ ok: true, revision: 1 });
+    const writer = await createWriter({
+      keyLimits: { preferences: 10 },
+      memoryTokenMap: { preferences: 9 },
+      totalTokens: 9,
+      setMemory,
+    });
+
+    const { HumanMessage } = await import('@langchain/core/messages');
+    const attachments = await writer([new HumanMessage('Remember the synthetic preference.')]);
+    const error = JSON.parse(String(attachments?.[0]?.[Tools.memory]?.value));
+
+    expect(Run.create).toHaveBeenCalledTimes(2);
+    expect(setMemory).not.toHaveBeenCalled();
+    expect(attachments?.[0]?.[Tools.memory]?.type).toBe('error');
+    expect(error).toEqual(expect.objectContaining({ errorType: 'key_limit_exceeded' }));
+  });
+
+  it('preserves the original rejection when the correction returns noop', async () => {
+    installMemoryRunMock([
+      [{ action: 'set', key: 'preferences', value: '12345678901' }],
+      [{ action: 'noop', reason: 'No correction proposed.' }],
+    ]);
+    const setMemory = jest.fn().mockResolvedValue({ ok: true, revision: 1 });
+    const writer = await createWriter({
+      keyLimits: { preferences: 10 },
+      memoryTokenMap: { preferences: 9 },
+      totalTokens: 9,
+      setMemory,
+    });
+
+    const { HumanMessage } = await import('@langchain/core/messages');
+    const attachments = await writer([new HumanMessage('Remember the synthetic preference.')]);
+    const error = JSON.parse(String(attachments?.[0]?.[Tools.memory]?.value));
+
+    expect(Run.create).toHaveBeenCalledTimes(2);
+    expect(setMemory).not.toHaveBeenCalled();
+    expect(attachments?.[0]?.[Tools.memory]?.type).toBe('error');
+    expect(error).toEqual(expect.objectContaining({ errorType: 'key_limit_exceeded' }));
+  });
+
+  it('stops a rejected batch before any later operation can write', async () => {
+    installMemoryRunMock([
+      [
+        { action: 'set', key: 'preferences', value: '12345678901' },
+        { action: 'set', key: 'drafts', value: 'draft' },
+      ],
+      [{ action: 'set', key: 'preferences', value: '123456789' }],
+    ]);
+    const setMemory = jest.fn().mockResolvedValue({ ok: true, revision: 1 });
+    const writer = await createWriter({
+      keyLimits: { preferences: 10, drafts: 10 },
+      memoryTokenMap: { preferences: 9, drafts: 0 },
+      totalTokens: 9,
+      setMemory,
+    });
+
+    const { HumanMessage } = await import('@langchain/core/messages');
+    await writer([new HumanMessage('Remember the synthetic preference.')]);
+
+    expect(Run.create).toHaveBeenCalledTimes(2);
+    expect(setMemory).toHaveBeenCalledTimes(1);
+    expect(setMemory).toHaveBeenCalledWith(
+      expect.objectContaining({ key: 'preferences', value: '123456789' }),
+    );
+  });
+
+  it.each([
+    {
+      errorType: 'already_exceeded',
+      tokenLimit: 10,
+      keyLimits: { preferences: 100 },
+      memoryTokenMap: { preferences: 11 },
+      rejectedValue: '123456789012',
+    },
+    {
+      errorType: 'would_exceed',
+      tokenLimit: 10,
+      keyLimits: { preferences: 100 },
+      memoryTokenMap: { preferences: 9 },
+      rejectedValue: '12345678901',
+    },
+    {
+      errorType: 'key_limit_exceeded',
+      tokenLimit: 100,
+      keyLimits: { preferences: 10 },
+      memoryTokenMap: { preferences: 9 },
+      rejectedValue: '12345678901',
+    },
+    {
+      errorType: 'key_already_exceeded',
+      tokenLimit: 100,
+      keyLimits: { preferences: 10 },
+      memoryTokenMap: { preferences: 11 },
+      rejectedValue: 'abcdefghijk',
+    },
+  ])('allows one correction for $errorType', async ({
+    tokenLimit,
+    keyLimits,
+    memoryTokenMap,
+    rejectedValue,
+  }) => {
+    installMemoryRunMock([
+      [{ action: 'set', key: 'preferences', value: rejectedValue }],
+      [{ action: 'set', key: 'preferences', value: '123456789' }],
+    ]);
+    const setMemory = jest.fn().mockResolvedValue({ ok: true, revision: 1 });
+    const writer = await createWriter({
+      keyLimits,
+      memoryTokenMap,
+      totalTokens: memoryTokenMap.preferences,
+      tokenLimit,
+      setMemory,
+    });
+
+    const { HumanMessage } = await import('@langchain/core/messages');
+    const attachments = await writer([new HumanMessage('Remember the synthetic preference.')]);
+
+    expect(Run.create).toHaveBeenCalledTimes(2);
+    expect(setMemory).toHaveBeenCalledTimes(1);
+    expect(attachments?.[0]?.[Tools.memory]?.type).toBe('update');
+  });
+
+  it('does not retry a failed batch after an earlier operation already applied', async () => {
+    installMemoryRunMock([
+      [
+        { action: 'set', key: 'preferences', value: '123456789' },
+        { action: 'set', key: 'drafts', value: '12345678901' },
+      ],
+    ]);
+    const setMemory = jest.fn().mockResolvedValue({ ok: true, revision: 1 });
+    const writer = await createWriter({
+      keyLimits: { preferences: 10, drafts: 10 },
+      memoryTokenMap: { preferences: 0, drafts: 0 },
+      totalTokens: 0,
+      setMemory,
+    });
+
+    const { HumanMessage } = await import('@langchain/core/messages');
+    const attachments = await writer([new HumanMessage('Remember two synthetic facts.')]);
+    const error = JSON.parse(String(attachments?.[0]?.[Tools.memory]?.value));
+
+    expect(Run.create).toHaveBeenCalledTimes(1);
+    expect(setMemory).toHaveBeenCalledTimes(1);
+    expect(attachments?.[0]?.[Tools.memory]?.type).toBe('error');
+    expect(error).toEqual(expect.objectContaining({ partialApplied: true }));
+  });
+
+  it('does not replay an applied write after a retryable upstream failure', async () => {
+    let processStream: jest.Mock;
+    (Run.create as jest.Mock).mockImplementation((runConfig) => {
+      processStream = jest.fn(async () => {
+        const decisionTool = runConfig.graphConfig.tools.find(
+          (candidate: { name: string }) => candidate.name === 'apply_memory_changes',
+        );
+        const result = await decisionTool.func({
+          operations: [{ action: 'set', key: 'preferences', value: '123456789' }],
+        });
+        const handler = Object.values(runConfig.customHandlers)[0] as {
+          handle: (event: string, data: unknown, metadata: unknown) => void;
+        };
+        handler.handle(
+          'tool_end',
+          { output: { artifact: result[1], tool_call_id: 'memory-call-0' } },
+          { run_id: 'msg-123', thread_id: 'conv-123' },
+        );
+        const error = Object.assign(new Error('synthetic timeout'), { code: 'ETIMEDOUT' });
+        throw error;
+      });
+      return { processStream };
+    });
+    const setMemory = jest.fn().mockResolvedValue({ ok: true, revision: 1 });
+
+    await processMemory({
+      res: { write: jest.fn(), end: jest.fn(), headersSent: false } as unknown as Response,
+      userId: 'user-123',
+      messageId: 'msg-123',
+      conversationId: 'conv-123',
+      messages: [],
+      memory: 'Existing synthetic memory',
+      instructions: 'Apply explicit durable-memory requests.',
+      llmConfig: { provider: Providers.OPENAI, model: 'gpt-5.4' },
+      validKeys: ['preferences'],
+      keyLimits: { preferences: 10 },
+      tokenLimit: 100,
+      memoryTokenMap: { preferences: 9 },
+      memoryRevisionMap: { preferences: 0 },
+      totalTokens: 9,
+      setMemory,
+      deleteMemory: jest.fn().mockResolvedValue({ ok: true }),
+      user: createTestUser(),
+    });
+
+    expect(processStream!).toHaveBeenCalledTimes(1);
+    expect(setMemory).toHaveBeenCalledTimes(1);
   });
 });

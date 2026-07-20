@@ -5,10 +5,22 @@ import { ThemeContext, Spinner, Button, isDark } from '@librechat/client';
 import { useNavigate, useOutletContext, useLocation } from 'react-router-dom';
 import { useRegisterUserMutation } from 'librechat-data-provider/react-query';
 import { loginPage } from 'librechat-data-provider';
-import type { TRegisterUser, TError } from 'librechat-data-provider';
+import type { TRegisterUser, TError, TStartupConfig } from 'librechat-data-provider';
 import type { TLoginLayoutContext } from '~/common';
 import { useLocalize, TranslationKeys } from '~/hooks';
 import { ErrorMessage } from './ErrorMessage';
+
+/* === VIVENTIUM START ===
+ * Feature: Easy Install browser-first onboarding.
+ * Purpose: Send a fresh Easy Install user directly to the existing Connected Accounts setup surface.
+ * === VIVENTIUM END === */
+export function registrationDestination(
+  startupConfig: Pick<TStartupConfig, 'viventiumInstallExperience'> | null | undefined,
+): string {
+  return startupConfig?.viventiumInstallExperience === 'express'
+    ? '/c/new?setup=accounts'
+    : '/c/new';
+}
 
 const Registration: React.FC = () => {
   const navigate = useNavigate();
@@ -44,7 +56,11 @@ const Registration: React.FC = () => {
     }
 
     if (countdown <= 0) {
-      navigate('/c/new', { replace: true });
+      /* === VIVENTIUM START ===
+       * Feature: Easy Install browser-first onboarding.
+       * Purpose: Keep Custom Settings Install/legacy registration unchanged while Easy Install continues to account setup.
+       * === VIVENTIUM END === */
+      navigate(registrationDestination(startupConfig), { replace: true });
       return;
     }
 
@@ -53,7 +69,7 @@ const Registration: React.FC = () => {
     }, 1000);
 
     return () => window.clearTimeout(timer);
-  }, [countdown, navigate, registrationSucceeded]);
+  }, [countdown, navigate, registrationSucceeded, startupConfig]);
 
   const registerUser = useRegisterUserMutation({
     onMutate: () => {
@@ -120,9 +136,15 @@ const Registration: React.FC = () => {
           role="alert"
         >
           {localize(
-            startupConfig?.emailEnabled
-              ? 'com_auth_registration_success_generic'
-              : 'com_auth_registration_success_insecure',
+            /* === VIVENTIUM START ===
+             * Feature: Honest duplicate-registration recovery.
+             * Purpose: Preserve anti-enumeration while avoiding a false Easy Install success claim.
+             * === VIVENTIUM END === */
+            startupConfig?.viventiumInstallExperience === 'express'
+              ? 'com_auth_registration_submitted_easy_install'
+              : startupConfig?.emailEnabled
+                ? 'com_auth_registration_success_generic'
+                : 'com_auth_registration_success_insecure',
           ) +
             ' ' +
             localize('com_auth_email_verification_redirecting', { 0: countdown.toString() })}

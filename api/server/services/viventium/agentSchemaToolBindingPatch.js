@@ -21,7 +21,49 @@ const { StandardGraph } = require('@librechat/agents');
 
 const PATCH_FLAG = Symbol.for('viventium.agent.schema.tool.binding.patch.v2');
 const SCOPED_TOOLS_FLAG = Symbol.for('viventium.agent.schema.tool.binding.accessor.v1');
+const DEDUPED_BINDING_FLAG = Symbol.for('viventium.agent.schema.tool.binding.dedupe.v1');
 const scopedTools = new AsyncLocalStorage();
+
+function dedupeToolsByName(tools) {
+  if (!Array.isArray(tools) || tools.length < 2) {
+    return tools;
+  }
+  const seenNames = new Set();
+  let duplicateFound = false;
+  const deduped = tools.filter((tool) => {
+    const name = toolName(tool);
+    if (!name) {
+      return true;
+    }
+    if (seenNames.has(name)) {
+      duplicateFound = true;
+      return false;
+    }
+    seenNames.add(name);
+    return true;
+  });
+  return duplicateFound ? deduped : tools;
+}
+
+function installDedupedBindingMethod(agentContext) {
+  if (agentContext?.[DEDUPED_BINDING_FLAG] === true) {
+    return true;
+  }
+  if (!agentContext || typeof agentContext.getToolsForBinding !== 'function') {
+    return false;
+  }
+  const originalGetToolsForBinding = agentContext.getToolsForBinding;
+  agentContext.getToolsForBinding = function getDedupedToolsForBinding(...args) {
+    return dedupeToolsByName(originalGetToolsForBinding.apply(this, args));
+  };
+  Object.defineProperty(agentContext, DEDUPED_BINDING_FLAG, {
+    value: true,
+    enumerable: false,
+    configurable: false,
+    writable: false,
+  });
+  return true;
+}
 
 function installScopedToolsAccessor(agentContext) {
   if (agentContext?.[SCOPED_TOOLS_FLAG] === true) {
@@ -124,6 +166,12 @@ function installUnifiedSchemaToolBindingPatch(proto = StandardGraph?.prototype) 
 
     return async (state, config) => {
       const agentContext = this?.agentContexts?.get?.(agentId);
+      if (agentContext && !installDedupedBindingMethod(agentContext)) {
+        logger.error(
+          `[Agent Schema Tool Binding Patch] binding dedupe unavailable agent=${agentId}`,
+        );
+        return originalCallModel(state, config);
+      }
       const getToolsForBinding =
         agentContext && typeof agentContext.getToolsForBinding === 'function'
           ? agentContext.getToolsForBinding
@@ -186,6 +234,7 @@ try {
 }
 
 module.exports = {
+  dedupeToolsByName,
   installUnifiedSchemaToolBindingPatch,
   sameToolList,
 };

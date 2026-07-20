@@ -47,6 +47,9 @@ export default function useAttachmentHandler(queryClient?: QueryClient) {
 
         return handleMemoryArtifact({ memoryArtifact, currentData: oldData }) || oldData;
       });
+      /* === VIVENTIUM START === Ensure optimistic memory state is reconciled with authoritative CAS state. === */
+      queryClient.invalidateQueries([QueryKeys.memories]);
+      /* === VIVENTIUM END === */
     }
 
     setAttachmentsMap((prevMap) => {

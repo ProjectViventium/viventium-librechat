@@ -11,7 +11,13 @@ const path = require('path');
 require('../openaiResponsesOutputPatch');
 
 const AGENTS_CJS_DIR = path.dirname(require.resolve('@librechat/agents'));
-const agentsUtils = require(path.join(AGENTS_CJS_DIR, 'llm/openai/utils/index.cjs'));
+const LANGCHAIN_OPENAI_DIR = path.dirname(
+  require.resolve('@langchain/openai', { paths: [AGENTS_CJS_DIR] }),
+);
+const langchainResponses = require(path.join(
+  LANGCHAIN_OPENAI_DIR,
+  'converters/responses.cjs',
+));
 
 describe('openaiResponsesOutputPatch', () => {
   test('response.completed without response.output does not throw (gpt-5.4 shape)', () => {
@@ -24,14 +30,19 @@ describe('openaiResponsesOutputPatch', () => {
         usage: { output_tokens: 3 },
       },
     };
-    expect(() => agentsUtils._convertOpenAIResponsesDeltaToBaseMessageChunk(chunk)).not.toThrow();
+    expect(() => langchainResponses.convertResponsesDeltaToChatGenerationChunk(chunk)).not.toThrow();
     // The guard normalizes the missing field to an empty array.
     expect(Array.isArray(chunk.response.output)).toBe(true);
   });
 
   test('a real response.output array is preserved (guard only fills when absent)', () => {
     const realOutput = [
-      { type: 'message', id: 'msg_1', content: [{ type: 'output_text', text: 'hello' }] },
+      {
+        type: 'message',
+        id: 'msg_1',
+        phase: null,
+        content: [{ type: 'output_text', text: 'hello', annotations: [] }],
+      },
     ];
     const chunk = {
       type: 'response.completed',
@@ -43,7 +54,7 @@ describe('openaiResponsesOutputPatch', () => {
         usage: {},
       },
     };
-    expect(() => agentsUtils._convertOpenAIResponsesDeltaToBaseMessageChunk(chunk)).not.toThrow();
+    expect(() => langchainResponses.convertResponsesDeltaToChatGenerationChunk(chunk)).not.toThrow();
     expect(chunk.response.output).toBe(realOutput);
   });
 });

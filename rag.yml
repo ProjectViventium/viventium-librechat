@@ -24,11 +24,14 @@ services:
       start_period: 10s
     volumes:
       # === VIVENTIUM START ===
-      # Keep local RAG vector data on the host filesystem instead of a Docker-managed
+      # Keep local RAG vector data in an explicit bind mount instead of a Docker-managed
       # volume so the launcher's isolated runtime survives Docker Desktop disk-pressure
-      # without deleting user conversation-recall state.
+      # without deleting user conversation-recall state. The path is host-owned by default;
+      # an explicitly validated daemon-owned path supports remote/no-share Docker engines.
       # === VIVENTIUM END ===
-      - ${VIVENTIUM_RAG_PGDATA_PATH:-./.rag-pgdata}:/var/lib/postgresql/data
+      - type: bind
+        source: ${VIVENTIUM_RAG_PGDATA_PATH:-./.rag-pgdata}
+        target: /var/lib/postgresql/data
     ports:
       - '127.0.0.1:${VIVENTIUM_RAG_VECTORDB_HOST_PORT:-5433}:5432'
 
@@ -89,7 +92,12 @@ services:
       # === VIVENTIUM START ===
       # Feature: Request-scoped OpenAI embeddings overrides for connected accounts.
       # Purpose: Mount the patched RAG embed route so local runs can honor user-scoped
-      # OpenAI embeddings auth while preserving the existing env-key fallback path.
-      # Added: 2026-04-04
+      # OpenAI embeddings auth while preserving the existing env-key fallback path. The
+      # launcher validates byte identity before allowing a daemon-local mirror path, so
+      # no-host-share Docker engines can use this source without accepting arbitrary code.
+      # Added: 2026-04-04; daemon-local portability: 2026-07-20
       # === VIVENTIUM END ===
-      - ./viventium/rag_api_overrides/app/routes/document_routes.py:/app/app/routes/document_routes.py:ro
+      - type: bind
+        source: ${VIVENTIUM_RAG_DOCUMENT_ROUTE_PATH:-./viventium/rag_api_overrides/app/routes/document_routes.py}
+        target: /app/app/routes/document_routes.py
+        read_only: true

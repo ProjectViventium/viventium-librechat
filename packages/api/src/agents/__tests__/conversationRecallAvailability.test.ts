@@ -35,7 +35,10 @@ describe('conversationRecallAvailability', () => {
 
   test('continues probing the vector runtime when no restore marker exists', async () => {
     jest.spyOn(fs, 'existsSync').mockReturnValue(false);
-    global.fetch = jest.fn().mockResolvedValue({ ok: true } as Response);
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: jest.fn().mockResolvedValue({ status: 'UP' }),
+    } as unknown as Response);
 
     const status = await getConversationRecallVectorRuntimeStatus();
 
@@ -44,5 +47,38 @@ describe('conversationRecallAvailability', () => {
       reason: 'ok',
     });
     expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  test('rejects a reachable vector runtime whose semantic health is down', async () => {
+    jest.spyOn(fs, 'existsSync').mockReturnValue(false);
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: jest.fn().mockResolvedValue({
+        status: 'DOWN',
+        error: 'vector_store_unavailable',
+      }),
+    } as unknown as Response);
+
+    const status = await getConversationRecallVectorRuntimeStatus();
+
+    expect(status).toEqual({
+      available: false,
+      reason: 'unhealthy',
+    });
+  });
+
+  test('rejects an invalid semantic health response', async () => {
+    jest.spyOn(fs, 'existsSync').mockReturnValue(false);
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: jest.fn().mockRejectedValue(new SyntaxError('invalid json')),
+    } as unknown as Response);
+
+    const status = await getConversationRecallVectorRuntimeStatus();
+
+    expect(status).toEqual({
+      available: false,
+      reason: 'invalid_response',
+    });
   });
 });

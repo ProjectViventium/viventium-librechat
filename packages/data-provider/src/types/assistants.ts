@@ -179,6 +179,10 @@ export interface ActivationConfig {
   model: string;
   /** Provider for the activation model (e.g., "openai") */
   provider: string;
+  /** Ordered recovery routes for activation detection */
+  fallbacks?: Array<{ provider: string; model: string }>;
+  /** Whether an exhausted detector route should be surfaced to the user */
+  activation_failure_visibility?: 'silent' | 'visible';
   /** System prompt for making activation decisions */
   prompt: string;
   /** Optional config-defined routing scope for runtime helper context */

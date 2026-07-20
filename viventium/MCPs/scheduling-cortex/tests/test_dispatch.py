@@ -10,7 +10,7 @@ import unittest
 from datetime import datetime, timezone
 from io import BytesIO
 from urllib.error import HTTPError
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -81,6 +81,44 @@ class DispatchWorkbenchTests(unittest.TestCase):
                 {},
                 'run-1',
             )
+
+    def test_workbench_refresh_preserves_dispatched_occurrence(self):
+        dispatched_at = '2026-07-14T03:41:27Z'
+        persisted_next_run = '2026-07-14T07:00:00Z'
+        task = {
+            'id': 'task-1',
+            'user_id': 'user-1',
+            'prompt': 'Template {{memory.current}}',
+            'next_run_at': dispatched_at,
+            'metadata': {},
+        }
+        wb = {'definition_id': 'definition-1'}
+        definition = {
+            'id': 'definition-1',
+            'user_id': 'user-1',
+            'prompt_text': 'Template {{memory.current}}',
+            'metadata': {},
+        }
+        storage = MagicMock()
+        storage.get_scheduled_prompt_definition.return_value = definition
+        storage.latest_scheduled_prompt_version.return_value = None
+        storage.update_task.return_value = {
+            **task,
+            'next_run_at': persisted_next_run,
+        }
+        renderer = MagicMock()
+        renderer.render_variables.return_value = {
+            'rendered': 'Template rendered now',
+            'renderedHash': 'rendered-hash',
+            'variableSnapshotJson': '{}',
+            'variableSnapshotHash': 'snapshot-hash',
+        }
+
+        with patch.object(dispatch, '_import_workbench_scheduled_prompts', return_value=renderer):
+            refreshed_task, _ = dispatch._refresh_workbench_rendered_prompt(storage, task, wb)
+
+        self.assertEqual(refreshed_task['next_run_at'], dispatched_at)
+        self.assertEqual(refreshed_task['prompt'], 'Template rendered now')
 
 
 class DispatchTelegramTests(unittest.TestCase):
@@ -473,7 +511,15 @@ class DispatchTelegramTests(unittest.TestCase):
             seen_payloads.append(payload)
             return {'streamId': 'stream-run-context', 'conversationId': 'conv-run-context'}
 
-        with patch.object(
+        with patch.dict(
+            os.environ,
+            {
+                'VIVENTIUM_SCHEDULED_AGENT_PROVIDER': 'openai',
+                'VIVENTIUM_SCHEDULED_AGENT_MODEL': 'gpt-5.6-sol',
+                'VIVENTIUM_SCHEDULED_AGENT_REASONING_EFFORT': 'xhigh',
+            },
+            clear=False,
+        ), patch.object(
             dispatch,
             '_utc_now',
             return_value=datetime(2026, 6, 15, 15, 0, 26, tzinfo=timezone.utc),
@@ -497,8 +543,81 @@ class DispatchTelegramTests(unittest.TestCase):
         self.assertEqual(payload['scheduledDueAt'], '2026-06-15T15:00:00Z')
         self.assertEqual(payload['schedulerRunContext']['scheduled_due_local_date'], 'Monday, June 15, 2026')
         self.assertEqual(payload['schedulerRunContext']['scheduled_due_local_date_iso'], '2026-06-15')
+        self.assertEqual(payload['model'], 'gpt-5.6-sol')
+        self.assertEqual(payload['reasoning_effort'], 'xhigh')
+        self.assertEqual(
+            payload['scheduledAgentExecution'],
+            {
+                'provider': 'openai',
+                'model': 'gpt-5.6-sol',
+                'reasoning_effort': 'xhigh',
+            },
+        )
         self.assertIn('Scheduled Run Context (Deterministic)', payload['text'])
+        self.assertEqual(result['execution']['model'], 'gpt-5.6-sol')
+        self.assertEqual(result['execution']['reasoning_effort'], 'xhigh')
         self.assertEqual(result['date_guard']['final']['status'], 'passed')
+
+    def test_scheduled_agent_execution_rejects_an_incomplete_tuple(self):
+        with patch.dict(
+            os.environ,
+            {
+                'VIVENTIUM_SCHEDULED_AGENT_PROVIDER': 'openai',
+                'VIVENTIUM_SCHEDULED_AGENT_MODEL': 'gpt-5.6-sol',
+                'VIVENTIUM_SCHEDULED_AGENT_REASONING_EFFORT': '',
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                'requires provider, model, and reasoning effort',
+            ):
+                dispatch._scheduled_agent_execution()
+
+    def test_run_scheduler_generation_omits_execution_when_policy_is_unset(self):
+        task = {
+            'id': 'task-no-execution-policy',
+            'user_id': 'user_1',
+            'agent_id': 'agent-1',
+            'prompt': 'prepare a synthetic briefing',
+            'channel': 'librechat',
+            'conversation_policy': 'new',
+            'metadata': None,
+        }
+        seen_payloads = []
+
+        def fake_post(_url, payload, _headers, _timeout_s):
+            seen_payloads.append(payload)
+            return {'streamId': 'stream-no-policy', 'conversationId': 'conv-no-policy'}
+
+        with patch.dict(
+            os.environ,
+            {
+                'VIVENTIUM_SCHEDULED_AGENT_PROVIDER': '',
+                'VIVENTIUM_SCHEDULED_AGENT_MODEL': '',
+                'VIVENTIUM_SCHEDULED_AGENT_REASONING_EFFORT': '',
+            },
+            clear=False,
+        ), patch.object(
+            dispatch,
+            '_post_json',
+            side_effect=fake_post,
+        ), patch.object(
+            dispatch,
+            '_stream_scheduler_response',
+            return_value=('Synthetic response', 'msg-no-policy', ''),
+        ), patch.object(
+            dispatch,
+            '_poll_scheduler_followup',
+            return_value={'followup_text': '', 'canonical_text': ''},
+        ):
+            result = dispatch._run_scheduler_generation(task, 'http://localhost:3080', 10, 'new')
+
+        payload = seen_payloads[0]
+        self.assertNotIn('scheduledAgentExecution', payload)
+        self.assertNotIn('model', payload)
+        self.assertNotIn('reasoning_effort', payload)
+        self.assertEqual(result['execution'], {})
 
     def test_run_scheduler_generation_corrects_delivery_without_persisting_history(self):
         task = {

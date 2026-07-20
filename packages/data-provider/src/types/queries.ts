@@ -142,6 +142,9 @@ export type TUserMemory = {
   value: string;
   updated_at: string;
   tokenCount?: number;
+  /* === VIVENTIUM START === Revision-safe saved-memory writes. === */
+  revision: number;
+  /* === VIVENTIUM END === */
 };
 
 export type MemoriesResponse = {

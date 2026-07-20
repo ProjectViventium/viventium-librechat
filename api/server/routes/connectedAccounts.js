@@ -54,8 +54,14 @@ function isSupportedProvider(provider) {
   return provider === 'openai' || provider === 'anthropic';
 }
 
-function isConnectedAccountsEnabled() {
-  return isEnabled(process.env.VIVENTIUM_LOCAL_SUBSCRIPTION_AUTH);
+function isExperimentalDirectSubscriptionAuthEnabled() {
+  /* === VIVENTIUM START ===
+   * Feature: Experimental direct subscription authentication gate.
+   * Purpose: Copied provider OAuth clients and private subscription endpoints are not a stable,
+   * officially supported integration contract. Keep every direct OAuth route fail-closed unless
+   * an operator explicitly opts into the legacy experimental path.
+   * === VIVENTIUM END === */
+  return isEnabled(process.env.VIVENTIUM_EXPERIMENTAL_DIRECT_SUBSCRIPTION_AUTH);
 }
 
 function shouldForceOpenAIManualMode() {
@@ -86,11 +92,10 @@ function getDefaultConnectedAccountsOrigin() {
   return (process.env.DOMAIN_SERVER || 'http://localhost:3080').replace(/\/+$/, '');
 }
 
-function getServerOrigin(req) {
+function getServerOrigin() {
   /* === VIVENTIUM START ===
-   * Feature: Configurable connected-account OAuth browser return origin.
-   * Purpose: Use an explicit browser return override only when configured; otherwise preserve
-   * existing DOMAIN_SERVER/request-host behavior.
+   * Feature: Trusted connected-account OAuth browser return origin.
+   * Purpose: OAuth state must never derive its signed callback origin from a request Host header.
    * === VIVENTIUM END === */
   const configuredReturnOrigin = process.env[CONNECTED_ACCOUNTS_RETURN_ORIGIN_ENV];
   if (configuredReturnOrigin && configuredReturnOrigin.trim()) {
@@ -99,7 +104,9 @@ function getServerOrigin(req) {
   if (process.env.DOMAIN_SERVER) {
     return process.env.DOMAIN_SERVER.replace(/\/+$/, '');
   }
-  return `${req.protocol}://${req.get('host')}`;
+  throw new Error(
+    `Missing ${CONNECTED_ACCOUNTS_RETURN_ORIGIN_ENV} or DOMAIN_SERVER for connected-account OAuth`,
+  );
 }
 
 function getOpenAICallbackRedirectUri() {
@@ -651,7 +658,7 @@ router.get('/:provider/start', requireJwtAuth, async (req, res) => {
     return res.status(404).json({ error: 'Unsupported provider' });
   }
 
-  if (!isConnectedAccountsEnabled()) {
+  if (!isExperimentalDirectSubscriptionAuthEnabled()) {
     return res.status(404).json({ error: 'oauth_not_enabled' });
   }
 
@@ -664,7 +671,7 @@ router.get('/:provider/start', requireJwtAuth, async (req, res) => {
     const { verifier, challenge } = createPKCE();
     const redirectUri =
       provider === 'openai' ? getOpenAICallbackRedirectUri() : getAnthropicRedirectUri();
-    const serverOrigin = getServerOrigin(req);
+    const serverOrigin = getServerOrigin();
     const state =
       provider === 'openai'
         ? createOAuthState({
@@ -719,7 +726,7 @@ router.post('/:provider/complete', requireJwtAuth, async (req, res) => {
     return res.status(404).json({ error: 'Unsupported provider' });
   }
 
-  if (!isConnectedAccountsEnabled()) {
+  if (!isExperimentalDirectSubscriptionAuthEnabled()) {
     return res.status(404).json({ error: 'oauth_not_enabled' });
   }
 
@@ -760,7 +767,7 @@ router.get('/:provider/callback', async (req, res) => {
     return res.redirect(errorRedirect(error, provider));
   }
 
-  if (!isConnectedAccountsEnabled()) {
+  if (!isExperimentalDirectSubscriptionAuthEnabled()) {
     return res.redirect(errorRedirect('oauth_not_enabled', provider));
   }
 

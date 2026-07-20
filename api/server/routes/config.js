@@ -113,10 +113,29 @@ router.get('/', async function (req, res) {
         process.env.SHOW_BIRTHDAY_ICON === '',
       helpAndFaqURL: process.env.HELP_AND_FAQ_URL || 'https://viventium.ai',
       /* === VIVENTIUM START ===
-       * Feature: Local subscription connected accounts.
-       * Purpose: Gate OAuth-only OpenAI/Anthropic account connection UI to local/self-hosted mode.
+       * Feature: Local credential setup.
+       * Purpose: Gate the novice-facing OpenAI/Anthropic credential setup surface.
        * === VIVENTIUM END === */
-      viventiumConnectedAccountsEnabled: isEnabled(process.env.VIVENTIUM_LOCAL_SUBSCRIPTION_AUTH),
+      viventiumConnectedAccountsEnabled:
+        isEnabled(process.env.VIVENTIUM_LOCAL_SUBSCRIPTION_AUTH) ||
+        process.env.OPENAI_API_KEY === 'user_provided' ||
+        process.env.ANTHROPIC_API_KEY === 'user_provided',
+      /* === VIVENTIUM START ===
+       * Feature: Experimental direct subscription authentication.
+       * Purpose: Expose the explicit opt-in separately from the stable API-key setup surface.
+       * === VIVENTIUM END === */
+      viventiumExperimentalDirectSubscriptionAuth: isEnabled(
+        process.env.VIVENTIUM_EXPERIMENTAL_DIRECT_SUBSCRIPTION_AUTH,
+      ),
+      /* === VIVENTIUM START ===
+       * Feature: Easy Install browser-first onboarding.
+       * Purpose: Project the bounded installer experience into the authenticated first-user UI.
+       * === VIVENTIUM END === */
+      viventiumInstallExperience: ['express', 'custom', 'legacy'].includes(
+        process.env.VIVENTIUM_INSTALL_EXPERIENCE,
+      )
+        ? process.env.VIVENTIUM_INSTALL_EXPERIENCE
+        : undefined,
       /* === VIVENTIUM START ===
        * Feature: Prompt Workbench local launcher.
        * Purpose: Keep the Connected Accounts workbench entry in sync with the server-side local

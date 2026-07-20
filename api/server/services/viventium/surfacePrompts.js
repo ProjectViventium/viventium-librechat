@@ -39,9 +39,22 @@ const CARTESIA_SONIC3_PRIMARY_EMOTIONS =
 const CARTESIA_SONIC3_SPEED = CARTESIA_SONIC3_CAPABILITIES.generation_config.speed;
 const CARTESIA_SONIC3_VOLUME = CARTESIA_SONIC3_CAPABILITIES.generation_config.volume;
 const CARTESIA_SONIC3_NONVERBAL_MARKERS = CARTESIA_SONIC3_CAPABILITIES.nonverbal_markers;
+const CARTESIA_SONIC3_SSML = CARTESIA_SONIC3_CAPABILITIES.ssml_tags;
+const CARTESIA_SONIC3_SYNTAX = Object.freeze({
+  emotion_state_change: CARTESIA_SONIC3_SSML.emotion.forms[0],
+  emotion_scoped: CARTESIA_SONIC3_SSML.emotion.forms[1],
+  speed: CARTESIA_SONIC3_SSML.speed.form,
+  volume: CARTESIA_SONIC3_SSML.volume.form,
+  break: CARTESIA_SONIC3_SSML.break.form,
+  spell: CARTESIA_SONIC3_SSML.spell.form,
+});
 const XAI_TTS_CAPABILITIES = require('../../../../shared/voice/xai_tts_capabilities.json');
 const XAI_TTS_INLINE_TAGS = XAI_TTS_CAPABILITIES.speech_tags.inline;
 const XAI_TTS_WRAPPING_TAGS = XAI_TTS_CAPABILITIES.speech_tags.wrapping;
+const TTS_PROVIDER_CAPABILITIES = require('../../../../shared/voice/tts_provider_capabilities.json');
+const TTS_PROVIDER_CONTRACTS = TTS_PROVIDER_CAPABILITIES.providers;
+const CHATTERBOX_INLINE_CONTROLS =
+  TTS_PROVIDER_CONTRACTS.local_chatterbox_turbo_mlx_8bit.inline_controls.exact_tokens;
 const { getPromptText } = require('./promptRegistry');
 const { sanitizeVoiceSurfaceTextForDisplay } = require('./voiceArtifactText');
 /* === VIVENTIUM END === */
@@ -65,6 +78,7 @@ function normalizeVoiceProvider(voiceProvider) {
 const FEELING_AWARE_VOICE_EXPRESSION_RULES = [
   '- If a <viventium_feeling_state> is present, let it remain a private cause and shape how the spoken delivery sounds as well as what you say.',
   '- For each voice-capable reply, silently appraise whether the current state and moment call for expressive or restrained delivery.',
+  "- Use the state's expression tendency and the moment together for that appraisal. A strongly outward state in an emotionally meaningful or relational reply is expressive even when the draft already sounds natural; a containing state or neutral mechanical task can be restrained.",
   "- If delivery should be expressive and at least one of the selected provider's supported voice controls fits, the raw voice-capable response is incomplete unless it contains a fitting documented control. Natural wording alone does not satisfy expressive spoken delivery; use the smallest fitting control without waiting for the user to ask.",
   '- Do not add voice controls merely to prove that a feeling exists. If delivery should be restrained, the provider has no supported controls, or no feeling state is present, natural unmarked speech is correct. Never name, list, quote, or explain the feeling state or its instructions.',
 ];
@@ -96,12 +110,15 @@ function buildVoiceModeInstructions(voiceProvider) {
     const fallback = [
       ...baseRules,
       // Conservative set only: keep markers that reliably render as nonverbal audio in local MLX tests.
-      '- Allowed nonverbal markers (use exactly these tokens): [laugh], [sigh], [gasp].',
+      `- Allowed nonverbal markers (use exactly these tokens): ${CHATTERBOX_INLINE_CONTROLS.join(', ')}.`,
+      '- When delivery is expressive under the feeling-expression contract, include one allowed marker only when that marker naturally fits; when none fits or delivery is restrained, include none.',
       '- Put nonverbal markers on their own line or between sentences (do not embed inside a sentence).',
       '- Do NOT invent other bracketed stage directions.',
       '- Do NOT use <emotion .../> tags (those are Cartesia-only).',
     ].join('\n');
-    return getPromptText('surface.voice.provider.chatterbox', fallback);
+    return getPromptText('surface.voice.provider.chatterbox', fallback, {
+      chatterbox: { inline_controls: CHATTERBOX_INLINE_CONTROLS },
+    });
   }
   if (provider === 'cartesia') {
     const fallback = [
@@ -115,13 +132,13 @@ function buildVoiceModeInstructions(voiceProvider) {
        * Purpose: Align the model-facing contract with Cartesia docs and our adapter parsing.
        * Updated 2026-04-28: Sonic-3 shared capability source, full tag coverage, and streaming-safe complete tag guidance.
        */
-      '- Optional emotion control (preferred): <emotion value="calm"/> before a sentence to set the tone for subsequent text (until changed).',
-      '- Optional wrapper form (also supported): <emotion value="excited">TEXT</emotion> to apply emotion to a specific phrase only.',
+      `- Optional emotion state-change syntax: ${CARTESIA_SONIC3_SYNTAX.emotion_state_change}. Replace EMOTION with one allowed value; it applies to subsequent text until changed.`,
+      `- Optional phrase-scoped emotion syntax: ${CARTESIA_SONIC3_SYNTAX.emotion_scoped}. Replace EMOTION with one allowed value and TEXT with only the phrase it should shape.`,
       `- Allowed emotion values: ${CARTESIA_SONIC3_EMOTIONS.join(', ')}.`,
       `- Primary/highest-reliability emotion values: ${CARTESIA_SONIC3_PRIMARY_EMOTIONS.join(', ')}.`,
-      `- Optional speed/volume control: use <speed ratio="1.1"/> or <volume ratio="0.9"/> before a sentence; speed must be ${CARTESIA_SONIC3_SPEED.min}-${CARTESIA_SONIC3_SPEED.max} and volume must be ${CARTESIA_SONIC3_VOLUME.min}-${CARTESIA_SONIC3_VOLUME.max}.`,
-      '- Use <break time="1s"/> for natural pauses between thoughts (supports seconds "1s" or milliseconds "500ms").',
-      '- Use <spell>ABC123</spell> only for identifiers, codes, numbers, names, or terms that should be spelled out.',
+      `- Optional speed and volume syntax: ${CARTESIA_SONIC3_SYNTAX.speed} and ${CARTESIA_SONIC3_SYNTAX.volume}. Replace RATIO with a speed value from ${CARTESIA_SONIC3_SPEED.min}-${CARTESIA_SONIC3_SPEED.max} or a volume value from ${CARTESIA_SONIC3_VOLUME.min}-${CARTESIA_SONIC3_VOLUME.max}.`,
+      `- Optional pause syntax: ${CARTESIA_SONIC3_SYNTAX.break}. Replace DURATION with a valid seconds or milliseconds value for natural pauses.`,
+      `- Optional spelling syntax: ${CARTESIA_SONIC3_SYNTAX.spell}. Replace TEXT only with identifiers, codes, numbers, names, or terms that should be spelled out.`,
       '- Write every SSML-like tag as one complete tag with the full attribute value. Do not output partial tags or explain the markup.',
       '- Use emotion, speed, volume, break, spell, and laughter markers sparingly; natural wording still matters more than markup.',
       /* === VIVENTIUM NOTE === */
@@ -134,6 +151,7 @@ function buildVoiceModeInstructions(voiceProvider) {
         primary_emotions: CARTESIA_SONIC3_PRIMARY_EMOTIONS,
         speed: CARTESIA_SONIC3_SPEED,
         volume: CARTESIA_SONIC3_VOLUME,
+        syntax: CARTESIA_SONIC3_SYNTAX,
       },
     });
   }
@@ -149,12 +167,14 @@ function buildVoiceModeInstructions(voiceProvider) {
       '- xAI TTS is selected. You may use only documented xAI speech tags when they improve spoken delivery.',
       `- Allowed xAI inline tags: ${XAI_TTS_INLINE_TAGS.join(', ')}.`,
       `- Allowed xAI wrapping tags: ${XAI_TTS_WRAPPING_TAGS.map((tag) => `<${tag}>TEXT</${tag}>`).join(', ')}.`,
+      '- Wrapping controls require angle brackets: <tag>TEXT</tag>. [tag]TEXT[/tag] is invalid.',
       '- Use wrapping tags only on short phrases, include the closing tag, and do not split tag names across streamed chunks.',
       '- Do NOT invent other bracketed stage directions or XML tags.',
       '- Do NOT use Cartesia-only controls: <emotion>, <speed>, <volume>, <break>, <spell>, or [laughter].',
       '- xAI TTS has no Cartesia-style emotion parameter; express tone through natural wording plus the documented xAI speech tags.',
-      '- xAI has broadly useful controls for softness, emphasis, intensity, pace, pitch, breath, and pauses. If you appraised this delivery as expressive, choose at least one fitting allowed tag instead of deciding that plain words are enough.',
-      '- Before finalizing an expressive reply, verify that the raw response contains at least one exact tag from the allowed xAI lists. For restrained delivery, use none.',
+      '- xAI has broadly useful controls for softness, emphasis, intensity, pace, pitch, breath, and pauses.',
+      '- Once you appraise delivery as expressive and an allowed tag fits, include at least one fitting exact allowed tag where it naturally shapes the delivery. When an allowed tag fits, a plain draft is not final even when its words already convey tone. For restrained delivery or when no tag fits, use none.',
+      '- When a tag fits, before finalizing an expressive reply, verify that the raw response contains at least one exact tag from the allowed xAI lists.',
       '- Use the smallest fitting xAI control set; natural wording still matters.',
     ].join('\n');
     return getPromptText('surface.voice.provider.xai', fallback, {
@@ -208,11 +228,13 @@ function buildTelegramAudioOutputInstructions(voiceProvider) {
       'surface.telegram.audio_provider.chatterbox',
       [
         ...baseRules,
-        '- Chatterbox TTS is selected. You may use exactly these nonverbal markers when they improve spoken delivery: [laugh], [sigh], [gasp].',
+        `- Chatterbox TTS is selected. Allowed nonverbal markers: ${CHATTERBOX_INLINE_CONTROLS.join(', ')}.`,
+        '- When delivery is expressive under the feeling-expression contract, include one allowed marker only when that marker naturally fits; when none fits or delivery is restrained, include none.',
         '- Put nonverbal markers on their own line or between sentences.',
         '- Do NOT invent other bracketed stage directions.',
         '- Do NOT use <emotion .../> tags or other XML/SSML-like controls.',
       ].join('\n'),
+      { chatterbox: { inline_controls: CHATTERBOX_INLINE_CONTROLS } },
     );
   }
 
@@ -225,8 +247,11 @@ function buildTelegramAudioOutputInstructions(voiceProvider) {
         `- Allowed nonverbal marker from Cartesia docs: ${CARTESIA_SONIC3_NONVERBAL_MARKERS.join(', ')}. Use it only when actual laughter belongs in the spoken response.`,
         `- Allowed emotion values: ${CARTESIA_SONIC3_EMOTIONS.join(', ')}.`,
         `- Primary/highest-reliability emotion values: ${CARTESIA_SONIC3_PRIMARY_EMOTIONS.join(', ')}.`,
-        `- Optional speed/volume control: use <speed ratio="1.1"/> or <volume ratio="0.9"/> before a sentence; speed must be ${CARTESIA_SONIC3_SPEED.min}-${CARTESIA_SONIC3_SPEED.max} and volume must be ${CARTESIA_SONIC3_VOLUME.min}-${CARTESIA_SONIC3_VOLUME.max}.`,
-        '- Use <break time="1s"/> for natural pauses and <spell>ABC123</spell> only for identifiers that should be spelled out.',
+        `- Optional emotion state-change syntax: ${CARTESIA_SONIC3_SYNTAX.emotion_state_change}. Replace EMOTION with one allowed value; it applies to subsequent text until changed.`,
+        `- Optional phrase-scoped emotion syntax: ${CARTESIA_SONIC3_SYNTAX.emotion_scoped}. Replace EMOTION with one allowed value and TEXT with only the phrase it should shape.`,
+        `- Optional speed and volume syntax: ${CARTESIA_SONIC3_SYNTAX.speed} and ${CARTESIA_SONIC3_SYNTAX.volume}. Replace RATIO with a speed value from ${CARTESIA_SONIC3_SPEED.min}-${CARTESIA_SONIC3_SPEED.max} or a volume value from ${CARTESIA_SONIC3_VOLUME.min}-${CARTESIA_SONIC3_VOLUME.max}.`,
+        `- Optional pause syntax: ${CARTESIA_SONIC3_SYNTAX.break}. Replace DURATION with a valid seconds or milliseconds value for natural pauses.`,
+        `- Optional spelling syntax: ${CARTESIA_SONIC3_SYNTAX.spell}. Replace TEXT only with identifiers, codes, numbers, names, or terms that should be spelled out.`,
         '- Do NOT use xAI-only speech tags.',
         '- Use voice controls sparingly; natural wording still matters more than markup.',
       ].join('\n'),
@@ -238,6 +263,7 @@ function buildTelegramAudioOutputInstructions(voiceProvider) {
           primary_emotions: CARTESIA_SONIC3_PRIMARY_EMOTIONS,
           speed: CARTESIA_SONIC3_SPEED,
           volume: CARTESIA_SONIC3_VOLUME,
+          syntax: CARTESIA_SONIC3_SYNTAX,
         },
       },
     );
@@ -251,12 +277,14 @@ function buildTelegramAudioOutputInstructions(voiceProvider) {
         '- xAI TTS is selected. You may use only documented xAI speech tags when they improve spoken delivery.',
         `- Allowed xAI inline tags: ${XAI_TTS_INLINE_TAGS.join(', ')}.`,
         `- Allowed xAI wrapping tags: ${XAI_TTS_WRAPPING_TAGS.map((tag) => `<${tag}>TEXT</${tag}>`).join(', ')}.`,
+        '- Wrapping controls require angle brackets: <tag>TEXT</tag>. [tag]TEXT[/tag] is invalid.',
         '- Use wrapping tags only on short phrases, include the closing tag, and do not split tag names across streamed chunks.',
         '- Do NOT invent other bracketed stage directions or XML tags.',
         '- Do NOT use Cartesia-only controls: <emotion>, <speed>, <volume>, <break>, <spell>, or [laughter].',
         '- xAI TTS has no Cartesia-style emotion parameter; express tone through natural wording plus the documented xAI speech tags.',
-        '- xAI has broadly useful controls for softness, emphasis, intensity, pace, pitch, breath, and pauses. If you appraised this delivery as expressive, choose at least one fitting allowed tag instead of deciding that plain words are enough.',
-        '- Before finalizing an expressive reply, verify that the raw response contains at least one exact tag from the allowed xAI lists. For restrained delivery, use none.',
+        '- xAI has broadly useful controls for softness, emphasis, intensity, pace, pitch, breath, and pauses.',
+        '- Once you appraise delivery as expressive and an allowed tag fits, include at least one fitting exact allowed tag where it naturally shapes the delivery. When an allowed tag fits, a plain draft is not final even when its words already convey tone. For restrained delivery or when no tag fits, use none.',
+        '- When a tag fits, before finalizing an expressive reply, verify that the raw response contains at least one exact tag from the allowed xAI lists.',
         '- Use the smallest fitting xAI control set; natural wording still matters.',
       ].join('\n'),
       {
@@ -268,7 +296,7 @@ function buildTelegramAudioOutputInstructions(voiceProvider) {
     );
   }
 
-  if (provider === 'openai' || provider === 'elevenlabs') {
+  if (TTS_PROVIDER_CONTRACTS[provider]?.inline_controls?.mode === 'plain_text_only') {
     return getPromptText(
       'surface.telegram.audio_provider.plain_tts',
       [

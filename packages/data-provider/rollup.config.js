@@ -8,7 +8,11 @@ import terser from '@rollup/plugin-terser';
 
 const plugins = [
   peerDepsExternal(),
-  resolve(),
+  /* === VIVENTIUM START ===
+   * Build compatibility: explicitly resolve TypeScript modules so clean
+   * installs do not depend on transitive Rollup resolver behavior.
+   * === VIVENTIUM END === */
+  resolve({ extensions: ['.mjs', '.js', '.json', '.node', '.ts', '.tsx'] }),
   replace({
     __IS_DEV__: process.env.NODE_ENV === 'development',
   }),

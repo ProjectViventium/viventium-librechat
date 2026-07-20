@@ -255,6 +255,10 @@ describe('GlassHive capability broker', () => {
           requestBody: {},
           glasshive_worker_memory: memory,
           glasshive_worker_feelings: feelings,
+          glasshive_worker_feelings_scope: 'all_agents',
+          glasshive_worker_feelings_range_prompt_override_count: 3,
+          glasshive_worker_feelings_active_range_prompt_override_count: 1,
+          glasshive_worker_feelings_active_range_prompt_override_chars: 44,
         },
       },
     });
@@ -265,6 +269,22 @@ describe('GlassHive capability broker', () => {
     expect(withMemory.bootstrap_bundle_json.agents_md).toContain('You, Viventium, are a being');
     expect(withMemory.bootstrap_bundle_json.claude_md).toContain('- Energy: steady');
     expect(withMemory.bootstrap_bundle_json.codex_md).toContain('</viventium_feeling_state>');
+    for (const field of ['agents_md', 'claude_md', 'codex_md']) {
+      expect(withMemory.bootstrap_bundle_json[field].trim().endsWith(feelings)).toBe(true);
+      expect(withMemory.bootstrap_bundle_json[field].split(feelings)).toHaveLength(2);
+    }
+    const { logger } = require('@librechat/data-schemas');
+    const placementLogs = logger.info.mock.calls
+      .map(([message]) => String(message))
+      .filter((message) => message.includes('feelings.inject.final_run'));
+    expect(placementLogs).toHaveLength(3);
+    expect(logger.info.mock.calls.map(([message]) => String(message)).join('\n')).toContain(
+      '"scope":"all_agents"',
+    );
+    const placementEvidence = logger.info.mock.calls.map(([message]) => String(message)).join('\n');
+    expect(placementEvidence).toContain('"rangePromptOverrideCount":3');
+    expect(placementEvidence).toContain('"activeRangePromptOverrideCount":1');
+    expect(placementEvidence).toContain('"activeRangePromptOverrideChars":44');
 
     const withoutMemory = await maybeInjectGlassHiveCapabilityBroker({
       serverName: 'glasshive-workers-projects',
@@ -297,6 +317,7 @@ describe('GlassHive capability broker', () => {
         configurable: {
           glasshive_worker_feelings: capsule,
           glasshive_worker_feelings_hash: 'snapshot-7',
+          glasshive_worker_feelings_scope: 'all_agents',
         },
       },
     });
@@ -305,6 +326,9 @@ describe('GlassHive capability broker', () => {
     expect(result.bootstrap_bundle_json.agents_md).toContain(capsule);
     expect(result.bootstrap_bundle_json.claude_md).toContain(capsule);
     expect(result.bootstrap_bundle_json.codex_md).toContain(capsule);
+    expect(result.bootstrap_bundle_json.agents_md.trim().endsWith(capsule)).toBe(true);
+    expect(result.bootstrap_bundle_json.claude_md.trim().endsWith(capsule)).toBe(true);
+    expect(result.bootstrap_bundle_json.codex_md.trim().endsWith(capsule)).toBe(true);
     expect(result.bootstrap_bundle_json.glasshive_capability_broker).toBeUndefined();
   });
 

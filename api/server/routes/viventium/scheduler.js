@@ -48,6 +48,9 @@ const {
   extractTextDeltas,
 } = require('~/server/services/viventium/gateway/streamExtractors');
 const { getCortexMessageState } = require('~/server/services/viventium/cortexMessageState');
+const {
+  normalizeScheduledAgentExecution,
+} = require('~/server/services/viventium/scheduledAgentOverride');
 
 const router = express.Router();
 const SCHEDULER_SECRET_HEADER = 'x-viventium-scheduler-secret';
@@ -222,6 +225,18 @@ router.post(
   configMiddleware,
   async (req, _res, next) => {
     const incoming = req.body ?? {};
+    let scheduledAgentExecution;
+    try {
+      scheduledAgentExecution = normalizeScheduledAgentExecution(incoming.scheduledAgentExecution);
+    } catch (error) {
+      return _res.status(400).json({
+        error: error.message,
+        reason: 'invalid_scheduled_agent_execution',
+      });
+    }
+    if (scheduledAgentExecution) {
+      req.viventiumScheduledAgentExecution = scheduledAgentExecution;
+    }
     const text = typeof incoming.text === 'string' ? incoming.text : '';
     const requestedConversationId =
       typeof incoming.conversationId === 'string' ? incoming.conversationId : 'new';
@@ -276,6 +291,12 @@ router.post(
       agent_id: agentId,
       streamId,
       scheduleId,
+      ...(scheduledAgentExecution
+        ? {
+            model: scheduledAgentExecution.model,
+            reasoning_effort: scheduledAgentExecution.reasoning_effort,
+          }
+        : {}),
     };
     if (resolvedSpec) {
       req.body.spec = resolvedSpec;

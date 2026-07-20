@@ -1,6 +1,6 @@
 const axios = require('axios');
-const { tool } = require('@langchain/core/tools');
 const { logger } = require('@librechat/data-schemas');
+const { tool } = require('@librechat/agents/langchain/tools');
 const { generateShortLivedToken } = require('@librechat/api');
 const { Tools, EToolResources } = require('librechat-data-provider');
 const { filterFilesByAgentAccess } = require('~/server/services/Files/permissions');
@@ -15,9 +15,11 @@ const { getFiles } = require('~/models');
 const { Message, Conversation } = require('~/db/models');
 const {
   getMessageText: getConversationRecallMessageText,
+  orderRecallMessagesParentFirst,
   shouldSkipFromRecallCorpus,
 } = require('~/server/services/viventium/conversationRecallService');
 const {
+  buildRecallDerivedParentIdSet,
   isAssistantMemoryDisclaimer,
   isConversationRecallFileId,
   messageUsesConversationRecallSearch,
@@ -71,7 +73,7 @@ const DEFAULT_FILE_SEARCH_MAX_RESULTS_MEETING_TRANSCRIPT = 6;
 const DEFAULT_FILE_SEARCH_MIN_RESULTS_MEETING_TRANSCRIPT_WHEN_MIXED = 2;
 /* === VIVENTIUM END === */
 const DEFAULT_FILE_SEARCH_RESULT_MAX_CHARS = 1600;
-const DEFAULT_FILE_SEARCH_RESULT_MAX_CHARS_CONVERSATION_RECALL = 800;
+const DEFAULT_FILE_SEARCH_RESULT_MAX_CHARS_CONVERSATION_RECALL = 4000;
 /* === VIVENTIUM START ===
  * Feature: Meeting transcript recall result budget
  * Added: 2026-05-05
@@ -407,7 +409,22 @@ const preserveMeetingTranscriptResults = ({ results = [], maxResults }) => {
     nextIds.add(requiredResult.file_id);
   }
 
-  return frontloadMeetingTranscriptEvidence(frontloadMeetingTranscriptInventory(nextResults));
+  /* === VIVENTIUM START ===
+   * Fix: Keep cross-corpus ordering evidence-based.
+   * Purpose: Transcript coverage may fill a bounded result slot, but the transcript source class
+   * must not jump ahead of a stronger conversation-history result. Preserve the reranker order
+   * unless transcript evidence already won the top position on relevance.
+   * === VIVENTIUM END === */
+  const selectedResults = new Set(nextResults);
+  const evidenceOrderedResults = results
+    .filter((result) => selectedResults.has(result))
+    .slice(0, maxResults);
+  if (!isMeetingTranscriptFileId(evidenceOrderedResults[0]?.file_id)) {
+    return evidenceOrderedResults;
+  }
+  return frontloadMeetingTranscriptEvidence(
+    frontloadMeetingTranscriptInventory(evidenceOrderedResults),
+  );
 };
 
 const formatTranscriptMetadataValue = (value) => {
@@ -513,6 +530,70 @@ const clipContent = (content, maxChars) => {
   return `${content.slice(0, Math.max(0, maxChars - 3))}...`;
 };
 
+/* === VIVENTIUM START ===
+ * Fix: Preserve the primary recalled episode when it or adjacent context exceeds the result budget.
+ * Purpose: Source-backed recall may surround a matching user turn with nearby messages. Preserve
+ * both ends of an oversized primary turn so its opening context and concluding evidence survive.
+ */
+const clipPrimaryConversationRecallContent = (content, maxChars) => {
+  if (typeof content !== 'string' || maxChars <= 0) {
+    return '';
+  }
+  if (content.length <= maxChars) {
+    return content;
+  }
+
+  const marker = '\n...\n';
+  if (maxChars <= marker.length) {
+    return content.slice(0, maxChars);
+  }
+
+  const availableChars = maxChars - marker.length;
+  const headChars = Math.ceil(availableChars * 0.6);
+  const tailChars = availableChars - headChars;
+  return `${content.slice(0, headChars)}${marker}${content.slice(-tailChars)}`;
+};
+
+const clipConversationRecallContent = (result, maxChars) => {
+  const content = typeof result?.content === 'string' ? result.content : '';
+  const primaryContent =
+    typeof result?.primaryContent === 'string' ? result.primaryContent : '';
+  if (!primaryContent || content.length <= maxChars) {
+    return clipContent(content, maxChars);
+  }
+  if (primaryContent.length >= maxChars) {
+    return clipPrimaryConversationRecallContent(primaryContent, maxChars);
+  }
+
+  const turns = content.match(/<turn\b[^>]*>[\s\S]*?<\/turn>/gi) || [];
+  const primaryIndex = turns.indexOf(primaryContent);
+  if (primaryIndex < 0) {
+    return primaryContent;
+  }
+
+  const selectedIndexes = new Set([primaryIndex]);
+  let usedChars = primaryContent.length;
+  for (let offset = 1; offset < turns.length; offset += 1) {
+    for (const index of [primaryIndex - offset, primaryIndex + offset]) {
+      if (index < 0 || index >= turns.length || selectedIndexes.has(index)) {
+        continue;
+      }
+      const separatorChars = selectedIndexes.size > 0 ? 1 : 0;
+      if (usedChars + separatorChars + turns[index].length > maxChars) {
+        continue;
+      }
+      selectedIndexes.add(index);
+      usedChars += separatorChars + turns[index].length;
+    }
+  }
+
+  return Array.from(selectedIndexes)
+    .sort((left, right) => left - right)
+    .map((index) => turns[index])
+    .join('\n');
+};
+/* === VIVENTIUM END === */
+
 const clipInventoryContent = (content, maxChars) => {
   if (typeof content !== 'string') return '';
   if (content.length <= maxChars) return content;
@@ -537,9 +618,56 @@ const dedupeFilesById = (files = []) => {
   return uniqueFiles;
 };
 
+/* === VIVENTIUM START ===
+ * Feature: Conversation recall runtime safety overlay
+ * Purpose: Keep DB-backed authorization/metadata authoritative while preserving the transient
+ * source-only mode selected from current vector health and corpus freshness.
+ * === VIVENTIUM END === */
+const overlayConversationRecallRuntimeState = (dbFiles = [], resourceFiles = []) => {
+  const runtimeStateById = new Map();
+  for (const file of resourceFiles) {
+    if (!isConversationRecallFileId(file?.file_id) || runtimeStateById.has(file.file_id)) {
+      continue;
+    }
+    runtimeStateById.set(file.file_id, {
+      viventiumConversationRecallMode: file.viventiumConversationRecallMode,
+      viventiumConversationRecallAttachmentReason: file.viventiumConversationRecallAttachmentReason,
+    });
+  }
+
+  return dbFiles.map((file) => {
+    const runtimeState = runtimeStateById.get(file?.file_id);
+    if (!runtimeState) {
+      return file;
+    }
+    return {
+      ...file,
+      ...(runtimeState.viventiumConversationRecallMode
+        ? { viventiumConversationRecallMode: runtimeState.viventiumConversationRecallMode }
+        : {}),
+      ...(runtimeState.viventiumConversationRecallAttachmentReason
+        ? {
+            viventiumConversationRecallAttachmentReason:
+              runtimeState.viventiumConversationRecallAttachmentReason,
+          }
+        : {}),
+    };
+  });
+};
+
 const isSourceOnlyConversationRecallFile = (file) =>
   isConversationRecallFileId(file?.file_id) &&
   file?.viventiumConversationRecallMode === CONVERSATION_RECALL_MODE_SOURCE_ONLY;
+
+/* === VIVENTIUM START ===
+ * Fix: Resolve the concrete active conversation for source-backed recall exclusion.
+ * Purpose: A new-chat request carries the placeholder "new" until BaseClient allocates its real
+ * thread id. The placeholder must not mask the concrete runnable thread id.
+ * === VIVENTIUM END === */
+const normalizeConcreteConversationId = (value) => {
+  const normalized = typeof value === 'string' ? value.trim() : '';
+  return normalized && normalized !== 'new' ? normalized : undefined;
+};
 
 const dedupeRecallResults = (results = []) => {
   const seen = new Set();
@@ -758,6 +886,20 @@ const normalizeRecallPromptEchoText = (value) =>
     .trim()
     .replace(/\s+/g, ' ');
 
+const isConversationRecallPromptEchoResult = ({ query, result }) => {
+  if (!isConversationRecallFileId(result?.file_id)) {
+    return false;
+  }
+  const normalizedQuery = normalizeRecallPromptEchoText(query);
+  if (normalizedQuery.length < 12) {
+    return false;
+  }
+  const snippetBody = String(result?.content || '')
+    .replace(/^\s*<turn\b[^>]*>\s*/i, '')
+    .replace(/\s*<\/turn>\s*$/i, '');
+  return normalizeRecallPromptEchoText(snippetBody) === normalizedQuery;
+};
+
 const isLongExactPromptEchoWithoutEvidence = ({
   message,
   content,
@@ -800,6 +942,185 @@ const buildConversationRecallSnippet = ({ message, content }) => {
   const conversation = message?.conversationId || 'unknown';
   return `<turn timestamp="${timestamp}" conversation="${conversation}" role="${role}">\n${content}\n</turn>`;
 };
+
+/* === VIVENTIUM START ===
+ * Feature: Bounded adjacent-turn context for source-backed recall.
+ * Purpose: Keep facts split across several short neighboring chat turns together without widening
+ * the global corpus or using prompt-specific matching.
+ * === VIVENTIUM END === */
+const CONVERSATION_RECALL_CONTEXT_WINDOW_MS = 5 * 60 * 1000;
+const CONVERSATION_RECALL_CONTEXT_MAX_TURNS = 7;
+const CONVERSATION_RECALL_CONTEXT_FETCH_LIMIT = 16;
+
+function buildConversationRecallContextSnippet({ message, content, nearbyMessages }) {
+  const createdAtMs = message?.createdAt ? new Date(message.createdAt).getTime() : NaN;
+  if (!message?.conversationId || !Number.isFinite(createdAtMs) || !Array.isArray(nearbyMessages)) {
+    return buildConversationRecallSnippet({ message, content });
+  }
+
+  const nearbyMessagesById = new Map();
+  for (const candidate of [...nearbyMessages, message]) {
+    const identity =
+      candidate?.messageId ||
+      `${candidate?.createdAt || ''}:${candidate?.isCreatedByUser ? 'user' : 'assistant'}:${
+        candidate?.text || ''
+      }`;
+    if (!nearbyMessagesById.has(identity)) {
+      nearbyMessagesById.set(identity, candidate);
+    }
+  }
+  const orderedNearbyMessages = orderRecallMessagesParentFirst(
+    Array.from(nearbyMessagesById.values()).sort(
+      (left, right) => new Date(left?.createdAt).getTime() - new Date(right?.createdAt).getTime(),
+    ),
+  );
+
+  const scopedNearbyMessages = orderedNearbyMessages.filter(
+    (candidate) => candidate?.conversationId === message.conversationId,
+  );
+  const recallDerivedParentIds = buildRecallDerivedParentIdSet(scopedNearbyMessages);
+  const eligibleMessages = scopedNearbyMessages.filter((candidate) => {
+    const candidateContent = getConversationRecallMessageText(candidate);
+    return !shouldSkipFromRecallCorpus({
+      message: candidate,
+      messageText: candidateContent,
+      isCreatedByUser: candidate?.isCreatedByUser,
+      hasRecallDerivedChild: recallDerivedParentIds.has(candidate?.messageId),
+    });
+  });
+  if (!eligibleMessages.length) {
+    return buildConversationRecallSnippet({ message, content });
+  }
+
+  let centerIndex = eligibleMessages.findIndex(
+    (candidate) => candidate?.messageId && candidate.messageId === message?.messageId,
+  );
+  if (centerIndex < 0) {
+    return buildConversationRecallSnippet({ message, content });
+  }
+
+  const halfWindow = Math.floor(CONVERSATION_RECALL_CONTEXT_MAX_TURNS / 2);
+  const start = Math.max(
+    0,
+    Math.min(
+      centerIndex - halfWindow,
+      eligibleMessages.length - CONVERSATION_RECALL_CONTEXT_MAX_TURNS,
+    ),
+  );
+  return eligibleMessages
+    .slice(start, start + CONVERSATION_RECALL_CONTEXT_MAX_TURNS)
+    .map((candidate) =>
+      buildConversationRecallSnippet({
+        message: candidate,
+        content: getConversationRecallMessageText(candidate),
+      }),
+    )
+    .join('\n');
+}
+
+/* === VIVENTIUM START ===
+ * Batch all selected source-match context windows into one bounded Mongo aggregate. The previous
+ * per-result before/after reads issued eight overlapping queries for the default four matches.
+ * Facets preserve the exact per-center 16-before/16-after bounds without letting one dense
+ * conversation starve another selected match.
+ * === VIVENTIUM END === */
+async function buildConversationRecallContextSnippets({ userId, selectedResults }) {
+  const facets = {};
+  const windowFilters = [];
+
+  selectedResults.forEach((result, index) => {
+    const message = result?.sourceMessage;
+    const createdAtMs = message?.createdAt ? new Date(message.createdAt).getTime() : NaN;
+    if (!message?.conversationId || !Number.isFinite(createdAtMs)) {
+      return;
+    }
+    const lower = new Date(createdAtMs - CONVERSATION_RECALL_CONTEXT_WINDOW_MS);
+    const center = new Date(createdAtMs);
+    const upper = new Date(createdAtMs + CONVERSATION_RECALL_CONTEXT_WINDOW_MS);
+    windowFilters.push({
+      conversationId: message.conversationId,
+      createdAt: { $gte: lower, $lte: upper },
+    });
+    facets[`before_${index}`] = [
+      {
+        $match: {
+          conversationId: message.conversationId,
+          createdAt: { $gte: lower, $lte: center },
+        },
+      },
+      { $sort: { createdAt: -1 } },
+      { $limit: CONVERSATION_RECALL_CONTEXT_FETCH_LIMIT },
+    ];
+    facets[`after_${index}`] = [
+      {
+        $match: {
+          conversationId: message.conversationId,
+          createdAt: { $gt: center, $lte: upper },
+        },
+      },
+      { $sort: { createdAt: 1 } },
+      { $limit: CONVERSATION_RECALL_CONTEXT_FETCH_LIMIT },
+    ];
+  });
+
+  let contextByFacet = {};
+  if (windowFilters.length > 0) {
+    try {
+      const aggregateResult = await Message.aggregate([
+        {
+          $match: {
+            user: userId,
+            unfinished: { $ne: true },
+            error: { $ne: true },
+            'metadata.viventium.type': { $ne: 'listen_only_transcript' },
+            'metadata.viventium.mode': { $ne: 'listen_only' },
+            'metadata.viventium.memoryEligible': { $ne: false },
+            'metadata.viventium.qaRun': { $ne: true },
+            $and: [
+              { $or: [{ expiredAt: { $exists: false } }, { expiredAt: null }] },
+              { $or: windowFilters },
+            ],
+          },
+        },
+        {
+          $project: {
+            messageId: 1,
+            parentMessageId: 1,
+            conversationId: 1,
+            createdAt: 1,
+            sender: 1,
+            isCreatedByUser: 1,
+            text: 1,
+            content: 1,
+            attachments: 1,
+            metadata: 1,
+          },
+        },
+        { $facet: facets },
+      ]);
+      contextByFacet = aggregateResult?.[0] || {};
+    } catch (error) {
+      logger.warn(`[${Tools.file_search}] batched conversation recall context expansion failed`, {
+        code: error?.code,
+        message: error?.message,
+      });
+    }
+  }
+
+  return selectedResults.map((result, index) => {
+    const before = Array.isArray(contextByFacet[`before_${index}`])
+      ? contextByFacet[`before_${index}`]
+      : [];
+    const after = Array.isArray(contextByFacet[`after_${index}`])
+      ? contextByFacet[`after_${index}`]
+      : [];
+    return buildConversationRecallContextSnippet({
+      message: result.sourceMessage,
+      content: result.sourceContent,
+      nearbyMessages: [...before, result.sourceMessage, ...after],
+    });
+  });
+}
 
 const buildScopedConversationIds = async ({ userId, recallFileId, currentConversationId }) => {
   const agentId = parseConversationRecallAgentIdFromFileId(recallFileId);
@@ -882,6 +1203,8 @@ async function searchConversationRecallSourceMatches({
       error: { $ne: true },
       'metadata.viventium.type': { $ne: 'listen_only_transcript' },
       'metadata.viventium.mode': { $ne: 'listen_only' },
+      'metadata.viventium.memoryEligible': { $ne: false },
+      'metadata.viventium.qaRun': { $ne: true },
       ...(scopedConversationIds ? { conversationId: scopedConversationIds } : {}),
       $or: [{ expiredAt: { $exists: false } }, { expiredAt: null }],
       $and: [
@@ -946,11 +1269,14 @@ async function searchConversationRecallSourceMatches({
         file_id: file.file_id,
         page: null,
         sourceKind: 'raw_message',
+        sourceRole: message?.isCreatedByUser === true ? 'user' : 'assistant',
         sourceRecallScore:
           literalMatchCount * 4 +
           termMatches +
           (queryLower.length >= 8 && contentLower.includes(queryLower) ? 2 : 0),
         createdAt: message?.createdAt ? new Date(message.createdAt).getTime() : 0,
+        sourceMessage: message,
+        sourceContent: content,
       });
 
       if (results.length >= maxMatches * 3) {
@@ -959,21 +1285,49 @@ async function searchConversationRecallSourceMatches({
     }
   }
 
-  return dedupeRecallResults(results)
+  const selectedResults = dedupeRecallResults(results)
     .sort((a, b) => {
       if ((b.sourceRecallScore || 0) !== (a.sourceRecallScore || 0)) {
         return (b.sourceRecallScore || 0) - (a.sourceRecallScore || 0);
       }
       return (b.createdAt || 0) - (a.createdAt || 0);
     })
-    .slice(0, maxMatches)
-    .map(({ sourceRecallScore, createdAt, ...result }) => result);
+    .slice(0, maxMatches);
+
+  const expandedContents = await buildConversationRecallContextSnippets({
+    userId,
+    selectedResults,
+  });
+
+  return selectedResults.map(
+    (
+      {
+        sourceRecallScore: _sourceRecallScore,
+        createdAt: _createdAt,
+        sourceMessage,
+        sourceContent,
+        ...result
+      },
+      index,
+    ) => {
+      const primaryContent = buildConversationRecallSnippet({
+        message: sourceMessage,
+        content: sourceContent,
+      });
+      return {
+        ...result,
+        primaryContent,
+        content: expandedContents[index],
+      };
+    },
+  );
 }
 
 const getConversationRecallRerankScore = ({ query, result, queryTerms }) => {
   const content = typeof result?.content === 'string' ? result.content : '';
   const contentLower = content.toLowerCase();
   const queryLower = String(query || '').toLowerCase();
+  const isPromptEcho = isConversationRecallPromptEchoResult({ query, result });
 
   let score = 1.0 - Number(result?.distance || 0);
   const termMatches = countTermMatches(contentLower, queryTerms);
@@ -988,7 +1342,7 @@ const getConversationRecallRerankScore = ({ query, result, queryTerms }) => {
     score += Math.min(1.8, metadataMatches * 0.3);
   }
 
-  if (queryLower.length >= 8 && contentLower.includes(queryLower)) {
+  if (!isPromptEcho && queryLower.length >= 8 && contentLower.includes(queryLower)) {
     score += 0.45;
   }
 
@@ -1000,12 +1354,30 @@ const getConversationRecallRerankScore = ({ query, result, queryTerms }) => {
     score += 0.9;
   }
 
+  /* === VIVENTIUM START ===
+   * Primary user-authored episodes outrank later assistant paraphrases when both match.
+   * This is provenance-based: assistant work remains searchable, but cannot displace the user's
+   * own account solely because it is shorter or newer.
+   * === VIVENTIUM END === */
+  if (result?.sourceKind === 'raw_message' && result?.sourceRole === 'user') {
+    score += 0.5;
+  }
+
   if (Number.isFinite(result?.recallFusionScore)) {
     score += Math.min(0.8, Number(result.recallFusionScore) * 24);
   }
 
   if (isAssistantMemoryDisclaimer(contentLower)) {
     score -= 1.25;
+  }
+
+  /* === VIVENTIUM START ===
+   * Fix: A verbatim copy of the active user question is provenance, not answer evidence.
+   * Keep it available at low priority, but never let exact-query overlap outrank a substantive
+   * result from chat history or another attached evidence corpus.
+   * === VIVENTIUM END === */
+  if (isPromptEcho) {
+    score -= 2;
   }
 
   return score;
@@ -1071,6 +1443,7 @@ const primeFiles = async (options) => {
     dbFiles = allFiles;
   }
 
+  dbFiles = overlayConversationRecallRuntimeState(dbFiles, resourceFiles);
   dbFiles = dedupeFilesById(dbFiles.concat(resourceFiles));
 
   let toolContext = `- Note: Semantic search is available through the ${Tools.file_search} tool but no files are currently loaded. Request the user to upload documents to search through.`;
@@ -1098,6 +1471,8 @@ const primeFiles = async (options) => {
       metadata: file.metadata,
       /* === VIVENTIUM END === */
       viventiumConversationRecallMode: file?.viventiumConversationRecallMode,
+      viventiumConversationRecallAttachmentReason:
+        file?.viventiumConversationRecallAttachmentReason,
       /* === VIVENTIUM START ===
        * Feature: Meeting transcript retrieval provenance
        */
@@ -1163,11 +1538,13 @@ const createFileSearchTool = async ({
       const literalCandidates = extractRecallLiteralCandidates(query);
       const recallFiles = files.filter((file) => isConversationRecallFileId(file?.file_id));
       const effectiveConversationId =
-        conversationId ||
-        runnableConfig?.configurable?.thread_id ||
-        runnableConfig?.configurable?.conversationId ||
-        runnableConfig?.configurable?.requestBody?.conversationId ||
-        runnableConfig?.metadata?.conversationId;
+        normalizeConcreteConversationId(conversationId) ||
+        normalizeConcreteConversationId(runnableConfig?.configurable?.thread_id) ||
+        normalizeConcreteConversationId(runnableConfig?.configurable?.conversationId) ||
+        normalizeConcreteConversationId(
+          runnableConfig?.configurable?.requestBody?.conversationId,
+        ) ||
+        normalizeConcreteConversationId(runnableConfig?.metadata?.conversationId);
       const effectiveActiveMessageId =
         activeMessageId ||
         runnableConfig?.configurable?.messageId ||
@@ -1395,6 +1772,10 @@ const createFileSearchTool = async ({
         sourceOutcome.status === 'fulfilled' ? sourceOutcome.value : [];
       const validResults = vectorOutcome.status === 'fulfilled' ? vectorOutcome.value : [];
       if (sourceOutcome.status === 'rejected') {
+        /* === VIVENTIUM START ===
+         * Count source-recall failures so an unavailable corpus cannot look like a successful no-match.
+         * === VIVENTIUM END === */
+        queryErrorCount += 1;
         logger.error(`[${Tools.file_search}] conversation recall lexical query failed`, {
           message: sourceOutcome.reason?.message,
           code: sourceOutcome.reason?.code,
@@ -1513,12 +1894,14 @@ const createFileSearchTool = async ({
             : isMeetingTranscriptFileId(result.file_id)
               ? getMeetingTranscriptFileSearchResultMaxChars()
               : getFileSearchResultMaxChars();
-        const content = isMeetingTranscriptInventoryFile({
-          file_id: result.file_id,
-          metadata: result.fileMetadata,
-        })
-          ? clipInventoryContent(result.content, resultMaxChars)
-          : clipContent(result.content, resultMaxChars);
+        const content = isConversationRecallFileId(result.file_id)
+          ? clipConversationRecallContent(result, resultMaxChars)
+          : isMeetingTranscriptInventoryFile({
+                file_id: result.file_id,
+                metadata: result.fileMetadata,
+              })
+            ? clipInventoryContent(result.content, resultMaxChars)
+            : clipContent(result.content, resultMaxChars);
         const modelContent = withMeetingTranscriptHeader(result, content);
         const displayRelevance = Number.isFinite(result?.recallRerankScore)
           ? result.recallRerankScore

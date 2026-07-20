@@ -1,5 +1,7 @@
 import mongoose from 'mongoose';
-import { v4 as uuidv4 } from 'uuid';
+// VIVENTIUM START: avoid relying on jest-junit's transitive uuid package in tests.
+import { randomUUID as uuidv4 } from 'node:crypto';
+// VIVENTIUM END
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import { EToolResources, FileContext } from 'librechat-data-provider';
 import { createFileMethods } from './file';

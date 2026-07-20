@@ -9,7 +9,7 @@ jest.mock('@librechat/data-schemas', () => ({
   },
 }));
 
-jest.mock('@langchain/core/tools', () => ({
+jest.mock('@librechat/agents/langchain/tools', () => ({
   tool: jest.fn((fn, config) => {
     const toolInstance = { _call: fn, ...config };
     return toolInstance;

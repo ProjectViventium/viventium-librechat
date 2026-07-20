@@ -7,6 +7,12 @@ const { getAppConfig } = require('~/server/services/Config/app');
 const { getProjectByName } = require('~/models/Project');
 const { getLogStores } = require('~/cache');
 const { isBrowserRegistrationOpen } = require('~/server/services/viventium/registrationGate');
+// VIVENTIUM START
+// Purpose: Project the account-setup capability without requiring a provider secret sentinel.
+const {
+  isConnectedAccountsCapabilityEnabled,
+} = require('~/server/services/viventium/connectedAccountsCapability');
+// VIVENTIUM END
 
 const router = express.Router();
 const emailLoginEnabled =
@@ -116,10 +122,7 @@ router.get('/', async function (req, res) {
        * Feature: Local credential setup.
        * Purpose: Gate the novice-facing OpenAI/Anthropic credential setup surface.
        * === VIVENTIUM END === */
-      viventiumConnectedAccountsEnabled:
-        isEnabled(process.env.VIVENTIUM_LOCAL_SUBSCRIPTION_AUTH) ||
-        process.env.OPENAI_API_KEY === 'user_provided' ||
-        process.env.ANTHROPIC_API_KEY === 'user_provided',
+      viventiumConnectedAccountsEnabled: isConnectedAccountsCapabilityEnabled(),
       /* === VIVENTIUM START ===
        * Feature: Experimental direct subscription authentication.
        * Purpose: Expose the explicit opt-in separately from the stable API-key setup surface.

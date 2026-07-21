@@ -1,3 +1,5 @@
+// VIVENTIUM START — Browser-only compatibility adapter derived from react-remove-scroll-bar.
+// Attribution and exact upstream legal records: ./scrollBarAdapter.NOTICE.md
 import { useLayoutEffect } from 'react';
 
 export const zeroRightClassName = 'right-scroll-bar-position';
@@ -82,3 +84,4 @@ export function RemoveScrollBar({
 
   return null;
 }
+// VIVENTIUM END

@@ -1,3 +1,5 @@
+// VIVENTIUM START — Browser-only compatibility adapter derived from use-composed-ref.
+// Attribution and exact upstream MIT declaration: ./useComposedRefAdapter.NOTICE.md
 import { useCallback } from 'react';
 import type { MutableRefObject, Ref } from 'react';
 
@@ -22,3 +24,4 @@ export default function useComposedRef<T>(
     [externalRef, internalRef],
   );
 }
+// VIVENTIUM END

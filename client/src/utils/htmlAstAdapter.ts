@@ -1,3 +1,5 @@
+// VIVENTIUM START — Browser-only compatibility adapter derived from html-parse-stringify.
+// Attribution and exact upstream legal records: ./htmlAstAdapter.NOTICE.md
 type Attributes = Record<string, string>;
 
 export type HtmlAstNode =
@@ -181,3 +183,4 @@ export function stringify(ast: HtmlAstNode[]) {
 }
 
 export default { parse, stringify };
+// VIVENTIUM END

@@ -37,8 +37,13 @@ test('pins source, package, container, devcontainer, and CI to Node 24.16.0', ()
     [...read('Dockerfile.multi').matchAll(/ARG NODE_MAX_OLD_SPACE_SIZE=(\d+)/g)].map(
       (match) => match[1],
     ),
-    ['4096', '4096'],
-    'Docker client builds must fit alongside sibling stages in an 8 GiB builder',
+    ['2560', '2560'],
+    'Docker client builds must fit beside supported services in an 8 GiB builder',
+  );
+  assert.match(
+    read('Dockerfile'),
+    /ARG NODE_MAX_OLD_SPACE_SIZE=2560/,
+    'The legacy Docker entrypoint must use the same loaded-machine-safe heap budget',
   );
   assert.match(
     read('.devcontainer/Dockerfile'),
@@ -151,6 +156,36 @@ test('Docker API image ships the generated legal compliance bundle at a stable p
   const buildScript = json('client/package.json').scripts.build;
   assert.match(buildScript, /collect-browser-compliance\.cjs --verify/);
   assert.ok(fs.statSync(path.join(ROOT, 'scripts/verify-viventium-docker-image.cjs')).isFile());
+
+  const overrides = json('client/third_party/browser-compliance/overrides.json');
+  assert.deepEqual(
+    overrides.vendoredAdapters.map(({ id, upstreamPackage, upstreamVersion }) => ({
+      id,
+      upstreamPackage,
+      upstreamVersion,
+    })),
+    [
+      {
+        id: 'react-remove-scroll-bar-adapter',
+        upstreamPackage: 'react-remove-scroll-bar',
+        upstreamVersion: '2.3.8',
+      },
+      {
+        id: 'use-composed-ref-adapter',
+        upstreamPackage: 'use-composed-ref',
+        upstreamVersion: '1.4.0',
+      },
+      {
+        id: 'html-parse-stringify-adapter',
+        upstreamPackage: 'html-parse-stringify',
+        upstreamVersion: '3.0.1',
+      },
+    ],
+  );
+  const imageVerifier = read('scripts/verify-viventium-docker-image.cjs');
+  for (const adapter of overrides.vendoredAdapters) {
+    assert.match(imageVerifier, new RegExp(adapter.id));
+  }
 });
 
 test('Docker build contexts exclude personal runtime state without excluding source assets', () => {

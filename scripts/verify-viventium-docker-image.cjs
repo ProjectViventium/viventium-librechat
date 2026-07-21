@@ -13,6 +13,7 @@ if (!image || !/^[A-Za-z0-9._/:@-]+$/.test(image)) {
 }
 
 const verifier = String.raw`
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 if (process.version !== 'v24.16.0') throw new Error('unexpected Node runtime: ' + process.version);
@@ -39,6 +40,34 @@ for (const required of [manifestPath, closurePath]) {
 const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
 if (!Array.isArray(manifest.packages) || manifest.packages.length < 400) {
   throw new Error('compliance package inventory is incomplete');
+}
+const requiredAdapters = new Map([
+  ['react-remove-scroll-bar-adapter', ['react-remove-scroll-bar', '2.3.8']],
+  ['use-composed-ref-adapter', ['use-composed-ref', '1.4.0']],
+  ['html-parse-stringify-adapter', ['html-parse-stringify', '3.0.1']],
+]);
+for (const [id, [upstreamPackage, upstreamVersion]] of requiredAdapters) {
+  const adapter = manifest.vendoredComponents?.find((component) => component.id === id);
+  if (
+    !adapter ||
+    adapter.upstreamPackage !== upstreamPackage ||
+    adapter.upstreamVersion !== upstreamVersion ||
+    adapter.license !== 'MIT' ||
+    adapter.modified !== true ||
+    !adapter.notice ||
+    !Array.isArray(adapter.legalFiles) ||
+    adapter.legalFiles.length === 0
+  ) {
+    throw new Error('missing shipped browser adapter attribution: ' + id);
+  }
+  for (const record of [adapter.notice, ...adapter.legalFiles]) {
+    const absolutePath = path.resolve(root, record.path);
+    if (!absolutePath.startsWith(root + path.sep) || !fs.statSync(absolutePath).isFile()) {
+      throw new Error('unsafe or missing browser adapter legal file: ' + id);
+    }
+    const digest = crypto.createHash('sha256').update(fs.readFileSync(absolutePath)).digest('hex');
+    if (digest !== record.sha256) throw new Error('browser adapter legal hash drift: ' + id);
+  }
 }
 let files = 0;
 let legalFiles = 0;

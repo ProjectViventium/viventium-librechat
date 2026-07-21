@@ -44,7 +44,7 @@ describe('browser compliance collector', () => {
     );
     curatedOverrides.sources.forEach((source) => {
       expect(() => validateCuratedSource(source)).not.toThrow();
-      expect(curatedFileName(source)).toMatch(/^(?:LICENSE|NOTICE)\.curated\./);
+      expect(curatedFileName(source)).toMatch(/^(?:LICENSE(?:-DECLARATION)?|NOTICE)\.curated\./);
     });
     curatedOverrides.packageOverrides.forEach((packageOverride) => {
       expect(packageOverride.lockPath).not.toContain('*');
@@ -52,6 +52,25 @@ describe('browser compliance collector', () => {
       expect(packageOverride.resolved).toMatch(/^https:\/\/registry\.npmjs\.org\//);
       expect(packageOverride.integrity).toMatch(/^sha512-/);
     });
+  });
+
+  it('requires shipped attribution records for every browser compatibility adapter', () => {
+    const expectedAdapters = new Map([
+      ['react-remove-scroll-bar', '2.3.8'],
+      ['use-composed-ref', '1.4.0'],
+      ['html-parse-stringify', '3.0.1'],
+    ]);
+
+    expect(curatedOverrides.vendoredAdapters).toHaveLength(expectedAdapters.size);
+    curatedOverrides.vendoredAdapters.forEach((adapter) => {
+      expect(expectedAdapters.get(adapter.upstreamPackage)).toBe(adapter.upstreamVersion);
+      expect(adapter.modified).toBe(true);
+      expect(adapter.license).toBe('MIT');
+      expect(adapter.noticeFile).toMatch(/\.NOTICE\.md$/);
+      expect(adapter.legalSourceIds).not.toHaveLength(0);
+      expectedAdapters.delete(adapter.upstreamPackage);
+    });
+    expect([...expectedAdapters.keys()]).toEqual([]);
   });
 
   it('rejects curated identity and shipped provenance drift', () => {

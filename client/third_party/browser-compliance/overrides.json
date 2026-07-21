@@ -200,6 +200,36 @@
       "sha256": "cb992262f361a5359e6771c28740d33c7041e15332ae8537fae40538992591a9",
       "contentRole": "license",
       "provenance": "exact-package-revision"
+    },
+    {
+      "id": "react-remove-scroll-bar-license",
+      "repository": "https://github.com/theKashey/react-remove-scroll-bar",
+      "revision": "8ca9ba5ea52de03308fe8ced94f7b159a44d28ff",
+      "sourcePath": "LICENSE",
+      "localFile": "react-remove-scroll-bar-LICENSE.txt",
+      "sha256": "a79aae0c0f21990d9d963bb3c5a79cdcea9a46f8523ba55c58d7fe776b6ebc84",
+      "contentRole": "license",
+      "provenance": "exact-upstream-revision"
+    },
+    {
+      "id": "use-composed-ref-mit-declaration",
+      "repository": "https://github.com/Andarist/use-composed-ref",
+      "revision": "ea2c9d969f2f90a349f4c99338b806423824cea2",
+      "sourcePath": "package.json",
+      "localFile": "use-composed-ref-package.json",
+      "sha256": "f1bb61c939b089aa90f631b513f14c7d2eaff3093395634365243127f2ba8547",
+      "contentRole": "license-declaration",
+      "provenance": "exact-package-revision"
+    },
+    {
+      "id": "html-parse-stringify-license",
+      "repository": "https://github.com/henrikjoreteg/html-parse-stringify",
+      "revision": "a2659e6eac3603ba8b46958e0bd35b337108261f",
+      "sourcePath": "LICENSE",
+      "localFile": "html-parse-stringify-LICENSE.txt",
+      "sha256": "f51aa7a410f3d3ff9352a5422b76c072588ac76b63861f59447502caeacacc16",
+      "contentRole": "license",
+      "provenance": "exact-upstream-revision"
     }
   ],
   "packageOverrides": [
@@ -673,6 +703,56 @@
           "integrity": "sha512-ImicSAG+lTotAe5izcs1fz49Zk48w7pDusqYg04WaPhCoej8BJ24soMu3iLXIrsi273s4P1gZrYGrqReMfgEEA=="
         }
       ]
+    }
+  ],
+  "vendoredAdapters": [
+    {
+      "id": "react-remove-scroll-bar-adapter",
+      "name": "Viventium react-remove-scroll-bar browser adapter",
+      "lockPath": "node_modules/react-remove-scroll-bar",
+      "upstreamPackage": "react-remove-scroll-bar",
+      "upstreamVersion": "2.3.8",
+      "resolved": "https://registry.npmjs.org/react-remove-scroll-bar/-/react-remove-scroll-bar-2.3.8.tgz",
+      "integrity": "sha512-9r+yi9+mgU33AKcj6IbT9oRCO78WriSj6t/cF8DWBZJ9aOGPOTEDvdUDz1FwKim7QXWwmHqtdHnRJfhAxEG46Q==",
+      "license": "MIT",
+      "modified": true,
+      "sourceFile": "src/utils/scrollBarAdapter.tsx",
+      "sourceSha256": "1ab04f643fa0efba19bb935e01ba435cdfb636aff45bc5e14891c3f978a15e9b",
+      "noticeFile": "src/utils/scrollBarAdapter.NOTICE.md",
+      "noticeSha256": "fcc016446a5875c994dd0a0707f3ce708f6ab908687f5d03bfe41447cde021c2",
+      "legalSourceIds": ["react-remove-scroll-bar-license"]
+    },
+    {
+      "id": "use-composed-ref-adapter",
+      "name": "Viventium use-composed-ref browser adapter",
+      "lockPath": "node_modules/use-composed-ref",
+      "upstreamPackage": "use-composed-ref",
+      "upstreamVersion": "1.4.0",
+      "resolved": "https://registry.npmjs.org/use-composed-ref/-/use-composed-ref-1.4.0.tgz",
+      "integrity": "sha512-djviaxuOOh7wkj0paeO1Q/4wMZ8Zrnag5H6yBvzN7AKKe8beOaED9SF5/ByLqsku8NP4zQqsvM2u3ew/tJK8/w==",
+      "license": "MIT",
+      "modified": true,
+      "sourceFile": "src/utils/useComposedRefAdapter.ts",
+      "sourceSha256": "7f2137ac298ddb586d4aee6ce8f1c7b0c0b607f7ee10b292821dcff87567621d",
+      "noticeFile": "src/utils/useComposedRefAdapter.NOTICE.md",
+      "noticeSha256": "7f4200c7b27267053bec4416ce2c714f1e54a33fb271382abfbf54d999127570",
+      "legalSourceIds": ["use-composed-ref-mit-declaration"]
+    },
+    {
+      "id": "html-parse-stringify-adapter",
+      "name": "Viventium html-parse-stringify browser adapter",
+      "lockPath": "node_modules/html-parse-stringify",
+      "upstreamPackage": "html-parse-stringify",
+      "upstreamVersion": "3.0.1",
+      "resolved": "https://registry.npmjs.org/html-parse-stringify/-/html-parse-stringify-3.0.1.tgz",
+      "integrity": "sha512-KknJ50kTInJ7qIScF3jeaFRpMpE8/lfiTdzf/twXyPBLAGrLRTmkz3AdTnKeh40X8k9L2fdYwEp/42WGXIRGcg==",
+      "license": "MIT",
+      "modified": true,
+      "sourceFile": "src/utils/htmlAstAdapter.ts",
+      "sourceSha256": "af7203589d2db7b61657bd2f4f4c7d47a25120c84fd53482d2df09afd8d26cb5",
+      "noticeFile": "src/utils/htmlAstAdapter.NOTICE.md",
+      "noticeSha256": "d209e3f24adad9596f60b125fd0c60c35efb399b2ef8f6bea22dbe837eda3b82",
+      "legalSourceIds": ["html-parse-stringify-license"]
     }
   ]
 }

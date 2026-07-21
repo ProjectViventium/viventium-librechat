@@ -183,8 +183,10 @@ function validateCuratedSource(source) {
     typeof source.localFile !== 'string' ||
     source.localFile.length === 0 ||
     !sha256Pattern.test(source.sha256) ||
-    !['license', 'license-text-in-readme', 'notice'].includes(source.contentRole) ||
-    source.provenance !== 'exact-package-revision'
+    !['license', 'license-declaration', 'license-text-in-readme', 'notice'].includes(
+      source.contentRole,
+    ) ||
+    !['exact-package-revision', 'exact-upstream-revision'].includes(source.provenance)
   ) {
     throw new Error('Curated browser legal source metadata is incomplete or ambiguous');
   }
@@ -215,7 +217,8 @@ function loadCuratedOverrides(packageLock, closureLockPaths) {
     overrides.schemaVersion !== 1 ||
     !Array.isArray(overrides.sources) ||
     !Array.isArray(overrides.packageOverrides) ||
-    !Array.isArray(overrides.supplementalNotices)
+    !Array.isArray(overrides.supplementalNotices) ||
+    !Array.isArray(overrides.vendoredAdapters)
   ) {
     throw new Error('Curated browser compliance overrides have an unsupported schema');
   }
@@ -249,7 +252,8 @@ function loadCuratedOverrides(packageLock, closureLockPaths) {
       typeof packageOverride.license !== 'string' ||
       packageOverride.license.length === 0 ||
       !sources.has(packageOverride.legalSourceId) ||
-      sources.get(packageOverride.legalSourceId).contentRole === 'notice'
+      sources.get(packageOverride.legalSourceId).contentRole === 'notice' ||
+      sources.get(packageOverride.legalSourceId).provenance !== 'exact-package-revision'
     ) {
       throw new Error(`Curated package override is incomplete: ${packageOverride.lockPath}`);
     }
@@ -280,22 +284,106 @@ function loadCuratedOverrides(packageLock, closureLockPaths) {
     }
   }
 
+  const vendoredAdapters = new Map();
+  for (const adapter of overrides.vendoredAdapters) {
+    assertSafeLockPath(adapter?.lockPath);
+    const lockEntry = packageLock.packages?.[adapter.lockPath];
+    const packageMetadata = readJson(
+      path.join(repositoryRoot, adapter.lockPath, 'package.json'),
+      `Vendored browser adapter package metadata for ${adapter?.lockPath}`,
+    );
+    if (
+      typeof adapter.id !== 'string' ||
+      !/^[a-z0-9][a-z0-9.-]*$/.test(adapter.id) ||
+      vendoredAdapters.has(adapter.id) ||
+      typeof adapter.name !== 'string' ||
+      typeof adapter.upstreamPackage !== 'string' ||
+      adapter.upstreamPackage !== packageMetadata.name ||
+      adapter.upstreamVersion !== lockEntry?.version ||
+      adapter.upstreamVersion !== packageMetadata.version ||
+      adapter.resolved !== lockEntry?.resolved ||
+      adapter.integrity !== lockEntry?.integrity ||
+      adapter.license !== 'MIT' ||
+      adapter.modified !== true ||
+      typeof adapter.sourceFile !== 'string' ||
+      !sha256Pattern.test(adapter.sourceSha256) ||
+      typeof adapter.noticeFile !== 'string' ||
+      !adapter.noticeFile.endsWith('.NOTICE.md') ||
+      !sha256Pattern.test(adapter.noticeSha256) ||
+      !Array.isArray(adapter.legalSourceIds) ||
+      adapter.legalSourceIds.length === 0 ||
+      new Set(adapter.legalSourceIds).size !== adapter.legalSourceIds.length ||
+      adapter.legalSourceIds.some((sourceId) => !sources.has(sourceId))
+    ) {
+      throw new Error('Curated vendored browser adapter metadata is incomplete or ambiguous');
+    }
+    assertSafeCompliancePath(adapter.sourceFile);
+    assertSafeCompliancePath(adapter.noticeFile);
+    for (const [filePath, expectedSha256, label] of [
+      [path.join(clientRoot, adapter.sourceFile), adapter.sourceSha256, 'source'],
+      [path.join(clientRoot, adapter.noticeFile), adapter.noticeSha256, 'notice'],
+    ]) {
+      const stat = fs.lstatSync(filePath);
+      const bytes = fs.readFileSync(filePath);
+      if (!stat.isFile() || stat.isSymbolicLink() || sha256(bytes) !== expectedSha256) {
+        throw new Error(`Curated vendored browser adapter ${adapter.id} ${label} drifted`);
+      }
+    }
+    vendoredAdapters.set(adapter.id, adapter);
+  }
+
   const referencedSourceIds = new Set([
     ...[...packageOverrides.values()].map((entry) => entry.legalSourceId),
     ...[...supplementalNotices.values()].map((entry) => entry.source.id),
+    ...[...vendoredAdapters.values()].flatMap((entry) => entry.legalSourceIds),
   ]);
   for (const sourceId of sources.keys()) {
     if (!referencedSourceIds.has(sourceId)) {
       throw new Error(`Curated browser legal source is unreferenced: ${sourceId}`);
     }
   }
-  return { packageOverrides, supplementalNotices, sources };
+  return { packageOverrides, supplementalNotices, sources, vendoredAdapters };
 }
 
 function curatedFileName(source) {
   const extension = source.sourcePath.toLowerCase().endsWith('.md') ? '.md' : '.txt';
-  const prefix = source.contentRole === 'notice' ? 'NOTICE' : 'LICENSE';
+  const prefix =
+    source.contentRole === 'notice'
+      ? 'NOTICE'
+      : source.contentRole === 'license-declaration'
+        ? 'LICENSE-DECLARATION'
+        : 'LICENSE';
   return `${prefix}.curated.${source.id}${extension}`;
+}
+
+function copyVendoredBrowserAdapter(adapter, curatedOverrides) {
+  const destinationDirectory = `vendored/${adapter.id}`;
+  const notice = copyAndHash(
+    path.join(clientRoot, adapter.noticeFile),
+    `${destinationDirectory}/NOTICE.md`,
+  );
+  if (notice.sha256 !== adapter.noticeSha256) {
+    throw new Error(`Vendored browser adapter ${adapter.id} notice changed while copying`);
+  }
+  const legalFiles = adapter.legalSourceIds.map((sourceId) =>
+    copyCuratedSource(curatedOverrides.sources.get(sourceId), destinationDirectory),
+  );
+  return {
+    id: adapter.id,
+    name: adapter.name,
+    upstreamPackage: adapter.upstreamPackage,
+    upstreamVersion: adapter.upstreamVersion,
+    upstreamResolved: adapter.resolved,
+    upstreamIntegrity: adapter.integrity,
+    license: adapter.license,
+    modified: adapter.modified,
+    notice,
+    legalFiles,
+    sourceIdentity: {
+      path: adapter.sourceFile,
+      sha256: adapter.sourceSha256,
+    },
+  };
 }
 
 function copyCuratedSource(source, destinationDirectory) {
@@ -488,6 +576,7 @@ function collect() {
       throw new Error('Prepared Sandpack runtime does not match its pinned shipped identity');
     }
     manifest.vendoredComponents.push({
+      id: 'sandpack-client-adapter',
       name: 'Viventium Sandpack browser adapter',
       upstreamPackage: '@codesandbox/sandpack-client',
       upstreamVersion: sandpackLockEntry.version,
@@ -512,6 +601,18 @@ function collect() {
       lockPath: 'vendored/sandpack-client-adapter',
       reason: error instanceof Error ? error.message : String(error),
     });
+  }
+
+
+  for (const adapter of curatedOverrides.vendoredAdapters.values()) {
+    try {
+      manifest.vendoredComponents.push(copyVendoredBrowserAdapter(adapter, curatedOverrides));
+    } catch (error) {
+      failures.push({
+        lockPath: `vendored/${adapter.id}`,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   if (failures.length > 0) {
@@ -678,12 +779,18 @@ function verifyShipped() {
     }
   }
 
-  if (!Array.isArray(manifest.vendoredComponents) || manifest.vendoredComponents.length !== 1) {
-    throw new Error('Shipped compliance is missing its single vendored component record');
+  if (
+    !Array.isArray(manifest.vendoredComponents) ||
+    manifest.vendoredComponents.length !== curatedOverrides.vendoredAdapters.size + 1
+  ) {
+    throw new Error('Shipped compliance has an incomplete vendored component set');
   }
-  const vendored = manifest.vendoredComponents[0];
+  const vendored = manifest.vendoredComponents.find(
+    (component) => component.id === 'sandpack-client-adapter',
+  );
   const sandpackLock = packageLock.packages?.['node_modules/@codesandbox/sandpack-client'];
   if (
+    !vendored ||
     vendored.name !== 'Viventium Sandpack browser adapter' ||
     vendored.upstreamPackage !== '@codesandbox/sandpack-client' ||
     vendored.upstreamVersion !== sandpackLock?.version ||
@@ -738,6 +845,45 @@ function verifyShipped() {
     clientRoot + '/dist',
   );
   fileRecords.push(vendored.notice, vendored.runtimePrivacyNotice, ...vendored.legalFiles);
+
+  for (const adapter of curatedOverrides.vendoredAdapters.values()) {
+    const shippedAdapter = manifest.vendoredComponents.find(
+      (component) => component.id === adapter.id,
+    );
+    const expectedDirectory = `vendored/${adapter.id}`;
+    if (
+      !shippedAdapter ||
+      shippedAdapter.name !== adapter.name ||
+      shippedAdapter.upstreamPackage !== adapter.upstreamPackage ||
+      shippedAdapter.upstreamVersion !== adapter.upstreamVersion ||
+      shippedAdapter.upstreamResolved !== adapter.resolved ||
+      shippedAdapter.upstreamIntegrity !== adapter.integrity ||
+      shippedAdapter.license !== adapter.license ||
+      shippedAdapter.modified !== true ||
+      shippedAdapter.notice?.path !== `${expectedDirectory}/NOTICE.md` ||
+      shippedAdapter.notice?.sha256 !== adapter.noticeSha256 ||
+      shippedAdapter.sourceIdentity?.path !== adapter.sourceFile ||
+      shippedAdapter.sourceIdentity?.sha256 !== adapter.sourceSha256 ||
+      !Array.isArray(shippedAdapter.legalFiles) ||
+      shippedAdapter.legalFiles.length !== adapter.legalSourceIds.length
+    ) {
+      throw new Error(`Shipped vendored browser adapter mismatch for ${adapter.id}`);
+    }
+    const sourceBytes = fs.readFileSync(path.join(clientRoot, adapter.sourceFile));
+    if (sha256(sourceBytes) !== shippedAdapter.sourceIdentity.sha256) {
+      throw new Error(`Shipped vendored browser adapter source drift for ${adapter.id}`);
+    }
+    verifyFileRecord(shippedAdapter.notice, `vendored browser adapter notice for ${adapter.id}`);
+    for (const sourceId of adapter.legalSourceIds) {
+      const source = curatedOverrides.sources.get(sourceId);
+      const legalFile = shippedAdapter.legalFiles.find(
+        (file) => file.provenance?.sourceId === sourceId,
+      );
+      assertCuratedFileRecord(legalFile, source, expectedDirectory, adapter.id);
+      verifyFileRecord(legalFile, `vendored browser adapter legal file for ${adapter.id}`);
+    }
+    fileRecords.push(shippedAdapter.notice, ...shippedAdapter.legalFiles);
+  }
 
   if (new Set(fileRecords.map((fileRecord) => fileRecord.path)).size !== fileRecords.length) {
     throw new Error('Shipped compliance contains duplicate legal-file destinations');

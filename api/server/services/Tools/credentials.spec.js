@@ -47,4 +47,15 @@ describe('loadAuthValues', () => {
 
     expect(mockGetUserPluginAuthValue).toHaveBeenCalledWith('user-1', 'REQUIRED_TOOL_KEY', true);
   });
+
+  test('skips an unavailable auth-field capability without throwing or querying storage', async () => {
+    const result = await loadAuthValues({
+      userId: 'new-user',
+      authFields: [undefined],
+      throwError: false,
+    });
+
+    expect(result).toEqual({});
+    expect(mockGetUserPluginAuthValue).not.toHaveBeenCalled();
+  });
 });

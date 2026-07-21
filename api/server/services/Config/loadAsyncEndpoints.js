@@ -1,4 +1,5 @@
 const path = require('path');
+const fs = require('fs');
 const { logger } = require('@librechat/data-schemas');
 const { loadServiceKey, isUserProvided } = require('@librechat/api');
 const { config } = require('./EndpointService');
@@ -18,12 +19,20 @@ async function loadAsyncEndpoints() {
     const serviceKeyPath =
       process.env.GOOGLE_SERVICE_KEY_FILE || path.join(__dirname, '../../..', 'data', 'auth.json');
 
-    try {
-      serviceKey = await loadServiceKey(serviceKeyPath);
-    } catch (error) {
-      logger.error('Error loading service key', error);
-      serviceKey = null;
+    /* === VIVENTIUM START ===
+     * Feature: Quiet, truthful pristine-install auth discovery.
+     * Purpose: The optional implicit auth.json is not a requirement and must not be probed/logged
+     * when absent. An explicitly configured path is still loaded so real misconfiguration remains visible.
+     */
+    if (process.env.GOOGLE_SERVICE_KEY_FILE || fs.existsSync(serviceKeyPath)) {
+      try {
+        serviceKey = await loadServiceKey(serviceKeyPath);
+      } catch (error) {
+        logger.error('Error loading service key', error);
+        serviceKey = null;
+      }
     }
+    /* === VIVENTIUM END === */
   }
 
   const google = serviceKey || isGoogleKeyProvided ? { userProvide: googleUserProvides } : false;

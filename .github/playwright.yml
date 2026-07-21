@@ -1,7 +1,7 @@
 # name: Playwright Tests
 # on:
 #   pull_request:
-#     branches: 
+#     branches:
 #       - main
 #       - dev
 #       - release/*
@@ -37,10 +37,12 @@
 #       TITLE_CONVO: false
 #     steps:
 #       - uses: actions/checkout@v4
+#       # VIVENTIUM START — exact release toolchain if this workflow is re-enabled.
 #       - uses: actions/setup-node@v4
 #         with:
-#           node-version: 18
+#           node-version: 24.16.0
 #           cache: 'npm'
+#       # VIVENTIUM END
 
 #       - name: Install global dependencies
 #         run: npm ci

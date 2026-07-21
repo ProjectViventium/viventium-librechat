@@ -7,6 +7,7 @@ import {
   isHeicContainer,
   isNativeHeicRequestAllowed,
   NativeHeicError,
+  scavengeNativeHeicTemporaryFiles,
 } from './nativeHeic';
 import type { Request, Response } from 'express';
 
@@ -156,7 +157,7 @@ describe('Native HEIC converter', () => {
     ).resolves.toEqual([]);
   });
 
-  test('fails closed when temporary files cannot be removed', async () => {
+  test('retries transient cleanup failures without leaking temporary files', async () => {
     let removalAttempts = 0;
     const convert = createNativeHeicConverter({
       run: async (_executable, args) => {
@@ -175,12 +176,61 @@ describe('Native HEIC converter', () => {
       },
     });
 
-    await expect(convert(heic, appSupportDirectory)).rejects.toMatchObject({
-      code: 'unsafe_runtime',
-    });
     await expect(convert(heic, appSupportDirectory)).resolves.toEqual(
       Buffer.from([0xff, 0xd8, 0xff, 0xd9]),
     );
+    expect(removalAttempts).toBe(2);
+    await expect(
+      fs.readdir(path.join(appSupportDirectory, 'runtime', 'heic-tmp')),
+    ).resolves.toEqual([]);
+  });
+
+  test('startup scavenging removes a conversion directory abandoned by a crashed process', async () => {
+    const temporaryRoot = path.join(appSupportDirectory, 'runtime', 'heic-tmp');
+    const abandoned = path.join(temporaryRoot, 'conversion-abandoned');
+    await fs.mkdir(abandoned, { recursive: true, mode: 0o700 });
+    await fs.writeFile(path.join(abandoned, 'input.heic'), heic, { mode: 0o600 });
+
+    await scavengeNativeHeicTemporaryFiles(appSupportDirectory, { minimumAgeMs: 0 });
+
+    await expect(fs.readdir(temporaryRoot)).resolves.toEqual([]);
+  });
+
+  test('startup recovery removes files left after all in-process cleanup retries fail', async () => {
+    const convert = createNativeHeicConverter({
+      run: async (_executable, args) => {
+        if (args[0] === '-g') {
+          return { stdout: 'pixelWidth: 2\npixelHeight: 2\n', stderr: '' };
+        }
+        await fs.writeFile(args[args.length - 1], Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+        return { stdout: '', stderr: '' };
+      },
+      removeTemporaryDirectory: async () => {
+        throw new Error('synthetic persistent cleanup failure');
+      },
+    });
+
+    await expect(convert(heic, appSupportDirectory)).rejects.toMatchObject({
+      code: 'unsafe_runtime',
+    });
+    await scavengeNativeHeicTemporaryFiles(appSupportDirectory, { minimumAgeMs: 0 });
+
+    await expect(
+      fs.readdir(path.join(appSupportDirectory, 'runtime', 'heic-tmp')),
+    ).resolves.toEqual([]);
+  });
+
+  test('fails closed at the bounded startup scan limit instead of traversing arbitrary state', async () => {
+    const temporaryRoot = path.join(appSupportDirectory, 'runtime', 'heic-tmp');
+    await fs.mkdir(path.join(temporaryRoot, 'conversion-one'), { recursive: true, mode: 0o700 });
+    await fs.mkdir(path.join(temporaryRoot, 'conversion-two'), { recursive: true, mode: 0o700 });
+
+    await expect(
+      scavengeNativeHeicTemporaryFiles(appSupportDirectory, {
+        maxEntries: 1,
+        minimumAgeMs: 0,
+      }),
+    ).rejects.toMatchObject({ code: 'unsafe_runtime' });
   });
 
   test('bounds concurrent conversion without queueing extra work', async () => {
@@ -273,6 +323,58 @@ describe('Native HEIC HTTP handler', () => {
     expect(response.status).toHaveBeenCalledWith(200);
     expect(response.send).toHaveBeenCalledWith(output);
   });
+
+  test.each(['', 'application/octet-stream'])(
+    'accepts signature-verified HEIC when upload MIME is %j',
+    async (mimetype) => {
+      const response = createResponse();
+      const output = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+      const convert = jest.fn(async () => output);
+      const handler = createNativeHeicHandler({
+        platform: 'darwin',
+        environment: nativeEnvironment,
+        verifySocket: async () => true,
+        convert,
+      });
+
+      await handler(
+        createRequest({
+          file: { buffer: heic, mimetype, size: heic.length },
+        }) as unknown as Request,
+        response as unknown as Response,
+      );
+
+      expect(convert).toHaveBeenCalledWith(heic, '/private');
+      expect(response.status).toHaveBeenCalledWith(200);
+      expect(response.send).toHaveBeenCalledWith(output);
+    },
+  );
+
+  test.each(['', 'application/octet-stream'])(
+    'rejects %j uploads without a verified HEIC/HEIF signature',
+    async (mimetype) => {
+      const response = createResponse();
+      const convert = jest.fn();
+      const handler = createNativeHeicHandler({
+        platform: 'darwin',
+        environment: nativeEnvironment,
+        verifySocket: async () => true,
+        convert,
+      });
+      const invalid = Buffer.from('not-a-heic-container');
+
+      await handler(
+        createRequest({
+          file: { buffer: invalid, mimetype, size: invalid.length },
+        }) as unknown as Request,
+        response as unknown as Response,
+      );
+
+      expect(convert).not.toHaveBeenCalled();
+      expect(response.status).toHaveBeenCalledWith(400);
+      expect(response.json).toHaveBeenCalledWith({ code: 'invalid_heic' });
+    },
+  );
 
   test('does not invoke conversion when the socket or local origin is unverified', async () => {
     const response = createResponse();

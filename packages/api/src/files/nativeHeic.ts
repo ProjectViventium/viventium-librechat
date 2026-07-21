@@ -19,6 +19,9 @@ export const NATIVE_HEIC_OUTPUT_LIMIT_BYTES = 50 * 1024 * 1024;
 export const NATIVE_HEIC_MAX_DIMENSION = 8192;
 export const NATIVE_HEIC_MAX_PIXELS = 40_000_000;
 export const NATIVE_HEIC_CONCURRENCY = 2;
+export const NATIVE_HEIC_STALE_MINIMUM_AGE_MS = 15 * 60 * 1000;
+export const NATIVE_HEIC_STALE_SCAN_LIMIT = 64;
+export const NATIVE_HEIC_CLEANUP_ATTEMPTS = 3;
 
 type NativeHeicErrorCode =
   'busy' | 'invalid_input' | 'unsafe_runtime' | 'unsupported_dimensions' | 'conversion_failed';
@@ -48,6 +51,14 @@ type ExecFileRunner = (
 type ConverterDependencies = {
   run?: ExecFileRunner;
   getUid?: () => number;
+  removeTemporaryDirectory?: (directory: string) => Promise<void>;
+};
+
+type NativeHeicScavengeOptions = {
+  getUid?: () => number;
+  maxEntries?: number;
+  minimumAgeMs?: number;
+  now?: number;
   removeTemporaryDirectory?: (directory: string) => Promise<void>;
 };
 
@@ -89,6 +100,107 @@ async function assertPrivateDirectory(directory: string, uid: number): Promise<v
   }
 }
 
+function assertAppSupportDirectory(
+  appSupportDirectory: string | undefined,
+): asserts appSupportDirectory is string {
+  if (
+    typeof appSupportDirectory !== 'string' ||
+    !path.isAbsolute(appSupportDirectory) ||
+    appSupportDirectory !== appSupportDirectory.trim()
+  ) {
+    throw new NativeHeicError('unsafe_runtime', 'Native runtime directory is invalid');
+  }
+}
+
+async function removeWithRetry(
+  directory: string,
+  removeTemporaryDirectory: (directory: string) => Promise<void>,
+): Promise<void> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < NATIVE_HEIC_CLEANUP_ATTEMPTS; attempt += 1) {
+    try {
+      await removeTemporaryDirectory(directory);
+      try {
+        await fs.lstat(directory);
+        lastError = new Error('temporary directory still exists');
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+          return;
+        }
+        lastError = error;
+      }
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error('temporary directory cleanup failed');
+}
+
+export async function scavengeNativeHeicTemporaryFiles(
+  appSupportDirectory: string | undefined,
+  options: NativeHeicScavengeOptions = {},
+): Promise<number> {
+  assertAppSupportDirectory(appSupportDirectory);
+  const getUid = options.getUid ?? process.getuid;
+  if (typeof getUid !== 'function') {
+    throw new NativeHeicError('unsafe_runtime', 'Native runtime ownership cannot be verified');
+  }
+  const maxEntries = options.maxEntries ?? NATIVE_HEIC_STALE_SCAN_LIMIT;
+  const minimumAgeMs = options.minimumAgeMs ?? NATIVE_HEIC_STALE_MINIMUM_AGE_MS;
+  const now = options.now ?? Date.now();
+  if (
+    !Number.isSafeInteger(maxEntries) ||
+    maxEntries < 1 ||
+    maxEntries > NATIVE_HEIC_STALE_SCAN_LIMIT ||
+    !Number.isSafeInteger(minimumAgeMs) ||
+    minimumAgeMs < 0 ||
+    !Number.isFinite(now)
+  ) {
+    throw new NativeHeicError('unsafe_runtime', 'Native cleanup bounds are invalid');
+  }
+
+  const uid = getUid();
+  const temporaryRoot = path.join(appSupportDirectory, 'runtime', 'heic-tmp');
+  await assertPrivateDirectory(temporaryRoot, uid);
+  const entryNames: string[] = [];
+  const directory = await fs.opendir(temporaryRoot);
+  for await (const entry of directory) {
+    if (entryNames.length >= maxEntries) {
+      throw new NativeHeicError('unsafe_runtime', 'Native cleanup scan exceeded its safe bound');
+    }
+    entryNames.push(entry.name);
+  }
+
+  const removeTemporaryDirectory =
+    options.removeTemporaryDirectory ??
+    ((directoryPath: string) => fs.rm(directoryPath, { recursive: true, force: true }));
+  let removed = 0;
+  for (const entryName of entryNames) {
+    if (!/^conversion-[A-Za-z0-9_-]{1,128}$/.test(entryName)) {
+      throw new NativeHeicError('unsafe_runtime', 'Native cleanup found an unexpected entry');
+    }
+    const entryPath = path.join(temporaryRoot, entryName);
+    const stat = await fs.lstat(entryPath);
+    if (stat.isSymbolicLink() || !stat.isDirectory() || stat.uid !== uid) {
+      throw new NativeHeicError('unsafe_runtime', 'Native cleanup found an unsafe entry');
+    }
+    const ageMs = Math.max(0, now - stat.mtimeMs);
+    if (ageMs < minimumAgeMs) {
+      continue;
+    }
+    try {
+      await removeWithRetry(entryPath, removeTemporaryDirectory);
+      removed += 1;
+    } catch {
+      throw new NativeHeicError(
+        'unsafe_runtime',
+        'Abandoned conversion files could not be removed',
+      );
+    }
+  }
+  return removed;
+}
+
 export function createNativeHeicConverter(
   dependencies: ConverterDependencies = {},
 ): (input: Buffer, appSupportDirectory: string) => Promise<Buffer> {
@@ -107,12 +219,7 @@ export function createNativeHeicConverter(
     ) {
       throw new NativeHeicError('invalid_input', 'Input is not a supported HEIC/HEIF container');
     }
-    if (
-      !path.isAbsolute(appSupportDirectory) ||
-      appSupportDirectory !== appSupportDirectory.trim()
-    ) {
-      throw new NativeHeicError('unsafe_runtime', 'Native runtime directory is invalid');
-    }
+    assertAppSupportDirectory(appSupportDirectory);
     if (activeConversions >= NATIVE_HEIC_CONCURRENCY) {
       throw new NativeHeicError('busy', 'Native HEIC conversion is busy');
     }
@@ -128,6 +235,10 @@ export function createNativeHeicConverter(
       const uid = getUid();
       const temporaryRoot = path.join(appSupportDirectory, 'runtime', 'heic-tmp');
       await assertPrivateDirectory(temporaryRoot, uid);
+      await scavengeNativeHeicTemporaryFiles(appSupportDirectory, {
+        getUid,
+        removeTemporaryDirectory,
+      });
       temporaryDirectory = await fs.mkdtemp(path.join(temporaryRoot, 'conversion-'));
       await fs.chmod(temporaryDirectory, 0o700);
 
@@ -223,7 +334,7 @@ export function createNativeHeicConverter(
     let cleanupFailed = false;
     try {
       if (temporaryDirectory) {
-        await removeTemporaryDirectory(temporaryDirectory);
+        await removeWithRetry(temporaryDirectory, removeTemporaryDirectory);
       }
     } catch {
       cleanupFailed = true;
@@ -301,7 +412,9 @@ export function createNativeHeicHandler(dependencies: NativeHeicHandlerDependenc
       !Buffer.isBuffer(file.buffer) ||
       file.size !== file.buffer.length ||
       file.size > NATIVE_HEIC_INPUT_LIMIT_BYTES ||
-      !['image/heic', 'image/heif'].includes(file.mimetype.toLowerCase()) ||
+      !['', 'application/octet-stream', 'image/heic', 'image/heif'].includes(
+        file.mimetype.toLowerCase(),
+      ) ||
       !isHeicContainer(file.buffer)
     ) {
       response.status(400).json({ code: 'invalid_heic' });

@@ -26,6 +26,7 @@ const {
   initializeFileStorage,
   startSandpackBundlerServer,
   resolveSandpackBundlerServerConfig,
+  scavengeNativeHeicTemporaryFiles,
 } = require('@librechat/api');
 const { connectDb, indexSync } = require('~/db');
 const initializeOAuthReconnectManager = require('./services/initializeOAuthReconnectManager');
@@ -77,6 +78,25 @@ const startServer = async () => {
   if (typeof Bun !== 'undefined') {
     axios.defaults.headers.common['Accept-Encoding'] = 'gzip';
   }
+  /* === VIVENTIUM START ===
+   * Feature: Native HEIC crash recovery.
+   * Purpose: Remove bounded, owner-verified conversion state before any Native request can run.
+   */
+  if (
+    process.env.VIVENTIUM_INSTALL_MODE === 'native' &&
+    process.env.VIVENTIUM_RUNTIME_PROFILE === 'native'
+  ) {
+    try {
+      await scavengeNativeHeicTemporaryFiles(process.env.VIVENTIUM_APP_SUPPORT_DIR, {
+        minimumAgeMs: 0,
+      });
+    } catch (nativeHeicCleanupError) {
+      logger.error('Native HEIC startup cleanup failed:', nativeHeicCleanupError);
+      process.exit(1);
+      return;
+    }
+  }
+  /* === VIVENTIUM END === */
   await connectDb();
 
   logger.info('Connected to MongoDB');

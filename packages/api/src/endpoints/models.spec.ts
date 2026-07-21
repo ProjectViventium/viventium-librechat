@@ -223,6 +223,18 @@ describe('getOpenAIModels', () => {
     expect(models).toEqual(expect.arrayContaining(['openai-model', 'openai-model-2']));
   });
 
+  // === VIVENTIUM START ===
+  // Regression: a configured user-provided key is not a ready credential for provider egress.
+  it('returns defaults without provider egress when the OpenAI key is user-provided', async () => {
+    process.env.OPENAI_API_KEY = 'user_provided';
+
+    const models = await getOpenAIModels({ user: 'new-user' });
+
+    expect(models).toContain('gpt-4');
+    expect(mockedAxios.get).not.toHaveBeenCalled();
+  });
+  // === VIVENTIUM END ===
+
   it('utilizes proxy configuration when PROXY is set', async () => {
     mockedAxios.get.mockResolvedValue({
       data: {

@@ -53,6 +53,15 @@ const loadAuthValues = async ({ userId, authFields, optional, throwError = true 
   };
 
   for (let authField of authFields) {
+    /* === VIVENTIUM START ===
+     * Feature: Fail-closed auth capability discovery across pinned component interfaces.
+     * Purpose: A capability absent from the installed agents package is unavailable, not a key
+     * name to parse or query. Skip it cleanly so first-run checks remain unauthenticated and quiet.
+     */
+    if (typeof authField !== 'string' || authField.trim() === '') {
+      continue;
+    }
+    /* === VIVENTIUM END === */
     const fields = authField.split('||');
     const result = await findAuthValue(fields);
     if (result) {

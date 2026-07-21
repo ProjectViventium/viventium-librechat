@@ -279,9 +279,13 @@ export async function getOpenAIModels(opts: GetOpenAIModelsOptions = {}): Promis
     return splitAndTrim(process.env[key]);
   }
 
-  if (opts.userProvidedOpenAI) {
+  // === VIVENTIUM START ===
+  // Feature: First-run provider readiness must differ from provider configuration.
+  // Purpose: `user_provided` enables the account UI but is never a credential for outbound egress.
+  if (opts.userProvidedOpenAI || isUserProvided(process.env.OPENAI_API_KEY)) {
     return models;
   }
+  // === VIVENTIUM END ===
 
   return await fetchOpenAIModels(opts, models);
 }

@@ -2,7 +2,10 @@
   "name": "LibreChat",
   "version": "v0.8.3",
   "description": "",
-  "packageManager": "npm@11.10.0",
+  "packageManager": "npm@11.13.0",
+  "engines": {
+    "node": "24.16.0"
+  },
   "workspaces": [
     "api",
     "client",
@@ -68,6 +71,9 @@
     "test:all": "npm run test:client && npm run test:api && npm run test:packages:api && npm run test:packages:data-provider && npm run test:packages:data-schemas",
     "test:production-dependency-tree": "node scripts/viventium-audit-production-dependencies.js",
     "test:production-runtime-load": "node scripts/viventium-audit-production-runtime.js",
+    "test:release-contracts": "node --test scripts/viventium-release-contracts.test.cjs",
+    "verify:docker-image": "node scripts/verify-viventium-docker-image.cjs",
+    "verify:docker-context": "node scripts/verify-docker-build-context.cjs",
     "e2e:update": "playwright test --config=e2e/playwright.config.js --update-snapshots",
     "e2e:report": "npx playwright show-report e2e/playwright-report",
     "lint:fix": "eslint --fix \"{,!(node_modules|venv)/**/}*.{js,jsx,ts,tsx}\"",

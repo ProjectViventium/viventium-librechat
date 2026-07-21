@@ -200,19 +200,42 @@ const SetKeyDialog = ({
   const localize = useLocalize();
 
   const expirationOptions = Object.values(EXPIRY);
+  const selectedExpiration = expirationOptions.find((option) => option.label === expiresAtLabel);
+
+  /* === VIVENTIUM START ===
+   * Feature: Secure cancellation for credential drafts.
+   * Purpose: Escape, close, and explicit parent dismissal must discard unsaved secrets and reset
+   * the retention choice. Saving still closes only after storage confirms success.
+   */
+  const resetForm = methods.reset;
+  React.useEffect(() => {
+    if (!open) {
+      resetForm();
+      setUserKey('');
+      setExpiresAtLabel(EXPIRY.TWELVE_HOURS.label);
+    }
+  }, [open, resetForm]);
+  const handleDialogOpenChange = (nextOpen: boolean) => {
+    if (!nextOpen) {
+      resetForm();
+      setUserKey('');
+      setExpiresAtLabel(EXPIRY.TWELVE_HOURS.label);
+    }
+    onOpenChange(nextOpen);
+  };
+  /* === VIVENTIUM END === */
 
   const handleExpirationChange = (label: string) => {
     setExpiresAtLabel(label);
   };
 
   const submit = async () => {
-    const selectedOption = expirationOptions.find((option) => option.label === expiresAtLabel);
     let expiresAt: number | null;
 
-    if (selectedOption?.value === 0) {
+    if (selectedExpiration?.value === 0) {
       expiresAt = null;
     } else {
-      expiresAt = Date.now() + (selectedOption ? selectedOption.value : 0);
+      expiresAt = Date.now() + (selectedExpiration ? selectedExpiration.value : 0);
     }
 
     const saveKey = async (key: string): Promise<boolean> => {
@@ -226,7 +249,7 @@ const SetKeyDialog = ({
           message: localize('com_ui_save_key_success'),
           status: NotificationSeverity.SUCCESS,
         });
-        onOpenChange(false);
+        handleDialogOpenChange(false);
         return true;
         /* === VIVENTIUM END === */
       } catch (error) {
@@ -304,10 +327,14 @@ const SetKeyDialog = ({
 
   const EndpointComponent =
     endpointComponents[endpointType ?? endpoint] ?? endpointComponents['default'];
-  const expiryTime = getExpiry();
+  const currentKeyExpiry = getExpiry();
+  const selectedExpiryTime =
+    selectedExpiration?.value === 0
+      ? null
+      : new Date(Date.now() + (selectedExpiration?.value ?? 0)).toLocaleString();
 
   return (
-    <OGDialog open={open} onOpenChange={onOpenChange}>
+    <OGDialog open={open} onOpenChange={handleDialogOpenChange}>
       <OGDialogContent className="w-11/12 max-w-2xl">
         <OGDialogHeader>
           <OGDialogTitle>
@@ -316,11 +343,13 @@ const SetKeyDialog = ({
         </OGDialogHeader>
         <div className="grid w-full items-center gap-2 py-4">
           <small className="text-red-600">
-            {expiryTime === 'never'
+            {/* === VIVENTIUM START ===
+             * UX truth: describe the retention policy being selected for this new key, not the
+             * unrelated lifecycle of a currently saved key.
+             * === VIVENTIUM END === */}
+            {selectedExpiryTime === null
               ? localize('com_endpoint_config_key_never_expires')
-              : `${localize('com_endpoint_config_key_encryption')} ${new Date(
-                  expiryTime ?? 0,
-                ).toLocaleString()}`}
+              : `${localize('com_endpoint_config_key_encryption')} ${selectedExpiryTime}`}
           </small>
           <Dropdown
             label="Expires "
@@ -344,8 +373,8 @@ const SetKeyDialog = ({
         <OGDialogFooter>
           <RevokeKeysButton
             endpoint={endpoint}
-            disabled={!(expiryTime ?? '')}
-            setDialogOpen={onOpenChange}
+            disabled={!(currentKeyExpiry ?? '')}
+            setDialogOpen={handleDialogOpenChange}
             removalMode={removalMode}
           />
           <Button variant="submit" onClick={() => void submit()}>

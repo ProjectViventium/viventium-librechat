@@ -1,7 +1,8 @@
 # v0.8.3
 
-# Base node image
-FROM node:20-alpine AS node
+# VIVENTIUM START — exact release runtime shared with source and the parent installer.
+FROM node:24.16.0-alpine AS node
+# VIVENTIUM END
 
 # Install jemalloc
 RUN apk add --no-cache jemalloc

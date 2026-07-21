@@ -50,7 +50,9 @@ services:
     volumes:
       - pgdata2:/var/lib/postgresql/data
   rag_api:
-    image: registry.librechat.ai/danny-avila/librechat-rag-api-dev-lite:latest
+    # VIVENTIUM START — use the same immutable RAG artifact as supported Compose entrypoints.
+    image: registry.librechat.ai/danny-avila/librechat-rag-api-dev-lite:latest@sha256:c0ad82657b556c1e16dcfca85d045788f67caa223e25e70eb687f4d16b41dedc
+    # VIVENTIUM END
     environment:
       - DB_HOST=vectordb
       - RAG_PORT=${RAG_PORT:-8000}

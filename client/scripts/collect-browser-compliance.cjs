@@ -721,7 +721,7 @@ function verifyShipped() {
     vendored.notice.sha256 !== 'c6780cf00c1a0d36452e24213995dacef06f3631d1c8cc1cdafb7693362f68e8' ||
     !runtimePrivacyNoticeBytes.toString('utf8').includes('window._env_.IS_ONPREM') ||
     vendored.runtimePrivacyNotice.sha256 !==
-      'b5e1c0609ef1aba13300307cfa182c891bcd58b698f22bc4801d7c406d541efd' ||
+      'bce814f591509b996e21a1d70342014bf04a4d0a25b90140ef3bcf657b33978a' ||
     sha256(sandpackLicenseBytes) !==
       'b75c33064bdc1c7f392dc4e42df8329f64332e841f87ccaa1f3954c5eeba5bc1'
   ) {

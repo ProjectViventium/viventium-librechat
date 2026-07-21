@@ -22,9 +22,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # VIVENTIUM START — exact release toolchain.
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24.16.0
+      # VIVENTIUM END
       - run: cd packages/data-provider && npm ci
       - run: cd packages/data-provider && npm run build
 
@@ -34,13 +36,15 @@ jobs:
     environment: publish  # Must match npm trusted publisher config
     steps:
       - uses: actions/checkout@v4
+      # VIVENTIUM START — exact release toolchain.
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24.16.0
           registry-url: 'https://registry.npmjs.org'
+      # VIVENTIUM END
       
       - name: Update npm for OIDC support
-        run: npm install -g npm@latest  # Must be 11.5.1+ for provenance
+        run: npm install -g npm@11.13.0 # Exact project package-manager contract; supports provenance
       
       - run: cd packages/data-provider && npm ci
       - run: cd packages/data-provider && npm run build

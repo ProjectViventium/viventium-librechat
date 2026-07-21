@@ -2,14 +2,22 @@
 
 Viventium self-hosts the browser runtime distributed in
 `@codesandbox/sandpack-client@2.19.8` instead of loading the default CodeSandbox-hosted bundler.
-The package identity is pinned by `package-lock.json`; the build also verifies the exact source
-index and runtime hashes before copying the runtime into `dist/sandpack-bundler/`.
+The package identity is pinned by `package-lock.json`; the build also verifies exact source-tree,
+index, and runtime hashes before copying the runtime into `dist/sandpack-bundler/`.
 
 Before any runtime script executes, Viventium's generated copy of `index.html` sets the upstream
 on-premises environment flag `window._env_.IS_ONPREM` to `"true"`. The upstream runtime checks this
 flag before its metrics request, so artifact previews do not submit CodeSandbox analytics. The
-runtime JavaScript itself is not rewritten. The generated index hash and unchanged upstream runtime
-hash are enforced by the build and shipped-compliance verifier.
+functional sandbox behavior is not rewritten. Two known classes of non-functional upstream
+build-machine path metadata embedded in JavaScript are replaced deterministically with neutral
+virtual paths. Exact replacement counts, the sanitized output-tree hash, and a recursive
+private-home-path scan are enforced by the build and shipped-compliance verifier.
+
+Self-hosting the bundler removes the default CodeSandbox bundler and analytics requests, but it does
+not make arbitrary artifact execution offline. When artifact source imports packages that are not
+already bundled, the upstream runtime can resolve them from public package services such as UNPKG,
+jsDelivr, and CodeSandbox's package endpoint. Users should treat artifact imports as network egress
+and apply host firewall or network policy when fully offline execution is required.
 
 The client requires the generated runtime to be served from a dedicated origin that differs from the
 LibreChat origin. Sandpack's browser compilers use Web Workers, which need `allow-same-origin` inside

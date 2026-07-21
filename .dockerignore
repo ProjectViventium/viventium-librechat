@@ -26,8 +26,16 @@ backups
 **/backups
 tmp
 data
+# VIVENTIUM START — exclude all machine-local runtime state from the Docker build context.
+data-node
+data-node-*
 data-node-dual
+meili_data*
 meili_data_v1.12_dual
+images
+uploads
+.rag-pgdata*
+# VIVENTIUM END
 .git
 .DS_Store
 .env

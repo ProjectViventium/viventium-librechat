@@ -12,6 +12,7 @@ const runtimePrivacyNotice = path.join(
 const localBundlerRoot = path.join(dist, 'sandpack-bundler');
 const localBundlerIndex = path.join(localBundlerRoot, 'index.html');
 const localBundlerRuntime = path.join(localBundlerRoot, 'static/js/sandbox.8a7d01a44.js');
+const allowedVirtualHomeNames = new Set(['ai', 'myself', 'sandbox']);
 const PINNED_OUTPUT_INDEX_SHA256 =
   'ace51687532a2e9cbfcc11d790bc96b250c477cfa3545ab285915b9eca8e7aa6';
 const PINNED_RUNTIME_SHA256 = '17a6448ab2dc5c3f426454c3147529c359d52b8a09cc060cb557457e13ae680b';
@@ -85,6 +86,37 @@ const violations = javascriptFiles.flatMap((file) => {
 
 if (violations.length > 0) {
   throw new Error(`Nodebox code reached the browser production bundle:\n${violations.join('\n')}`);
+}
+
+const privatePathViolations = [];
+function scanPrivatePaths(directory) {
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const entryPath = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      scanPrivatePaths(entryPath);
+      continue;
+    }
+    if (!entry.isFile()) {
+      continue;
+    }
+    const contents = fs.readFileSync(entryPath, 'utf8');
+    if (/\/Users\/[A-Za-z0-9._-]+(?:\/|\b)/.test(contents)) {
+      privatePathViolations.push(`${path.relative(localBundlerRoot, entryPath)}: macOS home`);
+    }
+    for (const match of contents.matchAll(/\/home\/([A-Za-z0-9._-]+)(?:\/|\b)/g)) {
+      if (!allowedVirtualHomeNames.has(match[1])) {
+        privatePathViolations.push(
+          `${path.relative(localBundlerRoot, entryPath)}: non-virtual Unix home`,
+        );
+      }
+    }
+  }
+}
+scanPrivatePaths(localBundlerRoot);
+if (privatePathViolations.length > 0) {
+  throw new Error(
+    `Private build paths reached the shipped Sandpack runtime:\n${privatePathViolations.join('\n')}`,
+  );
 }
 
 console.log(

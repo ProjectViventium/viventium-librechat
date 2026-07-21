@@ -6,6 +6,8 @@ const {
   PINNED_OUTPUT_INDEX_SHA256,
   PINNED_SOURCE_INDEX_SHA256,
   PINNED_SOURCE_RUNTIME_SHA256,
+  PINNED_SOURCE_TREE_SHA256,
+  PINNED_OUTPUT_TREE_SHA256,
   injectOnPremEnvironment,
   prepareSandpackBundler,
   sha256,
@@ -45,11 +47,25 @@ describe('local Sandpack bundler preparation', () => {
       expect(result.sourceIndexSha256).toBe(PINNED_SOURCE_INDEX_SHA256);
       expect(result.outputIndexSha256).toBe(PINNED_OUTPUT_INDEX_SHA256);
       expect(result.runtimeSha256).toBe(PINNED_SOURCE_RUNTIME_SHA256);
+      expect(result.sourceTreeSha256).toBe(PINNED_SOURCE_TREE_SHA256);
+      expect(result.outputTreeSha256).toBe(PINNED_OUTPUT_TREE_SHA256);
       expect(sha256(indexBytes)).toBe(PINNED_OUTPUT_INDEX_SHA256);
       expect(sha256(runtimeBytes)).toBe(PINNED_SOURCE_RUNTIME_SHA256);
       expect(indexBytes.toString('utf8')).toContain(
         'window._env_=Object.assign({},window._env_,{IS_ONPREM:"true"})',
       );
+      const typescriptParser = fs.readFileSync(
+        path.join(destinationRoot, 'static/js/prettier/1.16.4/parser-typescript.js'),
+        'utf8',
+      );
+      const browserFs = fs.readFileSync(
+        path.join(destinationRoot, 'static/browserfs12/browserfs.js'),
+        'utf8',
+      );
+      expect(typescriptParser).not.toMatch(/\/Users\/[A-Za-z0-9._-]+\//);
+      expect(typescriptParser).toContain('/virtual/typescript/lib');
+      expect(browserFs).not.toMatch(/\/home\/(?!ai(?:\/|\b)|myself(?:\/|\b)|sandbox(?:\/|\b))/);
+      expect(browserFs).toContain('/virtual/browserfs');
     } finally {
       fs.rmSync(tempDirectory, { recursive: true, force: true });
     }

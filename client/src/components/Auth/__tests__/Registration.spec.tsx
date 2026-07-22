@@ -270,7 +270,7 @@ test('shows error message when registration fails', async () => {
     await waitFor(() => {
       const alert = screen
         .getByText(/There was an error attempting to register your account\. Please try again\./i)
-        .closest('[role=\"alert\"]');
+        .closest('[role="alert"]');
       expect(alert).toBeInTheDocument();
       expect(alert).toHaveTextContent(
         /There was an error attempting to register your account. Please try again. Registration failed/i,

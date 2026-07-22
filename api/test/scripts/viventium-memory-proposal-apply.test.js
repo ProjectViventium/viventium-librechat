@@ -205,9 +205,7 @@ describe('viventium-memory-proposal-apply', () => {
       }),
       'utf8',
     );
-    let memories = [
-      { key: 'context', value: 'Previous context', tokenCount: 2, __v: 4 },
-    ];
+    let memories = [{ key: 'context', value: 'Previous context', tokenCount: 2, __v: 4 }];
     const methods = {
       getAllUserMemories: jest.fn(async () => memories.map((memory) => ({ ...memory }))),
       setMemory: jest.fn(async ({ key, value, tokenCount, expectedRevision }) => {
@@ -234,9 +232,9 @@ describe('viventium-memory-proposal-apply', () => {
       );
 
       expect(result.ok).toBe(true);
-      expect(methods.setMemory.mock.calls.filter(([write]) => write.key === 'context')).toHaveLength(
-        1,
-      );
+      expect(
+        methods.setMemory.mock.calls.filter(([write]) => write.key === 'context'),
+      ).toHaveLength(1);
       expect(memories.find((memory) => memory.key === 'context')?.value).toBe(proposedContext);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -250,9 +248,7 @@ describe('viventium-memory-proposal-apply', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-memory-proposal-rejected-'));
     const proposal = path.join(dir, 'memory-proposals-apply.json');
     fs.writeFileSync(proposal, JSON.stringify({ actions: [action] }), 'utf8');
-    const memories = [
-      { key: 'context', value: 'Existing context', tokenCount: 1, __v: 3 },
-    ];
+    const memories = [{ key: 'context', value: 'Existing context', tokenCount: 1, __v: 3 }];
     const methods = {
       getAllUserMemories: async () => memories.map((memory) => ({ ...memory })),
       getAllUserMemoryStates: async () => memories.map((memory) => ({ ...memory })),

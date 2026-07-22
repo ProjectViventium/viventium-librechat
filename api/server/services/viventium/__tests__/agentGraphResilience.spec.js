@@ -4,9 +4,7 @@
  * === VIVENTIUM END === */
 
 const { filterOrphanedEdges } = require('@librechat/api');
-const {
-  markOptionalAgentInitializationFailed,
-} = require('../agentGraphResilience');
+const { markOptionalAgentInitializationFailed } = require('../agentGraphResilience');
 
 describe('optional agent graph resilience', () => {
   test('removes a handoff edge when its optional target fails initialization', () => {

@@ -39,9 +39,13 @@ describe('shouldOpenConnectedAccountsSetup', () => {
 
   it('recognizes only the internal new-chat Connected Accounts destination', () => {
     expect(isConnectedAccountsSetupDestination('/c/new?setup=accounts')).toBe(true);
-    expect(isConnectedAccountsSetupDestination('/c/new?source=installer&setup=accounts')).toBe(true);
+    expect(isConnectedAccountsSetupDestination('/c/new?source=installer&setup=accounts')).toBe(
+      true,
+    );
     expect(isConnectedAccountsSetupDestination('/c/other?setup=accounts')).toBe(false);
-    expect(isConnectedAccountsSetupDestination('//example.invalid/c/new?setup=accounts')).toBe(false);
+    expect(isConnectedAccountsSetupDestination('//example.invalid/c/new?setup=accounts')).toBe(
+      false,
+    );
     expect(isConnectedAccountsSetupDestination(null)).toBe(false);
   });
 });

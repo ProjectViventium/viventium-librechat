@@ -238,10 +238,11 @@ describe('BackgroundCortexService activation policy helpers', () => {
     expect(isActivationFallbackCandidate({ code: 'MODEL_DECOMMISSIONED', status: 404 })).toBe(true);
     expect(isActivationFallbackCandidate({ code: 'JSON_VALIDATE_FAILED', status: 400 })).toBe(true);
     expect(
-      isActivationFallbackCandidate(
-        new Error('provider initialization failed'),
-        { class: 'provider_error', status: null, code: '' },
-      ),
+      isActivationFallbackCandidate(new Error('provider initialization failed'), {
+        class: 'provider_error',
+        status: null,
+        code: '',
+      }),
     ).toBe(true);
     expect(isActivationFallbackCandidate({ code: 'INVALID_REQUEST', status: 400 })).toBe(false);
   });
@@ -290,9 +291,7 @@ describe('BackgroundCortexService activation policy helpers', () => {
     }
 
     expect(
-      parseActivationResponse(
-        '{"should_activate":false,"confidence":0.91,"reason":"valid alias"}',
-      ),
+      parseActivationResponse('{"should_activate":false,"confidence":0.91,"reason":"valid alias"}'),
     ).toEqual({ activate: false, confidence: 0.91, reason: 'valid alias' });
   });
 

@@ -187,9 +187,8 @@ describe('buildVoiceModeInstructions', () => {
   test('chatterbox branch allows bracket markers and prohibits emotion tags', () => {
     const result = buildVoiceModeInstructions('local_chatterbox_turbo_mlx_8bit');
     expect(result).toContain('VOICE MODE:');
-    for (const marker of
-      TTS_PROVIDER_CAPABILITIES.providers.local_chatterbox_turbo_mlx_8bit.inline_controls
-        .exact_tokens) {
+    for (const marker of TTS_PROVIDER_CAPABILITIES.providers.local_chatterbox_turbo_mlx_8bit
+      .inline_controls.exact_tokens) {
       expect(result).toContain(marker);
     }
     expect(result).toContain(
@@ -209,8 +208,8 @@ describe('buildVoiceModeInstructions', () => {
       exact_tokens: [],
     });
     expect(
-      providers.openai.runtime_models.find((model) => model.id === 'gpt-4o-mini-tts')
-        .side_channels.instructions,
+      providers.openai.runtime_models.find((model) => model.id === 'gpt-4o-mini-tts').side_channels
+        .instructions,
     ).toBe(true);
     expect(providers.openai.dynamic_expression.per_turn_wired).toBe(false);
     expect(providers.elevenlabs.default_model).toBe('eleven_turbo_v2_5');

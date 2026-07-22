@@ -2526,15 +2526,14 @@ describe('AgentClient - titleConvo', () => {
       try {
         await client.runMemory([new HumanMessage('Remember a synthetic preference.')]);
 
-        expect(logSpy).toHaveBeenCalledWith(
-          expect.stringContaining(
-            'step=memory_run_done ms=',
+        expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('step=memory_run_done ms='));
+        expect(
+          logSpy.mock.calls.some(
+            ([message]) =>
+              String(message).includes('step=memory_run_done') &&
+              String(message).includes('status=error failure=key_limit_exceeded'),
           ),
-        );
-        expect(logSpy.mock.calls.some(([message]) =>
-          String(message).includes('step=memory_run_done') &&
-          String(message).includes('status=error failure=key_limit_exceeded'),
-        )).toBe(true);
+        ).toBe(true);
       } finally {
         logSpy.mockRestore();
         if (previousTimingFlag == null) {

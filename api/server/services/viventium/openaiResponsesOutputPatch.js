@@ -78,12 +78,8 @@ function patchConverter(moduleExports, exportName) {
 function applyOpenAIResponsesOutputPatch() {
   const patchedTargets = [];
 
-  const legacyUtilsModule = tryRequire(() =>
-    requireAgentsCjsModule('llm/openai/utils/index.cjs'),
-  );
-  if (
-    patchConverter(legacyUtilsModule, '_convertOpenAIResponsesDeltaToBaseMessageChunk')
-  ) {
+  const legacyUtilsModule = tryRequire(() => requireAgentsCjsModule('llm/openai/utils/index.cjs'));
+  if (patchConverter(legacyUtilsModule, '_convertOpenAIResponsesDeltaToBaseMessageChunk')) {
     patchedTargets.push('agents');
   }
 
@@ -93,9 +89,7 @@ function applyOpenAIResponsesOutputPatch() {
     );
     return require(path.join(langchainOpenAIDir, 'converters/responses.cjs'));
   });
-  if (
-    patchConverter(langchainResponsesModule, 'convertResponsesDeltaToChatGenerationChunk')
-  ) {
+  if (patchConverter(langchainResponsesModule, 'convertResponsesDeltaToChatGenerationChunk')) {
     patchedTargets.push('langchain');
   }
 

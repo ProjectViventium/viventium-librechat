@@ -14,10 +14,7 @@ const AGENTS_CJS_DIR = path.dirname(require.resolve('@librechat/agents'));
 const LANGCHAIN_OPENAI_DIR = path.dirname(
   require.resolve('@langchain/openai', { paths: [AGENTS_CJS_DIR] }),
 );
-const langchainResponses = require(path.join(
-  LANGCHAIN_OPENAI_DIR,
-  'converters/responses.cjs',
-));
+const langchainResponses = require(path.join(LANGCHAIN_OPENAI_DIR, 'converters/responses.cjs'));
 
 describe('openaiResponsesOutputPatch', () => {
   test('response.completed without response.output does not throw (gpt-5.4 shape)', () => {
@@ -30,7 +27,9 @@ describe('openaiResponsesOutputPatch', () => {
         usage: { output_tokens: 3 },
       },
     };
-    expect(() => langchainResponses.convertResponsesDeltaToChatGenerationChunk(chunk)).not.toThrow();
+    expect(() =>
+      langchainResponses.convertResponsesDeltaToChatGenerationChunk(chunk),
+    ).not.toThrow();
     // The guard normalizes the missing field to an empty array.
     expect(Array.isArray(chunk.response.output)).toBe(true);
   });
@@ -54,7 +53,9 @@ describe('openaiResponsesOutputPatch', () => {
         usage: {},
       },
     };
-    expect(() => langchainResponses.convertResponsesDeltaToChatGenerationChunk(chunk)).not.toThrow();
+    expect(() =>
+      langchainResponses.convertResponsesDeltaToChatGenerationChunk(chunk),
+    ).not.toThrow();
     expect(chunk.response.output).toBe(realOutput);
   });
 });

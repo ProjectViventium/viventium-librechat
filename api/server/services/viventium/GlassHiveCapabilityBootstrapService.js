@@ -15,10 +15,7 @@ const {
 } = require('./GlassHiveCapabilityPolicyService');
 const { mintBrokerGrant } = require('./GlassHiveCapabilityBrokerAuth');
 const { pinFeelingCapsuleLast } = require('./feelingPromptTail');
-const {
-  logFeelingsEvent,
-  summarizeFeelingCapsulePlacement,
-} = require('./feelingsTelemetry');
+const { logFeelingsEvent, summarizeFeelingCapsulePlacement } = require('./feelingsTelemetry');
 
 const WORKER_INSTRUCTION_FIELDS = Object.freeze(['agents_md', 'claude_md', 'codex_md']);
 
@@ -264,23 +261,18 @@ function logWorkerFeelingPlacement({
       instructions: bundle?.[field],
       capsule: feelingBlock,
     });
-    logFeelingsEvent(
-      logger,
-      { body: requestBody || {} },
-      'feelings.inject.final_run',
-      {
-        route: `glasshive_worker_${field}`,
-        enabled: Boolean(feelingBlock),
-        scope,
-        snapshotHash,
-        rangePromptOverrideCount,
-        activeRangePromptOverrideCount,
-        activeRangePromptOverrideChars,
-        injected: placement.presentInFinalRun,
-        reason,
-        ...placement,
-      },
-    );
+    logFeelingsEvent(logger, { body: requestBody || {} }, 'feelings.inject.final_run', {
+      route: `glasshive_worker_${field}`,
+      enabled: Boolean(feelingBlock),
+      scope,
+      snapshotHash,
+      rangePromptOverrideCount,
+      activeRangePromptOverrideCount,
+      activeRangePromptOverrideChars,
+      injected: placement.presentInFinalRun,
+      reason,
+      ...placement,
+    });
   }
 }
 

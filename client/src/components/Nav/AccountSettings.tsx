@@ -107,9 +107,7 @@ function AccountSettings() {
 
     const setupPending =
       window.sessionStorage.getItem(CONNECTED_ACCOUNTS_SETUP_PENDING_KEY) === 'true';
-    if (
-      !shouldResumeConnectedAccountsSetup(installExperience, location.search, setupPending)
-    ) {
+    if (!shouldResumeConnectedAccountsSetup(installExperience, location.search, setupPending)) {
       return;
     }
 

@@ -58,9 +58,19 @@ describe('limiterCache', () => {
     expect(typeof testStore!.sendCommand).toBe('function');
 
     const testKey = 'user:123';
+    /* === VIVENTIUM START ===
+     * Regression: rate-limit-redis 4.3 exposes RedisStore.sendCommand as a command-details wrapper.
+     * Purpose: Exercise the installed public shape without relying on the removed variadic internals.
+     */
+    const sendStoreCommand = (...command: string[]) =>
+      testStore!.sendCommand({
+        command,
+        isReadOnly: ['GET', 'TTL'].includes(command[0]),
+      });
+    /* === VIVENTIUM END === */
 
     // SET operation
-    await testStore!.sendCommand('SET', testKey, '1', 'EX', '60');
+    await sendStoreCommand('SET', testKey, '1', 'EX', '60');
 
     // Verify the key was created WITHOUT prefix using ioredis
     // Note: Using call method since get method seems to have issues in test environment
@@ -73,11 +83,11 @@ describe('limiterCache', () => {
     expect(directValue).toBe('1');
 
     // GET operation
-    const value = await testStore!.sendCommand('GET', testKey);
+    const value = await sendStoreCommand('GET', testKey);
     expect(value).toBe('1');
 
     // INCR operation
-    const incremented = await testStore!.sendCommand('INCR', testKey);
+    const incremented = await sendStoreCommand('INCR', testKey);
     expect(incremented).toBe(2);
 
     // Verify increment worked with ioredis
@@ -85,21 +95,21 @@ describe('limiterCache', () => {
     expect(incrementedValue).toBe('2');
 
     // TTL operation
-    const ttl = (await testStore!.sendCommand('TTL', testKey)) as number;
+    const ttl = (await sendStoreCommand('TTL', testKey)) as number;
     expect(ttl).toBeGreaterThan(0);
     expect(ttl).toBeLessThanOrEqual(60);
 
     // DEL operation
-    const deleted = await testStore!.sendCommand('DEL', testKey);
+    const deleted = await sendStoreCommand('DEL', testKey);
     expect(deleted).toBe(1);
 
     // Verify deletion
-    const afterDelete = await testStore!.sendCommand('GET', testKey);
+    const afterDelete = await sendStoreCommand('GET', testKey);
     expect(afterDelete).toBeNull();
     const directAfterDelete = await ioredisClient!.get(testKey);
     expect(directAfterDelete).toBeNull();
 
     // Test error handling
-    await expect(testStore!.sendCommand('INVALID_COMMAND')).rejects.toThrow();
+    await expect(sendStoreCommand('INVALID_COMMAND')).rejects.toThrow();
   });
 });

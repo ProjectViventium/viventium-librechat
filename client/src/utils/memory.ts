@@ -52,12 +52,11 @@ export function handleMemoryArtifact({
     /* === VIVENTIUM END === */
     const timestamp = new Date().toISOString();
     let totalTokens = currentData.totalTokens;
-    let newMemories: TUserMemory[];
 
     const oldTokenCount = memories[existingIndex].tokenCount || 0;
     totalTokens = totalTokens - oldTokenCount + tokenCount;
 
-    newMemories = [...memories];
+    const newMemories: TUserMemory[] = [...memories];
     newMemories[existingIndex] = {
       key,
       value: value!,

@@ -1397,9 +1397,9 @@ describe('fileSearch.js - tuple return validation', () => {
       expect(
         recallContents.some((content) => content.includes('Project Cedar intake at Harbor Annex')),
       ).toBe(true);
-      expect(recallContents.some((content) => content.includes('Project Cedar launch review'))).toBe(
-        true,
-      );
+      expect(
+        recallContents.some((content) => content.includes('Project Cedar launch review')),
+      ).toBe(true);
     });
 
     it('ranks complete user-authored evidence above a newer assistant restatement', async () => {

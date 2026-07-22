@@ -15,11 +15,7 @@ const {
   sanitizeAnthropicThinkingBlocks,
   sanitizeMessagesForAnthropicThinking,
 } = require('../anthropicThinkingPatch');
-const {
-  AIMessage,
-  HumanMessage,
-  ToolMessage,
-} = require('@librechat/agents/langchain/messages');
+const { AIMessage, HumanMessage, ToolMessage } = require('@librechat/agents/langchain/messages');
 const { Providers, ensureThinkingBlockInMessages } = require('@librechat/agents');
 
 describe('anthropicThinkingPatch', () => {

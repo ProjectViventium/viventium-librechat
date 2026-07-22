@@ -17,10 +17,7 @@ const {
   sanitizeAnthropicFormattedMessages,
   sanitizeProviderFormattedMessages,
 } = require('../normalizeTextContentParts');
-const {
-  HumanMessage,
-  isBaseMessage,
-} = require('@librechat/agents/langchain/messages');
+const { HumanMessage, isBaseMessage } = require('@librechat/agents/langchain/messages');
 const { formatAgentMessages } = require('@librechat/agents');
 const { filterMalformedContentParts } = require('@librechat/api');
 const { ContentTypes } = require('librechat-data-provider');
@@ -184,7 +181,9 @@ describe('normalizeTextContentParts', () => {
     expect(typeof result[0]._getType).toBe('function');
     expect(typeof result[0].getType).toBe('function');
     expect(result[0]._getType()).toBe('human');
-    expect(result[0].content).toEqual([{ type: ContentTypes.TEXT, text: 'Hi', [ContentTypes.TEXT]: 'Hi' }]);
+    expect(result[0].content).toEqual([
+      { type: ContentTypes.TEXT, text: 'Hi', [ContentTypes.TEXT]: 'Hi' },
+    ]);
     expect(isBaseMessage(result[0])).toBe(true);
   });
 

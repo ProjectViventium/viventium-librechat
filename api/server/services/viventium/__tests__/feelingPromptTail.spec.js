@@ -3,9 +3,7 @@
  * Purpose: Prove the private capsule is pinned once at the final behavioral instruction boundary.
  * === VIVENTIUM END === */
 
-const {
-  pinFeelingCapsuleLast,
-} = require('~/server/services/viventium/feelingPromptTail');
+const { pinFeelingCapsuleLast } = require('~/server/services/viventium/feelingPromptTail');
 
 describe('Feeling prompt tail', () => {
   const capsule = [

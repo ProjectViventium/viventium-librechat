@@ -6,6 +6,17 @@
 
 const mockLoadServiceKey = jest.fn();
 const mockLoggerError = jest.fn();
+/* === VIVENTIUM START ===
+ * Regression: parallel API suites may create the conventional auth.json while this pristine test runs.
+ * Purpose: Model the missing-file state deterministically without weakening the production existence check.
+ */
+const mockExistsSync = jest.fn(() => false);
+
+jest.mock('fs', () => ({
+  ...jest.requireActual('fs'),
+  existsSync: (...args) => mockExistsSync(...args),
+}));
+/* === VIVENTIUM END === */
 
 jest.mock('@librechat/api', () => ({
   isUserProvided: (value) => value === 'user_provided',
@@ -27,6 +38,7 @@ describe('loadAsyncEndpoints first-run auth discovery', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    mockExistsSync.mockReturnValue(false);
     delete process.env.GOOGLE_SERVICE_KEY_FILE;
   });
 
@@ -42,6 +54,15 @@ describe('loadAsyncEndpoints first-run auth discovery', () => {
     await expect(loadAsyncEndpoints()).resolves.toEqual({ google: false });
 
     expect(mockLoadServiceKey).not.toHaveBeenCalled();
+    expect(mockLoggerError).not.toHaveBeenCalled();
+  });
+
+  test('still loads an explicitly configured service-key path', async () => {
+    process.env.GOOGLE_SERVICE_KEY_FILE = '/path/to/google-service-key.json';
+    mockLoadServiceKey.mockResolvedValue({ client_email: 'service@example.com' });
+
+    await expect(loadAsyncEndpoints()).resolves.toEqual({ google: { userProvide: undefined } });
+    expect(mockLoadServiceKey).toHaveBeenCalledWith('/path/to/google-service-key.json');
     expect(mockLoggerError).not.toHaveBeenCalled();
   });
 });

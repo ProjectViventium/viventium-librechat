@@ -86,9 +86,7 @@ const {
   logFeelingsEvent,
   summarizeFeelingCapsulePlacement,
 } = require('~/server/services/viventium/feelingsTelemetry');
-const {
-  pinFeelingCapsuleLast,
-} = require('~/server/services/viventium/feelingPromptTail');
+const { pinFeelingCapsuleLast } = require('~/server/services/viventium/feelingPromptTail');
 const {
   scheduleEmotionalReaction,
 } = require('~/server/services/viventium/EmotionalReactionService');
@@ -2279,8 +2277,7 @@ class AgentClient extends BaseClient {
           snapshotHash: feelingSnapshot?.snapshotHash || 'none',
           cacheHit: feelingSnapshot?.cacheHit === true,
           rangePromptOverrideCount: feelingSnapshot?.rangePromptOverrideCount ?? 0,
-          activeRangePromptOverrideCount:
-            feelingSnapshot?.activeRangePromptOverrideCount ?? 0,
+          activeRangePromptOverrideCount: feelingSnapshot?.activeRangePromptOverrideCount ?? 0,
           activeRangePromptOverrideChars: feelingSnapshot?.activeRangePromptOverrideChars ?? 0,
           durationMs: Date.now() - feelingReadStartedAt,
         });

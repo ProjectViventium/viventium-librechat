@@ -97,6 +97,8 @@ describe('handleMemoryArtifact revision safety', () => {
       revision: 5,
     };
 
-    expect(handleMemoryArtifact({ memoryArtifact: artifact, currentData: deletedData })).toBeUndefined();
+    expect(
+      handleMemoryArtifact({ memoryArtifact: artifact, currentData: deletedData }),
+    ).toBeUndefined();
   });
 });

@@ -556,8 +556,7 @@ const clipPrimaryConversationRecallContent = (content, maxChars) => {
 
 const clipConversationRecallContent = (result, maxChars) => {
   const content = typeof result?.content === 'string' ? result.content : '';
-  const primaryContent =
-    typeof result?.primaryContent === 'string' ? result.primaryContent : '';
+  const primaryContent = typeof result?.primaryContent === 'string' ? result.primaryContent : '';
   if (!primaryContent || content.length <= maxChars) {
     return clipContent(content, maxChars);
   }

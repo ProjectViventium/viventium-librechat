@@ -187,9 +187,9 @@ export default function CallButton({ className }: { className?: string }) {
               'flex items-center justify-center rounded-lg p-2 transition-all duration-200',
               'hover:bg-surface-secondary focus:outline-none focus:ring-2 focus:ring-offset-2',
               state === 'idle' && 'text-text-secondary hover:text-text-primary',
-              state === 'connecting' && 'text-yellow-500 cursor-wait',
+              state === 'connecting' && 'cursor-wait text-yellow-500',
               state === 'active' &&
-                'text-green-500 bg-green-500/10 hover:bg-red-500/10 hover:text-red-500',
+                'bg-green-500/10 text-green-500 hover:bg-red-500/10 hover:text-red-500',
               state === 'error' && 'text-red-500',
               className,
             )}

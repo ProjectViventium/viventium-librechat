@@ -123,11 +123,16 @@ function collectSourceFiles(sourceRoot) {
       if (!absolutePath.startsWith(sourceRootWithSeparator)) {
         throw new Error('Sandpack source file escaped its package root');
       }
-      const relativePath = path.relative(sourceRoot, absolutePath);
+      /* === VIVENTIUM START ===
+       * Feature: Cross-platform immutable Sandpack manifest.
+       * Purpose: Hash the same package path identity on POSIX and Windows instead of native separators.
+       */
+      const relativePath = path.relative(sourceRoot, absolutePath).split(path.sep).join('/');
+      /* === VIVENTIUM END === */
       if (
         relativePath.length === 0 ||
         path.isAbsolute(relativePath) ||
-        relativePath.split(path.sep).includes('..')
+        relativePath.split('/').includes('..')
       ) {
         throw new Error('Sandpack source produced an unsafe relative path');
       }

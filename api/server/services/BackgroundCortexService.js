@@ -927,9 +927,7 @@ function parseActivationResponse(response) {
     }
 
     const errorCode =
-      terminalError?.code === 'JSON_VALIDATE_FAILED'
-        ? 'JSON_VALIDATE_FAILED'
-        : 'JSON_PARSE_FAILED';
+      terminalError?.code === 'JSON_VALIDATE_FAILED' ? 'JSON_VALIDATE_FAILED' : 'JSON_PARSE_FAILED';
     logger.warn('[BackgroundCortexService] Invalid activation response', {
       response_hash: hashString(response, 12),
       response_length: typeof response === 'string' ? response.length : 0,
@@ -3679,8 +3677,7 @@ async function executeCortexOnce({
         glasshive_worker_feelings_hash: backgroundFeelingTail
           ? safeReq._viventiumFeelingSnapshot?.snapshotHash || ''
           : '',
-        glasshive_worker_feelings_scope:
-          safeReq._viventiumFeelingSnapshot?.agentScope || 'unknown',
+        glasshive_worker_feelings_scope: safeReq._viventiumFeelingSnapshot?.agentScope || 'unknown',
         glasshive_worker_feelings_range_prompt_override_count:
           safeReq._viventiumFeelingSnapshot?.rangePromptOverrideCount ?? 0,
         glasshive_worker_feelings_active_range_prompt_override_count:

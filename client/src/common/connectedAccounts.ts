@@ -44,8 +44,7 @@ export function connectedAccountsSetupCleanUrl(location: {
  * Feature: Remount-safe Easy Install account handoff.
  * Purpose: The authenticated shell can remount after login; preserve the setup intent until the user dismisses it.
  */
-export const CONNECTED_ACCOUNTS_SETUP_PENDING_KEY =
-  'viventium:connected-accounts-setup-pending';
+export const CONNECTED_ACCOUNTS_SETUP_PENDING_KEY = 'viventium:connected-accounts-setup-pending';
 
 export function isConnectedAccountsSetupDestination(target: string | null): boolean {
   if (target == null || !target.startsWith('/') || target.startsWith('//')) {
@@ -53,9 +52,7 @@ export function isConnectedAccountsSetupDestination(target: string | null): bool
   }
 
   const destination = new URL(target, 'https://viventium.invalid');
-  return (
-    destination.pathname === '/c/new' && destination.searchParams.get('setup') === 'accounts'
-  );
+  return destination.pathname === '/c/new' && destination.searchParams.get('setup') === 'accounts';
 }
 
 export function shouldResumeConnectedAccountsSetup(

@@ -405,9 +405,8 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
       if (repaired) {
         sanitizeAggregatedContentParts(contentParts);
         req._viventiumVisibleDeltaAggregationRepaired = true;
-        req._viventiumVisibleDeltaAggregationRecoveredText = extractVisibleTextFromContentParts(
-          contentParts,
-        );
+        req._viventiumVisibleDeltaAggregationRecoveredText =
+          extractVisibleTextFromContentParts(contentParts);
         if (!req._viventiumVisibleDeltaAggregationRepairLogged) {
           req._viventiumVisibleDeltaAggregationRepairLogged = true;
           logger.warn(
@@ -503,8 +502,11 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
    * === VIVENTIUM END === */
   applyScheduledAgentOverride(primaryAgent, req);
   if (req.viventiumScheduledAgentExecution) {
-    const { provider, model, reasoning_effort: reasoningEffort } =
-      req.viventiumScheduledAgentExecution;
+    const {
+      provider,
+      model,
+      reasoning_effort: reasoningEffort,
+    } = req.viventiumScheduledAgentExecution;
     logger.info(
       `[scheduledAgent] Applied authenticated execution tuple provider=${provider} model=${model} effort=${reasoningEffort}`,
     );
@@ -635,8 +637,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
       if (previousOpenAIPlatformFallbackFlag === undefined) {
         delete req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure;
       } else {
-        req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure =
-          previousOpenAIPlatformFallbackFlag;
+        req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure = previousOpenAIPlatformFallbackFlag;
       }
     }
   };

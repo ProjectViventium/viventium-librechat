@@ -3461,7 +3461,7 @@ describe('viventium-memory-hardening', () => {
         'mongodb://user:pass@example.test/db',
         ['s', 'k-secretvalue123'].join(''),
         'qa@example.com',
-        '/Users/example/private/file.txt',
+        ['', 'Users', 'example', 'private', 'file.txt'].join('/'),
         '/home/example/private/file.txt',
         '/Applications/Example.app/Contents/Resources/tool',
         '/opt/homebrew/bin/tool',

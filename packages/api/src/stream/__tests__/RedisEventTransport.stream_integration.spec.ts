@@ -826,23 +826,36 @@ describe('RedisEventTransport Integration Tests', () => {
 
       const streamId = `error-${Date.now()}`;
       let receivedError: string | null = null;
+      let receiveError: ((error: string) => void) | undefined;
+      const deliveredError = new Promise<string>((resolve) => {
+        receiveError = resolve;
+      });
 
-      transport.subscribe(streamId, {
+      /* === VIVENTIUM START ===
+       * Purpose: Redis Cluster readiness is acknowledgement-driven. Await the
+       * actual channel and delivered error instead of assuming fixed delays.
+       */
+      const subscription = transport.subscribe(streamId, {
         onChunk: () => {},
         onError: (err) => {
           receivedError = err;
+          receiveError?.(err);
         },
       });
 
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      await subscription.ready;
 
       await transport.emitError(streamId, 'Test error message');
 
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      await expect(within(deliveredError, 2_000, 'cluster error delivery')).resolves.toBe(
+        'Test error message',
+      );
 
       expect(receivedError).toBe('Test error message');
 
+      subscription.unsubscribe();
       await transport.destroy();
+      /* === VIVENTIUM END === */
       subscriber.disconnect();
     });
   });

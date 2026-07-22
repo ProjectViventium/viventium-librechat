@@ -314,7 +314,9 @@ jobs:
           path: packages/data-schemas/dist
 
       - name: Run unit tests
-        run: cd packages/data-schemas && npm run test:ci
+        # VIVENTIUM START — prevent mongodb-memory-server binary-lock races between Jest workers.
+        run: cd packages/data-schemas && npm run test:ci -- --runInBand
+        # VIVENTIUM END
 
   test-packages-api:
     name: 'Tests: @librechat/api'

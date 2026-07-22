@@ -568,6 +568,40 @@ describe('/api/viventium/scheduler/stream', () => {
     await dispatched;
   });
 
+  test('does not write a structured subscription error after close during readiness', async () => {
+    let releaseSubscription;
+    let markSubscriptionStarted;
+    const subscriptionStarted = new Promise((resolve) => {
+      markSubscriptionStarted = resolve;
+    });
+    mockSubscribe = jest.fn(
+      () =>
+        new Promise((resolve) => {
+          releaseSubscription = resolve;
+          markSubscriptionStarted();
+        }),
+    );
+    const schedulerRouter = require('../scheduler');
+    const app = createTestApp(schedulerRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/scheduler/events/closed-during-readiness',
+      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+      query: { userId: 'user_1' },
+    });
+    const res = createMockRes();
+
+    const dispatched = dispatch(app, req, res);
+    await subscriptionStarted;
+    res.emit('close');
+    releaseSubscription(null);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(res.write).not.toHaveBeenCalled();
+    res._resolve();
+    await dispatched;
+  });
+
   test('unsubscribes when a normally completed response closes', async () => {
     const unsubscribe = jest.fn();
     let completeStream;

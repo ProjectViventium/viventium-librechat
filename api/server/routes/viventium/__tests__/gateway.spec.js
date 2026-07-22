@@ -861,6 +861,51 @@ describe('/api/viventium/gateway', () => {
     await dispatched;
   });
 
+  test('does not write a subscription error after the client closes during readiness', async () => {
+    let releaseSubscription;
+    let markSubscriptionStarted;
+    const subscriptionStarted = new Promise((resolve) => {
+      markSubscriptionStarted = resolve;
+    });
+    mockSubscribe = jest.fn(
+      () =>
+        new Promise((resolve) => {
+          releaseSubscription = resolve;
+          markSubscriptionStarted();
+        }),
+    );
+    const gatewayRouter = require('../gateway');
+    const app = createTestApp(gatewayRouter);
+    const query = {
+      channel: 'discord',
+      accountId: 'acct-1',
+      externalUserId: 'ext-1',
+    };
+    const headers = signedGatewayHeaders({
+      secret: 'gateway_secret',
+      method: 'GET',
+      path: '/api/viventium/gateway/stream/closed-during-readiness',
+      body: {},
+    });
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/gateway/stream/closed-during-readiness?channel=discord&accountId=acct-1&externalUserId=ext-1',
+      headers,
+      query,
+    });
+    const res = createMockRes();
+
+    const dispatched = dispatch(app, req, res);
+    await subscriptionStarted;
+    res.emit('close');
+    releaseSubscription(null);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(res.write).not.toHaveBeenCalled();
+    res._resolve();
+    await dispatched;
+  });
+
   test('GET cortex returns follow-up via semantic parent metadata lookup', async () => {
     const gatewayRouter = require('../gateway');
     const app = createTestApp(gatewayRouter);

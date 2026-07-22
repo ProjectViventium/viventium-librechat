@@ -653,6 +653,9 @@ router.get('/events/:streamId', schedulerAuth, async (req, res) => {
 
   if (!result) {
     res.removeListener('close', onRequestClose);
+    if (requestAbort.signal.aborted) {
+      return;
+    }
     if (!res.writableEnded) {
       writeSseEvent(res, 'error', { error: 'Failed to subscribe to stream' });
       res.end();

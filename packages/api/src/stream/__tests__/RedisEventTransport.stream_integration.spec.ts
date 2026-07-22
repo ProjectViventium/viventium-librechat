@@ -1,5 +1,22 @@
 import type { Redis, Cluster } from 'ioredis';
 
+/* === VIVENTIUM START ===
+ * Purpose: Bound acknowledgement waits in real Redis lifecycle acceptance
+ * without masking connection races behind fixed sleeps.
+ */
+function within<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timeout = setTimeout(() => reject(new Error(`Timed out waiting for ${label}`)), timeoutMs);
+  });
+  return Promise.race([promise, deadline]).finally(() => {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  });
+}
+/* === VIVENTIUM END === */
+
 /**
  * Integration tests for RedisEventTransport.
  *
@@ -11,6 +28,10 @@ import type { Redis, Cluster } from 'ioredis';
  * Run with: USE_REDIS=true npx jest RedisEventTransport.stream_integration
  */
 describe('RedisEventTransport Integration Tests', () => {
+  /* === VIVENTIUM START ===
+   * Purpose: Redis transport teardown is acknowledgement-aware and asynchronous;
+   * every modified teardown site in this suite awaits that public boundary.
+   * === VIVENTIUM END === */
   let originalEnv: NodeJS.ProcessEnv;
   let ioredisClient: Redis | Cluster | null = null;
   const testPrefix = 'EventTransport-Integration-Test';
@@ -49,6 +70,71 @@ describe('RedisEventTransport Integration Tests', () => {
   });
 
   describe('Pub/Sub Event Delivery', () => {
+    /* === VIVENTIUM START ===
+     * Purpose: Exercise the exact first-connect and reconnect acknowledgement
+     * boundaries without fixed sleeps masking Redis pub/sub races.
+     */
+    test('delivers immediately after readiness on fresh duplicated subscribers', async () => {
+      if (!ioredisClient) {
+        console.warn('Redis not available, skipping test');
+        return;
+      }
+
+      const { RedisEventTransport } = await import('../implementations/RedisEventTransport');
+
+      for (let cycle = 0; cycle < 10; cycle++) {
+        const subscriber = (ioredisClient as Redis).duplicate();
+        const transport = new RedisEventTransport(ioredisClient, subscriber);
+        const streamId = `acknowledged-first-connect-${cycle}`;
+        let receive: ((event: unknown) => void) | undefined;
+        const received = new Promise<unknown>((resolve) => {
+          receive = resolve;
+        });
+
+        const subscription = transport.subscribe(streamId, { onChunk: receive! });
+        await subscription.ready;
+        await transport.emitChunk(streamId, { cycle });
+
+        await expect(within(received, 2_000, `fresh cycle ${cycle}`)).resolves.toEqual({ cycle });
+
+        subscription.unsubscribe();
+        await transport.destroy();
+        subscriber.disconnect();
+      }
+    });
+
+    test('delivers every event across zero-sleep same-channel reconnect cycles', async () => {
+      if (!ioredisClient) {
+        console.warn('Redis not available, skipping test');
+        return;
+      }
+
+      const { RedisEventTransport } = await import('../implementations/RedisEventTransport');
+      const subscriber = (ioredisClient as Redis).duplicate();
+      const transport = new RedisEventTransport(ioredisClient, subscriber);
+      const streamId = 'acknowledged-reconnect';
+
+      for (let cycle = 0; cycle < 20; cycle++) {
+        let receive: ((event: unknown) => void) | undefined;
+        const received = new Promise<unknown>((resolve) => {
+          receive = resolve;
+        });
+        const subscription = transport.subscribe(streamId, { onChunk: receive! });
+
+        await subscription.ready;
+        await transport.emitChunk(streamId, { cycle });
+        await expect(within(received, 2_000, `reconnect cycle ${cycle}`)).resolves.toEqual({
+          cycle,
+        });
+
+        subscription.unsubscribe();
+      }
+
+      await transport.destroy();
+      subscriber.disconnect();
+    });
+    /* === VIVENTIUM END === */
+
     test('should deliver events to subscribers on same instance', async () => {
       if (!ioredisClient) {
         console.warn('Redis not available, skipping test');
@@ -88,7 +174,7 @@ describe('RedisEventTransport Integration Tests', () => {
       expect(doneEvent).toEqual({ finished: true });
 
       unsubscribe();
-      transport.destroy();
+      await transport.destroy();
       subscriber.disconnect();
     });
 
@@ -130,8 +216,8 @@ describe('RedisEventTransport Integration Tests', () => {
       expect(instance2Chunks[0]).toEqual({ data: 'from-instance-1' });
 
       sub2.unsubscribe();
-      transport1.destroy();
-      transport2.destroy();
+      await transport1.destroy();
+      await transport2.destroy();
       subscriber1.disconnect();
       subscriber2.disconnect();
     });
@@ -173,7 +259,7 @@ describe('RedisEventTransport Integration Tests', () => {
 
       sub1.unsubscribe();
       sub2.unsubscribe();
-      transport.destroy();
+      await transport.destroy();
       subscriber.disconnect();
     });
   });
@@ -213,7 +299,7 @@ describe('RedisEventTransport Integration Tests', () => {
         expect(receivedEvents[i]).toBe(i);
       }
 
-      transport.destroy();
+      await transport.destroy();
       subscriber.disconnect();
     });
 
@@ -267,7 +353,7 @@ describe('RedisEventTransport Integration Tests', () => {
       expect(receivedArgs).toEqual(argChunks);
       expect(receivedArgs.join('')).toBe('{"code": "# First line\\n..."}');
 
-      transport.destroy();
+      await transport.destroy();
       subscriber.disconnect();
     });
 
@@ -309,7 +395,7 @@ describe('RedisEventTransport Integration Tests', () => {
       expect(stream1Events).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
       expect(stream2Events).toEqual([0, 10, 20, 30, 40, 50, 60, 70, 80, 90]);
 
-      transport.destroy();
+      await transport.destroy();
       subscriber.disconnect();
     });
   });
@@ -355,7 +441,7 @@ describe('RedisEventTransport Integration Tests', () => {
 
       first.unsubscribe();
       second.unsubscribe();
-      transport.destroy();
+      await transport.destroy();
     });
     /* === VIVENTIUM END === */
 
@@ -397,7 +483,7 @@ describe('RedisEventTransport Integration Tests', () => {
 
       expect(receivedEvents).toEqual([0, 1, 2]);
 
-      transport.destroy();
+      await transport.destroy();
     });
 
     test('should buffer early messages and deliver when gaps are filled', async () => {
@@ -443,7 +529,7 @@ describe('RedisEventTransport Integration Tests', () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
       expect(receivedEvents).toEqual([0, 1, 2, 3, 4]);
 
-      transport.destroy();
+      await transport.destroy();
     });
 
     test('should force-flush on timeout when gaps are not filled', async () => {
@@ -487,7 +573,7 @@ describe('RedisEventTransport Integration Tests', () => {
 
       expect(receivedEvents).toEqual([2, 3]);
 
-      transport.destroy();
+      await transport.destroy();
       jest.useRealTimers();
     });
 
@@ -530,7 +616,7 @@ describe('RedisEventTransport Integration Tests', () => {
 
       expect(receivedEvents).toEqual(['no-seq-1', 'no-seq-2', 'done:finished']);
 
-      transport.destroy();
+      await transport.destroy();
     });
 
     test('should deliver done event after all pending chunks (terminal event ordering)', async () => {
@@ -585,7 +671,7 @@ describe('RedisEventTransport Integration Tests', () => {
       expect(doneReceived).toBe(true);
       expect(receivedEvents).toEqual(['chunk-0', 'chunk-1', 'chunk-2', 'done:complete']);
 
-      transport.destroy();
+      await transport.destroy();
     });
 
     test('should deliver error event after all pending chunks (terminal event ordering)', async () => {
@@ -637,7 +723,7 @@ describe('RedisEventTransport Integration Tests', () => {
       expect(errorReceived).toBe('Something failed');
       expect(receivedEvents).toEqual(['chunk-0', 'chunk-1', 'error:Something failed']);
 
-      transport.destroy();
+      await transport.destroy();
     });
   });
 
@@ -679,7 +765,7 @@ describe('RedisEventTransport Integration Tests', () => {
 
       sub1.unsubscribe();
       sub2.unsubscribe();
-      transport.destroy();
+      await transport.destroy();
       subscriber.disconnect();
     });
 
@@ -720,7 +806,7 @@ describe('RedisEventTransport Integration Tests', () => {
       // Now all left
       expect(allLeftCalled).toBe(true);
 
-      transport.destroy();
+      await transport.destroy();
       subscriber.disconnect();
     });
   });
@@ -755,7 +841,7 @@ describe('RedisEventTransport Integration Tests', () => {
 
       expect(receivedError).toBe('Test error message');
 
-      transport.destroy();
+      await transport.destroy();
       subscriber.disconnect();
     });
   });
@@ -776,7 +862,7 @@ describe('RedisEventTransport Integration Tests', () => {
       let abortReceived = false;
 
       // Register abort callback
-      transport.onAbort(streamId, () => {
+      await transport.onAbort(streamId, () => {
         abortReceived = true;
       });
 
@@ -791,7 +877,7 @@ describe('RedisEventTransport Integration Tests', () => {
 
       expect(abortReceived).toBe(true);
 
-      transport.destroy();
+      await transport.destroy();
       subscriber.disconnect();
     });
 
@@ -814,7 +900,7 @@ describe('RedisEventTransport Integration Tests', () => {
       let instance1AbortReceived = false;
 
       // Instance 1 registers abort callback (simulates server running generation)
-      transport1.onAbort(streamId, () => {
+      await transport1.onAbort(streamId, () => {
         instance1AbortReceived = true;
       });
 
@@ -830,8 +916,8 @@ describe('RedisEventTransport Integration Tests', () => {
       // Instance 1 should receive abort signal
       expect(instance1AbortReceived).toBe(true);
 
-      transport1.destroy();
-      transport2.destroy();
+      await transport1.destroy();
+      await transport2.destroy();
       subscriber1.disconnect();
       subscriber2.disconnect();
     });
@@ -852,10 +938,10 @@ describe('RedisEventTransport Integration Tests', () => {
       let callback2Called = false;
 
       // Multiple abort callbacks
-      transport.onAbort(streamId, () => {
+      await transport.onAbort(streamId, () => {
         callback1Called = true;
       });
-      transport.onAbort(streamId, () => {
+      await transport.onAbort(streamId, () => {
         callback2Called = true;
       });
 
@@ -868,7 +954,7 @@ describe('RedisEventTransport Integration Tests', () => {
       expect(callback1Called).toBe(true);
       expect(callback2Called).toBe(true);
 
-      transport.destroy();
+      await transport.destroy();
       subscriber.disconnect();
     });
 
@@ -886,7 +972,7 @@ describe('RedisEventTransport Integration Tests', () => {
       const streamId = `abort-cleanup-${Date.now()}`;
       let abortReceived = false;
 
-      transport.onAbort(streamId, () => {
+      await transport.onAbort(streamId, () => {
         abortReceived = true;
       });
 
@@ -903,7 +989,7 @@ describe('RedisEventTransport Integration Tests', () => {
       // Should NOT receive abort since stream was cleaned up
       expect(abortReceived).toBe(false);
 
-      transport.destroy();
+      await transport.destroy();
       subscriber.disconnect();
     });
   });
@@ -933,7 +1019,7 @@ describe('RedisEventTransport Integration Tests', () => {
       // Subscriber count should be 0
       expect(transport.getSubscriberCount(streamId)).toBe(0);
 
-      transport.destroy();
+      await transport.destroy();
       subscriber.disconnect();
     });
   });
@@ -962,7 +1048,7 @@ describe('RedisEventTransport Integration Tests', () => {
       // Throwing would cause unhandled promise rejections.
       await expect(transport.emitChunk(streamId, { data: 'test' })).resolves.toBeUndefined();
 
-      transport.destroy();
+      await transport.destroy();
     });
 
     test('should throw when emitDone publish fails', async () => {
@@ -988,7 +1074,7 @@ describe('RedisEventTransport Integration Tests', () => {
         'Redis connection lost',
       );
 
-      transport.destroy();
+      await transport.destroy();
     });
 
     test('should throw when emitError publish fails', async () => {
@@ -1014,7 +1100,7 @@ describe('RedisEventTransport Integration Tests', () => {
         'Redis connection lost',
       );
 
-      transport.destroy();
+      await transport.destroy();
     });
 
     test('should still deliver events successfully when publish succeeds', async () => {
@@ -1050,7 +1136,7 @@ describe('RedisEventTransport Integration Tests', () => {
       expect(receivedChunks.length).toBe(1);
       expect(doneEvent).toEqual({ finished: true });
 
-      transport.destroy();
+      await transport.destroy();
       subscriber.disconnect();
     });
   });

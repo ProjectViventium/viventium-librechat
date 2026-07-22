@@ -24,8 +24,12 @@ import {
  * Run with: USE_REDIS=true npx jest reconnect-reorder-desync
  */
 describe('Reconnect Reorder Buffer Desync (Regression)', () => {
+  /* === VIVENTIUM START ===
+   * Purpose: Reconnect tests await abort readiness and asynchronous transport
+   * teardown so their assertions cannot race Redis lifecycle acknowledgements.
+   * === VIVENTIUM END === */
   describe('Callback preservation across reconnect cycles (Unit)', () => {
-    test('allSubscribersLeft callback fires on every disconnect, not just the first', () => {
+    test('allSubscribersLeft callback fires on every disconnect, not just the first', async () => {
       const mockPublisher = {
         publish: jest.fn().mockResolvedValue(1),
       };
@@ -66,10 +70,10 @@ describe('Reconnect Reorder Buffer Desync (Regression)', () => {
 
       expect(callbackFireCount).toBe(3);
 
-      transport.destroy();
+      await transport.destroy();
     });
 
-    test('abort callback survives across reconnect cycles', () => {
+    test('abort callback survives across reconnect cycles', async () => {
       const mockPublisher = {
         publish: jest.fn().mockResolvedValue(1),
       };
@@ -88,7 +92,7 @@ describe('Reconnect Reorder Buffer Desync (Regression)', () => {
       let abortCallbackFired = false;
 
       // Register abort callback (simulates what createJob does)
-      transport.onAbort(streamId, () => {
+      await transport.onAbort(streamId, () => {
         abortCallbackFired = true;
       });
 
@@ -110,7 +114,7 @@ describe('Reconnect Reorder Buffer Desync (Regression)', () => {
       expect(abortCallbackFired).toBe(true);
 
       sub2.unsubscribe();
-      transport.destroy();
+      await transport.destroy();
     });
   });
 
@@ -185,7 +189,7 @@ describe('Reconnect Reorder Buffer Desync (Regression)', () => {
         sub.unsubscribe();
       }
 
-      transport.destroy();
+      await transport.destroy();
     });
 
     test('reorder buffer works correctly when syncReorderBuffer IS called', async () => {
@@ -236,7 +240,7 @@ describe('Reconnect Reorder Buffer Desync (Regression)', () => {
       expect(chunks.map((c) => (c as { index: number }).index)).toEqual([20, 21, 22, 23, 24]);
 
       sub.unsubscribe();
-      transport.destroy();
+      await transport.destroy();
     });
   });
 

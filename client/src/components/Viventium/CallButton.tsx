@@ -8,19 +8,21 @@
  *
  * Purpose:
  * - Add a modern, accessible Call entrypoint in LibreChat
- * - Opens LiveKit Agents Playground in a new tab/window (minimal coupling)
+ * - Opens the exact configured Viventium voice surface in a new tab/window (minimal coupling)
  *
  * Added: 2026-01-08
  */
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { Phone, PhoneOff, Loader2 } from 'lucide-react';
 import { useRecoilValue } from 'recoil';
 import { TooltipAnchor } from '@librechat/client';
 import { request } from 'librechat-data-provider';
 import { useAuthContext } from '~/hooks/AuthContext';
+import { useGetStartupConfig } from '~/data-provider';
 import store from '~/store';
 import { cn } from '~/utils';
+import { readVoiceCallFailureMessage } from './voiceCallError';
 
 type CallState = 'idle' | 'connecting' | 'active' | 'error';
 
@@ -29,12 +31,19 @@ export default function CallButton({ className }: { className?: string }) {
   const agentId = conversation?.agent_id;
   const conversationId = conversation?.conversationId;
   const { token } = useAuthContext();
+  const { data: startupConfig } = useGetStartupConfig();
 
   const [state, setState] = useState<CallState>('idle');
   const [error, setError] = useState<string | null>(null);
   const callWindowRef = useRef<Window | null>(null);
+  const errorId = useId();
 
-  const enabled = typeof agentId === 'string' && agentId.length > 0;
+  /* === VIVENTIUM START ===
+   * Feature: Voice readiness and privacy guard.
+   * Purpose: Missing or disabled Voice capability must not expose a working-looking call action.
+   * === VIVENTIUM END === */
+  const voiceEnabled = startupConfig?.viventiumVoiceEnabled === true;
+  const enabled = voiceEnabled && typeof agentId === 'string' && agentId.length > 0;
 
   // Reset to idle once the call window is closed.
   useEffect(() => {
@@ -50,16 +59,12 @@ export default function CallButton({ className }: { className?: string }) {
   }, []);
 
   const startCall = useCallback(async () => {
-    console.log('[VIVENTIUM][CallButton] startCall clicked', { enabled, state, agentId, conversationId });
-
     if (!enabled || state === 'connecting') {
-      console.log('[VIVENTIUM][CallButton] Early return - not enabled or connecting');
       return;
     }
 
     // If a call tab is already open, focus it.
     if (callWindowRef.current && !callWindowRef.current.closed) {
-      console.log('[VIVENTIUM][CallButton] Focusing existing window');
       callWindowRef.current.focus();
       return;
     }
@@ -68,7 +73,6 @@ export default function CallButton({ className }: { className?: string }) {
     setError(null);
 
     try {
-      console.log('[VIVENTIUM][CallButton] Calling /api/viventium/calls');
       const makeRequest = async (bearerToken?: string) => {
         return await fetch('/api/viventium/calls', {
           method: 'POST',
@@ -94,54 +98,52 @@ export default function CallButton({ className }: { className?: string }) {
         }
       }
 
-      console.log('[VIVENTIUM][CallButton] Response status:', resp.status);
-
       if (!resp.ok) {
-        const msg = await resp.text().catch(() => '');
-        console.error('[VIVENTIUM][CallButton] API error:', msg);
-        throw new Error(msg || `Call session failed (${resp.status})`);
+        setState('error');
+        setError(await readVoiceCallFailureMessage(resp));
+        return;
       }
 
       const data = await resp.json();
-      console.log('[VIVENTIUM][CallButton] Response data:', data);
 
       const url = data?.playgroundUrl;
       if (typeof url !== 'string' || url.length === 0) {
         throw new Error('Missing playgroundUrl');
       }
 
-      console.log('[VIVENTIUM][CallButton] Opening playground:', url);
-
       // Use simpler window.open to avoid popup blocker issues
       const w = window.open(url, '_blank');
 
       if (!w) {
-        console.warn('[VIVENTIUM][CallButton] Popup blocked, copying URL');
         setState('error');
-        setError('Popup blocked. URL copied to clipboard.');
-        await navigator.clipboard.writeText(url);
-        // Also show alert with the URL
-        alert(`Popup blocked! Open this URL manually:\n${url}`);
+        let copied = false;
+        try {
+          await navigator.clipboard?.writeText(url);
+          copied = true;
+        } catch {
+          // The visible recovery copy below remains usable when clipboard permission is denied.
+        }
+        setError(
+          copied
+            ? 'Your browser blocked the Voice window. The secure link was copied; paste it into a new tab.'
+            : 'Your browser blocked the Voice window. Allow pop-ups for Viventium, then try again.',
+        );
         return;
       }
 
       callWindowRef.current = w;
       setState('active');
       w.focus();
-      console.log('[VIVENTIUM][CallButton] Window opened successfully');
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : 'Call failed';
-      console.error('[VIVENTIUM][CallButton] Error:', e);
+    } catch {
       setState('error');
-      setError(msg);
-      alert(`Voice call error: ${msg}`);
+      setError('Voice could not start. Try again. If it keeps happening, check Viventium Status.');
     } finally {
       // If active, we keep it active until window closes; otherwise return to idle shortly.
       setTimeout(() => {
         setState((s) => (s === 'active' ? 'active' : 'idle'));
       }, 800);
     }
-  }, [agentId, conversationId, enabled, state]);
+  }, [agentId, conversationId, enabled, state, token]);
 
   const endCall = useCallback(() => {
     const w = callWindowRef.current;
@@ -159,46 +161,55 @@ export default function CallButton({ className }: { className?: string }) {
   const isConnecting = state === 'connecting';
   const isActive = state === 'active';
 
-  const label = isActive ? 'End voice call' : 'Start voice call';
+  const label = isActive ? 'End voice call' : error ? 'Retry voice call' : 'Start voice call';
   const title =
-    state === 'idle'
+    error ||
+    (state === 'idle'
       ? 'Start voice call'
       : state === 'connecting'
         ? 'Connecting…'
         : state === 'active'
           ? 'End voice call'
-          : error || 'Error';
+          : 'Voice could not start');
 
   return (
-    <TooltipAnchor
-      description={title}
-      render={
-        <button
-          type="button"
-          onClick={isActive ? endCall : startCall}
-          disabled={isConnecting}
-          aria-label={label}
-          className={cn(
-            'flex items-center justify-center rounded-lg p-2 transition-all duration-200',
-            'hover:bg-surface-secondary focus:outline-none focus:ring-2 focus:ring-offset-2',
-            state === 'idle' && 'text-text-secondary hover:text-text-primary',
-            state === 'connecting' && 'text-yellow-500 cursor-wait',
-            state === 'active' &&
-              'text-green-500 bg-green-500/10 hover:bg-red-500/10 hover:text-red-500',
-            state === 'error' && 'text-red-500',
-            className,
-          )}
-        >
-          {state === 'connecting' ? (
-            <Loader2 className="h-5 w-5 animate-spin" />
-          ) : state === 'active' ? (
-            <PhoneOff className="h-5 w-5" />
-          ) : (
-            <Phone className="h-5 w-5" />
-          )}
-        </button>
-      }
-    />
+    <div className="flex items-center gap-2">
+      <TooltipAnchor
+        description={title}
+        render={
+          <button
+            type="button"
+            onClick={isActive ? endCall : startCall}
+            disabled={isConnecting}
+            aria-label={label}
+            aria-describedby={error ? errorId : undefined}
+            className={cn(
+              'flex items-center justify-center rounded-lg p-2 transition-all duration-200',
+              'hover:bg-surface-secondary focus:outline-none focus:ring-2 focus:ring-offset-2',
+              state === 'idle' && 'text-text-secondary hover:text-text-primary',
+              state === 'connecting' && 'text-yellow-500 cursor-wait',
+              state === 'active' &&
+                'text-green-500 bg-green-500/10 hover:bg-red-500/10 hover:text-red-500',
+              state === 'error' && 'text-red-500',
+              className,
+            )}
+          >
+            {state === 'connecting' ? (
+              <Loader2 className="h-5 w-5 animate-spin" />
+            ) : state === 'active' ? (
+              <PhoneOff className="h-5 w-5" />
+            ) : (
+              <Phone className="h-5 w-5" />
+            )}
+          </button>
+        }
+      />
+      {error ? (
+        <span id={errorId} role="alert" className="max-w-64 text-xs leading-tight text-red-500">
+          {error}
+        </span>
+      ) : null}
+    </div>
   );
 }
 

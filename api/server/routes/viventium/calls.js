@@ -11,6 +11,8 @@
  * === VIVENTIUM END === */
 
 const express = require('express');
+const { logger } = require('@librechat/data-schemas');
+const { isEnabled } = require('@librechat/api');
 const { requireJwtAuth } = require('~/server/middleware');
 const {
   createCallSession,
@@ -24,6 +26,7 @@ const {
 const {
   buildCallLaunchResponse,
   shouldPreferPublicPlaygroundForRequest,
+  verifyPlaygroundReadiness,
 } = require('~/server/services/viventium/callLaunch');
 const { getConvo } = require('~/models');
 
@@ -42,23 +45,30 @@ async function dispatchAuth(req, res, next) {
     next();
   } catch (err) {
     const status = err?.status || 401;
-    console.error('[VIVENTIUM][calls] Dispatch auth failed:', err);
+    logger.warn('[VIVENTIUM][calls] dispatch_auth_failed', { status });
     res.status(status).json({ error: err?.message || 'Unauthorized' });
   }
 }
 
 router.post('/', requireJwtAuth, async (req, res) => {
-  console.log('[VIVENTIUM][calls] POST /api/viventium/calls', {
-    body: req.body,
-    userId: req.user?.id,
-  });
-
   try {
+    /* === VIVENTIUM START ===
+     * Feature: Voice readiness and privacy guard.
+     * Purpose: A disabled install must fail closed before creating any durable call state.
+     * === VIVENTIUM END === */
+    if (!isEnabled(process.env.VIVENTIUM_VOICE_ENABLED)) {
+      logger.info('[VIVENTIUM][calls] call_rejected', { reason: 'voice_not_enabled' });
+      return res.status(409).json({
+        error: 'voice_not_enabled',
+        message: 'Voice is not enabled. Open Viventium setup to enable Voice.',
+      });
+    }
+
     const { conversationId, agentId, requestedVoiceRoute } = req.body ?? {};
     const userId = req.user?.id;
 
     if (!userId) {
-      console.log('[VIVENTIUM][calls] Unauthorized - no userId');
+      logger.warn('[VIVENTIUM][calls] call_rejected', { reason: 'unauthorized' });
       return res.status(401).json({ error: 'Unauthorized' });
     }
     const normalizedConversationId = typeof conversationId === 'string' ? conversationId : 'new';
@@ -70,33 +80,39 @@ router.post('/', requireJwtAuth, async (req, res) => {
       try {
         const convo = await getConvo(userId, normalizedConversationId);
         if (!convo) {
-          console.log('[VIVENTIUM][calls] Conversation not found', {
-            normalizedConversationId,
-            userId,
-          });
+          logger.info('[VIVENTIUM][calls] call_rejected', { reason: 'conversation_not_found' });
           return res.status(404).json({ error: 'Conversation not found' });
         }
         if (typeof convo.agent_id === 'string' && convo.agent_id.length > 0) {
-          console.log('[VIVENTIUM][calls] Using conversation agent_id', {
-            requestedAgentId: effectiveAgentId,
-            conversationAgentId: convo.agent_id,
-          });
           effectiveAgentId = convo.agent_id;
         }
-      } catch (e) {
-        console.error('[VIVENTIUM][calls] Failed to load conversation for agent_id', e);
+      } catch {
+        logger.error('[VIVENTIUM][calls] conversation_lookup_failed');
         return res.status(500).json({ error: 'Failed to load conversation' });
       }
     }
-    console.log('[VIVENTIUM][calls] Selected agent for voice call', {
-      effectiveAgentId,
-      conversationId: normalizedConversationId,
-    });
 
     if (typeof effectiveAgentId !== 'string' || effectiveAgentId.length === 0) {
-      console.log('[VIVENTIUM][calls] Bad request - no agentId');
-      return res.status(400).json({ error: 'agentId is required' });
+      logger.info('[VIVENTIUM][calls] call_rejected', { reason: 'agent_required' });
+      return res.status(400).json({
+        error: 'voice_agent_required',
+        message: 'Choose an assistant before starting Voice.',
+      });
     }
+
+    const preferPublicPlayground = shouldPreferPublicPlaygroundForRequest(req);
+    const readiness = await verifyPlaygroundReadiness({ preferPublicPlayground });
+    if (!readiness.ready) {
+      logger.warn('[VIVENTIUM][calls] call_rejected', {
+        reason: readiness.reason,
+      });
+      return res.status(503).json({
+        error: 'voice_runtime_not_ready',
+        reason: readiness.reason,
+        message: 'Voice is temporarily unavailable. Check Viventium status and try again.',
+      });
+    }
+    /* === VIVENTIUM END === */
 
     const session = await createCallSession({
       userId,
@@ -105,16 +121,14 @@ router.post('/', requireJwtAuth, async (req, res) => {
       requestedVoiceRoute,
     });
 
-    console.log('[VIVENTIUM][calls] Session created:', session);
-
     const response = buildCallLaunchResponse(session, {
-      preferPublicPlayground: shouldPreferPublicPlaygroundForRequest(req),
+      preferPublicPlayground,
     });
 
-    console.log('[VIVENTIUM][calls] Response:', response);
+    logger.info('[VIVENTIUM][calls] call_session_created');
     res.json(response);
-  } catch (e) {
-    console.error('[VIVENTIUM][calls] error', e);
+  } catch {
+    logger.error('[VIVENTIUM][calls] call_session_create_failed');
     res.status(500).json({ error: 'Failed to create call session' });
   }
 });
@@ -135,7 +149,7 @@ router.get('/:callSessionId/voice-settings', dispatchAuth, async (req, res) => {
     return res.json(settings);
   } catch (err) {
     const status = err?.status || 500;
-    console.error('[VIVENTIUM][calls] Call session voice-settings read failed:', err);
+    logger.warn('[VIVENTIUM][calls] voice_settings_read_failed', { status });
     return res
       .status(status)
       .json({ error: err?.message || 'Call session voice-settings read failed' });
@@ -160,7 +174,7 @@ router.post('/:callSessionId/voice-settings', dispatchAuth, async (req, res) => 
     return res.json(updated);
   } catch (err) {
     const status = err?.status || 500;
-    console.error('[VIVENTIUM][calls] Call session voice-settings update failed:', err);
+    logger.warn('[VIVENTIUM][calls] voice_settings_update_failed', { status });
     return res
       .status(status)
       .json({ error: err?.message || 'Call session voice-settings update failed' });
@@ -198,7 +212,7 @@ router.post('/:callSessionId/dispatch/claim', dispatchAuth, async (req, res) => 
     });
   } catch (err) {
     const status = err?.status || 500;
-    console.error('[VIVENTIUM][calls] Dispatch claim failed:', err);
+    logger.warn('[VIVENTIUM][calls] dispatch_claim_failed', { status });
     return res.status(status).json({ error: err?.message || 'Dispatch claim failed' });
   }
 });
@@ -233,7 +247,7 @@ router.post('/:callSessionId/dispatch/confirm', dispatchAuth, async (req, res) =
     });
   } catch (err) {
     const status = err?.status || 500;
-    console.error('[VIVENTIUM][calls] Dispatch confirm failed:', err);
+    logger.warn('[VIVENTIUM][calls] dispatch_confirm_failed', { status });
     return res.status(status).json({ error: err?.message || 'Dispatch confirm failed' });
   }
 });
@@ -278,7 +292,7 @@ router.post('/:callSessionId/state', dispatchAuth, async (req, res) => {
     });
   } catch (err) {
     const status = err?.status || 500;
-    console.error('[VIVENTIUM][calls] Call session state update failed:', err);
+    logger.warn('[VIVENTIUM][calls] call_session_state_update_failed', { status });
     return res.status(status).json({ error: err?.message || 'Call session state update failed' });
   }
 });

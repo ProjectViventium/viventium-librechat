@@ -803,6 +803,11 @@ export type TStartupConfig = {
    * === VIVENTIUM END === */
   viventiumInstallExperience?: 'express' | 'custom' | 'legacy';
   /* === VIVENTIUM START ===
+   * Feature: Voice readiness and privacy guard.
+   * Purpose: Hide call surfaces unless the server explicitly enables Voice.
+   * === VIVENTIUM END === */
+  viventiumVoiceEnabled?: boolean;
+  /* === VIVENTIUM START ===
    * Feature: Prompt Workbench local launcher.
    * Purpose: Expose the server-side workbench link gate to the web client.
    * === VIVENTIUM END === */

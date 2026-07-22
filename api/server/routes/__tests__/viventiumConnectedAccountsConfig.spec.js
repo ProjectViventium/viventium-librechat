@@ -35,6 +35,7 @@ const capabilityKeys = [
   'VIVENTIUM_CONNECTED_ACCOUNTS_ENABLED',
   'VIVENTIUM_LOCAL_SUBSCRIPTION_AUTH',
   'VIVENTIUM_EXPERIMENTAL_DIRECT_SUBSCRIPTION_AUTH',
+  'VIVENTIUM_VOICE_ENABLED',
   'OPENAI_API_KEY',
   'ANTHROPIC_API_KEY',
 ];
@@ -51,6 +52,15 @@ afterEach(() => {
 });
 
 describe('GET /api/config connected-account capability', () => {
+  it('projects Voice as disabled unless the runtime explicitly enables it', async () => {
+    let response = await request(app).get('/api/config');
+    expect(response.body.viventiumVoiceEnabled).toBe(false);
+
+    process.env.VIVENTIUM_VOICE_ENABLED = 'true';
+    response = await request(app).get('/api/config');
+    expect(response.body.viventiumVoiceEnabled).toBe(true);
+  });
+
   it('projects the Native capability without enabling experimental direct OAuth', async () => {
     process.env.VIVENTIUM_CONNECTED_ACCOUNTS_ENABLED = 'true';
 

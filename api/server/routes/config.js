@@ -140,6 +140,11 @@ router.get('/', async function (req, res) {
         ? process.env.VIVENTIUM_INSTALL_EXPERIENCE
         : undefined,
       /* === VIVENTIUM START ===
+       * Feature: Voice readiness and privacy guard.
+       * Purpose: Expose the explicit compiled Voice capability to browser call surfaces.
+       * === VIVENTIUM END === */
+      viventiumVoiceEnabled: isEnabled(process.env.VIVENTIUM_VOICE_ENABLED),
+      /* === VIVENTIUM START ===
        * Feature: Prompt Workbench local launcher.
        * Purpose: Keep the Connected Accounts workbench entry in sync with the server-side local
        * lifecycle route and its kill switch.

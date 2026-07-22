@@ -1246,7 +1246,28 @@ router.get('/stream/:streamId', telegramAuth, async (req, res) => {
   const lingerMs = resolveLingerMs(req);
   let lingerTimer = null;
 
+  /* === VIVENTIUM START ===
+   * Purpose: Cancel a Telegram stream before any asynchronous lookup can
+   * advance a disconnected client into subscription readiness.
+   */
+  const requestAbort = new AbortController();
+  let result;
+  const onRequestClose = () => {
+    requestAbort.abort();
+    logger.debug(`[TelegramStream] Client disconnected from ${streamId}`);
+    logTelegramTiming(traceId, 'stream_closed', streamStartTs);
+    if (lingerTimer) {
+      clearTimeout(lingerTimer);
+      lingerTimer = null;
+    }
+    result?.unsubscribe();
+  };
+  res.once('close', onRequestClose);
+
   const job = await GenerationJobManager.getJob(streamId);
+  if (requestAbort.signal.aborted) {
+    return;
+  }
   if (!job) {
     return res.status(404).json({
       error: 'Stream not found',
@@ -1295,6 +1316,9 @@ router.get('/stream/:streamId', telegramAuth, async (req, res) => {
 
   if (isResume) {
     const resumeState = await GenerationJobManager.getResumeState(streamId);
+    if (requestAbort.signal.aborted) {
+      return;
+    }
     if (resumeState && !res.writableEnded) {
       res.write(`event: message\ndata: ${JSON.stringify({ sync: true, resumeState })}\n\n`);
       if (typeof res.flush === 'function') {
@@ -1311,77 +1335,104 @@ router.get('/stream/:streamId', telegramAuth, async (req, res) => {
     }
   }
 
-  const result = await GenerationJobManager.subscribe(
-    streamId,
-    (event) => {
-      if (TELEGRAM_TRACE_ENABLED && event && typeof event === 'object') {
-        const eventName = event.event;
-        const status = event?.data?.status;
-        if (eventName === 'on_cortex_update' || eventName === 'on_cortex_followup') {
-          traceTelegram(
-            '[VIVENTIUM][telegram/stream] Event streamId=%s event=%s status=%s',
-            streamId,
-            eventName,
-            status,
-          );
+  try {
+    result = await GenerationJobManager.subscribe(
+      streamId,
+      (event) => {
+        if (TELEGRAM_TRACE_ENABLED && event && typeof event === 'object') {
+          const eventName = event.event;
+          const status = event?.data?.status;
+          if (eventName === 'on_cortex_update' || eventName === 'on_cortex_followup') {
+            traceTelegram(
+              '[VIVENTIUM][telegram/stream] Event streamId=%s event=%s status=%s',
+              streamId,
+              eventName,
+              status,
+            );
+          }
         }
+        if (!res.writableEnded) {
+          if (!firstEventLogged) {
+            logTelegramTiming(traceId, 'stream_first_event', streamStartTs);
+            firstEventLogged = true;
+          }
+          res.write(`event: message\ndata: ${JSON.stringify(event)}\n\n`);
+          if (typeof res.flush === 'function') {
+            res.flush();
+          }
+        }
+      },
+      (event) => {
+        if (TELEGRAM_TRACE_ENABLED && event && typeof event === 'object') {
+          const eventName = event.event;
+          if (event?.final || eventName === 'on_cortex_followup') {
+            traceTelegram(
+              '[VIVENTIUM][telegram/stream] Done streamId=%s event=%s final=%s',
+              streamId,
+              eventName,
+              Boolean(event?.final),
+            );
+          }
+        }
+        if (!res.writableEnded) {
+          res.write(`event: message\ndata: ${JSON.stringify(event)}\n\n`);
+          if (typeof res.flush === 'function') {
+            res.flush();
+          }
+          logTelegramTiming(traceId, 'stream_done', streamStartTs);
+          scheduleEnd();
+        }
+      },
+      (error) => {
+        if (!res.writableEnded) {
+          res.write(`event: error\ndata: ${JSON.stringify({ error })}\n\n`);
+          if (typeof res.flush === 'function') {
+            res.flush();
+          }
+          endStream();
+        }
+      },
+      requestAbort.signal,
+    );
+  } catch (error) {
+    if (requestAbort.signal.aborted) {
+      return;
+    }
+    res.removeListener('close', onRequestClose);
+    logger.error(`[VIVENTIUM][TelegramStream] subscription readiness failed: ${streamId}`, error);
+    if (!res.writableEnded) {
+      res.write(
+        `event: error\ndata: ${JSON.stringify({ error: 'Stream connection unavailable' })}\n\n`,
+      );
+      if (typeof res.flush === 'function') {
+        res.flush();
       }
-      if (!res.writableEnded) {
-        if (!firstEventLogged) {
-          logTelegramTiming(traceId, 'stream_first_event', streamStartTs);
-          firstEventLogged = true;
-        }
-        res.write(`event: message\ndata: ${JSON.stringify(event)}\n\n`);
-        if (typeof res.flush === 'function') {
-          res.flush();
-        }
-      }
-    },
-    (event) => {
-      if (TELEGRAM_TRACE_ENABLED && event && typeof event === 'object') {
-        const eventName = event.event;
-        if (event?.final || eventName === 'on_cortex_followup') {
-          traceTelegram(
-            '[VIVENTIUM][telegram/stream] Done streamId=%s event=%s final=%s',
-            streamId,
-            eventName,
-            Boolean(event?.final),
-          );
-        }
-      }
-      if (!res.writableEnded) {
-        res.write(`event: message\ndata: ${JSON.stringify(event)}\n\n`);
-        if (typeof res.flush === 'function') {
-          res.flush();
-        }
-        logTelegramTiming(traceId, 'stream_done', streamStartTs);
-        scheduleEnd();
-      }
-    },
-    (error) => {
-      if (!res.writableEnded) {
-        res.write(`event: error\ndata: ${JSON.stringify({ error })}\n\n`);
-        if (typeof res.flush === 'function') {
-          res.flush();
-        }
-        endStream();
-      }
-    },
-  );
-
-  if (!result) {
-    return res.status(404).json({ error: 'Failed to subscribe to stream' });
+      endStream();
+    }
+    return;
   }
 
-  req.on('close', () => {
-    logger.debug(`[TelegramStream] Client disconnected from ${streamId}`);
-    logTelegramTiming(traceId, 'stream_closed', streamStartTs);
-    if (lingerTimer) {
-      clearTimeout(lingerTimer);
-      lingerTimer = null;
+  if (!result) {
+    res.removeListener('close', onRequestClose);
+    if (requestAbort.signal.aborted) {
+      return;
     }
+    if (!res.writableEnded) {
+      res.write(
+        `event: error\ndata: ${JSON.stringify({ error: 'Failed to subscribe to stream' })}\n\n`,
+      );
+      if (typeof res.flush === 'function') {
+        res.flush();
+      }
+      endStream();
+    }
+    return;
+  }
+
+  if (requestAbort.signal.aborted) {
     result.unsubscribe();
-  });
+  }
+  /* === VIVENTIUM END === */
 });
 
 /* === VIVENTIUM NOTE ===

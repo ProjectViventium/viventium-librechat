@@ -65,6 +65,8 @@ interface ServiceGenerationSnapshot {
   generation: number;
   jobStore: IJobStore;
   eventTransport: IEventTransport;
+  cleanupOnComplete: boolean;
+  isRedis: boolean;
 }
 /* === VIVENTIUM END === */
 
@@ -128,6 +130,8 @@ class GenerationJobManagerClass {
       generation: this.serviceGeneration,
       jobStore: this._jobStore,
       eventTransport: this._eventTransport,
+      cleanupOnComplete: this._cleanupOnComplete,
+      isRedis: this._isRedis,
     };
   }
 
@@ -180,7 +184,11 @@ class GenerationJobManagerClass {
     this.jobStore.initialize();
 
     this.cleanupInterval = setInterval(() => {
-      this.cleanup();
+      void this.cleanup().catch((error) => {
+        if (this.lifecycleState === 'active') {
+          logger.error('[GenerationJobManager] Periodic cleanup failed:', error);
+        }
+      });
     }, 60000);
 
     if (this.cleanupInterval.unref) {
@@ -644,14 +652,19 @@ class GenerationJobManagerClass {
    * Check if a job exists.
    */
   async hasJob(streamId: string): Promise<boolean> {
-    return this.jobStore.hasJob(streamId);
+    const services = this.captureServices();
+    const hasJob = await services.jobStore.hasJob(streamId);
+    this.assertServiceGeneration(services.generation);
+    return hasJob;
   }
 
   /**
    * Get job status.
    */
   async getJobStatus(streamId: string): Promise<t.GenerationJobStatus | undefined> {
-    const jobData = await this.jobStore.getJob(streamId);
+    const services = this.captureServices();
+    const jobData = await services.jobStore.getJob(streamId);
+    this.assertServiceGeneration(services.generation);
     return jobData?.status as t.GenerationJobStatus | undefined;
   }
 
@@ -665,6 +678,12 @@ class GenerationJobManagerClass {
    * by the periodic cleanup job.
    */
   async completeJob(streamId: string, error?: string): Promise<void> {
+    /* === VIVENTIUM START ===
+     * Purpose: Completion may overlap shutdown; keep every awaited continuation
+     * on its original services and reject before touching replacement state.
+     */
+    const services = this.captureServices();
+    const { generation, jobStore, cleanupOnComplete } = services;
     const runtime = this.runtimeState.get(streamId);
 
     // Abort the controller to signal all pending operations (e.g., OAuth flow monitors)
@@ -674,7 +693,7 @@ class GenerationJobManagerClass {
     }
 
     // Clear content state and run step buffer (Redis only)
-    this.jobStore.clearContentState(streamId);
+    jobStore.clearContentState(streamId);
     this.runStepBuffers?.delete(streamId);
 
     // For error jobs, DON'T delete immediately - keep around so late-connecting
@@ -687,11 +706,12 @@ class GenerationJobManagerClass {
     // meaning cleanup on next interval). This gives clients ~60s to connect and
     // receive the error before the job is removed.
     if (error) {
-      await this.jobStore.updateJob(streamId, {
+      await jobStore.updateJob(streamId, {
         status: 'error',
         completedAt: Date.now(),
         error,
       });
+      this.assertServiceGeneration(generation);
       // Keep runtime state so subscribe() can access errorEvent
       logger.debug(
         `[GenerationJobManager] Job completed with error (keeping for late subscribers): ${streamId}`,
@@ -700,20 +720,25 @@ class GenerationJobManagerClass {
     }
 
     // Immediate cleanup if configured (default: true) - only for successful completions
-    if (this._cleanupOnComplete) {
-      this.runtimeState.delete(streamId);
+    if (cleanupOnComplete) {
       // Don't cleanup eventTransport here - let the done event fully transmit first.
       // EventTransport will be cleaned up when subscribers disconnect or by periodic cleanup.
-      await this.jobStore.deleteJob(streamId);
+      await jobStore.deleteJob(streamId);
+      this.assertServiceGeneration(generation);
+      if (!runtime || this.runtimeState.get(streamId) === runtime) {
+        this.runtimeState.delete(streamId);
+      }
     } else {
       // Only update status if keeping the job around
-      await this.jobStore.updateJob(streamId, {
+      await jobStore.updateJob(streamId, {
         status: 'complete',
         completedAt: Date.now(),
       });
+      this.assertServiceGeneration(generation);
     }
 
     logger.debug(`[GenerationJobManager] Job completed: ${streamId}`);
+    /* === VIVENTIUM END === */
   }
 
   /**
@@ -725,7 +750,14 @@ class GenerationJobManagerClass {
    * - The replica running generation receives signal and aborts its AbortController
    */
   async abortJob(streamId: string): Promise<AbortResult> {
-    const jobData = await this.jobStore.getJob(streamId);
+    /* === VIVENTIUM START ===
+     * Purpose: A delayed abort must never target a replacement same-stream job
+     * after manager teardown and reconfiguration.
+     */
+    const services = this.captureServices();
+    const { generation, jobStore, eventTransport, cleanupOnComplete } = services;
+    const jobData = await jobStore.getJob(streamId);
+    this.assertServiceGeneration(generation);
     const runtime = this.runtimeState.get(streamId);
 
     if (!jobData) {
@@ -742,8 +774,8 @@ class GenerationJobManagerClass {
 
     // Emit abort signal for cross-replica support (Redis mode)
     // This ensures the generating replica receives the abort signal
-    if (this.eventTransport.emitAbort) {
-      this.eventTransport.emitAbort(streamId);
+    if (eventTransport.emitAbort) {
+      eventTransport.emitAbort(streamId);
     }
 
     // Also abort local controller if we have it (same-replica abort)
@@ -752,11 +784,12 @@ class GenerationJobManagerClass {
     }
 
     /** Content before clearing state */
-    const result = await this.jobStore.getContentParts(streamId);
+    const result = await jobStore.getContentParts(streamId);
+    this.assertServiceGeneration(generation);
     const content = result?.content ?? [];
 
     /** Collected usage for all models */
-    const collectedUsage = this.jobStore.getCollectedUsage(streamId);
+    const collectedUsage = jobStore.getCollectedUsage(streamId);
 
     /** Text from content parts for fallback token counting */
     const text = parseTextParts(content as TMessageContentParts[]);
@@ -803,21 +836,26 @@ class GenerationJobManagerClass {
       runtime.finalEvent = abortFinalEvent;
     }
 
-    await this.eventTransport.emitDone(streamId, abortFinalEvent);
-    this.jobStore.clearContentState(streamId);
+    await eventTransport.emitDone(streamId, abortFinalEvent);
+    this.assertServiceGeneration(generation);
+    jobStore.clearContentState(streamId);
     this.runStepBuffers?.delete(streamId);
 
     // Immediate cleanup if configured (default: true)
-    if (this._cleanupOnComplete) {
-      this.runtimeState.delete(streamId);
+    if (cleanupOnComplete) {
       // Don't cleanup eventTransport here - let the abort event fully transmit first.
-      await this.jobStore.deleteJob(streamId);
+      await jobStore.deleteJob(streamId);
+      this.assertServiceGeneration(generation);
+      if (!runtime || this.runtimeState.get(streamId) === runtime) {
+        this.runtimeState.delete(streamId);
+      }
     } else {
       // Only update status if keeping the job around
-      await this.jobStore.updateJob(streamId, {
+      await jobStore.updateJob(streamId, {
         status: 'aborted',
         completedAt: Date.now(),
       });
+      this.assertServiceGeneration(generation);
     }
 
     logger.debug(`[GenerationJobManager] Job aborted: ${streamId}`);
@@ -830,6 +868,7 @@ class GenerationJobManagerClass {
       text,
       collectedUsage,
     };
+    /* === VIVENTIUM END === */
   }
 
   /**
@@ -848,6 +887,7 @@ class GenerationJobManagerClass {
    * @param onChunk - Handler for chunk events (streamed tokens, run steps, etc.)
    * @param onDone - Handler for completion event (includes final message)
    * @param onError - Handler for error events
+   * @param signal - Optional request-lifetime cancellation signal
    * @returns Subscription object with unsubscribe function, or null if job not found
    */
   async subscribe(
@@ -855,6 +895,7 @@ class GenerationJobManagerClass {
     onChunk: t.ChunkHandler,
     onDone?: t.DoneHandler,
     onError?: t.ErrorHandler,
+    signal?: AbortSignal,
   ): Promise<{ unsubscribe: t.UnsubscribeFn } | null> {
     /* === VIVENTIUM START ===
      * Purpose: Keep lazy runtime lookup, stored status, subscription readiness,
@@ -862,15 +903,29 @@ class GenerationJobManagerClass {
      */
     const services = this.captureServices();
     const { generation, jobStore, eventTransport } = services;
+    const createCancellationError = () => {
+      const error = new Error('Generation stream subscription cancelled');
+      error.name = 'AbortError';
+      return error;
+    };
+    if (signal?.aborted) {
+      throw createCancellationError();
+    }
     // Use lazy initialization to support cross-replica subscriptions
     const runtime = await this.getOrCreateRuntimeState(streamId, services);
     this.assertServiceGeneration(generation);
+    if (signal?.aborted) {
+      throw createCancellationError();
+    }
     if (!runtime) {
       return null;
     }
 
     const jobData = await jobStore.getJob(streamId);
     this.assertServiceGeneration(generation);
+    if (signal?.aborted) {
+      throw createCancellationError();
+    }
 
     // If job already complete/error, send final event or error
     // Error status takes precedence to ensure errors aren't misreported as successes
@@ -911,12 +966,22 @@ class GenerationJobManagerClass {
      * Await that boundary before generation is allowed to publish its first
      * chunk; otherwise fast first responses can be silently lost.
      * === VIVENTIUM END === */
+    let onAbort: () => void = () => undefined;
     try {
-      await subscription.ready;
+      const cancellation = new Promise<never>((_, reject) => {
+        onAbort = () => reject(createCancellationError());
+        signal?.addEventListener('abort', onAbort, { once: true });
+        if (signal?.aborted) {
+          onAbort();
+        }
+      });
+      await (signal ? Promise.race([subscription.ready, cancellation]) : subscription.ready);
       this.assertServiceGeneration(generation);
     } catch (error) {
       subscription.unsubscribe();
       throw error;
+    } finally {
+      signal?.removeEventListener('abort', onAbort);
     }
 
     // Check if this is the first subscriber
@@ -970,6 +1035,12 @@ class GenerationJobManagerClass {
    * This is critical for streaming deltas (tool args, message content) to arrive in order.
    */
   async emitChunk(streamId: string, event: t.ServerSentEvent): Promise<void> {
+    /* === VIVENTIUM START ===
+     * Purpose: Streaming emits stay on one service generation through their
+     * asynchronous transport acknowledgement.
+     */
+    const services = this.captureServices();
+    const { generation, jobStore, eventTransport, isRedis } = services;
     const runtime = this.runtimeState.get(streamId);
     if (!runtime || runtime.abortController.signal.aborted) {
       return;
@@ -979,7 +1050,7 @@ class GenerationJobManagerClass {
     this.trackUserMessage(streamId, event);
 
     // For Redis mode, persist chunk for later reconstruction (fire-and-forget for resumability)
-    if (this._isRedis) {
+    if (isRedis) {
       // The SSE event structure is { event: string, data: unknown, ... }
       // The aggregator expects { event: string, data: unknown } where data is the payload
       const eventObj = event as Record<string, unknown>;
@@ -988,7 +1059,7 @@ class GenerationJobManagerClass {
 
       if (eventType && eventData !== undefined) {
         // Store in format expected by aggregateContent: { event, data }
-        this.jobStore.appendChunk(streamId, { event: eventType, data: eventData }).catch((err) => {
+        jobStore.appendChunk(streamId, { event: eventType, data: eventData }).catch((err) => {
           logger.error(`[GenerationJobManager] Failed to append chunk:`, err);
         });
 
@@ -1005,7 +1076,9 @@ class GenerationJobManagerClass {
     }
 
     // Await the transport emit - critical for Redis mode to maintain event order
-    await this.eventTransport.emitChunk(streamId, event);
+    await eventTransport.emitChunk(streamId, event);
+    this.assertServiceGeneration(generation);
+    /* === VIVENTIUM END === */
   }
 
   /**
@@ -1091,6 +1164,11 @@ class GenerationJobManagerClass {
     streamId: string,
     metadata: Partial<t.GenerationJobMetadata>,
   ): Promise<void> {
+    /* === VIVENTIUM START ===
+     * Purpose: Metadata persistence must not report success after its service
+     * generation has been replaced.
+     */
+    const services = this.captureServices();
     const updates: Partial<SerializableJobData> = {};
     if (metadata.responseMessageId) {
       updates.responseMessageId = metadata.responseMessageId;
@@ -1116,7 +1194,9 @@ class GenerationJobManagerClass {
     if (metadata.promptTokens !== undefined) {
       updates.promptTokens = metadata.promptTokens;
     }
-    await this.jobStore.updateJob(streamId, updates);
+    await services.jobStore.updateJob(streamId, updates);
+    this.assertServiceGeneration(services.generation);
+    /* === VIVENTIUM END === */
   }
 
   /**
@@ -1157,14 +1237,22 @@ class GenerationJobManagerClass {
    * Get resume state for reconnecting clients.
    */
   async getResumeState(streamId: string): Promise<t.ResumeState | null> {
-    const jobData = await this.jobStore.getJob(streamId);
+    /* === VIVENTIUM START ===
+     * Purpose: Resume state cannot combine metadata from an old store with
+     * content from replacement services.
+     */
+    const services = this.captureServices();
+    const jobData = await services.jobStore.getJob(streamId);
+    this.assertServiceGeneration(services.generation);
     if (!jobData) {
       return null;
     }
 
-    const result = await this.jobStore.getContentParts(streamId);
+    const result = await services.jobStore.getContentParts(streamId);
+    this.assertServiceGeneration(services.generation);
     const aggregatedContent = result?.content ?? [];
-    const runSteps = await this.jobStore.getRunSteps(streamId);
+    const runSteps = await services.jobStore.getRunSteps(streamId);
+    this.assertServiceGeneration(services.generation);
 
     logger.debug(`[GenerationJobManager] getResumeState:`, {
       streamId,
@@ -1180,6 +1268,7 @@ class GenerationJobManagerClass {
       conversationId: jobData.conversationId,
       sender: jobData.sender,
     };
+    /* === VIVENTIUM END === */
   }
 
   /**
@@ -1187,14 +1276,20 @@ class GenerationJobManagerClass {
    * Persists to Redis for cross-replica consistency.
    */
   markSyncSent(streamId: string): void {
+    /* === VIVENTIUM START ===
+     * Purpose: Fire-and-forget persistence still captures its originating store
+     * instead of resolving a replacement service later.
+     */
+    const services = this.captureServices();
     const runtime = this.runtimeState.get(streamId);
     if (runtime) {
       runtime.syncSent = true;
     }
     // Persist to Redis for cross-replica consistency
-    this.jobStore.updateJob(streamId, { syncSent: true }).catch((err) => {
+    services.jobStore.updateJob(streamId, { syncSent: true }).catch((err) => {
       logger.error(`[GenerationJobManager] Failed to persist syncSent flag:`, err);
     });
+    /* === VIVENTIUM END === */
   }
 
   /**
@@ -1207,7 +1302,9 @@ class GenerationJobManagerClass {
       return localSyncSent;
     }
     // Cross-replica: check Redis
-    const jobData = await this.jobStore.getJob(streamId);
+    const services = this.captureServices();
+    const jobData = await services.jobStore.getJob(streamId);
+    this.assertServiceGeneration(services.generation);
     return jobData?.syncSent ?? false;
   }
 
@@ -1216,15 +1313,24 @@ class GenerationJobManagerClass {
    * Persists finalEvent to Redis for cross-replica access.
    */
   async emitDone(streamId: string, event: t.ServerSentEvent): Promise<void> {
+    /* === VIVENTIUM START ===
+     * Purpose: Terminal persistence and delivery share one immutable service
+     * generation and reject stale completion.
+     */
+    const services = this.captureServices();
     const runtime = this.runtimeState.get(streamId);
     if (runtime) {
       runtime.finalEvent = event;
     }
     // Persist finalEvent to Redis for cross-replica consistency
-    this.jobStore.updateJob(streamId, { finalEvent: JSON.stringify(event) }).catch((err) => {
-      logger.error(`[GenerationJobManager] Failed to persist finalEvent:`, err);
-    });
-    await this.eventTransport.emitDone(streamId, event);
+    void services.jobStore
+      .updateJob(streamId, { finalEvent: JSON.stringify(event) })
+      .catch((error) => {
+        logger.error(`[GenerationJobManager] Failed to persist terminal event:`, error);
+      });
+    await services.eventTransport.emitDone(streamId, event);
+    this.assertServiceGeneration(services.generation);
+    /* === VIVENTIUM END === */
   }
 
   /**
@@ -1233,15 +1339,22 @@ class GenerationJobManagerClass {
    * occurs before client connects to SSE stream).
    */
   async emitError(streamId: string, error: string): Promise<void> {
+    /* === VIVENTIUM START ===
+     * Purpose: Error persistence and delivery share one immutable service
+     * generation and reject stale completion.
+     */
+    const services = this.captureServices();
     const runtime = this.runtimeState.get(streamId);
     if (runtime) {
       runtime.errorEvent = error;
     }
     // Persist error to job store for cross-replica consistency
-    this.jobStore.updateJob(streamId, { error }).catch((err) => {
-      logger.error(`[GenerationJobManager] Failed to persist error:`, err);
+    void services.jobStore.updateJob(streamId, { error }).catch((persistError) => {
+      logger.error(`[GenerationJobManager] Failed to persist terminal error:`, persistError);
     });
-    await this.eventTransport.emitError(streamId, error);
+    await services.eventTransport.emitError(streamId, error);
+    this.assertServiceGeneration(services.generation);
+    /* === VIVENTIUM END === */
   }
 
   /**
@@ -1249,22 +1362,33 @@ class GenerationJobManagerClass {
    * Also cleans up any orphaned runtime state, buffers, and event transport entries.
    */
   private async cleanup(): Promise<void> {
-    const count = await this.jobStore.cleanup();
+    /* === VIVENTIUM START ===
+     * Purpose: Periodic cleanup must stop at the generation boundary instead
+     * of traversing replacement runtime, store, or transport state.
+     */
+    const services = this.captureServices();
+    const { generation, jobStore, eventTransport } = services;
+    const count = await jobStore.cleanup();
+    this.assertServiceGeneration(generation);
 
     // Cleanup runtime state for deleted jobs
-    for (const streamId of this.runtimeState.keys()) {
-      if (!(await this.jobStore.hasJob(streamId))) {
+    for (const [streamId, runtime] of this.runtimeState) {
+      const jobExists = await jobStore.hasJob(streamId);
+      this.assertServiceGeneration(generation);
+      if (!jobExists && this.runtimeState.get(streamId) === runtime) {
         this.runtimeState.delete(streamId);
         this.runStepBuffers?.delete(streamId);
-        this.jobStore.clearContentState(streamId);
-        this.eventTransport.cleanup(streamId);
+        jobStore.clearContentState(streamId);
+        eventTransport.cleanup(streamId);
       }
     }
 
     // Also check runStepBuffers for any orphaned entries (Redis mode only)
     if (this.runStepBuffers) {
-      for (const streamId of this.runStepBuffers.keys()) {
-        if (!(await this.jobStore.hasJob(streamId))) {
+      for (const [streamId, runStepBuffer] of this.runStepBuffers) {
+        const jobExists = await jobStore.hasJob(streamId);
+        this.assertServiceGeneration(generation);
+        if (!jobExists && this.runStepBuffers.get(streamId) === runStepBuffer) {
           this.runStepBuffers.delete(streamId);
         }
       }
@@ -1272,15 +1396,20 @@ class GenerationJobManagerClass {
 
     // Check eventTransport for orphaned streams (e.g., connections dropped without clean close)
     // These are streams that exist in eventTransport but have no corresponding job
-    for (const streamId of this.eventTransport.getTrackedStreamIds()) {
-      if (!(await this.jobStore.hasJob(streamId)) && !this.runtimeState.has(streamId)) {
-        this.eventTransport.cleanup(streamId);
+    for (const streamId of eventTransport.getTrackedStreamIds()) {
+      const jobExists = await jobStore.hasJob(streamId);
+      this.assertServiceGeneration(generation);
+      if (!jobExists) {
+        if (!this.runtimeState.has(streamId)) {
+          eventTransport.cleanup(streamId);
+        }
       }
     }
 
     if (count > 0) {
       logger.debug(`[GenerationJobManager] Cleaned up ${count} expired jobs`);
     }
+    /* === VIVENTIUM END === */
   }
 
   /**
@@ -1292,12 +1421,15 @@ class GenerationJobManagerClass {
     aggregatedContent?: Agents.MessageContentComplex[];
     createdAt: number;
   } | null> {
-    const jobData = await this.jobStore.getJob(streamId);
+    const services = this.captureServices();
+    const jobData = await services.jobStore.getJob(streamId);
+    this.assertServiceGeneration(services.generation);
     if (!jobData) {
       return null;
     }
 
-    const result = await this.jobStore.getContentParts(streamId);
+    const result = await services.jobStore.getContentParts(streamId);
+    this.assertServiceGeneration(services.generation);
     const aggregatedContent = result?.content ?? [];
 
     return {
@@ -1312,19 +1444,24 @@ class GenerationJobManagerClass {
    * Get total job count.
    */
   async getJobCount(): Promise<number> {
-    return this.jobStore.getJobCount();
+    const services = this.captureServices();
+    const count = await services.jobStore.getJobCount();
+    this.assertServiceGeneration(services.generation);
+    return count;
   }
 
   /**
    * Get job count by status.
    */
   async getJobCountByStatus(): Promise<Record<t.GenerationJobStatus, number>> {
+    const services = this.captureServices();
     const [running, complete, error, aborted] = await Promise.all([
-      this.jobStore.getJobCountByStatus('running'),
-      this.jobStore.getJobCountByStatus('complete'),
-      this.jobStore.getJobCountByStatus('error'),
-      this.jobStore.getJobCountByStatus('aborted'),
+      services.jobStore.getJobCountByStatus('running'),
+      services.jobStore.getJobCountByStatus('complete'),
+      services.jobStore.getJobCountByStatus('error'),
+      services.jobStore.getJobCountByStatus('aborted'),
     ]);
+    this.assertServiceGeneration(services.generation);
     return { running, complete, error, aborted };
   }
 
@@ -1351,7 +1488,10 @@ class GenerationJobManagerClass {
    * @returns Array of conversation IDs with active jobs
    */
   async getActiveJobIdsForUser(userId: string): Promise<string[]> {
-    return this.jobStore.getActiveJobIdsByUser(userId);
+    const services = this.captureServices();
+    const activeJobIds = await services.jobStore.getActiveJobIdsByUser(userId);
+    this.assertServiceGeneration(services.generation);
+    return activeJobIds;
   }
 
   /**

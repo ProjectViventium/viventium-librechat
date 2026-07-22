@@ -378,7 +378,26 @@ router.get('/stream/:streamId', schedulerAuth, async (req, res) => {
   const lingerMs = resolveLingerMs(req);
   let lingerTimer = null;
 
+  /* === VIVENTIUM START ===
+   * Purpose: Cancel a scheduler stream before any asynchronous lookup can
+   * advance a disconnected client into subscription readiness.
+   */
+  const requestAbort = new AbortController();
+  let result;
+  const onRequestClose = () => {
+    requestAbort.abort();
+    if (lingerTimer) {
+      clearTimeout(lingerTimer);
+      lingerTimer = null;
+    }
+    result?.unsubscribe();
+  };
+  res.once('close', onRequestClose);
+
   const job = await GenerationJobManager.getJob(streamId);
+  if (requestAbort.signal.aborted) {
+    return;
+  }
   if (!job) {
     return res.status(404).json({
       error: 'Stream not found',
@@ -419,12 +438,17 @@ router.get('/stream/:streamId', schedulerAuth, async (req, res) => {
 
   if (isResume) {
     const resumeState = await GenerationJobManager.getResumeState(streamId);
+    if (requestAbort.signal.aborted) {
+      return;
+    }
     if (resumeState && !res.writableEnded) {
       writeSseEvent(res, 'message', { sync: true, resumeState });
     }
   }
 
-  const result = await GenerationJobManager.subscribe(
+  let readinessFailed = false;
+
+  result = await GenerationJobManager.subscribe(
     streamId,
     (event) => {
       if (!res.writableEnded) {
@@ -443,19 +467,39 @@ router.get('/stream/:streamId', schedulerAuth, async (req, res) => {
         endStream();
       }
     },
-  );
+    requestAbort.signal,
+  ).catch((error) => {
+    if (!requestAbort.signal.aborted) {
+      readinessFailed = true;
+      res.removeListener('close', onRequestClose);
+      logger.error(
+        `[VIVENTIUM][SchedulerStream] subscription readiness failed: ${streamId}`,
+        error,
+      );
+      if (!res.writableEnded) {
+        writeSseEvent(res, 'error', { error: 'Stream connection unavailable' });
+        endStream();
+      }
+    }
+    return null;
+  });
 
   if (!result) {
-    return res.status(404).json({ error: 'Failed to subscribe to stream' });
+    res.removeListener('close', onRequestClose);
+    if (requestAbort.signal.aborted || readinessFailed) {
+      return;
+    }
+    if (!res.writableEnded) {
+      writeSseEvent(res, 'error', { error: 'Failed to subscribe to stream' });
+      endStream();
+    }
+    return;
   }
 
-  req.on('close', () => {
-    if (lingerTimer) {
-      clearTimeout(lingerTimer);
-      lingerTimer = null;
-    }
+  if (requestAbort.signal.aborted) {
     result.unsubscribe();
-  });
+  }
+  /* === VIVENTIUM END === */
 });
 
 router.get('/events/:streamId', schedulerAuth, async (req, res) => {
@@ -463,7 +507,22 @@ router.get('/events/:streamId', schedulerAuth, async (req, res) => {
   const userId = req.user?.id;
   const isResume = req.query.resume === 'true';
 
+  /* === VIVENTIUM START ===
+   * Purpose: Apply the same pre-lookup cancellation boundary to the structured
+   * scheduler event stream.
+   */
+  const requestAbort = new AbortController();
+  let result;
+  const onRequestClose = () => {
+    requestAbort.abort();
+    result?.unsubscribe();
+  };
+  res.once('close', onRequestClose);
+
   const job = await GenerationJobManager.getJob(streamId);
+  if (requestAbort.signal.aborted) {
+    return;
+  }
   if (!job) {
     return res.status(404).json({
       error: 'Stream not found',
@@ -497,91 +556,114 @@ router.get('/events/:streamId', schedulerAuth, async (req, res) => {
 
   if (isResume) {
     const resumeState = await GenerationJobManager.getResumeState(streamId);
+    if (requestAbort.signal.aborted) {
+      return;
+    }
     if (resumeState && !res.writableEnded) {
       writeSseEvent(res, 'message', { type: 'sync', resumeState });
     }
   }
 
-  const result = await GenerationJobManager.subscribe(
-    streamId,
-    (event) => {
-      if (res.writableEnded) {
-        return;
-      }
-
-      const attachments = extractAttachments(event);
-      for (const attachment of attachments) {
-        if (rememberAttachment(attachment)) {
-          continue;
+  try {
+    result = await GenerationJobManager.subscribe(
+      streamId,
+      (event) => {
+        if (res.writableEnded) {
+          return;
         }
-        writeSseEvent(res, 'attachment', attachment);
-      }
 
-      const deltas = extractTextDeltas(event);
-      for (const delta of deltas) {
-        if (delta) {
-          writeSseEvent(res, 'message', { type: 'delta', text: delta });
+        const attachments = extractAttachments(event);
+        for (const attachment of attachments) {
+          if (rememberAttachment(attachment)) {
+            continue;
+          }
+          writeSseEvent(res, 'attachment', attachment);
         }
-      }
 
-      if (event?.event === 'on_cortex_update' || event?.event === 'on_cortex_followup') {
-        writeSseEvent(res, 'message', {
-          type: 'status',
-          event: event.event,
-          data: event.data,
-        });
-      }
-    },
-    (event) => {
-      if (res.writableEnded) {
-        return;
-      }
-
-      const finalError = extractFinalError(event);
-      if (finalError) {
-        writeSseEvent(res, 'error', { error: finalError });
-      }
-
-      const finalText = extractFinalResponseText(event);
-      const responseMessageId = extractResponseMessageId(event);
-
-      const attachments = extractAttachments(event);
-      for (const attachment of attachments) {
-        if (rememberAttachment(attachment)) {
-          continue;
+        const deltas = extractTextDeltas(event);
+        for (const delta of deltas) {
+          if (delta) {
+            writeSseEvent(res, 'message', { type: 'delta', text: delta });
+          }
         }
-        writeSseEvent(res, 'attachment', attachment);
-      }
 
-      if (finalText) {
-        writeSseEvent(res, 'message', {
-          type: 'final',
-          text: finalText,
+        if (event?.event === 'on_cortex_update' || event?.event === 'on_cortex_followup') {
+          writeSseEvent(res, 'message', {
+            type: 'status',
+            event: event.event,
+            data: event.data,
+          });
+        }
+      },
+      (event) => {
+        if (res.writableEnded) {
+          return;
+        }
+
+        const finalError = extractFinalError(event);
+        if (finalError) {
+          writeSseEvent(res, 'error', { error: finalError });
+        }
+
+        const finalText = extractFinalResponseText(event);
+        const responseMessageId = extractResponseMessageId(event);
+
+        const attachments = extractAttachments(event);
+        for (const attachment of attachments) {
+          if (rememberAttachment(attachment)) {
+            continue;
+          }
+          writeSseEvent(res, 'attachment', attachment);
+        }
+
+        if (finalText) {
+          writeSseEvent(res, 'message', {
+            type: 'final',
+            text: finalText,
+            messageId: responseMessageId,
+          });
+        }
+
+        writeSseEvent(res, 'done', {
+          final: true,
           messageId: responseMessageId,
         });
-      }
-
-      writeSseEvent(res, 'done', {
-        final: true,
-        messageId: responseMessageId,
-      });
-      res.end();
-    },
-    (error) => {
-      if (!res.writableEnded) {
-        writeSseEvent(res, 'error', { error: String(error || 'Stream error') });
         res.end();
-      }
-    },
-  );
-
-  if (!result) {
-    return res.status(404).json({ error: 'Failed to subscribe to stream' });
+      },
+      (error) => {
+        if (!res.writableEnded) {
+          writeSseEvent(res, 'error', { error: String(error || 'Stream error') });
+          res.end();
+        }
+      },
+      requestAbort.signal,
+    );
+  } catch (error) {
+    if (requestAbort.signal.aborted) {
+      return;
+    }
+    res.removeListener('close', onRequestClose);
+    logger.error(`[VIVENTIUM][SchedulerEvents] subscription readiness failed: ${streamId}`, error);
+    if (!res.writableEnded) {
+      writeSseEvent(res, 'error', { error: 'Stream connection unavailable' });
+      res.end();
+    }
+    return;
   }
 
-  req.on('close', () => {
+  if (!result) {
+    res.removeListener('close', onRequestClose);
+    if (!res.writableEnded) {
+      writeSseEvent(res, 'error', { error: 'Failed to subscribe to stream' });
+      res.end();
+    }
+    return;
+  }
+
+  if (requestAbort.signal.aborted) {
     result.unsubscribe();
-  });
+  }
+  /* === VIVENTIUM END === */
 });
 
 router.get('/cortex/:messageId', schedulerAuth, async (req, res) => {

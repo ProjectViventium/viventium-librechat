@@ -1369,7 +1369,22 @@ router.get('/stream/:streamId', voiceAuth, async (req, res) => {
   const callSessionId = req.viventiumCallSession?.callSessionId || 'unknown';
   const logLatency = parseBoolEnv('VIVENTIUM_VOICE_LOG_LATENCY', false);
 
+  /* === VIVENTIUM START ===
+   * Purpose: Arm disconnect cancellation before job/resume lookup and Redis
+   * readiness so a closed voice client leaves no stream handler behind.
+   */
+  const requestAbort = new AbortController();
+  let result;
+  const onRequestClose = () => {
+    requestAbort.abort();
+    result?.unsubscribe();
+  };
+  res.once('close', onRequestClose);
+
   const job = await GenerationJobManager.getJob(streamId);
+  if (requestAbort.signal.aborted) {
+    return;
+  }
   if (!job) {
     logger.warn(
       `[VIVENTIUM][VoiceStream] stream_not_found streamId=${streamId} ` +
@@ -1408,6 +1423,9 @@ router.get('/stream/:streamId', voiceAuth, async (req, res) => {
 
   if (isResume) {
     const resumeState = await GenerationJobManager.getResumeState(streamId);
+    if (requestAbort.signal.aborted) {
+      return;
+    }
     if (resumeState && !res.writableEnded) {
       res.write(`event: message\ndata: ${JSON.stringify({ sync: true, resumeState })}\n\n`);
       if (typeof res.flush === 'function') {
@@ -1416,7 +1434,9 @@ router.get('/stream/:streamId', voiceAuth, async (req, res) => {
     }
   }
 
-  const result = await GenerationJobManager.subscribe(
+  let readinessFailed = false;
+
+  result = await GenerationJobManager.subscribe(
     streamId,
     (event) => {
       if (!res.writableEnded) {
@@ -1444,9 +1464,27 @@ router.get('/stream/:streamId', voiceAuth, async (req, res) => {
         res.end();
       }
     },
-  );
+    requestAbort.signal,
+  ).catch((error) => {
+    if (!requestAbort.signal.aborted) {
+      readinessFailed = true;
+      res.removeListener('close', onRequestClose);
+      logger.error(`[VIVENTIUM][VoiceStream] subscription readiness failed: ${streamId}`, error);
+      if (!res.writableEnded) {
+        res.write(
+          `event: error\ndata: ${JSON.stringify({ error: 'Stream connection unavailable' })}\n\n`,
+        );
+        res.end();
+      }
+    }
+    return null;
+  });
 
   if (!result) {
+    res.removeListener('close', onRequestClose);
+    if (requestAbort.signal.aborted || readinessFailed) {
+      return;
+    }
     logger.warn(
       `[VIVENTIUM][VoiceStream] subscribe_failed streamId=${streamId} ` +
         `callSessionId=${callSessionId} resume=${isResume}`,
@@ -1469,9 +1507,10 @@ router.get('/stream/:streamId', voiceAuth, async (req, res) => {
     return;
   }
 
-  req.on('close', () => {
+  if (requestAbort.signal.aborted) {
     result.unsubscribe();
-  });
+  }
+  /* === VIVENTIUM END === */
 });
 
 /* === VIVENTIUM START ===

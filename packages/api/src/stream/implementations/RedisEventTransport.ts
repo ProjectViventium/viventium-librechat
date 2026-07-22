@@ -45,6 +45,8 @@ interface ReorderBuffer {
 const REORDER_TIMEOUT_MS = 500;
 /** Max messages to buffer before force-flushing (prevents memory issues) */
 const MAX_BUFFER_SIZE = 100;
+/** Max time to wait for a Redis subscriber connection to become usable. */
+const SUBSCRIBER_READY_TIMEOUT_MS = 10_000;
 
 /**
  * Subscriber state for a stream
@@ -108,6 +110,11 @@ export class RedisEventTransport implements IEventTransport {
    * boundaries, so overlapping transitions can corrupt the subscriber client.
    */
   private subscriptionTransitions = new Map<string, Promise<void>>();
+  /* === VIVENTIUM START ===
+   * Purpose: Own deferred reconnect cleanup explicitly so renewed demand or
+   * transport teardown can cancel stale UNSUBSCRIBE listeners.
+   * === VIVENTIUM END === */
+  private deferredUnsubscribeCancellations = new Map<string, () => void>();
   /* === VIVENTIUM START ===
    * Purpose: Record connection ownership and stable listeners so asynchronous
    * teardown is idempotent and does not leak borrowed subscriber references.
@@ -260,6 +267,28 @@ export class RedisEventTransport implements IEventTransport {
     return Promise.race([Promise.resolve().then(operation), this.teardownSignal]);
   }
 
+  private withSubscriberLifecycleTimeout<T>(
+    operation: () => Promise<T>,
+    operationName: string,
+  ): Promise<T> {
+    let readyTimeout: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      readyTimeout = setTimeout(() => {
+        reject(
+          new Error(
+            `Redis subscriber ${operationName} did not settle within ${SUBSCRIBER_READY_TIMEOUT_MS}ms`,
+          ),
+        );
+      }, SUBSCRIBER_READY_TIMEOUT_MS);
+    });
+
+    return Promise.race([this.withTeardownCancellation(operation), timeout]).finally(() => {
+      if (readyTimeout) {
+        clearTimeout(readyTimeout);
+      }
+    });
+  }
+
   /* === VIVENTIUM START ===
    * Purpose: A newly duplicated ioredis connection performs a server readiness
    * check before it can safely enter subscriber mode. Sending SUBSCRIBE first
@@ -280,7 +309,10 @@ export class RedisEventTransport implements IEventTransport {
       return Promise.resolve();
     }
     if (currentStatus === 'wait') {
-      return this.withTeardownCancellation(() => this.subscriber.connect()).then(() => undefined);
+      return this.withSubscriberLifecycleTimeout(
+        () => this.subscriber.connect(),
+        'connection attempt',
+      ).then(() => undefined);
     }
     if (currentStatus === 'end') {
       return Promise.reject(new Error('Redis subscriber connection has ended'));
@@ -289,6 +321,7 @@ export class RedisEventTransport implements IEventTransport {
     return new Promise<void>((resolve, reject) => {
       let settled = false;
       let cancel = (_error: Error) => undefined;
+      let readyTimeout: ReturnType<typeof setTimeout> | undefined;
       const removeListener = (event: string, listener: () => void) => {
         if (typeof this.subscriber.off === 'function') {
           this.subscriber.off(event, listener);
@@ -297,6 +330,10 @@ export class RedisEventTransport implements IEventTransport {
         }
       };
       const cleanup = () => {
+        if (readyTimeout) {
+          clearTimeout(readyTimeout);
+          readyTimeout = undefined;
+        }
         removeListener('ready', onReady);
         removeListener('end', onEnd);
         this.connectionWaiterCancellations.delete(cancel);
@@ -329,6 +366,13 @@ export class RedisEventTransport implements IEventTransport {
       this.connectionWaiterCancellations.add(cancel);
       this.subscriber.once('ready', onReady);
       this.subscriber.once('end', onEnd);
+      readyTimeout = setTimeout(() => {
+        cancel(
+          new Error(
+            `Redis subscriber connection did not become ready within ${SUBSCRIBER_READY_TIMEOUT_MS}ms`,
+          ),
+        );
+      }, SUBSCRIBER_READY_TIMEOUT_MS);
 
       // Close the narrow check/listener-registration race.
       const statusAfterListeners = getStatus();
@@ -349,13 +393,24 @@ export class RedisEventTransport implements IEventTransport {
       return Promise.reject(new Error('Redis event transport has been destroyed'));
     }
 
+    this.cancelDeferredChannelUnsubscribe(channel);
+
     const existing = this.subscriptionReady.get(channel);
     if (existing) {
       return existing;
     }
 
     const precedingTransition = this.subscriptionTransitions.get(channel) ?? Promise.resolve();
-    const ready = this.withTeardownCancellation(() => precedingTransition)
+    const ready = this.withSubscriberLifecycleTimeout(
+      () => precedingTransition,
+      'preceding channel transition',
+    )
+      .catch((error) => {
+        if (this.subscriptionTransitions.get(channel) === precedingTransition) {
+          this.subscriptionTransitions.delete(channel);
+        }
+        throw error;
+      })
       .then(async () => {
         /* === VIVENTIUM START ===
          * Purpose: Retry a changed connection generation inside this one
@@ -365,7 +420,10 @@ export class RedisEventTransport implements IEventTransport {
         while (this.hasChannelDemand(channel)) {
           await this.waitForSubscriberConnection();
           const connectionGeneration = this.connectionGeneration;
-          await this.withTeardownCancellation(() => this.subscriber.subscribe(channel));
+          await this.withSubscriberLifecycleTimeout(
+            () => this.subscriber.subscribe(channel),
+            'subscription acknowledgement',
+          );
           if (connectionGeneration === this.connectionGeneration) {
             return;
           }
@@ -417,8 +475,6 @@ export class RedisEventTransport implements IEventTransport {
           .catch((err) => {
             logger.error(`[RedisEventTransport] Failed teardown unsubscribe from ${channel}:`, err);
           });
-      } else if (!this.ownsSubscriber && subscriberStatus !== 'end') {
-        this.deferChannelUnsubscribe(channel);
       }
       return Promise.resolve();
     }
@@ -437,6 +493,9 @@ export class RedisEventTransport implements IEventTransport {
       .catch(() => undefined)
       .then(() => {
         if (this.destroyed) {
+          return undefined;
+        }
+        if (this.hasChannelDemand(channel)) {
           return undefined;
         }
         const subscriberStatus = (this.subscriber as { status?: string }).status;
@@ -468,6 +527,10 @@ export class RedisEventTransport implements IEventTransport {
    * still closes an owned client directly and never closes a borrowed client.
    * === VIVENTIUM END === */
   private deferChannelUnsubscribe(channel: string): void {
+    if (this.destroyed || this.deferredUnsubscribeCancellations.has(channel)) {
+      return;
+    }
+
     let settled = false;
     let onReady = () => undefined;
     const cleanup = () => {
@@ -482,23 +545,27 @@ export class RedisEventTransport implements IEventTransport {
         this.subscriber.removeListener('ready', onReady);
         this.subscriber.removeListener('end', cleanup);
       }
+      if (this.deferredUnsubscribeCancellations.get(channel) === cleanup) {
+        this.deferredUnsubscribeCancellations.delete(channel);
+      }
     };
     onReady = () => {
+      cleanup();
       setImmediate(() => {
-        void this.subscriber
-          .unsubscribe(channel)
-          .catch((error) => {
-            logger.error(
-              `[RedisEventTransport] Failed deferred unsubscribe from ${channel}:`,
-              error,
-            );
-          })
-          .finally(cleanup);
+        if (this.destroyed || this.hasChannelDemand(channel)) {
+          return;
+        }
+        void this.queueChannelUnsubscribe(channel);
       });
     };
 
+    this.deferredUnsubscribeCancellations.set(channel, cleanup);
     this.subscriber.once('ready', onReady);
     this.subscriber.once('end', cleanup);
+  }
+
+  private cancelDeferredChannelUnsubscribe(channel: string): void {
+    this.deferredUnsubscribeCancellations.get(channel)?.();
   }
 
   /** Get next sequence number for a stream (0-indexed) */
@@ -1011,6 +1078,9 @@ export class RedisEventTransport implements IEventTransport {
     for (const cancel of [...this.connectionWaiterCancellations]) {
       cancel(cancellationError);
     }
+    for (const cancel of [...this.deferredUnsubscribeCancellations.values()]) {
+      cancel();
+    }
     this.destroyPromise = this.destroyInternal();
     return this.destroyPromise;
   }
@@ -1040,6 +1110,7 @@ export class RedisEventTransport implements IEventTransport {
     this.subscribedChannels.clear();
     this.subscriptionReady.clear();
     this.subscriptionTransitions.clear();
+    this.deferredUnsubscribeCancellations.clear();
     this.streams.clear();
     this.sequenceCounters.clear();
     if (typeof this.subscriber.removeListener === 'function') {

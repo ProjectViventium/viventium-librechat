@@ -143,6 +143,28 @@ describe('RedisEventTransport subscription lifecycle', () => {
     await transport.destroy();
   });
 
+  test('cancels a deferred unsubscribe when same-channel demand returns before ready', async () => {
+    const { publisher, subscriber } = createSubscriber();
+    const transport = new RedisEventTransport(publisher as never, subscriber as never);
+    const first = transport.subscribe('renewed-demand', { onChunk: () => undefined });
+    await first.ready;
+
+    subscriber.status = 'reconnecting';
+    subscriber.emit('close');
+    first.unsubscribe();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const replacement = transport.subscribe('renewed-demand', { onChunk: () => undefined });
+    subscriber.status = 'ready';
+    subscriber.emit('ready');
+    await replacement.ready;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(subscriber.subscribe).toHaveBeenCalledTimes(2);
+    expect(subscriber.unsubscribe).not.toHaveBeenCalled();
+    await transport.destroy();
+  });
+
   test('serializes a resubscribe behind the preceding unsubscribe acknowledgement', async () => {
     const { publisher, subscriber } = createSubscriber();
     let acknowledgeUnsubscribe: (() => void) | undefined;
@@ -157,6 +179,7 @@ describe('RedisEventTransport subscription lifecycle', () => {
     const first = transport.subscribe('reconnect', { onChunk: () => undefined });
     await first.ready;
     first.unsubscribe();
+    await new Promise<void>((resolve) => setImmediate(resolve));
 
     const second = transport.subscribe('reconnect', { onChunk: () => undefined });
     await new Promise<void>((resolve) => setImmediate(resolve));
@@ -191,7 +214,7 @@ describe('RedisEventTransport subscription lifecycle', () => {
 
     expect(outcome).toBe('ready');
     expect(subscriber.subscribe).toHaveBeenCalledTimes(2);
-    expect(subscriber.unsubscribe).toHaveBeenCalledTimes(2);
+    expect(subscriber.unsubscribe).toHaveBeenCalledTimes(1);
   });
 
   test('makes unsubscribe idempotent for each subscription handle', async () => {
@@ -303,6 +326,145 @@ describe('RedisEventTransport subscription lifecycle', () => {
     expect(subscriber.disconnect).toHaveBeenCalledTimes(1);
   });
 
+  test('rejects a subscriber connection that never becomes ready', async () => {
+    jest.useFakeTimers();
+    const { publisher, subscriber } = createSubscriber('reconnecting');
+    const transport = new RedisEventTransport(publisher as never, subscriber as never);
+    const subscription = transport.subscribe('ready-timeout', { onChunk: () => undefined });
+
+    try {
+      await jest.advanceTimersByTimeAsync(10_000);
+      await expect(subscription.ready).rejects.toThrow(
+        'Redis subscriber connection did not become ready within 10000ms',
+      );
+    } finally {
+      jest.useRealTimers();
+      await transport.destroy();
+    }
+  });
+
+  test('rejects a lazy connection attempt that never settles', async () => {
+    jest.useFakeTimers();
+    const { publisher, subscriber } = createSubscriber('wait');
+    subscriber.connect.mockReturnValue(new Promise<void>(() => undefined));
+    const transport = new RedisEventTransport(publisher as never, subscriber as never);
+    const subscription = transport.subscribe('connect-timeout', { onChunk: () => undefined });
+
+    try {
+      await jest.advanceTimersByTimeAsync(10_000);
+      await expect(subscription.ready).rejects.toThrow(
+        'Redis subscriber connection attempt did not settle within 10000ms',
+      );
+    } finally {
+      jest.useRealTimers();
+      await transport.destroy();
+    }
+  });
+
+  test('rejects a subscription acknowledgement that never settles', async () => {
+    jest.useFakeTimers();
+    const { publisher, subscriber } = createSubscriber();
+    subscriber.subscribe.mockReturnValue(new Promise<number>(() => undefined));
+    const transport = new RedisEventTransport(publisher as never, subscriber as never);
+    const subscription = transport.subscribe('subscribe-timeout', { onChunk: () => undefined });
+
+    try {
+      await jest.advanceTimersByTimeAsync(10_000);
+      await expect(subscription.ready).rejects.toThrow(
+        'Redis subscriber subscription acknowledgement did not settle within 10000ms',
+      );
+    } finally {
+      jest.useRealTimers();
+      await transport.destroy();
+    }
+  });
+
+  test('permits a recovered subscription after an acknowledgement timeout', async () => {
+    jest.useFakeTimers();
+    const { publisher, subscriber } = createSubscriber();
+    let releaseTimedOutAcknowledgement: (() => void) | undefined;
+    subscriber.subscribe
+      .mockImplementationOnce(
+        () =>
+          new Promise<number>((resolve) => {
+            releaseTimedOutAcknowledgement = () => resolve(1);
+          }),
+      )
+      .mockResolvedValueOnce(1);
+    const transport = new RedisEventTransport(publisher as never, subscriber as never);
+    const timedOut = transport.subscribe('subscribe-timeout-recovery', {
+      onChunk: () => undefined,
+    });
+
+    try {
+      await jest.advanceTimersByTimeAsync(10_000);
+      await expect(timedOut.ready).rejects.toThrow(
+        'Redis subscriber subscription acknowledgement did not settle within 10000ms',
+      );
+      timedOut.unsubscribe();
+
+      const onChunk = jest.fn();
+      const recovered = transport.subscribe('subscribe-timeout-recovery', { onChunk });
+      await recovered.ready;
+
+      releaseTimedOutAcknowledgement?.();
+      await Promise.resolve();
+      subscriber.emit(
+        'message',
+        'stream:{subscribe-timeout-recovery}:events',
+        JSON.stringify({ type: 'chunk', seq: 0, data: 'recovered-live' }),
+      );
+
+      expect(subscriber.subscribe).toHaveBeenCalledTimes(2);
+      expect(subscriber.unsubscribe).not.toHaveBeenCalled();
+      expect(onChunk).toHaveBeenCalledWith('recovered-live');
+    } finally {
+      jest.useRealTimers();
+      await transport.destroy();
+    }
+  });
+
+  test('times out a stalled unsubscribe transition and permits recovery', async () => {
+    const { publisher, subscriber } = createSubscriber();
+    subscriber.unsubscribe.mockImplementationOnce(() => new Promise<number>(() => undefined));
+    const transport = new RedisEventTransport(publisher as never, subscriber as never);
+    const first = transport.subscribe('unsubscribe-timeout-recovery', {
+      onChunk: () => undefined,
+    });
+    await first.ready;
+    first.unsubscribe();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(subscriber.unsubscribe).toHaveBeenCalledTimes(1);
+
+    jest.useFakeTimers();
+    const timedOut = transport.subscribe('unsubscribe-timeout-recovery', {
+      onChunk: () => undefined,
+    });
+
+    try {
+      await jest.advanceTimersByTimeAsync(10_000);
+      await expect(timedOut.ready).rejects.toThrow(
+        'Redis subscriber preceding channel transition did not settle within 10000ms',
+      );
+      timedOut.unsubscribe();
+
+      const onChunk = jest.fn();
+      const recovered = transport.subscribe('unsubscribe-timeout-recovery', { onChunk });
+      await recovered.ready;
+      subscriber.emit(
+        'message',
+        'stream:{unsubscribe-timeout-recovery}:events',
+        JSON.stringify({ type: 'chunk', seq: 0, data: 'recovered-after-unsubscribe-timeout' }),
+      );
+
+      expect(subscriber.subscribe).toHaveBeenCalledTimes(2);
+      expect(onChunk).toHaveBeenCalledWith('recovered-after-unsubscribe-timeout');
+    } finally {
+      jest.useRealTimers();
+      await transport.destroy();
+    }
+  });
+
   test('cancels a stalled lazy connect so owned teardown cannot hang', async () => {
     const { publisher, subscriber } = createSubscriber('wait');
     subscriber.connect.mockReturnValue(new Promise<void>(() => undefined));
@@ -344,6 +506,7 @@ describe('RedisEventTransport subscription lifecycle', () => {
     const first = transport.subscribe('stalled-transition', { onChunk: () => undefined });
     await first.ready;
     first.unsubscribe();
+    await new Promise<void>((resolve) => setImmediate(resolve));
     const second = transport.subscribe('stalled-transition', { onChunk: () => undefined });
     void second.ready.catch(() => undefined);
 
@@ -353,7 +516,7 @@ describe('RedisEventTransport subscription lifecycle', () => {
     expect(subscriber.disconnect).toHaveBeenCalledTimes(1);
   });
 
-  test('settles borrowed teardown during reconnect and defers only its unsubscribe', async () => {
+  test('settles borrowed teardown without leaving a stale reconnect listener', async () => {
     const { publisher, subscriber } = createSubscriber();
     const transport = new RedisEventTransport(publisher as never, subscriber as never);
     const subscription = transport.subscribe('borrowed-reconnect', { onChunk: () => undefined });
@@ -366,11 +529,21 @@ describe('RedisEventTransport subscription lifecycle', () => {
     expect(subscriber.disconnect).not.toHaveBeenCalled();
     expect(subscriber.unsubscribe).not.toHaveBeenCalled();
 
+    const onChunk = jest.fn();
+    const replacementTransport = new RedisEventTransport(publisher as never, subscriber as never);
+    const replacement = replacementTransport.subscribe('borrowed-reconnect', { onChunk });
     subscriber.status = 'ready';
     subscriber.emit('ready');
+    await replacement.ready;
     await new Promise<void>((resolve) => setImmediate(resolve));
+    subscriber.emit(
+      'message',
+      'stream:{borrowed-reconnect}:events',
+      JSON.stringify({ type: 'chunk', seq: 0, data: 'replacement-live' }),
+    );
 
-    expect(subscriber.unsubscribe).toHaveBeenCalledTimes(1);
-    expect(subscriber.unsubscribe).toHaveBeenCalledWith('stream:{borrowed-reconnect}:events');
+    expect(subscriber.unsubscribe).not.toHaveBeenCalled();
+    expect(onChunk).toHaveBeenCalledWith('replacement-live');
+    await replacementTransport.destroy();
   });
 });

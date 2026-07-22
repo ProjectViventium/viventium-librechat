@@ -219,6 +219,7 @@ function createMockReq({ method = 'POST', url, headers = {}, body = {}, query = 
 }
 
 function createMockRes() {
+  const emitter = new EventEmitter();
   const res = {
     statusCode: 200,
     headers: {},
@@ -229,6 +230,9 @@ function createMockRes() {
     flushHeaders: jest.fn(),
     write: jest.fn(),
     flush: jest.fn(),
+    once: emitter.once.bind(emitter),
+    removeListener: emitter.removeListener.bind(emitter),
+    emit: emitter.emit.bind(emitter),
     status(code) {
       res.statusCode = code;
       return res;
@@ -974,6 +978,41 @@ describe('/api/viventium/telegram', () => {
     expect(res.statusCode).toBe(404);
     expect(res.body.error).toBe('Stream not found');
     expect(mockSubscribe).not.toHaveBeenCalled();
+  });
+
+  test('does not subscribe when the client closes during job lookup', async () => {
+    let releaseJobLookup;
+    let markJobLookupStarted;
+    const jobLookupStarted = new Promise((resolve) => {
+      markJobLookupStarted = resolve;
+    });
+    mockGetJob = jest.fn(
+      () =>
+        new Promise((resolve) => {
+          releaseJobLookup = resolve;
+          markJobLookupStarted();
+        }),
+    );
+    const telegramRouter = require('../telegram');
+    const app = createTestApp(telegramRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/telegram/stream/closed-during-lookup?telegramUserId=tg-1',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      query: { telegramUserId: 'tg-1' },
+    });
+    const res = createMockRes();
+
+    const dispatched = dispatch(app, req, res);
+    await jobLookupStarted;
+    res.emit('close');
+    releaseJobLookup({ metadata: { userId: 'user_1' } });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(mockSubscribe).not.toHaveBeenCalled();
+    expect(res.flushHeaders).not.toHaveBeenCalled();
+    res._resolve();
+    await dispatched;
   });
 
   test('GET stream forwards attachment events in SSE payload', async () => {

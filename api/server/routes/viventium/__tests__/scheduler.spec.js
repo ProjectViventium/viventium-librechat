@@ -4,6 +4,7 @@
  * === VIVENTIUM END === */
 
 const express = require('express');
+const { EventEmitter } = require('events');
 
 let mockGetUserById;
 let mockGetMessage;
@@ -122,6 +123,7 @@ function createMockReq({ method = 'POST', url, headers = {}, body = {}, query = 
 }
 
 function createMockRes() {
+  const emitter = new EventEmitter();
   const res = {
     statusCode: 200,
     headers: {},
@@ -132,6 +134,9 @@ function createMockRes() {
     flushHeaders: jest.fn(),
     write: jest.fn(),
     flush: jest.fn(),
+    once: emitter.once.bind(emitter),
+    removeListener: emitter.removeListener.bind(emitter),
+    emit: emitter.emit.bind(emitter),
     status(code) {
       res.statusCode = code;
       return res;
@@ -491,6 +496,102 @@ describe('/api/viventium/scheduler/stream', () => {
     expect(res.statusCode).toBe(200);
     expect(writes).toContain('"event":"on_message_delta"');
     expect(writes).toContain('"final":true');
+  });
+
+  test('does not subscribe when the client closes during job lookup', async () => {
+    let releaseJobLookup;
+    let markJobLookupStarted;
+    const jobLookupStarted = new Promise((resolve) => {
+      markJobLookupStarted = resolve;
+    });
+    mockGetJob = jest.fn(
+      () =>
+        new Promise((resolve) => {
+          releaseJobLookup = resolve;
+          markJobLookupStarted();
+        }),
+    );
+    const schedulerRouter = require('../scheduler');
+    const app = createTestApp(schedulerRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/scheduler/stream/closed-during-lookup',
+      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+      query: { userId: 'user_1' },
+    });
+    const res = createMockRes();
+
+    const dispatched = dispatch(app, req, res);
+    await jobLookupStarted;
+    res.emit('close');
+    releaseJobLookup({ metadata: { userId: 'user_1' } });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(mockSubscribe).not.toHaveBeenCalled();
+    expect(res.flushHeaders).not.toHaveBeenCalled();
+    res._resolve();
+    await dispatched;
+  });
+
+  test('does not subscribe to structured events when the client closes during job lookup', async () => {
+    let releaseJobLookup;
+    let markJobLookupStarted;
+    const jobLookupStarted = new Promise((resolve) => {
+      markJobLookupStarted = resolve;
+    });
+    mockGetJob = jest.fn(
+      () =>
+        new Promise((resolve) => {
+          releaseJobLookup = resolve;
+          markJobLookupStarted();
+        }),
+    );
+    const schedulerRouter = require('../scheduler');
+    const app = createTestApp(schedulerRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/scheduler/events/closed-during-lookup',
+      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+      query: { userId: 'user_1' },
+    });
+    const res = createMockRes();
+
+    const dispatched = dispatch(app, req, res);
+    await jobLookupStarted;
+    res.emit('close');
+    releaseJobLookup({ metadata: { userId: 'user_1' } });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(mockSubscribe).not.toHaveBeenCalled();
+    expect(res.flushHeaders).not.toHaveBeenCalled();
+    res._resolve();
+    await dispatched;
+  });
+
+  test('unsubscribes when a normally completed response closes', async () => {
+    const unsubscribe = jest.fn();
+    let completeStream;
+    mockSubscribe = jest.fn(async (_streamId, _onChunk, onDone) => {
+      completeStream = onDone;
+      return { unsubscribe };
+    });
+    const schedulerRouter = require('../scheduler');
+    const app = createTestApp(schedulerRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/scheduler/stream/normal-completion',
+      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+      query: { userId: 'user_1' },
+    });
+    const res = createMockRes();
+
+    const dispatched = dispatch(app, req, res);
+    await new Promise((resolve) => setImmediate(resolve));
+    completeStream({ final: true });
+    await dispatched;
+    res.emit('close');
+
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -430,7 +430,8 @@ describe('RedisEventTransport Integration Tests', () => {
         ready = true;
       });
 
-      await Promise.resolve();
+      // Drain the acknowledgement chain without imposing a wall-clock sleep.
+      await new Promise<void>((resolve) => setImmediate(resolve));
       expect(ready).toBe(false);
       expect(second.ready).toBe(first.ready);
       expect(mockSubscriber.subscribe).toHaveBeenCalledTimes(1);

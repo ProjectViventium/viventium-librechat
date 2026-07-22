@@ -4,6 +4,7 @@ const request = require('supertest');
 const mockGetAllUserMemories = jest.fn();
 const mockCreateMemory = jest.fn();
 const mockDeleteMemory = jest.fn();
+const mockRenameMemory = jest.fn();
 const mockSetMemory = jest.fn();
 const mockEvaluateMemoryWrite = jest.fn();
 const mockRunMemoryMaintenance = jest.fn();
@@ -22,6 +23,7 @@ jest.mock('~/models', () => ({
   updateUserPersonalization: jest.fn(),
   createMemory: (...args) => mockCreateMemory(...args),
   deleteMemory: (...args) => mockDeleteMemory(...args),
+  renameMemory: (...args) => mockRenameMemory(...args),
   setMemory: (...args) => mockSetMemory(...args),
 }));
 
@@ -80,7 +82,7 @@ describe('memories write routes', () => {
 
   test('PATCH rejects updates when shared memory policy fails', async () => {
     mockGetAllUserMemories.mockResolvedValueOnce([
-      { key: 'context', value: 'old', tokenCount: 40 },
+      { key: 'context', value: 'old', tokenCount: 40, __v: 3 },
     ]);
     mockEvaluateMemoryWrite.mockReturnValueOnce({
       ok: false,
@@ -90,7 +92,7 @@ describe('memories write routes', () => {
 
     const res = await request(app)
       .patch('/api/memories/context')
-      .send({ value: 'x'.repeat(81) });
+      .send({ value: 'x'.repeat(81), expectedRevision: 3 });
 
     expect(res.status).toBe(400);
     expect(res.body.error).toBe('Memory storage would exceed the configured token limit.');
@@ -99,7 +101,9 @@ describe('memories write routes', () => {
   });
 
   test('PATCH applies deterministic pre-write compaction before validation', async () => {
-    mockGetAllUserMemories.mockResolvedValueOnce([{ key: 'world', value: 'old', tokenCount: 100 }]);
+    mockGetAllUserMemories.mockResolvedValueOnce([
+      { key: 'world', value: 'old', tokenCount: 100, __v: 2 },
+    ]);
     mockPrepareMemoryValueForWrite.mockReturnValueOnce({
       value: 'compacted world',
       tokenCount: 15,
@@ -112,7 +116,7 @@ describe('memories write routes', () => {
 
     const res = await request(app)
       .patch('/api/memories/world')
-      .send({ value: 'very long world value' });
+      .send({ value: 'very long world value', expectedRevision: 2 });
 
     expect(res.status).toBe(200);
     expect(mockPrepareMemoryValueForWrite).toHaveBeenCalledWith(
@@ -138,18 +142,17 @@ describe('memories write routes', () => {
 
   test('PATCH rename evaluates against the total minus the replaced key', async () => {
     mockGetAllUserMemories.mockResolvedValueOnce([
-      { key: 'context', value: 'old', tokenCount: 40 },
-      { key: 'drafts', value: 'other', tokenCount: 30 },
+      { key: 'context', value: 'old', tokenCount: 40, __v: 4 },
+      { key: 'drafts', value: 'other', tokenCount: 30, __v: 1 },
     ]);
-    mockCreateMemory.mockResolvedValueOnce({ ok: true });
-    mockDeleteMemory.mockResolvedValueOnce({ ok: true });
+    mockRenameMemory.mockResolvedValueOnce({ ok: true });
     mockGetAllUserMemories.mockResolvedValueOnce([
       { key: 'context_archive', value: 'new', tokenCount: 20 },
     ]);
 
     const res = await request(app)
       .patch('/api/memories/context')
-      .send({ key: 'context_archive', value: 'new content' });
+      .send({ key: 'context_archive', value: 'new content', expectedRevision: 4 });
 
     expect(res.status).toBe(200);
     expect(mockEvaluateMemoryWrite).toHaveBeenCalledWith(
@@ -159,11 +162,96 @@ describe('memories write routes', () => {
         previousTokenCount: 0,
       }),
     );
+    expect(mockRenameMemory).toHaveBeenCalledWith({
+      userId: 'user_1',
+      key: 'context',
+      newKey: 'context_archive',
+      value: 'new content',
+      tokenCount: 11,
+      expectedRevision: 4,
+    });
     expect(mockRunMemoryMaintenance).toHaveBeenCalledWith(
       expect.objectContaining({
         userId: 'user_1',
       }),
     );
+  });
+
+  test('PATCH returns a refresh conflict instead of overwriting a newer revision', async () => {
+    mockGetAllUserMemories.mockResolvedValueOnce([
+      { key: 'context', value: 'newer value', tokenCount: 11, __v: 5 },
+    ]);
+    mockSetMemory.mockResolvedValueOnce({ ok: false, conflict: true, revision: 5 });
+
+    const res = await request(app)
+      .patch('/api/memories/context')
+      .send({ value: 'stale edit', expectedRevision: 4 });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toContain('Refresh memories');
+    expect(mockSetMemory).toHaveBeenCalledWith(
+      expect.objectContaining({ key: 'context', expectedRevision: 4 }),
+    );
+    expect(mockRunMemoryMaintenance).not.toHaveBeenCalled();
+  });
+
+  test('PATCH rename returns a refresh conflict without a compensating write', async () => {
+    mockGetAllUserMemories.mockResolvedValueOnce([
+      { key: 'context', value: 'newer source', tokenCount: 12, __v: 5 },
+    ]);
+    mockRenameMemory.mockResolvedValueOnce({ ok: false, conflict: true, currentRevision: 5 });
+
+    const res = await request(app)
+      .patch('/api/memories/context')
+      .send({ key: 'context_archive', value: 'stale rename', expectedRevision: 4 });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toContain('Refresh memories');
+    expect(mockRenameMemory).toHaveBeenCalledWith({
+      userId: 'user_1',
+      key: 'context',
+      newKey: 'context_archive',
+      value: 'stale rename',
+      tokenCount: 12,
+      expectedRevision: 4,
+    });
+    expect(mockCreateMemory).not.toHaveBeenCalled();
+    expect(mockDeleteMemory).not.toHaveBeenCalled();
+    expect(mockRunMemoryMaintenance).not.toHaveBeenCalled();
+  });
+
+  test('PATCH rename gives a durable alternate-key action for a hidden tombstone target', async () => {
+    mockGetAllUserMemories.mockResolvedValueOnce([
+      { key: 'context', value: 'source', tokenCount: 12, __v: 4 },
+    ]);
+    mockRenameMemory.mockResolvedValueOnce({
+      ok: false,
+      conflict: true,
+      conflictReason: 'target_key_reserved',
+    });
+
+    const res = await request(app)
+      .patch('/api/memories/context')
+      .send({ key: 'context_archive', value: 'renamed value', expectedRevision: 4 });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe('That memory key is already reserved. Choose a different key.');
+    expect(res.body.error).not.toContain('Refresh');
+    expect(mockRunMemoryMaintenance).not.toHaveBeenCalled();
+  });
+
+  test('DELETE returns a refresh conflict instead of deleting a newer revision', async () => {
+    mockDeleteMemory.mockResolvedValueOnce({ ok: false, conflict: true, revision: 7 });
+
+    const res = await request(app).delete('/api/memories/context?revision=6');
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toContain('Refresh memories');
+    expect(mockDeleteMemory).toHaveBeenCalledWith({
+      userId: 'user_1',
+      key: 'context',
+      expectedRevision: 6,
+    });
   });
 
   test('POST runs maintenance after a successful write', async () => {

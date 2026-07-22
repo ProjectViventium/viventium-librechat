@@ -142,6 +142,8 @@ describe('conversationRecallService', () => {
     process.env.VIVENTIUM_CONVERSATION_RECALL_MAX_TRANSIENT_FAILURES = '4';
     process.env.VIVENTIUM_CONVERSATION_RECALL_MAX_PENDING_SYNCS = '8';
     process.env.VIVENTIUM_CONVERSATION_RECALL_MIN_SYNC_INTERVAL_MS = '0';
+    delete process.env.VIVENTIUM_CONVERSATION_RECALL_MAX_MESSAGE_TEXT_CHARS;
+    delete process.env.VIVENTIUM_CONVERSATION_RECALL_MAX_USER_MESSAGE_TEXT_CHARS;
 
     mockWriteFile.mockResolvedValue(undefined);
     mockUnlink.mockResolvedValue(undefined);
@@ -206,6 +208,93 @@ describe('conversationRecallService', () => {
       { user: 'user_1', file_id: 'conversation_recall:user_1:all' },
       expect.any(Object),
       { upsert: true, new: true },
+    );
+  });
+
+  test('indexes the complete bounded user turn when assistant turns use a smaller clip limit', async () => {
+    process.env.VIVENTIUM_CONVERSATION_RECALL_MAX_MESSAGE_TEXT_CHARS = '200';
+    delete process.env.VIVENTIUM_CONVERSATION_RECALL_MAX_USER_MESSAGE_TEXT_CHARS;
+    mockUserFindById.mockReturnValue(
+      queryResult({
+        personalization: { conversation_recall: true },
+      }),
+    );
+    const longUserTurn =
+      'Synthetic first-person event. '.repeat(100) +
+      'Critical user-authored tail evidence survives indexing.';
+    const longAssistantTurn =
+      'Synthetic assistant restatement. '.repeat(100) + 'Assistant tail should be clipped.';
+    mockMessageFind.mockReturnValue(
+      queryResult([
+        {
+          conversationId: 'conv_1',
+          createdAt: '2026-07-15T14:00:01.000Z',
+          isCreatedByUser: false,
+          text: longAssistantTurn,
+        },
+        {
+          conversationId: 'conv_1',
+          createdAt: '2026-07-15T14:00:00.000Z',
+          isCreatedByUser: true,
+          text: longUserTurn,
+        },
+      ]),
+    );
+    mockConversationFind.mockReturnValue(queryResult([]));
+    mockFileFind.mockReturnValue(queryResult([]));
+    mockFileFindOneAndUpdate.mockReturnValue(queryResult({ _id: 'file_all' }));
+
+    const service = require('../conversationRecallService');
+    await service.refreshConversationRecallForUser({ userId: 'user_1' });
+
+    const corpus = mockWriteFile.mock.calls[0][1];
+    expect(corpus).toContain('Critical user-authored tail evidence survives indexing.');
+    expect(corpus).not.toContain('Assistant tail should be clipped.');
+  });
+
+  test('orders each indexed reply after its parent when persistence timestamps are inverted', async () => {
+    mockUserFindById.mockReturnValue(
+      queryResult({
+        personalization: { conversation_recall: true },
+      }),
+    );
+
+    // Mongo returns newest-first. The parent user row was persisted milliseconds after its child.
+    mockMessageFind.mockReturnValue(
+      queryResult([
+        {
+          messageId: 'user_1',
+          parentMessageId: '00000000-0000-0000-0000-000000000000',
+          conversationId: 'conv_1',
+          createdAt: '2026-07-14T12:00:00.030Z',
+          isCreatedByUser: true,
+          text: 'Synthetic parent request.',
+        },
+        {
+          messageId: 'assistant_1',
+          parentMessageId: 'user_1',
+          conversationId: 'conv_1',
+          createdAt: '2026-07-14T12:00:00.000Z',
+          isCreatedByUser: false,
+          sender: 'assistant',
+          text: 'Synthetic child reply.',
+        },
+      ]),
+    );
+
+    mockConversationFind.mockReturnValue(queryResult([]));
+    mockFileFind.mockReturnValue(queryResult([]));
+    mockFileFindOneAndUpdate.mockReturnValue(queryResult({ _id: 'file_all' }));
+
+    const service = require('../conversationRecallService');
+    await service.refreshConversationRecallForUser({ userId: 'user_1' });
+
+    const writtenCorpus = String(mockWriteFile.mock.calls[0][1]);
+    expect(writtenCorpus.indexOf('Synthetic parent request.')).toBeLessThan(
+      writtenCorpus.indexOf('Synthetic child reply.'),
+    );
+    expect(writtenCorpus).toContain(
+      '<latest_timestamp>2026-07-14T12:00:00.030Z</latest_timestamp>',
     );
   });
 

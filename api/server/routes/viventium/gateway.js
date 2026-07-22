@@ -956,7 +956,22 @@ router.get('/stream/:streamId', gatewayAuth, async (req, res) => {
   const userId = req.user?.id;
   const isResume = req.query.resume === 'true';
 
+  /* === VIVENTIUM START ===
+   * Purpose: Arm gateway disconnect cancellation before job/resume lookup and
+   * Redis readiness.
+   */
+  const requestAbort = new AbortController();
+  let result;
+  const onRequestClose = () => {
+    requestAbort.abort();
+    result?.unsubscribe();
+  };
+  res.once('close', onRequestClose);
+
   const job = await GenerationJobManager.getJob(streamId);
+  if (requestAbort.signal.aborted) {
+    return;
+  }
   if (!job) {
     return res.status(404).json({
       error: 'Stream not found',
@@ -991,91 +1006,117 @@ router.get('/stream/:streamId', gatewayAuth, async (req, res) => {
 
   if (isResume) {
     const resumeState = await GenerationJobManager.getResumeState(streamId);
+    if (requestAbort.signal.aborted) {
+      return;
+    }
     if (resumeState && !res.writableEnded) {
       writeSseEvent(res, 'message', { type: 'sync', resumeState });
     }
   }
 
-  const result = await GenerationJobManager.subscribe(
-    streamId,
-    (event) => {
-      if (res.writableEnded) {
-        return;
-      }
-
-      const attachments = extractAttachments(event);
-      for (const attachment of attachments) {
-        if (rememberAttachment(attachment)) {
-          continue;
+  try {
+    result = await GenerationJobManager.subscribe(
+      streamId,
+      (event) => {
+        if (res.writableEnded) {
+          return;
         }
-        writeSseEvent(res, 'attachment', attachment);
-      }
 
-      const deltas = extractTextDeltas(event);
-      for (const delta of deltas) {
-        if (delta) {
-          writeSseEvent(res, 'message', { type: 'delta', text: delta });
+        const attachments = extractAttachments(event);
+        for (const attachment of attachments) {
+          if (rememberAttachment(attachment)) {
+            continue;
+          }
+          writeSseEvent(res, 'attachment', attachment);
         }
-      }
 
-      if (event?.event === 'on_cortex_update' || event?.event === 'on_cortex_followup') {
-        writeSseEvent(res, 'message', {
-          type: 'status',
-          event: event.event,
-          data: event.data,
-        });
-      }
-    },
-    (event) => {
-      if (res.writableEnded) {
-        return;
-      }
-
-      const finalError = extractFinalError(event);
-      if (finalError) {
-        writeSseEvent(res, 'error', { error: finalError });
-      }
-
-      const finalText = extractFinalResponseText(event);
-      const responseMessageId = extractResponseMessageId(event);
-
-      const attachments = extractAttachments(event);
-      for (const attachment of attachments) {
-        if (rememberAttachment(attachment)) {
-          continue;
+        const deltas = extractTextDeltas(event);
+        for (const delta of deltas) {
+          if (delta) {
+            writeSseEvent(res, 'message', { type: 'delta', text: delta });
+          }
         }
-        writeSseEvent(res, 'attachment', attachment);
-      }
 
-      if (finalText) {
-        writeSseEvent(res, 'message', {
-          type: 'final',
-          text: finalText,
+        if (event?.event === 'on_cortex_update' || event?.event === 'on_cortex_followup') {
+          writeSseEvent(res, 'message', {
+            type: 'status',
+            event: event.event,
+            data: event.data,
+          });
+        }
+      },
+      (event) => {
+        if (res.writableEnded) {
+          return;
+        }
+
+        const finalError = extractFinalError(event);
+        if (finalError) {
+          writeSseEvent(res, 'error', { error: finalError });
+        }
+
+        const finalText = extractFinalResponseText(event);
+        const responseMessageId = extractResponseMessageId(event);
+
+        const attachments = extractAttachments(event);
+        for (const attachment of attachments) {
+          if (rememberAttachment(attachment)) {
+            continue;
+          }
+          writeSseEvent(res, 'attachment', attachment);
+        }
+
+        if (finalText) {
+          writeSseEvent(res, 'message', {
+            type: 'final',
+            text: finalText,
+            messageId: responseMessageId,
+          });
+        }
+
+        writeSseEvent(res, 'done', {
+          final: true,
           messageId: responseMessageId,
         });
-      }
-
-      writeSseEvent(res, 'done', {
-        final: true,
-        messageId: responseMessageId,
-      });
-      res.end();
-    },
-    (error) => {
-      if (!res.writableEnded) {
-        writeSseEvent(res, 'error', { error: String(error || 'Stream error') });
         res.end();
-      }
-    },
-  );
-
-  if (!result) {
-    return res.status(404).json({ error: 'Failed to subscribe to stream' });
+      },
+      (error) => {
+        if (!res.writableEnded) {
+          writeSseEvent(res, 'error', { error: String(error || 'Stream error') });
+          res.end();
+        }
+      },
+      requestAbort.signal,
+    );
+  } catch (error) {
+    if (requestAbort.signal.aborted) {
+      return;
+    }
+    res.removeListener('close', onRequestClose);
+    logger.error(`[VIVENTIUM][GatewayStream] subscription readiness failed: ${streamId}`, error);
+    if (!res.writableEnded) {
+      writeSseEvent(res, 'error', { error: 'Stream connection unavailable' });
+      res.end();
+    }
+    return;
   }
 
-  req.on('close', () => {
+  if (!result) {
+    res.removeListener('close', onRequestClose);
+    if (requestAbort.signal.aborted) {
+      return;
+    }
+    if (!res.writableEnded) {
+      writeSseEvent(res, 'error', { error: 'Failed to subscribe to stream' });
+      res.end();
+    }
+    return;
+  }
+
+  if (requestAbort.signal.aborted) {
     result.unsubscribe();
-  });
+  }
+  /* === VIVENTIUM END === */
 });
 
 router.get('/cortex/:messageId', gatewayAuth, async (req, res) => {

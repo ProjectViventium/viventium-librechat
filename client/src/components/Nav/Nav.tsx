@@ -10,7 +10,6 @@ import {
   startTransition,
 } from 'react';
 import { useRecoilValue } from 'recoil';
-import { motion } from 'framer-motion';
 import { Skeleton, useMediaQuery } from '@librechat/client';
 import { PermissionTypes, Permissions } from 'librechat-data-provider';
 import type { InfiniteQueryObserverResult } from '@tanstack/react-query';
@@ -255,50 +254,45 @@ const Nav = memo(
       </div>
     );
 
-    // Mobile: Fixed positioned sidebar that slides over content
-    // Uses CSS transitions (not Framer Motion) to sync perfectly with content animation
-    if (isSmallScreen) {
-      return (
-        <>
+    /* === VIVENTIUM START ===
+     * Feature: Accessible Settings reflow.
+     * Purpose: Keep AccountSettings mounted when zoom or viewport changes cross the mobile breakpoint.
+     * A conditional mobile/desktop tree discarded the open dialog and unsaved input during reflow.
+     */
+    return (
+      <>
+        <div
+          className={cn(
+            isSmallScreen
+              ? 'nav fixed left-0 top-0 z-[110] h-full bg-surface-primary-alt'
+              : 'flex-shrink-0 overflow-hidden',
+            isSmallScreen && navVisible && 'active',
+          )}
+          style={
+            isSmallScreen
+              ? {
+                  width: sidebarWidth,
+                  transform: navVisible ? 'translateX(0)' : `translateX(-${sidebarWidth}px)`,
+                  transition: 'transform 0.2s ease-out',
+                }
+              : {
+                  width: navVisible ? sidebarWidth : 0,
+                  transition: 'width 0.2s ease-out',
+                }
+          }
+        >
           <div
             data-testid="nav"
-            className={cn(
-              'nav fixed left-0 top-0 z-[110] h-full bg-surface-primary-alt',
-              navVisible && 'active',
-            )}
-            style={{
-              width: sidebarWidth,
-              transform: navVisible ? 'translateX(0)' : `translateX(-${sidebarWidth}px)`,
-              transition: 'transform 0.2s ease-out',
-            }}
+            className={cn('nav h-full bg-surface-primary-alt', navVisible && 'active')}
+            style={{ width: sidebarWidth }}
           >
             {sidebarContent}
           </div>
-          <NavMask navVisible={navVisible} toggleNavVisible={toggleNavVisible} />
-        </>
-      );
-    }
-
-    // Desktop: Inline sidebar with width transition
-    return (
-      <div
-        className="flex-shrink-0 overflow-hidden"
-        style={{ width: navVisible ? sidebarWidth : 0, transition: 'width 0.2s ease-out' }}
-      >
-        <motion.div
-          data-testid="nav"
-          className={cn('nav h-full bg-surface-primary-alt', navVisible && 'active')}
-          style={{ width: sidebarWidth }}
-          initial={false}
-          animate={{
-            x: navVisible ? 0 : -sidebarWidth,
-          }}
-          transition={{ duration: 0.2, ease: 'easeOut' }}
-        >
-          {sidebarContent}
-        </motion.div>
-      </div>
+        </div>
+        {isSmallScreen && <NavMask navVisible={navVisible} toggleNavVisible={toggleNavVisible} />}
+      </>
     );
+    /* === VIVENTIUM END === */
   },
 );
 

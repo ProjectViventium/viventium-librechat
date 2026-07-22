@@ -133,6 +133,194 @@ describe('Memory Methods', () => {
       expect(first).toEqual(expect.objectContaining({ ok: true, revision: 1 }));
       expect(stale).toEqual(expect.objectContaining({ ok: false, conflict: true }));
     });
+
+    it('retains a tombstone so delete and recreate cannot reset the CAS revision', async () => {
+      const userId = new mongoose.Types.ObjectId();
+      const original = await MemoryEntry.create({
+        userId,
+        key: 'world',
+        value: 'Original',
+        tokenCount: 1,
+        updated_at: new Date('2026-07-10T10:00:00.000Z'),
+      });
+
+      const deleted = await memoryMethods.deleteMemory({
+        userId,
+        key: 'world',
+        expectedRevision: Number(original.__v ?? 0),
+      });
+      const recreated = await memoryMethods.createMemory({
+        userId,
+        key: 'world',
+        value: 'Recreated safely',
+        tokenCount: 2,
+      });
+      const staleSet = await memoryMethods.setMemory({
+        userId,
+        key: 'world',
+        value: 'Stale overwrite',
+        tokenCount: 2,
+        expectedRevision: Number(original.__v ?? 0),
+      });
+      const staleDelete = await memoryMethods.deleteMemory({
+        userId,
+        key: 'world',
+        expectedRevision: Number(original.__v ?? 0),
+      });
+
+      expect(deleted).toEqual(expect.objectContaining({ ok: true, revision: 1 }));
+      expect(recreated).toEqual(expect.objectContaining({ ok: true, revision: 2 }));
+      expect(staleSet).toEqual(expect.objectContaining({ ok: false, conflict: true }));
+      expect(staleDelete).toEqual(expect.objectContaining({ ok: false, conflict: true }));
+      const stored = await MemoryEntry.findOne({ userId, key: 'world' }).lean();
+      expect(stored?.value).toBe('Recreated safely');
+      expect(stored?.deletedAt).toBeUndefined();
+    });
+
+    it('rejects a stale absent-key create after a newer delete while hiding the tombstone', async () => {
+      const userId = new mongoose.Types.ObjectId();
+      const created = await memoryMethods.createMemory({
+        userId,
+        key: 'context',
+        value: 'Newer fact',
+        tokenCount: 2,
+      });
+      await memoryMethods.deleteMemory({
+        userId,
+        key: 'context',
+        expectedRevision: created.revision,
+      });
+
+      const staleCreate = await memoryMethods.setMemory({
+        userId,
+        key: 'context',
+        value: 'Stale resurrection',
+        tokenCount: 2,
+        expectedRevision: null,
+      });
+
+      expect(staleCreate).toEqual(expect.objectContaining({ ok: false, conflict: true }));
+      expect(await memoryMethods.getAllUserMemories(userId)).toEqual([]);
+      const states = await memoryMethods.getAllUserMemoryStates(userId);
+      expect(states).toHaveLength(1);
+      expect(states[0]).toEqual(expect.objectContaining({ key: 'context', __v: 1 }));
+      expect(states[0].deletedAt).toBeInstanceOf(Date);
+    });
+  });
+
+  describe('renameMemory revision protection', () => {
+    it('renames and updates one row atomically', async () => {
+      const userId = new mongoose.Types.ObjectId();
+      const original = await MemoryEntry.create({
+        userId,
+        key: 'context',
+        value: 'Original',
+        tokenCount: 1,
+      });
+
+      const result = await memoryMethods.renameMemory({
+        userId,
+        key: 'context',
+        newKey: 'context_archive',
+        value: 'Archived',
+        tokenCount: 2,
+        expectedRevision: Number(original.__v ?? 0),
+      });
+
+      expect(result).toEqual(expect.objectContaining({ ok: true, revision: 1 }));
+      expect(await MemoryEntry.countDocuments({ userId })).toBe(1);
+      expect(await MemoryEntry.findOne({ userId }).lean()).toEqual(
+        expect.objectContaining({ key: 'context_archive', value: 'Archived', __v: 1 }),
+      );
+    });
+
+    it('rejects a stale rename without creating a second row', async () => {
+      const userId = new mongoose.Types.ObjectId();
+      await MemoryEntry.create({ userId, key: 'context', value: 'Newer', tokenCount: 1 });
+      await MemoryEntry.updateOne({ userId, key: 'context' }, { $set: { __v: 2 } });
+
+      const result = await memoryMethods.renameMemory({
+        userId,
+        key: 'context',
+        newKey: 'context_archive',
+        value: 'Stale',
+        tokenCount: 1,
+        expectedRevision: 1,
+      });
+
+      expect(result).toEqual(expect.objectContaining({ ok: false, conflict: true }));
+      expect(await MemoryEntry.countDocuments({ userId })).toBe(1);
+      expect(await MemoryEntry.findOne({ userId }).lean()).toEqual(
+        expect.objectContaining({ key: 'context', value: 'Newer', __v: 2 }),
+      );
+    });
+
+    it('preserves the source when the target key already exists', async () => {
+      const userId = new mongoose.Types.ObjectId();
+      await MemoryEntry.create([
+        { userId, key: 'context', value: 'Source', tokenCount: 1 },
+        { userId, key: 'context_archive', value: 'Target', tokenCount: 1 },
+      ]);
+
+      const result = await memoryMethods.renameMemory({
+        userId,
+        key: 'context',
+        newKey: 'context_archive',
+        value: 'Replacement',
+        tokenCount: 1,
+        expectedRevision: 0,
+      });
+
+      expect(result).toEqual(expect.objectContaining({ ok: false, conflict: true }));
+      expect(await MemoryEntry.countDocuments({ userId })).toBe(2);
+      expect(await MemoryEntry.findOne({ userId, key: 'context' }).lean()).toEqual(
+        expect.objectContaining({ value: 'Source' }),
+      );
+    });
+
+    it('identifies a hidden tombstone target without changing the source or tombstone', async () => {
+      const userId = new mongoose.Types.ObjectId();
+      const source = await MemoryEntry.create({
+        userId,
+        key: 'context',
+        value: 'Source',
+        tokenCount: 1,
+      });
+      const target = await MemoryEntry.create({
+        userId,
+        key: 'context_archive',
+        value: 'Deleted target',
+        tokenCount: 1,
+      });
+      const deletedAt = new Date('2026-07-19T12:00:00.000Z');
+      await MemoryEntry.updateOne(
+        { _id: target._id },
+        { $set: { value: '', tokenCount: 0, deletedAt } },
+      );
+
+      const result = await memoryMethods.renameMemory({
+        userId,
+        key: 'context',
+        newKey: 'context_archive',
+        value: 'Replacement',
+        tokenCount: 1,
+        expectedRevision: Number(source.__v ?? 0),
+      });
+
+      expect(result).toEqual(
+        expect.objectContaining({
+          ok: false,
+          conflict: true,
+          conflictReason: 'target_key_reserved',
+        }),
+      );
+      expect(await MemoryEntry.findOne({ userId, key: 'context' }).lean()).toEqual(
+        expect.objectContaining({ value: 'Source', __v: 0 }),
+      );
+      expect(await MemoryEntry.findOne({ userId, key: 'context_archive' }).lean()).toEqual(
+        expect.objectContaining({ deletedAt, __v: 0 }),
+      );
+    });
   });
 
   describe('getFormattedMemories', () => {

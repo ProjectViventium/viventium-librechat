@@ -2,10 +2,13 @@
 # v0.8.3
 
 # Set configurable max-old-space-size with default
-ARG NODE_MAX_OLD_SPACE_SIZE=6144
+# VIVENTIUM START — leave native/build overhead while supported services run in an 8 GiB Docker VM.
+ARG NODE_MAX_OLD_SPACE_SIZE=2560
+# VIVENTIUM END
 
-# Base for all builds
-FROM node:20-alpine AS base-min
+# VIVENTIUM START — exact release runtime shared with source and the parent installer.
+FROM node:24.16.0-alpine AS base-min
+# VIVENTIUM END
 # Install jemalloc
 RUN apk add --no-cache jemalloc
 # Set environment variable to use jemalloc
@@ -63,7 +66,7 @@ FROM base AS client-build
 # Purpose: Redeclare NODE_MAX_OLD_SPACE_SIZE in this stage so NODE_OPTIONS honors the ARG during client build.
 # Why: Docker ARGs are stage-scoped; without redeclaration the build stage ignores the configured value, which can cause OOM in CI/ACR builds.
 # Added: 2026-02-07
-ARG NODE_MAX_OLD_SPACE_SIZE=6144
+ARG NODE_MAX_OLD_SPACE_SIZE=2560
 # === VIVENTIUM END ===
 WORKDIR /app/client
 COPY client ./
@@ -88,6 +91,9 @@ COPY --from=data-provider-build /app/packages/data-provider/dist ./packages/data
 COPY --from=data-schemas-build /app/packages/data-schemas/dist ./packages/data-schemas/dist
 COPY --from=api-package-build /app/packages/api/dist ./packages/api/dist
 COPY --from=client-build /app/client/dist ./client/dist
+# VIVENTIUM START — ship the verified third-party NOTICE/LICENSE bundle beside client dist.
+COPY --from=client-build /app/client/dist-compliance /app/client/dist-compliance
+# VIVENTIUM END
 WORKDIR /app/api
 EXPOSE 3080
 ENV HOST=0.0.0.0

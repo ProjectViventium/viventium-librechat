@@ -318,7 +318,11 @@ export interface IEventTransport {
    * Called when abort is triggered from any replica.
    * Optional - only implemented in Redis transport.
    */
-  onAbort?(streamId: string, callback: () => void): void;
+  /* === VIVENTIUM START ===
+   * Purpose: Redis implementations expose acknowledgement and teardown
+   * boundaries while in-memory implementations remain synchronous.
+   * === VIVENTIUM END === */
+  onAbort?(streamId: string, callback: () => void): void | Promise<void>;
 
   /** Get subscriber count for a stream */
   getSubscriberCount(streamId: string): number;
@@ -342,5 +346,5 @@ export interface IEventTransport {
   getTrackedStreamIds(): string[];
 
   /** Destroy all transport resources */
-  destroy(): void;
+  destroy(): void | Promise<void>;
 }

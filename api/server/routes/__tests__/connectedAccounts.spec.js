@@ -36,6 +36,7 @@ describe('Connected Accounts Routes', () => {
     process.env.JWT_SECRET = 'test-jwt-secret';
     process.env.DOMAIN_SERVER = 'https://chat.viventium.ai';
     process.env.VIVENTIUM_LOCAL_SUBSCRIPTION_AUTH = 'true';
+    process.env.VIVENTIUM_EXPERIMENTAL_DIRECT_SUBSCRIPTION_AUTH = 'true';
 
     global.fetch = jest.fn();
 
@@ -50,6 +51,7 @@ describe('Connected Accounts Routes', () => {
     delete process.env.DOMAIN_SERVER;
     delete process.env.JWT_SECRET;
     delete process.env.VIVENTIUM_LOCAL_SUBSCRIPTION_AUTH;
+    delete process.env.VIVENTIUM_EXPERIMENTAL_DIRECT_SUBSCRIPTION_AUTH;
     delete process.env.VIVENTIUM_ANTHROPIC_OAUTH_REDIRECT_URI;
     delete process.env.VIVENTIUM_OPENAI_LOCAL_CALLBACK_MANUAL_ONLY;
     delete process.env.VIVENTIUM_CONNECTED_ACCOUNTS_RETURN_ORIGIN;
@@ -95,6 +97,18 @@ describe('Connected Accounts Routes', () => {
     expect(response.status).toBe(200);
     expect(decoded.serverOrigin).toBe('http://localhost:3190');
     expect(process.env.DOMAIN_SERVER).toBe('https://chat.viventium.ai');
+  });
+
+  it('should fail closed when no trusted connected-account return origin is configured', async () => {
+    delete process.env.VIVENTIUM_CONNECTED_ACCOUNTS_RETURN_ORIGIN;
+    delete process.env.DOMAIN_SERVER;
+
+    const response = await request(app)
+      .get('/api/connected-accounts/openai/start')
+      .set('Host', 'untrusted.example');
+
+    expect(response.status).toBe(500);
+    expect(response.body).toEqual({ error: 'oauth_start_failed' });
   });
 
   it('should exchange callback code and store OpenAI credentials', async () => {
@@ -288,12 +302,23 @@ describe('Connected Accounts Routes', () => {
     expect(updateUserKey).not.toHaveBeenCalled();
   });
 
-  it('should return oauth_not_enabled when local subscription auth is disabled', async () => {
-    process.env.VIVENTIUM_LOCAL_SUBSCRIPTION_AUTH = 'false';
+  it('should keep direct OAuth disabled by default even when credential setup is enabled', async () => {
+    delete process.env.VIVENTIUM_EXPERIMENTAL_DIRECT_SUBSCRIPTION_AUTH;
 
     const response = await request(app).get('/api/connected-accounts/openai/start');
 
     expect(response.status).toBe(404);
     expect(response.body).toEqual({ error: 'oauth_not_enabled' });
+  });
+
+  it('should not treat the legacy page gate as authorization for direct OAuth', async () => {
+    process.env.VIVENTIUM_LOCAL_SUBSCRIPTION_AUTH = 'true';
+    process.env.VIVENTIUM_EXPERIMENTAL_DIRECT_SUBSCRIPTION_AUTH = 'false';
+
+    const response = await request(app).get('/api/connected-accounts/anthropic/start');
+
+    expect(response.status).toBe(404);
+    expect(response.body).toEqual({ error: 'oauth_not_enabled' });
+    expect(global.fetch).not.toHaveBeenCalled();
   });
 });

@@ -668,6 +668,9 @@ export type MemoryArtifact = {
   key: string;
   value?: string;
   tokenCount?: number;
+  /* === VIVENTIUM START === Post-write revision for conflict-safe optimistic memory state. === */
+  revision?: number;
+  /* === VIVENTIUM END === */
   type: 'update' | 'delete' | 'error';
 };
 

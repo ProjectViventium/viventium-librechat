@@ -5,21 +5,38 @@ services:
   api:
     container_name: LibreChat
     ports:
-      - "${PORT}:${PORT}"
+      - '${PORT}:${PORT}'
+      # VIVENTIUM START
+      # Browser artifact code is served from a dedicated origin, never the authenticated app origin.
+      - '127.0.0.1:${SANDPACK_BUNDLER_PORT:-3081}:${SANDPACK_BUNDLER_PORT:-3081}'
+      # VIVENTIUM END
     depends_on:
       - mongodb
       - rag_api
-    image: registry.librechat.ai/danny-avila/librechat-dev:latest
+    # VIVENTIUM START
+    # Build the checked-out fork so Docker cannot silently omit local runtime/security patches.
+    build:
+      context: .
+      dockerfile: Dockerfile.multi
+      target: api-build
+    # VIVENTIUM END
     restart: always
-    user: "${UID}:${GID}"
+    user: '${UID}:${GID}'
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - 'host.docker.internal:host-gateway'
     environment:
       - HOST=0.0.0.0
       - MONGO_URI=mongodb://mongodb:27017/LibreChat
       - MEILI_HOST=http://meilisearch:7700
       - RAG_PORT=${RAG_PORT:-8000}
       - RAG_API_URL=http://rag_api:${RAG_PORT:-8000}
+      # VIVENTIUM START
+      # The API process owns this lightweight second listener only in source/Docker profiles.
+      - SANDPACK_BUNDLER_LISTEN_HOST=0.0.0.0
+      - SANDPACK_BUNDLER_LISTEN_PORT=${SANDPACK_BUNDLER_PORT:-3081}
+      - SANDPACK_BUNDLER_URL=${SANDPACK_BUNDLER_URL:-http://localhost:3081/}
+      - SANDPACK_STATIC_BUNDLER_URL=${SANDPACK_STATIC_BUNDLER_URL:-http://localhost:3081/}
+      # VIVENTIUM END
     volumes:
       - type: bind
         source: ./.env
@@ -31,7 +48,7 @@ services:
     container_name: chat-mongodb
     image: mongo:8.0.17
     restart: always
-    user: "${UID}:${GID}"
+    user: '${UID}:${GID}'
     volumes:
       - ./data-node:/data/db
     command: mongod --noauth
@@ -39,7 +56,7 @@ services:
     container_name: chat-meilisearch
     image: getmeili/meilisearch:v1.35.1
     restart: always
-    user: "${UID}:${GID}"
+    user: '${UID}:${GID}'
     environment:
       - MEILI_HOST=http://meilisearch:7700
       - MEILI_NO_ANALYTICS=true
@@ -58,7 +75,9 @@ services:
       - pgdata2:/var/lib/postgresql/data
   rag_api:
     container_name: rag_api
-    image: registry.librechat.ai/danny-avila/librechat-rag-api-dev-lite:latest
+    # VIVENTIUM START — registry-verified multi-platform digest, inspected 2026-07-20.
+    image: registry.librechat.ai/danny-avila/librechat-rag-api-dev-lite:latest@sha256:c0ad82657b556c1e16dcfca85d045788f67caa223e25e70eb687f4d16b41dedc
+    # VIVENTIUM END
     environment:
       - DB_HOST=vectordb
       - RAG_PORT=${RAG_PORT:-8000}

@@ -6,6 +6,9 @@
 const DEFAULT_PLAYGROUND_URL = 'http://localhost:3000';
 const DEFAULT_VOICE_AGENT_NAME = 'librechat-voice-gateway';
 const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
+const PLAYGROUND_HEALTH_TIMEOUT_MS = 2000;
+const MAX_PLAYGROUND_HEALTH_BODY_LENGTH = 64 * 1024;
+const SOURCE_REF_PATTERN = /^[0-9a-f]{40}$/;
 
 function trimBaseUrl(value) {
   if (typeof value !== 'string') {
@@ -28,7 +31,11 @@ function parseBaseUrl(value) {
 }
 
 function isLocalHostname(hostname) {
-  return LOCAL_HOSTNAMES.has(String(hostname || '').trim().toLowerCase());
+  return LOCAL_HOSTNAMES.has(
+    String(hostname || '')
+      .trim()
+      .toLowerCase(),
+  );
 }
 
 function normalizeLocalPlaygroundBaseUrl(baseUrl) {
@@ -123,10 +130,158 @@ function shouldPreferPublicPlaygroundForRequest(req) {
   return extractRequestOrigins(req).some((origin) => configuredOrigins.has(origin));
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Voice readiness and runtime identity guard.
+ * Purpose: Fail closed unless the configured voice surface proves it is the selected Viventium
+ * playground variant built from the exact expected component commit.
+ * === VIVENTIUM END === */
+function resolveExpectedPlaygroundIdentity() {
+  const configuredVariant = String(process.env.PLAYGROUND_VARIANT || '')
+    .trim()
+    .toLowerCase();
+  const variant = configuredVariant === 'classic' ? 'classic' : 'modern';
+  const sourceRef = String(process.env.VIVENTIUM_PLAYGROUND_SOURCE_REF || '')
+    .trim()
+    .toLowerCase();
+
+  if (!SOURCE_REF_PATTERN.test(sourceRef)) {
+    return null;
+  }
+
+  return {
+    schema_version: 1,
+    product: 'viventium-playground',
+    status: 'ok',
+    surface: `${variant}-playground`,
+    variant,
+    source_ref: sourceRef,
+  };
+}
+
+function matchesExpectedPlaygroundIdentity(payload, expected) {
+  return (
+    payload != null &&
+    typeof payload === 'object' &&
+    Object.entries(expected).every(([key, value]) => payload[key] === value)
+  );
+}
+
+function contentLengthIsInvalidOrOversized(response) {
+  const rawLength = response?.headers?.get?.('content-length');
+  if (rawLength == null || rawLength === '') {
+    return false;
+  }
+  if (!/^\d+$/.test(rawLength)) {
+    return true;
+  }
+  const length = Number(rawLength);
+  return !Number.isSafeInteger(length) || length > MAX_PLAYGROUND_HEALTH_BODY_LENGTH;
+}
+
+async function readBoundedPlaygroundHealthBody(response) {
+  const reader = response?.body?.getReader?.();
+  if (!reader) {
+    return null;
+  }
+
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  let body = '';
+  let bytesRead = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      if (!(value instanceof Uint8Array)) {
+        await reader.cancel().catch(() => {});
+        return null;
+      }
+      bytesRead += value.byteLength;
+      if (bytesRead > MAX_PLAYGROUND_HEALTH_BODY_LENGTH) {
+        await reader.cancel().catch(() => {});
+        return null;
+      }
+      try {
+        body += decoder.decode(value, { stream: true });
+      } catch {
+        await reader.cancel().catch(() => {});
+        return null;
+      }
+    }
+    try {
+      body += decoder.decode();
+    } catch {
+      return null;
+    }
+    return body;
+  } finally {
+    reader.releaseLock?.();
+  }
+}
+
+async function verifyPlaygroundReadiness({ preferPublicPlayground = false } = {}) {
+  const expected = resolveExpectedPlaygroundIdentity();
+  if (!expected) {
+    return { ready: false, reason: 'playground_source_unavailable' };
+  }
+
+  const baseUrl = resolvePlaygroundBaseUrl({ preferPublicPlayground });
+  let healthUrl;
+  try {
+    healthUrl = new URL('/api/health', `${baseUrl}/`).toString();
+  } catch {
+    return { ready: false, reason: 'playground_configuration_invalid' };
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), PLAYGROUND_HEALTH_TIMEOUT_MS);
+  timeout.unref?.();
+
+  try {
+    const response = await fetch(healthUrl, {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+      redirect: 'error',
+      cache: 'no-store',
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      return { ready: false, reason: 'playground_unhealthy' };
+    }
+
+    if (contentLengthIsInvalidOrOversized(response)) {
+      return { ready: false, reason: 'playground_identity_mismatch' };
+    }
+
+    const body = await readBoundedPlaygroundHealthBody(response);
+    if (body == null) {
+      return { ready: false, reason: 'playground_identity_mismatch' };
+    }
+
+    let payload;
+    try {
+      payload = JSON.parse(body);
+    } catch {
+      return { ready: false, reason: 'playground_identity_mismatch' };
+    }
+
+    if (!matchesExpectedPlaygroundIdentity(payload, expected)) {
+      return { ready: false, reason: 'playground_identity_mismatch' };
+    }
+
+    return { ready: true };
+  } catch {
+    return { ready: false, reason: 'playground_unreachable' };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+/* === VIVENTIUM END === */
+
 function resolveVoiceAgentName() {
   return (
-    trimBaseUrl(process.env.VIVENTIUM_VOICE_GATEWAY_AGENT_NAME || '') ||
-    DEFAULT_VOICE_AGENT_NAME
+    trimBaseUrl(process.env.VIVENTIUM_VOICE_GATEWAY_AGENT_NAME || '') || DEFAULT_VOICE_AGENT_NAME
   );
 }
 
@@ -162,6 +317,7 @@ module.exports = {
   buildCallLaunchResponse,
   buildPlaygroundUrl,
   resolvePlaygroundBaseUrl,
+  verifyPlaygroundReadiness,
   shouldPreferPublicPlaygroundForRequest,
   resolveTelegramPublicPlaygroundBaseUrl,
   resolveVoiceAgentName,

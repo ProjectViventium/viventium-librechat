@@ -1,5 +1,6 @@
 import { describe, expect, it } from '@jest/globals';
 import {
+  didAgentProviderChange,
   resolveAgentModelForProvider,
   shouldDefaultOpenAIGPT56AgentToResponses,
 } from '../modelSelection';
@@ -36,6 +37,25 @@ describe('resolveAgentModelForProvider', () => {
         previousProvider: '',
       }),
     ).toBe('claude-opus-4-7');
+  });
+});
+
+/* === VIVENTIUM START ===
+ * Regression: optional-route provider changes must discard provider-specific parameters.
+ * === VIVENTIUM END === */
+describe('didAgentProviderChange', () => {
+  it('ignores initial hydration and detects later provider changes', () => {
+    expect(didAgentProviderChange({ provider: 'openAI', previousProvider: undefined })).toBe(false);
+    expect(didAgentProviderChange({ provider: 'openAI', previousProvider: 'openAI' })).toBe(false);
+    expect(didAgentProviderChange({ provider: 'xai', previousProvider: 'openAI' })).toBe(true);
+  });
+
+  it('preserves parameters during mounted empty-to-value hydration', () => {
+    expect(didAgentProviderChange({ provider: 'xai', previousProvider: '' })).toBe(false);
+  });
+
+  it('treats clearing a hydrated provider as a change', () => {
+    expect(didAgentProviderChange({ provider: '', previousProvider: 'xai' })).toBe(true);
   });
 });
 

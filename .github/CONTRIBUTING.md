@@ -26,7 +26,12 @@ Project maintainers have the right and responsibility to remove, edit, or reject
 
 ## 1. Development Setup
 
-1. Use Node.js v20.19.0+ or ^22.12.0 or >= 23.0.0.
+<!-- VIVENTIUM START — exact public release toolchain contract. -->
+
+1. Use Node.js 24.16.0 and its bundled npm 11.13.0, matching `.nvmrc`, `.node-version`, CI, and Docker.
+
+<!-- VIVENTIUM END -->
+
 2. Run `npm run smart-reinstall` to install dependencies (uses Turborepo). Use `npm run reinstall` for a clean install, or `npm ci` for a fresh lockfile-based install.
 3. Build all compiled code: `npm run build`.
 4. Setup and run unit tests:

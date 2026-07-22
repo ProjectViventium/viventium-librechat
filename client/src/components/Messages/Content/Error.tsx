@@ -2,6 +2,13 @@ import { useState } from 'react';
 // file deepcode ignore HardcodedNonCryptoSecret: No hardcoded secrets
 import { ViolationTypes, ErrorTypes, alternateName } from 'librechat-data-provider';
 import type { LocalizeFunction } from '~/common';
+/* === VIVENTIUM START ===
+ * Feature: Missing-key inline recovery.
+ * Purpose: Reuse the shared Connected Accounts navigation contract from the message surface.
+ */
+import { CONNECTED_ACCOUNTS_OPEN_EVENT } from '~/common/connectedAccounts';
+import { useGetStartupConfig } from '~/data-provider';
+/* === VIVENTIUM END === */
 import { extractJson, isJson } from '~/utils/json';
 import { useLocalize } from '~/hooks';
 
@@ -122,6 +129,36 @@ function TokenBalanceAction({ json }: { json: TTokenBalance }) {
   );
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Missing-key inline recovery.
+ * Purpose: Give users a provider-agnostic, one-click route to Connected Accounts when the
+ * structured runtime error proves that their selected model has no user credential.
+ */
+function MissingUserKeyAction({ localize }: { localize: LocalizeFunction }) {
+  const { data: startupConfig } = useGetStartupConfig();
+  const connectedAccountsEnabled = startupConfig?.viventiumConnectedAccountsEnabled === true;
+
+  if (!connectedAccountsEnabled) {
+    return localize('com_error_no_user_key');
+  }
+
+  return (
+    <>
+      {localize('com_error_no_user_key')}
+      <br />
+      <br />
+      <button
+        type="button"
+        className="rounded bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
+        onClick={() => window.dispatchEvent(new Event(CONNECTED_ACCOUNTS_OPEN_EVENT))}
+      >
+        {localize('com_ui_connected_accounts')}
+      </button>
+    </>
+  );
+}
+/* === VIVENTIUM END === */
+
 const errorMessages = {
   [ErrorTypes.MODERATION]: 'com_error_moderation',
   [ErrorTypes.NO_USER_KEY]: 'com_error_no_user_key',
@@ -228,6 +265,16 @@ const Error = ({ text }: { text: string }) => {
   const json = JSON.parse(jsonString);
   const errorKey = json.code || json.type;
   const keyExists = errorKey && errorMessages[errorKey];
+
+  /* === VIVENTIUM START ===
+   * Feature: Missing-key inline recovery.
+   * Purpose: Make the typed missing-key error actionable only when the destination capability is
+   * available; otherwise preserve LibreChat's original localized message instead of an inert CTA.
+   */
+  if (errorKey === ErrorTypes.NO_USER_KEY) {
+    return <MissingUserKeyAction localize={localize} />;
+  }
+  /* === VIVENTIUM END === */
 
   if (keyExists && typeof errorMessages[errorKey] === 'function') {
     return errorMessages[errorKey](json, localize);

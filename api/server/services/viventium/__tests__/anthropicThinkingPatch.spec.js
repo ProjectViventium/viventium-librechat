@@ -15,7 +15,7 @@ const {
   sanitizeAnthropicThinkingBlocks,
   sanitizeMessagesForAnthropicThinking,
 } = require('../anthropicThinkingPatch');
-const { AIMessage, HumanMessage, ToolMessage } = require('@langchain/core/messages');
+const { AIMessage, HumanMessage, ToolMessage } = require('@librechat/agents/langchain/messages');
 const { Providers, ensureThinkingBlockInMessages } = require('@librechat/agents');
 
 describe('anthropicThinkingPatch', () => {
@@ -61,7 +61,10 @@ describe('anthropicThinkingPatch', () => {
     );
 
     expect(result[1]).toBeInstanceOf(HumanMessage);
-    expect(result[1].content).toContain('[Previous agent context]');
+    const previousAgentContext = Array.isArray(result[1].content)
+      ? result[1].content.find((part) => part?.type === 'text')?.text
+      : result[1].content;
+    expect(previousAgentContext).toContain('[Previous agent context]');
   });
 
   test('preserves valid Anthropic thinking blocks so genuine thinking turns are not downgraded', () => {

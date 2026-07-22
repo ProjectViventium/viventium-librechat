@@ -462,7 +462,9 @@ export async function initializeAgent(
         recallAttachmentReason = 'stale_corpus';
       } else {
         recallAttachmentReason =
-          `runtime_${conversationRecallVectorStatus.reason}` as ConversationRecallAttachmentReason;
+          conversationRecallVectorStatus.reason === 'ok'
+            ? 'runtime_unhealthy'
+            : `runtime_${conversationRecallVectorStatus.reason}`;
       }
       const recallAttachmentFiles = buildConversationRecallAttachmentFiles({
         userId: req.user.id,

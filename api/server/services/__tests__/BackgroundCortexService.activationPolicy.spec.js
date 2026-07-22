@@ -24,6 +24,7 @@ const {
   shouldProbeSuppressedActivationAttempt,
   activationProviderAttemptsUnavailable,
   isActivationFallbackCandidate,
+  parseActivationResponse,
   activationFailureVisibility,
   shouldSurfaceActivationProviderUnavailable,
   shouldSurfaceActivationTimeout,
@@ -44,7 +45,7 @@ describe('BackgroundCortexService activation policy helpers', () => {
     delete process.env.VIVENTIUM_CORTEX_PHASE_A_NOTICE_MODE;
   });
 
-  test('injects a pinned feeling capsule only into the configured all-agent scope', () => {
+  test('keeps specialist background cortices independent from the pinned embodiment capsule', () => {
     const capsule = '<viventium_feeling_state>\n- Energy: steady\n</viventium_feeling_state>';
     expect(
       feelingTailForBackgroundAgent({
@@ -53,7 +54,7 @@ describe('BackgroundCortexService activation policy helpers', () => {
         agentScope: 'all_agents',
         capsule,
       }),
-    ).toBe(capsule);
+    ).toBe('');
     expect(
       feelingTailForBackgroundAgent({
         available: true,
@@ -215,8 +216,8 @@ describe('BackgroundCortexService activation policy helpers', () => {
       fallbacks: [
         { provider: 'groq', model: 'qwen/qwen3.6-27b' },
         { provider: 'xai', model: 'grok-4.20-non-reasoning' },
-        { provider: 'openai', model: 'gpt-5.4' },
         { provider: 'anthropic', model: 'claude-haiku-4-5' },
+        { provider: 'openai', model: 'gpt-5.4' },
       ],
     });
 
@@ -227,8 +228,8 @@ describe('BackgroundCortexService activation policy helpers', () => {
         source: 'primary',
       },
       { provider: 'xai', model: 'grok-4.20-non-reasoning', source: 'fallback' },
-      { provider: 'openai', model: 'gpt-5.4', source: 'fallback' },
       { provider: 'anthropic', model: 'claude-haiku-4-5', source: 'fallback' },
+      { provider: 'openai', model: 'gpt-5.4', source: 'fallback' },
     ]);
   });
 
@@ -236,7 +237,62 @@ describe('BackgroundCortexService activation policy helpers', () => {
     expect(isActivationFallbackCandidate({ code: 'MODEL_NOT_FOUND', status: 404 })).toBe(true);
     expect(isActivationFallbackCandidate({ code: 'MODEL_DECOMMISSIONED', status: 404 })).toBe(true);
     expect(isActivationFallbackCandidate({ code: 'JSON_VALIDATE_FAILED', status: 400 })).toBe(true);
+    expect(
+      isActivationFallbackCandidate(new Error('provider initialization failed'), {
+        class: 'provider_error',
+        status: null,
+        code: '',
+      }),
+    ).toBe(true);
     expect(isActivationFallbackCandidate({ code: 'INVALID_REQUEST', status: 400 })).toBe(false);
+  });
+
+  test('treats an unparseable completed classifier response as unavailable fallback evidence', () => {
+    let parseError;
+    try {
+      parseActivationResponse('provider returned prose instead of the required JSON object');
+    } catch (error) {
+      parseError = error;
+    }
+
+    expect(parseError).toEqual(
+      expect.objectContaining({
+        code: 'JSON_PARSE_FAILED',
+      }),
+    );
+    const errorSummary = summarizeActivationError(parseError);
+    expect(errorSummary).toEqual(
+      expect.objectContaining({
+        class: 'provider_invalid_response',
+        code: 'JSON_PARSE_FAILED',
+      }),
+    );
+    expect(isActivationFallbackCandidate(parseError, errorSummary)).toBe(true);
+    expect(
+      activationProviderAttemptsUnavailable([
+        {
+          status: 'error',
+          error: errorSummary,
+        },
+      ]),
+    ).toBe(true);
+  });
+
+  test('rejects schema-invalid classifier JSON instead of coercing it into a decision', () => {
+    for (const response of [
+      '{}',
+      '{"activate":"false","confidence":0.9,"reason":"wrong type"}',
+      '{"activate":false,"confidence":"0.9","reason":"wrong type"}',
+      '{"activate":true,"confidence":1.4,"reason":"out of range"}',
+    ]) {
+      expect(() => parseActivationResponse(response)).toThrow(
+        expect.objectContaining({ code: 'JSON_VALIDATE_FAILED' }),
+      );
+    }
+
+    expect(
+      parseActivationResponse('{"should_activate":false,"confidence":0.91,"reason":"valid alias"}'),
+    ).toEqual({ activate: false, confidence: 0.91, reason: 'valid alias' });
   });
 
   test('renders configured direct-action surfaces only when exact tools are attached', () => {

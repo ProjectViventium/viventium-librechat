@@ -46,6 +46,9 @@ export * from './web';
 export * from './cache';
 /* Stream */
 export * from './stream';
+/* === VIVENTIUM START === Isolated local Sandpack runtime === */
+export * from './runtime/sandpackBundlerServer';
+/* === VIVENTIUM END === */
 /* Diagnostics */
 export { memoryDiagnostics } from './utils/memory';
 /* types */

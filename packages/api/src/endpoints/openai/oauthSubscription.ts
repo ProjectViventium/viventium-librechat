@@ -7,6 +7,7 @@
  * - Refresh before endpoint initialization so UI/API/voice/Telegram all share the
  *   same durable credential behavior.
  * === VIVENTIUM END === */
+import { createHash } from 'node:crypto';
 import { logger } from '@librechat/data-schemas';
 import { EModelEndpoint } from 'librechat-data-provider';
 import type { EndpointDbMethods, UserKeyValues } from '~/types';
@@ -17,6 +18,7 @@ const OPENAI_CODEX_BASE_URL = 'https://chatgpt.com/backend-api/codex';
 const OPENAI_OAUTH_REFRESH_BUFFER_MS = 5 * 60 * 1000;
 
 const nonExpiringPersistenceCache = new Set<string>();
+const refreshInFlightByUser = new Map<string, Promise<OpenAISubscriptionUserValues>>();
 
 type OpenAISubscriptionUserValues = UserKeyValues & {
   oauthProvider: 'openai-codex';
@@ -94,13 +96,15 @@ function shouldRefresh(userValues: OpenAISubscriptionUserValues): boolean {
 }
 
 function buildPersistenceCacheKey(userId: string, userValues: OpenAISubscriptionUserValues): string {
-  const tokenSuffix = (userValues.apiKey || '').slice(-12) || 'no-token';
+  const tokenHash = userValues.apiKey
+    ? createHash('sha256').update(userValues.apiKey).digest('hex')
+    : 'no-token';
   return [
     userId,
     userValues.oauthProvider,
     userValues.oauthType ?? 'no-type',
     String(userValues.oauthExpiresAt ?? 'no-expiry'),
-    tokenSuffix,
+    tokenHash,
   ].join(':');
 }
 
@@ -206,6 +210,31 @@ async function refreshAccessToken(
   return refreshedValues;
 }
 
+export async function forceRefreshOpenAISubscriptionUserValues(
+  userId: string,
+  userValues: UserKeyValues | null | undefined,
+  db: EndpointDbMethods,
+): Promise<OpenAISubscriptionUserValues> {
+  if (!isOpenAISubscriptionUserValues(userValues)) {
+    throw new Error(
+      'OpenAI connected account needs reconnect in Settings > Account > Connected Accounts.',
+    );
+  }
+
+  const existingRefresh = refreshInFlightByUser.get(userId);
+  if (existingRefresh) {
+    return existingRefresh;
+  }
+
+  const refreshPromise = refreshAccessToken(userId, userValues, db).finally(() => {
+    if (refreshInFlightByUser.get(userId) === refreshPromise) {
+      refreshInFlightByUser.delete(userId);
+    }
+  });
+  refreshInFlightByUser.set(userId, refreshPromise);
+  return refreshPromise;
+}
+
 export async function resolveOpenAISubscriptionUserValues(
   userId: string,
   userValues: UserKeyValues | null | undefined,
@@ -217,7 +246,7 @@ export async function resolveOpenAISubscriptionUserValues(
 
   if (shouldRefresh(userValues)) {
     try {
-      return await refreshAccessToken(userId, userValues, db);
+      return await forceRefreshOpenAISubscriptionUserValues(userId, userValues, db);
     } catch (error) {
       logger.warn('[OpenAI OAuth] Refresh failed for connected account', error);
       throw new Error(

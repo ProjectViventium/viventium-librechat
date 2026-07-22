@@ -10,10 +10,13 @@ const { logger } = require('@librechat/data-schemas');
 const {
   FEELING_BANDS,
   FEELING_BAND_IDS,
+  FEELING_LEVEL_IDS,
+  MAX_FEELING_RANGE_PROMPT_CHARS,
   DEFAULT_REACTION_INSTRUCTION,
   loadFeelingsReadContext,
   createInitialFeelingState,
   prepareManualFeelingPatch,
+  updateFeelingRangePromptOverride,
   clearFeelingsReadCache,
   resolveFeelingsRuntimeConfig,
 } = require('@librechat/api');
@@ -53,6 +56,13 @@ const bandSchema = z
     halfLifeMinutes: z.number().min(1).max(525600).optional(),
     enabled: z.boolean().optional(),
     reset: z.boolean().optional(),
+    rangePromptOverride: z
+      .object({
+        levelId: z.enum(FEELING_LEVEL_IDS),
+        instruction: z.string().trim().min(1).max(MAX_FEELING_RANGE_PROMPT_CHARS).nullable(),
+      })
+      .strict()
+      .optional(),
   })
   .strict()
   .refine(
@@ -61,7 +71,8 @@ const bandSchema = z
       value.current != null ||
       value.halfLifeMinutes != null ||
       value.enabled != null ||
-      value.reset === true,
+      value.reset === true ||
+      value.rangePromptOverride != null,
     'At least one band field is required',
   );
 
@@ -119,7 +130,7 @@ function responsePayload(state) {
   };
 }
 
-async function finishMutation(req, res, result, startedAt) {
+async function finishMutation(req, res, result, startedAt, telemetry = {}) {
   const userId = String(req.user.id);
   if (!result) {
     logFeelingsEvent(
@@ -146,6 +157,10 @@ async function finishMutation(req, res, result, startedAt) {
   logFeelingsEvent(logger, req, 'feelings.api.write', {
     route: req.route?.path || 'unknown',
     version: state.version,
+    rangePromptOverrideCount: state.rangePromptOverrideCount,
+    activeRangePromptOverrideCount: state.activeRangePromptOverrideCount,
+    activeRangePromptOverrideChars: state.activeRangePromptOverrideChars,
+    ...telemetry,
     durationMs: Date.now() - startedAt,
   });
   return res.json(responsePayload(state));
@@ -160,6 +175,9 @@ router.get('/', async (req, res) => {
       hasInnerState: Boolean(state.innerState?.text),
       version: state.version,
       cacheHit: state.cacheHit === true,
+      rangePromptOverrideCount: state.rangePromptOverrideCount,
+      activeRangePromptOverrideCount: state.activeRangePromptOverrideCount,
+      activeRangePromptOverrideChars: state.activeRangePromptOverrideChars,
       durationMs: Date.now() - startedAt,
     });
     return res.json(responsePayload(state));
@@ -238,15 +256,37 @@ router.patch('/bands/:bandId', bodyLimit, requireFeelingsAvailable, async (req, 
     const userId = String(req.user.id);
     await ensureState(userId);
     const snapshot = await readSnapshot(userId, true);
-    const { expectedVersion, ...change } = parsed.data;
-    const prepared = prepareManualFeelingPatch({ bands: snapshot.bands, bandId, change });
+    const { expectedVersion, rangePromptOverride, ...change } = parsed.data;
+    const hasBandStateChange = Object.keys(change).length > 0;
+    const prepared = hasBandStateChange
+      ? prepareManualFeelingPatch({ bands: snapshot.bands, bandId, change })
+      : null;
+    const set = { innerState: null };
+    if (prepared) set[`bands.${bandId}`] = prepared.band;
+    if (rangePromptOverride) {
+      set.rangePromptOverrides = updateFeelingRangePromptOverride({
+        overrides: snapshot.rangePromptOverrides,
+        bandId,
+        levelId: rangePromptOverride.levelId,
+        instruction: rangePromptOverride.instruction,
+      });
+    }
     const result = await updateFeelingState({
       userId,
       expectedVersion,
-      set: { [`bands.${bandId}`]: prepared.band, innerState: null },
-      trailEntries: prepared.trail,
+      set,
+      trailEntries: prepared?.trail ?? [],
     });
-    return finishMutation(req, res, result, startedAt);
+    return finishMutation(req, res, result, startedAt, {
+      ...(rangePromptOverride
+        ? {
+            bandId,
+            rangeLevelId: rangePromptOverride.levelId,
+            rangePromptOverrideChanged: true,
+            rangePromptOverridePresent: Boolean(rangePromptOverride.instruction?.trim()),
+          }
+        : {}),
+    });
   } catch (_error) {
     logFeelingsEvent(
       logger,

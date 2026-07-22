@@ -1,12 +1,20 @@
-import { FEELING_BAND_IDS, FEELING_REACTION_CAUSES } from 'librechat-data-provider';
-import type { FeelingReactionCause } from 'librechat-data-provider';
+import {
+  FEELING_BAND_IDS,
+  FEELING_LEVEL_IDS,
+  FEELING_REACTION_CAUSES,
+} from 'librechat-data-provider';
+import type { FeelingReactionCause, FeelingLevelId } from 'librechat-data-provider';
 import type { Types } from 'mongoose';
 
 export const FEELING_STATE_BAND_IDS = FEELING_BAND_IDS;
 export const FEELING_STATE_REACTION_CAUSES = FEELING_REACTION_CAUSES;
+export const FEELING_STATE_LEVEL_IDS = FEELING_LEVEL_IDS;
 export const MAX_FEELING_STATE_TRAIL_ENTRIES = 90;
 
 export type FeelingBandId = (typeof FEELING_STATE_BAND_IDS)[number];
+export type FeelingRangePromptOverridesRecord = Partial<
+  Record<FeelingBandId, Partial<Record<FeelingLevelId, string>>>
+>;
 
 export type FeelingBandRecord = {
   baseline: number;
@@ -36,6 +44,7 @@ export interface IFeelingState {
   userId: Types.ObjectId | string;
   enabled: boolean;
   bands: Record<FeelingBandId, FeelingBandRecord>;
+  rangePromptOverrides: FeelingRangePromptOverridesRecord;
   reactionInstruction: string;
   reactionActivationMode: 'always' | 'classified' | 'disabled';
   innerState?: FeelingInnerStateRecord | null;

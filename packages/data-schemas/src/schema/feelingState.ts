@@ -1,5 +1,9 @@
 import { Schema } from 'mongoose';
-import { FEELING_STATE_BAND_IDS, FEELING_STATE_REACTION_CAUSES } from '~/types/feelingState';
+import {
+  FEELING_STATE_BAND_IDS,
+  FEELING_STATE_LEVEL_IDS,
+  FEELING_STATE_REACTION_CAUSES,
+} from '~/types/feelingState';
 import type { IFeelingState } from '~/types/feelingState';
 
 const FeelingBandSchema = new Schema(
@@ -73,6 +77,26 @@ const feelingBandsDefinition = Object.fromEntries(
   FEELING_STATE_BAND_IDS.map((bandId) => [bandId, { type: FeelingBandSchema, required: true }]),
 );
 
+const FeelingRangePromptBandSchema = new Schema(
+  Object.fromEntries(
+    FEELING_STATE_LEVEL_IDS.map((levelId) => [
+      levelId,
+      { type: String, minlength: 1, maxlength: 1200 },
+    ]),
+  ),
+  { _id: false },
+);
+
+const FeelingRangePromptOverridesSchema = new Schema(
+  Object.fromEntries(
+    FEELING_STATE_BAND_IDS.map((bandId) => [
+      bandId,
+      { type: FeelingRangePromptBandSchema, default: undefined },
+    ]),
+  ),
+  { _id: false },
+);
+
 const feelingStateSchema = new Schema<IFeelingState>(
   {
     userId: {
@@ -84,6 +108,7 @@ const feelingStateSchema = new Schema<IFeelingState>(
     },
     enabled: { type: Boolean, required: true, default: false },
     bands: feelingBandsDefinition,
+    rangePromptOverrides: { type: FeelingRangePromptOverridesSchema, default: () => ({}) },
     reactionInstruction: { type: String, default: '', maxlength: 4000 },
     reactionActivationMode: {
       type: String,

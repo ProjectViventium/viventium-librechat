@@ -15,7 +15,7 @@
 
 const XAI_TTS_CAPABILITIES = require('../../../../shared/voice/xai_tts_capabilities.json');
 
-const ARTIFACT_CONTRACT_VERSION = '2026-05-31.3';
+const ARTIFACT_CONTRACT_VERSION = '2026-07-13.4';
 
 const KNOWN_MISSING_SPACE_JOINS = Object.freeze([]);
 
@@ -461,7 +461,7 @@ function sanitizeVoiceSurfaceTextForDisplay(text) {
   cleaned = cleaned.replace(PRIVATE_USE_CITATION_RE, '');
   cleaned = cleaned.replace(INTERNAL_TURN_ID_RE, '');
   cleaned = cleaned.replace(NUMERIC_CITATION_RE, '');
-  cleaned = cleaned.replace(EMAIL_RE, 'email available');
+  cleaned = cleaned.replace(EMAIL_RE, 'address available');
   cleaned = cleaned.replace(URL_RE, 'link available');
   cleaned = cleaned.replace(GENERIC_ANGLE_TAG_RE, '');
   cleaned = normalizeVoiceSurfaceWhitespace(cleaned);

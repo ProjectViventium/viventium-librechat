@@ -55,7 +55,23 @@ router.get('/chat/stream/:streamId', async (req, res) => {
   const { streamId } = req.params;
   const isResume = req.query.resume === 'true';
 
+  /* === VIVENTIUM START ===
+   * Purpose: Arm disconnect cancellation before any asynchronous lookup so a
+   * closed client can never advance into Redis subscription readiness.
+   */
+  const requestAbort = new AbortController();
+  let result;
+  const onRequestClose = () => {
+    requestAbort.abort();
+    result?.unsubscribe();
+    logger.debug(`[AgentStream] Client disconnected from ${streamId}`);
+  };
+  res.once('close', onRequestClose);
+
   const job = await GenerationJobManager.getJob(streamId);
+  if (requestAbort.signal.aborted) {
+    return;
+  }
   if (!job) {
     return res.status(404).json({
       error: 'Stream not found',
@@ -80,6 +96,9 @@ router.get('/chat/stream/:streamId', async (req, res) => {
   // This supports multi-tab scenarios where each tab needs run step data
   if (isResume) {
     const resumeState = await GenerationJobManager.getResumeState(streamId);
+    if (requestAbort.signal.aborted) {
+      return;
+    }
     if (resumeState && !res.writableEnded) {
       // Send sync event with run steps AND aggregatedContent
       // Client will use aggregatedContent to initialize message state
@@ -93,7 +112,9 @@ router.get('/chat/stream/:streamId', async (req, res) => {
     }
   }
 
-  const result = await GenerationJobManager.subscribe(
+  let readinessFailed = false;
+
+  result = await GenerationJobManager.subscribe(
     streamId,
     (event) => {
       if (!res.writableEnded) {
@@ -121,16 +142,46 @@ router.get('/chat/stream/:streamId', async (req, res) => {
         res.end();
       }
     },
-  );
+    requestAbort.signal,
+  ).catch((error) => {
+    if (!requestAbort.signal.aborted) {
+      readinessFailed = true;
+      res.removeListener('close', onRequestClose);
+      logger.error(`[AgentStream] Failed to subscribe to ${streamId}:`, error);
+      if (!res.writableEnded) {
+        res.write(
+          `event: error\ndata: ${JSON.stringify({ error: 'Stream connection unavailable' })}\n\n`,
+        );
+        if (typeof res.flush === 'function') {
+          res.flush();
+        }
+        res.end();
+      }
+    }
+    return null;
+  });
 
   if (!result) {
-    return res.status(404).json({ error: 'Failed to subscribe to stream' });
+    res.removeListener('close', onRequestClose);
+    if (requestAbort.signal.aborted || readinessFailed) {
+      return;
+    }
+    if (!res.writableEnded) {
+      res.write(
+        `event: error\ndata: ${JSON.stringify({ error: 'Failed to subscribe to stream' })}\n\n`,
+      );
+      if (typeof res.flush === 'function') {
+        res.flush();
+      }
+      res.end();
+    }
+    return;
   }
 
-  req.on('close', () => {
-    logger.debug(`[AgentStream] Client disconnected from ${streamId}`);
+  if (requestAbort.signal.aborted) {
     result.unsubscribe();
-  });
+  }
+  /* === VIVENTIUM END === */
 });
 
 /**

@@ -13,7 +13,7 @@
  * === VIVENTIUM END === */
 
 const path = require('path');
-const { tool } = require('@langchain/core/tools');
+const { tool } = require('@librechat/agents/langchain/tools');
 const { Constants } = require('@librechat/agents');
 const {
   DATE_RANGE,

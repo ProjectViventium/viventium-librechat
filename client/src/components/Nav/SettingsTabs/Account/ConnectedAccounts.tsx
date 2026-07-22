@@ -1,12 +1,13 @@
 /* === VIVENTIUM START ===
  * Feature: Connected Accounts provider-auth flows.
- * Purpose: Let users connect OpenAI/Anthropic through account login without API key dialogs.
+ * Purpose: Give novice users one truthful place to save or remove local provider credentials.
  * === VIVENTIUM END === */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { EModelEndpoint, apiBaseUrl, request } from 'librechat-data-provider';
 import { useRevokeUserKeyMutation, useUserKeyQuery } from 'librechat-data-provider/react-query';
 import { Button, Label, Spinner, useToastContext } from '@librechat/client';
 import { useGetEndpointsQuery, useGetStartupConfig } from '~/data-provider';
+import { SetKeyDialog } from '~/components/Input/SetKeyDialog';
 import { NotificationSeverity } from '~/common';
 import { useLocalize } from '~/hooks';
 import type { TranslationKeys } from '~/hooks';
@@ -19,15 +20,15 @@ import {
 import { cn } from '~/utils';
 
 type ProviderSlug = ConnectedAccountProviderSlug;
+type ApiKeyOnlyProviderSlug = 'groq' | 'xai';
 
 type ProviderDefinition = {
-  endpoint: EModelEndpoint;
+  endpoint: EModelEndpoint | string;
+  endpointType?: EModelEndpoint;
   labelKey: TranslationKeys;
-  connectLabelKey: TranslationKeys;
   platformFallbackAvailable: boolean;
-  queryKey: EModelEndpoint;
-  slug: ProviderSlug;
-};
+  queryKey: EModelEndpoint | string;
+} & ({ oauth: true; slug: ProviderSlug } | { oauth: false; slug: ApiKeyOnlyProviderSlug });
 
 type OAuthSuccessMessage = {
   type: 'viventium_connected_account_oauth_success';
@@ -80,30 +81,38 @@ function ConnectedAccounts() {
   const { showToast } = useToastContext();
   const { data: startupConfig } = useGetStartupConfig();
   const { data: endpointsConfig } = useGetEndpointsQuery();
-  const [connectingProvider, setConnectingProvider] = useState<EModelEndpoint | null>(null);
+  const [connectingProvider, setConnectingProvider] = useState<string | null>(null);
+  const [keyDialogProvider, setKeyDialogProvider] = useState<ProviderDefinition | null>(null);
   const [manualFlows, setManualFlows] = useState<Partial<Record<ProviderSlug, ManualFlowState>>>(
     {},
   );
   const popupMonitorsRef = useRef<Partial<Record<ProviderSlug, number>>>({});
   const popupWindowsRef = useRef<Partial<Record<ProviderSlug, Window>>>({});
   const keyPollersRef = useRef<Partial<Record<ProviderSlug, number>>>({});
-  const keyPollInFlightRef = useRef<Partial<Record<ProviderSlug, boolean>>>({});
+  const keyPollInFlightRef = useRef<Partial<Record<ProviderSlug, number>>>({});
+  const flowAttemptsRef = useRef<Partial<Record<ProviderSlug, number>>>({});
   const connectedAccountsEnabled =
     (startupConfig as { viventiumConnectedAccountsEnabled?: boolean } | undefined)
       ?.viventiumConnectedAccountsEnabled === true;
+  const experimentalDirectSubscriptionAuth =
+    startupConfig?.viventiumExperimentalDirectSubscriptionAuth === true;
   const allowedPostMessageOrigins = useMemo(() => getAllowedPostMessageOrigins(), []);
 
   const openAIKeyQuery = useUserKeyQuery(EModelEndpoint.openAI, { refetchOnMount: 'always' });
   const anthropicKeyQuery = useUserKeyQuery(EModelEndpoint.anthropic, { refetchOnMount: 'always' });
+  const groqKeyQuery = useUserKeyQuery('groq', { refetchOnMount: 'always' });
+  const xAIKeyQuery = useUserKeyQuery('xai', { refetchOnMount: 'always' });
   const revokeOpenAIKeyMutation = useRevokeUserKeyMutation(EModelEndpoint.openAI);
   const revokeAnthropicKeyMutation = useRevokeUserKeyMutation(EModelEndpoint.anthropic);
+  const revokeGroqKeyMutation = useRevokeUserKeyMutation('groq');
+  const revokeXAIKeyMutation = useRevokeUserKeyMutation('xai');
 
   const openAIPlatformFallbackAvailable = useMemo(() => {
     const openAIConfig = endpointsConfig?.[EModelEndpoint.openAI];
     const azureOpenAIConfig = endpointsConfig?.[EModelEndpoint.azureOpenAI];
     return Boolean(
       (openAIConfig && !openAIConfig.userProvide) ||
-        (azureOpenAIConfig && !azureOpenAIConfig.userProvide),
+      (azureOpenAIConfig && !azureOpenAIConfig.userProvide),
     );
   }, [endpointsConfig]);
 
@@ -118,39 +127,78 @@ function ConnectedAccounts() {
         endpoint: EModelEndpoint.openAI,
         queryKey: EModelEndpoint.openAI,
         labelKey: 'com_ui_openai',
-        connectLabelKey: 'com_ui_connect_openai_account',
         platformFallbackAvailable: openAIPlatformFallbackAvailable,
+        oauth: true,
         slug: 'openai',
       },
       {
         endpoint: EModelEndpoint.anthropic,
         queryKey: EModelEndpoint.anthropic,
         labelKey: 'com_ui_anthropic',
-        connectLabelKey: 'com_ui_connect_anthropic_account',
         platformFallbackAvailable: anthropicPlatformFallbackAvailable,
+        oauth: true,
         slug: 'anthropic',
+      },
+      {
+        endpoint: 'groq',
+        endpointType: EModelEndpoint.custom,
+        queryKey: 'groq',
+        labelKey: 'com_ui_groq',
+        platformFallbackAvailable: false,
+        oauth: false,
+        slug: 'groq',
+      },
+      {
+        endpoint: 'xai',
+        endpointType: EModelEndpoint.custom,
+        queryKey: 'xai',
+        labelKey: 'com_ui_xai',
+        platformFallbackAvailable: false,
+        oauth: false,
+        slug: 'xai',
       },
     ],
     [anthropicPlatformFallbackAvailable, openAIPlatformFallbackAvailable],
   );
 
   const getKeyQuery = useCallback(
-    (endpoint: EModelEndpoint) =>
-      endpoint === EModelEndpoint.openAI ? openAIKeyQuery : anthropicKeyQuery,
-    [anthropicKeyQuery, openAIKeyQuery],
+    (endpoint: EModelEndpoint | string) => {
+      if (endpoint === EModelEndpoint.openAI) {
+        return openAIKeyQuery;
+      }
+      if (endpoint === EModelEndpoint.anthropic) {
+        return anthropicKeyQuery;
+      }
+      return endpoint === 'groq' ? groqKeyQuery : xAIKeyQuery;
+    },
+    [anthropicKeyQuery, groqKeyQuery, openAIKeyQuery, xAIKeyQuery],
   );
 
   const getRevokeKeyMutation = useCallback(
-    (endpoint: EModelEndpoint) =>
-      endpoint === EModelEndpoint.openAI ? revokeOpenAIKeyMutation : revokeAnthropicKeyMutation,
-    [revokeAnthropicKeyMutation, revokeOpenAIKeyMutation],
+    (endpoint: EModelEndpoint | string) => {
+      if (endpoint === EModelEndpoint.openAI) {
+        return revokeOpenAIKeyMutation;
+      }
+      if (endpoint === EModelEndpoint.anthropic) {
+        return revokeAnthropicKeyMutation;
+      }
+      return endpoint === 'groq' ? revokeGroqKeyMutation : revokeXAIKeyMutation;
+    },
+    [
+      revokeAnthropicKeyMutation,
+      revokeGroqKeyMutation,
+      revokeOpenAIKeyMutation,
+      revokeXAIKeyMutation,
+    ],
   );
 
   const providersBySlug = useMemo(
     () =>
       providers.reduce(
         (acc, provider) => {
-          acc[provider.slug] = provider;
+          if (provider.oauth) {
+            acc[provider.slug] = provider;
+          }
           return acc;
         },
         {} as Record<ProviderSlug, ProviderDefinition>,
@@ -181,6 +229,21 @@ function ConnectedAccounts() {
       popup.close();
     }
     delete popupWindowsRef.current[provider];
+  }, []);
+
+  const beginFlowAttempt = useCallback((provider: ProviderSlug) => {
+    const attempt = (flowAttemptsRef.current[provider] ?? 0) + 1;
+    flowAttemptsRef.current[provider] = attempt;
+    return attempt;
+  }, []);
+
+  const isCurrentFlowAttempt = useCallback(
+    (provider: ProviderSlug, attempt: number) => flowAttemptsRef.current[provider] === attempt,
+    [],
+  );
+
+  const invalidateFlowAttempt = useCallback((provider: ProviderSlug) => {
+    flowAttemptsRef.current[provider] = (flowAttemptsRef.current[provider] ?? 0) + 1;
   }, []);
 
   const upsertManualFlow = useCallback((provider: ProviderSlug, state?: string) => {
@@ -250,22 +313,30 @@ function ConnectedAccounts() {
   );
 
   const pollForConnectedKey = useCallback(
-    (provider: ProviderDefinition) => {
+    (provider: ProviderDefinition, attempt: number) => {
       clearKeyPoller(provider.slug);
       const startedAt = Date.now();
       keyPollersRef.current[provider.slug] = window.setInterval(() => {
-        if (keyPollInFlightRef.current[provider.slug]) {
+        if (!isCurrentFlowAttempt(provider.slug, attempt)) {
+          return;
+        }
+        if (keyPollInFlightRef.current[provider.slug] === attempt) {
           return;
         }
 
-        keyPollInFlightRef.current[provider.slug] = true;
+        keyPollInFlightRef.current[provider.slug] = attempt;
         void getKeyQuery(provider.queryKey)
           .refetch()
           .then((result) => {
+            if (!isCurrentFlowAttempt(provider.slug, attempt)) {
+              return;
+            }
             const isConnected = Boolean(result.data?.expiresAt);
             if (isConnected) {
+              invalidateFlowAttempt(provider.slug);
               clearPopupMonitor(provider.slug);
               clearKeyPoller(provider.slug);
+              clearPopupWindow(provider.slug);
               clearManualFlow(provider.slug);
               setConnectingProvider((current) => (current === provider.endpoint ? null : current));
               showProviderConnectedToast(provider);
@@ -278,11 +349,22 @@ function ConnectedAccounts() {
             }
           })
           .finally(() => {
-            keyPollInFlightRef.current[provider.slug] = false;
+            if (keyPollInFlightRef.current[provider.slug] === attempt) {
+              delete keyPollInFlightRef.current[provider.slug];
+            }
           });
       }, KEY_POLL_INTERVAL_MS);
     },
-    [clearKeyPoller, clearManualFlow, clearPopupMonitor, getKeyQuery, showProviderConnectedToast],
+    [
+      clearKeyPoller,
+      clearManualFlow,
+      clearPopupMonitor,
+      clearPopupWindow,
+      getKeyQuery,
+      invalidateFlowAttempt,
+      isCurrentFlowAttempt,
+      showProviderConnectedToast,
+    ],
   );
 
   const beginManualFlow = useCallback(
@@ -297,6 +379,9 @@ function ConnectedAccounts() {
 
   useEffect(() => {
     const messageHandler = (event: MessageEvent<OAuthSuccessMessage>) => {
+      if (!experimentalDirectSubscriptionAuth) {
+        return;
+      }
       if (!allowedPostMessageOrigins.has(event.origin)) {
         return;
       }
@@ -325,8 +410,10 @@ function ConnectedAccounts() {
         return;
       }
 
+      invalidateFlowAttempt(provider.slug);
       clearPopupMonitor(provider.slug);
       clearKeyPoller(provider.slug);
+      clearPopupWindow(provider.slug);
       clearManualFlow(provider.slug);
       setConnectingProvider((current) => (current === provider.endpoint ? null : current));
       void getKeyQuery(provider.queryKey).refetch();
@@ -340,15 +427,18 @@ function ConnectedAccounts() {
     clearKeyPoller,
     clearManualFlow,
     clearPopupMonitor,
+    clearPopupWindow,
     connectingProvider,
+    experimentalDirectSubscriptionAuth,
     getKeyQuery,
+    invalidateFlowAttempt,
     manualFlows,
     providersBySlug,
     showProviderConnectedToast,
   ]);
 
   useEffect(() => {
-    if (!connectedAccountsEnabled) {
+    if (!connectedAccountsEnabled || !experimentalDirectSubscriptionAuth) {
       return;
     }
 
@@ -389,10 +479,12 @@ function ConnectedAccounts() {
         CONNECTED_ACCOUNTS_MANUAL_FLOW_EVENT,
         manualFlowHandler as EventListener,
       );
-  }, [beginManualFlow, connectedAccountsEnabled]);
+  }, [beginManualFlow, connectedAccountsEnabled, experimentalDirectSubscriptionAuth]);
 
   useEffect(() => {
     return () => {
+      invalidateFlowAttempt('openai');
+      invalidateFlowAttempt('anthropic');
       clearPopupMonitor('openai');
       clearPopupMonitor('anthropic');
       clearKeyPoller('openai');
@@ -400,7 +492,7 @@ function ConnectedAccounts() {
       clearPopupWindow('openai');
       clearPopupWindow('anthropic');
     };
-  }, [clearKeyPoller, clearPopupMonitor, clearPopupWindow]);
+  }, [clearKeyPoller, clearPopupMonitor, clearPopupWindow, invalidateFlowAttempt]);
 
   const getSourceLine = (isConnected: boolean, platformFallbackAvailable: boolean) => {
     if (isConnected) {
@@ -413,6 +505,13 @@ function ConnectedAccounts() {
   };
 
   const connectProvider = async (provider: ProviderDefinition) => {
+    if (!experimentalDirectSubscriptionAuth || !provider.oauth) {
+      return;
+    }
+    const attempt = beginFlowAttempt(provider.slug);
+    clearPopupMonitor(provider.slug);
+    clearKeyPoller(provider.slug);
+    clearPopupWindow(provider.slug);
     const popup = window.open('', '_blank', 'width=640,height=760');
     if (!popup) {
       showToast({
@@ -433,6 +532,11 @@ function ConnectedAccounts() {
       const authUrl = response?.authUrl;
       const flowMode = response?.flowMode ?? 'popup_callback';
 
+      if (!isCurrentFlowAttempt(provider.slug, attempt)) {
+        popup.close();
+        return;
+      }
+
       if (!authUrl) {
         throw new Error('oauth_start_failed');
       }
@@ -452,16 +556,36 @@ function ConnectedAccounts() {
       }
 
       clearPopupMonitor(provider.slug);
-      pollForConnectedKey(provider);
+      pollForConnectedKey(provider, attempt);
       popupMonitorsRef.current[provider.slug] = window.setInterval(() => {
+        if (!isCurrentFlowAttempt(provider.slug, attempt)) {
+          clearPopupMonitor(provider.slug);
+          return;
+        }
         if (!popup.closed) {
           return;
         }
 
         clearPopupMonitor(provider.slug);
         delete popupWindowsRef.current[provider.slug];
+        /* === VIVENTIUM START ===
+         * Feature: Connected-account cancellation recovery.
+         * Purpose: A closed OAuth popup must restore immediate retry without discarding bounded polling.
+         */
+        // The user may cancel the provider page without a callback. Restore
+        // the Connect action immediately while the bounded key poll continues
+        // in case authorization completed just before the popup closed.
+        setConnectingProvider((current) => (current === provider.endpoint ? null : current));
+        /* === VIVENTIUM END === */
       }, 800);
     } catch (_error) {
+      if (!isCurrentFlowAttempt(provider.slug, attempt)) {
+        if (!popup.closed) {
+          popup.close();
+        }
+        return;
+      }
+      invalidateFlowAttempt(provider.slug);
       setConnectingProvider((current) => (current === provider.endpoint ? null : current));
       clearPopupMonitor(provider.slug);
       clearKeyPoller(provider.slug);
@@ -484,6 +608,7 @@ function ConnectedAccounts() {
 
     setManualFlowSubmitting(provider.slug, true);
     setConnectingProvider(provider.endpoint);
+    const attempt = flowAttemptsRef.current[provider.slug] ?? beginFlowAttempt(provider.slug);
 
     try {
       await request.post(`${apiBaseUrl()}/api/connected-accounts/${provider.slug}/complete`, {
@@ -491,6 +616,11 @@ function ConnectedAccounts() {
         ...(manualFlow.state ? { state: manualFlow.state } : {}),
       });
 
+      if (!isCurrentFlowAttempt(provider.slug, attempt)) {
+        return;
+      }
+
+      invalidateFlowAttempt(provider.slug);
       clearPopupMonitor(provider.slug);
       clearKeyPoller(provider.slug);
       clearPopupWindow(provider.slug);
@@ -499,6 +629,9 @@ function ConnectedAccounts() {
       setConnectingProvider((current) => (current === provider.endpoint ? null : current));
       showProviderConnectedToast(provider);
     } catch (_error) {
+      if (!isCurrentFlowAttempt(provider.slug, attempt)) {
+        return;
+      }
       setConnectingProvider((current) => (current === provider.endpoint ? null : current));
       setManualFlowSubmitting(provider.slug, false);
       showToast({
@@ -511,6 +644,7 @@ function ConnectedAccounts() {
   };
 
   const cancelManualFlow = (provider: ProviderDefinition) => {
+    invalidateFlowAttempt(provider.slug);
     clearManualFlow(provider.slug);
     clearPopupMonitor(provider.slug);
     clearKeyPoller(provider.slug);
@@ -518,12 +652,13 @@ function ConnectedAccounts() {
     setConnectingProvider((current) => (current === provider.endpoint ? null : current));
   };
 
-  const revokeConnection = (provider: ProviderDefinition) => {
+  const disconnectLocalCredential = (provider: ProviderDefinition) => {
     const mutation = getRevokeKeyMutation(provider.endpoint);
     mutation.mutate(
       {},
       {
-        onSuccess: () => {
+        onSuccess: async () => {
+          await getKeyQuery(provider.queryKey).refetch();
           const providerLabel = localize(provider.labelKey);
           showToast({
             message: localize('com_ui_provider_disconnected', { provider: providerLabel }),
@@ -553,22 +688,28 @@ function ConnectedAccounts() {
           {localize('com_ui_connected_accounts_description')}
         </p>
       </div>
+      {experimentalDirectSubscriptionAuth && (
+        <div className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-amber-950 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-100">
+          <p className="text-sm font-medium">
+            {localize('com_ui_connected_accounts_experimental')}
+          </p>
+          <p className="mt-1 text-xs">
+            {localize('com_ui_connected_accounts_experimental_description')}
+          </p>
+        </div>
+      )}
       <div className="space-y-2" aria-labelledby="connected-accounts-label">
         {providers.map((provider) => {
           const providerLabel = localize(provider.labelKey);
           const keyQuery = getKeyQuery(provider.queryKey);
           const revokeMutation = getRevokeKeyMutation(provider.endpoint);
           const isConnected = Boolean(keyQuery.data?.expiresAt);
-          const manualFlow = manualFlows[provider.slug];
+          const manualFlow = provider.oauth ? manualFlows[provider.slug] : undefined;
           const isManualSubmitting = manualFlow?.isSubmitting === true;
           const isConnecting = connectingProvider === provider.endpoint || isManualSubmitting;
           const statusText = isConnected
-            ? localize('com_nav_mcp_status_connected')
-            : localize('com_nav_mcp_status_disconnected');
-          let connectButtonLabel = localize(provider.connectLabelKey);
-          if (isConnected) {
-            connectButtonLabel = localize('com_ui_reconnect');
-          }
+            ? localize('com_ui_connected_accounts_local_credential_saved')
+            : localize('com_ui_connected_accounts_no_local_credential');
 
           return (
             <section
@@ -582,7 +723,7 @@ function ConnectedAccounts() {
                   <p
                     className={cn(
                       'text-xs',
-                      isConnected ? 'text-green-600 dark:text-green-400' : 'text-text-secondary',
+                      isConnected ? 'text-amber-700 dark:text-amber-300' : 'text-text-secondary',
                     )}
                   >
                     {statusText}
@@ -631,28 +772,57 @@ function ConnectedAccounts() {
                   </div>
                 </div>
               )}
+              {isConnected && (
+                <p className="mb-3 text-xs text-text-secondary">
+                  {localize('com_ui_connected_accounts_disconnect_local_only')}
+                </p>
+              )}
               <div className="flex items-center justify-end gap-2">
                 {isConnected && (
                   <Button
                     variant="outline"
-                    onClick={() => revokeConnection(provider)}
+                    onClick={() => disconnectLocalCredential(provider)}
                     disabled={revokeMutation.isLoading || isConnecting}
                   >
                     {revokeMutation.isLoading ? (
                       <Spinner className="icon-sm" />
                     ) : (
-                      localize('com_ui_revoke')
+                      localize('com_ui_connected_accounts_disconnect')
                     )}
                   </Button>
                 )}
-                <Button onClick={() => connectProvider(provider)} disabled={isConnecting}>
-                  {isConnecting ? <Spinner className="icon-sm" /> : connectButtonLabel}
+                <Button variant="outline" onClick={() => setKeyDialogProvider(provider)}>
+                  {localize('com_ui_connected_accounts_use_provider_api_key', {
+                    provider: providerLabel,
+                  })}
                 </Button>
+                {experimentalDirectSubscriptionAuth && provider.oauth && (
+                  <Button onClick={() => connectProvider(provider)} disabled={isConnecting}>
+                    {isConnecting ? (
+                      <Spinner className="icon-sm" />
+                    ) : (
+                      localize('com_ui_connected_accounts_experimental')
+                    )}
+                  </Button>
+                )}
               </div>
             </section>
           );
         })}
       </div>
+      {keyDialogProvider && (
+        <SetKeyDialog
+          open={true}
+          endpoint={keyDialogProvider.endpoint}
+          endpointType={keyDialogProvider.endpointType}
+          removalMode="disconnect"
+          onOpenChange={(open) => {
+            if (!open) {
+              setKeyDialogProvider(null);
+            }
+          }}
+        />
+      )}
     </div>
   );
 }

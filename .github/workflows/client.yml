@@ -24,14 +24,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Use Node.js
+      # VIVENTIUM START — exact release toolchain.
+      - name: Use Node.js 24.16.0
         uses: actions/setup-node@v4
         with:
-          node-version: '20.x'
+          node-version: '24.16.0'
           registry-url: 'https://registry.npmjs.org'
+      # VIVENTIUM END
       
       - name: Update npm for OIDC support
-        run: npm install -g npm@latest  # Must be 11.5.1+ for provenance
+        run: npm install -g npm@11.13.0 # Exact project package-manager contract; supports provenance
         
       - name: Install client dependencies
         run: cd packages/client && npm ci

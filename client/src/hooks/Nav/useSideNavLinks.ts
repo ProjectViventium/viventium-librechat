@@ -1,6 +1,19 @@
 import { useMemo } from 'react';
+/* === VIVENTIUM START ===
+ * Feature: Feelings discovery in ordinary chat controls.
+ * Purpose: Reuse the existing route and design-system icon from the right-side navigation.
+ */
+import { useNavigate } from 'react-router-dom';
 import { Blocks, MCPIcon, AttachmentIcon } from '@librechat/client';
-import { Database, Bookmark, Settings2, ArrowRightToLine, MessageSquareQuote } from 'lucide-react';
+import {
+  Database,
+  Bookmark,
+  Settings2,
+  HeartPulse,
+  ArrowRightToLine,
+  MessageSquareQuote,
+} from 'lucide-react';
+/* === VIVENTIUM END === */
 import {
   Permissions,
   EModelEndpoint,
@@ -19,6 +32,12 @@ import PromptsAccordion from '~/components/Prompts/PromptsAccordion';
 import Parameters from '~/components/SidePanel/Parameters/Panel';
 import { MemoryPanel } from '~/components/SidePanel/Memories';
 import FilesPanel from '~/components/SidePanel/Files/Panel';
+/* === VIVENTIUM START ===
+ * Feature: Feelings discovery in ordinary chat controls.
+ * Purpose: Keep navigation availability aligned with the compiled startup-config gate.
+ */
+import { useGetStartupConfig } from '~/data-provider';
+/* === VIVENTIUM END === */
 import { useHasAccess, useMCPServerManager } from '~/hooks';
 
 export default function useSideNavLinks({
@@ -36,6 +55,14 @@ export default function useSideNavLinks({
   interfaceConfig: Partial<TInterfaceConfig>;
   endpointsConfig: TEndpointsConfig;
 }) {
+  /* === VIVENTIUM START ===
+   * Feature: Feelings discovery in ordinary chat controls.
+   * Purpose: Expose the existing immersive route without leaving a dead entry when disabled.
+   */
+  const navigate = useNavigate();
+  const { data: startupConfig } = useGetStartupConfig();
+  const feelingsAvailable = startupConfig?.viventiumFeelingsAvailable !== false;
+  /* === VIVENTIUM END === */
   const hasAccessToPrompts = useHasAccess({
     permissionType: PermissionTypes.PROMPTS,
     permission: Permissions.USE,
@@ -116,6 +143,21 @@ export default function useSideNavLinks({
       });
     }
 
+    /* === VIVENTIUM START ===
+     * Feature: Feelings discovery in ordinary chat controls.
+     * Purpose: Route to the existing authenticated Feelings page from the right control panel.
+     */
+    if (feelingsAvailable) {
+      links.push({
+        title: 'com_nav_feelings',
+        label: '',
+        icon: HeartPulse,
+        id: 'feelings',
+        onClick: () => navigate('/feelings'),
+      });
+    }
+    /* === VIVENTIUM END === */
+
     if (hasAccessToMemories && hasAccessToReadMemories) {
       links.push({
         title: 'com_ui_memories',
@@ -188,6 +230,8 @@ export default function useSideNavLinks({
     hasAccessToAgents,
     hasAccessToCreateAgents,
     hasAccessToPrompts,
+    feelingsAvailable,
+    navigate,
     hasAccessToMemories,
     hasAccessToReadMemories,
     interfaceConfig.parameters,

@@ -109,16 +109,23 @@ const DialogContent = React.forwardRef<
           return;
         }
 
-        // Check if a dropdown menu, listbox, or combobox has focus (focus is within it)
-        const popoverElements = document.querySelectorAll(
-          '[role="menu"], [role="listbox"], [role="combobox"]',
-        );
+        /* === VIVENTIUM START ===
+         * Feature: Reliable keyboard cancellation for account dialogs.
+         * Purpose: A closed combobox keeps focus but must not consume Escape and trap the dialog.
+         * Only an actually open menu/listbox may consume the first Escape press.
+         */
+        const popoverElements = document.querySelectorAll('[role="menu"], [role="listbox"]');
         for (const popover of popoverElements) {
-          if (popover.contains(activeElement)) {
+          const popoverIsOpen =
+            !popover.hasAttribute('hidden') &&
+            popover.getAttribute('aria-hidden') !== 'true' &&
+            popover.getAttribute('data-state') !== 'closed';
+          if (popoverIsOpen && popover.contains(activeElement)) {
             event.preventDefault();
             return;
           }
         }
+        /* === VIVENTIUM END === */
 
         // Check if a tooltip has focus (focus is within it)
         const tooltips = document.querySelectorAll('.tooltip');

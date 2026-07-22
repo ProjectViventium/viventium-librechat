@@ -19,11 +19,13 @@ jest.mock('~/models', () => ({
 }));
 
 const mockMessageFind = jest.fn();
+const mockMessageAggregate = jest.fn();
 const mockConversationFind = jest.fn();
 
 jest.mock('~/db/models', () => ({
   Message: {
     find: (...args) => mockMessageFind(...args),
+    aggregate: (...args) => mockMessageAggregate(...args),
   },
   Conversation: {
     find: (...args) => mockConversationFind(...args),
@@ -32,6 +34,25 @@ jest.mock('~/db/models', () => ({
 
 jest.mock('~/server/services/viventium/conversationRecallService', () => ({
   getMessageText: jest.fn((message) => message?.text || ''),
+  orderRecallMessagesParentFirst: jest.fn((messages) => {
+    const source = Array.isArray(messages) ? messages : [];
+    const byId = new Map(source.map((message) => [message?.messageId, message]));
+    const visited = new Set();
+    const ordered = [];
+    const visit = (message) => {
+      if (!message?.messageId || visited.has(message.messageId)) {
+        return;
+      }
+      const parent = byId.get(message.parentMessageId);
+      if (parent?.conversationId === message.conversationId) {
+        visit(parent);
+      }
+      visited.add(message.messageId);
+      ordered.push(message);
+    };
+    source.forEach(visit);
+    return ordered;
+  }),
   shouldSkipFromRecallCorpus: jest.fn(({ messageText, hasRecallDerivedChild = false, message }) => {
     const metadata = message?.metadata?.viventium;
     if (metadata?.type === 'listen_only_transcript' && metadata?.mode === 'listen_only') {
@@ -100,6 +121,7 @@ describe('fileSearch.js - tuple return validation', () => {
     delete process.env.VIVENTIUM_FILE_SEARCH_OUTPUT_MAX_CHARS_MEETING_TRANSCRIPT;
     delete process.env.VIVENTIUM_FILE_SEARCH_LITERAL_FALLBACK_MAX_MATCHES;
     mockMessageFind.mockReturnValue(queryResult([]));
+    mockMessageAggregate.mockResolvedValue([]);
     mockConversationFind.mockReturnValue(queryResult([]));
     shouldSkipFromRecallCorpus.mockImplementation(
       ({ messageText, hasRecallDerivedChild = false, message }) => {
@@ -1328,7 +1350,7 @@ describe('fileSearch.js - tuple return validation', () => {
               [
                 {
                   page_content:
-                    '<turn role="assistant">The cousins visit was a warm family evening.</turn>',
+                    '<turn role="assistant">Project Cedar launch review was calm and productive.</turn>',
                   metadata: { source: '/path/to/conversation-recall.txt', page: 3 },
                 },
                 0.2,
@@ -1348,7 +1370,7 @@ describe('fileSearch.js - tuple return validation', () => {
             conversationId: 'prior_skyline_convo',
             createdAt: '2026-06-23T22:19:44.960Z',
             isCreatedByUser: true,
-            text: 'Canopy restaurant North Pier, right before mentioning Lina and Sora.',
+            text: 'Project Cedar intake at Harbor Annex, before mentioning Avery and Morgan.',
           },
         ]);
       });
@@ -1363,7 +1385,7 @@ describe('fileSearch.js - tuple return validation', () => {
       });
 
       const [, artifact] = await fileSearchTool.func({
-        query: 'Skyline deck restaurant Lina Sora',
+        query: 'Project Cedar Harbor Annex Avery Morgan',
       });
 
       expect(axios.post.mock.calls.map(([, body]) => body.file_id)).toEqual(
@@ -1373,9 +1395,83 @@ describe('fileSearch.js - tuple return validation', () => {
         .filter((source) => source.fileId === 'conversation_recall:user_1:all')
         .map((source) => source.content);
       expect(
-        recallContents.some((content) => content.includes('Canopy restaurant North Pier')),
+        recallContents.some((content) => content.includes('Project Cedar intake at Harbor Annex')),
       ).toBe(true);
-      expect(recallContents.some((content) => content.includes('cousins visit'))).toBe(true);
+      expect(
+        recallContents.some((content) => content.includes('Project Cedar launch review')),
+      ).toBe(true);
+    });
+
+    it('ranks complete user-authored evidence above a newer assistant restatement', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      axios.post.mockResolvedValue({ data: [] });
+      const primaryUserText =
+        'Synthetic Project Atlas outcome: the pilot scope was frozen. Thursday follow-up covers the intake workflow. ' +
+        'Additional first-person project context. '.repeat(180) +
+        'Critical tail evidence: the following Tuesday review is with Casey for the final decision.';
+      const assistantRestatement =
+        'Project Atlas pilot scope was frozen, with a Thursday intake-workflow follow-up.';
+      mockMessageFind.mockImplementation((filter) => {
+        if (filter?.parentMessageId) {
+          return queryResult([]);
+        }
+        if (filter?.createdAt?.$lte) {
+          return queryResult([
+            {
+              messageId: 'long-preceding-assistant-turn',
+              conversationId: 'prior-convo',
+              createdAt: '2026-07-15T13:59:00.000Z',
+              isCreatedByUser: false,
+              sender: 'assistant',
+              text: 'Unrelated preceding assistant context. '.repeat(90),
+            },
+            {
+              messageId: 'primary-user-turn',
+              conversationId: 'prior-convo',
+              createdAt: '2026-07-15T14:00:00.000Z',
+              isCreatedByUser: true,
+              text: primaryUserText,
+            },
+          ]);
+        }
+        if (filter?.createdAt?.$gt) {
+          return queryResult([]);
+        }
+        return queryResult([
+          {
+            messageId: 'assistant-restatement',
+            conversationId: 'prior-convo',
+            createdAt: '2026-07-15T15:00:00.000Z',
+            isCreatedByUser: false,
+            sender: 'assistant',
+            text: assistantRestatement,
+          },
+          {
+            messageId: 'primary-user-turn',
+            conversationId: 'prior-convo',
+            createdAt: '2026-07-15T14:00:00.000Z',
+            isCreatedByUser: true,
+            text: primaryUserText,
+          },
+        ]);
+      });
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        conversationId: 'current-convo',
+        files: [
+          { file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' },
+        ],
+      });
+      const [, artifact] = await fileSearchTool.func({
+        query: 'Project Atlas frozen pilot Thursday intake',
+      });
+
+      expect(artifact.file_search.sources[0].content).toContain('role="user"');
+      expect(artifact.file_search.sources[0].content).toContain(
+        'Critical tail evidence: the following Tuesday review is with Casey for the final decision.',
+      );
+      expect(artifact.file_search.sources[0].content.length).toBeLessThanOrEqual(4000);
     });
 
     it('keeps vector recall results when lexical Mongo retrieval fails', async () => {
@@ -1384,7 +1480,7 @@ describe('fileSearch.js - tuple return validation', () => {
         data: [
           [
             {
-              page_content: '<turn role="user">Vector-only cousins evidence.</turn>',
+              page_content: '<turn role="user">Vector-only Project Cedar evidence.</turn>',
               metadata: { source: '/path/to/conversation-recall.txt', page: 1 },
             },
             0.1,
@@ -1406,12 +1502,12 @@ describe('fileSearch.js - tuple return validation', () => {
         ],
       });
 
-      const [, artifact] = await fileSearchTool.func({ query: 'remember cousins evidence' });
+      const [, artifact] = await fileSearchTool.func({ query: 'remember Project Cedar evidence' });
 
       expect(artifact.file_search.sources).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
-            content: expect.stringContaining('Vector-only cousins evidence'),
+            content: expect.stringContaining('Vector-only Project Cedar evidence'),
           }),
         ]),
       );
@@ -1430,7 +1526,7 @@ describe('fileSearch.js - tuple return validation', () => {
             conversationId: 'prior_convo',
             createdAt: '2026-07-10T22:00:00.000Z',
             isCreatedByUser: true,
-            text: 'Lexical-only cousins evidence from last night.',
+            text: 'Lexical-only Project Cedar evidence from the prior run.',
           },
         ]);
       });
@@ -1443,15 +1539,41 @@ describe('fileSearch.js - tuple return validation', () => {
         ],
       });
 
-      const [, artifact] = await fileSearchTool.func({ query: 'remember cousins evidence' });
+      const [, artifact] = await fileSearchTool.func({ query: 'remember Project Cedar evidence' });
 
       expect(artifact.file_search.sources).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
-            content: expect.stringContaining('Lexical-only cousins evidence'),
+            content: expect.stringContaining('Lexical-only Project Cedar evidence'),
           }),
         ]),
       );
+    });
+
+    it('reports recall as inconclusive when lexical and vector retrieval both fail', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      axios.post.mockRejectedValue(new Error('synthetic rag unavailable'));
+      mockMessageFind.mockReturnValue({
+        select: jest.fn().mockReturnThis(),
+        sort: jest.fn().mockReturnThis(),
+        limit: jest.fn().mockReturnThis(),
+        lean: jest.fn().mockRejectedValue(new Error('synthetic mongo unavailable')),
+      });
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        conversationId: 'current_convo',
+        files: [
+          { file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' },
+        ],
+      });
+
+      const [output, artifact] = await fileSearchTool.func({
+        query: 'remember Project Cedar evidence',
+      });
+
+      expect(output).toContain('Treat this as inconclusive');
+      expect(artifact).toBeUndefined();
     });
 
     it('keeps recall vector active when source-backed recall and transcript resources are attached', async () => {
@@ -1462,7 +1584,7 @@ describe('fileSearch.js - tuple return validation', () => {
             data: [
               [
                 {
-                  page_content: 'Transcript chunk mentioning unrelated North Pier coffee.',
+                  page_content: 'Transcript chunk mentioning unrelated Harbor Annex coffee.',
                   metadata: { file_id: 'meeting_summary:user_1:coffee', source: 'coffee.txt' },
                 },
                 0.35,
@@ -1482,7 +1604,7 @@ describe('fileSearch.js - tuple return validation', () => {
             conversationId: 'prior_skyline_convo',
             createdAt: '2026-06-23T22:19:44.960Z',
             isCreatedByUser: true,
-            text: 'Canopy restaurant North Pier, right before mentioning Lina and Sora.',
+            text: 'Project Cedar intake at Harbor Annex, before mentioning Avery and Morgan.',
           },
         ]);
       });
@@ -1501,7 +1623,7 @@ describe('fileSearch.js - tuple return validation', () => {
       });
 
       const [, artifact] = await fileSearchTool.func({
-        query: 'Skyline deck restaurant Lina Sora',
+        query: 'Project Cedar Harbor Annex Avery Morgan',
       });
 
       expect(
@@ -1513,7 +1635,7 @@ describe('fileSearch.js - tuple return validation', () => {
       const sourceBackedRecall = artifact.file_search.sources.find(
         (source) => source.fileId === 'conversation_recall:user_1:all',
       );
-      expect(sourceBackedRecall?.content).toContain('Canopy restaurant North Pier');
+      expect(sourceBackedRecall?.content).toContain('Project Cedar intake at Harbor Annex');
       expect(artifact.file_search.sources.map((source) => source.fileId)).toContain(
         'meeting_summary:user_1:coffee',
       );
@@ -1732,6 +1854,143 @@ describe('fileSearch.js - tuple return validation', () => {
       expect(artifact.file_search.sources[0].content).toContain(
         'Project Atlas decision: ship the slimmer onboarding flow first.',
       );
+    });
+
+    it('batches four source-only matches within a two-database-round-trip latency budget', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      axios.post.mockResolvedValue({ data: [] });
+      const matchedTurns = Array.from({ length: 4 }, (_, index) => ({
+        messageId: `source_turn_${index}`,
+        conversationId: 'source_convo',
+        createdAt: `2026-07-19T12:0${index}:00.000Z`,
+        isCreatedByUser: false,
+        sender: 'assistant',
+        text: `Project Atlas synthetic onboarding evidence segment ${index}.`,
+      }));
+      mockMessageFind.mockImplementation((filter) => {
+        if (filter?.parentMessageId || filter?.createdAt) {
+          return queryResult([]);
+        }
+        return queryResult(matchedTurns);
+      });
+      mockMessageAggregate.mockImplementation((pipeline) => {
+        const facetStage = pipeline.find((stage) => stage.$facet);
+        if (!facetStage) {
+          return Promise.resolve([]);
+        }
+        return Promise.resolve([
+          Object.fromEntries(
+            matchedTurns.flatMap((turn, index) => [
+              [`before_${index}`, [turn]],
+              [`after_${index}`, []],
+            ]),
+          ),
+        ]);
+      });
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        conversationId: 'current-convo',
+        files: [
+          {
+            file_id: 'conversation_recall:user_1:all',
+            filename: 'conversation-recall-all.txt',
+            viventiumConversationRecallMode: 'source_only',
+          },
+        ],
+      });
+
+      const [, artifact] = await fileSearchTool.func({
+        query: 'Project Atlas onboarding evidence',
+      });
+
+      expect(artifact.file_search.sources.length).toBeLessThanOrEqual(4);
+      const combinedEvidence = artifact.file_search.sources
+        .map((source) => source.content)
+        .join('\n');
+      matchedTurns.forEach((turn) => expect(combinedEvidence).toContain(turn.text));
+      expect(mockMessageFind).toHaveBeenCalledTimes(1);
+      expect(mockMessageAggregate).toHaveBeenCalledTimes(1);
+      const aggregatePipeline = mockMessageAggregate.mock.calls[0][0];
+      expect(aggregatePipeline[0].$match).toEqual(
+        expect.objectContaining({
+          user: 'user1',
+          'metadata.viventium.type': { $ne: 'listen_only_transcript' },
+          'metadata.viventium.mode': { $ne: 'listen_only' },
+          'metadata.viventium.memoryEligible': { $ne: false },
+          'metadata.viventium.qaRun': { $ne: true },
+        }),
+      );
+      expect(Object.keys(aggregatePipeline[2].$facet)).toHaveLength(8);
+      const simulatedSerialDbLatencyMs =
+        (mockMessageFind.mock.calls.length + mockMessageAggregate.mock.calls.length) * 25;
+      expect(simulatedSerialDbLatencyMs).toBeLessThanOrEqual(50);
+    });
+
+    it('keeps primary source evidence when batched context expansion is unavailable', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      axios.post.mockResolvedValue({ data: [] });
+      mockMessageFind.mockReturnValue(
+        queryResult([
+          {
+            messageId: 'source_turn',
+            conversationId: 'source_convo',
+            createdAt: '2026-07-19T12:00:00.000Z',
+            isCreatedByUser: false,
+            sender: 'assistant',
+            text: 'Project Atlas primary evidence survives context degradation.',
+          },
+        ]),
+      );
+      mockMessageAggregate.mockRejectedValueOnce(new Error('synthetic aggregate unavailable'));
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        conversationId: 'current-convo',
+        files: [
+          {
+            file_id: 'conversation_recall:user_1:all',
+            filename: 'conversation-recall-all.txt',
+            viventiumConversationRecallMode: 'source_only',
+          },
+        ],
+      });
+
+      const [, artifact] = await fileSearchTool.func({ query: 'Project Atlas primary evidence' });
+
+      expect(artifact.file_search.sources[0].content).toContain(
+        'Project Atlas primary evidence survives context degradation.',
+      );
+      expect(mockMessageAggregate).toHaveBeenCalledTimes(1);
+    });
+
+    it('reports source-only recall retrieval failure as inconclusive', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      mockMessageFind.mockReturnValue({
+        select: jest.fn().mockReturnThis(),
+        sort: jest.fn().mockReturnThis(),
+        limit: jest.fn().mockReturnThis(),
+        lean: jest.fn().mockRejectedValue(new Error('synthetic mongo unavailable')),
+      });
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        conversationId: 'current-convo',
+        files: [
+          {
+            file_id: 'conversation_recall:user_1:all',
+            filename: 'conversation-recall-all.txt',
+            viventiumConversationRecallMode: 'source_only',
+          },
+        ],
+      });
+
+      const [output, artifact] = await fileSearchTool.func({
+        query: 'Project Atlas onboarding flow',
+      });
+
+      expect(output).toContain('Treat this as inconclusive');
+      expect(artifact).toBeUndefined();
     });
 
     it('does not rescue the active prompt echo as conversation recall evidence', async () => {
@@ -2069,6 +2328,220 @@ describe('fileSearch.js - tuple return validation', () => {
       );
       expect(artifact.file_search.sources[0].content).toContain('conversation="prior_convo"');
     });
+
+    it('expands a source match with bounded adjacent turns from the same conversation', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      axios.post.mockResolvedValue({ data: [] });
+      const matchedTurn = {
+        messageId: 'relation-turn',
+        conversationId: 'prior-convo',
+        createdAt: '2026-06-23T22:20:24.610Z',
+        isCreatedByUser: true,
+        text: 'Old friends catching up',
+      };
+      const adjacentTurns = [
+        {
+          messageId: 'venue-turn',
+          conversationId: 'prior-convo',
+          createdAt: '2026-06-23T22:19:44.960Z',
+          isCreatedByUser: true,
+          text: 'Juniper Cafe in Harbor District',
+        },
+        {
+          messageId: 'names-turn',
+          conversationId: 'prior-convo',
+          createdAt: '2026-06-23T22:20:14.811Z',
+          isCreatedByUser: true,
+          text: 'Riley and Morgan',
+        },
+        matchedTurn,
+      ];
+      mockMessageFind.mockImplementation((filter) => {
+        if (filter?.createdAt) {
+          return queryResult(adjacentTurns);
+        }
+        if (filter?.parentMessageId) {
+          return queryResult([]);
+        }
+        return queryResult([matchedTurn]);
+      });
+      mockMessageAggregate.mockResolvedValueOnce([{ before_0: adjacentTurns, after_0: [] }]);
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        conversationId: 'current-convo',
+        files: [
+          { file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' },
+        ],
+      });
+
+      const [, artifact] = await fileSearchTool.func({
+        query: 'Who were the old friends at Juniper Cafe in Harbor District?',
+      });
+      const source = artifact.file_search.sources[0].content;
+
+      expect(source).toContain('Juniper Cafe in Harbor District');
+      expect(source).toContain('Riley and Morgan');
+      expect(source).toContain('Old friends catching up');
+    });
+
+    it('keeps an adjacent reply after its parent when persistence timestamps are inverted', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      axios.post.mockResolvedValue({ data: [] });
+      const parent = {
+        messageId: 'parent-turn',
+        parentMessageId: '00000000-0000-0000-0000-000000000000',
+        conversationId: 'prior-convo',
+        createdAt: '2026-06-23T22:20:24.610Z',
+        isCreatedByUser: true,
+        text: 'Who joined the synthetic meetup?',
+      };
+      const reply = {
+        messageId: 'reply-turn',
+        parentMessageId: 'parent-turn',
+        conversationId: 'prior-convo',
+        createdAt: '2026-06-23T22:20:24.600Z',
+        isCreatedByUser: false,
+        text: 'Riley joined the synthetic meetup.',
+      };
+      mockMessageFind.mockImplementation((filter) => {
+        if (filter?.createdAt) {
+          return queryResult([reply, parent]);
+        }
+        if (filter?.parentMessageId) {
+          return queryResult([]);
+        }
+        return queryResult([reply]);
+      });
+      mockMessageAggregate.mockResolvedValueOnce([{ before_0: [reply, parent], after_0: [] }]);
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        conversationId: 'current-convo',
+        files: [
+          { file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' },
+        ],
+      });
+      const [, artifact] = await fileSearchTool.func({ query: 'synthetic meetup Riley' });
+      const source = artifact.file_search.sources[0].content;
+
+      expect(source.indexOf(parent.text)).toBeLessThan(source.indexOf(reply.text));
+    });
+
+    it('keeps stronger chat-history evidence ahead of transcript evidence when both hit', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      axios.post.mockImplementation((url, body) => {
+        if (body.file_id === 'conversation_recall:user_1:all') {
+          return Promise.resolve({
+            data: [
+              [
+                {
+                  page_content:
+                    '<turn role="user">Temporary QA event: Avery and Rowan met at Harbor Cafe with table marker cobalt-lantern.</turn>',
+                  metadata: { source: '/path/to/conversation-recall-all.txt', page: 1 },
+                },
+                0.05,
+              ],
+            ],
+          });
+        }
+        if (Array.isArray(body.file_ids)) {
+          return Promise.resolve({
+            data: [
+              [
+                {
+                  page_content:
+                    'Nimbus pricing retro with Sofia and Mateo covered a temporary pricing experiment.',
+                  metadata: {
+                    file_id: 'meeting_summary:user_1:nimbus',
+                    source: '/path/to/meeting-transcript-summary-nimbus.txt',
+                  },
+                },
+                0.2,
+              ],
+            ],
+          });
+        }
+        return Promise.resolve({ data: [] });
+      });
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        files: [
+          { file_id: 'conversation_recall:user_1:all', filename: 'conversation-recall-all.txt' },
+          {
+            file_id: 'meeting_summary:user_1:nimbus',
+            filename: 'meeting-transcript-summary-nimbus.txt',
+            metadata: {
+              meetingTranscriptKind: 'summary',
+              meetingTranscriptDisplayTitle: 'Nimbus pricing retro',
+            },
+          },
+        ],
+      });
+
+      const [, artifact] = await fileSearchTool.func({
+        query: 'temporary QA event Harbor Cafe table marker',
+      });
+
+      expect(artifact.file_search.sources[0].fileId).toBe('conversation_recall:user_1:all');
+      expect(artifact.file_search.sources[0].relevance).toBeGreaterThan(
+        artifact.file_search.sources[1].relevance,
+      );
+    });
+
+    it('uses the runtime thread id to exclude the active turn when the request conversation is new', async () => {
+      generateShortLivedToken.mockReturnValue('mock-jwt-token');
+      const currentTurn = {
+        messageId: 'current-turn',
+        conversationId: 'current-convo',
+        createdAt: '2026-07-14T22:00:02.000Z',
+        isCreatedByUser: true,
+        text: 'Where was the cobalt-lantern event?',
+      };
+      const priorTurn = {
+        messageId: 'prior-turn',
+        conversationId: 'prior-convo',
+        createdAt: '2026-07-14T21:59:00.000Z',
+        isCreatedByUser: true,
+        text: 'The cobalt-lantern event was at Harbor Cafe.',
+      };
+      let sourceFilter;
+      mockMessageFind.mockImplementation((filter) => {
+        if (filter?.parentMessageId) {
+          return queryResult([]);
+        }
+        if (filter?.createdAt) {
+          return queryResult([priorTurn]);
+        }
+        sourceFilter = filter;
+        return queryResult(
+          filter?.conversationId?.$ne === 'current-convo' ? [priorTurn] : [currentTurn, priorTurn],
+        );
+      });
+
+      const fileSearchTool = await createFileSearchTool({
+        userId: 'user1',
+        conversationId: 'new',
+        files: [
+          {
+            file_id: 'conversation_recall:user_1:all',
+            filename: 'conversation-recall-all.txt',
+            viventiumConversationRecallMode: 'source_only',
+          },
+        ],
+      });
+
+      const [, artifact] = await fileSearchTool.func(
+        { query: 'cobalt-lantern event Harbor Cafe' },
+        undefined,
+        { configurable: { thread_id: 'current-convo' } },
+      );
+
+      expect(sourceFilter.conversationId).toEqual({ $ne: 'current-convo' });
+      expect(artifact.file_search.sources[0].content).toContain('prior-convo');
+      expect(artifact.file_search.sources[0].content).not.toContain('current-convo');
+    });
   });
 });
 
@@ -2096,5 +2569,65 @@ describe('fileSearch.js - primeFiles', () => {
     expect(result.files.map((file) => file.file_id)).toEqual(['file-1', 'file-2']);
     expect(result.toolContext).toContain('from-db.pdf');
     expect(result.toolContext).toContain('new-attachment.pdf (just attached by user)');
+  });
+
+  it('preserves a runtime source-only recall policy over the authorized DB file', async () => {
+    getFiles.mockResolvedValueOnce([
+      {
+        file_id: 'conversation_recall:user_1:all',
+        filename: 'conversation-recall-all.txt',
+        embedded: true,
+      },
+    ]);
+    mockMessageFind.mockReturnValue(
+      queryResult([
+        {
+          messageId: 'source_user_turn',
+          conversationId: 'source_convo',
+          createdAt: '2026-07-10T22:00:00.000Z',
+          isCreatedByUser: true,
+          text: 'Synthetic source-only recall evidence.',
+        },
+      ]),
+    );
+
+    const primed = await primeFiles({
+      tool_resources: {
+        file_search: {
+          file_ids: ['conversation_recall:user_1:all'],
+          files: [
+            {
+              file_id: 'conversation_recall:user_1:all',
+              filename: 'runtime-placeholder.txt',
+              viventiumConversationRecallMode: 'source_only',
+              viventiumConversationRecallAttachmentReason: 'runtime_unhealthy',
+            },
+          ],
+        },
+      },
+      req: { user: { id: 'user_1', role: 'USER' } },
+      agentId: 'agent_1',
+    });
+
+    expect(primed.files).toEqual([
+      expect.objectContaining({
+        file_id: 'conversation_recall:user_1:all',
+        filename: 'conversation-recall-all.txt',
+        viventiumConversationRecallMode: 'source_only',
+        viventiumConversationRecallAttachmentReason: 'runtime_unhealthy',
+      }),
+    ]);
+
+    const fileSearchTool = await createFileSearchTool({
+      userId: 'user_1',
+      conversationId: 'current_convo',
+      files: primed.files,
+    });
+    const [, artifact] = await fileSearchTool.func({ query: 'source-only recall evidence' });
+
+    expect(axios.post).not.toHaveBeenCalled();
+    expect(artifact.file_search.sources[0].content).toContain(
+      'Synthetic source-only recall evidence.',
+    );
   });
 });

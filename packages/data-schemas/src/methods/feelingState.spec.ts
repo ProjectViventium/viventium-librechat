@@ -195,3 +195,51 @@ test('upgrades a legacy seven-band record without requiring a destructive migrat
     }),
   );
 });
+
+test('persists bounded range-prompt overrides without touching the band decay clock', async () => {
+  const userId = new mongoose.Types.ObjectId();
+  const bands = {
+    energy: band(56),
+    mood: band(58),
+    drive: band(62),
+    curiosity: band(66),
+    vigilance: band(68),
+    care: band(74),
+    connection: band(52),
+    openness: band(55),
+    play: band(48),
+  };
+  await mongoose.models.FeelingState.create({
+    userId,
+    enabled: true,
+    bands,
+    reactionInstruction: 'React naturally.',
+    reactionActivationMode: 'always',
+    version: 0,
+  });
+
+  const updated = await methods.updateFeelingState({
+    userId: userId.toString(),
+    expectedVersion: 0,
+    set: {
+      rangePromptOverrides: {
+        play: {
+          level_4: 'Everything wants to become a ridiculous game.',
+        },
+      },
+      innerState: null,
+    },
+  });
+
+  expect(updated?.rangePromptOverrides).toEqual({
+    play: { level_4: 'Everything wants to become a ridiculous game.' },
+  });
+  expect(updated?.bands.play.updatedAt).toEqual(bands.play.updatedAt);
+  await expect(
+    mongoose.models.FeelingState.updateOne(
+      { userId },
+      { $set: { 'rangePromptOverrides.play.level_4': 'x'.repeat(1201) } },
+      { runValidators: true },
+    ),
+  ).rejects.toThrow();
+});

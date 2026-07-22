@@ -38,17 +38,31 @@ export default function MemoryCardActions({ memory }: MemoryCardActionsProps) {
     'focus:outline-none focus-visible:ring-2 focus-visible:ring-border-heavy',
   );
 
+  /* === VIVENTIUM START === Revision-safe saved-memory deletion. === */
   const confirmDelete = () => {
-    deleteMemory(memory.key, {
-      onSuccess: () => {
-        showToast({ message: localize('com_ui_deleted'), status: 'success' });
-        setDeleteOpen(false);
+    deleteMemory(
+      { key: memory.key, expectedRevision: memory.revision },
+      {
+        onSuccess: () => {
+          showToast({ message: localize('com_ui_deleted'), status: 'success' });
+          setDeleteOpen(false);
+        },
+        onError: (error: unknown) => {
+          const message =
+            typeof error === 'object' &&
+            error !== null &&
+            'response' in error &&
+            typeof (error as { response?: { data?: { error?: unknown } } }).response?.data
+              ?.error === 'string'
+              ? ((error as { response: { data: { error: string } } }).response.data.error ??
+                localize('com_ui_error'))
+              : localize('com_ui_error');
+          showToast({ message, status: 'error' });
+        },
       },
-      onError: () => {
-        showToast({ message: localize('com_ui_error'), status: 'error' });
-      },
-    });
+    );
   };
+  /* === VIVENTIUM END === */
 
   return (
     <div className="flex items-center gap-0.5">

@@ -156,6 +156,7 @@ describe('promptFrameTelemetry', () => {
       no_response_instructions: 'nta text',
       formatted_input_messages: [{ role: 'user', content: 'message context' }],
       telegram_text: 'surface text',
+      telegram_audio_output: 'telegram audio expression text',
       activation_prompt: 'activate',
       cortex_instructions: 'execute',
       productivity_runtime_instructions: 'productivity runtime',
@@ -173,6 +174,7 @@ describe('promptFrameTelemetry', () => {
     expect(normalized.layers.background_context).toContain('message context');
     expect(normalized.layers.background_context).toContain('file evidence');
     expect(normalized.layers.surface_prompt).toContain('surface text');
+    expect(normalized.layers.surface_prompt).toContain('telegram audio expression text');
     expect(normalized.layers.cortex_activation).toContain('activate');
     expect(normalized.layers.cortex_execution).toContain('execute');
     expect(normalized.layers.cortex_execution).toContain('productivity runtime');

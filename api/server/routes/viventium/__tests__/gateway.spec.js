@@ -203,6 +203,7 @@ function createMockReq({ method = 'POST', url, headers = {}, body = {}, query = 
 }
 
 function createMockRes() {
+  const emitter = new EventEmitter();
   const res = {
     statusCode: 200,
     headers: {},
@@ -213,6 +214,9 @@ function createMockRes() {
     flushHeaders: jest.fn(),
     write: jest.fn(),
     flush: jest.fn(),
+    once: emitter.once.bind(emitter),
+    removeListener: emitter.removeListener.bind(emitter),
+    emit: emitter.emit.bind(emitter),
     status(code) {
       res.statusCode = code;
       return res;
@@ -808,6 +812,98 @@ describe('/api/viventium/gateway', () => {
     expect(writes.some((line) => line.includes('event: attachment'))).toBe(true);
     expect(writes.some((line) => line.includes('event: message'))).toBe(true);
     expect(writes.some((line) => line.includes('event: done'))).toBe(true);
+  });
+
+  test('does not subscribe when the client closes during resume lookup', async () => {
+    let releaseResumeLookup;
+    let markResumeLookupStarted;
+    const resumeLookupStarted = new Promise((resolve) => {
+      markResumeLookupStarted = resolve;
+    });
+    mockGetResumeState = jest.fn(
+      () =>
+        new Promise((resolve) => {
+          releaseResumeLookup = resolve;
+          markResumeLookupStarted();
+        }),
+    );
+    const gatewayRouter = require('../gateway');
+    const app = createTestApp(gatewayRouter);
+    const query = {
+      resume: 'true',
+      channel: 'discord',
+      accountId: 'acct-1',
+      externalUserId: 'ext-1',
+    };
+    const headers = signedGatewayHeaders({
+      secret: 'gateway_secret',
+      method: 'GET',
+      path: '/api/viventium/gateway/stream/closed-during-resume',
+      body: {},
+    });
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/gateway/stream/closed-during-resume?resume=true&channel=discord&accountId=acct-1&externalUserId=ext-1',
+      headers,
+      query,
+    });
+    const res = createMockRes();
+
+    const dispatched = dispatch(app, req, res);
+    await resumeLookupStarted;
+    res.emit('close');
+    releaseResumeLookup({ runSteps: [], aggregatedContent: [] });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(mockSubscribe).not.toHaveBeenCalled();
+    expect(res.write).not.toHaveBeenCalled();
+    res._resolve();
+    await dispatched;
+  });
+
+  test('does not write a subscription error after the client closes during readiness', async () => {
+    let releaseSubscription;
+    let markSubscriptionStarted;
+    const subscriptionStarted = new Promise((resolve) => {
+      markSubscriptionStarted = resolve;
+    });
+    mockSubscribe = jest.fn(
+      () =>
+        new Promise((resolve) => {
+          releaseSubscription = resolve;
+          markSubscriptionStarted();
+        }),
+    );
+    const gatewayRouter = require('../gateway');
+    const app = createTestApp(gatewayRouter);
+    const query = {
+      channel: 'discord',
+      accountId: 'acct-1',
+      externalUserId: 'ext-1',
+    };
+    const headers = signedGatewayHeaders({
+      secret: 'gateway_secret',
+      method: 'GET',
+      path: '/api/viventium/gateway/stream/closed-during-readiness',
+      body: {},
+    });
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/gateway/stream/closed-during-readiness?channel=discord&accountId=acct-1&externalUserId=ext-1',
+      headers,
+      query,
+    });
+    const res = createMockRes();
+
+    const dispatched = dispatch(app, req, res);
+    await subscriptionStarted;
+    res.emit('close');
+    releaseSubscription(null);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(res.write).not.toHaveBeenCalled();
+    res._resolve();
+    await dispatched;
   });
 
   test('GET cortex returns follow-up via semantic parent metadata lookup', async () => {

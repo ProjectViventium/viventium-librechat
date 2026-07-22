@@ -1,7 +1,7 @@
 import { useState, memo, useRef, useCallback, useEffect } from 'react';
 import * as Select from '@ariakit/react/select';
 import { FileText, FlaskConical, HeartPulse, LogOut, Plug2 } from 'lucide-react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { SettingsTabValues, SystemRoles, apiBaseUrl, request } from 'librechat-data-provider';
 import {
   LinkIcon,
@@ -16,7 +16,13 @@ import { useGetStartupConfig, useGetUserBalance } from '~/data-provider';
 import { useAuthContext } from '~/hooks/AuthContext';
 import { NotificationSeverity } from '~/common';
 import { useLocalize } from '~/hooks';
-import { CONNECTED_ACCOUNTS_OPEN_EVENT } from '~/common/connectedAccounts';
+import {
+  CONNECTED_ACCOUNTS_SETUP_PENDING_KEY,
+  CONNECTED_ACCOUNTS_OPEN_EVENT,
+  connectedAccountsSetupCleanUrl,
+  isConnectedAccountsSetupDestination,
+  shouldResumeConnectedAccountsSetup,
+} from '~/common/connectedAccounts';
 import Settings from './Settings';
 
 type PromptWorkbenchStartResponse = {
@@ -25,8 +31,23 @@ type PromptWorkbenchStartResponse = {
   url?: string;
 };
 
+/* === VIVENTIUM START ===
+ * Feature: Keyboard-accessible account actions.
+ * Purpose: Ariakit Select options need unique values for arrow-key virtual focus and activation.
+ */
+const ACCOUNT_ACTION_VALUES = {
+  connectedAccounts: 'connected-accounts',
+  feelings: 'feelings',
+  files: 'files',
+  help: 'help',
+  promptWorkbench: 'prompt-workbench',
+  settings: 'settings',
+} as const;
+/* === VIVENTIUM END === */
+
 function AccountSettings() {
   const navigate = useNavigate();
+  const location = useLocation();
   const localize = useLocalize();
   const { showToast } = useToastContext();
   const { user, isAuthenticated, logout } = useAuthContext();
@@ -34,6 +55,7 @@ function AccountSettings() {
   const connectedAccountsEnabled =
     (startupConfig as { viventiumConnectedAccountsEnabled?: boolean } | undefined)
       ?.viventiumConnectedAccountsEnabled === true;
+  const installExperience = startupConfig?.viventiumInstallExperience;
   const promptWorkbenchLinkEnabled =
     (startupConfig as { viventiumPromptWorkbenchLinkEnabled?: boolean } | undefined)
       ?.viventiumPromptWorkbenchLinkEnabled === true && user?.role === SystemRoles.ADMIN;
@@ -57,6 +79,59 @@ function AccountSettings() {
     setSettingsInitialTab(initialTab);
     setShowSettings(true);
   }, []);
+
+  const onSettingsOpenChange = useCallback((open: boolean) => {
+    setShowSettings(open);
+    if (!open) {
+      window.sessionStorage.removeItem(CONNECTED_ACCOUNTS_SETUP_PENDING_KEY);
+    }
+  }, []);
+
+  /* === VIVENTIUM START ===
+   * Feature: Easy Install browser-first onboarding.
+   * Purpose: Consume the registration handoff once, open the real account UI, and leave a clean URL.
+   * === VIVENTIUM END === */
+  useEffect(() => {
+    const setupRequested = isConnectedAccountsSetupDestination(
+      `${location.pathname}${location.search}`,
+    );
+    if (setupRequested) {
+      /* Capture the route intent before startup config resolves. Chat-route initialization may
+       * normalize `/c/new` and remove its query before the feature gate becomes available. */
+      window.sessionStorage.setItem(CONNECTED_ACCOUNTS_SETUP_PENDING_KEY, 'true');
+    }
+
+    if (!connectedAccountsEnabled) {
+      return;
+    }
+
+    const setupPending =
+      window.sessionStorage.getItem(CONNECTED_ACCOUNTS_SETUP_PENDING_KEY) === 'true';
+    if (!shouldResumeConnectedAccountsSetup(installExperience, location.search, setupPending)) {
+      return;
+    }
+
+    openSettings(SettingsTabValues.ACCOUNT);
+    /* === VIVENTIUM START ===
+     * Feature: Deterministic Easy Install account handoff.
+     * Purpose: URL cleanup must not remount AccountSettings and discard its newly opened dialog state.
+     */
+    if (setupRequested) {
+      window.history.replaceState(
+        window.history.state,
+        '',
+        connectedAccountsSetupCleanUrl(location),
+      );
+    }
+    /* === VIVENTIUM END === */
+  }, [
+    connectedAccountsEnabled,
+    installExperience,
+    location.hash,
+    location.pathname,
+    location.search,
+    openSettings,
+  ]);
 
   /* === VIVENTIUM START ===
    * Feature: Prompt Workbench account-menu entry.
@@ -145,7 +220,7 @@ function AccountSettings() {
           </>
         )}
         <Select.SelectItem
-          value=""
+          value={ACCOUNT_ACTION_VALUES.files}
           onClick={() => setShowFiles(true)}
           className="select-item text-sm"
         >
@@ -154,7 +229,7 @@ function AccountSettings() {
         </Select.SelectItem>
         {startupConfig?.helpAndFaqURL !== '/' && (
           <Select.SelectItem
-            value=""
+            value={ACCOUNT_ACTION_VALUES.help}
             onClick={() => window.open(startupConfig?.helpAndFaqURL, '_blank')}
             className="select-item text-sm"
           >
@@ -164,7 +239,7 @@ function AccountSettings() {
         )}
         {connectedAccountsEnabled && (
           <Select.SelectItem
-            value=""
+            value={ACCOUNT_ACTION_VALUES.connectedAccounts}
             onClick={() => openSettings(SettingsTabValues.ACCOUNT)}
             className="select-item text-sm"
           >
@@ -174,7 +249,7 @@ function AccountSettings() {
         )}
         {feelingsAvailable && (
           <Select.SelectItem
-            value=""
+            value={ACCOUNT_ACTION_VALUES.feelings}
             onClick={() => navigate('/feelings')}
             className="select-item text-sm"
           >
@@ -184,7 +259,7 @@ function AccountSettings() {
         )}
         {promptWorkbenchLinkEnabled && (
           <Select.SelectItem
-            value=""
+            value={ACCOUNT_ACTION_VALUES.promptWorkbench}
             onClick={() => void openPromptWorkbench()}
             className="select-item text-sm"
             aria-disabled={isOpeningPromptWorkbench}
@@ -199,7 +274,7 @@ function AccountSettings() {
           </Select.SelectItem>
         )}
         <Select.SelectItem
-          value=""
+          value={ACCOUNT_ACTION_VALUES.settings}
           onClick={() => openSettings(SettingsTabValues.GENERAL)}
           className="select-item text-sm"
         >
@@ -227,7 +302,7 @@ function AccountSettings() {
       {showSettings && (
         <Settings
           open={showSettings}
-          onOpenChange={setShowSettings}
+          onOpenChange={onSettingsOpenChange}
           initialTab={settingsInitialTab}
         />
       )}

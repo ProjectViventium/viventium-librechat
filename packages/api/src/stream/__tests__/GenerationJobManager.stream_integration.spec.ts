@@ -9,6 +9,10 @@ import type { Redis, Cluster } from 'ioredis';
  * Run with: USE_REDIS=true npx jest GenerationJobManager.stream_integration
  */
 describe('GenerationJobManager Integration Tests', () => {
+  /* === VIVENTIUM START ===
+   * Purpose: Modified Redis transport teardown sites await their asynchronous
+   * acknowledgement boundary before disconnecting borrowed test clients.
+   * === VIVENTIUM END === */
   let originalEnv: NodeJS.ProcessEnv;
   let ioredisClient: Redis | Cluster | null = null;
   const testPrefix = 'JobManager-Integration-Test';
@@ -327,9 +331,8 @@ describe('GenerationJobManager Integration Tests', () => {
           });
         } else {
           const { InMemoryJobStore } = await import('../implementations/InMemoryJobStore');
-          const { InMemoryEventTransport } = await import(
-            '../implementations/InMemoryEventTransport'
-          );
+          const { InMemoryEventTransport } =
+            await import('../implementations/InMemoryEventTransport');
           GenerationJobManager.configure({
             jobStore: new InMemoryJobStore({ ttlAfterComplete: 60000 }),
             eventTransport: new InMemoryEventTransport(),
@@ -753,7 +756,7 @@ describe('GenerationJobManager Integration Tests', () => {
       expect(abortSignaled).toBe(true);
       expect(job.abortController.signal.aborted).toBe(true);
 
-      replicaBTransport.destroy();
+      await replicaBTransport.destroy();
       (subscriber2 as { disconnect: () => void }).disconnect();
       await GenerationJobManager.destroy();
     });

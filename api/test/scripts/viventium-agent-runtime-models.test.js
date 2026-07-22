@@ -3,6 +3,8 @@ const {
   APPROVED_MAIN_RUNTIME_FAMILIES,
   APPROVED_BACKGROUND_RUNTIME_FAMILIES,
   CANONICAL_BUILT_IN_BACKGROUND_MODEL_PARAMETERS,
+  BUILT_IN_BACKGROUND_AGENT_IDS,
+  ACTIVATION_RUNTIME_ENV_BY_AGENT_ID,
   normalizeProvider,
   normalizeBundleForRuntime,
   buildCanonicalPersistedAgentFields,
@@ -10,6 +12,12 @@ const {
 } = require('../../../scripts/viventium-agent-runtime-models');
 
 describe('viventium-agent-runtime-models', () => {
+  test('gives every built-in background cortex an env-driven activation route', () => {
+    expect(Object.keys(ACTIVATION_RUNTIME_ENV_BY_AGENT_ID).sort()).toEqual(
+      [...BUILT_IN_BACKGROUND_AGENT_IDS].sort(),
+    );
+  });
+
   test('keeps the GPT-5.6 workload profile and Responses parameters as runtime truth', () => {
     expect(DEFAULT_MODELS.openAI).toBe('gpt-5.6-sol');
     expect([...APPROVED_MAIN_RUNTIME_FAMILIES]).toEqual([

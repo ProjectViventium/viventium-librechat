@@ -32,6 +32,11 @@ const {
   Group,
   Token,
   User,
+  /* === VIVENTIUM START ===
+   * Feature: Feelings account-erasure cascade
+   * Purpose: Remove private feeling state and user-authored range instructions with the account.
+   * === VIVENTIUM END === */
+  FeelingState,
 } = require('~/db/models');
 const { updateUserPluginAuth, deleteUserPluginAuth } = require('~/server/services/PluginService');
 const { verifyEmail, resendVerificationEmail } = require('~/server/services/AuthService');
@@ -253,6 +258,11 @@ const deleteUserController = async (req, res) => {
       logger.error('[deleteUserController] Error deleting user convos, likely no convos', error);
     }
     await deleteUserPluginAuth(user.id, null, true); // delete user plugin auth
+    /* === VIVENTIUM START ===
+     * Feature: Feelings account-erasure cascade
+     * Purpose: Account deletion must not orphan private affect state or custom prompt additions.
+     * === VIVENTIUM END === */
+    await FeelingState.deleteOne({ userId: user.id });
     await deleteUserById(user.id); // delete user
     await deleteAllSharedLinks(user.id); // delete user shared links
     await deleteUserFiles(req); // delete user files

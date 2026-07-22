@@ -28,6 +28,7 @@ const { resetPromptRegistryForTests } = require('../promptRegistry');
 
 const CARTESIA_SONIC3_CAPABILITIES = require('../../../../../shared/voice/cartesia_sonic3_capabilities.json');
 const XAI_TTS_CAPABILITIES = require('../../../../../shared/voice/xai_tts_capabilities.json');
+const TTS_PROVIDER_CAPABILITIES = require('../../../../../shared/voice/tts_provider_capabilities.json');
 
 describe('buildTimeContextInstructions', () => {
   const originalDefaultTimezone = process.env.VIVENTIUM_DEFAULT_TIMEZONE;
@@ -186,8 +187,41 @@ describe('buildVoiceModeInstructions', () => {
   test('chatterbox branch allows bracket markers and prohibits emotion tags', () => {
     const result = buildVoiceModeInstructions('local_chatterbox_turbo_mlx_8bit');
     expect(result).toContain('VOICE MODE:');
-    expect(result).toContain('[laugh]');
+    for (const marker of TTS_PROVIDER_CAPABILITIES.providers.local_chatterbox_turbo_mlx_8bit
+      .inline_controls.exact_tokens) {
+      expect(result).toContain(marker);
+    }
+    expect(result).toContain(
+      'When delivery is expressive under the feeling-expression contract, include one allowed marker only when that marker naturally fits; when none fits or delivery is restrained, include none.',
+    );
     expect(result).toContain('Do NOT use <emotion');
+  });
+
+  test('provider capability contract distinguishes inline controls from side channels', () => {
+    const providers = TTS_PROVIDER_CAPABILITIES.providers;
+    expect(Object.keys(providers).sort()).toEqual(
+      ['cartesia', 'elevenlabs', 'local_chatterbox_turbo_mlx_8bit', 'openai', 'xai'].sort(),
+    );
+    expect(providers.openai.inline_controls).toMatchObject({
+      supported: false,
+      mode: 'plain_text_only',
+      exact_tokens: [],
+    });
+    expect(
+      providers.openai.runtime_models.find((model) => model.id === 'gpt-4o-mini-tts').side_channels
+        .instructions,
+    ).toBe(true);
+    expect(providers.openai.dynamic_expression.per_turn_wired).toBe(false);
+    expect(providers.elevenlabs.default_model).toBe('eleven_turbo_v2_5');
+    expect(providers.elevenlabs.inline_controls.supported).toBe(false);
+    expect(providers.elevenlabs.model_specific_controls_not_enabled).toHaveProperty('eleven_v3');
+    expect(providers.cartesia.inline_controls.dialect_contract).toBe(
+      'cartesia_sonic3_capabilities.json',
+    );
+    expect(providers.xai.inline_controls.dialect_contract).toBe('xai_tts_capabilities.json');
+    expect(providers.xai.runtime_models).toEqual([
+      { id: 'xai-tts', api_route: 'tts', legacy: false },
+    ]);
   });
 
   test('openai branch prohibits all tags', () => {
@@ -219,6 +253,8 @@ describe('buildVoiceModeInstructions', () => {
     for (const tag of XAI_TTS_CAPABILITIES.speech_tags.wrapping) {
       expect(result).toContain(`<${tag}>TEXT</${tag}>`);
     }
+    expect(result).toContain('Wrapping controls require angle brackets');
+    expect(result).toContain('[tag]TEXT[/tag] is invalid');
     expect(result).toContain('no Cartesia-style emotion parameter');
     expect(result).toContain('Do NOT use Cartesia-only controls');
   });
@@ -237,6 +273,9 @@ describe('buildVoiceModeInstructions', () => {
       expect(result).toContain('If a <viventium_feeling_state> is present');
       expect(result).toContain(
         'silently appraise whether the current state and moment call for expressive or restrained delivery',
+      );
+      expect(result).toContain(
+        'A strongly outward state in an emotionally meaningful or relational reply is expressive',
       );
       expect(result).toContain(
         'the raw voice-capable response is incomplete unless it contains a fitting documented control',
@@ -323,6 +362,36 @@ describe('buildVoiceModeInstructions', () => {
     expect(result).toContain('<speed ratio=');
     expect(result).toContain('<volume ratio=');
     expect(result).toContain('complete tag');
+  });
+
+  test('cartesia guidance is rendered from neutral capability syntax rather than fixed emotions', () => {
+    const result = buildVoiceModeInstructions('cartesia');
+    const tags = CARTESIA_SONIC3_CAPABILITIES.ssml_tags;
+
+    expect(tags.emotion.forms).toEqual([
+      '<emotion value="EMOTION"/>',
+      '<emotion value="EMOTION">TEXT</emotion>',
+    ]);
+    expect(tags.speed.form).toBe('<speed ratio="RATIO"/>');
+    expect(tags.volume.form).toBe('<volume ratio="RATIO"/>');
+    expect(tags.break.form).toBe('<break time="DURATION"/>');
+    expect(tags.spell.form).toBe('<spell>TEXT</spell>');
+
+    for (const form of [
+      ...tags.emotion.forms,
+      tags.speed.form,
+      tags.volume.form,
+      tags.break.form,
+      tags.spell.form,
+    ]) {
+      expect(result).toContain(form);
+    }
+    expect(result).not.toContain('<emotion value="calm"/>');
+    expect(result).not.toContain('<emotion value="excited">TEXT</emotion>');
+    expect(result).not.toContain('<speed ratio="1.1"/>');
+    expect(result).not.toContain('<volume ratio="0.9"/>');
+    expect(result).not.toContain('<break time="1s"/>');
+    expect(result).not.toContain('<spell>ABC123</spell>');
   });
 
   test('cartesia branch includes break tag guidance', () => {
@@ -517,10 +586,16 @@ describe('buildTelegramAudioOutputInstructions', () => {
     for (const tag of XAI_TTS_CAPABILITIES.speech_tags.wrapping) {
       expect(result).toContain(`<${tag}>TEXT</${tag}>`);
     }
+    expect(result).toContain('Wrapping controls require angle brackets');
+    expect(result).toContain('[tag]TEXT[/tag] is invalid');
     expect(result).toContain('without waiting for the user to ask');
     expect(result).toContain(
       'verify that the raw response contains at least one exact tag from the allowed xAI lists',
     );
+    expect(result).toContain(
+      'When an allowed tag fits, a plain draft is not final even when its words already convey tone',
+    );
+    expect(result).not.toContain('finish the raw response with one fitting exact allowed tag');
     expect(result).not.toContain('When the user explicitly asks for more emotion');
     expect(result).toContain('Do NOT use Cartesia-only controls');
   });
@@ -546,14 +621,27 @@ describe('buildTelegramAudioOutputInstructions', () => {
     expect(result).toContain(`Cartesia ${CARTESIA_SONIC3_CAPABILITIES.model_id} TTS is selected`);
     expect(result).toContain('Allowed emotion values:');
     expect(result).toContain('Allowed nonverbal marker from Cartesia docs: [laughter]');
-    expect(result).toContain('<break time="1s"/>');
+    expect(result).toContain(CARTESIA_SONIC3_CAPABILITIES.ssml_tags.break.form);
     expect(result).toContain('Do NOT use xAI-only speech tags');
+    expect(result).not.toContain('<emotion value="calm"/>');
+    expect(result).not.toContain('<emotion value="excited">TEXT</emotion>');
+    expect(result).not.toContain('<speed ratio="1.1"/>');
+    expect(result).not.toContain('<volume ratio="0.9"/>');
+    expect(result).not.toContain('<break time="1s"/>');
+    expect(result).not.toContain('<spell>ABC123</spell>');
   });
 
   test('chatterbox branch limits bracketed nonverbal markers', () => {
     const result = buildTelegramAudioOutputInstructions('chatterbox');
     expect(result).toContain('Chatterbox TTS is selected');
-    expect(result).toContain('[laugh], [sigh], [gasp]');
+    expect(result).toContain(
+      TTS_PROVIDER_CAPABILITIES.providers.local_chatterbox_turbo_mlx_8bit.inline_controls.exact_tokens.join(
+        ', ',
+      ),
+    );
+    expect(result).toContain(
+      'When delivery is expressive under the feeling-expression contract, include one allowed marker only when that marker naturally fits; when none fits or delivery is restrained, include none.',
+    );
     expect(result).toContain('Do NOT invent other bracketed stage directions');
     expect(result).toContain('Do NOT use <emotion .../> tags');
   });
@@ -750,7 +838,8 @@ describe('stripVoiceControlTagsForDisplay', () => {
     const result = stripVoiceControlTagsForDisplay(
       'Sources: https://example.com/report Read [brief](https://example.com/brief). Email qa@example.com. Answer [12].',
     );
-    expect(result).toBe('link available Read brief. Email email available. Answer.');
+    expect(result).toBe('link available Read brief. Email address available. Answer.');
+    expect(result).not.toMatch(/\b([A-Za-z][A-Za-z']{1,})\b[\s.,!?;:]+\1\b/i);
     expect(result).not.toContain('Sources:');
     expect(result).not.toContain('https://');
     expect(result).not.toContain('[12]');

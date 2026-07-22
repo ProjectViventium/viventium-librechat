@@ -655,15 +655,26 @@ export default function AgentPanel() {
         )}
         {/* === VIVENTIUM START === Voice Chat LLM Override panel */}
         {canEditAgent && !agentQuery.isInitialLoading && activePanel === Panel.voiceLlmModel && (
-          <VoiceLlmPanel models={models} providers={providers} setActivePanel={setActivePanel} />
+          <VoiceLlmPanel
+            key={`voice-llm-${agent_id}`}
+            models={models}
+            providers={providers}
+            setActivePanel={setActivePanel}
+          />
         )}
         {canEditAgent && !agentQuery.isInitialLoading && activePanel === Panel.fallbackLlmModel && (
-          <FallbackLlmPanel models={models} providers={providers} setActivePanel={setActivePanel} />
+          <FallbackLlmPanel
+            key={`fallback-llm-${agent_id}`}
+            models={models}
+            providers={providers}
+            setActivePanel={setActivePanel}
+          />
         )}
         {canEditAgent &&
           !agentQuery.isInitialLoading &&
           activePanel === Panel.voiceFallbackLlmModel && (
             <VoiceFallbackLlmPanel
+              key={`voice-fallback-llm-${agent_id}`}
               models={models}
               providers={providers}
               setActivePanel={setActivePanel}

@@ -8,6 +8,8 @@
  * Added: 2026-03-06
  * === VIVENTIUM END === */
 
+const { logger } = require('@librechat/data-schemas');
+const { Run } = require('@librechat/agents');
 const {
   formatFollowUpPrompt,
   resolveFollowUpContinuationContext,
@@ -23,6 +25,8 @@ const {
   upsertCortexParts,
   buildFollowUpDecisionRecord,
   compactDecisionRecordForMetadata,
+  generateFollowUpText,
+  resolvePhaseBFeelingContext,
 } = require('../BackgroundCortexFollowUpService');
 
 describe('upsertCortexParts', () => {
@@ -178,6 +182,20 @@ describe('Phase B prompt registry ownership', () => {
     );
   });
 
+  test('pins one Feeling capsule as the final system layer for a visible follow-up', () => {
+    const capsule =
+      '<viventium_feeling_state>\nsynthetic private cause\n</viventium_feeling_state>';
+    const systemPrompt = require('../BackgroundCortexFollowUpService').buildFollowUpSystemPrompt({
+      primaryResponseMode: false,
+      noResponseInstructions: 'Use {NTA} when no reply is needed.',
+      feelingCapsule: capsule,
+    });
+
+    expect(systemPrompt.endsWith(capsule)).toBe(true);
+    expect(systemPrompt.match(/<viventium_feeling_state>/g)).toHaveLength(1);
+    expect(systemPrompt.indexOf('Use {NTA}')).toBeLessThan(systemPrompt.indexOf(capsule));
+  });
+
   test('routes forced primary follow-up prompts with the user request through the prompt registry', () => {
     jest.resetModules();
     const getPromptText = jest.fn((_promptId, fallback) => fallback);
@@ -203,6 +221,143 @@ describe('Phase B prompt registry ownership', () => {
         background_insights: expect.stringContaining('Use two bullets.'),
       }),
     );
+  });
+});
+
+describe('Phase B conscious Feelings context', () => {
+  const capsule = '<viventium_feeling_state>\nsynthetic private cause\n</viventium_feeling_state>';
+
+  test.each(['all_agents', 'conscious_agent'])(
+    'applies the pinned capsule to conscious synthesis under %s scope',
+    (agentScope) => {
+      expect(
+        resolvePhaseBFeelingContext({
+          enabled: true,
+          agentScope,
+          snapshotHash: 'synthetic-hash',
+          capsule,
+        }),
+      ).toEqual({
+        capsule,
+        enabled: true,
+        scope: agentScope,
+        snapshotHash: 'synthetic-hash',
+        reason: 'conscious_synthesis',
+        rangePromptOverrideCount: 0,
+        activeRangePromptOverrideCount: 0,
+        activeRangePromptOverrideChars: 0,
+      });
+    },
+  );
+
+  test('does not apply a capsule when Feelings is off', () => {
+    expect(
+      resolvePhaseBFeelingContext({
+        enabled: false,
+        agentScope: 'all_agents',
+        snapshotHash: 'synthetic-off-hash',
+        capsule,
+      }),
+    ).toEqual({
+      capsule: '',
+      enabled: false,
+      scope: 'all_agents',
+      snapshotHash: 'synthetic-off-hash',
+      reason: 'feelings_disabled',
+      rangePromptOverrideCount: 0,
+      activeRangePromptOverrideCount: 0,
+      activeRangePromptOverrideChars: 0,
+    });
+  });
+
+  test('distinguishes operator unavailability from a user turning Feelings off', () => {
+    expect(
+      resolvePhaseBFeelingContext({
+        available: false,
+        enabled: false,
+        agentScope: 'all_agents',
+        snapshotHash: 'synthetic-unavailable-hash',
+        capsule: '',
+      }),
+    ).toEqual({
+      capsule: '',
+      enabled: false,
+      scope: 'all_agents',
+      snapshotHash: 'synthetic-unavailable-hash',
+      reason: 'operator_unavailable',
+      rangePromptOverrideCount: 0,
+      activeRangePromptOverrideCount: 0,
+      activeRangePromptOverrideChars: 0,
+    });
+  });
+
+  test.each([
+    [null, 'snapshot_unavailable'],
+    [
+      {
+        enabled: true,
+        agentScope: 'all_agents',
+        snapshotHash: 'synthetic-empty-hash',
+        capsule: '',
+      },
+      'capsule_unavailable',
+    ],
+  ])(
+    'fails open without invented affect when pinned context is unavailable',
+    (snapshot, reason) => {
+      expect(resolvePhaseBFeelingContext(snapshot)).toEqual(
+        expect.objectContaining({
+          capsule: '',
+          reason,
+        }),
+      );
+    },
+  );
+
+  test('sends the exact pinned capsule to the model and logs only structural application evidence', async () => {
+    const processStream = jest.fn().mockResolvedValue('A natural synthesized continuation.');
+    const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
+    const infoLog = jest.spyOn(logger, 'info').mockImplementation(() => {});
+    const warnLog = jest.spyOn(logger, 'warn').mockImplementation(() => {});
+
+    try {
+      await generateFollowUpText({
+        req: {
+          id: 'synthetic-phase-b-request',
+          body: {},
+          _viventiumFeelingSnapshot: {
+            enabled: true,
+            agentScope: 'conscious_agent',
+            snapshotHash: 'synthetic-hash',
+            capsule,
+          },
+        },
+        agent: {
+          provider: 'xai',
+          model: 'synthetic-model',
+          model_parameters: {},
+        },
+        insightsData: {
+          insights: [{ cortexName: 'Synthetic specialist', insight: 'A new grounded fact.' }],
+        },
+        recentResponse: 'The initial answer is already visible.',
+        runId: 'synthetic-run',
+      });
+
+      const modelInstructions = createRun.mock.calls[0][0].graphConfig.instructions;
+      expect(modelInstructions.endsWith(capsule)).toBe(true);
+      expect(modelInstructions.match(/<viventium_feeling_state>/g)).toHaveLength(1);
+
+      const serializedLogs = infoLog.mock.calls.map(([message]) => String(message)).join('\n');
+      expect(serializedLogs).toContain('feelings.inject.final_run');
+      expect(serializedLogs).toContain('phase_b_followup');
+      expect(serializedLogs).toContain('conscious_synthesis');
+      expect(serializedLogs).not.toContain('synthetic private cause');
+    } finally {
+      createRun.mockRestore();
+      infoLog.mockRestore();
+      warnLog.mockRestore();
+    }
   });
 });
 

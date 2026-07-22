@@ -389,7 +389,7 @@ describe('classification.ts', () => {
       expect(mockLoadAuthValues).not.toHaveBeenCalled();
     });
 
-    it('should call loadAuthValues for PTC when definitionsOnly=false', async () => {
+    it('should load optional Code API auth without making a missing key an error', async () => {
       const loadedTools: GenericTool[] = [createMCPTool('tool1')];
 
       const agentToolOptions: AgentToolOptions = {
@@ -406,7 +406,11 @@ describe('classification.ts', () => {
         loadAuthValues: mockLoadAuthValues,
       });
 
-      expect(mockLoadAuthValues).toHaveBeenCalled();
+      expect(mockLoadAuthValues).toHaveBeenCalledWith({
+        userId: 'user1',
+        authFields: ['LIBRECHAT_CODE_API_KEY'],
+        throwError: false,
+      });
     });
 
     it('should create tool instances when definitionsOnly=false (default)', async () => {

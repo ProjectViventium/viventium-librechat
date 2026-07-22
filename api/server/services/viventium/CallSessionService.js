@@ -494,13 +494,11 @@ async function createCallSession({ userId, agentId, conversationId, ttlMs, reque
 
   const saved = await ViventiumCallSession.create(session);
 
-  logger.debug?.('[VIVENTIUM][CallSession] created', {
-    callSessionId,
-    userId,
-    agentId,
-    conversationId: session.conversationId,
-    roomName,
-  });
+  /* === VIVENTIUM START ===
+   * Feature: Voice diagnostics privacy.
+   * Purpose: Record lifecycle state without persisting user, agent, conversation, room, or session identifiers.
+   * === VIVENTIUM END === */
+  logger.debug?.('[VIVENTIUM][CallSession] created');
 
   return normalizeSession(saved);
 }
@@ -687,17 +685,14 @@ async function claimVoiceSession({ callSessionId, jobId, workerId, leaseDuration
 }
 
 async function updateCallSessionConversationId(callSessionId, conversationId) {
-  /* VIVENTIUM NOTE
-   * Purpose: Trace call-session conversationId updates for debugging.
-   * Details: docs/requirements_and_learnings/05_Open_Source_Modifications.md#librechat-call-session-debug
-   */
-  logger.info(
-    `[CallSessionService] DEBUG UPDATE: callSessionId=${callSessionId}, newConversationId=${conversationId}`,
-  );
-  /* VIVENTIUM NOTE */
+  /* === VIVENTIUM START ===
+   * Feature: Voice diagnostics privacy.
+   * Purpose: Trace state transitions without logging call-session or conversation identifiers.
+   * === VIVENTIUM END === */
+  logger.info('[VIVENTIUM][CallSession] conversation_update_attempted');
 
   if (!callSessionId || !conversationId || conversationId === 'new') {
-    logger.info('[CallSessionService] DEBUG UPDATE: Skipping update (invalid params)');
+    logger.info('[VIVENTIUM][CallSession] conversation_update_skipped');
     return null;
   }
 
@@ -712,13 +707,11 @@ async function updateCallSessionConversationId(callSessionId, conversationId) {
   ).lean();
 
   if (!session) {
-    logger.info('[CallSessionService] DEBUG UPDATE: Session not found');
+    logger.info('[VIVENTIUM][CallSession] conversation_update_not_found');
     return null;
   }
 
-  logger.info(
-    `[CallSessionService] DEBUG UPDATE: Updated session conversationId to ${conversationId}`,
-  );
+  logger.info('[VIVENTIUM][CallSession] conversation_updated');
   return normalizeSession(session);
 }
 

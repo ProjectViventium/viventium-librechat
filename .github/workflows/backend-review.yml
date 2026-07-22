@@ -22,10 +22,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Use Node.js 20.19
+      # VIVENTIUM START — exact release toolchain.
+      - name: Use Node.js 24.16.0
         uses: actions/setup-node@v4
         with:
-          node-version: '20.19'
+          node-version: '24.16.0'
+      # VIVENTIUM END
 
       - name: Restore node_modules cache
         id: cache-node-modules
@@ -37,7 +39,7 @@ jobs:
             packages/api/node_modules
             packages/data-provider/node_modules
             packages/data-schemas/node_modules
-          key: node-modules-backend-${{ runner.os }}-20.19-${{ hashFiles('package-lock.json') }}
+          key: node-modules-backend-${{ runner.os }}-24.16.0-${{ hashFiles('package-lock.json') }}
 
       - name: Install dependencies
         if: steps.cache-node-modules.outputs.cache-hit != 'true'
@@ -105,10 +107,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Use Node.js 20.19
+      # VIVENTIUM START — exact release toolchain.
+      - name: Use Node.js 24.16.0
         uses: actions/setup-node@v4
         with:
-          node-version: '20.19'
+          node-version: '24.16.0'
+      # VIVENTIUM END
 
       - name: Restore node_modules cache
         id: cache-node-modules
@@ -120,7 +124,7 @@ jobs:
             packages/api/node_modules
             packages/data-provider/node_modules
             packages/data-schemas/node_modules
-          key: node-modules-backend-${{ runner.os }}-20.19-${{ hashFiles('package-lock.json') }}
+          key: node-modules-backend-${{ runner.os }}-24.16.0-${{ hashFiles('package-lock.json') }}
 
       - name: Install dependencies
         if: steps.cache-node-modules.outputs.cache-hit != 'true'
@@ -174,10 +178,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Use Node.js 20.19
+      # VIVENTIUM START — exact release toolchain.
+      - name: Use Node.js 24.16.0
         uses: actions/setup-node@v4
         with:
-          node-version: '20.19'
+          node-version: '24.16.0'
+      # VIVENTIUM END
 
       - name: Restore node_modules cache
         id: cache-node-modules
@@ -189,7 +195,7 @@ jobs:
             packages/api/node_modules
             packages/data-provider/node_modules
             packages/data-schemas/node_modules
-          key: node-modules-backend-${{ runner.os }}-20.19-${{ hashFiles('package-lock.json') }}
+          key: node-modules-backend-${{ runner.os }}-24.16.0-${{ hashFiles('package-lock.json') }}
 
       - name: Install dependencies
         if: steps.cache-node-modules.outputs.cache-hit != 'true'
@@ -232,10 +238,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Use Node.js 20.19
+      # VIVENTIUM START — exact release toolchain.
+      - name: Use Node.js 24.16.0
         uses: actions/setup-node@v4
         with:
-          node-version: '20.19'
+          node-version: '24.16.0'
+      # VIVENTIUM END
 
       - name: Restore node_modules cache
         id: cache-node-modules
@@ -247,7 +255,7 @@ jobs:
             packages/api/node_modules
             packages/data-provider/node_modules
             packages/data-schemas/node_modules
-          key: node-modules-backend-${{ runner.os }}-20.19-${{ hashFiles('package-lock.json') }}
+          key: node-modules-backend-${{ runner.os }}-24.16.0-${{ hashFiles('package-lock.json') }}
 
       - name: Install dependencies
         if: steps.cache-node-modules.outputs.cache-hit != 'true'
@@ -270,10 +278,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Use Node.js 20.19
+      # VIVENTIUM START — exact release toolchain.
+      - name: Use Node.js 24.16.0
         uses: actions/setup-node@v4
         with:
-          node-version: '20.19'
+          node-version: '24.16.0'
+      # VIVENTIUM END
 
       - name: Restore node_modules cache
         id: cache-node-modules
@@ -285,7 +295,7 @@ jobs:
             packages/api/node_modules
             packages/data-provider/node_modules
             packages/data-schemas/node_modules
-          key: node-modules-backend-${{ runner.os }}-20.19-${{ hashFiles('package-lock.json') }}
+          key: node-modules-backend-${{ runner.os }}-24.16.0-${{ hashFiles('package-lock.json') }}
 
       - name: Install dependencies
         if: steps.cache-node-modules.outputs.cache-hit != 'true'
@@ -304,7 +314,9 @@ jobs:
           path: packages/data-schemas/dist
 
       - name: Run unit tests
-        run: cd packages/data-schemas && npm run test:ci
+        # VIVENTIUM START — prevent mongodb-memory-server binary-lock races between Jest workers.
+        run: cd packages/data-schemas && npm run test:ci -- --runInBand
+        # VIVENTIUM END
 
   test-packages-api:
     name: 'Tests: @librechat/api'
@@ -314,10 +326,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Use Node.js 20.19
+      # VIVENTIUM START — exact release toolchain.
+      - name: Use Node.js 24.16.0
         uses: actions/setup-node@v4
         with:
-          node-version: '20.19'
+          node-version: '24.16.0'
+      # VIVENTIUM END
 
       - name: Restore node_modules cache
         id: cache-node-modules
@@ -329,7 +343,7 @@ jobs:
             packages/api/node_modules
             packages/data-provider/node_modules
             packages/data-schemas/node_modules
-          key: node-modules-backend-${{ runner.os }}-20.19-${{ hashFiles('package-lock.json') }}
+          key: node-modules-backend-${{ runner.os }}-24.16.0-${{ hashFiles('package-lock.json') }}
 
       - name: Install dependencies
         if: steps.cache-node-modules.outputs.cache-hit != 'true'

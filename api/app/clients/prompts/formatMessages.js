@@ -1,6 +1,10 @@
-const { ToolMessage } = require('@langchain/core/messages');
 const { EModelEndpoint, ContentTypes } = require('librechat-data-provider');
-const { HumanMessage, AIMessage, SystemMessage } = require('@langchain/core/messages');
+const {
+  AIMessage,
+  ToolMessage,
+  HumanMessage,
+  SystemMessage,
+} = require('@librechat/agents/langchain/messages');
 /* === VIVENTIUM START ===
  * Feature: Normalize legacy search-tool diagnostics before they re-enter model context.
  * === VIVENTIUM END === */
@@ -222,7 +226,7 @@ const formatAgentMessages = (payload) => {
         let args = _args;
         try {
           args = JSON.parse(_args);
-        } catch (e) {
+        } catch (_e) {
           if (typeof _args === 'string') {
             args = { input: _args };
           }
@@ -242,10 +246,10 @@ const formatAgentMessages = (payload) => {
             }),
           }),
         );
-      /* VIVENTIUM START
-       * Purpose: Suppress cortex activation/brewing parts and surface insights as assistant text.
-       * Details: docs/requirements_and_learnings/05_Open_Source_Modifications.md#librechat-formatmessages-cortex
-       */
+        /* VIVENTIUM START
+         * Purpose: Suppress cortex activation/brewing parts and surface insights as assistant text.
+         * Details: docs/requirements_and_learnings/05_Open_Source_Modifications.md#librechat-formatmessages-cortex
+         */
       } else if (
         part.type === ContentTypes.CORTEX_ACTIVATION ||
         part.type === ContentTypes.CORTEX_BREWING
@@ -277,7 +281,7 @@ const formatAgentMessages = (payload) => {
         messages.push(
           new AIMessage({ content: `[Background Insight - ${cortexLabel}]: ${insight}` }),
         );
-      /* VIVENTIUM END */
+        /* VIVENTIUM END */
       } else if (part.type === ContentTypes.THINK) {
         hasReasoning = true;
         continue;

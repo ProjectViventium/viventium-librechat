@@ -8,7 +8,10 @@ import type {
 } from '~/types';
 import { getAzureCredentials, resolveHeaders, isUserProvided, checkUserKeyExpiry } from '~/utils';
 import { getOpenAIConfig } from './config';
-import { resolveOpenAISubscriptionUserValues } from './oauthSubscription';
+import {
+  forceRefreshOpenAISubscriptionUserValues,
+  resolveOpenAISubscriptionUserValues,
+} from './oauthSubscription';
 
 /* === VIVENTIUM START ===
  * Feature: Connected Accounts routing policy.
@@ -190,6 +193,40 @@ export async function initializeOpenAI({
     reverseProxyUrl: baseURL || undefined,
     streaming: true,
   };
+
+  /* === VIVENTIUM START ===
+   * Feature: Connected-account early-401 recovery
+   * Purpose: Refresh from the latest encrypted user record, while reusing a token already rotated
+   * by another concurrent request.
+   */
+  if (isOpenAIOAuthSubscription) {
+    const initializedAccessToken = userValues?.apiKey;
+    clientOptions.connectedAccountAuthRefresh = async () => {
+      const latestValues = await db.getUserKeyValues({
+        userId: req.user?.id ?? '',
+        name: endpoint,
+      });
+      const resolvedValues =
+        latestValues.oauthProvider === 'openai-codex' &&
+        latestValues.apiKey &&
+        latestValues.apiKey !== initializedAccessToken
+          ? latestValues
+          : await forceRefreshOpenAISubscriptionUserValues(
+              req.user?.id ?? '',
+              latestValues,
+              db,
+            );
+
+      if (!resolvedValues.apiKey) {
+        throw openAIConnectedAccountReconnectError();
+      }
+      return {
+        apiKey: resolvedValues.apiKey,
+        headers: resolvedValues.headers,
+      };
+    };
+  }
+  /* === VIVENTIUM END === */
 
   if (hasUserHeaders) {
     clientOptions.headers = resolveHeaders({

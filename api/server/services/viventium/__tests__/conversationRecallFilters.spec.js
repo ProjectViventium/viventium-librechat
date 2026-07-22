@@ -110,4 +110,21 @@ describe('conversationRecallFilters', () => {
       }),
     ).toBe(true);
   });
+
+  test.each([
+    [{ memoryEligible: false }, 'explicitly ineligible'],
+    [{ qaRun: true }, 'QA'],
+  ])('skips %s rows from every recall path', (viventiumMetadata) => {
+    expect(
+      shouldSkipRecallMessage({
+        message: {
+          messageId: 'excluded_source',
+          isCreatedByUser: true,
+          metadata: { viventium: viventiumMetadata },
+        },
+        messageText: 'Synthetic excluded source evidence.',
+        isCreatedByUser: true,
+      }),
+    ).toBe(true);
+  });
 });

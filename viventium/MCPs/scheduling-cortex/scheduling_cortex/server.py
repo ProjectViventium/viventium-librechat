@@ -1246,7 +1246,10 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Scheduling Cortex MCP")
     parser.add_argument("--transport", choices=["stdio", "streamable-http"], default="streamable-http")
-    parser.add_argument("--host", default=os.getenv("SCHEDULER_HOST", "0.0.0.0"))
+    # === VIVENTIUM START ===
+    # Local-only installs fail closed to loopback unless a future declared remote boundary owns exposure.
+    parser.add_argument("--host", default=os.getenv("SCHEDULER_HOST", "127.0.0.1"))
+    # === VIVENTIUM END ===
     parser.add_argument("--port", type=int, default=int(os.getenv("SCHEDULER_PORT", DEFAULT_PORT)))
     args = parser.parse_args()
 

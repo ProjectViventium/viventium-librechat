@@ -89,9 +89,15 @@ export function createStreamServices(config: StreamServicesConfig = {}): StreamS
       // For subscribing, we need a dedicated connection
       // If subscriber not provided, duplicate the main client
       let subscriber = redisSubscriber;
+      /* === VIVENTIUM START ===
+       * Purpose: Distinguish factory-owned duplicates from injected subscribers
+       * so teardown closes only resources created here.
+       * === VIVENTIUM END === */
+      let ownsSubscriber = false;
 
       if (!subscriber && 'duplicate' in redisClient) {
         subscriber = (redisClient as Redis).duplicate();
+        ownsSubscriber = true;
         logger.info('[StreamServices] Duplicated Redis client for subscriber');
       }
 
@@ -101,7 +107,11 @@ export function createStreamServices(config: StreamServicesConfig = {}): StreamS
       }
 
       const jobStore = new RedisJobStore(redisClient);
-      const eventTransport = new RedisEventTransport(redisClient, subscriber);
+      /* === VIVENTIUM START ===
+       * Purpose: Factory-created subscriber duplicates belong to this transport
+       * and must be closed during manager teardown; injected clients are borrowed.
+       * === VIVENTIUM END === */
+      const eventTransport = new RedisEventTransport(redisClient, subscriber, { ownsSubscriber });
 
       logger.info('[StreamServices] Created Redis-backed stream services');
 

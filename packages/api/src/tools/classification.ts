@@ -8,12 +8,17 @@
 import { logger } from '@librechat/data-schemas';
 import { Constants } from 'librechat-data-provider';
 import {
-  EnvVar,
   createToolSearch,
   ToolSearchToolDefinition,
   createProgrammaticToolCallingTool,
   ProgrammaticToolCallingDefinition,
 } from '@librechat/agents';
+
+/* === VIVENTIUM START ===
+ * Compatibility contract: the host's established Code API key is optional, while current
+ * @librechat/agents accepts request headers instead of exposing the removed EnvVar.CODE_API_KEY.
+ * === VIVENTIUM END === */
+const CODE_API_KEY_FIELD = 'LIBRECHAT_CODE_API_KEY';
 import type { AgentToolOptions } from 'librechat-data-provider';
 import type {
   LCToolRegistry,
@@ -192,6 +197,7 @@ export interface BuildToolClassificationParams {
   loadAuthValues: (params: {
     userId: string;
     authFields: string[];
+    throwError?: boolean;
   }) => Promise<Record<string, string>>;
 }
 
@@ -354,19 +360,22 @@ export async function buildToolClassification(
   }
 
   try {
+    /* === VIVENTIUM START ===
+     * Feature: Current agents-package Code API auth compatibility.
+     * Purpose: Missing optional auth must neither disable PTC nor create first-run error logs.
+     * If the legacy key is configured, preserve its established X-API-Key wire contract.
+     */
     const authValues = await loadAuthValues({
       userId,
-      authFields: [EnvVar.CODE_API_KEY],
+      authFields: [CODE_API_KEY_FIELD],
+      throwError: false,
     });
-    const codeApiKey = authValues[EnvVar.CODE_API_KEY];
-
-    if (!codeApiKey) {
-      logger.warn('[buildToolClassification] PTC configured but CODE_API_KEY not available');
-      return { toolRegistry, toolDefinitions, additionalTools, hasDeferredTools };
-    }
-
-    const ptcTool = createProgrammaticToolCallingTool({ apiKey: codeApiKey });
+    const codeApiKey = authValues[CODE_API_KEY_FIELD];
+    const ptcTool = createProgrammaticToolCallingTool({
+      authHeaders: codeApiKey ? { 'X-API-Key': codeApiKey } : undefined,
+    });
     additionalTools.push(ptcTool);
+    /* === VIVENTIUM END === */
 
     /** Add PTC definition for event-driven mode */
     toolDefinitions.push({

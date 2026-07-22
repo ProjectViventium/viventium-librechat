@@ -14,10 +14,12 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set Up Node.js
+      # VIVENTIUM START — exact release toolchain.
+      - name: Set Up Node.js 24.16.0
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24.16.0
+      # VIVENTIUM END
 
       - name: Install locize CLI
         run: npm install -g locize-cli

@@ -4,20 +4,31 @@ import { Tools } from 'librechat-data-provider';
 import type { MemoryArtifact } from 'librechat-data-provider';
 import { createApplyMemoryChangesTool, createMemoryTool, processMemory } from '../memory';
 
-// Mock the logger
+// Mock the logger. `winston.format` is a callable factory in the real module;
+// @librechat/data-schemas invokes it while loading its parser configuration.
 jest.mock('winston', () => ({
   createLogger: jest.fn(() => ({
     debug: jest.fn(),
     warn: jest.fn(),
     error: jest.fn(),
+    info: jest.fn(),
   })),
-  format: {
+  format: Object.assign(jest.fn((fn) => () => ({ transform: fn })), {
     combine: jest.fn(),
     colorize: jest.fn(),
     simple: jest.fn(),
-  },
+    label: jest.fn(),
+    timestamp: jest.fn(),
+    printf: jest.fn(),
+    errors: jest.fn(),
+    splat: jest.fn(),
+    json: jest.fn(),
+  }),
+  addColors: jest.fn(),
   transports: {
     Console: jest.fn(),
+    DailyRotateFile: jest.fn(),
+    File: jest.fn(),
   },
 }));
 
@@ -55,13 +66,14 @@ describe('createMemoryTool', () => {
   describe('overflow handling', () => {
     it('passes the snapshot revision to the storage layer', async () => {
       const expectedRevision = 7;
+      mockSetMemory.mockResolvedValue({ ok: true, revision: expectedRevision + 1 });
       const tool = createMemoryTool({
         userId: 'test-user',
         setMemory: mockSetMemory,
         memoryRevisionMap: { world: expectedRevision },
       });
 
-      await tool.func({ key: 'world', value: 'Fresh fact' });
+      const result = await tool.func({ key: 'world', value: 'Fresh fact' });
 
       expect(mockSetMemory).toHaveBeenCalledWith({
         userId: 'test-user',
@@ -70,6 +82,8 @@ describe('createMemoryTool', () => {
         tokenCount: 10,
         expectedRevision,
       });
+      const artifacts = result[1] as Record<Tools.memory, MemoryArtifact>;
+      expect(artifacts[Tools.memory].revision).toBe(expectedRevision + 1);
     });
 
     it('surfaces a revision conflict without reporting a successful update artifact', async () => {
@@ -492,6 +506,25 @@ describe('createApplyMemoryChangesTool', () => {
     const artifacts = result[1] as Record<Tools.memory, MemoryArtifact>;
     expect(artifacts[Tools.memory]).toBeDefined();
     expect(['delete', 'update']).toContain(artifacts[Tools.memory].type);
+  });
+
+  it('includes the post-delete tombstone revision in a delete artifact', async () => {
+    mockDeleteMemory.mockResolvedValue({ ok: true, revision: 8 });
+    const tool = createApplyMemoryChangesTool({
+      userId: 'test-user',
+      setMemory: mockSetMemory,
+      deleteMemory: mockDeleteMemory,
+      memoryRevisionMap: { working: 7 },
+      memoryTokenMap: { working: 10 },
+      totalTokens: 10,
+    });
+
+    const result = await tool.func({ operations: [{ action: 'delete', key: 'working' }] });
+    const artifacts = result[1] as Record<Tools.memory, MemoryArtifact>;
+
+    expect(artifacts[Tools.memory]).toEqual(
+      expect.objectContaining({ type: 'delete', key: 'working', revision: 8 }),
+    );
   });
 });
 

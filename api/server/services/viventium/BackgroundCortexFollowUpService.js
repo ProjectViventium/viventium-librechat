@@ -14,7 +14,7 @@ const crypto = require('crypto');
 const { logger } = require('@librechat/data-schemas');
 const { Run, Providers } = require('@librechat/agents');
 const { initializeAnthropic, initializeOpenAI } = require('@librechat/api');
-const { HumanMessage } = require('@langchain/core/messages');
+const { HumanMessage } = require('@librechat/agents/langchain/messages');
 const {
   ContentTypes,
   EModelEndpoint,
@@ -80,6 +80,11 @@ const {
  * inline fallbacks for installs that have not loaded the compiled prompt bundle yet.
  * === VIVENTIUM END === */
 const { getPromptText } = require('~/server/services/viventium/promptRegistry');
+const {
+  logFeelingsEvent,
+  summarizeFeelingCapsulePlacement,
+} = require('~/server/services/viventium/feelingsTelemetry');
+const { pinFeelingCapsuleLast } = require('~/server/services/viventium/feelingPromptTail');
 /* === VIVENTIUM NOTE === */
 /* === VIVENTIUM NOTE ===
  * Feature: No Response Tag ({NTA}) prompt injection (env-gated, config-driven).
@@ -1696,6 +1701,7 @@ function buildFollowUpSystemPrompt({
   primaryResponseMode = false,
   continuationContext = '',
   noResponseInstructions = '',
+  feelingCapsule = '',
 } = {}) {
   const continuationContract =
     !primaryResponseMode && typeof continuationContext === 'string' && continuationContext.trim()
@@ -1723,10 +1729,86 @@ function buildFollowUpSystemPrompt({
   const promptId = primaryResponseMode
     ? 'cortex.follow_up_phase_b.primary_system'
     : 'cortex.follow_up_phase_b.system';
-  return getPromptText(promptId, fallback, {
+  const registeredPrompt = getPromptText(promptId, fallback, {
     continuation_contract: continuationContract,
     no_response_instructions: noResponseInstructions || '',
   });
+  return pinFeelingCapsuleLast({
+    instructions: registeredPrompt,
+    capsule: feelingCapsule,
+  });
+}
+
+function resolvePhaseBFeelingContext(snapshot) {
+  const hasSnapshot = snapshot != null && typeof snapshot === 'object';
+  const enabled = hasSnapshot && snapshot.enabled === true;
+  const scope = ['all_agents', 'conscious_agent'].includes(snapshot?.agentScope)
+    ? snapshot.agentScope
+    : 'unknown';
+  const snapshotHash =
+    typeof snapshot?.snapshotHash === 'string' && snapshot.snapshotHash.trim()
+      ? snapshot.snapshotHash.trim().slice(0, 64)
+      : 'none';
+  const rangePromptOverrideCount = Number(snapshot?.rangePromptOverrideCount || 0);
+  const activeRangePromptOverrideCount = Number(snapshot?.activeRangePromptOverrideCount || 0);
+  const activeRangePromptOverrideChars = Number(snapshot?.activeRangePromptOverrideChars || 0);
+  const rangePromptTelemetry = {
+    rangePromptOverrideCount,
+    activeRangePromptOverrideCount,
+    activeRangePromptOverrideChars,
+  };
+
+  if (!hasSnapshot) {
+    return {
+      capsule: '',
+      enabled: false,
+      scope,
+      snapshotHash,
+      ...rangePromptTelemetry,
+      reason: 'snapshot_unavailable',
+    };
+  }
+  if (snapshot.available === false) {
+    return {
+      capsule: '',
+      enabled: false,
+      scope,
+      snapshotHash,
+      ...rangePromptTelemetry,
+      reason: 'operator_unavailable',
+    };
+  }
+  if (!enabled) {
+    return {
+      capsule: '',
+      enabled: false,
+      scope,
+      snapshotHash,
+      ...rangePromptTelemetry,
+      reason: 'feelings_disabled',
+    };
+  }
+
+  const capsule = typeof snapshot.capsule === 'string' ? snapshot.capsule.trim() : '';
+  if (!capsule) {
+    return {
+      capsule: '',
+      enabled: true,
+      scope,
+      snapshotHash,
+      ...rangePromptTelemetry,
+      reason: 'capsule_unavailable',
+    };
+  }
+
+  return {
+    capsule,
+    enabled: true,
+    scope,
+    snapshotHash,
+    ...rangePromptTelemetry,
+    reason: 'conscious_synthesis',
+  };
 }
 /* === VIVENTIUM END === */
 
@@ -2026,10 +2108,32 @@ async function generateFollowUpText({
    * style directives.
    */
   const noResponseInstructions = buildNoResponseInstructions(req);
+  const phaseBFeelingContext = resolvePhaseBFeelingContext(req?._viventiumFeelingSnapshot);
   const systemPrompt = buildFollowUpSystemPrompt({
     primaryResponseMode,
     continuationContext,
     noResponseInstructions,
+    feelingCapsule: phaseBFeelingContext.capsule,
+  });
+  const feelingPlacement = summarizeFeelingCapsulePlacement({
+    instructions: systemPrompt,
+    capsule: phaseBFeelingContext.capsule,
+  });
+  const feelingInjectionReason =
+    !feelingPlacement.presentInFinalRun && phaseBFeelingContext.reason === 'conscious_synthesis'
+      ? 'capsule_not_applied'
+      : phaseBFeelingContext.reason;
+  logFeelingsEvent(logger, req, 'feelings.inject.final_run', {
+    route: 'phase_b_followup',
+    enabled: phaseBFeelingContext.enabled,
+    scope: phaseBFeelingContext.scope,
+    snapshotHash: phaseBFeelingContext.snapshotHash,
+    rangePromptOverrideCount: phaseBFeelingContext.rangePromptOverrideCount,
+    activeRangePromptOverrideCount: phaseBFeelingContext.activeRangePromptOverrideCount,
+    activeRangePromptOverrideChars: phaseBFeelingContext.activeRangePromptOverrideChars,
+    injected: feelingPlacement.presentInFinalRun,
+    reason: feelingInjectionReason,
+    ...feelingPlacement,
   });
   logPromptFrame(
     logger,
@@ -2041,6 +2145,7 @@ async function generateFollowUpText({
       authClass: 'user_runtime',
       layers: {
         followup_system: systemPrompt,
+        viventium_feeling_state: phaseBFeelingContext.capsule,
         followup_prompt: prompt,
         recent_response: recentResponse || '',
         user_request: userRequest || '',
@@ -2385,6 +2490,7 @@ module.exports = {
   buildFollowUpDecisionRecord,
   compactDecisionRecordForMetadata,
   logFollowUpDecisionRecord,
+  resolvePhaseBFeelingContext,
   persistFollowUpDecisionToParentMessage,
   sanitizeAnthropicFollowUpLLMConfig,
   stripQuestionSentences,

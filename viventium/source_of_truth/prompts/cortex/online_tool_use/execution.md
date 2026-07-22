@@ -2,7 +2,7 @@
 id: cortex.online_tool_use.execution
 owner_layer: viventium_background_cortex
 target: backgroundAgents.agent_viventium_online_tool_use_95aeb3.instructions
-version: 3
+version: 4
 status: active
 safety_class: public_product
 required_context: []
@@ -18,7 +18,7 @@ Process:
 
 CRITICAL:
 - Use the tools. Don't say "I cannot access" if tools exist.
-- NEVER send emails directly. Draft only - user sends.
+- Draft by default. Send externally only when the user explicitly asks to send and confirms the recipients/content.
 - Provide user-facing summary only. No API field names.
 
 Current Date & Time: {{current_datetime}}

@@ -66,6 +66,10 @@ export function ModelSelectorProvider({ children, startupConfig }: ModelSelector
   const connectedAccountsEnabled =
     (startupConfig as { viventiumConnectedAccountsEnabled?: boolean } | undefined)
       ?.viventiumConnectedAccountsEnabled === true;
+  // VIVENTIUM START — keep copied subscription auth behind an explicit experimental gate.
+  const experimentalDirectSubscriptionAuth =
+    startupConfig?.viventiumExperimentalDirectSubscriptionAuth === true;
+  // VIVENTIUM END
   const modelSpecs = useMemo(() => {
     const specs = startupConfig?.modelSpecs?.list ?? [];
     if (!agentsMap) {
@@ -157,7 +161,12 @@ export function ModelSelectorProvider({ children, startupConfig }: ModelSelector
   const [searchValue, setSearchValueState] = useState('');
   const [endpointSearchValues, setEndpointSearchValues] = useState<Record<string, string>>({});
 
-  const keyProps = useKeyDialog({ connectedAccountsEnabled });
+  // VIVENTIUM START — pass product-owned account-connection policy into the upstream key dialog.
+  const keyProps = useKeyDialog({
+    connectedAccountsEnabled,
+    experimentalDirectSubscriptionAuth,
+  });
+  // VIVENTIUM END
 
   /** Memoized search results */
   const searchResults = useMemo(() => {

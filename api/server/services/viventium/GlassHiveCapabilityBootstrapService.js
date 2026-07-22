@@ -14,6 +14,10 @@ const {
   shouldGrantContentReadScope,
 } = require('./GlassHiveCapabilityPolicyService');
 const { mintBrokerGrant } = require('./GlassHiveCapabilityBrokerAuth');
+const { pinFeelingCapsuleLast } = require('./feelingPromptTail');
+const { logFeelingsEvent, summarizeFeelingCapsulePlacement } = require('./feelingsTelemetry');
+
+const WORKER_INSTRUCTION_FIELDS = Object.freeze(['agents_md', 'claude_md', 'codex_md']);
 
 const GLASSHIVE_LAUNCH_TOOLS = new Set([
   'workspace_launch',
@@ -228,6 +232,50 @@ function workerFeelingBlock(feelings) {
   return String(feelings || '').trim();
 }
 
+function pinWorkerFeelingBlockLast(bundle, feelingBlock) {
+  if (!feelingBlock) {
+    return bundle;
+  }
+  for (const field of WORKER_INSTRUCTION_FIELDS) {
+    bundle[field] = pinFeelingCapsuleLast({
+      instructions: bundle[field],
+      capsule: feelingBlock,
+    });
+  }
+  return bundle;
+}
+
+function logWorkerFeelingPlacement({
+  requestBody,
+  bundle,
+  feelingBlock,
+  snapshotHash,
+  scope,
+  rangePromptOverrideCount,
+  activeRangePromptOverrideCount,
+  activeRangePromptOverrideChars,
+  reason,
+}) {
+  for (const field of WORKER_INSTRUCTION_FIELDS) {
+    const placement = summarizeFeelingCapsulePlacement({
+      instructions: bundle?.[field],
+      capsule: feelingBlock,
+    });
+    logFeelingsEvent(logger, { body: requestBody || {} }, 'feelings.inject.final_run', {
+      route: `glasshive_worker_${field}`,
+      enabled: Boolean(feelingBlock),
+      scope,
+      snapshotHash,
+      rangePromptOverrideCount,
+      activeRangePromptOverrideCount,
+      activeRangePromptOverrideChars,
+      injected: placement.presentInFinalRun,
+      reason,
+      ...placement,
+    });
+  }
+}
+
 function contentReadIntentForArgs(args = {}) {
   return (
     truthyFlag(args.connected_account_content_intent) ||
@@ -251,7 +299,7 @@ function mergeWorkerContextBundle({ existingBundle, workerMemory = '', workerFee
     bundle.claude_md = appendText(bundle.claude_md, feelingBlock);
     bundle.codex_md = appendText(bundle.codex_md, feelingBlock);
   }
-  return bundle;
+  return pinWorkerFeelingBlockLast(bundle, feelingBlock);
 }
 
 function mergeBrokerBundle({
@@ -308,7 +356,7 @@ function mergeBrokerBundle({
   bundle.agents_md = appendText(bundle.agents_md, instruction);
   bundle.claude_md = appendText(bundle.claude_md, instruction);
   bundle.codex_md = appendText(bundle.codex_md, instruction);
-  return bundle;
+  return pinWorkerFeelingBlockLast(bundle, workerFeelingBlock(workerFeelings));
 }
 
 function applyContextBrief(args, toolName, allowedServers, { contentReadScope = false } = {}) {
@@ -344,6 +392,23 @@ async function maybeInjectGlassHiveCapabilityBroker({
   const workerFeelingsHash = String(
     config?.configurable?.glasshive_worker_feelings_hash || '',
   ).trim();
+  const configuredWorkerScope = String(
+    config?.configurable?.glasshive_worker_feelings_scope || '',
+  ).trim();
+  const workerFeelingsScope = ['all_agents', 'conscious_agent'].includes(configuredWorkerScope)
+    ? configuredWorkerScope
+    : 'unknown';
+  const workerFeelingRangeTelemetry = {
+    rangePromptOverrideCount: Number(
+      config?.configurable?.glasshive_worker_feelings_range_prompt_override_count || 0,
+    ),
+    activeRangePromptOverrideCount: Number(
+      config?.configurable?.glasshive_worker_feelings_active_range_prompt_override_count || 0,
+    ),
+    activeRangePromptOverrideChars: Number(
+      config?.configurable?.glasshive_worker_feelings_active_range_prompt_override_chars || 0,
+    ),
+  };
   const originalWasString = typeof toolArguments === 'string';
   const returnWorkerContextOnly = (reason) => {
     if (!workerMemory && !workerFeelings) {
@@ -353,6 +418,15 @@ async function maybeInjectGlassHiveCapabilityBroker({
       existingBundle: normalizeBootstrapBundle(args.bootstrap_bundle_json),
       workerMemory,
       workerFeelings,
+    });
+    logWorkerFeelingPlacement({
+      requestBody: config?.configurable?.requestBody,
+      bundle: args.bootstrap_bundle_json,
+      feelingBlock: workerFeelingBlock(workerFeelings),
+      snapshotHash: workerFeelingsHash,
+      scope: workerFeelingsScope,
+      ...workerFeelingRangeTelemetry,
+      reason,
     });
     logger.info('[VIVENTIUM][Feelings]', {
       event: 'feelings.worker.inject',
@@ -428,6 +502,15 @@ async function maybeInjectGlassHiveCapabilityBroker({
     contentReadScope,
     workerMemory,
     workerFeelings,
+  });
+  logWorkerFeelingPlacement({
+    requestBody,
+    bundle: args.bootstrap_bundle_json,
+    feelingBlock: workerFeelingBlock(workerFeelings),
+    snapshotHash: workerFeelingsHash,
+    scope: workerFeelingsScope,
+    ...workerFeelingRangeTelemetry,
+    reason: 'injected',
   });
   logger.info('[VIVENTIUM][Feelings]', {
     event: 'feelings.worker.inject',

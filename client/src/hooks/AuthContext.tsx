@@ -26,6 +26,10 @@ import {
   useRefreshTokenMutation,
 } from '~/data-provider';
 import { TAuthConfig, TUserContext, TAuthContext, TResError } from '~/common';
+import {
+  CONNECTED_ACCOUNTS_SETUP_PENDING_KEY,
+  isConnectedAccountsSetupDestination,
+} from '~/common/connectedAccounts';
 import { SESSION_KEY, isSafeRedirect, getPostLoginRedirect } from '~/utils';
 import useTimeout from './useTimeout';
 import store from '~/store';
@@ -66,6 +70,15 @@ const AuthContextProvider = ({
 
         const searchParams = new URLSearchParams(window.location.search);
         const postLoginRedirect = getPostLoginRedirect(searchParams);
+
+        /* === VIVENTIUM START ===
+         * Feature: Remount-safe Easy Install account handoff.
+         * Purpose: Capture setup intent before authentication navigation mounts the chat shell.
+         */
+        if (isConnectedAccountsSetupDestination(postLoginRedirect)) {
+          sessionStorage.setItem(CONNECTED_ACCOUNTS_SETUP_PENDING_KEY, 'true');
+        }
+        /* === VIVENTIUM END === */
 
         const logoutRedirect = logoutRedirectRef.current;
         logoutRedirectRef.current = undefined;
@@ -183,6 +196,14 @@ const AuthContextProvider = ({
           const fallbackRedirect = isSafeRedirect(currentUrl) ? currentUrl : '/c/new';
           const redirect =
             storedRedirect && isSafeRedirect(storedRedirect) ? storedRedirect : fallbackRedirect;
+          /* === VIVENTIUM START ===
+           * Feature: Remount-safe Easy Install account handoff.
+           * Purpose: Preserve the same setup intent across OAuth/silent-refresh authentication.
+           */
+          if (isConnectedAccountsSetupDestination(redirect)) {
+            sessionStorage.setItem(CONNECTED_ACCOUNTS_SETUP_PENDING_KEY, 'true');
+          }
+          /* === VIVENTIUM END === */
           setUserContext({ user, token, isAuthenticated: true, redirect });
           return;
         }

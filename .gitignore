@@ -48,6 +48,7 @@ client/src/localization/languages/*_missing_keys.json
 # Compiled Dirs (http://nodejs.org/api/addons.html)
 build/
 dist/
+client/dist-compliance/
 public/main.js
 public/main.js.map
 public/main.js.LICENSE.txt
@@ -188,12 +189,18 @@ claude-flow
 hive-mind-prompt-*.txt
 
 # Viventium public-release hardening
-        .env
-        .env.*
-        !.env.example
-        node_modules/
-        .venv*/
-        __pycache__/
-        .local_artifacts/
-        tmp/
-        backups/
+.env
+.env.*
+!.env.example
+node_modules/
+.venv*/
+__pycache__/
+.local_artifacts/
+tmp/
+backups/
+artifacts/
+.playwright-cli/
+*.mp4
+*.mov
+*.webm
+*.har

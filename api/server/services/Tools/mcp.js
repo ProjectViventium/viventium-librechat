@@ -288,8 +288,8 @@ async function reinitMCPServer({
       availableTools,
       success: Boolean(
         (connection && !oauthRequired) ||
-          (oauthRequired && oauthUrl) ||
-          (tools && tools.length > 0),
+        (oauthRequired && oauthUrl) ||
+        (tools && tools.length > 0),
       ),
       message: getResponseMessage(),
       oauthRequired,
@@ -311,6 +311,21 @@ async function reinitMCPServer({
       '[MCP Reinitialize] Error loading MCP Tools, servers may still be initializing:',
       error,
     );
+    /* === VIVENTIUM START ===
+     * Feature: Explicit MCP reinitialization failures.
+     * Purpose: Preserve a stable result contract so callers can distinguish a failed
+     * reinitialization from an absent result without silently collapsing undefined.
+     * === VIVENTIUM END === */
+    return {
+      availableTools: null,
+      success: false,
+      failureClass: 'reinitialization_error',
+      message: `Failed to reinitialize MCP server '${serverName}'`,
+      oauthRequired,
+      serverName,
+      oauthUrl,
+      tools,
+    };
   }
 }
 

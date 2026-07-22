@@ -326,6 +326,60 @@ describe('viventium-sync-agents args', () => {
     ]);
   });
 
+  test('a background-only prompt selection cannot overwrite top-level main-agent prompts', () => {
+    const update = buildUpdateData(
+      {
+        id: 'main-agent',
+        name: 'Tracked main name',
+        description: 'Tracked main description',
+        instructions: 'Tracked main instructions',
+        conversation_starters: ['Tracked starter'],
+        background_cortices: [
+          {
+            agent_id: 'background-a',
+            activation: {
+              prompt: 'new activation prompt',
+              fallbacks: [{ provider: 'openai', model: 'new-fallback' }],
+            },
+          },
+        ],
+      },
+      {
+        promptsOnly: true,
+        activationFields: ['prompt'],
+        selectedAgentIds: ['background-a'],
+        existingAgent: {
+          id: 'main-agent',
+          name: 'Live main name',
+          description: 'Live main description',
+          instructions: 'Live main instructions',
+          conversation_starters: ['Live starter'],
+          background_cortices: [
+            {
+              agent_id: 'background-a',
+              activation: {
+                prompt: 'old activation prompt',
+                fallbacks: [{ provider: 'anthropic', model: 'live-fallback' }],
+              },
+            },
+          ],
+        },
+      },
+    );
+
+    expect(update).toEqual({
+      background_cortices: [
+        {
+          agent_id: 'background-a',
+          activation: {
+            prompt: 'new activation prompt',
+            fallbacks: [{ provider: 'anthropic', model: 'live-fallback' }],
+          },
+        },
+      ],
+    });
+  });
+
   test('mergeBackgroundCorticesActivationFields respects selected agent filters', () => {
     const existing = [
       {

@@ -248,6 +248,10 @@ const ACTIVATION_RUNTIME_ENV_BY_AGENT_ID = {
     providerEnv: 'VIVENTIUM_BACKGROUND_ACTIVATION_PROVIDER',
     modelEnv: 'VIVENTIUM_BACKGROUND_ACTIVATION_MODEL',
   },
+  agent_viventium_support_95aeb3: {
+    providerEnv: 'VIVENTIUM_BACKGROUND_ACTIVATION_PROVIDER',
+    modelEnv: 'VIVENTIUM_BACKGROUND_ACTIVATION_MODEL',
+  },
 };
 
 function deepClone(value) {

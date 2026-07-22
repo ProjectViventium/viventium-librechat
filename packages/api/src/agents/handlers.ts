@@ -8,7 +8,7 @@ import type {
   ToolExecuteResult,
   ToolExecuteBatchRequest,
 } from '@librechat/agents';
-import type { StructuredToolInterface } from '@langchain/core/tools';
+import type { StructuredToolInterface } from '@librechat/agents/langchain/tools';
 
 export interface ToolEndCallbackData {
   output: {

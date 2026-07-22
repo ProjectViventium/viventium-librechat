@@ -4,6 +4,7 @@
  * === VIVENTIUM END === */
 
 const express = require('express');
+const { EventEmitter } = require('events');
 
 let mockAssertVoiceGatewayAuth;
 let mockGetUserById;
@@ -183,6 +184,7 @@ function createMockReq({ method = 'POST', url, headers = {}, body = {}, query = 
 }
 
 function createMockRes() {
+  const emitter = new EventEmitter();
   const res = {
     statusCode: 200,
     headers: {},
@@ -193,6 +195,9 @@ function createMockRes() {
     flushHeaders: jest.fn(),
     write: jest.fn(),
     flush: jest.fn(),
+    once: emitter.once.bind(emitter),
+    removeListener: emitter.removeListener.bind(emitter),
+    emit: emitter.emit.bind(emitter),
     status(code) {
       res.statusCode = code;
       return res;
@@ -404,6 +409,40 @@ describe('/api/viventium/voice/chat', () => {
     } finally {
       await connection.close().catch(() => {});
     }
+  });
+
+  test('does not subscribe when a voice client closes during job lookup', async () => {
+    const { GenerationJobManager } = require('@librechat/api');
+    let releaseJobLookup;
+    let markJobLookupStarted;
+    const jobLookupStarted = new Promise((resolve) => {
+      markJobLookupStarted = resolve;
+    });
+    GenerationJobManager.getJob.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          releaseJobLookup = resolve;
+          markJobLookupStarted();
+        }),
+    );
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/voice/stream/closed-during-lookup',
+    });
+    const res = createMockRes();
+
+    const dispatched = dispatch(app, req, res);
+    await jobLookupStarted;
+    res.emit('close');
+    releaseJobLookup({ metadata: { userId: 'user_1' } });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(GenerationJobManager.subscribe).not.toHaveBeenCalled();
+    expect(res.flushHeaders).not.toHaveBeenCalled();
+    res._resolve();
+    await dispatched;
   });
 
   test('reuses the latest assistant leaf as parentMessageId', async () => {

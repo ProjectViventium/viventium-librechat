@@ -1,5 +1,6 @@
 const { Providers } = require('@librechat/agents');
 const { Constants, ContentTypes, EModelEndpoint, Tools } = require('librechat-data-provider');
+const { logger } = require('@librechat/data-schemas');
 const db = require('~/models');
 const AgentClient = require('./client');
 const {
@@ -7,6 +8,7 @@ const {
   feelingTailForAgent,
   externalUserStimulusForReaction,
   evalIsolationForRequest,
+  classifyMemoryWriterResult,
   mergeLateActivationCandidates,
 } = AgentClient;
 
@@ -283,6 +285,36 @@ describe('Feelings agent scope', () => {
   });
 });
 
+describe('Detached memory writer result classification', () => {
+  test('treats a structured storage rejection and a missing processor result as failures', () => {
+    expect(classifyMemoryWriterResult(undefined)).toBe('processor_failed');
+    expect(
+      classifyMemoryWriterResult([
+        {
+          [Tools.memory]: {
+            type: 'error',
+            value: JSON.stringify({ errorType: 'key_limit_exceeded' }),
+          },
+        },
+      ]),
+    ).toBe('key_limit_exceeded');
+  });
+
+  test('accepts empty/noop and successful update results', () => {
+    expect(classifyMemoryWriterResult([])).toBeNull();
+    expect(
+      classifyMemoryWriterResult([
+        {
+          [Tools.memory]: {
+            type: 'update',
+            key: 'preferences',
+          },
+        },
+      ]),
+    ).toBeNull();
+  });
+});
+
 describe('buildViventiumMcpRequestBody', () => {
   test('passes surface context and existing upload references to GlassHive MCP', () => {
     const body = AgentClient.buildViventiumMcpRequestBody({
@@ -450,6 +482,20 @@ describe('late completion error content parts', () => {
     expect(AgentClient.createCompletionErrorContentPart(structured).error_class).toBe(
       'provider_unauthorized',
     );
+  });
+
+  test('classifies authentication signals preserved on nested provider errors', () => {
+    const providerError = new Error('Incorrect API key provided.');
+    providerError.status = 401;
+    providerError.code = 'invalid_api_key';
+    const wrapped = new Error('No result after model invocation');
+    wrapped.cause = providerError;
+
+    expect(AgentClient.createCompletionErrorContentPart(wrapped)).toEqual({
+      type: ContentTypes.ERROR,
+      [ContentTypes.ERROR]: 'The model provider credentials were rejected.',
+      error_class: 'provider_unauthorized',
+    });
   });
 
   test('does not mutate content parts for late stream termination after assistant text', () => {
@@ -1662,6 +1708,15 @@ describe('AgentClient - titleConvo', () => {
     });
   });
 
+  test('classifies wrapped OpenAI incorrect-key errors as provider authentication failures', () => {
+    const incorrectKey = new Error('401 Incorrect API key provided.');
+    expect(AgentClient.createCompletionErrorContentPart(incorrectKey)).toEqual({
+      type: ContentTypes.ERROR,
+      [ContentTypes.ERROR]: 'The model provider credentials were rejected.',
+      error_class: 'provider_unauthorized',
+    });
+  });
+
   describe('getOptions method - GPT-5+ model handling', () => {
     let mockReq;
     let mockRes;
@@ -1925,7 +1980,7 @@ describe('AgentClient - titleConvo', () => {
         '# MCP Server Instructions\n\nTest MCP instructions here',
       );
 
-      const { DynamicStructuredTool } = require('@langchain/core/tools');
+      const { DynamicStructuredTool } = require('@librechat/agents/langchain/tools');
 
       // Create mock MCP tools with the delimiter pattern
       const mockMCPTool1 = new DynamicStructuredTool({
@@ -2158,7 +2213,7 @@ describe('AgentClient - titleConvo', () => {
     });
 
     it('should filter out image URLs from message content', async () => {
-      const { HumanMessage, AIMessage } = require('@langchain/core/messages');
+      const { HumanMessage, AIMessage } = require('@librechat/agents/langchain/messages');
       const messages = [
         new HumanMessage({
           content: [
@@ -2214,7 +2269,7 @@ describe('AgentClient - titleConvo', () => {
     });
 
     it('should handle messages with only text content', async () => {
-      const { HumanMessage, AIMessage } = require('@langchain/core/messages');
+      const { HumanMessage, AIMessage } = require('@librechat/agents/langchain/messages');
       const messages = [
         new HumanMessage('Hello, how are you?'),
         new AIMessage('I am doing well, thank you!'),
@@ -2232,7 +2287,7 @@ describe('AgentClient - titleConvo', () => {
     });
 
     it('should exclude scheduler control prompts, think parts, and NTA-only assistant turns from memory buffer', async () => {
-      const { HumanMessage, AIMessage } = require('@langchain/core/messages');
+      const { HumanMessage, AIMessage } = require('@librechat/agents/langchain/messages');
       const messages = [
         new HumanMessage(
           'Internal Check:\n1. Verify whether the project update email was sent.\nDo not nudge anyone. Just observe and update context. {NTA} if nothing new.',
@@ -2268,7 +2323,7 @@ describe('AgentClient - titleConvo', () => {
     });
 
     it('should skip memory processing when the window contains only internal-control and NTA content', async () => {
-      const { HumanMessage, AIMessage } = require('@langchain/core/messages');
+      const { HumanMessage, AIMessage } = require('@librechat/agents/langchain/messages');
       const messages = [
         new HumanMessage(
           'Internal Check:\n1. Verify whether the project update email was sent.\nDo not nudge anyone. Just observe and update context. {NTA} if nothing new.',
@@ -2295,7 +2350,7 @@ describe('AgentClient - titleConvo', () => {
     });
 
     it('should handle mixed content types correctly', async () => {
-      const { HumanMessage } = require('@langchain/core/messages');
+      const { HumanMessage } = require('@librechat/agents/langchain/messages');
       const { ContentTypes } = require('librechat-data-provider');
 
       const messages = [
@@ -2332,7 +2387,7 @@ describe('AgentClient - titleConvo', () => {
     });
 
     it('should preserve original messages without mutation', async () => {
-      const { HumanMessage } = require('@langchain/core/messages');
+      const { HumanMessage } = require('@librechat/agents/langchain/messages');
       const originalContent = [
         {
           type: 'text',
@@ -2361,7 +2416,7 @@ describe('AgentClient - titleConvo', () => {
     });
 
     it('should keep the current chat window bounded while surfacing older user context separately', async () => {
-      const { HumanMessage, AIMessage } = require('@langchain/core/messages');
+      const { HumanMessage, AIMessage } = require('@librechat/agents/langchain/messages');
       const messages = [
         new HumanMessage('Message 1'),
         new AIMessage('Response 1'),
@@ -2388,7 +2443,7 @@ describe('AgentClient - titleConvo', () => {
     });
 
     it('should include bounded older user context outside the current chat window', async () => {
-      const { HumanMessage, AIMessage } = require('@langchain/core/messages');
+      const { HumanMessage, AIMessage } = require('@librechat/agents/langchain/messages');
       const messages = [
         new HumanMessage('I used to work on Project Atlas.'),
         new AIMessage('Noted.'),
@@ -2420,7 +2475,7 @@ describe('AgentClient - titleConvo', () => {
     });
 
     it('should cap older user context by configured char limit', async () => {
-      const { HumanMessage, AIMessage } = require('@langchain/core/messages');
+      const { HumanMessage, AIMessage } = require('@librechat/agents/langchain/messages');
       client.options.req.config.memory.historyContextCharLimit = 45;
 
       const messages = [
@@ -2444,7 +2499,7 @@ describe('AgentClient - titleConvo', () => {
     });
 
     it('should return early if processMemory is not set', async () => {
-      const { HumanMessage } = require('@langchain/core/messages');
+      const { HumanMessage } = require('@librechat/agents/langchain/messages');
       client.processMemory = null;
 
       const result = await client.runMemory([new HumanMessage('Test')]);
@@ -2453,8 +2508,44 @@ describe('AgentClient - titleConvo', () => {
       expect(mockProcessMemory).not.toHaveBeenCalled();
     });
 
-    it('clears only the captured user cache when the client options are disposed mid-writer', async () => {
+    it('records a structured storage rejection as an error in deep timing', async () => {
       const { HumanMessage } = require('@langchain/core/messages');
+      const previousTimingFlag = process.env.VIVENTIUM_TIMING_DEEP;
+      const logSpy = jest.spyOn(logger, 'info').mockImplementation(() => undefined);
+      process.env.VIVENTIUM_TIMING_DEEP = 'true';
+      mockReq.body = { traceId: 'synthetic-memory-timing' };
+      mockProcessMemory.mockResolvedValue([
+        {
+          [Tools.memory]: {
+            type: 'error',
+            value: JSON.stringify({ errorType: 'key_limit_exceeded' }),
+          },
+        },
+      ]);
+
+      try {
+        await client.runMemory([new HumanMessage('Remember a synthetic preference.')]);
+
+        expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('step=memory_run_done ms='));
+        expect(
+          logSpy.mock.calls.some(
+            ([message]) =>
+              String(message).includes('step=memory_run_done') &&
+              String(message).includes('status=error failure=key_limit_exceeded'),
+          ),
+        ).toBe(true);
+      } finally {
+        logSpy.mockRestore();
+        if (previousTimingFlag == null) {
+          delete process.env.VIVENTIUM_TIMING_DEEP;
+        } else {
+          process.env.VIVENTIUM_TIMING_DEEP = previousTimingFlag;
+        }
+      }
+    });
+
+    it('clears only the captured user cache when the client options are disposed mid-writer', async () => {
+      const { HumanMessage } = require('@librechat/agents/langchain/messages');
       const mockClearMemoryReadContextCache = require('@librechat/api').clearMemoryReadContextCache;
       client.initializeMemoryWriter = jest.fn().mockImplementation(async () => {
         client.options = null;
@@ -2475,7 +2566,7 @@ describe('AgentClient - titleConvo', () => {
     });
 
     it('uses the captured artifact sink when detached writer completes after client cleanup', async () => {
-      const { HumanMessage } = require('@langchain/core/messages');
+      const { HumanMessage } = require('@librechat/agents/langchain/messages');
       const artifactPromises = [];
       const attachment = { type: Tools.memory, messageId: 'response-123' };
       client.artifactPromises = artifactPromises;
@@ -2498,7 +2589,7 @@ describe('AgentClient - titleConvo', () => {
     });
 
     it('does not clear the global memory read cache when detached writer lacks a user id', async () => {
-      const { HumanMessage } = require('@langchain/core/messages');
+      const { HumanMessage } = require('@librechat/agents/langchain/messages');
       const mockClearMemoryReadContextCache = require('@librechat/api').clearMemoryReadContextCache;
       client.options = {
         ...client.options,
@@ -2515,7 +2606,7 @@ describe('AgentClient - titleConvo', () => {
     });
 
     it('does not schedule duplicate detached memory writers for the same client lifecycle', async () => {
-      const { HumanMessage } = require('@langchain/core/messages');
+      const { HumanMessage } = require('@librechat/agents/langchain/messages');
       client.runMemory = jest.fn().mockResolvedValue(undefined);
 
       const firstPromise = client.scheduleMemoryWriter([new HumanMessage('Remember this once.')]);
@@ -3128,6 +3219,16 @@ describe('AgentClient - titleConvo', () => {
           agent: mockAgent,
         }),
         expect.any(Object),
+      );
+      /* === VIVENTIUM START ===
+       * Regression: detached writer initialization must receive the revision-bearing state reader.
+       * === VIVENTIUM END === */
+      expect(mockCreateMemoryProcessor).toHaveBeenCalledWith(
+        expect.objectContaining({
+          memoryMethods: expect.objectContaining({
+            getAllUserMemoryStates: expect.any(Function),
+          }),
+        }),
       );
     });
 

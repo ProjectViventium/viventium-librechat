@@ -1487,6 +1487,23 @@ def _poll_scheduler_followup(
     )
 
 
+def _scheduled_agent_execution() -> Dict[str, str]:
+    provider = str(os.getenv("VIVENTIUM_SCHEDULED_AGENT_PROVIDER") or "").strip().lower()
+    model = str(os.getenv("VIVENTIUM_SCHEDULED_AGENT_MODEL") or "").strip()
+    effort = str(
+        os.getenv("VIVENTIUM_SCHEDULED_AGENT_REASONING_EFFORT") or ""
+    ).strip().lower()
+    if not provider and not model and not effort:
+        return {}
+    if not provider or not model or not effort:
+        raise RuntimeError(
+            "Scheduled-agent automation requires provider, model, and reasoning effort"
+        )
+    if effort not in {"none", "minimal", "low", "medium", "high", "xhigh"}:
+        raise RuntimeError(f"Unsupported scheduled-agent reasoning effort: {effort}")
+    return {"provider": provider, "model": model, "reasoning_effort": effort}
+
+
 def _run_scheduler_generation(
     task: Dict[str, Any],
     base_url: str,
@@ -1505,6 +1522,7 @@ def _run_scheduler_generation(
 
     schedule = task.get("schedule") or {}
     run_context = _build_scheduled_run_context(task)
+    execution = _scheduled_agent_execution()
     payload = {
         "userId": task.get("user_id"),
         "agentId": task.get("agent_id"),
@@ -1516,6 +1534,10 @@ def _run_scheduler_generation(
         "scheduledDueAt": run_context.get("scheduled_due_at_utc"),
         "schedulerRunContext": run_context,
     }
+    if execution:
+        payload["model"] = execution["model"]
+        payload["reasoning_effort"] = execution["reasoning_effort"]
+        payload["scheduledAgentExecution"] = execution
     headers = {
         "Content-Type": "application/json",
         "X-VIVENTIUM-SCHEDULER-SECRET": secret,
@@ -1588,6 +1610,7 @@ def _run_scheduler_generation(
         "followup_text_fallback_reason": followup_text_fallback_reason,
         "suppressed_fallback_reason": suppressed_fallback_reason,
         "date_guard": date_guard,
+        "execution": execution,
     }
 
 
@@ -1817,56 +1840,6 @@ def _normalize_dispatch_channels(value: Any) -> list[str]:
     if not channels:
         raise RuntimeError("channel must include at least one valid entry")
     return channels
-
-
-def _dispatch_librechat(
-    task: Dict[str, Any],
-    base_url: str,
-    timeout_s: int,
-    conversation_id: str,
-) -> Dict[str, Any]:
-    secret = (
-        os.getenv("SCHEDULER_LIBRECHAT_SECRET")
-        or os.getenv("VIVENTIUM_SCHEDULER_SECRET")
-        or ""
-    )
-    if not secret:
-        raise RuntimeError(
-            "SCHEDULER_LIBRECHAT_SECRET or VIVENTIUM_SCHEDULER_SECRET is required for LibreChat dispatch"
-        )
-
-    # === VIVENTIUM NOTE ===
-    # Feature: Pass schedule timezone as clientTimezone for time context injection.
-    # This mirrors how the web client sends Intl.DateTimeFormat().resolvedOptions().timeZone
-    # === VIVENTIUM NOTE ===
-    schedule = task.get("schedule") or {}
-    payload = {
-        "userId": task.get("user_id"),
-        "agentId": task.get("agent_id"),
-        "text": _compose_prompt(task),
-        "conversationId": conversation_id,
-        "scheduleId": task.get("id"),
-        "clientTimezone": schedule.get("timezone") or "UTC",
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "X-VIVENTIUM-SCHEDULER-SECRET": secret,
-    }
-    response = _post_json(f"{base_url}/api/viventium/scheduler/chat", payload, headers, timeout_s)
-    response_text = response.get("text") if isinstance(response, dict) else None
-    generated_text = response_text.strip() if isinstance(response_text, str) and response_text.strip() else None
-    return {
-        "conversation_id": _extract_conversation_id(response, conversation_id),
-        # === VIVENTIUM NOTE ===
-        # Feature: Return delivery visibility metadata to scheduler persistence layer.
-        "delivery": {
-            "channel": "librechat",
-            "outcome": "accepted",
-            "reason": "librechat_pipeline_started",
-            "generated_text": generated_text,
-        },
-        # === VIVENTIUM NOTE ===
-    }
 
 
 def _dispatch_telegram(
@@ -2242,6 +2215,17 @@ def _workbench_codex_model(value: Any = None) -> str:
 
 
 def _import_workbench_scheduled_prompts() -> Any:
+    # VIVENTIUM START: Prefer an already-installed Workbench package so side-by-side
+    # release worktrees and installed layouts do not depend on repository ancestry.
+    try:
+        from prompt_workbench import scheduled_prompts as workbench_scheduled_prompts
+
+        return workbench_scheduled_prompts
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"prompt_workbench", "prompt_workbench.scheduled_prompts"}:
+            raise
+    # VIVENTIUM END
+
     current = Path(__file__).resolve()
     for parent in current.parents:
         backend_root = parent / "viventium_v0_4" / "prompt-workbench" / "backend"
@@ -2261,6 +2245,7 @@ def _refresh_workbench_rendered_prompt(
     task: Dict[str, Any],
     wb: Dict[str, Any],
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    dispatched_occurrence = task.get("next_run_at")
     definition_id = str(wb.get("definition_id") or "").strip()
     if not definition_id:
         raise RuntimeError("Workbench scheduled prompt metadata missing definition_id; refusing stale dispatch")
@@ -2383,6 +2368,7 @@ def _refresh_workbench_rendered_prompt(
     runtime_metadata["workbench_scheduled_prompt"] = patched_wb
     if updated_task:
         patched_task = dict(updated_task)
+        patched_task["next_run_at"] = dispatched_occurrence
         patched_task["prompt"] = rendered
         patched_task["metadata"] = runtime_metadata
         return patched_task, patched_wb
@@ -3239,6 +3225,9 @@ def dispatch_task(task: Dict[str, Any]) -> Dict[str, Any]:
             "channels": delivery_by_channel,
         },
     }
+    execution = generation_result.get("execution")
+    if isinstance(execution, dict) and execution:
+        response["execution"] = execution
     # === VIVENTIUM NOTE ===
     # Feature: Per-channel error ledger for partial success visibility.
     if errors:

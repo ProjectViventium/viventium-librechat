@@ -15,6 +15,7 @@ const {
   findTranscriptContentHashesMissingVectors,
   findTranscriptVectorRepairTargets,
   fetchRecentMemoryMessages,
+  getTranscriptVectorRuntimeStatus,
   invokeModel,
   invokeModelWithFallback,
   invokeTranscriptSummaryModel,
@@ -2135,7 +2136,10 @@ describe('viventium-memory-hardening', () => {
     const oldRag = process.env.RAG_API_URL;
     const oldFetch = global.fetch;
     process.env.RAG_API_URL = 'http://rag.example.test';
-    global.fetch = jest.fn().mockResolvedValue({ ok: true });
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: jest.fn().mockResolvedValue({ status: 'UP' }),
+    });
 
     const uploadedBodies = [];
     const uploadVectors = jest.fn(async (payload) => {
@@ -2959,6 +2963,29 @@ describe('viventium-memory-hardening', () => {
     }
   });
 
+  test('transcript vector health rejects reachable semantic DOWN responses', async () => {
+    const oldRag = process.env.RAG_API_URL;
+    const oldFetch = global.fetch;
+    process.env.RAG_API_URL = 'http://rag.example.test';
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: jest.fn().mockResolvedValue({
+        status: 'DOWN',
+        error: 'vector_store_unavailable',
+      }),
+    });
+    try {
+      await expect(getTranscriptVectorRuntimeStatus()).resolves.toEqual({
+        available: false,
+        reason: 'unhealthy',
+      });
+    } finally {
+      global.fetch = oldFetch;
+      if (oldRag) process.env.RAG_API_URL = oldRag;
+      else delete process.env.RAG_API_URL;
+    }
+  });
+
   test('apply rejects a stale proposal write instead of overwriting a newer memory value', async () => {
     const runDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-memory-cas-'));
     const setMemory = jest.fn().mockResolvedValue({ ok: false, conflict: true });
@@ -2997,6 +3024,112 @@ describe('viventium-memory-hardening', () => {
       expect(result.conflicts).toEqual([
         { key: 'context', action: 'set', reason: 'revision_conflict' },
       ]);
+    } finally {
+      fs.rmSync(runDir, { recursive: true, force: true });
+    }
+  });
+
+  test('post-apply maintenance never rewrites conversation-owned working memory', async () => {
+    const runDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-memory-working-'));
+    const setMemory = jest.fn().mockResolvedValue({ ok: true, revision: 8 });
+    try {
+      await applyUserProposal({
+        methods: {
+          getAllUserMemories: jest.fn().mockResolvedValue([
+            { key: 'context', value: 'Current value', tokenCount: 2, __v: 7 },
+            {
+              key: 'working',
+              value: 'Critical current event.\n_stale_after: 2026-07-10',
+              tokenCount: 50,
+              __v: 7,
+            },
+          ]),
+          setMemory,
+          deleteMemory: jest.fn(),
+        },
+        user: { _id: '507f1f77bcf86cd799439011' },
+        runDir,
+        memoryConfig,
+        userProposal: {
+          userId: '507f1f77bcf86cd799439011',
+          userIdHash: 'user-hash',
+          accepted: [
+            {
+              key: 'context',
+              action: 'set',
+              value: 'Hardened context value',
+              tokenCount: 3,
+              expectedRevision: 7,
+              evidence: [],
+            },
+          ],
+          transcripts: [],
+          staleTranscriptArtifacts: [],
+        },
+      });
+
+      expect(setMemory).toHaveBeenCalledWith(expect.objectContaining({ key: 'context' }));
+      expect(setMemory).not.toHaveBeenCalledWith(expect.objectContaining({ key: 'working' }));
+    } finally {
+      fs.rmSync(runDir, { recursive: true, force: true });
+    }
+  });
+
+  test('post-apply maintenance preserves keys written by the reviewed proposal', async () => {
+    const runDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-memory-proposal-'));
+    let memories = [
+      { key: 'context', value: 'Previous context', tokenCount: 2, __v: 7 },
+      {
+        key: 'me',
+        value: "What I've noticed:\n- repeated internal checks without user-facing value",
+        tokenCount: 500,
+        __v: 2,
+      },
+    ];
+    const setMemory = jest.fn(async ({ key, value, tokenCount, expectedRevision }) => {
+      const revision = Number(expectedRevision) + 1;
+      const existing = memories.find((memory) => memory.key === key);
+      memories = [
+        ...memories.filter((memory) => memory.key !== key),
+        { ...(existing || {}), key, value, tokenCount, __v: revision },
+      ];
+      return { ok: true, revision };
+    });
+    const proposedContext =
+      'A complete newly consolidated event with its outcome and both follow-up commitments intact.';
+
+    try {
+      const result = await applyUserProposal({
+        methods: {
+          getAllUserMemories: jest.fn(async () => memories.map((memory) => ({ ...memory }))),
+          setMemory,
+          deleteMemory: jest.fn(),
+        },
+        user: { _id: '507f1f77bcf86cd799439011' },
+        runDir,
+        memoryConfig,
+        userProposal: {
+          userId: '507f1f77bcf86cd799439011',
+          userIdHash: 'user-hash',
+          accepted: [
+            {
+              key: 'context',
+              action: 'set',
+              value: proposedContext,
+              tokenCount: 12,
+              expectedRevision: 7,
+              evidence: [],
+            },
+          ],
+          transcripts: [],
+          staleTranscriptArtifacts: [],
+        },
+      });
+
+      expect(setMemory.mock.calls.filter(([write]) => write.key === 'context')).toHaveLength(1);
+      expect(memories.find((memory) => memory.key === 'context')?.value).toBe(proposedContext);
+      expect(setMemory).toHaveBeenCalledWith(expect.objectContaining({ key: 'me' }));
+      expect(result.maintenanceApplied).toBe(true);
     } finally {
       fs.rmSync(runDir, { recursive: true, force: true });
     }
@@ -3079,7 +3212,7 @@ describe('viventium-memory-hardening', () => {
         deleteMemory,
       },
       rollback: {
-        schemaVersion: 2,
+        schemaVersion: 3,
         userId: '507f1f77bcf86cd799439011',
         memories: [{ key: 'context', value: 'Original value', tokenCount: 2, revision: 3 }],
         applied: [{ key: 'context', exists: true, revision: 4 }],
@@ -3112,7 +3245,7 @@ describe('viventium-memory-hardening', () => {
         deleteMemory,
       },
       rollback: {
-        schemaVersion: 2,
+        schemaVersion: 3,
         userId: '507f1f77bcf86cd799439011',
         memories: [{ key: 'context', value: 'Original value', tokenCount: 2, revision: 3 }],
         applied: [{ key: 'context', exists: true, revision: 4 }],
@@ -3125,6 +3258,43 @@ describe('viventium-memory-hardening', () => {
       restoredKeys: [],
       conflicts: [{ key: 'context', reason: 'revision_conflict' }],
     });
+  });
+
+  test('rollback reactivates only the exact tombstone produced by the hardener delete', async () => {
+    const setMemory = jest.fn().mockResolvedValue({ ok: true, revision: 5 });
+    const deleteMemory = jest.fn();
+
+    const result = await restoreRollback({
+      methods: {
+        getAllUserMemoryStates: jest.fn().mockResolvedValue([
+          {
+            key: 'context',
+            value: '',
+            tokenCount: 0,
+            __v: 4,
+            deletedAt: new Date('2026-07-11T16:00:00.000Z'),
+          },
+        ]),
+        setMemory,
+        deleteMemory,
+      },
+      rollback: {
+        schemaVersion: 3,
+        userId: '507f1f77bcf86cd799439011',
+        memories: [{ key: 'context', value: 'Original value', tokenCount: 2, revision: 3 }],
+        applied: [{ key: 'context', exists: false, revision: 4 }],
+      },
+    });
+
+    expect(setMemory).toHaveBeenCalledWith({
+      userId: '507f1f77bcf86cd799439011',
+      key: 'context',
+      value: 'Original value',
+      tokenCount: 2,
+      expectedRevision: 4,
+    });
+    expect(deleteMemory).not.toHaveBeenCalled();
+    expect(result).toEqual({ restoredKeys: ['context'], conflicts: [] });
   });
 
   test('rollback fails closed for legacy snapshots without post-apply revisions', async () => {
@@ -3149,6 +3319,84 @@ describe('viventium-memory-hardening', () => {
     expect(result).toEqual({
       restoredKeys: [],
       conflicts: [{ key: null, reason: 'rollback_revision_state_missing' }],
+    });
+  });
+
+  test('rollback preserves revision-safe schema v2 write-only snapshots', async () => {
+    const setMemory = jest.fn().mockResolvedValue({ ok: true, revision: 9 });
+    const deleteMemory = jest.fn().mockResolvedValue({ ok: true, revision: 4 });
+
+    const result = await restoreRollback({
+      methods: {
+        getAllUserMemoryStates: jest.fn().mockResolvedValue([
+          {
+            key: 'context',
+            value: 'Hardened value',
+            tokenCount: 2,
+            __v: 8,
+          },
+          {
+            key: 'drafts',
+            value: 'New hardener value',
+            tokenCount: 3,
+            __v: 3,
+          },
+        ]),
+        setMemory,
+        deleteMemory,
+      },
+      rollback: {
+        schemaVersion: 2,
+        userId: '507f1f77bcf86cd799439011',
+        memories: [{ key: 'context', value: 'Original value', tokenCount: 2, revision: 7 }],
+        applied: [
+          { key: 'context', exists: true, revision: 8 },
+          { key: 'drafts', exists: true, revision: 3 },
+        ],
+      },
+    });
+
+    expect(setMemory).toHaveBeenCalledWith({
+      userId: '507f1f77bcf86cd799439011',
+      key: 'context',
+      value: 'Original value',
+      tokenCount: 2,
+      expectedRevision: 8,
+    });
+    expect(deleteMemory).toHaveBeenCalledWith({
+      userId: '507f1f77bcf86cd799439011',
+      key: 'drafts',
+      expectedRevision: 3,
+    });
+    expect(result).toEqual({ restoredKeys: ['context', 'drafts'], conflicts: [] });
+  });
+
+  test('rollback fails closed for mixed schema v2 write and tombstone state', async () => {
+    const methods = {
+      getAllUserMemoryStates: jest.fn(),
+      setMemory: jest.fn(),
+      deleteMemory: jest.fn(),
+    };
+
+    const result = await restoreRollback({
+      methods,
+      rollback: {
+        schemaVersion: 2,
+        userId: '507f1f77bcf86cd799439011',
+        memories: [{ key: 'context', value: 'Original value', tokenCount: 2, revision: 7 }],
+        applied: [
+          { key: 'context', exists: true, revision: 8 },
+          { key: 'moments', exists: false, revision: 4 },
+        ],
+      },
+    });
+
+    expect(methods.getAllUserMemoryStates).not.toHaveBeenCalled();
+    expect(methods.setMemory).not.toHaveBeenCalled();
+    expect(methods.deleteMemory).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      restoredKeys: [],
+      conflicts: [{ key: 'moments', reason: 'rollback_v2_delete_state_unsafe' }],
     });
   });
 
@@ -3213,8 +3461,10 @@ describe('viventium-memory-hardening', () => {
         'mongodb://user:pass@example.test/db',
         ['s', 'k-secretvalue123'].join(''),
         'qa@example.com',
-        '/Users/example/private/file.txt',
+        ['', 'Users', 'example', 'private', 'file.txt'].join('/'),
         '/home/example/private/file.txt',
+        '/Applications/Example.app/Contents/Resources/tool',
+        '/opt/homebrew/bin/tool',
         'C:\\Users\\Example\\secret.txt',
         '507f1f77bcf86cd799439011',
         'conversationabc123456789',
@@ -3230,6 +3480,8 @@ describe('viventium-memory-hardening', () => {
     expect(redacted).toContain('<runtime-id>');
     expect(redacted).not.toContain('/Users/');
     expect(redacted).not.toContain('/home/');
+    expect(redacted).not.toContain('/Applications/');
+    expect(redacted).not.toContain('/opt/');
     expect(redacted).not.toContain('qa@example.com');
     expect(redacted).toContain('--ask-for-approval');
   });
@@ -3542,6 +3794,8 @@ describe('viventium-memory-hardening', () => {
   });
 
   test('Codex provider path uses xhigh reasoning and JSON schema output', () => {
+    const oldCodexBin = process.env.WPR_CODEX_BIN;
+    process.env.WPR_CODEX_BIN = '/Applications/ChatGPT.app/Contents/Resources/codex';
     const spawnSpy = jest.spyOn(childProcess, 'spawnSync').mockReturnValue({
       status: 0,
       stdout: '{"ok":true}',
@@ -3554,6 +3808,7 @@ describe('viventium-memory-hardening', () => {
       expect(probeArgs).toContain('model_reasoning_effort="xhigh"');
       expect(probeArgs).toContain('--output-schema');
       expect(probeArgs).toContain('--output-last-message');
+      expect(spawnSpy.mock.calls[0][0]).toBe(process.env.WPR_CODEX_BIN);
       expect(spawnSpy.mock.calls[0][2].env.ANTHROPIC_API_KEY).toBeUndefined();
       expect(spawnSpy.mock.calls[0][2].env.OPENAI_API_KEY).toBeUndefined();
 
@@ -3585,6 +3840,8 @@ describe('viventium-memory-hardening', () => {
       );
     } finally {
       spawnSpy.mockRestore();
+      if (oldCodexBin) process.env.WPR_CODEX_BIN = oldCodexBin;
+      else delete process.env.WPR_CODEX_BIN;
     }
   });
 });

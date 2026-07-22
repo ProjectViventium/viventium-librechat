@@ -1,0 +1,2 @@
+# VIVENTIUM: Raw-byte legal pins must remain identical on Windows checkouts.
+client/third_party/browser-compliance/** text eol=lf

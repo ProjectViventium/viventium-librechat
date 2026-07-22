@@ -108,15 +108,238 @@ jest.mock('~/server/middleware', () => ({
   },
 }));
 
+function playgroundHealthResponse(payload, { declaredLength, chunks } = {}) {
+  const encoded = Buffer.from(JSON.stringify(payload));
+  const responseChunks = chunks || [encoded];
+  let index = 0;
+  return {
+    ok: true,
+    status: 200,
+    headers: {
+      get: (name) =>
+        String(name).toLowerCase() === 'content-length' && declaredLength != null
+          ? String(declaredLength)
+          : null,
+    },
+    body: {
+      getReader: () => ({
+        read: async () =>
+          index < responseChunks.length
+            ? { done: false, value: responseChunks[index++] }
+            : { done: true },
+        cancel: jest.fn(async () => {}),
+        releaseLock: jest.fn(),
+      }),
+    },
+  };
+}
+
+function modernIdentity(sourceRef = 'a'.repeat(40)) {
+  return {
+    schema_version: 1,
+    product: 'viventium-playground',
+    status: 'ok',
+    surface: 'modern-playground',
+    variant: 'modern',
+    source_ref: sourceRef,
+  };
+}
+
 describe('/api/viventium/calls', () => {
   beforeEach(() => {
     jest.resetModules();
     jest.clearAllMocks();
+    process.env.VIVENTIUM_VOICE_ENABLED = 'true';
     process.env.VIVENTIUM_PLAYGROUND_URL = 'http://localhost:3000';
+    process.env.PLAYGROUND_VARIANT = 'modern';
+    process.env.VIVENTIUM_PLAYGROUND_SOURCE_REF = 'a'.repeat(40);
     process.env.VIVENTIUM_PUBLIC_CLIENT_URL = '';
     process.env.VIVENTIUM_PUBLIC_SERVER_URL = '';
     process.env.VIVENTIUM_PUBLIC_PLAYGROUND_URL = '';
     process.env.VIVENTIUM_VOICE_GATEWAY_AGENT_NAME = 'librechat-voice-gateway';
+    global.fetch = jest.fn(async () => playgroundHealthResponse(modernIdentity()));
+  });
+
+  test('POST fails closed before creating a session when Voice is disabled', async () => {
+    process.env.VIVENTIUM_VOICE_ENABLED = 'false';
+    const callsRouter = require('../calls');
+    const { createCallSession } = require('~/server/services/viventium/CallSessionService');
+
+    const app = express();
+    app.use(express.json());
+    app.use('/api/viventium/calls', callsRouter);
+
+    const res = await request(app)
+      .post('/api/viventium/calls')
+      .send({ conversationId: 'new', agentId: 'agent_123' })
+      .expect(409);
+
+    expect(res.body).toMatchObject({ error: 'voice_not_enabled' });
+    expect(createCallSession).not.toHaveBeenCalled();
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  test('POST returns a stable structured error before readiness when no assistant is selected', async () => {
+    const callsRouter = require('../calls');
+    const { createCallSession } = require('~/server/services/viventium/CallSessionService');
+
+    const app = express();
+    app.use(express.json());
+    app.use('/api/viventium/calls', callsRouter);
+
+    const res = await request(app)
+      .post('/api/viventium/calls')
+      .send({ conversationId: 'new' })
+      .expect(400);
+
+    expect(res.body).toMatchObject({
+      error: 'voice_agent_required',
+      message: 'Choose an assistant before starting Voice.',
+    });
+    expect(createCallSession).not.toHaveBeenCalled();
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  test('POST fails closed when the configured playground has no listener', async () => {
+    global.fetch.mockRejectedValueOnce(new Error('connection refused'));
+    const callsRouter = require('../calls');
+    const { createCallSession } = require('~/server/services/viventium/CallSessionService');
+
+    const app = express();
+    app.use(express.json());
+    app.use('/api/viventium/calls', callsRouter);
+
+    const res = await request(app)
+      .post('/api/viventium/calls')
+      .send({ conversationId: 'new', agentId: 'agent_123' })
+      .expect(503);
+
+    expect(res.body).toMatchObject({
+      error: 'voice_runtime_not_ready',
+      reason: 'playground_unreachable',
+    });
+    expect(createCallSession).not.toHaveBeenCalled();
+  });
+
+  test('POST fails closed when the playground URL is invalid', async () => {
+    process.env.VIVENTIUM_PLAYGROUND_URL = 'not a URL';
+    const callsRouter = require('../calls');
+    const { createCallSession } = require('~/server/services/viventium/CallSessionService');
+
+    const app = express();
+    app.use(express.json());
+    app.use('/api/viventium/calls', callsRouter);
+
+    const res = await request(app)
+      .post('/api/viventium/calls')
+      .send({ conversationId: 'new', agentId: 'agent_123' })
+      .expect(503);
+
+    expect(res.body).toMatchObject({
+      error: 'voice_runtime_not_ready',
+      reason: 'playground_configuration_invalid',
+    });
+    expect(createCallSession).not.toHaveBeenCalled();
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  test('POST rejects a stale classic playground when modern is configured', async () => {
+    global.fetch.mockResolvedValueOnce(
+      playgroundHealthResponse({
+        schema_version: 1,
+        product: 'viventium-playground',
+        status: 'ok',
+        surface: 'classic-playground',
+        variant: 'classic',
+        source_ref: 'b'.repeat(40),
+      }),
+    );
+    const callsRouter = require('../calls');
+    const { createCallSession } = require('~/server/services/viventium/CallSessionService');
+
+    const app = express();
+    app.use(express.json());
+    app.use('/api/viventium/calls', callsRouter);
+
+    const res = await request(app)
+      .post('/api/viventium/calls')
+      .send({ conversationId: 'new', agentId: 'agent_123' })
+      .expect(503);
+
+    expect(res.body).toMatchObject({
+      error: 'voice_runtime_not_ready',
+      reason: 'playground_identity_mismatch',
+    });
+    expect(createCallSession).not.toHaveBeenCalled();
+  });
+
+  test('POST rejects a stale modern playground source ref', async () => {
+    global.fetch.mockResolvedValueOnce(playgroundHealthResponse(modernIdentity('b'.repeat(40))));
+    const callsRouter = require('../calls');
+    const { createCallSession } = require('~/server/services/viventium/CallSessionService');
+
+    const app = express();
+    app.use(express.json());
+    app.use('/api/viventium/calls', callsRouter);
+
+    const res = await request(app)
+      .post('/api/viventium/calls')
+      .send({ conversationId: 'new', agentId: 'agent_123' })
+      .expect(503);
+
+    expect(res.body).toMatchObject({
+      error: 'voice_runtime_not_ready',
+      reason: 'playground_identity_mismatch',
+    });
+    expect(createCallSession).not.toHaveBeenCalled();
+  });
+
+  test('POST rejects an oversized declared identity before reading its body', async () => {
+    global.fetch.mockResolvedValueOnce(
+      playgroundHealthResponse(modernIdentity(), { declaredLength: 65537 }),
+    );
+    const callsRouter = require('../calls');
+    const { createCallSession } = require('~/server/services/viventium/CallSessionService');
+
+    const app = express();
+    app.use(express.json());
+    app.use('/api/viventium/calls', callsRouter);
+
+    const res = await request(app)
+      .post('/api/viventium/calls')
+      .send({ conversationId: 'new', agentId: 'agent_123' })
+      .expect(503);
+
+    expect(res.body).toMatchObject({
+      error: 'voice_runtime_not_ready',
+      reason: 'playground_identity_mismatch',
+    });
+    expect(createCallSession).not.toHaveBeenCalled();
+  });
+
+  test('POST bounds a chunked identity response before creating durable call state', async () => {
+    global.fetch.mockResolvedValueOnce(
+      playgroundHealthResponse(modernIdentity(), {
+        chunks: [Buffer.alloc(40000, 'a'), Buffer.alloc(30000, 'b')],
+      }),
+    );
+    const callsRouter = require('../calls');
+    const { createCallSession } = require('~/server/services/viventium/CallSessionService');
+
+    const app = express();
+    app.use(express.json());
+    app.use('/api/viventium/calls', callsRouter);
+
+    const res = await request(app)
+      .post('/api/viventium/calls')
+      .send({ conversationId: 'new', agentId: 'agent_123' })
+      .expect(503);
+
+    expect(res.body).toMatchObject({
+      error: 'voice_runtime_not_ready',
+      reason: 'playground_identity_mismatch',
+    });
+    expect(createCallSession).not.toHaveBeenCalled();
   });
 
   test('POST creates a call session and returns a deep-link url', async () => {
@@ -140,6 +363,33 @@ describe('/api/viventium/calls', () => {
     expect(u.searchParams.get('callSessionId')).toBe(res.body.callSessionId);
     expect(u.searchParams.get('agentName')).toBe('librechat-voice-gateway');
     expect(u.searchParams.get('autoConnect')).toBe('1');
+  });
+
+  test('POST diagnostics do not log user, conversation, agent, session, room, or deep-link values', async () => {
+    const callsRouter = require('../calls');
+    const { logger } = require('@librechat/data-schemas');
+
+    const app = express();
+    app.use(express.json());
+    app.use('/api/viventium/calls', callsRouter);
+
+    const res = await request(app)
+      .post('/api/viventium/calls')
+      .send({ conversationId: 'new', agentId: 'agent_private' })
+      .expect(200);
+
+    const diagnostics = JSON.stringify(
+      Object.values(logger).flatMap((method) => method.mock.calls),
+    );
+    for (const privateValue of [
+      'user_1',
+      'agent_private',
+      res.body.callSessionId,
+      res.body.roomName,
+      res.body.playgroundUrl,
+    ]) {
+      expect(diagnostics).not.toContain(privateValue);
+    }
   });
 
   test('POST prefers the configured public playground for matching public browser origins', async () => {

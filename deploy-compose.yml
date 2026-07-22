@@ -1,13 +1,17 @@
 services:
   api:
-    # build:
-    #   context: .
-    #   dockerfile: Dockerfile.multi
-    #   target: api-build
-    image: registry.librechat.ai/danny-avila/librechat-dev-api:latest
+    # VIVENTIUM START — build the exact checked-out fork; never substitute an upstream image.
+    build:
+      context: .
+      dockerfile: Dockerfile.multi
+      target: api-build
+    # VIVENTIUM END
     container_name: LibreChat-API
     ports:
       - 3080:3080
+      # VIVENTIUM START — browser code executes on a dedicated loopback origin.
+      - '127.0.0.1:${SANDPACK_BUNDLER_PORT:-3081}:${SANDPACK_BUNDLER_PORT:-3081}'
+      # VIVENTIUM END
     depends_on:
       - mongodb
       - rag_api
@@ -23,6 +27,12 @@ services:
       - MEILI_HOST=http://meilisearch:7700
       - RAG_PORT=${RAG_PORT:-8000}
       - RAG_API_URL=http://rag_api:${RAG_PORT:-8000}
+      # VIVENTIUM START — source/Docker API owns the isolated Sandpack listener.
+      - SANDPACK_BUNDLER_LISTEN_HOST=0.0.0.0
+      - SANDPACK_BUNDLER_LISTEN_PORT=${SANDPACK_BUNDLER_PORT:-3081}
+      - SANDPACK_BUNDLER_URL=${SANDPACK_BUNDLER_URL:-http://localhost:3081/}
+      - SANDPACK_STATIC_BUNDLER_URL=${SANDPACK_STATIC_BUNDLER_URL:-http://localhost:3081/}
+      # VIVENTIUM END
     volumes:
       - type: bind
         source: ./librechat.yaml
@@ -74,7 +84,9 @@ services:
     volumes:
       - pgdata2:/var/lib/postgresql/data
   rag_api:
-    image: registry.librechat.ai/danny-avila/librechat-rag-api-dev-lite:latest
+    # VIVENTIUM START — registry-verified multi-platform digest, inspected 2026-07-20.
+    image: registry.librechat.ai/danny-avila/librechat-rag-api-dev-lite:latest@sha256:c0ad82657b556c1e16dcfca85d045788f67caa223e25e70eb687f4d16b41dedc
+    # VIVENTIUM END
     environment:
       - DB_HOST=vectordb
       - RAG_PORT=${RAG_PORT:-8000}

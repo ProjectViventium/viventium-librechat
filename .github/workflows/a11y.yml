@@ -4,23 +4,43 @@ on:
   pull_request:
     paths:
       - 'client/src/**'
+      - 'eslint.config.mjs'
+      - 'package-lock.json'
   workflow_dispatch:
-    inputs:
-      run_workflow:
-        description: 'Set to true to run this workflow'
-        required: true
-        default: 'false'
 
 jobs:
-  axe-linter:
+  accessibility-static-lint:
+    name: Accessibility static lint
     runs-on: ubuntu-latest
-    if: >
-      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == 'danny-avila/LibreChat') ||
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.run_workflow == 'true')
-    
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
-      - uses: dequelabs/axe-linter-action@v1
         with:
-          api_key: ${{ secrets.AXE_LINTER_API_KEY }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+      # VIVENTIUM START — the public fork has no private axe-linter service key.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.16.0
+          cache: npm
+      - run: npm ci
+      - name: Run secret-free client accessibility lint
+        shell: bash
+        run: |
+          declare -a CHANGED_FILES=()
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BASE_SHA=$(jq --raw-output .pull_request.base.sha "$GITHUB_EVENT_PATH")
+            while IFS= read -r -d '' file; do
+              CHANGED_FILES+=("$file")
+            done < <(git diff --name-only -z --diff-filter=ACMRTUXB "$BASE_SHA" HEAD | grep -zE '^client/src/.*\.(js|jsx|ts|tsx)$' || true)
+          else
+            while IFS= read -r -d '' file; do
+              CHANGED_FILES+=("$file")
+            done < <(git ls-files -z -- 'client/src/**/*.js' 'client/src/**/*.jsx' 'client/src/**/*.ts' 'client/src/**/*.tsx')
+          fi
+          if [[ ${#CHANGED_FILES[@]} -eq 0 ]]; then
+            echo "No matching client source changed."
+            exit 0
+          fi
+          npx eslint --no-error-on-unmatched-pattern --config eslint.config.mjs -- "${CHANGED_FILES[@]}"
+      # VIVENTIUM END

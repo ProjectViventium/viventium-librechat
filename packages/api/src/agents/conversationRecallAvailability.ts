@@ -15,7 +15,17 @@ import type { TFile } from 'librechat-data-provider';
 
 type ConversationRecallVectorRuntimeStatus = {
   available: boolean;
-  reason: 'ok' | 'unconfigured' | 'http_error' | 'timeout' | 'unreachable' | 'stale_restore';
+  /* === VIVENTIUM START === Semantic recall-health failure classes. === */
+  reason:
+    | 'ok'
+    | 'unconfigured'
+    | 'http_error'
+    | 'unhealthy'
+    | 'invalid_response'
+    | 'timeout'
+    | 'unreachable'
+    | 'stale_restore';
+  /* === VIVENTIUM END === */
 };
 
 const HEALTH_CHECK_TIMEOUT_MS = 1000;
@@ -47,7 +57,9 @@ function parseTimestamp(value: unknown): Date | null {
   return null;
 }
 
-export function getConversationRecallCorpusUpdatedAt(recallFiles: TFile[] | null | undefined): Date | null {
+export function getConversationRecallCorpusUpdatedAt(
+  recallFiles: TFile[] | null | undefined,
+): Date | null {
   if (!Array.isArray(recallFiles) || recallFiles.length === 0) {
     return null;
   }
@@ -145,9 +157,24 @@ export async function getConversationRecallVectorRuntimeStatus(): Promise<Conver
     const response = await fetch(`${process.env.RAG_API_URL}/health`, {
       signal: controller.signal,
     });
-    const status: ConversationRecallVectorRuntimeStatus = response?.ok
-      ? { available: true, reason: 'ok' }
-      : { available: false, reason: 'http_error' };
+    /* === VIVENTIUM START ===
+     * HTTP reachability is insufficient: only the RAG service's declared UP state enables vectors.
+     */
+    let status: ConversationRecallVectorRuntimeStatus;
+    if (!response?.ok) {
+      status = { available: false, reason: 'http_error' };
+    } else {
+      try {
+        const payload = (await response.json()) as { status?: unknown };
+        status =
+          payload?.status === 'UP'
+            ? { available: true, reason: 'ok' }
+            : { available: false, reason: 'unhealthy' };
+      } catch {
+        status = { available: false, reason: 'invalid_response' };
+      }
+    }
+    /* === VIVENTIUM END === */
     healthCache = {
       status,
       expiresAt: now + HEALTH_CACHE_TTL_MS,

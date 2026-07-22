@@ -8,8 +8,9 @@ import * as miscDataProvider from '~/data-provider/Misc/queries';
 import * as endpointQueries from '~/data-provider/Endpoints/queries';
 import * as authMutations from '~/data-provider/Auth/mutations';
 import * as authQueries from '~/data-provider/Auth/queries';
-import Registration from '~/components/Auth/Registration';
+import Registration, { registrationDestination } from '~/components/Auth/Registration';
 import AuthLayout from '~/components/Auth/AuthLayout';
+import { getPostLoginRedirect, persistRedirectToSession } from '~/utils';
 
 jest.mock('librechat-data-provider/react-query');
 
@@ -32,6 +33,7 @@ const mockStartupConfig = {
     registrationEnabled: true,
     socialLoginEnabled: true,
     serverDomain: 'mock-server',
+    viventiumInstallExperience: 'express',
   },
 };
 
@@ -117,6 +119,21 @@ jest.mock('react-router-dom', () => ({
     startupConfig: mockStartupConfig,
   }),
 }));
+
+test('sends fresh Easy Install registration to browser account setup', () => {
+  expect(registrationDestination({ viventiumInstallExperience: 'express' })).toBe(
+    '/c/new?setup=accounts',
+  );
+  expect(registrationDestination({ viventiumInstallExperience: 'custom' })).toBe('/c/new');
+  expect(registrationDestination(undefined)).toBe('/c/new');
+});
+
+test('preserves the Easy Install account setup target through the login redirect', () => {
+  const destination = registrationDestination({ viventiumInstallExperience: 'express' });
+  persistRedirectToSession(destination);
+
+  expect(getPostLoginRedirect(new URLSearchParams())).toBe('/c/new?setup=accounts');
+});
 
 test('renders registration form', () => {
   const { getByText, getByTestId, getByRole } = setup();
@@ -206,26 +223,28 @@ test('shows validation error messages', async () => {
 test('shows error message when registration fails', async () => {
   const useRegisterSpy = jest
     .spyOn(mockDataProvider, 'useRegisterUserMutation')
-    .mockImplementation((options?: Parameters<typeof mockDataProvider.useRegisterUserMutation>[0]) => {
-      const mutate = jest.fn(() =>
-        options?.onError?.({
-          response: {
-            data: {
-              message: 'Registration failed',
+    .mockImplementation(
+      (options?: Parameters<typeof mockDataProvider.useRegisterUserMutation>[0]) => {
+        const mutate = jest.fn(() =>
+          options?.onError?.({
+            response: {
+              data: {
+                message: 'Registration failed',
+              },
             },
-          },
-        }),
-      );
+          }),
+        );
 
-      return {
-        isLoading: false,
-        isError: true,
-        mutate,
-        error: new Error('Registration failed'),
-        data: {},
-        isSuccess: false,
-      } as ReturnType<typeof mockDataProvider.useRegisterUserMutation>;
-    });
+        return {
+          isLoading: false,
+          isError: true,
+          mutate,
+          error: new Error('Registration failed'),
+          data: {},
+          isSuccess: false,
+        } as ReturnType<typeof mockDataProvider.useRegisterUserMutation>;
+      },
+    );
 
   try {
     render(
@@ -251,7 +270,7 @@ test('shows error message when registration fails', async () => {
     await waitFor(() => {
       const alert = screen
         .getByText(/There was an error attempting to register your account\. Please try again\./i)
-        .closest('[role=\"alert\"]');
+        .closest('[role="alert"]');
       expect(alert).toBeInTheDocument();
       expect(alert).toHaveTextContent(
         /There was an error attempting to register your account. Please try again. Registration failed/i,
@@ -267,21 +286,29 @@ test('redirects after successful registration countdown without render-time rout
 
   const navigate = jest.fn();
   jest.spyOn(reactRouter, 'useNavigate').mockReturnValue(navigate);
+  jest.spyOn(reactRouter, 'useOutletContext').mockReturnValue({
+    startupConfig: {
+      ...mockStartupConfig.data,
+      viventiumInstallExperience: 'express',
+    },
+  });
 
   const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
   const useRegisterSpy = jest
     .spyOn(mockDataProvider, 'useRegisterUserMutation')
-    .mockImplementation((options?: Parameters<typeof mockDataProvider.useRegisterUserMutation>[0]) => {
-      const mutate = jest.fn(() => options?.onSuccess?.());
-      return {
-        isLoading: false,
-        isError: false,
-        mutate,
-        data: {},
-        isSuccess: false,
-        error: null,
-      } as ReturnType<typeof mockDataProvider.useRegisterUserMutation>;
-    });
+    .mockImplementation(
+      (options?: Parameters<typeof mockDataProvider.useRegisterUserMutation>[0]) => {
+        const mutate = jest.fn(() => options?.onSuccess?.());
+        return {
+          isLoading: false,
+          isError: false,
+          mutate,
+          data: {},
+          isSuccess: false,
+          error: null,
+        } as ReturnType<typeof mockDataProvider.useRegisterUserMutation>;
+      },
+    );
 
   try {
     const user = userEvent.setup({ advanceTimers: jest.advanceTimersByTime });
@@ -305,29 +332,31 @@ test('redirects after successful registration countdown without render-time rout
     await user.type(screen.getByTestId('confirm_password'), 'ViventiumQA!234');
     await user.click(screen.getByRole('button', { name: /Submit registration/i }));
 
-    await waitFor(() =>
-      expect(screen.getByText(/Redirecting in 3 seconds/i)).toBeInTheDocument(),
-    );
+    await waitFor(() => expect(screen.getByText(/Redirecting in 3 seconds/i)).toBeInTheDocument());
+    expect(
+      screen.getByText(
+        /Continue to sign in\. For a new account, verify your email if prompted and use the password you just chose\. If this email was already registered, use its existing password or reset it\./i,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Registration successful\./i)).not.toBeInTheDocument();
 
     act(() => {
       jest.advanceTimersByTime(1000);
     });
-    await waitFor(() =>
-      expect(screen.getByText(/Redirecting in 2 seconds/i)).toBeInTheDocument(),
-    );
+    await waitFor(() => expect(screen.getByText(/Redirecting in 2 seconds/i)).toBeInTheDocument());
 
     act(() => {
       jest.advanceTimersByTime(1000);
     });
-    await waitFor(() =>
-      expect(screen.getByText(/Redirecting in 1 seconds/i)).toBeInTheDocument(),
-    );
+    await waitFor(() => expect(screen.getByText(/Redirecting in 1 seconds/i)).toBeInTheDocument());
 
     act(() => {
       jest.advanceTimersByTime(1000);
     });
 
-    await waitFor(() => expect(navigate).toHaveBeenCalledWith('/c/new', { replace: true }));
+    await waitFor(() =>
+      expect(navigate).toHaveBeenCalledWith('/c/new?setup=accounts', { replace: true }),
+    );
     expect(
       consoleErrorSpy.mock.calls.some((call) =>
         call.some((arg) => String(arg).includes('Cannot update a component')),

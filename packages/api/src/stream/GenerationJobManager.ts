@@ -754,6 +754,18 @@ class GenerationJobManagerClass {
       onError,
     });
 
+    /* === VIVENTIUM START ===
+     * Purpose: A Redis subscription is not live until Redis acknowledges it.
+     * Await that boundary before generation is allowed to publish its first
+     * chunk; otherwise fast first responses can be silently lost.
+     * === VIVENTIUM END === */
+    try {
+      await subscription.ready;
+    } catch (error) {
+      subscription.unsubscribe();
+      throw error;
+    }
+
     // Check if this is the first subscriber
     const isFirst = this.eventTransport.isFirstSubscriber(streamId);
 

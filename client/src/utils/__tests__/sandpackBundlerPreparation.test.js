@@ -31,13 +31,7 @@ describe('local Sandpack bundler preparation', () => {
     try {
       const result = prepareSandpackBundler({
         destinationRoot,
-        copyFile: (source, destination, relativePath) => {
-          if (relativePath === 'index.html') {
-            fs.copyFileSync(source, destination);
-          } else {
-            fs.linkSync(source, destination);
-          }
-        },
+        copyFile: (source, destination) => fs.copyFileSync(source, destination),
       });
       const indexBytes = fs.readFileSync(path.join(destinationRoot, 'index.html'));
       const runtimeBytes = fs.readFileSync(

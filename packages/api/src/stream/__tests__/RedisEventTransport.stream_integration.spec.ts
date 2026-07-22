@@ -315,6 +315,50 @@ describe('RedisEventTransport Integration Tests', () => {
   });
 
   describe('Reorder Buffer (Redis Cluster Fix)', () => {
+    /* === VIVENTIUM START ===
+     * Purpose: Guard the Redis acknowledgement boundary that prevents first
+     * events from being published before a subscription becomes live.
+     */
+    test('exposes Redis subscription readiness and shares it across local subscribers', async () => {
+      const { RedisEventTransport } = await import('../implementations/RedisEventTransport');
+
+      let acknowledgeSubscription: (() => void) | undefined;
+      const acknowledgement = new Promise<void>((resolve) => {
+        acknowledgeSubscription = resolve;
+      });
+      const mockPublisher = { publish: jest.fn().mockResolvedValue(1) };
+      const mockSubscriber = {
+        on: jest.fn(),
+        subscribe: jest.fn().mockReturnValue(acknowledgement),
+        unsubscribe: jest.fn().mockResolvedValue(undefined),
+      };
+      const transport = new RedisEventTransport(
+        mockPublisher as unknown as Redis,
+        mockSubscriber as unknown as Redis,
+      );
+
+      const first = transport.subscribe('ready-test', { onChunk: () => {} });
+      const second = transport.subscribe('ready-test', { onChunk: () => {} });
+      let ready = false;
+      void first.ready.then(() => {
+        ready = true;
+      });
+
+      await Promise.resolve();
+      expect(ready).toBe(false);
+      expect(second.ready).toBe(first.ready);
+      expect(mockSubscriber.subscribe).toHaveBeenCalledTimes(1);
+
+      acknowledgeSubscription?.();
+      await expect(first.ready).resolves.toBeUndefined();
+      expect(ready).toBe(true);
+
+      first.unsubscribe();
+      second.unsubscribe();
+      transport.destroy();
+    });
+    /* === VIVENTIUM END === */
+
     test('should reorder out-of-sequence messages', async () => {
       const { RedisEventTransport } = await import('../implementations/RedisEventTransport');
 

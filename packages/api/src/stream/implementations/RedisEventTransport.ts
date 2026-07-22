@@ -94,6 +94,11 @@ export class RedisEventTransport implements IEventTransport {
   private streams = new Map<string, StreamSubscribers>();
   /** Track which channels we're subscribed to */
   private subscribedChannels = new Set<string>();
+  /* === VIVENTIUM START ===
+   * Purpose: Let callers await the actual Redis subscription acknowledgement so
+   * the first published event cannot disappear into a subscribe/publish race.
+   * === VIVENTIUM END === */
+  private subscriptionReady = new Map<string, Promise<void>>();
   /** Counter for generating unique subscriber IDs */
   private subscriberIdCounter = 0;
   /** Sequence counters per stream for publishing (ensures ordered delivery in cluster mode) */
@@ -349,7 +354,7 @@ export class RedisEventTransport implements IEventTransport {
       onDone?: (event: unknown) => void;
       onError?: (error: string) => void;
     },
-  ): { unsubscribe: () => void } {
+  ): { unsubscribe: () => void; ready: Promise<void> } {
     const channel = CHANNELS.events(streamId);
     const subscriberId = `sub_${++this.subscriberIdCounter}`;
 
@@ -366,16 +371,34 @@ export class RedisEventTransport implements IEventTransport {
     streamState.count++;
     streamState.handlers.set(subscriberId, handlers);
 
-    // Subscribe to Redis channel if this is first subscriber
-    if (!this.subscribedChannels.has(channel)) {
+    /* === VIVENTIUM START ===
+     * Purpose: Preserve and expose the Redis acknowledgement promise. Callers
+     * can wait until the channel is actually live, and a failed attempt clears
+     * optimistic bookkeeping so the next subscription can retry.
+     */
+    let ready = this.subscriptionReady.get(channel);
+    if (!ready) {
       this.subscribedChannels.add(channel);
-      this.subscriber.subscribe(channel).catch((err) => {
-        logger.error(`[RedisEventTransport] Failed to subscribe to ${channel}:`, err);
-      });
+      ready = this.subscriber
+        .subscribe(channel)
+        .then(() => undefined)
+        .catch((err) => {
+          this.subscribedChannels.delete(channel);
+          this.subscriptionReady.delete(channel);
+          logger.error(`[RedisEventTransport] Failed to subscribe to ${channel}:`, err);
+          throw err;
+        });
+      this.subscriptionReady.set(channel, ready);
+      // Some direct transport consumers only need `unsubscribe`; keep their
+      // ignored readiness promise from becoming an unhandled rejection while
+      // preserving the rejection for callers that do await `ready`.
+      void ready.catch(() => undefined);
     }
+    /* === VIVENTIUM END === */
 
     // Return unsubscribe function
     return {
+      ready,
       unsubscribe: () => {
         const state = this.streams.get(streamId);
         if (!state) {
@@ -398,6 +421,7 @@ export class RedisEventTransport implements IEventTransport {
             logger.error(`[RedisEventTransport] Failed to unsubscribe from ${channel}:`, err);
           });
           this.subscribedChannels.delete(channel);
+          this.subscriptionReady.delete(channel);
 
           // Call all-subscribers-left callbacks
           for (const callback of state.allSubscribersLeftCallbacks) {

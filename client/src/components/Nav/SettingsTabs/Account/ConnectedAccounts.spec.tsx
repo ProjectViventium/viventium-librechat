@@ -90,15 +90,17 @@ jest.mock('~/hooks', () => ({
       com_ui_groq: 'Groq',
       com_ui_xai: 'Grok (xAI)',
       com_ui_connected_accounts: 'Connected Accounts',
-      com_ui_connected_accounts_description: 'Add your own API key.',
+      com_ui_connected_accounts_description:
+        'Easy Install uses OpenAI for the complete optimized Viventium experience today.',
       com_ui_connected_accounts_disconnect: 'Disconnect',
       com_ui_connected_accounts_disconnect_local_only:
         'Disconnect removes this credential from Viventium only. It does not revoke provider access or API keys.',
       com_ui_connected_accounts_experimental: 'Experimental account connection',
       com_ui_connected_accounts_experimental_description: 'Optional legacy subscription sign-in.',
-      com_ui_connected_accounts_local_credential_saved: 'Local credential saved',
+      com_ui_connected_accounts_local_credential_saved: 'Saved locally — not tested yet',
       com_ui_connected_accounts_no_local_credential: 'No local credential saved',
-      com_ui_connected_account_source_user: 'A local credential is saved for this provider.',
+      com_ui_connected_account_source_user:
+        'A local credential is saved, but Viventium has not tested provider access yet.',
       com_ui_connected_account_source_none: 'No local credential is configured.',
     };
     return copy[key] ?? key;
@@ -133,6 +135,13 @@ describe('ConnectedAccounts', () => {
     });
 
     render(<ConnectedAccounts />);
+
+    expect(screen.getAllByText('Saved locally — not tested yet')).toHaveLength(2);
+    expect(
+      screen.getAllByText(
+        'A local credential is saved, but Viventium has not tested provider access yet.',
+      ),
+    ).toHaveLength(2);
 
     expect(screen.getByRole('button', { name: 'Use OpenAI API key' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Use Anthropic API key' })).toBeInTheDocument();

@@ -723,7 +723,7 @@ function ConnectedAccounts() {
                   <p
                     className={cn(
                       'text-xs',
-                      isConnected ? 'text-green-600 dark:text-green-400' : 'text-text-secondary',
+                      isConnected ? 'text-amber-700 dark:text-amber-300' : 'text-text-secondary',
                     )}
                   >
                     {statusText}

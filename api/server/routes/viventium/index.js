@@ -46,6 +46,9 @@ const glasshiveCapabilities = require('./glasshiveCapabilities');
 const promptWorkbench = require('./promptWorkbench');
 /* === VIVENTIUM NOTE === Feelings / Emotional Cortex */
 const feelings = require('./feelings');
+/* === VIVENTIUM START === Connected Channels administration === */
+const channels = require('./channels');
+/* === VIVENTIUM END === */
 
 const router = express.Router();
 
@@ -64,5 +67,6 @@ router.use('/glasshive', glasshive);
 router.use('/glasshive/capabilities', glasshiveCapabilities);
 router.use('/prompt-workbench', promptWorkbench);
 router.use('/feelings', feelings);
+router.use('/channels', channels);
 
 module.exports = router;

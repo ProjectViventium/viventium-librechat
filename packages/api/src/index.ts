@@ -30,6 +30,9 @@ export * from './memory';
 /* === VIVENTIUM START === Feelings / Emotional Cortex === */
 export * from './feelings';
 /* === VIVENTIUM END === */
+/* === VIVENTIUM START === Channel-neutral messaging === */
+export * from './channels';
+/* === VIVENTIUM END === */
 /* Agents */
 export * from './agents';
 /* Prompts */

@@ -22,6 +22,9 @@ export * from './pluginAuth';
 /* Memories */
 export * from './memory';
 export * from './feelingState';
+/* === VIVENTIUM START === Channel-neutral messaging === */
+export * from './channel';
+/* === VIVENTIUM END === */
 /* Prompts */
 export * from './prompts';
 /* Access Control */

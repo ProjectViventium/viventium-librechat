@@ -164,6 +164,16 @@ const startServer = async () => {
   /* Middleware */
   app.use(noIndex);
   /* === VIVENTIUM START ===
+   * Feature: Official WhatsApp Cloud API callback.
+   * Purpose: Preserve exact request bytes for Meta HMAC verification before JSON parsing.
+   */
+  app.use(
+    '/api/viventium/channels/whatsapp/webhook',
+    express.raw({ type: 'application/json', limit: '1mb' }),
+    routes.viventiumChannelsWebhook,
+  );
+  /* === VIVENTIUM END === */
+  /* === VIVENTIUM START ===
    * Feature: Telegram file upload payload sizing
    * Purpose: Allow larger JSON bodies when Telegram sends base64 files.
    * Added: 2026-01-31
@@ -321,6 +331,13 @@ const startServer = async () => {
 
     await initializeMCPs();
     await initializeOAuthReconnectManager();
+    /* === VIVENTIUM START ===
+     * Feature: Connected channel restart recovery.
+     * Purpose: Restore only explicitly registered in-process transports from encrypted records.
+     */
+    const { restoreChannelWorkers } = require('./services/viventium/channelAdminService');
+    await restoreChannelWorkers();
+    /* === VIVENTIUM END === */
     await checkMigrations();
     recoverStaleCortexMessages().catch((error) => {
       logger.error('[staleCortexMessageRecovery] Startup recovery failed:', error);

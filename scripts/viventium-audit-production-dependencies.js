@@ -5,6 +5,7 @@ const semver = require('semver');
 
 const projectRoot = path.resolve(__dirname, '..');
 const minimumSafeDOMPurify = '3.4.12';
+const minimumSafeHonoNodeServer = '2.0.11';
 
 function readJSON(relativePath) {
   return JSON.parse(fs.readFileSync(path.join(projectRoot, relativePath), 'utf8'));
@@ -61,9 +62,32 @@ function isAuditedMonacoDOMPurifyOverride(problem) {
   );
 }
 
+function isAuditedMCPHonoOverride(problem) {
+  const problemVersion = /^invalid: @hono\/node-server@([^\s]+)\s/.exec(problem)?.[1];
+  if (!problemVersion || !semver.valid(problemVersion)) {
+    return false;
+  }
+
+  const rootPackage = readJSON('package.json');
+  const installedHonoServer = readJSON('node_modules/@hono/node-server/package.json');
+  const installedMCPSDK = readJSON('node_modules/@modelcontextprotocol/sdk/package.json');
+  const override = rootPackage.overrides?.['@modelcontextprotocol/sdk']?.['@hono/node-server'];
+  const sdkRange = installedMCPSDK.dependencies?.['@hono/node-server'];
+
+  return (
+    problemVersion === installedHonoServer.version &&
+    override === installedHonoServer.version &&
+    semver.gte(installedHonoServer.version, minimumSafeHonoNodeServer) &&
+    typeof sdkRange === 'string' &&
+    !semver.satisfies(installedHonoServer.version, sdkRange)
+  );
+}
+
 function main() {
   const problems = productionTreeProblems();
-  const unexpected = problems.filter((problem) => !isAuditedMonacoDOMPurifyOverride(problem));
+  const unexpected = problems.filter(
+    (problem) => !isAuditedMonacoDOMPurifyOverride(problem) && !isAuditedMCPHonoOverride(problem),
+  );
 
   if (unexpected.length > 0) {
     console.error('Unexpected production dependency-tree problems:');
@@ -74,10 +98,8 @@ function main() {
     return;
   }
 
-  if (problems.length === 1) {
-    console.log(
-      `PASS: production tree has only the audited Monaco DOMPurify security override (>=${minimumSafeDOMPurify}).`,
-    );
+  if (problems.length > 0) {
+    console.log('PASS: production tree has only explicitly audited security overrides.');
   } else {
     console.log('PASS: production dependency tree is clean.');
   }
@@ -87,4 +109,4 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { parseFailedNpmList };
+module.exports = { isAuditedMCPHonoOverride, parseFailedNpmList };

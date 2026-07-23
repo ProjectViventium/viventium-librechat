@@ -64,6 +64,15 @@ function timingSafeEqualHex(left, right) {
   return crypto.timingSafeEqual(leftBuf, rightBuf);
 }
 
+function timingSafeTextEqual(left, right) {
+  if (typeof left !== 'string' || typeof right !== 'string' || !left || !right) {
+    return false;
+  }
+  const leftDigest = crypto.createHash('sha256').update(left, 'utf8').digest();
+  const rightDigest = crypto.createHash('sha256').update(right, 'utf8').digest();
+  return crypto.timingSafeEqual(leftDigest, rightDigest);
+}
+
 function cleanupNonceCache(nowMs) {
   for (const [key, expiresAt] of nonceCache.entries()) {
     if (expiresAt <= nowMs) {
@@ -142,7 +151,10 @@ function verifyGatewayRequestSignature(req, { secret, requireSignature = true } 
     return { ok: false, error: 'Invalid gateway signature' };
   }
 
-  const nonceTtlSeconds = parseIntEnv('VIVENTIUM_GATEWAY_NONCE_TTL_SECONDS', DEFAULT_NONCE_TTL_SECONDS);
+  const nonceTtlSeconds = parseIntEnv(
+    'VIVENTIUM_GATEWAY_NONCE_TTL_SECONDS',
+    DEFAULT_NONCE_TTL_SECONDS,
+  );
   nonceCache.set(nonceKey, nowMs + nonceTtlSeconds * 1000);
 
   return { ok: true };
@@ -158,6 +170,7 @@ module.exports = {
   getGatewaySecret,
   sha256Hex,
   computeGatewaySignature,
+  timingSafeTextEqual,
   verifyGatewayRequestSignature,
   resolveRequestPath,
   resolveBodyHash,

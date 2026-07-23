@@ -1844,6 +1844,13 @@ export enum SettingsTabValues {
    */
   BALANCE = 'balance',
   /**
+   * === VIVENTIUM START ===
+   * Feature: First-class Connected Channels settings.
+   * Purpose: Give messaging onboarding a direct, discoverable destination instead of burying it in Account.
+   * === VIVENTIUM END ===
+   */
+  CHANNELS = 'channels',
+  /**
    * Tab for Account Settings
    */
   ACCOUNT = 'account',

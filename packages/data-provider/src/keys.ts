@@ -65,6 +65,11 @@ export enum QueryKeys {
   /* Agent API Keys */
   agentApiKeys = 'agentApiKeys',
   feelings = 'feelings',
+  /* === VIVENTIUM START === Connected Channels === */
+  connectedChannels = 'connectedChannels',
+  connectedChannelAvailability = 'connectedChannelAvailability',
+  slackChannelManifest = 'slackChannelManifest',
+  /* === VIVENTIUM END === */
 }
 
 // Dynamic query keys that require parameters
@@ -101,4 +106,10 @@ export enum MutationKeys {
   updateFeelingBand = 'updateFeelingBand',
   resetFeelings = 'resetFeelings',
   deleteFeelings = 'deleteFeelings',
+  /* === VIVENTIUM START === Connected Channels === */
+  connectChannel = 'connectChannel',
+  createChannelPairingCode = 'createChannelPairingCode',
+  testChannel = 'testChannel',
+  disconnectChannel = 'disconnectChannel',
+  /* === VIVENTIUM END === */
 }

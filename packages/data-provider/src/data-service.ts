@@ -18,6 +18,16 @@ import type {
   UpdateFeelingBand,
   UpdateFeelingsProfile,
 } from './types/feelings';
+import type {
+  ConnectedChannel,
+  ConnectedChannelConnectRequest,
+  ChannelPairingCodeResponse,
+  ConnectedChannelAvailabilityResponse,
+  ConnectedChannelResponse,
+  ConnectedChannelsResponse,
+  ConnectedChannelTestResponse,
+  SlackManifestResponse,
+} from './types/connectedChannels';
 
 export function revokeUserKey(name: string): Promise<unknown> {
   return request.delete(endpoints.revokeUserKey(name));
@@ -1077,6 +1087,41 @@ export const resetFeelings = (expectedVersion: number): Promise<FeelingsResponse
 
 export const deleteFeelings = (expectedVersion: number): Promise<{ deleted: boolean }> => {
   return request.deleteWithOptions(endpoints.feelings(), { data: { expectedVersion } });
+};
+/* === VIVENTIUM END === */
+
+/* === VIVENTIUM START === Connected Channels === */
+export const getConnectedChannels = (): Promise<ConnectedChannelsResponse> => {
+  return request.get(endpoints.connectedChannels());
+};
+
+export const getConnectedChannelAvailability =
+  (): Promise<ConnectedChannelAvailabilityResponse> => {
+    return request.get(endpoints.connectedChannelAvailability());
+  };
+
+export const connectChannel = (
+  input: ConnectedChannelConnectRequest,
+): Promise<ConnectedChannelResponse> => {
+  return request.post(endpoints.connectConnectedChannel(input.channel), input);
+};
+
+export const testChannel = (channel: ConnectedChannel): Promise<ConnectedChannelTestResponse> => {
+  return request.post(endpoints.testConnectedChannel(channel));
+};
+
+export const disconnectChannel = (channel: ConnectedChannel): Promise<ConnectedChannelResponse> => {
+  return request.post(endpoints.disconnectConnectedChannel(channel));
+};
+
+export const createChannelPairingCode = (
+  channel: ConnectedChannel,
+): Promise<ChannelPairingCodeResponse> => {
+  return request.post(endpoints.connectedChannelPairingCode(channel));
+};
+
+export const getSlackChannelManifest = (): Promise<SlackManifestResponse> => {
+  return request.get(endpoints.slackChannelManifest());
 };
 /* === VIVENTIUM END === */
 

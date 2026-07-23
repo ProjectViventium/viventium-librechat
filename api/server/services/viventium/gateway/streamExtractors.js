@@ -112,6 +112,14 @@ function extractResponseMessageId(payload = {}) {
   return '';
 }
 
+function extractResponseConversationId(payload = {}) {
+  if (!payload.final) {
+    return '';
+  }
+  const conversationId = payload?.responseMessage?.conversationId || payload.conversationId;
+  return typeof conversationId === 'string' && conversationId ? conversationId : '';
+}
+
 function isFileAttachmentPayload(value) {
   if (!value || typeof value !== 'object') {
     return false;
@@ -191,6 +199,7 @@ module.exports = {
   extractTextDeltas,
   extractFinalResponseText,
   extractResponseMessageId,
+  extractResponseConversationId,
   extractAttachments,
   isFileAttachmentPayload,
   extractFinalError,

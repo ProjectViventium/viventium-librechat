@@ -26,6 +26,9 @@ let mockGatewayMappingUpdateOne;
 let mockGatewayLinkTokenCreate;
 let mockGatewayIngressCreate;
 let mockGatewayIngressDeleteOne;
+let mockGatewayIngressFindOne;
+let mockGatewayIngressFindOneAndUpdate;
+let mockGatewayIngressUpdateOne;
 let mockTelegramLinkTokenFindOneAndUpdate;
 let mockTelegramMappingFindOne;
 let mockTelegramMappingUpdateOne;
@@ -131,6 +134,36 @@ jest.mock('~/models/Agent', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  normalizeChannelEnvelope: (input) => ({
+    externalUsername: '',
+    externalThreadId: '',
+    externalMessageId: '',
+    externalUpdateId: '',
+    inputMode: 'text',
+    audioRequested: false,
+    attachments: [],
+    ...input,
+  }),
+  buildChannelAgentRequest: ({ envelope, resolved }) => ({
+    text: envelope.text,
+    endpoint: 'agents',
+    endpointType: 'agents',
+    conversationId: resolved.conversationId,
+    parentMessageId: resolved.parentMessageId,
+    agent_id: resolved.agentId,
+    streamId: resolved.streamId,
+    files: resolved.files || [],
+    channel: envelope.channel,
+    accountId: envelope.accountId,
+    externalUserId: envelope.externalUserId,
+    externalConversationId: envelope.externalConversationId,
+    externalThreadId: envelope.externalThreadId,
+    externalMessageId: envelope.externalMessageId,
+    externalUpdateId: envelope.externalUpdateId,
+    viventiumSurface: envelope.channel,
+    viventiumInputMode: envelope.inputMode,
+    ...(resolved.spec ? { spec: resolved.spec } : {}),
+  }),
   GenerationJobManager: {
     getJob: (...args) => mockGetJob(...args),
     getResumeState: (...args) => mockGetResumeState(...args),
@@ -156,6 +189,9 @@ jest.mock('~/db/models', () => ({
   ViventiumGatewayIngressEvent: {
     create: (...args) => mockGatewayIngressCreate(...args),
     deleteOne: (...args) => mockGatewayIngressDeleteOne(...args),
+    findOne: (...args) => mockGatewayIngressFindOne(...args),
+    findOneAndUpdate: (...args) => mockGatewayIngressFindOneAndUpdate(...args),
+    updateOne: (...args) => mockGatewayIngressUpdateOne(...args),
   },
   TelegramUserMapping: {
     findOne: (...args) => mockTelegramMappingFindOne(...args),
@@ -359,7 +395,7 @@ describe('/api/viventium/gateway', () => {
     jest.resetModules();
 
     mockSubscribe = jest.fn();
-    mockGetJob = jest.fn().mockResolvedValue({ metadata: { userId: 'user_1' } });
+    mockGetJob = jest.fn().mockResolvedValue({ status: 'running', metadata: { userId: 'user_1' } });
     mockGetResumeState = jest.fn().mockResolvedValue(null);
     mockGetMessages = jest.fn().mockResolvedValue([]);
     mockGetMessage = jest.fn().mockResolvedValue(null);
@@ -373,6 +409,20 @@ describe('/api/viventium/gateway', () => {
     mockGatewayLinkTokenCreate = jest.fn().mockResolvedValue({});
     mockGatewayIngressCreate = jest.fn().mockResolvedValue({ _id: 'ingress_1' });
     mockGatewayIngressDeleteOne = jest.fn().mockResolvedValue({});
+    mockGatewayIngressFindOne = jest.fn().mockReturnValue({
+      lean: async () => ({
+        _id: 'ingress-existing',
+        ownerToken: 'owner-existing',
+        state: 'in_flight',
+        leaseExpiresAt: new Date(Date.now() + 60_000),
+        streamId: 'gateway-discord-existing',
+        conversationId: 'conv-existing',
+        libreChatUserId: 'user_1',
+        bindingVersion: '',
+      }),
+    });
+    mockGatewayIngressFindOneAndUpdate = jest.fn().mockResolvedValue({ _id: 'ingress-existing' });
+    mockGatewayIngressUpdateOne = jest.fn().mockResolvedValue({ matchedCount: 1 });
 
     mockTelegramLinkTokenFindOneAndUpdate = jest.fn().mockResolvedValue(null);
     mockTelegramMappingFindOne = jest
@@ -415,6 +465,35 @@ describe('/api/viventium/gateway', () => {
     await dispatch(app, req, res);
     expect(res.statusCode).toBe(401);
   });
+
+  test.each(['gateway_secrex', 'short'])(
+    'POST rejects a correctly signed request with wrong shared secret %s',
+    async (providedSecret) => {
+      const gatewayRouter = require('../gateway');
+      const app = createTestApp(gatewayRouter);
+      const body = {
+        text: 'hi',
+        conversationId: 'new',
+        channel: 'telegram',
+        externalUserId: 'synthetic-user',
+      };
+      const req = createMockReq({
+        url: '/api/viventium/gateway/chat',
+        headers: signedGatewayHeaders({
+          secret: providedSecret,
+          method: 'POST',
+          path: '/api/viventium/gateway/chat',
+          body,
+        }),
+        body,
+      });
+      const res = createMockRes();
+
+      await dispatch(app, req, res);
+      expect(res.statusCode).toBe(401);
+      expect(res.body).toEqual({ error: 'Unauthorized gateway request' });
+    },
+  );
 
   test('POST rejects invalid signature', async () => {
     const gatewayRouter = require('../gateway');
@@ -537,7 +616,435 @@ describe('/api/viventium/gateway', () => {
 
     expect(secondRes.statusCode).toBe(200);
     expect(secondRes.body.duplicate).toBe(true);
-    expect(secondRes.body.streamId).toBe('');
+    expect(secondRes.body.streamId).toBe('gateway-discord-existing');
+    expect(secondRes.body.conversationId).toBe('conv-existing');
+    expect(lastStreamId).toBeNull();
+  });
+
+  test('POST atomically reclaims a stale ingress whose assigned job disappeared', async () => {
+    const duplicateError = Object.assign(new Error('duplicate key'), { code: 11000 });
+    mockGatewayIngressCreate.mockRejectedValueOnce(duplicateError);
+    mockGatewayIngressFindOne.mockReturnValueOnce({
+      lean: async () => ({
+        _id: 'ingress-stale',
+        ownerToken: 'owner-stale',
+        state: 'in_flight',
+        leaseExpiresAt: new Date(0),
+        streamId: 'gateway-discord-missing',
+        conversationId: 'new',
+        libreChatUserId: 'user_1',
+        bindingVersion: '',
+      }),
+    });
+    mockGetJob.mockResolvedValueOnce(null);
+    const gatewayRouter = require('../gateway');
+    const app = createTestApp(gatewayRouter);
+    const body = {
+      text: 'retry after crash',
+      conversationId: 'new',
+      channel: 'discord',
+      accountId: 'acct-1',
+      externalUserId: 'ext-1',
+      externalChatId: 'chat-1',
+      externalMessageId: 'stale-1',
+    };
+    const req = createMockReq({
+      url: '/api/viventium/gateway/chat',
+      body,
+      headers: signedGatewayHeaders({
+        secret: 'gateway_secret',
+        method: 'POST',
+        path: '/api/viventium/gateway/chat',
+        body,
+      }),
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body.duplicate).not.toBe(true);
+    expect(lastStreamId).toMatch(/^gateway-discord-/);
+    expect(mockGatewayIngressFindOneAndUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({ dedupeKey: expect.any(String), ownerToken: 'owner-stale' }),
+      expect.any(Object),
+      { new: true },
+    );
+  });
+
+  test('POST reclaims a duplicate with an error job', async () => {
+    const duplicateError = Object.assign(new Error('duplicate key'), { code: 11000 });
+    mockGatewayIngressCreate.mockRejectedValueOnce(duplicateError);
+    mockGetJob.mockResolvedValueOnce({ status: 'error', error: 'synthetic failure' });
+    const gatewayRouter = require('../gateway');
+    const app = createTestApp(gatewayRouter);
+    const body = {
+      text: 'retry terminal failure',
+      conversationId: 'new',
+      channel: 'discord',
+      externalUserId: 'ext-1',
+      externalMessageId: 'terminal-error',
+    };
+    const req = createMockReq({
+      url: '/api/viventium/gateway/chat',
+      body,
+      headers: signedGatewayHeaders({
+        secret: 'gateway_secret',
+        method: 'POST',
+        path: '/api/viventium/gateway/chat',
+        body,
+      }),
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.body.duplicate).not.toBe(true);
+    expect(lastStreamId).toMatch(/^gateway-discord-/);
+    expect(mockGatewayIngressFindOneAndUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  test('POST preserves a completed empty job instead of repeating its Agent turn', async () => {
+    const duplicateError = Object.assign(new Error('duplicate key'), { code: 11000 });
+    mockGatewayIngressCreate.mockRejectedValueOnce(duplicateError);
+    mockGetJob.mockResolvedValueOnce({ status: 'complete', finalEvent: { data: {} } });
+    const gatewayRouter = require('../gateway');
+    const app = createTestApp(gatewayRouter);
+    const body = {
+      text: 'same completed event',
+      conversationId: 'new',
+      channel: 'discord',
+      externalUserId: 'ext-1',
+      externalMessageId: 'terminal-empty',
+    };
+    const req = createMockReq({
+      url: '/api/viventium/gateway/chat',
+      body,
+      headers: signedGatewayHeaders({
+        secret: 'gateway_secret',
+        method: 'POST',
+        path: '/api/viventium/gateway/chat',
+        body,
+      }),
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.body).toMatchObject({ duplicate: true, streamId: 'gateway-discord-existing' });
+    expect(lastStreamId).toBeNull();
+    expect(mockGatewayIngressFindOneAndUpdate).not.toHaveBeenCalled();
+  });
+
+  test('POST preserves a legacy terminal-empty reservation instead of repeating its Agent turn', async () => {
+    const duplicateError = Object.assign(new Error('duplicate key'), { code: 11000 });
+    mockGatewayIngressCreate.mockRejectedValueOnce(duplicateError);
+    mockGatewayIngressFindOne.mockReturnValueOnce({
+      lean: async () => ({
+        _id: 'legacy-empty',
+        ownerToken: 'owner-legacy',
+        state: 'failed',
+        failureCode: 'terminal_empty',
+        leaseExpiresAt: new Date(0),
+        streamId: 'gateway-discord-legacy-empty',
+        conversationId: 'conv-empty',
+        libreChatUserId: 'user_1',
+        bindingVersion: '',
+      }),
+    });
+    mockGetJob.mockResolvedValueOnce(null);
+    const gatewayRouter = require('../gateway');
+    const app = createTestApp(gatewayRouter);
+    const body = {
+      text: 'same legacy event',
+      conversationId: 'new',
+      channel: 'discord',
+      externalUserId: 'ext-1',
+      externalMessageId: 'legacy-terminal-empty',
+    };
+    const req = createMockReq({
+      url: '/api/viventium/gateway/chat',
+      body,
+      headers: signedGatewayHeaders({
+        secret: 'gateway_secret',
+        method: 'POST',
+        path: '/api/viventium/gateway/chat',
+        body,
+      }),
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.body).toMatchObject({
+      duplicate: true,
+      streamId: 'gateway-discord-legacy-empty',
+      conversationId: 'conv-empty',
+    });
+    expect(lastStreamId).toBeNull();
+    expect(mockGatewayIngressFindOneAndUpdate).not.toHaveBeenCalled();
+  });
+
+  test('POST replays a completed reservation after job eviction without starting another Agent turn', async () => {
+    const duplicateError = Object.assign(new Error('duplicate key'), { code: 11000 });
+    mockGatewayIngressCreate.mockRejectedValueOnce(duplicateError);
+    mockGatewayIngressFindOne.mockReturnValueOnce({
+      lean: async () => ({
+        _id: 'ingress-complete',
+        ownerToken: 'owner-complete',
+        state: 'completed',
+        leaseExpiresAt: new Date(0),
+        streamId: 'gateway-discord-complete',
+        conversationId: 'conv-complete',
+        finalText: 'persisted answer',
+        libreChatUserId: 'user_1',
+        bindingVersion: '',
+      }),
+    });
+    mockGetJob.mockResolvedValueOnce(null);
+    const gatewayRouter = require('../gateway');
+    const app = createTestApp(gatewayRouter);
+    const body = {
+      text: 'same event',
+      conversationId: 'new',
+      channel: 'discord',
+      externalUserId: 'ext-1',
+      externalMessageId: 'completed-1',
+    };
+    const req = createMockReq({
+      url: '/api/viventium/gateway/chat',
+      body,
+      headers: signedGatewayHeaders({
+        secret: 'gateway_secret',
+        method: 'POST',
+        path: '/api/viventium/gateway/chat',
+        body,
+      }),
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.body).toMatchObject({
+      duplicate: true,
+      streamId: 'gateway-discord-complete',
+      conversationId: 'conv-complete',
+    });
+    expect(lastStreamId).toBeNull();
+    expect(mockGatewayIngressFindOneAndUpdate).not.toHaveBeenCalled();
+  });
+
+  test('POST refuses a persisted completion after the external identity is re-paired', async () => {
+    const duplicateError = Object.assign(new Error('duplicate key'), { code: 11000 });
+    mockGatewayIngressCreate.mockRejectedValueOnce(duplicateError);
+    mockGatewayIngressFindOne.mockReturnValueOnce({
+      lean: async () => ({
+        state: 'completed',
+        leaseExpiresAt: new Date(0),
+        streamId: 'stream-for-user-a',
+        finalText: 'private answer for A',
+        libreChatUserId: 'user_A',
+        bindingVersion: 'binding-A',
+      }),
+    });
+    const gatewayRouter = require('../gateway');
+    const app = createTestApp(gatewayRouter);
+    const body = {
+      text: 'same event',
+      conversationId: 'new',
+      channel: 'discord',
+      externalUserId: 'ext-1',
+      externalMessageId: 'repaired-1',
+    };
+    const req = createMockReq({
+      url: '/api/viventium/gateway/chat',
+      body,
+      headers: signedGatewayHeaders({
+        secret: 'gateway_secret',
+        method: 'POST',
+        path: '/api/viventium/gateway/chat',
+        body,
+      }),
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toEqual({ error: 'channel_binding_changed' });
+    expect(lastStreamId).toBeNull();
+  });
+
+  test('POST fails closed for a legacy duplicate that has no stored user binding', async () => {
+    const duplicateError = Object.assign(new Error('duplicate key'), { code: 11000 });
+    mockGatewayIngressCreate.mockRejectedValueOnce(duplicateError);
+    mockGatewayIngressFindOne.mockReturnValueOnce({
+      lean: async () => ({
+        state: 'completed',
+        streamId: 'legacy-stream',
+        finalText: 'legacy private answer',
+        leaseExpiresAt: new Date(0),
+      }),
+    });
+    const gatewayRouter = require('../gateway');
+    const app = createTestApp(gatewayRouter);
+    const body = {
+      text: 'legacy retry',
+      conversationId: 'new',
+      channel: 'discord',
+      externalUserId: 'ext-1',
+      externalMessageId: 'legacy-ownerless-1',
+    };
+    const req = createMockReq({
+      url: '/api/viventium/gateway/chat',
+      body,
+      headers: signedGatewayHeaders({
+        secret: 'gateway_secret',
+        method: 'POST',
+        path: '/api/viventium/gateway/chat',
+        body,
+      }),
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toEqual({ error: 'channel_binding_changed' });
+    expect(lastStreamId).toBeNull();
+  });
+
+  test('POST does not start an Agent turn after losing stream-assignment ownership', async () => {
+    mockGatewayIngressUpdateOne.mockResolvedValueOnce({ matchedCount: 0 });
+    mockGatewayIngressFindOne.mockReturnValueOnce({
+      lean: async () => ({
+        streamId: 'winner-stream',
+        conversationId: 'winner-conversation',
+        libreChatUserId: 'user_1',
+        bindingVersion: '',
+      }),
+    });
+    const gatewayRouter = require('../gateway');
+    const app = createTestApp(gatewayRouter);
+    const body = {
+      text: 'ownership race',
+      conversationId: 'new',
+      channel: 'discord',
+      externalUserId: 'ext-1',
+      externalMessageId: 'ownership-1',
+    };
+    const req = createMockReq({
+      url: '/api/viventium/gateway/chat',
+      body,
+      headers: signedGatewayHeaders({
+        secret: 'gateway_secret',
+        method: 'POST',
+        path: '/api/viventium/gateway/chat',
+        body,
+      }),
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.body).toEqual({
+      duplicate: true,
+      streamId: 'winner-stream',
+      conversationId: 'winner-conversation',
+    });
+    expect(lastStreamId).toBeNull();
+  });
+
+  test('POST refuses an assignment winner owned by a different channel binding', async () => {
+    mockGatewayIngressUpdateOne.mockResolvedValueOnce({ matchedCount: 0 });
+    mockGatewayIngressFindOne.mockReturnValueOnce({
+      lean: async () => ({
+        streamId: 'winner-for-a',
+        conversationId: 'conversation-for-a',
+        libreChatUserId: 'user_A',
+        bindingVersion: 'binding-A',
+      }),
+    });
+    const gatewayRouter = require('../gateway');
+    const app = createTestApp(gatewayRouter);
+    const body = {
+      text: 'ownership mismatch',
+      conversationId: 'new',
+      channel: 'discord',
+      externalUserId: 'ext-1',
+      externalMessageId: 'ownership-mismatch-1',
+    };
+    const req = createMockReq({
+      url: '/api/viventium/gateway/chat',
+      body,
+      headers: signedGatewayHeaders({
+        secret: 'gateway_secret',
+        method: 'POST',
+        path: '/api/viventium/gateway/chat',
+        body,
+      }),
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toEqual({ error: 'channel_binding_changed' });
+    expect(lastStreamId).toBeNull();
+  });
+
+  test('POST keeps a completion that wins between stale read and reclaim CAS', async () => {
+    const duplicateError = Object.assign(new Error('duplicate key'), { code: 11000 });
+    mockGatewayIngressCreate.mockRejectedValueOnce(duplicateError);
+    mockGetJob.mockResolvedValueOnce(null);
+    mockGatewayIngressFindOne
+      .mockReturnValueOnce({
+        lean: async () => ({
+          ownerToken: 'same-owner',
+          state: 'in_flight',
+          leaseExpiresAt: new Date(0),
+          streamId: 'old-stream',
+          conversationId: 'old-conversation',
+          libreChatUserId: 'user_1',
+          bindingVersion: '',
+        }),
+      })
+      .mockReturnValueOnce({
+        lean: async () => ({
+          ownerToken: 'same-owner',
+          state: 'completed',
+          streamId: 'old-stream',
+          conversationId: 'completed-conversation',
+          finalText: 'completed while reclaiming',
+          libreChatUserId: 'user_1',
+          bindingVersion: '',
+        }),
+      });
+    mockGatewayIngressFindOneAndUpdate.mockResolvedValueOnce(null);
+    const gatewayRouter = require('../gateway');
+    const app = createTestApp(gatewayRouter);
+    const body = {
+      text: 'race',
+      conversationId: 'new',
+      channel: 'discord',
+      externalUserId: 'ext-1',
+      externalMessageId: 'race-1',
+    };
+    const req = createMockReq({
+      url: '/api/viventium/gateway/chat',
+      body,
+      headers: signedGatewayHeaders({
+        secret: 'gateway_secret',
+        method: 'POST',
+        path: '/api/viventium/gateway/chat',
+        body,
+      }),
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.body).toMatchObject({ duplicate: true, conversationId: 'completed-conversation' });
     expect(lastStreamId).toBeNull();
   });
 
@@ -812,6 +1319,216 @@ describe('/api/viventium/gateway', () => {
     expect(writes.some((line) => line.includes('event: attachment'))).toBe(true);
     expect(writes.some((line) => line.includes('event: message'))).toBe(true);
     expect(writes.some((line) => line.includes('event: done'))).toBe(true);
+  });
+
+  test('GET stream persists an error-free empty final as completed terminal state', async () => {
+    mockSubscribe.mockImplementation(async (_streamId, _onChunk, onDone) => {
+      onDone({
+        final: true,
+        responseMessage: { conversationId: 'conv-empty', files: [{ file_id: 'file-1' }] },
+      });
+      return { unsubscribe: jest.fn() };
+    });
+    const gatewayRouter = require('../gateway');
+    const app = createTestApp(gatewayRouter);
+    const query = { channel: 'discord', accountId: 'acct-1', externalUserId: 'ext-1' };
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/gateway/stream/empty-stream?channel=discord&accountId=acct-1&externalUserId=ext-1',
+      query,
+      headers: signedGatewayHeaders({
+        secret: 'gateway_secret',
+        method: 'GET',
+        path: '/api/viventium/gateway/stream/empty-stream',
+        body: {},
+      }),
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(mockGatewayIngressUpdateOne).toHaveBeenCalledWith(
+      { streamId: 'empty-stream' },
+      expect.objectContaining({
+        $set: expect.objectContaining({ state: 'completed', finalText: '' }),
+      }),
+    );
+    const writes = res.write.mock.calls.map((call) => String(call[0] || '')).join('');
+    expect(writes).toContain('"type":"final"');
+    expect(writes).toContain('event: done');
+  });
+
+  test('GET stream replays a persisted empty completion after job eviction', async () => {
+    mockGetJob.mockResolvedValueOnce(null);
+    mockGatewayIngressFindOne.mockReturnValueOnce({
+      lean: async () => ({
+        state: 'completed',
+        finalText: '',
+        responseConversationId: 'conv-empty',
+        libreChatUserId: 'user_1',
+        bindingVersion: '',
+      }),
+    });
+    const gatewayRouter = require('../gateway');
+    const app = createTestApp(gatewayRouter);
+    const query = { channel: 'discord', accountId: 'acct-1', externalUserId: 'ext-1' };
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/gateway/stream/empty-replay?channel=discord&accountId=acct-1&externalUserId=ext-1',
+      query,
+      headers: signedGatewayHeaders({
+        secret: 'gateway_secret',
+        method: 'GET',
+        path: '/api/viventium/gateway/stream/empty-replay',
+        body: {},
+      }),
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    const writes = res.write.mock.calls.map((call) => String(call[0] || '')).join('');
+    expect(writes).toContain('"type":"final"');
+    expect(writes).toContain('event: done');
+    expect(mockSubscribe).not.toHaveBeenCalled();
+  });
+
+  test('GET stream replays a legacy terminal-empty completion after job eviction', async () => {
+    mockGetJob.mockResolvedValueOnce(null);
+    mockGatewayIngressFindOne.mockReturnValueOnce({
+      lean: async () => ({
+        state: 'failed',
+        failureCode: 'terminal_empty',
+        finalText: null,
+        responseConversationId: 'conv-empty',
+        libreChatUserId: 'user_1',
+        bindingVersion: '',
+      }),
+    });
+    const gatewayRouter = require('../gateway');
+    const app = createTestApp(gatewayRouter);
+    const query = { channel: 'discord', accountId: 'acct-1', externalUserId: 'ext-1' };
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/gateway/stream/legacy-empty?channel=discord&accountId=acct-1&externalUserId=ext-1',
+      query,
+      headers: signedGatewayHeaders({
+        secret: 'gateway_secret',
+        method: 'GET',
+        path: '/api/viventium/gateway/stream/legacy-empty',
+        body: {},
+      }),
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    const writes = res.write.mock.calls.map((call) => String(call[0] || '')).join('');
+    expect(writes).toContain('"type":"final"');
+    expect(writes).toContain('event: done');
+    expect(mockSubscribe).not.toHaveBeenCalled();
+  });
+
+  test('GET stream replays a persisted completion after the generation job is evicted', async () => {
+    mockGetJob.mockResolvedValueOnce(null);
+    mockGatewayIngressFindOne.mockReturnValueOnce({
+      lean: async () => ({
+        state: 'completed',
+        finalText: 'persisted final answer',
+        responseMessageId: 'msg-final',
+        responseConversationId: 'conv-final',
+        libreChatUserId: 'user_1',
+        bindingVersion: '',
+      }),
+    });
+    const gatewayRouter = require('../gateway');
+    const app = createTestApp(gatewayRouter);
+    const query = { channel: 'discord', accountId: 'acct-1', externalUserId: 'ext-1' };
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/gateway/stream/completed-stream?channel=discord&accountId=acct-1&externalUserId=ext-1',
+      query,
+      headers: signedGatewayHeaders({
+        secret: 'gateway_secret',
+        method: 'GET',
+        path: '/api/viventium/gateway/stream/completed-stream',
+        body: {},
+      }),
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    const writes = res.write.mock.calls.map((call) => String(call[0] || '')).join('');
+    expect(writes).toContain('persisted final answer');
+    expect(writes).toContain('event: done');
+    expect(mockSubscribe).not.toHaveBeenCalled();
+  });
+
+  test('GET stream refuses a persisted completion without the current user binding', async () => {
+    mockGetJob.mockResolvedValueOnce(null);
+    mockGatewayIngressFindOne.mockReturnValueOnce({
+      lean: async () => ({
+        state: 'completed',
+        finalText: 'legacy private answer',
+        responseConversationId: 'conv-private',
+      }),
+    });
+    const gatewayRouter = require('../gateway');
+    const app = createTestApp(gatewayRouter);
+    const query = { channel: 'discord', accountId: 'acct-1', externalUserId: 'ext-1' };
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/gateway/stream/legacy-stream?channel=discord&accountId=acct-1&externalUserId=ext-1',
+      query,
+      headers: signedGatewayHeaders({
+        secret: 'gateway_secret',
+        method: 'GET',
+        path: '/api/viventium/gateway/stream/legacy-stream',
+        body: {},
+      }),
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toEqual({ error: 'channel_binding_changed' });
+    expect(res.write).not.toHaveBeenCalled();
+    expect(mockSubscribe).not.toHaveBeenCalled();
+  });
+
+  test('GET missing stream releases the durable reservation for the next retry', async () => {
+    mockGetJob.mockResolvedValueOnce(null);
+    mockGatewayIngressFindOne.mockReturnValueOnce({ lean: async () => null });
+    const gatewayRouter = require('../gateway');
+    const app = createTestApp(gatewayRouter);
+    const query = { channel: 'discord', accountId: 'acct-1', externalUserId: 'ext-1' };
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/gateway/stream/missing-stream?channel=discord&accountId=acct-1&externalUserId=ext-1',
+      query,
+      headers: signedGatewayHeaders({
+        secret: 'gateway_secret',
+        method: 'GET',
+        path: '/api/viventium/gateway/stream/missing-stream',
+        body: {},
+      }),
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(404);
+    expect(mockGatewayIngressUpdateOne).toHaveBeenCalledWith(
+      { streamId: 'missing-stream' },
+      expect.objectContaining({
+        $set: expect.objectContaining({ state: 'failed', failureCode: 'job_missing' }),
+      }),
+    );
   });
 
   test('does not subscribe when the client closes during resume lookup', async () => {

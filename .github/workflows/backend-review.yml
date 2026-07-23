@@ -176,7 +176,11 @@ jobs:
       BAN_DURATION: ${{ secrets.BAN_DURATION }}
       BAN_INTERVAL: ${{ secrets.BAN_INTERVAL }}
     steps:
+      # VIVENTIUM START — the API suite verifies every published managed-agent predecessor.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # VIVENTIUM END
 
       # VIVENTIUM START — exact release toolchain.
       - name: Use Node.js 24.16.0

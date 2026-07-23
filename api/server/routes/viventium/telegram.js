@@ -20,7 +20,11 @@ const path = require('path');
 const { performance } = require('perf_hooks');
 const mime = require('mime');
 const { Readable } = require('stream');
-const { GenerationJobManager } = require('@librechat/api');
+const {
+  GenerationJobManager,
+  normalizeChannelEnvelope,
+  buildChannelAgentRequest,
+} = require('@librechat/api');
 const { EnvVar } = require('@librechat/agents');
 const { logger } = require('@librechat/data-schemas');
 const {
@@ -1079,21 +1083,40 @@ router.post(
       : [];
     const allFormattedImages = [...formattedImages, ...extractedDocumentImages];
     const hasImages = allFormattedImages.length > 0;
-    const { files: _unusedFiles, iconURL: _unusedIconURL, ...safeIncoming } = incoming;
-
-    req.body = {
-      ...safeIncoming,
+    const channelEnvelope = normalizeChannelEnvelope({
+      channel: 'telegram',
+      accountId: 'default',
+      externalUserId: telegramUserId,
+      externalUsername:
+        typeof incoming.telegramUsername === 'string' ? incoming.telegramUsername : '',
+      externalConversationId: telegramChatId || telegramUserId,
+      externalThreadId: normalizeIngressId(incoming.telegramMessageThreadId),
+      externalMessageId: telegramMessageId,
+      externalUpdateId: telegramUpdateId,
+      inputMode:
+        typeof incoming.viventiumInputMode === 'string' ? incoming.viventiumInputMode : 'text',
+      audioRequested: telegramAudioRequested === true,
       text,
-      endpoint: 'agents',
-      endpointType: 'agents',
-      conversationId,
-      parentMessageId,
-      agent_id: agentId,
-      streamId,
-      files: uploadedFiles,
-    };
-    if (resolvedSpec) {
-      req.body.spec = resolvedSpec;
+    });
+    req.body = buildChannelAgentRequest({
+      envelope: channelEnvelope,
+      resolved: {
+        agentId,
+        conversationId,
+        parentMessageId,
+        streamId,
+        files: uploadedFiles,
+        spec: resolvedSpec,
+      },
+    });
+    req.body.telegramUserId = telegramUserId;
+    req.body.telegramChatId = telegramChatId;
+    req.body.telegramMessageId = telegramMessageId;
+    req.body.telegramUpdateId = telegramUpdateId;
+    for (const field of ['clientTimestamp', 'clientTimezone']) {
+      if (typeof incoming[field] === 'string' || typeof incoming[field] === 'number') {
+        req.body[field] = incoming[field];
+      }
     }
     if (traceId) {
       req.body.traceId = traceId;

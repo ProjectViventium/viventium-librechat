@@ -246,6 +246,16 @@ if (cluster.isMaster) {
 
     /** Middleware */
     app.use(noIndex);
+    /* === VIVENTIUM START ===
+     * Feature: Official WhatsApp Cloud API callback.
+     * Purpose: Preserve exact request bytes for Meta HMAC verification before JSON parsing.
+     */
+    app.use(
+      '/api/viventium/channels/whatsapp/webhook',
+      express.raw({ type: 'application/json', limit: '1mb' }),
+      routes.viventiumChannelsWebhook,
+    );
+    /* === VIVENTIUM END === */
     app.use(express.json({ limit: '3mb' }));
     app.use(express.urlencoded({ extended: true, limit: '3mb' }));
 
@@ -325,6 +335,7 @@ if (cluster.isMaster) {
     app.use('/api/permissions', routes.accessPermissions);
     app.use('/api/tags', routes.tags);
     app.use('/api/mcp', routes.mcp);
+    app.use('/api/viventium', routes.viventium);
 
     /** 404 for unmatched API routes */
     app.use('/api', apiNotFound);
@@ -364,6 +375,13 @@ if (cluster.isMaster) {
       /** Initialize MCP servers and OAuth reconnection for this worker */
       await initializeMCPs();
       await initializeOAuthReconnectManager();
+      /* === VIVENTIUM START ===
+       * Feature: Connected channel restart recovery in clustered development mode.
+       * Purpose: Let every worker reconcile while Mongo leases elect exactly one provider consumer.
+       */
+      const { restoreChannelWorkers } = require('./services/viventium/channelAdminService');
+      await restoreChannelWorkers();
+      /* === VIVENTIUM END === */
       await checkMigrations();
       recoverStaleCortexMessages().catch((error) => {
         logger.error('[staleCortexMessageRecovery] Startup recovery failed:', error);

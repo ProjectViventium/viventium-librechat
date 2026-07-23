@@ -28,6 +28,9 @@ export * from './types/queries';
 export * from './types/runs';
 export * from './types/web';
 export * from './types/graph';
+/* === VIVENTIUM START === Connected Channels === */
+export * from './types/connectedChannels';
+/* === VIVENTIUM END === */
 /* access permissions */
 export * from './accessPermissions';
 /* query/mutation keys */

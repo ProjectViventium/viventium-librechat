@@ -17,3 +17,6 @@ export * from './tags';
 export * from './MCP';
 export * from './SSE';
 export * from './Feelings';
+/* === VIVENTIUM START === Connected Channels === */
+export * from './ConnectedChannels';
+/* === VIVENTIUM END === */

@@ -26,10 +26,16 @@ export default async function cleanupUser(user: TUser) {
     console.log('🤖:  ✅  Found user in Database');
 
     // Delete all conversations & associated messages
-    const { deletedCount, messages } = await deleteConvos(userId, {});
-
-    if (messages.deletedCount > 0 || deletedCount > 0) {
-      console.log(`🤖:  ✅  Deleted ${deletedCount} convos & ${messages.deletedCount} messages`);
+    try {
+      const { deletedCount, messages } = await deleteConvos(userId, {});
+      if (messages.deletedCount > 0 || deletedCount > 0) {
+        console.log(`🤖:  ✅  Deleted ${deletedCount} convos & ${messages.deletedCount} messages`);
+      }
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.includes('Conversation not found')) {
+        throw error;
+      }
+      console.log('🤖:  ✅  No conversations needed cleanup');
     }
 
     // Ensure all user messages are deleted

@@ -1,0 +1,22 @@
+version: 1.3.6
+cache: false
+interface:
+  customWelcome: Welcome to Viventium QA
+  endpointsMenu: true
+  modelSelect: true
+  parameters: true
+  sidePanel: true
+  presets: true
+  prompts:
+    use: true
+    create: true
+    share: false
+    public: false
+  agents:
+    use: true
+    create: true
+    share: false
+    public: false
+endpoints:
+  agents:
+    disableBuilder: false

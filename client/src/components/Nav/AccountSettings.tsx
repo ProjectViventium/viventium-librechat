@@ -1,6 +1,8 @@
 import { useState, memo, useRef, useCallback, useEffect } from 'react';
 import * as Select from '@ariakit/react/select';
-import { FileText, FlaskConical, HeartPulse, LogOut, Plug2 } from 'lucide-react';
+/* === VIVENTIUM START === Connected Channels shortcut icon. === */
+import { FileText, FlaskConical, HeartPulse, LogOut, Plug2, RadioTower } from 'lucide-react';
+/* === VIVENTIUM END === */
 import { useLocation, useNavigate } from 'react-router-dom';
 import { SettingsTabValues, SystemRoles, apiBaseUrl, request } from 'librechat-data-provider';
 import {
@@ -37,6 +39,7 @@ type PromptWorkbenchStartResponse = {
  */
 const ACCOUNT_ACTION_VALUES = {
   connectedAccounts: 'connected-accounts',
+  connectedChannels: 'connected-channels',
   feelings: 'feelings',
   files: 'files',
   help: 'help',
@@ -247,6 +250,18 @@ function AccountSettings() {
             {localize('com_nav_connected_accounts')}
           </Select.SelectItem>
         )}
+        {/* === VIVENTIUM START ===
+         * Feature: Connected Channels shortcut.
+         * Purpose: Put Telegram, Slack, and WhatsApp onboarding one click from the account menu.
+         * === VIVENTIUM END === */}
+        <Select.SelectItem
+          value={ACCOUNT_ACTION_VALUES.connectedChannels}
+          onClick={() => openSettings(SettingsTabValues.CHANNELS)}
+          className="select-item text-sm"
+        >
+          <RadioTower className="icon-md" aria-hidden="true" />
+          {localize('com_nav_connected_channels')}
+        </Select.SelectItem>
         {feelingsAvailable && (
           <Select.SelectItem
             value={ACCOUNT_ACTION_VALUES.feelings}

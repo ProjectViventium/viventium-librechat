@@ -19,5 +19,15 @@ describe('Viventium backend review workflow', () => {
       'run: cd packages/data-schemas && npm run test:ci -- --runInBand',
     );
   });
+
+  test('fetches complete history for the managed-agent predecessor audit', () => {
+    const workflow = fs.readFileSync(
+      path.resolve(__dirname, '../../../.github/workflows/backend-review.yml'),
+      'utf8',
+    );
+    const apiJob = workflow.match(/test-api:[\s\S]*?(?=\n {2}test-data-provider:)/)?.[0];
+
+    expect(apiJob).toMatch(/uses: actions\/checkout@v4\n\s+with:\n\s+fetch-depth: 0/);
+  });
 });
 /* === VIVENTIUM END === */

@@ -1,7 +1,9 @@
 import React, { useState, useRef, useEffect } from 'react';
 import * as Tabs from '@radix-ui/react-tabs';
 import { SettingsTabValues } from 'librechat-data-provider';
-import { MessageSquare, Command, DollarSign } from 'lucide-react';
+/* === VIVENTIUM START === First-class Connected Channels icon. === */
+import { MessageSquare, Command, DollarSign, RadioTower } from 'lucide-react';
+/* === VIVENTIUM END === */
 import { Dialog, DialogPanel, DialogTitle, Transition, TransitionChild } from '@headlessui/react';
 import {
   GearIcon,
@@ -22,6 +24,9 @@ import {
   Balance,
   Account,
 } from './SettingsTabs';
+/* === VIVENTIUM START === First-class Connected Channels settings content. === */
+import ConnectedChannels from './SettingsTabs/Account/ConnectedChannels';
+/* === VIVENTIUM END === */
 import usePersonalizationAccess from '~/hooks/usePersonalizationAccess';
 import { useLocalize, TranslationKeys } from '~/hooks';
 import { useGetStartupConfig } from '~/data-provider';
@@ -40,7 +45,7 @@ export default function Settings({
   const { data: startupConfig } = useGetStartupConfig();
   const localize = useLocalize();
   const [activeTab, setActiveTab] = useState(initialTab);
-  const tabRefs = useRef({});
+  const tabRefs = useRef<Partial<Record<SettingsTabValues, HTMLButtonElement | null>>>({});
   const { hasAnyPersonalizationFeature, hasMemoryOptOut } = usePersonalizationAccess();
 
   /* === VIVENTIUM START ===
@@ -62,26 +67,38 @@ export default function Settings({
       ...(hasAnyPersonalizationFeature ? [SettingsTabValues.PERSONALIZATION] : []),
       SettingsTabValues.DATA,
       ...(startupConfig?.balance?.enabled ? [SettingsTabValues.BALANCE] : []),
+      /* === VIVENTIUM START === First-class Connected Channels keyboard navigation. === */
+      SettingsTabValues.CHANNELS,
+      /* === VIVENTIUM END === */
       SettingsTabValues.ACCOUNT,
     ];
     const currentIndex = tabs.indexOf(activeTab);
+    const activateTab = (tab: SettingsTabValues) => {
+      setActiveTab(tab);
+      tabRefs.current[tab]?.focus();
+    };
+    const nextKey = isSmallScreen ? 'ArrowRight' : 'ArrowDown';
+    const previousKey = isSmallScreen ? 'ArrowLeft' : 'ArrowUp';
+
+    if (event.key === nextKey) {
+      event.preventDefault();
+      activateTab(tabs[(currentIndex + 1) % tabs.length]);
+      return;
+    }
+    if (event.key === previousKey) {
+      event.preventDefault();
+      activateTab(tabs[(currentIndex - 1 + tabs.length) % tabs.length]);
+      return;
+    }
 
     switch (event.key) {
-      case 'ArrowDown':
-        event.preventDefault();
-        setActiveTab(tabs[(currentIndex + 1) % tabs.length]);
-        break;
-      case 'ArrowUp':
-        event.preventDefault();
-        setActiveTab(tabs[(currentIndex - 1 + tabs.length) % tabs.length]);
-        break;
       case 'Home':
         event.preventDefault();
-        setActiveTab(tabs[0]);
+        activateTab(tabs[0]);
         break;
       case 'End':
         event.preventDefault();
-        setActiveTab(tabs[tabs.length - 1]);
+        activateTab(tabs[tabs.length - 1]);
         break;
     }
   };
@@ -134,6 +151,15 @@ export default function Settings({
           },
         ]
       : ([] as { value: SettingsTabValues; icon: React.JSX.Element; label: TranslationKeys }[])),
+    /* === VIVENTIUM START ===
+     * Feature: First-class Connected Channels settings.
+     * Purpose: Make Telegram, Slack, and WhatsApp discoverable as a direct settings tab.
+     * === VIVENTIUM END === */
+    {
+      value: SettingsTabValues.CHANNELS,
+      icon: <RadioTower className="icon-sm" aria-hidden="true" />,
+      label: 'com_nav_setting_channels',
+    },
     {
       value: SettingsTabValues.ACCOUNT,
       icon: <UserIcon />,
@@ -208,7 +234,7 @@ export default function Settings({
                   value={activeTab}
                   onValueChange={handleTabChange}
                   className="flex flex-col gap-10 md:flex-row"
-                  orientation="vertical"
+                  orientation={isSmallScreen ? 'horizontal' : 'vertical'}
                 >
                   <Tabs.List
                     aria-label="Settings"
@@ -230,7 +256,9 @@ export default function Settings({
                             : 'bg-transparent text-text-secondary radix-state-active:bg-surface-tertiary radix-state-active:text-text-primary',
                         )}
                         value={value}
-                        ref={(el) => (tabRefs.current[value] = el)}
+                        ref={(element) => {
+                          tabRefs.current[value] = element;
+                        }}
                       >
                         {icon}
                         {localize(label)}
@@ -266,6 +294,11 @@ export default function Settings({
                         <Balance />
                       </Tabs.Content>
                     )}
+                    {/* === VIVENTIUM START === First-class Connected Channels content. === */}
+                    <Tabs.Content value={SettingsTabValues.CHANNELS} tabIndex={-1}>
+                      <ConnectedChannels />
+                    </Tabs.Content>
+                    {/* === VIVENTIUM END === */}
                     <Tabs.Content value={SettingsTabValues.ACCOUNT} tabIndex={-1}>
                       <Account />
                     </Tabs.Content>

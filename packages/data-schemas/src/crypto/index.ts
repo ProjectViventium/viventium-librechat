@@ -114,6 +114,72 @@ export async function decryptV2(encryptedValue: string): Promise<string> {
 /** --- v3: AES-256-CTR using Node's crypto functions --- */
 const algorithm_v3 = 'aes-256-ctr';
 
+/** Viventium channel credentials use an authenticated, domain-separated envelope. */
+const CHANNEL_CREDENTIAL_PREFIX = 'v4gcm';
+const CHANNEL_CREDENTIAL_AAD = Buffer.from('viventium:channel-credentials:v4', 'utf8');
+
+function getChannelCredentialKey(): Buffer {
+  const rootKey = Buffer.from(process.env.CREDS_KEY ?? '', 'hex');
+  if (rootKey.length !== 32) {
+    throw new Error('Channel credential encryption is unavailable');
+  }
+  return Buffer.from(
+    crypto.hkdfSync(
+      'sha256',
+      rootKey,
+      Buffer.from('viventium:channel-credentials:salt:v4', 'utf8'),
+      Buffer.from('viventium:channel-credentials:key:v4', 'utf8'),
+      32,
+    ),
+  );
+}
+
+export function isChannelCredentialV4(value: string): boolean {
+  return typeof value === 'string' && value.startsWith(`${CHANNEL_CREDENTIAL_PREFIX}:`);
+}
+
+export async function encryptChannelCredentialsV4(value: string): Promise<string> {
+  const nonce = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', getChannelCredentialKey(), nonce);
+  cipher.setAAD(CHANNEL_CREDENTIAL_AAD);
+  const ciphertext = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return [
+    CHANNEL_CREDENTIAL_PREFIX,
+    nonce.toString('hex'),
+    ciphertext.toString('hex'),
+    tag.toString('hex'),
+  ].join(':');
+}
+
+export async function decryptChannelCredentialsV4(value: string): Promise<string> {
+  const parts = value.split(':');
+  if (
+    parts.length !== 4 ||
+    parts[0] !== CHANNEL_CREDENTIAL_PREFIX ||
+    !/^[a-f0-9]{24}$/i.test(parts[1]) ||
+    !/^(?:[a-f0-9]{2})+$/i.test(parts[2]) ||
+    !/^[a-f0-9]{32}$/i.test(parts[3])
+  ) {
+    throw new Error('Channel credentials could not be authenticated');
+  }
+  try {
+    const decipher = crypto.createDecipheriv(
+      'aes-256-gcm',
+      getChannelCredentialKey(),
+      Buffer.from(parts[1], 'hex'),
+    );
+    decipher.setAAD(CHANNEL_CREDENTIAL_AAD);
+    decipher.setAuthTag(Buffer.from(parts[3], 'hex'));
+    return Buffer.concat([
+      decipher.update(Buffer.from(parts[2], 'hex')),
+      decipher.final(),
+    ]).toString('utf8');
+  } catch {
+    throw new Error('Channel credentials could not be authenticated');
+  }
+}
+
 /**
  * Encrypts a value using AES-256-CTR.
  * Note: AES-256 requires a 32-byte key. Ensure that process.env.CREDS_KEY is a 64-character hex string.

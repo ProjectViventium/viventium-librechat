@@ -37,7 +37,7 @@ async function authenticate(config: FullConfig, user: User) {
   console.log('🤖: global setup has been started');
   const { baseURL, storageState } = config.projects[0].use;
   console.log('🤖: using baseURL', baseURL);
-  console.dir(user, { depth: null });
+  console.log('🤖: using synthetic E2E account:', user.email);
   const browser = await chromium.launch({
     headless: false,
   });

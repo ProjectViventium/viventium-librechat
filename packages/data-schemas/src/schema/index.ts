@@ -26,3 +26,15 @@ export { default as userSchema } from './user';
 export { default as memorySchema } from './memory';
 export { default as feelingStateSchema } from './feelingState';
 export { default as groupSchema } from './group';
+/* === VIVENTIUM START === Channel-neutral messaging === */
+export { default as channelConnectionSchema } from './channelConnection';
+export { default as channelThreadSchema } from './channelThread';
+export { default as gatewayUserMappingSchema } from './gatewayUserMapping';
+export { default as gatewayLinkTokenSchema } from './gatewayLinkToken';
+export { default as viventiumGatewayIngressEventSchema } from './viventiumGatewayIngressEvent';
+export { default as channelPairingCodeSchema } from './channelPairingCode';
+export { default as channelPairingAttemptSchema } from './channelPairingAttempt';
+export { default as channelWorkerLeaseSchema } from './channelWorkerLease';
+export { default as channelDeliverySchema } from './channelDelivery';
+export { default as channelIngressQuotaSchema } from './channelIngressQuota';
+/* === VIVENTIUM END === */

@@ -415,6 +415,20 @@ export const feelingBand = (bandId: string) => `${feelings()}/bands/${encodeURIC
 export const resetFeelings = () => `${feelings()}/reset`;
 /* === VIVENTIUM END === */
 
+/* === VIVENTIUM START === Connected Channels === */
+export const connectedChannels = () => `${BASE_URL}/api/viventium/channels`;
+export const connectedChannelAvailability = () => `${connectedChannels()}/availability`;
+export const connectedChannel = (channel: string) =>
+  `${connectedChannels()}/${encodeURIComponent(channel)}`;
+export const connectConnectedChannel = (channel: string) => `${connectedChannel(channel)}/connect`;
+export const testConnectedChannel = (channel: string) => `${connectedChannel(channel)}/test`;
+export const disconnectConnectedChannel = (channel: string) =>
+  `${connectedChannel(channel)}/disconnect`;
+export const connectedChannelPairingCode = (channel: string) =>
+  `${connectedChannel(channel)}/pairing-code`;
+export const slackChannelManifest = () => `${connectedChannel('slack')}/manifest`;
+/* === VIVENTIUM END === */
+
 export const searchPrincipals = (params: q.PrincipalSearchParams) => {
   const { q: query, limit, types } = params;
   let url = `${BASE_URL}/api/permissions/search-principals?q=${encodeURIComponent(query)}`;

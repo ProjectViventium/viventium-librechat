@@ -28,6 +28,20 @@ import { createFeelingStateModel } from './feelingState';
 import { createAccessRoleModel } from './accessRole';
 import { createAclEntryModel } from './aclEntry';
 import { createGroupModel } from './group';
+/* === VIVENTIUM START ===
+ * Feature: Channel-neutral messaging persistence.
+ * Purpose: Export typed models while preserving legacy Gateway model names/collections.
+ * === VIVENTIUM END === */
+import { createChannelConnectionModel } from './channelConnection';
+import { createChannelThreadModel } from './channelThread';
+import { createGatewayUserMappingModel } from './gatewayUserMapping';
+import { createGatewayLinkTokenModel } from './gatewayLinkToken';
+import { createViventiumGatewayIngressEventModel } from './viventiumGatewayIngressEvent';
+import { createChannelPairingCodeModel } from './channelPairingCode';
+import { createChannelPairingAttemptModel } from './channelPairingAttempt';
+import { createChannelWorkerLeaseModel } from './channelWorkerLease';
+import { createChannelDeliveryModel } from './channelDelivery';
+import { createChannelIngressQuotaModel } from './channelIngressQuota';
 
 /**
  * Creates all database models for all collections
@@ -64,5 +78,15 @@ export function createModels(mongoose: typeof import('mongoose')) {
     AccessRole: createAccessRoleModel(mongoose),
     AclEntry: createAclEntryModel(mongoose),
     Group: createGroupModel(mongoose),
+    ChannelConnection: createChannelConnectionModel(mongoose),
+    ChannelThread: createChannelThreadModel(mongoose),
+    GatewayUserMapping: createGatewayUserMappingModel(mongoose),
+    GatewayLinkToken: createGatewayLinkTokenModel(mongoose),
+    ViventiumGatewayIngressEvent: createViventiumGatewayIngressEventModel(mongoose),
+    ChannelPairingCode: createChannelPairingCodeModel(mongoose),
+    ChannelPairingAttempt: createChannelPairingAttemptModel(mongoose),
+    ChannelWorkerLease: createChannelWorkerLeaseModel(mongoose),
+    ChannelDelivery: createChannelDeliveryModel(mongoose),
+    ChannelIngressQuota: createChannelIngressQuotaModel(mongoose),
   };
 }

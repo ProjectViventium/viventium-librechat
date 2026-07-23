@@ -564,9 +564,13 @@ function buildCanonicalPersistedAgentFields(
     patch.model_parameters = patch.model
       ? {
           ...canonicalBuiltInParameters,
+          ...incomingModelParameters,
           model: patch.model,
         }
-      : canonicalBuiltInParameters;
+      : {
+          ...canonicalBuiltInParameters,
+          ...incomingModelParameters,
+        };
   } else {
     const mergedModelParameters = {
       ...(runtimeManagedBuiltIn || runtimeFamilyChanged ? {} : existingModelParameters),

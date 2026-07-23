@@ -6,3 +6,8 @@ export { default as General } from './General/General';
 export { default as Account } from './Account/Account';
 export { default as Commands } from './Commands/Commands';
 export { default as Personalization } from './Personalization';
+/* === VIVENTIUM START ===
+ * Feature: First-class Connected Channels settings.
+ * Purpose: Export the guided messaging connection surface as its own settings destination.
+ * === VIVENTIUM END === */
+export { default as ConnectedChannels } from './Account/ConnectedChannels';

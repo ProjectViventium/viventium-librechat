@@ -155,6 +155,36 @@ jest.mock('~/models/Agent', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  normalizeChannelEnvelope: (input) => ({
+    externalUsername: '',
+    externalThreadId: '',
+    externalMessageId: '',
+    externalUpdateId: '',
+    inputMode: 'text',
+    audioRequested: false,
+    attachments: [],
+    ...input,
+  }),
+  buildChannelAgentRequest: ({ envelope, resolved }) => ({
+    text: envelope.text,
+    endpoint: 'agents',
+    endpointType: 'agents',
+    conversationId: resolved.conversationId,
+    parentMessageId: resolved.parentMessageId,
+    agent_id: resolved.agentId,
+    streamId: resolved.streamId,
+    files: resolved.files || [],
+    channel: envelope.channel,
+    accountId: envelope.accountId,
+    externalUserId: envelope.externalUserId,
+    externalConversationId: envelope.externalConversationId,
+    externalThreadId: envelope.externalThreadId,
+    externalMessageId: envelope.externalMessageId,
+    externalUpdateId: envelope.externalUpdateId,
+    viventiumSurface: envelope.channel,
+    viventiumInputMode: envelope.inputMode,
+    ...(resolved.spec ? { spec: resolved.spec } : {}),
+  }),
   GenerationJobManager: {
     getJob: (...args) => mockGetJob(...args),
     getResumeState: (...args) => mockGetResumeState(...args),

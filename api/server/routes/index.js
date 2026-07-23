@@ -32,6 +32,11 @@ const mcp = require('./mcp');
 const connectedAccounts = require('./connectedAccounts');
 // === VIVENTIUM START - Voice Call Routes ===
 const viventium = require('./viventium');
+/* === VIVENTIUM START ===
+ * Feature: Official WhatsApp Cloud API callback.
+ * Purpose: Export a dedicated raw-body route mounted before the global JSON parser.
+ * === VIVENTIUM END === */
+const viventiumChannelsWebhook = require('./viventium/channelsWebhook');
 // === VIVENTIUM END ===
 
 module.exports = {
@@ -66,5 +71,6 @@ module.exports = {
   accessPermissions,
   // === VIVENTIUM START ===
   viventium,
+  viventiumChannelsWebhook,
   // === VIVENTIUM END ===
 };

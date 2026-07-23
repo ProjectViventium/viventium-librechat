@@ -24,7 +24,11 @@ const os = require('os');
 const path = require('path');
 const mime = require('mime');
 const { Readable } = require('stream');
-const { GenerationJobManager } = require('@librechat/api');
+const {
+  GenerationJobManager,
+  normalizeChannelEnvelope,
+  buildChannelAgentRequest,
+} = require('@librechat/api');
 const { EnvVar } = require('@librechat/agents');
 const { logger } = require('@librechat/data-schemas');
 const {
@@ -78,12 +82,14 @@ const {
   parseBoolEnv,
   parseIntEnv,
   getGatewaySecret,
+  timingSafeTextEqual,
   verifyGatewayRequestSignature,
 } = require('~/server/services/viventium/gateway/security');
 const {
   extractTextDeltas,
   extractFinalResponseText,
   extractResponseMessageId,
+  extractResponseConversationId,
   extractAttachments,
   extractFinalError,
 } = require('~/server/services/viventium/gateway/streamExtractors');
@@ -93,6 +99,7 @@ const router = express.Router();
 
 const GATEWAY_FILE_UPLOAD_ENABLED = parseBoolEnv('VIVENTIUM_GATEWAY_FILE_UPLOAD_ENABLED', true);
 const GATEWAY_MAX_FILE_BYTES = parseIntEnv('VIVENTIUM_GATEWAY_MAX_FILE_SIZE', 10485760);
+const GATEWAY_INGRESS_LEASE_MS = parseIntEnv('VIVENTIUM_GATEWAY_INGRESS_LEASE_MS', 120000);
 const GATEWAY_INGRESS_DEDUPE_ENABLED = parseBoolEnv(
   'VIVENTIUM_GATEWAY_INGRESS_DEDUPE_ENABLED',
   true,
@@ -129,13 +136,20 @@ function extractGatewayIdentity(req) {
 
 async function resolveGatewayUserId({ channel, accountId, externalUserId }) {
   if (!channel || !externalUserId) {
-    return { userId: '', source: 'missing' };
+    return { userId: '', source: 'missing', bindingVersion: '' };
   }
   const mapping = await resolveGatewayMapping({ channel, accountId, externalUserId });
   if (!mapping?.libreChatUserId) {
-    return { userId: '', source: 'unlinked' };
+    return { userId: '', source: 'unlinked', bindingVersion: '' };
   }
-  return { userId: mapping.libreChatUserId.toString(), source: 'mapping' };
+  return {
+    userId: mapping.libreChatUserId.toString(),
+    source: 'mapping',
+    bindingVersion:
+      mapping.linkedAt instanceof Date
+        ? mapping.linkedAt.toISOString()
+        : String(mapping.linkedAt || ''),
+  };
 }
 
 async function issueGatewayLink(req, identity) {
@@ -160,6 +174,13 @@ function normalizeIngressId(value) {
 
 function isMongoDuplicateKeyError(error) {
   return Boolean(error) && Number(error.code) === 11000;
+}
+
+function isPersistedTerminalCompletion(record) {
+  return (
+    record?.state === 'completed' ||
+    (record?.state === 'failed' && record?.failureCode === 'terminal_empty')
+  );
 }
 
 function dedupeKeyFromIngress({
@@ -191,6 +212,8 @@ async function reserveGatewayIngress({
   externalThreadId,
   conversationId,
   traceId,
+  libreChatUserId,
+  bindingVersion,
 }) {
   if (!GATEWAY_INGRESS_DEDUPE_ENABLED) {
     return { duplicate: false };
@@ -210,25 +233,105 @@ async function reserveGatewayIngress({
     return { duplicate: false };
   }
 
-  const expiresAt = new Date(Date.now() + GATEWAY_INGRESS_DEDUPE_TTL_S * 1000);
+  const now = Date.now();
+  const expiresAt = new Date(now + GATEWAY_INGRESS_DEDUPE_TTL_S * 1000);
+  const leaseExpiresAt = new Date(now + GATEWAY_INGRESS_LEASE_MS);
+  const ownerToken = crypto.randomUUID();
+  const reservationFields = {
+    channel,
+    accountId,
+    externalUserId,
+    externalChatId,
+    externalMessageId,
+    externalUpdateId,
+    externalThreadId,
+    conversationId,
+    traceId,
+    streamId: '',
+    state: 'reserved',
+    ownerToken,
+    leaseExpiresAt,
+    failureCode: null,
+    finalText: null,
+    responseMessageId: null,
+    responseConversationId: null,
+    libreChatUserId,
+    bindingVersion,
+    expiresAt,
+  };
   try {
     const record = await ViventiumGatewayIngressEvent.create({
       dedupeKey,
-      channel,
-      accountId,
-      externalUserId,
-      externalChatId,
-      externalMessageId,
-      externalUpdateId,
-      externalThreadId,
-      conversationId,
-      traceId,
-      expiresAt,
+      ...reservationFields,
     });
-    return { duplicate: false, recordId: record?._id || null, dedupeKey };
+    return { duplicate: false, recordId: record?._id || null, dedupeKey, ownerToken };
   } catch (error) {
     if (isMongoDuplicateKeyError(error)) {
-      return { duplicate: true, dedupeKey };
+      const existing = await ViventiumGatewayIngressEvent.findOne({ dedupeKey }).lean();
+      if (!existing) {
+        throw error;
+      }
+      if (
+        String(existing.libreChatUserId || '') !== String(libreChatUserId || '') ||
+        String(existing.bindingVersion || '') !== String(bindingVersion || '')
+      ) {
+        return { duplicate: true, authorizationConflict: true, dedupeKey };
+      }
+      let reclaim =
+        existing.state === 'failed' || new Date(existing.leaseExpiresAt || 0).getTime() <= now;
+      if (isPersistedTerminalCompletion(existing)) {
+        reclaim = false;
+      } else if (existing.streamId) {
+        const job = await GenerationJobManager.getJob(existing.streamId);
+        if (job?.status === 'error' || job?.status === 'aborted') {
+          reclaim = true;
+        } else if (job?.status === 'complete') {
+          const finalError = extractFinalError(job.finalEvent);
+          reclaim = Boolean(finalError);
+        } else if (job?.status === 'running') {
+          reclaim = false;
+        }
+      }
+      if (reclaim) {
+        const reclaimed = await ViventiumGatewayIngressEvent.findOneAndUpdate(
+          {
+            dedupeKey,
+            ownerToken: existing.ownerToken || '',
+            state: existing.state,
+            streamId: existing.streamId || '',
+            leaseExpiresAt: existing.leaseExpiresAt,
+          },
+          { $set: reservationFields },
+          { new: true },
+        );
+        if (reclaimed) {
+          return {
+            duplicate: false,
+            recordId: reclaimed._id || existing._id || null,
+            dedupeKey,
+            ownerToken,
+          };
+        }
+        const winner = await ViventiumGatewayIngressEvent.findOne({ dedupeKey }).lean();
+        if (
+          String(winner?.libreChatUserId || '') !== String(libreChatUserId || '') ||
+          String(winner?.bindingVersion || '') !== String(bindingVersion || '')
+        ) {
+          return { duplicate: true, authorizationConflict: true, dedupeKey };
+        }
+        return {
+          duplicate: true,
+          dedupeKey,
+          streamId: winner?.streamId || '',
+          conversationId: winner?.conversationId || conversationId || 'new',
+        };
+      }
+      return {
+        duplicate: true,
+        dedupeKey,
+        streamId: existing?.streamId || '',
+        conversationId: existing?.conversationId || conversationId || 'new',
+      };
     }
     throw error;
   }
@@ -588,7 +691,7 @@ async function gatewayAuth(req, res, next) {
       throw err;
     }
 
-    if (!providedSecret || providedSecret !== expectedSecret) {
+    if (!timingSafeTextEqual(providedSecret, expectedSecret)) {
       const err = new Error('Unauthorized gateway request');
       err.status = 401;
       throw err;
@@ -616,7 +719,7 @@ async function gatewayAuth(req, res, next) {
       throw err;
     }
 
-    const { userId, source } = await resolveGatewayUserId(identity);
+    const { userId, source, bindingVersion } = await resolveGatewayUserId(identity);
     if (!userId) {
       if (req.method === 'POST' && req.path === '/chat') {
         const linkUrl = await issueGatewayLink(req, identity);
@@ -636,6 +739,19 @@ async function gatewayAuth(req, res, next) {
         source === 'missing' ? 'externalUserId is required' : 'Channel account not linked',
       );
       err.status = 401;
+      throw err;
+    }
+
+    const acceptedUserId =
+      typeof req.body?.acceptedLibreChatUserId === 'string' ? req.body.acceptedLibreChatUserId : '';
+    const acceptedBindingVersion =
+      typeof req.body?.acceptedBindingVersion === 'string' ? req.body.acceptedBindingVersion : '';
+    if (
+      (acceptedUserId && acceptedUserId !== userId) ||
+      (acceptedBindingVersion && acceptedBindingVersion !== bindingVersion)
+    ) {
+      const err = new Error('Channel account link changed after message acceptance');
+      err.status = 409;
       throw err;
     }
 
@@ -660,6 +776,7 @@ async function gatewayAuth(req, res, next) {
 
     req.user = user;
     req.gatewayIdentity = identity;
+    req.gatewayBindingVersion = bindingVersion;
     next();
   } catch (err) {
     const status = err?.status || 401;
@@ -758,9 +875,14 @@ router.post(
       externalThreadId,
       conversationId: requestedConversationId,
       traceId,
+      libreChatUserId: req.user?.id || '',
+      bindingVersion: req.gatewayBindingVersion || '',
     });
 
     if (ingressReservation.duplicate) {
+      if (ingressReservation.authorizationConflict) {
+        return _res.status(409).json({ error: 'channel_binding_changed' });
+      }
       logger.info(
         '[VIVENTIUM][gateway/chat] Duplicate ingress suppressed key=%s channel=%s account=%s externalUserId=%s',
         ingressReservation.dedupeKey,
@@ -770,8 +892,8 @@ router.post(
       );
       return _res.status(200).json({
         duplicate: true,
-        streamId: '',
-        conversationId: requestedConversationId,
+        streamId: ingressReservation.streamId,
+        conversationId: ingressReservation.conversationId,
       });
     }
 
@@ -780,19 +902,54 @@ router.post(
         if (_res.statusCode < 400) {
           return;
         }
-        ViventiumGatewayIngressEvent.deleteOne({ _id: ingressReservation.recordId }).catch(
-          (err) => {
-            logger.warn(
-              '[VIVENTIUM][gateway/chat] Failed to release ingress reservation %s: %s',
-              ingressReservation.recordId,
-              err?.message,
-            );
-          },
-        );
+        ViventiumGatewayIngressEvent.deleteOne({
+          _id: ingressReservation.recordId,
+          ownerToken: ingressReservation.ownerToken,
+        }).catch((err) => {
+          logger.warn(
+            '[VIVENTIUM][gateway/chat] Failed to release ingress reservation %s: %s',
+            ingressReservation.recordId,
+            err?.message,
+          );
+        });
       });
     }
 
     const streamId = `gateway-${identity.channel}-${crypto.randomUUID()}`;
+    if (ingressReservation.recordId) {
+      const assignment = await ViventiumGatewayIngressEvent.updateOne(
+        { _id: ingressReservation.recordId, ownerToken: ingressReservation.ownerToken },
+        {
+          $set: {
+            streamId,
+            state: 'in_flight',
+            leaseExpiresAt: new Date(Date.now() + GATEWAY_INGRESS_LEASE_MS),
+          },
+        },
+      );
+      const matchedCount = assignment?.matchedCount ?? assignment?.n ?? 0;
+      if (matchedCount !== 1) {
+        const winner = ingressReservation.dedupeKey
+          ? await ViventiumGatewayIngressEvent.findOne({
+              dedupeKey: ingressReservation.dedupeKey,
+            }).lean()
+          : null;
+        if (winner?.streamId) {
+          if (
+            String(winner.libreChatUserId || '') !== String(req.user?.id || '') ||
+            String(winner.bindingVersion || '') !== String(req.gatewayBindingVersion || '')
+          ) {
+            return _res.status(409).json({ error: 'channel_binding_changed' });
+          }
+          return _res.status(200).json({
+            duplicate: true,
+            streamId: winner.streamId,
+            conversationId: winner.conversationId || requestedConversationId,
+          });
+        }
+        return _res.status(503).json({ error: 'ingress_ownership_lost' });
+      }
+    }
 
     let parentMessageId =
       typeof incoming.parentMessageId === 'string' ? incoming.parentMessageId : null;
@@ -864,43 +1021,42 @@ router.post(
       : [];
     const allFormattedImages = [...formattedImages, ...extractedDocumentImages];
 
-    const { attachments: _ignoredAttachments, files: _ignoredFiles, ...safeIncoming } = incoming;
-
-    req.body = {
-      ...safeIncoming,
-      text,
-      endpoint: 'agents',
-      endpointType: 'agents',
-      conversationId,
-      parentMessageId,
-      agent_id: agentId,
-      streamId,
-      files: uploadedFiles,
-      channel: identity.channel,
-      accountId: identity.accountId,
-      externalUserId: identity.externalUserId,
-      externalChatId: identity.externalChatId,
-      externalMessageId,
-      externalUpdateId,
-      externalThreadId,
-    };
-
     const inputMode =
       typeof incoming.inputMode === 'string'
         ? incoming.inputMode
         : typeof incoming.viventiumInputMode === 'string'
           ? incoming.viventiumInputMode
           : '';
-    if (inputMode) {
-      req.body.viventiumInputMode = inputMode;
-    }
-
-    if (resolvedSpec) {
-      req.body.spec = resolvedSpec;
-    }
-
-    if (!req.body.viventiumSurface) {
-      req.body.viventiumSurface = identity.channel;
+    const channelEnvelope = normalizeChannelEnvelope({
+      channel: identity.channel,
+      accountId: identity.accountId,
+      externalUserId: identity.externalUserId,
+      externalUsername: identity.externalUsername,
+      externalConversationId: identity.externalChatId || identity.externalUserId,
+      externalThreadId,
+      externalMessageId,
+      externalUpdateId,
+      inputMode,
+      audioRequested: incoming.audioRequested === true,
+      text,
+    });
+    req.body = buildChannelAgentRequest({
+      envelope: channelEnvelope,
+      resolved: {
+        agentId,
+        conversationId,
+        parentMessageId,
+        streamId,
+        files: uploadedFiles,
+        spec: resolvedSpec,
+      },
+    });
+    // Preserve legacy field names consumed by existing gateway logs and bridge tooling.
+    req.body.externalChatId = identity.externalChatId;
+    for (const field of ['clientTimestamp', 'clientTimezone', 'traceId']) {
+      if (typeof incoming[field] === 'string' || typeof incoming[field] === 'number') {
+        req.body[field] = incoming[field];
+      }
     }
 
     if (allFormattedImages.length > 0) {
@@ -973,6 +1129,38 @@ router.get('/stream/:streamId', gatewayAuth, async (req, res) => {
     return;
   }
   if (!job) {
+    const replay = await ViventiumGatewayIngressEvent.findOne({ streamId }).lean();
+    if (isPersistedTerminalCompletion(replay)) {
+      if (
+        String(replay.libreChatUserId || '') !== String(userId || '') ||
+        String(replay.bindingVersion || '') !== String(req.gatewayBindingVersion || '')
+      ) {
+        return res.status(409).json({ error: 'channel_binding_changed' });
+      }
+      res.setHeader('Content-Encoding', 'identity');
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.flushHeaders();
+      writeSseEvent(res, 'message', {
+        type: 'final',
+        text: replay.finalText || '',
+        messageId: replay.responseMessageId || undefined,
+        conversationId: replay.responseConversationId || replay.conversationId || undefined,
+      });
+      writeSseEvent(res, 'done', {
+        final: true,
+        messageId: replay.responseMessageId || undefined,
+        conversationId: replay.responseConversationId || replay.conversationId || undefined,
+      });
+      res.end();
+      return;
+    }
+    await ViventiumGatewayIngressEvent.updateOne(
+      { streamId },
+      { $set: { state: 'failed', failureCode: 'job_missing', leaseExpiresAt: new Date(0) } },
+    ).catch(() => undefined);
     return res.status(404).json({
       error: 'Stream not found',
       message: 'The generation job does not exist or has expired.',
@@ -1057,6 +1245,45 @@ router.get('/stream/:streamId', gatewayAuth, async (req, res) => {
 
         const finalText = extractFinalResponseText(event);
         const responseMessageId = extractResponseMessageId(event);
+        const responseConversationId = extractResponseConversationId(event);
+
+        if (responseConversationId) {
+          ViventiumGatewayIngressEvent.updateOne(
+            { streamId },
+            { $set: { conversationId: responseConversationId } },
+          ).catch((err) =>
+            logger.warn(
+              '[VIVENTIUM][gateway/stream] Failed to persist conversation continuity: %s',
+              err?.message,
+            ),
+          );
+        }
+
+        ViventiumGatewayIngressEvent.updateOne(
+          { streamId },
+          finalError
+            ? {
+                $set: {
+                  state: 'failed',
+                  failureCode: 'terminal_error',
+                  leaseExpiresAt: new Date(0),
+                },
+              }
+            : {
+                $set: {
+                  state: 'completed',
+                  failureCode: null,
+                  finalText: finalText || '',
+                  responseMessageId: responseMessageId || null,
+                  responseConversationId: responseConversationId || null,
+                },
+              },
+        ).catch((err) =>
+          logger.warn(
+            '[VIVENTIUM][gateway/stream] Failed to persist ingress outcome: %s',
+            err?.message,
+          ),
+        );
 
         const attachments = extractAttachments(event);
         for (const attachment of attachments) {
@@ -1066,21 +1293,27 @@ router.get('/stream/:streamId', gatewayAuth, async (req, res) => {
           writeSseEvent(res, 'attachment', attachment);
         }
 
-        if (finalText) {
+        if (!finalError) {
           writeSseEvent(res, 'message', {
             type: 'final',
-            text: finalText,
+            text: finalText || '',
             messageId: responseMessageId,
+            conversationId: responseConversationId,
           });
         }
 
         writeSseEvent(res, 'done', {
           final: true,
           messageId: responseMessageId,
+          conversationId: responseConversationId,
         });
         res.end();
       },
       (error) => {
+        ViventiumGatewayIngressEvent.updateOne(
+          { streamId },
+          { $set: { state: 'failed', failureCode: 'stream_error', leaseExpiresAt: new Date(0) } },
+        ).catch(() => undefined);
         if (!res.writableEnded) {
           writeSseEvent(res, 'error', { error: String(error || 'Stream error') });
           res.end();
@@ -1094,6 +1327,10 @@ router.get('/stream/:streamId', gatewayAuth, async (req, res) => {
     }
     res.removeListener('close', onRequestClose);
     logger.error(`[VIVENTIUM][GatewayStream] subscription readiness failed: ${streamId}`, error);
+    await ViventiumGatewayIngressEvent.updateOne(
+      { streamId },
+      { $set: { state: 'failed', failureCode: 'subscribe_failed', leaseExpiresAt: new Date(0) } },
+    ).catch(() => undefined);
     if (!res.writableEnded) {
       writeSseEvent(res, 'error', { error: 'Stream connection unavailable' });
       res.end();
@@ -1107,6 +1344,12 @@ router.get('/stream/:streamId', gatewayAuth, async (req, res) => {
       return;
     }
     if (!res.writableEnded) {
+      await ViventiumGatewayIngressEvent.updateOne(
+        { streamId },
+        {
+          $set: { state: 'failed', failureCode: 'subscribe_missing', leaseExpiresAt: new Date(0) },
+        },
+      ).catch(() => undefined);
       writeSseEvent(res, 'error', { error: 'Failed to subscribe to stream' });
       res.end();
     }

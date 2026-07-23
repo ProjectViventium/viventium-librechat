@@ -121,7 +121,7 @@
     "pdfjs-dist": "^5.4.624",
     "rate-limit-redis": "^4.2.0",
     "tiktoken": "^1.0.15",
-    "undici": "^7.18.2",
+    "undici": "^7.28.0",
     "zod": "^3.22.4"
   }
 }

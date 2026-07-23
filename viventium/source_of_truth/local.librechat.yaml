@@ -747,7 +747,7 @@ endpoints:
       forcePrompt: false
     - name: xai
       apiKey: ${XAI_API_KEY}
-      baseURL: https://api.x.ai/v1
+      baseURL: ${XAI_BASE_URL}
       models:
         default:
           - grok-4.3
@@ -783,7 +783,7 @@ endpoints:
         - stop
     - name: groq
       apiKey: ${GROQ_API_KEY}
-      baseURL: https://api.groq.com/openai/v1/
+      baseURL: ${GROQ_BASE_URL}
       models:
         default:
           - meta-llama/llama-4-maverick-17b-128e-instruct

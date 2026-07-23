@@ -12,6 +12,9 @@ on:
 
 jobs:
   build:
+    # VIVENTIUM START — public forks must not fail main when optional publisher credentials are absent.
+    if: ${{ vars.VIVENTIUM_ENABLE_DOCKER_PUBLISH == 'true' }}
+    # VIVENTIUM END
     runs-on: ubuntu-latest
     strategy:
       matrix:

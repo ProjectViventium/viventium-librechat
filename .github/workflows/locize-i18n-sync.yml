@@ -9,6 +9,9 @@ on:
 jobs:
   sync-translations:
     name: Sync Translation Keys with Locize
+    # VIVENTIUM START — Locize is optional and requires an explicitly provisioned fork.
+    if: ${{ vars.VIVENTIUM_ENABLE_LOCIZE == 'true' }}
+    # VIVENTIUM END
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository

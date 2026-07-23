@@ -91,10 +91,19 @@ export async function initializeCustom({
   const userProvidesURL = isUserProvided(CUSTOM_BASE_URL);
 
   let userValues = null;
-  if (expiresAt && (userProvidesKey || userProvidesURL)) {
-    checkUserKeyExpiry(expiresAt, endpoint);
+  /* === VIVENTIUM START ===
+   * Feature: Connected Accounts custom-provider handoff.
+   * Purpose: A Settings-saved Groq/xAI key is user-scoped even when an agent or background
+   * activation request does not carry the legacy client-side expiry marker. The marker controls
+   * expiry validation only; it must not control whether the encrypted credential is loaded.
+   */
+  if (userProvidesKey || userProvidesURL) {
+    if (expiresAt) {
+      checkUserKeyExpiry(expiresAt, endpoint);
+    }
     userValues = await db.getUserKeyValues({ userId: req.user?.id ?? '', name: endpoint });
   }
+  /* === VIVENTIUM END === */
 
   const apiKey = userProvidesKey ? userValues?.apiKey : CUSTOM_API_KEY;
   const baseURL = userProvidesURL ? userValues?.baseURL : CUSTOM_BASE_URL;

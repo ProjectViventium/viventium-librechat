@@ -125,6 +125,26 @@ test.describe('Connected Channels', () => {
       () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
     );
     expect(overflow).toBeLessThanOrEqual(1);
+
+    await whatsapp.getByRole('button', { name: 'Cancel' }).click();
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.getByRole('button', { name: 'Close Settings' }).click();
+    await page.evaluate(() => localStorage.setItem('navVisible', 'false'));
+    await page.reload();
+
+    const accountSettings = page.getByTestId('nav-user');
+    const openSidebar = page.getByTestId('open-sidebar-button');
+    await expect(openSidebar).toBeVisible();
+    await openSidebar.click();
+    await expect(accountSettings).toBeVisible();
+    await accountSettings.click();
+    await page.getByRole('option', { name: 'Connected Channels' }).click();
+    const reopenedDialog = page.getByRole('dialog', { name: /Settings/ }).last();
+    for (const provider of ['Telegram', 'Slack', 'WhatsApp']) {
+      await expect(
+        reopenedDialog.getByRole('region', { name: `${provider} channel` }),
+      ).toBeVisible();
+    }
   });
 
   test('keeps recovery local and clear when a provider connection fails', async ({ page }) => {

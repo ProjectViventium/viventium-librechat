@@ -44,6 +44,18 @@ jest.mock('@librechat/api', () => ({
       maxTokens: model_parameters?.max_output_tokens,
     },
   })),
+  initializeCustom: jest.fn(async ({ model_parameters }) => ({
+    llmConfig: {
+      provider: 'openai',
+      model: model_parameters?.model,
+      temperature: model_parameters?.temperature,
+      maxTokens: model_parameters?.max_tokens,
+    },
+    configOptions: {
+      baseURL: 'https://api.groq.example/v1',
+      defaultHeaders: { 'x-synthetic-qa': 'enabled' },
+    },
+  })),
   createRun: jest.fn(),
   checkAccess: jest.fn(async () => true),
   loadMemoryReadContext: jest.fn(async ({ userId, memoryMethods }) => {
@@ -155,10 +167,16 @@ const {
   formatHistoryForActivation,
   buildCortexCompletionPayload,
   getCustomEndpointConfig,
+  buildActivationLlmConfig,
   sanitizeCortexDisplayName,
 } = require('~/server/services/BackgroundCortexService');
 const { Run, createContentAggregator } = require('@librechat/agents');
-const { initializeAgent, initializeAnthropic, createRun } = require('@librechat/api');
+const {
+  initializeAgent,
+  initializeAnthropic,
+  initializeCustom,
+  createRun,
+} = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
 const { getAppConfig } = require('~/server/services/Config/app');
 const { loadAgent } = require('~/models/Agent');
@@ -376,6 +394,73 @@ describe('BackgroundCortexService config hygiene helpers', () => {
     delete process.env.GROQ_API_BASE_URL;
 
     await expect(getCustomEndpointConfig('groq', { user: { role: 'USER' } })).resolves.toBeNull();
+  });
+
+  test('never treats the user-provided sentinel as an env-backed credential', async () => {
+    getAppConfig.mockRejectedValueOnce(new Error('config unavailable'));
+    process.env.GROQ_API_KEY = 'user_provided';
+    process.env.GROQ_BASE_URL = 'https://api.groq.example/v1';
+
+    await expect(getCustomEndpointConfig('groq', { user: { role: 'USER' } })).resolves.toBeNull();
+  });
+
+  test('routes configured custom activation providers through the user-scoped initializer', async () => {
+    const req = {
+      user: { id: 'synthetic-user', role: 'USER' },
+      body: {},
+      config: {
+        endpoints: {
+          custom: [
+            {
+              name: 'groq',
+              apiKey: 'user_provided',
+              baseURL: 'https://api.groq.example/v1',
+            },
+          ],
+        },
+      },
+    };
+
+    const llmConfig = await buildActivationLlmConfig({
+      providerName: 'groq',
+      model: 'qwen/qwen3.6-27b',
+      req,
+    });
+
+    expect(initializeCustom).toHaveBeenCalledWith(
+      expect.objectContaining({
+        req,
+        endpoint: 'groq',
+        model_parameters: expect.objectContaining({ model: 'qwen/qwen3.6-27b' }),
+      }),
+    );
+    expect(llmConfig.configuration).toEqual({
+      baseURL: 'https://api.groq.example/v1',
+      defaultHeaders: { 'x-synthetic-qa': 'enabled' },
+    });
+  });
+
+  test('preserves the env-backed activation fallback when app config is unavailable', async () => {
+    getAppConfig
+      .mockRejectedValueOnce(new Error('config unavailable'))
+      .mockRejectedValueOnce(new Error('config unavailable'));
+    process.env.GROQ_API_KEY = 'groq-test-key';
+    process.env.GROQ_BASE_URL = 'https://groq.example.internal/openai/v1';
+
+    await expect(
+      buildActivationLlmConfig({
+        providerName: 'groq',
+        model: 'qwen/qwen3.6-27b',
+        req: { user: { id: 'synthetic-user', role: 'USER' }, body: {} },
+      }),
+    ).resolves.toEqual(
+      expect.objectContaining({
+        configuration: {
+          apiKey: 'groq-test-key',
+          baseURL: 'https://groq.example.internal/openai/v1',
+        },
+      }),
+    );
   });
 });
 

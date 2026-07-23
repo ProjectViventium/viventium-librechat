@@ -19,6 +19,11 @@ const {
 const {
   initializeAgent,
   initializeAnthropic,
+  /* === VIVENTIUM START ===
+   * Feature: Connected Accounts background-provider handoff.
+   */
+  initializeCustom,
+  /* === VIVENTIUM END === */
   initializeOpenAI,
   createRun,
   Tokenizer,
@@ -677,9 +682,14 @@ function getEnvBackedEndpointConfig(endpointName) {
 
   const resolvedBaseURL = baseURL || defaultBaseUrls[normalizedName] || '';
 
-  if (!apiKey || !resolvedBaseURL) {
+  /* === VIVENTIUM START ===
+   * Feature: Connected Accounts background-provider safety.
+   * Purpose: `user_provided` is a control sentinel, never an outbound provider credential.
+   */
+  if (!apiKey || apiKey.toLowerCase() === 'user_provided' || !resolvedBaseURL) {
     return null;
   }
+  /* === VIVENTIUM END === */
 
   return { apiKey, baseURL: resolvedBaseURL };
 }
@@ -2345,9 +2355,14 @@ async function getCustomEndpointConfig(endpointName, req) {
       const apiKey = extractEnvVariable(endpoint.apiKey || '');
       const baseURL = extractEnvVariable(endpoint.baseURL || '');
 
-      if (apiKey && baseURL) {
+      /* === VIVENTIUM START ===
+       * Feature: Connected Accounts background-provider safety.
+       * Purpose: The user-provided capability sentinel is never an outbound credential.
+       */
+      if (apiKey && apiKey.toLowerCase() !== 'user_provided' && baseURL) {
         return { apiKey, baseURL };
       }
+      /* === VIVENTIUM END === */
     }
 
     const envConfig = getEnvBackedEndpointConfig(normalizedName);
@@ -2512,6 +2527,63 @@ async function buildActivationLlmConfig({ providerName, model, req }) {
   if (!(providerName === 'perplexity' || usesAdaptiveAnthropicTemperatureRules)) {
     llmConfig.temperature = 0.1;
   }
+
+  /* === VIVENTIUM START ===
+   * Feature: Connected Accounts background-provider handoff.
+   * Purpose: Route configured OpenAI-compatible activation providers through the canonical
+   * user-scoped initializer. This decrypts the current user's saved key or fails locally with
+   * NO_USER_KEY, instead of sending the `user_provided` sentinel to a public provider.
+   */
+  let appConfig = req?.config || null;
+  if (req && !appConfig) {
+    try {
+      appConfig = await getAppConfig({ role: req.user?.role });
+      req.config = appConfig;
+    } catch (error) {
+      logger.warn(
+        '[BackgroundCortexService] Failed to load app config before custom activation; preserving endpoint fallback',
+        sanitizeRuntimeErrorForLog(error),
+      );
+    }
+  }
+  const configuredCustomEndpoint = appConfig?.endpoints?.custom?.find(
+    (endpoint) =>
+      String(endpoint?.name || '').toLowerCase() === String(providerName || '').toLowerCase(),
+  );
+  if (req && configuredCustomEndpoint) {
+    const modelParameters = {
+      model,
+      max_tokens: 100,
+      ...(providerName === 'perplexity' || isOpenAIReasoningModelWithoutSampling(model)
+        ? {}
+        : { temperature: 0.1 }),
+    };
+    const initialized = await initializeCustom({
+      req,
+      endpoint: providerName,
+      model_parameters: modelParameters,
+      db,
+    });
+    const customLlmConfig = {
+      ...initialized.llmConfig,
+      ...(initialized.configOptions ? { configuration: initialized.configOptions } : {}),
+      provider: Providers.OPENAI,
+      model,
+      streaming: false,
+      disableStreaming: true,
+    };
+    sanitizeOpenAIReasoningSamplingParams(customLlmConfig, { model });
+    return applyActivationJsonMode({
+      providerName,
+      model,
+      llmConfig: applyGroqActivationModelDefaults({
+        providerName,
+        model,
+        llmConfig: customLlmConfig,
+      }),
+    });
+  }
+  /* === VIVENTIUM END === */
 
   if (req && providerName) {
     const customConfig = await getCustomEndpointConfig(providerName, req);

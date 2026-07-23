@@ -267,6 +267,7 @@ const Nav = memo(
               ? 'nav fixed left-0 top-0 z-[110] h-full bg-surface-primary-alt'
               : 'flex-shrink-0 overflow-hidden',
             isSmallScreen && navVisible && 'active',
+            !navVisible && 'pointer-events-none',
           )}
           style={
             isSmallScreen

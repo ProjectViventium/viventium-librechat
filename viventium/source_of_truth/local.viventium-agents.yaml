@@ -75,6 +75,13 @@ config:
               - schedule_preview_next_mcp_scheduling-cortex
               - periphery_list_mcp_scheduling-cortex
               - periphery_read_mcp_scheduling-cortex
+          - server: viventium-health
+            owns: read-only local health-source capture runs, raw response records, timestamps, and integrity evidence
+            tool_names:
+              - sys__server__sys_mcp_viventium-health
+              - health_list_runs_mcp_viventium-health
+              - health_list_records_mcp_viventium-health
+              - health_read_record_mcp_viventium-health
           - server: google-workspace
             scope_key: productivity_google_workspace
             same_scope_background_allowed: true
@@ -145,6 +152,10 @@ mainAgent:
     - schedule_preview_next_mcp_scheduling-cortex
     - periphery_list_mcp_scheduling-cortex
     - periphery_read_mcp_scheduling-cortex
+    - sys__server__sys_mcp_viventium-health
+    - health_list_runs_mcp_viventium-health
+    - health_list_records_mcp_viventium-health
+    - health_read_record_mcp_viventium-health
     - sys__server__sys_mcp_glasshive-workers-projects
     - projects_list_mcp_glasshive-workers-projects
     - project_create_mcp_glasshive-workers-projects

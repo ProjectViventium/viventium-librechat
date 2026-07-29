@@ -872,10 +872,6 @@ export async function initializeAgent(
         ? Buffer.from(workspacePath, 'utf8').toString('base64')
         : '',
       'X-GlassHive-Access': configuredOptions.access ?? 'full',
-      // The pinned LangChain OpenAI client drops reasoning_content extensions. GlassHive keeps
-      // that standard extension and opt-in mirrors activity as typed non-text content parts so the
-      // existing LibreChat graph can stream, resume, and persist it without a wrapper model.
-      'X-GlassHive-Activity-Format': 'langchain-content-parts-v1',
     };
     (agent.model_parameters as Record<string, unknown>).configuration = llmConfiguration;
   }

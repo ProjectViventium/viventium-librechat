@@ -76,6 +76,9 @@ const {
   attachConversationProviderCapabilityBundle,
   bindHarnessCancellation,
 } = require('~/server/services/viventium/GlassHiveConversationProviderService');
+const {
+  resolveAgentCapabilityProvider,
+} = require('~/server/services/viventium/agentCapabilityProvider');
 /* === VIVENTIUM END === */
 
 /* === VIVENTIUM START ===
@@ -661,7 +664,13 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
   const primaryConfig = primaryInitialization.config;
   const effectivePrimaryAgent = primaryInitialization.effectiveAgent;
   const primaryInitializationFallbackUsed = primaryInitialization.fallbackUsed;
-  const effectivePrimaryProvider = String(effectivePrimaryAgent?.provider || '').trim();
+  /* === VIVENTIUM START ===
+   * Feature: Preserve declared provider capabilities across custom-endpoint initialization.
+   * Purpose: initializeAgent adapts a custom endpoint's internal transport provider to openAI.
+   * The original provider remains on `endpoint`; capability ownership must follow that declared
+   * endpoint so transport adaptation cannot silently disable GlassHive lifecycle semantics.
+   * === VIVENTIUM END === */
+  const effectivePrimaryProvider = resolveAgentCapabilityProvider(effectivePrimaryAgent);
   const effectivePrimaryCapability =
     req.config?.endpoints?.agents?.providerCapabilities?.[effectivePrimaryProvider];
   req._viventiumHarnessActivityEnabled = effectivePrimaryCapability?.activity_stream === true;

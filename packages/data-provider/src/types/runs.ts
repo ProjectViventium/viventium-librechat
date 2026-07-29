@@ -53,7 +53,17 @@ export interface CortexContentPart {
 export interface HarnessActivityContentPart {
   type: ContentTypes.HARNESS_ACTIVITY;
   harness_activity: {
-    event: 'queued' | 'started' | 'reasoning-summary' | 'plan' | 'tool' | 'file' | 'waiting';
+    event:
+      | 'queued'
+      | 'started'
+      | 'reasoning-summary'
+      | 'plan'
+      | 'tool'
+      | 'file'
+      | 'waiting'
+      | 'completed'
+      | 'failed'
+      | 'cancelled';
     summary: string;
   };
 }

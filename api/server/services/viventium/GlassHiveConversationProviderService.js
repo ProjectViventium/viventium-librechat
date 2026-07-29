@@ -29,6 +29,20 @@ function bindHarnessCancellation({
   const cancelBaseURL = extractEnvVariable(endpointConfig?.baseURL || '').replace(/\/$/, '');
   const cancelApiKey = extractEnvVariable(endpointConfig?.apiKey || '');
   const cancelOwnerId = String(req.user?.id || '').trim();
+  const cancelStreamId = String(req?._resumableStreamId || '').trim();
+  let settleCancellationDelivery;
+  const cancellationDelivery = new Promise((resolve) => {
+    settleCancellationDelivery = resolve;
+  });
+  try {
+    Object.defineProperty(signal, '_viventiumHarnessCancellationDelivery', {
+      configurable: true,
+      value: cancellationDelivery,
+    });
+  } catch (_) {
+    // Delivery still occurs; older/non-extensible AbortSignal implementations simply cannot
+    // make the user-facing abort endpoint wait for its activity acknowledgement.
+  }
   signal.addEventListener(
     'abort',
     () => {
@@ -45,25 +59,53 @@ function bindHarnessCancellation({
         !cancelOwnerId ||
         typeof fetchImpl !== 'function'
       ) {
+        settleCancellationDelivery?.({ delivered: false });
         return;
       }
-      void fetchImpl(
-        `${cancelBaseURL}/requests/by-idempotency/${encodeURIComponent(cancelIdempotencyKey)}/cancel`,
-        {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${cancelApiKey}`,
-            'X-Viventium-User-Id': cancelOwnerId,
-          },
-          signal: AbortSignal.timeout(5000),
-        },
-      )
-        .then((response) => {
+      void (async () => {
+        try {
+          const response = await fetchImpl(
+            `${cancelBaseURL}/requests/by-idempotency/${encodeURIComponent(cancelIdempotencyKey)}/cancel`,
+            {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${cancelApiKey}`,
+                'X-Viventium-User-Id': cancelOwnerId,
+              },
+              signal: AbortSignal.timeout(5000),
+            },
+          );
           if (!response?.ok) {
             throw new Error(`GlassHive cancellation returned HTTP ${response?.status || 'unknown'}`);
           }
-        })
-        .catch(onDeliveryError);
+          if (cancelStreamId && req?._viventiumHarnessActivityEnabled === true) {
+            const { GraphEvents } = require('@librechat/agents');
+            const { GenerationJobManager } = require('@librechat/api');
+            await GenerationJobManager.emitChunk(cancelStreamId, {
+              _viventiumAllowAfterAbort: true,
+              event: GraphEvents.ON_REASONING_DELTA,
+              data: {
+                id: `${cancelStreamId}-harness-cancelled`,
+                delta: {
+                  content: [
+                    {
+                      type: 'harness_activity',
+                      harness_activity: {
+                        event: 'cancelled',
+                        summary: 'The harness turn was cancelled.\n',
+                      },
+                    },
+                  ],
+                },
+              },
+            });
+          }
+          settleCancellationDelivery?.({ delivered: true });
+        } catch (error) {
+          onDeliveryError(error);
+          settleCancellationDelivery?.({ delivered: false });
+        }
+      })();
     },
     { once: true },
   );

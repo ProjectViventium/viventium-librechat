@@ -1,5 +1,10 @@
 const { Constants } = require('librechat-data-provider');
 
+const mockEmitChunk = jest.fn();
+jest.mock('@librechat/api', () => ({
+  GenerationJobManager: { emitChunk: mockEmitChunk },
+}));
+
 jest.mock('../GlassHiveCapabilityBootstrapService', () => ({
   buildConversationProviderBootstrapBundle: jest.fn(),
 }));
@@ -37,7 +42,9 @@ describe('GlassHiveConversationProviderService', () => {
     const fetchImpl = jest.fn().mockResolvedValue({ ok: true });
     const req = {
       _viventiumHarnessExecutionEnabled: true,
+      _viventiumHarnessActivityEnabled: true,
       _viventiumHarnessIdempotencyKey: 'main:response-1',
+      _resumableStreamId: 'stream-synthetic',
       body: { responseMessageId: 'response-wrong' },
       user: { id: 'user-synthetic' },
     };
@@ -52,7 +59,7 @@ describe('GlassHiveConversationProviderService', () => {
     ).toBe(true);
 
     abortController.abort('user_cancelled');
-    await Promise.resolve();
+    await abortController.signal._viventiumHarnessCancellationDelivery;
 
     expect(fetchImpl).toHaveBeenCalledWith(
       'http://glasshive.local/v1/requests/by-idempotency/main%3Aresponse-1/cancel',
@@ -61,6 +68,25 @@ describe('GlassHiveConversationProviderService', () => {
         headers: {
           Authorization: 'Bearer synthetic-key',
           'X-Viventium-User-Id': 'user-synthetic',
+        },
+      }),
+    );
+    expect(mockEmitChunk).toHaveBeenCalledWith(
+      'stream-synthetic',
+      expect.objectContaining({
+        data: {
+          id: 'stream-synthetic-harness-cancelled',
+          delta: {
+            content: [
+              {
+                type: 'harness_activity',
+                harness_activity: {
+                  event: 'cancelled',
+                  summary: 'The harness turn was cancelled.\n',
+                },
+              },
+            ],
+          },
         },
       }),
     );

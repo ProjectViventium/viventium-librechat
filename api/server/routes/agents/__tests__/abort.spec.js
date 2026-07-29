@@ -117,7 +117,10 @@ describe('Agent Abort Endpoint', () => {
 
         expect(response.status).toBe(200);
         expect(response.body).toEqual({ success: true, aborted: jobStreamId });
-        expect(mockGenerationJobManager.abortJob).toHaveBeenCalledWith(jobStreamId);
+        expect(mockGenerationJobManager.abortJob).toHaveBeenCalledWith(
+          jobStreamId,
+          'user_cancelled',
+        );
       });
 
       it('should allow abort when job has no userId metadata (backwards compatibility)', async () => {

@@ -82,6 +82,15 @@ jest.mock('~/server/services/Config/app', () => ({
         allowedProviders: ['openai', 'anthropic', 'xai'],
       },
       custom: [
+        /* === VIVENTIUM START ===
+         * Regression: exact activation-provider resolution must be exercised with declared
+         * custom-endpoint configuration; unknown providers no longer inherit OpenAI transport.
+         * === VIVENTIUM END === */
+        {
+          name: 'groq',
+          apiKey: 'groq-test-key',
+          baseURL: 'https://groq.example.internal/openai/v1',
+        },
         {
           name: 'xai',
           apiKey: 'xai-test-key',

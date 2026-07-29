@@ -1365,6 +1365,7 @@ async function resolveFollowUpLLMConfig({
             ? Buffer.from(customPath, 'utf8').toString('base64')
             : '',
           'X-GlassHive-Access': options?.access || 'full',
+          'X-GlassHive-Activity-Format': 'langchain-content-parts-v1',
         };
       }
       llmConfig.provider = Providers.OPENAI;

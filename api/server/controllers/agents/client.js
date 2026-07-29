@@ -87,6 +87,9 @@ const {
   scheduleEmotionalReaction,
 } = require('~/server/services/viventium/EmotionalReactionService');
 const { enqueueUserMemoryWriter } = require('~/server/services/viventium/memoryWriterCoordinator');
+const {
+  buildHarnessIdempotencyKey,
+} = require('~/server/services/viventium/GlassHiveConversationProviderService');
 
 /* === VIVENTIUM START ===
  * Feature: Scope-aware Feelings dynamic tail.
@@ -1463,6 +1466,35 @@ function getCortexSpeculativeParallelEnabled(req) {
   return !voiceMode;
 }
 
+function convertHarnessActivityParts(contentParts) {
+  if (!Array.isArray(contentParts)) {
+    return contentParts;
+  }
+  for (let index = 0; index < contentParts.length; index += 1) {
+    const part = contentParts[index];
+    if (!part || part.type !== ContentTypes.THINK) {
+      continue;
+    }
+    const summary = typeof part.think === 'string' ? part.think : String(part.think?.value || '');
+    contentParts[index] = {
+      type: ContentTypes.HARNESS_ACTIVITY,
+      harness_activity: {
+        event: 'reasoning-summary',
+        summary,
+      },
+    };
+  }
+  return contentParts;
+}
+
+function isHarnessInvocationLocked(req) {
+  return (
+    (req?._viventiumHarnessExecutionEnabled === true ||
+      req?._viventiumHarnessActivityEnabled === true) &&
+    req?._viventiumHarnessInvocationStarted === true
+  );
+}
+
 /**
  * Fail-closed gate for speculative parallel detection.
  *
@@ -1865,6 +1897,7 @@ function buildViventiumMcpRequestBody({
   messageId,
   conversationId,
   parentMessageId,
+  harnessIdempotencyKey,
   req,
   attachments,
   toolResources,
@@ -1894,6 +1927,7 @@ function buildViventiumMcpRequestBody({
     messageId,
     conversationId,
     parentMessageId,
+    viventiumGlassHiveIdempotencyKey: harnessIdempotencyKey,
     viventiumSurface: req?.body?.viventiumSurface,
     viventiumInputMode: req?.body?.viventiumInputMode,
     viventiumStreamId: req?.body?.streamId || req?._resumableStreamId,
@@ -3228,13 +3262,16 @@ class AgentClient extends BaseClient {
       const fallbackInitializer = this.options.agent?.viventiumFallbackLlmInitializer;
       let fallbackAttempted = false;
       const fallbackAborted = opts.abortController?.signal?.aborted === true;
+      const harnessInvocationLocked = isHarnessInvocationLocked(this.options.req);
       const shouldRetryPrimaryErrorWithFallback =
         !fallbackAborted &&
+        !harnessInvocationLocked &&
         primaryError &&
         !hasVisibleAssistantText(this.contentParts) &&
         shouldRetryWithFallback([createCompletionErrorContentPart(primaryError)]);
       if (
         !fallbackAborted &&
+        !harnessInvocationLocked &&
         (fallbackAgent || typeof fallbackInitializer === 'function') &&
         (shouldRetryWithFallback(this.contentParts) || shouldRetryPrimaryErrorWithFallback)
       ) {
@@ -3887,6 +3924,14 @@ class AgentClient extends BaseClient {
       /** @type {AppConfig['endpoints']['agents']} */
       const agentsEConfig = appConfig.endpoints?.[EModelEndpoint.agents];
 
+      const harnessIdempotencyKey =
+        req?._viventiumHarnessExecutionEnabled === true
+          ? buildHarnessIdempotencyKey('main', this.responseMessageId)
+          : '';
+      if (harnessIdempotencyKey) {
+        req._viventiumHarnessIdempotencyKey = harnessIdempotencyKey;
+      }
+
       config = {
         runName: 'AgentRun',
         configurable: {
@@ -3898,6 +3943,7 @@ class AgentClient extends BaseClient {
             messageId: this.responseMessageId,
             conversationId: this.conversationId,
             parentMessageId: this.parentMessageId,
+            harnessIdempotencyKey,
             req,
             attachments: this.options.attachments,
             toolResources: this.options.agent?.tool_resources,
@@ -4426,7 +4472,9 @@ class AgentClient extends BaseClient {
          * cases must use the blocking path unless explicitly overridden; otherwise a speculative main
          * run could reach a real tool side effect before the nevermind decision.
          * === */
-        speculativeMode = shouldRunLiveSpeculativePhaseA({ policy: voicePhaseAPolicy });
+        speculativeMode =
+          req?._viventiumHarnessExecutionEnabled !== true &&
+          shouldRunLiveSpeculativePhaseA({ policy: voicePhaseAPolicy });
         if (speculativeMode) {
           speculativeDetectionPromise = detectActivations({
             req,
@@ -5468,6 +5516,9 @@ class AgentClient extends BaseClient {
         );
       }
       sanitizeAggregatedContentParts(this.contentParts);
+      if (req?._viventiumHarnessExecutionEnabled === true) {
+        convertHarnessActivityParts(this.contentParts);
+      }
       /** @deprecated Agent Chain */
       if (hideSequentialOutputs) {
         this.contentParts = pruneSequentialOutputPartsForPersistence(this.contentParts);
@@ -5614,7 +5665,17 @@ class AgentClient extends BaseClient {
           `[api/server/controllers/agents/client.js #titleConvo] Error getting title endpoint config for "${endpointConfig.titleEndpoint}", falling back to default`,
           error,
         );
-        // Fall back to original provider config
+        /* === VIVENTIUM START ===
+         * Feature: Direct-only title generation for workspace-bound harness providers.
+         * Purpose: If the configured lightweight title provider is unavailable, skip a title
+         * instead of launching a second full harness turn against the user's workspace.
+         * === VIVENTIUM END === */
+        const primaryCapability =
+          appConfig.endpoints?.agents?.providerCapabilities?.[agent.endpoint];
+        if (primaryCapability?.workspace_binding === true) {
+          return;
+        }
+        // Fall back to original provider config for ordinary direct providers.
         endpoint = agent.endpoint;
         titleProviderConfig = getProviderConfig({ provider: endpoint, appConfig });
       }
@@ -5865,5 +5926,7 @@ module.exports.createCortexPersistenceCoordinator = createCortexPersistenceCoord
 module.exports.feelingTailForAgent = feelingTailForAgent;
 module.exports.externalUserStimulusForReaction = externalUserStimulusForReaction;
 module.exports.evalIsolationForRequest = evalIsolationForRequest;
+module.exports.convertHarnessActivityParts = convertHarnessActivityParts;
+module.exports.isHarnessInvocationLocked = isHarnessInvocationLocked;
 
 /* === VIVENTIUM END === */

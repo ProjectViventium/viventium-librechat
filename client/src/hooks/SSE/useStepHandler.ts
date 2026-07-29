@@ -51,9 +51,15 @@ type MessageDeltaUpdate = { type: ContentTypes.TEXT; text: string; tool_call_ids
 
 type ReasoningDeltaUpdate = { type: ContentTypes.THINK; think: string };
 
+type HarnessActivityDeltaUpdate = {
+  type: ContentTypes.HARNESS_ACTIVITY;
+  harness_activity: { event: string; summary: string };
+};
+
 type AllContentTypes =
   | ContentTypes.TEXT
   | ContentTypes.THINK
+  | ContentTypes.HARNESS_ACTIVITY
   | ContentTypes.TOOL_CALL
   | ContentTypes.IMAGE_FILE
   | ContentTypes.IMAGE_URL
@@ -170,6 +176,21 @@ export default function useStepHandler({
       };
 
       updatedContent[index] = update;
+    } else if (
+      contentType === ContentTypes.HARNESS_ACTIVITY &&
+      ContentTypes.HARNESS_ACTIVITY in contentPart &&
+      contentPart.harness_activity
+    ) {
+      const currentContent = updatedContent[index] as HarnessActivityDeltaUpdate | undefined;
+      const incoming = contentPart.harness_activity as { event?: string; summary?: string };
+      const previous = currentContent?.harness_activity?.summary ?? '';
+      updatedContent[index] = {
+        type: ContentTypes.HARNESS_ACTIVITY,
+        harness_activity: {
+          event: incoming.event ?? 'reasoning-summary',
+          summary: previous + (incoming.summary ?? ''),
+        },
+      } as TMessageContentParts;
     } else if (contentType === ContentTypes.IMAGE_URL && 'image_url' in contentPart) {
       const currentContent = updatedContent[index] as {
         type: ContentTypes.IMAGE_URL;
@@ -629,10 +650,8 @@ export default function useStepHandler({
             metadata: {
               ...((existing as Record<string, unknown>).metadata as Record<string, unknown>),
               viventium: {
-                ...(
-                  (((existing as Record<string, unknown>).metadata as Record<string, unknown>)
-                    ?.viventium as Record<string, unknown>) ?? {}
-                ),
+                ...((((existing as Record<string, unknown>).metadata as Record<string, unknown>)
+                  ?.viventium as Record<string, unknown>) ?? {}),
                 type: 'cortex_followup',
                 parentRunId: followUp.runId,
                 cortexCount: followUp.cortexCount,

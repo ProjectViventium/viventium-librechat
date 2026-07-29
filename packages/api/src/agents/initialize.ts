@@ -64,6 +64,15 @@ import {
   getConversationRecallVectorRuntimeStatus,
 } from './conversationRecallAvailability';
 import { primeResources } from './resources';
+/* === VIVENTIUM START ===
+ * Feature: Runtime provider capability enforcement.
+ * Purpose: Validate every agent at the common initialization seam.
+ */
+import {
+  applyAgentProviderCapabilityDefaults,
+  type ProviderCapabilityRegistry,
+} from './validation';
+/* === VIVENTIUM END === */
 
 /**
  * Extended agent type with additional fields needed after initialization
@@ -251,6 +260,26 @@ export async function initializeAgent(
     );
   }
 
+  /* === VIVENTIUM START ===
+   * Feature: Runtime provider capability enforcement.
+   * Purpose: Fail closed for every main, handoff, and cortex agent before provider initialization.
+   */
+  const agentsEndpointConfig = req.config?.endpoints?.agents as
+    | {
+        providerCapabilities?: ProviderCapabilityRegistry;
+        capabilityRequiredProviders?: string[];
+      }
+    | undefined;
+  Object.assign(
+    agent,
+    applyAgentProviderCapabilityDefaults(
+      agent as Agent & Record<string, unknown>,
+      agentsEndpointConfig?.providerCapabilities,
+      agentsEndpointConfig?.capabilityRequiredProviders,
+    ),
+  );
+  /* === VIVENTIUM END === */
+
   let currentFiles: IMongoFile[] | undefined;
 
   const _modelOptions = structuredClone(
@@ -267,6 +296,22 @@ export async function initializeAgent(
 
   const provider = agent.provider;
   agent.endpoint = provider;
+  /* === VIVENTIUM START ===
+   * Feature: GlassHive provider capabilities at the owning Agent runtime seam.
+   * Purpose: Provider-specific behavior is declared by compiled capability metadata, never by
+   * provider labels. Harness-backed agents cannot recursively call GlassHive's delegation MCP.
+   * === VIVENTIUM END === */
+  const providerCapability = (
+    agentsEndpointConfig as
+      | {
+          providerCapabilities?: Record<
+            string,
+            { workspace_binding?: boolean; excluded_mcp_servers?: string[] }
+          >;
+        }
+      | undefined
+  )?.providerCapabilities?.[provider];
+  const excludedMcpServers = new Set(providerCapability?.excluded_mcp_servers ?? []);
 
   /**
    * Load conversation files for ALL agents, not just the initial agent.
@@ -654,6 +699,15 @@ export async function initializeAgent(
   }
   vivInitTimings.transcript_attach_ms = Date.now() - vivTranscriptStart;
 
+  /* Filter only at the load boundary: recall and meeting-resource setup above may add file_search. */
+  const runtimeAgentTools = (agent.tools ?? []).filter((tool) => {
+    const delimiterIndex = tool.lastIndexOf(Constants.mcp_delimiter);
+    if (delimiterIndex < 0) {
+      return true;
+    }
+    const serverName = tool.slice(delimiterIndex + Constants.mcp_delimiter.length);
+    return !excludedMcpServers.has(serverName);
+  });
   const vivLoadToolsStart = Date.now();
   const {
     toolRegistry,
@@ -667,7 +721,7 @@ export async function initializeAgent(
     res,
     provider,
     agentId: agent.id,
-    tools: agent.tools ?? [],
+    tools: runtimeAgentTools,
     model: agent.model,
     tool_options: agent.tool_options,
     tool_resources,
@@ -777,6 +831,49 @@ export async function initializeAgent(
   }
   if (options.configOptions) {
     (agent.model_parameters as Record<string, unknown>).configuration = options.configOptions;
+  }
+  /* === VIVENTIUM START ===
+   * Feature: Structured GlassHive conversation binding.
+   * Purpose: Supply authenticated Agent/document state to an OpenAI-compatible provider without
+   * teaching GlassHive about LibreChat internals. Dynamic request placeholders are resolved only
+   * at run time, when the conversation/message/surface are known.
+   * === VIVENTIUM END === */
+  if (providerCapability?.workspace_binding === true) {
+    const configuredOptions = (
+      agent as Agent & {
+        glasshive_options?: {
+          workspace?: { mode?: 'life' | 'custom'; path?: string };
+          access?: 'full' | 'workspace';
+        };
+      }
+    ).glasshive_options ?? {
+      workspace: { mode: 'life' as const },
+      access: 'full' as const,
+    };
+    const workspacePath =
+      configuredOptions.workspace?.mode === 'custom'
+        ? String(configuredOptions.workspace.path ?? '')
+        : '';
+    const llmConfiguration = ((agent.model_parameters as Record<string, unknown>).configuration ??
+      {}) as Record<string, unknown>;
+    const configuredHeaders = (llmConfiguration.defaultHeaders ?? {}) as Record<string, string>;
+    llmConfiguration.defaultHeaders = {
+      ...configuredHeaders,
+      'X-Viventium-User-Id': '{{LIBRECHAT_USER_ID}}',
+      'X-Viventium-Conversation-Id': '{{LIBRECHAT_BODY_CONVERSATIONID}}',
+      'X-Viventium-Message-Id': '{{LIBRECHAT_BODY_MESSAGEID}}',
+      'X-GlassHive-Idempotency-Key': '{{LIBRECHAT_BODY_VIVENTIUMGLASSHIVEIDEMPOTENCYKEY}}',
+      'X-Viventium-Stream-Id': '{{LIBRECHAT_BODY_VIVENTIUMSTREAMID}}',
+      'X-Viventium-Surface': '{{LIBRECHAT_BODY_VIVENTIUMSURFACE}}',
+      'X-Viventium-Input-Mode': '{{LIBRECHAT_BODY_VIVENTIUMINPUTMODE}}',
+      'X-GlassHive-Agent-Id': agent.id,
+      'X-GlassHive-Workspace-Mode': configuredOptions.workspace?.mode ?? 'life',
+      'X-GlassHive-Workspace-Path-B64': workspacePath
+        ? Buffer.from(workspacePath, 'utf8').toString('base64')
+        : '',
+      'X-GlassHive-Access': configuredOptions.access ?? 'full',
+    };
+    (agent.model_parameters as Record<string, unknown>).configuration = llmConfiguration;
   }
 
   if (agent.instructions && agent.instructions !== '') {

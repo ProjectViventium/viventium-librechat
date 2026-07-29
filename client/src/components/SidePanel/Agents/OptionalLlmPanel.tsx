@@ -13,7 +13,7 @@ import type { AgentForm, AgentModelPanelProps } from '~/common';
 import { useLocalize } from '~/hooks';
 import { Panel } from '~/common';
 import { cn } from '~/utils';
-import { resolveAgentModelForProvider } from './modelSelection';
+import { didAgentProviderChange, resolveAgentModelForProvider } from './modelSelection';
 import ModelParametersSection from './ModelParametersSection';
 
 type OptionalLlmFieldNames = {
@@ -64,6 +64,20 @@ export default function OptionalLlmPanel({
 
   useEffect(() => {
     const currentModel = selectedModel ?? '';
+    /* === VIVENTIUM START ===
+     * Feature: Optional-route provider parameter isolation.
+     * Purpose: Clear only the previous provider's parameter bag on a user-driven provider change.
+     * Initial hydration preserves the persisted route exactly.
+     * === VIVENTIUM END === */
+    if (
+      didAgentProviderChange({
+        provider,
+        previousProvider: previousProviderRef.current,
+      })
+    ) {
+      setValue(fields.parameters, {});
+    }
+
     if (!provider) {
       previousProviderRef.current = provider;
       return;
@@ -81,7 +95,7 @@ export default function OptionalLlmPanel({
     }
 
     previousProviderRef.current = provider;
-  }, [fields.model, provider, models, modelsData, setValue, selectedModel]);
+  }, [fields.model, fields.parameters, provider, models, modelsData, setValue, selectedModel]);
 
   const handleClear = () => {
     setValue(fields.model, null);

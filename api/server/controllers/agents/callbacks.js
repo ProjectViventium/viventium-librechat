@@ -7,7 +7,13 @@ const {
   writeAttachmentEvent,
   createToolExecuteHandler,
 } = require('@librechat/api');
-const { Tools, StepTypes, FileContext, ErrorTypes } = require('librechat-data-provider');
+const {
+  Tools,
+  StepTypes,
+  ContentTypes,
+  FileContext,
+  ErrorTypes,
+} = require('librechat-data-provider');
 const {
   EnvVar,
   Providers,
@@ -78,6 +84,60 @@ const logVoiceLatencyStage = (req, stage, stageStartAt = null, details = '') => 
  * Added: 2026-05-14
  */
 const isVoiceModeRequest = (req) => req?.body?.voiceMode === true;
+
+const harnessActivityDelta = (data) => {
+  const content = Array.isArray(data?.delta?.content) ? data.delta.content : [];
+  const summary = content
+    .map((part) => part?.think || part?.text || '')
+    .filter(Boolean)
+    .join('');
+  if (!summary) {
+    return data;
+  }
+  return {
+    ...data,
+    delta: {
+      ...data.delta,
+      content: [
+        {
+          type: ContentTypes.HARNESS_ACTIVITY,
+          harness_activity: {
+            event: 'reasoning-summary',
+            summary,
+          },
+        },
+      ],
+    },
+  };
+};
+
+/* === VIVENTIUM START ===
+ * Feature: GlassHive duplicate-author guard.
+ * Purpose: OpenAI-compatible streams begin with a role-only message delta before the native
+ * harness process starts. Only visible assistant content is an authoring commit point; otherwise
+ * a configured direct fallback must remain available for a pre-start harness failure.
+ */
+const hasVisibleMessageDelta = (data) => {
+  const content = data?.delta?.content;
+  if (typeof content === 'string') {
+    return content.length > 0;
+  }
+  if (!Array.isArray(content)) {
+    return false;
+  }
+  return content.some((part) => {
+    if (typeof part === 'string') {
+      return part.length > 0;
+    }
+    if (!part || typeof part !== 'object') {
+      return false;
+    }
+    return [part.text, part.output_text, part.content].some(
+      (value) => typeof value === 'string' && value.length > 0,
+    );
+  });
+};
+/* === VIVENTIUM END === */
 
 const getTextDeltaMode = (req) => {
   const configured = req?.body?.viventiumTextDeltaMode ?? req?.body?.viventiumStreamTextDeltaMode;
@@ -640,6 +700,17 @@ function getDefaultHandlers({
        * @param {GraphRunnableConfig['configurable']} [metadata] The runnable metadata.
        */
       handle: async (event, data, metadata) => {
+        /* === VIVENTIUM START ===
+         * Feature: GlassHive duplicate-author guard.
+         * Purpose: Visible provider-authored content proves the native harness has begun authoring.
+         * A role-only compatibility delta does not lock fallback because it precedes native start.
+         * === VIVENTIUM END === */
+        if (
+          req?._viventiumHarnessExecutionEnabled === true &&
+          hasVisibleMessageDelta(data)
+        ) {
+          req._viventiumHarnessInvocationStarted = true;
+        }
         markVoiceOrchEvent(req, 'on_message_delta');
         /* === VIVENTIUM START ===
          * Feature: Deep Telegram timing instrumentation (toggleable)
@@ -717,6 +788,14 @@ function getDefaultHandlers({
        * @param {GraphRunnableConfig['configurable']} [metadata] The runnable metadata.
        */
       handle: async (event, data, metadata) => {
+        /* === VIVENTIUM START ===
+         * Feature: GlassHive duplicate-author guard.
+         * Purpose: GlassHive emits normalized activity through the reasoning channel before
+         * ordinary text. Treat that first accepted delta as the authoring-run commit point.
+         * === VIVENTIUM END === */
+        if (req?._viventiumHarnessExecutionEnabled === true) {
+          req._viventiumHarnessInvocationStarted = true;
+        }
         const reasoningMetric = markVoiceOrchEvent(req, 'on_reasoning_delta');
         if (reasoningMetric?.firstSeen) {
           logVoiceLatencyStage(req, 'first_reasoning_delta', getVoiceProcessStreamStartAt(req), '');
@@ -752,11 +831,16 @@ function getDefaultHandlers({
           return;
         }
         /* === VIVENTIUM END === */
+        const visibleData = req?._viventiumHarnessActivityEnabled
+          ? harnessActivityDelta(data)
+          : data;
         if (checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node)) {
-          await emitEvent(res, streamId, { event, data });
+          await emitEvent(res, streamId, { event, data: visibleData });
         } else if (!metadata?.hide_sequential_outputs) {
-          await emitEvent(res, streamId, { event, data });
+          await emitEvent(res, streamId, { event, data: visibleData });
         }
+        // The closed upstream aggregator understands THINK only. Persisted content is converted
+        // to HARNESS_ACTIVITY at AgentClient's provider-aware finalization seam.
         aggregateContent({ event, data });
       },
     },

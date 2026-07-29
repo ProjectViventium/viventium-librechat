@@ -9,6 +9,12 @@ import type { Agent } from 'librechat-data-provider';
 
 // Mock toast context - define this after all mocks
 let mockShowToast: jest.Mock;
+/* === VIVENTIUM START === Optional-route agent-switch hydration regression state. === */
+let mockActivePanel = 'builder';
+let mockCurrentAgentId = 'agent-123';
+let mockWatchedAgentId = 'agent-123';
+let mockVoicePanelMount = 0;
+/* === VIVENTIUM END === */
 
 // Mock notification severity enum before other imports
 jest.mock('~/common/types', () => ({
@@ -110,12 +116,12 @@ jest.mock('~/hooks/useResourcePermissions', () => ({
 
 jest.mock('~/Providers/AgentPanelContext', () => ({
   useAgentPanelContext: () => ({
-    activePanel: 'builder',
+    activePanel: mockActivePanel,
     agentsConfig: { allowedProviders: [] },
     setActivePanel: jest.fn(),
     endpointsConfig: {},
     setCurrentAgentId: jest.fn(),
-    agent_id: 'agent-123',
+    agent_id: mockCurrentAgentId,
   }),
 }));
 
@@ -127,6 +133,9 @@ jest.mock('~/common', () => ({
     model: 'model',
     builder: 'builder',
     advanced: 'advanced',
+    voiceLlmModel: 'voiceLlmModel',
+    fallbackLlmModel: 'fallbackLlmModel',
+    voiceFallbackLlmModel: 'voiceFallbackLlmModel',
   },
 }));
 
@@ -155,6 +164,22 @@ jest.mock('./ModelPanel', () => ({
   __esModule: true,
   default: () => <div>{`Model Panel`}</div>,
 }));
+
+/* === VIVENTIUM START ===
+ * Regression: Track whether an agent-scoped optional route panel remounts on agent hydration.
+ * === VIVENTIUM END === */
+jest.mock('./VoiceLlmPanel', () => {
+  const ReactModule = jest.requireActual('react') as typeof React;
+  function VoiceLlmPanelMock() {
+    const [mountId] = ReactModule.useState(() => ++mockVoicePanelMount);
+    return <div data-testid="voice-llm-panel" data-mount-id={mountId} />;
+  }
+
+  return {
+    __esModule: true,
+    default: VoiceLlmPanelMock,
+  };
+});
 
 // Mock AgentFooter to provide a save button
 jest.mock('./AgentFooter', () => ({
@@ -198,7 +223,7 @@ jest.mock('react-hook-form', () => {
       };
     },
     FormProvider: ({ children }: any) => children,
-    useWatch: () => 'agent-123',
+    useWatch: () => mockWatchedAgentId,
   };
 });
 
@@ -291,6 +316,10 @@ describe('AgentPanel - Update Agent Toast Messages', () => {
     jest.clearAllMocks();
     mockShowToast = jest.fn();
     mockFormSubmitHandler = null;
+    mockActivePanel = 'builder';
+    mockCurrentAgentId = 'agent-123';
+    mockWatchedAgentId = 'agent-123';
+    mockVoicePanelMount = 0;
   });
 
   describe('AgentPanel', () => {
@@ -401,6 +430,31 @@ describe('AgentPanel - Update Agent Toast Messages', () => {
           status: 'error',
         });
       });
+    });
+
+    /* === VIVENTIUM START ===
+     * Regression: Switching agents while the voice panel is open must reset provider-history refs.
+     * === VIVENTIUM END === */
+    it('remounts the optional voice panel when the form hydrates a different agent', () => {
+      const { mockUseGetAgentByIdQuery } = setupMocks();
+      mockAgentQuery(mockUseGetAgentByIdQuery, {
+        name: 'First Agent',
+        version: 1,
+      });
+      mockActivePanel = 'voiceLlmModel';
+
+      const Wrapper = createWrapper();
+      const { getByTestId, rerender } = render(<AgentPanel />, { wrapper: Wrapper });
+      const firstMountId = getByTestId('voice-llm-panel').getAttribute('data-mount-id');
+
+      rerender(<AgentPanel />);
+      expect(getByTestId('voice-llm-panel').getAttribute('data-mount-id')).toBe(firstMountId);
+
+      mockCurrentAgentId = 'agent-456';
+      mockWatchedAgentId = 'agent-456';
+      rerender(<AgentPanel />);
+
+      expect(getByTestId('voice-llm-panel').getAttribute('data-mount-id')).not.toBe(firstMountId);
     });
   });
 });

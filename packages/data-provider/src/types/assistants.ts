@@ -6,7 +6,7 @@ import type { Agents, GraphEdge } from './agents';
  * Purpose: Import CortexContentPart so assistant/agent message types can include Viventium cortex parts.
  * Added: 2026-01-03
  */
-import type { ContentTypes, CortexContentPart } from './runs';
+import type { ContentTypes, CortexContentPart, HarnessActivityContentPart } from './runs';
 /* === VIVENTIUM END === */
 import type { TFile } from './files';
 import { ArtifactModes } from 'src/artifacts';
@@ -214,6 +214,19 @@ export type AgentModelParameters = {
   frequency_penalty: AgentParameterValue;
   presence_penalty: AgentParameterValue;
   useResponsesApi?: boolean;
+  reasoning_effort?: string | null;
+};
+
+/* === VIVENTIUM START ===
+ * Feature: GlassHive core Agent provider
+ * Purpose: Keep workspace/access typed across API, version, and Agent Builder surfaces.
+ * === VIVENTIUM END === */
+export type GlassHiveOptions = {
+  workspace: {
+    mode: 'life' | 'custom';
+    path?: string;
+  };
+  access: 'full' | 'workspace';
 };
 
 export interface AgentBaseResource {
@@ -305,6 +318,7 @@ export type Agent = {
   provider: AgentProvider;
   model: string | null;
   model_parameters: AgentModelParameters;
+  glasshive_options?: GlassHiveOptions;
   conversation_starters?: string[];
   /** @deprecated Use ACL permissions instead */
   isCollaborative?: boolean;
@@ -387,6 +401,7 @@ export type AgentCreateParams = {
   | 'support_contact'
   | 'tool_options'
   | 'conversation_recall_agent_only'
+  | 'glasshive_options'
   /* === VIVENTIUM START === */
   | 'background_cortices'
   /* === VIVENTIUM END === */
@@ -427,6 +442,7 @@ export type AgentUpdateParams = {
   | 'support_contact'
   | 'tool_options'
   | 'conversation_recall_agent_only'
+  | 'glasshive_options'
   /* === VIVENTIUM START === */
   | 'background_cortices'
   /* === VIVENTIUM END === */
@@ -672,8 +688,9 @@ export type TMessageContentParts =
    * Added: 2026-01-03
    */
   | (Agents.MessageContentInputAudio & ContentMetadata)
-  | (CortexContentPart & ContentMetadata);
-  /* === VIVENTIUM END === */
+  | (CortexContentPart & ContentMetadata)
+  | (HarnessActivityContentPart & ContentMetadata);
+/* === VIVENTIUM END === */
 
 export type StreamContentData = TMessageContentParts & {
   /** The index of the current content part */

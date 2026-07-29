@@ -38,6 +38,7 @@ const {
 
 const yaml = require('js-yaml');
 const mongoose = require('mongoose');
+const { applyAgentProviderCapabilityDefaults } = require('@librechat/api');
 const { Agent, User } = require('../api/db/models');
 const { updateAgent, createAgent } = require('../api/models/Agent');
 /* === VIVENTIUM START ===
@@ -103,6 +104,19 @@ function resolveSourceOfTruthAgentsPath(envSlug) {
 
 function resolveSourceOfTruthLibrechatYamlPath(envSlug) {
   return path.join(SOURCE_OF_TRUTH_DIR, `${sanitizeSlug(envSlug)}.librechat.yaml`);
+}
+
+function loadAgentProviderCapabilityPolicy(envSlug) {
+  const configPath = resolveSourceOfTruthLibrechatYamlPath(envSlug);
+  if (!fs.existsSync(configPath)) {
+    throw new Error(`Provider capability source of truth not found: ${configPath}`);
+  }
+  const config = yaml.load(fs.readFileSync(configPath, 'utf8')) || {};
+  const agents = config?.endpoints?.agents || {};
+  return {
+    registry: agents.providerCapabilities || {},
+    requiredProviders: agents.capabilityRequiredProviders || [],
+  };
 }
 
 function normalizeBundleForSourceOfTruth(bundle) {
@@ -183,6 +197,7 @@ const AGENT_FIELDS = [
   'tool_kwargs',
   'tool_options',
   'model_parameters',
+  'glasshive_options',
   'end_after_tools',
   'hide_sequential_outputs',
   'support_contact',
@@ -216,6 +231,7 @@ const MODEL_CONFIG_ONLY_FIELDS = [
   'provider',
   'model',
   'model_parameters',
+  'glasshive_options',
   'voice_llm_model',
   'voice_llm_provider',
   'voice_llm_model_parameters',
@@ -237,6 +253,7 @@ const REVIEW_FIELDS = [
   'provider',
   'model',
   'model_parameters',
+  'glasshive_options',
   'voice_llm_model',
   'voice_llm_provider',
   'voice_llm_model_parameters',
@@ -1611,6 +1628,7 @@ async function pushAgent({
   runtimeAware = false,
   activationFields = null,
   selectedAgentIds = null,
+  providerCapabilityPolicy,
 }) {
   if (!agentData || !agentData.id) {
     return { id: null, status: 'skipped', reason: 'missing agent id' };
@@ -1649,6 +1667,14 @@ async function pushAgent({
         createData[field] = agentData[field];
       }
     }
+    Object.assign(
+      createData,
+      applyAgentProviderCapabilityDefaults(
+        createData,
+        providerCapabilityPolicy?.registry,
+        providerCapabilityPolicy?.requiredProviders,
+      ),
+    );
     createData.author = userId;
     createData.authorName = (await User.findById(userId, 'name').lean())?.name || '';
     if (dryRun) {
@@ -1701,6 +1727,15 @@ async function pushAgent({
   });
   if (Object.keys(updateData).length === 0) {
     return { id: agentData.id, status: 'skipped', reason: 'no updatable fields' };
+  }
+
+  const validatedCandidate = applyAgentProviderCapabilityDefaults(
+    { ...existing, ...updateData },
+    providerCapabilityPolicy?.registry,
+    providerCapabilityPolicy?.requiredProviders,
+  );
+  for (const field of Object.keys(updateData)) {
+    updateData[field] = validatedCandidate[field];
   }
 
   const fieldsUpdated = Object.keys(updateData);
@@ -1756,6 +1791,7 @@ async function pushBundle({
   if (!bundle || !bundle.mainAgent) {
     throw new Error('Invalid bundle: missing mainAgent');
   }
+  const providerCapabilityPolicy = loadAgentProviderCapabilityPolicy(env);
   const compareResult = await compareBundles({
     email,
     agentId: bundle.mainAgent.id || bundle.meta?.mainAgentId || null,
@@ -1810,6 +1846,7 @@ async function pushBundle({
         runtimeAware,
         activationFields,
         selectedAgentIds,
+        providerCapabilityPolicy,
       }),
     );
   } else {
@@ -1854,6 +1891,7 @@ async function pushBundle({
           runtimeAware,
           activationFields,
           selectedAgentIds,
+          providerCapabilityPolicy,
         }),
       );
     }

@@ -44,7 +44,7 @@ describe('BackgroundCortexService activation policy helpers', () => {
     delete process.env.VIVENTIUM_CORTEX_PHASE_A_NOTICE_MODE;
   });
 
-  test('injects a pinned feeling capsule only into the configured all-agent scope', () => {
+  test('keeps specialist background cortices independent from the pinned embodiment capsule', () => {
     const capsule = '<viventium_feeling_state>\n- Energy: steady\n</viventium_feeling_state>';
     expect(
       feelingTailForBackgroundAgent({
@@ -53,7 +53,7 @@ describe('BackgroundCortexService activation policy helpers', () => {
         agentScope: 'all_agents',
         capsule,
       }),
-    ).toBe(capsule);
+    ).toBe('');
     expect(
       feelingTailForBackgroundAgent({
         available: true,
@@ -1020,6 +1020,16 @@ describe('BackgroundCortexService activation policy helpers', () => {
 
     expect(llmConfig.temperature).toBeUndefined();
     expect(llmConfig.modelKwargs).toBeUndefined();
+  });
+
+  test('fails loudly when an activation provider cannot be resolved exactly', async () => {
+    await expect(
+      buildActivationLlmConfig({
+        providerName: 'missing-provider',
+        model: 'missing-model',
+        req: { user: { id: 'user-test' }, config: { endpoints: { custom: [] } } },
+      }),
+    ).rejects.toThrow('Unsupported or unavailable activation provider');
   });
 
   test('adds a bounded guard grace around each Phase B cortex attempt', () => {

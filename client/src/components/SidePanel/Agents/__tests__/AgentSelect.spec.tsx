@@ -115,6 +115,7 @@ describe('AgentSelect', () => {
         selectedAgentId={null}
         setCurrentAgentId={jest.fn()}
         createMutation={{ reset: jest.fn() } as any}
+        providerCapabilities={{}}
       />,
     );
 

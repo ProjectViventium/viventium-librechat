@@ -1219,7 +1219,11 @@ const updateAgentProjects = async ({ user, agentId, projectIds, removeProjectIds
  * @returns {Promise<MongoAgent>} The updated agent document after reverting.
  * @throws {Error} If the agent is not found or the specified version does not exist.
  */
-const revertAgentVersion = async (searchParameter, versionIndex) => {
+/* === VIVENTIUM START ===
+ * Feature: Provider-safe agent version reverts.
+ * Purpose: Persist a capability-validated version instead of bypassing current provider policy.
+ */
+const revertAgentVersion = async (searchParameter, versionIndex, validatedVersion = null) => {
   const agent = await Agent.findOne(searchParameter);
   if (!agent) {
     throw new Error('Agent not found');
@@ -1232,8 +1236,9 @@ const revertAgentVersion = async (searchParameter, versionIndex) => {
   const revertToVersion = agent.versions[versionIndex];
 
   const updateData = {
-    ...revertToVersion,
+    ...(validatedVersion || revertToVersion),
   };
+  /* === VIVENTIUM END === */
 
   delete updateData._id;
   delete updateData.id;

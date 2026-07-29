@@ -13,7 +13,12 @@
 const crypto = require('crypto');
 const { logger } = require('@librechat/data-schemas');
 const { Run, Providers } = require('@librechat/agents');
-const { initializeAnthropic, initializeOpenAI } = require('@librechat/api');
+const {
+  createSafeUser,
+  initializeAnthropic,
+  initializeOpenAI,
+  resolveHeaders,
+} = require('@librechat/api');
 const { HumanMessage } = require('@langchain/core/messages');
 const {
   ContentTypes,
@@ -80,6 +85,22 @@ const {
  * inline fallbacks for installs that have not loaded the compiled prompt bundle yet.
  * === VIVENTIUM END === */
 const { getPromptText } = require('~/server/services/viventium/promptRegistry');
+const {
+  attachConversationProviderCapabilityBundle,
+  buildHarnessIdempotencyKey,
+} = require('~/server/services/viventium/GlassHiveConversationProviderService');
+
+function pinFeelingCapsuleLast({ instructions, capsule }) {
+  const current = typeof instructions === 'string' ? instructions : '';
+  const exactCapsule = typeof capsule === 'string' ? capsule.trim() : '';
+  if (!exactCapsule) return current;
+  const withoutCapsule = current
+    .split(exactCapsule)
+    .join('')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  return [withoutCapsule, exactCapsule].filter(Boolean).join('\n\n');
+}
 /* === VIVENTIUM NOTE === */
 /* === VIVENTIUM NOTE ===
  * Feature: No Response Tag ({NTA}) prompt injection (env-gated, config-driven).
@@ -625,11 +646,9 @@ function resolveGovernedFollowUpModel(agent, { useVoiceModel = false } = {}) {
   if (fallbackModel) {
     return fallbackModel;
   }
-  logger.warn(
-    `[BackgroundCortexFollowUpService] Unknown follow-up provider "${rawProvider}"; ` +
-      `falling back to ${DEFAULT_MODELS.openAI}`,
+  throw new Error(
+    `No governed follow-up model is configured for provider "${rawProvider || 'missing'}"`,
   );
-  return DEFAULT_MODELS.openAI;
 }
 /* === VIVENTIUM NOTE === */
 
@@ -734,7 +753,21 @@ function mergeFollowUpAgentRuntimeState(runtimeAgent, persistedAgent) {
 }
 
 async function resolveCanonicalFollowUpAgent(agent, { useVoiceModel = false } = {}) {
-  let assignment = resolveFollowUpRuntimeAssignment(agent, { useVoiceModel });
+  let assignment;
+  let initialResolutionError = null;
+  try {
+    assignment = resolveFollowUpRuntimeAssignment(agent, { useVoiceModel });
+  } catch (error) {
+    if (!agent?.id || normalizeFollowUpProvider(agent?.provider)) {
+      throw error;
+    }
+    initialResolutionError = error;
+    assignment = {
+      runtimeAgent: cloneFollowUpAgent(agent || {}),
+      effectiveModel: '',
+      effectiveProvider: '',
+    };
+  }
   const normalizedAssignmentProvider = normalizeFollowUpProvider(assignment.effectiveProvider);
   if (normalizedAssignmentProvider || !agent?.id) {
     return {
@@ -753,6 +786,9 @@ async function resolveCanonicalFollowUpAgent(agent, { useVoiceModel = false } = 
       logger.warn(
         `[BackgroundCortexFollowUpService] No canonical persisted agent found for follow-up rehydrate: id=${agent.id}`,
       );
+      if (initialResolutionError) {
+        throw initialResolutionError;
+      }
       return assignment;
     }
 
@@ -786,6 +822,9 @@ async function resolveCanonicalFollowUpAgent(agent, { useVoiceModel = false } = 
       '[BackgroundCortexFollowUpService] Failed to rehydrate canonical agent for follow-up:',
       sanitizeFollowUpErrorForLog(err),
     );
+    if (initialResolutionError) {
+      throw initialResolutionError;
+    }
     return assignment;
   }
 }
@@ -1113,6 +1152,8 @@ async function resolveFollowUpLLMConfig({
   effectiveModel,
   primaryResponseMode = false,
   useVoiceModel = false,
+  conversationId = '',
+  parentMessageId = '',
 }) {
   let resolvedAgent = agent || {};
   let resolvedProviderName = normalizeFollowUpProvider(providerName).toLowerCase();
@@ -1263,14 +1304,94 @@ async function resolveFollowUpLLMConfig({
   }
 
   if (req && resolvedProviderName) {
+    const agentsConfig = req.config?.endpoints?.agents || {};
+    const followUpCapability = agentsConfig.providerCapabilities?.[resolvedProviderName];
+    const followUpIdempotencyKey = buildHarnessIdempotencyKey(
+      'phase_b',
+      parentMessageId || req.body?.responseMessageId || req.body?.messageId,
+      resolvedAgent?.id,
+    );
+    if (followUpCapability?.phase_b_followup === false) {
+      throw new Error(`Provider "${resolvedProviderName}" cannot author Phase B follow-up`);
+    }
+    if (
+      !followUpCapability &&
+      (agentsConfig.capabilityRequiredProviders || []).includes(resolvedProviderName)
+    ) {
+      throw new Error(
+        `Provider capability configuration is unavailable for "${resolvedProviderName}"`,
+      );
+    }
+    await attachConversationProviderCapabilityBundle({
+      targetAgent: resolvedAgent,
+      declaredAgent: resolvedAgent,
+      req,
+      capability: followUpCapability,
+      requestBody: {
+        ...(req.body || {}),
+        conversationId: conversationId || req.body?.conversationId || '',
+        parentMessageId: parentMessageId || req.body?.parentMessageId || '',
+        messageId: parentMessageId || req.body?.messageId || '',
+        viventiumGlassHiveIdempotencyKey: followUpIdempotencyKey,
+      },
+    });
     const customConfig = await getCustomEndpointConfig(resolvedProviderName, req);
     if (customConfig?.apiKey && customConfig?.baseURL) {
+      const existingHeaders =
+        resolvedAgent?.model_parameters?.configuration?.defaultHeaders ||
+        customConfig.defaultHeaders ||
+        {};
+      let runtimeHeaders = { ...existingHeaders };
+      if (followUpCapability?.workspace_binding === true) {
+        const options = resolvedAgent.glasshive_options || {
+          workspace: { mode: 'life' },
+          access: 'full',
+        };
+        const customPath =
+          options?.workspace?.mode === 'custom' ? String(options.workspace.path || '') : '';
+        runtimeHeaders = {
+          ...runtimeHeaders,
+          'X-Viventium-User-Id': '{{LIBRECHAT_USER_ID}}',
+          'X-Viventium-Conversation-Id': '{{LIBRECHAT_BODY_CONVERSATIONID}}',
+          'X-Viventium-Message-Id': '{{LIBRECHAT_BODY_MESSAGEID}}',
+          'X-GlassHive-Idempotency-Key':
+            '{{LIBRECHAT_BODY_VIVENTIUMGLASSHIVEIDEMPOTENCYKEY}}',
+          'X-Viventium-Stream-Id': '{{LIBRECHAT_BODY_VIVENTIUMSTREAMID}}',
+          'X-Viventium-Surface': '{{LIBRECHAT_BODY_VIVENTIUMSURFACE}}',
+          'X-Viventium-Input-Mode': '{{LIBRECHAT_BODY_VIVENTIUMINPUTMODE}}',
+          'X-GlassHive-Agent-Id': resolvedAgent.id,
+          'X-GlassHive-Workspace-Mode': options?.workspace?.mode || 'life',
+          'X-GlassHive-Workspace-Path-B64': customPath
+            ? Buffer.from(customPath, 'utf8').toString('base64')
+            : '',
+          'X-GlassHive-Access': options?.access || 'full',
+        };
+      }
       llmConfig.provider = Providers.OPENAI;
       llmConfig.configuration = {
         apiKey: customConfig.apiKey,
         baseURL: customConfig.baseURL,
+        defaultHeaders: resolveHeaders({
+          headers: runtimeHeaders,
+          user: createSafeUser(req.user),
+          body: {
+            ...(req.body || {}),
+            conversationId: conversationId || req.body?.conversationId || '',
+            messageId: parentMessageId || req.body?.messageId || '',
+            viventiumGlassHiveIdempotencyKey: followUpIdempotencyKey,
+          },
+        }),
       };
+      if (Array.isArray(customConfig.dropParams) && customConfig.dropParams.length > 0) {
+        llmConfig.dropParams = customConfig.dropParams;
+      }
     }
+  }
+
+  if (!llmConfig.provider) {
+    throw new Error(
+      `Unsupported or unavailable follow-up provider "${resolvedProviderName || 'missing'}"`,
+    );
   }
 
   return llmConfig;
@@ -1696,6 +1817,7 @@ function buildFollowUpSystemPrompt({
   primaryResponseMode = false,
   continuationContext = '',
   noResponseInstructions = '',
+  feelingCapsule = '',
 } = {}) {
   const continuationContract =
     !primaryResponseMode && typeof continuationContext === 'string' && continuationContext.trim()
@@ -1723,10 +1845,45 @@ function buildFollowUpSystemPrompt({
   const promptId = primaryResponseMode
     ? 'cortex.follow_up_phase_b.primary_system'
     : 'cortex.follow_up_phase_b.system';
-  return getPromptText(promptId, fallback, {
+  const registeredPrompt = getPromptText(promptId, fallback, {
     continuation_contract: continuationContract,
     no_response_instructions: noResponseInstructions || '',
   });
+  return pinFeelingCapsuleLast({
+    instructions: registeredPrompt,
+    capsule: feelingCapsule,
+  });
+}
+
+function resolvePhaseBFeelingContext(snapshot) {
+  const capsule =
+    snapshot?.enabled === true && typeof snapshot?.capsule === 'string'
+      ? snapshot.capsule.trim()
+      : '';
+  return {
+    capsule,
+    enabled: snapshot?.enabled === true,
+    scope: snapshot?.agentScope || 'unknown',
+    snapshotHash: snapshot?.snapshotHash || '',
+    reason: capsule ? 'conscious_synthesis' : 'capsule_unavailable',
+  };
+}
+
+/* A same-session continuation already retains the capsule from the authored main turn. */
+function resolvePhaseBFeelingInjection({
+  feelingContext,
+  providerCapability,
+  primaryResponseMode = false,
+} = {}) {
+  const capsule = String(feelingContext?.capsule || '');
+  if (
+    capsule &&
+    primaryResponseMode !== true &&
+    providerCapability?.conversation_session === true
+  ) {
+    return { capsule: '', reason: 'preserved_in_conversation_session' };
+  }
+  return { capsule, reason: feelingContext?.reason || 'capsule_unavailable' };
 }
 /* === VIVENTIUM END === */
 
@@ -1943,6 +2100,8 @@ async function generateFollowUpText({
   continuationContext = '',
   runId = '',
   primaryResponseMode = false,
+  conversationId = '',
+  parentMessageId = '',
 }) {
   if (!agent) {
     return '';
@@ -2007,6 +2166,8 @@ async function generateFollowUpText({
     effectiveModel,
     primaryResponseMode,
     useVoiceModel,
+    conversationId,
+    parentMessageId,
   });
   if (!llmConfig?.provider) {
     throw new Error(
@@ -2026,10 +2187,19 @@ async function generateFollowUpText({
    * style directives.
    */
   const noResponseInstructions = buildNoResponseInstructions(req);
+  const phaseBFeelingContext = resolvePhaseBFeelingContext(req?._viventiumFeelingSnapshot);
+  const followUpProviderCapability =
+    req?.config?.endpoints?.agents?.providerCapabilities?.[providerName];
+  const phaseBFeelingInjection = resolvePhaseBFeelingInjection({
+    feelingContext: phaseBFeelingContext,
+    providerCapability: followUpProviderCapability,
+    primaryResponseMode,
+  });
   const systemPrompt = buildFollowUpSystemPrompt({
     primaryResponseMode,
     continuationContext,
     noResponseInstructions,
+    feelingCapsule: phaseBFeelingInjection.capsule,
   });
   logPromptFrame(
     logger,
@@ -2041,6 +2211,7 @@ async function generateFollowUpText({
       authClass: 'user_runtime',
       layers: {
         followup_system: systemPrompt,
+        viventium_feeling_state: phaseBFeelingInjection.capsule,
         followup_prompt: prompt,
         recent_response: recentResponse || '',
         user_request: userRequest || '',
@@ -2194,6 +2365,8 @@ async function createCortexFollowUpMessage({
         continuationContext: continuationContext.contextText,
         runId: parentMessageId || conversationId || '',
         primaryResponseMode: shouldForceVisibleFollowUp,
+        conversationId,
+        parentMessageId,
       });
     } catch (err) {
       generationFailed = true;
@@ -2385,6 +2558,8 @@ module.exports = {
   buildFollowUpDecisionRecord,
   compactDecisionRecordForMetadata,
   logFollowUpDecisionRecord,
+  resolvePhaseBFeelingContext,
+  resolvePhaseBFeelingInjection,
   persistFollowUpDecisionToParentMessage,
   sanitizeAnthropicFollowUpLLMConfig,
   stripQuestionSentences,

@@ -17,6 +17,7 @@ const {
   shouldRetryWithFallback,
   hasVisibleAssistantText,
   shouldRetryBackgroundCortexWithFallback,
+  initializePrimaryAgentWithFallback,
 } = require('../agentLlmFallback');
 
 describe('agentLlmFallback', () => {
@@ -182,6 +183,92 @@ describe('agentLlmFallback', () => {
         { provider: 'openAI', model: 'gpt-5.4' },
       ),
     ).toBe(true);
+  });
+
+  test('recovers a structured harness initialization failure through the configured direct fallback', async () => {
+    const primaryAgent = {
+      id: 'main',
+      provider: 'glasshive-harness',
+      model: 'codex-cli:gpt-5.6-sol',
+    };
+    const fallbackAgent = { id: 'main', provider: 'xai', model: 'grok-fallback' };
+    const primaryError = new Error('connected account unavailable');
+    primaryError.code = 'MODEL_AUTHENTICATION';
+    primaryError.viventiumRecoverableProviderError = true;
+    const initializePrimary = jest.fn(async () => {
+      throw primaryError;
+    });
+    const initializeFallback = jest.fn(async () => ({
+      id: 'main',
+      provider: 'xai',
+      model: 'grok-fallback',
+    }));
+
+    await expect(
+      initializePrimaryAgentWithFallback({
+        primaryAgent,
+        fallbackAgent,
+        fallbackAssignment: { provider: 'xai', model: 'grok-fallback' },
+        initializePrimary,
+        initializeFallback,
+      }),
+    ).resolves.toMatchObject({
+      effectiveAgent: fallbackAgent,
+      fallbackUsed: true,
+      primaryError,
+      config: { provider: 'xai', model: 'grok-fallback' },
+    });
+    expect(initializePrimary).toHaveBeenCalledTimes(1);
+    expect(initializeFallback).toHaveBeenCalledTimes(1);
+  });
+
+  test('does not hide a non-provider primary initialization failure behind model fallback', async () => {
+    const primaryError = new Error('tool registry invariant failed');
+    primaryError.code = 'TOOL_REGISTRY_FAILURE';
+    const initializeFallback = jest.fn();
+
+    await expect(
+      initializePrimaryAgentWithFallback({
+        primaryAgent: {
+          id: 'main',
+          provider: 'glasshive-harness',
+          model: 'codex-cli:gpt-5.6-sol',
+        },
+        fallbackAgent: { id: 'main', provider: 'xai', model: 'grok-fallback' },
+        fallbackAssignment: { provider: 'xai', model: 'grok-fallback' },
+        initializePrimary: async () => {
+          throw primaryError;
+        },
+        initializeFallback,
+      }),
+    ).rejects.toBe(primaryError);
+    expect(initializeFallback).not.toHaveBeenCalled();
+  });
+
+  test('does not start initialization fallback after cancellation', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const primaryError = new Error('connected account unavailable');
+    primaryError.code = 'MODEL_AUTHENTICATION';
+    const initializeFallback = jest.fn();
+
+    await expect(
+      initializePrimaryAgentWithFallback({
+        primaryAgent: {
+          id: 'main',
+          provider: 'glasshive-harness',
+          model: 'codex-cli:gpt-5.6-sol',
+        },
+        fallbackAgent: { id: 'main', provider: 'xai', model: 'grok-fallback' },
+        fallbackAssignment: { provider: 'xai', model: 'grok-fallback' },
+        initializePrimary: async () => {
+          throw primaryError;
+        },
+        initializeFallback,
+        signal: controller.signal,
+      }),
+    ).rejects.toBe(primaryError);
+    expect(initializeFallback).not.toHaveBeenCalled();
   });
 
   test('retries provider rate-limit errors only when no assistant text was produced', () => {

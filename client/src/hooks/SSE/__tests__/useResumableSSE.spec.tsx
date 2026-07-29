@@ -157,6 +157,35 @@ describe('useResumableSSE', () => {
     });
 
     expect(queueTitleGeneration).not.toHaveBeenCalled();
+    expect(request.post).toHaveBeenCalledWith(
+      '/api/agents/chat',
+      expect.objectContaining({ responseMessageId: expect.any(String) }),
+    );
+  });
+
+  it('reuses one client-minted response id when the generation start POST is retried', async () => {
+    jest.useFakeTimers();
+    const networkError = Object.assign(new Error('network unavailable'), { code: 'ERR_NETWORK' });
+    (request.post as jest.Mock)
+      .mockRejectedValueOnce(networkError)
+      .mockResolvedValueOnce({ streamId: 'stream-after-retry' });
+
+    renderHook(() => useResumableSSE(createSubmission(), chatHelpers), { wrapper: createWrapper() });
+
+    expect(request.post).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      await jest.advanceTimersByTimeAsync(1000);
+    });
+    const generationCalls = (request.post as jest.Mock).mock.calls.filter(
+      ([url]) => url === '/api/agents/chat',
+    );
+    expect(generationCalls.length).toBeGreaterThanOrEqual(2);
+
+    const firstPayload = generationCalls[0][1];
+    const secondPayload = generationCalls[1][1];
+    expect(firstPayload.responseMessageId).toEqual(expect.any(String));
+    expect(secondPayload.responseMessageId).toBe(firstPayload.responseMessageId);
+    jest.useRealTimers();
   });
 
   it('surfaces connected-account-required stream errors without queueing title generation', async () => {

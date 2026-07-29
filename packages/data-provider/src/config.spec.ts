@@ -3,11 +3,48 @@ import { EModelEndpoint, isDocumentSupportedProvider } from './schemas';
 import { getEndpointFileConfig, mergeFileConfig } from './file-config';
 import {
   AgentCapabilities,
+  agentsEndpointSchema,
   configSchema,
   getEndpointField,
   memorySchema,
   resolveEndpointType,
 } from './config';
+
+describe('agentsEndpointSchema provider capability policy', () => {
+  it('fails closed when a capability-required provider has no registry entry', () => {
+    expect(() =>
+      agentsEndpointSchema.parse({
+        capabilityRequiredProviders: ['synthetic-harness'],
+        providerCapabilities: {},
+      }),
+    ).toThrow('Provider capability configuration is required for synthetic-harness');
+  });
+
+  it('defaults every omitted role flag to false for a declared capability', () => {
+    const parsed = agentsEndpointSchema.parse({
+      capabilityRequiredProviders: ['synthetic-harness'],
+      providerCapabilities: {
+        'synthetic-harness': {
+          label: 'Synthetic Harness',
+          models: [{ id: 'synthetic:model', label: 'Synthetic Model' }],
+        },
+      },
+    });
+
+    expect(parsed.providerCapabilities['synthetic-harness']).toMatchObject({
+      main_chat: false,
+      cortex_execution: false,
+      phase_b_followup: false,
+      activation_classifier: false,
+      realtime_voice: false,
+      automatic_fallback_target: false,
+      workspace_binding: false,
+      native_tools: false,
+      activity_stream: false,
+      responses_api: false,
+    });
+  });
+});
 
 const endpointsConfig: TEndpointsConfig = {
   [EModelEndpoint.openAI]: { userProvide: false, order: 0 },

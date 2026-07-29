@@ -103,6 +103,25 @@ function isFallbackModelValid(fallbackModel, fallbackProvider, req, modelsConfig
     return false;
   }
 
+  /* === VIVENTIUM START ===
+   * Feature: Server-side automatic-fallback capability enforcement.
+   * Purpose: API/source-sync records cannot select a harness as a fallback target when the
+   * provider registry excludes that role.
+   * === VIVENTIUM END === */
+  const agentsConfig = req?.config?.endpoints?.agents || {};
+  const capability =
+    agentsConfig.providerCapabilities?.[fallbackProvider] ||
+    agentsConfig.providerCapabilities?.[provider];
+  if (capability?.automatic_fallback_target === false) {
+    return false;
+  }
+  if (
+    !capability &&
+    (agentsConfig.capabilityRequiredProviders || []).includes(String(fallbackProvider || ''))
+  ) {
+    return false;
+  }
+
   const allowedProviders = req?.config?.endpoints?.agents?.allowedProviders;
   if (
     Array.isArray(allowedProviders) &&
@@ -351,6 +370,61 @@ function isRecoverableFallbackStatus(status) {
   return status === 401 || status === 402 || status === 403 || status === 429 || status >= 500;
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Harness fallback during agent initialization
+ * Purpose: A workspace harness may fail readiness/auth before AgentClient exists. The caller gates
+ * this helper to workspace-backed primaries and may invoke the configured direct fallback once,
+ * before a native process starts. Never hide tool/runtime invariants or user cancellation.
+ * Added: 2026-07-29
+ */
+function isRecoverableProviderInitializationError(error) {
+  if (!error || typeof error !== 'object') {
+    return false;
+  }
+  if (error.viventiumRecoverableProviderError === true) {
+    return true;
+  }
+  const code = extractFallbackErrorCode(error);
+  return code === 'MODEL_AUTHENTICATION' || code === 'MODEL_RATE_LIMIT';
+}
+
+async function initializePrimaryAgentWithFallback({
+  primaryAgent,
+  fallbackAgent,
+  fallbackAssignment,
+  initializePrimary,
+  initializeFallback,
+  signal,
+}) {
+  try {
+    return {
+      config: await initializePrimary(),
+      effectiveAgent: primaryAgent,
+      fallbackUsed: false,
+      primaryError: null,
+    };
+  } catch (primaryError) {
+    const cancelled = signal?.aborted === true;
+    const canFallback =
+      !cancelled &&
+      fallbackAgent != null &&
+      fallbackAssignment != null &&
+      typeof initializeFallback === 'function' &&
+      isRecoverableProviderInitializationError(primaryError);
+    if (!canFallback) {
+      throw primaryError;
+    }
+
+    return {
+      config: await initializeFallback(primaryError),
+      effectiveAgent: fallbackAgent,
+      fallbackUsed: true,
+      primaryError,
+    };
+  }
+}
+/* === VIVENTIUM END === */
+
 function shouldRetryWithFallback(contentParts) {
   if (
     !Array.isArray(contentParts) ||
@@ -460,4 +534,6 @@ module.exports = {
   isAbortOrTimeoutErrorText,
   isRecoverableProviderErrorText,
   isNonRetryableFallbackErrorClass,
+  isRecoverableProviderInitializationError,
+  initializePrimaryAgentWithFallback,
 };

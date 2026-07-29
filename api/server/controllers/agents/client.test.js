@@ -8,6 +8,8 @@ const {
   externalUserStimulusForReaction,
   evalIsolationForRequest,
   mergeLateActivationCandidates,
+  convertHarnessActivityParts,
+  isHarnessInvocationLocked,
 } = AgentClient;
 
 jest.mock('@librechat/agents', () => ({
@@ -289,6 +291,7 @@ describe('buildViventiumMcpRequestBody', () => {
       messageId: 'assistant-1',
       conversationId: 'conv-1',
       parentMessageId: 'user-1',
+      harnessIdempotencyKey: 'main:assistant-1',
       req: {
         body: {
           viventiumSurface: 'telegram',
@@ -312,6 +315,7 @@ describe('buildViventiumMcpRequestBody', () => {
     });
 
     expect(body.viventiumSurface).toBe('telegram');
+    expect(body.viventiumGlassHiveIdempotencyKey).toBe('main:assistant-1');
     expect(body.viventiumStreamId).toBe('stream-1');
     expect(body.viventiumTelegramChatId).toBe('chat-1');
     expect(body.files[0]).toMatchObject({
@@ -323,6 +327,45 @@ describe('buildViventiumMcpRequestBody', () => {
     expect(body.attachments).toEqual(body.files);
     expect(body.file_ids).toEqual(['file-1']);
     expect(body.tool_resources.code_interpreter.file_ids).toEqual(['file-1']);
+  });
+});
+
+describe('GlassHive harness activity persistence', () => {
+  test('converts provider reasoning summaries without exposing them as model thinking', () => {
+    const parts = [
+      { type: ContentTypes.THINK, think: 'Started.\nWorking.\n' },
+      { type: ContentTypes.TEXT, text: 'The answer.' },
+    ];
+
+    expect(convertHarnessActivityParts(parts)).toBe(parts);
+    expect(parts).toEqual([
+      {
+        type: ContentTypes.HARNESS_ACTIVITY,
+        harness_activity: { event: 'reasoning-summary', summary: 'Started.\nWorking.\n' },
+      },
+      { type: ContentTypes.TEXT, text: 'The answer.' },
+    ]);
+  });
+
+  test('locks fallback and redispatch only after a harness invocation begins', () => {
+    expect(
+      isHarnessInvocationLocked({
+        _viventiumHarnessActivityEnabled: true,
+        _viventiumHarnessInvocationStarted: false,
+      }),
+    ).toBe(false);
+    expect(
+      isHarnessInvocationLocked({
+        _viventiumHarnessActivityEnabled: true,
+        _viventiumHarnessInvocationStarted: true,
+      }),
+    ).toBe(true);
+    expect(
+      isHarnessInvocationLocked({
+        _viventiumHarnessActivityEnabled: false,
+        _viventiumHarnessInvocationStarted: true,
+      }),
+    ).toBe(false);
   });
 });
 

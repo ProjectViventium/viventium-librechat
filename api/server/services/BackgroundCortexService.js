@@ -102,6 +102,10 @@ const {
   logPromptFrame,
 } = require('~/server/services/viventium/promptFrameTelemetry');
 const { logFeelingsEvent } = require('~/server/services/viventium/feelingsTelemetry');
+const {
+  attachConversationProviderCapabilityBundle,
+  buildHarnessIdempotencyKey,
+} = require('~/server/services/viventium/GlassHiveConversationProviderService');
 
 const NO_PARENT_MESSAGE_ID = '00000000-0000-0000-0000-000000000000';
 
@@ -109,16 +113,8 @@ const NO_PARENT_MESSAGE_ID = '00000000-0000-0000-0000-000000000000';
  * Feature: Request-pinned feeling state for all background agents.
  * Purpose: Keep the same decayed snapshot across every participant in one turn.
  * === VIVENTIUM END === */
-function feelingTailForBackgroundAgent(snapshot) {
-  if (
-    !snapshot?.available ||
-    !snapshot?.enabled ||
-    snapshot?.agentScope !== 'all_agents' ||
-    !String(snapshot?.capsule || '').trim()
-  ) {
-    return '';
-  }
-  return String(snapshot.capsule).trim();
+function feelingTailForBackgroundAgent(_snapshot) {
+  return '';
 }
 
 /* === VIVENTIUM NOTE ===
@@ -2266,14 +2262,10 @@ function mapProvider(provider) {
     google: Providers.GOOGLE,
     azure: Providers.AZURE_OPENAI,
     bedrock: Providers.BEDROCK,
-    // Groq uses OpenAI-compatible API, so use OPENAI provider with custom config
-    groq: Providers.OPENAI,
-    // xAI / Perplexity / other OpenAI-compatible providers are handled as custom endpoints
-    // via getCustomEndpointConfig(...) and also use the OPENAI provider.
-    xai: Providers.OPENAI,
-    perplexity: Providers.OPENAI,
+    // OpenAI-compatible custom endpoints intentionally resolve only after their exact
+    // endpoint configuration is found below.
   };
-  return providerMap[provider?.toLowerCase()] || Providers.OPENAI;
+  return providerMap[provider?.toLowerCase()] || null;
 }
 
 /**
@@ -2301,7 +2293,12 @@ async function getCustomEndpointConfig(endpointName, req) {
       const baseURL = extractEnvVariable(endpoint.baseURL || '');
 
       if (apiKey && baseURL) {
-        return { apiKey, baseURL };
+        return {
+          apiKey,
+          baseURL,
+          defaultHeaders: endpoint.headers || endpoint.defaultHeaders || {},
+          dropParams: endpoint.dropParams || [],
+        };
       }
     }
 
@@ -2453,11 +2450,33 @@ function sanitizeOpenAIReasoningSampling(agentForRun, safeReq) {
 }
 
 async function buildActivationLlmConfig({ providerName, model, req }) {
+  /* === VIVENTIUM START ===
+   * Feature: Capability-enforced Phase A provider boundary.
+   * Purpose: Classifier execution follows compiled capability metadata even when configuration was
+   * written outside Agent Builder.
+   * === VIVENTIUM END === */
+  const agentsConfig = req?.config?.endpoints?.agents || {};
+  const activationCapability = agentsConfig.providerCapabilities?.[providerName];
+  if (activationCapability?.activation_classifier === false) {
+    throw new Error(`Provider "${providerName}" cannot run activation classification`);
+  }
+  if (
+    !activationCapability &&
+    (agentsConfig.capabilityRequiredProviders || []).includes(String(providerName || ''))
+  ) {
+    throw new Error(`Provider capability configuration is unavailable for "${providerName}"`);
+  }
   const mappedProvider = mapProvider(providerName);
+  const normalizedProviderName = String(providerName || '')
+    .trim()
+    .toLowerCase();
+  const openAICompatibleProvider = ['groq', 'xai', 'perplexity'].includes(
+    normalizedProviderName,
+  );
   const usesAdaptiveAnthropicTemperatureRules =
     providerName === 'anthropic' && supportsAdaptiveThinking(model);
   const llmConfig = {
-    provider: mappedProvider,
+    provider: mappedProvider || (openAICompatibleProvider ? Providers.OPENAI : mappedProvider),
     model,
     maxTokens: 100,
     streaming: false,
@@ -2468,15 +2487,23 @@ async function buildActivationLlmConfig({ providerName, model, req }) {
     llmConfig.temperature = 0.1;
   }
 
+  let customEndpointResolved = false;
   if (req && providerName) {
     const customConfig = await getCustomEndpointConfig(providerName, req);
     if (customConfig?.apiKey && customConfig?.baseURL) {
+      customEndpointResolved = true;
       llmConfig.provider = Providers.OPENAI;
       llmConfig.configuration = {
         apiKey: customConfig.apiKey,
         baseURL: customConfig.baseURL,
       };
     }
+  }
+
+  if (req && !mappedProvider && !customEndpointResolved) {
+    throw new Error(
+      `Unsupported or unavailable activation provider "${String(providerName || '')}"`,
+    );
   }
 
   if (providerName === 'anthropic') {
@@ -3367,6 +3394,20 @@ async function executeCortexOnce({
     );
 
     executionStage = 'initialize_agent';
+    const cortexProviderName = String(agentForRun.provider || '').trim();
+    const cortexAgentsConfig = safeReq.config?.endpoints?.agents || {};
+    const cortexCapability = cortexAgentsConfig.providerCapabilities?.[cortexProviderName];
+    if (cortexCapability?.cortex_execution === false) {
+      throw new Error(`Provider "${cortexProviderName}" cannot execute a background cortex`);
+    }
+    if (
+      !cortexCapability &&
+      (cortexAgentsConfig.capabilityRequiredProviders || []).includes(cortexProviderName)
+    ) {
+      throw new Error(
+        `Provider capability configuration is unavailable for "${cortexProviderName}"`,
+      );
+    }
     const initializedAgent = await initializeAgent(
       {
         req: safeReq,
@@ -3589,13 +3630,32 @@ async function executeCortexOnce({
      * Reason: Anthropic SDK streaming can emit control characters that break JSON parsing in background runs.
      */
     const cortexProvider = (initializedAgent.provider || '').toLowerCase();
+    const cortexIdempotencyKey = buildHarnessIdempotencyKey(
+      'cortex',
+      runId,
+      agentForRun.id,
+    );
+    const cortexRequestBody = {
+      ...safeReq.body,
+      messageId: runId,
+      conversationId: safeReq.body.conversationId,
+      parentMessageId: safeReq.body.parentMessageId,
+      viventiumGlassHiveIdempotencyKey: cortexIdempotencyKey,
+    };
+    await attachConversationProviderCapabilityBundle({
+      targetAgent: initializedAgent,
+      declaredAgent: agentForRun,
+      req: safeReq,
+      capability: cortexCapability,
+      requestBody: cortexRequestBody,
+    });
     const disableStreaming = cortexProvider === 'anthropic';
     const runOptions = {
       agents: [initializedAgent],
       runId: `${runId}-cortex-${agent.id}`,
       signal: abortController.signal,
       customHandlers: eventHandlers,
-      requestBody: safeReq.body,
+      requestBody: cortexRequestBody,
       user: safeReq.user,
       /* Provide token counter/context map for context window management. */
       tokenCounter,
@@ -3618,11 +3678,7 @@ async function executeCortexOnce({
       configurable: {
         thread_id: runId,
         user_id: safeReq.user?.id,
-        requestBody: {
-          messageId: runId,
-          conversationId: safeReq.body.conversationId,
-          parentMessageId: safeReq.body.parentMessageId,
-        },
+        requestBody: cortexRequestBody,
         user: safeReq.user,
         glasshive_worker_feelings: backgroundFeelingTail,
         glasshive_worker_feelings_hash: backgroundFeelingTail

@@ -99,6 +99,14 @@ export default function useSSE(
     const payloadData = createPayload(submission);
     let { payload } = payloadData;
     payload = removeNullishValues(payload) as TPayload;
+    /* === VIVENTIUM START ===
+     * Feature: Stable provider authoring identity.
+     * Purpose: Supply the server-generated run path with a caller-stable assistant ID, including
+     * transparent authentication retries made below this hook.
+     * === VIVENTIUM END === */
+    if (!payload.responseMessageId) {
+      payload.responseMessageId = v4();
+    }
 
     let textIndex = null;
     clearStepMaps();

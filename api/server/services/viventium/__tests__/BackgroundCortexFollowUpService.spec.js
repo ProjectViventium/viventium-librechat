@@ -23,6 +23,9 @@ const {
   upsertCortexParts,
   buildFollowUpDecisionRecord,
   compactDecisionRecordForMetadata,
+  buildFollowUpSystemPrompt,
+  resolvePhaseBFeelingContext,
+  resolvePhaseBFeelingInjection,
 } = require('../BackgroundCortexFollowUpService');
 
 describe('upsertCortexParts', () => {
@@ -203,6 +206,52 @@ describe('Phase B prompt registry ownership', () => {
         background_insights: expect.stringContaining('Use two bullets.'),
       }),
     );
+  });
+});
+
+describe('Phase B session-backed Feelings', () => {
+  const capsule = '<viventium_feeling_state>synthetic state</viventium_feeling_state>';
+
+  test('pins one capsule at the final system layer for a direct-provider follow-up', () => {
+    const prompt = buildFollowUpSystemPrompt({
+      noResponseInstructions: 'Use {NTA} when no reply is needed.',
+      feelingCapsule: capsule,
+    });
+    expect(prompt.endsWith(capsule)).toBe(true);
+    expect(prompt.match(/<viventium_feeling_state>/g)).toHaveLength(1);
+  });
+
+  test('does not inject a second capsule into a same-session continuation', () => {
+    const feelingContext = resolvePhaseBFeelingContext({
+      enabled: true,
+      agentScope: 'conscious_agent',
+      snapshotHash: 'synthetic-hash',
+      capsule,
+    });
+    expect(
+      resolvePhaseBFeelingInjection({
+        feelingContext,
+        providerCapability: { conversation_session: true },
+        primaryResponseMode: false,
+      }),
+    ).toEqual({ capsule: '', reason: 'preserved_in_conversation_session' });
+  });
+
+  test('keeps the capsule for direct providers and a forced primary follow-up', () => {
+    const feelingContext = { capsule, reason: 'conscious_synthesis' };
+    expect(
+      resolvePhaseBFeelingInjection({
+        feelingContext,
+        providerCapability: { conversation_session: false },
+      }).capsule,
+    ).toBe(capsule);
+    expect(
+      resolvePhaseBFeelingInjection({
+        feelingContext,
+        providerCapability: { conversation_session: true },
+        primaryResponseMode: true,
+      }).capsule,
+    ).toBe(capsule);
   });
 });
 

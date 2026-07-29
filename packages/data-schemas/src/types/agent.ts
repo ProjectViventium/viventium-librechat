@@ -24,6 +24,10 @@ export interface IActivationConfig {
   model: string;
   /** Provider for the activation model (e.g., "openai") */
   provider: string;
+  /** Ordered recovery routes for activation detection */
+  fallbacks?: Array<{ provider: string; model: string }>;
+  /** Whether an exhausted detector route should be surfaced to the user */
+  activation_failure_visibility?: 'silent' | 'visible';
   /** System prompt for making activation decisions */
   prompt: string;
   /** Optional config-defined routing scope for runtime helper context */
@@ -59,6 +63,12 @@ export interface IAgent extends Omit<Document, 'model'> {
   provider: string;
   model: string;
   model_parameters?: Record<string, unknown>;
+  /* === VIVENTIUM START === GlassHive core Agent provider */
+  glasshive_options?: {
+    workspace: { mode: 'life' | 'custom'; path?: string };
+    access: 'full' | 'workspace';
+  };
+  /* === VIVENTIUM END === */
   artifacts?: string;
   access_level?: number;
   recursion_limit?: number;

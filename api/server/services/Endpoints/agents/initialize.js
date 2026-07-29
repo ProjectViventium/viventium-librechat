@@ -27,6 +27,7 @@ const {
   GenerationJobManager,
   getCustomEndpointConfig,
   createSequentialChainEdges,
+  applyAgentProviderCapabilityDefaults,
 } = require('@librechat/api');
 const {
   EModelEndpoint,
@@ -69,7 +70,12 @@ const {
   isFallbackModelValid,
   buildFallbackAgent,
   isSameAgentRoute,
+  initializePrimaryAgentWithFallback,
 } = require('~/server/services/viventium/agentLlmFallback');
+const {
+  attachConversationProviderCapabilityBundle,
+  bindHarnessCancellation,
+} = require('~/server/services/viventium/GlassHiveConversationProviderService');
 /* === VIVENTIUM END === */
 
 /* === VIVENTIUM START ===
@@ -487,6 +493,20 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
   if (!primaryAgent) {
     throw new Error('Agent not found');
   }
+  /* === VIVENTIUM START ===
+   * Feature: Runtime provider capability enforcement.
+   * Purpose: Fail loudly for a stored provider/model/options tuple that no longer matches the
+   * compiled capability registry; never coerce an unknown provider to OpenAI.
+   */
+  Object.assign(
+    primaryAgent,
+    applyAgentProviderCapabilityDefaults(
+      primaryAgent,
+      req.config?.endpoints?.agents?.providerCapabilities,
+      req.config?.endpoints?.agents?.capabilityRequiredProviders,
+    ),
+  );
+  /* === VIVENTIUM END === */
   /* === VIVENTIUM NOTE END === */
 
   /* === VIVENTIUM START ===
@@ -495,6 +515,26 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
    * Added: 2026-02-24
    */
   applyVoiceModelOverride(primaryAgent, req, modelsConfig);
+  Object.assign(
+    primaryAgent,
+    applyAgentProviderCapabilityDefaults(
+      primaryAgent,
+      req.config?.endpoints?.agents?.providerCapabilities,
+      req.config?.endpoints?.agents?.capabilityRequiredProviders,
+    ),
+  );
+  /* === VIVENTIUM END === */
+
+  /* === VIVENTIUM START ===
+   * Feature: Structured harness lifecycle.
+   * Purpose: Voice overrides and provider capabilities, not labels, decide whether this request
+   * owns workspace execution, activity rendering, duplicate prevention, and native cancellation.
+   */
+  const selectedPrimaryCapability =
+    appConfig?.endpoints?.[EModelEndpoint.agents]?.providerCapabilities?.[primaryAgent.provider];
+  req._viventiumHarnessActivityEnabled = selectedPrimaryCapability?.activity_stream === true;
+  req._viventiumHarnessExecutionEnabled = selectedPrimaryCapability?.workspace_binding === true;
+  req._viventiumHarnessInvocationStarted = false;
   /* === VIVENTIUM END === */
 
   const validateStart = nowIfDeep();
@@ -581,21 +621,63 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
 
   const initPrimaryStart = nowIfDeep();
   const voiceInitPrimaryStart = voiceLatencyEnabled ? voiceLatencyNow() : null;
-  const primaryConfig = await initializeAgent(
-    {
-      req,
-      res,
-      loadTools,
-      requestFiles,
-      conversationId,
-      parentMessageId,
-      agent: primaryAgent,
-      endpointOption,
-      allowedProviders,
-      isInitialAgent: true,
-    },
-    dbMethods,
-  );
+  /* === VIVENTIUM START ===
+   * Feature: Pre-start configured fallback for workspace harness providers.
+   * Purpose: Authentication/configuration may fail while initializing the primary. A validated
+   * direct fallback may recover only before any harness process starts.
+   */
+  const initializeConfiguredPrimary = (agent) =>
+    initializeAgent(
+      {
+        req,
+        res,
+        loadTools,
+        requestFiles,
+        conversationId,
+        parentMessageId,
+        agent,
+        endpointOption,
+        allowedProviders,
+        isInitialAgent: true,
+      },
+      dbMethods,
+    );
+  const initializeConfiguredFallback = () => initializeConfiguredPrimary(fallbackAgent);
+  const primaryInitialization = req._viventiumHarnessExecutionEnabled
+    ? await initializePrimaryAgentWithFallback({
+        primaryAgent,
+        fallbackAgent,
+        fallbackAssignment,
+        initializePrimary: () => initializeConfiguredPrimary(primaryAgent),
+        initializeFallback: initializeConfiguredFallback,
+        signal,
+      })
+    : {
+        config: await initializeConfiguredPrimary(primaryAgent),
+        effectiveAgent: primaryAgent,
+        fallbackUsed: false,
+        primaryError: null,
+      };
+  const primaryConfig = primaryInitialization.config;
+  const effectivePrimaryAgent = primaryInitialization.effectiveAgent;
+  const primaryInitializationFallbackUsed = primaryInitialization.fallbackUsed;
+  const effectivePrimaryProvider = String(effectivePrimaryAgent?.provider || '').trim();
+  const effectivePrimaryCapability =
+    req.config?.endpoints?.agents?.providerCapabilities?.[effectivePrimaryProvider];
+  req._viventiumHarnessActivityEnabled = effectivePrimaryCapability?.activity_stream === true;
+  req._viventiumHarnessExecutionEnabled = effectivePrimaryCapability?.workspace_binding === true;
+  await attachConversationProviderCapabilityBundle({
+    targetAgent: primaryConfig,
+    declaredAgent: effectivePrimaryAgent,
+    req,
+    capability: effectivePrimaryCapability,
+  });
+  if (primaryInitializationFallbackUsed) {
+    logger.warn(
+      `[agentLlmFallback] Primary provider initialization failed before AgentClient; recovered agent ${primaryConfig.id} with configured fallback ${fallbackAssignment.provider}/${fallbackAssignment.model}`,
+    );
+  }
+  /* === VIVENTIUM END === */
   const initializePrimaryMs = setVoiceStageMs('initialize_primary', voiceInitPrimaryStart);
   const primaryToolSummary = summarizeInitTools(primaryConfig);
   if (voiceLatencyEnabled && voiceInitSummary) {
@@ -625,7 +707,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
    * first-audio latency.
    * Updated: 2026-05-14
    */
-  if (fallbackAgent && fallbackAssignment) {
+  if (!primaryInitializationFallbackUsed && fallbackAgent && fallbackAssignment) {
     if (voiceLatencyEnabled && voiceInitSummary) {
       voiceInitSummary.fallbackMode = 'lazy';
       voiceInitSummary.fallbackProvider = fallbackAssignment.provider;
@@ -726,7 +808,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
     `[initializeClient] toolRegistry size: ${primaryConfig.toolRegistry?.size ?? 'undefined'}`,
   );
   agentToolContexts.set(primaryConfig.id, {
-    agent: primaryAgent,
+    agent: effectivePrimaryAgent,
     toolRegistry: primaryConfig.toolRegistry,
     userMCPAuthMap: primaryConfig.userMCPAuthMap,
     tool_resources: primaryConfig.tool_resources,
@@ -891,7 +973,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
     modelsConfig,
     requestFiles,
     agentConfigs,
-    primaryAgent,
+    primaryAgent: effectivePrimaryAgent,
     endpointOption,
     userMCPAuthMap,
     conversationId,
@@ -940,8 +1022,25 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
     }
   }
 
+  /* === VIVENTIUM START ===
+   * Feature: Explicit native harness cancellation.
+   * Purpose: Only the intentional Stop reason cancels; a transport disconnect leaves the native
+   * run available for resumable reattachment through its stable idempotency key.
+   */
+  bindHarnessCancellation({
+    req,
+    signal,
+    endpointConfig,
+    onDeliveryError: (error) => {
+      logger.warn('[GlassHiveProvider] Native cancellation delivery failed', {
+        error: error?.message || 'provider_unreachable',
+      });
+    },
+  });
+  /* === VIVENTIUM END === */
+
   const sender =
-    primaryAgent.name ??
+    effectivePrimaryAgent.name ??
     getResponseSender({
       ...endpointOption,
       model: endpointOption.model_parameters.model,

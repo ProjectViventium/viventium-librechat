@@ -14,6 +14,11 @@ describe('Feelings telemetry', () => {
     logFeelingsEvent(logger, req, 'feelings.api.read', {
       version: 4,
       durationMs: 2,
+      capsuleLength: 1082,
+      cachedCapsuleLength: 1082,
+      pinnedAgentCount: 1,
+      runInstructionLength: 4058,
+      runInstructionCapsuleCount: 1,
     });
 
     const envelopes = logger.info.mock.calls.map(([message]) =>
@@ -32,6 +37,11 @@ describe('Feelings telemetry', () => {
         event: 'feelings.api.read',
         version: 4,
         durationMs: 2,
+        capsuleLength: 1082,
+        cachedCapsuleLength: 1082,
+        pinnedAgentCount: 1,
+        runInstructionLength: 4058,
+        runInstructionCapsuleCount: 1,
       }),
     );
     expect(reconstructed).not.toHaveProperty('requestId');

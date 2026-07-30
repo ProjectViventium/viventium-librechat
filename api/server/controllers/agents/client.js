@@ -103,6 +103,45 @@ function feelingTailForAgent({ snapshot, agentId, primaryAgentId }) {
 }
 
 /* === VIVENTIUM START ===
+ * Feature: Final-boundary dynamic-tail pinning.
+ * Purpose: Agent graph preparation may rebuild instructions after buildMessages. Re-pin the exact
+ * structured per-turn tail immediately before createRun so it reaches the authoring provider once,
+ * at the end of the instruction frame. Exact-string handling avoids prompt/intent heuristics.
+ * === VIVENTIUM END === */
+function pinDynamicTailAtRunBoundary(instructions, dynamicTail) {
+  const instructionText = typeof instructions === 'string' ? instructions : '';
+  const tailText = typeof dynamicTail === 'string' ? dynamicTail.trim() : '';
+  if (!tailText) return instructionText;
+
+  const withoutExistingCopies = instructionText
+    .split(tailText)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .join('\n\n');
+  return [withoutExistingCopies, tailText].filter(Boolean).join('\n\n');
+}
+
+function withPinnedDynamicTailAtRunBoundary(agent, dynamicTail) {
+  if (!agent || typeof agent !== 'object' || !dynamicTail) return agent;
+  return {
+    ...agent,
+    instructions: pinDynamicTailAtRunBoundary(agent.instructions, dynamicTail),
+  };
+}
+
+function cloneAgentConfigForRuntime(agent) {
+  if (!agent || typeof agent !== 'object') return agent;
+  const instructionsDescriptor = Object.getOwnPropertyDescriptor(agent, 'instructions');
+  const cannotRetainRuntimeInstructions =
+    !Object.isExtensible(agent) ||
+    instructionsDescriptor?.writable === false ||
+    (instructionsDescriptor != null &&
+      'set' in instructionsDescriptor &&
+      typeof instructionsDescriptor.set !== 'function');
+  return cannotRetainRuntimeInstructions ? { ...agent } : agent;
+}
+
+/* === VIVENTIUM START ===
  * Feature: Prompt Workbench request isolation.
  * Purpose: Temporary eval turns and explicit local QA runs can isolate only the product layers
  * they are not grading. The flags are structured request metadata; prompt text and agent names are
@@ -1974,7 +2013,15 @@ class AgentClient extends BaseClient {
       ...clientOptions
     } = options;
 
-    this.agentConfigs = agentConfigs;
+    this.agentConfigs =
+      agentConfigs instanceof Map
+        ? new Map(
+            Array.from(agentConfigs.entries(), ([agentId, agent]) => [
+              agentId,
+              cloneAgentConfigForRuntime(agent),
+            ]),
+          )
+        : agentConfigs;
     this.maxContextTokens = maxContextTokens;
     /** @type {MessageContentComplex[]} */
     this.contentParts = contentParts;
@@ -1984,6 +2031,10 @@ class AgentClient extends BaseClient {
     this.artifactPromises = artifactPromises;
     /** @type {AgentClientOptions} */
     this.options = Object.assign({ endpoint: options.endpoint }, clientOptions);
+    /* Stored Agent records may be frozen by the shared initialization/cache layer. All context,
+     * surface, Feelings, and cortex-awareness additions are per-request state, so assemble them on
+     * a shallow runtime copy instead of attempting to mutate the stored/cached source object. */
+    this.options.agent = cloneAgentConfigForRuntime(this.options.agent);
     /** @type {string} */
     this.model = this.options.agent.model_parameters.model;
     /** The key for the usage object's input tokens
@@ -5039,6 +5090,53 @@ class AgentClient extends BaseClient {
           }
         }
         /* === VIVENTIUM NOTE END === */
+
+        /* === VIVENTIUM START ===
+         * Feature: Feelings final run-boundary guarantee.
+         * Purpose: buildMessages applies the turn-pinned snapshot to every eligible speaking agent,
+         * but graph/runtime preparation can later rebuild instructions. Guarantee the same exact
+         * capsule is present once, as the final block actually passed to createRun. Background
+         * specialist cortices use a separate execution path and remain intentionally excluded.
+         * === VIVENTIUM END === */
+        const primaryAgentId = agents[0]?.id;
+        let feelingsRunBoundaryAgentCount = 0;
+        for (let agentIndex = 0; agentIndex < agents.length; agentIndex += 1) {
+          const agent = agents[agentIndex];
+          if (!agent || typeof agent !== 'object') {
+            continue;
+          }
+          const dynamicTail = feelingTailForAgent({
+            snapshot: this.feelingSnapshot,
+            agentId: agent.id,
+            primaryAgentId,
+          });
+          if (dynamicTail) {
+            agents[agentIndex] = withPinnedDynamicTailAtRunBoundary(agent, dynamicTail);
+            feelingsRunBoundaryAgentCount += 1;
+          }
+        }
+        logFeelingsEvent(logger, req, 'feelings.run_boundary.complete', {
+          enabled: this.feelingSnapshot?.enabled === true,
+          scope: this.feelingSnapshot?.agentScope || 'unknown',
+          snapshotHash: this.feelingSnapshot?.snapshotHash || 'none',
+          capsuleLength:
+            typeof this.feelingSnapshot?.capsule === 'string'
+              ? this.feelingSnapshot.capsule.length
+              : 0,
+          cachedCapsuleLength:
+            typeof this.feelingsCapsule === 'string' ? this.feelingsCapsule.length : 0,
+          participatingAgentCount: agents.length,
+          pinnedAgentCount: feelingsRunBoundaryAgentCount,
+          runInstructionLength:
+            typeof agents[0]?.instructions === 'string' ? agents[0].instructions.length : 0,
+          runInstructionCapsuleCount:
+            typeof agents[0]?.instructions === 'string' && this.feelingsCapsule
+              ? agents[0].instructions.split(this.feelingsCapsule).length - 1
+              : 0,
+          skippedAgentCount: agents.length - feelingsRunBoundaryAgentCount,
+        });
+        /* === VIVENTIUM END === */
+
         logPromptFrame(
           logger,
           buildPromptFrame({
@@ -5924,6 +6022,9 @@ module.exports.shouldSuppressSpeculativeRunError = shouldSuppressSpeculativeRunE
 module.exports.buildMergedInsightsDataFromCortexParts = buildMergedInsightsDataFromCortexParts;
 module.exports.createCortexPersistenceCoordinator = createCortexPersistenceCoordinator;
 module.exports.feelingTailForAgent = feelingTailForAgent;
+module.exports.pinDynamicTailAtRunBoundary = pinDynamicTailAtRunBoundary;
+module.exports.withPinnedDynamicTailAtRunBoundary = withPinnedDynamicTailAtRunBoundary;
+module.exports.cloneAgentConfigForRuntime = cloneAgentConfigForRuntime;
 module.exports.externalUserStimulusForReaction = externalUserStimulusForReaction;
 module.exports.evalIsolationForRequest = evalIsolationForRequest;
 module.exports.convertHarnessActivityParts = convertHarnessActivityParts;

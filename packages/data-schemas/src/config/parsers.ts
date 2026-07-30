@@ -1,7 +1,6 @@
-import { klona } from 'klona';
+/* VIVENTIUM START: structured debug redaction no longer uses upstream object traversal. */
 import winston from 'winston';
-import traverse from '../utils/object-traverse';
-import type { TraverseContext } from '../utils/object-traverse';
+/* VIVENTIUM END */
 
 const SPLAT_SYMBOL = Symbol.for('splat');
 const MESSAGE_SYMBOL = Symbol.for('message');
@@ -9,12 +8,20 @@ const CONSOLE_JSON_STRING_LENGTH: number =
   parseInt(process.env.CONSOLE_JSON_STRING_LENGTH || '', 10) || 255;
 const DEBUG_MESSAGE_LENGTH: number = parseInt(process.env.DEBUG_MESSAGE_LENGTH || '', 10) || 150;
 
+// VIVENTIUM START: redact credentials at every log level, including structured debug config.
 const sensitiveKeys: RegExp[] = [
-  /^(sk-)[^\s]+/, // OpenAI API key pattern
-  /(Bearer )[^\s]+/, // Header: Bearer token pattern
-  /(api-key:? )[^\s]+/, // Header: API key pattern
-  /(key=)[^\s]+/, // URL query param: sensitive key pattern (Google)
+  /\b(sk-)[A-Za-z0-9_-]{8,}/gi,
+  /\b(ghp_)[A-Za-z0-9_]{8,}/gi,
+  /\b(xoxb-)[A-Za-z0-9-]{8,}/gi,
+  /\b(Bearer\s+)[^\s,;"']+/gi,
+  /\b(api[-_ ]?key\s*[:=]?\s*)[^\s,;"']+/gi,
+  /\b((?:token|secret|password|passwd|pwd)\s*[:=]\s*)[^\s,;"']+/gi,
+  /\b(key=)[^\s&#]+/gi,
+  /\b(eyJ[A-Za-z0-9_-]+\.)[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g,
+  /(-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----)[\s\S]*?(-----END (?:[A-Z ]+ )?PRIVATE KEY-----)/g,
 ];
+const sensitiveFieldName =
+  /(?:api.?key|token|secret|password|passwd|pwd|authorization|credential)/i;
 
 /**
  * Determines if a given value string is sensitive and returns matching regex patterns.
@@ -24,6 +31,9 @@ const sensitiveKeys: RegExp[] = [
  */
 function getMatchingSensitivePatterns(valueStr: string): RegExp[] {
   if (valueStr) {
+    sensitiveKeys.forEach((regex) => {
+      regex.lastIndex = 0;
+    });
     // Filter and return all regex patterns that match the value string
     return sensitiveKeys.filter((regex) => regex.test(valueStr));
   }
@@ -53,24 +63,41 @@ function redactMessage(str: string, trimLength?: number): string {
   return str;
 }
 
+function redactStructuredValue(value: unknown, key = ''): unknown {
+  if (key && sensitiveFieldName.test(key)) {
+    return '[REDACTED]';
+  }
+  if (typeof value === 'string') {
+    return redactMessage(value);
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => redactStructuredValue(item));
+  }
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([childKey, childValue]) => [
+        childKey,
+        redactStructuredValue(childValue, childKey),
+      ]),
+    );
+  }
+  return value;
+}
+
 /**
- * Redacts sensitive information from log messages if the log level is 'error'.
+ * Redacts sensitive information from log messages at every log level.
  * Note: Intentionally mutates the object.
  * @param info - The log information object.
  * @returns The modified log information object.
  */
 const redactFormat = winston.format((info: winston.Logform.TransformableInfo) => {
-  if (info.level === 'error') {
-    // Type guard to ensure message is a string
-    if (typeof info.message === 'string') {
-      info.message = redactMessage(info.message);
-    }
+  if (typeof info.message === 'string') {
+    info.message = redactMessage(info.message);
+  }
 
-    // Handle MESSAGE_SYMBOL with type safety
-    const symbolValue = (info as Record<string | symbol, unknown>)[MESSAGE_SYMBOL];
-    if (typeof symbolValue === 'string') {
-      (info as Record<string | symbol, unknown>)[MESSAGE_SYMBOL] = redactMessage(symbolValue);
-    }
+  const symbolValue = (info as Record<string | symbol, unknown>)[MESSAGE_SYMBOL];
+  if (typeof symbolValue === 'string') {
+    (info as Record<string | symbol, unknown>)[MESSAGE_SYMBOL] = redactMessage(symbolValue);
   }
   return info;
 });
@@ -141,7 +168,8 @@ const debugTraverse = winston.format.printf(
       // Type-safe access to SPLAT_SYMBOL using bracket notation
       const metadataRecord = metadata as Record<string | symbol, unknown>;
       const splatArray = metadataRecord[SPLAT_SYMBOL];
-      const debugValue = Array.isArray(splatArray) ? splatArray[0] : undefined;
+      const rawDebugValue = Array.isArray(splatArray) ? splatArray[0] : undefined;
+      const debugValue = redactStructuredValue(rawDebugValue);
 
       if (!debugValue) {
         return msgParts[0];
@@ -157,48 +185,12 @@ const debugTraverse = winston.format.printf(
         return msgParts.join('');
       }
 
-      msgParts.push('\n{');
-
-      const copy = klona(metadata);
-      try {
-        const traversal = traverse(copy);
-        traversal.forEach(function (this: TraverseContext, value: unknown) {
-          if (typeof this?.key === 'symbol') {
-            return;
-          }
-
-          let _parentKey = '';
-          const parent = this.parent;
-
-          if (typeof parent?.key !== 'symbol' && parent?.key !== undefined) {
-            _parentKey = String(parent.key);
-          }
-
-          const parentKey = `${parent && parent.notRoot ? _parentKey + '.' : ''}`;
-          const tabs = `${parent && parent.notRoot ? '    ' : '  '}`;
-          const currentKey = this?.key ?? 'unknown';
-
-          if (this.isLeaf && typeof value === 'string') {
-            const truncatedText = truncateLongStrings(value);
-            msgParts.push(`\n${tabs}${parentKey}${currentKey}: ${JSON.stringify(truncatedText)},`);
-          } else if (this.notLeaf && Array.isArray(value) && value.length > 0) {
-            const currentMessage = `\n${tabs}// ${value.length} ${String(currentKey).replace(/s$/, '')}(s)`;
-            this.update(currentMessage);
-            msgParts.push(currentMessage);
-            const stringifiedArray = value.map(condenseArray);
-            msgParts.push(`\n${tabs}${parentKey}${currentKey}: [${stringifiedArray}],`);
-          } else if (this.isLeaf && typeof value === 'function') {
-            msgParts.push(`\n${tabs}${parentKey}${currentKey}: function,`);
-          } else if (this.isLeaf) {
-            msgParts.push(`\n${tabs}${parentKey}${currentKey}: ${value},`);
-          }
-        });
-      } catch (e: unknown) {
-        const errorMessage = e instanceof Error ? e.message : 'Unknown error';
-        msgParts.push(`\n[LOGGER TRAVERSAL ERROR] ${errorMessage}`);
-      }
-
-      msgParts.push('\n}');
+      const serialized = JSON.stringify(
+        debugValue,
+        (_key, value) => (typeof value === 'string' ? truncateLongStrings(value) : value),
+        2,
+      );
+      msgParts.push(`\n${serialized}`);
       return msgParts.join('');
     } catch (e: unknown) {
       const errorMessage = e instanceof Error ? e.message : 'Unknown error';
@@ -207,6 +199,7 @@ const debugTraverse = winston.format.printf(
     }
   },
 );
+// VIVENTIUM END
 
 /**
  * Truncates long string values in JSON log objects.

@@ -208,8 +208,8 @@ viventium:
   primaryProvider: openai
   installMode: native
   consciousAgent:
-    provider: openai
-    model: gpt-5.6-sol
+    provider: glasshive-harness
+    model: codex-cli:gpt-5.6-sol
 balance:
   enabled: false
   startBalance: 200000

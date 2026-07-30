@@ -106,8 +106,9 @@ function resolveSourceOfTruthLibrechatYamlPath(envSlug) {
   return path.join(SOURCE_OF_TRUTH_DIR, `${sanitizeSlug(envSlug)}.librechat.yaml`);
 }
 
-function loadAgentProviderCapabilityPolicy(envSlug) {
-  const configPath = resolveSourceOfTruthLibrechatYamlPath(envSlug);
+function loadAgentProviderCapabilityPolicy(envSlug, { runtimeEnv = process.env } = {}) {
+  const configuredPath = String(runtimeEnv.VIVENTIUM_LIBRECHAT_SOURCE_OF_TRUTH || '').trim();
+  const configPath = configuredPath || resolveSourceOfTruthLibrechatYamlPath(envSlug);
   if (!fs.existsSync(configPath)) {
     throw new Error(`Provider capability source of truth not found: ${configPath}`);
   }
@@ -1776,13 +1777,15 @@ async function pushBundle({
     throw new Error(`Input file not found: ${inPath}`);
   }
 
+  const providerCapabilityPolicy = loadAgentProviderCapabilityPolicy(env);
   const bundle = runtimeAware
-    ? normalizeBundleForRuntime(loadBundle(inPath, format))
+    ? normalizeBundleForRuntime(loadBundle(inPath, format), {
+        capabilityRequiredProviders: providerCapabilityPolicy.requiredProviders,
+      })
     : loadBundle(inPath, format);
   if (!bundle || !bundle.mainAgent) {
     throw new Error('Invalid bundle: missing mainAgent');
   }
-  const providerCapabilityPolicy = loadAgentProviderCapabilityPolicy(env);
   const compareResult = await compareBundles({
     email,
     agentId: bundle.mainAgent.id || bundle.meta?.mainAgentId || null,
@@ -2363,4 +2366,5 @@ module.exports = {
   shouldApplyRuntimeOverrides,
   shouldRepairRuntimeFieldsForPushMode,
   shouldPushStandaloneBackgroundAgent,
+  loadAgentProviderCapabilityPolicy,
 };

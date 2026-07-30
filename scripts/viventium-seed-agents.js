@@ -16,7 +16,7 @@ const {
   buildCanonicalPersistedAgentFields,
   hasCanonicalPersistedAgentFieldDrift,
 } = require('./viventium-agent-runtime-models');
-const { resolvePromptRefs } = require('./viventium-sync-agents');
+const { loadAgentProviderCapabilityPolicy, resolvePromptRefs } = require('./viventium-sync-agents');
 
 // App Support runtime env is the canonical local runtime source. Component-local env files are
 // fallback-only and must not override the active generated runtime profile.
@@ -29,11 +29,7 @@ const { seedDatabase } = require('../api/models');
 const { Agent, User } = require('../api/db/models');
 const { createAgent, updateAgent } = require('../api/models/Agent');
 const { grantPermission } = require('../api/server/services/PermissionService');
-const {
-  AccessRoleIds,
-  PrincipalType,
-  ResourceType,
-} = require('librechat-data-provider');
+const { AccessRoleIds, PrincipalType, ResourceType } = require('librechat-data-provider');
 
 const DEFAULT_BUNDLE_PATH = path.join(ROOT_DIR, 'tmp', 'viventium-agents.yaml');
 const DEFAULT_AGENT_SEED_OWNER_EMAIL = 'viventium-system@example.com';
@@ -171,9 +167,18 @@ function resolvePublicAccessRoleIds(value) {
   };
 }
 
-function normalizeBundleForRuntimeWithOwner(bundle, { env = process.env } = {}) {
+function normalizeBundleForRuntimeWithOwner(
+  bundle,
+  { env = process.env, capabilityRequiredProviders = null } = {},
+) {
   const resolvedBundle = resolvePromptRefs(bundle);
-  const normalized = normalizeBundleForRuntime(resolvedBundle, { env });
+  const requiredProviders =
+    capabilityRequiredProviders ??
+    loadAgentProviderCapabilityPolicy('local', { runtimeEnv: env }).requiredProviders;
+  const normalized = normalizeBundleForRuntime(resolvedBundle, {
+    env,
+    capabilityRequiredProviders: requiredProviders,
+  });
   normalized.meta = {
     ...(normalized.meta || {}),
     user: {

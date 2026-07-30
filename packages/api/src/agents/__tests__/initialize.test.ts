@@ -406,6 +406,67 @@ describe('initializeAgent — custom endpoint init routing', () => {
   });
 });
 
+/* === VIVENTIUM START ===
+ * Regression: harness-native tool ownership.
+ * Purpose: A native-tools provider receives declared Agent tools through its signed capability
+ * bundle, so LibreChat must not also bind those tools into the model graph.
+ * === VIVENTIUM END === */
+describe('initializeAgent — provider-native tool ownership', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('keeps declared tools on the Agent while skipping LibreChat tool binding', async () => {
+    const provider = 'glasshive-harness';
+    const { agent, req, res, loadTools, db } = createMocks({ provider });
+    const declaredTools = [
+      'file_search',
+      'mcp__filesystem__read_file',
+      'mcp__glasshive-workers-projects__delegate',
+    ];
+    agent.tools = [...declaredTools];
+    req.config = {
+      endpoints: {
+        agents: {
+          providerCapabilities: {
+            [provider]: {
+              native_tools: true,
+              excluded_mcp_servers: ['glasshive-workers-projects'],
+              models: [
+                {
+                  id: 'test-model',
+                  effortChoices: [],
+                },
+              ],
+            },
+          },
+        },
+      },
+    } as ServerRequest['config'];
+
+    await initializeAgent(
+      {
+        req,
+        res,
+        agent,
+        loadTools,
+        endpointOption: { endpoint: EModelEndpoint.agents },
+        allowedProviders: new Set([provider]),
+        isInitialAgent: true,
+      },
+      db,
+    );
+
+    expect(loadTools).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider,
+        tools: [],
+      }),
+    );
+    expect(agent.tools).toEqual(declaredTools);
+  });
+});
+
 describe('initializeAgent — conversation recall resources', () => {
   const originalRagApiUrl = process.env.RAG_API_URL;
   const originalAppSupportDir = process.env.VIVENTIUM_APP_SUPPORT_DIR;

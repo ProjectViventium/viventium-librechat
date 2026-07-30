@@ -306,7 +306,11 @@ export async function initializeAgent(
       | {
           providerCapabilities?: Record<
             string,
-            { workspace_binding?: boolean; excluded_mcp_servers?: string[] }
+            {
+              workspace_binding?: boolean;
+              native_tools?: boolean;
+              excluded_mcp_servers?: string[];
+            }
           >;
         }
       | undefined
@@ -699,15 +703,21 @@ export async function initializeAgent(
   }
   vivInitTimings.transcript_attach_ms = Date.now() - vivTranscriptStart;
 
-  /* Filter only at the load boundary: recall and meeting-resource setup above may add file_search. */
-  const runtimeAgentTools = (agent.tools ?? []).filter((tool) => {
-    const delimiterIndex = tool.lastIndexOf(Constants.mcp_delimiter);
-    if (delimiterIndex < 0) {
-      return true;
-    }
-    const serverName = tool.slice(delimiterIndex + Constants.mcp_delimiter.length);
-    return !excludedMcpServers.has(serverName);
-  });
+  /* Filter only at the load boundary: recall and meeting-resource setup above may add file_search.
+   * A provider declaring native_tools owns execution through its authenticated capability bundle;
+   * retaining the declarations on `agent` lets that bundle remain complete while preventing a
+   * second, incompatible LibreChat tool graph from being bound to the provider request. */
+  const runtimeAgentTools =
+    providerCapability?.native_tools === true
+      ? []
+      : (agent.tools ?? []).filter((tool) => {
+          const delimiterIndex = tool.lastIndexOf(Constants.mcp_delimiter);
+          if (delimiterIndex < 0) {
+            return true;
+          }
+          const serverName = tool.slice(delimiterIndex + Constants.mcp_delimiter.length);
+          return !excludedMcpServers.has(serverName);
+        });
   const vivLoadToolsStart = Date.now();
   const {
     toolRegistry,

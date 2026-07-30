@@ -200,6 +200,46 @@ function buildFollowUpModelKwargsForProvider({ providerName, modelParameters } =
   }
   return Object.keys(kwargs).length > 0 ? kwargs : undefined;
 }
+
+const FOLLOW_UP_DROP_PARAM_ALIASES = Object.freeze({
+  frequency_penalty: ['frequencyPenalty'],
+  max_completion_tokens: ['maxCompletionTokens', 'maxTokens'],
+  max_output_tokens: ['maxOutputTokens', 'maxTokens'],
+  max_tokens: ['maxTokens'],
+  presence_penalty: ['presencePenalty'],
+  reasoning_summary: ['reasoningSummary'],
+  stop: ['stopSequences'],
+  top_p: ['topP'],
+  tool_choice: ['toolChoice'],
+  use_responses_api: ['useResponsesApi'],
+  web_search: ['webSearch'],
+});
+
+function applyCustomEndpointFollowUpDropParams(llmConfig, dropParams) {
+  if (!llmConfig || !Array.isArray(dropParams)) {
+    return llmConfig;
+  }
+  for (const rawParam of dropParams) {
+    const param = String(rawParam || '').trim();
+    if (!param) continue;
+    const normalized = param.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);
+    const aliases = new Set([
+      param,
+      normalized,
+      ...(FOLLOW_UP_DROP_PARAM_ALIASES[normalized] || []),
+    ]);
+    for (const alias of aliases) {
+      delete llmConfig[alias];
+      if (llmConfig.modelKwargs && typeof llmConfig.modelKwargs === 'object') {
+        delete llmConfig.modelKwargs[alias];
+      }
+    }
+  }
+  if (llmConfig.modelKwargs && Object.keys(llmConfig.modelKwargs).length === 0) {
+    delete llmConfig.modelKwargs;
+  }
+  return llmConfig;
+}
 /* === VIVENTIUM END === */
 
 function cloneFollowUpAgent(agent) {
@@ -1360,8 +1400,7 @@ async function resolveFollowUpLLMConfig({
           'X-Viventium-User-Id': '{{LIBRECHAT_USER_ID}}',
           'X-Viventium-Conversation-Id': '{{LIBRECHAT_BODY_CONVERSATIONID}}',
           'X-Viventium-Message-Id': '{{LIBRECHAT_BODY_MESSAGEID}}',
-          'X-GlassHive-Idempotency-Key':
-            '{{LIBRECHAT_BODY_VIVENTIUMGLASSHIVEIDEMPOTENCYKEY}}',
+          'X-GlassHive-Idempotency-Key': '{{LIBRECHAT_BODY_VIVENTIUMGLASSHIVEIDEMPOTENCYKEY}}',
           'X-Viventium-Stream-Id': '{{LIBRECHAT_BODY_VIVENTIUMSTREAMID}}',
           'X-Viventium-Surface': '{{LIBRECHAT_BODY_VIVENTIUMSURFACE}}',
           'X-Viventium-Input-Mode': '{{LIBRECHAT_BODY_VIVENTIUMINPUTMODE}}',
@@ -1389,7 +1428,7 @@ async function resolveFollowUpLLMConfig({
         }),
       };
       if (Array.isArray(customConfig.dropParams) && customConfig.dropParams.length > 0) {
-        llmConfig.dropParams = customConfig.dropParams;
+        applyCustomEndpointFollowUpDropParams(llmConfig, customConfig.dropParams);
       }
     }
   }

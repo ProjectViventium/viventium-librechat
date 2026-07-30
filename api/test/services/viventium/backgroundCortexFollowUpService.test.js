@@ -73,9 +73,7 @@ const db = require('~/models');
 const { getAgent } = require('~/models/Agent');
 const { initializeAnthropic, initializeOpenAI } = require('@librechat/api');
 const { Run } = require('@librechat/agents');
-const {
-  getCustomEndpointConfig,
-} = require('~/server/services/BackgroundCortexService');
+const { getCustomEndpointConfig } = require('~/server/services/BackgroundCortexService');
 const {
   cleanFallbackInsightText,
   getVisibleFallbackInsightTexts,
@@ -1618,7 +1616,7 @@ describe('BackgroundCortexFollowUpService', () => {
       apiKey: 'glasshive-provider-key',
       baseURL: 'http://127.0.0.1:8766/v1',
       defaultHeaders: { 'X-Existing': 'kept' },
-      dropParams: ['temperature'],
+      dropParams: ['temperature', 'max_tokens'],
     });
     const req = {
       user: { id: 'u1' },
@@ -1672,6 +1670,8 @@ describe('BackgroundCortexFollowUpService', () => {
       }),
     );
     expect(runCall.graphConfig.llmConfig.configuration).not.toHaveProperty('apiKey');
+    expect(runCall.graphConfig.llmConfig).not.toHaveProperty('maxTokens');
+    expect(runCall.graphConfig.llmConfig).not.toHaveProperty('temperature');
   });
 
   test('generateFollowUpText keeps governed OpenAI fallback when agent model metadata is missing', async () => {

@@ -23,6 +23,7 @@ jest.mock('@librechat/agents', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  createSafeUser: jest.fn((user) => user),
   initializeAnthropic: jest.fn(async ({ model_parameters }) => ({
     llmConfig: {
       model: model_parameters?.model ?? 'claude-sonnet-4-5',
@@ -49,6 +50,7 @@ jest.mock('@librechat/api', () => ({
       },
     },
   })),
+  resolveHeaders: jest.fn(({ headers }) => headers),
 }));
 
 jest.mock('~/server/services/BackgroundCortexService', () => ({
@@ -71,6 +73,9 @@ const db = require('~/models');
 const { getAgent } = require('~/models/Agent');
 const { initializeAnthropic, initializeOpenAI } = require('@librechat/api');
 const { Run } = require('@librechat/agents');
+const {
+  getCustomEndpointConfig,
+} = require('~/server/services/BackgroundCortexService');
 const {
   cleanFallbackInsightText,
   getVisibleFallbackInsightTexts,
@@ -1606,6 +1611,67 @@ describe('BackgroundCortexFollowUpService', () => {
       }),
     );
     expect(runInstance.processStream).toHaveBeenCalled();
+  });
+
+  test('generateFollowUpText gives a custom OpenAI-compatible endpoint a top-level API key', async () => {
+    getCustomEndpointConfig.mockResolvedValueOnce({
+      apiKey: 'glasshive-provider-key',
+      baseURL: 'http://127.0.0.1:8766/v1',
+      defaultHeaders: { 'X-Existing': 'kept' },
+      dropParams: ['temperature'],
+    });
+    const req = {
+      user: { id: 'u1' },
+      body: { conversationId: 'conversation-1', messageId: 'message-1' },
+      config: {
+        endpoints: {
+          agents: {
+            providerCapabilities: {
+              'glasshive-harness': {
+                phase_b_followup: true,
+                workspace_binding: true,
+              },
+            },
+          },
+        },
+      },
+    };
+
+    await generateFollowUpText({
+      req,
+      agent: {
+        id: 'agent-glasshive-main',
+        endpoint: 'glasshive-harness',
+        provider: 'openAI',
+        model: 'codex-cli:gpt-5.6-sol',
+        tools: [],
+        model_parameters: { reasoning_effort: 'medium' },
+        glasshive_options: {
+          workspace: { mode: 'life' },
+          access: 'workspace',
+        },
+      },
+      insightsData: {
+        insights: [{ cortexName: 'Risk', insight: 'A rollback plan is required.' }],
+      },
+      recentResponse: 'I am reviewing it.',
+      runId: 'message-1',
+      conversationId: 'conversation-1',
+      parentMessageId: 'message-1',
+    });
+
+    const runCall = Run.create.mock.calls.at(-1)[0];
+    expect(runCall.graphConfig.llmConfig).toEqual(
+      expect.objectContaining({
+        provider: 'openai',
+        apiKey: 'glasshive-provider-key',
+        configuration: expect.objectContaining({
+          baseURL: 'http://127.0.0.1:8766/v1',
+          defaultHeaders: expect.objectContaining({ 'X-Existing': 'kept' }),
+        }),
+      }),
+    );
+    expect(runCall.graphConfig.llmConfig.configuration).not.toHaveProperty('apiKey');
   });
 
   test('generateFollowUpText keeps governed OpenAI fallback when agent model metadata is missing', async () => {

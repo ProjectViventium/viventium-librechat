@@ -1374,8 +1374,8 @@ async function resolveFollowUpLLMConfig({
         };
       }
       llmConfig.provider = Providers.OPENAI;
+      llmConfig.apiKey = customConfig.apiKey;
       llmConfig.configuration = {
-        apiKey: customConfig.apiKey,
         baseURL: customConfig.baseURL,
         defaultHeaders: resolveHeaders({
           headers: runtimeHeaders,
@@ -2376,9 +2376,9 @@ async function createCortexFollowUpMessage({
       });
     } catch (err) {
       generationFailed = true;
+      const failure = sanitizeFollowUpErrorForLog(err);
       logger.warn(
-        '[BackgroundCortexFollowUpService] Failed to generate LLM follow-up text',
-        sanitizeFollowUpErrorForLog(err),
+        `[BackgroundCortexFollowUpService] Failed to generate LLM follow-up text: name=${failure.name || 'unknown'} status=${failure.status ?? 'none'} code=${failure.code || 'none'}`,
       );
     }
   }

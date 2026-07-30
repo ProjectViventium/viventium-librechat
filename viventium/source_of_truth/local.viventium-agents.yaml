@@ -296,8 +296,8 @@ mainAgent:
     - You're the conscious mind - respond immediately, don't wait for cortex results
 
     Current Date & Time: {{current_datetime}}
-  provider: openAI
-  model: gpt-5.6-sol
+  provider: glasshive-harness
+  model: codex-cli:gpt-5.6-sol
   tools:
     - sys__server__sys_mcp_scheduling-cortex
     - schedule_create_mcp_scheduling-cortex
@@ -412,9 +412,12 @@ mainAgent:
       defer_loading: true
   tool_kwargs: []
   model_parameters:
-    model: gpt-5.6-sol
+    model: codex-cli:gpt-5.6-sol
     reasoning_effort: medium
-    useResponsesApi: true
+  glasshive_options:
+    workspace:
+      mode: life
+    access: full
   end_after_tools: false
   hide_sequential_outputs: false
   support_contact:

@@ -1133,6 +1133,30 @@ describe('voice follow-up runtime assignment', () => {
     }
   });
 
+  test('preserves a custom endpoint as the Phase B route after OpenAI transport adaptation', () => {
+    const result = resolveFollowUpRuntimeAssignment(
+      {
+        id: 'agent-glasshive-main',
+        endpoint: 'glasshive-harness',
+        provider: 'openAI',
+        model: 'codex-cli:gpt-5.6-sol',
+        model_parameters: {
+          model: 'codex-cli:gpt-5.6-sol',
+          reasoning_effort: 'medium',
+        },
+        glasshive_options: {
+          workspace: { mode: 'life' },
+          access: 'workspace',
+        },
+      },
+      { useVoiceModel: false },
+    );
+
+    expect(result.effectiveProvider).toBe('glasshive-harness');
+    expect(result.effectiveModel).toBe('codex-cli:gpt-5.6-sol');
+    expect(result.runtimeAgent.endpoint).toBe('glasshive-harness');
+  });
+
   test('normalizes xAI voice follow-up parameters to no reasoning', () => {
     const result = resolveFollowUpRuntimeAssignment(
       {

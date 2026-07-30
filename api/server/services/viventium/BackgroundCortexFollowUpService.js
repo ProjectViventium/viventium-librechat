@@ -160,6 +160,23 @@ function normalizeFollowUpProvider(provider) {
 }
 
 /* === VIVENTIUM START ===
+ * Feature: Custom-endpoint Phase B route preservation.
+ * Purpose: Agent initialization adapts OpenAI-compatible custom endpoints to the internal OpenAI
+ * transport while retaining the declared provider on `agent.endpoint`. Phase B must resolve the
+ * declared endpoint, otherwise a GlassHive turn is silently reinterpreted as direct OpenAI.
+ * === VIVENTIUM END === */
+function resolveFollowUpProvider(agent, { useVoiceModel = false } = {}) {
+  if (useVoiceModel) {
+    return normalizeFollowUpProvider(agent?.voice_llm_provider || agent?.provider);
+  }
+  const endpoint = normalizeFollowUpProvider(agent?.endpoint);
+  if (endpoint && endpoint !== EModelEndpoint.agents && endpoint !== EModelEndpoint.custom) {
+    return endpoint;
+  }
+  return normalizeFollowUpProvider(agent?.provider);
+}
+
+/* === VIVENTIUM START ===
  * Feature: Voice Phase B no-reasoning parity.
  *
  * Purpose:
@@ -196,9 +213,7 @@ function hasExplicitFollowUpRoute(agent, { useVoiceModel = false } = {}) {
   if (!agent || typeof agent !== 'object') {
     return false;
   }
-  const provider = normalizeFollowUpProvider(
-    useVoiceModel ? agent.voice_llm_provider || agent.provider : agent.provider,
-  );
+  const provider = resolveFollowUpProvider(agent, { useVoiceModel });
   const model = String(
     useVoiceModel
       ? agent.voice_llm_model || agent.model || agent.model_parameters?.model || ''
@@ -628,11 +643,7 @@ function resolveFollowUpPersistenceText({
  *   docs/requirements_and_learnings/02_Background_Agents.md.
  */
 function resolveGovernedFollowUpModel(agent, { useVoiceModel = false } = {}) {
-  const rawProvider = String(
-    useVoiceModel ? agent?.voice_llm_provider || agent?.provider : agent?.provider,
-  )
-    .trim()
-    .toLowerCase();
+  const rawProvider = resolveFollowUpProvider(agent, { useVoiceModel });
   const provider = normalizeFollowUpProvider(rawProvider);
   const explicitModel = String(
     useVoiceModel
@@ -681,12 +692,7 @@ function resolveFollowUpRuntimeAssignment(agent, { useVoiceModel = false } = {})
       }
     : baseRuntimeAgent;
   const effectiveModel = resolveGovernedFollowUpModel(runtimeAgent, { useVoiceModel });
-  const rawProvider = String(
-    useVoiceModel
-      ? runtimeAgent?.voice_llm_provider || runtimeAgent?.provider
-      : runtimeAgent?.provider,
-  ).trim();
-  const effectiveProvider = normalizeFollowUpProvider(rawProvider);
+  const effectiveProvider = resolveFollowUpProvider(runtimeAgent, { useVoiceModel });
 
   return {
     runtimeAgent,

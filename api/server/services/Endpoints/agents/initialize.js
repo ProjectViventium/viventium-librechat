@@ -78,6 +78,7 @@ const {
 } = require('~/server/services/viventium/GlassHiveConversationProviderService');
 const {
   resolveAgentCapabilityProvider,
+  selectLibreChatAgentGraph,
 } = require('~/server/services/viventium/agentCapabilityProvider');
 /* === VIVENTIUM END === */
 
@@ -823,7 +824,18 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
     tool_resources: primaryConfig.tool_resources,
   });
 
-  const agent_ids = primaryConfig.agent_ids;
+  /* === VIVENTIUM START ===
+   * Feature: Native provider tool ownership at the graph boundary.
+   * Purpose: Handoff edges compile into model tool schemas. A native-tools endpoint receives
+   * capabilities through its signed broker bundle and must never also receive LibreChat graph
+   * tools; background cortices and Phase B are orchestrated independently of this graph.
+   * === VIVENTIUM END === */
+  const primaryGraph = selectLibreChatAgentGraph({
+    agentIds: primaryConfig.agent_ids,
+    edges: primaryConfig.edges,
+    capability: effectivePrimaryCapability,
+  });
+  const agent_ids = primaryGraph.agentIds;
   let userMCPAuthMap = primaryConfig.userMCPAuthMap;
   if (primaryConfig.viventiumFallbackLlm?.userMCPAuthMap) {
     if (userMCPAuthMap != null) {
@@ -941,7 +953,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
   );
 
   // Seed with primary agent's edges
-  collectEdges(primaryConfig.edges);
+  collectEdges(primaryGraph.edges);
 
   // BFS to load and merge all connected agents (enables transitive handoffs: A->B->C)
   while (agentsToProcess.size > 0) {

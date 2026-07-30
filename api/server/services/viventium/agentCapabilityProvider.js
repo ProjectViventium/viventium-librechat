@@ -11,4 +11,11 @@ function resolveAgentCapabilityProvider(agent) {
   return String(agent?.endpoint || agent?.provider || '').trim();
 }
 
-module.exports = { resolveAgentCapabilityProvider };
+function selectLibreChatAgentGraph({ agentIds, edges, capability } = {}) {
+  if (capability?.native_tools === true) {
+    return { agentIds: [], edges: [] };
+  }
+  return { agentIds, edges };
+}
+
+module.exports = { resolveAgentCapabilityProvider, selectLibreChatAgentGraph };

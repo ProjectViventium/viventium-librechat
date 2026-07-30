@@ -42,6 +42,8 @@ describe('agentsEndpointSchema provider capability policy', () => {
       native_tools: false,
       activity_stream: false,
       responses_api: false,
+      default_access: 'workspace',
+      allow_full_access: false,
     });
   });
 });

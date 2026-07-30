@@ -163,7 +163,9 @@ export default function ModelPanel({
       setValue('glasshive_options.workspace.mode', 'life', { shouldDirty: true });
     }
     if (!glassHiveOptions?.access) {
-      setValue('glasshive_options.access', 'full', { shouldDirty: true });
+      setValue('glasshive_options.access', providerCapability?.default_access ?? 'workspace', {
+        shouldDirty: true,
+      });
     }
     const effortChoices = modelCapability?.effortChoices ?? [];
     const currentEffort = String(modelParameters?.reasoning_effort ?? '');
@@ -182,6 +184,7 @@ export default function ModelPanel({
     modelCapability?.effortChoices,
     modelCapability?.recommendedEffort,
     modelParameters?.reasoning_effort,
+    providerCapability?.default_access,
     setValue,
   ]);
 
@@ -398,15 +401,24 @@ export default function ModelPanel({
                   id="glasshive-access"
                   className="border-token-border-light bg-token-surface-primary mb-3 h-10 w-full rounded-lg border px-3"
                 >
-                  <option value="full">Full access</option>
+                  {providerCapability?.allow_full_access === true && (
+                    <option value="full">Full access</option>
+                  )}
                   <option value="workspace">Workspace writes only</option>
                 </select>
               )}
             />
             <p className="text-token-text-secondary -mt-2 mb-3 text-xs">
-              Workspace mode limits writes to this folder. The harness may still read required
-              dependencies outside it.
+              {glassHiveOptions?.access === 'full'
+                ? 'Full access disables harness sandbox and approval gates. Use it only for a trusted local agent.'
+                : 'Workspace mode limits writes to this folder. The harness may still read required dependencies outside it.'}
             </p>
+            {providerCapability?.native_tools === true && (
+              <p className="text-token-text-secondary mb-3 text-xs">
+                This provider executes compatible declared MCP tools inside GlassHive. LibreChat
+                built-in Web Search, File Search, and Code Interpreter are not executed locally.
+              </p>
+            )}
 
             {(modelCapability?.effortChoices?.length ?? 0) > 0 && (
               <>

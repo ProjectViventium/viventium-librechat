@@ -5,6 +5,18 @@
  * === VIVENTIUM END === */
 
 const { Constants, extractEnvVariable } = require('librechat-data-provider');
+const crypto = require('crypto');
+
+function signBootstrapBundle(encodedBundle, issuedAt) {
+  const secret = String(process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET || '').trim();
+  if (!secret) {
+    throw new Error('GlassHive bootstrap signature secret is not configured');
+  }
+  return `sha256=${crypto
+    .createHmac('sha256', secret)
+    .update(`v1\n${issuedAt}\n${encodedBundle}`)
+    .digest('hex')}`;
+}
 
 function buildHarnessIdempotencyKey(role, messageId, agentId = '') {
   const cleanRole = String(role || '').trim();
@@ -76,7 +88,9 @@ function bindHarnessCancellation({
             },
           );
           if (!response?.ok) {
-            throw new Error(`GlassHive cancellation returned HTTP ${response?.status || 'unknown'}`);
+            throw new Error(
+              `GlassHive cancellation returned HTTP ${response?.status || 'unknown'}`,
+            );
           }
           if (cancelStreamId && req?._viventiumHarnessActivityEnabled === true) {
             const { GraphEvents } = require('@librechat/agents');
@@ -141,10 +155,7 @@ async function attachConversationProviderCapabilityBundle({
   if (!targetAgent || capability?.workspace_binding !== true) {
     return false;
   }
-  const allowedServerNames = declaredMcpServerNames(
-    declaredAgent,
-    capability.excluded_mcp_servers,
-  );
+  const allowedServerNames = declaredMcpServerNames(declaredAgent, capability.excluded_mcp_servers);
   if (allowedServerNames.length === 0) {
     return false;
   }
@@ -164,10 +175,11 @@ async function attachConversationProviderCapabilityBundle({
   const modelParameters = { ...(targetAgent.model_parameters || {}) };
   const configuration = { ...(modelParameters.configuration || {}) };
   const defaultHeaders = { ...(configuration.defaultHeaders || {}) };
-  defaultHeaders['X-GlassHive-Bootstrap-Bundle-B64'] = Buffer.from(
-    JSON.stringify(bundle),
-    'utf8',
-  ).toString('base64');
+  const encodedBundle = Buffer.from(JSON.stringify(bundle), 'utf8').toString('base64');
+  const issuedAt = String(Math.floor(Date.now() / 1000));
+  defaultHeaders['X-GlassHive-Bootstrap-Bundle-B64'] = encodedBundle;
+  defaultHeaders['X-GlassHive-Bootstrap-Timestamp'] = issuedAt;
+  defaultHeaders['X-GlassHive-Bootstrap-Signature'] = signBootstrapBundle(encodedBundle, issuedAt);
   configuration.defaultHeaders = defaultHeaders;
   modelParameters.configuration = configuration;
   targetAgent.model_parameters = modelParameters;

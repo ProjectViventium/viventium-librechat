@@ -309,6 +309,8 @@ export async function initializeAgent(
             {
               workspace_binding?: boolean;
               native_tools?: boolean;
+              default_access?: 'full' | 'workspace';
+              allow_full_access?: boolean;
               excluded_mcp_servers?: string[];
             }
           >;
@@ -849,6 +851,8 @@ export async function initializeAgent(
    * at run time, when the conversation/message/surface are known.
    * === VIVENTIUM END === */
   if (providerCapability?.workspace_binding === true) {
+    const providerDefaultAccess =
+      providerCapability.default_access === 'full' ? ('full' as const) : ('workspace' as const);
     const configuredOptions = (
       agent as Agent & {
         glasshive_options?: {
@@ -858,7 +862,7 @@ export async function initializeAgent(
       }
     ).glasshive_options ?? {
       workspace: { mode: 'life' as const },
-      access: 'full' as const,
+      access: providerDefaultAccess,
     };
     const workspacePath =
       configuredOptions.workspace?.mode === 'custom'
@@ -881,7 +885,7 @@ export async function initializeAgent(
       'X-GlassHive-Workspace-Path-B64': workspacePath
         ? Buffer.from(workspacePath, 'utf8').toString('base64')
         : '',
-      'X-GlassHive-Access': configuredOptions.access ?? 'full',
+      'X-GlassHive-Access': configuredOptions.access ?? providerDefaultAccess,
     };
     (agent.model_parameters as Record<string, unknown>).configuration = llmConfiguration;
   }

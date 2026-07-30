@@ -11,6 +11,8 @@ const providerRegistry = {
   'harness-provider': {
     workspace_binding: true,
     responses_api: false,
+    default_access: 'full' as const,
+    allow_full_access: true,
     models: [
       {
         id: 'native:model-a',
@@ -70,6 +72,33 @@ describe('applyAgentProviderCapabilityDefaults', () => {
     };
 
     expect(applyAgentProviderCapabilityDefaults(selection, providerRegistry)).toEqual(selection);
+  });
+
+  it('uses a registry-owned safer workspace default and rejects disallowed full access', () => {
+    const restrictedRegistry = {
+      'harness-provider': {
+        ...providerRegistry['harness-provider'],
+        default_access: 'workspace' as const,
+        allow_full_access: false,
+      },
+    };
+
+    expect(
+      applyAgentProviderCapabilityDefaults(
+        { provider: 'harness-provider', model: 'native:model-a' },
+        restrictedRegistry,
+      ).glasshive_options,
+    ).toEqual({ workspace: { mode: 'life' }, access: 'workspace' });
+    expect(() =>
+      applyAgentProviderCapabilityDefaults(
+        {
+          provider: 'harness-provider',
+          model: 'native:model-a',
+          glasshive_options: { workspace: { mode: 'life' }, access: 'full' },
+        },
+        restrictedRegistry,
+      ),
+    ).toThrow('does not permit full host access');
   });
 
   it('requires a custom workspace to be an absolute server-side path', () => {

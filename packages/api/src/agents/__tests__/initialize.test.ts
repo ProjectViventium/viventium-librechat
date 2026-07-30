@@ -431,6 +431,9 @@ describe('initializeAgent — provider-native tool ownership', () => {
           providerCapabilities: {
             [provider]: {
               native_tools: true,
+              workspace_binding: true,
+              default_access: 'workspace',
+              allow_full_access: false,
               excluded_mcp_servers: ['glasshive-workers-projects'],
               models: [
                 {
@@ -464,6 +467,11 @@ describe('initializeAgent — provider-native tool ownership', () => {
       }),
     );
     expect(agent.tools).toEqual(declaredTools);
+    expect(
+      (agent.model_parameters?.configuration?.defaultHeaders as Record<string, string>)[
+        'X-GlassHive-Access'
+      ],
+    ).toBe('workspace');
   });
 });
 

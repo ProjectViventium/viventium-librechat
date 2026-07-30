@@ -1,4 +1,5 @@
 const { Constants } = require('librechat-data-provider');
+const crypto = require('crypto');
 
 const mockEmitChunk = jest.fn();
 jest.mock('@librechat/api', () => ({
@@ -20,8 +21,19 @@ const {
 } = require('../GlassHiveConversationProviderService');
 
 describe('GlassHiveConversationProviderService', () => {
+  const originalBrokerSecret = process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
+
   beforeEach(() => {
     jest.clearAllMocks();
+    process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = 'synthetic-bundle-secret';
+  });
+
+  afterAll(() => {
+    if (originalBrokerSecret === undefined) {
+      delete process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
+    } else {
+      process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = originalBrokerSecret;
+    }
   });
 
   test('builds stable role-scoped keys for main, Phase B, and parallel cortices', () => {
@@ -213,5 +225,26 @@ describe('GlassHiveConversationProviderService', () => {
     expect(
       JSON.parse(Buffer.from(headers['X-GlassHive-Bootstrap-Bundle-B64'], 'base64').toString()),
     ).toEqual({ codex_config_append: '[mcp_servers.synthetic]' });
+    const expected = crypto
+      .createHmac('sha256', 'synthetic-bundle-secret')
+      .update(
+        `v1\n${headers['X-GlassHive-Bootstrap-Timestamp']}\n${headers['X-GlassHive-Bootstrap-Bundle-B64']}`,
+      )
+      .digest('hex');
+    expect(headers['X-GlassHive-Bootstrap-Signature']).toBe(`sha256=${expected}`);
+  });
+
+  test('fails closed instead of sending an unsigned capability bundle', async () => {
+    delete process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
+    buildConversationProviderBootstrapBundle.mockResolvedValue({ env: { SYNTHETIC: 'value' } });
+
+    await expect(
+      attachConversationProviderCapabilityBundle({
+        targetAgent: { model_parameters: {} },
+        declaredAgent: { tools: [`search${Constants.mcp_delimiter}synthetic-server`] },
+        req: { user: { id: 'user-synthetic' }, body: {} },
+        capability: { workspace_binding: true },
+      }),
+    ).rejects.toThrow('bootstrap signature secret is not configured');
   });
 });

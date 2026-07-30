@@ -747,6 +747,8 @@ endpoints:
         native_tools: true
         activity_stream: true
         responses_api: false
+        default_access: full
+        allow_full_access: true
         excluded_mcp_servers:
           - glasshive-workers-projects
         models:

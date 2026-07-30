@@ -214,6 +214,8 @@ export type ProviderCapabilityRegistry = Record<
     workspace_binding?: boolean;
     conversation_session?: boolean;
     responses_api?: boolean;
+    default_access?: 'full' | 'workspace';
+    allow_full_access?: boolean;
     models?: Array<{
       id: string;
       effortChoices?: string[];
@@ -369,8 +371,21 @@ export function applyAgentProviderCapabilityDefaults<T extends Record<string, un
   if (capability.workspace_binding === true && !next.glasshive_options) {
     next.glasshive_options = {
       workspace: { mode: 'life' },
-      access: 'full',
+      access: capability.default_access === 'full' ? 'full' : 'workspace',
     };
+  }
+  if (
+    capability.workspace_binding === true &&
+    next.glasshive_options?.access === 'full' &&
+    capability.allow_full_access !== true
+  ) {
+    throw new z.ZodError([
+      {
+        code: z.ZodIssueCode.custom,
+        path: ['glasshive_options', 'access'],
+        message: `Provider ${provider} does not permit full host access`,
+      },
+    ]);
   }
 
   return next;

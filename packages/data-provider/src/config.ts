@@ -311,6 +311,8 @@ export const agentProviderCapabilitySchema = z.object({
   native_tools: z.boolean().default(false),
   activity_stream: z.boolean().default(false),
   responses_api: z.boolean().default(false),
+  default_access: z.enum(['full', 'workspace']).default('workspace'),
+  allow_full_access: z.boolean().default(false),
   excluded_mcp_servers: z.array(z.string()).optional().default([]),
   models: z.array(agentProviderModelCapabilitySchema).default([]),
 });
@@ -2097,7 +2099,7 @@ export type TSpecialVarLabel = `com_ui_special_var_${keyof typeof specialVariabl
  * Does not infer or default any endpoint type when absent.
  */
 export function getEndpointField<
-  K extends TConfig[keyof TConfig] extends never ? never : keyof TConfig,
+  K extends (TConfig[keyof TConfig] extends never ? never : keyof TConfig),
 >(
   endpointsConfig: TEndpointsConfig | undefined | null,
   endpoint: EModelEndpoint | string | null | undefined,

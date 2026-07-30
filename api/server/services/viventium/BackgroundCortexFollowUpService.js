@@ -1389,9 +1389,11 @@ async function resolveFollowUpLLMConfig({
         {};
       let runtimeHeaders = { ...existingHeaders };
       if (followUpCapability?.workspace_binding === true) {
+        const providerDefaultAccess =
+          followUpCapability.default_access === 'full' ? 'full' : 'workspace';
         const options = resolvedAgent.glasshive_options || {
           workspace: { mode: 'life' },
-          access: 'full',
+          access: providerDefaultAccess,
         };
         const customPath =
           options?.workspace?.mode === 'custom' ? String(options.workspace.path || '') : '';
@@ -1409,7 +1411,7 @@ async function resolveFollowUpLLMConfig({
           'X-GlassHive-Workspace-Path-B64': customPath
             ? Buffer.from(customPath, 'utf8').toString('base64')
             : '',
-          'X-GlassHive-Access': options?.access || 'full',
+          'X-GlassHive-Access': options?.access || providerDefaultAccess,
         };
       }
       llmConfig.provider = Providers.OPENAI;

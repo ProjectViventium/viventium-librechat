@@ -2470,9 +2470,7 @@ async function buildActivationLlmConfig({ providerName, model, req }) {
   const normalizedProviderName = String(providerName || '')
     .trim()
     .toLowerCase();
-  const openAICompatibleProvider = ['groq', 'xai', 'perplexity'].includes(
-    normalizedProviderName,
-  );
+  const openAICompatibleProvider = ['groq', 'xai', 'perplexity'].includes(normalizedProviderName);
   const usesAdaptiveAnthropicTemperatureRules =
     providerName === 'anthropic' && supportsAdaptiveThinking(model);
   const llmConfig = {
@@ -3630,11 +3628,7 @@ async function executeCortexOnce({
      * Reason: Anthropic SDK streaming can emit control characters that break JSON parsing in background runs.
      */
     const cortexProvider = (initializedAgent.provider || '').toLowerCase();
-    const cortexIdempotencyKey = buildHarnessIdempotencyKey(
-      'cortex',
-      runId,
-      agentForRun.id,
-    );
+    const cortexIdempotencyKey = buildHarnessIdempotencyKey('cortex', runId, agentForRun.id);
     const cortexRequestBody = {
       ...safeReq.body,
       messageId: runId,
@@ -3812,15 +3806,18 @@ async function executeCortexOnce({
       publicError = publicCortexError('recoverable_provider_error');
     }
     // Log provider/model context for faster diagnosis (do NOT log api keys).
+    const safeError = {
+      ...sanitizeRuntimeErrorForLog(error, publicError.errorClass),
+      stage: executionStage,
+      configuredTools: configuredToolCount,
+      completedToolCalls,
+    };
     logger.error(
       `[BackgroundCortexService] Cortex execution failed for ${agent.id} ` +
-        `(provider=${agent.provider || 'unknown'}, model=${agent.model || agent.model_parameters?.model || 'unknown'}):`,
-      {
-        ...sanitizeRuntimeErrorForLog(error, publicError.errorClass),
-        stage: executionStage,
-        configuredTools: configuredToolCount,
-        completedToolCalls,
-      },
+        `(provider=${agent.provider || 'unknown'}, model=${agent.model || agent.model_parameters?.model || 'unknown'}, ` +
+        `class=${safeError.class}, stage=${safeError.stage}, status=${safeError.status ?? 'none'}, ` +
+        `code=${safeError.code ?? 'none'}, configured_tools=${safeError.configuredTools}, ` +
+        `completed_tool_calls=${safeError.completedToolCalls})`,
     );
     return {
       agentId: agent.id,

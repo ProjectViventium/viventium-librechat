@@ -5,7 +5,9 @@ import postcss from 'rollup-plugin-postcss';
 import replace from '@rollup/plugin-replace';
 import commonjs from '@rollup/plugin-commonjs';
 import resolve from '@rollup/plugin-node-resolve';
-import typescript from 'rollup-plugin-typescript2';
+/* VIVENTIUM START: Keep package compilation on the maintained Rollup TypeScript plugin. */
+import typescript from '@rollup/plugin-typescript';
+/* VIVENTIUM END */
 import { dirname, resolve as pathResolve } from 'path';
 import peerDepsExternal from 'rollup-plugin-peer-deps-external';
 import pkg from './package.json';
@@ -41,9 +43,11 @@ const plugins = [
   }),
   typescript({
     tsconfig: './tsconfig.json',
-    useTsconfigDeclarationDir: true,
-    clean: true,
-    check: false,
+    declaration: true,
+    declarationDir: 'dist/types',
+    rootDir: 'src',
+    outDir: 'dist',
+    noEmit: false,
   }),
 ];
 

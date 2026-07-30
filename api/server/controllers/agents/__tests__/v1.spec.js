@@ -205,6 +205,9 @@ describe('revertAgentVersion provider capability validation', () => {
       'glasshive-harness': {
         main_chat: true,
         workspace_binding: true,
+        responses_api: false,
+        default_access: 'full',
+        allow_full_access: true,
         models: [
           {
             id: 'codex-cli:gpt-5.6-sol',

@@ -91,14 +91,7 @@ describe('Viventium Claude Opus 5 release contract', () => {
     const capability = source.endpoints.agents.providerCapabilities['glasshive-harness'];
     const codex = capability.models.find((model) => model.id === 'codex-cli:gpt-5.6-sol');
     const claude = capability.models.find((model) => model.id === 'claude-code:opus');
-    expect(codex.effortChoices).toEqual([
-      'low',
-      'medium',
-      'high',
-      'xhigh',
-      'max',
-      'ultra',
-    ]);
+    expect(codex.effortChoices).toEqual(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
     expect(claude.effortChoices).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
 
     const modelParametersSection = fs.readFileSync(

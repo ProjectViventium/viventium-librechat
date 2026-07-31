@@ -92,8 +92,6 @@ describe('Viventium Claude Opus 5 release contract', () => {
     const codex = capability.models.find((model) => model.id === 'codex-cli:gpt-5.6-sol');
     const claude = capability.models.find((model) => model.id === 'claude-code:opus');
     expect(codex.effortChoices).toEqual([
-      'none',
-      'minimal',
       'low',
       'medium',
       'high',

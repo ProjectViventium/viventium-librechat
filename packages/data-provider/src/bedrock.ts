@@ -41,6 +41,17 @@ export function isOpus5OrLater(model: string): boolean {
   return opus != null && opus.major >= 5;
 }
 
+/** Checks whether the model accepts Anthropic's xhigh effort value. */
+export function supportsXhighEffort(model: string): boolean {
+  const opus = parseOpusVersion(model);
+  if (opus && (opus.major > 4 || (opus.major === 4 && opus.minor >= 7))) {
+    return true;
+  }
+
+  const sonnet = parseSonnetVersion(model);
+  return sonnet != null && sonnet.major >= 5;
+}
+
 /* === VIVENTIUM START ===
  * Feature: Current Anthropic sampling-parameter contract.
  * Purpose: Centralize the model capability used to omit parameters rejected by the provider.

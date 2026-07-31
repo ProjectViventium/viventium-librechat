@@ -33,10 +33,10 @@ describe('Viventium Claude Opus 5 release contract', () => {
         preset: expect.objectContaining({ model: 'claude-opus-4-8' }),
       }),
     );
-    expect(source.endpoints.anthropic.titleModel).toBe('claude-opus-5');
-    expect(source.endpoints.anthropic.summaryModel).toBe('claude-opus-5');
+    expect(source.endpoints.anthropic.titleModel).toBe('claude-sonnet-4-5');
+    expect(source.endpoints.anthropic.summaryModel).toBe('claude-sonnet-4-5');
     expect(source.memory.agent).toEqual(
-      expect.objectContaining({ provider: 'anthropic', model: 'claude-opus-5' }),
+      expect.objectContaining({ provider: 'anthropic', model: 'claude-sonnet-4-5' }),
     );
   });
 

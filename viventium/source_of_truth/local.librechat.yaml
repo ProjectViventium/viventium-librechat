@@ -688,7 +688,7 @@ ocr:
 endpoints:
   anthropic:
     titleEndpoint: anthropic
-    titleModel: claude-opus-5
+    titleModel: claude-sonnet-4-5
     titlePrompt: "Generate a concise natural conversation title from the user's request
       and the assistant's response. Do not browse, fetch, or judge URL accessibility.
       If the conversation contains a URL, title the user's intended task or outcome
@@ -701,7 +701,7 @@ endpoints:
 
       AI: {output}'
     summarize: false
-    summaryModel: claude-opus-5
+    summaryModel: claude-sonnet-4-5
     modelDisplayLabel: Azure AI Foundry (Claude)
   agents:
     order: -1
@@ -1103,7 +1103,7 @@ memory:
   personalize: true
   agent:
     provider: anthropic
-    model: claude-opus-5
+    model: claude-sonnet-4-5
     instructions: "You are the Memory Archivist. Maintain a LIVING, ACCURATE memory.\
       \ Structure, compress, never lose data.\n\n# RULE 1: NO DATA LOSS (HIGHEST PRIORITY)\n\
       When updating a key, you receive its EXISTING value. You MUST:\n- Start from\

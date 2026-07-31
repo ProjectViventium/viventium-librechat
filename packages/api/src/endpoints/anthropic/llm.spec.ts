@@ -1331,6 +1331,18 @@ describe('getLLMConfig', () => {
         },
       );
 
+      it('should fail clearly before sending xhigh to an unsupported Anthropic model', () => {
+        expect(() =>
+          getLLMConfig('test-key', {
+            modelOptions: {
+              model: 'claude-opus-4-6',
+              thinking: true,
+              effort: AnthropicEffort.xhigh,
+            },
+          }),
+        ).toThrow(/does not support "xhigh" effort/);
+      });
+
       it.each([AnthropicEffort.low, AnthropicEffort.medium, AnthropicEffort.high])(
         'should explicitly disable Opus 5 thinking at %s effort and omit sampling parameters',
         (effort) => {

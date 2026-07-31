@@ -1340,6 +1340,31 @@ describe('voice follow-up runtime assignment', () => {
     expect(result.runtimeAgent.endpoint).toBe('glasshive-harness');
   });
 
+  test('preserves a capability-required canonical Main across stale upgrade runtime defaults', () => {
+    const result = resolveFollowUpRuntimeAssignment(
+      {
+        id: 'agent_viventium_main_95aeb3',
+        provider: 'glasshive-harness',
+        model: 'codex-cli:gpt-5.6-sol',
+        model_parameters: {
+          model: 'codex-cli:gpt-5.6-sol',
+          reasoning_effort: 'medium',
+        },
+      },
+      {
+        useVoiceModel: false,
+        capabilityRequiredProviders: ['glasshive-harness'],
+      },
+    );
+
+    expect(result.effectiveProvider).toBe('glasshive-harness');
+    expect(result.effectiveModel).toBe('codex-cli:gpt-5.6-sol');
+    expect(result.runtimeAgent.model_parameters).toMatchObject({
+      model: 'codex-cli:gpt-5.6-sol',
+      reasoning_effort: 'medium',
+    });
+  });
+
   test('normalizes xAI voice follow-up parameters to no reasoning', () => {
     const result = resolveFollowUpRuntimeAssignment(
       {

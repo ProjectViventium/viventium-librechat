@@ -2538,7 +2538,12 @@ async function buildActivationLlmConfig({ providerName, model, req }) {
   const normalizedProviderName = String(providerName || '')
     .trim()
     .toLowerCase();
-  const openAICompatibleProvider = ['groq', 'xai', 'perplexity'].includes(normalizedProviderName);
+  const openAICompatibleProvider = (agentsConfig.activationOpenAITransportProviders || []).some(
+    (provider) =>
+      String(provider || '')
+        .trim()
+        .toLowerCase() === normalizedProviderName,
+  );
   const usesAdaptiveAnthropicTemperatureRules =
     providerName === 'anthropic' && supportsAdaptiveThinking(model);
   const llmConfig = {
@@ -2623,7 +2628,7 @@ async function buildActivationLlmConfig({ providerName, model, req }) {
     }
   }
 
-  if (req && !mappedProvider && !customEndpointResolved) {
+  if (req && !mappedProvider && !openAICompatibleProvider && !customEndpointResolved) {
     throw new Error(
       `Unsupported or unavailable activation provider "${String(providerName || '')}"`,
     );

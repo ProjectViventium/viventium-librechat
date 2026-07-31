@@ -132,33 +132,6 @@ function feelingTailForAgent({ snapshot, agentId, primaryAgentId }) {
   return snapshot.capsule;
 }
 
-/* === VIVENTIUM START ===
- * Feature: Final-boundary dynamic-tail pinning.
- * Purpose: Agent graph preparation may rebuild instructions after buildMessages. Re-pin the exact
- * structured per-turn tail immediately before createRun so it reaches the authoring provider once,
- * at the end of the instruction frame. Exact-string handling avoids prompt/intent heuristics.
- * === VIVENTIUM END === */
-function pinDynamicTailAtRunBoundary(instructions, dynamicTail) {
-  const instructionText = typeof instructions === 'string' ? instructions : '';
-  const tailText = typeof dynamicTail === 'string' ? dynamicTail.trim() : '';
-  if (!tailText) return instructionText;
-
-  const withoutExistingCopies = instructionText
-    .split(tailText)
-    .map((part) => part.trim())
-    .filter(Boolean)
-    .join('\n\n');
-  return [withoutExistingCopies, tailText].filter(Boolean).join('\n\n');
-}
-
-function withPinnedDynamicTailAtRunBoundary(agent, dynamicTail) {
-  if (!agent || typeof agent !== 'object' || !dynamicTail) return agent;
-  return {
-    ...agent,
-    instructions: pinDynamicTailAtRunBoundary(agent.instructions, dynamicTail),
-  };
-}
-
 function cloneAgentConfigForRuntime(agent) {
   if (!agent || typeof agent !== 'object') return agent;
   const instructionsDescriptor = Object.getOwnPropertyDescriptor(agent, 'instructions');
@@ -6138,8 +6111,6 @@ module.exports.shouldSuppressSpeculativeRunError = shouldSuppressSpeculativeRunE
 module.exports.buildMergedInsightsDataFromCortexParts = buildMergedInsightsDataFromCortexParts;
 module.exports.createCortexPersistenceCoordinator = createCortexPersistenceCoordinator;
 module.exports.feelingTailForAgent = feelingTailForAgent;
-module.exports.pinDynamicTailAtRunBoundary = pinDynamicTailAtRunBoundary;
-module.exports.withPinnedDynamicTailAtRunBoundary = withPinnedDynamicTailAtRunBoundary;
 module.exports.cloneAgentConfigForRuntime = cloneAgentConfigForRuntime;
 module.exports.externalUserStimulusForReaction = externalUserStimulusForReaction;
 module.exports.evalIsolationForRequest = evalIsolationForRequest;

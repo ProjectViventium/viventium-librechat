@@ -698,7 +698,10 @@ function resolveGovernedFollowUpModel(agent, { useVoiceModel = false } = {}) {
 }
 /* === VIVENTIUM NOTE === */
 
-function resolveFollowUpRuntimeAssignment(agent, { useVoiceModel = false } = {}) {
+function resolveFollowUpRuntimeAssignment(
+  agent,
+  { useVoiceModel = false, capabilityRequiredProviders = [] } = {},
+) {
   /* === VIVENTIUM START ===
    * Feature: Follow-up LLM route preservation.
    * Purpose: Phase B follows the live main agent route that produced the parent turn. The compiled
@@ -707,7 +710,7 @@ function resolveFollowUpRuntimeAssignment(agent, { useVoiceModel = false } = {})
    * === VIVENTIUM END === */
   const baseRuntimeAgent = hasExplicitFollowUpRoute(agent, { useVoiceModel })
     ? cloneFollowUpAgent(agent)
-    : rewriteAgentForRuntime(agent || {});
+    : rewriteAgentForRuntime(agent || {}, { capabilityRequiredProviders });
   /* === VIVENTIUM NOTE ===
    * Voice follow-ups should respect the same machine-level fast voice override contract as the
    * main voice turn, but only at runtime. Keep the canonical built-in bundle unset by default and
@@ -793,11 +796,17 @@ function mergeFollowUpAgentRuntimeState(runtimeAgent, persistedAgent) {
   return merged;
 }
 
-async function resolveCanonicalFollowUpAgent(agent, { useVoiceModel = false } = {}) {
+async function resolveCanonicalFollowUpAgent(
+  agent,
+  { useVoiceModel = false, capabilityRequiredProviders = [] } = {},
+) {
   let assignment;
   let initialResolutionError = null;
   try {
-    assignment = resolveFollowUpRuntimeAssignment(agent, { useVoiceModel });
+    assignment = resolveFollowUpRuntimeAssignment(agent, {
+      useVoiceModel,
+      capabilityRequiredProviders,
+    });
   } catch (error) {
     if (!agent?.id || normalizeFollowUpProvider(agent?.provider)) {
       throw error;
@@ -835,9 +844,11 @@ async function resolveCanonicalFollowUpAgent(agent, { useVoiceModel = false } = 
 
     const canonicalSourceAgent = rewriteAgentForRuntime(
       mergeFollowUpAgentRuntimeState(assignment.runtimeAgent, persistedAgent),
+      { capabilityRequiredProviders },
     );
     const canonicalAssignment = resolveFollowUpRuntimeAssignment(canonicalSourceAgent, {
       useVoiceModel,
+      capabilityRequiredProviders,
     });
     const canonicalRuntimeAgent = canonicalAssignment.runtimeAgent;
     const effectiveModel = canonicalAssignment.effectiveModel;
@@ -1196,6 +1207,8 @@ async function resolveFollowUpLLMConfig({
   conversationId = '',
   parentMessageId = '',
 }) {
+  const capabilityRequiredProviders =
+    req?.config?.endpoints?.agents?.capabilityRequiredProviders || [];
   let resolvedAgent = agent || {};
   let resolvedProviderName = normalizeFollowUpProvider(providerName).toLowerCase();
   let resolvedModel = String(effectiveModel || '').trim();
@@ -1214,9 +1227,11 @@ async function resolveFollowUpLLMConfig({
         const priorReasoningEffort = resolvedAgent?.model_parameters?.reasoning_effort;
         const mergedAgent = rewriteAgentForRuntime(
           mergeFollowUpAgentRuntimeState(resolvedAgent, persistedAgent),
+          { capabilityRequiredProviders },
         );
         const hydratedAssignment = resolveFollowUpRuntimeAssignment(mergedAgent, {
           useVoiceModel,
+          capabilityRequiredProviders,
         });
         resolvedAgent = hydratedAssignment.runtimeAgent;
         const hydratedProviderName = normalizeFollowUpProvider(
@@ -2265,6 +2280,8 @@ async function generateFollowUpText({
     agent,
     {
       useVoiceModel,
+      capabilityRequiredProviders:
+        req?.config?.endpoints?.agents?.capabilityRequiredProviders || [],
     },
   );
   /* === VIVENTIUM END === */
@@ -2327,8 +2344,7 @@ async function generateFollowUpText({
     capsule: phaseBFeelingInjection.capsule,
   });
   const feelingInjectionReason =
-    !feelingPlacement.presentInFinalRun &&
-    phaseBFeelingInjection.reason === 'conscious_synthesis'
+    !feelingPlacement.presentInFinalRun && phaseBFeelingInjection.reason === 'conscious_synthesis'
       ? 'capsule_not_applied'
       : phaseBFeelingInjection.reason;
   logFeelingsEvent(logger, req, 'feelings.inject.final_run', {

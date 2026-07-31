@@ -15,6 +15,7 @@ describe('agentsEndpointSchema provider capability policy', () => {
     expect(() =>
       agentsEndpointSchema.parse({
         capabilityRequiredProviders: ['synthetic-harness'],
+        activationOpenAITransportProviders: ['synthetic-openai-transport'],
         providerCapabilities: {},
       }),
     ).toThrow('Provider capability configuration is required for synthetic-harness');
@@ -23,6 +24,7 @@ describe('agentsEndpointSchema provider capability policy', () => {
   it('defaults every omitted role flag to false for a declared capability', () => {
     const parsed = agentsEndpointSchema.parse({
       capabilityRequiredProviders: ['synthetic-harness'],
+      activationOpenAITransportProviders: ['synthetic-openai-transport'],
       providerCapabilities: {
         'synthetic-harness': {
           label: 'Synthetic Harness',
@@ -45,6 +47,7 @@ describe('agentsEndpointSchema provider capability policy', () => {
       default_access: 'workspace',
       allow_full_access: false,
     });
+    expect(parsed.activationOpenAITransportProviders).toEqual(['synthetic-openai-transport']);
   });
 });
 

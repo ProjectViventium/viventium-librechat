@@ -407,7 +407,10 @@ function buildAssistantRouteAssignment(provider, model) {
  * Purpose: Resolve the effective call-session LLM from the actual owning agent so Wing Mode shows
  * the real agent primary route or explicit Voice Call LLM instead of a hidden machine default.
  * === VIVENTIUM END === */
-async function resolveCallSessionAssistantRoute(agentId) {
+async function resolveCallSessionAssistantRoute(
+  agentId,
+  { capabilityRequiredProviders = [] } = {},
+) {
   if (!agentId) {
     return null;
   }
@@ -422,7 +425,9 @@ async function resolveCallSessionAssistantRoute(agentId) {
     return null;
   }
 
-  const runtimeAgent = rewriteAgentForRuntime(persistedAgent);
+  const runtimeAgent = rewriteAgentForRuntime(persistedAgent, {
+    capabilityRequiredProviders,
+  });
   const primary = buildAssistantRouteAssignment(
     runtimeAgent?.provider,
     runtimeAgent?.model || runtimeAgent?.model_parameters?.model,
@@ -566,13 +571,18 @@ async function syncCallSessionState({
   return normalizeSession(session);
 }
 
-async function getCallSessionVoiceSettings(callSessionId) {
+async function getCallSessionVoiceSettings(
+  callSessionId,
+  { capabilityRequiredProviders = [] } = {},
+) {
   const session = await getCallSession(callSessionId);
   if (!session) {
     return null;
   }
 
-  const assistantRoute = await resolveCallSessionAssistantRoute(session.agentId);
+  const assistantRoute = await resolveCallSessionAssistantRoute(session.agentId, {
+    capabilityRequiredProviders,
+  });
 
   return {
     callSessionId: session.callSessionId,
@@ -595,6 +605,7 @@ async function updateCallSessionVoiceSettings({
   requestedVoiceRoute,
   touch = true,
   persistToUserDefaults = true,
+  capabilityRequiredProviders = [],
 }) {
   if (!callSessionId) {
     throw new Error('updateCallSessionVoiceSettings requires callSessionId');
@@ -637,7 +648,9 @@ async function updateCallSessionVoiceSettings({
     );
   }
 
-  const assistantRoute = await resolveCallSessionAssistantRoute(normalizedSession.agentId);
+  const assistantRoute = await resolveCallSessionAssistantRoute(normalizedSession.agentId, {
+    capabilityRequiredProviders,
+  });
 
   return {
     callSessionId: normalizedSession.callSessionId,

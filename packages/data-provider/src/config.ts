@@ -332,6 +332,7 @@ export const agentsEndpointSchema = baseEndpointSchema
       allowedProviders: z.array(z.union([z.string(), eModelEndpointSchema])).optional(),
       providerCapabilities: z.record(agentProviderCapabilitySchema).optional().default({}),
       capabilityRequiredProviders: z.array(z.string()).optional().default([]),
+      activationOpenAITransportProviders: z.array(z.string()).optional().default([]),
       capabilities: z
         .array(z.nativeEnum(AgentCapabilities))
         .optional()

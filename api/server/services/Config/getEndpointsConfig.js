@@ -85,6 +85,7 @@ async function getEndpointsConfig(req) {
       allowedProviders,
       providerCapabilities,
       capabilityRequiredProviders,
+      activationOpenAITransportProviders,
       ..._rest
     } = appConfig.endpoints[EModelEndpoint.agents];
 
@@ -93,6 +94,7 @@ async function getEndpointsConfig(req) {
       allowedProviders,
       providerCapabilities,
       capabilityRequiredProviders,
+      activationOpenAITransportProviders,
       disableBuilder,
       capabilities,
     };

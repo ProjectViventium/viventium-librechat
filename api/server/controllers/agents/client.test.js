@@ -6,8 +6,6 @@ const AgentClient = require('./client');
 const {
   createCortexPersistenceCoordinator,
   feelingTailForAgent,
-  pinDynamicTailAtRunBoundary,
-  withPinnedDynamicTailAtRunBoundary,
   cloneAgentConfigForRuntime,
   externalUserStimulusForReaction,
   evalIsolationForRequest,
@@ -203,33 +201,6 @@ describe('Feelings agent scope', () => {
         primaryAgentId: 'main',
       }),
     ).toBe('');
-  });
-
-  it('pins the exact dynamic tail once at the final run boundary', () => {
-    expect(pinDynamicTailAtRunBoundary('base instructions', snapshot.capsule)).toBe(
-      `base instructions\n\n${snapshot.capsule}`,
-    );
-    expect(
-      pinDynamicTailAtRunBoundary(
-        `base instructions\n\n${snapshot.capsule}\n\nsurface instructions\n\n${snapshot.capsule}`,
-        snapshot.capsule,
-      ),
-    ).toBe(`base instructions\n\nsurface instructions\n\n${snapshot.capsule}`);
-  });
-
-  it('leaves instructions unchanged when there is no eligible dynamic tail', () => {
-    expect(pinDynamicTailAtRunBoundary('base instructions', '')).toBe('base instructions');
-    expect(pinDynamicTailAtRunBoundary(undefined, '')).toBe('');
-  });
-
-  it('creates a run-local config when the source agent cannot retain instruction mutations', () => {
-    const frozenAgent = Object.freeze({ id: 'main', instructions: 'base instructions' });
-    const runAgent = withPinnedDynamicTailAtRunBoundary(frozenAgent, snapshot.capsule);
-
-    expect(runAgent).not.toBe(frozenAgent);
-    expect(frozenAgent.instructions).toBe('base instructions');
-    expect(runAgent.instructions).toBe(`base instructions\n\n${snapshot.capsule}`);
-    expect(withPinnedDynamicTailAtRunBoundary(frozenAgent, '')).toBe(frozenAgent);
   });
 
   it('clones immutable stored Agent configs before any per-turn context assembly', () => {

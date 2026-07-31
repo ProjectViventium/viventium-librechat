@@ -23,6 +23,7 @@ describe('viventium-agent-runtime-models', () => {
     expect([...APPROVED_MAIN_RUNTIME_FAMILIES]).toEqual([
       'openAI::gpt-5.6-sol',
       'anthropic::claude-opus-4-8',
+      'glasshive-harness::codex-cli:gpt-5.6-sol',
     ]);
     expect([...APPROVED_BACKGROUND_RUNTIME_FAMILIES]).toEqual([
       'openAI::gpt-5.6-sol',

@@ -140,7 +140,9 @@ router.post('/', requireJwtAuth, async (req, res) => {
 router.get('/:callSessionId/voice-settings', dispatchAuth, async (req, res) => {
   try {
     const session = req.viventiumCallSession;
-    const settings = await getCallSessionVoiceSettings(session.callSessionId);
+    const settings = await getCallSessionVoiceSettings(session.callSessionId, {
+      capabilityRequiredProviders: req.config?.endpoints?.agents?.capabilityRequiredProviders || [],
+    });
 
     if (!settings) {
       return res.status(401).json({ error: 'Unknown or expired call session' });
@@ -165,6 +167,7 @@ router.post('/:callSessionId/voice-settings', dispatchAuth, async (req, res) => 
       touch: body.touch !== false,
       persistToUserDefaults: body.persistToUserDefaults !== false,
       requestedVoiceRoute: body.requestedVoiceRoute,
+      capabilityRequiredProviders: req.config?.endpoints?.agents?.capabilityRequiredProviders || [],
     });
 
     if (!updated) {

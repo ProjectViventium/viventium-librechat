@@ -14,7 +14,7 @@ const sensitiveKeys: RegExp[] = [
   /\b(ghp_)[A-Za-z0-9_]{8,}/gi,
   /\b(xoxb-)[A-Za-z0-9-]{8,}/gi,
   /\b(Bearer\s+)[^\s,;"']+/gi,
-  /\b(api[-_ ]?key\s*[:=]?\s*)[^\s,;"']+/gi,
+  /\b(api[-_ ]?key\s*[:=]\s*)[^\s,;"']+/gi,
   /\b((?:token|secret|password|passwd|pwd)\s*[:=]\s*)[^\s,;"']+/gi,
   /\b(key=)[^\s&#]+/gi,
   /\b(eyJ[A-Za-z0-9_-]+\.)[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g,

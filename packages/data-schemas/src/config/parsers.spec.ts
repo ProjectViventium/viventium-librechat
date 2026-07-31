@@ -23,6 +23,12 @@ describe('Viventium log redaction', () => {
     expect(output).not.toContain('c3ludGhldGlj');
   });
 
+  it('does not redact ordinary prose that merely discusses API keys', () => {
+    expect(redactMessage('API key rotation completed successfully')).toBe(
+      'API key rotation completed successfully',
+    );
+  });
+
   it('redacts nested custom-endpoint credentials from debug formatting', () => {
     const info: Record<string | symbol, unknown> = {
       level: 'debug',

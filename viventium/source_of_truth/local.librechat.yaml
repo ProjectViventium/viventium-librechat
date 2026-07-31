@@ -735,6 +735,10 @@ endpoints:
             contextLimit: 200000
     capabilityRequiredProviders:
       - glasshive-harness
+    activationOpenAITransportProviders:
+      - groq
+      - xai
+      - perplexity
     # VIVENTIUM END
     capabilities:
       - deferred_tools

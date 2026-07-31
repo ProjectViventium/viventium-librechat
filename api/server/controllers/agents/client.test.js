@@ -6,10 +6,15 @@ const AgentClient = require('./client');
 const {
   createCortexPersistenceCoordinator,
   feelingTailForAgent,
+  pinDynamicTailAtRunBoundary,
+  withPinnedDynamicTailAtRunBoundary,
+  cloneAgentConfigForRuntime,
   externalUserStimulusForReaction,
   evalIsolationForRequest,
   classifyMemoryWriterResult,
   mergeLateActivationCandidates,
+  convertHarnessActivityParts,
+  isHarnessInvocationLocked,
 } = AgentClient;
 
 jest.mock('@librechat/agents', () => ({
@@ -200,6 +205,48 @@ describe('Feelings agent scope', () => {
     ).toBe('');
   });
 
+  it('pins the exact dynamic tail once at the final run boundary', () => {
+    expect(pinDynamicTailAtRunBoundary('base instructions', snapshot.capsule)).toBe(
+      `base instructions\n\n${snapshot.capsule}`,
+    );
+    expect(
+      pinDynamicTailAtRunBoundary(
+        `base instructions\n\n${snapshot.capsule}\n\nsurface instructions\n\n${snapshot.capsule}`,
+        snapshot.capsule,
+      ),
+    ).toBe(`base instructions\n\nsurface instructions\n\n${snapshot.capsule}`);
+  });
+
+  it('leaves instructions unchanged when there is no eligible dynamic tail', () => {
+    expect(pinDynamicTailAtRunBoundary('base instructions', '')).toBe('base instructions');
+    expect(pinDynamicTailAtRunBoundary(undefined, '')).toBe('');
+  });
+
+  it('creates a run-local config when the source agent cannot retain instruction mutations', () => {
+    const frozenAgent = Object.freeze({ id: 'main', instructions: 'base instructions' });
+    const runAgent = withPinnedDynamicTailAtRunBoundary(frozenAgent, snapshot.capsule);
+
+    expect(runAgent).not.toBe(frozenAgent);
+    expect(frozenAgent.instructions).toBe('base instructions');
+    expect(runAgent.instructions).toBe(`base instructions\n\n${snapshot.capsule}`);
+    expect(withPinnedDynamicTailAtRunBoundary(frozenAgent, '')).toBe(frozenAgent);
+  });
+
+  it('clones immutable stored Agent configs before any per-turn context assembly', () => {
+    const storedAgent = Object.freeze({
+      id: 'main',
+      instructions: 'stored instructions',
+      model_parameters: Object.freeze({ model: 'synthetic-model' }),
+    });
+    const runtimeAgent = cloneAgentConfigForRuntime(storedAgent);
+
+    runtimeAgent.instructions = 'turn instructions';
+    expect(runtimeAgent).not.toBe(storedAgent);
+    expect(runtimeAgent.instructions).toBe('turn instructions');
+    expect(storedAgent.instructions).toBe('stored instructions');
+    expect(runtimeAgent.model_parameters).toBe(storedAgent.model_parameters);
+  });
+
   it('captures only the external user stimulus for the detached reaction', () => {
     expect(
       externalUserStimulusForReaction(
@@ -321,6 +368,7 @@ describe('buildViventiumMcpRequestBody', () => {
       messageId: 'assistant-1',
       conversationId: 'conv-1',
       parentMessageId: 'user-1',
+      harnessIdempotencyKey: 'main:assistant-1',
       req: {
         body: {
           viventiumSurface: 'telegram',
@@ -344,6 +392,7 @@ describe('buildViventiumMcpRequestBody', () => {
     });
 
     expect(body.viventiumSurface).toBe('telegram');
+    expect(body.viventiumGlassHiveIdempotencyKey).toBe('main:assistant-1');
     expect(body.viventiumStreamId).toBe('stream-1');
     expect(body.viventiumTelegramChatId).toBe('chat-1');
     expect(body.files[0]).toMatchObject({
@@ -355,6 +404,45 @@ describe('buildViventiumMcpRequestBody', () => {
     expect(body.attachments).toEqual(body.files);
     expect(body.file_ids).toEqual(['file-1']);
     expect(body.tool_resources.code_interpreter.file_ids).toEqual(['file-1']);
+  });
+});
+
+describe('GlassHive harness activity persistence', () => {
+  test('converts provider reasoning summaries without exposing them as model thinking', () => {
+    const parts = [
+      { type: ContentTypes.THINK, think: 'Started.\nWorking.\n' },
+      { type: ContentTypes.TEXT, text: 'The answer.' },
+    ];
+
+    expect(convertHarnessActivityParts(parts)).toBe(parts);
+    expect(parts).toEqual([
+      {
+        type: ContentTypes.HARNESS_ACTIVITY,
+        harness_activity: { event: 'reasoning-summary', summary: 'Started.\nWorking.\n' },
+      },
+      { type: ContentTypes.TEXT, text: 'The answer.' },
+    ]);
+  });
+
+  test('locks fallback and redispatch only after a harness invocation begins', () => {
+    expect(
+      isHarnessInvocationLocked({
+        _viventiumHarnessActivityEnabled: true,
+        _viventiumHarnessInvocationStarted: false,
+      }),
+    ).toBe(false);
+    expect(
+      isHarnessInvocationLocked({
+        _viventiumHarnessActivityEnabled: true,
+        _viventiumHarnessInvocationStarted: true,
+      }),
+    ).toBe(true);
+    expect(
+      isHarnessInvocationLocked({
+        _viventiumHarnessActivityEnabled: false,
+        _viventiumHarnessInvocationStarted: true,
+      }),
+    ).toBe(false);
   });
 });
 

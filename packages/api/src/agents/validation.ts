@@ -93,6 +93,39 @@ export const backgroundCortexSchema = z.object({
   activation: activationConfigSchema,
 });
 /* === VIVENTIUM END === */
+/* === VIVENTIUM START === GlassHive core Agent provider */
+export const glassHiveOptionsSchema = z
+  .object({
+    workspace: z.object({
+      mode: z.enum(['life', 'custom']),
+      path: z.string().optional(),
+    }),
+    access: z.enum(['full', 'workspace']),
+  })
+  .superRefine((value, ctx) => {
+    const customPath = value.workspace.path?.trim() ?? '';
+    if (value.workspace.mode === 'custom' && !customPath) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['workspace', 'path'],
+        message: 'Custom GlassHive workspace requires a server-side path',
+      });
+    } else if (
+      value.workspace.mode === 'custom' &&
+      !(
+        customPath.startsWith('/') ||
+        customPath.startsWith('~/') ||
+        /^[A-Za-z]:[\\/]/.test(customPath)
+      )
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['workspace', 'path'],
+        message: 'Custom GlassHive workspace must be an absolute server-side path',
+      });
+    }
+  });
+/* === VIVENTIUM END === */
 /** Base agent schema with all common fields */
 export const agentBaseSchema = z.object({
   name: z.string().nullable().optional(),
@@ -100,6 +133,7 @@ export const agentBaseSchema = z.object({
   instructions: z.string().nullable().optional(),
   avatar: agentAvatarSchema.nullable().optional(),
   model_parameters: z.record(z.unknown()).optional(),
+  glasshive_options: glassHiveOptionsSchema.optional(),
   tools: z.array(z.string()).optional(),
   /** @deprecated Use edges instead */
   agent_ids: z.array(z.string()).optional(),
@@ -164,6 +198,198 @@ export const agentUpdateSchema = agentBaseSchema.extend({
   removeProjectIds: z.array(z.string()).optional(),
   isCollaborative: z.boolean().optional(),
 });
+
+/* === VIVENTIUM START ===
+ * Feature: Config-owned exact provider/model validation.
+ * Purpose: Capability-backed providers fail visibly on unsupported model/effort selections and
+ * receive registry defaults without branching on provider names or display labels.
+ * === VIVENTIUM END === */
+export type ProviderCapabilityRegistry = Record<
+  string,
+  {
+    main_chat?: boolean;
+    activation_classifier?: boolean;
+    realtime_voice?: boolean;
+    automatic_fallback_target?: boolean;
+    workspace_binding?: boolean;
+    conversation_session?: boolean;
+    responses_api?: boolean;
+    default_access?: 'full' | 'workspace';
+    allow_full_access?: boolean;
+    models?: Array<{
+      id: string;
+      effortChoices?: string[];
+      recommendedEffort?: string;
+    }>;
+  }
+>;
+
+export function applyAgentProviderCapabilityDefaults<T extends Record<string, unknown>>(
+  agent: T,
+  registry: ProviderCapabilityRegistry | undefined,
+  requiredProviders: string[] = [],
+): T {
+  const next = { ...agent } as T & {
+    model_parameters?: Record<string, unknown>;
+    glasshive_options?: {
+      workspace: { mode: 'life' | 'custom'; path?: string };
+      access: 'full' | 'workspace';
+    };
+  };
+  const rejectCapabilityTarget = (
+    selectedProviderValue: unknown,
+    capabilityField: 'activation_classifier' | 'realtime_voice' | 'automatic_fallback_target',
+    path: Array<string | number>,
+  ) => {
+    const selectedProvider = String(selectedProviderValue ?? '').trim();
+    if (!selectedProvider) {
+      return;
+    }
+    const selectedCapability = registry?.[selectedProvider];
+    if (requiredProviders.includes(selectedProvider) && !selectedCapability) {
+      throw new z.ZodError([
+        {
+          code: z.ZodIssueCode.custom,
+          path,
+          message: `Provider capability configuration is unavailable for ${selectedProvider}`,
+        },
+      ]);
+    }
+    if (selectedCapability?.[capabilityField] === false) {
+      throw new z.ZodError([
+        {
+          code: z.ZodIssueCode.custom,
+          path,
+          message: `Provider ${selectedProvider} does not support this agent role`,
+        },
+      ]);
+    }
+  };
+
+  rejectCapabilityTarget(next.voice_llm_provider, 'realtime_voice', ['voice_llm_provider']);
+  rejectCapabilityTarget(next.voice_fallback_llm_provider, 'realtime_voice', [
+    'voice_fallback_llm_provider',
+  ]);
+  rejectCapabilityTarget(next.fallback_llm_provider, 'automatic_fallback_target', [
+    'fallback_llm_provider',
+  ]);
+  const backgroundCortices = next.background_cortices;
+  if (Array.isArray(backgroundCortices)) {
+    backgroundCortices.forEach((entry, cortexIndex) => {
+      if (!entry || typeof entry !== 'object') {
+        return;
+      }
+      const activation = (entry as { activation?: unknown }).activation;
+      if (!activation || typeof activation !== 'object') {
+        return;
+      }
+      const activationConfig = activation as {
+        provider?: unknown;
+        fallbacks?: Array<{ provider?: unknown }>;
+      };
+      rejectCapabilityTarget(activationConfig.provider, 'activation_classifier', [
+        'background_cortices',
+        cortexIndex,
+        'activation',
+        'provider',
+      ]);
+      (activationConfig.fallbacks ?? []).forEach((fallback, fallbackIndex) => {
+        rejectCapabilityTarget(fallback.provider, 'activation_classifier', [
+          'background_cortices',
+          cortexIndex,
+          'activation',
+          'fallbacks',
+          fallbackIndex,
+          'provider',
+        ]);
+      });
+    });
+  }
+
+  const provider = String(agent.provider ?? '').trim();
+  const capability = registry?.[provider];
+  if (provider && requiredProviders.includes(provider) && !capability) {
+    throw new z.ZodError([
+      {
+        code: z.ZodIssueCode.custom,
+        path: ['provider'],
+        message: `Provider capability configuration is unavailable for ${provider}`,
+      },
+    ]);
+  }
+  if (!capability) {
+    return next;
+  }
+  if (capability.main_chat === false) {
+    throw new z.ZodError([
+      {
+        code: z.ZodIssueCode.custom,
+        path: ['provider'],
+        message: `Provider ${provider} does not support main Agent chat`,
+      },
+    ]);
+  }
+  const model = String(agent.model ?? '').trim();
+  const modelMetadata = capability.models?.find((candidate) => candidate.id === model);
+  if (!modelMetadata) {
+    throw new z.ZodError([
+      {
+        code: z.ZodIssueCode.custom,
+        path: ['model'],
+        message: `Unsupported model for configured provider ${provider}`,
+      },
+    ]);
+  }
+
+  const modelParameters = { ...(next.model_parameters ?? {}) };
+  // The top-level Agent model is canonical. Do not let a stale nested model silently initialize a
+  // different harness after a provider/model switch, source sync, or historical version revert.
+  modelParameters.model = model;
+  if (capability.responses_api === false) {
+    delete modelParameters.useResponsesApi;
+    delete modelParameters.reasoning;
+    delete modelParameters.reasoning_summary;
+    delete modelParameters.verbosity;
+    delete modelParameters.web_search;
+  }
+  const effort = String(
+    modelParameters.reasoning_effort ?? modelMetadata.recommendedEffort ?? '',
+  ).trim();
+  if (effort && !(modelMetadata.effortChoices ?? []).includes(effort)) {
+    throw new z.ZodError([
+      {
+        code: z.ZodIssueCode.custom,
+        path: ['model_parameters', 'reasoning_effort'],
+        message: `Unsupported reasoning effort for model ${model}`,
+      },
+    ]);
+  }
+  if (effort) {
+    modelParameters.reasoning_effort = effort;
+  }
+  next.model_parameters = modelParameters;
+  if (capability.workspace_binding === true && !next.glasshive_options) {
+    next.glasshive_options = {
+      workspace: { mode: 'life' },
+      access: capability.default_access === 'full' ? 'full' : 'workspace',
+    };
+  }
+  if (
+    capability.workspace_binding === true &&
+    next.glasshive_options?.access === 'full' &&
+    capability.allow_full_access !== true
+  ) {
+    throw new z.ZodError([
+      {
+        code: z.ZodIssueCode.custom,
+        path: ['glasshive_options', 'access'],
+        message: `Provider ${provider} does not permit full host access`,
+      },
+    ]);
+  }
+
+  return next;
+}
 
 interface ValidateAgentModelParams {
   req: Request;

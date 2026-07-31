@@ -1078,6 +1078,16 @@ describe('BackgroundCortexService activation policy helpers', () => {
     expect(llmConfig.modelKwargs).toBeUndefined();
   });
 
+  test('fails loudly when an activation provider cannot be resolved exactly', async () => {
+    await expect(
+      buildActivationLlmConfig({
+        providerName: 'missing-provider',
+        model: 'missing-model',
+        req: { user: { id: 'user-test' }, config: { endpoints: { custom: [] } } },
+      }),
+    ).rejects.toThrow('Unsupported or unavailable activation provider');
+  });
+
   test('adds a bounded guard grace around each Phase B cortex attempt', () => {
     const previous = process.env.VIVENTIUM_CORTEX_EXECUTION_GUARD_GRACE_MS;
     process.env.VIVENTIUM_CORTEX_EXECUTION_GUARD_GRACE_MS = '5000';

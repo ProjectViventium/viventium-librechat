@@ -22,6 +22,7 @@ const { StandardGraph } = require('@librechat/agents');
 const PATCH_FLAG = Symbol.for('viventium.agent.schema.tool.binding.patch.v2');
 const SCOPED_TOOLS_FLAG = Symbol.for('viventium.agent.schema.tool.binding.accessor.v1');
 const DEDUPED_BINDING_FLAG = Symbol.for('viventium.agent.schema.tool.binding.dedupe.v1');
+const SCOPED_BINDING_FLAG = Symbol.for('viventium.agent.schema.tool.binding.method.v1');
 const scopedTools = new AsyncLocalStorage();
 
 function dedupeToolsByName(tools) {
@@ -76,13 +77,47 @@ function installScopedToolsAccessor(agentContext) {
 
   let baseTools = agentContext.tools;
   let resolvingScopedValue = false;
+  const currentGetToolsForBinding = agentContext.getToolsForBinding;
+  if (
+    typeof currentGetToolsForBinding === 'function' &&
+    currentGetToolsForBinding[SCOPED_BINDING_FLAG] !== true
+  ) {
+    const scopedGetToolsForBinding = function scopedGetToolsForBinding(...args) {
+      const scopedEntry = scopedTools.getStore()?.get(agentContext);
+      if (!scopedEntry) {
+        return currentGetToolsForBinding.apply(this, args);
+      }
+      scopedEntry.computingBinding = true;
+      try {
+        return currentGetToolsForBinding.apply(this, args);
+      } finally {
+        scopedEntry.computingBinding = false;
+      }
+    };
+    Object.defineProperty(scopedGetToolsForBinding, SCOPED_BINDING_FLAG, {
+      value: true,
+      enumerable: false,
+      configurable: false,
+      writable: false,
+    });
+    Object.defineProperty(agentContext, 'getToolsForBinding', {
+      value: scopedGetToolsForBinding,
+      enumerable: false,
+      configurable: true,
+      writable: true,
+    });
+  }
   Object.defineProperty(agentContext, 'tools', {
     configurable: true,
     enumerable: descriptor?.enumerable ?? true,
     get() {
-      const scopedValue = scopedTools.getStore()?.get(agentContext);
+      const scopedEntry = scopedTools.getStore()?.get(agentContext);
+      if (!scopedEntry || scopedEntry.computingBinding === true) {
+        return baseTools;
+      }
+      const scopedValue = scopedEntry.value;
       if (typeof scopedValue !== 'function') {
-        return scopedValue ?? baseTools;
+        return scopedValue;
       }
       if (resolvingScopedValue) {
         return baseTools;
@@ -201,10 +236,11 @@ function installUnifiedSchemaToolBindingPatch(proto = StandardGraph?.prototype) 
           );
           const scopedValue =
             Array.isArray(agentContext.toolDefinitions) && agentContext.toolDefinitions.length > 0
-              ? () => getToolsForBinding.call(agentContext)
+              ? () => agentContext.getToolsForBinding()
               : unifiedTools;
-          return scopedTools.run(new Map([[agentContext, scopedValue]]), () =>
-            originalCallModel(state, config),
+          return scopedTools.run(
+            new Map([[agentContext, { value: scopedValue, computingBinding: false }]]),
+            () => originalCallModel(state, config),
           );
         }
       }

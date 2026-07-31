@@ -197,6 +197,42 @@ else
 fi
 
 # === VIVENTIUM START ===
+# Feature: Reuse Viventium's validated Python for prompt compilation.
+# Purpose: Homebrew's newest bare `python3` may not have PyYAML even though the public launcher
+# already selected and exported a dependency-complete runtime. Direct starts also fail clearly
+# before mutating generated config when no compatible interpreter exists.
+resolve_prompt_registry_python() {
+    local public_root="${VIVENTIUM_PUBLIC_ROOT:-$(cd "$PROJECT_DIR/../.." && pwd)}"
+    local candidate=""
+    local candidates=(
+        "${PYTHON_BIN:-}"
+        "${VIVENTIUM_PYTHON_BIN:-}"
+        "$public_root/.venv/bin/python"
+        python3
+        python
+    )
+
+    for candidate in "${candidates[@]}"; do
+        [[ -n "$candidate" ]] || continue
+        if [[ "$candidate" == */* ]]; then
+            [[ -x "$candidate" ]] || continue
+        elif ! command -v "$candidate" >/dev/null 2>&1; then
+            continue
+        fi
+        if "$candidate" -c "import yaml" >/dev/null 2>&1; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    echo -e "${RED}Error: prompt compilation requires a Python runtime with PyYAML. Run bin/viventium doctor.${NC}" >&2
+    return 1
+}
+
+PROMPT_REGISTRY_PYTHON="$(resolve_prompt_registry_python)" || exit 1
+# === VIVENTIUM END ===
+
+# === VIVENTIUM START ===
 # Feature: Keep direct LibreChat dev starts aligned with Viventium source-of-truth config.
 # Purpose: `librechat.yaml` is an ignored local runtime file; direct starts must refresh it
 # from the tracked template before the API loads model specs, endpoints, and tools.
@@ -212,7 +248,7 @@ sync_viventium_librechat_config() {
         local public_root="${VIVENTIUM_PUBLIC_ROOT:-$(cd "$PROJECT_DIR/../.." && pwd)}"
         local prompt_registry_script="$public_root/scripts/viventium/prompt_registry.py"
         if [[ -f "$prompt_registry_script" ]]; then
-            "$PYTHON_BIN" - "$source_config" "$target_config" "$prompt_registry_script" <<'PY'
+            "$PROMPT_REGISTRY_PYTHON" - "$source_config" "$target_config" "$prompt_registry_script" <<'PY'
 import importlib.util
 import sys
 from pathlib import Path
@@ -265,7 +301,7 @@ ensure_viventium_prompt_bundle() {
     fi
 
     mkdir -p "$(dirname "$target")"
-    "$PYTHON_BIN" "$prompt_registry_script" --json-out "$target"
+    "$PROMPT_REGISTRY_PYTHON" "$prompt_registry_script" --json-out "$target"
     export VIVENTIUM_PROMPT_BUNDLE_PATH="$target"
     echo -e "${GREEN}Prompt registry bundle generated at $target${NC}"
 }

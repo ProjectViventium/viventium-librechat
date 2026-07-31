@@ -185,12 +185,28 @@ describe('agentLlmFallback', () => {
     ).toBe(true);
   });
 
-  test('recovers a structured primary initialization auth failure through the configured fallback', async () => {
-    const primaryAgent = { id: 'main', provider: 'openAI', model: 'gpt-primary' };
+  test.each([
+    [
+      'connected-account',
+      { id: 'main', provider: 'openAI', model: 'gpt-primary' },
+      'viventiumConnectedAccountReconnectRequired',
+    ],
+    [
+      'workspace-harness',
+      {
+        id: 'main',
+        provider: 'glasshive-harness',
+        model: 'codex-cli:gpt-5.6-sol',
+      },
+      'viventiumRecoverableProviderError',
+    ],
+  ])(
+    'recovers a structured %s initialization failure through the configured fallback',
+    async (_routeKind, primaryAgent, recoverableFlag) => {
     const fallbackAgent = { id: 'main', provider: 'xai', model: 'grok-fallback' };
     const primaryError = new Error('connected account unavailable');
     primaryError.code = 'MODEL_AUTHENTICATION';
-    primaryError.viventiumConnectedAccountReconnectRequired = true;
+    primaryError[recoverableFlag] = true;
     const initializePrimary = jest.fn(async () => {
       throw primaryError;
     });
@@ -216,7 +232,8 @@ describe('agentLlmFallback', () => {
     });
     expect(initializePrimary).toHaveBeenCalledTimes(1);
     expect(initializeFallback).toHaveBeenCalledTimes(1);
-  });
+    },
+  );
 
   test('does not hide a non-provider primary initialization failure behind model fallback', async () => {
     const primaryError = new Error('tool registry invariant failed');
@@ -225,7 +242,11 @@ describe('agentLlmFallback', () => {
 
     await expect(
       initializePrimaryAgentWithFallback({
-        primaryAgent: { id: 'main', provider: 'openAI', model: 'gpt-primary' },
+        primaryAgent: {
+          id: 'main',
+          provider: 'glasshive-harness',
+          model: 'codex-cli:gpt-5.6-sol',
+        },
         fallbackAgent: { id: 'main', provider: 'xai', model: 'grok-fallback' },
         fallbackAssignment: { provider: 'xai', model: 'grok-fallback' },
         initializePrimary: async () => {
@@ -246,7 +267,11 @@ describe('agentLlmFallback', () => {
 
     await expect(
       initializePrimaryAgentWithFallback({
-        primaryAgent: { id: 'main', provider: 'openAI', model: 'gpt-primary' },
+        primaryAgent: {
+          id: 'main',
+          provider: 'glasshive-harness',
+          model: 'codex-cli:gpt-5.6-sol',
+        },
         fallbackAgent: { id: 'main', provider: 'xai', model: 'grok-fallback' },
         fallbackAssignment: { provider: 'xai', model: 'grok-fallback' },
         initializePrimary: async () => {

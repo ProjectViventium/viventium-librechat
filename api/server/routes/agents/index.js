@@ -272,7 +272,11 @@ router.post('/chat/abort', async (req, res) => {
     }
 
     logger.debug(`[AgentStream] Job found, aborting: ${jobStreamId}`);
-    const abortResult = await GenerationJobManager.abortJob(jobStreamId);
+    /* === VIVENTIUM START ===
+     * Feature: Explicit harness cancellation reason.
+     * Purpose: This authenticated Stop endpoint is user intent, unlike subscriber disconnects.
+     * === VIVENTIUM END === */
+    const abortResult = await GenerationJobManager.abortJob(jobStreamId, 'user_cancelled');
     logger.debug(`[AgentStream] Job aborted successfully: ${jobStreamId}`, {
       abortResultSuccess: abortResult.success,
       abortResultUserMessageId: abortResult.jobData?.userMessage?.messageId,

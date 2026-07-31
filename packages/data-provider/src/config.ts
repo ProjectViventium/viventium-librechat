@@ -284,6 +284,41 @@ export const defaultAgentCapabilities = [
   AgentCapabilities.ocr,
 ];
 
+/* === VIVENTIUM START ===
+ * Feature: Config-sourced provider capability registry
+ * Purpose: Let every consumer filter provider roles and render provider/model metadata without
+ * branching on provider labels or model-name substrings.
+ * === VIVENTIUM END === */
+export const agentProviderModelCapabilitySchema = z.object({
+  id: z.string(),
+  label: z.string(),
+  harnessProfile: z.string().optional(),
+  effortChoices: z.array(z.string()).default([]),
+  recommendedEffort: z.string().optional(),
+  contextLimit: z.number().int().positive().optional(),
+});
+
+export const agentProviderCapabilitySchema = z.object({
+  label: z.string(),
+  main_chat: z.boolean().default(false),
+  cortex_execution: z.boolean().default(false),
+  phase_b_followup: z.boolean().default(false),
+  activation_classifier: z.boolean().default(false),
+  realtime_voice: z.boolean().default(false),
+  automatic_fallback_target: z.boolean().default(false),
+  workspace_binding: z.boolean().default(false),
+  conversation_session: z.boolean().default(false),
+  native_tools: z.boolean().default(false),
+  activity_stream: z.boolean().default(false),
+  responses_api: z.boolean().default(false),
+  default_access: z.enum(['full', 'workspace']).default('workspace'),
+  allow_full_access: z.boolean().default(false),
+  excluded_mcp_servers: z.array(z.string()).optional().default([]),
+  models: z.array(agentProviderModelCapabilitySchema).default([]),
+});
+
+export type TAgentProviderCapability = z.infer<typeof agentProviderCapabilitySchema>;
+
 export const agentsEndpointSchema = baseEndpointSchema
   .merge(
     z.object({
@@ -295,12 +330,26 @@ export const agentsEndpointSchema = baseEndpointSchema
       maxCitationsPerFile: z.number().min(1).max(10).optional().default(7),
       minRelevanceScore: z.number().min(0.0).max(1.0).optional().default(0.45),
       allowedProviders: z.array(z.union([z.string(), eModelEndpointSchema])).optional(),
+      providerCapabilities: z.record(agentProviderCapabilitySchema).optional().default({}),
+      capabilityRequiredProviders: z.array(z.string()).optional().default([]),
       capabilities: z
         .array(z.nativeEnum(AgentCapabilities))
         .optional()
         .default(defaultAgentCapabilities),
     }),
   )
+  .superRefine((value, context) => {
+    for (const provider of value.capabilityRequiredProviders ?? []) {
+      if (value.providerCapabilities?.[provider]) {
+        continue;
+      }
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['providerCapabilities', provider],
+        message: `Provider capability configuration is required for ${provider}`,
+      });
+    }
+  })
   .default({
     disableBuilder: false,
     capabilities: defaultAgentCapabilities,

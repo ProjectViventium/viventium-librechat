@@ -83,6 +83,29 @@ const FEELING_AWARE_VOICE_EXPRESSION_RULES = [
   '- Do not add voice controls merely to prove that a feeling exists. If delivery should be restrained, the provider has no supported controls, or no feeling state is present, natural unmarked speech is correct. Never name, list, quote, or explain the feeling state or its instructions.',
 ];
 
+/* === VIVENTIUM START ===
+ * Feature: Model-owned smart delivery for messaging surfaces.
+ * Purpose: Expose structural controls while keeping artifact/audio judgment in the selected agent.
+ * Added: 2026-07-22
+ * === VIVENTIUM END === */
+const SMART_OPTIONAL_AUDIO_RULES = [
+  'SMART OPTIONAL AUDIO:',
+  '- Audio is eligible for this text-mode reply, but it is useful only when the result works well as spoken conversation.',
+  '- End the raw response with the exact standalone line {SKIP_VOICE} when optional audio would reduce usefulness because the result is primarily meant to be read, copied, scanned, edited, or reused, such as a message or document draft, code, a table, exact wording, or dense reference material.',
+  '- Do not skip audio for a normal conversational reply merely because it is detailed or somewhat long. Keep useful spoken warmth, explanations, stories, and ordinary chat.',
+  '- If the user explicitly asks to hear, read aloud, speak, or receive audio for the result, do not emit {SKIP_VOICE}.',
+  '- {SKIP_VOICE} suppresses only optional audio; the full visible text is still sent. Never mention or explain the control.',
+];
+
+const NATURAL_MESSAGE_BOUNDARY_RULES = [
+  'NATURAL MESSAGE DELIVERY:',
+  '- Produce one logical answer. When two complete, standalone conversational beats would feel more natural as separate messages, place the exact standalone line {MSG_BREAK} between them.',
+  '- Usually use none; occasionally use one; never use more than two.',
+  '- Never place it inside code, a quotation, an email or document draft, a table, a list, or any tightly connected artifact or explanation.',
+  '- {MSG_BREAK} changes only channel delivery, not meaning. Never mention or explain the control.',
+];
+/* === VIVENTIUM END === */
+
 function buildVoiceModeInstructions(voiceProvider) {
   const override = (process.env.VIVENTIUM_VOICE_MODE_PROMPT || '').trim();
   if (override) {
@@ -215,6 +238,7 @@ function buildTelegramAudioOutputInstructions(voiceProvider) {
 
   const baseRules = [
     ...FEELING_AWARE_VOICE_EXPRESSION_RULES,
+    ...SMART_OPTIONAL_AUDIO_RULES,
     'TELEGRAM AUDIO OUTPUT:',
     '- This Telegram text-mode answer will also be synthesized as audio.',
     '- Keep the visible Telegram answer readable: short paragraphs, bullets when useful, and no markdown tables.',
@@ -317,6 +341,7 @@ function buildTelegramTextInstructions() {
     return override;
   }
   const fallback = [
+    ...NATURAL_MESSAGE_BOUNDARY_RULES,
     'TELEGRAM TEXT MODE:',
     '- Use standard Markdown formatting (bold, italic, inline code, code blocks, block quotes).',
     '- Do NOT use Telegram MarkdownV2 escaping (no backslash-escaped punctuation like \\. \\- \\!).',

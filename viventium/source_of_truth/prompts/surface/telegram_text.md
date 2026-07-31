@@ -2,11 +2,13 @@
 id: surface.telegram.text
 owner_layer: viventium_surface
 target: surface.telegram.text
-version: 1
+version: 2
 status: active
 safety_class: public_product
 required_context: []
 output_contract: surface_text_instructions
+includes:
+  - surface.messaging.bubble_boundaries
 ---
 TELEGRAM TEXT MODE:
 - Use standard Markdown formatting (bold, italic, inline code, code blocks, block quotes).

@@ -749,7 +749,12 @@ class GenerationJobManagerClass {
    * - Emits abort signal via Redis pub/sub
    * - The replica running generation receives signal and aborts its AbortController
    */
-  async abortJob(streamId: string): Promise<AbortResult> {
+  /* === VIVENTIUM START ===
+   * Feature: Preserve explicit user-cancellation intent across provider boundaries.
+   * Purpose: A browser Stop must carry a distinct reason to harness-backed providers, while
+   * disconnect and transport aborts keep their existing reasonless/resumable behavior.
+   * === VIVENTIUM END === */
+  async abortJob(streamId: string, reason?: unknown): Promise<AbortResult> {
     /* === VIVENTIUM START ===
      * Purpose: A delayed abort must never target a replacement same-stream job
      * after manager teardown and reconfiguration.
@@ -779,14 +784,69 @@ class GenerationJobManagerClass {
     }
 
     // Also abort local controller if we have it (same-replica abort)
+    let harnessCancellationDelivered = false;
     if (runtime) {
-      runtime.abortController.abort();
+      runtime.abortController.abort(reason);
+      if (reason === 'user_cancelled') {
+        const cancellationDelivery = (
+          runtime.abortController.signal as AbortSignal & {
+            _viventiumHarnessCancellationDelivery?: Promise<unknown>;
+          }
+        )._viventiumHarnessCancellationDelivery;
+        if (cancellationDelivery) {
+          const deliveryResult = (await cancellationDelivery) as { delivered?: boolean } | undefined;
+          harnessCancellationDelivered = deliveryResult?.delivered === true;
+        }
+      }
     }
 
     /** Content before clearing state */
     const result = await jobStore.getContentParts(streamId);
     this.assertServiceGeneration(generation);
-    const content = result?.content ?? [];
+    const rawContent = result?.content ?? [];
+    /* === VIVENTIUM START ===
+     * Feature: Persist acknowledged harness cancellation as a public activity part.
+     * Purpose: The abort save path bypasses the normal final content conversion. Preserve safe
+     * activity summaries across refresh and never persist an internal `think` part for this turn.
+     * === VIVENTIUM END === */
+    let cancellationAppended = false;
+    const content = harnessCancellationDelivered
+      ? rawContent.map((part) => {
+          if (part?.type !== 'think' && part?.type !== 'harness_activity') {
+            return part;
+          }
+          const harnessPart = part as unknown as {
+            harness_activity?: { summary?: unknown };
+          };
+          const previousSummary =
+            part.type === 'think'
+              ? typeof part.think === 'string'
+                ? part.think
+                : ''
+              : typeof harnessPart.harness_activity?.summary === 'string'
+                ? harnessPart.harness_activity.summary
+                : '';
+          cancellationAppended = true;
+          return {
+            type: 'harness_activity',
+            harness_activity: {
+              event: 'cancelled',
+              summary: `${previousSummary}${
+                previousSummary && !previousSummary.endsWith('\n') ? '\n' : ''
+              }The harness turn was cancelled.\n`,
+            },
+          } as TMessageContentParts;
+        })
+      : rawContent;
+    if (harnessCancellationDelivered && !cancellationAppended) {
+      content.push({
+        type: 'harness_activity',
+        harness_activity: {
+          event: 'cancelled',
+          summary: 'The harness turn was cancelled.\n',
+        },
+      } as TMessageContentParts);
+    }
 
     /** Collected usage for all models */
     const collectedUsage = jobStore.getCollectedUsage(streamId);
@@ -1042,7 +1102,10 @@ class GenerationJobManagerClass {
     const services = this.captureServices();
     const { generation, jobStore, eventTransport, isRedis } = services;
     const runtime = this.runtimeState.get(streamId);
-    if (!runtime || runtime.abortController.signal.aborted) {
+    const allowAfterAbort =
+      (event as t.ServerSentEvent & { _viventiumAllowAfterAbort?: boolean })
+        ._viventiumAllowAfterAbort === true;
+    if (!runtime || (runtime.abortController.signal.aborted && !allowAfterAbort)) {
       return;
     }
 

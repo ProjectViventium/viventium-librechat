@@ -61,7 +61,11 @@ function getUpdateToastMessage(
  * @param {string | null} [agent_id] - Agent identifier, if the agent already exists.
  * @returns {{ payload: Partial<AgentForm>; provider: string; model: string }} Payload metadata.
  */
-export function composeAgentUpdatePayload(data: AgentForm, agent_id?: string | null) {
+export function composeAgentUpdatePayload(
+  data: AgentForm,
+  agent_id?: string | null,
+  providerUsesWorkspaceBinding = false,
+) {
   const {
     name,
     artifacts,
@@ -69,6 +73,9 @@ export function composeAgentUpdatePayload(data: AgentForm, agent_id?: string | n
     instructions,
     model: _model,
     model_parameters,
+    /* === VIVENTIUM START === GlassHive core Agent provider */
+    glasshive_options,
+    /* === VIVENTIUM END === */
     provider: _provider,
     agent_ids,
     edges,
@@ -148,6 +155,21 @@ export function composeAgentUpdatePayload(data: AgentForm, agent_id?: string | n
       : voice_fallback_llm_model
         ? { model: voice_fallback_llm_model }
         : undefined;
+  /* === VIVENTIUM START ===
+   * Feature: Preserve valid GlassHive options without blocking a temporary provider switch.
+   * Purpose: An unfinished custom path is meaningful form state while editing, but it must not
+   * make an unrelated direct-provider save fail. Valid options remain round-tripped on all agents.
+   * === VIVENTIUM END === */
+  const glassHiveCustomPath =
+    glasshive_options?.workspace?.mode === 'custom'
+      ? String(glasshive_options.workspace.path ?? '').trim()
+      : '';
+  const persistedGlassHiveOptions =
+    glasshive_options?.workspace?.mode === 'custom' &&
+    !glassHiveCustomPath &&
+    !providerUsesWorkspaceBinding
+      ? undefined
+      : glasshive_options;
 
   return {
     payload: {
@@ -158,6 +180,9 @@ export function composeAgentUpdatePayload(data: AgentForm, agent_id?: string | n
       model,
       provider,
       model_parameters: alignedModelParameters,
+      /* === VIVENTIUM START === GlassHive core Agent provider */
+      glasshive_options: persistedGlassHiveOptions,
+      /* === VIVENTIUM END === */
       agent_ids,
       edges,
       end_after_tools,
@@ -416,6 +441,26 @@ export default function AgentPanel() {
     [agentsConfig?.allowedProviders],
   );
 
+  /* === VIVENTIUM START ===
+   * Feature: Fail-closed capability-backed provider picker.
+   * Purpose: Direct providers remain available without registry entries, while providers declared
+   * capability-required disappear if their compiled registry is missing or stale.
+   * === VIVENTIUM END === */
+  const capabilityRequiredProviders = useMemo(
+    () => new Set(agentsConfig?.capabilityRequiredProviders ?? []),
+    [agentsConfig?.capabilityRequiredProviders],
+  );
+  const providerAllowsRole = useCallback(
+    (provider: string, role: 'main_chat' | 'realtime_voice' | 'automatic_fallback_target') => {
+      const capability = agentsConfig?.providerCapabilities?.[provider];
+      if (!capability) {
+        return !capabilityRequiredProviders.has(provider);
+      }
+      return capability[role] === true;
+    },
+    [agentsConfig?.providerCapabilities, capabilityRequiredProviders],
+  );
+
   const providers = useMemo(
     () =>
       Object.keys(endpointsConfig ?? {})
@@ -423,10 +468,27 @@ export default function AgentPanel() {
           (key) =>
             !isAssistantsEndpoint(key) &&
             (allowedProviders.size > 0 ? allowedProviders.has(key) : true) &&
+            providerAllowsRole(key, 'main_chat') &&
             key !== EModelEndpoint.agents,
         )
-        .map((provider) => createProviderOption(provider)),
-    [endpointsConfig, allowedProviders],
+        .map((provider) =>
+          createProviderOption(provider, agentsConfig?.providerCapabilities?.[provider]?.label),
+        ),
+    [endpointsConfig, allowedProviders, agentsConfig?.providerCapabilities, providerAllowsRole],
+  );
+
+  /* === VIVENTIUM START ===
+   * Feature: Capability-filtered Agent Builder provider choices
+   * Purpose: GlassHive is a text/main/cortex provider, not a real-time voice or automatic fallback
+   * target during the initial rollout.
+   * === VIVENTIUM END === */
+  const voiceProviders = useMemo(
+    () => providers.filter(({ value }) => providerAllowsRole(value, 'realtime_voice')),
+    [providerAllowsRole, providers],
+  );
+  const fallbackProviders = useMemo(
+    () => providers.filter(({ value }) => providerAllowsRole(value, 'automatic_fallback_target')),
+    [providerAllowsRole, providers],
   );
 
   /* Mutations */
@@ -528,7 +590,17 @@ export default function AgentPanel() {
         tools.push(Tools.web_search);
       }
 
-      const { payload: basePayload, provider, model } = composeAgentUpdatePayload(data, agent_id);
+      const selectedProvider =
+        typeof data.provider === 'string' ? data.provider : data.provider?.value;
+      const {
+        payload: basePayload,
+        provider,
+        model,
+      } = composeAgentUpdatePayload(
+        data,
+        agent_id,
+        agentsConfig?.providerCapabilities?.[selectedProvider ?? '']?.workspace_binding === true,
+      );
 
       if (agent_id) {
         if (data.avatar_action === 'upload' && isAvatarUploadOnlyDirty(dirtyFields)) {
@@ -568,7 +640,16 @@ export default function AgentPanel() {
 
       create.mutate({ ...basePayload, model, tools, provider });
     },
-    [agent_id, create, dirtyFields, handleAvatarUpload, update, showToast, localize],
+    [
+      agent_id,
+      agentsConfig?.providerCapabilities,
+      create,
+      dirtyFields,
+      handleAvatarUpload,
+      update,
+      showToast,
+      localize,
+    ],
   );
 
   const handleSelectAgent = useCallback(() => {
@@ -603,6 +684,7 @@ export default function AgentPanel() {
               createMutation={create}
               agentQuery={agentQuery}
               setCurrentAgentId={setCurrentAgentId}
+              providerCapabilities={agentsConfig?.providerCapabilities ?? {}}
               // The following is required to force re-render the component when the form's agent ID changes
               // Also maintains ComboBox Focus for Accessibility
               selectedAgentId={agentQuery.isInitialLoading ? null : (current_agent_id ?? null)}
@@ -651,23 +733,28 @@ export default function AgentPanel() {
           </div>
         )}
         {canEditAgent && !agentQuery.isInitialLoading && activePanel === Panel.model && (
-          <ModelPanel models={models} providers={providers} setActivePanel={setActivePanel} />
-        )}
-        {/* === VIVENTIUM START === Voice Chat LLM Override panel */}
-        {canEditAgent && !agentQuery.isInitialLoading && activePanel === Panel.voiceLlmModel && (
-          <VoiceLlmPanel
-            key={`voice-llm-${agent_id}`}
+          <ModelPanel
             models={models}
             providers={providers}
+            providerCapabilities={agentsConfig?.providerCapabilities ?? {}}
             setActivePanel={setActivePanel}
           />
         )}
+        {/* === VIVENTIUM START === Voice Chat LLM Override panel */}
+        {canEditAgent && !agentQuery.isInitialLoading && activePanel === Panel.voiceLlmModel && (
+            <VoiceLlmPanel
+              key={`voice-llm-${agent_id}`}
+              models={models}
+              providers={voiceProviders}
+              setActivePanel={setActivePanel}
+          />
+        )}
         {canEditAgent && !agentQuery.isInitialLoading && activePanel === Panel.fallbackLlmModel && (
-          <FallbackLlmPanel
-            key={`fallback-llm-${agent_id}`}
-            models={models}
-            providers={providers}
-            setActivePanel={setActivePanel}
+            <FallbackLlmPanel
+              key={`fallback-llm-${agent_id}`}
+              models={models}
+              providers={fallbackProviders}
+              setActivePanel={setActivePanel}
           />
         )}
         {canEditAgent &&
@@ -676,7 +763,9 @@ export default function AgentPanel() {
             <VoiceFallbackLlmPanel
               key={`voice-fallback-llm-${agent_id}`}
               models={models}
-              providers={providers}
+              providers={voiceProviders.filter(({ value }) =>
+                fallbackProviders.some((provider) => provider.value === value),
+              )}
               setActivePanel={setActivePanel}
             />
           )}

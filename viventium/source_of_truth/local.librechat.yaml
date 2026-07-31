@@ -177,8 +177,8 @@ viventium:
   primaryProvider: openai
   installMode: native
   consciousAgent:
-    provider: openai
-    model: gpt-5.6-sol
+    provider: glasshive-harness
+    model: codex-cli:gpt-5.6-sol
 balance:
   enabled: false
   startBalance: 200000
@@ -701,6 +701,41 @@ endpoints:
     disableBuilder: false
     defaultId: agent_viventium_main_95aeb3
     iconURL: /assets/logo.svg
+    # VIVENTIUM START: provider capabilities are product/config truth, not label parsing.
+    providerCapabilities:
+      glasshive-harness:
+        label: GlassHive
+        main_chat: true
+        cortex_execution: true
+        phase_b_followup: true
+        activation_classifier: false
+        realtime_voice: false
+        automatic_fallback_target: false
+        workspace_binding: true
+        conversation_session: true
+        native_tools: true
+        activity_stream: true
+        responses_api: false
+        default_access: full
+        allow_full_access: true
+        excluded_mcp_servers:
+          - glasshive-workers-projects
+        models:
+          - id: codex-cli:gpt-5.6-sol
+            label: Codex / GPT-5.6 Sol
+            harnessProfile: codex-cli
+            effortChoices: [low, medium, high, xhigh, max, ultra]
+            recommendedEffort: medium
+            contextLimit: 272000
+          - id: claude-code:opus
+            label: Claude / Opus
+            harnessProfile: claude-code
+            effortChoices: [low, medium, high, xhigh, max]
+            recommendedEffort: max
+            contextLimit: 200000
+    capabilityRequiredProviders:
+      - glasshive-harness
+    # VIVENTIUM END
     capabilities:
       - deferred_tools
       - programmatic_tools
@@ -724,6 +759,40 @@ endpoints:
 
       AI: {output}'
   custom:
+    # VIVENTIUM START: GlassHive is a normal Agent provider backed by harness-native execution.
+    - name: glasshive-harness
+      apiKey: ${GLASSHIVE_PROVIDER_API_KEY}
+      baseURL: ${GLASSHIVE_PROVIDER_BASE_URL}
+      models:
+        default:
+          - codex-cli:gpt-5.6-sol
+          - claude-code:opus
+        fetch: false
+      titleConvo: true
+      titleEndpoint: openAI
+      titleModel: gpt-5.6-terra
+      summarize: false
+      modelDisplayLabel: GlassHive
+      dropParams:
+        - stop
+        - temperature
+        - top_p
+        - frequency_penalty
+        - presence_penalty
+        - max_tokens
+        - max_completion_tokens
+        - tools
+        - tool_choice
+        - parallel_tool_calls
+        - reasoning
+        - reasoning_summary
+        - verbosity
+        - useResponsesApi
+        - web_search
+      addParams:
+        maxRetries: 0
+      forcePrompt: false
+    # VIVENTIUM END
     - name: perplexity
       apiKey: ${PERPLEXITY_API_KEY}
       baseURL: https://api.perplexity.ai/

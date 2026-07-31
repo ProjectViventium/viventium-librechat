@@ -529,9 +529,82 @@ async function maybeInjectGlassHiveCapabilityBroker({
   return typeof toolArguments === 'string' ? JSON.stringify(args) : args;
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Core-provider conversation capability bundle.
+ * Purpose: Reuse the existing signed capability broker for a harness selected directly as an
+ * Agent provider. Only MCP servers represented by that Agent's declared tools are projected.
+ * === VIVENTIUM END === */
+async function buildConversationProviderBootstrapBundle({
+  user,
+  requestBody = {},
+  allowedServerNames = [],
+} = {}) {
+  const userId = String(user?.id || user?._id || '').trim();
+  const declaredServers = new Set(
+    (allowedServerNames || []).map((value) => String(value || '').trim()).filter(Boolean),
+  );
+  if (!isBrokerProjectionEnabled() || !userId || declaredServers.size === 0) {
+    return {};
+  }
+  const registry = getMCPServersRegistry();
+  const mcpConfig = await registry.getAllServerConfigs(userId).catch((error) => {
+    logger.warn(
+      '[VIVENTIUM][glasshive-capability-broker] Provider bundle MCP config unavailable',
+      { message: error?.message },
+    );
+    return null;
+  });
+  if (!mcpConfig) {
+    return {};
+  }
+  const executionMode = 'host';
+  const allowedServerEntries = collectAllowedServerEntries({ mcpConfig, executionMode }).filter(
+    ({ serverName }) => declaredServers.has(serverName),
+  );
+  const allowedServers = allowedServerEntries.map(({ serverName }) => serverName);
+  if (allowedServers.length === 0) {
+    return {};
+  }
+  const contentReadScope = shouldGrantContentReadScope(allowedServerEntries);
+  let mintedGrant;
+  try {
+    mintedGrant = mintBrokerGrant({
+      user,
+      allowedServers,
+      executionMode,
+      requestContext: {
+        conversation_id: requestBody.conversationId,
+        parent_message_id: requestBody.parentMessageId,
+        message_id: requestBody.messageId,
+        execution_mode: executionMode,
+      },
+      ttlSeconds: intEnv('VIVENTIUM_GLASSHIVE_PROVIDER_BROKER_TTL_SECONDS', 60 * 60),
+      renewableTtlSeconds: intEnv(
+        'VIVENTIUM_GLASSHIVE_PROVIDER_BROKER_RENEWABLE_TTL_SECONDS',
+        24 * 60 * 60,
+      ),
+      scopes: { content_read: contentReadScope },
+    });
+  } catch (error) {
+    logger.warn('[VIVENTIUM][glasshive-capability-broker] Provider bundle grant unavailable', {
+      message: error?.message,
+    });
+    return {};
+  }
+  return mergeBrokerBundle({
+    existingBundle: {},
+    brokerUrl: resolveBrokerUrl(executionMode),
+    grantToken: mintedGrant.token,
+    grantPayload: mintedGrant.payload,
+    allowedServers,
+    contentReadScope,
+  });
+}
+
 module.exports = {
   GLASSHIVE_LAUNCH_TOOLS,
   brokerContextBrief,
+  buildConversationProviderBootstrapBundle,
   configuredGlassHiveServerNames,
   contentReadIntentForArgs,
   grantTtlSecondsForTool,

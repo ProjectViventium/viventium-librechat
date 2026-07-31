@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef } from 'react';
 import { useFormContext, Controller } from 'react-hook-form';
 import { AgentCapabilities, defaultAgentFormValues } from 'librechat-data-provider';
 import type { UseMutationResult, QueryObserverResult } from '@tanstack/react-query';
-import type { Agent, AgentCreateParams } from 'librechat-data-provider';
+import type { Agent, AgentCreateParams, TAgentProviderCapability } from 'librechat-data-provider';
 import type { TAgentCapabilities, AgentForm } from '~/common';
 import { cn, createProviderOption, processAgentOption, getDefaultAgentFormValues } from '~/utils';
 import { useLocalize, useAgentDefaultPermissionLevel } from '~/hooks';
@@ -17,11 +17,13 @@ export default function AgentSelect({
   selectedAgentId = null,
   setCurrentAgentId,
   createMutation,
+  providerCapabilities,
 }: {
   selectedAgentId: string | null;
   agentQuery: QueryObserverResult<Agent>;
   setCurrentAgentId: React.Dispatch<React.SetStateAction<string | undefined>>;
   createMutation: UseMutationResult<Agent, Error, AgentCreateParams>;
+  providerCapabilities: Record<string, TAgentProviderCapability>;
 }) {
   const localize = useLocalize();
   const lastSelectedAgent = useRef<string | null>(null);
@@ -48,7 +50,15 @@ export default function AgentSelect({
       const isGlobal = fullAgent.isPublic ?? false;
       const update = {
         ...fullAgent,
-        provider: createProviderOption(fullAgent.provider),
+        /* === VIVENTIUM START ===
+         * Feature: Configured provider labels on Agent reload
+         * Purpose: Preserve the visible GlassHive label when an existing agent is selected; the
+         * internal provider ID remains the saved value.
+         * === VIVENTIUM END === */
+        provider: createProviderOption(
+          fullAgent.provider,
+          providerCapabilities[fullAgent.provider]?.label,
+        ),
         label: fullAgent.name ?? '',
         value: fullAgent.id || '',
         icon: isGlobal ? <EarthIcon className={'icon-lg text-green-400'} /> : null,
@@ -88,6 +98,15 @@ export default function AgentSelect({
 
       Object.entries(fullAgent).forEach(([name, value]) => {
         if (name === 'model_parameters') {
+          formValues[name] = value;
+          return;
+        }
+
+        /* === VIVENTIUM START ===
+         * Feature: GlassHive core Agent provider
+         * Purpose: Round-trip the typed object when selecting, reloading, or reverting an agent.
+         * === VIVENTIUM END === */
+        if (name === 'glasshive_options' && typeof value === 'object' && value !== null) {
           formValues[name] = value;
           return;
         }
@@ -162,7 +181,7 @@ export default function AgentSelect({
 
       reset(formValues);
     },
-    [reset],
+    [providerCapabilities, reset],
   );
 
   const onSelect = useCallback(

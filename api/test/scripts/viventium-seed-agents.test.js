@@ -46,6 +46,56 @@ const {
 } = require('../../../scripts/viventium-generate-managed-agent-migrations');
 
 describe('viventium-seed-agents', () => {
+  test('loads capability-required providers from the active generated config before reseeding Main', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-seed-capability-'));
+    const generatedConfig = path.join(tempDir, 'local.librechat.yaml');
+    fs.writeFileSync(
+      generatedConfig,
+      [
+        'endpoints:',
+        '  agents:',
+        '    capabilityRequiredProviders:',
+        '      - glasshive-harness',
+        '',
+      ].join('\n'),
+    );
+
+    try {
+      const normalized = normalizeBundleForRuntimeWithOwner(
+        {
+          mainAgent: {
+            id: 'agent_viventium_main_95aeb3',
+            provider: 'glasshive-harness',
+            model: 'codex-cli:gpt-5.6-sol',
+            model_parameters: {
+              model: 'codex-cli:gpt-5.6-sol',
+              reasoning_effort: 'medium',
+            },
+          },
+        },
+        {
+          env: {
+            VIVENTIUM_AGENT_SEED_OWNER_EMAIL: 'seed-owner@example.com',
+            VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER: 'openai',
+            VIVENTIUM_FC_CONSCIOUS_LLM_MODEL: 'gpt-5.6-sol',
+            VIVENTIUM_LIBRECHAT_SOURCE_OF_TRUTH: generatedConfig,
+          },
+        },
+      );
+
+      expect(normalized.mainAgent).toMatchObject({
+        provider: 'glasshive-harness',
+        model: 'codex-cli:gpt-5.6-sol',
+        model_parameters: {
+          model: 'codex-cli:gpt-5.6-sol',
+          reasoning_effort: 'medium',
+        },
+      });
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   test('normalizes built-in models from runtime env and injects owner metadata', () => {
     const bundle = {
       meta: {

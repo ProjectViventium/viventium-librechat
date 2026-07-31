@@ -47,6 +47,42 @@ function hasConfiguredServerCredential(provider) {
   });
 }
 
+function resolveProviderCapability(provider, req) {
+  const selected = String(provider || '').trim();
+  const normalized = normalizeProvider(selected);
+  const agentsConfig = req?.config?.endpoints?.agents || {};
+  const registry = agentsConfig.providerCapabilities || {};
+  const exact = registry[selected] || registry[normalized];
+  if (exact) {
+    return exact;
+  }
+  const matchingKey = Object.keys(registry).find(
+    (candidate) => normalizeProvider(candidate) === normalized,
+  );
+  return matchingKey ? registry[matchingKey] : null;
+}
+
+function providerSupportsRealtimeVoice(provider, req) {
+  const selected = String(provider || '').trim();
+  if (!selected) {
+    return false;
+  }
+  const capability = resolveProviderCapability(selected, req);
+  if (capability) {
+    return capability.realtime_voice !== false;
+  }
+  const required = req?.config?.endpoints?.agents?.capabilityRequiredProviders || [];
+  return !required.some(
+    (candidate) => normalizeProvider(candidate) === normalizeProvider(selected),
+  );
+}
+
+function unsupportedVoiceProviderError(provider) {
+  return new Error(
+    `Provider ${String(provider || '').trim()} does not support real-time voice; configure a supported Voice Call LLM for this agent`,
+  );
+}
+
 /* === VIVENTIUM START ===
  * Feature: Voice Call LLM ownership alignment.
  * Purpose: Only the explicit agent voice fields may select a dedicated call LLM. When those fields
@@ -119,6 +155,9 @@ function isVoiceModelValid(voiceLlmModel, voiceProvider, req, modelsConfig) {
   const model = typeof voiceLlmModel === 'string' ? voiceLlmModel.trim() : '';
   const provider = normalizeProvider(voiceProvider);
   if (!model || !provider) {
+    return false;
+  }
+  if (!providerSupportsRealtimeVoice(voiceProvider, req)) {
     return false;
   }
 
@@ -256,7 +295,10 @@ function applyVoiceModelOverride(agent, req, modelsConfig) {
   const voiceProvider = assignment?.provider || '';
 
   if (!voiceLlmModel || !voiceProvider) {
-    // No voice override configured — use main model
+    if (!providerSupportsRealtimeVoice(agent.provider, req)) {
+      throw unsupportedVoiceProviderError(agent.provider);
+    }
+    // No voice override configured — use a voice-capable main model.
     return agent;
   }
 
@@ -264,6 +306,9 @@ function applyVoiceModelOverride(agent, req, modelsConfig) {
     logger.warn(
       `[voiceLlmOverride] Invalid ${assignment?.source || 'configured'} voice model ${voiceProvider}/${voiceLlmModel} for agent ${agent.id} — falling back to main model`,
     );
+    if (!providerSupportsRealtimeVoice(agent.provider, req)) {
+      throw unsupportedVoiceProviderError(agent.provider);
+    }
     return agent;
   }
 

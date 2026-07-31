@@ -79,6 +79,94 @@ describe('voiceLlmOverride', () => {
     expect(updated.model_parameters.model).toBe('gpt-4o-mini');
   });
 
+  test('applyVoiceModelOverride fails loudly when a text-only primary has no voice route', () => {
+    const req = {
+      body: {
+        voiceMode: true,
+        viventiumInputMode: 'voice_call',
+        viventiumSurface: 'voice',
+      },
+      config: {
+        endpoints: {
+          agents: {
+            capabilityRequiredProviders: ['glasshive-harness'],
+            providerCapabilities: {
+              'glasshive-harness': { realtime_voice: false },
+              openAI: { realtime_voice: true },
+            },
+          },
+        },
+      },
+    };
+    const modelsConfig = {
+      'glasshive-harness': ['codex-cli:gpt-5.6-sol'],
+      openAI: ['gpt-5.4'],
+    };
+    const agent = {
+      id: 'agent_glasshive_without_voice_route',
+      provider: 'glasshive-harness',
+      model: 'codex-cli:gpt-5.6-sol',
+      model_parameters: { model: 'codex-cli:gpt-5.6-sol' },
+      voice_llm_provider: null,
+      voice_llm_model: null,
+    };
+
+    expect(() => applyVoiceModelOverride(agent, req, modelsConfig)).toThrow(
+      'does not support real-time voice',
+    );
+  });
+
+  test('applyVoiceModelOverride routes a text-only primary through its explicit direct voice LLM', () => {
+    const originalOpenAIKey = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = 'test-openai-key';
+
+    try {
+      const req = {
+        body: {
+          voiceMode: true,
+          viventiumInputMode: 'voice_call',
+          viventiumSurface: 'voice',
+        },
+        config: {
+          endpoints: {
+            agents: {
+              capabilityRequiredProviders: ['glasshive-harness'],
+              providerCapabilities: {
+                'glasshive-harness': { realtime_voice: false },
+                openAI: { realtime_voice: true },
+              },
+            },
+          },
+        },
+      };
+      const modelsConfig = {
+        'glasshive-harness': ['codex-cli:gpt-5.6-sol'],
+        openAI: ['gpt-5.4'],
+      };
+      const agent = {
+        id: 'agent_glasshive_with_voice_route',
+        provider: 'glasshive-harness',
+        model: 'codex-cli:gpt-5.6-sol',
+        model_parameters: { model: 'codex-cli:gpt-5.6-sol', reasoning_effort: 'medium' },
+        voice_llm_provider: 'openAI',
+        voice_llm_model: 'gpt-5.4',
+        voice_llm_model_parameters: { reasoning_effort: 'low' },
+      };
+
+      const updated = applyVoiceModelOverride(agent, req, modelsConfig);
+
+      expect(updated.provider).toBe('openAI');
+      expect(updated.model).toBe('gpt-5.4');
+      expect(updated.model_parameters).toMatchObject({ model: 'gpt-5.4', reasoning_effort: 'low' });
+    } finally {
+      if (originalOpenAIKey === undefined) {
+        delete process.env.OPENAI_API_KEY;
+      } else {
+        process.env.OPENAI_API_KEY = originalOpenAIKey;
+      }
+    }
+  });
+
   test('applyVoiceModelOverride swaps model/provider when override valid', () => {
     const originalXaiKey = process.env.XAI_API_KEY;
     process.env.XAI_API_KEY = 'test-xai-key';

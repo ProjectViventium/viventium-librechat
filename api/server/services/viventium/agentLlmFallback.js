@@ -103,6 +103,25 @@ function isFallbackModelValid(fallbackModel, fallbackProvider, req, modelsConfig
     return false;
   }
 
+  /* === VIVENTIUM START ===
+   * Feature: Server-side automatic-fallback capability enforcement.
+   * Purpose: API/source-sync records cannot select a harness as a fallback target when the
+   * provider registry excludes that role.
+   * === VIVENTIUM END === */
+  const agentsConfig = req?.config?.endpoints?.agents || {};
+  const capability =
+    agentsConfig.providerCapabilities?.[fallbackProvider] ||
+    agentsConfig.providerCapabilities?.[provider];
+  if (capability?.automatic_fallback_target === false) {
+    return false;
+  }
+  if (
+    !capability &&
+    (agentsConfig.capabilityRequiredProviders || []).includes(String(fallbackProvider || ''))
+  ) {
+    return false;
+  }
+
   const allowedProviders = req?.config?.endpoints?.agents?.allowedProviders;
   if (
     Array.isArray(allowedProviders) &&
@@ -355,10 +374,9 @@ function isRecoverableFallbackStatus(status) {
 
 /* === VIVENTIUM START ===
  * Feature: Provider fallback during agent initialization
- * Purpose: Connected-account authentication can fail while the provider client is being built,
- * before AgentClient exists. Recognize only structured provider failures and invoke the same
- * configured fallback once; never hide tool/runtime invariants or user cancellation.
- * Added: 2026-07-13
+ * Purpose: Connected-account authentication or a workspace harness may fail while the provider
+ * client is being built, before AgentClient exists. Recognize only structured provider failures
+ * and invoke the configured fallback once; never hide runtime invariants or user cancellation.
  */
 function isRecoverableProviderInitializationError(error) {
   if (!error || typeof error !== 'object') {

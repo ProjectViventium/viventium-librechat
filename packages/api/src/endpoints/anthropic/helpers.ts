@@ -145,7 +145,12 @@ function configureReasoning(
    * Purpose: Anthropic rejects xhigh/max effort when thinking is explicitly disabled.
    * === VIVENTIUM END === */
   const effort = extendedOptions.effort;
-  if (modelName && effort === AnthropicEffort.xhigh && !supportsXhighEffort(modelName)) {
+  if (
+    modelName &&
+    supportsAdaptiveThinking(modelName) &&
+    effort === AnthropicEffort.xhigh &&
+    !supportsXhighEffort(modelName)
+  ) {
     throw new Error(
       `Anthropic model "${modelName}" does not support "xhigh" effort. ` +
         'Choose low, medium, high, or max effort.',

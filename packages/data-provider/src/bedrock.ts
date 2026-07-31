@@ -20,16 +20,18 @@ type AnthropicInput = BedrockConverseInput & {
 function parseOpusVersion(model: string): { major: number; minor: number } | null {
   const nameFirst = model.match(/claude-opus[-.]?(\d+)(?:[-.](\d+))?/);
   if (nameFirst) {
+    const minorToken = nameFirst[2] != null ? String(nameFirst[2]) : '';
     return {
       major: parseInt(nameFirst[1], 10),
-      minor: nameFirst[2] != null ? parseInt(nameFirst[2], 10) : 0,
+      minor: minorToken.length > 0 && minorToken.length < 4 ? parseInt(minorToken, 10) : 0,
     };
   }
   const numFirst = model.match(/claude-(\d+)(?:[-.](\d+))?-opus/);
   if (numFirst) {
+    const minorToken = numFirst[2] != null ? String(numFirst[2]) : '';
     return {
       major: parseInt(numFirst[1], 10),
-      minor: numFirst[2] != null ? parseInt(numFirst[2], 10) : 0,
+      minor: minorToken.length > 0 && minorToken.length < 4 ? parseInt(minorToken, 10) : 0,
     };
   }
   return null;
@@ -73,8 +75,7 @@ function parseSonnetVersion(model: string): { major: number; minor: number } | n
     const minorToken = nameFirst[2] != null ? String(nameFirst[2]) : '';
     return {
       major: parseInt(nameFirst[1], 10),
-      minor:
-        minorToken.length > 0 && minorToken.length < 4 ? parseInt(minorToken, 10) : 0,
+      minor: minorToken.length > 0 && minorToken.length < 4 ? parseInt(minorToken, 10) : 0,
     };
   }
   const numFirst = model.match(/claude-(\d+)(?:[-.](\d+))?-sonnet/);
@@ -82,8 +83,7 @@ function parseSonnetVersion(model: string): { major: number; minor: number } | n
     const minorToken = numFirst[2] != null ? String(numFirst[2]) : '';
     return {
       major: parseInt(numFirst[1], 10),
-      minor:
-        minorToken.length > 0 && minorToken.length < 4 ? parseInt(minorToken, 10) : 0,
+      minor: minorToken.length > 0 && minorToken.length < 4 ? parseInt(minorToken, 10) : 0,
     };
   }
   return null;

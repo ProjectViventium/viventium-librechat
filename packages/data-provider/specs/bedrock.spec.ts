@@ -32,12 +32,14 @@ describe('supportsXhighEffort', () => {
     expect(supportsXhighEffort(model)).toBe(true);
   });
 
-  test.each(['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-sonnet-4-5'])(
-    'rejects unsupported xhigh effort for %s',
-    (model) => {
-      expect(supportsXhighEffort(model)).toBe(false);
-    },
-  );
+  test.each([
+    'claude-opus-4-6',
+    'claude-opus-4-20250514',
+    'claude-sonnet-4-6',
+    'claude-sonnet-4-5',
+  ])('rejects unsupported xhigh effort for %s', (model) => {
+    expect(supportsXhighEffort(model)).toBe(false);
+  });
 });
 
 describe('rejectsNonDefaultSamplingParameters', () => {
@@ -52,12 +54,14 @@ describe('rejectsNonDefaultSamplingParameters', () => {
     expect(rejectsNonDefaultSamplingParameters(model)).toBe(true);
   });
 
-  test.each(['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-sonnet-4-5'])(
-    'does not over-restrict %s when thinking is disabled',
-    (model) => {
-      expect(rejectsNonDefaultSamplingParameters(model)).toBe(false);
-    },
-  );
+  test.each([
+    'claude-opus-4-6',
+    'claude-opus-4-20250514',
+    'claude-sonnet-4-6',
+    'claude-sonnet-4-5',
+  ])('does not over-restrict %s when thinking is disabled', (model) => {
+    expect(rejectsNonDefaultSamplingParameters(model)).toBe(false);
+  });
 });
 
 describe('supportsAdaptiveThinking', () => {
@@ -95,6 +99,10 @@ describe('supportsAdaptiveThinking', () => {
 
   test('should return false for claude-opus-4', () => {
     expect(supportsAdaptiveThinking('claude-opus-4')).toBe(false);
+  });
+
+  test('should not mistake a dated Opus 4 ID for an adaptive minor version', () => {
+    expect(supportsAdaptiveThinking('claude-opus-4-20250514')).toBe(false);
   });
 
   test('should return false for claude-opus-4-0', () => {
@@ -338,8 +346,7 @@ describe('bedrockInputParser', () => {
       };
       const result = bedrockInputParser.parse(input) as Record<string, unknown>;
       const additionalFields = result.additionalModelRequestFields as
-        | Record<string, unknown>
-        | undefined;
+        Record<string, unknown> | undefined;
       expect(additionalFields?.anthropic_beta).toBeUndefined();
     });
 
@@ -349,8 +356,7 @@ describe('bedrockInputParser', () => {
       };
       const result = bedrockInputParser.parse(input) as Record<string, unknown>;
       const additionalFields = result.additionalModelRequestFields as
-        | Record<string, unknown>
-        | undefined;
+        Record<string, unknown> | undefined;
       expect(additionalFields?.anthropic_beta).toBeUndefined();
     });
 

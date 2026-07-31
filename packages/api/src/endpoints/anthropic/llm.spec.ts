@@ -1,10 +1,6 @@
 import { AnthropicEffort } from 'librechat-data-provider';
 import type * as t from '~/types';
-import {
-  ANTHROPIC_OAUTH_SYSTEM_TEXT,
-  ensureAnthropicOAuthSystemPrompt,
-  getLLMConfig,
-} from './llm';
+import { ANTHROPIC_OAUTH_SYSTEM_TEXT, ensureAnthropicOAuthSystemPrompt, getLLMConfig } from './llm';
 
 jest.mock('https-proxy-agent', () => ({
   HttpsProxyAgent: jest.fn().mockImplementation((proxy) => ({ proxy })),
@@ -82,8 +78,9 @@ describe('getLLMConfig', () => {
     const clientOptions = result.llmConfig.clientOptions as Record<string, unknown>;
     const defaultHeaders = clientOptions?.defaultHeaders as Record<string, string>;
     const oauthClient = result.llmConfig.createClient?.({ apiKey: 'user_provided' });
-    const oauthClientHeaders = (oauthClient as { _options?: { defaultHeaders?: Record<string, string> } })
-      ?._options?.defaultHeaders;
+    const oauthClientHeaders = (
+      oauthClient as { _options?: { defaultHeaders?: Record<string, string> } }
+    )?._options?.defaultHeaders;
 
     expect(result.llmConfig).not.toHaveProperty('apiKey');
     expect(clientOptions?.authToken).toBe(TEST_ANTHROPIC_SUBSCRIPTION_TOKEN);
@@ -108,8 +105,9 @@ describe('getLLMConfig', () => {
     const clientOptions = result.llmConfig.clientOptions as Record<string, unknown>;
     const defaultHeaders = clientOptions?.defaultHeaders as Record<string, string>;
     const oauthClient = result.llmConfig.createClient?.({ apiKey: 'user_provided' });
-    const oauthClientHeaders = (oauthClient as { _options?: { defaultHeaders?: Record<string, string> } })
-      ?._options?.defaultHeaders;
+    const oauthClientHeaders = (
+      oauthClient as { _options?: { defaultHeaders?: Record<string, string> } }
+    )?._options?.defaultHeaders;
 
     expect(result.llmConfig).not.toHaveProperty('apiKey');
     expect(clientOptions?.authToken).toBe('oauth-access-token');
@@ -145,9 +143,7 @@ describe('getLLMConfig', () => {
   it('should preserve existing Anthropic system blocks after the Claude Code block', () => {
     const request = ensureAnthropicOAuthSystemPrompt({
       model: 'claude-sonnet-4-5',
-      system: [
-        { type: 'text', text: 'You are concise.', cache_control: { type: 'ephemeral' } },
-      ],
+      system: [{ type: 'text', text: 'You are concise.', cache_control: { type: 'ephemeral' } }],
       messages: [{ role: 'user', content: 'Hello' }],
     });
 
@@ -1135,7 +1131,7 @@ describe('getLLMConfig', () => {
         expect(result.llmConfig.maxTokens).toBe(128000);
       });
 
-      it('should remove temperature when default thinking enables adaptive Opus 4.7 reasoning', () => {
+      it('should keep adaptive Opus 4.7 defaults sampling-safe across temperatures', () => {
         const result = getLLMConfig('test-key', {
           modelOptions: {
             model: 'claude-opus-4-7',
@@ -1341,6 +1337,27 @@ describe('getLLMConfig', () => {
             },
           }),
         ).toThrow(/does not support "xhigh" effort/);
+      });
+
+      it('should preserve legacy models that ignore unsupported effort values', () => {
+        expect(() =>
+          getLLMConfig('test-key', {
+            modelOptions: {
+              model: 'claude-sonnet-4-5',
+              thinking: true,
+              effort: AnthropicEffort.xhigh,
+            },
+          }),
+        ).not.toThrow();
+
+        const result = getLLMConfig('test-key', {
+          modelOptions: {
+            model: 'claude-sonnet-4-5',
+            thinking: true,
+            effort: AnthropicEffort.xhigh,
+          },
+        });
+        expect(result.llmConfig.invocationKwargs?.output_config).toBeUndefined();
       });
 
       it.each([AnthropicEffort.low, AnthropicEffort.medium, AnthropicEffort.high])(

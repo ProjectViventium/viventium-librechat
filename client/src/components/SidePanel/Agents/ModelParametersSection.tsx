@@ -71,7 +71,9 @@ export default function ModelParametersSection({
     return defaultParams
       .filter((param) => param != null)
       .map((param) => (overriddenParamsMap[param.key] as SettingDefinition) ?? param)
-      .map((param) => withModelCompatibleOptions(param, overriddenEndpointKey, model));
+      .map((param) =>
+        withModelCompatibleOptions(param, overriddenEndpointKey, model, { persistReset: false }),
+      );
     /* === VIVENTIUM END === */
   }, [endpointType, endpointsConfig, model, provider]);
 

@@ -84,4 +84,38 @@ describe('Viventium Claude Opus 5 release contract', () => {
     expect(APPROVED_MAIN_RUNTIME_FAMILIES.has('anthropic::claude-opus-4-8')).toBe(true);
     expect(APPROVED_BACKGROUND_RUNTIME_FAMILIES.has('anthropic::claude-opus-4-8')).toBe(true);
   });
+
+  /* === VIVENTIUM START === Provider effort parity and form-persistence regression coverage. === */
+  test('keeps capability effort choices executable without silently rewriting agent forms', () => {
+    const source = loadYaml('local.librechat.yaml');
+    const capability = source.endpoints.agents.providerCapabilities['glasshive-harness'];
+    const codex = capability.models.find((model) => model.id === 'codex-cli:gpt-5.6-sol');
+    const claude = capability.models.find((model) => model.id === 'claude-code:opus');
+    expect(codex.effortChoices).toEqual([
+      'none',
+      'minimal',
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+      'max',
+      'ultra',
+    ]);
+    expect(claude.effortChoices).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
+
+    const modelParametersSection = fs.readFileSync(
+      path.join(
+        repoRoot,
+        'client',
+        'src',
+        'components',
+        'SidePanel',
+        'Agents',
+        'ModelParametersSection.tsx',
+      ),
+      'utf8',
+    );
+    expect(modelParametersSection).toContain('{ persistReset: false }');
+  });
+  /* === VIVENTIUM END === */
 });

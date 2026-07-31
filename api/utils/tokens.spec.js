@@ -996,6 +996,19 @@ describe('Claude Model Tests', () => {
     );
   });
 
+  it('should return the 1M context and 128K output limits for Claude Opus 5', () => {
+    expect(getModelMaxTokens('claude-opus-5', EModelEndpoint.anthropic)).toBe(1000000);
+    expect(maxOutputTokensMap[EModelEndpoint.anthropic]['claude-opus-5']).toBe(128000);
+    expect(findMatchingPattern('anthropic/claude-opus-5', maxTokensMap.anthropic)).toBe(
+      'claude-opus-5',
+    );
+  });
+
+  it('should return the 1M context and 128K output limits for Claude Opus 4.6', () => {
+    expect(getModelMaxTokens('claude-opus-4-6', EModelEndpoint.anthropic)).toBe(1000000);
+    expect(maxOutputTokensMap[EModelEndpoint.anthropic]['claude-opus-4-6']).toBe(128000);
+  });
+
   it('should handle Claude Haiku 4.5 model name variations', () => {
     const modelVariations = [
       'claude-haiku-4-5',

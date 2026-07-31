@@ -130,6 +130,14 @@ describe('viventium-seed-agents', () => {
           },
         },
       ],
+      handoffAgents: [
+        {
+          id: 'agent_viventium_connected_accounts_95aeb3',
+          provider: 'anthropic',
+          model: 'claude-opus-5',
+          tools: ['sys__server__sys_mcp_google_workspace'],
+        },
+      ],
     };
 
     const normalized = normalizeBundleForRuntimeWithOwner(bundle, {
@@ -152,6 +160,11 @@ describe('viventium-seed-agents', () => {
     expect(normalized.backgroundAgents[0].provider).toBe('anthropic');
     expect(normalized.backgroundAgents[0].model).toBe('claude-opus-4-8');
     expect(normalized.backgroundAgents[0].model_parameters.model).toBe('claude-opus-4-8');
+    expect(normalized.handoffAgents[0]).toMatchObject({
+      provider: 'anthropic',
+      model: 'claude-opus-5',
+      tools: [],
+    });
   });
 
   test('resolves promptRef instructions before seed-style persistence', () => {
@@ -417,6 +430,46 @@ describe('viventium-seed-agents', () => {
     expect(result.drift).toEqual([]);
   });
 
+  test('treats a schema-default null as missing when a predecessor predates the fallback field', () => {
+    const result = reconcileManagedAgentFields(
+      {
+        fallback_llm_provider: null,
+        fallback_llm_model: null,
+        fallback_llm_model_parameters: undefined,
+      },
+      {
+        fallback_llm_provider: 'anthropic',
+        fallback_llm_model: 'claude-opus-5',
+        fallback_llm_model_parameters: {
+          model: 'claude-opus-5',
+          thinking: true,
+          effort: 'max',
+        },
+      },
+      {},
+    );
+
+    expect(result.agentData.fallback_llm_provider).toBe('anthropic');
+    expect(result.agentData.fallback_llm_model).toBe('claude-opus-5');
+    expect(result.agentData.fallback_llm_model_parameters).toEqual({
+      model: 'claude-opus-5',
+      thinking: true,
+      effort: 'max',
+    });
+    expect(result.drift).toEqual([]);
+  });
+
+  test('preserves an explicit null when the predecessor baseline managed that value', () => {
+    const result = reconcileManagedAgentFields(
+      { fallback_llm_model: null },
+      { fallback_llm_model: 'claude-opus-5' },
+      { fallback_llm_model: 'claude-opus-4-8' },
+    );
+
+    expect(result.agentData.fallback_llm_model).toBeNull();
+    expect(result.drift).toEqual(['fallback_llm_model']);
+  });
+
   test('preserves legacy unknown drift but establishes a deterministic non-personal baseline', () => {
     const incoming = {
       id: 'agent_viventium_main_95aeb3',
@@ -436,6 +489,31 @@ describe('viventium-seed-agents', () => {
     expect(first.bundle_sha256).toMatch(/^[a-f0-9]{64}$/);
     expect(second).toEqual(first);
     expect(JSON.stringify(first)).not.toContain('example.com');
+  });
+
+  test('includes standalone handoff agents in the managed baseline used by seeding', () => {
+    const baseline = buildManagedBaseline({
+      mainAgent: {
+        id: 'agent_viventium_main_95aeb3',
+        provider: 'glasshive-harness',
+        model: 'codex-cli:gpt-5.6-sol',
+      },
+      backgroundAgents: [],
+      handoffAgents: [
+        {
+          id: 'agent_viventium_connected_accounts_95aeb3',
+          provider: 'anthropic',
+          model: 'claude-opus-5',
+        },
+      ],
+    });
+
+    expect(baseline.agents).toHaveProperty('agent_viventium_main_95aeb3');
+    expect(baseline.agents).toHaveProperty('agent_viventium_connected_accounts_95aeb3');
+    expect(baseline.agents.agent_viventium_connected_accounts_95aeb3.fields).toMatchObject({
+      provider: 'anthropic',
+      model: 'claude-opus-5',
+    });
   });
 
   test('uses an exact shipped predecessor baseline on first upgrade while preserving real user edits', () => {

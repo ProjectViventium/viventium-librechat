@@ -339,6 +339,15 @@ modelSpecs:
       preset:
         endpoint: anthropic
         model: claude-opus-4-8
+    - name: claude-opus-5
+      label: Claude Opus 5
+      description: Anthropic Direct
+      group: anthropic
+      groupIcon: anthropic
+      iconURL: anthropic
+      preset:
+        endpoint: anthropic
+        model: claude-opus-5
   addedEndpoints:
     - agents
     - anthropic
@@ -724,7 +733,7 @@ endpoints:
           - id: codex-cli:gpt-5.6-sol
             label: Codex / GPT-5.6 Sol
             harnessProfile: codex-cli
-            effortChoices: [low, medium, high, xhigh, max, ultra]
+            effortChoices: [none, minimal, low, medium, high, xhigh, max, ultra]
             recommendedEffort: medium
             contextLimit: 272000
           - id: claude-code:opus

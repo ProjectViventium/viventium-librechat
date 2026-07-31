@@ -470,10 +470,10 @@ mainAgent:
     model: gpt-5.6-terra
     reasoning_effort: none
     useResponsesApi: true
-  fallback_llm_model: claude-opus-4-8
+  fallback_llm_model: claude-opus-5
   fallback_llm_provider: anthropic
   fallback_llm_model_parameters:
-    model: claude-opus-4-8
+    model: claude-opus-5
   agent_ids: []
   edges:
     - from: agent_viventium_main_95aeb3
@@ -515,10 +515,10 @@ backgroundAgents:
     voice_fallback_llm_model: null
     voice_fallback_llm_provider: null
     voice_fallback_llm_model_parameters: {}
-    fallback_llm_model: claude-opus-4-8
+    fallback_llm_model: claude-opus-5
     fallback_llm_provider: anthropic
     fallback_llm_model_parameters:
-      model: claude-opus-4-8
+      model: claude-opus-5
     agent_ids: []
     edges: []
     conversation_starters: []
@@ -545,10 +545,10 @@ backgroundAgents:
     voice_llm_model: null
     voice_llm_provider: null
     voice_llm_model_parameters: {}
-    fallback_llm_model: claude-opus-4-8
+    fallback_llm_model: claude-opus-5
     fallback_llm_provider: anthropic
     fallback_llm_model_parameters:
-      model: claude-opus-4-8
+      model: claude-opus-5
     agent_ids: []
     edges: []
     conversation_starters: []
@@ -579,10 +579,10 @@ backgroundAgents:
     voice_llm_model: null
     voice_llm_provider: null
     voice_llm_model_parameters: {}
-    fallback_llm_model: claude-opus-4-8
+    fallback_llm_model: claude-opus-5
     fallback_llm_provider: anthropic
     fallback_llm_model_parameters:
-      model: claude-opus-4-8
+      model: claude-opus-5
       thinkingBudget: 4000
     agent_ids: []
     edges: []
@@ -612,10 +612,10 @@ backgroundAgents:
     voice_llm_model: null
     voice_llm_provider: null
     voice_llm_model_parameters: {}
-    fallback_llm_model: claude-opus-4-8
+    fallback_llm_model: claude-opus-5
     fallback_llm_provider: anthropic
     fallback_llm_model_parameters:
-      model: claude-opus-4-8
+      model: claude-opus-5
       thinkingBudget: 4000
     agent_ids: []
     edges: []
@@ -646,10 +646,10 @@ backgroundAgents:
     voice_fallback_llm_model: null
     voice_fallback_llm_provider: null
     voice_fallback_llm_model_parameters: {}
-    fallback_llm_model: claude-opus-4-8
+    fallback_llm_model: claude-opus-5
     fallback_llm_provider: anthropic
     fallback_llm_model_parameters:
-      model: claude-opus-4-8
+      model: claude-opus-5
     agent_ids: []
     edges: []
     conversation_starters: []
@@ -673,10 +673,10 @@ backgroundAgents:
     hide_sequential_outputs: false
     support_contact: {}
     background_cortices: []
-    fallback_llm_model: claude-opus-4-8
+    fallback_llm_model: claude-opus-5
     fallback_llm_provider: anthropic
     fallback_llm_model_parameters:
-      model: claude-opus-4-8
+      model: claude-opus-5
     agent_ids: []
     edges: []
     conversation_starters: []
@@ -697,10 +697,10 @@ backgroundAgents:
     end_after_tools: false
     hide_sequential_outputs: false
     background_cortices: []
-    fallback_llm_model: claude-opus-4-8
+    fallback_llm_model: claude-opus-5
     fallback_llm_provider: anthropic
     fallback_llm_model_parameters:
-      model: claude-opus-4-8
+      model: claude-opus-5
     agent_ids: []
     edges: []
     conversation_starters: []
@@ -719,10 +719,10 @@ backgroundAgents:
       useResponsesApi: true
       model: gpt-5.6-terra
     background_cortices: []
-    fallback_llm_model: claude-opus-4-8
+    fallback_llm_model: claude-opus-5
     fallback_llm_provider: anthropic
     fallback_llm_model_parameters:
-      model: claude-opus-4-8
+      model: claude-opus-5
     agent_ids: []
     edges: []
     conversation_starters: []
@@ -746,10 +746,10 @@ backgroundAgents:
       name: ''
       email: ''
     background_cortices: []
-    fallback_llm_model: claude-opus-4-8
+    fallback_llm_model: claude-opus-5
     fallback_llm_provider: anthropic
     fallback_llm_model_parameters:
-      model: claude-opus-4-8
+      model: claude-opus-5
       thinkingBudget: 2000
     agent_ids: []
     edges: []
@@ -777,10 +777,10 @@ backgroundAgents:
     voice_llm_model: null
     voice_llm_provider: null
     voice_llm_model_parameters: {}
-    fallback_llm_model: claude-opus-4-8
+    fallback_llm_model: claude-opus-5
     fallback_llm_provider: anthropic
     fallback_llm_model_parameters:
-      model: claude-opus-4-8
+      model: claude-opus-5
     agent_ids: []
     edges: []
     conversation_starters: []
@@ -810,10 +810,10 @@ backgroundAgents:
     voice_fallback_llm_model: null
     voice_fallback_llm_provider: null
     voice_fallback_llm_model_parameters: {}
-    fallback_llm_model: claude-opus-4-8
+    fallback_llm_model: claude-opus-5
     fallback_llm_provider: anthropic
     fallback_llm_model_parameters:
-      model: claude-opus-4-8
+      model: claude-opus-5
     agent_ids: []
     edges: []
     conversation_starters: []
@@ -836,7 +836,7 @@ handoffAgents:
 
       If a tool errors, auth is missing/expired, scope is insufficient, or a provider is rate-limited or unavailable, say so plainly and report what you could and could not retrieve. Do not fabricate or fill gaps from memory.
     provider: anthropic
-    model: claude-opus-4-8
+    model: claude-opus-5
     tools:
       - sys__server__sys_mcp_google_workspace
       - search_gmail_messages_mcp_google_workspace
@@ -876,7 +876,7 @@ handoffAgents:
       - search-query_mcp_ms-365
     tool_kwargs: []
     model_parameters:
-      model: claude-opus-4-8
+      model: claude-opus-5
       thinking: true
       effort: high
     end_after_tools: false

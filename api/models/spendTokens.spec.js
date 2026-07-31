@@ -1,7 +1,7 @@
 const mongoose = require('mongoose');
 const { MongoMemoryServer } = require('mongodb-memory-server');
 const { createTransaction, createAutoRefillTransaction } = require('./Transaction');
-const { tokenValues, premiumTokenValues, getCacheMultiplier } = require('./tx');
+const { tokenValues, getCacheMultiplier } = require('./tx');
 const { spendTokens, spendStructuredTokens } = require('./spendTokens');
 
 require('~/db/models');
@@ -756,8 +756,8 @@ describe('spendTokens', () => {
     expect(balance.tokenCredits).toBeLessThan(10000); // Balance should be reduced
   });
 
-  describe('premium token pricing', () => {
-    it('should charge standard rates for claude-opus-4-7 when prompt tokens are below threshold', async () => {
+  describe('large-context standard pricing', () => {
+    it('should charge standard rates for claude-opus-4-7 at 100K prompt tokens', async () => {
       const initialBalance = 100000000;
       await Balance.create({
         user: userId,
@@ -785,7 +785,7 @@ describe('spendTokens', () => {
       expect(balance.tokenCredits).toBeCloseTo(initialBalance - expectedCost, 0);
     });
 
-    it('should charge premium rates for claude-opus-4-7 when prompt tokens exceed threshold', async () => {
+    it('should charge standard rates for claude-opus-4-7 above 200K prompt tokens', async () => {
       const initialBalance = 100000000;
       await Balance.create({
         user: userId,
@@ -798,7 +798,7 @@ describe('spendTokens', () => {
 
       const txData = {
         user: userId,
-        conversationId: 'test-premium-pricing',
+        conversationId: 'test-standard-pricing-large-context',
         model,
         context: 'test',
         balance: { enabled: true },
@@ -807,14 +807,13 @@ describe('spendTokens', () => {
       await spendTokens(txData, { promptTokens, completionTokens });
 
       const expectedCost =
-        promptTokens * premiumTokenValues[model].prompt +
-        completionTokens * premiumTokenValues[model].completion;
+        promptTokens * tokenValues[model].prompt + completionTokens * tokenValues[model].completion;
 
       const balance = await Balance.findOne({ user: userId });
       expect(balance.tokenCredits).toBeCloseTo(initialBalance - expectedCost, 0);
     });
 
-    it('should charge premium rates for both prompt and completion in structured tokens when above threshold', async () => {
+    it('should charge standard rates for structured tokens above 200K total input', async () => {
       const initialBalance = 100000000;
       await Balance.create({
         user: userId,
@@ -841,22 +840,22 @@ describe('spendTokens', () => {
 
       const result = await spendStructuredTokens(txData, tokenUsage);
 
-      const premiumPromptRate = premiumTokenValues[model].prompt;
-      const premiumCompletionRate = premiumTokenValues[model].completion;
+      const standardPromptRate = tokenValues[model].prompt;
+      const standardCompletionRate = tokenValues[model].completion;
       const writeRate = getCacheMultiplier({ model, cacheType: 'write' });
       const readRate = getCacheMultiplier({ model, cacheType: 'read' });
 
       const expectedPromptCost =
-        tokenUsage.promptTokens.input * premiumPromptRate +
+        tokenUsage.promptTokens.input * standardPromptRate +
         tokenUsage.promptTokens.write * writeRate +
         tokenUsage.promptTokens.read * readRate;
-      const expectedCompletionCost = tokenUsage.completionTokens * premiumCompletionRate;
+      const expectedCompletionCost = tokenUsage.completionTokens * standardCompletionRate;
 
       expect(result.prompt.prompt).toBeCloseTo(-expectedPromptCost, 0);
       expect(result.completion.completion).toBeCloseTo(-expectedCompletionCost, 0);
     });
 
-    it('should charge standard rates for structured tokens when below threshold', async () => {
+    it('should charge standard rates for structured tokens below 200K total input', async () => {
       const initialBalance = 100000000;
       await Balance.create({
         user: userId,
@@ -898,7 +897,7 @@ describe('spendTokens', () => {
       expect(result.completion.completion).toBeCloseTo(-expectedCompletionCost, 0);
     });
 
-    it('should not apply premium pricing to non-premium models regardless of prompt size', async () => {
+    it('should keep older standard-priced models stable regardless of prompt size', async () => {
       const initialBalance = 100000000;
       await Balance.create({
         user: userId,
@@ -956,7 +955,7 @@ describe('spendTokens', () => {
       expect(completionTx.rate).toBe(standardCompletionRate);
     });
 
-    it('should use normalized inputTokenCount for premium threshold check on completion', async () => {
+    it('should use standard rates for normalized large input on completion', async () => {
       const initialBalance = 100000000;
       await Balance.create({
         user: userId,
@@ -981,10 +980,10 @@ describe('spendTokens', () => {
       const completionTx = transactions.find((t) => t.tokenType === 'completion');
       const promptTx = transactions.find((t) => t.tokenType === 'prompt');
 
-      const premiumPromptRate = premiumTokenValues[model].prompt;
-      const premiumCompletionRate = premiumTokenValues[model].completion;
-      expect(promptTx.rate).toBe(premiumPromptRate);
-      expect(completionTx.rate).toBe(premiumCompletionRate);
+      const standardPromptRate = tokenValues[model].prompt;
+      const standardCompletionRate = tokenValues[model].completion;
+      expect(promptTx.rate).toBe(standardPromptRate);
+      expect(completionTx.rate).toBe(standardCompletionRate);
     });
 
     it('should keep inputTokenCount as zero when promptTokens is zero', async () => {
@@ -1013,7 +1012,7 @@ describe('spendTokens', () => {
       expect(completionTx.rate).toBe(standardCompletionRate);
     });
 
-    it('should not trigger premium pricing with negative promptTokens on premium model', async () => {
+    it('should keep standard pricing with negative promptTokens on a large-context model', async () => {
       const initialBalance = 100000000;
       await Balance.create({
         user: userId,

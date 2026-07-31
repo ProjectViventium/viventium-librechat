@@ -181,6 +181,7 @@ export enum AnthropicEffort {
   low = 'low',
   medium = 'medium',
   high = 'high',
+  xhigh = 'xhigh',
   max = 'max',
 }
 
@@ -517,6 +518,7 @@ export const anthropicSettings = {
       AnthropicEffort.low,
       AnthropicEffort.medium,
       AnthropicEffort.high,
+      AnthropicEffort.xhigh,
       AnthropicEffort.max,
     ],
   },

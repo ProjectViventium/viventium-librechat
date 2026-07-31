@@ -17,7 +17,7 @@ describe('Feelings runtime config', () => {
       serviceTier: 'priority',
       timeoutMs: 15000,
       fallbackProvider: 'anthropic',
-      fallbackModel: 'claude-opus-4-8',
+      fallbackModel: 'claude-opus-5',
       activationModel: 'qwen/qwen3.6-27b',
     });
   });

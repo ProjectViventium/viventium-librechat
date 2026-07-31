@@ -52,6 +52,99 @@ describe('scheduledAgentOverride', () => {
     ).toThrow('requires provider, model, and reasoning_effort');
   });
 
+  test('accepts an exact GlassHive model and its declared extended effort', () => {
+    expect(
+      normalizeScheduledAgentExecution(
+        {
+          provider: 'glasshive-harness',
+          model: 'codex-cli:gpt-5.6-sol',
+          reasoning_effort: 'ultra',
+        },
+        {
+          capabilityRequiredProviders: ['glasshive-harness'],
+          providerCapabilities: {
+            'glasshive-harness': {
+              main_chat: true,
+              models: [
+                {
+                  id: 'codex-cli:gpt-5.6-sol',
+                  effortChoices: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+                },
+              ],
+            },
+          },
+        },
+      ),
+    ).toEqual({
+      provider: 'glasshive-harness',
+      model: 'codex-cli:gpt-5.6-sol',
+      reasoning_effort: 'ultra',
+    });
+  });
+
+  test.each([
+    [
+      'an undeclared model',
+      {
+        provider: 'glasshive-harness',
+        model: 'codex-cli:not-declared',
+        reasoning_effort: 'medium',
+      },
+      'Unsupported scheduled-agent model',
+    ],
+    [
+      'an undeclared effort',
+      {
+        provider: 'glasshive-harness',
+        model: 'codex-cli:gpt-5.6-sol',
+        reasoning_effort: 'ultra',
+      },
+      'Unsupported scheduled-agent reasoning effort for codex-cli:gpt-5.6-sol',
+    ],
+  ])('rejects %s for a capability-managed provider', (_case, execution, expectedError) => {
+    expect(() =>
+      normalizeScheduledAgentExecution(execution, {
+        capabilityRequiredProviders: ['glasshive-harness'],
+        providerCapabilities: {
+          'glasshive-harness': {
+            main_chat: true,
+            models: [
+              {
+                id: 'codex-cli:gpt-5.6-sol',
+                effortChoices: ['low', 'medium', 'high', 'xhigh', 'max'],
+              },
+            ],
+          },
+        },
+      }),
+    ).toThrow(expectedError);
+  });
+
+  test('fails loudly when a required provider capability is missing or cannot run main chat', () => {
+    const execution = {
+      provider: 'glasshive-harness',
+      model: 'codex-cli:gpt-5.6-sol',
+      reasoning_effort: 'medium',
+    };
+
+    expect(() =>
+      normalizeScheduledAgentExecution(execution, {
+        capabilityRequiredProviders: ['glasshive-harness'],
+      }),
+    ).toThrow('Provider capability configuration is unavailable');
+    expect(() =>
+      normalizeScheduledAgentExecution(execution, {
+        capabilityRequiredProviders: ['glasshive-harness'],
+        providerCapabilities: {
+          'glasshive-harness': {
+            main_chat: false,
+            models: [],
+          },
+        },
+      }),
+    ).toThrow('cannot execute a scheduled agent turn');
+  });
+
   test('removes persisted fallback routes from an authenticated exact scheduled run', () => {
     const agent = {
       provider: 'anthropic',

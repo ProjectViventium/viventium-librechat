@@ -109,7 +109,7 @@ export function resolveFeelingsRuntimeConfig(env: Env = process.env): FeelingsRu
         .trim()
         .toLowerCase(),
       fallbackModel: String(
-        env.VIVENTIUM_FEELINGS_REACTION_FALLBACK_MODEL || 'claude-opus-4-8',
+        env.VIVENTIUM_FEELINGS_REACTION_FALLBACK_MODEL || 'claude-opus-5',
       ).trim(),
       activationProvider: String(env.VIVENTIUM_FEELINGS_REACTION_ACTIVATION_PROVIDER || 'groq')
         .trim()

@@ -46,6 +46,22 @@ jest.mock('~/server/middleware', () => ({
           },
         ],
       },
+      endpoints: {
+        agents: {
+          capabilityRequiredProviders: ['glasshive-harness'],
+          providerCapabilities: {
+            'glasshive-harness': {
+              main_chat: true,
+              models: [
+                {
+                  id: 'codex-cli:gpt-5.6-sol',
+                  effortChoices: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+                },
+              ],
+            },
+          },
+        },
+      },
     };
     next();
   },
@@ -358,6 +374,36 @@ describe('/api/viventium/scheduler/chat', () => {
       provider: 'openai',
       model: 'gpt-5.6-sol',
       reasoning_effort: 'xhigh',
+    });
+  });
+
+  test('authenticated scheduler request carries an exact capability-managed GlassHive tuple', async () => {
+    const schedulerRouter = require('../scheduler');
+    const app = createTestApp(schedulerRouter);
+    const req = createMockReq({
+      url: '/api/viventium/scheduler/chat',
+      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+      body: {
+        userId: 'user_1',
+        text: 'synthetic scheduled harness prompt',
+        conversationId: 'new',
+        agentId: 'agent_test',
+        scheduledAgentExecution: {
+          provider: 'glasshive-harness',
+          model: 'codex-cli:gpt-5.6-sol',
+          reasoning_effort: 'ultra',
+        },
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(lastScheduledAgentExecution).toEqual({
+      provider: 'glasshive-harness',
+      model: 'codex-cli:gpt-5.6-sol',
+      reasoning_effort: 'ultra',
     });
   });
 

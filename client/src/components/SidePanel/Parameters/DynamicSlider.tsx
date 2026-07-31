@@ -1,4 +1,4 @@
-import { useMemo, useCallback } from 'react';
+import { useMemo, useCallback, useEffect } from 'react';
 import { OptionTypes } from 'librechat-data-provider';
 import type { DynamicSettingProps } from 'librechat-data-provider';
 import { Label, Slider, HoverCard, Input, InputNumber, HoverCardTrigger } from '@librechat/client';
@@ -7,6 +7,14 @@ import { cn, defaultTextProps, optionText } from '~/utils';
 import { ESide, defaultDebouncedDelay } from '~/common';
 import { useChatContext } from '~/Providers';
 import OptionHover from './OptionHover';
+import { getCompatibleEnumValue } from './modelCapabilities';
+
+/* === VIVENTIUM START === Capability-filtered enum persistence markers. === */
+type ViventiumDynamicSettingProps = DynamicSettingProps & {
+  viventiumRenderCompatibleEnum?: boolean;
+  viventiumResetIncompatible?: boolean;
+};
+/* === VIVENTIUM END === */
 
 function DynamicSlider({
   label = '',
@@ -25,7 +33,9 @@ function DynamicSlider({
   labelCode = false,
   descriptionCode = false,
   conversation,
-}: DynamicSettingProps) {
+  viventiumRenderCompatibleEnum = false,
+  viventiumResetIncompatible = false,
+}: ViventiumDynamicSettingProps) {
   const localize = useLocalize();
   const { preset } = useChatContext();
   const isEnum = useMemo(
@@ -58,6 +68,40 @@ function DynamicSlider({
 
     return inputValue;
   }, [conversation, defaultValue, settingKey, inputValue, isEnum]);
+
+  /* === VIVENTIUM START ===
+   * Feature: Capability-filtered enum persistence.
+   * Purpose: Reset a stale saved option when a provider/model no longer declares it.
+   * === VIVENTIUM END === */
+  const compatibleEnumValue = useMemo(() => {
+    if (!isEnum || !options) {
+      return undefined;
+    }
+    if (viventiumRenderCompatibleEnum) {
+      return getCompatibleEnumValue(options, selectedValue, defaultValue);
+    }
+    return typeof selectedValue === 'string' ? selectedValue : undefined;
+  }, [defaultValue, isEnum, options, selectedValue, viventiumRenderCompatibleEnum]);
+
+  useEffect(() => {
+    if (
+      !viventiumResetIncompatible ||
+      readonly ||
+      !isEnum ||
+      compatibleEnumValue == null ||
+      compatibleEnumValue === selectedValue
+    ) {
+      return;
+    }
+    setInputValue(compatibleEnumValue);
+  }, [
+    compatibleEnumValue,
+    isEnum,
+    readonly,
+    selectedValue,
+    setInputValue,
+    viventiumResetIncompatible,
+  ]);
 
   const enumToNumeric = useMemo(() => {
     if (isEnum && options) {
@@ -210,7 +254,7 @@ function DynamicSlider({
             disabled={readonly}
             value={[
               isEnum
-                ? enumToNumeric[(selectedValue as number) ?? '']
+                ? enumToNumeric[compatibleEnumValue ?? '']
                 : ((inputValue as number) ?? (defaultValue as number)),
             ]}
             onValueChange={(value) => handleValueChange(value[0])}

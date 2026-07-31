@@ -1499,8 +1499,19 @@ def _scheduled_agent_execution() -> Dict[str, str]:
         raise RuntimeError(
             "Scheduled-agent automation requires provider, model, and reasoning effort"
         )
-    if effort not in {"none", "minimal", "low", "medium", "high", "xhigh"}:
+    # === VIVENTIUM START === Keep scheduler transport aligned with capability-declared efforts.
+    if effort not in {
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra",
+    }:
         raise RuntimeError(f"Unsupported scheduled-agent reasoning effort: {effort}")
+    # === VIVENTIUM END ===
     return {"provider": provider, "model": model, "reasoning_effort": effort}
 
 

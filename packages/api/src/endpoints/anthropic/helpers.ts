@@ -4,6 +4,8 @@ import {
   EModelEndpoint,
   AnthropicEffort,
   anthropicSettings,
+  isOpus5OrLater,
+  supportsXhighEffort,
   supportsContext1m,
   supportsAdaptiveThinking,
 } from 'librechat-data-provider';
@@ -138,10 +140,40 @@ function configureReasoning(
   const currentMaxTokens = updatedOptions.max_tokens ?? updatedOptions.maxTokens;
   const modelName = updatedOptions.model ?? '';
 
+  /* === VIVENTIUM START ===
+   * Feature: Claude Opus 5 direct-API effort contract.
+   * Purpose: Anthropic rejects xhigh/max effort when thinking is explicitly disabled.
+   * === VIVENTIUM END === */
+  const effort = extendedOptions.effort;
+  if (
+    modelName &&
+    supportsAdaptiveThinking(modelName) &&
+    effort === AnthropicEffort.xhigh &&
+    !supportsXhighEffort(modelName)
+  ) {
+    throw new Error(
+      `Anthropic model "${modelName}" does not support "xhigh" effort. ` +
+        'Choose low, medium, high, or max effort.',
+    );
+  }
+  if (
+    modelName &&
+    isOpus5OrLater(modelName) &&
+    extendedOptions.thinking === false &&
+    (effort === AnthropicEffort.xhigh || effort === AnthropicEffort.max)
+  ) {
+    throw new Error(
+      `Claude Opus 5 requires thinking to be enabled when effort is "${effort}". ` +
+        'Enable thinking or choose high, medium, or low effort.',
+    );
+  }
+  if (modelName && isOpus5OrLater(modelName) && extendedOptions.thinking === false) {
+    updatedOptions.thinking = { type: 'disabled' };
+  }
+
   if (extendedOptions.thinking && modelName && supportsAdaptiveThinking(modelName)) {
     updatedOptions.thinking = { type: 'adaptive' };
 
-    const effort = extendedOptions.effort;
     if (effort && effort !== AnthropicEffort.unset) {
       updatedOptions.invocationKwargs = {
         ...updatedOptions.invocationKwargs,

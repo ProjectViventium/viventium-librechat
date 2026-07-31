@@ -2,7 +2,12 @@ import { Dispatcher, ProxyAgent } from 'undici';
 import { logger } from '@librechat/data-schemas';
 import Anthropic from '@anthropic-ai/sdk';
 import { AnthropicClientOptions } from '@librechat/agents';
-import { anthropicSettings, removeNullishValues, AuthKeys } from 'librechat-data-provider';
+import {
+  anthropicSettings,
+  rejectsNonDefaultSamplingParameters,
+  removeNullishValues,
+  AuthKeys,
+} from 'librechat-data-provider';
 import type {
   AnthropicLLMConfigResult,
   AnthropicConfigOptions,
@@ -471,7 +476,10 @@ function getLLMConfig(
   const hasActiveThinking = requestOptions.thinking != null;
   const isThinkingModel =
     /claude-3[-.]7/.test(mergedOptions.model) || supportsAdaptiveThinking(mergedOptions.model);
-  if (!isThinkingModel || !hasActiveThinking) {
+  if (
+    (!isThinkingModel || !hasActiveThinking) &&
+    !rejectsNonDefaultSamplingParameters(mergedOptions.model)
+  ) {
     requestOptions.topP = mergedOptions.topP;
     requestOptions.topK = mergedOptions.topK;
   }
@@ -557,6 +565,18 @@ function getLLMConfig(
         delete (requestOptions.invocationKwargs as Record<string, unknown>)[param];
       }
     });
+  }
+
+  /* === VIVENTIUM START ===
+   * Feature: Current Anthropic sampling-parameter contract.
+   * Purpose: Fail safe after model, default, and additive parameter merging by removing every
+   * provider-rejected sampling field from affected model requests.
+   * === VIVENTIUM END === */
+  const finalModel = requestOptions.model ?? mergedOptions.model;
+  if (rejectsNonDefaultSamplingParameters(finalModel)) {
+    delete requestOptions.temperature;
+    delete requestOptions.topP;
+    delete requestOptions.topK;
   }
 
   /* === VIVENTIUM START ===

@@ -20,19 +20,62 @@ type AnthropicInput = BedrockConverseInput & {
 function parseOpusVersion(model: string): { major: number; minor: number } | null {
   const nameFirst = model.match(/claude-opus[-.]?(\d+)(?:[-.](\d+))?/);
   if (nameFirst) {
+    const minorToken = nameFirst[2] != null ? String(nameFirst[2]) : '';
     return {
       major: parseInt(nameFirst[1], 10),
-      minor: nameFirst[2] != null ? parseInt(nameFirst[2], 10) : 0,
+      minor: minorToken.length > 0 && minorToken.length < 4 ? parseInt(minorToken, 10) : 0,
     };
   }
   const numFirst = model.match(/claude-(\d+)(?:[-.](\d+))?-opus/);
   if (numFirst) {
+    const minorToken = numFirst[2] != null ? String(numFirst[2]) : '';
     return {
       major: parseInt(numFirst[1], 10),
-      minor: numFirst[2] != null ? parseInt(numFirst[2], 10) : 0,
+      minor: minorToken.length > 0 && minorToken.length < 4 ? parseInt(minorToken, 10) : 0,
     };
   }
   return null;
+}
+
+/** Checks whether the model uses the Opus 5+ default-thinking contract. */
+export function isOpus5OrLater(model: string): boolean {
+  const opus = parseOpusVersion(model);
+  return opus != null && opus.major >= 5;
+}
+
+/** Checks whether the model accepts Anthropic's xhigh effort value. */
+export function supportsXhighEffort(model: string): boolean {
+  const opus = parseOpusVersion(model);
+  if (opus && (opus.major > 4 || (opus.major === 4 && opus.minor >= 7))) {
+    return true;
+  }
+
+  const sonnet = parseSonnetVersion(model);
+  return sonnet != null && sonnet.major >= 5;
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Capability-filtered Anthropic effort controls.
+ * Purpose: Share the provider's declared effort choices across direct, Bedrock, and UI paths.
+ * === VIVENTIUM END === */
+export function getAnthropicEffortOptions(model: string): s.AnthropicEffort[] {
+  return s.anthropicSettings.effort.options.filter(
+    (effort) => effort !== s.AnthropicEffort.xhigh || supportsXhighEffort(model),
+  );
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Current Anthropic sampling-parameter contract.
+ * Purpose: Centralize the model capability used to omit parameters rejected by the provider.
+ * === VIVENTIUM END === */
+export function rejectsNonDefaultSamplingParameters(model: string): boolean {
+  const opus = parseOpusVersion(model);
+  if (opus && (opus.major > 4 || (opus.major === 4 && opus.minor >= 7))) {
+    return true;
+  }
+
+  const sonnet = parseSonnetVersion(model);
+  return sonnet != null && sonnet.major >= 5;
 }
 
 /** Extracts sonnet major/minor version from both naming formats */
@@ -42,8 +85,7 @@ function parseSonnetVersion(model: string): { major: number; minor: number } | n
     const minorToken = nameFirst[2] != null ? String(nameFirst[2]) : '';
     return {
       major: parseInt(nameFirst[1], 10),
-      minor:
-        minorToken.length > 0 && minorToken.length < 4 ? parseInt(minorToken, 10) : 0,
+      minor: minorToken.length > 0 && minorToken.length < 4 ? parseInt(minorToken, 10) : 0,
     };
   }
   const numFirst = model.match(/claude-(\d+)(?:[-.](\d+))?-sonnet/);
@@ -51,8 +93,7 @@ function parseSonnetVersion(model: string): { major: number; minor: number } | n
     const minorToken = numFirst[2] != null ? String(numFirst[2]) : '';
     return {
       major: parseInt(numFirst[1], 10),
-      minor:
-        minorToken.length > 0 && minorToken.length < 4 ? parseInt(minorToken, 10) : 0,
+      minor: minorToken.length > 0 && minorToken.length < 4 ? parseInt(minorToken, 10) : 0,
     };
   }
   return null;
@@ -232,18 +273,57 @@ export const bedrockInputParser = s.tConversationSchema
       const isAdaptive = supportsAdaptiveThinking(typedData.model as string);
 
       if (isAdaptive) {
+        /* === VIVENTIUM START ===
+         * Feature: Anthropic direct/Bedrock reasoning parity.
+         * Purpose: Reject unsupported effort locally and honor explicit thinking-off on Opus 5.
+         * === VIVENTIUM END === */
         const effort = additionalFields.effort;
+        if (effort === s.AnthropicEffort.xhigh && !supportsXhighEffort(typedData.model as string)) {
+          throw new Error(
+            `Anthropic model "${typedData.model}" does not support "xhigh" effort. ` +
+              'Choose low, medium, high, or max effort.',
+          );
+        }
+        if (
+          isOpus5OrLater(typedData.model as string) &&
+          additionalFields.thinking === false &&
+          (effort === s.AnthropicEffort.xhigh || effort === s.AnthropicEffort.max)
+        ) {
+          throw new Error(
+            `Claude Opus 5 requires thinking to be enabled when effort is "${effort}". ` +
+              'Enable thinking or choose high, medium, or low effort.',
+          );
+        }
         if (effort && typeof effort === 'string' && effort !== '') {
           additionalFields.output_config = { effort };
         }
         delete additionalFields.effort;
 
         if (additionalFields.thinking === false) {
-          delete additionalFields.thinking;
+          if (isOpus5OrLater(typedData.model as string)) {
+            additionalFields.thinking = { type: 'disabled' };
+          } else {
+            delete additionalFields.thinking;
+          }
           delete additionalFields.thinkingBudget;
         } else {
           additionalFields.thinking = { type: 'adaptive' };
           delete additionalFields.thinkingBudget;
+        }
+
+        /* === VIVENTIUM START ===
+         * Feature: Anthropic direct/Bedrock sampling parity.
+         * Purpose: Current adaptive models reject legacy sampling controls; never forward them
+         * through either top-level Converse fields or persisted additional request fields.
+         * === VIVENTIUM END === */
+        delete typedData.temperature;
+        if (rejectsNonDefaultSamplingParameters(typedData.model as string)) {
+          delete typedData.topP;
+          delete additionalFields.top_k;
+          const persistedAdditionalFields = typedData.additionalModelRequestFields;
+          if (typeof persistedAdditionalFields === 'object' && persistedAdditionalFields != null) {
+            delete (persistedAdditionalFields as Record<string, unknown>).top_k;
+          }
         }
       } else {
         if (additionalFields.thinking === undefined) {

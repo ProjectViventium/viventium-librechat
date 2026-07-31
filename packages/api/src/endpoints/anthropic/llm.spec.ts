@@ -1,10 +1,6 @@
 import { AnthropicEffort } from 'librechat-data-provider';
 import type * as t from '~/types';
-import {
-  ANTHROPIC_OAUTH_SYSTEM_TEXT,
-  ensureAnthropicOAuthSystemPrompt,
-  getLLMConfig,
-} from './llm';
+import { ANTHROPIC_OAUTH_SYSTEM_TEXT, ensureAnthropicOAuthSystemPrompt, getLLMConfig } from './llm';
 
 jest.mock('https-proxy-agent', () => ({
   HttpsProxyAgent: jest.fn().mockImplementation((proxy) => ({ proxy })),
@@ -82,8 +78,9 @@ describe('getLLMConfig', () => {
     const clientOptions = result.llmConfig.clientOptions as Record<string, unknown>;
     const defaultHeaders = clientOptions?.defaultHeaders as Record<string, string>;
     const oauthClient = result.llmConfig.createClient?.({ apiKey: 'user_provided' });
-    const oauthClientHeaders = (oauthClient as { _options?: { defaultHeaders?: Record<string, string> } })
-      ?._options?.defaultHeaders;
+    const oauthClientHeaders = (
+      oauthClient as { _options?: { defaultHeaders?: Record<string, string> } }
+    )?._options?.defaultHeaders;
 
     expect(result.llmConfig).not.toHaveProperty('apiKey');
     expect(clientOptions?.authToken).toBe(TEST_ANTHROPIC_SUBSCRIPTION_TOKEN);
@@ -108,8 +105,9 @@ describe('getLLMConfig', () => {
     const clientOptions = result.llmConfig.clientOptions as Record<string, unknown>;
     const defaultHeaders = clientOptions?.defaultHeaders as Record<string, string>;
     const oauthClient = result.llmConfig.createClient?.({ apiKey: 'user_provided' });
-    const oauthClientHeaders = (oauthClient as { _options?: { defaultHeaders?: Record<string, string> } })
-      ?._options?.defaultHeaders;
+    const oauthClientHeaders = (
+      oauthClient as { _options?: { defaultHeaders?: Record<string, string> } }
+    )?._options?.defaultHeaders;
 
     expect(result.llmConfig).not.toHaveProperty('apiKey');
     expect(clientOptions?.authToken).toBe('oauth-access-token');
@@ -145,9 +143,7 @@ describe('getLLMConfig', () => {
   it('should preserve existing Anthropic system blocks after the Claude Code block', () => {
     const request = ensureAnthropicOAuthSystemPrompt({
       model: 'claude-sonnet-4-5',
-      system: [
-        { type: 'text', text: 'You are concise.', cache_control: { type: 'ephemeral' } },
-      ],
+      system: [{ type: 'text', text: 'You are concise.', cache_control: { type: 'ephemeral' } }],
       messages: [{ role: 'user', content: 'Hello' }],
     });
 
@@ -1135,7 +1131,7 @@ describe('getLLMConfig', () => {
         expect(result.llmConfig.maxTokens).toBe(128000);
       });
 
-      it('should remove temperature when default thinking enables adaptive Opus 4.7 reasoning', () => {
+      it('should keep adaptive Opus 4.7 defaults sampling-safe across temperatures', () => {
         const result = getLLMConfig('test-key', {
           modelOptions: {
             model: 'claude-opus-4-7',
@@ -1263,20 +1259,128 @@ describe('getLLMConfig', () => {
         expect(result.llmConfig).not.toHaveProperty('topK');
       });
 
-      it('should include topP/topK for Opus 4.7 when thinking is disabled', () => {
+      it.each(['claude-opus-4-7', 'claude-opus-4-8'])(
+        'should omit rejected sampling parameters for %s when thinking is disabled',
+        (model) => {
+          const result = getLLMConfig('test-key', {
+            modelOptions: {
+              model,
+              thinking: false,
+              topP: 0.9,
+              topK: 40,
+            },
+          });
+
+          expect(result.llmConfig.thinking).toBeUndefined();
+          expect(result.llmConfig).not.toHaveProperty('topP');
+          expect(result.llmConfig).not.toHaveProperty('topK');
+        },
+      );
+
+      it('should omit rejected sampling parameters supplied through endpoint addParams', () => {
         const result = getLLMConfig('test-key', {
           modelOptions: {
-            model: 'claude-opus-4-7',
+            model: 'claude-opus-5',
             thinking: false,
+          },
+          addParams: { temperature: 0.4, topP: 0.9, topK: 40 },
+        });
+
+        expect(result.llmConfig).not.toHaveProperty('temperature');
+        expect(result.llmConfig).not.toHaveProperty('topP');
+        expect(result.llmConfig).not.toHaveProperty('topK');
+      });
+
+      it('should use adaptive xhigh thinking and omit sampling parameters for Opus 5', () => {
+        const result = getLLMConfig('test-key', {
+          modelOptions: {
+            model: 'claude-opus-5',
+            thinking: true,
+            effort: AnthropicEffort.xhigh,
+            temperature: 0.4,
             topP: 0.9,
             topK: 40,
           },
         });
 
-        expect(result.llmConfig.thinking).toBeUndefined();
-        expect(result.llmConfig).toHaveProperty('topP', 0.9);
-        expect(result.llmConfig).toHaveProperty('topK', 40);
+        expect(result.llmConfig.thinking).toEqual({ type: 'adaptive' });
+        expect(result.llmConfig.invocationKwargs?.output_config).toEqual({
+          effort: AnthropicEffort.xhigh,
+        });
+        expect(result.llmConfig.temperature).toBeUndefined();
+        expect(result.llmConfig).not.toHaveProperty('topP');
+        expect(result.llmConfig).not.toHaveProperty('topK');
       });
+
+      it.each([AnthropicEffort.xhigh, AnthropicEffort.max])(
+        'should reject disabled thinking with %s effort for Opus 5',
+        (effort) => {
+          expect(() =>
+            getLLMConfig('test-key', {
+              modelOptions: {
+                model: 'claude-opus-5',
+                thinking: false,
+                effort,
+              },
+            }),
+          ).toThrow(/requires thinking to be enabled/);
+        },
+      );
+
+      it('should fail clearly before sending xhigh to an unsupported Anthropic model', () => {
+        expect(() =>
+          getLLMConfig('test-key', {
+            modelOptions: {
+              model: 'claude-opus-4-6',
+              thinking: true,
+              effort: AnthropicEffort.xhigh,
+            },
+          }),
+        ).toThrow(/does not support "xhigh" effort/);
+      });
+
+      it('should preserve legacy models that ignore unsupported effort values', () => {
+        expect(() =>
+          getLLMConfig('test-key', {
+            modelOptions: {
+              model: 'claude-sonnet-4-5',
+              thinking: true,
+              effort: AnthropicEffort.xhigh,
+            },
+          }),
+        ).not.toThrow();
+
+        const result = getLLMConfig('test-key', {
+          modelOptions: {
+            model: 'claude-sonnet-4-5',
+            thinking: true,
+            effort: AnthropicEffort.xhigh,
+          },
+        });
+        expect(result.llmConfig.invocationKwargs?.output_config).toBeUndefined();
+      });
+
+      it.each([AnthropicEffort.low, AnthropicEffort.medium, AnthropicEffort.high])(
+        'should explicitly disable Opus 5 thinking at %s effort and omit sampling parameters',
+        (effort) => {
+          const result = getLLMConfig('test-key', {
+            modelOptions: {
+              model: 'claude-opus-5',
+              thinking: false,
+              effort,
+              temperature: 0.4,
+              topP: 0.9,
+              topK: 40,
+            },
+          });
+
+          expect(result.llmConfig.thinking).toEqual({ type: 'disabled' });
+          expect(result.llmConfig.invocationKwargs?.output_config).toEqual({ effort });
+          expect(result.llmConfig.temperature).toBeUndefined();
+          expect(result.llmConfig).not.toHaveProperty('topP');
+          expect(result.llmConfig).not.toHaveProperty('topK');
+        },
+      );
 
       it('should respect model-specific maxOutputTokens for Claude 4.x models', () => {
         const testCases = [

@@ -20,14 +20,17 @@ describe('viventium-agent-runtime-models', () => {
 
   test('keeps the GPT-5.6 workload profile and Responses parameters as runtime truth', () => {
     expect(DEFAULT_MODELS.openAI).toBe('gpt-5.6-sol');
+    expect(DEFAULT_MODELS.anthropic).toBe('claude-opus-5');
     expect([...APPROVED_MAIN_RUNTIME_FAMILIES]).toEqual([
       'openAI::gpt-5.6-sol',
+      'anthropic::claude-opus-5',
       'anthropic::claude-opus-4-8',
       'glasshive-harness::codex-cli:gpt-5.6-sol',
     ]);
     expect([...APPROVED_BACKGROUND_RUNTIME_FAMILIES]).toEqual([
       'openAI::gpt-5.6-sol',
       'openAI::gpt-5.6-terra',
+      'anthropic::claude-opus-5',
       'anthropic::claude-opus-4-8',
     ]);
 

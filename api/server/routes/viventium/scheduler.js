@@ -227,7 +227,10 @@ router.post(
     const incoming = req.body ?? {};
     let scheduledAgentExecution;
     try {
-      scheduledAgentExecution = normalizeScheduledAgentExecution(incoming.scheduledAgentExecution);
+      scheduledAgentExecution = normalizeScheduledAgentExecution(
+        incoming.scheduledAgentExecution,
+        req.config?.endpoints?.agents,
+      );
     } catch (error) {
       return _res.status(400).json({
         error: error.message,

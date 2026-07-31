@@ -574,6 +574,28 @@ class DispatchTelegramTests(unittest.TestCase):
             ):
                 dispatch._scheduled_agent_execution()
 
+    # === VIVENTIUM START === Scheduler/provider effort parity regression coverage.
+    def test_scheduled_agent_execution_accepts_declared_extended_efforts(self):
+        for effort in ("max", "ultra"):
+            with self.subTest(effort=effort), patch.dict(
+                os.environ,
+                {
+                    "VIVENTIUM_SCHEDULED_AGENT_PROVIDER": "glasshive-harness",
+                    "VIVENTIUM_SCHEDULED_AGENT_MODEL": "codex-cli:gpt-5.6-sol",
+                    "VIVENTIUM_SCHEDULED_AGENT_REASONING_EFFORT": effort,
+                },
+                clear=False,
+            ):
+                self.assertEqual(
+                    dispatch._scheduled_agent_execution(),
+                    {
+                        "provider": "glasshive-harness",
+                        "model": "codex-cli:gpt-5.6-sol",
+                        "reasoning_effort": effort,
+                    },
+                )
+    # === VIVENTIUM END ===
+
     def test_run_scheduler_generation_omits_execution_when_policy_is_unset(self):
         task = {
             'id': 'task-no-execution-policy',

@@ -203,35 +203,35 @@ describe('agentLlmFallback', () => {
   ])(
     'recovers a structured %s initialization failure through the configured fallback',
     async (_routeKind, primaryAgent, recoverableFlag) => {
-    const fallbackAgent = { id: 'main', provider: 'xai', model: 'grok-fallback' };
-    const primaryError = new Error('connected account unavailable');
-    primaryError.code = 'MODEL_AUTHENTICATION';
-    primaryError[recoverableFlag] = true;
-    const initializePrimary = jest.fn(async () => {
-      throw primaryError;
-    });
-    const initializeFallback = jest.fn(async () => ({
-      id: 'main',
-      provider: 'xai',
-      model: 'grok-fallback',
-    }));
+      const fallbackAgent = { id: 'main', provider: 'xai', model: 'grok-fallback' };
+      const primaryError = new Error('connected account unavailable');
+      primaryError.code = 'MODEL_AUTHENTICATION';
+      primaryError[recoverableFlag] = true;
+      const initializePrimary = jest.fn(async () => {
+        throw primaryError;
+      });
+      const initializeFallback = jest.fn(async () => ({
+        id: 'main',
+        provider: 'xai',
+        model: 'grok-fallback',
+      }));
 
-    await expect(
-      initializePrimaryAgentWithFallback({
-        primaryAgent,
-        fallbackAgent,
-        fallbackAssignment: { provider: 'xai', model: 'grok-fallback' },
-        initializePrimary,
-        initializeFallback,
-      }),
-    ).resolves.toMatchObject({
-      effectiveAgent: fallbackAgent,
-      fallbackUsed: true,
-      primaryError,
-      config: { provider: 'xai', model: 'grok-fallback' },
-    });
-    expect(initializePrimary).toHaveBeenCalledTimes(1);
-    expect(initializeFallback).toHaveBeenCalledTimes(1);
+      await expect(
+        initializePrimaryAgentWithFallback({
+          primaryAgent,
+          fallbackAgent,
+          fallbackAssignment: { provider: 'xai', model: 'grok-fallback' },
+          initializePrimary,
+          initializeFallback,
+        }),
+      ).resolves.toMatchObject({
+        effectiveAgent: fallbackAgent,
+        fallbackUsed: true,
+        primaryError,
+        config: { provider: 'xai', model: 'grok-fallback' },
+      });
+      expect(initializePrimary).toHaveBeenCalledTimes(1);
+      expect(initializeFallback).toHaveBeenCalledTimes(1);
     },
   );
 

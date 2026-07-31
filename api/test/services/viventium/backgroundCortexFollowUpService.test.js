@@ -513,9 +513,7 @@ describe('BackgroundCortexFollowUpService', () => {
     };
     db.saveMessage.mockResolvedValue({});
     Run.create.mockResolvedValueOnce({
-      processStream: jest.fn(
-        async () => 'First beat.\n{MSG_BREAK}\nSecond beat.\n{SKIP_VOICE}',
-      ),
+      processStream: jest.fn(async () => 'First beat.\n{MSG_BREAK}\nSecond beat.\n{SKIP_VOICE}'),
     });
 
     const msg = await createCortexFollowUpMessage({
@@ -1157,9 +1155,7 @@ describe('BackgroundCortexFollowUpService', () => {
     });
     db.updateMessage.mockResolvedValue({});
     Run.create.mockResolvedValueOnce({
-      processStream: jest.fn(
-        async () => 'First beat.\n{MSG_BREAK}\nSecond beat.\n{SKIP_VOICE}',
-      ),
+      processStream: jest.fn(async () => 'First beat.\n{MSG_BREAK}\nSecond beat.\n{SKIP_VOICE}'),
     });
 
     const msg = await createCortexFollowUpMessage({
@@ -1186,9 +1182,7 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(promoted).toEqual(
       expect.objectContaining({
         text: 'First beat.\n\nSecond beat.',
-        content: expect.arrayContaining([
-          { type: 'text', text: 'First beat.\n\nSecond beat.' },
-        ]),
+        content: expect.arrayContaining([{ type: 'text', text: 'First beat.\n\nSecond beat.' }]),
         metadata: expect.objectContaining({
           viventium: expect.objectContaining({
             telegramDeliveryControls: {

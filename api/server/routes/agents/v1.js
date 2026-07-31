@@ -59,51 +59,72 @@ router.get('/categories', v1.getAgentCategories);
  * Purpose: Let Agent Builder show actual GlassHive binary/auth status without exposing the
  * provider credential or allowing arbitrary user-selected proxy destinations.
  * === VIVENTIUM END === */
-router.get('/provider-readiness/:provider', configMiddleware, checkAgentAccess, async (req, res) => {
-  const provider = String(req.params.provider || '').trim();
-  const capability = req.config?.endpoints?.agents?.providerCapabilities?.[provider];
-  if (!capability?.activity_stream) {
-    return res.status(404).json({ status: 'unavailable', detail: 'Provider readiness is not declared.' });
-  }
-  try {
-    const endpoint = getCustomEndpointConfig({ endpoint: provider, appConfig: req.config });
-    const apiKey = extractEnvVariable(endpoint?.apiKey || '');
-    const baseURL = extractEnvVariable(endpoint?.baseURL || '').replace(/\/$/, '');
-    if (!apiKey || !baseURL || apiKey.includes('${') || baseURL.includes('${')) {
-      return res.json({ status: 'unavailable', detail: 'Provider configuration is incomplete.', models: [] });
+router.get(
+  '/provider-readiness/:provider',
+  configMiddleware,
+  checkAgentAccess,
+  async (req, res) => {
+    const provider = String(req.params.provider || '').trim();
+    const capability = req.config?.endpoints?.agents?.providerCapabilities?.[provider];
+    if (!capability?.activity_stream) {
+      return res
+        .status(404)
+        .json({ status: 'unavailable', detail: 'Provider readiness is not declared.' });
     }
-    const response = await fetch(`${baseURL}/models`, {
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'X-Viventium-User-Id': String(req.user?.id || ''),
-      },
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!response.ok) {
-      return res.json({ status: 'unavailable', detail: `Provider returned HTTP ${response.status}.`, models: [] });
+    try {
+      const endpoint = getCustomEndpointConfig({ endpoint: provider, appConfig: req.config });
+      const apiKey = extractEnvVariable(endpoint?.apiKey || '');
+      const baseURL = extractEnvVariable(endpoint?.baseURL || '').replace(/\/$/, '');
+      if (!apiKey || !baseURL || apiKey.includes('${') || baseURL.includes('${')) {
+        return res.json({
+          status: 'unavailable',
+          detail: 'Provider configuration is incomplete.',
+          models: [],
+        });
+      }
+      const response = await fetch(`${baseURL}/models`, {
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'X-Viventium-User-Id': String(req.user?.id || ''),
+        },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!response.ok) {
+        return res.json({
+          status: 'unavailable',
+          detail: `Provider returned HTTP ${response.status}.`,
+          models: [],
+        });
+      }
+      const payload = await response.json();
+      const models = Array.isArray(payload?.data)
+        ? payload.data.map((model) => ({
+            id: String(model?.id || ''),
+            display_name: String(model?.display_name || model?.id || ''),
+            readiness: model?.readiness || { status: 'unknown' },
+          }))
+        : [];
+      const selected = models.find((model) => model.readiness?.status === 'ready');
+      return res.json({
+        status: selected ? 'ready' : models[0]?.readiness?.status || 'unavailable',
+        detail:
+          selected?.readiness?.detail ||
+          models[0]?.readiness?.detail ||
+          'No harness models returned.',
+        models,
+      });
+    } catch (error) {
+      return res.json({
+        status: 'unavailable',
+        detail:
+          error?.name === 'TimeoutError'
+            ? 'Provider readiness check timed out.'
+            : 'Provider is not reachable.',
+        models: [],
+      });
     }
-    const payload = await response.json();
-    const models = Array.isArray(payload?.data)
-      ? payload.data.map((model) => ({
-          id: String(model?.id || ''),
-          display_name: String(model?.display_name || model?.id || ''),
-          readiness: model?.readiness || { status: 'unknown' },
-        }))
-      : [];
-    const selected = models.find((model) => model.readiness?.status === 'ready');
-    return res.json({
-      status: selected ? 'ready' : models[0]?.readiness?.status || 'unavailable',
-      detail: selected?.readiness?.detail || models[0]?.readiness?.detail || 'No harness models returned.',
-      models,
-    });
-  } catch (error) {
-    return res.json({
-      status: 'unavailable',
-      detail: error?.name === 'TimeoutError' ? 'Provider readiness check timed out.' : 'Provider is not reachable.',
-      models: [],
-    });
-  }
-});
+  },
+);
 /**
  * Creates an agent.
  * @route POST /agents

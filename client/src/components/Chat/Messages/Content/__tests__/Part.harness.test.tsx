@@ -1,23 +1,26 @@
 import React from 'react';
 import { render, screen } from '@testing-library/react';
 import { ContentTypes } from 'librechat-data-provider';
+import { RecoilRoot } from 'recoil';
 import Part from '../Part';
 
 describe('Part harness activity wiring', () => {
   it('renders progress summaries as harness activity instead of hidden model reasoning', () => {
     render(
-      <Part
-        isSubmitting={true}
-        showCursor={false}
-        isCreatedByUser={false}
-        part={{
-          type: ContentTypes.HARNESS_ACTIVITY,
-          harness_activity: {
-            event: 'started',
-            summary: 'The harness started working.\nThe harness used a tool.\n',
-          },
-        }}
-      />,
+      <RecoilRoot>
+        <Part
+          isSubmitting={true}
+          showCursor={false}
+          isCreatedByUser={false}
+          part={{
+            type: ContentTypes.HARNESS_ACTIVITY,
+            harness_activity: {
+              event: 'started',
+              summary: 'The harness started working.\nThe harness used a tool.\n',
+            },
+          }}
+        />
+      </RecoilRoot>,
     );
 
     expect(screen.getByText('Harness activity')).toBeInTheDocument();

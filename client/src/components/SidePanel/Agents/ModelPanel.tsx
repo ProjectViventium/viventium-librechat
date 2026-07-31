@@ -86,14 +86,16 @@ export default function ModelPanel({
     : selectedReadiness?.status || readinessQuery.data?.status || 'unavailable';
   const readinessLabel =
     readinessStatus === 'ready'
-      ? 'Authenticated and ready'
+      ? localize('com_ui_glasshive_authenticated_ready')
       : readinessStatus === 'authentication_required'
-        ? 'Sign-in required'
+        ? localize('com_ui_glasshive_sign_in_required')
         : readinessStatus === 'checking'
-          ? 'Checking…'
-          : 'Unavailable';
+          ? localize('com_ui_glasshive_checking')
+          : localize('com_ui_unavailable');
   const readinessDetail =
-    selectedReadiness?.detail || readinessQuery.data?.detail || 'GlassHive is not reachable.';
+    selectedReadiness?.detail ||
+    readinessQuery.data?.detail ||
+    localize('com_ui_glasshive_unreachable');
 
   useEffect(() => {
     const _model = model ?? '';
@@ -318,9 +320,9 @@ export default function ModelPanel({
           <div className="border-token-border-light bg-token-surface-primary mb-4 rounded-lg border p-4 text-left">
             <div className="mb-3 flex items-center justify-between gap-3">
               <div>
-                <div className="font-medium">GlassHive harness</div>
+                <div className="font-medium">{localize('com_ui_glasshive_harness')}</div>
                 <div className="text-token-text-secondary text-xs">
-                  Runs in the selected server-side folder with native harness tools.
+                  {localize('com_ui_glasshive_harness_description')}
                 </div>
               </div>
               <span
@@ -343,12 +345,12 @@ export default function ModelPanel({
                 onClick={() => readinessQuery.refetch()}
                 disabled={readinessQuery.isFetching}
               >
-                Recheck
+                {localize('com_ui_glasshive_recheck')}
               </button>
             </div>
 
             <label className="mb-1 block text-sm font-medium" htmlFor="glasshive-workspace-mode">
-              Working folder
+              {localize('com_ui_glasshive_working_folder')}
             </label>
             <Controller
               name="glasshive_options.workspace.mode"
@@ -359,8 +361,8 @@ export default function ModelPanel({
                   id="glasshive-workspace-mode"
                   className="border-token-border-light bg-token-surface-primary mb-3 h-10 w-full rounded-lg border px-3"
                 >
-                  <option value="life">Viventium LIFE</option>
-                  <option value="custom">Custom server-side path</option>
+                  <option value="life">{localize('com_ui_glasshive_viventium_life')}</option>
+                  <option value="custom">{localize('com_ui_glasshive_custom_server_path')}</option>
                 </select>
               )}
             />
@@ -374,15 +376,15 @@ export default function ModelPanel({
                     <input
                       {...field}
                       value={field.value ?? ''}
-                      aria-label="Custom GlassHive working folder"
-                      placeholder="/path/to/viventium-life"
+                      aria-label={localize('com_ui_glasshive_custom_working_folder')}
+                      placeholder={localize('com_ui_glasshive_path_placeholder')}
                       className={cn(
                         'border-token-border-light bg-token-surface-primary h-10 w-full rounded-lg border px-3',
                         error && 'border-red-500',
                       )}
                     />
                     <p className="text-token-text-secondary mt-1 text-xs">
-                      This path is resolved on the computer running GlassHive.
+                      {localize('com_ui_glasshive_path_description')}
                     </p>
                   </div>
                 )}
@@ -390,7 +392,7 @@ export default function ModelPanel({
             )}
 
             <label className="mb-1 block text-sm font-medium" htmlFor="glasshive-access">
-              Access
+              {localize('com_ui_glasshive_access')}
             </label>
             <Controller
               name="glasshive_options.access"
@@ -402,28 +404,29 @@ export default function ModelPanel({
                   className="border-token-border-light bg-token-surface-primary mb-3 h-10 w-full rounded-lg border px-3"
                 >
                   {providerCapability?.allow_full_access === true && (
-                    <option value="full">Full access</option>
+                    <option value="full">{localize('com_ui_glasshive_full_access')}</option>
                   )}
-                  <option value="workspace">Workspace writes only</option>
+                  <option value="workspace">
+                    {localize('com_ui_glasshive_workspace_writes_only')}
+                  </option>
                 </select>
               )}
             />
             <p className="text-token-text-secondary -mt-2 mb-3 text-xs">
               {glassHiveOptions?.access === 'full'
-                ? 'Full access disables harness sandbox and approval gates. Use it only for a trusted local agent.'
-                : 'Workspace mode limits writes to this folder. The harness may still read required dependencies outside it.'}
+                ? localize('com_ui_glasshive_full_access_warning')
+                : localize('com_ui_glasshive_workspace_access_description')}
             </p>
             {providerCapability?.native_tools === true && (
               <p className="text-token-text-secondary mb-3 text-xs">
-                This provider executes compatible declared MCP tools inside GlassHive. LibreChat
-                built-in Web Search, File Search, and Code Interpreter are not executed locally.
+                {localize('com_ui_glasshive_native_tools_description')}
               </p>
             )}
 
             {(modelCapability?.effortChoices?.length ?? 0) > 0 && (
               <>
                 <label className="mb-1 block text-sm font-medium" htmlFor="glasshive-effort">
-                  Effort
+                  {localize('com_ui_glasshive_effort')}
                 </label>
                 <Controller
                   name="model_parameters.reasoning_effort"
@@ -438,7 +441,9 @@ export default function ModelPanel({
                       {modelCapability?.effortChoices.map((effort) => (
                         <option key={effort} value={effort}>
                           {effort}
-                          {effort === modelCapability.recommendedEffort ? ' (recommended)' : ''}
+                          {effort === modelCapability.recommendedEffort
+                            ? ` (${localize('com_ui_glasshive_recommended')})`
+                            : ''}
                         </option>
                       ))}
                     </select>

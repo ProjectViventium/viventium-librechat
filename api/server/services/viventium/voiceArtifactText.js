@@ -446,9 +446,7 @@ function sanitizeVoiceSurfaceTextForDisplay(text) {
     return '';
   }
 
-  let cleaned = parseDeliveryControls(text).cleanText
-    .replace(/\\n/g, '\n')
-    .replace(/\\r/g, '\r');
+  let cleaned = parseDeliveryControls(text).cleanText.replace(/\\n/g, '\n').replace(/\\r/g, '\r');
   cleaned = cleaned.replace(INTERNAL_NO_RESPONSE_RE, '$1');
   cleaned = cleaned.replace(CODE_BLOCK_RE, (match) =>
     match.replace(/```[A-Za-z0-9_-]*\s*/g, '').replace(/```/g, ' '),

@@ -705,10 +705,7 @@ function getDefaultHandlers({
          * Purpose: Visible provider-authored content proves the native harness has begun authoring.
          * A role-only compatibility delta does not lock fallback because it precedes native start.
          * === VIVENTIUM END === */
-        if (
-          req?._viventiumHarnessExecutionEnabled === true &&
-          hasVisibleMessageDelta(data)
-        ) {
+        if (req?._viventiumHarnessExecutionEnabled === true && hasVisibleMessageDelta(data)) {
           req._viventiumHarnessInvocationStarted = true;
         }
         markVoiceOrchEvent(req, 'on_message_delta');

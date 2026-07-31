@@ -345,9 +345,7 @@ describe('request persistence helpers', () => {
         conversationId: 'convo-1',
       },
       responseMessageId: 'assistant-msg',
-      aggregatedContent: [
-        { type: 'text', text: 'First.\n{MSG_BREAK}\nSecond.\n{SKIP_VOICE}' },
-      ],
+      aggregatedContent: [{ type: 'text', text: 'First.\n{MSG_BREAK}\nSecond.\n{SKIP_VOICE}' }],
       fallbackText: '',
       unfinished: true,
       error: true,

@@ -4,6 +4,7 @@
  * === VIVENTIUM END === */
 
 import { Activity, ChevronDown, Loader2 } from 'lucide-react';
+import { useLocalize } from '~/hooks';
 
 export default function HarnessActivity({
   summary,
@@ -12,6 +13,7 @@ export default function HarnessActivity({
   summary: string;
   isSubmitting: boolean;
 }) {
+  const localize = useLocalize();
   const rows = summary
     .split('\n')
     .map((row) => row.trim())
@@ -29,7 +31,7 @@ export default function HarnessActivity({
         ) : (
           <Activity className="size-4" aria-hidden="true" />
         )}
-        <span className="font-medium">Harness activity</span>
+        <span className="font-medium">{localize('com_ui_harness_activity')}</span>
         <ChevronDown
           className="ml-auto size-4 transition-transform group-open:rotate-180"
           aria-hidden="true"

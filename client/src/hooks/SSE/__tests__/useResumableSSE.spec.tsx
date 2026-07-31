@@ -150,7 +150,9 @@ describe('useResumableSSE', () => {
   };
 
   it('does not queue title generation with a transient stream id before a real conversation exists', async () => {
-    renderHook(() => useResumableSSE(createSubmission(), chatHelpers), { wrapper: createWrapper() });
+    renderHook(() => useResumableSSE(createSubmission(), chatHelpers), {
+      wrapper: createWrapper(),
+    });
 
     await waitFor(() => {
       expect(request.post).toHaveBeenCalledTimes(1);
@@ -170,7 +172,9 @@ describe('useResumableSSE', () => {
       .mockRejectedValueOnce(networkError)
       .mockResolvedValueOnce({ streamId: 'stream-after-retry' });
 
-    renderHook(() => useResumableSSE(createSubmission(), chatHelpers), { wrapper: createWrapper() });
+    renderHook(() => useResumableSSE(createSubmission(), chatHelpers), {
+      wrapper: createWrapper(),
+    });
 
     expect(request.post).toHaveBeenCalledTimes(1);
     await act(async () => {
@@ -189,7 +193,9 @@ describe('useResumableSSE', () => {
   });
 
   it('surfaces connected-account-required stream errors without queueing title generation', async () => {
-    renderHook(() => useResumableSSE(createSubmission(), chatHelpers), { wrapper: createWrapper() });
+    renderHook(() => useResumableSSE(createSubmission(), chatHelpers), {
+      wrapper: createWrapper(),
+    });
 
     await waitFor(() => {
       expect(mockSSEInstances.length).toBeGreaterThan(0);

@@ -237,7 +237,10 @@ function normalizeAtomicUpdateDocument(updateData) {
  * Purpose: Surface agent load latency (db/cache) in Telegram traces.
  * Added: 2026-02-07
  */
-const { startDeepTiming, logDeepTiming } = require('~/server/services/viventium/telegramTimingDeep');
+const {
+  startDeepTiming,
+  logDeepTiming,
+} = require('~/server/services/viventium/telegramTimingDeep');
 /* === VIVENTIUM END === */
 /**
  * Extracts unique MCP server names from tools array
@@ -287,7 +290,8 @@ const _agentCacheTtlMs = () => {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 120_000;
 };
 
-const _getAgentCacheStore = () => (_agentCacheEnabled() ? getLogStores(CacheKeys.CONFIG_STORE) : null);
+const _getAgentCacheStore = () =>
+  _agentCacheEnabled() ? getLogStores(CacheKeys.CONFIG_STORE) : null;
 
 const _agentCacheKey = (agentId) => `${AGENT_CACHE_PREFIX}${agentId}`;
 
@@ -535,10 +539,10 @@ const loadAgent = async ({ req, spec, agent_id, endpoint, model_parameters }) =>
     return await loadEphemeralAgent({ req, spec, endpoint, model_parameters });
   }
   /* === VIVENTIUM START ===
-     * Feature: Deep Telegram timing instrumentation (toggleable)
-     * Purpose: Measure db/cache time for agent load (Telegram traces).
-     * Added: 2026-02-07
-     */
+   * Feature: Deep Telegram timing instrumentation (toggleable)
+   * Purpose: Measure db/cache time for agent load (Telegram traces).
+   * Added: 2026-02-07
+   */
   const agentLoadStart = startDeepTiming(req);
   const agent = await getAgent({
     id: agent_id,

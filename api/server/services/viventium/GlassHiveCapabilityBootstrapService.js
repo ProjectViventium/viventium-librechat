@@ -548,10 +548,9 @@ async function buildConversationProviderBootstrapBundle({
   }
   const registry = getMCPServersRegistry();
   const mcpConfig = await registry.getAllServerConfigs(userId).catch((error) => {
-    logger.warn(
-      '[VIVENTIUM][glasshive-capability-broker] Provider bundle MCP config unavailable',
-      { message: error?.message },
-    );
+    logger.warn('[VIVENTIUM][glasshive-capability-broker] Provider bundle MCP config unavailable', {
+      message: error?.message,
+    });
     return null;
   });
   if (!mcpConfig) {

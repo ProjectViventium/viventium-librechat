@@ -316,21 +316,15 @@ const BackgroundCorticesConfig: React.FC<BackgroundCorticesConfigProps> = ({
   const activationModels = useMemo(
     () =>
       Object.fromEntries(
-        Object.entries(models).filter(
-          ([provider]) => {
-            const capability = agentsConfig?.providerCapabilities?.[provider];
-            if (!capability) {
-              return !(agentsConfig?.capabilityRequiredProviders ?? []).includes(provider);
-            }
-            return capability.activation_classifier === true;
-          },
-        ),
+        Object.entries(models).filter(([provider]) => {
+          const capability = agentsConfig?.providerCapabilities?.[provider];
+          if (!capability) {
+            return !(agentsConfig?.capabilityRequiredProviders ?? []).includes(provider);
+          }
+          return capability.activation_classifier === true;
+        }),
       ),
-    [
-      agentsConfig?.capabilityRequiredProviders,
-      agentsConfig?.providerCapabilities,
-      models,
-    ],
+    [agentsConfig?.capabilityRequiredProviders, agentsConfig?.providerCapabilities, models],
   );
 
   const cortices = useMemo(() => field.value || [], [field.value]);

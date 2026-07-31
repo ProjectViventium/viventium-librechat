@@ -12,8 +12,11 @@ jest.mock('react-hook-form', () => ({
     control: {},
     reset: mockReset,
   }),
-  Controller: ({ render }: { render: (props: { field: { value: undefined } }) => React.ReactNode }) =>
-    render({ field: { value: undefined } }),
+  Controller: ({
+    render,
+  }: {
+    render: (props: { field: { value: undefined } }) => React.ReactNode;
+  }) => render({ field: { value: undefined } }),
 }));
 
 jest.mock('@librechat/client', () => ({
@@ -50,8 +53,11 @@ jest.mock('librechat-data-provider', () => ({
 jest.mock('~/utils', () => ({
   cn: (...classes: Array<string | false | null | undefined>) => classes.filter(Boolean).join(' '),
   createProviderOption: (provider: string) => ({ value: provider, label: provider }),
-  processAgentOption: ({ agent }: { agent: { id: string; name: string; icon?: React.ReactNode } }) =>
+  processAgentOption: ({
     agent,
+  }: {
+    agent: { id: string; name: string; icon?: React.ReactNode };
+  }) => agent,
   getDefaultAgentFormValues: () => ({
     id: '',
     name: '',

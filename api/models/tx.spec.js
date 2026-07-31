@@ -1979,6 +1979,13 @@ describe('Long-context standard pricing', () => {
     expect(getPremiumRate('claude-opus-4-7', 'prompt', undefined)).toBeNull();
     expect(getPremiumRate('claude-opus-4-7', 'prompt', null)).toBeNull();
   });
+
+  it('uses the declared Opus 4.6 price instead of the legacy Opus 4 fallback', () => {
+    expect(getMultiplier({ model: 'claude-opus-4-6', tokenType: 'prompt' })).toBe(5);
+    expect(getMultiplier({ model: 'claude-opus-4-6', tokenType: 'completion' })).toBe(25);
+    expect(getCacheMultiplier({ model: 'claude-opus-4-6', cacheType: 'write' })).toBe(6.25);
+    expect(getCacheMultiplier({ model: 'claude-opus-4-6', cacheType: 'read' })).toBe(0.5);
+  });
 });
 
 describe('tokens.ts and tx.js sync validation', () => {

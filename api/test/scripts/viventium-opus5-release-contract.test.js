@@ -6,6 +6,7 @@ const {
   APPROVED_MAIN_RUNTIME_FAMILIES,
   APPROVED_BACKGROUND_RUNTIME_FAMILIES,
 } = require('../../../scripts/viventium-agent-runtime-models');
+const { buildManagedBaseline } = require('../../../scripts/viventium-seed-agents');
 
 const repoRoot = path.resolve(__dirname, '../../..');
 const sourceRoot = path.join(repoRoot, 'viventium', 'source_of_truth');
@@ -54,6 +55,13 @@ describe('Viventium Claude Opus 5 release contract', () => {
       expect(handoffAgent.provider).toBe('anthropic');
       expect(handoffAgent.model).toBe('claude-opus-5');
       expect(handoffAgent.model_parameters.model).toBe('claude-opus-5');
+    }
+    const managedBaseline = buildManagedBaseline(source);
+    for (const handoffAgent of source.handoffAgents ?? []) {
+      expect(managedBaseline.agents[handoffAgent.id]?.fields).toMatchObject({
+        provider: 'anthropic',
+        model: 'claude-opus-5',
+      });
     }
 
     for (const cortex of source.mainAgent.background_cortices) {

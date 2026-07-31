@@ -9,6 +9,13 @@ import { useChatContext } from '~/Providers';
 import OptionHover from './OptionHover';
 import { getCompatibleEnumValue } from './modelCapabilities';
 
+/* === VIVENTIUM START === Capability-filtered enum persistence markers. === */
+type ViventiumDynamicSettingProps = DynamicSettingProps & {
+  viventiumRenderCompatibleEnum?: boolean;
+  viventiumResetIncompatible?: boolean;
+};
+/* === VIVENTIUM END === */
+
 function DynamicSlider({
   label = '',
   settingKey,
@@ -26,7 +33,9 @@ function DynamicSlider({
   labelCode = false,
   descriptionCode = false,
   conversation,
-}: DynamicSettingProps) {
+  viventiumRenderCompatibleEnum = false,
+  viventiumResetIncompatible = false,
+}: ViventiumDynamicSettingProps) {
   const localize = useLocalize();
   const { preset } = useChatContext();
   const isEnum = useMemo(
@@ -64,18 +73,35 @@ function DynamicSlider({
    * Feature: Capability-filtered enum persistence.
    * Purpose: Reset a stale saved option when a provider/model no longer declares it.
    * === VIVENTIUM END === */
-  const compatibleEnumValue = useMemo(
-    () =>
-      isEnum && options ? getCompatibleEnumValue(options, selectedValue, defaultValue) : undefined,
-    [defaultValue, isEnum, options, selectedValue],
-  );
+  const compatibleEnumValue = useMemo(() => {
+    if (!isEnum || !options) {
+      return undefined;
+    }
+    if (viventiumRenderCompatibleEnum) {
+      return getCompatibleEnumValue(options, selectedValue, defaultValue);
+    }
+    return typeof selectedValue === 'string' ? selectedValue : undefined;
+  }, [defaultValue, isEnum, options, selectedValue, viventiumRenderCompatibleEnum]);
 
   useEffect(() => {
-    if (!isEnum || compatibleEnumValue == null || compatibleEnumValue === selectedValue) {
+    if (
+      !viventiumResetIncompatible ||
+      readonly ||
+      !isEnum ||
+      compatibleEnumValue == null ||
+      compatibleEnumValue === selectedValue
+    ) {
       return;
     }
     setInputValue(compatibleEnumValue);
-  }, [compatibleEnumValue, isEnum, selectedValue, setInputValue]);
+  }, [
+    compatibleEnumValue,
+    isEnum,
+    readonly,
+    selectedValue,
+    setInputValue,
+    viventiumResetIncompatible,
+  ]);
 
   const enumToNumeric = useMemo(() => {
     if (isEnum && options) {

@@ -566,6 +566,22 @@ describe('bedrockInputParser', () => {
       expect(additionalFields.output_config).toEqual({ effort: 'high' });
     });
 
+    test('should omit sampling parameters rejected by current adaptive Anthropic models', () => {
+      const result = bedrockInputParser.parse({
+        model: 'anthropic.claude-opus-4-8',
+        thinking: true,
+        effort: 'high',
+        temperature: 0.7,
+        topP: 0.9,
+        topK: 5,
+      }) as Record<string, unknown>;
+      const additionalFields = result.additionalModelRequestFields as Record<string, unknown>;
+
+      expect(result.temperature).toBeUndefined();
+      expect(result.topP).toBeUndefined();
+      expect(additionalFields.top_k).toBeUndefined();
+    });
+
     test.each(['xhigh', 'max'])(
       'should reject disabled thinking with %s effort for Opus 5',
       (effort) => {

@@ -175,6 +175,9 @@ const tokenValues = Object.assign(
     'claude-haiku-4-5': { prompt: 1, completion: 5 },
     'claude-opus-4': { prompt: 15, completion: 75 },
     'claude-opus-4-5': { prompt: 5, completion: 25 },
+    /* === VIVENTIUM START === Opus 4.6 uses the current standard Opus price. === */
+    'claude-opus-4-6': { prompt: 5, completion: 25 },
+    /* === VIVENTIUM END === */
     'claude-opus-4-7': { prompt: 5, completion: 25 },
     /* === VIVENTIUM START ===
      * Feature: Launch-ready Anthropic model accounting.
@@ -319,6 +322,9 @@ const cacheTokenValues = {
   'claude-sonnet-4': { write: 3.75, read: 0.3 },
   'claude-opus-4': { write: 18.75, read: 1.5 },
   'claude-opus-4-5': { write: 6.25, read: 0.5 },
+  /* === VIVENTIUM START === Opus 4.6 uses the current standard cache price. === */
+  'claude-opus-4-6': { write: 6.25, read: 0.5 },
+  /* === VIVENTIUM END === */
   'claude-opus-4-7': { write: 6.25, read: 0.5 },
   /* === VIVENTIUM START ===
    * Feature: Launch-ready Anthropic model accounting.

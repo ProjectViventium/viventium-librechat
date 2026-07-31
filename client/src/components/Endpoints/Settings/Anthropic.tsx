@@ -33,6 +33,7 @@ export default function AnthropicSettings({
       setting,
       EModelEndpoint.anthropic,
       conversation?.model ?? '',
+      { persistReset: false },
     );
     /* === VIVENTIUM END === */
     const Component = componentMapping[compatibleSetting.component];

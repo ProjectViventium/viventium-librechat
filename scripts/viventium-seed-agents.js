@@ -343,10 +343,21 @@ function mergeManagedValue(priorKnown, previous, live, incoming, pathParts) {
   return { value: deepClone(live), drift: [pathParts.join('.')] };
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Unified built-in Agent seeding.
+ * Purpose: Main, standalone cortex, and handoff Agents share one ownership, drift, permission,
+ * and managed-baseline lifecycle.
+ * === VIVENTIUM END === */
+function getManagedBundleAgents(bundle) {
+  return [
+    bundle?.mainAgent,
+    ...(bundle?.backgroundAgents || []),
+    ...(bundle?.handoffAgents || []),
+  ].filter((agent) => agent && typeof agent === 'object');
+}
+
 function buildManagedBaseline(bundle) {
-  const agents = [bundle.mainAgent, ...(bundle.backgroundAgents || [])].filter(
-    (agent) => agent && agent.id && !agent.missing,
-  );
+  const agents = getManagedBundleAgents(bundle).filter((agent) => agent.id && !agent.missing);
   const managedAgents = {};
   for (const agent of agents) {
     const fields = {};
@@ -1215,7 +1226,8 @@ async function run() {
   const placeholderOwner = await User.findOne({ email: DEFAULT_AGENT_SEED_OWNER_EMAIL })
     .select('_id')
     .lean();
-  const shippedAgentIds = [bundle.mainAgent, ...(bundle.backgroundAgents || [])]
+  const managedBundleAgents = getManagedBundleAgents(bundle);
+  const shippedAgentIds = managedBundleAgents
     .filter((agent) => agent?.id && !agent.missing)
     .map((agent) => String(agent.id));
   await preflightExistingAgentOwners({
@@ -1246,33 +1258,35 @@ async function run() {
   });
   results.push(mainResult);
 
-  if (Array.isArray(bundle.backgroundAgents)) {
-    for (const agentData of bundle.backgroundAgents) {
-      if (agentData && agentData.missing) {
-        results.push({ id: agentData.id || null, status: 'missing', reason: 'marked missing' });
-        continue;
-      }
-      const result = await upsertAgent({
-        agentData,
-        userId: owner._id,
-        dryRun: args.dryRun,
-        previousFields: previousBaseline?.agents?.[agentData.id]?.fields || null,
-        placeholderOwnerId: placeholderOwner?._id || null,
-      });
-      for (const field of result.managedDrift || []) {
-        unresolvedUserFields.push({ agent_id: agentData.id, field });
-      }
-      delete result.managedDrift;
-      result.permissions = await ensureAgentPermissions({
-        resourceId: result.resourceId,
-        ownerId: owner._id,
-        publicAccess: args.public,
-        publicAccessRole,
-        dryRun: args.dryRun,
-      });
-      results.push(result);
+  /* === VIVENTIUM START === Unified built-in Agent seeding, including handoff Agents. === */
+  for (const agentData of managedBundleAgents.filter(
+    (agent) => String(agent.id || '') !== String(bundle.mainAgent.id),
+  )) {
+    if (agentData.missing) {
+      results.push({ id: agentData.id || null, status: 'missing', reason: 'marked missing' });
+      continue;
     }
+    const result = await upsertAgent({
+      agentData,
+      userId: owner._id,
+      dryRun: args.dryRun,
+      previousFields: previousBaseline?.agents?.[agentData.id]?.fields || null,
+      placeholderOwnerId: placeholderOwner?._id || null,
+    });
+    for (const field of result.managedDrift || []) {
+      unresolvedUserFields.push({ agent_id: agentData.id, field });
+    }
+    delete result.managedDrift;
+    result.permissions = await ensureAgentPermissions({
+      resourceId: result.resourceId,
+      ownerId: owner._id,
+      publicAccess: args.public,
+      publicAccessRole,
+      dryRun: args.dryRun,
+    });
+    results.push(result);
   }
+  /* === VIVENTIUM END === */
 
   if (!args.dryRun) {
     const canonicalOwnerId =
@@ -1340,6 +1354,7 @@ module.exports = {
   requireExistingOwner,
   resolveSeedOwner,
   stableSerialize,
+  getManagedBundleAgents,
   buildManagedBaseline,
   buildManagedValueFingerprint,
   buildManagedBaselineMigrationArtifact,

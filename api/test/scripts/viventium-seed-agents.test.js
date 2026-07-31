@@ -130,6 +130,14 @@ describe('viventium-seed-agents', () => {
           },
         },
       ],
+      handoffAgents: [
+        {
+          id: 'agent_viventium_connected_accounts_95aeb3',
+          provider: 'anthropic',
+          model: 'claude-opus-5',
+          tools: ['sys__server__sys_mcp_google_workspace'],
+        },
+      ],
     };
 
     const normalized = normalizeBundleForRuntimeWithOwner(bundle, {
@@ -152,6 +160,11 @@ describe('viventium-seed-agents', () => {
     expect(normalized.backgroundAgents[0].provider).toBe('anthropic');
     expect(normalized.backgroundAgents[0].model).toBe('claude-opus-4-8');
     expect(normalized.backgroundAgents[0].model_parameters.model).toBe('claude-opus-4-8');
+    expect(normalized.handoffAgents[0]).toMatchObject({
+      provider: 'anthropic',
+      model: 'claude-opus-5',
+      tools: [],
+    });
   });
 
   test('resolves promptRef instructions before seed-style persistence', () => {
@@ -476,6 +489,31 @@ describe('viventium-seed-agents', () => {
     expect(first.bundle_sha256).toMatch(/^[a-f0-9]{64}$/);
     expect(second).toEqual(first);
     expect(JSON.stringify(first)).not.toContain('example.com');
+  });
+
+  test('includes standalone handoff agents in the managed baseline used by seeding', () => {
+    const baseline = buildManagedBaseline({
+      mainAgent: {
+        id: 'agent_viventium_main_95aeb3',
+        provider: 'glasshive-harness',
+        model: 'codex-cli:gpt-5.6-sol',
+      },
+      backgroundAgents: [],
+      handoffAgents: [
+        {
+          id: 'agent_viventium_connected_accounts_95aeb3',
+          provider: 'anthropic',
+          model: 'claude-opus-5',
+        },
+      ],
+    });
+
+    expect(baseline.agents).toHaveProperty('agent_viventium_main_95aeb3');
+    expect(baseline.agents).toHaveProperty('agent_viventium_connected_accounts_95aeb3');
+    expect(baseline.agents.agent_viventium_connected_accounts_95aeb3.fields).toMatchObject({
+      provider: 'anthropic',
+      model: 'claude-opus-5',
+    });
   });
 
   test('uses an exact shipped predecessor baseline on first upgrade while preserving real user edits', () => {

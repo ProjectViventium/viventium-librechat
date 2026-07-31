@@ -152,6 +152,9 @@ const anthropicModels = {
   'claude-4': 200000,
   'claude-opus-4': 200000,
   'claude-opus-4-5': 200000,
+  /* === VIVENTIUM START === Opus 4.6 verified context limit. === */
+  'claude-opus-4-6': 1000000,
+  /* === VIVENTIUM END === */
   'claude-opus-4-7': 1000000,
   /* === VIVENTIUM START ===
    * Feature: Launch-ready Anthropic model accounting.
@@ -404,6 +407,9 @@ const anthropicMaxOutputs = {
   'claude-sonnet-4': 64000,
   'claude-opus-4': 32000,
   'claude-opus-4-5': 64000,
+  /* === VIVENTIUM START === Opus 4.6 verified output limit. === */
+  'claude-opus-4-6': 128000,
+  /* === VIVENTIUM END === */
   'claude-opus-4-7': 128000,
   /* === VIVENTIUM START ===
    * Feature: Launch-ready Anthropic model accounting.

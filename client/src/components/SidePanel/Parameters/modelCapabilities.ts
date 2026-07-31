@@ -14,21 +14,34 @@ const ANTHROPIC_EFFORT_ENDPOINTS = new Set<string>([
   EModelEndpoint.bedrock,
 ]);
 
+export type ViventiumCompatibleSettingDefinition = SettingDefinition & {
+  viventiumRenderCompatibleEnum?: boolean;
+  viventiumResetIncompatible?: boolean;
+};
+
 export function withModelCompatibleOptions(
   setting: SettingDefinition,
   endpoint: string,
   model: string,
-): SettingDefinition {
-  if (setting.key !== 'effort' || !ANTHROPIC_EFFORT_ENDPOINTS.has(endpoint)) {
+  { persistReset = true }: { persistReset?: boolean } = {},
+): ViventiumCompatibleSettingDefinition {
+  if (!model || setting.key !== 'effort' || !ANTHROPIC_EFFORT_ENDPOINTS.has(endpoint)) {
     return setting;
   }
 
   const availableEfforts = new Set(getAnthropicEffortOptions(model));
+  const compatibleOptions = setting.options?.filter(
+    (option) => option !== AnthropicEffort.xhigh || availableEfforts.has(AnthropicEffort.xhigh),
+  );
+  if (compatibleOptions == null || compatibleOptions.length === setting.options?.length) {
+    return setting;
+  }
+
   return {
     ...setting,
-    options: setting.options?.filter(
-      (option) => option !== AnthropicEffort.xhigh || availableEfforts.has(AnthropicEffort.xhigh),
-    ),
+    options: compatibleOptions,
+    viventiumRenderCompatibleEnum: true,
+    ...(persistReset ? { viventiumResetIncompatible: true } : {}),
   };
 }
 

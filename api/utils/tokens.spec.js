@@ -1004,6 +1004,11 @@ describe('Claude Model Tests', () => {
     );
   });
 
+  it('should return the 1M context and 128K output limits for Claude Opus 4.6', () => {
+    expect(getModelMaxTokens('claude-opus-4-6', EModelEndpoint.anthropic)).toBe(1000000);
+    expect(maxOutputTokensMap[EModelEndpoint.anthropic]['claude-opus-4-6']).toBe(128000);
+  });
+
   it('should handle Claude Haiku 4.5 model name variations', () => {
     const modelVariations = [
       'claude-haiku-4-5',

@@ -764,6 +764,16 @@ function normalizeBundleForRuntime(
     );
   }
 
+  /* === VIVENTIUM START ===
+   * Feature: Unified built-in Agent runtime normalization.
+   * Purpose: Handoff Agents must not retain tools or provider fields unavailable in this install.
+   * === VIVENTIUM END === */
+  if (Array.isArray(normalized.handoffAgents)) {
+    normalized.handoffAgents = normalized.handoffAgents.map((agent) =>
+      rewriteAgentForRuntime(agent, { env, capabilityRequiredProviders }),
+    );
+  }
+
   return normalized;
 }
 

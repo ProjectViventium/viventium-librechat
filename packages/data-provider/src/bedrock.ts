@@ -310,6 +310,21 @@ export const bedrockInputParser = s.tConversationSchema
           additionalFields.thinking = { type: 'adaptive' };
           delete additionalFields.thinkingBudget;
         }
+
+        /* === VIVENTIUM START ===
+         * Feature: Anthropic direct/Bedrock sampling parity.
+         * Purpose: Current adaptive models reject legacy sampling controls; never forward them
+         * through either top-level Converse fields or persisted additional request fields.
+         * === VIVENTIUM END === */
+        delete typedData.temperature;
+        if (rejectsNonDefaultSamplingParameters(typedData.model as string)) {
+          delete typedData.topP;
+          delete additionalFields.top_k;
+          const persistedAdditionalFields = typedData.additionalModelRequestFields;
+          if (typeof persistedAdditionalFields === 'object' && persistedAdditionalFields != null) {
+            delete (persistedAdditionalFields as Record<string, unknown>).top_k;
+          }
+        }
       } else {
         if (additionalFields.thinking === undefined) {
           additionalFields.thinking = true;

@@ -225,9 +225,15 @@ function resolvePromptRefs(value, registry) {
 }
 
 function buildHistoricalManagedBaseline(bundle) {
-  const agents = [bundle.mainAgent, ...(bundle.backgroundAgents || [])].filter(
-    (agent) => agent && agent.id && !agent.missing,
-  );
+  /* === VIVENTIUM START ===
+   * Feature: Unified built-in Agent migration history.
+   * Purpose: Handoff Agents use the same three-way upgrade protection as Main and cortex Agents.
+   * === VIVENTIUM END === */
+  const agents = [
+    bundle.mainAgent,
+    ...(bundle.backgroundAgents || []),
+    ...(bundle.handoffAgents || []),
+  ].filter((agent) => agent && agent.id && !agent.missing);
   const managed = {};
   for (const agent of agents) {
     const fields = {};

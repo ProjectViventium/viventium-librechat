@@ -33,6 +33,7 @@ export default function BedrockSettings({
       setting,
       EModelEndpoint.bedrock,
       conversation?.model ?? '',
+      { persistReset: false },
     );
     /* === VIVENTIUM END === */
     const Component = componentMapping[compatibleSetting.component];

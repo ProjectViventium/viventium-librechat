@@ -37,6 +37,45 @@ describe('model-compatible parameter options', () => {
       effortSetting,
     );
   });
+
+  it('does not filter or mark options while the model is unresolved', () => {
+    expect(withModelCompatibleOptions(effortSetting, EModelEndpoint.anthropic, '')).toBe(
+      effortSetting,
+    );
+  });
+
+  it('marks only a filtered Anthropic effort setting for incompatible-value reset', () => {
+    expect(
+      withModelCompatibleOptions(effortSetting, EModelEndpoint.anthropic, 'claude-opus-4-6'),
+    ).toMatchObject({
+      viventiumResetIncompatible: true,
+    });
+    expect(
+      withModelCompatibleOptions(effortSetting, EModelEndpoint.anthropic, 'claude-opus-5'),
+    ).not.toHaveProperty('viventiumResetIncompatible');
+  });
+
+  it('filters a preset picker without mutating the preset on open', () => {
+    expect(
+      withModelCompatibleOptions(effortSetting, EModelEndpoint.anthropic, 'claude-opus-4-6', {
+        persistReset: false,
+      }),
+    ).toMatchObject({
+      viventiumRenderCompatibleEnum: true,
+      options: [
+        AnthropicEffort.unset,
+        AnthropicEffort.low,
+        AnthropicEffort.medium,
+        AnthropicEffort.high,
+        AnthropicEffort.max,
+      ],
+    });
+    expect(
+      withModelCompatibleOptions(effortSetting, EModelEndpoint.anthropic, 'claude-opus-4-6', {
+        persistReset: false,
+      }),
+    ).not.toHaveProperty('viventiumResetIncompatible');
+  });
 });
 
 describe('getCompatibleEnumValue', () => {

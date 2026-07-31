@@ -18,6 +18,8 @@ const {
   ErrorController,
   performStartupChecks,
   handleJsonParseError,
+  GenerationJobManager,
+  createStreamServices,
   initializeFileStorage,
 } = require('@librechat/api');
 const { connectDb, indexSync } = require('~/db');
@@ -34,6 +36,12 @@ const staticCache = require('./utils/staticCache');
 const noIndex = require('./middleware/noIndex');
 const { seedDatabase } = require('~/models');
 const routes = require('./routes');
+/* === VIVENTIUM START ===
+ * Feature: Clustered post-upgrade readiness parity.
+ * Purpose: Apply the same quiescence and durable finalization contract in clustered startup.
+ */
+const upgradeFinalization = require('./services/viventium/upgradeFinalization');
+/* === VIVENTIUM END === */
 
 const { PORT, HOST, ALLOW_SOCIAL_LOGIN, DISABLE_COMPRESSION, TRUST_PROXY } = process.env ?? {};
 
@@ -55,6 +63,15 @@ const wrapLogMessage = (msg) => {
  * This ensures a clean state for testing multi-pod MCP connection issues
  */
 const flushRedisCache = async () => {
+  /* === VIVENTIUM START ===
+   * Feature: Quiesced successor validation.
+   * Purpose: Validation cannot mutate shared Redis state before the outer transaction commits.
+   */
+  if (upgradeFinalization.isQuiesced()) {
+    logger.info('Viventium successor validation is quiesced, skipping Redis cache flush');
+    return;
+  }
+  /* === VIVENTIUM END === */
   /** Skip cache flush if Redis is not enabled */
   if (!isEnabled(process.env.USE_REDIS)) {
     logger.info('Redis is not enabled, skipping cache flush');
@@ -134,13 +151,27 @@ if (cluster.isMaster) {
 
   let activeWorkers = 0;
   const startTime = Date.now();
+  let finalizationReceiptWriterId = null;
+  let consecutiveStartupFailures = 0;
+  const workerStartedAt = new Map();
+
+  const forkWorker = ({ receiptWriter = false } = {}) => {
+    const worker = cluster.fork({
+      VIVENTIUM_POSTCOMMIT_RECEIPT_WRITER: receiptWriter ? '1' : '0',
+    });
+    workerStartedAt.set(worker.id, Date.now());
+    if (receiptWriter) {
+      finalizationReceiptWriterId = worker.id;
+    }
+    return worker;
+  };
 
   /** Flush Redis cache before starting workers */
   flushRedisCache()
     .then(() => {
       logger.info('Cache flushed, forking workers...');
       for (let i = 0; i < workers; i++) {
-        cluster.fork();
+        forkWorker({ receiptWriter: i === 0 });
       }
     })
     .catch((err) => {
@@ -169,11 +200,28 @@ if (cluster.isMaster) {
 
   cluster.on('exit', (worker, code, signal) => {
     activeWorkers--;
+    const wasReceiptWriter = worker.id === finalizationReceiptWriterId;
+    if (wasReceiptWriter) {
+      finalizationReceiptWriterId = null;
+    }
+    const workerLifetimeMs = Date.now() - (workerStartedAt.get(worker.id) || Date.now());
+    workerStartedAt.delete(worker.id);
+    if (workerLifetimeMs >= 60_000 || code === 0) {
+      consecutiveStartupFailures = 0;
+    } else {
+      consecutiveStartupFailures += 1;
+    }
+    const restartDelayMs =
+      code === 0
+        ? 0
+        : Math.min(500 * 2 ** Math.min(Math.max(consecutiveStartupFailures - 1, 0), 6), 30_000);
     logger.error(
       `Worker ${worker.process.pid} died (${activeWorkers}/${workers}). Code: ${code}, Signal: ${signal}`,
     );
-    logger.info('Starting a new worker to replace it...');
-    cluster.fork();
+    logger.info(`Starting a replacement worker in ${restartDelayMs}ms`);
+    setTimeout(() => {
+      forkWorker({ receiptWriter: wasReceiptWriter });
+    }, restartDelayMs);
   });
 
   /** Graceful shutdown on SIGTERM/SIGINT */
@@ -204,26 +252,46 @@ if (cluster.isMaster) {
       axios.defaults.headers.common['Accept-Encoding'] = 'gzip';
     }
 
+    /* === VIVENTIUM START ===
+     * Feature: Clustered post-upgrade readiness parity.
+     * Purpose: Begin the durable finalization attempt before any required writer runs.
+     */
+    const quiescedApiStartup = upgradeFinalization.isQuiesced();
+    upgradeFinalization.beginAttempt();
+    /* === VIVENTIUM END === */
+
     /** Connect to MongoDB */
     await connectDb();
     logger.info(`Worker ${process.pid}: Connected to MongoDB`);
+    upgradeFinalization.recordCompleted('database-connected');
 
-    /** Background index sync (non-blocking) */
-    indexSync().catch((err) => {
-      logger.error(`[Worker ${process.pid}][indexSync] Background sync failed:`, err);
-    });
+    /* === VIVENTIUM START === Quiesced validation keeps derived-state writers disabled. === */
+    if (!quiescedApiStartup) {
+      /** Background index sync (non-blocking) */
+      indexSync().catch((err) => {
+        logger.error(`[Worker ${process.pid}][indexSync] Background sync failed:`, err);
+      });
+    }
+    /* === VIVENTIUM END === */
 
     app.disable('x-powered-by');
     app.set('trust proxy', trusted_proxy);
 
     /** Seed database (idempotent) */
-    await seedDatabase();
+    if (!quiescedApiStartup) {
+      await seedDatabase();
+      upgradeFinalization.recordCompleted('database-seed-ready');
+    }
 
     /** Initialize app configuration */
     const appConfig = await getAppConfig();
     initializeFileStorage(appConfig);
     await performStartupChecks(appConfig);
-    await updateInterfacePermissions(appConfig);
+    upgradeFinalization.recordCompleted('startup-checks-ready');
+    if (!quiescedApiStartup) {
+      await updateInterfacePermissions(appConfig);
+      upgradeFinalization.recordCompleted('interface-permissions-ready');
+    }
 
     /** Load index.html for SPA serving */
     const indexPath = path.join(appConfig.paths.dist, 'index.html');
@@ -241,8 +309,14 @@ if (cluster.isMaster) {
       }
     }
 
-    /** Health check endpoint */
-    app.get('/health', (_req, res) => res.status(200).send('OK'));
+    /* === VIVENTIUM START ===
+     * Feature: Clustered health/readiness parity.
+     * Purpose: Both probes remain unavailable during armed finalization while ordinary quiesced
+     * validation still exposes only the lightweight health surface.
+     */
+    app.get(['/health', '/api/health'], upgradeFinalization.health);
+    app.use(['/oauth', '/api'], upgradeFinalization.requireReady);
+    /* === VIVENTIUM END === */
 
     /** Middleware */
     app.use(noIndex);
@@ -372,20 +446,56 @@ if (cluster.isMaster) {
         }:${port}`,
       );
 
-      /** Initialize MCP servers and OAuth reconnection for this worker */
-      await initializeMCPs();
-      await initializeOAuthReconnectManager();
       /* === VIVENTIUM START ===
-       * Feature: Connected channel restart recovery in clustered development mode.
-       * Purpose: Let every worker reconcile while Mongo leases elect exactly one provider consumer.
+       * Feature: Clustered quiescence and post-upgrade finalization.
+       * Purpose: Prove the complete required startup sequence before any worker reports ready.
        */
-      const { restoreChannelWorkers } = require('./services/viventium/channelAdminService');
-      await restoreChannelWorkers();
+      if (quiescedApiStartup) {
+        logger.info(
+          `Worker ${process.pid}: successor validation started with autonomous writers quiesced`,
+        );
+        return;
+      }
+      try {
+        await initializeMCPs();
+        upgradeFinalization.recordCompleted('mcp-runtime-ready');
+        await initializeOAuthReconnectManager();
+        upgradeFinalization.recordCompleted('oauth-reconnect-ready');
+        const { restoreChannelWorkers } = require('./services/viventium/channelAdminService');
+        await restoreChannelWorkers();
+        upgradeFinalization.recordCompleted('channel-persistence-ready');
+        await checkMigrations();
+        upgradeFinalization.recordCompleted('permission-migration-inspection');
+        if (upgradeFinalization.isArmed()) {
+          await recoverStaleCortexMessages();
+          upgradeFinalization.recordCompleted('stale-cortex-recovery');
+        } else {
+          recoverStaleCortexMessages().catch((error) => {
+            logger.error('[staleCortexMessageRecovery] Startup recovery failed:', error);
+          });
+        }
+        const streamServices = createStreamServices();
+        GenerationJobManager.configure(streamServices);
+        GenerationJobManager.initialize();
+        upgradeFinalization.recordCompleted('generation-runtime-ready');
+        upgradeFinalization.markReady();
+      } catch (startupError) {
+        if (!upgradeFinalization.isArmed()) {
+          throw startupError;
+        }
+        try {
+          upgradeFinalization.markFailed(startupError);
+        } catch (receiptError) {
+          logger.error(
+            `Worker ${process.pid}: could not persist failed API finalization proof:`,
+            receiptError,
+          );
+        }
+        logger.error(`Worker ${process.pid}: required startup finalization failed:`, startupError);
+        process.exit(1);
+        return;
+      }
       /* === VIVENTIUM END === */
-      await checkMigrations();
-      recoverStaleCortexMessages().catch((error) => {
-        logger.error('[staleCortexMessageRecovery] Startup recovery failed:', error);
-      });
     });
 
     /** Handle inter-process messages from master */
@@ -403,6 +513,16 @@ if (cluster.isMaster) {
   };
 
   startServer().catch((err) => {
+    if (upgradeFinalization.isArmed()) {
+      try {
+        upgradeFinalization.markFailed(err);
+      } catch (receiptError) {
+        logger.error(
+          `Worker ${process.pid}: could not persist failed API finalization proof:`,
+          receiptError,
+        );
+      }
+    }
     logger.error(`Failed to start worker ${process.pid}:`, err);
     process.exit(1);
   });

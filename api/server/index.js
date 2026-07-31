@@ -54,6 +54,12 @@ const {
   secureNativeApiSocket,
 } = require('./services/viventium/nativeApiListen');
 // === VIVENTIUM END ===
+/* === VIVENTIUM START ===
+ * Feature: Forward-recoverable post-upgrade API finalization.
+ * Purpose: Keep health, API, and OAuth unavailable until every required startup mutation is proven.
+ */
+const upgradeFinalization = require('./services/viventium/upgradeFinalization');
+// === VIVENTIUM END ===
 
 const { PORT, HOST, ALLOW_SOCIAL_LOGIN, DISABLE_COMPRESSION, TRUST_PROXY } = process.env ?? {};
 
@@ -97,21 +103,43 @@ const startServer = async () => {
     }
   }
   /* === VIVENTIUM END === */
+  /* === VIVENTIUM START ===
+   * Feature: Forward-recoverable post-upgrade API finalization.
+   * Purpose: Begin the exact durable attempt before any required startup mutation runs.
+   */
+  const quiescedApiStartup = upgradeFinalization.isQuiesced();
+  upgradeFinalization.beginAttempt();
+  /* === VIVENTIUM END === */
   await connectDb();
-
   logger.info('Connected to MongoDB');
-  indexSync().catch((err) => {
-    logger.error('[indexSync] Background sync failed:', err);
-  });
+  upgradeFinalization.recordCompleted('database-connected');
+  /* === VIVENTIUM START ===
+   * Feature: Quiesced successor validation.
+   * Purpose: Derived search synchronization and managed database seeding remain disabled until
+   * the outer upgrade transaction commits.
+   */
+  if (!quiescedApiStartup) {
+    indexSync().catch((err) => {
+      logger.error('[indexSync] Background sync failed:', err);
+    });
+  }
+  /* === VIVENTIUM END === */
 
   app.disable('x-powered-by');
   app.set('trust proxy', trusted_proxy);
 
-  await seedDatabase();
+  if (!quiescedApiStartup) {
+    await seedDatabase();
+    upgradeFinalization.recordCompleted('database-seed-ready');
+  }
   const appConfig = await getAppConfig();
   initializeFileStorage(appConfig);
   await performStartupChecks(appConfig);
-  await updateInterfacePermissions(appConfig);
+  upgradeFinalization.recordCompleted('startup-checks-ready');
+  if (!quiescedApiStartup) {
+    await updateInterfacePermissions(appConfig);
+    upgradeFinalization.recordCompleted('interface-permissions-ready');
+  }
 
   /* === VIVENTIUM START ===
    * Feature: Isolated local Sandpack runtime.
@@ -158,7 +186,8 @@ const startServer = async () => {
    * Purpose: Liveness/readiness probes currently hit /api/health in managed cloud.
    * Keep both routes lightweight and equivalent to avoid false restarts.
    */
-  app.get(['/health', '/api/health'], (_req, res) => res.status(200).send('OK'));
+  app.get(['/health', '/api/health'], upgradeFinalization.health);
+  app.use(['/oauth', '/api'], upgradeFinalization.requireReady);
   /* === VIVENTIUM END === */
 
   /* Middleware */
@@ -329,32 +358,63 @@ const startServer = async () => {
     }
     // === VIVENTIUM END ===
 
-    await initializeMCPs();
-    await initializeOAuthReconnectManager();
     /* === VIVENTIUM START ===
-     * Feature: Connected channel restart recovery.
-     * Purpose: Restore only explicitly registered in-process transports from encrypted records.
+     * Feature: Quiesced successor validation and post-upgrade finalization.
+     * Purpose: Validation starts only the core read path. Full startup proves every required
+     * mutator in order before readiness becomes visible.
      */
-    const { restoreChannelWorkers } = require('./services/viventium/channelAdminService');
-    await restoreChannelWorkers();
-    /* === VIVENTIUM END === */
-    await checkMigrations();
-    recoverStaleCortexMessages().catch((error) => {
-      logger.error('[staleCortexMessageRecovery] Startup recovery failed:', error);
-    });
-    const staleCortexRecoveryIntervalMs = getStaleCortexRecoveryIntervalMs();
-    if (staleCortexRecoveryIntervalMs > 0) {
-      setInterval(() => {
-        recoverStaleCortexMessages().catch((error) => {
-          logger.error('[staleCortexMessageRecovery] Periodic recovery failed:', error);
-        });
-      }, staleCortexRecoveryIntervalMs).unref?.();
+    if (quiescedApiStartup) {
+      logger.info('Viventium successor validation API started with autonomous writers quiesced');
+      return;
     }
+    try {
+      await initializeMCPs();
+      upgradeFinalization.recordCompleted('mcp-runtime-ready');
+      await initializeOAuthReconnectManager();
+      upgradeFinalization.recordCompleted('oauth-reconnect-ready');
+      const { restoreChannelWorkers } = require('./services/viventium/channelAdminService');
+      await restoreChannelWorkers();
+      upgradeFinalization.recordCompleted('channel-persistence-ready');
+      await checkMigrations();
+      upgradeFinalization.recordCompleted('permission-migration-inspection');
 
-    // Configure stream services (auto-detects Redis from USE_REDIS env var)
-    const streamServices = createStreamServices();
-    GenerationJobManager.configure(streamServices);
-    GenerationJobManager.initialize();
+      if (upgradeFinalization.isArmed()) {
+        await recoverStaleCortexMessages();
+        upgradeFinalization.recordCompleted('stale-cortex-recovery');
+      } else {
+        recoverStaleCortexMessages().catch((error) => {
+          logger.error('[staleCortexMessageRecovery] Startup recovery failed:', error);
+        });
+      }
+      const staleCortexRecoveryIntervalMs = getStaleCortexRecoveryIntervalMs();
+      if (staleCortexRecoveryIntervalMs > 0) {
+        setInterval(() => {
+          recoverStaleCortexMessages().catch((error) => {
+            logger.error('[staleCortexMessageRecovery] Periodic recovery failed:', error);
+          });
+        }, staleCortexRecoveryIntervalMs).unref?.();
+      }
+
+      // Configure stream services (auto-detects Redis from USE_REDIS env var)
+      const streamServices = createStreamServices();
+      GenerationJobManager.configure(streamServices);
+      GenerationJobManager.initialize();
+      upgradeFinalization.recordCompleted('generation-runtime-ready');
+      upgradeFinalization.markReady();
+    } catch (startupError) {
+      if (!upgradeFinalization.isArmed()) {
+        throw startupError;
+      }
+      try {
+        upgradeFinalization.markFailed(startupError);
+      } catch (receiptError) {
+        logger.error('Could not persist failed API finalization proof:', receiptError);
+      }
+      logger.error('Required Viventium API startup finalization failed:', startupError);
+      process.exit(1);
+      return;
+    }
+    /* === VIVENTIUM END === */
 
     const inspectFlags = process.execArgv.some((arg) => arg.startsWith('--inspect'));
     if (inspectFlags || isEnabled(process.env.MEM_DIAG)) {
@@ -363,7 +423,18 @@ const startServer = async () => {
   });
 };
 
-startServer();
+startServer().catch((startupError) => {
+  if (!upgradeFinalization.isArmed()) {
+    throw startupError;
+  }
+  try {
+    upgradeFinalization.markFailed(startupError);
+  } catch (receiptError) {
+    logger.error('Could not persist failed API finalization proof:', receiptError);
+  }
+  logger.error('Failed to start server:', startupError);
+  process.exit(1);
+});
 
 let messageCount = 0;
 process.on('uncaughtException', (err) => {

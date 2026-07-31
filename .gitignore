@@ -133,6 +133,7 @@ auth.json
 
 # User uploads
 uploads/
+/uploads
 
 # owner
 release/

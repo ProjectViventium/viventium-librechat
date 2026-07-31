@@ -16,6 +16,7 @@ import { useGetEndpointsQuery } from '~/data-provider';
 import { componentMapping } from './components';
 import { useChatContext } from '~/Providers';
 import { logger } from '~/utils';
+import { withModelCompatibleOptions } from './modelCapabilities';
 
 export default function Parameters() {
   const localize = useLocalize();
@@ -45,9 +46,12 @@ export default function Parameters() {
     const defaultParams = paramSettings[combinedKey] ?? paramSettings[overriddenEndpointKey] ?? [];
     const overriddenParams = endpointsConfig[provider]?.customParams?.paramDefinitions ?? [];
     const overriddenParamsMap = keyBy(overriddenParams, 'key');
+    /* === VIVENTIUM START === Capability-filter Anthropic effort choices by selected model. === */
     return defaultParams
       .filter((param) => param != null)
-      .map((param) => (overriddenParamsMap[param.key] as SettingDefinition) ?? param);
+      .map((param) => (overriddenParamsMap[param.key] as SettingDefinition) ?? param)
+      .map((param) => withModelCompatibleOptions(param, overriddenEndpointKey, model));
+    /* === VIVENTIUM END === */
   }, [endpointType, endpointsConfig, model, provider]);
 
   useEffect(() => {

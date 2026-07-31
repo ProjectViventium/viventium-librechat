@@ -1,4 +1,5 @@
 import {
+  getAnthropicEffortOptions,
   isOpus5OrLater,
   rejectsNonDefaultSamplingParameters,
   supportsXhighEffort,
@@ -7,6 +8,7 @@ import {
   bedrockInputParser,
   supportsContext1m,
 } from '../src/bedrock';
+import { AnthropicEffort } from '../src/schemas';
 
 describe('isOpus5OrLater', () => {
   test('recognizes canonical, provider-prefixed, and alternate Opus 5 IDs', () => {
@@ -36,9 +38,29 @@ describe('supportsXhighEffort', () => {
     'claude-opus-4-6',
     'claude-opus-4-20250514',
     'claude-sonnet-4-6',
+    'claude-sonnet-4-20250514',
     'claude-sonnet-4-5',
   ])('rejects unsupported xhigh effort for %s', (model) => {
     expect(supportsXhighEffort(model)).toBe(false);
+  });
+});
+
+describe('getAnthropicEffortOptions', () => {
+  test('offers xhigh only to models that declare support', () => {
+    expect(getAnthropicEffortOptions('claude-opus-5')).toContain(AnthropicEffort.xhigh);
+    expect(getAnthropicEffortOptions('claude-opus-4-8')).toContain(AnthropicEffort.xhigh);
+    expect(getAnthropicEffortOptions('claude-opus-4-6')).not.toContain(AnthropicEffort.xhigh);
+    expect(getAnthropicEffortOptions('claude-sonnet-4-6')).not.toContain(AnthropicEffort.xhigh);
+  });
+
+  test('preserves the remaining effort choices and order', () => {
+    expect(getAnthropicEffortOptions('claude-opus-4-6')).toEqual([
+      AnthropicEffort.unset,
+      AnthropicEffort.low,
+      AnthropicEffort.medium,
+      AnthropicEffort.high,
+      AnthropicEffort.max,
+    ]);
   });
 });
 
@@ -58,6 +80,7 @@ describe('rejectsNonDefaultSamplingParameters', () => {
     'claude-opus-4-6',
     'claude-opus-4-20250514',
     'claude-sonnet-4-6',
+    'claude-sonnet-4-20250514',
     'claude-sonnet-4-5',
   ])('does not over-restrict %s when thinking is disabled', (model) => {
     expect(rejectsNonDefaultSamplingParameters(model)).toBe(false);
@@ -115,6 +138,10 @@ describe('supportsAdaptiveThinking', () => {
 
   test('should return false for anthropic.claude-sonnet-4-5-20250929-v1:0', () => {
     expect(supportsAdaptiveThinking('anthropic.claude-sonnet-4-5-20250929-v1:0')).toBe(false);
+  });
+
+  test('should not mistake a dated Sonnet 4 ID for an adaptive minor version', () => {
+    expect(supportsAdaptiveThinking('claude-sonnet-4-20250514')).toBe(false);
   });
 
   test('should return false for claude-sonnet-4', () => {
@@ -517,6 +544,40 @@ describe('bedrockInputParser', () => {
       expect(additionalFields.thinking).toEqual({ type: 'adaptive' });
       expect(additionalFields.output_config).toEqual({ effort: 'max' });
     });
+
+    test('should reject xhigh before sending it to unsupported adaptive models', () => {
+      expect(() =>
+        bedrockInputParser.parse({
+          model: 'anthropic.claude-opus-4-6',
+          effort: 'xhigh',
+        }),
+      ).toThrow(/does not support "xhigh" effort/);
+    });
+
+    test('should explicitly disable thinking for Opus 5', () => {
+      const result = bedrockInputParser.parse({
+        model: 'anthropic.claude-opus-5',
+        thinking: false,
+        effort: 'high',
+      }) as Record<string, unknown>;
+      const additionalFields = result.additionalModelRequestFields as Record<string, unknown>;
+      expect(additionalFields.thinking).toEqual({ type: 'disabled' });
+      expect(additionalFields.thinkingBudget).toBeUndefined();
+      expect(additionalFields.output_config).toEqual({ effort: 'high' });
+    });
+
+    test.each(['xhigh', 'max'])(
+      'should reject disabled thinking with %s effort for Opus 5',
+      (effort) => {
+        expect(() =>
+          bedrockInputParser.parse({
+            model: 'anthropic.claude-opus-5',
+            thinking: false,
+            effort,
+          }),
+        ).toThrow(/requires thinking to be enabled/);
+      },
+    );
   });
 
   describe('bedrockOutputParser with configureThinking', () => {

@@ -1,4 +1,4 @@
-import { useMemo, useCallback } from 'react';
+import { useMemo, useCallback, useEffect } from 'react';
 import { OptionTypes } from 'librechat-data-provider';
 import type { DynamicSettingProps } from 'librechat-data-provider';
 import { Label, Slider, HoverCard, Input, InputNumber, HoverCardTrigger } from '@librechat/client';
@@ -7,6 +7,7 @@ import { cn, defaultTextProps, optionText } from '~/utils';
 import { ESide, defaultDebouncedDelay } from '~/common';
 import { useChatContext } from '~/Providers';
 import OptionHover from './OptionHover';
+import { getCompatibleEnumValue } from './modelCapabilities';
 
 function DynamicSlider({
   label = '',
@@ -58,6 +59,23 @@ function DynamicSlider({
 
     return inputValue;
   }, [conversation, defaultValue, settingKey, inputValue, isEnum]);
+
+  /* === VIVENTIUM START ===
+   * Feature: Capability-filtered enum persistence.
+   * Purpose: Reset a stale saved option when a provider/model no longer declares it.
+   * === VIVENTIUM END === */
+  const compatibleEnumValue = useMemo(
+    () =>
+      isEnum && options ? getCompatibleEnumValue(options, selectedValue, defaultValue) : undefined,
+    [defaultValue, isEnum, options, selectedValue],
+  );
+
+  useEffect(() => {
+    if (!isEnum || compatibleEnumValue == null || compatibleEnumValue === selectedValue) {
+      return;
+    }
+    setInputValue(compatibleEnumValue);
+  }, [compatibleEnumValue, isEnum, selectedValue, setInputValue]);
 
   const enumToNumeric = useMemo(() => {
     if (isEnum && options) {
@@ -210,7 +228,7 @@ function DynamicSlider({
             disabled={readonly}
             value={[
               isEnum
-                ? enumToNumeric[(selectedValue as number) ?? '']
+                ? enumToNumeric[compatibleEnumValue ?? '']
                 : ((inputValue as number) ?? (defaultValue as number)),
             ]}
             onValueChange={(value) => handleValueChange(value[0])}

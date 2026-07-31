@@ -55,6 +55,16 @@ export function supportsXhighEffort(model: string): boolean {
 }
 
 /* === VIVENTIUM START ===
+ * Feature: Capability-filtered Anthropic effort controls.
+ * Purpose: Share the provider's declared effort choices across direct, Bedrock, and UI paths.
+ * === VIVENTIUM END === */
+export function getAnthropicEffortOptions(model: string): s.AnthropicEffort[] {
+  return s.anthropicSettings.effort.options.filter(
+    (effort) => effort !== s.AnthropicEffort.xhigh || supportsXhighEffort(model),
+  );
+}
+
+/* === VIVENTIUM START ===
  * Feature: Current Anthropic sampling-parameter contract.
  * Purpose: Centralize the model capability used to omit parameters rejected by the provider.
  * === VIVENTIUM END === */
@@ -263,14 +273,38 @@ export const bedrockInputParser = s.tConversationSchema
       const isAdaptive = supportsAdaptiveThinking(typedData.model as string);
 
       if (isAdaptive) {
+        /* === VIVENTIUM START ===
+         * Feature: Anthropic direct/Bedrock reasoning parity.
+         * Purpose: Reject unsupported effort locally and honor explicit thinking-off on Opus 5.
+         * === VIVENTIUM END === */
         const effort = additionalFields.effort;
+        if (effort === s.AnthropicEffort.xhigh && !supportsXhighEffort(typedData.model as string)) {
+          throw new Error(
+            `Anthropic model "${typedData.model}" does not support "xhigh" effort. ` +
+              'Choose low, medium, high, or max effort.',
+          );
+        }
+        if (
+          isOpus5OrLater(typedData.model as string) &&
+          additionalFields.thinking === false &&
+          (effort === s.AnthropicEffort.xhigh || effort === s.AnthropicEffort.max)
+        ) {
+          throw new Error(
+            `Claude Opus 5 requires thinking to be enabled when effort is "${effort}". ` +
+              'Enable thinking or choose high, medium, or low effort.',
+          );
+        }
         if (effort && typeof effort === 'string' && effort !== '') {
           additionalFields.output_config = { effort };
         }
         delete additionalFields.effort;
 
         if (additionalFields.thinking === false) {
-          delete additionalFields.thinking;
+          if (isOpus5OrLater(typedData.model as string)) {
+            additionalFields.thinking = { type: 'disabled' };
+          } else {
+            delete additionalFields.thinking;
+          }
           delete additionalFields.thinkingBudget;
         } else {
           additionalFields.thinking = { type: 'adaptive' };

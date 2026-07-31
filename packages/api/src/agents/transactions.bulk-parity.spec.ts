@@ -36,12 +36,7 @@ jest.mock('@librechat/data-schemas', () => {
 
 // Real pricing functions from api/models/tx.js — same ones the legacy path uses
 /* eslint-disable @typescript-eslint/no-require-imports */
-const {
-  getMultiplier,
-  getCacheMultiplier,
-  tokenValues,
-  premiumTokenValues,
-} = require('../../../../api/models/tx.js');
+const { getMultiplier, getCacheMultiplier, tokenValues } = require('../../../../api/models/tx.js');
 /* eslint-enable @typescript-eslint/no-require-imports */
 
 const pricing: PricingFns = { getMultiplier, getCacheMultiplier };
@@ -396,8 +391,8 @@ describe('Structured token parity', () => {
   });
 });
 
-describe('Premium pricing parity', () => {
-  test('standard pricing below threshold — identical to legacy', async () => {
+describe('Large-context standard pricing parity', () => {
+  test('standard pricing at 100K input — identical to legacy', async () => {
     const userId = new mongoose.Types.ObjectId().toString();
     const initialBalance = 100000000;
     await Balance.create({ user: userId, tokenCredits: initialBalance });
@@ -424,7 +419,7 @@ describe('Premium pricing parity', () => {
     expect(balance.tokenCredits).toBeCloseTo(initialBalance - expectedCost, 0);
   });
 
-  test('premium pricing above threshold — identical to legacy', async () => {
+  test('standard pricing above 200K input — identical to legacy', async () => {
     const userId = new mongoose.Types.ObjectId().toString();
     const initialBalance = 100000000;
     await Balance.create({ user: userId, tokenCredits: initialBalance });
@@ -433,13 +428,12 @@ describe('Premium pricing parity', () => {
     const promptTokens = 250000;
     const completionTokens = 500;
 
-    const premiumPromptRate = (premiumTokenValues as Record<string, Record<string, number>>)[model]
+    const standardPromptRate = (tokenValues as Record<string, Record<string, number>>)[model]
       .prompt;
-    const premiumCompletionRate = (premiumTokenValues as Record<string, Record<string, number>>)[
-      model
-    ].completion;
+    const standardCompletionRate = (tokenValues as Record<string, Record<string, number>>)[model]
+      .completion;
     const expectedCost =
-      promptTokens * premiumPromptRate + completionTokens * premiumCompletionRate;
+      promptTokens * standardPromptRate + completionTokens * standardCompletionRate;
 
     const entries = prepareTokenSpend(
       txMeta(userId, { model }),
@@ -452,14 +446,13 @@ describe('Premium pricing parity', () => {
     expect(balance.tokenCredits).toBeCloseTo(initialBalance - expectedCost, 0);
   });
 
-  test('standard pricing at exactly the threshold — identical to legacy', async () => {
+  test('standard pricing at 200K input — identical to legacy', async () => {
     const userId = new mongoose.Types.ObjectId().toString();
     const initialBalance = 100000000;
     await Balance.create({ user: userId, tokenCredits: initialBalance });
 
     const model = 'claude-opus-4-7';
-    const promptTokens = (premiumTokenValues as Record<string, Record<string, number>>)[model]
-      .threshold;
+    const promptTokens = 200000;
     const completionTokens = 500;
 
     const standardPromptRate = (tokenValues as Record<string, Record<string, number>>)[model]
@@ -519,7 +512,7 @@ describe('Multi-entry batch parity', () => {
     expect(balance.tokenCredits).toBeCloseTo(initialBalance - expectedTotalCost, 0);
   });
 
-  test('structured premium above threshold — batch vs individual produce same balance deduction', async () => {
+  test('structured large-context usage uses standard pricing in batch', async () => {
     const userId = new mongoose.Types.ObjectId().toString();
     const initialBalance = 100000000;
     await Balance.create({ user: userId, tokenCredits: initialBalance });
@@ -531,24 +524,21 @@ describe('Multi-entry batch parity', () => {
     };
     const totalInput = 215000;
 
-    const premiumPromptRate = (premiumTokenValues as Record<string, Record<string, number>>)[model]
+    const standardPromptRate = (tokenValues as Record<string, Record<string, number>>)[model]
       .prompt;
-    const premiumCompletionRate = (premiumTokenValues as Record<string, Record<string, number>>)[
-      model
-    ].completion;
+    const standardCompletionRate = (tokenValues as Record<string, Record<string, number>>)[model]
+      .completion;
     const writeMultiplier = getCacheMultiplier({ model, cacheType: 'write' });
     const readMultiplier = getCacheMultiplier({ model, cacheType: 'read' });
 
     const expectedPromptCost =
-      tokenUsage.promptTokens.input * premiumPromptRate +
+      tokenUsage.promptTokens.input * standardPromptRate +
       tokenUsage.promptTokens.write * writeMultiplier +
       tokenUsage.promptTokens.read * readMultiplier;
-    const expectedCompletionCost = tokenUsage.completionTokens * premiumCompletionRate;
+    const expectedCompletionCost = tokenUsage.completionTokens * standardCompletionRate;
     const expectedTotalCost = expectedPromptCost + expectedCompletionCost;
 
-    expect(totalInput).toBeGreaterThan(
-      (premiumTokenValues as Record<string, Record<string, number>>)[model].threshold,
-    );
+    expect(totalInput).toBeGreaterThan(200000);
 
     const entries = prepareStructuredTokenSpend(txMeta(userId, { model }), tokenUsage, pricing);
     await bulkWriteTransactions({ user: userId, docs: entries }, dbOps());

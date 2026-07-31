@@ -1,9 +1,10 @@
 import { useMemo } from 'react';
-import { getSettingsKeys } from 'librechat-data-provider';
+import { EModelEndpoint, getSettingsKeys } from 'librechat-data-provider';
 import type { SettingDefinition } from 'librechat-data-provider';
 import type { TModelSelectProps } from '~/common';
 import { componentMapping } from '~/components/SidePanel/Parameters/components';
 import { presetSettings } from 'librechat-data-provider';
+import { withModelCompatibleOptions } from '~/components/SidePanel/Parameters/modelCapabilities';
 
 export default function AnthropicSettings({
   conversation,
@@ -27,11 +28,18 @@ export default function AnthropicSettings({
     if (!setting) {
       return null;
     }
-    const Component = componentMapping[setting.component];
+    /* === VIVENTIUM START === Capability-filter Anthropic effort choices by selected model. === */
+    const compatibleSetting = withModelCompatibleOptions(
+      setting,
+      EModelEndpoint.anthropic,
+      conversation?.model ?? '',
+    );
+    /* === VIVENTIUM END === */
+    const Component = componentMapping[compatibleSetting.component];
     if (!Component) {
       return null;
     }
-    const { key, default: defaultValue, ...rest } = setting;
+    const { key, default: defaultValue, ...rest } = compatibleSetting;
 
     const props = {
       key,

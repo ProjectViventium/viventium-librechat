@@ -417,6 +417,46 @@ describe('viventium-seed-agents', () => {
     expect(result.drift).toEqual([]);
   });
 
+  test('treats a schema-default null as missing when a predecessor predates the fallback field', () => {
+    const result = reconcileManagedAgentFields(
+      {
+        fallback_llm_provider: null,
+        fallback_llm_model: null,
+        fallback_llm_model_parameters: undefined,
+      },
+      {
+        fallback_llm_provider: 'anthropic',
+        fallback_llm_model: 'claude-opus-5',
+        fallback_llm_model_parameters: {
+          model: 'claude-opus-5',
+          thinking: true,
+          effort: 'max',
+        },
+      },
+      {},
+    );
+
+    expect(result.agentData.fallback_llm_provider).toBe('anthropic');
+    expect(result.agentData.fallback_llm_model).toBe('claude-opus-5');
+    expect(result.agentData.fallback_llm_model_parameters).toEqual({
+      model: 'claude-opus-5',
+      thinking: true,
+      effort: 'max',
+    });
+    expect(result.drift).toEqual([]);
+  });
+
+  test('preserves an explicit null when the predecessor baseline managed that value', () => {
+    const result = reconcileManagedAgentFields(
+      { fallback_llm_model: null },
+      { fallback_llm_model: 'claude-opus-5' },
+      { fallback_llm_model: 'claude-opus-4-8' },
+    );
+
+    expect(result.agentData.fallback_llm_model).toBeNull();
+    expect(result.drift).toEqual(['fallback_llm_model']);
+  });
+
   test('preserves legacy unknown drift but establishes a deterministic non-personal baseline', () => {
     const incoming = {
       id: 'agent_viventium_main_95aeb3',

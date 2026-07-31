@@ -79,6 +79,19 @@ const AGENT_FIELDS = [
  * reconciles them; startup seeding should only create missing agents or fill missing fields.
  * === VIVENTIUM END === */
 const PRESERVE_EXISTING_EDITABLE_FIELDS = AGENT_FIELDS.filter((field) => field !== 'id');
+/* === VIVENTIUM START ===
+ * Feature: Historical managed-agent null-default recovery.
+ * Purpose: Schema-created nulls must not masquerade as user edits when the predecessor predates
+ * the newly managed provider/model field.
+ * === VIVENTIUM END === */
+const NULL_DEFAULT_EDITABLE_FIELDS = new Set([
+  'voice_llm_model',
+  'voice_llm_provider',
+  'voice_fallback_llm_model',
+  'voice_fallback_llm_provider',
+  'fallback_llm_model',
+  'fallback_llm_provider',
+]);
 
 const PUBLIC_ACCESS_ROLE_IDS = Object.freeze({
   viewer: {
@@ -737,6 +750,17 @@ function reconcileManagedAgentFields(existing, incoming, previousFields = null) 
     }
     const priorKnown =
       previousFields != null && Object.prototype.hasOwnProperty.call(previousFields, field);
+    /* === VIVENTIUM START === Historical managed-agent null-default recovery. === */
+    if (
+      !priorKnown &&
+      NULL_DEFAULT_EDITABLE_FIELDS.has(field) &&
+      existing[field] === null &&
+      incoming[field] != null
+    ) {
+      merged[field] = deepClone(incoming[field]);
+      continue;
+    }
+    /* === VIVENTIUM END === */
     const result = mergeManagedValue(
       priorKnown,
       previousFields?.[field],

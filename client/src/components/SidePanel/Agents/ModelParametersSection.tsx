@@ -16,6 +16,7 @@ import { useGetEndpointsQuery } from '~/data-provider';
 import { useLiveAnnouncer } from '~/Providers';
 import { useLocalize } from '~/hooks';
 import type { AgentForm } from '~/common';
+import { withModelCompatibleOptions } from '../Parameters/modelCapabilities';
 
 type ModelParameterFieldName =
   | 'model_parameters'
@@ -39,7 +40,8 @@ export default function ModelParametersSection({
   const localize = useLocalize();
   const { announcePolite } = useLiveAnnouncer();
   const { control, setValue } = useFormContext<AgentForm>();
-  const parameterValues = useWatch({ control, name: fieldName }) as AgentModelParameters | undefined;
+  const parameterValues = useWatch({ control, name: fieldName }) as
+    AgentModelParameters | undefined;
   const { data: endpointsConfig = {} } = useGetEndpointsQuery();
 
   const bedrockRegions = useMemo(
@@ -65,15 +67,17 @@ export default function ModelParametersSection({
     const overriddenParams = endpointsConfig[provider]?.customParams?.paramDefinitions ?? [];
     const overriddenParamsMap = keyBy(overriddenParams, 'key');
 
+    /* === VIVENTIUM START === Capability-filter Anthropic effort choices by selected model. === */
     return defaultParams
       .filter((param) => param != null)
-      .map((param) => (overriddenParamsMap[param.key] as SettingDefinition) ?? param);
+      .map((param) => (overriddenParamsMap[param.key] as SettingDefinition) ?? param)
+      .map((param) => withModelCompatibleOptions(param, overriddenEndpointKey, model));
+    /* === VIVENTIUM END === */
   }, [endpointType, endpointsConfig, model, provider]);
 
-  const setOption =
-    (optionKey: keyof AgentModelParameters) => (value: AgentParameterValue) => {
-      setValue(`${fieldName}.${optionKey}` as never, value as never);
-    };
+  const setOption = (optionKey: keyof AgentModelParameters) => (value: AgentParameterValue) => {
+    setValue(`${fieldName}.${optionKey}` as never, value as never);
+  };
 
   const handleResetParameters = () => {
     setValue(fieldName as never, {} as never);

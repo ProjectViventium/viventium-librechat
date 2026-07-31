@@ -351,12 +351,10 @@ const cacheTokenValues = {
  * @type {Object.<string, {threshold: number, prompt: number, completion: number}>}
  */
 const premiumTokenValues = {
-  'claude-opus-4-7': { threshold: 200000, prompt: 10, completion: 37.5 },
   /* === VIVENTIUM START ===
    * Feature: Launch-ready Anthropic model accounting.
-   * Purpose: Preserve premium-token threshold behavior for Opus 4.8.
+   * Purpose: Opus 4.7+ uses standard pricing across its full context window.
    * === VIVENTIUM END === */
-  'claude-opus-4-8': { threshold: 200000, prompt: 10, completion: 37.5 },
 };
 
 /**

@@ -50,6 +50,12 @@ describe('Viventium Claude Opus 5 release contract', () => {
       expect(agent.fallback_llm_model_parameters.model).toBe('claude-opus-5');
     }
 
+    for (const handoffAgent of source.handoffAgents ?? []) {
+      expect(handoffAgent.provider).toBe('anthropic');
+      expect(handoffAgent.model).toBe('claude-opus-5');
+      expect(handoffAgent.model_parameters.model).toBe('claude-opus-5');
+    }
+
     for (const cortex of source.mainAgent.background_cortices) {
       expect(cortex.activation.fallbacks).toContainEqual({
         provider: 'anthropic',

@@ -1895,6 +1895,17 @@ describe('Claude Model Tests', () => {
     );
   });
 
+  it('should return official prompt, completion, and cache rates for Claude Opus 5', () => {
+    expect(getValueKey('anthropic/claude-opus-5')).toBe('claude-opus-5');
+    expect(getMultiplier({ model: 'claude-opus-5', tokenType: 'prompt' })).toBe(5);
+    expect(getMultiplier({ model: 'claude-opus-5', tokenType: 'completion' })).toBe(25);
+    expect(getCacheMultiplier({ model: 'claude-opus-5', cacheType: 'write' })).toBe(6.25);
+    expect(getCacheMultiplier({ model: 'claude-opus-5', cacheType: 'read' })).toBe(0.5);
+    expect(premiumTokenValues['claude-opus-5']).toBeUndefined();
+    expect(getPremiumRate('claude-opus-5', 'prompt', 250000)).toBeNull();
+    expect(getPremiumRate('claude-opus-5', 'completion', 250000)).toBeNull();
+  });
+
   it('should handle Claude Opus 4.7 model name variations', () => {
     const modelVariations = [
       'claude-opus-4-7',

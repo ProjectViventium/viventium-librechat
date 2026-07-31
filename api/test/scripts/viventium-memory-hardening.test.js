@@ -3666,7 +3666,7 @@ describe('viventium-memory-hardening', () => {
     try {
       expect(resolveProvider({}).candidates).toEqual(
         expect.arrayContaining([
-          expect.objectContaining({ provider: 'anthropic', model: 'claude-opus-4-8' }),
+          expect.objectContaining({ provider: 'anthropic', model: 'claude-opus-5' }),
           expect.objectContaining({ provider: 'anthropic', model: 'opus' }),
         ]),
       );

@@ -1346,7 +1346,13 @@ const sharedOpenAIModels = [
 ];
 
 const sharedAnthropicModels = [
+  /* === VIVENTIUM START ===
+   * Feature: Claude Opus 5 direct endpoint.
+   * Purpose: Publish the canonical direct-API model while retaining explicit Opus 4.8 overrides.
+   */
+  'claude-opus-5',
   'claude-opus-4-8', // VIVENTIUM: opus-4.8 support (2026-05-29 eval; subscription-granted)
+  /* === VIVENTIUM END === */
   'claude-opus-4-7',
   'claude-opus-4-6',
   'claude-sonnet-4-5',

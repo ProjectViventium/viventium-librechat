@@ -35,6 +35,26 @@ function parseOpusVersion(model: string): { major: number; minor: number } | nul
   return null;
 }
 
+/** Checks whether the model uses the Opus 5+ default-thinking contract. */
+export function isOpus5OrLater(model: string): boolean {
+  const opus = parseOpusVersion(model);
+  return opus != null && opus.major >= 5;
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Current Anthropic sampling-parameter contract.
+ * Purpose: Centralize the model capability used to omit parameters rejected by the provider.
+ * === VIVENTIUM END === */
+export function rejectsNonDefaultSamplingParameters(model: string): boolean {
+  const opus = parseOpusVersion(model);
+  if (opus && (opus.major > 4 || (opus.major === 4 && opus.minor >= 7))) {
+    return true;
+  }
+
+  const sonnet = parseSonnetVersion(model);
+  return sonnet != null && sonnet.major >= 5;
+}
+
 /** Extracts sonnet major/minor version from both naming formats */
 function parseSonnetVersion(model: string): { major: number; minor: number } | null {
   const nameFirst = model.match(/claude-sonnet[-.]?(\d+)(?:[-.](\d+))?/);

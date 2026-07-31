@@ -2,13 +2,14 @@
 
 const DEFAULT_MODELS = {
   openAI: 'gpt-5.6-sol',
-  anthropic: 'claude-sonnet-4-5',
+  anthropic: 'claude-opus-5',
   xai: 'grok-4.20-non-reasoning',
   groq: 'qwen/qwen3.6-27b',
 };
 
 const APPROVED_MAIN_RUNTIME_FAMILIES = new Set([
   'openAI::gpt-5.6-sol',
+  'anthropic::claude-opus-5',
   'anthropic::claude-opus-4-8',
   'glasshive-harness::codex-cli:gpt-5.6-sol',
 ]);
@@ -16,6 +17,7 @@ const APPROVED_MAIN_RUNTIME_FAMILIES = new Set([
 const APPROVED_BACKGROUND_RUNTIME_FAMILIES = new Set([
   'openAI::gpt-5.6-sol',
   'openAI::gpt-5.6-terra',
+  'anthropic::claude-opus-5',
   'anthropic::claude-opus-4-8',
 ]);
 

@@ -1,9 +1,43 @@
 import {
+  isOpus5OrLater,
+  rejectsNonDefaultSamplingParameters,
   supportsAdaptiveThinking,
   bedrockOutputParser,
   bedrockInputParser,
   supportsContext1m,
 } from '../src/bedrock';
+
+describe('isOpus5OrLater', () => {
+  test('recognizes canonical, provider-prefixed, and alternate Opus 5 IDs', () => {
+    expect(isOpus5OrLater('claude-opus-5')).toBe(true);
+    expect(isOpus5OrLater('anthropic.claude-opus-5')).toBe(true);
+    expect(isOpus5OrLater('claude-5-opus')).toBe(true);
+  });
+
+  test('keeps Opus 4.8 on its earlier thinking contract', () => {
+    expect(isOpus5OrLater('claude-opus-4-8')).toBe(false);
+  });
+});
+
+describe('rejectsNonDefaultSamplingParameters', () => {
+  test.each([
+    'claude-opus-4-7',
+    'claude-opus-4-8',
+    'claude-opus-5',
+    'anthropic.claude-opus-5',
+    'claude-5-opus',
+    'claude-sonnet-5',
+  ])('recognizes %s', (model) => {
+    expect(rejectsNonDefaultSamplingParameters(model)).toBe(true);
+  });
+
+  test.each(['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-sonnet-4-5'])(
+    'does not over-restrict %s when thinking is disabled',
+    (model) => {
+      expect(rejectsNonDefaultSamplingParameters(model)).toBe(false);
+    },
+  );
+});
 
 describe('supportsAdaptiveThinking', () => {
   test('should return true for claude-opus-4-7', () => {

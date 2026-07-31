@@ -14,8 +14,9 @@
  * === VIVENTIUM END === */
 
 const XAI_TTS_CAPABILITIES = require('../../../../shared/voice/xai_tts_capabilities.json');
+const { parseDeliveryControls } = require('./deliveryControls');
 
-const ARTIFACT_CONTRACT_VERSION = '2026-05-31.3';
+const ARTIFACT_CONTRACT_VERSION = '2026-07-22.1';
 
 const KNOWN_MISSING_SPACE_JOINS = Object.freeze([]);
 
@@ -445,7 +446,9 @@ function sanitizeVoiceSurfaceTextForDisplay(text) {
     return '';
   }
 
-  let cleaned = text.replace(/\\n/g, '\n').replace(/\\r/g, '\r');
+  let cleaned = parseDeliveryControls(text).cleanText
+    .replace(/\\n/g, '\n')
+    .replace(/\\r/g, '\r');
   cleaned = cleaned.replace(INTERNAL_NO_RESPONSE_RE, '$1');
   cleaned = cleaned.replace(CODE_BLOCK_RE, (match) =>
     match.replace(/```[A-Za-z0-9_-]*\s*/g, '').replace(/```/g, ' '),
@@ -558,9 +561,62 @@ function sanitizeVoiceContentPartsForPersistence(contentParts = []) {
 }
 
 function sanitizeVoiceAssistantMessageForPersistence(req, message) {
-  if (req?.body?.voiceMode !== true || message?.isCreatedByUser === true) {
+  if (message?.isCreatedByUser === true) {
     return message;
   }
+
+  const isVoiceMode = req?.body?.voiceMode === true;
+  const isTelegram = String(req?.body?.viventiumSurface || '').toLowerCase() === 'telegram';
+  if (!isVoiceMode && !isTelegram) {
+    return message;
+  }
+
+  /* === VIVENTIUM START ===
+   * Feature: Clean Telegram delivery controls at the one-turn persistence boundary.
+   * Purpose: Preserve Markdown/content semantics while removing structural delivery and TTS markup.
+   * Added: 2026-07-22
+   * === VIVENTIUM END === */
+  if (isTelegram && !isVoiceMode) {
+    const audioRequested =
+      req?.body?.telegramAudioRequested === true ||
+      String(req?.body?.telegramAudioRequested || '').toLowerCase() === 'true';
+    const cleanTelegramText = (value) => {
+      const deliveryClean = parseDeliveryControls(value).cleanText;
+      return audioRequested ? stripVoiceControlTags(deliveryClean).trim() : deliveryClean;
+    };
+    const out = { ...message };
+    if (Array.isArray(out.content)) {
+      out.content = out.content.map((part) => {
+        if (!part || part.type !== 'text') {
+          return part;
+        }
+        if (typeof part.text === 'string') {
+          return { ...part, text: cleanTelegramText(part.text) };
+        }
+        if (part.text && typeof part.text === 'object') {
+          const raw =
+            typeof part.text.value === 'string'
+              ? part.text.value
+              : typeof part.text.text === 'string'
+                ? part.text.text
+                : '';
+          const cleaned = cleanTelegramText(raw);
+          return {
+            ...part,
+            text: {
+              ...part.text,
+              value: typeof part.text.value === 'string' ? cleaned : part.text.value,
+              text: typeof part.text.text === 'string' ? cleaned : part.text.text,
+            },
+          };
+        }
+        return part;
+      });
+    }
+    out.text = cleanTelegramText(typeof out.text === 'string' ? out.text : '');
+    return out;
+  }
+  /* === VIVENTIUM END === */
 
   const out = { ...message };
   if (Array.isArray(out.content)) {

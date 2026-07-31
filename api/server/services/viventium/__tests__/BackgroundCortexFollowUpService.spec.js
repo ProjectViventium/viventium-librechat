@@ -282,6 +282,28 @@ describe('formatFollowUpPrompt', () => {
     expect(prompt).not.toContain('WEB TEXT MODE:');
   });
 
+  test('teaches smart optional audio only to Telegram follow-ups that can attach audio', () => {
+    const base = {
+      insights: [{ cortexName: 'planner', insight: 'The synthetic draft is ready.' }],
+      recentResponse: 'I started checking it.',
+      voiceMode: false,
+      surface: 'telegram',
+    };
+
+    const textOnlyPrompt = formatFollowUpPrompt(base);
+    const audioEligiblePrompt = formatFollowUpPrompt({
+      ...base,
+      telegramAudioRequested: true,
+      voiceProvider: 'xai',
+    });
+
+    expect(textOnlyPrompt).toContain('{MSG_BREAK}');
+    expect(textOnlyPrompt).not.toContain('{SKIP_VOICE}');
+    expect(audioEligiblePrompt).toContain('{MSG_BREAK}');
+    expect(audioEligiblePrompt).toContain('{SKIP_VOICE}');
+    expect(audioEligiblePrompt).toContain('explicitly asks to hear, read aloud, speak');
+  });
+
   test('keeps Wing Mode follow-ups silence-first', () => {
     const prompt = formatFollowUpPrompt({
       insights: [

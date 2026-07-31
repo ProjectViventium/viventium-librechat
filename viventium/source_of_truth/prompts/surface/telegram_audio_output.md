@@ -2,13 +2,14 @@
 id: surface.telegram.audio_output
 owner_layer: viventium_surface
 target: surface.telegram.audio_output
-version: 2
+version: 3
 status: active
 safety_class: public_product
 required_context: []
 output_contract: telegram_text_with_audio_instructions
 includes:
   - surface.voice.feeling_expression
+  - surface.messaging.optional_audio
 ---
 
 TELEGRAM AUDIO OUTPUT:

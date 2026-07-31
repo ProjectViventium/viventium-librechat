@@ -43,6 +43,7 @@ const {
   resolveViventiumSurface,
   buildWebTextInstructions,
   buildTelegramTextInstructions,
+  buildTelegramAudioOutputInstructions,
   buildPlaygroundTextInstructions,
   stripVoiceControlTagsForDisplay,
 } = require('~/server/services/viventium/surfacePrompts');
@@ -89,6 +90,7 @@ const {
   attachConversationProviderCapabilityBundle,
   buildHarnessIdempotencyKey,
 } = require('~/server/services/viventium/GlassHiveConversationProviderService');
+const { parseDeliveryControls } = require('~/server/services/viventium/deliveryControls');
 
 function pinFeelingCapsuleLast({ instructions, capsule }) {
   const current = typeof instructions === 'string' ? instructions : '';
@@ -1684,6 +1686,8 @@ function formatFollowUpPrompt({
   continuationContext = '',
   voiceMode = false,
   surface = '',
+  telegramAudioRequested = false,
+  voiceProvider = '',
   primaryResponseMode = false,
 }) {
   if (!Array.isArray(insights) || insights.length === 0) {
@@ -1734,6 +1738,10 @@ function formatFollowUpPrompt({
    */
   const voiceRules = voiceMode ? buildVoiceFollowUpRules() : '';
   const telegramRules = surface === 'telegram' && !voiceMode ? buildTelegramTextInstructions() : '';
+  const telegramAudioRules =
+    surface === 'telegram' && !voiceMode && telegramAudioRequested
+      ? buildTelegramAudioOutputInstructions(voiceProvider)
+      : '';
   const webRules =
     !voiceMode && surface !== 'telegram' && surface !== 'playground'
       ? buildWebTextInstructions()
@@ -1750,7 +1758,14 @@ function formatFollowUpPrompt({
           '- Emotional resonance, general support, or “space to talk” is not enough to interrupt Wing Mode.',
         ].join('\n')
       : '';
-  const surfaceRules = [voiceRules, telegramRules, webRules, playgroundRules, wingRules]
+  const surfaceRules = [
+    voiceRules,
+    telegramRules,
+    telegramAudioRules,
+    webRules,
+    playgroundRules,
+    wingRules,
+  ]
     .filter(Boolean)
     .join('\n\n');
   /* === VIVENTIUM NOTE === */
@@ -2022,6 +2037,7 @@ async function promoteForcedFollowUpToEmptyParent({
   conversationId,
   parentMessageId,
   text,
+  telegramDeliveryControls,
   insightsData,
   forceVisibleFollowUp,
   scheduleId,
@@ -2069,6 +2085,7 @@ async function promoteForcedFollowUpToEmptyParent({
         replacedParentMessage: true,
         forceVisibleFollowUp: true,
         promotedToEmptyParent: true,
+        telegramDeliveryControls: telegramDeliveryControls || undefined,
         recoveredPrimaryErrorClasses:
           recoveredPrimaryErrorClasses.length > 0 ? recoveredPrimaryErrorClasses : undefined,
       },
@@ -2164,6 +2181,10 @@ async function generateFollowUpText({
 
   const voiceMode = isVoiceMode(req);
   const surface = resolveViventiumSurface(req);
+  const telegramAudioRequested =
+    req?.body?.telegramAudioRequested === true ||
+    String(req?.body?.telegramAudioRequested || '').toLowerCase() === 'true';
+  const voiceProvider = String(req?.body?.voiceProvider || '');
   if (surface === 'wing' && primaryResponseMode !== true) {
     return NO_RESPONSE_TAG;
   }
@@ -2175,6 +2196,8 @@ async function generateFollowUpText({
     continuationContext,
     voiceMode,
     surface,
+    telegramAudioRequested,
+    voiceProvider,
     primaryResponseMode,
   });
   if (!prompt) {
@@ -2464,6 +2487,15 @@ async function createCortexFollowUpMessage({
       finalContinuationContext.hasMovedOn || finalContinuationContext.lookupFailed,
   });
   text = resolvedText;
+  let telegramDeliveryControls = null;
+  if (surface === 'telegram' && !voiceMode) {
+    const delivery = parseDeliveryControls(text);
+    text = delivery.cleanText;
+    telegramDeliveryControls = {
+      skipVoice: delivery.skipVoice,
+      segments: delivery.segments,
+    };
+  }
 
   const followUpDecisionRecord = buildFollowUpDecisionRecord({
     req,
@@ -2494,6 +2526,7 @@ async function createCortexFollowUpMessage({
     conversationId,
     parentMessageId,
     text,
+    telegramDeliveryControls,
     insightsData,
     forceVisibleFollowUp: shouldForceVisibleFollowUp,
     scheduleId,
@@ -2556,6 +2589,9 @@ async function createCortexFollowUpMessage({
       cortexFollowUpDecision: compactDecisionRecordForMetadata(followUpDecisionRecord),
     },
   };
+  if (telegramDeliveryControls) {
+    metadata.viventium.telegramDeliveryControls = telegramDeliveryControls;
+  }
 
   const followUpMessage = {
     messageId,

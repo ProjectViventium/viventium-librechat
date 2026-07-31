@@ -12,13 +12,22 @@ describe('Viventium API finalization entrypoint contracts', () => {
   });
 
   test('clustered outer startup failures always terminate the failed worker', () => {
-    const outerCatch = clusteredSource.split('startServer().catch((err) => {', 2)[1];
+    const outerCatchStart = clusteredSource.indexOf('startServer().catch((err) => {');
+    const outerCatchEnd = clusteredSource.indexOf(
+      '/** Export app for testing purposes',
+      outerCatchStart,
+    );
+    const outerCatch = clusteredSource.slice(outerCatchStart, outerCatchEnd);
 
-    expect(outerCatch).toBeDefined();
+    expect(outerCatchStart).toBeGreaterThanOrEqual(0);
+    expect(outerCatchEnd).toBeGreaterThan(outerCatchStart);
     expect(outerCatch).toContain('if (upgradeFinalization.isArmed()) {');
     expect(outerCatch).toContain('upgradeFinalization.markFailed(err);');
     expect(outerCatch).toContain('process.exit(1);');
     expect(outerCatch).not.toContain('if (!upgradeFinalization.isArmed()) {');
+    expect(clusteredSource).toContain(
+      'if (!upgradeFinalization.isArmed()) {\n          throw startupError;',
+    );
   });
 
   test('clustered startup elects one receipt writer and backs off replacement failures', () => {

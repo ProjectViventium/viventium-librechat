@@ -155,6 +155,13 @@ describe('CollectedUsage - GenerationJobManager', () => {
     const job = await GenerationJobManager.createJob(streamId, 'user-1');
     GenerationJobManager.setContentParts(streamId, [
       { type: 'think', think: 'The harness started working.\n' },
+      {
+        type: 'harness_activity',
+        harness_activity: {
+          event: 'tool',
+          summary: 'The harness inspected the workspace.\n',
+        },
+      },
     ] as never[]);
     Object.defineProperty(job.abortController.signal, '_viventiumHarnessCancellationDelivery', {
       value: Promise.resolve({ delivered: true }),
@@ -167,8 +174,22 @@ describe('CollectedUsage - GenerationJobManager', () => {
       {
         type: 'harness_activity',
         harness_activity: {
+          event: 'reasoning-summary',
+          summary: 'The harness started working.\n',
+        },
+      },
+      {
+        type: 'harness_activity',
+        harness_activity: {
+          event: 'tool',
+          summary: 'The harness inspected the workspace.\n',
+        },
+      },
+      {
+        type: 'harness_activity',
+        harness_activity: {
           event: 'cancelled',
-          summary: 'The harness started working.\nThe harness turn was cancelled.\n',
+          summary: 'The harness turn was cancelled.\n',
         },
       },
     ]);

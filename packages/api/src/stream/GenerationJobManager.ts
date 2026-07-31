@@ -794,7 +794,8 @@ class GenerationJobManagerClass {
           }
         )._viventiumHarnessCancellationDelivery;
         if (cancellationDelivery) {
-          const deliveryResult = (await cancellationDelivery) as { delivered?: boolean } | undefined;
+          const deliveryResult = (await cancellationDelivery) as
+            { delivered?: boolean } | undefined;
           harnessCancellationDelivered = deliveryResult?.delivered === true;
         }
       }
@@ -809,36 +810,21 @@ class GenerationJobManagerClass {
      * Purpose: The abort save path bypasses the normal final content conversion. Preserve safe
      * activity summaries across refresh and never persist an internal `think` part for this turn.
      * === VIVENTIUM END === */
-    let cancellationAppended = false;
     const content = harnessCancellationDelivered
       ? rawContent.map((part) => {
-          if (part?.type !== 'think' && part?.type !== 'harness_activity') {
+          if (part?.type !== 'think') {
             return part;
           }
-          const harnessPart = part as unknown as {
-            harness_activity?: { summary?: unknown };
-          };
-          const previousSummary =
-            part.type === 'think'
-              ? typeof part.think === 'string'
-                ? part.think
-                : ''
-              : typeof harnessPart.harness_activity?.summary === 'string'
-                ? harnessPart.harness_activity.summary
-                : '';
-          cancellationAppended = true;
           return {
             type: 'harness_activity',
             harness_activity: {
-              event: 'cancelled',
-              summary: `${previousSummary}${
-                previousSummary && !previousSummary.endsWith('\n') ? '\n' : ''
-              }The harness turn was cancelled.\n`,
+              event: 'reasoning-summary',
+              summary: typeof part.think === 'string' ? part.think : '',
             },
           } as TMessageContentParts;
         })
       : rawContent;
-    if (harnessCancellationDelivered && !cancellationAppended) {
+    if (harnessCancellationDelivered) {
       content.push({
         type: 'harness_activity',
         harness_activity: {

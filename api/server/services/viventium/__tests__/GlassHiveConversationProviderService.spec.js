@@ -2,6 +2,9 @@ const { Constants } = require('librechat-data-provider');
 const crypto = require('crypto');
 
 const mockEmitChunk = jest.fn();
+jest.mock('@librechat/agents', () => ({
+  GraphEvents: { ON_REASONING_DELTA: 'on_reasoning_delta' },
+}));
 jest.mock('@librechat/api', () => ({
   GenerationJobManager: { emitChunk: mockEmitChunk },
 }));
@@ -52,6 +55,7 @@ describe('GlassHiveConversationProviderService', () => {
   test('delivers an intentional Stop to the exact authenticated main request', async () => {
     const abortController = new AbortController();
     const fetchImpl = jest.fn().mockResolvedValue({ ok: true });
+    const onDeliveryError = jest.fn();
     const req = {
       _viventiumHarnessExecutionEnabled: true,
       _viventiumHarnessActivityEnabled: true,
@@ -67,11 +71,13 @@ describe('GlassHiveConversationProviderService', () => {
         signal: abortController.signal,
         endpointConfig: { baseURL: 'http://glasshive.local/v1/', apiKey: 'synthetic-key' },
         fetchImpl,
+        onDeliveryError,
       }),
     ).toBe(true);
 
     abortController.abort('user_cancelled');
     await abortController.signal._viventiumHarnessCancellationDelivery;
+    await new Promise((resolve) => setImmediate(resolve));
 
     expect(fetchImpl).toHaveBeenCalledWith(
       'http://glasshive.local/v1/requests/by-idempotency/main%3Aresponse-1/cancel',
@@ -83,6 +89,7 @@ describe('GlassHiveConversationProviderService', () => {
         },
       }),
     );
+    expect(onDeliveryError).not.toHaveBeenCalled();
     expect(mockEmitChunk).toHaveBeenCalledWith(
       'stream-synthetic',
       expect.objectContaining({
@@ -101,6 +108,61 @@ describe('GlassHiveConversationProviderService', () => {
           },
         },
       }),
+    );
+  });
+
+  test('delivers an intentional Stop when the signal was already aborted before binding', async () => {
+    const abortController = new AbortController();
+    const fetchImpl = jest.fn().mockResolvedValue({ ok: true });
+    abortController.abort('user_cancelled');
+
+    expect(
+      bindHarnessCancellation({
+        req: {
+          _viventiumHarnessExecutionEnabled: true,
+          _viventiumHarnessIdempotencyKey: 'main:response-pre-aborted',
+          user: { id: 'user-synthetic' },
+        },
+        signal: abortController.signal,
+        endpointConfig: { baseURL: 'http://glasshive.local/v1', apiKey: 'synthetic-key' },
+        fetchImpl,
+      }),
+    ).toBe(true);
+
+    await expect(abortController.signal._viventiumHarnessCancellationDelivery).resolves.toEqual({
+      delivered: true,
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  test('acknowledges native cancellation without waiting for activity delivery', async () => {
+    const abortController = new AbortController();
+    const onDeliveryError = jest.fn();
+    mockEmitChunk.mockImplementationOnce(() => new Promise(() => {}));
+
+    bindHarnessCancellation({
+      req: {
+        _viventiumHarnessExecutionEnabled: true,
+        _viventiumHarnessActivityEnabled: true,
+        _viventiumHarnessIdempotencyKey: 'main:response-stalled-activity',
+        _resumableStreamId: 'stream-stalled-activity',
+        user: { id: 'user-synthetic' },
+      },
+      signal: abortController.signal,
+      endpointConfig: { baseURL: 'http://glasshive.local/v1', apiKey: 'synthetic-key' },
+      fetchImpl: jest.fn().mockResolvedValue({ ok: true }),
+      onDeliveryError,
+      activityDeliveryTimeoutMs: 1,
+    });
+
+    abortController.abort('user_cancelled');
+
+    await expect(abortController.signal._viventiumHarnessCancellationDelivery).resolves.toEqual({
+      delivered: true,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(onDeliveryError).toHaveBeenCalledWith(
+      expect.objectContaining({ message: 'GlassHive cancellation activity delivery timed out' }),
     );
   });
 

@@ -151,13 +151,27 @@ if (cluster.isMaster) {
 
   let activeWorkers = 0;
   const startTime = Date.now();
+  let finalizationReceiptWriterId = null;
+  let consecutiveStartupFailures = 0;
+  const workerStartedAt = new Map();
+
+  const forkWorker = ({ receiptWriter = false } = {}) => {
+    const worker = cluster.fork({
+      VIVENTIUM_POSTCOMMIT_RECEIPT_WRITER: receiptWriter ? '1' : '0',
+    });
+    workerStartedAt.set(worker.id, Date.now());
+    if (receiptWriter) {
+      finalizationReceiptWriterId = worker.id;
+    }
+    return worker;
+  };
 
   /** Flush Redis cache before starting workers */
   flushRedisCache()
     .then(() => {
       logger.info('Cache flushed, forking workers...');
       for (let i = 0; i < workers; i++) {
-        cluster.fork();
+        forkWorker({ receiptWriter: i === 0 });
       }
     })
     .catch((err) => {
@@ -186,11 +200,28 @@ if (cluster.isMaster) {
 
   cluster.on('exit', (worker, code, signal) => {
     activeWorkers--;
+    const wasReceiptWriter = worker.id === finalizationReceiptWriterId;
+    if (wasReceiptWriter) {
+      finalizationReceiptWriterId = null;
+    }
+    const workerLifetimeMs = Date.now() - (workerStartedAt.get(worker.id) || Date.now());
+    workerStartedAt.delete(worker.id);
+    if (workerLifetimeMs >= 60_000 || code === 0) {
+      consecutiveStartupFailures = 0;
+    } else {
+      consecutiveStartupFailures += 1;
+    }
+    const restartDelayMs =
+      code === 0
+        ? 0
+        : Math.min(500 * 2 ** Math.min(Math.max(consecutiveStartupFailures - 1, 0), 6), 30_000);
     logger.error(
       `Worker ${worker.process.pid} died (${activeWorkers}/${workers}). Code: ${code}, Signal: ${signal}`,
     );
-    logger.info('Starting a new worker to replace it...');
-    cluster.fork();
+    logger.info(`Starting a replacement worker in ${restartDelayMs}ms`);
+    setTimeout(() => {
+      forkWorker({ receiptWriter: wasReceiptWriter });
+    }, restartDelayMs);
   });
 
   /** Graceful shutdown on SIGTERM/SIGINT */
@@ -449,6 +480,9 @@ if (cluster.isMaster) {
         upgradeFinalization.recordCompleted('generation-runtime-ready');
         upgradeFinalization.markReady();
       } catch (startupError) {
+        if (!upgradeFinalization.isArmed()) {
+          throw startupError;
+        }
         try {
           upgradeFinalization.markFailed(startupError);
         } catch (receiptError) {
@@ -479,6 +513,9 @@ if (cluster.isMaster) {
   };
 
   startServer().catch((err) => {
+    if (!upgradeFinalization.isArmed()) {
+      throw err;
+    }
     try {
       upgradeFinalization.markFailed(err);
     } catch (receiptError) {

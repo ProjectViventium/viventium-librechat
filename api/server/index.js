@@ -402,6 +402,9 @@ const startServer = async () => {
       upgradeFinalization.recordCompleted('generation-runtime-ready');
       upgradeFinalization.markReady();
     } catch (startupError) {
+      if (!upgradeFinalization.isArmed()) {
+        throw startupError;
+      }
       try {
         upgradeFinalization.markFailed(startupError);
       } catch (receiptError) {
@@ -421,6 +424,9 @@ const startServer = async () => {
 };
 
 startServer().catch((startupError) => {
+  if (!upgradeFinalization.isArmed()) {
+    throw startupError;
+  }
   try {
     upgradeFinalization.markFailed(startupError);
   } catch (receiptError) {

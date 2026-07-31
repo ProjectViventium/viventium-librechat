@@ -163,6 +163,72 @@ describe('Viventium post-commit API finalization', () => {
     expect(ordinary.isReady()).toBe(true);
   });
 
+  test('rejects an armed quiesced process before any stage can run', () => {
+    expect(() =>
+      createUpgradeFinalization({
+        env: {
+          ...env,
+          VIVENTIUM_QUIESCED_API_STARTUP: '1',
+        },
+      }),
+    ).toThrow(/cannot be both armed and quiesced/i);
+  });
+
+  test('keeps non-writer cluster readiness local without touching the shared receipt', () => {
+    const finalization = createUpgradeFinalization({
+      env: {
+        ...env,
+        VIVENTIUM_POSTCOMMIT_RECEIPT_WRITER: '0',
+      },
+    });
+    const receiptPath = path.join(
+      supportDir,
+      'state',
+      'continuity',
+      'postcommit-api-finalization.json',
+    );
+
+    expect(finalization.isReceiptWriter()).toBe(false);
+    expect(finalization.beginAttempt()).toBe(1);
+    for (const stage of REQUIRED_STAGES) {
+      finalization.recordCompleted(stage);
+    }
+    finalization.markReady();
+
+    expect(finalization.isReady()).toBe(true);
+    expect(fs.existsSync(receiptPath)).toBe(false);
+  });
+
+  test('non-writer cluster progress cannot overwrite the authoritative ready receipt', () => {
+    const writer = createUpgradeFinalization({ env });
+    const nonWriter = createUpgradeFinalization({
+      env: {
+        ...env,
+        VIVENTIUM_POSTCOMMIT_RECEIPT_WRITER: '0',
+      },
+    });
+
+    writer.beginAttempt();
+    nonWriter.beginAttempt();
+    for (const stage of REQUIRED_STAGES) {
+      writer.recordCompleted(stage);
+    }
+    writer.markReady();
+    for (const stage of REQUIRED_STAGES) {
+      nonWriter.recordCompleted(stage);
+    }
+    nonWriter.markReady();
+
+    const receipt = JSON.parse(
+      fs.readFileSync(
+        path.join(supportDir, 'state', 'continuity', 'postcommit-api-finalization.json'),
+        'utf8',
+      ),
+    );
+    expect(receipt.status).toBe('ready');
+    expect(receipt.completed).toEqual(REQUIRED_STAGES);
+  });
+
   test('quiesced validation blocks ordinary routes without creating a receipt', () => {
     const finalization = createUpgradeFinalization({
       env: { VIVENTIUM_QUIESCED_API_STARTUP: '1' },

@@ -37,10 +37,14 @@ function createUpgradeFinalization({ env = process.env } = {}) {
   const appSupportDir = String(env.VIVENTIUM_APP_SUPPORT_DIR || '').trim();
   const quiesced = enabled(env.VIVENTIUM_QUIESCED_API_STARTUP);
   const armed = Boolean(runId || sourceId);
+  const receiptWriter = String(env.VIVENTIUM_POSTCOMMIT_RECEIPT_WRITER || '1').trim() !== '0';
 
   if (armed) {
     if (!RUN_ID_PATTERN.test(runId) || !SOURCE_ID_PATTERN.test(sourceId)) {
       throw new Error('Post-commit API finalization identity is incomplete or invalid');
+    }
+    if (quiesced) {
+      throw new Error('Post-commit API finalization cannot be both armed and quiesced');
     }
     if (!path.isAbsolute(appSupportDir)) {
       throw new Error('Post-commit API finalization requires an absolute App Support directory');
@@ -114,6 +118,9 @@ function createUpgradeFinalization({ env = process.env } = {}) {
   }
 
   function writeReceipt(payload) {
+    if (!receiptWriter) {
+      return;
+    }
     const directory = ensureReceiptDirectory();
     readReceipt();
     const temporaryPath = path.join(
@@ -285,6 +292,7 @@ function createUpgradeFinalization({ env = process.env } = {}) {
     health,
     isArmed: () => armed,
     isQuiesced: () => quiesced,
+    isReceiptWriter: () => receiptWriter,
     isReady,
     markFailed,
     markReady,

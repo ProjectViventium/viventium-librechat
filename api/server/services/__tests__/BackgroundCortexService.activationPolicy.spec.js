@@ -171,9 +171,17 @@ describe('BackgroundCortexService activation policy helpers', () => {
     const llmConfig = await buildActivationLlmConfig({
       providerName: 'groq',
       model: 'openai/gpt-oss-120b',
-      req: null,
+      req: {
+        config: {
+          endpoints: {
+            agents: { activationOpenAITransportProviders: ['groq'] },
+            custom: [],
+          },
+        },
+      },
     });
 
+    expect(llmConfig.provider).toBe('openAI');
     expect(llmConfig.temperature).toBeUndefined();
     expect(llmConfig.modelKwargs).toEqual({
       reasoning_effort: 'low',
@@ -187,9 +195,17 @@ describe('BackgroundCortexService activation policy helpers', () => {
     const llmConfig = await buildActivationLlmConfig({
       providerName: 'groq',
       model: 'qwen/qwen3.6-27b',
-      req: null,
+      req: {
+        config: {
+          endpoints: {
+            agents: { activationOpenAITransportProviders: ['groq'] },
+            custom: [],
+          },
+        },
+      },
     });
 
+    expect(llmConfig.provider).toBe('openAI');
     expect(llmConfig.temperature).toBe(0.1);
     expect(llmConfig.modelKwargs).toEqual({
       reasoning_effort: 'none',
@@ -1076,6 +1092,36 @@ describe('BackgroundCortexService activation policy helpers', () => {
 
     expect(llmConfig.temperature).toBeUndefined();
     expect(llmConfig.modelKwargs).toBeUndefined();
+  });
+
+  test('fails loudly when an activation provider cannot be resolved exactly', async () => {
+    await expect(
+      buildActivationLlmConfig({
+        providerName: 'missing-provider',
+        model: 'missing-model',
+        req: { user: { id: 'user-test' }, config: { endpoints: { custom: [] } } },
+      }),
+    ).rejects.toThrow('Unsupported or unavailable activation provider');
+  });
+
+  test('uses config rather than provider-name literals for OpenAI-compatible activation transport', async () => {
+    const llmConfig = await buildActivationLlmConfig({
+      providerName: 'synthetic-openai-transport',
+      model: 'synthetic-model',
+      req: {
+        config: {
+          endpoints: {
+            agents: {
+              activationOpenAITransportProviders: ['synthetic-openai-transport'],
+            },
+            custom: [],
+          },
+        },
+      },
+    });
+
+    expect(llmConfig.provider).toBe('openAI');
+    expect(llmConfig.model).toBe('synthetic-model');
   });
 
   test('adds a bounded guard grace around each Phase B cortex attempt', () => {

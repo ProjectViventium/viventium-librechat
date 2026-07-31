@@ -21,6 +21,7 @@ export type RequestBody = {
   viventiumSurface?: string;
   viventiumInputMode?: string;
   viventiumStreamId?: string;
+  viventiumGlassHiveIdempotencyKey?: string;
   viventiumVoiceRequestId?: string;
   viventiumVoiceCallSessionId?: string;
   viventiumTelegramChatId?: string;

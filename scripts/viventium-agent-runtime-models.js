@@ -10,6 +10,7 @@ const DEFAULT_MODELS = {
 const APPROVED_MAIN_RUNTIME_FAMILIES = new Set([
   'openAI::gpt-5.6-sol',
   'anthropic::claude-opus-4-8',
+  'glasshive-harness::codex-cli:gpt-5.6-sol',
 ]);
 
 const APPROVED_BACKGROUND_RUNTIME_FAMILIES = new Set([
@@ -392,20 +393,31 @@ function canonicalBuiltInBackgroundModelParameters(agentId, provider) {
   return canonical ? deepClone(canonical) : {};
 }
 
-function rewriteAgentForRuntime(agent, { env = process.env } = {}) {
+function rewriteAgentForRuntime(
+  agent,
+  { env = process.env, capabilityRequiredProviders = [] } = {},
+) {
   if (!agent?.id) {
     return agent;
   }
   let rewritten = deepClone(agent);
   const envMap = AGENT_RUNTIME_ENV_BY_ID[rewritten.id];
   if (envMap) {
-    const assignment = readRuntimeAssignment({
-      env,
-      ...envMap,
-      fallbackProvider: rewritten.provider,
-      fallbackModel: rewritten.model,
-      approvedFamilies: approvedRuntimeFamiliesForAgent(rewritten.id, { env }),
-    });
+    const requiredProviders = new Set(
+      (Array.isArray(capabilityRequiredProviders) ? capabilityRequiredProviders : [])
+        .map((provider) => normalizeProvider(provider))
+        .filter(Boolean),
+    );
+    const sourceProvider = normalizeProvider(rewritten.provider);
+    const assignment = requiredProviders.has(sourceProvider)
+      ? null
+      : readRuntimeAssignment({
+          env,
+          ...envMap,
+          fallbackProvider: rewritten.provider,
+          fallbackModel: rewritten.model,
+          approvedFamilies: approvedRuntimeFamiliesForAgent(rewritten.id, { env }),
+        });
     if (assignment) {
       rewritten.provider = assignment.provider;
       rewritten.model = assignment.model;
@@ -727,11 +739,17 @@ function hasCanonicalPersistedAgentFieldDrift(existingAgent, patch) {
   });
 }
 
-function normalizeBundleForRuntime(bundle, { env = process.env } = {}) {
+function normalizeBundleForRuntime(
+  bundle,
+  { env = process.env, capabilityRequiredProviders = [] } = {},
+) {
   const normalized = deepClone(bundle);
 
   if (normalized.mainAgent) {
-    normalized.mainAgent = rewriteAgentForRuntime(normalized.mainAgent, { env });
+    normalized.mainAgent = rewriteAgentForRuntime(normalized.mainAgent, {
+      env,
+      capabilityRequiredProviders,
+    });
     normalized.mainAgent.background_cortices = rewriteBackgroundCortices(
       normalized.mainAgent.background_cortices,
       { env },
@@ -740,7 +758,7 @@ function normalizeBundleForRuntime(bundle, { env = process.env } = {}) {
 
   if (Array.isArray(normalized.backgroundAgents)) {
     normalized.backgroundAgents = normalized.backgroundAgents.map((agent) =>
-      rewriteAgentForRuntime(agent, { env }),
+      rewriteAgentForRuntime(agent, { env, capabilityRequiredProviders }),
     );
   }
 

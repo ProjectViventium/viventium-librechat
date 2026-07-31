@@ -23,6 +23,7 @@ jest.mock('@librechat/agents', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  createSafeUser: jest.fn((user) => user),
   initializeAnthropic: jest.fn(async ({ model_parameters }) => ({
     llmConfig: {
       model: model_parameters?.model ?? 'claude-sonnet-4-5',
@@ -49,6 +50,7 @@ jest.mock('@librechat/api', () => ({
       },
     },
   })),
+  resolveHeaders: jest.fn(({ headers }) => headers),
 }));
 
 jest.mock('~/server/services/BackgroundCortexService', () => ({
@@ -71,6 +73,7 @@ const db = require('~/models');
 const { getAgent } = require('~/models/Agent');
 const { initializeAnthropic, initializeOpenAI } = require('@librechat/api');
 const { Run } = require('@librechat/agents');
+const { getCustomEndpointConfig } = require('~/server/services/BackgroundCortexService');
 const {
   cleanFallbackInsightText,
   getVisibleFallbackInsightTexts,
@@ -501,6 +504,41 @@ describe('BackgroundCortexFollowUpService', () => {
       }),
       expect.any(Object),
     );
+  });
+
+  test('persists clean Telegram follow-up text with structured delivery metadata', async () => {
+    const req = {
+      user: { id: 'u1' },
+      body: { viventiumSurface: 'telegram', telegramAudioRequested: true },
+    };
+    db.saveMessage.mockResolvedValue({});
+    Run.create.mockResolvedValueOnce({
+      processStream: jest.fn(async () => 'First beat.\n{MSG_BREAK}\nSecond beat.\n{SKIP_VOICE}'),
+    });
+
+    const msg = await createCortexFollowUpMessage({
+      req,
+      conversationId: 'c-telegram',
+      parentMessageId: 'm-parent',
+      agent: {
+        id: 'agent_123',
+        provider: 'openai',
+        model: 'gpt-4o-mini',
+        model_parameters: {},
+      },
+      insightsData: {
+        cortexCount: 1,
+        insights: [{ cortexName: 'Planner', insight: 'Two useful beats are ready.' }],
+      },
+    });
+
+    expect(msg.text).toBe('First beat.\n\nSecond beat.');
+    expect(msg.metadata.viventium.telegramDeliveryControls).toEqual({
+      skipVoice: true,
+      segments: ['First beat.', 'Second beat.'],
+    });
+    expect(JSON.stringify(msg)).not.toContain('{MSG_BREAK}');
+    expect(JSON.stringify(msg)).not.toContain('{SKIP_VOICE}');
   });
 
   test('resolveConversationLeafMessageId prefers the actual leaf over the last-written ancestor row', () => {
@@ -1089,6 +1127,77 @@ describe('BackgroundCortexFollowUpService', () => {
     );
   });
 
+  test('promotes clean Telegram text with structured controls onto an empty canonical parent', async () => {
+    const req = {
+      user: { id: 'u1' },
+      body: { viventiumSurface: 'telegram', telegramAudioRequested: true },
+    };
+    db.getMessages.mockResolvedValueOnce([
+      { messageId: 'm-parent', parentMessageId: 'u-message', sender: 'AI', text: '' },
+    ]);
+    db.getMessage.mockResolvedValue({
+      messageId: 'm-parent',
+      conversationId: 'c-telegram',
+      parentMessageId: 'u-message',
+      sender: 'Viventium',
+      text: '',
+      unfinished: true,
+      content: [
+        {
+          type: 'cortex_insight',
+          cortex_id: 'agent_123',
+          cortex_name: 'Planner',
+          status: 'complete',
+          insight: 'Two useful beats are ready.',
+        },
+      ],
+      metadata: { viventium: { existing: true } },
+    });
+    db.updateMessage.mockResolvedValue({});
+    Run.create.mockResolvedValueOnce({
+      processStream: jest.fn(async () => 'First beat.\n{MSG_BREAK}\nSecond beat.\n{SKIP_VOICE}'),
+    });
+
+    const msg = await createCortexFollowUpMessage({
+      req,
+      conversationId: 'c-telegram',
+      parentMessageId: 'm-parent',
+      agent: {
+        id: 'agent_123',
+        provider: 'openai',
+        model: 'gpt-5.4',
+        model_parameters: {},
+      },
+      insightsData: {
+        cortexCount: 1,
+        insights: [{ cortexName: 'Planner', insight: 'Two useful beats are ready.' }],
+      },
+      recentResponse: '',
+      forceVisibleFollowUp: true,
+    });
+
+    const promoted = db.updateMessage.mock.calls.find(
+      ([, update]) => update?.metadata?.viventium?.promotedToEmptyParent === true,
+    )?.[1];
+    expect(promoted).toEqual(
+      expect.objectContaining({
+        text: 'First beat.\n\nSecond beat.',
+        content: expect.arrayContaining([{ type: 'text', text: 'First beat.\n\nSecond beat.' }]),
+        metadata: expect.objectContaining({
+          viventium: expect.objectContaining({
+            telegramDeliveryControls: {
+              skipVoice: true,
+              segments: ['First beat.', 'Second beat.'],
+            },
+          }),
+        }),
+      }),
+    );
+    expect(JSON.stringify(promoted)).not.toContain('{MSG_BREAK}');
+    expect(JSON.stringify(promoted)).not.toContain('{SKIP_VOICE}');
+    expect(msg.text).toBe('First beat.\n\nSecond beat.');
+  });
+
   test('createCortexFollowUpMessage saves forced follow-up with best insight when synthesis returns NTA', async () => {
     const req = { user: { id: 'u1' } };
     db.getMessages.mockResolvedValueOnce([
@@ -1606,6 +1715,69 @@ describe('BackgroundCortexFollowUpService', () => {
       }),
     );
     expect(runInstance.processStream).toHaveBeenCalled();
+  });
+
+  test('generateFollowUpText gives a custom OpenAI-compatible endpoint a top-level API key', async () => {
+    getCustomEndpointConfig.mockResolvedValueOnce({
+      apiKey: 'glasshive-provider-key',
+      baseURL: 'http://127.0.0.1:8766/v1',
+      defaultHeaders: { 'X-Existing': 'kept' },
+      dropParams: ['temperature', 'max_tokens'],
+    });
+    const req = {
+      user: { id: 'u1' },
+      body: { conversationId: 'conversation-1', messageId: 'message-1' },
+      config: {
+        endpoints: {
+          agents: {
+            providerCapabilities: {
+              'glasshive-harness': {
+                phase_b_followup: true,
+                workspace_binding: true,
+              },
+            },
+          },
+        },
+      },
+    };
+
+    await generateFollowUpText({
+      req,
+      agent: {
+        id: 'agent-glasshive-main',
+        endpoint: 'glasshive-harness',
+        provider: 'openAI',
+        model: 'codex-cli:gpt-5.6-sol',
+        tools: [],
+        model_parameters: { reasoning_effort: 'medium' },
+        glasshive_options: {
+          workspace: { mode: 'life' },
+          access: 'workspace',
+        },
+      },
+      insightsData: {
+        insights: [{ cortexName: 'Risk', insight: 'A rollback plan is required.' }],
+      },
+      recentResponse: 'I am reviewing it.',
+      runId: 'message-1',
+      conversationId: 'conversation-1',
+      parentMessageId: 'message-1',
+    });
+
+    const runCall = Run.create.mock.calls.at(-1)[0];
+    expect(runCall.graphConfig.llmConfig).toEqual(
+      expect.objectContaining({
+        provider: 'openai',
+        apiKey: 'glasshive-provider-key',
+        configuration: expect.objectContaining({
+          baseURL: 'http://127.0.0.1:8766/v1',
+          defaultHeaders: expect.objectContaining({ 'X-Existing': 'kept' }),
+        }),
+      }),
+    );
+    expect(runCall.graphConfig.llmConfig.configuration).not.toHaveProperty('apiKey');
+    expect(runCall.graphConfig.llmConfig).not.toHaveProperty('maxTokens');
+    expect(runCall.graphConfig.llmConfig).not.toHaveProperty('temperature');
   });
 
   test('generateFollowUpText keeps governed OpenAI fallback when agent model metadata is missing', async () => {

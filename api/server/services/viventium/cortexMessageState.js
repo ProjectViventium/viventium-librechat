@@ -281,6 +281,11 @@ async function getFollowUpMessageForParent({ userId, conversationId, parentMessa
   return {
     messageId: lastFollowUp.messageId,
     text,
+    deliveryControls:
+      lastFollowUp?.metadata?.viventium?.telegramDeliveryControls &&
+      typeof lastFollowUp.metadata.viventium.telegramDeliveryControls === 'object'
+        ? lastFollowUp.metadata.viventium.telegramDeliveryControls
+        : undefined,
   };
 }
 

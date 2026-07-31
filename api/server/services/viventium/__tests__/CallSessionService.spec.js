@@ -604,4 +604,38 @@ describe('CallSessionService', () => {
       },
     });
   });
+
+  test('keeps a capability-required GlassHive Main in call-session route disclosure', async () => {
+    const user = await User.create({
+      name: 'Harness Route User',
+      email: 'harness-route@example.com',
+      provider: 'local',
+    });
+    await Agent.create({
+      id: 'agent_viventium_main_95aeb3',
+      name: 'Main Agent',
+      provider: 'glasshive-harness',
+      model: 'codex-cli:gpt-5.6-sol',
+      model_parameters: {
+        model: 'codex-cli:gpt-5.6-sol',
+        reasoning_effort: 'medium',
+      },
+      author: user._id.toString(),
+      versions: [],
+    });
+    const created = await createCallSession({
+      userId: user._id.toString(),
+      agentId: 'agent_viventium_main_95aeb3',
+      conversationId: 'new',
+    });
+
+    const settings = await getCallSessionVoiceSettings(created.callSessionId, {
+      capabilityRequiredProviders: ['glasshive-harness'],
+    });
+
+    expect(settings.assistantRoute.primary).toEqual({
+      provider: 'glasshive-harness',
+      model: 'codex-cli:gpt-5.6-sol',
+    });
+  });
 });

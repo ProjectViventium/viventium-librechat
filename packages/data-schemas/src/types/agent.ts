@@ -63,6 +63,12 @@ export interface IAgent extends Omit<Document, 'model'> {
   provider: string;
   model: string;
   model_parameters?: Record<string, unknown>;
+  /* === VIVENTIUM START === GlassHive core Agent provider */
+  glasshive_options?: {
+    workspace: { mode: 'life' | 'custom'; path?: string };
+    access: 'full' | 'workspace';
+  };
+  /* === VIVENTIUM END === */
   artifacts?: string;
   access_level?: number;
   recursion_limit?: number;

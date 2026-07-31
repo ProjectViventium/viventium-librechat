@@ -8,6 +8,9 @@ const { logger } = require('@librechat/data-schemas');
 const {
   agentCreateSchema,
   agentUpdateSchema,
+  /* VIVENTIUM START: exact provider/model enforcement for Agent writes and reverts. */
+  applyAgentProviderCapabilityDefaults,
+  /* VIVENTIUM END */
   refreshListAvatars,
   mergeAgentOcrConversion,
   MAX_AVATAR_REFRESH_AGENTS,
@@ -79,13 +82,24 @@ const escapeRegex = (str = '') => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
  */
 const createAgentHandler = async (req, res) => {
   try {
-    const validatedData = agentCreateSchema.parse(req.body);
+    /* === VIVENTIUM START ===
+     * Feature: Fail-closed provider selection on Agent creation.
+     */
+    const validatedData = applyAgentProviderCapabilityDefaults(
+      agentCreateSchema.parse(req.body),
+      req.config?.endpoints?.agents?.providerCapabilities,
+      req.config?.endpoints?.agents?.capabilityRequiredProviders,
+    );
+    /* === VIVENTIUM END === */
     const { tools = [], ...agentData } = removeNullishValues(validatedData);
 
     if (agentData.model_parameters && typeof agentData.model_parameters === 'object') {
       agentData.model_parameters = removeNullishValues(agentData.model_parameters, true);
     }
-    if (agentData.voice_llm_model_parameters && typeof agentData.voice_llm_model_parameters === 'object') {
+    if (
+      agentData.voice_llm_model_parameters &&
+      typeof agentData.voice_llm_model_parameters === 'object'
+    ) {
       agentData.voice_llm_model_parameters = removeNullishValues(
         agentData.voice_llm_model_parameters,
         true,
@@ -368,6 +382,29 @@ const updateAgentHandler = async (req, res) => {
       return res.status(404).json({ error: 'Agent not found' });
     }
 
+    /* === VIVENTIUM START ===
+     * Feature: Server-side provider role enforcement.
+     * Purpose: Validate primary, voice, fallback, and Phase A provider roles on every update,
+     * including API/source-sync updates that bypass Agent Builder filters.
+     * === VIVENTIUM END === */
+    const providerSelectionTouched = [
+      'provider',
+      'model',
+      'model_parameters',
+      'glasshive_options',
+    ].some((field) => Object.prototype.hasOwnProperty.call(validatedData, field));
+    const validatedSelection = applyAgentProviderCapabilityDefaults(
+      { ...existingAgent, ...updateData },
+      req.config?.endpoints?.agents?.providerCapabilities,
+      req.config?.endpoints?.agents?.capabilityRequiredProviders,
+    );
+    if (providerSelectionTouched) {
+      updateData.model_parameters = validatedSelection.model_parameters;
+      if (validatedSelection.glasshive_options) {
+        updateData.glasshive_options = validatedSelection.glasshive_options;
+      }
+    }
+
     // Convert legacy OCR tool resource to context format in existing agent
     const ocrConversion = mergeAgentOcrConversion(existingAgent, updateData);
     if (ocrConversion.tool_resources) {
@@ -420,12 +457,14 @@ const updateAgentHandler = async (req, res) => {
 
     logger.error('[/Agents/:id] Error updating Agent', error);
 
-    if (error.statusCode === 409) {
-      return res.status(409).json({
+    /* VIVENTIUM START: preserve visible validation failures instead of returning a generic 500. */
+    if (error.statusCode === 400 || error.statusCode === 409) {
+      return res.status(error.statusCode).json({
         error: error.message,
         details: error.details,
       });
     }
+    /* VIVENTIUM END */
 
     res.status(500).json({ error: error.message });
   }
@@ -535,7 +574,17 @@ const duplicateAgentHandler = async (req, res) => {
 
     const agentActions = await Promise.all(promises);
     newAgentData.actions = agentActions;
-    const newAgent = await createAgent(newAgentData);
+    /* === VIVENTIUM START ===
+     * Feature: Provider-safe Agent duplication.
+     * Purpose: A copied historical provider/model tuple must pass the same exact capability and
+     * model validation as create/update/revert before it becomes executable.
+     * === VIVENTIUM END === */
+    const validatedNewAgentData = applyAgentProviderCapabilityDefaults(
+      newAgentData,
+      req.config?.endpoints?.agents?.providerCapabilities,
+      req.config?.endpoints?.agents?.capabilityRequiredProviders,
+    );
+    const newAgent = await createAgent(validatedNewAgentData);
 
     try {
       await Promise.all([
@@ -573,7 +622,7 @@ const duplicateAgentHandler = async (req, res) => {
   } catch (error) {
     logger.error('[/Agents/:id/duplicate] Error duplicating Agent:', error);
 
-    res.status(500).json({ error: error.message });
+    res.status(error instanceof z.ZodError ? 400 : 500).json({ error: error.message });
   }
 };
 
@@ -675,33 +724,33 @@ const getListAgentsHandler = async (req, res) => {
      * Refresh all S3 avatars for this user's accessible agent set (not only the current page)
      * This addresses page-size limits preventing refresh of agents beyond the first page
      */
-	    const cache = getLogStores(CacheKeys.S3_EXPIRY_INTERVAL);
-	    const refreshKey = `${userId}:agents_avatar_refresh`;
-	    let cachedRefresh = await cache.get(refreshKey);
-	    const isValidCachedRefresh =
-	      cachedRefresh != null && typeof cachedRefresh === 'object' && cachedRefresh.urlCache != null;
-	    if (!isValidCachedRefresh) {
-	      try {
-	        const fullList = await getListAgentsByAccess({
-	          accessibleIds: combinedAccessibleIds,
-	          otherParams: {},
-	          limit: MAX_AVATAR_REFRESH_AGENTS,
-	          after: null,
-	        });
-	        const { urlCache } = await refreshListAvatars({
-	          agents: fullList?.data ?? [],
-	          userId,
-	          refreshS3Url,
-	          updateAgent,
-	        });
-	        cachedRefresh = { urlCache };
-	        await cache.set(refreshKey, cachedRefresh, Time.THIRTY_MINUTES);
-	      } catch (err) {
-	        logger.error('[/Agents] Error refreshing avatars for full list: %o', err);
-	      }
-	    } else {
-	      logger.debug('[/Agents] S3 avatar refresh already checked, skipping');
-	    }
+    const cache = getLogStores(CacheKeys.S3_EXPIRY_INTERVAL);
+    const refreshKey = `${userId}:agents_avatar_refresh`;
+    let cachedRefresh = await cache.get(refreshKey);
+    const isValidCachedRefresh =
+      cachedRefresh != null && typeof cachedRefresh === 'object' && cachedRefresh.urlCache != null;
+    if (!isValidCachedRefresh) {
+      try {
+        const fullList = await getListAgentsByAccess({
+          accessibleIds: combinedAccessibleIds,
+          otherParams: {},
+          limit: MAX_AVATAR_REFRESH_AGENTS,
+          after: null,
+        });
+        const { urlCache } = await refreshListAvatars({
+          agents: fullList?.data ?? [],
+          userId,
+          refreshS3Url,
+          updateAgent,
+        });
+        cachedRefresh = { urlCache };
+        await cache.set(refreshKey, cachedRefresh, Time.THIRTY_MINUTES);
+      } catch (err) {
+        logger.error('[/Agents] Error refreshing avatars for full list: %o', err);
+      }
+    } else {
+      logger.debug('[/Agents] S3 avatar refresh already checked, skipping');
+    }
 
     // Use the new ACL-aware function
     const data = await getListAgentsByAccess({
@@ -717,25 +766,25 @@ const getListAgentsHandler = async (req, res) => {
       return res.json(data);
     }
 
-	    const publicSet = new Set(publiclyAccessibleIds.map((oid) => oid.toString()));
-	    const urlCache = cachedRefresh?.urlCache;
+    const publicSet = new Set(publiclyAccessibleIds.map((oid) => oid.toString()));
+    const urlCache = cachedRefresh?.urlCache;
 
-	    data.data = agents.map((agent) => {
-	      try {
-	        if (agent?._id && publicSet.has(agent._id.toString())) {
-	          agent.isPublic = true;
-	        }
-	        if (
-	          urlCache &&
-	          agent?.id &&
-	          agent?.avatar?.source === FileSources.s3 &&
-	          urlCache[agent.id]
-	        ) {
-	          agent.avatar = { ...agent.avatar, filepath: urlCache[agent.id] };
-	        }
-	      } catch (e) {
-	        // Silently ignore mapping errors
-	        void e;
+    data.data = agents.map((agent) => {
+      try {
+        if (agent?._id && publicSet.has(agent._id.toString())) {
+          agent.isPublic = true;
+        }
+        if (
+          urlCache &&
+          agent?.id &&
+          agent?.avatar?.source === FileSources.s3 &&
+          urlCache[agent.id]
+        ) {
+          agent.avatar = { ...agent.avatar, filepath: urlCache[agent.id] };
+        }
+      } catch (e) {
+        // Silently ignore mapping errors
+        void e;
       }
       return agent;
     });
@@ -815,18 +864,18 @@ const uploadAgentAvatarHandler = async (req, res) => {
       },
     };
 
-	    const updatedAgent = await updateAgent({ id: agent_id }, data, {
-	      updatingUserId: req.user.id,
-	    });
+    const updatedAgent = await updateAgent({ id: agent_id }, data, {
+      updatingUserId: req.user.id,
+    });
 
-	    try {
-	      const avatarCache = getLogStores(CacheKeys.S3_EXPIRY_INTERVAL);
-	      await avatarCache.delete(`${req.user.id}:agents_avatar_refresh`);
-	    } catch (cacheErr) {
-	      logger.error('[/:agent_id/avatar] Error invalidating avatar refresh cache', cacheErr);
-	    }
+    try {
+      const avatarCache = getLogStores(CacheKeys.S3_EXPIRY_INTERVAL);
+      await avatarCache.delete(`${req.user.id}:agents_avatar_refresh`);
+    } catch (cacheErr) {
+      logger.error('[/:agent_id/avatar] Error invalidating avatar refresh cache', cacheErr);
+    }
 
-	    res.status(201).json(updatedAgent);
+    res.status(201).json(updatedAgent);
   } catch (error) {
     const message = 'An error occurred while updating the Agent Avatar';
     logger.error(
@@ -879,7 +928,23 @@ const revertAgentVersionHandler = async (req, res) => {
 
     // Permissions are enforced via route middleware (ACL EDIT)
 
-    const updatedAgent = await revertAgentVersion({ id }, version_index);
+    /* === VIVENTIUM START ===
+     * Feature: Provider-safe version reverts.
+     * Purpose: Old versions must pass current exact model/capability policy before restore.
+     */
+    const revertCandidate = existingAgent.versions?.[version_index];
+    if (!revertCandidate) {
+      return res.status(404).json({ error: `Version ${version_index} not found` });
+    }
+    const validatedVersion = applyAgentProviderCapabilityDefaults(
+      typeof revertCandidate.toObject === 'function'
+        ? revertCandidate.toObject()
+        : { ...revertCandidate },
+      req.config?.endpoints?.agents?.providerCapabilities,
+      req.config?.endpoints?.agents?.capabilityRequiredProviders,
+    );
+    const updatedAgent = await revertAgentVersion({ id }, version_index, validatedVersion);
+    /* === VIVENTIUM END === */
 
     if (updatedAgent.author) {
       updatedAgent.author = updatedAgent.author.toString();
@@ -892,7 +957,9 @@ const revertAgentVersionHandler = async (req, res) => {
     return res.json(updatedAgent);
   } catch (error) {
     logger.error('[/agents/:id/revert] Error reverting Agent version', error);
-    res.status(500).json({ error: error.message });
+    /* VIVENTIUM START: capability validation errors are user-correctable 400s. */
+    res.status(error instanceof z.ZodError ? 400 : 500).json({ error: error.message });
+    /* VIVENTIUM END */
   }
 };
 /**

@@ -23,6 +23,7 @@ describe('viventium-agent-runtime-models', () => {
     expect([...APPROVED_MAIN_RUNTIME_FAMILIES]).toEqual([
       'openAI::gpt-5.6-sol',
       'anthropic::claude-opus-4-8',
+      'glasshive-harness::codex-cli:gpt-5.6-sol',
     ]);
     expect([...APPROVED_BACKGROUND_RUNTIME_FAMILIES]).toEqual([
       'openAI::gpt-5.6-sol',
@@ -118,6 +119,58 @@ describe('viventium-agent-runtime-models', () => {
     expect(normalized.mainAgent.background_cortices[0].activation.model).toBe('qwen/qwen3.6-27b');
     expect(normalized.mainAgent.background_cortices[1].activation.provider).toBe('groq');
     expect(normalized.mainAgent.background_cortices[1].activation.model).toBe('qwen/qwen3.6-27b');
+  });
+
+  test('preserves a capability-required provider instead of coercing it to the runtime foundation family', () => {
+    const bundle = {
+      mainAgent: {
+        id: 'agent_viventium_main_95aeb3',
+        provider: 'glasshive-harness',
+        model: 'codex-cli:gpt-5.6-sol',
+        model_parameters: {
+          model: 'codex-cli:gpt-5.6-sol',
+          reasoning_effort: 'medium',
+        },
+      },
+    };
+
+    const normalized = normalizeBundleForRuntime(bundle, {
+      env: {
+        VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER: 'openai',
+        VIVENTIUM_FC_CONSCIOUS_LLM_MODEL: 'gpt-5.6-sol',
+      },
+      capabilityRequiredProviders: ['glasshive-harness'],
+    });
+
+    expect(normalized.mainAgent).toMatchObject({
+      provider: 'glasshive-harness',
+      model: 'codex-cli:gpt-5.6-sol',
+      model_parameters: {
+        model: 'codex-cli:gpt-5.6-sol',
+        reasoning_effort: 'medium',
+      },
+    });
+  });
+
+  test('uses the runtime foundation family when a source provider is not capability-required', () => {
+    const bundle = {
+      mainAgent: {
+        id: 'agent_viventium_main_95aeb3',
+        provider: 'glasshive-harness',
+        model: 'codex-cli:gpt-5.6-sol',
+      },
+    };
+
+    const normalized = normalizeBundleForRuntime(bundle, {
+      env: {
+        VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER: 'openai',
+        VIVENTIUM_FC_CONSCIOUS_LLM_MODEL: 'gpt-5.6-sol',
+      },
+      capabilityRequiredProviders: [],
+    });
+
+    expect(normalized.mainAgent.provider).toBe('openAI');
+    expect(normalized.mainAgent.model).toBe('gpt-5.6-sol');
   });
 
   test('rejects non-approved built-in runtime assignments and preserves shipped launch bundle families', () => {

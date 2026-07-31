@@ -33,6 +33,14 @@ const agentSchema = new Schema<IAgent>(
     model_parameters: {
       type: Object,
     },
+    /* === VIVENTIUM START ===
+     * Feature: GlassHive core Agent provider
+     * Purpose: Persist the provider's typed workspace and access binding on the normal Agent.
+     * === VIVENTIUM END === */
+    glasshive_options: {
+      type: Schema.Types.Mixed,
+      default: undefined,
+    },
     artifacts: {
       type: String,
     },

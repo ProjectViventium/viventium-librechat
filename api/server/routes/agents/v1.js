@@ -1,6 +1,11 @@
 const express = require('express');
-const { generateCheckAccess } = require('@librechat/api');
-const { PermissionTypes, Permissions, PermissionBits } = require('librechat-data-provider');
+const { generateCheckAccess, getCustomEndpointConfig } = require('@librechat/api');
+const {
+  PermissionTypes,
+  Permissions,
+  PermissionBits,
+  extractEnvVariable,
+} = require('librechat-data-provider');
 const { requireJwtAuth, configMiddleware, canAccessAgentResource } = require('~/server/middleware');
 const v1 = require('~/server/controllers/agents/v1');
 const { getRoleByName } = require('~/models/Role');
@@ -49,13 +54,84 @@ router.use('/tools', configMiddleware, tools);
  * @route GET /agents/categories
  */
 router.get('/categories', v1.getAgentCategories);
+/* === VIVENTIUM START ===
+ * Feature: Authenticated harness provider readiness.
+ * Purpose: Let Agent Builder show actual GlassHive binary/auth status without exposing the
+ * provider credential or allowing arbitrary user-selected proxy destinations.
+ * === VIVENTIUM END === */
+router.get(
+  '/provider-readiness/:provider',
+  configMiddleware,
+  checkAgentAccess,
+  async (req, res) => {
+    const provider = String(req.params.provider || '').trim();
+    const capability = req.config?.endpoints?.agents?.providerCapabilities?.[provider];
+    if (!capability?.activity_stream) {
+      return res
+        .status(404)
+        .json({ status: 'unavailable', detail: 'Provider readiness is not declared.' });
+    }
+    try {
+      const endpoint = getCustomEndpointConfig({ endpoint: provider, appConfig: req.config });
+      const apiKey = extractEnvVariable(endpoint?.apiKey || '');
+      const baseURL = extractEnvVariable(endpoint?.baseURL || '').replace(/\/$/, '');
+      if (!apiKey || !baseURL || apiKey.includes('${') || baseURL.includes('${')) {
+        return res.json({
+          status: 'unavailable',
+          detail: 'Provider configuration is incomplete.',
+          models: [],
+        });
+      }
+      const response = await fetch(`${baseURL}/models`, {
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'X-Viventium-User-Id': String(req.user?.id || ''),
+        },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!response.ok) {
+        return res.json({
+          status: 'unavailable',
+          detail: `Provider returned HTTP ${response.status}.`,
+          models: [],
+        });
+      }
+      const payload = await response.json();
+      const models = Array.isArray(payload?.data)
+        ? payload.data.map((model) => ({
+            id: String(model?.id || ''),
+            display_name: String(model?.display_name || model?.id || ''),
+            readiness: model?.readiness || { status: 'unknown' },
+          }))
+        : [];
+      const selected = models.find((model) => model.readiness?.status === 'ready');
+      return res.json({
+        status: selected ? 'ready' : models[0]?.readiness?.status || 'unavailable',
+        detail:
+          selected?.readiness?.detail ||
+          models[0]?.readiness?.detail ||
+          'No harness models returned.',
+        models,
+      });
+    } catch (error) {
+      return res.json({
+        status: 'unavailable',
+        detail:
+          error?.name === 'TimeoutError'
+            ? 'Provider readiness check timed out.'
+            : 'Provider is not reachable.',
+        models: [],
+      });
+    }
+  },
+);
 /**
  * Creates an agent.
  * @route POST /agents
  * @param {AgentCreateParams} req.body - The agent creation parameters.
  * @returns {Agent} 201 - Success response - application/json
  */
-router.post('/', checkAgentCreate, v1.createAgent);
+router.post('/', configMiddleware, checkAgentCreate, v1.createAgent);
 
 /**
  * Retrieves basic agent information (VIEW permission required).
@@ -99,6 +175,7 @@ router.get(
  */
 router.patch(
   '/:id',
+  configMiddleware,
   checkGlobalAgentShare,
   canAccessAgentResource({
     requiredPermission: PermissionBits.EDIT,
@@ -115,6 +192,7 @@ router.patch(
  */
 router.post(
   '/:id/duplicate',
+  configMiddleware,
   checkAgentCreate,
   canAccessAgentResource({
     requiredPermission: PermissionBits.EDIT,
@@ -148,6 +226,7 @@ router.delete(
  */
 router.post(
   '/:id/revert',
+  configMiddleware,
   checkGlobalAgentShare,
   canAccessAgentResource({
     requiredPermission: PermissionBits.EDIT,

@@ -1,5 +1,5 @@
-const { duplicateAgent } = require('../v1');
-const { getAgent, createAgent } = require('~/models/Agent');
+const { duplicateAgent, revertAgentVersion: revertAgentVersionHandler } = require('../v1');
+const { getAgent, createAgent, revertAgentVersion } = require('~/models/Agent');
 const { getActions } = require('~/models/Action');
 const { nanoid } = require('nanoid');
 
@@ -191,5 +191,103 @@ describe('duplicateAgent', () => {
 
     expect(res.status).toHaveBeenCalledWith(500);
     expect(res.json).toHaveBeenCalledWith({ error: 'Database error' });
+  });
+});
+
+/* === VIVENTIUM START ===
+ * Feature: Provider-safe version reverts.
+ * Purpose: Prove version history cannot bypass exact GlassHive model validation and that typed
+ * provider options survive the controller/model boundary.
+ * === VIVENTIUM END === */
+describe('revertAgentVersion provider capability validation', () => {
+  const providerConfig = {
+    providerCapabilities: {
+      'glasshive-harness': {
+        main_chat: true,
+        workspace_binding: true,
+        responses_api: false,
+        default_access: 'full',
+        allow_full_access: true,
+        models: [
+          {
+            id: 'codex-cli:gpt-5.6-sol',
+            effortChoices: ['medium'],
+            recommendedEffort: 'medium',
+          },
+        ],
+      },
+    },
+    capabilityRequiredProviders: ['glasshive-harness'],
+  };
+
+  const response = () => ({
+    status: jest.fn().mockReturnThis(),
+    json: jest.fn().mockReturnThis(),
+  });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('fails visibly before persistence when a historical GlassHive model is unsupported', async () => {
+    getAgent.mockResolvedValue({
+      author: 'user_456',
+      versions: [
+        {
+          provider: 'glasshive-harness',
+          model: 'codex-cli:unsupported',
+          model_parameters: { model: 'codex-cli:unsupported' },
+        },
+      ],
+    });
+    const res = response();
+
+    await revertAgentVersionHandler(
+      {
+        params: { id: 'agent_123' },
+        body: { version_index: 0 },
+        user: { id: 'user_456' },
+        config: { endpoints: { agents: providerConfig } },
+      },
+      res,
+    );
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(revertAgentVersion).not.toHaveBeenCalled();
+  });
+
+  it('passes the validated historical model and GlassHive options to persistence', async () => {
+    const historicalVersion = {
+      provider: 'glasshive-harness',
+      model: 'codex-cli:gpt-5.6-sol',
+      model_parameters: { model: 'codex-cli:gpt-5.6-sol', reasoning_effort: 'medium' },
+      glasshive_options: { workspace: { mode: 'life' }, access: 'full' },
+    };
+    getAgent.mockResolvedValue({ author: 'user_456', versions: [historicalVersion] });
+    revertAgentVersion.mockResolvedValue({ author: 'user_456', ...historicalVersion });
+    const res = response();
+
+    await revertAgentVersionHandler(
+      {
+        params: { id: 'agent_123' },
+        body: { version_index: 0 },
+        user: { id: 'user_456' },
+        config: { endpoints: { agents: providerConfig } },
+      },
+      res,
+    );
+
+    expect(revertAgentVersion).toHaveBeenCalledWith(
+      { id: 'agent_123' },
+      0,
+      expect.objectContaining({
+        provider: 'glasshive-harness',
+        model: 'codex-cli:gpt-5.6-sol',
+        glasshive_options: historicalVersion.glasshive_options,
+      }),
+    );
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ glasshive_options: historicalVersion.glasshive_options }),
+    );
   });
 });

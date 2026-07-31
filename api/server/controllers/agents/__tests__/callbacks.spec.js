@@ -414,6 +414,87 @@ describe('getDefaultHandlers voice reasoning guard', () => {
     });
   });
 
+  it('renders harness reasoning summaries as dedicated activity while preserving upstream aggregation', async () => {
+    const aggregateContent = jest.fn();
+    const res = {};
+    const req = {
+      body: {},
+      _viventiumHarnessActivityEnabled: true,
+      _viventiumHarnessExecutionEnabled: true,
+      _viventiumHarnessInvocationStarted: false,
+    };
+    const data = {
+      id: 'step-harness',
+      delta: { content: [{ type: 'think', think: 'The harness started working.\n' }] },
+    };
+    const handlers = getDefaultHandlers({
+      req,
+      res,
+      aggregateContent,
+      toolEndCallback: jest.fn(),
+      collectedUsage: [],
+      streamId: null,
+    });
+
+    await handlers[GraphEvents.ON_REASONING_DELTA].handle(GraphEvents.ON_REASONING_DELTA, data, {
+      last_agent_id: 'agent-1',
+      langgraph_node: 'node_agent-1',
+    });
+
+    expect(sendEvent).toHaveBeenCalledWith(res, {
+      event: GraphEvents.ON_REASONING_DELTA,
+      data: expect.objectContaining({
+        delta: {
+          content: [
+            {
+              type: 'harness_activity',
+              harness_activity: {
+                event: 'reasoning-summary',
+                summary: 'The harness started working.\n',
+              },
+            },
+          ],
+        },
+      }),
+    });
+    expect(aggregateContent).toHaveBeenCalledWith({
+      event: GraphEvents.ON_REASONING_DELTA,
+      data,
+    });
+    expect(req._viventiumHarnessInvocationStarted).toBe(true);
+  });
+
+  it('keeps pre-start fallback available for role-only deltas and locks on visible harness text', async () => {
+    const req = {
+      body: {},
+      _viventiumHarnessExecutionEnabled: true,
+      _viventiumHarnessInvocationStarted: false,
+    };
+    const handlers = getDefaultHandlers({
+      req,
+      res: {},
+      aggregateContent: jest.fn(),
+      toolEndCallback: jest.fn(),
+      collectedUsage: [],
+      streamId: null,
+    });
+    const metadata = { last_agent_id: 'agent-1', langgraph_node: 'node_agent-1' };
+
+    await handlers[GraphEvents.ON_MESSAGE_DELTA].handle(
+      GraphEvents.ON_MESSAGE_DELTA,
+      { id: 'step-role', delta: { role: 'assistant' } },
+      metadata,
+    );
+    expect(req._viventiumHarnessInvocationStarted).toBe(false);
+
+    await handlers[GraphEvents.ON_MESSAGE_DELTA].handle(
+      GraphEvents.ON_MESSAGE_DELTA,
+      { id: 'step-text', delta: { content: [{ type: 'text', text: 'Started.' }] } },
+      metadata,
+    );
+    expect(req._viventiumHarnessInvocationStarted).toBe(true);
+  });
+
   it('normalizes cumulative voice message snapshots before resumable emit and aggregation', async () => {
     const aggregateContent = jest.fn();
     const handlers = getDefaultHandlers({

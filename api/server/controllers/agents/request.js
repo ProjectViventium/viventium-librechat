@@ -210,6 +210,34 @@ function normalizePersistedAssistantResponse(req, response) {
   }
   return persistedResponse;
 }
+
+/* === VIVENTIUM START ===
+ * Feature: Telegram delivery-control transport boundary.
+ * Purpose:
+ * - Keep internal delivery controls out of Mongo and every user-visible stored message.
+ * - Preserve them in the authenticated Telegram final event long enough for the bridge to
+ *   apply optional-audio and message-boundary decisions.
+ * Added: 2026-07-30
+ * === VIVENTIUM END === */
+function normalizeAssistantResponseForTransmit(req, response) {
+  const isTelegramText =
+    req?._viventiumTelegram === true &&
+    String(req?.body?.viventiumSurface || '').toLowerCase() === 'telegram' &&
+    req?.body?.voiceMode !== true;
+  if (!isTelegramText) {
+    return normalizePersistedAssistantResponse(req, response);
+  }
+
+  const currentText = typeof response?.text === 'string' ? response.text : '';
+  const contentText = extractTextFromContentParts(response?.content);
+  if (!currentText && contentText) {
+    return {
+      ...response,
+      text: contentText,
+    };
+  }
+  return response;
+}
 /* === VIVENTIUM END === */
 
 async function persistAssistantSnapshot({
@@ -281,9 +309,23 @@ async function persistAssistantSnapshot({
   const rawContent = Array.isArray(aggregatedContent)
     ? aggregatedContent.filter(Boolean)
     : (resumeState?.aggregatedContent ?? []);
-  const effectiveContent = sanitizePersistedAssistantContent(req, rawContent);
-  const extractedText = extractTextFromContentParts(effectiveContent);
-  const text = sanitizePersistedAssistantText(req, extractedText || fallbackText || '');
+  const voiceSanitizedContent = sanitizePersistedAssistantContent(req, rawContent);
+  const rawText =
+    sanitizePersistedAssistantText(
+      req,
+      extractTextFromContentParts(voiceSanitizedContent) || fallbackText || '',
+    ) || '';
+  const persistedSnapshot = sanitizeVoiceAssistantMessageForPersistence(req, {
+    content: voiceSanitizedContent,
+    text: rawText,
+  });
+  const effectiveContent = Array.isArray(persistedSnapshot?.content)
+    ? persistedSnapshot.content
+    : [];
+  const text =
+    typeof persistedSnapshot?.text === 'string'
+      ? persistedSnapshot.text
+      : extractTextFromContentParts(effectiveContent);
 
   if (effectiveContent.length === 0 && text.length === 0) {
     return { persisted: false, fingerprint: null };
@@ -916,7 +958,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           }
           /* === VIVENTIUM NOTE END === */
 
-          const responseMessageForTransmit = normalizePersistedAssistantResponse(req, response);
+          const responseMessageForTransmit = normalizeAssistantResponseForTransmit(req, response);
           const finalEvent = {
             final: true,
             conversation,
@@ -1441,7 +1483,7 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
     // Only send if not aborted
     if (!job.abortController.signal.aborted) {
       // Create a new response object with minimal copies
-      const finalResponse = normalizePersistedAssistantResponse(req, response);
+      const finalResponse = normalizeAssistantResponseForTransmit(req, response);
 
       sendEvent(res, {
         final: true,
@@ -1545,6 +1587,7 @@ module.exports.__testables = {
   extractTextFromContentParts,
   sanitizePersistedAssistantContent,
   sanitizePersistedAssistantText,
+  normalizeAssistantResponseForTransmit,
   normalizePersistedAssistantResponse,
   persistAssistantSnapshot,
 };

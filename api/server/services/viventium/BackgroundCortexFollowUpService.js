@@ -13,7 +13,12 @@
 const crypto = require('crypto');
 const { logger } = require('@librechat/data-schemas');
 const { Run, Providers } = require('@librechat/agents');
-const { initializeAnthropic, initializeOpenAI } = require('@librechat/api');
+const {
+  createSafeUser,
+  initializeAnthropic,
+  initializeOpenAI,
+  resolveHeaders,
+} = require('@librechat/api');
 const { HumanMessage } = require('@librechat/agents/langchain/messages');
 const {
   ContentTypes,
@@ -38,6 +43,7 @@ const {
   resolveViventiumSurface,
   buildWebTextInstructions,
   buildTelegramTextInstructions,
+  buildTelegramAudioOutputInstructions,
   buildPlaygroundTextInstructions,
   stripVoiceControlTagsForDisplay,
 } = require('~/server/services/viventium/surfacePrompts');
@@ -85,6 +91,11 @@ const {
   summarizeFeelingCapsulePlacement,
 } = require('~/server/services/viventium/feelingsTelemetry');
 const { pinFeelingCapsuleLast } = require('~/server/services/viventium/feelingPromptTail');
+const {
+  attachConversationProviderCapabilityBundle,
+  buildHarnessIdempotencyKey,
+} = require('~/server/services/viventium/GlassHiveConversationProviderService');
+const { parseDeliveryControls } = require('~/server/services/viventium/deliveryControls');
 /* === VIVENTIUM NOTE === */
 /* === VIVENTIUM NOTE ===
  * Feature: No Response Tag ({NTA}) prompt injection (env-gated, config-driven).
@@ -144,6 +155,23 @@ function normalizeFollowUpProvider(provider) {
 }
 
 /* === VIVENTIUM START ===
+ * Feature: Custom-endpoint Phase B route preservation.
+ * Purpose: Agent initialization adapts OpenAI-compatible custom endpoints to the internal OpenAI
+ * transport while retaining the declared provider on `agent.endpoint`. Phase B must resolve the
+ * declared endpoint, otherwise a GlassHive turn is silently reinterpreted as direct OpenAI.
+ * === VIVENTIUM END === */
+function resolveFollowUpProvider(agent, { useVoiceModel = false } = {}) {
+  if (useVoiceModel) {
+    return normalizeFollowUpProvider(agent?.voice_llm_provider || agent?.provider);
+  }
+  const endpoint = normalizeFollowUpProvider(agent?.endpoint);
+  if (endpoint && endpoint !== EModelEndpoint.agents && endpoint !== EModelEndpoint.custom) {
+    return endpoint;
+  }
+  return normalizeFollowUpProvider(agent?.provider);
+}
+
+/* === VIVENTIUM START ===
  * Feature: Voice Phase B no-reasoning parity.
  *
  * Purpose:
@@ -167,6 +195,46 @@ function buildFollowUpModelKwargsForProvider({ providerName, modelParameters } =
   }
   return Object.keys(kwargs).length > 0 ? kwargs : undefined;
 }
+
+const FOLLOW_UP_DROP_PARAM_ALIASES = Object.freeze({
+  frequency_penalty: ['frequencyPenalty'],
+  max_completion_tokens: ['maxCompletionTokens', 'maxTokens'],
+  max_output_tokens: ['maxOutputTokens', 'maxTokens'],
+  max_tokens: ['maxTokens'],
+  presence_penalty: ['presencePenalty'],
+  reasoning_summary: ['reasoningSummary'],
+  stop: ['stopSequences'],
+  top_p: ['topP'],
+  tool_choice: ['toolChoice'],
+  use_responses_api: ['useResponsesApi'],
+  web_search: ['webSearch'],
+});
+
+function applyCustomEndpointFollowUpDropParams(llmConfig, dropParams) {
+  if (!llmConfig || !Array.isArray(dropParams)) {
+    return llmConfig;
+  }
+  for (const rawParam of dropParams) {
+    const param = String(rawParam || '').trim();
+    if (!param) continue;
+    const normalized = param.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);
+    const aliases = new Set([
+      param,
+      normalized,
+      ...(FOLLOW_UP_DROP_PARAM_ALIASES[normalized] || []),
+    ]);
+    for (const alias of aliases) {
+      delete llmConfig[alias];
+      if (llmConfig.modelKwargs && typeof llmConfig.modelKwargs === 'object') {
+        delete llmConfig.modelKwargs[alias];
+      }
+    }
+  }
+  if (llmConfig.modelKwargs && Object.keys(llmConfig.modelKwargs).length === 0) {
+    delete llmConfig.modelKwargs;
+  }
+  return llmConfig;
+}
 /* === VIVENTIUM END === */
 
 function cloneFollowUpAgent(agent) {
@@ -180,9 +248,7 @@ function hasExplicitFollowUpRoute(agent, { useVoiceModel = false } = {}) {
   if (!agent || typeof agent !== 'object') {
     return false;
   }
-  const provider = normalizeFollowUpProvider(
-    useVoiceModel ? agent.voice_llm_provider || agent.provider : agent.provider,
-  );
+  const provider = resolveFollowUpProvider(agent, { useVoiceModel });
   const model = String(
     useVoiceModel
       ? agent.voice_llm_model || agent.model || agent.model_parameters?.model || ''
@@ -612,11 +678,7 @@ function resolveFollowUpPersistenceText({
  *   docs/requirements_and_learnings/02_Background_Agents.md.
  */
 function resolveGovernedFollowUpModel(agent, { useVoiceModel = false } = {}) {
-  const rawProvider = String(
-    useVoiceModel ? agent?.voice_llm_provider || agent?.provider : agent?.provider,
-  )
-    .trim()
-    .toLowerCase();
+  const rawProvider = resolveFollowUpProvider(agent, { useVoiceModel });
   const provider = normalizeFollowUpProvider(rawProvider);
   const explicitModel = String(
     useVoiceModel
@@ -630,15 +692,16 @@ function resolveGovernedFollowUpModel(agent, { useVoiceModel = false } = {}) {
   if (fallbackModel) {
     return fallbackModel;
   }
-  logger.warn(
-    `[BackgroundCortexFollowUpService] Unknown follow-up provider "${rawProvider}"; ` +
-      `falling back to ${DEFAULT_MODELS.openAI}`,
+  throw new Error(
+    `No governed follow-up model is configured for provider "${rawProvider || 'missing'}"`,
   );
-  return DEFAULT_MODELS.openAI;
 }
 /* === VIVENTIUM NOTE === */
 
-function resolveFollowUpRuntimeAssignment(agent, { useVoiceModel = false } = {}) {
+function resolveFollowUpRuntimeAssignment(
+  agent,
+  { useVoiceModel = false, capabilityRequiredProviders = [] } = {},
+) {
   /* === VIVENTIUM START ===
    * Feature: Follow-up LLM route preservation.
    * Purpose: Phase B follows the live main agent route that produced the parent turn. The compiled
@@ -647,7 +710,7 @@ function resolveFollowUpRuntimeAssignment(agent, { useVoiceModel = false } = {})
    * === VIVENTIUM END === */
   const baseRuntimeAgent = hasExplicitFollowUpRoute(agent, { useVoiceModel })
     ? cloneFollowUpAgent(agent)
-    : rewriteAgentForRuntime(agent || {});
+    : rewriteAgentForRuntime(agent || {}, { capabilityRequiredProviders });
   /* === VIVENTIUM NOTE ===
    * Voice follow-ups should respect the same machine-level fast voice override contract as the
    * main voice turn, but only at runtime. Keep the canonical built-in bundle unset by default and
@@ -667,12 +730,7 @@ function resolveFollowUpRuntimeAssignment(agent, { useVoiceModel = false } = {})
       }
     : baseRuntimeAgent;
   const effectiveModel = resolveGovernedFollowUpModel(runtimeAgent, { useVoiceModel });
-  const rawProvider = String(
-    useVoiceModel
-      ? runtimeAgent?.voice_llm_provider || runtimeAgent?.provider
-      : runtimeAgent?.provider,
-  ).trim();
-  const effectiveProvider = normalizeFollowUpProvider(rawProvider);
+  const effectiveProvider = resolveFollowUpProvider(runtimeAgent, { useVoiceModel });
 
   return {
     runtimeAgent,
@@ -738,8 +796,28 @@ function mergeFollowUpAgentRuntimeState(runtimeAgent, persistedAgent) {
   return merged;
 }
 
-async function resolveCanonicalFollowUpAgent(agent, { useVoiceModel = false } = {}) {
-  let assignment = resolveFollowUpRuntimeAssignment(agent, { useVoiceModel });
+async function resolveCanonicalFollowUpAgent(
+  agent,
+  { useVoiceModel = false, capabilityRequiredProviders = [] } = {},
+) {
+  let assignment;
+  let initialResolutionError = null;
+  try {
+    assignment = resolveFollowUpRuntimeAssignment(agent, {
+      useVoiceModel,
+      capabilityRequiredProviders,
+    });
+  } catch (error) {
+    if (!agent?.id || normalizeFollowUpProvider(agent?.provider)) {
+      throw error;
+    }
+    initialResolutionError = error;
+    assignment = {
+      runtimeAgent: cloneFollowUpAgent(agent || {}),
+      effectiveModel: '',
+      effectiveProvider: '',
+    };
+  }
   const normalizedAssignmentProvider = normalizeFollowUpProvider(assignment.effectiveProvider);
   if (normalizedAssignmentProvider || !agent?.id) {
     return {
@@ -758,14 +836,19 @@ async function resolveCanonicalFollowUpAgent(agent, { useVoiceModel = false } = 
       logger.warn(
         `[BackgroundCortexFollowUpService] No canonical persisted agent found for follow-up rehydrate: id=${agent.id}`,
       );
+      if (initialResolutionError) {
+        throw initialResolutionError;
+      }
       return assignment;
     }
 
     const canonicalSourceAgent = rewriteAgentForRuntime(
       mergeFollowUpAgentRuntimeState(assignment.runtimeAgent, persistedAgent),
+      { capabilityRequiredProviders },
     );
     const canonicalAssignment = resolveFollowUpRuntimeAssignment(canonicalSourceAgent, {
       useVoiceModel,
+      capabilityRequiredProviders,
     });
     const canonicalRuntimeAgent = canonicalAssignment.runtimeAgent;
     const effectiveModel = canonicalAssignment.effectiveModel;
@@ -791,6 +874,9 @@ async function resolveCanonicalFollowUpAgent(agent, { useVoiceModel = false } = 
       '[BackgroundCortexFollowUpService] Failed to rehydrate canonical agent for follow-up:',
       sanitizeFollowUpErrorForLog(err),
     );
+    if (initialResolutionError) {
+      throw initialResolutionError;
+    }
     return assignment;
   }
 }
@@ -1118,7 +1204,11 @@ async function resolveFollowUpLLMConfig({
   effectiveModel,
   primaryResponseMode = false,
   useVoiceModel = false,
+  conversationId = '',
+  parentMessageId = '',
 }) {
+  const capabilityRequiredProviders =
+    req?.config?.endpoints?.agents?.capabilityRequiredProviders || [];
   let resolvedAgent = agent || {};
   let resolvedProviderName = normalizeFollowUpProvider(providerName).toLowerCase();
   let resolvedModel = String(effectiveModel || '').trim();
@@ -1137,9 +1227,11 @@ async function resolveFollowUpLLMConfig({
         const priorReasoningEffort = resolvedAgent?.model_parameters?.reasoning_effort;
         const mergedAgent = rewriteAgentForRuntime(
           mergeFollowUpAgentRuntimeState(resolvedAgent, persistedAgent),
+          { capabilityRequiredProviders },
         );
         const hydratedAssignment = resolveFollowUpRuntimeAssignment(mergedAgent, {
           useVoiceModel,
+          capabilityRequiredProviders,
         });
         resolvedAgent = hydratedAssignment.runtimeAgent;
         const hydratedProviderName = normalizeFollowUpProvider(
@@ -1268,14 +1360,95 @@ async function resolveFollowUpLLMConfig({
   }
 
   if (req && resolvedProviderName) {
+    const agentsConfig = req.config?.endpoints?.agents || {};
+    const followUpCapability = agentsConfig.providerCapabilities?.[resolvedProviderName];
+    const followUpIdempotencyKey = buildHarnessIdempotencyKey(
+      'phase_b',
+      parentMessageId || req.body?.responseMessageId || req.body?.messageId,
+      resolvedAgent?.id,
+    );
+    if (followUpCapability?.phase_b_followup === false) {
+      throw new Error(`Provider "${resolvedProviderName}" cannot author Phase B follow-up`);
+    }
+    if (
+      !followUpCapability &&
+      (agentsConfig.capabilityRequiredProviders || []).includes(resolvedProviderName)
+    ) {
+      throw new Error(
+        `Provider capability configuration is unavailable for "${resolvedProviderName}"`,
+      );
+    }
+    await attachConversationProviderCapabilityBundle({
+      targetAgent: resolvedAgent,
+      declaredAgent: resolvedAgent,
+      req,
+      capability: followUpCapability,
+      requestBody: {
+        ...(req.body || {}),
+        conversationId: conversationId || req.body?.conversationId || '',
+        parentMessageId: parentMessageId || req.body?.parentMessageId || '',
+        messageId: parentMessageId || req.body?.messageId || '',
+        viventiumGlassHiveIdempotencyKey: followUpIdempotencyKey,
+      },
+    });
     const customConfig = await getCustomEndpointConfig(resolvedProviderName, req);
     if (customConfig?.apiKey && customConfig?.baseURL) {
+      const existingHeaders =
+        resolvedAgent?.model_parameters?.configuration?.defaultHeaders ||
+        customConfig.defaultHeaders ||
+        {};
+      let runtimeHeaders = { ...existingHeaders };
+      if (followUpCapability?.workspace_binding === true) {
+        const providerDefaultAccess =
+          followUpCapability.default_access === 'full' ? 'full' : 'workspace';
+        const options = resolvedAgent.glasshive_options || {
+          workspace: { mode: 'life' },
+          access: providerDefaultAccess,
+        };
+        const customPath =
+          options?.workspace?.mode === 'custom' ? String(options.workspace.path || '') : '';
+        runtimeHeaders = {
+          ...runtimeHeaders,
+          'X-Viventium-User-Id': '{{LIBRECHAT_USER_ID}}',
+          'X-Viventium-Conversation-Id': '{{LIBRECHAT_BODY_CONVERSATIONID}}',
+          'X-Viventium-Message-Id': '{{LIBRECHAT_BODY_MESSAGEID}}',
+          'X-GlassHive-Idempotency-Key': '{{LIBRECHAT_BODY_VIVENTIUMGLASSHIVEIDEMPOTENCYKEY}}',
+          'X-Viventium-Stream-Id': '{{LIBRECHAT_BODY_VIVENTIUMSTREAMID}}',
+          'X-Viventium-Surface': '{{LIBRECHAT_BODY_VIVENTIUMSURFACE}}',
+          'X-Viventium-Input-Mode': '{{LIBRECHAT_BODY_VIVENTIUMINPUTMODE}}',
+          'X-GlassHive-Agent-Id': resolvedAgent.id,
+          'X-GlassHive-Workspace-Mode': options?.workspace?.mode || 'life',
+          'X-GlassHive-Workspace-Path-B64': customPath
+            ? Buffer.from(customPath, 'utf8').toString('base64')
+            : '',
+          'X-GlassHive-Access': options?.access || providerDefaultAccess,
+        };
+      }
       llmConfig.provider = Providers.OPENAI;
+      llmConfig.apiKey = customConfig.apiKey;
       llmConfig.configuration = {
-        apiKey: customConfig.apiKey,
         baseURL: customConfig.baseURL,
+        defaultHeaders: resolveHeaders({
+          headers: runtimeHeaders,
+          user: createSafeUser(req.user),
+          body: {
+            ...(req.body || {}),
+            conversationId: conversationId || req.body?.conversationId || '',
+            messageId: parentMessageId || req.body?.messageId || '',
+            viventiumGlassHiveIdempotencyKey: followUpIdempotencyKey,
+          },
+        }),
       };
+      if (Array.isArray(customConfig.dropParams) && customConfig.dropParams.length > 0) {
+        applyCustomEndpointFollowUpDropParams(llmConfig, customConfig.dropParams);
+      }
     }
+  }
+
+  if (!llmConfig.provider) {
+    throw new Error(
+      `Unsupported or unavailable follow-up provider "${resolvedProviderName || 'missing'}"`,
+    );
   }
 
   return llmConfig;
@@ -1521,6 +1694,8 @@ function formatFollowUpPrompt({
   continuationContext = '',
   voiceMode = false,
   surface = '',
+  telegramAudioRequested = false,
+  voiceProvider = '',
   primaryResponseMode = false,
 }) {
   if (!Array.isArray(insights) || insights.length === 0) {
@@ -1571,6 +1746,10 @@ function formatFollowUpPrompt({
    */
   const voiceRules = voiceMode ? buildVoiceFollowUpRules() : '';
   const telegramRules = surface === 'telegram' && !voiceMode ? buildTelegramTextInstructions() : '';
+  const telegramAudioRules =
+    surface === 'telegram' && !voiceMode && telegramAudioRequested
+      ? buildTelegramAudioOutputInstructions(voiceProvider)
+      : '';
   const webRules =
     !voiceMode && surface !== 'telegram' && surface !== 'playground'
       ? buildWebTextInstructions()
@@ -1587,7 +1766,14 @@ function formatFollowUpPrompt({
           '- Emotional resonance, general support, or “space to talk” is not enough to interrupt Wing Mode.',
         ].join('\n')
       : '';
-  const surfaceRules = [voiceRules, telegramRules, webRules, playgroundRules, wingRules]
+  const surfaceRules = [
+    voiceRules,
+    telegramRules,
+    telegramAudioRules,
+    webRules,
+    playgroundRules,
+    wingRules,
+  ]
     .filter(Boolean)
     .join('\n\n');
   /* === VIVENTIUM NOTE === */
@@ -1810,6 +1996,23 @@ function resolvePhaseBFeelingContext(snapshot) {
     reason: 'conscious_synthesis',
   };
 }
+
+/* A same-session continuation already retains the capsule from the authored main turn. */
+function resolvePhaseBFeelingInjection({
+  feelingContext,
+  providerCapability,
+  primaryResponseMode = false,
+} = {}) {
+  const capsule = String(feelingContext?.capsule || '');
+  if (
+    capsule &&
+    primaryResponseMode !== true &&
+    providerCapability?.conversation_session === true
+  ) {
+    return { capsule: '', reason: 'preserved_in_conversation_session' };
+  }
+  return { capsule, reason: feelingContext?.reason || 'capsule_unavailable' };
+}
 /* === VIVENTIUM END === */
 
 function extractTextFromMessageContent(content) {
@@ -1900,6 +2103,7 @@ async function promoteForcedFollowUpToEmptyParent({
   conversationId,
   parentMessageId,
   text,
+  telegramDeliveryControls,
   insightsData,
   forceVisibleFollowUp,
   scheduleId,
@@ -1947,6 +2151,7 @@ async function promoteForcedFollowUpToEmptyParent({
         replacedParentMessage: true,
         forceVisibleFollowUp: true,
         promotedToEmptyParent: true,
+        telegramDeliveryControls: telegramDeliveryControls || undefined,
         recoveredPrimaryErrorClasses:
           recoveredPrimaryErrorClasses.length > 0 ? recoveredPrimaryErrorClasses : undefined,
       },
@@ -2025,6 +2230,8 @@ async function generateFollowUpText({
   continuationContext = '',
   runId = '',
   primaryResponseMode = false,
+  conversationId = '',
+  parentMessageId = '',
 }) {
   if (!agent) {
     return '';
@@ -2040,6 +2247,10 @@ async function generateFollowUpText({
 
   const voiceMode = isVoiceMode(req);
   const surface = resolveViventiumSurface(req);
+  const telegramAudioRequested =
+    req?.body?.telegramAudioRequested === true ||
+    String(req?.body?.telegramAudioRequested || '').toLowerCase() === 'true';
+  const voiceProvider = String(req?.body?.voiceProvider || '');
   if (surface === 'wing' && primaryResponseMode !== true) {
     return NO_RESPONSE_TAG;
   }
@@ -2051,6 +2262,8 @@ async function generateFollowUpText({
     continuationContext,
     voiceMode,
     surface,
+    telegramAudioRequested,
+    voiceProvider,
     primaryResponseMode,
   });
   if (!prompt) {
@@ -2067,6 +2280,8 @@ async function generateFollowUpText({
     agent,
     {
       useVoiceModel,
+      capabilityRequiredProviders:
+        req?.config?.endpoints?.agents?.capabilityRequiredProviders || [],
     },
   );
   /* === VIVENTIUM END === */
@@ -2089,6 +2304,8 @@ async function generateFollowUpText({
     effectiveModel,
     primaryResponseMode,
     useVoiceModel,
+    conversationId,
+    parentMessageId,
   });
   if (!llmConfig?.provider) {
     throw new Error(
@@ -2109,20 +2326,27 @@ async function generateFollowUpText({
    */
   const noResponseInstructions = buildNoResponseInstructions(req);
   const phaseBFeelingContext = resolvePhaseBFeelingContext(req?._viventiumFeelingSnapshot);
+  const followUpProviderCapability =
+    req?.config?.endpoints?.agents?.providerCapabilities?.[providerName];
+  const phaseBFeelingInjection = resolvePhaseBFeelingInjection({
+    feelingContext: phaseBFeelingContext,
+    providerCapability: followUpProviderCapability,
+    primaryResponseMode,
+  });
   const systemPrompt = buildFollowUpSystemPrompt({
     primaryResponseMode,
     continuationContext,
     noResponseInstructions,
-    feelingCapsule: phaseBFeelingContext.capsule,
+    feelingCapsule: phaseBFeelingInjection.capsule,
   });
   const feelingPlacement = summarizeFeelingCapsulePlacement({
     instructions: systemPrompt,
-    capsule: phaseBFeelingContext.capsule,
+    capsule: phaseBFeelingInjection.capsule,
   });
   const feelingInjectionReason =
-    !feelingPlacement.presentInFinalRun && phaseBFeelingContext.reason === 'conscious_synthesis'
+    !feelingPlacement.presentInFinalRun && phaseBFeelingInjection.reason === 'conscious_synthesis'
       ? 'capsule_not_applied'
-      : phaseBFeelingContext.reason;
+      : phaseBFeelingInjection.reason;
   logFeelingsEvent(logger, req, 'feelings.inject.final_run', {
     route: 'phase_b_followup',
     enabled: phaseBFeelingContext.enabled,
@@ -2145,7 +2369,7 @@ async function generateFollowUpText({
       authClass: 'user_runtime',
       layers: {
         followup_system: systemPrompt,
-        viventium_feeling_state: phaseBFeelingContext.capsule,
+        viventium_feeling_state: phaseBFeelingInjection.capsule,
         followup_prompt: prompt,
         recent_response: recentResponse || '',
         user_request: userRequest || '',
@@ -2299,12 +2523,14 @@ async function createCortexFollowUpMessage({
         continuationContext: continuationContext.contextText,
         runId: parentMessageId || conversationId || '',
         primaryResponseMode: shouldForceVisibleFollowUp,
+        conversationId,
+        parentMessageId,
       });
     } catch (err) {
       generationFailed = true;
+      const failure = sanitizeFollowUpErrorForLog(err);
       logger.warn(
-        '[BackgroundCortexFollowUpService] Failed to generate LLM follow-up text',
-        sanitizeFollowUpErrorForLog(err),
+        `[BackgroundCortexFollowUpService] Failed to generate LLM follow-up text: name=${failure.name || 'unknown'} status=${failure.status ?? 'none'} code=${failure.code || 'none'}`,
       );
     }
   }
@@ -2349,6 +2575,15 @@ async function createCortexFollowUpMessage({
       finalContinuationContext.hasMovedOn || finalContinuationContext.lookupFailed,
   });
   text = resolvedText;
+  let telegramDeliveryControls = null;
+  if (surface === 'telegram' && !voiceMode) {
+    const delivery = parseDeliveryControls(text);
+    text = delivery.cleanText;
+    telegramDeliveryControls = {
+      skipVoice: delivery.skipVoice,
+      segments: delivery.segments,
+    };
+  }
 
   const followUpDecisionRecord = buildFollowUpDecisionRecord({
     req,
@@ -2379,6 +2614,7 @@ async function createCortexFollowUpMessage({
     conversationId,
     parentMessageId,
     text,
+    telegramDeliveryControls,
     insightsData,
     forceVisibleFollowUp: shouldForceVisibleFollowUp,
     scheduleId,
@@ -2441,6 +2677,9 @@ async function createCortexFollowUpMessage({
       cortexFollowUpDecision: compactDecisionRecordForMetadata(followUpDecisionRecord),
     },
   };
+  if (telegramDeliveryControls) {
+    metadata.viventium.telegramDeliveryControls = telegramDeliveryControls;
+  }
 
   const followUpMessage = {
     messageId,
@@ -2491,6 +2730,7 @@ module.exports = {
   compactDecisionRecordForMetadata,
   logFollowUpDecisionRecord,
   resolvePhaseBFeelingContext,
+  resolvePhaseBFeelingInjection,
   persistFollowUpDecisionToParentMessage,
   sanitizeAnthropicFollowUpLLMConfig,
   stripQuestionSentences,

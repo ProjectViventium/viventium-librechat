@@ -637,6 +637,14 @@ export default function useResumableSSE(
       const payloadData = createPayload(currentSubmission);
       let { payload } = payloadData;
       payload = removeNullishValues(payload) as TPayload;
+      /* === VIVENTIUM START ===
+       * Feature: Stable authoring identity across start-POST retries.
+       * Purpose: A lost HTTP response may cause this loop to POST again. Reuse one client-minted
+       * assistant ID so the server and GlassHive idempotency boundary see the same turn.
+       * === VIVENTIUM END === */
+      if (!payload.responseMessageId) {
+        payload.responseMessageId = v4();
+      }
 
       clearStepMaps();
 

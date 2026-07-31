@@ -243,6 +243,120 @@ describe('request persistence helpers', () => {
     );
   });
 
+  it('persists Telegram turns without delivery or provider controls', () => {
+    const req = {
+      _viventiumTelegram: true,
+      body: {
+        voiceMode: false,
+        viventiumSurface: 'telegram',
+        telegramAudioRequested: true,
+      },
+    };
+
+    const response = __testables.normalizePersistedAssistantResponse(req, {
+      messageId: 'assistant-msg-telegram',
+      text: [
+        '<whisper>Here is **the draft** for qa@example.com.</whisper>',
+        '{MSG_BREAK}',
+        'Keep https://example.com and `literal_code`.',
+        '{SKIP_VOICE}',
+      ].join('\n'),
+      content: [
+        {
+          type: 'text',
+          text: '<whisper>Here is **the draft** for qa@example.com.</whisper>\n{SKIP_VOICE}',
+        },
+        { type: 'think', think: 'Existing Telegram content semantics stay unchanged.' },
+      ],
+    });
+
+    expect(response.text).toBe(
+      'Here is **the draft** for qa@example.com.\n\nKeep https://example.com and `literal_code`.',
+    );
+    expect(response.content).toEqual([
+      { type: 'text', text: 'Here is **the draft** for qa@example.com.' },
+      { type: 'think', think: 'Existing Telegram content semantics stay unchanged.' },
+    ]);
+  });
+
+  it('preserves Telegram delivery controls only in the authenticated final transport event', () => {
+    const req = {
+      _viventiumTelegram: true,
+      body: {
+        voiceMode: false,
+        viventiumSurface: 'telegram',
+        telegramAudioRequested: true,
+      },
+    };
+    const raw = {
+      messageId: 'assistant-msg-telegram',
+      text: 'Copy-ready draft.\n{MSG_BREAK}\nOne afterthought.\n{SKIP_VOICE}',
+      content: [
+        {
+          type: 'text',
+          text: 'Copy-ready draft.\n{MSG_BREAK}\nOne afterthought.\n{SKIP_VOICE}',
+        },
+      ],
+    };
+
+    const transmitted = __testables.normalizeAssistantResponseForTransmit(req, raw);
+    const persisted = __testables.normalizePersistedAssistantResponse(req, raw);
+
+    expect(transmitted.text).toContain('{MSG_BREAK}');
+    expect(transmitted.text).toContain('{SKIP_VOICE}');
+    expect(transmitted.content[0].text).toContain('{SKIP_VOICE}');
+    expect(persisted.text).toBe('Copy-ready draft.\n\nOne afterthought.');
+    expect(persisted.content[0].text).toBe('Copy-ready draft.\n\nOne afterthought.');
+  });
+
+  it('does not trust a client-supplied Telegram surface without the route flag', () => {
+    const response = __testables.normalizeAssistantResponseForTransmit(
+      {
+        body: {
+          voiceMode: false,
+          viventiumSurface: 'telegram',
+          telegramAudioRequested: true,
+        },
+      },
+      { text: 'Draft.\n{SKIP_VOICE}' },
+    );
+
+    expect(response.text).toBe('Draft.');
+  });
+
+  it('sanitizes Telegram delivery controls in interrupted snapshots', async () => {
+    const req = {
+      user: { id: 'user-1' },
+      body: {
+        voiceMode: false,
+        viventiumSurface: 'telegram',
+        telegramAudioRequested: true,
+      },
+    };
+
+    await __testables.persistAssistantSnapshot({
+      req,
+      streamId: 'stream-telegram-error',
+      userId: 'user-1',
+      client: { sender: 'AI', options: { endpoint: 'agents' }, model: 'test-model' },
+      conversationId: 'convo-1',
+      userMessage: {
+        messageId: 'user-msg',
+        conversationId: 'convo-1',
+      },
+      responseMessageId: 'assistant-msg',
+      aggregatedContent: [{ type: 'text', text: 'First.\n{MSG_BREAK}\nSecond.\n{SKIP_VOICE}' }],
+      fallbackText: '',
+      unfinished: true,
+      error: true,
+      context: 'test-telegram-error',
+    });
+
+    const saved = mockSaveMessage.mock.calls.at(-1)[1];
+    expect(saved.text).toBe('First.\n\nSecond.');
+    expect(saved.content[0].text).toBe('First.\n\nSecond.');
+  });
+
   it('persists a fallback error message when no content exists yet', async () => {
     const req = {
       user: { id: 'user-1' },

@@ -130,14 +130,14 @@ describe('agentSchemaToolBindingPatch', () => {
     expect(agentContext.tools).toBe(originalTools);
   });
 
-  it('does not feed scoped schema tools back into the event-driven binding merge', async () => {
+  it('does not append invocation-scoped schema tools to the provider binding twice', async () => {
     const originalTools = [];
-    const schemaTools = [{ name: 'schedule_create_mcp_scheduling-cortex' }];
+    const schemaTools = [{ name: 'schedule_create' }, { name: 'schedule_list' }];
     const agentContext = {
       tools: originalTools,
-      toolDefinitions: [{ name: 'schedule_create_mcp_scheduling-cortex' }],
+      toolDefinitions: schemaTools.map((tool) => ({ ...tool })),
       getToolsForBinding() {
-        return [...schemaTools, ...(this.tools ?? [])];
+        return [...schemaTools, ...this.tools];
       },
     };
     const observed = {};
@@ -145,7 +145,9 @@ describe('agentSchemaToolBindingPatch', () => {
       createCallModel(agentId = 'default') {
         const graph = this;
         return async function fakeCallModel() {
-          observed.bindingTools = graph.agentContexts.get(agentId).getToolsForBinding();
+          const context = graph.agentContexts.get(agentId);
+          observed.bindingTools = context.getToolsForBinding();
+          observed.fallbackTools = context.tools;
           return { messages: [] };
         };
       },
@@ -157,7 +159,14 @@ describe('agentSchemaToolBindingPatch', () => {
 
     await callModel({ messages: [] }, {});
 
-    expect(observed.bindingTools).toEqual(schemaTools);
+    expect(observed.bindingTools.map((tool) => tool.name)).toEqual([
+      'schedule_create',
+      'schedule_list',
+    ]);
+    expect(observed.fallbackTools.map((tool) => tool.name)).toEqual([
+      'schedule_create',
+      'schedule_list',
+    ]);
     expect(agentContext.tools).toBe(originalTools);
   });
 

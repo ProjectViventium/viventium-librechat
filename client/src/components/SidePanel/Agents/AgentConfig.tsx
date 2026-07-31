@@ -29,6 +29,7 @@ import Artifacts from './Artifacts';
 import AgentTool from './AgentTool';
 import CodeForm from './Code/Form';
 import MCPTools from './MCPTools';
+import { resolveAgentModelDisplayLabel } from './modelSelection';
 
 const labelClass = 'mb-2 text-token-text-primary block font-medium';
 const inputClass = cn(
@@ -159,6 +160,16 @@ export default function AgentConfig() {
   }, [agent_id, setActivePanel, showToast, localize]);
 
   const providerValue = typeof provider === 'string' ? provider : provider?.value;
+  /* === VIVENTIUM START ===
+   * Feature: Friendly provider model labels in the collapsed Agent Builder field.
+   * Purpose: Keep exact model IDs in persisted Agent data without exposing transport IDs as the
+   * user-facing model name after save/reload.
+   * === VIVENTIUM END === */
+  const modelDisplayLabel = resolveAgentModelDisplayLabel({
+    provider: providerValue ?? '',
+    model: model ?? '',
+    providerCapabilities: agentsConfig?.providerCapabilities ?? {},
+  });
   let Icon: IconComponentTypes | null | undefined;
   let endpointType: EModelEndpoint | undefined;
   let endpointIconURL: string | undefined;
@@ -300,7 +311,9 @@ export default function AgentConfig() {
                   />
                 </div>
               )}
-              <span>{model != null && model ? model : localize('com_ui_select_model')}</span>
+              <span>
+                {model != null && model ? modelDisplayLabel : localize('com_ui_select_model')}
+              </span>
             </div>
           </button>
         </div>

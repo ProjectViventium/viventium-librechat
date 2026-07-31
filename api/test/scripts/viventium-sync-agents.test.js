@@ -144,13 +144,13 @@ describe('viventium-sync-agents args', () => {
     expect(args.action).toBe('push');
   });
 
-  test('local push defaults to runtime-aware rewrites', () => {
+  test('local push keeps tracked source-of-truth unless runtime-aware is explicit', () => {
     const args = parseArgs(['push']);
 
-    expect(shouldApplyRuntimeOverrides(args)).toBe(true);
+    expect(shouldApplyRuntimeOverrides(args)).toBe(false);
   });
 
-  test('raw-source-of-truth disables runtime-aware default', () => {
+  test('raw-source-of-truth explicitly keeps runtime overrides disabled', () => {
     const args = parseArgs(['push', '--raw-source-of-truth']);
 
     expect(shouldApplyRuntimeOverrides(args)).toBe(false);
@@ -164,6 +164,12 @@ describe('viventium-sync-agents args', () => {
 
   test('runtime-aware can be requested explicitly', () => {
     const args = parseArgs(['push', '--env=cloud', '--runtime-aware']);
+
+    expect(shouldApplyRuntimeOverrides(args)).toBe(true);
+  });
+
+  test('runtime-aware can be requested explicitly for local pushes', () => {
+    const args = parseArgs(['push', '--env=local', '--runtime-aware']);
 
     expect(shouldApplyRuntimeOverrides(args)).toBe(true);
   });

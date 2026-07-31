@@ -531,6 +531,14 @@ describe('buildTelegramTextInstructions', () => {
     const result = buildTelegramTextInstructions();
     expect(result).toContain('TELEGRAM TEXT MODE:');
   });
+
+  test('allows bounded natural bubble boundaries without splitting artifacts', () => {
+    const result = buildTelegramTextInstructions();
+
+    expect(result).toContain('{MSG_BREAK}');
+    expect(result).toContain('Usually use none; occasionally use one; never use more than two');
+    expect(result).toContain('Never place it inside code, a quotation, an email or document draft');
+  });
 });
 
 describe('buildWebTextInstructions', () => {
@@ -559,6 +567,16 @@ describe('buildWebTextInstructions', () => {
 });
 
 describe('buildTelegramAudioOutputInstructions', () => {
+  test('gives the model a semantic optional-audio decision without runtime heuristics', () => {
+    const result = buildTelegramAudioOutputInstructions('xai');
+
+    expect(result).toContain('{SKIP_VOICE}');
+    expect(result).toContain('meant to be read, copied, scanned, edited, or reused');
+    expect(result).toContain('Do not skip audio for a normal conversational reply merely because');
+    expect(result).toContain('explicitly asks to hear, read aloud, speak, or receive audio');
+    expect(result).toContain('full visible text is still sent');
+  });
+
   test('Telegram text mode and audio output overlay can be combined without voice-call rules', () => {
     const telegramText = buildTelegramTextInstructions();
     const telegramAudio = buildTelegramAudioOutputInstructions('xai');

@@ -26,7 +26,9 @@ const {
   buildFollowUpDecisionRecord,
   compactDecisionRecordForMetadata,
   generateFollowUpText,
+  buildFollowUpSystemPrompt,
   resolvePhaseBFeelingContext,
+  resolvePhaseBFeelingInjection,
 } = require('../BackgroundCortexFollowUpService');
 
 describe('upsertCortexParts', () => {
@@ -319,8 +321,10 @@ describe('Phase B conscious Feelings context', () => {
     const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
     const infoLog = jest.spyOn(logger, 'info').mockImplementation(() => {});
     const warnLog = jest.spyOn(logger, 'warn').mockImplementation(() => {});
+    const originalXaiApiKey = process.env.XAI_API_KEY;
 
     try {
+      process.env.XAI_API_KEY = 'synthetic-xai-key';
       await generateFollowUpText({
         req: {
           id: 'synthetic-phase-b-request',
@@ -354,10 +358,61 @@ describe('Phase B conscious Feelings context', () => {
       expect(serializedLogs).toContain('conscious_synthesis');
       expect(serializedLogs).not.toContain('synthetic private cause');
     } finally {
+      if (originalXaiApiKey == null) {
+        delete process.env.XAI_API_KEY;
+      } else {
+        process.env.XAI_API_KEY = originalXaiApiKey;
+      }
       createRun.mockRestore();
       infoLog.mockRestore();
       warnLog.mockRestore();
     }
+  });
+});
+
+describe('Phase B session-backed Feelings', () => {
+  const capsule = '<viventium_feeling_state>synthetic state</viventium_feeling_state>';
+
+  test('pins one capsule at the final system layer for a direct-provider follow-up', () => {
+    const prompt = buildFollowUpSystemPrompt({
+      noResponseInstructions: 'Use {NTA} when no reply is needed.',
+      feelingCapsule: capsule,
+    });
+    expect(prompt.endsWith(capsule)).toBe(true);
+    expect(prompt.match(/<viventium_feeling_state>/g)).toHaveLength(1);
+  });
+
+  test('does not inject a second capsule into a same-session continuation', () => {
+    const feelingContext = resolvePhaseBFeelingContext({
+      enabled: true,
+      agentScope: 'conscious_agent',
+      snapshotHash: 'synthetic-hash',
+      capsule,
+    });
+    expect(
+      resolvePhaseBFeelingInjection({
+        feelingContext,
+        providerCapability: { conversation_session: true },
+        primaryResponseMode: false,
+      }),
+    ).toEqual({ capsule: '', reason: 'preserved_in_conversation_session' });
+  });
+
+  test('keeps the capsule for direct providers and a forced primary follow-up', () => {
+    const feelingContext = { capsule, reason: 'conscious_synthesis' };
+    expect(
+      resolvePhaseBFeelingInjection({
+        feelingContext,
+        providerCapability: { conversation_session: false },
+      }).capsule,
+    ).toBe(capsule);
+    expect(
+      resolvePhaseBFeelingInjection({
+        feelingContext,
+        providerCapability: { conversation_session: true },
+        primaryResponseMode: true,
+      }).capsule,
+    ).toBe(capsule);
   });
 });
 
@@ -386,6 +441,28 @@ describe('formatFollowUpPrompt', () => {
 
     expect(prompt).toContain('PLAYGROUND TEXT MODE:');
     expect(prompt).not.toContain('WEB TEXT MODE:');
+  });
+
+  test('teaches smart optional audio only to Telegram follow-ups that can attach audio', () => {
+    const base = {
+      insights: [{ cortexName: 'planner', insight: 'The synthetic draft is ready.' }],
+      recentResponse: 'I started checking it.',
+      voiceMode: false,
+      surface: 'telegram',
+    };
+
+    const textOnlyPrompt = formatFollowUpPrompt(base);
+    const audioEligiblePrompt = formatFollowUpPrompt({
+      ...base,
+      telegramAudioRequested: true,
+      voiceProvider: 'xai',
+    });
+
+    expect(textOnlyPrompt).toContain('{MSG_BREAK}');
+    expect(textOnlyPrompt).not.toContain('{SKIP_VOICE}');
+    expect(audioEligiblePrompt).toContain('{MSG_BREAK}');
+    expect(audioEligiblePrompt).toContain('{SKIP_VOICE}');
+    expect(audioEligiblePrompt).toContain('explicitly asks to hear, read aloud, speak');
   });
 
   test('keeps Wing Mode follow-ups silence-first', () => {
@@ -1237,6 +1314,55 @@ describe('voice follow-up runtime assignment', () => {
         process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL = originalModel;
       }
     }
+  });
+
+  test('preserves a custom endpoint as the Phase B route after OpenAI transport adaptation', () => {
+    const result = resolveFollowUpRuntimeAssignment(
+      {
+        id: 'agent-glasshive-main',
+        endpoint: 'glasshive-harness',
+        provider: 'openAI',
+        model: 'codex-cli:gpt-5.6-sol',
+        model_parameters: {
+          model: 'codex-cli:gpt-5.6-sol',
+          reasoning_effort: 'medium',
+        },
+        glasshive_options: {
+          workspace: { mode: 'life' },
+          access: 'workspace',
+        },
+      },
+      { useVoiceModel: false },
+    );
+
+    expect(result.effectiveProvider).toBe('glasshive-harness');
+    expect(result.effectiveModel).toBe('codex-cli:gpt-5.6-sol');
+    expect(result.runtimeAgent.endpoint).toBe('glasshive-harness');
+  });
+
+  test('preserves a capability-required canonical Main across stale upgrade runtime defaults', () => {
+    const result = resolveFollowUpRuntimeAssignment(
+      {
+        id: 'agent_viventium_main_95aeb3',
+        provider: 'glasshive-harness',
+        model: 'codex-cli:gpt-5.6-sol',
+        model_parameters: {
+          model: 'codex-cli:gpt-5.6-sol',
+          reasoning_effort: 'medium',
+        },
+      },
+      {
+        useVoiceModel: false,
+        capabilityRequiredProviders: ['glasshive-harness'],
+      },
+    );
+
+    expect(result.effectiveProvider).toBe('glasshive-harness');
+    expect(result.effectiveModel).toBe('codex-cli:gpt-5.6-sol');
+    expect(result.runtimeAgent.model_parameters).toMatchObject({
+      model: 'codex-cli:gpt-5.6-sol',
+      reasoning_effort: 'medium',
+    });
   });
 
   test('normalizes xAI voice follow-up parameters to no reasoning', () => {

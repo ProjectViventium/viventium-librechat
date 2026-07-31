@@ -74,12 +74,27 @@ async function getEndpointsConfig(req) {
     };
   }
   if (mergedConfig[EModelEndpoint.agents] && appConfig?.endpoints?.[EModelEndpoint.agents]) {
-    const { disableBuilder, capabilities, allowedProviders, ..._rest } =
-      appConfig.endpoints[EModelEndpoint.agents];
+    /* === VIVENTIUM START ===
+     * Feature: Capability-backed Agent Builder providers
+     * Purpose: Expose the public-safe capability/label registry to the client so Provider/Model
+     * filtering and GlassHive's visible label use structured configuration rather than IDs.
+     * === VIVENTIUM END === */
+    const {
+      disableBuilder,
+      capabilities,
+      allowedProviders,
+      providerCapabilities,
+      capabilityRequiredProviders,
+      activationOpenAITransportProviders,
+      ..._rest
+    } = appConfig.endpoints[EModelEndpoint.agents];
 
     mergedConfig[EModelEndpoint.agents] = {
       ...mergedConfig[EModelEndpoint.agents],
       allowedProviders,
+      providerCapabilities,
+      capabilityRequiredProviders,
+      activationOpenAITransportProviders,
       disableBuilder,
       capabilities,
     };

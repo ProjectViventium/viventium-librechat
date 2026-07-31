@@ -121,6 +121,7 @@ const ALLOWED_BODY_FIELDS = [
   'viventiumSurface',
   'viventiumInputMode',
   'viventiumStreamId',
+  'viventiumGlassHiveIdempotencyKey',
   'viventiumVoiceRequestId',
   'viventiumVoiceCallSessionId',
   'viventiumTelegramChatId',

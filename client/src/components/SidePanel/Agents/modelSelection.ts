@@ -1,3 +1,26 @@
+/* === VIVENTIUM START ===
+ * Feature: Capability-owned Agent Builder model labels.
+ * Purpose: Persist exact provider model IDs while rendering the friendly label declared by the
+ * provider capability registry on both the picker and the collapsed Builder field.
+ * === VIVENTIUM END === */
+export function resolveAgentModelDisplayLabel({
+  provider,
+  model,
+  providerCapabilities,
+}: {
+  provider: string;
+  model: string;
+  providerCapabilities: Record<
+    string,
+    { models?: Array<{ id: string; label?: string }> } | undefined
+  >;
+}): string {
+  return (
+    providerCapabilities[provider]?.models?.find((candidate) => candidate.id === model)?.label ??
+    model
+  );
+}
+
 export function resolveAgentModelForProvider({
   provider,
   model,

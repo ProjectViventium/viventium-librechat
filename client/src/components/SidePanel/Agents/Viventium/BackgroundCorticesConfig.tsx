@@ -34,6 +34,7 @@ import type { AgentForm, OptionWithIcon } from '~/common';
 import MessageIcon from '~/components/Share/MessageIcon';
 import { useLocalize } from '~/hooks';
 import { useAgentsMapContext } from '~/Providers';
+import { useAgentPanelContext } from '~/Providers/AgentPanelContext';
 import { ESide } from '~/common';
 import {
   activationModelKey,
@@ -304,13 +305,32 @@ const BackgroundCorticesConfig: React.FC<BackgroundCorticesConfigProps> = ({
 }) => {
   const localize = useLocalize();
   const agentsMap = useAgentsMapContext();
+  const { agentsConfig } = useAgentPanelContext();
   const modelsQuery = useGetModelsQuery({ refetchOnMount: 'always' });
   const models = useMemo(() => modelsQuery.data ?? {}, [modelsQuery.data]);
+  /* === VIVENTIUM START ===
+   * Feature: Capability-filtered Phase-A classifier picker
+   * Purpose: Classifier routes stay on declared fast direct providers; GlassHive conversation
+   * harnesses are excluded by capability rather than by provider-name matching.
+   * === VIVENTIUM END === */
+  const activationModels = useMemo(
+    () =>
+      Object.fromEntries(
+        Object.entries(models).filter(([provider]) => {
+          const capability = agentsConfig?.providerCapabilities?.[provider];
+          if (!capability) {
+            return !(agentsConfig?.capabilityRequiredProviders ?? []).includes(provider);
+          }
+          return capability.activation_classifier === true;
+        }),
+      ),
+    [agentsConfig?.capabilityRequiredProviders, agentsConfig?.providerCapabilities, models],
+  );
 
   const cortices = useMemo(() => field.value || [], [field.value]);
   const defaultActivationRoute = useMemo(
-    () => resolveDefaultActivationRoute(cortices, models),
-    [cortices, models],
+    () => resolveDefaultActivationRoute(cortices, activationModels),
+    [activationModels, cortices],
   );
   const canAddCortex = Boolean(activationModelKey(defaultActivationRoute));
   const activeCortexCount = cortices.filter(
@@ -411,7 +431,7 @@ const BackgroundCorticesConfig: React.FC<BackgroundCorticesConfigProps> = ({
                 cortex={cortex}
                 index={index}
                 agentsMap={agentsMap}
-                models={models}
+                models={activationModels}
                 onUpdate={handleUpdateCortex}
                 onRemove={handleRemoveCortex}
               />

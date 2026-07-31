@@ -38,6 +38,7 @@ const {
 
 const yaml = require('js-yaml');
 const mongoose = require('mongoose');
+const { applyAgentProviderCapabilityDefaults } = require('@librechat/api');
 const { Agent, User } = require('../api/db/models');
 const { updateAgent, createAgent } = require('../api/models/Agent');
 /* === VIVENTIUM START ===
@@ -103,6 +104,20 @@ function resolveSourceOfTruthAgentsPath(envSlug) {
 
 function resolveSourceOfTruthLibrechatYamlPath(envSlug) {
   return path.join(SOURCE_OF_TRUTH_DIR, `${sanitizeSlug(envSlug)}.librechat.yaml`);
+}
+
+function loadAgentProviderCapabilityPolicy(envSlug, { runtimeEnv = process.env } = {}) {
+  const configuredPath = String(runtimeEnv.VIVENTIUM_LIBRECHAT_SOURCE_OF_TRUTH || '').trim();
+  const configPath = configuredPath || resolveSourceOfTruthLibrechatYamlPath(envSlug);
+  if (!fs.existsSync(configPath)) {
+    throw new Error(`Provider capability source of truth not found: ${configPath}`);
+  }
+  const config = yaml.load(fs.readFileSync(configPath, 'utf8')) || {};
+  const agents = config?.endpoints?.agents || {};
+  return {
+    registry: agents.providerCapabilities || {},
+    requiredProviders: agents.capabilityRequiredProviders || [],
+  };
 }
 
 function normalizeBundleForSourceOfTruth(bundle) {
@@ -183,6 +198,7 @@ const AGENT_FIELDS = [
   'tool_kwargs',
   'tool_options',
   'model_parameters',
+  'glasshive_options',
   'end_after_tools',
   'hide_sequential_outputs',
   'support_contact',
@@ -216,6 +232,7 @@ const MODEL_CONFIG_ONLY_FIELDS = [
   'provider',
   'model',
   'model_parameters',
+  'glasshive_options',
   'voice_llm_model',
   'voice_llm_provider',
   'voice_llm_model_parameters',
@@ -237,6 +254,7 @@ const REVIEW_FIELDS = [
   'provider',
   'model',
   'model_parameters',
+  'glasshive_options',
   'voice_llm_model',
   'voice_llm_provider',
   'voice_llm_model_parameters',
@@ -626,17 +644,8 @@ function parseArgs(argv) {
   return args;
 }
 
-function shouldApplyRuntimeOverrides({ action, env = DEFAULT_ENV_SLUG, runtimeAware = null } = {}) {
-  if (action !== 'push') {
-    return false;
-  }
-  if (runtimeAware === true) {
-    return true;
-  }
-  if (runtimeAware === false) {
-    return false;
-  }
-  return sanitizeSlug(env) === 'local';
+function shouldApplyRuntimeOverrides({ action, runtimeAware = null } = {}) {
+  return action === 'push' && runtimeAware === true;
 }
 
 function resolveSchedulesPath({ baseFilePath, explicitPath, defaultBasename }) {
@@ -1625,6 +1634,7 @@ async function pushAgent({
   runtimeAware = false,
   activationFields = null,
   selectedAgentIds = null,
+  providerCapabilityPolicy,
 }) {
   if (!agentData || !agentData.id) {
     return { id: null, status: 'skipped', reason: 'missing agent id' };
@@ -1663,6 +1673,14 @@ async function pushAgent({
         createData[field] = agentData[field];
       }
     }
+    Object.assign(
+      createData,
+      applyAgentProviderCapabilityDefaults(
+        createData,
+        providerCapabilityPolicy?.registry,
+        providerCapabilityPolicy?.requiredProviders,
+      ),
+    );
     createData.author = userId;
     createData.authorName = (await User.findById(userId, 'name').lean())?.name || '';
     if (dryRun) {
@@ -1717,6 +1735,15 @@ async function pushAgent({
     return { id: agentData.id, status: 'skipped', reason: 'no updatable fields' };
   }
 
+  const validatedCandidate = applyAgentProviderCapabilityDefaults(
+    { ...existing, ...updateData },
+    providerCapabilityPolicy?.registry,
+    providerCapabilityPolicy?.requiredProviders,
+  );
+  for (const field of Object.keys(updateData)) {
+    updateData[field] = validatedCandidate[field];
+  }
+
   const fieldsUpdated = Object.keys(updateData);
   if (!dryRun) {
     await updateAgent({ id: agentData.id }, updateData, { updatingUserId: userId });
@@ -1764,8 +1791,11 @@ async function pushBundle({
     throw new Error(`Input file not found: ${inPath}`);
   }
 
+  const providerCapabilityPolicy = loadAgentProviderCapabilityPolicy(env);
   const bundle = runtimeAware
-    ? normalizeBundleForRuntime(loadBundle(inPath, format))
+    ? normalizeBundleForRuntime(loadBundle(inPath, format), {
+        capabilityRequiredProviders: providerCapabilityPolicy.requiredProviders,
+      })
     : loadBundle(inPath, format);
   if (!bundle || !bundle.mainAgent) {
     throw new Error('Invalid bundle: missing mainAgent');
@@ -1824,6 +1854,7 @@ async function pushBundle({
         runtimeAware,
         activationFields,
         selectedAgentIds,
+        providerCapabilityPolicy,
       }),
     );
   } else {
@@ -1868,6 +1899,7 @@ async function pushBundle({
           runtimeAware,
           activationFields,
           selectedAgentIds,
+          providerCapabilityPolicy,
         }),
       );
     }
@@ -2122,7 +2154,7 @@ function printUsage() {
     '  --runtime-aware   Rewrite built-in model/provider fields from canonical runtime env before push',
   );
   console.log(
-    '  --raw-source-of-truth  Push raw bundle values without runtime rewrite (disables local default)',
+    '  --raw-source-of-truth  Push raw bundle values without runtime rewrite (the default; overrides an earlier --runtime-aware flag)',
   );
   console.log(
     '  --agent-ids=...   Optional comma-separated background agent ids to update surgically',
@@ -2348,4 +2380,5 @@ module.exports = {
   shouldApplyRuntimeOverrides,
   shouldRepairRuntimeFieldsForPushMode,
   shouldPushStandaloneBackgroundAgent,
+  loadAgentProviderCapabilityPolicy,
 };

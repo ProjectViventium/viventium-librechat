@@ -19,6 +19,51 @@ describe('cortexMessageState', () => {
     mockGetAgent = jest.fn().mockResolvedValue(null);
   });
 
+  test('returns clean follow-up text with structured Telegram delivery metadata', async () => {
+    const { getCortexMessageState } = require('~/server/services/viventium/cortexMessageState');
+
+    mockGetMessage.mockResolvedValueOnce({
+      messageId: 'msg-telegram',
+      conversationId: 'conv-1',
+      text: 'Primary answer.',
+      content: [],
+    });
+    mockGetMessages.mockResolvedValueOnce([
+      {
+        messageId: 'follow-up',
+        conversationId: 'conv-1',
+        text: 'First beat.\n\nSecond beat.',
+        metadata: {
+          viventium: {
+            type: 'cortex_followup',
+            parentMessageId: 'msg-telegram',
+            telegramDeliveryControls: {
+              skipVoice: true,
+              segments: ['First beat.', 'Second beat.'],
+            },
+          },
+        },
+      },
+    ]);
+
+    const state = await getCortexMessageState({
+      userId: 'user-1',
+      messageId: 'msg-telegram',
+      conversationId: 'conv-1',
+    });
+
+    expect(state.followUp).toEqual({
+      messageId: 'follow-up',
+      text: 'First beat.\n\nSecond beat.',
+      deliveryControls: {
+        skipVoice: true,
+        segments: ['First beat.', 'Second beat.'],
+      },
+    });
+    expect(JSON.stringify(state.followUp)).not.toContain('{MSG_BREAK}');
+    expect(JSON.stringify(state.followUp)).not.toContain('{SKIP_VOICE}');
+  });
+
   test('resolves deferred placeholder parent to the best completed insight when follow-up is absent', async () => {
     const { getCortexMessageState } = require('~/server/services/viventium/cortexMessageState');
 

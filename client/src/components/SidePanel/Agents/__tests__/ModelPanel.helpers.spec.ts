@@ -1,9 +1,39 @@
 import { describe, expect, it } from '@jest/globals';
 import {
   didAgentProviderChange,
+  resolveAgentModelDisplayLabel,
   resolveAgentModelForProvider,
   shouldDefaultOpenAIGPT56AgentToResponses,
 } from '../modelSelection';
+
+/* === VIVENTIUM START ===
+ * Regression: friendly provider model labels must survive the collapsed Agent Builder view.
+ * === VIVENTIUM END === */
+describe('resolveAgentModelDisplayLabel', () => {
+  it('renders the declared friendly model label while preserving the saved model id', () => {
+    expect(
+      resolveAgentModelDisplayLabel({
+        provider: 'glasshive-harness',
+        model: 'codex-cli:gpt-5.6-sol',
+        providerCapabilities: {
+          'glasshive-harness': {
+            models: [{ id: 'codex-cli:gpt-5.6-sol', label: 'Codex / GPT-5.6 Sol' }],
+          },
+        },
+      }),
+    ).toBe('Codex / GPT-5.6 Sol');
+  });
+
+  it('falls back to the exact model id when no display label is declared', () => {
+    expect(
+      resolveAgentModelDisplayLabel({
+        provider: 'openAI',
+        model: 'gpt-5.6-sol',
+        providerCapabilities: {},
+      }),
+    ).toBe('gpt-5.6-sol');
+  });
+});
 
 describe('resolveAgentModelForProvider', () => {
   it('preserves an existing saved model when the provider did not change', () => {

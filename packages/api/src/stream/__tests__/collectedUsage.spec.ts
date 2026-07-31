@@ -134,6 +134,69 @@ describe('CollectedUsage - GenerationJobManager', () => {
     jest.resetModules();
   });
 
+  /* === VIVENTIUM START ===
+   * Regression: explicit Stop must remain distinguishable from a transport disconnect so a
+   * harness-backed provider can cancel native work without cancelling resumable disconnects.
+   * === VIVENTIUM END === */
+  it('forwards an explicit abort reason to the local generation signal', async () => {
+    const { GenerationJobManager } = await import('../GenerationJobManager');
+    const { InMemoryJobStore } = await import('../implementations/InMemoryJobStore');
+    const { InMemoryEventTransport } = await import('../implementations/InMemoryEventTransport');
+
+    GenerationJobManager.configure({
+      jobStore: new InMemoryJobStore(),
+      eventTransport: new InMemoryEventTransport(),
+      isRedis: false,
+      cleanupOnComplete: false,
+    });
+    GenerationJobManager.initialize();
+
+    const streamId = `explicit-cancel-${Date.now()}`;
+    const job = await GenerationJobManager.createJob(streamId, 'user-1');
+    GenerationJobManager.setContentParts(streamId, [
+      { type: 'think', think: 'The harness started working.\n' },
+      {
+        type: 'harness_activity',
+        harness_activity: {
+          event: 'tool',
+          summary: 'The harness inspected the workspace.\n',
+        },
+      },
+    ] as never[]);
+    Object.defineProperty(job.abortController.signal, '_viventiumHarnessCancellationDelivery', {
+      value: Promise.resolve({ delivered: true }),
+    });
+    const result = await GenerationJobManager.abortJob(streamId, 'user_cancelled');
+
+    expect(job.abortController.signal.aborted).toBe(true);
+    expect(job.abortController.signal.reason).toBe('user_cancelled');
+    expect(result.content).toEqual([
+      {
+        type: 'harness_activity',
+        harness_activity: {
+          event: 'reasoning-summary',
+          summary: 'The harness started working.\n',
+        },
+      },
+      {
+        type: 'harness_activity',
+        harness_activity: {
+          event: 'tool',
+          summary: 'The harness inspected the workspace.\n',
+        },
+      },
+      {
+        type: 'harness_activity',
+        harness_activity: {
+          event: 'cancelled',
+          summary: 'The harness turn was cancelled.\n',
+        },
+      },
+    ]);
+
+    await GenerationJobManager.destroy();
+  });
+
   it('should set and retrieve collectedUsage through manager', async () => {
     const { GenerationJobManager } = await import('../GenerationJobManager');
     const { InMemoryJobStore } = await import('../implementations/InMemoryJobStore');

@@ -6,10 +6,10 @@
     "published_at": "2026-04-02T00:22:54-04:00"
   },
   "history_boundary": {
-    "parent_commit": "75fe431abd5398e59323befd699117adfbfb39a0",
-    "published_at": "2026-07-22T09:20:37-04:00"
+    "parent_commit": "8c3a34bcb63a19c6481e6309e632f858a0cbedac",
+    "published_at": "2026-07-27T14:15:45-04:00"
   },
-  "public_lock_revision_count": 74,
+  "public_lock_revision_count": 80,
   "invalid_predecessors": [
     {
       "predecessor_source_ref": "327dec04af80c3f6f6fbfe9eaeb7eb756b9fbe6b",
@@ -5504,12 +5504,24 @@
       "predecessor_managed_bundle_sha256": "97b05116ec78816fde075b7755ce276fc51ade69d41802688d3c33d5b3b98923",
       "baseline": {
         "schema_version": 1,
-        "bundle_sha256": "c2e85fb02e9b63eb6c7137300d57630e23b0156f61c9e6aab79e0dcb75a96a45",
+        "bundle_sha256": "63cdeb310a022f4b29f1eaa4a1135766aae66060689337343105dec6ce125cd9",
         "agents": {
           "agent_viventium_main_95aeb3": {
             "fields": {
               "instructions": {
                 "$viventium_managed_sha256": "4081746772cdd59a88d3d01536717288ff99b5038c998bb2e4da13aba08a51e1"
+              },
+              "provider": {
+                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
+              },
+              "model": {
+                "$viventium_managed_sha256": "cfaff7a01583ab1171b19140263fddfe86a812686ce572fcebd6cd934d3fb871"
+              },
+              "tools": {
+                "$viventium_managed_sha256": "8368ed9433cdebe28ed5a2c7f3c6fd50d6fcaf8dc49b8d3e099b987967984aeb"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "8ebb72f2d3b8dc15cdc103150a41baa85cab81840918cd75552f54e69851ea60"
               },
               "background_cortices": {
                 "$viventium_managed_sha256": "0e5118a4d731390afe76745c03edcff36d00aec7bd8626cc4f7d336df1ec06ce"
@@ -5558,16 +5570,62 @@
       "migration_id": "public-components-lock-group-22",
       "predecessor_source_refs": [
         "38527a8651653f5f7d0cba48038421653312d999",
-        "44ac1f7a149e5a915e52f2f9f54fce5d38bab710"
+        "44ac1f7a149e5a915e52f2f9f54fce5d38bab710",
+        "85a2e326cd5672f00c927984f00a92c9b3f07f9c",
+        "9e859bcac6a691bb67224380842b44b96a6e3073"
       ],
       "predecessor_source_bundle_sha256": "513d52ea409b6618f08368d8ba02313109afc36f3e954023f58ec54b6b7af9ac",
       "predecessor_managed_bundle_sha256": "399726f8fa75eef7f086d6db7c1b276297d0e49f8142f66a2604087726f74306",
       "baseline": {
         "schema_version": 1,
-        "bundle_sha256": "1a45d49d295538a64a6849af7cbdb5f9e6e7cddcf717776912f4eca76a47594d",
-        "agents": {}
+        "bundle_sha256": "0e12f0a36d3b1a116a9114eccc2e4e5041aa8058b1cced35f80a23387687b0e1",
+        "agents": {
+          "agent_viventium_main_95aeb3": {
+            "fields": {
+              "provider": {
+                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
+              },
+              "model": {
+                "$viventium_managed_sha256": "cfaff7a01583ab1171b19140263fddfe86a812686ce572fcebd6cd934d3fb871"
+              },
+              "tools": {
+                "$viventium_managed_sha256": "8368ed9433cdebe28ed5a2c7f3c6fd50d6fcaf8dc49b8d3e099b987967984aeb"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "8ebb72f2d3b8dc15cdc103150a41baa85cab81840918cd75552f54e69851ea60"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "migration_id": "public-components-lock-group-23",
+      "predecessor_source_refs": [
+        "6ba9ee1cf92cce7946e4204d499629dc78fc4fe7"
+      ],
+      "predecessor_source_bundle_sha256": "c4c8ddad8adb4ec4371c2da9adc7a07ac8c9f0e0996bff0684225393f15fae65",
+      "predecessor_managed_bundle_sha256": "c628487063a941086e044bb7d8dd8875fdd97de97b3b0d7ee6618378b8ef8a29",
+      "baseline": {
+        "schema_version": 1,
+        "bundle_sha256": "d8b54299f8e791189de4f1aa91fa5b7c81c1899d651b55f361b2c5b73f7bbe4d",
+        "agents": {
+          "agent_viventium_main_95aeb3": {
+            "fields": {
+              "provider": {
+                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
+              },
+              "model": {
+                "$viventium_managed_sha256": "cfaff7a01583ab1171b19140263fddfe86a812686ce572fcebd6cd934d3fb871"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "8ebb72f2d3b8dc15cdc103150a41baa85cab81840918cd75552f54e69851ea60"
+              }
+            }
+          }
+        }
       }
     }
   ],
-  "artifact_sha256": "3ba97d5c1ab07305b5699639426a8ee02d22f823031fc3d316f13802a83476a1"
+  "artifact_sha256": "7f11b23305d7adeaf40079c61040ce58e6fd3e17791b91ed2d45634e6056430a"
 }

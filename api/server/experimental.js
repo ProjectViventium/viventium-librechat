@@ -513,16 +513,15 @@ if (cluster.isMaster) {
   };
 
   startServer().catch((err) => {
-    if (!upgradeFinalization.isArmed()) {
-      throw err;
-    }
-    try {
-      upgradeFinalization.markFailed(err);
-    } catch (receiptError) {
-      logger.error(
-        `Worker ${process.pid}: could not persist failed API finalization proof:`,
-        receiptError,
-      );
+    if (upgradeFinalization.isArmed()) {
+      try {
+        upgradeFinalization.markFailed(err);
+      } catch (receiptError) {
+        logger.error(
+          `Worker ${process.pid}: could not persist failed API finalization proof:`,
+          receiptError,
+        );
+      }
     }
     logger.error(`Failed to start worker ${process.pid}:`, err);
     process.exit(1);

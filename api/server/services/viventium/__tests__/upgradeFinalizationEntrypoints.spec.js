@@ -6,12 +6,19 @@ describe('Viventium API finalization entrypoint contracts', () => {
   const standardSource = fs.readFileSync(path.join(serverRoot, 'index.js'), 'utf8');
   const clusteredSource = fs.readFileSync(path.join(serverRoot, 'experimental.js'), 'utf8');
 
-  test.each([
-    ['standard', standardSource],
-    ['clustered', clusteredSource],
-  ])('%s startup exits directly only for an armed finalization failure', (_label, source) => {
-    expect(source).toContain('if (!upgradeFinalization.isArmed()) {');
-    expect(source).toContain('throw startupError;');
+  test('standard startup preserves ordinary unarmed rejection behavior', () => {
+    expect(standardSource).toContain('if (!upgradeFinalization.isArmed()) {');
+    expect(standardSource).toContain('throw startupError;');
+  });
+
+  test('clustered outer startup failures always terminate the failed worker', () => {
+    const outerCatch = clusteredSource.split('startServer().catch((err) => {', 2)[1];
+
+    expect(outerCatch).toBeDefined();
+    expect(outerCatch).toContain('if (upgradeFinalization.isArmed()) {');
+    expect(outerCatch).toContain('upgradeFinalization.markFailed(err);');
+    expect(outerCatch).toContain('process.exit(1);');
+    expect(outerCatch).not.toContain('if (!upgradeFinalization.isArmed()) {');
   });
 
   test('clustered startup elects one receipt writer and backs off replacement failures', () => {

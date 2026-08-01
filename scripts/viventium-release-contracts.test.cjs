@@ -20,6 +20,19 @@ const RAG_FULL_IMAGE =
 const read = (file) => fs.readFileSync(path.join(ROOT, file), 'utf8');
 const json = (file) => JSON.parse(read(file));
 
+test('explicit Viventium env file isolates direct start from canonical App Support fallbacks', () => {
+  const launcher = read('viventium-start.sh');
+
+  assert.match(
+    launcher,
+    /if \[\[ -n "\$\{VIVENTIUM_ENV_FILE:-\}" \]\]; then[\s\S]*generated_env_files=\("\$VIVENTIUM_ENV_FILE"\)[\s\S]*else[\s\S]*runtime\/service-env\/librechat\.env[\s\S]*runtime\/runtime\.env[\s\S]*fi/,
+  );
+  assert.doesNotMatch(
+    launcher,
+    /for generated_env_file in \\\s*"\$\{VIVENTIUM_ENV_FILE:-\}" \\\s*"\$\{HOME\}\/Library\/Application Support\/Viventium\/runtime\/service-env\/librechat\.env"/,
+  );
+});
+
 test('pins source, package, container, devcontainer, and CI to Node 24.16.0', () => {
   assert.equal(read('.nvmrc').trim(), NODE_VERSION);
   assert.equal(read('.node-version').trim(), NODE_VERSION);

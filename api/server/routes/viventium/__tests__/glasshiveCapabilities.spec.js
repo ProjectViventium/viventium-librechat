@@ -40,7 +40,11 @@ function appWithRoute({ requestSignal } = {}) {
     app.use((req, _res, next) => {
       // Keep the sentinel inert: a native aborted signal can make Node abort the test transport
       // before this route gets a chance to prove that it does not forward request lifecycle state.
-      req.signal = requestSignal;
+      // Node 24 exposes `signal` as a getter-only request property, so shadow it explicitly.
+      Object.defineProperty(req, 'signal', {
+        configurable: true,
+        value: requestSignal,
+      });
       next();
     });
   }

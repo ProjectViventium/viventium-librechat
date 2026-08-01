@@ -882,6 +882,7 @@ export class RedisJobStore implements IJobStore {
       iconURL: data.iconURL || undefined,
       model: data.model || undefined,
       promptTokens: data.promptTokens ? parseInt(data.promptTokens, 10) : undefined,
+      voiceCallSessionId: data.voiceCallSessionId || undefined,
     };
   }
 }

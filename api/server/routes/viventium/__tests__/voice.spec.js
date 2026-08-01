@@ -869,6 +869,31 @@ describe('/api/viventium/voice/chat', () => {
     );
   });
 
+  test('does not race a second transport abort against explicit End Call cancellation', async () => {
+    const { GenerationJobManager } = require('@librechat/api');
+    const abortController = new AbortController();
+    abortController.abort('user_cancelled');
+    GenerationJobManager.getJob.mockResolvedValue({
+      metadata: { userId: 'user_1' },
+      abortController,
+    });
+
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/stream/lc_req_cancelled/abort',
+      headers: { 'x-viventium-call-secret': 'secret' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(202);
+    expect(res.body).toEqual({ success: true, alreadyCancelled: true });
+    expect(GenerationJobManager.abortJob).not.toHaveBeenCalled();
+  });
+
   test('Listen-Only mode saves ambient transcripts without starting an agent stream', async () => {
     const { initializeClient } = require('~/server/services/Endpoints/agents');
     const addTitle = require('~/server/services/Endpoints/agents/title');

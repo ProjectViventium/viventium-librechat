@@ -371,14 +371,14 @@ class GenerationJobManagerClass {
          * Purpose: Do not report a Redis-backed job as created until its
          * cross-replica abort channel is actually live.
          * === VIVENTIUM END === */
-        await eventTransport.onAbort(streamId, () => {
+        await eventTransport.onAbort(streamId, (reason) => {
           if (generation !== this.serviceGeneration) {
             return;
           }
           const currentRuntime = this.runtimeState.get(streamId);
           if (currentRuntime === runtime && !currentRuntime.abortController.signal.aborted) {
             logger.debug(`[GenerationJobManager] Received cross-replica abort for ${streamId}`);
-            currentRuntime.abortController.abort();
+            currentRuntime.abortController.abort(reason);
           }
         });
         this.assertServiceGeneration(generation);
@@ -472,6 +472,7 @@ class GenerationJobManagerClass {
         userMessage: jobData.userMessage,
         responseMessageId: jobData.responseMessageId,
         sender: jobData.sender,
+        voiceCallSessionId: jobData.voiceCallSessionId,
       },
       readyPromise: runtime.readyPromise,
       resolveReady: runtime.resolveReady,
@@ -595,7 +596,7 @@ class GenerationJobManagerClass {
          * Purpose: A lazily created replica runtime is usable only after its
          * abort subscription is acknowledged.
          * === VIVENTIUM END === */
-        await eventTransport.onAbort(streamId, () => {
+        await eventTransport.onAbort(streamId, (reason) => {
           if (generation !== this.serviceGeneration) {
             return;
           }
@@ -604,7 +605,7 @@ class GenerationJobManagerClass {
             logger.debug(
               `[GenerationJobManager] Received cross-replica abort for lazily-init job ${streamId}`,
             );
-            currentRuntime.abortController.abort();
+            currentRuntime.abortController.abort(reason);
           }
         });
         this.assertServiceGeneration(generation);
@@ -780,7 +781,11 @@ class GenerationJobManagerClass {
     // Emit abort signal for cross-replica support (Redis mode)
     // This ensures the generating replica receives the abort signal
     if (eventTransport.emitAbort) {
-      eventTransport.emitAbort(streamId);
+      await eventTransport.emitAbort(
+        streamId,
+        reason === 'user_cancelled' ? 'user_cancelled' : undefined,
+      );
+      this.assertServiceGeneration(generation);
     }
 
     // Also abort local controller if we have it (same-replica abort)
@@ -1242,6 +1247,9 @@ class GenerationJobManagerClass {
     }
     if (metadata.promptTokens !== undefined) {
       updates.promptTokens = metadata.promptTokens;
+    }
+    if (metadata.voiceCallSessionId) {
+      updates.voiceCallSessionId = metadata.voiceCallSessionId;
     }
     await services.jobStore.updateJob(streamId, updates);
     this.assertServiceGeneration(services.generation);

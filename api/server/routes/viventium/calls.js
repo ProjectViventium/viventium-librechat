@@ -12,7 +12,7 @@
 
 const express = require('express');
 const { logger } = require('@librechat/data-schemas');
-const { isEnabled } = require('@librechat/api');
+const { GenerationJobManager, isEnabled } = require('@librechat/api');
 const { requireJwtAuth } = require('~/server/middleware');
 const {
   createCallSession,
@@ -181,6 +181,50 @@ router.post('/:callSessionId/voice-settings', dispatchAuth, async (req, res) => 
     return res
       .status(status)
       .json({ error: err?.message || 'Call session voice-settings update failed' });
+  }
+});
+
+/* === VIVENTIUM START ===
+ * Feature: Explicit voice-call cancellation
+ * Purpose: End Call is user cancellation and must stop the exact harness-backed generation;
+ * refresh and transport disconnect do not request native provider cancellation because they never
+ * call this endpoint; successful stream reattachment remains a separate acceptance concern.
+ * === VIVENTIUM END === */
+router.post('/:callSessionId/end', dispatchAuth, async (req, res) => {
+  try {
+    const session = req.viventiumCallSession;
+    const activeJobIds = await GenerationJobManager.getActiveJobIdsForUser(session.userId);
+    const matchingJobIds = [];
+
+    for (const streamId of activeJobIds) {
+      const job = await GenerationJobManager.getJob(streamId);
+      if (
+        job?.metadata?.userId === session.userId &&
+        job.metadata.voiceCallSessionId === session.callSessionId
+      ) {
+        matchingJobIds.push(streamId);
+      }
+    }
+
+    const results = await Promise.allSettled(
+      matchingJobIds.map((streamId) => GenerationJobManager.abortJob(streamId, 'user_cancelled')),
+    );
+    const cancelled = results.filter(
+      (result) => result.status === 'fulfilled' && result.value?.success === true,
+    ).length;
+    const failed = results.length - cancelled;
+
+    logger.info('[VIVENTIUM][calls] call_session_ended', {
+      cancelled,
+      failed,
+    });
+    if (failed > 0) {
+      return res.status(503).json({ success: false, cancelled, failed });
+    }
+    return res.json({ success: true, cancelled });
+  } catch {
+    logger.error('[VIVENTIUM][calls] call_session_end_failed');
+    return res.status(500).json({ error: 'Failed to end call generation' });
   }
 });
 

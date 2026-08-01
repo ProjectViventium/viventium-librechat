@@ -1545,6 +1545,14 @@ router.post('/stream/:streamId/abort', voiceAuth, async (req, res) => {
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
+  if (
+    job.abortController?.signal?.aborted === true &&
+    job.abortController.signal.reason === 'user_cancelled'
+  ) {
+    logger.info('[VIVENTIUM][VoiceStream] abort_already_user_cancelled');
+    return res.status(202).json({ success: true, alreadyCancelled: true });
+  }
+
   const abortResult = await GenerationJobManager.abortJob(streamId);
 
   if (

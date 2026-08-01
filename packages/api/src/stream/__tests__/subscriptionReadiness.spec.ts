@@ -51,6 +51,18 @@ class FailedAbortTransport extends InMemoryEventTransport {
   }
 }
 
+class ReasonAbortTransport extends InMemoryEventTransport {
+  private abortCallback: ((reason?: 'user_cancelled') => void) | undefined;
+
+  onAbort(_streamId: string, callback: (reason?: 'user_cancelled') => void): void {
+    this.abortCallback = callback;
+  }
+
+  emitAbort(_streamId: string, reason?: 'user_cancelled'): void {
+    this.abortCallback?.(reason);
+  }
+}
+
 class DeferredDestroyTransport extends InMemoryEventTransport {
   private finishDestroy: (() => void) | undefined;
 
@@ -321,6 +333,21 @@ describe('GenerationJobManager subscription readiness', () => {
       'synthetic abort subscription failure',
     );
     await expect(jobStore.hasJob('abort-failure')).resolves.toBe(false);
+    await manager.destroy();
+  });
+
+  test('preserves explicit user-cancellation reason from a remote abort transport', async () => {
+    const transport = new ReasonAbortTransport();
+    const manager = new GenerationJobManagerClass({
+      eventTransport: transport,
+      jobStore: new InMemoryJobStore({ ttlAfterComplete: 60_000 }),
+    });
+    const job = await manager.createJob('reasoned-remote-abort', 'synthetic-user');
+
+    transport.emitAbort('reasoned-remote-abort', 'user_cancelled');
+
+    expect(job.abortController.signal.aborted).toBe(true);
+    expect(job.abortController.signal.reason).toBe('user_cancelled');
     await manager.destroy();
   });
 

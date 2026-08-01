@@ -43,6 +43,7 @@ export interface SerializableJobData {
   iconURL?: string;
   model?: string;
   promptTokens?: number;
+  voiceCallSessionId?: string;
 }
 
 /**
@@ -311,7 +312,7 @@ export interface IEventTransport {
    * generating Replica A receives signal and stops.
    * Optional - only implemented in Redis transport.
    */
-  emitAbort?(streamId: string): void;
+  emitAbort?(streamId: string, reason?: 'user_cancelled'): void | Promise<void>;
 
   /**
    * Register callback for abort signals from any replica (Redis mode).
@@ -322,7 +323,7 @@ export interface IEventTransport {
    * Purpose: Redis implementations expose acknowledgement and teardown
    * boundaries while in-memory implementations remain synchronous.
    * === VIVENTIUM END === */
-  onAbort?(streamId: string, callback: () => void): void | Promise<void>;
+  onAbort?(streamId: string, callback: (reason?: 'user_cancelled') => void): void | Promise<void>;
 
   /** Get subscriber count for a stream */
   getSubscriberCount(streamId: string): number;

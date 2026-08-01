@@ -19,6 +19,8 @@ export interface GenerationJobMetadata {
   model?: string;
   /** Prompt token count for abort token spending */
   promptTokens?: number;
+  /** Viventium voice-call session that owns this generation, when applicable */
+  voiceCallSessionId?: string;
 }
 
 export type GenerationJobStatus = 'running' | 'complete' | 'error' | 'aborted';

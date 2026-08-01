@@ -221,16 +221,37 @@ function auditSafeToolSummary({
   policy,
   tool,
 } = {}) {
+  const toolPolicy = getToolPolicy(policy, toolName, tool);
+  const sourceInputSchema =
+    inputSchema && typeof inputSchema === 'object' && !Array.isArray(inputSchema)
+      ? inputSchema
+      : { type: 'object', properties: {} };
+  const brokerInputSchema =
+    toolPolicy.access === 'write'
+      ? {
+          ...sourceInputSchema,
+          type: 'object',
+          properties: {
+            ...(sourceInputSchema.properties || {}),
+            invocation_id: {
+              type: 'string',
+              description:
+                'A stable unique id for this intended mutation; reuse it only when retrying the same action.',
+            },
+          },
+          required: Array.from(new Set([...(sourceInputSchema.required || []), 'invocation_id'])),
+        }
+      : sourceInputSchema;
   return {
     name: brokerName,
     title: `${serverName}:${toolName}`,
     description: description || '',
-    inputSchema: inputSchema || { type: 'object', properties: {} },
+    inputSchema: brokerInputSchema,
     annotations: {
       server: serverName,
       tool: toolName,
       riskClass: policy?.riskClass || 'unspecified',
-      access: getToolPolicy(policy, toolName, tool).access,
+      access: toolPolicy.access,
     },
   };
 }

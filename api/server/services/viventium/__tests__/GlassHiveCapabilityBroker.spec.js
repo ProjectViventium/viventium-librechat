@@ -962,6 +962,12 @@ describe('GlassHive capability broker', () => {
       args: { query: 'quarterly planning' },
     });
     expect(readAllowed).toEqual({ ok: true });
+    expect(mockGetMCPManager().callTool).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        options: expect.objectContaining({ timeout: 45000 }),
+      }),
+    );
+    expect(mockGetMCPManager().callTool.mock.calls.at(-1)[0].options.signal).toBeUndefined();
 
     const writeBlocked = await handleToolCall({
       grant,
@@ -1099,7 +1105,7 @@ describe('GlassHive capability broker', () => {
     expect(catalog.tools).toEqual([]);
   });
 
-  test('uses a fresh MCP connection and retries stale empty broker discovery once', async () => {
+  test('reuses an active MCP connection and retries stale empty broker discovery once', async () => {
     const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
     const {
       buildCapabilityCatalog,
@@ -1139,7 +1145,15 @@ describe('GlassHive capability broker', () => {
     const definitions = toolDefinitionsForMcp(catalog);
 
     expect(mockReinitMCPServer).toHaveBeenCalledTimes(2);
-    expect(mockReinitMCPServer).toHaveBeenCalledWith(
+    expect(mockReinitMCPServer).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        serverName: 'google_workspace',
+        forceNew: false,
+      }),
+    );
+    expect(mockReinitMCPServer).toHaveBeenNthCalledWith(
+      2,
       expect.objectContaining({
         serverName: 'google_workspace',
         forceNew: true,

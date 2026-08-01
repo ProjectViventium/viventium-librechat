@@ -581,6 +581,9 @@ describe('buildTelegramAudioOutputInstructions', () => {
     expect(result).toContain('{SKIP_VOICE}');
     expect(result).toContain('meant to be read, copied, scanned, edited, or reused');
     expect(result).toContain('explicitly asks for text only, no audio, or no voice note');
+    expect(result).toContain(
+      'transport control is not part of the visible answer and does not conflict with exact-wording instructions',
+    );
     expect(result).toContain('Do not skip audio for a normal conversational reply merely because');
     expect(result).toContain('explicitly asks to hear, read aloud, speak, or receive audio');
     expect(result).toContain('full visible text is still sent');

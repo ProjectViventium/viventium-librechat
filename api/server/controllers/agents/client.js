@@ -3907,31 +3907,6 @@ class AgentClient extends BaseClient {
               );
             }
           }
-          /* === VIVENTIUM START ===
-           * Feature: Visible/canonical callback repair.
-           * Purpose: After repairing a mismatch between streamed visible text and persisted
-           * canonical text, suppress a secondary follow-up so users do not receive duplicate
-           * callback responses.
-           */
-          if (
-            req?._viventiumVisibleDeltaAggregationRepaired === true &&
-            !effectiveShouldDeferMainResponse &&
-            recentResponse.trim().length > 0
-          ) {
-            logger.warn(
-              '[AgentClient] Suppressing cortex follow-up after repairing a visible/canonical text mismatch for parent=%s',
-              responseMessageId,
-            );
-            await recordTerminalPhaseBDecision({
-              result: 'suppressed',
-              suppressionReason: 'visible_delta_aggregation_repaired',
-              selectedStrategy: 'visible_primary_recovered_suppressed',
-              llmResult: 'not_requested',
-            });
-            await finalizeCanonicalParent();
-            return null;
-          }
-          /* === VIVENTIUM END === */
           const followUpMessage = await createCortexFollowUpMessage({
             req,
             conversationId,

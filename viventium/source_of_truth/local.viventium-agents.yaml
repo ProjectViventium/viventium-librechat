@@ -493,16 +493,19 @@ backgroundAgents:
     description: Deep analytical processing - surfaces hidden meanings and logical gaps.
     instructions:
       promptRef: cortex.background_analysis.execution
-    provider: openAI
-    model: gpt-5.6-terra
+    provider: glasshive-harness
+    model: codex-cli:gpt-5.6-sol
     tools:
       - sys__server__sys_mcp_sequential-thinking
       - sequentialthinking_mcp_sequential-thinking
     tool_kwargs: []
     model_parameters:
       reasoning_effort: medium
-      useResponsesApi: true
-      model: gpt-5.6-terra
+      model: codex-cli:gpt-5.6-sol
+    glasshive_options:
+      workspace:
+        mode: life
+      access: full
     end_after_tools: false
     hide_sequential_outputs: false
     support_contact:
@@ -528,14 +531,17 @@ backgroundAgents:
     description: Error detection - flags overconfidence and unchecked assumptions before they solidify.
     instructions:
       promptRef: cortex.confirmation_bias.execution
-    provider: openAI
-    model: gpt-5.6-terra
+    provider: glasshive-harness
+    model: codex-cli:gpt-5.6-sol
     tools: []
     tool_kwargs: []
     model_parameters:
       reasoning_effort: medium
-      useResponsesApi: true
-      model: gpt-5.6-terra
+      model: codex-cli:gpt-5.6-sol
+    glasshive_options:
+      workspace:
+        mode: life
+      access: full
     end_after_tools: false
     hide_sequential_outputs: false
     support_contact:
@@ -558,8 +564,8 @@ backgroundAgents:
     description: Evidence-first mistake detection - verifies claims, tests viability, and calls out rationalization.
     instructions:
       promptRef: cortex.red_team.execution
-    provider: openAI
-    model: gpt-5.6-sol
+    provider: glasshive-harness
+    model: codex-cli:gpt-5.6-sol
     tools:
       - sys__server__sys_mcp_sequential-thinking
       - sequentialthinking_mcp_sequential-thinking
@@ -567,9 +573,12 @@ backgroundAgents:
       - web_search
     tool_kwargs: []
     model_parameters:
-      reasoning_effort: xhigh
-      useResponsesApi: true
-      model: gpt-5.6-sol
+      reasoning_effort: high
+      model: codex-cli:gpt-5.6-sol
+    glasshive_options:
+      workspace:
+        mode: life
+      access: full
     end_after_tools: false
     hide_sequential_outputs: false
     support_contact:
@@ -593,16 +602,19 @@ backgroundAgents:
     description: Multi-step research across sources, building comprehensive understanding.
     instructions:
       promptRef: cortex.deep_research.execution
-    provider: openAI
-    model: gpt-5.6-sol
+    provider: glasshive-harness
+    model: codex-cli:gpt-5.6-sol
     tools:
       - sys__server__sys_mcp_sequential-thinking
       - sys__all__sys_mcp_sequential-thinking
     tool_kwargs: []
     model_parameters:
       reasoning_effort: xhigh
-      useResponsesApi: true
-      model: gpt-5.6-sol
+      model: codex-cli:gpt-5.6-sol
+    glasshive_options:
+      workspace:
+        mode: life
+      access: full
     end_after_tools: false
     hide_sequential_outputs: false
     support_contact:
@@ -626,14 +638,17 @@ backgroundAgents:
     description: Orchestrates MS365 productivity tool calls (Outlook email, calendar, OneDrive files).
     instructions:
       promptRef: cortex.online_tool_use.execution
-    provider: openAI
-    model: gpt-5.6-terra
+    provider: glasshive-harness
+    model: codex-cli:gpt-5.6-sol
     tools: []
     tool_kwargs: []
     model_parameters:
       reasoning_effort: low
-      useResponsesApi: true
-      model: gpt-5.6-terra
+      model: codex-cli:gpt-5.6-sol
+    glasshive_options:
+      workspace:
+        mode: life
+      access: full
     end_after_tools: false
     hide_sequential_outputs: false
     support_contact:
@@ -659,16 +674,19 @@ backgroundAgents:
     description: Mathematical, physics, and statistical reasoning using first-principles thinking.
     instructions:
       promptRef: cortex.parietal_cortex.execution
-    provider: openAI
-    model: gpt-5.6-terra
+    provider: glasshive-harness
+    model: codex-cli:gpt-5.6-sol
     tools:
       - sys__server__sys_mcp_sequential-thinking
       - sys__all__sys_mcp_sequential-thinking
     tool_kwargs: []
     model_parameters:
       reasoning_effort: medium
-      useResponsesApi: true
-      model: gpt-5.6-terra
+      model: codex-cli:gpt-5.6-sol
+    glasshive_options:
+      workspace:
+        mode: life
+      access: full
     end_after_tools: false
     hide_sequential_outputs: false
     support_contact: {}
@@ -686,14 +704,17 @@ backgroundAgents:
     description: Identifies recurring themes, behavioral loops, and contradictions across conversation.
     instructions:
       promptRef: cortex.pattern_recognition.execution
-    provider: openAI
-    model: gpt-5.6-terra
+    provider: glasshive-harness
+    model: codex-cli:gpt-5.6-sol
     tools: []
     tool_kwargs: []
     model_parameters:
       reasoning_effort: medium
-      useResponsesApi: true
-      model: gpt-5.6-terra
+      model: codex-cli:gpt-5.6-sol
+    glasshive_options:
+      workspace:
+        mode: life
+      access: full
     end_after_tools: false
     hide_sequential_outputs: false
     background_cortices: []
@@ -710,14 +731,17 @@ backgroundAgents:
     description: Senses emotional undercurrents and unspoken needs that words don't capture.
     instructions:
       promptRef: cortex.emotional_resonance.execution
-    provider: openAI
-    model: gpt-5.6-terra
+    provider: glasshive-harness
+    model: codex-cli:gpt-5.6-sol
     tools: []
     tool_kwargs: []
     model_parameters:
       reasoning_effort: low
-      useResponsesApi: true
-      model: gpt-5.6-terra
+      model: codex-cli:gpt-5.6-sol
+    glasshive_options:
+      workspace:
+        mode: life
+      access: full
     background_cortices: []
     fallback_llm_model: claude-opus-5
     fallback_llm_provider: anthropic
@@ -732,14 +756,17 @@ backgroundAgents:
     description: Transforms abstract goals into concrete action sequences with risk awareness.
     instructions:
       promptRef: cortex.strategic_planning.execution
-    provider: openAI
-    model: gpt-5.6-sol
+    provider: glasshive-harness
+    model: codex-cli:gpt-5.6-sol
     tools: []
     tool_kwargs: []
     model_parameters:
       reasoning_effort: high
-      useResponsesApi: true
-      model: gpt-5.6-sol
+      model: codex-cli:gpt-5.6-sol
+    glasshive_options:
+      workspace:
+        mode: life
+      access: full
     end_after_tools: false
     hide_sequential_outputs: false
     support_contact:
@@ -760,14 +787,17 @@ backgroundAgents:
     description: In-product help for using Viventium — conversations, voice, agents, integrations, scheduling. Never mentions internal implementation; escalates to the official Viventium support channel only when needed.
     instructions:
       promptRef: cortex.support.execution
-    provider: openAI
-    model: gpt-5.6-terra
+    provider: glasshive-harness
+    model: codex-cli:gpt-5.6-sol
     tools: []
     tool_kwargs: []
     model_parameters:
       reasoning_effort: low
-      useResponsesApi: true
-      model: gpt-5.6-terra
+      model: codex-cli:gpt-5.6-sol
+    glasshive_options:
+      workspace:
+        mode: life
+      access: full
     end_after_tools: false
     hide_sequential_outputs: false
     support_contact:
@@ -790,14 +820,17 @@ backgroundAgents:
     description: Orchestrates Google Workspace productivity tool calls
     instructions:
       promptRef: cortex.google.execution
-    provider: openAI
-    model: gpt-5.6-terra
+    provider: glasshive-harness
+    model: codex-cli:gpt-5.6-sol
     tools: []
     tool_kwargs: []
     model_parameters:
       reasoning_effort: low
-      useResponsesApi: true
-      model: gpt-5.6-terra
+      model: codex-cli:gpt-5.6-sol
+    glasshive_options:
+      workspace:
+        mode: life
+      access: full
     end_after_tools: false
     hide_sequential_outputs: false
     support_contact:

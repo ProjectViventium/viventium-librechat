@@ -93,7 +93,14 @@ async function handleRpc(req, res) {
       return res.json(rpcResult(id, {}));
     }
     if (body.method === 'tools/list') {
-      const catalog = await buildCapabilityCatalog({ grant, signal: req.signal });
+      /* === VIVENTIUM START ===
+       * Feature: Durable GlassHive broker tool execution.
+       * Purpose: The host request signal is already aborted by the surrounding HTTP lifecycle
+       *   before an MCP tool may execute. Passing it downstream made every healthy provider call
+       *   fail locally. GlassHive owns explicit run cancellation; the broker owns its bounded
+       *   provider timeout, so neither operation is coupled to this completed request signal.
+       */
+      const catalog = await buildCapabilityCatalog({ grant });
       return res.json(rpcResult(id, { tools: toolDefinitionsForMcp(catalog) }));
     }
     if (body.method === 'tools/call') {
@@ -101,8 +108,8 @@ async function handleRpc(req, res) {
         grant,
         toolName: body.params?.name,
         args: body.params?.arguments || {},
-        signal: req.signal,
       });
+      /* === VIVENTIUM END === */
       // MCP requires structuredContent to be a JSON object. Some underlying tools
       // (e.g. MS365 list_mail_messages) return arrays; emitting an array here makes
       // strict MCP clients (claude-code workers) reject the result with

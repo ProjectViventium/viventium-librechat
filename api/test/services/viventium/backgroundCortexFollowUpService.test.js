@@ -2247,6 +2247,42 @@ describe('BackgroundCortexFollowUpService', () => {
       expect(prompt).toContain('redundant or already covered');
     });
 
+    test('distinguishes topical overlap from repeated content and honors explicit later-continuation consent', () => {
+      const prompt = formatFollowUpPrompt({
+        insights: [
+          {
+            cortexName: 'Red Team',
+            insight: 'Validate demand with a paid pilot and a precommitted stop threshold.',
+          },
+        ],
+        recentResponse: 'Validate before building.',
+      });
+
+      expect(prompt).toContain('Sharing the same topic is not enough to call an insight redundant');
+      expect(prompt).toContain(
+        'unless the user explicitly authorized a conditional later continuation',
+      );
+    });
+
+    test('includes the original request so conditional continuation consent is decidable', () => {
+      const prompt = formatFollowUpPrompt({
+        insights: [{ cortexName: 'Red Team', insight: 'Require a paid pilot.' }],
+        recentResponse: 'Validate before building.',
+        userRequest:
+          'Give one initial sentence, then add a later continuation only for material new findings.',
+      });
+
+      expect(prompt).toContain(
+        'Give one initial sentence, then add a later continuation only for material new findings.',
+      );
+      expect(prompt).toContain(
+        'and the user did not explicitly authorize a conditional later continuation',
+      );
+      expect(prompt).not.toContain(
+        'If the primary answer already fulfilled the requested count or bound, output exactly {NTA};',
+      );
+    });
+
     test('returns empty string for no insights', () => {
       const prompt = formatFollowUpPrompt({
         insights: [],

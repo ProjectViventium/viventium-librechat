@@ -1842,6 +1842,11 @@ function formatFollowUpPrompt({
   const recentResponseContext = cleanContinuation
     ? `Here is the earlier response this follow-up belongs to:\n---\n${recentBlock}\n---`
     : `Here is the response you JUST sent to the user:\n---\n${recentBlock}\n---`;
+  const originalUserRequestContext = [
+    'Original user request for interpreting response-shape constraints and any explicit permission for a later continuation:',
+    `---\n${userRequestBlock}\n---`,
+    'Do not answer that request again; use it only to decide whether a concise additive continuation is authorized.',
+  ].join('\n');
   const continuationBlock = cleanContinuation
     ? [
         '## Current Conversation State',
@@ -1856,13 +1861,17 @@ function formatFollowUpPrompt({
     'This is NOT a new user message. Do NOT start a new turn.',
     surfaceRules,
     '## CRITICAL: Do Not Repeat',
+    originalUserRequestContext,
     recentResponseContext,
     continuationBlock,
     'Background agents provide evidence only. You decide whether there is anything worth surfacing.',
-    'You MUST NOT repeat, rephrase, re-ask, or echo ANY part of the above. If the background insights below overlap with what you already said, respond with {NTA}.',
+    'You MUST NOT repeat, rephrase, re-ask, or echo any concrete claim or advice from the response above.',
+    'Sharing the same topic is not enough to call an insight redundant. Compare concrete facts, risks, decisions, and actions: surface a new one even when it concerns the same topic.',
     'Only respond if the insights contain genuinely NEW information not covered above.',
     'If an insight contains new factual/contextual material followed by a question, keep the new material and drop the question.',
     'Use {NTA} only when there is truly no new user-visible content beyond a question or repetition.',
+    'Honor strict output shapes and bounded counts from the original request, unless the user explicitly authorized a conditional later continuation; in that case, surface qualifying new evidence in that authorized continuation.',
+    'If the primary answer already fulfilled a requested count or bound and the user did not explicitly authorize a conditional later continuation, respond with {NTA}; do not append optional secondary items.',
     '',
     insightLines ? `Background insights that surfaced after your response:\n${insightLines}` : '',
     limitationLines
@@ -1883,6 +1892,7 @@ function formatFollowUpPrompt({
     .join('\n\n');
   return getPromptText('cortex.follow_up_phase_b.user_message', fallbackPrompt, {
     surface_rules: surfaceRules,
+    user_request: userRequestBlock,
     recent_response_context: recentResponseContext,
     continuation_context: continuationBlock,
     background_insights: insightLines,
@@ -1920,7 +1930,7 @@ function buildFollowUpSystemPrompt({
         'You are a conversational AI assistant continuing an ongoing conversation.',
         'Your sole job: if background insights contain genuinely new information that was NOT in your recent response, add it in 1-3 natural sentences. Otherwise respond with exactly {NTA}.',
         'Background agents provide evidence only; you decide whether to surface a follow-up or stay silent with {NTA}.',
-        'Do not re-ask questions, do not repeat topics, do not introduce yourself.',
+        'Do not re-ask questions, do not repeat concrete content, and do not introduce yourself.',
         continuationContract,
         noResponseInstructions,
       ];

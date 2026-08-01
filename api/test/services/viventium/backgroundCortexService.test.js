@@ -126,6 +126,13 @@ jest.mock('~/server/controllers/agents/callbacks', () => ({
   getDefaultHandlers: jest.fn(() => ({})),
 }));
 
+jest.mock('~/server/services/viventium/GlassHiveCapabilityBootstrapService', () => ({
+  buildConversationProviderBootstrapBundle: jest.fn(async ({ allowedServerNames }) => ({
+    schemaVersion: 1,
+    allowedServerNames,
+  })),
+}));
+
 jest.mock('~/server/controllers/ModelController', () => ({
   getModelsConfig: jest.fn(async () => ({
     anthropic: ['claude-sonnet-4-5'],
@@ -177,6 +184,7 @@ const {
   buildCortexCompletionPayload,
   getCustomEndpointConfig,
   buildActivationLlmConfig,
+  getCortexAttemptGuardTimeoutMs,
   sanitizeCortexDisplayName,
 } = require('~/server/services/BackgroundCortexService');
 const { Run, createContentAggregator } = require('@librechat/agents');
@@ -189,6 +197,10 @@ const {
 const { logger } = require('@librechat/data-schemas');
 const { getAppConfig } = require('~/server/services/Config/app');
 const { loadAgent } = require('~/models/Agent');
+const { getDefaultHandlers } = require('~/server/controllers/agents/callbacks');
+const {
+  buildConversationProviderBootstrapBundle,
+} = require('~/server/services/viventium/GlassHiveCapabilityBootstrapService');
 const {
   PROMPT_BUNDLE_ENV,
   resetPromptRegistryForTests,
@@ -334,6 +346,13 @@ describe('BackgroundCortexService config hygiene helpers', () => {
     expect(sanitizeCortexDisplayName('Parietal Cortex')).toBe('Parietal Cortex');
     expect(sanitizeCortexDisplayName('Background Analysis')).toBe('Background Analysis');
     expect(sanitizeCortexDisplayName('')).toBe('Background Agent');
+  });
+
+  test('keeps the default cortex guard beyond supported run plus single-CLI queueing', () => {
+    delete process.env.VIVENTIUM_CORTEX_EXECUTION_TIMEOUT_MS;
+    delete process.env.VIVENTIUM_CORTEX_EXECUTION_GUARD_GRACE_MS;
+
+    expect(getCortexAttemptGuardTimeoutMs()).toBe(3_615_000);
   });
 
   test('uses env-backed custom endpoint config without hardcoded Groq URL fallback', async () => {
@@ -1710,6 +1729,71 @@ describe('BackgroundCortexService.executeCortex', () => {
     );
   });
 
+  test('direct GlassHive cortex does not launch fallback after native authoring starts', async () => {
+    let handlerReq;
+    getDefaultHandlers.mockImplementationOnce(({ req }) => {
+      handlerReq = req;
+      return {};
+    });
+    const primaryProcessStream = jest.fn(async () => {
+      handlerReq._viventiumHarnessInvocationStarted = true;
+      throw new Error('recoverable stream transport failure');
+    });
+    initializeAgent.mockResolvedValueOnce({
+      id: 'agent_direct_glasshive_started',
+      name: 'GlassHive Started Cortex',
+      tools: [],
+      userMCPAuthMap: null,
+      recursion_limit: 11,
+      provider: 'glasshive-harness',
+    });
+    createRun.mockResolvedValueOnce({ processStream: primaryProcessStream });
+    createContentAggregator.mockReturnValueOnce({ contentParts: [], aggregateContent: jest.fn() });
+
+    const result = await executeCortex({
+      agent: {
+        id: 'agent_direct_glasshive_started',
+        name: 'GlassHive Started Cortex',
+        provider: 'glasshive-harness',
+        model: 'codex-cli:gpt-5.6-sol',
+        model_parameters: { model: 'codex-cli:gpt-5.6-sol', reasoning_effort: 'high' },
+        fallback_llm_provider: 'anthropic',
+        fallback_llm_model: 'claude-sonnet-4-5',
+        fallback_llm_model_parameters: { model: 'claude-sonnet-4-5' },
+        tools: [],
+      },
+      messages: [{ role: 'user', content: 'Review this plan.' }],
+      runId: 'run-direct-glasshive-started',
+      conversationId: 'canonical-glasshive-conversation',
+      req: {
+        user: { id: 'user-1', role: 'USER' },
+        config: {
+          endpoints: {
+            agents: {
+              allowedProviders: ['glasshive-harness', 'anthropic'],
+              capabilityRequiredProviders: ['glasshive-harness'],
+              providerCapabilities: {
+                'glasshive-harness': { cortex_execution: true, workspace_binding: true },
+              },
+            },
+          },
+        },
+        body: { conversationId: 'new', parentMessageId: 'p1' },
+      },
+      contextMode: 'minimal',
+      executionTimeoutMs: 8000,
+    });
+
+    expect(createRun).toHaveBeenCalledTimes(1);
+    expect(result).toEqual(
+      expect.objectContaining({
+        insight: null,
+        harnessInvocationStarted: true,
+      }),
+    );
+    expect(result.fallbackUsed).toBeUndefined();
+  });
+
   test('suppresses productivity insights when no live tool call completed', async () => {
     const processStream = jest.fn(async () => 'run-output');
     const initializedAgent = {
@@ -1922,15 +2006,34 @@ describe('BackgroundCortexService.executeCortex', () => {
 
   test('executeActivated binds cortex provider requests to the canonical persisted conversation', async () => {
     const processStream = jest.fn(async () => 'bound cortex output');
+    const priorBrokerSecret = process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
+    process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = 'synthetic-broker-secret';
     const initializedAgent = {
       id: 'agent_glasshive_cortex',
       name: 'GlassHive Cortex',
-      tools: [],
+      tools: [
+        'worker_run_mcp_glasshive-workers-projects',
+        'search_gmail_messages_mcp_google_workspace',
+      ],
       userMCPAuthMap: null,
       recursion_limit: 11,
-      provider: 'openai',
+      provider: 'glasshive-harness',
+      model: 'codex-cli:gpt-5.6-sol',
+      model_parameters: { model: 'codex-cli:gpt-5.6-sol', reasoning_effort: 'xhigh' },
     };
 
+    loadAgent.mockResolvedValueOnce({
+      id: 'agent_glasshive_cortex',
+      name: 'GlassHive Cortex',
+      provider: 'glasshive-harness',
+      model: 'codex-cli:gpt-5.6-sol',
+      model_parameters: { model: 'codex-cli:gpt-5.6-sol', reasoning_effort: 'xhigh' },
+      glasshive_options: { workspace: { mode: 'life' }, access: 'full' },
+      tools: [
+        'worker_run_mcp_glasshive-workers-projects',
+        'search_gmail_messages_mcp_google_workspace',
+      ],
+    });
     initializeAgent.mockResolvedValueOnce(initializedAgent);
     createRun.mockResolvedValueOnce({ processStream });
     createContentAggregator.mockReturnValueOnce({
@@ -1940,6 +2043,21 @@ describe('BackgroundCortexService.executeCortex', () => {
 
     const req = {
       user: { id: 'user-1', role: 'USER' },
+      config: {
+        endpoints: {
+          agents: {
+            allowedProviders: ['glasshive-harness'],
+            capabilityRequiredProviders: ['glasshive-harness'],
+            providerCapabilities: {
+              'glasshive-harness': {
+                cortex_execution: true,
+                workspace_binding: true,
+                excluded_mcp_servers: ['glasshive-workers-projects'],
+              },
+            },
+          },
+        },
+      },
       body: { conversationId: 'new', parentMessageId: 'parent-1' },
     };
     await executeActivated({
@@ -1963,6 +2081,11 @@ describe('BackgroundCortexService.executeCortex', () => {
     expect(initializeAgent).toHaveBeenCalledWith(
       expect.objectContaining({
         conversationId: 'canonical-conversation-1',
+        agent: expect.objectContaining({
+          provider: 'glasshive-harness',
+          model: 'codex-cli:gpt-5.6-sol',
+          glasshive_options: { workspace: { mode: 'life' }, access: 'full' },
+        }),
       }),
       expect.any(Object),
     );
@@ -1972,9 +2095,31 @@ describe('BackgroundCortexService.executeCortex', () => {
           conversationId: 'canonical-conversation-1',
           messageId: 'response-message-1',
           parentMessageId: 'parent-1',
+          viventiumGlassHiveIdempotencyKey: 'cortex:agent_glasshive_cortex:response-message-1',
         }),
+        agents: [
+          expect.objectContaining({
+            provider: 'glasshive-harness',
+            model_parameters: expect.objectContaining({
+              configuration: expect.objectContaining({
+                defaultHeaders: expect.objectContaining({
+                  'X-GlassHive-Bootstrap-Bundle-B64': expect.any(String),
+                  'X-GlassHive-Bootstrap-Signature': expect.stringMatching(/^sha256=/),
+                }),
+              }),
+            }),
+          }),
+        ],
       }),
     );
+    expect(buildConversationProviderBootstrapBundle).toHaveBeenCalledWith(
+      expect.objectContaining({ allowedServerNames: ['google_workspace'] }),
+    );
+    if (priorBrokerSecret == null) {
+      delete process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
+    } else {
+      process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = priorBrokerSecret;
+    }
   });
 
   test('executeActivated emits a silent terminal completion for no-response cortex output', async () => {
@@ -2141,6 +2286,85 @@ describe('BackgroundCortexService.executeCortex', () => {
           }),
         ],
       }),
+    );
+  });
+
+  test('executeActivated does not launch fallback after GlassHive native authoring starts', async () => {
+    let handlerReq;
+    getDefaultHandlers.mockImplementationOnce(({ req }) => {
+      handlerReq = req;
+      return {};
+    });
+    const primaryProcessStream = jest.fn(async () => {
+      handlerReq._viventiumHarnessInvocationStarted = true;
+      throw new Error('recoverable stream transport failure');
+    });
+    const onCortexComplete = jest.fn();
+    const onAllComplete = jest.fn();
+
+    loadAgent.mockResolvedValueOnce({
+      id: 'agent_glasshive_started',
+      name: 'GlassHive Started Cortex',
+      provider: 'glasshive-harness',
+      model: 'codex-cli:gpt-5.6-sol',
+      model_parameters: { model: 'codex-cli:gpt-5.6-sol', reasoning_effort: 'high' },
+      fallback_llm_provider: 'anthropic',
+      fallback_llm_model: 'claude-sonnet-4-5',
+      fallback_llm_model_parameters: { model: 'claude-sonnet-4-5' },
+      tools: [],
+    });
+    initializeAgent.mockResolvedValueOnce({
+      id: 'agent_glasshive_started',
+      name: 'GlassHive Started Cortex',
+      tools: [],
+      userMCPAuthMap: null,
+      recursion_limit: 11,
+      provider: 'glasshive-harness',
+    });
+    createRun.mockResolvedValueOnce({ processStream: primaryProcessStream });
+    createContentAggregator.mockReturnValueOnce({ contentParts: [], aggregateContent: jest.fn() });
+
+    await executeActivated({
+      req: {
+        user: { id: 'user-1', role: 'USER' },
+        config: {
+          endpoints: {
+            agents: {
+              allowedProviders: ['glasshive-harness', 'anthropic'],
+              capabilityRequiredProviders: ['glasshive-harness'],
+              providerCapabilities: {
+                'glasshive-harness': { cortex_execution: true, workspace_binding: true },
+              },
+            },
+          },
+        },
+        body: { conversationId: 'c1', parentMessageId: 'p1' },
+      },
+      res: null,
+      mainAgent: { provider: 'glasshive-harness' },
+      messages: [{ role: 'user', content: 'Review this.' }],
+      runId: 'run-activated-glasshive-started',
+      activatedCortices: [
+        {
+          agentId: 'agent_glasshive_started',
+          cortexName: 'GlassHive Started Cortex',
+          confidence: 1,
+          reason: 'risk_review',
+        },
+      ],
+      onCortexComplete,
+      onAllComplete,
+    });
+
+    expect(createRun).toHaveBeenCalledTimes(1);
+    expect(onCortexComplete).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cortex_id: 'agent_glasshive_started',
+        status: 'error',
+      }),
+    );
+    expect(onAllComplete).toHaveBeenCalledWith(
+      expect.objectContaining({ hasErrors: true, insights: [] }),
     );
   });
 

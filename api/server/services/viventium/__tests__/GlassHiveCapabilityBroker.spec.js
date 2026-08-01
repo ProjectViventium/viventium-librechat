@@ -158,6 +158,56 @@ describe('GlassHive capability broker', () => {
     expect(allowed).toEqual(['google_workspace']);
   });
 
+  test('projects declared Scheduling Cortex tools into a direct GlassHive provider bundle', async () => {
+    const {
+      buildConversationProviderBootstrapBundle,
+    } = require('../GlassHiveCapabilityBootstrapService');
+    mockGetMCPServersRegistry.mockReturnValue({
+      getAllServerConfigs: jest.fn().mockResolvedValue({
+        'scheduling-cortex': {
+          source: 'config',
+          viventiumGlassHive: {
+            version: 1,
+            permitsAutonomousWorker: true,
+            hostAllowed: true,
+            sandboxAllowed: false,
+            defaultToolAccess: 'none',
+            contentReadPolicy: 'require_broker_grant',
+            writePolicy: 'allow',
+            toolPolicies: {
+              schedule_list: { access: 'content_read' },
+              schedule_create: { access: 'write' },
+            },
+          },
+        },
+        'not-declared': {
+          source: 'config',
+          viventiumGlassHive: {
+            version: 1,
+            permitsAutonomousWorker: true,
+            hostAllowed: true,
+            defaultToolAccess: 'content_read',
+          },
+        },
+      }),
+    });
+
+    const result = await buildConversationProviderBootstrapBundle({
+      user: { id: 'user-1', role: 'USER' },
+      requestBody: { conversationId: 'conversation-1', messageId: 'message-1' },
+      allowedServerNames: ['scheduling-cortex'],
+    });
+
+    expect(result.glasshive_capability_broker.allowed_servers).toEqual(['scheduling-cortex']);
+    expect(result.glasshive_capability_broker.scopes.content_read).toBe(true);
+    expect(result.codex_config_append).toContain('glasshive-user-capabilities');
+    expect(result.env.GLASSHIVE_CAPABILITY_BROKER_TOKEN).toEqual(expect.any(String));
+    const providerGrant = JSON.parse(
+      Buffer.from(result.env.GLASSHIVE_CAPABILITY_BROKER_TOKEN, 'base64url').toString('utf8'),
+    );
+    expect(providerGrant.allow_dynamic_policy_servers).toBe(false);
+  });
+
   test('injects broker MCP config into GlassHive launch bootstrap without provider secrets', async () => {
     const {
       maybeInjectGlassHiveCapabilityBroker,
@@ -751,6 +801,74 @@ describe('GlassHive capability broker', () => {
     );
   });
 
+  test('exposes broker idempotency for explicitly allowed scheduling writes', async () => {
+    const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
+    const {
+      buildCapabilityCatalog,
+      handleToolCall,
+      toolDefinitionsForMcp,
+    } = require('../GlassHiveCapabilityBrokerService');
+    const policyConfig = {
+      source: 'config',
+      viventiumGlassHive: {
+        version: 1,
+        permitsAutonomousWorker: true,
+        hostAllowed: true,
+        sandboxAllowed: false,
+        defaultToolAccess: 'none',
+        writePolicy: 'allow',
+        toolPolicies: {
+          schedule_create: { access: 'write' },
+        },
+      },
+    };
+    mockGetMCPServersRegistry.mockReturnValue({
+      getServerConfig: jest.fn().mockResolvedValue(policyConfig),
+    });
+    mockReinitMCPServer.mockResolvedValue({
+      success: true,
+      oauthRequired: false,
+      tools: [
+        {
+          name: 'schedule_create',
+          description: 'Create a scheduled task',
+          inputSchema: {
+            type: 'object',
+            properties: { prompt: { type: 'string' } },
+            required: ['prompt'],
+            additionalProperties: false,
+          },
+        },
+      ],
+    });
+    const callTool = jest.fn().mockResolvedValue({ success: true });
+    mockGetMCPManager.mockReturnValue({ callTool });
+    const grant = mintBrokerGrant({
+      user: { id: 'user-1', role: 'USER' },
+      allowedServers: ['scheduling-cortex'],
+    }).payload;
+
+    const catalog = await buildCapabilityCatalog({ grant });
+    const definition = toolDefinitionsForMcp(catalog).find(
+      (tool) => tool.name === 'gh_scheduling_cortex__schedule_create',
+    );
+    expect(definition.inputSchema.properties.invocation_id).toEqual(
+      expect.objectContaining({ type: 'string' }),
+    );
+    expect(definition.inputSchema.additionalProperties).toBe(false);
+
+    await expect(
+      handleToolCall({
+        grant,
+        toolName: definition.name,
+        args: { prompt: 'Synthetic reminder', invocation_id: 'schedule-create-synthetic-1' },
+      }),
+    ).resolves.toEqual({ success: true });
+    expect(callTool).toHaveBeenCalledWith(
+      expect.objectContaining({ toolArguments: { prompt: 'Synthetic reminder' } }),
+    );
+  });
+
   test('requires signed content-read grant scope and escalates destructive annotations to write policy', async () => {
     const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
     const {
@@ -844,6 +962,12 @@ describe('GlassHive capability broker', () => {
       args: { query: 'quarterly planning' },
     });
     expect(readAllowed).toEqual({ ok: true });
+    expect(mockGetMCPManager().callTool).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        options: expect.objectContaining({ timeout: 45000 }),
+      }),
+    );
+    expect(mockGetMCPManager().callTool.mock.calls.at(-1)[0].options.signal).toBeUndefined();
 
     const writeBlocked = await handleToolCall({
       grant,
@@ -981,7 +1105,7 @@ describe('GlassHive capability broker', () => {
     expect(catalog.tools).toEqual([]);
   });
 
-  test('uses a fresh MCP connection and retries stale empty broker discovery once', async () => {
+  test('reuses an active MCP connection and retries stale empty broker discovery once', async () => {
     const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
     const {
       buildCapabilityCatalog,
@@ -1021,7 +1145,15 @@ describe('GlassHive capability broker', () => {
     const definitions = toolDefinitionsForMcp(catalog);
 
     expect(mockReinitMCPServer).toHaveBeenCalledTimes(2);
-    expect(mockReinitMCPServer).toHaveBeenCalledWith(
+    expect(mockReinitMCPServer).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        serverName: 'google_workspace',
+        forceNew: false,
+      }),
+    );
+    expect(mockReinitMCPServer).toHaveBeenNthCalledWith(
+      2,
       expect.objectContaining({
         serverName: 'google_workspace',
         forceNew: true,

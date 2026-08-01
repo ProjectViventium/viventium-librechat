@@ -86,11 +86,11 @@ async function requestedServersFromGrant(grant, user, registry) {
 }
 
 async function discoverServerTools({ user, serverName, serverConfig, signal } = {}) {
-  const discoverOnce = () =>
+  const discoverOnce = (forceNew) =>
     reinitMCPServer({
       user,
       signal,
-      forceNew: true,
+      forceNew,
       serverName,
       serverConfig,
       returnOnOAuth: true,
@@ -99,7 +99,14 @@ async function discoverServerTools({ user, serverName, serverConfig, signal } = 
       },
     });
 
-  let result = await discoverOnce();
+  /* === VIVENTIUM START ===
+   * Feature: Stable GlassHive broker MCP reuse.
+   * Purpose: Catalog resolution runs before every brokered tool call. Replacing a healthy
+   *   user-scoped MCP connection here can invalidate the connection immediately before the
+   *   actual call, especially when a harness retries in parallel. Reuse first; only force a
+   *   fresh connection when discovery proves the cached connection stale or empty.
+   */
+  let result = await discoverOnce(false);
   const toolCount = () => (Array.isArray(result?.tools) ? result.tools.length : 0);
   const shouldRetry =
     !signal?.aborted && !result?.oauthRequired && (!result?.success || toolCount() === 0);
@@ -110,9 +117,10 @@ async function discoverServerTools({ user, serverName, serverConfig, signal } = 
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
     if (!signal?.aborted) {
-      result = await discoverOnce();
+      result = await discoverOnce(true);
     }
   }
+  /* === VIVENTIUM END === */
 
   return {
     tools: Array.isArray(result?.tools) ? result.tools : [],
@@ -339,15 +347,14 @@ async function invokeUnderlyingTool({ grant, catalog, nativeTool, args = {}, sig
    *   `provider_degraded` blocker the worker reports per its completion contract, not hang or
    *   bubble an opaque RPC error that nudges the worker into a browser fallback. */
   const providerTimeoutMs = brokerProviderTimeoutMs();
-  const abortController = new AbortController();
-  const onParentAbort = () => abortController.abort();
-  if (signal) {
-    if (signal.aborted) {
-      abortController.abort();
-    } else if (typeof signal.addEventListener === 'function') {
-      signal.addEventListener('abort', onParentAbort, { once: true });
-    }
-  }
+  /* Let the MCP SDK own its request timeout. Passing a broker-created AbortSignal through
+   * `MCPManager.callTool` made a reusable HTTP connection behave like a one-shot connection:
+   * the next call could fail locally with `This operation was aborted` before the request ever
+   * reached the healthy provider. A real caller cancellation signal is still preserved. */
+  const requestOptions = {
+    timeout: providerTimeoutMs,
+    ...(signal ? { signal } : {}),
+  };
   let timedOut = false;
   let timeoutHandle = null;
   let result;
@@ -358,7 +365,7 @@ async function invokeUnderlyingTool({ grant, catalog, nativeTool, args = {}, sig
         toolName: nativeTool.toolName,
         provider: DEFAULT_PROVIDER,
         toolArguments,
-        options: { signal: abortController.signal },
+        options: requestOptions,
         user: catalog.user,
         requestBody: {
           conversationId: grant.conversation_id,
@@ -381,7 +388,6 @@ async function invokeUnderlyingTool({ grant, catalog, nativeTool, args = {}, sig
       new Promise((_resolve, reject) => {
         timeoutHandle = setTimeout(() => {
           timedOut = true;
-          abortController.abort();
           reject(new Error(`broker provider call timed out after ${providerTimeoutMs}ms`));
         }, providerTimeoutMs);
       }),
@@ -414,9 +420,6 @@ async function invokeUnderlyingTool({ grant, catalog, nativeTool, args = {}, sig
   } finally {
     if (timeoutHandle) {
       clearTimeout(timeoutHandle);
-    }
-    if (signal && typeof signal.removeEventListener === 'function') {
-      signal.removeEventListener('abort', onParentAbort);
     }
   }
   logger.info('[VIVENTIUM][glasshive-capability-broker] MCP tool invoked', {

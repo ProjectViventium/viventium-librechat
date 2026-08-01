@@ -33,9 +33,15 @@ jest.mock('~/server/services/viventium/GlassHiveCapabilityBrokerService', () => 
   toolDefinitionsForMcp: (...args) => mockToolDefinitionsForMcp(...args),
 }));
 
-function appWithRoute() {
+function appWithRoute({ requestSignal } = {}) {
   const app = express();
   app.use(express.json());
+  if (requestSignal) {
+    app.use((req, _res, next) => {
+      req.signal = requestSignal;
+      next();
+    });
+  }
   app.use('/api/viventium/glasshive/capabilities', require('../glasshiveCapabilities'));
   return app;
 }
@@ -83,14 +89,16 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
       },
     ]);
 
-    const response = await request(appWithRoute())
+    const response = await request(appWithRoute({ requestSignal: AbortSignal.abort() }))
       .post('/api/viventium/glasshive/capabilities/mcp')
       .set('Authorization', `Bearer ${token}`)
       .send({ jsonrpc: '2.0', id: 2, method: 'tools/list' })
       .expect(200);
 
     expect(response.body.result.tools[0].name).toBe('capabilities_list');
-    expect(mockBuildCapabilityCatalog).toHaveBeenCalled();
+    expect(mockBuildCapabilityCatalog).toHaveBeenCalledWith(
+      expect.not.objectContaining({ signal: expect.anything() }),
+    );
   });
 
   test('rate limits repeated broker requests for the same grant', async () => {
@@ -179,7 +187,7 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
     });
     mockHandleToolCall.mockResolvedValue({ servers: [{ name: 'google_workspace' }] });
 
-    const response = await request(appWithRoute())
+    const response = await request(appWithRoute({ requestSignal: AbortSignal.abort() }))
       .post('/api/viventium/glasshive/capabilities/mcp')
       .set('Authorization', `Bearer ${token}`)
       .send({
@@ -191,6 +199,9 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
       .expect(200);
 
     expect(response.body.result.structuredContent.servers[0].name).toBe('google_workspace');
+    expect(mockHandleToolCall).toHaveBeenCalledWith(
+      expect.not.objectContaining({ signal: expect.anything() }),
+    );
   });
 
   test('omits structuredContent for array tool results so strict MCP clients accept them', async () => {

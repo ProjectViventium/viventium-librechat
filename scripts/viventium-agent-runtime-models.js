@@ -19,6 +19,7 @@ const APPROVED_BACKGROUND_RUNTIME_FAMILIES = new Set([
   'openAI::gpt-5.6-terra',
   'anthropic::claude-opus-5',
   'anthropic::claude-opus-4-8',
+  'glasshive-harness::codex-cli:gpt-5.6-sol',
 ]);
 
 const APPROVED_BACKGROUND_ACTIVATION_FAMILIES = new Set([
@@ -126,12 +127,22 @@ const BUILT_IN_BACKGROUND_AGENT_IDS = Object.freeze(
   ),
 );
 
+const CANONICAL_BUILT_IN_MAIN_MODEL_PARAMETERS = Object.freeze({
+  openAI: Object.freeze({
+    reasoning_effort: 'medium',
+    useResponsesApi: true,
+  }),
+  anthropic: Object.freeze({}),
+  'glasshive-harness': Object.freeze({ reasoning_effort: 'medium' }),
+});
+
 const CANONICAL_BUILT_IN_BACKGROUND_MODEL_PARAMETERS = Object.freeze({
   agent_viventium_background_analysis_95aeb3: Object.freeze({
     openAI: Object.freeze({
       reasoning_effort: 'medium',
       useResponsesApi: true,
     }),
+    'glasshive-harness': Object.freeze({ reasoning_effort: 'medium' }),
   }),
   agent_viventium_confirmation_bias_95aeb3: Object.freeze({
     openAI: Object.freeze({
@@ -141,6 +152,7 @@ const CANONICAL_BUILT_IN_BACKGROUND_MODEL_PARAMETERS = Object.freeze({
     anthropic: Object.freeze({
       thinking: false,
     }),
+    'glasshive-harness': Object.freeze({ reasoning_effort: 'medium' }),
   }),
   agent_viventium_red_team_95aeb3: Object.freeze({
     openAI: Object.freeze({
@@ -150,6 +162,7 @@ const CANONICAL_BUILT_IN_BACKGROUND_MODEL_PARAMETERS = Object.freeze({
     anthropic: Object.freeze({
       thinkingBudget: 4000,
     }),
+    'glasshive-harness': Object.freeze({ reasoning_effort: 'high' }),
   }),
   agent_viventium_deep_research_95aeb3: Object.freeze({
     openAI: Object.freeze({
@@ -159,24 +172,28 @@ const CANONICAL_BUILT_IN_BACKGROUND_MODEL_PARAMETERS = Object.freeze({
     anthropic: Object.freeze({
       thinkingBudget: 4000,
     }),
+    'glasshive-harness': Object.freeze({ reasoning_effort: 'xhigh' }),
   }),
   agent_viventium_online_tool_use_95aeb3: Object.freeze({
     openAI: Object.freeze({
       reasoning_effort: 'low',
       useResponsesApi: true,
     }),
+    'glasshive-harness': Object.freeze({ reasoning_effort: 'low' }),
   }),
   agent_viventium_parietal_cortex_95aeb3: Object.freeze({
     openAI: Object.freeze({
       reasoning_effort: 'medium',
       useResponsesApi: true,
     }),
+    'glasshive-harness': Object.freeze({ reasoning_effort: 'medium' }),
   }),
   agent_viventium_pattern_recognition_95aeb3: Object.freeze({
     openAI: Object.freeze({
       reasoning_effort: 'medium',
       useResponsesApi: true,
     }),
+    'glasshive-harness': Object.freeze({ reasoning_effort: 'medium' }),
   }),
   agent_viventium_emotional_resonance_95aeb3: Object.freeze({
     openAI: Object.freeze({
@@ -186,6 +203,7 @@ const CANONICAL_BUILT_IN_BACKGROUND_MODEL_PARAMETERS = Object.freeze({
     anthropic: Object.freeze({
       thinking: false,
     }),
+    'glasshive-harness': Object.freeze({ reasoning_effort: 'low' }),
   }),
   agent_viventium_strategic_planning_95aeb3: Object.freeze({
     openAI: Object.freeze({
@@ -195,18 +213,21 @@ const CANONICAL_BUILT_IN_BACKGROUND_MODEL_PARAMETERS = Object.freeze({
     anthropic: Object.freeze({
       thinkingBudget: 2000,
     }),
+    'glasshive-harness': Object.freeze({ reasoning_effort: 'high' }),
   }),
   agent_viventium_support_95aeb3: Object.freeze({
     openAI: Object.freeze({
       reasoning_effort: 'low',
       useResponsesApi: true,
     }),
+    'glasshive-harness': Object.freeze({ reasoning_effort: 'low' }),
   }),
   agent_8Y1d7JNhpubtvzYz3hvEv: Object.freeze({
     openAI: Object.freeze({
       reasoning_effort: 'low',
       useResponsesApi: true,
     }),
+    'glasshive-harness': Object.freeze({ reasoning_effort: 'low' }),
   }),
 });
 
@@ -395,6 +416,37 @@ function canonicalBuiltInBackgroundModelParameters(agentId, provider) {
   return canonical ? deepClone(canonical) : {};
 }
 
+function canonicalBuiltInModelParameters(agentId, provider, incomingParameters = {}) {
+  if (agentId === 'agent_viventium_main_95aeb3') {
+    const normalizedProvider = normalizeProvider(provider);
+    const canonical = CANONICAL_BUILT_IN_MAIN_MODEL_PARAMETERS[normalizedProvider];
+    if (canonical == null) {
+      return null;
+    }
+    if (normalizedProvider === 'anthropic') {
+      const providerNative = deepClone(incomingParameters || {});
+      delete providerNative.reasoning_effort;
+      delete providerNative.useResponsesApi;
+      return providerNative;
+    }
+    return deepClone(canonical);
+  }
+  const canonical = canonicalBuiltInBackgroundModelParameters(agentId, provider);
+  if (canonical == null) {
+    return null;
+  }
+  if (normalizeProvider(provider) === 'anthropic') {
+    const providerNative = {
+      ...canonical,
+      ...deepClone(incomingParameters || {}),
+    };
+    delete providerNative.reasoning_effort;
+    delete providerNative.useResponsesApi;
+    return providerNative;
+  }
+  return canonical;
+}
+
 function rewriteAgentForRuntime(
   agent,
   { env = process.env, capabilityRequiredProviders = [] } = {},
@@ -423,16 +475,19 @@ function rewriteAgentForRuntime(
     if (assignment) {
       rewritten.provider = assignment.provider;
       rewritten.model = assignment.model;
-      const canonicalBuiltInParameters = canonicalBuiltInBackgroundModelParameters(
-        rewritten.id,
-        assignment.provider,
-      );
-      if (canonicalBuiltInParameters !== null) {
-        rewritten.model_parameters = {
-          ...canonicalBuiltInParameters,
-          model: assignment.model,
-        };
-      } else if (
+    }
+    const canonicalBuiltInParameters = canonicalBuiltInModelParameters(
+      rewritten.id,
+      rewritten.provider,
+      assignment ? {} : rewritten.model_parameters,
+    );
+    if (canonicalBuiltInParameters !== null) {
+      rewritten.model_parameters = {
+        ...canonicalBuiltInParameters,
+        model: rewritten.model,
+      };
+    } else if (assignment) {
+      if (
         rewritten.model_parameters &&
         typeof rewritten.model_parameters === 'object' &&
         !Array.isArray(rewritten.model_parameters)
@@ -564,7 +619,11 @@ function buildCanonicalPersistedAgentFields(
     !Array.isArray(agent.model_parameters)
       ? deepClone(agent.model_parameters)
       : {};
-  const canonicalBuiltInParameters = canonicalBuiltInBackgroundModelParameters(agent.id, provider);
+  const canonicalBuiltInParameters = canonicalBuiltInModelParameters(
+    agent.id,
+    provider,
+    incomingModelParameters,
+  );
   const existingProvider = normalizeProvider(existingAgent?.provider);
   const existingModel = String(
     existingAgent?.model || existingAgent?.model_parameters?.model || '',
@@ -578,12 +637,10 @@ function buildCanonicalPersistedAgentFields(
     patch.model_parameters = patch.model
       ? {
           ...canonicalBuiltInParameters,
-          ...incomingModelParameters,
           model: patch.model,
         }
       : {
           ...canonicalBuiltInParameters,
-          ...incomingModelParameters,
         };
   } else {
     const mergedModelParameters = {
@@ -783,6 +840,7 @@ module.exports = {
   APPROVED_MAIN_RUNTIME_FAMILIES,
   APPROVED_BACKGROUND_RUNTIME_FAMILIES,
   APPROVED_BACKGROUND_ACTIVATION_FAMILIES,
+  CANONICAL_BUILT_IN_MAIN_MODEL_PARAMETERS,
   CANONICAL_BUILT_IN_BACKGROUND_MODEL_PARAMETERS,
   BUILT_IN_BACKGROUND_AGENT_IDS,
   AGENT_RUNTIME_ENV_BY_ID,

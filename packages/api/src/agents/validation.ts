@@ -212,10 +212,12 @@ export type ProviderCapabilityRegistry = Record<
     realtime_voice?: boolean;
     automatic_fallback_target?: boolean;
     workspace_binding?: boolean;
+    native_tools?: boolean;
     conversation_session?: boolean;
     responses_api?: boolean;
     default_access?: 'full' | 'workspace';
     allow_full_access?: boolean;
+    excluded_mcp_servers?: string[];
     models?: Array<{
       id: string;
       effortChoices?: string[];

@@ -14,6 +14,7 @@ const crypto = require('crypto');
 const { logger } = require('@librechat/data-schemas');
 const { Run, Providers } = require('@librechat/agents');
 const {
+  applyDeclaredProviderTransport,
   createSafeUser,
   initializeAnthropic,
   initializeOpenAI,
@@ -1359,9 +1360,16 @@ async function resolveFollowUpLLMConfig({
     llmConfig.temperature = baseModelParameters.temperature;
   }
 
+  let declaredProviderTransport;
   if (req && resolvedProviderName) {
     const agentsConfig = req.config?.endpoints?.agents || {};
     const followUpCapability = agentsConfig.providerCapabilities?.[resolvedProviderName];
+    if (followUpCapability?.responses_api === false) {
+      declaredProviderTransport = {
+        mode: 'chat_completions',
+        reasoningEffort: baseModelParameters.reasoning_effort,
+      };
+    }
     const followUpIdempotencyKey = buildHarnessIdempotencyKey(
       'phase_b',
       parentMessageId || req.body?.responseMessageId || req.body?.messageId,
@@ -1451,7 +1459,12 @@ async function resolveFollowUpLLMConfig({
     );
   }
 
-  return llmConfig;
+  /* === VIVENTIUM START ===
+   * Feature: Capability-declared Phase B provider transport.
+   * Purpose: Phase B constructs `Run` directly, so enforce the same capability-owned transport
+   * contract used by ordinary agent runs after custom endpoint parameter pruning is complete.
+   * === VIVENTIUM END === */
+  return applyDeclaredProviderTransport(llmConfig, declaredProviderTransport, llmConfig.provider);
 }
 /* === VIVENTIUM NOTE === */
 

@@ -144,8 +144,7 @@ const customProviders = new Set([
 
 // === VIVENTIUM START ===
 // Feature: Optional global streamUsage disable to suppress LangChain merge warnings.
-const disableStreamUsageEnv =
-  (process.env.VIVENTIUM_DISABLE_STREAM_USAGE ?? '').trim() === '1';
+const disableStreamUsageEnv = (process.env.VIVENTIUM_DISABLE_STREAM_USAGE ?? '').trim() === '1';
 // === VIVENTIUM END ===
 export function getReasoningKey(
   provider: Providers,
@@ -179,7 +178,76 @@ type RunAgent = Omit<Agent, 'tools'> & {
   toolDefinitions?: LCTool[];
   /** Precomputed flag indicating if any tools have defer_loading enabled */
   hasDeferredTools?: boolean;
+  /* === VIVENTIUM START === Capability-declared provider wire transport. === */
+  /** Runtime-only wire contract derived from provider capability metadata during initialization. */
+  declaredProviderTransport?: DeclaredProviderTransport;
+  /* === VIVENTIUM END === */
 };
+
+/* === VIVENTIUM START ===
+ * Feature: Capability-declared provider wire transport.
+ * Purpose: Enforce Chat Completions after SDK model-name heuristics while preserving the exact
+ * provider model on the serialized wire request.
+ */
+export type DeclaredProviderTransport = {
+  mode: 'chat_completions';
+  reasoningEffort?: string;
+};
+
+const CHAT_COMPLETIONS_INTERNAL_MODEL = 'viventium-chat-completions';
+
+/**
+ * Enforces a capability-declared Chat Completions wire contract at the model-construction seam.
+ *
+ * @langchain/openai may force Responses solely from a model-name heuristic even when
+ * `useResponsesApi` is false. Keep the exact provider model in `modelKwargs`, which wins in the
+ * serialized Chat Completions payload, while using a transport-neutral internal model name for
+ * SDK routing. This is capability-driven and applies to any compatible provider, not a label.
+ */
+export function applyDeclaredProviderTransport(
+  modelParameters: Record<string, unknown>,
+  transport?: DeclaredProviderTransport,
+  provider?: Providers | string,
+): Record<string, unknown> {
+  const next = { ...modelParameters };
+  if (transport?.mode !== 'chat_completions') {
+    return next;
+  }
+
+  if (
+    String(provider ?? '')
+      .trim()
+      .toLowerCase() !== String(Providers.OPENAI).trim().toLowerCase()
+  ) {
+    throw new Error(
+      `A declared Chat Completions transport requires an OpenAI-compatible provider; received "${String(provider ?? 'missing')}"`,
+    );
+  }
+
+  const wireModel = String(next.model ?? '').trim();
+  if (!wireModel) {
+    throw new Error('A declared Chat Completions provider requires an exact model');
+  }
+
+  const existingModelKwargs =
+    next.modelKwargs && typeof next.modelKwargs === 'object' && !Array.isArray(next.modelKwargs)
+      ? (next.modelKwargs as Record<string, unknown>)
+      : {};
+  const reasoningEffort = String(transport.reasoningEffort ?? '').trim();
+  next.modelKwargs = {
+    ...existingModelKwargs,
+    model: wireModel,
+    ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
+  };
+  next.model = CHAT_COMPLETIONS_INTERNAL_MODEL;
+  next.useResponsesApi = false;
+  delete next.reasoning;
+  delete next.reasoning_summary;
+  delete next.verbosity;
+  delete next.web_search;
+  return next;
+}
+/* === VIVENTIUM END === */
 
 const nullableAgentModelParameterKeys = [
   'temperature',
@@ -274,9 +342,17 @@ export async function createRun({
      * input flag meaning disabled, so consume it before creating graph client options.
      * Added: 2026-05-19
      * === VIVENTIUM END === */
-    const modelParameters = {
-      ...(normalizeAgentModelParameters(agent.model_parameters) ?? {}),
-    } as Record<string, unknown>;
+    /* === VIVENTIUM START ===
+     * Feature: Capability-declared provider wire transport.
+     * Purpose: Apply the contract immediately before the agents package constructs its model.
+     * === VIVENTIUM END === */
+    const modelParameters = applyDeclaredProviderTransport(
+      {
+        ...(normalizeAgentModelParameters(agent.model_parameters) ?? {}),
+      } as Record<string, unknown>,
+      agent.declaredProviderTransport,
+      provider,
+    );
     if (provider === Providers.ANTHROPIC && modelParameters.thinking === false) {
       delete modelParameters.thinking;
       delete modelParameters.thinkingBudget;
@@ -321,9 +397,10 @@ export async function createRun({
 
     /** Resolves issues with new OpenAI usage field */
     // === VIVENTIUM START ===
-    const requestMeta = requestBody as
-      | { viventiumSurface?: string; viventiumInputMode?: string }
-      | undefined;
+    const requestMeta = requestBody as {
+      viventiumSurface?: string;
+      viventiumInputMode?: string;
+    };
     const inputMode = (requestMeta?.viventiumInputMode ?? '').toString().toLowerCase();
     const voiceSurface = requestMeta?.viventiumSurface === 'voice' || inputMode === 'voice_call';
     const forceDisableStreamUsage = disableStreamUsageEnv || voiceSurface;

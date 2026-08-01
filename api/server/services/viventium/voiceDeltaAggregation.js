@@ -249,9 +249,7 @@ function collapseRecoveredVisibleTextDuplicate({ contentParts, recoveredText }) 
     return false;
   }
 
-  const firstTextIndex = contentParts.findIndex(
-    (part) => part && part.type === ContentTypes.TEXT,
-  );
+  const firstTextIndex = contentParts.findIndex((part) => part && part.type === ContentTypes.TEXT);
   if (firstTextIndex < 0) {
     return false;
   }

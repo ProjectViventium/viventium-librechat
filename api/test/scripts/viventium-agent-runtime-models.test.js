@@ -62,9 +62,9 @@ describe('viventium-agent-runtime-models', () => {
         reasoning_effort: reasoningEffort,
         useResponsesApi: true,
       });
-      expect(
-        CANONICAL_BUILT_IN_BACKGROUND_MODEL_PARAMETERS[agentId]['glasshive-harness'],
-      ).toEqual({ reasoning_effort: glasshiveEffortOverrides[agentId] || reasoningEffort });
+      expect(CANONICAL_BUILT_IN_BACKGROUND_MODEL_PARAMETERS[agentId]['glasshive-harness']).toEqual({
+        reasoning_effort: glasshiveEffortOverrides[agentId] || reasoningEffort,
+      });
     }
   });
 

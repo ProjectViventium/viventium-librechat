@@ -252,9 +252,9 @@ describe('voiceDeltaAggregation', () => {
   test('does not collapse repeated text without an exact recovered replay match', () => {
     const contentParts = [{ type: ContentTypes.TEXT, text: 'hahaha' }];
 
-    expect(
-      collapseRecoveredVisibleTextDuplicate({ contentParts, recoveredText: 'ha' }),
-    ).toBe(false);
+    expect(collapseRecoveredVisibleTextDuplicate({ contentParts, recoveredText: 'ha' })).toBe(
+      false,
+    );
     expect(contentParts).toEqual([{ type: ContentTypes.TEXT, text: 'hahaha' }]);
   });
 });

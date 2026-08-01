@@ -3911,8 +3911,7 @@ async function executeCortexOnce({
         activationScope,
         configuredTools: configuredToolCount,
         completedToolCalls: toolExecutionState.completed || 0,
-        harnessInvocationStarted:
-          harnessInvocationReq?._viventiumHarnessInvocationStarted === true,
+        harnessInvocationStarted: harnessInvocationReq?._viventiumHarnessInvocationStarted === true,
       };
     }
 
@@ -3934,8 +3933,7 @@ async function executeCortexOnce({
         activationScope,
         configuredTools: configuredToolCount,
         completedToolCalls: toolExecutionState.completed || 0,
-        harnessInvocationStarted:
-          harnessInvocationReq?._viventiumHarnessInvocationStarted === true,
+        harnessInvocationStarted: harnessInvocationReq?._viventiumHarnessInvocationStarted === true,
       };
     }
 
@@ -3951,8 +3949,7 @@ async function executeCortexOnce({
       activationScope,
       configuredTools: configuredToolCount,
       completedToolCalls: toolExecutionState.completed || 0,
-      harnessInvocationStarted:
-        harnessInvocationReq?._viventiumHarnessInvocationStarted === true,
+      harnessInvocationStarted: harnessInvocationReq?._viventiumHarnessInvocationStarted === true,
     };
   } catch (error) {
     const isAborted = abortController?.signal?.aborted === true || error?.name === 'AbortError';
@@ -3993,8 +3990,7 @@ async function executeCortexOnce({
       activationScope,
       configuredTools: configuredToolCount,
       completedToolCalls,
-      harnessInvocationStarted:
-        harnessInvocationReq?._viventiumHarnessInvocationStarted === true,
+      harnessInvocationStarted: harnessInvocationReq?._viventiumHarnessInvocationStarted === true,
     };
   } finally {
     if (abortTimer) {

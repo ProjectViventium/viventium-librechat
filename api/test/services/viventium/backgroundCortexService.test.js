@@ -2095,8 +2095,7 @@ describe('BackgroundCortexService.executeCortex', () => {
           conversationId: 'canonical-conversation-1',
           messageId: 'response-message-1',
           parentMessageId: 'parent-1',
-          viventiumGlassHiveIdempotencyKey:
-            'cortex:agent_glasshive_cortex:response-message-1',
+          viventiumGlassHiveIdempotencyKey: 'cortex:agent_glasshive_cortex:response-message-1',
         }),
         agents: [
           expect.objectContaining({

@@ -569,12 +569,22 @@ describe('buildWebTextInstructions', () => {
 describe('buildTelegramAudioOutputInstructions', () => {
   test('gives the model a semantic optional-audio decision without runtime heuristics', () => {
     const result = buildTelegramAudioOutputInstructions('xai');
+    const source = fs.readFileSync(
+      path.resolve(
+        __dirname,
+        '../../../../../viventium/source_of_truth/prompts/surface/messaging_optional_audio.md',
+      ),
+      'utf8',
+    );
+    const registeredBody = source.replace(/^---[\s\S]*?\n---\s*\n/, '').trim();
 
     expect(result).toContain('{SKIP_VOICE}');
     expect(result).toContain('meant to be read, copied, scanned, edited, or reused');
+    expect(result).toContain('explicitly asks for text only, no audio, or no voice note');
     expect(result).toContain('Do not skip audio for a normal conversational reply merely because');
     expect(result).toContain('explicitly asks to hear, read aloud, speak, or receive audio');
     expect(result).toContain('full visible text is still sent');
+    expect(result).toContain(registeredBody);
   });
 
   test('Telegram text mode and audio output overlay can be combined without voice-call rules', () => {

@@ -96,6 +96,55 @@ describe('viventium-seed-agents', () => {
     }
   });
 
+  test('round-trips GlassHive LIFE options through fresh seed and update paths only when declared', () => {
+    const glassHiveOptions = {
+      workspace: { mode: 'life' },
+      access: 'full',
+    };
+    const normalized = normalizeBundleForRuntimeWithOwner(
+      {
+        mainAgent: {
+          id: 'agent_viventium_main_95aeb3',
+          provider: 'glasshive-harness',
+          model: 'codex-cli:gpt-5.6-sol',
+          model_parameters: {
+            model: 'codex-cli:gpt-5.6-sol',
+            reasoning_effort: 'medium',
+          },
+          glasshive_options: glassHiveOptions,
+        },
+      },
+      {
+        env: {},
+        capabilityRequiredProviders: ['glasshive-harness'],
+      },
+    );
+
+    expect(pickAgentFields(normalized.mainAgent).glasshive_options).toEqual(glassHiveOptions);
+    expect(
+      buildSeedAgentUpdatePlan(
+        {
+          id: normalized.mainAgent.id,
+          provider: normalized.mainAgent.provider,
+          model: normalized.mainAgent.model,
+          model_parameters: normalized.mainAgent.model_parameters,
+        },
+        normalized.mainAgent,
+      ).updateData.glasshive_options,
+    ).toEqual(glassHiveOptions);
+
+    const directAgent = {
+      id: 'agent_viventium_support_95aeb3',
+      provider: 'anthropic',
+      model: 'claude-opus-5',
+    };
+    expect(pickAgentFields(directAgent)).toEqual(directAgent);
+    expect(buildSeedAgentUpdatePlan(directAgent, directAgent).updateData).toEqual({
+      provider: 'anthropic',
+      model: 'claude-opus-5',
+    });
+  });
+
   test('normalizes built-in models from runtime env and injects owner metadata', () => {
     const bundle = {
       meta: {

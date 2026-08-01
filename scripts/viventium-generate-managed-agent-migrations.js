@@ -42,6 +42,7 @@ const MANAGED_FIELDS = Object.freeze([
   'tools',
   'tool_kwargs',
   'model_parameters',
+  'glasshive_options',
   'end_after_tools',
   'hide_sequential_outputs',
   'support_contact',

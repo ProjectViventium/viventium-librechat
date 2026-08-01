@@ -55,6 +55,9 @@ const AGENT_FIELDS = [
   'tools',
   'tool_kwargs',
   'model_parameters',
+  /* === VIVENTIUM START === GlassHive Agent seed/create/update round-trip. === */
+  'glasshive_options',
+  /* === VIVENTIUM END === */
   'end_after_tools',
   'hide_sequential_outputs',
   'support_contact',

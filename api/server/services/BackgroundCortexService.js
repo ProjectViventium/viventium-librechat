@@ -3269,6 +3269,7 @@ ${activationFormat}`;
  * @param {object} params.agent - Loaded cortex agent
  * @param {Array} params.messages - Conversation messages to provide context
  * @param {string} params.runId - Unique run ID
+ * @param {string} [params.conversationId] - Canonical persisted conversation ID
  * @param {object} [params.req] - Express request object (required for custom endpoints and tool loading)
  * @param {object} [params.res] - Express response object (for tool streaming if needed)
  * @param {'full'|'minimal'} [params.contextMode='full'] - Minimal mode is for compact internal workers.
@@ -3279,6 +3280,7 @@ async function executeCortexOnce({
   agent,
   messages,
   runId,
+  conversationId,
   req,
   res,
   activationScope = null,
@@ -3303,6 +3305,7 @@ async function executeCortexOnce({
     safeReq.body = safeReq.body || {};
     safeReq.user = safeReq.user || {};
     safeReq.config = safeReq.config || (await getAppConfig({ role: safeReq.user?.role }));
+    const resolvedConversationId = conversationId || safeReq.body.conversationId;
     const minimalContext = contextMode === 'minimal';
 
     const providerName = (agent.provider || '').toLowerCase();
@@ -3545,7 +3548,7 @@ async function executeCortexOnce({
         signal: abortController.signal,
         streamId,
         requestFiles: safeReq.body.files ?? [],
-        conversationId: safeReq.body.conversationId ?? null,
+        conversationId: resolvedConversationId ?? null,
         agent: agentForRun,
         endpointOption: { endpoint: EModelEndpoint.agents },
         allowedProviders,
@@ -3766,7 +3769,7 @@ async function executeCortexOnce({
     const cortexRequestBody = {
       ...safeReq.body,
       messageId: runId,
-      conversationId: safeReq.body.conversationId,
+      conversationId: resolvedConversationId,
       parentMessageId: safeReq.body.parentMessageId,
       viventiumGlassHiveIdempotencyKey: cortexIdempotencyKey,
     };
@@ -4553,6 +4556,7 @@ async function detectActivations({
  * @param {object} params.mainAgent - The main agent
  * @param {Array} params.messages - Current conversation messages
  * @param {string} params.runId - Unique run ID
+ * @param {string} [params.conversationId] - Canonical persisted conversation ID
  * @param {Array} params.activatedCortices - Results from detectActivations()
  * @param {Function} [params.onCortexBrewing] - Callback when cortex starts executing
  * @param {Function} [params.onCortexComplete] - Callback when cortex completes
@@ -4565,6 +4569,7 @@ async function executeActivated({
   mainAgent,
   messages,
   runId,
+  conversationId,
   activatedCortices,
   onCortexBrewing,
   onCortexComplete,
@@ -4593,6 +4598,7 @@ async function executeActivated({
       agent,
       messages,
       runId,
+      conversationId,
       req,
       res,
       activationScope: activationResult.activationScope || null,

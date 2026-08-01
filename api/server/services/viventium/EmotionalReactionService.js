@@ -205,7 +205,7 @@ async function writeHealth({ deps, userId, config, fields }) {
 }
 
 async function runEmotionalReaction(
-  { req, userText, stimulusId, scheduledSnapshot },
+  { req, userText, stimulusId, conversationId, scheduledSnapshot },
   injectedDeps = {},
 ) {
   const deps = { ...defaultDeps(), ...injectedDeps };
@@ -362,6 +362,7 @@ async function runEmotionalReaction(
                 ),
               ],
         runId: `${stimulusId || 'turn'}-feelings-reaction-${attempt}`,
+        conversationId,
         req: reactionReq,
         res: createBackgroundRes(),
         contextMode: 'minimal',

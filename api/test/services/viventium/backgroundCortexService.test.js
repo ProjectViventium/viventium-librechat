@@ -1680,15 +1680,20 @@ describe('BackgroundCortexService.executeCortex', () => {
       },
       messages: [{ role: 'user', content: 'Return a typed result.' }],
       runId: 'run-direct-fallback',
+      conversationId: 'canonical-fallback-conversation',
       req: {
         user: { id: 'user-1', role: 'USER' },
-        body: { conversationId: 'c1', parentMessageId: 'p1' },
+        body: { conversationId: 'new', parentMessageId: 'p1' },
       },
       contextMode: 'minimal',
       executionTimeoutMs: 8000,
     });
 
     expect(createRun).toHaveBeenCalledTimes(2);
+    expect(createRun.mock.calls.map(([options]) => options.requestBody.conversationId)).toEqual([
+      'canonical-fallback-conversation',
+      'canonical-fallback-conversation',
+    ]);
     expect(initializeAgent.mock.calls[1][0].agent).toEqual(
       expect.objectContaining({ provider: 'anthropic', model: 'claude-sonnet-4-5' }),
     );
@@ -1911,6 +1916,63 @@ describe('BackgroundCortexService.executeCortex', () => {
             error_class: 'no_live_tool_execution',
           }),
         ],
+      }),
+    );
+  });
+
+  test('executeActivated binds cortex provider requests to the canonical persisted conversation', async () => {
+    const processStream = jest.fn(async () => 'bound cortex output');
+    const initializedAgent = {
+      id: 'agent_glasshive_cortex',
+      name: 'GlassHive Cortex',
+      tools: [],
+      userMCPAuthMap: null,
+      recursion_limit: 11,
+      provider: 'openai',
+    };
+
+    initializeAgent.mockResolvedValueOnce(initializedAgent);
+    createRun.mockResolvedValueOnce({ processStream });
+    createContentAggregator.mockReturnValueOnce({
+      contentParts: [{ type: 'text', text: 'bound cortex output' }],
+      aggregateContent: jest.fn(),
+    });
+
+    const req = {
+      user: { id: 'user-1', role: 'USER' },
+      body: { conversationId: 'new', parentMessageId: 'parent-1' },
+    };
+    await executeActivated({
+      req,
+      res: null,
+      mainAgent: { provider: 'glasshive-harness' },
+      messages: [{ role: 'user', content: 'Review this carefully.' }],
+      runId: 'response-message-1',
+      conversationId: 'canonical-conversation-1',
+      activatedCortices: [
+        {
+          agentId: 'agent_glasshive_cortex',
+          cortexName: 'GlassHive Cortex',
+          confidence: 1,
+          reason: 'risk_review',
+        },
+      ],
+    });
+
+    expect(req.body.conversationId).toBe('new');
+    expect(initializeAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: 'canonical-conversation-1',
+      }),
+      expect.any(Object),
+    );
+    expect(createRun).toHaveBeenCalledWith(
+      expect.objectContaining({
+        requestBody: expect.objectContaining({
+          conversationId: 'canonical-conversation-1',
+          messageId: 'response-message-1',
+          parentMessageId: 'parent-1',
+        }),
       }),
     );
   });

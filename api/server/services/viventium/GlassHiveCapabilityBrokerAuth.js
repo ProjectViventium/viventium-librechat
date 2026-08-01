@@ -89,6 +89,7 @@ function mintBrokerGrant({
   ttlSeconds = DEFAULT_TTL_SECONDS,
   renewableTtlSeconds = ttlSeconds,
   scopes = {},
+  allowDynamicPolicyServers = true,
   nowMs = Date.now(),
 } = {}) {
   const secret = getBrokerSecret();
@@ -121,7 +122,7 @@ function mintBrokerGrant({
     run_id: String(requestContext.run_id || requestContext.runId || ''),
     execution_mode: String(executionMode || requestContext.execution_mode || ''),
     allowed_servers: sanitizeAllowedServers(allowedServers),
-    allow_dynamic_policy_servers: true,
+    allow_dynamic_policy_servers: allowDynamicPolicyServers === true,
     scopes: normalizeBrokerScopes(scopes),
     iat,
     exp,

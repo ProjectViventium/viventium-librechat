@@ -582,6 +582,10 @@ async function buildConversationProviderBootstrapBundle({
         'VIVENTIUM_GLASSHIVE_PROVIDER_BROKER_RENEWABLE_TTL_SECONDS',
         24 * 60 * 60,
       ),
+      // A direct provider run is scoped to the MCP servers declared on that Agent. Do not expand
+      // it to unrelated reviewed connectors, whose auth/discovery latency could block the intended
+      // local capability and would violate the Agent Builder selection.
+      allowDynamicPolicyServers: false,
       scopes: { content_read: contentReadScope },
     });
   } catch (error) {

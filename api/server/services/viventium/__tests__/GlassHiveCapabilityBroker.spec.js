@@ -202,6 +202,10 @@ describe('GlassHive capability broker', () => {
     expect(result.glasshive_capability_broker.scopes.content_read).toBe(true);
     expect(result.codex_config_append).toContain('glasshive-user-capabilities');
     expect(result.env.GLASSHIVE_CAPABILITY_BROKER_TOKEN).toEqual(expect.any(String));
+    const providerGrant = JSON.parse(
+      Buffer.from(result.env.GLASSHIVE_CAPABILITY_BROKER_TOKEN, 'base64url').toString('utf8'),
+    );
+    expect(providerGrant.allow_dynamic_policy_servers).toBe(false);
   });
 
   test('injects broker MCP config into GlassHive launch bootstrap without provider secrets', async () => {

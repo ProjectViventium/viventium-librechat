@@ -352,7 +352,7 @@ function buildActivationCooldownKey({ agentId, req, runId } = {}) {
 function getCortexExecutionTimeoutMs() {
   const raw = String(process.env.VIVENTIUM_CORTEX_EXECUTION_TIMEOUT_MS || '').trim();
   const parsed = parseInt(raw, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 180_000;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 3_600_000;
 }
 
 function getCortexExecutionGuardGraceMs() {

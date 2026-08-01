@@ -184,6 +184,7 @@ const {
   buildCortexCompletionPayload,
   getCustomEndpointConfig,
   buildActivationLlmConfig,
+  getCortexAttemptGuardTimeoutMs,
   sanitizeCortexDisplayName,
 } = require('~/server/services/BackgroundCortexService');
 const { Run, createContentAggregator } = require('@librechat/agents');
@@ -345,6 +346,13 @@ describe('BackgroundCortexService config hygiene helpers', () => {
     expect(sanitizeCortexDisplayName('Parietal Cortex')).toBe('Parietal Cortex');
     expect(sanitizeCortexDisplayName('Background Analysis')).toBe('Background Analysis');
     expect(sanitizeCortexDisplayName('')).toBe('Background Agent');
+  });
+
+  test('keeps the default cortex guard beyond supported run plus single-CLI queueing', () => {
+    delete process.env.VIVENTIUM_CORTEX_EXECUTION_TIMEOUT_MS;
+    delete process.env.VIVENTIUM_CORTEX_EXECUTION_GUARD_GRACE_MS;
+
+    expect(getCortexAttemptGuardTimeoutMs()).toBe(3_615_000);
   });
 
   test('uses env-backed custom endpoint config without hardcoded Groq URL fallback', async () => {

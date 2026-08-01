@@ -162,7 +162,7 @@ const CANONICAL_BUILT_IN_BACKGROUND_MODEL_PARAMETERS = Object.freeze({
     anthropic: Object.freeze({
       thinkingBudget: 4000,
     }),
-    'glasshive-harness': Object.freeze({ reasoning_effort: 'xhigh' }),
+    'glasshive-harness': Object.freeze({ reasoning_effort: 'high' }),
   }),
   agent_viventium_deep_research_95aeb3: Object.freeze({
     openAI: Object.freeze({

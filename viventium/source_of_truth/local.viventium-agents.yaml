@@ -573,7 +573,7 @@ backgroundAgents:
       - web_search
     tool_kwargs: []
     model_parameters:
-      reasoning_effort: xhigh
+      reasoning_effort: high
       model: codex-cli:gpt-5.6-sol
     glasshive_options:
       workspace:

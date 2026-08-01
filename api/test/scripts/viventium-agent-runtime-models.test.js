@@ -54,6 +54,9 @@ describe('viventium-agent-runtime-models', () => {
       agent_viventium_support_95aeb3: 'low',
       agent_8Y1d7JNhpubtvzYz3hvEv: 'low',
     };
+    const glasshiveEffortOverrides = {
+      agent_viventium_red_team_95aeb3: 'high',
+    };
     for (const [agentId, reasoningEffort] of Object.entries(expectedEffortByAgent)) {
       expect(CANONICAL_BUILT_IN_BACKGROUND_MODEL_PARAMETERS[agentId].openAI).toEqual({
         reasoning_effort: reasoningEffort,
@@ -61,7 +64,7 @@ describe('viventium-agent-runtime-models', () => {
       });
       expect(
         CANONICAL_BUILT_IN_BACKGROUND_MODEL_PARAMETERS[agentId]['glasshive-harness'],
-      ).toEqual({ reasoning_effort: reasoningEffort });
+      ).toEqual({ reasoning_effort: glasshiveEffortOverrides[agentId] || reasoningEffort });
     }
   });
 
@@ -69,7 +72,7 @@ describe('viventium-agent-runtime-models', () => {
     const expectedEffortByAgent = {
       agent_viventium_background_analysis_95aeb3: 'medium',
       agent_viventium_confirmation_bias_95aeb3: 'medium',
-      agent_viventium_red_team_95aeb3: 'xhigh',
+      agent_viventium_red_team_95aeb3: 'high',
       agent_viventium_deep_research_95aeb3: 'xhigh',
       agent_viventium_online_tool_use_95aeb3: 'low',
       agent_viventium_parietal_cortex_95aeb3: 'medium',

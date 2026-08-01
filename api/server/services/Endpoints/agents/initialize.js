@@ -50,6 +50,7 @@ const {
   sanitizeAggregatedContentParts,
 } = require('~/server/services/viventium/sanitizeAggregatedContentParts');
 const {
+  collapseRecoveredVisibleTextDuplicate,
   extractVisibleTextFromContentParts,
   repairMissedVisibleMessageDelta,
   repairMissedVoiceMessageDelta,
@@ -422,6 +423,20 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
             `[VIVENTIUM][VisibleDeltaAggregation] Repaired missed visible message delta streamId=${streamId || 'none'}`,
           );
         }
+      }
+    }
+    if (
+      collapseRecoveredVisibleTextDuplicate({
+        contentParts,
+        recoveredText: req?._viventiumVisibleDeltaAggregationRecoveredText,
+      })
+    ) {
+      req._viventiumVisibleDeltaAggregationDuplicateCollapsed = true;
+      if (!req._viventiumVisibleDeltaAggregationCollapseLogged) {
+        req._viventiumVisibleDeltaAggregationCollapseLogged = true;
+        logger.warn(
+          `[VIVENTIUM][VisibleDeltaAggregation] Collapsed exact final replay of repaired text streamId=${streamId || 'none'}`,
+        );
       }
     }
   };

@@ -1,5 +1,6 @@
 const { ContentTypes } = require('librechat-data-provider');
 const {
+  collapseRecoveredVisibleTextDuplicate,
   createMessageDeltaBoundaryNormalizer,
   extractVisibleTextFromContentParts,
   repairMissedVisibleMessageDelta,
@@ -227,5 +228,33 @@ describe('voiceDeltaAggregation', () => {
 
     expect(repaired).toBe(true);
     expect(extractVisibleTextFromContentParts(contentParts)).toBe('hahaha');
+  });
+
+  test('collapses an exact final replay of text already recovered from visible deltas', () => {
+    const contentParts = [
+      { type: ContentTypes.TEXT, text: 'Already visible answer.' },
+      { type: 'cortex_insight', status: 'complete' },
+      { type: ContentTypes.TEXT, text: 'Already visible answer.' },
+    ];
+
+    const collapsed = collapseRecoveredVisibleTextDuplicate({
+      contentParts,
+      recoveredText: 'Already visible answer.',
+    });
+
+    expect(collapsed).toBe(true);
+    expect(contentParts).toEqual([
+      { type: ContentTypes.TEXT, text: 'Already visible answer.' },
+      { type: 'cortex_insight', status: 'complete' },
+    ]);
+  });
+
+  test('does not collapse repeated text without an exact recovered replay match', () => {
+    const contentParts = [{ type: ContentTypes.TEXT, text: 'hahaha' }];
+
+    expect(
+      collapseRecoveredVisibleTextDuplicate({ contentParts, recoveredText: 'ha' }),
+    ).toBe(false);
+    expect(contentParts).toEqual([{ type: ContentTypes.TEXT, text: 'hahaha' }]);
   });
 });

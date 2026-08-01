@@ -239,12 +239,42 @@ function repairMissedVisibleMessageDelta({ contentParts, event, data, beforeText
   return appendTextToContentParts(contentParts, deltaText);
 }
 
+function collapseRecoveredVisibleTextDuplicate({ contentParts, recoveredText }) {
+  if (
+    !Array.isArray(contentParts) ||
+    typeof recoveredText !== 'string' ||
+    recoveredText.length === 0 ||
+    extractVisibleTextFromContentParts(contentParts) !== `${recoveredText}${recoveredText}`
+  ) {
+    return false;
+  }
+
+  const firstTextIndex = contentParts.findIndex(
+    (part) => part && part.type === ContentTypes.TEXT,
+  );
+  if (firstTextIndex < 0) {
+    return false;
+  }
+
+  contentParts[firstTextIndex] = {
+    ...contentParts[firstTextIndex],
+    text: recoveredText,
+  };
+  for (let index = contentParts.length - 1; index > firstTextIndex; index -= 1) {
+    if (contentParts[index]?.type === ContentTypes.TEXT) {
+      contentParts.splice(index, 1);
+    }
+  }
+  return true;
+}
+
 function repairMissedVoiceMessageDelta(params) {
   return repairMissedVisibleMessageDelta(params);
 }
 
 module.exports = {
   appendTextToContentParts,
+  collapseRecoveredVisibleTextDuplicate,
   collectTextParts,
   createMessageDeltaBoundaryNormalizer,
   extractVisibleTextFromContentParts,

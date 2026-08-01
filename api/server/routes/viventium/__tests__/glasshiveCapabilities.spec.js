@@ -38,6 +38,8 @@ function appWithRoute({ requestSignal } = {}) {
   app.use(express.json());
   if (requestSignal) {
     app.use((req, _res, next) => {
+      // Keep the sentinel inert: a native aborted signal can make Node abort the test transport
+      // before this route gets a chance to prove that it does not forward request lifecycle state.
       req.signal = requestSignal;
       next();
     });
@@ -89,7 +91,7 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
       },
     ]);
 
-    const response = await request(appWithRoute({ requestSignal: AbortSignal.abort() }))
+    const response = await request(appWithRoute({ requestSignal: { aborted: true } }))
       .post('/api/viventium/glasshive/capabilities/mcp')
       .set('Authorization', `Bearer ${token}`)
       .send({ jsonrpc: '2.0', id: 2, method: 'tools/list' })
@@ -187,7 +189,7 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
     });
     mockHandleToolCall.mockResolvedValue({ servers: [{ name: 'google_workspace' }] });
 
-    const response = await request(appWithRoute({ requestSignal: AbortSignal.abort() }))
+    const response = await request(appWithRoute({ requestSignal: { aborted: true } }))
       .post('/api/viventium/glasshive/capabilities/mcp')
       .set('Authorization', `Bearer ${token}`)
       .send({

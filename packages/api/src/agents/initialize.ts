@@ -94,6 +94,15 @@ export type InitializedAgent = Agent & {
   toolDefinitions?: LCTool[];
   /** Precomputed flag indicating if any tools have defer_loading enabled (for efficient runtime checks) */
   hasDeferredTools?: boolean;
+  /* === VIVENTIUM START ===
+   * Feature: Capability-declared provider wire transport.
+   * Purpose: Carry the compiled transport contract to model construction without provider labels.
+   * === VIVENTIUM END === */
+  /** Runtime-only wire contract derived from the selected provider's capability registry. */
+  declaredProviderTransport?: {
+    mode: 'chat_completions';
+    reasoningEffort?: string;
+  };
 };
 
 /**
@@ -301,22 +310,15 @@ export async function initializeAgent(
    * Purpose: Provider-specific behavior is declared by compiled capability metadata, never by
    * provider labels. Harness-backed agents cannot recursively call GlassHive's delegation MCP.
    * === VIVENTIUM END === */
-  const providerCapability = (
-    agentsEndpointConfig as
-      | {
-          providerCapabilities?: Record<
-            string,
-            {
-              workspace_binding?: boolean;
-              native_tools?: boolean;
-              default_access?: 'full' | 'workspace';
-              allow_full_access?: boolean;
-              excluded_mcp_servers?: string[];
-            }
-          >;
-        }
-      | undefined
-  )?.providerCapabilities?.[provider];
+  const providerCapability = agentsEndpointConfig?.providerCapabilities?.[provider];
+  /* === VIVENTIUM START ===
+   * Feature: Capability-declared provider wire transport.
+   * Purpose: Preserve the validated effort before custom-endpoint option compilation and carry it
+   * with the capability-derived transport contract into the graph run.
+   * === VIVENTIUM END === */
+  const declaredReasoningEffort = String(
+    (agent.model_parameters as Record<string, unknown> | undefined)?.reasoning_effort ?? '',
+  ).trim();
   const excludedMcpServers = new Set(providerCapability?.excluded_mcp_servers ?? []);
 
   /**
@@ -935,6 +937,15 @@ export async function initializeAgent(
     userMCPAuthMap,
     toolDefinitions,
     hasDeferredTools,
+    /* === VIVENTIUM START === Capability-declared provider wire transport. === */
+    declaredProviderTransport:
+      providerCapability?.responses_api === false
+        ? {
+            mode: 'chat_completions',
+            ...(declaredReasoningEffort ? { reasoningEffort: declaredReasoningEffort } : {}),
+          }
+        : undefined,
+    /* === VIVENTIUM END === */
     attachments: finalAttachments,
     toolContextMap: toolContextMap ?? {},
     useLegacyContent: !!options.useLegacyContent,

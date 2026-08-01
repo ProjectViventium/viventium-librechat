@@ -23,6 +23,21 @@ jest.mock('@librechat/agents', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  applyDeclaredProviderTransport: jest.fn((modelParameters, transport) => {
+    if (transport?.mode !== 'chat_completions') {
+      return { ...modelParameters };
+    }
+    return {
+      ...modelParameters,
+      model: 'viventium-chat-completions',
+      modelKwargs: {
+        ...(modelParameters.modelKwargs || {}),
+        model: modelParameters.model,
+        reasoning_effort: transport.reasoningEffort,
+      },
+      useResponsesApi: false,
+    };
+  }),
   createSafeUser: jest.fn((user) => user),
   initializeAnthropic: jest.fn(async ({ model_parameters }) => ({
     llmConfig: {
@@ -71,7 +86,11 @@ jest.mock('~/models/Agent', () => ({
 
 const db = require('~/models');
 const { getAgent } = require('~/models/Agent');
-const { initializeAnthropic, initializeOpenAI } = require('@librechat/api');
+const {
+  applyDeclaredProviderTransport,
+  initializeAnthropic,
+  initializeOpenAI,
+} = require('@librechat/api');
 const { Run } = require('@librechat/agents');
 const { getCustomEndpointConfig } = require('~/server/services/BackgroundCortexService');
 const {
@@ -1722,7 +1741,7 @@ describe('BackgroundCortexFollowUpService', () => {
       apiKey: 'glasshive-provider-key',
       baseURL: 'http://127.0.0.1:8766/v1',
       defaultHeaders: { 'X-Existing': 'kept' },
-      dropParams: ['temperature', 'max_tokens'],
+      dropParams: ['temperature', 'max_tokens', 'use_responses_api'],
     });
     const req = {
       user: { id: 'u1' },
@@ -1734,6 +1753,7 @@ describe('BackgroundCortexFollowUpService', () => {
               'glasshive-harness': {
                 phase_b_followup: true,
                 workspace_binding: true,
+                responses_api: false,
               },
             },
           },
@@ -1768,12 +1788,23 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(runCall.graphConfig.llmConfig).toEqual(
       expect.objectContaining({
         provider: 'openai',
+        model: 'viventium-chat-completions',
+        useResponsesApi: false,
+        modelKwargs: expect.objectContaining({
+          model: 'codex-cli:gpt-5.6-sol',
+          reasoning_effort: 'medium',
+        }),
         apiKey: 'glasshive-provider-key',
         configuration: expect.objectContaining({
           baseURL: 'http://127.0.0.1:8766/v1',
           defaultHeaders: expect.objectContaining({ 'X-Existing': 'kept' }),
         }),
       }),
+    );
+    expect(applyDeclaredProviderTransport).toHaveBeenCalledWith(
+      expect.objectContaining({ model: 'codex-cli:gpt-5.6-sol' }),
+      { mode: 'chat_completions', reasoningEffort: 'medium' },
+      'openai',
     );
     expect(runCall.graphConfig.llmConfig.configuration).not.toHaveProperty('apiKey');
     expect(runCall.graphConfig.llmConfig).not.toHaveProperty('maxTokens');

@@ -34,17 +34,20 @@ jest.mock('winston', () => ({
     warn: jest.fn(),
     error: jest.fn(),
   })),
-  format: Object.assign(jest.fn((fn) => () => ({ transform: fn })), {
-    combine: jest.fn(),
-    colorize: jest.fn(),
-    simple: jest.fn(),
-    label: jest.fn(),
-    timestamp: jest.fn(),
-    printf: jest.fn(),
-    errors: jest.fn(),
-    splat: jest.fn(),
-    json: jest.fn(),
-  }),
+  format: Object.assign(
+    jest.fn((fn) => () => ({ transform: fn })),
+    {
+      combine: jest.fn(),
+      colorize: jest.fn(),
+      simple: jest.fn(),
+      label: jest.fn(),
+      timestamp: jest.fn(),
+      printf: jest.fn(),
+      errors: jest.fn(),
+      splat: jest.fn(),
+      json: jest.fn(),
+    },
+  ),
   addColors: jest.fn(),
   transports: {
     Console: jest.fn(),
@@ -487,6 +490,59 @@ describe('initializeAgent — provider-native tool ownership', () => {
         'X-GlassHive-Access'
       ],
     ).toBe('workspace');
+  });
+
+  it('derives the runtime Chat Completions contract from capability metadata', async () => {
+    const provider = 'synthetic-harness-provider';
+    const { agent, req, res, loadTools, db } = createMocks({ provider });
+    req.config = {
+      endpoints: {
+        agents: {
+          providerCapabilities: {
+            [provider]: {
+              main_chat: true,
+              native_tools: true,
+              responses_api: false,
+              models: [
+                {
+                  id: 'codex-cli:gpt-5.6-sol',
+                  effortChoices: ['low', 'medium'],
+                },
+              ],
+            },
+          },
+          capabilityRequiredProviders: [provider],
+        },
+      },
+    } as unknown as ServerRequest['config'];
+    agent.model = 'codex-cli:gpt-5.6-sol';
+    agent.model_parameters = {
+      model: 'codex-cli:gpt-5.6-sol',
+      reasoning_effort: 'medium',
+    } as unknown as Agent['model_parameters'];
+
+    const result = await initializeAgent(
+      {
+        req,
+        res,
+        agent,
+        loadTools,
+        endpointOption: {
+          endpoint: EModelEndpoint.agents,
+          model_parameters: {
+            reasoning_effort: 'unsupported-conversation-value',
+          },
+        },
+        allowedProviders: new Set([provider]),
+        isInitialAgent: true,
+      },
+      db,
+    );
+
+    expect(result.declaredProviderTransport).toEqual({
+      mode: 'chat_completions',
+      reasoningEffort: 'medium',
+    });
   });
 });
 

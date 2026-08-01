@@ -2,6 +2,7 @@ const {
   DEFAULT_MODELS,
   APPROVED_MAIN_RUNTIME_FAMILIES,
   APPROVED_BACKGROUND_RUNTIME_FAMILIES,
+  CANONICAL_BUILT_IN_MAIN_MODEL_PARAMETERS,
   CANONICAL_BUILT_IN_BACKGROUND_MODEL_PARAMETERS,
   BUILT_IN_BACKGROUND_AGENT_IDS,
   ACTIVATION_RUNTIME_ENV_BY_AGENT_ID,
@@ -32,7 +33,13 @@ describe('viventium-agent-runtime-models', () => {
       'openAI::gpt-5.6-terra',
       'anthropic::claude-opus-5',
       'anthropic::claude-opus-4-8',
+      'glasshive-harness::codex-cli:gpt-5.6-sol',
     ]);
+    expect(CANONICAL_BUILT_IN_MAIN_MODEL_PARAMETERS).toEqual({
+      openAI: { reasoning_effort: 'medium', useResponsesApi: true },
+      anthropic: {},
+      'glasshive-harness': { reasoning_effort: 'medium' },
+    });
 
     const expectedEffortByAgent = {
       agent_viventium_background_analysis_95aeb3: 'medium',
@@ -51,6 +58,51 @@ describe('viventium-agent-runtime-models', () => {
       expect(CANONICAL_BUILT_IN_BACKGROUND_MODEL_PARAMETERS[agentId].openAI).toEqual({
         reasoning_effort: reasoningEffort,
         useResponsesApi: true,
+      });
+      expect(
+        CANONICAL_BUILT_IN_BACKGROUND_MODEL_PARAMETERS[agentId]['glasshive-harness'],
+      ).toEqual({ reasoning_effort: reasoningEffort });
+    }
+  });
+
+  test('normalizes every built-in cortex onto GlassHive while preserving its workload effort', () => {
+    const expectedEffortByAgent = {
+      agent_viventium_background_analysis_95aeb3: 'medium',
+      agent_viventium_confirmation_bias_95aeb3: 'medium',
+      agent_viventium_red_team_95aeb3: 'xhigh',
+      agent_viventium_deep_research_95aeb3: 'xhigh',
+      agent_viventium_online_tool_use_95aeb3: 'low',
+      agent_viventium_parietal_cortex_95aeb3: 'medium',
+      agent_viventium_pattern_recognition_95aeb3: 'medium',
+      agent_viventium_emotional_resonance_95aeb3: 'low',
+      agent_viventium_strategic_planning_95aeb3: 'high',
+      agent_viventium_support_95aeb3: 'low',
+      agent_8Y1d7JNhpubtvzYz3hvEv: 'low',
+    };
+    const bundle = {
+      backgroundAgents: Object.keys(expectedEffortByAgent).map((id) => ({
+        id,
+        provider: 'openAI',
+        model: 'gpt-5.6-terra',
+        model_parameters: { model: 'gpt-5.6-terra', useResponsesApi: true },
+      })),
+    };
+    const env = {};
+    for (const id of Object.keys(expectedEffortByAgent)) {
+      const envMap = require('../../../scripts/viventium-agent-runtime-models')
+        .AGENT_RUNTIME_ENV_BY_ID[id];
+      env[envMap.providerEnv] = 'glasshive-harness';
+      env[envMap.modelEnv] = 'codex-cli:gpt-5.6-sol';
+    }
+
+    const normalized = normalizeBundleForRuntime(bundle, { env });
+
+    for (const agent of normalized.backgroundAgents) {
+      expect(agent.provider).toBe('glasshive-harness');
+      expect(agent.model).toBe('codex-cli:gpt-5.6-sol');
+      expect(agent.model_parameters).toEqual({
+        model: 'codex-cli:gpt-5.6-sol',
+        reasoning_effort: expectedEffortByAgent[agent.id],
       });
     }
   });
@@ -113,6 +165,11 @@ describe('viventium-agent-runtime-models', () => {
 
     expect(normalized.mainAgent.provider).toBe('openAI');
     expect(normalized.mainAgent.model).toBe('gpt-5.6-sol');
+    expect(normalized.mainAgent.model_parameters).toEqual({
+      model: 'gpt-5.6-sol',
+      reasoning_effort: 'medium',
+      useResponsesApi: true,
+    });
     expect(normalized.mainAgent.voice_llm_provider).toBeNull();
     expect(normalized.mainAgent.voice_llm_model).toBeNull();
     expect(normalized.backgroundAgents[0].provider).toBe('anthropic');
@@ -174,6 +231,54 @@ describe('viventium-agent-runtime-models', () => {
 
     expect(normalized.mainAgent.provider).toBe('openAI');
     expect(normalized.mainAgent.model).toBe('gpt-5.6-sol');
+    expect(normalized.mainAgent.model_parameters).toEqual({
+      model: 'gpt-5.6-sol',
+      reasoning_effort: 'medium',
+      useResponsesApi: true,
+    });
+  });
+
+  test('replaces provider-specific Main parameters across GlassHive, OpenAI, and Anthropic families', () => {
+    const source = {
+      mainAgent: {
+        id: 'agent_viventium_main_95aeb3',
+        provider: 'openAI',
+        model: 'gpt-5.6-sol',
+        model_parameters: {
+          model: 'gpt-5.6-sol',
+          reasoning_effort: 'medium',
+          useResponsesApi: true,
+        },
+      },
+    };
+
+    const glasshive = normalizeBundleForRuntime(source, {
+      env: {
+        VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER: 'glasshive-harness',
+        VIVENTIUM_FC_CONSCIOUS_LLM_MODEL: 'codex-cli:gpt-5.6-sol',
+      },
+    });
+    expect(glasshive.mainAgent.model_parameters).toEqual({
+      model: 'codex-cli:gpt-5.6-sol',
+      reasoning_effort: 'medium',
+    });
+
+    const anthropic = normalizeBundleForRuntime(
+      {
+        mainAgent: {
+          ...source.mainAgent,
+          provider: 'glasshive-harness',
+          model: 'codex-cli:gpt-5.6-sol',
+        },
+      },
+      {
+        env: {
+          VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER: 'anthropic',
+          VIVENTIUM_FC_CONSCIOUS_LLM_MODEL: 'claude-opus-5',
+        },
+      },
+    );
+    expect(anthropic.mainAgent.model_parameters).toEqual({ model: 'claude-opus-5' });
   });
 
   test('rejects non-approved built-in runtime assignments and preserves shipped launch bundle families', () => {

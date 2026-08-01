@@ -3299,6 +3299,7 @@ async function executeCortexOnce({
   let executionStage = 'setup';
   let configuredToolCount = countConfiguredCortexTools(agent, agent);
   let completedToolCalls = 0;
+  let harnessInvocationReq = null;
 
   try {
     const safeReq = req || { body: {}, user: {} };
@@ -3661,8 +3662,19 @@ async function executeCortexOnce({
     };
     /* === VIVENTIUM NOTE END === */
 
+    /* === VIVENTIUM START ===
+     * Feature: Per-cortex GlassHive duplicate-author guard.
+     * Purpose: Concurrent cortices share the outer Express request, so authoring-start state must
+     * live on an isolated callback request for this exact cortex run. A native harness run that
+     * has begun authoring may be reattached, but a later transport error must not launch a second
+     * direct-provider author.
+     * === VIVENTIUM END === */
+    harnessInvocationReq = Object.create(safeReq);
+    harnessInvocationReq._viventiumHarnessExecutionEnabled =
+      cortexCapability?.workspace_binding === true;
+    harnessInvocationReq._viventiumHarnessInvocationStarted = false;
     const eventHandlers = getDefaultHandlers({
-      req: safeReq,
+      req: harnessInvocationReq,
       res: safeRes,
       aggregateContent,
       toolEndCallback,
@@ -3899,6 +3911,8 @@ async function executeCortexOnce({
         activationScope,
         configuredTools: configuredToolCount,
         completedToolCalls: toolExecutionState.completed || 0,
+        harnessInvocationStarted:
+          harnessInvocationReq?._viventiumHarnessInvocationStarted === true,
       };
     }
 
@@ -3920,6 +3934,8 @@ async function executeCortexOnce({
         activationScope,
         configuredTools: configuredToolCount,
         completedToolCalls: toolExecutionState.completed || 0,
+        harnessInvocationStarted:
+          harnessInvocationReq?._viventiumHarnessInvocationStarted === true,
       };
     }
 
@@ -3935,6 +3951,8 @@ async function executeCortexOnce({
       activationScope,
       configuredTools: configuredToolCount,
       completedToolCalls: toolExecutionState.completed || 0,
+      harnessInvocationStarted:
+        harnessInvocationReq?._viventiumHarnessInvocationStarted === true,
     };
   } catch (error) {
     const isAborted = abortController?.signal?.aborted === true || error?.name === 'AbortError';
@@ -3975,6 +3993,8 @@ async function executeCortexOnce({
       activationScope,
       configuredTools: configuredToolCount,
       completedToolCalls,
+      harnessInvocationStarted:
+        harnessInvocationReq?._viventiumHarnessInvocationStarted === true,
     };
   } finally {
     if (abortTimer) {
@@ -3993,6 +4013,7 @@ async function executeCortex(params) {
   const primaryResult = await executeCortexOnce(params);
   if (
     !resolveFallbackAssignment(primaryAgent) ||
+    primaryResult?.harnessInvocationStarted === true ||
     !shouldRetryBackgroundCortexWithFallback(primaryResult)
   ) {
     return primaryResult;
@@ -4752,6 +4773,7 @@ async function executeActivated({
       if (
         fallbackAgent &&
         result?.fallbackUsed !== true &&
+        result?.harnessInvocationStarted !== true &&
         shouldRetryBackgroundCortexWithFallback(result)
       ) {
         const primaryProvider = cortexAgent.provider || 'unknown';

@@ -3584,7 +3584,7 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     });
   });
 
-  test('suppresses Phase B synthesis when visible text was repaired from emitted deltas', async () => {
+  test('still adjudicates Phase B when visible text was repaired from emitted deltas', async () => {
     const phaseB = deferred();
     const pendingCortexParts = [
       {
@@ -3625,22 +3625,18 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
       responseMessageId: 'resp-1',
       cortexParts: pendingCortexParts,
     });
-    expect(mockCreateCortexFollowUpMessage).not.toHaveBeenCalled();
-    expect(mockBuildFollowUpDecisionRecord).toHaveBeenCalledWith(
+    expect(mockCreateCortexFollowUpMessage).toHaveBeenCalledTimes(1);
+    expect(mockCreateCortexFollowUpMessage).toHaveBeenCalledWith(
       expect.objectContaining({
+        req,
+        conversationId: 'conv-1',
         parentMessageId: 'resp-1',
-        decision: expect.objectContaining({
-          result: 'suppressed',
-          selectedStrategy: 'visible_primary_recovered_suppressed',
-          suppressionReason: 'visible_delta_aggregation_repaired',
-        }),
-        recentResponseResolution: {
-          source: 'runtime_content_parts',
-          text: 'Already visible answer.',
-        },
+        recentResponse: 'Already visible answer.',
+        forceVisibleFollowUp: false,
       }),
     );
-    expect(mockPersistFollowUpDecisionToParentMessage).toHaveBeenCalledTimes(1);
+    expect(mockBuildFollowUpDecisionRecord).not.toHaveBeenCalled();
+    expect(mockPersistFollowUpDecisionToParentMessage).not.toHaveBeenCalled();
     expect(mockFinalizeCanonicalCortexMessage).toHaveBeenCalledWith({
       req,
       messageId: 'resp-1',

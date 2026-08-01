@@ -62,14 +62,14 @@ function resolveProviderCapability(provider, req) {
   return matchingKey ? registry[matchingKey] : null;
 }
 
-function providerSupportsRealtimeVoice(provider, req) {
+function providerSupportsVoicePipeline(provider, req) {
   const selected = String(provider || '').trim();
   if (!selected) {
     return false;
   }
   const capability = resolveProviderCapability(selected, req);
   if (capability) {
-    return capability.realtime_voice !== false;
+    return capability.voice_pipeline_llm === true || capability.realtime_voice === true;
   }
   const required = req?.config?.endpoints?.agents?.capabilityRequiredProviders || [];
   return !required.some(
@@ -79,7 +79,7 @@ function providerSupportsRealtimeVoice(provider, req) {
 
 function unsupportedVoiceProviderError(provider) {
   return new Error(
-    `Provider ${String(provider || '').trim()} does not support real-time voice; configure a supported Voice Call LLM for this agent`,
+    `Provider ${String(provider || '').trim()} does not support the Voice Call LLM pipeline; configure a supported Voice Call LLM for this agent`,
   );
 }
 
@@ -157,7 +157,7 @@ function isVoiceModelValid(voiceLlmModel, voiceProvider, req, modelsConfig) {
   if (!model || !provider) {
     return false;
   }
-  if (!providerSupportsRealtimeVoice(voiceProvider, req)) {
+  if (!providerSupportsVoicePipeline(voiceProvider, req)) {
     return false;
   }
 
@@ -196,9 +196,21 @@ function hasOwn(value, key) {
   return Object.prototype.hasOwnProperty.call(value || {}, key);
 }
 
-function normalizeVoiceModelParametersForProvider(parameters, voiceParams, provider) {
+function normalizeVoiceModelParametersForProvider(
+  parameters,
+  voiceParams,
+  provider,
+  providerCapability,
+) {
   const resolved = cloneModelParameters(parameters);
   const normalizedProvider = normalizeProvider(provider);
+  if (providerCapability?.responses_api === false) {
+    delete resolved.useResponsesApi;
+    delete resolved.reasoning;
+    delete resolved.reasoning_summary;
+    delete resolved.verbosity;
+    delete resolved.web_search;
+  }
   if (normalizedProvider === 'anthropic') {
     delete resolved.useResponsesApi;
     delete resolved.reasoning;
@@ -261,7 +273,7 @@ function normalizeVoiceModelParametersForProvider(parameters, voiceParams, provi
   return resolved;
 }
 
-function resolveVoiceModelParameters(agent, voiceLlmModel, voiceProvider) {
+function resolveVoiceModelParameters(agent, voiceLlmModel, voiceProvider, providerCapability) {
   const voiceParams = cloneModelParameters(agent?.voice_llm_model_parameters);
   const resolved = {
     ...cloneModelParameters(agent?.model_parameters),
@@ -273,7 +285,12 @@ function resolveVoiceModelParameters(agent, voiceLlmModel, voiceProvider) {
     resolved.model = model;
   }
 
-  return normalizeVoiceModelParametersForProvider(resolved, voiceParams, voiceProvider);
+  return normalizeVoiceModelParametersForProvider(
+    resolved,
+    voiceParams,
+    voiceProvider,
+    providerCapability,
+  );
 }
 
 /**
@@ -295,7 +312,7 @@ function applyVoiceModelOverride(agent, req, modelsConfig) {
   const voiceProvider = assignment?.provider || '';
 
   if (!voiceLlmModel || !voiceProvider) {
-    if (!providerSupportsRealtimeVoice(agent.provider, req)) {
+    if (!providerSupportsVoicePipeline(agent.provider, req)) {
       throw unsupportedVoiceProviderError(agent.provider);
     }
     // No voice override configured — use a voice-capable main model.
@@ -306,7 +323,7 @@ function applyVoiceModelOverride(agent, req, modelsConfig) {
     logger.warn(
       `[voiceLlmOverride] Invalid ${assignment?.source || 'configured'} voice model ${voiceProvider}/${voiceLlmModel} for agent ${agent.id} — falling back to main model`,
     );
-    if (!providerSupportsRealtimeVoice(agent.provider, req)) {
+    if (!providerSupportsVoicePipeline(agent.provider, req)) {
       throw unsupportedVoiceProviderError(agent.provider);
     }
     return agent;
@@ -318,7 +335,12 @@ function applyVoiceModelOverride(agent, req, modelsConfig) {
 
   agent.model = voiceLlmModel;
   agent.provider = voiceProvider;
-  agent.model_parameters = resolveVoiceModelParameters(agent, voiceLlmModel, voiceProvider);
+  agent.model_parameters = resolveVoiceModelParameters(
+    agent,
+    voiceLlmModel,
+    voiceProvider,
+    resolveProviderCapability(voiceProvider, req),
+  );
   /* === VIVENTIUM START ===
    * Feature: Voice LLM no-reasoning diagnostics.
    * Purpose: Log only non-secret provider/model reasoning knobs so live voice QA can prove the

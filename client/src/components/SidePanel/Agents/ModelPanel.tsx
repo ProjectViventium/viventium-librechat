@@ -2,8 +2,7 @@ import React, { useMemo, useEffect, useRef } from 'react';
 import { ControlCombobox } from '@librechat/client';
 import { ChevronLeft, ChevronRight } from 'lucide-react';
 import { useFormContext, useWatch, Controller } from 'react-hook-form';
-import { useQuery } from '@tanstack/react-query';
-import { alternateName, LocalStorageKeys, request } from 'librechat-data-provider';
+import { alternateName, LocalStorageKeys } from 'librechat-data-provider';
 import type { TAgentProviderCapability } from 'librechat-data-provider';
 import type { AgentForm, AgentModelPanelProps, StringOption } from '~/common';
 import { useLocalize } from '~/hooks';
@@ -14,15 +13,7 @@ import {
   shouldDefaultOpenAIGPT56AgentToResponses,
 } from './modelSelection';
 import ModelParametersSection from './ModelParametersSection';
-
-type ProviderReadiness = {
-  status: string;
-  detail: string;
-  models: Array<{
-    id: string;
-    readiness?: { status?: string; authentication?: string; detail?: string };
-  }>;
-};
+import CapabilityProviderOptions from './CapabilityProviderOptions';
 
 export default function ModelPanel({
   providers,
@@ -41,7 +32,6 @@ export default function ModelPanel({
   const fallbackModel = useWatch({ control, name: 'fallback_llm_model' });
   const fallbackProvider = useWatch({ control, name: 'fallback_llm_provider' });
   const modelParameters = useWatch({ control, name: 'model_parameters' });
-  const glassHiveOptions = useWatch({ control, name: 'glasshive_options' });
 
   const provider = useMemo(() => {
     const value =
@@ -55,47 +45,6 @@ export default function ModelPanel({
     [modelsData, provider],
   );
   const providerCapability = providerCapabilities[provider];
-  const hasWorkspaceBinding = providerCapability?.workspace_binding === true;
-  const modelCapability = useMemo(
-    () => providerCapability?.models?.find((item) => item.id === model),
-    [model, providerCapability?.models],
-  );
-  const readinessQuery = useQuery<ProviderReadiness>(
-    ['agent-provider-readiness', provider],
-    /* === VIVENTIUM START ===
-     * Feature: Authenticated GlassHive readiness
-     * Purpose: Use LibreChat's normal authenticated request client; a raw fetch omits the bearer
-     * token and makes the Provider/Model panel fail closed with HTTP 401 for signed-in users.
-     * === VIVENTIUM END === */
-    () =>
-      request.get<ProviderReadiness>(
-        `/api/agents/provider-readiness/${encodeURIComponent(provider)}`,
-      ),
-    {
-      enabled: hasWorkspaceBinding,
-      retry: false,
-      refetchOnWindowFocus: false,
-      staleTime: 15_000,
-    },
-  );
-  const selectedReadiness = readinessQuery.data?.models.find(
-    (item) => item.id === model,
-  )?.readiness;
-  const readinessStatus = readinessQuery.isLoading
-    ? 'checking'
-    : selectedReadiness?.status || readinessQuery.data?.status || 'unavailable';
-  const readinessLabel =
-    readinessStatus === 'ready'
-      ? localize('com_ui_glasshive_authenticated_ready')
-      : readinessStatus === 'authentication_required'
-        ? localize('com_ui_glasshive_sign_in_required')
-        : readinessStatus === 'checking'
-          ? localize('com_ui_glasshive_checking')
-          : localize('com_ui_unavailable');
-  const readinessDetail =
-    selectedReadiness?.detail ||
-    readinessQuery.data?.detail ||
-    localize('com_ui_glasshive_unreachable');
 
   useEffect(() => {
     const _model = model ?? '';
@@ -151,44 +100,6 @@ export default function ModelPanel({
       setValue('model_parameters.useResponsesApi', false, { shouldDirty: true });
     }
   }, [modelParameters?.useResponsesApi, providerCapability?.responses_api, setValue]);
-
-  /* === VIVENTIUM START ===
-   * Feature: GlassHive core Agent provider fields
-   * Purpose: Source defaults and per-model effort choices from declared capabilities while keeping
-   * the saved options intact if a user temporarily switches providers.
-   * === VIVENTIUM END === */
-  useEffect(() => {
-    if (!hasWorkspaceBinding) {
-      return;
-    }
-    if (!glassHiveOptions?.workspace?.mode) {
-      setValue('glasshive_options.workspace.mode', 'life', { shouldDirty: true });
-    }
-    if (!glassHiveOptions?.access) {
-      setValue('glasshive_options.access', providerCapability?.default_access ?? 'workspace', {
-        shouldDirty: true,
-      });
-    }
-    const effortChoices = modelCapability?.effortChoices ?? [];
-    const currentEffort = String(modelParameters?.reasoning_effort ?? '');
-    if (
-      modelCapability?.recommendedEffort &&
-      (!currentEffort || !effortChoices.includes(currentEffort))
-    ) {
-      setValue('model_parameters.reasoning_effort', modelCapability.recommendedEffort, {
-        shouldDirty: true,
-      });
-    }
-  }, [
-    glassHiveOptions?.access,
-    glassHiveOptions?.workspace?.mode,
-    hasWorkspaceBinding,
-    modelCapability?.effortChoices,
-    modelCapability?.recommendedEffort,
-    modelParameters?.reasoning_effort,
-    providerCapability?.default_access,
-    setValue,
-  ]);
 
   return (
     <div className="mx-1 mb-1 flex h-full min-h-[50vh] w-full flex-col gap-2 text-sm">
@@ -316,143 +227,16 @@ export default function ModelPanel({
             }}
           />
         </div>
-        {hasWorkspaceBinding && (
-          <div className="border-token-border-light bg-token-surface-primary mb-4 rounded-lg border p-4 text-left">
-            <div className="mb-3 flex items-center justify-between gap-3">
-              <div>
-                <div className="font-medium">{localize('com_ui_glasshive_harness')}</div>
-                <div className="text-token-text-secondary text-xs">
-                  {localize('com_ui_glasshive_harness_description')}
-                </div>
-              </div>
-              <span
-                className={cn(
-                  'rounded-full px-2 py-1 text-xs font-medium',
-                  readinessStatus === 'ready'
-                    ? 'bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-200'
-                    : 'bg-amber-100 text-amber-900 dark:bg-amber-900/40 dark:text-amber-200',
-                )}
-                aria-live="polite"
-              >
-                {readinessLabel}
-              </span>
-            </div>
-            <div className="text-token-text-secondary mb-3 flex items-start justify-between gap-3 text-xs">
-              <span>{readinessDetail}</span>
-              <button
-                type="button"
-                className="underline"
-                onClick={() => readinessQuery.refetch()}
-                disabled={readinessQuery.isFetching}
-              >
-                {localize('com_ui_glasshive_recheck')}
-              </button>
-            </div>
-
-            <label className="mb-1 block text-sm font-medium" htmlFor="glasshive-workspace-mode">
-              {localize('com_ui_glasshive_working_folder')}
-            </label>
-            <Controller
-              name="glasshive_options.workspace.mode"
-              control={control}
-              render={({ field }) => (
-                <select
-                  {...field}
-                  id="glasshive-workspace-mode"
-                  className="border-token-border-light bg-token-surface-primary mb-3 h-10 w-full rounded-lg border px-3"
-                >
-                  <option value="life">{localize('com_ui_glasshive_viventium_life')}</option>
-                  <option value="custom">{localize('com_ui_glasshive_custom_server_path')}</option>
-                </select>
-              )}
-            />
-            {glassHiveOptions?.workspace?.mode === 'custom' && (
-              <Controller
-                name="glasshive_options.workspace.path"
-                control={control}
-                rules={{ required: true }}
-                render={({ field, fieldState: { error } }) => (
-                  <div className="mb-3">
-                    <input
-                      {...field}
-                      value={field.value ?? ''}
-                      aria-label={localize('com_ui_glasshive_custom_working_folder')}
-                      placeholder={localize('com_ui_glasshive_path_placeholder')}
-                      className={cn(
-                        'border-token-border-light bg-token-surface-primary h-10 w-full rounded-lg border px-3',
-                        error && 'border-red-500',
-                      )}
-                    />
-                    <p className="text-token-text-secondary mt-1 text-xs">
-                      {localize('com_ui_glasshive_path_description')}
-                    </p>
-                  </div>
-                )}
-              />
-            )}
-
-            <label className="mb-1 block text-sm font-medium" htmlFor="glasshive-access">
-              {localize('com_ui_glasshive_access')}
-            </label>
-            <Controller
-              name="glasshive_options.access"
-              control={control}
-              render={({ field }) => (
-                <select
-                  {...field}
-                  id="glasshive-access"
-                  className="border-token-border-light bg-token-surface-primary mb-3 h-10 w-full rounded-lg border px-3"
-                >
-                  {providerCapability?.allow_full_access === true && (
-                    <option value="full">{localize('com_ui_glasshive_full_access')}</option>
-                  )}
-                  <option value="workspace">
-                    {localize('com_ui_glasshive_workspace_writes_only')}
-                  </option>
-                </select>
-              )}
-            />
-            <p className="text-token-text-secondary -mt-2 mb-3 text-xs">
-              {glassHiveOptions?.access === 'full'
-                ? localize('com_ui_glasshive_full_access_warning')
-                : localize('com_ui_glasshive_workspace_access_description')}
-            </p>
-            {providerCapability?.native_tools === true && (
-              <p className="text-token-text-secondary mb-3 text-xs">
-                {localize('com_ui_glasshive_native_tools_description')}
-              </p>
-            )}
-
-            {(modelCapability?.effortChoices?.length ?? 0) > 0 && (
-              <>
-                <label className="mb-1 block text-sm font-medium" htmlFor="glasshive-effort">
-                  {localize('com_ui_glasshive_effort')}
-                </label>
-                <Controller
-                  name="model_parameters.reasoning_effort"
-                  control={control}
-                  render={({ field }) => (
-                    <select
-                      {...field}
-                      value={field.value ?? modelCapability?.recommendedEffort ?? ''}
-                      id="glasshive-effort"
-                      className="border-token-border-light bg-token-surface-primary h-10 w-full rounded-lg border px-3"
-                    >
-                      {modelCapability?.effortChoices.map((effort) => (
-                        <option key={effort} value={effort}>
-                          {effort}
-                          {effort === modelCapability.recommendedEffort
-                            ? ` (${localize('com_ui_glasshive_recommended')})`
-                            : ''}
-                        </option>
-                      ))}
-                    </select>
-                  )}
-                />
-              </>
-            )}
-          </div>
-        )}
+        {/* === VIVENTIUM START ===
+         * Feature: capability-backed Agent provider controls.
+         * Purpose: Share readiness, workspace/access, and effort behavior with optional routes.
+         * === VIVENTIUM END === */}
+        <CapabilityProviderOptions
+          provider={provider}
+          model={model ?? ''}
+          parameterField="model_parameters"
+          providerCapability={providerCapability}
+        />
         {/* === VIVENTIUM START ===
          * Feature: Agent Fallback LLM
          * Purpose: Let users configure the secondary model from the existing Model Parameters page.

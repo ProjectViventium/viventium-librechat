@@ -718,6 +718,8 @@ endpoints:
         cortex_execution: true
         phase_b_followup: true
         activation_classifier: false
+        voice_pipeline_llm: true
+        native_realtime_voice: false
         realtime_voice: false
         automatic_fallback_target: false
         workspace_binding: true

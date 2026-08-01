@@ -9,6 +9,7 @@ import {
 
 const providerRegistry = {
   'harness-provider': {
+    main_chat: true,
     workspace_binding: true,
     responses_api: false,
     default_access: 'full' as const,
@@ -135,6 +136,7 @@ describe('applyAgentProviderCapabilityDefaults', () => {
       ...providerRegistry,
       'harness-provider': {
         ...providerRegistry['harness-provider'],
+        voice_pipeline_llm: false,
         realtime_voice: false,
         automatic_fallback_target: false,
         activation_classifier: false,
@@ -165,8 +167,97 @@ describe('applyAgentProviderCapabilityDefaults', () => {
           registry,
           ['harness-provider'],
         ),
-      ).toThrow('does not support this agent role');
+      ).toThrow('does not support agent capability');
     }
+  });
+
+  it('accepts a harness as a cascaded Voice Call LLM and applies exact model defaults', () => {
+    const result = applyAgentProviderCapabilityDefaults(
+      {
+        provider: 'openAI',
+        model: 'gpt-direct',
+        voice_llm_provider: 'harness-provider',
+        voice_llm_model: 'native:model-a',
+        voice_llm_model_parameters: { useResponsesApi: true },
+      },
+      {
+        ...providerRegistry,
+        'harness-provider': {
+          ...providerRegistry['harness-provider'],
+          voice_pipeline_llm: true,
+          native_realtime_voice: false,
+          realtime_voice: false,
+        },
+      },
+      ['harness-provider'],
+    );
+
+    expect(result.voice_llm_model_parameters).toEqual({
+      model: 'native:model-a',
+      reasoning_effort: 'medium',
+    });
+    expect(result.glasshive_options).toEqual({
+      workspace: { mode: 'life' },
+      access: 'full',
+    });
+  });
+
+  it('does not allow a voice-capable harness to become an automatic voice fallback target', () => {
+    expect(() =>
+      applyAgentProviderCapabilityDefaults(
+        {
+          provider: 'openAI',
+          model: 'gpt-direct',
+          voice_fallback_llm_provider: 'harness-provider',
+          voice_fallback_llm_model: 'native:model-a',
+        },
+        {
+          ...providerRegistry,
+          'harness-provider': {
+            ...providerRegistry['harness-provider'],
+            voice_pipeline_llm: true,
+            automatic_fallback_target: false,
+          },
+        },
+        ['harness-provider'],
+      ),
+    ).toThrow('automatic_fallback_target');
+  });
+
+  it('rejects an unsupported exact harness model or voice effort', () => {
+    const voiceRegistry = {
+      ...providerRegistry,
+      'harness-provider': {
+        ...providerRegistry['harness-provider'],
+        voice_pipeline_llm: true,
+        realtime_voice: false,
+      },
+    };
+    expect(() =>
+      applyAgentProviderCapabilityDefaults(
+        {
+          provider: 'openAI',
+          model: 'gpt-direct',
+          voice_llm_provider: 'harness-provider',
+          voice_llm_model: 'made-up',
+        },
+        voiceRegistry,
+        ['harness-provider'],
+      ),
+    ).toThrow('Unsupported model');
+    expect(() =>
+      applyAgentProviderCapabilityDefaults(
+        {
+          provider: 'openAI',
+          model: 'gpt-direct',
+          voice_llm_provider: 'harness-provider',
+          voice_llm_model: 'native:model-a',
+          voice_llm_model_parameters: { reasoning_effort: 'ultra' },
+        },
+        voiceRegistry,
+        ['harness-provider'],
+      ),
+    ).toThrow('Unsupported reasoning effort');
   });
 
   it('strips every Responses API-only parameter from harness model configuration', () => {

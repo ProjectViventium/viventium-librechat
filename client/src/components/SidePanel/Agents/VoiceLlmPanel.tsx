@@ -1,6 +1,7 @@
 import { useFormContext, useWatch } from 'react-hook-form';
 import { ChevronRight } from 'lucide-react';
 import type { AgentForm, AgentModelPanelProps } from '~/common';
+import type { TAgentProviderCapability } from 'librechat-data-provider';
 import { Panel } from '~/common';
 import { useLocalize } from '~/hooks';
 import OptionalLlmPanel from './OptionalLlmPanel';
@@ -9,7 +10,10 @@ export default function VoiceLlmPanel({
   providers,
   setActivePanel,
   models: modelsData,
-}: Pick<AgentModelPanelProps, 'models' | 'providers' | 'setActivePanel'>) {
+  providerCapabilities,
+}: Pick<AgentModelPanelProps, 'models' | 'providers' | 'setActivePanel'> & {
+  providerCapabilities: Record<string, TAgentProviderCapability>;
+}) {
   const localize = useLocalize();
   const { control } = useFormContext<AgentForm>();
   const voiceFallbackModel = useWatch({ control, name: 'voice_fallback_llm_model' });
@@ -20,6 +24,7 @@ export default function VoiceLlmPanel({
       models={modelsData}
       providers={providers}
       setActivePanel={setActivePanel}
+      providerCapabilities={providerCapabilities}
       title={localize('com_ui_voice_chat_llm')}
       description={localize('com_ui_voice_chat_llm_description')}
       clearLabel={localize('com_ui_voice_chat_llm_clear')}

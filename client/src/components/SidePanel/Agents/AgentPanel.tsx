@@ -10,6 +10,7 @@ import {
   EModelEndpoint,
   PermissionBits,
   isAssistantsEndpoint,
+  isAgentProviderCapabilityEnabled,
 } from 'librechat-data-provider';
 import type { AgentForm, StringOption } from '~/common';
 import type { Agent } from 'librechat-data-provider';
@@ -451,44 +452,61 @@ export default function AgentPanel() {
     [agentsConfig?.capabilityRequiredProviders],
   );
   const providerAllowsRole = useCallback(
-    (provider: string, role: 'main_chat' | 'realtime_voice' | 'automatic_fallback_target') => {
+    (provider: string, role: 'main_chat' | 'voice_pipeline_llm' | 'automatic_fallback_target') => {
       const capability = agentsConfig?.providerCapabilities?.[provider];
       if (!capability) {
         return !capabilityRequiredProviders.has(provider);
       }
-      return capability[role] === true;
+      return isAgentProviderCapabilityEnabled(capability, role);
     },
     [agentsConfig?.providerCapabilities, capabilityRequiredProviders],
   );
 
-  const providers = useMemo(
+  const availableProviderOptions = useMemo(
     () =>
       Object.keys(endpointsConfig ?? {})
         .filter(
           (key) =>
             !isAssistantsEndpoint(key) &&
             (allowedProviders.size > 0 ? allowedProviders.has(key) : true) &&
-            providerAllowsRole(key, 'main_chat') &&
+            (!capabilityRequiredProviders.has(key) ||
+              agentsConfig?.providerCapabilities?.[key] != null) &&
             key !== EModelEndpoint.agents,
         )
         .map((provider) =>
           createProviderOption(provider, agentsConfig?.providerCapabilities?.[provider]?.label),
         ),
-    [endpointsConfig, allowedProviders, agentsConfig?.providerCapabilities, providerAllowsRole],
+    [
+      endpointsConfig,
+      allowedProviders,
+      agentsConfig?.providerCapabilities,
+      capabilityRequiredProviders,
+    ],
+  );
+
+  const providers = useMemo(
+    () => availableProviderOptions.filter(({ value }) => providerAllowsRole(value, 'main_chat')),
+    [availableProviderOptions, providerAllowsRole],
   );
 
   /* === VIVENTIUM START ===
    * Feature: Capability-filtered Agent Builder provider choices
-   * Purpose: GlassHive is a text/main/cortex provider, not a real-time voice or automatic fallback
-   * target during the initial rollout.
+   * Purpose: Voice Call LLM choices include providers that can author text in the cascaded LiveKit
+   * pipeline; native audio-session and automatic-fallback capabilities remain separate.
    * === VIVENTIUM END === */
   const voiceProviders = useMemo(
-    () => providers.filter(({ value }) => providerAllowsRole(value, 'realtime_voice')),
-    [providerAllowsRole, providers],
+    () =>
+      availableProviderOptions.filter(({ value }) =>
+        providerAllowsRole(value, 'voice_pipeline_llm'),
+      ),
+    [availableProviderOptions, providerAllowsRole],
   );
   const fallbackProviders = useMemo(
-    () => providers.filter(({ value }) => providerAllowsRole(value, 'automatic_fallback_target')),
-    [providerAllowsRole, providers],
+    () =>
+      availableProviderOptions.filter(({ value }) =>
+        providerAllowsRole(value, 'automatic_fallback_target'),
+      ),
+    [availableProviderOptions, providerAllowsRole],
   );
 
   /* Mutations */
@@ -746,6 +764,7 @@ export default function AgentPanel() {
             key={`voice-llm-${agent_id}`}
             models={models}
             providers={voiceProviders}
+            providerCapabilities={agentsConfig?.providerCapabilities ?? {}}
             setActivePanel={setActivePanel}
           />
         )}

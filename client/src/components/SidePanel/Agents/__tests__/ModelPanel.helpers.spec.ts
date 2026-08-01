@@ -1,10 +1,31 @@
 import { describe, expect, it } from '@jest/globals';
 import {
   didAgentProviderChange,
+  resolveCapabilityEffort,
   resolveAgentModelDisplayLabel,
   resolveAgentModelForProvider,
   shouldDefaultOpenAIGPT56AgentToResponses,
 } from '../modelSelection';
+
+describe('resolveCapabilityEffort', () => {
+  const modelCapability = {
+    effortChoices: ['low', 'medium', 'high'],
+    recommendedEffort: 'medium',
+  };
+
+  it('keeps a supported lighter voice effort', () => {
+    expect(resolveCapabilityEffort('low', modelCapability)).toBe('low');
+  });
+
+  it('uses the provider recommendation for missing or stale effort', () => {
+    expect(resolveCapabilityEffort(undefined, modelCapability)).toBe('medium');
+    expect(resolveCapabilityEffort('ultra', modelCapability)).toBe('medium');
+  });
+
+  it('does not invent effort for a model without declared choices', () => {
+    expect(resolveCapabilityEffort('low', undefined)).toBeUndefined();
+  });
+});
 
 /* === VIVENTIUM START ===
  * Regression: friendly provider model labels must survive the collapsed Agent Builder view.

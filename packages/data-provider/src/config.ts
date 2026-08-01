@@ -304,6 +304,14 @@ export const agentProviderCapabilitySchema = z.object({
   cortex_execution: z.boolean().default(false),
   phase_b_followup: z.boolean().default(false),
   activation_classifier: z.boolean().default(false),
+  /* === VIVENTIUM START ===
+   * Feature: Voice capability split.
+   * Purpose: A provider can author text inside the LiveKit STT -> LLM -> TTS pipeline without
+   * pretending to own a native low-latency audio session. `realtime_voice` remains a compatibility
+   * alias for older compiled configurations.
+   * === VIVENTIUM END === */
+  voice_pipeline_llm: z.boolean().default(false),
+  native_realtime_voice: z.boolean().default(false),
   realtime_voice: z.boolean().default(false),
   automatic_fallback_target: z.boolean().default(false),
   workspace_binding: z.boolean().default(false),
@@ -318,6 +326,23 @@ export const agentProviderCapabilitySchema = z.object({
 });
 
 export type TAgentProviderCapability = z.infer<typeof agentProviderCapabilitySchema>;
+
+export type AgentProviderCapabilityRole =
+  'main_chat' | 'activation_classifier' | 'voice_pipeline_llm' | 'automatic_fallback_target';
+
+export function isAgentProviderCapabilityEnabled(
+  capability:
+    Partial<Record<AgentProviderCapabilityRole | 'realtime_voice', boolean>> | null | undefined,
+  role: AgentProviderCapabilityRole,
+): boolean {
+  if (!capability) {
+    return false;
+  }
+  if (role === 'voice_pipeline_llm') {
+    return capability.voice_pipeline_llm === true || capability.realtime_voice === true;
+  }
+  return capability[role] === true;
+}
 
 export const agentsEndpointSchema = baseEndpointSchema
   .merge(

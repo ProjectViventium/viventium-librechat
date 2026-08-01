@@ -8,7 +8,28 @@ import {
   getEndpointField,
   memorySchema,
   resolveEndpointType,
+  isAgentProviderCapabilityEnabled,
 } from './config';
+
+describe('isAgentProviderCapabilityEnabled', () => {
+  it('accepts a cascaded voice LLM without claiming native realtime audio', () => {
+    expect(
+      isAgentProviderCapabilityEnabled(
+        {
+          voice_pipeline_llm: true,
+          realtime_voice: false,
+        },
+        'voice_pipeline_llm',
+      ),
+    ).toBe(true);
+  });
+
+  it('keeps legacy realtime voice capability compatible', () => {
+    expect(isAgentProviderCapabilityEnabled({ realtime_voice: true }, 'voice_pipeline_llm')).toBe(
+      true,
+    );
+  });
+});
 
 describe('agentsEndpointSchema provider capability policy', () => {
   it('fails closed when a capability-required provider has no registry entry', () => {
@@ -38,6 +59,8 @@ describe('agentsEndpointSchema provider capability policy', () => {
       cortex_execution: false,
       phase_b_followup: false,
       activation_classifier: false,
+      voice_pipeline_llm: false,
+      native_realtime_voice: false,
       realtime_voice: false,
       automatic_fallback_target: false,
       workspace_binding: false,

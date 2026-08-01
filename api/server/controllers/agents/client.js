@@ -3345,6 +3345,7 @@ class AgentClient extends BaseClient {
       req,
       userText,
       stimulusId,
+      conversationId: this.conversationId,
       scheduledSnapshot: snapshot,
     })
       .catch((error) => {
@@ -4843,6 +4844,7 @@ class AgentClient extends BaseClient {
                 mainAgent: this.options.agent,
                 messages: initialMessages,
                 runId: this.responseMessageId,
+                conversationId: this.conversationId,
                 activatedCortices: phaseBActivatedCorticesList,
 
                 onCortexBrewing: (cortexData) => {
@@ -4992,6 +4994,7 @@ class AgentClient extends BaseClient {
                     mainAgent: this.options.agent,
                     messages: initialMessages,
                     runId: this.responseMessageId,
+                    conversationId: this.conversationId,
                     activatedCortices: recoveredCortices,
                     onCortexBrewing: (cortexData) => {
                       void emitCortexEvent({ ...cortexData, type: ContentTypes.CORTEX_BREWING });
@@ -5525,6 +5528,7 @@ class AgentClient extends BaseClient {
             mainAgent: this.options.agent,
             messages: initialMessages,
             runId: this.responseMessageId,
+            conversationId: this.conversationId,
             activatedCortices: activatedCorticesList,
             onCortexBrewing: (cortexData) => {
               void emitCortexEvent({ ...cortexData, type: ContentTypes.CORTEX_BREWING });

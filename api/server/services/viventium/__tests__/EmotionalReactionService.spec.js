@@ -132,6 +132,7 @@ describe('EmotionalReactionService', () => {
         req: { user: { id: 'user-1' }, body: {} },
         userText: 'I found something surprising.',
         stimulusId: 'message-1',
+        conversationId: 'canonical-conversation-1',
         scheduledSnapshot: state,
       },
       deps,
@@ -144,7 +145,11 @@ describe('EmotionalReactionService', () => {
     });
     expect(deps.checkCortexActivation).not.toHaveBeenCalled();
     expect(deps.executeCortex).toHaveBeenCalledWith(
-      expect.objectContaining({ contextMode: 'minimal', executionTimeoutMs: expect.any(Number) }),
+      expect.objectContaining({
+        contextMode: 'minimal',
+        conversationId: 'canonical-conversation-1',
+        executionTimeoutMs: expect.any(Number),
+      }),
     );
     expect(deps.executeCortex.mock.calls[0][0].executionTimeoutMs).toBeLessThanOrEqual(15000);
     expect(deps.commitFeelingReaction).toHaveBeenCalledWith(

@@ -8,8 +8,8 @@ import type { AgentForm } from '~/common';
 import OptionalLlmPanel from '../OptionalLlmPanel';
 
 jest.mock('lucide-react', () => ({
-  ChevronLeft: () => <span aria-hidden="true">back</span>,
-  Trash2: () => <span aria-hidden="true">clear</span>,
+  ChevronLeft: () => <span aria-hidden="true" />,
+  Trash2: () => <span aria-hidden="true" />,
 }));
 
 jest.mock('@librechat/client', () => ({

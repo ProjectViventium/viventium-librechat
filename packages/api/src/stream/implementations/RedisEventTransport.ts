@@ -63,7 +63,7 @@ interface StreamSubscribers {
   >;
   allSubscribersLeftCallbacks: Array<() => void>;
   /** Abort callbacks - called when abort signal is received from any replica */
-  abortCallbacks: Array<() => void>;
+  abortCallbacks: Array<(reason?: 'user_cancelled') => void>;
   /** Reorder buffer for handling out-of-order delivery in Redis Cluster */
   reorderBuffer: ReorderBuffer;
 }
@@ -763,7 +763,7 @@ export class RedisEventTransport implements IEventTransport {
     if (message.type === EventTypes.ABORT) {
       for (const callback of streamState.abortCallbacks) {
         try {
-          callback();
+          callback(message.data === 'user_cancelled' ? 'user_cancelled' : undefined);
         } catch (err) {
           logger.error(`[RedisEventTransport] Error in abort callback:`, err);
         }
@@ -986,13 +986,20 @@ export class RedisEventTransport implements IEventTransport {
    * This enables cross-replica abort: when a user aborts on Replica B,
    * the generating Replica A receives the signal and stops.
    */
-  emitAbort(streamId: string): void {
+  emitAbort(streamId: string, reason?: 'user_cancelled'): Promise<void> {
     const channel = CHANNELS.events(streamId);
-    const message: PubSubMessage = { type: EventTypes.ABORT };
+    const message: PubSubMessage = {
+      type: EventTypes.ABORT,
+      data: reason === 'user_cancelled' ? reason : undefined,
+    };
 
-    this.publisher.publish(channel, JSON.stringify(message)).catch((err) => {
-      logger.error(`[RedisEventTransport] Failed to publish abort:`, err);
-    });
+    return this.publisher.publish(channel, JSON.stringify(message)).then(
+      () => undefined,
+      (err) => {
+        logger.error(`[RedisEventTransport] Failed to publish abort:`, err);
+        throw err;
+      },
+    );
   }
 
   /**
@@ -1002,7 +1009,7 @@ export class RedisEventTransport implements IEventTransport {
    * @param streamId - The stream identifier
    * @param callback - Called when abort signal is received
    */
-  onAbort(streamId: string, callback: () => void): Promise<void> {
+  onAbort(streamId: string, callback: (reason?: 'user_cancelled') => void): Promise<void> {
     const channel = CHANNELS.events(streamId);
     let state = this.streams.get(streamId);
 

@@ -57,6 +57,27 @@ export function resolveAgentModelForProvider({
 }
 
 /* === VIVENTIUM START ===
+ * Feature: capability-declared model effort.
+ * Purpose: Preserve a supported explicit effort and repair only missing/stale values from the
+ * provider registry instead of parsing model names or provider labels.
+ * === VIVENTIUM END === */
+export function resolveCapabilityEffort(
+  currentEffort: unknown,
+  modelCapability: { effortChoices?: string[]; recommendedEffort?: string } | null | undefined,
+): string | undefined {
+  const choices = modelCapability?.effortChoices ?? [];
+  if (choices.length === 0) {
+    return undefined;
+  }
+  const current = String(currentEffort ?? '').trim();
+  if (current && choices.includes(current)) {
+    return current;
+  }
+  const recommended = String(modelCapability?.recommendedEffort ?? '').trim();
+  return recommended && choices.includes(recommended) ? recommended : choices[0];
+}
+
+/* === VIVENTIUM START ===
  * Feature: Optional-route provider parameter isolation.
  * Purpose: Provider-specific settings such as OpenAI Responses must not survive a real provider
  * change and contaminate an xAI, Anthropic, or other optional agent route.

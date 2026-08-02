@@ -193,6 +193,11 @@ export default function AgentConfig() {
    */
   const voiceLlmModel = useWatch({ control, name: 'voice_llm_model' });
   const voiceLlmProvider = useWatch({ control, name: 'voice_llm_provider' });
+  const voiceModelDisplayLabel = resolveAgentModelDisplayLabel({
+    provider: voiceLlmProvider ?? '',
+    model: voiceLlmModel ?? '',
+    providerCapabilities: agentsConfig?.providerCapabilities ?? {},
+  });
   let VoiceIcon: IconComponentTypes | null | undefined;
   if (voiceLlmProvider) {
     const voiceEndpointType = getEndpointField(endpointsConfig, voiceLlmProvider, 'type');
@@ -345,7 +350,7 @@ export default function AgentConfig() {
               )}
               <span>
                 {voiceLlmModel && voiceLlmProvider
-                  ? voiceLlmModel
+                  ? voiceModelDisplayLabel
                   : localize('com_ui_voice_chat_llm_fallback')}
               </span>
             </div>

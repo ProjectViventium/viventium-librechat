@@ -821,7 +821,7 @@ describe('/api/viventium/voice/chat', () => {
     expect(infoText).toContain('requestId=req-log-1');
   });
 
-  test('aborts a voice-owned generation stream via call-session auth', async () => {
+  test('cancels a voice-owned generation stream for an intentional user interruption', async () => {
     const { GenerationJobManager } = require('@librechat/api');
     GenerationJobManager.getJob.mockResolvedValue({
       metadata: { userId: 'user_1' },
@@ -845,6 +845,7 @@ describe('/api/viventium/voice/chat', () => {
       method: 'POST',
       url: '/api/viventium/voice/stream/lc_req_abort_1/abort',
       headers: { 'x-viventium-call-secret': 'secret' },
+      body: { reason: 'voice_user_interruption' },
     });
     const res = createMockRes();
 
@@ -852,7 +853,7 @@ describe('/api/viventium/voice/chat', () => {
 
     expect(res.statusCode).toBe(200);
     expect(res.body).toEqual({ success: true, aborted: 'lc_req_abort_1' });
-    expect(GenerationJobManager.abortJob).toHaveBeenCalledWith('lc_req_abort_1');
+    expect(GenerationJobManager.abortJob).toHaveBeenCalledWith('lc_req_abort_1', 'user_cancelled');
     expect(mockSaveMessage).toHaveBeenCalledWith(
       expect.any(Object),
       expect.objectContaining({
@@ -867,6 +868,79 @@ describe('/api/viventium/voice/chat', () => {
         context: 'api/server/routes/viventium/voice.js - voice stream abort endpoint',
       }),
     );
+  });
+
+  test('detaches a passive refresh without cancelling the authoring job', async () => {
+    const { GenerationJobManager } = require('@librechat/api');
+    GenerationJobManager.getJob.mockResolvedValue({
+      metadata: { userId: 'user_1' },
+    });
+
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/stream/lc_req_refresh/abort',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: { reason: 'voice_client_disconnected' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(202);
+    expect(res.body).toEqual({ success: true, detached: true });
+    expect(GenerationJobManager.abortJob).not.toHaveBeenCalled();
+    expect(mockSaveMessage).not.toHaveBeenCalled();
+  });
+
+  test('rejects an unknown voice abort reason without cancelling authoring', async () => {
+    const { GenerationJobManager } = require('@librechat/api');
+    GenerationJobManager.getJob.mockResolvedValue({
+      metadata: { userId: 'user_1' },
+    });
+
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/stream/lc_req_unknown_abort/abort',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: { reason: 'unexpected_transport_state' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toEqual({ error: 'Unsupported voice abort reason' });
+    expect(GenerationJobManager.abortJob).not.toHaveBeenCalled();
+    expect(mockSaveMessage).not.toHaveBeenCalled();
+  });
+
+  test('does not race a second transport abort against explicit End Call cancellation', async () => {
+    const { GenerationJobManager } = require('@librechat/api');
+    const abortController = new AbortController();
+    abortController.abort('user_cancelled');
+    GenerationJobManager.getJob.mockResolvedValue({
+      metadata: { userId: 'user_1' },
+      abortController,
+    });
+
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/stream/lc_req_cancelled/abort',
+      headers: { 'x-viventium-call-secret': 'secret' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(202);
+    expect(res.body).toEqual({ success: true, alreadyCancelled: true });
+    expect(GenerationJobManager.abortJob).not.toHaveBeenCalled();
   });
 
   test('Listen-Only mode saves ambient transcripts without starting an agent stream', async () => {

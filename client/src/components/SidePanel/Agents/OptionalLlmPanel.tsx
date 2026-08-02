@@ -9,12 +9,18 @@ import { ControlCombobox } from '@librechat/client';
 import { ChevronLeft, Trash2 } from 'lucide-react';
 import { useFormContext, useWatch, Controller } from 'react-hook-form';
 import { alternateName } from 'librechat-data-provider';
+import type { TAgentProviderCapability } from 'librechat-data-provider';
 import type { AgentForm, AgentModelPanelProps } from '~/common';
 import { useLocalize } from '~/hooks';
 import { Panel } from '~/common';
 import { cn } from '~/utils';
-import { didAgentProviderChange, resolveAgentModelForProvider } from './modelSelection';
+import {
+  didAgentProviderChange,
+  resolveAgentModelDisplayLabel,
+  resolveAgentModelForProvider,
+} from './modelSelection';
 import ModelParametersSection from './ModelParametersSection';
+import CapabilityProviderOptions from './CapabilityProviderOptions';
 
 type OptionalLlmFieldNames = {
   provider: 'voice_llm_provider' | 'fallback_llm_provider' | 'voice_fallback_llm_provider';
@@ -35,6 +41,7 @@ type OptionalLlmPanelProps = Pick<
   fields: OptionalLlmFieldNames;
   backPanel?: Panel;
   children?: React.ReactNode;
+  providerCapabilities?: Record<string, TAgentProviderCapability>;
 };
 
 export default function OptionalLlmPanel({
@@ -47,6 +54,7 @@ export default function OptionalLlmPanel({
   fields,
   backPanel = Panel.builder,
   children,
+  providerCapabilities = {},
 }: OptionalLlmPanelProps) {
   const localize = useLocalize();
   const { control, setValue } = useFormContext<AgentForm>();
@@ -61,6 +69,7 @@ export default function OptionalLlmPanel({
     () => (provider ? (modelsData[provider] ?? []) : []),
     [modelsData, provider],
   );
+  const providerCapability = providerCapabilities[provider];
 
   useEffect(() => {
     const currentModel = selectedModel ?? '';
@@ -75,7 +84,7 @@ export default function OptionalLlmPanel({
         previousProvider: previousProviderRef.current,
       })
     ) {
-      setValue(fields.parameters, {});
+      setValue(fields.parameters, {} as never);
     }
 
     if (!provider) {
@@ -100,7 +109,7 @@ export default function OptionalLlmPanel({
   const handleClear = () => {
     setValue(fields.model, null);
     setValue(fields.provider, null);
-    setValue(fields.parameters, {});
+    setValue(fields.parameters, {} as never);
   };
 
   const parametersTitle = `${title} ${localize('com_sidepanel_parameters')}`;
@@ -140,10 +149,15 @@ export default function OptionalLlmPanel({
             control={control}
             render={({ field }) => {
               const value = field.value ?? '';
+              const providerOption = providers.find((candidate) =>
+                typeof candidate === 'string' ? candidate === value : candidate.value === value,
+              );
+              const providerLabel =
+                typeof providerOption === 'string' ? providerOption : providerOption?.label;
               return (
                 <ControlCombobox
                   selectedValue={value}
-                  displayValue={alternateName[value] ?? value}
+                  displayValue={alternateName[value] ?? providerLabel ?? value}
                   selectPlaceholder={localize('com_ui_select_provider')}
                   searchPlaceholder={localize('com_ui_select_search_provider')}
                   setValue={(val: string) => {
@@ -179,6 +193,11 @@ export default function OptionalLlmPanel({
               return (
                 <ControlCombobox
                   selectedValue={field.value || ''}
+                  displayValue={resolveAgentModelDisplayLabel({
+                    provider,
+                    model: field.value || '',
+                    providerCapabilities,
+                  })}
                   selectPlaceholder={
                     provider
                       ? localize('com_ui_select_model')
@@ -189,7 +208,11 @@ export default function OptionalLlmPanel({
                     field.onChange(val || null);
                   }}
                   items={models.map((m) => ({
-                    label: m,
+                    label: resolveAgentModelDisplayLabel({
+                      provider,
+                      model: m,
+                      providerCapabilities,
+                    }),
                     value: m,
                   }))}
                   disabled={!provider}
@@ -202,6 +225,12 @@ export default function OptionalLlmPanel({
             }}
           />
         </div>
+        <CapabilityProviderOptions
+          provider={provider}
+          model={selectedModel ?? ''}
+          parameterField={fields.parameters}
+          providerCapability={providerCapability}
+        />
       </div>
       <ModelParametersSection
         fieldName={fields.parameters}

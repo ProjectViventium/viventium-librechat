@@ -501,6 +501,11 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
 
     const voiceJobCreateStart = voiceLatencyEnabled ? voiceLatencyNow() : 0;
     const job = await GenerationJobManager.createJob(streamId, userId, conversationId);
+    if (req.viventiumCallSession?.callSessionId) {
+      await GenerationJobManager.updateMetadata(streamId, {
+        voiceCallSessionId: req.viventiumCallSession.callSessionId,
+      });
+    }
     if (voiceLatencyEnabled) {
       logVoiceLatencyStage(
         req,
@@ -1394,6 +1399,7 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
       iconURL: endpointOption.iconURL,
       model: endpointOption.modelOptions?.model || endpointOption.model_parameters?.model,
       sender: client?.sender,
+      voiceCallSessionId: req.viventiumCallSession?.callSessionId,
     });
 
     // Store content parts reference for abort

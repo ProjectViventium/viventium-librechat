@@ -448,6 +448,7 @@ describe('initializeAgent — provider-native tool ownership', () => {
         agents: {
           providerCapabilities: {
             [provider]: {
+              main_chat: true,
               native_tools: true,
               workspace_binding: true,
               default_access: 'workspace',

@@ -6,6 +6,21 @@
 const express = require('express');
 const request = require('supertest');
 
+const mockGenerationJobManager = {
+  getActiveJobIdsForUser: jest.fn(),
+  getJob: jest.fn(),
+  abortJob: jest.fn(),
+};
+
+jest.mock(
+  '@librechat/api',
+  () => ({
+    isEnabled: (value) => ['true', '1', 'yes', 'on'].includes(String(value).toLowerCase()),
+    GenerationJobManager: mockGenerationJobManager,
+  }),
+  { virtual: true },
+);
+
 jest.mock(
   '@librechat/data-schemas',
   () => ({
@@ -37,6 +52,7 @@ jest.mock('~/server/services/viventium/CallSessionService', () => ({
   })),
   assertCallSessionSecret: jest.fn(async () => ({
     callSessionId: 'call_session_test',
+    userId: 'user_1',
     roomName: 'lc-calltest',
     wingModeEnabled: false,
     shadowModeEnabled: false,
@@ -158,6 +174,9 @@ describe('/api/viventium/calls', () => {
     process.env.VIVENTIUM_PUBLIC_PLAYGROUND_URL = '';
     process.env.VIVENTIUM_VOICE_GATEWAY_AGENT_NAME = 'librechat-voice-gateway';
     global.fetch = jest.fn(async () => playgroundHealthResponse(modernIdentity()));
+    mockGenerationJobManager.getActiveJobIdsForUser.mockResolvedValue([]);
+    mockGenerationJobManager.getJob.mockResolvedValue(undefined);
+    mockGenerationJobManager.abortJob.mockResolvedValue({ success: true });
   });
 
   test('POST fails closed before creating a session when Voice is disabled', async () => {
@@ -512,6 +531,104 @@ describe('/api/viventium/calls', () => {
 
     expect(res.body.status).toBe('confirmed');
     expect(res.body.dispatchConfirmedAtMs).toBe(123);
+  });
+
+  test('POST end explicitly cancels only active generation jobs for the exact call session', async () => {
+    mockGenerationJobManager.getActiveJobIdsForUser.mockResolvedValue([
+      'stream_same_call',
+      'stream_other_call',
+    ]);
+    mockGenerationJobManager.getJob.mockImplementation(async (streamId) => ({
+      metadata: {
+        userId: 'user_1',
+        voiceCallSessionId:
+          streamId === 'stream_same_call' ? 'call_session_test' : 'call_session_other',
+      },
+    }));
+    const callsRouter = require('../calls');
+
+    const app = express();
+    app.use(express.json());
+    app.use('/api/viventium/calls', callsRouter);
+
+    const res = await request(app)
+      .post('/api/viventium/calls/call_session_test/end')
+      .set('x-viventium-call-secret', 'secret')
+      .send({})
+      .expect(200);
+
+    expect(res.body).toEqual({ success: true, cancelled: 1 });
+    expect(mockGenerationJobManager.abortJob).toHaveBeenCalledTimes(1);
+    expect(mockGenerationJobManager.abortJob).toHaveBeenCalledWith(
+      'stream_same_call',
+      'user_cancelled',
+    );
+  });
+
+  test('POST end is idempotent when the call has no active generation', async () => {
+    const callsRouter = require('../calls');
+
+    const app = express();
+    app.use(express.json());
+    app.use('/api/viventium/calls', callsRouter);
+
+    const res = await request(app)
+      .post('/api/viventium/calls/call_session_test/end')
+      .set('x-viventium-call-secret', 'secret')
+      .send({})
+      .expect(200);
+
+    expect(res.body).toEqual({ success: true, cancelled: 0 });
+    expect(mockGenerationJobManager.abortJob).not.toHaveBeenCalled();
+  });
+
+  test('POST end fails visibly when an exact active job cannot be cancelled', async () => {
+    mockGenerationJobManager.getActiveJobIdsForUser.mockResolvedValue(['stream_failed']);
+    mockGenerationJobManager.getJob.mockResolvedValue({
+      metadata: { userId: 'user_1', voiceCallSessionId: 'call_session_test' },
+    });
+    mockGenerationJobManager.abortJob.mockResolvedValue({ success: false });
+    const callsRouter = require('../calls');
+
+    const app = express();
+    app.use(express.json());
+    app.use('/api/viventium/calls', callsRouter);
+
+    const res = await request(app)
+      .post('/api/viventium/calls/call_session_test/end')
+      .set('x-viventium-call-secret', 'secret')
+      .send({})
+      .expect(503);
+
+    expect(res.body).toEqual({ success: false, cancelled: 0, failed: 1 });
+  });
+
+  test('POST end diagnostics never log session, stream, or provider error values', async () => {
+    const privateError = new Error('provider private diagnostic');
+    mockGenerationJobManager.getActiveJobIdsForUser.mockResolvedValue(['stream_private']);
+    mockGenerationJobManager.getJob.mockResolvedValue({
+      metadata: { userId: 'user_1', voiceCallSessionId: 'call_session_test' },
+    });
+    mockGenerationJobManager.abortJob.mockRejectedValue(privateError);
+    const callsRouter = require('../calls');
+    const { logger } = require('@librechat/data-schemas');
+
+    const app = express();
+    app.use(express.json());
+    app.use('/api/viventium/calls', callsRouter);
+
+    await request(app)
+      .post('/api/viventium/calls/call_session_test/end')
+      .set('x-viventium-call-secret', 'secret')
+      .send({})
+      .expect(503);
+
+    const diagnostics = JSON.stringify(
+      Object.values(logger).flatMap((method) => method.mock.calls),
+    );
+    for (const privateValue of ['call_session_test', 'stream_private', privateError.message]) {
+      expect(diagnostics).not.toContain(privateValue);
+    }
   });
 
   test('GET voice-settings returns both saved defaults and requested route', async () => {

@@ -99,9 +99,13 @@ describe('GenerationJobManager Integration Tests', () => {
       expect(retrieved?.streamId).toBe(streamId);
 
       // Update job
-      await GenerationJobManager.updateMetadata(streamId, { sender: 'TestAgent' });
+      await GenerationJobManager.updateMetadata(streamId, {
+        sender: 'TestAgent',
+        voiceCallSessionId: 'call-session-1',
+      });
       const updated = await GenerationJobManager.getJob(streamId);
       expect(updated?.metadata?.sender).toBe('TestAgent');
+      expect(updated?.metadata?.voiceCallSessionId).toBe('call-session-1');
 
       // Complete job
       await GenerationJobManager.completeJob(streamId);
@@ -356,11 +360,13 @@ describe('GenerationJobManager Integration Tests', () => {
         await GenerationJobManager.updateMetadata(streamId, {
           sender: 'ConsistencyAgent',
           responseMessageId: 'resp-123',
+          voiceCallSessionId: 'call-session-consistency',
         });
 
         const updated = await GenerationJobManager.getJob(streamId);
         expect(updated?.metadata?.sender).toBe('ConsistencyAgent');
         expect(updated?.metadata?.responseMessageId).toBe('resp-123');
+        expect(updated?.metadata?.voiceCallSessionId).toBe('call-session-consistency');
 
         await GenerationJobManager.completeJob(streamId);
 

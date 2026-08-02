@@ -1545,7 +1545,26 @@ router.post('/stream/:streamId/abort', voiceAuth, async (req, res) => {
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
-  const abortResult = await GenerationJobManager.abortJob(streamId);
+  if (
+    job.abortController?.signal?.aborted === true &&
+    job.abortController.signal.reason === 'user_cancelled'
+  ) {
+    logger.info('[VIVENTIUM][VoiceStream] abort_already_user_cancelled');
+    return res.status(202).json({ success: true, alreadyCancelled: true });
+  }
+
+  const reason = typeof req.body?.reason === 'string' ? req.body.reason : '';
+  const passiveDetachReasons = new Set(['voice_client_disconnected']);
+  if (passiveDetachReasons.has(reason)) {
+    logger.info('[VIVENTIUM][VoiceStream] voice_stream_detached');
+    return res.status(202).json({ success: true, detached: true });
+  }
+  if (reason !== 'voice_user_interruption') {
+    logger.warn('[VIVENTIUM][VoiceStream] unsupported_abort_reason');
+    return res.status(400).json({ error: 'Unsupported voice abort reason' });
+  }
+
+  const abortResult = await GenerationJobManager.abortJob(streamId, 'user_cancelled');
 
   if (
     abortResult?.success &&

@@ -68,6 +68,21 @@ function createSubscriber(initialStatus: string = 'ready') {
 }
 
 describe('RedisEventTransport subscription lifecycle', () => {
+  test('carries only explicit user-cancellation intent across Redis abort delivery', async () => {
+    const { publisher, subscriber } = createSubscriber();
+    const transport = new RedisEventTransport(publisher as never, subscriber as never);
+    const onAbort = jest.fn();
+    await transport.onAbort('reasoned-abort', onAbort);
+
+    transport.emitAbort('reasoned-abort', 'user_cancelled');
+    const published = publisher.publish.mock.calls[0][1] as string;
+    subscriber.emit('message', 'stream:{reasoned-abort}:events', published);
+
+    expect(JSON.parse(published)).toEqual({ type: 'abort', data: 'user_cancelled' });
+    expect(onAbort).toHaveBeenCalledWith('user_cancelled');
+    await transport.destroy();
+  });
+
   test('waits for the Redis connection readiness check before entering subscriber mode', async () => {
     const { publisher, subscriber } = createSubscriber('connecting');
     const transport = new RedisEventTransport(publisher as never, subscriber as never);

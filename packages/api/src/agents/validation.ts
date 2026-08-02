@@ -1,6 +1,11 @@
 import { z } from 'zod';
-import { ViolationTypes, ErrorTypes, normalizeEndpointName } from 'librechat-data-provider';
-import type { Agent, TModelsConfig } from 'librechat-data-provider';
+import {
+  ViolationTypes,
+  ErrorTypes,
+  normalizeEndpointName,
+  isAgentProviderCapabilityEnabled,
+} from 'librechat-data-provider';
+import type { Agent, AgentProviderCapabilityRole, TModelsConfig } from 'librechat-data-provider';
 import type { Request, Response } from 'express';
 
 /** Avatar schema shared between create and update */
@@ -209,6 +214,8 @@ export type ProviderCapabilityRegistry = Record<
   {
     main_chat?: boolean;
     activation_classifier?: boolean;
+    voice_pipeline_llm?: boolean;
+    native_realtime_voice?: boolean;
     realtime_voice?: boolean;
     automatic_fallback_target?: boolean;
     workspace_binding?: boolean;
@@ -233,6 +240,12 @@ export function applyAgentProviderCapabilityDefaults<T extends Record<string, un
 ): T {
   const next = { ...agent } as T & {
     model_parameters?: Record<string, unknown>;
+    voice_llm_provider?: unknown;
+    voice_llm_model?: unknown;
+    voice_llm_model_parameters?: Record<string, unknown>;
+    voice_fallback_llm_provider?: unknown;
+    voice_fallback_llm_model?: unknown;
+    voice_fallback_llm_model_parameters?: Record<string, unknown>;
     glasshive_options?: {
       workspace: { mode: 'life' | 'custom'; path?: string };
       access: 'full' | 'workspace';
@@ -240,7 +253,7 @@ export function applyAgentProviderCapabilityDefaults<T extends Record<string, un
   };
   const rejectCapabilityTarget = (
     selectedProviderValue: unknown,
-    capabilityField: 'activation_classifier' | 'realtime_voice' | 'automatic_fallback_target',
+    capabilityField: AgentProviderCapabilityRole,
     path: Array<string | number>,
   ) => {
     const selectedProvider = String(selectedProviderValue ?? '').trim();
@@ -257,24 +270,98 @@ export function applyAgentProviderCapabilityDefaults<T extends Record<string, un
         },
       ]);
     }
-    if (selectedCapability?.[capabilityField] === false) {
+    if (
+      selectedCapability &&
+      !isAgentProviderCapabilityEnabled(selectedCapability, capabilityField)
+    ) {
       throw new z.ZodError([
         {
           code: z.ZodIssueCode.custom,
           path,
-          message: `Provider ${selectedProvider} does not support this agent role`,
+          message: `Provider ${selectedProvider} does not support agent capability ${capabilityField}`,
         },
       ]);
     }
   };
 
-  rejectCapabilityTarget(next.voice_llm_provider, 'realtime_voice', ['voice_llm_provider']);
-  rejectCapabilityTarget(next.voice_fallback_llm_provider, 'realtime_voice', [
+  rejectCapabilityTarget(next.voice_llm_provider, 'voice_pipeline_llm', ['voice_llm_provider']);
+  rejectCapabilityTarget(next.voice_fallback_llm_provider, 'voice_pipeline_llm', [
+    'voice_fallback_llm_provider',
+  ]);
+  rejectCapabilityTarget(next.voice_fallback_llm_provider, 'automatic_fallback_target', [
     'voice_fallback_llm_provider',
   ]);
   rejectCapabilityTarget(next.fallback_llm_provider, 'automatic_fallback_target', [
     'fallback_llm_provider',
   ]);
+
+  const normalizeCapabilityRoute = ({
+    providerField,
+    modelField,
+    parametersField,
+  }: {
+    providerField: 'voice_llm_provider' | 'voice_fallback_llm_provider';
+    modelField: 'voice_llm_model' | 'voice_fallback_llm_model';
+    parametersField: 'voice_llm_model_parameters' | 'voice_fallback_llm_model_parameters';
+  }) => {
+    const routeProvider = String(next[providerField] ?? '').trim();
+    if (!routeProvider) {
+      return;
+    }
+    const routeCapability = registry?.[routeProvider];
+    if (!routeCapability) {
+      return;
+    }
+    const routeModel = String(next[modelField] ?? '').trim();
+    const routeModelMetadata = routeCapability.models?.find(
+      (candidate) => candidate.id === routeModel,
+    );
+    if (!routeModelMetadata) {
+      throw new z.ZodError([
+        {
+          code: z.ZodIssueCode.custom,
+          path: [modelField],
+          message: `Unsupported model for configured provider ${routeProvider}`,
+        },
+      ]);
+    }
+    const routeParameters = { ...(next[parametersField] ?? {}) };
+    routeParameters.model = routeModel;
+    if (routeCapability.responses_api === false) {
+      delete routeParameters.useResponsesApi;
+      delete routeParameters.reasoning;
+      delete routeParameters.reasoning_summary;
+      delete routeParameters.verbosity;
+      delete routeParameters.web_search;
+    }
+    const routeEffort = String(
+      routeParameters.reasoning_effort ?? routeModelMetadata.recommendedEffort ?? '',
+    ).trim();
+    if (routeEffort && !(routeModelMetadata.effortChoices ?? []).includes(routeEffort)) {
+      throw new z.ZodError([
+        {
+          code: z.ZodIssueCode.custom,
+          path: [parametersField, 'reasoning_effort'],
+          message: `Unsupported reasoning effort for model ${routeModel}`,
+        },
+      ]);
+    }
+    if (routeEffort) {
+      routeParameters.reasoning_effort = routeEffort;
+    }
+    next[parametersField] = routeParameters;
+  };
+
+  normalizeCapabilityRoute({
+    providerField: 'voice_llm_provider',
+    modelField: 'voice_llm_model',
+    parametersField: 'voice_llm_model_parameters',
+  });
+  normalizeCapabilityRoute({
+    providerField: 'voice_fallback_llm_provider',
+    modelField: 'voice_fallback_llm_model',
+    parametersField: 'voice_fallback_llm_model_parameters',
+  });
   const backgroundCortices = next.background_cortices;
   if (Array.isArray(backgroundCortices)) {
     backgroundCortices.forEach((entry, cortexIndex) => {
@@ -310,6 +397,30 @@ export function applyAgentProviderCapabilityDefaults<T extends Record<string, un
 
   const provider = String(agent.provider ?? '').trim();
   const capability = registry?.[provider];
+  const workspaceCapability = [
+    capability,
+    registry?.[String(next.voice_llm_provider ?? '').trim()],
+    registry?.[String(next.voice_fallback_llm_provider ?? '').trim()],
+  ].find((candidate) => candidate?.workspace_binding === true);
+  if (workspaceCapability && !next.glasshive_options) {
+    next.glasshive_options = {
+      workspace: { mode: 'life' },
+      access: workspaceCapability.default_access === 'full' ? 'full' : 'workspace',
+    };
+  }
+  if (
+    workspaceCapability &&
+    next.glasshive_options?.access === 'full' &&
+    workspaceCapability.allow_full_access !== true
+  ) {
+    throw new z.ZodError([
+      {
+        code: z.ZodIssueCode.custom,
+        path: ['glasshive_options', 'access'],
+        message: `Selected provider does not permit full host access`,
+      },
+    ]);
+  }
   if (provider && requiredProviders.includes(provider) && !capability) {
     throw new z.ZodError([
       {
@@ -322,7 +433,7 @@ export function applyAgentProviderCapabilityDefaults<T extends Record<string, un
   if (!capability) {
     return next;
   }
-  if (capability.main_chat === false) {
+  if (!isAgentProviderCapabilityEnabled(capability, 'main_chat')) {
     throw new z.ZodError([
       {
         code: z.ZodIssueCode.custom,
@@ -370,26 +481,6 @@ export function applyAgentProviderCapabilityDefaults<T extends Record<string, un
     modelParameters.reasoning_effort = effort;
   }
   next.model_parameters = modelParameters;
-  if (capability.workspace_binding === true && !next.glasshive_options) {
-    next.glasshive_options = {
-      workspace: { mode: 'life' },
-      access: capability.default_access === 'full' ? 'full' : 'workspace',
-    };
-  }
-  if (
-    capability.workspace_binding === true &&
-    next.glasshive_options?.access === 'full' &&
-    capability.allow_full_access !== true
-  ) {
-    throw new z.ZodError([
-      {
-        code: z.ZodIssueCode.custom,
-        path: ['glasshive_options', 'access'],
-        message: `Provider ${provider} does not permit full host access`,
-      },
-    ]);
-  }
-
   return next;
 }
 

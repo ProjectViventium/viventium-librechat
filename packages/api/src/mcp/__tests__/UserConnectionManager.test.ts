@@ -10,6 +10,7 @@ import type { MCPConnection } from '~/mcp/connection';
 
 const mockRegistryInstance = {
   getServerConfig: jest.fn(),
+  shouldEnableSSRFProtection: jest.fn().mockReturnValue(false),
 };
 
 jest.mock('@librechat/data-schemas', () => ({
@@ -124,5 +125,30 @@ describe('UserConnectionManager idle behavior', () => {
     expect(result).toBe(schedulingConnection);
     expect(schedulingConnection.disconnect).not.toHaveBeenCalled();
     expect(MCPConnectionFactory.create).not.toHaveBeenCalled();
+  });
+
+  it('replaces a cached interactive connection before non-interactive reuse', async () => {
+    const manager = new TestUserConnectionManager();
+    manager.appConnections = {
+      has: jest.fn().mockResolvedValue(false),
+    } as never;
+    const interactiveConnection = createMockConnection();
+    const nonInteractiveConnection = createMockConnection();
+    manager.setUserConnection(userId, 'ms-365', interactiveConnection);
+    (MCPConnectionFactory.create as jest.Mock).mockResolvedValue(nonInteractiveConnection);
+
+    const result = await manager.getUserConnection({
+      serverName: 'ms-365',
+      user: { id: userId } as IUser,
+      flowManager: {} as never,
+      allowOAuthInitiation: false,
+    } as never);
+
+    expect(result).toBe(nonInteractiveConnection);
+    expect(interactiveConnection.disconnect).toHaveBeenCalledTimes(1);
+    expect(MCPConnectionFactory.create).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({ allowOAuthInitiation: false }),
+    );
   });
 });

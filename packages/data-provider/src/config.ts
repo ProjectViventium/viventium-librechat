@@ -322,6 +322,12 @@ export const agentProviderCapabilitySchema = z.object({
   default_access: z.enum(['full', 'workspace']).default('workspace'),
   allow_full_access: z.boolean().default(false),
   excluded_mcp_servers: z.array(z.string()).optional().default([]),
+  /* === VIVENTIUM START ===
+   * Feature: Deferred connected-account projection.
+   * Purpose: Preserve reviewed lazy MCP scope through config parsing without eagerly discovering
+   * connected-account schemas on ordinary conversation turns.
+   * === VIVENTIUM END === */
+  reviewed_mcp_projection: z.enum(['deferred']).optional(),
   models: z.array(agentProviderModelCapabilitySchema).default([]),
 });
 

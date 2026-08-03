@@ -271,6 +271,42 @@ describe('MCPConnectionFactory', () => {
       );
     });
 
+    it('does not create an OAuth flow when non-interactive initiation is disabled', async () => {
+      const basicOptions = {
+        serverName: 'test-server',
+        serverConfig: {
+          ...mockServerConfig,
+          url: 'https://api.example.com',
+          type: 'sse' as const,
+        } as t.SSEOptions,
+      };
+      const oauthOptions: t.OAuthConnectionOptions = {
+        useOAuth: true,
+        user: mockUser,
+        flowManager: mockFlowManager,
+        returnOnOAuth: true,
+        allowOAuthInitiation: false,
+      };
+      mockConnectionInstance.isConnected.mockResolvedValue(false);
+      let oauthRequiredHandler: (data: Record<string, unknown>) => Promise<void>;
+      mockConnectionInstance.on.mockImplementation((event, handler) => {
+        if (event === 'oauthRequired') {
+          oauthRequiredHandler = handler as (data: Record<string, unknown>) => Promise<void>;
+        }
+        return mockConnectionInstance;
+      });
+
+      await MCPConnectionFactory.create(basicOptions, oauthOptions).catch(() => {});
+      await oauthRequiredHandler!({ serverUrl: 'https://api.example.com' });
+
+      expect(mockMCPOAuthHandler.initiateOAuthFlow).not.toHaveBeenCalled();
+      expect(mockFlowManager.createFlow).not.toHaveBeenCalled();
+      expect(mockConnectionInstance.emit).toHaveBeenCalledWith(
+        'oauthFailed',
+        expect.objectContaining({ message: 'OAuth reconnection required' }),
+      );
+    });
+
     it('should delete existing flow before creating new OAuth flow to prevent stale codeVerifier', async () => {
       const basicOptions = {
         serverName: 'test-server',

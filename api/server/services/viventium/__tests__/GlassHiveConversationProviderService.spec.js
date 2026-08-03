@@ -18,8 +18,10 @@ const {
 } = require('../GlassHiveCapabilityBootstrapService');
 const {
   attachConversationProviderCapabilityBundle,
+  bindConversationProviderDeveloperInstructionTail,
   bindHarnessCancellation,
   buildHarnessIdempotencyKey,
+  declaredHandoffMcpServerNames,
   declaredMcpServerNames,
 } = require('../GlassHiveConversationProviderService');
 
@@ -50,6 +52,53 @@ describe('GlassHiveConversationProviderService', () => {
     expect(buildHarnessIdempotencyKey('cortex', 'response-1', 'red-team')).not.toBe(
       buildHarnessIdempotencyKey('cortex', 'response-1', 'research'),
     );
+  });
+
+  test('binds one exact provider-only developer tail without changing other providers', () => {
+    const capsule = [
+      '<viventium_feeling_state>',
+      'Synthetic bright and playful private causal state.',
+      '</viventium_feeling_state>',
+    ].join('\n');
+    const targetAgent = {
+      model_parameters: {
+        configuration: {
+          defaultHeaders: {
+            'X-GlassHive-Agent-Id': 'agent-synthetic',
+            'X-Existing': 'kept',
+          },
+        },
+      },
+    };
+
+    expect(
+      bindConversationProviderDeveloperInstructionTail({ targetAgent, tail: capsule }),
+    ).toBe(true);
+    const headers = targetAgent.model_parameters.configuration.defaultHeaders;
+    expect(headers['X-Existing']).toBe('kept');
+    expect(
+      Buffer.from(headers['X-GlassHive-Developer-Instruction-Tail-B64'], 'base64').toString(
+        'utf8',
+      ),
+    ).toBe(capsule);
+
+    expect(
+      bindConversationProviderDeveloperInstructionTail({ targetAgent, tail: '' }),
+    ).toBe(true);
+    expect(
+      targetAgent.model_parameters.configuration.defaultHeaders[
+        'X-GlassHive-Developer-Instruction-Tail-B64'
+      ],
+    ).toBeUndefined();
+
+    const ordinaryAgent = { model_parameters: { configuration: { defaultHeaders: {} } } };
+    expect(
+      bindConversationProviderDeveloperInstructionTail({
+        targetAgent: ordinaryAgent,
+        tail: capsule,
+      }),
+    ).toBe(false);
+    expect(ordinaryAgent.model_parameters.configuration.defaultHeaders).toEqual({});
   });
 
   test('delivers an intentional Stop to the exact authenticated main request', async () => {
@@ -281,6 +330,8 @@ describe('GlassHiveConversationProviderService', () => {
       user: { id: 'user-synthetic' },
       requestBody,
       allowedServerNames: ['google-workspace'],
+      deferredServerNames: [],
+      excludedServerNames: ['glasshive-workers-projects'],
     });
     const headers = targetAgent.model_parameters.configuration.defaultHeaders;
     expect(headers['X-Existing']).toBe('kept');
@@ -294,6 +345,190 @@ describe('GlassHiveConversationProviderService', () => {
       )
       .digest('hex');
     expect(headers['X-GlassHive-Bootstrap-Signature']).toBe(`sha256=${expected}`);
+  });
+
+  test('attaches only reviewed MCPs owned by a declared handoff as deferred capabilities', async () => {
+    buildConversationProviderBootstrapBundle.mockResolvedValue({
+      codex_config_append: '[mcp_servers.synthetic]',
+    });
+    const targetAgent = { model_parameters: {} };
+    const declaredAgent = {
+      id: 'main-agent',
+      tools: [],
+      edges: [
+        {
+          from: 'main-agent',
+          to: 'connected-accounts',
+          edgeType: 'handoff',
+        },
+      ],
+    };
+    const resolveAgentById = jest.fn().mockResolvedValue({
+      id: 'connected-accounts',
+      tools: [
+        `search${Constants.mcp_delimiter}google_workspace`,
+        `list${Constants.mcp_delimiter}ms-365`,
+        `run${Constants.mcp_delimiter}glasshive-workers-projects`,
+      ],
+    });
+
+    await expect(
+      attachConversationProviderCapabilityBundle({
+        targetAgent,
+        declaredAgent,
+        req: { user: { id: 'user-synthetic' }, body: {} },
+        resolveAgentById,
+        capability: {
+          workspace_binding: true,
+          reviewed_mcp_projection: 'deferred',
+          excluded_mcp_servers: ['glasshive-workers-projects'],
+        },
+      }),
+    ).resolves.toBe(true);
+
+    expect(buildConversationProviderBootstrapBundle).toHaveBeenCalledWith({
+      user: { id: 'user-synthetic' },
+      requestBody: {},
+      allowedServerNames: [],
+      deferredServerNames: ['google_workspace', 'ms-365'],
+      excludedServerNames: ['glasshive-workers-projects'],
+    });
+    expect(resolveAgentById).toHaveBeenCalledWith('connected-accounts');
+  });
+
+  test('projects deferred MCPs through default handoff edges with array endpoints', async () => {
+    buildConversationProviderBootstrapBundle.mockResolvedValue({
+      codex_config_append: '[mcp_servers.synthetic]',
+    });
+    const targetAgent = { model_parameters: {} };
+    const declaredAgent = {
+      id: 'main-agent',
+      tools: [],
+      edges: [
+        {
+          from: ['other-agent', 'main-agent'],
+          to: ['connected-accounts', 'connected-files'],
+        },
+        {
+          from: 'main-agent',
+          to: 'direct-target',
+          edgeType: 'direct',
+        },
+      ],
+    };
+    const resolveAgentById = jest.fn(async (id) => {
+      const agents = {
+        'connected-accounts': {
+          tools: [`search${Constants.mcp_delimiter}google_workspace`],
+        },
+        'connected-files': { tools: [`list${Constants.mcp_delimiter}ms-365`] },
+        'direct-target': { tools: [`ignored${Constants.mcp_delimiter}unreviewed`] },
+      };
+      return agents[id];
+    });
+
+    await expect(
+      attachConversationProviderCapabilityBundle({
+        targetAgent,
+        declaredAgent,
+        req: { user: { id: 'user-synthetic' }, body: {} },
+        resolveAgentById,
+        capability: {
+          workspace_binding: true,
+          reviewed_mcp_projection: 'deferred',
+        },
+      }),
+    ).resolves.toBe(true);
+
+    expect(resolveAgentById.mock.calls.map(([id]) => id)).toEqual([
+      'connected-accounts',
+      'connected-files',
+    ]);
+    expect(buildConversationProviderBootstrapBundle).toHaveBeenCalledWith({
+      user: { id: 'user-synthetic' },
+      requestBody: {},
+      allowedServerNames: [],
+      deferredServerNames: ['google_workspace', 'ms-365'],
+      excludedServerNames: [],
+    });
+  });
+
+  test('does not project unrelated reviewed MCPs when no declared handoff owns them', async () => {
+    const resolver = jest.fn();
+
+    await expect(
+      attachConversationProviderCapabilityBundle({
+        targetAgent: { model_parameters: {} },
+        declaredAgent: { id: 'standalone-agent', tools: [], edges: [] },
+        req: { user: { id: 'user-synthetic' }, body: {} },
+        resolveAgentById: resolver,
+        capability: {
+          workspace_binding: true,
+          reviewed_mcp_projection: 'deferred',
+        },
+      }),
+    ).resolves.toBe(false);
+
+    expect(resolver).not.toHaveBeenCalled();
+    expect(buildConversationProviderBootstrapBundle).not.toHaveBeenCalled();
+  });
+
+  test('derives handoff MCP ownership from structured edges and excludes self-delegation', async () => {
+    const resolveAgentById = jest.fn().mockResolvedValue({
+      tools: [
+        `read${Constants.mcp_delimiter}ms-365`,
+        `run${Constants.mcp_delimiter}glasshive-workers-projects`,
+      ],
+    });
+
+    await expect(
+      declaredHandoffMcpServerNames(
+        {
+          id: 'main-agent',
+          edges: [
+            { from: 'main-agent', to: 'connected-accounts', edgeType: 'handoff' },
+            { from: 'other-agent', to: 'unrelated', edgeType: 'handoff' },
+          ],
+        },
+        ['glasshive-workers-projects'],
+        resolveAgentById,
+      ),
+    ).resolves.toEqual(['ms-365']);
+  });
+
+  test('returns typed degraded capability context when a declared handoff cannot be resolved', async () => {
+    buildConversationProviderBootstrapBundle.mockResolvedValue({
+      glasshive_capability_status: {
+        status: 'degraded',
+        reason: 'handoff_capability_resolution_unavailable',
+      },
+    });
+
+    await expect(
+      attachConversationProviderCapabilityBundle({
+        targetAgent: { model_parameters: {} },
+        declaredAgent: {
+          id: 'main-agent',
+          tools: [],
+          edges: [{ from: 'main-agent', to: 'connected-accounts', edgeType: 'handoff' }],
+        },
+        req: { user: { id: 'user-synthetic' }, body: {} },
+        resolveAgentById: jest.fn().mockRejectedValue(new Error('synthetic lookup outage')),
+        capability: {
+          workspace_binding: true,
+          reviewed_mcp_projection: 'deferred',
+        },
+      }),
+    ).resolves.toBe(true);
+
+    expect(buildConversationProviderBootstrapBundle).toHaveBeenCalledWith({
+      user: { id: 'user-synthetic' },
+      requestBody: {},
+      allowedServerNames: [],
+      deferredServerNames: [],
+      excludedServerNames: [],
+      capabilityResolutionStatus: 'handoff_capability_resolution_unavailable',
+    });
   });
 
   test('fails closed instead of sending an unsigned capability bundle', async () => {

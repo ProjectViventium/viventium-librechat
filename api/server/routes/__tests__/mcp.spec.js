@@ -55,6 +55,7 @@ jest.mock('@librechat/api', () => {
 });
 
 jest.mock('@librechat/data-schemas', () => ({
+  decryptV2: jest.fn(),
   logger: {
     debug: jest.fn(),
     info: jest.fn(),
@@ -158,6 +159,8 @@ describe('MCP Routes', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    mockRegistryInstance.getServerConfig.mockResolvedValue({});
+    require('@librechat/data-schemas').decryptV2.mockResolvedValue('synthetic-decrypted-token');
     mcpRouter.__resetPersistentWarmupStateForTests?.();
   });
 
@@ -207,6 +210,59 @@ describe('MCP Routes', () => {
           redirect_uri: 'https://chat.viventium.ai/api/mcp/test-server/oauth/callback',
         },
       );
+    });
+
+    it('should initiate an account slot with the shared provider callback and slot-scoped flow id', async () => {
+      const previousDomainServer = process.env.DOMAIN_SERVER;
+      const previousAuthUrl = process.env.GOOGLE_WORKSPACE_MCP_AUTH_URL;
+      const previousTokenUrl = process.env.GOOGLE_WORKSPACE_MCP_TOKEN_URL;
+      process.env.DOMAIN_SERVER = 'https://chat.viventium.example';
+      process.env.GOOGLE_WORKSPACE_MCP_AUTH_URL = 'https://google-mcp.example/authorize';
+      process.env.GOOGLE_WORKSPACE_MCP_TOKEN_URL = 'https://google-mcp.example/token';
+      try {
+        const mockFlowManager = { getFlowState: jest.fn() };
+        getLogStores.mockReturnValue({});
+        require('~/config').getFlowStateManager.mockReturnValue(mockFlowManager);
+        mockRegistryInstance.getServerConfig.mockResolvedValue({
+          url: 'https://google-mcp.example/mcp',
+          viventiumOAuthConnection: {
+            providerId: 'google_workspace',
+            slot: 2,
+          },
+          oauth: {
+            authorization_url: 'http://localhost:8111/authorize',
+            token_url: 'http://localhost:8111/token',
+            redirect_uri: 'http://localhost:3180/api/mcp/google_workspace/oauth/callback',
+          },
+        });
+        MCPOAuthHandler.initiateOAuthFlow.mockResolvedValue({
+          authorizationUrl: 'https://oauth.example.com/auth',
+          flowId: 'test-user-id:google_workspace_2',
+        });
+
+        const response = await request(app).get('/api/mcp/google_workspace_2/oauth/initiate');
+
+        expect(response.status).toBe(302);
+        expect(MCPOAuthHandler.initiateOAuthFlow).toHaveBeenCalledWith(
+          'google_workspace_2',
+          'https://google-mcp.example/mcp',
+          'test-user-id',
+          {},
+          expect.objectContaining({
+            authorization_url: 'https://google-mcp.example/authorize',
+            token_url: 'https://google-mcp.example/token',
+            redirect_uri:
+              'https://chat.viventium.example/api/mcp/google_workspace/oauth/callback',
+          }),
+        );
+      } finally {
+        if (previousDomainServer == null) delete process.env.DOMAIN_SERVER;
+        else process.env.DOMAIN_SERVER = previousDomainServer;
+        if (previousAuthUrl == null) delete process.env.GOOGLE_WORKSPACE_MCP_AUTH_URL;
+        else process.env.GOOGLE_WORKSPACE_MCP_AUTH_URL = previousAuthUrl;
+        if (previousTokenUrl == null) delete process.env.GOOGLE_WORKSPACE_MCP_TOKEN_URL;
+        else process.env.GOOGLE_WORKSPACE_MCP_TOKEN_URL = previousTokenUrl;
+      }
     });
 
     it('should initiate OAuth flow when userId/flowId query params are omitted', async () => {
@@ -558,6 +614,65 @@ describe('MCP Routes', () => {
       expect(mockFlowManager.deleteFlow).toHaveBeenCalledWith(
         'test-user-id:test-server',
         'mcp_get_tokens',
+      );
+    });
+
+    it('should persist and reconnect the flow server when a shared callback serves another account slot', async () => {
+      const mockFlowManager = {
+        getFlowState: jest.fn().mockResolvedValue({ status: 'PENDING' }),
+        completeFlow: jest.fn().mockResolvedValue(),
+        deleteFlow: jest.fn().mockResolvedValue(true),
+      };
+      const mockFlowState = {
+        serverName: 'google_workspace_2',
+        userId: 'test-user-id',
+        metadata: {},
+        clientInfo: {},
+        codeVerifier: 'test-verifier',
+      };
+      const mockTokens = {
+        access_token: 'test-access-token',
+        refresh_token: 'test-refresh-token',
+      };
+      MCPOAuthHandler.getFlowState.mockResolvedValue(mockFlowState);
+      MCPOAuthHandler.completeOAuthFlow.mockResolvedValue(mockTokens);
+      MCPTokenStorage.storeTokens.mockResolvedValue();
+      mockRegistryInstance.getServerConfig.mockResolvedValue({
+        viventiumOAuthConnection: {
+          providerId: 'google_workspace',
+          slot: 2,
+        },
+      });
+      getLogStores.mockReturnValue({});
+      require('~/config').getFlowStateManager.mockReturnValue(mockFlowManager);
+
+      const mockUserConnection = { fetchTools: jest.fn().mockResolvedValue([]) };
+      const mockMcpManager = {
+        getUserConnection: jest.fn().mockResolvedValue(mockUserConnection),
+      };
+      require('~/config').getMCPManager.mockReturnValue(mockMcpManager);
+
+      const flowId = 'test-user-id:google_workspace_2';
+      const csrfToken = generateTestCsrfToken(flowId);
+      const response = await request(app)
+        .get('/api/mcp/google_workspace/oauth/callback')
+        .set('Cookie', [`oauth_csrf=${csrfToken}`])
+        .query({ code: 'test-auth-code', state: flowId });
+      const basePath = getBasePath();
+
+      expect(response.status).toBe(302);
+      expect(response.headers.location).toBe(
+        `${basePath}/oauth/success?serverName=google_workspace_2`,
+      );
+      expect(MCPTokenStorage.storeTokens).toHaveBeenCalledWith(
+        expect.objectContaining({
+          userId: 'test-user-id',
+          serverName: 'google_workspace_2',
+          tokens: mockTokens,
+        }),
+      );
+      expect(mockMcpManager.getUserConnection).toHaveBeenCalledWith(
+        expect.objectContaining({ serverName: 'google_workspace_2' }),
       );
     });
 
@@ -1439,7 +1554,10 @@ describe('MCP Routes', () => {
 
       findToken.mockImplementation(({ type, identifier }) => {
         if (type === 'mcp_oauth_refresh' && identifier === 'mcp:ms-365:refresh') {
-          return Promise.resolve({ expiresAt: new Date(Date.now() + 60_000) });
+          return Promise.resolve({
+            token: 'synthetic-encrypted-refresh-token',
+            expiresAt: new Date(Date.now() + 60_000),
+          });
         }
         return Promise.resolve(null);
       });
@@ -1541,6 +1659,79 @@ describe('MCP Routes', () => {
       expect(getMCPSetupData).toHaveBeenCalledTimes(1);
     });
 
+    it('should not warm an OAuth MCP server when its saved token cannot be decrypted', async () => {
+      const { findToken } = require('~/models');
+      const { decryptV2 } = require('@librechat/data-schemas');
+      const mockGetConnection = jest.fn().mockResolvedValue({});
+      const mockGetUserConnections = jest.fn().mockReturnValue(new Map());
+
+      require('~/config').getMCPManager.mockReturnValue({
+        getConnection: mockGetConnection,
+        getUserConnections: mockGetUserConnections,
+      });
+      findToken.mockImplementation(({ type, identifier }) => {
+        if (type === 'mcp_oauth_refresh' && identifier === 'mcp:ms-365:refresh') {
+          return Promise.resolve({
+            token: 'encrypted-under-an-old-runtime-key',
+            expiresAt: new Date(Date.now() + 60_000),
+          });
+        }
+        return Promise.resolve(null);
+      });
+      decryptV2.mockRejectedValue(new Error('credential cannot be decrypted'));
+      getMCPSetupData.mockResolvedValue({
+        mcpConfig: {
+          'ms-365': { url: 'http://localhost:6274/mcp' },
+        },
+        appConnections: {},
+        userConnections: {},
+        oauthServers: new Set(['ms-365']),
+      });
+      getServerConnectionStatus.mockResolvedValue({
+        connectionState: 'disconnected',
+        requiresOAuth: true,
+      });
+
+      const response = await request(app).get('/api/mcp/connection/status');
+
+      expect(response.status).toBe(200);
+      expect(mockGetConnection).not.toHaveBeenCalled();
+      expect(decryptV2).toHaveBeenCalledWith('encrypted-under-an-old-runtime-key');
+    });
+
+    it('should not warm an OAuth MCP server for an empty credential row', async () => {
+      const { findToken } = require('~/models');
+      const { decryptV2 } = require('@librechat/data-schemas');
+      const mockGetConnection = jest.fn().mockResolvedValue({});
+
+      require('~/config').getMCPManager.mockReturnValue({
+        getConnection: mockGetConnection,
+        getUserConnections: jest.fn().mockReturnValue(new Map()),
+      });
+      findToken.mockImplementation(({ type, identifier }) => {
+        if (type === 'mcp_oauth_refresh' && identifier === 'mcp:ms-365:refresh') {
+          return Promise.resolve({ token: '', expiresAt: new Date(Date.now() + 60_000) });
+        }
+        return Promise.resolve(null);
+      });
+      getMCPSetupData.mockResolvedValue({
+        mcpConfig: { 'ms-365': { url: 'http://localhost:6274/mcp' } },
+        appConnections: {},
+        userConnections: {},
+        oauthServers: new Set(['ms-365']),
+      });
+      getServerConnectionStatus.mockResolvedValue({
+        connectionState: 'disconnected',
+        requiresOAuth: true,
+      });
+
+      const response = await request(app).get('/api/mcp/connection/status');
+
+      expect(response.status).toBe(200);
+      expect(mockGetConnection).not.toHaveBeenCalled();
+      expect(decryptV2).not.toHaveBeenCalled();
+    });
+
     it('should cache OAuth token presence across rapid status polls', async () => {
       const { findToken } = require('~/models');
       const originalWarmupCooldown = process.env.MCP_PERSISTENT_WARMUP_COOLDOWN_MS;
@@ -1559,7 +1750,10 @@ describe('MCP Routes', () => {
 
         findToken.mockImplementation(({ type, identifier }) => {
           if (type === 'mcp_oauth_refresh' && identifier === 'mcp:ms-365:refresh') {
-            return Promise.resolve({ expiresAt: new Date(Date.now() + 60_000) });
+            return Promise.resolve({
+              token: 'synthetic-encrypted-refresh-token',
+              expiresAt: new Date(Date.now() + 60_000),
+            });
           }
           return Promise.resolve(null);
         });

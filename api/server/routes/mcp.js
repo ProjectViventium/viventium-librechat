@@ -1,6 +1,6 @@
 const { Router } = require('express');
 const net = require('net');
-const { logger } = require('@librechat/data-schemas');
+const { decryptV2, logger } = require('@librechat/data-schemas');
 const {
   CacheKeys,
   Constants,
@@ -39,6 +39,12 @@ const { findPluginAuthsByKeys } = require('~/models');
 const { getRoleByName } = require('~/models/Role');
 const { getLogStores } = require('~/cache');
 const {
+  getOAuthTokenPresence,
+  invalidateOAuthTokenPresence,
+  resetOAuthTokenPresenceForTests,
+  setOAuthTokenPresence,
+} = require('~/server/services/viventium/mcpOAuthPresenceCache');
+const {
   createMCPServerController,
   getMCPServerById,
   getMCPServersList,
@@ -50,16 +56,16 @@ const router = Router();
 const OAUTH_CSRF_COOKIE_PATH = '/api/mcp';
 
 /* VIVENTIUM START: MCP OAuth redirect-uri hardening + config source-of-truth */
-function getExpectedMCPOAuthCallback(serverName) {
+function getExpectedMCPOAuthCallback(providerId) {
   if (!process.env.DOMAIN_SERVER) {
     return null;
   }
   const domain = process.env.DOMAIN_SERVER.replace(/\/+$/, '');
-  return `${domain}/api/mcp/${serverName}/oauth/callback`;
+  return `${domain}/api/mcp/${providerId}/oauth/callback`;
 }
 
-function getExpectedMCPOAuthUrls(serverName) {
-  switch (serverName) {
+function getExpectedMCPOAuthUrls(providerId) {
+  switch (providerId) {
     case 'google_workspace':
       return {
         authorization_url: process.env.GOOGLE_WORKSPACE_MCP_AUTH_URL,
@@ -73,6 +79,10 @@ function getExpectedMCPOAuthUrls(serverName) {
     default:
       return null;
   }
+}
+
+function getOAuthProviderId(serverName, serverConfig) {
+  return serverConfig?.viventiumOAuthConnection?.providerId || serverName;
 }
 
 function isLoopbackUrl(urlString) {
@@ -102,7 +112,6 @@ function getPersistentMCPServers() {
 const persistentWarmupInFlight = new Set();
 const persistentWarmupLastAttemptAt = new Map();
 const localEndpointUnavailableLastLoggedAt = new Map();
-const oauthTokenPresenceCache = new Map();
 
 function getPersistentWarmupKey(userId, serverName) {
   return `${userId}:${serverName}`;
@@ -200,10 +209,9 @@ function maybeLogLocalEndpointUnavailable(userId, serverName, warmupKey) {
 }
 
 async function hasUsableMCPOAuthToken(userId, serverName) {
-  const cacheKey = getPersistentWarmupKey(userId, serverName);
   const nowMs = Date.now();
   const cacheMs = getOAuthTokenPresenceCacheMs();
-  const cached = oauthTokenPresenceCache.get(cacheKey);
+  const cached = getOAuthTokenPresence(userId, serverName);
 
   if (cached && cacheMs > 0 && nowMs - cached.checkedAt < cacheMs) {
     return cached.usable;
@@ -225,7 +233,7 @@ async function hasUsableMCPOAuthToken(userId, serverName) {
 
   try {
     const tokens = await Promise.all(tokenQueries.map((query) => findToken(query)));
-    const usable = tokens.some((token) => {
+    const unexpiredTokens = tokens.filter((token) => {
       if (!token) {
         return false;
       }
@@ -234,14 +242,27 @@ async function hasUsableMCPOAuthToken(userId, serverName) {
       }
       return new Date(token.expiresAt) >= now;
     });
+    let usable = false;
+    for (const token of unexpiredTokens) {
+      if (!token?.token) {
+        continue;
+      }
+      try {
+        await decryptV2(token.token);
+        usable = true;
+        break;
+      } catch (_error) {
+        // A row that cannot be decrypted by this runtime is not a usable credential.
+      }
+    }
 
     if (cacheMs > 0) {
-      oauthTokenPresenceCache.set(cacheKey, { checkedAt: nowMs, usable });
+      setOAuthTokenPresence(userId, serverName, { checkedAt: nowMs, usable });
     }
 
     return usable;
   } catch (error) {
-    oauthTokenPresenceCache.delete(cacheKey);
+    invalidateOAuthTokenPresence(userId, serverName);
     logger.warn(
       `[MCP Persistent Warmup][User: ${userId}] Could not inspect OAuth token state for "${serverName}": ${error?.message ?? String(error)}`,
     );
@@ -515,7 +536,8 @@ router.get('/:serverName/oauth/initiate', requireJwtAuth, setOAuthSession, async
     }
 
     /* VIVENTIUM START: stabilize OAuth URLs + callback for active local/prod environment */
-    const expectedOauthUrls = getExpectedMCPOAuthUrls(serverName);
+    const oauthProviderId = getOAuthProviderId(serverName, serverConfig);
+    const expectedOauthUrls = getExpectedMCPOAuthUrls(oauthProviderId);
     if (expectedOauthUrls) {
       const nextOauthConfig = { ...oauthConfig };
       let urlsPatched = false;
@@ -548,7 +570,7 @@ router.get('/:serverName/oauth/initiate', requireJwtAuth, setOAuthSession, async
       }
     }
 
-    const expectedCallback = getExpectedMCPOAuthCallback(serverName);
+    const expectedCallback = getExpectedMCPOAuthCallback(oauthProviderId);
     if (expectedCallback && oauthConfig.redirect_uri !== expectedCallback) {
       logger.warn('[MCP OAuth] Rewriting redirect_uri from domain source', {
         serverName,
@@ -589,11 +611,11 @@ router.get('/:serverName/oauth/initiate', requireJwtAuth, setOAuthSession, async
 router.get('/:serverName/oauth/callback', async (req, res) => {
   const basePath = getBasePath();
   try {
-    const { serverName } = req.params;
+    const callbackServerName = req.params.serverName;
     const { code, state, error: oauthError } = req.query;
 
     logger.debug('[MCP OAuth] Callback received', {
-      serverName,
+      serverName: callbackServerName,
       code: code ? 'present' : 'missing',
       state,
       error: oauthError,
@@ -657,6 +679,24 @@ router.get('/:serverName/oauth/callback', async (req, res) => {
       hasCodeVerifier: !!flowState.codeVerifier,
     });
 
+    const serverName =
+      typeof flowState.serverName === 'string' && flowState.serverName
+        ? flowState.serverName
+        : callbackServerName;
+    const flowServerConfig = await getMCPServersRegistry().getServerConfig(
+      serverName,
+      flowState.userId,
+    );
+    const expectedCallbackServerName = getOAuthProviderId(serverName, flowServerConfig);
+    if (expectedCallbackServerName !== callbackServerName) {
+      logger.error('[MCP OAuth] Callback provider does not match flow server', {
+        callbackServerName,
+        flowServerName: serverName,
+        expectedCallbackServerName,
+      });
+      return res.redirect(`${basePath}/oauth/error?error=invalid_state`);
+    }
+
     /** Check if this flow has already been completed (idempotency protection) */
     const currentFlowState = await flowManager.getFlowState(flowId, 'mcp_oauth');
     if (currentFlowState?.status === 'COMPLETED') {
@@ -689,6 +729,7 @@ router.get('/:serverName/oauth/callback', async (req, res) => {
           serverName,
           userId: flowState.userId,
         });
+        invalidateOAuthTokenPresence(flowState.userId, serverName);
       } catch (error) {
         logger.error('[MCP OAuth] Failed to store OAuth tokens after callback', error);
         throw error;
@@ -1271,6 +1312,6 @@ module.exports.__resetPersistentWarmupStateForTests = () => {
   persistentWarmupInFlight.clear();
   persistentWarmupLastAttemptAt.clear();
   localEndpointUnavailableLastLoggedAt.clear();
-  oauthTokenPresenceCache.clear();
+  resetOAuthTokenPresenceForTests();
 };
 /* VIVENTIUM END */

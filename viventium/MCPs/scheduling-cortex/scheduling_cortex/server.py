@@ -93,6 +93,9 @@ When to use:
 - The user asks what reminders/jobs exist, when one will run, or what happened on the last run.
 - A starter morning briefing exists and should be changed. Its stable template_id is
   morning_briefing_default_v1.
+- Current schedule counts, status, and delivery state are live facts. Call the matching read tool in
+  the current turn before stating them; never infer them from conversation history, capability
+  readiness, or an earlier tool result.
 
 Private periphery:
 

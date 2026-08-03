@@ -225,6 +225,11 @@ export type ProviderCapabilityRegistry = Record<
     default_access?: 'full' | 'workspace';
     allow_full_access?: boolean;
     excluded_mcp_servers?: string[];
+    /* === VIVENTIUM START ===
+     * Feature: Deferred connected-account projection.
+     * Purpose: Keep the provider registry type aligned with the parsed capability contract.
+     * === VIVENTIUM END === */
+    reviewed_mcp_projection?: 'deferred';
     models?: Array<{
       id: string;
       effortChoices?: string[];

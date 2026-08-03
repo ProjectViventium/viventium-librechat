@@ -134,6 +134,18 @@ viventium:
             - search_docs_mcp_google_workspace
             - get_doc_content_mcp_google_workspace
             - read_sheet_values_mcp_google_workspace
+            - sys__server__sys_mcp_google_workspace_2
+            - search_gmail_messages_mcp_google_workspace_2
+            - get_gmail_message_content_mcp_google_workspace_2
+            - get_gmail_messages_content_batch_mcp_google_workspace_2
+            - get_gmail_thread_content_mcp_google_workspace_2
+            - list_calendars_mcp_google_workspace_2
+            - get_events_mcp_google_workspace_2
+            - search_drive_files_mcp_google_workspace_2
+            - get_drive_file_content_mcp_google_workspace_2
+            - search_docs_mcp_google_workspace_2
+            - get_doc_content_mcp_google_workspace_2
+            - read_sheet_values_mcp_google_workspace_2
         - server: ms365
           scope_key: productivity_ms365
           same_scope_background_allowed: true
@@ -731,6 +743,9 @@ endpoints:
         allow_full_access: true
         excluded_mcp_servers:
           - glasshive-workers-projects
+        # VIVENTIUM START: lazily project reviewed MCPs owned by this Agent's declared handoffs.
+        reviewed_mcp_projection: deferred
+        # VIVENTIUM END
         models:
           - id: codex-cli:gpt-5.6-sol
             label: Codex / GPT-5.6 Sol
@@ -942,13 +957,17 @@ mcpServers:
       or updating. Prefer exact tool outputs over memory. Do not branch on prompt
       text, display names, provider labels, or user identity; use declared capabilities,
       structured fields, IDs, timestamps, and tool evidence.
-  google_workspace:
+  google_workspace: &google_workspace_account
     type: streamable-http
+    title: Google Workspace Account 1
     url: ${GOOGLE_WORKSPACE_MCP_URL}
     startup: false
     chatMenu: true
     timeout: 120000
     requiresOAuth: true
+    viventiumOAuthConnection:
+      providerId: google_workspace
+      slot: 1
     oauth:
       authorization_url: ${GOOGLE_WORKSPACE_MCP_AUTH_URL}
       token_url: ${GOOGLE_WORKSPACE_MCP_TOKEN_URL}
@@ -966,7 +985,12 @@ mcpServers:
       reexportNativeTools: true
     serverInstructions: Google Workspace owns authenticated Gmail, Google Calendar,
       Drive, Docs, Sheets, Slides, Tasks, Forms, Chat where exposed by tool schemas,
-      and verified Google productivity facts. Use it when the user asks about Gmail,
+      and verified Google productivity facts. Each configured connection is an independent
+      account. When a request covers all Google accounts, inspect every connected account
+      once and deduplicate repeated facts; otherwise use only the account(s) needed. For
+      relative Gmail date windows such as today or yesterday, calculate the user's local
+      start and end boundaries and pass them to `after:` and `before:` as Unix epoch seconds;
+      date-only Gmail boundaries are Pacific time. Use it when the user asks about Gmail,
       Google Calendar, Drive, Docs, Sheets, Slides, or a general productivity check
       where the available evidence may live in Google Workspace. Do not use it for
       Microsoft 365, web/news/weather facts, local files, or schedule/reminder management
@@ -984,6 +1008,12 @@ mcpServers:
       or updating. Prefer exact tool outputs over memory. Do not branch on prompt
       text, display names, provider labels, or user identity; use declared capabilities,
       structured fields, IDs, timestamps, and tool evidence.
+  google_workspace_2:
+    <<: *google_workspace_account
+    title: Google Workspace Account 2
+    viventiumOAuthConnection:
+      providerId: google_workspace
+      slot: 2
   viventium-health:
     type: stdio
     command: /bin/sh
@@ -993,6 +1023,16 @@ mcpServers:
     startup: false
     chatMenu: true
     timeout: 120000
+    viventiumGlassHive:
+      version: 1
+      permitsAutonomousWorker: true
+      hostAllowed: true
+      sandboxAllowed: false
+      defaultToolAccess: content_read
+      contentReadPolicy: require_broker_grant
+      writePolicy: deny
+      riskClass: health
+      reexportNativeTools: true
     serverInstructions: >-
       Viventium-Health provides read-only access to the owner's local raw health-source archive. List
       runs or records first, then read only the bounded record chunks needed for the user's request.

@@ -1,6 +1,35 @@
 import { MCPOptionsSchema, MCPServerUserInputSchema } from './mcp';
 
 describe('MCP Viventium server-managed fields', () => {
+  test('accepts trusted OAuth connection-group metadata in full MCP options', () => {
+    const parsed = MCPOptionsSchema.parse({
+      type: 'streamable-http',
+      url: 'https://mcp.example.com/mcp',
+      viventiumOAuthConnection: {
+        providerId: 'google_workspace',
+        slot: 2,
+      },
+    });
+
+    expect(parsed.viventiumOAuthConnection).toEqual({
+      providerId: 'google_workspace',
+      slot: 2,
+    });
+  });
+
+  test('omits trusted OAuth connection-group metadata from user-created MCP input', () => {
+    const parsed = MCPServerUserInputSchema.parse({
+      type: 'streamable-http',
+      url: 'https://mcp.example.com/mcp',
+      viventiumOAuthConnection: {
+        providerId: 'google_workspace',
+        slot: 2,
+      },
+    });
+
+    expect('viventiumOAuthConnection' in parsed).toBe(false);
+  });
+
   test('accepts reviewed GlassHive broker policy in full MCP options', () => {
     const parsed = MCPOptionsSchema.parse({
       type: 'streamable-http',

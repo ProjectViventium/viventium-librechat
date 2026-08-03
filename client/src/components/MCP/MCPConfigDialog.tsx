@@ -22,6 +22,8 @@ interface MCPConfigDialogProps {
   isSubmitting?: boolean;
   onRevoke?: () => void;
   serverName: string;
+  /** VIVENTIUM: Optional human-readable label while serverName remains the routing identity. */
+  displayName?: string;
   serverStatus?: MCPServerStatus;
   conversationId?: string | null;
   storageContextKey?: string;
@@ -35,21 +37,27 @@ export default function MCPConfigDialog({
   isSubmitting = false,
   onRevoke,
   serverName,
+  displayName,
   serverStatus,
   conversationId,
   storageContextKey,
 }: MCPConfigDialogProps) {
   const localize = useLocalize();
 
+  /* === VIVENTIUM START ===
+   * Feature: Human-readable managed MCP connection slots.
+   * Purpose: Distinguish multiple accounts in auth dialogs without changing routing IDs.
+   * === VIVENTIUM END === */
+  const visibleServerName = displayName || serverName;
   const hasFields = Object.keys(fieldsSchema).length > 0;
   const dialogTitle = hasFields
-    ? localize('com_ui_configure_mcp_variables_for', { 0: serverName })
-    : `${serverName} MCP Server`;
+    ? localize('com_ui_configure_mcp_variables_for', { 0: visibleServerName })
+    : `${visibleServerName} MCP Server`;
 
   const fullTitle = useMemo(() => {
     if (!serverStatus) {
       return localize('com_ui_mcp_dialog_title', {
-        serverName,
+        serverName: visibleServerName,
         status: '',
       });
     }
@@ -68,10 +76,10 @@ export default function MCPConfigDialog({
     }
 
     return localize('com_ui_mcp_dialog_title', {
-      serverName,
+      serverName: visibleServerName,
       status: statusText,
     });
-  }, [serverStatus, serverName, localize]);
+  }, [serverStatus, visibleServerName, localize]);
 
   /**
    * Render status badge with unified color system:

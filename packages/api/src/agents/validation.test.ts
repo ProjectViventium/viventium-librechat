@@ -11,6 +11,7 @@ const providerRegistry = {
   'harness-provider': {
     main_chat: true,
     workspace_binding: true,
+    reviewed_mcp_projection: 'deferred' as const,
     responses_api: false,
     default_access: 'full' as const,
     allow_full_access: true,

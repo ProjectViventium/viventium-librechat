@@ -58,7 +58,17 @@ const { primeFiles: primeCodeFiles } = require('~/server/services/Files/Code/pro
 const { manifestToolMap, toolkits } = require('~/app/clients/tools/manifest');
 const { createOnSearchResults } = require('~/server/services/Tools/search');
 const { loadAuthValues } = require('~/server/services/Tools/credentials');
-const { reinitMCPServer } = require('~/server/services/Tools/mcp');
+/* === VIVENTIUM START ===
+ * Feature: Credential-aware MCP readiness.
+ * Purpose: Cached tool schemas do not prove that this user's OAuth grant is still usable.
+ */
+const {
+  buildMcpOAuthRecovery,
+  inspectStoredOAuthCredentialState,
+  reinitMCPServer,
+  shouldUseCachedMcpTools,
+} = require('~/server/services/Tools/mcp');
+/* === VIVENTIUM END === */
 const { resolveConfigServers } = require('~/server/services/MCP');
 const { recordUsage } = require('~/server/services/Threads');
 const { loadTools } = require('~/app/clients/tools/util');
@@ -616,6 +626,24 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
   const configServers = await resolveConfigServers(req);
   /* === VIVENTIUM END === */
   const pendingOAuthServers = new Set();
+  const mcpCapabilityReadiness = {};
+  const oauthRecoveryStatuses = new Set([
+    'missing_auth',
+    'unreadable_credential',
+    'reconnect_required',
+    'oauth_required',
+    'oauth_pending',
+  ]);
+  const setMcpCapabilityReadiness = (serverName, status, recovery = null) => {
+    if (serverName && status) {
+      const resolvedRecovery =
+        recovery || (oauthRecoveryStatuses.has(status) ? buildMcpOAuthRecovery(serverName) : null);
+      mcpCapabilityReadiness[serverName] = {
+        status,
+        ...(resolvedRecovery ? { recovery: resolvedRecovery } : {}),
+      };
+    }
+  };
 
   const createOAuthEmitter = (serverName) => {
     return async (authURL) => {
@@ -717,26 +745,48 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
         `[Tool Definitions] Skipping MCP server ${serverName} because it is disabled by env`,
       );
       logFetchDone('disabled_by_env');
+      setMcpCapabilityReadiness(serverName, 'disabled');
       return null;
     }
     // === VIVENTIUM END ===
 
     const cached = await getMCPServerTools(userId, serverName);
+    let cachedCredentialState = null;
     if (cached) {
+      const serverConfig = configServers?.[serverName];
+      if (serverConfig?.requiresOAuth || serverConfig?.oauthMetadata) {
+        try {
+          cachedCredentialState = await inspectStoredOAuthCredentialState(userId, serverName);
+        } catch (error) {
+          logger.warn(`[Tool Definitions] OAuth credential inspection failed for ${serverName}`, {
+            error: error?.message ?? String(error),
+          });
+          cachedCredentialState = { status: 'credential_inspection_failed' };
+        }
+      }
+    }
+    if (cached && shouldUseCachedMcpTools(configServers?.[serverName], cachedCredentialState)) {
       clearMcpOAuthPendingMemo({ userId, serverName });
+      setMcpCapabilityReadiness(serverName, 'ready');
       logFetchDone('cache_hit', `tools=${Object.keys(cached).length}`);
       return cached;
+    }
+    if (cachedCredentialState) {
+      setMcpCapabilityReadiness(serverName, cachedCredentialState.status);
+      logFetchDone('cache_credential_unusable', `status=${cachedCredentialState.status}`);
     }
 
     const pendingMemo = readMcpOAuthPendingMemo({ userId, serverName });
     if (pendingMemo) {
       pendingOAuthServers.add(serverName);
+      setMcpCapabilityReadiness(serverName, pendingMemo.reason || 'oauth_required');
       logFetchDone('oauth_pending_memo_hit', `reason=${pendingMemo.reason}`);
       return null;
     }
 
     const oauthStart = async () => {
       pendingOAuthServers.add(serverName);
+      setMcpCapabilityReadiness(serverName, 'oauth_required');
       writeMcpOAuthPendingMemo({ userId, serverName, reason: 'oauth_pending' });
     };
 
@@ -747,16 +797,26 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
       serverName,
       configServers,
       userMCPAuthMap,
+      /* === VIVENTIUM START ===
+       * Feature: Non-interactive OAuth definition discovery.
+       * Purpose: Loading an Agent graph must not launch browser OAuth or a polling loop. The
+       * explicit Connected Accounts action remains the owner of OAuth initiation.
+       */
+      allowOAuthInitiation: false,
+      /* === VIVENTIUM END === */
     });
 
     if (result?.availableTools) {
       clearMcpOAuthPendingMemo({ userId, serverName });
+      setMcpCapabilityReadiness(serverName, 'ready');
       logFetchDone('reinit_success', `tools=${Object.keys(result.availableTools).length}`);
       return result.availableTools;
     }
 
     if (pendingOAuthServers.has(serverName) || result?.oauthRequired) {
-      writeMcpOAuthPendingMemo({ userId, serverName, reason: 'oauth_pending' });
+      const credentialStatus = result?.credentialState?.status || 'oauth_required';
+      writeMcpOAuthPendingMemo({ userId, serverName, reason: credentialStatus });
+      setMcpCapabilityReadiness(serverName, credentialStatus, result?.recovery);
       logFetchDone('oauth_pending', `oauth_required=${Boolean(result?.oauthRequired)}`);
       return null;
     }
@@ -771,10 +831,12 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
         failureClass: result.failureClass,
       });
       logFetchDone('reinit_error', `failure_class=${result.failureClass}`);
+      setMcpCapabilityReadiness(serverName, result.failureClass);
       return null;
     }
 
     logFetchDone('reinit_no_tools', `success=${Boolean(result?.success)}`);
+    setMcpCapabilityReadiness(serverName, 'unavailable');
     return null;
   };
 
@@ -906,6 +968,7 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
 
           if (result?.availableTools) {
             clearMcpOAuthPendingMemo({ userId: req.user.id, serverName });
+            setMcpCapabilityReadiness(serverName, 'ready');
             logger.info(`[Tool Definitions] OAuth completed for ${serverName}, tools available`);
             return { serverName, success: true };
           }
@@ -1028,6 +1091,7 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
     toolContextMap,
     toolDefinitions,
     hasDeferredTools,
+    mcpCapabilityReadiness,
   };
 }
 

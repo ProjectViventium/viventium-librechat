@@ -34,6 +34,14 @@ function DeleteButton({
   const conversationAgentId = useRecoilValue(store.conversationAgentIdByIndex(0));
 
   const deleteAgent = useDeleteAgentMutation({
+    // VIVENTIUM START: stop the active agent query before deleting its backing row.
+    // The Agent Builder always deletes the agent it is currently editing. Clearing
+    // the selection before the request resolves prevents React Query from
+    // refetching that now-deleted ID when the mutation removes its cached query.
+    onMutate: () => {
+      setCurrentAgentId(undefined);
+    },
+    // VIVENTIUM END
     onSuccess: (_, vars, context) => {
       const updatedList = context as Agent[] | undefined;
       if (!updatedList) {
@@ -60,6 +68,7 @@ function DeleteButton({
 
       if (vars.agent_id === conversationAgentId) {
         setConversation((prev) => (prev ? { ...prev, model: '', agent_id: firstAgent.id } : prev));
+        setCurrentAgentId(firstAgent.id);
         return;
       }
 
@@ -72,6 +81,10 @@ function DeleteButton({
       setCurrentAgentId(firstAgent.id);
     },
     onError: (error) => {
+      // VIVENTIUM START: a failed delete must restore the editable selection.
+      // Preserve a newer selection the user made while the delete was pending.
+      setCurrentAgentId((currentAgentId) => currentAgentId ?? agent_id);
+      // VIVENTIUM END
       console.error(error);
       showToast({
         message: localize('com_ui_agent_delete_error'),

@@ -202,8 +202,12 @@ function tomlString(value) {
   return JSON.stringify(String(value || ''));
 }
 
-function brokerContextBrief(allowedServers, { contentReadScope = false } = {}) {
+function brokerContextBrief(
+  allowedServers,
+  { contentReadScope = false, deferredServers = [] } = {},
+) {
   const serverList = allowedServers.length ? allowedServers.join(', ') : 'none';
+  const deferredServerList = deferredServers.length ? deferredServers.join(', ') : 'none';
   return [
     'GlassHive connected capability broker [v2]:',
     '- A broker MCP named `glasshive-user-capabilities` is available in this workspace when the local MCP client loads project MCP config.',
@@ -213,7 +217,23 @@ function brokerContextBrief(allowedServers, { contentReadScope = false } = {}) {
     '- Do not treat memory, recall, or prior chat text as live Google/MS365 evidence. Ask the broker when current provider truth is needed.',
     `- Content-read broker scope for this run is ${contentReadScope ? 'authorized by reviewed host policy' : 'not authorized'}. If a needed content read is blocked by broker policy, report that blocker instead of self-authorizing with worker-authored flags.`,
     `- Authorized capability servers for this run: ${serverList}. If a needed server is missing, report the broker omission/auth limitation rather than fabricating.`,
+    `- Deferred capability servers (discover only when the task needs them): ${deferredServerList}. Use \`capability_describe\` for one deferred server before invoking its underlying tool; do not probe deferred servers during unrelated chat.`,
   ].join('\n');
+}
+
+function degradedConversationCapabilityBundle(reason) {
+  const safeReason = String(reason || 'unavailable').trim() || 'unavailable';
+  const instruction = [
+    'GlassHive connected capability broker is degraded for this turn.',
+    `- Structured reason: ${safeReason}.`,
+    '- Continue with unrelated work normally. If the request needs a connected capability, report this exact connection blocker rather than substituting memory or another account.',
+  ].join('\n');
+  return {
+    glasshive_capability_status: { status: 'degraded', reason: safeReason },
+    agents_md: instruction,
+    claude_md: instruction,
+    codex_md: instruction,
+  };
 }
 
 function workerMemoryBlock(memory) {
@@ -308,6 +328,8 @@ function mergeBrokerBundle({
   grantToken,
   grantPayload,
   allowedServers,
+  eagerServers = allowedServers,
+  deferredServers = [],
   contentReadScope = false,
   workerMemory = '',
   workerFeelings = '',
@@ -331,8 +353,12 @@ function mergeBrokerBundle({
     grant_expires_at: grantPayload.exp,
     grant_renewable_until: grantPayload.renewable_until,
     allowed_servers: allowedServers,
+    eager_servers: eagerServers,
+    deferred_servers: deferredServers,
     scopes: grantPayload.scopes || {},
-    projection: 'all_user_enabled_policy_gated',
+    projection: deferredServers.length
+      ? 'signed_eager_and_deferred_policy_gated'
+      : 'all_user_enabled_policy_gated',
   };
   bundle.glasshive_capability_intent = {
     ...(bundle.glasshive_capability_intent || {}),
@@ -352,7 +378,7 @@ function mergeBrokerBundle({
     ...(bundle.env || {}),
     [codexTokenEnvVar]: grantToken,
   };
-  const instruction = brokerContextBrief(allowedServers, { contentReadScope });
+  const instruction = brokerContextBrief(allowedServers, { contentReadScope, deferredServers });
   bundle.agents_md = appendText(bundle.agents_md, instruction);
   bundle.claude_md = appendText(bundle.claude_md, instruction);
   bundle.codex_md = appendText(bundle.codex_md, instruction);
@@ -538,13 +564,31 @@ async function buildConversationProviderBootstrapBundle({
   user,
   requestBody = {},
   allowedServerNames = [],
+  deferredServerNames = [],
+  excludedServerNames = [],
+  capabilityResolutionStatus = '',
 } = {}) {
   const userId = String(user?.id || user?._id || '').trim();
   const declaredServers = new Set(
     (allowedServerNames || []).map((value) => String(value || '').trim()).filter(Boolean),
   );
-  if (!isBrokerProjectionEnabled() || !userId || declaredServers.size === 0) {
-    return {};
+  const declaredDeferredServers = new Set(
+    (deferredServerNames || []).map((value) => String(value || '').trim()).filter(Boolean),
+  );
+  const excludedServers = new Set(
+    (excludedServerNames || []).map((value) => String(value || '').trim()).filter(Boolean),
+  );
+  const hasRequestedCapabilities =
+    declaredServers.size > 0 || declaredDeferredServers.size > 0;
+  if (!hasRequestedCapabilities) {
+    return capabilityResolutionStatus
+      ? degradedConversationCapabilityBundle(capabilityResolutionStatus)
+      : {};
+  }
+  if (!isBrokerProjectionEnabled() || !userId) {
+    return degradedConversationCapabilityBundle(
+      !userId ? 'user_scope_unavailable' : 'broker_disabled',
+    );
   }
   const registry = getMCPServersRegistry();
   const mcpConfig = await registry.getAllServerConfigs(userId).catch((error) => {
@@ -554,15 +598,28 @@ async function buildConversationProviderBootstrapBundle({
     return null;
   });
   if (!mcpConfig) {
-    return {};
+    return degradedConversationCapabilityBundle('registry_unavailable');
   }
   const executionMode = 'host';
-  const allowedServerEntries = collectAllowedServerEntries({ mcpConfig, executionMode }).filter(
-    ({ serverName }) => declaredServers.has(serverName),
-  );
+  /* === VIVENTIUM START ===
+   * Feature: Deferred connected-account projection.
+   * Purpose: Resolve both scopes through current reviewed policy, but preserve which servers may
+   * be discovered during initial tools/list versus only after an explicit helper request.
+   */
+  const reviewedEntries = collectAllowedServerEntries({ mcpConfig, executionMode });
+  const allowedServerEntries = reviewedEntries.filter(({ serverName }) => {
+    if (excludedServers.has(serverName)) {
+      return false;
+    }
+    return declaredServers.has(serverName) || declaredDeferredServers.has(serverName);
+  });
   const allowedServers = allowedServerEntries.map(({ serverName }) => serverName);
+  const eagerServers = allowedServers.filter((serverName) => declaredServers.has(serverName));
+  const deferredServers = allowedServers.filter(
+    (serverName) => !declaredServers.has(serverName) && declaredDeferredServers.has(serverName),
+  );
   if (allowedServers.length === 0) {
-    return {};
+    return degradedConversationCapabilityBundle('no_reviewed_capabilities');
   }
   const contentReadScope = shouldGrantContentReadScope(allowedServerEntries);
   let mintedGrant;
@@ -570,6 +627,8 @@ async function buildConversationProviderBootstrapBundle({
     mintedGrant = mintBrokerGrant({
       user,
       allowedServers,
+      eagerServers,
+      deferredServers,
       executionMode,
       requestContext: {
         conversation_id: requestBody.conversationId,
@@ -582,9 +641,9 @@ async function buildConversationProviderBootstrapBundle({
         'VIVENTIUM_GLASSHIVE_PROVIDER_BROKER_RENEWABLE_TTL_SECONDS',
         24 * 60 * 60,
       ),
-      // A direct provider run is scoped to the MCP servers declared on that Agent. Do not expand
-      // it to unrelated reviewed connectors, whose auth/discovery latency could block the intended
-      // local capability and would violate the Agent Builder selection.
+      // The signed allowlist is complete, but ordinary catalog construction touches only eager
+      // Agent-declared servers. Servers owned by an explicit Agent handoff remain dormant until
+      // the model describes or invokes one, so unrelated reviewed MCPs never become implicit grants.
       allowDynamicPolicyServers: false,
       scopes: { content_read: contentReadScope },
     });
@@ -592,16 +651,33 @@ async function buildConversationProviderBootstrapBundle({
     logger.warn('[VIVENTIUM][glasshive-capability-broker] Provider bundle grant unavailable', {
       message: error?.message,
     });
-    return {};
+    return degradedConversationCapabilityBundle('grant_unavailable');
   }
-  return mergeBrokerBundle({
+  const bundle = mergeBrokerBundle({
     existingBundle: {},
     brokerUrl: resolveBrokerUrl(executionMode),
     grantToken: mintedGrant.token,
     grantPayload: mintedGrant.payload,
     allowedServers,
+    eagerServers,
+    deferredServers,
     contentReadScope,
   });
+  if (!capabilityResolutionStatus) {
+    return bundle;
+  }
+  const degraded = degradedConversationCapabilityBundle(capabilityResolutionStatus);
+  return {
+    ...bundle,
+    glasshive_capability_status: degraded.glasshive_capability_status,
+    ...Object.fromEntries(
+      WORKER_INSTRUCTION_FIELDS.map((field) => [
+        field,
+        appendText(bundle[field], degraded[field]),
+      ]),
+    ),
+  };
+  /* === VIVENTIUM END === */
 }
 
 module.exports = {

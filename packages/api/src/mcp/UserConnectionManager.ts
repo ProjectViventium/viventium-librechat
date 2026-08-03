@@ -23,6 +23,13 @@ export abstract class UserConnectionManager {
   public appConnections: ConnectionsRepository | null = null;
   // Connections per userId -> serverName -> connection
   protected userConnections: Map<string, Map<string, MCPConnection>> = new Map();
+  /* === VIVENTIUM START ===
+   * Feature: Per-caller non-interactive OAuth safety.
+   * Purpose: Never reuse a connection whose event handler may launch OAuth for a Voice or
+   * background caller that explicitly disabled interactive initiation.
+   */
+  protected connectionAllowsOAuthInitiation: WeakMap<MCPConnection, boolean> = new WeakMap();
+  /* === VIVENTIUM END === */
   /** Last activity timestamp for users (not per server) */
   protected userLastActivity: Map<string, number> = new Map();
 
@@ -63,6 +70,7 @@ export abstract class UserConnectionManager {
     oauthEnd,
     signal,
     returnOnOAuth = false,
+    allowOAuthInitiation = true,
     connectionTimeout,
     serverConfig: providedConfig,
   }: {
@@ -103,6 +111,25 @@ export abstract class UserConnectionManager {
     const userServerMap = this.userConnections.get(userId);
     let connection = forceNew ? undefined : userServerMap?.get(serverName);
     const now = Date.now();
+
+    /* === VIVENTIUM START ===
+     * Feature: Per-caller non-interactive OAuth safety.
+     * Purpose: A cached connection keeps the OAuth event policy from the call that created it.
+     * Downgrade unknown/interactive connections once for non-interactive callers; already-safe
+     * connections continue to be reused without broker churn.
+     */
+    if (
+      connection &&
+      !allowOAuthInitiation &&
+      this.connectionAllowsOAuthInitiation.get(connection) !== false
+    ) {
+      logger.info(
+        `[MCP][User: ${userId}][${serverName}] Replacing cached interactive connection for non-interactive use`,
+      );
+      await this.disconnectUserConnection(userId, serverName);
+      connection = undefined;
+    }
+    /* === VIVENTIUM END === */
 
     // Check if user is idle
     const lastActivity = this.userLastActivity.get(userId);
@@ -181,6 +208,7 @@ export abstract class UserConnectionManager {
           oauthStart: oauthStart,
           oauthEnd: oauthEnd,
           returnOnOAuth: returnOnOAuth,
+          allowOAuthInitiation: allowOAuthInitiation,
           requestBody: requestBody,
           connectionTimeout: connectionTimeout,
         },
@@ -194,6 +222,7 @@ export abstract class UserConnectionManager {
         this.userConnections.set(userId, new Map());
       }
       this.userConnections.get(userId)?.set(serverName, connection);
+      this.connectionAllowsOAuthInitiation.set(connection, allowOAuthInitiation);
 
       logger.info(`[MCP][User: ${userId}][${serverName}] Connection successfully established`);
       // Update timestamp on creation

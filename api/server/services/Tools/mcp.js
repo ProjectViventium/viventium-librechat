@@ -1,4 +1,4 @@
-const { logger } = require('@librechat/data-schemas');
+const { decryptV2, logger } = require('@librechat/data-schemas');
 const { MCPOAuthHandler } = require('@librechat/api');
 const { CacheKeys, Constants } = require('librechat-data-provider');
 const { findToken, createToken, updateToken, deleteToken, deleteTokens } = require('~/models');
@@ -6,7 +6,11 @@ const { updateMCPServerTools } = require('~/server/services/Config');
 const { getMCPManager, getFlowStateManager, getMCPServersRegistry } = require('~/config');
 const { getLogStores } = require('~/cache');
 
-async function hasUsableOAuthTokens(userId, serverName) {
+/* === VIVENTIUM START ===
+ * Feature: Credential-aware MCP readiness.
+ * Purpose: Distinguish missing, unreadable, and present OAuth state without exposing tokens.
+ */
+async function inspectStoredOAuthCredentialState(userId, serverName) {
   const now = new Date();
   const accessToken = await findToken({
     userId,
@@ -19,16 +23,53 @@ async function hasUsableOAuthTokens(userId, serverName) {
     identifier: `mcp:${serverName}:refresh`,
   });
 
-  if (accessToken?.expiresAt && accessToken.expiresAt >= now) {
-    return true;
+  const liveAccess =
+    accessToken && (!accessToken.expiresAt || accessToken.expiresAt >= now) ? accessToken : null;
+  const liveRefresh =
+    refreshToken && (!refreshToken.expiresAt || refreshToken.expiresAt >= now)
+      ? refreshToken
+      : null;
+  if (!liveAccess && !liveRefresh) {
+    return { status: 'missing_auth' };
   }
-
-  if (refreshToken == null) {
-    return false;
+  let unreadableCredential = false;
+  // A still-live access token is independently usable even if an older refresh token was
+  // encrypted under unavailable key material. Accept either readable credential; reconnect only
+  // when no live credential can be decrypted.
+  for (const credential of [liveAccess, liveRefresh]) {
+    if (!credential?.token) {
+      continue;
+    }
+    try {
+      await decryptV2(credential.token);
+      return { status: 'credential_present' };
+    } catch (_) {
+      unreadableCredential = true;
+    }
   }
-
-  return refreshToken.expiresAt == null || refreshToken.expiresAt >= now;
+  return { status: unreadableCredential ? 'unreadable_credential' : 'missing_auth' };
 }
+
+/**
+ * Stable, provider-independent recovery guidance for an OAuth MCP that cannot authenticate during
+ * a non-interactive request. The owning agent is deliberately resolved by the user in Agent
+ * Builder: this layer knows the MCP server, not which one of potentially many agent graphs owns it.
+ */
+function buildMcpOAuthRecovery(serverName) {
+  return {
+    action: 'connect_mcp_account',
+    surface: 'agent_builder',
+    server: String(serverName || '').trim(),
+    instructions:
+      'Open Agent Builder, select the agent that owns this connected account, then in MCP Servers choose Connect beside the unavailable server.',
+  };
+}
+
+function shouldUseCachedMcpTools(serverConfig, credentialState) {
+  const requiresOAuth = Boolean(serverConfig?.requiresOAuth || serverConfig?.oauthMetadata);
+  return !requiresOAuth || credentialState?.status === 'credential_present';
+}
+/* === VIVENTIUM END === */
 
 async function initiateOAuthFlowFallback({
   user,
@@ -67,6 +108,7 @@ async function initiateOAuthFlowFallback({
  * @param {Record<string, Record<string, string>>} [params.userMCPAuthMap]
  * @param {Record<string, import('@librechat/api').ParsedServerConfig>} [params.configServers]
  * @param {import('@librechat/api').ParsedServerConfig} [params.serverConfig]
+ * @param {boolean} [params.allowOAuthInitiation]
  */
 async function reinitMCPServer({
   user,
@@ -80,6 +122,7 @@ async function reinitMCPServer({
   oauthStart: _oauthStart,
   flowManager: _flowManager,
   serverConfig: providedConfig,
+  allowOAuthInitiation = true,
 }) {
   /** @type {MCPConnection | null} */
   let connection = null;
@@ -89,10 +132,12 @@ async function reinitMCPServer({
   let tools = null;
   let oauthRequired = false;
   let oauthUrl = null;
+  let credentialState = null;
+  let serverConfig = null;
 
   try {
     const registry = getMCPServersRegistry();
-    const serverConfig =
+    serverConfig =
       providedConfig ?? (await registry.getServerConfig(serverName, user?.id, configServers));
     if (serverConfig?.inspectionFailed) {
       /* === VIVENTIUM START ===
@@ -140,6 +185,30 @@ async function reinitMCPServer({
       }
     }
 
+    /* === VIVENTIUM START ===
+     * Feature: Non-interactive OAuth preflight.
+     * Purpose: Voice and other request hot paths must not create an interactive OAuth flow merely
+     * while resolving tool definitions. Explicit Connect/reconnect flows retain the default.
+     */
+    const serverRequiresOAuth = Boolean(serverConfig?.requiresOAuth || serverConfig?.oauthMetadata);
+    if (!allowOAuthInitiation && serverRequiresOAuth) {
+      credentialState = await inspectStoredOAuthCredentialState(user?.id, serverName);
+      if (credentialState?.status !== 'credential_present') {
+        return {
+          availableTools: null,
+          success: false,
+          message: `MCP server '${serverName}' requires account reconnection`,
+          oauthRequired: true,
+          serverName,
+          oauthUrl: null,
+          tools: null,
+          credentialState,
+          recovery: buildMcpOAuthRecovery(serverName),
+        };
+      }
+    }
+    /* === VIVENTIUM END === */
+
     const customUserVars = userMCPAuthMap?.[`${Constants.mcp_prefix}${serverName}`];
     const flowManager = _flowManager ?? getFlowStateManager(getLogStores(CacheKeys.FLOWS));
     const mcpManager = getMCPManager();
@@ -166,6 +235,7 @@ async function reinitMCPServer({
         customUserVars,
         connectionTimeout,
         serverConfig,
+        allowOAuthInitiation,
       });
 
       logger.info(`[MCP Reinitialize] Successfully established connection for ${serverName}`);
@@ -183,20 +253,31 @@ async function reinitMCPServer({
       const serverRequiresOAuth = Boolean(
         serverConfig?.requiresOAuth || serverConfig?.oauthMetadata,
       );
+      credentialState = serverRequiresOAuth
+        ? await inspectStoredOAuthCredentialState(user.id, serverName)
+        : null;
+      if (
+        serverRequiresOAuth &&
+        credentialState?.status === 'credential_present' &&
+        (isOAuthError || oauthRequired)
+      ) {
+        credentialState = { status: 'reconnect_required' };
+      }
       const hasStoredOAuthTokens =
-        serverRequiresOAuth && user.id ? await hasUsableOAuthTokens(user.id, serverName) : false;
+        serverRequiresOAuth && user.id && credentialState?.status === 'credential_present';
 
       const isOAuthFlowInitiated = err.message === 'OAuth flow initiated - return early';
 
       if (
+        allowOAuthInitiation &&
         serverRequiresOAuth &&
-        isConnectionTimeout &&
+        (isConnectionTimeout || isOAuthError) &&
         !oauthRequired &&
         !isOAuthFlowInitiated &&
         !hasStoredOAuthTokens
       ) {
         logger.warn(
-          `[MCP Reinitialize] ${serverName} timed out before surfacing OAuth; initiating fallback OAuth flow`,
+          `[MCP Reinitialize] ${serverName} could not use stored OAuth state; initiating a clean OAuth flow`,
         );
 
         try {
@@ -224,6 +305,9 @@ async function reinitMCPServer({
         oauthRequired = true;
 
         try {
+          if (!allowOAuthInitiation) {
+            throw new Error('Non-interactive OAuth discovery is disabled');
+          }
           const discoveryResult = await mcpManager.discoverServerTools({
             user,
             signal,
@@ -296,6 +380,10 @@ async function reinitMCPServer({
       serverName,
       oauthUrl,
       tools,
+      ...(credentialState ? { credentialState } : {}),
+      ...(!allowOAuthInitiation && oauthRequired
+        ? { recovery: buildMcpOAuthRecovery(serverName) }
+        : {}),
     };
 
     logger.debug(`[MCP Reinitialize] Response for ${serverName}:`, {
@@ -330,5 +418,8 @@ async function reinitMCPServer({
 }
 
 module.exports = {
+  buildMcpOAuthRecovery,
+  inspectStoredOAuthCredentialState,
   reinitMCPServer,
+  shouldUseCachedMcpTools,
 };

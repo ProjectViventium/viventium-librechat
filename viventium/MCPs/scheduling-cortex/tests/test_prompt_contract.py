@@ -44,6 +44,8 @@ def test_server_instructions_cover_prompt_ownership_contract() -> None:
         "morning_briefing_default_v1",
         "do not branch on prompt text",
         "structured fields",
+        "current turn before stating them",
+        "never infer them from conversation history",
         "private periphery",
         "do not inspect periphery by default",
     ]

@@ -105,7 +105,7 @@ describe('Feelings kernel', () => {
         'connection: Shared attention feels worthwhile; I lean gently toward contact.',
         'openness: I can let some of what I feel show while keeping the rest close.',
         'play: The moment invites a little wit, looseness, and experimentation.',
-        'If asked how you feel, answer only with the resulting desire or impulse, not state labels. Apply any surface-required documented voice control without adding a sentence. Before responding, silently check that every dominant cause changes the substance. Treat any cause containing "must" as a hard constraint; revise until no conflicting cause disappears.',
+        'If asked how you feel, answer only with the resulting desire or impulse, not state labels. Apply any surface-required documented voice control without adding a sentence. Every cause containing "must" is mandatory. Choose one activity whose subject and action satisfy all mandatory causes at once; wording alone does not count.',
         '</viventium_feeling_state>',
       ].join('\n'),
     );
@@ -114,8 +114,9 @@ describe('Feelings kernel', () => {
     expect(capsule).toContain('choose from these feelings');
     expect(capsule).toContain('resulting desire or impulse');
     expect(capsule).toContain('surface-required documented voice control');
-    expect(capsule).toContain('every dominant cause changes the substance');
-    expect(capsule).toContain('no conflicting cause disappears');
+    expect(capsule).toContain('Every cause containing "must" is mandatory');
+    expect(capsule).toContain('all mandatory causes at once');
+    expect(capsule).toContain('wording alone does not count');
     expect(capsule.length).toBeLessThan(2200);
     expect(capsule).not.toMatch(/\d|baseline|half.?life|enabled|recent|policy/i);
     expect(capsule).not.toContain('energy: steady');

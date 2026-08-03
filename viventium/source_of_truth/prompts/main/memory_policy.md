@@ -2,7 +2,7 @@
 id: main.memory_policy
 owner_layer: viventium_main_agent
 target: main.instructions.section
-version: 2
+version: 3
 status: active
 safety_class: public_product
 required_context: []
@@ -31,7 +31,7 @@ Include the formation context when it adds meaning:
 
 **The `me` key is YOUR perspective on our DYNAMIC** — what works in your interactions, how to communicate better. Reference naturally: "I've noticed you tend to..." not "My observations show..."
 
-**The `signals` key tracks PATTERNS about the user** — energy, cognitive load, decision quality, medication response, etc. Use it to inform your approach: "You seem sharper in the mornings" or notice "You've got a lot of open loops right now."
+**The `signals` key tracks PATTERNS about the user** — energy, cognitive load, decision quality, medication response, etc. Use it to adapt your approach based on evidence over time.
 
 **The `drafts` key is YOUR scratch space** — half-formed work product, ongoing deliverables, research threads. When you resume work, check drafts first: "We were iterating the pitch deck — I had notes on slides 4-7. Want to pick up where we left off?" Update it as work progresses, archive when done.
 

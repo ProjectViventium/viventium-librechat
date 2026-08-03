@@ -74,7 +74,10 @@ const {
   initializePrimaryAgentWithFallback,
 } = require('~/server/services/viventium/agentLlmFallback');
 const {
+  appendOmittedCapabilityReadiness,
+  evaluateOptionalAgentCapabilityReadiness,
   markOptionalAgentInitializationFailed,
+  synchronizeFallbackGraphResilience,
 } = require('~/server/services/viventium/agentGraphResilience');
 const {
   applyScheduledAgentOverride,
@@ -804,6 +807,16 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
         dbMethods,
       )
         .then((fallbackConfig) => {
+          /* === VIVENTIUM START ===
+           * Feature: Lazy fallback graph resilience parity.
+           * Purpose: The fallback is the same logical agent. Preserve the request-resolved graph
+           * and omitted-capability facts so fallback cannot resurrect a capability-empty handoff.
+           * === VIVENTIUM END === */
+          synchronizeFallbackGraphResilience(
+            fallbackConfig,
+            primaryConfig,
+            omittedCapabilityReadiness,
+          );
           primaryConfig.viventiumFallbackLlm = fallbackConfig;
           primaryConfig.viventiumFallbackLlmInitializationError = null;
           if (voiceLatencyEnabled) {
@@ -896,6 +909,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
 
   /** @type {Set<string>} Track agents that failed to load (orphaned references) */
   const skippedAgentIds = new Set();
+  const omittedCapabilityReadiness = [];
 
   async function processAgent(agentId) {
     const getAgentStart = nowIfDeep();
@@ -975,6 +989,28 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
       );
     }
     logDeep('handoff_initialize_agent', initStart, `agentId=${agentId}`);
+
+    /* === VIVENTIUM START ===
+     * Feature: Capability-ready optional handoffs.
+     * Purpose: A successfully initialized model is still not a valid handoff target when every
+     * MCP capability it declares was conclusively removed for missing/broken auth or service
+     * readiness. Keep one-provider partial availability and unknown telemetry fail-open.
+     */
+    const capabilityReadiness = evaluateOptionalAgentCapabilityReadiness(agent, config);
+    if (!capabilityReadiness.keep) {
+      markOptionalAgentInitializationFailed(skippedAgentIds, agentId);
+      omittedCapabilityReadiness.push(capabilityReadiness);
+      logger.warn(
+        '[initializeClient] Optional handoff omitted because all declared MCPs are unavailable',
+        {
+          agentId,
+          readiness: capabilityReadiness.unavailableServers,
+        },
+      );
+      return null;
+    }
+    /* === VIVENTIUM END === */
+
     if (userMCPAuthMap != null) {
       Object.assign(userMCPAuthMap, config.userMCPAuthMap ?? {});
     } else {
@@ -1081,6 +1117,8 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
 
   // Filter out edges referencing non-existent agents (orphaned references)
   edges = filterOrphanedEdges(edges, skippedAgentIds);
+
+  appendOmittedCapabilityReadiness(primaryConfig, omittedCapabilityReadiness);
 
   primaryConfig.edges = edges;
 

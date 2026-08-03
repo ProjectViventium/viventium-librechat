@@ -59,6 +59,11 @@ export default function MCPTool({ serverInfo }: { serverInfo?: MCPServerInfo }) 
   }
 
   const currentServerName = serverInfo.serverName;
+  /* === VIVENTIUM START ===
+   * Feature: Human-readable managed MCP connection slots.
+   * Purpose: Keep opaque server names as routing IDs while showing the configured account label.
+   * === VIVENTIUM END === */
+  const displayServerName = serverInfo.metadata.name || currentServerName;
   const tools = serverInfo.tools || [];
 
   const getSelectedTools = () => {
@@ -134,7 +139,7 @@ export default function MCPTool({ serverInfo }: { serverInfo?: MCPServerInfo }) 
                   className="grow px-2 py-1.5"
                   style={{ textOverflow: 'ellipsis', wordBreak: 'break-all', overflow: 'hidden' }}
                 >
-                  {currentServerName}
+                  {displayServerName}
                 </div>
                 <div className="flex items-center">
                   <div className="relative flex items-center">
@@ -358,7 +363,9 @@ export default function MCPTool({ serverInfo }: { serverInfo?: MCPServerInfo }) 
           selectText: localize('com_ui_delete'),
         }}
       />
-      {configDialogProps && <MCPConfigDialog {...configDialogProps} />}
+      {configDialogProps && (
+        <MCPConfigDialog {...configDialogProps} displayName={displayServerName} />
+      )}
     </OGDialog>
   );
 }

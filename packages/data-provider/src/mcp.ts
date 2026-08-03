@@ -70,6 +70,17 @@ const BaseOptionsSchema = z.object({
         .optional(),
     })
     .optional(),
+  /* === VIVENTIUM START ===
+   * Feature: Multiple OAuth connections for one logical MCP provider.
+   * Purpose: Allow trusted config to expose independent account slots backed by the same endpoint
+   * and callback without coupling the connection model to Gmail or any user identity.
+   * === VIVENTIUM END === */
+  viventiumOAuthConnection: z
+    .object({
+      providerId: z.string().regex(/^[a-zA-Z0-9_-]+$/),
+      slot: z.number().int().min(1).max(10),
+    })
+    .optional(),
   /**
    * Whether this server requires OAuth authentication
    * If not specified, will be auto-detected during construction
@@ -259,6 +270,7 @@ const omitServerManagedFields = <T extends z.ZodObject<z.ZodRawShape>>(schema: T
     serverInstructions: true,
     viventiumRequestContext: true,
     viventiumGlassHive: true,
+    viventiumOAuthConnection: true,
     requiresOAuth: true,
     customUserVars: true,
     oauth_headers: true,

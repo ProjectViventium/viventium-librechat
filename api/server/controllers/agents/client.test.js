@@ -415,6 +415,46 @@ describe('GlassHive harness activity persistence', () => {
       }),
     ).toBe(false);
   });
+
+  test('keeps harness activity out of later provider history while preserving its answer', () => {
+    expect(
+      AgentClient.stripInternalContentParts([
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.HARNESS_ACTIVITY,
+              harness_activity: { event: 'reasoning-summary', summary: 'Working.' },
+            },
+            { type: ContentTypes.TEXT, text: 'Visible answer.' },
+          ],
+        },
+      ]),
+    ).toEqual([
+      {
+        role: 'assistant',
+        content: [{ type: ContentTypes.TEXT, text: 'Visible answer.' }],
+      },
+    ]);
+  });
+
+  test('omits internal-only history turns instead of sending empty provider content', () => {
+    expect(
+      AgentClient.stripInternalContentParts([
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.ERROR,
+              [ContentTypes.ERROR]: 'The model provider could not complete this request.',
+              error_class: 'completion_error',
+            },
+          ],
+        },
+        { role: 'user', content: [{ type: ContentTypes.TEXT, text: 'Try again.' }] },
+      ]),
+    ).toEqual([{ role: 'user', content: [{ type: ContentTypes.TEXT, text: 'Try again.' }] }]);
+  });
 });
 
 describe('late completion error content parts', () => {
@@ -4058,6 +4098,50 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     expect(client.chatCompletion).toHaveBeenCalledTimes(2);
     expect(fallbackSawUserMcpAuthMap).toEqual(fallbackAgent.userMCPAuthMap);
     expect(result.completion).toEqual([{ type: ContentTypes.TEXT, text: 'Fallback answer.' }]);
+  });
+
+  test('materializes lazy fallback for a nested provider access denial before assistant text', async () => {
+    const fallbackAgent = {
+      id: 'agent-fallback',
+      provider: EModelEndpoint.openAI,
+      model: 'gpt-5.4',
+      model_parameters: { model: 'gpt-5.4' },
+    };
+    primaryAgent.viventiumFallbackLlmInitializer = jest.fn(async () => fallbackAgent);
+    let calls = 0;
+    client.chatCompletion = jest.fn(async () => {
+      calls += 1;
+      if (calls === 1) {
+        const error = new Error('Provider request failed.');
+        error.response = { status: 403, data: { code: 'permission-denied' } };
+        throw error;
+      }
+      client.contentParts.push({ type: ContentTypes.TEXT, text: 'Fallback answer.' });
+    });
+
+    const result = await client.sendCompletion({ text: 'hello' });
+
+    expect(primaryAgent.viventiumFallbackLlmInitializer).toHaveBeenCalledTimes(1);
+    expect(client.chatCompletion).toHaveBeenCalledTimes(2);
+    expect(result.completion).toEqual([{ type: ContentTypes.TEXT, text: 'Fallback answer.' }]);
+  });
+
+  test('does not hide a deterministic generic 400 behind model fallback', async () => {
+    primaryAgent.viventiumFallbackLlmInitializer = jest.fn(async () => ({
+      id: 'agent-fallback',
+      provider: EModelEndpoint.openAI,
+      model: 'gpt-5.4',
+      model_parameters: { model: 'gpt-5.4' },
+    }));
+    const error = new Error('Bad request.');
+    error.response = { status: 400, data: { code: 'invalid-request' } };
+    client.chatCompletion = jest.fn(async () => {
+      throw error;
+    });
+
+    await expect(client.sendCompletion({ text: 'hello' })).rejects.toBe(error);
+    expect(primaryAgent.viventiumFallbackLlmInitializer).not.toHaveBeenCalled();
+    expect(client.chatCompletion).toHaveBeenCalledTimes(1);
   });
 
   test('replaces stale primary rate-limit part when lazy fallback needs reconnect', async () => {

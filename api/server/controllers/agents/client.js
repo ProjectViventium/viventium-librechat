@@ -92,6 +92,7 @@ const {
 } = require('~/server/services/viventium/EmotionalReactionService');
 const { enqueueUserMemoryWriter } = require('~/server/services/viventium/memoryWriterCoordinator');
 const {
+  bindConversationProviderDeveloperInstructionTail,
   buildHarnessIdempotencyKey,
 } = require('~/server/services/viventium/GlassHiveConversationProviderService');
 
@@ -228,6 +229,7 @@ const INTERNAL_CONTENT_TYPES = new Set([
   ContentTypes.CORTEX_BREWING,
   ContentTypes.CORTEX_INSIGHT,
   ContentTypes.AGENT_UPDATE,
+  ContentTypes.HARNESS_ACTIVITY,
   ContentTypes.ERROR,
   ContentTypes.THINK,
 ]);
@@ -407,9 +409,9 @@ const stripInternalContentParts = (payload) => {
   if (!Array.isArray(payload)) {
     return payload;
   }
-  return payload.map((message) => {
+  return payload.flatMap((message) => {
     if (!message || !Array.isArray(message.content)) {
-      return message;
+      return [message];
     }
     const filtered = message.content.filter((part) => {
       /* === VIVENTIUM START ===
@@ -428,9 +430,18 @@ const stripInternalContentParts = (payload) => {
       return !INTERNAL_CONTENT_TYPES.has(type);
     });
     if (filtered.length === message.content.length) {
-      return message;
+      return [message];
     }
-    return { ...message, content: filtered.length ? filtered : '' };
+    /* === VIVENTIUM START ===
+     * Feature: Provider-safe internal history pruning.
+     * Purpose: UI-only activity/error/cortex parts are not model context. If they were the whole
+     * turn, omit that historical turn instead of emitting an empty content block that strict
+     * OpenAI-compatible providers reject. Visible text and tool/image content remain unchanged.
+     * === VIVENTIUM END === */
+    if (filtered.length === 0) {
+      return [];
+    }
+    return [{ ...message, content: filtered }];
   });
 };
 /* === VIVENTIUM NOTE END === */
@@ -5176,6 +5187,10 @@ class AgentClient extends BaseClient {
               capsule,
             });
           }
+          bindConversationProviderDeveloperInstructionTail({
+            targetAgent: agent,
+            tail: capsule,
+          });
           const placement = summarizeFeelingCapsulePlacement({
             instructions: agent.instructions || '',
             capsule,
@@ -6096,5 +6111,6 @@ module.exports.evalIsolationForRequest = evalIsolationForRequest;
 module.exports.classifyMemoryWriterResult = classifyMemoryWriterResult;
 module.exports.convertHarnessActivityParts = convertHarnessActivityParts;
 module.exports.isHarnessInvocationLocked = isHarnessInvocationLocked;
+module.exports.stripInternalContentParts = stripInternalContentParts;
 
 /* === VIVENTIUM END === */

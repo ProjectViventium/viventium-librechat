@@ -49,6 +49,9 @@ const { deleteToolCalls } = require('~/models/ToolCall');
 const { deleteUserPrompts } = require('~/models/Prompt');
 const { deleteUserAgents } = require('~/models/Agent');
 const { getLogStores } = require('~/cache');
+const {
+  invalidateOAuthTokenPresence,
+} = require('~/server/services/viventium/mcpOAuthPresenceCache');
 
 const getUserController = async (req, res) => {
   const appConfig = await getAppConfig({ role: req.user?.role });
@@ -213,10 +216,11 @@ const updateUserPluginsController = async (req, res) => {
       // If auth was updated successfully, disconnect MCP sessions as they might use these credentials
       if (pluginKey.startsWith(Constants.mcp_prefix)) {
         try {
+          // Extract server name from pluginKey (format: "mcp_<serverName>")
+          const serverName = pluginKey.replace(Constants.mcp_prefix, '');
+          invalidateOAuthTokenPresence(user.id, serverName);
           const mcpManager = getMCPManager();
           if (mcpManager) {
-            // Extract server name from pluginKey (format: "mcp_<serverName>")
-            const serverName = pluginKey.replace(Constants.mcp_prefix, '');
             logger.info(
               `[updateUserPluginsController] Attempting disconnect of MCP server "${serverName}" for user ${user.id} after plugin auth update.`,
             );

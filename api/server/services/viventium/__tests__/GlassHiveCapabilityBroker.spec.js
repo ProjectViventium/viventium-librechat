@@ -12,6 +12,7 @@ const mockGetLogStores = jest.fn(() => {
   };
 });
 const mockReinitMCPServer = jest.fn();
+const mockInspectStoredOAuthCredentialState = jest.fn();
 const mockGetUserById = jest.fn();
 
 jest.mock('@librechat/data-schemas', () => ({
@@ -50,6 +51,14 @@ jest.mock('~/server/services/GraphTokenService', () => ({
 }));
 
 jest.mock('~/server/services/Tools/mcp', () => ({
+  buildMcpOAuthRecovery: (server) => ({
+    action: 'connect_mcp_account',
+    surface: 'agent_builder',
+    server,
+    instructions:
+      'Open Agent Builder, select the agent that owns this connected account, then in MCP Servers choose Connect beside the unavailable server.',
+  }),
+  inspectStoredOAuthCredentialState: (...args) => mockInspectStoredOAuthCredentialState(...args),
   reinitMCPServer: (...args) => mockReinitMCPServer(...args),
 }));
 
@@ -66,6 +75,7 @@ describe('GlassHive capability broker', () => {
       VIVENTIUM_GLASSHIVE_BROKER_DISCOVERY_RETRY_DELAY_MS: '0',
     };
     mockGetUserById.mockResolvedValue({ _id: 'user-1', id: 'user-1', role: 'USER' });
+    mockInspectStoredOAuthCredentialState.mockResolvedValue({ status: 'credential_present' });
   });
 
   afterAll(() => {
@@ -77,6 +87,8 @@ describe('GlassHive capability broker', () => {
     const { token, payload } = mintBrokerGrant({
       user: { id: 'user-1', role: 'USER' },
       allowedServers: ['google_workspace', 'ms-365'],
+      eagerServers: ['google_workspace'],
+      deferredServers: ['ms-365'],
       requestContext: { conversation_id: 'conv-1', message_id: 'msg-1' },
       executionMode: 'docker',
       nowMs: 1_000_000,
@@ -85,6 +97,8 @@ describe('GlassHive capability broker', () => {
     const verified = verifyBrokerGrant(token, { nowMs: 1_001_000, expectedUserId: 'user-1' });
     expect(verified.aud).toBe('glasshive-capability-broker');
     expect(verified.allowed_servers).toEqual(['google_workspace', 'ms-365']);
+    expect(verified.eager_servers).toEqual(['google_workspace']);
+    expect(verified.deferred_servers).toEqual(['ms-365']);
     expect(verified.grant_id).toBe(payload.grant_id);
     expect(verified.scopes.content_read).toBe(false);
 
@@ -180,7 +194,380 @@ describe('GlassHive capability broker', () => {
             },
           },
         },
-        'not-declared': {
+        'future-reviewed': {
+          source: 'config',
+          viventiumGlassHive: {
+            version: 1,
+            permitsAutonomousWorker: true,
+            hostAllowed: true,
+            defaultToolAccess: 'content_read',
+          },
+        },
+        'ms-365': {
+          source: 'config',
+          viventiumGlassHive: {
+            version: 1,
+            permitsAutonomousWorker: true,
+            hostAllowed: true,
+            defaultToolAccess: 'content_read',
+            contentReadPolicy: 'require_broker_grant',
+          },
+        },
+        google_workspace: {
+          source: 'config',
+          viventiumGlassHive: {
+            version: 1,
+            permitsAutonomousWorker: true,
+            hostAllowed: true,
+            defaultToolAccess: 'content_read',
+            contentReadPolicy: 'require_broker_grant',
+          },
+        },
+        unreviewed: { source: 'config' },
+      }),
+    });
+
+    const result = await buildConversationProviderBootstrapBundle({
+      user: { id: 'user-1', role: 'USER' },
+      requestBody: { conversationId: 'conversation-1', messageId: 'message-1' },
+      allowedServerNames: ['scheduling-cortex'],
+      deferredServerNames: ['google_workspace', 'ms-365'],
+      excludedServerNames: ['glasshive-workers-projects'],
+    });
+
+    expect(result.glasshive_capability_broker.allowed_servers).toEqual([
+      'google_workspace',
+      'ms-365',
+      'scheduling-cortex',
+    ]);
+    expect(result.glasshive_capability_broker.eager_servers).toEqual(['scheduling-cortex']);
+    expect(result.glasshive_capability_broker.deferred_servers).toEqual([
+      'google_workspace',
+      'ms-365',
+    ]);
+    expect(result.glasshive_capability_broker.scopes.content_read).toBe(true);
+    expect(result.codex_config_append).toContain('glasshive-user-capabilities');
+    expect(result.env.GLASSHIVE_CAPABILITY_BROKER_TOKEN).toEqual(expect.any(String));
+    const providerGrant = JSON.parse(
+      Buffer.from(result.env.GLASSHIVE_CAPABILITY_BROKER_TOKEN, 'base64url').toString('utf8'),
+    );
+    expect(providerGrant.allow_dynamic_policy_servers).toBe(false);
+    expect(providerGrant.eager_servers).toEqual(['scheduling-cortex']);
+    expect(providerGrant.deferred_servers).toEqual(['google_workspace', 'ms-365']);
+    expect(result.glasshive_capability_broker.allowed_servers).not.toContain('future-reviewed');
+  });
+
+  test('keeps deferred MS365 dormant until an explicit describe or invoke', async () => {
+    const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
+    const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
+    const policyConfig = {
+      source: 'config',
+      viventiumGlassHive: {
+        version: 1,
+        permitsAutonomousWorker: true,
+        hostAllowed: true,
+        defaultToolAccess: 'content_read',
+        contentReadPolicy: 'require_broker_grant',
+      },
+    };
+    mockGetMCPServersRegistry.mockReturnValue({
+      getServerConfig: jest.fn().mockResolvedValue(policyConfig),
+    });
+    mockReinitMCPServer.mockImplementation(({ serverName }) =>
+      Promise.resolve({
+        success: true,
+        oauthRequired: false,
+        tools: [{ name: `${serverName}_search`, inputSchema: { type: 'object' } }],
+      }),
+    );
+    const callTool = jest.fn().mockResolvedValue({ ok: true });
+    mockGetMCPManager.mockReturnValue({ callTool });
+    const grant = mintBrokerGrant({
+      user: { id: 'user-1', role: 'USER' },
+      allowedServers: ['scheduling-cortex', 'ms-365'],
+      eagerServers: ['scheduling-cortex'],
+      deferredServers: ['ms-365'],
+      allowDynamicPolicyServers: false,
+      scopes: { content_read: true },
+    }).payload;
+
+    const listed = await handleToolCall({ grant, toolName: 'capabilities_list' });
+    expect(listed.servers.map((server) => server.name)).toEqual(['scheduling-cortex']);
+    expect(listed.deferredServers).toEqual(['ms-365']);
+    expect(mockReinitMCPServer).toHaveBeenCalledTimes(1);
+    expect(mockReinitMCPServer).not.toHaveBeenCalledWith(
+      expect.objectContaining({ serverName: 'ms-365' }),
+    );
+
+    mockReinitMCPServer.mockClear();
+    const described = await handleToolCall({
+      grant,
+      toolName: 'capability_describe',
+      args: { server: 'ms-365' },
+    });
+    expect(described.servers.map((server) => server.name)).toEqual(['ms-365']);
+    expect(mockReinitMCPServer).toHaveBeenCalledTimes(1);
+    expect(mockReinitMCPServer).toHaveBeenCalledWith(
+      expect.objectContaining({ serverName: 'ms-365', forceNew: false }),
+    );
+
+    mockReinitMCPServer.mockClear();
+    await expect(
+      handleToolCall({
+        grant,
+        toolName: 'capability_invoke',
+        args: { server: 'ms-365', tool: 'ms-365_search', arguments: { query: 'synthetic' } },
+      }),
+    ).resolves.toEqual({ ok: true });
+    expect(mockReinitMCPServer).toHaveBeenCalledTimes(1);
+    expect(callTool).toHaveBeenCalledWith(
+      expect.objectContaining({ serverName: 'ms-365', toolName: 'ms-365_search' }),
+    );
+
+    mockReinitMCPServer.mockClear();
+    await expect(
+      handleToolCall({
+        grant,
+        toolName: 'capability_describe',
+        args: { server: 'not-signed' },
+      }),
+    ).resolves.toEqual(expect.objectContaining({ servers: [], deferredServers: ['ms-365'] }));
+    expect(mockReinitMCPServer).not.toHaveBeenCalled();
+  });
+
+  test.each(['missing_auth', 'unreadable_credential'])(
+    'returns %s without starting interactive OAuth or MCP discovery',
+    async (credentialStatus) => {
+      const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
+      const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
+      mockGetMCPServersRegistry.mockReturnValue({
+        getServerConfig: jest.fn().mockResolvedValue({
+          source: 'config',
+          requiresOAuth: true,
+          viventiumGlassHive: {
+            version: 1,
+            permitsAutonomousWorker: true,
+            hostAllowed: true,
+            defaultToolAccess: 'content_read',
+            contentReadPolicy: 'require_broker_grant',
+          },
+        }),
+      });
+      mockInspectStoredOAuthCredentialState.mockResolvedValue({ status: credentialStatus });
+      const grant = mintBrokerGrant({
+        user: { id: 'user-1', role: 'USER' },
+        allowedServers: ['ms-365'],
+        eagerServers: [],
+        deferredServers: ['ms-365'],
+        scopes: { content_read: true },
+      }).payload;
+
+      const described = await handleToolCall({
+        grant,
+        toolName: 'capability_describe',
+        args: { server: 'ms-365' },
+      });
+
+      expect(described.omissions).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            reason: credentialStatus,
+            recovery: expect.objectContaining({
+              action: 'connect_mcp_account',
+              surface: 'agent_builder',
+              server: 'ms-365',
+            }),
+          }),
+        ]),
+      );
+      expect(described.servers).toEqual([
+        expect.objectContaining({
+          name: 'ms-365',
+          available: false,
+          oauthRequired: true,
+          credentialStatus,
+          recovery: expect.objectContaining({
+            action: 'connect_mcp_account',
+            surface: 'agent_builder',
+            server: 'ms-365',
+          }),
+        }),
+      ]);
+      expect(mockReinitMCPServer).not.toHaveBeenCalled();
+
+      await expect(
+        handleToolCall({
+          grant,
+          toolName: 'capability_describe',
+          args: { server: 'ms-365', tool: 'list_mail' },
+        }),
+      ).resolves.toEqual({
+        status: 'blocked',
+        reason: credentialStatus,
+        server: 'ms-365',
+        tool: 'list_mail',
+        oauthRequired: true,
+        recovery: expect.objectContaining({
+          action: 'connect_mcp_account',
+          surface: 'agent_builder',
+          server: 'ms-365',
+        }),
+      });
+
+      await expect(
+        handleToolCall({
+          grant,
+          toolName: 'capability_invoke',
+          args: { server: 'ms-365', tool: 'list_mail', arguments: {} },
+        }),
+      ).resolves.toEqual({
+        status: 'blocked',
+        reason: credentialStatus,
+        server: 'ms-365',
+        tool: 'list_mail',
+        oauthRequired: true,
+        recovery: expect.objectContaining({
+          action: 'connect_mcp_account',
+          surface: 'agent_builder',
+          server: 'ms-365',
+        }),
+      });
+      expect(mockReinitMCPServer).not.toHaveBeenCalled();
+    },
+  );
+
+  test('preserves reconnect_required when a readable credential is rejected during discovery', async () => {
+    const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
+    const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
+    mockGetMCPServersRegistry.mockReturnValue({
+      getServerConfig: jest.fn().mockResolvedValue({
+        source: 'config',
+        requiresOAuth: true,
+        viventiumGlassHive: {
+          version: 1,
+          permitsAutonomousWorker: true,
+          hostAllowed: true,
+          defaultToolAccess: 'content_read',
+          contentReadPolicy: 'require_broker_grant',
+        },
+      }),
+    });
+    mockInspectStoredOAuthCredentialState.mockResolvedValue({ status: 'credential_present' });
+    mockReinitMCPServer.mockResolvedValue({
+      success: false,
+      oauthRequired: true,
+      tools: [],
+      credentialState: { status: 'reconnect_required' },
+      recovery: {
+        action: 'connect_mcp_account',
+        surface: 'agent_builder',
+        server: 'ms-365',
+        instructions:
+          'Open Agent Builder, select the agent that owns this connected account, then in MCP Servers choose Connect beside the unavailable server.',
+      },
+    });
+    const grant = mintBrokerGrant({
+      user: { id: 'user-1', role: 'USER' },
+      allowedServers: ['ms-365'],
+      eagerServers: [],
+      deferredServers: ['ms-365'],
+      scopes: { content_read: true },
+    }).payload;
+
+    await expect(
+      handleToolCall({
+        grant,
+        toolName: 'capability_invoke',
+        args: { server: 'ms-365', tool: 'list_mail', arguments: {} },
+      }),
+    ).resolves.toEqual(
+      expect.objectContaining({
+        status: 'blocked',
+        reason: 'reconnect_required',
+        recovery: expect.objectContaining({
+          action: 'connect_mcp_account',
+          surface: 'agent_builder',
+        }),
+      }),
+    );
+    expect(mockReinitMCPServer).toHaveBeenCalledTimes(1);
+  });
+
+  test('continues normal MCP discovery when an OAuth credential is readable', async () => {
+    const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
+    const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
+    mockGetMCPServersRegistry.mockReturnValue({
+      getServerConfig: jest.fn().mockResolvedValue({
+        source: 'config',
+        requiresOAuth: true,
+        viventiumGlassHive: {
+          version: 1,
+          permitsAutonomousWorker: true,
+          hostAllowed: true,
+          defaultToolAccess: 'content_read',
+          contentReadPolicy: 'require_broker_grant',
+        },
+      }),
+    });
+    mockInspectStoredOAuthCredentialState.mockResolvedValue({ status: 'credential_present' });
+    mockReinitMCPServer.mockResolvedValue({
+      success: true,
+      oauthRequired: false,
+      tools: [{ name: 'list_mail', inputSchema: { type: 'object' } }],
+    });
+    const grant = mintBrokerGrant({
+      user: { id: 'user-1', role: 'USER' },
+      allowedServers: ['ms-365'],
+      eagerServers: [],
+      deferredServers: ['ms-365'],
+      scopes: { content_read: true },
+    }).payload;
+
+    const described = await handleToolCall({
+      grant,
+      toolName: 'capability_describe',
+      args: { server: 'ms-365' },
+    });
+
+    expect(described.servers).toEqual([
+      expect.objectContaining({ name: 'ms-365', available: true, oauthRequired: false }),
+    ]);
+    expect(mockInspectStoredOAuthCredentialState).toHaveBeenCalledWith('user-1', 'ms-365');
+    expect(mockReinitMCPServer).toHaveBeenCalledTimes(1);
+    expect(mockReinitMCPServer).toHaveBeenCalledWith(
+      expect.objectContaining({ allowOAuthInitiation: false }),
+    );
+  });
+
+  test('returns a typed degraded bundle when reviewed capability inventory is unavailable', async () => {
+    const {
+      buildConversationProviderBootstrapBundle,
+    } = require('../GlassHiveCapabilityBootstrapService');
+    mockGetMCPServersRegistry.mockReturnValue({
+      getAllServerConfigs: jest.fn().mockRejectedValue(new Error('synthetic registry outage')),
+    });
+
+    const result = await buildConversationProviderBootstrapBundle({
+      user: { id: 'user-1', role: 'USER' },
+      requestBody: { conversationId: 'conversation-1', messageId: 'message-1' },
+      deferredServerNames: ['ms-365'],
+    });
+
+    expect(result.glasshive_capability_status).toEqual({
+      status: 'degraded',
+      reason: 'registry_unavailable',
+    });
+    expect(result.agents_md).toContain('capability broker is degraded');
+    expect(JSON.stringify(result)).not.toContain('synthetic registry outage');
+  });
+
+  test('preserves eager capabilities while exposing a typed handoff-resolution degradation', async () => {
+    const {
+      buildConversationProviderBootstrapBundle,
+    } = require('../GlassHiveCapabilityBootstrapService');
+    mockGetMCPServersRegistry.mockReturnValue({
+      getAllServerConfigs: jest.fn().mockResolvedValue({
+        'scheduling-cortex': {
           source: 'config',
           viventiumGlassHive: {
             version: 1,
@@ -196,17 +583,47 @@ describe('GlassHive capability broker', () => {
       user: { id: 'user-1', role: 'USER' },
       requestBody: { conversationId: 'conversation-1', messageId: 'message-1' },
       allowedServerNames: ['scheduling-cortex'],
+      capabilityResolutionStatus: 'handoff_capability_resolution_unavailable',
     });
 
-    expect(result.glasshive_capability_broker.allowed_servers).toEqual(['scheduling-cortex']);
-    expect(result.glasshive_capability_broker.scopes.content_read).toBe(true);
-    expect(result.codex_config_append).toContain('glasshive-user-capabilities');
-    expect(result.env.GLASSHIVE_CAPABILITY_BROKER_TOKEN).toEqual(expect.any(String));
-    const providerGrant = JSON.parse(
-      Buffer.from(result.env.GLASSHIVE_CAPABILITY_BROKER_TOKEN, 'base64url').toString('utf8'),
-    );
-    expect(providerGrant.allow_dynamic_policy_servers).toBe(false);
+    expect(result.glasshive_capability_broker.eager_servers).toEqual(['scheduling-cortex']);
+    expect(result.glasshive_capability_status).toEqual({
+      status: 'degraded',
+      reason: 'handoff_capability_resolution_unavailable',
+    });
+    expect(result.agents_md).toContain('capability broker is degraded');
   });
+
+  test.each([
+    [{ id: 'user-1', role: 'USER' }, false, 'broker_disabled'],
+    [undefined, true, 'user_scope_unavailable'],
+  ])(
+    'returns typed degraded context for eager Agent tools when broker/user scope is unavailable',
+    async (user, projectionEnabled, reason) => {
+      const {
+        buildConversationProviderBootstrapBundle,
+      } = require('../GlassHiveCapabilityBootstrapService');
+      const previous = process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_ENABLED;
+      process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_ENABLED = projectionEnabled
+        ? 'true'
+        : 'false';
+      try {
+        const result = await buildConversationProviderBootstrapBundle({
+          user,
+          requestBody: { conversationId: 'conversation-1', messageId: 'message-1' },
+          allowedServerNames: ['scheduling-cortex'],
+        });
+        expect(result.glasshive_capability_status).toEqual({ status: 'degraded', reason });
+        expect(result.agents_md).toContain('capability broker is degraded');
+      } finally {
+        if (previous === undefined) {
+          delete process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_ENABLED;
+        } else {
+          process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_ENABLED = previous;
+        }
+      }
+    },
+  );
 
   test('injects broker MCP config into GlassHive launch bootstrap without provider secrets', async () => {
     const {

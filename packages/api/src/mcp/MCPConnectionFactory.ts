@@ -39,6 +39,12 @@ export class MCPConnectionFactory {
   protected readonly oauthStart?: (authURL: string) => Promise<void>;
   protected readonly oauthEnd?: () => Promise<void>;
   protected readonly returnOnOAuth?: boolean;
+  /* === VIVENTIUM START ===
+   * Feature: Non-interactive MCP readiness.
+   * Purpose: Fail with a typed reconnect requirement before creating OAuth flow state.
+   */
+  protected readonly allowOAuthInitiation: boolean;
+  /* === VIVENTIUM END === */
   protected readonly connectionTimeout?: number;
 
   /** Creates a new MCP connection with optional OAuth support */
@@ -195,6 +201,7 @@ export class MCPConnectionFactory {
     this.useOAuth = !!oauth?.useOAuth;
     this.useSSRFProtection = basic.useSSRFProtection === true;
     this.connectionTimeout = oauth?.connectionTimeout;
+    this.allowOAuthInitiation = oauth?.allowOAuthInitiation !== false;
     this.logPrefix = oauth?.user
       ? `[MCP][${basic.serverName}][${oauth.user.id}]`
       : `[MCP][${basic.serverName}]`;
@@ -350,6 +357,17 @@ export class MCPConnectionFactory {
             refreshError,
           );
         }
+      }
+      /* === VIVENTIUM END === */
+
+      /* === VIVENTIUM START ===
+       * Feature: Non-interactive MCP readiness.
+       * Purpose: Voice/background hot paths may validate or refresh stored credentials, but must
+       * never create an OAuth redirect flow that no user can complete from that turn.
+       */
+      if (!this.allowOAuthInitiation) {
+        connection.emit('oauthFailed', new Error('OAuth reconnection required'));
+        return;
       }
       /* === VIVENTIUM END === */
 

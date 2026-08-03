@@ -186,6 +186,13 @@ export interface OAuthConnectionOptions {
   oauthStart?: (authURL: string) => Promise<void>;
   oauthEnd?: () => Promise<void>;
   returnOnOAuth?: boolean;
+  /* === VIVENTIUM START ===
+   * Feature: Non-interactive MCP readiness.
+   * Purpose: Permit background/voice discovery to use stored credentials without creating an
+   * interactive OAuth flow when the credential is rejected.
+   */
+  allowOAuthInitiation?: boolean;
+  /* === VIVENTIUM END === */
   connectionTimeout?: number;
 }
 

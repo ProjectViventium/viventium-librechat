@@ -11,7 +11,11 @@ const { getMCPManager, getMCPServersRegistry, getFlowStateManager } = require('~
 const { findToken, createToken, updateToken, deleteToken, getUserById } = require('~/models');
 const { getLogStores } = require('~/cache');
 const { getGraphApiToken } = require('~/server/services/GraphTokenService');
-const { reinitMCPServer } = require('~/server/services/Tools/mcp');
+const {
+  buildMcpOAuthRecovery,
+  inspectStoredOAuthCredentialState,
+  reinitMCPServer,
+} = require('~/server/services/Tools/mcp');
 const {
   auditSafeToolSummary,
   brokerToolName,
@@ -61,9 +65,23 @@ async function userForGrant(grant) {
   };
 }
 
-async function requestedServersFromGrant(grant, user, registry) {
-  const servers = new Set(
+async function requestedServersFromGrant(grant, user, registry, requestedServerNames) {
+  /* === VIVENTIUM START ===
+   * Feature: Deferred connected-account projection.
+   * Purpose: Initial catalog construction is limited to the signed eager set. A helper call may
+   * request an exact signed deferred server without waking every connected account.
+   */
+  const allowedServers = new Set(
     (grant?.allowed_servers || []).map((server) => String(server || '').trim()).filter(Boolean),
+  );
+  const eagerServers = Array.isArray(grant?.eager_servers)
+    ? grant.eager_servers
+    : grant?.allowed_servers || [];
+  const requested = Array.isArray(requestedServerNames)
+    ? requestedServerNames.map((server) => String(server || '').trim()).filter(Boolean)
+    : null;
+  const servers = new Set(
+    (requested || eagerServers).filter((server) => allowedServers.has(server)),
   );
   if (grant?.allow_dynamic_policy_servers === true && registry?.getAllServerConfigs) {
     const mcpConfig = await registry.getAllServerConfigs(user.id).catch((error) => {
@@ -79,13 +97,43 @@ async function requestedServersFromGrant(grant, user, registry) {
       mcpConfig: mcpConfig || {},
       executionMode: grant.execution_mode,
     })) {
-      servers.add(serverName);
+      if (!requested || requested.includes(serverName)) {
+        servers.add(serverName);
+      }
     }
   }
   return Array.from(servers).sort();
+  /* === VIVENTIUM END === */
 }
 
 async function discoverServerTools({ user, serverName, serverConfig, signal } = {}) {
+  const requiresOAuth = Boolean(serverConfig?.requiresOAuth || serverConfig?.oauthMetadata);
+  if (requiresOAuth) {
+    let credentialState = null;
+    try {
+      credentialState = await inspectStoredOAuthCredentialState(user?.id, serverName);
+    } catch (error) {
+      // Readiness inspection is advisory when it cannot run. Continue through the normal MCP
+      // path so a telemetry outage cannot falsely delete a working capability.
+      logger.warn(
+        '[VIVENTIUM][glasshive-capability-broker] OAuth readiness inspection unavailable',
+        { serverName, errorType: typeOfError(error) },
+      );
+    }
+    if (credentialState?.status && credentialState.status !== 'credential_present') {
+      // A background/native harness cannot complete an interactive OAuth redirect. Return the
+      // exact structured blocker immediately; do not start an OAuth flow, wait on flow-state
+      // polling, or repeat the same unavailable initialization on describe then invoke.
+      return {
+        tools: [],
+        oauthRequired: true,
+        success: false,
+        credentialStatus: credentialState.status,
+        message: 'Connected account requires reconnection before this worker can use it.',
+        recovery: buildMcpOAuthRecovery(serverName),
+      };
+    }
+  }
   const discoverOnce = (forceNew) =>
     reinitMCPServer({
       user,
@@ -94,6 +142,7 @@ async function discoverServerTools({ user, serverName, serverConfig, signal } = 
       serverName,
       serverConfig,
       returnOnOAuth: true,
+      allowOAuthInitiation: false,
       oauthStart: async () => {
         // Worker-side OAuth starts are intentionally not launched from the sandbox.
       },
@@ -127,10 +176,19 @@ async function discoverServerTools({ user, serverName, serverConfig, signal } = 
     oauthRequired: Boolean(result?.oauthRequired),
     success: Boolean(result?.success),
     message: result?.message || '',
+    credentialStatus: String(result?.credentialState?.status || '').trim(),
+    recovery: result?.recovery || null,
   };
 }
 
+function typeOfError(error) {
+  return String(error?.name || error?.constructor?.name || 'Error');
+}
+
 function omissionReasonForDiscovery(discovered) {
+  if (discovered.credentialStatus) {
+    return discovered.credentialStatus;
+  }
   if (discovered.oauthRequired && discovered.tools.length === 0) {
     return 'oauth_required';
   }
@@ -143,14 +201,19 @@ function omissionReasonForDiscovery(discovered) {
   return '';
 }
 
-async function buildCapabilityCatalog({ grant, signal } = {}) {
+async function buildCapabilityCatalog({ grant, signal, requestedServerNames } = {}) {
   const user = await userForGrant(grant);
   const registry = getMCPServersRegistry();
   const tools = [];
   const servers = [];
   const omissions = [];
 
-  for (const serverName of await requestedServersFromGrant(grant, user, registry)) {
+  for (const serverName of await requestedServersFromGrant(
+    grant,
+    user,
+    registry,
+    requestedServerNames,
+  )) {
     const serverConfig = await registry.getServerConfig(serverName, user.id).catch(() => null);
     const policy = getPolicy(serverConfig);
     if (!serverConfig || !policy || !isTrustedServerConfig(serverConfig)) {
@@ -166,7 +229,13 @@ async function buildCapabilityCatalog({ grant, signal } = {}) {
     }
     const omissionReason = omissionReasonForDiscovery(discovered);
     if (omissionReason) {
-      omissions.push(logOmission(omissionReason, serverName, { message: discovered.message }));
+      const omission = logOmission(omissionReason, serverName, {
+        message: discovered.message,
+        ...(discovered.recovery ? { recovery: discovered.recovery } : {}),
+      });
+      omissions.push(
+        discovered.recovery ? { ...omission, recovery: discovered.recovery } : omission,
+      );
     }
     servers.push({
       name: serverName,
@@ -175,6 +244,8 @@ async function buildCapabilityCatalog({ grant, signal } = {}) {
       oauthRequired: discovered.oauthRequired,
       toolCount: discovered.tools.length,
       message: discovered.message,
+      ...(discovered.credentialStatus ? { credentialStatus: discovered.credentialStatus } : {}),
+      ...(discovered.recovery ? { recovery: discovered.recovery } : {}),
     });
     for (const tool of discovered.tools) {
       if (policy.reexportNativeTools === false) {
@@ -210,6 +281,10 @@ async function buildCapabilityCatalog({ grant, signal } = {}) {
     omissions,
     tools,
     helperTools: helperToolDefinitions(),
+    deferredServers: (grant?.deferred_servers || [])
+      .map((server) => String(server || '').trim())
+      .filter(Boolean)
+      .sort(),
   };
 }
 
@@ -236,6 +311,7 @@ function publicCatalog(catalog) {
       riskClass: item.definition.annotations.riskClass,
     })),
     omissions: catalog.omissions,
+    deferredServers: catalog.deferredServers || [],
   };
 }
 
@@ -245,6 +321,21 @@ function findNativeTool(catalog, brokerToolNameValue) {
 
 function findNativeToolByServerTool(catalog, serverName, toolName) {
   return catalog.tools.find((item) => item.serverName === serverName && item.toolName === toolName);
+}
+
+function authBlockedServerResult(catalog, serverName, toolName = '') {
+  const server = catalog.servers.find((item) => item.name === serverName);
+  if (!server || server.available !== false || !server.credentialStatus || !server.recovery) {
+    return null;
+  }
+  return {
+    status: 'blocked',
+    reason: server.credentialStatus,
+    server: serverName,
+    ...(toolName ? { tool: toolName } : {}),
+    oauthRequired: server.oauthRequired === true,
+    recovery: server.recovery,
+  };
 }
 
 function extractIntentFlags(args = {}) {
@@ -434,17 +525,26 @@ async function invokeUnderlyingTool({ grant, catalog, nativeTool, args = {}, sig
 }
 
 async function handleToolCall({ grant, toolName, args = {}, signal } = {}) {
-  const catalog = await buildCapabilityCatalog({ grant, signal });
   if (toolName === 'capabilities_list') {
+    const catalog = await buildCapabilityCatalog({ grant, signal });
     return publicCatalog(catalog);
   }
   if (toolName === 'capability_describe') {
     const requested = args || {};
+    const catalog = await buildCapabilityCatalog({
+      grant,
+      signal,
+      requestedServerNames: requested.server ? [requested.server] : undefined,
+    });
     if (requested.tool) {
       const native =
         findNativeTool(catalog, requested.tool) ||
         findNativeToolByServerTool(catalog, requested.server, requested.tool);
       if (!native) {
+        const blocked = authBlockedServerResult(catalog, requested.server, requested.tool);
+        if (blocked) {
+          return blocked;
+        }
         return { status: 'not_found', server: requested.server || '', tool: requested.tool };
       }
       return native.definition;
@@ -452,8 +552,17 @@ async function handleToolCall({ grant, toolName, args = {}, signal } = {}) {
     return publicCatalog(catalog);
   }
   if (toolName === 'capability_invoke') {
+    const catalog = await buildCapabilityCatalog({
+      grant,
+      signal,
+      requestedServerNames: args.server ? [args.server] : [],
+    });
     const native = findNativeToolByServerTool(catalog, args.server, args.tool);
     if (!native) {
+      const blocked = authBlockedServerResult(catalog, args.server, args.tool);
+      if (blocked) {
+        return blocked;
+      }
       return { status: 'not_found', server: args.server || '', tool: args.tool || '' };
     }
     return invokeUnderlyingTool({
@@ -464,6 +573,7 @@ async function handleToolCall({ grant, toolName, args = {}, signal } = {}) {
       signal,
     });
   }
+  const catalog = await buildCapabilityCatalog({ grant, signal });
   const nativeTool = findNativeTool(catalog, toolName);
   if (!nativeTool) {
     return { status: 'not_found', tool: toolName };

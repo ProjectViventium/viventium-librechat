@@ -49,6 +49,7 @@ describe('agentsEndpointSchema provider capability policy', () => {
       providerCapabilities: {
         'synthetic-harness': {
           label: 'Synthetic Harness',
+          reviewed_mcp_projection: 'deferred',
           models: [{ id: 'synthetic:model', label: 'Synthetic Model' }],
         },
       },
@@ -69,6 +70,7 @@ describe('agentsEndpointSchema provider capability policy', () => {
       responses_api: false,
       default_access: 'workspace',
       allow_full_access: false,
+      reviewed_mcp_projection: 'deferred',
     });
     expect(parsed.activationOpenAITransportProviders).toEqual(['synthetic-openai-transport']);
   });

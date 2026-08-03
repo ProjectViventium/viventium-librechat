@@ -21,6 +21,11 @@ export default function UninitializedMCPTool({ serverInfo }: { serverInfo?: MCPS
   }
 
   const serverName = serverInfo.serverName;
+  /* === VIVENTIUM START ===
+   * Feature: Human-readable managed MCP connection slots.
+   * Purpose: Keep opaque server names as routing IDs while showing the configured account label.
+   * === VIVENTIUM END === */
+  const displayServerName = serverInfo.metadata.name || serverName;
   const isServerInitializing = isInitializing(serverName);
   const statusIconProps = getServerStatusIconProps(serverName);
   const configDialogProps = getConfigDialogProps();
@@ -92,7 +97,7 @@ export default function UninitializedMCPTool({ serverInfo }: { serverInfo?: MCPS
             className="grow px-2 py-1.5"
             style={{ textOverflow: 'ellipsis', wordBreak: 'break-all', overflow: 'hidden' }}
           >
-            {serverName}
+            {displayServerName}
             {isServerInitializing && (
               <span className="ml-2 text-xs text-text-secondary">
                 {localize('com_ui_initializing')}
@@ -133,7 +138,9 @@ export default function UninitializedMCPTool({ serverInfo }: { serverInfo?: MCPS
           selectText: localize('com_ui_delete'),
         }}
       />
-      {configDialogProps && <MCPConfigDialog {...configDialogProps} />}
+      {configDialogProps && (
+        <MCPConfigDialog {...configDialogProps} displayName={displayServerName} />
+      )}
     </OGDialog>
   );
 }

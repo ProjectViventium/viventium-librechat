@@ -84,6 +84,8 @@ function normalizeBrokerScopes(scopes = {}) {
 function mintBrokerGrant({
   user,
   allowedServers = [],
+  eagerServers = allowedServers,
+  deferredServers = [],
   requestContext = {},
   executionMode,
   ttlSeconds = DEFAULT_TTL_SECONDS,
@@ -108,6 +110,20 @@ function mintBrokerGrant({
       Math.max(60, Number(ttlSeconds) || DEFAULT_TTL_SECONDS),
       Math.max(60, Number(renewableTtlSeconds) || Number(ttlSeconds) || DEFAULT_TTL_SECONDS),
     );
+  /* === VIVENTIUM START ===
+   * Feature: Deferred connected-account projection.
+   * Purpose: Sign eager and on-demand server scopes separately so ordinary harness turns do not
+   * initialize heavyweight connected-account MCPs merely because they are authorized.
+   */
+  const sanitizedAllowedServers = sanitizeAllowedServers(allowedServers);
+  const allowedServerSet = new Set(sanitizedAllowedServers);
+  const sanitizedEagerServers = sanitizeAllowedServers(eagerServers).filter((server) =>
+    allowedServerSet.has(server),
+  );
+  const eagerServerSet = new Set(sanitizedEagerServers);
+  const sanitizedDeferredServers = sanitizeAllowedServers(deferredServers).filter(
+    (server) => allowedServerSet.has(server) && !eagerServerSet.has(server),
+  );
   const payload = {
     aud: BROKER_AUDIENCE,
     grant_id: `ghcb_${crypto.randomBytes(16).toString('hex')}`,
@@ -121,7 +137,9 @@ function mintBrokerGrant({
     worker_id: String(requestContext.worker_id || requestContext.workerId || ''),
     run_id: String(requestContext.run_id || requestContext.runId || ''),
     execution_mode: String(executionMode || requestContext.execution_mode || ''),
-    allowed_servers: sanitizeAllowedServers(allowedServers),
+    allowed_servers: sanitizedAllowedServers,
+    eager_servers: sanitizedEagerServers,
+    deferred_servers: sanitizedDeferredServers,
     allow_dynamic_policy_servers: allowDynamicPolicyServers === true,
     scopes: normalizeBrokerScopes(scopes),
     iat,
@@ -130,6 +148,7 @@ function mintBrokerGrant({
     nonce: crypto.randomBytes(16).toString('hex'),
     policy_version: 1,
   };
+  /* === VIVENTIUM END === */
   payload.sig = signPayload(payload, secret);
   return {
     token: base64urlEncode(JSON.stringify(payload)),
@@ -174,9 +193,23 @@ function verifyBrokerGrant(
   ) {
     throw new Error('GlassHive capability broker grant expired');
   }
+  const verifiedAllowedServers = sanitizeAllowedServers(payload.allowed_servers);
+  const verifiedAllowedServerSet = new Set(verifiedAllowedServers);
+  const verifiedEagerServers = sanitizeAllowedServers(
+    Array.isArray(payload.eager_servers) ? payload.eager_servers : payload.allowed_servers,
+  ).filter((server) => verifiedAllowedServerSet.has(server));
+  const verifiedEagerServerSet = new Set(verifiedEagerServers);
+  const verifiedDeferredServers = sanitizeAllowedServers(payload.deferred_servers).filter(
+    (server) => verifiedAllowedServerSet.has(server) && !verifiedEagerServerSet.has(server),
+  );
   return {
     ...payload,
-    allowed_servers: sanitizeAllowedServers(payload.allowed_servers),
+    allowed_servers: verifiedAllowedServers,
+    /* === VIVENTIUM START: preserve backwards compatibility for grants minted before deferred
+     * projection by treating their complete allowlist as eager. === */
+    eager_servers: verifiedEagerServers,
+    deferred_servers: verifiedDeferredServers,
+    /* === VIVENTIUM END === */
     scopes: normalizeBrokerScopes(payload.scopes),
     renewed: expired,
   };

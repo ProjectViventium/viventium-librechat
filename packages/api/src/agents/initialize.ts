@@ -94,6 +94,8 @@ export type InitializedAgent = Agent & {
   toolDefinitions?: LCTool[];
   /** Precomputed flag indicating if any tools have defer_loading enabled (for efficient runtime checks) */
   hasDeferredTools?: boolean;
+  /** Request-local readiness for each declared MCP server; never contains credentials. */
+  mcpCapabilityReadiness?: Record<string, { status: string }>;
   /* === VIVENTIUM START ===
    * Feature: Capability-declared provider wire transport.
    * Purpose: Carry the compiled transport contract to model construction without provider labels.
@@ -141,6 +143,7 @@ export interface InitializeAgentParams {
     /** Serializable tool definitions for event-driven mode */
     toolDefinitions?: LCTool[];
     hasDeferredTools?: boolean;
+    mcpCapabilityReadiness?: Record<string, { status: string }>;
   } | null>;
   /** Endpoint option (contains model_parameters and endpoint info) */
   endpointOption?: Partial<TEndpointOption>;
@@ -731,6 +734,7 @@ export async function initializeAgent(
     userMCPAuthMap,
     toolDefinitions,
     hasDeferredTools,
+    mcpCapabilityReadiness,
     tools: structuredTools,
   } = (await loadTools?.({
     req,
@@ -748,6 +752,7 @@ export async function initializeAgent(
     toolRegistry: undefined,
     toolDefinitions: [],
     hasDeferredTools: false,
+    mcpCapabilityReadiness: {},
   };
   vivInitTimings.loadtools_ms = Date.now() - vivLoadToolsStart;
 
@@ -937,6 +942,7 @@ export async function initializeAgent(
     userMCPAuthMap,
     toolDefinitions,
     hasDeferredTools,
+    mcpCapabilityReadiness,
     /* === VIVENTIUM START === Capability-declared provider wire transport. === */
     declaredProviderTransport:
       providerCapability?.responses_api === false

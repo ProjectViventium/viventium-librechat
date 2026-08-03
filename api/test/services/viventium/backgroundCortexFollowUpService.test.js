@@ -1811,6 +1811,162 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(runCall.graphConfig.llmConfig).not.toHaveProperty('temperature');
   });
 
+  test.each([
+    ['normal suppression', '{NTA}', '{NTA}'],
+    [
+      'valuable continuation',
+      'One additional safeguard is needed before deployment.',
+      'One additional safeguard is needed before deployment.',
+    ],
+  ])(
+    'generateFollowUpText reattaches a durable GlassHive Phase B request for %s',
+    async (_caseName, providerResult, expectedResult) => {
+      getCustomEndpointConfig.mockResolvedValueOnce({
+        apiKey: 'glasshive-provider-key',
+        baseURL: 'http://127.0.0.1:8766/v1',
+        defaultHeaders: {},
+        dropParams: ['temperature', 'max_tokens', 'use_responses_api'],
+      });
+      const processStream = jest
+        .fn()
+        .mockRejectedValueOnce(Object.assign(new Error('socket reset'), { code: 'ECONNRESET' }))
+        .mockResolvedValueOnce(providerResult);
+      Run.create.mockResolvedValueOnce({ processStream });
+      const req = {
+        user: { id: 'u1' },
+        body: { conversationId: 'conversation-1', messageId: 'message-1' },
+        config: {
+          endpoints: {
+            agents: {
+              providerCapabilities: {
+                'glasshive-harness': {
+                  phase_b_followup: true,
+                  workspace_binding: true,
+                  conversation_session: true,
+                  activity_stream: true,
+                  responses_api: false,
+                },
+              },
+            },
+          },
+        },
+      };
+
+      const result = await generateFollowUpText({
+        req,
+        agent: {
+          id: 'agent-glasshive-main',
+          endpoint: 'glasshive-harness',
+          provider: 'openAI',
+          model: 'codex-cli:gpt-5.6-sol',
+          tools: [],
+          model_parameters: { reasoning_effort: 'medium' },
+          glasshive_options: {
+            workspace: { mode: 'life' },
+            access: 'workspace',
+          },
+        },
+        insightsData: {
+          insights: [{ cortexName: 'Risk', insight: 'No additional action is needed.' }],
+        },
+        recentResponse: 'I already addressed that risk.',
+        runId: 'message-1',
+        conversationId: 'conversation-1',
+        parentMessageId: 'message-1',
+      });
+
+      expect(result).toBe(expectedResult);
+      expect(Run.create).toHaveBeenCalledTimes(1);
+      expect(processStream).toHaveBeenCalledTimes(2);
+      expect(processStream.mock.calls[1]).toEqual(processStream.mock.calls[0]);
+      expect(
+        Run.create.mock.calls[0][0].graphConfig.llmConfig.configuration.defaultHeaders,
+      ).toEqual(
+        expect.objectContaining({
+          'X-GlassHive-Idempotency-Key': expect.any(String),
+        }),
+      );
+    },
+  );
+
+  test('generateFollowUpText does not retry a durable GlassHive request after an auth failure', async () => {
+    getCustomEndpointConfig.mockResolvedValueOnce({
+      apiKey: 'glasshive-provider-key',
+      baseURL: 'http://127.0.0.1:8766/v1',
+      defaultHeaders: {},
+    });
+    const authError = Object.assign(new Error('authentication failed'), { status: 401 });
+    const processStream = jest.fn().mockRejectedValueOnce(authError);
+    Run.create.mockResolvedValueOnce({ processStream });
+    const req = {
+      user: { id: 'u1' },
+      body: { conversationId: 'conversation-1', messageId: 'message-1' },
+      config: {
+        endpoints: {
+          agents: {
+            providerCapabilities: {
+              'glasshive-harness': {
+                phase_b_followup: true,
+                workspace_binding: true,
+                conversation_session: true,
+                activity_stream: true,
+                responses_api: false,
+              },
+            },
+          },
+        },
+      },
+    };
+
+    await expect(
+      generateFollowUpText({
+        req,
+        agent: {
+          id: 'agent-glasshive-main',
+          endpoint: 'glasshive-harness',
+          provider: 'openAI',
+          model: 'codex-cli:gpt-5.6-sol',
+          model_parameters: { reasoning_effort: 'medium' },
+          glasshive_options: { workspace: { mode: 'life' }, access: 'workspace' },
+        },
+        insightsData: {
+          insights: [{ cortexName: 'Risk', insight: 'A new issue was identified.' }],
+        },
+        recentResponse: 'I am reviewing it.',
+        runId: 'message-1',
+        conversationId: 'conversation-1',
+        parentMessageId: 'message-1',
+      }),
+    ).rejects.toBe(authError);
+    expect(Run.create).toHaveBeenCalledTimes(1);
+    expect(processStream).toHaveBeenCalledTimes(1);
+  });
+
+  test('generateFollowUpText does not retry an ordinary provider after transport loss', async () => {
+    const transportError = Object.assign(new Error('socket reset'), { code: 'ECONNRESET' });
+    const processStream = jest.fn().mockRejectedValueOnce(transportError);
+    Run.create.mockResolvedValueOnce({ processStream });
+
+    await expect(
+      generateFollowUpText({
+        req: { user: { id: 'u1' }, body: {} },
+        agent: {
+          id: 'agent-direct',
+          provider: 'openai',
+          model: 'gpt-5.4',
+          model_parameters: {},
+        },
+        insightsData: {
+          insights: [{ cortexName: 'Risk', insight: 'A new issue was identified.' }],
+        },
+        recentResponse: 'I am reviewing it.',
+        runId: 'message-1',
+      }),
+    ).rejects.toBe(transportError);
+    expect(Run.create).toHaveBeenCalledTimes(1);
+    expect(processStream).toHaveBeenCalledTimes(1);
+  });
+
   test('generateFollowUpText keeps governed OpenAI fallback when agent model metadata is missing', async () => {
     const req = { user: { id: 'u1' }, body: {} };
 

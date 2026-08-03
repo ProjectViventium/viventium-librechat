@@ -28,6 +28,34 @@ function buildHarnessIdempotencyKey(role, messageId, agentId = '') {
   return [cleanRole, cleanAgentId, cleanMessageId].filter(Boolean).join(':');
 }
 
+function bindConversationProviderDeveloperInstructionTail({ targetAgent, tail } = {}) {
+  const modelParameters = targetAgent?.model_parameters;
+  const configuration = modelParameters?.configuration;
+  const currentHeaders = configuration?.defaultHeaders;
+  if (
+    !currentHeaders ||
+    typeof currentHeaders !== 'object' ||
+    !Object.prototype.hasOwnProperty.call(currentHeaders, 'X-GlassHive-Agent-Id')
+  ) {
+    return false;
+  }
+  const defaultHeaders = { ...currentHeaders };
+  const exactTail = typeof tail === 'string' ? tail.trim() : '';
+  if (exactTail) {
+    defaultHeaders['X-GlassHive-Developer-Instruction-Tail-B64'] = Buffer.from(
+      exactTail,
+      'utf8',
+    ).toString('base64');
+  } else {
+    delete defaultHeaders['X-GlassHive-Developer-Instruction-Tail-B64'];
+  }
+  targetAgent.model_parameters = {
+    ...modelParameters,
+    configuration: { ...configuration, defaultHeaders },
+  };
+  return true;
+}
+
 async function withTimeout(promise, timeoutMs, message) {
   let timeout;
   try {
@@ -176,22 +204,93 @@ function declaredMcpServerNames(agent, excludedServers = []) {
   return Array.from(serverNames).sort();
 }
 
+async function declaredHandoffMcpServerNames(agent, excludedServers = [], resolveAgentById) {
+  if (!Array.isArray(agent?.edges) || typeof resolveAgentById !== 'function') {
+    return [];
+  }
+  const agentId = String(agent.id || '').trim();
+  const endpointIds = (value) =>
+    (Array.isArray(value) ? value : [value])
+      .map((entry) => String(entry || '').trim())
+      .filter(Boolean);
+  const targetIds = Array.from(
+    new Set(
+      agent.edges
+        .filter(
+          (edge) =>
+            edge &&
+            typeof edge === 'object' &&
+            (edge.edgeType ?? 'handoff') === 'handoff' &&
+            (!agentId || endpointIds(edge.from).includes(agentId)),
+        )
+        .flatMap((edge) => endpointIds(edge.to))
+        .filter(Boolean),
+    ),
+  ).sort();
+  const serverNames = new Set();
+  for (const targetId of targetIds) {
+    const target = await resolveAgentById(targetId);
+    if (!target) {
+      const error = new Error('Declared handoff capability target is unavailable');
+      error.code = 'handoff_capability_resolution_unavailable';
+      throw error;
+    }
+    for (const serverName of declaredMcpServerNames(target, excludedServers)) {
+      serverNames.add(serverName);
+    }
+  }
+  return Array.from(serverNames).sort();
+}
+
 async function attachConversationProviderCapabilityBundle({
   targetAgent,
   declaredAgent = targetAgent,
   req,
   capability,
   requestBody = req?.body || {},
+  resolveAgentById,
 } = {}) {
   if (!targetAgent || capability?.workspace_binding !== true) {
     return false;
   }
   const allowedServerNames = declaredMcpServerNames(declaredAgent, capability.excluded_mcp_servers);
-  if (allowedServerNames.length === 0) {
+  /* === VIVENTIUM START ===
+   * Feature: Deferred connected-account projection.
+   * Purpose: Provider capability metadata may authorize reviewed MCP servers for on-demand use
+   * without adding their schemas or discovery latency to every conversation turn.
+   */
+  const excludedServers = new Set(
+    (capability.excluded_mcp_servers || []).map((value) => String(value || '').trim()),
+  );
+  const includeDeclaredHandoffServers = capability.reviewed_mcp_projection === 'deferred';
+  const effectiveResolver =
+    resolveAgentById ||
+    (async (agentId) => {
+      const { getAgent } = require('~/models/Agent');
+      return getAgent({ id: agentId });
+    });
+  let deferredServerNames = [];
+  let capabilityResolutionStatus = '';
+  if (includeDeclaredHandoffServers) {
+    try {
+      deferredServerNames = await declaredHandoffMcpServerNames(
+        declaredAgent,
+        Array.from(excludedServers),
+        effectiveResolver,
+      );
+    } catch (_) {
+      capabilityResolutionStatus = 'handoff_capability_resolution_unavailable';
+    }
+  }
+  if (
+    allowedServerNames.length === 0 &&
+    deferredServerNames.length === 0 &&
+    !capabilityResolutionStatus
+  ) {
     return false;
   }
-  // Load the broker boundary only when an Agent actually declares an eligible MCP server. This
-  // keeps ordinary harness chat independent of connected-account cache/bootstrap dependencies.
+  // Load the broker boundary only when the provider has an eager or deferred reviewed MCP scope.
+  // Deferred scopes add signed metadata but no connected-account discovery to ordinary chat.
   const {
     buildConversationProviderBootstrapBundle,
   } = require('./GlassHiveCapabilityBootstrapService');
@@ -199,7 +298,11 @@ async function attachConversationProviderCapabilityBundle({
     user: req?.user,
     requestBody,
     allowedServerNames,
+    deferredServerNames,
+    excludedServerNames: Array.from(excludedServers).filter(Boolean).sort(),
+    ...(capabilityResolutionStatus ? { capabilityResolutionStatus } : {}),
   });
+  /* === VIVENTIUM END === */
   if (!bundle || Object.keys(bundle).length === 0) {
     return false;
   }
@@ -219,7 +322,9 @@ async function attachConversationProviderCapabilityBundle({
 
 module.exports = {
   attachConversationProviderCapabilityBundle,
+  bindConversationProviderDeveloperInstructionTail,
   bindHarnessCancellation,
   buildHarnessIdempotencyKey,
   declaredMcpServerNames,
+  declaredHandoffMcpServerNames,
 };

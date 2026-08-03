@@ -115,6 +115,113 @@ const PLACEHOLDER_RESPONSE_PATTERNS = [
   /^(generation in progress|generation interrupted before completion)\.?$/i,
 ];
 
+/* === VIVENTIUM START ===
+ * Feature: Durable Phase B transport reattachment.
+ * Purpose: A harness provider request can continue while LibreChat or its HTTP connection restarts.
+ * Re-running the same local `Run` with the exact idempotency header reattaches that request instead
+ * of creating a second author. Keep retries bounded and limited to structured transport failures.
+ * === VIVENTIUM END === */
+const DURABLE_FOLLOW_UP_RECONNECT_DELAYS_MS = Object.freeze([0, 250, 500, 1000, 2000, 4000]);
+const RETRYABLE_FOLLOW_UP_TRANSPORT_CODES = new Set([
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'EPIPE',
+  'ETIMEDOUT',
+  'ERR_STREAM_PREMATURE_CLOSE',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_SOCKET',
+]);
+
+function getFollowUpErrorStatus(error) {
+  for (const candidate of [error?.status, error?.statusCode, error?.response?.status]) {
+    const status = Number(candidate);
+    if (Number.isFinite(status)) {
+      return status;
+    }
+  }
+  return null;
+}
+
+function getFollowUpErrorCode(error) {
+  for (const candidate of [
+    error?.code,
+    error?.lc_error_code,
+    error?.cause?.code,
+    error?.error?.code,
+  ]) {
+    const code = String(candidate || '')
+      .trim()
+      .toUpperCase();
+    if (code) {
+      return code;
+    }
+  }
+  return '';
+}
+
+function isRetryableFollowUpTransportError(error) {
+  const status = getFollowUpErrorStatus(error);
+  if (status != null) {
+    return status === 408 || status === 425 || status === 429 || status >= 500;
+  }
+  if (RETRYABLE_FOLLOW_UP_TRANSPORT_CODES.has(getFollowUpErrorCode(error))) {
+    return true;
+  }
+  return error?.name === 'APIConnectionError' || error?.name === 'FetchError';
+}
+
+function hasDurableFollowUpReattachContract(providerCapability, llmConfig) {
+  if (
+    providerCapability?.conversation_session !== true ||
+    providerCapability?.activity_stream !== true
+  ) {
+    return false;
+  }
+  const headers = llmConfig?.configuration?.defaultHeaders;
+  if (!headers || typeof headers !== 'object') {
+    return false;
+  }
+  return Object.entries(headers).some(
+    ([name, value]) =>
+      String(name).trim().toLowerCase() === 'x-glasshive-idempotency-key' &&
+      String(value || '').trim().length > 0,
+  );
+}
+
+async function processFollowUpWithDurableReattach({
+  run,
+  input,
+  config,
+  providerCapability,
+  llmConfig,
+}) {
+  const canReattach = hasDurableFollowUpReattachContract(providerCapability, llmConfig);
+  let failureCount = 0;
+  while (true) {
+    try {
+      return await run.processStream(input, config);
+    } catch (error) {
+      if (
+        !canReattach ||
+        !isRetryableFollowUpTransportError(error) ||
+        failureCount >= DURABLE_FOLLOW_UP_RECONNECT_DELAYS_MS.length
+      ) {
+        throw error;
+      }
+      const delayMs = DURABLE_FOLLOW_UP_RECONNECT_DELAYS_MS[failureCount];
+      failureCount += 1;
+      const failure = sanitizeFollowUpErrorForLog(error);
+      logger.warn(
+        `[BackgroundCortexFollowUpService] Reattaching durable Phase B request after transport loss: attempt=${failureCount} delay_ms=${delayMs} name=${failure.name || 'unknown'} status=${failure.status ?? 'none'} code=${failure.code || 'none'}`,
+      );
+      if (delayMs > 0) {
+        await sleep(delayMs);
+      }
+    }
+  }
+}
+/* === VIVENTIUM END === */
+
 function isPlaceholderRecentResponseText(text) {
   const lines = String(text || '')
     .split(/\r?\n/)
@@ -2438,7 +2545,13 @@ async function generateFollowUpText({
     version: 'v2',
   };
 
-  const content = await run.processStream({ messages: [new HumanMessage(prompt)] }, config);
+  const content = await processFollowUpWithDurableReattach({
+    run,
+    input: { messages: [new HumanMessage(prompt)] },
+    config,
+    providerCapability: followUpProviderCapability,
+    llmConfig,
+  });
 
   let text = '';
   if (typeof content === 'string') {

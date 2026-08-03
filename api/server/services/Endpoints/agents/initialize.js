@@ -1000,10 +1000,13 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
     if (!capabilityReadiness.keep) {
       markOptionalAgentInitializationFailed(skippedAgentIds, agentId);
       omittedCapabilityReadiness.push(capabilityReadiness);
-      logger.warn('[initializeClient] Optional handoff omitted because all declared MCPs are unavailable', {
-        agentId,
-        readiness: capabilityReadiness.unavailableServers,
-      });
+      logger.warn(
+        '[initializeClient] Optional handoff omitted because all declared MCPs are unavailable',
+        {
+          agentId,
+          readiness: capabilityReadiness.unavailableServers,
+        },
+      );
       return null;
     }
     /* === VIVENTIUM END === */

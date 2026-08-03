@@ -251,8 +251,7 @@ describe('MCP Routes', () => {
           expect.objectContaining({
             authorization_url: 'https://google-mcp.example/authorize',
             token_url: 'https://google-mcp.example/token',
-            redirect_uri:
-              'https://chat.viventium.example/api/mcp/google_workspace/oauth/callback',
+            redirect_uri: 'https://chat.viventium.example/api/mcp/google_workspace/oauth/callback',
           }),
         );
       } finally {

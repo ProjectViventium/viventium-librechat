@@ -51,7 +51,7 @@ jest.mock('@librechat/client', () => ({
   Button: ({ children, ...props }: React.ButtonHTMLAttributes<HTMLButtonElement>) => (
     <button {...props}>{children}</button>
   ),
-  TrashIcon: () => <span>trash</span>,
+  TrashIcon: () => <span aria-hidden="true" />,
   OGDialog: ({ children }: { children: React.ReactNode }) => <>{children}</>,
   OGDialogTrigger: ({ children }: { children: React.ReactNode }) => <>{children}</>,
   OGDialogTemplate: ({ selection }) => (

@@ -578,8 +578,7 @@ async function buildConversationProviderBootstrapBundle({
   const excludedServers = new Set(
     (excludedServerNames || []).map((value) => String(value || '').trim()).filter(Boolean),
   );
-  const hasRequestedCapabilities =
-    declaredServers.size > 0 || declaredDeferredServers.size > 0;
+  const hasRequestedCapabilities = declaredServers.size > 0 || declaredDeferredServers.size > 0;
   if (!hasRequestedCapabilities) {
     return capabilityResolutionStatus
       ? degradedConversationCapabilityBundle(capabilityResolutionStatus)
@@ -671,10 +670,7 @@ async function buildConversationProviderBootstrapBundle({
     ...bundle,
     glasshive_capability_status: degraded.glasshive_capability_status,
     ...Object.fromEntries(
-      WORKER_INSTRUCTION_FIELDS.map((field) => [
-        field,
-        appendText(bundle[field], degraded[field]),
-      ]),
+      WORKER_INSTRUCTION_FIELDS.map((field) => [field, appendText(bundle[field], degraded[field])]),
     ),
   };
   /* === VIVENTIUM END === */

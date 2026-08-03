@@ -71,20 +71,16 @@ describe('GlassHiveConversationProviderService', () => {
       },
     };
 
-    expect(
-      bindConversationProviderDeveloperInstructionTail({ targetAgent, tail: capsule }),
-    ).toBe(true);
+    expect(bindConversationProviderDeveloperInstructionTail({ targetAgent, tail: capsule })).toBe(
+      true,
+    );
     const headers = targetAgent.model_parameters.configuration.defaultHeaders;
     expect(headers['X-Existing']).toBe('kept');
     expect(
-      Buffer.from(headers['X-GlassHive-Developer-Instruction-Tail-B64'], 'base64').toString(
-        'utf8',
-      ),
+      Buffer.from(headers['X-GlassHive-Developer-Instruction-Tail-B64'], 'base64').toString('utf8'),
     ).toBe(capsule);
 
-    expect(
-      bindConversationProviderDeveloperInstructionTail({ targetAgent, tail: '' }),
-    ).toBe(true);
+    expect(bindConversationProviderDeveloperInstructionTail({ targetAgent, tail: '' })).toBe(true);
     expect(
       targetAgent.model_parameters.configuration.defaultHeaders[
         'X-GlassHive-Developer-Instruction-Tail-B64'

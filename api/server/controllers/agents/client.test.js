@@ -453,9 +453,7 @@ describe('GlassHive harness activity persistence', () => {
         },
         { role: 'user', content: [{ type: ContentTypes.TEXT, text: 'Try again.' }] },
       ]),
-    ).toEqual([
-      { role: 'user', content: [{ type: ContentTypes.TEXT, text: 'Try again.' }] },
-    ]);
+    ).toEqual([{ role: 'user', content: [{ type: ContentTypes.TEXT, text: 'Try again.' }] }]);
   });
 });
 

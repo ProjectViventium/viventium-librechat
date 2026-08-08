@@ -9,6 +9,9 @@ import { checkUserKeyExpiry, isEnabled } from '~/utils';
 import { loadAnthropicVertexCredentials, getVertexCredentialOptions } from './vertex';
 import { getLLMConfig } from './llm';
 import { resolveAnthropicSubscriptionUserValues } from './oauthSubscription';
+/* === VIVENTIUM START === Connected Accounts credential policy === */
+import { resolveConnectedAccountCredentialPolicy } from '../connectedAccounts/policy';
+/* === VIVENTIUM END === */
 
 /* === VIVENTIUM START ===
  * Feature: Connected-account credential recovery.
@@ -105,6 +108,16 @@ export async function initializeAnthropic({
   const appConfig = req.config;
   const { ANTHROPIC_API_KEY, ANTHROPIC_REVERSE_PROXY, PROXY } = process.env;
   const { key: expiresAt } = req.body;
+  /* === VIVENTIUM START ===
+   * Feature: Per-user connected-account credential policy.
+   * Purpose: Resolve the personal-only opt-out before any platform credential can be selected.
+   * === VIVENTIUM END === */
+  const credentialPolicy = await resolveConnectedAccountCredentialPolicy({
+    userId: req.user?.id ?? '',
+    provider: 'anthropic',
+    db,
+  });
+  const personalCredentialsRequired = credentialPolicy === 'personal_required';
 
   let credentials: Record<string, unknown> = {};
   let vertexOptions: { region?: string; projectId?: string } | undefined;
@@ -117,6 +130,12 @@ export async function initializeAnthropic({
   // When vertexConfig exists and enabled is not explicitly false, Vertex AI is enabled
   const useVertexAI =
     (vertexConfig && vertexConfig.enabled !== false) || isEnabled(process.env.ANTHROPIC_USE_VERTEX);
+
+  /* === VIVENTIUM START === Personal-required credential policy === */
+  if (useVertexAI && personalCredentialsRequired) {
+    throw anthropicConnectedAccountReconnectError();
+  }
+  /* === VIVENTIUM END === */
 
   if (useVertexAI) {
     // Load credentials with optional YAML config overrides
@@ -160,31 +179,39 @@ export async function initializeAnthropic({
           }
         } catch (legacyError) {
           if (isAnthropicConnectedAccountReadError(legacyError)) {
-            if (isConnectedAccountAuthMode()) {
+            /* === VIVENTIUM START === Personal-required credential policy === */
+            if (personalCredentialsRequired || isConnectedAccountAuthMode()) {
               throw anthropicConnectedAccountReconnectError();
             }
+            /* === VIVENTIUM END === */
           } else if (!isNoUserKeyError(legacyError)) {
             throw legacyError;
           }
         }
       } else if (isAnthropicConnectedAccountReadError(error)) {
-        if (isConnectedAccountAuthMode()) {
+        /* === VIVENTIUM START === Personal-required credential policy === */
+        if (personalCredentialsRequired || isConnectedAccountAuthMode()) {
           throw anthropicConnectedAccountReconnectError();
         }
+        /* === VIVENTIUM END === */
       } else if (!isNoUserKeyError(error)) {
         throw error;
       }
     }
 
-    if (!anthropicApiKey) {
+    /* === VIVENTIUM START === Personal-required credential policy === */
+    if (!anthropicApiKey && !personalCredentialsRequired) {
       anthropicApiKey = isUserProvided ? undefined : ANTHROPIC_API_KEY;
     }
+    /* === VIVENTIUM END === */
 
     if (!anthropicApiKey) {
+      /* === VIVENTIUM START === Personal-required credential policy === */
+      if (personalCredentialsRequired || (isUserProvided && isConnectedAccountAuthMode())) {
+        throw anthropicConnectedAccountReconnectError();
+      }
+      /* === VIVENTIUM END === */
       if (isUserProvided) {
-        if (isConnectedAccountAuthMode()) {
-          throw anthropicConnectedAccountReconnectError();
-        }
         throw new Error(
           JSON.stringify({
             type: ErrorTypes.NO_USER_KEY,

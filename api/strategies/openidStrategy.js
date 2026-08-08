@@ -27,6 +27,13 @@ const {
   markUserPendingApproval,
   notifyAdminRegistration,
 } = require('~/server/services/viventium/registrationApprovalService');
+/* === VIVENTIUM START ===
+ * Feature: Shared-OIDC GlassHive principal backfill on authenticated login.
+ */
+const {
+  glassHivePrincipalIdFromClaims,
+} = require('~/server/services/viventium/GlassHiveSharedOidcIdentity');
+/* === VIVENTIUM END === */
 const getLogStores = require('~/cache/getLogStores');
 
 /**
@@ -368,6 +375,11 @@ async function processOpenIDAuth(tokenset, existingUsersOnly = false) {
   }
 
   const fullName = getFullName(userinfo);
+  /* === VIVENTIUM START ===
+   * Feature: Shared-OIDC GlassHive principal backfill on authenticated login.
+   */
+  const viventiumGlassHivePrincipalId = glassHivePrincipalIdFromClaims(userinfo);
+  /* === VIVENTIUM END === */
 
   const requiredRole = process.env.OPENID_REQUIRED_ROLE;
   if (requiredRole) {
@@ -428,6 +440,9 @@ async function processOpenIDAuth(tokenset, existingUsersOnly = false) {
       emailVerified: userinfo.email_verified || false,
       name: fullName,
       idOnTheSource: userinfo.oid,
+      /* === VIVENTIUM START === Shared-OIDC GlassHive identity. === */
+      ...(viventiumGlassHivePrincipalId ? { viventiumGlassHivePrincipalId } : {}),
+      /* === VIVENTIUM END === */
     };
 
     const balanceConfig = getBalanceConfig(appConfig);
@@ -451,6 +466,11 @@ async function processOpenIDAuth(tokenset, existingUsersOnly = false) {
     user.username = username;
     user.name = fullName;
     user.idOnTheSource = userinfo.oid;
+    /* === VIVENTIUM START === Shared-OIDC GlassHive existing-user backfill. === */
+    if (viventiumGlassHivePrincipalId) {
+      user.viventiumGlassHivePrincipalId = viventiumGlassHivePrincipalId;
+    }
+    /* === VIVENTIUM END === */
     if (email && email !== user.email) {
       user.email = email;
       user.emailVerified = userinfo.email_verified || false;

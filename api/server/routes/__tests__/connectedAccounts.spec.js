@@ -1,9 +1,10 @@
 const express = require('express');
 const request = require('supertest');
-const jwt = require('jsonwebtoken');
-const { EModelEndpoint } = require('librechat-data-provider');
+const { EModelEndpoint, ErrorTypes } = require('librechat-data-provider');
 
 jest.mock('~/models', () => ({
+  deleteUserKey: jest.fn(),
+  getUserKey: jest.fn(),
   updateUserKey: jest.fn(),
 }));
 
@@ -27,6 +28,8 @@ jest.mock('@librechat/api', () => ({
 describe('Connected Accounts Routes', () => {
   let app;
   let router;
+  let deleteUserKey;
+  let getUserKey;
   let updateUserKey;
 
   beforeEach(() => {
@@ -40,7 +43,7 @@ describe('Connected Accounts Routes', () => {
 
     global.fetch = jest.fn();
 
-    ({ updateUserKey } = require('~/models'));
+    ({ deleteUserKey, getUserKey, updateUserKey } = require('~/models'));
     router = require('../connectedAccounts');
     app = express();
     app.use(express.json());
@@ -55,6 +58,93 @@ describe('Connected Accounts Routes', () => {
     delete process.env.VIVENTIUM_ANTHROPIC_OAUTH_REDIRECT_URI;
     delete process.env.VIVENTIUM_OPENAI_LOCAL_CALLBACK_MANUAL_ONLY;
     delete process.env.VIVENTIUM_CONNECTED_ACCOUNTS_RETURN_ORIGIN;
+    delete process.env.VIVENTIUM_CONNECTED_ACCOUNTS_ENABLED;
+  });
+
+  it('should persist and report a personal-required credential policy per user and provider', async () => {
+    getUserKey.mockResolvedValueOnce('personal_required');
+
+    const updateResponse = await request(app)
+      .put('/api/connected-accounts/openai/policy')
+      .send({ policy: 'personal_required' });
+    const readResponse = await request(app).get('/api/connected-accounts/openai/policy');
+
+    expect(updateResponse.status).toBe(200);
+    expect(updateUserKey).toHaveBeenCalledWith({
+      userId: 'test-user-id',
+      name: 'viventium:connected-account-policy:openai',
+      value: 'personal_required',
+      expiresAt: null,
+    });
+    expect(readResponse.status).toBe(200);
+    expect(readResponse.body).toEqual({ policy: 'personal_required' });
+  });
+
+  it('should allow personal-required recovery when setup is disabled but a credential is already saved', async () => {
+    process.env.VIVENTIUM_CONNECTED_ACCOUNTS_ENABLED = 'false';
+    process.env.VIVENTIUM_LOCAL_SUBSCRIPTION_AUTH = 'false';
+    getUserKey.mockResolvedValueOnce('synthetic-saved-personal-credential');
+
+    const response = await request(app)
+      .put('/api/connected-accounts/openai/policy')
+      .send({ policy: 'personal_required' });
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ policy: 'personal_required' });
+    expect(updateUserKey).toHaveBeenCalledWith({
+      userId: 'test-user-id',
+      name: 'viventium:connected-account-policy:openai',
+      value: 'personal_required',
+      expiresAt: null,
+    });
+  });
+
+  it('should reject personal-required mode when setup is disabled and no personal credential exists', async () => {
+    process.env.VIVENTIUM_CONNECTED_ACCOUNTS_ENABLED = 'false';
+    process.env.VIVENTIUM_LOCAL_SUBSCRIPTION_AUTH = 'false';
+    getUserKey.mockRejectedValueOnce(
+      new Error(JSON.stringify({ type: ErrorTypes.NO_USER_KEY })),
+    );
+
+    const response = await request(app)
+      .put('/api/connected-accounts/anthropic/policy')
+      .send({ policy: 'personal_required' });
+
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({ error: 'personal_credential_unavailable' });
+    expect(updateUserKey).not.toHaveBeenCalled();
+  });
+
+  it('should report the backward-compatible preferred policy when no override exists', async () => {
+    getUserKey.mockRejectedValueOnce(new Error(JSON.stringify({ type: ErrorTypes.NO_USER_KEY })));
+
+    const response = await request(app).get('/api/connected-accounts/openai/policy');
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ policy: 'personal_preferred' });
+  });
+
+  it('should restore backward-compatible platform fallback by deleting the policy override', async () => {
+    const response = await request(app)
+      .put('/api/connected-accounts/anthropic/policy')
+      .send({ policy: 'personal_preferred' });
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ policy: 'personal_preferred' });
+    expect(deleteUserKey).toHaveBeenCalledWith({
+      userId: 'test-user-id',
+      name: 'viventium:connected-account-policy:anthropic',
+    });
+  });
+
+  it('should reject unsupported connected-account credential policies', async () => {
+    const response = await request(app)
+      .put('/api/connected-accounts/openai/policy')
+      .send({ policy: 'platform_required' });
+
+    expect(response.status).toBe(400);
+    expect(updateUserKey).not.toHaveBeenCalled();
+    expect(deleteUserKey).not.toHaveBeenCalled();
   });
 
   it('should return an OAuth authorization URL for OpenAI with local callback flow mode', async () => {
@@ -83,19 +173,36 @@ describe('Connected Accounts Routes', () => {
     expect(response.body.authUrl).toContain('code_challenge=');
     expect(response.body.flowMode).toBe('manual_code');
     expect(typeof state).toBe('string');
-    expect(state).not.toContain('.');
+    expect(state.split('.')).toHaveLength(4);
+    expect(state).not.toContain('test-user-id');
   });
 
-  it('should use the configured connected-account return origin without changing DOMAIN_SERVER', async () => {
+  it('should keep OAuth state confidential without changing the trusted return origin', async () => {
     process.env.VIVENTIUM_CONNECTED_ACCOUNTS_RETURN_ORIGIN = 'http://localhost:3190/';
+    global.fetch.mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () =>
+        JSON.stringify({
+          access_token: 'header.payload.signature',
+          refresh_token: 'refresh-token',
+          expires_in: 3600,
+        }),
+    });
 
-    const response = await request(app).get('/api/connected-accounts/openai/start');
-    const authUrl = new URL(response.body.authUrl);
+    const startResponse = await request(app).get('/api/connected-accounts/openai/start');
+    const authUrl = new URL(startResponse.body.authUrl);
     const state = authUrl.searchParams.get('state');
-    const decoded = jwt.decode(state);
+    const response = await request(app).get('/api/connected-accounts/openai/callback').query({
+      code: 'auth-code',
+      state,
+    });
 
-    expect(response.status).toBe(200);
-    expect(decoded.serverOrigin).toBe('http://localhost:3190');
+    expect(startResponse.status).toBe(200);
+    expect(state).not.toContain('test-user-id');
+    expect(state).not.toContain('localhost');
+    expect(response.status).toBe(302);
+    expect(response.headers.location).toContain('/oauth/success');
     expect(process.env.DOMAIN_SERVER).toBe('https://chat.viventium.ai');
   });
 

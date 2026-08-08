@@ -2,9 +2,15 @@
  * Feature: Connected Accounts fallback routing tests.
  * Purpose: Verify user-first/admin-fallback credential resolution for Anthropic initialization.
  * === VIVENTIUM END === */
-import { AuthKeys, ErrorTypes, EModelEndpoint } from 'librechat-data-provider';
+import {
+  AuthKeys,
+  ErrorTypes,
+  EModelEndpoint,
+  connectedAccountCredentialPolicyKey,
+} from 'librechat-data-provider';
 import type { BaseInitializeParams } from '~/types';
 import { initializeAnthropic } from './initialize';
+import { loadAnthropicVertexCredentials } from './vertex';
 import { checkUserKeyExpiry } from '~/utils';
 
 const mockGetLLMConfig = jest.fn(
@@ -32,6 +38,7 @@ jest.mock('~/utils', () => ({
 }));
 
 const mockedCheckUserKeyExpiry = jest.mocked(checkUserKeyExpiry);
+const mockedLoadAnthropicVertexCredentials = jest.mocked(loadAnthropicVertexCredentials);
 
 const createParams = (
   overrides: Partial<{
@@ -160,6 +167,56 @@ describe('initializeAnthropic', () => {
     );
   });
 
+  it('should not fallback to the platform key when personal credentials are required', async () => {
+    const params = createParams({
+      dbOverrides: {
+        getUserKey: jest.fn().mockResolvedValue('personal_required'),
+      },
+    });
+
+    await expect(initializeAnthropic(params)).rejects.toThrow(
+      'Anthropic connected account needs reconnect in Settings > Account > Connected Accounts.',
+    );
+    expect(mockGetLLMConfig).not.toHaveBeenCalled();
+  });
+
+  it('should preserve platform fallback when personal credentials are only preferred', async () => {
+    const params = createParams({
+      dbOverrides: {
+        getUserKey: jest.fn().mockResolvedValue('personal_preferred'),
+      },
+    });
+
+    await initializeAnthropic(params);
+
+    expect(mockGetLLMConfig).toHaveBeenCalledWith(
+      expect.objectContaining({
+        [AuthKeys.ANTHROPIC_API_KEY]: 'platform-anthropic-key',
+      }),
+      expect.any(Object),
+    );
+  });
+
+  it('should not use shared Vertex credentials when personal credentials are required', async () => {
+    const params = createParams({
+      dbOverrides: {
+        getUserKey: jest.fn().mockResolvedValue('personal_required'),
+      },
+    });
+    params.req.config = {
+      endpoints: {
+        [EModelEndpoint.anthropic]: {
+          vertexConfig: { enabled: true },
+        },
+      },
+    } as BaseInitializeParams['req']['config'];
+
+    await expect(initializeAnthropic(params)).rejects.toThrow(
+      'Anthropic connected account needs reconnect in Settings > Account > Connected Accounts.',
+    );
+    expect(mockedLoadAnthropicVertexCredentials).not.toHaveBeenCalled();
+  });
+
   it('should throw NO_USER_KEY when endpoint is strictly user_provided and user key is missing', async () => {
     process.env.ANTHROPIC_API_KEY = 'user_provided';
     const params = createParams();
@@ -247,7 +304,12 @@ describe('initializeAnthropic', () => {
             }),
           ),
         ),
-        getUserKey: jest.fn().mockResolvedValue('legacy-anthropic-key'),
+        getUserKey: jest.fn().mockImplementation(({ name }: { name: string }) => {
+          if (name === connectedAccountCredentialPolicyKey('anthropic')) {
+            throw new Error(JSON.stringify({ type: ErrorTypes.NO_USER_KEY }));
+          }
+          return 'legacy-anthropic-key';
+        }),
       },
     });
 
@@ -289,16 +351,16 @@ describe('initializeAnthropic', () => {
 
     await initializeAnthropic(params);
 
-      expect(mockFetch).toHaveBeenCalledWith(
-        'https://platform.claude.com/v1/oauth/token',
-        expect.objectContaining({
-          method: 'POST',
-          headers: expect.objectContaining({
-            'Content-Type': 'application/x-www-form-urlencoded',
-          }),
-          body: expect.any(URLSearchParams),
+    expect(mockFetch).toHaveBeenCalledWith(
+      'https://platform.claude.com/v1/oauth/token',
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({
+          'Content-Type': 'application/x-www-form-urlencoded',
         }),
-      );
+        body: expect.any(URLSearchParams),
+      }),
+    );
     expect((mockFetch.mock.calls[0]?.[1] as RequestInit | undefined)?.body?.toString()).toContain(
       'grant_type=refresh_token',
     );

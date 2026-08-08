@@ -41,6 +41,11 @@ from .models import (
     ScheduleTask,
 )
 from .scheduler import SchedulerEngine, compute_next_run, compute_next_runs
+from .dispatch import _patch_private_run_detail
+from .glasshive_workspace_schedules import (
+    GlassHiveWorkspaceScheduleService,
+    WorkspaceScheduleError,
+)
 from .storage import ScheduleStorage, StorageConfig
 from .utils import to_utc_iso
 
@@ -49,6 +54,48 @@ HEADER_USER_ID = "x-viventium-user-id"
 HEADER_AGENT_ID = "x-viventium-agent-id"
 
 logger = logging.getLogger(__name__)
+
+
+def _metadata_with_required_capability_servers(
+    metadata: Any,
+    required_capability_servers: list[str] | None,
+    *,
+    executor: str,
+) -> Dict[str, Any]:
+    """Persist the schedule-authoring selection that fire-time grants consume.
+
+    The typed top-level field owns this value. Callers cannot smuggle a broader selection through
+    free-form metadata, and a GlassHive capability selection cannot be attached to another executor.
+    """
+
+    base = dict(metadata) if isinstance(metadata, dict) else {}
+    workbench = base.get("workbench_scheduled_prompt")
+    workbench = dict(workbench) if isinstance(workbench, dict) else {}
+    values = list(required_capability_servers or [])
+    if values and executor != "glasshive_host":
+        raise ValueError("required_capability_servers requires executor='glasshive_host'")
+    if values:
+        workbench["required_capability_servers"] = values
+    else:
+        workbench.pop("required_capability_servers", None)
+        workbench.pop("required_capability_server_names", None)
+    if workbench:
+        base["workbench_scheduled_prompt"] = workbench
+    else:
+        base.pop("workbench_scheduled_prompt", None)
+    return base
+
+
+def _required_capability_servers_from_metadata(metadata: Any) -> list[str]:
+    if not isinstance(metadata, dict):
+        return []
+    workbench = metadata.get("workbench_scheduled_prompt")
+    if not isinstance(workbench, dict):
+        return []
+    values = workbench.get("required_capability_servers")
+    if not isinstance(values, list):
+        return []
+    return [str(value) for value in values]
 
 
 def _default_scheduling_db_path() -> str:
@@ -488,6 +535,7 @@ def build_health_payload(storage: ScheduleStorage) -> Dict[str, Any]:
 
 def build_server(storage: ScheduleStorage) -> FastMCP:
     mcp = FastMCP(name="scheduling-cortex", instructions=SCHEDULING_CORTEX_INSTRUCTIONS)
+    glasshive_workspace_schedules = GlassHiveWorkspaceScheduleService(storage)
 
     # VIVENTIUM NOTE: Add public-safe runtime identity for launcher probes.
     @mcp.custom_route("/health", methods=["GET"])
@@ -732,6 +780,9 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             error_class = run.get("error_class")
 
         private_detail = _append_private_callback(run, payload, now)
+        # GlassHive now mints and revokes capability grants inside the execution boundary. Scheduling
+        # Cortex persists only identity/work references and must never receive broker credentials.
+        capability_revocation: Dict[str, Any] | None = None
         memory_apply = _maybe_apply_governed_memory(run, private_detail) if event == "run.completed" else None
         if memory_apply and not memory_apply.get("ok"):
             error_class = str(memory_apply.get("reason") or "memory_apply_blocked")
@@ -748,6 +799,11 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             "message_hash": _hash_payload_text(payload),
             "has_private_payload": bool(payload.get("message") or payload.get("full_message") or payload.get("error")),
             "memory_apply_reason": memory_apply.get("reason") if isinstance(memory_apply, dict) else None,
+            "capability_revocation_status": (
+                capability_revocation.get("status")
+                if isinstance(capability_revocation, dict)
+                else None
+            ),
             "effort_projection": {
                 "requested": str((payload.get("effort_projection") or {}).get("requested") or "")[:32],
                 "effective": str((payload.get("effort_projection") or {}).get("effective") or "")[:32],
@@ -781,6 +837,80 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
         if event == "run.completed":
             _refresh_workbench_periphery_index(run)
         return JSONResponse({"status": "ok", "run_id": run["run_id"]})
+    # === VIVENTIUM END ===
+
+    # === VIVENTIUM START ===
+    # Feature: Authoritative GlassHive workspace recurrence owner.
+    # Purpose: Viventium keeps one durable definition and one polling engine in Scheduling Cortex.
+    @mcp.custom_route("/internal/glasshive/recurring-schedules", methods=["POST"])
+    async def glasshive_recurring_schedules(request: Request) -> Response:
+        expected_secret = str(os.getenv("VIVENTIUM_SCHEDULER_SECRET") or "").strip()
+        provided_secret = str(request.headers.get("x-viventium-scheduler-secret") or "").strip()
+        if not expected_secret:
+            return JSONResponse(
+                {"error": "Viventium Scheduling Cortex owner is unavailable", "code": "owner_unavailable"},
+                status_code=503,
+            )
+        if not provided_secret or not hmac.compare_digest(provided_secret, expected_secret):
+            return JSONResponse(
+                {"error": "Unauthorized scheduling owner request", "code": "owner_unauthorized"},
+                status_code=401,
+            )
+        raw = await request.body()
+        if len(raw) > 1_048_576:
+            return JSONResponse(
+                {"error": "Scheduling owner request is too large", "code": "invalid_schedule"},
+                status_code=413,
+            )
+        try:
+            body = json.loads(raw.decode("utf-8")) if raw else {}
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return JSONResponse(
+                {"error": "Scheduling owner request is invalid", "code": "invalid_schedule"},
+                status_code=400,
+            )
+        if not isinstance(body, dict) or not isinstance(body.get("payload"), dict):
+            return JSONResponse(
+                {"error": "Scheduling owner request is invalid", "code": "invalid_schedule"},
+                status_code=400,
+            )
+        tenant_id = str(body.get("tenant_id") or "").strip()
+        owner_id = str(body.get("owner_id") or "").strip()
+        agent_id = str(body.get("agent_id") or "scheduling-cortex").strip()
+        asserted_tenant = str(request.headers.get("x-viventium-tenant-id") or "").strip()
+        asserted_owner = str(request.headers.get("x-viventium-user-id") or "").strip()
+        asserted_agent = str(request.headers.get("x-viventium-agent-id") or "").strip()
+        if (
+            not tenant_id
+            or not owner_id
+            or tenant_id != asserted_tenant
+            or owner_id != asserted_owner
+            or (asserted_agent and agent_id != asserted_agent)
+        ):
+            return JSONResponse(
+                {"error": "Scheduling owner identity does not match", "code": "owner_identity_mismatch"},
+                status_code=403,
+            )
+        try:
+            result = glasshive_workspace_schedules.handle(
+                str(body.get("action") or "").strip(),
+                body["payload"],
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                agent_id=agent_id,
+            )
+            return JSONResponse({"result": result})
+        except WorkspaceScheduleError as exc:
+            return JSONResponse(
+                {"error": str(exc), "code": exc.code},
+                status_code=exc.status,
+            )
+        except Exception:
+            logger.exception("[scheduling-cortex] GlassHive recurrence owner request failed")
+            return JSONResponse(
+                {"error": "Viventium Scheduling Cortex request failed", "code": "owner_failed"},
+                status_code=503,
+            )
     # === VIVENTIUM END ===
 
     # === VIVENTIUM NOTE ===
@@ -969,6 +1099,11 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
         elif not next_run:
             raise ValueError("Unable to compute next_run_at for schedule")
 
+        metadata = _metadata_with_required_capability_servers(
+            args.metadata,
+            args.required_capability_servers,
+            executor=args.executor,
+        )
         task = {
             "id": str(uuid.uuid4()),
             "user_id": user_id,
@@ -1002,7 +1137,7 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             "last_generated_text": None,
             "last_delivery": None,
             # === VIVENTIUM NOTE ===
-            "metadata": args.metadata,
+            "metadata": metadata or None,
         }
 
         storage.create_task(task)
@@ -1158,6 +1293,21 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
                 f"run_at {run_at} must be in the future (now: {to_utc_iso(now)})"
             )
 
+        effective_executor = args.executor or str(existing.get("executor") or "viventium_agent")
+        current_required_capabilities = _required_capability_servers_from_metadata(
+            existing.get("metadata")
+        )
+        selected_required_capabilities = (
+            current_required_capabilities
+            if args.required_capability_servers is None
+            else args.required_capability_servers
+        )
+        effective_metadata = _metadata_with_required_capability_servers(
+            args.metadata if args.metadata is not None else existing.get("metadata"),
+            selected_required_capabilities,
+            executor=effective_executor,
+        )
+
         updates: Dict[str, Any] = {
             "updated_at": to_utc_iso(now),
             "updated_by": updated_by,
@@ -1189,8 +1339,12 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             updates["conversation_id"] = args.conversation_id
         if args.active is not None:
             updates["active"] = 1 if args.active else 0
-        if args.metadata is not None:
-            updates["metadata"] = args.metadata
+        if (
+            args.metadata is not None
+            or args.required_capability_servers is not None
+            or args.executor is not None
+        ):
+            updates["metadata"] = effective_metadata or None
         if args.schedule is not None:
             updates["schedule"] = schedule
             updates["next_run_at"] = to_utc_iso(next_run) if next_run else None

@@ -6,14 +6,26 @@
  * - Keep the worker's prompt context compact while machine-readable MCP setup lives in bootstrap.
  * === VIVENTIUM END === */
 
+/* === VIVENTIUM START === Scheduled/direct exact-scope grant identifiers. === */
+const crypto = require('crypto');
+/* === VIVENTIUM END === */
 const { logger } = require('@librechat/data-schemas');
 const { getMCPServersRegistry } = require('~/config');
+/* === VIVENTIUM START === Fire-time user-scoped OAuth readiness. === */
+const { inspectStoredOAuthCredentialState } = require('~/server/services/Tools/mcp');
+/* === VIVENTIUM END === */
 const {
   collectAllowedServerEntries,
   isBrokerProjectionEnabled,
   shouldGrantContentReadScope,
 } = require('./GlassHiveCapabilityPolicyService');
-const { mintBrokerGrant } = require('./GlassHiveCapabilityBrokerAuth');
+/* === VIVENTIUM START === Scheduled/direct mint and exact revoke boundary. === */
+const {
+  mintBrokerGrant,
+  revokeBrokerGrant,
+  resolveBrokerTenantId,
+} = require('./GlassHiveCapabilityBrokerAuth');
+/* === VIVENTIUM END === */
 const { pinFeelingCapsuleLast } = require('./feelingPromptTail');
 const { logFeelingsEvent, summarizeFeelingCapsulePlacement } = require('./feelingsTelemetry');
 
@@ -197,6 +209,584 @@ function grantRenewableTtlSecondsForTool(toolName, args = {}) {
   );
   return Math.max(base, Math.min(Math.max(base, defaultRenewable), maxRenewable));
 }
+
+/* === VIVENTIUM START ===
+ * Feature: Fire-time scheduled and direct worker capability grants.
+ * Purpose: Re-evaluate the authenticated user's current reviewed MCP policy and OAuth readiness
+ * when a schedule fires; no broker token is persisted in Scheduling Cortex.
+ */
+class ScheduledGlassHiveCapabilityError extends Error {
+  constructor(message, { code, status = 400, serverNames = [] } = {}) {
+    super(message);
+    this.name = 'ScheduledGlassHiveCapabilityError';
+    this.code = String(code || 'scheduled_capability_error');
+    this.status = Number(status) || 400;
+    this.serverNames = Array.from(
+      new Set((serverNames || []).map((value) => String(value || '').trim()).filter(Boolean)),
+    ).sort();
+  }
+}
+
+function normalizeScheduleScope(value, fieldName) {
+  const normalized = String(value || '').trim();
+  if (!normalized || normalized.length > 200 || !/^[A-Za-z0-9_.:-]+$/.test(normalized)) {
+    throw new ScheduledGlassHiveCapabilityError(`${fieldName} is invalid`, {
+      code: `invalid_${fieldName.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`)}`,
+      status: 400,
+    });
+  }
+  return normalized;
+}
+
+function scheduledGrantId({ userId, scheduleId, scheduledRunId, executionMode }) {
+  const tenantId = resolveBrokerTenantId();
+  const digest = crypto
+    .createHash('sha256')
+    .update(
+      [tenantId, userId, scheduleId, scheduledRunId, executionMode].map(String).join('\u0000'),
+    )
+    .digest('hex');
+  return `ghcb_sched_${digest}`;
+}
+
+function normalizeRequiredServerNames(values) {
+  if (!Array.isArray(values)) {
+    return [];
+  }
+  return Array.from(
+    new Set(values.map((value) => String(value || '').trim()).filter(Boolean)),
+  ).sort();
+}
+
+class DirectGlassHiveCapabilityError extends Error {
+  constructor(message, { code, status = 400, serverNames = [] } = {}) {
+    super(message);
+    this.name = 'DirectGlassHiveCapabilityError';
+    this.code = String(code || 'direct_capability_error');
+    this.status = Number(status) || 400;
+    this.serverNames = normalizeRequiredServerNames(serverNames);
+  }
+}
+
+function normalizeDirectScope(value, fieldName) {
+  const normalized = String(value || '').trim();
+  if (!normalized || normalized.length > 200 || !/^[A-Za-z0-9_.:-]+$/.test(normalized)) {
+    throw new DirectGlassHiveCapabilityError(`${fieldName} is invalid`, {
+      code: `invalid_${fieldName.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`)}`,
+      status: 400,
+    });
+  }
+  return normalized;
+}
+
+function directGrantId({ userId, workerId, runId, executionMode }) {
+  const tenantId = resolveBrokerTenantId();
+  const digest = crypto
+    .createHash('sha256')
+    .update([tenantId, userId, workerId, runId, executionMode].map(String).join('\u0000'))
+    .digest('hex');
+  return `ghcb_direct_${digest}`;
+}
+
+async function directCapabilityReadiness({ user, executionMode = 'docker' } = {}) {
+  const userId = String(user?.id || user?._id || '').trim();
+  if (!userId) {
+    throw new DirectGlassHiveCapabilityError('GlassHive capability owner is not mapped', {
+      code: 'owner_binding_required',
+      status: 409,
+    });
+  }
+  const cleanExecutionMode = normalizeExecutionMode(executionMode);
+  if (!cleanExecutionMode) {
+    throw new DirectGlassHiveCapabilityError('executionMode must be host or docker', {
+      code: 'invalid_execution_mode',
+      status: 400,
+    });
+  }
+  if (!isBrokerProjectionEnabled()) {
+    return { status: 'broker_unavailable', reason: 'broker_disabled', connections: [] };
+  }
+
+  let mcpConfig;
+  try {
+    mcpConfig = await getMCPServersRegistry().getAllServerConfigs(userId);
+  } catch (error) {
+    logger.warn('[VIVENTIUM][glasshive-capability-broker] Direct readiness unavailable', {
+      userId,
+      message: error?.message,
+    });
+    return { status: 'broker_unavailable', reason: 'registry_unavailable', connections: [] };
+  }
+  const reviewedEntries = collectAllowedServerEntries({
+    mcpConfig: mcpConfig || {},
+    executionMode: cleanExecutionMode,
+  });
+  const connections = [];
+  const readyEntries = [];
+  for (const entry of reviewedEntries) {
+    const requiresOAuth = Boolean(
+      entry?.serverConfig?.requiresOAuth || entry?.serverConfig?.oauthMetadata,
+    );
+    let status = 'ready';
+    if (requiresOAuth) {
+      try {
+        const credential = await inspectStoredOAuthCredentialState(userId, entry.serverName);
+        status = credential?.status === 'credential_present' ? 'ready' : 'action_required';
+      } catch (error) {
+        logger.warn('[VIVENTIUM][glasshive-capability-broker] Direct OAuth readiness failed', {
+          userId,
+          serverName: entry.serverName,
+          message: error?.message,
+        });
+        status = 'action_required';
+      }
+    }
+    if (status === 'ready') {
+      readyEntries.push(entry);
+    }
+    connections.push({
+      connection_id: `librechat:${entry.serverName}`,
+      label: String(entry?.serverConfig?.title || entry?.serverConfig?.name || entry.serverName),
+      kind: String(entry.serverName),
+      adapter: 'librechat_capability_broker',
+      status,
+    });
+  }
+  const status =
+    connections.length === 0
+      ? 'no_connections'
+      : connections.some((item) => item.status === 'action_required')
+        ? readyEntries.length
+          ? 'degraded'
+          : 'action_required'
+        : 'ready';
+  return {
+    status,
+    reason: status === 'action_required' ? 'connected_account_action_required' : '',
+    connections,
+    readyEntries,
+  };
+}
+
+async function buildDirectGlassHiveCapabilityBundle({
+  user,
+  workerId,
+  runId,
+  executionMode,
+} = {}) {
+  const userId = String(user?.id || user?._id || '').trim();
+  const cleanWorkerId = normalizeDirectScope(workerId, 'workerId');
+  const cleanRunId = normalizeDirectScope(runId, 'runId');
+  const cleanExecutionMode = normalizeExecutionMode(executionMode);
+  if (!cleanExecutionMode) {
+    throw new DirectGlassHiveCapabilityError('executionMode must be host or docker', {
+      code: 'invalid_execution_mode',
+      status: 400,
+    });
+  }
+  const readiness = await directCapabilityReadiness({ user, executionMode: cleanExecutionMode });
+  if (readiness.status === 'broker_unavailable') {
+    throw new DirectGlassHiveCapabilityError('Connected capability broker is unavailable', {
+      code: readiness.reason || 'broker_unavailable',
+      status: 503,
+    });
+  }
+  const readyEntries = readiness.readyEntries || [];
+  const allowedServers = readyEntries.map(({ serverName }) => serverName);
+  if (!allowedServers.length) {
+    const reason =
+      readiness.status === 'action_required'
+        ? 'connected_account_action_required'
+        : 'no_reviewed_capabilities';
+    return {
+      bootstrapBundle: degradedConversationCapabilityBundle(reason),
+      grantRef: null,
+      capabilityStatus: {
+        status: readiness.status,
+        reason,
+        connections: readiness.connections,
+      },
+    };
+  }
+  const contentReadScope = shouldGrantContentReadScope(readyEntries);
+  const grantId = directGrantId({
+    userId,
+    workerId: cleanWorkerId,
+    runId: cleanRunId,
+    executionMode: cleanExecutionMode,
+  });
+  let mintedGrant;
+  try {
+    mintedGrant = mintBrokerGrant({
+      user,
+      grantId,
+      allowedServers,
+      eagerServers: allowedServers,
+      deferredServers: [],
+      executionMode: cleanExecutionMode,
+      requestContext: {
+        worker_id: cleanWorkerId,
+        run_id: cleanRunId,
+        execution_mode: cleanExecutionMode,
+      },
+      ttlSeconds: intEnv('VIVENTIUM_GLASSHIVE_DIRECT_BROKER_TTL_SECONDS', 10 * 60),
+      renewableTtlSeconds: intEnv(
+        'VIVENTIUM_GLASSHIVE_DIRECT_BROKER_RENEWABLE_TTL_SECONDS',
+        24 * 60 * 60,
+      ),
+      allowDynamicPolicyServers: false,
+      scopes: { content_read: contentReadScope },
+    });
+  } catch (error) {
+    logger.warn('[VIVENTIUM][glasshive-capability-broker] Direct grant mint failed', {
+      userId,
+      message: error?.message,
+    });
+    throw new DirectGlassHiveCapabilityError('Connected capability grant is unavailable', {
+      code: 'grant_unavailable',
+      status: 503,
+    });
+  }
+  return {
+    bootstrapBundle: mergeBrokerBundle({
+      existingBundle: {},
+      brokerUrl: resolveBrokerUrl(cleanExecutionMode),
+      grantToken: mintedGrant.token,
+      grantPayload: mintedGrant.payload,
+      allowedServers,
+      eagerServers: allowedServers,
+      deferredServers: [],
+      contentReadScope,
+    }),
+    grantRef: {
+      grant_id: mintedGrant.payload.grant_id,
+      tenant_id: mintedGrant.payload.tenant_id,
+      user_id: userId,
+      worker_id: cleanWorkerId,
+      run_id: cleanRunId,
+      execution_mode: cleanExecutionMode,
+      exp: mintedGrant.payload.exp,
+      renewable_until: mintedGrant.payload.renewable_until,
+    },
+    capabilityStatus: {
+      status: readiness.status,
+      connections: readiness.connections,
+    },
+  };
+}
+
+async function revokeDirectGlassHiveCapabilityGrant({
+  user,
+  workerId,
+  runId,
+  executionMode,
+  grantId,
+  renewableUntil,
+} = {}) {
+  const userId = String(user?.id || user?._id || '').trim();
+  if (!userId) {
+    throw new DirectGlassHiveCapabilityError('GlassHive capability owner is not mapped', {
+      code: 'owner_binding_required',
+      status: 409,
+    });
+  }
+  const cleanWorkerId = normalizeDirectScope(workerId, 'workerId');
+  const cleanRunId = normalizeDirectScope(runId, 'runId');
+  const cleanExecutionMode = normalizeExecutionMode(executionMode);
+  if (!cleanExecutionMode) {
+    throw new DirectGlassHiveCapabilityError('executionMode must be host or docker', {
+      code: 'invalid_execution_mode',
+      status: 400,
+    });
+  }
+  const expectedGrantId = directGrantId({
+    userId,
+    workerId: cleanWorkerId,
+    runId: cleanRunId,
+    executionMode: cleanExecutionMode,
+  });
+  if (String(grantId || '').trim() && String(grantId).trim() !== expectedGrantId) {
+    throw new DirectGlassHiveCapabilityError('Direct capability revoke scope mismatch', {
+      code: 'grant_scope_mismatch',
+      status: 409,
+    });
+  }
+  return revokeBrokerGrant({
+    grant_id: expectedGrantId,
+    renewable_until:
+      Number(renewableUntil) || Math.floor(Date.now() / 1000) + 24 * 60 * 60,
+  });
+}
+
+async function buildScheduledGlassHiveCapabilityBundle({
+  user,
+  scheduleId,
+  scheduledRunId,
+  executionMode,
+  requiredServerNames = [],
+} = {}) {
+  const userId = String(user?.id || user?._id || '').trim();
+  if (!userId) {
+    throw new ScheduledGlassHiveCapabilityError('Scheduled capability grant requires a user', {
+      code: 'user_scope_unavailable',
+      status: 401,
+    });
+  }
+  const cleanScheduleId = normalizeScheduleScope(scheduleId, 'scheduleId');
+  const cleanScheduledRunId = normalizeScheduleScope(scheduledRunId, 'scheduledRunId');
+  const cleanExecutionMode = normalizeExecutionMode(executionMode);
+  if (!cleanExecutionMode) {
+    throw new ScheduledGlassHiveCapabilityError('executionMode must be host or docker', {
+      code: 'invalid_execution_mode',
+      status: 400,
+    });
+  }
+  const required = normalizeRequiredServerNames(requiredServerNames);
+  if (!isBrokerProjectionEnabled()) {
+    if (!required.length) {
+      return {
+        bootstrapBundle: degradedConversationCapabilityBundle('broker_disabled'),
+        grantRef: null,
+        capabilityStatus: { status: 'degraded', reason: 'broker_disabled' },
+      };
+    }
+    throw new ScheduledGlassHiveCapabilityError('Connected capability broker is disabled', {
+      code: 'broker_disabled',
+      status: 503,
+    });
+  }
+
+  let registry;
+  let mcpConfig;
+  try {
+    registry = getMCPServersRegistry();
+    mcpConfig = await registry.getAllServerConfigs(userId);
+  } catch (error) {
+    logger.warn('[VIVENTIUM][glasshive-capability-broker] Scheduled policy refresh failed', {
+      userId,
+      message: error?.message,
+    });
+    if (!required.length) {
+      return {
+        bootstrapBundle: degradedConversationCapabilityBundle('registry_unavailable'),
+        grantRef: null,
+        capabilityStatus: { status: 'degraded', reason: 'registry_unavailable' },
+      };
+    }
+    throw new ScheduledGlassHiveCapabilityError(
+      'Current connected capability policy is unavailable',
+      {
+        code: 'registry_unavailable',
+        status: 503,
+      },
+    );
+  }
+  const reviewedEntries = collectAllowedServerEntries({
+    mcpConfig: mcpConfig || {},
+    executionMode: cleanExecutionMode,
+  });
+  const reviewedByName = new Map(
+    reviewedEntries.map((entry) => [String(entry.serverName || ''), entry]),
+  );
+  const unauthorizedRequired = required.filter((serverName) => !reviewedByName.has(serverName));
+  if (unauthorizedRequired.length) {
+    throw new ScheduledGlassHiveCapabilityError(
+      'A required connected capability is no longer authorized for this worker',
+      {
+        code: 'connected_capability_not_authorized',
+        status: 403,
+        serverNames: unauthorizedRequired,
+      },
+    );
+  }
+
+  const candidates = required.length
+    ? required.map((serverName) => reviewedByName.get(serverName)).filter(Boolean)
+    : reviewedEntries;
+  const availableEntries = [];
+  const unavailableOAuthServers = [];
+  for (const entry of candidates) {
+    const requiresOAuth = Boolean(
+      entry?.serverConfig?.requiresOAuth || entry?.serverConfig?.oauthMetadata,
+    );
+    if (!requiresOAuth) {
+      availableEntries.push(entry);
+      continue;
+    }
+    let credentialState;
+    try {
+      credentialState = await inspectStoredOAuthCredentialState(userId, entry.serverName);
+    } catch (error) {
+      logger.warn('[VIVENTIUM][glasshive-capability-broker] Scheduled OAuth readiness failed', {
+        userId,
+        serverName: entry.serverName,
+        message: error?.message,
+      });
+      credentialState = { status: 'unreadable_credential' };
+    }
+    if (credentialState?.status === 'credential_present') {
+      availableEntries.push(entry);
+    } else {
+      unavailableOAuthServers.push(entry.serverName);
+    }
+  }
+  const unavailableRequired = unavailableOAuthServers.filter((serverName) =>
+    required.includes(serverName),
+  );
+  if (unavailableRequired.length) {
+    throw new ScheduledGlassHiveCapabilityError(
+      'A required connected account must be reconnected before this schedule can run',
+      {
+        code: 'connected_account_action_required',
+        status: 409,
+        serverNames: unavailableRequired,
+      },
+    );
+  }
+
+  const allowedServers = availableEntries.map(({ serverName }) => serverName);
+  if (!allowedServers.length) {
+    const reason = unavailableOAuthServers.length
+      ? 'connected_accounts_unavailable'
+      : 'no_reviewed_capabilities';
+    return {
+      bootstrapBundle: degradedConversationCapabilityBundle(reason),
+      grantRef: null,
+      capabilityStatus: {
+        status: 'degraded',
+        reason,
+        unavailableServerNames: unavailableOAuthServers.sort(),
+      },
+    };
+  }
+  const contentReadScope = shouldGrantContentReadScope(availableEntries);
+  const grantId = scheduledGrantId({
+    userId,
+    scheduleId: cleanScheduleId,
+    scheduledRunId: cleanScheduledRunId,
+    executionMode: cleanExecutionMode,
+  });
+  let mintedGrant;
+  try {
+    mintedGrant = mintBrokerGrant({
+      user,
+      grantId,
+      allowedServers,
+      eagerServers: allowedServers,
+      deferredServers: [],
+      executionMode: cleanExecutionMode,
+      requestContext: {
+        schedule_id: cleanScheduleId,
+        run_id: cleanScheduledRunId,
+        execution_mode: cleanExecutionMode,
+      },
+      ttlSeconds: intEnv('VIVENTIUM_GLASSHIVE_SCHEDULED_BROKER_TTL_SECONDS', 10 * 60),
+      renewableTtlSeconds: intEnv(
+        'VIVENTIUM_GLASSHIVE_SCHEDULED_BROKER_RENEWABLE_TTL_SECONDS',
+        60 * 60,
+      ),
+      allowDynamicPolicyServers: false,
+      scopes: { content_read: contentReadScope },
+    });
+  } catch (error) {
+    logger.warn('[VIVENTIUM][glasshive-capability-broker] Scheduled grant mint failed', {
+      userId,
+      message: error?.message,
+    });
+    if (!required.length) {
+      return {
+        bootstrapBundle: degradedConversationCapabilityBundle('grant_unavailable'),
+        grantRef: null,
+        capabilityStatus: { status: 'degraded', reason: 'grant_unavailable' },
+      };
+    }
+    throw new ScheduledGlassHiveCapabilityError(
+      'Scheduled connected capability authorization is unavailable',
+      {
+        code: 'grant_unavailable',
+        status: 503,
+        serverNames: required,
+      },
+    );
+  }
+  return {
+    bootstrapBundle: mergeBrokerBundle({
+      existingBundle: {},
+      brokerUrl: resolveBrokerUrl(cleanExecutionMode),
+      grantToken: mintedGrant.token,
+      grantPayload: mintedGrant.payload,
+      allowedServers,
+      eagerServers: allowedServers,
+      deferredServers: [],
+      contentReadScope,
+    }),
+    grantRef: {
+      grant_id: mintedGrant.payload.grant_id,
+      tenant_id: mintedGrant.payload.tenant_id,
+      user_id: userId,
+      schedule_id: cleanScheduleId,
+      run_id: cleanScheduledRunId,
+      execution_mode: cleanExecutionMode,
+      exp: mintedGrant.payload.exp,
+      renewable_until: mintedGrant.payload.renewable_until,
+    },
+    capabilityStatus: {
+      status: unavailableOAuthServers.length ? 'degraded' : 'ready',
+      unavailableServerNames: unavailableOAuthServers.sort(),
+    },
+  };
+}
+
+async function revokeScheduledGlassHiveCapabilityGrant({
+  user,
+  scheduleId,
+  scheduledRunId,
+  executionMode,
+  grantId,
+  renewableUntil,
+} = {}) {
+  const userId = String(user?.id || user?._id || '').trim();
+  if (!userId) {
+    throw new ScheduledGlassHiveCapabilityError('Scheduled capability revoke requires a user', {
+      code: 'user_scope_unavailable',
+      status: 401,
+    });
+  }
+  const cleanScheduleId = normalizeScheduleScope(scheduleId, 'scheduleId');
+  const cleanScheduledRunId = normalizeScheduleScope(scheduledRunId, 'scheduledRunId');
+  const cleanExecutionMode = normalizeExecutionMode(executionMode);
+  if (!cleanExecutionMode) {
+    throw new ScheduledGlassHiveCapabilityError('executionMode must be host or docker', {
+      code: 'invalid_execution_mode',
+      status: 400,
+    });
+  }
+  const expectedGrantId = scheduledGrantId({
+    userId,
+    scheduleId: cleanScheduleId,
+    scheduledRunId: cleanScheduledRunId,
+    executionMode: cleanExecutionMode,
+  });
+  const providedGrantId = String(grantId || '').trim();
+  if (providedGrantId && providedGrantId !== expectedGrantId) {
+    throw new ScheduledGlassHiveCapabilityError('Scheduled capability revoke grant scope mismatch', {
+      code: 'grant_scope_mismatch',
+      status: 409,
+    });
+  }
+  const originalRenewableUntil = Number(renewableUntil);
+  const fallbackRevocationTtlSeconds = intEnv(
+    'VIVENTIUM_GLASSHIVE_SCHEDULED_BROKER_REVOCATION_TTL_SECONDS',
+    24 * 60 * 60,
+  );
+  return revokeBrokerGrant({
+    grant_id: expectedGrantId,
+    renewable_until: Number.isFinite(originalRenewableUntil)
+      ? originalRenewableUntil
+      : Math.floor(Date.now() / 1000) + fallbackRevocationTtlSeconds,
+  });
+}
+/* === VIVENTIUM END === */
 
 function tomlString(value) {
   return JSON.stringify(String(value || ''));
@@ -676,19 +1266,30 @@ async function buildConversationProviderBootstrapBundle({
   /* === VIVENTIUM END === */
 }
 
+/* === VIVENTIUM START === Capability-bootstrap public export contract. === */
 module.exports = {
+  DirectGlassHiveCapabilityError,
   GLASSHIVE_LAUNCH_TOOLS,
+  ScheduledGlassHiveCapabilityError,
   brokerContextBrief,
+  buildDirectGlassHiveCapabilityBundle,
   buildConversationProviderBootstrapBundle,
+  buildScheduledGlassHiveCapabilityBundle,
   configuredGlassHiveServerNames,
   contentReadIntentForArgs,
   grantTtlSecondsForTool,
   grantRenewableTtlSecondsForTool,
+  directCapabilityReadiness,
+  directGrantId,
   maybeInjectGlassHiveCapabilityBroker,
   mergeBrokerBundle,
   mergeWorkerContextBundle,
   isGlassHiveLaunchTool,
   executionModeForBroker,
   resolveBrokerUrl,
+  revokeDirectGlassHiveCapabilityGrant,
+  revokeScheduledGlassHiveCapabilityGrant,
+  scheduledGrantId,
   shouldInjectForTool,
 };
+/* === VIVENTIUM END === */

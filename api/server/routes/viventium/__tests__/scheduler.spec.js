@@ -15,6 +15,8 @@ let mockGetAgent;
 let mockGetJob;
 let mockGetResumeState;
 let mockSubscribe;
+let mockBuildScheduledGlassHiveCapabilityBundle;
+let mockRevokeScheduledGlassHiveCapabilityGrant;
 let lastParentMessageId = null;
 let lastSpec = null;
 let lastAgentId = null;
@@ -106,6 +108,13 @@ jest.mock('~/server/services/TelegramLinkService', () => ({
   resolveTelegramMappingByUserId: (...args) => mockResolveTelegramMappingByUserId(...args),
 }));
 
+jest.mock('~/server/services/viventium/GlassHiveCapabilityBootstrapService', () => ({
+  buildScheduledGlassHiveCapabilityBundle: (...args) =>
+    mockBuildScheduledGlassHiveCapabilityBundle(...args),
+  revokeScheduledGlassHiveCapabilityGrant: (...args) =>
+    mockRevokeScheduledGlassHiveCapabilityGrant(...args),
+}));
+
 function createTestApp(router) {
   const app = express();
   app.use('/api/viventium/scheduler', router);
@@ -191,6 +200,123 @@ function dispatch(app, req, res) {
   });
   return res._done;
 }
+
+describe('/api/viventium/scheduler/glasshive-capabilities', () => {
+  beforeEach(() => {
+    jest.resetModules();
+    mockGetUserById = jest.fn().mockResolvedValue({ _id: 'user_1', role: 'USER' });
+    mockGetMessage = jest.fn().mockResolvedValue(null);
+    mockGetMessages = jest.fn().mockResolvedValue([]);
+    mockGetConvo = jest.fn().mockResolvedValue(null);
+    mockResolveTelegramMappingByUserId = jest.fn().mockResolvedValue(null);
+    mockGetAgent = jest.fn().mockResolvedValue(null);
+    mockGetJob = jest.fn().mockResolvedValue(null);
+    mockGetResumeState = jest.fn().mockResolvedValue(null);
+    mockSubscribe = jest.fn().mockResolvedValue({ unsubscribe: jest.fn() });
+    mockBuildScheduledGlassHiveCapabilityBundle = jest.fn().mockResolvedValue({
+      bootstrapBundle: {
+        env: { GLASSHIVE_CAPABILITY_BROKER_TOKEN: 'ephemeral-token' },
+      },
+      grantRef: {
+        grant_id: 'ghcb_sched_stable',
+        execution_mode: 'host',
+      },
+      capabilityStatus: { status: 'ready' },
+    });
+    mockRevokeScheduledGlassHiveCapabilityGrant = jest
+      .fn()
+      .mockResolvedValue({ revoked: true, grantId: 'ghcb_sched_stable' });
+    process.env.VIVENTIUM_SCHEDULER_SECRET = 'scheduler_secret';
+  });
+
+  test('mints a fire-time grant for the authenticated scheduler user', async () => {
+    const app = createTestApp(require('../scheduler'));
+    const req = createMockReq({
+      url: '/api/viventium/scheduler/glasshive-capabilities/grant',
+      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+      body: {
+        userId: 'user_1',
+        scheduleId: 'schedule-1',
+        scheduledRunId: 'sp_run_1',
+        executionMode: 'host',
+        requiredServerNames: ['ms-365'],
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body.bootstrapBundle.env.GLASSHIVE_CAPABILITY_BROKER_TOKEN).toBe('ephemeral-token');
+    expect(mockBuildScheduledGlassHiveCapabilityBundle).toHaveBeenCalledWith({
+      user: expect.objectContaining({ id: 'user_1' }),
+      scheduleId: 'schedule-1',
+      scheduledRunId: 'sp_run_1',
+      executionMode: 'host',
+      requiredServerNames: ['ms-365'],
+    });
+  });
+
+  test('returns a structured action-required response without minting for another user', async () => {
+    const error = new Error('Reconnect the required account');
+    error.status = 409;
+    error.code = 'connected_account_action_required';
+    error.serverNames = ['ms-365'];
+    mockBuildScheduledGlassHiveCapabilityBundle.mockRejectedValue(error);
+    const app = createTestApp(require('../scheduler'));
+    const req = createMockReq({
+      url: '/api/viventium/scheduler/glasshive-capabilities/grant',
+      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+      body: {
+        userId: 'user_1',
+        scheduleId: 'schedule-1',
+        scheduledRunId: 'sp_run_1',
+        executionMode: 'host',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toEqual({
+      error: 'Scheduled GlassHive capability authorization failed',
+      reason: 'connected_account_action_required',
+      failure_class: 'connected_account_action_required',
+      failure_retryable: false,
+      action_required: true,
+      server_names: ['ms-365'],
+    });
+  });
+
+  test('revokes the exact user/run/mode grant idempotently', async () => {
+    const app = createTestApp(require('../scheduler'));
+    const req = createMockReq({
+      url: '/api/viventium/scheduler/glasshive-capabilities/revoke',
+      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+      body: {
+        userId: 'user_1',
+        scheduleId: 'schedule-1',
+        scheduledRunId: 'sp_run_1',
+        executionMode: 'host',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.body).toEqual({
+      revoked: true,
+      grant_id: 'ghcb_sched_stable',
+    });
+    expect(mockRevokeScheduledGlassHiveCapabilityGrant).toHaveBeenCalledWith({
+      user: expect.objectContaining({ id: 'user_1' }),
+      scheduleId: 'schedule-1',
+      scheduledRunId: 'sp_run_1',
+      executionMode: 'host',
+    });
+  });
+});
 
 describe('/api/viventium/scheduler/telegram/resolve', () => {
   beforeEach(() => {

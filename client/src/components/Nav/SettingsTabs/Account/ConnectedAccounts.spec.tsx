@@ -15,6 +15,43 @@ const mockUseGetEndpointsQuery = jest.fn();
 const mockDisconnect = jest.fn();
 const mockRefetch = jest.fn();
 const mockRequestGet = jest.fn();
+const mockRequestPut = jest.fn();
+const mockShowToast = jest.fn();
+const mockLocalize = (key: string, params?: Record<string, string>) => {
+  if (key === 'com_ui_connected_accounts_use_provider_api_key') {
+    return `Use ${params?.provider} API key`;
+  }
+  const copy: Record<string, string> = {
+    com_ui_openai: 'OpenAI',
+    com_ui_anthropic: 'Anthropic',
+    com_ui_groq: 'Groq',
+    com_ui_xai: 'Grok (xAI)',
+    com_ui_connected_accounts: 'Connected Accounts',
+    com_ui_connected_accounts_description:
+      "Easy Install's optimized Viventium path uses OpenAI today.",
+    com_ui_connected_accounts_disconnect: 'Disconnect',
+    com_ui_connected_accounts_disconnect_local_only:
+      'Disconnect removes this credential from Viventium only. It does not revoke provider access or API keys.',
+    com_ui_connected_accounts_experimental: 'Experimental account connection',
+    com_ui_connected_accounts_experimental_description: 'Optional legacy subscription sign-in.',
+    com_ui_connected_accounts_local_credential_saved: 'Saved locally — send a message to test it',
+    com_ui_connected_accounts_no_local_credential: 'No local credential saved',
+    com_ui_connected_account_source_user:
+      'A local credential is saved. Select this provider in a new chat and send a message to verify access.',
+    com_ui_connected_account_source_none: 'No local credential is configured.',
+    com_ui_connected_account_personal_required: 'Use only my personal credential',
+    com_ui_connected_account_personal_required_description:
+      'Never use the shared platform credential for this provider.',
+    com_ui_connected_account_personal_required_unavailable:
+      'Connect a personal credential before turning on personal-only mode.',
+    com_ui_connected_account_policy_update_error: 'Could not update credential preference.',
+    com_ui_connected_account_policy_loading: 'Loading credential preference…',
+    com_ui_connected_account_policy_unavailable:
+      'Credential preference is unavailable. Try reopening Settings.',
+    com_ui_connected_account_policy_updated: 'Credential preference updated.',
+  };
+  return copy[key] ?? key;
+};
 
 jest.mock('librechat-data-provider', () => ({
   EModelEndpoint: {
@@ -27,6 +64,7 @@ jest.mock('librechat-data-provider', () => ({
   request: {
     get: (...args: unknown[]) => mockRequestGet(...args),
     post: jest.fn(),
+    put: (...args: unknown[]) => mockRequestPut(...args),
   },
 }));
 
@@ -54,7 +92,7 @@ jest.mock('@librechat/client', () => ({
     <label {...props}>{children}</label>
   ),
   Spinner: () => <span data-testid="spinner" />,
-  useToastContext: () => ({ showToast: jest.fn() }),
+  useToastContext: () => ({ showToast: mockShowToast }),
 }));
 
 jest.mock('~/data-provider', () => ({
@@ -79,33 +117,7 @@ jest.mock('~/components/Input/SetKeyDialog', () => ({
     ) : null,
 }));
 
-jest.mock('~/hooks', () => ({
-  useLocalize: () => (key: string, params?: Record<string, string>) => {
-    if (key === 'com_ui_connected_accounts_use_provider_api_key') {
-      return `Use ${params?.provider} API key`;
-    }
-    const copy: Record<string, string> = {
-      com_ui_openai: 'OpenAI',
-      com_ui_anthropic: 'Anthropic',
-      com_ui_groq: 'Groq',
-      com_ui_xai: 'Grok (xAI)',
-      com_ui_connected_accounts: 'Connected Accounts',
-      com_ui_connected_accounts_description:
-        "Easy Install's optimized Viventium path uses OpenAI today.",
-      com_ui_connected_accounts_disconnect: 'Disconnect',
-      com_ui_connected_accounts_disconnect_local_only:
-        'Disconnect removes this credential from Viventium only. It does not revoke provider access or API keys.',
-      com_ui_connected_accounts_experimental: 'Experimental account connection',
-      com_ui_connected_accounts_experimental_description: 'Optional legacy subscription sign-in.',
-      com_ui_connected_accounts_local_credential_saved: 'Saved locally — send a message to test it',
-      com_ui_connected_accounts_no_local_credential: 'No local credential saved',
-      com_ui_connected_account_source_user:
-        'A local credential is saved. Select this provider in a new chat and send a message to verify access.',
-      com_ui_connected_account_source_none: 'No local credential is configured.',
-    };
-    return copy[key] ?? key;
-  },
-}));
+jest.mock('~/hooks', () => ({ useLocalize: () => mockLocalize }));
 
 jest.mock('~/common', () => ({
   NotificationSeverity: { SUCCESS: 'success', ERROR: 'error', INFO: 'info' },
@@ -118,6 +130,13 @@ jest.mock('~/utils', () => ({
 describe('ConnectedAccounts', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockRequestGet.mockImplementation((url: string) => {
+      if (url.endsWith('/policy')) {
+        return Promise.resolve({ policy: 'personal_preferred' });
+      }
+      return Promise.resolve({});
+    });
+    mockRequestPut.mockImplementation((_url: string, payload: unknown) => Promise.resolve(payload));
     mockUseGetEndpointsQuery.mockReturnValue({
       data: {
         openAI: { userProvide: true },
@@ -126,7 +145,7 @@ describe('ConnectedAccounts', () => {
     });
   });
 
-  it('uses API keys by default and describes Disconnect as local-only removal', () => {
+  it('uses API keys by default and describes Disconnect as local-only removal', async () => {
     mockUseGetStartupConfig.mockReturnValue({
       data: {
         viventiumConnectedAccountsEnabled: true,
@@ -135,6 +154,10 @@ describe('ConnectedAccounts', () => {
     });
 
     render(<ConnectedAccounts />);
+
+    await within(screen.getByRole('region', { name: 'OpenAI account' })).findByRole('checkbox', {
+      name: 'Use only my personal credential',
+    });
 
     expect(screen.getAllByText('Saved locally — send a message to test it')).toHaveLength(2);
     expect(
@@ -161,10 +184,10 @@ describe('ConnectedAccounts', () => {
 
     fireEvent.click(within(openAISection).getByRole('button', { name: 'Use OpenAI API key' }));
     expect(screen.getByRole('dialog')).toHaveTextContent('openAI:openAI:disconnect');
-    expect(mockRequestGet).not.toHaveBeenCalled();
+    expect(mockRequestGet).not.toHaveBeenCalledWith(expect.stringContaining('/start'));
   });
 
-  it('opens custom endpoint key forms for Groq and Grok without experimental OAuth', () => {
+  it('opens custom endpoint key forms for Groq and Grok without experimental OAuth', async () => {
     mockUseGetStartupConfig.mockReturnValue({
       data: {
         viventiumConnectedAccountsEnabled: true,
@@ -173,6 +196,10 @@ describe('ConnectedAccounts', () => {
     });
 
     render(<ConnectedAccounts />);
+
+    await within(screen.getByRole('region', { name: 'OpenAI account' })).findByRole('checkbox', {
+      name: 'Use only my personal credential',
+    });
 
     const groqSection = screen.getByRole('region', { name: 'Groq account' });
     fireEvent.click(within(groqSection).getByRole('button', { name: 'Use Groq API key' }));
@@ -194,13 +221,17 @@ describe('ConnectedAccounts', () => {
 
     render(<ConnectedAccounts />);
 
+    await within(screen.getByRole('region', { name: 'OpenAI account' })).findByRole('checkbox', {
+      name: 'Use only my personal credential',
+    });
+
     const groqSection = screen.getByRole('region', { name: 'Groq account' });
     fireEvent.click(within(groqSection).getByRole('button', { name: 'Disconnect' }));
 
     await waitFor(() => expect(mockRefetch).toHaveBeenCalledWith('groq'));
   });
 
-  it('labels and exposes legacy direct OAuth only after explicit opt-in', () => {
+  it('labels and exposes legacy direct OAuth only after explicit opt-in', async () => {
     mockUseGetStartupConfig.mockReturnValue({
       data: {
         viventiumConnectedAccountsEnabled: true,
@@ -210,9 +241,126 @@ describe('ConnectedAccounts', () => {
 
     render(<ConnectedAccounts />);
 
+    await within(screen.getByRole('region', { name: 'OpenAI account' })).findByRole('checkbox', {
+      name: 'Use only my personal credential',
+    });
+
     expect(screen.getAllByText('Experimental account connection')).toHaveLength(3);
     expect(screen.getByText('Optional legacy subscription sign-in.')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Use OpenAI API key' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Use Anthropic API key' })).toBeInTheDocument();
+  });
+
+  it('lets each user require a personal provider credential without changing the default', async () => {
+    mockUseGetStartupConfig.mockReturnValue({
+      data: {
+        viventiumConnectedAccountsEnabled: true,
+        viventiumExperimentalDirectSubscriptionAuth: false,
+      },
+    });
+    mockUseGetEndpointsQuery.mockReturnValue({
+      data: {
+        openAI: { userProvide: false },
+        anthropic: { userProvide: false },
+      },
+    });
+
+    render(<ConnectedAccounts />);
+
+    const openAISection = screen.getByRole('region', { name: 'OpenAI account' });
+    const personalOnly = await within(openAISection).findByRole('checkbox', {
+      name: 'Use only my personal credential',
+    });
+    expect(personalOnly).not.toBeChecked();
+
+    fireEvent.click(personalOnly);
+
+    await waitFor(() =>
+      expect(mockRequestPut).toHaveBeenCalledWith('/api/connected-accounts/openai/policy', {
+        policy: 'personal_required',
+      }),
+    );
+    await waitFor(() => expect(personalOnly).toBeChecked());
+  });
+
+  it('keeps an enforced personal-only policy visible when platform fallback disappears', async () => {
+    mockUseGetStartupConfig.mockReturnValue({
+      data: {
+        viventiumConnectedAccountsEnabled: true,
+        viventiumCredentialPolicyEnabled: true,
+        viventiumExperimentalDirectSubscriptionAuth: false,
+      },
+    });
+    mockRequestGet.mockImplementation((url: string) =>
+      Promise.resolve({
+        policy: url.includes('/openai/') ? 'personal_required' : 'personal_preferred',
+      }),
+    );
+
+    render(<ConnectedAccounts />);
+
+    const openAISection = screen.getByRole('region', { name: 'OpenAI account' });
+    expect(
+      await within(openAISection).findByRole('checkbox', {
+        name: 'Use only my personal credential',
+      }),
+    ).toBeChecked();
+  });
+
+  it('keeps policy controls available when optional connected-account setup is disabled', async () => {
+    mockUseGetStartupConfig.mockReturnValue({
+      data: {
+        viventiumConnectedAccountsEnabled: false,
+        viventiumCredentialPolicyEnabled: true,
+        viventiumExperimentalDirectSubscriptionAuth: false,
+      },
+    });
+
+    render(<ConnectedAccounts />);
+
+    const openAISection = screen.getByRole('region', { name: 'OpenAI account' });
+    expect(
+      await within(openAISection).findByRole('checkbox', {
+        name: 'Use only my personal credential',
+      }),
+    ).toBeEnabled();
+    const anthropicSection = screen.getByRole('region', { name: 'Anthropic account' });
+    expect(
+      within(anthropicSection).getByRole('checkbox', {
+        name: 'Use only my personal credential',
+      }),
+    ).toBeDisabled();
+    expect(
+      within(anthropicSection).getByText(
+        'Connect a personal credential before turning on personal-only mode.',
+      ),
+    ).toBeInTheDocument();
+    expect(within(openAISection).queryByRole('button')).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Groq account' })).not.toBeInTheDocument();
+  });
+
+  it('shows an explicit unavailable state instead of a false unchecked policy', async () => {
+    mockUseGetStartupConfig.mockReturnValue({
+      data: {
+        viventiumConnectedAccountsEnabled: true,
+        viventiumCredentialPolicyEnabled: true,
+        viventiumExperimentalDirectSubscriptionAuth: false,
+      },
+    });
+    mockRequestGet.mockRejectedValue(new Error('policy store unavailable'));
+
+    render(<ConnectedAccounts />);
+
+    const openAISection = screen.getByRole('region', { name: 'OpenAI account' });
+    expect(
+      await within(openAISection).findByText(
+        'Credential preference is unavailable. Try reopening Settings.',
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(openAISection).queryByRole('checkbox', {
+        name: 'Use only my personal credential',
+      }),
+    ).not.toBeInTheDocument();
   });
 });

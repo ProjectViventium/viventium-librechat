@@ -67,11 +67,22 @@ describe('GlassHive capability broker', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    mockGetLogStores.mockImplementation(() => {
+      const store = new Map();
+      return {
+        get: jest.fn((key) => Promise.resolve(store.get(key))),
+        set: jest.fn((key, value) => {
+          store.set(key, value);
+          return Promise.resolve();
+        }),
+      };
+    });
     process.env = {
       ...originalEnv,
       VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET: 'test-broker-secret',
       VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_ENABLED: 'true',
       VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_URL: 'http://broker.example/mcp',
+      GLASSHIVE_ENTERPRISE_TENANT_ID: 'tenant-a',
       VIVENTIUM_GLASSHIVE_BROKER_DISCOVERY_RETRY_DELAY_MS: '0',
     };
     mockGetUserById.mockResolvedValue({ _id: 'user-1', id: 'user-1', role: 'USER' });
@@ -80,6 +91,34 @@ describe('GlassHive capability broker', () => {
 
   afterAll(() => {
     process.env = originalEnv;
+  });
+
+  test('reserves inference requests through the shared atomic counter', async () => {
+    process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_RATE_LIMIT_PER_WINDOW = '2';
+    let count = 0;
+    const reserveWithinLimit = jest.fn(async (_key, limit) => {
+      if (count >= limit) {
+        return { accepted: false, count };
+      }
+      count += 1;
+      return { accepted: true, count };
+    });
+    mockGetLogStores.mockImplementation(() => ({
+      opts: { namespace: 'flows', store: { reserveWithinLimit } },
+    }));
+    const { rememberBrokerRequest } = require('../GlassHiveCapabilityBrokerAuth');
+    const grant = { grant_id: 'ghcb_12345678' };
+
+    const results = await Promise.all([
+      rememberBrokerRequest({ grant, nowMs: 1_000 }),
+      rememberBrokerRequest({ grant, nowMs: 1_000 }),
+      rememberBrokerRequest({ grant, nowMs: 1_000 }),
+    ]);
+
+    expect(results.filter((result) => result.accepted)).toHaveLength(2);
+    expect(results.filter((result) => result.rateLimited)).toHaveLength(1);
+    expect(reserveWithinLimit).toHaveBeenCalledTimes(3);
+    expect(mockGetLogStores.mock.results[0].value.get).toBeUndefined();
   });
 
   test('mints and verifies scoped grants and rejects tampering', () => {
@@ -106,6 +145,192 @@ describe('GlassHive capability broker', () => {
     decoded.user_id = 'user-2';
     const tampered = Buffer.from(JSON.stringify(decoded), 'utf8').toString('base64url');
     expect(() => verifyBrokerGrant(tampered)).toThrow(/signature/);
+  });
+
+  test('binds new grants to tenant and schedule while accepting legacy direct grants', () => {
+    const { mintBrokerGrant, verifyBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
+    const { token, payload } = mintBrokerGrant({
+      user: { id: 'user-1', role: 'USER' },
+      allowedServers: ['ms-365'],
+      requestContext: {
+        schedule_id: 'schedule-1',
+        run_id: 'scheduled-run-1',
+      },
+      grantId: 'ghcb_scheduled_stable',
+      nowMs: 1_000_000,
+    });
+
+    expect(payload.policy_version).toBe(2);
+    expect(payload.tenant_id).toBe('tenant-a');
+    expect(payload.schedule_id).toBe('schedule-1');
+    expect(payload.grant_id).toBe('ghcb_scheduled_stable');
+    expect(
+      verifyBrokerGrant(token, {
+        nowMs: 1_001_000,
+        expectedTenantId: 'tenant-a',
+        expectedUserId: 'user-1',
+      }).run_id,
+    ).toBe('scheduled-run-1');
+    expect(() =>
+      verifyBrokerGrant(token, { nowMs: 1_001_000, expectedTenantId: 'tenant-b' }),
+    ).toThrow(/tenant mismatch/);
+
+    const decoded = JSON.parse(Buffer.from(token, 'base64url').toString('utf8'));
+    delete decoded.tenant_id;
+    delete decoded.schedule_id;
+    decoded.policy_version = 1;
+    const crypto = require('crypto');
+    const stableJson = (value) => {
+      if (Array.isArray(value)) {
+        return `[${value.map((item) => stableJson(item)).join(',')}]`;
+      }
+      if (value && typeof value === 'object') {
+        return `{${Object.keys(value)
+          .sort()
+          .map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`)
+          .join(',')}}`;
+      }
+      return JSON.stringify(value);
+    };
+    delete decoded.sig;
+    decoded.sig = crypto
+      .createHmac('sha256', 'test-broker-secret')
+      .update(stableJson(decoded))
+      .digest('base64url');
+    const legacy = Buffer.from(JSON.stringify(decoded), 'utf8').toString('base64url');
+    expect(
+      verifyBrokerGrant(legacy, {
+        nowMs: 1_001_000,
+        expectedTenantId: 'tenant-a',
+        allowLegacyTenantless: true,
+      }).policy_version,
+    ).toBe(1);
+  });
+
+  test('revokes a grant idempotently and blocks it throughout its renewal window', async () => {
+    const {
+      assertBrokerGrantActive,
+      mintBrokerGrant,
+      revokeBrokerGrant,
+      verifyBrokerGrant,
+    } = require('../GlassHiveCapabilityBrokerAuth');
+    const { token } = mintBrokerGrant({
+      user: { id: 'user-1' },
+      grantId: 'ghcb_revoke_me',
+      ttlSeconds: 60,
+      renewableTtlSeconds: 15 * 60,
+      nowMs: 1_000_000,
+    });
+    const grant = verifyBrokerGrant(token, {
+      nowMs: 1_061_000,
+      allowRenewal: true,
+      expectedTenantId: 'tenant-a',
+    });
+
+    await expect(assertBrokerGrantActive(grant, { nowMs: 1_061_000 })).resolves.toMatchObject({
+      active: true,
+    });
+    await expect(revokeBrokerGrant(grant, { nowMs: 1_061_000 })).resolves.toMatchObject({
+      revoked: true,
+    });
+    await expect(revokeBrokerGrant(grant, { nowMs: 1_062_000 })).resolves.toMatchObject({
+      revoked: true,
+    });
+    await expect(assertBrokerGrantActive(grant, { nowMs: 1_063_000 })).rejects.toThrow(/revoked/);
+  });
+
+  test('mints an idempotent fire-time scheduled bundle from current user policy', async () => {
+    const {
+      buildScheduledGlassHiveCapabilityBundle,
+    } = require('../GlassHiveCapabilityBootstrapService');
+    mockGetMCPServersRegistry.mockReturnValue({
+      getAllServerConfigs: jest.fn().mockResolvedValue({
+        'ms-365': {
+          source: 'config',
+          requiresOAuth: true,
+          viventiumGlassHive: {
+            version: 1,
+            permitsAutonomousWorker: true,
+            hostAllowed: true,
+            sandboxAllowed: true,
+            defaultToolAccess: 'content_read',
+            contentReadPolicy: 'require_broker_grant',
+          },
+        },
+      }),
+    });
+
+    const input = {
+      user: { id: 'user-1', role: 'USER' },
+      scheduleId: 'schedule-1',
+      scheduledRunId: 'scheduled-run-1',
+      executionMode: 'host',
+      requiredServerNames: ['ms-365'],
+    };
+    const first = await buildScheduledGlassHiveCapabilityBundle(input);
+    const retry = await buildScheduledGlassHiveCapabilityBundle(input);
+
+    expect(first.grantRef.grant_id).toBe(retry.grantRef.grant_id);
+    expect(first.grantRef.grant_id).toMatch(/^ghcb_sched_/);
+    expect(first.bootstrapBundle.env.GLASSHIVE_CAPABILITY_BROKER_TOKEN).toEqual(expect.any(String));
+    expect(first.bootstrapBundle.glasshive_capability_broker).toMatchObject({
+      allowed_servers: ['ms-365'],
+      grant_id: first.grantRef.grant_id,
+    });
+    expect(mockInspectStoredOAuthCredentialState).toHaveBeenCalledWith('user-1', 'ms-365');
+  });
+
+  test('scheduled fire-time grant fails closed when required OAuth consent is unavailable', async () => {
+    const {
+      buildScheduledGlassHiveCapabilityBundle,
+    } = require('../GlassHiveCapabilityBootstrapService');
+    mockGetMCPServersRegistry.mockReturnValue({
+      getAllServerConfigs: jest.fn().mockResolvedValue({
+        'ms-365': {
+          source: 'config',
+          requiresOAuth: true,
+          viventiumGlassHive: {
+            version: 1,
+            permitsAutonomousWorker: true,
+            hostAllowed: true,
+            defaultToolAccess: 'content_read',
+          },
+        },
+      }),
+    });
+    mockInspectStoredOAuthCredentialState.mockResolvedValue({ status: 'missing_auth' });
+
+    await expect(
+      buildScheduledGlassHiveCapabilityBundle({
+        user: { id: 'user-1' },
+        scheduleId: 'schedule-1',
+        scheduledRunId: 'scheduled-run-1',
+        executionMode: 'host',
+        requiredServerNames: ['ms-365'],
+      }),
+    ).rejects.toMatchObject({
+      code: 'connected_account_action_required',
+      status: 409,
+      serverNames: ['ms-365'],
+    });
+  });
+
+  test('preserves legacy schedules without declared capabilities when the broker is disabled', async () => {
+    const {
+      buildScheduledGlassHiveCapabilityBundle,
+    } = require('../GlassHiveCapabilityBootstrapService');
+    process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_ENABLED = 'false';
+
+    const result = await buildScheduledGlassHiveCapabilityBundle({
+      user: { id: 'user-1' },
+      scheduleId: 'legacy-schedule-1',
+      scheduledRunId: 'sp_run_legacy',
+      executionMode: 'host',
+    });
+
+    expect(result.grantRef).toBeNull();
+    expect(result.capabilityStatus).toEqual({ status: 'degraded', reason: 'broker_disabled' });
+    expect(result.bootstrapBundle.agents_md).toMatch(/broker is degraded/i);
   });
 
   test('binds content-read scope and bounded renewal to the signed broker grant', () => {
@@ -1627,4 +1852,113 @@ describe('GlassHive capability broker', () => {
 
     expect(catalog.servers.map((server) => server.name)).toEqual(['google_workspace', 'ms-365']);
   });
+
+  /* === VIVENTIUM START ===
+   * Feature: Direct user/worker/run-bound grants and redacted two-user readiness.
+   */
+  test('mints fresh direct grants bound to the verified user, worker, and run', async () => {
+    const {
+      buildDirectGlassHiveCapabilityBundle,
+    } = require('../GlassHiveCapabilityBootstrapService');
+    mockGetMCPServersRegistry.mockReturnValue({
+      getAllServerConfigs: jest.fn().mockResolvedValue({
+        documents: {
+          source: 'config',
+          title: 'Documents',
+          requiresOAuth: true,
+          viventiumGlassHive: {
+            version: 1,
+            permitsAutonomousWorker: true,
+            sandboxAllowed: true,
+            hostAllowed: true,
+            defaultToolAccess: 'content_read',
+          },
+        },
+      }),
+    });
+
+    const first = await buildDirectGlassHiveCapabilityBundle({
+      user: { id: 'user-1', role: 'USER' },
+      workerId: 'worker-a',
+      runId: 'run-a',
+      executionMode: 'docker',
+    });
+    const second = await buildDirectGlassHiveCapabilityBundle({
+      user: { id: 'user-1', role: 'USER' },
+      workerId: 'worker-a',
+      runId: 'run-b',
+      executionMode: 'docker',
+    });
+    const firstGrant = JSON.parse(
+      Buffer.from(
+        first.bootstrapBundle.env.GLASSHIVE_CAPABILITY_BROKER_TOKEN,
+        'base64url',
+      ).toString('utf8'),
+    );
+    const secondGrant = JSON.parse(
+      Buffer.from(
+        second.bootstrapBundle.env.GLASSHIVE_CAPABILITY_BROKER_TOKEN,
+        'base64url',
+      ).toString('utf8'),
+    );
+
+    expect(first.grantRef).toMatchObject({
+      user_id: 'user-1',
+      worker_id: 'worker-a',
+      run_id: 'run-a',
+    });
+    expect(firstGrant.worker_id).toBe('worker-a');
+    expect(firstGrant.run_id).toBe('run-a');
+    expect(secondGrant.run_id).toBe('run-b');
+    expect(firstGrant.grant_id).not.toBe(secondGrant.grant_id);
+    expect(first.capabilityStatus.connections).toEqual([
+      expect.objectContaining({
+        connection_id: 'librechat:documents',
+        status: 'ready',
+      }),
+    ]);
+  });
+
+  test('keeps two users isolated and returns redacted action-required readiness', async () => {
+    const { directCapabilityReadiness } = require('../GlassHiveCapabilityBootstrapService');
+    const getAllServerConfigs = jest.fn(async (userId) => ({
+      [`documents-${userId}`]: {
+        source: 'config',
+        title: `Documents ${userId}`,
+        requiresOAuth: true,
+        viventiumGlassHive: {
+          version: 1,
+          permitsAutonomousWorker: true,
+          sandboxAllowed: true,
+          defaultToolAccess: 'content_read',
+        },
+      },
+    }));
+    mockGetMCPServersRegistry.mockReturnValue({ getAllServerConfigs });
+    mockInspectStoredOAuthCredentialState.mockImplementation(async (userId, serverName) => ({
+      status:
+        userId === 'user-1' && serverName === 'documents-user-1'
+          ? 'credential_present'
+          : 'missing_auth',
+    }));
+
+    const userOne = await directCapabilityReadiness({
+      user: { id: 'user-1' },
+      executionMode: 'docker',
+    });
+    const userTwo = await directCapabilityReadiness({
+      user: { id: 'user-2' },
+      executionMode: 'docker',
+    });
+
+    expect(userOne.connections).toEqual([
+      expect.objectContaining({ kind: 'documents-user-1', status: 'ready' }),
+    ]);
+    expect(userTwo.connections).toEqual([
+      expect.objectContaining({ kind: 'documents-user-2', status: 'action_required' }),
+    ]);
+    expect(userTwo).not.toHaveProperty('token');
+    expect(JSON.stringify(userTwo)).not.toMatch(/credential_present|missing_auth/);
+  });
+  /* === VIVENTIUM END === */
 });

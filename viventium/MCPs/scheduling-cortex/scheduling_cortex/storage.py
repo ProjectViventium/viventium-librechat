@@ -201,11 +201,15 @@ class ScheduleStorage:
               error_class TEXT,
               private_detail_path TEXT,
               callback_payload_json TEXT,
+              claimed_at TEXT,
+              claim_expires_at TEXT,
+              attempt_count INTEGER NOT NULL DEFAULT 0,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             )
             """
         )
+        self._ensure_scheduled_prompt_run_columns(conn)
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_scheduled_prompt_definitions_user ON scheduled_prompt_definitions(user_id)"
         )
@@ -228,6 +232,23 @@ class ScheduleStorage:
         self._sanitize_existing_scheduled_prompt_snapshots(conn)
         self._reconcile_stale_scheduled_prompt_runs(conn)
         # === VIVENTIUM NOTE ===
+
+    @staticmethod
+    def _ensure_scheduled_prompt_run_columns(conn: sqlite3.Connection) -> None:
+        existing = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(scheduled_prompt_runs)").fetchall()
+        }
+        additions = {
+            "claimed_at": "TEXT",
+            "claim_expires_at": "TEXT",
+            "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for name, definition in additions.items():
+            if name not in existing:
+                conn.execute(
+                    f"ALTER TABLE scheduled_prompt_runs ADD COLUMN {name} {definition}"
+                )
 
     @staticmethod
     def _hash_text(value: str) -> str:
@@ -418,6 +439,22 @@ class ScheduleStorage:
         cutoff = now - timedelta(seconds=stale_seconds)
         now_iso = now.isoformat().replace("+00:00", "Z")
         cutoff_iso = cutoff.isoformat().replace("+00:00", "Z")
+        expired_claims = conn.execute(
+            """
+            UPDATE scheduled_prompt_runs
+            SET status = 'failed',
+                completed_at = COALESCE(completed_at, ?),
+                error_class = 'stale_claim_recovered',
+                result_summary = 'Expired occurrence claim recovered for idempotent retry.',
+                updated_at = ?
+            WHERE status = 'dispatching'
+              AND claim_expires_at IS NOT NULL
+              AND claim_expires_at <= ?
+            """,
+            (now_iso, now_iso, now_iso),
+        )
+        if expired_claims.rowcount:
+            logger.info("Recovered %s expired occurrence claim(s)", expired_claims.rowcount)
         cursor = conn.execute(
             """
             UPDATE scheduled_prompt_runs
@@ -696,6 +733,88 @@ class ScheduleStorage:
         # === VIVENTIUM NOTE ===
         return self.get_task(user_id, task_id)
 
+    def deactivate_glasshive_workspace_tasks_for_owner(
+        self,
+        *,
+        user_id: str,
+        tenant_id: str,
+        updated_at: str,
+    ) -> int:
+        """Atomically pause this principal's delegated GlassHive definitions only."""
+
+        delivery = json.dumps(
+            {
+                "outcome": "action_required",
+                "reason": "principal_disabled",
+                "failure_class": "principal_disabled",
+                "generated_text": None,
+            }
+        )
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT id, metadata_json
+                FROM scheduled_tasks
+                WHERE user_id = ? AND executor = 'glasshive_workspace' AND active = 1
+                """,
+                (user_id,),
+            ).fetchall()
+            task_ids: list[str] = []
+            cleaned_metadata_by_id: dict[str, str] = {}
+            for row in rows:
+                try:
+                    metadata = json.loads(row["metadata_json"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                workspace = (
+                    metadata.get("glasshive_workspace_schedule")
+                    if isinstance(metadata, dict)
+                    else None
+                )
+                if not isinstance(workspace, dict):
+                    continue
+                if str(workspace.get("tenant_id") or "local") != tenant_id:
+                    continue
+                task_id = str(row["id"])
+                cleaned_workspace = dict(workspace)
+                cleaned_workspace.pop("pending_occurrence_key", None)
+                cleaned_metadata = dict(metadata)
+                cleaned_metadata["glasshive_workspace_schedule"] = cleaned_workspace
+                task_ids.append(task_id)
+                cleaned_metadata_by_id[task_id] = json.dumps(cleaned_metadata)
+            if task_ids:
+                placeholders = ", ".join("?" for _ in task_ids)
+                conn.execute(
+                    f"""
+                    UPDATE scheduled_tasks
+                    SET active = 0,
+                        next_run_at = NULL,
+                        last_status = 'action_required',
+                        last_error = 'principal_disabled',
+                        last_delivery_outcome = 'action_required',
+                        last_delivery_reason = 'principal_disabled',
+                        last_delivery_at = ?,
+                        last_generated_text = NULL,
+                        last_delivery_json = ?,
+                        updated_at = ?
+                    WHERE id IN ({placeholders}) AND user_id = ?
+                    """,
+                    (updated_at, delivery, updated_at, *task_ids, user_id),
+                )
+                for task_id, metadata_json in cleaned_metadata_by_id.items():
+                    conn.execute(
+                        """
+                        UPDATE scheduled_tasks
+                        SET metadata_json = ?
+                        WHERE id = ? AND user_id = ?
+                        """,
+                        (metadata_json, task_id, user_id),
+                    )
+            conn.execute("COMMIT")
+        self._sync_to_mirror()
+        return len(task_ids)
+
     def delete_task(self, user_id: str, task_id: str) -> bool:
         with self._connect() as conn:
             cur = conn.execute(
@@ -877,6 +996,12 @@ class ScheduleStorage:
         return self._row_to_scheduled_prompt_version(row)
 
     def create_scheduled_prompt_run(self, run: Dict[str, Any]) -> Dict[str, Any]:
+        payload = {
+            **run,
+            "claimed_at": run.get("claimed_at"),
+            "claim_expires_at": run.get("claim_expires_at"),
+            "attempt_count": int(run.get("attempt_count") or 0),
+        }
         with self._connect() as conn:
             conn.execute(
                 """
@@ -885,19 +1010,96 @@ class ScheduleStorage:
                   started_at, completed_at, status, executor, rendered_hash,
                   variable_snapshot_hash, glasshive_project_id, glasshive_worker_id,
                   glasshive_run_id, result_summary, error_class, private_detail_path,
-                  callback_payload_json, created_at, updated_at
+                  callback_payload_json, claimed_at, claim_expires_at, attempt_count,
+                  created_at, updated_at
                 ) VALUES (
                   :run_id, :task_id, :definition_id, :user_id, :version_id, :due_at,
                   :started_at, :completed_at, :status, :executor, :rendered_hash,
                   :variable_snapshot_hash, :glasshive_project_id, :glasshive_worker_id,
                   :glasshive_run_id, :result_summary, :error_class, :private_detail_path,
-                  :callback_payload_json, :created_at, :updated_at
+                  :callback_payload_json, :claimed_at, :claim_expires_at, :attempt_count,
+                  :created_at, :updated_at
                 )
                 """,
-                run,
+                payload,
             )
         self._sync_to_mirror()
-        return run
+        return payload
+
+    def claim_scheduled_prompt_run(
+        self,
+        run: Dict[str, Any],
+        *,
+        claimed_at: str,
+        claim_expires_at: str,
+    ) -> Dict[str, Any]:
+        """Atomically reserve or recover one deterministic occurrence dispatch."""
+
+        payload = {
+            **run,
+            "claimed_at": claimed_at,
+            "claim_expires_at": claim_expires_at,
+            "attempt_count": 1,
+        }
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM scheduled_prompt_runs WHERE run_id = ?",
+                (payload["run_id"],),
+            ).fetchone()
+            claimed = False
+            reason = ""
+            if row is None:
+                columns = tuple(payload.keys())
+                placeholders = ", ".join("?" for _ in columns)
+                conn.execute(
+                    f"INSERT INTO scheduled_prompt_runs ({', '.join(columns)}) VALUES ({placeholders})",
+                    tuple(payload[column] for column in columns),
+                )
+                claimed = True
+            else:
+                current = dict(row)
+                status = str(current.get("status") or "")
+                active_expiry = str(current.get("claim_expires_at") or "")
+                if str(current.get("glasshive_run_id") or ""):
+                    reason = "occurrence_already_reserved"
+                elif status in {"completed", "skipped"}:
+                    reason = "occurrence_terminal"
+                elif status in {"queued", "running"}:
+                    reason = "occurrence_active"
+                elif status == "dispatching" and active_expiry and active_expiry > claimed_at:
+                    reason = "occurrence_claim_active"
+                else:
+                    conn.execute(
+                        """
+                        UPDATE scheduled_prompt_runs
+                        SET status = 'dispatching', started_at = ?, completed_at = NULL,
+                            result_summary = NULL, error_class = NULL,
+                            claimed_at = ?, claim_expires_at = ?,
+                            attempt_count = COALESCE(attempt_count, 0) + 1,
+                            updated_at = ?
+                        WHERE run_id = ?
+                        """,
+                        (
+                            payload["started_at"],
+                            claimed_at,
+                            claim_expires_at,
+                            payload["updated_at"],
+                            payload["run_id"],
+                        ),
+                    )
+                    claimed = True
+            selected = conn.execute(
+                "SELECT * FROM scheduled_prompt_runs WHERE run_id = ?",
+                (payload["run_id"],),
+            ).fetchone()
+            conn.execute("COMMIT")
+        self._sync_to_mirror()
+        return {
+            "claimed": claimed,
+            "reason": reason,
+            "run": self._row_to_scheduled_prompt_run(selected),
+        }
 
     def update_scheduled_prompt_run(self, run_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if not updates:
@@ -912,6 +1114,51 @@ class ScheduleStorage:
             )
         self._sync_to_mirror()
         return self.get_scheduled_prompt_run(run_id)
+
+    def link_scheduled_prompt_glasshive_run(
+        self,
+        run_id: str,
+        glasshive_run_id: str,
+        *,
+        queued_summary: str,
+        updated_at: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Link dispatch identity without overwriting an already-terminal callback."""
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT status FROM scheduled_prompt_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                return None
+            if str(row["status"] or "") in {"completed", "failed"}:
+                conn.execute(
+                    """
+                    UPDATE scheduled_prompt_runs
+                    SET glasshive_run_id = ?, updated_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (glasshive_run_id, updated_at, run_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE scheduled_prompt_runs
+                    SET status = 'queued', glasshive_run_id = ?, result_summary = ?, updated_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (glasshive_run_id, queued_summary, updated_at, run_id),
+                )
+            linked = conn.execute(
+                "SELECT * FROM scheduled_prompt_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            conn.execute("COMMIT")
+        self._sync_to_mirror()
+        return self._row_to_scheduled_prompt_run(linked)
 
     def get_scheduled_prompt_run(self, run_id: str) -> Optional[Dict[str, Any]]:
         with self._connect() as conn:

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -16,6 +17,13 @@ from croniter import croniter
 from .dispatch import dispatch_task
 from .utils import ensure_timezone, parse_time, parse_iso, to_utc_iso, normalize_days, last_day_of_month
 from .storage import ScheduleStorage
+from .workspace_recurrence import (
+    deterministic_jitter_seconds,
+    due_occurrences_and_next,
+    next_after as next_workspace_occurrence,
+    occurrence_run_id,
+    parse_aware_utc as parse_workspace_utc,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +31,8 @@ DEFAULT_CATCH_UP_MAX_LATE_S = 12 * 60 * 60
 HARD_CATCH_UP_MAX_LATE_S = 24 * 60 * 60
 MISFIRE_POLICY_KEY = "misfire_policy"
 SCHEDULER_MISFIRE_KEY = "scheduler_misfire"
+GLASSHIVE_WORKSPACE_METADATA_KEY = "glasshive_workspace_schedule"
+GLASSHIVE_PENDING_OCCURRENCE_KEY = "pending_occurrence_key"
 STALE_INTERNAL_METADATA_KEYS = frozenset(
     {
         "heartbeat_quiet_streak",
@@ -105,6 +115,22 @@ def _is_orphaned_user_failure(error: object) -> bool:
     return failure_class == "user_not_found" or reason == "user_not_found"
 
 
+def _glasshive_failure_details(error: object) -> Dict[str, object]:
+    payload = getattr(error, "payload", None)
+    action_required = isinstance(payload, dict) and payload.get("action_required") is True
+    retryable = getattr(error, "failure_retryable", None)
+    if not isinstance(retryable, bool):
+        retryable = None
+    failure_class = str(getattr(error, "failure_class", "") or "").strip()
+    if not failure_class:
+        failure_class = str(getattr(error, "reason", "") or "").strip()
+    return {
+        "action_required": action_required,
+        "retryable": retryable,
+        "failure_class": failure_class or "workspace_dispatch_failed",
+    }
+
+
 # === VIVENTIUM NOTE ===
 # Feature: Structured misfire policy and late-reminder catch-up.
 # Purpose: User-created one-time reminders should not disappear silently after
@@ -150,9 +176,35 @@ def _pruned_internal_metadata(task: Dict[str, object]) -> Optional[Dict[str, obj
     metadata = task.get("metadata")
     if not isinstance(metadata, dict):
         return None
-    if not any(key in metadata for key in STALE_INTERNAL_METADATA_KEYS):
-        return None
-    return {key: value for key, value in metadata.items() if key not in STALE_INTERNAL_METADATA_KEYS}
+    cleaned = {key: value for key, value in metadata.items() if key not in STALE_INTERNAL_METADATA_KEYS}
+    changed = len(cleaned) != len(metadata)
+    workspace = cleaned.get(GLASSHIVE_WORKSPACE_METADATA_KEY)
+    if isinstance(workspace, dict) and GLASSHIVE_PENDING_OCCURRENCE_KEY in workspace:
+        cleaned_workspace = dict(workspace)
+        cleaned_workspace.pop(GLASSHIVE_PENDING_OCCURRENCE_KEY, None)
+        cleaned[GLASSHIVE_WORKSPACE_METADATA_KEY] = cleaned_workspace
+        changed = True
+    return cleaned if changed else None
+
+
+def _with_glasshive_occurrence_key(
+    task: Dict[str, object], due_at: datetime
+) -> Dict[str, object]:
+    if str(task.get("executor") or "") != "glasshive_workspace":
+        return task
+    metadata = task.get("metadata")
+    if not isinstance(metadata, dict):
+        return task
+    workspace = metadata.get(GLASSHIVE_WORKSPACE_METADATA_KEY)
+    if not isinstance(workspace, dict):
+        return task
+    patched = dict(task)
+    patched_metadata = dict(metadata)
+    patched_workspace = dict(workspace)
+    patched_workspace.setdefault(GLASSHIVE_PENDING_OCCURRENCE_KEY, to_utc_iso(due_at))
+    patched_metadata[GLASSHIVE_WORKSPACE_METADATA_KEY] = patched_workspace
+    patched["metadata"] = patched_metadata
+    return patched
 
 
 def _default_misfire_mode(task: Dict[str, object]) -> str:
@@ -355,6 +407,16 @@ class SchedulerEngine:
         self._poll_interval_s = max(1, poll_interval_s)
         self._misfire_grace_s = max(0, misfire_grace_s)
         self._retry_delay_s = max(1, retry_delay_s)
+        self._glasshive_max_retry_attempts = max(
+            1,
+            min(
+                _coerce_int(
+                    os.getenv("SCHEDULING_GLASSHIVE_MAX_RETRY_ATTEMPTS"),
+                    3,
+                ),
+                10,
+            ),
+        )
         self._catch_up_max_late_s = _clamp_late_window(
             catch_up_max_late_s,
             DEFAULT_CATCH_UP_MAX_LATE_S,
@@ -392,8 +454,16 @@ class SchedulerEngine:
             self._process_task(task, now)
 
     def _process_task(self, task: Dict[str, object], now: datetime) -> None:
-        task_id = task.get("id")
         schedule = task.get("schedule")
+        if (
+            str(task.get("executor") or "") == "glasshive_workspace"
+            and isinstance(schedule, dict)
+            and schedule.get("type") == "glasshive_recurrence"
+        ):
+            self._process_glasshive_workspace_task(task, now)
+            return
+
+        task_id = task.get("id")
         next_run_at = task.get("next_run_at")
 
         if not schedule or not next_run_at:
@@ -434,19 +504,24 @@ class SchedulerEngine:
                 )
                 return
 
+        task = _with_glasshive_occurrence_key(task, next_run_dt)
+
         if late_seconds > self._misfire_grace_s:
             logger.info("Dispatching scheduled task %s as late catch-up", task_id)
         else:
             logger.info("Dispatching scheduled task %s", task_id)
+        running_updates = {
+            "last_run_at": to_utc_iso(now),
+            "last_status": "running",
+            "last_error": None,
+            "updated_at": to_utc_iso(now),
+        }
+        if str(task.get("executor") or "") == "glasshive_workspace":
+            running_updates["metadata"] = task.get("metadata")
         self._storage.update_task(
             task["user_id"],
             task_id,
-            {
-                "last_run_at": to_utc_iso(now),
-                "last_status": "running",
-                "last_error": None,
-                "updated_at": to_utc_iso(now),
-            },
+            running_updates,
         )
 
         try:
@@ -456,14 +531,283 @@ class SchedulerEngine:
             logger.exception("Task %s failed: %s", task_id, exc)
             self._update_after_failure(task, now, exc)
 
+    @staticmethod
+    def _workspace_pending_occurrence(task: Dict[str, object]) -> Optional[datetime]:
+        metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+        workspace = (
+            metadata.get(GLASSHIVE_WORKSPACE_METADATA_KEY)
+            if isinstance(metadata, dict)
+            else None
+        )
+        if not isinstance(workspace, dict):
+            return None
+        value = str(workspace.get(GLASSHIVE_PENDING_OCCURRENCE_KEY) or "").strip()
+        if not value:
+            return None
+        return parse_workspace_utc(value, label=GLASSHIVE_PENDING_OCCURRENCE_KEY)
+
+    def _workspace_has_overlap(self, task_id: str, current_run_id: str) -> bool:
+        return any(
+            str(run.get("run_id") or "") != current_run_id
+            and str(run.get("status") or "") in {"dispatching", "queued", "running"}
+            for run in self._storage.list_scheduled_prompt_runs(task_id=task_id, limit=500)
+        )
+
+    def _record_workspace_skip(
+        self,
+        task: Dict[str, object],
+        *,
+        scheduled_for: datetime,
+        reason: str,
+        now: datetime,
+    ) -> None:
+        task_id = str(task.get("id") or "")
+        run_id = occurrence_run_id(task_id, scheduled_for)
+        if self._storage.get_scheduled_prompt_run(run_id):
+            return
+        metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+        workspace = (
+            metadata.get(GLASSHIVE_WORKSPACE_METADATA_KEY)
+            if isinstance(metadata, dict)
+            else {}
+        )
+        workspace = workspace if isinstance(workspace, dict) else {}
+        now_iso = to_utc_iso(now)
+        self._storage.create_scheduled_prompt_run(
+            {
+                "run_id": run_id,
+                "task_id": task_id,
+                "definition_id": None,
+                "user_id": str(task.get("user_id") or ""),
+                "version_id": None,
+                "due_at": to_utc_iso(scheduled_for),
+                "started_at": now_iso,
+                "completed_at": now_iso,
+                "status": "skipped",
+                "executor": "glasshive_workspace",
+                "rendered_hash": None,
+                "variable_snapshot_hash": None,
+                "glasshive_project_id": str(workspace.get("project_id") or ""),
+                "glasshive_worker_id": str(workspace.get("worker_id") or ""),
+                "glasshive_run_id": None,
+                "result_summary": reason,
+                "error_class": reason,
+                "private_detail_path": None,
+                "callback_payload_json": None,
+                "created_at": now_iso,
+                "updated_at": now_iso,
+            }
+        )
+
+    @staticmethod
+    def _task_with_workspace_occurrence(
+        task: Dict[str, object], scheduled_for: datetime
+    ) -> Dict[str, object]:
+        patched = _with_glasshive_occurrence_key(task, scheduled_for)
+        patched["next_run_at"] = to_utc_iso(scheduled_for)
+        return patched
+
+    def _advance_workspace_task(
+        self,
+        task: Dict[str, object],
+        *,
+        next_run: Optional[datetime],
+        now: datetime,
+        status: str,
+        reason: str,
+    ) -> None:
+        cleaned_metadata = _pruned_internal_metadata(task)
+        updates: Dict[str, object] = {
+            "last_run_at": to_utc_iso(now),
+            "last_status": status,
+            "last_error": None,
+            "last_delivery_outcome": status,
+            "last_delivery_reason": reason,
+            "last_delivery_at": to_utc_iso(now),
+            "last_generated_text": None,
+            "last_delivery": {"outcome": status, "reason": reason, "generated_text": None},
+            "next_run_at": to_utc_iso(next_run) if next_run else None,
+            "updated_at": to_utc_iso(now),
+        }
+        if cleaned_metadata is not None:
+            updates["metadata"] = cleaned_metadata
+        if next_run is None:
+            updates["active"] = 0
+        self._storage.update_task(str(task["user_id"]), str(task["id"]), updates)
+
+    def _process_glasshive_workspace_task(
+        self,
+        task: Dict[str, object],
+        now: datetime,
+    ) -> None:
+        schedule = task.get("schedule")
+        next_run_at = str(task.get("next_run_at") or "").strip()
+        if not isinstance(schedule, dict) or not next_run_at:
+            return
+
+        pending = self._workspace_pending_occurrence(task)
+        resuming_pending_occurrence = pending is not None
+        if pending is not None:
+            decisions = [{"scheduled_for": pending, "state": "pending", "outcome": "pending"}]
+            following = next_workspace_occurrence(schedule, pending)
+        else:
+            decisions, following = due_occurrences_and_next(
+                schedule,
+                next_run_at=next_run_at,
+                now=now,
+            )
+        if not decisions:
+            return
+
+        task_id = str(task.get("id") or "")
+        for decision in decisions:
+            scheduled_for = decision.get("scheduled_for")
+            if not isinstance(scheduled_for, datetime):
+                continue
+            occurrence_task = self._task_with_workspace_occurrence(task, scheduled_for)
+            occurrence_next = next_workspace_occurrence(schedule, scheduled_for)
+            run_id = occurrence_run_id(task_id, scheduled_for)
+            existing = self._storage.get_scheduled_prompt_run(run_id)
+            if existing and str(existing.get("status") or "") == "skipped":
+                self._advance_workspace_task(
+                    occurrence_task,
+                    next_run=occurrence_next,
+                    now=now,
+                    status="skipped",
+                    reason=str(existing.get("error_class") or "occurrence_skipped"),
+                )
+                task = self._storage.get_task(str(task["user_id"]), task_id) or task
+                continue
+
+            if str(decision.get("state") or "") == "skipped":
+                skip_reason = str(decision.get("outcome") or "misfire_skipped")
+                self._record_workspace_skip(
+                    occurrence_task,
+                    scheduled_for=scheduled_for,
+                    reason=skip_reason,
+                    now=now,
+                )
+                self._advance_workspace_task(
+                    occurrence_task,
+                    next_run=occurrence_next,
+                    now=now,
+                    status="skipped",
+                    reason=skip_reason,
+                )
+                task = self._storage.get_task(str(task["user_id"]), task_id) or task
+                continue
+
+            jitter_seconds = deterministic_jitter_seconds(
+                task_id,
+                scheduled_for,
+                int(schedule.get("jitter_seconds") or 0),
+            )
+            if not resuming_pending_occurrence and jitter_seconds:
+                dispatch_at = max(scheduled_for, now) + timedelta(seconds=jitter_seconds)
+                self._storage.update_task(
+                    str(task["user_id"]),
+                    task_id,
+                    {
+                        "last_status": "waiting",
+                        "last_error": None,
+                        "metadata": occurrence_task.get("metadata"),
+                        "next_run_at": to_utc_iso(dispatch_at),
+                        "updated_at": to_utc_iso(now),
+                    },
+                )
+                return
+
+            skip_reason = ""
+            if (
+                str(schedule.get("overlap_policy") or "skip") == "skip"
+                and self._workspace_has_overlap(task_id, run_id)
+            ):
+                skip_reason = "overlap_skipped"
+            if skip_reason:
+                self._record_workspace_skip(
+                    occurrence_task,
+                    scheduled_for=scheduled_for,
+                    reason=skip_reason,
+                    now=now,
+                )
+                self._advance_workspace_task(
+                    occurrence_task,
+                    next_run=occurrence_next,
+                    now=now,
+                    status="skipped",
+                    reason=skip_reason,
+                )
+                task = self._storage.get_task(str(task["user_id"]), task_id) or task
+                continue
+
+            self._storage.update_task(
+                str(task["user_id"]),
+                task_id,
+                {
+                    "last_run_at": to_utc_iso(now),
+                    "last_status": "running",
+                    "last_error": None,
+                    "metadata": occurrence_task.get("metadata"),
+                    "updated_at": to_utc_iso(now),
+                },
+            )
+            try:
+                dispatch_result = dispatch_task(occurrence_task)
+            except Exception as exc:
+                logger.exception("Task %s failed: %s", task_id, exc)
+                self._update_after_failure(occurrence_task, now, exc)
+                return
+            if isinstance(dispatch_result, dict) and dispatch_result.get("deferred") is True:
+                retry_value = str(dispatch_result.get("retry_at") or "").strip()
+                retry_at = (
+                    parse_workspace_utc(retry_value, label="retry_at")
+                    if retry_value
+                    else now + timedelta(seconds=self._retry_delay_s)
+                )
+                self._storage.update_task(
+                    str(task["user_id"]),
+                    task_id,
+                    {
+                        "last_status": "waiting",
+                        "last_error": None,
+                        "metadata": occurrence_task.get("metadata"),
+                        "next_run_at": to_utc_iso(retry_at),
+                        "updated_at": to_utc_iso(now),
+                    },
+                )
+                return
+            self._update_after_success(
+                occurrence_task,
+                now,
+                dispatch_result,
+                resolved_next_run=occurrence_next,
+                resolved_next_run_set=True,
+            )
+            task = self._storage.get_task(str(task["user_id"]), task_id) or task
+
+        latest = self._storage.get_task(str(task["user_id"]), task_id)
+        if latest and following is None and latest.get("next_run_at") is not None:
+            self._storage.update_task(
+                str(task["user_id"]),
+                task_id,
+                {"active": 0, "next_run_at": None, "updated_at": to_utc_iso(now)},
+            )
+
     def _update_after_success(
         self,
         task: Dict[str, object],
         now: datetime,
         dispatch_result: Optional[Dict[str, object]] = None,
+        *,
+        resolved_next_run: Optional[datetime] = None,
+        resolved_next_run_set: bool = False,
     ) -> None:
         schedule = task["schedule"]
-        next_run = compute_next_run(schedule, now, now)
+        next_run = (
+            resolved_next_run
+            if resolved_next_run_set
+            else compute_next_run(schedule, now, now)
+        )
         updates = {
             "last_run_at": to_utc_iso(now),
             "last_status": "success",
@@ -540,7 +884,7 @@ class SchedulerEngine:
         updates["last_delivery"] = base_delivery
         # === VIVENTIUM NOTE ===
 
-        if schedule.get("type") == "once":
+        if schedule.get("type") == "once" or (resolved_next_run_set and next_run is None):
             updates["active"] = 0
             updates["next_run_at"] = None
         else:
@@ -553,6 +897,27 @@ class SchedulerEngine:
         orphaned_user = _is_orphaned_user_failure(error)
         error_message = str(error)
         delivery_reason = "orphaned_user_not_found" if orphaned_user else error_message
+        workspace_failure = (
+            _glasshive_failure_details(error)
+            if str(task.get("executor") or "") == "glasshive_workspace"
+            else None
+        )
+        workspace_run = None
+        if workspace_failure is not None:
+            pending_occurrence = self._workspace_pending_occurrence(task)
+            if pending_occurrence is not None:
+                workspace_run = self._storage.get_scheduled_prompt_run(
+                    occurrence_run_id(str(task.get("id") or ""), pending_occurrence)
+                )
+        attempt_count = int((workspace_run or {}).get("attempt_count") or 1)
+        workspace_nonretryable = bool(
+            workspace_failure is not None and workspace_failure["retryable"] is False
+        )
+        workspace_budget_exhausted = bool(
+            workspace_failure is not None
+            and not workspace_nonretryable
+            and attempt_count >= self._glasshive_max_retry_attempts
+        )
         updates = {
             "last_status": "error",
             "last_error": error_message,
@@ -574,12 +939,49 @@ class SchedulerEngine:
             updates["active"] = 0
             updates["next_run_at"] = None
             updates["last_delivery"]["failure_class"] = "orphaned_user_not_found"
+        elif workspace_failure is not None:
+            failure_class = str(workspace_failure["failure_class"])
+            updates["last_delivery"]["failure_class"] = failure_class
+            updates["last_delivery"]["attempt_count"] = attempt_count
+            if workspace_nonretryable:
+                terminal_status = (
+                    "action_required"
+                    if workspace_failure["action_required"] is True
+                    else "terminal"
+                )
+                updates["active"] = 0
+                updates["next_run_at"] = None
+                updates["last_status"] = terminal_status
+                updates["last_delivery_outcome"] = terminal_status
+                updates["last_delivery"]["outcome"] = terminal_status
+            elif workspace_budget_exhausted:
+                updates["active"] = 0
+                updates["next_run_at"] = None
+                updates["last_status"] = "terminal"
+                updates["last_delivery_reason"] = "retry_budget_exhausted"
+                updates["last_delivery"]["reason"] = "retry_budget_exhausted"
+                updates["last_delivery"]["failure_class"] = "retry_budget_exhausted"
+                updates["last_delivery"]["source_failure_class"] = failure_class
+                if workspace_run:
+                    self._storage.update_scheduled_prompt_run(
+                        str(workspace_run["run_id"]),
+                        {
+                            "status": "failed",
+                            "completed_at": to_utc_iso(now),
+                            "error_class": "retry_budget_exhausted",
+                            "result_summary": "GlassHive workspace dispatch exhausted its bounded retry budget.",
+                            "updated_at": to_utc_iso(now),
+                        },
+                    )
         late_delivery = _scheduler_late_delivery(task)
         if late_delivery is not None:
             updates["last_delivery"]["late_delivery"] = late_delivery
 
-        if not orphaned_user:
-            if task["schedule"].get("type") == "once":
+        if not orphaned_user and not workspace_nonretryable and not workspace_budget_exhausted:
+            if str(task.get("executor") or "") == "glasshive_workspace":
+                updates["next_run_at"] = to_utc_iso(retry_at)
+                updates["metadata"] = task.get("metadata")
+            elif task["schedule"].get("type") == "once":
                 updates["next_run_at"] = to_utc_iso(retry_at)
             else:
                 next_run = compute_next_run(task["schedule"], now, now)

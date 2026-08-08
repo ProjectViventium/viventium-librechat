@@ -4,6 +4,7 @@
  * === VIVENTIUM END === */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { EModelEndpoint, apiBaseUrl, request } from 'librechat-data-provider';
+import type { ConnectedAccountCredentialPolicy } from 'librechat-data-provider';
 import { useRevokeUserKeyMutation, useUserKeyQuery } from 'librechat-data-provider/react-query';
 import { Button, Label, Spinner, useToastContext } from '@librechat/client';
 import { useGetEndpointsQuery, useGetStartupConfig } from '~/data-provider';
@@ -40,11 +41,17 @@ type ConnectedAccountStartResponse = {
   flowMode?: 'popup_callback' | 'manual_code';
 };
 
+type ConnectedAccountPolicyResponse = {
+  policy: ConnectedAccountCredentialPolicy;
+};
+
 type ManualFlowState = {
   callbackInput: string;
   isSubmitting: boolean;
   state?: string;
 };
+
+type CredentialPolicyLoadState = 'loading' | 'ready' | 'unavailable';
 
 const KEY_POLL_INTERVAL_MS = 1200;
 const KEY_POLL_TIMEOUT_MS = 90_000;
@@ -83,6 +90,19 @@ function ConnectedAccounts() {
   const { data: endpointsConfig } = useGetEndpointsQuery();
   const [connectingProvider, setConnectingProvider] = useState<string | null>(null);
   const [keyDialogProvider, setKeyDialogProvider] = useState<ProviderDefinition | null>(null);
+  /* === VIVENTIUM START ===
+   * Feature: Per-user connected-account credential policy.
+   * Purpose: Keep personal-only fallback choices independent from credential connect/disconnect state.
+   * === VIVENTIUM END === */
+  const [credentialPolicies, setCredentialPolicies] = useState<
+    Partial<Record<ProviderSlug, ConnectedAccountCredentialPolicy>>
+  >({});
+  const [credentialPolicyStates, setCredentialPolicyStates] = useState<
+    Partial<Record<ProviderSlug, CredentialPolicyLoadState>>
+  >({});
+  const [updatingCredentialPolicy, setUpdatingCredentialPolicy] = useState<ProviderSlug | null>(
+    null,
+  );
   const [manualFlows, setManualFlows] = useState<Partial<Record<ProviderSlug, ManualFlowState>>>(
     {},
   );
@@ -94,6 +114,8 @@ function ConnectedAccounts() {
   const connectedAccountsEnabled =
     (startupConfig as { viventiumConnectedAccountsEnabled?: boolean } | undefined)
       ?.viventiumConnectedAccountsEnabled === true;
+  const credentialPolicyEnabled =
+    startupConfig?.viventiumCredentialPolicyEnabled === true || connectedAccountsEnabled;
   const experimentalDirectSubscriptionAuth =
     startupConfig?.viventiumExperimentalDirectSubscriptionAuth === true;
   const allowedPostMessageOrigins = useMemo(() => getAllowedPostMessageOrigins(), []);
@@ -120,6 +142,55 @@ function ConnectedAccounts() {
     const anthropicConfig = endpointsConfig?.[EModelEndpoint.anthropic];
     return Boolean(anthropicConfig && !anthropicConfig.userProvide);
   }, [endpointsConfig]);
+
+  useEffect(() => {
+    const policyProviders: ProviderSlug[] = ['openai', 'anthropic'];
+    if (!credentialPolicyEnabled) {
+      return;
+    }
+
+    let cancelled = false;
+    setCredentialPolicyStates({ openai: 'loading', anthropic: 'loading' });
+    void Promise.all(
+      policyProviders.map(async (provider) => {
+        try {
+          const response = await request.get<ConnectedAccountPolicyResponse>(
+            `${apiBaseUrl()}/api/connected-accounts/${provider}/policy`,
+          );
+          if (!cancelled) {
+            setCredentialPolicies((current) => ({
+              ...current,
+              [provider]: response.policy,
+            }));
+            setCredentialPolicyStates((current) => ({ ...current, [provider]: 'ready' }));
+          }
+          return true;
+        } catch {
+          if (!cancelled) {
+            setCredentialPolicyStates((current) => ({
+              ...current,
+              [provider]: 'unavailable',
+            }));
+          }
+          return false;
+        }
+      }),
+    )
+      .then((results) => {
+        if (!cancelled && results.some((result) => !result)) {
+          showToast({
+            message: localize('com_ui_connected_account_policy_update_error'),
+            status: NotificationSeverity.ERROR,
+          });
+        }
+      })
+      .catch(() => undefined);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [credentialPolicyEnabled, localize, showToast]);
+  /* === VIVENTIUM END === */
 
   const providers: ProviderDefinition[] = useMemo(
     () => [
@@ -676,19 +747,57 @@ function ConnectedAccounts() {
     );
   };
 
-  if (!connectedAccountsEnabled) {
+  /* === VIVENTIUM START ===
+   * Feature: Per-user connected-account credential policy.
+   * Purpose: An explicit personal-only selection must survive Disconnect and prevent platform fallback.
+   * === VIVENTIUM END === */
+  const updateCredentialPolicy = async (
+    provider: ProviderSlug,
+    policy: ConnectedAccountCredentialPolicy,
+  ) => {
+    setUpdatingCredentialPolicy(provider);
+    try {
+      const response = await request.put<ConnectedAccountPolicyResponse>(
+        `${apiBaseUrl()}/api/connected-accounts/${provider}/policy`,
+        { policy },
+      );
+      setCredentialPolicies((current) => ({ ...current, [provider]: response.policy }));
+      showToast({
+        message: localize('com_ui_connected_account_policy_updated'),
+        status: NotificationSeverity.SUCCESS,
+      });
+    } catch {
+      showToast({
+        message: localize('com_ui_connected_account_policy_update_error'),
+        status: NotificationSeverity.ERROR,
+      });
+    } finally {
+      setUpdatingCredentialPolicy((current) => (current === provider ? null : current));
+    }
+  };
+  /* === VIVENTIUM END === */
+
+  if (!connectedAccountsEnabled && !credentialPolicyEnabled) {
     return null;
   }
+
+  const visibleProviders = connectedAccountsEnabled
+    ? providers
+    : providers.filter((provider) => provider.oauth);
 
   return (
     <div className="space-y-3">
       <div className="space-y-1">
         <Label id="connected-accounts-label">{localize('com_ui_connected_accounts')}</Label>
         <p className="text-xs text-text-secondary">
-          {localize('com_ui_connected_accounts_description')}
+          {localize(
+            connectedAccountsEnabled
+              ? 'com_ui_connected_accounts_description'
+              : 'com_ui_connected_account_policy_description',
+          )}
         </p>
       </div>
-      {experimentalDirectSubscriptionAuth && (
+      {connectedAccountsEnabled && experimentalDirectSubscriptionAuth && (
         <div className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-amber-950 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-100">
           <p className="text-sm font-medium">
             {localize('com_ui_connected_accounts_experimental')}
@@ -699,7 +808,7 @@ function ConnectedAccounts() {
         </div>
       )}
       <div className="space-y-2" aria-labelledby="connected-accounts-label">
-        {providers.map((provider) => {
+        {visibleProviders.map((provider) => {
           const providerLabel = localize(provider.labelKey);
           const keyQuery = getKeyQuery(provider.queryKey);
           const revokeMutation = getRevokeKeyMutation(provider.endpoint);
@@ -710,6 +819,15 @@ function ConnectedAccounts() {
           const statusText = isConnected
             ? localize('com_ui_connected_accounts_local_credential_saved')
             : localize('com_ui_connected_accounts_no_local_credential');
+          const credentialPolicy = provider.oauth ? credentialPolicies[provider.slug] : undefined;
+          const credentialPolicyState = provider.oauth
+            ? credentialPolicyStates[provider.slug]
+            : undefined;
+          const personalOnlyUnavailable =
+            provider.oauth &&
+            !connectedAccountsEnabled &&
+            !isConnected &&
+            credentialPolicy !== 'personal_required';
 
           return (
             <section
@@ -720,17 +838,23 @@ function ConnectedAccounts() {
               <div className="mb-3 flex items-start justify-between gap-2">
                 <div className="space-y-1">
                   <p className="font-medium">{providerLabel}</p>
-                  <p
-                    className={cn(
-                      'text-xs',
-                      isConnected ? 'text-amber-700 dark:text-amber-300' : 'text-text-secondary',
-                    )}
-                  >
-                    {statusText}
-                  </p>
-                  <p className="text-xs text-text-secondary">
-                    {getSourceLine(isConnected, provider.platformFallbackAvailable)}
-                  </p>
+                  {connectedAccountsEnabled && (
+                    <>
+                      <p
+                        className={cn(
+                          'text-xs',
+                          isConnected
+                            ? 'text-amber-700 dark:text-amber-300'
+                            : 'text-text-secondary',
+                        )}
+                      >
+                        {statusText}
+                      </p>
+                      <p className="text-xs text-text-secondary">
+                        {getSourceLine(isConnected, provider.platformFallbackAvailable)}
+                      </p>
+                    </>
+                  )}
                 </div>
                 {keyQuery.isLoading && <Spinner className="icon-sm" />}
               </div>
@@ -772,40 +896,93 @@ function ConnectedAccounts() {
                   </div>
                 </div>
               )}
-              {isConnected && (
+              {connectedAccountsEnabled && isConnected && (
                 <p className="mb-3 text-xs text-text-secondary">
                   {localize('com_ui_connected_accounts_disconnect_local_only')}
                 </p>
               )}
-              <div className="flex items-center justify-end gap-2">
-                {isConnected && (
-                  <Button
-                    variant="outline"
-                    onClick={() => disconnectLocalCredential(provider)}
-                    disabled={revokeMutation.isLoading || isConnecting}
+              {provider.oauth && credentialPolicyEnabled && credentialPolicyState === 'loading' && (
+                <div
+                  className="mb-3 flex items-center gap-2 rounded-lg border border-border-light bg-surface-secondary p-2 text-xs text-text-secondary"
+                  role="status"
+                >
+                  <Spinner className="icon-sm" />
+                  {localize('com_ui_connected_account_policy_loading')}
+                </div>
+              )}
+              {provider.oauth &&
+                credentialPolicyEnabled &&
+                credentialPolicyState === 'unavailable' && (
+                  <p
+                    className="mb-3 rounded-lg border border-red-300 bg-red-50 p-2 text-xs text-red-800 dark:border-red-800 dark:bg-red-950/30 dark:text-red-200"
+                    role="alert"
                   >
-                    {revokeMutation.isLoading ? (
-                      <Spinner className="icon-sm" />
-                    ) : (
-                      localize('com_ui_connected_accounts_disconnect')
-                    )}
-                  </Button>
+                    {localize('com_ui_connected_account_policy_unavailable')}
+                  </p>
                 )}
-                <Button variant="outline" onClick={() => setKeyDialogProvider(provider)}>
-                  {localize('com_ui_connected_accounts_use_provider_api_key', {
-                    provider: providerLabel,
-                  })}
-                </Button>
-                {experimentalDirectSubscriptionAuth && provider.oauth && (
-                  <Button onClick={() => connectProvider(provider)} disabled={isConnecting}>
-                    {isConnecting ? (
-                      <Spinner className="icon-sm" />
-                    ) : (
-                      localize('com_ui_connected_accounts_experimental')
+              {provider.oauth && credentialPolicyEnabled && credentialPolicyState === 'ready' && (
+                <label className="mb-3 flex items-start gap-2 rounded-lg border border-border-light bg-surface-secondary p-2">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5"
+                    aria-label={localize('com_ui_connected_account_personal_required')}
+                    checked={credentialPolicy === 'personal_required'}
+                    disabled={
+                      updatingCredentialPolicy === provider.slug || personalOnlyUnavailable
+                    }
+                    onChange={(event) =>
+                      void updateCredentialPolicy(
+                        provider.slug,
+                        event.target.checked ? 'personal_required' : 'personal_preferred',
+                      )
+                    }
+                  />
+                  <span className="space-y-0.5">
+                    <span className="block text-sm font-medium">
+                      {localize('com_ui_connected_account_personal_required')}
+                    </span>
+                    <span className="block text-xs text-text-secondary">
+                      {localize('com_ui_connected_account_personal_required_description')}
+                    </span>
+                    {personalOnlyUnavailable && (
+                      <span className="block text-xs text-amber-700 dark:text-amber-300">
+                        {localize('com_ui_connected_account_personal_required_unavailable')}
+                      </span>
                     )}
+                  </span>
+                </label>
+              )}
+              {connectedAccountsEnabled && (
+                <div className="flex items-center justify-end gap-2">
+                  {isConnected && (
+                    <Button
+                      variant="outline"
+                      onClick={() => disconnectLocalCredential(provider)}
+                      disabled={revokeMutation.isLoading || isConnecting}
+                    >
+                      {revokeMutation.isLoading ? (
+                        <Spinner className="icon-sm" />
+                      ) : (
+                        localize('com_ui_connected_accounts_disconnect')
+                      )}
+                    </Button>
+                  )}
+                  <Button variant="outline" onClick={() => setKeyDialogProvider(provider)}>
+                    {localize('com_ui_connected_accounts_use_provider_api_key', {
+                      provider: providerLabel,
+                    })}
                   </Button>
-                )}
-              </div>
+                  {experimentalDirectSubscriptionAuth && provider.oauth && (
+                    <Button onClick={() => connectProvider(provider)} disabled={isConnecting}>
+                      {isConnecting ? (
+                        <Spinner className="icon-sm" />
+                      ) : (
+                        localize('com_ui_connected_accounts_experimental')
+                      )}
+                    </Button>
+                  )}
+                </div>
+              )}
             </section>
           );
         })}

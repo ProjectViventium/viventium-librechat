@@ -113,6 +113,15 @@ const userSchema = new Schema<IUser>(
       unique: true,
       sparse: true,
     },
+    /* === VIVENTIUM START ===
+     * Feature: Shared-OIDC GlassHive principal binding.
+     * Purpose: Persist only the opaque issuer+subject hash, never email or provider tokens.
+     * === VIVENTIUM END === */
+    viventiumGlassHivePrincipalId: {
+      type: String,
+      unique: true,
+      sparse: true,
+    },
     samlId: {
       type: String,
       unique: true,

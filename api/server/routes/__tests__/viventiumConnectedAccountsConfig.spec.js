@@ -35,6 +35,7 @@ const capabilityKeys = [
   'VIVENTIUM_CONNECTED_ACCOUNTS_ENABLED',
   'VIVENTIUM_LOCAL_SUBSCRIPTION_AUTH',
   'VIVENTIUM_EXPERIMENTAL_DIRECT_SUBSCRIPTION_AUTH',
+  'VIVENTIUM_CONNECTED_ACCOUNT_POLICY_ENABLED',
   'VIVENTIUM_VOICE_ENABLED',
   'OPENAI_API_KEY',
   'ANTHROPIC_API_KEY',
@@ -82,7 +83,19 @@ describe('GET /api/config connected-account capability', () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.body.viventiumConnectedAccountsEnabled).toBe(false);
+    expect(response.body.viventiumCredentialPolicyEnabled).toBe(false);
     expect(response.body.viventiumExperimentalDirectSubscriptionAuth).toBe(false);
+  });
+
+  it('can expose policy recovery without falsely enabling account connection', async () => {
+    process.env.VIVENTIUM_CONNECTED_ACCOUNTS_ENABLED = 'false';
+    process.env.VIVENTIUM_CONNECTED_ACCOUNT_POLICY_ENABLED = 'true';
+
+    const response = await request(app).get('/api/config');
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body.viventiumConnectedAccountsEnabled).toBe(false);
+    expect(response.body.viventiumCredentialPolicyEnabled).toBe(true);
   });
 
   it.each([

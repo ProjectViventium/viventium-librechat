@@ -155,15 +155,15 @@ function resolveBrokerUrl(executionMode = '') {
   const port = String(process.env.PORT || process.env.LIBRECHAT_PORT || '3080').trim();
   const mode = normalizeExecutionMode(executionMode) || defaultExecutionModeForBroker();
   const configuredHost = String(process.env.HOST || '').trim();
-  const host =
-    mode === 'host'
-      ? configuredHost &&
-        configuredHost !== 'localhost' &&
-        configuredHost !== '0.0.0.0' &&
-        configuredHost !== '::'
-        ? configuredHost
-        : '127.0.0.1'
-      : 'host.docker.internal';
+  let host = 'host.docker.internal';
+  if (mode === 'host') {
+    const configuredHostIsRoutable =
+      configuredHost &&
+      configuredHost !== 'localhost' &&
+      configuredHost !== '0.0.0.0' &&
+      configuredHost !== '::';
+    host = configuredHostIsRoutable ? configuredHost : '127.0.0.1';
+  }
   const urlHost = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
   return `http://${urlHost}:${port}/api/viventium/glasshive/capabilities/mcp`;
 }
@@ -352,14 +352,12 @@ async function directCapabilityReadiness({ user, executionMode = 'docker' } = {}
       status,
     });
   }
-  const status =
-    connections.length === 0
-      ? 'no_connections'
-      : connections.some((item) => item.status === 'action_required')
-        ? readyEntries.length
-          ? 'degraded'
-          : 'action_required'
-        : 'ready';
+  let status = 'ready';
+  if (connections.length === 0) {
+    status = 'no_connections';
+  } else if (connections.some((item) => item.status === 'action_required')) {
+    status = readyEntries.length ? 'degraded' : 'action_required';
+  }
   return {
     status,
     reason: status === 'action_required' ? 'connected_account_action_required' : '',
@@ -368,12 +366,7 @@ async function directCapabilityReadiness({ user, executionMode = 'docker' } = {}
   };
 }
 
-async function buildDirectGlassHiveCapabilityBundle({
-  user,
-  workerId,
-  runId,
-  executionMode,
-} = {}) {
+async function buildDirectGlassHiveCapabilityBundle({ user, workerId, runId, executionMode } = {}) {
   const userId = String(user?.id || user?._id || '').trim();
   const cleanWorkerId = normalizeDirectScope(workerId, 'workerId');
   const cleanRunId = normalizeDirectScope(runId, 'runId');
@@ -513,8 +506,7 @@ async function revokeDirectGlassHiveCapabilityGrant({
   }
   return revokeBrokerGrant({
     grant_id: expectedGrantId,
-    renewable_until:
-      Number(renewableUntil) || Math.floor(Date.now() / 1000) + 24 * 60 * 60,
+    renewable_until: Number(renewableUntil) || Math.floor(Date.now() / 1000) + 24 * 60 * 60,
   });
 }
 
@@ -769,10 +761,13 @@ async function revokeScheduledGlassHiveCapabilityGrant({
   });
   const providedGrantId = String(grantId || '').trim();
   if (providedGrantId && providedGrantId !== expectedGrantId) {
-    throw new ScheduledGlassHiveCapabilityError('Scheduled capability revoke grant scope mismatch', {
-      code: 'grant_scope_mismatch',
-      status: 409,
-    });
+    throw new ScheduledGlassHiveCapabilityError(
+      'Scheduled capability revoke grant scope mismatch',
+      {
+        code: 'grant_scope_mismatch',
+        status: 409,
+      },
+    );
   }
   const originalRenewableUntil = Number(renewableUntil);
   const fallbackRevocationTtlSeconds = intEnv(

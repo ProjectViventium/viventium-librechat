@@ -927,9 +927,7 @@ function ConnectedAccounts() {
                     className="mt-0.5"
                     aria-label={localize('com_ui_connected_account_personal_required')}
                     checked={credentialPolicy === 'personal_required'}
-                    disabled={
-                      updatingCredentialPolicy === provider.slug || personalOnlyUnavailable
-                    }
+                    disabled={updatingCredentialPolicy === provider.slug || personalOnlyUnavailable}
                     onChange={(event) =>
                       void updateCredentialPolicy(
                         provider.slug,

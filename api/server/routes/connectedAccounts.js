@@ -224,9 +224,12 @@ function createOAuthState({ provider, userId, codeVerifier, redirectUri, serverO
   cipher.setAAD(OAUTH_STATE_AAD);
   const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
   const tag = cipher.getAuthTag();
-  return [OAUTH_STATE_VERSION, base64UrlEncode(iv), base64UrlEncode(ciphertext), base64UrlEncode(tag)].join(
-    '.',
-  );
+  return [
+    OAUTH_STATE_VERSION,
+    base64UrlEncode(iv),
+    base64UrlEncode(ciphertext),
+    base64UrlEncode(tag),
+  ].join('.');
 }
 
 function decodeOAuthState(token, secret) {

@@ -224,19 +224,18 @@ function directError(res, error) {
     code,
     status: safeStatus,
   });
+  let responseStatus = 'broker_unavailable';
+  if (code === 'owner_binding_required') {
+    responseStatus = 'unmapped';
+  } else if (code === 'connected_account_action_required') {
+    responseStatus = 'action_required';
+  }
   return res.status(safeStatus).json({
     error: {
       code,
       message: 'GlassHive connected capability authorization failed',
     },
-    status:
-      code === 'owner_binding_required'
-        ? 'unmapped'
-        : code === 'issuer_assertion_replay'
-          ? 'broker_unavailable'
-          : code === 'connected_account_action_required'
-            ? 'action_required'
-            : 'broker_unavailable',
+    status: responseStatus,
   });
 }
 

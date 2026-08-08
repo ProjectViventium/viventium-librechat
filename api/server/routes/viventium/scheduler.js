@@ -24,7 +24,7 @@ const {
 const { initializeClient } = require('~/server/services/Endpoints/agents');
 const addTitle = require('~/server/services/Endpoints/agents/title');
 const AgentController = require('~/server/controllers/agents/request');
-const { getUserById, getMessages, getConvo } = require('~/models');
+const { getUserById, getConvo } = require('~/models');
 /* === VIVENTIUM NOTE ===
  * Feature: Scheduler <-> Telegram mapping helper import.
  * === VIVENTIUM NOTE === */
@@ -322,12 +322,12 @@ router.post(
     const text = typeof incoming.text === 'string' ? incoming.text : '';
     const requestedConversationId =
       typeof incoming.conversationId === 'string' ? incoming.conversationId : 'new';
-    const requestedAgentId =
-      typeof incoming.agentId === 'string'
-        ? incoming.agentId
-        : typeof incoming.agent_id === 'string'
-          ? incoming.agent_id
-          : '';
+    let requestedAgentId = '';
+    if (typeof incoming.agentId === 'string') {
+      requestedAgentId = incoming.agentId;
+    } else if (typeof incoming.agent_id === 'string') {
+      requestedAgentId = incoming.agent_id;
+    }
     const scheduleId = typeof incoming.scheduleId === 'string' ? incoming.scheduleId : '';
     const streamId = `scheduler-${crypto.randomUUID()}`;
     const validatedConversationId = await normalizeSchedulerConversationId({

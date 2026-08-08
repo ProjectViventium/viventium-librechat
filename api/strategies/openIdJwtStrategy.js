@@ -66,7 +66,10 @@ function reusedTokenHasRequiredRole(payload) {
 const openIdJwtLogin = (openIdConfig) => {
   /* === VIVENTIUM START === Reused-token verifier boundary. === */
   const metadata = openIdConfig.serverMetadata();
-  const expectedIssuer = String(metadata.issuer || process.env.OPENID_ISSUER || '').replace(/\/$/, '');
+  const expectedIssuer = String(metadata.issuer || process.env.OPENID_ISSUER || '').replace(
+    /\/$/,
+    '',
+  );
   const expectedAudience = String(
     process.env.OPENID_AUDIENCE || process.env.OPENID_CLIENT_ID || '',
   ).trim();

@@ -1,9 +1,7 @@
 /* === VIVENTIUM START ===
  * Feature: Shared-OIDC GlassHive opaque-principal regressions.
  */
-const {
-  glassHivePrincipalIdFromClaims,
-} = require('../GlassHiveSharedOidcIdentity');
+const { glassHivePrincipalIdFromClaims } = require('../GlassHiveSharedOidcIdentity');
 
 describe('GlassHive shared OIDC identity', () => {
   const originalEnv = process.env;
@@ -26,9 +24,7 @@ describe('GlassHive shared OIDC identity', () => {
         iss: 'https://identity.example.test/tenant/v2.0',
         oid: 'stable-subject-a',
       }),
-    ).toBe(
-      'usr_af9431cb40eb3f7689177813cb841b28',
-    );
+    ).toBe('usr_af9431cb40eb3f7689177813cb841b28');
   });
 
   test('never falls back to email or another claim', () => {

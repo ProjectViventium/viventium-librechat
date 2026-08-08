@@ -102,9 +102,7 @@ describe('Connected Accounts Routes', () => {
   it('should reject personal-required mode when setup is disabled and no personal credential exists', async () => {
     process.env.VIVENTIUM_CONNECTED_ACCOUNTS_ENABLED = 'false';
     process.env.VIVENTIUM_LOCAL_SUBSCRIPTION_AUTH = 'false';
-    getUserKey.mockRejectedValueOnce(
-      new Error(JSON.stringify({ type: ErrorTypes.NO_USER_KEY })),
-    );
+    getUserKey.mockRejectedValueOnce(new Error(JSON.stringify({ type: ErrorTypes.NO_USER_KEY })));
 
     const response = await request(app)
       .put('/api/connected-accounts/anthropic/policy')

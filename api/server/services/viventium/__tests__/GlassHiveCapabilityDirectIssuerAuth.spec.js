@@ -22,10 +22,7 @@ function tokenFor(overrides = {}) {
     nonce: '1234567890abcdef1234567890abcdef',
     ...overrides,
   };
-  claims.sig = signatureFor(
-    claims,
-    process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_ISSUER_SECRET,
-  );
+  claims.sig = signatureFor(claims, process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_ISSUER_SECRET);
   return Buffer.from(JSON.stringify(claims), 'utf8').toString('base64url');
 }
 

@@ -28,7 +28,11 @@ function glassHivePrincipalIdFromClaims(claims = {}) {
     return '';
   }
   const subject = String(claims?.[principalClaim] || '').trim();
-  if (!subject || subject.length > 512 || /[\u0000-\u001f\u007f]/.test(subject)) {
+  const hasControlCharacter = Array.from(subject).some((character) => {
+    const codePoint = character.codePointAt(0);
+    return codePoint <= 0x1f || codePoint === 0x7f;
+  });
+  if (!subject || subject.length > 512 || hasControlCharacter) {
     return '';
   }
   const digest = crypto.createHash('sha256').update(`${issuer}\0${subject}`).digest('hex');

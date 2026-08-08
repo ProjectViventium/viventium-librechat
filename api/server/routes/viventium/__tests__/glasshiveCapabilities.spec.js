@@ -13,6 +13,11 @@ jest.mock('@librechat/data-schemas', () => ({
   },
 }));
 
+jest.mock('~/models', () => ({
+  findUser: jest.fn(),
+  getUserById: jest.fn(),
+}));
+
 jest.mock('librechat-data-provider', () => ({
   CacheKeys: { FLOWS: 'flows' },
 }));
@@ -31,6 +36,16 @@ jest.mock('~/server/services/viventium/GlassHiveCapabilityBrokerService', () => 
   buildCapabilityCatalog: (...args) => mockBuildCapabilityCatalog(...args),
   handleToolCall: (...args) => mockHandleToolCall(...args),
   toolDefinitionsForMcp: (...args) => mockToolDefinitionsForMcp(...args),
+}));
+
+jest.mock('~/server/services/viventium/GlassHiveCapabilityBootstrapService', () => ({
+  buildDirectGlassHiveCapabilityBundle: jest.fn(),
+  directCapabilityReadiness: jest.fn(),
+  revokeDirectGlassHiveCapabilityGrant: jest.fn(),
+}));
+
+jest.mock('~/server/services/viventium/GlassHiveCapabilityDirectIssuerAuth', () => ({
+  verifyDirectIssuerAssertion: jest.fn(),
 }));
 
 function appWithRoute({ requestSignal } = {}) {
@@ -163,6 +178,31 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
         grant: expect.objectContaining({ renewed: true }),
       }),
     );
+  });
+
+  test('rejects a revoked scheduled grant even inside its renewal window', async () => {
+    const {
+      mintBrokerGrant,
+      revokeBrokerGrant,
+    } = require('~/server/services/viventium/GlassHiveCapabilityBrokerAuth');
+    const { token, payload } = mintBrokerGrant({
+      user: { id: 'user-1', role: 'USER' },
+      grantId: 'ghcb_sched_revoked_route',
+      allowedServers: ['google_workspace'],
+      ttlSeconds: 60,
+      renewableTtlSeconds: 600,
+      nowMs: Date.now() - 120_000,
+    });
+    await revokeBrokerGrant(payload);
+
+    const response = await request(appWithRoute())
+      .post('/api/viventium/glasshive/capabilities/mcp')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ jsonrpc: '2.0', id: 8, method: 'tools/list' })
+      .expect(401);
+
+    expect(response.body.error.message).toBe('Unauthorized GlassHive capability broker request');
+    expect(mockBuildCapabilityCatalog).not.toHaveBeenCalled();
   });
 
   test('accepts MCP initialized notifications without a JSON-RPC response body', async () => {

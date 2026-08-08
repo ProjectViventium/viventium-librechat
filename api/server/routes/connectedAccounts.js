@@ -1,12 +1,26 @@
 const crypto = require('crypto');
 const express = require('express');
 const http = require('http');
-const jwt = require('jsonwebtoken');
 const { logger } = require('@librechat/data-schemas');
-const { EModelEndpoint } = require('librechat-data-provider');
+const {
+  EModelEndpoint,
+  ErrorTypes,
+  connectedAccountCredentialPolicies,
+  connectedAccountCredentialPolicyKey,
+  normalizeConnectedAccountCredentialPolicy,
+} = require('librechat-data-provider');
 const { getBasePath, isEnabled } = require('@librechat/api');
-const { updateUserKey } = require('~/models');
+const { deleteUserKey, getUserKey, updateUserKey } = require('~/models');
 const { requireJwtAuth } = require('~/server/middleware');
+/* === VIVENTIUM START ===
+ * Feature: Truthful personal-only credential policy.
+ * Purpose: Do not let a user opt out of platform credentials when neither a saved personal
+ * credential nor a supported setup path exists.
+ */
+const {
+  isConnectedAccountsCapabilityEnabled,
+} = require('~/server/services/viventium/connectedAccountsCapability');
+/* === VIVENTIUM END === */
 
 const router = express.Router();
 const OAUTH_STATE_TTL_SECONDS = 30 * 60;
@@ -16,7 +30,8 @@ const OPENAI_LOCAL_CALLBACK_PORT = 1455;
 const OPENAI_LOCAL_CALLBACK_PATH = '/auth/callback';
 const OPENAI_LOCAL_REDIRECT_URI = `http://localhost:${OPENAI_LOCAL_CALLBACK_PORT}${OPENAI_LOCAL_CALLBACK_PATH}`;
 const ANTHROPIC_MANUAL_REDIRECT_URI = 'https://platform.claude.com/oauth/code/callback';
-const ANTHROPIC_PENDING_STATE_TTL_MS = OAUTH_STATE_TTL_SECONDS * 1000;
+const OAUTH_STATE_VERSION = 'v1';
+const OAUTH_STATE_AAD = Buffer.from('viventium-connected-account-oauth-state-v1', 'utf8');
 
 const OPENAI_CODEX_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
 const ANTHROPIC_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
@@ -40,7 +55,6 @@ const CONNECTED_ACCOUNTS_RETURN_ORIGIN_ENV = 'VIVENTIUM_CONNECTED_ACCOUNTS_RETUR
 
 let openAILocalCallbackServerPromise;
 let openAILocalCallbackServerStatus;
-const pendingAnthropicStates = new Map();
 
 class OAuthFlowError extends Error {
   constructor(code, message, status = 400) {
@@ -53,6 +67,52 @@ class OAuthFlowError extends Error {
 function isSupportedProvider(provider) {
   return provider === 'openai' || provider === 'anthropic';
 }
+
+/* === VIVENTIUM START ===
+ * Feature: Per-user connected-account credential policy.
+ * Purpose: Persist a non-secret personal-only opt-out separately from provider credentials.
+ */
+function isNoUserKeyError(error) {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  try {
+    return JSON.parse(error.message)?.type === ErrorTypes.NO_USER_KEY;
+  } catch {
+    return false;
+  }
+}
+
+async function getConnectedAccountCredentialPolicy(userId, provider) {
+  try {
+    const value = await getUserKey({
+      userId,
+      name: connectedAccountCredentialPolicyKey(provider),
+    });
+    return normalizeConnectedAccountCredentialPolicy(value);
+  } catch (error) {
+    if (isNoUserKeyError(error)) {
+      return normalizeConnectedAccountCredentialPolicy(undefined);
+    }
+    throw error;
+  }
+}
+
+async function hasSavedPersonalCredential(userId, provider) {
+  try {
+    const value = await getUserKey({
+      userId,
+      name: getProviderEndpoint(provider),
+    });
+    return typeof value === 'string' && value.trim().length > 0;
+  } catch (error) {
+    if (isNoUserKeyError(error)) {
+      return false;
+    }
+    throw error;
+  }
+}
+/* === VIVENTIUM END === */
 
 function isExperimentalDirectSubscriptionAuthEnabled() {
   /* === VIVENTIUM START ===
@@ -131,54 +191,83 @@ function createPKCE() {
   return { verifier, challenge };
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Confidential, replica-safe OAuth state.
+ * Purpose: PKCE verifiers and internal user identifiers must not appear in the browser-visible
+ * state parameter. AES-GCM keeps the state self-contained for multi-replica callbacks while the
+ * provider authorization code remains the one-time replay boundary.
+ * === VIVENTIUM END === */
+function oauthStateKey(secret) {
+  return crypto
+    .createHash('sha256')
+    .update(`viventium:connected-account-oauth-state:${secret}`, 'utf8')
+    .digest();
+}
+
 function createOAuthState({ provider, userId, codeVerifier, redirectUri, serverOrigin, secret }) {
-  return jwt.sign(
-    {
+  const now = Math.floor(Date.now() / 1000);
+  const plaintext = Buffer.from(
+    JSON.stringify({
       provider,
       userId,
       codeVerifier,
       redirectUri,
       serverOrigin,
       nonce: crypto.randomUUID(),
-    },
-    secret,
-    { expiresIn: OAUTH_STATE_TTL_SECONDS },
+      iat: now,
+      exp: now + OAUTH_STATE_TTL_SECONDS,
+    }),
+    'utf8',
   );
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', oauthStateKey(secret), iv);
+  cipher.setAAD(OAUTH_STATE_AAD);
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return [
+    OAUTH_STATE_VERSION,
+    base64UrlEncode(iv),
+    base64UrlEncode(ciphertext),
+    base64UrlEncode(tag),
+  ].join('.');
 }
 
-function purgePendingAnthropicStates() {
-  const now = Date.now();
-  for (const [state, entry] of pendingAnthropicStates.entries()) {
-    if (!entry || typeof entry.expiresAt !== 'number' || entry.expiresAt <= now) {
-      pendingAnthropicStates.delete(state);
-    }
-  }
-}
-
-function setPendingAnthropicState({ state, userId, codeVerifier, redirectUri, serverOrigin }) {
-  purgePendingAnthropicStates();
-  pendingAnthropicStates.set(state, {
-    provider: 'anthropic',
-    userId,
-    codeVerifier,
-    redirectUri,
-    serverOrigin,
-    expiresAt: Date.now() + ANTHROPIC_PENDING_STATE_TTL_MS,
-  });
-}
-
-function getPendingAnthropicState(state) {
-  if (typeof state !== 'string' || state.length === 0) {
+function decodeOAuthState(token, secret) {
+  if (typeof token !== 'string' || !secret) {
     return null;
   }
-  purgePendingAnthropicStates();
-  const entry = pendingAnthropicStates.get(state);
-  return entry ?? null;
-}
-
-function deletePendingAnthropicState(state) {
-  if (typeof state === 'string' && state.length > 0) {
-    pendingAnthropicStates.delete(state);
+  const parts = token.split('.');
+  if (parts.length !== 4 || parts[0] !== OAUTH_STATE_VERSION) {
+    return null;
+  }
+  try {
+    const iv = Buffer.from(parts[1], 'base64url');
+    const ciphertext = Buffer.from(parts[2], 'base64url');
+    const tag = Buffer.from(parts[3], 'base64url');
+    if (iv.length !== 12 || tag.length !== 16 || ciphertext.length === 0) {
+      return null;
+    }
+    const decipher = crypto.createDecipheriv('aes-256-gcm', oauthStateKey(secret), iv);
+    decipher.setAAD(OAUTH_STATE_AAD);
+    decipher.setAuthTag(tag);
+    const decoded = JSON.parse(
+      Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8'),
+    );
+    const now = Math.floor(Date.now() / 1000);
+    if (
+      typeof decoded !== 'object' ||
+      decoded == null ||
+      !Number.isInteger(decoded.iat) ||
+      !Number.isInteger(decoded.exp) ||
+      decoded.iat > now + 60 ||
+      decoded.exp < now ||
+      decoded.exp - decoded.iat !== OAUTH_STATE_TTL_SECONDS
+    ) {
+      return null;
+    }
+    return decoded;
+  } catch {
+    return null;
   }
 }
 
@@ -204,11 +293,6 @@ function extractOpenAIAccountId(accessToken) {
   const payload = parseJWTPayload(accessToken);
   const accountId = payload?.['https://api.openai.com/auth']?.chatgpt_account_id;
   return typeof accountId === 'string' && accountId.length > 0 ? accountId : null;
-}
-
-function decodeOAuthState(token) {
-  const decoded = jwt.decode(token);
-  return decoded && typeof decoded === 'object' ? decoded : null;
 }
 
 function toAbsolutePath(serverOrigin, pathOrUrl) {
@@ -457,7 +541,7 @@ function errorRedirect(errorCode, provider) {
 }
 
 function createOpenAICallbackUrl(provider, errorCode, state, params = {}) {
-  const decoded = typeof state === 'string' ? decodeOAuthState(state) : null;
+  const decoded = typeof state === 'string' ? decodeOAuthState(state, getJWTSecret()) : null;
   const serverOrigin =
     typeof decoded?.serverOrigin === 'string'
       ? decoded.serverOrigin
@@ -484,18 +568,10 @@ async function completeConnectedAccount({ provider, code, state, secret, expecte
     throw new OAuthFlowError('missing_state', 'Missing OAuth state');
   }
 
-  let decodedState = null;
-  if (provider === 'anthropic') {
-    decodedState = getPendingAnthropicState(state);
-  }
-
+  const decodedState = decodeOAuthState(state, secret);
   if (!decodedState) {
-    try {
-      decodedState = jwt.verify(state, secret);
-    } catch (verifyError) {
-      logger.error('[Connected Accounts] Invalid OAuth state', verifyError);
-      throw new OAuthFlowError('invalid_state', 'Invalid OAuth state');
-    }
+    logger.error('[Connected Accounts] Invalid or expired confidential OAuth state');
+    throw new OAuthFlowError('invalid_state', 'Invalid OAuth state');
   }
 
   if (
@@ -539,10 +615,6 @@ async function completeConnectedAccount({ provider, code, state, secret, expecte
         ? null
         : getTokenExpiryDate(tokenData.expires_in),
     });
-
-    if (provider === 'anthropic') {
-      deletePendingAnthropicState(state);
-    }
 
     return { decodedState, value };
   } catch (callbackError) {
@@ -645,11 +717,55 @@ async function ensureOpenAILocalCallbackServer() {
 }
 
 /* === VIVENTIUM START ===
- * Feature: Local Connected Accounts OAuth login flows (OpenClaw-aligned).
- * Purpose: For local/self-hosted deployments:
- * - OpenAI Codex uses 127.0.0.1:1455 callback with ChatGPT OAuth parameters.
- * - Anthropic uses browser sign-in + manual callback/code completion.
- * === VIVENTIUM END === */
+ * Feature: Per-user connected-account credential policy routes.
+ * Purpose: Read and persist an authenticated user's non-secret provider fallback choice.
+ */
+router.get('/:provider/policy', requireJwtAuth, async (req, res) => {
+  const provider = req.params.provider;
+  if (!isSupportedProvider(provider)) {
+    return res.status(404).json({ error: 'Unsupported provider' });
+  }
+
+  try {
+    const policy = await getConnectedAccountCredentialPolicy(req.user.id, provider);
+    return res.status(200).json({ policy });
+  } catch (error) {
+    logger.error('[Connected Accounts] Failed to read credential policy', error);
+    return res.status(500).json({ error: 'policy_unavailable' });
+  }
+});
+
+router.put('/:provider/policy', requireJwtAuth, async (req, res) => {
+  const provider = req.params.provider;
+  const policy = req.body?.policy;
+  if (!isSupportedProvider(provider)) {
+    return res.status(404).json({ error: 'Unsupported provider' });
+  }
+  if (!connectedAccountCredentialPolicies.includes(policy)) {
+    return res.status(400).json({ error: 'invalid_policy' });
+  }
+
+  const name = connectedAccountCredentialPolicyKey(provider);
+  try {
+    if (policy === 'personal_required') {
+      const personalCredentialAvailable =
+        isConnectedAccountsCapabilityEnabled() ||
+        (await hasSavedPersonalCredential(req.user.id, provider));
+      if (!personalCredentialAvailable) {
+        return res.status(409).json({ error: 'personal_credential_unavailable' });
+      }
+      await updateUserKey({ userId: req.user.id, name, value: policy, expiresAt: null });
+    } else {
+      await deleteUserKey({ userId: req.user.id, name });
+    }
+    return res.status(200).json({ policy });
+  } catch (error) {
+    logger.error('[Connected Accounts] Failed to update credential policy', error);
+    return res.status(500).json({ error: 'policy_update_failed' });
+  }
+});
+/* === VIVENTIUM END === */
+
 router.get('/:provider/start', requireJwtAuth, async (req, res) => {
   const provider = req.params.provider;
   const secret = getJWTSecret();
@@ -672,27 +788,14 @@ router.get('/:provider/start', requireJwtAuth, async (req, res) => {
     const redirectUri =
       provider === 'openai' ? getOpenAICallbackRedirectUri() : getAnthropicRedirectUri();
     const serverOrigin = getServerOrigin();
-    const state =
-      provider === 'openai'
-        ? createOAuthState({
-            provider,
-            userId: req.user.id,
-            codeVerifier: verifier,
-            redirectUri,
-            serverOrigin,
-            secret,
-          })
-        : verifier;
-
-    if (provider === 'anthropic') {
-      setPendingAnthropicState({
-        state,
-        userId: req.user.id,
-        codeVerifier: verifier,
-        redirectUri,
-        serverOrigin,
-      });
-    }
+    const state = createOAuthState({
+      provider,
+      userId: req.user.id,
+      codeVerifier: verifier,
+      redirectUri,
+      serverOrigin,
+      secret,
+    });
 
     const flowMode =
       provider === 'openai'

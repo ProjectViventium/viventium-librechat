@@ -40,6 +40,11 @@ const glasshive = require('./glasshive');
  * Feature: GlassHive connected-account capability broker MCP endpoint.
  * === VIVENTIUM NOTE === */
 const glasshiveCapabilities = require('./glasshiveCapabilities');
+/* === VIVENTIUM START ===
+ * Feature: LibreChat-owned GlassHive inference credential broker.
+ */
+const glasshiveInference = require('./glasshiveInference');
+/* === VIVENTIUM END === */
 /* === VIVENTIUM NOTE ===
  * Feature: Prompt Workbench local launcher route.
  * === VIVENTIUM NOTE === */
@@ -65,6 +70,9 @@ router.use('/auth', auth);
 router.use('/skyvern', skyvern);
 router.use('/glasshive', glasshive);
 router.use('/glasshive/capabilities', glasshiveCapabilities);
+/* === VIVENTIUM START === GlassHive inference credential broker route. === */
+router.use('/glasshive/inference', glasshiveInference);
+/* === VIVENTIUM END === */
 router.use('/prompt-workbench', promptWorkbench);
 router.use('/feelings', feelings);
 router.use('/channels', channels);

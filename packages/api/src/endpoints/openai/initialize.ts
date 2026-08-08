@@ -12,6 +12,9 @@ import {
   forceRefreshOpenAISubscriptionUserValues,
   resolveOpenAISubscriptionUserValues,
 } from './oauthSubscription';
+/* === VIVENTIUM START === Connected Accounts credential policy === */
+import { resolveConnectedAccountCredentialPolicy } from '../connectedAccounts/policy';
+/* === VIVENTIUM END === */
 
 /* === VIVENTIUM START ===
  * Feature: Connected Accounts routing policy.
@@ -128,6 +131,16 @@ export async function initializeOpenAI({
 
   const { key: expiresAt } = req.body;
   const modelName = model_parameters?.model as string | undefined;
+  /* === VIVENTIUM START ===
+   * Feature: Per-user connected-account credential policy.
+   * Purpose: Resolve the personal-only opt-out before any platform credential can be selected.
+   * === VIVENTIUM END === */
+  const credentialPolicy = await resolveConnectedAccountCredentialPolicy({
+    userId: req.user?.id ?? '',
+    provider: 'openai',
+    db,
+  });
+  const personalCredentialsRequired = credentialPolicy === 'personal_required';
 
   const credentials = {
     [EModelEndpoint.openAI]: OPENAI_API_KEY,
@@ -153,14 +166,22 @@ export async function initializeOpenAI({
     if (isNoUserKeyError(error)) {
       userValues = null;
     } else if (isOpenAIConnectedAccountReadError(error)) {
-      if (isConnectedAccountAuthMode()) {
+      /* === VIVENTIUM START === Personal-required credential policy === */
+      if (personalCredentialsRequired || isConnectedAccountAuthMode()) {
         throw openAIConnectedAccountReconnectError();
       }
+      /* === VIVENTIUM END === */
       userValues = null;
     } else if (isOpenAIConnectedAccountOAuthFailure(error)) {
-      if (isConnectedAccountAuthMode() || !allowPlatformFallbackOnOAuthFailure(req)) {
+      /* === VIVENTIUM START === Personal-required credential policy === */
+      if (
+        personalCredentialsRequired ||
+        isConnectedAccountAuthMode() ||
+        !allowPlatformFallbackOnOAuthFailure(req)
+      ) {
         throw openAIConnectedAccountReconnectError();
       }
+      /* === VIVENTIUM END === */
       userValues = null;
     } else {
       throw error;
@@ -173,9 +194,11 @@ export async function initializeOpenAI({
   const isOpenAIOAuthSubscription = userValues?.oauthProvider === 'openai-codex';
 
   let apiKey = credentials[endpoint as keyof typeof credentials];
-  if (userProvidesKey) {
+  /* === VIVENTIUM START === Personal-required credential policy === */
+  if (userProvidesKey || personalCredentialsRequired) {
     apiKey = undefined;
   }
+  /* === VIVENTIUM END === */
   if (hasUserApiKey) {
     apiKey = userValues?.apiKey;
   }
@@ -211,11 +234,7 @@ export async function initializeOpenAI({
         latestValues.apiKey &&
         latestValues.apiKey !== initializedAccessToken
           ? latestValues
-          : await forceRefreshOpenAISubscriptionUserValues(
-              req.user?.id ?? '',
-              latestValues,
-              db,
-            );
+          : await forceRefreshOpenAISubscriptionUserValues(req.user?.id ?? '', latestValues, db);
 
       if (!resolvedValues.apiKey) {
         throw openAIConnectedAccountReconnectError();
@@ -287,8 +306,17 @@ export async function initializeOpenAI({
     apiKey = clientOptions.azure ? clientOptions.azure.azureOpenAIApiKey : undefined;
   }
 
-  if (userProvidesKey && !apiKey) {
-    if (isConnectedAccountAuthMode()) {
+  /* === VIVENTIUM START ===
+   * Feature: Personal-required credential policy.
+   * Purpose: Azure/OpenAI platform configuration must not reintroduce a shared key after opt-out.
+   * === VIVENTIUM END === */
+  if (personalCredentialsRequired && !hasUserApiKey) {
+    apiKey = undefined;
+  }
+
+  /* === VIVENTIUM START === Personal-required credential policy === */
+  if ((userProvidesKey || personalCredentialsRequired) && !apiKey) {
+    if (personalCredentialsRequired || isConnectedAccountAuthMode()) {
       throw new Error(
         JSON.stringify({
           type: ErrorTypes.CONNECTED_ACCOUNT_REQUIRED,
@@ -303,6 +331,7 @@ export async function initializeOpenAI({
       }),
     );
   }
+  /* === VIVENTIUM END === */
 
   if (!apiKey) {
     throw new Error(`${endpoint} API Key not provided.`);

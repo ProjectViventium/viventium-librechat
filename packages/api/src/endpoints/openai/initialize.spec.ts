@@ -142,8 +142,7 @@ describe('initializeOpenAI', () => {
           chatgpt_account_id: 'acct_refreshed',
         },
       }),
-    )
-      .toString('base64url');
+    ).toString('base64url');
     const refreshedAccessToken = `header.${accessTokenPayload}.signature`;
     const mockFetch = jest.mocked(global.fetch);
     mockFetch.mockResolvedValue({
@@ -452,6 +451,52 @@ describe('initializeOpenAI', () => {
       expect.any(Object),
       EModelEndpoint.openAI,
     );
+  });
+
+  it('should not fallback to the platform key when personal credentials are required', async () => {
+    const params = createParams({
+      dbOverrides: {
+        getUserKey: jest.fn().mockResolvedValue('personal_required'),
+      },
+    });
+
+    await expect(initializeOpenAI(params)).rejects.toThrow();
+
+    try {
+      await initializeOpenAI(params);
+    } catch (error) {
+      const parsedError = JSON.parse((error as Error).message);
+      expect(parsedError.type).toBe(ErrorTypes.CONNECTED_ACCOUNT_REQUIRED);
+      expect(parsedError.info).toBe(EModelEndpoint.openAI);
+    }
+    expect(mockGetOpenAIConfig).not.toHaveBeenCalled();
+  });
+
+  it('should preserve platform fallback when personal credentials are only preferred', async () => {
+    const params = createParams({
+      dbOverrides: {
+        getUserKey: jest.fn().mockResolvedValue('personal_preferred'),
+      },
+    });
+
+    await initializeOpenAI(params);
+
+    expect(mockGetOpenAIConfig).toHaveBeenCalledWith(
+      'platform-openai-key',
+      expect.any(Object),
+      EModelEndpoint.openAI,
+    );
+  });
+
+  it('should fail closed when the stored credential policy cannot be read', async () => {
+    const params = createParams({
+      dbOverrides: {
+        getUserKey: jest.fn().mockRejectedValue(new Error('bad decrypt')),
+      },
+    });
+
+    await expect(initializeOpenAI(params)).rejects.toThrow('bad decrypt');
+    expect(mockGetOpenAIConfig).not.toHaveBeenCalled();
   });
 
   it('should surface reconnect guidance when connected-account auth cannot read the stored key', async () => {

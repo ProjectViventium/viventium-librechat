@@ -876,6 +876,8 @@ export type TStartupConfig = {
    * Purpose: Expose the novice-facing OpenAI/Anthropic credential setup surface.
    * === VIVENTIUM END === */
   viventiumConnectedAccountsEnabled?: boolean;
+  /** Keep the per-user shared-credential opt-out visible independently from account setup. */
+  viventiumCredentialPolicyEnabled?: boolean;
   /** Explicit opt-in for legacy direct provider subscription OAuth. Defaults false. */
   viventiumExperimentalDirectSubscriptionAuth?: boolean;
   /* === VIVENTIUM START ===

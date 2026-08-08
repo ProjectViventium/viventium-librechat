@@ -13,8 +13,15 @@ dependencies = [
   "fastmcp>=2.12.5",
   "pydantic>=2.7",
   "croniter>=2.0",
+  "python-dateutil>=2.9",
   "md2tgmd>=0.3.10",
 ]
 
 [project.scripts]
 scheduling-cortex = "scheduling_cortex.server:main"
+
+[dependency-groups]
+test = [
+  "fastapi>=0.139,<1.0",
+  "pytest>=9.1,<10.0",
+]

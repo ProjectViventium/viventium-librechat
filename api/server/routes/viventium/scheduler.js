@@ -24,7 +24,7 @@ const {
 const { initializeClient } = require('~/server/services/Endpoints/agents');
 const addTitle = require('~/server/services/Endpoints/agents/title');
 const AgentController = require('~/server/controllers/agents/request');
-const { getUserById, getMessages, getConvo } = require('~/models');
+const { getUserById, getConvo } = require('~/models');
 /* === VIVENTIUM NOTE ===
  * Feature: Scheduler <-> Telegram mapping helper import.
  * === VIVENTIUM NOTE === */
@@ -51,6 +51,10 @@ const { getCortexMessageState } = require('~/server/services/viventium/cortexMes
 const {
   normalizeScheduledAgentExecution,
 } = require('~/server/services/viventium/scheduledAgentOverride');
+const {
+  buildScheduledGlassHiveCapabilityBundle,
+  revokeScheduledGlassHiveCapabilityGrant,
+} = require('~/server/services/viventium/GlassHiveCapabilityBootstrapService');
 
 const router = express.Router();
 const SCHEDULER_SECRET_HEADER = 'x-viventium-scheduler-secret';
@@ -219,6 +223,81 @@ async function schedulerAuth(req, res, next) {
   }
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Scheduling Cortex fire-time GlassHive capability authorization.
+ * Purpose: Revalidate the current user policy/consent immediately before dispatch and revoke the
+ * deterministic run grant on terminal callbacks. The scheduler never stores provider credentials.
+ */
+function scheduledCapabilityInput(req) {
+  const body = req.body || {};
+  let requiredServerNames = [];
+  if (Array.isArray(body.requiredServerNames)) {
+    requiredServerNames = body.requiredServerNames;
+  } else if (Array.isArray(body.required_server_names)) {
+    requiredServerNames = body.required_server_names;
+  }
+  const input = {
+    user: req.user,
+    scheduleId: body.scheduleId ?? body.schedule_id,
+    scheduledRunId: body.scheduledRunId ?? body.scheduled_run_id,
+    executionMode: body.executionMode ?? body.execution_mode,
+    requiredServerNames,
+  };
+  const grantId = body.grantId ?? body.grant_id;
+  const renewableUntil = body.renewableUntil ?? body.renewable_until;
+  if (grantId != null) input.grantId = grantId;
+  if (renewableUntil != null) input.renewableUntil = renewableUntil;
+  return input;
+}
+
+function scheduledCapabilityError(res, error) {
+  const status = Number(error?.status);
+  const safeStatus = Number.isInteger(status) && status >= 400 && status <= 599 ? status : 500;
+  const reason = String(error?.code || 'scheduled_capability_failed').replace(
+    /[^a-z0-9_.:-]/gi,
+    '',
+  );
+  const serverNames = Array.isArray(error?.serverNames)
+    ? error.serverNames
+        .map((value) => String(value || '').trim())
+        .filter((value) => /^[A-Za-z0-9_.:-]{1,120}$/.test(value))
+        .sort()
+    : [];
+  logger.warn('[VIVENTIUM][scheduler] Scheduled GlassHive capability authorization failed', {
+    reason,
+    status: safeStatus,
+    serverNames,
+  });
+  return res.status(safeStatus).json({
+    error: 'Scheduled GlassHive capability authorization failed',
+    reason,
+    failure_class: reason,
+    failure_retryable: safeStatus >= 500,
+    action_required: reason === 'connected_account_action_required',
+    server_names: serverNames,
+  });
+}
+
+router.post('/glasshive-capabilities/grant', schedulerAuth, async (req, res) => {
+  try {
+    return res.json(await buildScheduledGlassHiveCapabilityBundle(scheduledCapabilityInput(req)));
+  } catch (error) {
+    return scheduledCapabilityError(res, error);
+  }
+});
+
+router.post('/glasshive-capabilities/revoke', schedulerAuth, async (req, res) => {
+  try {
+    const input = scheduledCapabilityInput(req);
+    delete input.requiredServerNames;
+    const result = await revokeScheduledGlassHiveCapabilityGrant(input);
+    return res.json({ revoked: result.revoked === true, grant_id: result.grantId });
+  } catch (error) {
+    return scheduledCapabilityError(res, error);
+  }
+});
+/* === VIVENTIUM END === */
+
 router.post(
   '/chat',
   schedulerAuth,
@@ -243,12 +322,12 @@ router.post(
     const text = typeof incoming.text === 'string' ? incoming.text : '';
     const requestedConversationId =
       typeof incoming.conversationId === 'string' ? incoming.conversationId : 'new';
-    const requestedAgentId =
-      typeof incoming.agentId === 'string'
-        ? incoming.agentId
-        : typeof incoming.agent_id === 'string'
-          ? incoming.agent_id
-          : '';
+    let requestedAgentId = '';
+    if (typeof incoming.agentId === 'string') {
+      requestedAgentId = incoming.agentId;
+    } else if (typeof incoming.agent_id === 'string') {
+      requestedAgentId = incoming.agent_id;
+    }
     const scheduleId = typeof incoming.scheduleId === 'string' ? incoming.scheduleId : '';
     const streamId = `scheduler-${crypto.randomUUID()}`;
     const validatedConversationId = await normalizeSchedulerConversationId({

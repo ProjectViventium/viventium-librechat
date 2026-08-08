@@ -2,8 +2,10 @@ const { SystemRoles } = require('librechat-data-provider');
 
 // --- Capture the verify callback from JwtStrategy ---
 let capturedVerifyCallback;
+let capturedStrategyOptions;
 jest.mock('passport-jwt', () => ({
-  Strategy: jest.fn((_opts, verifyCallback) => {
+  Strategy: jest.fn((opts, verifyCallback) => {
+    capturedStrategyOptions = opts;
     capturedVerifyCallback = verifyCallback;
     return { name: 'jwt' };
   }),
@@ -23,6 +25,7 @@ jest.mock('@librechat/data-schemas', () => ({
 jest.mock('@librechat/api', () => ({
   isEnabled: jest.fn(() => false),
   findOpenIDUser: jest.fn(),
+  isEmailDomainAllowed: jest.fn(() => true),
   math: jest.fn((val, fallback) => fallback),
 }));
 jest.mock('~/models', () => ({
@@ -42,12 +45,17 @@ jest.mock('~/cache/getLogStores', () =>
 );
 
 const { findOpenIDUser } = require('@librechat/api');
+const { isEmailDomainAllowed } = require('@librechat/api');
 const openIdJwtLogin = require('./openIdJwtStrategy');
 const { findUser, updateUser } = require('~/models');
+const { getAppConfig } = require('~/server/services/Config');
 
 // Helper: build a mock openIdConfig
 const mockOpenIdConfig = {
-  serverMetadata: () => ({ jwks_uri: 'https://example.com/.well-known/jwks.json' }),
+  serverMetadata: () => ({
+    issuer: 'https://identity.example.test/tenant/v2.0',
+    jwks_uri: 'https://example.com/.well-known/jwks.json',
+  }),
 };
 
 // Helper: invoke the captured verify callback
@@ -73,11 +81,70 @@ describe('openIdJwtStrategy – token source handling', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    process.env.OPENID_CLIENT_ID = 'librechat-web';
+    process.env.OPENID_AUDIENCE = 'api://librechat';
+    delete process.env.OPENID_REQUIRED_ROLE;
+    delete process.env.OPENID_REQUIRED_ROLE_PARAMETER_PATH;
+    /* === VIVENTIUM START === Shared-OIDC test isolation. === */
+    delete process.env.VIVENTIUM_GLASSHIVE_SHARED_OIDC_ISSUER;
+    delete process.env.VIVENTIUM_GLASSHIVE_SHARED_OIDC_PRINCIPAL_CLAIM;
+    /* === VIVENTIUM END === */
     findOpenIDUser.mockResolvedValue({ user: { ...baseUser }, error: null, migration: false });
+    getAppConfig.mockResolvedValue({ registration: { allowedDomains: ['example.com'] } });
+    isEmailDomainAllowed.mockReturnValue(true);
     updateUser.mockResolvedValue({});
 
     // Initialize the strategy so capturedVerifyCallback is set
     openIdJwtLogin(mockOpenIdConfig);
+  });
+
+  it('pins issuer, audience, and RS256 before accepting a reused bearer token', () => {
+    expect(capturedStrategyOptions).toEqual(
+      expect.objectContaining({
+        issuer: 'https://identity.example.test/tenant/v2.0',
+        audience: 'api://librechat',
+        algorithms: ['RS256'],
+      }),
+    );
+  });
+
+  it('rejects a reused token when its email is outside the current domain policy', async () => {
+    isEmailDomainAllowed.mockReturnValue(false);
+
+    const result = await invokeVerify(
+      { headers: { authorization: 'Bearer raw-bearer-token' }, session: {} },
+      payload,
+    );
+
+    expect(result.user).toBe(false);
+    expect(result.info).toEqual({ message: 'OpenID account is not authorized' });
+    expect(findOpenIDUser).not.toHaveBeenCalled();
+  });
+
+  it('rejects a reused token when its required role was removed', async () => {
+    process.env.OPENID_REQUIRED_ROLE = 'Workspace.User';
+    process.env.OPENID_REQUIRED_ROLE_PARAMETER_PATH = 'roles';
+
+    const result = await invokeVerify(
+      { headers: { authorization: 'Bearer raw-bearer-token' }, session: {} },
+      { ...payload, roles: ['Other.Role'] },
+    );
+
+    expect(result.user).toBe(false);
+    expect(result.info).toEqual({ message: 'OpenID account is not authorized' });
+    expect(findOpenIDUser).not.toHaveBeenCalled();
+  });
+
+  it('accepts a reused token carrying one of the approved roles', async () => {
+    process.env.OPENID_REQUIRED_ROLE = 'Workspace.Reader, Workspace.User';
+    process.env.OPENID_REQUIRED_ROLE_PARAMETER_PATH = 'roles';
+
+    const { user } = await invokeVerify(
+      { headers: { authorization: 'Bearer raw-bearer-token' }, session: {} },
+      { ...payload, roles: ['Workspace.User'] },
+    );
+
+    expect(user.id).toBe('user-abc');
   });
 
   it('should read all tokens from session when available', async () => {
@@ -191,6 +258,46 @@ describe('openIdJwtStrategy – token source handling', () => {
     expect(user.federatedTokens.id_token).toBe('the-id-token');
     expect(user.federatedTokens.access_token).not.toBe(user.federatedTokens.id_token);
   });
+
+  /* === VIVENTIUM START ===
+   * Feature: Shared-OIDC GlassHive authenticated JWT-login backfill.
+   */
+  it('should backfill the opaque GlassHive principal from the exact configured issuer and claim', async () => {
+    process.env.VIVENTIUM_GLASSHIVE_SHARED_OIDC_ISSUER =
+      'https://identity.example.test/tenant/v2.0';
+    process.env.VIVENTIUM_GLASSHIVE_SHARED_OIDC_PRINCIPAL_CLAIM = 'oid';
+    const linkedPayload = {
+      ...payload,
+      iss: 'https://identity.example.test/tenant/v2.0',
+      oid: 'stable-object-id',
+    };
+
+    await invokeVerify(
+      { headers: { authorization: 'Bearer raw-bearer-token' }, session: {} },
+      linkedPayload,
+    );
+
+    expect(updateUser).toHaveBeenCalledWith(
+      'user-abc',
+      expect.objectContaining({
+        viventiumGlassHivePrincipalId: expect.stringMatching(/^usr_[a-f0-9]{32}$/),
+      }),
+    );
+  });
+
+  it('should refuse GlassHive backfill when the signed token issuer does not match', async () => {
+    process.env.VIVENTIUM_GLASSHIVE_SHARED_OIDC_ISSUER =
+      'https://identity.example.test/tenant/v2.0';
+    process.env.VIVENTIUM_GLASSHIVE_SHARED_OIDC_PRINCIPAL_CLAIM = 'oid';
+
+    await invokeVerify(
+      { headers: { authorization: 'Bearer raw-bearer-token' }, session: {} },
+      { ...payload, iss: 'https://wrong.example.test/tenant/v2.0', oid: 'stable-object-id' },
+    );
+
+    expect(updateUser).not.toHaveBeenCalled();
+  });
+  /* === VIVENTIUM END === */
 });
 
 describe('openIdJwtStrategy – OPENID_EMAIL_CLAIM', () => {

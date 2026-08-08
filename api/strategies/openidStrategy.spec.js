@@ -117,6 +117,10 @@ describe('setupOpenId', () => {
     access_token: 'fake_access_token',
     claims: () => ({
       sub: '1234',
+      /* === VIVENTIUM START === Shared-OIDC stable-principal fixture. === */
+      iss: 'https://fake-issuer.com',
+      oid: 'stable-object-id-1234',
+      /* === VIVENTIUM END === */
       email: 'test@example.com',
       email_verified: true,
       given_name: 'First',
@@ -134,6 +138,10 @@ describe('setupOpenId', () => {
 
     // Reset environment variables needed by the strategy
     process.env.OPENID_ISSUER = 'https://fake-issuer.com';
+    /* === VIVENTIUM START === Shared-OIDC stable-principal config. === */
+    process.env.VIVENTIUM_GLASSHIVE_SHARED_OIDC_ISSUER = 'https://fake-issuer.com';
+    process.env.VIVENTIUM_GLASSHIVE_SHARED_OIDC_PRINCIPAL_CLAIM = 'oid';
+    /* === VIVENTIUM END === */
     process.env.OPENID_CLIENT_ID = 'fake_client_id';
     process.env.OPENID_CLIENT_SECRET = 'fake_client_secret';
     process.env.DOMAIN_SERVER = 'https://example.com';
@@ -196,6 +204,9 @@ describe('setupOpenId', () => {
         username: userinfo.preferred_username,
         email: userinfo.email,
         name: `${userinfo.given_name} ${userinfo.family_name}`,
+        /* === VIVENTIUM START === Shared-OIDC stable-principal assertion. === */
+        viventiumGlassHivePrincipalId: expect.stringMatching(/^usr_[a-f0-9]{32}$/),
+        /* === VIVENTIUM END === */
       }),
       { enabled: false },
       true,
@@ -315,9 +326,30 @@ describe('setupOpenId', () => {
         openidId: userinfo.sub,
         username: userinfo.preferred_username,
         name: `${userinfo.given_name} ${userinfo.family_name}`,
+        /* === VIVENTIUM START === Shared-OIDC stable-principal assertion. === */
+        viventiumGlassHivePrincipalId: expect.stringMatching(/^usr_[a-f0-9]{32}$/),
+        /* === VIVENTIUM END === */
       }),
     );
   });
+
+  /* === VIVENTIUM START ===
+   * Feature: Mutable email claims never substitute for the configured stable principal claim.
+   */
+  it('does not link by email or another claim when the configured principal claim is absent', async () => {
+    const userinfo = { ...tokenset.claims() };
+    delete userinfo.oid;
+
+    await validate({ ...tokenset, claims: () => userinfo });
+
+    expect(createUser).toHaveBeenCalledWith(
+      expect.not.objectContaining({ viventiumGlassHivePrincipalId: expect.anything() }),
+      { enabled: false },
+      true,
+      true,
+    );
+  });
+  /* === VIVENTIUM END === */
 
   it('should block login when email exists with different provider', async () => {
     // Arrange – simulate that a user exists with same email but different provider

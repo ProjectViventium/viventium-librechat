@@ -16,6 +16,8 @@ const WRITE_CONFIRMATION_AUDIENCE = 'glasshive-write-confirmation';
 const DEFAULT_TTL_SECONDS = 10 * 60;
 const FALLBACK_REPLAY_CACHE = new Map();
 const FALLBACK_RATE_LIMIT_CACHE = new Map();
+const FALLBACK_REVOCATION_CACHE = new Map();
+let BROKER_REVOCATION_CACHE;
 
 function base64urlEncode(value) {
   return Buffer.from(value, 'utf8').toString('base64url');
@@ -28,6 +30,31 @@ function base64urlDecode(value) {
 function getBrokerSecret() {
   return String(process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET || '').trim();
 }
+
+/* === VIVENTIUM START ===
+ * Feature: Tenant-bound and revocable GlassHive grants.
+ * Purpose: Derive tenant scope from deployment-owned configuration, never from a worker request.
+ */
+function resolveBrokerTenantId() {
+  return String(
+    process.env.GLASSHIVE_ENTERPRISE_TENANT_ID ||
+      process.env.VIVENTIUM_GLASSHIVE_TENANT_ID ||
+      process.env.VIVENTIUM_TENANT_ID ||
+      'local',
+  ).trim();
+}
+
+function normalizeGrantId(value) {
+  const grantId = String(value || '').trim();
+  if (!grantId) {
+    return '';
+  }
+  if (!/^ghcb_[A-Za-z0-9_-]{8,152}$/.test(grantId)) {
+    throw new Error('Invalid GlassHive capability broker grant id');
+  }
+  return grantId;
+}
+/* === VIVENTIUM END === */
 
 function stableJson(value) {
   if (Array.isArray(value)) {
@@ -92,6 +119,7 @@ function mintBrokerGrant({
   renewableTtlSeconds = ttlSeconds,
   scopes = {},
   allowDynamicPolicyServers = true,
+  grantId,
   nowMs = Date.now(),
 } = {}) {
   const secret = getBrokerSecret();
@@ -126,7 +154,8 @@ function mintBrokerGrant({
   );
   const payload = {
     aud: BROKER_AUDIENCE,
-    grant_id: `ghcb_${crypto.randomBytes(16).toString('hex')}`,
+    grant_id: normalizeGrantId(grantId) || `ghcb_${crypto.randomBytes(16).toString('hex')}`,
+    tenant_id: resolveBrokerTenantId(),
     user_id: userId,
     user_role: String(user?.role || requestContext.user_role || ''),
     conversation_id: String(requestContext.conversation_id || requestContext.conversationId || ''),
@@ -136,6 +165,7 @@ function mintBrokerGrant({
     message_id: String(requestContext.message_id || requestContext.messageId || ''),
     worker_id: String(requestContext.worker_id || requestContext.workerId || ''),
     run_id: String(requestContext.run_id || requestContext.runId || ''),
+    schedule_id: String(requestContext.schedule_id || requestContext.scheduleId || ''),
     execution_mode: String(executionMode || requestContext.execution_mode || ''),
     allowed_servers: sanitizedAllowedServers,
     eager_servers: sanitizedEagerServers,
@@ -146,7 +176,7 @@ function mintBrokerGrant({
     exp,
     renewable_until: renewableUntil,
     nonce: crypto.randomBytes(16).toString('hex'),
-    policy_version: 1,
+    policy_version: 2,
   };
   /* === VIVENTIUM END === */
   payload.sig = signPayload(payload, secret);
@@ -158,7 +188,13 @@ function mintBrokerGrant({
 
 function verifyBrokerGrant(
   token,
-  { nowMs = Date.now(), expectedUserId, allowRenewal = false } = {},
+  {
+    nowMs = Date.now(),
+    expectedUserId,
+    expectedTenantId,
+    allowRenewal = false,
+    allowLegacyTenantless = false,
+  } = {},
 ) {
   const secret = getBrokerSecret();
   if (!secret) {
@@ -167,7 +203,7 @@ function verifyBrokerGrant(
   let payload;
   try {
     payload = JSON.parse(base64urlDecode(token));
-  } catch (error) {
+  } catch (_error) {
     throw new Error('Invalid GlassHive capability broker grant');
   }
   const incoming = String(payload.sig || '');
@@ -181,6 +217,19 @@ function verifyBrokerGrant(
   }
   if (!payload.user_id) {
     throw new Error('GlassHive capability broker grant is missing user scope');
+  }
+  const policyVersion = Number(payload.policy_version || 1);
+  if (policyVersion >= 2 && !String(payload.tenant_id || '').trim()) {
+    throw new Error('GlassHive capability broker grant is missing tenant scope');
+  }
+  if (expectedTenantId) {
+    const tenantId = String(payload.tenant_id || '').trim();
+    if (!tenantId && !(allowLegacyTenantless && policyVersion < 2)) {
+      throw new Error('GlassHive capability broker grant is missing tenant scope');
+    }
+    if (tenantId && String(expectedTenantId) !== tenantId) {
+      throw new Error('GlassHive capability broker grant tenant mismatch');
+    }
   }
   if (expectedUserId && String(expectedUserId) !== String(payload.user_id)) {
     throw new Error('GlassHive capability broker grant user mismatch');
@@ -214,6 +263,83 @@ function verifyBrokerGrant(
     renewed: expired,
   };
 }
+
+async function getRevocationCache() {
+  if (BROKER_REVOCATION_CACHE) {
+    return BROKER_REVOCATION_CACHE;
+  }
+  try {
+    BROKER_REVOCATION_CACHE = getLogStores(CacheKeys.FLOWS);
+    return BROKER_REVOCATION_CACHE;
+  } catch (error) {
+    logger.warn('[VIVENTIUM][glasshive-capability-broker] Revocation cache unavailable', {
+      message: error?.message,
+    });
+    return null;
+  }
+}
+
+function revocationKey(grantId) {
+  return `glasshive-capability-broker:revoked:${normalizeGrantId(grantId)}`;
+}
+
+function revocationTtlMs(grant, nowMs = Date.now()) {
+  const expiryMs = Number(grant?.renewable_until || grant?.exp) * 1000;
+  return Math.max(60_000, (Number.isFinite(expiryMs) ? expiryMs : nowMs) - nowMs);
+}
+
+function cleanupFallbackRevocations(nowMs) {
+  for (const [key, entry] of FALLBACK_REVOCATION_CACHE.entries()) {
+    if (!entry || Number(entry.expiresAt) <= nowMs) {
+      FALLBACK_REVOCATION_CACHE.delete(key);
+    }
+  }
+}
+
+async function revokeBrokerGrant(grant, { nowMs = Date.now() } = {}) {
+  const grantId = normalizeGrantId(grant?.grant_id);
+  if (!grantId) {
+    throw new Error('GlassHive capability broker revocation requires a grant id');
+  }
+  const key = revocationKey(grantId);
+  const ttlMs = revocationTtlMs(grant, nowMs);
+  const entry = JSON.stringify({ revokedAt: nowMs, expiresAt: nowMs + ttlMs });
+  const cache = await getRevocationCache();
+  if (cache?.set) {
+    await cache.set(key, entry, ttlMs);
+    return { revoked: true, grantId, shared: true };
+  }
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('GlassHive capability broker revocation cache is unavailable');
+  }
+  cleanupFallbackRevocations(nowMs);
+  FALLBACK_REVOCATION_CACHE.set(key, { revokedAt: nowMs, expiresAt: nowMs + ttlMs });
+  return { revoked: true, grantId, shared: false };
+}
+
+async function assertBrokerGrantActive(grant, { nowMs = Date.now() } = {}) {
+  const grantId = normalizeGrantId(grant?.grant_id);
+  if (!grantId) {
+    throw new Error('GlassHive capability broker grant is missing grant id');
+  }
+  const key = revocationKey(grantId);
+  const cache = await getRevocationCache();
+  if (cache?.get && cache?.set) {
+    if (await cache.get(key)) {
+      throw new Error('GlassHive capability broker grant revoked');
+    }
+    return { active: true, grantId, shared: true };
+  }
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('GlassHive capability broker revocation cache is unavailable');
+  }
+  cleanupFallbackRevocations(nowMs);
+  if (FALLBACK_REVOCATION_CACHE.has(key)) {
+    throw new Error('GlassHive capability broker grant revoked');
+  }
+  return { active: true, grantId, shared: false };
+}
+/* === VIVENTIUM END === */
 
 function grantReplayTtlMs(grant, nowMs = Date.now()) {
   const expMs = Number(grant?.exp) * 1000;
@@ -298,38 +424,26 @@ async function rememberBrokerRequest({ grant, nowMs = Date.now() } = {}) {
   const key = `glasshive-capability-broker:rate:${grantId}:${bucket}`;
   const bucketExpiresAt = (bucket + 1) * windowMs;
   const cache = await getRateLimitCache();
-  if (cache?.get && cache?.set) {
-    let current = { count: 0, expiresAt: bucketExpiresAt };
-    const raw = await cache.get(key);
-    if (raw) {
-      try {
-        const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
-        current = {
-          count: Math.max(0, Number(parsed?.count) || 0),
-          expiresAt: Math.max(bucketExpiresAt, Number(parsed?.expiresAt) || bucketExpiresAt),
-        };
-      } catch (error) {
-        current = { count: 0, expiresAt: bucketExpiresAt };
-      }
-    }
-    if (current.count >= limit) {
+  const atomicStore = cache?.opts?.store;
+  if (typeof atomicStore?.reserveWithinLimit === 'function') {
+    const reservation = await atomicStore.reserveWithinLimit(
+      `${cache.opts?.namespace || CacheKeys.FLOWS}:${key}`,
+      limit,
+      bucketExpiresAt,
+    );
+    if (!reservation.accepted) {
       return {
         accepted: false,
         rateLimited: true,
-        retryAfterMs: Math.max(1_000, current.expiresAt - nowMs),
+        retryAfterMs: Math.max(1_000, bucketExpiresAt - nowMs),
         shared: true,
       };
     }
-    const next = {
-      count: current.count + 1,
-      expiresAt: current.expiresAt,
-    };
-    await cache.set(key, JSON.stringify(next), Math.max(1_000, next.expiresAt - nowMs));
     return {
       accepted: true,
       rateLimited: false,
-      remaining: Math.max(0, limit - next.count),
-      resetAtMs: next.expiresAt,
+      remaining: Math.max(0, limit - reservation.count),
+      resetAtMs: bucketExpiresAt,
       shared: true,
     };
   }
@@ -405,7 +519,7 @@ function verifyWriteConfirmation(
   let payload;
   try {
     payload = JSON.parse(base64urlDecode(token));
-  } catch (error) {
+  } catch (_error) {
     throw new Error('Invalid GlassHive write confirmation');
   }
   const incoming = String(payload.sig || '');
@@ -512,4 +626,7 @@ module.exports = {
   normalizeBrokerScopes,
   sanitizeAllowedServers,
   allowInMemoryReplayCache,
+  assertBrokerGrantActive,
+  revokeBrokerGrant,
+  resolveBrokerTenantId,
 };

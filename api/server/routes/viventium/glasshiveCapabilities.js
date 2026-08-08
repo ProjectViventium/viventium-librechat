@@ -10,8 +10,15 @@
 
 const express = require('express');
 const { logger } = require('@librechat/data-schemas');
+/* === VIVENTIUM START ===
+ * Feature: Tenant-bound and direct user-scoped GlassHive capability authorization.
+ */
+const { findUser, getUserById } = require('~/models');
 const {
+  assertBrokerGrantActive,
+  rememberInvocation,
   rememberBrokerRequest,
+  resolveBrokerTenantId,
   verifyBrokerGrant,
 } = require('~/server/services/viventium/GlassHiveCapabilityBrokerAuth');
 const {
@@ -19,6 +26,15 @@ const {
   handleToolCall,
   toolDefinitionsForMcp,
 } = require('~/server/services/viventium/GlassHiveCapabilityBrokerService');
+const {
+  buildDirectGlassHiveCapabilityBundle,
+  directCapabilityReadiness,
+  revokeDirectGlassHiveCapabilityGrant,
+} = require('~/server/services/viventium/GlassHiveCapabilityBootstrapService');
+const {
+  verifyDirectIssuerAssertion,
+} = require('~/server/services/viventium/GlassHiveCapabilityDirectIssuerAuth');
+/* === VIVENTIUM END === */
 
 const router = express.Router();
 
@@ -48,7 +64,16 @@ async function handleRpc(req, res) {
   const id = body.id ?? null;
   let grant;
   try {
-    grant = verifyBrokerGrant(bearerToken(req), { allowRenewal: true });
+    /* === VIVENTIUM START === Tenant-bound grants and durable revocation. === */
+    grant = verifyBrokerGrant(bearerToken(req), {
+      allowRenewal: true,
+      expectedTenantId: resolveBrokerTenantId(),
+      // Existing direct-conversation grants live for minutes. Accept those v1 grants during the
+      // rolling upgrade only; all newly minted grants are tenant-bound v2 grants.
+      allowLegacyTenantless: true,
+    });
+    await assertBrokerGrantActive(grant);
+    /* === VIVENTIUM END === */
     if (grant.renewed) {
       res.set('x-glasshive-capability-grant-renewed', 'true');
     }
@@ -143,6 +168,128 @@ async function handleRpc(req, res) {
 }
 
 router.post('/mcp', handleRpc);
+
+/* === VIVENTIUM START ===
+ * Feature: Replay-safe direct capability readiness, grant, and revoke issuer surface.
+ */
+async function directIssuerContext(req, action) {
+  const claims = verifyDirectIssuerAssertion(bearerToken(req), {
+    action,
+    expectedTenantId: resolveBrokerTenantId(),
+  });
+  const replay = await rememberInvocation({
+    grantId: 'direct-issuer',
+    invocationId: `${action}:${claims.nonce}`,
+    ttlMs: 90 * 1000,
+  });
+  if (!replay.accepted) {
+    const error = new Error('Direct issuer assertion replay rejected');
+    error.code = replay.reason || 'issuer_assertion_replay';
+    error.status = 409;
+    throw error;
+  }
+  const projection = '_id role expiresAt viventiumApprovalStatus';
+  const user =
+    claims.binding_proof === 'shared_oidc_subject'
+      ? await findUser({ viventiumGlassHivePrincipalId: claims.user_id }, projection)
+      : await getUserById(claims.user_id, projection);
+  if (!user && claims.binding_proof === 'shared_oidc_subject') {
+    const error = new Error('Shared OIDC principal has not linked a LibreChat account');
+    error.code = 'owner_binding_required';
+    error.status = 409;
+    throw error;
+  }
+  const expiresAt = user?.expiresAt ? new Date(user.expiresAt).getTime() : null;
+  if (
+    !user ||
+    (expiresAt != null && (!Number.isFinite(expiresAt) || expiresAt <= Date.now())) ||
+    ['pending', 'denied'].includes(String(user.viventiumApprovalStatus || '').toLowerCase())
+  ) {
+    const error = new Error('Verified LibreChat user is unavailable');
+    error.code = 'user_unavailable';
+    error.status = 401;
+    throw error;
+  }
+  user.id = String(user._id);
+  return { claims, user };
+}
+
+function directError(res, error) {
+  const status = Number(error?.status);
+  const safeStatus = Number.isInteger(status) && status >= 400 && status <= 599 ? status : 401;
+  const code = String(error?.code || (safeStatus === 401 ? 'unauthorized' : 'broker_unavailable'))
+    .replace(/[^a-z0-9_.:-]/gi, '')
+    .slice(0, 120);
+  logger.warn('[VIVENTIUM][glasshive-capability-broker] Direct issuer request failed', {
+    code,
+    status: safeStatus,
+  });
+  let responseStatus = 'broker_unavailable';
+  if (code === 'owner_binding_required') {
+    responseStatus = 'unmapped';
+  } else if (code === 'connected_account_action_required') {
+    responseStatus = 'action_required';
+  }
+  return res.status(safeStatus).json({
+    error: {
+      code,
+      message: 'GlassHive connected capability authorization failed',
+    },
+    status: responseStatus,
+  });
+}
+
+router.post('/direct/status', async (req, res) => {
+  try {
+    const { claims, user } = await directIssuerContext(req, 'status');
+    const readiness = await directCapabilityReadiness({
+      user,
+      executionMode: claims.execution_mode || 'docker',
+    });
+    return res.json({
+      status: readiness.status,
+      reason: readiness.reason || '',
+      connections: readiness.connections || [],
+    });
+  } catch (error) {
+    return directError(res, error);
+  }
+});
+
+router.post('/direct/grant', async (req, res) => {
+  try {
+    const { claims, user } = await directIssuerContext(req, 'grant');
+    const result = await buildDirectGlassHiveCapabilityBundle({
+      user,
+      workerId: claims.worker_id,
+      runId: claims.run_id,
+      executionMode: claims.execution_mode,
+    });
+    res.set('Cache-Control', 'no-store');
+    return res.json(result);
+  } catch (error) {
+    return directError(res, error);
+  }
+});
+
+router.post('/direct/revoke', async (req, res) => {
+  try {
+    const { claims, user } = await directIssuerContext(req, 'revoke');
+    const result = await revokeDirectGlassHiveCapabilityGrant({
+      user,
+      workerId: claims.worker_id,
+      runId: claims.run_id,
+      executionMode: claims.execution_mode,
+      grantId: req.body?.grant_id,
+      renewableUntil: req.body?.renewable_until,
+    });
+    return res.json({ revoked: result.revoked === true, grant_id: result.grantId });
+  } catch (error) {
+    return directError(res, error);
+  }
+});
+/* === VIVENTIUM END === */
+
 router.get('/health', (_req, res) =>
   res.json({
     status: 'ok',

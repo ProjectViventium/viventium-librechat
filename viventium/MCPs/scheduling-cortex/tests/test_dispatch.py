@@ -6,6 +6,7 @@
 import os
 import json
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timezone
 from io import BytesIO
@@ -24,10 +25,12 @@ class DispatchWorkbenchTests(unittest.TestCase):
     def setUp(self):
         os.environ['WPR_MODEL_HOST_CODEX_CLI'] = 'gpt-managed-test'
         os.environ['WPR_CODEX_CLI_REASONING_EFFORT'] = 'xhigh'
+        os.environ['SCHEDULER_LIBRECHAT_SECRET'] = 'scheduler-secret'
 
     def tearDown(self):
         os.environ.pop('WPR_CODEX_CLI_REASONING_EFFORT', None)
         os.environ.pop('WPR_MODEL_HOST_CODEX_CLI', None)
+        os.environ.pop('SCHEDULER_LIBRECHAT_SECRET', None)
 
     def test_glasshive_bootstrap_normalizes_legacy_max_codex_effort(self):
         bundle = dispatch._glasshive_bootstrap_bundle(
@@ -61,6 +64,7 @@ class DispatchWorkbenchTests(unittest.TestCase):
 
     def test_glasshive_bootstrap_uses_persisted_tuple_when_compiled_policy_is_absent(self):
         os.environ.pop('WPR_MODEL_HOST_CODEX_CLI', None)
+        os.environ.pop('WPR_MODEL_CODEX_CLI', None)
         os.environ.pop('WPR_CODEX_CLI_REASONING_EFFORT', None)
         bundle = dispatch._glasshive_bootstrap_bundle(
             {'id': 'task-1', 'user_id': 'user-1', 'prompt': 'Synthetic prompt'},
@@ -73,6 +77,7 @@ class DispatchWorkbenchTests(unittest.TestCase):
 
     def test_glasshive_bootstrap_fails_closed_when_codex_tuple_is_absent(self):
         os.environ.pop('WPR_MODEL_HOST_CODEX_CLI', None)
+        os.environ.pop('WPR_MODEL_CODEX_CLI', None)
         os.environ.pop('WPR_CODEX_CLI_REASONING_EFFORT', None)
 
         with self.assertRaisesRegex(RuntimeError, 'requires WPR_MODEL_HOST_CODEX_CLI'):
@@ -119,6 +124,166 @@ class DispatchWorkbenchTests(unittest.TestCase):
 
         self.assertEqual(refreshed_task['next_run_at'], dispatched_at)
         self.assertEqual(refreshed_task['prompt'], 'Template rendered now')
+
+    def test_glasshive_dispatch_delegates_just_in_time_capabilities_without_credentials(self):
+        storage = MagicMock()
+        storage.get_scheduled_prompt_definition.return_value = {
+            'id': 'definition-1',
+            'prompt_text': 'Synthetic prompt',
+            'metadata': {},
+        }
+        calls = []
+        worker_payloads = []
+
+        def fake_post(url, payload, _headers, _timeout):
+            if url.endswith('/workers/find-or-resume'):
+                calls.append('worker')
+                worker_payloads.append(payload)
+                return {'worker_id': 'worker-1'}
+            if url.endswith('/assign'):
+                calls.append('assign')
+                return {'run_id': 'glasshive-run-1'}
+            raise AssertionError(url)
+
+        task = {
+            'id': 'task-1',
+            'user_id': 'user-1',
+            'prompt': 'Synthetic prompt',
+            'next_run_at': '2026-08-05T12:00:00Z',
+            'metadata': {
+                'workbench_scheduled_prompt': {
+                    'definition_id': 'definition-1',
+                    'execution_profile': 'codex-cli',
+                    'execution_mode': 'host',
+                    'required_capability_servers': ['ms-365'],
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
+            os.environ,
+            {
+                'VIVENTIUM_PRIVATE_USER_DATA_DIR': temp_dir,
+                'SCHEDULER_LIBRECHAT_SECRET': 'scheduler-secret',
+                'SCHEDULING_GLASSHIVE_CALLBACK_SECRET': 'callback-secret',
+            },
+        ), patch.object(dispatch, '_scheduler_storage', return_value=storage), patch.object(
+            dispatch, '_ensure_glasshive_project', side_effect=lambda *_args: calls.append('project') or 'project-1'
+        ), patch.object(dispatch, '_post_json', side_effect=fake_post):
+            result = dispatch._dispatch_glasshive_task(task)
+            created_run = storage.create_scheduled_prompt_run.call_args.args[0]
+            private_detail = json.loads(Path(created_run['private_detail_path']).read_text())
+
+        self.assertEqual(calls, ['project', 'worker', 'assign'])
+        self.assertEqual(result['glasshive_run_id'], 'glasshive-run-1')
+        self.assertNotIn('GLASSHIVE_CAPABILITY_BROKER_TOKEN', json.dumps(worker_payloads[0]))
+        self.assertNotIn('glasshive_capability_grant', private_detail)
+        self.assertNotIn('GLASSHIVE_CAPABILITY_BROKER_TOKEN', json.dumps(created_run))
+        self.assertNotIn('GLASSHIVE_CAPABILITY_BROKER_TOKEN', json.dumps(private_detail))
+
+    def test_glasshive_dispatch_records_runtime_capability_failure(self):
+        storage = MagicMock()
+        storage.get_scheduled_prompt_definition.return_value = {
+            'id': 'definition-1',
+            'prompt_text': 'Synthetic prompt',
+            'metadata': {},
+        }
+        action_required = dispatch.HttpJsonError(
+            'Reconnect the required account',
+            status=409,
+            method='POST',
+            path='/api/viventium/scheduler/glasshive-capabilities/grant',
+            reason='connected_account_action_required',
+            failure_class='connected_account_action_required',
+            failure_retryable=False,
+        )
+        task = {
+            'id': 'task-1',
+            'user_id': 'user-1',
+            'prompt': 'Synthetic prompt',
+            'metadata': {
+                'workbench_scheduled_prompt': {
+                    'definition_id': 'definition-1',
+                    'execution_profile': 'codex-cli',
+                    'execution_mode': 'host',
+                    'required_capability_servers': ['ms-365'],
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
+            os.environ,
+            {
+                'VIVENTIUM_PRIVATE_USER_DATA_DIR': temp_dir,
+                'SCHEDULING_GLASSHIVE_CALLBACK_SECRET': 'callback-secret',
+            },
+        ), patch.object(dispatch, '_scheduler_storage', return_value=storage), patch.object(
+            dispatch, '_post_json', side_effect=action_required
+        ), patch.object(dispatch, '_ensure_glasshive_project', return_value='project-1'):
+            with self.assertRaises(dispatch.HttpJsonError):
+                dispatch._dispatch_glasshive_task(task)
+
+        failed_update = storage.update_scheduled_prompt_run.call_args_list[-1].args[1]
+        self.assertEqual(failed_update['status'], 'failed')
+        self.assertEqual(failed_update['error_class'], 'connected_account_action_required')
+
+    def test_glasshive_dispatch_host_recovery_remains_credential_free(self):
+        storage = MagicMock()
+        storage.get_scheduled_prompt_definition.return_value = {
+            'id': 'definition-1',
+            'prompt_text': 'Synthetic prompt',
+            'metadata': {},
+        }
+        calls = []
+        worker_payloads = []
+
+        def fake_post(url, payload, _headers, _timeout):
+            if url.endswith('/workers/find-or-resume'):
+                mode = payload['execution_mode']
+                calls.append(f'worker:{mode}')
+                worker_payloads.append(payload)
+                if mode == 'host':
+                    raise dispatch.HttpJsonError(
+                        'host unavailable',
+                        status=503,
+                        method='POST',
+                        path='/workers/find-or-resume',
+                        failure_class='runtime_dependency_missing',
+                    )
+                return {'worker_id': 'worker-1'}
+            if url.endswith('/assign'):
+                calls.append('assign')
+                return {'run_id': 'glasshive-run-1'}
+            raise AssertionError(url)
+
+        task = {
+            'id': 'task-1',
+            'user_id': 'user-1',
+            'prompt': 'Synthetic prompt',
+            'metadata': {
+                'workbench_scheduled_prompt': {
+                    'definition_id': 'definition-1',
+                    'execution_profile': 'codex-cli',
+                    'execution_mode': 'host',
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
+            os.environ,
+            {
+                'VIVENTIUM_PRIVATE_USER_DATA_DIR': temp_dir,
+                'SCHEDULER_LIBRECHAT_SECRET': 'scheduler-secret',
+                'SCHEDULING_GLASSHIVE_CALLBACK_SECRET': 'callback-secret',
+            },
+        ), patch.object(dispatch, '_scheduler_storage', return_value=storage), patch.object(
+            dispatch, '_ensure_glasshive_project', return_value='project-1'
+        ), patch.object(dispatch, '_post_json', side_effect=fake_post):
+            dispatch._dispatch_glasshive_task(task)
+
+        self.assertEqual(
+            calls,
+            ['worker:host', 'worker:docker', 'assign'],
+        )
+        for payload in worker_payloads:
+            self.assertNotIn('GLASSHIVE_CAPABILITY_BROKER_TOKEN', json.dumps(payload))
 
 
 class DispatchTelegramTests(unittest.TestCase):

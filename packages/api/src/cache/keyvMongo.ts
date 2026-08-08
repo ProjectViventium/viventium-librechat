@@ -2,7 +2,7 @@ import mongoose from 'mongoose';
 import { EventEmitter } from 'events';
 import { GridFSBucket } from 'mongodb';
 import { logger } from '@librechat/data-schemas';
-import type { Db, ReadPreference, Collection } from 'mongodb';
+import type { Db, ReadPreference, Collection, Document, Filter } from 'mongodb';
 
 interface KeyvMongoOptions {
   url?: string;
@@ -258,6 +258,78 @@ class KeyvMongoCustom extends EventEmitter {
     const filter = { [this.opts.useGridFS ? 'filename' : 'key']: { $eq: key } };
     const document = await client.store.countDocuments(filter, { limit: 1 });
     return document !== 0;
+  }
+
+  /* === VIVENTIUM START ===
+   * Feature: Atomic bounded counters on the shared Mongo-backed cache.
+   * Purpose: Security rate limits must never use a raceable Keyv get/set pair. The deterministic
+   * Mongo _id closes the first-window upsert race without creating a new storage dependency.
+   * === VIVENTIUM END === */
+  async reserveWithinLimit(
+    key: string,
+    limit: number,
+    expiresAtMs: number,
+  ): Promise<{ accepted: boolean; count: number }> {
+    const client = await this._getClient();
+    if (this.opts.useGridFS || this.isGridFSClient(client)) {
+      throw new Error('Atomic counters are unavailable for GridFS cache stores');
+    }
+    const safeLimit = Math.max(1, Math.floor(limit));
+    const now = new Date();
+    const expiresAt = new Date(expiresAtMs);
+    const documentId = `viventium-atomic-counter:${key}`;
+    // This collection also stores ordinary Keyv rows with ObjectId ids. Atomic counter rows use a
+    // deterministic string id so Mongo's primary-key uniqueness closes concurrent first inserts.
+    const counterId = { _id: documentId } as unknown as Filter<Document>;
+    const updateActive = async () =>
+      await client.store.findOneAndUpdate(
+        {
+          ...counterId,
+          counter: { $lt: safeLimit },
+          expiresAt: { $gt: now },
+        },
+        { $inc: { counter: 1 } },
+        { returnDocument: 'after' },
+      );
+
+    const active = await updateActive();
+    if (active) {
+      return { accepted: true, count: Number(active.counter) };
+    }
+
+    try {
+      const reset = await client.store.findOneAndUpdate(
+        {
+          ...counterId,
+          $or: [{ expiresAt: { $lte: now } }, { expiresAt: { $exists: false } }],
+        },
+        {
+          $set: {
+            key: documentId,
+            counter: 1,
+            expiresAt,
+          },
+        },
+        { upsert: true, returnDocument: 'after' },
+      );
+      if (reset) {
+        return { accepted: true, count: 1 };
+      }
+    } catch (error: unknown) {
+      if (!(error instanceof Error && 'code' in error && Number(error.code) === 11000)) {
+        throw error;
+      }
+    }
+
+    const raced = await updateActive();
+    if (raced) {
+      return { accepted: true, count: Number(raced.counter) };
+    }
+    const current = await client.store.findOne(
+      counterId,
+      { projection: { counter: 1 } },
+    );
+    return { accepted: false, count: Math.max(safeLimit, Number(current?.counter) || safeLimit) };
   }
 
   // No-op disconnect

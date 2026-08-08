@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -56,6 +57,7 @@ DEFAULT_SCHEDULER_PROMPT_PREFIX = "\n".join(
 # === VIVENTIUM START ===
 # Feature: Multi-channel dispatch support.
 from .models import AVAILABLE_CHANNELS, DEFAULT_DELIVERY_CHANNELS
+from .glasshive_assertions import ASSERTION_HEADER, mint_workspace_run_assertion
 from .storage import ScheduleStorage, StorageConfig
 from .utils import ensure_timezone, parse_iso, to_utc_iso
 # === VIVENTIUM END ===
@@ -2205,6 +2207,14 @@ def _workbench_metadata(task: Dict[str, Any]) -> Dict[str, Any]:
     return nested if isinstance(nested, dict) else {}
 
 
+def _glasshive_workspace_schedule_metadata(task: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = task.get("metadata")
+    if not isinstance(metadata, dict):
+        return {}
+    nested = metadata.get("glasshive_workspace_schedule")
+    return nested if isinstance(nested, dict) else {}
+
+
 _CODEX_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 
 
@@ -2418,8 +2428,8 @@ def _safe_result_summary(text: Any, limit: int = 2000) -> str:
 
 
 def _scheduled_prompt_error_class(exc: Exception) -> str:
-    if isinstance(exc, HttpJsonError) and exc.failure_class:
-        return _safe_result_summary(exc.failure_class, limit=128)
+    if isinstance(exc, HttpJsonError) and (exc.failure_class or exc.reason):
+        return _safe_result_summary(exc.failure_class or exc.reason, limit=128)
     return exc.__class__.__name__
 
 
@@ -2433,6 +2443,27 @@ def _glasshive_execution_mode(wb: Dict[str, Any]) -> str:
 
 def _glasshive_execution_backend(wb: Dict[str, Any]) -> str:
     return str(wb.get("execution_backend") or wb.get("backend") or "openclaw").strip() or "openclaw"
+
+
+# === VIVENTIUM START ===
+# Feature: Private Scheduling Cortex detail updates.
+def _patch_private_run_detail(path_value: str, updates: Dict[str, Any]) -> None:
+    path = Path(str(path_value or "")).expanduser()
+    if not path_value or not path.exists():
+        return
+    try:
+        current = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        current = {}
+    if not isinstance(current, dict):
+        current = {}
+    current.update(updates)
+    path.write_text(json.dumps(current, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+# === VIVENTIUM END ===
 
 
 def _can_recover_workbench_host_dependency_to_docker(
@@ -2736,13 +2767,14 @@ def _dispatch_glasshive_task(task: Dict[str, Any]) -> Dict[str, Any]:
     try:
         base_url = _glasshive_base_url()
         timeout_s = int(os.getenv("SCHEDULER_GLASSHIVE_HTTP_TIMEOUT_S", "20"))
+        execution_profile = _glasshive_execution_profile(wb)
+        execution_mode = _glasshive_execution_mode(wb)
         project_id = _ensure_glasshive_project(storage, task, wb)
         alias = str(wb.get("workspace_alias") or f"workbench-scheduled-{str(wb.get('definition_id') or task.get('id'))[:12]}")
         if str(wb.get("glasshive_worker_strategy") or "same_worker").strip() == "new_worker_each_run":
             alias = f"{alias}-{run_id[-8:]}"
-        execution_profile = _glasshive_execution_profile(wb)
-        execution_mode = _glasshive_execution_mode(wb)
         workspace_root = str(wb.get("workspace_root") or "").strip()
+        base_bootstrap_bundle = _glasshive_bootstrap_bundle(task, wb, run_id)
         worker_payload = {
             "owner_id": str(task.get("user_id") or "workbench"),
             "name": str(wb.get("title") or "Workbench Scheduled Prompt"),
@@ -2753,7 +2785,7 @@ def _dispatch_glasshive_task(task: Dict[str, Any]) -> Dict[str, Any]:
             "alias": alias,
             "workspace_root": workspace_root,
             "bootstrap_profile": "prompt-workbench-scheduled-v1",
-            "bootstrap_bundle": _glasshive_bootstrap_bundle(task, wb, run_id),
+            "bootstrap_bundle": base_bootstrap_bundle,
         }
         runtime_recovery: Dict[str, Any] | None = None
         find_or_resume_url = f"{base_url}/v1/projects/{urllib.parse.quote(project_id)}/workers/find-or-resume"
@@ -2778,13 +2810,19 @@ def _dispatch_glasshive_task(task: Dict[str, Any]) -> Dict[str, Any]:
             }
             worker_payload = dict(worker_payload)
             worker_payload["execution_mode"] = "docker"
+            execution_mode = "docker"
+            _patch_private_run_detail(
+                private_detail_path,
+                {
+                    "glasshive_capability_recovery": runtime_recovery,
+                },
+            )
             worker = _post_json(
                 find_or_resume_url,
                 worker_payload,
                 _glasshive_headers(),
                 timeout_s,
             )
-            execution_mode = "docker"
         worker_id = str(worker.get("worker_id") or "").strip()
         if not worker_id:
             raise RuntimeError("GlassHive worker find-or-resume did not return worker_id")
@@ -2842,6 +2880,176 @@ def _dispatch_glasshive_task(task: Dict[str, Any]) -> Dict[str, Any]:
                 "error_class": _scheduled_prompt_error_class(exc),
                 "result_summary": _safe_result_summary(str(exc)),
                 "updated_at": to_utc_iso(datetime.now(timezone.utc)),
+            },
+        )
+        raise
+
+
+def _dispatch_glasshive_workspace_task(task: Dict[str, Any]) -> Dict[str, Any]:
+    workspace = _glasshive_workspace_schedule_metadata(task)
+    if not workspace:
+        raise RuntimeError("glasshive_workspace executor requires structured workspace metadata")
+    task_id = str(task.get("id") or "").strip()
+    due_at = str(task.get("next_run_at") or to_utc_iso(datetime.now(timezone.utc))).strip()
+    occurrence_key = str(
+        workspace.get("pending_occurrence_key")
+        or workspace.get("manual_occurrence_key")
+        or due_at
+    ).strip()
+    digest = hashlib.sha256(f"{task_id}\0{occurrence_key}".encode("utf-8")).hexdigest()
+    scheduled_run_id = f"sp_run_{digest[:32]}"
+    storage = _scheduler_storage()
+    existing = storage.get_scheduled_prompt_run(scheduled_run_id)
+    if existing and str(existing.get("glasshive_run_id") or "").strip():
+        return {
+            "delivery": {
+                "outcome": str(existing.get("status") or "queued"),
+                "reason": "glasshive_workspace_run_already_reserved",
+                "generated_text": None,
+            },
+            "scheduled_prompt_run_id": scheduled_run_id,
+            "glasshive_run_id": existing.get("glasshive_run_id"),
+        }
+
+    now_dt = datetime.now(timezone.utc)
+    now = to_utc_iso(now_dt)
+    try:
+        claim_seconds = int(os.getenv("SCHEDULING_OCCURRENCE_CLAIM_SECONDS") or 300)
+    except ValueError:
+        claim_seconds = 300
+    claim_seconds = max(30, min(claim_seconds, 900))
+    claim_expires_at = to_utc_iso(now_dt + timedelta(seconds=claim_seconds))
+    private_detail_path = str((existing or {}).get("private_detail_path") or "").strip()
+    claim = storage.claim_scheduled_prompt_run(
+        {
+            "run_id": scheduled_run_id,
+            "task_id": task_id,
+            "definition_id": None,
+            "user_id": str(task.get("user_id") or ""),
+            "version_id": None,
+            "due_at": due_at,
+            "started_at": now,
+            "completed_at": None,
+            "status": "dispatching",
+            "executor": "glasshive_workspace",
+            "rendered_hash": hashlib.sha256(str(task.get("prompt") or "").encode("utf-8")).hexdigest(),
+            "variable_snapshot_hash": None,
+            "glasshive_project_id": str(workspace.get("project_id") or ""),
+            "glasshive_worker_id": str(workspace.get("worker_id") or ""),
+            "glasshive_run_id": None,
+            "result_summary": None,
+            "error_class": None,
+            "private_detail_path": private_detail_path,
+            "callback_payload_json": None,
+            "created_at": now,
+            "updated_at": now,
+        },
+        claimed_at=now,
+        claim_expires_at=claim_expires_at,
+    )
+    claimed_run = claim.get("run") if isinstance(claim.get("run"), dict) else {}
+    if not claim.get("claimed"):
+        glasshive_run_id = str(claimed_run.get("glasshive_run_id") or "").strip()
+        if glasshive_run_id:
+            return {
+                "delivery": {
+                    "outcome": str(claimed_run.get("status") or "queued"),
+                    "reason": "glasshive_workspace_run_already_reserved",
+                    "generated_text": None,
+                },
+                "scheduled_prompt_run_id": scheduled_run_id,
+                "glasshive_run_id": glasshive_run_id,
+            }
+        reason = str(claim.get("reason") or "occurrence_claim_active")
+        terminal = reason == "occurrence_terminal"
+        return {
+            "delivery": {
+                "outcome": str(claimed_run.get("status") or "dispatching"),
+                "reason": reason,
+                "generated_text": None,
+            },
+            "scheduled_prompt_run_id": scheduled_run_id,
+            "glasshive_run_id": None,
+            "deferred": not terminal,
+            "retry_at": claimed_run.get("claim_expires_at") if not terminal else None,
+        }
+    try:
+        if not private_detail_path:
+            private_detail_path = _write_private_run_detail(
+                scheduled_run_id,
+                {
+                    "scheduled_prompt_run_id": scheduled_run_id,
+                    "task_id": task_id,
+                    "executor": "glasshive_workspace",
+                    "created_at": now,
+                    "user_id": str(task.get("user_id") or ""),
+                },
+            )
+            storage.update_scheduled_prompt_run(
+                scheduled_run_id,
+                {
+                    "private_detail_path": private_detail_path,
+                    "updated_at": to_utc_iso(datetime.now(timezone.utc)),
+                },
+            )
+        headers = _glasshive_headers()
+        scheduler_secret = str(os.getenv("VIVENTIUM_SCHEDULER_SECRET") or "").strip()
+        if not scheduler_secret:
+            raise RuntimeError("VIVENTIUM_SCHEDULER_SECRET is required for workspace recurrence")
+        execution_mode = str(workspace.get("execution_mode") or "docker").strip().lower()
+        if execution_mode not in {"host", "docker"}:
+            raise RuntimeError("GlassHive workspace recurrence execution mode is invalid")
+        request_payload = {
+            "occurrence_id": scheduled_run_id,
+            "task_id": task_id,
+            "tenant_id": str(workspace.get("tenant_id") or "local"),
+            "owner_id": str(task.get("user_id") or ""),
+            "project_id": str(workspace.get("project_id") or ""),
+            "worker_id": str(workspace.get("worker_id") or ""),
+            "execution_mode": execution_mode,
+            "instruction": str(task.get("prompt") or ""),
+        }
+        headers[ASSERTION_HEADER] = mint_workspace_run_assertion(
+            secret=scheduler_secret,
+            request_payload=request_payload,
+        )
+        run = _post_json(
+            f"{_glasshive_base_url()}/internal/scheduling-cortex/workspace-runs",
+            request_payload,
+            headers,
+            int(os.getenv("SCHEDULER_GLASSHIVE_HTTP_TIMEOUT_S", "20")),
+        )
+        glasshive_run_id = str(run.get("run_id") or "").strip()
+        if not glasshive_run_id:
+            raise RuntimeError("GlassHive workspace dispatch did not return run_id")
+        storage.link_scheduled_prompt_glasshive_run(
+            scheduled_run_id,
+            glasshive_run_id,
+            queued_summary="GlassHive workspace run queued.",
+            updated_at=to_utc_iso(datetime.now(timezone.utc)),
+        )
+        return {
+            "delivery": {
+                "outcome": "queued",
+                "reason": "glasshive_workspace_run_queued",
+                "generated_text": None,
+            },
+            "scheduled_prompt_run_id": scheduled_run_id,
+            "glasshive_run_id": glasshive_run_id,
+        }
+    except Exception as exc:
+        failure_retryable = getattr(exc, "failure_retryable", None)
+        retryable = failure_retryable is not False
+        failed_at = to_utc_iso(datetime.now(timezone.utc))
+        storage.update_scheduled_prompt_run(
+            scheduled_run_id,
+            {
+                "status": "retryable" if retryable else "failed",
+                "completed_at": None if retryable else failed_at,
+                "claim_expires_at": failed_at if retryable else claim_expires_at,
+                "result_summary": _safe_result_summary(str(exc)),
+                "error_class": _scheduled_prompt_error_class(exc),
+                "updated_at": failed_at,
             },
         )
         raise
@@ -3106,6 +3314,8 @@ def dispatch_task(task: Dict[str, Any]) -> Dict[str, Any]:
         task, wb = _refresh_workbench_rendered_prompt(storage, task, wb)
     if executor == "glasshive_host":
         return _dispatch_glasshive_task(task)
+    if executor == "glasshive_workspace":
+        return _dispatch_glasshive_workspace_task(task)
     if executor != "viventium_agent":
         raise RuntimeError(f"Unsupported schedule executor: {executor}")
 

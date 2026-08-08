@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Literal, Optional, Dict, Any, List, Union
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -12,10 +13,32 @@ ChannelLiteral = Literal["telegram", "librechat", "workbench"]
 ChannelList = List[ChannelLiteral]
 ChannelValue = Union[ChannelLiteral, ChannelList]
 ExecutorLiteral = Literal["viventium_agent", "glasshive_host"]
+RuntimeExecutorLiteral = Literal["viventium_agent", "glasshive_host", "glasshive_workspace"]
 AVAILABLE_CHANNELS: tuple[ChannelLiteral, ...] = ("telegram", "librechat", "workbench")
 DEFAULT_DELIVERY_CHANNELS: tuple[ChannelLiteral, ...] = ("telegram", "librechat")
-AVAILABLE_EXECUTORS: tuple[ExecutorLiteral, ...] = ("viventium_agent", "glasshive_host")
+AVAILABLE_EXECUTORS: tuple[ExecutorLiteral, ...] = (
+    "viventium_agent",
+    "glasshive_host",
+)
+CAPABILITY_SERVER_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,120}$")
 # === VIVENTIUM END ===
+
+
+def _normalize_capability_servers(value: Any) -> Optional[List[str]]:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError("required_capability_servers must be a list")
+    normalized: List[str] = []
+    for item in value:
+        server_name = str(item or "").strip()
+        if not server_name or not CAPABILITY_SERVER_RE.fullmatch(server_name):
+            raise ValueError("required_capability_servers contains an invalid server name")
+        if server_name not in normalized:
+            normalized.append(server_name)
+    if len(normalized) > 32:
+        raise ValueError("required_capability_servers may contain at most 32 entries")
+    return sorted(normalized)
 
 
 class IntervalRule(BaseModel):
@@ -73,6 +96,33 @@ class ScheduleRule(BaseModel):
         return self
 
 
+class GlassHiveWorkspaceScheduleRule(BaseModel):
+    """Internal-only normalized recurrence persisted for glasshive_workspace tasks."""
+
+    type: Literal["glasshive_recurrence"]
+    recurrence_type: Literal["once", "daily", "interval", "cron", "rfc5545"]
+    interval_seconds: Optional[int] = Field(None, ge=60, le=366 * 24 * 60 * 60)
+    local_time: str = ""
+    timezone_name: str = "UTC"
+    dst_policy: Literal["elapsed", "next_valid_earliest", "next_valid_latest"]
+    cron_expression: str = ""
+    rrule: str = ""
+    starts_at: Optional[str] = None
+    ends_at: Optional[str] = None
+    enabled: bool = True
+    overlap_policy: Literal["skip", "queue"] = "skip"
+    misfire_grace_seconds: int = Field(300, ge=0, le=7 * 24 * 60 * 60)
+    catch_up_policy: Literal["skip", "bounded", "coalesce"] = "skip"
+    max_catch_up_occurrences: int = Field(1, ge=1, le=10)
+    jitter_seconds: int = Field(0, ge=0, le=15 * 60)
+
+    @field_validator("timezone_name")
+    @classmethod
+    def _validate_timezone_name(cls, value: str) -> str:
+        ensure_timezone(value)
+        return value
+
+
 class CreateScheduleArgs(BaseModel):
     # === VIVENTIUM NOTE ===
     # Feature: Clarify auto-injected fields, channel defaults, and conversation policy behavior.
@@ -125,6 +175,13 @@ class CreateScheduleArgs(BaseModel):
     )
     created_source: Optional[Literal["user", "agent"]] = "user"
     metadata: Optional[Dict[str, Any]] = None
+    required_capability_servers: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Exact reviewed connected capability server names required by a glasshive_host "
+            "schedule. Omit or leave empty when the scheduled worker needs no connected account."
+        ),
+    )
     active: bool = True
 
     @field_validator("created_by")
@@ -145,6 +202,11 @@ class CreateScheduleArgs(BaseModel):
             raise ValueError("channel list cannot be empty")
         return value
     # === VIVENTIUM NOTE ===
+
+    @field_validator("required_capability_servers", mode="before")
+    @classmethod
+    def _validate_required_capability_servers(cls, value: Any) -> List[str]:
+        return _normalize_capability_servers(value) or []
 
 
 class UpdateScheduleArgs(BaseModel):
@@ -182,6 +244,13 @@ class UpdateScheduleArgs(BaseModel):
     # === VIVENTIUM NOTE ===
     active: Optional[bool] = None
     metadata: Optional[Dict[str, Any]] = None
+    required_capability_servers: Optional[List[str]] = Field(
+        None,
+        description=(
+            "Replace the exact reviewed connected capability server names for a glasshive_host "
+            "schedule. Use an empty list to remove all connected capabilities."
+        ),
+    )
     updated_by: Optional[str] = Field(
         None, description="editor id, must be agent:<id> (auto-injected when omitted)"
     )
@@ -205,6 +274,11 @@ class UpdateScheduleArgs(BaseModel):
             raise ValueError("channel list cannot be empty")
         return value
     # === VIVENTIUM NOTE ===
+
+    @field_validator("required_capability_servers", mode="before")
+    @classmethod
+    def _validate_required_capability_servers(cls, value: Any) -> Optional[List[str]]:
+        return _normalize_capability_servers(value)
 
 
 class GetScheduleArgs(BaseModel):
@@ -347,12 +421,12 @@ class ScheduleTask(BaseModel):
     user_id: str
     agent_id: str
     prompt: str
-    schedule: ScheduleRule
+    schedule: Union[ScheduleRule, GlassHiveWorkspaceScheduleRule]
     # === VIVENTIUM NOTE ===
     # Feature: Tasks may target one or multiple channels.
     channel: ChannelValue
     # === VIVENTIUM NOTE ===
-    executor: ExecutorLiteral = "viventium_agent"
+    executor: RuntimeExecutorLiteral = "viventium_agent"
     conversation_policy: Literal["new", "same"]
     conversation_id: Optional[str] = None
     last_conversation_id: Optional[str] = None

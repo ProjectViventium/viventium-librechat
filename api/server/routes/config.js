@@ -124,6 +124,14 @@ router.get('/', async function (req, res) {
        * === VIVENTIUM END === */
       viventiumConnectedAccountsEnabled: isConnectedAccountsCapabilityEnabled(),
       /* === VIVENTIUM START ===
+       * Feature: Per-user credential policy visibility.
+       * Purpose: A saved personal-only policy remains enforceable and reversible even when the
+       * optional account-connection capability is disabled or provider fallback discovery changes.
+       * === VIVENTIUM END === */
+      viventiumCredentialPolicyEnabled:
+        isConnectedAccountsCapabilityEnabled() ||
+        isEnabled(process.env.VIVENTIUM_CONNECTED_ACCOUNT_POLICY_ENABLED),
+      /* === VIVENTIUM START ===
        * Feature: Experimental direct subscription authentication.
        * Purpose: Expose the explicit opt-in separately from the stable API-key setup surface.
        * === VIVENTIUM END === */

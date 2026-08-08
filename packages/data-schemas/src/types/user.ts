@@ -23,6 +23,9 @@ export interface IUser extends Document {
   googleId?: string;
   facebookId?: string;
   openidId?: string;
+  /* === VIVENTIUM START === Shared-OIDC GlassHive opaque principal. === */
+  viventiumGlassHivePrincipalId?: string;
+  /* === VIVENTIUM END === */
   samlId?: string;
   ldapId?: string;
   githubId?: string;
@@ -93,6 +96,9 @@ export interface UpdateUserRequest {
   username?: string;
   email?: string;
   role?: string;
+  /* === VIVENTIUM START === Shared-OIDC GlassHive opaque principal. === */
+  viventiumGlassHivePrincipalId?: string;
+  /* === VIVENTIUM END === */
   emailVerified?: boolean;
   avatar?: string;
   plugins?: string[];

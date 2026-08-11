@@ -222,6 +222,11 @@ jest.mock('~/server/services/viventium/CallSessionService', () => ({
     callSessionId: 'call_session_test',
     dispatchConfirmedAtMs: 123,
   })),
+  getDispatchStatus: jest.fn(async () => ({
+    version: 1,
+    status: 'claimed',
+    isWorkerClaimed: true,
+  })),
   updateCallSessionVoiceSettings: jest.fn(async ({ requestedVoiceRoute }) => ({
     callSessionId: 'call_session_test',
     roomName: 'lc-calltest',
@@ -853,6 +858,27 @@ describe('/api/viventium/calls', () => {
 
     expect(res.body.status).toBe('confirmed');
     expect(res.body.dispatchConfirmedAtMs).toBe(123);
+  });
+
+  test('GET dispatch/status returns exact worker-claim readiness', async () => {
+    const callsRouter = require('../calls');
+    const { getDispatchStatus } = require('~/server/services/viventium/CallSessionService');
+
+    const app = express();
+    app.use(express.json());
+    app.use('/api/viventium/calls', callsRouter);
+
+    const res = await request(app)
+      .get('/api/viventium/calls/call_session_test/dispatch/status?claimId=claim_1')
+      .set('x-viventium-call-secret', 'secret')
+      .set('x-viventium-call-capability', 'A'.repeat(43))
+      .expect(200);
+
+    expect(res.body).toEqual({ version: 1, status: 'claimed', isWorkerClaimed: true });
+    expect(getDispatchStatus).toHaveBeenCalledWith({
+      callSessionId: 'call_session_test',
+      claimId: 'claim_1',
+    });
   });
 
   test('ended sessions cannot claim or confirm a new worker dispatch', async () => {

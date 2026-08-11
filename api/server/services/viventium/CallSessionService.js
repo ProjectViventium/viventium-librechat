@@ -1655,6 +1655,41 @@ async function confirmDispatch({ callSessionId, claimId, success, error }) {
   return normalizeSession(session);
 }
 
+async function getDispatchStatus({ callSessionId, claimId }) {
+  if (!callSessionId) {
+    throw new Error('getDispatchStatus requires callSessionId');
+  }
+  if (!claimId) {
+    throw new Error('getDispatchStatus requires claimId');
+  }
+
+  const now = new Date();
+  const session = await ViventiumCallSession.findOne({
+    callSessionId: String(callSessionId),
+    expiresAt: { $gt: now },
+    callStatus: { $ne: 'ended' },
+  }).lean();
+  if (!session) {
+    return { version: 1, status: 'expired', isWorkerClaimed: false };
+  }
+
+  if (String(session.dispatchAttemptId || '') !== String(claimId)) {
+    return { version: 1, status: 'superseded', isWorkerClaimed: false };
+  }
+
+  const isWorkerClaimed =
+    !session.dispatchClaimId &&
+    Boolean(session.activeJobId) &&
+    Boolean(session.activeWorkerId) &&
+    session.leaseExpiresAt instanceof Date &&
+    session.leaseExpiresAt.getTime() > now.getTime();
+  return {
+    version: 1,
+    status: isWorkerClaimed ? 'claimed' : 'waiting',
+    isWorkerClaimed,
+  };
+}
+
 module.exports = {
   abandonVoiceSessionClaim,
   compactVoiceRouteState,
@@ -1681,6 +1716,7 @@ module.exports = {
   assertVoiceGatewayAuth,
   claimDispatch,
   confirmDispatch,
+  getDispatchStatus,
 };
 
 /* === VIVENTIUM NOTE === */

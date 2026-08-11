@@ -27,6 +27,7 @@ const {
   claimVoiceSession,
   claimDispatch,
   confirmDispatch,
+  getDispatchStatus,
   assertVoiceGatewayAuth,
   assertCallBrowserCapability,
 } = require('../CallSessionService');
@@ -1406,6 +1407,10 @@ describe('CallSessionService', () => {
       agentName: 'librechat-voice-gateway',
     });
 
+    await expect(
+      getDispatchStatus({ callSessionId: created.callSessionId, claimId: claim.claimId }),
+    ).resolves.toEqual({ version: 1, status: 'waiting', isWorkerClaimed: false });
+
     const workerClaim = await claimVoiceSession({
       callSessionId: created.callSessionId,
       jobId: 'dispatch-job-before-confirm',
@@ -1413,6 +1418,12 @@ describe('CallSessionService', () => {
       dispatchClaimId: claim.claimId,
     });
     expect(workerClaim.dispatchClaimId).toBeNull();
+    await expect(
+      getDispatchStatus({ callSessionId: created.callSessionId, claimId: claim.claimId }),
+    ).resolves.toEqual({ version: 1, status: 'claimed', isWorkerClaimed: true });
+    await expect(
+      getDispatchStatus({ callSessionId: created.callSessionId, claimId: 'superseded-claim' }),
+    ).resolves.toEqual({ version: 1, status: 'superseded', isWorkerClaimed: false });
 
     const confirmed = await confirmDispatch({
       callSessionId: created.callSessionId,

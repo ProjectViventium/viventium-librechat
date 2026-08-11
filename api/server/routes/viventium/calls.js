@@ -23,6 +23,7 @@ const {
   heartbeatCallSession,
   claimDispatch,
   confirmDispatch,
+  getDispatchStatus,
   getCallSessionVoiceSettings,
   syncCallSessionState,
   updateCallSessionVoiceSettings,
@@ -498,6 +499,25 @@ router.post('/:callSessionId/dispatch/confirm', dispatchAuth, async (req, res) =
     const status = err?.status || 500;
     logger.warn('[VIVENTIUM][calls] dispatch_confirm_failed', { status });
     return res.status(status).json({ error: err?.message || 'Dispatch confirm failed' });
+  }
+});
+
+router.get('/:callSessionId/dispatch/status', dispatchAuth, async (req, res) => {
+  try {
+    const claimId = typeof req.query?.claimId === 'string' ? req.query.claimId.trim() : '';
+    if (!claimId || claimId.length > 160) {
+      return res.status(400).json({ error: 'claimId is required' });
+    }
+
+    const status = await getDispatchStatus({
+      callSessionId: req.viventiumCallSession.callSessionId,
+      claimId,
+    });
+    return res.json(status);
+  } catch (err) {
+    const status = err?.status || 500;
+    logger.warn('[VIVENTIUM][calls] dispatch_status_failed', { status });
+    return res.status(status).json({ error: err?.message || 'Dispatch status failed' });
   }
 });
 

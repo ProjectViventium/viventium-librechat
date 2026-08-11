@@ -895,6 +895,11 @@ export type TStartupConfig = {
    * Purpose: Expose the server-side workbench link gate to the web client.
    * === VIVENTIUM END === */
   viventiumPromptWorkbenchLinkEnabled?: boolean;
+  /* === VIVENTIUM START ===
+   * Feature: WHOOP owner onboarding visibility.
+   * Purpose: Show the host-owner connector only when the compiled health integration is enabled.
+   * === VIVENTIUM END === */
+  viventiumHealthWhoopEnabled?: boolean;
   /** Operator-level Feelings instrument availability. */
   viventiumFeelingsAvailable?: boolean;
   /* === VIVENTIUM START ===

@@ -59,6 +59,8 @@ function AccountSettings() {
     (startupConfig as { viventiumConnectedAccountsEnabled?: boolean } | undefined)
       ?.viventiumConnectedAccountsEnabled === true;
   const installExperience = startupConfig?.viventiumInstallExperience;
+  const whoopSetupEnabled =
+    startupConfig?.viventiumHealthWhoopEnabled === true && user?.role === SystemRoles.ADMIN;
   const promptWorkbenchLinkEnabled =
     (startupConfig as { viventiumPromptWorkbenchLinkEnabled?: boolean } | undefined)
       ?.viventiumPromptWorkbenchLinkEnabled === true && user?.role === SystemRoles.ADMIN;
@@ -87,6 +89,18 @@ function AccountSettings() {
     setShowSettings(open);
     if (!open) {
       window.sessionStorage.removeItem(CONNECTED_ACCOUNTS_SETUP_PENDING_KEY);
+      const currentUrl = new URL(window.location.href);
+      if (currentUrl.searchParams.get('setup') === 'whoop') {
+        window.history.replaceState(
+          window.history.state,
+          '',
+          connectedAccountsSetupCleanUrl({
+            pathname: currentUrl.pathname,
+            search: currentUrl.search,
+            hash: currentUrl.hash,
+          }),
+        );
+      }
     }
   }, []);
 
@@ -135,6 +149,16 @@ function AccountSettings() {
     location.search,
     openSettings,
   ]);
+
+  /* === VIVENTIUM START ===
+   * Feature: WHOOP browser-first onboarding.
+   * Purpose: Open the owner-only health card from the helper callback without router remounts.
+   * === VIVENTIUM END === */
+  useEffect(() => {
+    if (whoopSetupEnabled && new URLSearchParams(location.search).get('setup') === 'whoop') {
+      openSettings(SettingsTabValues.ACCOUNT);
+    }
+  }, [location.search, openSettings, whoopSetupEnabled]);
 
   /* === VIVENTIUM START ===
    * Feature: Prompt Workbench account-menu entry.

@@ -2,16 +2,22 @@ schema_version: 1
 prompt_root: viventium/source_of_truth/prompts
 managed_scope: viventium_owned_product_prompts
 notes:
-- The compiler discovers .md prompts by frontmatter id.
-- local.*.yaml source files may use promptRef; compiled runtime YAML receives plain
-  strings.
-- Upstream LibreChat/user-managed prompts remain view-only unless explicitly migrated.
+  - The compiler discovers .md prompts by frontmatter id.
+  - local.*.yaml source files may use promptRef; compiled runtime YAML receives plain
+    strings.
+  - Upstream LibreChat/user-managed prompts remain view-only unless explicitly migrated.
 related_config:
   prompts:
     main.scheduling_self_continuity:
       - scheduling.direct_action_owner
       - scheduling.main_agent_tools
       - scheduling.mcp_server
+    scheduler.run_envelope:
+      - scheduler.shared_run_envelope
+    scheduler.consciousness_continuity_opportunity:
+      - scheduler.shared_consciousness_continuity_opportunity
+    scheduler.canonical_output:
+      - scheduler.canonical_output_runtime
     mcp.scheduling_cortex.server:
       - scheduling.direct_action_owner
       - scheduling.main_agent_tools
@@ -38,3 +44,21 @@ related_config:
       selector: mcpServers.scheduling-cortex
       source: librechat.mcp_server
       server: scheduling-cortex
+    scheduler.shared_run_envelope:
+      title: Shared Scheduled Run Envelope
+      summary: Registry-owned generic scheduler wrapper and deterministic factual run context contract.
+      path: viventium_v0_4/shared/scheduler_prompt_contract.py
+      selector: SCHEDULER_RUN_ENVELOPE_TEMPLATE
+      source: scheduler.shared_prompt_contract
+    scheduler.shared_consciousness_continuity_opportunity:
+      title: Consciousness Continuity Opportunity
+      summary: General all-feelings orientation, appraisal, choice, action, observation, and reappraisal opportunity.
+      path: viventium_v0_4/shared/scheduler_prompt_contract.py
+      selector: CONSCIOUSNESS_CONTINUITY_OPPORTUNITY_PROMPT_ID
+      source: scheduler.shared_prompt_contract
+    scheduler.canonical_output_runtime:
+      title: Scheduled Canonical Output
+      summary: One channel-neutral scheduled result for downstream adapters and intentional silence.
+      path: viventium_v0_4/LibreChat/api/server/services/viventium/surfacePrompts.js
+      selector: buildScheduledCanonicalOutputInstructions
+      source: scheduler.canonical_output_contract

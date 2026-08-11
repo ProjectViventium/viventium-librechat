@@ -1,6 +1,7 @@
-const { Providers } = require('@librechat/agents');
+const { Providers, GraphEvents, createContentAggregator } = require('@librechat/agents');
 const { Constants, ContentTypes, EModelEndpoint, Tools } = require('librechat-data-provider');
 const { logger } = require('@librechat/data-schemas');
+const { APIError } = require('openai');
 const db = require('~/models');
 const mockIsVoiceTaskSuppressed = jest.fn(() => false);
 
@@ -21,12 +22,32 @@ const {
   externalUserStimulusForReaction,
   evalIsolationForRequest,
   classifyMemoryWriterResult,
+  memoryReadUnavailableContext,
+  resolveWorkspaceParticipantBindings,
   mergeLateActivationCandidates,
   convertHarnessActivityParts,
+  finalizeHarnessActivityPartsForPersistence,
+  mergeCapturedHarnessActivityParts,
   isHarnessInvocationLocked,
+  shouldRunOnePassNonblockingPhaseA,
+  resolveParallelDetectionNoticeMode,
+  resolveOnePassPhaseBPlan,
+  startOnePassNonblockingMain,
+  startParallelPhaseBRecovery,
   isCancelledVoiceTask,
   buildUntrustedAmbientVoiceContextInstructions,
 } = AgentClient;
+
+const createProviderDeadlineApiError = (status) => {
+  const payload = {
+    message: 'The foreground response exceeded its configured deadline.',
+    type: 'glasshive_timeout_error',
+    code: 'provider_response_deadline_exceeded',
+  };
+  return status == null
+    ? new APIError(undefined, payload, undefined, new Headers())
+    : APIError.generate(status, { error: payload }, undefined, new Headers());
+};
 
 describe('Untrusted ambient voice context', () => {
   test('carries guest facts as bounded data with an explicit zero-authority contract', () => {
@@ -114,6 +135,9 @@ jest.mock('~/server/services/viventium/conversationRecallService', () => ({
 jest.mock('~/server/services/viventium/EmotionalReactionService', () => ({
   scheduleEmotionalReaction: jest.fn().mockResolvedValue({ status: 'healthy' }),
 }));
+jest.mock('~/server/services/viventium/memoryContinuityHealthLedger', () => ({
+  recordMemoryContinuityHealth: jest.fn().mockResolvedValue(undefined),
+}));
 
 // Mock getMCPManager
 const mockFormatInstructions = jest.fn();
@@ -139,6 +163,12 @@ const mockPersistFollowUpDecisionToParentMessage =
   require('~/server/services/viventium/BackgroundCortexFollowUpService').persistFollowUpDecisionToParentMessage;
 const mockScheduleEmotionalReaction =
   require('~/server/services/viventium/EmotionalReactionService').scheduleEmotionalReaction;
+const mockRecordMemoryContinuityHealth =
+  require('~/server/services/viventium/memoryContinuityHealthLedger').recordMemoryContinuityHealth;
+const {
+  createSchedulerInteractionContext,
+  setTrustedInteractionContext,
+} = require('~/server/services/viventium/interactionContext');
 
 function deferred() {
   let resolve;
@@ -423,21 +453,31 @@ describe('Detached memory writer result classification', () => {
 
 describe('buildViventiumMcpRequestBody', () => {
   test('passes surface context and existing upload references to GlassHive MCP', () => {
+    const req = {
+      body: {
+        viventiumSurface: 'telegram',
+        viventiumInputMode: 'voice_note',
+        streamId: 'stream-1',
+        telegramChatId: 'chat-1',
+        telegramUserId: 'tg-user-1',
+        telegramMessageId: 'tg-msg-1',
+      },
+    };
+    setTrustedInteractionContext(req, {
+      actor_kind: 'external_user',
+      origin: 'interactive',
+      surface: 'telegram',
+      conversation_id: 'conv-1',
+      logical_turn_id: 'turn-1',
+      revision: 2,
+      source_event_id: 'telegram:chat-1:tg-msg-1',
+    });
     const body = AgentClient.buildViventiumMcpRequestBody({
       messageId: 'assistant-1',
       conversationId: 'conv-1',
       parentMessageId: 'user-1',
       harnessIdempotencyKey: 'main:assistant-1',
-      req: {
-        body: {
-          viventiumSurface: 'telegram',
-          viventiumInputMode: 'voice_note',
-          streamId: 'stream-1',
-          telegramChatId: 'chat-1',
-          telegramUserId: 'tg-user-1',
-          telegramMessageId: 'tg-msg-1',
-        },
-      },
+      req,
       attachments: [
         {
           file_id: 'file-1',
@@ -454,6 +494,8 @@ describe('buildViventiumMcpRequestBody', () => {
     expect(body.viventiumGlassHiveIdempotencyKey).toBe('main:assistant-1');
     expect(body.viventiumStreamId).toBe('stream-1');
     expect(body.viventiumTelegramChatId).toBe('chat-1');
+    expect(body.viventiumLogicalTurnId).toBe('turn-1');
+    expect(body.viventiumLogicalTurnRevision).toBe('2');
     expect(body.files[0]).toMatchObject({
       file_id: 'file-1',
       filename: 'brief.txt',
@@ -463,6 +505,301 @@ describe('buildViventiumMcpRequestBody', () => {
     expect(body.attachments).toEqual(body.files);
     expect(body.file_ids).toEqual(['file-1']);
     expect(body.tool_resources.code_interpreter.file_ids).toEqual(['file-1']);
+  });
+
+  test('passes the per-agent idempotency map without changing the primary key', () => {
+    const body = AgentClient.buildViventiumMcpRequestBody({
+      messageId: 'assistant-1',
+      conversationId: 'conv-1',
+      parentMessageId: 'user-1',
+      harnessIdempotencyKey: 'main:assistant-1',
+      harnessAgentIdempotencyKeys: {
+        'main-agent': 'main:assistant-1',
+        'reality-agent': 'main:reality-agent:assistant-1',
+      },
+      req: { body: {} },
+    });
+
+    expect(body.viventiumGlassHiveIdempotencyKey).toBe('main:assistant-1');
+    expect(body.viventiumGlassHiveAgentIdempotencyKeys).toEqual({
+      'main-agent': 'main:assistant-1',
+      'reality-agent': 'main:reality-agent:assistant-1',
+    });
+  });
+});
+
+describe('graph participant workspace bindings', () => {
+  test('includes a direct-primary participant when its hidden runtime fallback is workspace-bound', () => {
+    const fallbackEndpointConfig = {
+      baseURL: 'http://workspace-fallback.local/v1',
+      apiKey: 'synthetic-key',
+    };
+    const directParticipant = {
+      id: 'red-agent',
+      endpoint: 'direct-endpoint',
+    };
+    Object.defineProperty(directParticipant, 'viventiumGraphLlmFallbacks', {
+      value: [
+        {
+          id: 'red-agent',
+          endpoint: 'workspace-endpoint',
+          viventiumHarnessCancellationEndpointConfig: fallbackEndpointConfig,
+        },
+      ],
+      enumerable: false,
+    });
+
+    expect(
+      resolveWorkspaceParticipantBindings([directParticipant], {
+        'direct-endpoint': { workspace_binding: false },
+        'workspace-endpoint': { workspace_binding: true },
+      }),
+    ).toEqual([
+      {
+        agentId: 'red-agent',
+        cancellationEndpointConfigs: [fallbackEndpointConfig],
+      },
+    ]);
+  });
+
+  test('preserves primary workspace bindings and dedupes shared cancellation configs', () => {
+    const sharedEndpointConfig = {
+      baseURL: 'http://workspace-primary.local/v1',
+      apiKey: 'synthetic-key',
+    };
+    const secondEndpointConfig = {
+      baseURL: 'http://workspace-secondary.local/v1',
+      apiKey: 'synthetic-key',
+    };
+    const participant = {
+      id: 'main-agent',
+      endpoint: 'workspace-primary',
+      viventiumHarnessCancellationEndpointConfig: sharedEndpointConfig,
+      viventiumGraphLlmFallbacks: [
+        {
+          id: 'main-agent',
+          endpoint: 'workspace-primary',
+          viventiumHarnessCancellationEndpointConfig: sharedEndpointConfig,
+        },
+        {
+          id: 'main-agent',
+          endpoint: 'workspace-secondary',
+          viventiumHarnessCancellationEndpointConfig: secondEndpointConfig,
+        },
+      ],
+    };
+
+    expect(
+      resolveWorkspaceParticipantBindings([participant], {
+        'workspace-primary': { workspace_binding: true },
+        'workspace-secondary': { workspace_binding: true },
+      }),
+    ).toEqual([
+      {
+        agentId: 'main-agent',
+        cancellationEndpointConfigs: [sharedEndpointConfig, secondEndpointConfig],
+      },
+    ]);
+  });
+
+  test('creates the participant-scoped key and delivers Stop to a fallback-only workspace route', async () => {
+    const fallbackEndpointConfig = {
+      baseURL: 'http://workspace-fallback.local/v1',
+      apiKey: 'synthetic-key',
+    };
+    const participant = {
+      id: 'red-agent',
+      endpoint: 'direct-endpoint',
+      viventiumGraphLlmFallbacks: [
+        {
+          id: 'red-agent',
+          endpoint: 'workspace-endpoint',
+          viventiumHarnessCancellationEndpointConfig: fallbackEndpointConfig,
+        },
+      ],
+    };
+    const bindings = resolveWorkspaceParticipantBindings([participant], {
+      'workspace-endpoint': { workspace_binding: true },
+    });
+    const request = {
+      user: { id: 'synthetic-user' },
+      body: { responseMessageId: 'response-1' },
+    };
+    const identity = buildHarnessAgentIdempotencyKeys(request, 'response-1', {
+      primaryAgentId: 'main-agent',
+      agentIds: bindings.map(({ agentId }) => agentId),
+      preserveGraphTurnFamily: true,
+    });
+    request._viventiumHarnessIdempotencyKey = identity.primaryKey;
+    request._viventiumHarnessIdempotencyKeys = new Set(identity.allKeys);
+    const cancellationFetch = jest.fn().mockResolvedValue({ ok: true });
+    const abortController = new AbortController();
+    for (const binding of bindings) {
+      for (const endpointConfig of binding.cancellationEndpointConfigs) {
+        bindHarnessCancellation({
+          req: request,
+          signal: abortController.signal,
+          endpointConfig,
+          fetchImpl: cancellationFetch,
+        });
+      }
+    }
+
+    abortController.abort('user_cancelled');
+    await Promise.resolve();
+
+    expect(identity.byAgentId['red-agent']).toBe('main:red-agent:response-1');
+    expect(cancellationFetch).toHaveBeenCalledWith(
+      'http://workspace-fallback.local/v1/requests/by-idempotency/main%3Ared-agent%3Aresponse-1/cancel',
+      expect.any(Object),
+    );
+  });
+});
+
+describe('one-pass nonblocking Phase A', () => {
+  test('preserves early voice notice mode only for exactly-once orchestration', () => {
+    expect(
+      resolveParallelDetectionNoticeMode({
+        onePass: true,
+        noticeMode: 'first_activation_continue',
+      }),
+    ).toBe('first_activation_continue');
+    expect(
+      resolveParallelDetectionNoticeMode({
+        onePass: false,
+        noticeMode: 'first_activation_continue',
+      }),
+    ).toBe('all_within_budget');
+  });
+
+  test('is selected when async detection is enabled but speculative reruns are unsafe', () => {
+    expect(
+      shouldRunOnePassNonblockingPhaseA({ policy: { enabled: true }, speculativeMode: false }),
+    ).toBe(true);
+    expect(
+      shouldRunOnePassNonblockingPhaseA({ policy: { enabled: true }, speculativeMode: true }),
+    ).toBe(true);
+    expect(
+      shouldRunOnePassNonblockingPhaseA({ policy: { enabled: false }, speculativeMode: false }),
+    ).toBe(false);
+  });
+
+  test('starts detection and completes Main exactly once without waiting for detection', async () => {
+    const detection = deferred();
+    const runMain = jest.fn().mockResolvedValue(undefined);
+    const onDetection = jest.fn().mockResolvedValue('phase-b-result');
+
+    const result = startOnePassNonblockingMain({
+      runMain,
+      detectionPromise: detection.promise,
+      onDetection,
+    });
+
+    await result.mainPromise;
+    expect(runMain).toHaveBeenCalledTimes(1);
+    expect(onDetection).not.toHaveBeenCalled();
+    detection.resolve({ activatedCortices: [{ agentId: 'deep-memory' }] });
+    await expect(result.backgroundPromise).resolves.toBe('phase-b-result');
+    expect(onDetection).toHaveBeenCalledTimes(1);
+  });
+
+  test('starts late recovery without waiting for initial Phase B execution', async () => {
+    const initialExecution = deferred();
+    const runInitial = jest.fn(() => initialExecution.promise);
+    const runLate = jest.fn().mockResolvedValue('late-result');
+
+    const completion = startParallelPhaseBRecovery({ runInitial, runLate });
+
+    await Promise.resolve();
+    expect(runInitial).toHaveBeenCalledTimes(1);
+    expect(runLate).toHaveBeenCalledTimes(1);
+    initialExecution.resolve('initial-result');
+    await expect(completion).resolves.toEqual(['initial-result', 'late-result']);
+  });
+
+  test.each([
+    {
+      name: 'no-classified',
+      detectionResult: { timedOut: false, activatedCortices: [] },
+      expectedInitial: [],
+      expectedLateBudget: 0,
+    },
+    {
+      name: 'fast-before-boundary',
+      detectionResult: {
+        timedOut: false,
+        activatedCortices: [{ agentId: 'deep-memory' }],
+      },
+      expectedInitial: ['deep-memory'],
+      expectedLateBudget: 0,
+    },
+    {
+      name: 'timed-out-no-new',
+      detectionResult: { timedOut: true, activatedCortices: [] },
+      expectedInitial: [],
+      expectedLateBudget: 900,
+    },
+  ])('resolves the $name activation boundary without replaying Main', async (scenario) => {
+    const plan = await resolveOnePassPhaseBPlan({
+      detectionResult: scenario.detectionResult,
+      detectTimeoutMs: 400,
+      resolveLateDetectTimeoutMs: () => 900,
+    });
+
+    expect(plan.initialActivations.map((cortex) => cortex.agentId)).toEqual(
+      scenario.expectedInitial,
+    );
+    expect(plan.lateDetectTimeoutMs).toBe(scenario.expectedLateBudget);
+    expect(plan.mergeLateActivations([]).recovered).toEqual([]);
+  });
+
+  test('runs early activation, final timeout, and late recovery once per cortex', async () => {
+    const early = [{ agentId: 'deep-memory' }];
+    const final = [{ agentId: 'deep-memory' }, { agentId: 'red-team' }];
+    const late = [{ agentId: 'red-team' }, { agentId: 'pattern' }];
+    const finalDetection = deferred();
+    const resolveLateDetectTimeoutMs = jest.fn((timeoutMs) => timeoutMs + 1000);
+    const planPromise = resolveOnePassPhaseBPlan({
+      detectionResult: {
+        earlyReturned: true,
+        timedOut: false,
+        activatedCortices: early,
+        finalDetectionPromise: finalDetection.promise,
+      },
+      detectTimeoutMs: 500,
+      resolveLateDetectTimeoutMs,
+    });
+
+    finalDetection.resolve({ timedOut: true, activatedCortices: final });
+    const plan = await planPromise;
+    expect(plan.initialActivations.map((cortex) => cortex.agentId)).toEqual([
+      'deep-memory',
+      'red-team',
+    ]);
+    expect(plan.finalRecoveredActivations.map((cortex) => cortex.agentId)).toEqual(['red-team']);
+    expect(plan.lateDetectTimeoutMs).toBe(1500);
+    expect(resolveLateDetectTimeoutMs).toHaveBeenCalledWith(500);
+
+    const lateMerge = plan.mergeLateActivations(late);
+    const initialExecution = deferred();
+    const executed = [];
+
+    const completion = startParallelPhaseBRecovery({
+      runInitial: () => {
+        executed.push(...plan.initialActivations.map((cortex) => cortex.agentId));
+        return initialExecution.promise;
+      },
+      runLate: async () => {
+        executed.push(...lateMerge.recovered.map((cortex) => cortex.agentId));
+        return 'late-result';
+      },
+    });
+
+    await Promise.resolve();
+    expect(executed).toEqual(['deep-memory', 'red-team', 'pattern']);
+    expect(new Set(executed).size).toBe(executed.length);
+    initialExecution.resolve('initial-result');
+    await expect(completion).resolves.toEqual(['initial-result', 'late-result']);
   });
 });
 
@@ -624,6 +961,31 @@ describe('late completion error content parts', () => {
       [ContentTypes.ERROR]:
         'The model provider is temporarily overloaded. Please try again shortly.',
       error_class: 'provider_temporarily_unavailable',
+    });
+
+    const structuredHostLoss = new Error(
+      'The provider worker stopped unexpectedly before completing the response.',
+    );
+    structuredHostLoss.code = 'provider_temporarily_unavailable';
+    expect(AgentClient.createCompletionErrorContentPart(structuredHostLoss)).toEqual({
+      type: ContentTypes.ERROR,
+      [ContentTypes.ERROR]:
+        'The model provider is temporarily overloaded. Please try again shortly.',
+      error_class: 'provider_temporarily_unavailable',
+    });
+  });
+
+  test.each([
+    ['non-stream HTTP 504', 504],
+    ['HTTP-200 SSE APIError', undefined],
+  ])('classifies a %s foreground deadline as the same honest timeout', (_transport, status) => {
+    const error = createProviderDeadlineApiError(status);
+
+    expect(AgentClient.createCompletionErrorContentPart(error)).toEqual({
+      type: ContentTypes.ERROR,
+      [ContentTypes.ERROR]:
+        "The model response exceeded this turn's configured deadline and was stopped. Please retry the turn.",
+      error_class: 'provider_response_deadline_exceeded',
     });
   });
 
@@ -2317,7 +2679,10 @@ describe('AgentClient - titleConvo', () => {
       });
 
       // Verify the instructions still work without MCP content (from agent config, not buildOptions)
-      expect(client.options.agent.instructions).toBe('Base agent instructions');
+      expect(client.options.agent.instructions).toContain('Base agent instructions');
+      expect(client.options.agent.instructions).toContain(
+        "Use only facts from the user's current request, prepared My World context",
+      );
       expect(client.options.agent.instructions).not.toContain('[object Promise]');
     });
 
@@ -3234,7 +3599,10 @@ describe('AgentClient - titleConvo', () => {
         additional_instructions: null,
       });
 
-      expect(parallelAgent.instructions).toBe('Original parallel instructions');
+      expect(parallelAgent.instructions).toContain('Original parallel instructions');
+      expect(parallelAgent.instructions).toContain(
+        "Use only facts from the user's current request, prepared My World context",
+      );
     });
 
     it('should handle parallel agents without existing instructions', async () => {
@@ -3577,6 +3945,10 @@ describe('AgentClient - titleConvo', () => {
 
       expect(result).toBe('stored memories');
       expect(writerResult.ok).toBe(false);
+      expect(writerResult.attachment?.[Tools.memory]?.type).toBe('error');
+      expect(JSON.parse(writerResult.attachment[Tools.memory].value)).toEqual(
+        expect.objectContaining({ errorType: 'writer_unavailable' }),
+      );
       expect(mockCreateMemoryProcessor).not.toHaveBeenCalled();
     });
   });
@@ -3591,6 +3963,18 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
   let client;
   let req;
   let primaryAgent;
+
+  const fallbackRecoveryPart = (model) => ({
+    type: ContentTypes.HARNESS_ACTIVITY,
+    harness_activity: {
+      event: 'fallback-recovery',
+      summary: expect.stringContaining(`configured fallback model (${model})`),
+    },
+  });
+
+  const expectFallbackCompletion = (parts, text, model) => {
+    expect(parts).toEqual([fallbackRecoveryPart(model), { type: ContentTypes.TEXT, text }]);
+  };
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -3623,6 +4007,33 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     });
     client.conversationId = 'conv-1';
     client.responseMessageId = 'resp-1';
+  });
+
+  test('persists one graph participant fallback receipt for refresh without duplicate answer text', async () => {
+    client.chatCompletion = jest.fn(async () => {
+      client.run = { Graph: {} };
+      Object.defineProperty(client.run.Graph, 'viventiumGraphFallbackRecoveryReceipt', {
+        value: { provider: 'openAI', model: 'synthetic-worker-fallback' },
+        enumerable: false,
+      });
+      client.contentParts.push({ type: ContentTypes.TEXT, text: 'One recovered final answer.' });
+    });
+
+    const { completion } = await client.sendCompletion({ text: 'hello' });
+    const refreshed = JSON.parse(JSON.stringify(completion));
+
+    expect(client.chatCompletion).toHaveBeenCalledTimes(1);
+    expect(refreshed).toEqual([
+      {
+        type: ContentTypes.HARNESS_ACTIVITY,
+        harness_activity: expect.objectContaining({
+          event: 'fallback-recovery',
+          provider: 'openAI',
+          model: 'synthetic-worker-fallback',
+        }),
+      },
+      { type: ContentTypes.TEXT, text: 'One recovered final answer.' },
+    ]);
   });
 
   test('persists Phase B parts and waits for fallback text before follow-up synthesis', async () => {
@@ -4208,6 +4619,35 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     expect(result.completion).toEqual([{ type: ContentTypes.TEXT, text: 'Primary answer.' }]);
   });
 
+  test.each([
+    ['non-stream HTTP 504', 504],
+    ['HTTP-200 SSE APIError', undefined],
+  ])(
+    'does not start an outer fallback after a %s foreground deadline',
+    async (_transport, status) => {
+      primaryAgent.viventiumFallbackLlm = {
+        id: 'agent-fallback',
+        provider: EModelEndpoint.openAI,
+        model: 'gpt-5.4',
+        model_parameters: { model: 'gpt-5.4' },
+      };
+      const deadlineError = createProviderDeadlineApiError(status);
+      client.chatCompletion = jest.fn(async () => {
+        throw deadlineError;
+      });
+
+      await expect(client.sendCompletion({ text: 'hello' })).rejects.toBe(deadlineError);
+
+      expect(client.chatCompletion).toHaveBeenCalledTimes(1);
+      expect(AgentClient.createCompletionErrorContentPart(deadlineError)).toEqual({
+        type: ContentTypes.ERROR,
+        [ContentTypes.ERROR]:
+          "The model response exceeded this turn's configured deadline and was stopped. Please retry the turn.",
+        error_class: 'provider_response_deadline_exceeded',
+      });
+    },
+  );
+
   test('materializes lazy fallback only after primary fails before assistant text', async () => {
     const fallbackAgent = {
       id: 'agent-fallback',
@@ -4237,7 +4677,7 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     expect(primaryAgent.viventiumFallbackLlmInitializer).toHaveBeenCalledTimes(1);
     expect(client.chatCompletion).toHaveBeenCalledTimes(2);
     expect(fallbackSawUserMcpAuthMap).toEqual(fallbackAgent.userMCPAuthMap);
-    expect(result.completion).toEqual([{ type: ContentTypes.TEXT, text: 'Fallback answer.' }]);
+    expectFallbackCompletion(result.completion, 'Fallback answer.', 'gpt-5.4');
   });
 
   test('materializes lazy fallback for a nested provider access denial before assistant text', async () => {
@@ -4263,7 +4703,17 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
 
     expect(primaryAgent.viventiumFallbackLlmInitializer).toHaveBeenCalledTimes(1);
     expect(client.chatCompletion).toHaveBeenCalledTimes(2);
-    expect(result.completion).toEqual([{ type: ContentTypes.TEXT, text: 'Fallback answer.' }]);
+    expect(result.completion).toEqual([
+      {
+        type: ContentTypes.HARNESS_ACTIVITY,
+        harness_activity: {
+          event: 'fallback-recovery',
+          summary:
+            'The primary model route was unavailable. This response was recovered with your configured fallback model (gpt-5.4).',
+        },
+      },
+      { type: ContentTypes.TEXT, text: 'Fallback answer.' },
+    ]);
   });
 
   test('does not hide a deterministic generic 400 behind model fallback', async () => {
@@ -4351,7 +4801,7 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     expect(Object.prototype.hasOwnProperty.call(req.body, 'suppressBackgroundCortices')).toBe(
       false,
     );
-    expect(result.completion).toEqual([{ type: ContentTypes.TEXT, text: 'Fallback answer.' }]);
+    expectFallbackCompletion(result.completion, 'Fallback answer.', 'gpt-5.4');
   });
 
   test('retries fallback when primary throws after adding a recoverable error part', async () => {
@@ -4382,8 +4832,90 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     const result = await client.sendCompletion({ text: 'hello' });
 
     expect(client.chatCompletion).toHaveBeenCalledTimes(2);
-    expect(result.completion).toEqual([{ type: ContentTypes.TEXT, text: 'Fallback answer.' }]);
-    expect(client.contentParts).toEqual([{ type: ContentTypes.TEXT, text: 'Fallback answer.' }]);
+    expectFallbackCompletion(result.completion, 'Fallback answer.', 'gpt-5.4');
+    expectFallbackCompletion(client.contentParts, 'Fallback answer.', 'gpt-5.4');
+  });
+
+  test('logs one metadata-only diagnostic for a wrapped primary error before fallback', async () => {
+    const secret = 'sk-test-primary-error-secret-never-log';
+    const providerError = new Error(`rate limit from provider with ${secret}`);
+    providerError.status = 429;
+    providerError.code = 'rate_limit_exceeded';
+    const wrappedError = new Error(`wrapped provider failure with ${secret}`);
+    wrappedError.cause = providerError;
+    primaryAgent.viventiumFallbackLlm = {
+      id: 'agent-fallback',
+      provider: EModelEndpoint.openAI,
+      model: 'gpt-5.4',
+      model_parameters: { model: 'gpt-5.4' },
+    };
+    let calls = 0;
+    client.chatCompletion = jest.fn(async () => {
+      calls += 1;
+      if (calls === 1) {
+        throw wrappedError;
+      }
+      client.contentParts.push({ type: ContentTypes.TEXT, text: 'Fallback answer.' });
+    });
+    const warnSpy = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+
+    try {
+      const result = await client.sendCompletion({ text: 'hello' });
+      const diagnosticCalls = warnSpy.mock.calls.filter(
+        ([message]) =>
+          message === '[AgentClient] Primary completion threw before fallback evaluation',
+      );
+
+      expectFallbackCompletion(result.completion, 'Fallback answer.', 'gpt-5.4');
+      expect(diagnosticCalls).toHaveLength(1);
+      expect(diagnosticCalls[0][1]).toEqual({
+        class: 'provider_rate_limited',
+        status: 429,
+        code: 'rate_limit_exceeded',
+        chainDepth: 2,
+        messageHash: expect.stringMatching(/^[a-f0-9]{12}$/),
+      });
+      const serializedCalls = JSON.stringify(warnSpy.mock.calls);
+      expect(serializedCalls).not.toContain(secret);
+      expect(serializedCalls).not.toContain(wrappedError.message);
+      expect(serializedCalls).not.toContain(providerError.message);
+      expect(serializedCalls).not.toContain(wrappedError.stack);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  test('does not log a thrown-primary diagnostic for content-part-only fallback', async () => {
+    primaryAgent.viventiumFallbackLlm = {
+      id: 'agent-fallback',
+      provider: EModelEndpoint.openAI,
+      model: 'gpt-5.4',
+      model_parameters: { model: 'gpt-5.4' },
+    };
+    let calls = 0;
+    client.chatCompletion = jest.fn(async () => {
+      calls += 1;
+      if (calls === 1) {
+        client.contentParts.push({
+          type: ContentTypes.ERROR,
+          [ContentTypes.ERROR]: 'provider temporarily unavailable',
+        });
+        return;
+      }
+      client.contentParts.push({ type: ContentTypes.TEXT, text: 'Fallback answer.' });
+    });
+    const warnSpy = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+
+    try {
+      await client.sendCompletion({ text: 'hello' });
+
+      expect(warnSpy).not.toHaveBeenCalledWith(
+        '[AgentClient] Primary completion threw before fallback evaluation',
+        expect.anything(),
+      );
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 
   test('retries fallback when primary throws public hyphenated rate-limit text', async () => {
@@ -4406,8 +4938,212 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     const result = await client.sendCompletion({ text: 'hello' });
 
     expect(client.chatCompletion).toHaveBeenCalledTimes(2);
-    expect(result.completion).toEqual([{ type: ContentTypes.TEXT, text: 'Fallback answer.' }]);
-    expect(client.contentParts).toEqual([{ type: ContentTypes.TEXT, text: 'Fallback answer.' }]);
+    expectFallbackCompletion(result.completion, 'Fallback answer.', 'gpt-5.4');
+    expectFallbackCompletion(client.contentParts, 'Fallback answer.', 'gpt-5.4');
+  });
+
+  test.each([
+    ['connection refusal', { code: 'ECONNREFUSED' }],
+    ['connection reset', { code: 'ECONNRESET' }],
+    ['gateway failure', { status: 502 }],
+    ['gateway timeout without a persisted deadline code', { status: 504 }],
+    ['provider timeout', { code: 'ETIMEDOUT' }],
+  ])('retries fallback when the primary provider has a %s', async (_label, shape) => {
+    primaryAgent.viventiumFallbackLlm = {
+      id: 'agent-fallback',
+      provider: 'glasshive-harness',
+      model: 'claude-code:opus',
+      model_parameters: { model: 'claude-code:opus', reasoning_effort: 'high' },
+    };
+    let calls = 0;
+    client.chatCompletion = jest.fn(async () => {
+      calls += 1;
+      if (calls === 1) {
+        throw Object.assign(new Error('provider connection failed'), shape);
+      }
+      client.contentParts.push({ type: ContentTypes.TEXT, text: 'Connection fallback answer.' });
+    });
+
+    const result = await client.sendCompletion({ text: 'hello' });
+
+    expect(client.chatCompletion).toHaveBeenCalledTimes(2);
+    expectFallbackCompletion(result.completion, 'Connection fallback answer.', 'claude-code:opus');
+  });
+
+  test('marks a same-provider generic fallback as a distinct harness attempt', async () => {
+    req.config.endpoints.agents = {
+      providerCapabilities: {
+        'glasshive-harness': {
+          activity_stream: true,
+          workspace_binding: true,
+          conversation_session: true,
+        },
+      },
+    };
+    primaryAgent.provider = EModelEndpoint.openAI;
+    primaryAgent.endpoint = 'glasshive-harness';
+    primaryAgent.model = 'codex-cli:gpt-5.6-sol';
+    primaryAgent.model_parameters.model = 'codex-cli:gpt-5.6-sol';
+    req._viventiumHarnessActivityEnabled = true;
+    req._viventiumHarnessExecutionEnabled = true;
+    primaryAgent.viventiumFallbackLlm = {
+      ...primaryAgent,
+      provider: EModelEndpoint.openAI,
+      endpoint: 'glasshive-harness',
+      model: 'claude-code:opus',
+      model_parameters: { model: 'claude-code:opus', reasoning_effort: 'high' },
+    };
+    const attempts = [];
+    client.chatCompletion = jest.fn(async () => {
+      attempts.push({
+        fallback: req._viventiumFallbackLlmAttempt === true,
+        key: buildHarnessAttemptIdempotencyKey(req, client.responseMessageId),
+        provider: client.options.agent.endpoint || client.options.agent.provider,
+        model: client.options.agent.model,
+      });
+      if (attempts.length === 1) {
+        const error = new Error(
+          'The model provider rate-limited this request. Please try again shortly.',
+        );
+        error.errorClass = 'provider_quota_exhausted';
+        throw error;
+      }
+      client.contentParts.push({ type: ContentTypes.TEXT, text: 'Claude fallback answer.' });
+    });
+
+    const result = await client.sendCompletion({ text: 'hello' });
+
+    expect(attempts).toEqual([
+      {
+        fallback: false,
+        key: 'main:resp-1',
+        provider: 'glasshive-harness',
+        model: 'codex-cli:gpt-5.6-sol',
+      },
+      {
+        fallback: true,
+        key: 'main-fallback:resp-1',
+        provider: 'glasshive-harness',
+        model: 'claude-code:opus',
+      },
+    ]);
+    expect(req._viventiumHarnessExecutionEnabled).toBe(true);
+    expectFallbackCompletion(result.completion, 'Claude fallback answer.', 'claude-code:opus');
+  });
+
+  test('rebuilds the complete same-provider fallback graph family before Stop can fire', async () => {
+    const abortController = new AbortController();
+    const cancellationFetch = jest.fn().mockResolvedValue({ ok: true });
+    const cancellationEndpoint = {
+      baseURL: 'http://glasshive.local/v1',
+      apiKey: 'synthetic-key',
+    };
+    req.body.responseMessageId = 'resp-1';
+    req.config.endpoints.agents = {
+      providerCapabilities: {
+        'glasshive-harness': {
+          activity_stream: true,
+          workspace_binding: true,
+          conversation_session: true,
+        },
+      },
+    };
+    primaryAgent.id = 'main-agent';
+    primaryAgent.provider = EModelEndpoint.openAI;
+    primaryAgent.endpoint = 'glasshive-harness';
+    primaryAgent.model = 'codex-cli:gpt-5.6-sol';
+    primaryAgent.model_parameters.model = 'codex-cli:gpt-5.6-sol';
+    primaryAgent.viventiumHarnessCancellationEndpointConfig = cancellationEndpoint;
+    primaryAgent.viventiumFallbackLlm = {
+      ...primaryAgent,
+      model: 'claude-code:opus',
+      model_parameters: { model: 'claude-code:opus', reasoning_effort: 'high' },
+    };
+    client.agentConfigs = new Map([
+      [
+        'reality-agent',
+        {
+          id: 'reality-agent',
+          endpoint: 'glasshive-harness',
+          viventiumHarnessCancellationEndpointConfig: cancellationEndpoint,
+        },
+      ],
+      [
+        'red-agent',
+        {
+          id: 'red-agent',
+          endpoint: 'glasshive-harness',
+          viventiumHarnessCancellationEndpointConfig: cancellationEndpoint,
+        },
+      ],
+    ]);
+
+    req._viventiumHarnessExecutionEnabled = true;
+    const primaryIdentity = buildHarnessAgentIdempotencyKeys(req, 'resp-1', {
+      primaryAgentId: 'main-agent',
+      agentIds: ['main-agent'],
+    });
+    req._viventiumHarnessIdempotencyKey = primaryIdentity.primaryKey;
+    req._viventiumHarnessIdempotencyKeys = new Set(primaryIdentity.allKeys);
+    bindHarnessCancellation({
+      req,
+      signal: abortController.signal,
+      endpointConfig: cancellationEndpoint,
+      fetchImpl: cancellationFetch,
+    });
+
+    let calls = 0;
+    let fallbackKeys = [];
+    client.chatCompletion = jest.fn(async () => {
+      calls += 1;
+      if (calls === 1) {
+        throw Object.assign(new Error('provider rate limited'), {
+          errorClass: 'provider_quota_exhausted',
+        });
+      }
+      fallbackKeys = Array.from(req._viventiumHarnessIdempotencyKeys || []);
+      abortController.abort('user_cancelled');
+      client.contentParts.push({ type: ContentTypes.TEXT, text: 'Stopped fallback answer.' });
+    });
+
+    await client.sendCompletion({ text: 'hello' }, { abortController });
+    await Promise.resolve();
+
+    expect(fallbackKeys).toEqual([
+      'main:resp-1',
+      'main:reality-agent:resp-1',
+      'main:red-agent:resp-1',
+    ]);
+    expect(cancellationFetch.mock.calls.map(([url]) => url)).toEqual([
+      'http://glasshive.local/v1/requests/by-idempotency/main%3Aresp-1/cancel',
+      'http://glasshive.local/v1/requests/by-idempotency/main%3Areality-agent%3Aresp-1/cancel',
+      'http://glasshive.local/v1/requests/by-idempotency/main%3Ared-agent%3Aresp-1/cancel',
+    ]);
+  });
+
+  test('cancellation during lazy fallback initialization prevents the fallback request', async () => {
+    const fallbackReady = deferred();
+    const abortController = new AbortController();
+    primaryAgent.viventiumFallbackLlmInitializer = jest.fn(() => fallbackReady.promise);
+    client.chatCompletion = jest.fn(async () => {
+      throw new Error('The model provider rate-limited this request. Please try again shortly.');
+    });
+
+    const completionPromise = client.sendCompletion({ text: 'hello' }, { abortController });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(primaryAgent.viventiumFallbackLlmInitializer).toHaveBeenCalledTimes(1);
+
+    abortController.abort('user_cancelled');
+    fallbackReady.resolve({
+      id: 'agent-fallback',
+      provider: 'glasshive-harness',
+      model: 'claude-code:opus',
+      model_parameters: { model: 'claude-code:opus' },
+    });
+
+    await expect(completionPromise).rejects.toMatchObject({ name: 'AbortError' });
+    expect(client.chatCompletion).toHaveBeenCalledTimes(1);
   });
 
   test('retries fallback when primary auth throws before adding an error part', async () => {
@@ -4435,12 +5171,27 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     const result = await client.sendCompletion({ text: 'hello' });
 
     expect(client.chatCompletion).toHaveBeenCalledTimes(2);
-    expect(result.completion).toEqual([
-      { type: ContentTypes.TEXT, text: 'Fallback answer after auth.' },
-    ]);
-    expect(client.contentParts).toEqual([
-      { type: ContentTypes.TEXT, text: 'Fallback answer after auth.' },
-    ]);
+    expectFallbackCompletion(result.completion, 'Fallback answer after auth.', 'gpt-5.4');
+    expectFallbackCompletion(client.contentParts, 'Fallback answer after auth.', 'gpt-5.4');
+  });
+
+  test('discloses a fallback that already recovered during provider initialization', async () => {
+    req._viventiumFallbackRouteNotice = { model: 'claude-code:opus' };
+    client.chatCompletion = jest.fn(async () => {
+      client.contentParts.push({
+        type: ContentTypes.TEXT,
+        text: 'Answer from the initialization fallback.',
+      });
+    });
+
+    const result = await client.sendCompletion({ text: 'hello' });
+
+    expect(client.chatCompletion).toHaveBeenCalledTimes(1);
+    expectFallbackCompletion(
+      result.completion,
+      'Answer from the initialization fallback.',
+      'claude-code:opus',
+    );
   });
 
   test('does not retry fallback when primary is aborted by the user before assistant text', async () => {
@@ -4492,12 +5243,8 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     const result = await client.sendCompletion({ text: 'hello' });
 
     expect(client.chatCompletion).toHaveBeenCalledTimes(2);
-    expect(result.completion).toEqual([
-      { type: ContentTypes.TEXT, text: 'Fallback answer after overload.' },
-    ]);
-    expect(client.contentParts).toEqual([
-      { type: ContentTypes.TEXT, text: 'Fallback answer after overload.' },
-    ]);
+    expectFallbackCompletion(result.completion, 'Fallback answer after overload.', 'gpt-5.4');
+    expectFallbackCompletion(client.contentParts, 'Fallback answer after overload.', 'gpt-5.4');
   });
 
   test('suppresses fallback background cortices only when primary Phase B already owns the response', async () => {
@@ -4545,6 +5292,7 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
         cortex_id: 'agent-background',
         status: 'error',
       }),
+      fallbackRecoveryPart('gpt-5.4'),
       { type: ContentTypes.TEXT, text: 'Fallback answer.' },
     ]);
   });
@@ -4592,6 +5340,26 @@ describe('pruneSequentialOutputPartsForPersistence', () => {
         status: 'complete',
         insight: 'Background result.',
       },
+    ]);
+  });
+
+  test('keeps a visible fallback disclosure when sequential output hiding is enabled', () => {
+    const fallbackNotice = {
+      type: ContentTypes.HARNESS_ACTIVITY,
+      harness_activity: {
+        event: 'fallback-recovery',
+        summary: 'The primary route was unavailable. The fallback completed.',
+      },
+    };
+    const parts = [
+      { type: ContentTypes.TEXT, text: 'Intermediate response.' },
+      fallbackNotice,
+      { type: ContentTypes.TEXT, text: 'Recovered final response.' },
+    ];
+
+    expect(AgentClient.pruneSequentialOutputPartsForPersistence(parts)).toEqual([
+      fallbackNotice,
+      { type: ContentTypes.TEXT, text: 'Recovered final response.' },
     ]);
   });
 });

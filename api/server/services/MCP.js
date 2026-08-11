@@ -84,15 +84,19 @@ const _logTelegramMcpTiming = (streamId, step, startTs, extra = '') => {
 async function resolveConfigServers(req) {
   try {
     const registry = getMCPServersRegistry();
-    if (typeof registry.ensureConfigServers !== 'function') {
-      return {};
-    }
     const user = req?.user;
     const appConfig = await getAppConfig({
       role: user?.role,
       userId: user?.id,
     });
-    return await registry.ensureConfigServers(appConfig?.mcpConfig || {});
+    const configServers = appConfig?.mcpConfig || {};
+    if (typeof registry.ensureConfigServers === 'function') {
+      return await registry.ensureConfigServers(configServers);
+    }
+    if (typeof registry.getAllServerConfigs === 'function') {
+      return await registry.getAllServerConfigs(user?.id, configServers);
+    }
+    return configServers;
   } catch (error) {
     logger.warn(
       '[resolveConfigServers] Failed to resolve config servers, degrading to empty:',

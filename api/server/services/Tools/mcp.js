@@ -100,6 +100,7 @@ async function initiateOAuthFlowFallback({
  * @param {IUser} params.user - The user from the request object.
  * @param {string} params.serverName - The name of the MCP server
  * @param {boolean} params.returnOnOAuth - Whether to initiate OAuth and return, or wait for OAuth flow to finish
+ * @param {boolean} [params.suppressOAuthFlow] - Whether missing OAuth must be reported without starting an interactive flow
  * @param {AbortSignal} [params.signal] - The abort signal to handle cancellation.
  * @param {boolean} [params.forceNew]
  * @param {number} [params.connectionTimeout]
@@ -119,6 +120,7 @@ async function reinitMCPServer({
   userMCPAuthMap,
   connectionTimeout,
   returnOnOAuth = true,
+  suppressOAuthFlow = false,
   oauthStart: _oauthStart,
   flowManager: _flowManager,
   serverConfig: providedConfig,
@@ -210,6 +212,21 @@ async function reinitMCPServer({
     /* === VIVENTIUM END === */
 
     const customUserVars = userMCPAuthMap?.[`${Constants.mcp_prefix}${serverName}`];
+
+    /* === VIVENTIUM START ===
+     * Feature: Non-interactive OAuth capability degradation.
+     * Purpose: Scheduled and other trusted background turns cannot answer an OAuth prompt.
+     * Report the capability as unavailable before the connection factory creates a polling flow.
+     * Existing usable access/refresh tokens still take the normal connection path.
+     * === VIVENTIUM END === */
+    if (
+      suppressOAuthFlow &&
+      serverRequiresOAuth &&
+      !(user?.id && (await hasUsableOAuthTokens(user.id, serverName)))
+    ) {
+      return oauthAuthorizationUnavailableResult(serverName);
+    }
+
     const flowManager = _flowManager ?? getFlowStateManager(getLogStores(CacheKeys.FLOWS));
     const mcpManager = getMCPManager();
     const tokenMethods = { findToken, updateToken, createToken, deleteToken, deleteTokens };
@@ -232,6 +249,7 @@ async function reinitMCPServer({
         flowManager,
         tokenMethods,
         returnOnOAuth,
+        suppressOAuthFlow,
         customUserVars,
         connectionTimeout,
         serverConfig,
@@ -245,10 +263,13 @@ async function reinitMCPServer({
         `[MCP Reinitialize] OAuth state - oauthRequired: ${oauthRequired}, oauthUrl: ${oauthUrl ? 'present' : 'null'}`,
       );
 
+      const errorMessage = String(err?.message || '').toLowerCase();
       const isOAuthError =
-        err.message?.includes('OAuth') ||
-        err.message?.includes('authentication') ||
-        err.message?.includes('401');
+        errorMessage.includes('oauth') ||
+        errorMessage.includes('authentication') ||
+        errorMessage.includes('401') ||
+        errorMessage.includes('invalid_token') ||
+        errorMessage.includes('invalid access token');
       const isConnectionTimeout = err.message?.includes('Connection timeout');
       const serverRequiresOAuth = Boolean(
         serverConfig?.requiresOAuth || serverConfig?.oauthMetadata,
@@ -265,6 +286,10 @@ async function reinitMCPServer({
       }
       const hasStoredOAuthTokens =
         serverRequiresOAuth && user.id && credentialState?.status === 'credential_present';
+
+      if (suppressOAuthFlow && serverRequiresOAuth && isOAuthError) {
+        return oauthAuthorizationUnavailableResult(serverName);
+      }
 
       const isOAuthFlowInitiated = err.message === 'OAuth flow initiated - return early';
 

@@ -831,6 +831,12 @@ function buildCallbackMetadata({
       voiceRequestId: body?.voice_request_id,
       telegramChatId: body?.telegram_chat_id,
       telegramUserId: body?.telegram_user_id,
+      logicalTurnId: sanitizeCallbackMetadataValue(body?.logical_turn_id, { maxLength: 160 }),
+      logicalTurnRevision:
+        Number.isInteger(Number(body?.logical_turn_revision)) &&
+        Number(body?.logical_turn_revision) >= 1
+          ? Number(body.logical_turn_revision)
+          : null,
       callbackId: body?.callback_id || null,
       callbackKey: callbackReplayKey(body || {}),
       deliverable: callbackDeliverable(body || {}),

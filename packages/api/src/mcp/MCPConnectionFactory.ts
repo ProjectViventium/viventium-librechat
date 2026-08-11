@@ -214,6 +214,7 @@ export class MCPConnectionFactory {
       this.oauthStart = oauth.oauthStart;
       this.oauthEnd = oauth.oauthEnd;
       this.returnOnOAuth = oauth.returnOnOAuth;
+      this.suppressOAuthFlow = oauth.suppressOAuthFlow;
     }
   }
 

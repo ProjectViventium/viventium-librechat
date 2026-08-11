@@ -13,6 +13,7 @@ const {
   recoverDeferredHoldParentErrorCards,
   recoverVisibleFollowUpErrorCards,
   recoverStaleCortexMessages,
+  getStaleCortexRecoveryConfig,
   stripDeferredHoldParentErrorParts,
   stripErrorPartsFromRecoveredFollowUpContent,
 } = require('../staleCortexMessageRecovery');
@@ -40,6 +41,16 @@ describe('staleCortexMessageRecovery', () => {
     delete process.env.VIVENTIUM_STALE_CORTEX_RECOVERY_LIMIT;
     Message.updateOne.mockResolvedValue({ modifiedCount: 1 });
     mockFindOneLean(null);
+  });
+
+  test('does not invent a background execution deadline when none is configured', () => {
+    expect(getStaleCortexRecoveryConfig()).toEqual(
+      expect.objectContaining({
+        timeoutMs: 240000,
+        cortexExecutionTimeoutMs: 0,
+        graceMs: 60000,
+      }),
+    );
   });
 
   test('marks active cortex parts as terminal errors', () => {

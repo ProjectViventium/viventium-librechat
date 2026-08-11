@@ -90,6 +90,8 @@ function callbackBody(overrides = {}) {
     agent_id: 'agent-main',
     conversation_id: 'conv-1',
     parent_message_id: 'msg-parent',
+    logical_turn_id: 'turn-1',
+    logical_turn_revision: 2,
     message_id: 'msg-anchor',
     worker_id: 'wrk-1',
     run_id: 'run-1',
@@ -1146,6 +1148,8 @@ describe('/api/viventium/glasshive/callback', () => {
     expect(message.metadata.viventium.parentMessageId).toBe('user-msg');
     expect(message.metadata.viventium.treeParentMessageId).toBe('follow-up-assistant');
     expect(message.metadata.viventium.anchorMessageId).toBe('assistant-anchor');
+    expect(message.metadata.viventium.logicalTurnId).toBe('turn-1');
+    expect(message.metadata.viventium.logicalTurnRevision).toBe(2);
   });
 
   test('retries late callbacks while the current conversation leaf is a moved-on user message', async () => {

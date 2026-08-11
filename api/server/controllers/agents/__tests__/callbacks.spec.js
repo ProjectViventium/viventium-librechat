@@ -1,5 +1,5 @@
 const { Tools } = require('librechat-data-provider');
-const { GraphEvents } = require('@librechat/agents');
+const { GraphEvents, GraphNodeKeys } = require('@librechat/agents');
 
 // Mock all dependencies before requiring the module
 jest.mock('nanoid', () => ({

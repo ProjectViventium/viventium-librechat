@@ -42,6 +42,10 @@ const {
 const {
   createMessageDeltaBoundaryNormalizer,
 } = require('~/server/services/viventium/voiceDeltaAggregation');
+const {
+  markMainProviderAttemptStart,
+  markMainProviderFirstOutput,
+} = require('~/server/services/viventium/textTurnTiming');
 /* === VIVENTIUM END === */
 
 /* === VIVENTIUM NOTE ===
@@ -185,6 +189,35 @@ const markVoiceOrchEvent = (req, eventKey) => {
 };
 /* === VIVENTIUM END === */
 /* === VIVENTIUM NOTE END === */
+
+const hasProviderStreamOutput = (data) => {
+  const chunk = data?.chunk;
+  const message = chunk?.message || chunk;
+  if (!message || typeof message !== 'object') {
+    return false;
+  }
+  if (
+    [message.tool_call_chunks, message.tool_calls].some(
+      (value) => Array.isArray(value) && value.length > 0,
+    )
+  ) {
+    return true;
+  }
+  const content = message.content;
+  if (typeof content === 'string') {
+    return content.length > 0;
+  }
+  return (
+    Array.isArray(content) &&
+    content.some((part) => {
+      if (typeof part === 'string') return part.length > 0;
+      if (!part || typeof part !== 'object') return false;
+      return [part.text, part.output_text, part.content].some(
+        (value) => typeof value === 'string' && value.length > 0,
+      );
+    })
+  );
+};
 
 class ModelEndHandler {
   /* === VIVENTIUM START ===
@@ -446,6 +479,12 @@ function getDefaultHandlers({
   const handlers = {
     [GraphEvents.CHAT_MODEL_START]: {
       handle: async (_event, _data, metadata) => {
+        /* === VIVENTIUM START ===
+         * Feature: Parallel text provider-attempt timing.
+         * Purpose: Correlate each structural Main graph invocation without conflating re-entry.
+         */
+        markMainProviderAttemptStart(req, metadata);
+        /* === VIVENTIUM END === */
         const metric = markVoiceOrchEvent(req, 'chat_model_start');
         if (metric?.firstSeen) {
           const modelName =
@@ -476,7 +515,15 @@ function getDefaultHandlers({
       },
     },
     [GraphEvents.LLM_STREAM]: {
-      handle: async () => {
+      handle: async (_event, _data, metadata) => {
+        /* === VIVENTIUM START ===
+         * Feature: Parallel text first-provider-output timing.
+         * Purpose: Record the actual first provider token independently from visible paint.
+         */
+        if (hasProviderStreamOutput(_data)) {
+          markMainProviderFirstOutput(req, metadata, { kind: 'provider_token' });
+        }
+        /* === VIVENTIUM END === */
         const metric = markVoiceOrchEvent(req, 'llm_stream');
         if (metric?.firstSeen) {
           logVoiceLatencyStage(req, 'first_llm_stream', getVoiceProcessStreamStartAt(req), '');

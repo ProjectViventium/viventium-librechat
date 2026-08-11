@@ -84,7 +84,7 @@ config:
               - health_read_record_mcp_viventium-health
           - server: google-workspace
             scope_key: productivity_google_workspace
-            same_scope_background_allowed: true
+            same_scope_background_allowed: false
             owns: live Gmail, Google Calendar, Google Drive, Docs, Sheets, Slides, Chat, Tasks, and Workspace actions when this MCP is connected to the main agent
             tool_names:
               - sys__server__sys_mcp_google_workspace
@@ -113,7 +113,7 @@ config:
               - read_sheet_values_mcp_google_workspace_2
           - server: ms365
             scope_key: productivity_ms365
-            same_scope_background_allowed: true
+            same_scope_background_allowed: false
             owns: live Outlook email, Outlook calendar, OneDrive, Excel, OneNote, Planner, To Do, and Microsoft 365 actions when this MCP is connected to the main agent
             tool_names:
               - sys__server__sys_mcp_ms-365
@@ -316,6 +316,10 @@ mainAgent:
         confidence_threshold: 0.6
         cooldown_ms: 30000
         max_history: 6
+    - agent_id: agent_viventium_deep_memory_95aeb3
+      activation:
+        enabled: true
+        mode: always
     - agent_id: agent_viventium_red_team_95aeb3
       activation:
         enabled: true
@@ -471,11 +475,11 @@ mainAgent:
         confidence_threshold: 0.7
         cooldown_ms: 30000
         max_history: 15
-  voice_llm_model: grok-4.3
+  voice_llm_model: grok-4.5
   voice_llm_provider: xai
   voice_llm_model_parameters:
-    model: grok-4.3
-    reasoning_effort: none
+    model: grok-4.5
+    reasoning_effort: low
   voice_fallback_llm_model: gpt-5.6-terra
   voice_fallback_llm_provider: openAI
   voice_fallback_llm_model_parameters:
@@ -489,11 +493,25 @@ mainAgent:
   agent_ids: []
   edges:
     - from: agent_viventium_main_95aeb3
+      to: agent_viventium_reality_check_95aeb3
+      description: Consult Reality Check at most once per user turn, before a consequential answer, when fresh outside-world evidence, trusted sources, relevant experience, or reference classes could materially change the answer. If its evidence or return already appears after the current user request, do not call it again; synthesize instead.
+      edgeType: handoff
+    - from: agent_viventium_reality_check_95aeb3
+      to: agent_viventium_main_95aeb3
+      description: Return Reality Check evidence to the conscious Main Agent for judgment and final synthesis.
+      edgeType: handoff
+    - from: agent_viventium_main_95aeb3
+      to: agent_viventium_red_team_95aeb3
+      description: At most once per user turn and only after Reality Check has returned, consult the existing Red Team when an important claim, plan, or decision still deserves independent adversarial pressure-testing. If its challenge or return already appears after the current user request, do not call it again; synthesize instead.
+      edgeType: handoff
+    - from: agent_viventium_red_team_95aeb3
+      to: agent_viventium_main_95aeb3
+      description: Return the Red Team challenge to the conscious Main Agent for final adjudication.
+      edgeType: handoff
+    - from: agent_viventium_main_95aeb3
       to: agent_viventium_connected_accounts_95aeb3
       description: Hand off to Connected Accounts for quick checks and explicitly confirmed email/calendar updates in the user’s Gmail, Outlook, calendars, Drive/OneDrive, Docs/Sheets via connected tools. Use for inbox/email/calendar/file lookups, status checks, summaries, and confirmed non-destructive email/calendar updates. Ask for confirmation before any external write.
       edgeType: handoff
-      prompt: Handle the user’s connected-account request directly with your Google Workspace and Microsoft 365 tools. For generic inbox/email questions, check BOTH Gmail and Outlook unless the user named one provider. Default to read-only inspection. For sending/drafting email or creating/updating calendar events, use the relevant write tool only after explicit user confirmation and only when recipient/time/impact are clear; otherwise ask for the missing confirmation or detail. Route delete/move/archive/mark-read/sharing/permission/file-write operations to GlassHive or another confirmed write-capable path. Return a concise, user-facing result. Do not expose account email addresses, aliases, OAuth details, raw IDs, server names, or tool plumbing unless the user explicitly asks for diagnostic account details. Do not claim this path is read-only when a requested confirmed email/calendar write tool is present.
-      promptKey: Main_To_ConnectedAccounts
   conversation_starters:
     - What do you want to actually do today?
     - What feels stuck right now?
@@ -864,6 +882,41 @@ backgroundAgents:
     conversation_starters: []
     category: viventium
 handoffAgents:
+  - id: agent_viventium_reality_check_95aeb3
+    name: Reality Check
+    description: GlassHive-powered outside-world evidence consultant that verifies consequential claims, likelihoods, and reference classes before returning control to Viventium.
+    instructions:
+      promptRef: cortex.reality_check.execution
+    provider: glasshive-harness
+    model: codex-cli:gpt-5.6-sol
+    tools:
+      - file_search
+      - web_search
+    tool_kwargs: []
+    model_parameters:
+      model: codex-cli:gpt-5.6-sol
+      reasoning_effort: xhigh
+      resendFiles: true
+    glasshive_options:
+      workspace:
+        mode: life
+      access: full
+      fallback_model: claude-code:opus
+      fallback_reasoning_effort: high
+    end_after_tools: false
+    hide_sequential_outputs: false
+    support_contact: {}
+    background_cortices: []
+    voice_llm_model: null
+    voice_llm_provider: null
+    voice_llm_model_parameters: {}
+    voice_fallback_llm_model: null
+    voice_fallback_llm_provider: null
+    voice_fallback_llm_model_parameters: {}
+    agent_ids: []
+    edges: []
+    conversation_starters: []
+    category: viventium
   - id: agent_viventium_connected_accounts_95aeb3
     name: Connected Accounts
     description: Uses your connected Google Workspace and Microsoft 365 accounts for quick inbox, calendar, and file checks, plus explicitly confirmed email/calendar updates.
@@ -950,10 +1003,11 @@ handoffAgents:
     voice_llm_provider: null
     voice_fallback_llm_model: null
     voice_fallback_llm_provider: null
-    fallback_llm_model: gpt-5.4
-    fallback_llm_provider: openAI
+    fallback_llm_model: claude-code:opus
+    fallback_llm_provider: glasshive-harness
     fallback_llm_model_parameters:
-      model: gpt-5.4
+      model: claude-code:opus
+      reasoning_effort: high
     agent_ids: []
     edges: []
     conversation_starters: []

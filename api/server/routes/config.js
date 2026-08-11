@@ -153,6 +153,15 @@ router.get('/', async function (req, res) {
        * === VIVENTIUM END === */
       viventiumVoiceEnabled: isEnabled(process.env.VIVENTIUM_VOICE_ENABLED),
       /* === VIVENTIUM START ===
+       * Feature: Easy Install browser-first onboarding.
+       * Purpose: Project the bounded installer experience into the authenticated first-user UI.
+       * === VIVENTIUM END === */
+      viventiumInstallExperience: ['express', 'custom', 'legacy'].includes(
+        process.env.VIVENTIUM_INSTALL_EXPERIENCE,
+      )
+        ? process.env.VIVENTIUM_INSTALL_EXPERIENCE
+        : undefined,
+      /* === VIVENTIUM START ===
        * Feature: Prompt Workbench local launcher.
        * Purpose: Keep the Connected Accounts workbench entry in sync with the server-side local
        * lifecycle route and its kill switch.
@@ -174,6 +183,12 @@ router.get('/', async function (req, res) {
       viventiumFeelingsAvailable:
         process.env.VIVENTIUM_FEELINGS_AVAILABLE == null ||
         isEnabled(process.env.VIVENTIUM_FEELINGS_AVAILABLE),
+      /* === VIVENTIUM START ===
+       * Feature: Background follow-up browser-listening parity.
+       * Purpose: Bound Web query refreshes with the same compiled window as Phase B surfaces.
+       * This is a listening window only; it does not cancel or deadline background execution.
+       * === VIVENTIUM END === */
+      viventiumBackgroundFollowupWindowS: getCortexFollowupGraceSeconds(),
       /* === VIVENTIUM START ===
        * Feature: GlassHive host worker callbacks.
        * Purpose: Project the compiled callback wait window into the web client.

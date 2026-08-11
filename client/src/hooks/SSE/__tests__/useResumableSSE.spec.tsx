@@ -231,4 +231,25 @@ describe('useResumableSSE', () => {
     expect(queueTitleGeneration).not.toHaveBeenCalled();
     expect(chatHelpers.setIsSubmitting).toHaveBeenCalledWith(false);
   });
+
+  it('removes only the unfinished assistant draft when a revision is superseded', async () => {
+    const user = createSubmission().userMessage;
+    const draft = createSubmission().initialResponse;
+    chatHelpers.getMessages.mockReturnValueOnce([user, draft]);
+    renderHook(() => useResumableSSE(createSubmission(), chatHelpers), {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => expect(mockSSEInstances.length).toBeGreaterThan(0));
+    const latestStream = mockSSEInstances.at(-1);
+    act(() => {
+      latestStream?.emit('message', {
+        data: JSON.stringify({ final: true, superseded: true, revision: 1 }),
+      });
+    });
+
+    expect(chatHelpers.setMessages).toHaveBeenCalledWith([user]);
+    expect(mockErrorHandler).not.toHaveBeenCalled();
+    expect(latestStream?.close).toHaveBeenCalled();
+  });
 });

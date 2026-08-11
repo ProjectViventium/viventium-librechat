@@ -99,7 +99,7 @@ export default function useChatFunctions({
     resetLatestMultiMessage();
 
     text = text.trim();
-    if (!!isSubmitting || text === '') {
+    if (text === '') {
       return;
     }
 
@@ -108,6 +108,17 @@ export default function useChatFunctions({
     const endpoint = conversation?.endpoint;
     if (endpoint === null) {
       console.error('No endpoint available');
+      return;
+    }
+
+    /* === VIVENTIUM START ===
+     * Feature: Cross-surface logical-turn coherence.
+     * Purpose: A stable web message may supersede an unfinished non-Assistants
+     *          response. Remove the obsolete assistant placeholder/partial from
+     *          authored context and attach the new source segment beside the
+     *          prior user message. The server owns the atomic revision claim.
+     * === VIVENTIUM END === */
+    if (isSubmitting && isAssistantsEndpoint(endpoint)) {
       return;
     }
 
@@ -126,6 +137,14 @@ export default function useChatFunctions({
     const isEditOrContinue = isEdited || isContinued;
 
     let currentMessages: TMessage[] | null = overrideMessages ?? getMessages() ?? [];
+    const supersededAssistant =
+      isSubmitting && latestMessage?.isCreatedByUser === false ? latestMessage : null;
+    if (supersededAssistant) {
+      currentMessages = currentMessages.filter(
+        (message) => message.messageId !== supersededAssistant.messageId,
+      );
+      parentMessageId = parentMessageId ?? supersededAssistant.parentMessageId ?? null;
+    }
 
     if (conversation?.promptPrefix) {
       conversation.promptPrefix = replaceSpecialVars({

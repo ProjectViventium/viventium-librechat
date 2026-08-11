@@ -343,16 +343,17 @@ function buildActivationCooldownKey({ agentId, req, runId } = {}) {
 }
 
 /* === VIVENTIUM NOTE ===
- * Feature: Deterministic timeouts for Phase B cortex execution.
+ * Feature: Optional operator-configured Phase B cortex execution guard.
  *
  * Why:
- * - A single hung cortex should never stall the "brewing" UI forever.
- * - Tool/MCP failures must resolve to completion/error states so follow-up logic can decide what to surface.
+ * - Operators may bound one provider attempt when their deployment requires an execution deadline.
+ * - When unset, background execution has no automatic deadline; terminal provider/tool state and
+ *   restart recovery remain separate from browser/voice/Telegram follow-up listening windows.
  */
 function getCortexExecutionTimeoutMs() {
   const raw = String(process.env.VIVENTIUM_CORTEX_EXECUTION_TIMEOUT_MS || '').trim();
   const parsed = parseInt(raw, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 3_600_000;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
 }
 
 function getCortexExecutionGuardGraceMs() {
@@ -462,7 +463,14 @@ async function resolveBackgroundCortexFallbackAgent({ cortexAgent, req, modelsCo
     return null;
   }
 
-  return buildFallbackAgent(cortexAgent, fallbackAssignment);
+  /* === VIVENTIUM START ===
+   * Feature: Capability-preserving background fallback.
+   * Purpose: Keep capability-declared parameters such as GlassHive reasoning_effort when a
+   * background cortex takes the same configured fallback route as the main agent.
+   * === VIVENTIUM END === */
+  const agentsConfig = req?.config?.endpoints?.agents || {};
+  const fallbackCapability = agentsConfig.providerCapabilities?.[fallbackAssignment.provider] || {};
+  return buildFallbackAgent(cortexAgent, fallbackAssignment, fallbackCapability);
 }
 /* === VIVENTIUM NOTE === */
 
@@ -1636,6 +1644,16 @@ function hasVisibleCortexInsight(insight) {
   return Boolean(trimmed) && !isNoResponseOnly(trimmed);
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Detached Phase B lifecycle ownership.
+ * Purpose: Main-response cleanup is not user cancellation. Background cortices must continue to
+ * their own terminal result after `generation_completed`, while an intentional Stop still cancels
+ * their provider/tool work.
+ * === VIVENTIUM END === */
+function isBackgroundCortexCancellationSignal(signal) {
+  return signal?.aborted === true && signal.reason === 'user_cancelled';
+}
+
 function buildCortexCompletionPayload(result) {
   if (!result) {
     return null;
@@ -1665,6 +1683,13 @@ function buildCortexCompletionPayload(result) {
   }
   if (Array.isArray(result.directActionSurfaces)) {
     basePayload.direct_action_surfaces = result.directActionSurfaces;
+  }
+  if (result.fallbackUsed === true) {
+    basePayload.fallback_used = true;
+    basePayload.fallback_reason_class =
+      String(result.primaryErrorClass || '')
+        .trim()
+        .slice(0, 80) || null;
   }
   const directActionSurfaceScopes = normalizeDirectActionSurfaceScopes(
     result.directActionSurfaceScopes,
@@ -1717,6 +1742,8 @@ function buildCompletionInputFromActivation({
     activationScope: result?.activationScope || activationResult.activationScope || null,
     configuredTools: result?.configuredTools || 0,
     completedToolCalls: result?.completedToolCalls || 0,
+    fallbackUsed: result?.fallbackUsed === true,
+    primaryErrorClass: result?.primaryErrorClass || null,
     confidence: activationResult.confidence,
     reason: activationResult.reason,
     cortexDescription: activationResult.cortexDescription,
@@ -2857,8 +2884,30 @@ async function checkCortexActivation({
 }) {
   const { agent_id, activation } = cortexConfig;
 
-  if (!activation?.enabled) {
+  /* === VIVENTIUM START ===
+   * Feature: Structured background-cortex activation modes.
+   * Purpose: Let a cortex run on every eligible turn without a fake classifier request while
+   * preserving the existing enabled switch and classified default. Invalid persisted values fall
+   * back to classified behavior; API/compiler boundaries reject them for new writes.
+   * === VIVENTIUM END === */
+  const activationMode =
+    activation?.enabled === false || activation?.mode === 'disabled'
+      ? 'disabled'
+      : activation?.mode === 'always'
+        ? 'always'
+        : 'classified';
+
+  if (activationMode === 'disabled') {
     return { shouldActivate: false, confidence: 0, reason: 'disabled', agentId: agent_id };
+  }
+  if (activationMode === 'always') {
+    return {
+      shouldActivate: true,
+      confidence: 1,
+      reason: 'activation_mode_always',
+      agentId: agent_id,
+      providerAttempts: [],
+    };
   }
 
   const {
@@ -3663,8 +3712,8 @@ async function executeCortexOnce({
      * - The ON_TOOL_EXECUTE handler calls toolExecuteOptions.loadTools to create
      *   the actual tool instance (with MCP connection, OAuth, etc.) on demand.
      * - Without toolExecuteOptions, getDefaultHandlers never registers the
-     *   ON_TOOL_EXECUTE handler, so tool calls silently drop into the void:
-     *   the LLM asks to call a tool, nothing happens, 180s timeout fires.
+     *   ON_TOOL_EXECUTE handler, so tool calls silently drop into the void and the run cannot reach
+     *   a truthful tool-result terminal state.
      *
      * Fix:
      * - After initializeAgent returns the agent config (including toolRegistry,
@@ -5362,6 +5411,7 @@ module.exports = {
   normalizeAgentToolNames,
   hasVisibleCortexInsight,
   buildCortexCompletionPayload,
+  isBackgroundCortexCancellationSignal,
   summarizeActivationError,
   classifyActivationError,
   buildActivationLlmConfig,

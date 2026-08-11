@@ -159,15 +159,22 @@ function resolveFallbackModelParameters(
   return resolved;
 }
 
-function sanitizeFallbackModelParametersForProvider(parameters, provider) {
+function sanitizeFallbackModelParametersForProvider(parameters, provider, capability = {}) {
   const sanitized = clonePlainObject(parameters);
   const normalizedProvider = normalizeProvider(provider);
+  const targetModel = String(sanitized.model || '').trim();
+  const targetModelCapability = Array.isArray(capability?.models)
+    ? capability.models.find((model) => String(model?.id || '').trim() === targetModel)
+    : null;
+  const supportsDeclaredReasoningEffort =
+    Array.isArray(targetModelCapability?.effortChoices) &&
+    targetModelCapability.effortChoices.length > 0;
 
   if (normalizedProvider !== 'anthropic') {
     delete sanitized.thinking;
     delete sanitized.thinkingBudget;
   }
-  if (!['openAI', 'xai'].includes(normalizedProvider)) {
+  if (!['openAI', 'xai'].includes(normalizedProvider) && !supportsDeclaredReasoningEffort) {
     delete sanitized.reasoning_effort;
   }
   /* === VIVENTIUM START ===
@@ -187,7 +194,7 @@ function sanitizeFallbackModelParametersForProvider(parameters, provider) {
   return sanitized;
 }
 
-function buildFallbackAgent(agent, assignment) {
+function buildFallbackAgent(agent, assignment, capability = {}) {
   if (!agent || !assignment) {
     return null;
   }
@@ -206,6 +213,7 @@ function buildFallbackAgent(agent, assignment) {
     model_parameters: sanitizeFallbackModelParametersForProvider(
       modelParameters,
       assignment.provider,
+      capability,
     ),
   };
 }

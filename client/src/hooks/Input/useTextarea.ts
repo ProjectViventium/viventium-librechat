@@ -144,9 +144,11 @@ export default function useTextarea({
         const scrollable = checkIfScrollable(textAreaRef.current);
         scrollable && setIsScrollable(scrollable);
       }
-      if (e.key === 'Enter' && isSubmitting) {
-        return;
-      }
+      /* === VIVENTIUM START ===
+       * Feature: Cross-surface logical-turn coherence.
+       * Purpose: Let a stable web message supersede the unfinished response instead of
+       *          turning Enter into a no-op while generation is active.
+       * === VIVENTIUM END === */
 
       checkHealth();
 
@@ -186,15 +188,7 @@ export default function useTextarea({
         submitButtonRef.current?.click();
       }
     },
-    [
-      isSubmitting,
-      checkHealth,
-      filesLoading,
-      enterToSend,
-      setIsScrollable,
-      textAreaRef,
-      submitButtonRef,
-    ],
+    [checkHealth, filesLoading, enterToSend, setIsScrollable, textAreaRef, submitButtonRef],
   );
 
   const handleCompositionStart = () => {

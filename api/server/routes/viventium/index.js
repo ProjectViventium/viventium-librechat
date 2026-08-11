@@ -11,6 +11,7 @@ const calls = require('./calls');
 const voice = require('./voice');
 const telegram = require('./telegram');
 const scheduler = require('./scheduler');
+const interactions = require('./interactions');
 /* === VIVENTIUM NOTE ===
  * Feature: Generic multi-channel gateway routes (OpenClaw channel bridge contract).
  * === VIVENTIUM NOTE === */
@@ -63,6 +64,7 @@ router.use('/calls', calls);
 router.use('/voice', voice);
 router.use('/telegram', telegram);
 router.use('/scheduler', scheduler);
+router.use('/interactions', interactions);
 router.use('/gateway', gateway);
 // Telegram account linking routes are mounted under /telegram/*.
 router.use('/telegram', telegramLink);

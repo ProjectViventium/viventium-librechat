@@ -84,6 +84,30 @@ describe('Meilisearch Mongoose plugin', () => {
     expect(mockAddDocuments).toHaveBeenCalled();
   });
 
+  test('model updateOne resolves when the query result has no document hook', async () => {
+    const conversationModel = createConversationModel(mongoose);
+    const conversationId = new mongoose.Types.ObjectId().toString();
+    const user = new mongoose.Types.ObjectId().toString();
+    await conversationModel.create({
+      conversationId,
+      user,
+      title: 'Before update',
+      endpoint: EModelEndpoint.openAI,
+    });
+
+    const outcome = await Promise.race([
+      conversationModel
+        .updateOne({ conversationId, user }, { $set: { isArchived: true } })
+        .then(() => 'resolved'),
+      new Promise<string>((resolve) => setTimeout(() => resolve('timed_out'), 250)),
+    ]);
+
+    expect(outcome).toBe('resolved');
+    await expect(conversationModel.findOne({ conversationId, user }).lean()).resolves.toEqual(
+      expect.objectContaining({ isArchived: true }),
+    );
+  });
+
   test('saving conversation indexes with expiredAt=null w/ meilisearch', async () => {
     await createConversationModel(mongoose).create({
       conversationId: new mongoose.Types.ObjectId(),

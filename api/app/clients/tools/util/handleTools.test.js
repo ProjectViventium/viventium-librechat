@@ -34,7 +34,12 @@ const { Calculator } = require('@librechat/agents');
 
 const { User } = require('~/db/models');
 const PluginService = require('~/server/services/PluginService');
-const { validateTools, loadTools, loadToolWithAuth } = require('./handleTools');
+const {
+  validateTools,
+  loadTools,
+  loadToolWithAuth,
+  canUseViventiumMCPServer,
+} = require('./handleTools');
 const { StructuredSD, availableTools, DALLE3 } = require('../');
 
 describe('Tool Handlers', () => {
@@ -154,6 +159,40 @@ describe('Tool Handlers', () => {
       for (const authConfig of authConfigs) {
         delete process.env[authConfig.authField];
       }
+    });
+  });
+
+  describe('Viventium MCP audience policy', () => {
+    const ownerOnlyConfig = {
+      viventiumAccess: { audience: 'local_owner' },
+    };
+
+    it('allows ordinary MCP servers for an authenticated user', () => {
+      expect(canUseViventiumMCPServer({ serverConfig: {}, reqUser: { role: 'USER' } })).toBe(true);
+    });
+
+    it('fails closed for owner-only MCP servers when request identity is absent', () => {
+      expect(canUseViventiumMCPServer({ serverConfig: ownerOnlyConfig, reqUser: undefined })).toBe(
+        false,
+      );
+    });
+
+    it('denies owner-only MCP servers to non-admin users', () => {
+      expect(
+        canUseViventiumMCPServer({
+          serverConfig: ownerOnlyConfig,
+          reqUser: { role: 'USER' },
+        }),
+      ).toBe(false);
+    });
+
+    it('allows owner-only MCP servers to the local owner role', () => {
+      expect(
+        canUseViventiumMCPServer({
+          serverConfig: ownerOnlyConfig,
+          reqUser: { role: 'ADMIN' },
+        }),
+      ).toBe(true);
     });
   });
 

@@ -903,6 +903,11 @@ export type TStartupConfig = {
   /** Operator-level Feelings instrument availability. */
   viventiumFeelingsAvailable?: boolean;
   /* === VIVENTIUM START ===
+   * Feature: Background follow-up browser-listening parity.
+   * Purpose: Expose the canonical Phase B listening window without making it an execution deadline.
+   * === VIVENTIUM END === */
+  viventiumBackgroundFollowupWindowS?: number;
+  /* === VIVENTIUM START ===
    * Feature: GlassHive host worker callbacks.
    * Purpose: Expose the compiled callback wait window to the web polling hook.
    * === VIVENTIUM END === */
@@ -1084,7 +1089,7 @@ export const memorySchema = z.object({
    * === VIVENTIUM END === */
   readProfile: z
     .object({
-      tokenLimit: z.number().optional().default(1800),
+      tokenLimit: z.number().optional().default(8000),
       keyLimits: z.record(z.number()).optional(),
       keyOrder: z.array(z.string()).optional(),
       cacheTtlMs: z.number().optional().default(30000),
@@ -1393,8 +1398,6 @@ const sharedAnthropicModels = [
   /* === VIVENTIUM END === */
   'claude-opus-4-7',
   'claude-opus-4-6',
-  'claude-sonnet-4-5',
-  'claude-sonnet-4-5-20250929',
   'claude-haiku-4-5',
   'claude-haiku-4-5-20251001',
   'claude-opus-4-1',
@@ -1414,7 +1417,6 @@ const sharedAnthropicModels = [
 
 export const bedrockModels = [
   'anthropic.claude-opus-4-7',
-  'anthropic.claude-sonnet-4-5-20250929-v1:0',
   'anthropic.claude-haiku-4-5-20251001-v1:0',
   'anthropic.claude-opus-4-1-20250805-v1:0',
   'anthropic.claude-3-5-sonnet-20241022-v2:0',

@@ -46,6 +46,24 @@ class IntervalRule(BaseModel):
     unit: Literal["minute", "hour", "day", "week"]
 
 
+class IntervalActiveWindow(BaseModel):
+    start_local: str = Field(..., description="Inclusive local HH:MM window start")
+    end_local: str = Field(..., description="Inclusive local HH:MM window end")
+    cadence: Literal["restart_daily"]
+
+    @field_validator("start_local", "end_local")
+    @classmethod
+    def _validate_local_time(cls, value: str) -> str:
+        parse_time(value)
+        return value
+
+    @model_validator(mode="after")
+    def _validate_bounds(self) -> "IntervalActiveWindow":
+        if parse_time(self.end_local) < parse_time(self.start_local):
+            raise ValueError("active_window end_local must be at or after start_local")
+        return self
+
+
 class ScheduleRule(BaseModel):
     type: Literal["once", "daily", "weekdays", "weekly", "monthly", "interval", "cron"]
     time: Optional[str] = Field(None, description="HH:MM 24-hour format")
@@ -56,6 +74,7 @@ class ScheduleRule(BaseModel):
     run_at: Optional[str] = Field(None, description="ISO datetime for once schedules")
     cron: Optional[str] = Field(None, description="Cron expression")
     start_at: Optional[str] = Field(None, description="ISO datetime anchor for intervals")
+    active_window: Optional[IntervalActiveWindow] = None
 
     @field_validator("timezone")
     @classmethod
@@ -91,6 +110,8 @@ class ScheduleRule(BaseModel):
             raise ValueError("day_of_month is required for monthly schedules")
         if self.type == "interval" and not self.interval:
             raise ValueError("interval is required for interval schedules")
+        if self.active_window is not None and self.type != "interval":
+            raise ValueError("active_window is only supported for interval schedules")
         if self.type == "cron" and not self.cron:
             raise ValueError("cron is required for cron schedules")
         return self

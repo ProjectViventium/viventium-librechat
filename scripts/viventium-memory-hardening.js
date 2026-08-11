@@ -95,7 +95,15 @@ const DEFAULT_MEMORY_HARDENING_MODEL_FALLBACKS = [
   { provider: 'anthropic', model: 'claude-opus-5', effort: 'xhigh', source: 'default' },
   { provider: 'anthropic', model: 'opus', effort: 'xhigh', source: 'default' },
 ];
+const DEFAULT_OPENAI_MEMORY_EFFORT_BY_MODEL = Object.freeze({
+  'gpt-5.5': 'xhigh',
+  'gpt-5.6-sol': 'xhigh',
+  'gpt-5.6-terra': 'high',
+  'gpt-5.6-luna': 'medium',
+});
+const DEFAULT_OPENAI_MEMORY_EFFORT = 'high';
 const MEMORY_HARDENING_EFFICIENCY_MARKER = 'last-model-apply.public.json';
+const SCHEDULE_V3_OBSERVATION_MARKER = 'schedule-v3-observed.public.json';
 
 function isListenOnlyTranscriptMessage(message) {
   return classifyVoiceMemoryEvidence(message).kind === 'soft_voice';
@@ -207,6 +215,30 @@ function voiceMemoryEvidenceHash(message) {
       speakerSegments: voiceSpeakerSegmentsForMemory(message),
     }),
   );
+  if (!isVoice) return { kind: 'ordinary', sourceId: '' };
+  const segments = voiceSpeakerSegmentsForMemory(message);
+  const sessionAttributionState = metadata?.speakerSessionState?.attributionState;
+  const speakerKeys = new Set(segments.map((segment) => segment?.speaker?.key).filter(Boolean));
+  const ownerOnly =
+    message?.isCreatedByUser === true &&
+    metadata.mode === 'call' &&
+    sessionAttributionState !== 'shared_mic_unverified' &&
+    segments.length > 0 &&
+    speakerKeys.size === 1 &&
+    segments.every(
+      (segment) =>
+        segment?.speaker?.actorTrust === 'owner_participant' &&
+        segment?.speaker?.attribution === 'verified' &&
+        segment?.overlap !== true &&
+        segment?.uncertain !== true,
+    );
+  return {
+    kind: ownerOnly ? 'owner_call' : 'soft_voice',
+    sourceId: callSessionId
+      ? `call:${callSessionId}`
+      : `message:${String(message?.messageId || '')}`,
+    segments,
+  };
 }
 
 function listenOnlySpeakerLabel(message) {
@@ -686,6 +718,32 @@ function efficiencyMarkerPath(paths) {
   return path.join(paths.stateDir, MEMORY_HARDENING_EFFICIENCY_MARKER);
 }
 
+function scheduleV3ObservationPath(paths) {
+  const stateDir = paths.stateDir || path.dirname(paths.scheduleEventsDir);
+  return paths.scheduleV3ObservationPath || path.join(stateDir, SCHEDULE_V3_OBSERVATION_MARKER);
+}
+
+function readScheduleV3Observation(paths) {
+  const observation = readJsonIfExists(scheduleV3ObservationPath(paths), null);
+  return observation &&
+    Number(observation.schemaVersion) >= 1 &&
+    Number(observation.observedReceiptSchemaVersion) >= 3
+    ? observation
+    : null;
+}
+
+function persistScheduleV3Observation(paths, event) {
+  const existing = readScheduleV3Observation(paths);
+  if (existing) return existing;
+  const observation = {
+    schemaVersion: 1,
+    observedReceiptSchemaVersion: Number(event?.schemaVersion),
+    firstObservedAtUtc: event?.fired_at_utc || new Date().toISOString(),
+  };
+  safeJsonWrite(scheduleV3ObservationPath(paths), observation, 0o600);
+  return observation;
+}
+
 function readEfficiencyMarker(paths) {
   return readJsonIfExists(efficiencyMarkerPath(paths), null);
 }
@@ -1002,6 +1060,13 @@ function buildScheduleHealth(paths, options = {}) {
     state,
     healthy: state === 'healthy',
     trigger_receipt_count: scheduledEvents.length,
+    launchd_invocation_receipt_count: launchdEvents.length,
+    attested_launchd_invocation_receipt_count: attestedLaunchdEvents.length,
+    rejected_launchd_invocation_receipt_count: launchdEvents.length - attestedLaunchdEvents.length,
+    legacy_v2_receipt_count: legacyV2Events.length,
+    legacy_v2_transition_open: allowLegacyV2,
+    schema_v3_observed: hasSchemaV3Observation,
+    schema_v3_observation_persisted: schemaV3ObservationPersisted,
   };
 }
 
@@ -1148,6 +1213,10 @@ function acquireLock(lockDir) {
     try {
       fs.mkdirSync(lockDir, { mode: 0o700 });
       fs.writeFileSync(path.join(lockDir, 'pid'), String(process.pid), { mode: 0o600 });
+      const processStart = processStartIdentity(process.pid);
+      if (processStart) {
+        fs.writeFileSync(path.join(lockDir, 'process_start'), processStart, { mode: 0o600 });
+      }
       fs.writeFileSync(path.join(lockDir, 'started_at'), new Date().toISOString(), {
         mode: 0o600,
       });
@@ -1171,18 +1240,22 @@ function acquireLock(lockDir) {
 function readLockInfo(lockDir) {
   const pidPath = path.join(lockDir, 'pid');
   const startedAtPath = path.join(lockDir, 'started_at');
+  const processStartPath = path.join(lockDir, 'process_start');
   const pidLabel = fs.existsSync(pidPath) ? fs.readFileSync(pidPath, 'utf8').trim() : 'unknown';
   const startedAt = fs.existsSync(startedAtPath)
     ? fs.readFileSync(startedAtPath, 'utf8').trim()
     : '';
   const startedAtMs = startedAt ? Date.parse(startedAt) : NaN;
+  const expectedProcessStart = fs.existsSync(processStartPath)
+    ? fs.readFileSync(processStartPath, 'utf8').trim()
+    : '';
   const staleMs = positiveNumber(
     process.env.VIVENTIUM_MEMORY_HARDENING_LOCK_STALE_MS,
     DEFAULT_MEMORY_HARDENING_LOCK_STALE_MS,
   );
   return {
     pidLabel,
-    pidAlive: isLockPidAlive(pidLabel),
+    pidAlive: isLockPidAlive(pidLabel, { expectedProcessStart, lockStartedAt: startedAt }),
     lockTooOld: Number.isFinite(startedAtMs) && staleMs > 0 && Date.now() - startedAtMs > staleMs,
   };
 }
@@ -1194,13 +1267,45 @@ function shouldClearMemoryHardeningLock(lockInfo) {
   return lockInfo.pidAlive === false || lockInfo.lockTooOld === true;
 }
 
-function isLockPidAlive(pidValue) {
+function processStartIdentity(pidValue) {
+  const pid = Number.parseInt(String(pidValue || ''), 10);
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return '';
+  }
+  try {
+    return childProcess
+      .execFileSync('/bin/ps', ['-o', 'lstart=', '-p', String(pid)], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      })
+      .trim();
+  } catch {
+    return '';
+  }
+}
+
+function isLockPidAlive(pidValue, { expectedProcessStart = '', lockStartedAt = '' } = {}) {
   const pid = Number.parseInt(String(pidValue || ''), 10);
   if (!Number.isInteger(pid) || pid <= 0) {
     return true;
   }
   try {
     process.kill(pid, 0);
+    const actualProcessStart = processStartIdentity(pid);
+    if (expectedProcessStart && actualProcessStart && actualProcessStart !== expectedProcessStart) {
+      return false;
+    }
+    if (!expectedProcessStart && actualProcessStart && lockStartedAt) {
+      const processStartedAtMs = Date.parse(actualProcessStart);
+      const lockStartedAtMs = Date.parse(lockStartedAt);
+      if (
+        Number.isFinite(processStartedAtMs) &&
+        Number.isFinite(lockStartedAtMs) &&
+        processStartedAtMs > lockStartedAtMs + 1000
+      ) {
+        return false;
+      }
+    }
     return true;
   } catch (error) {
     if (error?.code === 'ESRCH') {
@@ -1208,6 +1313,23 @@ function isLockPidAlive(pidValue) {
     }
     return true;
   }
+}
+
+function persistRollbackAppliedState(rollbackPath, state) {
+  const rollback = readJson(rollbackPath);
+  const appliedByKey = new Map(
+    (rollback.applied || []).filter((entry) => entry?.key).map((entry) => [entry.key, entry]),
+  );
+  appliedByKey.set(state.key, state);
+  safeJsonWrite(
+    rollbackPath,
+    {
+      ...rollback,
+      applied: Array.from(appliedByKey.values()),
+      lastMutationRecordedAt: new Date().toISOString(),
+    },
+    0o600,
+  );
 }
 
 function loadRuntimeMemoryConfig(configPath) {
@@ -2314,8 +2436,12 @@ function normalizeProvider(provider) {
   return normalized;
 }
 
-function defaultEffortForProvider(provider) {
-  return normalizeProvider(provider) === 'anthropic' ? 'xhigh' : 'high';
+function defaultEffortForProvider(provider, model = '') {
+  if (normalizeProvider(provider) === 'anthropic') return 'xhigh';
+  return (
+    DEFAULT_OPENAI_MEMORY_EFFORT_BY_MODEL[String(model || '').trim()] ||
+    DEFAULT_OPENAI_MEMORY_EFFORT
+  );
 }
 
 function normalizeModelCandidate(candidate = {}, source = 'configured') {
@@ -2325,7 +2451,7 @@ function normalizeModelCandidate(candidate = {}, source = 'configured') {
   return {
     provider,
     model,
-    effort: String(candidate.effort || defaultEffortForProvider(provider)).trim(),
+    effort: String(candidate.effort || defaultEffortForProvider(provider, model)).trim(),
     source: candidate.source || source,
   };
 }
@@ -2423,6 +2549,12 @@ function resolveProvider(options = {}) {
     const resolvedProvider = normalizeProvider(process.env.VIVENTIUM_MEMORY_HARDENING_PROVIDER);
     const selectedModelFromCompiler =
       resolvedProvider === explicit ? process.env.VIVENTIUM_MEMORY_HARDENING_MODEL : '';
+    const selectedModel =
+      options.model ||
+      selectedModelFromCompiler ||
+      (explicit === 'anthropic'
+        ? process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_MODEL || 'claude-opus-5'
+        : process.env.VIVENTIUM_MEMORY_HARDENING_OPENAI_MODEL || 'gpt-5.6-luna');
     return withResolvedCandidates({
       provider: explicit,
       model:
@@ -2435,22 +2567,23 @@ function resolveProvider(options = {}) {
         explicit === 'anthropic'
           ? process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_EFFORT ||
             process.env.VIVENTIUM_MEMORY_HARDENING_EFFORT ||
-            'xhigh'
+            defaultEffortForProvider(explicit, selectedModel)
           : process.env.VIVENTIUM_MEMORY_HARDENING_OPENAI_REASONING_EFFORT ||
             process.env.VIVENTIUM_MEMORY_HARDENING_EFFORT ||
-            'xhigh',
+            defaultEffortForProvider(explicit, selectedModel),
       source: options.provider || options.model ? 'explicit' : 'configured',
     });
   }
   const providers = configuredProviders();
   if (providers.includes('openai')) {
+    const selectedModel = process.env.VIVENTIUM_MEMORY_HARDENING_OPENAI_MODEL || 'gpt-5.6-luna';
     return withResolvedCandidates({
       provider: 'openai',
-      model: process.env.VIVENTIUM_MEMORY_HARDENING_OPENAI_MODEL || 'gpt-5.6-sol',
+      model: selectedModel,
       effort:
         process.env.VIVENTIUM_MEMORY_HARDENING_OPENAI_REASONING_EFFORT ||
         process.env.VIVENTIUM_MEMORY_HARDENING_EFFORT ||
-        'xhigh',
+        defaultEffortForProvider('openai', selectedModel),
       source: 'configured',
     });
   }
@@ -2531,7 +2664,9 @@ function modelAttemptRecord({
   return {
     provider: normalizeProvider(candidate?.provider),
     model: String(candidate?.model || ''),
-    effort: String(candidate?.effort || defaultEffortForProvider(candidate?.provider)),
+    effort: String(
+      candidate?.effort || defaultEffortForProvider(candidate?.provider, candidate?.model),
+    ),
     source: candidate?.source || null,
     ok,
     reason: error ? classifyModelCallFailure(error) : null,
@@ -2663,7 +2798,7 @@ function runCodexStructured({ prompt, model, effort, schema, timeoutMs }) {
           '--sandbox',
           'read-only',
           '--config',
-          `model_reasoning_effort="${effort || 'xhigh'}"`,
+          `model_reasoning_effort="${effort || defaultEffortForProvider('openai', model)}"`,
           '--output-schema',
           schemaPath,
           '--output-last-message',
@@ -2683,7 +2818,7 @@ function runCodexStructured({ prompt, model, effort, schema, timeoutMs }) {
 function probeModel(
   provider,
   model,
-  effort = defaultEffortForProvider(provider),
+  effort = defaultEffortForProvider(provider, model),
   timeoutMs = null,
 ) {
   const prompt = 'Return JSON only: {"ok":true}';
@@ -2759,7 +2894,10 @@ function invokeStructuredModel({ prompt, provider, model, effort, schema, timeou
     return runCodexStructured({
       prompt: `${prompt}\n\nReturn JSON only. No markdown.`,
       model,
-      effort: effort || process.env.VIVENTIUM_MEMORY_HARDENING_OPENAI_REASONING_EFFORT || 'xhigh',
+      effort:
+        effort ||
+        process.env.VIVENTIUM_MEMORY_HARDENING_OPENAI_REASONING_EFFORT ||
+        defaultEffortForProvider('openai', model),
       schema,
       timeoutMs,
     });
@@ -2982,6 +3120,7 @@ function messageInputCost(message) {
 function selectMessagesForPrompt(messages, maxChars) {
   const cap = Number.isFinite(maxChars) && maxChars > 0 ? maxChars : DEFAULT_MAX_INPUT_CHARS;
   let usedChars = 0;
+  let truncatedMessages = 0;
   const selected = [];
   for (const message of messages.slice().reverse()) {
     const cost = messageInputCost(message);
@@ -2992,6 +3131,7 @@ function selectMessagesForPrompt(messages, maxChars) {
         text: String(message.text || '').slice(0, Math.max(cap - 256, 0)),
       });
       usedChars = cap;
+      truncatedMessages += 1;
       break;
     }
     selected.push(message);
@@ -3003,7 +3143,8 @@ function selectMessagesForPrompt(messages, maxChars) {
     estimatedInputChars: messages.reduce((total, message) => total + messageInputCost(message), 0),
     selectedInputChars: usedChars,
     omittedMessages: Math.max(messages.length - selected.length, 0),
-    complete: selected.length === messages.length,
+    truncatedMessages,
+    complete: selected.length === messages.length && truncatedMessages === 0,
   };
 }
 
@@ -3044,6 +3185,7 @@ function promptTelemetry({
     messages_in_lookback: messages.length,
     messages_fed_to_model: promptSelection.messages.length,
     messages_omitted_for_input_cap: promptSelection.omittedMessages,
+    messages_truncated_for_input_cap: promptSelection.truncatedMessages,
     lookback_complete: promptSelection.complete,
     conversation_count_in_lookback: conversationIds.size,
     conversation_count_fed_to_model: selectedConversationIds.size,
@@ -5690,6 +5832,10 @@ async function restoreRollback({ methods, rollback }) {
   }
 
   const beforeByKey = new Map((rollback.memories || []).map((entry) => [entry.key, entry]));
+  const currentMemoryReader =
+    rollbackSchemaVersion >= 3
+      ? methods.getAllUserMemoryStates || methods.getAllUserMemories
+      : methods.getAllUserMemories;
   const currentByKey = new Map(
     (await (methods.getAllUserMemoryStates || methods.getAllUserMemories)(rollback.userId)).map(
       (entry) => [entry.key, entry],
@@ -6358,7 +6504,7 @@ function status(options) {
           mode: latest.mode,
           provider: latest.provider,
           model: latest.model,
-          status: latest.status || 'success',
+          status: latest.status || null,
           failure_reason: latest.failure?.reason || null,
           failure_phase: latest.failure?.phase || null,
           applied_at:
@@ -6400,6 +6546,7 @@ if (require.main === module) {
 module.exports = {
   DEFAULT_VALID_KEYS,
   DEFAULT_MEMORY_HARDENING_MODEL_TIMEOUT_MS,
+  DEFAULT_OPENAI_MEMORY_EFFORT_BY_MODEL,
   acquireLock,
   applyUserProposal,
   applyTranscriptVectorLifecycle,
@@ -6434,6 +6581,7 @@ module.exports = {
   normalizeTranscriptRagMode,
   parseModelFallbacks,
   parseArgs,
+  processStartIdentity,
   modelApplyCooldownDecision,
   readEfficiencyMarker,
   probeModel,

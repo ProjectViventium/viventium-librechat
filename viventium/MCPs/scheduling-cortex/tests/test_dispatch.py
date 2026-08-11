@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from io import BytesIO
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from unittest.mock import MagicMock, patch
 from pathlib import Path
 
@@ -40,6 +40,25 @@ class DispatchWorkbenchTests(unittest.TestCase):
         )
 
         self.assertEqual(bundle['env']['WPR_CODEX_CLI_REASONING_EFFORT'], 'xhigh')
+
+    def test_registered_source_prompt_id_is_passively_exposed_from_structured_metadata(self):
+        task = {
+            'metadata': {
+                'workbench_scheduled_prompt': {
+                    'source_prompt_id': 'scheduler.consciousness_continuity_opportunity',
+                },
+            },
+        }
+
+        self.assertEqual(
+            dispatch._declared_scheduler_source_prompt_id(task),
+            'scheduler.consciousness_continuity_opportunity',
+        )
+        self.assertIsNone(
+            dispatch._declared_scheduler_source_prompt_id(
+                {'metadata': {'source_prompt_id': 'scheduler.unregistered-selector'}}
+            )
+        )
 
     def test_glasshive_bootstrap_prefers_compiled_codex_effort(self):
         bundle = dispatch._glasshive_bootstrap_bundle(
@@ -307,6 +326,37 @@ class DispatchTelegramTests(unittest.TestCase):
         os.environ.pop('VIVENTIUM_TELEGRAM_FOLLOWUP_TIMEOUT_S', None)
         os.environ.pop('VIVENTIUM_TELEGRAM_FOLLOWUP_GRACE_S', None)
 
+    def test_core_accept_lost_response_reconciles_by_occurrence_without_second_generation(self):
+        task = {
+            'id': 'task-core-reconcile',
+            'user_id': 'user_1',
+            'agent_id': 'agent-1',
+            'prompt': 'synthetic prompt',
+            'channel': 'librechat',
+            'conversation_policy': 'new',
+            '_scheduled_prompt_occurrence_key': 'occurrence-core-1',
+            'metadata': None,
+        }
+        with patch.object(
+            dispatch, '_post_json', side_effect=URLError('response lost after accept')
+        ) as post_json, patch.object(
+            dispatch,
+            '_get_json',
+            return_value={'streamId': 'stream-existing', 'conversationId': 'conversation-existing'},
+        ) as reconcile, patch.object(
+            dispatch, '_stream_scheduler_response', return_value=('canonical', 'message-1', '')
+        ), patch.object(
+            dispatch,
+            '_poll_scheduler_followup',
+            return_value={'followup_text': '', 'canonical_text': '', 'canonical_text_source': ''},
+        ):
+            result = dispatch._run_scheduler_generation(task, 'http://localhost:3080', 10, 'new')
+
+        self.assertEqual(result['conversation_id'], 'conversation-existing')
+        self.assertEqual(post_json.call_count, 1)
+        self.assertIn('occurrence-core-1', reconcile.call_args.args[0])
+        self.assertEqual(post_json.call_args.args[1]['idempotencyKey'], 'occurrence-core-1')
+
     def test_resolve_telegram_identity_uses_metadata(self):
         task = {
             'user_id': 'user_1',
@@ -521,6 +571,27 @@ class DispatchTelegramTests(unittest.TestCase):
         self.assertTrue(sent_text.startswith('Late reminder: originally scheduled for 2026-02-13 19:00 UTC'))
         self.assertEqual(telegram_detail.get('late_delivery', {}).get('late_minutes'), 85)
 
+    def test_silent_telegram_fanout_does_not_require_identity_or_transport(self):
+        task = {'id': 'task-silent'}
+        visibility = dispatch._prepare_generated_visibility(task, '', '')
+
+        with patch.object(dispatch, '_resolve_telegram_identity') as identity, patch.object(
+            dispatch,
+            '_send_telegram_voice_or_text',
+        ) as send:
+            detail = dispatch._deliver_telegram_generated_text(
+                task,
+                'http://localhost:3080',
+                10,
+                None,
+                visibility,
+            )
+
+        identity.assert_not_called()
+        send.assert_not_called()
+        self.assertEqual(detail['outcome'], 'suppressed')
+        self.assertEqual(detail['reason'], 'empty')
+
     def test_dispatch_task_sends_telegram_message(self):
         task = {
             'id': 'task-1',
@@ -668,7 +739,9 @@ class DispatchTelegramTests(unittest.TestCase):
             'conversation_policy': 'same',
             'schedule': {'type': 'daily', 'time': '08:00', 'timezone': 'America/Los_Angeles'},
             'next_run_at': '2026-06-15T15:00:00Z',
-            'metadata': None,
+            'metadata': {
+                'source_prompt_id': 'scheduler.consciousness_continuity_opportunity',
+            },
         }
         seen_payloads = []
 
@@ -889,6 +962,78 @@ class DispatchTelegramTests(unittest.TestCase):
         self.assertEqual(followup_text, '')
         self.assertNotIn('linger=', seen['url'])
         self.assertIn('/api/viventium/scheduler/stream/stream-final', seen['url'])
+
+    def test_scheduled_generation_default_stream_window_supports_xhigh_runs(self):
+        task = {
+            'id': 'task-xhigh-window',
+            'user_id': 'user_1',
+            'agent_id': 'agent-1',
+            'prompt': 'appraise current state',
+            'channel': 'workbench',
+            'conversation_policy': 'same',
+            'metadata': None,
+        }
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('SCHEDULER_STREAM_TIMEOUT_S', None)
+            with patch.object(
+                dispatch,
+                '_post_json',
+                return_value={'streamId': 'stream-xhigh-window', 'conversationId': 'conv-1'},
+            ), patch.object(
+                dispatch,
+                '_stream_scheduler_response',
+                return_value=('{NTA}', 'msg-xhigh-window', ''),
+            ) as stream_response, patch.object(
+                dispatch,
+                '_poll_scheduler_followup',
+                return_value={'followup_text': '', 'canonical_text': ''},
+            ):
+                dispatch._run_scheduler_generation(task, 'http://localhost:3080', 10, 'conv-1')
+
+        self.assertEqual(stream_response.call_args.args[4], 600)
+
+    def test_scheduled_generation_timeout_explicitly_cancels_model_authoring(self):
+        task = {
+            'id': 'task-timeout-cancel',
+            'user_id': 'user_1',
+            'agent_id': 'agent-1',
+            'prompt': 'appraise current state',
+            'channel': 'workbench',
+            'conversation_policy': 'same',
+            'metadata': None,
+        }
+
+        with patch.object(
+            dispatch,
+            '_post_json',
+            side_effect=[
+                {'streamId': 'stream-timeout', 'conversationId': 'conv-1'},
+                {'success': True, 'cancelled': 'stream-timeout'},
+            ],
+        ) as post_json, patch.object(
+            dispatch,
+            '_stream_scheduler_response',
+            side_effect=TimeoutError('scheduled stream timed out'),
+        ):
+            with self.assertRaisesRegex(TimeoutError, 'scheduled stream timed out'):
+                dispatch._run_scheduler_generation(
+                    task,
+                    'http://localhost:3080',
+                    10,
+                    'conv-1',
+                )
+
+        cancel_call = post_json.call_args_list[1]
+        self.assertEqual(
+            cancel_call.args[0],
+            'http://localhost:3080/api/viventium/scheduler/stream/stream-timeout/cancel',
+        )
+        self.assertEqual(cancel_call.args[1], {'userId': 'user_1', 'reason': 'stream_timeout'})
+        self.assertEqual(
+            cancel_call.args[2]['X-VIVENTIUM-SCHEDULER-SECRET'],
+            'scheduler_secret',
+        )
 
     def test_telegram_stream_returns_on_final_event_without_linger(self):
         seen = {}
@@ -2018,7 +2163,50 @@ class DispatchBestEffortFanoutTests(unittest.TestCase):
             self.assertEqual(result.get('delivery', {}).get('outcome'), 'sent')
             self.assertIn('channel_errors', result)
             self.assertIn('telegram', result['channel_errors'])
-            self.assertIn('identity', result['channel_errors']['telegram'])
+            self.assertEqual(
+                result['channel_errors']['telegram'],
+                {
+                    'outcome': 'failed',
+                    'reason': 'channel_dispatch_failed',
+                    'error_class': 'RuntimeError',
+                },
+            )
+            self.assertEqual(
+                result['delivery']['channels']['telegram'],
+                result['channel_errors']['telegram'],
+            )
+            self.assertNotIn('identity', str(result))
+
+    def test_structured_superseded_generation_is_not_delivered_as_failure_or_silence(self):
+        task = {
+            'id': 'task-superseded',
+            'user_id': 'user_1',
+            'agent_id': 'agent-1',
+            'prompt': 'obsolete scheduled prompt',
+            'channel': ['librechat', 'telegram'],
+            'conversation_policy': 'same',
+            'metadata': None,
+        }
+
+        with patch.object(
+            dispatch,
+            '_run_scheduler_generation',
+            return_value={
+                'conversation_id': 'lc-same',
+                'response_message_id': 'msg-obsolete',
+                'final_text': 'stale result',
+                'followup_text': '',
+                'disposition': 'superseded',
+                'superseded': True,
+            },
+        ), patch.object(dispatch, '_deliver_telegram_generated_text') as telegram:
+            result = dispatch.dispatch_task(task)
+
+        telegram.assert_not_called()
+        self.assertEqual(result['delivery']['outcome'], 'superseded')
+        self.assertEqual(result['delivery']['channels']['librechat']['outcome'], 'superseded')
+        self.assertEqual(result['delivery']['channels']['telegram']['outcome'], 'superseded')
+        self.assertNotIn('channel_errors', result)
 
     def test_generation_failure_raises_runtime_error(self):
         task = {
@@ -2061,6 +2249,39 @@ class DispatchBestEffortFanoutTests(unittest.TestCase):
 
             self.assertNotIn('channel_errors', result)
             self.assertEqual(result.get('delivery', {}).get('outcome'), 'sent')
+
+    def test_workbench_only_channel_is_silent_audit_not_dispatch_failure(self):
+        task = {
+            'id': 'task-audit-only',
+            'user_id': 'user_1',
+            'agent_id': 'agent-1',
+            'prompt': 'inspect state',
+            'channel': 'workbench',
+            'conversation_policy': 'new',
+            'metadata': None,
+        }
+
+        with patch.object(
+            dispatch,
+            '_run_scheduler_generation',
+            return_value={
+                'conversation_id': 'lc-audit',
+                'response_message_id': 'msg-audit',
+                'final_text': 'Private audit result',
+                'followup_text': '',
+            },
+        ):
+            result = dispatch.dispatch_task(task)
+
+        self.assertEqual(result['delivery']['outcome'], 'audit_only')
+        self.assertEqual(
+            result['delivery']['channels']['workbench'],
+            {
+                'outcome': 'audit_only',
+                'reason': 'workbench_channel_is_audit_only',
+                'generated_text': None,
+            },
+        )
 
 
 if __name__ == '__main__':

@@ -14,9 +14,12 @@ const { getLogStores } = require('~/cache');
 const BROKER_AUDIENCE = 'glasshive-capability-broker';
 const WRITE_CONFIRMATION_AUDIENCE = 'glasshive-write-confirmation';
 const DEFAULT_TTL_SECONDS = 10 * 60;
+const MAX_BROKER_TTL_SECONDS = 24 * 60 * 60;
 const FALLBACK_REPLAY_CACHE = new Map();
 const FALLBACK_RATE_LIMIT_CACHE = new Map();
 const FALLBACK_REVOCATION_CACHE = new Map();
+const FALLBACK_GRANT_RESOURCE_CACHE = new Map();
+const DEFAULT_GRANT_RESOURCE_MAX_BYTES = 512 * 1024;
 let BROKER_REVOCATION_CACHE;
 
 function base64urlEncode(value) {
@@ -86,6 +89,10 @@ function argsHash(args = {}) {
     .digest('base64url');
 }
 
+function valueHash(value) {
+  return crypto.createHash('sha256').update(stableJson(value)).digest('base64url');
+}
+
 function timingSafeEqualString(a, b) {
   const left = Buffer.from(String(a || ''), 'utf8');
   const right = Buffer.from(String(b || ''), 'utf8');
@@ -96,6 +103,70 @@ function sanitizeAllowedServers(servers) {
   return Array.from(
     new Set((servers || []).map((server) => String(server || '').trim()).filter(Boolean)),
   ).sort();
+}
+
+function sanitizeAllowedHostTools(tools) {
+  return Array.from(
+    new Set((tools || []).map((tool) => String(tool || '').trim()).filter(Boolean)),
+  ).sort();
+}
+
+function sanitizeHostToolResources(resources, allowedHostTools) {
+  if (!resources || typeof resources !== 'object' || Array.isArray(resources)) {
+    return {};
+  }
+  const result = {};
+  for (const toolName of allowedHostTools) {
+    const value = resources[toolName];
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      continue;
+    }
+    try {
+      result[toolName] = JSON.parse(JSON.stringify(value));
+    } catch {
+      // Fail closed for a non-serializable resource descriptor.
+    }
+  }
+  return result;
+}
+
+function grantResourceMaxBytes() {
+  const configured = Number(
+    process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_RESOURCE_MAX_BYTES ||
+      DEFAULT_GRANT_RESOURCE_MAX_BYTES,
+  );
+  return Math.max(
+    16 * 1024,
+    Number.isFinite(configured) ? Math.floor(configured) : DEFAULT_GRANT_RESOURCE_MAX_BYTES,
+  );
+}
+
+function grantResourceCacheKey(grantId) {
+  return `glasshive-capability-broker:resources:${String(grantId || '').trim()}`;
+}
+
+function rememberGrantResourcesFallback(record, nowMs = Date.now()) {
+  for (const [grantId, cached] of FALLBACK_GRANT_RESOURCE_CACHE.entries()) {
+    if (!cached || Number(cached.expires_at_ms) <= nowMs) {
+      FALLBACK_GRANT_RESOURCE_CACHE.delete(grantId);
+    }
+  }
+  FALLBACK_GRANT_RESOURCE_CACHE.set(record.grant_id, record);
+}
+
+function resourceRecordForGrant({ grantId, resources, expiresAt, nowMs = Date.now() }) {
+  const serialized = stableJson(resources);
+  const sizeBytes = Buffer.byteLength(serialized, 'utf8');
+  if (sizeBytes > grantResourceMaxBytes()) {
+    throw new Error('GlassHive capability broker resource scope exceeds the configured limit');
+  }
+  return {
+    grant_id: grantId,
+    resource_ref: valueHash(resources),
+    resources,
+    size_bytes: sizeBytes,
+    expires_at_ms: Math.max(nowMs + 60_000, Number(expiresAt) * 1000),
+  };
 }
 
 function normalizeBrokerScopes(scopes = {}) {
@@ -113,12 +184,14 @@ function mintBrokerGrant({
   allowedServers = [],
   eagerServers = allowedServers,
   deferredServers = [],
+  allowedHostTools = [],
+  hostToolResources = {},
   requestContext = {},
   executionMode,
   ttlSeconds = DEFAULT_TTL_SECONDS,
   renewableTtlSeconds = ttlSeconds,
   scopes = {},
-  allowDynamicPolicyServers = true,
+  allowDynamicPolicyServers = false,
   grantId,
   nowMs = Date.now(),
 } = {}) {
@@ -131,7 +204,16 @@ function mintBrokerGrant({
     throw new Error('GlassHive capability broker grant requires a user id');
   }
   const iat = Math.floor(nowMs / 1000);
-  const exp = iat + Math.max(60, Number(ttlSeconds) || DEFAULT_TTL_SECONDS);
+  const requestedTtl = Number(ttlSeconds);
+  const exp =
+    iat +
+    Math.max(
+      60,
+      Math.min(
+        Number.isFinite(requestedTtl) ? Math.floor(requestedTtl) : DEFAULT_TTL_SECONDS,
+        MAX_BROKER_TTL_SECONDS,
+      ),
+    );
   const renewableUntil =
     iat +
     Math.max(
@@ -152,9 +234,22 @@ function mintBrokerGrant({
   const sanitizedDeferredServers = sanitizeAllowedServers(deferredServers).filter(
     (server) => allowedServerSet.has(server) && !eagerServerSet.has(server),
   );
+  const normalizedHostTools = sanitizeAllowedHostTools(allowedHostTools);
+  const normalizedHostResources = sanitizeHostToolResources(hostToolResources, normalizedHostTools);
+  const resolvedGrantId =
+    normalizeGrantId(grantId) || `ghcb_${crypto.randomBytes(16).toString('hex')}`;
+  const resourceRecord =
+    Object.keys(normalizedHostResources).length > 0
+      ? resourceRecordForGrant({
+          grantId: resolvedGrantId,
+          resources: normalizedHostResources,
+          expiresAt: exp,
+          nowMs,
+        })
+      : null;
   const payload = {
     aud: BROKER_AUDIENCE,
-    grant_id: normalizeGrantId(grantId) || `ghcb_${crypto.randomBytes(16).toString('hex')}`,
+    grant_id: resolvedGrantId,
     tenant_id: resolveBrokerTenantId(),
     user_id: userId,
     user_role: String(user?.role || requestContext.user_role || ''),
@@ -163,6 +258,7 @@ function mintBrokerGrant({
       requestContext.parent_message_id || requestContext.parentMessageId || '',
     ),
     message_id: String(requestContext.message_id || requestContext.messageId || ''),
+    turn_id: String(requestContext.turn_id || requestContext.turnId || ''),
     worker_id: String(requestContext.worker_id || requestContext.workerId || ''),
     run_id: String(requestContext.run_id || requestContext.runId || ''),
     schedule_id: String(requestContext.schedule_id || requestContext.scheduleId || ''),
@@ -170,19 +266,28 @@ function mintBrokerGrant({
     allowed_servers: sanitizedAllowedServers,
     eager_servers: sanitizedEagerServers,
     deferred_servers: sanitizedDeferredServers,
+    allowed_host_tools: normalizedHostTools,
+    ...(resourceRecord ? { host_tool_resources_ref: resourceRecord.resource_ref } : {}),
     allow_dynamic_policy_servers: allowDynamicPolicyServers === true,
     scopes: normalizeBrokerScopes(scopes),
     iat,
     exp,
-    renewable_until: renewableUntil,
+    ...(renewableUntil > exp ? { renewable_until: renewableUntil } : {}),
     nonce: crypto.randomBytes(16).toString('hex'),
     policy_version: 2,
   };
   /* === VIVENTIUM END === */
   payload.sig = signPayload(payload, secret);
+  if (resourceRecord) {
+    rememberGrantResourcesFallback(resourceRecord, nowMs);
+  }
   return {
     token: base64urlEncode(JSON.stringify(payload)),
-    payload,
+    payload: {
+      ...payload,
+      ...(resourceRecord ? { host_tool_resources: resourceRecord.resources } : {}),
+    },
+    resourceRecord,
   };
 }
 
@@ -194,6 +299,7 @@ function verifyBrokerGrant(
     expectedTenantId,
     allowRenewal = false,
     allowLegacyTenantless = false,
+    requireTurnScope = false,
   } = {},
 ) {
   const secret = getBrokerSecret();
@@ -234,6 +340,15 @@ function verifyBrokerGrant(
   if (expectedUserId && String(expectedUserId) !== String(payload.user_id)) {
     throw new Error('GlassHive capability broker grant user mismatch');
   }
+  const hasMessageScope = Boolean(String(payload.message_id || '').trim());
+  const hasConversationScope = Boolean(String(payload.conversation_id || '').trim());
+  const hasPrePersistenceTurnScope = Boolean(String(payload.turn_id || '').trim());
+  if (
+    requireTurnScope &&
+    (!hasMessageScope || (!hasConversationScope && !hasPrePersistenceTurnScope))
+  ) {
+    throw new Error('GlassHive capability broker grant is missing turn scope');
+  }
   const expired = !Number.isFinite(Number(payload.exp)) || Number(payload.exp) < nowSeconds;
   const renewableUntil = Number(payload.renewable_until || payload.exp);
   if (
@@ -259,8 +374,66 @@ function verifyBrokerGrant(
     eager_servers: verifiedEagerServers,
     deferred_servers: verifiedDeferredServers,
     /* === VIVENTIUM END === */
+    allowed_host_tools: sanitizeAllowedHostTools(payload.allowed_host_tools),
     scopes: normalizeBrokerScopes(payload.scopes),
     renewed: expired,
+  };
+}
+
+async function persistBrokerGrantResources(mintedGrant) {
+  const record = mintedGrant?.resourceRecord;
+  if (!record) {
+    return { persisted: false, reason: 'no_resources' };
+  }
+  rememberGrantResourcesFallback(record);
+  const cache = await getRateLimitCache();
+  if (!cache?.set) {
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error('GlassHive capability broker resource cache is unavailable');
+    }
+    return { persisted: false, fallback: true };
+  }
+  await cache.set(
+    grantResourceCacheKey(record.grant_id),
+    JSON.stringify(record),
+    Math.max(60_000, record.expires_at_ms - Date.now()),
+  );
+  return { persisted: true, sizeBytes: record.size_bytes };
+}
+
+async function hydrateBrokerGrantResources(grant, { nowMs = Date.now() } = {}) {
+  const resourceRef = String(grant?.host_tool_resources_ref || '').trim();
+  if (!resourceRef) {
+    return { ...grant, host_tool_resources: {} };
+  }
+  const grantId = String(grant?.grant_id || '').trim();
+  let record = FALLBACK_GRANT_RESOURCE_CACHE.get(grantId);
+  if (!record) {
+    const cache = await getRateLimitCache();
+    const raw = cache?.get ? await cache.get(grantResourceCacheKey(grantId)) : null;
+    if (raw) {
+      try {
+        record = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      } catch {
+        record = null;
+      }
+    }
+  }
+  if (
+    !record ||
+    record.grant_id !== grantId ||
+    Number(record.expires_at_ms) < nowMs ||
+    valueHash(record.resources || {}) !== resourceRef
+  ) {
+    throw new Error('GlassHive capability broker resource scope is unavailable');
+  }
+  rememberGrantResourcesFallback(record, nowMs);
+  return {
+    ...grant,
+    host_tool_resources: sanitizeHostToolResources(
+      record.resources,
+      sanitizeAllowedHostTools(grant.allowed_host_tools),
+    ),
   };
 }
 
@@ -343,12 +516,7 @@ async function assertBrokerGrantActive(grant, { nowMs = Date.now() } = {}) {
 
 function grantReplayTtlMs(grant, nowMs = Date.now()) {
   const expMs = Number(grant?.exp) * 1000;
-  const renewableMs = Number(grant?.renewable_until || grant?.exp) * 1000;
-  const until = Math.max(
-    Number.isFinite(expMs) ? expMs : 0,
-    Number.isFinite(renewableMs) ? renewableMs : 0,
-  );
-  return Math.max(60_000, until - nowMs);
+  return Math.max(60_000, (Number.isFinite(expMs) ? expMs : 0) - nowMs);
 }
 
 function brokerRateLimitWindowMs() {
@@ -617,9 +785,11 @@ module.exports = {
   WRITE_CONFIRMATION_AUDIENCE,
   argsHash,
   grantReplayTtlMs,
+  hydrateBrokerGrantResources,
   rememberBrokerRequest,
   mintBrokerGrant,
   mintWriteConfirmation,
+  persistBrokerGrantResources,
   verifyBrokerGrant,
   verifyWriteConfirmation,
   rememberInvocation,

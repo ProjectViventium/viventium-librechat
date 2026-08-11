@@ -33,6 +33,7 @@ const {
   detectActivations,
   normalizePhaseANoticeMode,
   resolvePhaseANoticeModeForRequest,
+  isBackgroundCortexCancellationSignal,
 } = require('../BackgroundCortexService');
 const fs = require('fs');
 const path = require('path');
@@ -573,9 +574,9 @@ describe('BackgroundCortexService activation policy helpers', () => {
       expect.arrayContaining([
         expect.objectContaining({
           server: 'google-workspace',
-          same_scope_background_allowed: true,
+          same_scope_background_allowed: false,
         }),
-        expect.objectContaining({ server: 'ms365', same_scope_background_allowed: true }),
+        expect.objectContaining({ server: 'ms365', same_scope_background_allowed: false }),
       ]),
     );
     expect(declaredTools).not.toContain('web_search');
@@ -723,6 +724,24 @@ describe('BackgroundCortexService activation policy helpers', () => {
         insight: 'Useful supporting evidence.',
         silent: false,
         no_response: false,
+      }),
+    );
+  });
+
+  test('preserves public fallback disclosure on cortex completion', () => {
+    expect(
+      buildCortexCompletionPayload({
+        agentId: 'agent_research',
+        agentName: 'Deep Research',
+        insight: 'Useful fallback evidence.',
+        fallbackUsed: true,
+        primaryErrorClass: 'provider_unauthorized',
+      }),
+    ).toEqual(
+      expect.objectContaining({
+        status: 'complete',
+        fallback_used: true,
+        fallback_reason_class: 'provider_unauthorized',
       }),
     );
   });
@@ -1125,7 +1144,10 @@ describe('BackgroundCortexService activation policy helpers', () => {
   });
 
   test('adds a bounded guard grace around each Phase B cortex attempt', () => {
+    const previousTimeout = process.env.VIVENTIUM_CORTEX_EXECUTION_TIMEOUT_MS;
     const previous = process.env.VIVENTIUM_CORTEX_EXECUTION_GUARD_GRACE_MS;
+    delete process.env.VIVENTIUM_CORTEX_EXECUTION_TIMEOUT_MS;
+    expect(getCortexAttemptGuardTimeoutMs()).toBe(0);
     process.env.VIVENTIUM_CORTEX_EXECUTION_GUARD_GRACE_MS = '5000';
     expect(getCortexAttemptGuardTimeoutMs(1000)).toBe(6000);
     process.env.VIVENTIUM_CORTEX_EXECUTION_GUARD_GRACE_MS = '120000';
@@ -1134,6 +1156,11 @@ describe('BackgroundCortexService activation policy helpers', () => {
       delete process.env.VIVENTIUM_CORTEX_EXECUTION_GUARD_GRACE_MS;
     } else {
       process.env.VIVENTIUM_CORTEX_EXECUTION_GUARD_GRACE_MS = previous;
+    }
+    if (previousTimeout == null) {
+      delete process.env.VIVENTIUM_CORTEX_EXECUTION_TIMEOUT_MS;
+    } else {
+      process.env.VIVENTIUM_CORTEX_EXECUTION_TIMEOUT_MS = previousTimeout;
     }
   });
 
@@ -1237,6 +1264,55 @@ describe('BackgroundCortexService activation policy helpers', () => {
     expect(fallbackAgent.model_parameters).toEqual({
       model: 'gpt-5.4',
       reasoning_effort: 'high',
+    });
+  });
+
+  test('preserves capability-declared high effort for a GlassHive background fallback', async () => {
+    const fallbackAgent = await resolveBackgroundCortexFallbackAgent({
+      req: {
+        config: {
+          endpoints: {
+            agents: {
+              allowedProviders: ['openAI', 'glasshive-harness'],
+              providerCapabilities: {
+                'glasshive-harness': {
+                  automatic_fallback_target: true,
+                  models: [
+                    {
+                      id: 'claude-code:opus',
+                      effortChoices: ['low', 'medium', 'high', 'xhigh', 'max'],
+                    },
+                  ],
+                },
+              },
+            },
+          },
+        },
+      },
+      modelsConfig: {
+        'glasshive-harness': ['claude-code:opus'],
+      },
+      cortexAgent: {
+        id: 'agent_viventium_confirmation_bias_95aeb3',
+        provider: 'openAI',
+        model: 'gpt-5.6-sol',
+        model_parameters: { model: 'gpt-5.6-sol' },
+        fallback_llm_provider: 'glasshive-harness',
+        fallback_llm_model: 'claude-code:opus',
+        fallback_llm_model_parameters: {
+          model: 'claude-code:opus',
+          reasoning_effort: 'high',
+        },
+      },
+    });
+
+    expect(fallbackAgent).toMatchObject({
+      provider: 'glasshive-harness',
+      model: 'claude-code:opus',
+      model_parameters: {
+        model: 'claude-code:opus',
+        reasoning_effort: 'high',
+      },
     });
   });
 });

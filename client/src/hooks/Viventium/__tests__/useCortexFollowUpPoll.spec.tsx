@@ -80,6 +80,9 @@ describe('useCortexFollowUpPoll', () => {
 
   it('keeps polling long enough to surface delayed Phase B follow-up', () => {
     const queryClient = new QueryClient();
+    queryClient.setQueryData([QueryKeys.startupConfig], {
+      viventiumBackgroundFollowupWindowS: 60,
+    });
     const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
 
     const conversationId = 'conv-delayed-followup';
@@ -153,6 +156,9 @@ describe('useCortexFollowUpPoll', () => {
 
   it('keeps polling through the grace window after the parent resolves before a follow-up arrives', () => {
     const queryClient = new QueryClient();
+    queryClient.setQueryData([QueryKeys.startupConfig], {
+      viventiumBackgroundFollowupWindowS: 30,
+    });
     const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
 
     const conversationId = 'conv-resolved-parent-grace';
@@ -234,6 +240,9 @@ describe('useCortexFollowUpPoll', () => {
 
   it('does not treat an older follow-up as completion for the current cortex cycle', () => {
     const queryClient = new QueryClient();
+    queryClient.setQueryData([QueryKeys.startupConfig], {
+      viventiumBackgroundFollowupWindowS: 60,
+    });
     const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
 
     const conversationId = 'conv-with-old-followup';
@@ -305,6 +314,9 @@ describe('useCortexFollowUpPoll', () => {
 
   it('stops polling only when follow-up for the current parent appears', () => {
     const queryClient = new QueryClient();
+    queryClient.setQueryData([QueryKeys.startupConfig], {
+      viventiumBackgroundFollowupWindowS: 30,
+    });
     const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
 
     const conversationId = 'conv-parent-scoped-followup';
@@ -391,6 +403,9 @@ describe('useCortexFollowUpPoll', () => {
 
   it('stops polling after the grace window when no follow-up arrives', () => {
     const queryClient = new QueryClient();
+    queryClient.setQueryData([QueryKeys.startupConfig], {
+      viventiumBackgroundFollowupWindowS: 3,
+    });
     const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
 
     const conversationId = 'conv-no-followup';
@@ -436,9 +451,9 @@ describe('useCortexFollowUpPoll', () => {
     messages = [resolvedMessage];
     invalidateSpy.mockClear();
 
-    // Entire grace window + one extra interval.
+    // Entire configured listening window + one extra interval.
     act(() => {
-      jest.advanceTimersByTime(181_500);
+      jest.advanceTimersByTime(4500);
     });
     const callsAtGraceEnd = invalidateSpy.mock.calls.length;
 
@@ -446,6 +461,419 @@ describe('useCortexFollowUpPoll', () => {
       jest.advanceTimersByTime(15_000);
     });
     expect(invalidateSpy.mock.calls.length).toBe(callsAtGraceEnd);
+  });
+
+  it('uses the configured background follow-up window instead of a client-only 180-second grace', () => {
+    const queryClient = new QueryClient();
+    queryClient.setQueryData([QueryKeys.startupConfig], {
+      viventiumBackgroundFollowupWindowS: 3,
+    });
+    const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
+
+    const conversationId = 'conv-configured-background-window';
+    const activeMessage = {
+      messageId: 'assistant-active',
+      conversationId,
+      parentMessageId: 'user-1',
+      isCreatedByUser: false,
+      text: 'Phase A response.',
+      content: [
+        {
+          type: ContentTypes.CORTEX_BREWING,
+          cortex_id: 'c1',
+          cortex_name: 'Strategic Planning',
+          status: 'brewing',
+          confidence: 0.8,
+        } as any,
+      ],
+    } as any;
+
+    const getMessages = () => [activeMessage] as TMessage[];
+    const wrapper = ({ children }: { children: React.ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+
+    renderHook(() => useCortexFollowUpPoll({ conversationId, getMessages, isSubmitting: false }), {
+      wrapper,
+    });
+
+    act(() => {
+      jest.advanceTimersByTime(3000);
+    });
+    expect(invalidateSpy).toHaveBeenCalledTimes(2);
+
+    const callsAtConfiguredWindowEnd = invalidateSpy.mock.calls.length;
+    act(() => {
+      jest.advanceTimersByTime(15_000);
+    });
+    expect(invalidateSpy.mock.calls.length).toBe(callsAtConfiguredWindowEnd);
+  });
+
+  it('does not rearm an expired target during a later unrelated submission', () => {
+    const queryClient = new QueryClient();
+    queryClient.setQueryData([QueryKeys.startupConfig], {
+      viventiumBackgroundFollowupWindowS: 3,
+    });
+    const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
+
+    const conversationId = 'conv-expired-target-does-not-rearm';
+    const oldActiveMessage = {
+      messageId: 'assistant-old',
+      conversationId,
+      parentMessageId: 'user-old',
+      isCreatedByUser: false,
+      text: 'Earlier response.',
+      content: [
+        {
+          type: ContentTypes.CORTEX_BREWING,
+          cortex_id: 'c1',
+          cortex_name: 'Strategic Planning',
+          status: 'brewing',
+          confidence: 0.8,
+        } as any,
+      ],
+    } as any;
+
+    const getMessages = () => [oldActiveMessage] as TMessage[];
+    const wrapper = ({ children }: { children: React.ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+
+    const { rerender } = renderHook(
+      ({ isSubmitting }) => useCortexFollowUpPoll({ conversationId, getMessages, isSubmitting }),
+      {
+        wrapper,
+        initialProps: { isSubmitting: false },
+      },
+    );
+
+    act(() => {
+      jest.advanceTimersByTime(4500);
+    });
+    const callsAtWindowEnd = invalidateSpy.mock.calls.length;
+
+    act(() => {
+      rerender({ isSubmitting: true });
+    });
+    act(() => {
+      jest.advanceTimersByTime(1500);
+    });
+    act(() => {
+      rerender({ isSubmitting: false });
+    });
+    act(() => {
+      jest.advanceTimersByTime(6000);
+    });
+
+    expect(invalidateSpy.mock.calls.length).toBe(callsAtWindowEnd);
+  });
+
+  it('performs only one catch-up poll when background follow-up startup config is unavailable', () => {
+    const queryClient = new QueryClient();
+    const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
+
+    const conversationId = 'conv-missing-background-window';
+    const activeMessage = {
+      messageId: 'assistant-active',
+      conversationId,
+      parentMessageId: 'user-1',
+      isCreatedByUser: false,
+      text: 'Phase A response.',
+      content: [
+        {
+          type: ContentTypes.CORTEX_BREWING,
+          cortex_id: 'c1',
+          cortex_name: 'Strategic Planning',
+          status: 'brewing',
+          confidence: 0.8,
+        } as any,
+      ],
+    } as any;
+
+    const getMessages = () => [activeMessage] as TMessage[];
+    const wrapper = ({ children }: { children: React.ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+
+    renderHook(() => useCortexFollowUpPoll({ conversationId, getMessages, isSubmitting: false }), {
+      wrapper,
+    });
+
+    act(() => {
+      jest.advanceTimersByTime(1500);
+    });
+    expect(invalidateSpy).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      jest.advanceTimersByTime(15_000);
+    });
+    expect(invalidateSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('honors an explicit zero background follow-up window without a catch-up poll', () => {
+    const queryClient = new QueryClient();
+    queryClient.setQueryData([QueryKeys.startupConfig], {
+      viventiumBackgroundFollowupWindowS: 0,
+    });
+    const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
+
+    const conversationId = 'conv-disabled-background-window';
+    const activeMessage = {
+      messageId: 'assistant-active',
+      conversationId,
+      parentMessageId: 'user-1',
+      isCreatedByUser: false,
+      text: 'Phase A response.',
+      content: [
+        {
+          type: ContentTypes.CORTEX_BREWING,
+          cortex_id: 'c1',
+          cortex_name: 'Strategic Planning',
+          status: 'brewing',
+          confidence: 0.8,
+        } as any,
+      ],
+    } as any;
+
+    const getMessages = () => [activeMessage] as TMessage[];
+    const wrapper = ({ children }: { children: React.ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+
+    renderHook(() => useCortexFollowUpPoll({ conversationId, getMessages, isSubmitting: false }), {
+      wrapper,
+    });
+
+    act(() => {
+      jest.advanceTimersByTime(15_000);
+    });
+    expect(invalidateSpy).not.toHaveBeenCalled();
+  });
+
+  it.each(['suppressed', 'empty', 'skipped'])(
+    'stops polling on a durable %s Phase B decision',
+    (result) => {
+      const queryClient = new QueryClient();
+      queryClient.setQueryData([QueryKeys.startupConfig], {
+        viventiumBackgroundFollowupWindowS: 30,
+      });
+      const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
+
+      const conversationId = `conv-terminal-${result}`;
+      const activeMessage = {
+        messageId: 'assistant-parent',
+        conversationId,
+        parentMessageId: 'user-1',
+        isCreatedByUser: false,
+        text: 'Phase A response.',
+        content: [
+          {
+            type: ContentTypes.CORTEX_BREWING,
+            cortex_id: 'c1',
+            cortex_name: 'Strategic Planning',
+            status: 'brewing',
+            confidence: 0.8,
+          } as any,
+        ],
+      } as any;
+      const resolvedMessage = {
+        ...activeMessage,
+        content: [
+          { type: ContentTypes.TEXT, text: 'Phase A response.' },
+          {
+            type: ContentTypes.CORTEX_INSIGHT,
+            cortex_id: 'c1',
+            cortex_name: 'Strategic Planning',
+            status: 'complete',
+            confidence: 0.8,
+            insight: '',
+          } as any,
+        ],
+        metadata: {
+          viventium: {
+            cortexFollowUpDecision: { result },
+          },
+        },
+      } as any;
+
+      let messages = [activeMessage] as TMessage[];
+      const getMessages = () => messages;
+      const wrapper = ({ children }: { children: React.ReactNode }) => (
+        <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+      );
+
+      renderHook(
+        () => useCortexFollowUpPoll({ conversationId, getMessages, isSubmitting: false }),
+        { wrapper },
+      );
+
+      act(() => {
+        jest.advanceTimersByTime(1500);
+      });
+      expect(invalidateSpy).toHaveBeenCalledTimes(1);
+
+      messages = [resolvedMessage] as TMessage[];
+      const callsBeforeTerminalDecision = invalidateSpy.mock.calls.length;
+      act(() => {
+        jest.advanceTimersByTime(15_000);
+      });
+      expect(invalidateSpy.mock.calls.length).toBe(callsBeforeTerminalDecision);
+    },
+  );
+
+  it('keeps polling after a persisted decision until its visible follow-up arrives', () => {
+    const queryClient = new QueryClient();
+    queryClient.setQueryData([QueryKeys.startupConfig], {
+      viventiumBackgroundFollowupWindowS: 30,
+    });
+    const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
+
+    const conversationId = 'conv-persisted-decision-race';
+    const activeMessage = {
+      messageId: 'assistant-parent',
+      conversationId,
+      parentMessageId: 'user-1',
+      isCreatedByUser: false,
+      text: 'Phase A response.',
+      content: [
+        {
+          type: ContentTypes.CORTEX_BREWING,
+          cortex_id: 'c1',
+          cortex_name: 'Strategic Planning',
+          status: 'brewing',
+          confidence: 0.8,
+        } as any,
+      ],
+    } as any;
+    const resolvedMessage = {
+      ...activeMessage,
+      content: [
+        { type: ContentTypes.TEXT, text: 'Phase A response.' },
+        {
+          type: ContentTypes.CORTEX_INSIGHT,
+          cortex_id: 'c1',
+          cortex_name: 'Strategic Planning',
+          status: 'complete',
+          confidence: 0.8,
+          insight: 'New useful evidence.',
+        } as any,
+      ],
+      metadata: {
+        viventium: {
+          cortexFollowUpDecision: { result: 'persisted' },
+        },
+      },
+    } as any;
+    const followUpMessage = {
+      messageId: 'assistant-followup',
+      conversationId,
+      parentMessageId: 'assistant-parent',
+      isCreatedByUser: false,
+      text: 'A visible follow-up.',
+      metadata: {
+        viventium: {
+          type: 'cortex_followup',
+          parentMessageId: 'assistant-parent',
+        },
+      },
+    } as any;
+
+    let messages = [activeMessage] as TMessage[];
+    const getMessages = () => messages;
+    const wrapper = ({ children }: { children: React.ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+
+    renderHook(() => useCortexFollowUpPoll({ conversationId, getMessages, isSubmitting: false }), {
+      wrapper,
+    });
+
+    act(() => {
+      jest.advanceTimersByTime(1500);
+    });
+    messages = [resolvedMessage] as TMessage[];
+    const callsBeforePersistedDecision = invalidateSpy.mock.calls.length;
+
+    act(() => {
+      jest.advanceTimersByTime(1500);
+    });
+    expect(invalidateSpy.mock.calls.length).toBeGreaterThan(callsBeforePersistedDecision);
+
+    messages = [resolvedMessage, followUpMessage] as TMessage[];
+    const callsBeforeVisibleFollowUp = invalidateSpy.mock.calls.length;
+    act(() => {
+      jest.advanceTimersByTime(15_000);
+    });
+    expect(invalidateSpy.mock.calls.length).toBe(callsBeforeVisibleFollowUp);
+  });
+
+  it('stops polling when Phase B was promoted onto the empty parent', () => {
+    const queryClient = new QueryClient();
+    queryClient.setQueryData([QueryKeys.startupConfig], {
+      viventiumBackgroundFollowupWindowS: 30,
+    });
+    const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
+
+    const conversationId = 'conv-promoted-parent';
+    const activeMessage = {
+      messageId: 'assistant-parent',
+      conversationId,
+      parentMessageId: 'user-1',
+      isCreatedByUser: false,
+      text: '',
+      content: [
+        {
+          type: ContentTypes.CORTEX_BREWING,
+          cortex_id: 'c1',
+          cortex_name: 'Strategic Planning',
+          status: 'brewing',
+          confidence: 0.8,
+        } as any,
+      ],
+    } as any;
+    const promotedMessage = {
+      ...activeMessage,
+      text: 'Recovered visible answer.',
+      content: [
+        { type: ContentTypes.TEXT, text: 'Recovered visible answer.' },
+        {
+          type: ContentTypes.CORTEX_INSIGHT,
+          cortex_id: 'c1',
+          cortex_name: 'Strategic Planning',
+          status: 'complete',
+          confidence: 0.8,
+          insight: 'Recovered evidence.',
+        } as any,
+      ],
+      metadata: {
+        viventium: {
+          type: 'cortex_followup',
+          promotedToEmptyParent: true,
+          cortexFollowUpDecision: { result: 'persisted' },
+        },
+      },
+    } as any;
+
+    let messages = [activeMessage] as TMessage[];
+    const getMessages = () => messages;
+    const wrapper = ({ children }: { children: React.ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+
+    renderHook(() => useCortexFollowUpPoll({ conversationId, getMessages, isSubmitting: false }), {
+      wrapper,
+    });
+
+    act(() => {
+      jest.advanceTimersByTime(1500);
+    });
+    messages = [promotedMessage] as TMessage[];
+    const callsBeforePromotion = invalidateSpy.mock.calls.length;
+
+    act(() => {
+      jest.advanceTimersByTime(15_000);
+    });
+    expect(invalidateSpy.mock.calls.length).toBe(callsBeforePromotion);
   });
 
   it('arms grace polling when latest message has cortex parts but no active statuses', () => {

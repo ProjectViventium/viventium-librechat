@@ -15,13 +15,101 @@ type FilterRenderableContentPartsOptions = {
 };
 
 /* === VIVENTIUM START ===
+ * Feature: Exact rendered message-part identity for QA telemetry.
+ * Purpose: Carry non-serializing source identity through UI-only filtering, sanitizing, merging,
+ * and parallel reordering so visible text can be correlated to its exact persisted author.
+ * === VIVENTIUM END === */
+const VIVENTIUM_RENDER_SOURCE_INDICES = Symbol('viventium-render-source-indices');
+const VIVENTIUM_RENDER_AGENT_ID = Symbol('viventium-render-agent-id');
+const VIVENTIUM_RENDER_PART_ID = Symbol('viventium-render-part-id');
+
+type RenderIdentityPart = TMessageContentParts & {
+  viventium_render_part_id?: string;
+  [VIVENTIUM_RENDER_SOURCE_INDICES]?: number[];
+  [VIVENTIUM_RENDER_AGENT_ID]?: string;
+  [VIVENTIUM_RENDER_PART_ID]?: string;
+};
+
+function normalizedAgentId(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function sourceIndices(part: TMessageContentParts | undefined): number[] {
+  const indices = (part as RenderIdentityPart | undefined)?.[VIVENTIUM_RENDER_SOURCE_INDICES];
+  return Array.isArray(indices) ? indices.filter(Number.isInteger) : [];
+}
+
+function persistedSourceIndices(part: TMessageContentParts | undefined): number[] {
+  const value = normalizedAgentId(
+    (part as RenderIdentityPart | undefined)?.viventium_render_part_id,
+  );
+  if (!/^content:\d+(?:,\d+)*$/.test(value)) {
+    return [];
+  }
+  const indices = value.slice('content:'.length).split(',').map(Number);
+  return indices.every(
+    (index, position) =>
+      Number.isInteger(index) && index >= 0 && indices.indexOf(index) === position,
+  )
+    ? indices
+    : [];
+}
+
+export function getRenderableContentPartIdentity(part: TMessageContentParts | undefined): {
+  agentId: string;
+  partId: string;
+} {
+  const identified = part as RenderIdentityPart | undefined;
+  const agentId =
+    normalizedAgentId(identified?.[VIVENTIUM_RENDER_AGENT_ID]) || normalizedAgentId(part?.agentId);
+  const explicitPartId = normalizedAgentId(identified?.[VIVENTIUM_RENDER_PART_ID]);
+  const indices = sourceIndices(part);
+  return {
+    agentId,
+    partId: explicitPartId || (indices.length > 0 ? `content:${indices.join(',')}` : ''),
+  };
+}
+
+export function annotateRenderableContentParts(
+  content: RenderableContentInput,
+  fallbackAgentId = '',
+): Array<TMessageContentParts | undefined> | undefined {
+  if (content == null) {
+    return undefined;
+  }
+  const rawParts = Array.isArray(content) ? content : [content];
+  return rawParts.map((rawPart, index) => {
+    const part = normalizeContentPart(rawPart);
+    if (!part) {
+      return undefined;
+    }
+    const agentId = normalizedAgentId(part.agentId) || normalizedAgentId(fallbackAgentId);
+    const stableSourceIndices = persistedSourceIndices(part);
+    return {
+      ...part,
+      [VIVENTIUM_RENDER_SOURCE_INDICES]:
+        stableSourceIndices.length > 0 ? stableSourceIndices : [index],
+      [VIVENTIUM_RENDER_AGENT_ID]: agentId,
+    } as RenderIdentityPart;
+  });
+}
+
+export function createRenderableMessageTextPart(text: string, agentId = ''): TMessageContentParts {
+  return {
+    ...textContentPart(text),
+    [VIVENTIUM_RENDER_PART_ID]: 'message-text',
+    [VIVENTIUM_RENDER_AGENT_ID]: normalizedAgentId(agentId),
+  } as RenderIdentityPart;
+}
+
+/* === VIVENTIUM START ===
  * Feature: User-facing GlassHive plumbing hygiene.
  * Purpose: Strip accidental raw GlassHive tool transcripts from assistant text while preserving
  * normal examples and visible product-language tool rows.
  * === VIVENTIUM END === */
-const RAW_TOOL_TRANSCRIPT_LINE_RE =
-  /^\s*Tool:\s+(.*)$/i;
-const RAW_TOOL_XML_INVOKE_BLOCK_RE = /<(?:invoke|tool_call)\b[^>]*>[\s\S]*?<\/(?:invoke|tool_call)>/gi;
+const RAW_TOOL_TRANSCRIPT_LINE_RE = /^\s*Tool:\s+(.*)$/i;
+const RAW_TOOL_XML_INVOKE_BLOCK_RE =
+  /<(?:invoke|tool_call)\b[^>]*>[\s\S]*?<\/(?:invoke|tool_call)>/gi;
 const RAW_TOOL_JSON_FENCE_RE =
   /```(?:json|tool|tool_call)?\s*\n\s*\{[\s\S]*?"(?:tool_call|tool|arguments|args)"[\s\S]*?\}\s*```/gi;
 const GLASSHIVE_RAW_TOOL_NAMES = new Set([
@@ -71,7 +159,6 @@ function textContentPart(text: string): TMessageContentParts {
   return {
     type: ContentTypes.TEXT,
     text,
-    [ContentTypes.TEXT]: text,
   } as TMessageContentParts;
 }
 
@@ -145,13 +232,20 @@ function mergeAdjacentTextParts(
     const text = plainTextPartValue(part);
     const previous = merged[merged.length - 1];
     const previousText = plainTextPartValue(previous);
+    const currentIdentity = getRenderableContentPartIdentity(part);
+    const previousIdentity = getRenderableContentPartIdentity(previous);
+    const sameAuthor = currentIdentity.agentId === previousIdentity.agentId;
+    const sameParallelGroup = part?.groupId === previous?.groupId;
 
-    if (text != null && previousText != null && previous) {
+    if (text != null && previousText != null && previous && sameAuthor && sameParallelGroup) {
       const combined = `${previousText}${text}`;
+      const combinedSourceIndices = [...sourceIndices(previous), ...sourceIndices(part)];
       merged[merged.length - 1] = {
         ...previous,
         text: combined,
-        [ContentTypes.TEXT]: combined,
+        ...(combinedSourceIndices.length > 0
+          ? { [VIVENTIUM_RENDER_SOURCE_INDICES]: combinedSourceIndices }
+          : {}),
       } as TMessageContentParts;
       changed = true;
       return;
@@ -211,7 +305,10 @@ function sanitizeRawToolTranscriptText(value: string): string {
   if (cleaned === value) {
     return value;
   }
-  return cleaned.replace(/[ \t]+\n/g, '\n').replace(/\n{2,}/g, '\n').trim();
+  return cleaned
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{2,}/g, '\n')
+    .trim();
 }
 
 function containsGlassHiveRawToolName(value: string): boolean {
@@ -267,7 +364,6 @@ function sanitizeRawToolTranscriptTextParts(
     return {
       ...part,
       text: cleaned,
-      [ContentTypes.TEXT]: cleaned,
     } as TMessageContentParts;
   });
   return changed ? sanitized : content;
@@ -420,7 +516,8 @@ function collapseConsecutiveGlassHiveToolCalls(
       previousToolCallId.length > 0 &&
       currentToolCallId !== previousToolCallId;
     const currentIsCollapsibleLaunchTool =
-      currentGlassHiveToolName != null && COLLAPSIBLE_GLASSHIVE_TOOL_NAMES.has(currentGlassHiveToolName);
+      currentGlassHiveToolName != null &&
+      COLLAPSIBLE_GLASSHIVE_TOOL_NAMES.has(currentGlassHiveToolName);
     /* === VIVENTIUM START ===
      * Feature: User-facing GlassHive tool-row hygiene.
      * Purpose: Keep one concise launch/schedule/delegate row visible across retry ids.

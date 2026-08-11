@@ -43,6 +43,13 @@ type ChatHelpers = Pick<
 
 const MAX_RETRIES = 5;
 
+type GenerationStartReceipt = {
+  streamId: string;
+  conversationId?: string;
+  logical_turn_id?: string;
+  revision?: number;
+};
+
 /**
  * Hook for resumable SSE streams.
  * Separates generation start (POST) from stream subscription (GET EventSource).
@@ -185,6 +192,25 @@ export default function useResumableSSE(
               conversationId: data.conversation?.conversationId,
               hasResponseMessage: !!data.responseMessage,
             });
+            if (data.superseded === true) {
+              const supersededUserMessageId = userMessage?.messageId;
+              if (supersededUserMessageId) {
+                setMessages(
+                  (getMessages() ?? []).filter(
+                    (message) =>
+                      message.isCreatedByUser === true ||
+                      message.parentMessageId !== supersededUserMessageId,
+                  ),
+                );
+              }
+              clearStepMaps();
+              removeActiveJob(currentStreamId);
+              sse.close();
+              setIsSubmitting(false);
+              setShowStopButton(false);
+              setStreamId(null);
+              return;
+            }
             clearDraft(currentSubmission.conversation?.conversationId);
             try {
               finalHandler(data, currentSubmission as EventSubmission);
@@ -281,6 +307,8 @@ export default function useResumableSSE(
               direct_action_surface_scopes: cortexData.direct_action_surface_scopes,
               configured_tools: cortexData.configured_tools,
               completed_tool_calls: cortexData.completed_tool_calls,
+              fallback_used: cortexData.fallback_used,
+              fallback_reason_class: cortexData.fallback_reason_class,
               status_changed_at: cortexData.status_changed_at,
             };
 
@@ -633,7 +661,7 @@ export default function useResumableSSE(
    * Retries up to 3 times on network errors with exponential backoff.
    */
   const startGeneration = useCallback(
-    async (currentSubmission: TSubmission): Promise<string | null> => {
+    async (currentSubmission: TSubmission): Promise<GenerationStartReceipt | null> => {
       const payloadData = createPayload(currentSubmission);
       let { payload } = payloadData;
       payload = removeNullishValues(payload) as TPayload;
@@ -656,9 +684,9 @@ export default function useResumableSSE(
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
           // Use request.post which handles auth token refresh via axios interceptors
-          const data = (await request.post(url, payload)) as { streamId: string };
+          const data = (await request.post(url, payload)) as GenerationStartReceipt;
           console.log('[ResumableSSE] Generation started:', { streamId: data.streamId });
-          return data.streamId;
+          return data;
         } catch (error) {
           lastError = error;
           // Check if it's a network error (retry) vs server error (don't retry)
@@ -744,12 +772,53 @@ export default function useResumableSSE(
       } else {
         // New generation: start and then subscribe
         console.log('[ResumableSSE] Starting NEW generation');
-        const newStreamId = await startGeneration(submission);
-        if (newStreamId) {
+        const startReceipt = await startGeneration(submission);
+        if (startReceipt?.streamId) {
+          const newStreamId = startReceipt.streamId;
+          const canonicalConversationId = startReceipt.conversationId;
+          let claimedSubmission = submission;
+
+          /* === VIVENTIUM START ===
+           * Feature: Cross-surface logical-turn coherence.
+           * Purpose: Bind the server-authored canonical conversation as soon as
+           *          the start request is accepted. A rapid follow-up can then
+           *          claim revision 2 of the same turn before the slower CREATED
+           *          model event arrives.
+           * === VIVENTIUM END === */
+          if (
+            canonicalConversationId &&
+            canonicalConversationId !== submission.conversation?.conversationId
+          ) {
+            claimedSubmission = {
+              ...submission,
+              conversation: {
+                ...submission.conversation,
+                conversationId: canonicalConversationId,
+              },
+              userMessage: {
+                ...submission.userMessage,
+                conversationId: canonicalConversationId,
+              },
+              initialResponse: {
+                ...submission.initialResponse,
+                conversationId: canonicalConversationId,
+              },
+            };
+            const currentMessages = getMessages() ?? [];
+            queryClient.setQueryData<TMessage[]>(
+              [QueryKeys.messages, canonicalConversationId],
+              currentMessages,
+            );
+            setConversation?.((previous) =>
+              previous ? { ...previous, conversationId: canonicalConversationId } : previous,
+            );
+          }
+
+          submissionRef.current = claimedSubmission;
           setStreamId(newStreamId);
           // Optimistically add to active jobs
           addActiveJob(newStreamId);
-          subscribeToStream(newStreamId, submission);
+          subscribeToStream(newStreamId, claimedSubmission);
         } else {
           console.error('[ResumableSSE] Failed to get streamId from startGeneration');
         }

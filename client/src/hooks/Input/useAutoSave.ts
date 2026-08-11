@@ -9,6 +9,15 @@ import { useChatFormContext } from '~/Providers';
 import { useGetFiles } from '~/data-provider';
 import store from '~/store';
 
+export const migratePendingTextDraft = (conversationId: string, visibleDraft: string) => {
+  localStorage.removeItem(`${LocalStorageKeys.TEXT_DRAFT}${Constants.PENDING_CONVO}`);
+  if (visibleDraft) {
+    setDraft({ id: conversationId, value: visibleDraft });
+  } else {
+    localStorage.removeItem(`${LocalStorageKeys.TEXT_DRAFT}${conversationId}`);
+  }
+};
+
 export const useAutoSave = ({
   isSubmitting,
   conversationId: _conversationId,
@@ -177,14 +186,15 @@ export const useAutoSave = ({
           `${LocalStorageKeys.TEXT_DRAFT}${Constants.PENDING_CONVO}`,
         );
 
-        // Clear the pending text draft, if it exists, and save the current draft to the new conversationId;
-        // otherwise, save the current text area value to the new conversationId
-        localStorage.removeItem(`${LocalStorageKeys.TEXT_DRAFT}${Constants.PENDING_CONVO}`);
-        if (pendingDraft) {
-          localStorage.setItem(`${LocalStorageKeys.TEXT_DRAFT}${conversationId}`, pendingDraft);
-        } else if (textAreaRef?.current?.value) {
-          setDraft({ id: conversationId, value: textAreaRef.current.value });
-        }
+        // === VIVENTIUM START ===
+        // Feature: Cross-surface logical-turn coherence.
+        // Purpose: Only carry a pending draft into the canonical conversation when text is
+        //          still visibly being authored. A submitted rapid follow-up has already reset
+        //          the composer, so copying its stale pending draft would make the sent message
+        //          reappear after completion or refresh.
+        // === VIVENTIUM END ===
+        const visibleDraft = textAreaRef?.current?.value ?? '';
+        migratePendingTextDraft(conversationId, visibleDraft);
         const pendingFileDraft = localStorage.getItem(
           `${LocalStorageKeys.FILES_DRAFT}${Constants.PENDING_CONVO}`,
         );

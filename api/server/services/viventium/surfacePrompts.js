@@ -9,6 +9,11 @@
  * === VIVENTIUM END === */
 
 function resolveViventiumSurface(req) {
+  const { getTrustedInteractionContext } = require('./interactionContext');
+  const trustedSurface = getTrustedInteractionContext(req)?.surface;
+  if (trustedSurface) {
+    return trustedSurface;
+  }
   const bodySurface = (req?.body?.viventiumSurface || '').toString().toLowerCase();
   if (bodySurface) {
     return bodySurface;
@@ -124,6 +129,8 @@ function buildVoiceModeInstructions(voiceProvider) {
     '- Use natural language for dates/times (no raw timestamps).',
     '- Use plain ASCII punctuation for spoken/display text. Do not use Unicode dash punctuation such as U+2013 or U+2014. Use commas, periods, or short sentence breaks instead.',
     '- Keep responses concise (1-4 sentences) unless the user asks for detail.',
+    '- Unless the user explicitly asks for a lookup or tool action now, do not start foreground research or tool work during a live voice call. For facts that are not already verified, give the best bounded immediate answer, state what remains unverified, and let nonblocking background work surface later value through Phase B.',
+    '- When the user explicitly asks for a lookup or tool action now, the current voice task may do it. Keep the work interruptible and cancellable, and never claim a result before its authoritative tool evidence returns.',
     '- If a spoken turn clearly sounds unfinished, cut off, or like the user is still gathering the thought, stay silent by outputting exactly {NTA} instead of answering an assumed intent.',
     '- Do not add memory/personality context to simple audio checks or short acknowledgments; answer the spoken need first and stop when no extra value is needed.',
     '- If the user talks about voice providers, TTS, fallback routes, markup, or audio internals, treat that as a delivery constraint unless they explicitly ask for diagnostics. Do not narrate provider/fallback mechanics; give only the user-facing spoken response.',
@@ -149,7 +156,8 @@ function buildVoiceModeInstructions(voiceProvider) {
   if (provider === 'cartesia') {
     const fallback = [
       ...baseRules,
-      `- Cartesia ${CARTESIA_SONIC3_CAPABILITIES.model_id} TTS is selected. You may use documented Cartesia SSML-like tags in the assistant text when they improve spoken delivery.`,
+      `- Cartesia ${CARTESIA_SONIC3_CAPABILITIES.model_id} TTS is selected. Use only documented Cartesia controls when they improve spoken delivery.`,
+      '- For expressive delivery, include one complete documented Cartesia control; before finalizing, verify it is present and valid.',
       `- Allowed nonverbal marker from Cartesia docs: ${CARTESIA_SONIC3_NONVERBAL_MARKERS.join(', ')}. Use it only when actual laughter belongs in the spoken response.`,
       '- Put nonverbal markers on their own line or between sentences (do not embed inside a sentence).',
       '- Do NOT invent other bracketed stage directions.',
@@ -200,7 +208,7 @@ function buildVoiceModeInstructions(voiceProvider) {
       '- xAI TTS has no Cartesia-style emotion parameter; express tone through natural wording plus the documented xAI speech tags.',
       '- xAI has broadly useful controls for softness, emphasis, intensity, pace, pitch, breath, and pauses.',
       '- Once you appraise delivery as expressive and an allowed tag fits, include at least one fitting exact allowed tag where it naturally shapes the delivery. When an allowed tag fits, a plain draft is not final even when its words already convey tone. For restrained delivery or when no tag fits, use none.',
-      '- When a tag fits, before finalizing an expressive reply, verify that the raw response contains at least one exact tag from the allowed xAI lists.',
+      '- When a tag fits, before finalizing an expressive reply, verify that the raw response contains at least one exact allowed tag and no unmatched angle tag.',
       '- Use the smallest fitting xAI control set; natural wording still matters.',
     ].join('\n');
     return getPromptText('surface.voice.provider.xai', fallback, {
@@ -270,7 +278,8 @@ function buildTelegramAudioOutputInstructions(voiceProvider) {
       'surface.telegram.audio_provider.cartesia',
       [
         ...baseRules,
-        `- Cartesia ${CARTESIA_SONIC3_CAPABILITIES.model_id} TTS is selected. You may use documented Cartesia SSML-like tags when they improve spoken delivery.`,
+        `- Cartesia ${CARTESIA_SONIC3_CAPABILITIES.model_id} TTS is selected. Use only documented Cartesia controls when they improve spoken delivery.`,
+        '- For expressive delivery, include one complete documented Cartesia control; before finalizing, verify it is present and valid.',
         `- Allowed nonverbal marker from Cartesia docs: ${CARTESIA_SONIC3_NONVERBAL_MARKERS.join(', ')}. Use it only when actual laughter belongs in the spoken response.`,
         `- Allowed emotion values: ${CARTESIA_SONIC3_EMOTIONS.join(', ')}.`,
         `- Primary/highest-reliability emotion values: ${CARTESIA_SONIC3_PRIMARY_EMOTIONS.join(', ')}.`,
@@ -311,7 +320,7 @@ function buildTelegramAudioOutputInstructions(voiceProvider) {
         '- xAI TTS has no Cartesia-style emotion parameter; express tone through natural wording plus the documented xAI speech tags.',
         '- xAI has broadly useful controls for softness, emphasis, intensity, pace, pitch, breath, and pauses.',
         '- Once you appraise delivery as expressive and an allowed tag fits, include at least one fitting exact allowed tag where it naturally shapes the delivery. When an allowed tag fits, a plain draft is not final even when its words already convey tone. For restrained delivery or when no tag fits, use none.',
-        '- When a tag fits, before finalizing an expressive reply, verify that the raw response contains at least one exact tag from the allowed xAI lists.',
+        '- When a tag fits, before finalizing an expressive reply, verify that the raw response contains at least one exact allowed tag and no unmatched angle tag.',
         '- Use the smallest fitting xAI control set; natural wording still matters.',
       ].join('\n'),
       {
@@ -368,6 +377,18 @@ function buildWebTextInstructions() {
     '- If sources are helpful, include plain URLs on a "Sources" line (no markdown links, no citation markers).',
   ].join('\n');
   return getPromptText('surface.web', fallback);
+}
+
+function buildScheduledCanonicalOutputInstructions() {
+  const fallback = [
+    'SCHEDULED CANONICAL OUTPUT:',
+    '- Produce one channel-neutral semantic result for downstream delivery adapters.',
+    '- If intentional silence is the best outcome, output exactly {NTA}.',
+    '- Do not add surface-specific markup, delivery directions, or internal mechanics.',
+    '- State actions, unavailable capabilities, failures, and no-action outcomes truthfully.',
+    '- Let downstream delivery adapters adapt paragraphs and presentation without changing meaning or requesting another model generation.',
+  ].join('\n');
+  return getPromptText('scheduler.canonical_output', fallback);
 }
 
 function buildPlaygroundTextInstructions() {
@@ -862,6 +883,31 @@ function buildTimeContextInstructions(req) {
   return [baseInstructions, schedulerContextInstructions].filter(Boolean).join('\n\n');
 }
 
+function applyTimeContextDelivery({
+  req,
+  requestBody,
+  instructions,
+  timeContextInstructions,
+  providerCapability,
+}) {
+  if (!timeContextInstructions) {
+    return instructions || '';
+  }
+  if (
+    providerCapability?.workspace_binding === true &&
+    providerCapability?.conversation_session === true
+  ) {
+    req.body = req.body || {};
+    const encodedTurnContext = Buffer.from(timeContextInstructions, 'utf8').toString('base64');
+    req.body.viventiumGlassHiveTurnContextB64 = encodedTurnContext;
+    if (requestBody && typeof requestBody === 'object') {
+      requestBody.viventiumGlassHiveTurnContextB64 = encodedTurnContext;
+    }
+    return instructions || '';
+  }
+  return [instructions || '', timeContextInstructions].filter(Boolean).join('\n\n');
+}
+
 /* === VIVENTIUM START ===
  * Feature: Strip voice control tags for display/persistence.
  * Purpose: Remove Cartesia SSML, bracket nonverbal markers, and other TTS-specific
@@ -989,6 +1035,7 @@ module.exports = {
   buildTelegramAudioOutputInstructions,
   buildTelegramTextInstructions,
   buildWebTextInstructions,
+  buildScheduledCanonicalOutputInstructions,
   buildPlaygroundTextInstructions,
   buildVoiceNoteInputInstructions,
   buildVoiceCallInputInstructions,
@@ -996,6 +1043,7 @@ module.exports = {
   isWingModeEnabledForRequest,
   buildCortexOutputInstructions,
   buildTimeContextInstructions,
+  applyTimeContextDelivery,
   stripVoiceControlTagsForDisplay,
   sanitizeVoiceSurfaceTextForDisplay,
 };

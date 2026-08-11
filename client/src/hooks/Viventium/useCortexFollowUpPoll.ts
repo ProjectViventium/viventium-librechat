@@ -10,10 +10,11 @@
  *
  * Approach:
  * - While any cortex is "activating" or "brewing", periodically invalidate the messages query.
- * - Once all cortices are resolved, keep polling briefly to catch the follow-up message.
+ * - Bound automatic browser listening with the canonical server-projected follow-up window.
+ * - Stop early on a visible follow-up or a durable terminal-silent Phase B decision.
  * - After a recent tool-using assistant response, keep polling briefly for out-of-band direct-action
  *   callbacks that are persisted after the main SSE stream has already closed.
- * - Stop automatically (and never poll indefinitely).
+ * - Window expiry stops query refreshes only; it never cancels Main or Phase B execution.
  * === VIVENTIUM END === */
 
 import { useEffect, useRef } from 'react';
@@ -22,12 +23,7 @@ import { Constants, ContentTypes, QueryKeys } from 'librechat-data-provider';
 import type { TMessage, TMessageContentParts } from 'librechat-data-provider';
 import { GLASSHIVE_MCP_SERVER_NAME } from '~/utils/viventiumGlassHive';
 
-/**
- * Keep polling long enough for real-world Phase B completion.
- * Backend default cortex execution timeout is 180s.
- */
 const POLL_INTERVAL_MS = 1500;
-const FOLLOW_UP_GRACE_MS = 180_000;
 const DEFAULT_TOOL_CALLBACK_GRACE_MS = 10 * 60 * 1000;
 const MAX_TOOL_CALLBACK_GRACE_MS = 24 * 60 * 60 * 1000;
 
@@ -44,6 +40,7 @@ const TERMINAL_GLASSHIVE_CALLBACK_EVENTS = new Set<string>([
   'checkpoint.ready',
   'takeover.requested',
 ]);
+const TERMINAL_SILENT_FOLLOW_UP_RESULTS = new Set<string>(['suppressed', 'empty', 'skipped']);
 const GLASSHIVE_MCP_SERVER = GLASSHIVE_MCP_SERVER_NAME;
 
 function extractCortexParts(message: TMessage): any[] {
@@ -133,7 +130,8 @@ function hasGlassHiveToolCallPart(message: TMessage): boolean {
     return false;
   }
   return (message.content as Array<TMessageContentParts | undefined>).some(
-    (part) => part?.type === ContentTypes.TOOL_CALL && isGlassHiveToolName(extractToolCallName(part)),
+    (part) =>
+      part?.type === ContentTypes.TOOL_CALL && isGlassHiveToolName(extractToolCallName(part)),
   );
 }
 
@@ -167,34 +165,31 @@ function getLatestCortexMessageId(messages: TMessage[]): string | null {
   return null;
 }
 
-function isResolvedDeferredCortexMessage(
+function getTargetMessage(messages: TMessage[], targetMessageId: string | null): TMessage | null {
+  if (!targetMessageId) {
+    return null;
+  }
+  return messages.find((message) => message?.messageId === targetMessageId) ?? null;
+}
+
+function hasPromotedFollowUp(messages: TMessage[], targetMessageId: string | null): boolean {
+  const targetMessage = getTargetMessage(messages, targetMessageId);
+  const viventiumMetadata = (targetMessage as any)?.metadata?.viventium;
+  const renderedText = typeof targetMessage?.text === 'string' ? targetMessage.text.trim() : '';
+  return viventiumMetadata?.promotedToEmptyParent === true && renderedText.length > 0;
+}
+
+function hasTerminalSilentFollowUpDecision(
   messages: TMessage[],
   targetMessageId: string | null,
 ): boolean {
-  if (!targetMessageId) {
-    return false;
-  }
-
-  const targetMessage = messages.find((message) => message?.messageId === targetMessageId);
-  if (!targetMessage) {
-    return false;
-  }
-
-  if (targetMessage.unfinished === true) {
-    return false;
-  }
-
-  const parts = extractCortexParts(targetMessage);
-  if (parts.length === 0) {
-    return false;
-  }
-
-  if (parts.some((part) => part?.status === 'activating' || part?.status === 'brewing')) {
-    return false;
-  }
-
-  const renderedText = typeof targetMessage.text === 'string' ? targetMessage.text.trim() : '';
-  return renderedText.length > 0;
+  const targetMessage = getTargetMessage(messages, targetMessageId);
+  const result = String(
+    (targetMessage as any)?.metadata?.viventium?.cortexFollowUpDecision?.result || '',
+  )
+    .trim()
+    .toLowerCase();
+  return TERMINAL_SILENT_FOLLOW_UP_RESULTS.has(result);
 }
 
 function collectFollowUpParentIds(messages: TMessage[]): Set<string> {
@@ -260,6 +255,21 @@ function getToolCallbackGraceMs(queryClient: ReturnType<typeof useQueryClient>):
   return Math.min(Math.max(timeoutS * 1000, POLL_INTERVAL_MS), MAX_TOOL_CALLBACK_GRACE_MS);
 }
 
+function getBackgroundFollowUpWindowMs(queryClient: ReturnType<typeof useQueryClient>): number {
+  const startupConfig = queryClient.getQueryData<{
+    viventiumBackgroundFollowupWindowS?: unknown;
+  }>([QueryKeys.startupConfig]);
+  const windowS = startupConfig?.viventiumBackgroundFollowupWindowS;
+  if (typeof windowS !== 'number' || !Number.isFinite(windowS) || windowS < 0) {
+    // A mismatched/old client-server bundle gets one catch-up refresh, not a guessed business timer.
+    return POLL_INTERVAL_MS;
+  }
+  if (windowS === 0) {
+    return 0;
+  }
+  return Math.max(windowS * 1000, POLL_INTERVAL_MS);
+}
+
 export default function useCortexFollowUpPoll({
   conversationId,
   getMessages,
@@ -280,10 +290,11 @@ export default function useCortexFollowUpPoll({
   isSubmitting?: boolean;
 }) {
   const queryClient = useQueryClient();
-  const graceStartRef = useRef<number | null>(null);
+  const listenWindowStartRef = useRef<number | null>(null);
   const sawActiveRef = useRef(false);
   const isSubmittingRef = useRef<boolean>(false);
   const targetParentRef = useRef<string | null>(null);
+  const expiredCortexTargetRef = useRef<string | null>(null);
   const toolCallbackTargetRef = useRef<string | null>(null);
   const toolCallbackExpiredTargetRef = useRef<string | null>(null);
   const toolCallbackGraceStartRef = useRef<number | null>(null);
@@ -323,36 +334,29 @@ export default function useCortexFollowUpPoll({
 
       // While submitting, SSE is the source of truth for the in-flight message.
       // Avoid any polling/refetching that could clobber the client-only placeholder `${userMessageId}_`.
-      // Also, do not consume the grace-period budget while the stream is still active.
+      // Also, do not consume the browser-listening window while the stream is still active.
       if (submitting) {
         if (active || recentLatestCortex) {
-          sawActiveRef.current = true;
-          if (latestCortexMessageId) {
+          if (latestCortexMessageId && latestCortexMessageId !== expiredCortexTargetRef.current) {
+            sawActiveRef.current = true;
             targetParentRef.current = latestCortexMessageId;
+            listenWindowStartRef.current = null;
           }
-          graceStartRef.current = null;
         } else if (sawActiveRef.current && !followUpForExistingTarget) {
-          // Pause grace until the stream ends.
-          graceStartRef.current = null;
+          // Start the browser listening window only after the stream ends.
+          listenWindowStartRef.current = null;
         }
         return;
       }
 
-      if (active) {
+      if (
+        !sawActiveRef.current &&
+        latestCortexMessageId &&
+        latestCortexMessageId !== expiredCortexTargetRef.current &&
+        (active || recentLatestCortex)
+      ) {
         sawActiveRef.current = true;
-        if (latestCortexMessageId) {
-          targetParentRef.current = latestCortexMessageId;
-        }
-        graceStartRef.current = null;
-        queryClient.invalidateQueries([QueryKeys.messages, conversationId]);
-        return;
-      }
-
-      if (!sawActiveRef.current && recentLatestCortex) {
-        sawActiveRef.current = true;
-        if (latestCortexMessageId) {
-          targetParentRef.current = latestCortexMessageId;
-        }
+        targetParentRef.current = latestCortexMessageId;
       }
 
       if (!sawActiveRef.current) {
@@ -386,6 +390,27 @@ export default function useCortexFollowUpPoll({
         return;
       }
 
+      if (listenWindowStartRef.current == null) {
+        listenWindowStartRef.current = Date.now();
+      }
+      const backgroundFollowUpWindowMs = getBackgroundFollowUpWindowMs(queryClient);
+      const listenWindowElapsedMs = Date.now() - listenWindowStartRef.current;
+      if (listenWindowElapsedMs >= backgroundFollowUpWindowMs) {
+        expiredCortexTargetRef.current = targetParentRef.current;
+        sawActiveRef.current = false;
+        listenWindowStartRef.current = null;
+        targetParentRef.current = null;
+        return;
+      }
+
+      if (active) {
+        if (latestCortexMessageId) {
+          targetParentRef.current = latestCortexMessageId;
+        }
+        queryClient.invalidateQueries([QueryKeys.messages, conversationId]);
+        return;
+      }
+
       if (!targetParentRef.current && latestCortexMessageId) {
         targetParentRef.current = latestCortexMessageId;
       }
@@ -395,50 +420,29 @@ export default function useCortexFollowUpPoll({
         ? followUpParentIds.has(currentTargetParentId)
         : false;
 
-      // All cortices resolved: keep polling briefly to catch the follow-up message (if any)
-      if (followUpForTarget) {
+      // The decision record is written before a visible follow-up is saved. Therefore `persisted`
+      // remains pending here; only visible or terminal-silent state ends browser listening early.
+      if (
+        followUpForTarget ||
+        hasPromotedFollowUp(messages, currentTargetParentId) ||
+        hasTerminalSilentFollowUpDecision(messages, currentTargetParentId)
+      ) {
+        expiredCortexTargetRef.current = currentTargetParentId;
         sawActiveRef.current = false;
-        graceStartRef.current = null;
+        listenWindowStartRef.current = null;
         targetParentRef.current = null;
         return;
       }
 
-      if (isResolvedDeferredCortexMessage(messages, targetParentRef.current)) {
-        if (graceStartRef.current == null) {
-          graceStartRef.current = Date.now();
-        }
-        const elapsed = Date.now() - graceStartRef.current;
-        if (elapsed < FOLLOW_UP_GRACE_MS) {
-          queryClient.invalidateQueries([QueryKeys.messages, conversationId]);
-          return;
-        }
-
-        sawActiveRef.current = false;
-        graceStartRef.current = null;
-        targetParentRef.current = null;
-        return;
-      }
-
-      if (graceStartRef.current == null) {
-        graceStartRef.current = Date.now();
-      }
-      const elapsed = Date.now() - graceStartRef.current;
-      if (elapsed < FOLLOW_UP_GRACE_MS) {
-        queryClient.invalidateQueries([QueryKeys.messages, conversationId]);
-        return;
-      }
-
-      // Stop after grace period (covers the suppression case: user sent newer input)
-      sawActiveRef.current = false;
-      graceStartRef.current = null;
-      targetParentRef.current = null;
+      queryClient.invalidateQueries([QueryKeys.messages, conversationId]);
     }, POLL_INTERVAL_MS);
 
     return () => {
       window.clearInterval(interval);
       sawActiveRef.current = false;
-      graceStartRef.current = null;
+      listenWindowStartRef.current = null;
       targetParentRef.current = null;
+      expiredCortexTargetRef.current = null;
       toolCallbackTargetRef.current = null;
       toolCallbackExpiredTargetRef.current = null;
       toolCallbackGraceStartRef.current = null;

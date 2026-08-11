@@ -39,6 +39,16 @@ const BaseOptionsSchema = z.object({
    * === VIVENTIUM END === */
   viventiumRequestContext: z.boolean().optional(),
   /* === VIVENTIUM START ===
+   * Security: Server-managed request audience for private local integrations.
+   * Purpose: Declare access structurally so common MCP loading can fail closed without matching
+   * server names, tool names, prompts, providers, or individual users.
+   * === VIVENTIUM END === */
+  viventiumAccess: z
+    .object({
+      audience: z.enum(['authenticated', 'local_owner']),
+    })
+    .optional(),
+  /* === VIVENTIUM START ===
    * Feature: GlassHive autonomous MCP capability broker policy.
    * Purpose: Let reviewed Viventium-managed MCP server configs opt into projection through the
    * GlassHive capability broker without allowing user-created MCP configs to self-authorize.
@@ -49,9 +59,7 @@ const BaseOptionsSchema = z.object({
       permitsAutonomousWorker: z.boolean().optional(),
       hostAllowed: z.boolean().optional(),
       sandboxAllowed: z.boolean().optional(),
-      defaultToolAccess: z
-        .enum(['none', 'read_metadata', 'content_read', 'write'])
-        .optional(),
+      defaultToolAccess: z.enum(['none', 'read_metadata', 'content_read', 'write']).optional(),
       contentReadPolicy: z
         .enum(['deny', 'require_broker_grant', 'require_explicit_intent', 'allow'])
         .optional(),
@@ -269,6 +277,7 @@ const omitServerManagedFields = <T extends z.ZodObject<z.ZodRawShape>>(schema: T
     chatMenu: true,
     serverInstructions: true,
     viventiumRequestContext: true,
+    viventiumAccess: true,
     viventiumGlassHive: true,
     viventiumOAuthConnection: true,
     requiresOAuth: true,

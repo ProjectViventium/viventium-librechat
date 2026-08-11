@@ -7,19 +7,27 @@ const DEFAULT_MODELS = {
   groq: 'qwen/qwen3.6-27b',
 };
 
+const MAIN_AGENT_ID = 'agent_viventium_main_95aeb3';
+const GLASSHIVE_MAIN_PROVIDER = 'glasshive-harness';
+const GLASSHIVE_MAIN_MODEL = 'codex-cli:gpt-5.6-sol';
+const GLASSHIVE_MAIN_REASONING_EFFORT = 'medium';
+const GLASSHIVE_FALLBACK_MODEL = 'claude-code:opus';
+const DIRECT_ANTHROPIC_FALLBACK_MODEL = DEFAULT_MODELS.anthropic;
+const DIRECT_OPENAI_FALLBACK_MODEL = 'gpt-5.6-sol';
+
 const APPROVED_MAIN_RUNTIME_FAMILIES = new Set([
+  `${GLASSHIVE_MAIN_PROVIDER}::${GLASSHIVE_MAIN_MODEL}`,
   'openAI::gpt-5.6-sol',
   'anthropic::claude-opus-5',
   'anthropic::claude-opus-4-8',
-  'glasshive-harness::codex-cli:gpt-5.6-sol',
 ]);
 
 const APPROVED_BACKGROUND_RUNTIME_FAMILIES = new Set([
+  `${GLASSHIVE_MAIN_PROVIDER}::${GLASSHIVE_MAIN_MODEL}`,
   'openAI::gpt-5.6-sol',
   'openAI::gpt-5.6-terra',
   'anthropic::claude-opus-5',
   'anthropic::claude-opus-4-8',
-  'glasshive-harness::codex-cli:gpt-5.6-sol',
 ]);
 
 const APPROVED_BACKGROUND_ACTIVATION_FAMILIES = new Set([
@@ -66,18 +74,22 @@ const TOOL_RUNTIME_GATES = Object.freeze([
  * === VIVENTIUM NOTE === */
 const DEFAULT_VOICE_MODELS = {
   openAI: 'gpt-4o-mini',
-  anthropic: 'claude-sonnet-4-5',
+  anthropic: 'claude-opus-5',
   xai: 'grok-4.20-non-reasoning',
 };
 
 const AGENT_RUNTIME_ENV_BY_ID = {
-  agent_viventium_main_95aeb3: {
+  [MAIN_AGENT_ID]: {
     providerEnv: 'VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER',
     modelEnv: 'VIVENTIUM_FC_CONSCIOUS_LLM_MODEL',
   },
   agent_viventium_background_analysis_95aeb3: {
     providerEnv: 'VIVENTIUM_CORTEX_BACKGROUND_ANALYSIS_LLM_PROVIDER',
     modelEnv: 'VIVENTIUM_CORTEX_BACKGROUND_ANALYSIS_LLM_MODEL',
+  },
+  agent_viventium_deep_memory_95aeb3: {
+    providerEnv: 'VIVENTIUM_CORTEX_DEEP_MEMORY_LLM_PROVIDER',
+    modelEnv: 'VIVENTIUM_CORTEX_DEEP_MEMORY_LLM_MODEL',
   },
   agent_viventium_confirmation_bias_95aeb3: {
     providerEnv: 'VIVENTIUM_CORTEX_CONFIRMATION_BIAS_LLM_PROVIDER',
@@ -143,6 +155,15 @@ const CANONICAL_BUILT_IN_BACKGROUND_MODEL_PARAMETERS = Object.freeze({
       useResponsesApi: true,
     }),
     'glasshive-harness': Object.freeze({ reasoning_effort: 'medium' }),
+  }),
+  agent_viventium_deep_memory_95aeb3: Object.freeze({
+    'glasshive-harness': Object.freeze({
+      reasoning_effort: 'medium',
+    }),
+    openAI: Object.freeze({
+      reasoning_effort: 'medium',
+      useResponsesApi: true,
+    }),
   }),
   agent_viventium_confirmation_bias_95aeb3: Object.freeze({
     openAI: Object.freeze({
@@ -447,6 +468,46 @@ function canonicalBuiltInModelParameters(agentId, provider, incomingParameters =
   return canonical;
 }
 
+function isGlassHiveMainFamily(provider, model) {
+  return (
+    normalizeProvider(provider) === GLASSHIVE_MAIN_PROVIDER &&
+    String(model || '').trim() === GLASSHIVE_MAIN_MODEL
+  );
+}
+
+function shouldPreserveExplicitGlassHiveMain(agent, { env = process.env } = {}) {
+  return (
+    agent?.id === MAIN_AGENT_ID &&
+    envFlagEnabled('START_GLASSHIVE', { env }) &&
+    isGlassHiveMainFamily(agent.provider, agent.model)
+  );
+}
+
+function rewriteBuiltInFallbackForRuntime(agent, { env = process.env } = {}) {
+  if (
+    (agent?.id !== MAIN_AGENT_ID && !BUILT_IN_BACKGROUND_AGENT_IDS.includes(agent?.id)) ||
+    normalizeProvider(agent.fallback_llm_provider) !== GLASSHIVE_MAIN_PROVIDER ||
+    String(agent.fallback_llm_model || '').trim() !== GLASSHIVE_FALLBACK_MODEL ||
+    envFlagEnabled('START_GLASSHIVE', { env })
+  ) {
+    return agent;
+  }
+
+  const primaryProvider = normalizeProvider(agent.provider);
+  const primaryModel = String(agent.model || '').trim();
+  const directFallback =
+    primaryProvider === 'anthropic' && primaryModel === DIRECT_ANTHROPIC_FALLBACK_MODEL
+      ? { provider: 'openAI', model: DIRECT_OPENAI_FALLBACK_MODEL }
+      : { provider: 'anthropic', model: DIRECT_ANTHROPIC_FALLBACK_MODEL };
+
+  return {
+    ...agent,
+    fallback_llm_provider: directFallback.provider,
+    fallback_llm_model: directFallback.model,
+    fallback_llm_model_parameters: { model: directFallback.model },
+  };
+}
+
 function rewriteAgentForRuntime(
   agent,
   { env = process.env, capabilityRequiredProviders = [] } = {},
@@ -463,15 +524,21 @@ function rewriteAgentForRuntime(
         .filter(Boolean),
     );
     const sourceProvider = normalizeProvider(rewritten.provider);
-    const assignment = requiredProviders.has(sourceProvider)
+    const preserveRequiredProvider = requiredProviders.has(sourceProvider);
+    const assignment = preserveRequiredProvider
       ? null
-      : readRuntimeAssignment({
-          env,
-          ...envMap,
-          fallbackProvider: rewritten.provider,
-          fallbackModel: rewritten.model,
-          approvedFamilies: approvedRuntimeFamiliesForAgent(rewritten.id, { env }),
-        });
+      : shouldPreserveExplicitGlassHiveMain(rewritten, { env })
+        ? {
+            provider: GLASSHIVE_MAIN_PROVIDER,
+            model: GLASSHIVE_MAIN_MODEL,
+          }
+        : readRuntimeAssignment({
+            env,
+            ...envMap,
+            fallbackProvider: rewritten.provider,
+            fallbackModel: rewritten.model,
+            approvedFamilies: approvedRuntimeFamiliesForAgent(rewritten.id, { env }),
+          });
     if (assignment) {
       rewritten.provider = assignment.provider;
       rewritten.model = assignment.model;
@@ -533,6 +600,7 @@ function rewriteAgentForRuntime(
       rewritten.voice_fallback_llm_model = null;
     }
   }
+  rewritten = rewriteBuiltInFallbackForRuntime(rewritten, { env });
   rewritten = pruneUnavailableTools(rewritten, { env });
   return rewritten;
 }
@@ -543,6 +611,20 @@ function rewriteBackgroundCortices(backgroundCortices, { env = process.env } = {
   }
   return backgroundCortices.map((cortex) => {
     if (!cortex || !cortex.agent_id || !cortex.activation) {
+      return cortex;
+    }
+    /* === VIVENTIUM START ===
+     * Feature: Unconditional background-cortex activation.
+     * Purpose: Runtime provider normalization must not invent classifier fields for modes that do
+     * not invoke a classifier. The enabled switch remains the master off switch.
+     * === VIVENTIUM END === */
+    const activationMode =
+      cortex.activation.enabled === false || cortex.activation.mode === 'disabled'
+        ? 'disabled'
+        : cortex.activation.mode === 'always'
+          ? 'always'
+          : 'classified';
+    if (activationMode !== 'classified') {
       return cortex;
     }
     const envMap = ACTIVATION_RUNTIME_ENV_BY_AGENT_ID[cortex.agent_id];
@@ -849,6 +931,8 @@ module.exports = {
   envFlagEnabled,
   toolAvailableAtRuntime,
   pruneUnavailableTools,
+  rewriteBuiltInFallbackForRuntime,
+  rewriteBuiltInMainFallbackForRuntime: rewriteBuiltInFallbackForRuntime,
   readRuntimeAssignment,
   readVoiceAssignment,
   rewriteAgentForRuntime,

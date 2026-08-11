@@ -19,6 +19,7 @@ const {
   applyHostEvidenceBoundaryInstructions,
   attachDeclaredConversationProviderCapabilityBundle,
   attachConversationProviderCapabilityBundle,
+  installConversationProviderCapabilityRefresher,
   bindConversationProviderDeveloperInstructionTail,
   bindHarnessCancellation,
   buildHarnessAgentIdempotencyKeys,
@@ -890,6 +891,273 @@ describe('GlassHiveConversationProviderService', () => {
       .digest('hex');
     expect(headers['X-GlassHive-Bootstrap-Signature']).toBe(`sha256=${expected}`);
   });
+
+  test('regenerates the complete signed bundle and broker grant after 301 and 601 seconds', async () => {
+    jest.useFakeTimers().setSystemTime(new Date('2026-08-10T18:52:15.000Z'));
+    try {
+      buildConversationProviderBootstrapBundle.mockImplementation(async () => {
+        const issuedAt = Math.floor(Date.now() / 1000);
+        return {
+          glasshive_capability_broker: {
+            grant_token: `synthetic-grant-${issuedAt}`,
+            grant: { iat: issuedAt, exp: issuedAt + 600 },
+          },
+          conversation_provider_instructions: 'Use the freshly authorized host capability.',
+        };
+      });
+      const targetAgent = {
+        id: 'agent-synthetic',
+        toolRegistry: new Map([['file_search', { name: 'file_search' }]]),
+        tool_resources: { file_search: { files: [{ file_id: 'synthetic-file' }] } },
+        model_parameters: { configuration: { defaultHeaders: { 'X-Existing': 'kept' } } },
+      };
+      const args = {
+        targetAgent,
+        declaredAgent: { id: 'agent-synthetic', tools: ['file_search'] },
+        req: {
+          user: { id: 'user-synthetic' },
+          body: { conversationId: 'conversation-synthetic', messageId: 'message-synthetic' },
+        },
+        capability: {
+          workspace_binding: true,
+          host_tools_transport: 'broker_mcp',
+          host_tools: ['file_search'],
+        },
+      };
+
+      await expect(attachConversationProviderCapabilityBundle(args)).resolves.toBe(true);
+      expect(installConversationProviderCapabilityRefresher(args)).toBe(true);
+      const descriptor = Object.getOwnPropertyDescriptor(
+        targetAgent,
+        'viventiumConversationProviderCapabilityRefresh',
+      );
+      expect(descriptor).toMatchObject({ enumerable: false, writable: false });
+      const initialHeaders = { ...targetAgent.model_parameters.configuration.defaultHeaders };
+
+      jest.setSystemTime(new Date('2026-08-10T18:57:16.000Z'));
+      const after301 = await descriptor.value();
+      jest.setSystemTime(new Date('2026-08-10T19:02:16.000Z'));
+      const after601 = await descriptor.value();
+
+      const decode = (headers) =>
+        JSON.parse(Buffer.from(headers['X-GlassHive-Bootstrap-Bundle-B64'], 'base64').toString());
+      const refreshedHeaders = [initialHeaders, after301.defaultHeaders, after601.defaultHeaders];
+      for (const headers of refreshedHeaders) {
+        const expectedSignature = crypto
+          .createHmac('sha256', 'synthetic-bundle-secret')
+          .update(
+            `v1\n${headers['X-GlassHive-Bootstrap-Timestamp']}\n${headers['X-GlassHive-Bootstrap-Bundle-B64']}`,
+          )
+          .digest('hex');
+        expect(headers['X-GlassHive-Bootstrap-Signature']).toBe(`sha256=${expectedSignature}`);
+      }
+      expect([
+        initialHeaders['X-GlassHive-Bootstrap-Timestamp'],
+        after301.defaultHeaders['X-GlassHive-Bootstrap-Timestamp'],
+        after601.defaultHeaders['X-GlassHive-Bootstrap-Timestamp'],
+      ]).toEqual(['1786387935', '1786388236', '1786388536']);
+      expect([
+        decode(initialHeaders).glasshive_capability_broker.grant_token,
+        decode(after301.defaultHeaders).glasshive_capability_broker.grant_token,
+        decode(after601.defaultHeaders).glasshive_capability_broker.grant_token,
+      ]).toEqual([
+        'synthetic-grant-1786387935',
+        'synthetic-grant-1786388236',
+        'synthetic-grant-1786388536',
+      ]);
+      expect(decode(after601.defaultHeaders).glasshive_capability_broker.grant.exp).toBe(
+        1786389136,
+      );
+      expect(
+        new Set(refreshedHeaders.map((headers) => headers['X-GlassHive-Bootstrap-Signature'])).size,
+      ).toBe(3);
+      expect(after601.defaultHeaders['X-Existing']).toBe('kept');
+      expect(primeFiles).toHaveBeenCalledTimes(3);
+      expect(JSON.stringify(targetAgent)).not.toContain(
+        'viventiumConversationProviderCapabilityRefresh',
+      );
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('keeps one exact first-message scope across primary, fallback, and delayed re-entry bundles', async () => {
+    const originalEnabled = process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_ENABLED;
+    const originalTtl = process.env.VIVENTIUM_GLASSHIVE_PROVIDER_BROKER_TTL_SECONDS;
+    process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_ENABLED = 'true';
+    process.env.VIVENTIUM_GLASSHIVE_PROVIDER_BROKER_TTL_SECONDS = '600';
+    jest.useFakeTimers().setSystemTime(new Date('2026-08-10T18:52:15.000Z'));
+    try {
+      const actualBootstrap = jest.requireActual('../GlassHiveCapabilityBootstrapService');
+      const { verifyBrokerGrant } = jest.requireActual('../GlassHiveCapabilityBrokerAuth');
+      buildConversationProviderBootstrapBundle.mockImplementation((args) =>
+        actualBootstrap.buildConversationProviderBootstrapBundle(args),
+      );
+      const requestBody = {
+        messageId: 'user-msg-foreground-1',
+        parentMessageId: '00000000-0000-0000-0000-000000000000',
+      };
+      const capability = {
+        workspace_binding: true,
+        host_tools_transport: 'broker_mcp',
+        host_tools: ['synthetic_lookup'],
+      };
+      const buildArgs = (id) => {
+        const targetAgent = {
+          id,
+          toolRegistry: new Map([['synthetic_lookup', { name: 'synthetic_lookup' }]]),
+          model_parameters: { configuration: { defaultHeaders: {} } },
+        };
+        return {
+          targetAgent,
+          declaredAgent: { id, tools: ['synthetic_lookup'] },
+          req: { user: { id: 'user-synthetic' }, body: requestBody },
+          capability,
+        };
+      };
+      const primaryArgs = buildArgs('agent-primary-synthetic');
+      const fallbackArgs = buildArgs('agent-fallback-synthetic');
+
+      await expect(attachConversationProviderCapabilityBundle(primaryArgs)).resolves.toBe(true);
+      expect(installConversationProviderCapabilityRefresher(primaryArgs)).toBe(true);
+      await expect(attachConversationProviderCapabilityBundle(fallbackArgs)).resolves.toBe(true);
+      expect(installConversationProviderCapabilityRefresher(fallbackArgs)).toBe(true);
+
+      const initialPrimary = {
+        ...primaryArgs.targetAgent.model_parameters.configuration.defaultHeaders,
+      };
+      jest.setSystemTime(new Date('2026-08-10T18:57:16.000Z'));
+      const fallbackAttempt =
+        await fallbackArgs.targetAgent.viventiumConversationProviderCapabilityRefresh();
+      jest.setSystemTime(new Date('2026-08-10T19:02:17.000Z'));
+      const mainReentry =
+        await primaryArgs.targetAgent.viventiumConversationProviderCapabilityRefresh();
+
+      const refreshes = [
+        { role: 'primary', headers: initialPrimary },
+        { role: 'fallback', headers: fallbackAttempt.defaultHeaders },
+        { role: 'reentry', headers: mainReentry.defaultHeaders },
+      ];
+      const grants = refreshes.map(({ role, headers }) => {
+        const encodedBundle = headers['X-GlassHive-Bootstrap-Bundle-B64'];
+        const issuedAt = Number(headers['X-GlassHive-Bootstrap-Timestamp']);
+        const expectedSignature = crypto
+          .createHmac('sha256', 'synthetic-bundle-secret')
+          .update(`v1\n${issuedAt}\n${encodedBundle}`)
+          .digest('hex');
+        expect(headers['X-GlassHive-Bootstrap-Signature']).toBe(`sha256=${expectedSignature}`);
+        const bundle = JSON.parse(Buffer.from(encodedBundle, 'base64').toString());
+        const grant = verifyBrokerGrant(bundle.env.GLASSHIVE_CAPABILITY_BROKER_TOKEN, {
+          nowMs: issuedAt * 1000,
+          expectedUserId: 'user-synthetic',
+          requireTurnScope: true,
+        });
+        expect(grant).toMatchObject({
+          conversation_id: '',
+          parent_message_id: '',
+          message_id: 'user-msg-foreground-1',
+          turn_id: 'user-msg-foreground-1',
+        });
+        expect(grant.exp - grant.iat).toBe(600);
+        return { role, issuedAt, grantId: grant.grant_id };
+      });
+
+      expect(grants.map(({ issuedAt }) => issuedAt)).toEqual([1786387935, 1786388236, 1786388537]);
+      expect(new Set(grants.map(({ grantId }) => grantId)).size).toBe(3);
+      expect(primeFiles).not.toHaveBeenCalled();
+      expect(JSON.stringify(primaryArgs.targetAgent)).not.toContain(
+        'viventiumConversationProviderCapabilityRefresh',
+      );
+      expect(JSON.stringify(fallbackArgs.targetAgent)).not.toContain(
+        'viventiumConversationProviderCapabilityRefresh',
+      );
+    } finally {
+      jest.useRealTimers();
+      if (originalEnabled === undefined) {
+        delete process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_ENABLED;
+      } else {
+        process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_ENABLED = originalEnabled;
+      }
+      if (originalTtl === undefined) {
+        delete process.env.VIVENTIUM_GLASSHIVE_PROVIDER_BROKER_TTL_SECONDS;
+      } else {
+        process.env.VIVENTIUM_GLASSHIVE_PROVIDER_BROKER_TTL_SECONDS = originalTtl;
+      }
+    }
+  });
+
+  test('removes stale signed headers and replaces capability authority when refresh becomes unavailable', async () => {
+    buildConversationProviderBootstrapBundle
+      .mockResolvedValueOnce({
+        glasshive_capability_broker: { grant_token: 'synthetic-initial-grant' },
+        conversation_provider_instructions: 'Old authorized capability claim.',
+      })
+      .mockResolvedValueOnce({});
+    const targetAgent = {
+      model_parameters: { configuration: { defaultHeaders: { 'X-Existing': 'kept' } } },
+    };
+    const args = {
+      targetAgent,
+      declaredAgent: {
+        tools: [`search${Constants.mcp_delimiter}synthetic-server`],
+      },
+      req: { user: { id: 'user-synthetic' }, body: {} },
+      capability: { workspace_binding: true },
+    };
+
+    await expect(attachConversationProviderCapabilityBundle(args)).resolves.toBe(true);
+    expect(installConversationProviderCapabilityRefresher(args)).toBe(true);
+    const result = await targetAgent.viventiumConversationProviderCapabilityRefresh();
+
+    expect(result).toMatchObject({
+      attached: false,
+      previousInstructionAppend: 'Old authorized capability claim.',
+    });
+    expect(result.instructionAppend).toContain('host capability broker is unavailable');
+    expect(result.defaultHeaders).toEqual({ 'X-Existing': 'kept' });
+    expect(result.defaultHeaders).not.toHaveProperty('X-GlassHive-Bootstrap-Bundle-B64');
+    expect(result.defaultHeaders).not.toHaveProperty('X-GlassHive-Bootstrap-Timestamp');
+    expect(result.defaultHeaders).not.toHaveProperty('X-GlassHive-Bootstrap-Signature');
+  });
+
+  test.each(['policy-null', 'declaration-empty'])(
+    'clears prior capability authority when refresh has no projection: %s',
+    async (mode) => {
+      buildConversationProviderBootstrapBundle.mockResolvedValueOnce({
+        glasshive_capability_broker: { grant_token: 'synthetic-initial-grant' },
+        conversation_provider_instructions: 'Old authorized capability claim.',
+      });
+      if (mode === 'policy-null') {
+        buildConversationProviderBootstrapBundle.mockResolvedValueOnce(null);
+      }
+      const declaredAgent = {
+        tools: [`search${Constants.mcp_delimiter}synthetic-server`],
+      };
+      const targetAgent = {
+        model_parameters: { configuration: { defaultHeaders: {} } },
+      };
+      const args = {
+        targetAgent,
+        declaredAgent,
+        req: { user: { id: 'user-synthetic' }, body: {} },
+        capability: { workspace_binding: true },
+      };
+
+      await expect(attachConversationProviderCapabilityBundle(args)).resolves.toBe(true);
+      expect(installConversationProviderCapabilityRefresher(args)).toBe(true);
+      if (mode === 'declaration-empty') {
+        declaredAgent.tools = [];
+      }
+      const result = await targetAgent.viventiumConversationProviderCapabilityRefresh();
+
+      expect(result).toMatchObject({
+        attached: false,
+        previousInstructionAppend: 'Old authorized capability claim.',
+        instructionAppend: '',
+        defaultHeaders: {},
+      });
+    },
+  );
 
   test('keeps one Feeling tail and a signed capability bundle on a declared GlassHive fallback', async () => {
     buildConversationProviderBootstrapBundle.mockResolvedValue({

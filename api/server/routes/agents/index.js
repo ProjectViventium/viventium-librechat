@@ -191,7 +191,9 @@ router.get('/chat/stream/:streamId', async (req, res) => {
  * @returns { activeJobIds: string[] }
  */
 router.get('/chat/active', async (req, res) => {
-  const activeJobIds = await GenerationJobManager.getActiveJobIdsForUser(req.user.id);
+  const activeJobIds = GenerationJobManager.getActiveConversationIdsForUser
+    ? await GenerationJobManager.getActiveConversationIdsForUser(req.user.id)
+    : await GenerationJobManager.getActiveJobIdsForUser(req.user.id);
   res.json({ activeJobIds });
 });
 
@@ -204,8 +206,10 @@ router.get('/chat/active', async (req, res) => {
 router.get('/chat/status/:conversationId', async (req, res) => {
   const { conversationId } = req.params;
 
-  // streamId === conversationId, so we can use getJob directly
-  const job = await GenerationJobManager.getJob(conversationId);
+  const activeStreamId = GenerationJobManager.getActiveStreamIdForConversation
+    ? await GenerationJobManager.getActiveStreamIdForConversation(req.user.id, conversationId)
+    : conversationId;
+  const job = activeStreamId ? await GenerationJobManager.getJob(activeStreamId) : null;
 
   if (!job) {
     return res.json({ active: false });
@@ -217,12 +221,12 @@ router.get('/chat/status/:conversationId', async (req, res) => {
 
   // Get resume state which contains aggregatedContent
   // Avoid calling both getStreamInfo and getResumeState (both fetch content)
-  const resumeState = await GenerationJobManager.getResumeState(conversationId);
+  const resumeState = await GenerationJobManager.getResumeState(activeStreamId);
   const isActive = job.status === 'running';
 
   res.json({
     active: isActive,
-    streamId: conversationId,
+    streamId: activeStreamId,
     status: job.status,
     aggregatedContent: resumeState?.aggregatedContent ?? [],
     createdAt: job.createdAt,
@@ -250,6 +254,15 @@ router.post('/chat/abort', async (req, res) => {
     streamId || (conversationId !== 'new' ? conversationId : null) || abortKey?.split(':')[0];
   let job = jobStreamId ? await GenerationJobManager.getJob(jobStreamId) : null;
 
+  if (!job && conversationId && conversationId !== 'new' && userId) {
+    const activeConversationStreamId =
+      await GenerationJobManager.getActiveStreamIdForConversation?.(userId, conversationId);
+    if (activeConversationStreamId) {
+      jobStreamId = activeConversationStreamId;
+    }
+    job = jobStreamId ? await GenerationJobManager.getJob(jobStreamId) : null;
+  }
+
   // Fallback: if job not found and we have a userId, look up active jobs for user
   // This handles the case where frontend sends "new" but job was created with a UUID
   if (!job && userId) {
@@ -269,6 +282,18 @@ router.post('/chat/abort', async (req, res) => {
     if (job.metadata?.userId && job.metadata.userId !== userId) {
       logger.warn(`[AgentStream] Unauthorized abort attempt for ${jobStreamId} by user ${userId}`);
       return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    /* === VIVENTIUM START ===
+     * A completed Main response may retain a short-lived runtime solely for Phase B delivery.
+     * It is not an active generation and must never be abortable, because an abort persists the
+     * volatile stream buffer over the already-final assistant message.
+     * === VIVENTIUM END === */
+    if (job.status && job.status !== 'running') {
+      return res.status(409).json({
+        error: 'Generation is already complete',
+        streamId: jobStreamId,
+      });
     }
 
     logger.debug(`[AgentStream] Job found, aborting: ${jobStreamId}`);

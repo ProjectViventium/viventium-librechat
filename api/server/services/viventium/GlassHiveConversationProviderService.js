@@ -444,6 +444,103 @@ function applyHostEvidenceBoundaryInstructions(targetAgent, unavailableHostTools
 
 const BROKER_UNAVAILABLE_START = '<viventium_capability_broker_unavailable>';
 const BROKER_UNAVAILABLE_END = '</viventium_capability_broker_unavailable>';
+const CONVERSATION_PROVIDER_INSTRUCTION_APPEND = 'viventiumConversationProviderInstructionAppend';
+const CONVERSATION_PROVIDER_CAPABILITY_REFRESH = 'viventiumConversationProviderCapabilityRefresh';
+const BOOTSTRAP_HEADER_NAMES = Object.freeze([
+  'X-GlassHive-Bootstrap-Bundle-B64',
+  'X-GlassHive-Bootstrap-Timestamp',
+  'X-GlassHive-Bootstrap-Signature',
+]);
+
+function setConversationProviderInstructionAppend(targetAgent, instructions) {
+  if (!targetAgent || typeof targetAgent !== 'object') {
+    return;
+  }
+  Object.defineProperty(targetAgent, CONVERSATION_PROVIDER_INSTRUCTION_APPEND, {
+    value: String(instructions || '').trim(),
+    configurable: true,
+    enumerable: false,
+    writable: false,
+  });
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Invocation-fresh conversation-provider authority.
+ * Purpose: Graph initialization can precede a later participant re-entry by more than the
+ * provider's 300-second bootstrap-signature window. Keep the short replay defense intact by
+ * rebuilding the complete signed bundle and broker grant immediately before an actual model
+ * attempt. The runtime-only closure reuses already-resolved Agent capability/resource state; it
+ * never reloads ToolService/MCPs and cannot enter Agent serialization or persistence.
+ * Added: 2026-08-10
+ * === VIVENTIUM END === */
+function removeBootstrapBundleHeaders(targetAgent) {
+  const modelParameters = targetAgent?.model_parameters;
+  const configuration = modelParameters?.configuration;
+  const currentHeaders = configuration?.defaultHeaders;
+  if (!currentHeaders || typeof currentHeaders !== 'object') {
+    return;
+  }
+  const defaultHeaders = { ...currentHeaders };
+  for (const headerName of BOOTSTRAP_HEADER_NAMES) {
+    delete defaultHeaders[headerName];
+  }
+  targetAgent.model_parameters = {
+    ...modelParameters,
+    configuration: { ...configuration, defaultHeaders },
+  };
+}
+
+function capabilityRefreshResult(targetAgent, attached, previousInstructionAppend = '') {
+  return Object.freeze({
+    attached: attached === true,
+    defaultHeaders: Object.freeze({
+      ...(targetAgent?.model_parameters?.configuration?.defaultHeaders || {}),
+    }),
+    instructionAppend: String(targetAgent?.[CONVERSATION_PROVIDER_INSTRUCTION_APPEND] || '').trim(),
+    previousInstructionAppend: String(previousInstructionAppend || '').trim(),
+  });
+}
+
+function installConversationProviderCapabilityRefresher({
+  targetAgent,
+  declaredAgent = targetAgent,
+  capabilitySourceAgent = targetAgent,
+  req,
+  capability,
+  requestBody = req?.body || {},
+} = {}) {
+  const declaredProvider = resolveConversationProviderId(declaredAgent);
+  const resolvedCapability =
+    capability ?? req?.config?.endpoints?.agents?.providerCapabilities?.[declaredProvider];
+  if (!targetAgent || resolvedCapability?.workspace_binding !== true) {
+    return false;
+  }
+  const refresh = async () => {
+    const previousInstructionAppend = String(
+      targetAgent?.[CONVERSATION_PROVIDER_INSTRUCTION_APPEND] || '',
+    ).trim();
+    const attached = await attachConversationProviderCapabilityBundle({
+      targetAgent,
+      declaredAgent,
+      capabilitySourceAgent,
+      req,
+      capability: resolvedCapability,
+      requestBody,
+    });
+    if (!attached) {
+      // Never leave a previously valid but now expired bundle on the next provider attempt.
+      removeBootstrapBundleHeaders(targetAgent);
+    }
+    return capabilityRefreshResult(targetAgent, attached, previousInstructionAppend);
+  };
+  Object.defineProperty(targetAgent, CONVERSATION_PROVIDER_CAPABILITY_REFRESH, {
+    value: refresh,
+    configurable: true,
+    enumerable: false,
+    writable: false,
+  });
+  return true;
+}
 
 function applyCapabilityBrokerUnavailableInstructions(targetAgent, unavailable = true) {
   if (!targetAgent) {
@@ -526,6 +623,7 @@ async function resolveHostToolCapabilityState({ targetAgent, capability, req } =
 async function attachDeclaredConversationProviderCapabilityBundle({
   targetAgent,
   declaredAgent = targetAgent,
+  capabilitySourceAgent = targetAgent,
   req,
   requestBody = req?.body || {},
   resolveAgentById,
@@ -535,6 +633,7 @@ async function attachDeclaredConversationProviderCapabilityBundle({
   return attachConversationProviderCapabilityBundle({
     targetAgent,
     declaredAgent,
+    capabilitySourceAgent,
     req,
     capability,
     requestBody,
@@ -545,6 +644,7 @@ async function attachDeclaredConversationProviderCapabilityBundle({
 async function attachConversationProviderCapabilityBundle({
   targetAgent,
   declaredAgent = targetAgent,
+  capabilitySourceAgent = targetAgent,
   req,
   capability,
   requestBody = req?.body || {},
@@ -558,7 +658,7 @@ async function attachConversationProviderCapabilityBundle({
   }
   const allowedServerNames = declaredMcpServerNames(declaredAgent, capability.excluded_mcp_servers);
   const hostToolCapabilityState = await resolveHostToolCapabilityState({
-    targetAgent,
+    targetAgent: capabilitySourceAgent,
     capability,
     req,
   });
@@ -567,6 +667,7 @@ async function attachConversationProviderCapabilityBundle({
     hostToolCapabilityState.unavailableHostTools,
   );
   if (allowedServerNames.length === 0 && hostToolCapabilityState.authorizedHostTools.length === 0) {
+    setConversationProviderInstructionAppend(targetAgent, unavailableInstructions);
     return false;
   }
   // Load the broker boundary only when an Agent actually resolves an eligible capability. This
@@ -587,14 +688,29 @@ async function attachConversationProviderCapabilityBundle({
     logger.warn('[VIVENTIUM][glasshive-capability-broker] Provider bundle build failed', {
       message: error?.message,
     });
-    applyCapabilityBrokerUnavailableInstructions(targetAgent, true);
+    const brokerUnavailableInstructions = applyCapabilityBrokerUnavailableInstructions(
+      targetAgent,
+      true,
+    );
+    setConversationProviderInstructionAppend(
+      targetAgent,
+      [unavailableInstructions, brokerUnavailableInstructions].filter(Boolean).join('\n\n'),
+    );
     return false;
   }
   if (bundle == null) {
+    setConversationProviderInstructionAppend(targetAgent, unavailableInstructions);
     return false;
   }
   if (!bundle || Object.keys(bundle).length === 0) {
-    applyCapabilityBrokerUnavailableInstructions(targetAgent, true);
+    const brokerUnavailableInstructions = applyCapabilityBrokerUnavailableInstructions(
+      targetAgent,
+      true,
+    );
+    setConversationProviderInstructionAppend(
+      targetAgent,
+      [unavailableInstructions, brokerUnavailableInstructions].filter(Boolean).join('\n\n'),
+    );
     return false;
   }
   const capabilityInstructions = [
@@ -615,7 +731,14 @@ async function attachConversationProviderCapabilityBundle({
     logger.warn('[VIVENTIUM][glasshive-capability-broker] Provider bundle signing failed', {
       message: error?.message,
     });
-    applyCapabilityBrokerUnavailableInstructions(targetAgent, true);
+    const brokerUnavailableInstructions = applyCapabilityBrokerUnavailableInstructions(
+      targetAgent,
+      true,
+    );
+    setConversationProviderInstructionAppend(
+      targetAgent,
+      [unavailableInstructions, brokerUnavailableInstructions].filter(Boolean).join('\n\n'),
+    );
     return false;
   }
   applyCapabilityBrokerUnavailableInstructions(targetAgent, false);
@@ -625,6 +748,7 @@ async function attachConversationProviderCapabilityBundle({
       ? currentInstructions
       : [currentInstructions, capabilityInstructions].filter(Boolean).join('\n\n');
   }
+  setConversationProviderInstructionAppend(targetAgent, capabilityInstructions);
   defaultHeaders['X-GlassHive-Bootstrap-Bundle-B64'] = encodedBundle;
   defaultHeaders['X-GlassHive-Bootstrap-Timestamp'] = issuedAt;
   defaultHeaders['X-GlassHive-Bootstrap-Signature'] = signature;
@@ -646,6 +770,7 @@ module.exports = {
   configuredBrokerHostTools,
   buildHarnessIdempotencyKey,
   declaredMcpServerNames,
+  installConversationProviderCapabilityRefresher,
   resolveHostToolCapabilityState,
   resolvedHostToolNames,
   resolvedHostToolResources,

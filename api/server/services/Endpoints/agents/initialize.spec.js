@@ -14,6 +14,13 @@ const mockLoadAgentTools = jest.fn();
 const mockLoadToolsForExecution = jest.fn();
 const mockProcessAddedConvo = jest.fn();
 const mockGetDefaultHandlers = jest.fn();
+const mockValidateAgentModel = jest.fn();
+const mockResolveFallbackCandidates = jest.fn();
+const mockIsFallbackModelValid = jest.fn();
+const mockBuildFallbackAgent = jest.fn();
+const mockIsSameAgentRoute = jest.fn();
+const mockInitializePrimaryAgentWithFallback = jest.fn();
+const mockPrimeFiles = jest.fn(async () => ({ files: [], toolContext: '' }));
 
 jest.mock('@librechat/data-schemas', () => ({
   logger: {
@@ -57,7 +64,7 @@ jest.mock('@librechat/api', () => ({
   filterOrphanedEdges: jest.fn((edges) => edges),
   getCustomEndpointConfig: jest.fn(() => ({})),
   initializeAgent: (...args) => mockInitializeAgent(...args),
-  validateAgentModel: jest.fn(async () => ({ isValid: true })),
+  validateAgentModel: (...args) => mockValidateAgentModel(...args),
 }));
 
 jest.mock('librechat-data-provider', () => {
@@ -132,16 +139,12 @@ jest.mock('~/server/services/viventium/voiceLlmOverride', () => ({
   isVoiceCallActive: jest.fn(() => false),
 }));
 jest.mock('~/server/services/viventium/agentLlmFallback', () => ({
-  buildFallbackAgent: jest.fn(),
+  buildFallbackAgent: (...args) => mockBuildFallbackAgent(...args),
   inheritResolvedAgentGraph: jest.fn(),
-  initializePrimaryAgentWithFallback: jest.fn(async ({ primaryAgent, initializePrimary }) => ({
-    config: await initializePrimary(),
-    effectiveAgent: primaryAgent,
-    fallbackUsed: false,
-  })),
-  isFallbackModelValid: jest.fn(() => true),
-  isSameAgentRoute: jest.fn(() => false),
-  resolveFallbackCandidates: jest.fn(() => []),
+  initializePrimaryAgentWithFallback: (...args) => mockInitializePrimaryAgentWithFallback(...args),
+  isFallbackModelValid: (...args) => mockIsFallbackModelValid(...args),
+  isSameAgentRoute: (...args) => mockIsSameAgentRoute(...args),
+  resolveFallbackCandidates: (...args) => mockResolveFallbackCandidates(...args),
 }));
 jest.mock('~/server/services/viventium/agentGraphResilience', () => ({
   appendOmittedCapabilityReadiness: jest.fn(),
@@ -163,7 +166,7 @@ jest.mock('~/server/services/viventium/GlassHiveCapabilityBootstrapService', () 
     mockBuildConversationProviderBootstrapBundle(...args),
 }));
 jest.mock('~/app/clients/tools/util/fileSearch', () => ({
-  primeFiles: jest.fn(async () => ({ files: [], toolContext: '' })),
+  primeFiles: (...args) => mockPrimeFiles(...args),
 }));
 
 const { initializeClient } = require('./initialize');
@@ -192,6 +195,8 @@ function makeRequest() {
             'glasshive-harness': {
               workspace_binding: true,
               excluded_mcp_servers: ['glasshive-workers-projects'],
+              host_tools_transport: 'broker_mcp',
+              host_tools: ['file_search'],
             },
           },
         },
@@ -239,10 +244,53 @@ describe('initializeClient handoff capability projection', () => {
     mockGetDefaultHandlers.mockImplementation(({ toolExecuteOptions }) => ({
       invokeSyntheticTool: (toolNames, agentId) => toolExecuteOptions.loadTools(toolNames, agentId),
     }));
+    mockValidateAgentModel.mockResolvedValue({ isValid: true });
+    mockResolveFallbackCandidates.mockReturnValue([]);
+    mockIsFallbackModelValid.mockReturnValue(true);
+    mockIsSameAgentRoute.mockReturnValue(false);
+    mockBuildFallbackAgent.mockImplementation((agent, assignment) => ({
+      ...agent,
+      endpoint: undefined,
+      provider: assignment.provider,
+      model: assignment.model,
+      model_parameters: {
+        ...agent.model_parameters,
+        model: assignment.model,
+      },
+    }));
+    mockInitializePrimaryAgentWithFallback.mockImplementation(
+      async ({
+        primaryAgent,
+        fallbackAgent,
+        fallbackAssignment,
+        initializePrimary,
+        initializeFallback,
+        signal,
+      }) => {
+        try {
+          return {
+            config: await initializePrimary(),
+            effectiveAgent: primaryAgent,
+            fallbackUsed: false,
+          };
+        } catch (error) {
+          if (signal?.aborted || !fallbackAgent || !fallbackAssignment || !initializeFallback) {
+            throw error;
+          }
+          return {
+            config: await initializeFallback(error),
+            effectiveAgent: fallbackAgent,
+            fallbackUsed: true,
+            primaryError: error,
+          };
+        }
+      },
+    );
     process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = 'synthetic-bundle-secret';
     mockBuildConversationProviderBootstrapBundle.mockResolvedValue({
       glasshive_capability_broker: { allowed_servers: ['synthetic-connected-account'] },
     });
+    mockPrimeFiles.mockResolvedValue({ files: [], toolContext: '' });
   });
 
   afterAll(() => {
@@ -274,6 +322,12 @@ describe('initializeClient handoff capability projection', () => {
     expect(headers['X-GlassHive-Bootstrap-Bundle-B64']).toBeDefined();
     expect(headers['X-GlassHive-Bootstrap-Timestamp']).toMatch(/^\d+$/);
     expect(headers['X-GlassHive-Bootstrap-Signature']).toMatch(/^sha256=[a-f0-9]{64}$/);
+    expect(
+      Object.getOwnPropertyDescriptor(
+        initializedHandoff,
+        'viventiumConversationProviderCapabilityRefresh',
+      ),
+    ).toMatchObject({ enumerable: false, writable: false, value: expect.any(Function) });
     expect(initializedHandoff.viventiumHarnessCancellationEndpointConfig).toEqual({});
     expect(mockBuildConversationProviderBootstrapBundle).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -300,6 +354,7 @@ describe('initializeClient handoff capability projection', () => {
       'X-Existing': 'kept',
     });
     expect(mockBuildConversationProviderBootstrapBundle).not.toHaveBeenCalled();
+    expect(initializedHandoff.viventiumConversationProviderCapabilityRefresh).toBeUndefined();
   });
 
   test('marks unavailable workspace capabilities instead of attaching an empty handoff bundle', async () => {
@@ -408,5 +463,273 @@ describe('initializeClient handoff capability projection', () => {
     expect(req._viventiumHarnessExecutionEnabled).toBe(false);
     expect(req._viventiumHarnessActivityEnabled).toBe(false);
     expect(req._viventiumHarnessIdempotencyKey).toBeUndefined();
+  });
+
+  test('prepares the handoff own validated fallback as hidden graph runtime state without loading tools twice', async () => {
+    const handoffAgent = {
+      id: 'handoff-agent',
+      endpoint: 'openAI',
+      provider: 'openAI',
+      model: 'synthetic-primary-model',
+      tools: [`search${Constants.mcp_delimiter}synthetic-connected-account`],
+      fallback_llm_provider: 'glasshive-harness',
+      fallback_llm_model: 'synthetic-fallback-model',
+      edges: [],
+    };
+    const assignment = {
+      provider: 'glasshive-harness',
+      model: 'synthetic-fallback-model',
+      source: 'agent',
+      parametersField: 'fallback_llm_model_parameters',
+    };
+    mockResolveFallbackCandidates.mockImplementation((agent) =>
+      agent.id === handoffAgent.id ? [assignment] : [],
+    );
+
+    const { client } = await initializeWithHandoff(handoffAgent);
+    const initializedHandoff = client.options.agentConfigs.get(handoffAgent.id);
+    const fallbackRoutes = initializedHandoff.viventiumGraphLlmFallbacks;
+    const fallbackInitCall = mockInitializeAgent.mock.calls.find(
+      ([params]) => params.agent?.provider === assignment.provider,
+    );
+
+    expect(fallbackRoutes).toHaveLength(1);
+    expect(fallbackRoutes[0]).toMatchObject({
+      id: handoffAgent.id,
+      endpoint: assignment.provider,
+      provider: assignment.provider,
+      model: assignment.model,
+    });
+    expect(fallbackRoutes[0].model_parameters.configuration.defaultHeaders).toEqual(
+      expect.objectContaining({
+        'X-GlassHive-Bootstrap-Bundle-B64': expect.any(String),
+        'X-GlassHive-Bootstrap-Signature': expect.stringMatching(/^sha256=[a-f0-9]{64}$/),
+      }),
+    );
+    expect(fallbackRoutes[0].viventiumHarnessCancellationEndpointConfig).toEqual({});
+    expect(
+      Object.getOwnPropertyDescriptor(
+        fallbackRoutes[0],
+        'viventiumConversationProviderCapabilityRefresh',
+      ),
+    ).toMatchObject({ enumerable: false, writable: false, value: expect.any(Function) });
+    expect(
+      Object.prototype.propertyIsEnumerable.call(initializedHandoff, 'viventiumGraphLlmFallbacks'),
+    ).toBe(false);
+    expect(JSON.stringify(initializedHandoff)).not.toContain('viventiumGraphLlmFallbacks');
+    expect(fallbackInitCall?.[0].loadTools).toBeUndefined();
+    expect(mockInitializeAgent).toHaveBeenCalledTimes(3);
+    expect(mockResolveFallbackCandidates).toHaveBeenCalledWith(
+      expect.objectContaining({ id: handoffAgent.id }),
+      { isVoiceCall: false },
+    );
+  });
+
+  test('mints a tool-less fallback bundle from the initialized participant host authority', async () => {
+    const recallFile = { file_id: 'synthetic-file', filename: 'synthetic-evidence.txt' };
+    const handoffAgent = {
+      id: 'handoff-agent',
+      endpoint: 'openAI',
+      provider: 'openAI',
+      model: 'synthetic-primary-model',
+      tools: ['file_search'],
+      fallback_llm_provider: 'glasshive-harness',
+      fallback_llm_model: 'synthetic-fallback-model',
+      edges: [],
+    };
+    const assignment = {
+      provider: 'glasshive-harness',
+      model: 'synthetic-fallback-model',
+      source: 'agent',
+      parametersField: 'fallback_llm_model_parameters',
+    };
+    mockResolveFallbackCandidates.mockImplementation((agent) =>
+      agent.id === handoffAgent.id ? [assignment] : [],
+    );
+    mockPrimeFiles.mockResolvedValue({ files: [recallFile], toolContext: '' });
+    mockInitializeAgent.mockImplementation(async ({ agent, loadTools }) => {
+      const config = makeInitializedConfig(agent);
+      if (agent.id === handoffAgent.id && typeof loadTools === 'function') {
+        config.tools = [{ name: 'file_search' }];
+        config.toolDefinitions = [{ name: 'file_search' }];
+        config.toolRegistry = new Map([['file_search', { name: 'file_search' }]]);
+        config.tool_resources = { file_search: { file_ids: [recallFile.file_id] } };
+      } else if (agent.provider === assignment.provider) {
+        config.tools = [];
+        config.toolDefinitions = [];
+        config.toolRegistry = new Map();
+        config.tool_resources = {};
+      }
+      return config;
+    });
+    mockGetAgent.mockResolvedValue(handoffAgent);
+    mockBuildConversationProviderBootstrapBundle.mockImplementation(
+      async ({ allowedHostTools, hostToolResources }) => ({
+        glasshive_capability_broker: {
+          allowed_host_tools: allowedHostTools,
+          host_tool_resources: hostToolResources,
+        },
+      }),
+    );
+
+    const { client } = await initializeClient({
+      req: makeRequest(),
+      res: {},
+      signal: null,
+      endpointOption: {
+        agent: Promise.resolve({ ...primaryAgent }),
+        model_parameters: { model: primaryAgent.model },
+      },
+    });
+    const initializedHandoff = client.options.agentConfigs.get(handoffAgent.id);
+    const [fallbackRoute] = initializedHandoff.viventiumGraphLlmFallbacks;
+    const encodedBundle =
+      fallbackRoute.model_parameters.configuration.defaultHeaders[
+        'X-GlassHive-Bootstrap-Bundle-B64'
+      ];
+    const bundle = JSON.parse(Buffer.from(encodedBundle, 'base64').toString('utf8'));
+
+    expect(bundle.glasshive_capability_broker.allowed_host_tools).toEqual(['file_search']);
+    expect(bundle.glasshive_capability_broker.host_tool_resources).toEqual({
+      file_search: { entity_id: handoffAgent.id, files: [recallFile] },
+    });
+    expect(mockInitializeAgent).toHaveBeenCalledTimes(3);
+    expect(
+      mockInitializeAgent.mock.calls.find(
+        ([params]) => params.agent?.provider === assignment.provider,
+      )?.[0].loadTools,
+    ).toBeUndefined();
+  });
+
+  test('keeps a healthy handoff and its edge when optional fallback preparation fails', async () => {
+    const handoffAgent = {
+      id: 'handoff-agent',
+      provider: 'openAI',
+      model: 'synthetic-primary-model',
+      fallback_llm_provider: 'glasshive-harness',
+      fallback_llm_model: 'synthetic-fallback-model',
+      edges: [],
+    };
+    const assignment = {
+      provider: 'glasshive-harness',
+      model: 'synthetic-fallback-model',
+      source: 'agent',
+      parametersField: 'fallback_llm_model_parameters',
+    };
+    mockResolveFallbackCandidates.mockImplementation((agent) =>
+      agent.id === handoffAgent.id ? [assignment] : [],
+    );
+    mockGetAgent.mockResolvedValue(handoffAgent);
+    mockInitializeAgent.mockImplementation(async ({ agent }) => {
+      if (agent.provider === assignment.provider) {
+        throw Object.assign(new Error('synthetic fallback unavailable'), { status: 503 });
+      }
+      return makeInitializedConfig(agent);
+    });
+    const endpointOption = {
+      agent: Promise.resolve({ ...primaryAgent }),
+      model_parameters: { model: primaryAgent.model },
+    };
+
+    const { client } = await initializeClient({
+      req: makeRequest(),
+      res: {},
+      signal: null,
+      endpointOption,
+    });
+    const initializedHandoff = client.options.agentConfigs.get(handoffAgent.id);
+
+    expect(initializedHandoff).toMatchObject({
+      id: handoffAgent.id,
+      provider: handoffAgent.provider,
+      model: handoffAgent.model,
+    });
+    expect(initializedHandoff.viventiumGraphLlmFallbacks).toBeUndefined();
+    expect(client.options.agent.edges).toEqual(primaryAgent.edges);
+  });
+
+  test('recovers a handoff initialization failure through that handoff configured fallback', async () => {
+    const handoffAgent = {
+      id: 'handoff-agent',
+      provider: 'openAI',
+      model: 'synthetic-primary-model',
+      tools: ['synthetic-target-tool'],
+      fallback_llm_provider: 'glasshive-harness',
+      fallback_llm_model: 'synthetic-fallback-model',
+      edges: [],
+    };
+    const assignment = {
+      provider: 'glasshive-harness',
+      model: 'synthetic-fallback-model',
+      source: 'agent',
+      parametersField: 'fallback_llm_model_parameters',
+    };
+    mockResolveFallbackCandidates.mockImplementation((agent) =>
+      agent.id === handoffAgent.id ? [assignment] : [],
+    );
+    mockGetAgent.mockResolvedValue(handoffAgent);
+    mockInitializeAgent.mockImplementation(async ({ agent, loadTools }) => {
+      if (agent.id === handoffAgent.id && agent.provider === handoffAgent.provider) {
+        throw Object.assign(new Error('synthetic primary rate limit'), { status: 429 });
+      }
+      return {
+        ...makeInitializedConfig(agent),
+        initializedWithTargetTools: typeof loadTools === 'function',
+      };
+    });
+    const endpointOption = {
+      agent: Promise.resolve({ ...primaryAgent }),
+      model_parameters: { model: primaryAgent.model },
+    };
+
+    const { client } = await initializeClient({
+      req: makeRequest(),
+      res: {},
+      signal: null,
+      endpointOption,
+    });
+    const initializedHandoff = client.options.agentConfigs.get(handoffAgent.id);
+
+    expect(initializedHandoff).toMatchObject({
+      id: handoffAgent.id,
+      provider: assignment.provider,
+      model: assignment.model,
+      initializedWithTargetTools: true,
+    });
+    expect(initializedHandoff.viventiumGraphLlmFallbacks).toBeUndefined();
+    expect(mockInitializeAgent).toHaveBeenCalledTimes(3);
+  });
+
+  test('ignores same-route and invalid handoff fallback candidates without preparing either', async () => {
+    const handoffAgent = {
+      id: 'handoff-agent',
+      provider: 'openAI',
+      model: 'synthetic-primary-model',
+      edges: [],
+    };
+    const sameRoute = {
+      provider: 'openAI',
+      model: 'synthetic-primary-model',
+      source: 'agent',
+      parametersField: 'fallback_llm_model_parameters',
+    };
+    const invalidRoute = {
+      provider: 'glasshive-harness',
+      model: 'not-in-catalog',
+      source: 'agent',
+      parametersField: 'fallback_llm_model_parameters',
+    };
+    mockResolveFallbackCandidates.mockImplementation((agent) =>
+      agent.id === handoffAgent.id ? [sameRoute, invalidRoute] : [],
+    );
+    mockIsSameAgentRoute.mockImplementation((_agent, candidate) => candidate === sameRoute);
+    mockIsFallbackModelValid.mockImplementation((model) => model !== invalidRoute.model);
+
+    const { client } = await initializeWithHandoff(handoffAgent);
+    const initializedHandoff = client.options.agentConfigs.get(handoffAgent.id);
+
+    expect(initializedHandoff.viventiumGraphLlmFallbacks).toBeUndefined();
+    expect(mockBuildFallbackAgent).not.toHaveBeenCalled();
+    expect(mockInitializeAgent).toHaveBeenCalledTimes(2);
   });
 });

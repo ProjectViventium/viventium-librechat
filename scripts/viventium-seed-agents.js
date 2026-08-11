@@ -94,6 +94,7 @@ const AGENT_FIELDS = [
   /* === VIVENTIUM START === GlassHive Agent seed/create/update round-trip. === */
   'glasshive_options',
   /* === VIVENTIUM END === */
+  'recursion_limit',
   'end_after_tools',
   'hide_sequential_outputs',
   'support_contact',
@@ -893,6 +894,13 @@ function pickAgentFields(agent) {
   return picked;
 }
 
+function collectSeedAgentDefinitions(bundle) {
+  return [
+    ...(Array.isArray(bundle?.backgroundAgents) ? bundle.backgroundAgents : []),
+    ...(Array.isArray(bundle?.handoffAgents) ? bundle.handoffAgents : []),
+  ];
+}
+
 function buildUpdateData(agentData) {
   const updateData = {};
   for (const field of AGENT_FIELDS) {
@@ -1394,6 +1402,7 @@ module.exports = {
   normalizeBundleForRuntimeWithOwner,
   normalizePublicAccessRole,
   buildSeedAgentUpdatePlan,
+  collectSeedAgentDefinitions,
   pickAgentFields,
   resolvePublicAccessRoleIds,
   selectCanonicalOwnerId,

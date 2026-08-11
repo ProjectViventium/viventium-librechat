@@ -23,6 +23,7 @@ const {
   loadManagedBaseline,
   loadManagedBaselineMigration,
   loadManagedMigrationState,
+  collectSeedAgentDefinitions,
   pickAgentFields,
   preserveExistingEditableFields,
   reconcileManagedAgentFields,
@@ -145,6 +146,14 @@ describe('viventium-seed-agents', () => {
     });
   });
 
+  test('includes both background and handoff agents in the seed inventory', () => {
+    expect(
+      collectSeedAgentDefinitions({
+        backgroundAgents: [{ id: 'background-a' }],
+        handoffAgents: [{ id: 'handoff-a' }, { id: 'handoff-b' }],
+      }).map((agent) => agent.id),
+    ).toEqual(['background-a', 'handoff-a', 'handoff-b']);
+  });
   test('normalizes built-in models from runtime env and injects owner metadata', () => {
     const bundle = {
       meta: {
@@ -193,9 +202,9 @@ describe('viventium-seed-agents', () => {
       env: {
         VIVENTIUM_AGENT_SEED_OWNER_EMAIL: 'seed-owner@example.com',
         VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER: 'anthropic',
-        VIVENTIUM_FC_CONSCIOUS_LLM_MODEL: 'claude-opus-4-8',
+        VIVENTIUM_FC_CONSCIOUS_LLM_MODEL: 'claude-opus-5',
         VIVENTIUM_CORTEX_PRODUCTIVITY_LLM_PROVIDER: 'anthropic',
-        VIVENTIUM_CORTEX_PRODUCTIVITY_LLM_MODEL: 'claude-opus-4-8',
+        VIVENTIUM_CORTEX_PRODUCTIVITY_LLM_MODEL: 'claude-opus-5',
         OTUC_ACTIVATION_PROVIDER: 'groq',
         OTUC_ACTIVATION_LLM: 'qwen/qwen3.6-27b',
       },
@@ -203,12 +212,12 @@ describe('viventium-seed-agents', () => {
 
     expect(normalized.meta.user).toEqual({ email: 'seed-owner@example.com' });
     expect(normalized.mainAgent.provider).toBe('anthropic');
-    expect(normalized.mainAgent.model).toBe('claude-opus-4-8');
+    expect(normalized.mainAgent.model).toBe('claude-opus-5');
     expect(normalized.mainAgent.voice_llm_provider).toBe('openAI');
     expect(normalized.mainAgent.voice_llm_model).toBe('gpt-5.4');
     expect(normalized.backgroundAgents[0].provider).toBe('anthropic');
-    expect(normalized.backgroundAgents[0].model).toBe('claude-opus-4-8');
-    expect(normalized.backgroundAgents[0].model_parameters.model).toBe('claude-opus-4-8');
+    expect(normalized.backgroundAgents[0].model).toBe('claude-opus-5');
+    expect(normalized.backgroundAgents[0].model_parameters.model).toBe('claude-opus-5');
     expect(normalized.handoffAgents[0]).toMatchObject({
       provider: 'anthropic',
       model: 'claude-opus-5',
@@ -256,13 +265,13 @@ describe('viventium-seed-agents', () => {
   test('preserves live user-managed agent fields from existing agents during reseed', () => {
     const existing = {
       provider: 'anthropic',
-      model: 'claude-sonnet-4-5',
+      model: 'claude-opus-5',
       name: 'My Viv',
       description: 'custom description',
       instructions: 'keep my live instructions',
       tools: ['sys__server__sys_mcp_sequential-thinking'],
       model_parameters: {
-        model: 'claude-sonnet-4-5',
+        model: 'claude-opus-5',
       },
       voice_llm_provider: 'anthropic',
       voice_llm_model: 'claude-haiku-4-5',
@@ -312,13 +321,13 @@ describe('viventium-seed-agents', () => {
 
     expect(preserveExistingEditableFields(existing, incoming)).toEqual({
       provider: 'anthropic',
-      model: 'claude-sonnet-4-5',
+      model: 'claude-opus-5',
       name: 'My Viv',
       description: 'custom description',
       instructions: 'keep my live instructions',
       tools: ['sys__server__sys_mcp_sequential-thinking'],
       model_parameters: {
-        model: 'claude-sonnet-4-5',
+        model: 'claude-opus-5',
       },
       voice_llm_provider: 'anthropic',
       voice_llm_model: 'claude-haiku-4-5',
@@ -1036,18 +1045,18 @@ describe('viventium-seed-agents', () => {
       env: {
         VIVENTIUM_AGENT_SEED_OWNER_EMAIL: 'seed-owner@example.com',
         VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER: 'anthropic',
-        VIVENTIUM_FC_CONSCIOUS_LLM_MODEL: 'claude-opus-4-8',
+        VIVENTIUM_FC_CONSCIOUS_LLM_MODEL: 'claude-opus-5',
         VIVENTIUM_CORTEX_DEEP_RESEARCH_LLM_PROVIDER: 'anthropic',
-        VIVENTIUM_CORTEX_DEEP_RESEARCH_LLM_MODEL: 'claude-opus-4-8',
+        VIVENTIUM_CORTEX_DEEP_RESEARCH_LLM_MODEL: 'claude-opus-5',
       },
     });
 
     expect(normalized.backgroundAgents[0]).toMatchObject({
       id: 'agent_viventium_deep_research_95aeb3',
       provider: 'anthropic',
-      model: 'claude-opus-4-8',
+      model: 'claude-opus-5',
       model_parameters: {
-        model: 'claude-opus-4-8',
+        model: 'claude-opus-5',
         thinkingBudget: 4000,
       },
     });
@@ -1113,6 +1122,20 @@ describe('viventium-seed-agents', () => {
       voice_llm_model_parameters: {
         thinking: false,
       },
+    });
+  });
+
+  test('pickAgentFields preserves graph recursion settings for seeded installs', () => {
+    expect(
+      pickAgentFields({
+        id: 'agent_viventium_main_95aeb3',
+        recursion_limit: 40,
+        edges: [{ from: 'main', to: 'specialist', edgeType: 'handoff' }],
+      }),
+    ).toEqual({
+      id: 'agent_viventium_main_95aeb3',
+      recursion_limit: 40,
+      edges: [{ from: 'main', to: 'specialist', edgeType: 'handoff' }],
     });
   });
 });

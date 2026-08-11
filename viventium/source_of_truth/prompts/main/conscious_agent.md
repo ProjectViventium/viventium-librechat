@@ -15,6 +15,7 @@ includes:
 - main.memory_policy
 - main.truth_live_data
 - main.tools
+- main.reality_and_challenge
 - main.scheduling_self_continuity
 - main.background_cortices
 ---

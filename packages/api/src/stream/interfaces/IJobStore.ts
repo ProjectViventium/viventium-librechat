@@ -4,7 +4,60 @@ import type { StandardGraph } from '@librechat/agents';
 /**
  * Job status enum
  */
-export type JobStatus = 'running' | 'complete' | 'error' | 'aborted';
+export type JobStatus = 'running' | 'complete' | 'error' | 'aborted' | 'superseded';
+
+/** Trusted, server-authored context shared by generation and delivery adapters. */
+export interface InteractionContext {
+  actor_kind: 'external_user' | 'system' | 'worker';
+  origin: 'interactive' | 'scheduler' | 'callback';
+  surface: 'web' | 'telegram' | 'voice' | 'workbench';
+  conversation_id: string;
+  logical_turn_id?: string;
+  revision: number;
+  source_event_id: string;
+}
+
+export interface InteractionAdapterCapabilities {
+  segment_stability: 'immediate' | 'provisional';
+  supersede_scope: 'response_and_authoring' | 'response_only';
+}
+
+export type AdapterCapabilities = InteractionAdapterCapabilities;
+
+export interface InteractionDeliveryPolicy {
+  commit_authority: 'server' | 'external_adapter';
+}
+
+export interface LogicalTurnClaim {
+  status: 'claimed' | 'duplicate';
+  streamId: string;
+  interactionContext: InteractionContext;
+  supersededStreamIds: string[];
+}
+
+export type DeliveryAcknowledgementState = 'committed' | 'partial_removed' | 'failed';
+
+export interface InteractionDeliveryAck {
+  logical_turn_id: string;
+  revision: number;
+  state: DeliveryAcknowledgementState;
+  presentation_ref?: string;
+}
+
+export interface DeliveryAcknowledgementResult {
+  status: 'recorded' | 'not_found' | 'stale_revision' | 'conflict';
+  acknowledgement?: InteractionDeliveryAck;
+  idempotent?: boolean;
+  /** Internal server-held owner; never accepted from or exposed as client authority. */
+  ownerStreamId?: string;
+  /** Internal persistence target derived from the owner job, never from adapter claims. */
+  presentation?: {
+    userId: string;
+    conversationId?: string;
+    responseMessageId?: string;
+    interactionContext?: InteractionContext;
+  };
+}
 
 /**
  * Serializable job data - no object references, suitable for Redis/external storage
@@ -44,6 +97,11 @@ export interface SerializableJobData {
   model?: string;
   promptTokens?: number;
   voiceCallSessionId?: string;
+  interactionContext?: InteractionContext;
+  adapterCapabilities?: AdapterCapabilities;
+  deliveryPolicy?: InteractionDeliveryPolicy;
+  deliveryAcknowledgement?: InteractionDeliveryAck;
+  generationCompleted?: boolean;
 }
 
 /**
@@ -144,7 +202,41 @@ export interface IJobStore {
     streamId: string,
     userId: string,
     conversationId?: string,
+    initialData?: Partial<SerializableJobData>,
   ): Promise<SerializableJobData>;
+
+  /** Atomically claim a revision, or return the first stream for a duplicate source event. */
+  claimLogicalTurn(
+    streamId: string,
+    userId: string,
+    interactionContext: InteractionContext,
+  ): Promise<LogicalTurnClaim>;
+
+  /** Conditionally undo a failed claim only while that stream still owns the latest revision. */
+  rollbackLogicalTurnClaim(
+    streamId: string,
+    interactionContext: InteractionContext,
+  ): Promise<boolean>;
+
+  /** Remove only a source-event receipt that points at a confirmed missing owner job. */
+  forgetMissingSourceEventReceipt(
+    interactionContext: InteractionContext,
+    expectedStreamId: string,
+  ): Promise<boolean>;
+
+  /** Release the active revision only when the supplied stream still owns it. */
+  completeLogicalTurn(streamId: string): Promise<void>;
+
+  /** Whether this stream is still the latest revision of its logical turn. */
+  isCurrentLogicalTurn(streamId: string): Promise<boolean>;
+
+  /** Resolve revision ownership from the server-held logical-turn index. */
+  resolveDeliveryOwner(logicalTurnId: string, revision: number): Promise<string | null>;
+
+  /** Record the current presentation outcome using server-held logical-turn ownership. */
+  acknowledgeDelivery(
+    acknowledgement: InteractionDeliveryAck,
+  ): Promise<DeliveryAcknowledgementResult>;
 
   /** Get a job by streamId (streamId === conversationId) */
   getJob(streamId: string): Promise<SerializableJobData | null>;
@@ -312,18 +404,14 @@ export interface IEventTransport {
    * generating Replica A receives signal and stops.
    * Optional - only implemented in Redis transport.
    */
-  emitAbort?(streamId: string, reason?: 'user_cancelled'): void | Promise<void>;
+  emitAbort?(streamId: string, reason?: string): void | Promise<void>;
 
   /**
    * Register callback for abort signals from any replica (Redis mode).
    * Called when abort is triggered from any replica.
    * Optional - only implemented in Redis transport.
    */
-  /* === VIVENTIUM START ===
-   * Purpose: Redis implementations expose acknowledgement and teardown
-   * boundaries while in-memory implementations remain synchronous.
-   * === VIVENTIUM END === */
-  onAbort?(streamId: string, callback: (reason?: 'user_cancelled') => void): void | Promise<void>;
+  onAbort?(streamId: string, callback: (reason?: string) => void): void | Promise<void>;
 
   /** Get subscriber count for a stream */
   getSubscriberCount(streamId: string): number;

@@ -73,6 +73,7 @@ const {
   resolveFallbackCandidates,
   isFallbackModelValid,
   buildFallbackAgent,
+  inheritResolvedAgentGraph,
   isSameAgentRoute,
   initializePrimaryAgentWithFallback,
 } = require('~/server/services/viventium/agentLlmFallback');
@@ -89,6 +90,9 @@ const {
   attachDeclaredConversationProviderCapabilityBundle,
   attachConversationProviderCapabilityBundle,
   bindHarnessCancellation,
+  installConversationProviderCapabilityRefresher,
+  resolveConversationProviderId,
+  setConversationProviderCapability,
 } = require('~/server/services/viventium/GlassHiveConversationProviderService');
 const {
   resolveAgentCapabilityProvider,
@@ -646,49 +650,93 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
   const parentMessageId = req.body.parentMessageId;
 
   /* === VIVENTIUM START ===
-   * Feature: Agent Fallback LLM
-   * Purpose: Prepare a validated secondary route before primary initialization mutates
-   * provider options, then attach the initialized route for one-shot runtime retry.
+   * Feature: Agent Fallback LLM validation parity
+   * Purpose: Prepare a validated secondary route for every graph participant before
+   * initialization mutates provider options. Main and handoff agents therefore share the same
+   * catalog, capability, same-route, and model validation contract.
    * Voice calls prefer the voice-specific fallback route and inherit the general fallback
    * when the voice fallback is unset.
-   * Added: 2026-04-28
+   * Added: 2026-04-28; expanded to graph participants 2026-08-10
    */
-  let fallbackAgent = null;
-  const fallbackCandidates = resolveFallbackCandidates(primaryAgent, {
-    isVoiceCall: isVoiceCallActive(req),
-  });
-  let fallbackAssignment = null;
-  for (const candidate of fallbackCandidates) {
-    if (isSameAgentRoute(primaryAgent, candidate)) {
-      logger.warn(
-        `[agentLlmFallback] Skipping ${candidate.source} fallback for agent ${primaryAgent.id} because it matches the effective primary route ${candidate.provider}/${candidate.model}`,
-      );
-      continue;
-    }
-    if (!isFallbackModelValid(candidate.model, candidate.provider, req, modelsConfig)) {
-      logger.warn(
-        `[agentLlmFallback] Invalid ${candidate.source} fallback model ${candidate.provider}/${candidate.model} for agent ${primaryAgent.id}; trying next fallback candidate`,
-      );
-      continue;
-    }
-    const candidateFallbackAgent = buildFallbackAgent(primaryAgent, candidate);
-    const fallbackValidationResult = await validateAgentModel({
-      req,
-      res,
-      modelsConfig,
-      logViolation,
-      agent: candidateFallbackAgent,
+  const resolveValidatedFallbackRoute = async (agent) => {
+    const candidates = resolveFallbackCandidates(agent, {
+      isVoiceCall: isVoiceCallActive(req),
     });
-    if (!fallbackValidationResult.isValid) {
-      logger.warn(
-        `[agentLlmFallback] ${candidate.source} fallback model ${candidate.provider}/${candidate.model} failed validation for agent ${primaryAgent.id}: ${fallbackValidationResult.error?.message || 'invalid'}; trying next fallback candidate`,
-      );
-      continue;
+    for (const candidate of candidates) {
+      if (isSameAgentRoute(agent, candidate)) {
+        logger.warn(
+          `[agentLlmFallback] Skipping ${candidate.source} fallback for agent ${agent.id} because it matches the effective primary route ${candidate.provider}/${candidate.model}`,
+        );
+        continue;
+      }
+      if (!isFallbackModelValid(candidate.model, candidate.provider, req, modelsConfig)) {
+        logger.warn(
+          `[agentLlmFallback] Invalid ${candidate.source} fallback model ${candidate.provider}/${candidate.model} for agent ${agent.id}; trying next fallback candidate`,
+        );
+        continue;
+      }
+      const candidateCapability =
+        req?.config?.endpoints?.agents?.providerCapabilities?.[candidate.provider];
+      const candidateFallbackAgent = buildFallbackAgent(agent, candidate, candidateCapability);
+      const fallbackValidationResult = await validateAgentModel({
+        req,
+        res,
+        modelsConfig,
+        logViolation,
+        agent: candidateFallbackAgent,
+      });
+      if (!fallbackValidationResult.isValid) {
+        logger.warn(
+          `[agentLlmFallback] ${candidate.source} fallback model ${candidate.provider}/${candidate.model} failed validation for agent ${agent.id}: ${fallbackValidationResult.error?.message || 'invalid'}; trying next fallback candidate`,
+        );
+        continue;
+      }
+      return {
+        fallbackAgent: candidateFallbackAgent,
+        fallbackAssignment: candidate,
+      };
     }
-    fallbackAgent = candidateFallbackAgent;
-    fallbackAssignment = candidate;
-    break;
-  }
+    return { fallbackAgent: null, fallbackAssignment: null };
+  };
+
+  const withPlatformFallbackAuth = async (callback) => {
+    const previousOpenAIPlatformFallbackFlag =
+      req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure;
+    req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure = true;
+    try {
+      return await callback();
+    } finally {
+      if (previousOpenAIPlatformFallbackFlag === undefined) {
+        delete req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure;
+      } else {
+        req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure = previousOpenAIPlatformFallbackFlag;
+      }
+    }
+  };
+
+  const attachHarnessCancellationConfig = (targetAgent, logContext) => {
+    let cancellationEndpointConfig = appConfig.endpoints?.[targetAgent.endpoint];
+    if (!isAgentsEndpoint(targetAgent.endpoint) && !cancellationEndpointConfig) {
+      try {
+        cancellationEndpointConfig = getCustomEndpointConfig({
+          endpoint: targetAgent.endpoint,
+          appConfig,
+        });
+      } catch (error) {
+        logger.warn(
+          `[${logContext}] Could not resolve cancellation endpoint for ${targetAgent.id}: ${error?.message || error}`,
+        );
+      }
+    }
+    Object.defineProperty(targetAgent, 'viventiumHarnessCancellationEndpointConfig', {
+      value: cancellationEndpointConfig,
+      configurable: true,
+      enumerable: false,
+      writable: false,
+    });
+  };
+
+  const { fallbackAgent, fallbackAssignment } = await resolveValidatedFallbackRoute(primaryAgent);
   /* === VIVENTIUM END === */
 
   const initPrimaryStart = nowIfDeep();
@@ -698,6 +746,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
    * Purpose: Provider auth and workspace-harness readiness resolve before AgentClient exists.
    * Recover once through the validated, user-configured fallback before a harness process starts,
    * so web, Telegram, and voice share the same explicit fallback contract.
+   * Added: 2026-07-13
    */
   const initializeConfiguredPrimary = (agent) =>
     initializeAgent(
@@ -715,20 +764,8 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
       },
       dbMethods,
     );
-  const initializeConfiguredFallback = async () => {
-    const previousOpenAIPlatformFallbackFlag =
-      req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure;
-    req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure = true;
-    try {
-      return await initializeConfiguredPrimary(fallbackAgent);
-    } finally {
-      if (previousOpenAIPlatformFallbackFlag === undefined) {
-        delete req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure;
-      } else {
-        req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure = previousOpenAIPlatformFallbackFlag;
-      }
-    }
-  };
+  const initializeConfiguredFallback = () =>
+    withPlatformFallbackAuth(() => initializeConfiguredPrimary(fallbackAgent));
   const primaryInitialization = await initializePrimaryAgentWithFallback({
     primaryAgent,
     fallbackAgent,
@@ -745,20 +782,31 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
     : primaryInitialization.effectiveAgent;
   const primaryInitializationFallbackUsed = primaryInitialization.fallbackUsed;
   /* === VIVENTIUM START ===
-   * Feature: Preserve declared provider capabilities across custom-endpoint initialization.
-   * Purpose: initializeAgent adapts a custom endpoint's internal transport provider to openAI.
-   * The original provider remains on `endpoint`; capability ownership must follow that declared
-   * endpoint so transport adaptation cannot silently disable GlassHive lifecycle semantics.
+   * Feature: Preserve declared conversation-provider identity after transport normalization.
+   * Purpose: Custom OpenAI-compatible providers keep their capability/cancellation contract on
+   * `endpoint`; initialization may normalize only the internal `provider` transport to openAI.
    * === VIVENTIUM END === */
-  const effectivePrimaryProvider = resolveAgentCapabilityProvider(effectivePrimaryAgent);
-  const effectivePrimaryCapability =
-    req.config?.endpoints?.agents?.providerCapabilities?.[effectivePrimaryProvider];
-  req._viventiumHarnessActivityEnabled =
-    !sideEffectsRestricted && effectivePrimaryCapability?.activity_stream === true;
-  req._viventiumHarnessExecutionEnabled =
-    !sideEffectsRestricted && effectivePrimaryCapability?.workspace_binding === true;
+  const effectivePrimaryProvider = resolveConversationProviderId(effectivePrimaryAgent);
+  const effectivePrimaryCapability = setConversationProviderCapability(
+    req,
+    effectivePrimaryProvider,
+  );
+  req._viventiumFallbackLlmAttempt = primaryInitializationFallbackUsed === true;
+  if (primaryInitializationFallbackUsed === true) {
+    req._viventiumFallbackRouteNotice = {
+      model: fallbackAssignment.model,
+    };
+  } else {
+    delete req._viventiumFallbackRouteNotice;
+  }
   if (!sideEffectsRestricted) {
     await attachConversationProviderCapabilityBundle({
+      targetAgent: primaryConfig,
+      declaredAgent: effectivePrimaryAgent,
+      req,
+      capability: effectivePrimaryCapability,
+    });
+    installConversationProviderCapabilityRefresher({
       targetAgent: primaryConfig,
       declaredAgent: effectivePrimaryAgent,
       req,
@@ -870,6 +918,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
           if (sideEffectsRestricted) {
             fallbackConfig = sanitizeAgentForRestrictedVoiceTurn(fallbackConfig);
           }
+          inheritResolvedAgentGraph(fallbackConfig, primaryConfig);
           /* === VIVENTIUM START ===
            * Feature: Lazy fallback graph resilience parity.
            * Purpose: The fallback is the same logical agent. Preserve the request-resolved graph
@@ -886,31 +935,12 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
               declaredAgent: fallbackAgent,
               req,
             });
-          }
-          let fallbackEndpointConfig = appConfig.endpoints?.[fallbackConfig.endpoint];
-          if (
-            !sideEffectsRestricted &&
-            !isAgentsEndpoint(fallbackConfig.endpoint) &&
-            !fallbackEndpointConfig
-          ) {
-            try {
-              fallbackEndpointConfig = getCustomEndpointConfig({
-                endpoint: fallbackConfig.endpoint,
-                appConfig,
-              });
-            } catch (error) {
-              logger.warn(
-                `[agentLlmFallback] Could not resolve cancellation endpoint for ${fallbackAssignment.provider}/${fallbackAssignment.model}: ${error?.message || error}`,
-              );
-            }
-          }
-          if (!sideEffectsRestricted) {
-            Object.defineProperty(fallbackConfig, 'viventiumHarnessCancellationEndpointConfig', {
-              value: fallbackEndpointConfig,
-              configurable: true,
-              enumerable: false,
-              writable: false,
+            installConversationProviderCapabilityRefresher({
+              targetAgent: fallbackConfig,
+              declaredAgent: fallbackAgent,
+              req,
             });
+            attachHarnessCancellationConfig(fallbackConfig, 'agentLlmFallback');
           }
           primaryConfig.viventiumFallbackLlm = fallbackConfig;
           primaryConfig.viventiumFallbackLlmInitializationError = null;
@@ -1008,15 +1038,18 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
 
   async function processAgent(agentId) {
     const getAgentStart = nowIfDeep();
-    const agent = await getAgent({ id: agentId });
+    const loadedAgent = await getAgent({ id: agentId });
     logDeep('handoff_get_agent', getAgentStart, `agentId=${agentId}`);
-    if (!agent) {
+    if (!loadedAgent) {
       logger.warn(
         `[processAgent] Handoff agent ${agentId} not found, skipping (orphaned reference)`,
       );
       skippedAgentIds.add(agentId);
       return null;
     }
+    const agent = sideEffectsRestricted
+      ? sanitizeAgentForRestrictedVoiceTurn(loadedAgent)
+      : loadedAgent;
 
     /* === VIVENTIUM START ===
      * Feature: Voice Chat LLM Override (handoff graph agents)
@@ -1047,51 +1080,119 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
       throw new Error(validationResult.error?.message);
     }
 
+    const { fallbackAgent: handoffFallbackAgent, fallbackAssignment: handoffFallbackAssignment } =
+      await resolveValidatedFallbackRoute(agent);
     const initStart = nowIfDeep();
     const voiceHandoffInitStart = voiceLatencyEnabled ? voiceLatencyNow() : null;
-    const config = await initializeAgent(
-      {
-        req,
-        res,
-        agent,
-        loadTools,
-        requestFiles,
-        conversationId,
-        parentMessageId,
-        endpointOption,
-        allowedProviders,
-      },
-      dbMethods,
-    );
-    /* === VIVENTIUM START ===
-     * Feature: GlassHive handoff capability and cancellation parity.
-     * Purpose: A graph handoff gets the same signed workspace bundle and intentional Stop adapter
-     * as primary/fallback/background agents; ordinary providers remain unchanged.
-     * === VIVENTIUM END === */
-    await attachDeclaredConversationProviderCapabilityBundle({
-      targetAgent: config,
-      declaredAgent: agent,
-      req,
+    const initializeHandoffAgent = (targetAgent, { includeTools = true } = {}) =>
+      initializeAgent(
+        {
+          req,
+          res,
+          agent: targetAgent,
+          loadTools: includeTools ? loadTools : undefined,
+          requestFiles,
+          conversationId,
+          parentMessageId,
+          endpointOption,
+          allowedProviders,
+        },
+        dbMethods,
+      );
+    const handoffInitialization = await initializePrimaryAgentWithFallback({
+      primaryAgent: agent,
+      fallbackAgent: handoffFallbackAgent,
+      fallbackAssignment: handoffFallbackAssignment,
+      initializePrimary: () => initializeHandoffAgent(agent),
+      initializeFallback: () =>
+        withPlatformFallbackAuth(() => initializeHandoffAgent(handoffFallbackAgent)),
+      signal,
     });
-    let handoffEndpointConfig = appConfig.endpoints?.[config.endpoint];
-    if (!isAgentsEndpoint(config.endpoint) && !handoffEndpointConfig) {
+    const config = sideEffectsRestricted
+      ? sanitizeAgentForRestrictedVoiceTurn(handoffInitialization.config)
+      : handoffInitialization.config;
+    const effectiveAgent = sideEffectsRestricted
+      ? sanitizeAgentForRestrictedVoiceTurn(handoffInitialization.effectiveAgent)
+      : handoffInitialization.effectiveAgent;
+    const handoffInitializationFallbackUsed = handoffInitialization.fallbackUsed === true;
+    /* === VIVENTIUM START ===
+     * Feature: GlassHive handoff capability parity
+     * Purpose: Attach the endpoint-declared signed workspace capability bundle before an Agent
+     * Builder handoff enters the graph, matching primary/fallback/background provider behavior.
+     * The shared helper keeps non-workspace providers unchanged and exposes bundle failures through
+     * the existing capability-unavailable instruction instead of inventing handoff-specific policy.
+     * === VIVENTIUM END === */
+    if (!sideEffectsRestricted) {
+      await attachDeclaredConversationProviderCapabilityBundle({
+        targetAgent: config,
+        declaredAgent: effectiveAgent,
+        req,
+      });
+      installConversationProviderCapabilityRefresher({
+        targetAgent: config,
+        declaredAgent: effectiveAgent,
+        req,
+      });
+    }
+    /* === VIVENTIUM START ===
+     * Feature: GlassHive handoff cancellation parity.
+     * Purpose: Preserve the declared handoff endpoint configuration so a workspace-bound graph
+     * participant can receive an intentional native Stop even when the primary agent is direct.
+     * === VIVENTIUM END === */
+    if (!sideEffectsRestricted) {
+      attachHarnessCancellationConfig(config, 'processAgent');
+    }
+
+    /* === VIVENTIUM START ===
+     * Feature: Per-participant Agent Builder fallback
+     * Purpose: Graph-native fallback must belong to the participant that can fail, not Main. The
+     * fallback model route is initialized with the same provider/auth/capability path but without
+     * a second ToolService/MCP load; LangGraph reuses the target participant's authorized tools.
+     * Runtime-only state stays out of persisted Agent documents and API serialization.
+     * Added: 2026-08-10
+     * === VIVENTIUM END === */
+    if (!handoffInitializationFallbackUsed && handoffFallbackAgent && handoffFallbackAssignment) {
+      const graphFallbackInitStart = performance.now();
       try {
-        handoffEndpointConfig = getCustomEndpointConfig({
-          endpoint: config.endpoint,
-          appConfig,
+        let graphFallbackConfig = await withPlatformFallbackAuth(() =>
+          initializeHandoffAgent(handoffFallbackAgent, { includeTools: false }),
+        );
+        if (sideEffectsRestricted) {
+          graphFallbackConfig = sanitizeAgentForRestrictedVoiceTurn(graphFallbackConfig);
+        } else {
+          await attachDeclaredConversationProviderCapabilityBundle({
+            targetAgent: graphFallbackConfig,
+            declaredAgent: handoffFallbackAgent,
+            capabilitySourceAgent: config,
+            req,
+          });
+          installConversationProviderCapabilityRefresher({
+            targetAgent: graphFallbackConfig,
+            declaredAgent: handoffFallbackAgent,
+            capabilitySourceAgent: config,
+            req,
+          });
+          attachHarnessCancellationConfig(graphFallbackConfig, 'processAgentFallback');
+        }
+        Object.defineProperty(config, 'viventiumGraphLlmFallbacks', {
+          value: [graphFallbackConfig],
+          configurable: true,
+          enumerable: false,
+          writable: false,
         });
+        logger.info(
+          `[agentLlmFallback] Prepared graph fallback for agent ${agentId}: ${handoffFallbackAssignment.provider}/${handoffFallbackAssignment.model} prep_ms=${Math.round(performance.now() - graphFallbackInitStart)}`,
+        );
       } catch (error) {
         logger.warn(
-          `[processAgent] Could not resolve cancellation endpoint for handoff ${agentId}: ${error?.message || error}`,
+          `[agentLlmFallback] Could not prepare graph fallback for agent ${agentId}; keeping healthy primary participant prep_ms=${Math.round(performance.now() - graphFallbackInitStart)}: ${error?.message || error}`,
         );
       }
+    } else if (handoffInitializationFallbackUsed) {
+      logger.warn(
+        `[agentLlmFallback] Handoff provider initialization recovered through configured fallback for agent ${agentId}: ${handoffFallbackAssignment.provider}/${handoffFallbackAssignment.model}`,
+      );
     }
-    Object.defineProperty(config, 'viventiumHarnessCancellationEndpointConfig', {
-      value: handoffEndpointConfig,
-      configurable: true,
-      enumerable: false,
-      writable: false,
-    });
     const handoffToolSummary = summarizeInitTools(config);
     if (voiceLatencyEnabled && voiceInitSummary) {
       const handoffInitializeMs = calcVoiceStageMs(voiceHandoffInitStart);
@@ -1143,14 +1244,14 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
 
     /** Store handoff agent's tool context for ON_TOOL_EXECUTE callback */
     agentToolContexts.set(agentId, {
-      agent,
+      agent: effectiveAgent,
       toolRegistry: config.toolRegistry,
       userMCPAuthMap: config.userMCPAuthMap,
       tool_resources: config.tool_resources,
     });
 
     agentConfigs.set(agentId, config);
-    return agent;
+    return effectiveAgent;
   }
 
   const checkAgentInit = (agentId) => agentId === primaryConfig.id || agentConfigs.has(agentId);

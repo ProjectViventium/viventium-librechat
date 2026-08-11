@@ -1,4 +1,5 @@
 import { logger } from '@librechat/data-schemas';
+import { createHash, randomUUID } from 'crypto';
 import { createContentAggregator } from '@librechat/agents';
 import type { StandardGraph } from '@librechat/agents';
 import type { Agents } from 'librechat-data-provider';
@@ -8,7 +9,24 @@ import type {
   UsageMetadata,
   IJobStore,
   JobStatus,
+  InteractionContext,
+  LogicalTurnClaim,
+  InteractionDeliveryAck,
+  DeliveryAcknowledgementResult,
 } from '~/stream/interfaces/IJobStore';
+
+function logicalTurnScopeDigest(userId: string, interactionContext: InteractionContext): string {
+  return createHash('sha256')
+    .update(
+      [
+        userId,
+        interactionContext.conversation_id,
+        interactionContext.actor_kind,
+        interactionContext.origin,
+      ].join('\u0000'),
+    )
+    .digest('hex');
+}
 
 /**
  * Key prefixes for Redis storage.
@@ -31,6 +49,25 @@ const KEYS = {
   runningJobs: 'stream:running',
   /** User's active jobs set: stream:user:{userId}:jobs */
   userJobs: (userId: string) => `stream:user:{${userId}}:jobs`,
+  /** Atomic logical-turn claim state, deliberately separate from stream payload storage. */
+  logicalTurn: (userId: string, interactionContext: InteractionContext) => {
+    const scope = logicalTurnScopeDigest(userId, interactionContext);
+    return `stream:logical:{${scope}}`;
+  },
+  /** New logical IDs carry only the irreversible scope digest needed for atomic owner lookup. */
+  logicalTurnId: (userId: string, interactionContext: InteractionContext) => {
+    const scope = logicalTurnScopeDigest(userId, interactionContext);
+    return `${scope}.${randomUUID()}`;
+  },
+  logicalTurnFromId: (logicalTurnId: string) => {
+    const scope = /^([a-f0-9]{64})\./.exec(logicalTurnId)?.[1];
+    return scope ? `stream:logical:{${scope}}` : null;
+  },
+  /** Reverse lookup contains the server-owned scope key, never client ownership claims. */
+  logicalTurnIndex: (logicalTurnId: string) => {
+    const id = createHash('sha256').update(logicalTurnId).digest('hex');
+    return `stream:logical-index:{${id}}`;
+  },
 };
 
 /**
@@ -140,8 +177,10 @@ export class RedisJobStore implements IJobStore {
     streamId: string,
     userId: string,
     conversationId?: string,
+    initialData?: Partial<SerializableJobData>,
   ): Promise<SerializableJobData> {
     const job: SerializableJobData = {
+      ...initialData,
       streamId,
       userId,
       status: 'running',
@@ -173,6 +212,293 @@ export class RedisJobStore implements IJobStore {
     return job;
   }
 
+  async claimLogicalTurn(
+    streamId: string,
+    userId: string,
+    interactionContext: InteractionContext,
+  ): Promise<LogicalTurnClaim> {
+    const key = KEYS.logicalTurn(userId, interactionContext);
+    const result = (await this.redis.eval(
+      `local receipt_key = 'receipt:' .. ARGV[2]
+       local receipt = redis.call('HGET', KEYS[1], receipt_key)
+       if receipt then
+         local decoded = cjson.decode(receipt)
+         return {'duplicate', decoded.streamId, cjson.encode(decoded.interactionContext), ''}
+       end
+       local logical_id = redis.call('HGET', KEYS[1], 'logicalTurnId')
+       local revision = tonumber(redis.call('HGET', KEYS[1], 'revision') or '0')
+       local current = redis.call('HGET', KEYS[1], 'currentStreamId') or ''
+       local active = redis.call('HGET', KEYS[1], 'active') == '1'
+       local superseded = ''
+       if active and current ~= '' then
+         revision = revision + 1
+         superseded = current
+       else
+         redis.call('DEL', KEYS[1])
+         logical_id = ARGV[3]
+         revision = 1
+       end
+       local context = cjson.decode(ARGV[4])
+       context.logical_turn_id = logical_id
+       context.revision = revision
+       local encoded_context = cjson.encode(context)
+       local encoded_receipt = cjson.encode({streamId = ARGV[1], interactionContext = context})
+       redis.call('HSET', KEYS[1],
+         'logicalTurnId', logical_id,
+         'revision', tostring(revision),
+         'currentStreamId', ARGV[1],
+         'active', '1',
+         'streamForRevision:' .. tostring(revision), ARGV[1],
+         receipt_key, encoded_receipt)
+       redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
+       return {'claimed', ARGV[1], encoded_context, superseded}`,
+      1,
+      key,
+      streamId,
+      interactionContext.source_event_id,
+      KEYS.logicalTurnId(userId, interactionContext),
+      JSON.stringify(interactionContext),
+      this.ttl.running,
+    )) as [string, string, string, string];
+
+    const claimedContext = JSON.parse(result[2]) as InteractionContext;
+    if (claimedContext.logical_turn_id) {
+      // Prefixed IDs resolve directly to this hash slot, so ack ownership cannot race a second
+      // reverse-index write. Retain the index only for pre-upgrade UUID turns.
+      if (!KEYS.logicalTurnFromId(claimedContext.logical_turn_id)) {
+        const indexKey = KEYS.logicalTurnIndex(claimedContext.logical_turn_id);
+        await this.redis.hset(indexKey, {
+          logicalTurnId: claimedContext.logical_turn_id,
+          ownerScopeKey: key,
+          surface: claimedContext.surface,
+        });
+        await this.redis.expire(indexKey, this.ttl.running);
+      }
+    }
+
+    return {
+      status: result[0] as LogicalTurnClaim['status'],
+      streamId: result[1],
+      interactionContext: claimedContext,
+      supersededStreamIds: result[3] ? [result[3]] : [],
+    };
+  }
+
+  async rollbackLogicalTurnClaim(
+    streamId: string,
+    interactionContext: InteractionContext,
+  ): Promise<boolean> {
+    if (!interactionContext.logical_turn_id) {
+      return false;
+    }
+    const indexKey = KEYS.logicalTurnIndex(interactionContext.logical_turn_id);
+    const ownerScopeKey =
+      KEYS.logicalTurnFromId(interactionContext.logical_turn_id) ??
+      (await this.redis.hget(indexKey, 'ownerScopeKey'));
+    if (!ownerScopeKey) {
+      return false;
+    }
+    const rolledBack = await this.redis.eval(
+      `if redis.call('HGET', KEYS[1], 'logicalTurnId') ~= ARGV[1]
+          or tonumber(redis.call('HGET', KEYS[1], 'revision') or '0') ~= tonumber(ARGV[2])
+          or redis.call('HGET', KEYS[1], 'currentStreamId') ~= ARGV[3] then
+         return 0
+       end
+       local receipt_key = 'receipt:' .. ARGV[4]
+       local receipt = redis.call('HGET', KEYS[1], receipt_key)
+       if receipt then
+         local decoded = cjson.decode(receipt)
+         if decoded.streamId == ARGV[3] then
+           redis.call('HDEL', KEYS[1], receipt_key)
+         end
+       end
+       redis.call('HDEL', KEYS[1], 'streamForRevision:' .. ARGV[2])
+       local previous_revision = tonumber(ARGV[2]) - 1
+       if previous_revision > 0 then
+         local previous_stream = redis.call(
+           'HGET',
+           KEYS[1],
+           'streamForRevision:' .. tostring(previous_revision)
+         ) or ''
+         redis.call('HSET', KEYS[1],
+           'revision', tostring(previous_revision),
+           'currentStreamId', previous_stream,
+           'active', previous_stream ~= '' and '1' or '0')
+       else
+         redis.call('HSET', KEYS[1],
+           'revision', '0',
+           'currentStreamId', '',
+           'active', '0')
+       end
+       return 1`,
+      1,
+      ownerScopeKey,
+      interactionContext.logical_turn_id,
+      interactionContext.revision,
+      streamId,
+      interactionContext.source_event_id,
+    );
+    if (
+      rolledBack === 1 &&
+      interactionContext.revision === 1 &&
+      !KEYS.logicalTurnFromId(interactionContext.logical_turn_id)
+    ) {
+      await this.redis.del(indexKey);
+    }
+    return rolledBack === 1;
+  }
+
+  async forgetMissingSourceEventReceipt(
+    interactionContext: InteractionContext,
+    expectedStreamId: string,
+  ): Promise<boolean> {
+    if (!interactionContext.logical_turn_id) {
+      return false;
+    }
+    const indexKey = KEYS.logicalTurnIndex(interactionContext.logical_turn_id);
+    const ownerScopeKey =
+      KEYS.logicalTurnFromId(interactionContext.logical_turn_id) ??
+      (await this.redis.hget(indexKey, 'ownerScopeKey'));
+    if (!ownerScopeKey) {
+      return false;
+    }
+    const removed = await this.redis.eval(
+      `if redis.call('HGET', KEYS[1], 'logicalTurnId') ~= ARGV[1] then
+         return 0
+       end
+       local receipt_key = 'receipt:' .. ARGV[2]
+       local receipt = redis.call('HGET', KEYS[1], receipt_key)
+       if not receipt then
+         return 0
+       end
+       local decoded = cjson.decode(receipt)
+       if decoded.streamId ~= ARGV[3] then
+         return 0
+       end
+       redis.call('HDEL', KEYS[1], receipt_key)
+       return 1`,
+      1,
+      ownerScopeKey,
+      interactionContext.logical_turn_id,
+      interactionContext.source_event_id,
+      expectedStreamId,
+    );
+    return removed === 1;
+  }
+
+  async completeLogicalTurn(streamId: string): Promise<void> {
+    const job = await this.getJob(streamId);
+    if (!job?.interactionContext) {
+      return;
+    }
+    const key = KEYS.logicalTurn(job.userId, job.interactionContext);
+    await this.redis.eval(
+      `if redis.call('HGET', KEYS[1], 'currentStreamId') == ARGV[1] then
+         redis.call('HSET', KEYS[1], 'active', '0')
+         return 1
+       end
+       return 0`,
+      1,
+      key,
+      streamId,
+    );
+  }
+
+  async isCurrentLogicalTurn(streamId: string): Promise<boolean> {
+    const job = await this.getJob(streamId);
+    if (!job?.interactionContext) {
+      return true;
+    }
+    const key = KEYS.logicalTurn(job.userId, job.interactionContext);
+    return (await this.redis.hget(key, 'currentStreamId')) === streamId;
+  }
+
+  async resolveDeliveryOwner(logicalTurnId: string, revision: number): Promise<string | null> {
+    const indexKey = KEYS.logicalTurnIndex(logicalTurnId);
+    const ownerScopeKey =
+      KEYS.logicalTurnFromId(logicalTurnId) ?? (await this.redis.hget(indexKey, 'ownerScopeKey'));
+    if (!ownerScopeKey) {
+      return null;
+    }
+    const [storedLogicalTurnId, ownerStreamId] = await this.redis.hmget(
+      ownerScopeKey,
+      'logicalTurnId',
+      `streamForRevision:${revision}`,
+    );
+    if (storedLogicalTurnId !== logicalTurnId || !ownerStreamId) {
+      return null;
+    }
+    return ownerStreamId;
+  }
+
+  async acknowledgeDelivery(
+    acknowledgement: InteractionDeliveryAck,
+  ): Promise<DeliveryAcknowledgementResult> {
+    const indexKey = KEYS.logicalTurnIndex(acknowledgement.logical_turn_id);
+    const ownerScopeKey =
+      KEYS.logicalTurnFromId(acknowledgement.logical_turn_id) ??
+      (await this.redis.hget(indexKey, 'ownerScopeKey'));
+    if (!ownerScopeKey) {
+      return { status: 'not_found' };
+    }
+    const encoded = JSON.stringify(acknowledgement);
+    const result = (await this.redis.eval(
+      `if redis.call('HGET', KEYS[1], 'logicalTurnId') ~= ARGV[1] then
+         return {'not_found', ''}
+       end
+       local current_revision = tonumber(redis.call('HGET', KEYS[1], 'revision') or '0')
+       local requested_revision = tonumber(ARGV[2])
+       if requested_revision > current_revision then
+         return {'stale_revision', ''}
+       end
+       local owner_stream_id = redis.call(
+         'HGET',
+         KEYS[1],
+         'streamForRevision:' .. tostring(requested_revision)
+       ) or ''
+       if owner_stream_id == '' then
+         return {'stale_revision', ''}
+       end
+       if requested_revision < current_revision and ARGV[4] == 'committed' then
+         return {'stale_revision', ''}
+       end
+       local ack_key = 'deliveryAck:' .. ARGV[1] .. ':' .. ARGV[2]
+       local existing = redis.call('HGET', KEYS[1], ack_key)
+       if existing then
+         if existing == ARGV[3] then
+           return {'recorded', existing, owner_stream_id}
+         end
+         return {'conflict', existing}
+       end
+       redis.call('HSET', KEYS[1], ack_key, ARGV[3])
+       if requested_revision == current_revision and (ARGV[4] == 'committed' or ARGV[4] == 'failed') then
+         redis.call('HSET', KEYS[1], 'active', '0')
+       end
+       redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
+       return {'recorded_new', ARGV[3], owner_stream_id}`,
+      1,
+      ownerScopeKey,
+      acknowledgement.logical_turn_id,
+      acknowledgement.revision,
+      encoded,
+      acknowledgement.state,
+      this.ttl.completed,
+    )) as [string, string, string];
+
+    if (result[0] === 'not_found' || result[0] === 'stale_revision' || result[0] === 'conflict') {
+      return { status: result[0] };
+    }
+    if (!KEYS.logicalTurnFromId(acknowledgement.logical_turn_id)) {
+      await this.redis.expire(indexKey, this.ttl.completed);
+    }
+    return {
+      status: 'recorded',
+      acknowledgement: JSON.parse(result[1]) as InteractionDeliveryAck,
+      idempotent: result[0] === 'recorded',
+      ownerStreamId: result[2] || undefined,
+    };
+  }
+
   async getJob(streamId: string): Promise<SerializableJobData | null> {
     const data = await this.redis.hgetall(KEYS.job(streamId));
     if (!data || Object.keys(data).length === 0) {
@@ -201,9 +527,9 @@ export class RedisJobStore implements IJobStore {
       return;
     }
 
-    // If status changed to complete/error/aborted, update TTL and remove from running set
+    // If status changed to a terminal state, update TTL and remove from running set
     // Note: userJobs cleanup is handled lazily via self-healing in getActiveJobIdsByUser
-    if (updates.status && ['complete', 'error', 'aborted'].includes(updates.status)) {
+    if (updates.status && ['complete', 'error', 'aborted', 'superseded'].includes(updates.status)) {
       // In cluster mode, separate runningJobs (global) from stream-specific keys
       if (this.isCluster) {
         await this.redis.expire(key, this.ttl.completed);
@@ -883,6 +1209,17 @@ export class RedisJobStore implements IJobStore {
       model: data.model || undefined,
       promptTokens: data.promptTokens ? parseInt(data.promptTokens, 10) : undefined,
       voiceCallSessionId: data.voiceCallSessionId || undefined,
+      interactionContext: data.interactionContext
+        ? (JSON.parse(data.interactionContext) as InteractionContext)
+        : undefined,
+      adapterCapabilities: data.adapterCapabilities
+        ? JSON.parse(data.adapterCapabilities)
+        : undefined,
+      deliveryPolicy: data.deliveryPolicy ? JSON.parse(data.deliveryPolicy) : undefined,
+      deliveryAcknowledgement: data.deliveryAcknowledgement
+        ? JSON.parse(data.deliveryAcknowledgement)
+        : undefined,
+      generationCompleted: data.generationCompleted === '1',
     };
   }
 }

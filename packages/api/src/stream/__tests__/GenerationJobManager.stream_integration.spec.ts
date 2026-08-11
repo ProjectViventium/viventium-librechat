@@ -164,6 +164,46 @@ describe('GenerationJobManager Integration Tests', () => {
       unsubscribe();
       await GenerationJobManager.destroy();
     });
+
+    test('marks Main complete for discovery while retaining the Phase B runtime', async () => {
+      const { GenerationJobManager } = await import('../GenerationJobManager');
+      const { InMemoryJobStore } = await import('../implementations/InMemoryJobStore');
+      const { InMemoryEventTransport } = await import('../implementations/InMemoryEventTransport');
+
+      GenerationJobManager.configure({
+        jobStore: new InMemoryJobStore({ ttlAfterComplete: 60000 }),
+        eventTransport: new InMemoryEventTransport(),
+        isRedis: false,
+        cleanupOnComplete: true,
+      });
+      await GenerationJobManager.initialize();
+
+      const streamId = `inmem-main-complete-${Date.now()}`;
+      const userId = 'phase-b-user';
+      await GenerationJobManager.createJob(streamId, userId);
+
+      const finalEvent = {
+        final: true,
+        conversation: { conversationId: streamId },
+      } as never;
+
+      await expect(
+        GenerationJobManager.markMainResponseComplete(streamId, finalEvent),
+      ).resolves.toBe(true);
+      await expect(GenerationJobManager.getActiveJobIdsForUser(userId)).resolves.toEqual([]);
+      const completedMain = await GenerationJobManager.getJob(streamId);
+      expect(completedMain?.status).toBe('complete');
+      const storedFinalEvent =
+        typeof completedMain?.finalEvent === 'string'
+          ? JSON.parse(completedMain.finalEvent)
+          : completedMain?.finalEvent;
+      expect(storedFinalEvent).toEqual(finalEvent);
+      expect(GenerationJobManager.getRuntimeStats().runtimeStateCount).toBe(1);
+
+      await GenerationJobManager.completeJob(streamId);
+      await expect(GenerationJobManager.getJob(streamId)).resolves.toBeUndefined();
+      await GenerationJobManager.destroy();
+    });
   });
 
   describe('Redis Mode', () => {

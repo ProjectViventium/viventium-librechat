@@ -39,8 +39,12 @@ const { getLogStores } = require('~/cache');
  * without relying on the chat model to choose connected-account tools.
  * === VIVENTIUM END === */
 const {
+  isGlassHiveLaunchTool,
   maybeInjectGlassHiveCapabilityBroker,
 } = require('~/server/services/viventium/GlassHiveCapabilityBootstrapService');
+const {
+  markCallbackBackedVoiceContinuation,
+} = require('~/server/services/viventium/GlassHiveDispatchContinuationService');
 
 /* === VIVENTIUM START ===
  * Feature: Deep Telegram timing instrumentation (toggleable)
@@ -614,6 +618,19 @@ function createToolInstance({
         oauthEnd,
         graphTokenResolver: getGraphApiToken,
       });
+
+      const requestBody = config?.configurable?.requestBody;
+      if (
+        isGlassHiveLaunchTool({ serverName, toolName }) &&
+        requestBody?.voiceMode === true &&
+        typeof requestBody?.viventiumVoiceTaskId === 'string'
+      ) {
+        await markCallbackBackedVoiceContinuation({
+          result,
+          requestBody,
+          continuationKey: config?.toolCall?.id || stepId,
+        });
+      }
 
       if (isAssistantsEndpoint(provider) && Array.isArray(result)) {
         return result[0];

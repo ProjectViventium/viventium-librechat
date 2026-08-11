@@ -82,7 +82,7 @@ describe('conversationThreading', () => {
     expect(resolveLatestLeafMessageId(messages)).toBe('assistant-phase2');
   });
 
-  test('resolveLatestLeafMessageId ignores Listen-Only transcript chains for live replies', () => {
+  test('resolveLatestLeafMessageId ignores every passive voice transcript for live replies', () => {
     const messages = [
       {
         messageId: 'user-1',
@@ -116,12 +116,25 @@ describe('conversationThreading', () => {
           },
         },
       },
+      {
+        messageId: 'guest-ambient-1',
+        parentMessageId: 'listen-only-2',
+        createdAt: '2026-03-26T20:07:00.000Z',
+        isCreatedByUser: false,
+        metadata: {
+          viventium: {
+            type: 'voice_ambient_transcript',
+            mode: 'call',
+            actorTrust: 'authenticated_participant',
+          },
+        },
+      },
     ];
 
     expect(resolveLatestLeafMessageId(messages)).toBe('assistant-1');
   });
 
-  test('resolveReusableConversationState resumes after the latest non-Listen-Only leaf', async () => {
+  test('resolveReusableConversationState resumes after the latest non-passive voice leaf', async () => {
     mockGetMessages.mockResolvedValueOnce([
       {
         messageId: 'user-1',
@@ -155,6 +168,19 @@ describe('conversationThreading', () => {
           },
         },
       },
+      {
+        messageId: 'guest-ambient-1',
+        parentMessageId: 'listen-only-2',
+        createdAt: '2026-03-26T20:07:00.000Z',
+        isCreatedByUser: false,
+        metadata: {
+          viventium: {
+            type: 'voice_ambient_transcript',
+            mode: 'call',
+            actorTrust: 'authenticated_participant',
+          },
+        },
+      },
     ]);
 
     const state = await resolveReusableConversationState({
@@ -168,7 +194,7 @@ describe('conversationThreading', () => {
     expect(state.reason).toBe('existing');
     expect(mockGetMessages).toHaveBeenCalledWith(
       { conversationId: 'conv-1' },
-      expect.stringContaining('metadata.viventium.mode'),
+      expect.stringContaining('metadata.viventium.actorTrust'),
     );
   });
 

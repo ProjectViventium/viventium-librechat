@@ -21,6 +21,10 @@ const createViventiumCallSession = require('./viventiumCallSession');
  * Added: 2026-04-20
  * === VIVENTIUM END === */
 const createViventiumVoiceIngressEvent = require('./viventiumVoiceIngressEvent');
+/* === VIVENTIUM START === SpeakerSegmentV1 call-scoped revision ledger. === VIVENTIUM END === */
+const createViventiumVoiceSpeakerSegment = require('./viventiumVoiceSpeakerSegment');
+const createViventiumVoiceTask = require('./viventiumVoiceTask');
+const createViventiumVoiceTaskSuppression = require('./viventiumVoiceTaskSuppression');
 /* === VIVENTIUM START ===
  * Feature: Credits purchase request audit model.
  * Added: 2026-02-18
@@ -57,6 +61,9 @@ module.exports = {
   GatewayLinkToken: createGatewayLinkToken(mongoose),
   ViventiumCallSession: createViventiumCallSession(mongoose),
   ViventiumVoiceIngressEvent: createViventiumVoiceIngressEvent(mongoose),
+  ViventiumVoiceSpeakerSegment: createViventiumVoiceSpeakerSegment(mongoose),
+  ViventiumVoiceTask: createViventiumVoiceTask(mongoose),
+  ViventiumVoiceTaskSuppression: createViventiumVoiceTaskSuppression(mongoose),
   ViventiumCreditsRequest: createViventiumCreditsRequest(mongoose),
   ViventiumTelegramIngressEvent: createViventiumTelegramIngressEvent(mongoose),
   ViventiumGatewayIngressEvent: createViventiumGatewayIngressEvent(mongoose),

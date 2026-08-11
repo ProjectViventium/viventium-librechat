@@ -13,6 +13,19 @@
 
 'use strict';
 
+/* === VIVENTIUM START ===
+ * Feature: Hermetic agent-sync help.
+ * Purpose: Help is a source-checkout entrypoint and must not require compiled API workspace
+ * packages. Function declarations are hoisted, so the canonical usage renderer remains singular.
+ * === VIVENTIUM END === */
+if (
+  require.main === module &&
+  process.argv.slice(2).some((arg) => arg === '--help' || arg === '-h' || arg === 'help')
+) {
+  printUsage();
+  process.exit(0);
+}
+
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');

@@ -9,6 +9,9 @@ const mockCheckAndIncrementPendingRequest = jest.fn(async () => ({
   limit: 10,
 }));
 const mockEnsureMorningBriefing = jest.fn(async () => undefined);
+const mockIsVoiceTaskSuppressed = jest.fn(() => false);
+const mockMessageFindOneAndDelete = jest.fn();
+const mockConversationUpdateOne = jest.fn();
 
 const mockGenerationJobManager = {
   createJob: jest.fn(),
@@ -60,6 +63,11 @@ jest.mock('~/models', () => ({
   saveMessage: (...args) => mockSaveMessage(...args),
 }));
 
+jest.mock('~/db/models', () => ({
+  Message: { findOneAndDelete: (...args) => mockMessageFindOneAndDelete(...args) },
+  Conversation: { updateOne: (...args) => mockConversationUpdateOne(...args) },
+}));
+
 jest.mock('~/server/services/viventium/telegramTimingDeep', () => ({
   isDeepTimingEnabled: jest.fn(() => false),
   startDeepTiming: jest.fn(() => null),
@@ -72,6 +80,12 @@ jest.mock('~/server/services/viventium/morningBriefingBootstrap', () => ({
 
 jest.mock('~/server/services/viventium/surfacePrompts', () => ({
   stripVoiceControlTagsForDisplay: jest.fn((text) => text),
+}));
+
+jest.mock('~/server/services/viventium/VoiceTaskService', () => ({
+  isVoiceTaskSuppressed: (...args) => mockIsVoiceTaskSuppressed(...args),
+  isVoiceTaskSuppressedDurably: async (...args) => mockIsVoiceTaskSuppressed(...args),
+  setVoiceTaskOwnerCapabilities: jest.fn(),
 }));
 
 const AgentController = require('./request');
@@ -158,6 +172,7 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     mockGenerationJobManager.emitDone.mockResolvedValue(undefined);
     mockGenerationJobManager.completeJob.mockResolvedValue(undefined);
     mockGenerationJobManager.emitChunk.mockResolvedValue(undefined);
+    mockIsVoiceTaskSuppressed.mockReturnValue(false);
     mockGenerationJobManager.updateMetadata.mockResolvedValue(undefined);
     mockGenerationJobManager.setContentParts.mockResolvedValue(undefined);
   });
@@ -230,5 +245,76 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     await Promise.resolve();
 
     expect(mockGenerationJobManager.completeJob).toHaveBeenCalledWith('conv-1');
+  });
+});
+
+/* === VIVENTIUM START ===
+ * Feature: voice task cancellation suppression barrier
+ * Purpose: A remote owner may finish after cancellation; its assistant output must never become
+ * conversation state, while the already-spoken owner request remains durable.
+ * === VIVENTIUM END === */
+describe('voice task cancellation persistence barrier', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockIsVoiceTaskSuppressed.mockReturnValue(true);
+  });
+
+  test('suppresses assistant persistence after cancellation but preserves the user turn', async () => {
+    const req = makeReq();
+    req.body.viventiumVoiceTaskId = 'voice-task-cancelled';
+    const { timedSaveMessage } = AgentController.__testables;
+
+    const suppressed = await timedSaveMessage(
+      req,
+      { messageId: 'assistant-late', isCreatedByUser: false, text: 'late remote result' },
+      { context: 'test' },
+      'db_save_response',
+    );
+    const preserved = await timedSaveMessage(
+      req,
+      { messageId: 'owner-turn', isCreatedByUser: true, text: 'please research this' },
+      { context: 'test' },
+      'db_save_user',
+    );
+
+    expect(suppressed).toEqual({ suppressed: true, taskId: 'voice-task-cancelled' });
+    expect(preserved).toEqual({});
+    expect(mockSaveMessage).toHaveBeenCalledTimes(1);
+    expect(mockSaveMessage.mock.calls[0][1].messageId).toBe('owner-turn');
+  });
+
+  test('removes an assistant result when cancellation lands during the database save', async () => {
+    const req = makeReq();
+    req.body.viventiumVoiceTaskId = 'voice-task-race';
+    const save = deferred();
+    mockIsVoiceTaskSuppressed.mockReturnValue(false);
+    mockSaveMessage.mockImplementationOnce(() => save.promise);
+    mockMessageFindOneAndDelete.mockResolvedValueOnce({ _id: 'assistant-object-id' });
+    mockConversationUpdateOne.mockResolvedValueOnce({ modifiedCount: 1 });
+
+    const pending = AgentController.__testables.timedSaveMessage(
+      req,
+      {
+        messageId: 'assistant-race',
+        conversationId: 'conv-1',
+        isCreatedByUser: false,
+        text: 'late result',
+      },
+      { context: 'test' },
+      'db_save_response',
+    );
+    await Promise.resolve();
+    mockIsVoiceTaskSuppressed.mockReturnValue(true);
+    save.resolve({ messageId: 'assistant-race' });
+
+    await expect(pending).resolves.toEqual({ suppressed: true, taskId: 'voice-task-race' });
+    expect(mockMessageFindOneAndDelete).toHaveBeenCalledWith({
+      user: 'user-1',
+      messageId: 'assistant-race',
+    });
+    expect(mockConversationUpdateOne).toHaveBeenCalledWith(
+      { user: 'user-1', conversationId: 'conv-1' },
+      { $pull: { messages: 'assistant-object-id' } },
+    );
   });
 });

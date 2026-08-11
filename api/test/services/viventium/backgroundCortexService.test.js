@@ -133,6 +133,10 @@ jest.mock('~/server/services/viventium/GlassHiveCapabilityBootstrapService', () 
   })),
 }));
 
+jest.mock('~/app/clients/tools/util/fileSearch', () => ({
+  primeFiles: jest.fn(async () => ({ files: [], toolContext: '' })),
+}));
+
 jest.mock('~/server/controllers/ModelController', () => ({
   getModelsConfig: jest.fn(async () => ({
     anthropic: ['claude-sonnet-4-5'],

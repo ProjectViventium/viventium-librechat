@@ -1071,7 +1071,9 @@ async function buildConversationRecallContextSnippets({ userId, selectedResults 
             user: userId,
             unfinished: { $ne: true },
             error: { $ne: true },
-            'metadata.viventium.type': { $ne: 'listen_only_transcript' },
+            'metadata.viventium.type': {
+              $nin: ['listen_only_transcript', 'voice_ambient_transcript'],
+            },
             'metadata.viventium.mode': { $ne: 'listen_only' },
             'metadata.viventium.memoryEligible': { $ne: false },
             'metadata.viventium.qaRun': { $ne: true },
@@ -1200,7 +1202,9 @@ async function searchConversationRecallSourceMatches({
       user: userId,
       unfinished: { $ne: true },
       error: { $ne: true },
-      'metadata.viventium.type': { $ne: 'listen_only_transcript' },
+      'metadata.viventium.type': {
+        $nin: ['listen_only_transcript', 'voice_ambient_transcript'],
+      },
       'metadata.viventium.mode': { $ne: 'listen_only' },
       'metadata.viventium.memoryEligible': { $ne: false },
       'metadata.viventium.qaRun': { $ne: true },

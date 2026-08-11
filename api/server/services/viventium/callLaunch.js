@@ -287,15 +287,24 @@ function resolveVoiceAgentName() {
 
 function buildPlaygroundUrl(
   session,
-  { preferPublicPlayground = false, voiceAgentName = resolveVoiceAgentName() } = {},
+  { preferPublicPlayground = false, launchCapability = '' } = {},
 ) {
   const playgroundBase = resolvePlaygroundBaseUrl({ preferPublicPlayground });
   const url = new URL(playgroundBase);
 
-  url.searchParams.set('roomName', session.roomName);
+  url.pathname = `${url.pathname.replace(/\/$/, '')}/call-bootstrap`;
+
   url.searchParams.set('callSessionId', session.callSessionId);
-  url.searchParams.set('agentName', voiceAgentName);
   url.searchParams.set('autoConnect', '1');
+  if (typeof launchCapability === 'string' && launchCapability) {
+    const fragment = new URLSearchParams();
+    fragment.set('viventiumCallLaunch', launchCapability);
+    url.hash = fragment.toString();
+  } else if (typeof session.browserCapability === 'string' && session.browserCapability) {
+    const fragment = new URLSearchParams();
+    fragment.set('viventiumCallCapability', session.browserCapability);
+    url.hash = fragment.toString();
+  }
 
   return url.toString();
 }
@@ -307,6 +316,8 @@ function buildCallLaunchResponse(session, options = {}) {
     callSessionId: session.callSessionId,
     conversationId: session.conversationId,
     roomName: session.roomName,
+    gatewayAgentName: session.gatewayAgentName || resolveVoiceAgentName(),
+    ownerParticipantIdentity: session.ownerParticipantIdentity || null,
     requestedVoiceRoute: session.requestedVoiceRoute,
     playgroundUrl,
     callUrl: playgroundUrl,

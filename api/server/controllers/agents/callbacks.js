@@ -458,6 +458,12 @@ function getDefaultHandlers({
             getVoiceProcessStreamStartAt(req),
             `model=${modelName}`,
           );
+          logVoiceLatencyStage(
+            req,
+            'agent_generation_start',
+            getVoiceProcessStreamStartAt(req),
+            `model=${modelName}`,
+          );
         }
       },
     },
@@ -474,6 +480,7 @@ function getDefaultHandlers({
         const metric = markVoiceOrchEvent(req, 'llm_stream');
         if (metric?.firstSeen) {
           logVoiceLatencyStage(req, 'first_llm_stream', getVoiceProcessStreamStartAt(req), '');
+          logVoiceLatencyStage(req, 'first_model_token', getVoiceProcessStreamStartAt(req), '');
         }
       },
     },

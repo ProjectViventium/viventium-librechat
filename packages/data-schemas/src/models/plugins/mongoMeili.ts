@@ -104,6 +104,7 @@ function isViventiumMeiliOptOut(doc: unknown): boolean {
   return (
     !_.isNil(row?.expiredAt) ||
     (metadata?.type === 'listen_only_transcript' && metadata?.mode === 'listen_only') ||
+    metadata?.type === 'voice_ambient_transcript' ||
     metadata?.qaRun === true ||
     metadata?.memoryEligible === false
   );
@@ -111,7 +112,9 @@ function isViventiumMeiliOptOut(doc: unknown): boolean {
 
 const getMeiliEligibleQuery = (): FilterQuery<unknown> => ({
   expiredAt: null,
-  'metadata.viventium.type': { $ne: 'listen_only_transcript' },
+  'metadata.viventium.type': {
+    $nin: ['listen_only_transcript', 'voice_ambient_transcript'],
+  },
   'metadata.viventium.mode': { $ne: 'listen_only' },
   'metadata.viventium.qaRun': { $ne: true },
   'metadata.viventium.memoryEligible': { $ne: false },
@@ -436,7 +439,9 @@ const createMeiliMongooseModel = ({
           const meiliIds = meiliRecords.map((record) => record.primaryValue);
           const query: Record<string, unknown> = {};
           query[primaryKey] = { $in: meiliIds };
-          query['metadata.viventium.type'] = { $ne: 'listen_only_transcript' };
+          query['metadata.viventium.type'] = {
+            $nin: ['listen_only_transcript', 'voice_ambient_transcript'],
+          };
           query['metadata.viventium.mode'] = { $ne: 'listen_only' };
           query['metadata.viventium.qaRun'] = { $ne: true };
           query['metadata.viventium.memoryEligible'] = { $ne: false };

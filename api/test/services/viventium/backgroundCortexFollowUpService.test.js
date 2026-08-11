@@ -73,6 +73,10 @@ jest.mock('~/server/services/BackgroundCortexService', () => ({
   mapProvider: jest.fn(() => 'openai'),
 }));
 
+jest.mock('~/app/clients/tools/util/fileSearch', () => ({
+  primeFiles: jest.fn(async () => ({ files: [], toolContext: '' })),
+}));
+
 jest.mock('~/models', () => ({
   getMessage: jest.fn(),
   getMessages: jest.fn(),

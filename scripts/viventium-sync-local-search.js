@@ -20,7 +20,9 @@ const failedTaskLookback = process.env.VIVENTIUM_MEILI_FAILED_TASK_LOOKBACK
 const expectedMeiliPrimaryKey = '_meiliId';
 const meiliEligibleQuery = {
   expiredAt: null,
-  'metadata.viventium.type': { $ne: 'listen_only_transcript' },
+  'metadata.viventium.type': {
+    $nin: ['listen_only_transcript', 'voice_ambient_transcript'],
+  },
   'metadata.viventium.mode': { $ne: 'listen_only' },
 };
 

@@ -14,7 +14,7 @@ const express = require('express');
 const crypto = require('crypto');
 const { logger } = require('@librechat/data-schemas');
 const { ContentTypes } = require('librechat-data-provider');
-const { Conversation } = require('~/db/models');
+const { Conversation, Message } = require('~/db/models');
 const db = require('~/models');
 const {
   GLASSHIVE_CALLBACK_TYPE,
@@ -22,7 +22,28 @@ const {
 const {
   enqueueGlassHiveCallbackDelivery,
 } = require('~/server/services/viventium/GlassHiveCallbackDeliveryService');
+const {
+  claimOrReplaceCallSessionConversationId,
+  getCallSession,
+} = require('~/server/services/viventium/CallSessionService');
+const {
+  registerGlassHiveVoiceTaskActionCapabilities,
+} = require('~/server/services/viventium/GlassHiveVoiceTaskActionService');
 const { resolveLatestLeafMessageId } = require('~/server/services/viventium/conversationThreading');
+const {
+  completeVoiceTask,
+  confirmVoiceTaskOwnerCancellation,
+  createVoiceTask,
+  failVoiceTask,
+  flushVoiceTaskPersistence,
+  getVoiceTaskByStreamId,
+  hydrateVoiceTasksForCall,
+  hydrateVoiceTaskByStreamId,
+  isVoiceTaskSuppressedDurably,
+  linkVoiceTaskOwnerChild,
+  observeGenerationEvent,
+  setVoiceTaskOwnerCapabilities,
+} = require('~/server/services/viventium/VoiceTaskService');
 
 const router = express.Router();
 const CALLBACK_SKEW_SEC = 5 * 60;
@@ -67,6 +88,185 @@ const ACTIVE_WORKER_FAILURE_CODES = new Set([
   'host_worker_already_active',
 ]);
 const GENERATION_PLACEHOLDER_TEXTS = new Set(['generation in progress.']);
+
+function glassHiveVoiceTaskStreamId(runId) {
+  const value = String(runId || '')
+    .trim()
+    .slice(0, 120);
+  return value ? `glasshive:${value}` : '';
+}
+
+async function isGlassHiveVoiceTaskSuppressed(task) {
+  if (!task?.taskId) return false;
+  return isVoiceTaskSuppressedDurably(task.taskId, {
+    callSessionId: task.callSessionId,
+    userId: task.userId,
+    streamId: task.streamId,
+  });
+}
+
+async function ensureGlassHiveVoiceTask(body = {}) {
+  if (
+    String(body.surface || '')
+      .trim()
+      .toLowerCase() !== 'voice'
+  ) {
+    return { task: null, parentTask: null, mismatch: false };
+  }
+  const callSessionId = String(body.voice_call_session_id || '')
+    .trim()
+    .slice(0, 160);
+  const runId = String(body.run_id || '')
+    .trim()
+    .slice(0, 120);
+  const userId = String(body.user_id || '')
+    .trim()
+    .slice(0, 160);
+  const conversationId = String(body.conversation_id || '')
+    .trim()
+    .slice(0, 160);
+  const parentStreamId = String(body.stream_id || body.voice_request_id || '')
+    .trim()
+    .slice(0, 160);
+  if (!callSessionId || !runId || !userId || !conversationId) {
+    return { task: null, parentTask: null, mismatch: true };
+  }
+  const session = await getCallSession(callSessionId);
+  if (!session || session.callSessionId !== callSessionId || session.userId !== userId) {
+    return { task: null, parentTask: null, mismatch: true };
+  }
+  let boundSession = session;
+  if (!session.conversationId || session.conversationId === 'new') {
+    boundSession = await claimOrReplaceCallSessionConversationId(callSessionId, conversationId);
+  }
+  if (
+    !boundSession ||
+    boundSession.callSessionId !== callSessionId ||
+    boundSession.userId !== userId ||
+    boundSession.conversationId !== conversationId
+  ) {
+    return { task: null, parentTask: null, mismatch: true };
+  }
+  await hydrateVoiceTasksForCall({ callSessionId, userId });
+  await hydrateVoiceTaskByStreamId(glassHiveVoiceTaskStreamId(runId), {
+    callSessionId,
+    userId,
+  });
+  if (parentStreamId) {
+    await hydrateVoiceTaskByStreamId(parentStreamId, { callSessionId, userId });
+  }
+  const parentTask = parentStreamId ? getVoiceTaskByStreamId(parentStreamId) : null;
+  if (
+    parentTask &&
+    (parentTask.callSessionId !== callSessionId ||
+      (parentTask.userId && parentTask.userId !== userId) ||
+      (parentTask.conversationId && parentTask.conversationId !== conversationId))
+  ) {
+    return { task: null, parentTask, mismatch: true };
+  }
+  const task = createVoiceTask({
+    callSessionId,
+    userId,
+    conversationId,
+    turnId: runId,
+    streamId: glassHiveVoiceTaskStreamId(runId),
+    parentTaskId: parentTask?.taskId,
+    owner: { kind: 'glasshive_run', id: runId },
+  });
+  setVoiceTaskOwnerCapabilities(task.taskId, {
+    kind: 'glasshive_run',
+    ownerId: runId,
+    cancellationConfirmable: false,
+  });
+  if (parentTask && (await isGlassHiveVoiceTaskSuppressed(parentTask))) {
+    await confirmVoiceTaskOwnerCancellation(
+      task.taskId,
+      'The originating voice task was already cancelled; worker output remains suppressed.',
+    );
+  }
+  await flushVoiceTaskPersistence();
+  if (parentTask) {
+    linkVoiceTaskOwnerChild(parentTask.taskId, {
+      continuationPrefix: 'glasshive_dispatch:',
+      resolvedOwnerId: `glasshive_run:${runId}`,
+    });
+    await flushVoiceTaskPersistence();
+  }
+  return { task, parentTask, mismatch: false };
+}
+
+async function applyGlassHiveVoiceTaskCallback(body = {}, task, { resultMessageId } = {}) {
+  if (!task) {
+    return null;
+  }
+  const callbackEventId = String(body.callback_id || '')
+    .trim()
+    .slice(0, 160);
+  const event = String(body.event || '').trim();
+  if (event === 'run.started') {
+    return observeGenerationEvent(task.taskId, {
+      event: 'on_agent_update',
+      data: {
+        eventId: callbackEventId,
+        name: 'GlassHive worker',
+        message: 'Worker started',
+      },
+    });
+  }
+  if (event === 'checkpoint.ready') {
+    return failVoiceTask(task.taskId, {
+      code: 'glasshive_checkpoint_unavailable',
+      message:
+        sanitizeCallbackMessage(body.message) ||
+        'This worker stopped at a checkpoint that cannot currently accept call input.',
+    });
+  }
+  if (event === 'artifact.created') {
+    return observeGenerationEvent(task.taskId, {
+      event: 'source',
+      data: {
+        eventId: callbackEventId,
+        source: {
+          id: String(body.run_id || '').trim(),
+          title:
+            sanitizeCallbackMetadataValue(body?.deliverable?.label, { maxLength: 120 }) ||
+            'GlassHive artifact',
+          provider: 'glasshive',
+        },
+      },
+    });
+  }
+  if (event === 'run.completed') {
+    const deliverable = callbackDeliverable(body);
+    if (deliverable) {
+      observeGenerationEvent(task.taskId, {
+        event: 'source',
+        data: {
+          eventId: `${callbackEventId}:source`,
+          source: {
+            id: String(body.run_id || '').trim(),
+            title: deliverable.label || 'GlassHive result',
+            provider: 'glasshive',
+          },
+        },
+      });
+    }
+    return completeVoiceTask(task.taskId, { resultMessageId });
+  }
+  if (event === 'run.failed') {
+    return failVoiceTask(task.taskId, {
+      code: String(body.failure_code || body.failure_class || 'glasshive_run_failed').slice(0, 80),
+      message: sanitizeCallbackMessage(body.message) || 'The GlassHive run failed.',
+    });
+  }
+  if (event === 'run.cancelled' || event === 'run.interrupted') {
+    return await confirmVoiceTaskOwnerCancellation(
+      task.taskId,
+      sanitizeCallbackMessage(body.message) || 'The GlassHive worker confirmed it stopped.',
+    );
+  }
+  return null;
+}
 
 function stableStringify(value) {
   if (value === null || typeof value !== 'object') {
@@ -280,14 +480,16 @@ function hasCallbackDeliverable(body = {}) {
   }
   return Boolean(
     String(deliverable.workspace_path || deliverable.workspacePath || '').trim() ||
-      String(deliverable.open_url || deliverable.openUrl || '').trim() ||
-      String(deliverable.download_url || deliverable.downloadUrl || '').trim() ||
-      String(deliverable.label || '').trim(),
+    String(deliverable.open_url || deliverable.openUrl || '').trim() ||
+    String(deliverable.download_url || deliverable.downloadUrl || '').trim() ||
+    String(deliverable.label || '').trim(),
   );
 }
 
 function isEvidenceGateFailure({ failureCode = '', message = '' } = {}) {
-  const code = String(failureCode || '').trim().toLowerCase();
+  const code = String(failureCode || '')
+    .trim()
+    .toLowerCase();
   if (code === 'glasshive_evidence_check_failed') {
     return true;
   }
@@ -454,7 +656,8 @@ function resolveCallbackTreeParentMessageId({
       };
     }
     return {
-      parentMessageId: currentLeaf.message.parentMessageId || requestedParentMessageId || anchorMessageId || '',
+      parentMessageId:
+        currentLeaf.message.parentMessageId || requestedParentMessageId || anchorMessageId || '',
       currentLeaf,
       updateMessage: currentLeaf.message,
     };
@@ -637,6 +840,30 @@ function buildCallbackMetadata({
   };
 }
 
+async function rollbackSuppressedVoiceCallback({
+  priorStatusMessage,
+  followUpMessage,
+  userId,
+  conversationId,
+}) {
+  if (priorStatusMessage && typeof db.updateMessage === 'function') {
+    await db.updateMessage({ user: { id: userId } }, priorStatusMessage, {
+      context: 'viventium/routes/glasshive.callback.cancel_rollback',
+      overrideTimestamp: true,
+    });
+    return;
+  }
+  if (typeof db.deleteMessages === 'function') {
+    await db.deleteMessages({ user: userId, messageId: followUpMessage.messageId });
+  } else {
+    await Message.deleteOne({ user: userId, messageId: followUpMessage.messageId });
+  }
+  await Conversation.updateOne(
+    { user: userId, conversationId },
+    { $pull: { messages: followUpMessage.messageId } },
+  );
+}
+
 function callbackMessageTimestamps({ messages, requestedParentMessageId, priorStatusMessage }) {
   const now = new Date();
   const requestedParent = messageById(messages, requestedParentMessageId);
@@ -693,15 +920,24 @@ router.post('/callback', async (req, res) => {
   const requestedParentMessageId = String(req.body?.parent_message_id || '').trim();
   const anchorMessageId = String(req.body?.message_id || '').trim();
   const event = String(req.body?.event || '').trim();
-  if (!USER_VISIBLE_CALLBACK_EVENTS.has(event)) {
+  const taskOnlyEvent =
+    event === 'run.started' &&
+    String(req.body?.surface || '')
+      .trim()
+      .toLowerCase() === 'voice';
+  if (!USER_VISIBLE_CALLBACK_EVENTS.has(event) && !taskOnlyEvent) {
     return res.status(202).json({ status: 'ignored', reason: 'non_user_visible_event' });
   }
   const text = callbackText(req.body);
-  if (!text) {
+  if (!text && !taskOnlyEvent) {
     return res.status(202).json({ status: 'ignored', reason: 'missing_context_or_text' });
   }
   const fullText = callbackFullText(req.body || {}, text);
-  if (!userId || !conversationId || !requestedParentMessageId || !anchorMessageId) {
+  if (
+    !userId ||
+    !conversationId ||
+    (!taskOnlyEvent && (!requestedParentMessageId || !anchorMessageId))
+  ) {
     return res.status(425).json({ error: 'missing_callback_anchor' });
   }
   if (typeof db.getConvo !== 'function') {
@@ -711,6 +947,37 @@ router.post('/callback', async (req, res) => {
   const conversation = await db.getConvo(userId, conversationId);
   if (!conversation) {
     return res.status(403).json({ error: 'conversation_not_found' });
+  }
+  let voiceTaskResolution;
+  try {
+    voiceTaskResolution = await ensureGlassHiveVoiceTask(req.body || {});
+  } catch (err) {
+    logger.warn(
+      '[VIVENTIUM][glasshive] Voice task session binding unavailable:',
+      sanitizeCallbackErrorForLog(err),
+    );
+    return res.status(503).json({ error: 'voice_task_binding_unavailable' });
+  }
+  if (voiceTaskResolution.mismatch) {
+    return res.status(409).json({ error: 'voice_task_session_mismatch' });
+  }
+  const voiceTask = voiceTaskResolution.task;
+  if (voiceTask && (await isGlassHiveVoiceTaskSuppressed(voiceTask))) {
+    if (event === 'run.cancelled' || event === 'run.interrupted') {
+      await applyGlassHiveVoiceTaskCallback(req.body || {}, voiceTask);
+      rememberCallback(req.body || {});
+      return res.status(202).json({ status: 'accepted', reason: 'cancellation_confirmed' });
+    }
+    rememberCallback(req.body || {});
+    return res.status(202).json({ status: 'suppressed', reason: 'voice_task_cancelled' });
+  }
+  if (voiceTask) {
+    registerGlassHiveVoiceTaskActionCapabilities({ body: req.body || {}, task: voiceTask });
+  }
+  if (taskOnlyEvent) {
+    await applyGlassHiveVoiceTaskCallback(req.body || {}, voiceTask);
+    rememberCallback(req.body || {});
+    return res.status(202).json({ status: 'accepted', reason: 'voice_task_updated' });
   }
   const callbackWasRecentlySeen = hasSeenCallback(req.body || {});
   if (callbackWasRecentlySeen && !needsSurfaceDelivery(req.body || {})) {
@@ -796,6 +1063,15 @@ router.post('/callback', async (req, res) => {
     previousMetadata: priorStatusMessage?.metadata,
     hasFullText: Boolean(fullText),
   });
+  if (voiceTask) {
+    metadata.viventium = {
+      ...metadata.viventium,
+      callSessionId: voiceTask.callSessionId,
+      voiceTaskId: voiceTask.taskId,
+      memoryDeferredPostCall: true,
+      memoryEligible: false,
+    };
+  }
   const timestamps = callbackMessageTimestamps({
     messages,
     requestedParentMessageId,
@@ -818,6 +1094,10 @@ router.post('/callback', async (req, res) => {
     ...timestamps,
   };
 
+  if (voiceTask && (await isGlassHiveVoiceTaskSuppressed(voiceTask))) {
+    rememberCallback(req.body || {});
+    return res.status(202).json({ status: 'suppressed', reason: 'voice_task_cancelled' });
+  }
   try {
     if (priorStatusMessage && typeof db.updateMessage === 'function') {
       await db.updateMessage({ user: { id: userId } }, followUpMessage, {
@@ -834,6 +1114,16 @@ router.post('/callback', async (req, res) => {
       conversationId,
       updatedAt: timestamps.updatedAt,
     });
+    if (voiceTask && (await isGlassHiveVoiceTaskSuppressed(voiceTask))) {
+      await rollbackSuppressedVoiceCallback({
+        priorStatusMessage,
+        followUpMessage,
+        userId,
+        conversationId,
+      });
+      rememberCallback(req.body || {});
+      return res.status(202).json({ status: 'suppressed', reason: 'voice_task_cancelled' });
+    }
   } catch (err) {
     logger.warn(
       '[VIVENTIUM][glasshive] Failed to persist callback message:',
@@ -842,7 +1132,19 @@ router.post('/callback', async (req, res) => {
     return res.status(500).json({ error: 'persist_failed' });
   }
 
+  if (voiceTask && (await isGlassHiveVoiceTaskSuppressed(voiceTask))) {
+    rememberCallback(req.body || {});
+    return res.status(202).json({ status: 'suppressed', reason: 'voice_task_cancelled' });
+  }
+  await applyGlassHiveVoiceTaskCallback(req.body || {}, voiceTask, {
+    resultMessageId: messageId,
+  });
+
   try {
+    if (voiceTask && (await isGlassHiveVoiceTaskSuppressed(voiceTask))) {
+      rememberCallback(req.body || {});
+      return res.status(202).json({ status: 'suppressed', reason: 'voice_task_cancelled' });
+    }
     await enqueueSurfaceDeliveryOrThrow({
       body: req.body || {},
       message: followUpMessage,

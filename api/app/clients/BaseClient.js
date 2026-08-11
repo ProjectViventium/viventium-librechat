@@ -40,7 +40,7 @@ const {
   enforceAnthropicInlineDocumentLimits,
 } = require('~/server/services/viventium/anthropicPayloadGuard');
 const {
-  isListenOnlyTranscriptMessage,
+  isPassiveVoiceTranscriptMessage,
 } = require('~/server/services/viventium/listenOnlyTranscript');
 /* === VIVENTIUM START ===
  * Feature: Voice message correlation metadata.
@@ -970,7 +970,7 @@ class BaseClient {
       messages,
       parentMessageId,
       mapMethod,
-      skipCondition: isListenOnlyTranscriptMessage,
+      skipCondition: isPassiveVoiceTranscriptMessage,
     });
 
     _messages = await this.addPreviousAttachments(_messages);

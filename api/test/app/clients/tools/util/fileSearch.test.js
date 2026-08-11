@@ -1915,7 +1915,9 @@ describe('fileSearch.js - tuple return validation', () => {
       expect(aggregatePipeline[0].$match).toEqual(
         expect.objectContaining({
           user: 'user1',
-          'metadata.viventium.type': { $ne: 'listen_only_transcript' },
+          'metadata.viventium.type': {
+            $nin: ['listen_only_transcript', 'voice_ambient_transcript'],
+          },
           'metadata.viventium.mode': { $ne: 'listen_only' },
           'metadata.viventium.memoryEligible': { $ne: false },
           'metadata.viventium.qaRun': { $ne: true },
@@ -2120,7 +2122,9 @@ describe('fileSearch.js - tuple return validation', () => {
           return queryResult([]);
         }
         expect(filter).toMatchObject({
-          'metadata.viventium.type': { $ne: 'listen_only_transcript' },
+          'metadata.viventium.type': {
+            $nin: ['listen_only_transcript', 'voice_ambient_transcript'],
+          },
           'metadata.viventium.mode': { $ne: 'listen_only' },
         });
         return sourceQuery;

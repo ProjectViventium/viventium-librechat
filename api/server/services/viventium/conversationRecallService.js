@@ -624,7 +624,9 @@ async function buildConversationRecallCorpus({ userId, agentId }) {
     user: userId,
     ...(conversationIdsFilter != null ? { conversationId: conversationIdsFilter } : {}),
     ...(INCLUDE_ASSISTANT_MESSAGES ? {} : { isCreatedByUser: true }),
-    'metadata.viventium.type': { $ne: 'listen_only_transcript' },
+    'metadata.viventium.type': {
+      $nin: ['listen_only_transcript', 'voice_ambient_transcript'],
+    },
     'metadata.viventium.mode': { $ne: 'listen_only' },
     'metadata.viventium.memoryEligible': { $ne: false },
     'metadata.viventium.qaRun': { $ne: true },

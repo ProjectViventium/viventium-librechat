@@ -12,14 +12,21 @@ let mockSaveMessage;
 let mockUpdateMessage;
 let mockGetConvo;
 let mockGetMessages;
+let mockDeleteMessages;
 let mockEnqueueGlassHiveCallbackDelivery;
 let mockConversationFindOneAndUpdate;
+let mockConversationUpdateOne;
+let mockGetCallSession;
+let mockClaimOrReplaceCallSessionConversationId;
 
 jest.mock(
   '@librechat/data-schemas',
   () => ({
     logger: {
+      debug: jest.fn(),
+      info: jest.fn(),
       warn: jest.fn(),
+      error: jest.fn(),
     },
   }),
   { virtual: true },
@@ -30,16 +37,25 @@ jest.mock('~/models', () => ({
   getMessages: (...args) => mockGetMessages(...args),
   saveMessage: (...args) => mockSaveMessage(...args),
   updateMessage: (...args) => mockUpdateMessage(...args),
+  deleteMessages: (...args) => mockDeleteMessages(...args),
 }));
 
 jest.mock('~/db/models', () => ({
   Conversation: {
     findOneAndUpdate: (...args) => mockConversationFindOneAndUpdate(...args),
+    updateOne: (...args) => mockConversationUpdateOne(...args),
   },
+  Message: { deleteOne: jest.fn() },
 }));
 
 jest.mock('~/server/services/viventium/GlassHiveCallbackDeliveryService', () => ({
   enqueueGlassHiveCallbackDelivery: (...args) => mockEnqueueGlassHiveCallbackDelivery(...args),
+}));
+
+jest.mock('~/server/services/viventium/CallSessionService', () => ({
+  getCallSession: (...args) => mockGetCallSession(...args),
+  claimOrReplaceCallSessionConversationId: (...args) =>
+    mockClaimOrReplaceCallSessionConversationId(...args),
 }));
 
 function stableStringify(value) {
@@ -79,6 +95,19 @@ function callbackBody(overrides = {}) {
     run_id: 'run-1',
     surface: 'api',
     ...overrides,
+  };
+}
+
+function actionResponse(payload, status = 202) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: {
+      get: jest.fn((name) =>
+        String(name).toLowerCase() === 'content-type' ? 'application/json' : null,
+      ),
+    },
+    text: jest.fn().mockResolvedValue(JSON.stringify(payload)),
   };
 }
 
@@ -164,9 +193,20 @@ describe('/api/viventium/glasshive/callback', () => {
     jest.resetModules();
     mockSaveMessage = jest.fn().mockResolvedValue({});
     mockUpdateMessage = jest.fn().mockResolvedValue({});
+    mockDeleteMessages = jest.fn().mockResolvedValue({ deletedCount: 1 });
     mockGetConvo = jest.fn().mockResolvedValue({ conversationId: 'conv-1', user: 'user-1' });
     mockEnqueueGlassHiveCallbackDelivery = jest.fn().mockResolvedValue(null);
     mockConversationFindOneAndUpdate = jest.fn().mockResolvedValue({});
+    mockConversationUpdateOne = jest.fn().mockResolvedValue({ modifiedCount: 1 });
+    mockGetCallSession = jest.fn().mockImplementation(async (callSessionId) => ({
+      version: 1,
+      callSessionId,
+      userId: 'user-1',
+      conversationId: 'conv-1',
+      status: 'listening',
+      expiresAtMs: Date.now() + 60_000,
+    }));
+    mockClaimOrReplaceCallSessionConversationId = jest.fn();
     mockGetMessages = jest.fn().mockResolvedValue([
       {
         messageId: 'msg-parent',
@@ -184,6 +224,740 @@ describe('/api/viventium/glasshive/callback', () => {
       },
     ]);
     process.env.VIVENTIUM_GLASSHIVE_CALLBACK_SECRET = 'callback-secret';
+    require('~/server/services/viventium/VoiceTaskService').resetVoiceTasksForTests();
+  });
+
+  test('maps signed voice worker callbacks into one monotonic run-scoped task', async () => {
+    const {
+      getVoiceTaskByStreamId,
+      snapshotEvent,
+    } = require('~/server/services/viventium/VoiceTaskService');
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const base = {
+      surface: 'voice',
+      voice_call_session_id: 'call-voice-task',
+      voice_request_id: 'voice-request-task',
+      run_id: 'run-voice-task',
+    };
+    const started = callbackBody({ ...base, event: 'run.started', message: '' });
+    const startedRes = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/glasshive/callback',
+        headers: { 'x-glasshive-signature': signature(started) },
+        body: started,
+      }),
+      startedRes,
+    );
+    expect(startedRes.statusCode).toBe(202);
+    const task = getVoiceTaskByStreamId('glasshive:run-voice-task');
+    expect(task).toMatchObject({
+      callSessionId: 'call-voice-task',
+      state: 'running',
+      owner: { kind: 'glasshive_run', id: 'run-voice-task' },
+    });
+    const startedSequence = task.sequence;
+
+    const artifact = callbackBody({
+      ...base,
+      callback_id: 'cb-voice-artifact',
+      event: 'artifact.created',
+      message: 'A source is ready.',
+      deliverable: { label: 'Interim source' },
+    });
+    const artifactRes = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/glasshive/callback',
+        headers: { 'x-glasshive-signature': signature(artifact) },
+        body: artifact,
+      }),
+      artifactRes,
+    );
+    expect(artifactRes.statusCode).toBe(200);
+    expect(snapshotEvent(task.taskId)).toMatchObject({
+      state: 'running',
+      sources: [expect.objectContaining({ title: 'Interim source', provider: 'glasshive' })],
+      retryable: false,
+    });
+
+    const completed = callbackBody({
+      ...base,
+      callback_id: 'cb-voice-completed',
+      event: 'run.completed',
+      deliverable: { label: 'Verified report' },
+    });
+    const completedRes = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/glasshive/callback',
+        headers: { 'x-glasshive-signature': signature(completed) },
+        body: completed,
+      }),
+      completedRes,
+    );
+    expect(completedRes.statusCode).toBe(200);
+    expect(snapshotEvent(task.taskId)).toMatchObject({
+      state: 'completed',
+      resultMessageId: completedRes.body.messageId,
+      sources: [expect.objectContaining({ title: 'Verified report', provider: 'glasshive' })],
+    });
+    expect(snapshotEvent(task.taskId).sequence).toBeGreaterThan(startedSequence);
+  });
+
+  test('keeps an unsupported worker checkpoint non-actionable and fail-closed', async () => {
+    const {
+      getVoiceTaskByStreamId,
+      snapshotEvent,
+    } = require('~/server/services/viventium/VoiceTaskService');
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({
+      callback_id: 'cb-voice-unsupported-checkpoint',
+      surface: 'voice',
+      voice_call_session_id: 'call-checkpoint',
+      run_id: 'run-checkpoint',
+      event: 'checkpoint.ready',
+      message: 'Approval requested without an action capability.',
+    });
+    const res = createMockRes();
+
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/glasshive/callback',
+        headers: { 'x-glasshive-signature': signature(body) },
+        body,
+      }),
+      res,
+    );
+
+    expect(res.statusCode).toBe(200);
+    const task = getVoiceTaskByStreamId('glasshive:run-checkpoint');
+    expect(snapshotEvent(task.taskId)).toMatchObject({
+      state: 'failed',
+      retryable: false,
+      error: { code: 'glasshive_checkpoint_unavailable' },
+    });
+    expect(snapshotEvent(task.taskId).needsInput).toBeUndefined();
+  });
+
+  test('registers retry only from a signed exact-run capability without persisting its secret', async () => {
+    const originalBaseUrl = process.env.GLASSHIVE_PROVIDER_BASE_URL;
+    process.env.GLASSHIVE_PROVIDER_BASE_URL = 'http://glasshive.example.test:8766/v1';
+    try {
+      const {
+        getVoiceTaskByStreamId,
+        snapshotEvent,
+      } = require('~/server/services/viventium/VoiceTaskService');
+      const router = require('../glasshive');
+      const app = createTestApp(router);
+      const body = callbackBody({
+        callback_id: 'cb-voice-retry-capability',
+        surface: 'voice',
+        voice_call_session_id: 'call-retry-capability',
+        run_id: 'run-retry-capability',
+        worker_id: 'worker-retry-capability',
+        event: 'run.failed',
+        failure_retryable: true,
+        actionCapabilities: [
+          {
+            version: 1,
+            capabilityId: 'capability-retry-1',
+            operation: 'workspace_continue',
+            action: 'retry',
+            endpoint: '/v1/run-actions',
+            projectId: 'project-retry',
+            workerId: 'worker-retry-capability',
+            runId: 'run-retry-capability',
+            expiresAt: new Date(Date.now() + 60_000).toISOString(),
+            capability: 'opaque-callback-capability',
+          },
+        ],
+      });
+      const res = createMockRes();
+
+      await dispatch(
+        app,
+        createMockReq({
+          url: '/api/viventium/glasshive/callback',
+          headers: { 'x-glasshive-signature': signature(body) },
+          body,
+        }),
+        res,
+      );
+
+      expect(res.statusCode).toBe(200);
+      const task = getVoiceTaskByStreamId('glasshive:run-retry-capability');
+      expect(snapshotEvent(task.taskId)).toMatchObject({ state: 'failed', retryable: true });
+      expect(JSON.stringify(mockSaveMessage.mock.calls)).not.toContain(
+        'opaque-callback-capability',
+      );
+      expect(JSON.stringify(snapshotEvent(task.taskId))).not.toContain(
+        'opaque-callback-capability',
+      );
+    } finally {
+      if (originalBaseUrl == null) {
+        delete process.env.GLASSHIVE_PROVIDER_BASE_URL;
+      } else {
+        process.env.GLASSHIVE_PROVIDER_BASE_URL = originalBaseUrl;
+      }
+    }
+  });
+
+  test('rejects signed voice callback session mismatch and ignores reordered terminal replay', async () => {
+    const {
+      createVoiceTask,
+      getVoiceTaskByStreamId,
+    } = require('~/server/services/viventium/VoiceTaskService');
+    createVoiceTask({
+      callSessionId: 'call-parent',
+      userId: 'user-1',
+      conversationId: 'conv-1',
+      streamId: 'voice-parent-stream',
+      owner: { kind: 'generation_job', id: 'voice-parent-stream' },
+    });
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const mismatch = callbackBody({
+      surface: 'voice',
+      voice_call_session_id: 'call-other',
+      voice_request_id: 'voice-parent-stream',
+      run_id: 'run-mismatch',
+    });
+    const mismatchRes = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/glasshive/callback',
+        headers: { 'x-glasshive-signature': signature(mismatch) },
+        body: mismatch,
+      }),
+      mismatchRes,
+    );
+    expect(mismatchRes.statusCode).toBe(409);
+    expect(mockSaveMessage).not.toHaveBeenCalled();
+
+    const completed = callbackBody({
+      callback_id: 'cb-reordered-complete',
+      surface: 'voice',
+      voice_call_session_id: 'call-parent',
+      voice_request_id: 'voice-parent-stream',
+      run_id: 'run-reordered',
+      event: 'run.completed',
+    });
+    const completedRes = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/glasshive/callback',
+        headers: { 'x-glasshive-signature': signature(completed) },
+        body: completed,
+      }),
+      completedRes,
+    );
+    const task = getVoiceTaskByStreamId('glasshive:run-reordered');
+    expect(task.state).toBe('completed');
+    const terminalSequence = task.sequence;
+
+    const lateStarted = callbackBody({
+      callback_id: 'cb-reordered-start',
+      surface: 'voice',
+      voice_call_session_id: 'call-parent',
+      voice_request_id: 'voice-parent-stream',
+      run_id: 'run-reordered',
+      event: 'run.started',
+      message: '',
+    });
+    const lateStartedRes = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/glasshive/callback',
+        headers: { 'x-glasshive-signature': signature(lateStarted) },
+        body: lateStarted,
+      }),
+      lateStartedRes,
+    );
+    expect(getVoiceTaskByStreamId('glasshive:run-reordered')).toMatchObject({
+      state: 'completed',
+      sequence: terminalSequence,
+    });
+  });
+
+  test.each([
+    ['missing call session', null],
+    [
+      'different session owner',
+      {
+        version: 1,
+        callSessionId: 'call-unbound',
+        userId: 'user-other',
+        conversationId: 'conv-1',
+        status: 'listening',
+      },
+    ],
+    [
+      'different canonical conversation',
+      {
+        version: 1,
+        callSessionId: 'call-unbound',
+        userId: 'user-1',
+        conversationId: 'conv-other',
+        status: 'ended',
+      },
+    ],
+  ])('rejects a signed voice callback bound to a %s', async (_label, session) => {
+    const { getVoiceTaskByStreamId } = require('~/server/services/viventium/VoiceTaskService');
+    mockGetCallSession.mockResolvedValueOnce(session);
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({
+      callback_id: `cb-unbound-${_label.replaceAll(' ', '-')}`,
+      surface: 'voice',
+      voice_call_session_id: 'call-unbound',
+      run_id: 'run-unbound',
+      event: 'run.started',
+      message: '',
+    });
+    const res = createMockRes();
+
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/glasshive/callback',
+        headers: { 'x-glasshive-signature': signature(body) },
+        body,
+      }),
+      res,
+    );
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toEqual({ error: 'voice_task_session_mismatch' });
+    expect(getVoiceTaskByStreamId('glasshive:run-unbound')).toBeNull();
+    expect(mockSaveMessage).not.toHaveBeenCalled();
+  });
+
+  test('atomically binds a new call conversation before accepting its signed worker callback', async () => {
+    mockGetCallSession.mockResolvedValueOnce({
+      version: 1,
+      callSessionId: 'call-new-conversation',
+      userId: 'user-1',
+      conversationId: 'new',
+      status: 'ended',
+      expiresAtMs: Date.now() + 60_000,
+    });
+    mockClaimOrReplaceCallSessionConversationId.mockResolvedValueOnce({
+      version: 1,
+      callSessionId: 'call-new-conversation',
+      userId: 'user-1',
+      conversationId: 'conv-1',
+      status: 'ended',
+    });
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({
+      callback_id: 'cb-materialize-voice-conversation',
+      surface: 'voice',
+      voice_call_session_id: 'call-new-conversation',
+      run_id: 'run-new-conversation',
+      event: 'run.started',
+      message: '',
+    });
+    const res = createMockRes();
+
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/glasshive/callback',
+        headers: { 'x-glasshive-signature': signature(body) },
+        body,
+      }),
+      res,
+    );
+
+    expect(res.statusCode).toBe(202);
+    expect(mockClaimOrReplaceCallSessionConversationId).toHaveBeenCalledWith(
+      'call-new-conversation',
+      'conv-1',
+    );
+  });
+
+  test('suppresses late signed worker results after authoritative task cancellation', async () => {
+    const {
+      cancelVoiceTask,
+      getVoiceTaskByStreamId,
+      settleVoiceTaskCancellation,
+    } = require('~/server/services/viventium/VoiceTaskService');
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const base = {
+      surface: 'voice',
+      voice_call_session_id: 'call-cancel-worker',
+      voice_request_id: 'voice-cancel-worker',
+      run_id: 'run-cancel-worker',
+    };
+    const started = callbackBody({ ...base, event: 'run.started', message: '' });
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/glasshive/callback',
+        headers: { 'x-glasshive-signature': signature(started) },
+        body: started,
+      }),
+      createMockRes(),
+    );
+    const task = getVoiceTaskByStreamId('glasshive:run-cancel-worker');
+    cancelVoiceTask(task.taskId, { userId: 'user-1' });
+    await settleVoiceTaskCancellation(task.taskId, { confirmed: false });
+    mockSaveMessage.mockClear();
+    mockEnqueueGlassHiveCallbackDelivery.mockClear();
+
+    const completed = callbackBody({
+      ...base,
+      callback_id: 'cb-cancelled-late-result',
+      event: 'run.completed',
+    });
+    const res = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/glasshive/callback',
+        headers: { 'x-glasshive-signature': signature(completed) },
+        body: completed,
+      }),
+      res,
+    );
+
+    expect(res.statusCode).toBe(202);
+    expect(res.body).toEqual({ status: 'suppressed', reason: 'voice_task_cancelled' });
+    expect(mockSaveMessage).not.toHaveBeenCalled();
+    expect(mockEnqueueGlassHiveCallbackDelivery).not.toHaveBeenCalled();
+  });
+
+  test('rolls back a voice result when cancellation commits while its save is in flight', async () => {
+    const {
+      cancelVoiceTask,
+      getVoiceTaskByStreamId,
+    } = require('~/server/services/viventium/VoiceTaskService');
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const base = {
+      surface: 'voice',
+      voice_call_session_id: 'call-save-race',
+      voice_request_id: 'voice-save-race',
+      run_id: 'run-save-race',
+    };
+    const started = callbackBody({ ...base, event: 'run.started', message: '' });
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/glasshive/callback',
+        headers: { 'x-glasshive-signature': signature(started) },
+        body: started,
+      }),
+      createMockRes(),
+    );
+    let releaseSave;
+    mockSaveMessage.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseSave = resolve;
+        }),
+    );
+    const completed = callbackBody({
+      ...base,
+      callback_id: 'cb-save-cancel-race',
+      event: 'run.completed',
+      message: 'This result must be rolled back.',
+    });
+    const res = createMockRes();
+    const pending = dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/glasshive/callback',
+        headers: { 'x-glasshive-signature': signature(completed) },
+        body: completed,
+      }),
+      res,
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(mockSaveMessage).toHaveBeenCalledTimes(1);
+    const saved = mockSaveMessage.mock.calls[0][1];
+    expect(saved.metadata.viventium).toMatchObject({
+      callSessionId: 'call-save-race',
+      voiceTaskId: expect.any(String),
+      memoryDeferredPostCall: true,
+      memoryEligible: false,
+    });
+    const task = getVoiceTaskByStreamId('glasshive:run-save-race');
+    cancelVoiceTask(task.taskId, { userId: 'user-1' });
+    releaseSave({});
+    await pending;
+
+    expect(res.statusCode).toBe(202);
+    expect(res.body).toEqual({ status: 'suppressed', reason: 'voice_task_cancelled' });
+    expect(mockDeleteMessages).toHaveBeenCalledWith({
+      user: 'user-1',
+      messageId: saved.messageId,
+    });
+    expect(mockConversationUpdateOne).toHaveBeenCalledWith(
+      { user: 'user-1', conversationId: 'conv-1' },
+      { $pull: { messages: saved.messageId } },
+    );
+    expect(mockEnqueueGlassHiveCallbackDelivery).not.toHaveBeenCalled();
+  });
+
+  test('accepts a signed cancel confirmation through the suppression barrier, then drops late output', async () => {
+    const originalBaseUrl = process.env.GLASSHIVE_PROVIDER_BASE_URL;
+    const originalFetch = global.fetch;
+    process.env.GLASSHIVE_PROVIDER_BASE_URL = 'http://glasshive.example.test:8766/v1';
+    global.fetch = jest.fn().mockResolvedValue(
+      actionResponse({
+        version: 1,
+        status: 'accepted',
+        action: 'cancel',
+        projectId: 'project-cancel',
+        workerId: 'worker-cancel',
+        sourceRunId: 'run-cancel-confirmation',
+        newRun: null,
+        confirmationPending: true,
+        idempotentReplay: false,
+      }),
+    );
+    try {
+      const {
+        flushVoiceTaskOwnerOperations,
+        getVoiceTaskByStreamId,
+        requestVoiceTaskOwnerCancellation,
+      } = require('~/server/services/viventium/VoiceTaskService');
+      const router = require('../glasshive');
+      const app = createTestApp(router);
+      const base = {
+        surface: 'voice',
+        voice_call_session_id: 'call-cancel-confirmation',
+        run_id: 'run-cancel-confirmation',
+        worker_id: 'worker-cancel',
+      };
+      const started = callbackBody({
+        ...base,
+        callback_id: 'cb-cancel-capability-started',
+        event: 'run.started',
+        message: '',
+        actionCapabilities: [
+          {
+            version: 1,
+            capabilityId: 'capability-cancel-1',
+            operation: 'cancel',
+            action: 'cancel',
+            endpoint: '/v1/run-actions',
+            projectId: 'project-cancel',
+            workerId: 'worker-cancel',
+            runId: 'run-cancel-confirmation',
+            expiresAt: new Date(Date.now() + 60_000).toISOString(),
+            capability: 'opaque-cancel-capability',
+          },
+        ],
+      });
+      await dispatch(
+        app,
+        createMockReq({
+          url: '/api/viventium/glasshive/callback',
+          headers: { 'x-glasshive-signature': signature(started) },
+          body: started,
+        }),
+        createMockRes(),
+      );
+      const task = getVoiceTaskByStreamId('glasshive:run-cancel-confirmation');
+      const cancellation = await requestVoiceTaskOwnerCancellation(task.taskId, {
+        userId: 'user-1',
+      });
+      expect(cancellation).toMatchObject({ ownerAccepted: false, ownerPending: true });
+      await flushVoiceTaskOwnerOperations();
+      const settledAcknowledgement = await requestVoiceTaskOwnerCancellation(task.taskId, {
+        userId: 'user-1',
+      });
+      expect(settledAcknowledgement.ownerAccepted).toBe(true);
+      expect(getVoiceTaskByStreamId('glasshive:run-cancel-confirmation').state).toBe('cancelling');
+      mockSaveMessage.mockClear();
+      mockEnqueueGlassHiveCallbackDelivery.mockClear();
+
+      const interrupted = callbackBody({
+        ...base,
+        callback_id: 'cb-cancel-capability-confirmed',
+        event: 'run.interrupted',
+        message: 'Worker stopped.',
+      });
+      const interruptedRes = createMockRes();
+      await dispatch(
+        app,
+        createMockReq({
+          url: '/api/viventium/glasshive/callback',
+          headers: { 'x-glasshive-signature': signature(interrupted) },
+          body: interrupted,
+        }),
+        interruptedRes,
+      );
+
+      expect(interruptedRes.statusCode).toBe(202);
+      expect(getVoiceTaskByStreamId('glasshive:run-cancel-confirmation').state).toBe(
+        'cancelled_confirmed',
+      );
+      expect(mockSaveMessage).not.toHaveBeenCalled();
+      expect(mockEnqueueGlassHiveCallbackDelivery).not.toHaveBeenCalled();
+
+      const completed = callbackBody({
+        ...base,
+        callback_id: 'cb-cancel-capability-late-completion',
+        event: 'run.completed',
+      });
+      const completedRes = createMockRes();
+      await dispatch(
+        app,
+        createMockReq({
+          url: '/api/viventium/glasshive/callback',
+          headers: { 'x-glasshive-signature': signature(completed) },
+          body: completed,
+        }),
+        completedRes,
+      );
+      expect(completedRes.body).toEqual({
+        status: 'suppressed',
+        reason: 'voice_task_cancelled',
+      });
+    } finally {
+      global.fetch = originalFetch;
+      if (originalBaseUrl == null) {
+        delete process.env.GLASSHIVE_PROVIDER_BASE_URL;
+      } else {
+        process.env.GLASSHIVE_PROVIDER_BASE_URL = originalBaseUrl;
+      }
+    }
+  });
+
+  test('surfaces a delayed signed result when the run completed just before cancellation', async () => {
+    const originalBaseUrl = process.env.GLASSHIVE_PROVIDER_BASE_URL;
+    const originalFetch = global.fetch;
+    process.env.GLASSHIVE_PROVIDER_BASE_URL = 'http://glasshive.example.test:8766/v1';
+    global.fetch = jest.fn().mockResolvedValue(
+      actionResponse(
+        {
+          version: 1,
+          status: 'already_completed',
+          action: 'cancel',
+          projectId: 'project-race',
+          workerId: 'worker-race',
+          sourceRunId: 'run-race',
+          state: 'completed',
+        },
+        409,
+      ),
+    );
+    try {
+      const {
+        flushVoiceTaskOwnerOperations,
+        getVoiceTaskByStreamId,
+        requestVoiceTaskOwnerCancellation,
+        snapshotEvent,
+      } = require('~/server/services/viventium/VoiceTaskService');
+      const router = require('../glasshive');
+      const app = createTestApp(router);
+      const base = {
+        surface: 'voice',
+        voice_call_session_id: 'call-race',
+        run_id: 'run-race',
+        worker_id: 'worker-race',
+      };
+      const started = callbackBody({
+        ...base,
+        callback_id: 'cb-race-started',
+        event: 'run.started',
+        message: '',
+        actionCapabilities: [
+          {
+            version: 1,
+            capabilityId: 'capability-race',
+            operation: 'cancel',
+            action: 'cancel',
+            endpoint: '/v1/run-actions',
+            projectId: 'project-race',
+            workerId: 'worker-race',
+            runId: 'run-race',
+            expiresAt: new Date(Date.now() + 60_000).toISOString(),
+            capability: 'opaque-race-capability',
+          },
+        ],
+      });
+      await dispatch(
+        app,
+        createMockReq({
+          url: '/api/viventium/glasshive/callback',
+          headers: { 'x-glasshive-signature': signature(started) },
+          body: started,
+        }),
+        createMockRes(),
+      );
+      const task = getVoiceTaskByStreamId('glasshive:run-race');
+      const acknowledgement = await requestVoiceTaskOwnerCancellation(task.taskId, {
+        userId: 'user-1',
+      });
+      expect(acknowledgement).toMatchObject({
+        ownerAccepted: false,
+        ownerPending: true,
+        task: { state: 'cancelling' },
+      });
+      await flushVoiceTaskOwnerOperations();
+      const cancellation = await requestVoiceTaskOwnerCancellation(task.taskId, {
+        userId: 'user-1',
+      });
+      expect(cancellation).toMatchObject({
+        alreadyCompleted: true,
+        ownerAccepted: false,
+        task: { state: 'completed' },
+      });
+      expect(snapshotEvent(task.taskId)).toMatchObject({
+        state: 'completed',
+        phase: 'already_completed',
+      });
+      mockSaveMessage.mockClear();
+
+      const completed = callbackBody({
+        ...base,
+        callback_id: 'cb-race-delayed-completion',
+        event: 'run.completed',
+        message: 'Completed before cancellation.',
+        deliverable: { label: 'Completed report' },
+      });
+      const res = createMockRes();
+      await dispatch(
+        app,
+        createMockReq({
+          url: '/api/viventium/glasshive/callback',
+          headers: { 'x-glasshive-signature': signature(completed) },
+          body: completed,
+        }),
+        res,
+      );
+
+      expect(res.statusCode).toBe(200);
+      expect(mockSaveMessage).toHaveBeenCalledTimes(1);
+      expect(snapshotEvent(task.taskId)).toMatchObject({
+        state: 'completed',
+        resultMessageId: res.body.messageId,
+        sources: [expect.objectContaining({ title: 'Completed report' })],
+      });
+    } finally {
+      global.fetch = originalFetch;
+      if (originalBaseUrl == null) {
+        delete process.env.GLASSHIVE_PROVIDER_BASE_URL;
+      } else {
+        process.env.GLASSHIVE_PROVIDER_BASE_URL = originalBaseUrl;
+      }
+    }
   });
 
   test('keeps GlassHive placeholder text aligned with the agent fallback placeholder', () => {

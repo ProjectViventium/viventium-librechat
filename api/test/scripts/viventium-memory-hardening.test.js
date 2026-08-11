@@ -10,6 +10,7 @@ const {
   buildTranscriptReferenceContext,
   buildTranscriptSummaryPrompt,
   classifyModelCallFailure,
+  classifyVoiceMemoryEvidence,
   classifyVectorPresenceFailure,
   deferTranscriptLifecycleWhenRagUnavailable,
   findTranscriptContentHashesMissingVectors,
@@ -39,6 +40,7 @@ const {
   transcriptSummarySchema,
   transcriptSummaryMap,
   validateProposal,
+  voiceMemoryEvidenceHash,
 } = require('../../../scripts/viventium-memory-hardening');
 const fs = require('fs');
 const os = require('os');
@@ -111,6 +113,756 @@ describe('viventium-memory-hardening', () => {
       'metadata.viventium.qaRun': { $ne: true },
       $or: [{ expiredAt: { $exists: false } }, { expiredAt: null }],
     });
+  });
+
+  test('promotes only verified single-owner Call evidence and groups every other call as soft', () => {
+    const base = {
+      messageId: 'voice-1',
+      isCreatedByUser: true,
+      metadata: {
+        viventium: {
+          callSessionId: 'call-1',
+          inputMode: 'voice_call',
+          mode: 'call',
+          actorTrust: 'owner_participant',
+          memoryDeferredPostCall: true,
+          speakerSegments: [
+            {
+              version: 1,
+              segmentId: 'seg-1',
+              revision: 0,
+              speaker: {
+                key: 'track:owner',
+                source: 'hybrid',
+                attribution: 'verified',
+                actorTrust: 'owner_participant',
+              },
+            },
+          ],
+        },
+      },
+    };
+
+    expect(classifyVoiceMemoryEvidence(base)).toMatchObject({
+      kind: 'owner_call',
+      sourceId: 'call:call-1',
+    });
+    expect(
+      classifyVoiceMemoryEvidence({
+        ...base,
+        metadata: { viventium: { ...base.metadata.viventium, mode: 'wing' } },
+      }),
+    ).toMatchObject({ kind: 'soft_voice', sourceId: 'call:call-1' });
+    expect(
+      classifyVoiceMemoryEvidence({
+        ...base,
+        metadata: {
+          viventium: {
+            ...base.metadata.viventium,
+            speakerSegments: [
+              ...base.metadata.viventium.speakerSegments,
+              {
+                version: 1,
+                segmentId: 'seg-2',
+                revision: 1,
+                speaker: {
+                  key: 'provider:B',
+                  source: 'provider_diarization',
+                  attribution: 'unverified',
+                  actorTrust: 'shared_mic_unverified',
+                },
+              },
+            ],
+          },
+        },
+      }),
+    ).toMatchObject({ kind: 'soft_voice', sourceId: 'call:call-1' });
+  });
+
+  test('defers active calls and applies ended-session late speaker revisions before memory classification', async () => {
+    const ownerSegment = (segmentId) => ({
+      version: 1,
+      segmentId,
+      revision: 0,
+      speaker: {
+        key: 'track:owner',
+        source: 'hybrid',
+        attribution: 'verified',
+        actorTrust: 'owner_participant',
+      },
+    });
+    const message = (callSessionId, segment) => ({
+      messageId: `message-${callSessionId}`,
+      conversationId: 'conversation-voice',
+      createdAt: new Date('2026-08-09T12:00:00Z'),
+      isCreatedByUser: true,
+      text: 'Synthetic voice evidence',
+      metadata: {
+        viventium: {
+          callSessionId,
+          source: 'voice_call',
+          mode: 'call',
+          actorTrust: 'owner_participant',
+          memoryDeferredPostCall: true,
+          speakerSegments: [segment],
+        },
+      },
+    });
+    const messages = [
+      message('call-active', ownerSegment('segment-active')),
+      message('call-ended', ownerSegment('segment-ended')),
+      message('call-mixed', {
+        ...ownerSegment('segment-mixed'),
+        speaker: {
+          key: 'provider:A',
+          source: 'provider_diarization',
+          attribution: 'unverified',
+          actorTrust: 'shared_mic_unverified',
+        },
+      }),
+      message('call-revised', ownerSegment('segment-revised')),
+      message('call-tombstone', ownerSegment('segment-tombstone')),
+    ];
+    const cursor = (rows) => ({
+      project() {
+        return this;
+      },
+      sort() {
+        return this;
+      },
+      async toArray() {
+        return rows;
+      },
+    });
+    const finalizationWrites = [];
+    const db = {
+      collection(name) {
+        if (name === 'messages') {
+          return {
+            find: () => cursor(messages),
+            async bulkWrite(operations) {
+              finalizationWrites.push(...operations);
+              return { matchedCount: operations.length, modifiedCount: operations.length };
+            },
+          };
+        }
+        if (name === 'viventiumcallsessions') {
+          return {
+            async updateOne() {
+              return { matchedCount: 1, modifiedCount: 1 };
+            },
+            find: () =>
+              cursor([
+                {
+                  callSessionId: 'call-active',
+                  callStatus: 'listening',
+                  expiresAt: new Date('2099-01-01'),
+                },
+                {
+                  callSessionId: 'call-ended',
+                  callStatus: 'ended',
+                  expiresAt: new Date('2099-01-01'),
+                },
+                {
+                  callSessionId: 'call-mixed',
+                  callStatus: 'ended',
+                  expiresAt: new Date('2099-01-01'),
+                },
+                {
+                  callSessionId: 'call-revised',
+                  callStatus: 'ended',
+                  expiresAt: new Date('2099-01-01'),
+                },
+                {
+                  callSessionId: 'call-tombstone',
+                  callStatus: 'ended',
+                  expiresAt: new Date('2099-01-01'),
+                  speakerSessionRevision: 3,
+                  speakerAttributionState: 'shared_mic_unverified',
+                  speakerDetectedAt: new Date('2026-08-09T12:01:00Z'),
+                },
+              ]),
+          };
+        }
+        if (name === 'viventiumvoicespeakersegments') {
+          return {
+            find: () =>
+              cursor([
+                {
+                  callSessionId: 'call-ended',
+                  segmentId: 'segment-ended',
+                  revision: 0,
+                  payload: ownerSegment('segment-ended'),
+                },
+                {
+                  callSessionId: 'call-mixed',
+                  segmentId: 'segment-mixed',
+                  revision: 0,
+                  payload: messages[2].metadata.viventium.speakerSegments[0],
+                },
+                {
+                  callSessionId: 'call-revised',
+                  segmentId: 'segment-revised',
+                  revision: 2,
+                  payload: {
+                    ...ownerSegment('segment-revised'),
+                    revision: 2,
+                    speaker: {
+                      key: 'provider:A',
+                      source: 'provider_diarization',
+                      attribution: 'unverified',
+                      actorTrust: 'shared_mic_unverified',
+                    },
+                  },
+                },
+                {
+                  callSessionId: 'call-tombstone',
+                  segmentId: 'segment-tombstone',
+                  revision: 0,
+                  payload: ownerSegment('segment-tombstone'),
+                },
+              ]),
+          };
+        }
+        throw new Error(`Unexpected collection ${name}`);
+      },
+    };
+
+    const eligible = await fetchRecentMemoryMessages({
+      db,
+      userId: 'qa-user',
+      since: new Date('2026-08-01T00:00:00Z'),
+    });
+
+    expect(eligible.map((item) => item.metadata.viventium.callSessionId)).toEqual([
+      'call-ended',
+      'call-mixed',
+      'call-revised',
+      'call-tombstone',
+    ]);
+    expect(classifyVoiceMemoryEvidence(eligible[0]).kind).toBe('owner_call');
+    expect(classifyVoiceMemoryEvidence(eligible[1]).kind).toBe('soft_voice');
+    expect(classifyVoiceMemoryEvidence(eligible[2])).toMatchObject({
+      kind: 'soft_voice',
+      sourceId: 'call:call-revised',
+    });
+    expect(classifyVoiceMemoryEvidence(eligible[3])).toMatchObject({
+      kind: 'soft_voice',
+      sourceId: 'call:call-tombstone',
+    });
+    const committedFinalizationWrites = finalizationWrites.filter(
+      (operation) =>
+        operation.updateOne.update.$set['metadata.viventium.memoryFinalization']?.state ===
+        'finalized',
+    );
+    expect(committedFinalizationWrites).toHaveLength(4);
+    expect(
+      committedFinalizationWrites.map(
+        (operation) => operation.updateOne.update.$set['metadata.viventium.memoryFinalization'],
+      ),
+    ).toEqual([
+      expect.objectContaining({ version: 3, state: 'finalized', classification: 'owner_call' }),
+      expect.objectContaining({ version: 3, state: 'finalized', classification: 'soft_voice' }),
+      expect.objectContaining({ version: 3, state: 'finalized', classification: 'soft_voice' }),
+      expect.objectContaining({ version: 3, state: 'finalized', classification: 'soft_voice' }),
+    ]);
+
+    const writeCountBeforeDryRun = finalizationWrites.length;
+    const dryRunEligible = await fetchRecentMemoryMessages({
+      db,
+      userId: 'qa-user',
+      since: new Date('2026-08-01T00:00:00Z'),
+      persistFinalizationMarkers: false,
+    });
+    expect(dryRunEligible).toHaveLength(4);
+    expect(finalizationWrites).toHaveLength(writeCountBeforeDryRun);
+  });
+
+  test('fails closed when speaker evidence advances between message finalization and session CAS', async () => {
+    const segment = {
+      version: 1,
+      segmentId: 'segment-finalization-race',
+      revision: 0,
+      speaker: {
+        key: 'track:owner',
+        source: 'hybrid',
+        attribution: 'verified',
+        actorTrust: 'owner_participant',
+      },
+      overlap: false,
+      uncertain: false,
+    };
+    const message = {
+      messageId: 'message-finalization-race',
+      createdAt: new Date('2026-08-09T12:00:00Z'),
+      isCreatedByUser: true,
+      metadata: {
+        viventium: {
+          callSessionId: 'call-finalization-race',
+          source: 'voice_call',
+          mode: 'call',
+          speakerSegments: [segment],
+        },
+      },
+    };
+    let speakerEvidenceEpoch = 0;
+    const messageWrites = [];
+    const cursor = (rows) => ({
+      project() {
+        return this;
+      },
+      sort() {
+        return this;
+      },
+      async toArray() {
+        return rows;
+      },
+    });
+    const db = {
+      collection(name) {
+        if (name === 'messages') {
+          return {
+            find: () => cursor([message]),
+            async bulkWrite(operations) {
+              messageWrites.push(operations);
+              if (messageWrites.length === 1) {
+                // A late speaker mutation begins and completes after the hardener's read but
+                // before it can commit the call-session epoch.
+                speakerEvidenceEpoch = 2;
+              }
+              return { matchedCount: operations.length, modifiedCount: operations.length };
+            },
+          };
+        }
+        if (name === 'viventiumcallsessions') {
+          return {
+            find: () =>
+              cursor([
+                {
+                  callSessionId: 'call-finalization-race',
+                  callStatus: 'ended',
+                  expiresAt: new Date('2099-01-01'),
+                  speakerEvidenceEpoch: 0,
+                },
+              ]),
+            async updateOne(filter) {
+              const expectedEpoch = filter.speakerEvidenceEpoch ?? 0;
+              return {
+                matchedCount: expectedEpoch === speakerEvidenceEpoch ? 1 : 0,
+                modifiedCount: 0,
+              };
+            },
+          };
+        }
+        if (name === 'viventiumvoicespeakersegments') {
+          return {
+            find: () =>
+              cursor([
+                {
+                  callSessionId: 'call-finalization-race',
+                  segmentId: segment.segmentId,
+                  revision: 0,
+                  payload: segment,
+                },
+              ]),
+          };
+        }
+        throw new Error(`Unexpected collection ${name}`);
+      },
+    };
+
+    await expect(
+      fetchRecentMemoryMessages({
+        db,
+        userId: 'qa-user',
+        since: new Date('2026-08-01T00:00:00Z'),
+      }),
+    ).resolves.toEqual([]);
+    expect(messageWrites).toHaveLength(2);
+    expect(messageWrites[0][0].updateOne.update.$set).toMatchObject({
+      'metadata.viventium.memoryFinalization': expect.objectContaining({ evidenceEpoch: 0 }),
+    });
+    expect(messageWrites[0][0].updateOne.update.$set).toMatchObject({
+      'metadata.viventium.memoryFinalization': expect.objectContaining({
+        state: 'preparing',
+        evidenceEpoch: 0,
+      }),
+    });
+    expect(messageWrites[1][0].updateOne.filter).toMatchObject({
+      'metadata.viventium.memoryFinalization.leaseId': expect.any(String),
+    });
+  });
+
+  test('uses only a durable final classification after ephemeral session and sidecar evidence expires', async () => {
+    const segment = (actorTrust, attribution = 'verified') => ({
+      version: 1,
+      segmentId: `segment-${actorTrust}`,
+      revision: 2,
+      speaker: {
+        key: `track:${actorTrust}`,
+        source: 'hybrid',
+        attribution,
+        actorTrust,
+      },
+      overlap: false,
+      uncertain: actorTrust !== 'owner_participant',
+    });
+    const message = (callSessionId, classification, speakerSegment) => {
+      const result = {
+        messageId: `message-${callSessionId}`,
+        createdAt: new Date('2026-08-09T12:00:00Z'),
+        isCreatedByUser: true,
+        metadata: {
+          viventium: {
+            callSessionId,
+            source: 'voice_call',
+            mode: 'call',
+            speakerSegments: [speakerSegment],
+          },
+        },
+      };
+      result.metadata.viventium.memoryFinalization = {
+        version: 3,
+        state: 'finalized',
+        callSessionId,
+        classification,
+        evidenceEpoch: 0,
+        finalizedAt: '2026-08-09T12:05:00.000Z',
+        evidenceHash: voiceMemoryEvidenceHash(result),
+      };
+      return result;
+    };
+    const finalizedOwner = message('call-final-owner', 'owner_call', segment('owner_participant'));
+    const finalizedSoft = message(
+      'call-final-soft',
+      'soft_voice',
+      segment('shared_mic_unverified', 'unverified'),
+    );
+    const editedAfterFinalization = message(
+      'call-edited-after-finalization',
+      'owner_call',
+      segment('owner_participant'),
+    );
+    editedAfterFinalization.text = 'Text changed after the evidence marker was committed.';
+    const unfinalized = {
+      ...message('call-never-finalized', 'owner_call', segment('owner_participant')),
+      metadata: {
+        viventium: {
+          ...message('call-never-finalized', 'owner_call', segment('owner_participant')).metadata
+            .viventium,
+          memoryFinalization: undefined,
+        },
+      },
+    };
+    const staleFinalization = {
+      ...message('call-stale-finalization', 'owner_call', segment('owner_participant')),
+      metadata: {
+        viventium: {
+          ...message('call-stale-finalization', 'owner_call', segment('owner_participant')).metadata
+            .viventium,
+          speakerSegments: [segment('shared_mic_unverified', 'unverified')],
+        },
+      },
+    };
+    const cursor = (rows) => ({
+      project() {
+        return this;
+      },
+      sort() {
+        return this;
+      },
+      async toArray() {
+        return rows;
+      },
+    });
+    const db = {
+      collection(name) {
+        if (name === 'messages') {
+          return {
+            find: () =>
+              cursor([
+                finalizedOwner,
+                finalizedSoft,
+                unfinalized,
+                staleFinalization,
+                editedAfterFinalization,
+              ]),
+          };
+        }
+        if (name === 'viventiumcallsessions') return { find: () => cursor([]) };
+        throw new Error(`Unexpected collection ${name}`);
+      },
+    };
+
+    const eligible = await fetchRecentMemoryMessages({
+      db,
+      userId: 'qa-user',
+      since: new Date('2026-08-01T00:00:00Z'),
+    });
+
+    expect(eligible).toEqual([finalizedOwner, finalizedSoft]);
+    expect(classifyVoiceMemoryEvidence(eligible[0]).kind).toBe('owner_call');
+    expect(classifyVoiceMemoryEvidence(eligible[1]).kind).toBe('soft_voice');
+  });
+
+  test('does not treat an expired non-ended call session as terminal memory evidence', async () => {
+    const voiceMessage = {
+      messageId: 'message-expired-active-call',
+      createdAt: new Date('2026-08-09T12:00:00Z'),
+      isCreatedByUser: true,
+      metadata: {
+        viventium: {
+          callSessionId: 'call-expired-active',
+          source: 'voice_call',
+          mode: 'call',
+          speakerSegments: [
+            {
+              version: 1,
+              segmentId: 'segment-expired-active',
+              revision: 0,
+              speaker: {
+                key: 'track:owner',
+                source: 'hybrid',
+                attribution: 'verified',
+                actorTrust: 'owner_participant',
+              },
+              overlap: false,
+              uncertain: false,
+            },
+          ],
+        },
+      },
+    };
+    const cursor = (rows) => ({
+      project() {
+        return this;
+      },
+      sort() {
+        return this;
+      },
+      async toArray() {
+        return rows;
+      },
+    });
+    const db = {
+      collection(name) {
+        if (name === 'messages') return { find: () => cursor([voiceMessage]) };
+        if (name === 'viventiumcallsessions') {
+          return {
+            find: () =>
+              cursor([
+                {
+                  callSessionId: 'call-expired-active',
+                  callStatus: 'working',
+                  expiresAt: new Date('2026-08-09T12:01:00Z'),
+                },
+              ]),
+          };
+        }
+        throw new Error(`Unexpected collection ${name}`);
+      },
+    };
+
+    await expect(
+      fetchRecentMemoryMessages({
+        db,
+        userId: 'qa-user',
+        since: new Date('2026-08-01T00:00:00Z'),
+      }),
+    ).resolves.toEqual([]);
+  });
+
+  test('fails closed for voice memory when the late-revision ledger cannot be read', async () => {
+    const voiceMessage = {
+      messageId: 'voice-owner-looking',
+      createdAt: new Date('2026-08-09T12:00:00Z'),
+      isCreatedByUser: true,
+      metadata: {
+        viventium: {
+          callSessionId: 'call-ledger-failure',
+          source: 'voice_call',
+          mode: 'call',
+          speakerSegments: [
+            {
+              version: 1,
+              segmentId: 'segment-ledger-failure',
+              revision: 0,
+              speaker: {
+                key: 'track:owner',
+                source: 'hybrid',
+                attribution: 'verified',
+                actorTrust: 'owner_participant',
+              },
+            },
+          ],
+        },
+      },
+    };
+    const cursor = (rows, error) => ({
+      project() {
+        return this;
+      },
+      sort() {
+        return this;
+      },
+      async toArray() {
+        if (error) throw error;
+        return rows;
+      },
+    });
+    const db = {
+      collection(name) {
+        if (name === 'messages') return { find: () => cursor([voiceMessage]) };
+        if (name === 'viventiumcallsessions') {
+          return {
+            find: () =>
+              cursor([
+                {
+                  callSessionId: 'call-ledger-failure',
+                  callStatus: 'ended',
+                  expiresAt: new Date('2099-01-01'),
+                },
+              ]),
+          };
+        }
+        if (name === 'viventiumvoicespeakersegments') {
+          return { find: () => cursor([], new Error('synthetic ledger outage')) };
+        }
+        throw new Error(`Unexpected collection ${name}`);
+      },
+    };
+
+    await expect(
+      fetchRecentMemoryMessages({
+        db,
+        userId: 'qa-user',
+        since: new Date('2026-08-01T00:00:00Z'),
+      }),
+    ).resolves.toEqual([]);
+  });
+
+  test.each([
+    ['terminal call-session evidence expired', [], []],
+    [
+      'a referenced speaker revision never reached the durable ledger',
+      [
+        {
+          callSessionId: 'call-incomplete-finalization',
+          callStatus: 'ended',
+          expiresAt: new Date('2099-01-01'),
+        },
+      ],
+      [],
+    ],
+  ])('fails closed when %s', async (_label, sessions, segmentRows) => {
+    const voiceMessage = {
+      messageId: 'voice-incomplete-finalization',
+      createdAt: new Date('2026-08-09T12:00:00Z'),
+      isCreatedByUser: true,
+      metadata: {
+        viventium: {
+          callSessionId: 'call-incomplete-finalization',
+          source: 'voice_call',
+          mode: 'call',
+          speakerSegments: [
+            {
+              version: 1,
+              segmentId: 'segment-incomplete-finalization',
+              revision: 0,
+              speaker: {
+                key: 'track:owner',
+                source: 'hybrid',
+                attribution: 'verified',
+                actorTrust: 'owner_participant',
+              },
+            },
+          ],
+        },
+      },
+    };
+    const cursor = (rows) => ({
+      project() {
+        return this;
+      },
+      sort() {
+        return this;
+      },
+      async toArray() {
+        return rows;
+      },
+    });
+    const db = {
+      collection(name) {
+        if (name === 'messages') return { find: () => cursor([voiceMessage]) };
+        if (name === 'viventiumcallsessions') return { find: () => cursor(sessions) };
+        if (name === 'viventiumvoicespeakersegments') return { find: () => cursor(segmentRows) };
+        throw new Error(`Unexpected collection ${name}`);
+      },
+    };
+
+    await expect(
+      fetchRecentMemoryMessages({
+        db,
+        userId: 'qa-user',
+        since: new Date('2026-08-01T00:00:00Z'),
+      }),
+    ).resolves.toEqual([]);
+  });
+
+  test('excludes durably suppressed voice tasks and fails closed when the barrier ledger is unavailable', async () => {
+    const messages = [
+      {
+        messageId: 'voice-task-result',
+        createdAt: new Date('2026-08-09T12:00:00Z'),
+        isCreatedByUser: true,
+        metadata: { viventium: { voiceTaskId: 'task-suppressed' } },
+      },
+      {
+        messageId: 'ordinary-message',
+        createdAt: new Date('2026-08-09T12:00:01Z'),
+        isCreatedByUser: true,
+        metadata: {},
+      },
+    ];
+    const cursor = (rows, error) => ({
+      project() {
+        return this;
+      },
+      sort() {
+        return this;
+      },
+      async toArray() {
+        if (error) throw error;
+        return rows;
+      },
+    });
+    const createDb = (barrierError) => ({
+      collection(name) {
+        if (name === 'messages') return { find: () => cursor(messages) };
+        if (name === 'viventiumvoicetasksuppressions') {
+          return {
+            find: () =>
+              cursor([{ taskId: 'task-suppressed' }], barrierError ? new Error('outage') : null),
+          };
+        }
+        throw new Error(`Unexpected collection ${name}`);
+      },
+    });
+
+    await expect(
+      fetchRecentMemoryMessages({
+        db: createDb(false),
+        userId: 'qa-user',
+        since: new Date('2026-08-01T00:00:00Z'),
+      }),
+    ).resolves.toEqual([messages[1]]);
+    await expect(
+      fetchRecentMemoryMessages({
+        db: createDb(true),
+        userId: 'qa-user',
+        since: new Date('2026-08-01T00:00:00Z'),
+      }),
+    ).resolves.toEqual([messages[1]]);
   });
 
   test('memory hardening lock recovers from stale dead pid', () => {
@@ -3023,6 +3775,259 @@ describe('viventium-memory-hardening', () => {
       expect(result.changed).toEqual([]);
       expect(result.conflicts).toEqual([
         { key: 'context', action: 'set', reason: 'revision_conflict' },
+      ]);
+    } finally {
+      fs.rmSync(runDir, { recursive: true, force: true });
+    }
+  });
+
+  test('apply rejects voice evidence whose speaker epoch advanced after proposal generation', async () => {
+    const runDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-memory-voice-apply-cas-'));
+    const userId = '507f1f77bcf86cd799439011';
+    const message = {
+      messageId: 'message-late-speaker',
+      conversationId: 'conversation-late-speaker',
+      isCreatedByUser: true,
+      sender: 'Synthetic User',
+      text: 'Synthetic owner-only evidence',
+      metadata: {
+        viventium: {
+          callSessionId: 'call-late-speaker',
+          source: 'voice_call',
+          mode: 'call',
+          speakerSegments: [
+            {
+              version: 1,
+              segmentId: 'segment-owner',
+              revision: 0,
+              speaker: {
+                key: 'track:owner',
+                source: 'hybrid',
+                attribution: 'verified',
+                actorTrust: 'owner_participant',
+              },
+              overlap: false,
+              uncertain: false,
+            },
+          ],
+        },
+      },
+    };
+    const evidenceHash = voiceMemoryEvidenceHash(message);
+    message.metadata.viventium.memoryFinalization = {
+      version: 3,
+      state: 'finalized',
+      callSessionId: 'call-late-speaker',
+      classification: 'owner_call',
+      evidenceEpoch: 4,
+      evidenceHash,
+      finalizedAt: '2026-08-10T12:00:00.000Z',
+    };
+    const setMemory = jest.fn().mockResolvedValue({ ok: true, revision: 1 });
+    const db = {
+      collection(name) {
+        if (name === 'viventiumcallsessions') {
+          return {
+            // The persisted epoch is already 5, so the proposal's epoch-4 lease cannot be acquired.
+            updateOne: jest.fn().mockResolvedValue({ matchedCount: 0, modifiedCount: 0 }),
+          };
+        }
+        if (name === 'messages') {
+          return {
+            find: jest.fn(() => ({
+              project() {
+                return this;
+              },
+              async toArray() {
+                return [message];
+              },
+            })),
+          };
+        }
+        throw new Error(`Unexpected collection ${name}`);
+      },
+    };
+
+    try {
+      const result = await applyUserProposal({
+        db,
+        methods: {
+          getAllUserMemories: jest.fn().mockResolvedValue([]),
+          setMemory,
+          deleteMemory: jest.fn(),
+        },
+        user: { _id: userId },
+        runDir,
+        memoryConfig,
+        userProposal: {
+          userId,
+          userIdHash: 'user-hash',
+          accepted: [
+            {
+              key: 'context',
+              action: 'set',
+              value: 'Must not persist from stale voice evidence.',
+              tokenCount: 8,
+              expectedRevision: null,
+              evidence: [
+                {
+                  source: 'conversation',
+                  messageId: message.messageId,
+                  createdAt: '2026-08-10T12:00:00.000Z',
+                },
+              ],
+              voiceEvidenceProofs: [
+                {
+                  messageId: message.messageId,
+                  callSessionId: 'call-late-speaker',
+                  classification: 'owner_call',
+                  evidenceEpoch: 4,
+                  evidenceHash,
+                },
+              ],
+            },
+          ],
+          transcripts: [],
+          staleTranscriptArtifacts: [],
+        },
+      });
+
+      expect(setMemory).not.toHaveBeenCalled();
+      expect(result.changed).toEqual([]);
+      expect(result.conflicts).toEqual([
+        { key: 'context', action: 'set', reason: 'voice_evidence_stale' },
+      ]);
+    } finally {
+      fs.rmSync(runDir, { recursive: true, force: true });
+    }
+  });
+
+  test('apply rolls back an exact memory write when its speaker-evidence lease is lost', async () => {
+    const runDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-memory-voice-lease-loss-'));
+    const userId = '507f1f77bcf86cd799439011';
+    const message = {
+      messageId: 'message-lease-loss',
+      conversationId: 'conversation-lease-loss',
+      isCreatedByUser: true,
+      sender: 'Synthetic User',
+      text: 'Synthetic owner-only evidence',
+      metadata: {
+        viventium: {
+          callSessionId: 'call-lease-loss',
+          source: 'voice_call',
+          mode: 'call',
+          speakerSegments: [
+            {
+              version: 1,
+              segmentId: 'segment-owner',
+              revision: 0,
+              speaker: {
+                key: 'track:owner',
+                source: 'hybrid',
+                attribution: 'verified',
+                actorTrust: 'owner_participant',
+              },
+              overlap: false,
+              uncertain: false,
+            },
+          ],
+        },
+      },
+    };
+    const evidenceHash = voiceMemoryEvidenceHash(message);
+    message.metadata.viventium.memoryFinalization = {
+      version: 3,
+      state: 'finalized',
+      callSessionId: 'call-lease-loss',
+      classification: 'owner_call',
+      evidenceEpoch: 7,
+      evidenceHash,
+      finalizedAt: '2026-08-10T12:00:00.000Z',
+    };
+    const sessionUpdate = jest
+      .fn()
+      .mockResolvedValueOnce({ matchedCount: 1, modifiedCount: 1 })
+      // The speaker epoch changed after the memory CAS but before the apply lease was revalidated.
+      .mockResolvedValueOnce({ matchedCount: 0, modifiedCount: 0 })
+      .mockResolvedValue({ matchedCount: 1, modifiedCount: 1 });
+    const setMemory = jest
+      .fn()
+      .mockResolvedValueOnce({ ok: true, revision: 4 })
+      .mockResolvedValueOnce({ ok: true, revision: 5 });
+    const deleteMemory = jest.fn();
+    const db = {
+      collection(name) {
+        if (name === 'viventiumcallsessions') return { updateOne: sessionUpdate };
+        if (name === 'messages') {
+          return {
+            find: jest.fn(() => ({
+              project() {
+                return this;
+              },
+              async toArray() {
+                return [message];
+              },
+            })),
+          };
+        }
+        throw new Error(`Unexpected collection ${name}`);
+      },
+    };
+
+    try {
+      const result = await applyUserProposal({
+        db,
+        methods: {
+          getAllUserMemories: jest
+            .fn()
+            .mockResolvedValue([
+              { key: 'context', value: 'Prior safe value', tokenCount: 3, __v: 3 },
+            ]),
+          setMemory,
+          deleteMemory,
+        },
+        user: { _id: userId },
+        runDir,
+        memoryConfig,
+        userProposal: {
+          userId,
+          userIdHash: 'user-hash',
+          accepted: [
+            {
+              key: 'context',
+              action: 'set',
+              value: 'Stale owner-only value',
+              tokenCount: 8,
+              expectedRevision: 3,
+              evidence: [],
+              voiceEvidenceProofs: [
+                {
+                  messageId: message.messageId,
+                  callSessionId: 'call-lease-loss',
+                  classification: 'owner_call',
+                  evidenceEpoch: 7,
+                  evidenceHash,
+                },
+              ],
+            },
+          ],
+          transcripts: [],
+          staleTranscriptArtifacts: [],
+        },
+      });
+
+      expect(setMemory).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({
+          key: 'context',
+          value: 'Prior safe value',
+          expectedRevision: 4,
+        }),
+      );
+      expect(deleteMemory).not.toHaveBeenCalled();
+      expect(result.changed).toEqual([]);
+      expect(result.conflicts).toEqual([
+        { key: 'context', action: 'set', reason: 'voice_evidence_stale' },
       ]);
     } finally {
       fs.rmSync(runDir, { recursive: true, force: true });

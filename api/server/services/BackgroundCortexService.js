@@ -500,12 +500,11 @@ async function getUserMemoryContextBlock(req) {
       return '';
     }
   } catch (error) {
-    // Fail closed: if access check errors, do not include memory in cortex context.
     logger.warn(
-      '[BackgroundCortexService] Memory access check failed; skipping memory context for cortex',
+      '[BackgroundCortexService] Memory access check failed; marking context unavailable for cortex',
       sanitizeRuntimeErrorForLog(error),
     );
-    return '';
+    return memoryReadUnavailableContext();
   }
 
   try {
@@ -532,8 +531,16 @@ async function getUserMemoryContextBlock(req) {
       '[BackgroundCortexService] Failed to load memory read profile for cortex context',
       sanitizeRuntimeErrorForLog(error),
     );
-    return '';
+    return memoryReadUnavailableContext();
   }
+}
+
+function memoryReadUnavailableContext() {
+  return [
+    '# Saved-memory availability',
+    'Saved memory is unavailable for this turn because its read path failed.',
+    'This is not evidence that no saved memory exists. Do not invent missing facts; be transparent about the unavailable context when it matters to the answer.',
+  ].join('\n');
 }
 /* === VIVENTIUM NOTE === */
 
@@ -3263,6 +3270,31 @@ ${activationFormat}`;
   }
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Resolved conversation identity for background conversation providers.
+ * Purpose: New-chat requests may still carry an empty/provisional conversation id after Main has
+ * resolved the persisted id. Phase B must send that resolved id so GlassHive can validate and
+ * isolate the background session without mutating the request shared with Main.
+ * === VIVENTIUM END === */
+function buildCortexRequestBody({
+  requestBody = {},
+  runId,
+  conversationId = null,
+  idempotencyKey = '',
+} = {}) {
+  const resolvedConversationId =
+    String(conversationId || '').trim() ||
+    String(requestBody?.conversationId || '').trim() ||
+    String(runId || '').trim();
+  return {
+    ...(requestBody || {}),
+    messageId: runId,
+    conversationId: resolvedConversationId,
+    parentMessageId: requestBody?.parentMessageId,
+    viventiumGlassHiveIdempotencyKey: idempotencyKey,
+  };
+}
+
 /**
  * Execute a single cortex agent and collect its response
  * @param {object} params
@@ -3280,18 +3312,20 @@ async function executeCortexOnce({
   agent,
   messages,
   runId,
-  conversationId,
+  conversationId = null,
   req,
   res,
   activationScope = null,
   contextMode = 'full',
   executionTimeoutMs = null,
+  signal = null,
 }) {
   const startTime = Date.now();
   /** @type {AbortController | null} */
   let abortController = null;
   /** @type {NodeJS.Timeout | null} */
   let abortTimer = null;
+  let removeExternalAbortListener = null;
   /* === VIVENTIUM START ===
    * Fix: Preserve Phase B metadata through provider failures so UI cards, DB parts, and fallback
    * routing can distinguish provider-stage failures from missing tools or auth.
@@ -3508,6 +3542,20 @@ async function executeCortexOnce({
     };
 
     abortController = new AbortController();
+    /* === VIVENTIUM START ===
+     * Feature: composed voice-task cancellation
+     * Purpose: Bind the owning generation signal to background cortex tools/providers so a task
+     * cancellation does not merely hide a late result while avoidable work keeps running.
+     * === VIVENTIUM END === */
+    const ownerSignal = signal || safeReq?._viventiumVoiceAbortSignal || null;
+    if (ownerSignal?.aborted) {
+      abortController.abort(ownerSignal.reason);
+    } else if (typeof ownerSignal?.addEventListener === 'function') {
+      const abortFromOwner = () => abortController?.abort(ownerSignal.reason);
+      ownerSignal.addEventListener('abort', abortFromOwner, { once: true });
+      removeExternalAbortListener = () =>
+        ownerSignal.removeEventListener?.('abort', abortFromOwner);
+    }
     const effectiveExecutionTimeoutMs =
       Number.isFinite(executionTimeoutMs) && executionTimeoutMs > 0
         ? Math.floor(executionTimeoutMs)
@@ -3778,13 +3826,12 @@ async function executeCortexOnce({
      */
     const cortexProvider = (initializedAgent.provider || '').toLowerCase();
     const cortexIdempotencyKey = buildHarnessIdempotencyKey('cortex', runId, agentForRun.id);
-    const cortexRequestBody = {
-      ...safeReq.body,
-      messageId: runId,
-      conversationId: resolvedConversationId,
-      parentMessageId: safeReq.body.parentMessageId,
-      viventiumGlassHiveIdempotencyKey: cortexIdempotencyKey,
-    };
+    const cortexRequestBody = buildCortexRequestBody({
+      requestBody: safeReq.body,
+      runId,
+      conversationId,
+      idempotencyKey: cortexIdempotencyKey,
+    });
     await attachConversationProviderCapabilityBundle({
       targetAgent: initializedAgent,
       declaredAgent: agentForRun,
@@ -3996,6 +4043,7 @@ async function executeCortexOnce({
     if (abortTimer) {
       clearTimeout(abortTimer);
     }
+    removeExternalAbortListener?.();
   }
 }
 
@@ -4007,7 +4055,9 @@ async function executeCortexOnce({
 async function executeCortex(params) {
   const primaryAgent = params?.agent;
   const primaryResult = await executeCortexOnce(params);
+  const ownerSignal = params?.signal || params?.req?._viventiumVoiceAbortSignal;
   if (
+    ownerSignal?.aborted === true ||
     !resolveFallbackAssignment(primaryAgent) ||
     primaryResult?.harnessInvocationStarted === true ||
     !shouldRetryBackgroundCortexWithFallback(primaryResult)
@@ -4586,7 +4636,7 @@ async function executeActivated({
   mainAgent,
   messages,
   runId,
-  conversationId,
+  conversationId = null,
   activatedCortices,
   onCortexBrewing,
   onCortexComplete,
@@ -4597,6 +4647,10 @@ async function executeActivated({
   }
 
   const executionTimeoutMs = getCortexExecutionTimeoutMs();
+  const ownerSignal = req?._viventiumVoiceAbortSignal || null;
+  if (ownerSignal?.aborted) {
+    return { insights: [], cancelled: true };
+  }
   let modelsConfigPromise = null;
   const getModelsConfigOnce = () => {
     if (!modelsConfigPromise) {
@@ -4619,6 +4673,7 @@ async function executeActivated({
       req,
       res,
       activationScope: activationResult.activationScope || null,
+      signal: ownerSignal,
     });
     const guardTimeoutMs = getCortexAttemptGuardTimeoutMs(executionTimeoutMs);
     if (!guardTimeoutMs) {
@@ -4677,7 +4732,7 @@ async function executeActivated({
       }
 
       // Notify UI that cortex is brewing
-      if (onCortexBrewing) {
+      if (onCortexBrewing && !ownerSignal?.aborted) {
         try {
           onCortexBrewing({
             cortex_id: activationResult.agentId,
@@ -4768,6 +4823,7 @@ async function executeActivated({
       }
       if (
         fallbackAgent &&
+        !ownerSignal?.aborted &&
         result?.fallbackUsed !== true &&
         result?.harnessInvocationStarted !== true &&
         shouldRetryBackgroundCortexWithFallback(result)
@@ -4808,7 +4864,7 @@ async function executeActivated({
       const completionPayload = buildCortexCompletionPayload(
         buildCompletionInputFromActivation({ activationResult, cortexAgent, result }),
       );
-      if (completionPayload && onCortexComplete) {
+      if (completionPayload && onCortexComplete && !ownerSignal?.aborted) {
         try {
           onCortexComplete(completionPayload);
         } catch (e) {
@@ -4833,7 +4889,7 @@ async function executeActivated({
       );
 
       // Notify UI of error so it doesn't stay stuck on "Analyzing..."
-      if (onCortexComplete) {
+      if (onCortexComplete && !ownerSignal?.aborted) {
         try {
           onCortexComplete(
             buildCortexCompletionPayload(
@@ -4869,6 +4925,9 @@ async function executeActivated({
    * downstream code stays unchanged.
    */
   const settledResults = await Promise.allSettled(executionPromises);
+  if (ownerSignal?.aborted) {
+    return { insights: [], cancelled: true };
+  }
   const executionResults = settledResults.map((s) => {
     if (s.status === 'fulfilled') {
       return s.value;
@@ -5328,4 +5387,6 @@ module.exports = {
   DEFAULT_ACTIVATION_DECISION_SUBJECT_RULE,
   // Exported for unit testing only
   createBackgroundRes,
+  memoryReadUnavailableContext,
+  buildCortexRequestBody,
 };

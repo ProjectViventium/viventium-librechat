@@ -34,6 +34,8 @@ let mockFileAccess;
 let mockGetStrategyFunctions;
 let mockLoadAuthValues;
 let mockCreateCallSession;
+let mockCreateCallBrowserLaunch;
+let mockAssertVoiceAgentAccess;
 let mockFilterFile;
 let mockProcessAgentFileUpload;
 let mockClaimGlassHiveDeliveries;
@@ -138,7 +140,12 @@ jest.mock('~/server/controllers/assistants/helpers', () => ({
 
 jest.mock('~/server/services/viventium/CallSessionService', () => ({
   createCallSession: (...args) => mockCreateCallSession(...args),
+  createCallBrowserLaunch: (...args) => mockCreateCallBrowserLaunch(...args),
   resolveUserVoiceRoute: (...args) => mockResolveUserVoiceRoute(...args),
+}));
+
+jest.mock('~/server/services/viventium/VoiceAgentAuthorizationService', () => ({
+  assertVoiceAgentAccess: (...args) => mockAssertVoiceAgentAccess(...args),
 }));
 
 jest.mock('~/server/services/viventium/GlassHiveCallbackDeliveryService', () => ({
@@ -407,7 +414,13 @@ describe('/api/viventium/telegram', () => {
       conversationId,
       roomName: 'lc-calltest',
       requestedVoiceRoute: null,
+      browserCapability: 'B'.repeat(43),
     }));
+    mockCreateCallBrowserLaunch = jest.fn(async () => ({
+      capability: 'L'.repeat(43),
+      expiresAt: '2026-08-09T22:00:00.000Z',
+    }));
+    mockAssertVoiceAgentAccess = jest.fn().mockResolvedValue({ _id: 'agent-resource-1' });
     mockResolveUserVoiceRoute = jest.fn().mockResolvedValue({
       stt: { provider: 'pywhispercpp', variant: 'base.en' },
       tts: {
@@ -742,7 +755,7 @@ describe('/api/viventium/telegram', () => {
     expect(res.body.error).toContain('public HTTPS Viventium voice URL');
   });
 
-  test('POST /call-link creates a call session and returns a public deep-link url', async () => {
+  test('POST /call-link returns a public one-time launch link without reusable browser authority', async () => {
     process.env.VIVENTIUM_PUBLIC_PLAYGROUND_URL = 'https://voice.viventium.ai';
     const telegramRouter = require('../telegram');
     const app = createTestApp(telegramRouter);
@@ -764,10 +777,44 @@ describe('/api/viventium/telegram', () => {
     expect(res.body.callUrl).toBe(res.body.playgroundUrl);
     const url = new URL(res.body.playgroundUrl);
     expect(url.origin).toBe('https://voice.viventium.ai');
-    expect(url.searchParams.get('roomName')).toBe('lc-calltest');
+    expect(url.pathname).toBe('/call-bootstrap');
+    expect(url.searchParams.get('roomName')).toBeNull();
     expect(url.searchParams.get('callSessionId')).toBe('call_session_test');
-    expect(url.searchParams.get('agentName')).toBe('librechat-voice-gateway');
+    expect(url.searchParams.get('agentName')).toBeNull();
     expect(url.searchParams.get('autoConnect')).toBe('1');
+    expect(url.hash).toBe(`#viventiumCallLaunch=${'L'.repeat(43)}`);
+    expect(url.hash).not.toContain('viventiumCallCapability');
+    expect(mockCreateCallBrowserLaunch).toHaveBeenCalledWith('call_session_test');
+    expect(res.headers['Cache-Control']).toBe('no-store, private');
+    expect(res.headers.Pragma).toBe('no-cache');
+    expect(JSON.stringify(res.body)).not.toContain('B'.repeat(43));
+  });
+
+  test('POST /call-link denies a foreign or revoked agent before creating call authority', async () => {
+    process.env.VIVENTIUM_PUBLIC_PLAYGROUND_URL = 'https://voice.viventium.ai';
+    const error = new Error('Voice assistant is unavailable');
+    error.status = 404;
+    error.code = 'no_route';
+    mockAssertVoiceAgentAccess.mockRejectedValueOnce(error);
+    const telegramRouter = require('../telegram');
+    const app = createTestApp(telegramRouter);
+    const req = createMockReq({
+      url: '/api/viventium/telegram/call-link',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      body: { conversationId: 'new', telegramUserId: 'tg-1', agentId: 'agent_foreign' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(404);
+    expect(res.body).toEqual({
+      code: 'no_route',
+      message: 'Voice assistant is unavailable.',
+      retryable: false,
+    });
+    expect(mockCreateCallSession).not.toHaveBeenCalled();
+    expect(mockCreateCallBrowserLaunch).not.toHaveBeenCalled();
   });
 
   test('POST /call-link returns linkRequired when telegram user is unlinked', async () => {

@@ -36,6 +36,22 @@ function attachVoiceMessageMetadata(req, message) {
   const inputMode = String(
     req?.body?.viventiumInputMode || existingViventium.inputMode || 'voice_call',
   ).trim();
+  const rawMode = req?.body?.mode || req?.viventiumCallSession?.mode;
+  const mode = ['call', 'wing', 'listen_only'].includes(rawMode)
+    ? rawMode
+    : req?.body?.listenOnlyModeEnabled === true
+      ? 'listen_only'
+      : req?.body?.wingModeEnabled === true
+        ? 'wing'
+        : 'call';
+  const speakerSegments = Array.isArray(req?.body?.speakerSegments) ? req.body.speakerSegments : [];
+  const speakerLabel = String(req?.body?.speakerLabel || '')
+    .trim()
+    .slice(0, 120);
+  const actorTrust = String(req?.body?.viventiumActorTrust || 'unknown').trim();
+  const voiceTaskId = String(req?.body?.viventiumVoiceTaskId || '')
+    .trim()
+    .slice(0, 160);
 
   return {
     ...message,
@@ -47,6 +63,12 @@ function attachVoiceMessageMetadata(req, message) {
         ...(voiceRequestId ? { voiceRequestId } : {}),
         surface: surface || 'voice',
         inputMode: inputMode || 'voice_call',
+        mode,
+        speakerSegments,
+        ...(speakerLabel ? { speakerLabel } : {}),
+        actorTrust,
+        memoryDeferredPostCall: req?.body?.viventiumDeferVoiceMemory === true,
+        ...(voiceTaskId ? { voiceTaskId } : {}),
       },
     },
   };

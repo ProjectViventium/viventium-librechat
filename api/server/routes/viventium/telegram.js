@@ -89,6 +89,7 @@ const EXTRACTED_DOCUMENT_IMAGE_MAX_DIMENSION = 768;
  * Purpose: Reuse the same call-session creation contract as the web call button.
  * === VIVENTIUM END === */
 const {
+  createCallBrowserLaunch,
   createCallSession,
   resolveUserVoiceRoute,
 } = require('~/server/services/viventium/CallSessionService');
@@ -96,6 +97,9 @@ const {
   buildCallLaunchResponse,
   resolveTelegramPublicPlaygroundBaseUrl,
 } = require('~/server/services/viventium/callLaunch');
+const {
+  assertVoiceAgentAccess,
+} = require('~/server/services/viventium/VoiceAgentAuthorizationService');
 
 const router = express.Router();
 
@@ -824,6 +828,8 @@ router.post('/call-link', telegramAuth, configMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'agentId is required' });
     }
 
+    await assertVoiceAgentAccess({ req, agentId: effectiveAgentId });
+
     /* === VIVENTIUM START ===
      * Purpose: Telegram cannot open localhost browser-voice links.
      * Contract: /call must fail honestly until a public HTTPS playground URL is configured.
@@ -841,9 +847,23 @@ router.post('/call-link', telegramAuth, configMiddleware, async (req, res) => {
       agentId: effectiveAgentId,
       conversationId: normalizedConversationId,
     });
-
-    return res.json(buildCallLaunchResponse(session, { preferPublicPlayground: true }));
+    const launch = await createCallBrowserLaunch(session.callSessionId);
+    res.set('Cache-Control', 'no-store, private');
+    res.set('Pragma', 'no-cache');
+    return res.json(
+      buildCallLaunchResponse(session, {
+        preferPublicPlayground: true,
+        launchCapability: launch.capability,
+      }),
+    );
   } catch (err) {
+    if (err?.code === 'no_route' && err?.status === 404) {
+      return res.status(404).json({
+        code: 'no_route',
+        message: 'Voice assistant is unavailable.',
+        retryable: false,
+      });
+    }
     logger.error('[VIVENTIUM][telegram/call-link] Failed to create call link:', err);
     return res.status(500).json({ error: 'Failed to create call link' });
   }

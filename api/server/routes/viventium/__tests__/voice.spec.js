@@ -7,6 +7,9 @@ const express = require('express');
 const { EventEmitter } = require('events');
 
 let mockAssertVoiceGatewayAuth;
+let mockAbandonVoiceSessionClaim;
+let mockReportVoiceSessionFailure;
+let mockMarkVoiceSessionReady;
 let mockGetUserById;
 let mockSaveMessage;
 let mockGetMessages;
@@ -19,11 +22,20 @@ let mockMessageFindOne;
 let mockMessageFind;
 let mockMessageBulkWrite;
 let mockMessageFindOneAndUpdate;
+let mockPersistSpeakerSegments;
+let mockProjectSpeakerSegmentRevisions;
+let mockListSpeakerSegments;
+let mockPersistSpeakerSessionState;
+let mockSpeakerPersisted;
+let mockSpeakerPersistedAtController;
 let mockLastParentMessageId = null;
 let mockLastConversationId = null;
 let mockLastAgentId = null;
 let mockLastRequestText = null;
 let mockLastStreamId = null;
+let mockLastCanAuthorizeSideEffects = null;
+let mockLastActorTrust = null;
+let mockLastAmbientContext = null;
 let mockAgentControllerCallCount = 0;
 let mockAgentControllerResponseDelayMs = 0;
 let mockAgentControllerGeneratedConversationId = null;
@@ -33,6 +45,7 @@ let mockMarkGlassHiveDeliveryFailed;
 let mockMarkGlassHiveDeliverySuppressed;
 let mockObservedInfoLogs;
 let mockConsoleLogSpy;
+let mockRequireVoiceAgentAccess;
 
 jest.mock('@librechat/data-schemas', () => ({
   logger: {
@@ -73,11 +86,15 @@ jest.mock('~/server/services/Endpoints/agents/title', () => jest.fn());
 
 jest.mock('~/server/controllers/agents/request', () => (req, res) => {
   mockAgentControllerCallCount += 1;
+  mockSpeakerPersistedAtController = mockSpeakerPersisted;
   mockLastParentMessageId = req.body.parentMessageId;
   mockLastConversationId = req.body.conversationId;
   mockLastAgentId = req.body.agent_id;
   mockLastRequestText = req.body.text;
   mockLastStreamId = req.body.streamId;
+  mockLastCanAuthorizeSideEffects = req.body.viventiumCanAuthorizeSideEffects;
+  mockLastActorTrust = req.body.viventiumActorTrust;
+  mockLastAmbientContext = req.body.viventiumAmbientContext;
   const respond = () =>
     res.json({
       streamId: req.body.streamId || 'stream_voice_1',
@@ -94,8 +111,13 @@ jest.mock('~/server/controllers/agents/request', () => (req, res) => {
 });
 
 jest.mock('~/server/services/viventium/CallSessionService', () => ({
+  abandonVoiceSessionClaim: (...args) => mockAbandonVoiceSessionClaim(...args),
   assertCallSessionSecret: jest.fn(),
+  assertCallBrowserCapability: jest.fn(async (callSessionId) => ({ callSessionId })),
   claimVoiceSession: jest.fn(),
+  heartbeatCallSession: jest.fn(async ({ currentSession }) => currentSession),
+  reportVoiceSessionFailure: (...args) => mockReportVoiceSessionFailure(...args),
+  markVoiceSessionReady: (...args) => mockMarkVoiceSessionReady(...args),
   assertVoiceGatewayAuth: (...args) => mockAssertVoiceGatewayAuth(...args),
   materializeCallSessionConversationId: jest
     .fn()
@@ -134,12 +156,28 @@ jest.mock('~/server/services/viventium/VoiceCortexInsightsService', () => ({
   getCompletedCortexInsightsForMessage: jest.fn(),
 }));
 
+jest.mock('~/server/services/viventium/SpeakerSegmentService', () => {
+  const actual = jest.requireActual('~/server/services/viventium/SpeakerSegmentService');
+  return {
+    ...actual,
+    listSpeakerSegments: (...args) => mockListSpeakerSegments(...args),
+    persistSpeakerSegments: (...args) => mockPersistSpeakerSegments(...args),
+    persistSpeakerSessionState: (...args) => mockPersistSpeakerSessionState(...args),
+    projectSpeakerSegmentRevisionsToMessages: (...args) =>
+      mockProjectSpeakerSegmentRevisions(...args),
+  };
+});
+
 jest.mock('~/server/services/viventium/GlassHiveCallbackDeliveryService', () => ({
   claimPendingGlassHiveCallbackDeliveries: (...args) => mockClaimGlassHiveDeliveries(...args),
   markGlassHiveCallbackDeliverySent: (...args) => mockMarkGlassHiveDeliverySent(...args),
   markGlassHiveCallbackDeliveryFailed: (...args) => mockMarkGlassHiveDeliveryFailed(...args),
   markGlassHiveCallbackDeliverySuppressed: (...args) =>
     mockMarkGlassHiveDeliverySuppressed(...args),
+}));
+
+jest.mock('~/server/services/viventium/VoiceAgentAuthorizationService', () => ({
+  requireVoiceAgentAccess: (...args) => mockRequireVoiceAgentAccess(...args),
 }));
 
 jest.mock('@librechat/api', () => ({
@@ -240,6 +278,7 @@ function dispatch(app, req, res) {
 function createMessageFindOneMock(result = null) {
   const chain = {
     sort: jest.fn(() => chain),
+    limit: jest.fn(() => chain),
     select: jest.fn(() => chain),
     lean: jest.fn().mockResolvedValue(result),
   };
@@ -251,6 +290,7 @@ function createMessageFindOneMock(result = null) {
 function createMessageFindMock(result = []) {
   const chain = {
     sort: jest.fn(() => chain),
+    limit: jest.fn(() => chain),
     select: jest.fn(() => chain),
     lean: jest.fn().mockResolvedValue(result),
   };
@@ -282,6 +322,16 @@ describe('/api/viventium/voice/chat', () => {
     logger.warn.mockClear();
     logger.error.mockClear();
     const { GenerationJobManager } = require('@librechat/api');
+    const voiceTaskService = require('~/server/services/viventium/VoiceTaskService');
+    voiceTaskService.resetVoiceTasksForTests();
+    jest
+      .spyOn(voiceTaskService, 'subscribeDurableVoiceTaskEventsForCall')
+      .mockImplementation(() => ({
+        ready: Promise.resolve(),
+        catchUp: jest.fn().mockResolvedValue(undefined),
+        seed: jest.fn(),
+        stop: jest.fn(),
+      }));
     GenerationJobManager.getJob.mockReset();
     GenerationJobManager.getResumeState.mockReset();
     GenerationJobManager.subscribe.mockReset();
@@ -295,13 +345,36 @@ describe('/api/viventium/voice/chat', () => {
     mockLastAgentId = null;
     mockLastRequestText = null;
     mockLastStreamId = null;
+    mockLastCanAuthorizeSideEffects = null;
+    mockLastActorTrust = null;
+    mockLastAmbientContext = null;
     mockAgentControllerCallCount = 0;
     mockAgentControllerResponseDelayMs = 0;
     mockAgentControllerGeneratedConversationId = null;
+    mockRequireVoiceAgentAccess = jest.fn((_req, _res, next) => next());
     mockMessageFindOne = createMessageFindOneMock(null);
     mockMessageFind = createMessageFindMock([]);
     mockMessageBulkWrite = jest.fn().mockResolvedValue({ modifiedCount: 0 });
     mockMessageFindOneAndUpdate = jest.fn().mockResolvedValue({ _id: 'listen_only_msg_oid' });
+    mockSpeakerPersisted = false;
+    mockSpeakerPersistedAtController = false;
+    mockPersistSpeakerSegments = jest.fn().mockImplementation(async () => {
+      mockSpeakerPersisted = true;
+      return { accepted: [], ignored: [], effectiveSegments: [] };
+    });
+    mockProjectSpeakerSegmentRevisions = jest.fn().mockResolvedValue({ matched: 0, updated: 0 });
+    mockListSpeakerSegments = jest.fn().mockResolvedValue([]);
+    mockPersistSpeakerSessionState = jest.fn().mockResolvedValue({
+      accepted: true,
+      state: {
+        version: 1,
+        callSessionId: 'call_session_1',
+        revision: 2,
+        attributionState: 'shared_mic_unverified',
+        detectedAt: '2026-08-09T10:01:00.000Z',
+        sourceTrackSid: 'track-owner',
+      },
+    });
     mockConversationFindOneAndUpdate = jest
       .fn()
       .mockResolvedValue({ conversationId: 'conv-voice-1' });
@@ -341,10 +414,37 @@ describe('/api/viventium/voice/chat', () => {
     });
     mockAssertVoiceGatewayAuth = jest.fn().mockResolvedValue({
       callSessionId: 'call_session_1',
+      ownerParticipantIdentity: 'owner-participant',
       userId: 'user_1',
       agentId: 'agent_voice',
       conversationId: 'conv-voice-1',
       listenOnlyModeEnabled: false,
+    });
+    mockAbandonVoiceSessionClaim = jest.fn().mockResolvedValue(true);
+    mockReportVoiceSessionFailure = jest.fn().mockResolvedValue({
+      callSessionId: 'call_session_1',
+      status: 'failed',
+      error: {
+        code: 'provider_failure',
+        message: 'The voice provider could not start.',
+        retryable: true,
+      },
+    });
+    mockMarkVoiceSessionReady = jest.fn().mockResolvedValue({
+      callSessionId: 'call_session_1',
+      mode: 'wing',
+      status: 'listening',
+      revision: 9,
+      updatedAt: Date.parse('2026-08-09T15:10:00.000Z'),
+    });
+    const { assertCallSessionSecret } = require('~/server/services/viventium/CallSessionService');
+    assertCallSessionSecret.mockReset();
+    assertCallSessionSecret.mockResolvedValue({
+      callSessionId: 'call_session_1',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      conversationId: 'conv-voice-1',
+      dispatchClaimId: 'dispatch-claim-current',
     });
     mockGetUserById = jest.fn().mockResolvedValue({ _id: 'user_1', role: 'USER' });
     mockSaveMessage = jest.fn().mockResolvedValue({});
@@ -385,6 +485,728 @@ describe('/api/viventium/voice/chat', () => {
     delete process.env.VIVENTIUM_VOICE_TURN_COALESCE_RETURN_WINDOW_MS;
     delete process.env.VIVENTIUM_VOICE_TURN_CONTINUATION_WINDOW_MS;
     delete process.env.VIVENTIUM_VOICE_LOG_LATENCY;
+  });
+
+  test('claim returns only the canonical server-owned room, agent, identity, route, and speaker state', async () => {
+    const { claimVoiceSession } = require('~/server/services/viventium/CallSessionService');
+    claimVoiceSession.mockResolvedValueOnce({
+      callSessionId: 'call_session_1',
+      roomName: 'lc-canonical',
+      gatewayAgentName: 'librechat-voice-gateway',
+      ownerParticipantIdentity: 'owner-participant',
+      requestedVoiceRoute: {
+        stt: { provider: 'assemblyai', variant: 'universal-streaming' },
+        tts: { provider: 'openai', variant: 'gpt-4o-mini-tts' },
+      },
+      speakerSessionState: {
+        version: 1,
+        callSessionId: 'call_session_1',
+        revision: 3,
+        attributionState: 'shared_mic_unverified',
+        detectedAt: '2026-08-09T10:00:00.000Z',
+      },
+      activeJobId: 'job-canonical',
+      activeWorkerId: 'worker-canonical',
+      leaseExpiresAtMs: 123,
+      mode: 'listen_only',
+      status: 'connecting',
+      revision: 7,
+      updatedAt: new Date('2026-08-09T15:00:00.000Z').getTime(),
+      error: {
+        code: 'provider_failure',
+        message: 'The voice provider could not start.',
+        retryable: true,
+      },
+    });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/claim',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+        'x-viventium-job-id': 'job-canonical',
+        'x-viventium-worker-id': 'worker-canonical',
+        'x-viventium-dispatch-claim': 'dispatch-claim-current',
+      },
+      body: {
+        roomName: 'browser-room',
+        gatewayAgentName: 'browser-agent',
+        ownerParticipantIdentity: 'browser-owner',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({
+      status: 'claimed',
+      callSessionId: 'call_session_1',
+      roomName: 'lc-canonical',
+      gatewayAgentName: 'librechat-voice-gateway',
+      ownerParticipantIdentity: 'owner-participant',
+      requestedVoiceRoute: {
+        stt: { provider: 'assemblyai', variant: 'universal-streaming' },
+        tts: { provider: 'openai', variant: 'gpt-4o-mini-tts' },
+      },
+      speakerSessionState: { attributionState: 'shared_mic_unverified', revision: 3 },
+      callState: {
+        version: 1,
+        callSessionId: 'call_session_1',
+        mode: 'listen_only',
+        status: 'connecting',
+        revision: 7,
+        updatedAt: '2026-08-09T15:00:00.000Z',
+        error: {
+          code: 'provider_failure',
+          message: 'The voice provider could not start.',
+          retryable: true,
+        },
+      },
+    });
+    expect(JSON.stringify(res.body)).not.toContain('browser-room');
+    expect(JSON.stringify(res.body)).not.toContain('browser-agent');
+    expect(JSON.stringify(res.body)).not.toContain('browser-owner');
+    expect(claimVoiceSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        callSessionId: 'call_session_1',
+        jobId: 'job-canonical',
+        workerId: 'worker-canonical',
+        dispatchClaimId: 'dispatch-claim-current',
+      }),
+    );
+  });
+
+  test('claim initializes a pre-start Wing call from authoritative nested call state', async () => {
+    const { claimVoiceSession } = require('~/server/services/viventium/CallSessionService');
+    claimVoiceSession.mockResolvedValueOnce({
+      callSessionId: 'call_session_1',
+      roomName: 'lc-canonical',
+      gatewayAgentName: 'librechat-voice-gateway',
+      ownerParticipantIdentity: 'owner-participant',
+      requestedVoiceRoute: { stt: { provider: 'assemblyai' }, tts: { provider: 'openai' } },
+      activeJobId: 'job-wing',
+      activeWorkerId: 'worker-wing',
+      leaseExpiresAtMs: 123,
+      mode: 'wing',
+      status: 'created',
+      revision: 4,
+      updatedAt: new Date('2026-08-09T15:05:00.000Z').getTime(),
+    });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/claim',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+        'x-viventium-job-id': 'job-wing',
+        'x-viventium-worker-id': 'worker-wing',
+        'x-viventium-dispatch-claim': 'dispatch-claim-current',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.body).toMatchObject({
+      status: 'claimed',
+      callState: {
+        version: 1,
+        callSessionId: 'call_session_1',
+        mode: 'wing',
+        status: 'created',
+        revision: 4,
+        updatedAt: '2026-08-09T15:05:00.000Z',
+      },
+    });
+  });
+
+  test('claim requires both bounded job and worker identities before acquiring a lease', async () => {
+    const { claimVoiceSession } = require('~/server/services/viventium/CallSessionService');
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const requests = [
+      createMockReq({
+        method: 'POST',
+        url: '/api/viventium/voice/claim',
+        headers: {
+          'x-viventium-call-secret': 'secret',
+          'x-viventium-call-session': 'call_session_1',
+          'x-viventium-worker-id': 'worker-without-job',
+        },
+      }),
+      createMockReq({
+        method: 'POST',
+        url: '/api/viventium/voice/claim',
+        headers: {
+          'x-viventium-call-secret': 'secret',
+          'x-viventium-call-session': 'call_session_1',
+          'x-viventium-job-id': 'job-without-worker',
+        },
+      }),
+    ];
+
+    for (const req of requests) {
+      const res = createMockRes();
+      await dispatch(app, req, res);
+      expect(res.statusCode).toBe(400);
+      expect(res.body).toEqual({
+        code: 'provider_failure',
+        message: 'A valid voice job and worker identity are required.',
+        retryable: false,
+      });
+    }
+    expect(claimVoiceSession).not.toHaveBeenCalled();
+  });
+
+  test('rejects a late worker whose dispatch claim was released or replaced', async () => {
+    const { claimVoiceSession } = require('~/server/services/viventium/CallSessionService');
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/claim',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+        'x-viventium-job-id': 'job-late',
+        'x-viventium-worker-id': 'worker-late',
+        'x-viventium-dispatch-claim': 'dispatch-claim-stale',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toEqual({
+      code: 'auth_expired',
+      message: 'The dispatch attempt is no longer authorized for this call session.',
+      retryable: false,
+    });
+    expect(claimVoiceSession).not.toHaveBeenCalled();
+  });
+
+  test('claim reports secret failures through the public auth taxonomy only', async () => {
+    const secretError = new Error('invalid secret https://example.test/?secret=never-echo');
+    secretError.status = 401;
+    require('~/server/services/viventium/CallSessionService').assertCallSessionSecret.mockRejectedValueOnce(
+      secretError,
+    );
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/claim',
+      headers: {
+        'x-viventium-call-secret': 'wrong-secret',
+        'x-viventium-call-session': 'call_session_1',
+        'x-viventium-job-id': 'job-auth-failure',
+        'x-viventium-worker-id': 'worker-auth-failure',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(401);
+    expect(res.body).toEqual({
+      code: 'auth_expired',
+      message: 'The call session expired or is unauthorized.',
+      retryable: false,
+    });
+    expect(JSON.stringify(res.body)).not.toContain('never-echo');
+  });
+
+  test('abandons only the exact authenticated gateway claim with a declared startup failure', async () => {
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/claim/abandon',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+        'x-viventium-job-id': 'job-owner-wait',
+        'x-viventium-worker-id': 'worker-owner-wait',
+      },
+      body: { reason: 'owner_timeout' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({ version: 1, released: true });
+    expect(mockAbandonVoiceSessionClaim).toHaveBeenCalledWith({
+      callSessionId: 'call_session_1',
+      jobId: 'job-owner-wait',
+      workerId: 'worker-owner-wait',
+    });
+  });
+
+  test('rejects malformed claim-abandon requests before lease mutation', async () => {
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const requests = [
+      createMockReq({
+        method: 'POST',
+        url: '/api/viventium/voice/claim/abandon',
+        headers: {
+          'x-viventium-call-secret': 'secret',
+          'x-viventium-call-session': 'call_session_1',
+          'x-viventium-job-id': 'job-owner-wait',
+        },
+        body: { reason: 'owner_timeout' },
+      }),
+      createMockReq({
+        method: 'POST',
+        url: '/api/viventium/voice/claim/abandon',
+        headers: {
+          'x-viventium-call-secret': 'secret',
+          'x-viventium-call-session': 'call_session_1',
+          'x-viventium-job-id': 'job-owner-wait',
+          'x-viventium-worker-id': 'worker-owner-wait',
+        },
+        body: { reason: 'arbitrary_reason' },
+      }),
+    ];
+
+    for (const req of requests) {
+      const res = createMockRes();
+      await dispatch(app, req, res);
+      expect(res.statusCode).toBe(400);
+    }
+    expect(mockAbandonVoiceSessionClaim).not.toHaveBeenCalled();
+  });
+
+  test('reports bounded provider initialization failure through the exact gateway owner claim', async () => {
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/call-sessions/call_session_1/failure',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+        'x-viventium-job-id': 'job-provider',
+        'x-viventium-worker-id': 'worker-provider',
+      },
+      body: {
+        version: 1,
+        classification: 'provider_failure',
+        modality: 'stt',
+        provider: 'assemblyai',
+        phase: 'initialization',
+        fatal: true,
+        message: 'secret-bearing provider exception must not pass through',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({
+      version: 1,
+      callSessionId: 'call_session_1',
+      status: 'failed',
+      error: {
+        code: 'provider_failure',
+        message: 'The voice provider could not start.',
+        retryable: true,
+      },
+    });
+    expect(JSON.stringify(res.body)).not.toContain('secret-bearing');
+    expect(mockReportVoiceSessionFailure).toHaveBeenCalledWith({
+      callSessionId: 'call_session_1',
+      jobId: 'job-provider',
+      workerId: 'worker-provider',
+      classification: 'provider_failure',
+      modality: 'stt',
+      provider: 'assemblyai',
+      phase: 'initialization',
+      fatal: true,
+    });
+  });
+
+  test('rejects invalid or stale gateway provider failure reports without exposing owner state', async () => {
+    mockReportVoiceSessionFailure.mockResolvedValueOnce(null);
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/call-sessions/call_session_1/failure',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+        'x-viventium-job-id': 'job-stale',
+        'x-viventium-worker-id': 'worker-stale',
+      },
+      body: {
+        version: 1,
+        classification: 'provider_failure',
+        modality: 'tts',
+        provider: 'openai',
+        phase: 'runtime',
+        fatal: true,
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toEqual({
+      code: 'auth_expired',
+      message: 'The gateway no longer owns this call session.',
+      retryable: false,
+    });
+  });
+
+  test('marks the call ready only through the exact active gateway owner', async () => {
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/call-sessions/call_session_1/ready',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+        'x-viventium-job-id': 'job-ready',
+        'x-viventium-worker-id': 'worker-ready',
+      },
+      body: { version: 1 },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({
+      version: 1,
+      callSessionId: 'call_session_1',
+      mode: 'wing',
+      status: 'listening',
+      revision: 9,
+      updatedAt: '2026-08-09T15:10:00.000Z',
+    });
+    expect(mockMarkVoiceSessionReady).toHaveBeenCalledWith({
+      callSessionId: 'call_session_1',
+      jobId: 'job-ready',
+      workerId: 'worker-ready',
+    });
+  });
+
+  test('ready rejects malformed, stale-owner, and ended-owner attempts', async () => {
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const malformed = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/call-sessions/call_session_1/ready',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+        'x-viventium-job-id': 'job-ready',
+      },
+      body: { version: 1 },
+    });
+    const malformedRes = createMockRes();
+    await dispatch(app, malformed, malformedRes);
+    expect(malformedRes.statusCode).toBe(400);
+    expect(mockMarkVoiceSessionReady).not.toHaveBeenCalled();
+
+    mockMarkVoiceSessionReady.mockResolvedValueOnce(null).mockResolvedValueOnce(null);
+    for (const workerId of ['worker-stale', 'worker-ended']) {
+      const req = createMockReq({
+        method: 'POST',
+        url: '/api/viventium/voice/call-sessions/call_session_1/ready',
+        headers: {
+          'x-viventium-call-secret': 'secret',
+          'x-viventium-call-session': 'call_session_1',
+          'x-viventium-job-id': 'job-ready',
+          'x-viventium-worker-id': workerId,
+        },
+        body: { version: 1 },
+      });
+      const res = createMockRes();
+      await dispatch(app, req, res);
+      expect(res.statusCode).toBe(409);
+      expect(res.body).toEqual({
+        code: 'auth_expired',
+        message: 'The gateway no longer owns this call session.',
+        retryable: false,
+      });
+    }
+  });
+
+  test('replays a persisted ambient segment without rewriting its existing message parent', async () => {
+    const segment = {
+      version: 1,
+      segmentId: 'seg-ambient-replay',
+      callSessionId: 'call_session_1',
+      turnId: 'turn-ambient-replay',
+      sequence: 2,
+      revision: 1,
+      text: 'Recovered soft transcript',
+      isFinal: true,
+      speaker: {
+        key: 'track:guest',
+        label: 'Guest',
+        source: 'participant_track',
+        attribution: 'verified',
+        actorTrust: 'authenticated_participant',
+        participantIdentity: 'guest-participant',
+        trackSid: 'track-guest',
+      },
+    };
+    mockPersistSpeakerSegments.mockResolvedValueOnce({
+      accepted: [],
+      ignored: ['seg-ambient-replay'],
+      effectiveSegments: [segment],
+    });
+    mockMessageFindOne = createMessageFindOneMock({
+      messageId: 'ambient-existing',
+      parentMessageId: 'assistant-before-ambient',
+    });
+    mockMessageFindOneAndUpdate.mockResolvedValueOnce({
+      _id: 'ambient-existing-oid',
+      messageId: 'ambient-existing',
+      parentMessageId: 'assistant-before-ambient',
+    });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/ambient-transcript',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: {
+        version: 1,
+        callSessionId: 'call_session_1',
+        ingressKind: 'ambient_participant',
+        segments: [segment],
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body.messageIds).toHaveLength(1);
+    const update = mockMessageFindOneAndUpdate.mock.calls[0][1];
+    expect(update.$set).not.toHaveProperty('parentMessageId');
+    expect(update.$setOnInsert.parentMessageId).toBeDefined();
+  });
+
+  test('claim fails closed with classified auth expiry after the call ended', async () => {
+    const {
+      assertCallSessionSecret,
+      claimVoiceSession,
+    } = require('~/server/services/viventium/CallSessionService');
+    assertCallSessionSecret.mockResolvedValueOnce({
+      callSessionId: 'call_session_1',
+      status: 'ended',
+    });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/claim',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+        'x-viventium-job-id': 'job-after-end',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(410);
+    expect(res.body).toEqual({
+      code: 'auth_expired',
+      message: 'The call session has ended.',
+      retryable: false,
+    });
+    expect(claimVoiceSession).not.toHaveBeenCalled();
+  });
+
+  test('gateway state includes the terminal canonical status', async () => {
+    mockAssertVoiceGatewayAuth.mockResolvedValueOnce({
+      callSessionId: 'call_session_1',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      conversationId: 'conv-voice-1',
+      mode: 'call',
+      status: 'ended',
+      revision: 4,
+      updatedAt: Date.parse('2026-08-09T10:00:00.000Z'),
+      error: {
+        code: 'gateway_down',
+        message: 'The voice gateway is unavailable.',
+        retryable: true,
+      },
+    });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/voice/call-sessions/call_session_1/state',
+      headers: { 'x-viventium-call-secret': 'secret' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({
+      version: 1,
+      callSessionId: 'call_session_1',
+      mode: 'call',
+      status: 'ended',
+      revision: 4,
+      updatedAt: '2026-08-09T10:00:00.000Z',
+      error: {
+        code: 'gateway_down',
+        message: 'The voice gateway is unavailable.',
+        retryable: true,
+      },
+    });
+  });
+
+  test('persists shared-mic abstention across a worker restart before authorizing a turn', async () => {
+    mockAssertVoiceGatewayAuth.mockResolvedValueOnce({
+      callSessionId: 'call_session_1',
+      ownerParticipantIdentity: 'owner-participant',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      conversationId: 'conv-voice-1',
+      mode: 'call',
+      speakerAttributionState: 'shared_mic_unverified',
+    });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      url: '/api/viventium/voice/chat',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: {
+        text: 'first speech after reconnect',
+        ownerTrackSid: 'owner-track',
+        speakerSegments: [
+          {
+            version: 1,
+            segmentId: 'segment-after-reconnect',
+            turnId: 'turn-after-reconnect',
+            sequence: 1,
+            revision: 0,
+            text: 'first speech after reconnect',
+            isFinal: true,
+            speaker: {
+              key: 'track:owner',
+              label: 'Owner',
+              source: 'hybrid',
+              attribution: 'verified',
+              actorTrust: 'owner_participant',
+              participantIdentity: 'owner-participant',
+              trackSid: 'owner-track',
+            },
+          },
+        ],
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockLastCanAuthorizeSideEffects).toBe(false);
+    expect(mockLastActorTrust).toBe('shared_mic_unverified');
+    expect(mockPersistSpeakerSegments).toHaveBeenCalledWith(
+      expect.objectContaining({ speakerAttributionState: 'shared_mic_unverified' }),
+    );
+  });
+
+  test('keeps a separate signed owner track authoritative when only a guest track is shared', async () => {
+    mockMessageFind = createMessageFindMock([
+      {
+        text: 'Delete the shared project now',
+        createdAt: '2026-08-09T10:00:00.000Z',
+        metadata: {
+          viventium: {
+            type: 'voice_ambient_transcript',
+            callSessionId: 'call_session_1',
+            speakerLabel: 'Guest',
+            actorTrust: 'authenticated_participant',
+          },
+        },
+      },
+    ]);
+    mockAssertVoiceGatewayAuth.mockResolvedValueOnce({
+      callSessionId: 'call_session_1',
+      ownerParticipantIdentity: 'owner-participant',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      conversationId: 'conv-voice-1',
+      mode: 'call',
+      speakerAttributionState: 'shared_mic_unverified',
+      sharedTrackSids: ['guest-track'],
+      sharedParticipantIdentities: ['guest-participant'],
+    });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      url: '/api/viventium/voice/chat',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: {
+        text: 'owner authorizes this action',
+        ownerTrackSid: 'owner-track',
+        speakerSegments: [
+          {
+            version: 1,
+            segmentId: 'segment-owner-scoped-reconnect',
+            turnId: 'turn-owner-scoped-reconnect',
+            sequence: 1,
+            revision: 0,
+            text: 'owner authorizes this action',
+            isFinal: true,
+            speaker: {
+              key: 'track:owner',
+              label: 'Owner',
+              source: 'hybrid',
+              attribution: 'verified',
+              actorTrust: 'owner_participant',
+              participantIdentity: 'owner-participant',
+              trackSid: 'owner-track',
+            },
+          },
+        ],
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockLastCanAuthorizeSideEffects).toBe(true);
+    expect(mockLastActorTrust).toBe('owner_participant');
+    expect(mockLastAmbientContext).toEqual([
+      {
+        text: 'Delete the shared project now',
+        speakerLabel: 'Guest',
+        actorTrust: 'authenticated_participant',
+        observedAt: '2026-08-09T10:00:00.000Z',
+      },
+    ]);
+    expect(mockPersistSpeakerSegments).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sharedTrackSids: ['guest-track'],
+        sharedParticipantIdentities: ['guest-participant'],
+      }),
+    );
   });
 
   test('voice ingress schema keeps Listen-Only continuation audit fields under strict mode', async () => {
@@ -463,6 +1285,606 @@ describe('/api/viventium/voice/chat', () => {
     expect(mockLastAgentId).toBe('agent_voice');
   });
 
+  test('rechecks agent access before every Call/Wing turn and performs no work after revocation', async () => {
+    mockRequireVoiceAgentAccess.mockImplementationOnce((request, res) => {
+      expect(request.viventiumCallSession.agentId).toBe('revoked-session-agent');
+      expect(request.body.agent_id).toBe('accessible-decoy-agent');
+      return res.status(404).json({
+        code: 'no_route',
+        message: 'Voice assistant is unavailable.',
+        retryable: false,
+      });
+    });
+    mockAssertVoiceGatewayAuth.mockResolvedValueOnce({
+      callSessionId: 'call_session_1',
+      ownerParticipantIdentity: 'owner-participant',
+      userId: 'user_1',
+      agentId: 'revoked-session-agent',
+      conversationId: 'conv-voice-1',
+      mode: 'call',
+      listenOnlyModeEnabled: false,
+    });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      url: '/api/viventium/voice/chat',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: {
+        text: 'do not execute after revocation',
+        agent_id: 'accessible-decoy-agent',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(404);
+    expect(res.body).toEqual({
+      code: 'no_route',
+      message: 'Voice assistant is unavailable.',
+      retryable: false,
+    });
+    expect(mockRequireVoiceAgentAccess).toHaveBeenCalledTimes(1);
+    expect(mockPersistSpeakerSegments).not.toHaveBeenCalled();
+    expect(mockVoiceIngressCreate).not.toHaveBeenCalled();
+    expect(mockSaveMessage).not.toHaveBeenCalled();
+    expect(mockConversationFindOneAndUpdate).not.toHaveBeenCalled();
+    expect(mockAgentControllerCallCount).toBe(0);
+  });
+
+  test('persists SpeakerSegmentV1 revisions before launching and blocks side-effect authority for shared mic', async () => {
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const speakerSegment = {
+      version: 1,
+      segmentId: 'seg-shared-a',
+      turnId: 'turn-shared',
+      sequence: 1,
+      revision: 0,
+      text: 'draft an email',
+      isFinal: true,
+      speaker: {
+        key: 'provider:A',
+        label: 'Speaker 1',
+        source: 'provider_diarization',
+        attribution: 'unverified',
+        actorTrust: 'shared_mic_unverified',
+        providerSpeakerId: 'A',
+      },
+    };
+    const req = createMockReq({
+      url: '/api/viventium/voice/chat',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: {
+        text: 'draft an email',
+        speakerSegments: [speakerSegment],
+        speakerSegmentRevisions: [{ ...speakerSegment, revision: 1 }],
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(mockSpeakerPersistedAtController).toBe(true);
+    expect(mockPersistSpeakerSegments).toHaveBeenCalledWith(
+      expect.objectContaining({
+        callSessionId: 'call_session_1',
+        currentSegments: expect.any(Array),
+        revisions: expect.any(Array),
+      }),
+    );
+    expect(req.body.viventiumActorTrust).toBe('shared_mic_unverified');
+    expect(req.body.viventiumCanAuthorizeSideEffects).toBe(false);
+    expect(req.body.viventiumDeferVoiceMemory).toBe(true);
+  });
+
+  test('accepts late speaker revisions without requiring another chat turn', async () => {
+    mockPersistSpeakerSegments.mockResolvedValueOnce({
+      accepted: ['seg-late'],
+      ignored: [],
+    });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/speaker-segments/revisions',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: {
+        speakerSegmentRevisions: [
+          {
+            version: 1,
+            segmentId: 'seg-late',
+            turnId: 'turn-previous',
+            sequence: 1,
+            revision: 2,
+            text: 'earlier speech',
+            isFinal: true,
+            speaker: {
+              key: 'provider:A',
+              label: 'Speaker 1',
+              source: 'provider_diarization',
+              attribution: 'unverified',
+              actorTrust: 'shared_mic_unverified',
+            },
+          },
+        ],
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({ version: 1, accepted: ['seg-late'], ignored: [] });
+    expect(mockAgentControllerCallCount).toBe(0);
+  });
+
+  test('persists a call-scoped SpeakerSessionStateV1 tombstone without agent work', async () => {
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/speaker-session-state',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: {
+        version: 1,
+        callSessionId: 'call_session_1',
+        revision: 2,
+        attributionState: 'shared_mic_unverified',
+        detectedAt: '2026-08-09T10:01:00.000Z',
+        sourceTrackSid: 'track-owner',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockPersistSpeakerSessionState).toHaveBeenCalledWith({
+      callSessionId: 'call_session_1',
+      state: req.body,
+    });
+    expect(res.body).toMatchObject({
+      version: 1,
+      accepted: true,
+      state: { attributionState: 'shared_mic_unverified', revision: 2 },
+    });
+    expect(mockAgentControllerCallCount).toBe(0);
+  });
+
+  test('replays only authenticated call-scoped speaker segments after reconnect', async () => {
+    mockListSpeakerSegments.mockResolvedValueOnce([
+      {
+        version: 1,
+        segmentId: 'segment-replay',
+        callSessionId: 'call_session_1',
+        turnId: 'turn-replay',
+        sequence: 1,
+        revision: 2,
+        text: 'latest caption',
+        isFinal: true,
+        speaker: {
+          key: 'provider:A',
+          label: 'Speaker 1',
+          source: 'provider_diarization',
+          attribution: 'unverified',
+          actorTrust: 'shared_mic_unverified',
+        },
+      },
+    ]);
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/voice/speaker-segments?callSessionId=call_session_1',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+      },
+      query: { callSessionId: 'call_session_1' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({
+      version: 1,
+      segments: [{ segmentId: 'segment-replay', revision: 2 }],
+      hasMore: false,
+    });
+    expect(mockListSpeakerSegments).toHaveBeenCalledWith({
+      callSessionId: 'call_session_1',
+      limit: 512,
+      beforeSequence: undefined,
+      beforeSegmentId: undefined,
+      page: true,
+    });
+  });
+
+  test('never replays speaker segments from another call session', async () => {
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/voice/speaker-segments?callSessionId=call_other',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+      },
+      query: { callSessionId: 'call_other' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(403);
+    expect(mockListSpeakerSegments).not.toHaveBeenCalled();
+  });
+
+  test('accepts the bounded browser-BFF session capability without a gateway job id', async () => {
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/voice/speaker-segments?callSessionId=call_session_1',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+      },
+      query: { callSessionId: 'call_session_1' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockAssertVoiceGatewayAuth).not.toHaveBeenCalled();
+    expect(
+      require('~/server/services/viventium/CallSessionService').assertCallSessionSecret,
+    ).toHaveBeenCalledWith('call_session_1', 'secret');
+  });
+
+  test('rejects a mismatched browser-BFF session capability', async () => {
+    const { assertCallSessionSecret } = require('~/server/services/viventium/CallSessionService');
+    const authError = new Error('Unauthorized voice gateway');
+    authError.status = 401;
+    assertCallSessionSecret.mockRejectedValueOnce(authError);
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/voice/speaker-segments?callSessionId=call_session_1',
+      headers: {
+        'x-viventium-call-secret': 'wrong-secret',
+        'x-viventium-call-session': 'call_other',
+      },
+      query: { callSessionId: 'call_session_1' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(401);
+    expect(mockListSpeakerSegments).not.toHaveBeenCalled();
+  });
+
+  test('does not elevate the browser-BFF capability to speaker mutation routes', async () => {
+    const gatewayError = new Error('Missing voice job id');
+    gatewayError.status = 401;
+    mockAssertVoiceGatewayAuth.mockRejectedValueOnce(gatewayError);
+    const { assertCallSessionSecret } = require('~/server/services/viventium/CallSessionService');
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/speaker-segments/revisions',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+      },
+      body: { version: 1, speakerSegmentRevisions: [] },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(401);
+    expect(assertCallSessionSecret).not.toHaveBeenCalled();
+    expect(mockPersistSpeakerSegments).not.toHaveBeenCalled();
+  });
+
+  test('returns retryable gateway_down for transient speaker-session persistence failure', async () => {
+    mockPersistSpeakerSessionState.mockRejectedValueOnce(new Error('synthetic database outage'));
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/speaker-session-state',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: {
+        version: 1,
+        callSessionId: 'call_session_1',
+        revision: 2,
+        attributionState: 'shared_mic_unverified',
+        detectedAt: '2026-08-09T10:01:00.000Z',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(503);
+    expect(res.body).toEqual({
+      code: 'gateway_down',
+      message: 'Speaker state persistence is temporarily unavailable.',
+      retryable: true,
+    });
+  });
+
+  test('returns nonretryable provider_failure for invalid speaker-session state', async () => {
+    const validationError = new Error('Invalid SpeakerSessionStateV1');
+    validationError.status = 400;
+    mockPersistSpeakerSessionState.mockRejectedValueOnce(validationError);
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/speaker-session-state',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: { version: 1, attributionState: 'claimed_owner' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toEqual({
+      code: 'provider_failure',
+      message: 'Invalid SpeakerSessionStateV1',
+      retryable: false,
+    });
+  });
+
+  test('persists authenticated ambient participant segments as soft evidence without agent work', async () => {
+    mockPersistSpeakerSegments.mockResolvedValueOnce({
+      accepted: ['seg-guest'],
+      ignored: [],
+    });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/ambient-transcript',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: {
+        version: 1,
+        callSessionId: 'call_session_1',
+        mode: 'call',
+        ingressKind: 'ambient_participant',
+        segments: [
+          {
+            version: 1,
+            segmentId: 'seg-guest',
+            callSessionId: 'call_session_1',
+            turnId: 'turn-guest',
+            sequence: 1,
+            revision: 0,
+            text: 'Guest context only',
+            isFinal: true,
+            speaker: {
+              key: 'track:guest',
+              label: 'Guest',
+              source: 'hybrid',
+              attribution: 'verified',
+              actorTrust: 'authenticated_participant',
+              participantIdentity: 'guest-participant',
+              trackSid: 'track-guest',
+              providerSpeakerId: 'A',
+            },
+          },
+        ],
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({
+      version: 1,
+      accepted: ['seg-guest'],
+      rejected: [],
+      messageIds: [expect.stringMatching(/^ambient-/)],
+    });
+    expect(mockAgentControllerCallCount).toBe(0);
+    expect(mockPersistSpeakerSegments).toHaveBeenCalledWith(
+      expect.objectContaining({ ambientIngress: true }),
+    );
+    expect(mockMessageFindOneAndUpdate).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({
+        $set: expect.objectContaining({
+          _meiliIndex: false,
+          memoryEligible: 'soft',
+          isCreatedByUser: false,
+          metadata: expect.objectContaining({
+            viventium: expect.objectContaining({
+              type: 'voice_ambient_transcript',
+              ingressKind: 'ambient_participant',
+              actorTrust: 'authenticated_participant',
+              memoryEligible: 'soft',
+            }),
+          }),
+        }),
+      }),
+      expect.objectContaining({ upsert: true }),
+    );
+  });
+
+  test('persists the canonical owner track as soft Listen-Only evidence without agent work', async () => {
+    mockAssertVoiceGatewayAuth = jest.fn().mockResolvedValue({
+      callSessionId: 'call_session_listen_only',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      conversationId: 'conv-voice-1',
+      mode: 'listen_only',
+      listenOnlyModeEnabled: true,
+      ownerParticipantIdentity: 'owner-participant',
+    });
+    mockPersistSpeakerSegments.mockResolvedValueOnce({
+      accepted: ['seg-listen-owner'],
+      ignored: [],
+    });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/ambient-transcript',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-job-id': 'job-listen-owner',
+      },
+      body: {
+        version: 1,
+        callSessionId: 'call_session_listen_only',
+        mode: 'call',
+        ingressKind: 'listen_only_owner',
+        segments: [
+          {
+            version: 1,
+            segmentId: 'seg-listen-owner',
+            callSessionId: 'call_session_listen_only',
+            turnId: 'turn-listen-owner',
+            sequence: 1,
+            revision: 0,
+            text: 'Owner transcript only',
+            isFinal: true,
+            speaker: {
+              key: 'track:owner',
+              label: 'You',
+              source: 'participant_track',
+              attribution: 'verified',
+              actorTrust: 'owner_participant',
+              participantIdentity: 'owner-participant',
+              trackSid: 'track-owner',
+            },
+          },
+        ],
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({
+      version: 1,
+      accepted: ['seg-listen-owner'],
+      messageIds: [expect.stringMatching(/^ambient-/)],
+    });
+    expect(mockAgentControllerCallCount).toBe(0);
+    expect(mockPersistSpeakerSegments).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ambientIngress: true,
+        currentSegments: [
+          expect.objectContaining({
+            speaker: expect.objectContaining({
+              attribution: 'verified',
+              actorTrust: 'owner_participant',
+              participantIdentity: 'owner-participant',
+            }),
+          }),
+        ],
+      }),
+    );
+    expect(mockMessageFindOneAndUpdate).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({
+        $set: expect.objectContaining({
+          _meiliIndex: false,
+          memoryEligible: 'soft',
+          isCreatedByUser: false,
+          metadata: expect.objectContaining({
+            viventium: expect.objectContaining({
+              type: 'listen_only_transcript',
+              mode: 'listen_only',
+              ingressKind: 'listen_only_owner',
+              ambientKind: 'listen_only_owner_track',
+              actorTrust: 'owner_participant',
+              memoryEligible: 'soft',
+            }),
+          }),
+        }),
+      }),
+      expect.objectContaining({ upsert: true }),
+    );
+  });
+
+  test('rejects Listen-Only owner ingress unless authenticated session state is Listen-Only', async () => {
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/ambient-transcript',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: {
+        version: 1,
+        callSessionId: 'call_session_1',
+        mode: 'listen_only',
+        ingressKind: 'listen_only_owner',
+        segments: [
+          {
+            version: 1,
+            segmentId: 'seg-spoofed-listen-owner',
+            callSessionId: 'call_session_1',
+            turnId: 'turn-spoofed-listen-owner',
+            sequence: 1,
+            revision: 0,
+            text: 'Do not elevate this',
+            isFinal: true,
+            speaker: {
+              key: 'track:owner',
+              label: 'You',
+              source: 'participant_track',
+              attribution: 'verified',
+              actorTrust: 'owner_participant',
+              participantIdentity: 'owner-participant',
+              trackSid: 'track-owner',
+            },
+          },
+        ],
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toMatchObject({ code: 'provider_failure', retryable: false });
+    expect(mockPersistSpeakerSegments).not.toHaveBeenCalled();
+    expect(mockMessageFindOneAndUpdate).not.toHaveBeenCalled();
+    expect(mockAgentControllerCallCount).toBe(0);
+  });
+
+  test('fails closed when speaker attribution is missing or rejected', async () => {
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      url: '/api/viventium/voice/chat',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: { text: 'send the email', speakerSegments: [{ invalid: true }] },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(req.body.speakerSegments).toEqual([]);
+    expect(req.body.viventiumActorTrust).toBe('unknown');
+    expect(req.body.viventiumCanAuthorizeSideEffects).toBe(false);
+  });
+
   test('preserves a gateway-supplied per-turn streamId', async () => {
     const voiceRouter = require('../voice');
     const app = createTestApp(voiceRouter);
@@ -506,6 +1928,13 @@ describe('/api/viventium/voice/chat', () => {
       mockObservedInfoLogs.some(
         (line) =>
           line.includes('stage=voice_coalesce_done') && line.includes('coalesce_window_ms=0'),
+      ),
+    ).toBe(true);
+    expect(
+      mockObservedInfoLogs.some(
+        (line) =>
+          line.includes('stage=gateway_dispatch_received') &&
+          line.includes('request_id=lc_req_latency'),
       ),
     ).toBe(true);
   });
@@ -748,6 +2177,72 @@ describe('/api/viventium/voice/chat', () => {
     expect([firstRes.body.coalesced, secondRes.body.coalesced].filter(Boolean)).toHaveLength(1);
   });
 
+  test('preserves exact speaker boundaries when rapid turns from different speakers coalesce', async () => {
+    jest.useFakeTimers();
+    process.env.VIVENTIUM_VOICE_TURN_COALESCE_WINDOW_MS = '10';
+    process.env.VIVENTIUM_VOICE_TURN_COALESCE_WAIT_MS = '200';
+    process.env.VIVENTIUM_VOICE_TURN_COALESCE_POLL_MS = '5';
+    process.env.VIVENTIUM_VOICE_TURN_COALESCE_RETURN_WINDOW_MS = '200';
+    mockAgentControllerResponseDelayMs = 20;
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const segment = (segmentId, sequence, label, actorTrust, text) => ({
+      version: 1,
+      segmentId,
+      turnId: `turn-${sequence}`,
+      sequence,
+      revision: 0,
+      text,
+      isFinal: true,
+      speaker: {
+        key: `track:${label}`,
+        label,
+        source: 'participant_track',
+        attribution: 'verified',
+        actorTrust,
+        participantIdentity: label.toLowerCase(),
+        trackSid: `track-${sequence}`,
+      },
+    });
+    const firstReq = createMockReq({
+      url: '/api/viventium/voice/chat',
+      headers: { 'x-viventium-call-secret': 'secret', 'x-viventium-request-id': 'speaker-1' },
+      body: {
+        text: 'Owner says hello',
+        speakerSegments: [
+          segment('seg-owner', 1, 'Owner', 'owner_participant', 'Owner says hello'),
+        ],
+      },
+    });
+    const secondReq = createMockReq({
+      url: '/api/viventium/voice/chat',
+      headers: { 'x-viventium-call-secret': 'secret', 'x-viventium-request-id': 'speaker-2' },
+      body: {
+        text: 'Guest adds context',
+        speakerSegments: [
+          segment('seg-guest', 2, 'Guest', 'authenticated_participant', 'Guest adds context'),
+        ],
+      },
+    });
+    const firstRes = createMockRes();
+    const secondRes = createMockRes();
+
+    const firstPromise = dispatch(app, firstReq, firstRes);
+    await advanceVoiceRouteTimers(2);
+    const secondPromise = dispatch(app, secondReq, secondRes);
+    await advanceVoiceRouteTimers(100);
+    await Promise.all([firstPromise, secondPromise]);
+
+    expect(mockAgentControllerCallCount).toBe(1);
+    expect(firstReq.body.text).toBe('Owner says hello Guest adds context');
+    expect(firstReq.body.speakerSegments.map((value) => value.segmentId)).toEqual([
+      'seg-owner',
+      'seg-guest',
+    ]);
+    expect(firstReq.body.speakerLabel).toBe('multiple');
+    expect(firstReq.body.viventiumCanAuthorizeSideEffects).toBe(false);
+  });
+
   test('coalesces three rapid same-parent voice turns in ingress order', async () => {
     jest.useFakeTimers();
     process.env.VIVENTIUM_VOICE_TURN_COALESCE_WINDOW_MS = '10';
@@ -821,22 +2316,16 @@ describe('/api/viventium/voice/chat', () => {
     expect(infoText).toContain('requestId=req-log-1');
   });
 
-  test('cancels a voice-owned generation stream for an intentional user interruption', async () => {
+  test('interrupts voice speech without cancelling or persisting the underlying task', async () => {
     const { GenerationJobManager } = require('@librechat/api');
-    GenerationJobManager.getJob.mockResolvedValue({
-      metadata: { userId: 'user_1' },
+    const { createVoiceTask } = require('~/server/services/viventium/VoiceTaskService');
+    createVoiceTask({
+      callSessionId: 'call_session_1',
+      userId: 'user_1',
+      streamId: 'lc_req_abort_1',
     });
-    GenerationJobManager.abortJob.mockResolvedValue({
-      success: true,
-      text: 'partial response',
-      content: [{ type: 'text', text: 'partial response' }],
-      jobData: {
-        userMessage: { messageId: 'voice_user_abort_1' },
-        responseMessageId: 'voice_assistant_abort_1',
-        conversationId: 'conv-voice-1',
-        endpoint: 'agents',
-        model: 'agent_voice',
-      },
+    GenerationJobManager.getJob.mockResolvedValue({
+      metadata: { userId: 'user_1', viventiumCallSessionId: 'call_session_1' },
     });
 
     const voiceRouter = require('../voice');
@@ -852,21 +2341,1012 @@ describe('/api/viventium/voice/chat', () => {
     await dispatch(app, req, res);
 
     expect(res.statusCode).toBe(200);
-    expect(res.body).toEqual({ success: true, aborted: 'lc_req_abort_1' });
-    expect(GenerationJobManager.abortJob).toHaveBeenCalledWith('lc_req_abort_1', 'user_cancelled');
-    expect(mockSaveMessage).toHaveBeenCalledWith(
-      expect.any(Object),
-      expect.objectContaining({
-        messageId: 'voice_assistant_abort_1',
-        parentMessageId: 'voice_user_abort_1',
-        conversationId: 'conv-voice-1',
-        text: 'partial response',
-        unfinished: true,
-        isCreatedByUser: false,
-      }),
-      expect.objectContaining({
-        context: 'api/server/routes/viventium/voice.js - voice stream abort endpoint',
-      }),
+    expect(res.body).toMatchObject({
+      success: true,
+      interrupted: 'lc_req_abort_1',
+      taskId: expect.any(String),
+    });
+    expect(GenerationJobManager.abortJob).not.toHaveBeenCalled();
+    expect(mockSaveMessage).not.toHaveBeenCalled();
+  });
+
+  test('reconciles durable cancellation before relaying or observing a late stream event', async () => {
+    const taskService = require('~/server/services/viventium/VoiceTaskService');
+    const { GenerationJobManager } = require('@librechat/api');
+    const task = taskService.createVoiceTask({
+      callSessionId: 'call_session_1',
+      userId: 'user_1',
+      conversationId: 'conv-voice-1',
+      streamId: 'stream-cross-process-cancel',
+    });
+    taskService.setVoiceTaskSuppressionPersistenceForTests({
+      persist: async () => undefined,
+      clear: async () => undefined,
+      lookup: async () => true,
+    });
+    GenerationJobManager.getJob.mockResolvedValue({ metadata: { userId: 'user_1' } });
+    GenerationJobManager.subscribe.mockImplementationOnce((_streamId, onEvent, onDone) => {
+      onEvent({
+        event: 'on_source',
+        data: { id: 'late-source', title: 'Late', url: 'https://example.test/late' },
+      });
+      onDone({ responseMessage: { messageId: 'late-result' } });
+      return { unsubscribe: jest.fn() };
+    });
+    const before = taskService.snapshotEvent(task.taskId);
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/voice/stream/stream-cross-process-cancel',
+      headers: { 'x-viventium-call-secret': 'secret' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.write).not.toHaveBeenCalledWith(expect.stringContaining('event: message'));
+    expect(taskService.snapshotEvent(task.taskId)).toMatchObject({
+      sequence: before.sequence,
+      state: 'running',
+    });
+    expect(taskService.snapshotEvent(task.taskId).sources).toBeUndefined();
+  });
+
+  test('fails a voice stream closed when no authoritative durable task can be reconciled', async () => {
+    const { GenerationJobManager } = require('@librechat/api');
+    GenerationJobManager.getJob.mockResolvedValue({ metadata: { userId: 'user_1' } });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/voice/stream/missing-durable-task',
+      headers: { 'x-viventium-call-secret': 'secret' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(503);
+    expect(res.body).toEqual({
+      code: 'gateway_down',
+      message: 'Voice task recovery is temporarily unavailable.',
+      retryable: true,
+    });
+    expect(GenerationJobManager.subscribe).not.toHaveBeenCalled();
+    expect(res.write).not.toHaveBeenCalled();
+  });
+
+  test('does not let one same-user call subscribe to or interrupt another call stream', async () => {
+    const taskService = require('~/server/services/viventium/VoiceTaskService');
+    const { GenerationJobManager } = require('@librechat/api');
+    taskService.createVoiceTask({
+      callSessionId: 'call_other',
+      userId: 'user_1',
+      streamId: 'stream-other-call',
+    });
+    GenerationJobManager.getJob.mockResolvedValue({ metadata: { userId: 'user_1' } });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+
+    const streamReq = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/voice/stream/stream-other-call',
+      headers: { 'x-viventium-call-secret': 'secret' },
+    });
+    const streamRes = createMockRes();
+    await dispatch(app, streamReq, streamRes);
+    expect(streamRes.statusCode).toBe(503);
+    expect(GenerationJobManager.subscribe).not.toHaveBeenCalled();
+    expect(streamRes.write).not.toHaveBeenCalled();
+
+    const abortReq = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/stream/stream-other-call/abort',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: { reason: 'voice_user_interruption' },
+    });
+    const abortRes = createMockRes();
+    await dispatch(app, abortReq, abortRes);
+    expect(abortRes.statusCode).toBe(404);
+    expect(abortRes.body).toMatchObject({ error: 'Stream not found' });
+    expect(GenerationJobManager.abortJob).not.toHaveBeenCalled();
+  });
+
+  test('lists task snapshots through the bounded browser-BFF capability', async () => {
+    const taskService = require('~/server/services/viventium/VoiceTaskService');
+    const { createVoiceTask } = taskService;
+    const task = createVoiceTask({
+      callSessionId: 'call_session_1',
+      userId: 'user_1',
+      conversationId: 'conv-voice-1',
+      streamId: 'stream-bff-list',
+    });
+    jest.spyOn(taskService, 'listDurableVoiceTaskSnapshots').mockResolvedValueOnce({
+      events: [taskService.snapshotEvent(task.taskId)],
+      hasMore: false,
+      nextBeforeCreatedAt: null,
+      nextBeforeTaskId: null,
+    });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/voice/tasks?callSessionId=call_session_1',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+      },
+      query: { callSessionId: 'call_session_1' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({
+      version: 1,
+      events: [{ version: 1, taskId: task.taskId, type: 'snapshot' }],
+      taskOwnerCapabilityInventory: {
+        authoritative: true,
+        source: 'runtime_voice_task_owner_registry',
+        owners: [{ kind: 'generation_job', acceptsInput: false }],
+      },
+    });
+    expect(mockAssertVoiceGatewayAuth).not.toHaveBeenCalled();
+  });
+
+  test('streams initial and live call-scoped child task events after the parent completes', async () => {
+    const taskService = require('~/server/services/viventium/VoiceTaskService');
+    const { completeVoiceTask, createVoiceTask, observeGenerationEvent } = taskService;
+    const parent = createVoiceTask({
+      callSessionId: 'call_session_1',
+      userId: 'user_1',
+      conversationId: 'conv-voice-1',
+      streamId: 'parent-task-stream',
+    });
+    completeVoiceTask(parent.taskId, { resultMessageId: 'parent-result' });
+    jest.spyOn(taskService, 'listDurableVoiceTaskSnapshots').mockResolvedValueOnce({
+      events: [taskService.snapshotEvent(parent.taskId)],
+      hasMore: false,
+      nextBeforeCreatedAt: null,
+      nextBeforeTaskId: null,
+    });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const closeHandlers = [];
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/voice/tasks/events?callSessionId=call_session_1',
+      query: { callSessionId: 'call_session_1' },
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+        'x-viventium-job-id': 'job-1',
+        'x-viventium-worker-id': 'worker-1',
+      },
+    });
+    req.on.mockImplementation((event, listener) => {
+      if (event === 'close') closeHandlers.push(listener);
+      return req;
+    });
+    const res = createMockRes();
+
+    app.handle(req, res, (err) => {
+      if (err) throw err;
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    const child = createVoiceTask({
+      callSessionId: 'call_session_1',
+      userId: 'user_1',
+      conversationId: 'conv-voice-1',
+      streamId: 'glasshive:run-live-route',
+      parentTaskId: parent.taskId,
+      owner: { kind: 'glasshive_run', id: 'run-live-route' },
+    });
+    observeGenerationEvent(child.taskId, {
+      event: 'source',
+      data: {
+        eventId: 'route-live-source',
+        source: { title: 'Live callback source', provider: 'glasshive' },
+      },
+    });
+
+    const output = res.write.mock.calls.map(([chunk]) => String(chunk)).join('');
+    expect(res.headers['Content-Type']).toBe('text/event-stream');
+    expect(output).toContain('event: voice_task_event');
+    expect(output).toContain('event: voice_task_sync');
+    expect(output).toContain(
+      'data: {"version":1,"callSessionId":"call_session_1","state":"synchronized","emittedAt":',
+    );
+    expect(output).toContain(`"taskId":"${parent.taskId}"`);
+    expect(output).toContain(`"taskId":"${child.taskId}"`);
+    expect(output).toContain('Live callback source');
+    expect(output).toContain('"parentTaskId"');
+    const writesBeforeClose = res.write.mock.calls.length;
+    closeHandlers.forEach((listener) => listener());
+    observeGenerationEvent(child.taskId, {
+      event: 'on_agent_update',
+      data: { eventId: 'after-close', name: 'Should not stream' },
+    });
+    expect(res.write).toHaveBeenCalledTimes(writesBeforeClose);
+  });
+
+  test('subscribes live first and replays every durable task page beyond the in-memory limit', async () => {
+    const taskService = require('~/server/services/viventium/VoiceTaskService');
+    const snapshots = Array.from({ length: 1_002 }, (_, index) => ({
+      version: 1,
+      eventId: `snapshot-${index}`,
+      sequence: 2,
+      emittedAt: '2026-08-09T12:00:00.000Z',
+      callSessionId: 'call_session_1',
+      taskId: `durable-task-${index.toString().padStart(4, '0')}`,
+      type: 'snapshot',
+      state: index === 0 ? 'cancelled_unenforceable' : index === 1_001 ? 'running' : 'completed',
+      cancellable: index === 1_001,
+      retryable: false,
+      owner: { kind: 'generation_job' },
+    }));
+    const listSpy = jest
+      .spyOn(taskService, 'listDurableVoiceTaskSnapshots')
+      .mockResolvedValueOnce({
+        events: snapshots.slice(490),
+        hasMore: true,
+        nextBeforeCreatedAt: '2026-08-09T11:59:00.000Z',
+        nextBeforeTaskId: 'durable-task-0490',
+      })
+      .mockResolvedValueOnce({
+        events: snapshots.slice(0, 490),
+        hasMore: false,
+        nextBeforeCreatedAt: null,
+        nextBeforeTaskId: null,
+      });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const closeHandlers = [];
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/voice/tasks/events?callSessionId=call_session_1',
+      query: { callSessionId: 'call_session_1' },
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+        'x-viventium-job-id': 'job-1',
+        'x-viventium-worker-id': 'worker-1',
+      },
+    });
+    req.on.mockImplementation((event, listener) => {
+      if (event === 'close') closeHandlers.push(listener);
+      return req;
+    });
+    const res = createMockRes();
+    app.handle(req, res, (err) => {
+      if (err) throw err;
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const packets = res.write.mock.calls
+      .map(([chunk]) => String(chunk))
+      .filter((chunk) => chunk.startsWith('event: voice_task_event'));
+    expect(listSpy).toHaveBeenCalledTimes(2);
+    expect(packets).toHaveLength(1_002);
+    expect(packets.join('')).toContain('durable-task-0000');
+    expect(packets.join('')).toContain('durable-task-1001');
+    const allOutput = res.write.mock.calls.map(([chunk]) => String(chunk));
+    const syncPacketIndex = allOutput.findIndex((chunk) =>
+      chunk.startsWith('event: voice_task_sync'),
+    );
+    const finalReplayIndex = allOutput.findLastIndex((chunk) =>
+      chunk.startsWith('event: voice_task_event'),
+    );
+    expect(syncPacketIndex).toBeGreaterThan(finalReplayIndex);
+    expect(allOutput[syncPacketIndex]).toMatch(
+      /event: voice_task_sync\ndata: \{"version":1,"callSessionId":"call_session_1","state":"synchronized","emittedAt":"[^"\n]+"\}\n\n/,
+    );
+    closeHandlers.forEach((listener) => listener());
+  });
+
+  test('marks an empty durable task replay synchronized before waiting for live events', async () => {
+    const taskService = require('~/server/services/viventium/VoiceTaskService');
+    jest.spyOn(taskService, 'listDurableVoiceTaskSnapshots').mockResolvedValueOnce({
+      events: [],
+      hasMore: false,
+      nextBeforeCreatedAt: null,
+      nextBeforeTaskId: null,
+    });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const closeHandlers = [];
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/voice/tasks/events?callSessionId=call_session_1',
+      query: { callSessionId: 'call_session_1' },
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+        'x-viventium-job-id': 'job-1',
+        'x-viventium-worker-id': 'worker-1',
+      },
+    });
+    req.on.mockImplementation((event, listener) => {
+      if (event === 'close') closeHandlers.push(listener);
+      return req;
+    });
+    const res = createMockRes();
+    app.handle(req, res, (err) => {
+      if (err) throw err;
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const output = res.write.mock.calls.map(([chunk]) => String(chunk)).join('');
+    expect(output).not.toContain('event: voice_task_event');
+    expect(output).toContain('event: voice_task_sync');
+    expect(output).toContain('"state":"synchronized"');
+    closeHandlers.forEach((listener) => listener());
+  });
+
+  test('flushes a remote durable catch-up event before declaring the task stream synchronized', async () => {
+    const taskService = require('~/server/services/viventium/VoiceTaskService');
+    const remoteEvent = {
+      version: 1,
+      eventId: 'remote-tail-event',
+      sequence: 3,
+      emittedAt: '2026-08-09T12:00:01.000Z',
+      callSessionId: 'call_session_1',
+      taskId: 'task-remote-tail',
+      type: 'snapshot',
+      state: 'running',
+      phase: 'tool',
+      cancellable: true,
+      retryable: false,
+      owner: { kind: 'glasshive_run', id: 'run-remote-tail' },
+    };
+    const stop = jest.fn();
+    jest.spyOn(taskService, 'listDurableVoiceTaskSnapshots').mockResolvedValueOnce({
+      events: [{ ...remoteEvent, eventId: 'replay-before-tail', sequence: 2 }],
+      hasMore: false,
+      nextBeforeCreatedAt: null,
+      nextBeforeTaskId: null,
+    });
+    taskService.subscribeDurableVoiceTaskEventsForCall.mockImplementationOnce(({ onEvent }) => ({
+      ready: Promise.resolve(),
+      catchUp: jest.fn(async () => onEvent(remoteEvent)),
+      seed: jest.fn(),
+      stop,
+    }));
+    const app = createTestApp(require('../voice'));
+    const closeHandlers = [];
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/voice/tasks/events?callSessionId=call_session_1',
+      query: { callSessionId: 'call_session_1' },
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+        'x-viventium-job-id': 'job-1',
+        'x-viventium-worker-id': 'worker-1',
+      },
+    });
+    req.on.mockImplementation((event, listener) => {
+      if (event === 'close') closeHandlers.push(listener);
+      return req;
+    });
+    const res = createMockRes();
+
+    app.handle(req, res, (error) => {
+      if (error) throw error;
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const output = res.write.mock.calls.map(([chunk]) => String(chunk));
+    const remoteIndex = output.findIndex((chunk) => chunk.includes('remote-tail-event'));
+    const syncIndex = output.findIndex((chunk) => chunk.startsWith('event: voice_task_sync'));
+    expect(remoteIndex).toBeGreaterThanOrEqual(0);
+    expect(syncIndex).toBeGreaterThan(remoteIndex);
+    closeHandlers.forEach((listener) => listener());
+    expect(stop).toHaveBeenCalledTimes(1);
+  });
+
+  test('fails durable task replay closed without a synchronization marker', async () => {
+    const taskService = require('~/server/services/viventium/VoiceTaskService');
+    jest
+      .spyOn(taskService, 'listDurableVoiceTaskSnapshots')
+      .mockRejectedValueOnce(
+        Object.assign(new Error('database disconnected'), { code: 'db_down' }),
+      );
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/voice/tasks/events?callSessionId=call_session_1',
+      query: { callSessionId: 'call_session_1' },
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+        'x-viventium-job-id': 'job-1',
+        'x-viventium-worker-id': 'worker-1',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(503);
+    expect(res.body).toEqual({
+      code: 'gateway_down',
+      message: 'Task history is temporarily unavailable.',
+      retryable: true,
+    });
+    expect(res.write).not.toHaveBeenCalled();
+    expect(res.headers['Content-Type']).toBeUndefined();
+  });
+
+  test('fails closed before SSE headers when the initial cross-process tail is unavailable', async () => {
+    const taskService = require('~/server/services/viventium/VoiceTaskService');
+    const stop = jest.fn();
+    taskService.subscribeDurableVoiceTaskEventsForCall.mockReturnValueOnce({
+      ready: Promise.reject(new Error('tail database unavailable')),
+      catchUp: jest.fn(),
+      seed: jest.fn(),
+      stop,
+    });
+    const app = createTestApp(require('../voice'));
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/voice/tasks/events?callSessionId=call_session_1',
+      query: { callSessionId: 'call_session_1' },
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+        'x-viventium-job-id': 'job-1',
+        'x-viventium-worker-id': 'worker-1',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(503);
+    expect(res.body).toEqual({
+      code: 'gateway_down',
+      message: 'Task history is temporarily unavailable.',
+      retryable: true,
+    });
+    expect(res.write).not.toHaveBeenCalled();
+    expect(res.headers['Content-Type']).toBeUndefined();
+    expect(stop).toHaveBeenCalledTimes(1);
+  });
+
+  test('never marks a repeated durable replay cursor synchronized', async () => {
+    const taskService = require('~/server/services/viventium/VoiceTaskService');
+    const repeatedPage = {
+      events: [],
+      hasMore: true,
+      nextBeforeCreatedAt: '2026-08-09T11:59:00.000Z',
+      nextBeforeTaskId: 'task-repeat',
+    };
+    jest
+      .spyOn(taskService, 'listDurableVoiceTaskSnapshots')
+      .mockResolvedValueOnce(repeatedPage)
+      .mockResolvedValueOnce(repeatedPage);
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/voice/tasks/events?callSessionId=call_session_1',
+      query: { callSessionId: 'call_session_1' },
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+        'x-viventium-job-id': 'job-1',
+        'x-viventium-worker-id': 'worker-1',
+      },
+    });
+    const res = createMockRes();
+    app.handle(req, res, (err) => {
+      if (err) throw err;
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(res.write.mock.calls.map(([chunk]) => String(chunk)).join('')).not.toContain(
+      'event: voice_task_sync',
+    );
+    expect(res.end).toHaveBeenCalled();
+  });
+
+  test('rejects a call-scoped task stream for a different authenticated session', async () => {
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/voice/tasks/events?callSessionId=call_other',
+      query: { callSessionId: 'call_other' },
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+        'x-viventium-job-id': 'job-1',
+        'x-viventium-worker-id': 'worker-1',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(403);
+    expect(res.write).not.toHaveBeenCalled();
+    expect(mockAssertVoiceGatewayAuth).toHaveBeenCalled();
+  });
+
+  test('explicit task cancellation suppresses first and confirms the owner abort', async () => {
+    const { GenerationJobManager } = require('@librechat/api');
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const chatReq = createMockReq({
+      url: '/api/viventium/voice/chat',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: { text: 'look up the current status', streamId: 'stream-task-cancel' },
+    });
+    const chatRes = createMockRes();
+    await dispatch(app, chatReq, chatRes);
+    expect(chatRes.body.taskId).toEqual(expect.any(String));
+
+    GenerationJobManager.getJob.mockResolvedValueOnce({ metadata: { userId: 'user_1' } });
+    GenerationJobManager.abortJob.mockResolvedValueOnce({ success: true });
+    const cancelReq = createMockReq({
+      method: 'POST',
+      url: `/api/viventium/voice/tasks/${chatRes.body.taskId}/cancel`,
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+      },
+    });
+    const cancelRes = createMockRes();
+    await dispatch(app, cancelReq, cancelRes);
+
+    expect(cancelRes.statusCode).toBe(200);
+    expect(cancelRes.body).toMatchObject({
+      outcome: 'cancelling',
+      operationId: expect.any(String),
+      event: { state: 'cancelling' },
+      task: {
+        taskId: chatRes.body.taskId,
+        state: 'cancelling',
+      },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    const { getVoiceTask } = require('~/server/services/viventium/VoiceTaskService');
+    expect(getVoiceTask(chatRes.body.taskId)).toMatchObject({
+      taskId: chatRes.body.taskId,
+      state: 'cancelled_confirmed',
+    });
+    expect(GenerationJobManager.abortJob).toHaveBeenCalledWith('stream-task-cancel');
+  });
+
+  test('returns the authoritative recovering event when the durable cancel barrier is unavailable', async () => {
+    const taskService = require('~/server/services/viventium/VoiceTaskService');
+    const task = taskService.createVoiceTask({
+      callSessionId: 'call_session_1',
+      userId: 'user_1',
+      streamId: 'stream-barrier-unavailable',
+    });
+    taskService.setVoiceTaskSuppressionPersistenceForTests({
+      persist: async () => {
+        throw new Error('synthetic durable outage');
+      },
+      clear: async () => undefined,
+      lookup: async () => false,
+    });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: `/api/viventium/voice/tasks/${task.taskId}/cancel`,
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(503);
+    expect(res.body).toMatchObject({
+      version: 1,
+      code: 'gateway_down',
+      retryable: true,
+      event: {
+        taskId: task.taskId,
+        state: 'recovering',
+        error: { code: 'cancel_barrier_unavailable', retryable: true },
+      },
+      task: { taskId: task.taskId, state: 'recovering' },
+    });
+  });
+
+  test('keeps remote owner cancellation pending until its authoritative callback confirms stop', async () => {
+    const { GenerationJobManager } = require('@librechat/api');
+    const {
+      confirmVoiceTaskOwnerCancellation,
+      createVoiceTask,
+      getVoiceTask,
+      registerVoiceTaskOwnerAdapter,
+    } = require('~/server/services/viventium/VoiceTaskService');
+    const task = createVoiceTask({
+      callSessionId: 'call_session_1',
+      userId: 'user_1',
+      conversationId: 'conv-voice-1',
+      streamId: 'glasshive:run-owner-cancel',
+      owner: { kind: 'glasshive_run', id: 'run-owner-cancel' },
+    });
+    const cancel = jest.fn().mockResolvedValue({ accepted: true });
+    registerVoiceTaskOwnerAdapter(task.taskId, {
+      kind: 'glasshive_run',
+      cancel,
+      cancellationConfirmable: true,
+    });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: `/api/viventium/voice/tasks/${task.taskId}/cancel`,
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({
+      version: 1,
+      outcome: 'cancelling',
+      task: { taskId: task.taskId, state: 'cancelling' },
+    });
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(GenerationJobManager.abortJob).not.toHaveBeenCalled();
+    await confirmVoiceTaskOwnerCancellation(task.taskId, 'Signed callback confirmed interruption.');
+    expect(getVoiceTask(task.taskId).state).toBe('cancelled_confirmed');
+  });
+
+  test('reports remote owner cancellation as unenforceable even when the local job aborts', async () => {
+    const { GenerationJobManager } = require('@librechat/api');
+    const {
+      createVoiceTask,
+      setVoiceTaskOwnerCapabilities,
+    } = require('~/server/services/viventium/VoiceTaskService');
+    const task = createVoiceTask({
+      callSessionId: 'call_session_1',
+      userId: 'user_1',
+      streamId: 'stream-remote-cancel',
+    });
+    setVoiceTaskOwnerCapabilities(task.taskId, {
+      kind: 'remote_generation',
+      cancellationConfirmable: false,
+    });
+    GenerationJobManager.getJob.mockResolvedValueOnce({ metadata: { userId: 'user_1' } });
+    GenerationJobManager.abortJob.mockResolvedValueOnce({ success: true });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: `/api/viventium/voice/tasks/${task.taskId}/cancel`,
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.body).toMatchObject({
+      version: 1,
+      outcome: 'cancelling',
+      event: { state: 'cancelling' },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    const { getVoiceTask } = require('~/server/services/viventium/VoiceTaskService');
+    expect(getVoiceTask(task.taskId)).toMatchObject({ state: 'cancelled_unenforceable' });
+    expect(JSON.stringify(res.body)).not.toContain('cancellationConfirmable');
+    expect(res.body.task).not.toHaveProperty('suppressed');
+  });
+
+  test('delivers task input through a real session-owned adapter and returns its authoritative event', async () => {
+    const {
+      createVoiceTask,
+      observeGenerationEvent,
+      registerVoiceTaskOwnerAdapter,
+    } = require('~/server/services/viventium/VoiceTaskService');
+    const task = createVoiceTask({
+      callSessionId: 'call_session_1',
+      userId: 'user_1',
+      streamId: 'stream-input-route',
+      owner: { kind: 'generation_job', id: 'stream-input-route' },
+    });
+    const provideInput = jest.fn().mockResolvedValue({
+      accepted: true,
+      phase: 'resuming',
+      label: 'Continuing',
+    });
+    registerVoiceTaskOwnerAdapter(task.taskId, { kind: 'generation_job', provideInput });
+    observeGenerationEvent(task.taskId, {
+      event: 'needs_input',
+      data: { id: 'route-input-needed', prompt: 'Which scope?', inputType: 'text' },
+    });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: `/api/viventium/voice/tasks/${task.taskId}/input`,
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+      },
+      body: { input: 'Example scope' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({
+      version: 1,
+      outcome: 'accepted',
+      event: { type: 'state', state: 'running', phase: 'resuming' },
+      task: { taskId: task.taskId, state: 'running' },
+    });
+    expect(provideInput).toHaveBeenCalledWith(
+      expect.objectContaining({ input: 'Example scope', operationId: expect.any(String) }),
+    );
+  });
+
+  test('retries a failed task only through its installed owner adapter', async () => {
+    const {
+      createVoiceTask,
+      failVoiceTask,
+      registerVoiceTaskOwnerAdapter,
+    } = require('~/server/services/viventium/VoiceTaskService');
+    const task = createVoiceTask({
+      callSessionId: 'call_session_1',
+      userId: 'user_1',
+      streamId: 'stream-retry-route',
+      owner: { kind: 'generation_job', id: 'stream-retry-route' },
+    });
+    const retry = jest.fn().mockResolvedValue({
+      accepted: true,
+      streamId: 'stream-retry-route-2',
+    });
+    registerVoiceTaskOwnerAdapter(task.taskId, { kind: 'generation_job', retry });
+    failVoiceTask(task.taskId, { code: 'provider_failure', message: 'Unavailable' });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: `/api/viventium/voice/tasks/${task.taskId}/retry`,
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({
+      version: 1,
+      outcome: 'accepted',
+      events: [
+        { state: 'queued', phase: 'queued' },
+        { state: 'running', phase: 'starting' },
+      ],
+      task: {
+        taskId: expect.any(String),
+        parentTaskId: task.taskId,
+        state: 'running',
+        streamId: 'stream-retry-route-2',
+      },
+      previousTask: { taskId: task.taskId, state: 'failed' },
+    });
+    expect(res.body.task.taskId).not.toBe(task.taskId);
+    expect(retry).toHaveBeenCalledTimes(1);
+  });
+
+  test('fails task input and retry closed when no real owner adapter is installed', async () => {
+    const {
+      createVoiceTask,
+      failVoiceTask,
+    } = require('~/server/services/viventium/VoiceTaskService');
+    const task = createVoiceTask({
+      callSessionId: 'call_session_1',
+      userId: 'user_1',
+      streamId: 'stream-no-adapter',
+    });
+    failVoiceTask(task.taskId, { code: 'provider_failure', message: 'Unavailable' });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+
+    for (const operation of ['input', 'retry']) {
+      const req = createMockReq({
+        method: 'POST',
+        url: `/api/viventium/voice/tasks/${task.taskId}/${operation}`,
+        headers: {
+          'x-viventium-call-secret': 'secret',
+          'x-viventium-call-session': 'call_session_1',
+        },
+        body: operation === 'input' ? { input: 'Do not deliver this' } : {},
+      });
+      const res = createMockRes();
+      await dispatch(app, req, res);
+      expect(res.statusCode).toBe(409);
+      expect(res.body).toMatchObject({
+        version: 1,
+        error: operation === 'input' ? 'input_unsupported' : 'retry_unsupported',
+      });
+    }
+  });
+
+  test('never calls an already-completed task cancelled', async () => {
+    const {
+      createVoiceTask,
+      completeVoiceTask,
+    } = require('~/server/services/viventium/VoiceTaskService');
+    const task = createVoiceTask({
+      callSessionId: 'call_session_1',
+      userId: 'user_1',
+      streamId: 'stream-completed-side-effect',
+    });
+    completeVoiceTask(task.taskId, { resultMessageId: 'completed-result' });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: `/api/viventium/voice/tasks/${task.taskId}/cancel`,
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toMatchObject({
+      version: 1,
+      outcome: 'already_completed',
+      task: { state: 'completed' },
+    });
+    expect(res.body.outcome).not.toContain('cancelled');
+  });
+
+  test.each([
+    [true, 'cancelled_confirmed'],
+    [false, 'cancelled_unenforceable'],
+  ])('replays an already-settled cancellation idempotently (%s)', async (confirmed, state) => {
+    const {
+      cancelVoiceTask,
+      createVoiceTask,
+      settleVoiceTaskCancellation,
+    } = require('~/server/services/viventium/VoiceTaskService');
+    const task = createVoiceTask({
+      callSessionId: 'call_session_1',
+      userId: 'user_1',
+      streamId: `stream-settled-${state}`,
+    });
+    cancelVoiceTask(task.taskId, { userId: 'user_1' });
+    const terminalEvent = await settleVoiceTaskCancellation(task.taskId, { confirmed });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: `/api/viventium/voice/tasks/${task.taskId}/cancel`,
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({
+      version: 1,
+      outcome: state,
+      task: { taskId: task.taskId, state },
+      event: { eventId: terminalEvent.eventId, sequence: terminalEvent.sequence, state },
+    });
+  });
+
+  test('reports a failed task as inactive rather than already completed', async () => {
+    const {
+      createVoiceTask,
+      failVoiceTask,
+    } = require('~/server/services/viventium/VoiceTaskService');
+    const task = createVoiceTask({
+      callSessionId: 'call_session_1',
+      userId: 'user_1',
+      streamId: 'stream-failed-cancel',
+    });
+    failVoiceTask(task.taskId, { code: 'provider_failure', message: 'Unavailable' });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: `/api/viventium/voice/tasks/${task.taskId}/cancel`,
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toMatchObject({
+      version: 1,
+      outcome: 'not_active',
+      task: { taskId: task.taskId, state: 'failed' },
+      event: { state: 'failed' },
+    });
+    expect(JSON.stringify(res.body)).not.toContain('already_completed');
+  });
+
+  test('reports an exact owner completed-before-cancel race without falling back to generation abort', async () => {
+    const { GenerationJobManager } = require('@librechat/api');
+    const {
+      createVoiceTask,
+      registerVoiceTaskOwnerAdapter,
+    } = require('~/server/services/viventium/VoiceTaskService');
+    const task = createVoiceTask({
+      callSessionId: 'call_session_1',
+      userId: 'user_1',
+      streamId: 'glasshive:completed-before-cancel',
+      owner: { kind: 'glasshive_run', id: 'completed-before-cancel' },
+    });
+    registerVoiceTaskOwnerAdapter(task.taskId, {
+      kind: 'glasshive_run',
+      cancel: jest.fn().mockResolvedValue({ alreadyCompleted: true }),
+      cancellationConfirmable: true,
+    });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: `/api/viventium/voice/tasks/${task.taskId}/cancel`,
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({
+      version: 1,
+      outcome: 'cancelling',
+      task: { taskId: task.taskId, state: 'cancelling' },
+      event: { state: 'cancelling', phase: 'cancelling' },
+    });
+    const {
+      flushVoiceTaskOwnerOperations,
+      getVoiceTask,
+    } = require('~/server/services/viventium/VoiceTaskService');
+    await flushVoiceTaskOwnerOperations();
+    expect(getVoiceTask(task.taskId)).toMatchObject({
+      taskId: task.taskId,
+      state: 'completed',
+    });
+    expect(GenerationJobManager.abortJob).not.toHaveBeenCalledWith(
+      'glasshive:completed-before-cancel',
     );
   });
 

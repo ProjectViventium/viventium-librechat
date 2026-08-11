@@ -415,7 +415,9 @@ describe('conversationRecallService', () => {
     expect(mockMessageFind).toHaveBeenCalledWith(
       expect.objectContaining({
         user: 'user_1',
-        'metadata.viventium.type': { $ne: 'listen_only_transcript' },
+        'metadata.viventium.type': {
+          $nin: ['listen_only_transcript', 'voice_ambient_transcript'],
+        },
         'metadata.viventium.mode': { $ne: 'listen_only' },
       }),
     );

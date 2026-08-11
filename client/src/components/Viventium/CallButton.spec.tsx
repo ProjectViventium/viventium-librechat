@@ -7,6 +7,7 @@
 
 import React from 'react';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import CallButton from './CallButton';
 
 const mockUseGetStartupConfig = jest.fn();
@@ -44,11 +45,31 @@ jest.mock('~/utils', () => ({
   cn: (...values: unknown[]) => values.filter(Boolean).join(' '),
 }));
 
+function renderCallButton() {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  return render(
+    <QueryClientProvider client={queryClient}>
+      <CallButton />
+    </QueryClientProvider>,
+  );
+}
+
 describe('CallButton voice readiness', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockUseGetStartupConfig.mockReturnValue({ data: { viventiumVoiceEnabled: true } });
     global.fetch = jest.fn();
+    window.open = jest.fn(
+      () =>
+        ({
+          closed: false,
+          close: jest.fn(),
+          focus: jest.fn(),
+          location: { replace: jest.fn() },
+        }) as unknown as Window,
+    );
   });
 
   it.each([
@@ -57,13 +78,13 @@ describe('CallButton voice readiness', () => {
   ])('hides the call action for %s', (_label, startupConfig) => {
     mockUseGetStartupConfig.mockReturnValue({ data: startupConfig });
 
-    render(<CallButton />);
+    renderCallButton();
 
     expect(screen.queryByRole('button', { name: 'Start voice call' })).not.toBeInTheDocument();
   });
 
   it('shows the call action only when Voice is explicitly enabled', () => {
-    render(<CallButton />);
+    renderCallButton();
 
     expect(screen.getByRole('button', { name: 'Start voice call' })).toBeInTheDocument();
   });
@@ -80,7 +101,7 @@ describe('CallButton voice readiness', () => {
       }),
     });
 
-    render(<CallButton />);
+    renderCallButton();
     fireEvent.click(screen.getByRole('button', { name: 'Start voice call' }));
 
     const error = await screen.findByRole('alert');
@@ -105,7 +126,7 @@ describe('CallButton voice readiness', () => {
       }),
     });
 
-    render(<CallButton />);
+    renderCallButton();
     fireEvent.click(screen.getByRole('button', { name: 'Start voice call' }));
 
     const error = await screen.findByRole('alert');
@@ -123,7 +144,7 @@ describe('CallButton voice readiness', () => {
       },
     });
 
-    render(<CallButton />);
+    renderCallButton();
     fireEvent.click(screen.getByRole('button', { name: 'Start voice call' }));
 
     await waitFor(() => {

@@ -13,6 +13,8 @@ jest.mock('@librechat/data-schemas', () => ({
 jest.mock('librechat-data-provider', () => ({
   Constants: {},
   ContentTypes: { THINK: 'think' },
+  FileContext: { execute_code: 'execute_code' },
+  FileSources: { local: 'local' },
   ViolationTypes: {},
 }));
 
@@ -46,6 +48,11 @@ jest.mock('~/models', () => ({
   saveMessage: (...args) => mockSaveMessage(...args),
 }));
 
+jest.mock('~/db/models', () => ({
+  Message: { findOneAndDelete: jest.fn() },
+  Conversation: { updateOne: jest.fn() },
+}));
+
 jest.mock('~/server/services/viventium/telegramTimingDeep', () => ({
   isDeepTimingEnabled: jest.fn(() => false),
   startDeepTiming: jest.fn(() => 0),
@@ -63,6 +70,11 @@ jest.mock('~/server/services/viventium/surfacePrompts', () => ({
       .replace(/<emotion[^>]*>(.*?)<\/emotion>/g, '$1')
       .replace(/\[[^\]]+\]/g, ''),
   ),
+}));
+
+jest.mock('~/server/services/viventium/VoiceTaskService', () => ({
+  isVoiceTaskSuppressedDurably: jest.fn(async () => false),
+  setVoiceTaskOwnerCapabilities: jest.fn(),
 }));
 
 describe('request persistence helpers', () => {
@@ -118,13 +130,18 @@ describe('request persistence helpers', () => {
     );
   });
 
-  it('attaches voice call metadata to direct assistant snapshots', async () => {
+  it('attaches post-call hardener metadata to a completed voice response', async () => {
     const req = {
       user: { id: 'user-1' },
       body: {
         agent_id: 'agent-123',
         viventiumSurface: 'voice',
         viventiumInputMode: 'voice_call',
+        mode: 'call',
+        speakerSegments: [{ version: 1, segmentId: 'seg-1' }],
+        speakerLabel: 'Owner',
+        viventiumActorTrust: 'owner_participant',
+        viventiumDeferVoiceMemory: true,
       },
       viventiumCallSession: { callSessionId: 'call-session-1' },
       viventiumVoiceRequestId: 'voice-request-1',
@@ -136,8 +153,8 @@ describe('request persistence helpers', () => {
       userId: 'user-1',
       client: { sender: 'AI', options: { endpoint: 'agents' }, model: 'test-model' },
       conversationId: 'convo-1',
-      aggregatedContent: [{ type: 'text', text: 'Partial answer' }],
-      unfinished: true,
+      aggregatedContent: [{ type: 'text', text: 'Completed answer' }],
+      unfinished: false,
       error: false,
       context: 'test-voice-metadata',
     });
@@ -153,6 +170,11 @@ describe('request persistence helpers', () => {
             voiceRequestId: 'voice-request-1',
             surface: 'voice',
             inputMode: 'voice_call',
+            mode: 'call',
+            speakerSegments: [{ version: 1, segmentId: 'seg-1' }],
+            speakerLabel: 'Owner',
+            actorTrust: 'owner_participant',
+            memoryDeferredPostCall: true,
           }),
         },
       }),

@@ -18,7 +18,49 @@ const {
   buildCanonicalPersistedAgentFields,
   hasCanonicalPersistedAgentFieldDrift,
 } = require('./viventium-agent-runtime-models');
-const { loadAgentProviderCapabilityPolicy, resolvePromptRefs } = require('./viventium-sync-agents');
+
+/* === VIVENTIUM START ===
+ * Feature: Hermetic managed-migration helpers.
+ * Purpose: Upgrade reconciliation imports the pure migration helpers before the candidate API is
+ * built. Defer DB/API dependencies until a function that actually needs the live runtime calls for
+ * them; the normal executable seed path still loads the exact same modules before DB work begins.
+ * === VIVENTIUM END === */
+let operationalDependencies = null;
+
+function loadOperationalDependencies() {
+  if (operationalDependencies) {
+    return operationalDependencies;
+  }
+
+  const { connectDb } = require('../api/db/connect');
+  const { seedDatabase } = require('../api/models');
+  const { Agent, User, AclEntry } = require('../api/db/models');
+  const { createAgent, updateAgent } = require('../api/models/Agent');
+  const { grantPermission } = require('../api/server/services/PermissionService');
+  const { AccessRoleIds, PrincipalType, ResourceType } = require('librechat-data-provider');
+  operationalDependencies = {
+    connectDb,
+    seedDatabase,
+    Agent,
+    User,
+    AclEntry,
+    createAgent,
+    updateAgent,
+    grantPermission,
+    AccessRoleIds,
+    PrincipalType,
+    ResourceType,
+  };
+  return operationalDependencies;
+}
+
+function loadAgentProviderCapabilityPolicy(...args) {
+  return require('./viventium-sync-agents').loadAgentProviderCapabilityPolicy(...args);
+}
+
+function resolvePromptRefs(...args) {
+  return require('./viventium-sync-agents').resolvePromptRefs(...args);
+}
 
 // App Support runtime env is the canonical local runtime source. Component-local env files are
 // fallback-only and must not override the active generated runtime profile.
@@ -26,12 +68,6 @@ loadLocalRuntimeEnv(ROOT_DIR);
 require('module-alias')({ base: path.resolve(ROOT_DIR, 'api') });
 
 const yaml = require('js-yaml');
-const { connectDb } = require('../api/db/connect');
-const { seedDatabase } = require('../api/models');
-const { Agent, User, AclEntry } = require('../api/db/models');
-const { createAgent, updateAgent } = require('../api/models/Agent');
-const { grantPermission } = require('../api/server/services/PermissionService');
-const { AccessRoleIds, PrincipalType, ResourceType } = require('librechat-data-provider');
 
 const DEFAULT_BUNDLE_PATH = path.join(ROOT_DIR, 'tmp', 'viventium-agents.yaml');
 const DEFAULT_MANAGED_BASELINE_MIGRATION_PATH = path.join(
@@ -95,21 +131,6 @@ const NULL_DEFAULT_EDITABLE_FIELDS = new Set([
   'fallback_llm_model',
   'fallback_llm_provider',
 ]);
-
-const PUBLIC_ACCESS_ROLE_IDS = Object.freeze({
-  viewer: {
-    agent: AccessRoleIds.AGENT_VIEWER,
-    remoteAgent: AccessRoleIds.REMOTE_AGENT_VIEWER,
-  },
-  editor: {
-    agent: AccessRoleIds.AGENT_EDITOR,
-    remoteAgent: AccessRoleIds.REMOTE_AGENT_EDITOR,
-  },
-  owner: {
-    agent: AccessRoleIds.AGENT_OWNER,
-    remoteAgent: AccessRoleIds.REMOTE_AGENT_OWNER,
-  },
-});
 
 function parseArgs(argv) {
   const args = {
@@ -807,7 +828,7 @@ function normalizePublicAccessRole(value) {
   if (normalized === 'agent_owner') {
     return 'owner';
   }
-  if (normalized in PUBLIC_ACCESS_ROLE_IDS) {
+  if (normalized === 'viewer' || normalized === 'editor' || normalized === 'owner') {
     return normalized;
   }
   return DEFAULT_PUBLIC_ACCESS_ROLE;
@@ -815,9 +836,24 @@ function normalizePublicAccessRole(value) {
 
 function resolvePublicAccessRoleIds(value) {
   const normalizedRole = normalizePublicAccessRole(value);
+  const { AccessRoleIds } = loadOperationalDependencies();
+  const roleIds = {
+    viewer: {
+      agent: AccessRoleIds.AGENT_VIEWER,
+      remoteAgent: AccessRoleIds.REMOTE_AGENT_VIEWER,
+    },
+    editor: {
+      agent: AccessRoleIds.AGENT_EDITOR,
+      remoteAgent: AccessRoleIds.REMOTE_AGENT_EDITOR,
+    },
+    owner: {
+      agent: AccessRoleIds.AGENT_OWNER,
+      remoteAgent: AccessRoleIds.REMOTE_AGENT_OWNER,
+    },
+  };
   return {
     normalizedRole,
-    accessRoleIds: PUBLIC_ACCESS_ROLE_IDS[normalizedRole],
+    accessRoleIds: roleIds[normalizedRole],
   };
 }
 
@@ -885,6 +921,7 @@ function preserveExistingEditableFields(existing, agentData) {
 }
 
 async function ensureUser(email) {
+  const { User } = loadOperationalDependencies();
   let user = await User.findOne({ email }).lean();
   if (user) {
     return user;
@@ -914,6 +951,7 @@ async function findEligibleExistingOwner(ownerId) {
   if (!/^[a-f0-9]{24}$/i.test(String(ownerId || ''))) {
     return null;
   }
+  const { User } = loadOperationalDependencies();
   const user = await User.findById(ownerId).lean();
   if (!user || user.role !== 'ADMIN' || user.email === DEFAULT_AGENT_SEED_OWNER_EMAIL) {
     return null;
@@ -925,6 +963,7 @@ async function requireExistingOwner(ownerId) {
   if (!/^[a-f0-9]{24}$/i.test(String(ownerId || ''))) {
     throw new Error(`Owner user id is invalid. ${OWNER_RECOVERY_GUIDANCE}`);
   }
+  const { User } = loadOperationalDependencies();
   const user = await User.findById(ownerId).lean();
   if (!user) {
     throw new Error(`Owner user does not exist. ${OWNER_RECOVERY_GUIDANCE}`);
@@ -943,6 +982,7 @@ async function requireExistingOwner(ownerId) {
 }
 
 async function resolveSeedOwner({ ownerId, storedOwnerId, existingAgentOwnerId, requestedEmail }) {
+  const { User } = loadOperationalDependencies();
   const canonicalOwnerId = selectCanonicalOwnerId({
     ownerId,
     storedOwnerId,
@@ -998,6 +1038,7 @@ function assertExistingAgentOwnersCompatible({
 }
 
 async function preflightExistingAgentOwners({ agentIds, ownerId, placeholderOwnerId = null }) {
+  const { Agent } = loadOperationalDependencies();
   const existingAgents = await Agent.find({ id: { $in: agentIds } })
     .select('id author')
     .lean();
@@ -1010,6 +1051,7 @@ async function repairPersistedAgentRuntimeFields({ agentData, dryRun }) {
     return { repaired: false, reason: 'missing-agent-id' };
   }
 
+  const { Agent } = loadOperationalDependencies();
   const existing = await Agent.findOne({ id: agentData.id }).lean();
   if (!existing) {
     return { repaired: false, reason: 'missing-agent' };
@@ -1037,6 +1079,8 @@ async function upsertAgent({
   previousFields = null,
   placeholderOwnerId = null,
 }) {
+  const { Agent, AclEntry, createAgent, updateAgent, PrincipalType } =
+    loadOperationalDependencies();
   if (!agentData || !agentData.id) {
     return { id: null, status: 'skipped', reason: 'missing agent id' };
   }
@@ -1106,6 +1150,8 @@ async function ensureAgentPermissions({
   publicAccessRole,
   dryRun,
 }) {
+  const { grantPermission, AccessRoleIds, PrincipalType, ResourceType } =
+    loadOperationalDependencies();
   if (!resourceId || dryRun) {
     return [];
   }
@@ -1176,6 +1222,7 @@ async function ensureAgentPermissions({
 }
 
 async function run() {
+  const { connectDb, seedDatabase, Agent, User } = loadOperationalDependencies();
   const args = parseArgs(process.argv.slice(2));
   const bundle = normalizeBundleForRuntimeWithOwner(loadBundle(args.bundlePath));
   if (!bundle || !bundle.mainAgent) {

@@ -2,6 +2,7 @@
 
 const {
   isListenOnlyTranscriptMessage,
+  isPassiveVoiceTranscriptMessage,
 } = require('~/server/services/viventium/listenOnlyTranscript');
 
 /* === VIVENTIUM START ===
@@ -97,7 +98,7 @@ function shouldSkipRecallMessage({
   if (NTA_ONLY_REGEX.test(cleaned)) {
     return true;
   }
-  if (isListenOnlyTranscriptMessage(message)) {
+  if (isPassiveVoiceTranscriptMessage(message)) {
     return true;
   }
   /* === VIVENTIUM START ===

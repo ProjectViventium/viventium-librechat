@@ -27,6 +27,16 @@ const {
   supportsAdaptiveThinking,
 } = require('librechat-data-provider');
 const db = require('~/models');
+const { Conversation, Message } = require('~/db/models');
+const { isVoiceTaskSuppressedDurably } = require('./VoiceTaskService');
+
+async function isFollowUpVoiceTaskSuppressed(req, taskId) {
+  return isVoiceTaskSuppressedDurably(taskId, {
+    callSessionId: req?.body?.viventiumCallSessionId,
+    userId: req?.user?.id,
+    streamId: req?.body?.streamId,
+  });
+}
 const { getAgent } = require('~/models/Agent');
 const {
   getCustomEndpointConfig,
@@ -2600,6 +2610,10 @@ async function createCortexFollowUpMessage({
   recentResponse,
   forceVisibleFollowUp = false,
 }) {
+  const voiceTaskId = String(req?.body?.viventiumVoiceTaskId || '').trim();
+  if (voiceTaskId && (await isFollowUpVoiceTaskSuppressed(req, voiceTaskId))) {
+    return null;
+  }
   let text = '';
   let generationFailed = false;
   const hasInsights = Array.isArray(insightsData?.insights) && insightsData.insights.length > 0;
@@ -2833,6 +2847,20 @@ async function createCortexFollowUpMessage({
   await db.saveMessage(req, followUpMessage, {
     context: 'viventium/services/BackgroundCortexFollowUpService.createCortexFollowUpMessage',
   });
+
+  if (voiceTaskId && (await isFollowUpVoiceTaskSuppressed(req, voiceTaskId))) {
+    const removed = await Message.findOneAndDelete({
+      user: req?.user?.id,
+      messageId: followUpMessage.messageId,
+    });
+    if (removed?._id) {
+      await Conversation.updateOne(
+        { user: req?.user?.id, conversationId },
+        { $pull: { messages: removed._id } },
+      );
+    }
+    return null;
+  }
 
   return followUpMessage;
 }

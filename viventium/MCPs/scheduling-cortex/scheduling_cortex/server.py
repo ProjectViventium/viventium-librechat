@@ -86,7 +86,9 @@ def _glasshive_callback_lifecycle(
             run.get("completed_at"),
             run.get("error_class") if status != "queued" else None,
         )
-    if event in {"run.started", "run.waiting_on_capacity", "run.requeued"}:
+    if event == "run.waiting_on_capacity":
+        return "queued", "running", None, None
+    if event in {"run.started", "run.requeued"}:
         return "running", "running", run.get("completed_at"), None
     return current_status, current_disposition, run.get("completed_at"), run.get("error_class")
 

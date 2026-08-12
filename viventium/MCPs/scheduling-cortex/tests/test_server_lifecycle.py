@@ -42,6 +42,22 @@ def test_terminal_callback_sets_canonical_disposition():
     ) == ("failed", "cancelled", "now", "user_cancelled")
 
 
+def test_waiting_on_capacity_remains_retryable_and_queued():
+    running = {
+        "status": "running",
+        "disposition": "running",
+        "completed_at": None,
+        "error_class": "stale_failure",
+    }
+
+    assert _glasshive_callback_lifecycle(
+        running,
+        "run.waiting_on_capacity",
+        {},
+        "now",
+    ) == ("queued", "running", None, None)
+
+
 def test_late_failed_callback_cannot_regress_completed_run():
     completed = {
         "status": "completed",

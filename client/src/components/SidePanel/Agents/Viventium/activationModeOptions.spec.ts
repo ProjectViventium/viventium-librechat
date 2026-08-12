@@ -4,6 +4,7 @@
  * === VIVENTIUM END === */
 
 import {
+  activationModeHintKey,
   activationUpdatesForEnabledSwitch,
   activationUpdatesForMode,
   buildActivationModeOptions,
@@ -11,6 +12,12 @@ import {
 } from './activationModeOptions';
 
 describe('activation mode options', () => {
+  it('uses explicit localized hint keys for every mode', () => {
+    expect(activationModeHintKey('classified')).toBe('com_ui_activation_mode_classified_hint');
+    expect(activationModeHintKey('always')).toBe('com_ui_activation_mode_always_hint');
+    expect(activationModeHintKey('disabled')).toBe('com_ui_activation_mode_disabled_hint');
+  });
+
   test('defaults legacy configurations to classified mode', () => {
     expect(resolveActivationMode({ enabled: true })).toBe('classified');
   });

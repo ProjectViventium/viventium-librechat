@@ -43,6 +43,7 @@ import {
   resolveDefaultActivationRoute,
 } from './activationModelOptions';
 import {
+  activationModeHintKey,
   activationUpdatesForEnabledSwitch,
   activationUpdatesForMode,
   buildActivationModeOptions,
@@ -230,7 +231,7 @@ const CortexCard: React.FC<CortexCardProps> = ({
               containerClassName="px-0"
             />
             <p className="mt-1 text-xs text-text-tertiary">
-              {localize(`com_ui_activation_mode_${configuredActivationMode}_hint`)}
+              {localize(activationModeHintKey(configuredActivationMode))}
             </p>
           </div>
 

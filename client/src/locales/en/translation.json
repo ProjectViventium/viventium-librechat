@@ -1777,7 +1777,6 @@
   "com_ui_activation_prompt_placeholder": "System prompt for deciding when to activate",
   "com_ui_activation_prompt_hint": "Customize when this cortex should activate for this agent",
   "com_ui_unknown_agent": "Unknown Agent",
-  "com_ui_auto_on": "Auto-on",
   "com_ui_auto_off": "Auto-off",
   "com_ui_fallback_llm": "Fallback Model",
   "com_ui_fallback_llm_description": "Select the secondary model used when the primary provider fails before producing an answer.",

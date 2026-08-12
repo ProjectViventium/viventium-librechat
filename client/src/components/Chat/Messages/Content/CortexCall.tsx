@@ -12,6 +12,7 @@ import { useMemo, useState, useEffect, useRef, useLayoutEffect } from 'react';
 import ProgressText from './ProgressText';
 import type { CortexStatus } from 'librechat-data-provider';
 import CortexCallInfo from './CortexCallInfo';
+import { useLocalize } from '~/hooks';
 import { cn } from '~/utils';
 
 const ACTIVE_CORTEX_STATUSES = new Set<CortexStatus>(['activating', 'brewing']);
@@ -56,6 +57,7 @@ export default function CortexCall({
   status_changed_at?: string;
   isLast?: boolean;
 }) {
+  const localize = useLocalize();
   const [showInfo, setShowInfo] = useState(false);
   const contentRef = useRef<HTMLDivElement>(null);
   const [contentHeight, setContentHeight] = useState<number | undefined>(0);
@@ -135,7 +137,9 @@ export default function CortexCall({
       case 'brewing':
         return `Analyzing with ${cortex_name}...`;
       case 'complete':
-        return fallback_used ? `${cortex_name} · model fallback used` : cortex_name;
+        return fallback_used
+          ? `${cortex_name} · ${localize('com_ui_model_fallback_used')}`
+          : cortex_name;
       case 'skipped':
         return `${cortex_name} skipped`;
       case 'error':

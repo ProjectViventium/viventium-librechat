@@ -8,6 +8,7 @@
 /* eslint-disable i18next/no-literal-string */
 import { AlertCircle, Brain, Sparkles, Target } from 'lucide-react';
 import type { CortexStatus } from 'librechat-data-provider';
+import { useLocalize } from '~/hooks';
 import { cn } from '~/utils';
 
 const PUBLIC_BACKGROUND_AGENT_ERROR =
@@ -72,6 +73,7 @@ export default function CortexCallInfo({
   fallback_used?: boolean;
   fallback_reason_class?: string | null;
 }) {
+  const localize = useLocalize();
   const isSkipped = status === 'skipped';
   const safeError = publicErrorText(error);
   const safeErrorClass = publicErrorClassLabel(error_class);
@@ -84,7 +86,7 @@ export default function CortexCallInfo({
         <div className="flex flex-col gap-1 p-3">
           <div className="flex items-center gap-2 text-xs font-medium text-text-secondary">
             <Sparkles className="size-3" />
-            <span>Model fallback used</span>
+            <span>{localize('com_ui_model_fallback_used')}</span>
           </div>
           <div className="text-sm text-text-primary">
             The configured primary model route was unavailable, so this background result used its

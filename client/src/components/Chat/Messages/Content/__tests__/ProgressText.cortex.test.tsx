@@ -20,6 +20,11 @@ jest.mock('~/utils', () => ({
       .join(' '),
 }));
 
+jest.mock('~/hooks', () => ({
+  useLocalize: () => (key: string) =>
+    key === 'com_ui_model_fallback_used' ? 'Model fallback used' : key,
+}));
+
 class ResizeObserverMock {
   observe() {}
   disconnect() {}
@@ -269,9 +274,7 @@ describe('ProgressText and background cortex status layout', () => {
       />,
     );
 
-    expect(screen.getByRole('button')).toHaveTextContent(
-      'Deep Research · model fallback used',
-    );
+    expect(screen.getByRole('button')).toHaveTextContent('Deep Research · Model fallback used');
     fireEvent.click(screen.getByRole('button'));
     expect(screen.getByText('Model fallback used')).toBeInTheDocument();
     expect(screen.getByText('Reason: Provider authentication issue')).toBeInTheDocument();

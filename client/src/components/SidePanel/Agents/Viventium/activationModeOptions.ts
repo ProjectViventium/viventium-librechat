@@ -11,7 +11,17 @@ type ActivationModeLabelKey =
   | 'com_ui_activation_mode_always'
   | 'com_ui_activation_mode_disabled';
 
+type ActivationModeHintKey =
+  | 'com_ui_activation_mode_classified_hint'
+  | 'com_ui_activation_mode_always_hint'
+  | 'com_ui_activation_mode_disabled_hint';
+
 const ACTIVATION_MODES: BackgroundCortexActivationMode[] = ['classified', 'always', 'disabled'];
+const ACTIVATION_MODE_HINT_KEYS: Record<BackgroundCortexActivationMode, ActivationModeHintKey> = {
+  classified: 'com_ui_activation_mode_classified_hint',
+  always: 'com_ui_activation_mode_always_hint',
+  disabled: 'com_ui_activation_mode_disabled_hint',
+};
 
 export function isActivationMode(value: string): value is BackgroundCortexActivationMode {
   return ACTIVATION_MODES.includes(value as BackgroundCortexActivationMode);
@@ -40,6 +50,10 @@ export function activationUpdatesForEnabledSwitch(
     return { enabled: true, mode: 'classified' };
   }
   return { enabled };
+}
+
+export function activationModeHintKey(mode: BackgroundCortexActivationMode): ActivationModeHintKey {
+  return ACTIVATION_MODE_HINT_KEYS[mode];
 }
 
 export function buildActivationModeOptions(

@@ -64,6 +64,7 @@ const { loadAuthValues } = require('~/server/services/Tools/credentials');
  */
 const {
   buildMcpOAuthRecovery,
+  hasUsableOAuthTokens,
   inspectStoredOAuthCredentialState,
   reinitMCPServer,
   shouldUseCachedMcpTools,

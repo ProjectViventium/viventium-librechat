@@ -225,9 +225,7 @@ export function filterTrustedInternalMessagesTree(
   const visible: TMessage[] = [];
   for (const message of messagesTree) {
     const metadata = message.metadata as
-      | { viventium?: { visibility?: unknown } }
-      | null
-      | undefined;
+      { viventium?: { visibility?: unknown } } | null | undefined;
     const children = Array.isArray(message.children) ? message.children : [];
     const filteredChildren = filterTrustedInternalMessagesTree(children) ?? [];
     if (metadata?.viventium?.visibility === 'internal') {

@@ -36,8 +36,6 @@ describe('saved-memory entry mutations', () => {
 
     await (_dataService as any).deleteMemory('preferences', 4);
 
-    expect(mockedAxios.delete).toHaveBeenCalledWith(
-      '/api/memories/entries/preferences?revision=4',
-    );
+    expect(mockedAxios.delete).toHaveBeenCalledWith('/api/memories/entries/preferences?revision=4');
   });
 });

@@ -14,7 +14,7 @@ let mockActivePanel = 'builder';
 let mockCurrentAgentId = 'agent-123';
 let mockWatchedAgentId = 'agent-123';
 let mockVoicePanelMount = 0;
-let mockEndpointsConfig: Record<string, unknown> = {};
+const mockEndpointsConfig: Record<string, unknown> = {};
 /* === VIVENTIUM END === */
 
 // Mock notification severity enum before other imports

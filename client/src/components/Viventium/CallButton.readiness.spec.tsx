@@ -11,6 +11,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import CallButton from './CallButton';
 
 const mockUseGetStartupConfig = jest.fn();
+const mockFetch = jest.fn();
 
 jest.mock('recoil', () => ({
   useRecoilValue: () => ({ agent_id: 'agent_fixture', conversationId: 'conversation_fixture' }),
@@ -60,7 +61,7 @@ describe('CallButton voice readiness', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockUseGetStartupConfig.mockReturnValue({ data: { viventiumVoiceEnabled: true } });
-    global.fetch = jest.fn();
+    global.fetch = mockFetch as unknown as typeof fetch;
     window.open = jest.fn(
       () =>
         ({
@@ -90,7 +91,7 @@ describe('CallButton voice readiness', () => {
   });
 
   it('renders a structured runtime failure as concise inline recovery copy', async () => {
-    (global.fetch as jest.Mock).mockResolvedValue({
+    mockFetch.mockResolvedValue({
       ok: false,
       status: 503,
       headers: new Headers({ 'Content-Type': 'application/json' }),
@@ -116,7 +117,7 @@ describe('CallButton voice readiness', () => {
   });
 
   it('maps the structured missing-assistant error to actionable inline copy', async () => {
-    (global.fetch as jest.Mock).mockResolvedValue({
+    mockFetch.mockResolvedValue({
       ok: false,
       status: 400,
       headers: new Headers({ 'Content-Type': 'application/json' }),
@@ -135,7 +136,7 @@ describe('CallButton voice readiness', () => {
   });
 
   it('falls back to safe recovery copy when the server does not return JSON', async () => {
-    (global.fetch as jest.Mock).mockResolvedValue({
+    mockFetch.mockResolvedValue({
       ok: false,
       status: 500,
       headers: new Headers({ 'Content-Type': 'text/html' }),

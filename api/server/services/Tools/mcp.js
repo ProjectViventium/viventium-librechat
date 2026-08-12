@@ -479,6 +479,7 @@ async function reinitMCPServer({
 
 module.exports = {
   buildMcpOAuthRecovery,
+  hasUsableOAuthTokens,
   inspectStoredOAuthCredentialState,
   reinitMCPServer,
   shouldUseCachedMcpTools,

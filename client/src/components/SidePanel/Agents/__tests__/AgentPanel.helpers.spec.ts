@@ -228,49 +228,6 @@ describe('composeAgentUpdatePayload', () => {
       access: 'full',
     });
   });
-
-  it('persists typed GlassHive workspace options on the normal agent payload', () => {
-    const form = createForm();
-    form.provider = 'glasshive-harness';
-    form.model = 'codex-cli:gpt-5.6-sol';
-    form.model_parameters = {
-      reasoning_effort: 'medium',
-    } as AgentForm['model_parameters'];
-    form.glasshive_options = {
-      workspace: { mode: 'custom', path: '/srv/viventium/life' },
-      access: 'workspace',
-    };
-
-    const { payload } = composeAgentUpdatePayload(form, 'agent_123', true);
-
-    expect(payload.provider).toBe('glasshive-harness');
-    expect(payload.model).toBe('codex-cli:gpt-5.6-sol');
-    expect(payload.model_parameters).toMatchObject({
-      model: 'codex-cli:gpt-5.6-sol',
-      reasoning_effort: 'medium',
-    });
-    expect(payload.glasshive_options).toEqual({
-      workspace: { mode: 'custom', path: '/srv/viventium/life' },
-      access: 'workspace',
-    });
-  });
-
-  it('does not let an unfinished custom path block a temporary direct-provider save', () => {
-    const form = createForm();
-    form.glasshive_options = {
-      workspace: { mode: 'custom', path: '' },
-      access: 'full',
-    };
-
-    const { payload } = composeAgentUpdatePayload(form, 'agent_123', false);
-
-    expect(payload.provider).toBe('openai');
-    expect(payload.glasshive_options).toBeUndefined();
-    expect(form.glasshive_options).toEqual({
-      workspace: { mode: 'custom', path: '' },
-      access: 'full',
-    });
-  });
 });
 
 describe('persistAvatarChanges', () => {

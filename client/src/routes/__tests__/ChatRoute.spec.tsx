@@ -1,13 +1,7 @@
 /* eslint-disable i18next/no-literal-string */
 import React from 'react';
 import { act, fireEvent, render, screen } from '@testing-library/react';
-import {
-  createMemoryRouter,
-  MemoryRouter,
-  Route,
-  RouterProvider,
-  Routes,
-} from 'react-router-dom';
+import { createMemoryRouter, MemoryRouter, Route, RouterProvider, Routes } from 'react-router-dom';
 import ChatRoute from '../ChatRoute';
 
 if (typeof Request === 'undefined') {
@@ -468,10 +462,9 @@ describe('ChatRoute exact persisted-conversation settlement', () => {
       }
     });
 
-    const router = createMemoryRouter(
-      [{ path: '/c/:conversationId', element: <ChatRoute /> }],
-      { initialEntries: ['/c/conversation-a'] },
-    );
+    const router = createMemoryRouter([{ path: '/c/:conversationId', element: <ChatRoute /> }], {
+      initialEntries: ['/c/conversation-a'],
+    });
     render(<RouterProvider router={router} />);
     expect(screen.getByTestId('chat-view')).toBeInTheDocument();
 
@@ -521,10 +514,9 @@ describe('ChatRoute exact persisted-conversation settlement', () => {
     };
     mockIsNotFoundError.mockImplementation((error) => error === notFoundError);
 
-    const router = createMemoryRouter(
-      [{ path: '/c/:conversationId', element: <ChatRoute /> }],
-      { initialEntries: [`/c/${TARGET_CONVERSATION_ID}`] },
-    );
+    const router = createMemoryRouter([{ path: '/c/:conversationId', element: <ChatRoute /> }], {
+      initialEntries: [`/c/${TARGET_CONVERSATION_ID}`],
+    });
     mockNewConversation.mockImplementation(() => {
       mockRouteState.conversation = { conversationId: 'new' };
       void router.navigate('/c/new');

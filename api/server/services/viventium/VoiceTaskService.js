@@ -58,6 +58,10 @@ function persistenceAvailable(model) {
   return model?.db?.readyState === 1;
 }
 
+function isTestRuntime() {
+  return process.env.NODE_ENV === 'test' || process.env.NODE_ENV === 'CI';
+}
+
 function activeSuppressionClause(now = new Date()) {
   return {
     $and: [
@@ -366,8 +370,7 @@ async function hydrateVoiceTaskByStreamId(
 ) {
   const normalizedStreamId = safeText(streamId, 160);
   if (!normalizedStreamId) return null;
-  const hasTestPersistenceAdapter =
-    process.env.NODE_ENV === 'test' && suppressionPersistenceTestAdapter != null;
+  const hasTestPersistenceAdapter = isTestRuntime() && suppressionPersistenceTestAdapter != null;
   if (
     requireDurable &&
     !hasTestPersistenceAdapter &&
@@ -2685,10 +2688,9 @@ function resetVoiceTasksForTests() {
   suppressionTombstones.clear();
   pendingTaskPersistence.clear();
   taskPersistenceDrain = null;
-  suppressionPersistenceTestAdapter =
-    process.env.NODE_ENV === 'test'
-      ? { persist: async () => undefined, clear: async () => undefined }
-      : null;
+  suppressionPersistenceTestAdapter = isTestRuntime()
+    ? { persist: async () => undefined, clear: async () => undefined }
+    : null;
 }
 
 function getVoiceTaskRegistryStats() {

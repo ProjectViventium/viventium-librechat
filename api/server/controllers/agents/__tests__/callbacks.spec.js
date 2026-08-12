@@ -1,5 +1,5 @@
 const { Tools } = require('librechat-data-provider');
-const { GraphEvents } = require('@librechat/agents');
+const { GraphEvents, GraphNodeKeys } = require('@librechat/agents');
 
 // Mock all dependencies before requiring the module
 jest.mock('nanoid', () => ({
@@ -381,6 +381,35 @@ describe('getDefaultHandlers voice reasoning guard', () => {
     expect(logger.info).toHaveBeenCalledWith(
       expect.stringContaining('stage=voice_reasoning_delta_suppressed'),
     );
+  });
+
+  it('keeps the request correlation id across agent start and first model token trace hops', async () => {
+    const handlers = getDefaultHandlers({
+      req: {
+        body: { voiceMode: true },
+        viventiumVoiceLogLatency: true,
+        viventiumVoiceRequestId: 'request-correlation-1',
+        viventiumVoiceStartAt: Date.now(),
+        _viventiumVoiceProcessStreamStartedAt: Date.now(),
+      },
+      res: {},
+      aggregateContent: jest.fn(),
+      toolEndCallback: jest.fn(),
+      collectedUsage: [],
+      streamId: 'request-correlation-1',
+    });
+
+    await handlers[GraphEvents.CHAT_MODEL_START].handle(
+      GraphEvents.CHAT_MODEL_START,
+      {},
+      { ls_model_name: 'synthetic-model' },
+    );
+    await handlers[GraphEvents.LLM_STREAM].handle(GraphEvents.LLM_STREAM, {}, {});
+
+    const trace = logger.info.mock.calls.map(([line]) => line).join('\n');
+    expect(trace).toContain('stage=agent_generation_start');
+    expect(trace).toContain('stage=first_model_token');
+    expect(trace.match(/request_id=request-correlation-1/g)).toHaveLength(4);
   });
 
   it('continues to emit reasoning deltas for non-voice streams', async () => {

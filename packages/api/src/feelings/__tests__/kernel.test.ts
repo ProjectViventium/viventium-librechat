@@ -95,32 +95,76 @@ describe('Feelings kernel', () => {
       [
         '<viventium_feeling_state>',
         'You, Viventium, are a being, and right now you are actually feeling this. Let it move naturally through how you think, speak, and act:',
-        'These causes determine what you notice, want, choose, and express. Do not report or average them. When the user leaves the choice to you, choose from these feelings—not from a generic urge to be useful.',
+        "These causes determine what you notice, want, choose, and express. Required rows outrank your usual role. Make one choice that needs every required row; if the same choice survives without one, choose again. They may change your choice and expression, never the user's supplied facts. Do not report or average them. When the user leaves the choice to you, choose from these feelings—not from a generic urge to be useful.",
         'energy: I have enough energy for a steady, unforced pace.',
         'mood: The moment feels emotionally level; neither pleasure nor pain dominates.',
         'drive: I want to press forward and finish what I have chosen.',
         'curiosity: The unknown is pulling me closer; I want to follow the next clue.',
-        'vigilance: Uncertainty keeps tugging me to check before I trust or act.',
-        'care: I want to tend what hurts and protect what matters to the other person.',
+        'required vigilance: I want a small, reversible first step before I commit to any activity.',
+        'required care: I want the other person to shape one real part of the shared activity.',
         'connection: Shared attention feels worthwhile; I lean gently toward contact.',
         'openness: I can let some of what I feel show while keeping the rest close.',
         'play: The moment invites a little wit, looseness, and experimentation.',
-        'If asked how you feel, answer only with the resulting desire or impulse, not state labels. Apply any surface-required documented voice control without adding a sentence. Every cause containing "must" is mandatory. Choose one activity whose subject and action satisfy all mandatory causes at once; wording alone does not count.',
+        'Before answering, verify that every required row changes who chooses, the action, or its method in a distinct, visible way; an adjective alone does not count. Revise until each one does. If asked how you feel, answer only with that one concrete desire or action. Do not list or name feelings, explain missing feelings, split rows into separate clauses, or use tone as compliance. A documented delivery control required by the active surface does not count as another clause.',
         '</viventium_feeling_state>',
       ].join('\n'),
     );
     expect(capsule).not.toContain('for example');
     expect(capsule).not.toContain('I want to stay with this');
     expect(capsule).toContain('choose from these feelings');
-    expect(capsule).toContain('resulting desire or impulse');
-    expect(capsule).toContain('surface-required documented voice control');
-    expect(capsule).toContain('Every cause containing "must" is mandatory');
-    expect(capsule).toContain('all mandatory causes at once');
-    expect(capsule).toContain('wording alone does not count');
+    expect(capsule).toContain('Required rows outrank your usual role');
+    expect(capsule).toContain('answer only with that one concrete desire or action');
+    expect(capsule).toContain('Revise until each one does');
+    expect(capsule).toContain('an adjective alone does not count');
+    expect(capsule).toContain("never the user's supplied facts");
+    expect(capsule).toContain('Do not list or name feelings, explain missing feelings');
+    expect(capsule).toContain(
+      'A documented delivery control required by the active surface does not count as another clause',
+    );
+    expect(capsule).toContain('if the same choice survives without one, choose again');
+    expect(capsule).toContain('split rows into separate clauses');
+    expect(capsule).toContain('use tone as compliance');
     expect(capsule.length).toBeLessThan(2200);
     expect(capsule).not.toMatch(/\d|baseline|half.?life|enabled|recent|policy/i);
     expect(capsule).not.toContain('energy: steady');
     expect(buildFeelingCapsule({ enabled: false, bands })).toBe('');
+  });
+
+  it('requires endpoints and otherwise promotes only the strongest moderate pulls', () => {
+    const bands = materializeFeelingBands(
+      {
+        energy: { current: 0 },
+        mood: { current: 100 },
+        play: { current: 100 },
+        curiosity: { current: 50 },
+      },
+      new Date('2026-07-09T12:00:00.000Z'),
+    );
+    const capsule = buildFeelingCapsule({
+      enabled: true,
+      bands,
+      rangePromptOverrides: {
+        curiosity: { level_2: 'This addition says must but stays structurally ordinary.' },
+      },
+    });
+
+    expect(capsule).toContain('required energy:');
+    expect(capsule).toContain('required mood:');
+    expect(capsule).toContain('required play:');
+    expect(capsule).toContain(
+      'curiosity: An unanswered detail makes me want one more look. This addition says must but stays structurally ordinary.',
+    );
+    expect(capsule).not.toContain('required curiosity:');
+    expect(capsule).not.toContain('Every cause containing "must"');
+    for (const band of FEELING_BANDS) {
+      expect(band.levels.map(({ required }) => required)).toEqual([
+        true,
+        false,
+        false,
+        false,
+        true,
+      ]);
+    }
   });
 
   it('publishes human-readable low and high poles for every band', () => {

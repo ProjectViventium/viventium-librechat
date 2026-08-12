@@ -209,7 +209,7 @@ describe('Memory Methods', () => {
   });
 
   describe('renameMemory revision protection', () => {
-    it('renames and updates one row atomically', async () => {
+    it('renames while retaining the source key generation as a tombstone', async () => {
       const userId = new mongoose.Types.ObjectId();
       const original = await MemoryEntry.create({
         userId,
@@ -228,9 +228,12 @@ describe('Memory Methods', () => {
       });
 
       expect(result).toEqual(expect.objectContaining({ ok: true, revision: 1 }));
-      expect(await MemoryEntry.countDocuments({ userId })).toBe(1);
-      expect(await MemoryEntry.findOne({ userId }).lean()).toEqual(
+      expect(await MemoryEntry.countDocuments({ userId })).toBe(2);
+      expect(await MemoryEntry.findOne({ userId, key: 'context_archive' }).lean()).toEqual(
         expect.objectContaining({ key: 'context_archive', value: 'Archived', __v: 1 }),
+      );
+      expect(await MemoryEntry.findOne({ userId, key: 'context' }).lean()).toEqual(
+        expect.objectContaining({ key: 'context', value: '', tokenCount: 0, __v: 1 }),
       );
     });
 

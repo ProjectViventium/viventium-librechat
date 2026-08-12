@@ -6,10 +6,10 @@
     "published_at": "2026-04-02T00:22:54-04:00"
   },
   "history_boundary": {
-    "parent_commit": "359f581cf4dad41d0aab4bcc06805a220c3dc5f2",
-    "published_at": "2026-08-01T17:18:03-04:00"
+    "parent_commit": "629f8883a31376e4e33060e4c2cf0f05c36d1ab2",
+    "published_at": "2026-08-10T22:36:49-04:00"
   },
-  "public_lock_revision_count": 91,
+  "public_lock_revision_count": 118,
   "invalid_predecessors": [
     {
       "predecessor_source_ref": "327dec04af80c3f6f6fbfe9eaeb7eb756b9fbe6b",
@@ -37,7 +37,7 @@
       "predecessor_managed_bundle_sha256": "1b0d7ba5b492c3953c738d9d717ee9a80d2c2a4eebdef95701eff846b13ca0b0",
       "baseline": {
         "schema_version": 1,
-        "bundle_sha256": "909dc89365cb65e9c3bbeca722b633460ac093b819b239f6886daac6e97abcb5",
+        "bundle_sha256": "16fcbea04f9f822caff24c9ff21c313b78abd9a120360dddc02bb7a16d6441a0",
         "agents": {
           "agent_viventium_main_95aeb3": {
             "fields": {
@@ -113,9 +113,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "b5de9cf629d085993628f054e8e88e595d75882d24d1d71bead9856bc881acd7"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -129,14 +126,8 @@
               "instructions": {
                 "$viventium_managed_sha256": "b24bba27f11eaa2b6b3335b014b78b981128f48f5d904abe9241e8d71b7782c3"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
-              },
-              "tools": {
-                "$viventium_managed_sha256": "d2d81376dd00d899b97b9421cdb762c1060f2e2f5e409085155891d88763f3e6"
               },
               "model_parameters": {
                 "$viventium_managed_sha256": "11ef827a424f7d9198076450e548402dd0e361d92c9f5208f7595de665c601f7"
@@ -147,9 +138,6 @@
             "fields": {
               "instructions": {
                 "$viventium_managed_sha256": "d5ee9d1d150f8d7b61b014d4ce663546afd19a47318d6629088a39c6073c0303"
-              },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
               },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
@@ -166,9 +154,6 @@
             "fields": {
               "instructions": {
                 "$viventium_managed_sha256": "a05f8b4f8706aafd448e7d6d976bbc9965b9ff505d0b2ce605050cc3a3a1f4a3"
-              },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
               },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
@@ -253,9 +238,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "9a48746a1aca0b9929325c8ec547c617106725119de8628c864b7346372a1a81"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -284,7 +266,7 @@
       "predecessor_managed_bundle_sha256": "ac6a18716ca187191564f3fbd11874b58b726a43a94a58c2f4004143363ff621",
       "baseline": {
         "schema_version": 1,
-        "bundle_sha256": "ed5d951ee4663379a530d8c0a2db75cbb065b38bc9cd9073078e769429e444d9",
+        "bundle_sha256": "5c0452caa78f41e0d96a8ad35267c1e9557580e4b9e0ab830334b900d9fe0645",
         "agents": {
           "agent_viventium_main_95aeb3": {
             "fields": {
@@ -363,9 +345,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "b5de9cf629d085993628f054e8e88e595d75882d24d1d71bead9856bc881acd7"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -379,14 +358,8 @@
               "instructions": {
                 "$viventium_managed_sha256": "b24bba27f11eaa2b6b3335b014b78b981128f48f5d904abe9241e8d71b7782c3"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
-              },
-              "tools": {
-                "$viventium_managed_sha256": "d2d81376dd00d899b97b9421cdb762c1060f2e2f5e409085155891d88763f3e6"
               },
               "model_parameters": {
                 "$viventium_managed_sha256": "11ef827a424f7d9198076450e548402dd0e361d92c9f5208f7595de665c601f7"
@@ -397,9 +370,6 @@
             "fields": {
               "instructions": {
                 "$viventium_managed_sha256": "d5ee9d1d150f8d7b61b014d4ce663546afd19a47318d6629088a39c6073c0303"
-              },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
               },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
@@ -416,9 +386,6 @@
             "fields": {
               "instructions": {
                 "$viventium_managed_sha256": "a05f8b4f8706aafd448e7d6d976bbc9965b9ff505d0b2ce605050cc3a3a1f4a3"
-              },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
               },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
@@ -503,9 +470,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "9a48746a1aca0b9929325c8ec547c617106725119de8628c864b7346372a1a81"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -530,7 +494,7 @@
       "predecessor_managed_bundle_sha256": "0cf3ea7cc163957de4bf06f9b2cca26bf48d89a00b0291ddcc5e82159f8c5708",
       "baseline": {
         "schema_version": 1,
-        "bundle_sha256": "56cf7b0e4376b4d2c411d2d3d31a8dfa2274bf2e5c23febe5866848114edd1d6",
+        "bundle_sha256": "521fcc643b4a09aa36d427b9302e56f688f4f11d3c8a6bbbbb187aea5be1c2e5",
         "agents": {
           "agent_viventium_main_95aeb3": {
             "fields": {
@@ -609,9 +573,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "b5de9cf629d085993628f054e8e88e595d75882d24d1d71bead9856bc881acd7"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -625,14 +586,8 @@
               "instructions": {
                 "$viventium_managed_sha256": "b24bba27f11eaa2b6b3335b014b78b981128f48f5d904abe9241e8d71b7782c3"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
-              },
-              "tools": {
-                "$viventium_managed_sha256": "d2d81376dd00d899b97b9421cdb762c1060f2e2f5e409085155891d88763f3e6"
               },
               "model_parameters": {
                 "$viventium_managed_sha256": "a8b7d494673c1d23475d4d8a65b29e73c4adf81b058b0b2cecf9201aca1e6f69"
@@ -643,9 +598,6 @@
             "fields": {
               "instructions": {
                 "$viventium_managed_sha256": "d5ee9d1d150f8d7b61b014d4ce663546afd19a47318d6629088a39c6073c0303"
-              },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
               },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
@@ -662,9 +614,6 @@
             "fields": {
               "instructions": {
                 "$viventium_managed_sha256": "a05f8b4f8706aafd448e7d6d976bbc9965b9ff505d0b2ce605050cc3a3a1f4a3"
-              },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
               },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
@@ -749,9 +698,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "9a48746a1aca0b9929325c8ec547c617106725119de8628c864b7346372a1a81"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -776,7 +722,7 @@
       "predecessor_managed_bundle_sha256": "7e1947d430da16572825ace8c91af155b1b2a8f86b30a70e357173e7776158d3",
       "baseline": {
         "schema_version": 1,
-        "bundle_sha256": "f0d09cdbe2d823ab4c2ae0a19ca2a96678d4f59ca5537ba0eb9bce22f2423085",
+        "bundle_sha256": "8f38f84491064471be368d58b68df66dab56762790920af3a7209ccc8a3bd24b",
         "agents": {
           "agent_viventium_main_95aeb3": {
             "fields": {
@@ -855,9 +801,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "b5de9cf629d085993628f054e8e88e595d75882d24d1d71bead9856bc881acd7"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -871,14 +814,8 @@
               "instructions": {
                 "$viventium_managed_sha256": "b24bba27f11eaa2b6b3335b014b78b981128f48f5d904abe9241e8d71b7782c3"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
-              },
-              "tools": {
-                "$viventium_managed_sha256": "d2d81376dd00d899b97b9421cdb762c1060f2e2f5e409085155891d88763f3e6"
               },
               "model_parameters": {
                 "$viventium_managed_sha256": "a8b7d494673c1d23475d4d8a65b29e73c4adf81b058b0b2cecf9201aca1e6f69"
@@ -889,9 +826,6 @@
             "fields": {
               "instructions": {
                 "$viventium_managed_sha256": "d5ee9d1d150f8d7b61b014d4ce663546afd19a47318d6629088a39c6073c0303"
-              },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
               },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
@@ -908,9 +842,6 @@
             "fields": {
               "instructions": {
                 "$viventium_managed_sha256": "a05f8b4f8706aafd448e7d6d976bbc9965b9ff505d0b2ce605050cc3a3a1f4a3"
-              },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
               },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
@@ -995,9 +926,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "9a48746a1aca0b9929325c8ec547c617106725119de8628c864b7346372a1a81"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -1027,7 +955,7 @@
       "predecessor_managed_bundle_sha256": "25b0728b01814d5a8026b3d8485269a3428ef356d3d627c6a95c2d6431e07c74",
       "baseline": {
         "schema_version": 1,
-        "bundle_sha256": "b15b8c1f4e511ac92921fff3456066bab9c081dec979aa64462e190171c3246c",
+        "bundle_sha256": "d27d4fe3ffd32b9542cb64c1cea5a358806fd202ca5ab7d5854467e63fd3af95",
         "agents": {
           "agent_viventium_main_95aeb3": {
             "fields": {
@@ -1103,9 +1031,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "b1a0e290d106737df4752b8352930ed242891c1d8e67e5e68a09af4f9d082d63"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -1116,14 +1041,8 @@
           },
           "agent_viventium_deep_research_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
-              },
-              "tools": {
-                "$viventium_managed_sha256": "d2d81376dd00d899b97b9421cdb762c1060f2e2f5e409085155891d88763f3e6"
               },
               "model_parameters": {
                 "$viventium_managed_sha256": "a8b7d494673c1d23475d4d8a65b29e73c4adf81b058b0b2cecf9201aca1e6f69"
@@ -1134,9 +1053,6 @@
             "fields": {
               "instructions": {
                 "$viventium_managed_sha256": "47d118084da7e0179f47c689e50d6c39926314cc0ea9aa01745b04a600fc2c50"
-              },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
               },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
@@ -1151,9 +1067,6 @@
           },
           "agent_viventium_parietal_cortex_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -1231,9 +1144,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "15b54d6a4d0410e8dcd1188c0aebd8e73e5bbbff400db6753bde3ae7561e14c6"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -1258,7 +1168,7 @@
       "predecessor_managed_bundle_sha256": "9cee1a53ed9491e44e152dbc15bde7e76c7bf14d9592bb7d05ace30b90c92679",
       "baseline": {
         "schema_version": 1,
-        "bundle_sha256": "2dd818e523de642194779d273bf64b53543d069cc52e133afe36c6ab161ed52c",
+        "bundle_sha256": "4371e9e95fab711836dc55226bc100b54c9be64f2f296a0930e96a1ec5a6208b",
         "agents": {
           "agent_viventium_main_95aeb3": {
             "fields": {
@@ -1334,9 +1244,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "b1a0e290d106737df4752b8352930ed242891c1d8e67e5e68a09af4f9d082d63"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -1347,14 +1254,8 @@
           },
           "agent_viventium_deep_research_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
-              },
-              "tools": {
-                "$viventium_managed_sha256": "d2d81376dd00d899b97b9421cdb762c1060f2e2f5e409085155891d88763f3e6"
               },
               "model_parameters": {
                 "$viventium_managed_sha256": "a8b7d494673c1d23475d4d8a65b29e73c4adf81b058b0b2cecf9201aca1e6f69"
@@ -1365,9 +1266,6 @@
             "fields": {
               "instructions": {
                 "$viventium_managed_sha256": "47d118084da7e0179f47c689e50d6c39926314cc0ea9aa01745b04a600fc2c50"
-              },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
               },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
@@ -1382,9 +1280,6 @@
           },
           "agent_viventium_parietal_cortex_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -1462,9 +1357,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "15b54d6a4d0410e8dcd1188c0aebd8e73e5bbbff400db6753bde3ae7561e14c6"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -1488,7 +1380,7 @@
       "predecessor_managed_bundle_sha256": "5febfcffb9bef86516b6e233a2517d1b89265621f5fb07fd3ed671674f4d7cfc",
       "baseline": {
         "schema_version": 1,
-        "bundle_sha256": "7a2ecc003d60e3276e3323ef29e8b8bfb6f1b9dd80c82dd7343f285e40be9e1c",
+        "bundle_sha256": "f6e14d4606bbbafa17f239c285d06304a244f324ab7a096f8c149fa12410ee9f",
         "agents": {
           "agent_viventium_main_95aeb3": {
             "fields": {
@@ -1564,9 +1456,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "b1a0e290d106737df4752b8352930ed242891c1d8e67e5e68a09af4f9d082d63"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -1577,14 +1466,8 @@
           },
           "agent_viventium_deep_research_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
-              },
-              "tools": {
-                "$viventium_managed_sha256": "d2d81376dd00d899b97b9421cdb762c1060f2e2f5e409085155891d88763f3e6"
               },
               "model_parameters": {
                 "$viventium_managed_sha256": "a8b7d494673c1d23475d4d8a65b29e73c4adf81b058b0b2cecf9201aca1e6f69"
@@ -1595,9 +1478,6 @@
             "fields": {
               "instructions": {
                 "$viventium_managed_sha256": "47d118084da7e0179f47c689e50d6c39926314cc0ea9aa01745b04a600fc2c50"
-              },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
               },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
@@ -1612,9 +1492,6 @@
           },
           "agent_viventium_parietal_cortex_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -1692,9 +1569,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "15b54d6a4d0410e8dcd1188c0aebd8e73e5bbbff400db6753bde3ae7561e14c6"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -1718,7 +1592,7 @@
       "predecessor_managed_bundle_sha256": "1a8e93e65faab591fd7a7ef64821d65dee660c67ccbc7d727acc1ea82b83ea03",
       "baseline": {
         "schema_version": 1,
-        "bundle_sha256": "278a7187366540831ad6d2e9282b6612892b62c7507467e6fe909f4d9867c847",
+        "bundle_sha256": "851f52cc933f992f166e61ab9f51c36ad95a718b00fb5dfcf763d14dfa14542b",
         "agents": {
           "agent_viventium_main_95aeb3": {
             "fields": {
@@ -1794,9 +1668,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "b1a0e290d106737df4752b8352930ed242891c1d8e67e5e68a09af4f9d082d63"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -1807,14 +1678,8 @@
           },
           "agent_viventium_deep_research_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
-              },
-              "tools": {
-                "$viventium_managed_sha256": "d2d81376dd00d899b97b9421cdb762c1060f2e2f5e409085155891d88763f3e6"
               },
               "model_parameters": {
                 "$viventium_managed_sha256": "a8b7d494673c1d23475d4d8a65b29e73c4adf81b058b0b2cecf9201aca1e6f69"
@@ -1825,9 +1690,6 @@
             "fields": {
               "instructions": {
                 "$viventium_managed_sha256": "47d118084da7e0179f47c689e50d6c39926314cc0ea9aa01745b04a600fc2c50"
-              },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
               },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
@@ -1842,9 +1704,6 @@
           },
           "agent_viventium_parietal_cortex_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -1922,9 +1781,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "15b54d6a4d0410e8dcd1188c0aebd8e73e5bbbff400db6753bde3ae7561e14c6"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -1949,7 +1805,7 @@
       "predecessor_managed_bundle_sha256": "c7ff2066e6af8d0231cd85f5b2db0f9fbe86e847151aa3eafd38b4d468b95e8d",
       "baseline": {
         "schema_version": 1,
-        "bundle_sha256": "7c380e3af736eab904c040e7a500d9d475396a3d5a82c74d480a26ee50f127cc",
+        "bundle_sha256": "e886a7a0cf82f1b937aa686fa889bd60d55687d1e00ba603463735dc69b854cd",
         "agents": {
           "agent_viventium_main_95aeb3": {
             "fields": {
@@ -2025,9 +1881,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "b1a0e290d106737df4752b8352930ed242891c1d8e67e5e68a09af4f9d082d63"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -2038,14 +1891,8 @@
           },
           "agent_viventium_deep_research_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
-              },
-              "tools": {
-                "$viventium_managed_sha256": "d2d81376dd00d899b97b9421cdb762c1060f2e2f5e409085155891d88763f3e6"
               },
               "model_parameters": {
                 "$viventium_managed_sha256": "a8b7d494673c1d23475d4d8a65b29e73c4adf81b058b0b2cecf9201aca1e6f69"
@@ -2056,9 +1903,6 @@
             "fields": {
               "instructions": {
                 "$viventium_managed_sha256": "47d118084da7e0179f47c689e50d6c39926314cc0ea9aa01745b04a600fc2c50"
-              },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
               },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
@@ -2073,9 +1917,6 @@
           },
           "agent_viventium_parietal_cortex_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -2153,9 +1994,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "15b54d6a4d0410e8dcd1188c0aebd8e73e5bbbff400db6753bde3ae7561e14c6"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -2180,7 +2018,7 @@
       "predecessor_managed_bundle_sha256": "6cf07867118d09c17e6001e6cf36dc7507e861e173abf476c206272b16d6c84f",
       "baseline": {
         "schema_version": 1,
-        "bundle_sha256": "6c6f9ad6baea977fe47946a11f3cf60f49c58bc427f1d09e185c4a74be5236c3",
+        "bundle_sha256": "a41749c25543cc8f2c4b23f0fc034a225f0e8de912d5a0306260ba522270c97d",
         "agents": {
           "agent_viventium_main_95aeb3": {
             "fields": {
@@ -2233,9 +2071,6 @@
           },
           "agent_viventium_background_analysis_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -2286,9 +2121,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "b1a0e290d106737df4752b8352930ed242891c1d8e67e5e68a09af4f9d082d63"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -2302,11 +2134,11 @@
           },
           "agent_viventium_deep_research_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
+              },
+              "tools": {
+                "$viventium_managed_sha256": "c8e09f43858ba94072a5a0256c6cc4a929c031be24da9404f4bfe077b23b975a"
               },
               "model_parameters": {
                 "$viventium_managed_sha256": "a8b7d494673c1d23475d4d8a65b29e73c4adf81b058b0b2cecf9201aca1e6f69"
@@ -2318,9 +2150,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "47d118084da7e0179f47c689e50d6c39926314cc0ea9aa01745b04a600fc2c50"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -2331,9 +2160,6 @@
           },
           "agent_viventium_parietal_cortex_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -2417,9 +2243,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "15b54d6a4d0410e8dcd1188c0aebd8e73e5bbbff400db6753bde3ae7561e14c6"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -2449,7 +2272,7 @@
       "predecessor_managed_bundle_sha256": "c49e9420dd29d84199a18da320dd52d0b3479cea5c066681b068f82905519519",
       "baseline": {
         "schema_version": 1,
-        "bundle_sha256": "fcece5fe244a4687c5dbbe14e24a30016b9f2a638a364e1223c6a942be23508d",
+        "bundle_sha256": "f9562570efa77fa295c295feba68e4c00b8766bf52438f919db51cc4a39f0a62",
         "agents": {
           "agent_viventium_main_95aeb3": {
             "fields": {
@@ -2558,9 +2381,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "b1a0e290d106737df4752b8352930ed242891c1d8e67e5e68a09af4f9d082d63"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -2583,14 +2403,8 @@
           },
           "agent_viventium_deep_research_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
-              },
-              "tools": {
-                "$viventium_managed_sha256": "d2d81376dd00d899b97b9421cdb762c1060f2e2f5e409085155891d88763f3e6"
               },
               "model_parameters": {
                 "$viventium_managed_sha256": "a8b7d494673c1d23475d4d8a65b29e73c4adf81b058b0b2cecf9201aca1e6f69"
@@ -2611,9 +2425,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "824dfba301043b907b70b646945d9cfd396ea03b8152536aff016d90f82e6015"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -2633,9 +2444,6 @@
           },
           "agent_viventium_parietal_cortex_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -2754,9 +2562,6 @@
             "fields": {
               "instructions": {
                 "$viventium_managed_sha256": "9bc94999de4de8072924465477655a6289062606150df618a69fccb7a4a6801a"
-              },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
               },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
@@ -2794,7 +2599,7 @@
       "predecessor_managed_bundle_sha256": "97905c4312c577814b5156a8a5c2692d9883a21d82ab7e7f14470fcc9e44ccce",
       "baseline": {
         "schema_version": 1,
-        "bundle_sha256": "9b3de087c37959c2ba845a2386c263c055422c404560c0cc842a4e929281901e",
+        "bundle_sha256": "50f4ef6feb424ff7f654076ef9d6b984b0568a547f3fc1bf77bc5d7108fb4246",
         "agents": {
           "agent_viventium_main_95aeb3": {
             "fields": {
@@ -2903,9 +2708,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "b1a0e290d106737df4752b8352930ed242891c1d8e67e5e68a09af4f9d082d63"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -2928,14 +2730,8 @@
           },
           "agent_viventium_deep_research_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
-              },
-              "tools": {
-                "$viventium_managed_sha256": "d2d81376dd00d899b97b9421cdb762c1060f2e2f5e409085155891d88763f3e6"
               },
               "model_parameters": {
                 "$viventium_managed_sha256": "a8b7d494673c1d23475d4d8a65b29e73c4adf81b058b0b2cecf9201aca1e6f69"
@@ -2956,9 +2752,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "824dfba301043b907b70b646945d9cfd396ea03b8152536aff016d90f82e6015"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -2978,9 +2771,6 @@
           },
           "agent_viventium_parietal_cortex_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -3100,9 +2890,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "9bc94999de4de8072924465477655a6289062606150df618a69fccb7a4a6801a"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -3136,7 +2923,7 @@
       "predecessor_managed_bundle_sha256": "49569666643d38436e7c2f88f0619485639512600014b2583dd67fb167a9b866",
       "baseline": {
         "schema_version": 1,
-        "bundle_sha256": "52f87dfd166b29bcfb93dbf9b6078e030898eb0b86191295e82e9539680d23fd",
+        "bundle_sha256": "c2ad810311e0384f0cfa01eb3f9ee85e8430e3681e6ea69fb7da1562a2b1ca15",
         "agents": {
           "agent_viventium_main_95aeb3": {
             "fields": {
@@ -3245,9 +3032,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "b1a0e290d106737df4752b8352930ed242891c1d8e67e5e68a09af4f9d082d63"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -3267,14 +3051,8 @@
           },
           "agent_viventium_deep_research_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
-              },
-              "tools": {
-                "$viventium_managed_sha256": "d2d81376dd00d899b97b9421cdb762c1060f2e2f5e409085155891d88763f3e6"
               },
               "model_parameters": {
                 "$viventium_managed_sha256": "a8b7d494673c1d23475d4d8a65b29e73c4adf81b058b0b2cecf9201aca1e6f69"
@@ -3295,9 +3073,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "824dfba301043b907b70b646945d9cfd396ea03b8152536aff016d90f82e6015"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -3317,9 +3092,6 @@
           },
           "agent_viventium_parietal_cortex_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -3442,9 +3214,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "9bc94999de4de8072924465477655a6289062606150df618a69fccb7a4a6801a"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -3477,7 +3246,7 @@
       "predecessor_managed_bundle_sha256": "d4578e995a11f6a5c8dddcfedc21d4b5d05ee75262cf424a66a1421bff0bcbf5",
       "baseline": {
         "schema_version": 1,
-        "bundle_sha256": "d02abb7aad0e91801680d73d283fd4627e63a1764601436133e4cfc7f1aec34d",
+        "bundle_sha256": "59598623bb8a118c87ab67ad8fe3ff113cc107eb2245a7a3bee56a344541e13a",
         "agents": {
           "agent_viventium_main_95aeb3": {
             "fields": {
@@ -3586,9 +3355,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "b1a0e290d106737df4752b8352930ed242891c1d8e67e5e68a09af4f9d082d63"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -3608,14 +3374,8 @@
           },
           "agent_viventium_deep_research_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
-              },
-              "tools": {
-                "$viventium_managed_sha256": "d2d81376dd00d899b97b9421cdb762c1060f2e2f5e409085155891d88763f3e6"
               },
               "model_parameters": {
                 "$viventium_managed_sha256": "a8b7d494673c1d23475d4d8a65b29e73c4adf81b058b0b2cecf9201aca1e6f69"
@@ -3635,9 +3395,6 @@
             "fields": {
               "instructions": {
                 "$viventium_managed_sha256": "824dfba301043b907b70b646945d9cfd396ea03b8152536aff016d90f82e6015"
-              },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
               },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
@@ -3661,9 +3418,6 @@
           },
           "agent_viventium_parietal_cortex_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -3786,9 +3540,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "9bc94999de4de8072924465477655a6289062606150df618a69fccb7a4a6801a"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -3821,7 +3572,7 @@
       "predecessor_managed_bundle_sha256": "5d44a2b526175efdf8f73eb594912ee7d73c91eb6aba6ed259c7b14c9fa4ac06",
       "baseline": {
         "schema_version": 1,
-        "bundle_sha256": "40e306d8694d09dc798eaed863c333ab8642c5e52cb0a924803b7e517ab2265a",
+        "bundle_sha256": "e710e9168bd907e107fdc80fa07128f83d2c17c86500e9c46b4720f251cc6a3d",
         "agents": {
           "agent_viventium_main_95aeb3": {
             "fields": {
@@ -3930,9 +3681,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "b1a0e290d106737df4752b8352930ed242891c1d8e67e5e68a09af4f9d082d63"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -3952,14 +3700,8 @@
           },
           "agent_viventium_deep_research_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
-              },
-              "tools": {
-                "$viventium_managed_sha256": "d2d81376dd00d899b97b9421cdb762c1060f2e2f5e409085155891d88763f3e6"
               },
               "model_parameters": {
                 "$viventium_managed_sha256": "a8b7d494673c1d23475d4d8a65b29e73c4adf81b058b0b2cecf9201aca1e6f69"
@@ -3979,9 +3721,6 @@
             "fields": {
               "instructions": {
                 "$viventium_managed_sha256": "824dfba301043b907b70b646945d9cfd396ea03b8152536aff016d90f82e6015"
-              },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
               },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
@@ -4005,9 +3744,6 @@
           },
           "agent_viventium_parietal_cortex_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -4130,9 +3866,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "9bc94999de4de8072924465477655a6289062606150df618a69fccb7a4a6801a"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -4165,7 +3898,7 @@
       "predecessor_managed_bundle_sha256": "3f4bd620e6ef5b47d912871ab77d15d610e86107635e8d4b51bb2708a4e117fa",
       "baseline": {
         "schema_version": 1,
-        "bundle_sha256": "aeb5d979cce1c5ffc0fdd949bef620704349246b6155792bc2b4713bf48a4b32",
+        "bundle_sha256": "de4209ea3ce5a4f9cf312360659e22d96571fdda0a706c2fa918004ffbc960d5",
         "agents": {
           "agent_viventium_main_95aeb3": {
             "fields": {
@@ -4186,6 +3919,12 @@
               },
               "background_cortices": {
                 "$viventium_managed_sha256": "c4666618a1d88fe786ecf384bfbe57833127e81ee72d8f0c62c4062d782c05c6"
+              },
+              "voice_llm_model": {
+                "$viventium_managed_sha256": "91d796211525592a82fd9945bf5eee8520de446dfdd7ccb6c1b8003fcd5dadfc"
+              },
+              "voice_llm_model_parameters": {
+                "$viventium_managed_sha256": "4591eccff8bd715d6bf88395658dd390e254250ebe366b8f2d8ab2b34ae054c4"
               },
               "voice_fallback_llm_model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
@@ -4231,6 +3970,9 @@
           },
           "agent_viventium_confirmation_bias_95aeb3": {
             "fields": {
+              "instructions": {
+                "$viventium_managed_sha256": "3bcb5afc9ba5ab86e10bb61170afd3793eab7adac09e9a4ed5ed2e2040c29545"
+              },
               "provider": {
                 "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
@@ -4256,9 +3998,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "b1a0e290d106737df4752b8352930ed242891c1d8e67e5e68a09af4f9d082d63"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -4281,14 +4020,8 @@
           },
           "agent_viventium_deep_research_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
-              },
-              "tools": {
-                "$viventium_managed_sha256": "d2d81376dd00d899b97b9421cdb762c1060f2e2f5e409085155891d88763f3e6"
               },
               "model_parameters": {
                 "$viventium_managed_sha256": "a8b7d494673c1d23475d4d8a65b29e73c4adf81b058b0b2cecf9201aca1e6f69"
@@ -4308,9 +4041,6 @@
             "fields": {
               "instructions": {
                 "$viventium_managed_sha256": "47d118084da7e0179f47c689e50d6c39926314cc0ea9aa01745b04a600fc2c50"
-              },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
               },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
@@ -4334,9 +4064,6 @@
           },
           "agent_viventium_parietal_cortex_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -4456,9 +4183,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "15b54d6a4d0410e8dcd1188c0aebd8e73e5bbbff400db6753bde3ae7561e14c6"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -4494,7 +4218,7 @@
       "predecessor_managed_bundle_sha256": "4462537c10711e598009fb296afee361056010e91f56e73d8dd8833ac15c90d0",
       "baseline": {
         "schema_version": 1,
-        "bundle_sha256": "e62da1058aa5e1247484ea5f1909a8ec7db6c7722120d8f364e5d0507abf6593",
+        "bundle_sha256": "a01aa3fb4505e4a66985c050e0f0545f78b3c31b0422a6c6943bd0786bee5b3c",
         "agents": {
           "agent_viventium_main_95aeb3": {
             "fields": {
@@ -4516,6 +4240,12 @@
               "background_cortices": {
                 "$viventium_managed_sha256": "703947eaaa5c1356b65ef2e4848b48aa2df69dd1f4116e0133cd1dd61e12994d"
               },
+              "voice_llm_model": {
+                "$viventium_managed_sha256": "91d796211525592a82fd9945bf5eee8520de446dfdd7ccb6c1b8003fcd5dadfc"
+              },
+              "voice_llm_model_parameters": {
+                "$viventium_managed_sha256": "4591eccff8bd715d6bf88395658dd390e254250ebe366b8f2d8ab2b34ae054c4"
+              },
               "voice_fallback_llm_model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -4530,6 +4260,9 @@
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "3918ebbf899fcad82930809926c7c95539ca657356367a755a380cf6b400fb6f"
+              },
+              "edges": {
+                "$viventium_managed_sha256": "b28b705159d710499a392fb0994bc46827080db984142d3f4d7069c6615d8488"
               }
             }
           },
@@ -4557,6 +4290,9 @@
           },
           "agent_viventium_confirmation_bias_95aeb3": {
             "fields": {
+              "instructions": {
+                "$viventium_managed_sha256": "3bcb5afc9ba5ab86e10bb61170afd3793eab7adac09e9a4ed5ed2e2040c29545"
+              },
               "provider": {
                 "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
@@ -4582,9 +4318,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "b1a0e290d106737df4752b8352930ed242891c1d8e67e5e68a09af4f9d082d63"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -4607,14 +4340,8 @@
           },
           "agent_viventium_deep_research_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
-              },
-              "tools": {
-                "$viventium_managed_sha256": "d2d81376dd00d899b97b9421cdb762c1060f2e2f5e409085155891d88763f3e6"
               },
               "model_parameters": {
                 "$viventium_managed_sha256": "a8b7d494673c1d23475d4d8a65b29e73c4adf81b058b0b2cecf9201aca1e6f69"
@@ -4634,9 +4361,6 @@
             "fields": {
               "instructions": {
                 "$viventium_managed_sha256": "5fe618966e63ef0734ebb85de32379ca5fa98737a531cda33c448c6e67e1922d"
-              },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
               },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
@@ -4660,9 +4384,6 @@
           },
           "agent_viventium_parietal_cortex_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -4785,9 +4506,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "948558efaae35cec4ec4e9e22f241c7cfbc260bdebcdc2b4c731f511b3872138"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -4821,6 +4539,15 @@
               },
               "model_parameters": {
                 "$viventium_managed_sha256": "964301952bf1bc36cf3782c242245dfe1e3f4276bba0f138e94ea6f63f2fe704"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "3918ebbf899fcad82930809926c7c95539ca657356367a755a380cf6b400fb6f"
               }
             }
           }
@@ -4841,7 +4568,7 @@
       "predecessor_managed_bundle_sha256": "8ab93d90b8c36c2a30c330b771887745fa577dbb065625ccd243a7bffd2cfb51",
       "baseline": {
         "schema_version": 1,
-        "bundle_sha256": "a23cafebe1f39c75d8695e3f392de86ec7990b321e2512c556ff547e7a6d6b1c",
+        "bundle_sha256": "90cb4feb2243a38f1c04f130a8ac0e1ca3278e4f21788c0f783a2e8931ec6f02",
         "agents": {
           "agent_viventium_main_95aeb3": {
             "fields": {
@@ -4863,6 +4590,12 @@
               "background_cortices": {
                 "$viventium_managed_sha256": "c4666618a1d88fe786ecf384bfbe57833127e81ee72d8f0c62c4062d782c05c6"
               },
+              "voice_llm_model": {
+                "$viventium_managed_sha256": "91d796211525592a82fd9945bf5eee8520de446dfdd7ccb6c1b8003fcd5dadfc"
+              },
+              "voice_llm_model_parameters": {
+                "$viventium_managed_sha256": "4591eccff8bd715d6bf88395658dd390e254250ebe366b8f2d8ab2b34ae054c4"
+              },
               "voice_fallback_llm_model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -4877,6 +4610,9 @@
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "3918ebbf899fcad82930809926c7c95539ca657356367a755a380cf6b400fb6f"
+              },
+              "edges": {
+                "$viventium_managed_sha256": "b28b705159d710499a392fb0994bc46827080db984142d3f4d7069c6615d8488"
               }
             }
           },
@@ -4904,6 +4640,9 @@
           },
           "agent_viventium_confirmation_bias_95aeb3": {
             "fields": {
+              "instructions": {
+                "$viventium_managed_sha256": "3bcb5afc9ba5ab86e10bb61170afd3793eab7adac09e9a4ed5ed2e2040c29545"
+              },
               "provider": {
                 "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
@@ -4929,9 +4668,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "b1a0e290d106737df4752b8352930ed242891c1d8e67e5e68a09af4f9d082d63"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -4954,14 +4690,8 @@
           },
           "agent_viventium_deep_research_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
-              },
-              "tools": {
-                "$viventium_managed_sha256": "d2d81376dd00d899b97b9421cdb762c1060f2e2f5e409085155891d88763f3e6"
               },
               "model_parameters": {
                 "$viventium_managed_sha256": "a8b7d494673c1d23475d4d8a65b29e73c4adf81b058b0b2cecf9201aca1e6f69"
@@ -4981,9 +4711,6 @@
             "fields": {
               "instructions": {
                 "$viventium_managed_sha256": "5fe618966e63ef0734ebb85de32379ca5fa98737a531cda33c448c6e67e1922d"
-              },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
               },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
@@ -5007,9 +4734,6 @@
           },
           "agent_viventium_parietal_cortex_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -5132,9 +4856,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "948558efaae35cec4ec4e9e22f241c7cfbc260bdebcdc2b4c731f511b3872138"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -5168,6 +4889,15 @@
               },
               "model_parameters": {
                 "$viventium_managed_sha256": "964301952bf1bc36cf3782c242245dfe1e3f4276bba0f138e94ea6f63f2fe704"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "3918ebbf899fcad82930809926c7c95539ca657356367a755a380cf6b400fb6f"
               }
             }
           }
@@ -5183,7 +4913,7 @@
       "predecessor_managed_bundle_sha256": "69949e54350f3568fada2d350fb36fd13a5d2b79ca071825c69e8f3f69bad861",
       "baseline": {
         "schema_version": 1,
-        "bundle_sha256": "e69a720f5d1f164738dc17be533809bfa4a6f9add8f3e02f9b530a1310306fe9",
+        "bundle_sha256": "4e5c0454074509057f72bf95216f1a2ed2e9f122f68f6ae8c7415b635a215aa5",
         "agents": {
           "agent_viventium_main_95aeb3": {
             "fields": {
@@ -5205,6 +4935,12 @@
               "background_cortices": {
                 "$viventium_managed_sha256": "c4666618a1d88fe786ecf384bfbe57833127e81ee72d8f0c62c4062d782c05c6"
               },
+              "voice_llm_model": {
+                "$viventium_managed_sha256": "91d796211525592a82fd9945bf5eee8520de446dfdd7ccb6c1b8003fcd5dadfc"
+              },
+              "voice_llm_model_parameters": {
+                "$viventium_managed_sha256": "4591eccff8bd715d6bf88395658dd390e254250ebe366b8f2d8ab2b34ae054c4"
+              },
               "voice_fallback_llm_model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -5219,6 +4955,9 @@
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "3918ebbf899fcad82930809926c7c95539ca657356367a755a380cf6b400fb6f"
+              },
+              "edges": {
+                "$viventium_managed_sha256": "b28b705159d710499a392fb0994bc46827080db984142d3f4d7069c6615d8488"
               }
             }
           },
@@ -5246,6 +4985,9 @@
           },
           "agent_viventium_confirmation_bias_95aeb3": {
             "fields": {
+              "instructions": {
+                "$viventium_managed_sha256": "3bcb5afc9ba5ab86e10bb61170afd3793eab7adac09e9a4ed5ed2e2040c29545"
+              },
               "provider": {
                 "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
@@ -5271,9 +5013,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "b1a0e290d106737df4752b8352930ed242891c1d8e67e5e68a09af4f9d082d63"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -5296,14 +5035,8 @@
           },
           "agent_viventium_deep_research_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
-              },
-              "tools": {
-                "$viventium_managed_sha256": "d2d81376dd00d899b97b9421cdb762c1060f2e2f5e409085155891d88763f3e6"
               },
               "model_parameters": {
                 "$viventium_managed_sha256": "a8b7d494673c1d23475d4d8a65b29e73c4adf81b058b0b2cecf9201aca1e6f69"
@@ -5323,9 +5056,6 @@
             "fields": {
               "instructions": {
                 "$viventium_managed_sha256": "5fe618966e63ef0734ebb85de32379ca5fa98737a531cda33c448c6e67e1922d"
-              },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
               },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
@@ -5349,9 +5079,6 @@
           },
           "agent_viventium_parietal_cortex_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -5474,9 +5201,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "948558efaae35cec4ec4e9e22f241c7cfbc260bdebcdc2b4c731f511b3872138"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -5510,6 +5234,15 @@
               },
               "model_parameters": {
                 "$viventium_managed_sha256": "964301952bf1bc36cf3782c242245dfe1e3f4276bba0f138e94ea6f63f2fe704"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "3918ebbf899fcad82930809926c7c95539ca657356367a755a380cf6b400fb6f"
               }
             }
           }
@@ -5527,7 +5260,7 @@
       "predecessor_managed_bundle_sha256": "145816b150f579801c1288362e728de0c99873b2756433a1835e5aab206a6ab8",
       "baseline": {
         "schema_version": 1,
-        "bundle_sha256": "835a87e108706e428a50df28a00712f012bac7e9e076e044cf727e3e907b687f",
+        "bundle_sha256": "58981eef7aaf268c64e849144f2ba2ad5d366aada5b5cde2cee0ce8f5ad6fe23",
         "agents": {
           "agent_viventium_main_95aeb3": {
             "fields": {
@@ -5549,6 +5282,12 @@
               "background_cortices": {
                 "$viventium_managed_sha256": "703947eaaa5c1356b65ef2e4848b48aa2df69dd1f4116e0133cd1dd61e12994d"
               },
+              "voice_llm_model": {
+                "$viventium_managed_sha256": "91d796211525592a82fd9945bf5eee8520de446dfdd7ccb6c1b8003fcd5dadfc"
+              },
+              "voice_llm_model_parameters": {
+                "$viventium_managed_sha256": "4591eccff8bd715d6bf88395658dd390e254250ebe366b8f2d8ab2b34ae054c4"
+              },
               "voice_fallback_llm_model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -5563,6 +5302,9 @@
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "3918ebbf899fcad82930809926c7c95539ca657356367a755a380cf6b400fb6f"
+              },
+              "edges": {
+                "$viventium_managed_sha256": "b28b705159d710499a392fb0994bc46827080db984142d3f4d7069c6615d8488"
               }
             }
           },
@@ -5590,6 +5332,9 @@
           },
           "agent_viventium_confirmation_bias_95aeb3": {
             "fields": {
+              "instructions": {
+                "$viventium_managed_sha256": "3bcb5afc9ba5ab86e10bb61170afd3793eab7adac09e9a4ed5ed2e2040c29545"
+              },
               "provider": {
                 "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
@@ -5615,9 +5360,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "b1a0e290d106737df4752b8352930ed242891c1d8e67e5e68a09af4f9d082d63"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -5640,14 +5382,8 @@
           },
           "agent_viventium_deep_research_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
-              },
-              "tools": {
-                "$viventium_managed_sha256": "d2d81376dd00d899b97b9421cdb762c1060f2e2f5e409085155891d88763f3e6"
               },
               "model_parameters": {
                 "$viventium_managed_sha256": "a8b7d494673c1d23475d4d8a65b29e73c4adf81b058b0b2cecf9201aca1e6f69"
@@ -5667,9 +5403,6 @@
             "fields": {
               "instructions": {
                 "$viventium_managed_sha256": "5fe618966e63ef0734ebb85de32379ca5fa98737a531cda33c448c6e67e1922d"
-              },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
               },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
@@ -5693,9 +5426,6 @@
           },
           "agent_viventium_parietal_cortex_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -5818,9 +5548,6 @@
               "instructions": {
                 "$viventium_managed_sha256": "948558efaae35cec4ec4e9e22f241c7cfbc260bdebcdc2b4c731f511b3872138"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
               "model": {
                 "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
               },
@@ -5854,6 +5581,15 @@
               },
               "model_parameters": {
                 "$viventium_managed_sha256": "964301952bf1bc36cf3782c242245dfe1e3f4276bba0f138e94ea6f63f2fe704"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "3918ebbf899fcad82930809926c7c95539ca657356367a755a380cf6b400fb6f"
               }
             }
           }
@@ -5871,7 +5607,7 @@
       "predecessor_managed_bundle_sha256": "89a203977a2d8dfea9fe22887ad77bdf34c0de6291917ebcf3feca92ec1fb10c",
       "baseline": {
         "schema_version": 1,
-        "bundle_sha256": "b0d0fb6cc64e1eb5d06cd8acb4bc8e17e25a9048e782b56872f7ba1253b6dd13",
+        "bundle_sha256": "318e0c873cc233c7685ea40e6a7cf06e19f3cdbfe631735b6f74ded762876ffa",
         "agents": {
           "agent_viventium_main_95aeb3": {
             "fields": {
@@ -5893,27 +5629,33 @@
               "background_cortices": {
                 "$viventium_managed_sha256": "0e5118a4d731390afe76745c03edcff36d00aec7bd8626cc4f7d336df1ec06ce"
               },
+              "voice_llm_model": {
+                "$viventium_managed_sha256": "91d796211525592a82fd9945bf5eee8520de446dfdd7ccb6c1b8003fcd5dadfc"
+              },
+              "voice_llm_model_parameters": {
+                "$viventium_managed_sha256": "4591eccff8bd715d6bf88395658dd390e254250ebe366b8f2d8ab2b34ae054c4"
+              },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
               },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "71f19b3a9af22a042aeacefedac4ca7d868ed5ee558924f0ebb045e9931e8678"
+              },
+              "edges": {
+                "$viventium_managed_sha256": "b28b705159d710499a392fb0994bc46827080db984142d3f4d7069c6615d8488"
               }
             }
           },
           "agent_viventium_background_analysis_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
-              },
-              "model_parameters": {
-                "$viventium_managed_sha256": "6f6718b1d7f3ad90050aee3adbb8ca469c7ee02f55b2752a646f4754aaa2c5fb"
-              },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "71f19b3a9af22a042aeacefedac4ca7d868ed5ee558924f0ebb045e9931e8678"
@@ -5922,17 +5664,14 @@
           },
           "agent_viventium_confirmation_bias_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
-              },
-              "model_parameters": {
-                "$viventium_managed_sha256": "6f6718b1d7f3ad90050aee3adbb8ca469c7ee02f55b2752a646f4754aaa2c5fb"
+              "instructions": {
+                "$viventium_managed_sha256": "3bcb5afc9ba5ab86e10bb61170afd3793eab7adac09e9a4ed5ed2e2040c29545"
               },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "71f19b3a9af22a042aeacefedac4ca7d868ed5ee558924f0ebb045e9931e8678"
@@ -5944,17 +5683,14 @@
               "instructions": {
                 "$viventium_managed_sha256": "aa9e26348ced4a9c4bf6b9b81c23084ff37eced37bf7ec26385a4828b1a518a9"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "cfaff7a01583ab1171b19140263fddfe86a812686ce572fcebd6cd934d3fb871"
-              },
               "model_parameters": {
                 "$viventium_managed_sha256": "1f64d66f67793abc3d0ee9ae263209ada7c4fabbe33a968273795513d8954e48"
               },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "8070959139694c24167874b2c592204b81c272fb4a1ce4c8d1b6f9ab5ef36fa1"
@@ -5963,17 +5699,14 @@
           },
           "agent_viventium_deep_research_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "cfaff7a01583ab1171b19140263fddfe86a812686ce572fcebd6cd934d3fb871"
-              },
-              "model_parameters": {
-                "$viventium_managed_sha256": "1f64d66f67793abc3d0ee9ae263209ada7c4fabbe33a968273795513d8954e48"
+              "tools": {
+                "$viventium_managed_sha256": "c8e09f43858ba94072a5a0256c6cc4a929c031be24da9404f4bfe077b23b975a"
               },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "8070959139694c24167874b2c592204b81c272fb4a1ce4c8d1b6f9ab5ef36fa1"
@@ -5985,17 +5718,11 @@
               "instructions": {
                 "$viventium_managed_sha256": "5fe618966e63ef0734ebb85de32379ca5fa98737a531cda33c448c6e67e1922d"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
-              },
-              "model_parameters": {
-                "$viventium_managed_sha256": "35ff66d8dd6e91f7f20cf46087665f22bef24afe91f4a3a03b6879fc82be92e6"
-              },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "71f19b3a9af22a042aeacefedac4ca7d868ed5ee558924f0ebb045e9931e8678"
@@ -6004,17 +5731,11 @@
           },
           "agent_viventium_parietal_cortex_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
-              },
-              "model_parameters": {
-                "$viventium_managed_sha256": "6f6718b1d7f3ad90050aee3adbb8ca469c7ee02f55b2752a646f4754aaa2c5fb"
-              },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "71f19b3a9af22a042aeacefedac4ca7d868ed5ee558924f0ebb045e9931e8678"
@@ -6023,17 +5744,11 @@
           },
           "agent_viventium_pattern_recognition_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
-              },
-              "model_parameters": {
-                "$viventium_managed_sha256": "6f6718b1d7f3ad90050aee3adbb8ca469c7ee02f55b2752a646f4754aaa2c5fb"
-              },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "71f19b3a9af22a042aeacefedac4ca7d868ed5ee558924f0ebb045e9931e8678"
@@ -6045,17 +5760,11 @@
               "instructions": {
                 "$viventium_managed_sha256": "891d8ed9abcbbb84ac56607c5ea4112e8396814f117f94922d3418b3b954900e"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
-              },
-              "model_parameters": {
-                "$viventium_managed_sha256": "35ff66d8dd6e91f7f20cf46087665f22bef24afe91f4a3a03b6879fc82be92e6"
-              },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "71f19b3a9af22a042aeacefedac4ca7d868ed5ee558924f0ebb045e9931e8678"
@@ -6064,17 +5773,11 @@
           },
           "agent_viventium_strategic_planning_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "cfaff7a01583ab1171b19140263fddfe86a812686ce572fcebd6cd934d3fb871"
-              },
-              "model_parameters": {
-                "$viventium_managed_sha256": "a3fd044077a4252ea66f65c0ac196391e98a89ae2eb60fa8e637a1edb10c1321"
-              },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "e5ff1a3cafff328a6b7f1172ede4c3034cee30dc53ec523b60da3e6aea727936"
@@ -6086,17 +5789,11 @@
               "instructions": {
                 "$viventium_managed_sha256": "851a97dbc06368be8f631cc18206139101c01968a68ceaa63756db56e4b1235c"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
-              },
-              "model_parameters": {
-                "$viventium_managed_sha256": "35ff66d8dd6e91f7f20cf46087665f22bef24afe91f4a3a03b6879fc82be92e6"
-              },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "71f19b3a9af22a042aeacefedac4ca7d868ed5ee558924f0ebb045e9931e8678"
@@ -6108,17 +5805,11 @@
               "instructions": {
                 "$viventium_managed_sha256": "948558efaae35cec4ec4e9e22f241c7cfbc260bdebcdc2b4c731f511b3872138"
               },
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
-              },
-              "model_parameters": {
-                "$viventium_managed_sha256": "35ff66d8dd6e91f7f20cf46087665f22bef24afe91f4a3a03b6879fc82be92e6"
-              },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "71f19b3a9af22a042aeacefedac4ca7d868ed5ee558924f0ebb045e9931e8678"
@@ -6138,6 +5829,15 @@
               },
               "model_parameters": {
                 "$viventium_managed_sha256": "964301952bf1bc36cf3782c242245dfe1e3f4276bba0f138e94ea6f63f2fe704"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "3918ebbf899fcad82930809926c7c95539ca657356367a755a380cf6b400fb6f"
               }
             }
           }
@@ -6156,7 +5856,7 @@
       "predecessor_managed_bundle_sha256": "b819fe544f7cd8816b7c6dafca7b385397b4cebf3cec4271eb78229330975cd7",
       "baseline": {
         "schema_version": 1,
-        "bundle_sha256": "6139ff0bcb7606acc29302bf2f94611bc7fd7ee8724bed25dfc3c1ebc3b64dc1",
+        "bundle_sha256": "c8d0b3cf8ed9d69e0a1707b155a8183acd7b687abc7a9fac52096b74b76de674",
         "agents": {
           "agent_viventium_main_95aeb3": {
             "fields": {
@@ -6175,27 +5875,36 @@
               "model_parameters": {
                 "$viventium_managed_sha256": "8ebb72f2d3b8dc15cdc103150a41baa85cab81840918cd75552f54e69851ea60"
               },
+              "background_cortices": {
+                "$viventium_managed_sha256": "af65c093737b63a8cf2472d260649c89fea8bf6778ba3e915df690304ad37bd0"
+              },
+              "voice_llm_model": {
+                "$viventium_managed_sha256": "91d796211525592a82fd9945bf5eee8520de446dfdd7ccb6c1b8003fcd5dadfc"
+              },
+              "voice_llm_model_parameters": {
+                "$viventium_managed_sha256": "4591eccff8bd715d6bf88395658dd390e254250ebe366b8f2d8ab2b34ae054c4"
+              },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
               },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "71f19b3a9af22a042aeacefedac4ca7d868ed5ee558924f0ebb045e9931e8678"
+              },
+              "edges": {
+                "$viventium_managed_sha256": "b28b705159d710499a392fb0994bc46827080db984142d3f4d7069c6615d8488"
               }
             }
           },
           "agent_viventium_background_analysis_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
-              },
-              "model_parameters": {
-                "$viventium_managed_sha256": "6f6718b1d7f3ad90050aee3adbb8ca469c7ee02f55b2752a646f4754aaa2c5fb"
-              },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "71f19b3a9af22a042aeacefedac4ca7d868ed5ee558924f0ebb045e9931e8678"
@@ -6204,17 +5913,14 @@
           },
           "agent_viventium_confirmation_bias_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
-              },
-              "model_parameters": {
-                "$viventium_managed_sha256": "6f6718b1d7f3ad90050aee3adbb8ca469c7ee02f55b2752a646f4754aaa2c5fb"
+              "instructions": {
+                "$viventium_managed_sha256": "3bcb5afc9ba5ab86e10bb61170afd3793eab7adac09e9a4ed5ed2e2040c29545"
               },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "71f19b3a9af22a042aeacefedac4ca7d868ed5ee558924f0ebb045e9931e8678"
@@ -6223,17 +5929,17 @@
           },
           "agent_viventium_red_team_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "cfaff7a01583ab1171b19140263fddfe86a812686ce572fcebd6cd934d3fb871"
+              "instructions": {
+                "$viventium_managed_sha256": "6303f1ff2eadd2f4721597a0ff91863440129d93e9f94c1402d13ccf2a95d093"
               },
               "model_parameters": {
                 "$viventium_managed_sha256": "1f64d66f67793abc3d0ee9ae263209ada7c4fabbe33a968273795513d8954e48"
               },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "8070959139694c24167874b2c592204b81c272fb4a1ce4c8d1b6f9ab5ef36fa1"
@@ -6242,17 +5948,14 @@
           },
           "agent_viventium_deep_research_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "cfaff7a01583ab1171b19140263fddfe86a812686ce572fcebd6cd934d3fb871"
-              },
-              "model_parameters": {
-                "$viventium_managed_sha256": "1f64d66f67793abc3d0ee9ae263209ada7c4fabbe33a968273795513d8954e48"
+              "tools": {
+                "$viventium_managed_sha256": "c8e09f43858ba94072a5a0256c6cc4a929c031be24da9404f4bfe077b23b975a"
               },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "8070959139694c24167874b2c592204b81c272fb4a1ce4c8d1b6f9ab5ef36fa1"
@@ -6261,17 +5964,11 @@
           },
           "agent_viventium_online_tool_use_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
-              },
-              "model_parameters": {
-                "$viventium_managed_sha256": "35ff66d8dd6e91f7f20cf46087665f22bef24afe91f4a3a03b6879fc82be92e6"
-              },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "71f19b3a9af22a042aeacefedac4ca7d868ed5ee558924f0ebb045e9931e8678"
@@ -6280,17 +5977,11 @@
           },
           "agent_viventium_parietal_cortex_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
-              },
-              "model_parameters": {
-                "$viventium_managed_sha256": "6f6718b1d7f3ad90050aee3adbb8ca469c7ee02f55b2752a646f4754aaa2c5fb"
-              },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "71f19b3a9af22a042aeacefedac4ca7d868ed5ee558924f0ebb045e9931e8678"
@@ -6299,17 +5990,11 @@
           },
           "agent_viventium_pattern_recognition_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
-              },
-              "model_parameters": {
-                "$viventium_managed_sha256": "6f6718b1d7f3ad90050aee3adbb8ca469c7ee02f55b2752a646f4754aaa2c5fb"
-              },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "71f19b3a9af22a042aeacefedac4ca7d868ed5ee558924f0ebb045e9931e8678"
@@ -6318,17 +6003,11 @@
           },
           "agent_viventium_emotional_resonance_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
-              },
-              "model_parameters": {
-                "$viventium_managed_sha256": "35ff66d8dd6e91f7f20cf46087665f22bef24afe91f4a3a03b6879fc82be92e6"
-              },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "71f19b3a9af22a042aeacefedac4ca7d868ed5ee558924f0ebb045e9931e8678"
@@ -6337,17 +6016,11 @@
           },
           "agent_viventium_strategic_planning_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "cfaff7a01583ab1171b19140263fddfe86a812686ce572fcebd6cd934d3fb871"
-              },
-              "model_parameters": {
-                "$viventium_managed_sha256": "a3fd044077a4252ea66f65c0ac196391e98a89ae2eb60fa8e637a1edb10c1321"
-              },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "e5ff1a3cafff328a6b7f1172ede4c3034cee30dc53ec523b60da3e6aea727936"
@@ -6356,17 +6029,11 @@
           },
           "agent_viventium_support_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
-              },
-              "model_parameters": {
-                "$viventium_managed_sha256": "35ff66d8dd6e91f7f20cf46087665f22bef24afe91f4a3a03b6879fc82be92e6"
-              },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "71f19b3a9af22a042aeacefedac4ca7d868ed5ee558924f0ebb045e9931e8678"
@@ -6375,17 +6042,11 @@
           },
           "agent_8Y1d7JNhpubtvzYz3hvEv": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
-              },
-              "model_parameters": {
-                "$viventium_managed_sha256": "35ff66d8dd6e91f7f20cf46087665f22bef24afe91f4a3a03b6879fc82be92e6"
-              },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "71f19b3a9af22a042aeacefedac4ca7d868ed5ee558924f0ebb045e9931e8678"
@@ -6405,6 +6066,15 @@
               },
               "model_parameters": {
                 "$viventium_managed_sha256": "964301952bf1bc36cf3782c242245dfe1e3f4276bba0f138e94ea6f63f2fe704"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "3918ebbf899fcad82930809926c7c95539ca657356367a755a380cf6b400fb6f"
               }
             }
           }
@@ -6420,7 +6090,7 @@
       "predecessor_managed_bundle_sha256": "b0a8bc0ee0d3f1068140d94a68c6ebcda79868dad479d187f23ac2c301017098",
       "baseline": {
         "schema_version": 1,
-        "bundle_sha256": "ece6dcd85e526fbbe291de2f5b8a3b8d6ca86ea6cbd3a8834427fc3309dbe35d",
+        "bundle_sha256": "8409375aef12e667b0b3c5fd4edc8178338b2a02f1d6e92ddc2f84db6b8e7068",
         "agents": {
           "agent_viventium_main_95aeb3": {
             "fields": {
@@ -6433,30 +6103,42 @@
               "model": {
                 "$viventium_managed_sha256": "cfaff7a01583ab1171b19140263fddfe86a812686ce572fcebd6cd934d3fb871"
               },
+              "tools": {
+                "$viventium_managed_sha256": "bf1cbbcd053845a14df6547a48fcc45f1e2154ca6f43cb82b993c5d04be0a661"
+              },
               "model_parameters": {
                 "$viventium_managed_sha256": "8ebb72f2d3b8dc15cdc103150a41baa85cab81840918cd75552f54e69851ea60"
+              },
+              "background_cortices": {
+                "$viventium_managed_sha256": "af65c093737b63a8cf2472d260649c89fea8bf6778ba3e915df690304ad37bd0"
+              },
+              "voice_llm_model": {
+                "$viventium_managed_sha256": "91d796211525592a82fd9945bf5eee8520de446dfdd7ccb6c1b8003fcd5dadfc"
+              },
+              "voice_llm_model_parameters": {
+                "$viventium_managed_sha256": "4591eccff8bd715d6bf88395658dd390e254250ebe366b8f2d8ab2b34ae054c4"
               },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
               },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "71f19b3a9af22a042aeacefedac4ca7d868ed5ee558924f0ebb045e9931e8678"
+              },
+              "edges": {
+                "$viventium_managed_sha256": "b28b705159d710499a392fb0994bc46827080db984142d3f4d7069c6615d8488"
               }
             }
           },
           "agent_viventium_background_analysis_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
-              },
-              "model_parameters": {
-                "$viventium_managed_sha256": "6f6718b1d7f3ad90050aee3adbb8ca469c7ee02f55b2752a646f4754aaa2c5fb"
-              },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "71f19b3a9af22a042aeacefedac4ca7d868ed5ee558924f0ebb045e9931e8678"
@@ -6465,17 +6147,14 @@
           },
           "agent_viventium_confirmation_bias_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
-              },
-              "model_parameters": {
-                "$viventium_managed_sha256": "6f6718b1d7f3ad90050aee3adbb8ca469c7ee02f55b2752a646f4754aaa2c5fb"
+              "instructions": {
+                "$viventium_managed_sha256": "3bcb5afc9ba5ab86e10bb61170afd3793eab7adac09e9a4ed5ed2e2040c29545"
               },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "71f19b3a9af22a042aeacefedac4ca7d868ed5ee558924f0ebb045e9931e8678"
@@ -6484,17 +6163,17 @@
           },
           "agent_viventium_red_team_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "cfaff7a01583ab1171b19140263fddfe86a812686ce572fcebd6cd934d3fb871"
+              "instructions": {
+                "$viventium_managed_sha256": "6303f1ff2eadd2f4721597a0ff91863440129d93e9f94c1402d13ccf2a95d093"
               },
               "model_parameters": {
                 "$viventium_managed_sha256": "1f64d66f67793abc3d0ee9ae263209ada7c4fabbe33a968273795513d8954e48"
               },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "8070959139694c24167874b2c592204b81c272fb4a1ce4c8d1b6f9ab5ef36fa1"
@@ -6503,17 +6182,14 @@
           },
           "agent_viventium_deep_research_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "cfaff7a01583ab1171b19140263fddfe86a812686ce572fcebd6cd934d3fb871"
-              },
-              "model_parameters": {
-                "$viventium_managed_sha256": "1f64d66f67793abc3d0ee9ae263209ada7c4fabbe33a968273795513d8954e48"
+              "tools": {
+                "$viventium_managed_sha256": "c8e09f43858ba94072a5a0256c6cc4a929c031be24da9404f4bfe077b23b975a"
               },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "8070959139694c24167874b2c592204b81c272fb4a1ce4c8d1b6f9ab5ef36fa1"
@@ -6522,17 +6198,11 @@
           },
           "agent_viventium_online_tool_use_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
-              },
-              "model_parameters": {
-                "$viventium_managed_sha256": "35ff66d8dd6e91f7f20cf46087665f22bef24afe91f4a3a03b6879fc82be92e6"
-              },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "71f19b3a9af22a042aeacefedac4ca7d868ed5ee558924f0ebb045e9931e8678"
@@ -6541,17 +6211,11 @@
           },
           "agent_viventium_parietal_cortex_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
-              },
-              "model_parameters": {
-                "$viventium_managed_sha256": "6f6718b1d7f3ad90050aee3adbb8ca469c7ee02f55b2752a646f4754aaa2c5fb"
-              },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "71f19b3a9af22a042aeacefedac4ca7d868ed5ee558924f0ebb045e9931e8678"
@@ -6560,17 +6224,11 @@
           },
           "agent_viventium_pattern_recognition_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
-              },
-              "model_parameters": {
-                "$viventium_managed_sha256": "6f6718b1d7f3ad90050aee3adbb8ca469c7ee02f55b2752a646f4754aaa2c5fb"
-              },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "71f19b3a9af22a042aeacefedac4ca7d868ed5ee558924f0ebb045e9931e8678"
@@ -6579,17 +6237,11 @@
           },
           "agent_viventium_emotional_resonance_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
-              },
-              "model_parameters": {
-                "$viventium_managed_sha256": "35ff66d8dd6e91f7f20cf46087665f22bef24afe91f4a3a03b6879fc82be92e6"
-              },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "71f19b3a9af22a042aeacefedac4ca7d868ed5ee558924f0ebb045e9931e8678"
@@ -6598,17 +6250,11 @@
           },
           "agent_viventium_strategic_planning_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "cfaff7a01583ab1171b19140263fddfe86a812686ce572fcebd6cd934d3fb871"
-              },
-              "model_parameters": {
-                "$viventium_managed_sha256": "a3fd044077a4252ea66f65c0ac196391e98a89ae2eb60fa8e637a1edb10c1321"
-              },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "e5ff1a3cafff328a6b7f1172ede4c3034cee30dc53ec523b60da3e6aea727936"
@@ -6617,17 +6263,11 @@
           },
           "agent_viventium_support_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
-              },
-              "model_parameters": {
-                "$viventium_managed_sha256": "35ff66d8dd6e91f7f20cf46087665f22bef24afe91f4a3a03b6879fc82be92e6"
-              },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "71f19b3a9af22a042aeacefedac4ca7d868ed5ee558924f0ebb045e9931e8678"
@@ -6636,17 +6276,11 @@
           },
           "agent_8Y1d7JNhpubtvzYz3hvEv": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
-              },
-              "model_parameters": {
-                "$viventium_managed_sha256": "35ff66d8dd6e91f7f20cf46087665f22bef24afe91f4a3a03b6879fc82be92e6"
-              },
               "fallback_llm_model": {
                 "$viventium_managed_sha256": "1dd2d2c2c192890034b69f515dde98792d98b514c0656bcc806a6e58a61c8797"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
               "fallback_llm_model_parameters": {
                 "$viventium_managed_sha256": "71f19b3a9af22a042aeacefedac4ca7d868ed5ee558924f0ebb045e9931e8678"
@@ -6666,6 +6300,15 @@
               },
               "model_parameters": {
                 "$viventium_managed_sha256": "964301952bf1bc36cf3782c242245dfe1e3f4276bba0f138e94ea6f63f2fe704"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "3918ebbf899fcad82930809926c7c95539ca657356367a755a380cf6b400fb6f"
               }
             }
           }
@@ -6687,155 +6330,191 @@
       "predecessor_managed_bundle_sha256": "c47acad97a8e0851c80bd91ba69550063f7ab8ea8d02a27b30f65bd7aa28eef5",
       "baseline": {
         "schema_version": 1,
-        "bundle_sha256": "29c31aa621cdc0d201e9476fe172e4571b49d09c797de930ecc83a0e0c6b1aad",
+        "bundle_sha256": "d073af826578cb68de4f5f1d0be682428ffe7288fbaf61b2c42c498c112383a6",
         "agents": {
           "agent_viventium_main_95aeb3": {
             "fields": {
               "instructions": {
                 "$viventium_managed_sha256": "148734c8d2d0d222c0b868c713080b909e3ae175fae635fb5e65ef6b2ae6622e"
+              },
+              "tools": {
+                "$viventium_managed_sha256": "bf1cbbcd053845a14df6547a48fcc45f1e2154ca6f43cb82b993c5d04be0a661"
+              },
+              "background_cortices": {
+                "$viventium_managed_sha256": "af65c093737b63a8cf2472d260649c89fea8bf6778ba3e915df690304ad37bd0"
+              },
+              "voice_llm_model": {
+                "$viventium_managed_sha256": "91d796211525592a82fd9945bf5eee8520de446dfdd7ccb6c1b8003fcd5dadfc"
+              },
+              "voice_llm_model_parameters": {
+                "$viventium_managed_sha256": "4591eccff8bd715d6bf88395658dd390e254250ebe366b8f2d8ab2b34ae054c4"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
+              },
+              "edges": {
+                "$viventium_managed_sha256": "b28b705159d710499a392fb0994bc46827080db984142d3f4d7069c6615d8488"
               }
             }
           },
           "agent_viventium_background_analysis_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
               },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
-              "model_parameters": {
-                "$viventium_managed_sha256": "6f6718b1d7f3ad90050aee3adbb8ca469c7ee02f55b2752a646f4754aaa2c5fb"
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
               }
             }
           },
           "agent_viventium_confirmation_bias_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
+              "instructions": {
+                "$viventium_managed_sha256": "3bcb5afc9ba5ab86e10bb61170afd3793eab7adac09e9a4ed5ed2e2040c29545"
               },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
               },
-              "model_parameters": {
-                "$viventium_managed_sha256": "6f6718b1d7f3ad90050aee3adbb8ca469c7ee02f55b2752a646f4754aaa2c5fb"
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
               }
             }
           },
           "agent_viventium_red_team_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
-              },
-              "model": {
-                "$viventium_managed_sha256": "cfaff7a01583ab1171b19140263fddfe86a812686ce572fcebd6cd934d3fb871"
+              "instructions": {
+                "$viventium_managed_sha256": "6303f1ff2eadd2f4721597a0ff91863440129d93e9f94c1402d13ccf2a95d093"
               },
               "model_parameters": {
                 "$viventium_managed_sha256": "1f64d66f67793abc3d0ee9ae263209ada7c4fabbe33a968273795513d8954e48"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "5b67d19da2b22322c357f711f906c1dabbc203b3bc38bf9756d08c57c613d66c"
               }
             }
           },
           "agent_viventium_deep_research_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
+              "tools": {
+                "$viventium_managed_sha256": "c8e09f43858ba94072a5a0256c6cc4a929c031be24da9404f4bfe077b23b975a"
               },
-              "model": {
-                "$viventium_managed_sha256": "cfaff7a01583ab1171b19140263fddfe86a812686ce572fcebd6cd934d3fb871"
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
               },
-              "model_parameters": {
-                "$viventium_managed_sha256": "1f64d66f67793abc3d0ee9ae263209ada7c4fabbe33a968273795513d8954e48"
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "5b67d19da2b22322c357f711f906c1dabbc203b3bc38bf9756d08c57c613d66c"
               }
             }
           },
           "agent_viventium_online_tool_use_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
               },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
-              "model_parameters": {
-                "$viventium_managed_sha256": "35ff66d8dd6e91f7f20cf46087665f22bef24afe91f4a3a03b6879fc82be92e6"
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
               }
             }
           },
           "agent_viventium_parietal_cortex_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
               },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
-              "model_parameters": {
-                "$viventium_managed_sha256": "6f6718b1d7f3ad90050aee3adbb8ca469c7ee02f55b2752a646f4754aaa2c5fb"
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
               }
             }
           },
           "agent_viventium_pattern_recognition_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
               },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
-              "model_parameters": {
-                "$viventium_managed_sha256": "6f6718b1d7f3ad90050aee3adbb8ca469c7ee02f55b2752a646f4754aaa2c5fb"
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
               }
             }
           },
           "agent_viventium_emotional_resonance_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
               },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
-              "model_parameters": {
-                "$viventium_managed_sha256": "35ff66d8dd6e91f7f20cf46087665f22bef24afe91f4a3a03b6879fc82be92e6"
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
               }
             }
           },
           "agent_viventium_strategic_planning_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
               },
-              "model": {
-                "$viventium_managed_sha256": "cfaff7a01583ab1171b19140263fddfe86a812686ce572fcebd6cd934d3fb871"
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
-              "model_parameters": {
-                "$viventium_managed_sha256": "a3fd044077a4252ea66f65c0ac196391e98a89ae2eb60fa8e637a1edb10c1321"
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "29b26b176d25e769c270b48f49e44040e8216f4a89694df5b58ebee9f400cfad"
               }
             }
           },
           "agent_viventium_support_95aeb3": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
               },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
-              "model_parameters": {
-                "$viventium_managed_sha256": "35ff66d8dd6e91f7f20cf46087665f22bef24afe91f4a3a03b6879fc82be92e6"
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
               }
             }
           },
           "agent_8Y1d7JNhpubtvzYz3hvEv": {
             "fields": {
-              "provider": {
-                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
               },
-              "model": {
-                "$viventium_managed_sha256": "e9c378cdfac9f5fbc7814a1f8483b0e12447b876990893757c5d1709b3fad52c"
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
               },
-              "model_parameters": {
-                "$viventium_managed_sha256": "35ff66d8dd6e91f7f20cf46087665f22bef24afe91f4a3a03b6879fc82be92e6"
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
               }
             }
           },
@@ -6846,6 +6525,15 @@
               },
               "tools": {
                 "$viventium_managed_sha256": "461e409875205d1e5b8a9f6c32c51368a407bf86e7141e9fcf20d75ad189a0b5"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "3918ebbf899fcad82930809926c7c95539ca657356367a755a380cf6b400fb6f"
               }
             }
           }
@@ -6861,19 +6549,287 @@
       "predecessor_managed_bundle_sha256": "5dd3fe879cdac3bbbffdfe110b1d8cd1d3489ba3fb781e951b951b33027ecfd9",
       "baseline": {
         "schema_version": 1,
-        "bundle_sha256": "18f8bd5de79b381eb70392cbafd5343fb4285a78d2b3701e87bea26cda1340d9",
+        "bundle_sha256": "4fb0a60051e034c9dcd96692c4e28c434b9e3efa0e55467dcac13a0c10efd95a",
         "agents": {
           "agent_viventium_main_95aeb3": {
             "fields": {
               "instructions": {
                 "$viventium_managed_sha256": "148734c8d2d0d222c0b868c713080b909e3ae175fae635fb5e65ef6b2ae6622e"
+              },
+              "tools": {
+                "$viventium_managed_sha256": "bf1cbbcd053845a14df6547a48fcc45f1e2154ca6f43cb82b993c5d04be0a661"
+              },
+              "background_cortices": {
+                "$viventium_managed_sha256": "af65c093737b63a8cf2472d260649c89fea8bf6778ba3e915df690304ad37bd0"
+              },
+              "voice_llm_model": {
+                "$viventium_managed_sha256": "91d796211525592a82fd9945bf5eee8520de446dfdd7ccb6c1b8003fcd5dadfc"
+              },
+              "voice_llm_model_parameters": {
+                "$viventium_managed_sha256": "4591eccff8bd715d6bf88395658dd390e254250ebe366b8f2d8ab2b34ae054c4"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
+              },
+              "edges": {
+                "$viventium_managed_sha256": "b28b705159d710499a392fb0994bc46827080db984142d3f4d7069c6615d8488"
+              }
+            }
+          },
+          "agent_viventium_background_analysis_95aeb3": {
+            "fields": {
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "2cfa21f7211e4550fe78c61e6268a6c4515d70b514c8767a0e8dc2dec2e2e761"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
+              }
+            }
+          },
+          "agent_viventium_confirmation_bias_95aeb3": {
+            "fields": {
+              "instructions": {
+                "$viventium_managed_sha256": "3bcb5afc9ba5ab86e10bb61170afd3793eab7adac09e9a4ed5ed2e2040c29545"
+              },
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "2cfa21f7211e4550fe78c61e6268a6c4515d70b514c8767a0e8dc2dec2e2e761"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
               }
             }
           },
           "agent_viventium_red_team_95aeb3": {
             "fields": {
+              "instructions": {
+                "$viventium_managed_sha256": "6303f1ff2eadd2f4721597a0ff91863440129d93e9f94c1402d13ccf2a95d093"
+              },
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
               "model_parameters": {
                 "$viventium_managed_sha256": "3215994c8f86341aadaeb559389e91c28c701c17fc86a37cda82e3a079b2fcc7"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "5b67d19da2b22322c357f711f906c1dabbc203b3bc38bf9756d08c57c613d66c"
+              }
+            }
+          },
+          "agent_viventium_deep_research_95aeb3": {
+            "fields": {
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "tools": {
+                "$viventium_managed_sha256": "c8e09f43858ba94072a5a0256c6cc4a929c031be24da9404f4bfe077b23b975a"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "3215994c8f86341aadaeb559389e91c28c701c17fc86a37cda82e3a079b2fcc7"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "5b67d19da2b22322c357f711f906c1dabbc203b3bc38bf9756d08c57c613d66c"
+              }
+            }
+          },
+          "agent_viventium_online_tool_use_95aeb3": {
+            "fields": {
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "19c7e4164777dc5ebf828f734beb2cbf7efbaa57e922d246fffc43adcf2dd9c2"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
+              }
+            }
+          },
+          "agent_viventium_parietal_cortex_95aeb3": {
+            "fields": {
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "2cfa21f7211e4550fe78c61e6268a6c4515d70b514c8767a0e8dc2dec2e2e761"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
+              }
+            }
+          },
+          "agent_viventium_pattern_recognition_95aeb3": {
+            "fields": {
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "2cfa21f7211e4550fe78c61e6268a6c4515d70b514c8767a0e8dc2dec2e2e761"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
+              }
+            }
+          },
+          "agent_viventium_emotional_resonance_95aeb3": {
+            "fields": {
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "19c7e4164777dc5ebf828f734beb2cbf7efbaa57e922d246fffc43adcf2dd9c2"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
+              }
+            }
+          },
+          "agent_viventium_strategic_planning_95aeb3": {
+            "fields": {
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "356dd3319c014abb5aab56ba0849af08d8901919a6c8db4fc83c2b57e1efce28"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "29b26b176d25e769c270b48f49e44040e8216f4a89694df5b58ebee9f400cfad"
+              }
+            }
+          },
+          "agent_viventium_support_95aeb3": {
+            "fields": {
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "19c7e4164777dc5ebf828f734beb2cbf7efbaa57e922d246fffc43adcf2dd9c2"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
+              }
+            }
+          },
+          "agent_8Y1d7JNhpubtvzYz3hvEv": {
+            "fields": {
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "19c7e4164777dc5ebf828f734beb2cbf7efbaa57e922d246fffc43adcf2dd9c2"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
               }
             }
           },
@@ -6884,6 +6840,15 @@
               },
               "tools": {
                 "$viventium_managed_sha256": "461e409875205d1e5b8a9f6c32c51368a407bf86e7141e9fcf20d75ad189a0b5"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "3918ebbf899fcad82930809926c7c95539ca657356367a755a380cf6b400fb6f"
               }
             }
           }
@@ -6894,6 +6859,10 @@
       "migration_id": "public-components-lock-group-26",
       "predecessor_source_refs": [
         "5f9c44ef47ff83a4889313fda74dfe1f5e817ad3",
+        "75c5ca87f53c4975a6e00e4b9e12fde45a9bc5c9",
+        "8fba1024713b6378e5fc502e458505ef9f8d0636",
+        "c7b7555b8d404a558481a82e5673e05d32cdecc2",
+        "d0ea10e15dc24dd86feb2d91b4f5b90d00b0617a",
         "e40a1f3fe4a7c697cba52b7861c3d51f4fa8edc1",
         "eef0da0c5346373f1451fbb82727292607d07a5b"
       ],
@@ -6901,12 +6870,287 @@
       "predecessor_managed_bundle_sha256": "638c59ece3d89aeb1f8d707ca6a33847be1d3289cd5c074e3a0424e25125f6f0",
       "baseline": {
         "schema_version": 1,
-        "bundle_sha256": "c5c7b37f97dda056e2ec8f3df223749cc456fa432608426ac27486e81d98aefc",
+        "bundle_sha256": "b7861815b0537f56155432a655ecb685ba4e09f5a4a87426bafa125e5f3e8789",
         "agents": {
           "agent_viventium_main_95aeb3": {
             "fields": {
               "instructions": {
                 "$viventium_managed_sha256": "148734c8d2d0d222c0b868c713080b909e3ae175fae635fb5e65ef6b2ae6622e"
+              },
+              "tools": {
+                "$viventium_managed_sha256": "bf1cbbcd053845a14df6547a48fcc45f1e2154ca6f43cb82b993c5d04be0a661"
+              },
+              "background_cortices": {
+                "$viventium_managed_sha256": "af65c093737b63a8cf2472d260649c89fea8bf6778ba3e915df690304ad37bd0"
+              },
+              "voice_llm_model": {
+                "$viventium_managed_sha256": "91d796211525592a82fd9945bf5eee8520de446dfdd7ccb6c1b8003fcd5dadfc"
+              },
+              "voice_llm_model_parameters": {
+                "$viventium_managed_sha256": "4591eccff8bd715d6bf88395658dd390e254250ebe366b8f2d8ab2b34ae054c4"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
+              },
+              "edges": {
+                "$viventium_managed_sha256": "b28b705159d710499a392fb0994bc46827080db984142d3f4d7069c6615d8488"
+              }
+            }
+          },
+          "agent_viventium_background_analysis_95aeb3": {
+            "fields": {
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "2cfa21f7211e4550fe78c61e6268a6c4515d70b514c8767a0e8dc2dec2e2e761"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
+              }
+            }
+          },
+          "agent_viventium_confirmation_bias_95aeb3": {
+            "fields": {
+              "instructions": {
+                "$viventium_managed_sha256": "3bcb5afc9ba5ab86e10bb61170afd3793eab7adac09e9a4ed5ed2e2040c29545"
+              },
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "2cfa21f7211e4550fe78c61e6268a6c4515d70b514c8767a0e8dc2dec2e2e761"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
+              }
+            }
+          },
+          "agent_viventium_red_team_95aeb3": {
+            "fields": {
+              "instructions": {
+                "$viventium_managed_sha256": "6303f1ff2eadd2f4721597a0ff91863440129d93e9f94c1402d13ccf2a95d093"
+              },
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "356dd3319c014abb5aab56ba0849af08d8901919a6c8db4fc83c2b57e1efce28"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "5b67d19da2b22322c357f711f906c1dabbc203b3bc38bf9756d08c57c613d66c"
+              }
+            }
+          },
+          "agent_viventium_deep_research_95aeb3": {
+            "fields": {
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "tools": {
+                "$viventium_managed_sha256": "c8e09f43858ba94072a5a0256c6cc4a929c031be24da9404f4bfe077b23b975a"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "3215994c8f86341aadaeb559389e91c28c701c17fc86a37cda82e3a079b2fcc7"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "5b67d19da2b22322c357f711f906c1dabbc203b3bc38bf9756d08c57c613d66c"
+              }
+            }
+          },
+          "agent_viventium_online_tool_use_95aeb3": {
+            "fields": {
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "19c7e4164777dc5ebf828f734beb2cbf7efbaa57e922d246fffc43adcf2dd9c2"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
+              }
+            }
+          },
+          "agent_viventium_parietal_cortex_95aeb3": {
+            "fields": {
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "2cfa21f7211e4550fe78c61e6268a6c4515d70b514c8767a0e8dc2dec2e2e761"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
+              }
+            }
+          },
+          "agent_viventium_pattern_recognition_95aeb3": {
+            "fields": {
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "2cfa21f7211e4550fe78c61e6268a6c4515d70b514c8767a0e8dc2dec2e2e761"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
+              }
+            }
+          },
+          "agent_viventium_emotional_resonance_95aeb3": {
+            "fields": {
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "19c7e4164777dc5ebf828f734beb2cbf7efbaa57e922d246fffc43adcf2dd9c2"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
+              }
+            }
+          },
+          "agent_viventium_strategic_planning_95aeb3": {
+            "fields": {
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "356dd3319c014abb5aab56ba0849af08d8901919a6c8db4fc83c2b57e1efce28"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "29b26b176d25e769c270b48f49e44040e8216f4a89694df5b58ebee9f400cfad"
+              }
+            }
+          },
+          "agent_viventium_support_95aeb3": {
+            "fields": {
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "19c7e4164777dc5ebf828f734beb2cbf7efbaa57e922d246fffc43adcf2dd9c2"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
+              }
+            }
+          },
+          "agent_8Y1d7JNhpubtvzYz3hvEv": {
+            "fields": {
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "19c7e4164777dc5ebf828f734beb2cbf7efbaa57e922d246fffc43adcf2dd9c2"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
               }
             }
           },
@@ -6917,6 +7161,325 @@
               },
               "tools": {
                 "$viventium_managed_sha256": "461e409875205d1e5b8a9f6c32c51368a407bf86e7141e9fcf20d75ad189a0b5"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "3918ebbf899fcad82930809926c7c95539ca657356367a755a380cf6b400fb6f"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "migration_id": "public-components-lock-group-27",
+      "predecessor_source_refs": [
+        "ccfd307c3b6bd5573c58dfc4f16b84fc691fef4f",
+        "d2c8a8c7f1886117e4bd0f9dff35a7fac0b5dd1f"
+      ],
+      "predecessor_source_bundle_sha256": "4fdc3e58612230fb337f832544a5fc0bd74ecf62c031c9993ec8df3662e72eb1",
+      "predecessor_managed_bundle_sha256": "9e2194077b4af35da08a13f36adf2bb43995e6e9930a6be3a6f1ecac65d629d1",
+      "baseline": {
+        "schema_version": 1,
+        "bundle_sha256": "054a9484bd96d13b9fc32498e0998cf54f34541da1a6b6ad7cf2715091db9ce9",
+        "agents": {
+          "agent_viventium_main_95aeb3": {
+            "fields": {
+              "instructions": {
+                "$viventium_managed_sha256": "5181e756547f4c1e10a93bd067693b462e7d2921d454ca4b8961c3acdc711164"
+              },
+              "tools": {
+                "$viventium_managed_sha256": "bf1cbbcd053845a14df6547a48fcc45f1e2154ca6f43cb82b993c5d04be0a661"
+              },
+              "background_cortices": {
+                "$viventium_managed_sha256": "af65c093737b63a8cf2472d260649c89fea8bf6778ba3e915df690304ad37bd0"
+              },
+              "voice_llm_model": {
+                "$viventium_managed_sha256": "91d796211525592a82fd9945bf5eee8520de446dfdd7ccb6c1b8003fcd5dadfc"
+              },
+              "voice_llm_model_parameters": {
+                "$viventium_managed_sha256": "4591eccff8bd715d6bf88395658dd390e254250ebe366b8f2d8ab2b34ae054c4"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
+              },
+              "edges": {
+                "$viventium_managed_sha256": "b28b705159d710499a392fb0994bc46827080db984142d3f4d7069c6615d8488"
+              }
+            }
+          },
+          "agent_viventium_background_analysis_95aeb3": {
+            "fields": {
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "2cfa21f7211e4550fe78c61e6268a6c4515d70b514c8767a0e8dc2dec2e2e761"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
+              }
+            }
+          },
+          "agent_viventium_confirmation_bias_95aeb3": {
+            "fields": {
+              "instructions": {
+                "$viventium_managed_sha256": "3bcb5afc9ba5ab86e10bb61170afd3793eab7adac09e9a4ed5ed2e2040c29545"
+              },
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "2cfa21f7211e4550fe78c61e6268a6c4515d70b514c8767a0e8dc2dec2e2e761"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
+              }
+            }
+          },
+          "agent_viventium_red_team_95aeb3": {
+            "fields": {
+              "instructions": {
+                "$viventium_managed_sha256": "6303f1ff2eadd2f4721597a0ff91863440129d93e9f94c1402d13ccf2a95d093"
+              },
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "356dd3319c014abb5aab56ba0849af08d8901919a6c8db4fc83c2b57e1efce28"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "5b67d19da2b22322c357f711f906c1dabbc203b3bc38bf9756d08c57c613d66c"
+              }
+            }
+          },
+          "agent_viventium_deep_research_95aeb3": {
+            "fields": {
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "tools": {
+                "$viventium_managed_sha256": "c8e09f43858ba94072a5a0256c6cc4a929c031be24da9404f4bfe077b23b975a"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "3215994c8f86341aadaeb559389e91c28c701c17fc86a37cda82e3a079b2fcc7"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "5b67d19da2b22322c357f711f906c1dabbc203b3bc38bf9756d08c57c613d66c"
+              }
+            }
+          },
+          "agent_viventium_online_tool_use_95aeb3": {
+            "fields": {
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "19c7e4164777dc5ebf828f734beb2cbf7efbaa57e922d246fffc43adcf2dd9c2"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
+              }
+            }
+          },
+          "agent_viventium_parietal_cortex_95aeb3": {
+            "fields": {
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "2cfa21f7211e4550fe78c61e6268a6c4515d70b514c8767a0e8dc2dec2e2e761"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
+              }
+            }
+          },
+          "agent_viventium_pattern_recognition_95aeb3": {
+            "fields": {
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "2cfa21f7211e4550fe78c61e6268a6c4515d70b514c8767a0e8dc2dec2e2e761"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
+              }
+            }
+          },
+          "agent_viventium_emotional_resonance_95aeb3": {
+            "fields": {
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "19c7e4164777dc5ebf828f734beb2cbf7efbaa57e922d246fffc43adcf2dd9c2"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
+              }
+            }
+          },
+          "agent_viventium_strategic_planning_95aeb3": {
+            "fields": {
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "356dd3319c014abb5aab56ba0849af08d8901919a6c8db4fc83c2b57e1efce28"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "29b26b176d25e769c270b48f49e44040e8216f4a89694df5b58ebee9f400cfad"
+              }
+            }
+          },
+          "agent_viventium_support_95aeb3": {
+            "fields": {
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "19c7e4164777dc5ebf828f734beb2cbf7efbaa57e922d246fffc43adcf2dd9c2"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
+              }
+            }
+          },
+          "agent_8Y1d7JNhpubtvzYz3hvEv": {
+            "fields": {
+              "provider": {
+                "$viventium_managed_sha256": "ff21f18578c1b05780632f09ab0aaa02422f868fb41699877303b05c928b1e81"
+              },
+              "model": {
+                "$viventium_managed_sha256": "4193a44be7c056608ae2a67a2047c61d2352bf9f9430f1d54e1ea0442c70c468"
+              },
+              "model_parameters": {
+                "$viventium_managed_sha256": "19c7e4164777dc5ebf828f734beb2cbf7efbaa57e922d246fffc43adcf2dd9c2"
+              },
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "7e9a339b9517a06d17675660d43566fd15ea24547ba4c2cd7e2fc8075bfa5382"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "8d328adf33a6cb602c8c8d2e3b43e33911c843f77a9d3a09b5e132abc6d63f44"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "8ef2250c6e298e31287b619e8f2ac0f3086ac5a82fbd179b45a604fa2c2ba529"
+              }
+            }
+          },
+          "agent_viventium_connected_accounts_95aeb3": {
+            "fields": {
+              "fallback_llm_model": {
+                "$viventium_managed_sha256": "3d026fc97f356f1bf7f2914d2a7aade746e31476e1774dbb5894cfeb337314bd"
+              },
+              "fallback_llm_provider": {
+                "$viventium_managed_sha256": "c169219cf4428d4ac2ffbad324a220a72b11f382e83264ed2d8fc3d13c9c85f4"
+              },
+              "fallback_llm_model_parameters": {
+                "$viventium_managed_sha256": "3918ebbf899fcad82930809926c7c95539ca657356367a755a380cf6b400fb6f"
               }
             }
           }
@@ -6924,5 +7487,5 @@
       }
     }
   ],
-  "artifact_sha256": "f39b84542d89fab25a570aa393d36cab90e37967fb131158e30e2a26d519247e"
+  "artifact_sha256": "f1395e148d0b194f086ab159cd791206776daeb52c76d55b1ef629fd140d18dc"
 }

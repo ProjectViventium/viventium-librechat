@@ -13,10 +13,12 @@ const {
   resolveFallbackModelParameters,
   sanitizeFallbackModelParametersForProvider,
   buildFallbackAgent,
+  inheritResolvedAgentGraph,
   isSameAgentRoute,
   shouldRetryWithFallback,
   hasVisibleAssistantText,
   shouldRetryBackgroundCortexWithFallback,
+  isRecoverableProviderFallbackError,
   initializePrimaryAgentWithFallback,
 } = require('../agentLlmFallback');
 
@@ -37,7 +39,7 @@ describe('agentLlmFallback', () => {
   test('resolves voice fallback separately and prefers it for voice calls', () => {
     const agent = {
       fallback_llm_provider: 'anthropic',
-      fallback_llm_model: 'claude-sonnet-4-5',
+      fallback_llm_model: 'claude-opus-5',
       voice_fallback_llm_provider: 'openAI',
       voice_fallback_llm_model: 'gpt-5.4',
     };
@@ -54,7 +56,7 @@ describe('agentLlmFallback', () => {
     });
     expect(resolveEffectiveFallbackAssignment(agent, { isVoiceCall: false })).toMatchObject({
       provider: 'anthropic',
-      model: 'claude-sonnet-4-5',
+      model: 'claude-opus-5',
     });
     expect(
       resolveFallbackCandidates(agent, { isVoiceCall: true }).map((item) => item.source),
@@ -78,6 +80,28 @@ describe('agentLlmFallback', () => {
     ).toBe(false);
   });
 
+  test('accepts a capability-declared conversation provider as a generic fallback target', () => {
+    const req = {
+      config: {
+        endpoints: {
+          agents: {
+            allowedProviders: ['glasshive-harness'],
+            capabilityRequiredProviders: ['glasshive-harness'],
+            providerCapabilities: {
+              'glasshive-harness': { automatic_fallback_target: true },
+            },
+          },
+        },
+      },
+    };
+
+    expect(
+      isFallbackModelValid('claude-code:opus', 'glasshive-harness', req, {
+        'glasshive-harness': ['codex-cli:gpt-5.6-sol', 'claude-code:opus'],
+      }),
+    ).toBe(true);
+  });
+
   test('builds fallback parameters without mutating primary parameters', () => {
     const primaryParameters = { model: 'claude-opus-4-7', temperature: 0.8 };
     const agent = {
@@ -99,6 +123,24 @@ describe('agentLlmFallback', () => {
     expect(fallbackAgent.provider).toBe('openAI');
     expect(fallbackAgent.model).toBe('gpt-5.4');
     expect(primaryParameters).toEqual({ model: 'claude-opus-4-7', temperature: 0.8 });
+  });
+
+  test('replaces stale fallback edges with the resolved primary graph', () => {
+    const fallbackConfig = {
+      id: 'main',
+      edges: [
+        { from: 'main', to: 'unavailable-connected-account-agent' },
+        { from: 'unavailable-connected-account-agent', to: 'main' },
+      ],
+    };
+    const primaryConfig = {
+      id: 'main',
+      edges: [{ from: 'main', to: 'available-agent' }],
+    };
+
+    expect(inheritResolvedAgentGraph(fallbackConfig, primaryConfig)).toBe(fallbackConfig);
+    expect(fallbackConfig.edges).toEqual([{ from: 'main', to: 'available-agent' }]);
+    expect(fallbackConfig.edges).not.toBe(primaryConfig.edges);
   });
 
   test('strips provider-specific parameters from cross-provider fallback routes', () => {
@@ -148,6 +190,43 @@ describe('agentLlmFallback', () => {
       model: 'grok-4.3',
       reasoning_effort: 'none',
     });
+
+    expect(
+      sanitizeFallbackModelParametersForProvider(
+        {
+          model: 'claude-code:opus',
+          reasoning_effort: 'high',
+          useResponsesApi: true,
+          service_tier: 'priority',
+        },
+        'glasshive-harness',
+        {
+          models: [
+            {
+              id: 'claude-code:opus',
+              effortChoices: ['low', 'medium', 'high', 'xhigh', 'max'],
+            },
+          ],
+          responses_api: false,
+        },
+      ),
+    ).toEqual({
+      model: 'claude-code:opus',
+      reasoning_effort: 'high',
+    });
+
+    expect(
+      sanitizeFallbackModelParametersForProvider(
+        { model: 'native:effortless', reasoning_effort: 'max' },
+        'harness-provider',
+        {
+          models: [
+            { id: 'native:reasoning', effortChoices: ['low', 'high'] },
+            { id: 'native:effortless' },
+          ],
+        },
+      ),
+    ).toEqual({ model: 'native:effortless' });
   });
 
   test('builds voice fallback parameters from the effective voice model parameters', () => {
@@ -185,52 +264,67 @@ describe('agentLlmFallback', () => {
     ).toBe(true);
   });
 
+  test('recovers a structured primary initialization auth failure through the configured fallback', async () => {
+    const primaryAgent = { id: 'main', provider: 'openAI', model: 'gpt-primary' };
+    const fallbackAgent = { id: 'main', provider: 'xai', model: 'grok-fallback' };
+    const primaryError = new Error('connected account unavailable');
+    primaryError.code = 'MODEL_AUTHENTICATION';
+    primaryError.viventiumConnectedAccountReconnectRequired = true;
+    const initializePrimary = jest.fn(async () => {
+      throw primaryError;
+    });
+    const initializeFallback = jest.fn(async () => ({
+      id: 'main',
+      provider: 'xai',
+      model: 'grok-fallback',
+    }));
+
+    await expect(
+      initializePrimaryAgentWithFallback({
+        primaryAgent,
+        fallbackAgent,
+        fallbackAssignment: { provider: 'xai', model: 'grok-fallback' },
+        initializePrimary,
+        initializeFallback,
+      }),
+    ).resolves.toMatchObject({
+      effectiveAgent: fallbackAgent,
+      fallbackUsed: true,
+      primaryError,
+      config: { provider: 'xai', model: 'grok-fallback' },
+    });
+    expect(initializePrimary).toHaveBeenCalledTimes(1);
+    expect(initializeFallback).toHaveBeenCalledTimes(1);
+  });
+
   test.each([
-    [
-      'connected-account',
-      { id: 'main', provider: 'openAI', model: 'gpt-primary' },
-      'viventiumConnectedAccountReconnectRequired',
-    ],
-    [
-      'workspace-harness',
-      {
-        id: 'main',
-        provider: 'glasshive-harness',
-        model: 'codex-cli:gpt-5.6-sol',
-      },
-      'viventiumRecoverableProviderError',
-    ],
+    ['connection refusal', { code: 'ECONNREFUSED' }],
+    ['connection reset', { code: 'ECONNRESET' }],
+    ['gateway failure', { status: 502 }],
+    ['provider timeout', { code: 'ETIMEDOUT' }],
   ])(
-    'recovers a structured %s initialization failure through the configured fallback',
-    async (_routeKind, primaryAgent, recoverableFlag) => {
-      const fallbackAgent = { id: 'main', provider: 'xai', model: 'grok-fallback' };
-      const primaryError = new Error('connected account unavailable');
-      primaryError.code = 'MODEL_AUTHENTICATION';
-      primaryError[recoverableFlag] = true;
-      const initializePrimary = jest.fn(async () => {
-        throw primaryError;
-      });
-      const initializeFallback = jest.fn(async () => ({
-        id: 'main',
-        provider: 'xai',
-        model: 'grok-fallback',
-      }));
+    'recovers a primary initialization %s through the configured fallback',
+    async (_label, shape) => {
+      const primaryError = Object.assign(new Error('provider connection failed'), shape);
+      const initializeFallback = jest.fn(async () => ({ provider: 'glasshive-harness' }));
 
       await expect(
         initializePrimaryAgentWithFallback({
-          primaryAgent,
-          fallbackAgent,
-          fallbackAssignment: { provider: 'xai', model: 'grok-fallback' },
-          initializePrimary,
+          primaryAgent: { provider: 'openAI', model: 'gpt-5.6-sol' },
+          fallbackAgent: { provider: 'glasshive-harness', model: 'claude-code:opus' },
+          fallbackAssignment: {
+            provider: 'glasshive-harness',
+            model: 'claude-code:opus',
+          },
+          initializePrimary: async () => {
+            throw primaryError;
+          },
           initializeFallback,
         }),
       ).resolves.toMatchObject({
-        effectiveAgent: fallbackAgent,
         fallbackUsed: true,
         primaryError,
-        config: { provider: 'xai', model: 'grok-fallback' },
       });
-      expect(initializePrimary).toHaveBeenCalledTimes(1);
       expect(initializeFallback).toHaveBeenCalledTimes(1);
     },
   );
@@ -242,11 +336,7 @@ describe('agentLlmFallback', () => {
 
     await expect(
       initializePrimaryAgentWithFallback({
-        primaryAgent: {
-          id: 'main',
-          provider: 'glasshive-harness',
-          model: 'codex-cli:gpt-5.6-sol',
-        },
+        primaryAgent: { id: 'main', provider: 'openAI', model: 'gpt-primary' },
         fallbackAgent: { id: 'main', provider: 'xai', model: 'grok-fallback' },
         fallbackAssignment: { provider: 'xai', model: 'grok-fallback' },
         initializePrimary: async () => {
@@ -258,6 +348,26 @@ describe('agentLlmFallback', () => {
     expect(initializeFallback).not.toHaveBeenCalled();
   });
 
+  test('allows graph fallback only for structured recoverable provider failures', () => {
+    expect(isRecoverableProviderFallbackError({ status: 429 })).toBe(true);
+    expect(isRecoverableProviderFallbackError({ errorClass: 'provider_quota_exhausted' })).toBe(
+      true,
+    );
+    expect(isRecoverableProviderFallbackError({ cause: { code: 'ECONNRESET' } })).toBe(true);
+
+    expect(isRecoverableProviderFallbackError({ status: 400 })).toBe(false);
+    expect(
+      isRecoverableProviderFallbackError({ status: 403, code: 'content_policy_violation' }),
+    ).toBe(false);
+    expect(isRecoverableProviderFallbackError({ status: 500, errorClass: 'tool_failure' })).toBe(
+      false,
+    );
+    expect(isRecoverableProviderFallbackError({ code: 'GRAPH_INVARIANT_FAILURE' })).toBe(false);
+    expect(isRecoverableProviderFallbackError({ name: 'AbortError', code: 'ABORT_ERR' })).toBe(
+      false,
+    );
+  });
+
   test('does not start initialization fallback after cancellation', async () => {
     const controller = new AbortController();
     controller.abort();
@@ -267,11 +377,7 @@ describe('agentLlmFallback', () => {
 
     await expect(
       initializePrimaryAgentWithFallback({
-        primaryAgent: {
-          id: 'main',
-          provider: 'glasshive-harness',
-          model: 'codex-cli:gpt-5.6-sol',
-        },
+        primaryAgent: { id: 'main', provider: 'openAI', model: 'gpt-primary' },
         fallbackAgent: { id: 'main', provider: 'xai', model: 'grok-fallback' },
         fallbackAssignment: { provider: 'xai', model: 'grok-fallback' },
         initializePrimary: async () => {
@@ -315,6 +421,56 @@ describe('agentLlmFallback', () => {
     ).toBe(false);
   });
 
+  test('routes the Telegram rate-limit message to GlassHive Opus 5 at high effort', () => {
+    const primaryAgent = {
+      id: 'agent_viventium_main_95aeb3',
+      provider: 'openAI',
+      model: 'gpt-5.6-sol',
+      fallback_llm_provider: 'glasshive-harness',
+      fallback_llm_model: 'claude-code:opus',
+      fallback_llm_model_parameters: {
+        model: 'claude-code:opus',
+        reasoning_effort: 'high',
+      },
+    };
+    const assignment = resolveFallbackAssignment(primaryAgent);
+    const capability = {
+      models: [
+        {
+          id: 'claude-code:opus',
+          effortChoices: ['low', 'medium', 'high', 'xhigh', 'max'],
+        },
+      ],
+      responses_api: false,
+    };
+    const fallbackAgent = buildFallbackAgent(primaryAgent, assignment, capability);
+
+    expect(
+      shouldRetryWithFallback([
+        {
+          type: ContentTypes.ERROR,
+          [ContentTypes.ERROR]:
+            'The model provider rate-limited this request. Please try again shortly.',
+        },
+      ]),
+    ).toBe(true);
+    expect(fallbackAgent).toMatchObject({
+      provider: 'glasshive-harness',
+      model: 'claude-code:opus',
+      model_parameters: {
+        model: 'claude-code:opus',
+        reasoning_effort: 'high',
+      },
+    });
+    expect(
+      sanitizeFallbackModelParametersForProvider(
+        fallbackAgent.model_parameters,
+        fallbackAgent.provider,
+        capability,
+      ),
+    ).toEqual({ model: 'claude-code:opus', reasoning_effort: 'high' });
+  });
+
   test('retries provider overload errors only when no assistant text was produced', () => {
     expect(
       shouldRetryWithFallback([
@@ -335,6 +491,19 @@ describe('agentLlmFallback', () => {
           [ContentTypes.ERROR]:
             'The model provider is temporarily overloaded. Please try again shortly.',
           error_class: 'provider_temporarily_unavailable',
+        },
+      ]),
+    ).toBe(false);
+  });
+
+  test('keeps a persisted provider response deadline nonretryable at the outer agent layer', () => {
+    expect(
+      shouldRetryWithFallback([
+        {
+          type: ContentTypes.ERROR,
+          [ContentTypes.ERROR]:
+            'The provider returned status 504 after its configured deadline; retry the turn.',
+          error_class: 'provider_response_deadline_exceeded',
         },
       ]),
     ).toBe(false);

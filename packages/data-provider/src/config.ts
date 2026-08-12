@@ -314,9 +314,18 @@ export const agentProviderCapabilitySchema = z.object({
   native_realtime_voice: z.boolean().default(false),
   realtime_voice: z.boolean().default(false),
   automatic_fallback_target: z.boolean().default(false),
+  /* === VIVENTIUM START ===
+   * Feature: GlassHive provider-owned execution and host-tool brokerage.
+   * Purpose: Keep worker-native tools distinct from explicitly brokered host capabilities while
+   * preserving the declared serial fallback policy through config parsing.
+   * === VIVENTIUM END === */
+  serial_model_fallback: z.boolean().default(false),
   workspace_binding: z.boolean().default(false),
   conversation_session: z.boolean().default(false),
   native_tools: z.boolean().default(false),
+  worker_native_tools: z.boolean().default(false),
+  host_tools_transport: z.enum(['broker_mcp']).optional(),
+  host_tools: z.array(z.string()).optional().default([]),
   activity_stream: z.boolean().default(false),
   responses_api: z.boolean().default(false),
   default_access: z.enum(['full', 'workspace']).default('workspace'),
@@ -895,8 +904,18 @@ export type TStartupConfig = {
    * Purpose: Expose the server-side workbench link gate to the web client.
    * === VIVENTIUM END === */
   viventiumPromptWorkbenchLinkEnabled?: boolean;
+  /* === VIVENTIUM START ===
+   * Feature: WHOOP owner onboarding visibility.
+   * Purpose: Show the host-owner connector only when the compiled health integration is enabled.
+   * === VIVENTIUM END === */
+  viventiumHealthWhoopEnabled?: boolean;
   /** Operator-level Feelings instrument availability. */
   viventiumFeelingsAvailable?: boolean;
+  /* === VIVENTIUM START ===
+   * Feature: Background follow-up browser-listening parity.
+   * Purpose: Expose the canonical Phase B listening window without making it an execution deadline.
+   * === VIVENTIUM END === */
+  viventiumBackgroundFollowupWindowS?: number;
   /* === VIVENTIUM START ===
    * Feature: GlassHive host worker callbacks.
    * Purpose: Expose the compiled callback wait window to the web polling hook.
@@ -1079,7 +1098,7 @@ export const memorySchema = z.object({
    * === VIVENTIUM END === */
   readProfile: z
     .object({
-      tokenLimit: z.number().optional().default(1800),
+      tokenLimit: z.number().optional().default(8000),
       keyLimits: z.record(z.number()).optional(),
       keyOrder: z.array(z.string()).optional(),
       cacheTtlMs: z.number().optional().default(30000),
@@ -1388,8 +1407,6 @@ const sharedAnthropicModels = [
   /* === VIVENTIUM END === */
   'claude-opus-4-7',
   'claude-opus-4-6',
-  'claude-sonnet-4-5',
-  'claude-sonnet-4-5-20250929',
   'claude-haiku-4-5',
   'claude-haiku-4-5-20251001',
   'claude-opus-4-1',
@@ -1409,7 +1426,6 @@ const sharedAnthropicModels = [
 
 export const bedrockModels = [
   'anthropic.claude-opus-4-7',
-  'anthropic.claude-sonnet-4-5-20250929-v1:0',
   'anthropic.claude-haiku-4-5-20251001-v1:0',
   'anthropic.claude-opus-4-1-20250805-v1:0',
   'anthropic.claude-3-5-sonnet-20241022-v2:0',

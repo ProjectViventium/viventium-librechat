@@ -8,12 +8,32 @@
 const { ContentTypes } = require('librechat-data-provider');
 const RUNTIME_HOLD_TEXT_FLAG = 'viventium_runtime_hold';
 const NON_RETRYABLE_FALLBACK_ERROR_CLASSES = new Set([
+  'bad_request',
+  'content_policy',
+  'content_policy_violation',
+  'context_length_exceeded',
+  'graph_invariant_failure',
+  'invalid_request',
+  'invalid_request_error',
+  'invariant_failure',
   'no_live_tool_execution',
+  'schema_validation_error',
   'tool_failure',
   'mcp_failure',
   'mcp_tool_failure',
   'missing_tool_auth',
   'tool_auth_required',
+  'provider_response_deadline_exceeded',
+]);
+const RECOVERABLE_PROVIDER_CONNECTION_CODES = new Set([
+  'ECONNABORTED',
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'ETIMEDOUT',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_SOCKET',
 ]);
 
 function normalizeProvider(provider) {
@@ -159,15 +179,22 @@ function resolveFallbackModelParameters(
   return resolved;
 }
 
-function sanitizeFallbackModelParametersForProvider(parameters, provider) {
+function sanitizeFallbackModelParametersForProvider(parameters, provider, capability = {}) {
   const sanitized = clonePlainObject(parameters);
   const normalizedProvider = normalizeProvider(provider);
+  const targetModel = String(sanitized.model || '').trim();
+  const targetModelCapability = Array.isArray(capability?.models)
+    ? capability.models.find((model) => String(model?.id || '').trim() === targetModel)
+    : null;
+  const supportsDeclaredReasoningEffort =
+    Array.isArray(targetModelCapability?.effortChoices) &&
+    targetModelCapability.effortChoices.length > 0;
 
   if (normalizedProvider !== 'anthropic') {
     delete sanitized.thinking;
     delete sanitized.thinkingBudget;
   }
-  if (!['openAI', 'xai'].includes(normalizedProvider)) {
+  if (!['openAI', 'xai'].includes(normalizedProvider) && !supportsDeclaredReasoningEffort) {
     delete sanitized.reasoning_effort;
   }
   /* === VIVENTIUM START ===
@@ -187,7 +214,7 @@ function sanitizeFallbackModelParametersForProvider(parameters, provider) {
   return sanitized;
 }
 
-function buildFallbackAgent(agent, assignment) {
+function buildFallbackAgent(agent, assignment, capability = {}) {
   if (!agent || !assignment) {
     return null;
   }
@@ -206,8 +233,25 @@ function buildFallbackAgent(agent, assignment) {
     model_parameters: sanitizeFallbackModelParametersForProvider(
       modelParameters,
       assignment.provider,
+      capability,
     ),
   };
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Lazy fallback graph-topology reconciliation
+ * Purpose: Lazy fallback initialization starts from the declared primary agent, before optional
+ * handoff failures are known. Reuse the initialized primary's resolved edges so an unavailable
+ * optional child cannot make the fallback graph fail compilation before reaching its provider.
+ * === VIVENTIUM END === */
+function inheritResolvedAgentGraph(fallbackConfig, primaryConfig) {
+  if (!fallbackConfig || !primaryConfig) {
+    return fallbackConfig;
+  }
+  fallbackConfig.edges = Array.isArray(primaryConfig.edges)
+    ? [...primaryConfig.edges]
+    : primaryConfig.edges;
+  return fallbackConfig;
 }
 
 function getAgentModel(agent) {
@@ -255,6 +299,7 @@ function isRecoverableFallbackErrorClass(value) {
   const normalized = normalizeFallbackErrorClass(value);
   return [
     'provider_rate_limited',
+    'provider_quota_exhausted',
     'provider_temporarily_unavailable',
     'recoverable_provider_error',
     'provider_unauthorized',
@@ -325,7 +370,16 @@ function isRecoverableProviderErrorText(text, { allowToolOrMcpText = false } = {
     lowered.includes(' 403 ') ||
     lowered.includes('overloaded') ||
     lowered.includes('temporarily unavailable') ||
+    lowered.includes('connection refused') ||
+    lowered.includes('connection reset') ||
+    lowered.includes('socket hang up') ||
+    lowered.includes('fetch failed') ||
+    lowered.includes('econnrefused') ||
+    lowered.includes('econnreset') ||
+    lowered.includes('etimedout') ||
     lowered.includes(' 503 ') ||
+    lowered.includes(' 502 ') ||
+    lowered.includes(' 504 ') ||
     lowered.includes(' 529 ')
   );
 }
@@ -373,23 +427,109 @@ function isRecoverableFallbackStatus(status) {
 }
 
 /* === VIVENTIUM START ===
- * Feature: Provider fallback during agent initialization
- * Purpose: Connected-account authentication or a workspace harness may fail while the provider
- * client is being built, before AgentClient exists. Recognize only structured provider failures
- * and invoke the configured fallback once; never hide runtime invariants or user cancellation.
+ * Feature: Shared structured runtime-fallback recoverability gate.
+ * Purpose: Graph-native fallback must follow the same provider-failure boundary as initialization:
+ * retry auth, quota, rate-limit, outage, and transport failures; never mask cancellation, invalid
+ * requests, policy/schema rejection, tool failure, or graph invariants. Structured metadata only.
+ * Added: 2026-08-10
  */
-function isRecoverableProviderInitializationError(error) {
-  if (!error || typeof error !== 'object') {
+function getStructuredFallbackErrorChain(error) {
+  const chain = [];
+  const queue = [error];
+  const seen = new Set();
+  while (queue.length > 0 && chain.length < 12) {
+    const current = queue.shift();
+    if (!current || typeof current !== 'object' || seen.has(current)) {
+      continue;
+    }
+    seen.add(current);
+    chain.push(current);
+    for (const nested of [
+      current.cause,
+      current.error,
+      current.response,
+      current.response?.data,
+      current.response?.data?.error,
+    ]) {
+      if (nested && typeof nested === 'object' && !seen.has(nested)) {
+        queue.push(nested);
+      }
+    }
+  }
+  return chain;
+}
+
+function structuredFallbackErrorClasses(error) {
+  return getStructuredFallbackErrorChain(error)
+    .flatMap((item) => [
+      item.errorClass,
+      item.error_class,
+      item.errorCode,
+      item.error_code,
+      item.code,
+      item.lc_error_code,
+      item.type,
+    ])
+    .map(normalizeFallbackErrorClass)
+    .filter(Boolean);
+}
+
+function isRecoverableProviderFallbackError(error) {
+  const chain = getStructuredFallbackErrorChain(error);
+  if (chain.length === 0) {
     return false;
   }
-  if (error.viventiumConnectedAccountReconnectRequired === true) {
+  const structuredClasses = structuredFallbackErrorClasses(error);
+  if (
+    chain.some(
+      (item) =>
+        item.name === 'AbortError' ||
+        item.code === 'ABORT_ERR' ||
+        item.viventiumNonRetryableProviderError === true,
+    ) ||
+    structuredClasses.some(isNonRetryableFallbackErrorClass)
+  ) {
+    return false;
+  }
+  if (
+    chain.some(
+      (item) =>
+        item.viventiumConnectedAccountReconnectRequired === true ||
+        item.viventiumRecoverableProviderError === true,
+    ) ||
+    structuredClasses.some(isRecoverableFallbackErrorClass)
+  ) {
     return true;
   }
-  if (error.viventiumRecoverableProviderError === true) {
-    return true;
+  for (const item of chain) {
+    for (const candidate of [item.status, item.statusCode, item.errorStatus, item.error_status]) {
+      const status = Number(candidate);
+      if (Number.isFinite(status) && status > 0 && isRecoverableFallbackStatus(status)) {
+        return true;
+      }
+    }
   }
-  const code = extractFallbackErrorCode(error);
-  return code === 'MODEL_AUTHENTICATION' || code === 'MODEL_RATE_LIMIT';
+  return structuredClasses.some((value) => {
+    const code = value.toUpperCase();
+    return (
+      code === 'MODEL_AUTHENTICATION' ||
+      code === 'MODEL_RATE_LIMIT' ||
+      code === 'AUTHENTICATION_ERROR' ||
+      RECOVERABLE_PROVIDER_CONNECTION_CODES.has(code)
+    );
+  });
+}
+/* === VIVENTIUM END === */
+
+/* === VIVENTIUM START ===
+ * Feature: Provider fallback during agent initialization
+ * Purpose: Connected-account authentication can fail while the provider client is being built,
+ * before AgentClient exists. Recognize only structured provider failures and invoke the same
+ * configured fallback once; never hide tool/runtime invariants or user cancellation.
+ * Added: 2026-07-13
+ */
+function isRecoverableProviderInitializationError(error) {
+  return isRecoverableProviderFallbackError(error);
 }
 
 async function initializePrimaryAgentWithFallback({
@@ -531,6 +671,7 @@ module.exports = {
   resolveFallbackModelParameters,
   sanitizeFallbackModelParametersForProvider,
   buildFallbackAgent,
+  inheritResolvedAgentGraph,
   isSameAgentRoute,
   shouldRetryWithFallback,
   hasVisibleAssistantText,
@@ -538,6 +679,7 @@ module.exports = {
   isAbortOrTimeoutErrorText,
   isRecoverableProviderErrorText,
   isNonRetryableFallbackErrorClass,
+  isRecoverableProviderFallbackError,
   isRecoverableProviderInitializationError,
   initializePrimaryAgentWithFallback,
 };

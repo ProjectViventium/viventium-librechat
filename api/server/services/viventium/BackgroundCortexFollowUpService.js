@@ -27,6 +27,16 @@ const {
   supportsAdaptiveThinking,
 } = require('librechat-data-provider');
 const db = require('~/models');
+const { Conversation, Message } = require('~/db/models');
+const { isVoiceTaskSuppressedDurably } = require('./VoiceTaskService');
+
+async function isFollowUpVoiceTaskSuppressed(req, taskId) {
+  return isVoiceTaskSuppressedDurably(taskId, {
+    callSessionId: req?.body?.viventiumCallSessionId,
+    userId: req?.user?.id,
+    streamId: req?.body?.streamId,
+  });
+}
 const { getAgent } = require('~/models/Agent');
 const {
   getCustomEndpointConfig,
@@ -610,7 +620,17 @@ function sanitizeAnthropicFollowUpLLMConfig(llmConfig = {}) {
     ? llmConfig.thinking
     : true;
   const thinkingIsActive = hasActiveAnthropicThinking(effectiveThinking);
-  const adaptiveModel = model ? supportsAdaptiveThinking(model) : false;
+  /* === VIVENTIUM START ===
+   * Feature: Anthropic follow-up sampling compatibility.
+   * A family-major-date snapshot (for example opus-5-YYYYMMDD) does not declare an adaptive
+   * semantic revision. Do not let the shared loose version parser reinterpret the release date as
+   * a minor version. Explicit adaptive revisions (for example opus-4-7[-YYYYMMDD]) remain guarded,
+   * and active/default thinking always removes temperature below.
+   * === VIVENTIUM END === */
+  const hasAmbiguousDateSnapshot =
+    /claude-(?:opus|sonnet)[-.]?\d+[-.](?:19|20)\d{6}(?:$|[-.:])/.test(model);
+  const adaptiveModel =
+    model && !hasAmbiguousDateSnapshot ? supportsAdaptiveThinking(model) : false;
   if (!thinkingIsActive && !adaptiveModel) {
     return llmConfig;
   }
@@ -991,9 +1011,14 @@ async function resolveCanonicalFollowUpAgent(
 
 function upsertCortexParts(existingContent, cortexParts, options = {}) {
   const visibleText = typeof options.visibleText === 'string' ? options.visibleText.trim() : '';
+  const structuredVisibleText = extractTextFromMessageContent(existingContent).trim();
+  const preservesStructuredTranscript =
+    visibleText.length > 0 && structuredVisibleText === visibleText;
   const content =
     visibleText && !isNoResponseOnly(visibleText)
-      ? mergeVisibleTextIntoMessageContent(existingContent, visibleText)
+      ? preservesStructuredTranscript
+        ? [...existingContent]
+        : mergeVisibleTextIntoMessageContent(existingContent, visibleText)
       : Array.isArray(existingContent)
         ? [...existingContent]
         : [];
@@ -2600,6 +2625,10 @@ async function createCortexFollowUpMessage({
   recentResponse,
   forceVisibleFollowUp = false,
 }) {
+  const voiceTaskId = String(req?.body?.viventiumVoiceTaskId || '').trim();
+  if (voiceTaskId && (await isFollowUpVoiceTaskSuppressed(req, voiceTaskId))) {
+    return null;
+  }
   let text = '';
   let generationFailed = false;
   const hasInsights = Array.isArray(insightsData?.insights) && insightsData.insights.length > 0;
@@ -2833,6 +2862,20 @@ async function createCortexFollowUpMessage({
   await db.saveMessage(req, followUpMessage, {
     context: 'viventium/services/BackgroundCortexFollowUpService.createCortexFollowUpMessage',
   });
+
+  if (voiceTaskId && (await isFollowUpVoiceTaskSuppressed(req, voiceTaskId))) {
+    const removed = await Message.findOneAndDelete({
+      user: req?.user?.id,
+      messageId: followUpMessage.messageId,
+    });
+    if (removed?._id) {
+      await Conversation.updateOne(
+        { user: req?.user?.id, conversationId },
+        { $pull: { messages: removed._id } },
+      );
+    }
+    return null;
+  }
 
   return followUpMessage;
 }

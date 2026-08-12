@@ -111,6 +111,26 @@ describe('conversationRecallFilters', () => {
     ).toBe(true);
   });
 
+  test('skips authenticated guest ambient speech instead of replaying it as assistant-authored context', () => {
+    expect(
+      shouldSkipRecallMessage({
+        message: {
+          messageId: 'guest_ambient_1',
+          isCreatedByUser: false,
+          metadata: {
+            viventium: {
+              type: 'voice_ambient_transcript',
+              mode: 'call',
+              actorTrust: 'authenticated_participant',
+            },
+          },
+        },
+        messageText: 'A guest requested an action.',
+        isCreatedByUser: false,
+      }),
+    ).toBe(true);
+  });
+
   test.each([
     [{ memoryEligible: false }, 'explicitly ineligible'],
     [{ qaRun: true }, 'QA'],

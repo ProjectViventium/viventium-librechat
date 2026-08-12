@@ -392,7 +392,59 @@ describe('initializeAnthropic', () => {
     expect(persistedValue.oauthExpiresAt).toBeGreaterThan(Date.now());
   });
 
-  it('should preserve the current access token when Anthropic refresh fails', async () => {
+  it('should persist and surface reconnect guidance for a terminal inference-time auth failure', async () => {
+    const params = createParams({
+      dbOverrides: {
+        getUserKeyValues: jest.fn().mockResolvedValue({
+          authToken: 'current-access-token',
+          apiKey: 'current-access-token',
+          refreshToken: 'refresh-token',
+          oauthProvider: 'anthropic',
+          oauthType: 'subscription',
+          oauthExpiresAt: Date.now() + 60 * 60 * 1000,
+        }),
+      },
+    });
+
+    await initializeAnthropic(params);
+    const options = mockGetLLMConfig.mock.calls[0][1] as {
+      connectedAccountAuthFailure?: (error: unknown) => Promise<void>;
+    };
+    (params.db.updateUserKey as jest.Mock).mockClear();
+
+    await expect(options.connectedAccountAuthFailure?.({ status: 401 })).rejects.toThrow(
+      'Anthropic connected account needs reconnect',
+    );
+    expect(params.db.updateUserKey).toHaveBeenCalledTimes(1);
+    const persisted = JSON.parse((params.db.updateUserKey as jest.Mock).mock.calls[0][0].value);
+    expect(persisted.oauthReconnectRequired).toBe(true);
+  });
+
+  it('should keep transient inference-time failures retryable', async () => {
+    const params = createParams({
+      dbOverrides: {
+        getUserKeyValues: jest.fn().mockResolvedValue({
+          authToken: 'current-access-token',
+          apiKey: 'current-access-token',
+          refreshToken: 'refresh-token',
+          oauthProvider: 'anthropic',
+          oauthType: 'subscription',
+          oauthExpiresAt: Date.now() + 60 * 60 * 1000,
+        }),
+      },
+    });
+
+    await initializeAnthropic(params);
+    const options = mockGetLLMConfig.mock.calls[0][1] as {
+      connectedAccountAuthFailure?: (error: unknown) => Promise<void>;
+    };
+    (params.db.updateUserKey as jest.Mock).mockClear();
+
+    await expect(options.connectedAccountAuthFailure?.({ status: 503 })).resolves.toBeUndefined();
+    expect(params.db.updateUserKey).not.toHaveBeenCalled();
+  });
+
+  it('should mark reconnect required and reject an expired token when Anthropic refresh fails', async () => {
     mockFetch.mockResolvedValue({
       ok: false,
       status: 400,
@@ -417,18 +469,12 @@ describe('initializeAnthropic', () => {
       },
     });
 
-    await initializeAnthropic(params);
+    await expect(initializeAnthropic(params)).rejects.toThrow(
+      'Anthropic connected account needs reconnect in Settings > Account > Connected Accounts.',
+    );
 
     expect(mockFetch).toHaveBeenCalledTimes(1);
-    expect(mockGetLLMConfig).toHaveBeenCalledWith(
-      expect.objectContaining({
-        [AuthKeys.ANTHROPIC_API_KEY]: 'still-usable-access-token',
-      }),
-      expect.objectContaining({
-        oauthProvider: 'anthropic',
-        oauthType: 'subscription',
-      }),
-    );
+    expect(mockGetLLMConfig).not.toHaveBeenCalled();
     const updateUserKey = params.db.updateUserKey as jest.Mock;
     expect(updateUserKey).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -444,6 +490,33 @@ describe('initializeAnthropic', () => {
       refreshToken: 'broken-refresh-token',
       oauthProvider: 'anthropic',
       oauthType: 'subscription',
+      oauthReconnectRequired: true,
     });
+  });
+
+  it('should preserve transient Anthropic refresh failures without marking reconnect required', async () => {
+    mockFetch.mockResolvedValue({
+      ok: false,
+      status: 503,
+      statusText: 'Service Unavailable',
+      text: async () => JSON.stringify({ error: 'temporarily_unavailable' }),
+    });
+    const params = createParams({
+      dbOverrides: {
+        getUserKeyValues: jest.fn().mockResolvedValue({
+          apiKey: 'expired-anthropic-token',
+          authToken: 'expired-anthropic-token',
+          refreshToken: 'still-valid-refresh-token',
+          oauthProvider: 'anthropic',
+          oauthType: 'subscription',
+          oauthExpiresAt: Date.now() - 60 * 1000,
+        }),
+      },
+    });
+
+    await expect(initializeAnthropic(params)).rejects.toThrow(
+      'Anthropic connected account refresh failed: temporarily_unavailable',
+    );
+    expect(params.db.updateUserKey).not.toHaveBeenCalled();
   });
 });

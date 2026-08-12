@@ -101,6 +101,7 @@ describe('Agent Abort Endpoint', () => {
         const jobStreamId = 'test-stream-123';
 
         mockGenerationJobManager.getJob.mockResolvedValue({
+          status: 'running',
           metadata: { userId: 'test-user-123' },
         });
 
@@ -121,6 +122,27 @@ describe('Agent Abort Endpoint', () => {
           jobStreamId,
           'user_cancelled',
         );
+      });
+
+      it('should reject aborting a job whose main response is already complete', async () => {
+        const jobStreamId = 'test-stream-complete';
+
+        mockGenerationJobManager.getJob.mockResolvedValue({
+          status: 'complete',
+          metadata: { userId: 'test-user-123' },
+        });
+
+        const response = await request(app)
+          .post('/api/agents/chat/abort')
+          .send({ conversationId: jobStreamId });
+
+        expect(response.status).toBe(409);
+        expect(response.body).toEqual({
+          error: 'Generation is already complete',
+          streamId: jobStreamId,
+        });
+        expect(mockGenerationJobManager.abortJob).not.toHaveBeenCalled();
+        expect(mockSaveMessage).not.toHaveBeenCalled();
       });
 
       it('should allow abort when job has no userId metadata (backwards compatibility)', async () => {

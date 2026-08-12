@@ -78,6 +78,43 @@ describe('upsertCortexParts', () => {
       }),
     ]);
   });
+
+  test('preserves graph-authored text parts when top-level text is their concatenated transcript', () => {
+    const existing = [
+      {
+        type: 'text',
+        agentId: 'agent-consultant',
+        text: 'Verified evidence.',
+      },
+      {
+        type: 'text',
+        agentId: 'agent-author',
+        text: ' Final synthesis.',
+      },
+    ];
+
+    const merged = upsertCortexParts(
+      existing,
+      [
+        {
+          type: 'cortex_insight',
+          cortex_id: 'background-review',
+          status: 'complete',
+          insight: 'No additional correction.',
+        },
+      ],
+      { visibleText: 'Verified evidence. Final synthesis.' },
+    );
+
+    expect(merged).toEqual([
+      existing[0],
+      existing[1],
+      expect.objectContaining({
+        type: 'cortex_insight',
+        cortex_id: 'background-review',
+      }),
+    ]);
+  });
 });
 
 describe('mergeVisibleTextIntoMessageContent', () => {
@@ -1235,7 +1272,7 @@ describe('resolveFollowUpContinuationContext', () => {
 describe('sanitizeAnthropicFollowUpLLMConfig', () => {
   test('removes temperature when Anthropic follow-up relies on default thinking', () => {
     const result = sanitizeAnthropicFollowUpLLMConfig({
-      model: 'claude-sonnet-4-5',
+      model: 'claude-opus-5',
       temperature: 0.3,
     });
 
@@ -1252,9 +1289,19 @@ describe('sanitizeAnthropicFollowUpLLMConfig', () => {
     expect(result.temperature).toBeUndefined();
   });
 
+  test('keeps adaptive-era safety for date-stamped models with an explicit adaptive revision', () => {
+    const result = sanitizeAnthropicFollowUpLLMConfig({
+      model: 'claude-opus-4-7-20250929',
+      temperature: 0.3,
+      thinking: false,
+    });
+
+    expect(result.temperature).toBeUndefined();
+  });
+
   test('preserves temperature for legacy Anthropic models when thinking is explicitly disabled', () => {
     const result = sanitizeAnthropicFollowUpLLMConfig({
-      model: 'claude-sonnet-4-5-20250929',
+      model: 'claude-opus-5-20250929',
       temperature: 0.3,
       thinking: false,
     });

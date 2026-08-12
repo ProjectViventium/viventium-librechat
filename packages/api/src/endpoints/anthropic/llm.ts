@@ -298,7 +298,20 @@ function summarizeAnthropicOAuthRequest(request: Record<string, unknown>): Recor
 
 type AnthropicMessagesCreate = Anthropic['messages']['create'];
 
-function wrapAnthropicOAuthClient(client: Anthropic): Anthropic {
+async function handleAnthropicConnectedAccountAuthFailure(
+  error: unknown,
+  callback?: (error: unknown) => Promise<void>,
+): Promise<never> {
+  if (callback) {
+    await callback(error);
+  }
+  throw error;
+}
+
+function wrapAnthropicOAuthClient(
+  client: Anthropic,
+  connectedAccountAuthFailure?: (error: unknown) => Promise<void>,
+): Anthropic {
   const originalCreate: AnthropicMessagesCreate = client.messages.create.bind(client.messages);
   const wrappedCreate: AnthropicMessagesCreate = ((request, requestOptions) => {
     const normalizedRequest = ensureAnthropicOAuthSystemPrompt(
@@ -313,7 +326,9 @@ function wrapAnthropicOAuthClient(client: Anthropic): Anthropic {
       );
     }
 
-    return originalCreate(normalizedRequest, requestOptions);
+    return originalCreate(normalizedRequest, requestOptions).catch((error: unknown) =>
+      handleAnthropicConnectedAccountAuthFailure(error, connectedAccountAuthFailure),
+    );
   }) as AnthropicMessagesCreate;
 
   Object.defineProperty(client.messages, 'create', {
@@ -408,6 +423,7 @@ function getLLMConfig(
   } else if (apiKey) {
     // Direct API configuration
     if (oauthToken) {
+      const connectedAccountAuthFailure = options.connectedAccountAuthFailure;
       requestOptions.clientOptions = {
         ...(requestOptions.clientOptions ?? {}),
         authToken: apiKey,
@@ -431,6 +447,7 @@ function getLLMConfig(
             apiKey: null,
             authToken: apiKey,
           }),
+          connectedAccountAuthFailure,
         );
       };
       requestOptions.clientOptions.defaultHeaders = mergeDefaultHeaders(
@@ -632,4 +649,9 @@ function getLLMConfig(
   };
 }
 
-export { getLLMConfig, ensureAnthropicOAuthSystemPrompt, ANTHROPIC_OAUTH_SYSTEM_TEXT };
+export {
+  getLLMConfig,
+  ensureAnthropicOAuthSystemPrompt,
+  handleAnthropicConnectedAccountAuthFailure,
+  ANTHROPIC_OAUTH_SYSTEM_TEXT,
+};

@@ -6,11 +6,18 @@
  * === VIVENTIUM END === */
 
 const { logger } = require('@librechat/data-schemas');
+const { loadWebSearchAuth } = require('@librechat/api');
 const { CacheKeys } = require('librechat-data-provider');
 const { getMCPManager, getMCPServersRegistry, getFlowStateManager } = require('~/config');
 const { findToken, createToken, updateToken, deleteToken, getUserById } = require('~/models');
 const { getLogStores } = require('~/cache');
 const { getGraphApiToken } = require('~/server/services/GraphTokenService');
+const { loadAuthValues } = require('~/server/services/Tools/credentials');
+const {
+  createFileSearchTool,
+  fileSearchJsonSchema,
+} = require('~/app/clients/tools/util/fileSearch');
+const { createViventiumSearchTool } = require('~/app/clients/tools/util/viventiumSearchTool');
 const {
   buildMcpOAuthRecovery,
   inspectStoredOAuthCredentialState,
@@ -18,13 +25,14 @@ const {
 } = require('~/server/services/Tools/mcp');
 const {
   auditSafeToolSummary,
-  brokerToolName,
+  collisionSafeBrokerToolName,
   collectAllowedServers,
   evaluateToolCallPolicy,
   getPolicy,
   helperToolDefinitions,
   isTrustedServerConfig,
   logOmission,
+  mcpToolAnnotations,
 } = require('./GlassHiveCapabilityPolicyService');
 const {
   grantReplayTtlMs,
@@ -33,6 +41,41 @@ const {
 } = require('./GlassHiveCapabilityBrokerAuth');
 
 const DEFAULT_PROVIDER = 'openai';
+const DEFAULT_DISCOVERY_CACHE_TTL_MS = 2 * 60 * 1000;
+const MAX_DISCOVERY_CACHE_GRANTS = 256;
+const GRANT_DISCOVERY_CACHE = new Map();
+
+const HOST_TOOL_DEFINITIONS = Object.freeze({
+  file_search: Object.freeze({
+    name: 'file_search',
+    description:
+      'Search the files and conversation-recall resources resolved by the host for this exact Agent turn. Results include source provenance when available; degraded recall is reported explicitly.',
+    inputSchema: fileSearchJsonSchema,
+    annotations: Object.freeze(mcpToolAnnotations({ access: 'read', openWorldDefault: false })),
+  }),
+  web_search: Object.freeze({
+    name: 'web_search',
+    description:
+      'Search the configured live web provider through the authenticated host. Provider failures and successful empty results are returned explicitly.',
+    inputSchema: Object.freeze({
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'A concise search query.' },
+        date: {
+          type: 'string',
+          enum: ['h', 'd', 'w', 'm', 'y'],
+          description: 'Optional result age: hour, day, week, month, or year.',
+        },
+        country: { type: 'string', description: 'Optional two-letter country code.' },
+        images: { type: 'boolean', description: 'Also search images.' },
+        videos: { type: 'boolean', description: 'Also search videos.' },
+        news: { type: 'boolean', description: 'Also search news.' },
+      },
+      required: ['query'],
+    }),
+    annotations: Object.freeze(mcpToolAnnotations({ access: 'read', openWorldDefault: true })),
+  }),
+});
 
 function brokerDiscoveryRetryDelayMs() {
   const raw = Number(process.env.VIVENTIUM_GLASSHIVE_BROKER_DISCOVERY_RETRY_DELAY_MS);
@@ -45,6 +88,72 @@ function brokerProviderTimeoutMs() {
   // so a slow/unavailable provider becomes a clean blocker rather than a hang.
   return Number.isFinite(raw) && raw > 0 ? raw : 45000;
 }
+
+/* === VIVENTIUM START ===
+ * Feature: grant-scoped broker discovery reuse
+ * Purpose: `tools/list` already proves the provider schemas for this short-lived signed grant.
+ * Reuse only that successful schema discovery during the ensuing tool calls so an MCP client's
+ * request deadline is spent on the real provider operation, while user existence and current
+ * policy authorization are still revalidated on every request. */
+function brokerDiscoveryCacheTtlMs() {
+  const raw = Number(process.env.VIVENTIUM_GLASSHIVE_BROKER_DISCOVERY_CACHE_TTL_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_DISCOVERY_CACHE_TTL_MS;
+}
+
+function discoveryCacheKey(grant = {}) {
+  const grantId = String(grant.grant_id || '').trim();
+  const userId = String(grant.user_id || '').trim();
+  const nonce = String(grant.nonce || '').trim();
+  return grantId && userId && nonce ? `${grantId}:${userId}:${nonce}` : '';
+}
+
+function pruneDiscoveryCache(nowMs = Date.now()) {
+  for (const [key, record] of GRANT_DISCOVERY_CACHE.entries()) {
+    if (!record || Number(record.expiresAtMs) <= nowMs) {
+      GRANT_DISCOVERY_CACHE.delete(key);
+    }
+  }
+  while (GRANT_DISCOVERY_CACHE.size > MAX_DISCOVERY_CACHE_GRANTS) {
+    GRANT_DISCOVERY_CACHE.delete(GRANT_DISCOVERY_CACHE.keys().next().value);
+  }
+}
+
+function cachedServerDiscovery(grant, serverName, nowMs = Date.now()) {
+  pruneDiscoveryCache(nowMs);
+  const key = discoveryCacheKey(grant);
+  if (!key) {
+    return null;
+  }
+  return GRANT_DISCOVERY_CACHE.get(key)?.servers?.get(serverName) || null;
+}
+
+function rememberServerDiscovery(grant, serverName, discovered, nowMs = Date.now()) {
+  if (!discovered?.success || !Array.isArray(discovered.tools) || discovered.tools.length === 0) {
+    return;
+  }
+  const key = discoveryCacheKey(grant);
+  if (!key) {
+    return;
+  }
+  const grantExpiryMs = Number(grant.exp) * 1000;
+  const expiresAtMs = Math.min(
+    nowMs + brokerDiscoveryCacheTtlMs(),
+    Number.isFinite(grantExpiryMs) ? grantExpiryMs : nowMs + brokerDiscoveryCacheTtlMs(),
+  );
+  if (expiresAtMs <= nowMs) {
+    return;
+  }
+  const existing = GRANT_DISCOVERY_CACHE.get(key);
+  const record =
+    existing && Number(existing.expiresAtMs) > nowMs
+      ? existing
+      : { expiresAtMs, servers: new Map() };
+  record.expiresAtMs = Math.min(record.expiresAtMs, expiresAtMs);
+  record.servers.set(serverName, discovered);
+  GRANT_DISCOVERY_CACHE.set(key, record);
+  pruneDiscoveryCache(nowMs);
+}
+/* === VIVENTIUM END === */
 
 async function userForGrant(grant) {
   const userId = String(grant?.user_id || '').trim();
@@ -96,6 +205,7 @@ async function requestedServersFromGrant(grant, user, registry, requestedServerN
     for (const serverName of collectAllowedServers({
       mcpConfig: mcpConfig || {},
       executionMode: grant.execution_mode,
+      reqUser: user,
     })) {
       if (!requested || requested.includes(serverName)) {
         servers.add(serverName);
@@ -134,11 +244,11 @@ async function discoverServerTools({ user, serverName, serverConfig, signal } = 
       };
     }
   }
-  const discoverOnce = (forceNew) =>
+  const discoverOnce = () =>
     reinitMCPServer({
       user,
       signal,
-      forceNew,
+      forceNew: false,
       serverName,
       serverConfig,
       returnOnOAuth: true,
@@ -155,7 +265,7 @@ async function discoverServerTools({ user, serverName, serverConfig, signal } = 
    *   actual call, especially when a harness retries in parallel. Reuse first; only force a
    *   fresh connection when discovery proves the cached connection stale or empty.
    */
-  let result = await discoverOnce(false);
+  let result = await discoverOnce();
   const toolCount = () => (Array.isArray(result?.tools) ? result.tools.length : 0);
   const shouldRetry =
     !signal?.aborted && !result?.oauthRequired && (!result?.success || toolCount() === 0);
@@ -166,7 +276,7 @@ async function discoverServerTools({ user, serverName, serverConfig, signal } = 
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
     if (!signal?.aborted) {
-      result = await discoverOnce(true);
+      result = await discoverOnce();
     }
   }
   /* === VIVENTIUM END === */
@@ -201,12 +311,28 @@ function omissionReasonForDiscovery(discovered) {
   return '';
 }
 
-async function buildCapabilityCatalog({ grant, signal, requestedServerNames } = {}) {
+async function buildCapabilityCatalog({ grant, signal, requestedServerNames, appConfig } = {}) {
   const user = await userForGrant(grant);
   const registry = getMCPServersRegistry();
   const tools = [];
   const servers = [];
   const omissions = [];
+  const hostTools = [];
+  const claimedBrokerToolNames = new Map();
+
+  for (const toolName of grant?.allowed_host_tools || []) {
+    const definition = HOST_TOOL_DEFINITIONS[toolName];
+    if (!definition) {
+      omissions.push({ reason: 'unsupported_host_tool', tool: toolName });
+      continue;
+    }
+    const resources = grant?.host_tool_resources?.[toolName];
+    if (toolName === 'file_search' && !Array.isArray(resources?.files)) {
+      omissions.push({ reason: 'missing_host_tool_resources', tool: toolName });
+      continue;
+    }
+    hostTools.push({ toolName, definition, resources });
+  }
 
   for (const serverName of await requestedServersFromGrant(
     grant,
@@ -220,12 +346,24 @@ async function buildCapabilityCatalog({ grant, signal, requestedServerNames } = 
       omissions.push(logOmission('policy_not_authorized', serverName));
       continue;
     }
-    let discovered;
-    try {
-      discovered = await discoverServerTools({ user, serverName, serverConfig, signal });
-    } catch (error) {
-      omissions.push(logOmission('discovery_failed', serverName, { message: error?.message }));
-      continue;
+    const explicitDeferredRequest = Array.isArray(requestedServerNames);
+    let discovered = explicitDeferredRequest ? null : cachedServerDiscovery(grant, serverName);
+    if (discovered) {
+      logger.info('[VIVENTIUM][glasshive-capability-broker] Reused grant-scoped discovery', {
+        grantId: grant.grant_id,
+        serverName,
+        toolCount: discovered.tools.length,
+      });
+    } else {
+      try {
+        discovered = await discoverServerTools({ user, serverName, serverConfig, signal });
+        if (!explicitDeferredRequest) {
+          rememberServerDiscovery(grant, serverName, discovered);
+        }
+      } catch (error) {
+        omissions.push(logOmission('discovery_failed', serverName, { message: error?.message }));
+        continue;
+      }
     }
     const omissionReason = omissionReasonForDiscovery(discovered);
     if (omissionReason) {
@@ -255,7 +393,7 @@ async function buildCapabilityCatalog({ grant, signal, requestedServerNames } = 
       if (!name) {
         continue;
       }
-      const brokerName = brokerToolName(serverName, name);
+      const brokerName = collisionSafeBrokerToolName(serverName, name, claimedBrokerToolNames);
       tools.push({
         serverName,
         toolName: name,
@@ -280,6 +418,8 @@ async function buildCapabilityCatalog({ grant, signal, requestedServerNames } = 
     servers,
     omissions,
     tools,
+    hostTools,
+    appConfig,
     helperTools: helperToolDefinitions(),
     deferredServers: (grant?.deferred_servers || [])
       .map((server) => String(server || '').trim())
@@ -294,7 +434,9 @@ function toolDefinitionsForMcp(catalog) {
       name: tool.name,
       description: tool.description,
       inputSchema: tool.inputSchema,
+      annotations: tool.annotations,
     })),
+    ...catalog.hostTools.map((item) => item.definition),
     ...catalog.tools.map((item) => item.definition),
   ];
 }
@@ -310,9 +452,99 @@ function publicCatalog(catalog) {
       access: item.definition.annotations.access,
       riskClass: item.definition.annotations.riskClass,
     })),
+    hostTools: catalog.hostTools.map((item) => ({
+      name: item.toolName,
+      access: 'read',
+      transport: 'host',
+    })),
     omissions: catalog.omissions,
     deferredServers: catalog.deferredServers || [],
   };
+}
+
+function findHostTool(catalog, toolName) {
+  return catalog.hostTools.find((item) => item.toolName === toolName);
+}
+
+async function invokeHostTool({ grant, catalog, hostTool, args = {}, signal } = {}) {
+  const query = typeof args.query === 'string' ? args.query.trim() : '';
+  if (!query) {
+    return { status: 'blocked', reason: 'invalid_arguments', tool: hostTool.toolName };
+  }
+  try {
+    let content;
+    let artifact;
+    let resourceCount;
+    if (hostTool.toolName === 'file_search') {
+      const fileSearchTool = await createFileSearchTool({
+        userId: catalog.user.id,
+        files: hostTool.resources.files,
+        entity_id: String(hostTool.resources.entity_id || '').trim() || undefined,
+        conversationId: String(grant?.conversation_id || '').trim() || undefined,
+        activeMessageId: String(grant?.message_id || '').trim() || undefined,
+        fileCitations: false,
+      });
+      [content, artifact] = await fileSearchTool.func({ query });
+      resourceCount = hostTool.resources.files.length;
+    } else if (hostTool.toolName === 'web_search') {
+      const auth = await loadWebSearchAuth({
+        userId: catalog.user.id,
+        loadAuthValues,
+        webSearchConfig: catalog.appConfig?.webSearch,
+        throwError: true,
+      });
+      if (!auth?.authenticated) {
+        return {
+          status: 'blocked',
+          reason: 'missing_auth_or_config',
+          tool: hostTool.toolName,
+          retryable: false,
+        };
+      }
+      const webSearchTool = createViventiumSearchTool({
+        ...auth.authResult,
+        logger,
+      });
+      [content, artifact] = await webSearchTool.func({ ...args, query }, undefined, {
+        ...(signal ? { signal } : {}),
+        toolCall: { id: 'broker-web-search', name: 'web_search', turn: 0 },
+        metadata: {
+          user_id: catalog.user.id,
+          thread_id: String(grant?.conversation_id || '').trim(),
+          run_id: String(grant?.message_id || '').trim(),
+        },
+      });
+    } else {
+      return { status: 'not_found', tool: hostTool.toolName };
+    }
+    logger.info('[VIVENTIUM][glasshive-capability-broker] Host tool invoked', {
+      userId: catalog.user.id,
+      grantId: grant.grant_id,
+      toolName: hostTool.toolName,
+      ...(resourceCount !== undefined ? { resourceCount } : {}),
+      hasArtifact: artifact != null,
+      outcome: 'success',
+    });
+    return {
+      status: 'ok',
+      tool: hostTool.toolName,
+      content: String(content || ''),
+      ...(artifact != null ? { artifact } : {}),
+    };
+  } catch (error) {
+    logger.warn('[VIVENTIUM][glasshive-capability-broker] Host tool call failed', {
+      userId: catalog.user.id,
+      grantId: grant.grant_id,
+      toolName: hostTool.toolName,
+      message: error?.message,
+    });
+    return {
+      status: 'blocked',
+      reason: 'host_tool_error',
+      tool: hostTool.toolName,
+      retryable: true,
+    };
+  }
 }
 
 function findNativeTool(catalog, brokerToolNameValue) {
@@ -449,6 +681,23 @@ async function invokeUnderlyingTool({ grant, catalog, nativeTool, args = {}, sig
   let timedOut = false;
   let timeoutHandle = null;
   let result;
+  const providerCallStartedAt = Date.now();
+  logger.info(
+    `[VIVENTIUM][glasshive-capability-broker] Provider tool call starting ` +
+      `(parent_signal_present=${Boolean(signal)} ` +
+      `parent_signal_aborted=${signal?.aborted === true} ` +
+      `broker_signal_aborted=${requestOptions.signal?.aborted === true})`,
+    {
+      userId: catalog.user.id,
+      grantId: grant.grant_id,
+      serverName: nativeTool.serverName,
+      toolName: nativeTool.toolName,
+      parentSignalPresent: Boolean(signal),
+      parentSignalAborted: signal?.aborted === true,
+      brokerSignalAborted: requestOptions.signal?.aborted === true,
+      timeoutMs: providerTimeoutMs,
+    },
+  );
   try {
     result = await Promise.race([
       mcpManager.callTool({
@@ -487,15 +736,26 @@ async function invokeUnderlyingTool({ grant, catalog, nativeTool, args = {}, sig
     const message = String((error && error.message) || '');
     const isTimeout =
       timedOut || /timed out|timeout|ETIMEDOUT|ESOCKETTIMEDOUT|abort/i.test(message);
-    logger.warn('[VIVENTIUM][glasshive-capability-broker] Provider tool call failed', {
-      userId: catalog.user.id,
-      grantId: grant.grant_id,
-      serverName: nativeTool.serverName,
-      toolName: nativeTool.toolName,
-      timedOut: isTimeout,
-      timeoutMs: providerTimeoutMs,
-      message,
-    });
+    logger.warn(
+      `[VIVENTIUM][glasshive-capability-broker] Provider tool call failed ` +
+        `(elapsed_ms=${Date.now() - providerCallStartedAt} ` +
+        `parent_signal_present=${Boolean(signal)} ` +
+        `parent_signal_aborted=${signal?.aborted === true} ` +
+        `broker_signal_aborted=${requestOptions.signal?.aborted === true})`,
+      {
+        userId: catalog.user.id,
+        grantId: grant.grant_id,
+        serverName: nativeTool.serverName,
+        toolName: nativeTool.toolName,
+        timedOut: isTimeout,
+        timeoutMs: providerTimeoutMs,
+        elapsedMs: Date.now() - providerCallStartedAt,
+        parentSignalPresent: Boolean(signal),
+        parentSignalAborted: signal?.aborted === true,
+        brokerSignalAborted: requestOptions.signal?.aborted === true,
+        message,
+      },
+    );
     return {
       status: 'blocked',
       reason: isTimeout ? 'provider_degraded' : 'provider_error',
@@ -524,9 +784,9 @@ async function invokeUnderlyingTool({ grant, catalog, nativeTool, args = {}, sig
   /* === VIVENTIUM END === */
 }
 
-async function handleToolCall({ grant, toolName, args = {}, signal } = {}) {
+async function handleToolCall({ grant, toolName, args = {}, signal, appConfig } = {}) {
   if (toolName === 'capabilities_list') {
-    const catalog = await buildCapabilityCatalog({ grant, signal });
+    const catalog = await buildCapabilityCatalog({ grant, signal, appConfig });
     return publicCatalog(catalog);
   }
   if (toolName === 'capability_describe') {
@@ -534,6 +794,7 @@ async function handleToolCall({ grant, toolName, args = {}, signal } = {}) {
     const catalog = await buildCapabilityCatalog({
       grant,
       signal,
+      appConfig,
       requestedServerNames: requested.server ? [requested.server] : undefined,
     });
     if (requested.tool) {
@@ -555,6 +816,7 @@ async function handleToolCall({ grant, toolName, args = {}, signal } = {}) {
     const catalog = await buildCapabilityCatalog({
       grant,
       signal,
+      appConfig,
       requestedServerNames: args.server ? [args.server] : [],
     });
     const native = findNativeToolByServerTool(catalog, args.server, args.tool);
@@ -569,11 +831,18 @@ async function handleToolCall({ grant, toolName, args = {}, signal } = {}) {
       grant,
       catalog,
       nativeTool: native,
-      args: args.arguments || {},
+      args: {
+        ...(args.arguments || {}),
+        ...(args.invocation_id ? { invocation_id: args.invocation_id } : {}),
+      },
       signal,
     });
   }
-  const catalog = await buildCapabilityCatalog({ grant, signal });
+  const catalog = await buildCapabilityCatalog({ grant, signal, appConfig });
+  const hostTool = findHostTool(catalog, toolName);
+  if (hostTool) {
+    return invokeHostTool({ grant, catalog, hostTool, args, signal });
+  }
   const nativeTool = findNativeTool(catalog, toolName);
   if (!nativeTool) {
     return { status: 'not_found', tool: toolName };

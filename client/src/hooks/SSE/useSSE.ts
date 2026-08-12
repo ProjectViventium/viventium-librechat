@@ -210,6 +210,8 @@ export default function useSSE(
           direct_action_surface_scopes: cortexData.direct_action_surface_scopes,
           configured_tools: cortexData.configured_tools,
           completed_tool_calls: cortexData.completed_tool_calls,
+          fallback_used: cortexData.fallback_used,
+          fallback_reason_class: cortexData.fallback_reason_class,
           status_changed_at: cortexData.status_changed_at,
         };
 

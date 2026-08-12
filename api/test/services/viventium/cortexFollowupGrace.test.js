@@ -8,7 +8,10 @@
  * Details: docs/requirements_and_learnings/02_Background_Agents.md
  * === VIVENTIUM NOTE === */
 
-const { getCortexFollowupGraceMs } = require('~/server/services/viventium/cortexFollowupGrace');
+const {
+  getCortexFollowupGraceMs,
+  getCortexFollowupGraceSeconds,
+} = require('~/server/services/viventium/cortexFollowupGrace');
 
 describe('cortexFollowupGrace', () => {
   const originalEnv = process.env;
@@ -36,5 +39,16 @@ describe('cortexFollowupGrace', () => {
   test('converts seconds to milliseconds', () => {
     process.env.VIVENTIUM_CORTEX_FOLLOWUP_GRACE_S = '1.5';
     expect(getCortexFollowupGraceMs()).toBe(1500);
+  });
+
+  test('projects the same canonical value in seconds for startup clients', () => {
+    delete process.env.VIVENTIUM_CORTEX_FOLLOWUP_GRACE_S;
+    expect(getCortexFollowupGraceSeconds()).toBe(30);
+
+    process.env.VIVENTIUM_CORTEX_FOLLOWUP_GRACE_S = '45.5';
+    expect(getCortexFollowupGraceSeconds()).toBe(45.5);
+
+    process.env.VIVENTIUM_CORTEX_FOLLOWUP_GRACE_S = '0';
+    expect(getCortexFollowupGraceSeconds()).toBe(0);
   });
 });

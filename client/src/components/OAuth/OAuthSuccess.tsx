@@ -8,6 +8,7 @@ export default function OAuthSuccess() {
   const [secondsLeft, setSecondsLeft] = useState(3);
   const serverName = searchParams.get('serverName');
   const provider = searchParams.get('provider');
+  const attemptId = searchParams.get('attemptId');
 
   useEffect(() => {
     /* === VIVENTIUM START ===
@@ -19,6 +20,7 @@ export default function OAuthSuccess() {
         {
           type: 'viventium_connected_account_oauth_success',
           provider,
+          attemptId,
         },
         window.location.origin,
       );
@@ -36,7 +38,7 @@ export default function OAuthSuccess() {
     }, 1000);
 
     return () => clearInterval(countdown);
-  }, [provider]);
+  }, [attemptId, provider]);
 
   return (
     <div className="flex min-h-screen items-center justify-center bg-gray-50 p-8">

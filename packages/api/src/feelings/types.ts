@@ -48,6 +48,7 @@ export type FeelingLevelDefinition = {
   id: FeelingLevelId;
   min: number;
   max: number;
+  required: boolean;
   word: string;
   instruction: string;
 };

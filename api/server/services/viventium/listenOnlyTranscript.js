@@ -15,6 +15,22 @@ function isListenOnlyTranscriptMessage(message) {
   );
 }
 
+function isAmbientVoiceTranscriptMessage(message) {
+  const metadata = message?.metadata?.viventium;
+  return (
+    metadata &&
+    typeof metadata === 'object' &&
+    metadata.type === 'voice_ambient_transcript' &&
+    ['authenticated_participant', 'shared_mic_unverified', 'unknown'].includes(metadata.actorTrust)
+  );
+}
+
+function isPassiveVoiceTranscriptMessage(message) {
+  return isListenOnlyTranscriptMessage(message) || isAmbientVoiceTranscriptMessage(message);
+}
+
 module.exports = {
+  isAmbientVoiceTranscriptMessage,
   isListenOnlyTranscriptMessage,
+  isPassiveVoiceTranscriptMessage,
 };

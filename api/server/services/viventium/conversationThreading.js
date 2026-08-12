@@ -3,7 +3,7 @@
 const { logger } = require('@librechat/data-schemas');
 const { getConvo, getMessages } = require('~/models');
 const {
-  isListenOnlyTranscriptMessage,
+  isPassiveVoiceTranscriptMessage,
 } = require('~/server/services/viventium/listenOnlyTranscript');
 
 function toTimestampMs(value) {
@@ -45,7 +45,7 @@ function resolveLatestLeafMessageId(messages) {
 
   const hasChildren = new Set();
   for (const message of messages) {
-    if (isListenOnlyTranscriptMessage(message)) {
+    if (isPassiveVoiceTranscriptMessage(message)) {
       continue;
     }
     const parentMessageId = message?.parentMessageId;
@@ -57,7 +57,7 @@ function resolveLatestLeafMessageId(messages) {
   let latestLeaf = null;
   let latestLeafMs = NaN;
   for (const message of messages) {
-    if (isListenOnlyTranscriptMessage(message)) {
+    if (isPassiveVoiceTranscriptMessage(message)) {
       continue;
     }
     const messageId = message?.messageId ?? message?.id;
@@ -96,7 +96,7 @@ function resolveLatestLeafMessageId(messages) {
 
   const fallback = [...messages]
     .reverse()
-    .find((message) => !isListenOnlyTranscriptMessage(message));
+    .find((message) => !isPassiveVoiceTranscriptMessage(message));
   return fallback?.messageId ?? fallback?.id ?? null;
 }
 
@@ -182,7 +182,7 @@ async function resolveReusableConversationState({
     messages =
       (await getMessages(
         { conversationId },
-        'messageId parentMessageId createdAt metadata.viventium.type metadata.viventium.mode',
+        'messageId parentMessageId createdAt metadata.viventium.type metadata.viventium.mode metadata.viventium.actorTrust',
       )) ?? [];
   } catch (err) {
     logger.warn(

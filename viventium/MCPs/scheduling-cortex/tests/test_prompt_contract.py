@@ -6,13 +6,29 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from scheduling_cortex.server import (
     SCHEDULING_CORTEX_INSTRUCTIONS,
     _serialize_periphery_list_for_agent,
     _serialize_periphery_read_for_agent,
     build_server,
+)
+from scheduling_cortex import dispatch
+
+SHARED_ROOT = ROOT.parents[3] / "shared"
+if str(SHARED_ROOT) not in sys.path:
+    sys.path.insert(0, str(SHARED_ROOT))
+from scheduler_prompt_contract import (  # noqa: E402
+    CONSCIOUSNESS_CONTINUITY_OPPORTUNITY_PROMPT_ID,
+    SCHEDULER_RUN_ENVELOPE_PROMPT_ID,
+    SCHEDULER_RUN_ENVELOPE_TEMPLATE,
+    render_scheduler_run_envelope,
 )
 from scheduling_cortex.storage import ScheduleStorage, StorageConfig
 
@@ -123,6 +139,64 @@ def test_create_and_update_descriptions_prevent_duplicate_starter_briefings(tmp_
     assert "duplicate" in combined
 
 
+def test_create_description_makes_one_time_schedule_discriminator_explicit(tmp_path: Path) -> None:
+    mcp = _build_test_server(tmp_path)
+    description = str(_tools_by_name(mcp)["schedule_create"].description or "").lower()
+
+    assert "schedule.type" in description
+    assert "'once'" in description
+    assert "run_at" in description
+    assert "timezone" in description
+
+
+def test_registry_source_shared_artifact_and_runtime_scheduler_envelope_are_equal() -> None:
+    source = (
+        ROOT.parents[1]
+        / "source_of_truth"
+        / "prompts"
+        / "scheduler"
+        / "run_envelope.md"
+    )
+    registry = ROOT.parents[1] / "source_of_truth" / "prompts" / "registry.yaml"
+    source_text = source.read_text(encoding="utf-8")
+    source_body = source_text.split("---", 2)[-1].strip()
+    registry_text = registry.read_text(encoding="utf-8")
+    context = "- scheduled_due_at_utc: 2026-08-10T12:00:00Z"
+
+    assert "scheduler.run_envelope:" in registry_text
+    assert "path: viventium_v0_4/shared/scheduler_prompt_contract.py" in registry_text
+    assert "selector: SCHEDULER_RUN_ENVELOPE_TEMPLATE" in registry_text
+    assert source_body == SCHEDULER_RUN_ENVELOPE_TEMPLATE
+    assert dispatch.SCHEDULER_RUN_ENVELOPE_TEMPLATE is SCHEDULER_RUN_ENVELOPE_TEMPLATE
+    assert dispatch.render_scheduler_run_envelope is render_scheduler_run_envelope
+    assert dispatch._default_scheduler_run_envelope(context) == render_scheduler_run_envelope(context)
+
+
+def test_registry_source_shared_artifact_and_runtime_continuity_id_are_equal() -> None:
+    source = (
+        ROOT.parents[1]
+        / "source_of_truth"
+        / "prompts"
+        / "scheduler"
+        / "consciousness_continuity_opportunity.md"
+    )
+    registry = ROOT.parents[1] / "source_of_truth" / "prompts" / "registry.yaml"
+    source_text = source.read_text(encoding="utf-8")
+    registry_text = registry.read_text(encoding="utf-8")
+
+    assert "id: scheduler.consciousness_continuity_opportunity" in source_text
+    assert "scheduler.consciousness_continuity_opportunity:" in registry_text
+    assert "selector: CONSCIOUSNESS_CONTINUITY_OPPORTUNITY_PROMPT_ID" in registry_text
+    assert SCHEDULER_RUN_ENVELOPE_PROMPT_ID == "scheduler.run_envelope"
+    assert CONSCIOUSNESS_CONTINUITY_OPPORTUNITY_PROMPT_ID == (
+        "scheduler.consciousness_continuity_opportunity"
+    )
+    assert dispatch.SCHEDULER_RUN_ENVELOPE_PROMPT_ID is SCHEDULER_RUN_ENVELOPE_PROMPT_ID
+    assert dispatch.CONSCIOUSNESS_CONTINUITY_OPPORTUNITY_PROMPT_ID is (
+        CONSCIOUSNESS_CONTINUITY_OPPORTUNITY_PROMPT_ID
+    )
+
+
 def test_full_detail_read_description_keeps_raw_fields_private(tmp_path: Path) -> None:
     mcp = _build_test_server(tmp_path)
     tools = _tools_by_name(mcp)
@@ -203,6 +277,70 @@ def test_periphery_list_is_compact_and_hides_storage_details() -> None:
     assert "private-run-hash" not in encoded
     assert "private-invalid.json" not in encoded
     assert "artifact-current-older" not in encoded
+
+
+def test_periphery_list_surfaces_private_artifact_access_blockers_without_paths() -> None:
+    raw = {
+        "index": {
+            "status": "blocked",
+            "blockedReasons": ["private_permissions_unavailable"],
+            "artifactCount": 0,
+            "invalidArtifactCount": 1,
+            "qualityCounts": {},
+        },
+        "artifacts": [],
+        "invalidArtifacts": [
+            {
+                "relativePath": "health_context/2026/08/private.json",
+                "reason": "private_permissions_unavailable",
+            }
+        ],
+    }
+
+    result = _serialize_periphery_list_for_agent(raw)
+    encoded = json.dumps(result)
+
+    assert result["availability"] == {
+        "status": "blocked",
+        "reasons": ["private_permissions_unavailable"],
+        "blockedCount": 1,
+        "guidance": [
+            "Private insight permissions could not be verified; check ownership and filesystem support."
+        ],
+    }
+    assert "health_context/2026/08/private.json" not in encoded
+
+
+def test_periphery_list_keeps_available_insights_when_one_private_artifact_is_withheld() -> None:
+    raw = {
+        "index": {
+            "status": "degraded",
+            "blockedReasons": ["unsafe_hard_link"],
+            "blockedArtifactCount": 1,
+            "artifactCount": 1,
+            "invalidArtifactCount": 1,
+            "qualityCounts": {"passed": 1},
+        },
+        "artifacts": [
+            {
+                "artifactId": "artifact-current",
+                "moduleId": "health_context",
+                "generatedAt": "2026-08-10T16:02:38Z",
+                "qualityStatus": "passed",
+                "stale": False,
+            }
+        ],
+        "invalidArtifacts": [{"relativePath": "private.json", "reason": "unsafe_hard_link"}],
+    }
+
+    result = _serialize_periphery_list_for_agent(raw)
+    encoded = json.dumps(result)
+
+    assert result["availability"]["status"] == "degraded"
+    assert result["availability"]["blockedCount"] == 1
+    assert result["currentInsights"][0]["insightRef"] == "artifact-current"
+    assert "restore it as a normal private file" in result["availability"]["guidance"][0]
+    assert "private.json" not in encoded
 
 
 def test_periphery_read_keeps_evidence_but_hides_internal_references() -> None:

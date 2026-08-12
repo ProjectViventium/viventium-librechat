@@ -21,9 +21,10 @@ const CORTEX_TYPES = new Set([
   ContentTypes.CORTEX_BREWING,
   ContentTypes.CORTEX_INSIGHT,
 ]);
-const DEFAULT_CORTEX_EXECUTION_TIMEOUT_MS = 3_600_000;
+const DEFAULT_STALE_RECOVERY_TIMEOUT_MS = 240_000;
 const DEFAULT_STALE_RECOVERY_GRACE_MS = 60_000;
 const DEFAULT_STALE_RECOVERY_INTERVAL_MS = 60_000;
+const PROCESS_STARTED_AT_MS = Date.now();
 
 function parsePositiveInt(value) {
   const parsed = parseInt(String(value || '').trim(), 10);
@@ -31,10 +32,7 @@ function parsePositiveInt(value) {
 }
 
 function getConfiguredCortexExecutionTimeoutMs() {
-  return (
-    parsePositiveInt(process.env.VIVENTIUM_CORTEX_EXECUTION_TIMEOUT_MS) ||
-    DEFAULT_CORTEX_EXECUTION_TIMEOUT_MS
-  );
+  return parsePositiveInt(process.env.VIVENTIUM_CORTEX_EXECUTION_TIMEOUT_MS) || 0;
 }
 
 function getStaleCortexRecoveryConfig() {
@@ -43,7 +41,9 @@ function getStaleCortexRecoveryConfig() {
   const graceMs =
     parsePositiveInt(process.env.VIVENTIUM_STALE_CORTEX_RECOVERY_GRACE_MS) ||
     DEFAULT_STALE_RECOVERY_GRACE_MS;
-  const minimumTimeoutMs = cortexExecutionTimeoutMs + graceMs;
+  const minimumTimeoutMs = cortexExecutionTimeoutMs
+    ? cortexExecutionTimeoutMs + graceMs
+    : DEFAULT_STALE_RECOVERY_TIMEOUT_MS;
   const rawLimit = Number(process.env.VIVENTIUM_STALE_CORTEX_RECOVERY_LIMIT);
   return {
     timeoutMs: Math.max(configuredTimeoutMs || 0, minimumTimeoutMs),
@@ -299,7 +299,10 @@ async function recoverDeferredHoldParentErrorCards({ limit = 100 } = {}) {
 
 async function recoverStaleCortexMessages({ now = new Date() } = {}) {
   const { timeoutMs, limit, cortexExecutionTimeoutMs, graceMs } = getStaleCortexRecoveryConfig();
-  const cutoff = new Date(now.getTime() - timeoutMs);
+  // Never classify work created by this API process as restart-orphaned. The age threshold can
+  // advance up to process start, but not beyond it; an explicitly configured execution deadline
+  // remains owned by the executor itself.
+  const cutoff = new Date(Math.min(now.getTime() - timeoutMs, PROCESS_STARTED_AT_MS));
   const nowIso = now.toISOString();
 
   const messages = await Message.find({

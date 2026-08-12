@@ -20,6 +20,11 @@ jest.mock('~/utils', () => ({
       .join(' '),
 }));
 
+jest.mock('~/hooks', () => ({
+  useLocalize: () => (key: string) =>
+    key === 'com_ui_model_fallback_used' ? 'Model fallback used' : key,
+}));
+
 class ResizeObserverMock {
   observe() {}
   disconnect() {}
@@ -255,5 +260,23 @@ describe('ProgressText and background cortex status layout', () => {
     expect(screen.queryByText(/Additional thought/)).not.toBeInTheDocument();
     expect(screen.queryByText(/Insight from Confirmation Bias/)).not.toBeInTheDocument();
     expect(screen.getByText(/Confirmation Bias/)).toBeInTheDocument();
+  });
+
+  it('renders and expands a persisted background model fallback disclosure', () => {
+    render(
+      <CortexCall
+        cortex_id="research"
+        cortex_name="Deep Research"
+        status="complete"
+        insight="Useful fallback evidence."
+        fallback_used={true}
+        fallback_reason_class="provider_unauthorized"
+      />,
+    );
+
+    expect(screen.getByRole('button')).toHaveTextContent('Deep Research · Model fallback used');
+    fireEvent.click(screen.getByRole('button'));
+    expect(screen.getByText('Model fallback used')).toBeInTheDocument();
+    expect(screen.getByText('Reason: Provider authentication issue')).toBeInTheDocument();
   });
 });

@@ -832,7 +832,7 @@ describe('Memory snapshot loading', () => {
     expect(context.text).not.toContain('Old core memory.');
     expect(context.text).not.toContain('Legacy key should not be injected.');
     expect(context.text).toContain('## world');
-    expect(context.text).toContain('...');
+    expect(context.text).toContain('Memory read boundary');
     expect(context.includedKeys).toEqual(['core', 'world']);
     expect(context.duplicateKeys).toEqual(['core']);
     expect(methods.getAllUserMemories).toHaveBeenCalledWith(userId);
@@ -874,7 +874,7 @@ describe('Memory snapshot loading', () => {
     });
 
     expect(context.text).toContain('Older world context.');
-    expect(context.text).toContain('...');
+    expect(context.text).toContain('Memory read boundary');
     expect(context.text).toContain(tailFact);
     expect(context.omittedKeys).toContain('world:truncated');
   });
@@ -975,6 +975,80 @@ describe('Memory snapshot loading', () => {
       expect(gate.message).toContain('Reconnect');
       expect(gate.shouldLog).toBe(true);
     }
+  });
+
+  it('recognizes nested provider authorization failures and clears every model after reconnect', () => {
+    markMemoryWriterFailure({
+      userId: 'user-axios',
+      provider: Providers.OPENAI,
+      model: 'gpt-model-a',
+      error: { response: { status: 401 } },
+    });
+    markMemoryWriterFailure({
+      userId: 'user-axios',
+      provider: Providers.OPENAI,
+      model: 'gpt-model-b',
+      error: { response: { status: 403 } },
+    });
+
+    expect(
+      getMemoryWriterHealthGate({
+        userId: 'user-axios',
+        provider: Providers.OPENAI,
+        model: 'gpt-model-a',
+      }).blocked,
+    ).toBe(true);
+    expect(
+      getMemoryWriterHealthGate({
+        userId: 'user-axios',
+        provider: Providers.OPENAI,
+        model: 'gpt-model-b',
+      }).blocked,
+    ).toBe(true);
+
+    clearMemoryWriterHealth({ userId: 'user-axios', provider: Providers.OPENAI });
+
+    expect(
+      getMemoryWriterHealthGate({
+        userId: 'user-axios',
+        provider: Providers.OPENAI,
+        model: 'gpt-model-a',
+      }).blocked,
+    ).toBe(false);
+    expect(
+      getMemoryWriterHealthGate({
+        userId: 'user-axios',
+        provider: Providers.OPENAI,
+        model: 'gpt-model-b',
+      }).blocked,
+    ).toBe(false);
+  });
+
+  it('clears provider suppression when reconnect uses a differently cased provider alias', () => {
+    markMemoryWriterFailure({
+      userId: 'user-provider-alias',
+      provider: 'openai',
+      model: 'gpt-5.6-luna',
+      error: { response: { status: 401 } },
+    });
+
+    expect(
+      getMemoryWriterHealthGate({
+        userId: 'user-provider-alias',
+        provider: 'openAI',
+        model: 'gpt-5.6-luna',
+      }).blocked,
+    ).toBe(true);
+
+    clearMemoryWriterHealth({ userId: 'user-provider-alias', provider: 'openAI' });
+
+    expect(
+      getMemoryWriterHealthGate({
+        userId: 'user-provider-alias',
+        provider: 'openai',
+        model: 'gpt-5.6-luna',
+      }).blocked,
+    ).toBe(false);
   });
 
   it('loads stored memory without requiring a writer agent', async () => {

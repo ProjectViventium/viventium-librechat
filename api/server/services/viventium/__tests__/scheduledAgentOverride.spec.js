@@ -11,8 +11,8 @@ describe('scheduledAgentOverride', () => {
   test('leaves an ordinary non-scheduler request unchanged', () => {
     const agent = {
       provider: 'anthropic',
-      model: 'claude-sonnet-4-5',
-      model_parameters: { model: 'claude-sonnet-4-5', temperature: 0.2 },
+      model: 'claude-opus-5',
+      model_parameters: { model: 'claude-opus-5', temperature: 0.2 },
       fallback_llm_provider: 'openai',
       fallback_llm_model: 'gpt-5.6-sol',
     };
@@ -148,14 +148,14 @@ describe('scheduledAgentOverride', () => {
   test('removes persisted fallback routes from an authenticated exact scheduled run', () => {
     const agent = {
       provider: 'anthropic',
-      model: 'claude-sonnet-4-5',
-      model_parameters: { model: 'claude-sonnet-4-5' },
+      model: 'claude-opus-5',
+      model_parameters: { model: 'claude-opus-5' },
       fallback_llm_provider: 'anthropic',
       fallback_llm_model: 'claude-opus-4-1',
       fallback_llm_model_parameters: { model: 'claude-opus-4-1' },
       voice_fallback_llm_provider: 'anthropic',
-      voice_fallback_llm_model: 'claude-sonnet-4-5',
-      voice_fallback_llm_model_parameters: { model: 'claude-sonnet-4-5' },
+      voice_fallback_llm_model: 'claude-opus-5',
+      voice_fallback_llm_model_parameters: { model: 'claude-opus-5' },
     };
 
     applyScheduledAgentOverride(agent, {

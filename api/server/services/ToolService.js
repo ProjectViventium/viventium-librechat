@@ -64,6 +64,7 @@ const { loadAuthValues } = require('~/server/services/Tools/credentials');
  */
 const {
   buildMcpOAuthRecovery,
+  hasUsableOAuthTokens,
   inspectStoredOAuthCredentialState,
   reinitMCPServer,
   shouldUseCachedMcpTools,
@@ -89,8 +90,10 @@ const {
 } = require('~/server/services/viventium/telegramTimingDeep');
 const {
   getMcpOAuthWaitDecision,
+  shouldSuppressMcpOAuthFlow,
   stripOAuthPendingMcpTools,
 } = require('~/server/services/viventium/mcpOAuthPolicy');
+const { filterMCPToolsForAudience } = require('~/server/services/viventium/mcpAudiencePolicy');
 // === VIVENTIUM END ===
 const VIVENTIUM_GLASSHIVE_MCP_SERVER_NAME = 'glasshive-workers-projects';
 /* === VIVENTIUM START ===
@@ -586,7 +589,17 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
   const areToolsEnabled = checkCapability(AgentCapabilities.tools);
   const deferredToolsEnabled = checkCapability(AgentCapabilities.deferred_tools);
 
-  const filteredTools = agent.tools?.filter((tool) => {
+  /* === VIVENTIUM START ===
+   * Security: Apply server-declared request audiences before definition discovery or process
+   * startup. Execution repeats the same shared check as defense in depth.
+   * === VIVENTIUM END === */
+  const configServers = await resolveConfigServers(req);
+  const audienceEligibleTools = filterMCPToolsForAudience({
+    tools: agent.tools || [],
+    configServers,
+    reqUser: req.user,
+  });
+  const filteredTools = audienceEligibleTools.filter((tool) => {
     if (tool === Tools.file_search) {
       return checkCapability(AgentCapabilities.file_search);
     }
@@ -618,13 +631,6 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
 
   const flowsCache = getLogStores(CacheKeys.FLOWS);
   const flowManager = getFlowStateManager(flowsCache);
-  /* === VIVENTIUM START ===
-   * Feature: MCP config-server hot-path plumbing.
-   * Purpose: Follow upstream LibreChat's request-scoped config resolution pattern
-   * so MCP reinit can reuse config-source server state when the registry supports it.
-   */
-  const configServers = await resolveConfigServers(req);
-  /* === VIVENTIUM END === */
   const pendingOAuthServers = new Set();
   const mcpCapabilityReadiness = {};
   const oauthRecoveryStatuses = new Set([
@@ -749,6 +755,28 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
       return null;
     }
     // === VIVENTIUM END ===
+
+    /* === VIVENTIUM START ===
+     * Feature: Non-interactive OAuth capability degradation.
+     * Purpose: Do not reuse cached schemas for an OAuth-backed tool when the trusted
+     * background caller has no usable authorization. Otherwise a later tool call could
+     * recreate the same unattended wait that definition loading intentionally avoids.
+     * === VIVENTIUM END === */
+    const suppressOAuthFlow = shouldSuppressMcpOAuthFlow(req);
+    const resolvedServerConfig = configServers?.[serverName];
+    const requiresOAuth = Boolean(
+      resolvedServerConfig?.requiresOAuth || resolvedServerConfig?.oauthMetadata,
+    );
+    if (suppressOAuthFlow && requiresOAuth && !(await hasUsableOAuthTokens(userId, serverName))) {
+      pendingOAuthServers.add(serverName);
+      writeMcpOAuthPendingMemo({
+        userId,
+        serverName,
+        reason: 'oauth_authorization_unavailable',
+      });
+      logFetchDone('oauth_unavailable_noninteractive');
+      return null;
+    }
 
     const cached = await getMCPServerTools(userId, serverName);
     let cachedCredentialState = null;

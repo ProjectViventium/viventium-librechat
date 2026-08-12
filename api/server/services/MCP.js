@@ -39,8 +39,12 @@ const { getLogStores } = require('~/cache');
  * without relying on the chat model to choose connected-account tools.
  * === VIVENTIUM END === */
 const {
+  isGlassHiveLaunchTool,
   maybeInjectGlassHiveCapabilityBroker,
 } = require('~/server/services/viventium/GlassHiveCapabilityBootstrapService');
+const {
+  markCallbackBackedVoiceContinuation,
+} = require('~/server/services/viventium/GlassHiveDispatchContinuationService');
 
 /* === VIVENTIUM START ===
  * Feature: Deep Telegram timing instrumentation (toggleable)
@@ -80,15 +84,19 @@ const _logTelegramMcpTiming = (streamId, step, startTs, extra = '') => {
 async function resolveConfigServers(req) {
   try {
     const registry = getMCPServersRegistry();
-    if (typeof registry.ensureConfigServers !== 'function') {
-      return {};
-    }
     const user = req?.user;
     const appConfig = await getAppConfig({
       role: user?.role,
       userId: user?.id,
     });
-    return await registry.ensureConfigServers(appConfig?.mcpConfig || {});
+    const configServers = appConfig?.mcpConfig || {};
+    if (typeof registry.ensureConfigServers === 'function') {
+      return await registry.ensureConfigServers(configServers);
+    }
+    if (typeof registry.getAllServerConfigs === 'function') {
+      return await registry.getAllServerConfigs(user?.id, configServers);
+    }
+    return configServers;
   } catch (error) {
     logger.warn(
       '[resolveConfigServers] Failed to resolve config servers, degrading to empty:',
@@ -614,6 +622,19 @@ function createToolInstance({
         oauthEnd,
         graphTokenResolver: getGraphApiToken,
       });
+
+      const requestBody = config?.configurable?.requestBody;
+      if (
+        isGlassHiveLaunchTool({ serverName, toolName }) &&
+        requestBody?.voiceMode === true &&
+        typeof requestBody?.viventiumVoiceTaskId === 'string'
+      ) {
+        await markCallbackBackedVoiceContinuation({
+          result,
+          requestBody,
+          continuationKey: config?.toolCall?.id || stepId,
+        });
+      }
 
       if (isAssistantsEndpoint(provider) && Array.isArray(result)) {
         return result[0];

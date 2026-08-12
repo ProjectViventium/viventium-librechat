@@ -8,6 +8,7 @@ const { logger } = require('@librechat/data-schemas');
 const {
   buildEmotionalReactionAgent,
   buildEmotionalReactionInput,
+  countAppliedDeltaMagnitudes,
   feelingStimulusKey,
   runEmotionalReaction,
   scheduleEmotionalReaction,
@@ -63,6 +64,17 @@ function depsFor(state, insight = reactionInsight()) {
 }
 
 describe('EmotionalReactionService', () => {
+  test('reports exact applied delta magnitudes without inventing a second strength classifier', () => {
+    expect(
+      countAppliedDeltaMagnitudes([
+        { before: 50, after: 53 },
+        { before: 50, after: 58 },
+        { before: 50, after: 61 },
+        { before: 50, after: 61 },
+      ]),
+    ).toEqual({ 3: 1, 8: 1, 11: 2 });
+  });
+
   test('builds the approved GPT-5.6 Fast worker and includes only the external stimulus', () => {
     const state = snapshot({
       innerState: {

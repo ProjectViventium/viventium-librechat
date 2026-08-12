@@ -30,6 +30,11 @@ function getCortexFollowupGraceMs() {
   return Math.round(seconds * 1000);
 }
 
+function getCortexFollowupGraceSeconds() {
+  return getCortexFollowupGraceMs() / 1000;
+}
+
 module.exports = {
   getCortexFollowupGraceMs,
+  getCortexFollowupGraceSeconds,
 };

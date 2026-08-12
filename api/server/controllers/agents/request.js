@@ -31,6 +31,7 @@ const { disposeClient, clientRegistry, requestDataMap } = require('~/server/clea
 const { handleAbortError } = require('~/server/middleware');
 const { logViolation } = require('~/cache');
 const { saveMessage } = require('~/models');
+const { Conversation, Message } = require('~/db/models');
 /* === VIVENTIUM NOTE ===
  * Feature: Deep Telegram timing instrumentation (toggleable)
  */
@@ -43,6 +44,7 @@ const {
   formatVoiceLatencyTiming,
   voiceLatencyNow,
 } = require('~/server/services/viventium/voiceLatencyTiming');
+const { getCortexFollowupGraceMs } = require('~/server/services/viventium/cortexFollowupGrace');
 const { attachVoiceMessageMetadata } = require('~/server/services/viventium/voiceMessageMetadata');
 /* === VIVENTIUM NOTE END === */
 
@@ -65,19 +67,263 @@ const { stripVoiceControlTagsForDisplay } = require('~/server/services/viventium
 const {
   sanitizeVoiceAssistantMessageForPersistence,
 } = require('~/server/services/viventium/voiceArtifactText');
+const {
+  isVoiceTaskSuppressedDurably,
+  setVoiceTaskOwnerCapabilities,
+} = require('~/server/services/viventium/VoiceTaskService');
+const {
+  attachInteractionContextMetadata,
+  bindCanonicalInteractionConversation,
+  bindLogicalTurnContext,
+  createWebInteractionContext,
+  getTrustedInteractionContext,
+  getTrustedAdapterCapabilities,
+  getTrustedDeliveryPolicy,
+  isInternalOrigin,
+  isTrustedInternalMessage,
+  setTrustedInteractionContext,
+} = require('~/server/services/viventium/interactionContext');
 /* === VIVENTIUM NOTE END === */
 
 /* === VIVENTIUM NOTE ===
  * Feature: Timed message persistence for Telegram deep timing.
  */
-const timedSaveMessage = async (req, message, options, step) => {
-  const messageToSave = attachVoiceMessageMetadata(req, message);
-  if (!isDeepTimingEnabled(req)) {
-    return saveMessage(req, messageToSave, options);
+/* === VIVENTIUM START ===
+ * Feature: Durable QA request correlation receipt.
+ * Purpose: Capture explicit structured QA provenance before asynchronous Agent execution can
+ * mutate request state, then attach the same receipt to every persisted turn message.
+ * === VIVENTIUM END === */
+function normalizeQaRunReceipt(body) {
+  if (body?.viventiumQaRun !== true) return null;
+  const qaRunId = String(body?.viventiumQaRunId || '')
+    .trim()
+    .slice(0, 128);
+  return Object.freeze({
+    qaRun: true,
+    memoryEligible: false,
+    ...(qaRunId ? { qaRunId } : {}),
+  });
+}
+
+function captureQaRunReceipt(req) {
+  if (!req || req._viventiumQaRunReceipt) return req?._viventiumQaRunReceipt || null;
+  const receipt = normalizeQaRunReceipt(req.body);
+  if (!receipt) return null;
+  Object.defineProperty(req, '_viventiumQaRunReceipt', {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value: receipt,
+  });
+  return receipt;
+}
+
+function attachQaRunReceipt(req, message) {
+  const receipt = req?._viventiumQaRunReceipt || captureQaRunReceipt(req);
+  if (!receipt) return message;
+  const existingMetadata =
+    message?.metadata && typeof message.metadata === 'object' ? message.metadata : {};
+  const existingViventium =
+    existingMetadata.viventium && typeof existingMetadata.viventium === 'object'
+      ? existingMetadata.viventium
+      : {};
+  return {
+    ...message,
+    metadata: {
+      ...existingMetadata,
+      viventium: {
+        ...existingViventium,
+        ...receipt,
+      },
+    },
+  };
+}
+
+function captureRequestInteractionContext(req, { conversationId, streamId } = {}) {
+  const existing = getTrustedInteractionContext(req);
+  if (existing) return bindCanonicalInteractionConversation(req, conversationId);
+  const body = req?.body && typeof req.body === 'object' ? req.body : {};
+  const sourceEventId =
+    body.messageId || body.userMessageId || body.source_event_id || body.sourceEventId || streamId;
+  delete body.interactionContext;
+  delete body.viventiumInteractionContext;
+  return setTrustedInteractionContext(
+    req,
+    createWebInteractionContext({
+      conversation_id: conversationId,
+      source_event_id: sourceEventId,
+    }),
+  );
+}
+
+async function resolveRequestStreamId(req, userId, conversationId) {
+  const requested = typeof req?.body?.streamId === 'string' ? req.body.streamId.trim() : '';
+  if (requested && requested !== 'new') {
+    return { streamId: requested, requested };
   }
-  const t = startDeepTiming(req);
+  const activeStreamId = await GenerationJobManager.getActiveStreamIdForConversation?.(
+    userId,
+    conversationId,
+  );
+  return {
+    streamId: activeStreamId ? crypto.randomUUID() : conversationId,
+    requested,
+  };
+}
+
+function voiceTaskIdForRequest(req) {
+  const taskId = req?.body?.viventiumVoiceTaskId;
+  return typeof taskId === 'string' && taskId.trim() ? taskId.trim() : '';
+}
+
+async function isVoiceTaskOutputSuppressedDurably(req) {
+  const taskId = voiceTaskIdForRequest(req);
+  if (!taskId) return false;
+  return isVoiceTaskSuppressedDurably(taskId, {
+    callSessionId: req?.body?.viventiumCallSessionId,
+    userId: req?.user?.id,
+    streamId: req?.body?.streamId,
+  });
+}
+
+async function pullConversationMessageReference(req, conversationId, messageObjectId) {
+  if (!conversationId || !messageObjectId) return;
+  /* === VIVENTIUM START ===
+   * Feature: Cross-surface logical-turn coherence.
+   * Purpose: Retraction is an owning Mongo metadata update, not a search-document
+   *          mutation. Use the native collection so an unavailable derived
+   *          Meilisearch hook cannot block revision 2 from being accepted.
+   * === VIVENTIUM END === */
+  const updateOne =
+    Conversation.collection?.updateOne?.bind(Conversation.collection) ||
+    Conversation.updateOne?.bind(Conversation);
+  if (!updateOne) return;
+  await updateOne(
+    { user: req?.user?.id, conversationId },
+    { $pull: { messages: messageObjectId } },
+  );
+}
+
+async function removeSuppressedAssistantMessage(req, message) {
+  const taskId = voiceTaskIdForRequest(req);
+  if (!taskId || message?.isCreatedByUser === true || !message?.messageId) return false;
+  const removed = await Message.findOneAndDelete({
+    user: req?.user?.id,
+    messageId: message.messageId,
+  });
+  if (removed?._id && message?.conversationId) {
+    await pullConversationMessageReference(req, message.conversationId, removed._id);
+  }
+  logger.warn('[VIVENTIUM][voice-task] Removed assistant output saved during cancellation race', {
+    taskId,
+    messageId: message.messageId,
+  });
+  return true;
+}
+
+async function isSupersededRequest(req) {
+  const streamId = req?._resumableStreamId;
+  if (!streamId || !getTrustedInteractionContext(req)?.logical_turn_id) return false;
+  const job = await GenerationJobManager.getJob(streamId);
+  return job?.status === 'superseded';
+}
+
+async function removeSupersededAssistantMessage(req, message, interactionContextOverride) {
+  if (message?.isCreatedByUser === true || !message?.messageId) return false;
+  const interactionContext = interactionContextOverride || getTrustedInteractionContext(req);
+  const removed = await Message.findOneAndDelete({
+    user: req?.user?.id,
+    messageId: message.messageId,
+    isCreatedByUser: { $ne: true },
+    unfinished: true,
+    'metadata.viventium.interactionContext.logical_turn_id': interactionContext?.logical_turn_id,
+    'metadata.viventium.interactionContext.revision': interactionContext?.revision,
+  });
+  if (removed?._id && message?.conversationId) {
+    await pullConversationMessageReference(req, message.conversationId, removed._id);
+  }
+  return Boolean(removed);
+}
+
+async function removeSupersededPresentations(req, presentations) {
+  for (const presentation of presentations || []) {
+    if (!presentation?.responseMessageId) continue;
+    await removeSupersededAssistantMessage(
+      req,
+      {
+        messageId: presentation.responseMessageId,
+        conversationId: presentation.conversationId,
+        isCreatedByUser: false,
+      },
+      presentation.interactionContext,
+    );
+  }
+}
+
+const timedSaveMessage = async (req, message, options, step) => {
+  const taskId = voiceTaskIdForRequest(req);
+  if (
+    message?.isCreatedByUser !== true &&
+    taskId &&
+    (await isVoiceTaskOutputSuppressedDurably(req))
+  ) {
+    logger.warn('[VIVENTIUM][voice-task] Suppressed late assistant persistence', {
+      taskId,
+      messageId: message?.messageId,
+      step,
+    });
+    return { suppressed: true, taskId };
+  }
+  if (message?.isCreatedByUser !== true && (await isSupersededRequest(req))) {
+    await removeSupersededAssistantMessage(req, message);
+    return { suppressed: true, reason: 'superseded' };
+  }
+  const messageToSave = attachInteractionContextMetadata(
+    req,
+    attachQaRunReceipt(req, attachVoiceMessageMetadata(req, message)),
+  );
+  const t = isDeepTimingEnabled(req) ? startDeepTiming(req) : null;
   const result = await saveMessage(req, messageToSave, options);
-  logDeepTiming(req, step, t, `messageId=${message?.messageId || 'na'}`);
+  if (message?.isCreatedByUser !== true && (await isSupersededRequest(req))) {
+    await removeSupersededAssistantMessage(req, messageToSave);
+    return { suppressed: true, reason: 'superseded' };
+  }
+  if (isInternalOrigin(req) && messageToSave?.conversationId) {
+    if (messageToSave.isCreatedByUser !== true && !isTrustedInternalMessage(messageToSave)) {
+      await Conversation.updateOne(
+        { user: req?.user?.id, conversationId: messageToSave.conversationId },
+        { $set: { isArchived: false } },
+      );
+    } else {
+      const hasDeliverableAssistant =
+        typeof Message.exists === 'function'
+          ? await Message.exists({
+              user: req?.user?.id,
+              conversationId: messageToSave.conversationId,
+              isCreatedByUser: { $ne: true },
+              unfinished: { $ne: true },
+              'metadata.viventium.visibility': { $ne: 'internal' },
+            })
+          : null;
+      if (!hasDeliverableAssistant) {
+        await Conversation.updateOne(
+          { user: req?.user?.id, conversationId: messageToSave.conversationId },
+          { $set: { isArchived: true } },
+        );
+      }
+    }
+  }
+  if (
+    message?.isCreatedByUser !== true &&
+    taskId &&
+    (await isVoiceTaskOutputSuppressedDurably(req))
+  ) {
+    await removeSuppressedAssistantMessage(req, messageToSave);
+    return { suppressed: true, taskId };
+  }
+  if (t != null) {
+    logDeepTiming(req, step, t, `messageId=${message?.messageId || 'na'}`);
+  }
   return result;
 };
 /* === VIVENTIUM NOTE END === */
@@ -484,8 +730,13 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
    * Purpose: Telegram bridge can pass a stable streamId so resumable jobs don't collide across surfaces.
    * Added: 2026-01-31
    */
-  const reqStreamId = typeof req.body?.streamId === 'string' ? req.body.streamId.trim() : '';
-  const streamId = reqStreamId && reqStreamId !== 'new' ? reqStreamId : conversationId;
+  const { streamId, requested: reqStreamId } = await resolveRequestStreamId(
+    req,
+    userId,
+    conversationId,
+  );
+  req._resumableStreamId = streamId;
+  const interactionContext = captureRequestInteractionContext(req, { conversationId, streamId });
   /* === VIVENTIUM NOTE END === */
   const voiceLatencyEnabled = isVoiceLatencyEnabled(req);
 
@@ -500,10 +751,38 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
     });
 
     const voiceJobCreateStart = voiceLatencyEnabled ? voiceLatencyNow() : 0;
-    const job = await GenerationJobManager.createJob(streamId, userId, conversationId);
-    if (req.viventiumCallSession?.callSessionId) {
+    const job = await GenerationJobManager.createJob(streamId, userId, conversationId, {
+      interactionContext,
+      adapterCapabilities: getTrustedAdapterCapabilities(req),
+      deliveryPolicy: getTrustedDeliveryPolicy(req),
+    });
+    const claimedInteractionContext = bindLogicalTurnContext(req, job.metadata?.interactionContext);
+    if (job.duplicateOfStreamId) {
+      await maybeDecrement();
+      return res.status(202).json({
+        streamId: job.duplicateOfStreamId,
+        conversationId,
+        status: 'duplicate',
+        duplicate: true,
+        logical_turn_id: claimedInteractionContext?.logical_turn_id,
+        revision: claimedInteractionContext?.revision,
+      });
+    }
+    await removeSupersededPresentations(req, job.supersededPresentations);
+    /* === VIVENTIUM START ===
+     * Feature: voice-task owner metadata and composed cancellation signal
+     * Purpose: Carry task identity and the real generation abort signal into every owning layer.
+     * === VIVENTIUM END === */
+    req._viventiumVoiceAbortSignal = job.abortController.signal;
+    const viventiumVoiceTaskId = voiceTaskIdForRequest(req);
+    const voiceCallSessionId = req.viventiumCallSession?.callSessionId;
+    if (viventiumVoiceTaskId || voiceCallSessionId) {
       await GenerationJobManager.updateMetadata(streamId, {
-        voiceCallSessionId: req.viventiumCallSession.callSessionId,
+        ...(voiceCallSessionId ? { voiceCallSessionId } : {}),
+        ...(viventiumVoiceTaskId ? { viventiumVoiceTaskId } : {}),
+        ...(req?.body?.viventiumCallSessionId
+          ? { viventiumCallSessionId: req.body.viventiumCallSessionId }
+          : {}),
       });
     }
     if (voiceLatencyEnabled) {
@@ -520,7 +799,13 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
     // Send JSON response IMMEDIATELY so client can connect to SSE stream
     // This is critical: tool loading (MCP OAuth) may emit events that the client needs to receive
     const voiceReadyJsonStart = voiceLatencyEnabled ? voiceLatencyNow() : 0;
-    res.json({ streamId, conversationId, status: 'started' });
+    res.json({
+      streamId,
+      conversationId,
+      status: 'started',
+      logical_turn_id: claimedInteractionContext?.logical_turn_id,
+      revision: claimedInteractionContext?.revision,
+    });
     if (voiceLatencyEnabled) {
       logVoiceLatencyStage(
         req,
@@ -576,7 +861,26 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
      */
     let sender = client?.sender;
     let userMessage;
+    let userMessageSavePromise = null;
     let responseMessageId = editedResponseMessageId;
+
+    const ensureUserSourceSegmentPersisted = async () => {
+      if (client?.skipSaveUserMessage || !userMessage) {
+        return;
+      }
+      if (!userMessageSavePromise) {
+        userMessageSavePromise = timedSaveMessage(
+          req,
+          userMessage,
+          {
+            context:
+              'api/server/controllers/agents/request.js - user source segment before generation',
+          },
+          'db_save_user',
+        );
+      }
+      await userMessageSavePromise;
+    };
 
     job.emitter.on('allSubscribersLeft', async (aggregatedContent) => {
       if (!aggregatedContent || aggregatedContent.length === 0) {
@@ -639,6 +943,14 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
 
     client = result.client;
     sender = client?.sender;
+    if (viventiumVoiceTaskId && req._viventiumHarnessExecutionEnabled === true) {
+      setVoiceTaskOwnerCapabilities(viventiumVoiceTaskId, {
+        kind: 'remote_generation',
+        ownerId: streamId,
+        cancellationConfirmable: false,
+        acceptsInput: false,
+      });
+    }
 
     if (client?.sender) {
       await GenerationJobManager.updateMetadata(streamId, { sender: client.sender });
@@ -708,6 +1020,8 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           userMessage = userMsg;
           responseMessageId = respMsgId;
           generationStartedAt = Date.now();
+
+          await ensureUserSourceSegmentPersisted();
 
           try {
             const snapshot = await persistAssistantSnapshot({
@@ -893,19 +1207,17 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
 
         // Save user message BEFORE sending final event to avoid race condition
         // where client refetch happens before database is updated
-        if (!client.skipSaveUserMessage && userMessage) {
-          await timedSaveMessage(
-            req,
-            userMessage,
-            { context: 'api/server/controllers/agents/request.js - resumable user message' },
-            'db_save_user',
-          );
-        }
+        await ensureUserSourceSegmentPersisted();
 
         // CRITICAL: Save response message BEFORE emitting final event.
         // This prevents race conditions where the client sends a follow-up message
         // before the response is saved to the database, causing orphaned parentMessageIds.
-        if (client.savedMessageIds && !client.savedMessageIds.has(messageId)) {
+        const requiresExternalDeliveryAcknowledgement =
+          getTrustedDeliveryPolicy(req)?.commit_authority === 'external_adapter';
+        if (
+          requiresExternalDeliveryAcknowledgement ||
+          (client.savedMessageIds && !client.savedMessageIds.has(messageId))
+        ) {
           /* === VIVENTIUM NOTE ===
            * Feature: Strip voice control tags from persisted response text.
            * Purpose: Voice mode responses contain Cartesia SSML tags and bracket nonverbal markers
@@ -915,7 +1227,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           const persistedResponse = normalizePersistedAssistantResponse(req, {
             ...response,
             user: userId,
-            unfinished: wasAbortedBeforeComplete,
+            unfinished: wasAbortedBeforeComplete || requiresExternalDeliveryAcknowledgement,
           });
           /* === VIVENTIUM NOTE END === */
           await timedSaveMessage(
@@ -929,7 +1241,10 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
         // Check if our job was replaced by a new request before emitting
         // This prevents stale requests from emitting events to newer jobs
         const currentJob = await GenerationJobManager.getJob(streamId);
-        const jobWasReplaced = !currentJob || currentJob.createdAt !== jobCreatedAt;
+        const jobWasReplaced =
+          !currentJob ||
+          currentJob.createdAt !== jobCreatedAt ||
+          currentJob.status === 'superseded';
 
         if (jobWasReplaced) {
           stopPartialCheckpointing();
@@ -939,11 +1254,18 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
             currentCreatedAt: currentJob?.createdAt,
           });
           // Still decrement pending request since we incremented at start
-          await decrementPendingRequest(userId);
+          if (currentJob?.status === 'superseded') {
+            await removeSupersededAssistantMessage(req, {
+              messageId,
+              conversationId,
+              isCreatedByUser: false,
+            });
+          }
+          await maybeDecrement();
           return;
         }
 
-        if (!wasAbortedBeforeComplete) {
+        if (!wasAbortedBeforeComplete && !(await isVoiceTaskOutputSuppressedDurably(req))) {
           /* === VIVENTIUM NOTE ===
            * Feature: Log empty responses for Telegram debugging.
            * Added: 2026-02-01
@@ -980,7 +1302,17 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
             conversationId: conversation?.conversationId,
           });
 
+          /* Main is complete even while Phase B continues. Mark the job non-active immediately so
+           * reload/resume cannot present a destructive Stop action against a persisted final answer.
+           * The existing Phase B poller remains the durable out-of-band delivery path. */
+          await GenerationJobManager.markMainResponseComplete(streamId, finalEvent);
           await GenerationJobManager.emitDone(streamId, finalEvent);
+          if (getTrustedDeliveryPolicy(req)?.commit_authority === 'server') {
+            await GenerationJobManager.acknowledgeStreamDelivery(streamId, {
+              state: 'committed',
+              presentation_ref: response?.messageId,
+            });
+          }
           await maybeDecrement();
 
           /* === VIVENTIUM START ===
@@ -997,8 +1329,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
            */
           const phaseBPromise = client?._phaseBPromise;
           if (phaseBPromise && typeof phaseBPromise.then === 'function') {
-            const rawTimeout = Number(process.env.VIVENTIUM_PHASE_B_STREAM_WAIT_MS);
-            const timeoutMs = Number.isFinite(rawTimeout) && rawTimeout > 0 ? rawTimeout : 180_000;
+            const timeoutMs = getCortexFollowupGraceMs();
             const phaseBWaitStartedAt = Date.now();
             if (voiceLatencyEnabled) {
               logVoiceLatencyStage(
@@ -1082,7 +1413,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
             }
             GenerationJobManager.completeJob(streamId);
           }
-        } else {
+        } else if (!(await isVoiceTaskOutputSuppressedDurably(req))) {
           const finalEvent = {
             final: true,
             conversation,
@@ -1103,9 +1434,17 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           stopPartialCheckpointing();
           GenerationJobManager.completeJob(streamId, 'Request aborted');
           await maybeDecrement();
+        } else {
+          stopPartialCheckpointing();
+          logger.info('[VIVENTIUM][voice-task] Late completion suppressed after cancellation', {
+            taskId: voiceTaskIdForRequest(req),
+            streamId,
+          });
+          GenerationJobManager.completeJob(streamId, 'Voice task cancelled');
+          await maybeDecrement();
         }
 
-        if (shouldGenerateTitle) {
+        if (shouldGenerateTitle && !(await isVoiceTaskOutputSuppressedDurably(req))) {
           addTitle(req, {
             text,
             response: { ...response },
@@ -1131,6 +1470,14 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
 
         if (wasAborted) {
           logger.debug(`[ResumableAgentController] Generation aborted for ${streamId}`);
+          if (job.abortController.signal.reason === 'superseded') {
+            await ensureUserSourceSegmentPersisted();
+            await removeSupersededAssistantMessage(req, {
+              messageId: responseMessageId,
+              conversationId,
+              isCreatedByUser: false,
+            });
+          }
           // abortJob already handled emitDone and completeJob
         } else {
           if (voiceLatencyEnabled) {
@@ -1251,6 +1598,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
  * The legacy non-resumable path is kept below but no longer used by default.
  */
 const AgentController = async (req, res, next, initializeClient, addTitle) => {
+  captureQaRunReceipt(req);
   return ResumableAgentController(req, res, next, initializeClient, addTitle);
 };
 
@@ -1279,8 +1627,13 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
   /* === VIVENTIUM NOTE ===
    * Feature: Allow caller-supplied streamId to avoid stream collisions (Telegram).
    * === VIVENTIUM NOTE END === */
-  const reqStreamId = typeof req.body?.streamId === 'string' ? req.body.streamId.trim() : '';
-  const streamId = reqStreamId && reqStreamId !== 'new' ? reqStreamId : conversationId;
+  const { streamId, requested: reqStreamId } = await resolveRequestStreamId(
+    req,
+    req.user.id,
+    conversationId,
+  );
+  req._resumableStreamId = streamId;
+  const interactionContext = captureRequestInteractionContext(req, { conversationId, streamId });
 
   let userMessage;
   let userMessageId;
@@ -1391,7 +1744,24 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
 
     // Create job in GenerationJobManager for abort handling
     // streamId === conversationId (pre-generated above)
-    const job = await GenerationJobManager.createJob(streamId, userId, conversationId);
+    const job = await GenerationJobManager.createJob(streamId, userId, conversationId, {
+      interactionContext,
+      adapterCapabilities: getTrustedAdapterCapabilities(req),
+      deliveryPolicy: getTrustedDeliveryPolicy(req),
+    });
+    bindLogicalTurnContext(req, job.metadata?.interactionContext);
+    await removeSupersededPresentations(req, job.supersededPresentations);
+    if (job.duplicateOfStreamId) {
+      disposeClient(client);
+      client = null;
+      return res.status(202).json({
+        streamId: job.duplicateOfStreamId,
+        conversationId,
+        status: 'duplicate',
+        duplicate: true,
+      });
+    }
+    req._viventiumVoiceAbortSignal = job.abortController.signal;
 
     // Store endpoint metadata for abort handling
     GenerationJobManager.updateMetadata(streamId, {
@@ -1400,6 +1770,14 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
       model: endpointOption.modelOptions?.model || endpointOption.model_parameters?.model,
       sender: client?.sender,
       voiceCallSessionId: req.viventiumCallSession?.callSessionId,
+      ...(voiceTaskIdForRequest(req)
+        ? {
+            viventiumVoiceTaskId: voiceTaskIdForRequest(req),
+            ...(req?.body?.viventiumCallSessionId
+              ? { viventiumCallSessionId: req.body.viventiumCallSessionId }
+              : {}),
+          }
+        : {}),
     });
 
     // Store content parts reference for abort
@@ -1487,27 +1865,25 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
     }
 
     // Only send if not aborted
-    if (!job.abortController.signal.aborted) {
+    if (!job.abortController.signal.aborted && !(await isVoiceTaskOutputSuppressedDurably(req))) {
       // Create a new response object with minimal copies
       const finalResponse = normalizeAssistantResponseForTransmit(req, response);
 
-      sendEvent(res, {
-        final: true,
-        conversation,
-        title: conversation.title,
-        requestMessage: sanitizeMessageForTransmit(userMessage),
-        responseMessage: finalResponse,
-      });
-      res.end();
-
-      // Save the message if needed
-      if (client.savedMessageIds && !client.savedMessageIds.has(messageId)) {
+      // Save canonical state before publishing the final. External adapters keep this revision
+      // provisional until their authenticated presentation acknowledgement arrives.
+      const requiresExternalDeliveryAcknowledgement =
+        getTrustedDeliveryPolicy(req)?.commit_authority === 'external_adapter';
+      if (
+        requiresExternalDeliveryAcknowledgement ||
+        (client.savedMessageIds && !client.savedMessageIds.has(messageId))
+      ) {
         /* === VIVENTIUM NOTE ===
          * Feature: Strip voice control tags from persisted response text (non-resumable path).
          */
         const persistedFinalResponse = normalizePersistedAssistantResponse(req, {
           ...finalResponse,
           user: userId,
+          unfinished: requiresExternalDeliveryAcknowledgement,
         });
         /* === VIVENTIUM NOTE END === */
         await timedSaveMessage(
@@ -1517,10 +1893,29 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
           'db_save_response',
         );
       }
+
+      sendEvent(res, {
+        final: true,
+        conversation,
+        title: conversation.title,
+        requestMessage: sanitizeMessageForTransmit(userMessage),
+        responseMessage: finalResponse,
+      });
+      res.end();
+      if (!requiresExternalDeliveryAcknowledgement) {
+        await GenerationJobManager.acknowledgeStreamDelivery(streamId, {
+          state: 'committed',
+          presentation_ref: response?.messageId,
+        });
+      }
     }
     // Edge case: sendMessage completed but abort happened during sendCompletion
     // We need to ensure a final event is sent
-    else if (!res.headersSent && !res.finished) {
+    else if (
+      !res.headersSent &&
+      !res.finished &&
+      !(await isVoiceTaskOutputSuppressedDurably(req))
+    ) {
       logger.debug(
         '[AgentController] Handling edge case: `sendMessage` completed but aborted during `sendCompletion`',
       );
@@ -1550,7 +1945,12 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
     }
 
     // Add title if needed - extract minimal data
-    if (addTitle && parentMessageId === Constants.NO_PARENT && isNewConvo) {
+    if (
+      addTitle &&
+      parentMessageId === Constants.NO_PARENT &&
+      isNewConvo &&
+      !(await isVoiceTaskOutputSuppressedDurably(req))
+    ) {
       addTitle(req, {
         text,
         response: { ...response },
@@ -1596,6 +1996,14 @@ module.exports.__testables = {
   normalizeAssistantResponseForTransmit,
   normalizePersistedAssistantResponse,
   persistAssistantSnapshot,
+  timedSaveMessage,
+  isVoiceTaskOutputSuppressed: isVoiceTaskOutputSuppressedDurably,
+  removeSuppressedAssistantMessage,
+  normalizeQaRunReceipt,
+  captureQaRunReceipt,
+  attachQaRunReceipt,
+  captureRequestInteractionContext,
+  resolveRequestStreamId,
 };
 
 /* === VIVENTIUM END === */

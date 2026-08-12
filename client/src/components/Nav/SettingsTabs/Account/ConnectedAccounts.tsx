@@ -34,11 +34,18 @@ type ProviderDefinition = {
 type OAuthSuccessMessage = {
   type: 'viventium_connected_account_oauth_success';
   provider?: ProviderSlug;
+  attemptId?: string;
 };
 
 type ConnectedAccountStartResponse = {
+  attemptId?: string;
   authUrl?: string;
   flowMode?: 'popup_callback' | 'manual_code';
+};
+
+type ConnectedAccountStatusResponse = {
+  attemptId: string;
+  status: 'pending' | 'exchanging' | 'completed' | 'failed' | 'superseded';
 };
 
 type ConnectedAccountPolicyResponse = {
@@ -111,6 +118,7 @@ function ConnectedAccounts() {
   const keyPollersRef = useRef<Partial<Record<ProviderSlug, number>>>({});
   const keyPollInFlightRef = useRef<Partial<Record<ProviderSlug, number>>>({});
   const flowAttemptsRef = useRef<Partial<Record<ProviderSlug, number>>>({});
+  const oauthAttemptIdsRef = useRef<Partial<Record<ProviderSlug, string>>>({});
   const connectedAccountsEnabled =
     (startupConfig as { viventiumConnectedAccountsEnabled?: boolean } | undefined)
       ?.viventiumConnectedAccountsEnabled === true;
@@ -305,6 +313,7 @@ function ConnectedAccounts() {
   const beginFlowAttempt = useCallback((provider: ProviderSlug) => {
     const attempt = (flowAttemptsRef.current[provider] ?? 0) + 1;
     flowAttemptsRef.current[provider] = attempt;
+    delete oauthAttemptIdsRef.current[provider];
     return attempt;
   }, []);
 
@@ -384,7 +393,7 @@ function ConnectedAccounts() {
   );
 
   const pollForConnectedKey = useCallback(
-    (provider: ProviderDefinition, attempt: number) => {
+    (provider: ProviderDefinition, attempt: number, oauthAttemptId: string) => {
       clearKeyPoller(provider.slug);
       const startedAt = Date.now();
       keyPollersRef.current[provider.slug] = window.setInterval(() => {
@@ -394,31 +403,41 @@ function ConnectedAccounts() {
         if (keyPollInFlightRef.current[provider.slug] === attempt) {
           return;
         }
+        if (Date.now() - startedAt > KEY_POLL_TIMEOUT_MS) {
+          clearKeyPoller(provider.slug);
+          setConnectingProvider((current) => (current === provider.endpoint ? null : current));
+          return;
+        }
 
         keyPollInFlightRef.current[provider.slug] = attempt;
-        void getKeyQuery(provider.queryKey)
-          .refetch()
+        const statusUrl = `${apiBaseUrl()}/api/connected-accounts/${provider.slug}/status?attemptId=${encodeURIComponent(oauthAttemptId)}`;
+        void request
+          .get<ConnectedAccountStatusResponse>(statusUrl)
           .then((result) => {
             if (!isCurrentFlowAttempt(provider.slug, attempt)) {
               return;
             }
-            const isConnected = Boolean(result.data?.expiresAt);
-            if (isConnected) {
+            if (result.status === 'completed') {
               invalidateFlowAttempt(provider.slug);
+              delete oauthAttemptIdsRef.current[provider.slug];
               clearPopupMonitor(provider.slug);
               clearKeyPoller(provider.slug);
               clearPopupWindow(provider.slug);
               clearManualFlow(provider.slug);
               setConnectingProvider((current) => (current === provider.endpoint ? null : current));
+              void getKeyQuery(provider.queryKey).refetch();
               showProviderConnectedToast(provider);
               return;
             }
-
-            if (Date.now() - startedAt > KEY_POLL_TIMEOUT_MS) {
+            if (result.status === 'failed' || result.status === 'superseded') {
+              invalidateFlowAttempt(provider.slug);
+              delete oauthAttemptIdsRef.current[provider.slug];
+              clearPopupMonitor(provider.slug);
               clearKeyPoller(provider.slug);
               setConnectingProvider((current) => (current === provider.endpoint ? null : current));
             }
           })
+          .catch(() => undefined)
           .finally(() => {
             if (keyPollInFlightRef.current[provider.slug] === attempt) {
               delete keyPollInFlightRef.current[provider.slug];
@@ -465,6 +484,9 @@ function ConnectedAccounts() {
       if (!isProviderSlug(providerSlug)) {
         return;
       }
+      if (event.data.attemptId !== oauthAttemptIdsRef.current[providerSlug]) {
+        return;
+      }
 
       const provider = providersBySlug[providerSlug];
       if (!provider) {
@@ -482,6 +504,7 @@ function ConnectedAccounts() {
       }
 
       invalidateFlowAttempt(provider.slug);
+      delete oauthAttemptIdsRef.current[provider.slug];
       clearPopupMonitor(provider.slug);
       clearKeyPoller(provider.slug);
       clearPopupWindow(provider.slug);
@@ -553,6 +576,7 @@ function ConnectedAccounts() {
   }, [beginManualFlow, connectedAccountsEnabled, experimentalDirectSubscriptionAuth]);
 
   useEffect(() => {
+    const oauthAttemptIds = oauthAttemptIdsRef.current;
     return () => {
       invalidateFlowAttempt('openai');
       invalidateFlowAttempt('anthropic');
@@ -562,6 +586,8 @@ function ConnectedAccounts() {
       clearKeyPoller('anthropic');
       clearPopupWindow('openai');
       clearPopupWindow('anthropic');
+      delete oauthAttemptIds.openai;
+      delete oauthAttemptIds.anthropic;
     };
   }, [clearKeyPoller, clearPopupMonitor, clearPopupWindow, invalidateFlowAttempt]);
 
@@ -600,6 +626,7 @@ function ConnectedAccounts() {
     try {
       const startUrl = `${apiBaseUrl()}/api/connected-accounts/${provider.slug}/start`;
       const response = await request.get<ConnectedAccountStartResponse>(startUrl);
+      const oauthAttemptId = response?.attemptId;
       const authUrl = response?.authUrl;
       const flowMode = response?.flowMode ?? 'popup_callback';
 
@@ -608,9 +635,11 @@ function ConnectedAccounts() {
         return;
       }
 
-      if (!authUrl) {
+      if (!authUrl || !oauthAttemptId) {
         throw new Error('oauth_start_failed');
       }
+
+      oauthAttemptIdsRef.current[provider.slug] = oauthAttemptId;
 
       popup.location.href = authUrl;
 
@@ -627,7 +656,7 @@ function ConnectedAccounts() {
       }
 
       clearPopupMonitor(provider.slug);
-      pollForConnectedKey(provider, attempt);
+      pollForConnectedKey(provider, attempt, oauthAttemptId);
       popupMonitorsRef.current[provider.slug] = window.setInterval(() => {
         if (!isCurrentFlowAttempt(provider.slug, attempt)) {
           clearPopupMonitor(provider.slug);
@@ -657,6 +686,7 @@ function ConnectedAccounts() {
         return;
       }
       invalidateFlowAttempt(provider.slug);
+      delete oauthAttemptIdsRef.current[provider.slug];
       setConnectingProvider((current) => (current === provider.endpoint ? null : current));
       clearPopupMonitor(provider.slug);
       clearKeyPoller(provider.slug);
@@ -692,6 +722,7 @@ function ConnectedAccounts() {
       }
 
       invalidateFlowAttempt(provider.slug);
+      delete oauthAttemptIdsRef.current[provider.slug];
       clearPopupMonitor(provider.slug);
       clearKeyPoller(provider.slug);
       clearPopupWindow(provider.slug);
@@ -716,6 +747,7 @@ function ConnectedAccounts() {
 
   const cancelManualFlow = (provider: ProviderDefinition) => {
     invalidateFlowAttempt(provider.slug);
+    delete oauthAttemptIdsRef.current[provider.slug];
     clearManualFlow(provider.slug);
     clearPopupMonitor(provider.slug);
     clearKeyPoller(provider.slug);

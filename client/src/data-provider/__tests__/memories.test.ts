@@ -17,3 +17,25 @@ describe('getMemories', () => {
     expect(result).toEqual(mockData);
   });
 });
+
+describe('saved-memory entry mutations', () => {
+  it('updates a saved memory through the collision-free entry endpoint', async () => {
+    mockedAxios.patch.mockResolvedValueOnce({ data: { updated: true } } as any);
+
+    await (_dataService as any).updateMemory('preferences', 'new value', 2);
+
+    expect(mockedAxios.patch).toHaveBeenCalledWith(
+      '/api/memories/entries/preferences',
+      JSON.stringify({ key: 'preferences', value: 'new value', expectedRevision: 2 }),
+      { headers: { 'Content-Type': 'application/json' } },
+    );
+  });
+
+  it('deletes a saved memory through the collision-free entry endpoint', async () => {
+    mockedAxios.delete.mockResolvedValueOnce({ data: { deleted: true } } as any);
+
+    await (_dataService as any).deleteMemory('preferences', 4);
+
+    expect(mockedAxios.delete).toHaveBeenCalledWith('/api/memories/entries/preferences?revision=4');
+  });
+});

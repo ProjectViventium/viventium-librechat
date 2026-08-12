@@ -26,6 +26,7 @@ interface PubSubMessage {
   seq?: number;
   data?: unknown;
   error?: string;
+  reason?: string;
 }
 
 /**

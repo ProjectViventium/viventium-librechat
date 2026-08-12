@@ -164,13 +164,14 @@ const agentSchema = new Schema<IAgent>(
       //   agent_id: string,           // ID of the cortex agent
       //   activation: {
       //     enabled: boolean,
-      //     model: string,            // e.g., "gpt-4o-mini"
-      //     provider: string,         // e.g., "openai"
-      //     prompt: string,           // Custom activation prompt for this cortex
+      //     mode?: "classified" | "always" | "disabled", // absent defaults to classified
+      //     model?: string,           // required only for classified mode
+      //     provider?: string,        // required only for classified mode
+      //     prompt?: string,          // required only for classified mode
       //     intent_scope?: string,    // Optional config-defined routing scope
-      //     confidence_threshold: number, // 0.0-1.0
-      //     cooldown_ms: number,      // Min time between activations
-      //     max_history: number,      // Messages to include in activation check
+      //     confidence_threshold?: number, // required only for classified mode, 0.0-1.0
+      //     cooldown_ms?: number,     // required only for classified mode
+      //     max_history?: number,     // required only for classified mode
       //   }
       // }
     },

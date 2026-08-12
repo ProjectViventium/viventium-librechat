@@ -74,6 +74,18 @@ def _payload(next_run_at: str) -> dict:
     }
 
 
+def _wait_for_scheduler(engine: SchedulerEngine, timeout_s: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        with engine._futures_lock:
+            pending = list(engine._futures)
+        if not pending:
+            return
+        for future in pending:
+            future.result(timeout=max(0.01, deadline - time.monotonic()))
+    raise AssertionError("scheduler worker did not finish within the test timeout")
+
+
 class GlassHiveWorkspaceScheduleTests(unittest.TestCase):
     def test_workspace_executor_is_reserved_for_the_authenticated_internal_route(self):
         with self.assertRaisesRegex(ValueError, "executor"):
@@ -815,7 +827,9 @@ class GlassHiveWorkspaceScheduleTests(unittest.TestCase):
                     return_value={"run_id": "run_synthetic"},
                 ) as dispatch:
                     engine._tick()
+                    _wait_for_scheduler(engine)
                     engine._tick()
+                    _wait_for_scheduler(engine)
             finally:
                 if previous_db_path is None:
                     os.environ.pop("SCHEDULING_DB_PATH", None)
@@ -1149,6 +1163,7 @@ class GlassHiveWorkspaceScheduleTests(unittest.TestCase):
                     return_value=type("Response", (), {"status_code": 200})(),
                 ):
                     engine._tick()
+                    _wait_for_scheduler(engine)
                     retry_task = storage.get_task("owner-synthetic", "rsd_synthetic")
                     self.assertEqual(retry_task["last_status"], "error")
                     retry_at = datetime.fromisoformat(

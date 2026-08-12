@@ -4,21 +4,26 @@
  * Added: 2026-04-28
  * === VIVENTIUM END === */
 import type { AgentModelPanelProps } from '~/common';
+import type { TAgentProviderCapability } from 'librechat-data-provider';
 import { Panel } from '~/common';
 import { useLocalize } from '~/hooks';
 import OptionalLlmPanel from './OptionalLlmPanel';
 
 export default function VoiceFallbackLlmPanel({
   providers,
+  providerCapabilities,
   setActivePanel,
   models: modelsData,
-}: Pick<AgentModelPanelProps, 'models' | 'providers' | 'setActivePanel'>) {
+}: Pick<AgentModelPanelProps, 'models' | 'providers' | 'setActivePanel'> & {
+  providerCapabilities: Record<string, TAgentProviderCapability>;
+}) {
   const localize = useLocalize();
 
   return (
     <OptionalLlmPanel
       models={modelsData}
       providers={providers}
+      providerCapabilities={providerCapabilities}
       setActivePanel={setActivePanel}
       title={localize('com_ui_voice_fallback_llm')}
       description={localize('com_ui_voice_fallback_llm_description')}

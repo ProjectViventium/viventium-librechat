@@ -84,6 +84,30 @@ describe('Meilisearch Mongoose plugin', () => {
     expect(mockAddDocuments).toHaveBeenCalled();
   });
 
+  test('model updateOne resolves when the query result has no document hook', async () => {
+    const conversationModel = createConversationModel(mongoose);
+    const conversationId = new mongoose.Types.ObjectId().toString();
+    const user = new mongoose.Types.ObjectId().toString();
+    await conversationModel.create({
+      conversationId,
+      user,
+      title: 'Before update',
+      endpoint: EModelEndpoint.openAI,
+    });
+
+    const outcome = await Promise.race([
+      conversationModel
+        .updateOne({ conversationId, user }, { $set: { isArchived: true } })
+        .then(() => 'resolved'),
+      new Promise<string>((resolve) => setTimeout(() => resolve('timed_out'), 250)),
+    ]);
+
+    expect(outcome).toBe('resolved');
+    await expect(conversationModel.findOne({ conversationId, user }).lean()).resolves.toEqual(
+      expect.objectContaining({ isArchived: true }),
+    );
+  });
+
   test('saving conversation indexes with expiredAt=null w/ meilisearch', async () => {
     await createConversationModel(mongoose).create({
       conversationId: new mongoose.Types.ObjectId(),
@@ -230,6 +254,37 @@ describe('Meilisearch Mongoose plugin', () => {
     expect(mockUpdateDocuments).not.toHaveBeenCalled();
   });
 
+  test('saving untrusted ambient voice transcripts never indexes them', async () => {
+    const messageModel = createMessageModel(mongoose);
+    const messageId = new mongoose.Types.ObjectId().toString();
+
+    await messageModel.findOneAndUpdate(
+      { messageId },
+      {
+        $set: {
+          messageId,
+          conversationId: new mongoose.Types.ObjectId().toString(),
+          user: new mongoose.Types.ObjectId().toString(),
+          isCreatedByUser: false,
+          sender: 'Ambient participant',
+          text: 'Synthetic guest speech is visible evidence, not searchable authority.',
+          _meiliIndex: false,
+          metadata: {
+            viventium: {
+              type: 'voice_ambient_transcript',
+              mode: 'call',
+              actorTrust: 'authenticated_participant',
+            },
+          },
+        },
+      },
+      { upsert: true, new: true },
+    );
+
+    expect(mockAddDocuments).not.toHaveBeenCalled();
+    expect(mockUpdateDocuments).not.toHaveBeenCalled();
+  });
+
   test('sync w/ meili does not include TTL documents', async () => {
     const conversationModel = createConversationModel(mongoose) as SchemaWithMeiliMethods;
     await conversationModel.create({
@@ -252,6 +307,7 @@ describe('Meilisearch Mongoose plugin', () => {
 
     const normalMessageId = new mongoose.Types.ObjectId().toString();
     const listenOnlyMessageId = new mongoose.Types.ObjectId().toString();
+    const ambientMessageId = new mongoose.Types.ObjectId().toString();
     await messageModel.collection.insertMany([
       {
         messageId: normalMessageId,
@@ -277,6 +333,23 @@ describe('Meilisearch Mongoose plugin', () => {
           },
         },
       },
+      {
+        messageId: ambientMessageId,
+        conversationId: new mongoose.Types.ObjectId().toString(),
+        user: new mongoose.Types.ObjectId().toString(),
+        isCreatedByUser: false,
+        sender: 'Ambient participant',
+        text: 'Synthetic ambient transcript should not sync.',
+        expiredAt: null,
+        _meiliIndex: false,
+        metadata: {
+          viventium: {
+            type: 'voice_ambient_transcript',
+            mode: 'call',
+            actorTrust: 'authenticated_participant',
+          },
+        },
+      },
     ]);
 
     await expect(messageModel.syncWithMeili()).resolves.not.toThrow();
@@ -286,7 +359,9 @@ describe('Meilisearch Mongoose plugin', () => {
       expect.objectContaining({ messageId: normalMessageId }),
     ]);
     const listenOnlyDoc = await messageModel.collection.findOne({ messageId: listenOnlyMessageId });
+    const ambientDoc = await messageModel.collection.findOne({ messageId: ambientMessageId });
     expect(listenOnlyDoc?._meiliIndex).toBe(false);
+    expect(ambientDoc?._meiliIndex).toBe(false);
   });
 
   test('syncWithMeili uses an internal Meili id for primary keys containing colons', async () => {

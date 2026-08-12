@@ -18,6 +18,29 @@ const defaultConfigPath = path.resolve(projectRoot, 'librechat.yaml');
 let i = 0;
 const ENV_PLACEHOLDER_REGEX = /\$\{([A-Z0-9_]+)\}/g;
 
+/* === VIVENTIUM START ===
+ * Feature: secret-safe runtime configuration observability.
+ * Purpose: The loaded config is fully interpolated and may contain OAuth client secrets, API keys,
+ * authorization headers, or other credentials. Log only structural inventory, never the config.
+ * === VIVENTIUM END === */
+function summarizeCustomConfig(customConfig = {}) {
+  const customEndpoints = Array.isArray(customConfig?.endpoints?.custom)
+    ? customConfig.endpoints.custom
+    : [];
+  const providerCapabilities = customConfig?.endpoints?.agents?.providerCapabilities || {};
+  return {
+    version: customConfig.version ?? null,
+    cache: customConfig.cache === true,
+    topLevelKeys: Object.keys(customConfig).sort(),
+    customEndpointNames: customEndpoints
+      .map((endpoint) => String(endpoint?.name || '').trim())
+      .filter(Boolean)
+      .sort(),
+    mcpServerNames: Object.keys(customConfig.mcpServers || {}).sort(),
+    providerCapabilityNames: Object.keys(providerCapabilities).sort(),
+  };
+}
+
 function interpolateEnvPlaceholders(value) {
   if (typeof value === 'string') {
     return value.replace(ENV_PLACEHOLDER_REGEX, (_, envKey) => process.env[envKey] ?? '');
@@ -138,9 +161,10 @@ https://www.librechat.ai/docs/configuration/stt_tts`);
     process.exit(1);
   } else {
     if (printConfig) {
-      logger.info('Custom config file loaded:');
-      logger.info(JSON.stringify(customConfig, null, 2));
-      logger.debug('Custom config:', customConfig);
+      const summary = summarizeCustomConfig(customConfig);
+      logger.info('Custom config file loaded (secret-safe structural summary):');
+      logger.info(JSON.stringify(summary));
+      logger.debug('Custom config structural summary:', summary);
     }
   }
 

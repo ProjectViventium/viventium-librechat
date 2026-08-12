@@ -13,6 +13,7 @@
 
 const express = require('express');
 const crypto = require('crypto');
+const mongoose = require('mongoose');
 const { GenerationJobManager } = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
 const { SystemRoles } = require('librechat-data-provider');
@@ -25,6 +26,7 @@ const { initializeClient } = require('~/server/services/Endpoints/agents');
 const addTitle = require('~/server/services/Endpoints/agents/title');
 const AgentController = require('~/server/controllers/agents/request');
 const { getUserById, getConvo } = require('~/models');
+const { Message, Conversation } = require('~/db/models');
 /* === VIVENTIUM NOTE ===
  * Feature: Scheduler <-> Telegram mapping helper import.
  * === VIVENTIUM NOTE === */
@@ -52,12 +54,36 @@ const {
   normalizeScheduledAgentExecution,
 } = require('~/server/services/viventium/scheduledAgentOverride');
 const {
+  createSchedulerInteractionContext,
+  setTrustedInteractionContext,
+} = require('~/server/services/viventium/interactionContext');
+const {
   buildScheduledGlassHiveCapabilityBundle,
   revokeScheduledGlassHiveCapabilityGrant,
 } = require('~/server/services/viventium/GlassHiveCapabilityBootstrapService');
 
 const router = express.Router();
 const SCHEDULER_SECRET_HEADER = 'x-viventium-scheduler-secret';
+const SCHEDULER_DISPATCH_COLLECTION = 'viventium_scheduler_dispatch_intents';
+
+function normalizeSchedulerIdempotencyKey(value) {
+  const key = typeof value === 'string' ? value.trim() : '';
+  if (!key) {
+    return '';
+  }
+  if (key.length > 512) {
+    throw new Error('Scheduler idempotency key is too long');
+  }
+  return key;
+}
+
+function schedulerDispatchDocumentId(userId, idempotencyKey) {
+  return crypto.createHash('sha256').update(`${userId}\0${idempotencyKey}`).digest('hex');
+}
+
+function schedulerDispatchCollection() {
+  return mongoose.connection.collection(SCHEDULER_DISPATCH_COLLECTION);
+}
 
 function getSchedulerSecret() {
   return process.env.VIVENTIUM_SCHEDULER_SECRET || '';
@@ -304,6 +330,9 @@ router.post(
   configMiddleware,
   async (req, _res, next) => {
     const incoming = req.body ?? {};
+    const sanitizedIncoming = { ...incoming };
+    delete sanitizedIncoming.interactionContext;
+    delete sanitizedIncoming.viventiumInteractionContext;
     let scheduledAgentExecution;
     try {
       scheduledAgentExecution = normalizeScheduledAgentExecution(
@@ -329,7 +358,43 @@ router.post(
       requestedAgentId = incoming.agent_id;
     }
     const scheduleId = typeof incoming.scheduleId === 'string' ? incoming.scheduleId : '';
-    const streamId = `scheduler-${crypto.randomUUID()}`;
+    let idempotencyKey;
+    try {
+      idempotencyKey = normalizeSchedulerIdempotencyKey(incoming.idempotencyKey);
+    } catch (error) {
+      return _res.status(400).json({ error: error.message, reason: 'invalid_idempotency_key' });
+    }
+    const dispatchDocumentId = idempotencyKey
+      ? schedulerDispatchDocumentId(req.user?.id, idempotencyKey)
+      : '';
+    const existingDispatch = dispatchDocumentId
+      ? await schedulerDispatchCollection().findOne({ _id: dispatchDocumentId })
+      : null;
+    if (existingDispatch?.streamId) {
+      const existingJob =
+        existingDispatch.status === 'accepted'
+          ? true
+          : await GenerationJobManager.getJob(existingDispatch.streamId);
+      if (existingJob) {
+        if (existingDispatch.status !== 'accepted') {
+          await schedulerDispatchCollection().updateOne(
+            { _id: dispatchDocumentId },
+            { $set: { status: 'accepted', updatedAt: new Date() } },
+          );
+        }
+        return _res.status(200).json({
+          streamId: existingDispatch.streamId,
+          conversationId: existingDispatch.conversationId,
+          idempotencyKey,
+          duplicate: true,
+        });
+      }
+    }
+    const streamId =
+      existingDispatch?.streamId ||
+      (idempotencyKey
+        ? `scheduler-${crypto.createHash('sha256').update(dispatchDocumentId).digest('hex').slice(0, 32)}`
+        : `scheduler-${crypto.randomUUID()}`);
     const validatedConversationId = await normalizeSchedulerConversationId({
       conversationId: requestedConversationId,
       userId: req.user?.id,
@@ -340,7 +405,48 @@ router.post(
       surface: 'scheduler',
     });
     const conversationId = conversationState.conversationId;
+    if (dispatchDocumentId && !existingDispatch) {
+      await schedulerDispatchCollection().updateOne(
+        { _id: dispatchDocumentId },
+        {
+          $setOnInsert: {
+            _id: dispatchDocumentId,
+            userId: String(req.user?.id || ''),
+            idempotencyKey,
+            streamId,
+            conversationId,
+            status: 'reserved',
+            createdAt: new Date(),
+          },
+        },
+        { upsert: true },
+      );
+      const reserved = await schedulerDispatchCollection().findOne({ _id: dispatchDocumentId });
+      if (reserved?.streamId && reserved.streamId !== streamId) {
+        return _res.status(200).json({
+          streamId: reserved.streamId,
+          conversationId: reserved.conversationId,
+          idempotencyKey,
+          duplicate: true,
+        });
+      }
+    }
+    if (dispatchDocumentId) {
+      req.viventiumSchedulerDispatchDocumentId = dispatchDocumentId;
+    }
     let parentMessageId = conversationState.parentMessageId;
+    setTrustedInteractionContext(
+      req,
+      createSchedulerInteractionContext({
+        conversation_id: conversationId,
+        source_event_id: incoming.source_event_id || incoming.sourceEventId || streamId,
+      }),
+      {
+        segment_stability: 'immediate',
+        supersede_scope: 'response_only',
+      },
+      { commit_authority: 'server' },
+    );
 
     const agentId = await resolveAgentId({
       req,
@@ -364,7 +470,7 @@ router.post(
     });
 
     req.body = {
-      ...incoming,
+      ...sanitizedIncoming,
       text,
       endpoint: 'agents',
       endpointType: 'agents',
@@ -400,9 +506,89 @@ router.post(
   validateConvoAccess,
   buildEndpointOption,
   async (req, res, next) => {
-    return AgentController(req, res, next, initializeClient, addTitle);
+    const result = await AgentController(req, res, next, initializeClient, addTitle);
+    if (req.viventiumSchedulerDispatchDocumentId) {
+      await schedulerDispatchCollection().updateOne(
+        { _id: req.viventiumSchedulerDispatchDocumentId },
+        { $set: { status: 'accepted', updatedAt: new Date() } },
+      );
+    }
+    return result;
   },
 );
+
+router.get('/dispatches/:idempotencyKey', schedulerAuth, async (req, res) => {
+  const idempotencyKey = normalizeSchedulerIdempotencyKey(req.params.idempotencyKey);
+  const documentId = schedulerDispatchDocumentId(req.user?.id, idempotencyKey);
+  const dispatch = await schedulerDispatchCollection().findOne({ _id: documentId });
+  if (!dispatch?.streamId) {
+    return res.status(404).json({ error: 'Scheduler dispatch not found' });
+  }
+  const job = await GenerationJobManager.getJob(dispatch.streamId);
+  return res.json({
+    streamId: dispatch.streamId,
+    conversationId: dispatch.conversationId,
+    idempotencyKey,
+    state: job ? 'accepted' : 'reserved',
+  });
+});
+
+/* === VIVENTIUM START ===
+ * Feature: Bounded scheduled-authoring cancellation.
+ * Purpose: A scheduler stream timeout is an explicit cancellation of unfinished model authoring,
+ * not an implicit cancellation of a durable tool or GlassHive effect. Keep scheduler credentials
+ * scoped to scheduler-owned jobs and retract only the provisional assistant presentation.
+ * === VIVENTIUM END === */
+router.post('/stream/:streamId/cancel', schedulerAuth, async (req, res) => {
+  const { streamId } = req.params;
+  const userId = String(req.user?.id || '');
+  const job = await GenerationJobManager.getJob(streamId);
+  if (!job) {
+    return res.status(404).json({ error: 'Scheduler stream not found' });
+  }
+  if (job.metadata?.userId && String(job.metadata.userId) !== userId) {
+    return res.status(403).json({ error: 'Unauthorized scheduler stream' });
+  }
+  const context = job.metadata?.interactionContext;
+  if (context?.actor_kind !== 'system' || context?.origin !== 'scheduler') {
+    return res.status(409).json({
+      error: 'Only scheduler-owned authoring can be cancelled here',
+      reason: 'not_scheduler_authoring',
+    });
+  }
+  if (job.status !== 'running') {
+    return res.status(409).json({
+      error: 'Scheduler authoring is already terminal',
+      reason: 'not_running',
+    });
+  }
+
+  const result = await GenerationJobManager.abortJob(streamId);
+  if (!result?.success) {
+    return res.status(409).json({ error: 'Scheduler authoring could not be cancelled' });
+  }
+
+  const responseMessageId = result.jobData?.responseMessageId;
+  const conversationId = result.jobData?.conversationId;
+  if (responseMessageId) {
+    const removed = await Message.findOneAndDelete({
+      user: userId,
+      messageId: responseMessageId,
+      isCreatedByUser: { $ne: true },
+      unfinished: true,
+      'metadata.viventium.interactionContext.actor_kind': 'system',
+      'metadata.viventium.interactionContext.origin': 'scheduler',
+    });
+    if (removed?._id && conversationId) {
+      await Conversation.collection.updateOne(
+        { user: userId, conversationId },
+        { $pull: { messages: removed._id }, $set: { isArchived: true } },
+      );
+    }
+  }
+
+  return res.json({ success: true, cancelled: streamId });
+});
 
 /* === VIVENTIUM NOTE ===
  * Feature: Scheduler -> Telegram mapping resolver

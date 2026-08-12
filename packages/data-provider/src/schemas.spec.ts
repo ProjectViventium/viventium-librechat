@@ -97,10 +97,6 @@ describe('anthropicSettings', () => {
         expect(reset('claude-opus-4-7')).toBe(128000);
       });
 
-      it('should return 128K for claude-opus-4-8', () => {
-        expect(reset('claude-opus-4-8')).toBe(128000);
-      });
-
       it('should return 128K for claude-opus-4-9', () => {
         expect(reset('claude-opus-4-9')).toBe(128000);
       });

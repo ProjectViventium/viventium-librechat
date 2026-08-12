@@ -12,6 +12,9 @@ const { isBrowserRegistrationOpen } = require('~/server/services/viventium/regis
 const {
   isConnectedAccountsCapabilityEnabled,
 } = require('~/server/services/viventium/connectedAccountsCapability');
+const {
+  getCortexFollowupGraceSeconds,
+} = require('~/server/services/viventium/cortexFollowupGrace');
 // VIVENTIUM END
 
 const router = express.Router();
@@ -161,12 +164,25 @@ router.get('/', async function (req, res) {
         isEnabled(process.env.VIVENTIUM_LOCAL_SUBSCRIPTION_AUTH) &&
         !isEnabled(process.env.VIVENTIUM_PROMPT_WORKBENCH_LINK_DISABLED),
       /* === VIVENTIUM START ===
+       * Feature: WHOOP owner onboarding visibility.
+       * Purpose: Keep the browser card aligned with the admin-only local health route.
+       * === VIVENTIUM END === */
+      viventiumHealthWhoopEnabled:
+        isEnabled(process.env.VIVENTIUM_LOCAL_SUBSCRIPTION_AUTH) &&
+        isEnabled(process.env.VIVENTIUM_HEALTH_ENABLED),
+      /* === VIVENTIUM START ===
        * Feature: Feelings instrument availability.
        * Purpose: Keep navigation aligned with the operator-level feature gate.
        * === VIVENTIUM END === */
       viventiumFeelingsAvailable:
         process.env.VIVENTIUM_FEELINGS_AVAILABLE == null ||
         isEnabled(process.env.VIVENTIUM_FEELINGS_AVAILABLE),
+      /* === VIVENTIUM START ===
+       * Feature: Background follow-up browser-listening parity.
+       * Purpose: Bound Web query refreshes with the same compiled window as Phase B surfaces.
+       * This is a listening window only; it does not cancel or deadline background execution.
+       * === VIVENTIUM END === */
+      viventiumBackgroundFollowupWindowS: getCortexFollowupGraceSeconds(),
       /* === VIVENTIUM START ===
        * Feature: GlassHive host worker callbacks.
        * Purpose: Project the compiled callback wait window into the web client.

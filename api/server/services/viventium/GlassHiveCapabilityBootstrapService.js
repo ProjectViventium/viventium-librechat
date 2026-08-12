@@ -2,7 +2,7 @@
  * Feature: GlassHive capability broker bootstrap injection
  * Purpose:
  * - Add one broker MCP to GlassHive worker bootstrap bundles without relying on the chat model
- *   to choose Google/MS365 tools.
+ *   to predict which declared capability should satisfy the request.
  * - Keep the worker's prompt context compact while machine-readable MCP setup lives in bootstrap.
  * === VIVENTIUM END === */
 
@@ -16,12 +16,14 @@ const { inspectStoredOAuthCredentialState } = require('~/server/services/Tools/m
 /* === VIVENTIUM END === */
 const {
   collectAllowedServerEntries,
+  collectServerProjection,
   isBrokerProjectionEnabled,
   shouldGrantContentReadScope,
 } = require('./GlassHiveCapabilityPolicyService');
 /* === VIVENTIUM START === Scheduled/direct mint and exact revoke boundary. === */
 const {
   mintBrokerGrant,
+  persistBrokerGrantResources,
   revokeBrokerGrant,
   resolveBrokerTenantId,
 } = require('./GlassHiveCapabilityBrokerAuth');
@@ -43,6 +45,9 @@ const GLASSHIVE_LAUNCH_TOOLS = new Set([
 ]);
 
 const GLASSHIVE_SCHEDULE_TOOLS = new Set(['workspace_schedule', 'worker_schedule']);
+const MAX_SCHEDULE_GRANT_TTL_SECONDS = 24 * 60 * 60;
+const NEW_CONVERSATION_PLACEHOLDER = 'new';
+const NO_PARENT_MESSAGE_ID = '00000000-0000-0000-0000-000000000000';
 
 function configuredGlassHiveServerNames() {
   return String(process.env.VIVENTIUM_GLASSHIVE_MCP_SERVER_NAMES || 'glasshive-workers-projects')
@@ -181,10 +186,11 @@ function grantTtlSecondsForTool(toolName, args = {}) {
     'VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SCHEDULE_TTL_SECONDS',
     60 * 60,
   );
-  const scheduleMax = intEnv(
+  const configuredScheduleMax = intEnv(
     'VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_MAX_SCHEDULE_TTL_SECONDS',
-    24 * 60 * 60,
+    MAX_SCHEDULE_GRANT_TTL_SECONDS,
   );
+  const scheduleMax = Math.min(configuredScheduleMax, MAX_SCHEDULE_GRANT_TTL_SECONDS);
   let desired = scheduleDefault;
   const delaySeconds = Number(args.delay_seconds ?? args.delaySeconds);
   if (Number.isFinite(delaySeconds) && delaySeconds >= 0) {
@@ -208,6 +214,44 @@ function grantRenewableTtlSecondsForTool(toolName, args = {}) {
     24 * 60 * 60,
   );
   return Math.max(base, Math.min(Math.max(base, defaultRenewable), maxRenewable));
+}
+
+function brokerTurnScope(requestBody = {}) {
+  const normalizedId = (value, placeholders = []) => {
+    const id = String(value || '').trim();
+    return placeholders.includes(id) ? '' : id;
+  };
+  const conversationId = normalizedId(requestBody.conversationId || requestBody.conversation_id, [
+    NEW_CONVERSATION_PLACEHOLDER,
+  ]);
+  const parentMessageId = normalizedId(
+    requestBody.parentMessageId || requestBody.parent_message_id,
+    [NO_PARENT_MESSAGE_ID],
+  );
+  const requestMessageId = normalizedId(requestBody.messageId || requestBody.message_id, [
+    NO_PARENT_MESSAGE_ID,
+  ]);
+  const responseMessageId = normalizedId(
+    requestBody.responseMessageId || requestBody.response_message_id,
+    [NO_PARENT_MESSAGE_ID],
+  );
+  const explicitTurnId = normalizedId(requestBody.turnId || requestBody.turn_id);
+  // Provider fallback bundles can be prepared before the assistant response id exists. The signed
+  // parent user-message id is still an exact, immutable scope for an already-persisted conversation.
+  const messageId = requestMessageId || parentMessageId || responseMessageId;
+  // A first browser turn has an exact client-minted user message id before either the conversation
+  // or assistant response exists. Bind that same immutable id as the pre-persistence turn scope;
+  // never infer a turn from a placeholder or substitute this for a real conversation boundary.
+  const turnId =
+    explicitTurnId ||
+    responseMessageId ||
+    (!conversationId && requestMessageId ? requestMessageId : '');
+  return {
+    conversation_id: conversationId,
+    parent_message_id: parentMessageId,
+    message_id: messageId,
+    turn_id: turnId,
+  };
 }
 
 /* === VIVENTIUM START ===
@@ -412,6 +456,8 @@ async function buildDirectGlassHiveCapabilityBundle({ user, workerId, runId, exe
   try {
     mintedGrant = mintBrokerGrant({
       user,
+      // Direct operator runs are bound to a signed worker/run identity rather than a chat turn.
+      requireTurnScope: false,
       grantId,
       allowedServers,
       eagerServers: allowedServers,
@@ -662,6 +708,8 @@ async function buildScheduledGlassHiveCapabilityBundle({
   try {
     mintedGrant = mintBrokerGrant({
       user,
+      // Scheduled runs are bound to the signed schedule/run identity and have no chat message.
+      requireTurnScope: false,
       grantId,
       allowedServers,
       eagerServers: allowedServers,
@@ -789,20 +837,23 @@ function tomlString(value) {
 
 function brokerContextBrief(
   allowedServers,
-  { contentReadScope = false, deferredServers = [] } = {},
+  { contentReadScope = false, deferredServers = [], allowedHostTools = [] } = {},
 ) {
   const serverList = allowedServers.length ? allowedServers.join(', ') : 'none';
   const deferredServerList = deferredServers.length ? deferredServers.join(', ') : 'none';
+  const hostToolList = allowedHostTools.length ? allowedHostTools.join(', ') : 'none';
   return [
     'GlassHive connected capability broker [v2]:',
     '- A broker MCP named `glasshive-user-capabilities` is available in this workspace when the local MCP client loads project MCP config.',
-    '- The broker exposes the current user/run authorized MCP tools from the host application; treat it as an available capability option for Google Workspace, Microsoft 365, and other connected-account facts.',
-    '- Prefer MCP/tools for connected-account facts and actions when they can satisfy the task. Use browser or computer UI when MCP/tools are missing, unavailable, auth-blocked, explicitly required, or when visual/manual QA is genuinely the better route.',
+    '- The broker catalog exposes exactly the current user/run authorized host capabilities. Treat the catalog as capability truth; do not infer availability from this prose.',
+    '- Prefer callable broker tools for live connected-service facts and actions when they can satisfy the task. Use browser or computer UI when those tools are missing, unavailable, auth-blocked, explicitly required, or when visual/manual QA is genuinely the better route.',
     '- If a non-broker host connector is also available, including a built-in Codex app connector, prefer the brokered `glasshive-user-capabilities` tool when it covers the same connected-account provider. Use non-broker connectors only after the broker path is missing, unavailable, auth-blocked, or explicitly required.',
-    '- Do not treat memory, recall, or prior chat text as live Google/MS365 evidence. Ask the broker when current provider truth is needed.',
+    '- Do not treat memory, recall, or prior chat text as live connected-service evidence. Ask the broker when current provider truth is needed.',
     `- Content-read broker scope for this run is ${contentReadScope ? 'authorized by reviewed host policy' : 'not authorized'}. If a needed content read is blocked by broker policy, report that blocker instead of self-authorizing with worker-authored flags.`,
     `- Authorized capability servers for this run: ${serverList}. If a needed server is missing, report the broker omission/auth limitation rather than fabricating.`,
     `- Deferred capability servers (discover only when the task needs them): ${deferredServerList}. Use \`capability_describe\` for one deferred server before invoking its underlying tool; do not probe deferred servers during unrelated chat.`,
+    `- Authorized host tools for this run: ${hostToolList}. These are the same resolved host capabilities available to the main Agent; absence means the host did not resolve or authorize them for this turn.`,
+    '- Host-tool resources are virtual service evidence, not workspace paths. Never pass their labels to shell/filesystem tools or search for copies by filename. When an authorized host tool covers the needed evidence, call it before any filesystem discovery; resource labels are not proof of mounted files.',
   ].join('\n');
 }
 
@@ -819,6 +870,26 @@ function degradedConversationCapabilityBundle(reason) {
     claude_md: instruction,
     codex_md: instruction,
   };
+}
+
+function providerProjectionBoundary(omissions = []) {
+  if (!omissions.length) {
+    return '';
+  }
+  const omittedList = omissions.map(({ server, reason }) => `${server} (${reason})`).join(', ');
+  return [
+    `Declared but unavailable capability servers for this turn: ${omittedList}.`,
+    'Do not claim or plan to use those unavailable capabilities. Continue with genuinely callable tools when they can still complete the request; otherwise report the exact capability limitation.',
+  ].join('\n');
+}
+
+function brokerUnavailableBrief(reason) {
+  const safeReason = String(reason || 'unavailable').trim() || 'unavailable';
+  return [
+    `GlassHive host capability broker is unavailable for this run (${safeReason}).`,
+    'Do not claim that brokered host capabilities are available for this run.',
+    'Continue with unrelated work normally. If the request needs a connected capability, report this exact connection blocker rather than substituting memory or another account.',
+  ].join('\n');
 }
 
 function workerMemoryBlock(memory) {
@@ -890,7 +961,12 @@ function contentReadIntentForArgs(args = {}) {
   );
 }
 
-function mergeWorkerContextBundle({ existingBundle, workerMemory = '', workerFeelings = '' }) {
+function mergeWorkerContextBundle({
+  existingBundle,
+  workerMemory = '',
+  workerFeelings = '',
+  brokerUnavailableReason = '',
+}) {
   const bundle = { ...existingBundle };
   const memoryBlock = workerMemoryBlock(workerMemory);
   if (memoryBlock) {
@@ -904,6 +980,16 @@ function mergeWorkerContextBundle({ existingBundle, workerMemory = '', workerFee
     bundle.claude_md = appendText(bundle.claude_md, feelingBlock);
     bundle.codex_md = appendText(bundle.codex_md, feelingBlock);
   }
+  if (brokerUnavailableReason) {
+    const unavailableBrief = brokerUnavailableBrief(brokerUnavailableReason);
+    bundle.glasshive_capability_broker_status = {
+      status: 'unavailable',
+      reason: brokerUnavailableReason,
+    };
+    bundle.agents_md = appendText(bundle.agents_md, unavailableBrief);
+    bundle.claude_md = appendText(bundle.claude_md, unavailableBrief);
+    bundle.codex_md = appendText(bundle.codex_md, unavailableBrief);
+  }
   return pinWorkerFeelingBlockLast(bundle, feelingBlock);
 }
 
@@ -915,6 +1001,7 @@ function mergeBrokerBundle({
   allowedServers,
   eagerServers = allowedServers,
   deferredServers = [],
+  allowedHostTools = [],
   contentReadScope = false,
   workerMemory = '',
   workerFeelings = '',
@@ -936,10 +1023,10 @@ function mergeBrokerBundle({
     url: brokerUrl,
     grant_id: grantPayload.grant_id,
     grant_expires_at: grantPayload.exp,
-    grant_renewable_until: grantPayload.renewable_until,
     allowed_servers: allowedServers,
     eager_servers: eagerServers,
     deferred_servers: deferredServers,
+    allowed_host_tools: allowedHostTools,
     scopes: grantPayload.scopes || {},
     projection: deferredServers.length
       ? 'signed_eager_and_deferred_policy_gated'
@@ -963,15 +1050,39 @@ function mergeBrokerBundle({
     ...(bundle.env || {}),
     [codexTokenEnvVar]: grantToken,
   };
-  const instruction = brokerContextBrief(allowedServers, { contentReadScope, deferredServers });
+  const instruction = brokerContextBrief(allowedServers, {
+    contentReadScope,
+    deferredServers,
+    allowedHostTools,
+  });
   bundle.agents_md = appendText(bundle.agents_md, instruction);
   bundle.claude_md = appendText(bundle.claude_md, instruction);
   bundle.codex_md = appendText(bundle.codex_md, instruction);
   return pinWorkerFeelingBlockLast(bundle, workerFeelingBlock(workerFeelings));
 }
 
-function applyContextBrief(args, toolName, allowedServers, { contentReadScope = false } = {}) {
-  const brief = brokerContextBrief(allowedServers, { contentReadScope });
+function applyContextBrief(
+  args,
+  toolName,
+  allowedServers,
+  { contentReadScope = false, allowedHostTools = [] } = {},
+) {
+  const brief = brokerContextBrief(allowedServers, { contentReadScope, allowedHostTools });
+  if (toolName === 'workspace_launch' || toolName === 'workspace_schedule') {
+    args.context = appendText(args.context, brief);
+  } else if (toolName === 'workspace_continue') {
+    args.additional_instructions = appendText(args.additional_instructions, brief);
+  } else if (
+    toolName === 'worker_delegate_once' ||
+    toolName === 'worker_run' ||
+    toolName === 'worker_schedule'
+  ) {
+    args.instruction = appendText(args.instruction, brief);
+  }
+}
+
+function applyUnavailableContextBrief(args, toolName, reason) {
+  const brief = brokerUnavailableBrief(reason);
   if (toolName === 'workspace_launch' || toolName === 'workspace_schedule') {
     args.context = appendText(args.context, brief);
   } else if (toolName === 'workspace_continue') {
@@ -1000,6 +1111,14 @@ async function maybeInjectGlassHiveCapabilityBroker({
   }
   const workerMemory = String(config?.configurable?.glasshive_worker_memory || '').trim();
   const workerFeelings = String(config?.configurable?.glasshive_worker_feelings || '').trim();
+  const allowedHostTools = Array.from(
+    new Set(
+      (config?.configurable?.glasshive_host_tools || [])
+        .map((value) => String(value || '').trim())
+        .filter(Boolean),
+    ),
+  ).sort();
+  const hostToolResources = config?.configurable?.glasshive_host_tool_resources || {};
   const workerFeelingsHash = String(
     config?.configurable?.glasshive_worker_feelings_hash || '',
   ).trim();
@@ -1022,14 +1141,13 @@ async function maybeInjectGlassHiveCapabilityBroker({
   };
   const originalWasString = typeof toolArguments === 'string';
   const returnWorkerContextOnly = (reason) => {
-    if (!workerMemory && !workerFeelings) {
-      return toolArguments;
-    }
     args.bootstrap_bundle_json = mergeWorkerContextBundle({
       existingBundle: normalizeBootstrapBundle(args.bootstrap_bundle_json),
       workerMemory,
       workerFeelings,
+      brokerUnavailableReason: reason,
     });
+    applyUnavailableContextBrief(args, toolName, reason);
     logWorkerFeelingPlacement({
       requestBody: config?.configurable?.requestBody,
       bundle: args.bootstrap_bundle_json,
@@ -1066,23 +1184,24 @@ async function maybeInjectGlassHiveCapabilityBroker({
     );
     return null;
   });
-  if (!mcpConfig) {
+  if (!mcpConfig && allowedHostTools.length === 0) {
     return returnWorkerContextOnly('broker_config_unavailable');
   }
   const executionMode = executionModeForBroker(args);
-  const allowedServerEntries = collectAllowedServerEntries({ mcpConfig, executionMode });
+  const allowedServerEntries = mcpConfig
+    ? collectAllowedServerEntries({ mcpConfig, executionMode, reqUser: user })
+    : [];
   const allowedServers = allowedServerEntries.map(({ serverName }) => serverName);
-  if (allowedServers.length === 0) {
+  if (allowedServers.length === 0 && allowedHostTools.length === 0) {
     return returnWorkerContextOnly('no_broker_servers');
   }
   const requestBody = config?.configurable?.requestBody || {};
   const existingBundle = normalizeBootstrapBundle(args.bootstrap_bundle_json);
   const hostContentReadIntent = contentReadIntentForArgs(args);
   const contentReadScope = shouldGrantContentReadScope(allowedServerEntries);
+  const workerTurnScope = brokerTurnScope(requestBody);
   const requestContext = {
-    conversation_id: requestBody.conversationId,
-    parent_message_id: requestBody.parentMessageId,
-    message_id: requestBody.messageId,
+    ...workerTurnScope,
     execution_mode: executionMode,
   };
   let mintedGrant;
@@ -1090,12 +1209,15 @@ async function maybeInjectGlassHiveCapabilityBroker({
     mintedGrant = mintBrokerGrant({
       user,
       allowedServers,
+      allowedHostTools,
+      hostToolResources,
+      allowDynamicPolicyServers: false,
       requestContext,
       executionMode,
       ttlSeconds: grantTtlSecondsForTool(toolName, args),
-      renewableTtlSeconds: grantRenewableTtlSecondsForTool(toolName, args),
       scopes: { content_read: contentReadScope },
     });
+    await persistBrokerGrantResources(mintedGrant);
   } catch (error) {
     logger.warn('[VIVENTIUM][glasshive-capability-broker] Skipping bootstrap injection', {
       reason: 'grant_mint_failed',
@@ -1110,6 +1232,7 @@ async function maybeInjectGlassHiveCapabilityBroker({
     grantToken: token,
     grantPayload: payload,
     allowedServers,
+    allowedHostTools,
     contentReadScope,
     workerMemory,
     workerFeelings,
@@ -1136,7 +1259,7 @@ async function maybeInjectGlassHiveCapabilityBroker({
       { allowedServers },
     );
   }
-  applyContextBrief(args, toolName, allowedServers, { contentReadScope });
+  applyContextBrief(args, toolName, allowedServers, { contentReadScope, allowedHostTools });
   return typeof toolArguments === 'string' ? JSON.stringify(args) : args;
 }
 
@@ -1151,6 +1274,8 @@ async function buildConversationProviderBootstrapBundle({
   allowedServerNames = [],
   deferredServerNames = [],
   excludedServerNames = [],
+  allowedHostTools = [],
+  hostToolResources = {},
   capabilityResolutionStatus = '',
 } = {}) {
   const userId = String(user?.id || user?._id || '').trim();
@@ -1163,7 +1288,11 @@ async function buildConversationProviderBootstrapBundle({
   const excludedServers = new Set(
     (excludedServerNames || []).map((value) => String(value || '').trim()).filter(Boolean),
   );
-  const hasRequestedCapabilities = declaredServers.size > 0 || declaredDeferredServers.size > 0;
+  const normalizedHostTools = Array.from(
+    new Set((allowedHostTools || []).map((value) => String(value || '').trim()).filter(Boolean)),
+  ).sort();
+  const hasRequestedCapabilities =
+    declaredServers.size > 0 || declaredDeferredServers.size > 0 || normalizedHostTools.length > 0;
   if (!hasRequestedCapabilities) {
     return capabilityResolutionStatus
       ? degradedConversationCapabilityBundle(capabilityResolutionStatus)
@@ -1174,15 +1303,21 @@ async function buildConversationProviderBootstrapBundle({
       !userId ? 'user_scope_unavailable' : 'broker_disabled',
     );
   }
-  const registry = getMCPServersRegistry();
-  const mcpConfig = await registry.getAllServerConfigs(userId).catch((error) => {
-    logger.warn('[VIVENTIUM][glasshive-capability-broker] Provider bundle MCP config unavailable', {
-      message: error?.message,
+  let mcpConfig = {};
+  if (declaredServers.size > 0 || declaredDeferredServers.size > 0) {
+    const registry = getMCPServersRegistry();
+    mcpConfig = await registry.getAllServerConfigs(userId).catch((error) => {
+      logger.warn(
+        '[VIVENTIUM][glasshive-capability-broker] Provider bundle MCP config unavailable',
+        {
+          message: error?.message,
+        },
+      );
+      return null;
     });
-    return null;
-  });
-  if (!mcpConfig) {
-    return degradedConversationCapabilityBundle('registry_unavailable');
+    if (!mcpConfig) {
+      return degradedConversationCapabilityBundle('registry_unavailable');
+    }
   }
   const executionMode = 'host';
   /* === VIVENTIUM START ===
@@ -1190,7 +1325,7 @@ async function buildConversationProviderBootstrapBundle({
    * Purpose: Resolve both scopes through current reviewed policy, but preserve which servers may
    * be discovered during initial tools/list versus only after an explicit helper request.
    */
-  const reviewedEntries = collectAllowedServerEntries({ mcpConfig, executionMode });
+  const reviewedEntries = collectAllowedServerEntries({ mcpConfig, executionMode, reqUser: user });
   const allowedServerEntries = reviewedEntries.filter(({ serverName }) => {
     if (excludedServers.has(serverName)) {
       return false;
@@ -1202,7 +1337,7 @@ async function buildConversationProviderBootstrapBundle({
   const deferredServers = allowedServers.filter(
     (serverName) => !declaredServers.has(serverName) && declaredDeferredServers.has(serverName),
   );
-  if (allowedServers.length === 0) {
+  if (allowedServers.length === 0 && normalizedHostTools.length === 0) {
     return degradedConversationCapabilityBundle('no_reviewed_capabilities');
   }
   const contentReadScope = shouldGrantContentReadScope(allowedServerEntries);
@@ -1213,13 +1348,10 @@ async function buildConversationProviderBootstrapBundle({
       allowedServers,
       eagerServers,
       deferredServers,
+      allowedHostTools: normalizedHostTools,
+      hostToolResources,
       executionMode,
-      requestContext: {
-        conversation_id: requestBody.conversationId,
-        parent_message_id: requestBody.parentMessageId,
-        message_id: requestBody.messageId,
-        execution_mode: executionMode,
-      },
+      requestContext: { ...brokerTurnScope(requestBody), execution_mode: executionMode },
       ttlSeconds: intEnv('VIVENTIUM_GLASSHIVE_PROVIDER_BROKER_TTL_SECONDS', 60 * 60),
       renewableTtlSeconds: intEnv(
         'VIVENTIUM_GLASSHIVE_PROVIDER_BROKER_RENEWABLE_TTL_SECONDS',
@@ -1231,6 +1363,7 @@ async function buildConversationProviderBootstrapBundle({
       allowDynamicPolicyServers: false,
       scopes: { content_read: contentReadScope },
     });
+    await persistBrokerGrantResources(mintedGrant);
   } catch (error) {
     logger.warn('[VIVENTIUM][glasshive-capability-broker] Provider bundle grant unavailable', {
       message: error?.message,
@@ -1245,6 +1378,7 @@ async function buildConversationProviderBootstrapBundle({
     allowedServers,
     eagerServers,
     deferredServers,
+    allowedHostTools: normalizedHostTools,
     contentReadScope,
   });
   if (!capabilityResolutionStatus) {
@@ -1279,6 +1413,7 @@ module.exports = {
   maybeInjectGlassHiveCapabilityBroker,
   mergeBrokerBundle,
   mergeWorkerContextBundle,
+  providerProjectionBoundary,
   isGlassHiveLaunchTool,
   executionModeForBroker,
   resolveBrokerUrl,

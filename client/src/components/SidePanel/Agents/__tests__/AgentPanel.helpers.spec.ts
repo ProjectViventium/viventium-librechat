@@ -164,7 +164,7 @@ describe('composeAgentUpdatePayload', () => {
       max_output_tokens: 320,
     } as AgentForm['voice_fallback_llm_model_parameters'];
     form.fallback_llm_provider = 'anthropic';
-    form.fallback_llm_model = 'claude-sonnet-4-5';
+    form.fallback_llm_model = 'claude-opus-5';
 
     const { payload } = composeAgentUpdatePayload(form, 'agent_123');
 
@@ -179,7 +179,7 @@ describe('composeAgentUpdatePayload', () => {
       temperature: 0.1,
       max_output_tokens: 320,
     });
-    expect(payload.fallback_llm_model).toBe('claude-sonnet-4-5');
+    expect(payload.fallback_llm_model).toBe('claude-opus-5');
   });
 
   it('persists typed GlassHive workspace options on the normal agent payload', () => {
@@ -192,6 +192,8 @@ describe('composeAgentUpdatePayload', () => {
     form.glasshive_options = {
       workspace: { mode: 'custom', path: '/srv/viventium/life' },
       access: 'workspace',
+      fallback_model: 'claude-code:opus',
+      fallback_reasoning_effort: 'high',
     };
 
     const { payload } = composeAgentUpdatePayload(form, 'agent_123', true);
@@ -205,6 +207,8 @@ describe('composeAgentUpdatePayload', () => {
     expect(payload.glasshive_options).toEqual({
       workspace: { mode: 'custom', path: '/srv/viventium/life' },
       access: 'workspace',
+      fallback_model: 'claude-code:opus',
+      fallback_reasoning_effort: 'high',
     });
   });
 

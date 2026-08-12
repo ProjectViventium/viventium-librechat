@@ -182,6 +182,29 @@ type RunAgent = Omit<Agent, 'tools'> & {
   /** Runtime-only wire contract derived from provider capability metadata during initialization. */
   declaredProviderTransport?: DeclaredProviderTransport;
   /* === VIVENTIUM END === */
+  /** Runtime-only initialized model routes used by this graph participant. */
+  viventiumGraphLlmFallbacks?: RunAgentModelRoute[];
+  /** Runtime-only exact authority block regenerated before a workspace-bound provider attempt. */
+  viventiumConversationProviderInstructionAppend?: string;
+  viventiumConversationProviderCapabilityRefresh?: (requestBody?: t.RequestBody) => Promise<{
+    attached: boolean;
+    defaultHeaders: Record<string, string>;
+    previousInstructionAppend?: string;
+    instructionAppend?: string;
+  }>;
+};
+
+type RunAgentModelRoute = Pick<
+  RunAgent,
+  'id' | 'endpoint' | 'provider' | 'model_parameters' | 'declaredProviderTransport'
+> & {
+  viventiumConversationProviderInstructionAppend?: string;
+  viventiumConversationProviderCapabilityRefresh?: (requestBody?: t.RequestBody) => Promise<{
+    attached: boolean;
+    defaultHeaders: Record<string, string>;
+    previousInstructionAppend?: string;
+    instructionAppend?: string;
+  }>;
 };
 
 /* === VIVENTIUM START ===
@@ -196,14 +219,6 @@ export type DeclaredProviderTransport = {
 
 const CHAT_COMPLETIONS_INTERNAL_MODEL = 'viventium-chat-completions';
 
-/**
- * Enforces a capability-declared Chat Completions wire contract at the model-construction seam.
- *
- * @langchain/openai may force Responses solely from a model-name heuristic even when
- * `useResponsesApi` is false. Keep the exact provider model in `modelKwargs`, which wins in the
- * serialized Chat Completions payload, while using a transport-neutral internal model name for
- * SDK routing. This is capability-driven and applies to any compatible provider, not a label.
- */
 export function applyDeclaredProviderTransport(
   modelParameters: Record<string, unknown>,
   transport?: DeclaredProviderTransport,
@@ -213,7 +228,6 @@ export function applyDeclaredProviderTransport(
   if (transport?.mode !== 'chat_completions') {
     return next;
   }
-
   if (
     String(provider ?? '')
       .trim()
@@ -223,12 +237,10 @@ export function applyDeclaredProviderTransport(
       `A declared Chat Completions transport requires an OpenAI-compatible provider; received "${String(provider ?? 'missing')}"`,
     );
   }
-
   const wireModel = String(next.model ?? '').trim();
   if (!wireModel) {
     throw new Error('A declared Chat Completions provider requires an exact model');
   }
-
   const existingModelKwargs =
     next.modelKwargs && typeof next.modelKwargs === 'object' && !Array.isArray(next.modelKwargs)
       ? (next.modelKwargs as Record<string, unknown>)
@@ -247,7 +259,6 @@ export function applyDeclaredProviderTransport(
   delete next.web_search;
   return next;
 }
-/* === VIVENTIUM END === */
 
 const nullableAgentModelParameterKeys = [
   'temperature',
@@ -272,6 +283,231 @@ function normalizeAgentModelParameters(
     }
   }
   return normalized;
+}
+/* === VIVENTIUM END === */
+
+function withoutRuntimeCapabilityInstructionAppend(agent: RunAgent): string {
+  const instructions = String(agent.instructions ?? '').trim();
+  const runtimeAppend = String(agent.viventiumConversationProviderInstructionAppend ?? '').trim();
+  if (
+    typeof agent.viventiumConversationProviderCapabilityRefresh !== 'function' ||
+    !runtimeAppend ||
+    !instructions.includes(runtimeAppend)
+  ) {
+    return instructions;
+  }
+  return instructions
+    .replace(runtimeAppend, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Graph-agent-scoped GlassHive request identity.
+ * Purpose: Resolve the existing per-agent request key at the common Agent run boundary so each
+ * handoff executes once, while an exact retry of that same participant remains idempotent.
+ * === VIVENTIUM END === */
+export function requestBodyForAgent(
+  requestBody: t.RequestBody | undefined,
+  agentId: string | null | undefined,
+): t.RequestBody | undefined {
+  const viventiumBody = requestBody as
+    | (t.RequestBody & {
+        viventiumGlassHiveIdempotencyKey?: string;
+        viventiumGlassHiveAgentIdempotencyKeys?: Record<string, string>;
+      })
+    | undefined;
+  const scopedKey = String(
+    viventiumBody?.viventiumGlassHiveAgentIdempotencyKeys?.[String(agentId || '')] || '',
+  ).trim();
+  if (!scopedKey || !viventiumBody) {
+    return requestBody;
+  }
+  return {
+    ...viventiumBody,
+    viventiumGlassHiveIdempotencyKey: scopedKey,
+  } as t.RequestBody;
+}
+
+type ProjectGraphLlmFallbacksParams = {
+  routes?: RunAgentModelRoute[];
+  agentId: string;
+  requestBody?: t.RequestBody;
+  user?: IUser;
+  streaming: boolean;
+  streamUsage: boolean;
+};
+
+type ProjectedGraphLlmFallback = {
+  provider: Providers;
+  clientOptions: t.RunLLMConfig;
+};
+
+const VIVENTIUM_GRAPH_FALLBACK_CONTEXT = Symbol.for(
+  'viventium.agent.graph.fallback.runtime.context.v1',
+);
+const VIVENTIUM_MODEL_ROUTE_CAPABILITY_REFRESH = Symbol.for(
+  'viventium.agent.model.route.capability.refresh.v1',
+);
+
+function installProjectedCapabilityRefresh({
+  route,
+  clientOptions,
+  agentId,
+  requestBody,
+  user,
+}: {
+  route: RunAgentModelRoute;
+  clientOptions: t.RunLLMConfig;
+  agentId: string;
+  requestBody?: t.RequestBody;
+  user?: IUser;
+}): void {
+  const sourceRefresh = route.viventiumConversationProviderCapabilityRefresh;
+  if (typeof sourceRefresh !== 'function') {
+    return;
+  }
+  const configuration = (clientOptions.configuration ??= {});
+  const liveHeaders = (configuration.defaultHeaders ??= {}) as Record<string, string>;
+  const refresh = async () => {
+    /* === VIVENTIUM START ===
+     * Feature: Finalized gateway turn scope for invocation-fresh provider grants.
+     * Purpose: Rebuild signed capability authority from the exact per-agent run body created after
+     * persistence ids exist, rather than an initialization-time body that may still be unscoped.
+     * === VIVENTIUM END === */
+    const scopedRequestBody = requestBodyForAgent(requestBody, agentId);
+    const result = await sourceRefresh(scopedRequestBody);
+    const resolvedHeaders = resolveHeaders({
+      headers: result.defaultHeaders ?? {},
+      user: createSafeUser(user),
+      body: scopedRequestBody,
+    });
+    for (const headerName of Object.keys(liveHeaders)) {
+      delete liveHeaders[headerName];
+    }
+    Object.assign(liveHeaders, resolvedHeaders);
+    return {
+      ...result,
+      defaultHeaders: liveHeaders,
+    };
+  };
+  Object.defineProperty(clientOptions, VIVENTIUM_MODEL_ROUTE_CAPABILITY_REFRESH, {
+    value: refresh,
+    configurable: false,
+    enumerable: false,
+    writable: false,
+  });
+}
+
+function normalizeRunModelRoute({
+  route,
+  agentId,
+  requestBody,
+  user,
+  streaming,
+  streamUsage,
+}: {
+  route: RunAgentModelRoute;
+} & Omit<ProjectGraphLlmFallbacksParams, 'routes'>): ProjectedGraphLlmFallback {
+  const provider =
+    (providerEndpointMap[
+      route.provider as keyof typeof providerEndpointMap
+    ] as unknown as Providers) ?? route.provider;
+  const modelParameters = applyDeclaredProviderTransport(
+    {
+      ...(normalizeAgentModelParameters(route.model_parameters) ?? {}),
+    } as Record<string, unknown>,
+    route.declaredProviderTransport,
+    provider,
+  );
+  const configuration = modelParameters.configuration as
+    { defaultHeaders?: Record<string, string>; baseURL?: string } | undefined;
+  if (configuration) {
+    modelParameters.configuration = {
+      ...configuration,
+      ...(configuration.defaultHeaders
+        ? { defaultHeaders: { ...configuration.defaultHeaders } }
+        : {}),
+    };
+  }
+  if (provider === Providers.ANTHROPIC && modelParameters.thinking === false) {
+    delete modelParameters.thinking;
+    delete modelParameters.thinkingBudget;
+    delete modelParameters.thinkingLevel;
+    delete modelParameters.effort;
+  }
+
+  const clientOptions = Object.assign(
+    {
+      provider,
+      streaming,
+      streamUsage,
+    },
+    modelParameters,
+  ) as unknown as t.RunLLMConfig;
+
+  if (clientOptions.configuration?.defaultHeaders != null) {
+    clientOptions.configuration.defaultHeaders = resolveHeaders({
+      headers: clientOptions.configuration.defaultHeaders as Record<string, string>,
+      user: createSafeUser(user),
+      body: requestBodyForAgent(requestBody, agentId),
+    });
+  }
+  installProjectedCapabilityRefresh({
+    route,
+    clientOptions,
+    agentId,
+    requestBody,
+    user,
+  });
+
+  const requestMeta = requestBody as
+    { viventiumSurface?: string; viventiumInputMode?: string } | undefined;
+  const inputMode = (requestMeta?.viventiumInputMode ?? '').toString().toLowerCase();
+  const voiceSurface = requestMeta?.viventiumSurface === 'voice' || inputMode === 'voice_call';
+  if (
+    disableStreamUsageEnv ||
+    voiceSurface ||
+    customProviders.has(route.provider) ||
+    (route.provider === Providers.OPENAI && route.endpoint !== route.provider)
+  ) {
+    clientOptions.streamUsage = false;
+    clientOptions.usage = true;
+  }
+
+  return { provider, clientOptions };
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Per-participant Agent Builder fallback projection.
+ * Purpose: Convert only initialization-validated runtime routes into the installed graph's native
+ * fallback shape, with the same provider normalization and request-bound headers as the owning
+ * participant. No Agent document, prompt, name, or provider-specific routing rule is consulted.
+ * Added: 2026-08-10
+ * === VIVENTIUM END === */
+export function projectGraphLlmFallbacks({
+  routes = [],
+  ...params
+}: ProjectGraphLlmFallbacksParams): ProjectedGraphLlmFallback[] {
+  return routes.map((route) => {
+    const projected = normalizeRunModelRoute({ route, ...params });
+    const runtimeContext = {
+      endpoint: route.endpoint,
+      model: String(route.model_parameters?.model ?? '').trim(),
+      provider: projected.provider,
+      reasoningKey: getReasoningKey(projected.provider, projected.clientOptions, route.endpoint),
+      systemInstructionAppend: String(
+        route.viventiumConversationProviderInstructionAppend ?? '',
+      ).trim(),
+    };
+    Object.defineProperty(projected.clientOptions, VIVENTIUM_GRAPH_FALLBACK_CONTEXT, {
+      value: Object.freeze(runtimeContext),
+      configurable: false,
+      enumerable: false,
+      writable: false,
+    });
+    return projected;
+  });
 }
 
 /**
@@ -331,43 +567,14 @@ export async function createRun({
 
   const agentInputs: AgentInputs[] = [];
   const buildAgentContext = (agent: RunAgent) => {
-    const provider =
-      (providerEndpointMap[
-        agent.provider as keyof typeof providerEndpointMap
-      ] as unknown as Providers) ?? agent.provider;
-    /* === VIVENTIUM START ===
-     * Feature: Anthropic no-thinking normalization for Agents graph runs.
-     * Purpose: @librechat/agents currently treats any non-null Anthropic `thinking`
-     * value as an active thinking run for pruning. Persisted `thinking:false` is an
-     * input flag meaning disabled, so consume it before creating graph client options.
-     * Added: 2026-05-19
-     * === VIVENTIUM END === */
-    /* === VIVENTIUM START ===
-     * Feature: Capability-declared provider wire transport.
-     * Purpose: Apply the contract immediately before the agents package constructs its model.
-     * === VIVENTIUM END === */
-    const modelParameters = applyDeclaredProviderTransport(
-      {
-        ...(normalizeAgentModelParameters(agent.model_parameters) ?? {}),
-      } as Record<string, unknown>,
-      agent.declaredProviderTransport,
-      provider,
-    );
-    if (provider === Providers.ANTHROPIC && modelParameters.thinking === false) {
-      delete modelParameters.thinking;
-      delete modelParameters.thinkingBudget;
-      delete modelParameters.thinkingLevel;
-      delete modelParameters.effort;
-    }
-
-    const llmConfig = Object.assign(
-      {
-        provider,
-        streaming,
-        streamUsage,
-      },
-      modelParameters,
-    ) as unknown as t.RunLLMConfig;
+    const { provider, clientOptions: llmConfig } = normalizeRunModelRoute({
+      route: agent,
+      agentId: agent.id,
+      requestBody,
+      user,
+      streaming,
+      streamUsage,
+    });
 
     const systemMessage = Object.values(agent.toolContextMap ?? {})
       .join('\n')
@@ -375,44 +582,27 @@ export async function createRun({
 
     const systemContent = [
       systemMessage,
-      agent.instructions ?? '',
+      withoutRuntimeCapabilityInstructionAppend(agent),
       agent.additional_instructions ?? '',
     ]
       .join('\n')
       .trim();
 
-    /**
-     * Resolve request-based headers for Custom Endpoints. Note: if this is added to
-     *  non-custom endpoints, needs consideration of varying provider header configs.
-     *  This is done at this step because the request body may contain dynamic values
-     *  that need to be resolved after agent initialization.
-     */
-    if (llmConfig?.configuration?.defaultHeaders != null) {
-      llmConfig.configuration.defaultHeaders = resolveHeaders({
-        headers: llmConfig.configuration.defaultHeaders as Record<string, string>,
-        user: createSafeUser(user),
-        body: requestBody,
-      });
+    const graphFallbacks = projectGraphLlmFallbacks({
+      routes: agent.viventiumGraphLlmFallbacks,
+      agentId: agent.id,
+      requestBody,
+      user,
+      streaming,
+      streamUsage,
+    });
+    if (graphFallbacks.length > 0) {
+      (
+        llmConfig as t.RunLLMConfig & {
+          fallbacks: ProjectedGraphLlmFallback[];
+        }
+      ).fallbacks = graphFallbacks;
     }
-
-    /** Resolves issues with new OpenAI usage field */
-    // === VIVENTIUM START ===
-    const requestMeta = requestBody as {
-      viventiumSurface?: string;
-      viventiumInputMode?: string;
-    };
-    const inputMode = (requestMeta?.viventiumInputMode ?? '').toString().toLowerCase();
-    const voiceSurface = requestMeta?.viventiumSurface === 'voice' || inputMode === 'voice_call';
-    const forceDisableStreamUsage = disableStreamUsageEnv || voiceSurface;
-    if (
-      forceDisableStreamUsage ||
-      customProviders.has(agent.provider) ||
-      (agent.provider === Providers.OPENAI && agent.endpoint !== agent.provider)
-    ) {
-      llmConfig.streamUsage = false;
-      llmConfig.usage = true;
-    }
-    // === VIVENTIUM END ===
 
     /**
      * Override defer_loading for tools that were discovered in previous turns.

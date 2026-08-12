@@ -11,6 +11,7 @@ const mockRunMemoryMaintenance = jest.fn();
 const mockPrepareMemoryValueForWrite = jest.fn();
 
 jest.mock('@librechat/api', () => ({
+  clearMemoryReadContextCache: jest.fn(),
   evaluateMemoryWrite: (...args) => mockEvaluateMemoryWrite(...args),
   generateCheckAccess: jest.fn(() => (req, res, next) => next()),
   prepareMemoryValueForWrite: (...args) => mockPrepareMemoryValueForWrite(...args),

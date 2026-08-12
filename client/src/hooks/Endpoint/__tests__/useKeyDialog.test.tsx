@@ -52,6 +52,7 @@ describe('useKeyDialog', () => {
 
   it('opens the Anthropic browser flow and primes manual-code settings state', async () => {
     mockRequestGet.mockResolvedValue({
+      attemptId: 'anthropic-attempt-123',
       flowMode: 'manual_code',
       authUrl:
         'https://claude.ai/oauth/authorize?code=true&state=anthropic-state-123&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback',

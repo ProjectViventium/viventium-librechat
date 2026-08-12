@@ -40,6 +40,16 @@ describe('selectLibreChatAgentGraph', () => {
     expect(edges).toHaveLength(1);
   });
 
+  it('omits LibreChat handoff graph tools for the worker-native capability name', () => {
+    expect(
+      selectLibreChatAgentGraph({
+        agentIds: ['handoff-agent'],
+        edges: [{ from: 'main', to: 'handoff-agent', edgeType: 'handoff' }],
+        capability: { worker_native_tools: true },
+      }),
+    ).toEqual({ agentIds: [], edges: [] });
+  });
+
   it('preserves the normal graph for direct and non-native providers', () => {
     const agentIds = ['handoff-agent'];
     const edges = [{ from: 'main', to: 'handoff-agent', edgeType: 'handoff' }];

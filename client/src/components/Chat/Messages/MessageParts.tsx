@@ -155,6 +155,10 @@ export default function Message(props: TMessageProps) {
                     isSubmitting={isSubmitting}
                     searchResults={searchResults}
                     messageId={message.messageId}
+                    messageAgentId={
+                      (message as unknown as { agent_id?: string; agentId?: string }).agent_id ||
+                      (message as unknown as { agent_id?: string; agentId?: string }).agentId
+                    }
                     setSiblingIdx={setSiblingIdx}
                     isCreatedByUser={message.isCreatedByUser}
                     conversationId={conversation?.conversationId}

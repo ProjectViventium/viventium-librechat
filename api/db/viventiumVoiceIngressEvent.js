@@ -23,6 +23,9 @@ module.exports = function createViventiumVoiceIngressEvent(db) {
       text: { type: String, required: true },
       receivedAtMs: { type: Number, default: 0 },
       requestId: { type: String, default: '' },
+      /* === VIVENTIUM START === Speaker-aware continuation audit. === VIVENTIUM END === */
+      speakerSegment: { type: mongoose.Schema.Types.Mixed, default: null },
+      speakerSegments: { type: [mongoose.Schema.Types.Mixed], default: [] },
     },
     { _id: false },
   );

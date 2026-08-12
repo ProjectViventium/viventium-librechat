@@ -9,6 +9,8 @@ import logging
 import os
 import threading
 import time
+import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
@@ -84,6 +86,56 @@ def _delivery_detail_deferred_fallback_reason(delivery_detail: Optional[Dict[str
             if channel_reason:
                 return channel_reason
     return ""
+
+
+def dispatch_run_ledger_updates(
+    task: Dict[str, object],
+    dispatch_result: Optional[Dict[str, object]],
+    *,
+    existing_execution: Optional[Dict[str, object]] = None,
+    completed_at: Optional[datetime] = None,
+) -> Dict[str, object]:
+    """Build the canonical terminal ledger fields for scheduled and manual executions."""
+    result = dispatch_result if isinstance(dispatch_result, dict) else {}
+    delivery = result.get("delivery") if isinstance(result.get("delivery"), dict) else {}
+    channels = delivery.get("channels") if isinstance(delivery.get("channels"), dict) else {}
+    executor = str(task.get("executor") or "viventium_agent")
+    queued = executor == "glasshive_host" and str(delivery.get("outcome") or "") == "queued"
+    delivery_outcome = str(delivery.get("outcome") or "").strip().lower()
+    channel_errors = result.get("channel_errors") if isinstance(result.get("channel_errors"), dict) else {}
+
+    if queued:
+        disposition = "running"
+    elif delivery_outcome == "superseded":
+        disposition = "superseded"
+    elif channel_errors:
+        disposition = "partial"
+    elif delivery_outcome in {"sent", "fallback_delivered"}:
+        disposition = "delivered"
+    elif delivery_outcome in {"suppressed", "audit_only"}:
+        disposition = "silent"
+    else:
+        disposition = "partial"
+
+    interaction_ref = None
+    if queued and result.get("glasshive_run_id"):
+        interaction_ref = f"glasshive:{result['glasshive_run_id']}"
+    elif result.get("conversation_id"):
+        interaction_ref = f"conversation:{result['conversation_id']}"
+
+    result_execution = result.get("execution") if isinstance(result.get("execution"), dict) else {}
+    finished = completed_at or datetime.now(timezone.utc)
+    updates: Dict[str, object] = {
+        "status": "queued" if queued else "completed",
+        "disposition": disposition,
+        "execution_snapshot": {**(existing_execution or {}), **result_execution},
+        "channel_outcomes": channels,
+        "interaction_ref": interaction_ref,
+        "updated_at": to_utc_iso(finished),
+    }
+    if not queued:
+        updates["completed_at"] = to_utc_iso(finished)
+    return updates
 
 
 def _deferred_fallback_degradation(
@@ -298,6 +350,81 @@ def _scheduler_late_delivery(task: Dict[str, object]) -> Optional[Dict[str, obje
     return None
 
 
+def _interval_delta(schedule: Dict[str, object]) -> Optional[timedelta]:
+    interval = schedule.get("interval") if isinstance(schedule.get("interval"), dict) else {}
+    every = int(interval.get("every") or 0)
+    unit = str(interval.get("unit") or "")
+    units = {
+        "minute": timedelta(minutes=every),
+        "hour": timedelta(hours=every),
+        "day": timedelta(days=every),
+        "week": timedelta(weeks=every),
+    }
+    delta = units.get(unit)
+    return delta if every > 0 and delta is not None else None
+
+
+def _active_window_occurrences(
+    schedule: Dict[str, object],
+    local_day: object,
+) -> list[datetime]:
+    active_window = (
+        schedule.get("active_window")
+        if isinstance(schedule.get("active_window"), dict)
+        else None
+    )
+    if not active_window or active_window.get("cadence") != "restart_daily":
+        return []
+    delta = _interval_delta(schedule)
+    if delta is None:
+        return []
+    tz = ensure_timezone(str(schedule.get("timezone") or "UTC"))
+    start_hour, start_minute = parse_time(str(active_window.get("start_local") or ""))
+    end_hour, end_minute = parse_time(str(active_window.get("end_local") or ""))
+    day = local_day
+    start_naive = datetime(day.year, day.month, day.day, start_hour, start_minute)
+    end_naive = datetime(day.year, day.month, day.day, end_hour, end_minute)
+    candidates: list[datetime] = []
+    cursor = start_naive
+    while cursor <= end_naive:
+        local_candidate = cursor.replace(tzinfo=tz)
+        utc_candidate = local_candidate.astimezone(timezone.utc)
+        round_trip = utc_candidate.astimezone(tz).replace(tzinfo=None)
+        if round_trip == cursor and utc_candidate not in candidates:
+            candidates.append(utc_candidate)
+        cursor += delta
+    return candidates
+
+
+def _latest_active_window_occurrence(
+    schedule: Dict[str, object],
+    stored_due: datetime,
+    now: datetime,
+) -> datetime:
+    tz = ensure_timezone(str(schedule.get("timezone") or "UTC"))
+    now_local = now.astimezone(tz)
+    candidates = _active_window_occurrences(schedule, now_local.date())
+    due = [candidate for candidate in candidates if candidate <= now]
+    if not due:
+        due = _active_window_occurrences(schedule, now_local.date() - timedelta(days=1))
+    latest = max(due) if due else stored_due
+    return latest if latest >= stored_due else stored_due
+
+
+def _next_active_window_occurrence(
+    schedule: Dict[str, object],
+    now: datetime,
+) -> Optional[datetime]:
+    tz = ensure_timezone(str(schedule.get("timezone") or "UTC"))
+    local_day = now.astimezone(tz).date()
+    for day_offset in (0, 1):
+        candidates = _active_window_occurrences(schedule, local_day + timedelta(days=day_offset))
+        for candidate in candidates:
+            if candidate > now:
+                return candidate
+    return None
+
+
 def _latest_due_occurrence(
     schedule: Dict[str, object],
     stored_due: datetime,
@@ -355,17 +482,10 @@ def _latest_due_occurrence(
                 day = min(day_of_month, last_day_of_month(year, month))
                 candidate = candidate.replace(year=year, month=month, day=day)
         elif sched_type == "interval":
-            interval = schedule.get("interval") if isinstance(schedule.get("interval"), dict) else {}
-            every = int(interval.get("every") or 0)
-            unit = str(interval.get("unit") or "")
-            units = {
-                "minute": timedelta(minutes=every),
-                "hour": timedelta(hours=every),
-                "day": timedelta(days=every),
-                "week": timedelta(weeks=every),
-            }
-            delta = units.get(unit)
-            if every <= 0 or delta is None:
+            if isinstance(schedule.get("active_window"), dict):
+                return _latest_active_window_occurrence(schedule, stored_due, now)
+            delta = _interval_delta(schedule)
+            if delta is None:
                 return stored_due
             anchor_value = schedule.get("start_at")
             anchor = (
@@ -402,6 +522,8 @@ class SchedulerEngine:
         misfire_grace_s: int,
         retry_delay_s: int,
         catch_up_max_late_s: int = DEFAULT_CATCH_UP_MAX_LATE_S,
+        max_workers: int = 4,
+        occurrence_lease_s: int = 15 * 60,
     ) -> None:
         self._storage = storage
         self._poll_interval_s = max(1, poll_interval_s)
@@ -423,6 +545,16 @@ class SchedulerEngine:
         )
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._max_workers = max(1, int(max_workers))
+        self._occurrence_lease_s = max(1, int(occurrence_lease_s))
+        self._lease_owner = f"scheduler:{os.getpid()}:{uuid.uuid4().hex}"
+        self._executor = ThreadPoolExecutor(
+            max_workers=self._max_workers,
+            thread_name_prefix="scheduling-cortex-run",
+        )
+        self._capacity = threading.BoundedSemaphore(self._max_workers)
+        self._futures: set[Future[None]] = set()
+        self._futures_lock = threading.Lock()
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -435,6 +567,7 @@ class SchedulerEngine:
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=5)
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
     def _run_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -451,7 +584,25 @@ class SchedulerEngine:
         if not due_tasks:
             return
         for task in due_tasks:
-            self._process_task(task, now)
+            if not self._capacity.acquire(blocking=False):
+                logger.info(
+                    "Scheduler worker pool saturated; task %s remains due for retry",
+                    task.get("id"),
+                )
+                break
+            try:
+                future = self._executor.submit(self._process_task, task, now)
+            except Exception:
+                self._capacity.release()
+                raise
+            with self._futures_lock:
+                self._futures.add(future)
+            future.add_done_callback(self._release_worker_capacity)
+
+    def _release_worker_capacity(self, future: Future[None]) -> None:
+        with self._futures_lock:
+            self._futures.discard(future)
+        self._capacity.release()
 
     def _process_task(self, task: Dict[str, object], now: datetime) -> None:
         schedule = task.get("schedule")
@@ -476,6 +627,37 @@ class SchedulerEngine:
             next_run_dt = now
 
         next_run_dt = _latest_due_occurrence(schedule, next_run_dt, now)
+
+        metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+        workbench = (
+            metadata.get("workbench_scheduled_prompt")
+            if isinstance(metadata.get("workbench_scheduled_prompt"), dict)
+            else {}
+        )
+        claim = self._storage.claim_scheduled_prompt_occurrence(
+            task_id=str(task_id or ""),
+            user_id=str(task.get("user_id") or ""),
+            executor=str(task.get("executor") or "viventium_agent"),
+            due_at=to_utc_iso(next_run_dt),
+            lease_owner=self._lease_owner,
+            now=to_utc_iso(now),
+            lease_seconds=self._occurrence_lease_s,
+            definition_id=str(workbench.get("definition_id") or "") or None,
+            version_id=str(workbench.get("version_id") or "") or None,
+        )
+        if not claim.get("claimed"):
+            logger.info(
+                "Scheduled occurrence for task %s was not claimed: %s",
+                task_id,
+                claim.get("reason") or "already_active",
+            )
+            return
+        run = claim.get("run") if isinstance(claim.get("run"), dict) else {}
+        run_id = str(run.get("run_id") or "")
+        occurrence_key = str(run.get("occurrence_key") or run_id)
+        task = dict(task)
+        task["_scheduled_prompt_run_id"] = run_id
+        task["_scheduled_prompt_occurrence_key"] = occurrence_key
 
         late_seconds = max(0, int((now - next_run_dt).total_seconds()))
         if late_seconds > self._misfire_grace_s:
@@ -502,6 +684,16 @@ class SchedulerEngine:
                     reason=reason,
                     policy=policy,
                 )
+                self._storage.update_scheduled_prompt_run(
+                    run_id,
+                    {
+                        "status": "missed",
+                        "completed_at": to_utc_iso(now),
+                        "disposition": "cancelled",
+                        "channel_outcomes": {},
+                        "updated_at": to_utc_iso(now),
+                    },
+                )
                 return
 
         task = _with_glasshive_occurrence_key(task, next_run_dt)
@@ -523,13 +715,72 @@ class SchedulerEngine:
             task_id,
             running_updates,
         )
+        self._storage.update_scheduled_prompt_run(
+            run_id,
+            {
+                "status": "dispatching",
+                "disposition": "running",
+                "execution_snapshot": {
+                    "dispatch_idempotency_key": occurrence_key,
+                    "executor": str(task.get("executor") or "viventium_agent"),
+                },
+                "updated_at": to_utc_iso(now),
+            },
+        )
+        self._storage.update_scheduled_prompt_run(
+            run_id,
+            {
+                "status": "dispatching",
+                "disposition": "running",
+                "execution_snapshot": {
+                    "dispatch_idempotency_key": occurrence_key,
+                    "executor": str(task.get("executor") or "viventium_agent"),
+                },
+                "updated_at": to_utc_iso(now),
+            },
+        )
 
         try:
-            dispatch_result = dispatch_task(task)
+            scheduled_task = dict(task)
+            scheduled_task["_scheduled_prompt_trigger_kind"] = "scheduled"
+            scheduled_task["_scheduled_prompt_trigger_source"] = "scheduler_loop"
+            dispatch_result = dispatch_task(scheduled_task)
+            self._update_run_after_dispatch(run_id, task, now, dispatch_result)
             self._update_after_success(task, now, dispatch_result)
         except Exception as exc:
             logger.exception("Task %s failed: %s", task_id, exc)
+            self._storage.update_scheduled_prompt_run(
+                run_id,
+                {
+                    "status": "failed",
+                    "completed_at": to_utc_iso(datetime.now(timezone.utc)),
+                    "disposition": "failed",
+                    "error_class": type(exc).__name__,
+                    "result_summary": f"Dispatch failed ({type(exc).__name__}).",
+                    "updated_at": to_utc_iso(datetime.now(timezone.utc)),
+                },
+            )
             self._update_after_failure(task, now, exc)
+
+    def _update_run_after_dispatch(
+        self,
+        run_id: str,
+        task: Dict[str, object],
+        now: datetime,
+        dispatch_result: Optional[Dict[str, object]],
+    ) -> None:
+        existing_run = self._storage.get_scheduled_prompt_run(run_id) or {}
+        existing_execution = (
+            existing_run.get("execution_snapshot")
+            if isinstance(existing_run.get("execution_snapshot"), dict)
+            else {}
+        )
+        updates = dispatch_run_ledger_updates(
+            task,
+            dispatch_result,
+            existing_execution=existing_execution,
+        )
+        self._storage.update_scheduled_prompt_run(run_id, updates)
 
     @staticmethod
     def _workspace_pending_occurrence(task: Dict[str, object]) -> Optional[datetime]:
@@ -1106,23 +1357,15 @@ def compute_next_run(schedule: Dict[str, object], now: datetime, last_run: Optio
         return candidate.astimezone(timezone.utc)
 
     if sched_type == "interval":
-        interval = schedule.get("interval") or {}
-        every = int(interval.get("every") or 0)
-        unit = interval.get("unit")
-        if every <= 0 or unit not in {"minute", "hour", "day", "week"}:
+        if isinstance(schedule.get("active_window"), dict):
+            return _next_active_window_occurrence(schedule, now)
+        delta = _interval_delta(schedule)
+        if delta is None:
             return None
         anchor = schedule.get("start_at")
         base = last_run or now
         if anchor:
             base = parse_iso(anchor, tz).astimezone(timezone.utc)
-        if unit == "minute":
-            delta = timedelta(minutes=every)
-        elif unit == "hour":
-            delta = timedelta(hours=every)
-        elif unit == "day":
-            delta = timedelta(days=every)
-        else:
-            delta = timedelta(weeks=every)
         candidate = base
         while candidate <= now:
             candidate += delta

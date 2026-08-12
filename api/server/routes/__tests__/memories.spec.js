@@ -17,6 +17,7 @@ const mockUpdateUserPersonalization = jest.fn();
 const mockScheduleConversationRecallRefresh = jest.fn();
 
 jest.mock('@librechat/api', () => ({
+  clearMemoryReadContextCache: jest.fn(),
   Tokenizer: { getTokenCount: jest.fn(() => 1) },
   evaluateMemoryWrite: jest.fn(() => ({ ok: true })),
   generateCheckAccess: jest.fn(() => (req, res, next) => next()),

@@ -72,25 +72,68 @@ export const agentToolOptionsSchema = z.record(z.string(), toolOptionsSchema).op
  */
 
 /** Activation config schema for background cortices */
-export const activationConfigSchema = z.object({
-  enabled: z.boolean(),
-  model: z.string(),
-  provider: z.string(),
-  prompt: z.string(),
-  intent_scope: z.string().optional(),
-  activation_failure_visibility: z.enum(['silent', 'visible']).optional(),
-  confidence_threshold: z.number().min(0).max(1),
-  cooldown_ms: z.number().min(0),
-  max_history: z.number().min(1),
-  fallbacks: z
-    .array(
-      z.object({
-        provider: z.string(),
-        model: z.string(),
-      }),
-    )
-    .optional(),
-});
+export const activationConfigSchema = z
+  .object({
+    enabled: z.boolean(),
+    mode: z.enum(['classified', 'always', 'disabled']).optional(),
+    model: z.string().optional(),
+    provider: z.string().optional(),
+    prompt: z.string().optional(),
+    intent_scope: z.string().optional(),
+    activation_failure_visibility: z.enum(['silent', 'visible']).optional(),
+    confidence_threshold: z.number().min(0).max(1).optional(),
+    cooldown_ms: z.number().min(0).optional(),
+    max_history: z.number().min(1).optional(),
+    fallbacks: z
+      .array(
+        z.object({
+          provider: z.string(),
+          model: z.string(),
+        }),
+      )
+      .optional(),
+  })
+  .superRefine((activation, ctx) => {
+    const mode = activation.enabled === false ? 'disabled' : (activation.mode ?? 'classified');
+    if (mode !== 'classified') {
+      return;
+    }
+
+    const requireClassifierString = (field: 'provider' | 'model' | 'prompt', message: string) => {
+      if (String(activation[field] ?? '').trim()) {
+        return;
+      }
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [field],
+        message,
+      });
+    };
+    requireClassifierString('provider', 'Classifier provider is required');
+    requireClassifierString('model', 'Classifier model is required');
+    requireClassifierString('prompt', 'Classifier prompt is required');
+    if (activation.confidence_threshold == null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['confidence_threshold'],
+        message: 'Classifier confidence threshold is required',
+      });
+    }
+    if (activation.cooldown_ms == null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['cooldown_ms'],
+        message: 'Classifier cooldown is required',
+      });
+    }
+    if (activation.max_history == null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['max_history'],
+        message: 'Classifier history depth is required',
+      });
+    }
+  });
 
 /** Background cortex schema - an agent with its activation config */
 export const backgroundCortexSchema = z.object({
@@ -218,8 +261,12 @@ export type ProviderCapabilityRegistry = Record<
     native_realtime_voice?: boolean;
     realtime_voice?: boolean;
     automatic_fallback_target?: boolean;
+    serial_model_fallback?: boolean;
     workspace_binding?: boolean;
     native_tools?: boolean;
+    worker_native_tools?: boolean;
+    host_tools_transport?: 'broker_mcp';
+    host_tools?: string[];
     conversation_session?: boolean;
     responses_api?: boolean;
     default_access?: 'full' | 'workspace';

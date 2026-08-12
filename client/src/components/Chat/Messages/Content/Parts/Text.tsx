@@ -18,7 +18,12 @@ type ContentType =
   | ReactElement;
 
 const TextPart = memo(function TextPart({ text, isCreatedByUser, showCursor }: TextPartProps) {
-  const { isSubmitting = false, isLatestMessage = false } = useMessageContext();
+  const {
+    isSubmitting = false,
+    isLatestMessage = false,
+    viventiumPartId,
+    viventiumAgentId,
+  } = useMessageContext();
   const enableUserMsgMarkdown = useRecoilValue(store.enableUserMsgMarkdown);
   const showCursorState = useMemo(() => showCursor && isSubmitting, [showCursor, isSubmitting]);
 
@@ -32,8 +37,14 @@ const TextPart = memo(function TextPart({ text, isCreatedByUser, showCursor }: T
     }
   }, [isCreatedByUser, enableUserMsgMarkdown, text, isLatestMessage]);
 
+  /* === VIVENTIUM START ===
+   * Feature: Exact rendered message-part identity for QA telemetry.
+   * Purpose: Structural, UI-only metadata lets QA observe Main paint without text/name heuristics.
+   * === VIVENTIUM END === */
   return (
     <div
+      data-viventium-part-id={viventiumPartId || undefined}
+      data-viventium-agent-id={viventiumAgentId || undefined}
       className={cn(
         isSubmitting ? 'submitting' : '',
         showCursorState && !!text.length ? 'result-streaming' : '',

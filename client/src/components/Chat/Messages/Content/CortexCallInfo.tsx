@@ -8,6 +8,7 @@
 /* eslint-disable i18next/no-literal-string */
 import { AlertCircle, Brain, Sparkles, Target } from 'lucide-react';
 import type { CortexStatus } from 'librechat-data-provider';
+import { useLocalize } from '~/hooks';
 import { cn } from '~/utils';
 
 const PUBLIC_BACKGROUND_AGENT_ERROR =
@@ -59,6 +60,8 @@ export default function CortexCallInfo({
   insight,
   error,
   error_class,
+  fallback_used = false,
+  fallback_reason_class,
 }: {
   cortex_name: string;
   status: CortexStatus;
@@ -67,14 +70,33 @@ export default function CortexCallInfo({
   insight?: string;
   error?: string;
   error_class?: string;
+  fallback_used?: boolean;
+  fallback_reason_class?: string | null;
 }) {
+  const localize = useLocalize();
   const isSkipped = status === 'skipped';
   const safeError = publicErrorText(error);
   const safeErrorClass = publicErrorClassLabel(error_class);
   const hasError = status === 'error' && safeError.length > 0;
+  const safeFallbackReason = publicErrorClassLabel(fallback_reason_class || undefined);
 
   return (
     <div className="flex flex-col divide-y divide-border-light">
+      {fallback_used && (
+        <div className="flex flex-col gap-1 p-3">
+          <div className="flex items-center gap-2 text-xs font-medium text-text-secondary">
+            <Sparkles className="size-3" />
+            <span>{localize('com_ui_model_fallback_used')}</span>
+          </div>
+          <div className="text-sm text-text-primary">
+            The configured primary model route was unavailable, so this background result used its
+            configured fallback.
+          </div>
+          {safeFallbackReason && (
+            <div className="text-xs text-text-secondary">Reason: {safeFallbackReason}</div>
+          )}
+        </div>
+      )}
       {/* Activation reason section */}
       {reason && (
         <div className="flex flex-col gap-1 p-3">

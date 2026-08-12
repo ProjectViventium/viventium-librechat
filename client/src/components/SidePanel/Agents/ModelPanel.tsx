@@ -32,7 +32,8 @@ export default function ModelPanel({
   const fallbackModel = useWatch({ control, name: 'fallback_llm_model' });
   const fallbackProvider = useWatch({ control, name: 'fallback_llm_provider' });
   const modelParameters = useWatch({ control, name: 'model_parameters' });
-
+  const glassHiveOptions = useWatch({ control, name: 'glasshive_options' });
+  const glassHiveFallbackModel = glassHiveOptions?.fallback_model;
   const provider = useMemo(() => {
     const value =
       typeof providerOption === 'string'
@@ -45,6 +46,14 @@ export default function ModelPanel({
     [modelsData, provider],
   );
   const providerCapability = providerCapabilities[provider];
+  const modelCapability = useMemo(
+    () => providerCapability?.models?.find((candidate) => candidate.id === model),
+    [model, providerCapability?.models],
+  );
+  const fallbackModelCapability = useMemo(
+    () => providerCapability?.models?.find((candidate) => candidate.id === glassHiveFallbackModel),
+    [glassHiveFallbackModel, providerCapability?.models],
+  );
 
   useEffect(() => {
     const _model = model ?? '';
@@ -237,6 +246,69 @@ export default function ModelPanel({
           parameterField="model_parameters"
           providerCapability={providerCapability}
         />
+        {providerCapability?.serial_model_fallback === true && (
+          <div className="border-token-border-light mb-4 border-t pt-4">
+            <label className="mb-1 block text-sm font-medium" htmlFor="glasshive-fallback-model">
+              {localize('com_ui_glasshive_quota_fallback_model')}
+            </label>
+            <Controller
+              name="glasshive_options.fallback_model"
+              control={control}
+              render={({ field }) => (
+                <select
+                  {...field}
+                  value={field.value ?? ''}
+                  id="glasshive-fallback-model"
+                  className="border-token-border-light bg-token-surface-primary mb-3 h-10 w-full rounded-lg border px-3"
+                >
+                  <option value="">{localize('com_ui_glasshive_quota_fallback_empty')}</option>
+                  {providerCapability.models
+                    ?.filter((candidate) => candidate.id !== model)
+                    .map((candidate) => (
+                      <option key={candidate.id} value={candidate.id}>
+                        {candidate.label}
+                      </option>
+                    ))}
+                </select>
+              )}
+            />
+            <p className="text-token-text-secondary -mt-2 mb-3 text-xs">
+              {localize('com_ui_glasshive_quota_fallback_description')}
+            </p>
+            {glassHiveFallbackModel &&
+              (fallbackModelCapability?.effortChoices?.length ?? 0) > 0 && (
+                <>
+                  <label
+                    className="mb-1 block text-sm font-medium"
+                    htmlFor="glasshive-fallback-effort"
+                  >
+                    {localize('com_ui_glasshive_quota_fallback_effort')}
+                  </label>
+                  <Controller
+                    name="glasshive_options.fallback_reasoning_effort"
+                    control={control}
+                    render={({ field }) => (
+                      <select
+                        {...field}
+                        value={field.value ?? fallbackModelCapability?.recommendedEffort ?? ''}
+                        id="glasshive-fallback-effort"
+                        className="border-token-border-light bg-token-surface-primary h-10 w-full rounded-lg border px-3"
+                      >
+                        {fallbackModelCapability?.effortChoices.map((effort) => (
+                          <option key={effort} value={effort}>
+                            {effort}
+                            {effort === fallbackModelCapability.recommendedEffort
+                              ? ` (${localize('com_ui_glasshive_recommended')})`
+                              : ''}
+                          </option>
+                        ))}
+                      </select>
+                    )}
+                  />
+                </>
+              )}
+          </div>
+        )}
         {/* === VIVENTIUM START ===
          * Feature: Agent Fallback LLM
          * Purpose: Let users configure the secondary model from the existing Model Parameters page.
@@ -277,6 +349,9 @@ export default function ModelPanel({
         provider={provider}
         model={model ?? ''}
         title={localize('com_ui_model_parameters')}
+        excludedParameterKeys={
+          (modelCapability?.effortChoices?.length ?? 0) > 0 ? ['reasoning_effort'] : []
+        }
       />
     </div>
   );

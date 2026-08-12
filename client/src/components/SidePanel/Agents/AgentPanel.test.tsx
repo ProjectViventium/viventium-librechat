@@ -14,6 +14,7 @@ let mockActivePanel = 'builder';
 let mockCurrentAgentId = 'agent-123';
 let mockWatchedAgentId = 'agent-123';
 let mockVoicePanelMount = 0;
+const mockEndpointsConfig: Record<string, unknown> = {};
 /* === VIVENTIUM END === */
 
 // Mock notification severity enum before other imports
@@ -119,7 +120,7 @@ jest.mock('~/Providers/AgentPanelContext', () => ({
     activePanel: mockActivePanel,
     agentsConfig: { allowedProviders: [] },
     setActivePanel: jest.fn(),
-    endpointsConfig: {},
+    endpointsConfig: mockEndpointsConfig,
     setCurrentAgentId: jest.fn(),
     agent_id: mockCurrentAgentId,
   }),

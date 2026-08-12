@@ -11,6 +11,13 @@ export type {
   AbortResult,
   JobStatus,
   IJobStore,
+  InteractionContext,
+  AdapterCapabilities,
+  InteractionAdapterCapabilities,
+  InteractionDeliveryPolicy,
+  InteractionDeliveryAck,
+  DeliveryAcknowledgementResult,
+  DeliveryAcknowledgementState,
 } from './interfaces/IJobStore';
 
 export { createStreamServices } from './createStreamServices';

@@ -1,7 +1,18 @@
 /**
  * @jest-environment jsdom
  */
-import { buildLoginRedirectUrl } from '../src/api-endpoints';
+import { buildLoginRedirectUrl, memory, memoryPreferences } from '../src/api-endpoints';
+
+describe('memory API endpoints', () => {
+  it('keeps arbitrary saved-memory keys out of the preferences control namespace', () => {
+    expect(memory('preferences')).toBe('/api/memories/entries/preferences');
+    expect(memoryPreferences()).toBe('/api/memories/preferences');
+  });
+
+  it('encodes saved-memory keys inside the canonical entry namespace', () => {
+    expect(memory('project/notes')).toBe('/api/memories/entries/project%2Fnotes');
+  });
+});
 
 describe('buildLoginRedirectUrl', () => {
   afterEach(() => {

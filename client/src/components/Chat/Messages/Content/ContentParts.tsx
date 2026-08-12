@@ -14,7 +14,13 @@ import MemoryArtifacts from './MemoryArtifacts';
 import Sources from '~/components/Web/Sources';
 import Container from './Container';
 import Part from './Part';
-import { filterRenderableContentParts, type RenderableContentInput } from './contentPartUtils';
+import {
+  annotateRenderableContentParts,
+  createRenderableMessageTextPart,
+  filterRenderableContentParts,
+  getRenderableContentPartIdentity,
+  type RenderableContentInput,
+} from './contentPartUtils';
 import { isNoResponseOnlyText } from '~/utils/noResponseTag';
 
 /* === VIVENTIUM START ===
@@ -35,6 +41,7 @@ type ContentPartsProps = {
   fallbackText?: string | null;
   cortexParts?: Array<TMessageContentParts | undefined> | undefined;
   messageId: string;
+  messageAgentId?: string | null;
   conversationId?: string | null;
   attachments?: TAttachment[];
   searchResults?: { [key: string]: SearchResultData };
@@ -46,9 +53,7 @@ type ContentPartsProps = {
   enterEdit?: (cancel?: boolean) => void | null | undefined;
   siblingIdx?: number;
   setSiblingIdx?:
-    | ((value: number) => void | React.Dispatch<React.SetStateAction<number>>)
-    | null
-    | undefined;
+    ((value: number) => void | React.Dispatch<React.SetStateAction<number>>) | null | undefined;
 };
 
 /**
@@ -64,6 +69,7 @@ const ContentParts = memo(function ContentParts({
   fallbackText,
   cortexParts,
   messageId,
+  messageAgentId,
   enterEdit,
   siblingIdx,
   attachments,
@@ -87,8 +93,13 @@ const ContentParts = memo(function ContentParts({
   );
   const displayContent = useMemo(() => {
     const normalizedFallback = typeof fallbackText === 'string' ? fallbackText.trim() : '';
+    /* === VIVENTIUM START ===
+     * Feature: Exact rendered message-part identity for QA telemetry.
+     * Purpose: Annotate UI-only clones before filters can remove or reorder persisted parts.
+     * === VIVENTIUM END === */
+    const identifiedContent = annotateRenderableContentParts(content, messageAgentId ?? '');
     const parts =
-      filterRenderableContentParts(content, {
+      filterRenderableContentParts(identifiedContent, {
         visibleFallbackText: normalizedFallback,
       }) ?? [];
     const hasNonCortexRenderablePart = parts.some((part) => part && !cortexTypes.has(part.type));
@@ -100,15 +111,8 @@ const ContentParts = memo(function ContentParts({
       return parts;
     }
 
-    return [
-      {
-        type: ContentTypes.TEXT,
-        text: normalizedFallback,
-        [ContentTypes.TEXT]: normalizedFallback,
-      } as TMessageContentParts,
-      ...parts,
-    ];
-  }, [content, cortexTypes, fallbackText]);
+    return [createRenderableMessageTextPart(normalizedFallback, messageAgentId ?? ''), ...parts];
+  }, [content, cortexTypes, fallbackText, messageAgentId]);
 
   /**
    * Cortex parts come from a dedicated transient store during streaming
@@ -145,6 +149,7 @@ const ContentParts = memo(function ContentParts({
     (part: TMessageContentParts, idx: number, isLastPart: boolean) => {
       const toolCallId = (part?.[ContentTypes.TOOL_CALL] as Agents.ToolCall | undefined)?.id ?? '';
       const partAttachments = attachmentMap[toolCallId];
+      const renderIdentity = getRenderableContentPartIdentity(part);
 
       return (
         <MessageContext.Provider
@@ -157,6 +162,8 @@ const ContentParts = memo(function ContentParts({
             nextType: displayContent?.[idx + 1]?.type,
             isSubmitting: effectiveIsSubmitting,
             isLatestMessage,
+            viventiumPartId: renderIdentity.partId,
+            viventiumAgentId: renderIdentity.agentId,
           }}
         >
           <Part

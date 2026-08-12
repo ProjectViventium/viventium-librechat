@@ -243,23 +243,127 @@ function dedupeMemoriesByKey(memories: MemoryEntryLeanLike[]): {
 }
 
 /* === VIVENTIUM START ===
- * Feature: Memory recall context preservation.
- * Purpose: Keep both the beginning and end of long memory values when applying prompt budgets.
+ * Feature: Structure-aware memory read boundary.
+ * Purpose: Preserve complete semantic entries and make every omission visible to the model when a
+ * custom/degraded read budget is smaller than the governed memory store.
  */
 function trimMemoryValueToBudget(value: string, tokenBudget: number): string {
   const trimmed = value.trim();
   if (approximateTokenCount(trimmed) <= tokenBudget) {
     return trimmed;
   }
-  const separator = '\n...\n';
-  const charBudget = Math.max(16, tokenBudget * 4 - separator.length);
-  const headChars = Math.ceil(charBudget / 2);
-  const tailChars = Math.floor(charBudget / 2);
-  return `${trimmed.slice(0, headChars).trimEnd()}${separator}${trimmed
-    .slice(Math.max(0, trimmed.length - tailChars))
-    .trimStart()}`;
+  const maxSegmentChars = Math.max(24, Math.floor(tokenBudget * 4 * 0.2));
+  const splitAtWordBoundaries = (segment: string): string[] => {
+    if (segment.length <= maxSegmentChars) {
+      return [segment];
+    }
+    const chunks: string[] = [];
+    let chunk = '';
+    for (const word of segment.split(/\s+/).filter(Boolean)) {
+      if (word.length > maxSegmentChars) {
+        if (chunk) {
+          chunks.push(chunk);
+          chunk = '';
+        }
+        for (let start = 0; start < word.length; start += maxSegmentChars) {
+          chunks.push(word.slice(start, start + maxSegmentChars));
+        }
+        continue;
+      }
+      const candidate = chunk ? `${chunk} ${word}` : word;
+      if (candidate.length > maxSegmentChars) {
+        chunks.push(chunk);
+        chunk = word;
+      } else {
+        chunk = candidate;
+      }
+    }
+    if (chunk) {
+      chunks.push(chunk);
+    }
+    return chunks;
+  };
+  const lines = trimmed
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const segments = lines.flatMap((line) => {
+    if (approximateTokenCount(line) <= tokenBudget) {
+      return [line];
+    }
+    const sentences = line.match(/[^.!?]+[.!?]+(?:\s+|$)|[^.!?]+$/g) ?? [];
+    return sentences
+      .map((sentence) => sentence.trim())
+      .filter(Boolean)
+      .flatMap((sentence) =>
+        approximateTokenCount(sentence) > tokenBudget
+          ? splitAtWordBoundaries(sentence)
+          : [sentence],
+      );
+  });
+  const markerFor = (count: number) =>
+    `...\n[Memory read boundary: ${count} ${count === 1 ? 'segment' : 'segments'} omitted; this key is incomplete.]\n...`;
+  const selected = new Set<number>();
+  let head = 0;
+  let tail = segments.length - 1;
+  let usedChars = 0;
+
+  while (head <= tail) {
+    let added = false;
+    for (const index of head === tail ? [head] : [head, tail]) {
+      const segment = segments[index];
+      const omittedAfter = segments.length - selected.size - 1;
+      const projectedMarker = omittedAfter > 0 ? markerFor(omittedAfter) : '';
+      const separatorChars = selected.size > 0 ? 1 : 0;
+      if (usedChars + separatorChars + segment.length + projectedMarker.length <= tokenBudget * 4) {
+        selected.add(index);
+        usedChars += separatorChars + segment.length;
+        added = true;
+      }
+    }
+    head += 1;
+    tail -= 1;
+    if (!added) {
+      break;
+    }
+  }
+
+  if (selected.size === 0) {
+    return markerFor(segments.length || 1);
+  }
+  const ordered = Array.from(selected).sort((left, right) => left - right);
+  const output: string[] = [];
+  let previous = -1;
+  for (const index of ordered) {
+    if (previous >= 0 && index > previous + 1) {
+      output.push(markerFor(index - previous - 1));
+    }
+    output.push(segments[index]);
+    previous = index;
+  }
+  if (ordered[0] > 0) {
+    output.unshift(markerFor(ordered[0]));
+  }
+  if (ordered[ordered.length - 1] < segments.length - 1) {
+    output.push(markerFor(segments.length - 1 - ordered[ordered.length - 1]));
+  }
+  return output.join('\n');
 }
 /* === VIVENTIUM END === */
+
+/* === VIVENTIUM START ===
+ * Feature: Reader-safe memory lifecycle metadata.
+ * Purpose: Saved-memory lifecycle markers govern deterministic maintenance but are not user facts.
+ * Strip complete marker lines before composing model context so the reader cannot quote or infer
+ * from internal expiry/revision controls. Omission/truncation notices remain model-visible.
+ * === VIVENTIUM END === */
+function stripMemoryLifecycleMarkers(value: string): string {
+  return value
+    .split(/\r?\n/)
+    .filter((line) => !/^\s*_(?:updated|expires|stale_after|confirmed|v):/i.test(line))
+    .join('\n')
+    .trim();
+}
 
 function formatMemoryReadProfile({
   memories,
@@ -296,7 +400,8 @@ function formatMemoryReadProfile({
 
   for (const memory of eligibleMemories) {
     const key = String(memory.key);
-    const rawValue = typeof memory.value === 'string' ? memory.value.trim() : '';
+    const storedValue = typeof memory.value === 'string' ? memory.value.trim() : '';
+    const rawValue = stripMemoryLifecycleMarkers(storedValue);
     if (!rawValue) {
       continue;
     }
@@ -309,12 +414,39 @@ function formatMemoryReadProfile({
       omittedKeys.push(key);
       continue;
     }
-    const trimmedValue = trimMemoryValueToBudget(rawValue, budget);
-    const usedTokens = Math.min(budget, memory.tokenCount ?? approximateTokenCount(trimmedValue));
+    const rawApproximateTokens = approximateTokenCount(rawValue);
+    const persistedTokensRaw =
+      typeof memory.tokenCount === 'number' && Number.isFinite(memory.tokenCount)
+        ? memory.tokenCount
+        : 0;
+    const persistedTokens =
+      rawValue === storedValue
+        ? persistedTokensRaw
+        : Math.min(persistedTokensRaw, rawApproximateTokens);
+    const persistedCountIsPlausible =
+      persistedTokens > 0 && persistedTokens >= rawApproximateTokens * 0.5;
+    const rawBudgetTokens = persistedCountIsPlausible ? persistedTokens : rawApproximateTokens;
+    const trimBudget = persistedCountIsPlausible
+      ? Math.max(1, Math.ceil(budget * (rawApproximateTokens / persistedTokens)))
+      : budget;
+    const trimmedValue =
+      rawBudgetTokens <= budget ? rawValue : trimMemoryValueToBudget(rawValue, trimBudget);
+    const selectedTokens =
+      trimmedValue === rawValue && persistedCountIsPlausible
+        ? persistedTokens
+        : !persistedCountIsPlausible && rawApproximateTokens > budget
+          ? budget
+          : Math.max(
+              approximateTokenCount(trimmedValue),
+              persistedCountIsPlausible
+                ? Math.ceil(persistedTokens * (trimmedValue.length / rawValue.length))
+                : 0,
+            );
+    const usedTokens = Math.min(budget, selectedTokens);
     sections.push(`## ${key}\n${trimmedValue}`);
     includedKeys.push(key);
     remainingTokens -= Math.max(1, usedTokens);
-    if (approximateTokenCount(rawValue) > budget) {
+    if (rawBudgetTokens > budget) {
       omittedKeys.push(`${key}:truncated`);
     }
   }
@@ -325,6 +457,13 @@ function formatMemoryReadProfile({
     if (!includedSet.has(key) && !omittedKeys.includes(key)) {
       omittedKeys.push(key);
     }
+  }
+
+  const fullyOmittedKeys = omittedKeys.filter((key) => !key.endsWith(':truncated'));
+  if (fullyOmittedKeys.length > 0) {
+    sections.push(
+      `> Memory availability: the configured read budget omitted entire saved-memory keys (${fullyOmittedKeys.join(', ')}). Treat this snapshot as incomplete rather than inferring that missing facts do not exist.`,
+    );
   }
 
   return {
@@ -400,16 +539,26 @@ function getErrorField(error: unknown, key: string): unknown {
 }
 
 function errorContainsAuthFailure(error: unknown): boolean {
-  const status = getErrorField(error, 'status') ?? getErrorField(error, 'statusCode');
+  const response = getErrorField(error, 'response');
+  const responseData = getErrorField(response, 'data');
+  const responseError = getErrorField(responseData, 'error');
+  const status =
+    getErrorField(error, 'status') ??
+    getErrorField(error, 'statusCode') ??
+    getErrorField(response, 'status');
   const code = String(getErrorField(error, 'code') ?? '').toLowerCase();
   const type = String(getErrorField(error, 'type') ?? '').toLowerCase();
-  const message = String(
-    getErrorField(error, 'message') ??
-      getErrorField(getErrorField(error, 'error'), 'message') ??
-      '',
-  ).toLowerCase();
+  const message = [
+    getErrorField(error, 'message'),
+    getErrorField(getErrorField(error, 'error'), 'message'),
+    getErrorField(responseData, 'message'),
+    getErrorField(responseError, 'message'),
+  ]
+    .filter((value) => typeof value === 'string')
+    .join(' ')
+    .toLowerCase();
 
-  if (status === 401 || status === '401') {
+  if (status === 401 || status === '401' || status === 403 || status === '403') {
     return true;
   }
   return (
@@ -430,7 +579,18 @@ function getMemoryWriterHealthKey({
   provider?: string;
   model?: string;
 }) {
-  return [String(userId), provider || 'unknown', model || 'unknown'].join(':');
+  return [
+    String(userId),
+    normalizeMemoryWriterHealthProvider(provider) || 'unknown',
+    model || 'unknown',
+  ].join(':');
+}
+
+function normalizeMemoryWriterHealthProvider(provider?: string): string | undefined {
+  const normalized = String(provider ?? '')
+    .trim()
+    .toLowerCase();
+  return normalized || undefined;
 }
 
 export function clearMemoryWriterHealth({
@@ -442,7 +602,29 @@ export function clearMemoryWriterHealth({
   provider?: string;
   model?: string;
 }) {
-  memoryWriterHealth.delete(getMemoryWriterHealthKey({ userId, provider, model }));
+  const normalizedProvider = normalizeMemoryWriterHealthProvider(provider);
+  if (provider && model) {
+    memoryWriterHealth.delete(
+      getMemoryWriterHealthKey({ userId, provider: normalizedProvider, model }),
+    );
+    return;
+  }
+  const userPrefix = `${String(userId)}:`;
+  for (const [key, entry] of memoryWriterHealth.entries()) {
+    if (!key.startsWith(userPrefix)) {
+      continue;
+    }
+    if (
+      normalizedProvider &&
+      normalizeMemoryWriterHealthProvider(entry.provider) !== normalizedProvider
+    ) {
+      continue;
+    }
+    if (model && entry.model !== model) {
+      continue;
+    }
+    memoryWriterHealth.delete(key);
+  }
 }
 
 export function markMemoryWriterFailure({
@@ -459,13 +641,14 @@ export function markMemoryWriterFailure({
   if (!errorContainsAuthFailure(error)) {
     return undefined;
   }
-  const key = getMemoryWriterHealthKey({ userId, provider, model });
+  const normalizedProvider = normalizeMemoryWriterHealthProvider(provider);
+  const key = getMemoryWriterHealthKey({ userId, provider: normalizedProvider, model });
   const entry: MemoryWriterHealthEntry = {
     blockedUntil: Date.now() + MEMORY_WRITER_AUTH_SUPPRESSION_MS,
     reason: 'auth',
     message:
       'Saved memory writer authentication failed. Reconnect the memory provider account before retrying durable memory writes.',
-    provider,
+    provider: normalizedProvider,
     model,
   };
   memoryWriterHealth.set(key, entry);
@@ -627,7 +810,110 @@ function sanitizeAnthropicMemoryConfig(config: LLMConfig): LLMConfig {
   return sanitized;
 }
 
+/* === VIVENTIUM START ===
+ * Keep provider failures structured and privacy-safe. A terminal quota exhaustion is not made
+ * recoverable by immediately replaying the same provider/model route; transient 429s still get
+ * the existing single bounded retry.
+ */
+const TERMINAL_MEMORY_PROVIDER_ERROR_TYPES = new Set([
+  'usage_limit_reached',
+  'insufficient_quota',
+  'billing_hard_limit_reached',
+  'provider_quota_exhausted',
+]);
+
+const TRANSIENT_MEMORY_PROVIDER_ERROR_TYPES = new Set([
+  'provider_rate_limited',
+  'rate_limit_exceeded',
+  'rate_limit_error',
+  'provider_temporarily_unavailable',
+  'server_is_overloaded',
+]);
+
+const KNOWN_MEMORY_PROVIDER_ERROR_TYPES = new Set([
+  ...TERMINAL_MEMORY_PROVIDER_ERROR_TYPES,
+  'provider_rate_limited',
+  'rate_limit_exceeded',
+  'rate_limit_error',
+  'provider_temporarily_unavailable',
+  'server_is_overloaded',
+  'provider_unauthorized',
+  'provider_access_denied',
+]);
+
+const SAFE_MEMORY_PROVIDER_ERROR_CODES = new Set([
+  ...KNOWN_MEMORY_PROVIDER_ERROR_TYPES,
+  'econnreset',
+  'econnaborted',
+  'etimedout',
+  'econnrefused',
+]);
+
+function classifyMemoryProviderError(error: unknown): string {
+  const response = getErrorField(error, 'response');
+  const responseData = getErrorField(response, 'data');
+  const responseError = getErrorField(responseData, 'error');
+  const candidates = [
+    getErrorField(error, 'type'),
+    getErrorField(error, 'code'),
+    getErrorField(getErrorField(error, 'error'), 'type'),
+    getErrorField(getErrorField(error, 'error'), 'code'),
+    getErrorField(responseError, 'type'),
+    getErrorField(responseError, 'code'),
+  ];
+  for (const candidate of candidates) {
+    const normalized = typeof candidate === 'string' ? candidate.trim().toLowerCase() : '';
+    if (KNOWN_MEMORY_PROVIDER_ERROR_TYPES.has(normalized)) {
+      return normalized;
+    }
+  }
+
+  const rawStatus =
+    getErrorField(error, 'status') ??
+    getErrorField(error, 'statusCode') ??
+    getErrorField(response, 'status');
+  const status = Number(rawStatus);
+  if (status === 429) {
+    return 'provider_rate_limited';
+  }
+  if (status === 401) {
+    return 'provider_unauthorized';
+  }
+  if (status === 403) {
+    return 'provider_access_denied';
+  }
+  if (status >= 500 && status <= 599) {
+    return 'provider_temporarily_unavailable';
+  }
+  return 'provider_unavailable';
+}
+
+function sanitizeMemoryProviderErrorCode(error: unknown): string | undefined {
+  const response = getErrorField(error, 'response');
+  const responseData = getErrorField(response, 'data');
+  const responseError = getErrorField(responseData, 'error');
+  const candidates = [
+    getErrorField(error, 'code'),
+    getErrorField(getErrorField(error, 'error'), 'code'),
+    getErrorField(responseError, 'code'),
+  ];
+  for (const candidate of candidates) {
+    const normalized = typeof candidate === 'string' ? candidate.trim().toLowerCase() : '';
+    if (SAFE_MEMORY_PROVIDER_ERROR_CODES.has(normalized)) {
+      return normalized;
+    }
+  }
+  return undefined;
+}
+
 function isRetryableMemoryProcessingError(error: unknown): boolean {
+  const errorType = classifyMemoryProviderError(error);
+  if (TERMINAL_MEMORY_PROVIDER_ERROR_TYPES.has(errorType)) {
+    return false;
+  }
+  if (TRANSIENT_MEMORY_PROVIDER_ERROR_TYPES.has(errorType)) {
+    return true;
+  }
   const typedError = error as
     | {
         status?: number;
@@ -638,8 +924,9 @@ function isRetryableMemoryProcessingError(error: unknown): boolean {
       }
     | undefined;
 
-  const status = typedError?.status ?? typedError?.statusCode ?? typedError?.response?.status;
-  if (typeof status === 'number') {
+  const rawStatus = typedError?.status ?? typedError?.statusCode ?? typedError?.response?.status;
+  const status = Number(rawStatus);
+  if (Number.isFinite(status)) {
     return status === 429 || status >= 500;
   }
 
@@ -656,6 +943,7 @@ function isRetryableMemoryProcessingError(error: unknown): boolean {
     message.includes('fetch failed')
   );
 }
+/* === VIVENTIUM END === */
 
 function buildMemoryErrorArtifact(
   evaluation: ReturnType<typeof evaluateMemoryWrite>,
@@ -693,6 +981,43 @@ function buildGenericMemoryErrorArtifact(
     },
   };
 }
+
+/* === VIVENTIUM START ===
+ * Preserve the provider's structured failure class without exposing raw provider text in the
+ * memory attachment shown to the client or recorded by the continuity ledger.
+ */
+function buildMemoryProviderErrorAttachment({
+  messageId,
+  conversationId,
+  errorType,
+  totalTokens,
+  partialApplied = false,
+}: {
+  messageId: string;
+  conversationId: string;
+  errorType: string;
+  totalTokens: number;
+  partialApplied?: boolean;
+}): TAttachment {
+  return {
+    type: Tools.memory,
+    messageId,
+    conversationId,
+    [Tools.memory]: {
+      key: 'system',
+      type: 'error',
+      value: JSON.stringify({
+        errorType,
+        message: partialApplied
+          ? 'Saved memory was only partially updated because the configured provider became unavailable.'
+          : 'Saved memory could not be updated because the configured provider is unavailable.',
+        ...(partialApplied ? { partialApplied: true } : {}),
+      }),
+      tokenCount: totalTokens,
+    },
+  } as TAttachment;
+}
+/* === VIVENTIUM END === */
 
 /* === VIVENTIUM START ===
  * A model-correctable storage proposal gets one bounded retry only when no write from the batch
@@ -851,8 +1176,7 @@ function logMemoryWriteAudit({
 
 function memoryErrorMetadata(error: unknown): Record<string, unknown> {
   const typed = error as
-    | { name?: string; code?: string | number; status?: number; statusCode?: number }
-    | undefined;
+    { name?: string; code?: string | number; status?: number; statusCode?: number } | undefined;
   return {
     errorType: typed?.name ?? 'unknown',
     errorCode: typed?.code,
@@ -1580,6 +1904,8 @@ export async function processMemory({
   deferArtifactDelivery?: boolean;
   user?: IUser;
 }): Promise<(TAttachment | null)[] | undefined> {
+  const attemptState: MemoryProcessingAttemptState = { storageApplied: false };
+  const artifactPromises: Promise<TAttachment | null>[] = [];
   try {
     const attemptState: MemoryProcessingAttemptState = { storageApplied: false };
     const resolvedKeyLimits = resolveMemoryKeyLimits(keyLimits);
@@ -1886,7 +2212,8 @@ ${memory ?? 'No existing memories'}`;
     }
     return await Promise.all(artifactPromises);
   } catch (error) {
-    const typedError = error as { message?: string; code?: string; type?: string } | undefined;
+    const providerErrorType = classifyMemoryProviderError(error);
+    const providerErrorCode = sanitizeMemoryProviderErrorCode(error);
     const configuredModel =
       llmConfig != null && 'model' in llmConfig
         ? (llmConfig.model as string | undefined)
@@ -1902,12 +2229,12 @@ ${memory ?? 'No existing memories'}`;
       error,
     });
     logger.error(
-      `[MemoryAgent] Failed to process memory | userHash=${hashMemoryAuditValue(userId)} | conversationHash=${hashMemoryAuditValue(conversationId)} | messageHash=${hashMemoryAuditValue(messageId)} | provider=${String(llmConfig?.provider ?? 'unknown')} | model=${configuredModel ?? 'unknown'} | thinkingMode=${anthropicThinking == null ? 'n/a' : describeAnthropicThinkingMode(anthropicThinking)} | temperature=${String((llmConfig as { temperature?: unknown } | undefined)?.temperature ?? 'unset')} | errorType=${typedError?.type ?? 'unknown'} | errorCode=${typedError?.code ?? 'unknown'}`,
+      `[MemoryAgent] Failed to process memory | userHash=${hashMemoryAuditValue(userId)} | conversationHash=${hashMemoryAuditValue(conversationId)} | messageHash=${hashMemoryAuditValue(messageId)} | provider=${String(llmConfig?.provider ?? 'unknown')} | model=${configuredModel ?? 'unknown'} | thinkingMode=${anthropicThinking == null ? 'n/a' : describeAnthropicThinkingMode(anthropicThinking)} | temperature=${String((llmConfig as { temperature?: unknown } | undefined)?.temperature ?? 'unset')} | errorType=${providerErrorType} | errorCode=${providerErrorCode ?? 'unknown'}`,
       {
         provider: llmConfig?.provider,
         model: configuredModel,
-        errorCode: typedError?.code,
-        errorType: typedError?.type,
+        errorCode: providerErrorCode,
+        errorType: providerErrorType,
         memoryWriterHealth: healthEntry
           ? {
               reason: healthEntry.reason,
@@ -1916,6 +2243,21 @@ ${memory ?? 'No existing memories'}`;
           : undefined,
       },
     );
+    /* === VIVENTIUM START === Return an honest terminal result instead of lossy undefined. === */
+    const completedAttachments = (await Promise.all(artifactPromises)).filter(
+      (attachment): attachment is TAttachment => attachment != null,
+    );
+    return [
+      ...completedAttachments,
+      buildMemoryProviderErrorAttachment({
+        messageId,
+        conversationId,
+        errorType: providerErrorType,
+        totalTokens,
+        partialApplied: attemptState.storageApplied,
+      }),
+    ];
+    /* === VIVENTIUM END === */
   }
 }
 

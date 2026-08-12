@@ -339,17 +339,21 @@ const ChatForm = memo(({ index = 0 }: { index?: number }) => {
                   isSubmitting={isSubmitting}
                 />
               )}
-              <div className={`${isRTL ? 'ml-2' : 'mr-2'}`}>
-                {isSubmitting && showStopButton ? (
+              <div className={cn('flex items-center gap-1', isRTL ? 'ml-2' : 'mr-2')}>
+                {/* === VIVENTIUM START ===
+                 * Feature: Cross-surface logical-turn coherence.
+                 * Purpose: Keep explicit Stop available while also exposing Send so new
+                 *          context can supersede an unfinished web response.
+                 * === VIVENTIUM END === */}
+                {isSubmitting && showStopButton && (
                   <StopButton stop={handleStopGenerating} setShowStopButton={setShowStopButton} />
-                ) : (
-                  endpoint && (
-                    <SendButton
-                      ref={submitButtonRef}
-                      control={methods.control}
-                      disabled={filesLoading || isSubmitting || disableInputs || isNotAppendable}
-                    />
-                  )
+                )}
+                {endpoint && (
+                  <SendButton
+                    ref={submitButtonRef}
+                    control={methods.control}
+                    disabled={filesLoading || disableInputs || isNotAppendable}
+                  />
                 )}
               </div>
             </div>

@@ -215,3 +215,30 @@ export function filterNoResponseMessagesTree(
 ): TMessage[] | null {
   return _filterNoResponseMessagesTree(messagesTree, options);
 }
+
+/** Remove only rows explicitly marked internal by trusted server metadata. */
+export function filterTrustedInternalMessagesTree(
+  messagesTree?: TMessage[] | null,
+): TMessage[] | null {
+  if (!messagesTree) return messagesTree ?? null;
+  let changed = false;
+  const visible: TMessage[] = [];
+  for (const message of messagesTree) {
+    const metadata = message.metadata as
+      { viventium?: { visibility?: unknown } } | null | undefined;
+    const children = Array.isArray(message.children) ? message.children : [];
+    const filteredChildren = filterTrustedInternalMessagesTree(children) ?? [];
+    if (metadata?.viventium?.visibility === 'internal') {
+      changed = true;
+      visible.push(...filteredChildren);
+      continue;
+    }
+    if (filteredChildren !== children) {
+      changed = true;
+      visible.push({ ...message, children: filteredChildren });
+    } else {
+      visible.push(message);
+    }
+  }
+  return changed ? visible : messagesTree;
+}

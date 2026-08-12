@@ -1,9 +1,13 @@
 const express = require('express');
+const { EventEmitter } = require('events');
+const http = require('http');
 const request = require('supertest');
+const { requestLifetimeSignal } = require('../GlassHiveRequestLifetimeSignal');
 
 const mockBuildCapabilityCatalog = jest.fn();
 const mockHandleToolCall = jest.fn();
 const mockToolDefinitionsForMcp = jest.fn();
+const mockGetAppConfig = jest.fn();
 const mockSharedCache = new Map();
 
 jest.mock('@librechat/data-schemas', () => ({
@@ -38,6 +42,10 @@ jest.mock('~/server/services/viventium/GlassHiveCapabilityBrokerService', () => 
   toolDefinitionsForMcp: (...args) => mockToolDefinitionsForMcp(...args),
 }));
 
+jest.mock('~/server/services/Config', () => ({
+  getAppConfig: (...args) => mockGetAppConfig(...args),
+}));
+
 jest.mock('~/server/services/viventium/GlassHiveCapabilityBootstrapService', () => ({
   buildDirectGlassHiveCapabilityBundle: jest.fn(),
   directCapabilityReadiness: jest.fn(),
@@ -67,6 +75,45 @@ function appWithRoute({ requestSignal } = {}) {
   return app;
 }
 
+function lifecyclePair() {
+  const req = new EventEmitter();
+  const res = new EventEmitter();
+  res.writableEnded = false;
+  return { req, res };
+}
+
+describe('requestLifetimeSignal', () => {
+  test.each(['aborted', 'close'])(
+    'aborts and removes listeners after premature %s',
+    (eventName) => {
+      const { req, res } = lifecyclePair();
+      const signal = requestLifetimeSignal(req, res);
+
+      (eventName === 'aborted' ? req : res).emit(eventName);
+
+      expect(signal.aborted).toBe(true);
+      expect(signal.reason).toBe('broker_client_disconnected');
+      expect(req.listenerCount('aborted')).toBe(0);
+      expect(res.listenerCount('close')).toBe(0);
+      expect(res.listenerCount('finish')).toBe(0);
+    },
+  );
+
+  test('removes listeners without aborting after a normal response finish', () => {
+    const { req, res } = lifecyclePair();
+    const signal = requestLifetimeSignal(req, res);
+    res.writableEnded = true;
+
+    res.emit('finish');
+    res.emit('close');
+
+    expect(signal.aborted).toBe(false);
+    expect(req.listenerCount('aborted')).toBe(0);
+    expect(res.listenerCount('close')).toBe(0);
+    expect(res.listenerCount('finish')).toBe(0);
+  });
+});
+
 describe('/api/viventium/glasshive/capabilities/mcp', () => {
   const originalEnv = process.env;
 
@@ -78,6 +125,9 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
       ...originalEnv,
       VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET: 'route-test-secret',
     };
+    mockGetAppConfig.mockResolvedValue({
+      webSearch: { searchProvider: 'searxng', searxngInstanceUrl: 'http://127.0.0.1:18082' },
+    });
   });
 
   afterAll(() => {
@@ -93,13 +143,14 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
     expect(response.body.error.message).toBe('Unauthorized GlassHive capability broker request');
   });
 
-  test('returns MCP tools/list for a valid broker grant', async () => {
+  test('preserves read-only ToolAnnotations over the signed loopback MCP transport', async () => {
     const {
       mintBrokerGrant,
     } = require('~/server/services/viventium/GlassHiveCapabilityBrokerAuth');
     const { token } = mintBrokerGrant({
       user: { id: 'user-1', role: 'USER' },
       allowedServers: ['google_workspace'],
+      requestContext: { conversation_id: 'conv-1', message_id: 'msg-1' },
     });
     mockBuildCapabilityCatalog.mockResolvedValue({ tools: [] });
     mockToolDefinitionsForMcp.mockReturnValue([
@@ -107,6 +158,12 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
         name: 'capabilities_list',
         description: 'List capabilities',
         inputSchema: { type: 'object', properties: {} },
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
       },
     ]);
 
@@ -118,7 +175,12 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
 
     expect(response.body.result.tools[0].name).toBe('capabilities_list');
     expect(mockBuildCapabilityCatalog).toHaveBeenCalledWith(
-      expect.not.objectContaining({ signal: expect.anything() }),
+      expect.objectContaining({
+        signal: expect.any(AbortSignal),
+        appConfig: expect.objectContaining({
+          webSearch: expect.objectContaining({ searchProvider: 'searxng' }),
+        }),
+      }),
     );
   });
 
@@ -131,6 +193,7 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
     const { token } = mintBrokerGrant({
       user: { id: 'user-1', role: 'USER' },
       allowedServers: ['google_workspace'],
+      requestContext: { conversation_id: 'conv-1', message_id: 'msg-1' },
     });
     mockBuildCapabilityCatalog.mockResolvedValue({ tools: [] });
     mockToolDefinitionsForMcp.mockReturnValue([]);
@@ -151,15 +214,15 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
     expect(response.headers['retry-after']).toBeDefined();
   });
 
-  test('accepts an expired grant inside its bounded renewal window', async () => {
+  test('rejects an expired grant instead of silently extending bearer lifetime', async () => {
     const {
       mintBrokerGrant,
     } = require('~/server/services/viventium/GlassHiveCapabilityBrokerAuth');
     const { token } = mintBrokerGrant({
       user: { id: 'user-1', role: 'USER' },
       allowedServers: ['google_workspace'],
+      requestContext: { conversation_id: 'conv-1', message_id: 'msg-1' },
       ttlSeconds: 60,
-      renewableTtlSeconds: 600,
       nowMs: Date.now() - 120_000,
     });
     mockBuildCapabilityCatalog.mockResolvedValue({ tools: [] });
@@ -169,15 +232,11 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
       .post('/api/viventium/glasshive/capabilities/mcp')
       .set('Authorization', `Bearer ${token}`)
       .send({ jsonrpc: '2.0', id: 4, method: 'tools/list' })
-      .expect(200);
+      .expect(401);
 
-    expect(response.headers['x-glasshive-capability-grant-renewed']).toBe('true');
-    expect(response.body.result.tools).toEqual([]);
-    expect(mockBuildCapabilityCatalog).toHaveBeenCalledWith(
-      expect.objectContaining({
-        grant: expect.objectContaining({ renewed: true }),
-      }),
-    );
+    expect(response.headers['x-glasshive-capability-grant-renewed']).toBeUndefined();
+    expect(response.body.error.message).toBe('Unauthorized GlassHive capability broker request');
+    expect(mockBuildCapabilityCatalog).not.toHaveBeenCalled();
   });
 
   test('rejects a revoked scheduled grant even inside its renewal window', async () => {
@@ -189,6 +248,8 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
       user: { id: 'user-1', role: 'USER' },
       grantId: 'ghcb_sched_revoked_route',
       allowedServers: ['google_workspace'],
+      requestContext: { schedule_id: 'schedule-1', run_id: 'scheduled-run-1' },
+      requireTurnScope: false,
       ttlSeconds: 60,
       renewableTtlSeconds: 600,
       nowMs: Date.now() - 120_000,
@@ -212,6 +273,7 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
     const { token } = mintBrokerGrant({
       user: { id: 'user-1', role: 'USER' },
       allowedServers: ['google_workspace'],
+      requestContext: { conversation_id: 'conv-1', message_id: 'msg-1' },
     });
 
     const response = await request(appWithRoute())
@@ -230,8 +292,13 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
     const { token } = mintBrokerGrant({
       user: { id: 'user-1', role: 'USER' },
       allowedServers: ['google_workspace'],
+      requestContext: { conversation_id: 'conv-1', message_id: 'msg-1' },
     });
-    mockHandleToolCall.mockResolvedValue({ servers: [{ name: 'google_workspace' }] });
+    mockHandleToolCall.mockImplementation(({ signal }) => {
+      expect(signal).toBeInstanceOf(AbortSignal);
+      expect(signal.aborted).toBe(false);
+      return Promise.resolve({ servers: [{ name: 'google_workspace' }] });
+    });
 
     const response = await request(appWithRoute({ requestSignal: { aborted: true } }))
       .post('/api/viventium/glasshive/capabilities/mcp')
@@ -246,8 +313,79 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
 
     expect(response.body.result.structuredContent.servers[0].name).toBe('google_workspace');
     expect(mockHandleToolCall).toHaveBeenCalledWith(
-      expect.not.objectContaining({ signal: expect.anything() }),
+      expect.objectContaining({
+        signal: expect.any(AbortSignal),
+        appConfig: expect.objectContaining({
+          webSearch: expect.objectContaining({ searchProvider: 'searxng' }),
+        }),
+      }),
     );
+  });
+
+  test('aborts in-flight provider work when the broker client disconnects', async () => {
+    const {
+      mintBrokerGrant,
+    } = require('~/server/services/viventium/GlassHiveCapabilityBrokerAuth');
+    const { token } = mintBrokerGrant({
+      user: { id: 'user-1', role: 'USER' },
+      allowedServers: ['scheduling'],
+      requestContext: { conversation_id: 'conv-1', message_id: 'msg-1' },
+    });
+    let captureSignal;
+    let captureAbort;
+    const signalSeen = new Promise((resolve) => {
+      captureSignal = resolve;
+    });
+    const providerAborted = new Promise((resolve) => {
+      captureAbort = resolve;
+    });
+    mockHandleToolCall.mockImplementation(({ signal }) => {
+      captureSignal(signal);
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener(
+          'abort',
+          () => {
+            captureAbort(signal);
+            reject(new Error('provider work cancelled'));
+          },
+          { once: true },
+        );
+      });
+    });
+
+    const server = appWithRoute().listen(0, '127.0.0.1');
+    await new Promise((resolve) => server.once('listening', resolve));
+    const payload = JSON.stringify({
+      jsonrpc: '2.0',
+      id: 8,
+      method: 'tools/call',
+      params: { name: 'schedule_create', arguments: {} },
+    });
+    const clientRequest = http.request({
+      hostname: '127.0.0.1',
+      port: server.address().port,
+      path: '/api/viventium/glasshive/capabilities/mcp',
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+      },
+    });
+    clientRequest.on('error', () => {});
+    clientRequest.end(payload);
+
+    try {
+      const signal = await signalSeen;
+      expect(signal.aborted).toBe(false);
+      clientRequest.destroy();
+      const abortedSignal = await providerAborted;
+      expect(abortedSignal.aborted).toBe(true);
+      expect(abortedSignal.reason).toBe('broker_client_disconnected');
+    } finally {
+      server.closeAllConnections?.();
+      await new Promise((resolve) => server.close(resolve));
+    }
   });
 
   test('omits structuredContent for array tool results so strict MCP clients accept them', async () => {
@@ -261,6 +399,7 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
     const { token } = mintBrokerGrant({
       user: { id: 'user-1', role: 'USER' },
       allowedServers: ['ms-365'],
+      requestContext: { conversation_id: 'conv-1', message_id: 'msg-1' },
     });
     const arrayResult = [{ subject: 'Hello' }, { subject: 'World' }];
     mockHandleToolCall.mockResolvedValue(arrayResult);

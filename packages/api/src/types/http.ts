@@ -27,6 +27,8 @@ export type RequestBody = {
   viventiumTelegramChatId?: string;
   viventiumTelegramUserId?: string;
   viventiumTelegramMessageId?: string;
+  viventiumLogicalTurnId?: string;
+  viventiumLogicalTurnRevision?: string;
   files?: unknown[];
   attachments?: unknown[];
   tool_resources?: unknown;

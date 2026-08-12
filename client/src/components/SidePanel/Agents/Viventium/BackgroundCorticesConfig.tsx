@@ -42,6 +42,14 @@ import {
   parseActivationModelKey,
   resolveDefaultActivationRoute,
 } from './activationModelOptions';
+import {
+  activationModeHintKey,
+  activationUpdatesForEnabledSwitch,
+  activationUpdatesForMode,
+  buildActivationModeOptions,
+  isActivationMode,
+  resolveActivationMode,
+} from './activationModeOptions';
 
 interface BackgroundCorticesConfigProps {
   field: ControllerRenderProps<AgentForm, 'background_cortices'>;
@@ -64,6 +72,7 @@ Respond with a JSON object:
 
 const DEFAULT_ACTIVATION_CONFIG: Omit<ActivationConfig, 'model' | 'provider'> = {
   enabled: true,
+  mode: 'classified',
   prompt: DEFAULT_ACTIVATION_PROMPT,
   confidence_threshold: 0.7,
   cooldown_ms: 5000,
@@ -90,7 +99,13 @@ const CortexCard: React.FC<CortexCardProps> = ({
   const localize = useLocalize();
   const [isExpanded, setIsExpanded] = useState(false);
   const agent = agentsMap?.[cortex.agent_id];
-  const isActivationEnabled = cortex.activation?.enabled !== false;
+  const configuredActivationMode = cortex.activation.mode ?? 'classified';
+  const activationMode = resolveActivationMode(cortex.activation);
+  const isActivationEnabled = activationMode !== 'disabled';
+  const activationModeOptions = buildActivationModeOptions(localize);
+  const activationModeLabel =
+    activationModeOptions.find((option) => option.value === activationMode)?.label ??
+    localize('com_ui_activation_mode_classified');
 
   const selectedModelValue = activationModelKey(cortex.activation);
   const modelOptions = useMemo(
@@ -144,13 +159,17 @@ const CortexCard: React.FC<CortexCardProps> = ({
                 : 'bg-surface-tertiary text-text-secondary'
             }`}
           >
-            {isActivationEnabled ? localize('com_ui_auto_on') : localize('com_ui_auto_off')}
+            {cortex.activation.enabled === false
+              ? localize('com_ui_auto_off')
+              : activationModeLabel}
           </span>
         </div>
         <div className="flex items-center gap-2">
           <Switch
             checked={isActivationEnabled}
-            onCheckedChange={(checked) => updateActivation({ enabled: checked })}
+            onCheckedChange={(checked) =>
+              updateActivation(activationUpdatesForEnabledSwitch(checked, configuredActivationMode))
+            }
             aria-label={localize('com_ui_toggle_automatic_activation_for', {
               0: agent?.name || localize('com_ui_background_cortex'),
             })}
@@ -187,112 +206,149 @@ const CortexCard: React.FC<CortexCardProps> = ({
       {/* Expanded Activation Settings */}
       {isExpanded && (
         <div className="mt-3 space-y-4 border-t border-border-light pt-3">
-          {/* Model Selection */}
+          {/* Activation Mode */}
           <div>
             <Label className="mb-1 text-xs text-text-secondary">
-              {localize('com_ui_activation_model_recommended')}
+              {localize('com_ui_activation_mode')}
             </Label>
             <ControlCombobox
               isCollapsed={false}
-              ariaLabel={localize('com_ui_select_activation_model')}
-              selectedValue={selectedModelValue}
-              setValue={handleModelChange}
-              selectPlaceholder={localize('com_ui_select_model')}
-              searchPlaceholder={localize('com_ui_search_models')}
-              items={modelOptions}
+              ariaLabel={localize('com_ui_activation_mode')}
+              selectedValue={configuredActivationMode}
+              setValue={(value) => {
+                if (isActivationMode(value)) {
+                  updateActivation(activationUpdatesForMode(value));
+                }
+              }}
+              selectPlaceholder={localize('com_ui_activation_mode')}
+              searchPlaceholder={localize('com_ui_search')}
+              items={activationModeOptions}
               displayValue={
-                modelOptions.find((option) => option.value === selectedModelValue)?.label ??
-                selectedModelValue
+                activationModeOptions.find((option) => option.value === configuredActivationMode)
+                  ?.label ?? localize('com_ui_activation_mode_classified')
               }
               className="h-9 w-full border-border-heavy text-sm"
               containerClassName="px-0"
             />
-          </div>
-
-          {/* Auto Activation */}
-          <div className="flex items-center justify-between">
-            <Label htmlFor={`enabled-${index}`} className="text-xs text-text-secondary">
-              {localize('com_ui_automatic_activation')}
-            </Label>
-            <Switch
-              id={`enabled-${index}`}
-              checked={isActivationEnabled}
-              onCheckedChange={(checked) => updateActivation({ enabled: checked })}
-              aria-label={localize('com_ui_automatic_activation_for', {
-                0: agent?.name || localize('com_ui_background_cortex'),
-              })}
-            />
-          </div>
-
-          {/* Confidence Threshold */}
-          <div>
-            <div className="mb-2 flex items-center justify-between">
-              <Label className="text-xs text-text-secondary">
-                {localize('com_ui_confidence_threshold')}
-              </Label>
-              <span className="text-xs font-medium text-text-primary">
-                {Math.round(cortex.activation.confidence_threshold * 100)}%
-              </span>
-            </div>
-            <Slider
-              aria-label="Confidence threshold"
-              value={[cortex.activation.confidence_threshold * 100]}
-              onValueChange={([val]) => updateActivation({ confidence_threshold: val / 100 })}
-              min={0}
-              max={100}
-              step={5}
-              className="w-full"
-            />
-          </div>
-
-          {/* Cooldown */}
-          <div>
-            <Label htmlFor={`cooldown-${index}`} className="mb-1 text-xs text-text-secondary">
-              {localize('com_ui_cooldown_seconds')}
-            </Label>
-            <Input
-              id={`cooldown-${index}`}
-              type="number"
-              min={0}
-              max={3600}
-              value={cortex.activation.cooldown_ms / 1000}
-              onChange={(e) => updateActivation({ cooldown_ms: Number(e.target.value) * 1000 })}
-              className="h-8 text-sm"
-            />
-          </div>
-
-          {/* Max History */}
-          <div>
-            <Label htmlFor={`history-${index}`} className="mb-1 text-xs text-text-secondary">
-              {localize('com_ui_history_context_messages')}
-            </Label>
-            <Input
-              id={`history-${index}`}
-              type="number"
-              min={1}
-              max={50}
-              value={cortex.activation.max_history}
-              onChange={(e) => updateActivation({ max_history: Number(e.target.value) })}
-              className="h-8 text-sm"
-            />
-          </div>
-
-          {/* Activation Prompt */}
-          <div>
-            <Label htmlFor={`prompt-${index}`} className="mb-1 text-xs text-text-secondary">
-              {localize('com_ui_activation_prompt')}
-            </Label>
-            <Textarea
-              id={`prompt-${index}`}
-              value={cortex.activation.prompt}
-              onChange={(e) => updateActivation({ prompt: e.target.value })}
-              className="h-32 resize-none text-xs"
-              placeholder={localize('com_ui_activation_prompt_placeholder')}
-            />
             <p className="mt-1 text-xs text-text-tertiary">
-              {localize('com_ui_activation_prompt_hint')}
+              {localize(activationModeHintKey(configuredActivationMode))}
             </p>
           </div>
+
+          {configuredActivationMode === 'classified' && (
+            <>
+              {/* Model Selection */}
+              <div>
+                <Label className="mb-1 text-xs text-text-secondary">
+                  {localize('com_ui_activation_model_recommended')}
+                </Label>
+                <ControlCombobox
+                  isCollapsed={false}
+                  ariaLabel={localize('com_ui_select_activation_model')}
+                  selectedValue={selectedModelValue}
+                  setValue={handleModelChange}
+                  selectPlaceholder={localize('com_ui_select_model')}
+                  searchPlaceholder={localize('com_ui_search_models')}
+                  items={modelOptions}
+                  displayValue={
+                    modelOptions.find((option) => option.value === selectedModelValue)?.label ??
+                    selectedModelValue
+                  }
+                  className="h-9 w-full border-border-heavy text-sm"
+                  containerClassName="px-0"
+                />
+              </div>
+
+              {/* Auto Activation */}
+              <div className="flex items-center justify-between">
+                <Label htmlFor={`enabled-${index}`} className="text-xs text-text-secondary">
+                  {localize('com_ui_automatic_activation')}
+                </Label>
+                <Switch
+                  id={`enabled-${index}`}
+                  checked={isActivationEnabled}
+                  onCheckedChange={(checked) =>
+                    updateActivation(
+                      activationUpdatesForEnabledSwitch(checked, configuredActivationMode),
+                    )
+                  }
+                  aria-label={localize('com_ui_automatic_activation_for', {
+                    0: agent?.name || localize('com_ui_background_cortex'),
+                  })}
+                />
+              </div>
+
+              {/* Confidence Threshold */}
+              <div>
+                <div className="mb-2 flex items-center justify-between">
+                  <Label className="text-xs text-text-secondary">
+                    {localize('com_ui_confidence_threshold')}
+                  </Label>
+                  <span className="text-xs font-medium text-text-primary">
+                    {Math.round((cortex.activation.confidence_threshold ?? 0.7) * 100)}%
+                  </span>
+                </div>
+                <Slider
+                  aria-label="Confidence threshold"
+                  value={[(cortex.activation.confidence_threshold ?? 0.7) * 100]}
+                  onValueChange={([val]) => updateActivation({ confidence_threshold: val / 100 })}
+                  min={0}
+                  max={100}
+                  step={5}
+                  className="w-full"
+                />
+              </div>
+
+              {/* Cooldown */}
+              <div>
+                <Label htmlFor={`cooldown-${index}`} className="mb-1 text-xs text-text-secondary">
+                  {localize('com_ui_cooldown_seconds')}
+                </Label>
+                <Input
+                  id={`cooldown-${index}`}
+                  type="number"
+                  min={0}
+                  max={3600}
+                  value={(cortex.activation.cooldown_ms ?? 0) / 1000}
+                  onChange={(e) => updateActivation({ cooldown_ms: Number(e.target.value) * 1000 })}
+                  className="h-8 text-sm"
+                />
+              </div>
+
+              {/* Max History */}
+              <div>
+                <Label htmlFor={`history-${index}`} className="mb-1 text-xs text-text-secondary">
+                  {localize('com_ui_history_context_messages')}
+                </Label>
+                <Input
+                  id={`history-${index}`}
+                  type="number"
+                  min={1}
+                  max={50}
+                  value={cortex.activation.max_history ?? 5}
+                  onChange={(e) => updateActivation({ max_history: Number(e.target.value) })}
+                  className="h-8 text-sm"
+                />
+              </div>
+
+              {/* Activation Prompt */}
+              <div>
+                <Label htmlFor={`prompt-${index}`} className="mb-1 text-xs text-text-secondary">
+                  {localize('com_ui_activation_prompt')}
+                </Label>
+                <Textarea
+                  id={`prompt-${index}`}
+                  value={cortex.activation.prompt ?? ''}
+                  onChange={(e) => updateActivation({ prompt: e.target.value })}
+                  className="h-32 resize-none text-xs"
+                  placeholder={localize('com_ui_activation_prompt_placeholder')}
+                />
+                <p className="mt-1 text-xs text-text-tertiary">
+                  {localize('com_ui_activation_prompt_hint')}
+                </p>
+              </div>
+            </>
+          )}
         </div>
       )}
     </div>
@@ -334,7 +390,7 @@ const BackgroundCorticesConfig: React.FC<BackgroundCorticesConfigProps> = ({
   );
   const canAddCortex = Boolean(activationModelKey(defaultActivationRoute));
   const activeCortexCount = cortices.filter(
-    (cortex) => cortex.activation?.enabled !== false,
+    (cortex) => resolveActivationMode(cortex.activation) !== 'disabled',
   ).length;
 
   // Get list of available agents (exclude self and already-added cortices)

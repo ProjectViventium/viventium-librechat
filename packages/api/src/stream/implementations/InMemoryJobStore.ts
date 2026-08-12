@@ -1,4 +1,5 @@
 import { logger } from '@librechat/data-schemas';
+import { randomUUID } from 'crypto';
 import type { StandardGraph } from '@librechat/agents';
 import type { Agents } from 'librechat-data-provider';
 import type {
@@ -6,7 +7,32 @@ import type {
   UsageMetadata,
   IJobStore,
   JobStatus,
+  InteractionContext,
+  LogicalTurnClaim,
+  InteractionDeliveryAck,
+  DeliveryAcknowledgementResult,
 } from '~/stream/interfaces/IJobStore';
+
+interface LogicalTurnState {
+  scope: string;
+  logicalTurnId: string;
+  revision: number;
+  active: boolean;
+  currentStreamId?: string;
+  receipts: Map<string, { streamId: string; interactionContext: InteractionContext }>;
+  revisionStreams: Map<number, string>;
+  deliveryAcknowledgements: Map<number, InteractionDeliveryAck>;
+  completedAt?: number;
+}
+
+function logicalTurnScope(userId: string, interactionContext: InteractionContext): string {
+  return [
+    userId,
+    interactionContext.conversation_id,
+    interactionContext.actor_kind,
+    interactionContext.origin,
+  ].join('\u0000');
+}
 
 /**
  * Content state for a job - volatile, in-memory only.
@@ -34,6 +60,12 @@ export class InMemoryJobStore implements IJobStore {
 
   /** Maps userId -> Set of streamIds (conversationIds) for active jobs */
   private userJobMap = new Map<string, Set<string>>();
+
+  /** One synchronous claim state per user/conversation scope. */
+  private logicalTurns = new Map<string, LogicalTurnState>();
+  /** Reverse owner index; callers never supply user or conversation authority. */
+  private logicalTurnIndex = new Map<string, LogicalTurnState>();
+  private streamScopes = new Map<string, string>();
 
   /** Time to keep completed jobs before cleanup (0 = immediate) */
   private ttlAfterComplete = 0;
@@ -70,12 +102,14 @@ export class InMemoryJobStore implements IJobStore {
     streamId: string,
     userId: string,
     conversationId?: string,
+    initialData?: Partial<SerializableJobData>,
   ): Promise<SerializableJobData> {
     if (this.jobs.size >= this.maxJobs) {
       await this.evictOldest();
     }
 
     const job: SerializableJobData = {
+      ...initialData,
       streamId,
       userId,
       status: 'running',
@@ -97,6 +131,192 @@ export class InMemoryJobStore implements IJobStore {
     logger.debug(`[InMemoryJobStore] Created job: ${streamId}`);
 
     return job;
+  }
+
+  async claimLogicalTurn(
+    streamId: string,
+    userId: string,
+    interactionContext: InteractionContext,
+  ): Promise<LogicalTurnClaim> {
+    const scope = logicalTurnScope(userId, interactionContext);
+    const existing = this.logicalTurns.get(scope);
+    const receipt = existing?.receipts.get(interactionContext.source_event_id);
+    if (receipt) {
+      return {
+        status: 'duplicate',
+        streamId: receipt.streamId,
+        interactionContext: receipt.interactionContext,
+        supersededStreamIds: [],
+      };
+    }
+
+    const activeStreamId = existing?.active ? existing.currentStreamId : undefined;
+    const continuesTurn = activeStreamId != null;
+    if (!continuesTurn && existing) {
+      this.retireLogicalTurnState(existing);
+    }
+    const state: LogicalTurnState = continuesTurn
+      ? existing!
+      : {
+          scope,
+          logicalTurnId: randomUUID(),
+          revision: 0,
+          active: false,
+          receipts: new Map(),
+          revisionStreams: new Map(),
+          deliveryAcknowledgements: new Map(),
+        };
+    state.completedAt = undefined;
+    state.revision += 1;
+
+    const claimedContext: InteractionContext = Object.freeze({
+      ...interactionContext,
+      logical_turn_id: state.logicalTurnId,
+      revision: state.revision,
+    });
+    const supersededStreamIds = continuesTurn && activeStreamId ? [activeStreamId] : [];
+    state.currentStreamId = streamId;
+    state.active = true;
+    state.revisionStreams.set(state.revision, streamId);
+    state.receipts.set(interactionContext.source_event_id, {
+      streamId,
+      interactionContext: claimedContext,
+    });
+    this.logicalTurns.set(scope, state);
+    this.logicalTurnIndex.set(state.logicalTurnId, state);
+    this.streamScopes.set(streamId, scope);
+
+    return {
+      status: 'claimed',
+      streamId,
+      interactionContext: claimedContext,
+      supersededStreamIds,
+    };
+  }
+
+  async rollbackLogicalTurnClaim(
+    streamId: string,
+    interactionContext: InteractionContext,
+  ): Promise<boolean> {
+    const scope = this.streamScopes.get(streamId);
+    const state = scope ? this.logicalTurns.get(scope) : undefined;
+    if (
+      !scope ||
+      !state ||
+      state.logicalTurnId !== interactionContext.logical_turn_id ||
+      state.revision !== interactionContext.revision ||
+      state.currentStreamId !== streamId
+    ) {
+      return false;
+    }
+    const receipt = state.receipts.get(interactionContext.source_event_id);
+    if (receipt?.streamId === streamId) {
+      state.receipts.delete(interactionContext.source_event_id);
+    }
+    state.revisionStreams.delete(state.revision);
+    this.streamScopes.delete(streamId);
+    state.revision -= 1;
+    if (state.revision > 0) {
+      state.currentStreamId = state.revisionStreams.get(state.revision);
+      state.active = Boolean(state.currentStreamId);
+    } else {
+      state.currentStreamId = undefined;
+      state.active = false;
+      state.completedAt = Date.now();
+      this.logicalTurnIndex.delete(state.logicalTurnId);
+    }
+    return true;
+  }
+
+  async forgetMissingSourceEventReceipt(
+    interactionContext: InteractionContext,
+    expectedStreamId: string,
+  ): Promise<boolean> {
+    const logicalTurnId = interactionContext.logical_turn_id;
+    const state = logicalTurnId ? this.logicalTurnIndex.get(logicalTurnId) : undefined;
+    const receipt = state?.receipts.get(interactionContext.source_event_id);
+    if (
+      !state ||
+      this.logicalTurns.get(state.scope) !== state ||
+      receipt?.streamId !== expectedStreamId
+    ) {
+      return false;
+    }
+    state.receipts.delete(interactionContext.source_event_id);
+    return true;
+  }
+
+  async completeLogicalTurn(streamId: string): Promise<void> {
+    const scope = this.streamScopes.get(streamId);
+    if (!scope) {
+      return;
+    }
+    const state = this.logicalTurns.get(scope);
+    if (state?.currentStreamId === streamId) {
+      state.active = false;
+      state.completedAt = Date.now();
+    }
+  }
+
+  async isCurrentLogicalTurn(streamId: string): Promise<boolean> {
+    const scope = this.streamScopes.get(streamId);
+    if (!scope) {
+      return true;
+    }
+    return this.logicalTurns.get(scope)?.currentStreamId === streamId;
+  }
+
+  async resolveDeliveryOwner(logicalTurnId: string, revision: number): Promise<string | null> {
+    const state = this.logicalTurnIndex.get(logicalTurnId);
+    if (!state || this.logicalTurns.get(state.scope) !== state) {
+      return null;
+    }
+    return state.revisionStreams.get(revision) ?? null;
+  }
+
+  async acknowledgeDelivery(
+    acknowledgement: InteractionDeliveryAck,
+  ): Promise<DeliveryAcknowledgementResult> {
+    const state = this.logicalTurnIndex.get(acknowledgement.logical_turn_id);
+    if (!state || this.logicalTurns.get(state.scope) !== state) {
+      return { status: 'not_found' };
+    }
+    const ownerStreamId = state.revisionStreams.get(acknowledgement.revision);
+    if (!ownerStreamId || acknowledgement.revision > state.revision) {
+      return { status: 'stale_revision' };
+    }
+    if (acknowledgement.revision < state.revision && acknowledgement.state === 'committed') {
+      return { status: 'stale_revision' };
+    }
+    const existingAcknowledgement = state.deliveryAcknowledgements.get(acknowledgement.revision);
+    if (existingAcknowledgement) {
+      const idempotent =
+        existingAcknowledgement.state === acknowledgement.state &&
+        existingAcknowledgement.presentation_ref === acknowledgement.presentation_ref;
+      return idempotent
+        ? {
+            status: 'recorded',
+            acknowledgement: existingAcknowledgement,
+            idempotent: true,
+            ownerStreamId,
+          }
+        : { status: 'conflict' };
+    }
+    const recordedAcknowledgement = Object.freeze({ ...acknowledgement });
+    state.deliveryAcknowledgements.set(acknowledgement.revision, recordedAcknowledgement);
+    if (
+      acknowledgement.revision === state.revision &&
+      (acknowledgement.state === 'committed' || acknowledgement.state === 'failed')
+    ) {
+      state.active = false;
+      state.completedAt = Date.now();
+    }
+    return {
+      status: 'recorded',
+      acknowledgement: recordedAcknowledgement,
+      idempotent: false,
+      ownerStreamId,
+    };
   }
 
   async getJob(streamId: string): Promise<SerializableJobData | null> {
@@ -136,7 +356,7 @@ export class InMemoryJobStore implements IJobStore {
     const toDelete: string[] = [];
 
     for (const [streamId, job] of this.jobs) {
-      const isFinished = ['complete', 'error', 'aborted'].includes(job.status);
+      const isFinished = ['complete', 'error', 'aborted', 'superseded'].includes(job.status);
       if (isFinished && job.completedAt) {
         // TTL of 0 means immediate cleanup, otherwise wait for TTL to expire
         if (this.ttlAfterComplete === 0 || now - job.completedAt > this.ttlAfterComplete) {
@@ -147,6 +367,16 @@ export class InMemoryJobStore implements IJobStore {
 
     for (const id of toDelete) {
       await this.deleteJob(id);
+    }
+
+    for (const state of this.logicalTurns.values()) {
+      if (
+        !state.active &&
+        state.completedAt != null &&
+        (this.ttlAfterComplete === 0 || now - state.completedAt > this.ttlAfterComplete)
+      ) {
+        this.retireLogicalTurnState(state);
+      }
     }
 
     if (toDelete.length > 0) {
@@ -170,6 +400,20 @@ export class InMemoryJobStore implements IJobStore {
     if (oldestId) {
       logger.warn(`[InMemoryJobStore] Evicting oldest job: ${oldestId}`);
       await this.deleteJob(oldestId);
+    }
+  }
+
+  private retireLogicalTurnState(state: LogicalTurnState): void {
+    if (this.logicalTurns.get(state.scope) === state) {
+      this.logicalTurns.delete(state.scope);
+    }
+    if (this.logicalTurnIndex.get(state.logicalTurnId) === state) {
+      this.logicalTurnIndex.delete(state.logicalTurnId);
+    }
+    for (const streamId of state.revisionStreams.values()) {
+      if (this.streamScopes.get(streamId) === state.scope) {
+        this.streamScopes.delete(streamId);
+      }
     }
   }
 
@@ -197,6 +441,9 @@ export class InMemoryJobStore implements IJobStore {
     this.jobs.clear();
     this.contentState.clear();
     this.userJobMap.clear();
+    this.logicalTurns.clear();
+    this.logicalTurnIndex.clear();
+    this.streamScopes.clear();
     logger.debug('[InMemoryJobStore] Destroyed');
   }
 

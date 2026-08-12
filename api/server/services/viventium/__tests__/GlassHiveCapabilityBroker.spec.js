@@ -14,6 +14,14 @@ const mockGetLogStores = jest.fn(() => {
 const mockReinitMCPServer = jest.fn();
 const mockInspectStoredOAuthCredentialState = jest.fn();
 const mockGetUserById = jest.fn();
+const mockCreateFileSearchTool = jest.fn();
+const mockLoadWebSearchAuth = jest.fn();
+const mockLoadAuthValues = jest.fn();
+const mockCreateViventiumSearchTool = jest.fn();
+const SYNTHETIC_TURN_SCOPE = Object.freeze({
+  conversation_id: 'conversation-synthetic',
+  message_id: 'message-synthetic',
+});
 
 jest.mock('@librechat/data-schemas', () => ({
   logger: {
@@ -26,6 +34,8 @@ jest.mock('@librechat/data-schemas', () => ({
 
 jest.mock('librechat-data-provider', () => ({
   CacheKeys: { FLOWS: 'flows' },
+  Constants: { mcp_delimiter: '_mcp_' },
+  SystemRoles: { ADMIN: 'ADMIN', USER: 'USER' },
 }));
 
 jest.mock('~/cache', () => ({
@@ -60,6 +70,27 @@ jest.mock('~/server/services/Tools/mcp', () => ({
   }),
   inspectStoredOAuthCredentialState: (...args) => mockInspectStoredOAuthCredentialState(...args),
   reinitMCPServer: (...args) => mockReinitMCPServer(...args),
+}));
+
+jest.mock('@librechat/api', () => ({
+  loadWebSearchAuth: (...args) => mockLoadWebSearchAuth(...args),
+}));
+
+jest.mock('~/server/services/Tools/credentials', () => ({
+  loadAuthValues: mockLoadAuthValues,
+}));
+
+jest.mock('~/app/clients/tools/util/fileSearch', () => ({
+  createFileSearchTool: (...args) => mockCreateFileSearchTool(...args),
+  fileSearchJsonSchema: {
+    type: 'object',
+    properties: { query: { type: 'string' } },
+    required: ['query'],
+  },
+}));
+
+jest.mock('~/app/clients/tools/util/viventiumSearchTool', () => ({
+  createViventiumSearchTool: (...args) => mockCreateViventiumSearchTool(...args),
 }));
 
 describe('GlassHive capability broker', () => {
@@ -140,6 +171,7 @@ describe('GlassHive capability broker', () => {
     expect(verified.deferred_servers).toEqual(['ms-365']);
     expect(verified.grant_id).toBe(payload.grant_id);
     expect(verified.scopes.content_read).toBe(false);
+    expect(verified.allow_dynamic_policy_servers).toBe(false);
 
     const decoded = JSON.parse(Buffer.from(token, 'base64url').toString('utf8'));
     decoded.user_id = 'user-2';
@@ -156,6 +188,7 @@ describe('GlassHive capability broker', () => {
         schedule_id: 'schedule-1',
         run_id: 'scheduled-run-1',
       },
+      requireTurnScope: false,
       grantId: 'ghcb_scheduled_stable',
       nowMs: 1_000_000,
     });
@@ -216,6 +249,7 @@ describe('GlassHive capability broker', () => {
     } = require('../GlassHiveCapabilityBrokerAuth');
     const { token } = mintBrokerGrant({
       user: { id: 'user-1' },
+      requestContext: SYNTHETIC_TURN_SCOPE,
       grantId: 'ghcb_revoke_me',
       ttlSeconds: 60,
       renewableTtlSeconds: 15 * 60,
@@ -342,23 +376,384 @@ describe('GlassHive capability broker', () => {
     const { token, payload } = mintBrokerGrant({
       user: { id: 'user-1', role: 'USER' },
       allowedServers: ['ms-365'],
+      requestContext: SYNTHETIC_TURN_SCOPE,
       scopes: { content_read: true },
       ttlSeconds: 60,
-      renewableTtlSeconds: 15 * 60,
       nowMs: 1_000_000,
     });
 
     expect(payload.scopes.content_read).toBe(true);
-    expect(payload.renewable_until).toBe(payload.iat + 15 * 60);
+    expect(payload.renewable_until).toBeUndefined();
+    expect(() => verifyBrokerGrant(token, { nowMs: 1_061_000 })).toThrow(/expired/);
     expect(() => verifyBrokerGrant(token, { nowMs: 1_061_000 })).toThrow(/expired/);
 
-    const renewed = verifyBrokerGrant(token, { nowMs: 1_061_000, allowRenewal: true });
-    expect(renewed.renewed).toBe(true);
-    expect(renewed.scopes.content_read).toBe(true);
-    expect(grantReplayTtlMs(renewed, 1_061_000)).toBeGreaterThan(60_000);
+    const verified = verifyBrokerGrant(token, { nowMs: 1_001_000 });
+    expect(verified.renewed).toBe(false);
+    expect(verified.scopes.content_read).toBe(true);
+    expect(grantReplayTtlMs(verified, 1_001_000)).toBe(60_000);
 
-    expect(() => verifyBrokerGrant(token, { nowMs: 1_901_000, allowRenewal: true })).toThrow(
-      /expired/,
+    expect(() => verifyBrokerGrant(token, { nowMs: 1_901_000 })).toThrow(/expired/);
+  });
+
+  test('requires signed turn scope at the production broker boundary', () => {
+    const { mintBrokerGrant, verifyBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
+    const scoped = mintBrokerGrant({
+      user: { id: 'user-1' },
+      requestContext: { conversation_id: 'conv-1', message_id: 'msg-1' },
+      nowMs: 1_000_000,
+    });
+    expect(() =>
+      verifyBrokerGrant(scoped.token, { nowMs: 1_001_000, requireTurnScope: true }),
+    ).not.toThrow();
+
+    const userOnly = mintBrokerGrant({
+      user: { id: 'user-1' },
+      nowMs: 1_000_000,
+      requireTurnScope: false,
+    });
+    expect(() =>
+      verifyBrokerGrant(userOnly.token, { nowMs: 1_001_000, requireTurnScope: true }),
+    ).toThrow(/turn scope/);
+  });
+
+  test('refuses to mint a grant without exact turn scope', () => {
+    const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
+
+    expect(() =>
+      mintBrokerGrant({
+        user: { id: 'user-1' },
+        allowedServers: ['viventium-health'],
+        nowMs: 1_000_000,
+      }),
+    ).toThrow(/turn scope/);
+  });
+
+  test('keeps an existing conversation bound to its exact signed request message', async () => {
+    const {
+      buildConversationProviderBootstrapBundle,
+    } = require('../GlassHiveCapabilityBootstrapService');
+    const { verifyBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
+
+    const bundle = await buildConversationProviderBootstrapBundle({
+      user: { id: 'user-1', role: 'ADMIN' },
+      requestBody: {
+        conversationId: 'conv-1',
+        messageId: 'user-msg-1',
+        parentMessageId: 'prior-assistant-msg-1',
+      },
+      allowedHostTools: ['file_search'],
+    });
+    const grant = verifyBrokerGrant(bundle.env.GLASSHIVE_CAPABILITY_BROKER_TOKEN, {
+      requireTurnScope: true,
+    });
+
+    expect(grant).toMatchObject({
+      conversation_id: 'conv-1',
+      parent_message_id: 'prior-assistant-msg-1',
+      message_id: 'user-msg-1',
+      turn_id: '',
+    });
+  });
+
+  test.each([undefined, 'new'])(
+    'binds the actual first-browser-message shape before conversation persistence (%s)',
+    async (conversationId) => {
+      const {
+        buildConversationProviderBootstrapBundle,
+      } = require('../GlassHiveCapabilityBootstrapService');
+      const { verifyBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
+
+      const bundle = await buildConversationProviderBootstrapBundle({
+        user: { id: 'user-1', role: 'ADMIN' },
+        requestBody: {
+          ...(conversationId ? { conversationId } : {}),
+          messageId: 'user-msg-1',
+          parentMessageId: '00000000-0000-0000-0000-000000000000',
+        },
+        allowedHostTools: ['file_search'],
+      });
+      const grant = verifyBrokerGrant(bundle.env.GLASSHIVE_CAPABILITY_BROKER_TOKEN, {
+        requireTurnScope: true,
+      });
+
+      expect(grant).toMatchObject({
+        conversation_id: '',
+        parent_message_id: '',
+        message_id: 'user-msg-1',
+        turn_id: 'user-msg-1',
+      });
+    },
+  );
+
+  test('keeps an explicit pre-persistence response turn instead of deriving one', async () => {
+    const {
+      buildConversationProviderBootstrapBundle,
+    } = require('../GlassHiveCapabilityBootstrapService');
+    const { verifyBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
+
+    const bundle = await buildConversationProviderBootstrapBundle({
+      user: { id: 'user-1', role: 'ADMIN' },
+      requestBody: {
+        messageId: 'user-msg-1',
+        parentMessageId: '00000000-0000-0000-0000-000000000000',
+        responseMessageId: 'assistant-msg-1',
+      },
+      allowedHostTools: ['file_search'],
+    });
+    const grant = verifyBrokerGrant(bundle.env.GLASSHIVE_CAPABILITY_BROKER_TOKEN, {
+      requireTurnScope: true,
+    });
+
+    expect(grant).toMatchObject({
+      conversation_id: '',
+      parent_message_id: '',
+      message_id: 'user-msg-1',
+      turn_id: 'assistant-msg-1',
+    });
+  });
+
+  test('keeps an explicit pre-persistence turn instead of deriving one', async () => {
+    const {
+      buildConversationProviderBootstrapBundle,
+    } = require('../GlassHiveCapabilityBootstrapService');
+    const { verifyBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
+
+    const bundle = await buildConversationProviderBootstrapBundle({
+      user: { id: 'user-1', role: 'ADMIN' },
+      requestBody: {
+        messageId: 'user-msg-1',
+        parentMessageId: '00000000-0000-0000-0000-000000000000',
+        turnId: 'explicit-turn-1',
+      },
+      allowedHostTools: ['file_search'],
+    });
+    const grant = verifyBrokerGrant(bundle.env.GLASSHIVE_CAPABILITY_BROKER_TOKEN, {
+      requireTurnScope: true,
+    });
+
+    expect(grant).toMatchObject({
+      conversation_id: '',
+      parent_message_id: '',
+      message_id: 'user-msg-1',
+      turn_id: 'explicit-turn-1',
+    });
+  });
+
+  test('refuses to build a truly unscoped provider grant before it reaches the broker boundary', async () => {
+    const {
+      buildConversationProviderBootstrapBundle,
+    } = require('../GlassHiveCapabilityBootstrapService');
+    const { verifyBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
+
+    const bundle = await buildConversationProviderBootstrapBundle({
+      user: { id: 'user-1', role: 'ADMIN' },
+      requestBody: {
+        parentMessageId: '00000000-0000-0000-0000-000000000000',
+      },
+      allowedHostTools: ['file_search'],
+    });
+
+    expect(bundle).toMatchObject({
+      glasshive_capability_status: {
+        status: 'degraded',
+        reason: 'grant_unavailable',
+      },
+    });
+  });
+
+  test('hard-clamps every broker grant to a 24-hour absolute ceiling', () => {
+    const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
+    const { payload } = mintBrokerGrant({
+      user: { id: 'user-1' },
+      requestContext: SYNTHETIC_TURN_SCOPE,
+      ttlSeconds: 365 * 24 * 60 * 60,
+      nowMs: 1_000_000,
+    });
+    expect(payload.exp - payload.iat).toBe(24 * 60 * 60);
+  });
+
+  test('binds exact resolved host tools through a compact signed grant and server-side scope', async () => {
+    const {
+      hydrateBrokerGrantResources,
+      mintBrokerGrant,
+      persistBrokerGrantResources,
+      verifyBrokerGrant,
+    } = require('../GlassHiveCapabilityBrokerAuth');
+    const resources = {
+      file_search: {
+        entity_id: 'agent-1',
+        files: [
+          {
+            file_id: 'conversation_recall:all:user-1',
+            filename: 'conversation-recall-all.txt',
+            viventiumConversationRecallMode: 'source_only',
+            viventiumConversationRecallAttachmentReason: 'stale_corpus',
+            metadata: { largeSourceOnlyPayload: 'x'.repeat(24_000) },
+          },
+        ],
+      },
+    };
+    const minted = mintBrokerGrant({
+      user: { id: 'user-1', role: 'USER' },
+      allowedHostTools: ['file_search', 'file_search', 'unknown_tool'],
+      hostToolResources: resources,
+      requestContext: SYNTHETIC_TURN_SCOPE,
+    });
+    await persistBrokerGrantResources(minted);
+
+    expect(minted.token.length).toBeLessThan(4096);
+    const verified = await hydrateBrokerGrantResources(verifyBrokerGrant(minted.token));
+    expect(verified.allowed_host_tools).toEqual(['file_search', 'unknown_tool']);
+    expect(verified.host_tool_resources).toEqual(resources);
+  });
+
+  test('exposes and invokes canonical file_search through the same MCP catalog', async () => {
+    const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
+    const {
+      buildCapabilityCatalog,
+      handleToolCall,
+      toolDefinitionsForMcp,
+    } = require('../GlassHiveCapabilityBrokerService');
+    const recallFile = {
+      file_id: 'conversation_recall:all:user-1',
+      filename: 'conversation-recall-all.txt',
+      viventiumConversationRecallMode: 'source_only',
+      viventiumConversationRecallAttachmentReason: 'stale_corpus',
+    };
+    mockGetMCPServersRegistry.mockReturnValue({});
+    mockCreateFileSearchTool.mockResolvedValue({
+      func: jest
+        .fn()
+        .mockResolvedValue([
+          'Synthetic source-backed recall result.',
+          { file_search: { sources: [{ fileId: recallFile.file_id }] } },
+        ]),
+    });
+    const grant = mintBrokerGrant({
+      user: { id: 'user-1', role: 'USER' },
+      allowedHostTools: ['file_search'],
+      hostToolResources: {
+        file_search: { entity_id: 'agent-1', files: [recallFile] },
+      },
+      requestContext: { conversation_id: 'conv-1', message_id: 'msg-1' },
+    }).payload;
+
+    const catalog = await buildCapabilityCatalog({ grant });
+    expect(toolDefinitionsForMcp(catalog)).toContainEqual(
+      expect.objectContaining({
+        name: 'file_search',
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      }),
+    );
+    await expect(
+      handleToolCall({ grant, toolName: 'file_search', args: { query: 'synthetic fact' } }),
+    ).resolves.toEqual({
+      status: 'ok',
+      tool: 'file_search',
+      content: 'Synthetic source-backed recall result.',
+      artifact: { file_search: { sources: [{ fileId: recallFile.file_id }] } },
+    });
+    expect(mockCreateFileSearchTool).toHaveBeenCalledWith({
+      userId: 'user-1',
+      files: [recallFile],
+      entity_id: 'agent-1',
+      conversationId: 'conv-1',
+      activeMessageId: 'msg-1',
+      fileCitations: false,
+    });
+  });
+
+  test('exposes and invokes canonical web_search through the signed host-tool broker', async () => {
+    const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
+    const {
+      buildCapabilityCatalog,
+      handleToolCall,
+      toolDefinitionsForMcp,
+    } = require('../GlassHiveCapabilityBrokerService');
+    mockGetMCPServersRegistry.mockReturnValue({});
+    mockLoadWebSearchAuth.mockResolvedValue({
+      authenticated: true,
+      authResult: {
+        searchProvider: 'searxng',
+        searxngInstanceUrl: 'http://127.0.0.1:18082',
+      },
+    });
+    const searchFunc = jest.fn().mockResolvedValue([
+      'Synthetic public-safe search result.',
+      {
+        web_search: {
+          success: true,
+          organic: [
+            {
+              title: 'Synthetic result',
+              link: 'https://example.test/evidence',
+              snippet: 'Synthetic evidence only.',
+            },
+          ],
+        },
+      },
+    ]);
+    mockCreateViventiumSearchTool.mockReturnValue({ func: searchFunc });
+    const grant = mintBrokerGrant({
+      user: { id: 'user-1', role: 'USER' },
+      allowedHostTools: ['web_search'],
+      requestContext: { conversation_id: 'conv-1', message_id: 'msg-1' },
+    }).payload;
+    const appConfig = {
+      webSearch: {
+        searchProvider: 'searxng',
+        searxngInstanceUrl: 'http://127.0.0.1:18082',
+      },
+    };
+
+    const catalog = await buildCapabilityCatalog({ grant, appConfig });
+    expect(toolDefinitionsForMcp(catalog)).toContainEqual(
+      expect.objectContaining({
+        name: 'web_search',
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: true,
+        },
+      }),
+    );
+    await expect(
+      handleToolCall({
+        grant,
+        toolName: 'web_search',
+        args: { query: 'synthetic current fact' },
+        appConfig,
+      }),
+    ).resolves.toEqual({
+      status: 'ok',
+      tool: 'web_search',
+      content: 'Synthetic public-safe search result.',
+      artifact: expect.objectContaining({ web_search: expect.objectContaining({ success: true }) }),
+    });
+    expect(mockLoadWebSearchAuth).toHaveBeenCalledWith({
+      userId: 'user-1',
+      loadAuthValues: mockLoadAuthValues,
+      webSearchConfig: appConfig.webSearch,
+      throwError: true,
+    });
+    expect(mockCreateViventiumSearchTool).toHaveBeenCalledWith(
+      expect.objectContaining({
+        searchProvider: 'searxng',
+        searxngInstanceUrl: 'http://127.0.0.1:18082',
+      }),
+    );
+    expect(searchFunc).toHaveBeenCalledWith(
+      { query: 'synthetic current fact' },
+      undefined,
+      expect.objectContaining({
+        metadata: expect.objectContaining({ user_id: 'user-1' }),
+      }),
     );
   });
 
@@ -513,6 +908,7 @@ describe('GlassHive capability broker', () => {
       eagerServers: ['scheduling-cortex'],
       deferredServers: ['ms-365'],
       allowDynamicPolicyServers: false,
+      requestContext: SYNTHETIC_TURN_SCOPE,
       scopes: { content_read: true },
     }).payload;
 
@@ -584,6 +980,7 @@ describe('GlassHive capability broker', () => {
         allowedServers: ['ms-365'],
         eagerServers: [],
         deferredServers: ['ms-365'],
+        requestContext: SYNTHETIC_TURN_SCOPE,
         scopes: { content_read: true },
       }).payload;
 
@@ -696,6 +1093,7 @@ describe('GlassHive capability broker', () => {
       allowedServers: ['ms-365'],
       eagerServers: [],
       deferredServers: ['ms-365'],
+      requestContext: SYNTHETIC_TURN_SCOPE,
       scopes: { content_read: true },
     }).payload;
 
@@ -745,6 +1143,7 @@ describe('GlassHive capability broker', () => {
       allowedServers: ['ms-365'],
       eagerServers: [],
       deferredServers: ['ms-365'],
+      requestContext: SYNTHETIC_TURN_SCOPE,
       scopes: { content_read: true },
     }).payload;
 
@@ -888,7 +1287,8 @@ describe('GlassHive capability broker', () => {
     });
 
     expect(result.context).toContain('glasshive-user-capabilities');
-    expect(result.context).toContain('Prefer MCP/tools');
+    expect(result.context).toContain('Prefer callable broker tools');
+    expect(result.context).toContain('catalog as capability truth');
     expect(result.context).toContain('non-broker host connector');
     expect(result.context).toContain('authorized by reviewed host policy');
     expect(result.success_criteria).toBe('Use live connected evidence');
@@ -905,6 +1305,49 @@ describe('GlassHive capability broker', () => {
     const serialized = JSON.stringify(result.bootstrap_bundle_json);
     expect(serialized).toContain('Bearer ');
     expect(serialized).not.toContain('provider-secret');
+  });
+
+  test('delegates an ACL-resolved host file_search even when no connected MCP server is available', async () => {
+    const {
+      maybeInjectGlassHiveCapabilityBroker,
+    } = require('../GlassHiveCapabilityBootstrapService');
+    mockGetMCPServersRegistry.mockReturnValue({
+      getAllServerConfigs: jest.fn().mockRejectedValue(new Error('synthetic registry outage')),
+    });
+
+    const result = await maybeInjectGlassHiveCapabilityBroker({
+      serverName: 'glasshive-workers-projects',
+      toolName: 'worker_delegate_once',
+      toolArguments: {
+        instruction: 'Use the authorized corpus as needed.',
+        execution_mode: 'host',
+      },
+      config: {
+        configurable: {
+          user: { id: 'user-1', role: 'USER' },
+          requestBody: { conversationId: 'conv-1', messageId: 'msg-1' },
+          glasshive_host_tools: ['file_search'],
+          glasshive_host_tool_resources: {
+            file_search: {
+              entity_id: 'agent-1',
+              files: [{ file_id: 'file-1', filename: 'synthetic.txt' }],
+            },
+          },
+        },
+      },
+    });
+
+    expect(result.instruction).toContain('Authorized host tools for this run: file_search');
+    expect(result.instruction).toContain(
+      'Host-tool resources are virtual service evidence, not workspace paths',
+    );
+    expect(result.instruction).toContain(
+      'Never pass their labels to shell/filesystem tools or search for copies by filename',
+    );
+    expect(result.bootstrap_bundle_json.glasshive_capability_broker.allowed_servers).toEqual([]);
+    expect(result.bootstrap_bundle_json.glasshive_capability_broker.allowed_host_tools).toEqual([
+      'file_search',
+    ]);
   });
 
   test('injects run memory and the pinned feeling capsule into every worker instruction bundle', async () => {
@@ -1014,7 +1457,9 @@ describe('GlassHive capability broker', () => {
       },
     });
 
-    expect(result.instruction).toBe('Do the work.');
+    expect(result.instruction).toContain('Do the work.');
+    expect(result.instruction).toContain('host capability broker is unavailable');
+    expect(result.instruction).toContain('broker_disabled');
     expect(result.bootstrap_bundle_json.agents_md).toContain(capsule);
     expect(result.bootstrap_bundle_json.claude_md).toContain(capsule);
     expect(result.bootstrap_bundle_json.codex_md).toContain(capsule);
@@ -1069,7 +1514,7 @@ describe('GlassHive capability broker', () => {
     expect(result.bootstrap_bundle_json.glasshive_capability_broker.scopes.content_read).toBe(true);
   });
 
-  test('skips bootstrap injection instead of breaking GlassHive launch when broker secret is missing', async () => {
+  test('tells the worker when broker grant minting fails without breaking GlassHive launch', async () => {
     const {
       maybeInjectGlassHiveCapabilityBroker,
     } = require('../GlassHiveCapabilityBootstrapService');
@@ -1107,23 +1552,32 @@ describe('GlassHive capability broker', () => {
       },
     });
 
-    expect(result).toBe(toolArguments);
+    expect(result).not.toBe(toolArguments);
+    expect(result.context).toContain('capability broker is unavailable for this run');
+    expect(result.context).toContain('grant_mint_failed');
+    expect(result.bootstrap_bundle_json.glasshive_capability_broker_status).toEqual({
+      status: 'unavailable',
+      reason: 'grant_mint_failed',
+    });
+    expect(result.bootstrap_bundle_json.agents_md).toContain(
+      'Do not claim that brokered host capabilities are available',
+    );
   });
 
   test('uses schedule-aware broker grant ttl for delayed worker runs', () => {
-    const {
-      grantRenewableTtlSecondsForTool,
-      grantTtlSecondsForTool,
-    } = require('../GlassHiveCapabilityBootstrapService');
+    const { grantTtlSecondsForTool } = require('../GlassHiveCapabilityBootstrapService');
     process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_TTL_SECONDS = '';
     process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SCHEDULE_TTL_SECONDS = '';
     process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_MAX_SCHEDULE_TTL_SECONDS = '';
-    process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_RENEWABLE_TTL_SECONDS = '';
 
     expect(grantTtlSecondsForTool('workspace_launch', {})).toBe(600);
-    expect(grantRenewableTtlSecondsForTool('workspace_launch', {})).toBe(3600);
     expect(grantTtlSecondsForTool('worker_schedule', { delay_seconds: 7200 })).toBe(7800);
-    expect(grantRenewableTtlSecondsForTool('worker_schedule', { delay_seconds: 7200 })).toBe(7800);
+    process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_MAX_SCHEDULE_TTL_SECONDS = String(
+      7 * 24 * 60 * 60,
+    );
+    expect(grantTtlSecondsForTool('worker_schedule', { delay_seconds: 7 * 24 * 60 * 60 })).toBe(
+      24 * 60 * 60,
+    );
   });
 
   test('resolves host broker URL from deterministic listener host', () => {
@@ -1377,6 +1831,7 @@ describe('GlassHive capability broker', () => {
     const grant = mintBrokerGrant({
       user: { id: 'user-1', role: 'USER' },
       allowedServers: ['google_workspace'],
+      requestContext: SYNTHETIC_TURN_SCOPE,
     }).payload;
 
     const catalog = await buildCapabilityCatalog({ grant });
@@ -1488,6 +1943,7 @@ describe('GlassHive capability broker', () => {
     const grant = mintBrokerGrant({
       user: { id: 'user-1', role: 'USER' },
       allowedServers: ['scheduling-cortex'],
+      requestContext: SYNTHETIC_TURN_SCOPE,
     }).payload;
 
     const catalog = await buildCapabilityCatalog({ grant });
@@ -1509,6 +1965,55 @@ describe('GlassHive capability broker', () => {
     expect(callTool).toHaveBeenCalledWith(
       expect.objectContaining({ toolArguments: { prompt: 'Synthetic reminder' } }),
     );
+  });
+
+  test('reuses the grant-scoped discovery catalog between tools/list and tools/call', async () => {
+    const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
+    const {
+      buildCapabilityCatalog,
+      handleToolCall,
+    } = require('../GlassHiveCapabilityBrokerService');
+    mockGetMCPServersRegistry.mockReturnValue({
+      getServerConfig: jest.fn().mockResolvedValue({
+        source: 'config',
+        viventiumGlassHive: {
+          version: 1,
+          permitsAutonomousWorker: true,
+          defaultToolAccess: 'none',
+          writePolicy: 'allow',
+          toolPolicies: {
+            schedule_create: { access: 'write' },
+          },
+        },
+      }),
+    });
+    mockReinitMCPServer.mockResolvedValue({
+      success: true,
+      oauthRequired: false,
+      tools: [
+        {
+          name: 'schedule_create',
+          inputSchema: { type: 'object', properties: {} },
+        },
+      ],
+    });
+    mockGetMCPManager.mockReturnValue({
+      callTool: jest.fn().mockResolvedValue({ success: true }),
+    });
+    const grant = mintBrokerGrant({
+      user: { id: 'user-1', role: 'USER' },
+      allowedServers: ['scheduling-cortex'],
+      requestContext: SYNTHETIC_TURN_SCOPE,
+    }).payload;
+
+    await buildCapabilityCatalog({ grant });
+    await handleToolCall({
+      grant,
+      toolName: 'gh_scheduling_cortex__schedule_create',
+      args: { invocation_id: 'grant-catalog-reuse-1' },
+    });
+
+    expect(mockReinitMCPServer).toHaveBeenCalledTimes(1);
   });
 
   test('requires signed content-read grant scope and escalates destructive annotations to write policy', async () => {
@@ -1555,6 +2060,7 @@ describe('GlassHive capability broker', () => {
     const grant = mintBrokerGrant({
       user: { id: 'user-1', role: 'USER' },
       allowedServers: ['ms-365'],
+      requestContext: SYNTHETIC_TURN_SCOPE,
     }).payload;
 
     const catalog = await buildCapabilityCatalog({ grant });
@@ -1562,9 +2068,27 @@ describe('GlassHive capability broker', () => {
     expect(
       definitions.find((tool) => tool.name === 'gh_ms_365__mail_search')?.annotations.access,
     ).toBe('content_read');
+    expect(definitions.find((tool) => tool.name === 'gh_ms_365__mail_search')?.annotations).toEqual(
+      expect.objectContaining({
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      }),
+    );
     expect(
       definitions.find((tool) => tool.name === 'gh_ms_365__calendar_delete')?.annotations.access,
     ).toBe('write');
+    expect(
+      definitions.find((tool) => tool.name === 'gh_ms_365__calendar_delete')?.annotations,
+    ).toEqual(
+      expect.objectContaining({
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: true,
+      }),
+    );
 
     const readBlocked = await handleToolCall({
       grant,
@@ -1596,6 +2120,7 @@ describe('GlassHive capability broker', () => {
     const scopedGrant = mintBrokerGrant({
       user: { id: 'user-1', role: 'USER' },
       allowedServers: ['ms-365'],
+      requestContext: SYNTHETIC_TURN_SCOPE,
       scopes: { content_read: true },
     }).payload;
     const readAllowed = await handleToolCall({
@@ -1651,6 +2176,7 @@ describe('GlassHive capability broker', () => {
     const scopedGrant = mintBrokerGrant({
       user: { id: 'user-1', role: 'USER' },
       allowedServers: ['ms-365'],
+      requestContext: SYNTHETIC_TURN_SCOPE,
       scopes: { content_read: true },
     }).payload;
 
@@ -1725,6 +2251,7 @@ describe('GlassHive capability broker', () => {
     const grant = mintBrokerGrant({
       user: { id: 'user-1', role: 'USER' },
       allowedServers: ['google_workspace'],
+      requestContext: SYNTHETIC_TURN_SCOPE,
     }).payload;
 
     const catalog = await handleToolCall({
@@ -1780,6 +2307,7 @@ describe('GlassHive capability broker', () => {
     const grant = mintBrokerGrant({
       user: { id: 'user-1', role: 'USER' },
       allowedServers: ['google_workspace'],
+      requestContext: SYNTHETIC_TURN_SCOPE,
       scopes: { content_read: true },
     }).payload;
 
@@ -1798,7 +2326,7 @@ describe('GlassHive capability broker', () => {
       2,
       expect.objectContaining({
         serverName: 'google_workspace',
-        forceNew: true,
+        forceNew: false,
       }),
     );
     expect(definitions.map((tool) => tool.name)).toContain(
@@ -1807,7 +2335,7 @@ describe('GlassHive capability broker', () => {
     expect(catalog.omissions).toEqual([]);
   });
 
-  test('refreshes allowed server list from current reviewed policy during the grant lifetime', async () => {
+  test('refreshes allowed servers only when a non-conversation caller explicitly opts in', async () => {
     const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
     const { buildCapabilityCatalog } = require('../GlassHiveCapabilityBrokerService');
     const policyConfig = {
@@ -1846,6 +2374,8 @@ describe('GlassHive capability broker', () => {
     const grant = mintBrokerGrant({
       user: { id: 'user-1', role: 'USER' },
       allowedServers: ['google_workspace'],
+      requestContext: SYNTHETIC_TURN_SCOPE,
+      allowDynamicPolicyServers: true,
     }).payload;
 
     const catalog = await buildCapabilityCatalog({ grant });

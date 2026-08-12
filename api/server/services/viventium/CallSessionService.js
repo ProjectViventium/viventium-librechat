@@ -20,20 +20,67 @@
 const crypto = require('crypto');
 const mongoose = require('mongoose');
 const { logger } = require('@librechat/data-schemas');
-const { ViventiumCallSession } = require('~/db/models');
+const { ViventiumCallSession, ViventiumVoiceSpeakerSegment } = require('~/db/models');
 const { getUserById, updateUserViventiumVoicePreferences } = require('~/models');
 const { resolveVoiceOverrideAssignment } = require('./voiceLlmOverride');
 const { rewriteAgentForRuntime } = require('../../../../scripts/viventium-agent-runtime-models');
 
 const DEFAULT_TTL_MS = 15 * 60 * 1000; // 15 minutes
+// Keep terminal call/speaker authority evidence through the maximum supported task-owner callback
+// horizon. Durable memory finalization remains the authority after this recovery window expires.
+const POST_CALL_MEMORY_EVIDENCE_TTL_MS = 35 * 24 * 60 * 60 * 1000;
 const DEFAULT_LEASE_MS = 60 * 1000; // 60 seconds
 const DEFAULT_DISPATCH_CLAIM_MS = 15 * 1000; // 15 seconds
+const DEFAULT_VOICE_GATEWAY_AGENT_NAME = 'librechat-voice-gateway';
+const BROWSER_LAUNCH_TTL_MS = 15 * 60 * 1000;
 /* === VIVENTIUM START ===
  * Feature: Modern playground voice-route persistence
  * Purpose: Normalize provider/variant selections before storing them in the call session or user.
  * === VIVENTIUM END === */
 const MAX_PROVIDER_LENGTH = 80;
 const MAX_VARIANT_LENGTH = 160;
+/* === VIVENTIUM START ===
+ * Feature: VoiceCallStateV1 compatibility contract
+ * Purpose: Own one canonical mode while preserving the historical boolean aliases during rollout.
+ * === VIVENTIUM END === */
+const CALL_MODES = new Set(['call', 'wing', 'listen_only']);
+const CALL_STATUSES = new Set([
+  'created',
+  'connecting',
+  'listening',
+  'speaking',
+  'working',
+  'needs_input',
+  'degraded',
+  'failed',
+  'ended',
+]);
+const CALL_FAILURE_CODES = new Set(['no_route', 'provider_failure', 'gateway_down']);
+
+function publicCallFailure(failure) {
+  if (!failure || !CALL_FAILURE_CODES.has(failure.code)) {
+    return null;
+  }
+  const message = normalizeVoiceRouteText(failure.message, 300);
+  return {
+    code: failure.code,
+    message: message || 'Voice calling is temporarily unavailable.',
+    retryable: failure.retryable === true,
+  };
+}
+
+function resolveCallMode({ mode, wingModeEnabled, shadowModeEnabled, listenOnlyModeEnabled } = {}) {
+  if (CALL_MODES.has(mode)) {
+    return mode;
+  }
+  if (listenOnlyModeEnabled === true) {
+    return 'listen_only';
+  }
+  if (wingModeEnabled === true || shadowModeEnabled === true) {
+    return 'wing';
+  }
+  return 'call';
+}
 
 function createRoomName(callSessionId) {
   // LiveKit room name practical max ~64; keep it short & deterministic.
@@ -41,6 +88,37 @@ function createRoomName(callSessionId) {
     .replace(/[^a-zA-Z0-9]/g, '')
     .slice(0, 12);
   return `lc-${short || 'call'}`;
+}
+
+function getConfiguredGatewayAgentName() {
+  return (
+    normalizeVoiceRouteText(process.env.VIVENTIUM_VOICE_GATEWAY_AGENT_NAME, 160) ||
+    DEFAULT_VOICE_GATEWAY_AGENT_NAME
+  );
+}
+
+function createOwnerParticipantIdentity() {
+  return `owner-${crypto.randomUUID()}`;
+}
+
+/* === VIVENTIUM START ===
+ * Feature: browser-scoped call capability
+ * Purpose: Mint high-entropy browser authority independently from the non-secret session ID.
+ * Only its digest crosses the durable persistence boundary.
+ * === VIVENTIUM END === */
+function createBrowserCallCapability() {
+  const capability = crypto.randomBytes(32).toString('base64url');
+  return {
+    capability,
+    hash: crypto.createHash('sha256').update(capability).digest('hex'),
+  };
+}
+
+function hashBrowserCallCapability(capability) {
+  if (typeof capability !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(capability)) {
+    return null;
+  }
+  return crypto.createHash('sha256').update(capability).digest('hex');
 }
 
 function createEmptyVoiceRouteSelection() {
@@ -309,18 +387,88 @@ function normalizeSession(session) {
    * Purpose: Make Listen-Only mutually exclusive with Wing Mode at the durable session boundary.
    * === VIVENTIUM END === */
   const normalizedListenOnlyModeEnabled = session.listenOnlyModeEnabled === true;
+  const mode = resolveCallMode({
+    mode: session.mode,
+    wingModeEnabled: normalizedWingModeEnabled,
+    listenOnlyModeEnabled: normalizedListenOnlyModeEnabled,
+  });
+  const updatedAt = session.updatedAt ? new Date(session.updatedAt).getTime() : createdAt;
+  const speakerDetectedAt = session.speakerDetectedAt ? new Date(session.speakerDetectedAt) : null;
+  const speakerAttributionState = ['single_speaker', 'shared_mic_unverified'].includes(
+    session.speakerAttributionState,
+  )
+    ? session.speakerAttributionState
+    : null;
+  const speakerSessionRevision = Number.isFinite(Number(session.speakerSessionRevision))
+    ? Number(session.speakerSessionRevision)
+    : 0;
+  const sharedTrackSids = Array.isArray(session.speakerSharedTrackSids)
+    ? [
+        ...new Set(
+          session.speakerSharedTrackSids
+            .slice(0, 64)
+            .filter((value) => typeof value === 'string' && value.trim())
+            .map((value) => value.trim().slice(0, 160)),
+        ),
+      ].sort()
+    : null;
+  const sharedParticipantIdentities = Array.isArray(session.speakerSharedParticipantIdentities)
+    ? [
+        ...new Set(
+          session.speakerSharedParticipantIdentities
+            .slice(0, 64)
+            .filter((value) => typeof value === 'string' && value.trim())
+            .map((value) => value.trim().slice(0, 160)),
+        ),
+      ].sort()
+    : null;
+  const callFailure = publicCallFailure(session.callFailure);
   return {
+    version: 1,
     callSessionId: session.callSessionId,
     userId: session.userId,
     agentId: session.agentId,
     conversationId: session.conversationId,
     roomName: session.roomName,
+    gatewayAgentName: session.gatewayAgentName || DEFAULT_VOICE_GATEWAY_AGENT_NAME,
+    ownerParticipantIdentity: session.ownerParticipantIdentity || null,
     createdAtMs: createdAt,
     expiresAtMs: expiresAt,
     requestedVoiceRoute: normalizeVoiceRouteState(session.requestedVoiceRoute),
-    wingModeEnabled: normalizedListenOnlyModeEnabled ? false : normalizedWingModeEnabled,
-    shadowModeEnabled: normalizedListenOnlyModeEnabled ? false : normalizedWingModeEnabled,
-    listenOnlyModeEnabled: normalizedListenOnlyModeEnabled,
+    speakerAttributionState,
+    sharedTrackSids,
+    sharedParticipantIdentities,
+    speakerSessionRevision,
+    speakerSessionState:
+      speakerAttributionState && speakerDetectedAt && Number.isFinite(speakerDetectedAt.getTime())
+        ? {
+            version: 1,
+            callSessionId: session.callSessionId,
+            revision: speakerSessionRevision,
+            attributionState: speakerAttributionState,
+            detectedAt: speakerDetectedAt.toISOString(),
+            ...(session.speakerSourceTrackSid
+              ? { sourceTrackSid: String(session.speakerSourceTrackSid) }
+              : {}),
+            ...(session.speakerSourceParticipantIdentity
+              ? {
+                  sourceParticipantIdentity: String(session.speakerSourceParticipantIdentity),
+                }
+              : {}),
+            ...(sharedTrackSids ? { sharedTrackSids } : {}),
+            ...(sharedParticipantIdentities ? { sharedParticipantIdentities } : {}),
+          }
+        : null,
+    mode,
+    status: session.callStatus || 'created',
+    ...(callFailure ? { error: callFailure } : {}),
+    revision: Number.isFinite(Number(session.callModeRevision))
+      ? Number(session.callModeRevision)
+      : 0,
+    updatedAt,
+    wingModeEnabled: mode === 'wing',
+    shadowModeEnabled: mode === 'wing',
+    listenOnlyModeEnabled: mode === 'listen_only',
     activeJobId: session.activeJobId || null,
     activeWorkerId: session.activeWorkerId || null,
     leaseExpiresAtMs: leaseExpiresAt,
@@ -359,31 +507,6 @@ function getDispatchClaimTtlMs() {
     return parsed;
   }
   return DEFAULT_DISPATCH_CLAIM_MS;
-}
-
-function parseBooleanEnv(...values) {
-  for (const value of values) {
-    const normalized = String(value ?? '')
-      .trim()
-      .toLowerCase();
-    if (!normalized) {
-      continue;
-    }
-    if (['1', 'true', 'yes', 'on'].includes(normalized)) {
-      return true;
-    }
-    if (['0', 'false', 'no', 'off'].includes(normalized)) {
-      return false;
-    }
-  }
-  return false;
-}
-
-function getDefaultWingModeEnabled() {
-  return parseBooleanEnv(
-    process.env.VIVENTIUM_WING_MODE_DEFAULT_ENABLED,
-    process.env.VIVENTIUM_SHADOW_MODE_DEFAULT_ENABLED,
-  );
 }
 
 function normalizeAssistantRouteText(value) {
@@ -461,7 +584,7 @@ async function resolveCallSessionAssistantRoute(
   };
 }
 
-async function createCallSession({ userId, agentId, conversationId, ttlMs, requestedVoiceRoute }) {
+async function createCallSession({ userId, agentId, conversationId, ttlMs }) {
   if (!userId) {
     throw new Error('createCallSession requires userId');
   }
@@ -469,19 +592,30 @@ async function createCallSession({ userId, agentId, conversationId, ttlMs, reque
     throw new Error('createCallSession requires agentId');
   }
 
+  const normalizedRequestedVoiceRoute = compactVoiceRouteState(await resolveUserVoiceRoute(userId));
+  if (
+    !normalizedRequestedVoiceRoute?.stt?.provider ||
+    !normalizedRequestedVoiceRoute?.tts?.provider
+  ) {
+    const error = new Error('Voice calling requires configured STT and TTS providers.');
+    error.code = 'no_route';
+    error.status = 400;
+    error.retryable = false;
+    throw error;
+  }
+
   const callSessionId = crypto.randomUUID();
   const createdAtMs = Date.now();
   const ttl = Number(ttlMs) || getCallSessionTtlMs();
   const expiresAtMs = createdAtMs + ttl;
   const roomName = createRoomName(callSessionId);
+  const gatewayAgentName = getConfiguredGatewayAgentName();
+  const ownerParticipantIdentity = createOwnerParticipantIdentity();
+  const browserCapability = createBrowserCallCapability();
   /* === VIVENTIUM START ===
    * Feature: Modern playground voice-route persistence
    * Purpose: Seed new call sessions from the explicit request first, then fall back to saved defaults.
    * === VIVENTIUM END === */
-  const normalizedRequestedVoiceRoute =
-    compactVoiceRouteState(requestedVoiceRoute) ||
-    compactVoiceRouteState((await getUserSavedVoiceRoute(userId)) ?? null);
-
   const session = {
     callSessionId,
     userId,
@@ -489,11 +623,19 @@ async function createCallSession({ userId, agentId, conversationId, ttlMs, reque
     // conversationId may be "new" initially; it will be updated after first agent run starts.
     conversationId: conversationId || 'new',
     roomName,
+    gatewayAgentName,
+    ownerParticipantIdentity,
+    browserCapabilityHash: browserCapability.hash,
+    browserCapabilityExpiresAt: new Date(expiresAtMs),
+    browserCapabilityVersion: 1,
+    browserCapabilityScope: 'call_browser_v1',
     createdAt: new Date(createdAtMs),
     expiresAt: new Date(expiresAtMs),
-    wingModeEnabled: getDefaultWingModeEnabled(),
-    shadowModeEnabled: getDefaultWingModeEnabled(),
+    wingModeEnabled: false,
+    shadowModeEnabled: false,
     listenOnlyModeEnabled: false,
+    mode: 'call',
+    callStatus: 'created',
     requestedVoiceRoute: normalizedRequestedVoiceRoute,
   };
 
@@ -505,7 +647,11 @@ async function createCallSession({ userId, agentId, conversationId, ttlMs, reque
    * === VIVENTIUM END === */
   logger.debug?.('[VIVENTIUM][CallSession] created');
 
-  return normalizeSession(saved);
+  return {
+    ...normalizeSession(saved),
+    // Ephemeral launch-only value. Never returned by normalizeSession/getCallSession.
+    browserCapability: browserCapability.capability,
+  };
 }
 
 async function getCallSession(callSessionId) {
@@ -520,9 +666,143 @@ async function getCallSession(callSessionId) {
   return normalizeSession(session);
 }
 
+/* === VIVENTIUM START ===
+ * Feature: one-time Telegram call launch exchange
+ * Purpose: A Telegram button carries only a single-use launch bearer. The browser receives its
+ * renewable per-session capability only after a same-origin, server-authenticated atomic exchange.
+ * Neither raw bearer is persisted or returned by ordinary session readers.
+ * === VIVENTIUM END === */
+async function createCallBrowserLaunch(callSessionId) {
+  const normalizedCallSessionId = String(callSessionId || '');
+  if (!normalizedCallSessionId) {
+    const error = new Error('Call session is required');
+    error.status = 400;
+    throw error;
+  }
+  const launch = createBrowserCallCapability();
+  const now = new Date();
+  const launchExpiresAt = new Date(now.getTime() + BROWSER_LAUNCH_TTL_MS);
+  const session = await ViventiumCallSession.findOneAndUpdate(
+    {
+      callSessionId: normalizedCallSessionId,
+      callStatus: { $ne: 'ended' },
+      expiresAt: { $gt: now },
+    },
+    {
+      $set: {
+        browserLaunchCapabilityHash: launch.hash,
+        browserLaunchCapabilityExpiresAt: launchExpiresAt,
+        browserLaunchCapabilityVersion: 1,
+        browserLaunchCapabilityScope: 'call_browser_launch_v1',
+        browserLaunchCapabilityUsedAt: null,
+        browserLaunchIdempotencyHash: null,
+      },
+    },
+    { new: true },
+  ).lean();
+  if (!session) {
+    const error = new Error('Call session expired');
+    error.status = 410;
+    throw error;
+  }
+  return {
+    capability: launch.capability,
+    expiresAt: launchExpiresAt.toISOString(),
+  };
+}
+
+function deriveBrowserCapabilityForLaunch({ callSessionId, launchHash, idempotencyHash }) {
+  const secret = getRequiredEnvSecret();
+  if (!secret) {
+    const error = new Error('Call session secret is unavailable');
+    error.status = 503;
+    throw error;
+  }
+  return crypto
+    .createHmac('sha256', secret)
+    .update(`${callSessionId}\n${launchHash}\n${idempotencyHash}`)
+    .digest('base64url');
+}
+
+async function exchangeCallBrowserLaunch(callSessionId, launchCapability, idempotencyCapability) {
+  const normalizedCallSessionId = String(callSessionId || '');
+  const incomingHash = hashBrowserCallCapability(launchCapability);
+  const idempotencyHash = hashBrowserCallCapability(idempotencyCapability);
+  if (!normalizedCallSessionId || !incomingHash || !idempotencyHash) {
+    const error = new Error('Invalid call launch capability');
+    error.status = 401;
+    throw error;
+  }
+  const browserCapability = deriveBrowserCapabilityForLaunch({
+    callSessionId: normalizedCallSessionId,
+    launchHash: incomingHash,
+    idempotencyHash,
+  });
+  const browserCapabilityHash = hashBrowserCallCapability(browserCapability);
+  const now = new Date();
+  let session = await ViventiumCallSession.findOneAndUpdate(
+    {
+      callSessionId: normalizedCallSessionId,
+      callStatus: { $ne: 'ended' },
+      expiresAt: { $gt: now },
+      browserLaunchCapabilityHash: incomingHash,
+      browserLaunchCapabilityExpiresAt: { $gt: now },
+      browserLaunchCapabilityVersion: 1,
+      browserLaunchCapabilityScope: 'call_browser_launch_v1',
+      browserLaunchCapabilityUsedAt: null,
+    },
+    {
+      $set: {
+        browserLaunchCapabilityUsedAt: now,
+        browserLaunchIdempotencyHash: idempotencyHash,
+        browserCapabilityHash,
+        browserCapabilityExpiresAt: new Date(now.getTime() + getCallSessionTtlMs()),
+        browserCapabilityVersion: 1,
+        browserCapabilityScope: 'call_browser_v1',
+      },
+    },
+    { new: true },
+  )
+    .select(
+      '+browserLaunchCapabilityHash +browserLaunchCapabilityExpiresAt +browserLaunchCapabilityVersion +browserLaunchCapabilityScope +browserLaunchCapabilityUsedAt +browserLaunchIdempotencyHash',
+    )
+    .lean();
+  if (!session) {
+    session = await ViventiumCallSession.findOne({
+      callSessionId: normalizedCallSessionId,
+      callStatus: { $ne: 'ended' },
+      expiresAt: { $gt: now },
+      browserLaunchCapabilityHash: incomingHash,
+      browserLaunchCapabilityExpiresAt: { $gt: now },
+      browserLaunchCapabilityVersion: 1,
+      browserLaunchCapabilityScope: 'call_browser_launch_v1',
+      browserLaunchCapabilityUsedAt: { $ne: null },
+      browserLaunchIdempotencyHash: idempotencyHash,
+      browserCapabilityHash,
+      browserCapabilityExpiresAt: { $gt: now },
+    })
+      .select(
+        '+browserLaunchCapabilityHash +browserLaunchCapabilityExpiresAt +browserLaunchCapabilityVersion +browserLaunchCapabilityScope +browserLaunchCapabilityUsedAt +browserLaunchIdempotencyHash',
+      )
+      .lean();
+  }
+  if (!session) {
+    const error = new Error('Call launch capability expired or was already used');
+    error.status = 410;
+    throw error;
+  }
+  return {
+    ...normalizeSession(session),
+    browserCapability,
+  };
+}
+
 async function syncCallSessionState({
   callSessionId,
   touch = true,
+  nowMs,
+  status,
+  mode,
   wingModeEnabled,
   shadowModeEnabled,
   listenOnlyModeEnabled,
@@ -531,10 +811,25 @@ async function syncCallSessionState({
     throw new Error('syncCallSessionState requires callSessionId');
   }
 
-  const now = new Date();
+  const now = Number.isFinite(Number(nowMs)) ? new Date(Number(nowMs)) : new Date();
   const set = {};
   if (touch !== false) {
     set.expiresAt = new Date(now.getTime() + getCallSessionTtlMs());
+    set.browserCapabilityExpiresAt = set.expiresAt;
+  }
+  if (CALL_STATUSES.has(status)) {
+    set.callStatus = status;
+  }
+  if (status === 'ended') {
+    set.expiresAt = new Date(now.getTime() + POST_CALL_MEMORY_EVIDENCE_TTL_MS);
+    set.browserCapabilityExpiresAt = now;
+  }
+
+  if (CALL_MODES.has(mode)) {
+    set.mode = mode;
+    set.wingModeEnabled = mode === 'wing';
+    set.shadowModeEnabled = mode === 'wing';
+    set.listenOnlyModeEnabled = mode === 'listen_only';
   }
 
   const normalizedWingMode =
@@ -543,32 +838,124 @@ async function syncCallSessionState({
       : typeof shadowModeEnabled === 'boolean'
         ? shadowModeEnabled
         : null;
-  if (typeof normalizedWingMode === 'boolean') {
+  if (!CALL_MODES.has(mode) && typeof normalizedWingMode === 'boolean') {
     set.wingModeEnabled = normalizedWingMode;
     set.shadowModeEnabled = normalizedWingMode;
+    set.mode = normalizedWingMode ? 'wing' : 'call';
     if (normalizedWingMode) {
       set.listenOnlyModeEnabled = false;
     }
   }
 
-  if (typeof listenOnlyModeEnabled === 'boolean') {
+  if (!CALL_MODES.has(mode) && typeof listenOnlyModeEnabled === 'boolean') {
     set.listenOnlyModeEnabled = listenOnlyModeEnabled;
+    set.mode = listenOnlyModeEnabled ? 'listen_only' : 'call';
     if (listenOnlyModeEnabled) {
       set.wingModeEnabled = false;
       set.shadowModeEnabled = false;
     }
   }
 
+  const modeChanged =
+    CALL_MODES.has(mode) ||
+    typeof normalizedWingMode === 'boolean' ||
+    typeof listenOnlyModeEnabled === 'boolean';
+  const update = {
+    $set: set,
+    ...(modeChanged ? { $inc: { callModeRevision: 1 } } : {}),
+  };
   const session = await ViventiumCallSession.findOneAndUpdate(
     {
       callSessionId: String(callSessionId),
       expiresAt: { $gt: now },
+      callStatus: { $ne: 'ended' },
     },
-    { $set: set },
+    update,
     { new: true },
   ).lean();
+  if (session) {
+    if (status === 'ended' && session.expiresAt) {
+      await ViventiumVoiceSpeakerSegment.updateMany(
+        { callSessionId: String(callSessionId) },
+        { $set: { expiresAt: new Date(session.expiresAt) } },
+      );
+    } else if (touch !== false && session.expiresAt) {
+      const renewalThreshold = new Date(now.getTime() + Math.floor(getCallSessionTtlMs() / 2));
+      await ViventiumVoiceSpeakerSegment.updateMany(
+        {
+          callSessionId: String(callSessionId),
+          expiresAt: { $lt: renewalThreshold },
+        },
+        { $set: { expiresAt: new Date(session.expiresAt) } },
+      );
+    }
+    return normalizeSession(session);
+  }
+  // `ended` is terminal. A delayed keepalive, mode switch, or status packet may observe the
+  // terminal record but can never extend or reopen it.
+  const terminal = await ViventiumCallSession.findOne({
+    callSessionId: String(callSessionId),
+    expiresAt: { $gt: now },
+    callStatus: 'ended',
+  }).lean();
+  return normalizeSession(terminal);
+}
 
-  return normalizeSession(session);
+/* === VIVENTIUM START ===
+ * Feature: extended-call low-write heartbeat
+ * Purpose: Renew a silent call and its speaker ledger only inside the final half of the TTL,
+ * avoiding a database write on every gateway mode poll while keeping ended terminal.
+ * === VIVENTIUM END === */
+async function heartbeatCallSession({ callSessionId, currentSession, nowMs } = {}) {
+  if (!callSessionId) {
+    throw new Error('heartbeatCallSession requires callSessionId');
+  }
+  const now = Number.isFinite(Number(nowMs)) ? new Date(Number(nowMs)) : new Date();
+  const ttlMs = getCallSessionTtlMs();
+  let current = currentSession?.callSessionId === String(callSessionId) ? currentSession : null;
+  if (!current) {
+    const row = await ViventiumCallSession.findOne({
+      callSessionId: String(callSessionId),
+      expiresAt: { $gt: now },
+    }).lean();
+    current = normalizeSession(row);
+  }
+  if (!current || current.status === 'ended') {
+    return current;
+  }
+  const expiresAtMs = Number(current.expiresAtMs) || 0;
+  if (expiresAtMs <= now.getTime()) {
+    return null;
+  }
+  const renewalThreshold = new Date(now.getTime() + Math.floor(ttlMs / 2));
+  if (expiresAtMs >= renewalThreshold.getTime()) {
+    return current;
+  }
+  const expiresAt = new Date(now.getTime() + ttlMs);
+  const renewed = await ViventiumCallSession.findOneAndUpdate(
+    {
+      callSessionId: String(callSessionId),
+      expiresAt: { $gt: now, $lt: renewalThreshold },
+      callStatus: { $ne: 'ended' },
+    },
+    { $set: { expiresAt, browserCapabilityExpiresAt: expiresAt } },
+    { new: true },
+  ).lean();
+  if (renewed) {
+    await ViventiumVoiceSpeakerSegment.updateMany(
+      {
+        callSessionId: String(callSessionId),
+        expiresAt: { $lt: renewalThreshold },
+      },
+      { $set: { expiresAt } },
+    );
+    return normalizeSession(renewed);
+  }
+  const latest = await ViventiumCallSession.findOne({
+    callSessionId: String(callSessionId),
+    expiresAt: { $gt: now },
+  }).lean();
+  return normalizeSession(latest);
 }
 
 async function getCallSessionVoiceSettings(
@@ -615,6 +1002,7 @@ async function updateCallSessionVoiceSettings({
   const set = {};
   if (touch !== false) {
     set.expiresAt = new Date(now.getTime() + getCallSessionTtlMs());
+    set.browserCapabilityExpiresAt = set.expiresAt;
   }
   if (Object.prototype.hasOwnProperty.call(arguments[0] ?? {}, 'requestedVoiceRoute')) {
     set.requestedVoiceRoute = compactVoiceRouteState(requestedVoiceRoute);
@@ -662,38 +1050,168 @@ async function updateCallSessionVoiceSettings({
   };
 }
 
-async function claimVoiceSession({ callSessionId, jobId, workerId, leaseDurationMs }) {
+async function claimVoiceSession({
+  callSessionId,
+  jobId,
+  workerId,
+  leaseDurationMs,
+  dispatchClaimId,
+}) {
   if (!callSessionId) {
     throw new Error('claimVoiceSession requires callSessionId');
   }
   if (!jobId) {
     throw new Error('claimVoiceSession requires jobId');
   }
+  if (!workerId) {
+    throw new Error('claimVoiceSession requires workerId');
+  }
 
   const now = new Date();
   const leaseMs = Number(leaseDurationMs) || getCallSessionLeaseMs();
   const leaseExpiresAt = new Date(now.getTime() + leaseMs);
 
+  const normalizedDispatchClaimId = String(dispatchClaimId || '').trim();
+  const filter = {
+    callSessionId: String(callSessionId),
+    expiresAt: { $gt: now },
+    callStatus: { $ne: 'ended' },
+    $or: [{ activeJobId: String(jobId) }, { activeJobId: null }, { leaseExpiresAt: { $lt: now } }],
+  };
+  if (normalizedDispatchClaimId) {
+    filter.dispatchClaimId = normalizedDispatchClaimId;
+  }
+  const update = {
+    $set: {
+      activeJobId: String(jobId),
+      activeWorkerId: String(workerId),
+      leaseExpiresAt,
+    },
+  };
+  if (normalizedDispatchClaimId) {
+    update.$unset = { dispatchClaimId: '', dispatchClaimedAt: '' };
+  }
+
+  const session = await ViventiumCallSession.findOneAndUpdate(filter, update, {
+    new: true,
+  }).lean();
+
+  return normalizeSession(session);
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Voice gateway failed-start lease release
+ * Purpose: Let the exact worker that owns a pre-connect claim abandon it after owner timeout,
+ * mismatch, or initialization failure. The compare-and-clear cannot release another worker and
+ * never changes call status, conversation work, dispatch state, or task state.
+ * === VIVENTIUM END === */
+async function abandonVoiceSessionClaim({ callSessionId, jobId, workerId }) {
+  if (!callSessionId || !jobId || !workerId) {
+    return false;
+  }
+  const now = new Date();
+  const released = await ViventiumCallSession.findOneAndUpdate(
+    {
+      callSessionId: String(callSessionId),
+      expiresAt: { $gt: now },
+      activeJobId: String(jobId),
+      activeWorkerId: String(workerId),
+    },
+    {
+      $set: {
+        activeJobId: null,
+        activeWorkerId: null,
+        leaseExpiresAt: null,
+      },
+    },
+    { new: false },
+  ).lean();
+  return Boolean(released);
+}
+
+/* === VIVENTIUM START ===
+ * Feature: exact-owner voice provider failure reporting
+ * Purpose: Convert provider/runtime construction failures into bounded call state without
+ * persisting arbitrary SDK messages. Only the currently claimed job+worker may mutate it.
+ * === VIVENTIUM END === */
+async function reportVoiceSessionFailure({
+  callSessionId,
+  jobId,
+  workerId,
+  classification,
+  modality,
+  provider,
+  phase,
+  fatal = true,
+}) {
+  if (!callSessionId || !jobId || !workerId || !CALL_FAILURE_CODES.has(classification)) {
+    return null;
+  }
+  const normalizedModality = ['stt', 'tts'].includes(modality) ? modality : null;
+  const normalizedPhase = ['initialization', 'runtime'].includes(phase) ? phase : null;
+  const messages = {
+    no_route: 'The configured voice route is unavailable.',
+    provider_failure:
+      normalizedPhase === 'runtime'
+        ? 'The voice provider stopped unexpectedly.'
+        : 'The voice provider could not start.',
+    gateway_down: 'The voice gateway is unavailable.',
+  };
+  const callFailure = {
+    code: classification,
+    message: messages[classification],
+    retryable: classification !== 'no_route',
+    modality: normalizedModality,
+    provider: normalizeVoiceRouteText(provider, MAX_PROVIDER_LENGTH),
+    phase: normalizedPhase,
+    fatal: fatal === true,
+    reportedAt: new Date(),
+  };
+  const session = await ViventiumCallSession.findOneAndUpdate(
+    {
+      callSessionId: String(callSessionId),
+      expiresAt: { $gt: callFailure.reportedAt },
+      callStatus: { $ne: 'ended' },
+      activeJobId: String(jobId),
+      activeWorkerId: String(workerId),
+    },
+    {
+      $set: {
+        callStatus: fatal === true ? 'failed' : 'degraded',
+        callFailure,
+      },
+      $inc: { callModeRevision: 1 },
+    },
+    { new: true },
+  ).lean();
+  return normalizeSession(session);
+}
+
+/* === VIVENTIUM START ===
+ * Feature: exact-owner provider recovery readiness
+ * Purpose: A retryable provider failure remains visible across abandon/reclaim until the newly
+ * claimed gateway has proved session/provider readiness. Generic state writes cannot clear it.
+ * === VIVENTIUM END === */
+async function markVoiceSessionReady({ callSessionId, jobId, workerId }) {
+  if (!callSessionId || !jobId || !workerId) {
+    return null;
+  }
+  const now = new Date();
   const session = await ViventiumCallSession.findOneAndUpdate(
     {
       callSessionId: String(callSessionId),
       expiresAt: { $gt: now },
-      $or: [
-        { activeJobId: String(jobId) },
-        { activeJobId: null },
-        { leaseExpiresAt: { $lt: now } },
-      ],
+      callStatus: { $ne: 'ended' },
+      activeJobId: String(jobId),
+      activeWorkerId: String(workerId),
     },
     {
-      $set: {
-        activeJobId: String(jobId),
-        activeWorkerId: workerId ? String(workerId) : null,
-        leaseExpiresAt,
-      },
+      $set: { callStatus: 'listening' },
+      $unset: { callFailure: 1 },
+      $inc: { callModeRevision: 1 },
     },
     { new: true },
   ).lean();
-
   return normalizeSession(session);
 }
 
@@ -810,7 +1328,53 @@ async function assertCallSessionSecret(callSessionId, secret) {
   return session;
 }
 
-async function assertVoiceGatewayAuth(req) {
+/* === VIVENTIUM START ===
+ * Feature: browser-scoped call capability
+ * Purpose: Require both the trusted BFF secret and the exact per-session browser capability on
+ * browser-facing state/snapshot/control calls. Ended or expired capability is terminal (410).
+ * === VIVENTIUM END === */
+async function assertCallBrowserCapability(callSessionId, capability) {
+  const incomingHash = hashBrowserCallCapability(capability);
+  if (!callSessionId || !incomingHash) {
+    const error = new Error('Invalid call browser capability');
+    error.status = 401;
+    throw error;
+  }
+  const now = new Date();
+  const session = await ViventiumCallSession.findOne({
+    callSessionId: String(callSessionId),
+  })
+    .select(
+      '+browserCapabilityHash +browserCapabilityExpiresAt +browserCapabilityVersion +browserCapabilityScope',
+    )
+    .lean();
+  if (
+    !session ||
+    session.callStatus === 'ended' ||
+    !session.expiresAt ||
+    new Date(session.expiresAt) <= now ||
+    !session.browserCapabilityExpiresAt ||
+    new Date(session.browserCapabilityExpiresAt) <= now ||
+    session.browserCapabilityVersion !== 1 ||
+    session.browserCapabilityScope !== 'call_browser_v1'
+  ) {
+    const error = new Error('Call browser capability expired');
+    error.status = 410;
+    throw error;
+  }
+  const expectedHash = String(session.browserCapabilityHash || '');
+  if (
+    expectedHash.length !== incomingHash.length ||
+    !crypto.timingSafeEqual(Buffer.from(expectedHash), Buffer.from(incomingHash))
+  ) {
+    const error = new Error('Invalid call browser capability');
+    error.status = 401;
+    throw error;
+  }
+  return normalizeSession(session);
+}
+
+async function assertVoiceGatewayAuth(req, { nowMs } = {}) {
   const callSessionId =
     req.get('X-VIVENTIUM-CALL-SESSION') || req.get('x-viventium-call-session') || '';
   const secret = req.get('X-VIVENTIUM-CALL-SECRET') || req.get('x-viventium-call-secret') || '';
@@ -831,6 +1395,11 @@ async function assertVoiceGatewayAuth(req) {
     err.status = 401;
     throw err;
   }
+  if (!workerId) {
+    const err = new Error('Missing voice worker id');
+    err.status = 401;
+    throw err;
+  }
 
   /* === VIVENTIUM START ===
    * Feature: Voice hot-path auth compression.
@@ -838,23 +1407,41 @@ async function assertVoiceGatewayAuth(req) {
    * DB query on the successful path. The previous flow performed getCallSession() and
    * then claimVoiceSession(), adding an avoidable round trip before stream readiness.
    * === VIVENTIUM END === */
-  const now = new Date();
+  const now = Number.isFinite(Number(nowMs)) ? new Date(Number(nowMs)) : new Date();
   const leaseMs = getCallSessionLeaseMs();
   const leaseExpiresAt = new Date(now.getTime() + leaseMs);
+  const normalizedJobId = String(jobId);
+  const normalizedWorkerId = String(workerId);
+  const leaseRenewalThreshold = new Date(now.getTime() + Math.floor(leaseMs / 2));
+  const existingOwner = await ViventiumCallSession.findOne({
+    callSessionId: String(callSessionId),
+    expiresAt: { $gt: now },
+    callStatus: { $ne: 'ended' },
+    activeJobId: normalizedJobId,
+    activeWorkerId: normalizedWorkerId,
+    leaseExpiresAt: { $gt: leaseRenewalThreshold },
+  }).lean();
+  if (existingOwner) {
+    return normalizeSession(existingOwner);
+  }
   const claimed = await ViventiumCallSession.findOneAndUpdate(
     {
       callSessionId: String(callSessionId),
       expiresAt: { $gt: now },
+      callStatus: { $ne: 'ended' },
       $or: [
-        { activeJobId: String(jobId) },
+        {
+          activeJobId: normalizedJobId,
+          $or: [{ activeWorkerId: normalizedWorkerId }, { activeWorkerId: null }],
+        },
         { activeJobId: null },
         { leaseExpiresAt: { $lt: now } },
       ],
     },
     {
       $set: {
-        activeJobId: String(jobId),
-        activeWorkerId: workerId ? String(workerId) : null,
+        activeJobId: normalizedJobId,
+        activeWorkerId: normalizedWorkerId,
         leaseExpiresAt,
       },
     },
@@ -871,10 +1458,15 @@ async function assertVoiceGatewayAuth(req) {
     err.status = 401;
     throw err;
   }
-  const nowMs = Date.now();
+  if (session.status === 'ended') {
+    const err = new Error('Call session has ended');
+    err.status = 410;
+    throw err;
+  }
+  const currentTimeMs = now.getTime();
   if (session.activeJobId && session.activeJobId !== jobId) {
     const leaseExpiresAtMs = session.leaseExpiresAtMs || 0;
-    if (leaseExpiresAtMs > nowMs) {
+    if (leaseExpiresAtMs > currentTimeMs) {
       const err = new Error('Another worker owns this session');
       err.status = 403;
       throw err;
@@ -900,6 +1492,7 @@ async function claimDispatch({ callSessionId, roomName, agentName, reclaimConfir
   const session = await ViventiumCallSession.findOne({
     callSessionId: String(callSessionId),
     expiresAt: { $gt: now },
+    callStatus: { $ne: 'ended' },
   }).lean();
   if (!session) {
     return { status: 'expired', session: null };
@@ -907,6 +1500,11 @@ async function claimDispatch({ callSessionId, roomName, agentName, reclaimConfir
 
   if (session.roomName && session.roomName !== roomName) {
     const err = new Error('Room name mismatch for call session');
+    err.status = 409;
+    throw err;
+  }
+  if (session.gatewayAgentName && session.gatewayAgentName !== agentName) {
+    const err = new Error('Gateway agent name mismatch for call session');
     err.status = 409;
     throw err;
   }
@@ -919,6 +1517,14 @@ async function claimDispatch({ callSessionId, roomName, agentName, reclaimConfir
     return { status: 'already', session: normalizeSession(session) };
   }
 
+  const hasHealthyActiveWorker =
+    Boolean(session.activeJobId) &&
+    session.leaseExpiresAt instanceof Date &&
+    session.leaseExpiresAt.getTime() > now.getTime();
+  if (session.dispatchConfirmedAt && reclaimConfirmed === true && hasHealthyActiveWorker) {
+    return { status: 'already', session: normalizeSession(session) };
+  }
+
   const claimId = crypto.randomUUID();
   const claimCutoff = new Date(now.getTime() - getDispatchClaimTtlMs());
   const dispatchConfirmationCondition =
@@ -927,26 +1533,41 @@ async function claimDispatch({ callSessionId, roomName, agentName, reclaimConfir
       : { $or: [{ dispatchConfirmedAt: { $exists: false } }, { dispatchConfirmedAt: null }] };
   // Reclaims are guarded by dispatchConfirmedAt itself. The first winner unsets that field in the
   // same atomic update, so concurrent reclaims no longer match and report in_flight.
-  const dispatchClaimAvailabilityCondition =
+  const dispatchClaimAvailabilityCondition = {
+    $or: [
+      { dispatchClaimedAt: { $exists: false } },
+      { dispatchClaimedAt: null },
+      { dispatchClaimedAt: { $lt: claimCutoff } },
+    ],
+  };
+  const activeWorkerAvailabilityCondition =
     reclaimConfirmed === true
-      ? {}
-      : {
+      ? {
           $or: [
-            { dispatchClaimedAt: { $exists: false } },
-            { dispatchClaimedAt: null },
-            { dispatchClaimedAt: { $lt: claimCutoff } },
+            { activeJobId: { $exists: false } },
+            { activeJobId: null },
+            { leaseExpiresAt: { $exists: false } },
+            { leaseExpiresAt: null },
+            { leaseExpiresAt: { $lt: now } },
           ],
-        };
+        }
+      : {};
 
   const claimed = await ViventiumCallSession.findOneAndUpdate(
     {
       callSessionId: String(callSessionId),
       expiresAt: { $gt: now },
-      $and: [dispatchConfirmationCondition, dispatchClaimAvailabilityCondition],
+      callStatus: { $ne: 'ended' },
+      $and: [
+        dispatchConfirmationCondition,
+        dispatchClaimAvailabilityCondition,
+        activeWorkerAvailabilityCondition,
+      ],
     },
     {
       $set: {
         dispatchClaimId: claimId,
+        dispatchAttemptId: claimId,
         dispatchClaimedAt: now,
         dispatchRoomName: roomName,
         dispatchAgentName: agentName,
@@ -961,7 +1582,23 @@ async function claimDispatch({ callSessionId, roomName, agentName, reclaimConfir
   ).lean();
 
   if (!claimed) {
-    return { status: 'in_flight', session: normalizeSession(session) };
+    const current = await ViventiumCallSession.findOne({
+      callSessionId: String(callSessionId),
+      expiresAt: { $gt: now },
+      callStatus: { $ne: 'ended' },
+    }).lean();
+    const currentHasHealthyActiveWorker =
+      Boolean(current?.activeJobId) &&
+      current?.leaseExpiresAt instanceof Date &&
+      current.leaseExpiresAt.getTime() > now.getTime();
+    if (
+      reclaimConfirmed === true &&
+      current?.dispatchConfirmedAt &&
+      currentHasHealthyActiveWorker
+    ) {
+      return { status: 'already', session: normalizeSession(current) };
+    }
+    return { status: 'in_flight', session: normalizeSession(current || session) };
   }
 
   return {
@@ -994,21 +1631,22 @@ async function confirmDispatch({ callSessionId, claimId, success, error }) {
   const update = success
     ? {
         $set: { dispatchConfirmedAt: now },
-        $unset: { dispatchClaimId: '', dispatchClaimedAt: '' },
+        $unset: { dispatchAttemptId: '' },
       }
     : {
         $set: {
           dispatchLastError: normalizeDispatchError(error) || 'dispatch failed',
           dispatchLastErrorAt: now,
         },
-        $unset: { dispatchClaimId: '', dispatchClaimedAt: '' },
+        $unset: { dispatchClaimId: '', dispatchAttemptId: '', dispatchClaimedAt: '' },
       };
 
   const session = await ViventiumCallSession.findOneAndUpdate(
     {
       callSessionId: String(callSessionId),
-      dispatchClaimId: String(claimId),
+      dispatchAttemptId: String(claimId),
       expiresAt: { $gt: now },
+      callStatus: { $ne: 'ended' },
     },
     update,
     { new: true },
@@ -1017,13 +1655,55 @@ async function confirmDispatch({ callSessionId, claimId, success, error }) {
   return normalizeSession(session);
 }
 
+async function getDispatchStatus({ callSessionId, claimId }) {
+  if (!callSessionId) {
+    throw new Error('getDispatchStatus requires callSessionId');
+  }
+  if (!claimId) {
+    throw new Error('getDispatchStatus requires claimId');
+  }
+
+  const now = new Date();
+  const session = await ViventiumCallSession.findOne({
+    callSessionId: String(callSessionId),
+    expiresAt: { $gt: now },
+    callStatus: { $ne: 'ended' },
+  }).lean();
+  if (!session) {
+    return { version: 1, status: 'expired', isWorkerClaimed: false };
+  }
+
+  if (String(session.dispatchAttemptId || '') !== String(claimId)) {
+    return { version: 1, status: 'superseded', isWorkerClaimed: false };
+  }
+
+  const isWorkerClaimed =
+    !session.dispatchClaimId &&
+    Boolean(session.activeJobId) &&
+    Boolean(session.activeWorkerId) &&
+    session.leaseExpiresAt instanceof Date &&
+    session.leaseExpiresAt.getTime() > now.getTime();
+  return {
+    version: 1,
+    status: isWorkerClaimed ? 'claimed' : 'waiting',
+    isWorkerClaimed,
+  };
+}
+
 module.exports = {
+  abandonVoiceSessionClaim,
   compactVoiceRouteState,
   createCallSession,
+  createCallBrowserLaunch,
+  exchangeCallBrowserLaunch,
   getCallSession,
   getCallSessionVoiceSettings,
+  heartbeatCallSession,
+  markVoiceSessionReady,
+  reportVoiceSessionFailure,
   getUserSavedVoiceRoute,
   normalizeVoiceRouteState,
+  resolveCallMode,
   resolveUserVoiceRoute,
   syncCallSessionState,
   updateCallSessionVoiceSettings,
@@ -1032,9 +1712,11 @@ module.exports = {
   updateCallSessionConversationId,
   claimVoiceSession,
   assertCallSessionSecret,
+  assertCallBrowserCapability,
   assertVoiceGatewayAuth,
   claimDispatch,
   confirmDispatch,
+  getDispatchStatus,
 };
 
 /* === VIVENTIUM NOTE === */

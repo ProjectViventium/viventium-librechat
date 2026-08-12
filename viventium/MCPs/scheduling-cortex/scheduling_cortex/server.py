@@ -56,6 +56,43 @@ HEADER_AGENT_ID = "x-viventium-agent-id"
 logger = logging.getLogger(__name__)
 
 
+def _glasshive_callback_lifecycle(
+    run: dict[str, Any], event: str, payload: dict[str, Any], now: str
+) -> tuple[str, str, Optional[str], Optional[str]]:
+    """Apply monotonic callback state so late transport events cannot reopen terminal work."""
+
+    current_status = str(run.get("status") or "queued")
+    current_disposition = str(run.get("disposition") or "running")
+    if current_status in {"completed", "failed"}:
+        return current_status, current_disposition, run.get("completed_at"), run.get("error_class")
+    if event == "run.completed":
+        return "completed", "delivered", now, None
+    if event in {"run.failed", "run.cancelled", "run.interrupted"}:
+        callback_failure_class = str(
+            payload.get("failure_class") or payload.get("failure_code") or ""
+        ).strip()
+        error_class = (
+            callback_failure_class
+            if re.fullmatch(r"[a-z0-9_.:-]{1,128}", callback_failure_class)
+            else event.replace("run.", "")
+        )
+        disposition = "failed" if event == "run.failed" else "cancelled"
+        return "failed", disposition, now, error_class
+    if event == "run.queued":
+        status = current_status if current_status in {"running", "completed", "failed"} else "queued"
+        return (
+            status,
+            current_disposition if status in {"completed", "failed"} else "running",
+            run.get("completed_at"),
+            run.get("error_class") if status != "queued" else None,
+        )
+    if event == "run.waiting_on_capacity":
+        return "queued", "running", None, None
+    if event in {"run.started", "run.requeued"}:
+        return "running", "running", run.get("completed_at"), None
+    return current_status, current_disposition, run.get("completed_at"), run.get("error_class")
+
+
 def _metadata_with_required_capability_servers(
     metadata: Any,
     required_capability_servers: list[str] | None,
@@ -261,9 +298,35 @@ def _serialize_periphery_list_for_agent(payload: Dict[str, Any]) -> Dict[str, An
     current = latest_per_module(current_only=True, limit=5)
     historical = latest_per_module(current_only=False, limit=3)
     index = payload.get("index") if isinstance(payload.get("index"), dict) else {}
+    allowed_blockers = {
+        "outside_periphery_root",
+        "private_permissions_unavailable",
+        "unsafe_hard_link",
+        "unsafe_symlink",
+    }
+    blocked_reasons = [
+        str(reason)
+        for reason in index.get("blockedReasons", [])
+        if str(reason) in allowed_blockers
+    ]
+    status = str(index.get("status") or "").strip().lower()
+    if status not in {"available", "degraded", "blocked"}:
+        status = "degraded" if blocked_reasons and artifacts else "blocked" if blocked_reasons else "available"
+    reason_guidance = {
+        "outside_periphery_root": "An insight outside the private Periphery boundary was withheld.",
+        "private_permissions_unavailable": "Private insight permissions could not be verified; check ownership and filesystem support.",
+        "unsafe_hard_link": "A linked insight was withheld because its private storage boundary cannot be proven; restore it as a normal private file.",
+        "unsafe_symlink": "A linked insight path was withheld because it could leave the private Periphery boundary.",
+    }
     return {
         "currentInsights": current,
         "historicalInsights": historical,
+        "availability": {
+            "status": status,
+            "reasons": blocked_reasons,
+            "blockedCount": index.get("blockedArtifactCount", len(blocked_reasons)),
+            "guidance": [reason_guidance[reason] for reason in blocked_reasons],
+        },
         "totals": {
             "insights": index.get("artifactCount", len(artifacts)),
             "invalid": index.get("invalidArtifactCount", 0),
@@ -271,7 +334,9 @@ def _serialize_periphery_list_for_agent(payload: Dict[str, Any]) -> Dict[str, An
         },
         "usage": (
             "Prefer the newest current insight. Read historical insight only when explicitly useful, "
-            "and describe stale or legacy material as historical uncertainty."
+            "and describe stale or legacy material as historical uncertainty. If availability is degraded, "
+            "use the available insights and disclose that some private artifacts were withheld. If it is blocked, "
+            "report that private insight access is unavailable instead of claiming no insights exist."
         ),
     }
 
@@ -746,38 +811,10 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             return JSONResponse({"status": "error", "reason": "unknown_run"}, status_code=404)
 
         now = _now_iso()
-        if event == "run.completed":
-            status = "completed"
-            completed_at = now
-            error_class = None
-        elif event in {"run.failed", "run.cancelled", "run.interrupted"}:
-            status = "failed"
-            completed_at = now
-            callback_failure_class = str(
-                payload.get("failure_class") or payload.get("failure_code") or ""
-            ).strip()
-            error_class = (
-                callback_failure_class
-                if re.fullmatch(r"[a-z0-9_.:-]{1,128}", callback_failure_class)
-                else event.replace("run.", "")
-            )
-        elif event == "run.queued":
-            current_status = str(run.get("status") or "queued")
-            status = current_status if current_status in {"running", "completed", "failed"} else "queued"
-            completed_at = run.get("completed_at")
-            error_class = run.get("error_class") if status != "queued" else None
-        elif event in {"run.waiting_on_capacity", "run.requeued"}:
-            status = "queued"
-            completed_at = run.get("completed_at")
-            error_class = None
-        elif event == "run.started":
-            status = "running"
-            completed_at = run.get("completed_at")
-            error_class = run.get("error_class")
-        else:
-            status = str(run.get("status") or "queued")
-            completed_at = run.get("completed_at")
-            error_class = run.get("error_class")
+        terminal_before_callback = str(run.get("status") or "") in {"completed", "failed"}
+        status, disposition, completed_at, error_class = _glasshive_callback_lifecycle(
+            run, event, payload, now
+        )
 
         private_detail = _append_private_callback(run, payload, now)
         # GlassHive now mints and revokes capability grants inside the execution boundary. Scheduling
@@ -815,27 +852,29 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             else None,
         }
 
-        storage.update_scheduled_prompt_run(
-            str(run["run_id"]),
-            {
-                "status": status,
-                "completed_at": completed_at,
-                "result_summary": result_summary or run.get("result_summary"),
-                "error_class": error_class,
-                "callback_payload_json": json.dumps(callback_summary),
-                "updated_at": now,
-            },
-        )
-        _update_parent_task_for_glasshive_callback(
-            run,
-            status=status,
-            result_summary=result_summary or str(run.get("result_summary") or ""),
-            error_class=error_class,
-            payload=payload,
-            received_at=now,
-        )
-        if event == "run.completed":
-            _refresh_workbench_periphery_index(run)
+        if not terminal_before_callback:
+            storage.update_scheduled_prompt_run(
+                str(run["run_id"]),
+                {
+                    "status": status,
+                    "disposition": disposition,
+                    "completed_at": completed_at,
+                    "result_summary": result_summary or run.get("result_summary"),
+                    "error_class": error_class,
+                    "callback_payload_json": json.dumps(callback_summary),
+                    "updated_at": now,
+                },
+            )
+            _update_parent_task_for_glasshive_callback(
+                run,
+                status=status,
+                result_summary=result_summary or str(run.get("result_summary") or ""),
+                error_class=error_class,
+                payload=payload,
+                received_at=now,
+            )
+            if event == "run.completed":
+                _refresh_workbench_periphery_index(run)
         return JSONResponse({"status": "ok", "run_id": run["run_id"]})
     # === VIVENTIUM END ===
 
@@ -1060,7 +1099,9 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
                 "The request is immediate, or a matching existing schedule should be updated instead."
             ),
             inputs=(
-                "prompt, schedule, optional channel, conversation_policy, active, metadata; "
+                "prompt, schedule, optional channel, conversation_policy, active, metadata. "
+                "schedule.type is required; for one-time work use "
+                "{'type': 'once', 'run_at': '<ISO datetime>', 'timezone': '<IANA timezone>'}. "
                 "user_id, agent_id, and created_by are auto-injected when omitted."
             ),
             returns="success, full task object, and creation message.",

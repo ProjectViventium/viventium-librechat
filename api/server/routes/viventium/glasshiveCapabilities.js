@@ -10,6 +10,7 @@
 
 const express = require('express');
 const { logger } = require('@librechat/data-schemas');
+const { getAppConfig } = require('~/server/services/Config');
 /* === VIVENTIUM START ===
  * Feature: Tenant-bound and direct user-scoped GlassHive capability authorization.
  */
@@ -34,6 +35,7 @@ const {
 const {
   verifyDirectIssuerAssertion,
 } = require('~/server/services/viventium/GlassHiveCapabilityDirectIssuerAuth');
+const { requestLifetimeSignal } = require('./GlassHiveRequestLifetimeSignal');
 /* === VIVENTIUM END === */
 
 const router = express.Router();
@@ -62,6 +64,7 @@ function rpcError(id, code, message, data) {
 async function handleRpc(req, res) {
   const body = req.body || {};
   const id = body.id ?? null;
+  const signal = requestLifetimeSignal(req, res);
   let grant;
   try {
     /* === VIVENTIUM START === Tenant-bound grants and durable revocation. === */
@@ -97,6 +100,11 @@ async function handleRpc(req, res) {
   }
 
   try {
+    const appConfig =
+      req.config ||
+      (body.method === 'tools/list' || body.method === 'tools/call'
+        ? await getAppConfig({ role: String(grant?.user_role || '').trim() || undefined })
+        : undefined);
     if (body.method === 'initialize') {
       return res.json(
         rpcResult(id, {
@@ -119,13 +127,11 @@ async function handleRpc(req, res) {
     }
     if (body.method === 'tools/list') {
       /* === VIVENTIUM START ===
-       * Feature: Durable GlassHive broker tool execution.
-       * Purpose: The host request signal is already aborted by the surrounding HTTP lifecycle
-       *   before an MCP tool may execute. Passing it downstream made every healthy provider call
-       *   fail locally. GlassHive owns explicit run cancellation; the broker owns its bounded
-       *   provider timeout, so neither operation is coupled to this completed request signal.
+       * Feature: Durable, cancellable GlassHive broker tool execution.
+       * Purpose: Use the broker-owned request-lifetime signal, which ignores normal response
+       * completion but cancels provider work when the client disconnects prematurely.
        */
-      const catalog = await buildCapabilityCatalog({ grant });
+      const catalog = await buildCapabilityCatalog({ grant, signal, appConfig });
       return res.json(rpcResult(id, { tools: toolDefinitionsForMcp(catalog) }));
     }
     if (body.method === 'tools/call') {
@@ -133,6 +139,8 @@ async function handleRpc(req, res) {
         grant,
         toolName: body.params?.name,
         args: body.params?.arguments || {},
+        signal,
+        appConfig,
       });
       /* === VIVENTIUM END === */
       // MCP requires structuredContent to be a JSON object. Some underlying tools

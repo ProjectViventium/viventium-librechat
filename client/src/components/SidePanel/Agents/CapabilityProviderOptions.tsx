@@ -252,7 +252,8 @@ export default function CapabilityProviderOptions({
           ? localize('com_ui_glasshive_full_access_warning')
           : localize('com_ui_glasshive_workspace_access_description')}
       </p>
-      {providerCapability?.native_tools === true && (
+      {(providerCapability?.worker_native_tools === true ||
+        providerCapability?.native_tools === true) && (
         <p className="text-token-text-secondary mt-3 text-xs">
           {localize('com_ui_glasshive_native_tools_description')}
         </p>

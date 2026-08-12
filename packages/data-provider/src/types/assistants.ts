@@ -172,11 +172,15 @@ export type File = {
  * Configuration for LLM-based activation detection.
  * Each cortex attached to a main agent has its own activation config.
  */
+export type BackgroundCortexActivationMode = 'classified' | 'always' | 'disabled';
+
 export interface ActivationConfig {
   /** Whether activation detection is enabled */
   enabled: boolean;
+  /** Classified by default; always and disabled do not need classifier configuration. */
+  mode?: BackgroundCortexActivationMode;
   /** Model to use for activation detection (e.g., "gpt-4o-mini") */
-  model: string;
+  model?: string;
   /** Provider for the activation model (e.g., "openai") */
   provider: string;
   /** Ordered recovery routes for activation detection */
@@ -184,15 +188,15 @@ export interface ActivationConfig {
   /** Whether an exhausted detector route should be surfaced to the user */
   activation_failure_visibility?: 'silent' | 'visible';
   /** System prompt for making activation decisions */
-  prompt: string;
+  prompt?: string;
   /** Optional config-defined routing scope for runtime helper context */
   intent_scope?: string;
   /** Minimum confidence threshold (0.0-1.0) to trigger activation */
-  confidence_threshold: number;
+  confidence_threshold?: number;
   /** Minimum time between activations in milliseconds */
-  cooldown_ms: number;
+  cooldown_ms?: number;
   /** Number of recent messages to include in activation context */
-  max_history: number;
+  max_history?: number;
 }
 
 /**

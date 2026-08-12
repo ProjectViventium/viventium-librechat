@@ -281,7 +281,7 @@ describe('loadCustomConfig', () => {
     await loadCustomConfig();
   });
 
-  it('should log the loaded custom config', async () => {
+  it('should log only a secret-safe structural summary of the loaded custom config', async () => {
     const mockConfig = {
       version: '1.0',
       cache: true,
@@ -298,9 +298,25 @@ describe('loadCustomConfig', () => {
     process.env.CONFIG_PATH = 'validConfig.yaml';
     loadYaml.mockReturnValueOnce(mockConfig);
     await loadCustomConfig();
-    expect(logger.info).toHaveBeenCalledWith('Custom config file loaded:');
-    expect(logger.info).toHaveBeenCalledWith(JSON.stringify(mockConfig, null, 2));
-    expect(logger.debug).toHaveBeenCalledWith('Custom config:', mockConfig);
+    expect(logger.info).toHaveBeenCalledWith(
+      'Custom config file loaded (secret-safe structural summary):',
+    );
+    expect(logger.info).toHaveBeenCalledWith(
+      JSON.stringify({
+        version: '1.0',
+        cache: true,
+        topLevelKeys: ['cache', 'endpoints', 'version'],
+        customEndpointNames: ['mistral'],
+        mcpServerNames: [],
+        providerCapabilityNames: [],
+      }),
+    );
+    expect(logger.debug).toHaveBeenCalledWith(
+      'Custom config structural summary:',
+      expect.objectContaining({ customEndpointNames: ['mistral'] }),
+    );
+    expect(JSON.stringify(logger.info.mock.calls)).not.toContain('user_provided');
+    expect(JSON.stringify(logger.debug.mock.calls)).not.toContain('user_provided');
   });
 
   describe('parseCustomParams', () => {

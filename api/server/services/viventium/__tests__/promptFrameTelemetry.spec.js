@@ -14,6 +14,7 @@ const {
   FILE_LOG_ENV,
   OBSERVABILITY_DIR_ENV,
   estimatePromptTokens,
+  hashString,
   hashFile,
   redactPromptDebugText,
   countVoiceControlMarkers,
@@ -287,8 +288,38 @@ describe('promptFrameTelemetry', () => {
 
     process.env[LOG_ENV] = '1';
     expect(logPromptFrame(logger, frame)).toBe(true);
-    expect(logger.info).toHaveBeenCalledTimes(1);
+    expect(logger.info).toHaveBeenCalledTimes(2);
     expect(logger.info.mock.calls[0][0]).not.toContain('hello');
+    expect(logger.info.mock.calls[1][0]).not.toContain('hello');
+  });
+
+  test('normal logger emits a bounded public-safe route sink before the full frame', () => {
+    const logger = { info: jest.fn() };
+    process.env[LOG_ENV] = '1';
+    const frame = buildPromptFrame({
+      promptFamily: 'main_run_create',
+      surface: 'web',
+      provider: 'glasshive-harness',
+      model: 'codex-cli:synthetic-model',
+      layers: { main_instructions: 'private prompt text'.repeat(500) },
+    });
+
+    expect(logPromptFrame(logger, frame)).toBe(true);
+    expect(logger.info).toHaveBeenCalledTimes(2);
+    const routeLine = logger.info.mock.calls[0][0];
+    expect(routeLine).toMatch(/^\[PromptFrameRouteTelemetry\] /);
+    expect(routeLine.length).toBeLessThan(125);
+    expect(routeLine).not.toContain('glasshive-harness');
+    expect(routeLine).not.toContain('synthetic-model');
+    expect(routeLine).not.toContain('private prompt text');
+    const route = JSON.parse(routeLine.replace(/^\[PromptFrameRouteTelemetry\] /, ''));
+    expect(route).toEqual({
+      v: 1,
+      f: 'main_run_create',
+      p: hashString('glasshive-harness'),
+      m: hashString('codex-cli:synthetic-model'),
+    });
+    expect(logger.info.mock.calls[1][0]).toMatch(/^\[PromptFrameTelemetry\] /);
   });
 
   test('normal logger omits local debug prompt layers even when debug mode is enabled', () => {
@@ -308,8 +339,8 @@ describe('promptFrameTelemetry', () => {
 
     expect(frame.debug_redacted_layers.main_instructions).toContain('private prompt text');
     expect(logPromptFrame(logger, frame)).toBe(true);
-    expect(logger.info.mock.calls[0][0]).not.toContain('debug_redacted_layers');
-    expect(logger.info.mock.calls[0][0]).not.toContain('private prompt text');
+    expect(logger.info.mock.calls[1][0]).not.toContain('debug_redacted_layers');
+    expect(logger.info.mock.calls[1][0]).not.toContain('private prompt text');
   });
 
   test('token estimate is monotonic with prompt size', () => {

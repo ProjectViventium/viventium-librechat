@@ -90,16 +90,12 @@ const isOpenAIConnectedAccountReadError = (error: unknown): boolean => {
   );
 };
 
-const isOpenAIConnectedAccountOAuthFailure = (error: unknown): boolean => {
-  if (!(error instanceof Error)) {
-    return false;
-  }
+const isOpenAIConnectedAccountReconnectFailure = (error: unknown): boolean =>
+  error instanceof Error && error.message === OPENAI_CONNECTED_ACCOUNT_RECONNECT_MESSAGE;
 
-  return (
-    error.message === OPENAI_CONNECTED_ACCOUNT_RECONNECT_MESSAGE ||
-    error.message.startsWith(OPENAI_CONNECTED_ACCOUNT_REFRESH_FAILED_PREFIX)
-  );
-};
+const isOpenAIConnectedAccountTransientFailure = (error: unknown): boolean =>
+  error instanceof Error &&
+  error.message.startsWith(OPENAI_CONNECTED_ACCOUNT_REFRESH_FAILED_PREFIX);
 
 const isConnectedAccountAuthMode = (): boolean => {
   const values = [process.env.VIVENTIUM_OPENAI_AUTH_MODE, process.env.VIVENTIUM_PRIMARY_AUTH_MODE];
@@ -172,7 +168,7 @@ export async function initializeOpenAI({
       }
       /* === VIVENTIUM END === */
       userValues = null;
-    } else if (isOpenAIConnectedAccountOAuthFailure(error)) {
+    } else if (isOpenAIConnectedAccountReconnectFailure(error)) {
       /* === VIVENTIUM START === Personal-required credential policy === */
       if (
         personalCredentialsRequired ||
@@ -182,6 +178,11 @@ export async function initializeOpenAI({
         throw openAIConnectedAccountReconnectError();
       }
       /* === VIVENTIUM END === */
+      userValues = null;
+    } else if (isOpenAIConnectedAccountTransientFailure(error)) {
+      if (isConnectedAccountAuthMode() || !allowPlatformFallbackOnOAuthFailure(req)) {
+        throw error;
+      }
       userValues = null;
     } else {
       throw error;

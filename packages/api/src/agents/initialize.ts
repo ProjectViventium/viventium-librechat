@@ -713,11 +713,12 @@ export async function initializeAgent(
   vivInitTimings.transcript_attach_ms = Date.now() - vivTranscriptStart;
 
   /* Filter only at the load boundary: recall and meeting-resource setup above may add file_search.
-   * A provider declaring native_tools owns execution through its authenticated capability bundle;
+   * A provider declaring worker_native_tools (or the legacy native_tools alias) owns execution
+   * through its authenticated capability bundle;
    * retaining the declarations on `agent` lets that bundle remain complete while preventing a
    * second, incompatible LibreChat tool graph from being bound to the provider request. */
   const runtimeAgentTools =
-    providerCapability?.native_tools === true
+    providerCapability?.worker_native_tools === true || providerCapability?.native_tools === true
       ? []
       : (agent.tools ?? []).filter((tool) => {
           const delimiterIndex = tool.lastIndexOf(Constants.mcp_delimiter);
@@ -867,6 +868,8 @@ export async function initializeAgent(
         glasshive_options?: {
           workspace?: { mode?: 'life' | 'custom'; path?: string };
           access?: 'full' | 'workspace';
+          fallback_model?: string;
+          fallback_reasoning_effort?: string;
         };
       }
     ).glasshive_options ?? {
@@ -895,6 +898,11 @@ export async function initializeAgent(
         ? Buffer.from(workspacePath, 'utf8').toString('base64')
         : '',
       'X-GlassHive-Access': configuredOptions.access ?? providerDefaultAccess,
+      'X-GlassHive-Fallback-Model': String(configuredOptions.fallback_model ?? ''),
+      'X-GlassHive-Fallback-Reasoning-Effort': String(
+        configuredOptions.fallback_reasoning_effort ?? '',
+      ),
+      'X-GlassHive-Turn-Context-B64': '{{LIBRECHAT_BODY_VIVENTIUMGLASSHIVETURNCONTEXTB64}}',
     };
     (agent.model_parameters as Record<string, unknown>).configuration = llmConfiguration;
   }

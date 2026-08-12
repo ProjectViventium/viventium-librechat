@@ -13,6 +13,19 @@
 
 'use strict';
 
+/* === VIVENTIUM START ===
+ * Feature: Hermetic agent-sync help.
+ * Purpose: Help is a source-checkout entrypoint and must not require compiled API workspace
+ * packages. Function declarations are hoisted, so the canonical usage renderer remains singular.
+ * === VIVENTIUM END === */
+if (
+  require.main === module &&
+  process.argv.slice(2).some((arg) => arg === '--help' || arg === '-h' || arg === 'help')
+) {
+  printUsage();
+  process.exit(0);
+}
+
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
@@ -197,8 +210,10 @@ const AGENT_FIELDS = [
   'tools',
   'tool_kwargs',
   'tool_options',
+  'conversation_recall_agent_only',
   'model_parameters',
   'glasshive_options',
+  'recursion_limit',
   'end_after_tools',
   'hide_sequential_outputs',
   'support_contact',
@@ -243,7 +258,17 @@ const MODEL_CONFIG_ONLY_FIELDS = [
   'fallback_llm_provider',
   'fallback_llm_model_parameters',
 ];
-const TOOLS_ONLY_FIELDS = ['id', 'tools', 'tool_kwargs', 'tool_options'];
+const SAFE_MODEL_CONFIG_FIELD_SET = new Set(
+  MODEL_CONFIG_ONLY_FIELDS.filter((field) => field !== 'id'),
+);
+const TOOLS_ONLY_FIELDS = [
+  'id',
+  'tools',
+  'tool_kwargs',
+  'tool_options',
+  'conversation_recall_agent_only',
+];
+const GRAPH_CONFIG_ONLY_FIELDS = ['id', 'recursion_limit', 'edges'];
 const REVIEW_FIELDS = [
   'name',
   'description',
@@ -251,10 +276,12 @@ const REVIEW_FIELDS = [
   'tools',
   'tool_kwargs',
   'tool_options',
+  'conversation_recall_agent_only',
   'provider',
   'model',
   'model_parameters',
   'glasshive_options',
+  'recursion_limit',
   'voice_llm_model',
   'voice_llm_provider',
   'voice_llm_model_parameters',
@@ -266,6 +293,7 @@ const REVIEW_FIELDS = [
   'fallback_llm_model_parameters',
   'conversation_starters',
   'background_cortices',
+  'edges',
 ];
 const LIBRECHAT_REVIEW_FIELDS = [
   { path: ['interface', 'webSearch'], label: 'interface.webSearch' },
@@ -279,6 +307,7 @@ const LIBRECHAT_REVIEW_FIELDS = [
 
 const DEFAULT_PROMPTS_ONLY_ACTIVATION_FIELDS = [
   'enabled',
+  'mode',
   'prompt',
   'confidence_threshold',
   'fallbacks',
@@ -286,6 +315,7 @@ const DEFAULT_PROMPTS_ONLY_ACTIVATION_FIELDS = [
 ];
 const DEFAULT_ACTIVATION_CONFIG_FIELDS = [
   'enabled',
+  'mode',
   'prompt',
   'confidence_threshold',
   'model',
@@ -437,7 +467,9 @@ function parseArgs(argv) {
     promptsOnly: false, // Safe mode: only update prompts/instructions, not tools
     activationConfigOnly: false, // Safe mode: only update selected background cortex activation fields
     modelConfigOnly: false, // Safe mode: only update agent model/provider fields
+    modelConfigFields: null, // Optional narrower allowlist within model-config-only mode
     toolsOnly: false, // Safe mode: only update agent tool arrays/kwargs
+    graphConfigOnly: false, // Safe mode: only update graph edges/recursion limit
     runtimeAware: null, // Apply canonical runtime model/activation overrides before push
     activationFields: null,
     selectedAgentIds: null,
@@ -495,6 +527,10 @@ function parseArgs(argv) {
     }
     if (arg === '--tools-only') {
       args.toolsOnly = true;
+      continue;
+    }
+    if (arg === '--graph-config-only') {
+      args.graphConfigOnly = true;
       continue;
     }
     if (arg === '--runtime-aware') {
@@ -579,6 +615,10 @@ function parseArgs(argv) {
       args.activationFields = parseActivationFields(readValue(arg, '--activation-fields='));
       continue;
     }
+    if (arg.startsWith('--model-config-fields=')) {
+      args.modelConfigFields = parseActivationFields(readValue(arg, '--model-config-fields='));
+      continue;
+    }
     if (arg.startsWith('--agent-ids=')) {
       args.selectedAgentIds = parseIdList(readValue(arg, '--agent-ids='));
       continue;
@@ -628,24 +668,49 @@ function parseArgs(argv) {
   }
 
   if (
-    [args.promptsOnly, args.activationConfigOnly, args.modelConfigOnly, args.toolsOnly].filter(
-      Boolean,
-    ).length > 1
+    [
+      args.promptsOnly,
+      args.activationConfigOnly,
+      args.modelConfigOnly,
+      args.toolsOnly,
+      args.graphConfigOnly,
+    ].filter(Boolean).length > 1
   ) {
     throw new Error(
-      'Choose only one safe push mode: --prompts-only, --activation-config-only, --model-config-only, or --tools-only',
+      'Choose only one safe push mode: --prompts-only, --activation-config-only, --model-config-only, --tools-only, or --graph-config-only',
     );
   }
   if (args.activationFields && !args.promptsOnly && !args.activationConfigOnly) {
     throw new Error('--activation-fields requires --prompts-only or --activation-config-only');
+  }
+  if (args.modelConfigFields && !args.modelConfigOnly) {
+    throw new Error('--model-config-fields requires --model-config-only');
+  }
+  const invalidModelFields = (args.modelConfigFields || []).filter(
+    (field) => !SAFE_MODEL_CONFIG_FIELD_SET.has(field),
+  );
+  if (invalidModelFields.length) {
+    throw new Error(
+      `Unsupported model config field(s): ${invalidModelFields.join(', ')}. ` +
+        `Allowed: ${Array.from(SAFE_MODEL_CONFIG_FIELD_SET).join(', ')}`,
+    );
   }
   validateSafeActivationFields(resolveSafeActivationFields(args));
 
   return args;
 }
 
-function shouldApplyRuntimeOverrides({ action, runtimeAware = null } = {}) {
-  return action === 'push' && runtimeAware === true;
+function shouldApplyRuntimeOverrides({ action, env = DEFAULT_ENV_SLUG, runtimeAware = null } = {}) {
+  if (action !== 'push') {
+    return false;
+  }
+  if (runtimeAware === true) {
+    return true;
+  }
+  if (runtimeAware === false) {
+    return false;
+  }
+  return sanitizeSlug(env) === 'local';
 }
 
 function resolveSchedulesPath({ baseFilePath, explicitPath, defaultBasename }) {
@@ -1157,8 +1222,10 @@ function compareBundlesByAgent({ leftBundle, rightBundle, fields = REVIEW_FIELDS
     const fieldDetails = {};
 
     for (const field of fields) {
-      const leftValue = leftAgent[field];
-      const rightValue = rightAgent[field];
+      const normalizeFieldDefault = (value) =>
+        field === 'conversation_recall_agent_only' ? value === true : value;
+      const leftValue = normalizeFieldDefault(leftAgent[field]);
+      const rightValue = normalizeFieldDefault(rightAgent[field]);
       if (stableSerialize(leftValue) === stableSerialize(rightValue)) {
         continue;
       }
@@ -1475,7 +1542,7 @@ function mergeBackgroundCorticesActivationFields(
       ? new Set(selectedAgentIds)
       : null;
 
-  return existingCortices.map((existing) => {
+  const merged = existingCortices.map((existing) => {
     if (selectedIdSet && !selectedIdSet.has(existing.agent_id)) {
       return existing;
     }
@@ -1499,6 +1566,35 @@ function mergeBackgroundCorticesActivationFields(
       activation: mergedActivation,
     };
   });
+
+  if (!selectedIdSet) {
+    return merged;
+  }
+
+  const existingIds = new Set(existingCortices.map((cortex) => cortex?.agent_id).filter(Boolean));
+  for (const incoming of newCortices) {
+    if (
+      !incoming?.agent_id ||
+      existingIds.has(incoming.agent_id) ||
+      !selectedIdSet.has(incoming.agent_id) ||
+      !incoming.activation
+    ) {
+      continue;
+    }
+
+    const activation = {};
+    for (const field of activationFields || []) {
+      if (Object.prototype.hasOwnProperty.call(incoming.activation, field)) {
+        activation[field] = incoming.activation[field];
+      }
+    }
+    if (Object.keys(activation).length > 0) {
+      merged.push({ agent_id: incoming.agent_id, activation });
+      existingIds.add(incoming.agent_id);
+    }
+  }
+
+  return merged;
 }
 
 function buildUpdateData(
@@ -1507,7 +1603,9 @@ function buildUpdateData(
     promptsOnly = false,
     activationConfigOnly = false,
     modelConfigOnly = false,
+    modelConfigFields = null,
     toolsOnly = false,
+    graphConfigOnly = false,
     activationFields = null,
     existingAgent = null,
     selectedAgentIds = null,
@@ -1530,10 +1628,14 @@ function buildUpdateData(
     : activationConfigOnly
       ? ['background_cortices']
       : modelConfigOnly
-        ? MODEL_CONFIG_ONLY_FIELDS
+        ? Array.isArray(modelConfigFields) && modelConfigFields.length
+          ? modelConfigFields
+          : MODEL_CONFIG_ONLY_FIELDS
         : toolsOnly
           ? TOOLS_ONLY_FIELDS
-          : AGENT_FIELDS;
+          : graphConfigOnly
+            ? GRAPH_CONFIG_ONLY_FIELDS
+            : AGENT_FIELDS;
   const safeActivationFields = resolveSafeActivationFields({
     promptsOnly,
     activationConfigOnly,
@@ -1596,12 +1698,17 @@ function shouldRepairRuntimeFieldsForPushMode({
   promptsOnly = false,
   activationConfigOnly = false,
   toolsOnly = false,
+  graphConfigOnly = false,
   runtimeAware = false,
+  modelConfigFields = null,
 }) {
   if (!runtimeAware) {
     return false;
   }
-  if (promptsOnly || activationConfigOnly || toolsOnly) {
+  if (promptsOnly || activationConfigOnly || toolsOnly || graphConfigOnly) {
+    return false;
+  }
+  if (Array.isArray(modelConfigFields) && modelConfigFields.length) {
     return false;
   }
   return true;
@@ -1630,7 +1737,9 @@ async function pushAgent({
   promptsOnly = false,
   activationConfigOnly = false,
   modelConfigOnly = false,
+  modelConfigFields = null,
   toolsOnly = false,
+  graphConfigOnly = false,
   runtimeAware = false,
   activationFields = null,
   selectedAgentIds = null,
@@ -1644,7 +1753,9 @@ async function pushAgent({
     promptsOnly,
     activationConfigOnly,
     toolsOnly,
+    graphConfigOnly,
     runtimeAware,
+    modelConfigFields,
   });
   /* === VIVENTIUM START ===
    * Feature: Auto-create agents that exist in source-of-truth YAML but not yet in MongoDB.
@@ -1653,14 +1764,16 @@ async function pushAgent({
    * Fix: When an agent is missing, create it from the YAML data (safe — YAML is canonical).
    * === VIVENTIUM END === */
   if (!existing) {
-    if (promptsOnly || activationConfigOnly || modelConfigOnly || toolsOnly) {
+    if (promptsOnly || activationConfigOnly || modelConfigOnly || toolsOnly || graphConfigOnly) {
       const modeLabel = promptsOnly
         ? 'prompts-only'
         : activationConfigOnly
           ? 'activation-config-only'
           : modelConfigOnly
             ? 'model-config-only'
-            : 'tools-only';
+            : toolsOnly
+              ? 'tools-only'
+              : 'graph-config-only';
       return {
         id: agentData.id,
         status: 'missing',
@@ -1726,7 +1839,9 @@ async function pushAgent({
     promptsOnly,
     activationConfigOnly,
     modelConfigOnly,
+    modelConfigFields,
     toolsOnly,
+    graphConfigOnly,
     activationFields,
     existingAgent: existing,
     selectedAgentIds,
@@ -1763,7 +1878,9 @@ async function pushAgent({
           ? 'model-config-only'
           : toolsOnly
             ? 'tools-only'
-            : 'full',
+            : graphConfigOnly
+              ? 'graph-config-only'
+              : 'full',
     fieldsUpdated,
     runtimeRepair,
   };
@@ -1778,7 +1895,9 @@ async function pushBundle({
   promptsOnly = false,
   activationConfigOnly = false,
   modelConfigOnly = false,
+  modelConfigFields = null,
   toolsOnly = false,
+  graphConfigOnly = false,
   runtimeAware = false,
   activationFields = null,
   selectedAgentIds = null,
@@ -1850,7 +1969,9 @@ async function pushBundle({
         promptsOnly,
         activationConfigOnly,
         modelConfigOnly,
+        modelConfigFields,
         toolsOnly,
+        graphConfigOnly,
         runtimeAware,
         activationFields,
         selectedAgentIds,
@@ -1875,6 +1996,7 @@ async function pushBundle({
         !shouldPushStandaloneBackgroundAgent({
           agentId: agentData.id,
           selectedAgentIds,
+          providerCapabilityPolicy,
           activationConfigOnly,
         })
       ) {
@@ -1895,7 +2017,9 @@ async function pushBundle({
           promptsOnly,
           activationConfigOnly,
           modelConfigOnly,
+          modelConfigFields,
           toolsOnly,
+          graphConfigOnly,
           runtimeAware,
           activationFields,
           selectedAgentIds,
@@ -1935,10 +2059,13 @@ async function pushBundle({
           promptsOnly,
           activationConfigOnly,
           modelConfigOnly,
+          modelConfigFields,
           toolsOnly,
+          graphConfigOnly,
           runtimeAware,
           activationFields,
           selectedAgentIds,
+          providerCapabilityPolicy,
         }),
       );
     }
@@ -1954,11 +2081,14 @@ async function pushBundle({
           ? 'model-config-only'
           : toolsOnly
             ? 'tools-only'
-            : 'full',
+            : graphConfigOnly
+              ? 'graph-config-only'
+              : 'full',
     runtimeAwareApplied: runtimeAware,
     results,
     userId: user._id.toString(),
     selectedAgentIds: selectedAgentIds || [],
+    modelConfigFields: modelConfigFields || [],
   };
 }
 
@@ -2149,18 +2279,24 @@ function printUsage() {
     '  --activation-config-only  Safe mode: only update background cortex activation config',
   );
   console.log('  --model-config-only  Safe mode: only update agent model/provider fields');
+  console.log(
+    '  --model-config-fields=...  Optional comma-separated field allowlist within --model-config-only',
+  );
   console.log('  --tools-only  Safe mode: only update agent tools/tool_kwargs fields');
+  console.log(
+    '  --graph-config-only  Safe mode: only update agent graph edges and recursion limit',
+  );
   console.log(
     '  --runtime-aware   Rewrite built-in model/provider fields from canonical runtime env before push',
   );
   console.log(
-    '  --raw-source-of-truth  Push raw bundle values without runtime rewrite (the default; overrides an earlier --runtime-aware flag)',
+    '  --raw-source-of-truth  Push raw bundle values without runtime rewrite (disables local default)',
   );
   console.log(
     '  --agent-ids=...   Optional comma-separated background agent ids to update surgically',
   );
   console.log(
-    '  --activation-fields=...   Comma-separated activation fields for safe modes (enabled,prompt,confidence_threshold,fallbacks,activation_failure_visibility,model,provider,cooldown_ms,max_history,intent_scope)',
+    '  --activation-fields=...   Comma-separated activation fields for safe modes (enabled,mode,prompt,confidence_threshold,fallbacks,activation_failure_visibility,model,provider,cooldown_ms,max_history,intent_scope)',
   );
   console.log(
     '  --schedules       Also pull/push Scheduling Cortex tasks for this user (via viv-schedule-sync.js)',
@@ -2288,7 +2424,9 @@ async function run() {
       promptsOnly: args.promptsOnly,
       activationConfigOnly: args.activationConfigOnly,
       modelConfigOnly: args.modelConfigOnly,
+      modelConfigFields: args.modelConfigFields,
       toolsOnly: args.toolsOnly,
+      graphConfigOnly: args.graphConfigOnly,
       runtimeAware: shouldApplyRuntimeOverrides(args),
       activationFields: args.activationFields,
       selectedAgentIds: args.selectedAgentIds,

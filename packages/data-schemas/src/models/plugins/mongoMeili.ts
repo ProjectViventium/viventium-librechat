@@ -104,6 +104,7 @@ function isViventiumMeiliOptOut(doc: unknown): boolean {
   return (
     !_.isNil(row?.expiredAt) ||
     (metadata?.type === 'listen_only_transcript' && metadata?.mode === 'listen_only') ||
+    metadata?.type === 'voice_ambient_transcript' ||
     metadata?.qaRun === true ||
     metadata?.memoryEligible === false
   );
@@ -111,7 +112,9 @@ function isViventiumMeiliOptOut(doc: unknown): boolean {
 
 const getMeiliEligibleQuery = (): FilterQuery<unknown> => ({
   expiredAt: null,
-  'metadata.viventium.type': { $ne: 'listen_only_transcript' },
+  'metadata.viventium.type': {
+    $nin: ['listen_only_transcript', 'voice_ambient_transcript'],
+  },
   'metadata.viventium.mode': { $ne: 'listen_only' },
   'metadata.viventium.qaRun': { $ne: true },
   'metadata.viventium.memoryEligible': { $ne: false },
@@ -436,7 +439,9 @@ const createMeiliMongooseModel = ({
           const meiliIds = meiliRecords.map((record) => record.primaryValue);
           const query: Record<string, unknown> = {};
           query[primaryKey] = { $in: meiliIds };
-          query['metadata.viventium.type'] = { $ne: 'listen_only_transcript' };
+          query['metadata.viventium.type'] = {
+            $nin: ['listen_only_transcript', 'voice_ambient_transcript'],
+          };
           query['metadata.viventium.mode'] = { $ne: 'listen_only' };
           query['metadata.viventium.qaRun'] = { $ne: true };
           query['metadata.viventium.memoryEligible'] = { $ne: false };
@@ -638,7 +643,12 @@ const createMeiliMongooseModel = ({
     postSaveHook(this: DocumentWithMeiliIndex, next: CallbackWithoutResultAndOptionalError): void {
       if (isViventiumMeiliOptOut(this)) {
         if (!this._meiliIndex) return next();
-        return this.deleteObjectFromMeili!(async (error?: Error) => {
+        /* === VIVENTIUM START ===
+         * Feature: Deterministic Meili opt-out persistence.
+         * Purpose: This is callback-style middleware. Exposing the deletion promise lets Mongoose
+         * settle save() before the async Mongo flag update invokes `next()`.
+         * === VIVENTIUM END === */
+        void this.deleteObjectFromMeili!(async (error?: Error) => {
           if (error) return next(error);
           await this.collection.updateMany(
             { _id: this._id as Types.ObjectId },
@@ -646,6 +656,7 @@ const createMeiliMongooseModel = ({
           );
           next();
         });
+        return;
       }
       if (this._meiliIndex) {
         this.updateObjectToMeili!(next);
@@ -666,7 +677,7 @@ const createMeiliMongooseModel = ({
     ): void {
       if (isViventiumMeiliOptOut(this)) {
         if (!this._meiliIndex) return next();
-        return this.deleteObjectFromMeili!(async (error?: Error) => {
+        void this.deleteObjectFromMeili!(async (error?: Error) => {
           if (error) return next(error);
           await this.collection.updateMany(
             { _id: this._id as Types.ObjectId },
@@ -674,6 +685,7 @@ const createMeiliMongooseModel = ({
           );
           next();
         });
+        return;
       }
       if (this._meiliIndex) {
         this.updateObjectToMeili!(next);
@@ -804,15 +816,30 @@ export default function mongoMeili(schema: Schema, options: MongoMeiliOptions): 
 
   // Register Mongoose hooks
   schema.post('save', function (doc: DocumentWithMeiliIndex, next) {
-    doc.postSaveHook?.(next);
+    if (typeof doc?.postSaveHook === 'function') {
+      return doc.postSaveHook(next);
+    }
+    next();
   });
 
   schema.post('updateOne', function (doc: DocumentWithMeiliIndex, next) {
-    doc.postUpdateHook?.(next);
+    /* === VIVENTIUM START ===
+     * Feature: Non-blocking model-level persistence hooks.
+     * Purpose: Query middleware receives Mongo's update result rather than a hydrated document.
+     * Optional chaining without calling `next()` leaves Model.updateOne() pending forever when
+     * Meili is enabled, including trusted scheduler visibility updates.
+     * === VIVENTIUM END === */
+    if (typeof doc?.postUpdateHook === 'function') {
+      return doc.postUpdateHook(next);
+    }
+    next();
   });
 
   schema.post('deleteOne', function (doc: DocumentWithMeiliIndex, next) {
-    doc.postRemoveHook?.(next);
+    if (typeof doc?.postRemoveHook === 'function') {
+      return doc.postRemoveHook(next);
+    }
+    next();
   });
 
   // Pre-deleteMany hook: remove corresponding documents from MeiliSearch when multiple documents are deleted.

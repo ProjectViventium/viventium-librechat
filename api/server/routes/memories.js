@@ -1,5 +1,6 @@
 const express = require('express');
 const {
+  clearMemoryReadContextCache,
   evaluateMemoryWrite,
   generateCheckAccess,
   prepareMemoryValueForWrite,
@@ -222,6 +223,7 @@ router.post('/', memoryPayloadLimit, checkMemoryCreate, configMiddleware, async 
       userId: req.user.id,
       policy: memoryPolicy,
     });
+    clearMemoryReadContextCache(req.user.id);
 
     const updatedMemories = await getAllUserMemories(req.user.id);
     const newMemory = updatedMemories.find((m) => m.key === key.trim());
@@ -273,6 +275,9 @@ router.patch('/preferences', checkMemoryOptOut, async (req, res) => {
         userId: req.user.id,
       });
     }
+    if (hasMemories) {
+      clearMemoryReadContextCache(req.user.id);
+    }
 
     res.json({
       updated: true,
@@ -287,12 +292,18 @@ router.patch('/preferences', checkMemoryOptOut, async (req, res) => {
 });
 
 /**
- * PATCH /memories/:key
+ * PATCH /memories/entries/:key (canonical)
+ * PATCH /memories/:key (legacy compatibility for non-reserved keys)
  * Updates the value of an existing memory entry for the authenticated user.
  * Body: { key?: string, value: string }
  * Returns 200 and { updated: true, memory: <updatedDoc> } when successful.
  */
-router.patch('/:key', memoryPayloadLimit, checkMemoryUpdate, configMiddleware, async (req, res) => {
+/* === VIVENTIUM START ===
+ * Keep arbitrary saved-memory keys out of the control-route namespace. `preferences` is both a
+ * valid memory key and the personalization endpoint, so entry mutations use `/entries/:key`.
+ * Retain the legacy route for compatible callers and non-reserved keys.
+ */
+async function updateMemoryEntry(req, res) {
   const { key: urlKey } = req.params;
   /* === VIVENTIUM START ===
    * Require compare-and-swap state for edits and compensate a conflicted rename without data loss.
@@ -424,6 +435,7 @@ router.patch('/:key', memoryPayloadLimit, checkMemoryUpdate, configMiddleware, a
       userId: req.user.id,
       policy: memoryPolicy,
     });
+    clearMemoryReadContextCache(req.user.id);
 
     const updatedMemories = await getAllUserMemories(req.user.id);
     const updatedMemory = updatedMemories.find((m) => m.key === newKey);
@@ -436,14 +448,25 @@ router.patch('/:key', memoryPayloadLimit, checkMemoryUpdate, configMiddleware, a
     res.status(500).json({ error: error.message });
   }
   /* === VIVENTIUM END === */
-});
+}
+
+router.patch(
+  '/entries/:key',
+  memoryPayloadLimit,
+  checkMemoryUpdate,
+  configMiddleware,
+  updateMemoryEntry,
+);
+router.patch('/:key', memoryPayloadLimit, checkMemoryUpdate, configMiddleware, updateMemoryEntry);
+/* === VIVENTIUM END === */
 
 /**
- * DELETE /memories/:key
+ * DELETE /memories/entries/:key (canonical)
+ * DELETE /memories/:key (legacy compatibility)
  * Deletes a memory entry for the authenticated user.
  * Returns 200 and { deleted: true } when successful.
  */
-router.delete('/:key', checkMemoryDelete, async (req, res) => {
+async function deleteMemoryEntry(req, res) {
   const { key } = req.params;
   /* === VIVENTIUM START === Require compare-and-swap state for saved-memory deletion. === */
   const expectedRevision = Number(req.query?.revision);
@@ -466,11 +489,16 @@ router.delete('/:key', checkMemoryDelete, async (req, res) => {
       return res.status(404).json({ error: 'Memory not found.' });
     }
 
+    clearMemoryReadContextCache(req.user.id);
+
     res.json({ deleted: true });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
   /* === VIVENTIUM END === */
-});
+}
+
+router.delete('/entries/:key', checkMemoryDelete, deleteMemoryEntry);
+router.delete('/:key', checkMemoryDelete, deleteMemoryEntry);
 
 module.exports = router;

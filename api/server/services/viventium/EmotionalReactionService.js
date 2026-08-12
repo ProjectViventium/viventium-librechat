@@ -64,6 +64,15 @@ function countReactionStrengths(changes) {
   }, {});
 }
 
+function countAppliedDeltaMagnitudes(trail) {
+  return (Array.isArray(trail) ? trail : []).reduce((counts, entry) => {
+    const magnitude = Math.abs(Number(entry?.after) - Number(entry?.before));
+    const key = Number.isFinite(magnitude) ? String(Math.round(magnitude * 100) / 100) : 'unknown';
+    counts[key] = (counts[key] || 0) + 1;
+    return counts;
+  }, {});
+}
+
 const DEFAULT_EXECUTION_PROMPT = `Appraise how the latest external user stimulus moves Viventium's present feeling state.
 
 Use the current values, each feeling's nature (baseline), its persistence, and the recent typed trail. Apply Viventium's configured reaction preference. Prefer no change over an invented change. When the stimulus genuinely touches a feeling, choose strength in proportion to how much that specific feeling is moved.
@@ -657,6 +666,7 @@ module.exports = {
   REACTION_AGENT_ID,
   buildEmotionalReactionAgent,
   buildEmotionalReactionInput,
+  countAppliedDeltaMagnitudes,
   buildReactionHealth,
   feelingStimulusKey,
   runEmotionalReaction,

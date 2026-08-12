@@ -477,6 +477,16 @@ const getMeetingTranscriptInventoryText = (file) => {
 };
 
 const getNoMatchingContentOutput = ({ files = [], recallFiles = [] }) => {
+  const degradedRecallFile = recallFiles.find(isSourceOnlyConversationRecallFile);
+  if (degradedRecallFile) {
+    const reason = String(
+      degradedRecallFile.viventiumConversationRecallAttachmentReason ||
+        'semantic runtime unavailable',
+    )
+      .replace(/^runtime_/, '')
+      .replaceAll('_', ' ');
+    return `Source-backed lexical recall found no match, but semantic conversation recall is unavailable (${reason}). Treat this result as inconclusive: do not infer that the fact is absent from conversation history.`;
+  }
   const hasMeetingTranscriptResource = files.some((file) =>
     isMeetingTranscriptFileId(file?.file_id),
   );
@@ -950,6 +960,8 @@ const buildConversationRecallSnippet = ({ message, content }) => {
 const CONVERSATION_RECALL_CONTEXT_WINDOW_MS = 5 * 60 * 1000;
 const CONVERSATION_RECALL_CONTEXT_MAX_TURNS = 7;
 const CONVERSATION_RECALL_CONTEXT_FETCH_LIMIT = 16;
+const CONVERSATION_RECALL_WEAK_SOURCE_SCORE_MAX = 1;
+const CONVERSATION_RECALL_RECENT_FALLBACK_FETCH_LIMIT = 12;
 
 function buildConversationRecallContextSnippet({ message, content, nearbyMessages }) {
   const createdAtMs = message?.createdAt ? new Date(message.createdAt).getTime() : NaN;
@@ -1071,7 +1083,9 @@ async function buildConversationRecallContextSnippets({ userId, selectedResults 
             user: userId,
             unfinished: { $ne: true },
             error: { $ne: true },
-            'metadata.viventium.type': { $ne: 'listen_only_transcript' },
+            'metadata.viventium.type': {
+              $nin: ['listen_only_transcript', 'voice_ambient_transcript'],
+            },
             'metadata.viventium.mode': { $ne: 'listen_only' },
             'metadata.viventium.memoryEligible': { $ne: false },
             'metadata.viventium.qaRun': { $ne: true },
@@ -1196,16 +1210,22 @@ async function searchConversationRecallSourceMatches({
       currentConversationId: conversationId,
     });
 
-    const messages = await Message.find({
+    const sourceFilter = {
       user: userId,
       unfinished: { $ne: true },
       error: { $ne: true },
-      'metadata.viventium.type': { $ne: 'listen_only_transcript' },
+      'metadata.viventium.type': {
+        $nin: ['listen_only_transcript', 'voice_ambient_transcript'],
+      },
       'metadata.viventium.mode': { $ne: 'listen_only' },
       'metadata.viventium.memoryEligible': { $ne: false },
       'metadata.viventium.qaRun': { $ne: true },
       ...(scopedConversationIds ? { conversationId: scopedConversationIds } : {}),
       $or: [{ expiredAt: { $exists: false } }, { expiredAt: null }],
+    };
+    const fileResultStartIndex = results.length;
+    const messages = await Message.find({
+      ...sourceFilter,
       $and: [
         {
           $or: regexes.map((regex) => ({
@@ -1279,6 +1299,56 @@ async function searchConversationRecallSourceMatches({
       });
 
       if (results.length >= maxMatches * 3) {
+        break;
+      }
+    }
+
+    const fileResults = results.slice(fileResultStartIndex);
+    const strongestSourceScore = fileResults.reduce(
+      (strongest, result) => Math.max(strongest, Number(result.sourceRecallScore || 0)),
+      0,
+    );
+    if (conversationId && strongestSourceScore <= CONVERSATION_RECALL_WEAK_SOURCE_SCORE_MAX) {
+      const recentMessages = await Message.find(sourceFilter)
+        .select(
+          'messageId parentMessageId conversationId createdAt sender isCreatedByUser text content attachments metadata',
+        )
+        .sort({ createdAt: -1 })
+        .limit(CONVERSATION_RECALL_RECENT_FALLBACK_FETCH_LIMIT)
+        .lean();
+      for (const message of recentMessages) {
+        if (activeMessageId && message?.messageId === activeMessageId) {
+          continue;
+        }
+        const content = getConversationRecallMessageText(message);
+        const hasRecallDerivedChild =
+          message?.isCreatedByUser === true
+            ? await hasRecallDerivedChildMessage({ userId, messageId: message?.messageId })
+            : false;
+        if (
+          shouldSkipFromRecallCorpus({
+            message,
+            messageText: content,
+            isCreatedByUser: message?.isCreatedByUser,
+            hasRecallDerivedChild,
+          })
+        ) {
+          continue;
+        }
+        results.push({
+          filename: file.filename || 'conversation-recall-all.txt',
+          content: buildConversationRecallSnippet({ message, content }),
+          distance: 1,
+          file_id: file.file_id,
+          page: null,
+          sourceKind: 'raw_message',
+          sourceRole: message?.isCreatedByUser === true ? 'user' : 'assistant',
+          sourceRecallScore: 0.25,
+          sourceFallbackKind: 'recent',
+          createdAt: message?.createdAt ? new Date(message.createdAt).getTime() : 0,
+          sourceMessage: message,
+          sourceContent: content,
+        });
         break;
       }
     }
@@ -1456,7 +1526,17 @@ const primeFiles = async (options) => {
     if (i === 0) {
       toolContext = `- Note: Use the ${Tools.file_search} tool to find relevant information within:`;
     }
-    toolContext += `\n\t- ${file.filename}${
+    /* === VIVENTIUM START ===
+     * Fix: Host-owned evidence labels are service resources, not filesystem paths. Do not expose
+     * their storage-like filenames in the model's tool-context inventory, because a workstation
+     * worker can otherwise mistake the label for a mounted file and try native shell discovery.
+     * === VIVENTIUM END === */
+    const toolContextLabel = isConversationRecallFileId(file.file_id)
+      ? 'authorized prior-conversation evidence (service-backed; not a workspace file)'
+      : isMeetingTranscriptFileId(file.file_id)
+        ? 'authorized meeting-transcript evidence (service-backed; not a workspace file)'
+        : file.filename;
+    toolContext += `\n\t- ${toolContextLabel}${
       agentResourceIds.has(file.file_id) ? '' : ' (just attached by user)'
     }`;
     files.push({
@@ -1819,11 +1899,19 @@ const createFileSearchTool = async ({
       const vectorRecallResults = vectorFormattedResults.filter((result) =>
         isConversationRecallFileId(result.file_id),
       );
+      /* === VIVENTIUM START ===
+       * Fix: The query-agnostic recent-turn safety net is only eligible after semantic recall
+       * returns no candidates. Any vector candidate keeps normal global ranking authoritative;
+       * an arbitrary recent turn must not compete with or evict retrieved evidence.
+       * === VIVENTIUM END === */
+      const sourceRescueResultsForFusion = vectorRecallResults.length
+        ? earlySourceRescueResults.filter((result) => result.sourceFallbackKind !== 'recent')
+        : earlySourceRescueResults;
       let formattedResults = vectorFormattedResults
         .filter((result) => !isConversationRecallFileId(result.file_id))
         .concat(
           fuseConversationRecallResults({
-            lexicalResults: earlySourceRescueResults,
+            lexicalResults: sourceRescueResultsForFusion,
             vectorResults: vectorRecallResults,
           }),
         );

@@ -60,6 +60,7 @@ const { createMCPTool, createMCPTools } = require('~/server/services/MCP');
 const { loadAuthValues } = require('~/server/services/Tools/credentials');
 const { getMCPServerTools } = require('~/server/services/Config');
 const { getRoleByName } = require('~/models/Role');
+const { canUseViventiumMCPServer } = require('~/server/services/viventium/mcpAudiencePolicy');
 /* === VIVENTIUM START ===
  * Feature: Surface-aware prompt helpers (shared across tools + agents)
  */
@@ -420,6 +421,19 @@ const loadTools = async ({
         );
         continue;
       }
+      /* === VIVENTIUM START ===
+       * Security: Fail closed before discovery or process startup for request-ineligible servers.
+       */
+      if (
+        !canUseViventiumMCPServer({
+          serverConfig,
+          reqUser: options.req?.user,
+        })
+      ) {
+        logger.warn('[handleTools] MCP server access denied by request audience policy.');
+        continue;
+      }
+      /* === VIVENTIUM END === */
       if (toolName === Constants.mcp_all) {
         requestedMCPTools[serverName] = [
           {
@@ -555,4 +569,5 @@ module.exports = {
   loadToolWithAuth,
   validateTools,
   loadTools,
+  canUseViventiumMCPServer,
 };

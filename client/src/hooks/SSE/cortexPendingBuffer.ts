@@ -17,6 +17,8 @@ type CortexPart = {
   direct_action_surface_scopes?: unknown[];
   configured_tools?: number;
   completed_tool_calls?: number;
+  fallback_used?: boolean;
+  fallback_reason_class?: string | null;
   status_changed_at?: string;
 };
 

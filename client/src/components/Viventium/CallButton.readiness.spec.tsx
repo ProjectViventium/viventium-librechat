@@ -7,9 +7,11 @@
 
 import React from 'react';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import CallButton from './CallButton';
 
 const mockUseGetStartupConfig = jest.fn();
+const mockFetch = jest.fn();
 
 jest.mock('recoil', () => ({
   useRecoilValue: () => ({ agent_id: 'agent_fixture', conversationId: 'conversation_fixture' }),
@@ -44,11 +46,31 @@ jest.mock('~/utils', () => ({
   cn: (...values: unknown[]) => values.filter(Boolean).join(' '),
 }));
 
+function renderCallButton() {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  return render(
+    <QueryClientProvider client={queryClient}>
+      <CallButton />
+    </QueryClientProvider>,
+  );
+}
+
 describe('CallButton voice readiness', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockUseGetStartupConfig.mockReturnValue({ data: { viventiumVoiceEnabled: true } });
-    global.fetch = jest.fn();
+    global.fetch = mockFetch as unknown as typeof fetch;
+    window.open = jest.fn(
+      () =>
+        ({
+          closed: false,
+          close: jest.fn(),
+          focus: jest.fn(),
+          location: { replace: jest.fn() },
+        }) as unknown as Window,
+    );
   });
 
   it.each([
@@ -57,19 +79,19 @@ describe('CallButton voice readiness', () => {
   ])('hides the call action for %s', (_label, startupConfig) => {
     mockUseGetStartupConfig.mockReturnValue({ data: startupConfig });
 
-    render(<CallButton />);
+    renderCallButton();
 
     expect(screen.queryByRole('button', { name: 'Start voice call' })).not.toBeInTheDocument();
   });
 
   it('shows the call action only when Voice is explicitly enabled', () => {
-    render(<CallButton />);
+    renderCallButton();
 
     expect(screen.getByRole('button', { name: 'Start voice call' })).toBeInTheDocument();
   });
 
   it('renders a structured runtime failure as concise inline recovery copy', async () => {
-    (global.fetch as jest.Mock).mockResolvedValue({
+    mockFetch.mockResolvedValue({
       ok: false,
       status: 503,
       headers: new Headers({ 'Content-Type': 'application/json' }),
@@ -80,7 +102,7 @@ describe('CallButton voice readiness', () => {
       }),
     });
 
-    render(<CallButton />);
+    renderCallButton();
     fireEvent.click(screen.getByRole('button', { name: 'Start voice call' }));
 
     const error = await screen.findByRole('alert');
@@ -95,7 +117,7 @@ describe('CallButton voice readiness', () => {
   });
 
   it('maps the structured missing-assistant error to actionable inline copy', async () => {
-    (global.fetch as jest.Mock).mockResolvedValue({
+    mockFetch.mockResolvedValue({
       ok: false,
       status: 400,
       headers: new Headers({ 'Content-Type': 'application/json' }),
@@ -105,7 +127,7 @@ describe('CallButton voice readiness', () => {
       }),
     });
 
-    render(<CallButton />);
+    renderCallButton();
     fireEvent.click(screen.getByRole('button', { name: 'Start voice call' }));
 
     const error = await screen.findByRole('alert');
@@ -114,7 +136,7 @@ describe('CallButton voice readiness', () => {
   });
 
   it('falls back to safe recovery copy when the server does not return JSON', async () => {
-    (global.fetch as jest.Mock).mockResolvedValue({
+    mockFetch.mockResolvedValue({
       ok: false,
       status: 500,
       headers: new Headers({ 'Content-Type': 'text/html' }),
@@ -123,7 +145,7 @@ describe('CallButton voice readiness', () => {
       },
     });
 
-    render(<CallButton />);
+    renderCallButton();
     fireEvent.click(screen.getByRole('button', { name: 'Start voice call' }));
 
     await waitFor(() => {

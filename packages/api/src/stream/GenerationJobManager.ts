@@ -8,6 +8,11 @@ import type {
   UsageMetadata,
   AbortResult,
   IJobStore,
+  InteractionContext,
+  AdapterCapabilities,
+  InteractionDeliveryAck,
+  DeliveryAcknowledgementResult,
+  InteractionDeliveryPolicy,
 } from './interfaces/IJobStore';
 import type * as t from '~/types';
 import { InMemoryEventTransport } from './implementations/InMemoryEventTransport';
@@ -25,6 +30,12 @@ export interface GenerationJobManagerOptions {
    * Default: true (immediate cleanup to save memory)
    */
   cleanupOnComplete?: boolean;
+}
+
+export interface CreateGenerationJobOptions {
+  interactionContext?: InteractionContext;
+  adapterCapabilities?: AdapterCapabilities;
+  deliveryPolicy?: InteractionDeliveryPolicy;
 }
 
 /**
@@ -257,6 +268,78 @@ class GenerationJobManagerClass {
     return this.jobStore;
   }
 
+  /** Persist an adapter's terminal presentation outcome against server-held turn ownership. */
+  async acknowledgeDelivery(
+    acknowledgement: InteractionDeliveryAck,
+    adapterSurface: 'telegram' | 'voice',
+  ): Promise<DeliveryAcknowledgementResult> {
+    const ownerStreamId = await this.jobStore.resolveDeliveryOwner(
+      acknowledgement.logical_turn_id,
+      acknowledgement.revision,
+    );
+    const ownerJob = ownerStreamId ? await this.jobStore.getJob(ownerStreamId) : null;
+    if (!ownerJob) {
+      return { status: 'not_found' };
+    }
+    if (
+      ownerJob.deliveryPolicy?.commit_authority !== 'external_adapter' ||
+      ownerJob.interactionContext?.surface !== adapterSurface
+    ) {
+      return { status: 'conflict' };
+    }
+    return this.recordDeliveryAcknowledgement(acknowledgement);
+  }
+
+  private async recordDeliveryAcknowledgement(
+    acknowledgement: InteractionDeliveryAck,
+  ): Promise<DeliveryAcknowledgementResult> {
+    const result = await this.jobStore.acknowledgeDelivery(acknowledgement);
+    if (result.status !== 'recorded' || !result.ownerStreamId) {
+      return result;
+    }
+    const ownerJob = await this.jobStore.getJob(result.ownerStreamId);
+    const presentation = ownerJob
+      ? {
+          userId: ownerJob.userId,
+          conversationId: ownerJob.conversationId,
+          responseMessageId: ownerJob.responseMessageId,
+          interactionContext: ownerJob.interactionContext,
+        }
+      : undefined;
+    await this.jobStore.updateJob(result.ownerStreamId, {
+      deliveryAcknowledgement: result.acknowledgement,
+    });
+    const job = await this.jobStore.getJob(result.ownerStreamId);
+    if (acknowledgement.state === 'committed' && job?.generationCompleted === true) {
+      await this.finalizeCompletedJob(
+        result.ownerStreamId,
+        job.deliveryPolicy?.commit_authority === 'external_adapter',
+      );
+    }
+    return { ...result, presentation };
+  }
+
+  /** Server-owned commit point used only after canonical persistence and successful final emit. */
+  async acknowledgeStreamDelivery(
+    streamId: string,
+    acknowledgement: Pick<InteractionDeliveryAck, 'state' | 'presentation_ref'>,
+  ): Promise<DeliveryAcknowledgementResult> {
+    const job = await this.jobStore.getJob(streamId);
+    const context = job?.interactionContext;
+    if (
+      !job ||
+      !context?.logical_turn_id ||
+      job.deliveryPolicy?.commit_authority === 'external_adapter'
+    ) {
+      return { status: 'conflict' };
+    }
+    return this.recordDeliveryAcknowledgement({
+      logical_turn_id: context.logical_turn_id,
+      revision: context.revision,
+      ...acknowledgement,
+    });
+  }
+
   /**
    * Create a new generation job.
    *
@@ -278,15 +361,87 @@ class GenerationJobManagerClass {
     streamId: string,
     userId: string,
     conversationId?: string,
+    options?: CreateGenerationJobOptions,
   ): Promise<t.GenerationJob> {
     /* === VIVENTIUM START ===
-     * Purpose: Bind the whole asynchronous create flow to one service generation
-     * so an old completion cannot mutate replacement runtime or services.
+     * Purpose: Bind logical-turn claiming and job creation to one immutable service generation so
+     * a teardown cannot split ownership state across replacement services.
      */
     const services = this.captureServices();
     const { generation, jobStore, eventTransport } = services;
-    const jobData = await jobStore.createJob(streamId, userId, conversationId);
-    this.assertServiceGeneration(generation);
+    let interactionContext = options?.interactionContext;
+    let supersededStreamIds: string[] = [];
+    if (interactionContext) {
+      const baseInteractionContext = interactionContext;
+      let claim = await jobStore.claimLogicalTurn(streamId, userId, baseInteractionContext);
+      this.assertServiceGeneration(generation);
+      if (claim.status === 'duplicate' && !(await jobStore.hasJob(claim.streamId))) {
+        this.assertServiceGeneration(generation);
+        const forgotten = await jobStore.forgetMissingSourceEventReceipt(
+          claim.interactionContext,
+          claim.streamId,
+        );
+        this.assertServiceGeneration(generation);
+        if (forgotten) {
+          claim = await jobStore.claimLogicalTurn(streamId, userId, baseInteractionContext);
+          this.assertServiceGeneration(generation);
+        }
+      }
+      if (claim.status === 'claimed' && claim.supersededStreamIds.length > 0) {
+        const supersededJob = await jobStore.getJob(claim.supersededStreamIds[0]);
+        this.assertServiceGeneration(generation);
+        const persistedServerFinal =
+          supersededJob?.deliveryPolicy?.commit_authority === 'server' &&
+          supersededJob.status === 'complete' &&
+          Boolean(supersededJob.finalEvent) &&
+          Boolean(supersededJob.interactionContext?.logical_turn_id);
+        if (
+          persistedServerFinal &&
+          (await jobStore.rollbackLogicalTurnClaim(streamId, claim.interactionContext))
+        ) {
+          this.assertServiceGeneration(generation);
+          const supersededContext = supersededJob.interactionContext!;
+          await this.recordDeliveryAcknowledgement({
+            logical_turn_id: supersededContext.logical_turn_id!,
+            revision: supersededContext.revision,
+            state: 'committed',
+            ...(supersededJob.responseMessageId
+              ? { presentation_ref: supersededJob.responseMessageId }
+              : {}),
+          });
+          this.assertServiceGeneration(generation);
+          claim = await jobStore.claimLogicalTurn(streamId, userId, baseInteractionContext);
+          this.assertServiceGeneration(generation);
+        }
+      }
+      interactionContext = claim.interactionContext;
+      if (claim.status === 'duplicate') {
+        const duplicateJob = await this.getJob(claim.streamId);
+        this.assertServiceGeneration(generation);
+        if (!duplicateJob) {
+          throw new Error(`Duplicate source event references unavailable stream ${claim.streamId}`);
+        }
+        duplicateJob.duplicateOfStreamId = claim.streamId;
+        return duplicateJob;
+      }
+      supersededStreamIds = claim.supersededStreamIds;
+    }
+
+    let jobData: SerializableJobData;
+    try {
+      jobData = await jobStore.createJob(streamId, userId, conversationId, {
+        interactionContext,
+        adapterCapabilities: options?.adapterCapabilities,
+        deliveryPolicy: options?.deliveryPolicy,
+      });
+      this.assertServiceGeneration(generation);
+    } catch (error) {
+      if (interactionContext?.logical_turn_id) {
+        await jobStore.rollbackLogicalTurnClaim(streamId, interactionContext);
+        this.assertServiceGeneration(generation);
+      }
+      throw error;
+    }
     /* === VIVENTIUM END === */
 
     /**
@@ -396,8 +551,23 @@ class GenerationJobManagerClass {
 
     logger.debug(`[GenerationJobManager] Created job: ${streamId}`);
 
+    const supersededPresentations: NonNullable<t.GenerationJob['supersededPresentations']> = [];
+    for (const supersededStreamId of supersededStreamIds) {
+      const supersededJob = await this.jobStore.getJob(supersededStreamId);
+      if (supersededJob?.deliveryAcknowledgement?.state !== 'committed') {
+        supersededPresentations.push({
+          conversationId: supersededJob?.conversationId,
+          responseMessageId: supersededJob?.responseMessageId,
+          interactionContext: supersededJob?.interactionContext,
+        });
+      }
+      await this.supersedeJob(supersededStreamId);
+    }
+
     // Return facade for backwards compatibility
-    return this.buildJobFacade(streamId, jobData, runtime, eventTransport);
+    const facade = this.buildJobFacade(streamId, jobData, runtime, eventTransport);
+    facade.supersededPresentations = supersededPresentations;
+    return facade;
   }
 
   /**
@@ -473,6 +643,11 @@ class GenerationJobManagerClass {
         responseMessageId: jobData.responseMessageId,
         sender: jobData.sender,
         voiceCallSessionId: jobData.voiceCallSessionId,
+        interactionContext: jobData.interactionContext,
+        adapterCapabilities: jobData.adapterCapabilities,
+        deliveryPolicy: jobData.deliveryPolicy,
+        deliveryAcknowledgement: jobData.deliveryAcknowledgement,
+        generationCompleted: jobData.generationCompleted,
       },
       readyPromise: runtime.readyPromise,
       resolveReady: runtime.resolveReady,
@@ -669,6 +844,101 @@ class GenerationJobManagerClass {
     return jobData?.status as t.GenerationJobStatus | undefined;
   }
 
+  /* === VIVENTIUM START ===
+   * Mark the user-visible Main response complete without tearing down the runtime that may still
+   * deliver non-blocking Phase B updates. This removes the job from active-generation discovery,
+   * while completeJob() retains ownership of final runtime cleanup after the bounded follow-up
+   * window.
+   * === VIVENTIUM END === */
+  async markMainResponseComplete(
+    streamId: string,
+    finalEvent?: t.ServerSentEvent,
+  ): Promise<boolean> {
+    const job = await this.jobStore.getJob(streamId);
+    if (!job || job.status !== 'running') {
+      return false;
+    }
+    const runtime = this.runtimeState.get(streamId);
+    if (runtime && finalEvent) {
+      runtime.finalEvent = finalEvent;
+    }
+    await this.jobStore.updateJob(streamId, {
+      status: 'complete',
+      completedAt: Date.now(),
+      ...(finalEvent ? { finalEvent: JSON.stringify(finalEvent) } : {}),
+    });
+    return true;
+  }
+
+  /**
+   * Terminate only the obsolete provisional revision. Durable messages/tool side effects are not
+   * rolled back; downstream persistence can use the distinct status to remove unfinished output.
+   */
+  private async supersedeJob(streamId: string): Promise<void> {
+    const jobData = await this.jobStore.getJob(streamId);
+    if (!jobData || !['running', 'complete'].includes(jobData.status)) {
+      return;
+    }
+
+    const context = jobData.interactionContext;
+    const terminalEvent = {
+      final: true,
+      superseded: true,
+      logical_turn_id: context?.logical_turn_id,
+      revision: context?.revision,
+    } as unknown as t.ServerSentEvent;
+    const runtime = this.runtimeState.get(streamId);
+    const stopsAuthoring = jobData.adapterCapabilities?.supersede_scope !== 'response_only';
+    if (stopsAuthoring && runtime && !runtime.abortController.signal.aborted) {
+      runtime.abortController.abort('superseded');
+    }
+    if (runtime) {
+      runtime.finalEvent = terminalEvent;
+    }
+    if (stopsAuthoring) {
+      this.eventTransport.emitAbort?.(streamId, 'superseded');
+    }
+    await this.jobStore.updateJob(streamId, {
+      status: 'superseded',
+      completedAt: Date.now(),
+      finalEvent: JSON.stringify(terminalEvent),
+    });
+    if (stopsAuthoring) {
+      this.jobStore.clearContentState(streamId);
+      this.runStepBuffers?.delete(streamId);
+    }
+    await this.eventTransport.emitDone(streamId, terminalEvent);
+    logger.debug(`[GenerationJobManager] Job superseded: ${streamId}`);
+  }
+
+  private async finalizeCompletedJob(
+    streamId: string,
+    preserveJob = false,
+    services: ServiceGenerationSnapshot = this.captureServices(),
+  ): Promise<void> {
+    const { generation, jobStore, cleanupOnComplete } = services;
+    const runtime = this.runtimeState.get(streamId);
+    if (runtime && !runtime.abortController.signal.aborted) {
+      runtime.abortController.abort('generation_completed');
+    }
+    jobStore.clearContentState(streamId);
+    this.runStepBuffers?.delete(streamId);
+    await jobStore.completeLogicalTurn(streamId);
+    this.assertServiceGeneration(generation);
+    if (cleanupOnComplete && !preserveJob) {
+      this.runtimeState.delete(streamId);
+      await jobStore.deleteJob(streamId);
+      this.assertServiceGeneration(generation);
+      return;
+    }
+    await jobStore.updateJob(streamId, {
+      status: 'complete',
+      completedAt: Date.now(),
+      generationCompleted: true,
+    });
+    this.assertServiceGeneration(generation);
+  }
+
   /**
    * Mark job as complete.
    * If cleanupOnComplete is true (default), immediately cleans up job resources.
@@ -680,63 +950,78 @@ class GenerationJobManagerClass {
    */
   async completeJob(streamId: string, error?: string): Promise<void> {
     /* === VIVENTIUM START ===
-     * Purpose: Completion may overlap shutdown; keep every awaited continuation
-     * on its original services and reject before touching replacement state.
+     * Purpose: Completion, logical-turn ownership, and presentation acknowledgement stay on one
+     * immutable service generation across shutdown and reconfiguration.
      */
     const services = this.captureServices();
     const { generation, jobStore, cleanupOnComplete } = services;
-    const runtime = this.runtimeState.get(streamId);
-
-    // Abort the controller to signal all pending operations (e.g., OAuth flow monitors)
-    // that the job is done and they should clean up
-    if (runtime) {
-      runtime.abortController.abort();
+    const existingJob = await jobStore.getJob(streamId);
+    this.assertServiceGeneration(generation);
+    if (existingJob?.status === 'superseded') {
+      return;
     }
 
-    // Clear content state and run step buffer (Redis only)
-    jobStore.clearContentState(streamId);
-    this.runStepBuffers?.delete(streamId);
-
-    // For error jobs, DON'T delete immediately - keep around so late-connecting
-    // clients can receive the error. This handles the race condition where error
-    // occurs before client connects to SSE stream.
-    //
-    // Cleanup strategy: Error jobs are cleaned up by periodic cleanup (every 60s)
-    // via jobStore.cleanup() which checks for jobs with status 'error' and
-    // completedAt set. The TTL is configurable via jobStore options (default: 0,
-    // meaning cleanup on next interval). This gives clients ~60s to connect and
-    // receive the error before the job is removed.
     if (error) {
+      const runtime = this.runtimeState.get(streamId);
+      if (runtime && !runtime.abortController.signal.aborted) {
+        runtime.abortController.abort('generation_completed');
+      }
+      jobStore.clearContentState(streamId);
+      this.runStepBuffers?.delete(streamId);
       await jobStore.updateJob(streamId, {
         status: 'error',
         completedAt: Date.now(),
         error,
       });
       this.assertServiceGeneration(generation);
-      // Keep runtime state so subscribe() can access errorEvent
+      await jobStore.completeLogicalTurn(streamId);
+      this.assertServiceGeneration(generation);
       logger.debug(
         `[GenerationJobManager] Job completed with error (keeping for late subscribers): ${streamId}`,
       );
       return;
     }
 
-    // Immediate cleanup if configured (default: true) - only for successful completions
-    if (cleanupOnComplete) {
-      // Don't cleanup eventTransport here - let the done event fully transmit first.
-      // EventTransport will be cleaned up when subscribers disconnect or by periodic cleanup.
-      await jobStore.deleteJob(streamId);
+    await jobStore.updateJob(streamId, {
+      status: 'complete',
+      completedAt: Date.now(),
+      generationCompleted: true,
+    });
+    this.assertServiceGeneration(generation);
+    const refreshedJob = await jobStore.getJob(streamId);
+    this.assertServiceGeneration(generation);
+    const hasTrustedLifecycle = Boolean(refreshedJob?.interactionContext?.logical_turn_id);
+    const presentationCommitted = refreshedJob?.deliveryAcknowledgement?.state === 'committed';
+    if (hasTrustedLifecycle && !presentationCommitted) {
+      logger.debug(
+        `[GenerationJobManager] Generation complete; awaiting presentation acknowledgement: ${streamId}`,
+      );
+      return;
+    }
+
+    if (hasTrustedLifecycle) {
+      await this.finalizeCompletedJob(
+        streamId,
+        refreshedJob?.deliveryPolicy?.commit_authority === 'external_adapter',
+        services,
+      );
       this.assertServiceGeneration(generation);
+    } else {
+      const runtime = this.runtimeState.get(streamId);
+      if (runtime && !runtime.abortController.signal.aborted) {
+        runtime.abortController.abort('generation_completed');
+      }
+      jobStore.clearContentState(streamId);
+      this.runStepBuffers?.delete(streamId);
+      if (cleanupOnComplete) {
+        await jobStore.deleteJob(streamId);
+        this.assertServiceGeneration(generation);
+      }
       if (!runtime || this.runtimeState.get(streamId) === runtime) {
         this.runtimeState.delete(streamId);
       }
-    } else {
-      // Only update status if keeping the job around
-      await jobStore.updateJob(streamId, {
-        status: 'complete',
-        completedAt: Date.now(),
-      });
-      this.assertServiceGeneration(generation);
     }
+    await this.finalizeCompletedJob(streamId);
 
     logger.debug(`[GenerationJobManager] Job completed: ${streamId}`);
     /* === VIVENTIUM END === */
@@ -891,6 +1176,7 @@ class GenerationJobManagerClass {
     this.assertServiceGeneration(generation);
     jobStore.clearContentState(streamId);
     this.runStepBuffers?.delete(streamId);
+    await this.jobStore.completeLogicalTurn(streamId);
 
     // Immediate cleanup if configured (default: true)
     if (cleanupOnComplete) {
@@ -984,7 +1270,7 @@ class GenerationJobManagerClass {
       if (generation !== this.serviceGeneration || this.runtimeState.get(streamId) !== runtime) {
         return;
       }
-      if (jobData && ['complete', 'error', 'aborted'].includes(jobData.status)) {
+      if (jobData && ['complete', 'error', 'aborted', 'superseded'].includes(jobData.status)) {
         // Check for error status FIRST and prioritize error handling
         if (jobData.status === 'error' && (runtime.errorEvent || jobData.error)) {
           const errorToSend = runtime.errorEvent ?? jobData.error;
@@ -1000,8 +1286,17 @@ class GenerationJobManagerClass {
       }
     });
 
+    /* === VIVENTIUM START ===
+     * Purpose: The transport may install its local callback before the backing
+     * subscription is acknowledged. Keep user delivery behind the readiness
+     * boundary and let earlyEventBuffer provide the one authoritative replay.
+     */
+    let transportReady = false;
     const subscription = eventTransport.subscribe(streamId, {
       onChunk: (event) => {
+        if (!transportReady) {
+          return;
+        }
         const e = event as t.ServerSentEvent;
         // Filter out internal events
         if (!(e as Record<string, unknown>)._internal) {
@@ -1028,6 +1323,7 @@ class GenerationJobManagerClass {
       });
       await (signal ? Promise.race([subscription.ready, cancellation]) : subscription.ready);
       this.assertServiceGeneration(generation);
+      transportReady = true;
     } catch (error) {
       subscription.unsubscribe();
       throw error;
@@ -1097,6 +1393,9 @@ class GenerationJobManagerClass {
       (event as t.ServerSentEvent & { _viventiumAllowAfterAbort?: boolean })
         ._viventiumAllowAfterAbort === true;
     if (!runtime || (runtime.abortController.signal.aborted && !allowAfterAbort)) {
+      return;
+    }
+    if (!(await this.jobStore.isCurrentLogicalTurn(streamId))) {
       return;
     }
 
@@ -1375,6 +1674,11 @@ class GenerationJobManagerClass {
      * generation and reject stale completion.
      */
     const services = this.captureServices();
+    if (!(await services.jobStore.isCurrentLogicalTurn(streamId))) {
+      this.assertServiceGeneration(services.generation);
+      return;
+    }
+    this.assertServiceGeneration(services.generation);
     const runtime = this.runtimeState.get(streamId);
     if (runtime) {
       runtime.finalEvent = event;
@@ -1401,6 +1705,11 @@ class GenerationJobManagerClass {
      * generation and reject stale completion.
      */
     const services = this.captureServices();
+    if (!(await services.jobStore.isCurrentLogicalTurn(streamId))) {
+      this.assertServiceGeneration(services.generation);
+      return;
+    }
+    this.assertServiceGeneration(services.generation);
     const runtime = this.runtimeState.get(streamId);
     if (runtime) {
       runtime.errorEvent = error;
@@ -1512,14 +1821,15 @@ class GenerationJobManagerClass {
    */
   async getJobCountByStatus(): Promise<Record<t.GenerationJobStatus, number>> {
     const services = this.captureServices();
-    const [running, complete, error, aborted] = await Promise.all([
+    const [running, complete, error, aborted, superseded] = await Promise.all([
       services.jobStore.getJobCountByStatus('running'),
       services.jobStore.getJobCountByStatus('complete'),
       services.jobStore.getJobCountByStatus('error'),
       services.jobStore.getJobCountByStatus('aborted'),
+      services.jobStore.getJobCountByStatus('superseded'),
     ]);
     this.assertServiceGeneration(services.generation);
-    return { running, complete, error, aborted };
+    return { running, complete, error, aborted, superseded };
   }
 
   getRuntimeStats(): {
@@ -1549,6 +1859,39 @@ class GenerationJobManagerClass {
     const activeJobIds = await services.jobStore.getActiveJobIdsByUser(userId);
     this.assertServiceGeneration(services.generation);
     return activeJobIds;
+  }
+
+  /** Resolve the newest active stream by stable conversation identity. */
+  async getActiveStreamIdForConversation(
+    userId: string,
+    conversationId: string,
+  ): Promise<string | undefined> {
+    const streamIds = await this.jobStore.getActiveJobIdsByUser(userId);
+    let newest: SerializableJobData | undefined;
+    for (const streamId of streamIds) {
+      const job = await this.jobStore.getJob(streamId);
+      if (
+        job?.status === 'running' &&
+        job.conversationId === conversationId &&
+        (!newest || job.createdAt > newest.createdAt)
+      ) {
+        newest = job;
+      }
+    }
+    return newest?.streamId;
+  }
+
+  /** Conversation identities used by web navigation/title state, deduplicated from stream IDs. */
+  async getActiveConversationIdsForUser(userId: string): Promise<string[]> {
+    const streamIds = await this.jobStore.getActiveJobIdsByUser(userId);
+    const conversationIds = new Set<string>();
+    for (const streamId of streamIds) {
+      const job = await this.jobStore.getJob(streamId);
+      if (job?.status === 'running') {
+        conversationIds.add(job.conversationId ?? streamId);
+      }
+    }
+    return [...conversationIds];
   }
 
   /**

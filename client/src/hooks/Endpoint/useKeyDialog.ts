@@ -16,9 +16,11 @@ type ProviderSlug = 'openai' | 'anthropic';
 type OAuthSuccessMessage = {
   type: 'viventium_connected_account_oauth_success';
   provider?: ProviderSlug;
+  attemptId?: string;
 };
 
 type ConnectedAccountStartResponse = {
+  attemptId?: string;
   authUrl?: string;
   flowMode?: 'popup_callback' | 'manual_code';
 };
@@ -74,6 +76,8 @@ export const useKeyDialog = ({
   const [connectingProvider, setConnectingProvider] = useState<ProviderSlug | null>(null);
   const popupMonitorsRef = useRef<Partial<Record<ProviderSlug, number>>>({});
   const popupWindowsRef = useRef<Partial<Record<ProviderSlug, Window>>>({});
+  const oauthAttemptIdsRef = useRef<Partial<Record<ProviderSlug, string>>>({});
+  const flowRequestsRef = useRef<Partial<Record<ProviderSlug, number>>>({});
   const queryClient = useQueryClient();
   const { showToast } = useToastContext();
   const localize = useLocalize();
@@ -122,6 +126,9 @@ export const useKeyDialog = ({
       if (provider !== 'openai' && provider !== 'anthropic') {
         return;
       }
+      if (event.data.attemptId !== oauthAttemptIdsRef.current[provider]) {
+        return;
+      }
       const hasLocalPopupMonitor = popupMonitorsRef.current[provider] != null;
       if (!hasLocalPopupMonitor && connectingProvider !== provider) {
         return;
@@ -133,6 +140,7 @@ export const useKeyDialog = ({
         popup.close();
       }
       delete popupWindowsRef.current[provider];
+      delete oauthAttemptIdsRef.current[provider];
       void invalidateProviderKey(provider);
       setConnectingProvider((current) => (current === provider ? null : current));
 
@@ -156,11 +164,17 @@ export const useKeyDialog = ({
   ]);
 
   useEffect(() => {
+    const oauthAttemptIds = oauthAttemptIdsRef.current;
+    const flowRequests = flowRequestsRef.current;
     return () => {
       clearPopupMonitor('openai');
       clearPopupMonitor('anthropic');
       clearPopupWindow('openai');
       clearPopupWindow('anthropic');
+      delete oauthAttemptIds.openai;
+      delete oauthAttemptIds.anthropic;
+      flowRequests.openai = (flowRequests.openai ?? 0) + 1;
+      flowRequests.anthropic = (flowRequests.anthropic ?? 0) + 1;
     };
   }, [clearPopupMonitor, clearPopupWindow]);
 
@@ -173,6 +187,10 @@ export const useKeyDialog = ({
       if (connectingProvider === provider) {
         return;
       }
+
+      const flowRequest = (flowRequestsRef.current[provider] ?? 0) + 1;
+      flowRequestsRef.current[provider] = flowRequest;
+      delete oauthAttemptIdsRef.current[provider];
 
       const popup = window.open('', '_blank', 'width=640,height=760');
       if (!popup) {
@@ -191,12 +209,20 @@ export const useKeyDialog = ({
       try {
         const startUrl = `${apiBaseUrl()}/api/connected-accounts/${provider}/start`;
         const response = await request.get<ConnectedAccountStartResponse>(startUrl);
+        const attemptId = response?.attemptId;
         const authUrl = response?.authUrl;
         const flowMode = response?.flowMode ?? 'popup_callback';
 
-        if (!authUrl) {
+        if (flowRequestsRef.current[provider] !== flowRequest) {
+          popup.close();
+          return;
+        }
+
+        if (!authUrl || !attemptId) {
           throw new Error('oauth_start_failed');
         }
+
+        oauthAttemptIdsRef.current[provider] = attemptId;
 
         popup.location.href = authUrl;
 
@@ -221,6 +247,7 @@ export const useKeyDialog = ({
           window.dispatchEvent(new Event(CONNECTED_ACCOUNTS_OPEN_EVENT));
 
           clearPopupMonitor(provider);
+          delete oauthAttemptIdsRef.current[provider];
           setConnectingProvider((current) => (current === provider ? null : current));
           showToast({
             message: localize('com_ui_connected_account_manual_open_settings', {
@@ -239,6 +266,7 @@ export const useKeyDialog = ({
 
           clearPopupMonitor(provider);
           delete popupWindowsRef.current[provider];
+          delete oauthAttemptIdsRef.current[provider];
           void invalidateProviderKey(provider);
           setConnectingProvider((current) => (current === provider ? null : current));
         }, 800);
@@ -250,6 +278,7 @@ export const useKeyDialog = ({
           activePopup.close();
         }
         delete popupWindowsRef.current[provider];
+        delete oauthAttemptIdsRef.current[provider];
         const providerName =
           provider === 'openai' ? localize('com_ui_openai') : localize('com_ui_anthropic');
         showToast({
@@ -260,7 +289,6 @@ export const useKeyDialog = ({
     },
     [
       clearPopupMonitor,
-      clearPopupWindow,
       connectedAccountsEnabled,
       connectingProvider,
       invalidateProviderKey,

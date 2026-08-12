@@ -17,42 +17,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 
-# === VIVENTIUM START ===
-# Rationale: ship a default scheduled self-prompt contract so scheduler runs preserve
-# Phase A / Phase B parity even when env overrides are absent.
-BREW_PROMPT_MARKER = "<!--viv_internal:brew_begin-->"
-BREW_PROMPT_HEADER = "## Background Processing (Brewing)"
-SCHEDULED_SELF_PROMPT_LINE = (
-    "This is a scheduled self-prompt (for example: morning briefing, wake cycle, reminder, or passive check), "
-    "not a new user scheduling request."
-)
-LIVE_FACT_CONTRACT_LINE = (
-    "For live external facts such as weather, news, markets, web facts, calendar, email, tasks, "
-    "current-day plans, or connected-account facts, include them only when a verified tool/cortex "
-    "result or the deterministic scheduled-run context below supports the claim; otherwise omit "
-    "that section instead of guessing, inferring from memory, or apologizing about missing data."
-)
-SCHEDULED_RUN_CONTEXT_HEADER = "## Scheduled Run Context (Deterministic)"
 SCHEDULED_RUN_CONTEXT_CONTRACT_LINE = (
     "Use `scheduled_due_local_date` as the anchor date for this run. Do not carry forward dates "
     "or day labels from earlier messages in the conversation, and do not use the next recurrence "
     "as today's date."
 )
-DEFAULT_SCHEDULER_PROMPT_PREFIX = "\n".join(
-    [
-        BREW_PROMPT_MARKER,
-        BREW_PROMPT_HEADER,
-        SCHEDULED_SELF_PROMPT_LINE,
-        (
-            "If background agents are activated and still brewing, and the real user-visible answer "
-            "should wait for their insights, output exactly {NTA}."
-        ),
-        "If you can already give a complete stable answer without waiting, answer normally.",
-        LIVE_FACT_CONTRACT_LINE,
-        "Do not mention internal mechanics or talk about scheduling.",
-    ]
-)
-# === VIVENTIUM END ===
 
 # === VIVENTIUM START ===
 # Feature: Multi-channel dispatch support.
@@ -72,7 +41,7 @@ from .utils import ensure_timezone, parse_iso, to_utc_iso
 def _find_shared_path(start_path: Path) -> Optional[Path]:
     for parent in [start_path] + list(start_path.parents):
         candidate = parent / "shared"
-        if candidate.is_dir():
+        if (candidate / "scheduler_prompt_contract.py").is_file():
             return candidate
     return None
 
@@ -80,6 +49,26 @@ def _find_shared_path(start_path: Path) -> Optional[Path]:
 _SHARED_PATH = _find_shared_path(Path(__file__).resolve())  # .../viventium_v0_4/shared
 if _SHARED_PATH and str(_SHARED_PATH) not in sys.path:
     sys.path.insert(0, str(_SHARED_PATH))
+
+from scheduler_prompt_contract import (
+    CONSCIOUSNESS_CONTINUITY_OPPORTUNITY_PROMPT_ID,
+    SCHEDULER_RUN_ENVELOPE_PROMPT_ID,
+    SCHEDULER_RUN_ENVELOPE_TEMPLATE,
+    render_scheduler_run_envelope,
+)
+
+_ENVELOPE_LINES = SCHEDULER_RUN_ENVELOPE_TEMPLATE.splitlines()
+BREW_PROMPT_MARKER = _ENVELOPE_LINES[0]
+BREW_PROMPT_HEADER = _ENVELOPE_LINES[1]
+SCHEDULED_RUN_CONTEXT_HEADER = next(
+    line for line in _ENVELOPE_LINES if line.startswith("## Scheduled Run Context")
+)
+LIVE_FACT_CONTRACT_LINE = next(
+    line for line in _ENVELOPE_LINES if line.startswith("For live external facts")
+)
+DEFAULT_SCHEDULER_PROMPT_PREFIX = SCHEDULER_RUN_ENVELOPE_TEMPLATE.split(
+    f"\n\n{SCHEDULED_RUN_CONTEXT_HEADER}", 1
+)[0]
 
 try:
     from no_response import is_no_response_only, strip_trailing_nta
@@ -210,6 +199,26 @@ except Exception:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _declared_scheduler_source_prompt_id(task: Dict[str, Any]) -> Optional[str]:
+    """Expose recognized structured prompt provenance without activating a policy."""
+
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    workbench = (
+        metadata.get("workbench_scheduled_prompt")
+        if isinstance(metadata.get("workbench_scheduled_prompt"), dict)
+        else {}
+    )
+    declared = str(
+        task.get("source_prompt_id")
+        or workbench.get("source_prompt_id")
+        or metadata.get("source_prompt_id")
+        or ""
+    ).strip()
+    if declared == CONSCIOUSNESS_CONTINUITY_OPPORTUNITY_PROMPT_ID:
+        return CONSCIOUSNESS_CONTINUITY_OPPORTUNITY_PROMPT_ID
+    return None
 
 
 # === VIVENTIUM NOTE ===
@@ -706,6 +715,13 @@ def _format_scheduled_run_context_block(run_context: Dict[str, str]) -> str:
     return "\n".join(lines)
 
 
+def _default_scheduler_run_envelope(scheduled_run_context: str) -> str:
+    context = str(scheduled_run_context or "").strip()
+    if context.startswith(SCHEDULED_RUN_CONTEXT_HEADER):
+        context = context[len(SCHEDULED_RUN_CONTEXT_HEADER) :].lstrip()
+    return render_scheduler_run_envelope(context)
+
+
 _WEEKDAY_NAME_TO_INDEX = {calendar.day_name[index].lower(): index for index in range(7)}
 _MONTH_NAME_TO_INDEX = {calendar.month_name[index].lower(): index for index in range(1, 13)}
 _MONTH_NAME_TO_INDEX.update({calendar.month_abbr[index].lower(): index for index in range(1, 13)})
@@ -816,11 +832,19 @@ def _compose_prompt(
 ) -> str:
     base = (task.get("prompt") or "").strip()
     prefix = _get_prompt_prefix()
+    custom_prefix = str(
+        os.getenv("SCHEDULER_PROMPT_PREFIX")
+        or os.getenv("SCHEDULING_PROMPT_PREFIX")
+        or ""
+    ).strip()
     context = run_context or _build_scheduled_run_context(task, now_utc=now_utc)
     context_block = "" if _has_scheduled_run_context(base) else _format_scheduled_run_context_block(context)
     parts: list[str] = []
     base_has_scheduler_prefix = _looks_like_scheduled_self_prompt(base)
-    if prefix and not base_has_scheduler_prefix:
+    if not base_has_scheduler_prefix and context_block and not custom_prefix:
+        parts.append(_default_scheduler_run_envelope(context_block))
+        context_block = ""
+    elif prefix and not base_has_scheduler_prefix:
         parts.append(prefix)
     if base and base_has_scheduler_prefix:
         parts.append(base)
@@ -1423,7 +1447,8 @@ def _stream_scheduler_response(
     user_id: str,
     secret: str,
     timeout_s: int,
-) -> Tuple[str, str, str]:
+    return_metadata: bool = False,
+) -> Tuple[str, str, str] | Tuple[str, str, str, Dict[str, Any]]:
     params_data = {"userId": str(user_id)}
     params = urllib.parse.urlencode(params_data)
     url = f"{base_url}/api/viventium/scheduler/stream/{stream_id}?{params}"
@@ -1432,6 +1457,7 @@ def _stream_scheduler_response(
     final_text = ""
     response_message_id = ""
     followup_text = ""
+    stream_metadata: Dict[str, Any] = {}
     for raw in _iter_sse_payloads(url, headers, timeout_s):
         try:
             payload = json.loads(raw)
@@ -1441,6 +1467,15 @@ def _stream_scheduler_response(
             continue
         if "error" in payload:
             raise RuntimeError(payload.get("error") or "Scheduler stream error")
+        if (
+            payload.get("superseded") is True
+            or payload.get("disposition") == "superseded"
+            or payload.get("state") == "superseded"
+        ):
+            stream_metadata["superseded"] = True
+        for field in ("logical_turn_id", "revision"):
+            if payload.get(field) is not None:
+                stream_metadata[field] = payload[field]
         if not response_message_id:
             response_message_id = _extract_response_message_id(payload)
         if not followup_text:
@@ -1453,7 +1488,8 @@ def _stream_scheduler_response(
             break
     if not final_text:
         final_text = "".join(chunks).strip()
-    return final_text.strip(), response_message_id, followup_text.strip()
+    base_result = (final_text.strip(), response_message_id, followup_text.strip())
+    return (*base_result, stream_metadata) if return_metadata else base_result
 
 
 def _poll_scheduler_followup(
@@ -1536,6 +1572,12 @@ def _run_scheduler_generation(
     schedule = task.get("schedule") or {}
     run_context = _build_scheduled_run_context(task)
     execution = _scheduled_agent_execution()
+    source_prompt_id = _declared_scheduler_source_prompt_id(task)
+    idempotency_key = str(
+        task.get("_scheduled_prompt_occurrence_key")
+        or task.get("_scheduled_prompt_run_id")
+        or ""
+    ).strip()
     payload = {
         "userId": task.get("user_id"),
         "agentId": task.get("agent_id"),
@@ -1547,26 +1589,79 @@ def _run_scheduler_generation(
         "scheduledDueAt": run_context.get("scheduled_due_at_utc"),
         "schedulerRunContext": run_context,
     }
+    if idempotency_key:
+        payload["idempotencyKey"] = idempotency_key
+        payload["source_event_id"] = idempotency_key
     if execution:
         payload["model"] = execution["model"]
         payload["reasoning_effort"] = execution["reasoning_effort"]
         payload["scheduledAgentExecution"] = execution
+    if source_prompt_id:
+        payload["sourcePromptId"] = source_prompt_id
     headers = {
         "Content-Type": "application/json",
         "X-VIVENTIUM-SCHEDULER-SECRET": secret,
     }
-    response = _post_json(f"{base_url}/api/viventium/scheduler/chat", payload, headers, timeout_s)
+    chat_url = f"{base_url}/api/viventium/scheduler/chat"
+    try:
+        response = _post_json(chat_url, payload, headers, timeout_s)
+    except (urllib.error.URLError, TimeoutError):
+        if not idempotency_key:
+            raise
+        reconcile_url = (
+            f"{base_url}/api/viventium/scheduler/dispatches/"
+            f"{urllib.parse.quote(idempotency_key, safe='')}?"
+            f"{urllib.parse.urlencode({'userId': str(task.get('user_id') or '')})}"
+        )
+        try:
+            response = _get_json(reconcile_url, headers, timeout_s)
+        except HttpJsonError as error:
+            if error.status != 404:
+                raise
+            response = _post_json(chat_url, payload, headers, timeout_s)
+        else:
+            if str(response.get("state") or "").strip().lower() == "reserved":
+                response = _post_json(chat_url, payload, headers, timeout_s)
     stream_id = response.get("streamId") or response.get("stream_id")
     if not stream_id:
         raise RuntimeError("Scheduler dispatch missing streamId")
-    stream_timeout_s = int(os.getenv("SCHEDULER_STREAM_TIMEOUT_S", "120"))
-    final_text, response_message_id, followup_text = _stream_scheduler_response(
-        base_url,
-        stream_id,
-        str(task.get("user_id") or ""),
-        secret,
-        stream_timeout_s,
-    )
+    # Scheduled Main uses the governed high-reasoning route and can legitimately need more than
+    # the old two-minute interactive ceiling. Keep the wait below the scheduler's 15-minute lease;
+    # the bounded worker pool prevents one long generation from blocking other schedules.
+    stream_timeout_s = int(os.getenv("SCHEDULER_STREAM_TIMEOUT_S", "600"))
+    try:
+        streamed = _stream_scheduler_response(
+            base_url,
+            stream_id,
+            str(task.get("user_id") or ""),
+            secret,
+            stream_timeout_s,
+            return_metadata=True,
+        )
+    except TimeoutError:
+        # A scheduled model turn is authoring, not an independently committed external effect.
+        # Explicitly cancel it when the scheduler's bounded wait expires so an unfinished
+        # placeholder cannot keep running forever after the ledger truthfully records failure.
+        cancel_url = (
+            f"{base_url}/api/viventium/scheduler/stream/"
+            f"{urllib.parse.quote(str(stream_id), safe='')}/cancel"
+        )
+        try:
+            _post_json(
+                cancel_url,
+                {"userId": str(task.get("user_id") or ""), "reason": "stream_timeout"},
+                headers,
+                min(max(1, timeout_s), 10),
+            )
+        except Exception as cancel_error:
+            logger.warning(
+                "Scheduler timed-out stream cancellation failed for %s: %s",
+                stream_id,
+                cancel_error,
+            )
+        raise
+    final_text, response_message_id, followup_text = streamed[:3]
+    stream_metadata = streamed[3] if len(streamed) > 3 and isinstance(streamed[3], dict) else {}
     resolved_conversation_id = _extract_conversation_id(response, conversation_id)
     polled_state = {"followup_text": "", "canonical_text": "", "canonical_text_source": ""}
     final_text_source = "stream_final" if str(final_text or "").strip() else ""
@@ -2695,11 +2790,32 @@ def _dispatch_glasshive_task(task: Dict[str, Any]) -> Dict[str, Any]:
     if not _glasshive_callback_secret():
         raise RuntimeError("SCHEDULING_GLASSHIVE_CALLBACK_SECRET is required for signed GlassHive callbacks")
 
+    trigger_kind = str(task.get("_scheduled_prompt_trigger_kind") or "unknown")
+    trigger_source = str(task.get("_scheduled_prompt_trigger_source") or "unverified_caller")
     storage = _scheduler_storage()
     task, wb = _refresh_workbench_rendered_prompt(storage, task, wb)
     now = datetime.now(timezone.utc)
     now_iso = to_utc_iso(now)
-    run_id = f"sp_run_{uuid.uuid4().hex}"
+    execution_snapshot = {
+        "executor": "glasshive_host",
+        "dispatch_idempotency_key": str(
+            task.get("_scheduled_prompt_occurrence_key")
+            or task.get("_scheduled_prompt_run_id")
+            or ""
+        ),
+        "model": _workbench_codex_model(wb.get("execution_model")),
+        "reasoning_effort": _workbench_codex_reasoning_effort(wb.get("reasoning_effort")),
+        "profile": _glasshive_execution_profile(wb),
+        "backend": _glasshive_execution_backend(wb),
+        "execution_mode": _glasshive_execution_mode(wb),
+        **(
+            {"source_prompt_id": source_prompt_id}
+            if (source_prompt_id := _declared_scheduler_source_prompt_id(task))
+            else {}
+        ),
+    }
+    preclaimed_run_id = str(task.get("_scheduled_prompt_run_id") or "").strip()
+    run_id = preclaimed_run_id or f"sp_run_{uuid.uuid4().hex}"
     rendered_text = str(task.get("prompt") or "")
     rendered_hash = str(wb.get("rendered_hash") or _sha256_prefix(rendered_text))
     snapshot_hash = str(wb.get("variable_snapshot_hash") or "")
@@ -2717,10 +2833,11 @@ def _dispatch_glasshive_task(task: Dict[str, Any]) -> Dict[str, Any]:
             "rendered_prompt": rendered_text,
             "variable_snapshot_json": wb.get("variable_snapshot_json"),
             "periphery_snapshot_ref": wb.get("periphery_snapshot_ref"),
+            "trigger_kind": trigger_kind,
+            "trigger_source": trigger_source,
         },
     )
-    storage.create_scheduled_prompt_run(
-        {
+    run_record = {
             "run_id": run_id,
             "task_id": str(task.get("id") or ""),
             "definition_id": wb.get("definition_id"),
@@ -2740,10 +2857,23 @@ def _dispatch_glasshive_task(task: Dict[str, Any]) -> Dict[str, Any]:
             "error_class": None,
             "private_detail_path": private_detail_path,
             "callback_payload_json": None,
+            "trigger_kind": trigger_kind,
+            "trigger_source": trigger_source,
+            "execution_snapshot": execution_snapshot,
             "created_at": now_iso,
             "updated_at": now_iso,
         }
-    )
+    if preclaimed_run_id:
+        storage.update_scheduled_prompt_run(
+            run_id,
+            {
+                key: value
+                for key, value in run_record.items()
+                if key not in {"run_id", "task_id", "user_id", "created_at"}
+            },
+        )
+    else:
+        storage.create_scheduled_prompt_run(run_record)
 
     if (os.getenv("SCHEDULER_GLASSHIVE_DISABLE_DISPATCH") or "").strip() == "1":
         storage.update_scheduled_prompt_run(
@@ -2762,6 +2892,7 @@ def _dispatch_glasshive_task(task: Dict[str, Any]) -> Dict[str, Any]:
                 "channels": {"workbench": {"outcome": "queued", "reason": "test_disabled"}},
             },
             "scheduled_prompt_run_id": run_id,
+            "execution": execution_snapshot,
         }
 
     try:
@@ -2826,12 +2957,37 @@ def _dispatch_glasshive_task(task: Dict[str, Any]) -> Dict[str, Any]:
         worker_id = str(worker.get("worker_id") or "").strip()
         if not worker_id:
             raise RuntimeError("GlassHive worker find-or-resume did not return worker_id")
-        run = _post_json(
-            f"{base_url}/v1/workers/{urllib.parse.quote(worker_id)}/assign",
-            {"instruction": _glasshive_instruction(task, wb)},
-            _glasshive_headers(),
-            timeout_s,
-        )
+        dispatch_key = str(
+            task.get("_scheduled_prompt_occurrence_key")
+            or task.get("_scheduled_prompt_run_id")
+            or run_id
+        ).strip()
+        assign_url = f"{base_url}/v1/workers/{urllib.parse.quote(worker_id)}/assign"
+        assign_headers = _glasshive_headers()
+        assign_headers["X-GlassHive-Idempotency-Key"] = dispatch_key
+        try:
+            run = _post_json(
+                assign_url,
+                {"instruction": _glasshive_instruction(task, wb)},
+                assign_headers,
+                timeout_s,
+            )
+        except (urllib.error.URLError, TimeoutError):
+            reconcile_url = (
+                f"{base_url}/v1/workers/{urllib.parse.quote(worker_id)}/"
+                f"assignments/by-idempotency/{urllib.parse.quote(dispatch_key, safe='')}"
+            )
+            try:
+                run = _get_json(reconcile_url, assign_headers, timeout_s)
+            except HttpJsonError as error:
+                if error.status != 404:
+                    raise
+                run = _post_json(
+                    assign_url,
+                    {"instruction": _glasshive_instruction(task, wb)},
+                    assign_headers,
+                    timeout_s,
+                )
         glasshive_run_id = str(run.get("run_id") or "").strip()
         if not glasshive_run_id:
             raise RuntimeError("GlassHive assign did not return run_id")
@@ -2870,6 +3026,7 @@ def _dispatch_glasshive_task(task: Dict[str, Any]) -> Dict[str, Any]:
             },
             "scheduled_prompt_run_id": run_id,
             "glasshive_run_id": glasshive_run_id,
+            "execution": execution_snapshot,
         }
     except Exception as exc:
         storage.update_scheduled_prompt_run(
@@ -3219,19 +3376,23 @@ def _deliver_telegram_generated_text(
     response_message_id: Optional[str],
     visibility: Dict[str, Any],
 ) -> Dict[str, Any]:
-    telegram_user_id, telegram_chat_id, voice_preferences = _resolve_telegram_identity(
-        task,
-        base_url,
-        timeout_s,
-    )
-    if not telegram_user_id:
-        raise RuntimeError("telegram_user_id is required for Telegram dispatch")
-    if not telegram_chat_id:
-        raise RuntimeError("telegram_chat_id is required for Telegram dispatch")
-
     final_text = visibility.get("final_text") or ""
     followup_text = visibility.get("followup_text") or ""
     send_timeout_s = int(os.getenv("SCHEDULER_TELEGRAM_SEND_TIMEOUT_S", "15"))
+
+    telegram_user_id = None
+    telegram_chat_id = None
+    voice_preferences: Dict[str, Any] = {}
+    if final_text or followup_text:
+        telegram_user_id, telegram_chat_id, voice_preferences = _resolve_telegram_identity(
+            task,
+            base_url,
+            timeout_s,
+        )
+        if not telegram_user_id:
+            raise RuntimeError("telegram_user_id is required for Telegram dispatch")
+        if not telegram_chat_id:
+            raise RuntimeError("telegram_chat_id is required for Telegram dispatch")
 
     if final_text:
         for part in _split_telegram_message(final_text):
@@ -3331,9 +3492,25 @@ def dispatch_task(task: Dict[str, Any]) -> Dict[str, Any]:
     conversation_id = _resolve_conversation_id(task)
 
     channel_results: Dict[str, Dict[str, Any]] = {}
-    errors: Dict[str, str] = {}
+    errors: Dict[str, Dict[str, str]] = {}
     generation_result = _run_scheduler_generation(task, base_url, timeout_s, conversation_id)
     resolved_conversation_id = generation_result.get("conversation_id")
+    if generation_result.get("superseded") or generation_result.get("disposition") == "superseded":
+        superseded_channels = {
+            channel: {"outcome": "superseded", "reason": "newer_stable_turn"}
+            for channel in channels
+        }
+        return {
+            "conversation_id": resolved_conversation_id,
+            "delivery": {
+                "outcome": "superseded",
+                "reason": "newer_stable_turn",
+                "generated_text": None,
+                "channels": superseded_channels,
+            },
+            "logical_turn_id": generation_result.get("logical_turn_id"),
+            "revision": generation_result.get("revision"),
+        }
     visibility = _prepare_generated_visibility(
         task,
         str(generation_result.get("final_text") or ""),
@@ -3366,7 +3543,11 @@ def dispatch_task(task: Dict[str, Any]) -> Dict[str, Any]:
                 ),
             }
         except Exception as exc:
-            errors["telegram"] = str(exc)
+            errors["telegram"] = {
+                "outcome": "failed",
+                "reason": "channel_dispatch_failed",
+                "error_class": type(exc).__name__,
+            }
             logger.warning(
                 "[scheduling-cortex] Channel dispatch failed (best-effort continues): "
                 "channel=%s task_id=%s error=%s",
@@ -3375,13 +3556,25 @@ def dispatch_task(task: Dict[str, Any]) -> Dict[str, Any]:
                 exc,
             )
 
+    if "workbench" in channels:
+        channel_results["workbench"] = {
+            "conversation_id": resolved_conversation_id,
+            "delivery": {
+                "outcome": "audit_only",
+                "reason": "workbench_channel_is_audit_only",
+                "generated_text": None,
+            },
+        }
+
     # === VIVENTIUM NOTE ===
     # Feature: Best-effort multi-channel dispatch.
     # Scheduler generation is canonical. Requested channel delivery still succeeds if at
     # least one requested channel delivered or intentionally suppressed with a truthful ledger.
     if not channel_results:
-        detail = "; ".join([f"{name}: {error}" for name, error in errors.items()])
-        raise RuntimeError(f"Dispatch failed for all channels: {detail}")
+        classes = ", ".join(
+            sorted({str(error.get("error_class") or "Error") for error in errors.values()})
+        )
+        raise RuntimeError(f"Dispatch failed for all channels ({classes or 'Error'})")
     if errors:
         logger.info(
             "[scheduling-cortex] Partial dispatch success: task_id=%s succeeded=%s failed=%s",
@@ -3397,6 +3590,7 @@ def dispatch_task(task: Dict[str, Any]) -> Dict[str, Any]:
     generated_text: Optional[str] = None
     saw_sent = False
     saw_fallback_delivered = False
+    saw_audit_only = False
     suppress_reasons: list[str] = []
     fallback_reasons: list[str] = []
     saw_non_failed = False
@@ -3418,18 +3612,25 @@ def dispatch_task(task: Dict[str, Any]) -> Dict[str, Any]:
                 saw_non_failed = True
                 if reason:
                     suppress_reasons.append(f"{channel}:{reason}")
+            elif outcome == "audit_only":
+                saw_audit_only = True
+                saw_non_failed = True
             elif outcome:
                 saw_non_failed = True
             if not generated_text:
                 text = detail.get("generated_text")
                 if isinstance(text, str) and text.strip():
                     generated_text = text.strip()
+    delivery_by_channel.update(errors)
     if saw_sent:
         delivery_outcome = "sent"
         delivery_reason = "delivered"
     elif saw_fallback_delivered:
         delivery_outcome = "fallback_delivered"
         delivery_reason = "; ".join(fallback_reasons) if fallback_reasons else "deferred_fallback"
+    elif saw_audit_only:
+        delivery_outcome = "audit_only"
+        delivery_reason = "workbench_channel_is_audit_only"
     elif saw_non_failed:
         delivery_outcome = "suppressed"
         delivery_reason = "; ".join(suppress_reasons) if suppress_reasons else "suppressed"

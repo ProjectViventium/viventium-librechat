@@ -71,6 +71,7 @@ const {
   createMCPTool,
   createMCPTools,
   getMCPSetupData,
+  resolveConfigServers,
   checkOAuthFlowStatus,
   getServerConnectionStatus,
 } = require('./MCP');
@@ -139,6 +140,24 @@ describe('tests for the new helper functions used by the MCP connection status e
     mockGetFlowStateManager = require('~/config').getFlowStateManager;
     mockGetLogStores = require('~/cache').getLogStores;
     mockGetOAuthReconnectionManager = require('~/config').getOAuthReconnectionManager;
+  });
+
+  describe('resolveConfigServers', () => {
+    it('falls back to the registry bulk API while preserving request-scoped config metadata', async () => {
+      const configServers = {
+        private_source: { viventiumAccess: { audience: 'local_owner' } },
+      };
+      mockGetAppConfig.mockResolvedValueOnce({ mcpConfig: configServers });
+      mockRegistryInstance.getAllServerConfigs.mockResolvedValueOnce(configServers);
+
+      await expect(resolveConfigServers({ user: { id: 'user-1', role: 'USER' } })).resolves.toEqual(
+        configServers,
+      );
+      expect(mockRegistryInstance.getAllServerConfigs).toHaveBeenCalledWith(
+        'user-1',
+        configServers,
+      );
+    });
   });
 
   describe('getMCPSetupData', () => {

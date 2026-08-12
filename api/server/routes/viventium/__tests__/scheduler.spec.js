@@ -17,10 +17,15 @@ let mockGetResumeState;
 let mockSubscribe;
 let mockBuildScheduledGlassHiveCapabilityBundle;
 let mockRevokeScheduledGlassHiveCapabilityGrant;
+let mockAbortJob;
+let mockDeleteSchedulerPlaceholder;
+let mockUpdateSchedulerConversation;
 let lastParentMessageId = null;
 let lastSpec = null;
 let lastAgentId = null;
 let lastScheduledAgentExecution = null;
+let agentControllerCalls = 0;
+const mockSchedulerDispatchIntents = new Map();
 
 jest.mock(
   '@librechat/data-schemas',
@@ -72,11 +77,38 @@ jest.mock('~/server/middleware', () => ({
 }));
 
 jest.mock('~/server/controllers/agents/request', () => (req, res) => {
+  agentControllerCalls += 1;
   lastParentMessageId = req.body.parentMessageId;
   lastSpec = req.body.spec;
   lastAgentId = req.body.agent_id;
   lastScheduledAgentExecution = req.viventiumScheduledAgentExecution ?? null;
   res.json({ streamId: 'stream_1', conversationId: req.body.conversationId || 'new' });
+});
+
+jest.mock('mongoose', () => {
+  const mongoose = jest.requireActual('mongoose');
+  return {
+    ...mongoose,
+    default: mongoose,
+    connection: {
+      collection: () => ({
+        findOne: jest.fn(async ({ _id }) => mockSchedulerDispatchIntents.get(_id) ?? null),
+        updateOne: jest.fn(async ({ _id }, update) => {
+          if (!mockSchedulerDispatchIntents.has(_id)) {
+            mockSchedulerDispatchIntents.set(_id, { _id, ...update.$setOnInsert });
+            return { upsertedCount: 1 };
+          }
+          if (update.$set) {
+            mockSchedulerDispatchIntents.set(_id, {
+              ...mockSchedulerDispatchIntents.get(_id),
+              ...update.$set,
+            });
+          }
+          return { upsertedCount: 0 };
+        }),
+      }),
+    },
+  };
 });
 
 jest.mock('~/server/services/Endpoints/agents', () => ({
@@ -96,11 +128,23 @@ jest.mock('~/models/Agent', () => ({
   getAgent: (...args) => mockGetAgent(...args),
 }));
 
+jest.mock('~/db/models', () => ({
+  Message: {
+    findOneAndDelete: (...args) => mockDeleteSchedulerPlaceholder(...args),
+  },
+  Conversation: {
+    collection: {
+      updateOne: (...args) => mockUpdateSchedulerConversation(...args),
+    },
+  },
+}));
+
 jest.mock('@librechat/api', () => ({
   GenerationJobManager: {
     getJob: (...args) => mockGetJob(...args),
     getResumeState: (...args) => mockGetResumeState(...args),
     subscribe: (...args) => mockSubscribe(...args),
+    abortJob: (...args) => mockAbortJob(...args),
   },
 }));
 
@@ -338,6 +382,9 @@ describe('/api/viventium/scheduler/telegram/resolve', () => {
     });
     mockGetResumeState = jest.fn().mockResolvedValue(null);
     mockSubscribe = jest.fn().mockResolvedValue({ unsubscribe: jest.fn() });
+    mockAbortJob = jest.fn().mockResolvedValue({ success: true });
+    mockDeleteSchedulerPlaceholder = jest.fn().mockResolvedValue({ _id: 'message-object-id' });
+    mockUpdateSchedulerConversation = jest.fn().mockResolvedValue({ modifiedCount: 1 });
     process.env.VIVENTIUM_SCHEDULER_SECRET = 'scheduler_secret';
     process.env.DOMAIN_SERVER = 'http://example.com';
   });
@@ -429,6 +476,8 @@ describe('/api/viventium/scheduler/telegram/resolve', () => {
 describe('/api/viventium/scheduler/chat', () => {
   beforeEach(() => {
     jest.resetModules();
+    agentControllerCalls = 0;
+    mockSchedulerDispatchIntents.clear();
     lastParentMessageId = null;
     lastSpec = null;
     lastAgentId = null;
@@ -446,6 +495,9 @@ describe('/api/viventium/scheduler/chat', () => {
     });
     mockGetResumeState = jest.fn().mockResolvedValue(null);
     mockSubscribe = jest.fn().mockResolvedValue({ unsubscribe: jest.fn() });
+    mockAbortJob = jest.fn().mockResolvedValue({ success: true });
+    mockDeleteSchedulerPlaceholder = jest.fn().mockResolvedValue({ _id: 'message-object-id' });
+    mockUpdateSchedulerConversation = jest.fn().mockResolvedValue({ modifiedCount: 1 });
     process.env.VIVENTIUM_SCHEDULER_SECRET = 'scheduler_secret';
     process.env.DOMAIN_SERVER = 'http://example.com';
   });

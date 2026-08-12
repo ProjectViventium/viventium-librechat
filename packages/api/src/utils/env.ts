@@ -122,11 +122,14 @@ const ALLOWED_BODY_FIELDS = [
   'viventiumInputMode',
   'viventiumStreamId',
   'viventiumGlassHiveIdempotencyKey',
+  'viventiumGlassHiveTurnContextB64',
   'viventiumVoiceRequestId',
   'viventiumVoiceCallSessionId',
   'viventiumTelegramChatId',
   'viventiumTelegramUserId',
   'viventiumTelegramMessageId',
+  'viventiumLogicalTurnId',
+  'viventiumLogicalTurnRevision',
   'files',
   'attachments',
   'tool_resources',
@@ -265,7 +268,11 @@ function bodyFieldToString(fieldValue: unknown): string {
   return String(fieldValue);
 }
 
-function encodeBodyFieldJsonB64Header(field: string, fieldValue: unknown, isHeader: boolean): string {
+function encodeBodyFieldJsonB64Header(
+  field: string,
+  fieldValue: unknown,
+  isHeader: boolean,
+): string {
   const replacementValue = bodyFieldToString(fieldValue);
   if (!replacementValue) {
     return '';
@@ -289,7 +296,11 @@ function encodeBodyFieldJsonB64Header(field: string, fieldValue: unknown, isHead
   return `b64:${Buffer.from(fallback, 'utf8').toString('base64')}`;
 }
 
-function processBodyPlaceholders(value: string, body: RequestBody, isHeader: boolean = false): string {
+function processBodyPlaceholders(
+  value: string,
+  body: RequestBody,
+  isHeader: boolean = false,
+): string {
   // Type guard: ensure value is a string
   if (typeof value !== 'string') {
     return value;

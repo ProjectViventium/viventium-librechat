@@ -16,7 +16,7 @@ function loadYaml(name) {
 }
 
 describe('Viventium Claude Opus 5 release contract', () => {
-  test('publishes Opus 5 without removing managed Anthropic compatibility specs', () => {
+  test('publishes Opus 5 as the only managed Anthropic text model', () => {
     const source = loadYaml('local.librechat.yaml');
     const anthropicSpecs = source.modelSpecs.list.filter(
       (entry) => entry?.preset?.endpoint === 'anthropic',
@@ -28,43 +28,37 @@ describe('Viventium Claude Opus 5 release contract', () => {
         preset: expect.objectContaining({ model: 'claude-opus-5' }),
       }),
     );
-    expect(anthropicSpecs).toContainEqual(
-      expect.objectContaining({
-        name: 'claude-opus-4-8',
-        preset: expect.objectContaining({ model: 'claude-opus-4-8' }),
-      }),
-    );
-    expect(source.endpoints.anthropic.titleModel).toBe('claude-sonnet-4-5');
-    expect(source.endpoints.anthropic.summaryModel).toBe('claude-sonnet-4-5');
+    expect(anthropicSpecs.map((entry) => entry.name)).toEqual(['claude-opus-5']);
+    expect(source.endpoints.anthropic.titleModel).toBe('claude-opus-5');
+    expect(source.endpoints.anthropic.summaryModel).toBe('claude-opus-5');
     expect(source.memory.agent).toEqual(
-      expect.objectContaining({ provider: 'anthropic', model: 'claude-sonnet-4-5' }),
+      expect.objectContaining({ provider: 'anthropic', model: 'claude-opus-5' }),
     );
   });
 
-  test('uses Opus 5 for managed text fallbacks while keeping classifiers fast', () => {
+  test('uses declared GlassHive text fallbacks while keeping classifiers fast', () => {
     const source = loadYaml('local.viventium-agents.yaml');
     const agents = [source.mainAgent, ...source.backgroundAgents];
 
     for (const agent of agents) {
-      expect(agent.fallback_llm_provider).toBe('anthropic');
-      expect(agent.fallback_llm_model).toBe('claude-opus-5');
-      expect(agent.fallback_llm_model_parameters.model).toBe('claude-opus-5');
+      expect(agent.fallback_llm_provider).toBe('glasshive-harness');
+      expect(agent.fallback_llm_model_parameters.model).toBe(agent.fallback_llm_model);
     }
 
-    for (const handoffAgent of source.handoffAgents ?? []) {
-      expect(handoffAgent.provider).toBe('anthropic');
-      expect(handoffAgent.model).toBe('claude-opus-5');
-      expect(handoffAgent.model_parameters.model).toBe('claude-opus-5');
-    }
     const managedBaseline = buildManagedBaseline(source);
     for (const handoffAgent of source.handoffAgents ?? []) {
       expect(managedBaseline.agents[handoffAgent.id]?.fields).toMatchObject({
-        provider: 'anthropic',
-        model: 'claude-opus-5',
+        provider: handoffAgent.provider,
+        model: handoffAgent.model,
       });
+      expect(handoffAgent.model_parameters.model).toBe(handoffAgent.model);
     }
 
-    for (const cortex of source.mainAgent.background_cortices) {
+    const classifiedCortices = source.mainAgent.background_cortices.filter((cortex) =>
+      Array.isArray(cortex.activation?.fallbacks),
+    );
+    expect(classifiedCortices.length).toBeGreaterThan(0);
+    for (const cortex of classifiedCortices) {
       expect(cortex.activation.fallbacks).toContainEqual({
         provider: 'anthropic',
         model: 'claude-haiku-4-5',
@@ -76,13 +70,19 @@ describe('Viventium Claude Opus 5 release contract', () => {
     }
   });
 
-  test('accepts Opus 5 at runtime while preserving explicit Opus 4.8 compatibility', () => {
+  test('accepts Opus 5 at runtime without a retired Anthropic compatibility family', () => {
     expect(APPROVED_MAIN_RUNTIME_FAMILIES).toBeInstanceOf(Set);
     expect(APPROVED_BACKGROUND_RUNTIME_FAMILIES).toBeInstanceOf(Set);
     expect(APPROVED_MAIN_RUNTIME_FAMILIES.has('anthropic::claude-opus-5')).toBe(true);
     expect(APPROVED_BACKGROUND_RUNTIME_FAMILIES.has('anthropic::claude-opus-5')).toBe(true);
-    expect(APPROVED_MAIN_RUNTIME_FAMILIES.has('anthropic::claude-opus-4-8')).toBe(true);
-    expect(APPROVED_BACKGROUND_RUNTIME_FAMILIES.has('anthropic::claude-opus-4-8')).toBe(true);
+    expect(
+      [...APPROVED_MAIN_RUNTIME_FAMILIES].filter((family) => family.startsWith('anthropic::')),
+    ).toEqual(['anthropic::claude-opus-5']);
+    expect(
+      [...APPROVED_BACKGROUND_RUNTIME_FAMILIES].filter((family) =>
+        family.startsWith('anthropic::'),
+      ),
+    ).toEqual(['anthropic::claude-opus-5']);
   });
 
   /* === VIVENTIUM START === Provider effort parity and form-persistence regression coverage. === */

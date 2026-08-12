@@ -164,7 +164,10 @@ generated_env_files=()
 if [[ -n "${VIVENTIUM_ENV_FILE:-}" ]]; then
     # An explicit runtime env is an isolation boundary. In particular, dev/QA profiles must not
     # fill missing credentials or provider settings from the canonical production App Support.
-    generated_env_files=("$VIVENTIUM_ENV_FILE")
+    generated_env_files=(
+        "$VIVENTIUM_ENV_FILE"
+        "$(dirname "$VIVENTIUM_ENV_FILE")/service-env/librechat.env"
+    )
 else
     generated_env_files=(
         "${HOME}/Library/Application Support/Viventium/runtime/service-env/librechat.env"

@@ -104,6 +104,7 @@ const DEFAULT_OPENAI_MEMORY_EFFORT_BY_MODEL = Object.freeze({
 });
 const DEFAULT_OPENAI_MEMORY_EFFORT = 'high';
 const MEMORY_HARDENING_EFFICIENCY_MARKER = 'last-model-apply.public.json';
+const SCHEDULE_V3_OBSERVATION_MARKER = 'schedule-v3-observed.public.json';
 
 function isListenOnlyTranscriptMessage(message) {
   return classifyVoiceMemoryEvidence(message).kind === 'soft_voice';
@@ -694,6 +695,32 @@ function efficiencyMarkerPath(paths) {
   return path.join(paths.stateDir, MEMORY_HARDENING_EFFICIENCY_MARKER);
 }
 
+function scheduleV3ObservationPath(paths) {
+  const stateDir = paths.stateDir || path.dirname(paths.scheduleEventsDir);
+  return paths.scheduleV3ObservationPath || path.join(stateDir, SCHEDULE_V3_OBSERVATION_MARKER);
+}
+
+function readScheduleV3Observation(paths) {
+  const observation = readJsonIfExists(scheduleV3ObservationPath(paths), null);
+  return observation &&
+    Number(observation.schemaVersion) >= 1 &&
+    Number(observation.observedReceiptSchemaVersion) >= 3
+    ? observation
+    : null;
+}
+
+function persistScheduleV3Observation(paths, event) {
+  const existing = readScheduleV3Observation(paths);
+  if (existing) return existing;
+  const observation = {
+    schemaVersion: 1,
+    observedReceiptSchemaVersion: Number(event?.schemaVersion),
+    firstObservedAtUtc: event?.fired_at_utc || new Date().toISOString(),
+  };
+  safeJsonWrite(scheduleV3ObservationPath(paths), observation, 0o600);
+  return observation;
+}
+
 function readEfficiencyMarker(paths) {
   return readJsonIfExists(efficiencyMarkerPath(paths), null);
 }
@@ -895,6 +922,89 @@ function resolveSystemTimezone() {
   return 'UTC';
 }
 
+function scheduleWindowAligned(event, { schedule, timeZone }) {
+  const firedAtMs = Date.parse(event?.fired_at_utc || '');
+  if (!Number.isFinite(firedAtMs)) return false;
+  // launchctl kickstart executes the LaunchAgent's ProgramArguments but is not proof
+  // that StartCalendarInterval fired. Only receipts close to the declared calendar
+  // window qualify as natural schedule evidence. A short forward allowance covers
+  // ordinary launchd jitter and brief sleep/wake catch-up without accepting an
+  // arbitrary operator invocation later in the day.
+  const expectedAt = latestExpectedDailyRunUtc({
+    schedule,
+    timeZone,
+    now: new Date(firedAtMs + 5 * 60 * 1000),
+  });
+  const expectedMs = expectedAt ? Date.parse(expectedAt) : 0;
+  return Boolean(expectedMs && Math.abs(firedAtMs - expectedMs) <= 60 * 60 * 1000);
+}
+
+function scheduleEventAttestation(event, options = {}) {
+  const schemaVersion = Number(event?.schemaVersion);
+  const scheduledInvocation = event?.scheduled_invocation === true;
+  const scheduleLabel = String(event?.schedule_label || '').trim();
+  const proof = event?.trigger_proof;
+  if (!Number.isInteger(schemaVersion) || schemaVersion < 2) {
+    return { verified: false, method: null, reason: 'receipt_schema_unsupported' };
+  }
+  if (!scheduledInvocation || scheduleLabel !== 'ai.viventium.memory-harden') {
+    return { verified: false, method: null, reason: 'schedule_identity_missing' };
+  }
+  // Schema v2 was emitted by the prior installed writer and bound launchd by PPID. It is accepted
+  // only when the caller proves this is the sole v2 receipt and no v3 receipt has ever appeared.
+  // That makes the compatibility path single-use and permanently closes it after v3 observation.
+  // New v3 receipts must prove that launchctl reports this exact process as the loaded job PID.
+  if (schemaVersion === 2 && proof === 'launchd_parent') {
+    const verified = options.allowLegacyV2 === true;
+    return {
+      verified,
+      method: 'launchd_parent_legacy',
+      reason: verified ? null : 'legacy_transition_closed',
+    };
+  }
+  const objectProof = proof && typeof proof === 'object' && !Array.isArray(proof) ? proof : {};
+  const verified = Boolean(
+    schemaVersion >= 3 &&
+      objectProof.version === 1 &&
+      objectProof.method === 'launchctl_job_pid' &&
+      objectProof.verified === true &&
+      objectProof.launchctl_status === 'ok' &&
+      Number(objectProof.pid) === Number(event.pid) &&
+      Number(objectProof.observed_job_pid) === Number(event.pid) &&
+      Number(objectProof.parent_pid) === 1,
+  );
+  return {
+    verified,
+    method: objectProof.method || null,
+    reason: verified ? null : 'launchd_job_pid_unverified',
+  };
+}
+
+function publicScheduleEvent(event, scheduleWindowAlignedValue, attestation = null) {
+  if (!event) return null;
+  return {
+    schema_version: Number.isFinite(Number(event.schemaVersion)) ? Number(event.schemaVersion) : null,
+    status: event.status || null,
+    trigger_source: event.trigger_source || null,
+    trigger_attested: attestation?.verified === true,
+    trigger_proof_method: attestation?.method || null,
+    trigger_attestation_reason: attestation?.reason || null,
+    schedule_window_aligned: scheduleWindowAlignedValue,
+    fired_at_utc: event.fired_at_utc || null,
+    fired_at_local: event.fired_at_local || null,
+    finished_at_utc: event.finished_at_utc || null,
+    exit_code: event.exit_code ?? null,
+    run_id: event.run_id || null,
+    run_status: event.run_status || null,
+    requested_provider: normalizeProvider(event.requested_provider) || null,
+    requested_model: String(event.requested_model || '').trim() || null,
+    requested_effort: String(event.requested_effort || '').trim().toLowerCase() || null,
+    effective_provider: normalizeProvider(event.effective_provider) || null,
+    effective_model: String(event.effective_model || '').trim() || null,
+    effective_effort: String(event.effective_effort || '').trim().toLowerCase() || null,
+  };
+}
+
 function buildScheduleHealth(paths, options = {}) {
   const schedule =
     process.env.VIVENTIUM_MEMORY_HARDENING_SCHEDULE || DEFAULT_MEMORY_HARDENING_SCHEDULE;
@@ -907,7 +1017,34 @@ function buildScheduleHealth(paths, options = {}) {
     : resolveSystemTimezone();
   const now = options.now instanceof Date ? options.now : new Date();
   const events = readScheduleEvents(paths);
-  const scheduledEvents = events.filter((event) => event.trigger_source === 'launchd');
+  const launchdEvents = events.filter((event) => event.trigger_source === 'launchd');
+  const legacyV2Events = launchdEvents.filter(
+    (event) => Number(event?.schemaVersion) === 2 && event?.trigger_proof === 'launchd_parent',
+  );
+  const hasSchemaV3Receipt = launchdEvents.some((event) => Number(event?.schemaVersion) >= 3);
+  let schemaV3Observation = readScheduleV3Observation(paths);
+  let schemaV3ObservationPersisted = Boolean(schemaV3Observation);
+  if (hasSchemaV3Receipt && !schemaV3ObservationPersisted) {
+    try {
+      schemaV3Observation = persistScheduleV3Observation(
+        paths,
+        launchdEvents.find((event) => Number(event?.schemaVersion) >= 3),
+      );
+      schemaV3ObservationPersisted = Boolean(schemaV3Observation);
+    } catch {
+      schemaV3ObservationPersisted = false;
+    }
+  }
+  const hasSchemaV3Observation = schemaV3ObservationPersisted || hasSchemaV3Receipt;
+  const allowLegacyV2 = !hasSchemaV3Observation && legacyV2Events.length === 1;
+  const attestEvent = (event) => scheduleEventAttestation(event, { allowLegacyV2 });
+  const attestedLaunchdEvents = launchdEvents.filter(
+    (event) => attestEvent(event).verified,
+  );
+  const scheduledEvents = attestedLaunchdEvents.filter((event) =>
+    scheduleWindowAligned(event, { schedule, timeZone: systemTimeZone }),
+  );
+  const latestLaunchdEvent = launchdEvents.length ? launchdEvents[launchdEvents.length - 1] : null;
   const latestEvent = scheduledEvents.length ? scheduledEvents[scheduledEvents.length - 1] : null;
   const expectedLatestFireAtUtc = latestExpectedDailyRunUtc({
     schedule,
@@ -929,6 +1066,13 @@ function buildScheduleHealth(paths, options = {}) {
     .trim()
     .toLowerCase();
   const effectiveEffort = String(latestEvent?.effective_effort || '')
+    .trim()
+    .toLowerCase();
+  const configuredProvider = normalizeProvider(
+    process.env.VIVENTIUM_MEMORY_HARDENING_PROVIDER,
+  );
+  const configuredModel = String(process.env.VIVENTIUM_MEMORY_HARDENING_MODEL || '').trim();
+  const configuredEffort = String(process.env.VIVENTIUM_MEMORY_HARDENING_EFFORT || '')
     .trim()
     .toLowerCase();
   const executionTupleComplete = Boolean(
@@ -957,8 +1101,45 @@ function buildScheduleHealth(paths, options = {}) {
     effectiveEffort &&
     requestedEffort !== effectiveEffort,
   );
-  const executionMismatch = providerMismatch || modelMismatch || effortMismatch;
-  const executionUnverified = latestStatus === 'success' && !executionTupleComplete;
+  const receiptExecutionMismatch = providerMismatch || modelMismatch || effortMismatch;
+  const configuredExecutionRequired = Boolean(
+    configuredProvider || configuredModel || configuredEffort,
+  );
+  const configuredExecutionTupleComplete = Boolean(
+    configuredExecutionRequired &&
+      configuredProvider &&
+      configuredModel &&
+      configuredEffort &&
+      requestedProvider &&
+      requestedModel &&
+      requestedEffort,
+  );
+  const configuredProviderMismatch = Boolean(
+    latestStatus === 'success' &&
+      configuredProvider &&
+      requestedProvider &&
+      configuredProvider !== requestedProvider,
+  );
+  const configuredModelMismatch = Boolean(
+    latestStatus === 'success' &&
+      configuredModel &&
+      requestedModel &&
+      configuredModel !== requestedModel,
+  );
+  const configuredEffortMismatch = Boolean(
+    latestStatus === 'success' &&
+      configuredEffort &&
+      requestedEffort &&
+      configuredEffort !== requestedEffort,
+  );
+  const configuredExecutionMismatch =
+    configuredProviderMismatch || configuredModelMismatch || configuredEffortMismatch;
+  const executionMismatch = receiptExecutionMismatch || configuredExecutionMismatch;
+  const executionUnverified = Boolean(
+    latestStatus === 'success' &&
+      (!executionTupleComplete ||
+        (configuredExecutionRequired && !configuredExecutionTupleComplete)),
+  );
   let state = 'awaiting_first_run';
   if (missedWindow) {
     state = 'missed';
@@ -975,6 +1156,9 @@ function buildScheduleHealth(paths, options = {}) {
   } else if (latestStatus === 'success') {
     state = 'healthy';
   }
+  if (hasSchemaV3Receipt && !schemaV3ObservationPersisted) {
+    state = 'attestation_state_unpersisted';
+  }
 
   return {
     schedule,
@@ -982,26 +1166,30 @@ function buildScheduleHealth(paths, options = {}) {
     system_timezone: systemTimeZone,
     timezone: systemTimeZone,
     expected_latest_fire_at_utc: expectedLatestFireAtUtc,
-    latest_scheduled_trigger: latestEvent
-      ? {
-          status: latestEvent.status || null,
-          trigger_source: latestEvent.trigger_source || null,
-          fired_at_utc: latestEvent.fired_at_utc || null,
-          fired_at_local: latestEvent.fired_at_local || null,
-          finished_at_utc: latestEvent.finished_at_utc || null,
-          exit_code: latestEvent.exit_code ?? null,
-          run_id: latestEvent.run_id || null,
-          run_status: latestEvent.run_status || null,
-          requested_provider: requestedProvider || null,
-          requested_model: requestedModel || null,
-          requested_effort: requestedEffort || null,
-          effective_provider: effectiveProvider || null,
-          effective_model: effectiveModel || null,
-          effective_effort: effectiveEffort || null,
-        }
-      : null,
+    latest_scheduled_trigger: publicScheduleEvent(
+      latestEvent,
+      true,
+      latestEvent ? attestEvent(latestEvent) : null,
+    ),
+    latest_launchd_invocation: publicScheduleEvent(
+      latestLaunchdEvent,
+      latestLaunchdEvent
+        ? scheduleWindowAligned(latestLaunchdEvent, { schedule, timeZone: systemTimeZone })
+        : null,
+      latestLaunchdEvent ? attestEvent(latestLaunchdEvent) : null,
+    ),
     missed_expected_window: missedWindow,
     execution_tuple_complete: executionTupleComplete,
+    receipt_execution_mismatch: receiptExecutionMismatch,
+    configured_provider: configuredProvider || null,
+    configured_model: configuredModel || null,
+    configured_effort: configuredEffort || null,
+    configured_execution_required: configuredExecutionRequired,
+    configured_execution_tuple_complete: configuredExecutionTupleComplete,
+    configured_execution_mismatch: configuredExecutionMismatch,
+    configured_provider_mismatch: configuredProviderMismatch,
+    configured_model_mismatch: configuredModelMismatch,
+    configured_effort_mismatch: configuredEffortMismatch,
     execution_mismatch: executionMismatch,
     execution_unverified: executionUnverified,
     provider_mismatch: providerMismatch,
@@ -1010,6 +1198,13 @@ function buildScheduleHealth(paths, options = {}) {
     state,
     healthy: state === 'healthy',
     trigger_receipt_count: scheduledEvents.length,
+    launchd_invocation_receipt_count: launchdEvents.length,
+    attested_launchd_invocation_receipt_count: attestedLaunchdEvents.length,
+    rejected_launchd_invocation_receipt_count: launchdEvents.length - attestedLaunchdEvents.length,
+    legacy_v2_receipt_count: legacyV2Events.length,
+    legacy_v2_transition_open: allowLegacyV2,
+    schema_v3_observed: hasSchemaV3Observation,
+    schema_v3_observation_persisted: schemaV3ObservationPersisted,
   };
 }
 
@@ -5736,8 +5931,8 @@ async function applyUserProposal({ db, methods, userProposal, user, memoryConfig
 }
 
 async function restoreRollback({ methods, rollback }) {
-  const schemaVersion = Number(rollback.schemaVersion || 0);
-  if (schemaVersion < 2 || !Array.isArray(rollback.applied)) {
+  const rollbackSchemaVersion = Number(rollback.schemaVersion || 0);
+  if (rollbackSchemaVersion < 2 || !Array.isArray(rollback.applied)) {
     return {
       restoredKeys: [],
       conflicts: [{ key: null, reason: 'rollback_revision_state_missing' }],
@@ -5749,7 +5944,7 @@ async function restoreRollback({ methods, rollback }) {
    * transitions. Preserve compatibility for its provably safe write-only shape and reject the
    * entire snapshot before any DB access when a v2 entry claims a delete or malformed revision.
    * === VIVENTIUM END === */
-  if (schemaVersion === 2) {
+  if (rollbackSchemaVersion === 2) {
     const unsafeEntry = rollback.applied.find(
       (entry) =>
         !entry?.key ||
@@ -5816,6 +6011,32 @@ async function restoreRollback({ methods, rollback }) {
             expectedRevision,
           });
     } else if (applied.exists === false) {
+      if (rollbackSchemaVersion === 2) {
+        if (current) {
+          conflicts.push({ key, reason: 'revision_conflict' });
+          continue;
+        }
+        if (!before) {
+          restoredKeys.push(key);
+          continue;
+        }
+        result = await methods.setMemory({
+          userId: rollback.userId,
+          key,
+          value: before.value || '',
+          tokenCount: Number(before.tokenCount || 0),
+          expectedRevision: null,
+        });
+        if (result?.ok === true) {
+          restoredKeys.push(key);
+        } else {
+          conflicts.push({
+            key,
+            reason: result?.conflict ? 'revision_conflict' : 'write_rejected',
+          });
+        }
+        continue;
+      }
       const expectedRevision = Number(applied.revision);
       const currentRevision = current ? Number(current.__v ?? 0) : null;
       if (

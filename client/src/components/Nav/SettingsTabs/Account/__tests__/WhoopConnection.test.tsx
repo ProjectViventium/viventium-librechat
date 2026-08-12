@@ -4,7 +4,10 @@ import { request } from 'librechat-data-provider';
 import { useToastContext } from '@librechat/client';
 import WhoopConnection from '../WhoopConnection';
 
-jest.mock('axios', () => ({ post: jest.fn() }));
+jest.mock('axios', () => ({
+  post: jest.fn(),
+  interceptors: { response: { use: jest.fn() } },
+}));
 jest.mock('librechat-data-provider', () => ({
   apiBaseUrl: jest.fn(() => ''),
   request: { get: jest.fn(), post: jest.fn() },

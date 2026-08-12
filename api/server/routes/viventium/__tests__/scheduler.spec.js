@@ -85,26 +85,31 @@ jest.mock('~/server/controllers/agents/request', () => (req, res) => {
   res.json({ streamId: 'stream_1', conversationId: req.body.conversationId || 'new' });
 });
 
-jest.mock('mongoose', () => ({
-  connection: {
-    collection: () => ({
-      findOne: jest.fn(async ({ _id }) => mockSchedulerDispatchIntents.get(_id) ?? null),
-      updateOne: jest.fn(async ({ _id }, update) => {
-        if (!mockSchedulerDispatchIntents.has(_id)) {
-          mockSchedulerDispatchIntents.set(_id, { _id, ...update.$setOnInsert });
-          return { upsertedCount: 1 };
-        }
-        if (update.$set) {
-          mockSchedulerDispatchIntents.set(_id, {
-            ...mockSchedulerDispatchIntents.get(_id),
-            ...update.$set,
-          });
-        }
-        return { upsertedCount: 0 };
+jest.mock('mongoose', () => {
+  const mongoose = jest.requireActual('mongoose');
+  return {
+    ...mongoose,
+    default: mongoose,
+    connection: {
+      collection: () => ({
+        findOne: jest.fn(async ({ _id }) => mockSchedulerDispatchIntents.get(_id) ?? null),
+        updateOne: jest.fn(async ({ _id }, update) => {
+          if (!mockSchedulerDispatchIntents.has(_id)) {
+            mockSchedulerDispatchIntents.set(_id, { _id, ...update.$setOnInsert });
+            return { upsertedCount: 1 };
+          }
+          if (update.$set) {
+            mockSchedulerDispatchIntents.set(_id, {
+              ...mockSchedulerDispatchIntents.get(_id),
+              ...update.$set,
+            });
+          }
+          return { upsertedCount: 0 };
+        }),
       }),
-    }),
-  },
-}));
+    },
+  };
+});
 
 jest.mock('~/server/services/Endpoints/agents', () => ({
   initializeClient: jest.fn(),

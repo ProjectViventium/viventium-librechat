@@ -16,6 +16,7 @@ export interface UserKeyValues {
   oauthType?: string;
   refreshToken?: string;
   oauthExpiresAt?: number;
+  oauthReconnectRequired?: boolean;
   accountId?: string;
 }
 

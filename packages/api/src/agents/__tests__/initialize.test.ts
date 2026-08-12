@@ -422,6 +422,98 @@ describe('initializeAgent — custom endpoint init routing', () => {
     );
     expect(result.provider).toBe(Providers.OPENAI);
   });
+
+  it('binds structured harness context and removes recursive provider MCP tools', async () => {
+    const { agent, req, res, loadTools, db } = createMocks({
+      provider: 'glasshive-harness',
+    });
+    agent.id = 'agent-harness';
+    agent.model = 'codex-cli:gpt-5.6-sol';
+    agent.tools = ['worker_delegate_once_mcp_glasshive-workers-projects', 'search_mcp_github'];
+    (agent as Agent & { glasshive_options?: unknown }).glasshive_options = {
+      workspace: { mode: 'custom', path: '/srv/viventium-workspace' },
+      access: 'workspace',
+      fallback_model: 'claude-code:opus',
+      fallback_reasoning_effort: 'high',
+    };
+    req.config = {
+      endpoints: {
+        agents: {
+          providerCapabilities: {
+            'glasshive-harness': {
+              main_chat: true,
+              workspace_binding: true,
+              conversation_session: true,
+              serial_model_fallback: true,
+              responses_api: false,
+              excluded_mcp_servers: ['glasshive-workers-projects'],
+              models: [
+                {
+                  id: 'codex-cli:gpt-5.6-sol',
+                  effortChoices: ['medium'],
+                  recommendedEffort: 'medium',
+                },
+                {
+                  id: 'claude-code:opus',
+                  effortChoices: ['high', 'max'],
+                  recommendedEffort: 'high',
+                },
+              ],
+            },
+          },
+          capabilityRequiredProviders: ['glasshive-harness'],
+        },
+      },
+    } as never;
+    const mockGetOptions = jest.fn().mockResolvedValue({
+      llmConfig: {
+        model: 'codex-cli:gpt-5.6-sol',
+        maxTokens: 4096,
+      },
+      configOptions: {
+        defaultHeaders: { Authorization: 'Bearer configured-provider-key' },
+      },
+      endpointTokenConfig: undefined,
+    } satisfies InitializeResultBase);
+    mockGetProviderConfig.mockReturnValue({
+      getOptions: mockGetOptions,
+      overrideProvider: Providers.OPENAI,
+      initEndpoint: 'glasshive-harness',
+    });
+
+    const result = await initializeAgent(
+      {
+        req,
+        res,
+        agent,
+        loadTools,
+        endpointOption: { endpoint: EModelEndpoint.agents },
+        allowedProviders: new Set([Providers.OPENAI, 'glasshive-harness']),
+        isInitialAgent: true,
+      },
+      db,
+    );
+
+    expect(loadTools).toHaveBeenCalledWith(
+      expect.objectContaining({ tools: ['search_mcp_github'] }),
+    );
+    expect(result.model_parameters.configuration.defaultHeaders).toEqual(
+      expect.objectContaining({
+        Authorization: 'Bearer configured-provider-key',
+        'X-Viventium-User-Id': '{{LIBRECHAT_USER_ID}}',
+        'X-Viventium-Conversation-Id': '{{LIBRECHAT_BODY_CONVERSATIONID}}',
+        'X-GlassHive-Agent-Id': 'agent-harness',
+        'X-GlassHive-Workspace-Mode': 'custom',
+        'X-GlassHive-Workspace-Path-B64': Buffer.from('/srv/viventium-workspace', 'utf8').toString(
+          'base64',
+        ),
+        'X-GlassHive-Access': 'workspace',
+        'X-GlassHive-Fallback-Model': 'claude-code:opus',
+        'X-GlassHive-Fallback-Reasoning-Effort': 'high',
+        'X-GlassHive-Turn-Context-B64': '{{LIBRECHAT_BODY_VIVENTIUMGLASSHIVETURNCONTEXTB64}}',
+      }),
+    );
+  });
 });
 
 /* === VIVENTIUM START ===

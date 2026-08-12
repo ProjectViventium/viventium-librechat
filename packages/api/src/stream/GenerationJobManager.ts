@@ -1021,6 +1021,7 @@ class GenerationJobManagerClass {
         this.runtimeState.delete(streamId);
       }
     }
+    await this.finalizeCompletedJob(streamId);
 
     logger.debug(`[GenerationJobManager] Job completed: ${streamId}`);
     /* === VIVENTIUM END === */
@@ -1382,6 +1383,9 @@ class GenerationJobManagerClass {
       (event as t.ServerSentEvent & { _viventiumAllowAfterAbort?: boolean })
         ._viventiumAllowAfterAbort === true;
     if (!runtime || (runtime.abortController.signal.aborted && !allowAfterAbort)) {
+      return;
+    }
+    if (!(await this.jobStore.isCurrentLogicalTurn(streamId))) {
       return;
     }
     if (!(await this.jobStore.isCurrentLogicalTurn(streamId))) {

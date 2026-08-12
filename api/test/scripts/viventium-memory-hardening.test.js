@@ -22,9 +22,11 @@ const {
   invokeTranscriptSummaryModel,
   invokeTranscriptSummaryModelWithFallback,
   markTranscriptIndexProcessed,
+  modelApplyCooldownDecision,
   normalizeTranscriptRagMode,
   parseModelFallbacks,
   parseArgs,
+  processStartIdentity,
   probeModel,
   probeProviderCandidates,
   proposalSchema,
@@ -885,6 +887,7 @@ describe('viventium-memory-hardening', () => {
     const lockDir = path.join(tempDir, 'lock');
     fs.mkdirSync(lockDir, { mode: 0o700 });
     fs.writeFileSync(path.join(lockDir, 'pid'), String(process.pid));
+    fs.writeFileSync(path.join(lockDir, 'process_start'), processStartIdentity(process.pid));
     fs.writeFileSync(path.join(lockDir, 'started_at'), '2026-05-13T00:00:00.000Z');
 
     expect(() => acquireLock(lockDir)).toThrow(/Memory hardening lock is already held/);
@@ -896,9 +899,27 @@ describe('viventium-memory-hardening', () => {
     const lockDir = path.join(tempDir, 'lock');
     fs.mkdirSync(lockDir, { mode: 0o700 });
     fs.writeFileSync(path.join(lockDir, 'pid'), String(process.pid));
+    fs.writeFileSync(path.join(lockDir, 'process_start'), processStartIdentity(process.pid));
     fs.writeFileSync(path.join(lockDir, 'started_at'), '2000-01-01T00:00:00.000Z');
 
     expect(() => acquireLock(lockDir)).toThrow(/Memory hardening lock is already held/);
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  test('memory hardening lock recovers when a live pid belongs to a different process lifetime', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-hardening-lock-'));
+    const lockDir = path.join(tempDir, 'lock');
+    fs.mkdirSync(lockDir, { mode: 0o700 });
+    fs.writeFileSync(path.join(lockDir, 'pid'), String(process.pid));
+    fs.writeFileSync(path.join(lockDir, 'process_start'), 'Mon Jan  1 00:00:00 2001');
+    fs.writeFileSync(path.join(lockDir, 'started_at'), '2001-01-01T00:00:00.000Z');
+
+    const releaseLock = acquireLock(lockDir);
+
+    expect(fs.readFileSync(path.join(lockDir, 'process_start'), 'utf8')).toBe(
+      processStartIdentity(process.pid),
+    );
+    releaseLock();
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
@@ -1023,6 +1044,18 @@ describe('viventium-memory-hardening', () => {
       omittedMessages: 1,
       complete: false,
     });
+  });
+
+  test('prompt message selection marks a truncated first message incomplete', () => {
+    expect(selectMessagesForPrompt([{ messageId: 'm1', text: 'a'.repeat(45) }], 300)).toMatchObject(
+      {
+        omittedMessages: 0,
+        truncatedMessages: 1,
+        estimatedInputChars: 301,
+        selectedInputChars: 300,
+        complete: false,
+      },
+    );
   });
 
   test('user proposal skips oversized corpora when full-lookback is required', async () => {
@@ -4204,6 +4237,63 @@ describe('viventium-memory-hardening', () => {
     }
   });
 
+  test('persists each rollback revision before a later proposal mutation can fail', async () => {
+    const runDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-memory-crash-'));
+    const user = { _id: '507f1f77bcf86cd799439011' };
+    const setMemory = jest
+      .fn()
+      .mockResolvedValueOnce({ ok: true, revision: 4 })
+      .mockRejectedValueOnce(new Error('synthetic abrupt failure'));
+    try {
+      await expect(
+        applyUserProposal({
+          methods: {
+            getAllUserMemories: jest.fn().mockResolvedValue([
+              { key: 'context', value: 'Original context', tokenCount: 2, __v: 3 },
+              { key: 'drafts', value: 'Original draft', tokenCount: 2, __v: 2 },
+            ]),
+            setMemory,
+            deleteMemory: jest.fn(),
+          },
+          user,
+          runDir,
+          memoryConfig,
+          userProposal: {
+            userId: String(user._id),
+            userIdHash: 'user-hash',
+            accepted: [
+              {
+                key: 'context',
+                action: 'set',
+                value: 'Updated context',
+                tokenCount: 2,
+                expectedRevision: 3,
+                evidence: [],
+              },
+              {
+                key: 'drafts',
+                action: 'set',
+                value: 'Updated draft',
+                tokenCount: 2,
+                expectedRevision: 2,
+                evidence: [],
+              },
+            ],
+            transcripts: [],
+            staleTranscriptArtifacts: [],
+          },
+        }),
+      ).rejects.toThrow('synthetic abrupt failure');
+
+      const rollback = JSON.parse(
+        fs.readFileSync(path.join(runDir, 'user-hash.rollback.private.json'), 'utf8'),
+      );
+      expect(rollback.applied).toEqual([{ key: 'context', exists: true, revision: 4 }]);
+    } finally {
+      fs.rmSync(runDir, { recursive: true, force: true });
+    }
+  });
+
   test('rollback restores only the exact revision written by the hardener', async () => {
     const setMemory = jest.fn().mockResolvedValue({ ok: true, revision: 5 });
     const deleteMemory = jest.fn();
@@ -4473,6 +4563,7 @@ describe('viventium-memory-hardening', () => {
         'C:\\Users\\Example\\secret.txt',
         '507f1f77bcf86cd799439011',
         'conversationabc123456789',
+        '/api/v1/health',
         '--ask-for-approval',
       ].join(' '),
     );
@@ -4488,6 +4579,7 @@ describe('viventium-memory-hardening', () => {
     expect(redacted).not.toContain('/Applications/');
     expect(redacted).not.toContain('/opt/');
     expect(redacted).not.toContain('qa@example.com');
+    expect(redacted).toContain('/api/v1/health');
     expect(redacted).toContain('--ask-for-approval');
   });
 
@@ -4654,7 +4746,7 @@ describe('viventium-memory-hardening', () => {
       });
       expect(resolveProvider({ provider: 'openai' }).candidates).toEqual(
         expect.arrayContaining([
-          expect.objectContaining({ provider: 'openai', model: 'gpt-5.6-sol', effort: 'xhigh' }),
+          expect.objectContaining({ provider: 'openai', model: 'gpt-5.6-luna', effort: 'medium' }),
         ]),
       );
     } finally {

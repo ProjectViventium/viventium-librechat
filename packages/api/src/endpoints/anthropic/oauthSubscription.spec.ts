@@ -50,7 +50,7 @@ describe('resolveAnthropicSubscriptionUserValues — connected-account OAuth fas
     expect(global.fetch).toHaveBeenCalledTimes(1);
   });
 
-  it('negative-caches a failing refresh so repeated inits in a turn do not re-fetch (no fan-out)', async () => {
+  it('negative-caches a terminal refresh failure and requires reconnect without fan-out', async () => {
     const vals = baseValues({ oauthExpiresAt: Date.now() - 1000 }); // expired, has refresh token
     (global.fetch as jest.Mock).mockResolvedValue({
       ok: false,
@@ -59,16 +59,22 @@ describe('resolveAnthropicSubscriptionUserValues — connected-account OAuth fas
       text: async () => JSON.stringify({ error: 'invalid_grant' }),
     });
 
-    const r1 = await resolveAnthropicSubscriptionUserValues('user-broken-refresh', vals, db as never);
-    const r2 = await resolveAnthropicSubscriptionUserValues('user-broken-refresh', vals, db as never);
-    const r3 = await resolveAnthropicSubscriptionUserValues('user-broken-refresh', vals, db as never);
+    await expect(
+      resolveAnthropicSubscriptionUserValues('user-broken-refresh', vals, db as never),
+    ).rejects.toThrow('Anthropic connected account needs reconnect');
+    await expect(
+      resolveAnthropicSubscriptionUserValues('user-broken-refresh', vals, db as never),
+    ).rejects.toThrow('Anthropic connected account needs reconnect');
+    await expect(
+      resolveAnthropicSubscriptionUserValues('user-broken-refresh', vals, db as never),
+    ).rejects.toThrow('Anthropic connected account needs reconnect');
 
     // only the FIRST init hits the network; the rest are short-circuited by the negative cache
     expect(global.fetch).toHaveBeenCalledTimes(1);
-    // stale token preserved so the downstream 401 is surfaced honestly, not swallowed
-    expect((r1 as { authToken?: string }).authToken).toBe(SUB_TOKEN);
-    expect(r2).toBeTruthy();
-    expect(r3).toBeTruthy();
+    expect(db.updateUserKey).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(db.updateUserKey.mock.calls[0][0].value)).toMatchObject({
+      oauthReconnectRequired: true,
+    });
   });
 
   it('falls back to legacy blocking refresh when VIVENTIUM_ANTHROPIC_OAUTH_FAST_PATH=0', async () => {
@@ -90,6 +96,15 @@ describe('resolveAnthropicSubscriptionUserValues — connected-account OAuth fas
     const apiKeyValues = { apiKey: 'anthropic-api-key-test', oauthProvider: 'anthropic', oauthType: 'api_key' };
     const result = await resolveAnthropicSubscriptionUserValues('user-apikey', apiKeyValues as never, db as never);
     expect(result).toBe(apiKeyValues);
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it('does not reuse a credential already marked reconnect-required', async () => {
+    const vals = baseValues({ oauthReconnectRequired: true });
+
+    await expect(
+      resolveAnthropicSubscriptionUserValues('user-reconnect', vals, db as never),
+    ).rejects.toThrow('Anthropic connected account needs reconnect');
     expect(global.fetch).not.toHaveBeenCalled();
   });
 });

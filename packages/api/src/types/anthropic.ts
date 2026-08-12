@@ -90,6 +90,8 @@ export interface AnthropicConfigOptions {
   oauthType?: string;
   /** Optional connected-account provider marker (e.g. "anthropic"). */
   oauthProvider?: string;
+  /** Persist terminal inference-time OAuth failures and raise reconnect guidance. */
+  connectedAccountAuthFailure?: (error: unknown) => Promise<void>;
   /** Default parameters to apply only if fields are undefined */
   defaultParams?: Record<string, unknown>;
   /** Additional parameters to add to the configuration */

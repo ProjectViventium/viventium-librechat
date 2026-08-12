@@ -91,6 +91,7 @@ const STABLE_TRANSCRIPT_MEMORY_KEYS = new Set([
 ]);
 const MODEL_FALLBACK_SEPARATOR = /[,;]/;
 const DEFAULT_MEMORY_HARDENING_MODEL_FALLBACKS = [
+  { provider: 'openai', model: 'gpt-5.6-luna', effort: 'medium', source: 'default' },
   { provider: 'openai', model: 'gpt-5.6-sol', effort: 'xhigh', source: 'default' },
   { provider: 'anthropic', model: 'claude-opus-5', effort: 'xhigh', source: 'default' },
   { provider: 'anthropic', model: 'opus', effort: 'xhigh', source: 'default' },
@@ -103,7 +104,6 @@ const DEFAULT_OPENAI_MEMORY_EFFORT_BY_MODEL = Object.freeze({
 });
 const DEFAULT_OPENAI_MEMORY_EFFORT = 'high';
 const MEMORY_HARDENING_EFFICIENCY_MARKER = 'last-model-apply.public.json';
-const SCHEDULE_V3_OBSERVATION_MARKER = 'schedule-v3-observed.public.json';
 
 function isListenOnlyTranscriptMessage(message) {
   return classifyVoiceMemoryEvidence(message).kind === 'soft_voice';
@@ -215,30 +215,6 @@ function voiceMemoryEvidenceHash(message) {
       speakerSegments: voiceSpeakerSegmentsForMemory(message),
     }),
   );
-  if (!isVoice) return { kind: 'ordinary', sourceId: '' };
-  const segments = voiceSpeakerSegmentsForMemory(message);
-  const sessionAttributionState = metadata?.speakerSessionState?.attributionState;
-  const speakerKeys = new Set(segments.map((segment) => segment?.speaker?.key).filter(Boolean));
-  const ownerOnly =
-    message?.isCreatedByUser === true &&
-    metadata.mode === 'call' &&
-    sessionAttributionState !== 'shared_mic_unverified' &&
-    segments.length > 0 &&
-    speakerKeys.size === 1 &&
-    segments.every(
-      (segment) =>
-        segment?.speaker?.actorTrust === 'owner_participant' &&
-        segment?.speaker?.attribution === 'verified' &&
-        segment?.overlap !== true &&
-        segment?.uncertain !== true,
-    );
-  return {
-    kind: ownerOnly ? 'owner_call' : 'soft_voice',
-    sourceId: callSessionId
-      ? `call:${callSessionId}`
-      : `message:${String(message?.messageId || '')}`,
-    segments,
-  };
 }
 
 function listenOnlySpeakerLabel(message) {
@@ -718,32 +694,6 @@ function efficiencyMarkerPath(paths) {
   return path.join(paths.stateDir, MEMORY_HARDENING_EFFICIENCY_MARKER);
 }
 
-function scheduleV3ObservationPath(paths) {
-  const stateDir = paths.stateDir || path.dirname(paths.scheduleEventsDir);
-  return paths.scheduleV3ObservationPath || path.join(stateDir, SCHEDULE_V3_OBSERVATION_MARKER);
-}
-
-function readScheduleV3Observation(paths) {
-  const observation = readJsonIfExists(scheduleV3ObservationPath(paths), null);
-  return observation &&
-    Number(observation.schemaVersion) >= 1 &&
-    Number(observation.observedReceiptSchemaVersion) >= 3
-    ? observation
-    : null;
-}
-
-function persistScheduleV3Observation(paths, event) {
-  const existing = readScheduleV3Observation(paths);
-  if (existing) return existing;
-  const observation = {
-    schemaVersion: 1,
-    observedReceiptSchemaVersion: Number(event?.schemaVersion),
-    firstObservedAtUtc: event?.fired_at_utc || new Date().toISOString(),
-  };
-  safeJsonWrite(scheduleV3ObservationPath(paths), observation, 0o600);
-  return observation;
-}
-
 function readEfficiencyMarker(paths) {
   return readJsonIfExists(efficiencyMarkerPath(paths), null);
 }
@@ -1060,13 +1010,6 @@ function buildScheduleHealth(paths, options = {}) {
     state,
     healthy: state === 'healthy',
     trigger_receipt_count: scheduledEvents.length,
-    launchd_invocation_receipt_count: launchdEvents.length,
-    attested_launchd_invocation_receipt_count: attestedLaunchdEvents.length,
-    rejected_launchd_invocation_receipt_count: launchdEvents.length - attestedLaunchdEvents.length,
-    legacy_v2_receipt_count: legacyV2Events.length,
-    legacy_v2_transition_open: allowLegacyV2,
-    schema_v3_observed: hasSchemaV3Observation,
-    schema_v3_observation_persisted: schemaV3ObservationPersisted,
   };
 }
 
@@ -2557,12 +2500,7 @@ function resolveProvider(options = {}) {
         : process.env.VIVENTIUM_MEMORY_HARDENING_OPENAI_MODEL || 'gpt-5.6-luna');
     return withResolvedCandidates({
       provider: explicit,
-      model:
-        options.model ||
-        selectedModelFromCompiler ||
-        (explicit === 'anthropic'
-          ? process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_MODEL || 'claude-opus-5'
-          : process.env.VIVENTIUM_MEMORY_HARDENING_OPENAI_MODEL || 'gpt-5.6-sol'),
+      model: selectedModel,
       effort:
         explicit === 'anthropic'
           ? process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_EFFORT ||
@@ -5700,11 +5638,13 @@ async function applyUserProposal({ db, methods, userProposal, user, memoryConfig
           conflicts.push({ key: operation.key, action: 'set', reason: 'voice_evidence_stale' });
           continue;
         }
-        appliedState.set(operation.key, {
+        const applied = {
           key: operation.key,
           exists: true,
           revision: Number(result.revision),
-        });
+        };
+        appliedState.set(operation.key, applied);
+        persistRollbackAppliedState(rollbackPath, applied);
         changed.push({
           key: operation.key,
           action: 'set',
@@ -5734,11 +5674,13 @@ async function applyUserProposal({ db, methods, userProposal, user, memoryConfig
           conflicts.push({ key: operation.key, action: 'delete', reason: 'voice_evidence_stale' });
           continue;
         }
-        appliedState.set(operation.key, {
+        const applied = {
           key: operation.key,
           exists: false,
           revision: Number(result.revision),
-        });
+        };
+        appliedState.set(operation.key, applied);
+        persistRollbackAppliedState(rollbackPath, applied);
         changed.push({ key: operation.key, action: 'delete' });
       }
     } finally {
@@ -5832,14 +5774,9 @@ async function restoreRollback({ methods, rollback }) {
   }
 
   const beforeByKey = new Map((rollback.memories || []).map((entry) => [entry.key, entry]));
-  const currentMemoryReader =
-    rollbackSchemaVersion >= 3
-      ? methods.getAllUserMemoryStates || methods.getAllUserMemories
-      : methods.getAllUserMemories;
+  const currentMemoryReader = methods.getAllUserMemoryStates || methods.getAllUserMemories;
   const currentByKey = new Map(
-    (await (methods.getAllUserMemoryStates || methods.getAllUserMemories)(rollback.userId)).map(
-      (entry) => [entry.key, entry],
-    ),
+    (await currentMemoryReader(rollback.userId)).map((entry) => [entry.key, entry]),
   );
   const restoredKeys = [];
   const conflicts = [];
@@ -5939,7 +5876,7 @@ function redactFailureMessage(value) {
       .replace(/\/home\/[^/\s]+(?:\/[^\s'")]+)*/g, '<local-path>')
       .replace(/\/private\/var\/[^\s'")]+/g, '<local-path>')
       /* === VIVENTIUM START === Redact public-safe generic absolute Unix paths. === */
-      .replace(/(^|[\s"'(=:[])(\/(?!\/)[^\s'")]+)/g, '$1<local-path>')
+      .replace(/(^|[\s"'(=:[])(\/(?!\/|api(?:\/|$))[^\s'")]+)/g, '$1<local-path>')
       /* === VIVENTIUM END === */
       .replace(/[A-Za-z]:\\(?:[^\\\s'"]+\\?)+/g, '<local-path>')
       .replace(/\b(?:[a-f0-9]{24})\b/gi, '<mongo-id>')

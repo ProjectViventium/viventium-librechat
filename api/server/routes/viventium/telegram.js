@@ -82,6 +82,12 @@ const {
 const {
   resolveReusableConversationState,
 } = require('~/server/services/viventium/conversationThreading');
+const {
+  attachLogicalTurnMetadata,
+  createTelegramInteractionContext,
+  getTrustedInteractionContext,
+  setTrustedInteractionContext,
+} = require('~/server/services/viventium/interactionContext');
 
 const EXTRACTED_DOCUMENT_IMAGE_MAX_DIMENSION = 768;
 /* === VIVENTIUM START ===
@@ -1011,6 +1017,23 @@ router.post(
     });
     const conversationId = conversationState.conversationId;
     let parentMessageId = conversationState.parentMessageId;
+    const sourceEventId =
+      normalizeIngressId(incoming.sourceEventId ?? incoming.source_event_id) ||
+      telegramMessageId ||
+      telegramUpdateId ||
+      streamId;
+    setTrustedInteractionContext(
+      req,
+      createTelegramInteractionContext({
+        conversation_id: conversationId,
+        source_event_id: sourceEventId,
+      }),
+      {
+        segment_stability: 'immediate',
+        supersede_scope: 'response_and_authoring',
+      },
+      { commit_authority: 'external_adapter' },
+    );
     logTelegramTiming(
       traceId,
       'parent_message_lookup',
@@ -1203,18 +1226,19 @@ router.post(
   async (req, res, next) => {
     const originalJson = res.json.bind(res);
     res.json = (payload) => {
+      const withLogicalTurn = attachLogicalTurnMetadata(payload, getTrustedInteractionContext(req));
       if (
-        payload &&
-        typeof payload === 'object' &&
+        withLogicalTurn &&
+        typeof withLogicalTurn === 'object' &&
         req.viventiumTelegramVoiceRoute &&
-        !Object.prototype.hasOwnProperty.call(payload, 'voiceRoute')
+        !Object.prototype.hasOwnProperty.call(withLogicalTurn, 'voiceRoute')
       ) {
         return originalJson({
-          ...payload,
+          ...withLogicalTurn,
           voiceRoute: req.viventiumTelegramVoiceRoute,
         });
       }
-      return originalJson(payload);
+      return originalJson(withLogicalTurn);
     };
     const controllerStartTs = performance.now();
     const result = await AgentController(req, res, next, initializeClient, addTitle);
@@ -1321,6 +1345,8 @@ router.get('/stream/:streamId', telegramAuth, async (req, res) => {
   if (job.metadata?.userId && job.metadata.userId !== userId) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
+  const withStreamLogicalTurn = (event) =>
+    attachLogicalTurnMetadata(event, job.metadata?.interactionContext);
 
   res.setHeader('Content-Encoding', 'identity');
   res.setHeader('Content-Type', 'text/event-stream');
@@ -1363,7 +1389,9 @@ router.get('/stream/:streamId', telegramAuth, async (req, res) => {
       return;
     }
     if (resumeState && !res.writableEnded) {
-      res.write(`event: message\ndata: ${JSON.stringify({ sync: true, resumeState })}\n\n`);
+      res.write(
+        `event: message\ndata: ${JSON.stringify(withStreamLogicalTurn({ sync: true, resumeState }))}\n\n`,
+      );
       if (typeof res.flush === 'function') {
         res.flush();
       }
@@ -1399,7 +1427,7 @@ router.get('/stream/:streamId', telegramAuth, async (req, res) => {
             logTelegramTiming(traceId, 'stream_first_event', streamStartTs);
             firstEventLogged = true;
           }
-          res.write(`event: message\ndata: ${JSON.stringify(event)}\n\n`);
+          res.write(`event: message\ndata: ${JSON.stringify(withStreamLogicalTurn(event))}\n\n`);
           if (typeof res.flush === 'function') {
             res.flush();
           }
@@ -1418,7 +1446,7 @@ router.get('/stream/:streamId', telegramAuth, async (req, res) => {
           }
         }
         if (!res.writableEnded) {
-          res.write(`event: message\ndata: ${JSON.stringify(event)}\n\n`);
+          res.write(`event: message\ndata: ${JSON.stringify(withStreamLogicalTurn(event))}\n\n`);
           if (typeof res.flush === 'function') {
             res.flush();
           }

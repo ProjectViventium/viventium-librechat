@@ -92,6 +92,9 @@ function shouldSkipRecallMessage({
   if (!cleaned) {
     return true;
   }
+  if (message?.metadata?.viventium?.interactionContext?.origin === 'scheduler') {
+    return true;
+  }
   if (INTERNAL_CONTROL_TEXT_REGEX.test(cleaned)) {
     return true;
   }
@@ -99,6 +102,15 @@ function shouldSkipRecallMessage({
     return true;
   }
   if (isPassiveVoiceTranscriptMessage(message)) {
+    return true;
+  }
+  /* === VIVENTIUM START ===
+   * QA and explicitly ineligible rows must stay out of every recall path, including source rescue.
+   * === VIVENTIUM END === */
+  if (
+    message?.metadata?.viventium?.memoryEligible === false ||
+    message?.metadata?.viventium?.qaRun === true
+  ) {
     return true;
   }
   /* === VIVENTIUM START ===

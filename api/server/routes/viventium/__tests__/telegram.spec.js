@@ -15,6 +15,10 @@ let lastVoiceProvider = null;
 let lastVoiceMode = null;
 let lastTelegramAudioRequested = null;
 let lastTelegramImages = null;
+let mockLastInteractionContext = null;
+let mockLastAdapterCapabilities = null;
+let mockLastDeliveryPolicy = null;
+let mockClaimedLogicalTurn = null;
 let mockUserFindOne;
 let mockUserCountDocuments;
 let mockSubscribe;
@@ -80,6 +84,18 @@ jest.mock('~/server/middleware', () => ({
 }));
 
 jest.mock('~/server/controllers/agents/request', () => (req, res) => {
+  const {
+    bindLogicalTurnContext,
+    getTrustedAdapterCapabilities,
+    getTrustedDeliveryPolicy,
+    getTrustedInteractionContext,
+  } = require('~/server/services/viventium/interactionContext');
+  mockLastInteractionContext = getTrustedInteractionContext(req);
+  mockLastAdapterCapabilities = getTrustedAdapterCapabilities(req);
+  mockLastDeliveryPolicy = getTrustedDeliveryPolicy(req);
+  if (mockClaimedLogicalTurn) {
+    bindLogicalTurnContext(req, { ...mockLastInteractionContext, ...mockClaimedLogicalTurn });
+  }
   lastAgentId = req.body.agent_id;
   lastStreamId = req.body.streamId;
   lastParentMessageId = req.body.parentMessageId;
@@ -375,6 +391,10 @@ describe('/api/viventium/telegram', () => {
     lastVoiceMode = null;
     lastTelegramAudioRequested = null;
     lastTelegramImages = null;
+    mockLastInteractionContext = null;
+    mockLastAdapterCapabilities = null;
+    mockLastDeliveryPolicy = null;
+    mockClaimedLogicalTurn = null;
     jest.resetModules();
     mockUserFindOne = jest.fn();
     mockUserCountDocuments = jest.fn().mockResolvedValue(0);
@@ -477,6 +497,56 @@ describe('/api/viventium/telegram', () => {
     expect(lastAgentId).toBe('agent_default');
     expect(typeof lastStreamId).toBe('string');
     expect(lastStreamId.startsWith('telegram-')).toBe(true);
+  });
+
+  test('POST authors Telegram context, ignores forged authority, and returns claimed turn metadata', async () => {
+    mockClaimedLogicalTurn = { logical_turn_id: 'logical-telegram-1', revision: 3 };
+    const telegramRouter = require('../telegram');
+    const app = createTestApp(telegramRouter);
+    const req = createMockReq({
+      url: '/api/viventium/telegram/chat',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      body: {
+        text: 'hi',
+        conversationId: 'new',
+        telegramUserId: 'tg-1',
+        sourceEventId: 'telegram:opaque:event:1',
+        interactionContext: { actor_kind: 'system', origin: 'scheduler', surface: 'workbench' },
+        adapterCapabilities: { segment_stability: 'provisional', supersede_scope: 'response_only' },
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(mockLastInteractionContext).toEqual({
+      actor_kind: 'external_user',
+      origin: 'interactive',
+      surface: 'telegram',
+      conversation_id: expect.any(String),
+      revision: 1,
+      source_event_id: 'telegram:opaque:event:1',
+    });
+    expect(mockLastAdapterCapabilities).toEqual({
+      segment_stability: 'immediate',
+      supersede_scope: 'response_and_authoring',
+    });
+    expect(mockLastDeliveryPolicy).toEqual({ commit_authority: 'external_adapter' });
+    expect(req.body).not.toHaveProperty('interactionContext');
+    expect(req.body).not.toHaveProperty('adapterCapabilities');
+    expect(res.body).toMatchObject({
+      logical_turn_id: 'logical-telegram-1',
+      revision: 3,
+      metadata: {
+        viventium: {
+          interactionContext: expect.objectContaining({
+            surface: 'telegram',
+            logical_turn_id: 'logical-telegram-1',
+            revision: 3,
+          }),
+        },
+      },
+    });
   });
 
   test('POST suppresses duplicate ingress replay with no-op response', async () => {
@@ -1123,6 +1193,44 @@ describe('/api/viventium/telegram', () => {
     const writes = res.write.mock.calls.map((call) => String(call[0] || ''));
     expect(writes.some((line) => line.includes('"event":"attachment"'))).toBe(true);
     expect(writes.some((line) => line.includes('"file_id":"file-1"'))).toBe(true);
+  });
+
+  test('GET stream decorates SSE with authoritative logical-turn metadata', async () => {
+    mockGetJob.mockResolvedValueOnce({
+      metadata: {
+        userId: 'user_1',
+        interactionContext: {
+          actor_kind: 'external_user',
+          origin: 'interactive',
+          surface: 'telegram',
+          conversation_id: 'conversation-1',
+          logical_turn_id: 'logical-telegram-2',
+          revision: 2,
+          source_event_id: 'event-2',
+        },
+      },
+    });
+    mockSubscribe.mockImplementation(async (_streamId, onChunk, onDone) => {
+      onChunk({ event: 'on_message_delta', data: { text: 'hello' } });
+      onDone({ final: true });
+      return { unsubscribe: jest.fn() };
+    });
+    const telegramRouter = require('../telegram');
+    const app = createTestApp(telegramRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/telegram/stream/stream_1?telegramUserId=tg-1',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      query: { telegramUserId: 'tg-1' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    const writes = res.write.mock.calls.map((call) => String(call[0] || '')).join('\n');
+    expect(writes).toContain('"logical_turn_id":"logical-telegram-2"');
+    expect(writes).toContain('"revision":2');
+    expect(writes).toContain('"surface":"telegram"');
   });
 
   test('POST preferences persists voice preference sync payload', async () => {

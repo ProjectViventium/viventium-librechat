@@ -1,6 +1,11 @@
 import { AnthropicEffort } from 'librechat-data-provider';
 import type * as t from '~/types';
-import { ANTHROPIC_OAUTH_SYSTEM_TEXT, ensureAnthropicOAuthSystemPrompt, getLLMConfig } from './llm';
+import {
+  ANTHROPIC_OAUTH_SYSTEM_TEXT,
+  ensureAnthropicOAuthSystemPrompt,
+  getLLMConfig,
+  handleAnthropicConnectedAccountAuthFailure,
+} from './llm';
 
 jest.mock('https-proxy-agent', () => ({
   HttpsProxyAgent: jest.fn().mockImplementation((proxy) => ({ proxy })),
@@ -116,6 +121,16 @@ describe('getLLMConfig', () => {
     expect(oauthClient?.apiKey).toBeNull();
     expect(oauthClient?.authToken).toBe('oauth-access-token');
     expect(oauthClientHeaders?.['anthropic-beta']).toContain('oauth-2025-04-20');
+  });
+
+  it('should route inference-time OAuth failures through the connected-account callback', async () => {
+    const terminalError = { status: 401 };
+    const callback = jest.fn().mockRejectedValue(new Error('reconnect required'));
+
+    await expect(
+      handleAnthropicConnectedAccountAuthFailure(terminalError, callback),
+    ).rejects.toThrow('reconnect required');
+    expect(callback).toHaveBeenCalledWith(terminalError);
   });
 
   it('should inject the Claude Code system block for OAuth requests without system instructions', () => {

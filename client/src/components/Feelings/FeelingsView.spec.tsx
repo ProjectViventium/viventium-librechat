@@ -122,7 +122,7 @@ function response(enabled = false) {
         fast: true,
         serviceTier: 'priority',
         fallbackProvider: 'anthropic',
-        fallbackModel: 'claude-opus-4-8',
+        fallbackModel: 'claude-opus-5',
       },
     },
     state: {
@@ -219,7 +219,7 @@ describe('FeelingsView', () => {
     await user.click(screen.getByRole('button', { name: 'Reaction Cortex' }));
     expect(screen.getByRole('dialog', { name: 'Emotional Reaction Cortex' })).toBeVisible();
     expect(screen.getByText(/Primary: gpt-5\.6-terra · Fast/)).toBeInTheDocument();
-    expect(screen.getByText(/Fallback: claude-opus-4-8/)).toBeInTheDocument();
+    expect(screen.getByText(/Fallback: claude-opus-5/)).toBeInTheDocument();
     expect(screen.getByText(/Last route: gpt-5\.6-terra · priority/)).toBeInTheDocument();
     expect(
       (screen.getByLabelText('How should the subconscious react?') as HTMLTextAreaElement).value,

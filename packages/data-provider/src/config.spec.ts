@@ -201,6 +201,15 @@ describe('getEndpointField', () => {
 });
 
 describe('memorySchema', () => {
+  it('defaults bounded memory reads to the same 8,000-token ceiling as the runtime', () => {
+    const parsed = memorySchema.parse({
+      agent: { provider: 'anthropic', model: 'claude-sonnet-4-5' },
+      readProfile: {},
+    });
+
+    expect(parsed.readProfile?.tokenLimit).toBe(8000);
+  });
+
   it('accepts the bounded read profile config used by Viventium memory reads', () => {
     const parsed = memorySchema.parse({
       agent: { provider: 'anthropic', model: 'claude-sonnet-4-5' },

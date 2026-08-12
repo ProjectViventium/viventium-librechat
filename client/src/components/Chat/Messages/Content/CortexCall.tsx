@@ -36,6 +36,8 @@ export default function CortexCall({
   error_class,
   silent = false,
   no_response = false,
+  fallback_used = false,
+  fallback_reason_class,
   status_changed_at,
   isLast = false,
 }: {
@@ -49,6 +51,8 @@ export default function CortexCall({
   error_class?: string;
   silent?: boolean;
   no_response?: boolean;
+  fallback_used?: boolean;
+  fallback_reason_class?: string | null;
   status_changed_at?: string;
   isLast?: boolean;
 }) {
@@ -91,8 +95,8 @@ export default function CortexCall({
     if (isSilentComplete) {
       return false;
     }
-    return hasInsight || hasErrorDetail || (reason?.trim().length ?? 0) > 0;
-  }, [hasInsight, hasErrorDetail, isSilentComplete, reason]);
+    return fallback_used || hasInsight || hasErrorDetail || (reason?.trim().length ?? 0) > 0;
+  }, [fallback_used, hasInsight, hasErrorDetail, isSilentComplete, reason]);
 
   useEffect(() => {
     if (!isActiveStatus || statusChangedAtMs === null) {
@@ -131,7 +135,7 @@ export default function CortexCall({
       case 'brewing':
         return `Analyzing with ${cortex_name}...`;
       case 'complete':
-        return cortex_name;
+        return fallback_used ? `${cortex_name} · model fallback used` : cortex_name;
       case 'skipped':
         return `${cortex_name} skipped`;
       case 'error':
@@ -243,6 +247,8 @@ export default function CortexCall({
                 insight={insight}
                 error={displayError}
                 error_class={error_class}
+                fallback_used={fallback_used}
+                fallback_reason_class={fallback_reason_class}
               />
             )}
           </div>

@@ -714,7 +714,6 @@ function buildCanonicalPersistedAgentFields(
     (existingProvider && provider && existingProvider !== provider) ||
     (existingModel && model && existingModel !== model);
   const runtimeManagedBuiltIn = Boolean(agent.id && AGENT_RUNTIME_ENV_BY_ID[agent.id]);
-
   if (canonicalBuiltInParameters !== null) {
     patch.model_parameters = patch.model
       ? {

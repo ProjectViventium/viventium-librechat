@@ -402,6 +402,7 @@ function stripVoiceControlTags(text) {
     cleaned = cleaned.replace(wrappingRe, '$2');
   } while (cleaned !== previous);
   cleaned = cleaned.replace(angleTagRe, '');
+  cleaned = cleaned.replace(GENERIC_ANGLE_TAG_RE, '');
   cleaned = cleaned.replace(bracketTagRe, '');
   cleaned = cleaned.replace(VOICE_CONTROL_MARKER_RE, '');
   return stripBracketStageDirections(cleaned);
@@ -646,6 +647,7 @@ module.exports = {
   sanitizeVoiceAssistantMessageForPersistence,
   sanitizeVoiceContentPartsForPersistence,
   sanitizeVoiceSurfaceTextForDisplay,
+  stripVoiceControlTags,
   stripProtectedTextRanges,
   sumForbiddenArtifacts,
 };

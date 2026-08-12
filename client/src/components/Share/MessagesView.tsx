@@ -10,7 +10,7 @@ import { useLocalize } from '~/hooks';
  *
  * Added: 2026-02-07
  */
-import { filterNoResponseMessagesTree } from '~/utils';
+import { filterNoResponseMessagesTree, filterTrustedInternalMessagesTree } from '~/utils';
 /* === VIVENTIUM END === */
 
 export default function MessagesView({
@@ -31,7 +31,7 @@ export default function MessagesView({
    * Original feature added: 2026-02-07
    */
   // const messagesTree = filterNoResponseMessagesTree(_messagesTree);
-  const messagesTree = _messagesTree;
+  const messagesTree = filterTrustedInternalMessagesTree(_messagesTree);
   /* === VIVENTIUM END === */
   return (
     <div className="min-h-0 flex-1 overflow-hidden pb-[50px]">

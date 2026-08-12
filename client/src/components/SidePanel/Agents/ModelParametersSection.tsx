@@ -29,6 +29,7 @@ type ModelParametersSectionProps = {
   provider: string;
   model: string;
   title: string;
+  excludedParameterKeys?: Array<keyof AgentModelParameters>;
 };
 
 export default function ModelParametersSection({
@@ -36,6 +37,7 @@ export default function ModelParametersSection({
   provider,
   model,
   title,
+  excludedParameterKeys = [],
 }: ModelParametersSectionProps) {
   const localize = useLocalize();
   const { announcePolite } = useLiveAnnouncer();

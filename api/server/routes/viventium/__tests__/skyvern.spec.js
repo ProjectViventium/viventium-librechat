@@ -212,7 +212,7 @@ describe('/api/viventium/skyvern/openai/v1/chat/completions', () => {
       .post('/api/viventium/skyvern/openai/v1/chat/completions')
       .set('authorization', 'Bearer bridge-secret')
       .send({
-        model: 'anthropic/claude-sonnet-4-5',
+        model: 'anthropic/claude-opus-5',
         messages: [{ role: 'user', content: 'Say hello' }],
       });
 
@@ -226,5 +226,39 @@ describe('/api/viventium/skyvern/openai/v1/chat/completions', () => {
     expect(JSON.parse(fetchInit.body).system).toEqual([
       { type: 'text', text: "You are Claude Code, Anthropic's official CLI for Claude." },
     ]);
+  });
+
+  test('marks an Anthropic connected account disconnected after invalid_grant', async () => {
+    mockGetUserKeyValues.mockResolvedValue({
+      apiKey: 'expired-anthropic-token',
+      authToken: 'expired-anthropic-token',
+      refreshToken: 'revoked-refresh-token',
+      oauthProvider: 'anthropic',
+      oauthType: 'subscription',
+      oauthExpiresAt: Date.now() - 1000,
+    });
+    global.fetch.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ error: 'invalid_grant', error_description: 'Refresh token invalid' }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+
+    const app = createTestApp();
+    const response = await request(app)
+      .post('/api/viventium/skyvern/openai/v1/chat/completions')
+      .set('authorization', 'Bearer bridge-secret')
+      .send({
+        model: 'anthropic/claude-opus-5',
+        messages: [{ role: 'user', content: 'test' }],
+      });
+
+    expect(response.status).toBe(401);
+    expect(mockUpdateUserKey).toHaveBeenCalledTimes(1);
+    const persistedValue = JSON.parse(mockUpdateUserKey.mock.calls[0][0].value);
+    expect(persistedValue).toMatchObject({
+      oauthProvider: 'anthropic',
+      oauthReconnectRequired: true,
+    });
   });
 });

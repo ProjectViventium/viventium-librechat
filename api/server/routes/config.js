@@ -12,6 +12,9 @@ const { isBrowserRegistrationOpen } = require('~/server/services/viventium/regis
 const {
   isConnectedAccountsCapabilityEnabled,
 } = require('~/server/services/viventium/connectedAccountsCapability');
+const {
+  getCortexFollowupGraceSeconds,
+} = require('~/server/services/viventium/cortexFollowupGrace');
 // VIVENTIUM END
 
 const router = express.Router();
@@ -152,15 +155,6 @@ router.get('/', async function (req, res) {
        * Purpose: Expose the explicit compiled Voice capability to browser call surfaces.
        * === VIVENTIUM END === */
       viventiumVoiceEnabled: isEnabled(process.env.VIVENTIUM_VOICE_ENABLED),
-      /* === VIVENTIUM START ===
-       * Feature: Easy Install browser-first onboarding.
-       * Purpose: Project the bounded installer experience into the authenticated first-user UI.
-       * === VIVENTIUM END === */
-      viventiumInstallExperience: ['express', 'custom', 'legacy'].includes(
-        process.env.VIVENTIUM_INSTALL_EXPERIENCE,
-      )
-        ? process.env.VIVENTIUM_INSTALL_EXPERIENCE
-        : undefined,
       /* === VIVENTIUM START ===
        * Feature: Prompt Workbench local launcher.
        * Purpose: Keep the Connected Accounts workbench entry in sync with the server-side local

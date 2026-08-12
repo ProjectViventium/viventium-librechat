@@ -41,7 +41,7 @@ jest.mock('@librechat/api', () => ({
   createSafeUser: jest.fn((user) => user),
   initializeAnthropic: jest.fn(async ({ model_parameters }) => ({
     llmConfig: {
-      model: model_parameters?.model ?? 'claude-sonnet-4-5',
+      model: model_parameters?.model ?? 'claude-opus-5',
       ...(model_parameters?.temperature != null
         ? { temperature: model_parameters.temperature }
         : {}),
@@ -66,6 +66,13 @@ jest.mock('@librechat/api', () => ({
     },
   })),
   resolveHeaders: jest.fn(({ headers }) => headers),
+}));
+
+jest.mock('~/server/services/viventium/GlassHiveConversationProviderService', () => ({
+  attachConversationProviderCapabilityBundle: jest.fn(async () => false),
+  buildHarnessIdempotencyKey: jest.fn((role, messageId, agentId = '') =>
+    [role, agentId, messageId].filter(Boolean).join(':'),
+  ),
 }));
 
 jest.mock('~/server/services/BackgroundCortexService', () => ({
@@ -248,6 +255,30 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(updated).toEqual(
       expect.arrayContaining([expect.objectContaining({ cortex_id: 'c1', status: 'brewing' })]),
     );
+  });
+
+  test('persistCortexPartsToCanonicalMessage does not collapse graph-authored text parts', async () => {
+    const req = { user: { id: 'u1' } };
+    const graphContent = [
+      { type: 'text', agentId: 'agent-consultant', text: 'Verified evidence.' },
+      { type: 'text', agentId: 'agent-author', text: ' Final synthesis.' },
+    ];
+    db.getMessage.mockResolvedValue({
+      messageId: 'm1',
+      text: 'Verified evidence. Final synthesis.',
+      content: graphContent,
+    });
+    db.updateMessage.mockResolvedValue({ messageId: 'm1' });
+
+    const updated = await persistCortexPartsToCanonicalMessage({
+      req,
+      responseMessageId: 'm1',
+      cortexParts: [{ type: 'cortex_brewing', cortex_id: 'c1', status: 'brewing' }],
+      maxAttempts: 1,
+    });
+
+    expect(updated.slice(0, 2)).toEqual(graphContent);
+    expect(updated[0].text).not.toContain('Final synthesis.');
   });
 
   test('finalizeCanonicalCortexMessage marks the canonical parent as finished', async () => {
@@ -2038,7 +2069,7 @@ describe('BackgroundCortexFollowUpService', () => {
     const originalProvider = process.env.VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER;
     const originalModel = process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL;
     process.env.VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER = 'anthropic';
-    process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL = 'claude-opus-4-8';
+    process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL = 'claude-opus-5';
 
     try {
       await generateFollowUpText({
@@ -2069,7 +2100,7 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(initializeAnthropic).toHaveBeenCalledWith(
       expect.objectContaining({
         model_parameters: expect.objectContaining({
-          model: 'claude-opus-4-8',
+          model: 'claude-opus-5',
         }),
       }),
     );
@@ -2080,7 +2111,7 @@ describe('BackgroundCortexFollowUpService', () => {
     const originalProvider = process.env.VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER;
     const originalModel = process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL;
     process.env.VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER = 'anthropic';
-    process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL = 'claude-opus-4-8';
+    process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL = 'claude-opus-5';
 
     try {
       await generateFollowUpText({
@@ -2114,7 +2145,7 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(initializeAnthropic).toHaveBeenCalledWith(
       expect.objectContaining({
         model_parameters: expect.objectContaining({
-          model: 'claude-opus-4-8',
+          model: 'claude-opus-5',
         }),
       }),
     );

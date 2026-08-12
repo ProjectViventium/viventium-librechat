@@ -36,6 +36,10 @@ let mockLastStreamId = null;
 let mockLastCanAuthorizeSideEffects = null;
 let mockLastActorTrust = null;
 let mockLastAmbientContext = null;
+let mockLastInteractionContext = null;
+let mockLastAdapterCapabilities = null;
+let mockLastDeliveryPolicy = null;
+let mockClaimedLogicalTurn = null;
 let mockAgentControllerCallCount = 0;
 let mockAgentControllerResponseDelayMs = 0;
 let mockAgentControllerGeneratedConversationId = null;
@@ -85,6 +89,18 @@ jest.mock('~/server/services/Endpoints/agents', () => ({
 jest.mock('~/server/services/Endpoints/agents/title', () => jest.fn());
 
 jest.mock('~/server/controllers/agents/request', () => (req, res) => {
+  const {
+    bindLogicalTurnContext,
+    getTrustedAdapterCapabilities,
+    getTrustedDeliveryPolicy,
+    getTrustedInteractionContext,
+  } = require('~/server/services/viventium/interactionContext');
+  mockLastInteractionContext = getTrustedInteractionContext(req);
+  mockLastAdapterCapabilities = getTrustedAdapterCapabilities(req);
+  mockLastDeliveryPolicy = getTrustedDeliveryPolicy(req);
+  if (mockClaimedLogicalTurn) {
+    bindLogicalTurnContext(req, { ...mockLastInteractionContext, ...mockClaimedLogicalTurn });
+  }
   mockAgentControllerCallCount += 1;
   mockSpeakerPersistedAtController = mockSpeakerPersisted;
   mockLastParentMessageId = req.body.parentMessageId;
@@ -1904,6 +1920,61 @@ describe('/api/viventium/voice/chat', () => {
     expect(mockLastStreamId).toBe('lc_req_1');
     expect(res.body.streamId).toBe('lc_req_1');
     expect(mockLastConversationId).toBe('conv-voice-1');
+  });
+
+  test('authors provisional voice context, ignores forged authority, and returns claimed metadata', async () => {
+    mockClaimedLogicalTurn = { logical_turn_id: 'logical-voice-1', revision: 4 };
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      url: '/api/viventium/voice/chat',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-request-id': 'voice-request-1',
+      },
+      body: {
+        text: 'voice turn',
+        streamId: 'voice-request-1',
+        sourceEventId: 'voice:opaque:event:1',
+        interactionContext: { actor_kind: 'system', origin: 'scheduler', surface: 'workbench' },
+        adapterCapabilities: {
+          segment_stability: 'immediate',
+          supersede_scope: 'response_and_authoring',
+        },
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(mockLastInteractionContext).toEqual({
+      actor_kind: 'external_user',
+      origin: 'interactive',
+      surface: 'voice',
+      conversation_id: 'conv-voice-1',
+      revision: 1,
+      source_event_id: 'voice:opaque:event:1',
+    });
+    expect(mockLastAdapterCapabilities).toEqual({
+      segment_stability: 'provisional',
+      supersede_scope: 'response_only',
+    });
+    expect(mockLastDeliveryPolicy).toEqual({ commit_authority: 'external_adapter' });
+    expect(req.body).not.toHaveProperty('interactionContext');
+    expect(req.body).not.toHaveProperty('adapterCapabilities');
+    expect(res.body).toMatchObject({
+      logical_turn_id: 'logical-voice-1',
+      revision: 4,
+      metadata: {
+        viventium: {
+          interactionContext: expect.objectContaining({
+            surface: 'voice',
+            logical_turn_id: 'logical-voice-1',
+            revision: 4,
+          }),
+        },
+      },
+    });
   });
 
   test('normal voice launches with a zero live coalescing window by default', async () => {

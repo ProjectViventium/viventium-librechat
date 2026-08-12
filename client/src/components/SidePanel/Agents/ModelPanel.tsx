@@ -15,6 +15,15 @@ import {
 import ModelParametersSection from './ModelParametersSection';
 import CapabilityProviderOptions from './CapabilityProviderOptions';
 
+type ProviderReadiness = {
+  status: string;
+  detail: string;
+  models: Array<{
+    id: string;
+    readiness?: { status?: string; authentication?: string; detail?: string };
+  }>;
+};
+
 export default function ModelPanel({
   providers,
   setActivePanel,
@@ -32,6 +41,9 @@ export default function ModelPanel({
   const fallbackModel = useWatch({ control, name: 'fallback_llm_model' });
   const fallbackProvider = useWatch({ control, name: 'fallback_llm_provider' });
   const modelParameters = useWatch({ control, name: 'model_parameters' });
+  const glassHiveOptions = useWatch({ control, name: 'glasshive_options' });
+  const glassHiveFallbackModel = glassHiveOptions?.fallback_model;
+  const glassHiveFallbackEffort = glassHiveOptions?.fallback_reasoning_effort;
 
   const provider = useMemo(() => {
     const value =
@@ -227,6 +239,198 @@ export default function ModelPanel({
             }}
           />
         </div>
+        {hasWorkspaceBinding && (
+          <div className="border-token-border-light bg-token-surface-primary mb-4 rounded-lg border p-4 text-left">
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <div>
+                <div className="font-medium">GlassHive harness</div>
+                <div className="text-token-text-secondary text-xs">
+                  Runs in the selected server-side folder with native harness tools.
+                </div>
+              </div>
+              <span
+                className={cn(
+                  'rounded-full px-2 py-1 text-xs font-medium',
+                  readinessStatus === 'ready'
+                    ? 'bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-200'
+                    : 'bg-amber-100 text-amber-900 dark:bg-amber-900/40 dark:text-amber-200',
+                )}
+                aria-live="polite"
+              >
+                {readinessLabel}
+              </span>
+            </div>
+            <div className="text-token-text-secondary mb-3 flex items-start justify-between gap-3 text-xs">
+              <span>{readinessDetail}</span>
+              <button
+                type="button"
+                className="underline"
+                onClick={() => readinessQuery.refetch()}
+                disabled={readinessQuery.isFetching}
+              >
+                Recheck
+              </button>
+            </div>
+
+            <label className="mb-1 block text-sm font-medium" htmlFor="glasshive-workspace-mode">
+              Working folder
+            </label>
+            <Controller
+              name="glasshive_options.workspace.mode"
+              control={control}
+              render={({ field }) => (
+                <select
+                  {...field}
+                  id="glasshive-workspace-mode"
+                  className="border-token-border-light bg-token-surface-primary mb-3 h-10 w-full rounded-lg border px-3"
+                >
+                  <option value="life">Viventium LIFE</option>
+                  <option value="custom">Custom server-side path</option>
+                </select>
+              )}
+            />
+            {glassHiveOptions?.workspace?.mode === 'custom' && (
+              <Controller
+                name="glasshive_options.workspace.path"
+                control={control}
+                rules={{ required: true }}
+                render={({ field, fieldState: { error } }) => (
+                  <div className="mb-3">
+                    <input
+                      {...field}
+                      value={field.value ?? ''}
+                      aria-label="Custom GlassHive working folder"
+                      placeholder="/path/to/viventium-life"
+                      className={cn(
+                        'border-token-border-light bg-token-surface-primary h-10 w-full rounded-lg border px-3',
+                        error && 'border-red-500',
+                      )}
+                    />
+                    <p className="text-token-text-secondary mt-1 text-xs">
+                      This path is resolved on the computer running GlassHive.
+                    </p>
+                  </div>
+                )}
+              />
+            )}
+
+            <label className="mb-1 block text-sm font-medium" htmlFor="glasshive-access">
+              Access
+            </label>
+            <Controller
+              name="glasshive_options.access"
+              control={control}
+              render={({ field }) => (
+                <select
+                  {...field}
+                  id="glasshive-access"
+                  className="border-token-border-light bg-token-surface-primary mb-3 h-10 w-full rounded-lg border px-3"
+                >
+                  <option value="full">Full access</option>
+                  <option value="workspace">Workspace writes only</option>
+                </select>
+              )}
+            />
+            <p className="text-token-text-secondary -mt-2 mb-3 text-xs">
+              Workspace mode limits writes to this folder. The harness may still read required
+              dependencies outside it.
+            </p>
+
+            {(modelCapability?.effortChoices?.length ?? 0) > 0 && (
+              <>
+                <label className="mb-1 block text-sm font-medium" htmlFor="glasshive-effort">
+                  Effort
+                </label>
+                <Controller
+                  name="model_parameters.reasoning_effort"
+                  control={control}
+                  render={({ field }) => (
+                    <select
+                      {...field}
+                      value={field.value ?? modelCapability?.recommendedEffort ?? ''}
+                      id="glasshive-effort"
+                      className="border-token-border-light bg-token-surface-primary h-10 w-full rounded-lg border px-3"
+                    >
+                      {modelCapability?.effortChoices.map((effort) => (
+                        <option key={effort} value={effort}>
+                          {effort}
+                          {effort === modelCapability.recommendedEffort ? ' (recommended)' : ''}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                />
+              </>
+            )}
+
+            {providerCapability?.serial_model_fallback === true && (
+              <div className="border-token-border-light mt-4 border-t pt-4">
+                <label
+                  className="mb-1 block text-sm font-medium"
+                  htmlFor="glasshive-fallback-model"
+                >
+                  {localize('com_ui_glasshive_quota_fallback_model')}
+                </label>
+                <Controller
+                  name="glasshive_options.fallback_model"
+                  control={control}
+                  render={({ field }) => (
+                    <select
+                      {...field}
+                      value={field.value ?? ''}
+                      id="glasshive-fallback-model"
+                      className="border-token-border-light bg-token-surface-primary mb-3 h-10 w-full rounded-lg border px-3"
+                    >
+                      <option value="">{localize('com_ui_glasshive_quota_fallback_empty')}</option>
+                      {providerCapability.models
+                        ?.filter((candidate) => candidate.id !== model)
+                        .map((candidate) => (
+                          <option key={candidate.id} value={candidate.id}>
+                            {candidate.label}
+                          </option>
+                        ))}
+                    </select>
+                  )}
+                />
+                <p className="text-token-text-secondary -mt-2 mb-3 text-xs">
+                  {localize('com_ui_glasshive_quota_fallback_description')}
+                </p>
+                {glassHiveFallbackModel &&
+                  (fallbackModelCapability?.effortChoices?.length ?? 0) > 0 && (
+                    <>
+                      <label
+                        className="mb-1 block text-sm font-medium"
+                        htmlFor="glasshive-fallback-effort"
+                      >
+                        {localize('com_ui_glasshive_quota_fallback_effort')}
+                      </label>
+                      <Controller
+                        name="glasshive_options.fallback_reasoning_effort"
+                        control={control}
+                        render={({ field }) => (
+                          <select
+                            {...field}
+                            value={field.value ?? fallbackModelCapability?.recommendedEffort ?? ''}
+                            id="glasshive-fallback-effort"
+                            className="border-token-border-light bg-token-surface-primary h-10 w-full rounded-lg border px-3"
+                          >
+                            {fallbackModelCapability?.effortChoices.map((effort) => (
+                              <option key={effort} value={effort}>
+                                {effort}
+                                {effort === fallbackModelCapability.recommendedEffort
+                                  ? ' (recommended)'
+                                  : ''}
+                              </option>
+                            ))}
+                          </select>
+                        )}
+                      />
+                    </>
+                  )}
+              </div>
+            )}
+          </div>
+        )}
         {/* === VIVENTIUM START ===
          * Feature: capability-backed Agent provider controls.
          * Purpose: Share readiness, workspace/access, and effort behavior with optional routes.
@@ -277,6 +481,9 @@ export default function ModelPanel({
         provider={provider}
         model={model ?? ''}
         title={localize('com_ui_model_parameters')}
+        excludedParameterKeys={
+          (modelCapability?.effortChoices?.length ?? 0) > 0 ? ['reasoning_effort'] : []
+        }
       />
     </div>
   );

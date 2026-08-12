@@ -405,7 +405,9 @@ export const verifyTwoFactorTemp = () => `${BASE_URL}/api/auth/2fa/verify-temp`;
 
 /* Memories */
 export const memories = () => `${BASE_URL}/api/memories`;
-export const memory = (key: string) => `${memories()}/${encodeURIComponent(key)}`;
+/* === VIVENTIUM START === Keep saved-memory keys out of the control-route namespace. === */
+export const memory = (key: string) => `${memories()}/entries/${encodeURIComponent(key)}`;
+/* === VIVENTIUM END === */
 export const memoryPreferences = () => `${memories()}/preferences`;
 
 /* === VIVENTIUM START === Feelings instrument === */

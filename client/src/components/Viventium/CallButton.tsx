@@ -171,7 +171,7 @@ type EndCallSessionOptions = {
   authToken?: string;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
-  refreshToken?: () => Promise<{ token?: string }>;
+  refreshToken?: () => Promise<{ token?: string } | undefined>;
   dispatchTokenUpdated?: (token: string) => void;
   wait?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
   attemptTimeoutMs?: number;
@@ -563,6 +563,9 @@ export default function CallButton({ className }: { className?: string }) {
             );
           }
           return;
+        }
+        if (!continuation.continuation) {
+          throw new Error('Call task continuation state is missing');
         }
         const summary = summarizeCallTaskContinuation(
           continuation.events,

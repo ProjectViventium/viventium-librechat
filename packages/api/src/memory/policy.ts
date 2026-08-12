@@ -73,23 +73,13 @@ export const DEFAULT_VIVENTIUM_MEMORY_KEY_LIMITS: MemoryKeyLimits = Object.freez
 
 const DATE_ONLY_RE = /\b(\d{4}-\d{2}-\d{2})\b/;
 const URL_RE = /https?:\/\/\S+/gi;
-const OPERATIONAL_WORKING_SPLIT_RE =
-  /\b(?:repeated internal checks?|wake loops?|self-reflection brews?|tool auth errors?|no new data)\b|\{NTA\}/i;
-const NOISE_PATTERNS: RegExp[] = [
-  /\{NTA\}/i,
-  /\bwake loops?\b/i,
-  /\binternal checks?\b/i,
-  /\bself-reflection brews?\b/i,
-  /\btool auth errors?\b/i,
-  /\bschedule_list\b/i,
-  /\buser_id missing\b/i,
-  /\bno live ms365 access\b/i,
-  /\bms365 no access\b/i,
-  /\bmorning briefings repeated\b/i,
-  /\bquiet state\b/i,
-  /\bidentical loops?\b/i,
-];
-const EXISTING_MEMORY_NOISE_PATTERNS: RegExp[] = [...NOISE_PATTERNS, /\brepeated checks?\b/i];
+/* === VIVENTIUM START ===
+ * Feature: Structural operational-residue boundary.
+ * Purpose: Reject only the explicit machine control marker emitted by runtime no-turn actions.
+ * Ordinary language is user evidence, even when it happens to describe checks, tools, schedules,
+ * or a quiet state; deterministic memory policy must not classify that language with phrase lists.
+ * === VIVENTIUM END === */
+const OPERATIONAL_CONTROL_MARKER_RE = /\{NTA\}/i;
 
 const TODAY_TOKEN_ENCODING = 'o200k_base';
 const WORLD_PRECOMPACT_THRESHOLD_PERCENT = 85;
@@ -99,64 +89,6 @@ const WORKING_EXPIRY_DAYS = 3;
 const STALE_IN_PROGRESS_DRAFT_ARCHIVE_DAYS = 14;
 const NOISY_SEMICOLON_RUN_RE = /(?:\s*;\s*){2,}/g;
 const NOISY_SEMICOLON_RUN_TEST_RE = /(?:\s*;\s*){2,}/;
-const WORLD_TEMPORAL_MARKERS: RegExp[] = [
-  /\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)(?:day)?\b/i,
-  /\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)(?:[a-z]+)?\b/i,
-  /\b(?:today|tomorrow|yesterday|tonight|weekend|this week|next week|next month)\b/i,
-  /\b\d{4}-\d{2}-\d{2}\b/,
-  /\b\d{1,2}:\d{2}\s*(?:AM|PM)\b/i,
-  /\b(?:AM|PM)\s*(?:ET|EST|EDT|PT|PST|PDT|CT|CST|CDT|MT|MST|MDT|UTC)\b/i,
-];
-const WORLD_TRANSIENT_STATE_PATTERNS: RegExp[] = [
-  /\b(?:pending|scheduled|rescheduled|delayed|blocked|stalled|paused|waiting)\b/i,
-  /\b(?:deadline|eta|next step|follow-?up|reply state|outreach|intro(?:duction)?|prospective)\b/i,
-  /\b(?:call|meeting|demo|pitch|check-?in|sync)\b/i,
-  /\b(?:phase\d*|pilot|rollout|launch(?:ed)?|go-?live|prod(?:uction)?|deployment|migration|setup)\b/i,
-  /\b(?:pricing|quote|proposal|invoice|payment|paid|equity|term sheet|sow|contract draft)\b/i,
-  /\b(?:ordered|shipped|delivery|recently requested|gift|purchase|bought)\b/i,
-];
-const WORLD_CONTACT_LOGISTICS_PATTERNS: RegExp[] = [
-  /@/,
-  /\b(?:email|phone|cell|telegram|whatsapp|slack|discord|zoom|teams)\b/i,
-];
-const WORLD_DROP_PATTERNS: RegExp[] = [
-  ...WORLD_TEMPORAL_MARKERS,
-  ...WORLD_TRANSIENT_STATE_PATTERNS,
-  ...WORLD_CONTACT_LOGISTICS_PATTERNS,
-  /\$\d/i,
-];
-const WORLD_KEEP_PATTERNS: RegExp[] = [
-  /\bmet\b/i,
-  /\bmarried\b/i,
-  /\bbirthday(?:\s*[:|-]|\s+is|\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)(?:[a-z]+)?(?:\s+\d{1,2})?)\b/i,
-  /\bwife\b/i,
-  /\bdog\b/i,
-  /\bfamily\b/i,
-  /\bfather\b/i,
-  /\bmother\b/i,
-  /\bsister\b/i,
-  /\bparents\b/i,
-  /\bco-founded\b/i,
-  /\bco-founder\b/i,
-  /\bdecision intelligence\b/i,
-  /\bvoice-first\b/i,
-  /\bvision\b/i,
-  /\bDelaware\b/i,
-  /\bpowered by\b/i,
-  /\bflagship client\b/i,
-  /\bchampion\b/i,
-  /\badvisors?\b/i,
-  /\bdirector of\b/i,
-  /\blawyer\b/i,
-  /\btherapist\b/i,
-  /\bCIO\b/i,
-  /\bCEO\b/i,
-  /\bCSO\b/i,
-  /\badvisor\b/i,
-  /\bflagship\b/i,
-  /\bpartner\b/i,
-];
-
 type DraftRecord = {
   thread: string;
   status?: string;
@@ -206,12 +138,11 @@ export function resolveMaintenanceThresholdPercent(value?: number | null): numbe
   return Math.min(100, Math.max(1, Math.round(parsed)));
 }
 
-export function containsOperationalNoise(value?: string, useExistingPatterns = false): boolean {
+export function containsOperationalNoise(value?: string, _useExistingPatterns = false): boolean {
   if (typeof value !== 'string' || value.trim().length === 0) {
     return false;
   }
-  const patterns = useExistingPatterns ? EXISTING_MEMORY_NOISE_PATTERNS : NOISE_PATTERNS;
-  return patterns.some((pattern) => pattern.test(value));
+  return OPERATIONAL_CONTROL_MARKER_RE.test(value);
 }
 
 export function evaluateMemoryWrite({
@@ -450,9 +381,10 @@ export function createMemoryMaintenancePlan({
     key: string,
     reason: string,
     transform: (entry: MemoryEntryLike) => string,
+    allowGrowth = false,
   ) => {
     if (!protectedKeySet.has(key)) {
-      applyTransform(memoryMap, key, reason, transform);
+      applyTransform(memoryMap, key, reason, transform, allowGrowth);
     }
   };
 
@@ -478,9 +410,13 @@ export function createMemoryMaintenancePlan({
     'context',
     'Trimmed context to active state and removed operational chatter',
     (entry) => compactContextValue(entry.value, now, keyLimits?.context),
+    hasExpiredContext,
   );
-  applyAllowedTransform('working', 'Compacted stale working memory snapshot', (entry) =>
-    compactWorkingValue(entry.value, now, keyLimits?.working),
+  applyAllowedTransform(
+    'working',
+    'Compacted stale working memory snapshot',
+    (entry) => compactWorkingValue(entry.value, now, keyLimits?.working),
+    hasExpiredWorking,
   );
   applyAllowedTransform('moments', 'Pruned moments to the active episodic window', (entry) =>
     compactMomentsValue(entry.value, now, keyLimits?.moments),
@@ -591,6 +527,7 @@ function applyTransform(
   key: string,
   _reason: string,
   transform: (entry: MemoryEntryLike) => string,
+  allowGrowth = false,
 ): void {
   const entry = memoryMap.get(key);
   if (!entry || typeof entry.value !== 'string' || entry.value.trim().length === 0) {
@@ -602,10 +539,21 @@ function applyTransform(
     return;
   }
 
+  const nextTokenCount = countTokens(nextValue);
+  const previousTokenCount = sanitizeTokenCount(entry.tokenCount);
+  if (
+    !allowGrowth &&
+    !containsOperationalNoise(entry.value, true) &&
+    previousTokenCount > 0 &&
+    nextTokenCount > previousTokenCount
+  ) {
+    return;
+  }
+
   memoryMap.set(key, {
     ...entry,
     value: nextValue,
-    tokenCount: countTokens(nextValue),
+    tokenCount: nextTokenCount,
   });
 }
 
@@ -696,8 +644,7 @@ function buildMeValue(
 function compactSignalsValue(value: string, now: Date, keyLimit?: number): string {
   const records = parseSignals(value)
     .filter((record) => !containsOperationalNoise(record.domain, true))
-    .filter((record) => !containsOperationalNoise(record.observation, true))
-    .filter((record) => !record.domain.toLowerCase().includes('wake_loop'));
+    .filter((record) => !containsOperationalNoise(record.observation, true));
 
   let evidenceCount = 3;
   let observationWords = 26;
@@ -878,7 +825,7 @@ export function prepareMemoryValueForWrite({
   if (key === 'world' && keyLimit != null) {
     const pressureThreshold = Math.floor((keyLimit * thresholdPercent) / 100);
     const tokenCount = countTokens(trimmed);
-    if (tokenCount >= pressureThreshold || containsWorldTemporalResidue(trimmed)) {
+    if (tokenCount >= pressureThreshold) {
       nextValue = compactWorldValue(trimmed, now, keyLimit);
     }
   }
@@ -1022,7 +969,7 @@ function buildContextValue(
     if (!line || isMarkerLine(line)) {
       continue;
     }
-    if (matchesNoiseLine(line) || /repeated checks?|no new data/i.test(line)) {
+    if (matchesNoiseLine(line)) {
       continue;
     }
     if (line === 'Priority tracks:') {
@@ -1052,8 +999,7 @@ function buildContextValue(
 function compactWorkingValue(value: string, now: Date, keyLimit?: number): string {
   const isExpired = isDateMarkerBefore(value, '_expires', now);
   const isStale = isDateMarkerBefore(value, '_stale_after', now);
-  const hasOperationalNoise =
-    containsOperationalNoise(value, true) || /\bno new data\b/i.test(value);
+  const hasOperationalNoise = containsOperationalNoise(value, true);
   if (
     !isExpired &&
     !isStale &&
@@ -1064,29 +1010,23 @@ function compactWorkingValue(value: string, now: Date, keyLimit?: number): strin
   }
   const body = value
     .split(/\r?\n/)
-    .filter((line) => !isMarkerLine(line.trim()))
+    .filter((line) => !isMarkerLine(line.trim()) && !matchesNoiseLine(line))
     .join(' ')
     .trim();
-  const preferredBody =
-    hasOperationalNoise && OPERATIONAL_WORKING_SPLIT_RE.test(body)
-      ? body.split(OPERATIONAL_WORKING_SPLIT_RE)[0].trim()
-      : body;
-  const compactBody = compactSentence(
-    preferredBody || body,
-    isExpired || isStale || hasOperationalNoise ? 32 : 60,
-  );
-
-  if (!compactBody) {
-    return value.trim();
-  }
-
   const updated = formatDateOnly(now);
   const staleAfter = addDays(updated, WORKING_STALE_AFTER_DAYS);
   const expires = addDays(updated, WORKING_EXPIRY_DAYS);
-  let candidate = `${compactBody}\n_updated: ${updated} | _stale_after: ${staleAfter} | _expires: ${expires}`;
+  const lifecycleMarkers = `_updated: ${updated} | _stale_after: ${staleAfter} | _expires: ${expires}`;
+  const compactBody = compactSentence(body, isExpired || isStale || hasOperationalNoise ? 32 : 60);
+
+  if (!compactBody) {
+    return lifecycleMarkers;
+  }
+
+  let candidate = `${compactBody}\n${lifecycleMarkers}`;
 
   if (keyLimit != null && countTokens(candidate) > keyLimit) {
-    candidate = `${compactSentence(preferredBody || body, 40)}\n_updated: ${updated} | _stale_after: ${staleAfter} | _expires: ${expires}`;
+    candidate = `${compactSentence(body, 40)}\n${lifecycleMarkers}`;
   }
   return candidate.trim();
 }
@@ -1126,10 +1066,7 @@ function buildWorldEntryBody(body: string, wordLimit: number): string {
   const [label, content] = splitLabel(body);
   const rawClauses = splitWorldClauses(content);
   const keptClauses = dedupeLines(
-    rawClauses
-      .map((clause) => sanitizeWorldClause(clause))
-      .filter(Boolean)
-      .filter((clause) => !shouldDropWorldClause(clause)),
+    rawClauses.map((clause) => sanitizeWorldClause(clause)).filter(Boolean),
   );
 
   if (keptClauses.length === 0) {
@@ -1153,8 +1090,7 @@ function compactWorldPeopleLine(line: string, peopleLimit: number, wordLimit: nu
   const people = dedupeLines(
     splitTopLevelList(content)
       .map((entry) => sanitizeWorldClause(entry))
-      .filter(Boolean)
-      .filter((entry) => !shouldDropWorldClause(entry)),
+      .filter(Boolean),
   )
     .slice(0, peopleLimit)
     .map((entry) => compactSentence(entry, wordLimit))
@@ -1458,20 +1394,6 @@ function sanitizeOperationalText(value?: string): string {
   }
 
   return normalized
-    .replace(/\brepeated\s+quiet-state\s+wake loops?\b/gi, '')
-    .replace(/\bquiet-state\s+wake loops?\b/gi, '')
-    .replace(/\bwake loops?\b/gi, '')
-    .replace(/\binternal checks?\b/gi, '')
-    .replace(/\bself-reflection brews?\b/gi, '')
-    .replace(/\btool auth errors?\b/gi, '')
-    .replace(/\bschedule_list\b/gi, '')
-    .replace(/\buser_id missing\b/gi, '')
-    .replace(/\bno live ms365 access\b/gi, '')
-    .replace(/\bms365 no access\b/gi, '')
-    .replace(/\bmorning briefings repeated\b/gi, '')
-    .replace(/\bidentical loops?\b/gi, '')
-    .replace(/\bquiet state\b/gi, '')
-    .replace(/\brepeated checks?\b/gi, '')
     .replace(/\{NTA\}/gi, '')
     .replace(NOISY_SEMICOLON_RUN_RE, '; ')
     .replace(/\s+/g, ' ')
@@ -1485,12 +1407,13 @@ function stripOuterQuotes(value: string): string {
 }
 
 function getBlockedPattern(value: string): string | undefined {
-  const pattern = NOISE_PATTERNS.find((candidate) => candidate.test(value));
-  return pattern?.source;
+  return OPERATIONAL_CONTROL_MARKER_RE.test(value)
+    ? OPERATIONAL_CONTROL_MARKER_RE.source
+    : undefined;
 }
 
 function matchesNoiseLine(line: string): boolean {
-  return EXISTING_MEMORY_NOISE_PATTERNS.some((pattern) => pattern.test(line));
+  return OPERATIONAL_CONTROL_MARKER_RE.test(line);
 }
 
 function containsSeparatorCorruption(value?: string): boolean {
@@ -1498,12 +1421,6 @@ function containsSeparatorCorruption(value?: string): boolean {
     return false;
   }
   return NOISY_SEMICOLON_RUN_TEST_RE.test(value);
-}
-
-function containsWorldTemporalResidue(value: string): boolean {
-  return splitWorldClauses(value).some((clause) =>
-    shouldDropWorldClause(sanitizeWorldClause(clause)),
-  );
 }
 
 function splitLabel(value: string): [string | null, string] {
@@ -1559,13 +1476,10 @@ function sanitizeWorldClause(value: string): string {
       const kept = dedupeLines(
         splitTopLevelList(inner)
           .map((part) => sanitizeWorldClause(part))
-          .filter(Boolean)
-          .filter((part) => !shouldDropWorldClause(part)),
+          .filter(Boolean),
       );
       return kept.length > 0 ? `(${kept.join(', ')})` : '';
     })
-    .replace(/\bturning\s+\d{1,2},?\s*\d{4}\b/gi, '')
-    .replace(/\b(?:2\/\d{1,2}|\d{4}-\d{2}-\d{2})\b/g, '')
     .replace(/\s+/g, ' ')
     .replace(/\s+([,.;:!?])/g, '$1')
     .trim()
@@ -1575,31 +1489,6 @@ function sanitizeWorldClause(value: string): string {
     .replace(/^[,.;:-]+/, '')
     .replace(/[,.;:-]+$/, '')
     .trim();
-}
-
-function shouldDropWorldClause(value: string): boolean {
-  if (!value) {
-    return true;
-  }
-
-  if (hasWorldContactLogistics(value)) {
-    return true;
-  }
-
-  const hasTemporalMarker = WORLD_TEMPORAL_MARKERS.some((pattern) => pattern.test(value));
-  const hasTransientState = WORLD_TRANSIENT_STATE_PATTERNS.some((pattern) => pattern.test(value));
-  const hasKeepPattern = WORLD_KEEP_PATTERNS.some((pattern) => pattern.test(value));
-  const hasDropPattern = WORLD_DROP_PATTERNS.some((pattern) => pattern.test(value));
-
-  if ((hasTemporalMarker || hasTransientState) && !hasKeepPattern) {
-    return true;
-  }
-
-  return hasDropPattern && !hasKeepPattern;
-}
-
-function hasWorldContactLogistics(value: string): boolean {
-  return WORLD_CONTACT_LOGISTICS_PATTERNS.some((pattern) => pattern.test(value));
 }
 
 function trimWorldCandidateToLimit(value: string, keyLimit: number): string {

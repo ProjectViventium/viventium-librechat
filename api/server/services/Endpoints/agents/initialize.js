@@ -613,6 +613,17 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
   req._viventiumHarnessInvocationStarted = false;
   /* === VIVENTIUM END === */
 
+  /* === VIVENTIUM START ===
+   * Feature: Harness activity/cancellation lifecycle binding.
+   * Purpose: Mark activity-stream providers through structured capabilities after voice overrides,
+   * so UI rendering and duplicate-run guards never depend on a provider label.
+   * === VIVENTIUM END === */
+  const primaryProviderCapability =
+    appConfig?.endpoints?.[EModelEndpoint.agents]?.providerCapabilities?.[primaryAgent.provider];
+  req._viventiumHarnessActivityEnabled = primaryProviderCapability?.activity_stream === true;
+  req._viventiumHarnessExecutionEnabled = primaryProviderCapability?.workspace_binding === true;
+  req._viventiumHarnessInvocationStarted = false;
+
   const validateStart = nowIfDeep();
   const voiceValidatePrimaryStart = voiceLatencyEnabled ? voiceLatencyNow() : null;
   const validationResult = await validateAgentModel({

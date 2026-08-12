@@ -36,6 +36,23 @@ function normalizeProvider(provider) {
   return raw;
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Server-side real-time voice capability enforcement.
+ * Purpose: A text harness may be the Main provider, but it must never inherit a LiveKit call when
+ * its compiled capability says real-time voice is unsupported.
+ * === VIVENTIUM END === */
+function providerAllowsRealtimeVoice(provider, req) {
+  const normalized = normalizeProvider(provider);
+  const agentsConfig = req?.config?.endpoints?.agents || {};
+  const capability =
+    agentsConfig.providerCapabilities?.[provider] ||
+    agentsConfig.providerCapabilities?.[normalized];
+  if (capability) {
+    return capability.realtime_voice === true;
+  }
+  return !(agentsConfig.capabilityRequiredProviders || []).includes(provider);
+}
+
 function hasConfiguredServerCredential(provider) {
   const envKeys = PROVIDER_ENV_KEYS[provider];
   if (!Array.isArray(envKeys) || envKeys.length === 0) {
@@ -362,6 +379,7 @@ function applyVoiceModelOverride(agent, req, modelsConfig) {
 
 module.exports = {
   isVoiceCallActive,
+  providerAllowsRealtimeVoice,
   isVoiceModelValid,
   resolveVoiceOverrideAssignment,
   resolveVoiceModelParameters,

@@ -70,6 +70,12 @@ const {
   resolveReusableConversationState,
 } = require('~/server/services/viventium/conversationThreading');
 const {
+  attachLogicalTurnMetadata,
+  createVoiceInteractionContext,
+  getTrustedInteractionContext,
+  setTrustedInteractionContext,
+} = require('~/server/services/viventium/interactionContext');
+const {
   isListenOnlyTranscriptMessage,
 } = require('~/server/services/viventium/listenOnlyTranscript');
 const {
@@ -2023,6 +2029,24 @@ router.post(
     });
     const conversationId = conversationState.conversationId;
     let parentMessageId = conversationState.parentMessageId;
+    const sourceEventId =
+      (typeof incoming.sourceEventId === 'string' && incoming.sourceEventId) ||
+      (typeof incoming.source_event_id === 'string' && incoming.source_event_id) ||
+      req.viventiumVoiceRequestId ||
+      req.get('X-VIVENTIUM-REQUEST-ID') ||
+      crypto.randomUUID();
+    setTrustedInteractionContext(
+      req,
+      createVoiceInteractionContext({
+        conversation_id: conversationId,
+        source_event_id: sourceEventId,
+      }),
+      {
+        segment_stability: 'provisional',
+        supersede_scope: 'response_only',
+      },
+      { commit_authority: 'external_adapter' },
+    );
     const ownershipVerifiedReasons = new Set(['existing', 'message_lookup_error']);
     req.viventiumVoiceResolvedConversationId = conversationId;
     req.viventiumVoiceConvoAccessVerified =
@@ -2071,8 +2095,16 @@ router.post(
         : [];
 
     // Normalize request body for Agents buildEndpointOption + controller.
+    const {
+      interactionContext: _untrustedInteractionContext,
+      interaction_context: _untrustedInteractionContextSnake,
+      viventiumInteractionContext: _untrustedViventiumInteractionContext,
+      adapterCapabilities: _untrustedAdapterCapabilities,
+      adapter_capabilities: _untrustedAdapterCapabilitiesSnake,
+      ...safeIncoming
+    } = incoming;
     req.body = {
-      ...incoming,
+      ...safeIncoming,
       text,
       endpoint: 'agents',
       endpointType: 'agents',
@@ -2157,10 +2189,16 @@ router.post(
           `conversationId=${req.body?.conversationId || 'unknown'} streamId=${coalescedTurn.payload.streamId || 'unknown'}`,
       );
       const existingTask = getVoiceTaskByStreamId(coalescedTurn.payload.streamId);
-      return res.json({
-        ...coalescedTurn.payload,
-        ...(existingTask ? { taskId: existingTask.taskId } : {}),
-      });
+      const existingJob = await GenerationJobManager.getJob(coalescedTurn.payload.streamId);
+      return res.json(
+        attachLogicalTurnMetadata(
+          {
+            ...coalescedTurn.payload,
+            ...(existingTask ? { taskId: existingTask.taskId } : {}),
+          },
+          existingJob?.metadata?.interactionContext,
+        ),
+      );
     }
 
     if (
@@ -2266,7 +2304,12 @@ router.post(
       } catch (e) {
         // noop
       }
-      return originalJson({ ...payload, taskId: voiceTask.taskId });
+      return originalJson(
+        attachLogicalTurnMetadata(
+          { ...payload, taskId: voiceTask.taskId },
+          getTrustedInteractionContext(req),
+        ),
+      );
     };
 
     // Handle insight delivery mode (speakInsights=true)

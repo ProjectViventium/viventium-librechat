@@ -57,7 +57,7 @@ describe('CallSessionService', () => {
     process.env.VIVENTIUM_WING_MODE_DEFAULT_ENABLED = 'false';
     process.env.VIVENTIUM_SHADOW_MODE_DEFAULT_ENABLED = 'false';
     process.env.VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER = 'anthropic';
-    process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL = 'claude-opus-4-8';
+    process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL = 'claude-opus-5';
     delete process.env.OPENAI_API_KEY;
     process.env.VIVENTIUM_STT_PROVIDER = 'assemblyai';
     delete process.env.VIVENTIUM_STT_MODEL;
@@ -1642,11 +1642,11 @@ describe('CallSessionService', () => {
         tts: { provider: 'elevenlabs', variant: 'voice_123' },
       },
       assistantRoute: {
-        primary: { provider: 'anthropic', model: 'claude-opus-4-8' },
+        primary: { provider: 'anthropic', model: 'claude-opus-5' },
         voiceCallLlm: null,
         fallbackLlm: null,
         voiceFallbackLlm: null,
-        effective: { provider: 'anthropic', model: 'claude-opus-4-8' },
+        effective: { provider: 'anthropic', model: 'claude-opus-5' },
         inheritsPrimary: true,
       },
     });
@@ -1718,7 +1718,7 @@ describe('CallSessionService', () => {
         tts: { provider: 'cartesia', variant: 'sonic-2' },
       },
       assistantRoute: {
-        primary: { provider: 'anthropic', model: 'claude-opus-4-8' },
+        primary: { provider: 'anthropic', model: 'claude-opus-5' },
         voiceCallLlm: { provider: 'openAI', model: 'gpt-5.4' },
         fallbackLlm: { provider: 'anthropic', model: 'claude-haiku-4-5' },
         voiceFallbackLlm: { provider: 'anthropic', model: 'claude-haiku-4-5' },

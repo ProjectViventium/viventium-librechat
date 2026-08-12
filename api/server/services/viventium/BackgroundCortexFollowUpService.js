@@ -620,7 +620,17 @@ function sanitizeAnthropicFollowUpLLMConfig(llmConfig = {}) {
     ? llmConfig.thinking
     : true;
   const thinkingIsActive = hasActiveAnthropicThinking(effectiveThinking);
-  const adaptiveModel = model ? supportsAdaptiveThinking(model) : false;
+  /* === VIVENTIUM START ===
+   * Feature: Anthropic follow-up sampling compatibility.
+   * A family-major-date snapshot (for example opus-5-YYYYMMDD) does not declare an adaptive
+   * semantic revision. Do not let the shared loose version parser reinterpret the release date as
+   * a minor version. Explicit adaptive revisions (for example opus-4-7[-YYYYMMDD]) remain guarded,
+   * and active/default thinking always removes temperature below.
+   * === VIVENTIUM END === */
+  const hasAmbiguousDateSnapshot =
+    /claude-(?:opus|sonnet)[-.]?\d+[-.](?:19|20)\d{6}(?:$|[-.:])/.test(model);
+  const adaptiveModel =
+    model && !hasAmbiguousDateSnapshot ? supportsAdaptiveThinking(model) : false;
   if (!thinkingIsActive && !adaptiveModel) {
     return llmConfig;
   }
@@ -1001,9 +1011,14 @@ async function resolveCanonicalFollowUpAgent(
 
 function upsertCortexParts(existingContent, cortexParts, options = {}) {
   const visibleText = typeof options.visibleText === 'string' ? options.visibleText.trim() : '';
+  const structuredVisibleText = extractTextFromMessageContent(existingContent).trim();
+  const preservesStructuredTranscript =
+    visibleText.length > 0 && structuredVisibleText === visibleText;
   const content =
     visibleText && !isNoResponseOnly(visibleText)
-      ? mergeVisibleTextIntoMessageContent(existingContent, visibleText)
+      ? preservesStructuredTranscript
+        ? [...existingContent]
+        : mergeVisibleTextIntoMessageContent(existingContent, visibleText)
       : Array.isArray(existingContent)
         ? [...existingContent]
         : [];

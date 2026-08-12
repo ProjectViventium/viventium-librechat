@@ -141,6 +141,27 @@ describe('memory policy', () => {
       expect(result.errorType).toBe('noise_rejected');
     });
 
+    it('does not reject durable content merely because it names a provider access constraint', () => {
+      const result = evaluateMemoryWrite({
+        key: 'context',
+        value: 'Project Bluebird assumes no live MS365 access during the compliance review.',
+        tokenCount: 18,
+      });
+
+      expect(result.ok).toBe(true);
+    });
+
+    it('does not classify ordinary operational language as machine residue', () => {
+      const result = evaluateMemoryWrite({
+        key: 'context',
+        value:
+          'The quiet-state review uses repeated checks, a schedule list, and tool auth errors as discussion topics.',
+        tokenCount: 22,
+      });
+
+      expect(result.ok).toBe(true);
+    });
+
     it('rejects writes that would exceed a per-key budget but allows self-healing overwrites', () => {
       const rejected = evaluateMemoryWrite({
         key: 'drafts',
@@ -168,6 +189,23 @@ describe('memory policy', () => {
   });
 
   describe('world compaction', () => {
+    it('does not classify arbitrary world facts with phrase or entity keyword rules', () => {
+      const value =
+        'Nimbus: payment scheduled tomorrow. Rowan is a botanist. Their dog has a birthday next week.';
+
+      const prepared = prepareMemoryValueForWrite({
+        key: 'world',
+        value,
+        keyLimits: { world: 1200 },
+      });
+
+      expect(prepared).toEqual({
+        value,
+        tokenCount: expect.any(Number),
+        compacted: false,
+      });
+    });
+
     it('pre-compacts world writes before they hit the hard cap', () => {
       const prepared = prepareMemoryValueForWrite({
         key: 'world',
@@ -221,12 +259,12 @@ describe('memory policy', () => {
         'Compacted world to durable relationships and venture identity',
       );
       expect(worldUpdate?.value).toContain('Met May 25 2022');
-      expect(worldUpdate?.value).not.toContain('birthday gift');
-      expect(worldUpdate?.value).not.toContain('pending DNS');
+      expect(worldUpdate?.value).toContain('birthday gift');
+      expect(worldUpdate?.value).toContain('pending DNS');
       expect(worldUpdate?.value).not.toContain('@');
     });
 
-    it('keeps durable formation context when compacting world', () => {
+    it('keeps arbitrary relationship content when compacting world', () => {
       const compacted = compactWorldValue(
         [
           'Partner: Sam. Met May 25 2022 (first date: AI singularity). Married Dec 2025 Cancun. Recently requested a birthday gift.',
@@ -238,7 +276,7 @@ describe('memory policy', () => {
 
       expect(compacted).toContain('Met May 25 2022');
       expect(compacted).toContain('Married Dec 2025 Cancun');
-      expect(compacted).not.toContain('birthday gift');
+      expect(compacted).toContain('birthday gift');
     });
   });
 
@@ -322,7 +360,7 @@ describe('memory policy', () => {
       });
 
       expect(plan.shouldApply).toBe(true);
-      expect(plan.totalTokensAfter).toBeLessThan(plan.totalTokensBefore);
+      expect(plan.totalTokensAfter).toBeGreaterThan(0);
 
       const meUpdate = plan.updates.find((update) => update.key === 'me');
       expect(meUpdate?.value).not.toContain('{NTA}');
@@ -332,17 +370,15 @@ describe('memory policy', () => {
       expect(signalsUpdate?.value).toContain('business_execution');
 
       const draftsUpdate = plan.updates.find((update) => update.key === 'drafts');
-      expect(draftsUpdate?.value).toContain('summary:');
-      expect(draftsUpdate?.value).toContain('Archived:');
-      expect(draftsUpdate?.value).not.toContain('repeated quiet-state wake loops');
+      expect(draftsUpdate).toBeUndefined();
 
       const contextUpdate = plan.updates.find((update) => update.key === 'context');
-      expect(contextUpdate?.value).not.toContain('repeated checks 26x+');
+      expect(contextUpdate?.value).toContain('repeated checks 26x+');
 
       const workingUpdate = plan.updates.find((update) => update.key === 'working');
-      expect(workingUpdate?.value).toContain('Workspace');
+      expect(workingUpdate?.value).not.toContain('Workspace');
       expect(workingUpdate?.value).not.toContain('{NTA}');
-      expect(workingUpdate?.value).not.toContain('Internal Checks');
+      expect(workingUpdate?.value).not.toContain('internal checks');
       expect(workingUpdate?.value).not.toContain('no new data');
     });
 

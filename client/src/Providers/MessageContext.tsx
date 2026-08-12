@@ -10,6 +10,12 @@ type MessageContext = {
   isSubmitting?: boolean;
   /** Whether this is the latest message in the conversation */
   isLatestMessage?: boolean;
+  /* === VIVENTIUM START ===
+   * Feature: Exact rendered message-part identity for QA telemetry.
+   * Purpose: Let the actual text DOM node expose its UI-only persisted identity and author.
+   * === VIVENTIUM END === */
+  viventiumPartId?: string;
+  viventiumAgentId?: string;
 };
 
 export const MessageContext = createContext<MessageContext>({} as MessageContext);

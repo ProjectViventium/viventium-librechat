@@ -16,7 +16,7 @@ import MultiMessage from './MultiMessage';
  *
  * Added: 2026-02-07
  */
-import { cn, filterNoResponseMessagesTree } from '~/utils';
+import { cn, filterNoResponseMessagesTree, filterTrustedInternalMessagesTree } from '~/utils';
 /* === VIVENTIUM END === */
 import store from '~/store';
 
@@ -44,7 +44,7 @@ function MessagesViewContent({
   // const messagesTree = filterNoResponseMessagesTree(_messagesTree, {
   //   brewNoResponsePlaceholder: '-',
   // });
-  const messagesTree = _messagesTree;
+  const messagesTree = filterTrustedInternalMessagesTree(_messagesTree);
 
   const {
     conversation,

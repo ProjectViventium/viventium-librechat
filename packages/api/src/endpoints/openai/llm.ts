@@ -271,6 +271,7 @@ export function getOpenAILLMConfig({
       hasModelKwargs = true;
     }
   } else if (
+    !(dropParams && dropParams.includes('reasoning')) &&
     hasReasoningParams({ reasoning_effort, reasoning_summary }) &&
     (llmConfig.useResponsesApi === true ||
       (endpoint !== EModelEndpoint.openAI && endpoint !== EModelEndpoint.azureOpenAI))

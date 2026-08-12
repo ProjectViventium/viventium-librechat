@@ -10,6 +10,7 @@ output_contract: surface_text_instructions
 includes:
   - surface.messaging.bubble_boundaries
 ---
+
 TELEGRAM TEXT MODE:
 - Use standard Markdown formatting (bold, italic, inline code, code blocks, block quotes).
 - Do NOT use Telegram MarkdownV2 escaping (no backslash-escaped punctuation like \. \- \!).

@@ -1,6 +1,6 @@
 import { ContentTypes } from 'librechat-data-provider';
 import type { TMessage } from 'librechat-data-provider';
-import { filterNoResponseMessagesTree } from './noResponseTag';
+import { filterNoResponseMessagesTree, filterTrustedInternalMessagesTree } from './noResponseTag';
 
 function mkMessage({
   messageId,
@@ -97,5 +97,30 @@ describe('filterNoResponseMessagesTree', () => {
     });
 
     expect(filtered?.[0]?.children?.length).toBe(0);
+  });
+});
+
+describe('filterTrustedInternalMessagesTree', () => {
+  test('uses trusted visibility metadata and does not hide a user-authored literal tag', () => {
+    const literal = {
+      ...mkMessage({
+        messageId: 'u1',
+        parentMessageId: 'root',
+        text: '{NTA}',
+        isCreatedByUser: true,
+      }),
+      metadata: { viventium: { interactionContext: { origin: 'interactive' } } },
+    } as TMessage;
+    const internal = {
+      ...mkMessage({
+        messageId: 's1',
+        parentMessageId: 'root',
+        text: '{NTA}',
+        isCreatedByUser: false,
+      }),
+      metadata: { viventium: { visibility: 'internal' } },
+    } as TMessage;
+
+    expect(filterTrustedInternalMessagesTree([literal, internal])).toEqual([literal]);
   });
 });

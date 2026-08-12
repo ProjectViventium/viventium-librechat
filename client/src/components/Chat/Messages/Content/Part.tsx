@@ -264,6 +264,8 @@ const Part = memo(
           error_class={cortexPart.error_class || cortexPart.errorClass}
           silent={cortexPart.silent}
           no_response={cortexPart.no_response}
+          fallback_used={cortexPart.fallback_used}
+          fallback_reason_class={cortexPart.fallback_reason_class}
           status_changed_at={cortexPart.status_changed_at}
           isLast={isLast}
         />

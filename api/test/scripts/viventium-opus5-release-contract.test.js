@@ -34,10 +34,10 @@ describe('Viventium Claude Opus 5 release contract', () => {
         preset: expect.objectContaining({ model: 'claude-opus-4-8' }),
       }),
     );
-    expect(source.endpoints.anthropic.titleModel).toBe('claude-sonnet-4-5');
-    expect(source.endpoints.anthropic.summaryModel).toBe('claude-sonnet-4-5');
+    expect(source.endpoints.anthropic.titleModel).toBe('claude-opus-5');
+    expect(source.endpoints.anthropic.summaryModel).toBe('claude-opus-5');
     expect(source.memory.agent).toEqual(
-      expect.objectContaining({ provider: 'anthropic', model: 'claude-sonnet-4-5' }),
+      expect.objectContaining({ provider: 'anthropic', model: 'claude-opus-5' }),
     );
   });
 
@@ -51,20 +51,20 @@ describe('Viventium Claude Opus 5 release contract', () => {
       expect(agent.fallback_llm_model_parameters.model).toBe('claude-opus-5');
     }
 
-    for (const handoffAgent of source.handoffAgents ?? []) {
-      expect(handoffAgent.provider).toBe('anthropic');
-      expect(handoffAgent.model).toBe('claude-opus-5');
-      expect(handoffAgent.model_parameters.model).toBe('claude-opus-5');
-    }
     const managedBaseline = buildManagedBaseline(source);
     for (const handoffAgent of source.handoffAgents ?? []) {
       expect(managedBaseline.agents[handoffAgent.id]?.fields).toMatchObject({
-        provider: 'anthropic',
-        model: 'claude-opus-5',
+        provider: handoffAgent.provider,
+        model: handoffAgent.model,
       });
+      expect(handoffAgent.model_parameters.model).toBe(handoffAgent.model);
     }
 
-    for (const cortex of source.mainAgent.background_cortices) {
+    const classifiedCortices = source.mainAgent.background_cortices.filter((cortex) =>
+      Array.isArray(cortex.activation?.fallbacks),
+    );
+    expect(classifiedCortices.length).toBeGreaterThan(0);
+    for (const cortex of classifiedCortices) {
       expect(cortex.activation.fallbacks).toContainEqual({
         provider: 'anthropic',
         model: 'claude-haiku-4-5',

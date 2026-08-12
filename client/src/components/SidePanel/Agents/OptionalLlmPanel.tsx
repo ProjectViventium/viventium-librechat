@@ -70,6 +70,10 @@ export default function OptionalLlmPanel({
     [modelsData, provider],
   );
   const providerCapability = providerCapabilities[provider];
+  const modelCapability = useMemo(
+    () => providerCapability?.models?.find((item) => item.id === selectedModel),
+    [providerCapability?.models, selectedModel],
+  );
 
   useEffect(() => {
     const currentModel = selectedModel ?? '';
@@ -237,6 +241,9 @@ export default function OptionalLlmPanel({
         provider={provider}
         model={selectedModel ?? ''}
         title={parametersTitle}
+        excludedParameterKeys={
+          (modelCapability?.effortChoices?.length ?? 0) > 0 ? ['reasoning_effort'] : []
+        }
       />
       {children}
       <button

@@ -727,6 +727,18 @@ class SchedulerEngine:
                 "updated_at": to_utc_iso(now),
             },
         )
+        self._storage.update_scheduled_prompt_run(
+            run_id,
+            {
+                "status": "dispatching",
+                "disposition": "running",
+                "execution_snapshot": {
+                    "dispatch_idempotency_key": occurrence_key,
+                    "executor": str(task.get("executor") or "viventium_agent"),
+                },
+                "updated_at": to_utc_iso(now),
+            },
+        )
 
         try:
             scheduled_task = dict(task)

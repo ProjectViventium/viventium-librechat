@@ -134,6 +134,8 @@ LC_FRONTEND_URL="http://localhost:${LC_FRONTEND_PORT}"
 # - `npm run backend:dev` and this wrapper are common local entrypoints.
 # - Meeting transcript recall is opt-in via generated App Support env, so direct starts
 #   must not silently drop VIVENTIUM_MEMORY_TRANSCRIPTS_* while the outer launcher has it.
+# - An explicitly selected runtime env is the complete runtime boundary: intentional
+#   empty values stay empty, and installed/component fallback env cannot cross into it.
 load_env_file_preserving_existing() {
     local env_file="$1"
     local label="$2"
@@ -146,7 +148,7 @@ load_env_file_preserving_existing() {
         if [[ "$line" =~ ^([a-zA-Z_][a-zA-Z0-9_]*)=(.*)$ ]]; then
             key="${BASH_REMATCH[1]}"
             value="${BASH_REMATCH[2]}"
-            if [[ -z "${!key:-}" ]]; then
+            if [[ -z "${!key+x}" ]]; then
                 value="${value%\"}"
                 value="${value#\"}"
                 value="${value%\'}"
@@ -177,7 +179,9 @@ done
 # === VIVENTIUM END ===
 
 # Load environment variables from .env file if it exists
-if [ -f ".env" ]; then
+if [[ -n "${VIVENTIUM_ENV_FILE:-}" ]]; then
+    echo -e "${YELLOW}Skipping component .env because an explicit Viventium runtime env is selected.${NC}"
+elif [ -f ".env" ]; then
     echo -e "${YELLOW}Loading environment variables from .env...${NC}"
     # Export variables from .env file, skipping readonly vars like UID/GID
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -193,7 +197,7 @@ if [ -f ".env" ]; then
             # === VIVENTIUM NOTE ===
             # Respect already-set env vars so wrapper scripts can override .env
             # (prevents port/env mismatches across LibreChat + Playground + Voice Gateway).
-            if [[ -z "${!key:-}" ]]; then
+            if [[ -z "${!key+x}" ]]; then
                 export "$key=$value"
             fi
             # === VIVENTIUM NOTE ===

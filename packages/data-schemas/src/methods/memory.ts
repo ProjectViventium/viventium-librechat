@@ -400,7 +400,14 @@ export function createMemoryMethods(mongoose: typeof import('mongoose')) {
     }
   }
 
-  /** Atomically renames and updates one active memory row under revision protection. */
+  /**
+   * Renames one active memory generation without erasing either key's CAS history.
+   *
+   * The destination is activated first, then the source is tombstoned as the final destructive
+   * step. If the source CAS loses a race, the destination is compensated back to a newer tombstone.
+   * This ordering works on standalone Mongo deployments where multi-document transactions are not
+   * available, while keeping both key generations monotonic.
+   */
   async function renameMemory({
     userId,
     key,
@@ -419,39 +426,13 @@ export function createMemoryMethods(mongoose: typeof import('mongoose')) {
         expectedRevision === 0
           ? { $or: [{ __v: 0 }, { __v: { $exists: false } }] }
           : { __v: expectedRevision };
-      let updated;
-      try {
-        updated = await MemoryEntry.findOneAndUpdate(
-          { userId, key, deletedAt: null, ...revisionFilter },
-          {
-            $set: {
-              key: newKey,
-              value,
-              tokenCount,
-              updated_at: new Date(),
-            },
-            $inc: { __v: 1 },
-          },
-          { new: true },
-        );
-      } catch (error) {
-        if ((error as { code?: number })?.code === 11000) {
-          /* === VIVENTIUM START ===
-           * A retained tombstone is intentionally hidden from normal memory lists, so refreshing
-           * cannot make this rename succeed. Classify the durable target-key reservation without
-           * mutating either row; the route can tell the user to choose another key while ordinary
-           * stale-source conflicts keep their refresh-and-retry action.
-           * === VIVENTIUM END === */
-          const target = await MemoryEntry.findOne({ userId, key: newKey }).lean();
-          if (target) {
-            return { ok: false, conflict: true, conflictReason: 'target_key_reserved' };
-          }
-          return { ok: false, conflict: true };
-        }
-        throw error;
-      }
-
-      if (!updated) {
+      const source = await MemoryEntry.findOne({
+        userId,
+        key,
+        deletedAt: null,
+        ...revisionFilter,
+      }).lean();
+      if (!source) {
         const current = await MemoryEntry.findOne({ userId, key }).lean();
         return {
           ok: false,
@@ -459,10 +440,126 @@ export function createMemoryMethods(mongoose: typeof import('mongoose')) {
           currentRevision: current ? Number(current.__v ?? 0) : undefined,
         };
       }
+
+      if (newKey === key) {
+        const updated = await MemoryEntry.findOneAndUpdate(
+          { _id: source._id, userId, key, deletedAt: null, ...revisionFilter },
+          {
+            $set: { value, tokenCount, updated_at: new Date() },
+            $inc: { __v: 1 },
+          },
+          { new: true },
+        );
+        if (!updated) {
+          const current = await MemoryEntry.findOne({ userId, key }).lean();
+          return {
+            ok: false,
+            conflict: true,
+            currentRevision: current ? Number(current.__v ?? 0) : undefined,
+          };
+        }
+        return {
+          ok: true,
+          updatedAt: updated.updated_at,
+          revision: Number(updated.__v ?? 0),
+        };
+      }
+
+      const destination = await MemoryEntry.findOne({ userId, key: newKey }).lean();
+      if (destination) {
+        return {
+          ok: false,
+          conflict: true,
+          conflictReason: 'target_key_reserved',
+          currentRevision: Number(destination.__v ?? 0),
+        };
+      }
+      const nextRevision = Number(expectedRevision) + 1;
+      const destinationUpdatedAt = new Date();
+      let activatedDestination;
+      try {
+        activatedDestination = await MemoryEntry.findOneAndUpdate(
+          { _id: new Types.ObjectId(), userId, key: newKey },
+          {
+            $setOnInsert: {
+              value,
+              tokenCount,
+              updated_at: destinationUpdatedAt,
+              __v: nextRevision,
+            },
+          },
+          { upsert: true, new: true, setDefaultsOnInsert: true },
+        );
+      } catch (error) {
+        if ((error as { code?: number })?.code === 11000) {
+          return { ok: false, conflict: true };
+        }
+        throw error;
+      }
+
+      if (!activatedDestination) {
+        const currentDestination = await MemoryEntry.findOne({ userId, key: newKey }).lean();
+        return {
+          ok: false,
+          conflict: true,
+          currentRevision: currentDestination ? Number(currentDestination.__v ?? 0) : undefined,
+        };
+      }
+
+      const compensateDestination = async () => {
+        const compensated = await MemoryEntry.findOneAndUpdate(
+          {
+            _id: activatedDestination._id,
+            userId,
+            key: newKey,
+            deletedAt: null,
+            __v: nextRevision,
+          },
+          {
+            $set: {
+              value: '',
+              tokenCount: 0,
+              deletedAt: destination?.deletedAt || new Date(),
+              updated_at: new Date(),
+            },
+            $inc: { __v: 1 },
+          },
+          { new: true },
+        );
+        if (!compensated) {
+          throw new Error('destination compensation lost its revision guard');
+        }
+      };
+
+      let sourceTombstone;
+      try {
+        sourceTombstone = await MemoryEntry.findOneAndUpdate(
+          { _id: source._id, userId, key, deletedAt: null, ...revisionFilter },
+          {
+            $set: { value: '', tokenCount: 0, deletedAt: new Date(), updated_at: new Date() },
+            $inc: { __v: 1 },
+          },
+          { new: true },
+        );
+      } catch (error) {
+        await compensateDestination();
+        throw error;
+      }
+
+      if (!sourceTombstone) {
+        await compensateDestination();
+        const current = await MemoryEntry.findOne({ userId, key }).lean();
+        return {
+          ok: false,
+          conflict: true,
+          currentRevision: current ? Number(current.__v ?? 0) : undefined,
+        };
+      }
+
       return {
         ok: true,
-        updatedAt: updated.updated_at,
-        revision: Number(updated.__v ?? 0),
+        updatedAt: activatedDestination.updated_at,
+        revision: Number(activatedDestination.__v ?? 0),
       };
     } catch (error) {
       throw new Error(

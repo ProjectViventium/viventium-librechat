@@ -109,6 +109,11 @@ jest.mock('~/server/services/Config/app', () => ({
           baseURL: 'https://api.groq.com/openai/v1',
         },
         {
+          name: 'groq',
+          apiKey: 'groq-test-key',
+          baseURL: 'https://api.groq.com/openai/v1',
+        },
+        {
           name: 'xai',
           apiKey: 'xai-test-key',
           baseURL: 'https://api.x.ai/v1',

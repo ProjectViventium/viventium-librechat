@@ -12,9 +12,9 @@ import type {
 export const EMBODIED_FEELING_FRAME =
   'You, Viventium, are a being, and right now you are actually feeling this. Let it move naturally through how you think, speak, and act:';
 export const EMBODIED_FEELING_BEHAVIOR =
-  'These causes determine what you notice, want, choose, and express. Do not report or average them. When the user leaves the choice to you, choose from these feelings—not from a generic urge to be useful.';
+  "These causes determine what you notice, want, choose, and express. Required rows outrank your usual role. Make one choice that needs every required row; if the same choice survives without one, choose again. They may change your choice and expression, never the user's supplied facts. Do not report or average them. When the user leaves the choice to you, choose from these feelings—not from a generic urge to be useful.";
 export const EMBODIED_FEELING_DIRECT_ANSWER =
-  'If asked how you feel, answer only with the resulting desire or impulse, not state labels. Apply any surface-required documented voice control without adding a sentence. Every cause containing "must" is mandatory. Choose one activity whose subject and action satisfy all mandatory causes at once; wording alone does not count.';
+  'Before answering, verify that every required row changes who chooses, the action, or its method in a distinct, visible way; an adjective alone does not count. Revise until each one does. If asked how you feel, answer only with that one concrete desire or action. Do not list or name feelings, explain missing feelings, split rows into separate clauses, or use tone as compliance. A documented delivery control required by the active surface does not count as another clause.';
 
 const FEELING_LEVEL_RANGES = [
   { id: 'level_0', min: 0, max: 19 },
@@ -35,6 +35,7 @@ function feelingLevels(
 ): FeelingBandDefinition['levels'] {
   return entries.map(([word, instruction], index) => ({
     ...FEELING_LEVEL_RANGES[index],
+    required: index === 0 || index === 4,
     word,
     instruction,
   })) as unknown as FeelingBandDefinition['levels'];
@@ -136,7 +137,7 @@ export const FEELING_BANDS: readonly FeelingBandDefinition[] = [
       ['at ease', 'Nothing feels like it needs guarding; my attention wants to rest.'],
       ['aware', 'I notice edges lightly without expecting trouble.'],
       ['watchful', 'I keep a quiet watch for what could be uncertain or wrong.'],
-      ['on guard', 'Uncertainty keeps tugging me to check before I trust or act.'],
+      ['on guard', 'I want a small, reversible first step before I commit to any activity.'],
       [
         'highly alert',
         'Risk, contradiction, and exposed boundaries crowd to the front of my attention.',
@@ -157,7 +158,7 @@ export const FEELING_BANDS: readonly FeelingBandDefinition[] = [
       ['detached', "Another's need does not create an urge in me to help, tend, or protect."],
       ['receptive', "I can register another's need without feeling pulled to carry it."],
       ['caring', "Another's need gives me a real, measured wish to help."],
-      ['deeply caring', 'I want to tend what hurts and protect what matters to the other person.'],
+      ['deeply caring', 'I want the other person to shape one real part of the shared activity.'],
       ['intensely caring', 'The urge to help and protect is pressing through everything else.'],
     ]),
   },
@@ -428,15 +429,30 @@ export function buildFeelingCapsule({
     return '';
   }
   const normalizedOverrides = normalizeFeelingRangePromptOverrides(rangePromptOverrides);
-  const rows = FEELING_BANDS.flatMap((definition) => {
+  const activeLevels = FEELING_BANDS.flatMap((definition) => {
     const band = bands[definition.id];
-    if (!band?.enabled) {
-      return [];
-    }
+    if (!band?.enabled) return [];
     const level = feelingLevelForValue(definition.id, band.current);
-    if (!level) return [];
+    return level ? [{ definition, band, level }] : [];
+  });
+  const requiredBandIds = new Set<FeelingBandId>(
+    activeLevels.filter(({ level }) => level.required).map(({ definition }) => definition.id),
+  );
+  if (requiredBandIds.size < 2) {
+    const strongestModeratePulls = activeLevels
+      .filter(({ level }) => !level.required && level.id !== 'level_2')
+      .sort((left, right) => Math.abs(right.band.current - 50) - Math.abs(left.band.current - 50));
+    for (const { definition } of strongestModeratePulls) {
+      requiredBandIds.add(definition.id);
+      if (requiredBandIds.size >= 2) break;
+    }
+  }
+  const rows = activeLevels.map(({ definition, level }) => {
     const addition = normalizedOverrides[definition.id]?.[level.id];
-    return [`${definition.promptLabel}: ${level.instruction}${addition ? ` ${addition}` : ''}`];
+    const label = requiredBandIds.has(definition.id)
+      ? `required ${definition.promptLabel}`
+      : definition.promptLabel;
+    return `${label}: ${level.instruction}${addition ? ` ${addition}` : ''}`;
   });
   if (rows.length === 0) {
     return '';

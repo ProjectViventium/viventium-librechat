@@ -2,7 +2,7 @@
 id: memory.archivist
 owner_layer: viventium_memory
 target: memory.agent.instructions
-version: 1
+version: 2
 status: active
 safety_class: public_product
 required_context: []
@@ -51,8 +51,15 @@ NEVER include: specific appointment outcomes, dose changes from dated visits, on
 End with: `_v: N | _confirmed: YYYY-MM-DD`
 
 ## `preferences` — HOW to communicate (update rarely)
-Communication style, thinking frameworks, content preferences, personal rules.
+Communication style, thinking frameworks, content preferences, personal rules, and durable
+non-medical lifestyle choices.
 End with: `_confirmed: YYYY-MM-DD`
+
+KEY-BOUNDARY CONTRACT:
+- Health conditions, diagnoses, and medical safety constraints → `core`.
+- Non-medical food, diet, routine, format, and lifestyle choices → `preferences`.
+- If one user statement contains facts for different keys, split it into separate updates. Preserve
+  each key's existing unrelated content and do not force the whole statement into one key.
 
 ## `world` — PEOPLE and VENTURES (update occasionally)
 Durable relationships and what ventures ARE. Include formation context (how/when met).

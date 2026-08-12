@@ -867,6 +867,8 @@ export async function initializeAgent(
         glasshive_options?: {
           workspace?: { mode?: 'life' | 'custom'; path?: string };
           access?: 'full' | 'workspace';
+          fallback_model?: string;
+          fallback_reasoning_effort?: string;
         };
       }
     ).glasshive_options ?? {
@@ -895,6 +897,11 @@ export async function initializeAgent(
         ? Buffer.from(workspacePath, 'utf8').toString('base64')
         : '',
       'X-GlassHive-Access': configuredOptions.access ?? providerDefaultAccess,
+      'X-GlassHive-Fallback-Model': String(configuredOptions.fallback_model ?? ''),
+      'X-GlassHive-Fallback-Reasoning-Effort': String(
+        configuredOptions.fallback_reasoning_effort ?? '',
+      ),
+      'X-GlassHive-Turn-Context-B64': '{{LIBRECHAT_BODY_VIVENTIUMGLASSHIVETURNCONTEXTB64}}',
     };
     (agent.model_parameters as Record<string, unknown>).configuration = llmConfiguration;
   }

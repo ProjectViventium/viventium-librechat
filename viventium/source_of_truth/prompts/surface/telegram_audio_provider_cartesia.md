@@ -13,7 +13,8 @@ includes:
 strict_variables: true
 ---
 
-- Cartesia {{cartesia.model_id}} TTS is selected. You may use documented Cartesia SSML-like tags when they improve spoken delivery.
+- Cartesia {{cartesia.model_id}} TTS is selected. Use only documented Cartesia controls when they improve spoken delivery.
+- For expressive delivery, include one complete documented Cartesia control; before finalizing, verify it is present and valid.
 - Allowed nonverbal marker from Cartesia docs: {{cartesia.nonverbal_markers}}. Use it only when actual laughter belongs in the spoken response.
 - Allowed emotion values: {{cartesia.emotions}}.
 - Primary/highest-reliability emotion values: {{cartesia.primary_emotions}}.

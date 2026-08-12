@@ -220,7 +220,7 @@ describe('createMemoryTool', () => {
       expect(mockSetMemory).not.toHaveBeenCalled();
     });
 
-    it('compacts world writes before returning a per-key budget error', async () => {
+    it('uses structural world compaction without deleting model-selected facts by phrase', async () => {
       const tool = createMemoryTool({
         userId: 'test-user',
         setMemory: mockSetMemory,
@@ -248,8 +248,8 @@ describe('createMemoryTool', () => {
       );
       const savedValue = mockSetMemory.mock.calls[0][0].value;
       expect(savedValue).toContain('Met May 25 2022');
-      expect(savedValue).not.toContain('birthday gift');
-      expect(savedValue).not.toContain('pending DNS');
+      expect(savedValue).toContain('birthday gift');
+      expect(savedValue).toContain('pending DNS');
       expect(savedValue).not.toContain('@');
     });
   });

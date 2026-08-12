@@ -6,6 +6,41 @@ const { updateMCPServerTools } = require('~/server/services/Config');
 const { getMCPManager, getFlowStateManager, getMCPServersRegistry } = require('~/config');
 const { getLogStores } = require('~/cache');
 
+function oauthAuthorizationUnavailableResult(serverName) {
+  return {
+    availableTools: null,
+    success: false,
+    failureClass: 'oauth_authorization_unavailable',
+    message: `MCP server '${serverName}' requires interactive authorization`,
+    oauthRequired: true,
+    serverName,
+    oauthUrl: null,
+    tools: null,
+  };
+}
+
+async function hasUsableOAuthTokens(userId, serverName) {
+  const now = new Date();
+  const accessToken = await findToken({
+    userId,
+    type: 'mcp_oauth',
+    identifier: `mcp:${serverName}`,
+  });
+  const refreshToken = await findToken({
+    userId,
+    type: 'mcp_oauth_refresh',
+    identifier: `mcp:${serverName}:refresh`,
+  });
+
+  if (accessToken?.expiresAt && accessToken.expiresAt >= now) {
+    return true;
+  }
+  if (refreshToken == null) {
+    return false;
+  }
+  return refreshToken.expiresAt == null || refreshToken.expiresAt >= now;
+}
+
 /* === VIVENTIUM START ===
  * Feature: Credential-aware MCP readiness.
  * Purpose: Distinguish missing, unreadable, and present OAuth state without exposing tokens.

@@ -643,7 +643,12 @@ const createMeiliMongooseModel = ({
     postSaveHook(this: DocumentWithMeiliIndex, next: CallbackWithoutResultAndOptionalError): void {
       if (isViventiumMeiliOptOut(this)) {
         if (!this._meiliIndex) return next();
-        return this.deleteObjectFromMeili!(async (error?: Error) => {
+        /* === VIVENTIUM START ===
+         * Feature: Deterministic Meili opt-out persistence.
+         * Purpose: This is callback-style middleware. Exposing the deletion promise lets Mongoose
+         * settle save() before the async Mongo flag update invokes `next()`.
+         * === VIVENTIUM END === */
+        void this.deleteObjectFromMeili!(async (error?: Error) => {
           if (error) return next(error);
           await this.collection.updateMany(
             { _id: this._id as Types.ObjectId },
@@ -651,6 +656,7 @@ const createMeiliMongooseModel = ({
           );
           next();
         });
+        return;
       }
       if (this._meiliIndex) {
         this.updateObjectToMeili!(next);
@@ -671,7 +677,7 @@ const createMeiliMongooseModel = ({
     ): void {
       if (isViventiumMeiliOptOut(this)) {
         if (!this._meiliIndex) return next();
-        return this.deleteObjectFromMeili!(async (error?: Error) => {
+        void this.deleteObjectFromMeili!(async (error?: Error) => {
           if (error) return next(error);
           await this.collection.updateMany(
             { _id: this._id as Types.ObjectId },
@@ -679,6 +685,7 @@ const createMeiliMongooseModel = ({
           );
           next();
         });
+        return;
       }
       if (this._meiliIndex) {
         this.updateObjectToMeili!(next);

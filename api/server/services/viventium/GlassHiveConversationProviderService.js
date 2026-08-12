@@ -515,7 +515,19 @@ function installConversationProviderCapabilityRefresher({
   if (!targetAgent || resolvedCapability?.workspace_binding !== true) {
     return false;
   }
-  const refresh = async () => {
+  /* === VIVENTIUM START ===
+   * Feature: Finalized gateway turn scope for invocation-fresh provider grants.
+   * Purpose: Telegram, voice, scheduler, and other trusted gateways can initialize an Agent before
+   * the controller allocates the durable conversation/response ids. Prefer the finalized per-run
+   * body supplied at the model-attempt boundary so the broker grant is exact and fail-closed.
+   * === VIVENTIUM END === */
+  const refresh = async (finalizedRequestBody) => {
+    const effectiveRequestBody =
+      finalizedRequestBody &&
+      typeof finalizedRequestBody === 'object' &&
+      !Array.isArray(finalizedRequestBody)
+        ? finalizedRequestBody
+        : requestBody;
     const previousInstructionAppend = String(
       targetAgent?.[CONVERSATION_PROVIDER_INSTRUCTION_APPEND] || '',
     ).trim();
@@ -525,7 +537,7 @@ function installConversationProviderCapabilityRefresher({
       capabilitySourceAgent,
       req,
       capability: resolvedCapability,
-      requestBody,
+      requestBody: effectiveRequestBody,
     });
     if (!attached) {
       // Never leave a previously valid but now expired bundle on the next provider attempt.
@@ -656,7 +668,18 @@ async function attachConversationProviderCapabilityBundle({
   if (!targetAgent || capability?.workspace_binding !== true) {
     return false;
   }
-  const allowedServerNames = declaredMcpServerNames(declaredAgent, capability.excluded_mcp_servers);
+  /* === VIVENTIUM START ===
+   * Feature: Participant-owned capability parity across provider fallback routes.
+   * Purpose: The fallback route declares provider identity, while the owning participant declares
+   * its authorized tools. Project MCP servers from that explicit capability source so a tool-less
+   * fallback model cannot silently lose the participant's connected-account access.
+   * === VIVENTIUM END === */
+  const mcpCapabilitySource =
+    capabilitySourceAgent === targetAgent ? declaredAgent : capabilitySourceAgent;
+  const allowedServerNames = declaredMcpServerNames(
+    mcpCapabilitySource,
+    capability.excluded_mcp_servers,
+  );
   const hostToolCapabilityState = await resolveHostToolCapabilityState({
     targetAgent: capabilitySourceAgent,
     capability,

@@ -110,6 +110,7 @@ const { logFeelingsEvent } = require('~/server/services/viventium/feelingsTeleme
 const {
   attachConversationProviderCapabilityBundle,
   buildHarnessIdempotencyKey,
+  installConversationProviderCapabilityRefresher,
 } = require('~/server/services/viventium/GlassHiveConversationProviderService');
 
 const NO_PARENT_MESSAGE_ID = '00000000-0000-0000-0000-000000000000';
@@ -3344,6 +3345,26 @@ function buildCortexRequestBody({
   };
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Invocation-fresh background-cortex capability authority.
+ * Purpose: Background execution may begin after the provider's replay window. Attach the exact
+ * cortex turn now and install the same pre-attempt refresh used by foreground graph participants.
+ * === VIVENTIUM END === */
+async function prepareCortexConversationProviderCapability({
+  targetAgent,
+  declaredAgent,
+  req,
+  capability,
+  requestBody,
+  attachBundle = attachConversationProviderCapabilityBundle,
+  installRefresher = installConversationProviderCapabilityRefresher,
+}) {
+  const args = { targetAgent, declaredAgent, req, capability, requestBody };
+  const attached = await attachBundle(args);
+  installRefresher(args);
+  return attached;
+}
+
 /**
  * Execute a single cortex agent and collect its response
  * @param {object} params
@@ -3881,7 +3902,7 @@ async function executeCortexOnce({
       conversationId,
       idempotencyKey: cortexIdempotencyKey,
     });
-    await attachConversationProviderCapabilityBundle({
+    await prepareCortexConversationProviderCapability({
       targetAgent: initializedAgent,
       declaredAgent: agentForRun,
       req: safeReq,
@@ -5439,4 +5460,5 @@ module.exports = {
   createBackgroundRes,
   memoryReadUnavailableContext,
   buildCortexRequestBody,
+  prepareCortexConversationProviderCapability,
 };

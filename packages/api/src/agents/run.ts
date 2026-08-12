@@ -186,7 +186,7 @@ type RunAgent = Omit<Agent, 'tools'> & {
   viventiumGraphLlmFallbacks?: RunAgentModelRoute[];
   /** Runtime-only exact authority block regenerated before a workspace-bound provider attempt. */
   viventiumConversationProviderInstructionAppend?: string;
-  viventiumConversationProviderCapabilityRefresh?: () => Promise<{
+  viventiumConversationProviderCapabilityRefresh?: (requestBody?: t.RequestBody) => Promise<{
     attached: boolean;
     defaultHeaders: Record<string, string>;
     previousInstructionAppend?: string;
@@ -199,7 +199,7 @@ type RunAgentModelRoute = Pick<
   'id' | 'endpoint' | 'provider' | 'model_parameters' | 'declaredProviderTransport'
 > & {
   viventiumConversationProviderInstructionAppend?: string;
-  viventiumConversationProviderCapabilityRefresh?: () => Promise<{
+  viventiumConversationProviderCapabilityRefresh?: (requestBody?: t.RequestBody) => Promise<{
     attached: boolean;
     defaultHeaders: Record<string, string>;
     previousInstructionAppend?: string;
@@ -370,11 +370,17 @@ function installProjectedCapabilityRefresh({
   const configuration = (clientOptions.configuration ??= {});
   const liveHeaders = (configuration.defaultHeaders ??= {}) as Record<string, string>;
   const refresh = async () => {
-    const result = await sourceRefresh();
+    /* === VIVENTIUM START ===
+     * Feature: Finalized gateway turn scope for invocation-fresh provider grants.
+     * Purpose: Rebuild signed capability authority from the exact per-agent run body created after
+     * persistence ids exist, rather than an initialization-time body that may still be unscoped.
+     * === VIVENTIUM END === */
+    const scopedRequestBody = requestBodyForAgent(requestBody, agentId);
+    const result = await sourceRefresh(scopedRequestBody);
     const resolvedHeaders = resolveHeaders({
       headers: result.defaultHeaders ?? {},
       user: createSafeUser(user),
-      body: requestBodyForAgent(requestBody, agentId),
+      body: scopedRequestBody,
     });
     for (const headerName of Object.keys(liveHeaders)) {
       delete liveHeaders[headerName];

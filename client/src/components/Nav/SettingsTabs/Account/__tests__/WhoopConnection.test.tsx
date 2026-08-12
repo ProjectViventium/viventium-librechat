@@ -24,6 +24,7 @@ const setupStatus = {
   state: 'setup_required',
   clientConfigured: false,
   authorized: false,
+  authorizationRecoveryRequired: false,
   requestedScopes: [],
   grantedScopes: [],
   coverage: { api: {}, export: {} },
@@ -178,6 +179,52 @@ describe('WHOOP connection card', () => {
     expect(await screen.findByText('com_ui_whoop_error_history_import_failed')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'com_ui_whoop_import_export' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'com_ui_whoop_connect' })).not.toBeInTheDocument();
+  });
+
+  test.each(['authorization_failed', 'authorization_refresh_failed'])(
+    'offers a fresh one-click authorization for provider recovery state %s',
+    async (recoveryStatus) => {
+      mockGet.mockResolvedValue({
+        ...connectedStatus,
+        state: 'degraded',
+        authorizationRecoveryRequired: true,
+        onboarding: null,
+        coverage: {
+          ...connectedStatus.coverage,
+          api: Object.fromEntries(
+            Object.keys(connectedStatus.coverage.api).map((resource) => [
+              resource,
+              { status: recoveryStatus, items: 0 },
+            ]),
+          ),
+        },
+        latestApiRun: {
+          status: 'failed',
+          finishedAt: '2026-08-11T10:00:00Z',
+          itemCount: 0,
+        },
+      } as never);
+
+      render(<WhoopConnection />);
+
+      expect(
+        await screen.findByText('com_ui_whoop_error_authorization_failed'),
+      ).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'com_ui_whoop_connect' })).toBeInTheDocument();
+    },
+  );
+
+  test('keeps one-click reconnect available when a migrated grant has no API run yet', async () => {
+    mockGet.mockResolvedValue({
+      ...connectedStatus,
+      state: 'connected_no_data',
+      latestApiRun: null,
+    } as never);
+
+    render(<WhoopConnection />);
+
+    expect(await screen.findByText('com_ui_whoop_connected_import_pending')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'com_ui_whoop_connect' })).toBeInTheDocument();
   });
 
   test('uploads exact screenshot evidence without exposing its file name', async () => {

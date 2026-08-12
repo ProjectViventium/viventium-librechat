@@ -34,6 +34,7 @@ const {
   normalizePhaseANoticeMode,
   resolvePhaseANoticeModeForRequest,
   isBackgroundCortexCancellationSignal,
+  prepareCortexConversationProviderCapability,
 } = require('../BackgroundCortexService');
 const fs = require('fs');
 const path = require('path');
@@ -44,6 +45,39 @@ describe('BackgroundCortexService activation policy helpers', () => {
   afterEach(() => {
     clearActivationProviderHealth();
     delete process.env.VIVENTIUM_CORTEX_PHASE_A_NOTICE_MODE;
+  });
+
+  test('installs invocation-fresh capability refresh after the scoped cortex bundle', async () => {
+    const attachBundle = jest.fn().mockResolvedValue(true);
+    const installRefresher = jest.fn().mockReturnValue(true);
+    const args = {
+      targetAgent: { id: 'cortex-runtime' },
+      declaredAgent: { id: 'cortex-declared' },
+      req: { user: { id: 'user-synthetic' } },
+      capability: { workspace_binding: true },
+      requestBody: { conversationId: 'conversation-synthetic', messageId: 'message-synthetic' },
+    };
+
+    await expect(
+      prepareCortexConversationProviderCapability({
+        ...args,
+        attachBundle,
+        installRefresher,
+      }),
+    ).resolves.toBe(true);
+    expect(attachBundle).toHaveBeenCalledWith(args);
+    expect(installRefresher).toHaveBeenCalledWith(args);
+  });
+
+  test('keeps detached Phase B alive after Main cleanup but honors intentional Stop', () => {
+    expect(
+      isBackgroundCortexCancellationSignal({ aborted: true, reason: 'generation_completed' }),
+    ).toBe(false);
+    expect(isBackgroundCortexCancellationSignal({ aborted: true, reason: 'user_cancelled' })).toBe(
+      true,
+    );
+    expect(isBackgroundCortexCancellationSignal({ aborted: false })).toBe(false);
+    expect(isBackgroundCortexCancellationSignal(null)).toBe(false);
   });
 
   test('keeps specialist background cortices independent from the pinned embodiment capsule', () => {

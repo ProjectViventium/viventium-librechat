@@ -169,6 +169,7 @@ describe('WHOOP health command boundary', () => {
       state: 'setup_required',
       client_configured: false,
       authorized: false,
+      authorization_recovery_required: true,
       requested_scopes: [],
       granted_scopes: [],
       coverage: { api: {}, export: {} },
@@ -187,6 +188,7 @@ describe('WHOOP health command boundary', () => {
     const result = await getWhoopStatus(runner);
 
     expect(result.state).toBe('setup_required');
+    expect(result.authorizationRecoveryRequired).toBe(true);
     expect(result.manualEvidence).toEqual({ itemCount: 2, latestAt: '2026-08-10T12:00:00Z' });
     expect(JSON.stringify(result)).not.toContain('injected_private_field');
     expect(JSON.stringify(result)).not.toContain('/private/path');

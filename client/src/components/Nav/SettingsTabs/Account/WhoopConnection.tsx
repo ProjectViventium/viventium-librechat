@@ -29,6 +29,7 @@ type WhoopStatus = {
     | 'degraded';
   clientConfigured: boolean;
   authorized: boolean;
+  authorizationRecoveryRequired: boolean;
   coverage: {
     api: Record<string, CoverageRow>;
     export: Record<string, { status?: string | null }>;
@@ -135,8 +136,10 @@ function WhoopConnection() {
     }
   }, [shouldPoll, status?.state]);
 
+  const authorizationDegraded = status?.authorizationRecoveryRequired === true;
+
   const issueMessageKey = useMemo(() => {
-    const code = status?.onboarding?.errorCode;
+    const code = authorizationDegraded ? 'authorization_failed' : status?.onboarding?.errorCode;
     const known: Record<string, string> = {
       authorization_failed: 'com_ui_whoop_error_authorization_failed',
       history_import_failed: 'com_ui_whoop_error_history_import_failed',
@@ -146,7 +149,7 @@ function WhoopConnection() {
       provider_unavailable: 'com_ui_whoop_error_provider_unavailable',
     };
     return (code && known[code]) || 'com_ui_whoop_error_general';
-  }, [status?.onboarding?.errorCode]);
+  }, [authorizationDegraded, status?.onboarding?.errorCode]);
 
   const stateLabel = useMemo(() => {
     switch (status?.state) {
@@ -335,8 +338,10 @@ function WhoopConnection() {
   const itemCount = status?.latestApiRun?.itemCount;
   const canStartAuthorization =
     status?.clientConfigured === true &&
-    status.authorized === false &&
-    (status.state === 'ready_to_authorize' || status.state === 'degraded');
+    (authorizationDegraded ||
+      (status.authorized === true && status.state === 'connected_no_data') ||
+      (status.authorized === false &&
+        (status.state === 'ready_to_authorize' || status.state === 'degraded')));
 
   return (
     <section

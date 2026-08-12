@@ -248,6 +248,8 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
       user: { id: 'user-1', role: 'USER' },
       grantId: 'ghcb_sched_revoked_route',
       allowedServers: ['google_workspace'],
+      requestContext: { schedule_id: 'schedule-1', run_id: 'scheduled-run-1' },
+      requireTurnScope: false,
       ttlSeconds: 60,
       renewableTtlSeconds: 600,
       nowMs: Date.now() - 120_000,

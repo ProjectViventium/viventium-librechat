@@ -394,6 +394,7 @@ export async function getWhoopStatus(runner: HealthCommandRunner = defaultRunner
     state,
     clientConfigured: payload.client_configured === true,
     authorized: payload.authorized === true,
+    authorizationRecoveryRequired: payload.authorization_recovery_required === true,
     requestedScopes: Array.isArray(payload.requested_scopes)
       ? payload.requested_scopes.filter(
           (scope): scope is string => typeof scope === 'string' && scope.length <= 64,

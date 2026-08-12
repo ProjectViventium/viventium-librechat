@@ -944,11 +944,13 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
             await attachDeclaredConversationProviderCapabilityBundle({
               targetAgent: fallbackConfig,
               declaredAgent: fallbackAgent,
+              capabilitySourceAgent: primaryConfig,
               req,
             });
             installConversationProviderCapabilityRefresher({
               targetAgent: fallbackConfig,
               declaredAgent: fallbackAgent,
+              capabilitySourceAgent: primaryConfig,
               req,
             });
             attachHarnessCancellationConfig(fallbackConfig, 'agentLlmFallback');

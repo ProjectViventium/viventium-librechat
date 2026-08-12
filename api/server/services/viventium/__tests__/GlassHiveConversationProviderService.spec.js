@@ -981,6 +981,71 @@ describe('GlassHiveConversationProviderService', () => {
     }
   });
 
+  test('refreshes a gateway first turn from the finalized run scope instead of the pre-persistence body', async () => {
+    buildConversationProviderBootstrapBundle.mockResolvedValue({
+      glasshive_capability_broker: { grant_token: 'synthetic-scoped-grant' },
+      conversation_provider_instructions: 'Use the authorized host capability.',
+    });
+    const targetAgent = {
+      model_parameters: { configuration: { defaultHeaders: {} } },
+    };
+    const prePersistenceBody = {
+      conversationId: 'new',
+      parentMessageId: '00000000-0000-0000-0000-000000000000',
+    };
+    const finalizedRunBody = {
+      conversationId: 'conversation-telegram-synthetic',
+      messageId: 'assistant-message-telegram-synthetic',
+      parentMessageId: '00000000-0000-0000-0000-000000000000',
+      viventiumSurface: 'telegram',
+    };
+    const args = {
+      targetAgent,
+      declaredAgent: {
+        tools: [`health_read${Constants.mcp_delimiter}synthetic-private-health`],
+      },
+      req: { user: { id: 'user-synthetic', role: 'ADMIN' }, body: prePersistenceBody },
+      capability: { workspace_binding: true },
+    };
+
+    expect(installConversationProviderCapabilityRefresher(args)).toBe(true);
+    await targetAgent.viventiumConversationProviderCapabilityRefresh(finalizedRunBody);
+
+    expect(buildConversationProviderBootstrapBundle.mock.calls[0][0].requestBody).toEqual(
+      finalizedRunBody,
+    );
+  });
+
+  test('projects fallback MCP authority from the owning participant instead of the tool-less route', async () => {
+    buildConversationProviderBootstrapBundle.mockResolvedValue({
+      glasshive_capability_broker: { grant_token: 'synthetic-fallback-grant' },
+      conversation_provider_instructions: 'Use the authorized participant capability.',
+    });
+    const targetAgent = {
+      model_parameters: { configuration: { defaultHeaders: {} } },
+    };
+
+    await expect(
+      attachConversationProviderCapabilityBundle({
+        targetAgent,
+        declaredAgent: { id: 'synthetic-fallback-route', tools: [] },
+        capabilitySourceAgent: {
+          id: 'synthetic-owning-participant',
+          tools: [`health_read${Constants.mcp_delimiter}viventium-health`],
+        },
+        req: {
+          user: { id: 'user-synthetic' },
+          body: { conversationId: 'conversation-synthetic', messageId: 'message-synthetic' },
+        },
+        capability: { workspace_binding: true },
+      }),
+    ).resolves.toBe(true);
+
+    expect(buildConversationProviderBootstrapBundle).toHaveBeenCalledWith(
+      expect.objectContaining({ allowedServerNames: ['viventium-health'] }),
+    );
+  });
+
   test('keeps one exact first-message scope across primary, fallback, and delayed re-entry bundles', async () => {
     const originalEnabled = process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_ENABLED;
     const originalTtl = process.env.VIVENTIUM_GLASSHIVE_PROVIDER_BROKER_TTL_SECONDS;

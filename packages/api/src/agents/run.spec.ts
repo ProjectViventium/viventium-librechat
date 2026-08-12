@@ -12,112 +12,110 @@ import {
 
 installUnifiedSchemaToolBindingPatch();
 
-+(
-  /* === VIVENTIUM START ===
-   * Regression: capability-declared Chat Completions must beat SDK model-name heuristics.
-   * === VIVENTIUM END === */
-  describe('applyDeclaredProviderTransport', () => {
-    it('keeps the exact wire model while preventing SDK model-name heuristics from forcing Responses', () => {
-      const wireModel = 'codex-cli:gpt-5.6-sol';
-      const clientOptions = applyDeclaredProviderTransport(
+/* === VIVENTIUM START ===
+ * Regression: capability-declared Chat Completions must beat SDK model-name heuristics.
+ * === VIVENTIUM END === */
+describe('applyDeclaredProviderTransport', () => {
+  it('keeps the exact wire model while preventing SDK model-name heuristics from forcing Responses', () => {
+    const wireModel = 'codex-cli:gpt-5.6-sol';
+    const clientOptions = applyDeclaredProviderTransport(
+      {
+        model: wireModel,
+        apiKey: 'synthetic-test-key',
+        configuration: { baseURL: 'http://127.0.0.1:8766/v1' },
+      },
+      { mode: 'chat_completions', reasoningEffort: 'medium' },
+      Providers.OPENAI,
+    );
+    const ChatModel = getChatModelClass(Providers.OPENAI);
+    const model = new ChatModel(clientOptions as never) as unknown as {
+      _useResponsesApi: (options?: unknown) => boolean;
+      invocationParams: (options?: unknown) => { model?: string; reasoning_effort?: string };
+    };
+
+    expect(model._useResponsesApi()).toBe(false);
+    expect(model.invocationParams().model).toBe(wireModel);
+    expect(model.invocationParams().reasoning_effort).toBe('medium');
+  });
+
+  it('preserves the SDK Responses default when no provider transport is declared', () => {
+    const wireModel = 'codex-cli:gpt-5.6-sol';
+    const ChatModel = getChatModelClass(Providers.OPENAI);
+    const model = new ChatModel(
+      applyDeclaredProviderTransport(
         {
           model: wireModel,
           apiKey: 'synthetic-test-key',
-          configuration: { baseURL: 'http://127.0.0.1:8766/v1' },
         },
-        { mode: 'chat_completions', reasoningEffort: 'medium' },
+        undefined,
         Providers.OPENAI,
-      );
-      const ChatModel = getChatModelClass(Providers.OPENAI);
-      const model = new ChatModel(clientOptions as never) as unknown as {
-        _useResponsesApi: (options?: unknown) => boolean;
-        invocationParams: (options?: unknown) => { model?: string; reasoning_effort?: string };
-      };
+      ) as never,
+    ) as unknown as {
+      _useResponsesApi: (options?: unknown) => boolean;
+      invocationParams: (options?: unknown) => { model?: string };
+    };
 
-      expect(model._useResponsesApi()).toBe(false);
-      expect(model.invocationParams().model).toBe(wireModel);
-      expect(model.invocationParams().reasoning_effort).toBe('medium');
-    });
+    expect(model._useResponsesApi()).toBe(true);
+    expect(model.invocationParams().model).toBe(wireModel);
+  });
 
-    it('preserves the SDK Responses default when no provider transport is declared', () => {
-      const wireModel = 'codex-cli:gpt-5.6-sol';
-      const ChatModel = getChatModelClass(Providers.OPENAI);
-      const model = new ChatModel(
-        applyDeclaredProviderTransport(
+  it('fails loudly when a non-OpenAI provider declares the Chat Completions transport', () => {
+    expect(() =>
+      applyDeclaredProviderTransport(
+        { model: 'claude-code:opus' },
+        { mode: 'chat_completions' },
+        Providers.ANTHROPIC,
+      ),
+    ).toThrow('requires an OpenAI-compatible provider');
+  });
+
+  it('consumes the initialized-agent transport contract at Run creation', async () => {
+    const createSpy = jest.spyOn(Run, 'create').mockResolvedValue({ run: 'synthetic' } as never);
+    try {
+      await createRun({
+        agents: [
           {
-            model: wireModel,
-            apiKey: 'synthetic-test-key',
-          },
-          undefined,
-          Providers.OPENAI,
-        ) as never,
-      ) as unknown as {
-        _useResponsesApi: (options?: unknown) => boolean;
-        invocationParams: (options?: unknown) => { model?: string };
-      };
-
-      expect(model._useResponsesApi()).toBe(true);
-      expect(model.invocationParams().model).toBe(wireModel);
-    });
-
-    it('fails loudly when a non-OpenAI provider declares the Chat Completions transport', () => {
-      expect(() =>
-        applyDeclaredProviderTransport(
-          { model: 'claude-code:opus' },
-          { mode: 'chat_completions' },
-          Providers.ANTHROPIC,
-        ),
-      ).toThrow('requires an OpenAI-compatible provider');
-    });
-
-    it('consumes the initialized-agent transport contract at Run creation', async () => {
-      const createSpy = jest.spyOn(Run, 'create').mockResolvedValue({ run: 'synthetic' } as never);
-      try {
-        await createRun({
-          agents: [
-            {
-              id: 'agent-transport-linkage',
-              provider: Providers.OPENAI,
-              endpoint: 'glasshive-harness',
-              model: 'codex-cli:gpt-5.6-sol',
-              model_parameters: { model: 'codex-cli:gpt-5.6-sol' },
-              tools: [],
-              maxContextTokens: 200000,
-              useLegacyContent: false,
-              declaredProviderTransport: {
-                mode: 'chat_completions',
-                reasoningEffort: 'medium',
-              },
+            id: 'agent-transport-linkage',
+            provider: Providers.OPENAI,
+            endpoint: 'glasshive-harness',
+            model: 'codex-cli:gpt-5.6-sol',
+            model_parameters: { model: 'codex-cli:gpt-5.6-sol' },
+            tools: [],
+            maxContextTokens: 200000,
+            useLegacyContent: false,
+            declaredProviderTransport: {
+              mode: 'chat_completions',
+              reasoningEffort: 'medium',
             },
-          ],
-          signal: new AbortController().signal,
-        } as never);
+          },
+        ],
+        signal: new AbortController().signal,
+      } as never);
 
-        expect(createSpy).toHaveBeenCalledWith(
-          expect.objectContaining({
-            graphConfig: expect.objectContaining({
-              agents: [
-                expect.objectContaining({
-                  clientOptions: expect.objectContaining({
-                    provider: Providers.OPENAI,
-                    model: 'viventium-chat-completions',
-                    useResponsesApi: false,
-                    modelKwargs: expect.objectContaining({
-                      model: 'codex-cli:gpt-5.6-sol',
-                      reasoning_effort: 'medium',
-                    }),
+      expect(createSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          graphConfig: expect.objectContaining({
+            agents: [
+              expect.objectContaining({
+                clientOptions: expect.objectContaining({
+                  provider: Providers.OPENAI,
+                  model: 'viventium-chat-completions',
+                  useResponsesApi: false,
+                  modelKwargs: expect.objectContaining({
+                    model: 'codex-cli:gpt-5.6-sol',
+                    reasoning_effort: 'medium',
                   }),
                 }),
-              ],
-            }),
+              }),
+            ],
           }),
-        );
-      } finally {
-        createSpy.mockRestore();
-      }
-    });
-  })
-);
+        }),
+      );
+    } finally {
+      createSpy.mockRestore();
+    }
+  });
+});
 
 describe('requestBodyForAgent', () => {
   it('selects a stable agent-scoped GlassHive key while preserving the primary key', () => {
@@ -228,6 +226,11 @@ describe('projectGraphLlmFallbacks', () => {
       },
     });
     expect(capabilityRefresh).toHaveBeenCalledTimes(1);
+    expect(capabilityRefresh).toHaveBeenCalledWith(
+      expect.objectContaining({
+        viventiumGlassHiveIdempotencyKey: 'main:red:response-1',
+      }),
+    );
     expect(JSON.stringify(projected[0])).not.toContain('CapabilityRefresh');
   });
 

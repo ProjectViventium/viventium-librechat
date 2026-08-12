@@ -456,6 +456,8 @@ async function buildDirectGlassHiveCapabilityBundle({ user, workerId, runId, exe
   try {
     mintedGrant = mintBrokerGrant({
       user,
+      // Direct operator runs are bound to a signed worker/run identity rather than a chat turn.
+      requireTurnScope: false,
       grantId,
       allowedServers,
       eagerServers: allowedServers,
@@ -706,6 +708,8 @@ async function buildScheduledGlassHiveCapabilityBundle({
   try {
     mintedGrant = mintBrokerGrant({
       user,
+      // Scheduled runs are bound to the signed schedule/run identity and have no chat message.
+      requireTurnScope: false,
       grantId,
       allowedServers,
       eagerServers: allowedServers,

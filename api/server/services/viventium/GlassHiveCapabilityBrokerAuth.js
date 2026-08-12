@@ -194,6 +194,7 @@ function mintBrokerGrant({
   allowDynamicPolicyServers = false,
   grantId,
   nowMs = Date.now(),
+  requireTurnScope = true,
 } = {}) {
   const secret = getBrokerSecret();
   if (!secret) {
@@ -202,6 +203,21 @@ function mintBrokerGrant({
   const userId = String(user?.id || user?._id || requestContext.user_id || '').trim();
   if (!userId) {
     throw new Error('GlassHive capability broker grant requires a user id');
+  }
+  /* === VIVENTIUM START ===
+   * Security: Make mint-time authority match the production broker's verify-time boundary.
+   * Purpose: Never create or persist a bearer grant that the only production consumer is
+   * guaranteed to reject. Conversation grants stay bound to one exact message and
+   * conversation/turn; direct and scheduled runtimes must explicitly opt into their separate
+   * signed worker/run or schedule/run boundary.
+   * === VIVENTIUM END === */
+  const messageId = String(requestContext.message_id || requestContext.messageId || '').trim();
+  const conversationId = String(
+    requestContext.conversation_id || requestContext.conversationId || '',
+  ).trim();
+  const turnId = String(requestContext.turn_id || requestContext.turnId || '').trim();
+  if (requireTurnScope && (!messageId || (!conversationId && !turnId))) {
+    throw new Error('GlassHive capability broker grant is missing turn scope');
   }
   const iat = Math.floor(nowMs / 1000);
   const requestedTtl = Number(ttlSeconds);
@@ -253,12 +269,12 @@ function mintBrokerGrant({
     tenant_id: resolveBrokerTenantId(),
     user_id: userId,
     user_role: String(user?.role || requestContext.user_role || ''),
-    conversation_id: String(requestContext.conversation_id || requestContext.conversationId || ''),
+    conversation_id: conversationId,
     parent_message_id: String(
       requestContext.parent_message_id || requestContext.parentMessageId || '',
     ),
-    message_id: String(requestContext.message_id || requestContext.messageId || ''),
-    turn_id: String(requestContext.turn_id || requestContext.turnId || ''),
+    message_id: messageId,
+    turn_id: turnId,
     worker_id: String(requestContext.worker_id || requestContext.workerId || ''),
     run_id: String(requestContext.run_id || requestContext.runId || ''),
     schedule_id: String(requestContext.schedule_id || requestContext.scheduleId || ''),

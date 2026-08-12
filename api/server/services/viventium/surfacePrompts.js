@@ -60,6 +60,8 @@ const TTS_PROVIDER_CAPABILITIES = require('../../../../shared/voice/tts_provider
 const TTS_PROVIDER_CONTRACTS = TTS_PROVIDER_CAPABILITIES.providers;
 const CHATTERBOX_INLINE_CONTROLS =
   TTS_PROVIDER_CONTRACTS.local_chatterbox_turbo_mlx_8bit.inline_controls.exact_tokens;
+const CHATTERBOX_EXPRESSION_GUIDANCE =
+  '- A reply sharing relief is expressive: include [sigh]. For expressive surprise use [gasp]; for actual laughter use [laugh]. Otherwise use none.';
 const { getPromptText } = require('./promptRegistry');
 const { sanitizeVoiceSurfaceTextForDisplay } = require('./voiceArtifactText');
 /* === VIVENTIUM END === */
@@ -145,6 +147,7 @@ function buildVoiceModeInstructions(voiceProvider) {
       // Conservative set only: keep markers that reliably render as nonverbal audio in local MLX tests.
       `- Allowed nonverbal markers (use exactly these tokens): ${CHATTERBOX_INLINE_CONTROLS.join(', ')}.`,
       '- When delivery is expressive under the feeling-expression contract, include one allowed marker only when that marker naturally fits; when none fits or delivery is restrained, include none.',
+      CHATTERBOX_EXPRESSION_GUIDANCE,
       '- Put nonverbal markers on their own line or between sentences (do not embed inside a sentence).',
       '- Do NOT invent other bracketed stage directions.',
       '- Do NOT use <emotion .../> tags (those are Cartesia-only).',
@@ -202,7 +205,8 @@ function buildVoiceModeInstructions(voiceProvider) {
       `- Allowed xAI inline tags: ${XAI_TTS_INLINE_TAGS.join(', ')}.`,
       `- Allowed xAI wrapping tags: ${XAI_TTS_WRAPPING_TAGS.map((tag) => `<${tag}>TEXT</${tag}>`).join(', ')}.`,
       '- Wrapping controls require angle brackets: <tag>TEXT</tag>. [tag]TEXT[/tag] is invalid.',
-      '- Use wrapping tags only on short phrases, include the closing tag, and do not split tag names across streamed chunks.',
+      '- Prefer one complete inline tag copied verbatim from the allowed list.',
+      '- Use a wrapping tag only when an inline tag cannot express the delivery; copy its full opening and closing pair verbatim, with identical tag names.',
       '- Do NOT invent other bracketed stage directions or XML tags.',
       '- Do NOT use Cartesia-only controls: <emotion>, <speed>, <volume>, <break>, <spell>, or [laughter].',
       '- xAI TTS has no Cartesia-style emotion parameter; express tone through natural wording plus the documented xAI speech tags.',
@@ -265,6 +269,7 @@ function buildTelegramAudioOutputInstructions(voiceProvider) {
         ...baseRules,
         `- Chatterbox TTS is selected. Allowed nonverbal markers: ${CHATTERBOX_INLINE_CONTROLS.join(', ')}.`,
         '- When delivery is expressive under the feeling-expression contract, include one allowed marker only when that marker naturally fits; when none fits or delivery is restrained, include none.',
+        CHATTERBOX_EXPRESSION_GUIDANCE,
         '- Put nonverbal markers on their own line or between sentences.',
         '- Do NOT invent other bracketed stage directions.',
         '- Do NOT use <emotion .../> tags or other XML/SSML-like controls.',
@@ -314,7 +319,8 @@ function buildTelegramAudioOutputInstructions(voiceProvider) {
         `- Allowed xAI inline tags: ${XAI_TTS_INLINE_TAGS.join(', ')}.`,
         `- Allowed xAI wrapping tags: ${XAI_TTS_WRAPPING_TAGS.map((tag) => `<${tag}>TEXT</${tag}>`).join(', ')}.`,
         '- Wrapping controls require angle brackets: <tag>TEXT</tag>. [tag]TEXT[/tag] is invalid.',
-        '- Use wrapping tags only on short phrases, include the closing tag, and do not split tag names across streamed chunks.',
+        '- Prefer one complete inline tag copied verbatim from the allowed list.',
+        '- Use a wrapping tag only when an inline tag cannot express the delivery; copy its full opening and closing pair verbatim, with identical tag names.',
         '- Do NOT invent other bracketed stage directions or XML tags.',
         '- Do NOT use Cartesia-only controls: <emotion>, <speed>, <volume>, <break>, <spell>, or [laughter].',
         '- xAI TTS has no Cartesia-style emotion parameter; express tone through natural wording plus the documented xAI speech tags.',

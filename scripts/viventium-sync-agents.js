@@ -700,8 +700,17 @@ function parseArgs(argv) {
   return args;
 }
 
-function shouldApplyRuntimeOverrides({ action, runtimeAware = null } = {}) {
-  return action === 'push' && runtimeAware === true;
+function shouldApplyRuntimeOverrides({ action, env = DEFAULT_ENV_SLUG, runtimeAware = null } = {}) {
+  if (action !== 'push') {
+    return false;
+  }
+  if (runtimeAware === true) {
+    return true;
+  }
+  if (runtimeAware === false) {
+    return false;
+  }
+  return sanitizeSlug(env) === 'local';
 }
 
 function resolveSchedulesPath({ baseFilePath, explicitPath, defaultBasename }) {
@@ -2281,7 +2290,7 @@ function printUsage() {
     '  --runtime-aware   Rewrite built-in model/provider fields from canonical runtime env before push',
   );
   console.log(
-    '  --raw-source-of-truth  Push raw bundle values without runtime rewrite (the default; overrides an earlier --runtime-aware flag)',
+    '  --raw-source-of-truth  Push raw bundle values without runtime rewrite (disables local default)',
   );
   console.log(
     '  --agent-ids=...   Optional comma-separated background agent ids to update surgically',

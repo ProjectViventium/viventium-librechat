@@ -31,14 +31,12 @@ describe('viventium-agent-runtime-models', () => {
       'glasshive-harness::codex-cli:gpt-5.6-sol',
       'openAI::gpt-5.6-sol',
       'anthropic::claude-opus-5',
-      'anthropic::claude-opus-4-8',
     ]);
     expect([...APPROVED_BACKGROUND_RUNTIME_FAMILIES]).toEqual([
       'glasshive-harness::codex-cli:gpt-5.6-sol',
       'openAI::gpt-5.6-sol',
       'openAI::gpt-5.6-terra',
       'anthropic::claude-opus-5',
-      'anthropic::claude-opus-4-8',
     ]);
     expect(CANONICAL_BUILT_IN_MAIN_MODEL_PARAMETERS).toEqual({
       openAI: { reasoning_effort: 'medium', useResponsesApi: true },

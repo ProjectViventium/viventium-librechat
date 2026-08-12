@@ -261,8 +261,12 @@ export type ProviderCapabilityRegistry = Record<
     native_realtime_voice?: boolean;
     realtime_voice?: boolean;
     automatic_fallback_target?: boolean;
+    serial_model_fallback?: boolean;
     workspace_binding?: boolean;
     native_tools?: boolean;
+    worker_native_tools?: boolean;
+    host_tools_transport?: 'broker_mcp';
+    host_tools?: string[];
     conversation_session?: boolean;
     responses_api?: boolean;
     default_access?: 'full' | 'workspace';

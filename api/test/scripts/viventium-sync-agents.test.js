@@ -307,13 +307,13 @@ describe('viventium-sync-agents args', () => {
     expect(args.action).toBe('push');
   });
 
-  test('local push keeps tracked source-of-truth unless runtime-aware is explicit', () => {
+  test('local push defaults to runtime-aware rewrites', () => {
     const args = parseArgs(['push']);
 
-    expect(shouldApplyRuntimeOverrides(args)).toBe(false);
+    expect(shouldApplyRuntimeOverrides(args)).toBe(true);
   });
 
-  test('raw-source-of-truth explicitly keeps runtime overrides disabled', () => {
+  test('raw-source-of-truth disables the runtime-aware local default', () => {
     const args = parseArgs(['push', '--raw-source-of-truth']);
 
     expect(shouldApplyRuntimeOverrides(args)).toBe(false);

@@ -19,7 +19,6 @@ const APPROVED_MAIN_RUNTIME_FAMILIES = new Set([
   `${GLASSHIVE_MAIN_PROVIDER}::${GLASSHIVE_MAIN_MODEL}`,
   'openAI::gpt-5.6-sol',
   'anthropic::claude-opus-5',
-  'anthropic::claude-opus-4-8',
 ]);
 
 const APPROVED_BACKGROUND_RUNTIME_FAMILIES = new Set([
@@ -27,7 +26,6 @@ const APPROVED_BACKGROUND_RUNTIME_FAMILIES = new Set([
   'openAI::gpt-5.6-sol',
   'openAI::gpt-5.6-terra',
   'anthropic::claude-opus-5',
-  'anthropic::claude-opus-4-8',
 ]);
 
 const APPROVED_BACKGROUND_ACTIVATION_FAMILIES = new Set([

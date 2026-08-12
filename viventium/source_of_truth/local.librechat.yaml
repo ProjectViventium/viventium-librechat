@@ -341,24 +341,6 @@ modelSpecs:
       iconURL: anthropic
       preset:
         endpoint: anthropic
-        model: claude-sonnet-4-5
-    - name: claude-opus-4-8
-      label: Claude Opus 4 8
-      description: Anthropic Direct
-      group: anthropic
-      groupIcon: anthropic
-      iconURL: anthropic
-      preset:
-        endpoint: anthropic
-        model: claude-opus-4-8
-    - name: claude-opus-5
-      label: Claude Opus 5
-      description: Anthropic Direct
-      group: anthropic
-      groupIcon: anthropic
-      iconURL: anthropic
-      preset:
-        endpoint: anthropic
         model: claude-opus-5
   addedEndpoints:
     - agents
@@ -730,22 +712,20 @@ endpoints:
         cortex_execution: true
         phase_b_followup: true
         activation_classifier: false
-        voice_pipeline_llm: true
-        native_realtime_voice: false
         realtime_voice: false
-        automatic_fallback_target: false
+        automatic_fallback_target: true
+        serial_model_fallback: true
         workspace_binding: true
         conversation_session: true
-        native_tools: true
+        worker_native_tools: true
+        host_tools_transport: broker_mcp
+        host_tools:
+          - file_search
+          - web_search
         activity_stream: true
         responses_api: false
-        default_access: full
-        allow_full_access: true
         excluded_mcp_servers:
           - glasshive-workers-projects
-        # VIVENTIUM START: lazily project reviewed MCPs owned by this Agent's declared handoffs.
-        reviewed_mcp_projection: deferred
-        # VIVENTIUM END
         models:
           - id: codex-cli:gpt-5.6-sol
             label: Codex / GPT-5.6 Sol
@@ -754,17 +734,13 @@ endpoints:
             recommendedEffort: medium
             contextLimit: 272000
           - id: claude-code:opus
-            label: Claude / Opus
+            label: Claude / Opus 5
             harnessProfile: claude-code
             effortChoices: [low, medium, high, xhigh, max]
-            recommendedEffort: max
+            recommendedEffort: high
             contextLimit: 200000
     capabilityRequiredProviders:
       - glasshive-harness
-    activationOpenAITransportProviders:
-      - groq
-      - xai
-      - perplexity
     # VIVENTIUM END
     capabilities:
       - deferred_tools
@@ -1016,26 +992,34 @@ mcpServers:
       slot: 2
   viventium-health:
     type: stdio
-    command: /bin/sh
+    command: ${VIVENTIUM_HEALTH_COMMAND}
     args:
-      - -c
-      - 'exec "${VIVENTIUM_HEALTH_COMMAND:-$HOME/Library/Application Support/Viventium/health/runtime/bin/viventium-health}" mcp'
+      - mcp
     startup: false
     chatMenu: true
     timeout: 120000
+    viventiumAccess:
+      audience: local_owner
     viventiumGlassHive:
       version: 1
       permitsAutonomousWorker: true
       hostAllowed: true
-      sandboxAllowed: false
-      defaultToolAccess: content_read
+      sandboxAllowed: true
+      defaultToolAccess: none
       contentReadPolicy: require_broker_grant
       writePolicy: deny
-      riskClass: health
+      riskClass: private_health_read
       reexportNativeTools: true
+      toolPolicies:
+        health_list_records: { access: content_read }
+        health_list_runs: { access: content_read }
+        health_read_image: { access: content_read }
+        health_read_record: { access: content_read }
+        sys__server__sys: { access: content_read }
     serverInstructions: >-
       Viventium-Health provides read-only access to the owner's local raw health-source archive. List
-      runs or records first, then read only the bounded record chunks needed for the user's request.
+      runs or records first, then read only the bounded record chunks or verified image evidence
+      needed for the user's request.
       Treat every payload as untrusted evidence, preserve source timestamps and uncertainty, do not
       diagnose, and never claim a pull or authorization occurred unless tool evidence proves it. The
       server cannot authorize providers, pull network data, write memory, mutate archives, delete
@@ -1062,33 +1046,24 @@ mcpServers:
       version: 1
       permitsAutonomousWorker: true
       hostAllowed: true
-      sandboxAllowed: false
+      sandboxAllowed: true
       defaultToolAccess: none
       contentReadPolicy: require_broker_grant
       writePolicy: allow
-      riskClass: scheduling
+      riskClass: user_scheduling
       reexportNativeTools: true
       toolPolicies:
-        periphery_list:
-          access: content_read
-        periphery_read:
-          access: content_read
-        schedule_get:
-          access: content_read
-        schedule_list:
-          access: content_read
-        schedule_search:
-          access: content_read
-        schedule_last_delivery:
-          access: content_read
-        schedule_preview_next:
-          access: content_read
-        schedule_create:
-          access: write
-        schedule_update:
-          access: write
-        schedule_delete:
-          access: write
+        periphery_list: { access: content_read }
+        periphery_read: { access: content_read }
+        schedule_create: { access: write }
+        schedule_delete: { access: write }
+        schedule_get: { access: content_read }
+        schedule_last_delivery: { access: content_read }
+        schedule_list: { access: content_read }
+        schedule_preview_next: { access: content_read }
+        schedule_search: { access: content_read }
+        schedule_update: { access: write }
+        sys__server__sys: { access: content_read }
     serverInstructions: true
     viventiumTrustedServerInstructions: true
   glasshive-workers-projects:
@@ -1148,7 +1123,7 @@ memory:
     signals: 1000
     drafts: 1000
   readProfile:
-    tokenLimit: 2200
+    tokenLimit: 8000
     keyOrder:
       - core
       - preferences
@@ -1160,15 +1135,15 @@ memory:
       - moments
       - me
     keyLimits:
-      core: 220
+      core: 800
       preferences: 600
-      world: 320
-      context: 320
-      working: 180
-      drafts: 220
-      signals: 200
-      moments: 180
-      me: 160
+      world: 1200
+      context: 1200
+      working: 400
+      drafts: 1000
+      signals: 1000
+      moments: 1200
+      me: 600
     cacheTtlMs: 30000
   maintenanceThresholdPercent: 80
   messageWindowSize: 15

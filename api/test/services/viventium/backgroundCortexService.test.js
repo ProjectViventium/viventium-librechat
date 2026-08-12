@@ -1919,8 +1919,8 @@ describe('BackgroundCortexService.executeCortex', () => {
         model: 'codex-cli:gpt-5.6-sol',
         model_parameters: { model: 'codex-cli:gpt-5.6-sol', reasoning_effort: 'high' },
         fallback_llm_provider: 'anthropic',
-        fallback_llm_model: 'claude-sonnet-4-5',
-        fallback_llm_model_parameters: { model: 'claude-sonnet-4-5' },
+        fallback_llm_model: 'claude-opus-5',
+        fallback_llm_model_parameters: { model: 'claude-opus-5' },
         tools: [],
       },
       messages: [{ role: 'user', content: 'Review this plan.' }],
@@ -2470,8 +2470,8 @@ describe('BackgroundCortexService.executeCortex', () => {
       model: 'codex-cli:gpt-5.6-sol',
       model_parameters: { model: 'codex-cli:gpt-5.6-sol', reasoning_effort: 'high' },
       fallback_llm_provider: 'anthropic',
-      fallback_llm_model: 'claude-sonnet-4-5',
-      fallback_llm_model_parameters: { model: 'claude-sonnet-4-5' },
+      fallback_llm_model: 'claude-opus-5',
+      fallback_llm_model_parameters: { model: 'claude-opus-5' },
       tools: [],
     });
     initializeAgent.mockResolvedValueOnce({

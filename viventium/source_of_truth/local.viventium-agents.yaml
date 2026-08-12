@@ -76,11 +76,12 @@ config:
               - periphery_list_mcp_scheduling-cortex
               - periphery_read_mcp_scheduling-cortex
           - server: viventium-health
-            owns: read-only local health-source capture runs, raw response records, timestamps, and integrity evidence
+            owns: read-only local health-source capture runs, raw response records, verified manual images, timestamps, and integrity evidence
             tool_names:
               - sys__server__sys_mcp_viventium-health
               - health_list_runs_mcp_viventium-health
               - health_list_records_mcp_viventium-health
+              - health_read_image_mcp_viventium-health
               - health_read_record_mcp_viventium-health
           - server: google-workspace
             scope_key: productivity_google_workspace
@@ -152,6 +153,7 @@ mainAgent:
     promptRef: main.conscious_agent
   provider: glasshive-harness
   model: codex-cli:gpt-5.6-sol
+  recursion_limit: 40
   tools:
     - sys__server__sys_mcp_scheduling-cortex
     - schedule_create_mcp_scheduling-cortex
@@ -167,6 +169,7 @@ mainAgent:
     - sys__server__sys_mcp_viventium-health
     - health_list_runs_mcp_viventium-health
     - health_list_records_mcp_viventium-health
+    - health_read_image_mcp_viventium-health
     - health_read_record_mcp_viventium-health
     - sys__server__sys_mcp_glasshive-workers-projects
     - projects_list_mcp_glasshive-workers-projects
@@ -486,10 +489,11 @@ mainAgent:
     model: gpt-5.6-terra
     reasoning_effort: none
     useResponsesApi: true
-  fallback_llm_model: claude-opus-5
-  fallback_llm_provider: anthropic
+  fallback_llm_model: claude-code:opus
+  fallback_llm_provider: glasshive-harness
   fallback_llm_model_parameters:
-    model: claude-opus-5
+    model: claude-code:opus
+    reasoning_effort: high
   agent_ids: []
   edges:
     - from: agent_viventium_main_95aeb3
@@ -523,19 +527,16 @@ backgroundAgents:
     description: Deep analytical processing - surfaces hidden meanings and logical gaps.
     instructions:
       promptRef: cortex.background_analysis.execution
-    provider: glasshive-harness
-    model: codex-cli:gpt-5.6-sol
+    provider: openAI
+    model: gpt-5.6-terra
     tools:
       - sys__server__sys_mcp_sequential-thinking
       - sequentialthinking_mcp_sequential-thinking
     tool_kwargs: []
     model_parameters:
       reasoning_effort: medium
-      model: codex-cli:gpt-5.6-sol
-    glasshive_options:
-      workspace:
-        mode: life
-      access: full
+      useResponsesApi: true
+      model: gpt-5.6-terra
     end_after_tools: false
     hide_sequential_outputs: false
     support_contact:
@@ -548,10 +549,11 @@ backgroundAgents:
     voice_fallback_llm_model: null
     voice_fallback_llm_provider: null
     voice_fallback_llm_model_parameters: {}
-    fallback_llm_model: claude-opus-5
-    fallback_llm_provider: anthropic
+    fallback_llm_model: claude-code:opus
+    fallback_llm_provider: glasshive-harness
     fallback_llm_model_parameters:
-      model: claude-opus-5
+      model: claude-code:opus
+      reasoning_effort: high
     agent_ids: []
     edges: []
     conversation_starters: []
@@ -561,17 +563,14 @@ backgroundAgents:
     description: Error detection - flags overconfidence and unchecked assumptions before they solidify.
     instructions:
       promptRef: cortex.confirmation_bias.execution
-    provider: glasshive-harness
-    model: codex-cli:gpt-5.6-sol
+    provider: openAI
+    model: gpt-5.6-terra
     tools: []
     tool_kwargs: []
     model_parameters:
       reasoning_effort: medium
-      model: codex-cli:gpt-5.6-sol
-    glasshive_options:
-      workspace:
-        mode: life
-      access: full
+      useResponsesApi: true
+      model: gpt-5.6-terra
     end_after_tools: false
     hide_sequential_outputs: false
     support_contact:
@@ -581,10 +580,45 @@ backgroundAgents:
     voice_llm_model: null
     voice_llm_provider: null
     voice_llm_model_parameters: {}
-    fallback_llm_model: claude-opus-5
-    fallback_llm_provider: anthropic
+    fallback_llm_model: claude-code:opus
+    fallback_llm_provider: glasshive-harness
     fallback_llm_model_parameters:
-      model: claude-opus-5
+      model: claude-code:opus
+      reasoning_effort: high
+    agent_ids: []
+    edges: []
+    conversation_starters: []
+    category: viventium
+  - id: agent_viventium_deep_memory_95aeb3
+    name: Deep Memory Search
+    description: Always searches authorized long-term conversation and file memory in the background, surfacing only new relevant evidence through Phase B.
+    conversation_recall_agent_only: false
+    instructions:
+      promptRef: cortex.deep_memory.execution
+    provider: openAI
+    model: gpt-5.6-terra
+    tools:
+      - file_search
+    tool_kwargs: []
+    model_parameters:
+      reasoning_effort: medium
+      useResponsesApi: true
+      resendFiles: true
+      model: gpt-5.6-terra
+    end_after_tools: false
+    hide_sequential_outputs: false
+    support_contact:
+      name: ''
+      email: ''
+    background_cortices: []
+    voice_llm_model: null
+    voice_llm_provider: null
+    voice_llm_model_parameters: {}
+    fallback_llm_model: codex-cli:gpt-5.6-sol
+    fallback_llm_provider: glasshive-harness
+    fallback_llm_model_parameters:
+      model: codex-cli:gpt-5.6-sol
+      reasoning_effort: medium
     agent_ids: []
     edges: []
     conversation_starters: []
@@ -594,8 +628,8 @@ backgroundAgents:
     description: Evidence-first mistake detection - verifies claims, tests viability, and calls out rationalization.
     instructions:
       promptRef: cortex.red_team.execution
-    provider: glasshive-harness
-    model: codex-cli:gpt-5.6-sol
+    provider: openAI
+    model: gpt-5.6-sol
     tools:
       - sys__server__sys_mcp_sequential-thinking
       - sequentialthinking_mcp_sequential-thinking
@@ -603,12 +637,10 @@ backgroundAgents:
       - web_search
     tool_kwargs: []
     model_parameters:
-      reasoning_effort: high
-      model: codex-cli:gpt-5.6-sol
-    glasshive_options:
-      workspace:
-        mode: life
-      access: full
+      reasoning_effort: xhigh
+      useResponsesApi: true
+      resendFiles: true
+      model: gpt-5.6-sol
     end_after_tools: false
     hide_sequential_outputs: false
     support_contact:
@@ -618,11 +650,11 @@ backgroundAgents:
     voice_llm_model: null
     voice_llm_provider: null
     voice_llm_model_parameters: {}
-    fallback_llm_model: claude-opus-5
-    fallback_llm_provider: anthropic
+    fallback_llm_model: claude-code:opus
+    fallback_llm_provider: glasshive-harness
     fallback_llm_model_parameters:
-      model: claude-opus-5
-      thinkingBudget: 4000
+      model: claude-code:opus
+      reasoning_effort: high
     agent_ids: []
     edges: []
     conversation_starters: []
@@ -632,19 +664,17 @@ backgroundAgents:
     description: Multi-step research across sources, building comprehensive understanding.
     instructions:
       promptRef: cortex.deep_research.execution
-    provider: glasshive-harness
-    model: codex-cli:gpt-5.6-sol
+    provider: openAI
+    model: gpt-5.6-sol
     tools:
       - sys__server__sys_mcp_sequential-thinking
       - sys__all__sys_mcp_sequential-thinking
+      - web_search
     tool_kwargs: []
     model_parameters:
       reasoning_effort: xhigh
-      model: codex-cli:gpt-5.6-sol
-    glasshive_options:
-      workspace:
-        mode: life
-      access: full
+      useResponsesApi: true
+      model: gpt-5.6-sol
     end_after_tools: false
     hide_sequential_outputs: false
     support_contact:
@@ -654,11 +684,11 @@ backgroundAgents:
     voice_llm_model: null
     voice_llm_provider: null
     voice_llm_model_parameters: {}
-    fallback_llm_model: claude-opus-5
-    fallback_llm_provider: anthropic
+    fallback_llm_model: claude-code:opus
+    fallback_llm_provider: glasshive-harness
     fallback_llm_model_parameters:
-      model: claude-opus-5
-      thinkingBudget: 4000
+      model: claude-code:opus
+      reasoning_effort: high
     agent_ids: []
     edges: []
     conversation_starters: []
@@ -668,17 +698,14 @@ backgroundAgents:
     description: Orchestrates MS365 productivity tool calls (Outlook email, calendar, OneDrive files).
     instructions:
       promptRef: cortex.online_tool_use.execution
-    provider: glasshive-harness
-    model: codex-cli:gpt-5.6-sol
+    provider: openAI
+    model: gpt-5.6-terra
     tools: []
     tool_kwargs: []
     model_parameters:
       reasoning_effort: low
-      model: codex-cli:gpt-5.6-sol
-    glasshive_options:
-      workspace:
-        mode: life
-      access: full
+      useResponsesApi: true
+      model: gpt-5.6-terra
     end_after_tools: false
     hide_sequential_outputs: false
     support_contact:
@@ -691,10 +718,11 @@ backgroundAgents:
     voice_fallback_llm_model: null
     voice_fallback_llm_provider: null
     voice_fallback_llm_model_parameters: {}
-    fallback_llm_model: claude-opus-5
-    fallback_llm_provider: anthropic
+    fallback_llm_model: claude-code:opus
+    fallback_llm_provider: glasshive-harness
     fallback_llm_model_parameters:
-      model: claude-opus-5
+      model: claude-code:opus
+      reasoning_effort: high
     agent_ids: []
     edges: []
     conversation_starters: []
@@ -704,27 +732,25 @@ backgroundAgents:
     description: Mathematical, physics, and statistical reasoning using first-principles thinking.
     instructions:
       promptRef: cortex.parietal_cortex.execution
-    provider: glasshive-harness
-    model: codex-cli:gpt-5.6-sol
+    provider: openAI
+    model: gpt-5.6-terra
     tools:
       - sys__server__sys_mcp_sequential-thinking
       - sys__all__sys_mcp_sequential-thinking
     tool_kwargs: []
     model_parameters:
       reasoning_effort: medium
-      model: codex-cli:gpt-5.6-sol
-    glasshive_options:
-      workspace:
-        mode: life
-      access: full
+      useResponsesApi: true
+      model: gpt-5.6-terra
     end_after_tools: false
     hide_sequential_outputs: false
     support_contact: {}
     background_cortices: []
-    fallback_llm_model: claude-opus-5
-    fallback_llm_provider: anthropic
+    fallback_llm_model: claude-code:opus
+    fallback_llm_provider: glasshive-harness
     fallback_llm_model_parameters:
-      model: claude-opus-5
+      model: claude-code:opus
+      reasoning_effort: high
     agent_ids: []
     edges: []
     conversation_starters: []
@@ -734,24 +760,22 @@ backgroundAgents:
     description: Identifies recurring themes, behavioral loops, and contradictions across conversation.
     instructions:
       promptRef: cortex.pattern_recognition.execution
-    provider: glasshive-harness
-    model: codex-cli:gpt-5.6-sol
+    provider: openAI
+    model: gpt-5.6-terra
     tools: []
     tool_kwargs: []
     model_parameters:
       reasoning_effort: medium
-      model: codex-cli:gpt-5.6-sol
-    glasshive_options:
-      workspace:
-        mode: life
-      access: full
+      useResponsesApi: true
+      model: gpt-5.6-terra
     end_after_tools: false
     hide_sequential_outputs: false
     background_cortices: []
-    fallback_llm_model: claude-opus-5
-    fallback_llm_provider: anthropic
+    fallback_llm_model: claude-code:opus
+    fallback_llm_provider: glasshive-harness
     fallback_llm_model_parameters:
-      model: claude-opus-5
+      model: claude-code:opus
+      reasoning_effort: high
     agent_ids: []
     edges: []
     conversation_starters: []
@@ -761,22 +785,20 @@ backgroundAgents:
     description: Senses emotional undercurrents and unspoken needs that words don't capture.
     instructions:
       promptRef: cortex.emotional_resonance.execution
-    provider: glasshive-harness
-    model: codex-cli:gpt-5.6-sol
+    provider: openAI
+    model: gpt-5.6-terra
     tools: []
     tool_kwargs: []
     model_parameters:
       reasoning_effort: low
-      model: codex-cli:gpt-5.6-sol
-    glasshive_options:
-      workspace:
-        mode: life
-      access: full
+      useResponsesApi: true
+      model: gpt-5.6-terra
     background_cortices: []
-    fallback_llm_model: claude-opus-5
-    fallback_llm_provider: anthropic
+    fallback_llm_model: claude-code:opus
+    fallback_llm_provider: glasshive-harness
     fallback_llm_model_parameters:
-      model: claude-opus-5
+      model: claude-code:opus
+      reasoning_effort: high
     agent_ids: []
     edges: []
     conversation_starters: []
@@ -786,28 +808,25 @@ backgroundAgents:
     description: Transforms abstract goals into concrete action sequences with risk awareness.
     instructions:
       promptRef: cortex.strategic_planning.execution
-    provider: glasshive-harness
-    model: codex-cli:gpt-5.6-sol
+    provider: openAI
+    model: gpt-5.6-sol
     tools: []
     tool_kwargs: []
     model_parameters:
       reasoning_effort: high
-      model: codex-cli:gpt-5.6-sol
-    glasshive_options:
-      workspace:
-        mode: life
-      access: full
+      useResponsesApi: true
+      model: gpt-5.6-sol
     end_after_tools: false
     hide_sequential_outputs: false
     support_contact:
       name: ''
       email: ''
     background_cortices: []
-    fallback_llm_model: claude-opus-5
-    fallback_llm_provider: anthropic
+    fallback_llm_model: claude-code:opus
+    fallback_llm_provider: glasshive-harness
     fallback_llm_model_parameters:
-      model: claude-opus-5
-      thinkingBudget: 2000
+      model: claude-code:opus
+      reasoning_effort: high
     agent_ids: []
     edges: []
     conversation_starters: []
@@ -817,17 +836,14 @@ backgroundAgents:
     description: In-product help for using Viventium — conversations, voice, agents, integrations, scheduling. Never mentions internal implementation; escalates to the official Viventium support channel only when needed.
     instructions:
       promptRef: cortex.support.execution
-    provider: glasshive-harness
-    model: codex-cli:gpt-5.6-sol
+    provider: openAI
+    model: gpt-5.6-terra
     tools: []
     tool_kwargs: []
     model_parameters:
       reasoning_effort: low
-      model: codex-cli:gpt-5.6-sol
-    glasshive_options:
-      workspace:
-        mode: life
-      access: full
+      useResponsesApi: true
+      model: gpt-5.6-terra
     end_after_tools: false
     hide_sequential_outputs: false
     support_contact:
@@ -837,10 +853,11 @@ backgroundAgents:
     voice_llm_model: null
     voice_llm_provider: null
     voice_llm_model_parameters: {}
-    fallback_llm_model: claude-opus-5
-    fallback_llm_provider: anthropic
+    fallback_llm_model: claude-code:opus
+    fallback_llm_provider: glasshive-harness
     fallback_llm_model_parameters:
-      model: claude-opus-5
+      model: claude-code:opus
+      reasoning_effort: high
     agent_ids: []
     edges: []
     conversation_starters: []
@@ -850,17 +867,14 @@ backgroundAgents:
     description: Orchestrates Google Workspace productivity tool calls
     instructions:
       promptRef: cortex.google.execution
-    provider: glasshive-harness
-    model: codex-cli:gpt-5.6-sol
+    provider: openAI
+    model: gpt-5.6-terra
     tools: []
     tool_kwargs: []
     model_parameters:
       reasoning_effort: low
-      model: codex-cli:gpt-5.6-sol
-    glasshive_options:
-      workspace:
-        mode: life
-      access: full
+      useResponsesApi: true
+      model: gpt-5.6-terra
     end_after_tools: false
     hide_sequential_outputs: false
     support_contact:
@@ -873,10 +887,11 @@ backgroundAgents:
     voice_fallback_llm_model: null
     voice_fallback_llm_provider: null
     voice_fallback_llm_model_parameters: {}
-    fallback_llm_model: claude-opus-5
-    fallback_llm_provider: anthropic
+    fallback_llm_model: claude-code:opus
+    fallback_llm_provider: glasshive-harness
     fallback_llm_model_parameters:
-      model: claude-opus-5
+      model: claude-code:opus
+      reasoning_effort: high
     agent_ids: []
     edges: []
     conversation_starters: []

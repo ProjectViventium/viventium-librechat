@@ -1286,8 +1286,17 @@ class GenerationJobManagerClass {
       }
     });
 
+    /* === VIVENTIUM START ===
+     * Purpose: The transport may install its local callback before the backing
+     * subscription is acknowledged. Keep user delivery behind the readiness
+     * boundary and let earlyEventBuffer provide the one authoritative replay.
+     */
+    let transportReady = false;
     const subscription = eventTransport.subscribe(streamId, {
       onChunk: (event) => {
+        if (!transportReady) {
+          return;
+        }
         const e = event as t.ServerSentEvent;
         // Filter out internal events
         if (!(e as Record<string, unknown>)._internal) {
@@ -1314,6 +1323,7 @@ class GenerationJobManagerClass {
       });
       await (signal ? Promise.race([subscription.ready, cancellation]) : subscription.ready);
       this.assertServiceGeneration(generation);
+      transportReady = true;
     } catch (error) {
       subscription.unsubscribe();
       throw error;
@@ -1383,9 +1393,6 @@ class GenerationJobManagerClass {
       (event as t.ServerSentEvent & { _viventiumAllowAfterAbort?: boolean })
         ._viventiumAllowAfterAbort === true;
     if (!runtime || (runtime.abortController.signal.aborted && !allowAfterAbort)) {
-      return;
-    }
-    if (!(await this.jobStore.isCurrentLogicalTurn(streamId))) {
       return;
     }
     if (!(await this.jobStore.isCurrentLogicalTurn(streamId))) {

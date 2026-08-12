@@ -12,7 +12,7 @@ function resolveAgentCapabilityProvider(agent) {
 }
 
 function selectLibreChatAgentGraph({ agentIds, edges, capability } = {}) {
-  if (capability?.native_tools === true) {
+  if (capability?.worker_native_tools === true || capability?.native_tools === true) {
     return { agentIds: [], edges: [] };
   }
   return { agentIds, edges };

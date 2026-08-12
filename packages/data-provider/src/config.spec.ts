@@ -64,8 +64,11 @@ describe('agentsEndpointSchema provider capability policy', () => {
       native_realtime_voice: false,
       realtime_voice: false,
       automatic_fallback_target: false,
+      serial_model_fallback: false,
       workspace_binding: false,
       native_tools: false,
+      worker_native_tools: false,
+      host_tools: [],
       activity_stream: false,
       responses_api: false,
       default_access: 'workspace',
@@ -73,6 +76,29 @@ describe('agentsEndpointSchema provider capability policy', () => {
       reviewed_mcp_projection: 'deferred',
     });
     expect(parsed.activationOpenAITransportProviders).toEqual(['synthetic-openai-transport']);
+  });
+
+  it('preserves provider-owned execution and brokered host-tool capabilities', () => {
+    const parsed = agentsEndpointSchema.parse({
+      capabilityRequiredProviders: ['synthetic-harness'],
+      providerCapabilities: {
+        'synthetic-harness': {
+          label: 'Synthetic Harness',
+          serial_model_fallback: true,
+          worker_native_tools: true,
+          host_tools_transport: 'broker_mcp',
+          host_tools: ['file_search', 'web_search'],
+          models: [{ id: 'synthetic:model', label: 'Synthetic Model' }],
+        },
+      },
+    });
+
+    expect(parsed.providerCapabilities['synthetic-harness']).toMatchObject({
+      serial_model_fallback: true,
+      worker_native_tools: true,
+      host_tools_transport: 'broker_mcp',
+      host_tools: ['file_search', 'web_search'],
+    });
   });
 });
 

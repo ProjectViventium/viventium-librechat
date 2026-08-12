@@ -521,7 +521,7 @@ describe('viventium-seed-agents', () => {
     const result = reconcileManagedAgentFields(
       { fallback_llm_model: null },
       { fallback_llm_model: 'claude-opus-5' },
-      { fallback_llm_model: 'claude-opus-4-8' },
+      { fallback_llm_model: 'claude-opus-5' },
     );
 
     expect(result.agentData.fallback_llm_model).toBeNull();
@@ -623,8 +623,8 @@ describe('viventium-seed-agents', () => {
     const incoming = {
       id,
       provider: 'anthropic',
-      model: 'claude-opus-4-8',
-      model_parameters: { model: 'claude-opus-4-8', thinking: false, effort: 'high' },
+      model: 'claude-opus-5',
+      model_parameters: { model: 'claude-opus-5', thinking: false, effort: 'high' },
     };
     const predecessor = buildManagedBaseline({ mainAgent: prior, backgroundAgents: [] });
     const existing = {
@@ -647,12 +647,12 @@ describe('viventium-seed-agents', () => {
 
     expect(plan.managedDrift).toEqual(['model_parameters.effort']);
     expect(plan.runtimeRepairAgentData.model_parameters).toEqual({
-      model: 'claude-opus-4-8',
+      model: 'claude-opus-5',
       thinking: false,
       effort: 'low',
     });
     expect(repair.model_parameters).toEqual({
-      model: 'claude-opus-4-8',
+      model: 'claude-opus-5',
       thinking: false,
       effort: 'low',
     });

@@ -219,6 +219,29 @@ const hasProviderStreamOutput = (data) => {
   );
 };
 
+/* === VIVENTIUM START ===
+ * Feature: Parallel text first-output timing.
+ * Purpose: Recognize normalized reasoning content without treating empty compatibility deltas as output.
+ */
+const hasReasoningDelta = (data) => {
+  const content = data?.delta?.content;
+  if (!Array.isArray(content)) {
+    return false;
+  }
+  return content.some((part) => {
+    if (typeof part === 'string') {
+      return part.length > 0;
+    }
+    if (!part || typeof part !== 'object') {
+      return false;
+    }
+    return [part.think, part.thinking, part.reasoning, part.reasoningText?.text].some(
+      (value) => typeof value === 'string' && value.length > 0,
+    );
+  });
+};
+/* === VIVENTIUM END === */
+
 class ModelEndHandler {
   /* === VIVENTIUM START ===
    * Feature: Deep Telegram timing instrumentation (toggleable)
@@ -755,6 +778,14 @@ function getDefaultHandlers({
        */
       handle: async (event, data, metadata) => {
         /* === VIVENTIUM START ===
+         * Feature: Parallel text first-visible-output timing.
+         * Purpose: Separate accepted visible Main text from provider and reasoning arrival.
+         */
+        if (hasVisibleMessageDelta(data)) {
+          markMainProviderFirstOutput(req, metadata, { kind: 'visible_text_delta' });
+        }
+        /* === VIVENTIUM END === */
+        /* === VIVENTIUM START ===
          * Feature: GlassHive duplicate-author guard.
          * Purpose: Visible provider-authored content proves the native harness has begun authoring.
          * A role-only compatibility delta does not lock fallback because it precedes native start.
@@ -839,6 +870,14 @@ function getDefaultHandlers({
        * @param {GraphRunnableConfig['configurable']} [metadata] The runnable metadata.
        */
       handle: async (event, data, metadata) => {
+        /* === VIVENTIUM START ===
+         * Feature: Parallel text first-output timing.
+         * Purpose: Normalized reasoning is real provider output even before visible answer text.
+         */
+        if (hasReasoningDelta(data)) {
+          markMainProviderFirstOutput(req, metadata, { kind: 'provider_token' });
+        }
+        /* === VIVENTIUM END === */
         /* === VIVENTIUM START ===
          * Feature: GlassHive duplicate-author guard.
          * Purpose: GlassHive emits normalized activity through the reasoning channel before

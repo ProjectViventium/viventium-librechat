@@ -713,11 +713,12 @@ export async function initializeAgent(
   vivInitTimings.transcript_attach_ms = Date.now() - vivTranscriptStart;
 
   /* Filter only at the load boundary: recall and meeting-resource setup above may add file_search.
-   * A provider declaring native_tools owns execution through its authenticated capability bundle;
+   * A provider declaring worker_native_tools (or the legacy native_tools alias) owns execution
+   * through its authenticated capability bundle;
    * retaining the declarations on `agent` lets that bundle remain complete while preventing a
    * second, incompatible LibreChat tool graph from being bound to the provider request. */
   const runtimeAgentTools =
-    providerCapability?.native_tools === true
+    providerCapability?.worker_native_tools === true || providerCapability?.native_tools === true
       ? []
       : (agent.tools ?? []).filter((tool) => {
           const delimiterIndex = tool.lastIndexOf(Constants.mcp_delimiter);

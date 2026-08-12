@@ -517,8 +517,8 @@ describe('initializeAgent — custom endpoint init routing', () => {
 });
 
 /* === VIVENTIUM START ===
- * Regression: harness-native tool ownership.
- * Purpose: A native-tools provider receives declared Agent tools through its signed capability
+ * Regression: harness worker-native tool ownership.
+ * Purpose: A worker-native provider receives declared Agent tools through its signed capability
  * bundle, so LibreChat must not also bind those tools into the model graph.
  * === VIVENTIUM END === */
 describe('initializeAgent — provider-native tool ownership', () => {
@@ -541,7 +541,7 @@ describe('initializeAgent — provider-native tool ownership', () => {
           providerCapabilities: {
             [provider]: {
               main_chat: true,
-              native_tools: true,
+              worker_native_tools: true,
               workspace_binding: true,
               default_access: 'workspace',
               allow_full_access: false,

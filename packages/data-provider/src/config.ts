@@ -314,9 +314,18 @@ export const agentProviderCapabilitySchema = z.object({
   native_realtime_voice: z.boolean().default(false),
   realtime_voice: z.boolean().default(false),
   automatic_fallback_target: z.boolean().default(false),
+  /* === VIVENTIUM START ===
+   * Feature: GlassHive provider-owned execution and host-tool brokerage.
+   * Purpose: Keep worker-native tools distinct from explicitly brokered host capabilities while
+   * preserving the declared serial fallback policy through config parsing.
+   * === VIVENTIUM END === */
+  serial_model_fallback: z.boolean().default(false),
   workspace_binding: z.boolean().default(false),
   conversation_session: z.boolean().default(false),
   native_tools: z.boolean().default(false),
+  worker_native_tools: z.boolean().default(false),
+  host_tools_transport: z.enum(['broker_mcp']).optional(),
+  host_tools: z.array(z.string()).optional().default([]),
   activity_stream: z.boolean().default(false),
   responses_api: z.boolean().default(false),
   default_access: z.enum(['full', 'workspace']).default('workspace'),

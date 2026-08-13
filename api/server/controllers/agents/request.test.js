@@ -46,6 +46,9 @@ jest.mock('@librechat/api', () => ({
   sanitizeFileForTransmit: (f) => f,
   sanitizeMessageForTransmit: (m) => m,
   checkAndIncrementPendingRequest: (...args) => mockCheckAndIncrementPendingRequest(...args),
+  inspectProviderDeliveryDisposition: jest.fn(() => ({ status: 'missing' })),
+  resolveEffectiveDeliveryDisposition: jest.fn(() => null),
+  supportsMessagingDeliveryDisposition: jest.fn(() => false),
 }));
 
 jest.mock('~/server/cleanup', () => ({

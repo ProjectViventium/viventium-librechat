@@ -999,10 +999,13 @@ describe('viventium-seed-agents', () => {
     const audit = auditHermeticArtifact(tracked);
 
     expect(audit.artifact).toEqual(tracked);
-    expect(tracked.public_lock_revision_count).toBe(118);
+    expect(tracked.public_lock_revision_count).toBe(127);
     expect(tracked.invalid_predecessors).toHaveLength(3);
-    expect(tracked.migrations).toHaveLength(27);
-    expect(tracked.migrations.flatMap((item) => item.predecessor_source_refs)).toHaveLength(82);
+    expect(tracked.migrations).toHaveLength(29);
+    expect(tracked.migrations.flatMap((item) => item.predecessor_source_refs)).toHaveLength(89);
+    expect(tracked.migrations.flatMap((item) => item.predecessor_source_refs)).toContain(
+      '24289a2834aad5e620b6a4878bd20404a26b5106',
+    );
 
     for (const group of audit.groups) {
       const migration = tracked.migrations.find(

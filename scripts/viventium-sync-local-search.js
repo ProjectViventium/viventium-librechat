@@ -11,7 +11,6 @@ require('dotenv').config();
 const mongoose = require('mongoose');
 const { MeiliSearch } = require('meilisearch');
 const { createModels } = require('@librechat/data-schemas');
-const { connectDb } = require('../api/db/connect');
 const { batchResetMeiliFlags } = require('../api/db/utils');
 
 const failedTaskLookback = process.env.VIVENTIUM_MEILI_FAILED_TASK_LOOKBACK
@@ -24,7 +23,11 @@ const meiliEligibleQuery = {
     $nin: ['listen_only_transcript', 'voice_ambient_transcript'],
   },
   'metadata.viventium.mode': { $ne: 'listen_only' },
+  'metadata.viventium.qaRun': { $ne: true },
+  'metadata.viventium.memoryEligible': { $ne: false },
 };
+
+module.exports = { meiliEligibleQuery };
 
 const isTruthy = (value) => {
   if (typeof value !== 'string') {
@@ -169,6 +172,8 @@ const resetStaleFlagsForParity = async (state, Message, Conversation) => {
 };
 
 async function main() {
+  const { connectDb } = require('../api/db/connect');
+
   if (!isTruthy(process.env.SEARCH ?? '')) {
     console.log('[local-search-sync] SEARCH is disabled, skipping local backfill');
     return;
@@ -244,11 +249,13 @@ async function main() {
   console.log('[local-search-sync] Local conversation search is fully indexed');
 }
 
-main()
-  .catch((error) => {
-    console.error('[local-search-sync] Failed:', error.message);
-    process.exitCode = 1;
-  })
-  .finally(async () => {
-    await mongoose.disconnect().catch(() => {});
-  });
+if (require.main === module) {
+  main()
+    .catch((error) => {
+      console.error('[local-search-sync] Failed:', error.message);
+      process.exitCode = 1;
+    })
+    .finally(async () => {
+      await mongoose.disconnect().catch(() => {});
+    });
+}

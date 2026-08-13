@@ -7,6 +7,12 @@ jest.mock('nanoid', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  inspectProviderDeliveryDisposition:
+    jest.requireActual('@librechat/api').inspectProviderDeliveryDisposition,
+  resolveEffectiveDeliveryDisposition:
+    jest.requireActual('@librechat/api').resolveEffectiveDeliveryDisposition,
+  supportsMessagingDeliveryDisposition:
+    jest.requireActual('@librechat/api').supportsMessagingDeliveryDisposition,
   sendEvent: jest.fn(),
   GenerationJobManager: {
     emitChunk: jest.fn(),
@@ -410,6 +416,112 @@ describe('getDefaultHandlers voice reasoning guard', () => {
     expect(trace).toContain('stage=agent_generation_start');
     expect(trace).toContain('stage=first_model_token');
     expect(trace.match(/request_id=request-correlation-1/g)).toHaveLength(4);
+  });
+
+  it('captures the final non-tool disposition and invalidates it for a later legacy speaker', async () => {
+    const req = {
+      _viventiumTelegram: true,
+      body: { telegramAudioRequested: true },
+      _viventiumDeliveryDispositionRequired: true,
+      config: {
+        endpoints: {
+          agents: {
+            providerCapabilities: {
+              'glasshive-harness': {
+                messaging_delivery_disposition: true,
+                messaging_delivery_disposition_version: 1,
+              },
+            },
+          },
+        },
+      },
+    };
+    const handlers = getDefaultHandlers({
+      req,
+      res: {},
+      aggregateContent: jest.fn(),
+      toolEndCallback: jest.fn(),
+      collectedUsage: [],
+      streamId: null,
+    });
+    const capabilityOwner = Symbol.for(
+      'viventium.agent.messaging.delivery-disposition.capability-owner.v1',
+    );
+    const graph = {
+      getAgentContext: jest.fn(() => ({
+        provider: 'openAI',
+        clientOptions: { [capabilityOwner]: 'glasshive-harness' },
+      })),
+    };
+    const disposition = {
+      version: 1,
+      audio: 'skip',
+      required: true,
+      valid: true,
+      source: 'model',
+    };
+    const output = {
+      content: 'Final answer.',
+      additional_kwargs: {
+        __raw_response: {
+          choices: [
+            {
+              index: 0,
+              delta: {
+                provider_specific_fields: {
+                  viventium: { delivery_disposition: disposition },
+                },
+              },
+            },
+          ],
+        },
+      },
+    };
+
+    await handlers[GraphEvents.CHAT_MODEL_END].handle(
+      GraphEvents.CHAT_MODEL_END,
+      { output },
+      { last_agent_id: 'main', langgraph_node: 'agent_specialist' },
+      graph,
+    );
+    expect(req._viventiumDeliveryDispositionCapture).toEqual({
+      status: 'valid',
+      disposition,
+    });
+
+    await handlers[GraphEvents.CHAT_MODEL_END].handle(
+      GraphEvents.CHAT_MODEL_END,
+      { output: { ...output, tool_calls: [{ id: 'handoff-1' }] } },
+      { last_agent_id: 'main', langgraph_node: 'agent_main' },
+      graph,
+    );
+    expect(req._viventiumDeliveryDispositionCapture).toEqual({
+      status: 'valid',
+      disposition,
+    });
+
+    await handlers[GraphEvents.CHAT_MODEL_END].handle(
+      GraphEvents.CHAT_MODEL_END,
+      { output },
+      { last_agent_id: 'main', langgraph_node: 'agent_main' },
+      graph,
+    );
+    expect(req._viventiumDeliveryDispositionCapture).toEqual({
+      status: 'valid',
+      disposition,
+    });
+
+    graph.getAgentContext.mockReturnValueOnce({
+      provider: 'openAI',
+      clientOptions: {},
+    });
+    await handlers[GraphEvents.CHAT_MODEL_END].handle(
+      GraphEvents.CHAT_MODEL_END,
+      { output: { content: 'Final answer from a legacy provider.' } },
+      { last_agent_id: 'main', langgraph_node: 'agent_legacy' },
+      graph,
+    );
+    expect(req._viventiumDeliveryDispositionCapture).toEqual({ status: 'missing' });
   });
 
   it('continues to emit reasoning deltas for non-voice streams', async () => {

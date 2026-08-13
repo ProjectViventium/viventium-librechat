@@ -128,6 +128,7 @@ const ALLOWED_BODY_FIELDS = [
   'viventiumTelegramChatId',
   'viventiumTelegramUserId',
   'viventiumTelegramMessageId',
+  'telegramAudioRequested',
   'viventiumLogicalTurnId',
   'viventiumLogicalTurnRevision',
   'files',

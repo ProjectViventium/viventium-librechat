@@ -523,10 +523,26 @@ describe('resolveHeaders', () => {
       conversationId: 'conv-123',
       parentMessageId: 'parent-456',
       messageId: 'msg-789',
+      telegramAudioRequested: true,
     };
-    const headers = { 'X-Conversation': '{{LIBRECHAT_BODY_CONVERSATIONID}}' };
+    const headers = {
+      'X-Conversation': '{{LIBRECHAT_BODY_CONVERSATIONID}}',
+      'X-Audio-Eligible': '{{LIBRECHAT_BODY_TELEGRAMAUDIOREQUESTED}}',
+    };
     const result = resolveHeaders({ headers, body });
     expect(result['X-Conversation']).toBe('conv-123');
+    expect(result['X-Audio-Eligible']).toBe('true');
+  });
+
+  it('should not promote a false audio-eligibility field to true', () => {
+    const headers = {
+      'X-Audio-Eligible': '{{LIBRECHAT_BODY_TELEGRAMAUDIOREQUESTED}}',
+    };
+
+    expect(
+      resolveHeaders({ headers, body: { telegramAudioRequested: false } })['X-Audio-Eligible'],
+    ).toBe('false');
+    expect(resolveHeaders({ headers, body: {} })['X-Audio-Eligible']).toBe('');
   });
 
   it('should resolve GlassHive per-turn context headers', () => {

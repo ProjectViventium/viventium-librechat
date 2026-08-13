@@ -26,6 +26,14 @@ const { processFileCitations } = require('~/server/services/Files/Citations');
 const { processCodeOutput } = require('~/server/services/Files/Code/process');
 const { loadAuthValues } = require('~/server/services/Tools/credentials');
 const { saveBase64Image } = require('~/server/services/Files/process');
+/* === VIVENTIUM START === Versioned final-model delivery disposition. === */
+const {
+  captureFinalModelDeliveryDisposition,
+} = require('~/server/services/viventium/deliveryDisposition');
+/* === VIVENTIUM END === */
+const VIVENTIUM_DELIVERY_DISPOSITION_CAPABILITY_OWNER = Symbol.for(
+  'viventium.agent.messaging.delivery-disposition.capability-owner.v1',
+);
 /* === VIVENTIUM START ===
  * Feature: Deep Telegram timing instrumentation (toggleable)
  * Purpose: Add request-scoped timing logs for Telegram streams (cold starts, latency hotspots) without affecting other surfaces.
@@ -302,6 +310,15 @@ class ModelEndHandler {
       }
 
       const toolCalls = data?.output?.tool_calls;
+      /* === VIVENTIUM START === Capture only the capable winning model's disposition. === */
+      captureFinalModelDeliveryDisposition({
+        req: this.req,
+        output: data?.output,
+        capabilityOwner:
+          agentContext.clientOptions?.[VIVENTIUM_DELIVERY_DISPOSITION_CAPABILITY_OWNER] ||
+          agentContext.provider,
+      });
+      /* === VIVENTIUM END === */
       let hasUnprocessedToolCalls = false;
       if (Array.isArray(toolCalls) && toolCalls.length > 0 && graph?.toolCallStepIds?.has) {
         try {

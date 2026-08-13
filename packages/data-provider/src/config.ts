@@ -328,6 +328,8 @@ export const agentProviderCapabilitySchema = z.object({
   host_tools: z.array(z.string()).optional().default([]),
   activity_stream: z.boolean().default(false),
   responses_api: z.boolean().default(false),
+  messaging_delivery_disposition: z.boolean().default(false),
+  messaging_delivery_disposition_version: z.literal(1).optional(),
   default_access: z.enum(['full', 'workspace']).default('workspace'),
   allow_full_access: z.boolean().default(false),
   excluded_mcp_servers: z.array(z.string()).optional().default([]),

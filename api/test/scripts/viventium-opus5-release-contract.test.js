@@ -108,5 +108,13 @@ describe('Viventium Claude Opus 5 release contract', () => {
     );
     expect(modelParametersSection).toContain('{ persistReset: false }');
   });
+
+  test('declares the versioned GlassHive messaging delivery contract in tracked config truth', () => {
+    const source = loadYaml('local.librechat.yaml');
+    const capability = source.endpoints.agents.providerCapabilities['glasshive-harness'];
+
+    expect(capability.messaging_delivery_disposition).toBe(true);
+    expect(capability.messaging_delivery_disposition_version).toBe(1);
+  });
   /* === VIVENTIUM END === */
 });

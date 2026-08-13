@@ -349,6 +349,9 @@ const VIVENTIUM_GRAPH_FALLBACK_CONTEXT = Symbol.for(
 const VIVENTIUM_MODEL_ROUTE_CAPABILITY_REFRESH = Symbol.for(
   'viventium.agent.model.route.capability.refresh.v1',
 );
+const VIVENTIUM_DELIVERY_DISPOSITION_CAPABILITY_OWNER = Symbol.for(
+  'viventium.agent.messaging.delivery-disposition.capability-owner.v1',
+);
 
 function installProjectedCapabilityRefresh({
   route,
@@ -445,6 +448,12 @@ function normalizeRunModelRoute({
     },
     modelParameters,
   ) as unknown as t.RunLLMConfig;
+  Object.defineProperty(clientOptions, VIVENTIUM_DELIVERY_DISPOSITION_CAPABILITY_OWNER, {
+    value: route.endpoint || route.provider,
+    configurable: false,
+    enumerable: false,
+    writable: false,
+  });
 
   if (clientOptions.configuration?.defaultHeaders != null) {
     clientOptions.configuration.defaultHeaders = resolveHeaders({

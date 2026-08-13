@@ -443,6 +443,8 @@ describe('initializeAgent — custom endpoint init routing', () => {
             'glasshive-harness': {
               main_chat: true,
               workspace_binding: true,
+              messaging_delivery_disposition: true,
+              messaging_delivery_disposition_version: 1,
               conversation_session: true,
               serial_model_fallback: true,
               responses_api: false,
@@ -497,11 +499,13 @@ describe('initializeAgent — custom endpoint init routing', () => {
     expect(loadTools).toHaveBeenCalledWith(
       expect.objectContaining({ tools: ['search_mcp_github'] }),
     );
+    expect((result.model_parameters as Record<string, unknown>).__includeRawResponse).toBe(true);
     expect(result.model_parameters.configuration.defaultHeaders).toEqual(
       expect.objectContaining({
         Authorization: 'Bearer configured-provider-key',
         'X-Viventium-User-Id': '{{LIBRECHAT_USER_ID}}',
         'X-Viventium-Conversation-Id': '{{LIBRECHAT_BODY_CONVERSATIONID}}',
+        'X-Viventium-Audio-Eligible': '{{LIBRECHAT_BODY_TELEGRAMAUDIOREQUESTED}}',
         'X-GlassHive-Agent-Id': 'agent-harness',
         'X-GlassHive-Workspace-Mode': 'custom',
         'X-GlassHive-Workspace-Path-B64': Buffer.from('/srv/viventium-workspace', 'utf8').toString(
@@ -513,6 +517,50 @@ describe('initializeAgent — custom endpoint init routing', () => {
         'X-GlassHive-Turn-Context-B64': '{{LIBRECHAT_BODY_VIVENTIUMGLASSHIVETURNCONTEXTB64}}',
       }),
     );
+  });
+
+  it('activates the delivery contract from its own capability without workspace binding', async () => {
+    const provider = 'synthetic-delivery-provider';
+    const { agent, req, res, loadTools, db } = createMocks({ provider });
+    req.config = {
+      endpoints: {
+        agents: {
+          providerCapabilities: {
+            [provider]: {
+              main_chat: true,
+              messaging_delivery_disposition: true,
+              messaging_delivery_disposition_version: 1,
+              models: [{ id: 'test-model', effortChoices: [] }],
+            },
+          },
+        },
+      },
+    } as ServerRequest['config'];
+
+    const result = await initializeAgent(
+      {
+        req,
+        res,
+        agent,
+        loadTools,
+        endpointOption: { endpoint: EModelEndpoint.agents },
+        allowedProviders: new Set([provider]),
+        isInitialAgent: true,
+      },
+      db,
+    );
+
+    expect((result.model_parameters as Record<string, unknown>).__includeRawResponse).toBe(true);
+    expect(
+      (result.model_parameters.configuration.defaultHeaders as Record<string, string>)[
+        'X-Viventium-Audio-Eligible'
+      ],
+    ).toBe('{{LIBRECHAT_BODY_TELEGRAMAUDIOREQUESTED}}');
+    expect(
+      (result.model_parameters.configuration.defaultHeaders as Record<string, string>)[
+        'X-GlassHive-Workspace-Mode'
+      ],
+    ).toBeUndefined();
   });
 });
 
@@ -583,6 +631,14 @@ describe('initializeAgent — provider-native tool ownership', () => {
         'X-GlassHive-Access'
       ],
     ).toBe('workspace');
+    expect(
+      (agent.model_parameters?.configuration?.defaultHeaders as Record<string, string>)[
+        'X-Viventium-Audio-Eligible'
+      ],
+    ).toBeUndefined();
+    expect(
+      (agent.model_parameters as Record<string, unknown>).__includeRawResponse,
+    ).toBeUndefined();
   });
 
   it('derives the runtime Chat Completions contract from capability metadata', async () => {

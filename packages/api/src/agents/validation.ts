@@ -269,6 +269,8 @@ export type ProviderCapabilityRegistry = Record<
     host_tools?: string[];
     conversation_session?: boolean;
     responses_api?: boolean;
+    messaging_delivery_disposition?: boolean;
+    messaging_delivery_disposition_version?: 1;
     default_access?: 'full' | 'workspace';
     allow_full_access?: boolean;
     excluded_mcp_servers?: string[];

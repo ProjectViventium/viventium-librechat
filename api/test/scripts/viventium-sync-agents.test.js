@@ -20,9 +20,18 @@ const {
   shouldApplyRuntimeOverrides,
   shouldRepairRuntimeFieldsForPushMode,
   shouldPushStandaloneBackgroundAgent,
+  loadAgentProviderCapabilityPolicy,
 } = require('../../../scripts/viventium-sync-agents');
 
 describe('viventium-sync-agents args', () => {
+  test('local GlassHive capability preserves canonical full-access validation policy', () => {
+    const policy = loadAgentProviderCapabilityPolicy('local');
+    const glasshive = policy.registry['glasshive-harness'];
+
+    expect(glasshive.default_access).toBe('full');
+    expect(glasshive.allow_full_access).toBe(true);
+  });
+
   test('parseArgs captures mongo uri override', () => {
     const args = parseArgs([
       'pull',

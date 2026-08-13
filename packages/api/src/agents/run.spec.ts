@@ -597,6 +597,82 @@ describe('zero-input graph handoffs', () => {
     expect(result.messages.at(-1)?.content).toBe('Main final after specialist return.');
   });
 
+  it('bounds a pathological handoff bounce with the configured recursion limit', async () => {
+    const graph = new MultiAgentGraph({
+      runId: 'synthetic-bounded-bounce-run',
+      agents: [
+        {
+          agentId: 'main',
+          name: 'Main',
+          provider: Providers.OPENAI,
+          clientOptions: { model: 'synthetic-model' },
+        },
+        {
+          agentId: 'connected',
+          name: 'Connected Accounts',
+          provider: Providers.OPENAI,
+          clientOptions: { model: 'synthetic-model' },
+        },
+      ],
+      edges: [
+        {
+          from: 'main',
+          to: 'connected',
+          edgeType: 'handoff',
+          description: 'Consult Connected Accounts once.',
+        },
+        {
+          from: 'connected',
+          to: 'main',
+          edgeType: 'handoff',
+          description: 'Return the result to Main.',
+        },
+      ],
+    });
+    const calls: string[] = [];
+    graph.overrideModel = {
+      async *stream(_messages: unknown, config: never) {
+        const node = String(
+          (config as { metadata?: { langgraph_node?: string } })?.metadata?.langgraph_node,
+        );
+        const agentId = node.split('agent=').at(-1) || 'main';
+        const destination = agentId === 'main' ? 'connected' : 'main';
+        calls.push(agentId);
+        yield new AIMessageChunk({
+          content: '',
+          tool_call_chunks: [
+            {
+              id: `call-${calls.length}`,
+              name: `lc_transfer_to_${destination}`,
+              args: '{}',
+              index: 0,
+              type: 'tool_call_chunk',
+            },
+          ],
+        });
+      },
+    } as never;
+
+    await expect(
+      graph.createWorkflow().invoke(
+        {
+          messages: [new HumanMessage('Trigger a synthetic pathological handoff bounce.')],
+          agentMessages: [],
+        },
+        {
+          recursionLimit: 4,
+          metadata: {
+            run_id: 'synthetic-bounded-bounce-run',
+            thread_id: 'synthetic-bounded-bounce-thread',
+          },
+          configurable: { thread_id: 'synthetic-bounded-bounce-thread' },
+        },
+      ),
+    ).rejects.toThrow(/recursion/i);
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.length).toBeLessThanOrEqual(4);
+  });
+
   it('falls back only inside the failing participant, preserves its transfer tools, and still leaves Main final', async () => {
     const graph = new MultiAgentGraph({
       runId: 'synthetic-participant-fallback-run',

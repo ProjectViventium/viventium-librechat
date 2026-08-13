@@ -35,6 +35,12 @@ const {
   getResponseSender,
   isEphemeralAgentId,
 } = require('librechat-data-provider');
+/* === VIVENTIUM START ===
+ * Feature: ACL-safe handoff graph initialization
+ * Purpose: A persisted graph edge must not bypass the same VIEW gate used by the Agent API.
+ * === VIVENTIUM END === */
+const { PermissionBits, ResourceType, SystemRoles } = require('librechat-data-provider');
+const { checkPermission } = require('~/server/services/PermissionService');
 const {
   createToolEndCallback,
   getDefaultHandlers,
@@ -95,7 +101,6 @@ const {
   setConversationProviderCapability,
 } = require('~/server/services/viventium/GlassHiveConversationProviderService');
 const {
-  resolveAgentCapabilityProvider,
   selectLibreChatAgentGraph,
 } = require('~/server/services/viventium/agentCapabilityProvider');
 const {
@@ -1025,15 +1030,14 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
   });
 
   /* === VIVENTIUM START ===
-   * Feature: Native provider tool ownership at the graph boundary.
-   * Purpose: Handoff edges compile into model tool schemas. A native-tools endpoint receives
-   * capabilities through its signed broker bundle and must never also receive LibreChat graph
-   * tools; background cortices and Phase B are orchestrated independently of this graph.
+   * Feature: Native provider tool ownership with Agent Builder handoff preservation.
+   * Purpose: Ordinary Agent tools are filtered at initializeAgent's load boundary for native-tool
+   * providers. Preserve the separately configured graph topology so its bounded, zero-input
+   * transfer controls can still route Main to connected agents.
    * === VIVENTIUM END === */
   const primaryGraph = selectLibreChatAgentGraph({
     agentIds: primaryConfig.agent_ids,
     edges: primaryConfig.edges,
-    capability: effectivePrimaryCapability,
   });
   const agent_ids = primaryGraph.agentIds;
   let userMCPAuthMap = primaryConfig.userMCPAuthMap;
@@ -1054,9 +1058,27 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
     const loadedAgent = await getAgent({ id: agentId });
     logDeep('handoff_get_agent', getAgentStart, `agentId=${agentId}`);
     if (!loadedAgent) {
-      logger.warn(
-        `[processAgent] Handoff agent ${agentId} not found, skipping (orphaned reference)`,
-      );
+      logger.warn('[processAgent] Handoff agent unavailable, skipping');
+      skippedAgentIds.add(agentId);
+      return null;
+    }
+    /* === VIVENTIUM START ===
+     * Feature: ACL-safe handoff graph initialization
+     * Purpose: Enforce VIEW before validation, model setup, tool loading, or provider bootstrap.
+     * Match the Agent API's administrator bypass and keep denial logs non-enumerating.
+     * === VIVENTIUM END === */
+    const canViewAgent =
+      req.user?.role === SystemRoles.ADMIN ||
+      (loadedAgent._id != null &&
+        (await checkPermission({
+          userId: req.user?.id,
+          role: req.user?.role,
+          resourceType: ResourceType.AGENT,
+          resourceId: loadedAgent._id,
+          requiredPermission: PermissionBits.VIEW,
+        })));
+    if (!canViewAgent) {
+      logger.warn('[processAgent] Handoff agent unavailable, skipping');
       skippedAgentIds.add(agentId);
       return null;
     }

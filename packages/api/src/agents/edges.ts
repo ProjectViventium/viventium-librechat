@@ -31,16 +31,16 @@ export function getEdgeParticipants(edge: GraphEdge): string[] {
 
 /**
  * Filters out edges that reference non-existent (orphaned) agents.
- * Only filters based on the 'to' field since those are the handoff targets.
+ * A skipped participant can appear as either a handoff source or target, including
+ * reverse/conditional edges whose endpoints are arrays. Every such edge is invalid.
  */
 export function filterOrphanedEdges(edges: GraphEdge[], skippedAgentIds: Set<string>): GraphEdge[] {
   if (!edges || skippedAgentIds.size === 0) {
     return edges;
   }
-  return edges.filter((edge) => {
-    const toIds = Array.isArray(edge.to) ? edge.to : [edge.to];
-    return !toIds.some((id) => typeof id === 'string' && skippedAgentIds.has(id));
-  });
+  return edges.filter(
+    (edge) => !getEdgeParticipants(edge).some((agentId) => skippedAgentIds.has(agentId)),
+  );
 }
 
 /**

@@ -514,7 +514,11 @@ mainAgent:
       edgeType: handoff
     - from: agent_viventium_main_95aeb3
       to: agent_viventium_connected_accounts_95aeb3
-      description: Hand off to Connected Accounts for quick checks and explicitly confirmed email/calendar updates in the user’s Gmail, Outlook, calendars, Drive/OneDrive, Docs/Sheets via connected tools. Use for inbox/email/calendar/file lookups, status checks, summaries, and confirmed non-destructive email/calendar updates. Ask for confirmation before any external write.
+      description: Hand off to Connected Accounts at most once per user turn for quick checks and explicitly confirmed email/calendar updates in the user’s Gmail, Outlook, calendars, Drive/OneDrive, Docs/Sheets via connected tools. If its result or return already appears after the current user request, do not call it again; synthesize instead. Use for inbox/email/calendar/file lookups, status checks, summaries, and confirmed non-destructive email/calendar updates. Ask for confirmation before any external write.
+      edgeType: handoff
+    - from: agent_viventium_connected_accounts_95aeb3
+      to: agent_viventium_main_95aeb3
+      description: Return the Connected Accounts result to the conscious Main Agent for judgment and final synthesis.
       edgeType: handoff
   conversation_starters:
     - What do you want to actually do today?

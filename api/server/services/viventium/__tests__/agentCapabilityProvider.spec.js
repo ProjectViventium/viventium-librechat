@@ -25,30 +25,29 @@ describe('resolveAgentCapabilityProvider', () => {
 });
 
 describe('selectLibreChatAgentGraph', () => {
-  it('omits LibreChat handoff graph tools when the provider owns native tools', () => {
-    const agentIds = ['handoff-agent'];
-    const edges = [{ from: 'main', to: 'handoff-agent', edgeType: 'handoff' }];
+  it.each(['native_tools', 'worker_native_tools'])(
+    'preserves the configured Main to Connected Accounts topology for %s providers',
+    (capabilityName) => {
+      const agentIds = ['connected-accounts-agent'];
+      const edges = [
+        {
+          from: 'main-agent',
+          to: 'connected-accounts-agent',
+          edgeType: 'handoff',
+        },
+      ];
 
-    expect(
-      selectLibreChatAgentGraph({
-        agentIds,
-        edges,
-        capability: { native_tools: true },
-      }),
-    ).toEqual({ agentIds: [], edges: [] });
-    expect(agentIds).toEqual(['handoff-agent']);
-    expect(edges).toHaveLength(1);
-  });
-
-  it('omits LibreChat handoff graph tools for the worker-native capability name', () => {
-    expect(
-      selectLibreChatAgentGraph({
-        agentIds: ['handoff-agent'],
-        edges: [{ from: 'main', to: 'handoff-agent', edgeType: 'handoff' }],
-        capability: { worker_native_tools: true },
-      }),
-    ).toEqual({ agentIds: [], edges: [] });
-  });
+      expect(
+        selectLibreChatAgentGraph({
+          agentIds,
+          edges,
+          capability: { [capabilityName]: true },
+        }),
+      ).toEqual({ agentIds, edges });
+      expect(agentIds).toEqual(['connected-accounts-agent']);
+      expect(edges).toHaveLength(1);
+    },
+  );
 
   it('preserves the normal graph for direct and non-native providers', () => {
     const agentIds = ['handoff-agent'];

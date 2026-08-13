@@ -716,7 +716,8 @@ export async function initializeAgent(
    * A provider declaring worker_native_tools (or the legacy native_tools alias) owns execution
    * through its authenticated capability bundle;
    * retaining the declarations on `agent` lets that bundle remain complete while preventing a
-   * second, incompatible LibreChat tool graph from being bound to the provider request. */
+   * second, incompatible ordinary tool set from being bound to the provider request. Agent
+   * Builder's structural transfer controls are compiled separately from its configured edges. */
   const runtimeAgentTools =
     providerCapability?.worker_native_tools === true || providerCapability?.native_tools === true
       ? []

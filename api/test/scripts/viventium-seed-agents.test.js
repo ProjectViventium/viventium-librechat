@@ -7,6 +7,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const os = require('os');
 const path = require('path');
+const yaml = require('js-yaml');
 
 jest.mock('../../../api/server/services/PermissionService', () => ({
   grantPermission: jest.fn(),
@@ -47,6 +48,35 @@ const {
 } = require('../../../scripts/viventium-generate-managed-agent-migrations');
 
 describe('viventium-seed-agents', () => {
+  test('ships a bounded Connected Accounts consult that returns to Main for final synthesis', () => {
+    const bundle = yaml.load(
+      fs.readFileSync(
+        path.join(__dirname, '../../../viventium/source_of_truth/local.viventium-agents.yaml'),
+        'utf8',
+      ),
+    );
+    const mainId = bundle.mainAgent.id;
+    const connectedId = 'agent_viventium_connected_accounts_95aeb3';
+    const connectedAgent = bundle.handoffAgents.find((agent) => agent.id === connectedId);
+    const consultEdge = bundle.mainAgent.edges.find(
+      (edge) => edge.from === mainId && edge.to === connectedId && edge.edgeType === 'handoff',
+    );
+    const returnEdge = bundle.mainAgent.edges.find(
+      (edge) => edge.from === connectedId && edge.to === mainId && edge.edgeType === 'handoff',
+    );
+
+    expect(bundle.mainAgent.recursion_limit).toBe(40);
+    expect(consultEdge.description).toContain('at most once per user turn');
+    expect(consultEdge.description).toContain('already appears after the current user request');
+    expect(returnEdge).toMatchObject({
+      from: connectedId,
+      to: mainId,
+      edgeType: 'handoff',
+    });
+    expect(returnEdge.description).toContain('Return the Connected Accounts result');
+    expect(connectedAgent.edges).toEqual([]);
+  });
+
   test('loads capability-required providers from the active generated config before reseeding Main', () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-seed-capability-'));
     const generatedConfig = path.join(tempDir, 'local.librechat.yaml');

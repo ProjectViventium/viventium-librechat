@@ -11,10 +11,8 @@ function resolveAgentCapabilityProvider(agent) {
   return String(agent?.endpoint || agent?.provider || '').trim();
 }
 
-function selectLibreChatAgentGraph({ agentIds, edges, capability } = {}) {
-  if (capability?.worker_native_tools === true || capability?.native_tools === true) {
-    return { agentIds: [], edges: [] };
-  }
+/** Tool ownership is filtered during agent initialization; graph topology remains structural. */
+function selectLibreChatAgentGraph({ agentIds, edges } = {}) {
   return { agentIds, edges };
 }
 

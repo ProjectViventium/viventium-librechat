@@ -577,12 +577,21 @@ describe('initializeAgent — provider-native tool ownership', () => {
   it('keeps declared tools on the Agent while skipping LibreChat tool binding', async () => {
     const provider = 'glasshive-harness';
     const { agent, req, res, loadTools, db } = createMocks({ provider });
+    const connectedAccountsAgentId = 'connected-accounts-agent';
     const declaredTools = [
       'file_search',
       'mcp__filesystem__read_file',
       'mcp__glasshive-workers-projects__delegate',
     ];
     agent.tools = [...declaredTools];
+    agent.agent_ids = [connectedAccountsAgentId];
+    agent.edges = [
+      {
+        from: agent.id,
+        to: connectedAccountsAgentId,
+        edgeType: 'handoff',
+      },
+    ];
     req.config = {
       endpoints: {
         agents: {
@@ -606,7 +615,7 @@ describe('initializeAgent — provider-native tool ownership', () => {
       },
     } as ServerRequest['config'];
 
-    await initializeAgent(
+    const result = await initializeAgent(
       {
         req,
         res,
@@ -626,6 +635,16 @@ describe('initializeAgent — provider-native tool ownership', () => {
       }),
     );
     expect(agent.tools).toEqual(declaredTools);
+    expect(result.tools).toEqual([]);
+    expect(result.toolDefinitions).toEqual([]);
+    expect(result.agent_ids).toEqual([connectedAccountsAgentId]);
+    expect(result.edges).toEqual([
+      {
+        from: agent.id,
+        to: connectedAccountsAgentId,
+        edgeType: 'handoff',
+      },
+    ]);
     expect(
       (agent.model_parameters?.configuration?.defaultHeaders as Record<string, string>)[
         'X-GlassHive-Access'

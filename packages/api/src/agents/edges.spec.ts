@@ -82,25 +82,16 @@ describe('edges utilities', () => {
       expect(filterOrphanedEdges(edges, skipped)).toEqual(edges);
     });
 
-    it('should filter out edges with orphaned to targets', () => {
+    it('should filter out every edge that references an orphaned participant', () => {
       const skipped = new Set(['agent_b']);
       const result = filterOrphanedEdges(edges, skipped);
-      // Only filters edges where `to` is in skipped set
-      // agent_a -> agent_b (filtered - to=agent_b is skipped)
-      // agent_a -> agent_c (kept - to=agent_c not skipped)
-      // agent_b -> agent_d (kept - to=agent_d not skipped, from is not checked)
-      expect(result).toHaveLength(2);
-      expect(result.map((e) => e.to)).toEqual(['agent_c', 'agent_d']);
+      expect(result).toEqual([{ from: 'agent_a', to: 'agent_c', edgeType: 'handoff' }]);
     });
 
     it('should filter out multiple orphaned edges', () => {
       const skipped = new Set(['agent_b', 'agent_c']);
       const result = filterOrphanedEdges(edges, skipped);
-      // agent_a -> agent_b (filtered)
-      // agent_a -> agent_c (filtered)
-      // agent_b -> agent_d (kept - to=agent_d not skipped)
-      expect(result).toHaveLength(1);
-      expect(result[0].to).toBe('agent_d');
+      expect(result).toEqual([]);
     });
 
     it('should handle array to values', () => {
@@ -112,6 +103,16 @@ describe('edges utilities', () => {
       const result = filterOrphanedEdges(edgesWithArray, skipped);
       expect(result).toHaveLength(1);
       expect(result[0].to).toEqual(['agent_d']);
+    });
+
+    it('should handle array from values', () => {
+      const edgesWithArray: GraphEdge[] = [
+        { from: ['agent_a', 'agent_b'], to: 'agent_c', edgeType: 'handoff' },
+        { from: ['agent_a'], to: 'agent_d', edgeType: 'handoff' },
+      ];
+      const skipped = new Set(['agent_b']);
+      const result = filterOrphanedEdges(edgesWithArray, skipped);
+      expect(result).toEqual([{ from: ['agent_a'], to: 'agent_d', edgeType: 'handoff' }]);
     });
 
     it('should return original edges array when edges is null/undefined', () => {

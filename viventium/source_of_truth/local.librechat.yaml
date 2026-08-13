@@ -718,6 +718,8 @@ endpoints:
         workspace_binding: true
         conversation_session: true
         worker_native_tools: true
+        default_access: full
+        allow_full_access: true
         host_tools_transport: broker_mcp
         host_tools:
           - file_search

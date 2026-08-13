@@ -855,6 +855,25 @@ export async function initializeAgent(
     (agent.model_parameters as Record<string, unknown>).configuration = options.configOptions;
   }
   /* === VIVENTIUM START ===
+   * Feature: Versioned messaging delivery disposition.
+   * Purpose: Activate raw provider metadata and audio eligibility only through the provider's
+   * declared contract capability; workspace binding remains an independent concern.
+   * === VIVENTIUM END === */
+  const supportsDeliveryDisposition =
+    providerCapability?.messaging_delivery_disposition === true &&
+    providerCapability.messaging_delivery_disposition_version === 1;
+  if (supportsDeliveryDisposition) {
+    const llmConfiguration = ((agent.model_parameters as Record<string, unknown>).configuration ??
+      {}) as Record<string, unknown>;
+    const configuredHeaders = (llmConfiguration.defaultHeaders ?? {}) as Record<string, string>;
+    llmConfiguration.defaultHeaders = {
+      ...configuredHeaders,
+      'X-Viventium-Audio-Eligible': '{{LIBRECHAT_BODY_TELEGRAMAUDIOREQUESTED}}',
+    };
+    (agent.model_parameters as Record<string, unknown>).__includeRawResponse = true;
+    (agent.model_parameters as Record<string, unknown>).configuration = llmConfiguration;
+  }
+  /* === VIVENTIUM START ===
    * Feature: Structured GlassHive conversation binding.
    * Purpose: Supply authenticated Agent/document state to an OpenAI-compatible provider without
    * teaching GlassHive about LibreChat internals. Dynamic request placeholders are resolved only

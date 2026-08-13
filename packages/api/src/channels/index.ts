@@ -8,3 +8,5 @@ export * from './admin';
 export * from './gatewayClient';
 export * from './transports';
 export * from './pairing';
+/* === VIVENTIUM START === Versioned messaging delivery disposition. === VIVENTIUM END === */
+export * from './deliveryDisposition';

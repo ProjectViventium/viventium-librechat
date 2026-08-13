@@ -71,6 +71,7 @@ describe('agentsEndpointSchema provider capability policy', () => {
       host_tools: [],
       activity_stream: false,
       responses_api: false,
+      messaging_delivery_disposition: false,
       default_access: 'workspace',
       allow_full_access: false,
       reviewed_mcp_projection: 'deferred',
@@ -98,6 +99,24 @@ describe('agentsEndpointSchema provider capability policy', () => {
       worker_native_tools: true,
       host_tools_transport: 'broker_mcp',
       host_tools: ['file_search', 'web_search'],
+    });
+  });
+
+  it('preserves the versioned messaging delivery disposition capability', () => {
+    const parsed = agentsEndpointSchema.parse({
+      providerCapabilities: {
+        'synthetic-harness': {
+          label: 'Synthetic Harness',
+          messaging_delivery_disposition: true,
+          messaging_delivery_disposition_version: 1,
+          models: [{ id: 'synthetic:model', label: 'Synthetic Model' }],
+        },
+      },
+    });
+
+    expect(parsed.providerCapabilities['synthetic-harness']).toMatchObject({
+      messaging_delivery_disposition: true,
+      messaging_delivery_disposition_version: 1,
     });
   });
 });

@@ -726,6 +726,8 @@ endpoints:
           - web_search
         activity_stream: true
         responses_api: false
+        messaging_delivery_disposition: true
+        messaging_delivery_disposition_version: 1
         excluded_mcp_servers:
           - glasshive-workers-projects
         models:

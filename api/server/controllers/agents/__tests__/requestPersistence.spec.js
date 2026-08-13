@@ -19,6 +19,26 @@ jest.mock('librechat-data-provider', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  resolveEffectiveDeliveryDisposition: ({ audioEligible, legacySkipVoice, captured }) => {
+    if (legacySkipVoice) {
+      return {
+        version: 1,
+        audio: 'skip',
+        required: audioEligible,
+        valid: true,
+        source: 'legacy_marker',
+      };
+    }
+    if (!audioEligible) return null;
+    if (captured?.status === 'valid') return captured.disposition;
+    return {
+      version: 1,
+      audio: 'skip',
+      required: true,
+      valid: false,
+      source: captured?.status === 'malformed' ? 'required_malformed' : 'required_missing',
+    };
+  },
   sendEvent: jest.fn(),
   getViolationInfo: jest.fn(),
   GenerationJobManager: {
@@ -94,6 +114,35 @@ describe('request persistence helpers', () => {
       sender: 'AI',
     });
     mockSaveMessage.mockResolvedValue({ ok: true });
+  });
+
+  it('requires the structured contract only for an eligible request on a capable route', async () => {
+    const capability = {
+      messaging_delivery_disposition: true,
+      messaging_delivery_disposition_version: 1,
+    };
+    const req = {
+      _viventiumTelegram: true,
+      body: { telegramAudioRequested: true },
+      config: { endpoints: { agents: { providerCapabilities: { harness: capability } } } },
+    };
+
+    await expect(
+      __testables.resolveDeliveryDispositionRequirement(req, {
+        agent: Promise.resolve({ provider: 'harness' }),
+      }),
+    ).resolves.toBe(true);
+    await expect(
+      __testables.resolveDeliveryDispositionRequirement(
+        { ...req, body: { telegramAudioRequested: false } },
+        { agent: Promise.resolve({ provider: 'harness' }) },
+      ),
+    ).resolves.toBe(false);
+    await expect(
+      __testables.resolveDeliveryDispositionRequirement(req, {
+        agent: Promise.resolve({ provider: 'legacy' }),
+      }),
+    ).resolves.toBe(false);
   });
 
   it('persists partial assistant content with the resumable response message id', async () => {
@@ -268,6 +317,7 @@ describe('request persistence helpers', () => {
   it('persists Telegram turns without delivery or provider controls', () => {
     const req = {
       _viventiumTelegram: true,
+      _viventiumDeliveryDispositionRequired: true,
       body: {
         voiceMode: false,
         viventiumSurface: 'telegram',
@@ -304,6 +354,7 @@ describe('request persistence helpers', () => {
   it('preserves Telegram delivery controls only in the authenticated final transport event', () => {
     const req = {
       _viventiumTelegram: true,
+      _viventiumDeliveryDispositionRequired: true,
       body: {
         voiceMode: false,
         viventiumSurface: 'telegram',
@@ -313,6 +364,9 @@ describe('request persistence helpers', () => {
     const raw = {
       messageId: 'assistant-msg-telegram',
       text: 'Copy-ready draft.\n{MSG_BREAK}\nOne afterthought.\n{SKIP_VOICE}',
+      metadata: {
+        existing: 'preserved',
+      },
       content: [
         {
           type: 'text',
@@ -327,8 +381,125 @@ describe('request persistence helpers', () => {
     expect(transmitted.text).toContain('{MSG_BREAK}');
     expect(transmitted.text).toContain('{SKIP_VOICE}');
     expect(transmitted.content[0].text).toContain('{SKIP_VOICE}');
+    expect(transmitted.metadata).toEqual({
+      existing: 'preserved',
+      viventium: {
+        deliveryDisposition: {
+          version: 1,
+          audio: 'skip',
+          required: true,
+          valid: true,
+          source: 'legacy_marker',
+        },
+      },
+    });
     expect(persisted.text).toBe('Copy-ready draft.\n\nOne afterthought.');
     expect(persisted.content[0].text).toBe('Copy-ready draft.\n\nOne afterthought.');
+    expect(persisted.metadata).toEqual(transmitted.metadata);
+  });
+
+  it('carries the validated model disposition through persistence and final replay payloads', () => {
+    const req = {
+      _viventiumTelegram: true,
+      _viventiumDeliveryDispositionRequired: true,
+      body: {
+        voiceMode: false,
+        viventiumSurface: 'telegram',
+        telegramAudioRequested: true,
+      },
+      _viventiumDeliveryDispositionCapture: {
+        status: 'valid',
+        disposition: {
+          version: 1,
+          audio: 'eligible',
+          required: true,
+          valid: true,
+          source: 'model',
+        },
+      },
+    };
+    const raw = {
+      messageId: 'assistant-msg-telegram',
+      text: 'A warm conversational answer.',
+      metadata: { existing: 'preserved' },
+    };
+
+    const persisted = __testables.normalizePersistedAssistantResponse(req, raw);
+    const finalReplayResponse = __testables.normalizeAssistantResponseForTransmit(req, raw);
+
+    expect(persisted.metadata).toEqual({
+      existing: 'preserved',
+      viventium: {
+        deliveryDisposition: {
+          version: 1,
+          audio: 'eligible',
+          required: true,
+          valid: true,
+          source: 'model',
+        },
+      },
+    });
+    expect(finalReplayResponse.metadata).toEqual(persisted.metadata);
+  });
+
+  it('lets a legacy marker in Agent content parts override structured eligibility', () => {
+    const req = {
+      _viventiumTelegram: true,
+      _viventiumDeliveryDispositionRequired: true,
+      body: { viventiumSurface: 'telegram', telegramAudioRequested: true, voiceMode: false },
+      _viventiumDeliveryDispositionCapture: {
+        status: 'valid',
+        disposition: {
+          version: 1,
+          audio: 'eligible',
+          required: true,
+          valid: true,
+          source: 'model',
+        },
+      },
+    };
+
+    const response = __testables.normalizeAssistantResponseForTransmit(req, {
+      text: '',
+      content: [{ type: 'text', text: 'Copy-ready answer.\n{SKIP_VOICE}' }],
+    });
+
+    expect(response.metadata.viventium.deliveryDisposition).toEqual({
+      version: 1,
+      audio: 'skip',
+      required: true,
+      valid: true,
+      source: 'legacy_marker',
+    });
+  });
+
+  it.each([
+    ['missing', 'required_missing'],
+    ['malformed', 'required_malformed'],
+  ])('fails closed when required structured output is %s', (status, source) => {
+    const req = {
+      _viventiumTelegram: true,
+      _viventiumDeliveryDispositionRequired: true,
+      body: {
+        voiceMode: false,
+        viventiumSurface: 'telegram',
+        telegramAudioRequested: true,
+      },
+      _viventiumDeliveryDispositionCapture: { status },
+    };
+
+    const response = __testables.normalizeAssistantResponseForTransmit(req, {
+      messageId: 'assistant-msg-telegram',
+      text: 'Text remains visible.',
+    });
+
+    expect(response.metadata.viventium.deliveryDisposition).toEqual({
+      version: 1,
+      audio: 'skip',
+      required: true,
+      valid: false,
+      source,
+    });
   });
 
   it('does not trust a client-supplied Telegram surface without the route flag', () => {

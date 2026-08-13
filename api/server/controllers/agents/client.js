@@ -120,6 +120,12 @@ const {
   shouldSkipAutomaticMemoryWriter,
   shouldSkipEmotionalReaction,
 } = require('~/server/services/viventium/interactionContext');
+/* === VIVENTIUM START === Versioned messaging delivery disposition. === */
+const {
+  attachEffectiveDeliveryDisposition,
+  resetDeliveryDispositionCapture,
+} = require('~/server/services/viventium/deliveryDisposition');
+/* === VIVENTIUM END === */
 /* === VIVENTIUM START === Voice actor side-effect authority boundary. === VIVENTIUM END === */
 const {
   enforceRestrictedVoiceRequest,
@@ -2437,6 +2443,7 @@ function buildViventiumMcpRequestBody({
     viventiumTelegramChatId: req?.body?.telegramChatId,
     viventiumTelegramUserId: req?.body?.telegramUserId,
     viventiumTelegramMessageId: req?.body?.telegramMessageId,
+    telegramAudioRequested: req?.body?.telegramAudioRequested === true,
     viventiumLogicalTurnId: interactionContext?.logical_turn_id,
     viventiumLogicalTurnRevision: interactionContext?.logical_turn_id
       ? String(interactionContext.revision)
@@ -4167,7 +4174,12 @@ class AgentClient extends BaseClient {
         reason: 'no_visible_reply',
       });
     }
-    return { completion };
+    /* === VIVENTIUM START === Persist provider-owned delivery metadata with final text. === */
+    const dispositionEnvelope = attachEffectiveDeliveryDisposition(this.options.req, {
+      content: completion,
+    });
+    /* === VIVENTIUM END === */
+    return { completion, metadata: dispositionEnvelope.metadata };
   }
 
   /**
@@ -4683,6 +4695,9 @@ class AgentClient extends BaseClient {
     /** @type {ReturnType<createRun>} */
     let run;
     const req = this.options.req;
+    /* === VIVENTIUM START === Fence delivery metadata to the current model run. === */
+    resetDeliveryDispositionCapture(req);
+    /* === VIVENTIUM END === */
     initializeTextTurnTiming(req, {
       turnId: this.responseMessageId,
       mainAgentId: this.options.agent?.id,

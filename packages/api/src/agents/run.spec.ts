@@ -209,6 +209,14 @@ describe('projectGraphLlmFallbacks', () => {
       systemInstructionAppend: 'Synthetic signed capability boundary for this fallback route.',
     });
     const clientOptions = projected[0].clientOptions as unknown as Record<PropertyKey, unknown>;
+    const capabilityOwnerSymbol = Symbol.for(
+      'viventium.agent.messaging.delivery-disposition.capability-owner.v1',
+    );
+    expect(clientOptions[capabilityOwnerSymbol]).toBe('glasshive-harness');
+    expect(Object.getOwnPropertyDescriptor(clientOptions, capabilityOwnerSymbol)).toMatchObject({
+      enumerable: false,
+      writable: false,
+    });
     const refreshSymbol = Symbol.for('viventium.agent.model.route.capability.refresh.v1');
     const projectedRefresh = clientOptions[refreshSymbol] as () => Promise<{
       defaultHeaders: Record<string, string>;
@@ -352,6 +360,11 @@ describe('projectGraphLlmFallbacks', () => {
       tokenCounter: jest.fn(),
     });
     const graph = run.Graph as MultiAgentGraph;
+    expect(
+      (graph.agentContexts.get('main')?.clientOptions as unknown as Record<PropertyKey, unknown>)[
+        Symbol.for('viventium.agent.messaging.delivery-disposition.capability-owner.v1')
+      ],
+    ).toBe('glasshive-harness');
     expect(graph.agentContexts.get('main')?.instructions).toContain('Stable Main instructions.');
     expect(graph.agentContexts.get('main')?.systemRunnable).toBeDefined();
     const observedSystemMessages: string[] = [];

@@ -1,4 +1,5 @@
 const { Providers, GraphEvents, createContentAggregator } = require('@librechat/agents');
+const { resolveHeaders } = require('@librechat/api');
 const { Constants, ContentTypes, EModelEndpoint, Tools } = require('librechat-data-provider');
 const { logger } = require('@librechat/data-schemas');
 const { APIError } = require('openai');
@@ -461,6 +462,7 @@ describe('buildViventiumMcpRequestBody', () => {
         telegramChatId: 'chat-1',
         telegramUserId: 'tg-user-1',
         telegramMessageId: 'tg-msg-1',
+        telegramAudioRequested: true,
       },
     };
     setTrustedInteractionContext(req, {
@@ -494,6 +496,15 @@ describe('buildViventiumMcpRequestBody', () => {
     expect(body.viventiumGlassHiveIdempotencyKey).toBe('main:assistant-1');
     expect(body.viventiumStreamId).toBe('stream-1');
     expect(body.viventiumTelegramChatId).toBe('chat-1');
+    expect(body.telegramAudioRequested).toBe(true);
+    expect(
+      resolveHeaders({
+        headers: {
+          'X-Viventium-Audio-Eligible': '{{LIBRECHAT_BODY_TELEGRAMAUDIOREQUESTED}}',
+        },
+        body,
+      })['X-Viventium-Audio-Eligible'],
+    ).toBe('true');
     expect(body.viventiumLogicalTurnId).toBe('turn-1');
     expect(body.viventiumLogicalTurnRevision).toBe('2');
     expect(body.files[0]).toMatchObject({

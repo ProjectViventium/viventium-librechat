@@ -71,6 +71,11 @@ const {
   isVoiceTaskSuppressedDurably,
   setVoiceTaskOwnerCapabilities,
 } = require('~/server/services/viventium/VoiceTaskService');
+/* === VIVENTIUM START === Versioned messaging delivery disposition. === */
+const {
+  attachEffectiveDeliveryDisposition,
+} = require('~/server/services/viventium/deliveryDisposition');
+/* === VIVENTIUM END === */
 const {
   attachInteractionContextMetadata,
   bindCanonicalInteractionConversation,
@@ -170,6 +175,25 @@ async function resolveRequestStreamId(req, userId, conversationId) {
     requested,
   };
 }
+
+/* === VIVENTIUM START === Capability-gated messaging delivery handshake. === */
+async function resolveDeliveryDispositionRequirement(req, endpointOption) {
+  if (
+    req?._viventiumTelegram !== true ||
+    req?.body?.telegramAudioRequested !== true ||
+    !endpointOption?.agent
+  ) {
+    return false;
+  }
+  const agent = await endpointOption.agent;
+  const provider = String(agent?.endpoint || agent?.provider || '').trim();
+  const capability = req?.config?.endpoints?.agents?.providerCapabilities?.[provider];
+  return (
+    capability?.messaging_delivery_disposition === true &&
+    capability?.messaging_delivery_disposition_version === 1
+  );
+}
+/* === VIVENTIUM END === */
 
 function voiceTaskIdForRequest(req) {
   const taskId = req?.body?.viventiumVoiceTaskId;
@@ -441,7 +465,10 @@ function sanitizePersistedAssistantContent(req, content) {
  * Added: 2026-05-15
  */
 function normalizePersistedAssistantResponse(req, response) {
-  const persistedResponse = sanitizeVoiceAssistantMessageForPersistence(req, response);
+  const persistedResponse = sanitizeVoiceAssistantMessageForPersistence(
+    req,
+    attachEffectiveDeliveryDisposition(req, response),
+  );
   if (req?.body?.voiceMode === true) {
     return persistedResponse;
   }
@@ -474,6 +501,7 @@ function normalizeAssistantResponseForTransmit(req, response) {
     return normalizePersistedAssistantResponse(req, response);
   }
 
+  response = attachEffectiveDeliveryDisposition(req, response);
   const currentText = typeof response?.text === 'string' ? response.text : '';
   const contentText = extractTextFromContentParts(response?.content);
   if (!currentText && contentText) {
@@ -739,6 +767,10 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
   const interactionContext = captureRequestInteractionContext(req, { conversationId, streamId });
   /* === VIVENTIUM NOTE END === */
   const voiceLatencyEnabled = isVoiceLatencyEnabled(req);
+  req._viventiumDeliveryDispositionRequired = await resolveDeliveryDispositionRequirement(
+    req,
+    endpointOption,
+  );
 
   let client = null;
 
@@ -766,6 +798,9 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
         duplicate: true,
         logical_turn_id: claimedInteractionContext?.logical_turn_id,
         revision: claimedInteractionContext?.revision,
+        ...(req._viventiumDeliveryDispositionRequired === true
+          ? { deliveryDispositionRequired: true }
+          : {}),
       });
     }
     await removeSupersededPresentations(req, job.supersededPresentations);
@@ -805,6 +840,9 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
       status: 'started',
       logical_turn_id: claimedInteractionContext?.logical_turn_id,
       revision: claimedInteractionContext?.revision,
+      ...(req._viventiumDeliveryDispositionRequired === true
+        ? { deliveryDispositionRequired: true }
+        : {}),
     });
     if (voiceLatencyEnabled) {
       logVoiceLatencyStage(
@@ -2004,6 +2042,7 @@ module.exports.__testables = {
   attachQaRunReceipt,
   captureRequestInteractionContext,
   resolveRequestStreamId,
+  resolveDeliveryDispositionRequirement,
 };
 
 /* === VIVENTIUM END === */

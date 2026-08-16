@@ -15,7 +15,12 @@ import { memo } from 'react';
  *
  * Added: 2026-01-05
  */
-import type { TMessageContentParts, TAttachment, CortexContentPart } from 'librechat-data-provider';
+import type {
+  TMessageContentParts,
+  TAttachment,
+  CortexContentPart,
+  HarnessActivityContentPart,
+} from 'librechat-data-provider';
 import { OpenAIImageGen, EmptyText, Reasoning, ExecuteCode, AgentUpdate, Text } from './Parts';
 import { ErrorMessage } from './MessageContent';
 import RetrievalCall from './RetrievalCall';
@@ -24,6 +29,7 @@ import CodeAnalyze from './CodeAnalyze';
 import Container from './Container';
 import WebSearch from './WebSearch';
 import CortexCall from './CortexCall';
+import HarnessActivity from './HarnessActivity';
 /* === VIVENTIUM END === */
 import ToolCall from './ToolCall';
 import ImageGen from './ImageGen';
@@ -92,6 +98,18 @@ const Part = memo(
         return null;
       }
       return <Reasoning reasoning={reasoning} isLast={isLast ?? false} />;
+    } else if (part.type === ContentTypes.HARNESS_ACTIVITY) {
+      const activity = (part as HarnessActivityContentPart).harness_activity;
+      if (!activity?.summary) {
+        return null;
+      }
+      return (
+        <HarnessActivity
+          event={activity.event}
+          summary={activity.summary}
+          isSubmitting={isSubmitting}
+        />
+      );
     } else if (part.type === ContentTypes.TOOL_CALL) {
       const toolCall = part[ContentTypes.TOOL_CALL];
 
@@ -252,6 +270,8 @@ const Part = memo(
           error_class={cortexPart.error_class || cortexPart.errorClass}
           silent={cortexPart.silent}
           no_response={cortexPart.no_response}
+          fallback_used={cortexPart.fallback_used}
+          fallback_reason_class={cortexPart.fallback_reason_class}
           status_changed_at={cortexPart.status_changed_at}
           isLast={isLast}
         />

@@ -5,17 +5,13 @@ import Avatar from './Avatar';
 import EnableTwoFactorItem from './TwoFactorAuthentication';
 import BackupCodesItem from './BackupCodesItem';
 import ConnectedAccounts from './ConnectedAccounts';
-import WhoopConnection from './WhoopConnection';
 import ParallelWork from './ParallelWork';
-import { SystemRoles } from 'librechat-data-provider';
 import { useGetStartupConfig } from '~/data-provider';
 import { useAuthContext } from '~/hooks';
 
 function Account() {
   const { user } = useAuthContext();
   const { data: startupConfig } = useGetStartupConfig();
-  const whoopEnabled =
-    startupConfig?.viventiumHealthWhoopEnabled === true && user?.role === SystemRoles.ADMIN;
   const parallelWorkAvailable =
     (startupConfig as { viventiumParallelWorkAvailable?: boolean } | undefined)
       ?.viventiumParallelWorkAvailable === true;
@@ -36,11 +32,6 @@ function Account() {
       <div className="pb-3">
         <ConnectedAccounts />
       </div>
-      {whoopEnabled && (
-        <div className="pb-3">
-          <WhoopConnection />
-        </div>
-      )}
       <div className="pb-3">
         <DisplayUsernameMessages />
       </div>

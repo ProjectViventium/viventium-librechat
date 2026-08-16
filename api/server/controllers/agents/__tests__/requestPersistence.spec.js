@@ -22,6 +22,11 @@ jest.mock('@librechat/data-schemas', () => ({
 jest.mock('librechat-data-provider', () => ({
   Constants: {},
   ContentTypes: { THINK: 'think' },
+  /* === VIVENTIUM START ===
+   * Keep the focused persistence fixture compatible with schemas loaded by voice task support.
+   */
+  FileSources: { local: 'local' },
+  /* === VIVENTIUM END === */
   ViolationTypes: {},
 }));
 

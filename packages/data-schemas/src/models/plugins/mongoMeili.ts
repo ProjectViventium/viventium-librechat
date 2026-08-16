@@ -622,7 +622,12 @@ const createMeiliMongooseModel = ({
         const primaryValue = (this as unknown as Record<string, unknown>)[primaryKey];
         const task = await index.deleteDocument(getMeiliDocumentId(primaryValue));
         await waitForMeiliTasks(index, task);
-        next();
+        /* === VIVENTIUM START ===
+         * Feature: durable search opt-out transitions.
+         * Purpose: callers may use an async completion callback to persist `_meiliIndex=false`.
+         * Await that callback so a cold save cannot resolve before the durable flag update.
+         * === VIVENTIUM END === */
+        await Promise.resolve(next());
       } catch (error) {
         logger.error('[deleteObjectFromMeili] Error deleting document from Meili:', error);
         return next();

@@ -4413,16 +4413,6 @@ describe('AgentClient - titleConvo', () => {
         }),
         expect.any(Object),
       );
-      /* === VIVENTIUM START ===
-       * Regression: detached writer initialization must receive the revision-bearing state reader.
-       * === VIVENTIUM END === */
-      expect(mockCreateMemoryProcessor).toHaveBeenCalledWith(
-        expect.objectContaining({
-          memoryMethods: expect.objectContaining({
-            getAllUserMemoryStates: expect.any(Function),
-          }),
-        }),
-      );
     });
 
     it('should load different agent when memory config agent.id differs from current agent id', async () => {

@@ -3410,10 +3410,6 @@ class AgentClient extends BaseClient {
       deleteMemory: db.deleteMemory,
       getFormattedMemories: db.getFormattedMemories,
       getAllUserMemories: db.getAllUserMemories,
-      /* === VIVENTIUM START ===
-       * The detached writer snapshot needs tombstone revisions for atomic compare-and-set writes.
-       * === VIVENTIUM END === */
-      getAllUserMemoryStates: db.getAllUserMemoryStates,
     };
     const memoryPolicyConfig = {
       validKeys: memoryConfig.validKeys,

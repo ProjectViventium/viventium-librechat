@@ -18,6 +18,7 @@
  * === VIVENTIUM END === */
 
 const { Constants } = require('librechat-data-provider');
+const { getTrustedInteractionContext } = require('./interactionContext');
 
 const GENERIC_WAIT_SAFE_TOOL_NAMES = new Set(['file_search', 'web_search', 'execute_code']);
 
@@ -30,6 +31,10 @@ const normalizeWaitPolicy = (value) => {
 };
 
 const getSurface = (req) => {
+  const trusted = getTrustedInteractionContext(req);
+  if (trusted?.surface) {
+    return trusted.surface;
+  }
   if (req?._viventiumTelegram) {
     return 'telegram';
   }
@@ -40,6 +45,14 @@ const getSurface = (req) => {
     return 'voice';
   }
   return 'web';
+};
+
+const shouldSuppressMcpOAuthFlow = (req) => {
+  const trusted = getTrustedInteractionContext(req);
+  if (trusted) {
+    return trusted.origin !== 'interactive' || trusted.surface === 'workbench';
+  }
+  return false;
 };
 
 const collectLoadedToolNames = ({ toolDefinitions, toolRegistry } = {}) => {
@@ -122,7 +135,10 @@ const getMcpOAuthWaitDecision = (req, pendingOAuthServers, { toolDefinitions, to
           });
 
   let waitForOAuth = false;
-  if (surface === 'telegram' || surface === 'gateway') {
+  const trustedContext = getTrustedInteractionContext(req);
+  if (trustedContext && trustedContext.origin !== 'interactive') {
+    waitForOAuth = false;
+  } else if (surface === 'telegram' || surface === 'gateway' || surface === 'workbench') {
     waitForOAuth = false;
   } else if (mode === 'always') {
     waitForOAuth = allPendingOAuthServers.length > 0;
@@ -190,5 +206,6 @@ module.exports = {
   hasNonPendingSpecializedTools,
   getRelevantPendingOAuthServers,
   getMcpOAuthWaitDecision,
+  shouldSuppressMcpOAuthFlow,
   stripOAuthPendingMcpTools,
 };

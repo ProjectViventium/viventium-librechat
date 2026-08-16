@@ -196,6 +196,7 @@ fi
 sync_viventium_librechat_config() {
     local source_config="$PROJECT_DIR/viventium/source_of_truth/local.librechat.yaml"
     local target_config="$PROJECT_DIR/librechat.yaml"
+    local python_bin="${PYTHON_BIN:-python3}"
 
     if [[ ! -f "$source_config" ]]; then
         return 0
@@ -205,7 +206,7 @@ sync_viventium_librechat_config() {
         local public_root="${VIVENTIUM_PUBLIC_ROOT:-$(cd "$PROJECT_DIR/../.." && pwd)}"
         local prompt_registry_script="$public_root/scripts/viventium/prompt_registry.py"
         if [[ -f "$prompt_registry_script" ]]; then
-            python3 - "$source_config" "$target_config" "$prompt_registry_script" <<'PY'
+            "$python_bin" - "$source_config" "$target_config" "$prompt_registry_script" <<'PY'
 import importlib.util
 import sys
 from pathlib import Path
@@ -251,6 +252,7 @@ ensure_viventium_prompt_bundle() {
     local prompt_registry_script="$public_root/scripts/viventium/prompt_registry.py"
     local state_root="${VIVENTIUM_STATE_ROOT:-$HOME/Library/Application Support/Viventium/state/runtime/isolated}"
     local target="${VIVENTIUM_PROMPT_BUNDLE_PATH:-$state_root/prompt-bundle.json}"
+    local python_bin="${PYTHON_BIN:-python3}"
 
     if [[ ! -f "$prompt_registry_script" ]]; then
         echo -e "${YELLOW}Warning: prompt registry compiler not found: $prompt_registry_script${NC}"
@@ -258,7 +260,7 @@ ensure_viventium_prompt_bundle() {
     fi
 
     mkdir -p "$(dirname "$target")"
-    python3 "$prompt_registry_script" --json-out "$target"
+    "$python_bin" "$prompt_registry_script" --json-out "$target"
     export VIVENTIUM_PROMPT_BUNDLE_PATH="$target"
     echo -e "${GREEN}Prompt registry bundle generated at $target${NC}"
 }

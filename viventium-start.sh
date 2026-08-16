@@ -151,11 +151,35 @@ load_env_file_preserving_existing() {
     return 0
 }
 
-for generated_env_file in \
-    "${VIVENTIUM_ENV_FILE:-}" \
-    "${HOME}/Library/Application Support/Viventium/runtime/service-env/librechat.env" \
-    "${HOME}/Library/Application Support/Viventium/runtime/runtime.env"
-do
+generated_viventium_env_files=()
+if [[ -n "${VIVENTIUM_APP_SUPPORT_DIR:-}" ]]; then
+    if [[ -n "${VIVENTIUM_ENV_FILE:-}" ]]; then
+        case "$VIVENTIUM_ENV_FILE" in
+            "$VIVENTIUM_APP_SUPPORT_DIR"/*)
+                generated_viventium_env_files+=("$VIVENTIUM_ENV_FILE")
+                ;;
+            *)
+                echo -e "${RED}VIVENTIUM_ENV_FILE must belong to VIVENTIUM_APP_SUPPORT_DIR when both are set${NC}"
+                exit 1
+                ;;
+        esac
+    fi
+    generated_viventium_env_files+=(
+        "${VIVENTIUM_APP_SUPPORT_DIR}/runtime/service-env/librechat.env"
+        "${VIVENTIUM_APP_SUPPORT_DIR}/runtime/runtime.env"
+    )
+elif [[ -n "${VIVENTIUM_ENV_FILE:-}" ]]; then
+    generated_viventium_env_files+=("$VIVENTIUM_ENV_FILE")
+else
+    # Only fall back to the default App Support root for a standalone direct
+    # start that was not given an explicit runtime root or generated env file.
+    generated_viventium_env_files+=(
+        "${HOME}/Library/Application Support/Viventium/runtime/service-env/librechat.env"
+        "${HOME}/Library/Application Support/Viventium/runtime/runtime.env"
+    )
+fi
+
+for generated_env_file in "${generated_viventium_env_files[@]}"; do
     [[ -n "$generated_env_file" ]] || continue
     load_env_file_preserving_existing "$generated_env_file" "generated Viventium" || true
 done

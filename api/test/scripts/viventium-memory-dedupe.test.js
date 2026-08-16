@@ -6,6 +6,18 @@ const { buildDuplicateGroups, parseArgs } = require(
 );
 
 describe('viventium-memory-dedupe', () => {
+  test('loads on a fresh clone before the data-schemas package has been built', () => {
+    jest.isolateModules(() => {
+      jest.doMock('@librechat/data-schemas', () => {
+        throw new Error('compiled data-schemas entrypoint is unavailable');
+      });
+
+      expect(() =>
+        require(path.join(__dirname, '../../../scripts/viventium-memory-dedupe.js')),
+      ).not.toThrow();
+    });
+  });
+
   test('plans to keep the newest saved-memory document per user/key', () => {
     const userId = new Types.ObjectId();
     const oldId = new Types.ObjectId();

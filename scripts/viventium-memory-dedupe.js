@@ -16,7 +16,6 @@ const path = require('path');
 require('module-alias')({ base: path.resolve(__dirname, '..', 'api') });
 
 const mongoose = require('mongoose');
-const { createModels } = require('@librechat/data-schemas');
 
 const MEMORY_COLLECTION = 'memoryentries';
 const KEY_COLLECTION = 'keys';
@@ -183,7 +182,6 @@ async function run(options) {
   // Do not let Mongoose race this explicit migration by creating the new
   // unique indexes before duplicate rows have been inspected.
   await mongoose.connect(options.mongoUri, { autoIndex: false });
-  createModels(mongoose);
   const db = mongoose.connection.db;
 
   const memoryResult = await dedupeCollection({

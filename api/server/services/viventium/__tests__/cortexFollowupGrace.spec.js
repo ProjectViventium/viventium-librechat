@@ -14,9 +14,13 @@ describe('cortexFollowupGrace', () => {
    * - Lock the public-facing umbrella phrase so docs, config, and tests stay in sync.
    * === VIVENTIUM END === */
   test('defaults to a 30-second background follow-up window', () => {
-    const { getCortexFollowupGraceMs } = require('../cortexFollowupGrace');
+    const {
+      getCortexFollowupGraceMs,
+      getCortexFollowupGraceSeconds,
+    } = require('../cortexFollowupGrace');
 
     expect(getCortexFollowupGraceMs()).toBe(30000);
+    expect(getCortexFollowupGraceSeconds()).toBe(30);
   });
 
   test('treats non-positive values as disabled', () => {
@@ -32,8 +36,12 @@ describe('cortexFollowupGrace', () => {
 
   test('parses positive floating-point overrides', () => {
     process.env[ENV_NAME] = '2.5';
-    const { getCortexFollowupGraceMs } = require('../cortexFollowupGrace');
+    const {
+      getCortexFollowupGraceMs,
+      getCortexFollowupGraceSeconds,
+    } = require('../cortexFollowupGrace');
 
     expect(getCortexFollowupGraceMs()).toBe(2500);
+    expect(getCortexFollowupGraceSeconds()).toBe(2.5);
   });
 });

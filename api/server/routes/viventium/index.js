@@ -47,8 +47,6 @@ const glasshiveProvider = require('./glasshiveProvider');
  * Feature: Prompt Workbench local launcher route.
  * === VIVENTIUM NOTE === */
 const promptWorkbench = require('./promptWorkbench');
-/* === VIVENTIUM NOTE === WHOOP owner health onboarding */
-const healthWhoop = require('./healthWhoop');
 /* === VIVENTIUM NOTE === Feelings / Emotional Cortex */
 const feelings = require('./feelings');
 /* === VIVENTIUM NOTE === Account-wide adaptive parallel-work preference */
@@ -72,7 +70,6 @@ router.use('/glasshive', glasshive);
 router.use('/glasshive/capabilities', glasshiveCapabilities);
 router.use('/glasshive/providers', glasshiveProvider);
 router.use('/prompt-workbench', promptWorkbench);
-router.use('/health/whoop', healthWhoop);
 router.use('/feelings', feelings);
 router.use('/orchestration', orchestration);
 

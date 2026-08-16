@@ -1,7 +1,16 @@
 const mockSaveMessage = jest.fn();
 const mockGetResumeState = jest.fn();
+const mockMessageModel = { findOneAndDelete: jest.fn() };
+const mockConversationModel = {
+  updateOne: jest.fn(),
+  collection: { updateOne: jest.fn() },
+};
 
 jest.mock('@librechat/data-schemas', () => ({
+  createModels: jest.fn(() => ({
+    Message: mockMessageModel,
+    Conversation: mockConversationModel,
+  })),
   logger: {
     debug: jest.fn(),
     info: jest.fn(),
@@ -44,6 +53,11 @@ jest.mock('~/cache', () => ({
 
 jest.mock('~/models', () => ({
   saveMessage: (...args) => mockSaveMessage(...args),
+}));
+
+jest.mock('~/db/models', () => ({
+  Message: mockMessageModel,
+  Conversation: mockConversationModel,
 }));
 
 jest.mock('~/server/services/viventium/telegramTimingDeep', () => ({

@@ -53,10 +53,6 @@ const {
   resolveViventiumSurface,
   buildWebTextInstructions,
   buildTelegramTextInstructions,
-  /* === VIVENTIUM START ===
-   * Feature: Smart optional audio parity for proactive Telegram follow-ups.
-   * === VIVENTIUM END === */
-  buildTelegramAudioOutputInstructions,
   buildPlaygroundTextInstructions,
   stripVoiceControlTagsForDisplay,
 } = require('~/server/services/viventium/surfacePrompts');
@@ -1656,8 +1652,6 @@ function formatFollowUpPrompt({
   continuationContext = '',
   voiceMode = false,
   surface = '',
-  telegramAudioRequested = false,
-  voiceProvider = '',
   primaryResponseMode = false,
 }) {
   if (!Array.isArray(insights) || insights.length === 0) {
@@ -1680,8 +1674,7 @@ function formatFollowUpPrompt({
       const maxPromptChars = Number.isInteger(requestedMax)
         ? Math.max(700, Math.min(requestedMax, 12_000))
         : 700;
-      const clipped =
-        text.length > maxPromptChars ? `${text.slice(0, maxPromptChars)}...` : text;
+      const clipped = text.length > maxPromptChars ? `${text.slice(0, maxPromptChars)}...` : text;
       return `- ${name}: ${clipped}`;
     })
     .filter(Boolean)
@@ -1718,14 +1711,6 @@ function formatFollowUpPrompt({
    */
   const voiceRules = voiceMode ? buildVoiceFollowUpRules() : '';
   const telegramRules = surface === 'telegram' && !voiceMode ? buildTelegramTextInstructions() : '';
-  /* === VIVENTIUM START ===
-   * Feature: Smart optional audio parity for proactive Telegram follow-ups.
-   * Purpose: Teach the same model-owned skip contract when this follow-up can actually attach audio.
-   * === VIVENTIUM END === */
-  const telegramAudioRules =
-    surface === 'telegram' && !voiceMode && telegramAudioRequested
-      ? buildTelegramAudioOutputInstructions(voiceProvider)
-      : '';
   const webRules =
     !voiceMode && surface !== 'telegram' && surface !== 'playground'
       ? buildWebTextInstructions()
@@ -1742,14 +1727,7 @@ function formatFollowUpPrompt({
           '- Emotional resonance, general support, or “space to talk” is not enough to interrupt Wing Mode.',
         ].join('\n')
       : '';
-  const surfaceRules = [
-    voiceRules,
-    telegramRules,
-    telegramAudioRules,
-    webRules,
-    playgroundRules,
-    wingRules,
-  ]
+  const surfaceRules = [voiceRules, telegramRules, webRules, playgroundRules, wingRules]
     .filter(Boolean)
     .join('\n\n');
   /* === VIVENTIUM NOTE === */
@@ -2231,14 +2209,6 @@ async function generateFollowUpText({
 
   const voiceMode = isVoiceMode(req);
   const surface = resolveViventiumSurface(req);
-  /* === VIVENTIUM START ===
-   * Feature: Smart optional audio parity for proactive Telegram follow-ups.
-   * Preserve the route decision made at Telegram ingress; do not infer eligibility from content.
-   * === VIVENTIUM END === */
-  const telegramAudioRequested =
-    req?.body?.telegramAudioRequested === true ||
-    String(req?.body?.telegramAudioRequested || '').toLowerCase() === 'true';
-  const voiceProvider = String(req?.body?.voiceProvider || '');
   if (surface === 'wing' && primaryResponseMode !== true) {
     return NO_RESPONSE_TAG;
   }
@@ -2250,8 +2220,6 @@ async function generateFollowUpText({
     continuationContext,
     voiceMode,
     surface,
-    telegramAudioRequested,
-    voiceProvider,
     primaryResponseMode,
   });
   if (!prompt) {

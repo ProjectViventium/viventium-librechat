@@ -16,6 +16,9 @@ export interface UserKeyValues {
   oauthType?: string;
   refreshToken?: string;
   oauthExpiresAt?: number;
+  /* === VIVENTIUM START === Persist connected-account reconnect state. */
+  oauthReconnectRequired?: boolean;
+  /* === VIVENTIUM END === */
   accountId?: string;
 }
 

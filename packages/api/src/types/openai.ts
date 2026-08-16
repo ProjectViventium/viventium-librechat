@@ -24,6 +24,15 @@ export interface OpenAIConfigOptions {
   addParams?: Record<string, unknown>;
   dropParams?: string[];
   customParams?: Partial<TConfig['customParams']>;
+  /* === VIVENTIUM START ===
+   * Feature: Connected-account early-401 recovery
+   * Purpose: Keep refresh ownership outside the generic fetch adapter.
+   */
+  connectedAccountAuthRefresh?: () => Promise<{
+    apiKey: string;
+    headers?: Record<string, string>;
+  }>;
+  /* === VIVENTIUM END === */
 }
 
 export type OpenAIConfiguration = OpenAIClientOptions['configuration'];

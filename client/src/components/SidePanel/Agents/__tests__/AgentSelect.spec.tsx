@@ -12,11 +12,8 @@ jest.mock('react-hook-form', () => ({
     control: {},
     reset: mockReset,
   }),
-  Controller: ({
-    render,
-  }: {
-    render: (props: { field: { value: undefined } }) => React.ReactNode;
-  }) => render({ field: { value: undefined } }),
+  Controller: ({ render }: { render: (props: { field: { value: undefined } }) => React.ReactNode }) =>
+    render({ field: { value: undefined } }),
 }));
 
 jest.mock('@librechat/client', () => ({
@@ -53,11 +50,8 @@ jest.mock('librechat-data-provider', () => ({
 jest.mock('~/utils', () => ({
   cn: (...classes: Array<string | false | null | undefined>) => classes.filter(Boolean).join(' '),
   createProviderOption: (provider: string) => ({ value: provider, label: provider }),
-  processAgentOption: ({
+  processAgentOption: ({ agent }: { agent: { id: string; name: string; icon?: React.ReactNode } }) =>
     agent,
-  }: {
-    agent: { id: string; name: string; icon?: React.ReactNode };
-  }) => agent,
   getDefaultAgentFormValues: () => ({
     id: '',
     name: '',
@@ -115,6 +109,10 @@ describe('AgentSelect', () => {
       },
     };
 
+    /* === VIVENTIUM START ===
+     * Feature: Provider capability-aware Parallel Work agent form.
+     * Purpose: Supply the new capability contract in the legacy selector fixture.
+     */
     render(
       <AgentSelect
         agentQuery={{ data: agent, isSuccess: true } as any}
@@ -124,6 +122,7 @@ describe('AgentSelect', () => {
         providerCapabilities={{}}
       />,
     );
+    /* === VIVENTIUM END === */
 
     await waitFor(() => expect(mockReset).toHaveBeenCalledTimes(1));
 

@@ -29,7 +29,7 @@ describe('SpeakerSegmentService', () => {
           isFinal: true,
           speaker: {
             key: 'track:human-1',
-            label: 'Adrien',
+            label: 'Owner One',
             source: 'participant_track',
             attribution: 'verified',
             actorTrust: 'owner_participant',
@@ -53,7 +53,7 @@ describe('SpeakerSegmentService', () => {
       isFinal: true,
       speaker: {
         key: 'track:human-1',
-        label: 'Adrien',
+        label: 'Owner One',
         source: 'participant_track',
         attribution: 'verified',
         actorTrust: 'owner_participant',

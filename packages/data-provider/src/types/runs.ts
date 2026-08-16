@@ -14,6 +14,7 @@ export enum ContentTypes {
   CORTEX_ACTIVATION = 'cortex_activation',
   CORTEX_BREWING = 'cortex_brewing',
   CORTEX_INSIGHT = 'cortex_insight',
+  HARNESS_ACTIVITY = 'harness_activity',
   /* === VIVENTIUM END === */
 }
 
@@ -45,7 +46,26 @@ export interface CortexContentPart {
   direct_action_surface_scopes?: unknown[];
   configured_tools?: number;
   completed_tool_calls?: number;
+  fallback_used?: boolean;
+  fallback_reason_class?: string | null;
   status_changed_at?: string;
+}
+
+/** User-visible harness progress summaries. This must never contain hidden chain-of-thought. */
+export interface HarnessActivityContentPart {
+  type: ContentTypes.HARNESS_ACTIVITY;
+  harness_activity: {
+    event:
+      | 'queued'
+      | 'started'
+      | 'reasoning-summary'
+      | 'plan'
+      | 'tool'
+      | 'file'
+      | 'waiting'
+      | 'fallback-recovery';
+    summary: string;
+  };
 }
 /* === VIVENTIUM END === */
 export enum StepTypes {

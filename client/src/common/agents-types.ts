@@ -13,6 +13,7 @@ import type {
   AgentProvider,
   GraphEdge,
   Agent,
+  GlassHiveOptions,
 } from 'librechat-data-provider';
 import type { OptionWithIcon, ExtendedFile } from './types';
 
@@ -40,6 +41,9 @@ export type AgentForm = {
   instructions: string | null;
   model: string | null;
   model_parameters: AgentModelParameters;
+  /* === VIVENTIUM START === GlassHive core Agent provider */
+  glasshive_options?: GlassHiveOptions;
+  /* === VIVENTIUM END === */
   tools?: string[];
   /** Per-tool configuration options (deferred loading, allowed callers, etc.) */
   tool_options?: AgentToolOptions;

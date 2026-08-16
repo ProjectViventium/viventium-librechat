@@ -155,6 +155,195 @@ describe('RedisJobStore Integration Tests', () => {
   });
 
   describe('Horizontal Scaling - Multi-Instance Simulation', () => {
+    /* === VIVENTIUM START ===
+     * Feature: Owner-safe stream claim ordering.
+     * Purpose: The first logical claimant must reserve a global stream before either owner creates
+     * the job; scheduling order between replicas cannot transfer ownership.
+     * === VIVENTIUM END === */
+    test('reserves a shared stream for the first cross-owner logical claimant', async () => {
+      if (!ioredisClient) return;
+
+      const { RedisJobStore } = await import('../implementations/RedisJobStore');
+      const first = new RedisJobStore(ioredisClient);
+      const second = new RedisJobStore(ioredisClient);
+      const suffix = `${Date.now()}`;
+      const streamId = `claim-order-${suffix}`;
+      const context = (conversation_id: string, source_event_id: string) => ({
+        actor_kind: 'external_user' as const,
+        origin: 'interactive' as const,
+        surface: 'web' as const,
+        conversation_id,
+        revision: 1,
+        source_event_id,
+      });
+
+      const firstClaim = await first.claimLogicalTurn(
+        streamId,
+        `owner-a-${suffix}`,
+        context(`conversation-a-${suffix}`, 'source-a'),
+      );
+      await expect(
+        second.claimLogicalTurn(
+          streamId,
+          `owner-b-${suffix}`,
+          context(`conversation-b-${suffix}`, 'source-b'),
+        ),
+      ).rejects.toMatchObject({ code: 'stream_id_conflict' });
+
+      await expect(
+        first.createJob(streamId, `owner-a-${suffix}`, `conversation-a-${suffix}`, {
+          interactionContext: firstClaim.interactionContext,
+        }),
+      ).resolves.toMatchObject({ streamId, userId: `owner-a-${suffix}` });
+      await expect(first.getJob(streamId)).resolves.toMatchObject({ userId: `owner-a-${suffix}` });
+
+      await first.destroy();
+      await second.destroy();
+    });
+
+    test('newer admitted revision fences an older claim that has not published its job', async () => {
+      if (!ioredisClient) return;
+
+      const { RedisJobStore } = await import('../implementations/RedisJobStore');
+      const first = new RedisJobStore(ioredisClient);
+      const second = new RedisJobStore(ioredisClient);
+      const suffix = `${Date.now()}`;
+      const userId = `owner-${suffix}`;
+      const conversationId = `conversation-${suffix}`;
+      const context = (source_event_id: string) => ({
+        actor_kind: 'external_user' as const,
+        origin: 'interactive' as const,
+        surface: 'web' as const,
+        conversation_id: conversationId,
+        revision: 1,
+        source_event_id,
+      });
+      const older = await first.claimLogicalTurn(`older-${suffix}`, userId, context('source-a'));
+      const newer = await second.claimLogicalTurn(`newer-${suffix}`, userId, context('source-b'));
+
+      await second.createJob(`newer-${suffix}`, userId, conversationId, {
+        interactionContext: newer.interactionContext,
+      });
+      await second.fenceSupersededLogicalTurnClaims(newer);
+
+      await expect(
+        first.createJob(`older-${suffix}`, userId, conversationId, {
+          interactionContext: older.interactionContext,
+        }),
+      ).rejects.toMatchObject({ code: 'stream_id_conflict' });
+      await expect(second.getJob(`newer-${suffix}`)).resolves.toMatchObject({
+        userId,
+        status: 'running',
+      });
+      await first.destroy();
+      await second.destroy();
+    });
+
+    test('failed newer admission can roll back without fencing the older claim', async () => {
+      if (!ioredisClient) return;
+
+      const { RedisJobStore } = await import('../implementations/RedisJobStore');
+      const store = new RedisJobStore(ioredisClient);
+      const suffix = `${Date.now()}`;
+      const userId = `owner-${suffix}`;
+      const conversationId = `conversation-${suffix}`;
+      const context = (source_event_id: string) => ({
+        actor_kind: 'external_user' as const,
+        origin: 'interactive' as const,
+        surface: 'web' as const,
+        conversation_id: conversationId,
+        revision: 1,
+        source_event_id,
+      });
+      const older = await store.claimLogicalTurn(
+        `rollback-older-${suffix}`,
+        userId,
+        context('source-a'),
+      );
+      const newer = await store.claimLogicalTurn(
+        `rollback-newer-${suffix}`,
+        userId,
+        context('source-b'),
+      );
+
+      await expect(
+        store.rollbackLogicalTurnClaim(`rollback-newer-${suffix}`, newer.interactionContext),
+      ).resolves.toBe(true);
+      await expect(
+        store.createJob(`rollback-older-${suffix}`, userId, conversationId, {
+          interactionContext: older.interactionContext,
+        }),
+      ).resolves.toMatchObject({ status: 'running', userId });
+      await store.destroy();
+    });
+
+    test('manager prevents a late older Redis admission after newer job commit', async () => {
+      if (!ioredisClient) return;
+
+      const { RedisJobStore } = await import('../implementations/RedisJobStore');
+      const { InMemoryEventTransport } = await import('../implementations/InMemoryEventTransport');
+      const { GenerationJobManagerClass } = await import('../GenerationJobManager');
+      const firstStore = new RedisJobStore(ioredisClient);
+      const secondStore = new RedisJobStore(ioredisClient);
+      const firstManager = new GenerationJobManagerClass({
+        jobStore: firstStore,
+        eventTransport: new InMemoryEventTransport(),
+        cleanupOnComplete: false,
+      });
+      const secondManager = new GenerationJobManagerClass({
+        jobStore: secondStore,
+        eventTransport: new InMemoryEventTransport(),
+        cleanupOnComplete: false,
+      });
+      const suffix = `${Date.now()}`;
+      const userId = `owner-${suffix}`;
+      const conversationId = `conversation-${suffix}`;
+      const context = (source_event_id: string) => ({
+        actor_kind: 'external_user' as const,
+        origin: 'interactive' as const,
+        surface: 'web' as const,
+        conversation_id: conversationId,
+        revision: 1,
+        source_event_id,
+      });
+      const originalCreate = firstStore.createJob.bind(firstStore);
+      let releaseOlder!: () => void;
+      const olderReleased = new Promise<void>((resolve) => {
+        releaseOlder = resolve;
+      });
+      let markOlderStarted!: () => void;
+      const olderStarted = new Promise<void>((resolve) => {
+        markOlderStarted = resolve;
+      });
+      jest.spyOn(firstStore, 'createJob').mockImplementationOnce(async (...args) => {
+        markOlderStarted();
+        await olderReleased;
+        return originalCreate(...args);
+      });
+
+      const older = firstManager.createJob(`manager-older-${suffix}`, userId, conversationId, {
+        interactionContext: context('source-a'),
+      });
+      await olderStarted;
+      const newer = await secondManager.createJob(
+        `manager-newer-${suffix}`,
+        userId,
+        conversationId,
+        { interactionContext: context('source-b') },
+      );
+      releaseOlder();
+
+      await expect(older).rejects.toMatchObject({ code: 'stream_id_conflict' });
+      expect(newer.status).toBe('running');
+      await expect(firstStore.getJob(`manager-older-${suffix}`)).resolves.toBeNull();
+      await expect(secondStore.getJob(`manager-newer-${suffix}`)).resolves.toMatchObject({
+        status: 'running',
+        userId,
+      });
+      await firstManager.destroy();
+      await secondManager.destroy();
+    });
+
     test('should share job state between two store instances', async () => {
       if (!ioredisClient) {
         return;
@@ -665,6 +854,530 @@ describe('RedisJobStore Integration Tests', () => {
       // Should have cleaned the stale job
       expect(cleaned).toBeGreaterThanOrEqual(1);
 
+      await store.destroy();
+    });
+  });
+
+  describe('Logical turn delivery acknowledgement', () => {
+    test('reconciles persisted web final across a Redis manager restart before follow-up claim', async () => {
+      if (!ioredisClient) {
+        return;
+      }
+      const { GenerationJobManagerClass } = await import('../GenerationJobManager');
+      const { RedisJobStore } = await import('../implementations/RedisJobStore');
+      const { InMemoryEventTransport } = await import('../implementations/InMemoryEventTransport');
+      const store = new RedisJobStore(ioredisClient, { completedTtl: 60 });
+      const firstProcess = new GenerationJobManagerClass({
+        jobStore: store,
+        eventTransport: new InMemoryEventTransport(),
+        cleanupOnComplete: false,
+      });
+      firstProcess.initialize();
+      const suffix = `${Date.now()}`;
+      const conversationId = `restart-conversation-${suffix}`;
+      const context = (source_event_id: string) => ({
+        actor_kind: 'external_user' as const,
+        origin: 'interactive' as const,
+        surface: 'web' as const,
+        conversation_id: conversationId,
+        revision: 1,
+        source_event_id,
+      });
+      const first = await firstProcess.createJob(
+        `restart-web-a-${suffix}`,
+        `restart-user-${suffix}`,
+        conversationId,
+        {
+          interactionContext: context('web-a'),
+          adapterCapabilities: {
+            segment_stability: 'immediate',
+            supersede_scope: 'response_and_authoring',
+          },
+          deliveryPolicy: { commit_authority: 'server' },
+        },
+      );
+      await firstProcess.updateMetadata(`restart-web-a-${suffix}`, {
+        responseMessageId: 'assistant-b',
+      });
+      await firstProcess.markMainResponseComplete(`restart-web-a-${suffix}`, {
+        final: true,
+        responseMessage: { messageId: 'assistant-b', text: 'persisted B' },
+      } as never);
+      await firstProcess.emitDone(`restart-web-a-${suffix}`, {
+        final: true,
+        responseMessage: { messageId: 'assistant-b', text: 'persisted B' },
+      } as never);
+
+      const restartedProcess = new GenerationJobManagerClass({
+        jobStore: store,
+        eventTransport: new InMemoryEventTransport(),
+        cleanupOnComplete: false,
+      });
+      restartedProcess.initialize();
+      const followUp = await restartedProcess.createJob(
+        `restart-web-c-${suffix}`,
+        `restart-user-${suffix}`,
+        conversationId,
+        {
+          interactionContext: context('web-c'),
+          adapterCapabilities: {
+            segment_stability: 'immediate',
+            supersede_scope: 'response_and_authoring',
+          },
+          deliveryPolicy: { commit_authority: 'server' },
+        },
+      );
+
+      expect(followUp.metadata.interactionContext).toMatchObject({ revision: 1 });
+      expect(followUp.metadata.interactionContext?.logical_turn_id).not.toBe(
+        first.metadata.interactionContext?.logical_turn_id,
+      );
+      expect((await restartedProcess.getJob(`restart-web-a-${suffix}`))?.status).toBe('complete');
+      await restartedProcess.destroy();
+    });
+
+    test('isolates scheduler and interactive claims while preserving interactive A+C', async () => {
+      if (!ioredisClient) {
+        return;
+      }
+      const { RedisJobStore } = await import('../implementations/RedisJobStore');
+      const store = new RedisJobStore(ioredisClient);
+      const suffix = `${Date.now()}`;
+      const userId = `scope-user-${suffix}`;
+      const conversationId = `scope-conversation-${suffix}`;
+      const interactiveContext = (source_event_id: string) => ({
+        actor_kind: 'external_user' as const,
+        origin: 'interactive' as const,
+        surface: 'web' as const,
+        conversation_id: conversationId,
+        revision: 1,
+        source_event_id,
+      });
+      const schedulerContext = {
+        actor_kind: 'system' as const,
+        origin: 'scheduler' as const,
+        surface: 'workbench' as const,
+        conversation_id: conversationId,
+        revision: 1,
+        source_event_id: 'scheduler-a',
+      };
+
+      const interactive = await store.claimLogicalTurn(
+        `interactive-a-${suffix}`,
+        userId,
+        interactiveContext('interactive-a'),
+      );
+      const scheduler = await store.claimLogicalTurn(
+        `scheduler-a-${suffix}`,
+        userId,
+        schedulerContext,
+      );
+      expect(scheduler.interactionContext).toMatchObject({ revision: 1 });
+      expect(scheduler.interactionContext.logical_turn_id).not.toBe(
+        interactive.interactionContext.logical_turn_id,
+      );
+
+      const interactiveFollowUp = await store.claimLogicalTurn(
+        `interactive-c-${suffix}`,
+        userId,
+        interactiveContext('interactive-c'),
+      );
+      expect(interactiveFollowUp.interactionContext).toMatchObject({
+        revision: 2,
+        logical_turn_id: interactive.interactionContext.logical_turn_id,
+      });
+      await store.destroy();
+    });
+
+    test('atomically retains ordered rapid source segments with replay identity dedupe', async () => {
+      if (!ioredisClient) return;
+      const { RedisJobStore } = await import('../implementations/RedisJobStore');
+      const store = new RedisJobStore(ioredisClient);
+      const suffix = `${Date.now()}`;
+      const userId = `source-user-${suffix}`;
+      const conversationId = `source-conversation-${suffix}`;
+      const context = (
+        source_event_id: string,
+        text: string,
+        source_files: Array<{
+          file_id: string;
+          filename?: string;
+          type?: string;
+          media_group_index?: number;
+        }> = [],
+      ) => ({
+        actor_kind: 'external_user' as const,
+        origin: 'interactive' as const,
+        surface: 'telegram' as const,
+        conversation_id: conversationId,
+        revision: 1,
+        source_event_id,
+        source_segments: [
+          {
+            ordinal: 0,
+            source_event_id,
+            source_index: 0,
+            text,
+            ...(source_files.length ? { source_files } : {}),
+          },
+        ],
+      });
+
+      await store.claimLogicalTurn(
+        `source-a-${suffix}`,
+        userId,
+        context('event-a', 'same exact request', [
+          { file_id: 'file-a', filename: 'a.png', type: 'image/png', media_group_index: 0 },
+        ]),
+      );
+      const second = await store.claimLogicalTurn(
+        `source-b-${suffix}`,
+        userId,
+        context('event-b', 'same exact request'),
+      );
+      const replay = await store.claimLogicalTurn(
+        `source-b-replay-${suffix}`,
+        userId,
+        context('event-b', 'same exact request'),
+      );
+      const third = await store.claimLogicalTurn(
+        `source-c-${suffix}`,
+        userId,
+        context('event-c', 'third request'),
+      );
+
+      expect(replay).toMatchObject({ status: 'duplicate', streamId: `source-b-${suffix}` });
+      expect(second.interactionContext.source_segments).toHaveLength(2);
+      expect(third.interactionContext.source_segments).toEqual([
+        {
+          ordinal: 0,
+          source_event_id: 'event-a',
+          source_index: 0,
+          text: 'same exact request',
+          source_files: [
+            { file_id: 'file-a', filename: 'a.png', type: 'image/png', media_group_index: 0 },
+          ],
+        },
+        { ordinal: 1, source_event_id: 'event-b', source_index: 0, text: 'same exact request' },
+        { ordinal: 2, source_event_id: 'event-c', source_index: 0, text: 'third request' },
+      ]);
+      await store.destroy();
+    });
+
+    test('atomically evicts oldest large source context while retaining the newest event identity', async () => {
+      if (!ioredisClient) return;
+      const { RedisJobStore } = await import('../implementations/RedisJobStore');
+      const store = new RedisJobStore(ioredisClient);
+      const suffix = `${Date.now()}`;
+      const userId = `large-source-user-${suffix}`;
+      const conversationId = `large-source-conversation-${suffix}`;
+      const context = (sourceEventId: string, fill: string) => ({
+        actor_kind: 'external_user' as const,
+        origin: 'interactive' as const,
+        surface: 'web' as const,
+        conversation_id: conversationId,
+        revision: 1,
+        source_event_id: sourceEventId,
+        source_segments: [
+          {
+            ordinal: 0,
+            source_event_id: sourceEventId,
+            source_index: 0,
+            text: fill.repeat(30 * 1024),
+          },
+        ],
+      });
+
+      await store.claimLogicalTurn(`large-a-${suffix}`, userId, context('event-large-a', 'a'));
+      await store.claimLogicalTurn(`large-b-${suffix}`, userId, context('event-large-b', 'b'));
+      const third = await store.claimLogicalTurn(
+        `large-c-${suffix}`,
+        userId,
+        context('event-large-c', 'c'),
+      );
+
+      expect(third.interactionContext).toMatchObject({
+        source_event_id: 'event-large-c',
+        source_segments_overflow_count: 1,
+      });
+      expect(
+        third.interactionContext.source_segments?.map((segment) => segment.source_event_id),
+      ).toEqual(['event-large-b', 'event-large-c']);
+      await store.destroy();
+    });
+
+    test('rolls back a failed claim for retry without clobbering a concurrent takeover', async () => {
+      if (!ioredisClient) {
+        return;
+      }
+      const { RedisJobStore } = await import('../implementations/RedisJobStore');
+      const store = new RedisJobStore(ioredisClient);
+      const suffix = `${Date.now()}`;
+      const context = (conversation_id: string, source_event_id: string) => ({
+        actor_kind: 'external_user' as const,
+        origin: 'interactive' as const,
+        surface: 'telegram' as const,
+        conversation_id,
+        revision: 1,
+        source_event_id,
+      });
+
+      const retryConversation = `rollback-retry-${suffix}`;
+      const failed = await store.claimLogicalTurn(
+        `failed-${suffix}`,
+        `user-${suffix}`,
+        context(retryConversation, 'same-event'),
+      );
+      await expect(
+        store.rollbackLogicalTurnClaim(`failed-${suffix}`, failed.interactionContext),
+      ).resolves.toBe(true);
+      const retry = await store.claimLogicalTurn(
+        `retry-${suffix}`,
+        `user-${suffix}`,
+        context(retryConversation, 'same-event'),
+      );
+      expect(retry).toMatchObject({ status: 'claimed' });
+      expect(retry.interactionContext.revision).toBe(1);
+      expect(retry.interactionContext.logical_turn_id).not.toBe(
+        failed.interactionContext.logical_turn_id,
+      );
+
+      const takeoverConversation = `rollback-takeover-${suffix}`;
+      const original = await store.claimLogicalTurn(
+        `original-${suffix}`,
+        `user-${suffix}`,
+        context(takeoverConversation, 'original-event'),
+      );
+      const takeover = await store.claimLogicalTurn(
+        `takeover-${suffix}`,
+        `user-${suffix}`,
+        context(takeoverConversation, 'takeover-event'),
+      );
+      await expect(
+        store.rollbackLogicalTurnClaim(`original-${suffix}`, original.interactionContext),
+      ).resolves.toBe(false);
+      await expect(
+        store.resolveDeliveryOwner(takeover.interactionContext.logical_turn_id!, 2),
+      ).resolves.toBe(`takeover-${suffix}`);
+      await expect(
+        store.forgetMissingSourceEventReceipt(original.interactionContext, `original-${suffix}`),
+      ).resolves.toBe(true);
+      const retryAfterTakeover = await store.claimLogicalTurn(
+        `retry-after-takeover-${suffix}`,
+        `user-${suffix}`,
+        context(takeoverConversation, 'original-event'),
+      );
+      expect(retryAfterTakeover).toMatchObject({ status: 'claimed' });
+      expect(retryAfterTakeover.interactionContext).toMatchObject({ revision: 3 });
+      await store.destroy();
+    });
+
+    test('keeps superseded outcomes revision-scoped and starts fresh after current commit', async () => {
+      if (!ioredisClient) {
+        return;
+      }
+      const { RedisJobStore } = await import('../implementations/RedisJobStore');
+      const store = new RedisJobStore(ioredisClient);
+      const suffix = `${Date.now()}`;
+      for (const supersededState of ['partial_removed', 'failed'] as const) {
+        const scopeSuffix = `${suffix}-${supersededState}`;
+        const userId = `ack-user-${scopeSuffix}`;
+        const conversationId = `ack-conversation-${scopeSuffix}`;
+        const context = (source_event_id: string) => ({
+          actor_kind: 'external_user' as const,
+          origin: 'interactive' as const,
+          surface: 'telegram' as const,
+          conversation_id: conversationId,
+          revision: 1,
+          source_event_id,
+        });
+
+        const first = await store.claimLogicalTurn(
+          `ack-stream-a-${scopeSuffix}`,
+          userId,
+          context('ack-event-a'),
+        );
+        const second = await store.claimLogicalTurn(
+          `ack-stream-b-${scopeSuffix}`,
+          userId,
+          context('ack-event-b'),
+        );
+        expect(second.interactionContext).toMatchObject({
+          logical_turn_id: first.interactionContext.logical_turn_id,
+          revision: 2,
+        });
+
+        const superseded = {
+          logical_turn_id: first.interactionContext.logical_turn_id!,
+          revision: 1,
+          state: supersededState,
+          presentation_ref: `old-${supersededState}`,
+        };
+        await expect(store.acknowledgeDelivery(superseded)).resolves.toMatchObject({
+          status: 'recorded',
+          acknowledgement: superseded,
+          idempotent: false,
+        });
+        await expect(store.acknowledgeDelivery(superseded)).resolves.toMatchObject({
+          status: 'recorded',
+          acknowledgement: superseded,
+          idempotent: true,
+        });
+        await expect(
+          store.acknowledgeDelivery({
+            ...superseded,
+            state: supersededState === 'failed' ? 'partial_removed' : 'failed',
+          }),
+        ).resolves.toMatchObject({ status: 'conflict' });
+        await expect(
+          store.acknowledgeDelivery({
+            logical_turn_id: first.interactionContext.logical_turn_id!,
+            revision: 1,
+            state: 'committed',
+          }),
+        ).resolves.toMatchObject({ status: 'stale_revision' });
+
+        const committed = {
+          logical_turn_id: second.interactionContext.logical_turn_id!,
+          revision: 2,
+          state: 'committed' as const,
+          presentation_ref: 'telegram-message-1',
+        };
+        await expect(store.acknowledgeDelivery(committed)).resolves.toMatchObject({
+          status: 'recorded',
+          acknowledgement: committed,
+          idempotent: false,
+        });
+        await expect(store.acknowledgeDelivery(committed)).resolves.toMatchObject({
+          status: 'recorded',
+          acknowledgement: committed,
+          idempotent: true,
+        });
+
+        const next = await store.claimLogicalTurn(
+          `ack-stream-c-${scopeSuffix}`,
+          userId,
+          context('ack-event-c'),
+        );
+        expect(next.interactionContext.revision).toBe(1);
+        expect(next.interactionContext.logical_turn_id).not.toBe(
+          second.interactionContext.logical_turn_id,
+        );
+      }
+      await store.destroy();
+    });
+
+    test('closes the current claim on failed delivery without letting an old removal affect revision 2', async () => {
+      if (!ioredisClient) {
+        return;
+      }
+      const { RedisJobStore } = await import('../implementations/RedisJobStore');
+      const store = new RedisJobStore(ioredisClient);
+      const suffix = `${Date.now()}`;
+      const conversationId = `failed-close-conversation-${suffix}`;
+      const userId = `failed-close-user-${suffix}`;
+      const context = (source_event_id: string) => ({
+        actor_kind: 'external_user' as const,
+        origin: 'interactive' as const,
+        surface: 'telegram' as const,
+        conversation_id: conversationId,
+        revision: 1,
+        source_event_id,
+      });
+      const first = await store.claimLogicalTurn(
+        `failed-close-a-${suffix}`,
+        userId,
+        context('event-a'),
+      );
+      const second = await store.claimLogicalTurn(
+        `failed-close-b-${suffix}`,
+        userId,
+        context('event-b'),
+      );
+
+      await expect(
+        store.acknowledgeDelivery({
+          logical_turn_id: first.interactionContext.logical_turn_id!,
+          revision: 1,
+          state: 'partial_removed',
+        }),
+      ).resolves.toMatchObject({ status: 'recorded' });
+      await expect(
+        store.acknowledgeDelivery({
+          logical_turn_id: second.interactionContext.logical_turn_id!,
+          revision: 2,
+          state: 'failed',
+        }),
+      ).resolves.toMatchObject({ status: 'recorded' });
+
+      const next = await store.claimLogicalTurn(
+        `failed-close-c-${suffix}`,
+        userId,
+        context('event-c'),
+      );
+      expect(next.interactionContext).toMatchObject({ revision: 1 });
+      expect(next.interactionContext.logical_turn_id).not.toBe(
+        second.interactionContext.logical_turn_id,
+      );
+      await store.destroy();
+    });
+
+    test('prunes prior revision and receipt fields when a new logical turn begins', async () => {
+      if (!ioredisClient) {
+        return;
+      }
+      const { createHash } = await import('crypto');
+      const { RedisJobStore } = await import('../implementations/RedisJobStore');
+      const store = new RedisJobStore(ioredisClient);
+      const suffix = `${Date.now()}`;
+      const userId = `bounded-user-${suffix}`;
+      const conversationId = `bounded-conversation-${suffix}`;
+      const context = (source_event_id: string) => ({
+        actor_kind: 'external_user' as const,
+        origin: 'interactive' as const,
+        surface: 'telegram' as const,
+        conversation_id: conversationId,
+        revision: 1,
+        source_event_id,
+      });
+
+      const first = await store.claimLogicalTurn(
+        `bounded-stream-a-${suffix}`,
+        userId,
+        context('bounded-event-a'),
+      );
+      const second = await store.claimLogicalTurn(
+        `bounded-stream-b-${suffix}`,
+        userId,
+        context('bounded-event-b'),
+      );
+      await store.acknowledgeDelivery({
+        logical_turn_id: first.interactionContext.logical_turn_id!,
+        revision: 1,
+        state: 'partial_removed',
+      });
+      await store.acknowledgeDelivery({
+        logical_turn_id: second.interactionContext.logical_turn_id!,
+        revision: 2,
+        state: 'committed',
+      });
+      await store.claimLogicalTurn(
+        `bounded-stream-c-${suffix}`,
+        userId,
+        context('bounded-event-c'),
+      );
+
+      const scope = createHash('sha256')
+        .update([userId, conversationId, 'external_user', 'interactive'].join('\u0000'))
+        .digest('hex');
+      const fields = await ioredisClient.hkeys(`stream:logical:{${scope}}`);
+      expect(fields.filter((field) => field.startsWith('receipt:'))).toEqual([
+        'receipt:bounded-event-c',
+      ]);
+      expect(fields.filter((field) => field.startsWith('streamForRevision:'))).toEqual([
+        'streamForRevision:1',
+      ]);
+      expect(fields.filter((field) => field.startsWith('deliveryAck:'))).toEqual([]);
       await store.destroy();
     });
   });

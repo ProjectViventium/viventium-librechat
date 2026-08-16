@@ -7,7 +7,13 @@ const {
   writeAttachmentEvent,
   createToolExecuteHandler,
 } = require('@librechat/api');
-const { Tools, StepTypes, FileContext, ErrorTypes } = require('librechat-data-provider');
+const {
+  Tools,
+  StepTypes,
+  ContentTypes,
+  FileContext,
+  ErrorTypes,
+} = require('librechat-data-provider');
 const {
   EnvVar,
   Providers,
@@ -36,6 +42,10 @@ const {
 const {
   createMessageDeltaBoundaryNormalizer,
 } = require('~/server/services/viventium/voiceDeltaAggregation');
+const {
+  markMainProviderAttemptStart,
+  markMainProviderFirstOutput,
+} = require('~/server/services/viventium/textTurnTiming');
 /* === VIVENTIUM END === */
 
 /* === VIVENTIUM NOTE ===
@@ -78,6 +88,162 @@ const logVoiceLatencyStage = (req, stage, stageStartAt = null, details = '') => 
  * Added: 2026-05-14
  */
 const isVoiceModeRequest = (req) => req?.body?.voiceMode === true;
+
+const harnessActivityDelta = (data) => {
+  const content = Array.isArray(data?.delta?.content) ? data.delta.content : [];
+  const summary = content
+    .map((part) => part?.think || part?.text || '')
+    .filter(Boolean)
+    .join('');
+  if (!summary) {
+    return data;
+  }
+  return {
+    ...data,
+    delta: {
+      ...data.delta,
+      content: [
+        {
+          type: ContentTypes.HARNESS_ACTIVITY,
+          harness_activity: {
+            event: 'reasoning-summary',
+            summary,
+          },
+        },
+      ],
+    },
+  };
+};
+
+/* === VIVENTIUM START ===
+ * Feature: GlassHive activity durability across upstream aggregation.
+ * Purpose: Keep a request-local, public-safe copy of capability-declared activity parts so a
+ * reasoning-step aggregation miss cannot erase completed connected-tool evidence on refresh.
+ * Native payloads, arguments, results, provider IDs, and call IDs are deliberately not retained.
+ */
+const captureHarnessActivityParts = (req, data, sourceEvent = data) => {
+  if (!req || typeof req !== 'object') {
+    return;
+  }
+  const content = Array.isArray(data?.delta?.content) ? data.delta.content : [];
+  const safeParts = content
+    .filter((part) => part?.type === ContentTypes.HARNESS_ACTIVITY)
+    .map((part) => {
+      const event = String(part?.harness_activity?.event || '').trim();
+      const summary = String(part?.harness_activity?.summary || '');
+      if (!event || !summary) {
+        return null;
+      }
+      return {
+        type: ContentTypes.HARNESS_ACTIVITY,
+        harness_activity: { event, summary },
+      };
+    })
+    .filter(Boolean);
+  if (!safeParts.length) {
+    return;
+  }
+  if (!(req._viventiumCapturedHarnessActivityEvents instanceof WeakSet)) {
+    Object.defineProperty(req, '_viventiumCapturedHarnessActivityEvents', {
+      value: new WeakSet(),
+      configurable: true,
+      enumerable: false,
+      writable: false,
+    });
+  }
+  if (sourceEvent && typeof sourceEvent === 'object') {
+    if (req._viventiumCapturedHarnessActivityEvents.has(sourceEvent)) {
+      return;
+    }
+    req._viventiumCapturedHarnessActivityEvents.add(sourceEvent);
+  }
+  if (!Array.isArray(req._viventiumCapturedHarnessActivityParts)) {
+    Object.defineProperty(req, '_viventiumCapturedHarnessActivityParts', {
+      value: [],
+      configurable: true,
+      enumerable: false,
+      writable: false,
+    });
+  }
+  const remainingCapacity = Math.max(0, 128 - req._viventiumCapturedHarnessActivityParts.length);
+  req._viventiumCapturedHarnessActivityParts.push(...safeParts.slice(0, remainingCapacity));
+};
+/* === VIVENTIUM END === */
+
+/* === VIVENTIUM START ===
+ * Feature: GlassHive duplicate-author guard.
+ * Purpose: OpenAI-compatible streams begin with a role-only message delta before the native
+ * harness process starts. Only visible assistant content is an authoring commit point; otherwise
+ * a configured direct fallback must remain available for a pre-start harness failure.
+ */
+const hasVisibleMessageDelta = (data) => {
+  const content = data?.delta?.content;
+  if (typeof content === 'string') {
+    return content.length > 0;
+  }
+  if (!Array.isArray(content)) {
+    return false;
+  }
+  return content.some((part) => {
+    if (typeof part === 'string') {
+      return part.length > 0;
+    }
+    if (!part || typeof part !== 'object') {
+      return false;
+    }
+    return [part.text, part.output_text, part.content].some(
+      (value) => typeof value === 'string' && value.length > 0,
+    );
+  });
+};
+
+const hasProviderStreamOutput = (data) => {
+  const chunk = data?.chunk;
+  const message = chunk?.message || chunk;
+  if (!message || typeof message !== 'object') {
+    return false;
+  }
+  if (
+    [message.tool_call_chunks, message.tool_calls].some(
+      (value) => Array.isArray(value) && value.length > 0,
+    )
+  ) {
+    return true;
+  }
+  const content = message.content;
+  if (typeof content === 'string') {
+    return content.length > 0;
+  }
+  return (
+    Array.isArray(content) &&
+    content.some((part) => {
+      if (typeof part === 'string') return part.length > 0;
+      if (!part || typeof part !== 'object') return false;
+      return [part.text, part.output_text, part.content].some(
+        (value) => typeof value === 'string' && value.length > 0,
+      );
+    })
+  );
+};
+
+const hasReasoningDelta = (data) => {
+  const content = data?.delta?.content;
+  if (!Array.isArray(content)) {
+    return false;
+  }
+  return content.some((part) => {
+    if (typeof part === 'string') {
+      return part.length > 0;
+    }
+    if (!part || typeof part !== 'object') {
+      return false;
+    }
+    return [part.think, part.thinking, part.reasoning, part.reasoningText?.text].some(
+      (value) => typeof value === 'string' && value.length > 0,
+    );
+  });
+};
+/* === VIVENTIUM END === */
 
 const getTextDeltaMode = (req) => {
   const configured = req?.body?.viventiumTextDeltaMode ?? req?.body?.viventiumStreamTextDeltaMode;
@@ -386,6 +552,12 @@ function getDefaultHandlers({
   const handlers = {
     [GraphEvents.CHAT_MODEL_START]: {
       handle: async (_event, _data, metadata) => {
+        /* === VIVENTIUM START ===
+         * Feature: Parallel text provider-attempt timing.
+         * Purpose: Correlate each structural Main graph invocation without conflating re-entry.
+         */
+        markMainProviderAttemptStart(req, metadata);
+        /* === VIVENTIUM END === */
         const metric = markVoiceOrchEvent(req, 'chat_model_start');
         if (metric?.firstSeen) {
           const modelName =
@@ -395,6 +567,12 @@ function getDefaultHandlers({
           logVoiceLatencyStage(
             req,
             'first_chat_model_start',
+            getVoiceProcessStreamStartAt(req),
+            `model=${modelName}`,
+          );
+          logVoiceLatencyStage(
+            req,
+            'agent_generation_start',
             getVoiceProcessStreamStartAt(req),
             `model=${modelName}`,
           );
@@ -410,10 +588,19 @@ function getDefaultHandlers({
       },
     },
     [GraphEvents.LLM_STREAM]: {
-      handle: async () => {
+      handle: async (_event, _data, metadata) => {
+        /* === VIVENTIUM START ===
+         * Feature: Parallel text first-provider-output timing.
+         * Purpose: Record the actual first provider token independently from visible paint.
+         */
+        if (hasProviderStreamOutput(_data)) {
+          markMainProviderFirstOutput(req, metadata, { kind: 'provider_token' });
+        }
+        /* === VIVENTIUM END === */
         const metric = markVoiceOrchEvent(req, 'llm_stream');
         if (metric?.firstSeen) {
           logVoiceLatencyStage(req, 'first_llm_stream', getVoiceProcessStreamStartAt(req), '');
+          logVoiceLatencyStage(req, 'first_model_token', getVoiceProcessStreamStartAt(req), '');
         }
       },
     },
@@ -640,6 +827,22 @@ function getDefaultHandlers({
        * @param {GraphRunnableConfig['configurable']} [metadata] The runnable metadata.
        */
       handle: async (event, data, metadata) => {
+        /* === VIVENTIUM START ===
+         * Feature: GlassHive duplicate-author guard.
+         * Purpose: Visible provider-authored content proves the native harness has begun authoring.
+         * A role-only compatibility delta does not lock fallback because it precedes native start.
+         * === VIVENTIUM END === */
+        if (req?._viventiumHarnessExecutionEnabled === true && hasVisibleMessageDelta(data)) {
+          req._viventiumHarnessInvocationStarted = true;
+        }
+        /* === VIVENTIUM START ===
+         * Feature: Parallel text first-visible-output timing.
+         * Purpose: Separate accepted visible Main text from provider and reasoning arrival.
+         */
+        if (hasVisibleMessageDelta(data)) {
+          markMainProviderFirstOutput(req, metadata, { kind: 'visible_text_delta' });
+        }
+        /* === VIVENTIUM END === */
         markVoiceOrchEvent(req, 'on_message_delta');
         /* === VIVENTIUM START ===
          * Feature: Deep Telegram timing instrumentation (toggleable)
@@ -717,6 +920,22 @@ function getDefaultHandlers({
        * @param {GraphRunnableConfig['configurable']} [metadata] The runnable metadata.
        */
       handle: async (event, data, metadata) => {
+        /* === VIVENTIUM START ===
+         * Feature: Parallel text first-output timing.
+         * Purpose: Normalized reasoning is real provider output even before visible answer text.
+         */
+        if (hasReasoningDelta(data)) {
+          markMainProviderFirstOutput(req, metadata, { kind: 'provider_token' });
+        }
+        /* === VIVENTIUM END === */
+        /* === VIVENTIUM START ===
+         * Feature: GlassHive duplicate-author guard.
+         * Purpose: GlassHive emits normalized activity through the reasoning channel before
+         * ordinary text. Treat that first accepted delta as the authoring-run commit point.
+         * === VIVENTIUM END === */
+        if (req?._viventiumHarnessExecutionEnabled === true) {
+          req._viventiumHarnessInvocationStarted = true;
+        }
         const reasoningMetric = markVoiceOrchEvent(req, 'on_reasoning_delta');
         if (reasoningMetric?.firstSeen) {
           logVoiceLatencyStage(req, 'first_reasoning_delta', getVoiceProcessStreamStartAt(req), '');
@@ -752,11 +971,19 @@ function getDefaultHandlers({
           return;
         }
         /* === VIVENTIUM END === */
-        if (checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node)) {
-          await emitEvent(res, streamId, { event, data });
-        } else if (!metadata?.hide_sequential_outputs) {
-          await emitEvent(res, streamId, { event, data });
+        const visibleData = req?._viventiumHarnessActivityEnabled
+          ? harnessActivityDelta(data)
+          : data;
+        if (req?._viventiumHarnessActivityEnabled === true) {
+          captureHarnessActivityParts(req, visibleData, data);
         }
+        if (checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node)) {
+          await emitEvent(res, streamId, { event, data: visibleData });
+        } else if (!metadata?.hide_sequential_outputs) {
+          await emitEvent(res, streamId, { event, data: visibleData });
+        }
+        // The closed upstream aggregator understands THINK only. Persisted content is converted
+        // to HARNESS_ACTIVITY at AgentClient's provider-aware finalization seam.
         aggregateContent({ event, data });
       },
     },

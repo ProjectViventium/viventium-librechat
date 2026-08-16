@@ -1,9 +1,122 @@
+// VIVENTIUM START: verify Parallel Work content grouping and rendering contracts.
 import { Constants, ContentTypes, ToolCallTypes } from 'librechat-data-provider';
 import type { TMessageContentParts } from 'librechat-data-provider';
 import { groupParallelContent } from '../ParallelContent';
-import { filterRenderableContentParts } from '../contentPartUtils';
+import {
+  annotateRenderableContentParts,
+  filterRenderableContentParts,
+  getRenderableContentPartIdentity,
+} from '../contentPartUtils';
 
 describe('filterRenderableContentParts', () => {
+  it('uses the persisted stream identity after finalization inserts earlier activity parts', () => {
+    const content = annotateRenderableContentParts(
+      [
+        { type: ContentTypes.CORTEX_INSIGHT },
+        { type: ContentTypes.HARNESS_ACTIVITY },
+        {
+          type: ContentTypes.TEXT,
+          text: 'Main answer.',
+          agentId: 'agent-main',
+          viventium_render_part_id: 'content:1',
+        } as TMessageContentParts,
+      ],
+      'agent-main',
+    );
+
+    const rendered = (filterRenderableContentParts(content) ?? []).filter(
+      (part): part is TMessageContentParts => part?.type === ContentTypes.TEXT,
+    );
+
+    expect(getRenderableContentPartIdentity(rendered[0])).toEqual({
+      agentId: 'agent-main',
+      partId: 'content:1',
+    });
+  });
+
+  it('preserves exact persisted identity when sanitizer removal shifts rendered text order', () => {
+    const content = annotateRenderableContentParts(
+      [
+        {
+          type: ContentTypes.TEXT,
+          text: 'Tool: workspace_status {"workspace_id":"wrk_public_safe"}',
+          agentId: 'agent-main',
+        },
+        {
+          type: ContentTypes.TEXT,
+          text: 'Consultant answer.',
+          agentId: 'agent-consultant',
+        },
+      ],
+      'agent-main',
+    );
+
+    const rendered = (filterRenderableContentParts(content) ?? []).filter(
+      (part): part is TMessageContentParts => part != null,
+    );
+
+    expect(rendered).toHaveLength(1);
+    expect(getRenderableContentPartIdentity(rendered[0])).toEqual({
+      agentId: 'agent-consultant',
+      partId: 'content:1',
+    });
+  });
+
+  it('keeps adjacent text from different agents separate and merges same-agent stream fragments', () => {
+    const rendered =
+      filterRenderableContentParts(
+        annotateRenderableContentParts(
+          [
+            { type: ContentTypes.TEXT, text: 'Consultant.', agentId: 'agent-consultant' },
+            { type: ContentTypes.TEXT, text: 'Main ', agentId: 'agent-main' },
+            { type: ContentTypes.TEXT, text: 'answer.', agentId: 'agent-main' },
+          ],
+          'agent-main',
+        ),
+      ) ?? [];
+
+    expect(rendered).toHaveLength(2);
+    expect(rendered.map(getRenderableContentPartIdentity)).toEqual([
+      { agentId: 'agent-consultant', partId: 'content:0' },
+      { agentId: 'agent-main', partId: 'content:1,2' },
+    ]);
+    expect(rendered[1]).toMatchObject({ text: 'Main answer.' });
+  });
+
+  it('preserves Main persisted identity when parallel columns reorder rendered parts', () => {
+    const rendered =
+      filterRenderableContentParts(
+        annotateRenderableContentParts(
+          [
+            {
+              type: ContentTypes.TEXT,
+              text: 'Consultant parallel answer.',
+              agentId: 'agent-main____1',
+              groupId: 1,
+            },
+            {
+              type: ContentTypes.TEXT,
+              text: 'Main parallel answer.',
+              agentId: 'agent-main',
+              groupId: 1,
+            },
+          ],
+          'agent-main',
+        ),
+      ) ?? [];
+
+    const { parallelSections } = groupParallelContent(rendered);
+
+    expect(parallelSections[0].columns.map((column) => column.agentId)).toEqual([
+      'agent-main',
+      'agent-main____1',
+    ]);
+    expect(getRenderableContentPartIdentity(parallelSections[0].columns[0].parts[0].part)).toEqual({
+      agentId: 'agent-main',
+      partId: 'content:1',
+    });
+  });
+
   it('keeps undefined content empty', () => {
     expect(filterRenderableContentParts(undefined)).toBeUndefined();
     expect(filterRenderableContentParts(null)).toBeUndefined();
@@ -577,7 +690,8 @@ describe('filterRenderableContentParts', () => {
           args: '{"execution_mode":"host"}',
           type: ToolCallTypes.TOOL_CALL,
           progress: 1,
-          output: 'Error executing tool workspace_launch: host-native GlassHive workers are disabled',
+          output:
+            'Error executing tool workspace_launch: host-native GlassHive workers are disabled',
         },
       },
       {
@@ -588,7 +702,8 @@ describe('filterRenderableContentParts', () => {
           args: '{"execution_mode":"docker"}',
           type: ToolCallTypes.TOOL_CALL,
           progress: 1,
-          output: '{"status":"dispatched","view_steer_url":"https://example.com/watch/public-safe"}',
+          output:
+            '{"status":"dispatched","view_steer_url":"https://example.com/watch/public-safe"}',
         },
       },
       { type: ContentTypes.TEXT, text: 'Started in GlassHive.' },
@@ -660,6 +775,7 @@ describe('filterRenderableContentParts', () => {
     expect(filterRenderableContentParts(parts)).toBe(parts);
   });
 });
+// VIVENTIUM END
 
 describe('groupParallelContent', () => {
   it('keeps malformed non-array content empty instead of crashing', () => {

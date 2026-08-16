@@ -529,6 +529,22 @@ describe('resolveHeaders', () => {
     expect(result['X-Conversation']).toBe('conv-123');
   });
 
+  /* === VIVENTIUM START ===
+   * Feature: Trusted Parallel Work handoff.
+   * Purpose: Resolve only the server-authored bounded turn context into GlassHive headers.
+   */
+  it('should resolve GlassHive per-turn context headers', () => {
+    const headers = {
+      'X-GlassHive-Turn-Context-B64': '{{LIBRECHAT_BODY_VIVENTIUMGLASSHIVETURNCONTEXTB64}}',
+    };
+    const body = { viventiumGlassHiveTurnContextB64: 'c3ludGhldGljLXR1cm4tY29udGV4dA==' };
+
+    const result = resolveHeaders({ headers, body });
+
+    expect(result['X-GlassHive-Turn-Context-B64']).toBe('c3ludGhldGljLXR1cm4tY29udGV4dA==');
+  });
+  /* === VIVENTIUM END === */
+
   describe('non-string header values (type guard tests)', () => {
     it('should handle numeric header values without crashing', () => {
       const headers = {
@@ -1245,6 +1261,13 @@ describe('processMCPEnv', () => {
       viventiumTelegramChatId: 'chat-123',
       viventiumTelegramUserId: 'tg-user-123',
       viventiumTelegramMessageId: 'tg-msg-123',
+      /* === VIVENTIUM START ===
+       * Feature: Trusted Parallel Work handoff.
+       * Purpose: Preserve logical-turn identity while keeping raw surface identities inside Core.
+       */
+      viventiumLogicalTurnId: 'turn-123',
+      viventiumLogicalTurnRevision: '2',
+      /* === VIVENTIUM END === */
       files: [{ file_id: 'file-123', filename: 'brief.txt' }],
       attachments: [{ file_id: 'file-123', filename: 'brief.txt' }],
       tool_resources: { code_interpreter: { file_ids: ['file-123'] } },
@@ -1266,8 +1289,20 @@ describe('processMCPEnv', () => {
     }
     expect(result.headers?.['X-Viventium-Surface']).toBe('telegram');
     expect(result.headers?.['X-Viventium-Stream-Id']).toBe('stream-123');
-    expect(result.headers?.['X-Viventium-Voice-Call-Session-Id']).toBe('call-123');
-    expect(result.headers?.['X-Viventium-Telegram-Chat-Id']).toBe('chat-123');
+    /* === VIVENTIUM START ===
+     * Feature: Trusted Parallel Work handoff.
+     * Purpose: Mission roots receive opaque origin bindings, never raw Telegram or Voice identity.
+     */
+    // Mission roots receive only Core-owned opaque delivery/origin bindings. Raw surface
+    // identities remain inside Core and must never be projected into GlassHive MCP headers.
+    expect(result.headers?.['X-Viventium-Voice-Call-Session-Id']).toBeUndefined();
+    expect(result.headers?.['X-Viventium-Voice-Request-Id']).toBeUndefined();
+    expect(result.headers?.['X-Viventium-Telegram-Chat-Id']).toBeUndefined();
+    expect(result.headers?.['X-Viventium-Telegram-User-Id']).toBeUndefined();
+    expect(result.headers?.['X-Viventium-Telegram-Message-Id']).toBeUndefined();
+    expect(result.headers?.['X-Viventium-Logical-Turn-Id']).toBe('turn-123');
+    expect(result.headers?.['X-Viventium-Logical-Turn-Revision']).toBe('2');
+    /* === VIVENTIUM END === */
     expect(result.headers?.['X-Viventium-Request-Files']?.startsWith('b64:')).toBe(true);
     expect(result.headers?.['X-Viventium-Tool-Resources']?.startsWith('b64:')).toBe(true);
 

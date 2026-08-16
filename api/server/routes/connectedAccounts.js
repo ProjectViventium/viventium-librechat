@@ -4,7 +4,7 @@ const http = require('http');
 const jwt = require('jsonwebtoken');
 const { logger } = require('@librechat/data-schemas');
 const { EModelEndpoint } = require('librechat-data-provider');
-const { getBasePath, isEnabled } = require('@librechat/api');
+const { getBasePath, isEnabled, clearMemoryWriterHealth } = require('@librechat/api');
 const { updateUserKey } = require('~/models');
 const { requireJwtAuth } = require('~/server/middleware');
 
@@ -17,6 +17,7 @@ const OPENAI_LOCAL_CALLBACK_PATH = '/auth/callback';
 const OPENAI_LOCAL_REDIRECT_URI = `http://localhost:${OPENAI_LOCAL_CALLBACK_PORT}${OPENAI_LOCAL_CALLBACK_PATH}`;
 const ANTHROPIC_MANUAL_REDIRECT_URI = 'https://platform.claude.com/oauth/code/callback';
 const ANTHROPIC_PENDING_STATE_TTL_MS = OAUTH_STATE_TTL_SECONDS * 1000;
+const CONNECTED_ACCOUNT_ATTEMPT_TTL_MS = OAUTH_STATE_TTL_SECONDS * 1000;
 
 const OPENAI_CODEX_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
 const ANTHROPIC_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
@@ -41,6 +42,12 @@ const CONNECTED_ACCOUNTS_RETURN_ORIGIN_ENV = 'VIVENTIUM_CONNECTED_ACCOUNTS_RETUR
 let openAILocalCallbackServerPromise;
 let openAILocalCallbackServerStatus;
 const pendingAnthropicStates = new Map();
+/* === VIVENTIUM START ===
+ * Feature: Attempt-scoped connected-account OAuth completion.
+ * Purpose: A pre-existing provider key or stale callback must not complete or overwrite a newer flow.
+ * === VIVENTIUM END === */
+const connectedAccountAttempts = new Map();
+const latestConnectedAccountAttemptIds = new Map();
 
 class OAuthFlowError extends Error {
   constructor(code, message, status = 400) {
@@ -86,11 +93,10 @@ function getDefaultConnectedAccountsOrigin() {
   return (process.env.DOMAIN_SERVER || 'http://localhost:3080').replace(/\/+$/, '');
 }
 
-function getServerOrigin(req) {
+function getServerOrigin() {
   /* === VIVENTIUM START ===
-   * Feature: Configurable connected-account OAuth browser return origin.
-   * Purpose: Use an explicit browser return override only when configured; otherwise preserve
-   * existing DOMAIN_SERVER/request-host behavior.
+   * Feature: Trusted connected-account OAuth browser return origin.
+   * Purpose: OAuth state must never derive its signed callback origin from a request Host header.
    * === VIVENTIUM END === */
   const configuredReturnOrigin = process.env[CONNECTED_ACCOUNTS_RETURN_ORIGIN_ENV];
   if (configuredReturnOrigin && configuredReturnOrigin.trim()) {
@@ -99,7 +105,9 @@ function getServerOrigin(req) {
   if (process.env.DOMAIN_SERVER) {
     return process.env.DOMAIN_SERVER.replace(/\/+$/, '');
   }
-  return `${req.protocol}://${req.get('host')}`;
+  throw new Error(
+    `Missing ${CONNECTED_ACCOUNTS_RETURN_ORIGIN_ENV} or DOMAIN_SERVER for connected-account OAuth`,
+  );
 }
 
 function getOpenAICallbackRedirectUri() {
@@ -124,7 +132,15 @@ function createPKCE() {
   return { verifier, challenge };
 }
 
-function createOAuthState({ provider, userId, codeVerifier, redirectUri, serverOrigin, secret }) {
+function createOAuthState({
+  provider,
+  userId,
+  codeVerifier,
+  redirectUri,
+  serverOrigin,
+  attemptId,
+  secret,
+}) {
   return jwt.sign(
     {
       provider,
@@ -132,11 +148,98 @@ function createOAuthState({ provider, userId, codeVerifier, redirectUri, serverO
       codeVerifier,
       redirectUri,
       serverOrigin,
+      attemptId,
       nonce: crypto.randomUUID(),
     },
     secret,
     { expiresIn: OAUTH_STATE_TTL_SECONDS },
   );
+}
+
+function getConnectedAccountAttemptOwnerKey(userId, provider) {
+  return `${userId}:${provider}`;
+}
+
+function purgeConnectedAccountAttempts() {
+  const now = Date.now();
+  for (const [attemptId, attempt] of connectedAccountAttempts.entries()) {
+    if (!attempt || attempt.expiresAt <= now) {
+      connectedAccountAttempts.delete(attemptId);
+      const ownerKey = attempt
+        ? getConnectedAccountAttemptOwnerKey(attempt.userId, attempt.provider)
+        : null;
+      if (ownerKey && latestConnectedAccountAttemptIds.get(ownerKey) === attemptId) {
+        latestConnectedAccountAttemptIds.delete(ownerKey);
+      }
+    }
+  }
+}
+
+function registerConnectedAccountAttempt({ userId, provider }) {
+  purgeConnectedAccountAttempts();
+  const ownerKey = getConnectedAccountAttemptOwnerKey(userId, provider);
+  const previousAttemptId = latestConnectedAccountAttemptIds.get(ownerKey);
+  const previousAttempt = previousAttemptId
+    ? connectedAccountAttempts.get(previousAttemptId)
+    : null;
+  if (previousAttempt && ['pending', 'exchanging'].includes(previousAttempt.status)) {
+    previousAttempt.status = 'superseded';
+  }
+
+  const attemptId = crypto.randomUUID();
+  connectedAccountAttempts.set(attemptId, {
+    attemptId,
+    userId,
+    provider,
+    status: 'pending',
+    expiresAt: Date.now() + CONNECTED_ACCOUNT_ATTEMPT_TTL_MS,
+  });
+  latestConnectedAccountAttemptIds.set(ownerKey, attemptId);
+  return attemptId;
+}
+
+function getConnectedAccountAttempt(attemptId) {
+  purgeConnectedAccountAttempts();
+  return typeof attemptId === 'string' ? (connectedAccountAttempts.get(attemptId) ?? null) : null;
+}
+
+function assertConnectedAccountAttemptStatus({ attemptId, userId, provider, expectedStatus }) {
+  const attempt = getConnectedAccountAttempt(attemptId);
+  if (!attempt || attempt.userId !== userId || attempt.provider !== provider) {
+    throw new OAuthFlowError('invalid_state', 'OAuth state does not match an active attempt');
+  }
+
+  const ownerKey = getConnectedAccountAttemptOwnerKey(userId, provider);
+  if (
+    attempt.status === 'superseded' ||
+    latestConnectedAccountAttemptIds.get(ownerKey) !== attemptId
+  ) {
+    throw new OAuthFlowError('superseded_flow', 'OAuth flow was superseded by a newer attempt');
+  }
+  if (attempt.status !== expectedStatus) {
+    throw new OAuthFlowError('invalid_state', 'OAuth attempt is no longer pending');
+  }
+
+  return attempt;
+}
+
+function claimConnectedAccountAttempt({ attemptId, userId, provider }) {
+  const attempt = assertConnectedAccountAttemptStatus({
+    attemptId,
+    userId,
+    provider,
+    expectedStatus: 'pending',
+  });
+
+  attempt.status = 'exchanging';
+  return attempt;
+}
+
+function setConnectedAccountAttemptStatus(attemptId, status) {
+  const attempt = getConnectedAccountAttempt(attemptId);
+  if (attempt && attempt.status !== 'superseded') {
+    attempt.status = status;
+  }
 }
 
 function purgePendingAnthropicStates() {
@@ -148,7 +251,14 @@ function purgePendingAnthropicStates() {
   }
 }
 
-function setPendingAnthropicState({ state, userId, codeVerifier, redirectUri, serverOrigin }) {
+function setPendingAnthropicState({
+  state,
+  userId,
+  codeVerifier,
+  redirectUri,
+  serverOrigin,
+  attemptId,
+}) {
   purgePendingAnthropicStates();
   pendingAnthropicStates.set(state, {
     provider: 'anthropic',
@@ -156,6 +266,7 @@ function setPendingAnthropicState({ state, userId, codeVerifier, redirectUri, se
     codeVerifier,
     redirectUri,
     serverOrigin,
+    attemptId,
     expiresAt: Date.now() + ANTHROPIC_PENDING_STATE_TTL_MS,
   });
 }
@@ -456,7 +567,12 @@ function createOpenAICallbackUrl(provider, errorCode, state, params = {}) {
       ? decoded.serverOrigin
       : getDefaultConnectedAccountsOrigin();
   const redirectPath =
-    errorCode != null ? errorRedirect(errorCode, provider) : successRedirect(provider, params);
+    errorCode != null
+      ? errorRedirect(errorCode, provider)
+      : successRedirect(provider, {
+          ...params,
+          ...(typeof decoded?.attemptId === 'string' ? { attemptId: decoded.attemptId } : {}),
+        });
   return toAbsolutePath(serverOrigin, redirectPath);
 }
 
@@ -496,7 +612,8 @@ async function completeConnectedAccount({ provider, code, state, secret, expecte
     typeof decodedState.userId !== 'string' ||
     typeof decodedState.codeVerifier !== 'string' ||
     typeof decodedState.redirectUri !== 'string' ||
-    typeof decodedState.serverOrigin !== 'string'
+    typeof decodedState.serverOrigin !== 'string' ||
+    typeof decodedState.attemptId !== 'string'
   ) {
     throw new OAuthFlowError('invalid_state', 'Invalid OAuth state payload');
   }
@@ -504,6 +621,12 @@ async function completeConnectedAccount({ provider, code, state, secret, expecte
   if (typeof expectedUserId === 'string' && decodedState.userId !== expectedUserId) {
     throw new OAuthFlowError('invalid_state', 'OAuth state does not match active user');
   }
+
+  claimConnectedAccountAttempt({
+    attemptId: decodedState.attemptId,
+    userId: decodedState.userId,
+    provider,
+  });
 
   try {
     const tokenData =
@@ -520,6 +643,13 @@ async function completeConnectedAccount({ provider, code, state, secret, expecte
             redirectUri: decodedState.redirectUri,
           });
 
+    assertConnectedAccountAttemptStatus({
+      attemptId: decodedState.attemptId,
+      userId: decodedState.userId,
+      provider,
+      expectedStatus: 'exchanging',
+    });
+
     const endpoint = getProviderEndpoint(provider);
     const value =
       provider === 'openai' ? buildOpenAIUserValue(tokenData) : buildAnthropicUserValue(tokenData);
@@ -533,12 +663,23 @@ async function completeConnectedAccount({ provider, code, state, secret, expecte
         : getTokenExpiryDate(tokenData.expires_in),
     });
 
+    clearMemoryWriterHealth({
+      userId: decodedState.userId,
+      provider: endpoint,
+    });
+
     if (provider === 'anthropic') {
       deletePendingAnthropicState(state);
     }
 
+    setConnectedAccountAttemptStatus(decodedState.attemptId, 'completed');
+
     return { decodedState, value };
   } catch (callbackError) {
+    setConnectedAccountAttemptStatus(decodedState.attemptId, 'failed');
+    if (callbackError instanceof OAuthFlowError) {
+      throw callbackError;
+    }
     logger.error('[Connected Accounts] OAuth completion failed', callbackError);
     throw new OAuthFlowError('callback_failed', 'OAuth completion failed', 500);
   }
@@ -565,7 +706,7 @@ async function handleOpenAILocalCallback(req, res) {
   }
 
   try {
-    const { value } = await completeConnectedAccount({
+    const { decodedState, value } = await completeConnectedAccount({
       provider,
       code,
       state,
@@ -574,6 +715,7 @@ async function handleOpenAILocalCallback(req, res) {
 
     const successLocation = createOpenAICallbackUrl(provider, null, state, {
       ...(value.accountId ? { accountId: value.accountId } : {}),
+      attemptId: decodedState.attemptId,
     });
 
     res.statusCode = 302;
@@ -662,9 +804,10 @@ router.get('/:provider/start', requireJwtAuth, async (req, res) => {
 
   try {
     const { verifier, challenge } = createPKCE();
+    const attemptId = registerConnectedAccountAttempt({ userId: req.user.id, provider });
     const redirectUri =
       provider === 'openai' ? getOpenAICallbackRedirectUri() : getAnthropicRedirectUri();
-    const serverOrigin = getServerOrigin(req);
+    const serverOrigin = getServerOrigin();
     const state =
       provider === 'openai'
         ? createOAuthState({
@@ -673,6 +816,7 @@ router.get('/:provider/start', requireJwtAuth, async (req, res) => {
             codeVerifier: verifier,
             redirectUri,
             serverOrigin,
+            attemptId,
             secret,
           })
         : verifier;
@@ -684,6 +828,7 @@ router.get('/:provider/start', requireJwtAuth, async (req, res) => {
         codeVerifier: verifier,
         redirectUri,
         serverOrigin,
+        attemptId,
       });
     }
 
@@ -705,11 +850,34 @@ router.get('/:provider/start', requireJwtAuth, async (req, res) => {
     return res.status(200).json({
       authUrl,
       flowMode,
+      attemptId,
     });
   } catch (error) {
     logger.error('[Connected Accounts] Failed to initialize OAuth flow', error);
     return res.status(500).json({ error: 'oauth_start_failed' });
   }
+});
+
+router.get('/:provider/status', requireJwtAuth, (req, res) => {
+  const provider = req.params.provider;
+  const attemptId = typeof req.query.attemptId === 'string' ? req.query.attemptId : '';
+
+  if (!isSupportedProvider(provider)) {
+    return res.status(404).json({ error: 'Unsupported provider' });
+  }
+  if (!isConnectedAccountsEnabled()) {
+    return res.status(404).json({ error: 'oauth_not_enabled' });
+  }
+  if (!attemptId) {
+    return res.status(400).json({ error: 'missing_attempt_id' });
+  }
+
+  const attempt = getConnectedAccountAttempt(attemptId);
+  if (!attempt || attempt.provider !== provider || attempt.userId !== req.user.id) {
+    return res.status(404).json({ error: 'oauth_attempt_not_found' });
+  }
+
+  return res.status(200).json({ attemptId, status: attempt.status });
 });
 
 router.post('/:provider/complete', requireJwtAuth, async (req, res) => {
@@ -725,7 +893,7 @@ router.post('/:provider/complete', requireJwtAuth, async (req, res) => {
 
   try {
     const { code, state } = getProviderCodeAndState(req.body);
-    const { value } = await completeConnectedAccount({
+    const { decodedState, value } = await completeConnectedAccount({
       provider,
       code,
       state,
@@ -736,6 +904,7 @@ router.post('/:provider/complete', requireJwtAuth, async (req, res) => {
     return res.status(200).json({
       success: true,
       provider,
+      attemptId: decodedState.attemptId,
       ...(provider === 'openai' && value.accountId ? { accountId: value.accountId } : {}),
     });
   } catch (error) {
@@ -770,7 +939,7 @@ router.get('/:provider/callback', async (req, res) => {
   }
 
   try {
-    const { value } = await completeConnectedAccount({
+    const { decodedState, value } = await completeConnectedAccount({
       provider,
       code,
       state,
@@ -779,6 +948,7 @@ router.get('/:provider/callback', async (req, res) => {
 
     return res.redirect(
       successRedirect(provider, {
+        attemptId: decodedState.attemptId,
         ...(provider === 'openai' ? { accountId: value.accountId } : {}),
       }),
     );

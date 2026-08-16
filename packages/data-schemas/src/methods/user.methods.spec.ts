@@ -527,12 +527,15 @@ describe('User Methods - Database Tests', () => {
         provider: 'local',
       });
 
-      const updated = await methods.updateUserViventiumVoicePreferences(user._id?.toString() || '', {
-        livekitPlayground: {
-          stt: { provider: 'openai', variant: 'gpt-4o-transcribe' },
-          tts: { provider: 'cartesia', variant: 'sonic-2' },
+      const updated = await methods.updateUserViventiumVoicePreferences(
+        user._id?.toString() || '',
+        {
+          livekitPlayground: {
+            stt: { provider: 'openai', variant: 'gpt-4o-transcribe' },
+            tts: { provider: 'cartesia', variant: 'sonic-2' },
+          },
         },
-      });
+      );
 
       expect(updated?.viventiumVoicePreferences?.livekitPlayground).toEqual({
         stt: { provider: 'openai', variant: 'gpt-4o-transcribe' },
@@ -553,13 +556,146 @@ describe('User Methods - Database Tests', () => {
         },
       });
 
-      const updated = await methods.updateUserViventiumVoicePreferences(user._id?.toString() || '', {
-        livekitPlayground: null,
-      });
+      const updated = await methods.updateUserViventiumVoicePreferences(
+        user._id?.toString() || '',
+        {
+          livekitPlayground: null,
+        },
+      );
 
       expect(updated?.viventiumVoicePreferences?.livekitPlayground).toBeNull();
     });
   });
+
+  /* === VIVENTIUM START ===
+   * Feature: Account-wide Parallel Work preference.
+   * Purpose: Prove focused defaults, atomic known-work fencing, and epoch-safe concurrent clears.
+   */
+  describe('updateUserViventiumOrchestrationPreferences', () => {
+    test('should leave orchestration unset so the declared agent default remains authoritative', async () => {
+      const user = await User.create({
+        name: 'Focused User',
+        email: 'focused-orchestration@example.com',
+        provider: 'local',
+      });
+
+      expect(user.personalization?.orchestration_mode).toBeUndefined();
+    });
+
+    test('should persist parallel mode without replacing unrelated user preferences', async () => {
+      const user = await User.create({
+        name: 'Parallel User',
+        email: 'parallel-orchestration@example.com',
+        provider: 'local',
+        personalization: { memories: false, conversation_recall: true },
+      });
+
+      const updated = await methods.updateUserViventiumOrchestrationPreferences(
+        user._id?.toString() || '',
+        { mode: 'parallel' },
+      );
+
+      expect(updated?.personalization?.orchestration_mode).toBe('parallel');
+      expect(updated?.personalization).toMatchObject({
+        memories: false,
+        conversation_recall: true,
+      });
+    });
+
+    test('should return null for a non-existent user', async () => {
+      const fakeId = new mongoose.Types.ObjectId();
+      const updated = await methods.updateUserViventiumOrchestrationPreferences(fakeId.toString(), {
+        mode: 'parallel',
+      });
+
+      expect(updated).toBeNull();
+    });
+
+    test('should atomically fence positive work and advance its durable epoch', async () => {
+      const user = await User.create({
+        name: 'Durable Work User',
+        email: 'durable-work@example.com',
+        provider: 'local',
+        personalization: { orchestration_mode: 'focused' },
+      });
+
+      const userId = user._id?.toString() || '';
+      await expect(methods.getUserParallelWorkKnownEpoch(userId)).resolves.toBe(0);
+      await expect(
+        Promise.all(Array.from({ length: 8 }, () => methods.markUserParallelWorkKnown(userId))),
+      ).resolves.toEqual(Array(8).fill(true));
+
+      const updated = await User.findById(userId).lean();
+
+      expect(updated?.personalization?.orchestration_mode).toBe('focused');
+      expect(updated?.personalization?.parallel_work_known).toBe(true);
+      expect(updated?.personalization?.parallel_work_known_epoch).toBe(8);
+    });
+
+    test('should fence a legacy positive call and reject an unversioned negative call', async () => {
+      const user = await User.create({
+        name: 'Legacy Work API User',
+        email: 'legacy-work-api@example.com',
+        provider: 'local',
+      });
+      const userId = user._id?.toString() || '';
+
+      await expect(
+        methods.updateUserViventiumOrchestrationPreferences(userId, { knownWork: true }),
+      ).resolves.toMatchObject({
+        personalization: { parallel_work_known: true, parallel_work_known_epoch: 1 },
+      });
+      await expect(
+        methods.updateUserViventiumOrchestrationPreferences(userId, { knownWork: false }),
+      ).rejects.toThrow('parallel_work_known_clear_requires_epoch');
+      await expect(User.findById(userId).lean()).resolves.toMatchObject({
+        personalization: { parallel_work_known: true, parallel_work_known_epoch: 1 },
+      });
+    });
+
+    test('should treat a legacy missing epoch as zero and clear only through one atomic CAS', async () => {
+      const user = await User.create({
+        name: 'Legacy Durable Work User',
+        email: 'legacy-durable-work@example.com',
+        provider: 'local',
+        personalization: { parallel_work_known: true },
+      });
+      const userId = user._id?.toString() || '';
+      await User.collection.updateOne(
+        { _id: user._id },
+        { $unset: { 'personalization.parallel_work_known_epoch': '' } },
+      );
+
+      await expect(methods.getUserParallelWorkKnownEpoch(userId)).resolves.toBe(0);
+      await expect(methods.clearUserParallelWorkKnownIfEpoch(userId, 0)).resolves.toBe(true);
+      await expect(User.findById(userId).lean()).resolves.toMatchObject({
+        personalization: { parallel_work_known: false },
+      });
+    });
+
+    test('should reject an old empty observation after another process advances the epoch', async () => {
+      const user = await User.create({
+        name: 'Concurrent Durable Work User',
+        email: 'concurrent-durable-work@example.com',
+        provider: 'local',
+        personalization: { parallel_work_known: false },
+      });
+      const userId = user._id?.toString() || '';
+      const capturedEpoch = await methods.getUserParallelWorkKnownEpoch(userId);
+
+      await expect(methods.markUserParallelWorkKnown(userId)).resolves.toBe(true);
+      await expect(
+        methods.clearUserParallelWorkKnownIfEpoch(userId, capturedEpoch ?? -1),
+      ).resolves.toBe(false);
+      await expect(User.findById(userId).lean()).resolves.toMatchObject({
+        personalization: {
+          parallel_work_known: true,
+          parallel_work_known_epoch: 1,
+        },
+      });
+    });
+  });
+  /* === VIVENTIUM END === */
 
   describe('Email Normalization Edge Cases', () => {
     test('should handle email with multiple spaces', async () => {

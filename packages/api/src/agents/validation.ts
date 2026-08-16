@@ -67,31 +67,116 @@ export const agentToolOptionsSchema = z.record(z.string(), toolOptionsSchema).op
  */
 
 /** Activation config schema for background cortices */
-export const activationConfigSchema = z.object({
-  enabled: z.boolean(),
-  model: z.string(),
-  provider: z.string(),
-  prompt: z.string(),
-  intent_scope: z.string().optional(),
-  activation_failure_visibility: z.enum(['silent', 'visible']).optional(),
-  confidence_threshold: z.number().min(0).max(1),
-  cooldown_ms: z.number().min(0),
-  max_history: z.number().min(1),
-  fallbacks: z
-    .array(
-      z.object({
-        provider: z.string(),
-        model: z.string(),
-      }),
-    )
-    .optional(),
-});
+export const activationConfigSchema = z
+  .object({
+    enabled: z.boolean(),
+    mode: z.enum(['classified', 'always', 'disabled']).optional(),
+    model: z.string().optional(),
+    provider: z.string().optional(),
+    prompt: z.string().optional(),
+    intent_scope: z.string().optional(),
+    activation_failure_visibility: z.enum(['silent', 'visible']).optional(),
+    confidence_threshold: z.number().min(0).max(1).optional(),
+    cooldown_ms: z.number().min(0).optional(),
+    max_history: z.number().min(1).optional(),
+    fallbacks: z
+      .array(
+        z.object({
+          provider: z.string(),
+          model: z.string(),
+        }),
+      )
+      .optional(),
+  })
+  .superRefine((activation, ctx) => {
+    const mode = activation.enabled === false ? 'disabled' : (activation.mode ?? 'classified');
+    if (mode !== 'classified') {
+      return;
+    }
+
+    const requireClassifierString = (field: 'provider' | 'model' | 'prompt', message: string) => {
+      if (String(activation[field] ?? '').trim()) {
+        return;
+      }
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [field],
+        message,
+      });
+    };
+    requireClassifierString('provider', 'Classifier provider is required');
+    requireClassifierString('model', 'Classifier model is required');
+    requireClassifierString('prompt', 'Classifier prompt is required');
+    if (activation.confidence_threshold == null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['confidence_threshold'],
+        message: 'Classifier confidence threshold is required',
+      });
+    }
+    if (activation.cooldown_ms == null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['cooldown_ms'],
+        message: 'Classifier cooldown is required',
+      });
+    }
+    if (activation.max_history == null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['max_history'],
+        message: 'Classifier history depth is required',
+      });
+    }
+  });
 
 /** Background cortex schema - an agent with its activation config */
 export const backgroundCortexSchema = z.object({
   agent_id: z.string(),
   activation: activationConfigSchema,
 });
+/* === VIVENTIUM END === */
+/* === VIVENTIUM START === GlassHive core Agent provider */
+export const glassHiveOptionsSchema = z
+  .object({
+    workspace: z.object({
+      mode: z.enum(['life', 'custom']),
+      path: z.string().optional(),
+    }),
+    access: z.enum(['full', 'workspace']),
+    fallback_model: z.string().optional(),
+    fallback_reasoning_effort: z.string().optional(),
+    orchestration: z
+      .object({
+        parallel_available: z.boolean(),
+        default_mode: z.enum(['focused', 'parallel']),
+      })
+      .strict()
+      .optional(),
+  })
+  .superRefine((value, ctx) => {
+    const customPath = value.workspace.path?.trim() ?? '';
+    if (value.workspace.mode === 'custom' && !customPath) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['workspace', 'path'],
+        message: 'Custom GlassHive workspace requires a server-side path',
+      });
+    } else if (
+      value.workspace.mode === 'custom' &&
+      !(
+        customPath.startsWith('/') ||
+        customPath.startsWith('~/') ||
+        /^[A-Za-z]:[\\/]/.test(customPath)
+      )
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['workspace', 'path'],
+        message: 'Custom GlassHive workspace must be an absolute server-side path',
+      });
+    }
+  });
 /* === VIVENTIUM END === */
 /** Base agent schema with all common fields */
 export const agentBaseSchema = z.object({
@@ -100,6 +185,7 @@ export const agentBaseSchema = z.object({
   instructions: z.string().nullable().optional(),
   avatar: agentAvatarSchema.nullable().optional(),
   model_parameters: z.record(z.unknown()).optional(),
+  glasshive_options: glassHiveOptionsSchema.optional(),
   tools: z.array(z.string()).optional(),
   /** @deprecated Use edges instead */
   agent_ids: z.array(z.string()).optional(),
@@ -164,6 +250,272 @@ export const agentUpdateSchema = agentBaseSchema.extend({
   removeProjectIds: z.array(z.string()).optional(),
   isCollaborative: z.boolean().optional(),
 });
+
+/* === VIVENTIUM START ===
+ * Feature: Config-owned exact provider/model validation.
+ * Purpose: Capability-backed providers fail visibly on unsupported model/effort selections and
+ * receive registry defaults without branching on provider names or display labels.
+ * === VIVENTIUM END === */
+export type ProviderCapabilityRegistry = Record<
+  string,
+  {
+    main_chat?: boolean;
+    activation_classifier?: boolean;
+    realtime_voice?: boolean;
+    automatic_fallback_target?: boolean;
+    serial_model_fallback?: boolean;
+    workspace_binding?: boolean;
+    conversation_session?: boolean;
+    responses_api?: boolean;
+    models?: Array<{
+      id: string;
+      effortChoices?: string[];
+      recommendedEffort?: string;
+    }>;
+  }
+>;
+
+export function applyAgentProviderCapabilityDefaults<T extends Record<string, unknown>>(
+  agent: T,
+  registry: ProviderCapabilityRegistry | undefined,
+  requiredProviders: string[] = [],
+): T {
+  const next = { ...agent } as T & {
+    model_parameters?: Record<string, unknown>;
+    glasshive_options?: {
+      workspace: { mode: 'life' | 'custom'; path?: string };
+      access: 'full' | 'workspace';
+      fallback_model?: string;
+      fallback_reasoning_effort?: string;
+      orchestration?: {
+        parallel_available: boolean;
+        default_mode: 'focused' | 'parallel';
+      };
+    };
+  };
+  const rejectCapabilityTarget = (
+    selectedProviderValue: unknown,
+    capabilityField: 'activation_classifier' | 'realtime_voice' | 'automatic_fallback_target',
+    path: Array<string | number>,
+  ) => {
+    const selectedProvider = String(selectedProviderValue ?? '').trim();
+    if (!selectedProvider) {
+      return;
+    }
+    const selectedCapability = registry?.[selectedProvider];
+    if (requiredProviders.includes(selectedProvider) && !selectedCapability) {
+      throw new z.ZodError([
+        {
+          code: z.ZodIssueCode.custom,
+          path,
+          message: `Provider capability configuration is unavailable for ${selectedProvider}`,
+        },
+      ]);
+    }
+    if (selectedCapability?.[capabilityField] === false) {
+      throw new z.ZodError([
+        {
+          code: z.ZodIssueCode.custom,
+          path,
+          message: `Provider ${selectedProvider} does not support this agent role`,
+        },
+      ]);
+    }
+  };
+
+  rejectCapabilityTarget(next.voice_llm_provider, 'realtime_voice', ['voice_llm_provider']);
+  rejectCapabilityTarget(next.voice_fallback_llm_provider, 'realtime_voice', [
+    'voice_fallback_llm_provider',
+  ]);
+  rejectCapabilityTarget(next.fallback_llm_provider, 'automatic_fallback_target', [
+    'fallback_llm_provider',
+  ]);
+  const backgroundCortices = next.background_cortices;
+  if (Array.isArray(backgroundCortices)) {
+    backgroundCortices.forEach((entry, cortexIndex) => {
+      if (!entry || typeof entry !== 'object') {
+        return;
+      }
+      const activation = (entry as { activation?: unknown }).activation;
+      if (!activation || typeof activation !== 'object') {
+        return;
+      }
+      const activationConfig = activation as {
+        enabled?: boolean;
+        mode?: 'classified' | 'always' | 'disabled';
+        provider?: unknown;
+        fallbacks?: Array<{ provider?: unknown }>;
+      };
+      const activationMode =
+        activationConfig.enabled === false ? 'disabled' : (activationConfig.mode ?? 'classified');
+      if (activationMode !== 'classified') {
+        return;
+      }
+      rejectCapabilityTarget(activationConfig.provider, 'activation_classifier', [
+        'background_cortices',
+        cortexIndex,
+        'activation',
+        'provider',
+      ]);
+      (activationConfig.fallbacks ?? []).forEach((fallback, fallbackIndex) => {
+        rejectCapabilityTarget(fallback.provider, 'activation_classifier', [
+          'background_cortices',
+          cortexIndex,
+          'activation',
+          'fallbacks',
+          fallbackIndex,
+          'provider',
+        ]);
+      });
+    });
+  }
+
+  const provider = String(agent.provider ?? '').trim();
+  const capability = registry?.[provider];
+  if (provider && requiredProviders.includes(provider) && !capability) {
+    throw new z.ZodError([
+      {
+        code: z.ZodIssueCode.custom,
+        path: ['provider'],
+        message: `Provider capability configuration is unavailable for ${provider}`,
+      },
+    ]);
+  }
+  if (!capability) {
+    return next;
+  }
+  if (capability.main_chat === false) {
+    throw new z.ZodError([
+      {
+        code: z.ZodIssueCode.custom,
+        path: ['provider'],
+        message: `Provider ${provider} does not support main Agent chat`,
+      },
+    ]);
+  }
+  const model = String(agent.model ?? '').trim();
+  const modelMetadata = capability.models?.find((candidate) => candidate.id === model);
+  if (!modelMetadata) {
+    throw new z.ZodError([
+      {
+        code: z.ZodIssueCode.custom,
+        path: ['model'],
+        message: `Unsupported model for configured provider ${provider}`,
+      },
+    ]);
+  }
+
+  const modelParameters = { ...(next.model_parameters ?? {}) };
+  // The top-level Agent model is canonical. Do not let a stale nested model silently initialize a
+  // different harness after a provider/model switch, source sync, or historical version revert.
+  modelParameters.model = model;
+  if (capability.responses_api === false) {
+    delete modelParameters.useResponsesApi;
+    delete modelParameters.reasoning;
+    delete modelParameters.reasoning_summary;
+    delete modelParameters.verbosity;
+    delete modelParameters.web_search;
+  }
+  const effort = String(
+    modelParameters.reasoning_effort ?? modelMetadata.recommendedEffort ?? '',
+  ).trim();
+  if (effort && !(modelMetadata.effortChoices ?? []).includes(effort)) {
+    throw new z.ZodError([
+      {
+        code: z.ZodIssueCode.custom,
+        path: ['model_parameters', 'reasoning_effort'],
+        message: `Unsupported reasoning effort for model ${model}`,
+      },
+    ]);
+  }
+  if (effort) {
+    modelParameters.reasoning_effort = effort;
+  }
+  next.model_parameters = modelParameters;
+  if (capability.workspace_binding === true && !next.glasshive_options) {
+    next.glasshive_options = {
+      workspace: { mode: 'life' },
+      access: 'full',
+    };
+  }
+  /* === VIVENTIUM START ===
+   * Feature: Optional provider-internal GlassHive fallback
+   * Purpose: Validate the separate advanced provider-internal option when a user explicitly enables
+   * it. The ordinary Agent Builder fallback remains owned by fallback_llm_*.
+   * === VIVENTIUM END === */
+  const fallbackModel = String(next.glasshive_options?.fallback_model ?? '').trim();
+  if (fallbackModel) {
+    if (capability.serial_model_fallback !== true) {
+      throw new z.ZodError([
+        {
+          code: z.ZodIssueCode.custom,
+          path: ['glasshive_options', 'fallback_model'],
+          message: `Provider ${provider} does not support serial model fallback`,
+        },
+      ]);
+    }
+    const fallbackMetadata = capability.models?.find((candidate) => candidate.id === fallbackModel);
+    if (!fallbackMetadata) {
+      throw new z.ZodError([
+        {
+          code: z.ZodIssueCode.custom,
+          path: ['glasshive_options', 'fallback_model'],
+          message: `Unsupported GlassHive fallback model ${fallbackModel}`,
+        },
+      ]);
+    }
+    if (fallbackModel === model) {
+      throw new z.ZodError([
+        {
+          code: z.ZodIssueCode.custom,
+          path: ['glasshive_options', 'fallback_model'],
+          message: 'GlassHive fallback model must differ from the primary model',
+        },
+      ]);
+    }
+    const fallbackEffort = String(
+      next.glasshive_options?.fallback_reasoning_effort ?? fallbackMetadata.recommendedEffort ?? '',
+    ).trim();
+    if (fallbackEffort && !(fallbackMetadata.effortChoices ?? []).includes(fallbackEffort)) {
+      throw new z.ZodError([
+        {
+          code: z.ZodIssueCode.custom,
+          path: ['glasshive_options', 'fallback_reasoning_effort'],
+          message: `Unsupported reasoning effort for fallback model ${fallbackModel}`,
+        },
+      ]);
+    }
+    const glassHiveOptions = next.glasshive_options;
+    if (!glassHiveOptions) {
+      throw new z.ZodError([
+        {
+          code: z.ZodIssueCode.custom,
+          path: ['glasshive_options'],
+          message: `Provider ${provider} requires GlassHive options for serial model fallback`,
+        },
+      ]);
+    }
+    next.glasshive_options = {
+      workspace: glassHiveOptions.workspace,
+      access: glassHiveOptions.access,
+      fallback_model: fallbackModel,
+      ...(fallbackEffort ? { fallback_reasoning_effort: fallbackEffort } : {}),
+      ...(glassHiveOptions.orchestration
+        ? { orchestration: glassHiveOptions.orchestration }
+        : {}),
+    };
+  } else if (next.glasshive_options) {
+    next.glasshive_options = {
+      workspace: next.glasshive_options.workspace,
+      access: next.glasshive_options.access,
+      ...(next.glasshive_options.orchestration
+        ? { orchestration: next.glasshive_options.orchestration }
+        : {}),
+    };
+  }
+
+  return next;
+}
 
 interface ValidateAgentModelParams {
   req: Request;

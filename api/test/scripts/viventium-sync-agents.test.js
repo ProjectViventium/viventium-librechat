@@ -54,11 +54,31 @@ describe('viventium-sync-agents args', () => {
     expect(args.activationFields).toEqual(['prompt', 'model', 'provider', 'intent_scope']);
   });
 
+  test('activation mode is a supported surgical sync field', () => {
+    const args = parseArgs(['push', '--activation-config-only', '--activation-fields=mode']);
+
+    expect(resolveSafeActivationFields(args)).toEqual(['mode']);
+  });
+
   test('parseArgs captures model-config-only flag', () => {
-    const args = parseArgs(['push', '--model-config-only']);
+    const args = parseArgs([
+      'push',
+      '--model-config-only',
+      '--model-config-fields=glasshive_options',
+    ]);
 
     expect(args.action).toBe('push');
     expect(args.modelConfigOnly).toBe(true);
+    expect(args.modelConfigFields).toEqual(['glasshive_options']);
+  });
+
+  test('model-config field narrowing fails closed outside its safe mode or on unknown fields', () => {
+    expect(() => parseArgs(['push', '--model-config-fields=glasshive_options'])).toThrow(
+      '--model-config-fields requires --model-config-only',
+    );
+    expect(() => parseArgs(['push', '--model-config-only', '--model-config-fields=tools'])).toThrow(
+      'Unsupported model config field',
+    );
   });
 
   test('parseArgs captures tools-only flag', () => {
@@ -67,6 +87,60 @@ describe('viventium-sync-agents args', () => {
     expect(args.action).toBe('push');
     expect(args.toolsOnly).toBe(true);
     expect(args.selectedAgentIds).toEqual(['agent-a']);
+  });
+
+  test('parseArgs captures graph-config-only flag', () => {
+    const args = parseArgs(['push', '--graph-config-only', '--agent-ids=main-agent']);
+
+    expect(args.action).toBe('push');
+    expect(args.graphConfigOnly).toBe(true);
+    expect(args.selectedAgentIds).toEqual(['main-agent']);
+  });
+
+  test('buildUpdateData only updates graph fields in graph-config-only mode', () => {
+    const update = buildUpdateData(
+      {
+        id: 'main-agent',
+        instructions: 'do not overwrite this live prompt',
+        tools: ['web_search'],
+        recursion_limit: 40,
+        edges: [
+          {
+            from: 'main-agent',
+            to: 'reality-agent',
+          },
+        ],
+      },
+      { graphConfigOnly: true },
+    );
+
+    expect(update).toEqual({
+      recursion_limit: 40,
+      edges: [
+        {
+          from: 'main-agent',
+          to: 'reality-agent',
+        },
+      ],
+    });
+  });
+
+  test('graph-config-only preserves absent graph fields and can explicitly clear edges', () => {
+    expect(
+      buildUpdateData({ id: 'main-agent', instructions: 'unrelated' }, { graphConfigOnly: true }),
+    ).toEqual({});
+    expect(buildUpdateData({ id: 'main-agent', edges: [] }, { graphConfigOnly: true })).toEqual({
+      edges: [],
+    });
+  });
+
+  test('graph-config-only respects the selected top-level agent filter', () => {
+    expect(
+      buildUpdateData(
+        { id: 'other-agent', recursion_limit: 40, edges: [] },
+        { graphConfigOnly: true, selectedAgentIds: ['main-agent'] },
+      ),
+    ).toEqual({});
   });
 
   test('buildUpdateData only updates tools in tools-only mode', () => {
@@ -81,6 +155,7 @@ describe('viventium-sync-agents args', () => {
         tool_options: {
           search_gmail_messages_mcp_google_workspace: { defer_loading: true },
         },
+        conversation_recall_agent_only: false,
       },
       { toolsOnly: true },
     );
@@ -91,7 +166,54 @@ describe('viventium-sync-agents args', () => {
       tool_options: {
         search_gmail_messages_mcp_google_workspace: { defer_loading: true },
       },
+      conversation_recall_agent_only: false,
     });
+  });
+
+  test('agent source snapshots preserve explicit global conversation-recall inheritance', () => {
+    expect(
+      pickAgentFields({
+        id: 'deep-memory',
+        name: 'Deep Memory Search',
+        conversation_recall_agent_only: false,
+        unknown_live_field: 'do not export',
+      }),
+    ).toEqual({
+      id: 'deep-memory',
+      name: 'Deep Memory Search',
+      conversation_recall_agent_only: false,
+    });
+  });
+
+  test('compare treats omitted and false agent-only recall as the same default', () => {
+    const defaultDiff = compareBundlesByAgent({
+      leftBundle: {
+        mainAgent: { id: 'main' },
+        backgroundAgents: [{ id: 'deep-memory', conversation_recall_agent_only: false }],
+      },
+      rightBundle: {
+        mainAgent: { id: 'main' },
+        backgroundAgents: [{ id: 'deep-memory' }],
+      },
+    });
+    const restrictedDiff = compareBundlesByAgent({
+      leftBundle: {
+        mainAgent: { id: 'main' },
+        backgroundAgents: [{ id: 'deep-memory', conversation_recall_agent_only: true }],
+      },
+      rightBundle: {
+        mainAgent: { id: 'main' },
+        backgroundAgents: [{ id: 'deep-memory', conversation_recall_agent_only: false }],
+      },
+    });
+
+    expect(defaultDiff.diffCount).toBe(0);
+    expect(restrictedDiff.diffs).toEqual([
+      expect.objectContaining({
+        id: 'deep-memory',
+        changedFields: ['conversation_recall_agent_only'],
+      }),
+    ]);
   });
 
   test('GlassHive MCP prompt tells models to use namespaced callable tool ids', () => {
@@ -113,13 +235,45 @@ describe('viventium-sync-agents args', () => {
     expect(resolved.instructions).toContain('not by the worker running inside the workspace');
   });
 
-  test('buildUpdateData keeps the dedicated voice parameter bag in model-config-only mode', () => {
+  test('canonical Main prompt gates automatic delegation on the ephemeral parallel capsule', () => {
+    const resolved = resolvePromptRefs({
+      instructions: {
+        promptRef: 'main.conscious_agent',
+      },
+    });
+
+    expect(resolved.instructions).toContain(
+      'Automatic durable mission delegation is allowed only when the current ephemeral Parallel work capsule explicitly says `Mode: parallel`',
+    );
+    expect(resolved.instructions).toContain(
+      'delegate only when the user explicitly asks for delegation or background work',
+    );
+    expect(resolved.instructions).toContain(
+      'Existing missions remain visible and controllable in either mode',
+    );
+    expect(resolved.instructions).toContain(
+      'must invoke the declared delegation tool',
+    );
+    expect(resolved.instructions).toContain(
+      'Never say work was delegated, accepted, queued, or is running',
+    );
+    expect(resolved.instructions).toContain('successful delegation-tool receipt');
+  });
+
+  test('buildUpdateData keeps GlassHive and voice parameter bags in model-config-only mode', () => {
     const update = buildUpdateData(
       {
         id: 'agent_viventium_main_95aeb3',
         provider: 'anthropic',
         model: 'claude-opus-4-7',
         model_parameters: { model: 'claude-opus-4-7' },
+        glasshive_options: {
+          workspace: { mode: 'life' },
+          access: 'full',
+          fallback_model: 'claude-code:opus',
+          fallback_reasoning_effort: 'high',
+        },
+        recursion_limit: 99,
         voice_llm_provider: 'anthropic',
         voice_llm_model: 'claude-haiku-4-5',
         voice_llm_model_parameters: { thinking: false },
@@ -131,9 +285,43 @@ describe('viventium-sync-agents args', () => {
       provider: 'anthropic',
       model: 'claude-opus-4-7',
       model_parameters: { model: 'claude-opus-4-7' },
+      glasshive_options: {
+        workspace: { mode: 'life' },
+        access: 'full',
+        fallback_model: 'claude-code:opus',
+        fallback_reasoning_effort: 'high',
+      },
       voice_llm_provider: 'anthropic',
       voice_llm_model: 'claude-haiku-4-5',
       voice_llm_model_parameters: { thinking: false },
+    });
+  });
+
+  test('buildUpdateData can narrow model-config-only updates to GlassHive options', () => {
+    const update = buildUpdateData(
+      {
+        id: 'agent_viventium_main_95aeb3',
+        provider: 'glasshive-harness',
+        model: 'codex-cli:gpt-5.6-sol',
+        model_parameters: { reasoning_effort: 'medium' },
+        glasshive_options: {
+          workspace: { mode: 'life' },
+          access: 'full',
+          fallback_model: 'claude-code:opus',
+          fallback_reasoning_effort: 'high',
+        },
+        voice_llm_model: 'grok-4.5',
+      },
+      { modelConfigOnly: true, modelConfigFields: ['glasshive_options'] },
+    );
+
+    expect(update).toEqual({
+      glasshive_options: {
+        workspace: { mode: 'life' },
+        access: 'full',
+        fallback_model: 'claude-code:opus',
+        fallback_reasoning_effort: 'high',
+      },
     });
   });
 
@@ -246,9 +434,16 @@ describe('viventium-sync-agents args', () => {
     );
   });
 
+  test('parseArgs rejects graph config combined with another safe push mode', () => {
+    expect(() => parseArgs(['push', '--graph-config-only', '--tools-only'])).toThrow(
+      'Choose only one safe push mode',
+    );
+  });
+
   test('resolveSafeActivationFields uses safe defaults for activation-config-only mode', () => {
     expect(resolveSafeActivationFields({ activationConfigOnly: true })).toEqual([
       'enabled',
+      'mode',
       'prompt',
       'confidence_threshold',
       'model',
@@ -264,6 +459,7 @@ describe('viventium-sync-agents args', () => {
   test('resolveSafeActivationFields includes fallbacks for prompts-only mode', () => {
     expect(resolveSafeActivationFields({ promptsOnly: true })).toEqual([
       'enabled',
+      'mode',
       'prompt',
       'confidence_threshold',
       'fallbacks',
@@ -326,6 +522,60 @@ describe('viventium-sync-agents args', () => {
     ]);
   });
 
+  test('a background-only prompt selection cannot overwrite top-level main-agent prompts', () => {
+    const update = buildUpdateData(
+      {
+        id: 'main-agent',
+        name: 'Tracked main name',
+        description: 'Tracked main description',
+        instructions: 'Tracked main instructions',
+        conversation_starters: ['Tracked starter'],
+        background_cortices: [
+          {
+            agent_id: 'background-a',
+            activation: {
+              prompt: 'new activation prompt',
+              fallbacks: [{ provider: 'openai', model: 'new-fallback' }],
+            },
+          },
+        ],
+      },
+      {
+        promptsOnly: true,
+        activationFields: ['prompt'],
+        selectedAgentIds: ['background-a'],
+        existingAgent: {
+          id: 'main-agent',
+          name: 'Live main name',
+          description: 'Live main description',
+          instructions: 'Live main instructions',
+          conversation_starters: ['Live starter'],
+          background_cortices: [
+            {
+              agent_id: 'background-a',
+              activation: {
+                prompt: 'old activation prompt',
+                fallbacks: [{ provider: 'anthropic', model: 'live-fallback' }],
+              },
+            },
+          ],
+        },
+      },
+    );
+
+    expect(update).toEqual({
+      background_cortices: [
+        {
+          agent_id: 'background-a',
+          activation: {
+            prompt: 'new activation prompt',
+            fallbacks: [{ provider: 'anthropic', model: 'live-fallback' }],
+          },
+        },
+      ],
+    });
+  });
+
   test('mergeBackgroundCorticesActivationFields respects selected agent filters', () => {
     const existing = [
       {
@@ -376,6 +626,103 @@ describe('viventium-sync-agents args', () => {
         },
       },
     ]);
+  });
+
+  test('activation-only merge appends one explicitly selected new cortex without changing existing cortices', () => {
+    const existing = [
+      {
+        agent_id: 'existing-agent',
+        activation: {
+          enabled: true,
+          prompt: 'preserve live prompt',
+          fallbacks: [{ provider: 'openai', model: 'preserve-live-fallback' }],
+        },
+      },
+    ];
+    const incoming = [
+      {
+        agent_id: 'existing-agent',
+        activation: {
+          prompt: 'do not apply tracked drift',
+          fallbacks: [{ provider: 'anthropic', model: 'do-not-apply' }],
+        },
+      },
+      {
+        agent_id: 'new-agent',
+        activation: {
+          enabled: true,
+          mode: 'always',
+          prompt: 'do not need a classifier prompt',
+        },
+      },
+    ];
+
+    expect(
+      mergeBackgroundCorticesActivationFields(
+        existing,
+        incoming,
+        ['enabled', 'mode'],
+        ['new-agent'],
+      ),
+    ).toEqual([
+      {
+        agent_id: 'existing-agent',
+        activation: {
+          enabled: true,
+          prompt: 'preserve live prompt',
+          fallbacks: [{ provider: 'openai', model: 'preserve-live-fallback' }],
+        },
+      },
+      {
+        agent_id: 'new-agent',
+        activation: {
+          enabled: true,
+          mode: 'always',
+        },
+      },
+    ]);
+  });
+
+  test('activation-only append is explicit, safe-field-only, and duplicate resistant', () => {
+    const existing = [{ agent_id: 'existing-agent', activation: { enabled: true } }];
+    const incoming = [
+      {
+        agent_id: 'new-agent',
+        activation: { enabled: true, mode: 'always', prompt: 'unsafe for this operation' },
+      },
+      {
+        agent_id: 'new-agent',
+        activation: { enabled: false, mode: 'disabled' },
+      },
+      { agent_id: 'unselected-agent', activation: { enabled: true, mode: 'always' } },
+    ];
+
+    expect(
+      mergeBackgroundCorticesActivationFields(existing, incoming, ['enabled', 'mode']),
+    ).toEqual(existing);
+    expect(
+      mergeBackgroundCorticesActivationFields(
+        existing,
+        incoming,
+        ['enabled', 'mode'],
+        ['new-agent'],
+      ),
+    ).toEqual([
+      existing[0],
+      {
+        agent_id: 'new-agent',
+        activation: { enabled: true, mode: 'always' },
+      },
+    ]);
+  });
+
+  test('graph-config-only never triggers broad runtime field repair', () => {
+    expect(
+      shouldRepairRuntimeFieldsForPushMode({
+        graphConfigOnly: true,
+        runtimeAware: true,
+      }),
+    ).toBe(false);
   });
 
   test('compareBundlesByAgent includes tool options, tool kwargs, and activation diffs', () => {
@@ -452,6 +799,32 @@ describe('viventium-sync-agents args', () => {
         }),
       ]),
     );
+  });
+
+  test('compareBundlesByAgent protects handoff graph and recursion-limit drift', () => {
+    const diff = compareBundlesByAgent({
+      leftBundle: {
+        mainAgent: {
+          id: 'main',
+          recursion_limit: 20,
+          edges: [{ from: 'main', to: 'specialist-a', edgeType: 'handoff' }],
+        },
+      },
+      rightBundle: {
+        mainAgent: {
+          id: 'main',
+          recursion_limit: 40,
+          edges: [{ from: 'main', to: 'specialist-b', edgeType: 'handoff' }],
+        },
+      },
+    });
+
+    expect(diff.diffs).toEqual([
+      expect.objectContaining({
+        id: 'main',
+        changedFields: ['recursion_limit', 'edges'],
+      }),
+    ]);
   });
 
   test('compareBundlesByAgent ignores background cortex metadata noise when activation matches', () => {
@@ -591,6 +964,20 @@ describe('viventium-sync-agents args', () => {
       voice_llm_model: 'claude-haiku-4-5',
       voice_llm_provider: 'anthropic',
       voice_llm_model_parameters: { thinking: false },
+    });
+  });
+
+  test('pickAgentFields keeps graph recursion settings in pulled bundles', () => {
+    expect(
+      pickAgentFields({
+        id: 'agent_viventium_main_95aeb3',
+        recursion_limit: 40,
+        edges: [{ from: 'main', to: 'specialist', edgeType: 'handoff' }],
+      }),
+    ).toEqual({
+      id: 'agent_viventium_main_95aeb3',
+      recursion_limit: 40,
+      edges: [{ from: 'main', to: 'specialist', edgeType: 'handoff' }],
     });
   });
 

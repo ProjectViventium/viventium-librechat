@@ -21,11 +21,15 @@ export type RequestBody = {
   viventiumSurface?: string;
   viventiumInputMode?: string;
   viventiumStreamId?: string;
+  viventiumGlassHiveIdempotencyKey?: string;
+  viventiumGlassHiveTurnContextB64?: string;
   viventiumVoiceRequestId?: string;
   viventiumVoiceCallSessionId?: string;
   viventiumTelegramChatId?: string;
   viventiumTelegramUserId?: string;
   viventiumTelegramMessageId?: string;
+  viventiumLogicalTurnId?: string;
+  viventiumLogicalTurnRevision?: string;
   files?: unknown[];
   attachments?: unknown[];
   tool_resources?: unknown;

@@ -3,6 +3,8 @@
 # === VIVENTIUM END ===
 
 import json
+import hashlib
+import hmac
 import os
 import sys
 import tempfile
@@ -80,6 +82,128 @@ class BootstrapEndpointTests(unittest.TestCase):
 
     def _make_storage(self, tmpdir):
         return ScheduleStorage(StorageConfig(db_path=str(Path(tmpdir) / "schedules.db")))
+
+    @staticmethod
+    def _glasshive_signature(secret, raw, worker_id, run_id):
+        binding = f"{worker_id}:{run_id}".encode("utf-8")
+        derived = hmac.new(secret.encode("utf-8"), binding, hashlib.sha256).hexdigest().encode(
+            "utf-8"
+        )
+        return "sha256=" + hmac.new(derived, raw, hashlib.sha256).hexdigest()
+
+    @staticmethod
+    def _create_glasshive_run(storage, *, error_class):
+        now = "2026-08-11T12:00:00Z"
+        storage.create_task(
+            {
+                "id": "task-1",
+                "user_id": "user-1",
+                "agent_id": "agent-1",
+                "prompt": "Synthetic scheduled task.",
+                "schedule": {"type": "daily", "time": "09:00", "timezone": "UTC"},
+                "channel": ["workbench"],
+                "executor": "glasshive_host",
+                "conversation_policy": "new",
+                "conversation_id": None,
+                "last_conversation_id": None,
+                "active": 1,
+                "created_by": "agent:agent-1",
+                "created_source": "agent",
+                "created_at": now,
+                "updated_at": now,
+                "updated_by": "agent:agent-1",
+                "updated_source": "agent",
+                "last_run_at": now,
+                "next_run_at": None,
+                "last_status": "error",
+                "last_error": "Recovery window elapsed.",
+                "metadata": {},
+            }
+        )
+        return storage.create_scheduled_prompt_run(
+            {
+                "run_id": "scheduled-run-1",
+                "task_id": "task-1",
+                "definition_id": None,
+                "user_id": "user-1",
+                "version_id": None,
+                "due_at": now,
+                "started_at": now,
+                "completed_at": now,
+                "status": "failed",
+                "executor": "glasshive_host",
+                "rendered_hash": None,
+                "variable_snapshot_hash": None,
+                "glasshive_project_id": "project-1",
+                "glasshive_worker_id": "worker-1",
+                "glasshive_run_id": "glasshive-run-1",
+                "result_summary": "Synthetic terminal failure.",
+                "error_class": error_class,
+                "private_detail_path": None,
+                "callback_payload_json": None,
+                "disposition": "failed",
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+
+    def test_signed_late_completion_repairs_stale_recovery_but_not_real_terminal_failure(self):
+        secret = "synthetic-callback-secret"
+        payload = {
+            "event": "run.completed",
+            "worker_id": "worker-1",
+            "run_id": "glasshive-run-1",
+            "message": "Synthetic authoritative result.",
+        }
+        raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        signature = self._glasshive_signature(
+            secret, raw, payload["worker_id"], payload["run_id"]
+        )
+
+        for error_class, expected_persisted, expected_status in (
+            ("stale_run_reconciled", True, "completed"),
+            ("worker_failed", False, "failed"),
+        ):
+            with self.subTest(error_class=error_class), tempfile.TemporaryDirectory() as tmpdir:
+                storage = self._make_storage(tmpdir)
+                self._create_glasshive_run(storage, error_class=error_class)
+                try:
+                    client = self._make_client(storage)
+                except Exception:
+                    self.skipTest("Could not create test client from FastMCP app")
+                    return
+                with patch.dict(
+                    os.environ,
+                    {"SCHEDULING_GLASSHIVE_CALLBACK_SECRET": secret},
+                    clear=False,
+                ):
+                    response = client.post(
+                        "/internal/scheduled-prompts/glasshive-callback",
+                        content=raw,
+                        headers={
+                            "content-type": "application/json",
+                            "x-glasshive-signature": signature,
+                        },
+                    )
+
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["callback_persisted"], expected_persisted)
+                persisted = storage.get_scheduled_prompt_run("scheduled-run-1")
+                self.assertEqual(persisted["status"], expected_status)
+                if expected_persisted:
+                    self.assertEqual(persisted["disposition"], "delivered")
+                    self.assertIsNone(persisted["error_class"])
+                    callback_summary = json.loads(persisted["callback_payload_json"])
+                    self.assertEqual(callback_summary["event"], "run.completed")
+                    parent = storage.get_task("user-1", "task-1")
+                    self.assertEqual(parent["last_status"], "success")
+                    self.assertEqual(parent["last_delivery_outcome"], "sent")
+                    self.assertIsNone(parent["last_error"])
+                else:
+                    self.assertEqual(persisted["error_class"], "worker_failed")
+                    parent = storage.get_task("user-1", "task-1")
+                    self.assertEqual(parent["last_status"], "error")
+                    self.assertEqual(parent["last_error"], "Recovery window elapsed.")
 
     def test_bootstrap_creates_schedule(self):
         with tempfile.TemporaryDirectory() as tmpdir:

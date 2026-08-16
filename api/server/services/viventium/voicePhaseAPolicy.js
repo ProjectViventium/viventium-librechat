@@ -74,14 +74,14 @@ function resolveVoicePhaseAAsyncPolicy({
   toolDefinitions,
 }) {
   /* === VIVENTIUM START ===
-   * Feature: text-chat speculative parallel Activation Detection (default off).
+   * Feature: text-chat parallel Activation Detection.
    * Toggle: VIVENTIUM_CORTEX_SPECULATIVE_PARALLEL_DETECT. When on, text chat reuses the SAME
    * non-blocking Phase A + Phase B + follow-up pipeline as voice — the main answer proceeds while
    * Activation Detection runs, and activated Background Cortices surface via the follow-up turn
    * instead of blocking the first answer. The same tool-hold fail-closed checks below still apply
-   * (a tool-owning cortex forces the blocking path, preserving cortex tool-ownership), and the main
-   * run is never discarded, so there is no speculative tool side-effect risk. When the flag is off,
-   * text chat is byte-identical to before (returns not_voice_mode).
+   * (a tool-owning cortex can force the blocking path, preserving cortex tool-ownership). Main is
+   * invoked exactly once; late activation belongs to Phase B. When the flag is off, text chat is
+   * byte-identical to before (returns not_voice_mode).
    * === VIVENTIUM END === */
   const textAsyncFlagRaw =
     process.env.VIVENTIUM_TEXT_BACKGROUND_AGENT_DETECTION_ASYNC ??

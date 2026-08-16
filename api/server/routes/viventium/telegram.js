@@ -44,7 +44,12 @@ const { getStrategyFunctions } = require('~/server/services/Files/strategies');
 const { resizeImageBuffer } = require('~/server/services/Files/images');
 const { cleanFileName } = require('~/server/utils/files');
 const { getOpenAIClient } = require('~/server/controllers/assistants/helpers');
-const { getUserById, getMessages, getConvo } = require('~/models');
+const {
+  getUserById,
+  getMessages,
+  getConvo,
+  updateUserViventiumOrchestrationPreferences,
+} = require('~/models');
 /* === VIVENTIUM START ===
  * Feature: Telegram ingress idempotency store.
  * === VIVENTIUM END === */
@@ -78,6 +83,12 @@ const {
 const {
   resolveReusableConversationState,
 } = require('~/server/services/viventium/conversationThreading');
+const {
+  attachLogicalTurnMetadata,
+  createTelegramInteractionContext,
+  getTrustedInteractionContext,
+  setTrustedInteractionContext,
+} = require('~/server/services/viventium/interactionContext');
 
 const EXTRACTED_DOCUMENT_IMAGE_MAX_DIMENSION = 768;
 /* === VIVENTIUM START ===
@@ -85,6 +96,7 @@ const EXTRACTED_DOCUMENT_IMAGE_MAX_DIMENSION = 768;
  * Purpose: Reuse the same call-session creation contract as the web call button.
  * === VIVENTIUM END === */
 const {
+  createCallBrowserLaunch,
   createCallSession,
   resolveUserVoiceRoute,
 } = require('~/server/services/viventium/CallSessionService');
@@ -92,6 +104,16 @@ const {
   buildCallLaunchResponse,
   resolveTelegramPublicPlaygroundBaseUrl,
 } = require('~/server/services/viventium/callLaunch');
+const {
+  assertVoiceAgentAccess,
+} = require('~/server/services/viventium/VoiceAgentAuthorizationService');
+const {
+  getActiveWorkInteractiveSnapshot,
+  getActiveWorkPage,
+} = require('~/server/services/viventium/GlassHiveAccountService');
+const {
+  executeGlassHiveWorkAction,
+} = require('~/server/services/viventium/GlassHiveWorkActionService');
 
 const router = express.Router();
 
@@ -414,6 +436,7 @@ async function telegramAuth(req, res, next) {
         }
         return res.status(401).json({
           error: 'Telegram account not linked',
+          code: 'TELEGRAM_ACCOUNT_NOT_LINKED',
           linkRequired: true,
           linkUrl,
         });
@@ -423,6 +446,10 @@ async function telegramAuth(req, res, next) {
         source === 'missing' ? 'telegramUserId is required' : 'Telegram account not linked',
       );
       err.status = 401;
+      if (source !== 'missing') {
+        err.code = 'TELEGRAM_ACCOUNT_NOT_LINKED';
+        err.linkRequired = true;
+      }
       throw err;
     }
 
@@ -449,7 +476,15 @@ async function telegramAuth(req, res, next) {
   } catch (err) {
     const status = err?.status || 401;
     logger.error('[VIVENTIUM][telegramAuth] Auth failed:', err);
-    return res.status(status).json({ error: err?.message || 'Unauthorized' });
+    /* === VIVENTIUM START ===
+     * Feature: Stable Telegram authentication outcomes.
+     * Purpose: Clients must classify account linking from structured authority, never prose.
+     * === VIVENTIUM END === */
+    return res.status(status).json({
+      error: err?.message || 'Unauthorized',
+      ...(err?.code ? { code: err.code } : {}),
+      ...(err?.linkRequired === true ? { linkRequired: true } : {}),
+    });
   }
 }
 
@@ -626,6 +661,7 @@ async function uploadTelegramFiles({ req, files, agentId }) {
   req._telegramUploadedDocumentImages = [];
   const originalFile = req.file;
   const originalBody = req.body;
+  const originalDurableMissionAttachment = req._viventiumBridgeDurableMissionAttachment;
 
   for (let index = 0; index < files.length; index += 1) {
     const file = files[index];
@@ -699,6 +735,10 @@ async function uploadTelegramFiles({ req, files, agentId }) {
     try {
       req.file = tempFile;
       req._viventiumBridgeDocumentImageExtraction = true;
+      // Keep an owner-scoped copy of Telegram-native images under the canonical uploads root.
+      // Main still receives the already-formatted vision part, while a durable GlassHive mission
+      // receives only this file reference (never raw Telegram ids or base64 in its prompt).
+      req._viventiumBridgeDurableMissionAttachment = mimeType.startsWith('image/');
       const model =
         originalBody && typeof originalBody === 'object' ? originalBody.model : undefined;
       req.body = {
@@ -726,7 +766,11 @@ async function uploadTelegramFiles({ req, files, agentId }) {
 
       await processAgentFileUpload({ req, res, metadata });
       if (result) {
-        uploaded.push(result);
+        uploaded.push({
+          ...result,
+          viventium_media_group_index: index,
+          viventium_media_group_kind: mimeType.startsWith('image/') ? 'image' : 'file',
+        });
         const extractedImages = await formatExtractedImagesForVision(
           result.viventiumExtractedImages,
         );
@@ -749,6 +793,7 @@ async function uploadTelegramFiles({ req, files, agentId }) {
     } finally {
       req.file = originalFile;
       req.body = originalBody;
+      req._viventiumBridgeDurableMissionAttachment = originalDurableMissionAttachment;
       try {
         await fs.promises.unlink(filePath);
       } catch (err) {
@@ -820,6 +865,8 @@ router.post('/call-link', telegramAuth, configMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'agentId is required' });
     }
 
+    await assertVoiceAgentAccess({ req, agentId: effectiveAgentId });
+
     /* === VIVENTIUM START ===
      * Purpose: Telegram cannot open localhost browser-voice links.
      * Contract: /call must fail honestly until a public HTTPS playground URL is configured.
@@ -837,9 +884,23 @@ router.post('/call-link', telegramAuth, configMiddleware, async (req, res) => {
       agentId: effectiveAgentId,
       conversationId: normalizedConversationId,
     });
-
-    return res.json(buildCallLaunchResponse(session, { preferPublicPlayground: true }));
+    const launch = await createCallBrowserLaunch(session.callSessionId);
+    res.set('Cache-Control', 'no-store, private');
+    res.set('Pragma', 'no-cache');
+    return res.json(
+      buildCallLaunchResponse(session, {
+        preferPublicPlayground: true,
+        launchCapability: launch.capability,
+      }),
+    );
   } catch (err) {
+    if (err?.code === 'no_route' && err?.status === 404) {
+      return res.status(404).json({
+        code: 'no_route',
+        message: 'Voice assistant is unavailable.',
+        retryable: false,
+      });
+    }
     logger.error('[VIVENTIUM][telegram/call-link] Failed to create call link:', err);
     return res.status(500).json({ error: 'Failed to create call link' });
   }
@@ -987,6 +1048,23 @@ router.post(
     });
     const conversationId = conversationState.conversationId;
     let parentMessageId = conversationState.parentMessageId;
+    const sourceEventId =
+      normalizeIngressId(incoming.sourceEventId ?? incoming.source_event_id) ||
+      telegramMessageId ||
+      telegramUpdateId ||
+      streamId;
+    setTrustedInteractionContext(
+      req,
+      createTelegramInteractionContext({
+        conversation_id: conversationId,
+        source_event_id: sourceEventId,
+      }),
+      {
+        segment_stability: 'immediate',
+        supersede_scope: 'response_and_authoring',
+      },
+      { commit_authority: 'external_adapter' },
+    );
     logTelegramTiming(
       traceId,
       'parent_message_lookup',
@@ -1044,8 +1122,7 @@ router.post(
      * Feature: Format images for vision model injection
      * Updated: 2026-01-31 - Use req._telegramImages for direct injection into agent messages
      * === VIVENTIUM NOTE === */
-    const { images: telegramImageFiles, nonImages: telegramNonImageFiles } =
-      splitTelegramFiles(telegramFiles);
+    const { images: telegramImageFiles } = splitTelegramFiles(telegramFiles);
     const imageFormatStartTs = performance.now();
     const formattedImages = TELEGRAM_FILE_UPLOAD_ENABLED
       ? formatTelegramImagesForVision(telegramImageFiles)
@@ -1062,7 +1139,7 @@ router.post(
     let uploadedFiles = [];
     try {
       uploadedFiles = TELEGRAM_FILE_UPLOAD_ENABLED
-        ? await uploadTelegramFiles({ req, files: telegramNonImageFiles, agentId })
+        ? await uploadTelegramFiles({ req, files: telegramFiles, agentId })
         : [];
       logTelegramTiming(traceId, 'upload_files', uploadStartTs, `count=${uploadedFiles.length}`);
     } catch (err) {
@@ -1079,7 +1156,16 @@ router.post(
       : [];
     const allFormattedImages = [...formattedImages, ...extractedDocumentImages];
     const hasImages = allFormattedImages.length > 0;
-    const { files: _unusedFiles, iconURL: _unusedIconURL, ...safeIncoming } = incoming;
+    const {
+      files: _unusedFiles,
+      iconURL: _unusedIconURL,
+      interactionContext: _untrustedInteractionContext,
+      interaction_context: _untrustedInteractionContextSnake,
+      viventiumInteractionContext: _untrustedViventiumInteractionContext,
+      adapterCapabilities: _untrustedAdapterCapabilities,
+      adapter_capabilities: _untrustedAdapterCapabilitiesSnake,
+      ...safeIncoming
+    } = incoming;
 
     req.body = {
       ...safeIncoming,
@@ -1090,7 +1176,12 @@ router.post(
       parentMessageId,
       agent_id: agentId,
       streamId,
-      files: uploadedFiles,
+      files: uploadedFiles
+        .filter((file) => file?.viventium_media_group_kind !== 'image')
+        .map(
+          ({ viventium_media_group_index: _index, viventium_media_group_kind: _kind, ...file }) =>
+            file,
+        ),
     };
     if (resolvedSpec) {
       req.body.spec = resolvedSpec;
@@ -1121,6 +1212,16 @@ router.post(
       logger.info(
         '[VIVENTIUM][telegram/chat] Images prepared for vision: count=%d',
         allFormattedImages.length,
+      );
+    }
+    /* === VIVENTIUM START ===
+     * Feature: Durable Telegram media parity for background missions.
+     * Purpose: Preserve the authenticated media-group order as owner-scoped upload references.
+     * These private request fields are projected only into GlassHive's trusted file envelope.
+     * === VIVENTIUM END === */
+    if (uploadedFiles.length > 0) {
+      req._viventiumMissionAttachments = uploadedFiles.map(
+        ({ viventium_media_group_kind: _kind, ...file }) => ({ ...file }),
       );
     }
 
@@ -1160,18 +1261,19 @@ router.post(
   async (req, res, next) => {
     const originalJson = res.json.bind(res);
     res.json = (payload) => {
+      const withLogicalTurn = attachLogicalTurnMetadata(payload, getTrustedInteractionContext(req));
       if (
-        payload &&
-        typeof payload === 'object' &&
+        withLogicalTurn &&
+        typeof withLogicalTurn === 'object' &&
         req.viventiumTelegramVoiceRoute &&
-        !Object.prototype.hasOwnProperty.call(payload, 'voiceRoute')
+        !Object.prototype.hasOwnProperty.call(withLogicalTurn, 'voiceRoute')
       ) {
         return originalJson({
-          ...payload,
+          ...withLogicalTurn,
           voiceRoute: req.viventiumTelegramVoiceRoute,
         });
       }
-      return originalJson(payload);
+      return originalJson(withLogicalTurn);
     };
     const controllerStartTs = performance.now();
     const result = await AgentController(req, res, next, initializeClient, addTitle);
@@ -1231,6 +1333,169 @@ router.post('/preferences', telegramAuth, async (req, res) => {
   });
 });
 
+/* === VIVENTIUM START ===
+ * Feature: Telegram Parallel work account and Active work controls.
+ * Purpose: Use the same linked account preference and exact-work plane as Web/Main, without a
+ * model call or Telegram-owned mission registry.
+ * === VIVENTIUM END === */
+const PARALLEL_WORK_ACTIONS = new Set([
+  'queue',
+  'message',
+  'steer',
+  'pause',
+  'resume',
+  'stop',
+  'retry',
+  'dismiss',
+]);
+const PARALLEL_WORK_INSTRUCTION_ACTIONS = new Set(['queue', 'message', 'steer']);
+const WORK_REF_PATTERN = /^[A-Za-z0-9._:-]{1,160}$/;
+const OPERATION_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+const {
+  effectiveOrchestrationMode,
+  parallelWorkAvailable,
+} = require('~/server/services/viventium/ViventiumOrchestrationMode');
+const {
+  observeOrchestrationOwner,
+  refreshOrchestrationReadiness,
+} = require('~/server/services/viventium/GlassHiveOrchestrationReadinessService');
+
+function telegramOrchestrationResponse(user) {
+  const available = parallelWorkAvailable();
+  return {
+    available,
+    mode: effectiveOrchestrationMode(user, { available }),
+    hasKnownWork: user?.personalization?.parallel_work_known === true,
+  };
+}
+
+function setTelegramOrchestrationNoStore(res) {
+  res.setHeader('Cache-Control', 'no-store, private');
+  res.setHeader('Pragma', 'no-cache');
+}
+
+router.get('/orchestration', telegramAuth, async (req, res) => {
+  setTelegramOrchestrationNoStore(res);
+  observeOrchestrationOwner(String(req.user.id));
+  return res.json(telegramOrchestrationResponse(req.user));
+});
+
+router.patch('/orchestration', telegramAuth, async (req, res) => {
+  setTelegramOrchestrationNoStore(res);
+  const ownerId = String(req.user.id);
+  observeOrchestrationOwner(ownerId);
+  const mode = String(req.body?.mode || '').trim();
+  if (!['focused', 'parallel'].includes(mode)) {
+    return res.status(400).json({
+      error: 'Mode must be focused or parallel.',
+      code: 'INVALID_ORCHESTRATION_PREFERENCE',
+    });
+  }
+  if (mode === 'parallel' && !parallelWorkAvailable()) {
+    await refreshOrchestrationReadiness({ ownerId });
+  }
+  if (mode === 'parallel' && !parallelWorkAvailable()) {
+    return res.status(409).json({
+      error: 'Parallel work is not available in this runtime yet.',
+      code: 'PARALLEL_WORK_UNAVAILABLE',
+    });
+  }
+  try {
+    const user = await updateUserViventiumOrchestrationPreferences(ownerId, { mode });
+    if (!user) {
+      return res.status(404).json({ error: 'Account not found.', code: 'ACCOUNT_NOT_FOUND' });
+    }
+    return res.json(telegramOrchestrationResponse(user));
+  } catch (error) {
+    logger.error('[VIVENTIUM][telegram/orchestration] Preference update failed', {
+      errorClass: String(error?.message || 'orchestration_update_failed').slice(0, 120),
+    });
+    return res.status(500).json({
+      error: 'Unable to update Parallel work.',
+      code: 'ORCHESTRATION_UPDATE_FAILED',
+    });
+  }
+});
+
+router.get('/orchestration/work', telegramAuth, async (req, res) => {
+  setTelegramOrchestrationNoStore(res);
+  const cursor = String(req.query?.cursor || '').trim();
+  const limit = Number(req.query?.limit || 50);
+  if (
+    (cursor && (cursor.length > 2048 || !/^[A-Za-z0-9._~:@+-]+$/.test(cursor))) ||
+    !Number.isInteger(limit) ||
+    limit < 1 ||
+    limit > 100
+  ) {
+    return res.status(400).json({
+      error: 'The Active work page is invalid.',
+      code: 'INVALID_ACTIVE_WORK_CURSOR',
+    });
+  }
+  try {
+    return res.json(
+      cursor
+        ? await getActiveWorkPage({ ownerId: String(req.user.id), cursor, limit })
+        : await getActiveWorkInteractiveSnapshot({ ownerId: String(req.user.id) }),
+    );
+  } catch (error) {
+    logger.error('[VIVENTIUM][telegram/orchestration] Active work read failed', {
+      errorClass: String(error?.message || 'active_work_read_failed').slice(0, 120),
+    });
+    return res.status(500).json({
+      error: 'Unable to read Active work.',
+      code: 'ACTIVE_WORK_READ_FAILED',
+    });
+  }
+});
+
+router.post('/orchestration/work/:workRef/actions', telegramAuth, async (req, res) => {
+  setTelegramOrchestrationNoStore(res);
+  const workRef = String(req.params?.workRef || '').trim();
+  const action = String(req.body?.action || '').trim();
+  const instruction = String(req.body?.instruction || '').trim();
+  const operationId = String(req.body?.operationId || '').trim();
+  if (
+    !WORK_REF_PATTERN.test(workRef) ||
+    !PARALLEL_WORK_ACTIONS.has(action) ||
+    !OPERATION_ID_PATTERN.test(operationId) ||
+    (PARALLEL_WORK_INSTRUCTION_ACTIONS.has(action) && !instruction) ||
+    instruction.length > 8000
+  ) {
+    return res.status(400).json({
+      error: 'The Active work action is invalid.',
+      code: 'INVALID_WORK_ACTION',
+    });
+  }
+
+  const ownerId = String(req.user.id);
+  try {
+    const result = await executeGlassHiveWorkAction({
+      ownerId,
+      workRef,
+      action,
+      instruction,
+      operationId,
+    });
+    return res.status(202).json(result);
+  } catch (error) {
+    const status = Number(error?.status);
+    logger.warn('[VIVENTIUM][telegram/orchestration] Active work action rejected', {
+      action,
+      status: Number.isInteger(status) ? status : 502,
+      errorClass: String(error?.message || 'active_work_action_failed').slice(0, 120),
+    });
+    return res
+      .status(Number.isInteger(status) && status >= 400 && status < 600 ? status : 502)
+      .json({
+        error: error?.userMessage || 'Unable to apply the Active work action.',
+        code: error?.message || 'ACTIVE_WORK_ACTION_FAILED',
+      });
+  }
+});
+
 router.get('/stream/:streamId', telegramAuth, async (req, res) => {
   const { streamId } = req.params;
   const isResume = req.query.resume === 'true';
@@ -1254,9 +1519,14 @@ router.get('/stream/:streamId', telegramAuth, async (req, res) => {
     });
   }
 
-  if (job.metadata?.userId && job.metadata.userId !== userId) {
-    return res.status(403).json({ error: 'Unauthorized' });
+  if (!userId || job.metadata?.userId !== userId) {
+    return res.status(404).json({
+      error: 'Stream not found',
+      message: 'The generation job does not exist or has expired.',
+    });
   }
+  const withStreamLogicalTurn = (event) =>
+    attachLogicalTurnMetadata(event, job.metadata?.interactionContext);
 
   res.setHeader('Content-Encoding', 'identity');
   res.setHeader('Content-Type', 'text/event-stream');
@@ -1296,7 +1566,9 @@ router.get('/stream/:streamId', telegramAuth, async (req, res) => {
   if (isResume) {
     const resumeState = await GenerationJobManager.getResumeState(streamId);
     if (resumeState && !res.writableEnded) {
-      res.write(`event: message\ndata: ${JSON.stringify({ sync: true, resumeState })}\n\n`);
+      res.write(
+        `event: message\ndata: ${JSON.stringify(withStreamLogicalTurn({ sync: true, resumeState }))}\n\n`,
+      );
       if (typeof res.flush === 'function') {
         res.flush();
       }
@@ -1331,7 +1603,7 @@ router.get('/stream/:streamId', telegramAuth, async (req, res) => {
           logTelegramTiming(traceId, 'stream_first_event', streamStartTs);
           firstEventLogged = true;
         }
-        res.write(`event: message\ndata: ${JSON.stringify(event)}\n\n`);
+        res.write(`event: message\ndata: ${JSON.stringify(withStreamLogicalTurn(event))}\n\n`);
         if (typeof res.flush === 'function') {
           res.flush();
         }
@@ -1350,7 +1622,7 @@ router.get('/stream/:streamId', telegramAuth, async (req, res) => {
         }
       }
       if (!res.writableEnded) {
-        res.write(`event: message\ndata: ${JSON.stringify(event)}\n\n`);
+        res.write(`event: message\ndata: ${JSON.stringify(withStreamLogicalTurn(event))}\n\n`);
         if (typeof res.flush === 'function') {
           res.flush();
         }

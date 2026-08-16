@@ -41,6 +41,10 @@ const { getLogStores } = require('~/cache');
 const {
   maybeInjectGlassHiveCapabilityBroker,
 } = require('~/server/services/viventium/GlassHiveCapabilityBootstrapService');
+const {
+  markGlassHiveLaunchDispatchUnknown,
+  reconcileGlassHiveLaunchResult,
+} = require('~/server/services/viventium/GlassHiveCallbackBindingService');
 
 /* === VIVENTIUM START ===
  * Feature: Deep Telegram timing instrumentation (toggleable)
@@ -80,15 +84,19 @@ const _logTelegramMcpTiming = (streamId, step, startTs, extra = '') => {
 async function resolveConfigServers(req) {
   try {
     const registry = getMCPServersRegistry();
-    if (typeof registry.ensureConfigServers !== 'function') {
-      return {};
-    }
     const user = req?.user;
     const appConfig = await getAppConfig({
       role: user?.role,
       userId: user?.id,
     });
-    return await registry.ensureConfigServers(appConfig?.mcpConfig || {});
+    const configServers = appConfig?.mcpConfig || {};
+    if (typeof registry.ensureConfigServers === 'function') {
+      return await registry.ensureConfigServers(configServers);
+    }
+    if (typeof registry.getAllServerConfigs === 'function') {
+      return await registry.getAllServerConfigs(user?.id, configServers);
+    }
+    return configServers;
   } catch (error) {
     logger.warn(
       '[resolveConfigServers] Failed to resolve config servers, degrading to empty:',
@@ -549,6 +557,7 @@ function createToolInstance({
     let abortHandler = null;
     /** @type {AbortSignal} */
     let derivedSignal = null;
+    let effectiveToolArguments = null;
 
     try {
       const flowsCache = getLogStores(CacheKeys.FLOWS);
@@ -585,7 +594,7 @@ function createToolInstance({
       const customUserVars =
         config?.configurable?.userMCPAuthMap?.[`${Constants.mcp_prefix}${serverName}`];
 
-      const effectiveToolArguments = await maybeInjectGlassHiveCapabilityBroker({
+      effectiveToolArguments = await maybeInjectGlassHiveCapabilityBroker({
         serverName,
         toolName,
         toolArguments,
@@ -615,6 +624,11 @@ function createToolInstance({
         graphTokenResolver: getGraphApiToken,
       });
 
+      await reconcileGlassHiveLaunchResult({
+        toolArguments: effectiveToolArguments,
+        result,
+      });
+
       if (isAssistantsEndpoint(provider) && Array.isArray(result)) {
         return result[0];
       }
@@ -623,6 +637,15 @@ function createToolInstance({
       }
       return result;
     } catch (error) {
+      if (effectiveToolArguments) {
+        try {
+          await markGlassHiveLaunchDispatchUnknown(effectiveToolArguments);
+        } catch (reconcileError) {
+          logger.warn('[VIVENTIUM][glasshive-binding] Failed to mark uncertain dispatch', {
+            message: reconcileError?.message,
+          });
+        }
+      }
       logger.error(
         `[MCP][${serverName}][${toolName}][User: ${userId}] Error calling MCP tool:`,
         error,

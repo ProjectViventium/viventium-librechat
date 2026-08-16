@@ -33,8 +33,13 @@ const { initializeClient } = require('~/server/services/Endpoints/agents');
 const addTitle = require('~/server/services/Endpoints/agents/title');
 const AgentController = require('~/server/controllers/agents/request');
 const {
+  abandonVoiceSessionClaim,
   assertCallSessionSecret,
+  assertCallBrowserCapability,
   claimVoiceSession,
+  heartbeatCallSession,
+  markVoiceSessionReady,
+  reportVoiceSessionFailure,
   assertVoiceGatewayAuth,
   claimOrReplaceCallSessionConversationId,
   materializeCallSessionConversationId,
@@ -65,6 +70,12 @@ const {
   resolveReusableConversationState,
 } = require('~/server/services/viventium/conversationThreading');
 const {
+  attachLogicalTurnMetadata,
+  createVoiceInteractionContext,
+  getTrustedInteractionContext,
+  setTrustedInteractionContext,
+} = require('~/server/services/viventium/interactionContext');
+const {
   isListenOnlyTranscriptMessage,
 } = require('~/server/services/viventium/listenOnlyTranscript');
 const {
@@ -74,6 +85,43 @@ const {
   markVoiceLatencyStart,
   voiceLatencyNow,
 } = require('~/server/services/viventium/voiceLatencyTiming');
+const {
+  legacySpeakerLabel,
+  listSpeakerSegments,
+  normalizeSpeakerSegments,
+  persistSpeakerSegments,
+  persistSpeakerSessionState,
+  projectSpeakerSegmentRevisionsToMessages,
+  voiceTurnAuthority,
+} = require('~/server/services/viventium/SpeakerSegmentService');
+const {
+  bindVoiceTaskStream,
+  canConfirmVoiceTaskCancellation,
+  completeVoiceTask,
+  createVoiceTask,
+  failVoiceTask,
+  getVoiceTask,
+  getVoiceTaskByStreamId,
+  getVoiceTaskOwnerCapabilityInventory,
+  hydrateVoiceTask,
+  hydrateVoiceTaskByStreamId,
+  hydrateVoiceTasksForCall,
+  isVoiceTaskSuppressedDurably,
+  listVoiceTasks,
+  listDurableVoiceTaskSnapshots,
+  observeGenerationEvent,
+  requestVoiceTaskOwnerCancellation,
+  retryVoiceTask,
+  settleVoiceTaskCancellation,
+  snapshotEvent,
+  submitVoiceTaskInput,
+  subscribeVoiceTask,
+  subscribeVoiceTasksForCall,
+  subscribeDurableVoiceTaskEventsForCall,
+} = require('~/server/services/viventium/VoiceTaskService');
+const {
+  requireVoiceAgentAccess,
+} = require('~/server/services/viventium/VoiceAgentAuthorizationService');
 
 function parseBoolEnv(name, fallback) {
   const raw = process.env[name];
@@ -106,6 +154,25 @@ const VOICE_LIVE_TURN_COALESCE_WINDOW_MS = Math.max(
   parseIntEnv('VIVENTIUM_VOICE_LIVE_TURN_COALESCE_WINDOW_MS', VOICE_TURN_COALESCE_WINDOW_MS),
   0,
 );
+const ambientTranscriptTails = new Map();
+
+async function acquireAmbientTranscriptLock(callSessionId) {
+  const key = String(callSessionId || '');
+  const previous = ambientTranscriptTails.get(key) || Promise.resolve();
+  let releaseCurrent;
+  const current = new Promise((resolve) => {
+    releaseCurrent = resolve;
+  });
+  const tail = previous.then(() => current);
+  ambientTranscriptTails.set(key, tail);
+  await previous;
+  return () => {
+    releaseCurrent();
+    if (ambientTranscriptTails.get(key) === tail) {
+      ambientTranscriptTails.delete(key);
+    }
+  };
+}
 const VOICE_LISTEN_ONLY_TURN_COALESCE_WINDOW_MS = Math.max(
   parseIntEnv(
     'VIVENTIUM_VOICE_LISTEN_ONLY_TURN_COALESCE_WINDOW_MS',
@@ -159,6 +226,12 @@ function initializeVoiceChatLatency(req, _res, next) {
   const logLatency = parseBoolEnv('VIVENTIUM_VOICE_LOG_LATENCY', false);
   if (logLatency) {
     markVoiceLatencyStart(req, req.get('X-VIVENTIUM-REQUEST-ID') || '');
+    logVoiceRouteStage(
+      req,
+      'gateway_dispatch_received',
+      req.viventiumVoicePerfStartAt,
+      'method=POST',
+    );
     logVoiceRouteStage(req, 'voice_chat_route_enter', req.viventiumVoicePerfStartAt, 'method=POST');
   }
   next();
@@ -301,14 +374,57 @@ function combineVoiceTurnSegments(segments) {
   );
 }
 
+function combineVoiceSpeakerSegments(segments) {
+  if (!Array.isArray(segments)) {
+    return [];
+  }
+  const candidates = [];
+  segments.forEach((turnSegment, turnIndex) => {
+    const receivedAtMs = Number(turnSegment?.receivedAtMs) || 0;
+    const speakerSegments = Array.isArray(turnSegment?.speakerSegments)
+      ? turnSegment.speakerSegments
+      : turnSegment?.speakerSegment
+        ? [turnSegment.speakerSegment]
+        : [];
+    speakerSegments.forEach((speakerSegment, speakerIndex) => {
+      if (!speakerSegment?.segmentId) return;
+      candidates.push({ speakerSegment, receivedAtMs, turnIndex, speakerIndex });
+    });
+  });
+  candidates.sort(
+    (left, right) =>
+      left.receivedAtMs - right.receivedAtMs ||
+      left.turnIndex - right.turnIndex ||
+      Number(left.speakerSegment.sequence || 0) - Number(right.speakerSegment.sequence || 0) ||
+      left.speakerIndex - right.speakerIndex,
+  );
+  const bestRevisionById = new Map();
+  for (const candidate of candidates) {
+    const existing = bestRevisionById.get(candidate.speakerSegment.segmentId);
+    if (!existing || Number(candidate.speakerSegment.revision) > Number(existing.revision)) {
+      bestRevisionById.set(candidate.speakerSegment.segmentId, candidate.speakerSegment);
+    }
+  }
+  return [...bestRevisionById.values()].sort(
+    (left, right) => Number(left.sequence || 0) - Number(right.sequence || 0),
+  );
+}
+
 function voiceTurnTextAlreadyCaptured(capturedText, incomingText) {
   const captured = normalizeVoiceTurnText(capturedText);
   const incoming = normalizeVoiceTurnText(incomingText);
   return Boolean(captured && incoming && captured.includes(incoming));
 }
 
-function buildVoiceIngressKey({ callSessionId, conversationId, parentMessageId, mode }) {
+function buildVoiceIngressKey({
+  callSessionId,
+  conversationId,
+  parentMessageId,
+  mode,
+  speakerSegmentId,
+}) {
   const normalizedMode = mode || 'normal';
+  const normalizedSpeakerSegmentId = normalizeVoiceTurnText(speakerSegmentId).slice(0, 160);
   if (normalizedMode === 'listen_only') {
     return callSessionId ? `${normalizedMode}:${callSessionId}:listen-only-root` : '';
   }
@@ -318,7 +434,9 @@ function buildVoiceIngressKey({ callSessionId, conversationId, parentMessageId, 
     return '';
   }
   if (!conversationId) {
-    return '';
+    return callSessionId && normalizedSpeakerSegmentId
+      ? `${normalizedMode}:${callSessionId}:speaker-segment:${normalizedSpeakerSegmentId}`
+      : '';
   }
   return `${normalizedMode}:${callSessionId}:${conversationId}:${normalizedParentMessageId}`;
 }
@@ -337,14 +455,23 @@ async function coalesceVoiceTurn({
   receivedAtMs,
   requestId,
   mode = 'normal',
+  speakerSegments = [],
 }) {
   const normalizedText = normalizeVoiceTurnText(text);
-  const dedupeKey = buildVoiceIngressKey({ callSessionId, conversationId, parentMessageId, mode });
+  const speakerSegmentId = Array.isArray(speakerSegments) ? speakerSegments[0]?.segmentId : '';
+  const dedupeKey = buildVoiceIngressKey({
+    callSessionId,
+    conversationId,
+    parentMessageId,
+    mode,
+    speakerSegmentId,
+  });
   const coalesceWindowMs = resolveVoiceTurnCoalesceWindowMs(mode);
   if (!VOICE_TURN_COALESCE_ENABLED || !normalizedText || !dedupeKey) {
     return {
       shouldLaunch: true,
       mergedText: normalizedText || text,
+      mergedSpeakerSegments: Array.isArray(speakerSegments) ? speakerSegments : [],
       dedupeKey: '',
       coalesceWindowMs,
     };
@@ -355,6 +482,10 @@ async function coalesceVoiceTurn({
     text: normalizedText,
     receivedAtMs: normalizedReceivedAtMs,
     requestId,
+    ...(Array.isArray(speakerSegments) && speakerSegments[0]
+      ? { speakerSegment: speakerSegments[0] }
+      : {}),
+    speakerSegments: Array.isArray(speakerSegments) ? speakerSegments : [],
   };
   const expiresAt = new Date(Date.now() + VOICE_TURN_COALESCE_TTL_S * 1000);
   try {
@@ -376,9 +507,11 @@ async function coalesceVoiceTurn({
     const doc = await findVoiceIngressEvent({ dedupeKey });
     const mergedText =
       combineVoiceTurnSegments(doc?.segments || [normalizedText]) || normalizedText;
+    const mergedSpeakerSegments = combineVoiceSpeakerSegments(doc?.segments || [segment]);
     return {
       shouldLaunch: true,
       mergedText,
+      mergedSpeakerSegments,
       dedupeKey,
       coalesceWindowMs,
     };
@@ -468,9 +601,13 @@ async function coalesceVoiceTurn({
           const latestDoc = await findVoiceIngressEvent({ dedupeKey });
           const mergedText =
             combineVoiceTurnSegments(latestDoc?.segments || [segment]) || normalizedText;
+          const mergedSpeakerSegments = combineVoiceSpeakerSegments(
+            latestDoc?.segments || [segment],
+          );
           return {
             shouldLaunch: true,
             mergedText,
+            mergedSpeakerSegments,
             dedupeKey,
             continuationMessageId: messageId,
             coalesceWindowMs,
@@ -501,9 +638,11 @@ async function coalesceVoiceTurn({
         const latestDoc = await findVoiceIngressEvent({ dedupeKey });
         const mergedText =
           combineVoiceTurnSegments(latestDoc?.segments || [segment]) || normalizedText;
+        const mergedSpeakerSegments = combineVoiceSpeakerSegments(latestDoc?.segments || [segment]);
         return {
           shouldLaunch: true,
           mergedText,
+          mergedSpeakerSegments,
           dedupeKey,
           coalesceWindowMs,
         };
@@ -517,9 +656,11 @@ async function coalesceVoiceTurn({
     await sleep(VOICE_TURN_COALESCE_POLL_MS);
   }
 
+  const latestDoc = dedupeKey ? await findVoiceIngressEvent({ dedupeKey }) : null;
   return {
     shouldLaunch: true,
-    mergedText: normalizedText,
+    mergedText: combineVoiceTurnSegments(latestDoc?.segments || [segment]) || normalizedText,
+    mergedSpeakerSegments: combineVoiceSpeakerSegments(latestDoc?.segments || [segment]),
     dedupeKey: '',
     coalesceWindowMs,
   };
@@ -531,6 +672,12 @@ async function coalesceVoiceTurn({
  * background cortex, TTS, tools, or live memory writer path.
  * === VIVENTIUM END === */
 function normalizeListenOnlySpeakerLabel(incoming) {
+  const normalizedSegments = Array.isArray(incoming?.speakerSegments)
+    ? incoming.speakerSegments
+    : [];
+  if (normalizedSegments.length > 0) {
+    return legacySpeakerLabel(normalizedSegments);
+  }
   const candidates = [incoming?.participantName, incoming?.participantIdentity, incoming?.trackSid];
   for (const candidate of candidates) {
     if (typeof candidate === 'string' && candidate.trim()) {
@@ -681,6 +828,7 @@ async function persistListenOnlyTranscript({
 
   const now = new Date();
   const speakerLabel = normalizeListenOnlySpeakerLabel(incoming);
+  const speakerSegments = Array.isArray(incoming?.speakerSegments) ? incoming.speakerSegments : [];
   const requestId =
     req.viventiumVoiceRequestId || req.get('X-VIVENTIUM-REQUEST-ID') || crypto.randomUUID();
   const normalizedContinuationMessageId =
@@ -703,6 +851,7 @@ async function persistListenOnlyTranscript({
           unfinished: false,
           error: false,
           'metadata.viventium.speakerLabel': speakerLabel,
+          'metadata.viventium.speakerSegments': speakerSegments,
           'metadata.viventium.requestId': requestId,
         },
       },
@@ -810,6 +959,7 @@ async function persistListenOnlyTranscript({
             ambientKind: 'ambient_room_transcript',
             callSessionId: session?.callSessionId || null,
             speakerLabel,
+            speakerSegments,
             requestId,
           },
         },
@@ -871,6 +1021,7 @@ async function handleListenOnlyVoiceTurn({ req, res, session }) {
     requestId:
       req.viventiumVoiceRequestId || req.get('X-VIVENTIUM-REQUEST-ID') || crypto.randomUUID(),
     mode: 'listen_only',
+    speakerSegments: req.body?.speakerSegments,
   });
 
   if (!coalescedTurn.shouldLaunch && coalescedTurn.payload) {
@@ -891,6 +1042,10 @@ async function handleListenOnlyVoiceTurn({ req, res, session }) {
         `chars=${req.body?.text?.length || 0}->${coalescedTurn.mergedText.length}`,
     );
     req.body.text = coalescedTurn.mergedText;
+  }
+  if (Array.isArray(coalescedTurn.mergedSpeakerSegments)) {
+    req.body.speakerSegments = coalescedTurn.mergedSpeakerSegments;
+    req.body.speakerLabel = legacySpeakerLabel(coalescedTurn.mergedSpeakerSegments);
   }
 
   logger.info(
@@ -974,6 +1129,11 @@ async function handleListenOnlyVoiceTurn({ req, res, session }) {
  * breaking conversation continuity and cortex insight recall.
  * === VIVENTIUM NOTE === */
 const router = express.Router();
+const CLAIM_ABANDON_REASONS = new Set([
+  'owner_timeout',
+  'owner_mismatch',
+  'gateway_initialization_failed',
+]);
 
 // IMPORTANT:
 // Do NOT run configMiddleware until after voiceAuth sets req.user/role.
@@ -986,6 +1146,172 @@ const router = express.Router();
  * - Ensure only one LiveKit worker owns a call session at a time.
  * - Prevent duplicate voice responses when dispatch races spawn multiple workers.
  * === VIVENTIUM NOTE === */
+router.post('/claim/abandon', async (req, res) => {
+  try {
+    const callSessionId =
+      req.get('X-VIVENTIUM-CALL-SESSION') || req.get('x-viventium-call-session') || '';
+    const secret = req.get('X-VIVENTIUM-CALL-SECRET') || req.get('x-viventium-call-secret') || '';
+    const jobId = req.get('X-VIVENTIUM-JOB-ID') || req.get('x-viventium-job-id') || '';
+    const workerId = req.get('X-VIVENTIUM-WORKER-ID') || req.get('x-viventium-worker-id') || '';
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
+    if (
+      !jobId ||
+      !workerId ||
+      jobId.length > 160 ||
+      workerId.length > 160 ||
+      !CLAIM_ABANDON_REASONS.has(reason)
+    ) {
+      return res.status(400).json({
+        code: 'provider_failure',
+        message: 'A valid job, worker, and abandon reason are required.',
+        retryable: false,
+      });
+    }
+    const session = await assertCallSessionSecret(callSessionId, secret);
+    const released = await abandonVoiceSessionClaim({
+      callSessionId: session.callSessionId,
+      jobId,
+      workerId,
+    });
+    logger.info('[VIVENTIUM][voice/claim] gateway_start_abandoned', {
+      callSessionId: session.callSessionId,
+      jobId,
+      workerId,
+      reason,
+      released,
+    });
+    return res.json({ version: 1, released });
+  } catch (err) {
+    const status = err?.status || 401;
+    return res.status(status).json({
+      code: status === 401 ? 'auth_expired' : 'unknown',
+      message: status === 401 ? 'The call session is unavailable.' : 'Unable to release the claim.',
+      retryable: false,
+    });
+  }
+});
+
+router.post('/call-sessions/:callSessionId/failure', async (req, res) => {
+  try {
+    const headerSessionId =
+      req.get('X-VIVENTIUM-CALL-SESSION') || req.get('x-viventium-call-session') || '';
+    const secret = req.get('X-VIVENTIUM-CALL-SECRET') || req.get('x-viventium-call-secret') || '';
+    const jobId = req.get('X-VIVENTIUM-JOB-ID') || req.get('x-viventium-job-id') || '';
+    const workerId = req.get('X-VIVENTIUM-WORKER-ID') || req.get('x-viventium-worker-id') || '';
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const classification = typeof body.classification === 'string' ? body.classification : '';
+    const modality = typeof body.modality === 'string' ? body.modality : '';
+    const provider = typeof body.provider === 'string' ? body.provider.trim() : '';
+    const phase = typeof body.phase === 'string' ? body.phase : '';
+    if (
+      headerSessionId !== req.params.callSessionId ||
+      Number(body.version) !== 1 ||
+      !['no_route', 'provider_failure', 'gateway_down'].includes(classification) ||
+      (modality && !['stt', 'tts'].includes(modality)) ||
+      !['initialization', 'runtime'].includes(phase) ||
+      typeof body.fatal !== 'boolean' ||
+      !jobId ||
+      !workerId ||
+      jobId.length > 160 ||
+      workerId.length > 160 ||
+      provider.length > 80
+    ) {
+      return res.status(400).json({
+        code: 'provider_failure',
+        message: 'Invalid structured voice failure report.',
+        retryable: false,
+      });
+    }
+    const session = await assertCallSessionSecret(headerSessionId, secret);
+    const updated = await reportVoiceSessionFailure({
+      callSessionId: session.callSessionId,
+      jobId,
+      workerId,
+      classification,
+      modality,
+      provider,
+      phase,
+      fatal: body.fatal,
+    });
+    if (!updated) {
+      return res.status(409).json({
+        code: 'auth_expired',
+        message: 'The gateway no longer owns this call session.',
+        retryable: false,
+      });
+    }
+    return res.json({
+      version: 1,
+      callSessionId: updated.callSessionId,
+      status: updated.status,
+      error: updated.error,
+    });
+  } catch (err) {
+    return res.status(err?.status || 401).json({
+      code: 'auth_expired',
+      message: 'The call session is unavailable.',
+      retryable: false,
+    });
+  }
+});
+
+/* === VIVENTIUM START ===
+ * Feature: exact-owner provider recovery readiness
+ * Purpose: Clear a retryable startup/runtime failure only after the currently claimed gateway
+ * proves provider and call-session readiness; browser state writes cannot acknowledge recovery.
+ * === VIVENTIUM END === */
+router.post('/call-sessions/:callSessionId/ready', async (req, res) => {
+  try {
+    const headerSessionId =
+      req.get('X-VIVENTIUM-CALL-SESSION') || req.get('x-viventium-call-session') || '';
+    const secret = req.get('X-VIVENTIUM-CALL-SECRET') || req.get('x-viventium-call-secret') || '';
+    const jobId = req.get('X-VIVENTIUM-JOB-ID') || req.get('x-viventium-job-id') || '';
+    const workerId = req.get('X-VIVENTIUM-WORKER-ID') || req.get('x-viventium-worker-id') || '';
+    if (
+      Number(req.body?.version) !== 1 ||
+      headerSessionId !== req.params.callSessionId ||
+      !jobId ||
+      !workerId ||
+      jobId.length > 160 ||
+      workerId.length > 160
+    ) {
+      return res.status(400).json({
+        code: 'provider_failure',
+        message: 'A valid call session, job, and worker are required.',
+        retryable: false,
+      });
+    }
+    const session = await assertCallSessionSecret(headerSessionId, secret);
+    const updated = await markVoiceSessionReady({
+      callSessionId: session.callSessionId,
+      jobId,
+      workerId,
+    });
+    if (!updated) {
+      return res.status(409).json({
+        code: 'auth_expired',
+        message: 'The gateway no longer owns this call session.',
+        retryable: false,
+      });
+    }
+    return res.json({
+      version: 1,
+      callSessionId: updated.callSessionId,
+      mode: updated.mode || 'call',
+      status: 'listening',
+      revision: Number(updated.revision) || 0,
+      updatedAt: new Date(Number(updated.updatedAt)).toISOString(),
+    });
+  } catch (error) {
+    const status = error?.status || 401;
+    return res.status(status).json({
+      code: 'auth_expired',
+      message: 'The call session expired or is unauthorized.',
+      retryable: false,
+    });
+  }
+});
+
 router.post('/claim', async (req, res) => {
   try {
     const callSessionId =
@@ -995,8 +1321,19 @@ router.post('/claim', async (req, res) => {
     const workerId = req.get('X-VIVENTIUM-WORKER-ID') || req.get('x-viventium-worker-id') || '';
 
     const session = await assertCallSessionSecret(callSessionId, secret);
-    if (!jobId) {
-      return res.status(400).json({ error: 'Missing voice job id' });
+    if (session.status === 'ended') {
+      return res.status(410).json({
+        code: 'auth_expired',
+        message: 'The call session has ended.',
+        retryable: false,
+      });
+    }
+    if (!jobId || !workerId || jobId.length > 160 || workerId.length > 160) {
+      return res.status(400).json({
+        code: 'provider_failure',
+        message: 'A valid voice job and worker identity are required.',
+        retryable: false,
+      });
     }
 
     const claimed = await claimVoiceSession({
@@ -1005,20 +1342,69 @@ router.post('/claim', async (req, res) => {
       workerId,
     });
     if (!claimed) {
-      return res.status(409).json({ error: 'Voice session already claimed' });
+      return res.status(409).json({
+        code: 'auth_expired',
+        message: 'The call session is unavailable or already claimed.',
+        retryable: false,
+      });
     }
+    const claimMode = ['call', 'wing', 'listen_only'].includes(claimed.mode)
+      ? claimed.mode
+      : claimed.listenOnlyModeEnabled === true
+        ? 'listen_only'
+        : claimed.wingModeEnabled === true
+          ? 'wing'
+          : 'call';
+    const claimStatus = [
+      'created',
+      'connecting',
+      'listening',
+      'speaking',
+      'working',
+      'needs_input',
+      'degraded',
+      'failed',
+      'ended',
+    ].includes(claimed.status)
+      ? claimed.status
+      : 'created';
+    const claimUpdatedAt = new Date(Number(claimed.updatedAt)).toISOString();
 
     return res.json({
       status: 'claimed',
       callSessionId: claimed.callSessionId,
+      roomName: claimed.roomName,
+      gatewayAgentName: claimed.gatewayAgentName,
+      ownerParticipantIdentity: claimed.ownerParticipantIdentity,
+      requestedVoiceRoute: claimed.requestedVoiceRoute,
+      speakerSessionState: claimed.speakerSessionState || null,
       jobId: claimed.activeJobId,
       workerId: claimed.activeWorkerId,
       leaseExpiresAtMs: claimed.leaseExpiresAtMs,
+      callState: {
+        version: 1,
+        callSessionId: claimed.callSessionId,
+        mode: claimMode,
+        status: claimStatus,
+        revision: Number.isFinite(Number(claimed.revision)) ? Number(claimed.revision) : 0,
+        updatedAt: claimUpdatedAt,
+        ...(claimed.error ? { error: claimed.error } : {}),
+      },
     });
   } catch (err) {
     const status = err?.status || 401;
-    logger.error('[VIVENTIUM][voice/claim] Auth failed:', err);
-    return res.status(status).json({ error: err?.message || 'Unauthorized' });
+    logger.error('[VIVENTIUM][voice/claim] Auth failed', {
+      code: status === 401 || status === 410 ? 'auth_expired' : 'unknown',
+      status,
+    });
+    return res.status(status).json({
+      code: status === 401 || status === 410 ? 'auth_expired' : 'unknown',
+      message:
+        status === 401 || status === 410
+          ? 'The call session expired or is unauthorized.'
+          : 'The call session is unavailable.',
+      retryable: false,
+    });
   }
 });
 
@@ -1086,9 +1472,394 @@ async function voiceAuth(req, res, next) {
     );
     const status = err?.status || 401;
     logger.error('[VIVENTIUM][voiceAuth] Auth failed:', err);
-    return res.status(status).json({ error: err?.message || 'Unauthorized' });
+    return res.status(status).json({
+      code: 'auth_expired',
+      message: 'The call session expired or is unauthorized.',
+      retryable: false,
+    });
   }
 }
+
+/* === VIVENTIUM START ===
+ * Feature: browser-BFF call capability auth
+ * Purpose: The trusted UI server can restore captions and manage the current call's tasks without
+ * receiving a gateway job lease. This middleware is intentionally attached only to the bounded
+ * snapshot/control routes below; all ingress, event production, and speaker mutation keeps the
+ * stricter voiceAuth worker-job requirement.
+ * === VIVENTIUM END === */
+async function voiceSessionCapabilityAuth(req, res, next) {
+  try {
+    const callSessionId = req.get('X-VIVENTIUM-CALL-SESSION') || '';
+    const secret = req.get('X-VIVENTIUM-CALL-SECRET') || '';
+    const browserCapability = req.get('X-VIVENTIUM-CALL-CAPABILITY') || '';
+    if (!callSessionId) {
+      const error = new Error('Missing call session capability');
+      error.status = 401;
+      throw error;
+    }
+    const session = await assertCallSessionSecret(callSessionId, secret);
+    const browserSession = await assertCallBrowserCapability(callSessionId, browserCapability);
+    if (!session || session.callSessionId !== callSessionId) {
+      const error = new Error('Call session capability mismatch');
+      error.status = 401;
+      throw error;
+    }
+    if (browserSession.callSessionId !== session.callSessionId) {
+      const error = new Error('Call browser capability mismatch');
+      error.status = 401;
+      throw error;
+    }
+    const user = await getUserById(session.userId, '-password -__v -totpSecret -backupCodes');
+    if (!user) {
+      const error = new Error('User not found for call session');
+      error.status = 401;
+      throw error;
+    }
+    user.id = user._id.toString();
+    if (!user.role) {
+      user.role = SystemRoles.USER;
+    }
+    req.viventiumCallSession = session;
+    req.user = user;
+    return next();
+  } catch (error) {
+    return res.status(error?.status || 401).json({
+      code: 'auth_expired',
+      message: 'The call session expired or is unauthorized.',
+      retryable: false,
+    });
+  }
+}
+
+/* === VIVENTIUM START ===
+ * Feature: gateway dynamic call-mode state
+ * Purpose: Let the connected worker observe atomic Call/Wing/Listen-Only switches without
+ * reconnecting or trusting browser-supplied mode flags.
+ * === VIVENTIUM END === */
+router.get('/call-sessions/:callSessionId/state', voiceAuth, async (req, res) => {
+  const session = await heartbeatCallSession({
+    callSessionId: req.viventiumCallSession?.callSessionId,
+    currentSession: req.viventiumCallSession,
+  });
+  if (req.params.callSessionId !== session?.callSessionId) {
+    return res.status(404).json({
+      code: 'auth_expired',
+      message: 'Call session not found.',
+      retryable: false,
+    });
+  }
+  return res.json({
+    version: 1,
+    callSessionId: session.callSessionId,
+    mode:
+      session.mode ||
+      (session.listenOnlyModeEnabled === true
+        ? 'listen_only'
+        : session.wingModeEnabled === true
+          ? 'wing'
+          : 'call'),
+    status: session.status || 'created',
+    revision: Number(session.revision) || 0,
+    updatedAt: new Date(Number(session.updatedAt) || Date.now()).toISOString(),
+    ...(session.error ? { error: session.error } : {}),
+  });
+});
+
+/* === VIVENTIUM START ===
+ * Feature: Late SpeakerSegmentV1 revisions
+ * Purpose: Let the authenticated gateway downgrade/revise an earlier segment immediately, even
+ * when no later chat turn exists. Revisions are monotonic and remain scoped to the call session.
+ * === VIVENTIUM END === */
+router.post('/speaker-segments/revisions', voiceAuth, async (req, res) => {
+  const session = req.viventiumCallSession;
+  const revisions = normalizeSpeakerSegments(req.body?.speakerSegmentRevisions, {
+    callSessionId: session?.callSessionId,
+    ownerParticipantIdentity: session?.ownerParticipantIdentity,
+    ownerTrackSid: req.body?.ownerTrackSid,
+    speakerAttributionState: session?.speakerAttributionState,
+  });
+  if (revisions.length === 0) {
+    return res
+      .status(400)
+      .json({ error: 'speakerSegmentRevisions must contain a valid V1 segment' });
+  }
+  const result = await persistSpeakerSegments({
+    callSessionId: session.callSessionId,
+    currentSegments: [],
+    revisions,
+    expiresAtMs: session.expiresAtMs,
+    ownerParticipantIdentity: session?.ownerParticipantIdentity,
+    ownerTrackSid: req.body?.ownerTrackSid,
+    speakerAttributionState: session?.speakerAttributionState,
+  });
+  await projectSpeakerSegmentRevisionsToMessages({
+    callSessionId: session.callSessionId,
+    segments: result.effectiveSegments,
+  });
+  return res.json({ version: 1, accepted: result.accepted, ignored: result.ignored });
+});
+
+/* === VIVENTIUM START ===
+ * Feature: SpeakerSessionStateV1 downgrade tombstone
+ * Purpose: Persist the session-wide shared-microphone trust downgrade before paged segment
+ * revisions, so memory and action authority fail closed after reordering or partial delivery.
+ * === VIVENTIUM END === */
+router.post('/speaker-session-state', voiceAuth, async (req, res) => {
+  try {
+    const result = await persistSpeakerSessionState({
+      callSessionId: req.viventiumCallSession?.callSessionId,
+      state: req.body,
+    });
+    return res.json({ version: 1, accepted: result.accepted, state: result.state });
+  } catch (error) {
+    if (Number(error?.status) === 400) {
+      return res.status(400).json({
+        code: 'provider_failure',
+        message: error?.message || 'Invalid speaker session state.',
+        retryable: false,
+      });
+    }
+    logger.error('[VIVENTIUM][speaker-session-state] persistence failed', {
+      callSessionId: req.viventiumCallSession?.callSessionId,
+      error: error?.message || 'unknown',
+    });
+    return res.status(503).json({
+      code: 'gateway_down',
+      message: 'Speaker state persistence is temporarily unavailable.',
+      retryable: true,
+    });
+  }
+});
+
+/* === VIVENTIUM START ===
+ * Feature: SpeakerSegmentV1 reconnect snapshot
+ * Purpose: Restore persisted call-scoped captions after refresh/reconnect without exposing audio
+ * or another call session. The ledger is TTL-bounded and returns at most 512 latest segments.
+ * === VIVENTIUM END === */
+router.get('/speaker-segments', voiceSessionCapabilityAuth, async (req, res) => {
+  const callSessionId = typeof req.query?.callSessionId === 'string' ? req.query.callSessionId : '';
+  if (!callSessionId || callSessionId !== req.viventiumCallSession?.callSessionId) {
+    return res.status(403).json({
+      code: 'auth_expired',
+      message: 'Call session not found.',
+      retryable: false,
+    });
+  }
+  const beforeSequence =
+    req.query?.beforeSequence !== undefined &&
+    Number.isFinite(Number(req.query.beforeSequence)) &&
+    Number(req.query.beforeSequence) >= 0
+      ? Math.floor(Number(req.query.beforeSequence))
+      : undefined;
+  const beforeSegmentId =
+    typeof req.query?.beforeSegmentId === 'string' ? req.query.beforeSegmentId : undefined;
+  const afterSequence =
+    req.query?.afterSequence !== undefined &&
+    Number.isFinite(Number(req.query.afterSequence)) &&
+    Number(req.query.afterSequence) >= 0
+      ? Math.floor(Number(req.query.afterSequence))
+      : undefined;
+  const afterSegmentId =
+    typeof req.query?.afterSegmentId === 'string' ? req.query.afterSegmentId : undefined;
+  if (
+    (beforeSequence !== undefined || beforeSegmentId !== undefined) &&
+    (afterSequence !== undefined || afterSegmentId !== undefined)
+  ) {
+    return res.status(400).json({
+      code: 'unknown',
+      message: 'Speaker history accepts one paging direction at a time.',
+      retryable: false,
+    });
+  }
+  const page = await listSpeakerSegments({
+    callSessionId,
+    limit: 512,
+    beforeSequence,
+    beforeSegmentId,
+    afterSequence,
+    afterSegmentId,
+    page: true,
+  });
+  const normalizedPage = Array.isArray(page) ? { segments: page, hasMore: false } : page;
+  return res.json({ version: 1, ...normalizedPage });
+});
+
+/* === VIVENTIUM START ===
+ * Feature: authenticated ambient-participant transcript ingress
+ * Purpose: Persist signed non-owner tracks as soft call evidence while structurally avoiding the
+ * Agents controller and therefore TTS, tools, cortex, live memory, recall, and side effects.
+ * === VIVENTIUM END === */
+router.post('/ambient-transcript', voiceAuth, async (req, res) => {
+  const session = req.viventiumCallSession;
+  const incoming = req.body && typeof req.body === 'object' ? req.body : {};
+  const authoritativeMode = ['call', 'wing', 'listen_only'].includes(session?.mode)
+    ? session.mode
+    : session?.listenOnlyModeEnabled === true
+      ? 'listen_only'
+      : session?.wingModeEnabled === true
+        ? 'wing'
+        : 'call';
+  const isListenOnlyOwner = incoming.ingressKind === 'listen_only_owner';
+  if (
+    Number(incoming.version) !== 1 ||
+    !['ambient_participant', 'listen_only_owner'].includes(incoming.ingressKind) ||
+    incoming.callSessionId !== session?.callSessionId
+  ) {
+    return res.status(400).json({
+      code: 'unknown',
+      message: 'Invalid ambient participant transcript contract',
+      retryable: false,
+    });
+  }
+  if (isListenOnlyOwner && authoritativeMode !== 'listen_only') {
+    return res.status(409).json({
+      code: 'provider_failure',
+      message: 'Owner Listen-Only ingress requires an active Listen-Only call session.',
+      retryable: false,
+    });
+  }
+
+  const segments = normalizeSpeakerSegments(incoming.segments, {
+    callSessionId: session.callSessionId,
+    ambientIngress: true,
+    ...(isListenOnlyOwner ? { ownerParticipantIdentity: session?.ownerParticipantIdentity } : {}),
+    speakerAttributionState: session?.speakerAttributionState,
+  });
+  if (segments.length === 0) {
+    return res.status(400).json({
+      code: 'unknown',
+      message: 'segments must contain at least one valid SpeakerSegmentV1',
+      retryable: false,
+    });
+  }
+  const persistedSegments = await persistSpeakerSegments({
+    callSessionId: session.callSessionId,
+    currentSegments: segments,
+    revisions: [],
+    expiresAtMs: session.expiresAtMs,
+    ambientIngress: true,
+    ...(isListenOnlyOwner ? { ownerParticipantIdentity: session?.ownerParticipantIdentity } : {}),
+    speakerAttributionState: session?.speakerAttributionState,
+  });
+  const effectiveSegments = Array.isArray(persistedSegments.effectiveSegments)
+    ? persistedSegments.effectiveSegments
+    : segments.filter((segment) =>
+        [...(persistedSegments.accepted || []), ...(persistedSegments.ignored || [])].includes(
+          segment.segmentId,
+        ),
+      );
+  const releaseAmbientLock = await acquireAmbientTranscriptLock(session.callSessionId);
+  try {
+    const requestedConversationId = session.conversationId || 'new';
+    const state = await resolveReusableConversationState({
+      conversationId: requestedConversationId,
+      userId: req.user?.id,
+      surface: 'voice',
+      agentId: session.agentId,
+    });
+    let conversationId = state.conversationId;
+    if (!isConcreteConversationId(conversationId)) {
+      const materialized = await materializeCallSessionConversationId(
+        session.callSessionId,
+        crypto.randomUUID(),
+      );
+      conversationId = materialized?.conversationId;
+    }
+    if (!isConcreteConversationId(conversationId)) {
+      return res.status(409).json({
+        code: 'auth_expired',
+        message: 'The call session ended before its transcript could be saved.',
+        retryable: false,
+      });
+    }
+
+    const now = new Date();
+    let parentMessageId = state.parentMessageId;
+    const messageIds = [];
+    for (const segment of effectiveSegments) {
+      const messageId = `ambient-${crypto
+        .createHash('sha256')
+        .update(`${session.callSessionId}:${segment.segmentId}`)
+        .digest('hex')
+        .slice(0, 32)}`;
+      const existingMessage = await Message.findOne({ user: req.user.id, messageId })
+        .select({ _id: 1, messageId: 1, parentMessageId: 1 })
+        .lean();
+      const message = await Message.findOneAndUpdate(
+        { user: req.user.id, messageId },
+        {
+          $set: {
+            endpoint: 'agents',
+            sender: segment.speaker.label || 'Participant',
+            text: segment.text,
+            _meiliIndex: false,
+            memoryEligible: 'soft',
+            isCreatedByUser: false,
+            tokenCount: 0,
+            unfinished: !segment.isFinal,
+            error: false,
+            metadata: {
+              viventium: {
+                type: isListenOnlyOwner ? 'listen_only_transcript' : 'voice_ambient_transcript',
+                source: 'voice_call',
+                mode: authoritativeMode,
+                ingressKind: incoming.ingressKind,
+                ambientKind: isListenOnlyOwner
+                  ? 'listen_only_owner_track'
+                  : 'authenticated_participant_track',
+                callSessionId: session.callSessionId,
+                turnId: segment.turnId,
+                speakerLabel: segment.speaker.label || 'Unknown',
+                speakerSegments: [segment],
+                actorTrust: segment.speaker.actorTrust,
+                memoryEligible: 'soft',
+              },
+            },
+            updatedAt: now,
+          },
+          $setOnInsert: {
+            user: req.user.id,
+            messageId,
+            conversationId,
+            parentMessageId,
+            createdAt: now,
+          },
+        },
+        { upsert: true, new: true, timestamps: false, overwriteImmutable: true },
+      );
+      await Conversation.findOneAndUpdate(
+        { user: req.user.id, conversationId },
+        {
+          $setOnInsert: {
+            user: req.user.id,
+            conversationId,
+            title: 'Call Transcript',
+            endpoint: 'agents',
+            agent_id: session.agentId || null,
+            createdAt: now,
+          },
+          $set: { updatedAt: now },
+          $addToSet: { messages: message._id },
+        },
+        { upsert: true, new: true, timestamps: false, overwriteImmutable: true },
+      );
+      if (!existingMessage) {
+        parentMessageId = messageId;
+      }
+      messageIds.push(messageId);
+    }
+
+    return res.json({
+      version: 1,
+      accepted: persistedSegments.accepted || [],
+      rejected: persistedSegments.ignored || [],
+      conversationId,
+      messageIds,
+    });
+  } finally {
+    releaseAmbientLock();
+  }
+});
 
 /**
  * Start an Agents run using the call session's selected agent + conversation.
@@ -1103,6 +1874,7 @@ router.post(
   '/chat',
   initializeVoiceChatLatency,
   voiceAuth,
+  requireVoiceAgentAccess,
   timedConfigMiddleware,
   async (req, _res, next) => {
     req.viventiumVoiceIngressReceivedAtMs = Date.now();
@@ -1111,6 +1883,40 @@ router.post(
     const text = typeof incoming.text === 'string' ? incoming.text : '';
     const speakInsights = incoming.speakInsights === true;
     const systemPrompt = typeof incoming.systemPrompt === 'string' ? incoming.systemPrompt : '';
+    /* === VIVENTIUM START ===
+     * Feature: SpeakerSegmentV1 persistence and authority
+     * Purpose: Store current segments and late revisions before any coalescing or agent execution.
+     * === VIVENTIUM END === */
+    const currentSegments = normalizeSpeakerSegments(incoming.speakerSegments, {
+      callSessionId: session?.callSessionId,
+      ownerParticipantIdentity: session?.ownerParticipantIdentity,
+      ownerTrackSid: incoming.ownerTrackSid,
+      speakerAttributionState: session?.speakerAttributionState,
+    });
+    const speakerSegmentRevisions = normalizeSpeakerSegments(incoming.speakerSegmentRevisions, {
+      callSessionId: session?.callSessionId,
+      ownerParticipantIdentity: session?.ownerParticipantIdentity,
+      ownerTrackSid: incoming.ownerTrackSid,
+      speakerAttributionState: session?.speakerAttributionState,
+    });
+    const speakerPersistence = await persistSpeakerSegments({
+      callSessionId: session?.callSessionId,
+      currentSegments,
+      revisions: speakerSegmentRevisions,
+      expiresAtMs: session?.expiresAtMs,
+      ownerParticipantIdentity: session?.ownerParticipantIdentity,
+      ownerTrackSid: incoming.ownerTrackSid,
+      speakerAttributionState: session?.speakerAttributionState,
+    });
+    if (speakerSegmentRevisions.length > 0) {
+      await projectSpeakerSegmentRevisionsToMessages({
+        callSessionId: session?.callSessionId,
+        segments: speakerPersistence.effectiveSegments,
+      });
+    }
+    const authority = voiceTurnAuthority(currentSegments, {
+      speakerAttributionState: session?.speakerAttributionState,
+    });
     logVoiceRouteStage(
       req,
       'voice_chat_session_ready',
@@ -1135,6 +1941,24 @@ router.post(
     });
     const conversationId = conversationState.conversationId;
     let parentMessageId = conversationState.parentMessageId;
+    const sourceEventId =
+      (typeof incoming.sourceEventId === 'string' && incoming.sourceEventId) ||
+      (typeof incoming.source_event_id === 'string' && incoming.source_event_id) ||
+      req.viventiumVoiceRequestId ||
+      req.get('X-VIVENTIUM-REQUEST-ID') ||
+      crypto.randomUUID();
+    setTrustedInteractionContext(
+      req,
+      createVoiceInteractionContext({
+        conversation_id: conversationId,
+        source_event_id: sourceEventId,
+      }),
+      {
+        segment_stability: 'provisional',
+        supersede_scope: 'response_only',
+      },
+      { commit_authority: 'external_adapter' },
+    );
     const ownershipVerifiedReasons = new Set(['existing', 'message_lookup_error']);
     req.viventiumVoiceResolvedConversationId = conversationId;
     req.viventiumVoiceConvoAccessVerified =
@@ -1175,14 +1999,29 @@ router.post(
     });
 
     // Normalize request body for Agents buildEndpointOption + controller.
+    const {
+      interactionContext: _untrustedInteractionContext,
+      interaction_context: _untrustedInteractionContextSnake,
+      viventiumInteractionContext: _untrustedViventiumInteractionContext,
+      adapterCapabilities: _untrustedAdapterCapabilities,
+      adapter_capabilities: _untrustedAdapterCapabilitiesSnake,
+      ...safeIncoming
+    } = incoming;
     req.body = {
-      ...incoming,
+      ...safeIncoming,
       text,
       endpoint: 'agents',
       endpointType: 'agents',
+      voiceMode: true,
       conversationId,
       parentMessageId,
       agent_id: session.agentId,
+      speakerSegments: currentSegments,
+      speakerLabel:
+        currentSegments.length > 0 ? legacySpeakerLabel(currentSegments) : incoming.speakerLabel,
+      viventiumDeferVoiceMemory: true,
+      viventiumActorTrust: authority.actorTrust,
+      viventiumCanAuthorizeSideEffects: authority.canAuthorizeSideEffects,
     };
     logVoiceRouteStage(
       req,
@@ -1236,6 +2075,7 @@ router.post(
       requestId:
         req.viventiumVoiceRequestId || req.get('X-VIVENTIUM-REQUEST-ID') || crypto.randomUUID(),
       mode: 'normal',
+      speakerSegments: req.body?.speakerSegments,
     });
     logVoiceRouteStage(
       req,
@@ -1251,7 +2091,17 @@ router.post(
         `[VIVENTIUM][voice/chat] Coalesced onto existing stream parentMessageId=${req.body?.parentMessageId || 'none'} ` +
           `conversationId=${req.body?.conversationId || 'unknown'} streamId=${coalescedTurn.payload.streamId || 'unknown'}`,
       );
-      return res.json(coalescedTurn.payload);
+      const existingTask = getVoiceTaskByStreamId(coalescedTurn.payload.streamId);
+      const existingJob = await GenerationJobManager.getJob(coalescedTurn.payload.streamId);
+      return res.json(
+        attachLogicalTurnMetadata(
+          {
+            ...coalescedTurn.payload,
+            ...(existingTask ? { taskId: existingTask.taskId } : {}),
+          },
+          existingJob?.metadata?.interactionContext,
+        ),
+      );
     }
 
     if (
@@ -1265,6 +2115,15 @@ router.post(
       );
       req.body.text = coalescedTurn.mergedText;
     }
+    if (Array.isArray(coalescedTurn.mergedSpeakerSegments)) {
+      req.body.speakerSegments = coalescedTurn.mergedSpeakerSegments;
+      req.body.speakerLabel = legacySpeakerLabel(coalescedTurn.mergedSpeakerSegments);
+      const mergedAuthority = voiceTurnAuthority(coalescedTurn.mergedSpeakerSegments, {
+        speakerAttributionState: session?.speakerAttributionState,
+      });
+      req.body.viventiumActorTrust = mergedAuthority.actorTrust;
+      req.body.viventiumCanAuthorizeSideEffects = mergedAuthority.canAuthorizeSideEffects;
+    }
 
     logger.info(
       `[VIVENTIUM][voice/chat] user_turn_completed source=route callSessionId=${session?.callSessionId || 'unknown'} ` +
@@ -1274,9 +2133,26 @@ router.post(
         } coalesced=${Boolean(coalescedTurn.dedupeKey)} textChars=${req.body?.text?.length || 0}`,
     );
 
+    const streamId =
+      typeof req.body?.streamId === 'string' && req.body.streamId.trim()
+        ? req.body.streamId.trim()
+        : '';
+    const voiceTask = createVoiceTask({
+      callSessionId: session?.callSessionId,
+      userId: req.user?.id,
+      conversationId: req.body?.conversationId,
+      turnId: req.body?.speakerSegments?.[0]?.turnId || streamId,
+      streamId,
+      owner: { kind: 'generation_job', ...(streamId ? { id: streamId } : {}) },
+    });
+    req.body.viventiumVoiceTaskId = voiceTask.taskId;
+
     const originalJson = res.json.bind(res);
     res.json = (payload) => {
       try {
+        if (typeof payload?.streamId === 'string' && payload.streamId) {
+          bindVoiceTaskStream(voiceTask.taskId, payload.streamId);
+        }
         const convoId = payload?.conversationId;
         const shouldUpdateSessionConversationId =
           session &&
@@ -1328,7 +2204,12 @@ router.post(
       } catch (e) {
         // noop
       }
-      return originalJson(payload);
+      return originalJson(
+        attachLogicalTurnMetadata(
+          { ...payload, taskId: voiceTask.taskId },
+          getTrustedInteractionContext(req),
+        ),
+      );
     };
 
     // Handle insight delivery mode (speakInsights=true)
@@ -1357,6 +2238,388 @@ router.post(
     return AgentController(req, res, next, initializeClient, addTitle);
   },
 );
+
+/* === VIVENTIUM START ===
+ * Feature: VoiceTaskEventV1 control plane
+ * Purpose: Authenticated get/list/cancel/input/retry endpoints. Interruption remains a separate
+ * stream operation; cancelling installs suppression before touching the owner job.
+ * === VIVENTIUM END === */
+function taskOwnedBySession(task, req) {
+  return Boolean(
+    task &&
+    task.callSessionId === req.viventiumCallSession?.callSessionId &&
+    (!task.userId || task.userId === req.user?.id),
+  );
+}
+
+router.get('/tasks', voiceSessionCapabilityAuth, async (req, res) => {
+  const requestedCallSessionId =
+    typeof req.query?.callSessionId === 'string' ? req.query.callSessionId : '';
+  if (
+    requestedCallSessionId &&
+    requestedCallSessionId !== req.viventiumCallSession?.callSessionId
+  ) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  const rawBeforeCreatedAt =
+    typeof req.query?.beforeCreatedAt === 'string' ? req.query.beforeCreatedAt.trim() : '';
+  const rawBeforeTaskId =
+    typeof req.query?.beforeTaskId === 'string' ? req.query.beforeTaskId.trim() : '';
+  if (Boolean(rawBeforeCreatedAt) !== Boolean(rawBeforeTaskId)) {
+    return res.status(400).json({ error: 'A complete task paging cursor is required' });
+  }
+  let page;
+  try {
+    page = await listDurableVoiceTaskSnapshots({
+      userId: req.user?.id,
+      callSessionId: req.viventiumCallSession?.callSessionId,
+      beforeCreatedAt: rawBeforeCreatedAt || undefined,
+      beforeTaskId: rawBeforeTaskId || undefined,
+      requireDurable: true,
+    });
+  } catch {
+    return res.status(503).json({
+      code: 'gateway_down',
+      message: 'Task history is temporarily unavailable.',
+      retryable: true,
+    });
+  }
+  return res.json({
+    version: 1,
+    events: page.events,
+    taskOwnerCapabilityInventory: getVoiceTaskOwnerCapabilityInventory({
+      userId: req.user?.id,
+      callSessionId: req.viventiumCallSession?.callSessionId,
+    }),
+    hasMore: page.hasMore,
+    ...(page.nextBeforeCreatedAt
+      ? {
+          nextBeforeCreatedAt: page.nextBeforeCreatedAt,
+          nextBeforeTaskId: page.nextBeforeTaskId,
+        }
+      : {}),
+  });
+});
+
+router.get('/tasks/events', voiceAuth, async (req, res) => {
+  const callSessionId = req.viventiumCallSession?.callSessionId;
+  const requestedCallSessionId =
+    typeof req.query?.callSessionId === 'string' ? req.query.callSessionId.trim() : '';
+  if (!callSessionId || requestedCallSessionId !== callSessionId) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  let closed = false;
+  let replaying = true;
+  let synchronized = false;
+  let tailFailure = null;
+  let heartbeat = null;
+  let durableTail = null;
+  const bufferedLiveEvents = [];
+  const deliveredSequences = new Map();
+  const sendEvent = (event) => {
+    if (closed || !event || res.writableEnded) {
+      return;
+    }
+    const priorSequence = deliveredSequences.get(event.taskId) ?? -1;
+    if (!Number.isSafeInteger(event.sequence) || event.sequence <= priorSequence) return;
+    deliveredSequences.set(event.taskId, event.sequence);
+    res.write(`event: voice_task_event\ndata: ${JSON.stringify({ voiceTaskEvent: event })}\n\n`);
+    res.flush?.();
+  };
+  let unsubscribe = () => {};
+  const cleanup = () => {
+    if (closed) return;
+    closed = true;
+    if (heartbeat) clearInterval(heartbeat);
+    heartbeat = null;
+    unsubscribe();
+    durableTail?.stop();
+  };
+  // Subscribe before durable replay so a live child task cannot fall into the gap between the
+  // snapshot query and listener registration. Sequence checks make an interleaved older snapshot
+  // harmless at the gateway/UI boundary.
+  unsubscribe = subscribeVoiceTasksForCall(
+    callSessionId,
+    (event) => {
+      if (replaying) bufferedLiveEvents.push(event);
+      else sendEvent(event);
+    },
+    { replaySnapshots: false },
+  );
+  durableTail = subscribeDurableVoiceTaskEventsForCall({
+    callSessionId,
+    userId: req.user?.id,
+    onEvent: (event) => {
+      if (replaying) bufferedLiveEvents.push(event);
+      else sendEvent(event);
+    },
+    onError: (error) => {
+      tailFailure = error;
+      if (synchronized && !closed) {
+        cleanup();
+        if (!res.writableEnded) res.end();
+      }
+    },
+  });
+  req.on('close', cleanup);
+  let beforeCreatedAt;
+  let beforeTaskId;
+  const seenCursors = new Set();
+  let firstPage;
+  try {
+    [firstPage] = await Promise.all([
+      listDurableVoiceTaskSnapshots({
+        userId: req.user?.id,
+        callSessionId,
+        requireDurable: true,
+      }),
+      durableTail.ready,
+    ]);
+  } catch {
+    cleanup();
+    return res.status(503).json({
+      code: 'gateway_down',
+      message: 'Task history is temporarily unavailable.',
+      retryable: true,
+    });
+  }
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+  let page = firstPage;
+  while (!closed) {
+    for (const event of page.events) {
+      sendEvent(event);
+      durableTail.seed(event);
+    }
+    if (!page.hasMore || !page.nextBeforeCreatedAt || !page.nextBeforeTaskId) break;
+    const cursor = `${page.nextBeforeCreatedAt}\0${page.nextBeforeTaskId}`;
+    if (seenCursors.has(cursor)) {
+      closed = true;
+      unsubscribe();
+      durableTail.stop();
+      res.end();
+      return undefined;
+    }
+    seenCursors.add(cursor);
+    beforeCreatedAt = page.nextBeforeCreatedAt;
+    beforeTaskId = page.nextBeforeTaskId;
+    try {
+      page = await listDurableVoiceTaskSnapshots({
+        userId: req.user?.id,
+        callSessionId,
+        beforeCreatedAt,
+        beforeTaskId,
+        requireDurable: true,
+      });
+    } catch {
+      closed = true;
+      unsubscribe();
+      durableTail.stop();
+      res.end();
+      return undefined;
+    }
+  }
+  try {
+    await durableTail.catchUp();
+    if (tailFailure) throw tailFailure;
+  } catch {
+    cleanup();
+    if (!res.writableEnded) res.end();
+    return undefined;
+  }
+  for (const event of bufferedLiveEvents) sendEvent(event);
+  replaying = false;
+  if (!closed && !res.writableEnded) {
+    const synchronization = {
+      version: 1,
+      callSessionId,
+      state: 'synchronized',
+      emittedAt: new Date().toISOString(),
+    };
+    res.write(`event: voice_task_sync\ndata: ${JSON.stringify(synchronization)}\n\n`);
+    res.flush?.();
+    synchronized = true;
+  }
+  heartbeat = setInterval(() => {
+    if (!closed && !res.writableEnded) {
+      res.write(': heartbeat\n\n');
+      res.flush?.();
+    }
+  }, 15_000);
+  heartbeat.unref?.();
+  return undefined;
+});
+
+router.get('/tasks/:taskId', voiceSessionCapabilityAuth, async (req, res) => {
+  const task = await hydrateVoiceTask(req.params.taskId, {
+    userId: req.user?.id,
+    callSessionId: req.viventiumCallSession?.callSessionId,
+  });
+  if (!taskOwnedBySession(task, req)) {
+    return res.status(404).json({ error: 'Task not found' });
+  }
+  return res.json({ version: 1, event: snapshotEvent(task.taskId) });
+});
+
+router.post('/tasks/:taskId/cancel', voiceSessionCapabilityAuth, async (req, res) => {
+  const task = await hydrateVoiceTask(req.params.taskId, {
+    userId: req.user?.id,
+    callSessionId: req.viventiumCallSession?.callSessionId,
+  });
+  if (!taskOwnedBySession(task, req)) {
+    return res.status(404).json({ error: 'Task not found' });
+  }
+  let cancellation;
+  try {
+    cancellation = await requestVoiceTaskOwnerCancellation(task.taskId, {
+      userId: req.user?.id,
+    });
+  } catch (error) {
+    const current = getVoiceTask(task.taskId);
+    return res.status(error?.status || 503).json({
+      version: 1,
+      code: error?.code || 'gateway_down',
+      message: 'Cancellation could not be made durable. Please retry.',
+      retryable: true,
+      ...(error?.event ? { event: error.event } : {}),
+      ...(current ? { task: current } : {}),
+    });
+  }
+  if (cancellation?.alreadyCompleted) {
+    return res.status(409).json({
+      version: 1,
+      outcome: 'already_completed',
+      task: cancellation.task,
+      event: cancellation.event,
+    });
+  }
+  if (cancellation?.alreadyCancelled) {
+    return res.json({
+      version: 1,
+      outcome: cancellation.task?.state,
+      task: cancellation.task,
+      event: cancellation.event,
+    });
+  }
+  if (cancellation?.alreadyInactive) {
+    return res.status(409).json({
+      version: 1,
+      outcome: 'not_active',
+      task: cancellation.task,
+      event: cancellation.event,
+    });
+  }
+  if (cancellation?.alreadyCancelling) {
+    return res.json({
+      version: 1,
+      outcome: 'cancelling',
+      task: cancellation.task,
+      event: cancellation.event,
+    });
+  }
+
+  if (!cancellation?.ownerSupported) {
+    void (async () => {
+      const job = task.streamId ? await GenerationJobManager.getJob(task.streamId) : null;
+      const abortResult = job ? await GenerationJobManager.abortJob(task.streamId) : null;
+      const event = await settleVoiceTaskCancellation(task.taskId, {
+        confirmed: abortResult?.success === true && canConfirmVoiceTaskCancellation(task.taskId),
+        detail:
+          abortResult?.success === true && canConfirmVoiceTaskCancellation(task.taskId)
+            ? 'The generation owner confirmed cancellation.'
+            : abortResult?.success === true
+              ? 'Local generation stopped, but remote owner cancellation could not be confirmed; late output remains suppressed.'
+              : 'The owner could not confirm cancellation; late output remains suppressed.',
+      });
+      logger.info('[VIVENTIUM][VoiceTask] cancellation_settled', {
+        taskId: task.taskId,
+        callSessionId: task.callSessionId,
+        state: event?.state || 'unknown',
+      });
+    })().catch(() => {
+      void settleVoiceTaskCancellation(task.taskId, {
+        confirmed: false,
+        detail: 'The owner could not confirm cancellation; late output remains suppressed.',
+      }).catch(() => undefined);
+    });
+  }
+  logger.info('[VIVENTIUM][VoiceTask] cancellation_requested', {
+    taskId: task.taskId,
+    callSessionId: task.callSessionId,
+    state: 'cancelling',
+  });
+  return res.json({
+    version: 1,
+    outcome: 'cancelling',
+    operationId: cancellation.operationId,
+    task: cancellation.task,
+    event: cancellation.event,
+  });
+});
+
+router.post('/tasks/:taskId/input', voiceSessionCapabilityAuth, async (req, res) => {
+  const task = await hydrateVoiceTask(req.params.taskId, {
+    userId: req.user?.id,
+    callSessionId: req.viventiumCallSession?.callSessionId,
+  });
+  if (!taskOwnedBySession(task, req)) {
+    return res.status(404).json({ error: 'Task not found' });
+  }
+  if (typeof req.body?.input !== 'string' || !req.body.input.trim()) {
+    return res.status(400).json({ error: 'input is required' });
+  }
+  const result = await submitVoiceTaskInput(task.taskId, req.body.input, {
+    userId: req.user?.id,
+  });
+  if (!result.ok) {
+    const status = result.code === 'owner_input_failed' ? 503 : 409;
+    return res.status(status).json({
+      version: 1,
+      error: result.code,
+      message: result.message,
+      ...(result.event ? { event: result.event } : {}),
+      ...(result.task ? { task: result.task } : {}),
+    });
+  }
+  return res.json({
+    version: 1,
+    outcome: 'accepted',
+    task: result.task,
+    event: result.event,
+  });
+});
+
+router.post('/tasks/:taskId/retry', voiceSessionCapabilityAuth, async (req, res) => {
+  const task = await hydrateVoiceTask(req.params.taskId, {
+    userId: req.user?.id,
+    callSessionId: req.viventiumCallSession?.callSessionId,
+  });
+  if (!taskOwnedBySession(task, req)) {
+    return res.status(404).json({ error: 'Task not found' });
+  }
+  const result = await retryVoiceTask(task.taskId, { userId: req.user?.id });
+  if (!result.ok) {
+    const status = result.code === 'owner_retry_failed' ? 503 : 409;
+    return res.status(status).json({
+      version: 1,
+      error: result.code,
+      message: result.message,
+      ...(result.event ? { event: result.event } : {}),
+      ...(result.task ? { task: result.task } : {}),
+    });
+  }
+  return res.json({
+    version: 1,
+    outcome: 'accepted',
+    task: result.task,
+    previousTask: result.previousTask,
+    previousEvent: result.previousEvent,
+    event: result.event,
+    events: result.events,
+  });
+});
 
 /**
  * SSE subscription endpoint for the voice gateway.
@@ -1387,9 +2650,55 @@ router.get('/stream/:streamId', voiceAuth, async (req, res) => {
     });
   }
 
-  if (job.metadata?.userId && job.metadata.userId !== userId) {
-    return res.status(403).json({ error: 'Unauthorized' });
+  if (!userId || job.metadata?.userId !== userId) {
+    return res.status(404).json({
+      error: 'Stream not found',
+      message: 'The generation job does not exist or has expired.',
+    });
   }
+  if (
+    job.metadata?.viventiumCallSessionId &&
+    job.metadata.viventiumCallSessionId !== callSessionId
+  ) {
+    return res.status(404).json({
+      error: 'Stream not found',
+      message: 'The generation job does not exist or has expired.',
+    });
+  }
+
+  // A process restart (or cancellation accepted by another API worker) leaves the in-memory
+  // registry empty/stale. Reconcile the exact stream with the durable task and suppression ledgers
+  // before replaying resume state or subscribing to any model output.
+  let voiceTask;
+  try {
+    voiceTask = await hydrateVoiceTaskByStreamId(streamId, {
+      callSessionId,
+      userId,
+      requireDurable: true,
+    });
+  } catch (error) {
+    logger.error('[VIVENTIUM][VoiceStream] durable_task_reconcile_failed', {
+      streamId,
+      callSessionId,
+      code: error?.code || 'gateway_down',
+    });
+    return res.status(503).json({
+      code: 'gateway_down',
+      message: 'Voice task recovery is temporarily unavailable.',
+      retryable: true,
+    });
+  }
+  if (!voiceTask) {
+    return res.status(503).json({
+      code: 'gateway_down',
+      message: 'Voice task recovery is temporarily unavailable.',
+      retryable: true,
+    });
+  }
+  const suppressionScope = { callSessionId, userId, streamId };
+  const outputIsSuppressed = () => isVoiceTaskSuppressedDurably(voiceTask.taskId, suppressionScope);
+  const withStreamLogicalTurn = (event) =>
+    attachLogicalTurnMetadata(event, job.metadata?.interactionContext);
 
   res.setHeader('Content-Encoding', 'identity');
   res.setHeader('Content-Type', 'text/event-stream');
@@ -1397,6 +2706,17 @@ router.get('/stream/:streamId', voiceAuth, async (req, res) => {
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
+
+  const unsubscribeVoiceTask = voiceTask
+    ? subscribeVoiceTask(voiceTask.taskId, (voiceTaskEvent) => {
+        if (!res.writableEnded && voiceTaskEvent) {
+          res.write(
+            `event: voice_task_event\ndata: ${JSON.stringify(withStreamLogicalTurn({ voiceTaskEvent }))}\n\n`,
+          );
+          res.flush?.();
+        }
+      })
+    : () => {};
 
   logger.debug?.(`[VIVENTIUM][VoiceStream] subscribed ${streamId}, resume=${isResume}`);
   if (logLatency) {
@@ -1408,41 +2728,84 @@ router.get('/stream/:streamId', voiceAuth, async (req, res) => {
 
   if (isResume) {
     const resumeState = await GenerationJobManager.getResumeState(streamId);
-    if (resumeState && !res.writableEnded) {
-      res.write(`event: message\ndata: ${JSON.stringify({ sync: true, resumeState })}\n\n`);
+    if (resumeState && !res.writableEnded && !(await outputIsSuppressed())) {
+      res.write(
+        `event: message\ndata: ${JSON.stringify(withStreamLogicalTurn({ sync: true, resumeState }))}\n\n`,
+      );
       if (typeof res.flush === 'function') {
         res.flush();
       }
     }
   }
 
+  let outputTail = Promise.resolve();
+  const enqueueOutput = (operation) => {
+    outputTail = outputTail
+      .catch(() => undefined)
+      .then(operation)
+      .catch((error) => {
+        logger.error('[VIVENTIUM][VoiceStream] durable_output_guard_failed', {
+          streamId,
+          callSessionId,
+          code: error?.code || 'unknown',
+        });
+        if (!res.writableEnded) res.end();
+      });
+  };
+
   const result = await GenerationJobManager.subscribe(
     streamId,
     (event) => {
-      if (!res.writableEnded) {
-        res.write(`event: message\ndata: ${JSON.stringify(event)}\n\n`);
-        if (typeof res.flush === 'function') {
-          res.flush();
+      enqueueOutput(async () => {
+        const suppressed = await outputIsSuppressed();
+        if (!suppressed) {
+          observeGenerationEvent(voiceTask.taskId, event);
         }
-      }
+        if (!res.writableEnded && !suppressed) {
+          res.write(`event: message\ndata: ${JSON.stringify(withStreamLogicalTurn(event))}\n\n`);
+          if (typeof res.flush === 'function') {
+            res.flush();
+          }
+        }
+      });
     },
     (event) => {
-      if (!res.writableEnded) {
-        res.write(`event: message\ndata: ${JSON.stringify(event)}\n\n`);
-        if (typeof res.flush === 'function') {
-          res.flush();
+      enqueueOutput(async () => {
+        const suppressed = await outputIsSuppressed();
+        if (voiceTask && !suppressed) {
+          completeVoiceTask(voiceTask.taskId, {
+            resultMessageId: event?.responseMessage?.messageId,
+          });
         }
-        res.end();
-      }
+        if (!res.writableEnded) {
+          if (!suppressed) {
+            res.write(`event: message\ndata: ${JSON.stringify(withStreamLogicalTurn(event))}\n\n`);
+          }
+          if (typeof res.flush === 'function') {
+            res.flush();
+          }
+          res.end();
+        }
+      });
     },
     (error) => {
-      if (!res.writableEnded) {
-        res.write(`event: error\ndata: ${JSON.stringify({ error })}\n\n`);
-        if (typeof res.flush === 'function') {
-          res.flush();
+      enqueueOutput(async () => {
+        const suppressed = await outputIsSuppressed();
+        if (voiceTask && !suppressed) {
+          failVoiceTask(voiceTask.taskId, error);
         }
-        res.end();
-      }
+        if (!res.writableEnded) {
+          if (!suppressed) {
+            res.write(
+              `event: error\ndata: ${JSON.stringify(withStreamLogicalTurn({ error }))}\n\n`,
+            );
+          }
+          if (typeof res.flush === 'function') {
+            res.flush();
+          }
+          res.end();
+        }
+      });
     },
   );
 
@@ -1471,14 +2834,14 @@ router.get('/stream/:streamId', voiceAuth, async (req, res) => {
 
   req.on('close', () => {
     result.unsubscribe();
+    unsubscribeVoiceTask();
   });
 });
 
 /* === VIVENTIUM START ===
- * Feature: Voice barge-in cancellation propagation
- * Purpose: When LiveKit cancels an in-flight voice LLM stream, give the voice gateway
- * an authenticated path to stop the matching LibreChat generation job as well.
- * Added: 2026-05-18
+ * Feature: Voice interruption/cancellation separation
+ * Purpose: Barge-in stops gateway TTS only. It must not abort the authoritative task; explicit
+ * task cancellation uses /tasks/:taskId/cancel and installs the suppression barrier first.
  * === VIVENTIUM END === */
 router.post('/stream/:streamId/abort', voiceAuth, async (req, res) => {
   const { streamId } = req.params;
@@ -1498,54 +2861,52 @@ router.post('/stream/:streamId/abort', voiceAuth, async (req, res) => {
     return res.status(404).json({ error: 'Stream not found', streamId });
   }
 
-  if (job.metadata?.userId && job.metadata.userId !== userId) {
+  if (!userId || job.metadata?.userId !== userId) {
     logger.warn(
       `[VIVENTIUM][VoiceStream] abort_unauthorized streamId=${streamId} ` +
         `callSessionId=${callSessionId}`,
     );
-    return res.status(403).json({ error: 'Unauthorized' });
+    return res.status(404).json({ error: 'Stream not found', streamId });
   }
 
-  const abortResult = await GenerationJobManager.abortJob(streamId);
-
   if (
-    abortResult?.success &&
-    abortResult.jobData?.userMessage?.messageId &&
-    abortResult.jobData?.responseMessageId
+    job.metadata?.viventiumCallSessionId &&
+    job.metadata.viventiumCallSessionId !== callSessionId
   ) {
-    const { jobData, content, text } = abortResult;
-    const responseMessage = {
-      messageId: jobData.responseMessageId,
-      parentMessageId: jobData.userMessage.messageId,
-      conversationId: jobData.conversationId,
-      content: content || [],
-      text: text || '',
-      sender: jobData.sender || 'AI',
-      endpoint: jobData.endpoint,
-      model: jobData.model,
-      unfinished: true,
-      error: false,
-      isCreatedByUser: false,
-      user: userId,
-    };
+    logger.warn(
+      `[VIVENTIUM][VoiceStream] abort_call_session_mismatch streamId=${streamId} ` +
+        `callSessionId=${callSessionId}`,
+    );
+    return res.status(404).json({ error: 'Stream not found', streamId });
+  }
 
-    try {
-      await saveMessage(req, responseMessage, {
-        context: 'api/server/routes/viventium/voice.js - voice stream abort endpoint',
-      });
-    } catch (saveError) {
-      logger.error(
-        `[VIVENTIUM][VoiceStream] failed_to_save_partial_abort streamId=${streamId} ` +
-          `callSessionId=${callSessionId} error=${saveError.message}`,
-      );
-    }
+  let task;
+  try {
+    task = await hydrateVoiceTaskByStreamId(streamId, {
+      callSessionId,
+      userId,
+      requireDurable: true,
+    });
+  } catch (_error) {
+    return res.status(503).json({
+      code: 'gateway_down',
+      message: 'Voice task recovery is temporarily unavailable.',
+      retryable: true,
+    });
+  }
+  if (!task) {
+    return res.status(404).json({ error: 'Stream not found', streamId });
   }
 
   logger.info(
-    `[VIVENTIUM][VoiceStream] aborted_stream streamId=${streamId} ` +
-      `callSessionId=${callSessionId} success=${abortResult?.success !== false}`,
+    `[VIVENTIUM][VoiceStream] interrupted_speech streamId=${streamId} ` +
+      `callSessionId=${callSessionId}`,
   );
-  return res.json({ success: abortResult?.success !== false, aborted: streamId });
+  return res.json({
+    success: true,
+    interrupted: streamId,
+    ...(task ? { taskId: task.taskId } : {}),
+  });
 });
 
 /* === VIVENTIUM NOTE ===

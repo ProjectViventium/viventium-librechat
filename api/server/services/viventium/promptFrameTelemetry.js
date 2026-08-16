@@ -79,6 +79,7 @@ const PROMPT_FRAME_LAYER_ALIASES = Object.freeze({
   voice_call_input: 'surface_prompt',
   wing_mode: 'surface_prompt',
   telegram_text: 'surface_prompt',
+  telegram_audio_output: 'surface_prompt',
   web_text: 'surface_prompt',
   playground_text: 'surface_prompt',
   mcp_server_instructions: 'mcp_server_instructions',
@@ -561,6 +562,32 @@ async function flushPromptFrameFileWrites({ timeoutMs = 1000 } = {}) {
   return pendingFileWrites === 0;
 }
 
+/* === VIVENTIUM START ===
+ * Fix: Preserve completing provider/model identity when Winston truncates the full frame line.
+ */
+function compactRouteLabel(value, fallback) {
+  return normalizeString(value, fallback)
+    .replace(/[^a-zA-Z0-9_:-]/g, '_')
+    .slice(0, 32);
+}
+
+function routeIdentityHash(value) {
+  const normalized = normalizeString(value, 'missing');
+  return ['missing', 'none', 'unknown'].includes(normalized.toLowerCase())
+    ? 'missing'
+    : hashString(normalized);
+}
+
+function buildPromptFrameRouteTelemetry(frame) {
+  return {
+    v: 1,
+    f: compactRouteLabel(frame?.prompt_family, 'unknown'),
+    p: routeIdentityHash(frame?.provider),
+    m: routeIdentityHash(frame?.model),
+  };
+}
+/* === VIVENTIUM END === */
+
 function logPromptFrame(targetLogger, frame) {
   if (
     process.env[LOG_ENV] === '0' ||
@@ -582,6 +609,13 @@ function logPromptFrame(targetLogger, frame) {
     }
     const publicLogFrame = { ...frame };
     delete publicLogFrame.debug_redacted_layers;
+    /* === VIVENTIUM START ===
+     * The normal Winston text formatter truncates the full prompt-frame JSON. Emit the route
+     * identity through a second bounded, metadata-only sink so QA can prove the provider/model
+     * that actually completed a comparison without exposing either raw value.
+     */
+    log(`[PromptFrameRouteTelemetry] ${JSON.stringify(buildPromptFrameRouteTelemetry(frame))}`);
+    /* === VIVENTIUM END === */
     log(`[PromptFrameTelemetry] ${JSON.stringify(publicLogFrame)}`);
     wrote = true;
   } catch (_error) {
@@ -606,6 +640,9 @@ module.exports = {
   normalizeLayersToContract,
   normalizeMCPInstructionSources,
   buildPromptFrame,
+  /* === VIVENTIUM START: Export bounded route telemetry for regression tests. === */
+  buildPromptFrameRouteTelemetry,
+  /* === VIVENTIUM END === */
   logPromptFrame,
   resolvePromptObservabilityDir,
   writePromptFrameFile,

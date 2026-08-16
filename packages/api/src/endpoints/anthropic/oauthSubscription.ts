@@ -5,6 +5,8 @@ import type { EndpointDbMethods, UserKeyValues } from '~/types';
 const ANTHROPIC_OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-' + '88ed-5944d1962f5e';
 const ANTHROPIC_OAUTH_TOKEN_URL = 'https://platform.claude.com/v1/oauth/token';
 const ANTHROPIC_OAUTH_REFRESH_BUFFER_MS = 5 * 60 * 1000;
+const ANTHROPIC_RECONNECT_MESSAGE =
+  'Anthropic connected account needs reconnect in Settings > Account > Connected Accounts.';
 
 const nonExpiringPersistenceCache = new Set<string>();
 
@@ -81,6 +83,22 @@ async function persistNonExpiringKey(
   nonExpiringPersistenceCache.add(cacheKey);
 }
 
+async function persistReconnectRequired(
+  userId: string,
+  userValues: AnthropicSubscriptionUserValues,
+  db: EndpointDbMethods,
+): Promise<void> {
+  if (!db.updateUserKey) {
+    return;
+  }
+  await db.updateUserKey({
+    userId,
+    name: EModelEndpoint.anthropic,
+    value: JSON.stringify({ ...userValues, oauthReconnectRequired: true }),
+    expiresAt: null,
+  });
+}
+
 async function parseTokenResponse(response: Response): Promise<OAuthTokenResponse> {
   const bodyText = await response.text();
   if (!bodyText) {
@@ -104,9 +122,8 @@ async function refreshAccessToken(
   db: EndpointDbMethods,
 ): Promise<AnthropicSubscriptionUserValues> {
   if (!userValues.refreshToken) {
-    throw new Error(
-      'Anthropic connected account refresh failed: stored subscription credential is missing a refresh token.',
-    );
+    await persistReconnectRequired(userId, userValues, db);
+    throw new Error(ANTHROPIC_RECONNECT_MESSAGE);
   }
 
   const response = await fetch(getTokenUrl(), {
@@ -126,6 +143,10 @@ async function refreshAccessToken(
   if (!response.ok || typeof tokenData.access_token !== 'string' || tokenData.access_token.length === 0) {
     const details =
       tokenData.error_description || tokenData.error || `HTTP ${response.status} ${response.statusText}`;
+    if (tokenData.error === 'invalid_grant' || response.status === 401 || response.status === 403) {
+      await persistReconnectRequired(userId, userValues, db);
+      throw new Error(ANTHROPIC_RECONNECT_MESSAGE);
+    }
     throw new Error(`Anthropic connected account refresh failed: ${details}`);
   }
 
@@ -140,6 +161,7 @@ async function refreshAccessToken(
         ? tokenData.expires_in
         : 3600) *
         1000,
+    oauthReconnectRequired: false,
   };
 
   await persistNonExpiringKey(userId, refreshedValues, db);
@@ -195,7 +217,11 @@ function scheduleBackgroundRefresh(
       vivRefreshFailureCache.delete(cacheKey);
     })
     .catch((error) => {
-      vivRefreshFailureCache.set(cacheKey, Date.now() + VIV_FAILED_REFRESH_TTL_MS);
+      if (error instanceof Error && error.message === ANTHROPIC_RECONNECT_MESSAGE) {
+        vivRefreshFailureCache.set(cacheKey, Date.now() + VIV_FAILED_REFRESH_TTL_MS);
+      } else {
+        vivRefreshFailureCache.delete(cacheKey);
+      }
       logger.warn('[Anthropic OAuth] Background refresh failed; will retry after TTL', error);
     })
     .finally(() => {
@@ -211,6 +237,9 @@ export async function resolveAnthropicSubscriptionUserValues(
   if (!isAnthropicSubscriptionUserValues(userValues)) {
     return userValues ?? null;
   }
+  if (userValues.oauthReconnectRequired === true) {
+    throw new Error(ANTHROPIC_RECONNECT_MESSAGE);
+  }
 
   if (isOAuthFastPathEnabled()) {
     const cacheKey = buildPersistenceCacheKey(userId, userValues);
@@ -224,23 +253,20 @@ export async function resolveAnthropicSubscriptionUserValues(
       // Cannot proceed on a missing/expired token; refresh synchronously, but at most once per
       // failure TTL so a broken refresh_token does not stall every agent init in the turn.
       if (isRefreshNegativeCached(cacheKey)) {
-        // Preserve the current token (legacy contract); the persistence cache makes repeat
-        // writes within the turn no-ops, so this does not reintroduce the fan-out cost.
-        await persistNonExpiringKey(userId, userValues, db);
-        return userValues;
+        throw new Error(ANTHROPIC_RECONNECT_MESSAGE);
       }
       try {
         const refreshed = await refreshAccessToken(userId, userValues, db);
         vivRefreshFailureCache.delete(cacheKey);
         return refreshed;
       } catch (error) {
-        vivRefreshFailureCache.set(cacheKey, Date.now() + VIV_FAILED_REFRESH_TTL_MS);
-        logger.warn(
-          '[Anthropic OAuth] Refresh failed for connected account; preserving current access token',
-          error,
-        );
-        await persistNonExpiringKey(userId, userValues, db);
-        return userValues;
+        if (error instanceof Error && error.message === ANTHROPIC_RECONNECT_MESSAGE) {
+          vivRefreshFailureCache.set(cacheKey, Date.now() + VIV_FAILED_REFRESH_TTL_MS);
+        } else {
+          vivRefreshFailureCache.delete(cacheKey);
+        }
+        logger.warn('[Anthropic OAuth] Refresh failed for connected account', error);
+        throw error;
       }
     }
 
@@ -258,10 +284,8 @@ export async function resolveAnthropicSubscriptionUserValues(
     try {
       return await refreshAccessToken(userId, userValues, db);
     } catch (error) {
-      logger.warn(
-        '[Anthropic OAuth] Refresh failed for connected account; preserving current access token',
-        error,
-      );
+      logger.warn('[Anthropic OAuth] Refresh failed for connected account', error);
+      throw error;
     }
   }
 

@@ -1,3 +1,4 @@
+// VIVENTIUM START: verify Viventium search eligibility and synchronization contracts.
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import { EModelEndpoint } from 'librechat-data-provider';
@@ -24,6 +25,7 @@ const mockIndex = jest.fn().mockReturnValue({
   getDocument: mockGetDocument,
   getDocuments: jest.fn().mockReturnValue({ results: [] }),
 });
+// VIVENTIUM END
 jest.mock('meilisearch', () => {
   return {
     MeiliSearch: jest.fn().mockImplementation(() => {
@@ -82,6 +84,30 @@ describe('Meilisearch Mongoose plugin', () => {
       endpoint: EModelEndpoint.openAI,
     });
     expect(mockAddDocuments).toHaveBeenCalled();
+  });
+
+  test('model updateOne resolves when the query result has no document hook', async () => {
+    const conversationModel = createConversationModel(mongoose);
+    const conversationId = new mongoose.Types.ObjectId().toString();
+    const user = new mongoose.Types.ObjectId().toString();
+    await conversationModel.create({
+      conversationId,
+      user,
+      title: 'Before update',
+      endpoint: EModelEndpoint.openAI,
+    });
+
+    const outcome = await Promise.race([
+      conversationModel
+        .updateOne({ conversationId, user }, { $set: { isArchived: true } })
+        .then(() => 'resolved'),
+      new Promise<string>((resolve) => setTimeout(() => resolve('timed_out'), 250)),
+    ]);
+
+    expect(outcome).toBe('resolved');
+    await expect(conversationModel.findOne({ conversationId, user }).lean()).resolves.toEqual(
+      expect.objectContaining({ isArchived: true }),
+    );
   });
 
   test('saving conversation indexes with expiredAt=null w/ meilisearch', async () => {

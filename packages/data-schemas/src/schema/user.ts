@@ -179,6 +179,26 @@ const userSchema = new Schema<IUser>(
           type: Boolean,
           default: false,
         },
+        /* === VIVENTIUM START ===
+         * Feature: Account-wide Parallel work mode
+         * Purpose: Keep orchestration beside the other cross-surface personalization controls.
+         * === VIVENTIUM END === */
+        orchestration_mode: {
+          type: String,
+          enum: ['focused', 'parallel'],
+        },
+        /* Durable local hint: when false, a focused turn can skip every Parallel-work lookup. */
+        parallel_work_known: {
+          type: Boolean,
+          default: false,
+        },
+        /* Monotonic fence for cross-process authoritative-empty roster observations. */
+        parallel_work_known_epoch: {
+          type: Number,
+          default: 0,
+          min: 0,
+          validate: Number.isSafeInteger,
+        },
         /* === VIVENTIUM END === */
       },
       default: {},

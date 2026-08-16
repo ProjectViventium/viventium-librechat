@@ -6,6 +6,8 @@
  * === VIVENTIUM END === */
 
 const { logger } = require('@librechat/data-schemas');
+const crypto = require('crypto');
+const { canUseViventiumMCPServer } = require('./mcpAudiencePolicy');
 
 const BROKER_HELPER_TOOLS = new Set([
   'capabilities_list',
@@ -73,27 +75,65 @@ function policyAllowsExecutionMode(policy, executionMode = '') {
   return policy.hostAllowed !== false || policy.sandboxAllowed !== false;
 }
 
-function collectAllowedServerEntries({ mcpConfig = {}, executionMode = '' } = {}) {
+function collectServerProjection({
+  mcpConfig = {},
+  executionMode = '',
+  serverNames,
+  reqUser,
+} = {}) {
+  const requestedServerNames = Array.from(
+    new Set(
+      (Array.isArray(serverNames) ? serverNames : Object.keys(mcpConfig || {}))
+        .map((value) => String(value || '').trim())
+        .filter(Boolean),
+    ),
+  ).sort();
   if (!isBrokerProjectionEnabled()) {
-    return [];
+    return {
+      allowedEntries: [],
+      omissions: requestedServerNames.map((server) => ({
+        server,
+        reason: 'broker_projection_disabled',
+      })),
+    };
   }
-  return Object.entries(mcpConfig)
-    .map(([serverName, serverConfig]) => {
-      const policy = getPolicy(serverConfig);
-      return { serverName, serverConfig, policy };
-    })
-    .filter(({ serverConfig, policy }) => {
-      return (
-        policy &&
-        isTrustedServerConfig(serverConfig) &&
-        policyAllowsExecutionMode(policy, executionMode)
-      );
-    })
-    .sort((left, right) => left.serverName.localeCompare(right.serverName));
+
+  const allowedEntries = [];
+  const omissions = [];
+  for (const serverName of requestedServerNames) {
+    const serverConfig = mcpConfig?.[serverName];
+    if (!serverConfig) {
+      omissions.push({ server: serverName, reason: 'server_config_missing' });
+      continue;
+    }
+    if (!canUseViventiumMCPServer({ serverConfig, reqUser })) {
+      omissions.push({ server: serverName, reason: 'request_audience_not_authorized' });
+      continue;
+    }
+    const policy = getPolicy(serverConfig);
+    if (!policy) {
+      omissions.push({ server: serverName, reason: 'policy_not_authorized' });
+      continue;
+    }
+    if (!isTrustedServerConfig(serverConfig)) {
+      omissions.push({ server: serverName, reason: 'server_config_untrusted' });
+      continue;
+    }
+    if (!policyAllowsExecutionMode(policy, executionMode)) {
+      omissions.push({ server: serverName, reason: 'execution_mode_not_authorized' });
+      continue;
+    }
+    allowedEntries.push({ serverName, serverConfig, policy });
+  }
+  return { allowedEntries, omissions };
 }
 
-function collectAllowedServers({ mcpConfig = {}, executionMode = '' } = {}) {
-  return collectAllowedServerEntries({ mcpConfig, executionMode }).map(
+function collectAllowedServerEntries({ mcpConfig = {}, executionMode = '', reqUser } = {}) {
+  return collectServerProjection({ mcpConfig, executionMode, reqUser }).allowedEntries;
+}
+
+function collectAllowedServers({ mcpConfig = {}, executionMode = '', reqUser } = {}) {
+  return collectAllowedServerEntries({ mcpConfig, executionMode, reqUser }).map(
     ({ serverName }) => serverName,
   );
 }
@@ -115,10 +155,63 @@ function shouldGrantContentReadScope(allowedServerEntries = []) {
 }
 
 function brokerToolName(serverName, toolName) {
-  const safeServer = String(serverName || '').replace(/[^A-Za-z0-9_]+/g, '_');
-  const safeTool = String(toolName || '').replace(/[^A-Za-z0-9_]+/g, '_');
-  return `gh_${safeServer}__${safeTool}`.slice(0, 120);
+  const rawServer = String(serverName || '');
+  const rawTool = String(toolName || '');
+  const safeServer = rawServer.replace(/[^A-Za-z0-9_]+/g, '_');
+  const safeTool = rawTool.replace(/[^A-Za-z0-9_]+/g, '_');
+  const candidate = `gh_${safeServer}__${safeTool}`;
+  if (candidate.length <= 120) {
+    return candidate;
+  }
+  const digest = crypto
+    .createHash('sha256')
+    .update(`${rawServer}\0${rawTool}`)
+    .digest('hex')
+    .slice(0, 12);
+  return `${candidate.slice(0, 107)}_${digest}`;
 }
+
+function collisionSafeBrokerToolName(serverName, toolName, claimedNames = new Map()) {
+  const baseName = brokerToolName(serverName, toolName);
+  const identity = `${String(serverName || '')}\0${String(toolName || '')}`;
+  const claimedIdentity = claimedNames.get(baseName);
+  if (!claimedIdentity || claimedIdentity === identity) {
+    claimedNames.set(baseName, identity);
+    return baseName;
+  }
+  const digest = crypto.createHash('sha256').update(identity).digest('hex').slice(0, 12);
+  const collisionSafeName = `${baseName.slice(0, 107)}_${digest}`;
+  claimedNames.set(collisionSafeName, identity);
+  return collisionSafeName;
+}
+
+/* === VIVENTIUM START ===
+ * Feature: truthful MCP approval metadata
+ * Purpose: Project standard MCP ToolAnnotations from reviewed structured policy so non-interactive
+ * workers may call proven read-only tools while write or unknown tools remain approval-gated. */
+function mcpToolAnnotations({
+  access = 'none',
+  upstreamAnnotations,
+  openWorldDefault = true,
+} = {}) {
+  const upstream =
+    upstreamAnnotations &&
+    typeof upstreamAnnotations === 'object' &&
+    !Array.isArray(upstreamAnnotations)
+      ? upstreamAnnotations
+      : {};
+  const readOnly = access === 'read' || access === 'content_read';
+  return {
+    readOnlyHint: readOnly,
+    destructiveHint: readOnly ? false : upstream.destructiveHint !== false,
+    idempotentHint: readOnly ? true : upstream.idempotentHint === true,
+    openWorldHint:
+      typeof upstream.openWorldHint === 'boolean'
+        ? upstream.openWorldHint
+        : Boolean(openWorldDefault),
+  };
+}
+/* === VIVENTIUM END === */
 
 function helperToolDefinitions() {
   return [
@@ -127,6 +220,7 @@ function helperToolDefinitions() {
       description:
         'List the connected MCP capability servers and currently re-exported tools available to this GlassHive worker run.',
       inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+      annotations: mcpToolAnnotations({ access: 'read', openWorldDefault: false }),
     },
     {
       name: 'capability_describe',
@@ -140,6 +234,7 @@ function helperToolDefinitions() {
         },
         additionalProperties: false,
       },
+      annotations: mcpToolAnnotations({ access: 'read', openWorldDefault: false }),
     },
     {
       name: 'capability_invoke',
@@ -156,6 +251,7 @@ function helperToolDefinitions() {
         },
         additionalProperties: false,
       },
+      annotations: mcpToolAnnotations({ access: 'unknown', openWorldDefault: true }),
     },
   ];
 }
@@ -221,16 +317,42 @@ function auditSafeToolSummary({
   policy,
   tool,
 } = {}) {
+  const toolPolicy = getToolPolicy(policy, toolName, tool);
+  const sourceSchema =
+    inputSchema && typeof inputSchema === 'object' && !Array.isArray(inputSchema)
+      ? inputSchema
+      : { type: 'object', properties: {} };
+  const brokerInputSchema = {
+    ...sourceSchema,
+    properties: { ...(sourceSchema.properties || {}) },
+    required: Array.isArray(sourceSchema.required) ? [...sourceSchema.required] : [],
+  };
+  if (toolPolicy.access === 'write') {
+    brokerInputSchema.properties.invocation_id = {
+      type: 'string',
+      minLength: 1,
+      description:
+        'A unique idempotency key for this intended mutation. Reuse the same value only when retrying the same logical action.',
+    };
+    if (!brokerInputSchema.required.includes('invocation_id')) {
+      brokerInputSchema.required.push('invocation_id');
+    }
+  }
   return {
     name: brokerName,
     title: `${serverName}:${toolName}`,
     description: description || '',
-    inputSchema: inputSchema || { type: 'object', properties: {} },
+    inputSchema: brokerInputSchema,
     annotations: {
+      ...mcpToolAnnotations({
+        access: toolPolicy.access,
+        upstreamAnnotations: tool?.annotations,
+        openWorldDefault: true,
+      }),
       server: serverName,
       tool: toolName,
       riskClass: policy?.riskClass || 'unspecified',
-      access: getToolPolicy(policy, toolName, tool).access,
+      access: toolPolicy.access,
     },
   };
 }
@@ -248,14 +370,17 @@ module.exports = {
   BROKER_HELPER_TOOLS,
   auditSafeToolSummary,
   brokerToolName,
+  collisionSafeBrokerToolName,
   collectAllowedServerEntries,
   collectAllowedServers,
+  collectServerProjection,
   evaluateToolCallPolicy,
   getPolicy,
   helperToolDefinitions,
   isBrokerProjectionEnabled,
   isTrustedServerConfig,
   logOmission,
+  mcpToolAnnotations,
   policyCanReceiveContentReadGrant,
   shouldGrantContentReadScope,
 };

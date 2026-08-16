@@ -15,6 +15,11 @@ let lastVoiceProvider = null;
 let lastVoiceMode = null;
 let lastTelegramAudioRequested = null;
 let lastTelegramImages = null;
+let lastMissionAttachments = null;
+let mockLastInteractionContext = null;
+let mockLastAdapterCapabilities = null;
+let mockLastDeliveryPolicy = null;
+let mockClaimedLogicalTurn = null;
 let mockUserFindOne;
 let mockUserCountDocuments;
 let mockSubscribe;
@@ -34,6 +39,8 @@ let mockFileAccess;
 let mockGetStrategyFunctions;
 let mockLoadAuthValues;
 let mockCreateCallSession;
+let mockCreateCallBrowserLaunch;
+let mockAssertVoiceAgentAccess;
 let mockFilterFile;
 let mockProcessAgentFileUpload;
 let mockClaimGlassHiveDeliveries;
@@ -41,6 +48,18 @@ let mockMarkGlassHiveDeliverySent;
 let mockMarkGlassHiveDeliveryFailed;
 let mockMarkGlassHiveDeliverySuppressed;
 let mockDeliveryBacklogSummary;
+let mockGetUserById;
+let mockUpdateOrchestrationPreferences;
+let mockGetActiveWorkPage;
+let mockGetActiveWorkInteractiveSnapshot;
+let mockGetActiveWorkSnapshot;
+let mockRequestAccountApi;
+let mockBuildTrustedActionIdempotencyKey;
+let mockInvalidateActiveWorkSnapshot;
+let mockDismissCoreOnlyPreDispatchAttention;
+let mockGetCoreWorkDelivery;
+let mockReauthorizeCapabilityAuthorization;
+let mockRefreshOrchestrationReadiness;
 
 jest.mock(
   '@librechat/data-schemas',
@@ -78,6 +97,18 @@ jest.mock('~/server/middleware', () => ({
 }));
 
 jest.mock('~/server/controllers/agents/request', () => (req, res) => {
+  const {
+    bindLogicalTurnContext,
+    getTrustedAdapterCapabilities,
+    getTrustedDeliveryPolicy,
+    getTrustedInteractionContext,
+  } = require('~/server/services/viventium/interactionContext');
+  mockLastInteractionContext = getTrustedInteractionContext(req);
+  mockLastAdapterCapabilities = getTrustedAdapterCapabilities(req);
+  mockLastDeliveryPolicy = getTrustedDeliveryPolicy(req);
+  if (mockClaimedLogicalTurn) {
+    bindLogicalTurnContext(req, { ...mockLastInteractionContext, ...mockClaimedLogicalTurn });
+  }
   lastAgentId = req.body.agent_id;
   lastStreamId = req.body.streamId;
   lastParentMessageId = req.body.parentMessageId;
@@ -86,6 +117,7 @@ jest.mock('~/server/controllers/agents/request', () => (req, res) => {
   lastVoiceMode = req.body.voiceMode ?? null;
   lastTelegramAudioRequested = req.body.telegramAudioRequested ?? null;
   lastTelegramImages = req._telegramImages || null;
+  lastMissionAttachments = req._viventiumMissionAttachments || null;
   res.json({ streamId: 'stream_1', conversationId: req.body.conversationId || 'new' });
 });
 
@@ -96,10 +128,41 @@ jest.mock('~/server/services/Endpoints/agents', () => ({
 jest.mock('~/server/services/Endpoints/agents/title', () => jest.fn());
 
 jest.mock('~/models', () => ({
-  getUserById: async () => ({ _id: 'user_1', role: 'USER' }),
+  getUserById: (...args) => mockGetUserById(...args),
+  updateUserViventiumOrchestrationPreferences: (...args) =>
+    mockUpdateOrchestrationPreferences(...args),
   getMessages: (...args) => mockGetMessages(...args),
   getMessage: (...args) => mockGetMessage(...args),
   getConvo: (...args) => mockGetConvo(...args),
+}));
+
+jest.mock('~/server/services/viventium/GlassHiveAccountService', () => ({
+  getActiveWorkPage: (...args) => mockGetActiveWorkPage(...args),
+  getActiveWorkInteractiveSnapshot: (...args) => mockGetActiveWorkInteractiveSnapshot(...args),
+  getActiveWorkSnapshot: (...args) => mockGetActiveWorkSnapshot(...args),
+  requestAccountApi: (...args) => mockRequestAccountApi(...args),
+  buildTrustedActionIdempotencyKey: (...args) => mockBuildTrustedActionIdempotencyKey(...args),
+  invalidateActiveWorkSnapshot: (...args) => mockInvalidateActiveWorkSnapshot(...args),
+}));
+
+jest.mock('~/server/services/viventium/GlassHiveCapabilityAuthorizationService', () => ({
+  reauthorizeCapabilityAuthorization: (...args) => mockReauthorizeCapabilityAuthorization(...args),
+}));
+
+jest.mock('~/server/services/viventium/GlassHiveActiveWorkProjectionService', () => ({
+  dismissCoreOnlyPreDispatchAttention: (...args) =>
+    mockDismissCoreOnlyPreDispatchAttention(...args),
+  getCoreWorkDelivery: (...args) => mockGetCoreWorkDelivery(...args),
+}));
+
+jest.mock('~/server/services/viventium/GlassHiveOrchestrationReadinessService', () => ({
+  observeOrchestrationOwner: jest.fn(() => ({
+    available: process.env.VIVENTIUM_PARALLEL_WORK_AVAILABLE === 'true',
+  })),
+  orchestrationReadinessSnapshot: jest.fn(() => ({
+    available: process.env.VIVENTIUM_PARALLEL_WORK_AVAILABLE === 'true',
+  })),
+  refreshOrchestrationReadiness: (...args) => mockRefreshOrchestrationReadiness(...args),
 }));
 
 jest.mock('~/server/middleware/accessResources/fileAccess', () => ({
@@ -138,7 +201,12 @@ jest.mock('~/server/controllers/assistants/helpers', () => ({
 
 jest.mock('~/server/services/viventium/CallSessionService', () => ({
   createCallSession: (...args) => mockCreateCallSession(...args),
+  createCallBrowserLaunch: (...args) => mockCreateCallBrowserLaunch(...args),
   resolveUserVoiceRoute: (...args) => mockResolveUserVoiceRoute(...args),
+}));
+
+jest.mock('~/server/services/viventium/VoiceAgentAuthorizationService', () => ({
+  assertVoiceAgentAccess: (...args) => mockAssertVoiceAgentAccess(...args),
 }));
 
 jest.mock('~/server/services/viventium/GlassHiveCallbackDeliveryService', () => ({
@@ -334,6 +402,11 @@ describe('/api/viventium/telegram', () => {
     lastVoiceMode = null;
     lastTelegramAudioRequested = null;
     lastTelegramImages = null;
+    lastMissionAttachments = null;
+    mockLastInteractionContext = null;
+    mockLastAdapterCapabilities = null;
+    mockLastDeliveryPolicy = null;
+    mockClaimedLogicalTurn = null;
     jest.resetModules();
     mockUserFindOne = jest.fn();
     mockUserCountDocuments = jest.fn().mockResolvedValue(0);
@@ -373,7 +446,13 @@ describe('/api/viventium/telegram', () => {
       conversationId,
       roomName: 'lc-calltest',
       requestedVoiceRoute: null,
+      browserCapability: 'B'.repeat(43),
     }));
+    mockCreateCallBrowserLaunch = jest.fn(async () => ({
+      capability: 'L'.repeat(43),
+      expiresAt: '2026-08-09T22:00:00.000Z',
+    }));
+    mockAssertVoiceAgentAccess = jest.fn().mockResolvedValue({ _id: 'agent-resource-1' });
     mockResolveUserVoiceRoute = jest.fn().mockResolvedValue({
       stt: { provider: 'pywhispercpp', variant: 'base.en' },
       tts: {
@@ -386,6 +465,45 @@ describe('/api/viventium/telegram', () => {
     mockMarkGlassHiveDeliveryFailed = jest.fn().mockResolvedValue({ deliveryId: 'ghcd_1' });
     mockMarkGlassHiveDeliverySuppressed = jest.fn().mockResolvedValue({ deliveryId: 'ghcd_1' });
     mockDeliveryBacklogSummary = jest.fn().mockResolvedValue({ count: 0, oldest: null });
+    mockGetUserById = jest.fn().mockResolvedValue({
+      _id: 'user_1',
+      role: 'USER',
+      personalization: { orchestration_mode: 'focused' },
+    });
+    mockUpdateOrchestrationPreferences = jest.fn().mockResolvedValue({
+      _id: 'user_1',
+      role: 'USER',
+      personalization: { orchestration_mode: 'parallel' },
+    });
+    mockGetActiveWorkInteractiveSnapshot = jest.fn().mockResolvedValue({
+      snapshot: 'fresh',
+      work: [],
+      overflowCount: 0,
+    });
+    mockGetActiveWorkSnapshot = jest.fn().mockResolvedValue({
+      snapshot: 'fresh',
+      work: [],
+      overflowCount: 0,
+    });
+    mockGetActiveWorkPage = jest.fn().mockResolvedValue({
+      snapshot: 'fresh',
+      work: [{ workRef: 'work-next', state: 'running', actions: [] }],
+      overflowCount: 0,
+    });
+    mockRequestAccountApi = jest.fn().mockResolvedValue({
+      workRef: 'ghw_test',
+      state: 'stopping',
+    });
+    mockBuildTrustedActionIdempotencyKey = jest.fn().mockReturnValue('trusted-action-key');
+    mockInvalidateActiveWorkSnapshot = jest.fn();
+    mockDismissCoreOnlyPreDispatchAttention = jest.fn().mockResolvedValue(null);
+    mockGetCoreWorkDelivery = jest.fn().mockResolvedValue({ state: 'delivered' });
+    mockRefreshOrchestrationReadiness = jest.fn().mockResolvedValue({ available: false });
+    mockReauthorizeCapabilityAuthorization = jest.fn().mockResolvedValue({
+      authorizationRef: 'gha_authorization',
+      maxExpiresAt: '2026-08-14T00:00:00.000Z',
+      scopeFingerprint: 'scope-fingerprint',
+    });
     mockTelegramMappingFindOne = jest.fn().mockReturnValue({
       lean: async () => ({ libreChatUserId: 'user_1' }),
     });
@@ -398,6 +516,7 @@ describe('/api/viventium/telegram', () => {
     process.env.VIVENTIUM_PLAYGROUND_URL = 'http://localhost:3300';
     process.env.VIVENTIUM_PUBLIC_PLAYGROUND_URL = '';
     process.env.VIVENTIUM_VOICE_GATEWAY_AGENT_NAME = 'librechat-voice-gateway';
+    process.env.VIVENTIUM_PARALLEL_WORK_AVAILABLE = 'true';
   });
 
   test('POST rejects missing secret', async () => {
@@ -430,6 +549,56 @@ describe('/api/viventium/telegram', () => {
     expect(lastAgentId).toBe('agent_default');
     expect(typeof lastStreamId).toBe('string');
     expect(lastStreamId.startsWith('telegram-')).toBe(true);
+  });
+
+  test('POST authors Telegram context, ignores forged authority, and returns claimed turn metadata', async () => {
+    mockClaimedLogicalTurn = { logical_turn_id: 'logical-telegram-1', revision: 3 };
+    const telegramRouter = require('../telegram');
+    const app = createTestApp(telegramRouter);
+    const req = createMockReq({
+      url: '/api/viventium/telegram/chat',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      body: {
+        text: 'hi',
+        conversationId: 'new',
+        telegramUserId: 'tg-1',
+        sourceEventId: 'telegram:opaque:event:1',
+        interactionContext: { actor_kind: 'system', origin: 'scheduler', surface: 'workbench' },
+        adapterCapabilities: { segment_stability: 'provisional', supersede_scope: 'response_only' },
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(mockLastInteractionContext).toEqual({
+      actor_kind: 'external_user',
+      origin: 'interactive',
+      surface: 'telegram',
+      conversation_id: expect.any(String),
+      revision: 1,
+      source_event_id: 'telegram:opaque:event:1',
+    });
+    expect(mockLastAdapterCapabilities).toEqual({
+      segment_stability: 'immediate',
+      supersede_scope: 'response_and_authoring',
+    });
+    expect(mockLastDeliveryPolicy).toEqual({ commit_authority: 'external_adapter' });
+    expect(req.body).not.toHaveProperty('interactionContext');
+    expect(req.body).not.toHaveProperty('adapterCapabilities');
+    expect(res.body).toMatchObject({
+      logical_turn_id: 'logical-telegram-1',
+      revision: 3,
+      metadata: {
+        viventium: {
+          interactionContext: expect.objectContaining({
+            surface: 'telegram',
+            logical_turn_id: 'logical-telegram-1',
+            revision: 3,
+          }),
+        },
+      },
+    });
   });
 
   test('POST suppresses duplicate ingress replay with no-op response', async () => {
@@ -629,6 +798,65 @@ describe('/api/viventium/telegram', () => {
     ]);
   });
 
+  test('POST persists native Telegram photos as distinct owner-scoped mission files in media-group order', async () => {
+    const telegramRouter = require('../telegram');
+    const app = createTestApp(telegramRouter);
+    const durableUploadCalls = [];
+    mockProcessAgentFileUpload.mockImplementation(async ({ req, res, metadata }) => {
+      durableUploadCalls.push([
+        req._viventiumBridgeDurableMissionAttachment,
+        req.file.originalname,
+      ]);
+      res.status(200).json({
+        message: 'Agent file uploaded and processed successfully',
+        file_id: metadata.file_id,
+        temp_file_id: metadata.temp_file_id,
+        filename: req.file.originalname,
+        filepath: `/uploads/user-1/${metadata.file_id}__${req.file.originalname}`,
+        type: req.file.mimetype,
+        source: 'local',
+      });
+    });
+    const sameBytes = Buffer.from('synthetic-photo-bytes').toString('base64');
+    const req = createMockReq({
+      url: '/api/viventium/telegram/chat',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      body: {
+        text: 'compare these in order',
+        conversationId: 'new',
+        telegramUserId: 'tg-1',
+        files: [
+          { filename: 'first.png', mime_type: 'image/png', data: sameBytes },
+          { filename: 'second.png', mime_type: 'image/png', data: sameBytes },
+        ],
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockProcessAgentFileUpload).toHaveBeenCalledTimes(2);
+    expect(durableUploadCalls).toEqual([
+      [true, 'first.png'],
+      [true, 'second.png'],
+    ]);
+    expect(lastMissionAttachments).toEqual([
+      expect.objectContaining({
+        filename: 'first.png',
+        type: 'image/png',
+        viventium_media_group_index: 0,
+      }),
+      expect.objectContaining({
+        filename: 'second.png',
+        type: 'image/png',
+        viventium_media_group_index: 1,
+      }),
+    ]);
+    expect(lastMissionAttachments[0].file_id).not.toBe(lastMissionAttachments[1].file_id);
+    expect(lastTelegramImages).toHaveLength(2);
+  });
+
   test('POST stale existing convo resets to new for Telegram hidden conversation reuse', async () => {
     process.env.VIVENTIUM_TELEGRAM_CONVERSATION_IDLE_MAX_M = '60';
     const telegramRouter = require('../telegram');
@@ -686,8 +914,33 @@ describe('/api/viventium/telegram', () => {
 
     await dispatch(app, req, res);
     expect(res.statusCode).toBe(401);
+    expect(res.body.code).toBe('TELEGRAM_ACCOUNT_NOT_LINKED');
     expect(res.body.linkRequired).toBe(true);
     expect(res.body.linkUrl).toContain('/api/viventium/telegram/link/');
+  });
+
+  test('GET /orchestration returns structured link authority without relying on prose', async () => {
+    mockTelegramMappingFindOne.mockReturnValue({
+      lean: async () => null,
+    });
+    const telegramRouter = require('../telegram');
+    const app = createTestApp(telegramRouter);
+    const req = createMockReq({
+      url: '/api/viventium/telegram/orchestration?telegramUserId=tg-1',
+      method: 'GET',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      query: { telegramUserId: 'tg-1' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(401);
+    expect(res.body).toEqual({
+      error: 'Telegram account not linked',
+      code: 'TELEGRAM_ACCOUNT_NOT_LINKED',
+      linkRequired: true,
+    });
   });
 
   test('POST /call-link requires a public HTTPS playground URL for Telegram launches', async () => {
@@ -708,7 +961,7 @@ describe('/api/viventium/telegram', () => {
     expect(res.body.error).toContain('public HTTPS Viventium voice URL');
   });
 
-  test('POST /call-link creates a call session and returns a public deep-link url', async () => {
+  test('POST /call-link returns a public one-time launch link without reusable browser authority', async () => {
     process.env.VIVENTIUM_PUBLIC_PLAYGROUND_URL = 'https://voice.viventium.ai';
     const telegramRouter = require('../telegram');
     const app = createTestApp(telegramRouter);
@@ -730,10 +983,44 @@ describe('/api/viventium/telegram', () => {
     expect(res.body.callUrl).toBe(res.body.playgroundUrl);
     const url = new URL(res.body.playgroundUrl);
     expect(url.origin).toBe('https://voice.viventium.ai');
-    expect(url.searchParams.get('roomName')).toBe('lc-calltest');
+    expect(url.pathname).toBe('/call-bootstrap');
+    expect(url.searchParams.get('roomName')).toBeNull();
     expect(url.searchParams.get('callSessionId')).toBe('call_session_test');
-    expect(url.searchParams.get('agentName')).toBe('librechat-voice-gateway');
+    expect(url.searchParams.get('agentName')).toBeNull();
     expect(url.searchParams.get('autoConnect')).toBe('1');
+    expect(url.hash).toBe(`#viventiumCallLaunch=${'L'.repeat(43)}`);
+    expect(url.hash).not.toContain('viventiumCallCapability');
+    expect(mockCreateCallBrowserLaunch).toHaveBeenCalledWith('call_session_test');
+    expect(res.headers['Cache-Control']).toBe('no-store, private');
+    expect(res.headers.Pragma).toBe('no-cache');
+    expect(JSON.stringify(res.body)).not.toContain('B'.repeat(43));
+  });
+
+  test('POST /call-link denies a foreign or revoked agent before creating call authority', async () => {
+    process.env.VIVENTIUM_PUBLIC_PLAYGROUND_URL = 'https://voice.viventium.ai';
+    const error = new Error('Voice assistant is unavailable');
+    error.status = 404;
+    error.code = 'no_route';
+    mockAssertVoiceAgentAccess.mockRejectedValueOnce(error);
+    const telegramRouter = require('../telegram');
+    const app = createTestApp(telegramRouter);
+    const req = createMockReq({
+      url: '/api/viventium/telegram/call-link',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      body: { conversationId: 'new', telegramUserId: 'tg-1', agentId: 'agent_foreign' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(404);
+    expect(res.body).toEqual({
+      code: 'no_route',
+      message: 'Voice assistant is unavailable.',
+      retryable: false,
+    });
+    expect(mockCreateCallSession).not.toHaveBeenCalled();
+    expect(mockCreateCallBrowserLaunch).not.toHaveBeenCalled();
   });
 
   test('POST /call-link returns linkRequired when telegram user is unlinked', async () => {
@@ -752,6 +1039,7 @@ describe('/api/viventium/telegram', () => {
     await dispatch(app, req, res);
 
     expect(res.statusCode).toBe(401);
+    expect(res.body.code).toBe('TELEGRAM_ACCOUNT_NOT_LINKED');
     expect(res.body.linkRequired).toBe(true);
     expect(res.body.linkUrl).toContain('/api/viventium/telegram/link/');
   });
@@ -976,6 +1264,28 @@ describe('/api/viventium/telegram', () => {
     expect(mockSubscribe).not.toHaveBeenCalled();
   });
 
+  test("GET stream does not reveal another owner's stream existence", async () => {
+    mockGetJob.mockResolvedValueOnce({ metadata: { userId: 'other-owner' } });
+    const telegramRouter = require('../telegram');
+    const app = createTestApp(telegramRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/telegram/stream/foreign_1?telegramUserId=tg-1',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      query: { telegramUserId: 'tg-1' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(404);
+    expect(res.body).toEqual({
+      error: 'Stream not found',
+      message: 'The generation job does not exist or has expired.',
+    });
+    expect(mockSubscribe).not.toHaveBeenCalled();
+  });
+
   test('GET stream forwards attachment events in SSE payload', async () => {
     const telegramRouter = require('../telegram');
     const app = createTestApp(telegramRouter);
@@ -1009,6 +1319,44 @@ describe('/api/viventium/telegram', () => {
     expect(writes.some((line) => line.includes('"file_id":"file-1"'))).toBe(true);
   });
 
+  test('GET stream decorates SSE with authoritative logical-turn metadata', async () => {
+    mockGetJob.mockResolvedValueOnce({
+      metadata: {
+        userId: 'user_1',
+        interactionContext: {
+          actor_kind: 'external_user',
+          origin: 'interactive',
+          surface: 'telegram',
+          conversation_id: 'conversation-1',
+          logical_turn_id: 'logical-telegram-2',
+          revision: 2,
+          source_event_id: 'event-2',
+        },
+      },
+    });
+    mockSubscribe.mockImplementation(async (_streamId, onChunk, onDone) => {
+      onChunk({ event: 'on_message_delta', data: { text: 'hello' } });
+      onDone({ final: true });
+      return { unsubscribe: jest.fn() };
+    });
+    const telegramRouter = require('../telegram');
+    const app = createTestApp(telegramRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/telegram/stream/stream_1?telegramUserId=tg-1',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      query: { telegramUserId: 'tg-1' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    const writes = res.write.mock.calls.map((call) => String(call[0] || '')).join('\n');
+    expect(writes).toContain('"logical_turn_id":"logical-telegram-2"');
+    expect(writes).toContain('"revision":2');
+    expect(writes).toContain('"surface":"telegram"');
+  });
+
   test('POST preferences persists voice preference sync payload', async () => {
     const telegramRouter = require('../telegram');
     const app = createTestApp(telegramRouter);
@@ -1031,6 +1379,227 @@ describe('/api/viventium/telegram', () => {
     const lastCall = calls[calls.length - 1];
     expect(lastCall[1].$set.alwaysVoiceResponse).toBe(true);
     expect(lastCall[1].$set.voiceResponsesEnabled).toBe(false);
+  });
+
+  test('GET orchestration reads the linked account-wide mode without a model call', async () => {
+    mockGetUserById.mockResolvedValue({
+      _id: 'user_1',
+      role: 'USER',
+      personalization: { orchestration_mode: 'parallel' },
+    });
+    const telegramRouter = require('../telegram');
+    const app = createTestApp(telegramRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/telegram/orchestration?telegramUserId=tg-1',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      query: { telegramUserId: 'tg-1' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({ available: true, mode: 'parallel', hasKnownWork: false });
+    expect(res.headers['Cache-Control']).toContain('no-store');
+  });
+
+  test('PATCH orchestration persists only the linked account and disabling does not cancel work', async () => {
+    mockUpdateOrchestrationPreferences.mockResolvedValue({
+      personalization: { orchestration_mode: 'focused' },
+    });
+    const telegramRouter = require('../telegram');
+    const app = createTestApp(telegramRouter);
+    const req = createMockReq({
+      method: 'PATCH',
+      url: '/api/viventium/telegram/orchestration',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      body: { telegramUserId: 'tg-1', mode: 'focused' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({ available: true, mode: 'focused', hasKnownWork: false });
+    expect(mockUpdateOrchestrationPreferences).toHaveBeenCalledWith('user_1', {
+      mode: 'focused',
+    });
+    expect(mockRequestAccountApi).not.toHaveBeenCalled();
+  });
+
+  test('PATCH orchestration refreshes stale readiness before rejecting a linked enable', async () => {
+    process.env.VIVENTIUM_PARALLEL_WORK_AVAILABLE = 'false';
+    mockRefreshOrchestrationReadiness.mockImplementationOnce(async () => {
+      process.env.VIVENTIUM_PARALLEL_WORK_AVAILABLE = 'true';
+      return { available: true };
+    });
+    mockUpdateOrchestrationPreferences.mockResolvedValue({
+      personalization: { orchestration_mode: 'parallel' },
+    });
+    const telegramRouter = require('../telegram');
+    const app = createTestApp(telegramRouter);
+    const req = createMockReq({
+      method: 'PATCH',
+      url: '/api/viventium/telegram/orchestration',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      body: { telegramUserId: 'tg-1', mode: 'parallel' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockRefreshOrchestrationReadiness).toHaveBeenCalledWith({ ownerId: 'user_1' });
+    expect(mockUpdateOrchestrationPreferences).toHaveBeenCalledWith('user_1', {
+      mode: 'parallel',
+    });
+    expect(res.body).toEqual({ available: true, mode: 'parallel', hasKnownWork: false });
+  });
+
+  test('GET orchestration work preserves unavailable truth for the linked owner', async () => {
+    mockGetActiveWorkInteractiveSnapshot.mockResolvedValue({
+      snapshot: 'unavailable',
+      work: null,
+      overflowCount: null,
+    });
+    const telegramRouter = require('../telegram');
+    const app = createTestApp(telegramRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/telegram/orchestration/work?telegramUserId=tg-1',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      query: { telegramUserId: 'tg-1' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.body).toEqual({ snapshot: 'unavailable', work: null, overflowCount: null });
+    expect(mockGetActiveWorkInteractiveSnapshot).toHaveBeenCalledWith({ ownerId: 'user_1' });
+  });
+
+  test('GET orchestration work pages with an opaque cursor without changing account scope', async () => {
+    const telegramRouter = require('../telegram');
+    const app = createTestApp(telegramRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/telegram/orchestration/work?telegramUserId=tg-1&cursor=signed.next-page&limit=20',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      query: { telegramUserId: 'tg-1', cursor: 'signed.next-page', limit: '20' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockGetActiveWorkPage).toHaveBeenCalledWith({
+      ownerId: 'user_1',
+      cursor: 'signed.next-page',
+      limit: 20,
+    });
+    expect(res.body.work).toEqual([expect.objectContaining({ workRef: 'work-next' })]);
+  });
+
+  test('POST orchestration action derives trusted idempotency and uses canonical work endpoint', async () => {
+    const telegramRouter = require('../telegram');
+    const app = createTestApp(telegramRouter);
+    const req = createMockReq({
+      url: '/api/viventium/telegram/orchestration/work/ghw_test/actions',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      body: {
+        telegramUserId: 'tg-1',
+        action: 'message',
+        instruction: 'Add the new source without interrupting.',
+        operationId: '018f47d3-8965-7f6a-a826-7c06afedc001',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(202);
+    expect(mockBuildTrustedActionIdempotencyKey).toHaveBeenCalledWith({
+      ownerId: 'user_1',
+      workRef: 'ghw_test',
+      action: 'message',
+      operationId: '018f47d3-8965-7f6a-a826-7c06afedc001',
+    });
+    expect(mockRequestAccountApi).toHaveBeenCalledWith({
+      ownerId: 'user_1',
+      path: '/v1/work/ghw_test/actions',
+      method: 'POST',
+      body: {
+        action: 'message',
+        instruction: 'Add the new source without interrupting.',
+        idempotencyKey: 'trusted-action-key',
+      },
+    });
+  });
+
+  test('POST orchestration dismiss cannot bypass unsettled Core delivery truth', async () => {
+    mockGetCoreWorkDelivery.mockResolvedValueOnce({ state: 'pending' });
+    const telegramRouter = require('../telegram');
+    const app = createTestApp(telegramRouter);
+    const req = createMockReq({
+      url: '/api/viventium/telegram/orchestration/work/ghw_test/actions',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      body: {
+        telegramUserId: 'tg-1',
+        action: 'dismiss',
+        operationId: '018f47d3-8965-7f6a-a826-7c06afedc002',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body.code).toBe('glasshive_dismiss_delivery_not_settled');
+    expect(mockRequestAccountApi).not.toHaveBeenCalled();
+  });
+
+  test('POST orchestration auth Resume uses the canonical exact-scope reauthorization path', async () => {
+    mockRequestAccountApi
+      .mockResolvedValueOnce({
+        attention: { kind: 'auth', code: 'capability_authorization_horizon_expired' },
+      })
+      .mockResolvedValueOnce({ workRef: 'ghw_test', state: 'queued' });
+    const telegramRouter = require('../telegram');
+    const app = createTestApp(telegramRouter);
+    const req = createMockReq({
+      url: '/api/viventium/telegram/orchestration/work/ghw_test/actions',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      body: {
+        telegramUserId: 'tg-1',
+        action: 'resume',
+        operationId: '018f47d3-8965-7f6a-a826-7c06afedc003',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(202);
+    expect(mockReauthorizeCapabilityAuthorization).toHaveBeenCalledWith({
+      ownerId: 'user_1',
+      workRef: 'ghw_test',
+    });
+    expect(mockRequestAccountApi).toHaveBeenNthCalledWith(2, {
+      ownerId: 'user_1',
+      path: '/v1/work/ghw_test/actions',
+      method: 'POST',
+      body: {
+        action: 'resume',
+        idempotencyKey: 'trusted-action-key',
+        capabilityReauthorization: {
+          version: 1,
+          authorizationRef: 'gha_authorization',
+          maxExpiresAt: '2026-08-14T00:00:00.000Z',
+          scopeFingerprint: 'scope-fingerprint',
+        },
+      },
+    });
   });
 
   test('GET cortex returns cortex parts and follow-up', async () => {

@@ -1,6 +1,14 @@
 import type { EventEmitter } from 'events';
 import type { Agents } from 'librechat-data-provider';
 import type { ServerSentEvent } from '~/types';
+// VIVENTIUM START: carry durable interaction metadata through generation jobs.
+import type {
+  AdapterCapabilities,
+  InteractionContext,
+  InteractionDeliveryAck,
+  InteractionDeliveryPolicy,
+} from '~/stream/interfaces/IJobStore';
+// VIVENTIUM END
 
 export interface GenerationJobMetadata {
   userId: string;
@@ -19,9 +27,18 @@ export interface GenerationJobMetadata {
   model?: string;
   /** Prompt token count for abort token spending */
   promptTokens?: number;
+  // VIVENTIUM START: persist the interaction and delivery contract with the job.
+  interactionContext?: InteractionContext;
+  adapterCapabilities?: AdapterCapabilities;
+  deliveryPolicy?: InteractionDeliveryPolicy;
+  deliveryAcknowledgement?: InteractionDeliveryAck;
+  generationCompleted?: boolean;
+  // VIVENTIUM END
 }
 
-export type GenerationJobStatus = 'running' | 'complete' | 'error' | 'aborted';
+// VIVENTIUM START: represent durable supersession explicitly.
+export type GenerationJobStatus = 'running' | 'complete' | 'error' | 'aborted' | 'superseded';
+// VIVENTIUM END
 
 export interface GenerationJob {
   streamId: string;
@@ -38,6 +55,16 @@ export interface GenerationJob {
   finalEvent?: ServerSentEvent;
   /** Flag to indicate if a sync event was already sent (prevent duplicate replays) */
   syncSent?: boolean;
+  // VIVENTIUM START: expose idempotent replay and superseded-presentation receipts.
+  /** Set when source-event idempotency maps this request to an already-created stream. */
+  duplicateOfStreamId?: string;
+  /** Uncommitted older presentations that this revision superseded and must hide durably. */
+  supersededPresentations?: Array<{
+    conversationId?: string;
+    responseMessageId?: string;
+    interactionContext?: InteractionContext;
+  }>;
+  // VIVENTIUM END
 }
 
 export type ContentPart = Agents.ContentPart;

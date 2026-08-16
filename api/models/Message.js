@@ -586,6 +586,99 @@ async function getMessages(filter, select) {
 }
 
 /* === VIVENTIUM START ===
+ * Feature: Bounded ancestor-branch retrieval for durable mission context.
+ * Purpose: A GlassHive launch needs the exact relevant chat branch, not every message in a large
+ * or forked conversation. Keep the query owner-scoped, index-led by messageId, and hard-bounded.
+ * === VIVENTIUM END === */
+const MESSAGE_ANCESTOR_MAX_LIMIT = 64;
+
+function boundedAncestorCount(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 32;
+  return Math.max(1, Math.min(Math.floor(parsed), MESSAGE_ANCESTOR_MAX_LIMIT));
+}
+
+function buildMessageAncestorBranchPipeline({
+  user,
+  conversationId,
+  messageId,
+  maxAncestors = 32,
+}) {
+  const ancestorLimit = boundedAncestorCount(maxAncestors);
+  const projectedCurrent = {
+    messageId: '$messageId',
+    parentMessageId: '$parentMessageId',
+    sender: '$sender',
+    isCreatedByUser: '$isCreatedByUser',
+    text: '$text',
+    content: '$content',
+    unfinished: '$unfinished',
+    error: '$error',
+    metadata: '$metadata',
+    ancestorDepth: { $literal: -1 },
+  };
+  const projectedAncestor = {
+    messageId: '$$message.messageId',
+    parentMessageId: '$$message.parentMessageId',
+    sender: '$$message.sender',
+    isCreatedByUser: '$$message.isCreatedByUser',
+    text: '$$message.text',
+    content: '$$message.content',
+    unfinished: '$$message.unfinished',
+    error: '$$message.error',
+    metadata: '$$message.metadata',
+    ancestorDepth: '$$message.ancestorDepth',
+  };
+  return [
+    { $match: { user, conversationId, messageId } },
+    { $limit: 1 },
+    {
+      $graphLookup: {
+        from: Message.collection.name,
+        startWith: '$parentMessageId',
+        connectFromField: 'parentMessageId',
+        connectToField: 'messageId',
+        as: 'ancestors',
+        depthField: 'ancestorDepth',
+        maxDepth: ancestorLimit - 1,
+        restrictSearchWithMatch: { user, conversationId },
+      },
+    },
+    {
+      $project: {
+        _id: 0,
+        current: projectedCurrent,
+        ancestors: {
+          $map: {
+            input: '$ancestors',
+            as: 'message',
+            in: projectedAncestor,
+          },
+        },
+      },
+    },
+  ];
+}
+
+async function getMessageAncestorBranch({ user, conversationId, messageId, maxAncestors = 32 }) {
+  if (!user || !conversationId || !messageId) return [];
+  const ancestorLimit = boundedAncestorCount(maxAncestors);
+  try {
+    const [result] = await Message.aggregate(
+      buildMessageAncestorBranchPipeline({ user, conversationId, messageId, maxAncestors }),
+    );
+    if (!result?.current) return [];
+    return [result.current, ...(Array.isArray(result.ancestors) ? result.ancestors : [])]
+      .sort((left, right) => Number(left.ancestorDepth) - Number(right.ancestorDepth))
+      .slice(0, ancestorLimit + 1)
+      .map(({ ancestorDepth: _ancestorDepth, ...message }) => message);
+  } catch (err) {
+    logger.error('Error getting bounded message ancestor branch:', err);
+    throw err;
+  }
+}
+
+/* === VIVENTIUM START ===
  * Feature: Recall freshness timestamp helper.
  * Purpose: Let runtime attachment logic compare a recall corpus timestamp against the newest
  * recall-eligible message instead of blindly trusting stale vector state.
@@ -681,6 +774,7 @@ module.exports = {
   updateMessage,
   deleteMessagesSince,
   getMessages,
+  getMessageAncestorBranch,
   getLatestRecallEligibleMessageCreatedAt,
   getMessage,
   deleteMessages,
@@ -692,5 +786,6 @@ module.exports = {
     shouldMirrorContentTextToMessageText,
     mirrorContentTextToMessageText,
     shouldSkipConversationRecallSync,
+    buildMessageAncestorBranchPipeline,
   },
 };

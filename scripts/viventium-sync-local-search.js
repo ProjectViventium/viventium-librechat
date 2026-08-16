@@ -18,12 +18,6 @@ const failedTaskLookback = process.env.VIVENTIUM_MEILI_FAILED_TASK_LOOKBACK
   ? parseInt(process.env.VIVENTIUM_MEILI_FAILED_TASK_LOOKBACK, 10)
   : 25;
 const expectedMeiliPrimaryKey = '_meiliId';
-const meiliEligibleQuery = {
-  expiredAt: null,
-  'metadata.viventium.type': { $ne: 'listen_only_transcript' },
-  'metadata.viventium.mode': { $ne: 'listen_only' },
-};
-
 const isTruthy = (value) => {
   if (typeof value !== 'string') {
     return false;
@@ -117,20 +111,18 @@ const getIndexCount = async (client, indexName) => {
 };
 
 const getState = async (Message, Conversation, client) => {
-  const [msgTotal, msgIndexed, convoTotal, convoIndexed, msgMeili, convoMeili] = await Promise.all([
-    Message.countDocuments(meiliEligibleQuery),
-    Message.countDocuments({ ...meiliEligibleQuery, _meiliIndex: true }),
-    Conversation.countDocuments(meiliEligibleQuery),
-    Conversation.countDocuments({ ...meiliEligibleQuery, _meiliIndex: true }),
+  const [messageProgress, conversationProgress, msgMeili, convoMeili] = await Promise.all([
+    Message.getSyncProgress(),
+    Conversation.getSyncProgress(),
     getIndexCount(client, 'messages'),
     getIndexCount(client, 'convos'),
   ]);
 
   return {
-    msgTotal,
-    msgIndexed,
-    convoTotal,
-    convoIndexed,
+    msgTotal: messageProgress.totalDocuments,
+    msgIndexed: messageProgress.totalProcessed,
+    convoTotal: conversationProgress.totalDocuments,
+    convoIndexed: conversationProgress.totalProcessed,
     msgMeili,
     convoMeili,
   };

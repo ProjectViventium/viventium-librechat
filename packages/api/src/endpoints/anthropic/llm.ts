@@ -185,7 +185,9 @@ function ensureAnthropicOAuthSystemPrompt(
     return {
       ...request,
       system: prependAnthropicOAuthSystemBlock(
-        system.filter((block): block is Record<string, unknown> => block != null && typeof block === 'object'),
+        system.filter(
+          (block): block is Record<string, unknown> => block != null && typeof block === 'object',
+        ),
       ),
     };
   }
@@ -206,7 +208,9 @@ function ensureAnthropicOAuthSystemPrompt(
       return {
         ...request,
         system: prependAnthropicOAuthSystemBlock(
-          content.filter((block): block is Record<string, unknown> => block != null && typeof block === 'object'),
+          content.filter(
+            (block): block is Record<string, unknown> => block != null && typeof block === 'object',
+          ),
         ),
       };
     }
@@ -224,6 +228,36 @@ function ensureAnthropicOAuthSystemPrompt(
   };
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Public-safe Anthropic request diagnostics.
+ * Purpose: Retain structural troubleshooting signals without logging prompt text, tool names,
+ *          tool arguments, arbitrary field names, or other caller-controlled values.
+ */
+const SAFE_ANTHROPIC_CONTENT_BLOCK_TYPES = new Set([
+  'document',
+  'image',
+  'redacted_thinking',
+  'search_result',
+  'text',
+  'thinking',
+  'tool_result',
+  'tool_use',
+]);
+
+function summarizeAnthropicContentBlockType(value: unknown): string {
+  if (typeof value === 'string' && SAFE_ANTHROPIC_CONTENT_BLOCK_TYPES.has(value)) {
+    return value;
+  }
+
+  return typeof value === 'string' ? 'unknown_string' : typeof value;
+}
+
+function countObjectFields(value: unknown): number {
+  return value != null && typeof value === 'object' && !Array.isArray(value)
+    ? Object.keys(value).length
+    : 0;
+}
+
 function summarizeAnthropicContentBlocks(value: unknown): unknown[] {
   if (!Array.isArray(value)) {
     return [];
@@ -235,16 +269,17 @@ function summarizeAnthropicContentBlocks(value: unknown): unknown[] {
     }
 
     const typedBlock = block as Record<string, unknown>;
-    const text =
-      typeof typedBlock.text === 'string' ? typedBlock.text.slice(0, 120) : undefined;
-    const name = typeof typedBlock.name === 'string' ? typedBlock.name : undefined;
+    const nestedContentCount = Array.isArray(typedBlock.content) ? typedBlock.content.length : 0;
 
     return {
-      type: typedBlock.type,
-      name,
-      text,
+      type: summarizeAnthropicContentBlockType(typedBlock.type),
+      text_length: typeof typedBlock.text === 'string' ? typedBlock.text.length : 0,
+      name_present: typeof typedBlock.name === 'string' && typedBlock.name.length > 0,
+      name_length: typeof typedBlock.name === 'string' ? typedBlock.name.length : 0,
       hasInput: typedBlock.input != null,
+      input_field_count: countObjectFields(typedBlock.input),
       hasContent: Array.isArray(typedBlock.content),
+      nested_content_count: nestedContentCount,
     };
   });
 }
@@ -255,9 +290,54 @@ function summarizeAnthropicMessage(value: unknown): Record<string, unknown> | nu
   }
 
   const message = value as Record<string, unknown>;
+  const role = message.role === 'user' || message.role === 'assistant' ? message.role : 'unknown';
   return {
-    role: message.role,
+    role,
+    content_block_count: Array.isArray(message.content) ? message.content.length : 0,
     content: summarizeAnthropicContentBlocks(message.content),
+  };
+}
+
+function summarizeAnthropicTools(value: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.slice(0, 10).map((tool) => {
+    if (tool == null || typeof tool !== 'object') {
+      return { value_type: typeof tool };
+    }
+
+    const typedTool = tool as Record<string, unknown>;
+    const inputSchema = typedTool.input_schema;
+    const properties =
+      inputSchema != null && typeof inputSchema === 'object' && !Array.isArray(inputSchema)
+        ? (inputSchema as Record<string, unknown>).properties
+        : undefined;
+
+    return {
+      name_present: typeof typedTool.name === 'string' && typedTool.name.length > 0,
+      name_length: typeof typedTool.name === 'string' ? typedTool.name.length : 0,
+      description_present:
+        typeof typedTool.description === 'string' && typedTool.description.length > 0,
+      description_length:
+        typeof typedTool.description === 'string' ? typedTool.description.length : 0,
+      input_schema_present: inputSchema != null,
+      input_property_count: countObjectFields(properties),
+    };
+  });
+}
+
+function summarizeAnthropicSystem(value: unknown): Record<string, unknown> {
+  if (typeof value === 'string') {
+    return { value_type: 'string', text_length: value.length, block_count: 0 };
+  }
+
+  return {
+    value_type: Array.isArray(value) ? 'array' : typeof value,
+    text_length: 0,
+    block_count: Array.isArray(value) ? value.length : 0,
+    blocks: summarizeAnthropicContentBlocks(value),
   };
 }
 
@@ -270,30 +350,40 @@ function summarizeAnthropicOAuthRequest(request: Record<string, unknown>): Recor
       : (request.system as { content?: unknown } | undefined)?.content;
 
   return {
-    keys: Object.keys(request).sort(),
-    model: request.model,
-    max_tokens: request.max_tokens ?? request.maxTokens,
-    temperature: request.temperature,
-    stream: request.stream,
-    thinking: request.thinking,
-    tool_choice: request.tool_choice ?? request.toolChoice,
+    request_field_count: Object.keys(request).length,
+    model_present: typeof request.model === 'string' && request.model.length > 0,
+    model_length: typeof request.model === 'string' ? request.model.length : 0,
+    max_tokens_present: request.max_tokens != null || request.maxTokens != null,
+    temperature_present: request.temperature != null,
+    stream: typeof request.stream === 'boolean' ? request.stream : null,
+    thinking_present: request.thinking != null,
+    tool_choice_present: request.tool_choice != null || request.toolChoice != null,
     tool_count: tools.length,
-    tool_names: tools
-      .slice(0, 10)
-      .map((tool) =>
-        tool != null && typeof tool === 'object' ? (tool as { name?: unknown }).name : undefined,
-      )
-      .filter((name): name is string => typeof name === 'string'),
-    system: typeof system === 'string' ? system.slice(0, 200) : summarizeAnthropicContentBlocks(system),
+    tools: summarizeAnthropicTools(tools),
+    system: summarizeAnthropicSystem(system),
     message_count: messages.length,
     first_message: summarizeAnthropicMessage(messages[0]),
     last_message: summarizeAnthropicMessage(messages[messages.length - 1]),
   };
 }
+/* === VIVENTIUM END === */
 
 type AnthropicMessagesCreate = Anthropic['messages']['create'];
 
-function wrapAnthropicOAuthClient(client: Anthropic): Anthropic {
+async function handleAnthropicConnectedAccountAuthFailure(
+  error: unknown,
+  callback?: (error: unknown) => Promise<void>,
+): Promise<never> {
+  if (callback) {
+    await callback(error);
+  }
+  throw error;
+}
+
+function wrapAnthropicOAuthClient(
+  client: Anthropic,
+  connectedAccountAuthFailure?: (error: unknown) => Promise<void>,
+): Anthropic {
   const originalCreate: AnthropicMessagesCreate = client.messages.create.bind(client.messages);
   const wrappedCreate: AnthropicMessagesCreate = ((request, requestOptions) => {
     const normalizedRequest = ensureAnthropicOAuthSystemPrompt(
@@ -308,7 +398,9 @@ function wrapAnthropicOAuthClient(client: Anthropic): Anthropic {
       );
     }
 
-    return originalCreate(normalizedRequest, requestOptions);
+    return originalCreate(normalizedRequest, requestOptions).catch((error: unknown) =>
+      handleAnthropicConnectedAccountAuthFailure(error, connectedAccountAuthFailure),
+    );
   }) as AnthropicMessagesCreate;
 
   Object.defineProperty(client.messages, 'create', {
@@ -375,19 +467,25 @@ function getLLMConfig(
   const apiKey = creds[AuthKeys.ANTHROPIC_API_KEY] ?? null;
   const oauthToken = shouldUseAnthropicOAuthAuth(apiKey, options);
 
+  /* === VIVENTIUM START ===
+   * Feature: Public-safe provider diagnostics.
+   * Purpose: Auth debugging may expose booleans/mode only; even a credential prefix is bearer
+   *          material and must never enter logs.
+   */
   if (process.env.VIVENTIUM_ANTHROPIC_DEBUG === 'true') {
     logger.info(
       `[Anthropic Auth Debug] ${JSON.stringify({
-        oauthType: normalizeLowerString(options.oauthType),
-        oauthProvider: normalizeLowerString(options.oauthProvider),
+        oauthTypePresent: normalizeLowerString(options.oauthType) != null,
+        oauthProviderPresent: normalizeLowerString(options.oauthProvider) != null,
         oauthToken,
-        apiKeyPrefix: typeof apiKey === 'string' ? apiKey.slice(0, 12) : null,
+        apiKeyPresent: typeof apiKey === 'string' && apiKey.length > 0,
         requestApiKeySet: (requestOptions as Record<string, unknown>).apiKey != null,
         clientAuthTokenSet:
           (requestOptions.clientOptions as Record<string, unknown> | undefined)?.authToken != null,
       })}`,
     );
   }
+  /* === VIVENTIUM END === */
 
   if (isAnthropicVertexCredentials(creds)) {
     // Vertex AI configuration - use custom client with optional YAML config
@@ -403,6 +501,7 @@ function getLLMConfig(
   } else if (apiKey) {
     // Direct API configuration
     if (oauthToken) {
+      const connectedAccountAuthFailure = options.connectedAccountAuthFailure;
       requestOptions.clientOptions = {
         ...(requestOptions.clientOptions ?? {}),
         authToken: apiKey,
@@ -426,6 +525,7 @@ function getLLMConfig(
             apiKey: null,
             authToken: apiKey,
           }),
+          connectedAccountAuthFailure,
         );
       };
       requestOptions.clientOptions.defaultHeaders = mergeDefaultHeaders(
@@ -590,19 +690,31 @@ function getLLMConfig(
     }
   }
 
+  /* === VIVENTIUM START ===
+   * Feature: Public-safe Anthropic final auth diagnostics.
+   * Purpose: Report header/auth presence and counts without emitting header names or values.
+   */
   if (process.env.VIVENTIUM_ANTHROPIC_DEBUG === 'true') {
+    const finalDefaultHeaders = (
+      requestOptions.clientOptions as Record<string, unknown> | undefined
+    )?.defaultHeaders;
     logger.info(
       `[Anthropic Auth Final] ${JSON.stringify({
         finalApiKeySet: (requestOptions as Record<string, unknown>).apiKey != null,
-        hasCreateClient: typeof (requestOptions as Record<string, unknown>).createClient === 'function',
+        hasCreateClient:
+          typeof (requestOptions as Record<string, unknown>).createClient === 'function',
         finalClientAuthTokenSet:
           (requestOptions.clientOptions as Record<string, unknown> | undefined)?.authToken != null,
-        finalDefaultHeaders:
-          (requestOptions.clientOptions as Record<string, unknown> | undefined)?.defaultHeaders ??
-          null,
+        finalDefaultHeaderCount: countObjectFields(finalDefaultHeaders),
+        hasAnthropicBetaHeader:
+          finalDefaultHeaders != null &&
+          typeof finalDefaultHeaders === 'object' &&
+          !Array.isArray(finalDefaultHeaders) &&
+          Object.prototype.hasOwnProperty.call(finalDefaultHeaders, 'anthropic-beta'),
       })}`,
     );
   }
+  /* === VIVENTIUM END === */
 
   return {
     tools,
@@ -612,4 +724,9 @@ function getLLMConfig(
   };
 }
 
-export { getLLMConfig, ensureAnthropicOAuthSystemPrompt, ANTHROPIC_OAUTH_SYSTEM_TEXT };
+export {
+  getLLMConfig,
+  ensureAnthropicOAuthSystemPrompt,
+  handleAnthropicConnectedAccountAuthFailure,
+  ANTHROPIC_OAUTH_SYSTEM_TEXT,
+};

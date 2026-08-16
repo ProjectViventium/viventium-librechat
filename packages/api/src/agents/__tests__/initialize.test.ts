@@ -404,6 +404,168 @@ describe('initializeAgent — custom endpoint init routing', () => {
     );
     expect(result.provider).toBe(Providers.OPENAI);
   });
+
+  it('binds structured harness context while preserving only the declared Core delegation facade', async () => {
+    const { agent, req, res, loadTools, db } = createMocks({
+      provider: 'glasshive-harness',
+    });
+    agent.id = 'agent-harness';
+    agent.model = 'codex-cli:gpt-5.6-sol';
+    agent.tools = [
+      'worker_delegate_once_mcp_glasshive-workers-projects',
+      'search_mcp_glasshive-workers-projects',
+      'search_mcp_github',
+    ];
+    (agent as Agent & { glasshive_options?: unknown }).glasshive_options = {
+      workspace: { mode: 'custom', path: '/srv/Viventium Life' },
+      access: 'workspace',
+      fallback_model: 'claude-code:opus',
+      fallback_reasoning_effort: 'high',
+      orchestration: {
+        parallel_available: true,
+        default_mode: 'parallel',
+      },
+    };
+    req.config = {
+      endpoints: {
+        agents: {
+          providerCapabilities: {
+            'glasshive-harness': {
+              workspace_binding: true,
+              conversation_session: true,
+              serial_model_fallback: true,
+              responses_api: false,
+              excluded_mcp_servers: ['glasshive-workers-projects'],
+              conversation_orchestration_tools: [
+                'worker_delegate_once_mcp_glasshive-workers-projects',
+                'active_work_list',
+                'active_work_action',
+              ],
+              models: [
+                {
+                  id: 'codex-cli:gpt-5.6-sol',
+                  effortChoices: ['medium'],
+                  recommendedEffort: 'medium',
+                },
+                {
+                  id: 'claude-code:opus',
+                  effortChoices: ['high', 'max'],
+                  recommendedEffort: 'high',
+                },
+              ],
+            },
+          },
+          capabilityRequiredProviders: ['glasshive-harness'],
+        },
+      },
+    } as never;
+    const mockGetOptions = jest.fn().mockResolvedValue({
+      llmConfig: {
+        model: 'codex-cli:gpt-5.6-sol',
+        maxTokens: 4096,
+      },
+      configOptions: {
+        defaultHeaders: { Authorization: 'Bearer configured-provider-key' },
+      },
+      endpointTokenConfig: undefined,
+    } satisfies InitializeResultBase);
+    mockGetProviderConfig.mockReturnValue({
+      getOptions: mockGetOptions,
+      overrideProvider: Providers.OPENAI,
+      initEndpoint: 'glasshive-harness',
+    });
+
+    const result = await initializeAgent(
+      {
+        req,
+        res,
+        agent,
+        loadTools,
+        endpointOption: { endpoint: EModelEndpoint.agents },
+        allowedProviders: new Set([Providers.OPENAI, 'glasshive-harness']),
+        isInitialAgent: true,
+      },
+      db,
+    );
+
+    expect(loadTools).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tools: ['worker_delegate_once_mcp_glasshive-workers-projects', 'search_mcp_github'],
+        orchestration: {
+          parallel_available: true,
+          default_mode: 'parallel',
+        },
+      }),
+    );
+    expect(result.model_parameters.configuration.defaultHeaders).toEqual(
+      expect.objectContaining({
+        Authorization: 'Bearer configured-provider-key',
+        'X-Viventium-User-Id': '{{LIBRECHAT_USER_ID}}',
+        'X-Viventium-Conversation-Id': '{{LIBRECHAT_BODY_CONVERSATIONID}}',
+        'X-GlassHive-Agent-Id': 'agent-harness',
+        'X-GlassHive-Workspace-Mode': 'custom',
+        'X-GlassHive-Workspace-Path-B64': Buffer.from('/srv/Viventium Life', 'utf8').toString(
+          'base64',
+        ),
+        'X-GlassHive-Access': 'workspace',
+        'X-GlassHive-Fallback-Model': 'claude-code:opus',
+        'X-GlassHive-Fallback-Reasoning-Effort': 'high',
+        'X-GlassHive-Turn-Context-B64': '{{LIBRECHAT_BODY_VIVENTIUMGLASSHIVETURNCONTEXTB64}}',
+      }),
+    );
+  });
+});
+
+/* === VIVENTIUM START ===
+ * Regression: provider-independent Main orchestration facade binding.
+ * Purpose: Voice/provider overrides still load the Core-owned facade, while the narrow loader
+ * boundary receives no workspace, fallback, or mission-root authority.
+ * === VIVENTIUM END === */
+describe('initializeAgent — Main orchestration tool declaration', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('projects only the orchestration declaration into the tool-loader request', async () => {
+    const { agent, req, res, loadTools, db } = createMocks();
+    agent.tools = ['active_work_list', 'active_work_action'];
+    agent.glasshive_options = {
+      workspace: { mode: 'custom', path: '/must/not/cross' },
+      access: 'full',
+      fallback_model: 'must-not-cross',
+      orchestration: {
+        parallel_available: true,
+        default_mode: 'focused',
+      },
+    };
+
+    await initializeAgent(
+      {
+        req,
+        res,
+        agent,
+        loadTools,
+        endpointOption: { endpoint: EModelEndpoint.agents },
+        allowedProviders: new Set([Providers.OPENAI]),
+        isInitialAgent: true,
+      },
+      db,
+    );
+
+    expect(loadTools).toHaveBeenCalledWith(
+      expect.objectContaining({
+        orchestration: {
+          parallel_available: true,
+          default_mode: 'focused',
+        },
+      }),
+    );
+    const request = (loadTools as jest.Mock).mock.calls[0][0];
+    expect(request).not.toHaveProperty('glasshive_options');
+    expect(request).not.toHaveProperty('workspace');
+    expect(request).not.toHaveProperty('access');
+    expect(request).not.toHaveProperty('fallback_model');
+  });
 });
 
 describe('initializeAgent — conversation recall resources', () => {
@@ -426,7 +588,8 @@ describe('initializeAgent — conversation recall resources', () => {
     global.fetch = jest.fn().mockResolvedValue({
       ok: true,
       status: 200,
-    } as Response);
+      json: jest.fn().mockResolvedValue({ status: 'UP' }),
+    } as unknown as Response);
   });
 
   afterEach(() => {
@@ -614,7 +777,8 @@ describe('initializeAgent — meeting transcript resources', () => {
     global.fetch = jest.fn().mockResolvedValue({
       ok: true,
       status: 200,
-    } as Response);
+      json: jest.fn().mockResolvedValue({ status: 'UP' }),
+    } as unknown as Response);
   });
 
   afterEach(() => {

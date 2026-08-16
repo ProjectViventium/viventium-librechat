@@ -8,6 +8,12 @@ import type {
   UsageMetadata,
   AbortResult,
   IJobStore,
+  InteractionContext,
+  LogicalTurnClaim,
+  AdapterCapabilities,
+  InteractionDeliveryAck,
+  DeliveryAcknowledgementResult,
+  InteractionDeliveryPolicy,
 } from './interfaces/IJobStore';
 import type * as t from '~/types';
 import { InMemoryEventTransport } from './implementations/InMemoryEventTransport';
@@ -26,6 +32,71 @@ export interface GenerationJobManagerOptions {
    */
   cleanupOnComplete?: boolean;
 }
+
+export interface CreateGenerationJobOptions {
+  interactionContext?: InteractionContext;
+  adapterCapabilities?: AdapterCapabilities;
+  deliveryPolicy?: InteractionDeliveryPolicy;
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Durable source-event idempotency.
+ * Purpose: A retry must not erase the first creator's receipt during its claim-to-job window.
+ * === VIVENTIUM END === */
+function streamCreationPendingError(): Error & { code: string } {
+  return Object.assign(new Error('Generation stream creation is still pending'), {
+    code: 'stream_creation_pending',
+  });
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Owner-safe duplicate stream recovery.
+ * Purpose: A stale or forged receipt must never return another owner's persisted generation.
+ * === VIVENTIUM END === */
+function streamReceiptConflictError(): Error & { code: string } {
+  return Object.assign(new Error('Generation stream receipt ownership does not match'), {
+    code: 'stream_id_conflict',
+  });
+}
+
+function streamManagerUnavailableError(): Error & { code: string } {
+  return Object.assign(new Error('Generation stream manager is unavailable'), {
+    code: 'stream_store_unavailable',
+  });
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Stream-manager lifecycle fencing.
+ * Purpose: Shutdown must cancel a transport handshake instead of waiting forever on old state.
+ */
+const LIFECYCLE_ABORTED = Symbol('lifecycle_aborted');
+const lifecycleAbortPromises = new WeakMap<AbortSignal, Promise<typeof LIFECYCLE_ABORTED>>();
+
+function lifecycleAbortPromise(signal: AbortSignal): Promise<typeof LIFECYCLE_ABORTED> {
+  const existing = lifecycleAbortPromises.get(signal);
+  if (existing) {
+    return existing;
+  }
+  const created = signal.aborted
+    ? Promise.resolve(LIFECYCLE_ABORTED)
+    : new Promise<typeof LIFECYCLE_ABORTED>((resolve) => {
+        signal.addEventListener('abort', () => resolve(LIFECYCLE_ABORTED), { once: true });
+      });
+  lifecycleAbortPromises.set(signal, created);
+  return created;
+}
+
+async function awaitLifecycle<T>(value: T | PromiseLike<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) {
+    throw streamManagerUnavailableError();
+  }
+  const result = await Promise.race([Promise.resolve(value), lifecycleAbortPromise(signal)]);
+  if (result === LIFECYCLE_ABORTED) {
+    throw streamManagerUnavailableError();
+  }
+  return result as T;
+}
+/* === VIVENTIUM END === */
 
 /**
  * Runtime state for active jobs - not serializable, kept in-memory per instance.
@@ -55,7 +126,23 @@ interface RuntimeJobState {
   earlyEventBuffer: t.ServerSentEvent[];
   hasSubscriber: boolean;
   allSubscribersLeftHandlers?: Array<(...args: unknown[]) => void>;
+  /** Shared readiness for a lazily-created cross-replica runtime. */
+  initializationReady?: Promise<void>;
 }
+
+/* === VIVENTIUM START ===
+ * Feature: Stream-manager lifecycle fencing.
+ * Purpose: Bind every lazy cross-replica hydration to one exact service generation.
+ */
+interface ManagerLifecycleSnapshot {
+  epoch: number;
+  jobStore: IJobStore;
+  eventTransport: IEventTransport;
+  signal: AbortSignal;
+  isRedis: boolean;
+  cleanupOnComplete: boolean;
+}
+/* === VIVENTIUM END === */
 
 /**
  * Manages generation jobs for resumable LLM streams.
@@ -94,6 +181,77 @@ class GenerationJobManagerClass {
 
   /** Whether to cleanup event transport immediately on job completion */
   private _cleanupOnComplete = true;
+  private lifecycleEpoch = 0;
+  private pendingAdmissions = 0;
+  private unavailable = false;
+  private lifecycleAbortController = new AbortController();
+
+  /* === VIVENTIUM START ===
+   * Feature: Stream-manager lifecycle fencing.
+   * Purpose: Old asynchronous reads may only observe and clean up their captured services.
+   */
+  private captureLifecycle(): ManagerLifecycleSnapshot {
+    return {
+      epoch: this.lifecycleEpoch,
+      jobStore: this.jobStore,
+      eventTransport: this.eventTransport,
+      signal: this.lifecycleAbortController.signal,
+      isRedis: this._isRedis,
+      cleanupOnComplete: this._cleanupOnComplete,
+    };
+  }
+
+  private isLifecycleCurrent(lifecycle: ManagerLifecycleSnapshot): boolean {
+    return (
+      !this.unavailable &&
+      !lifecycle.signal.aborted &&
+      lifecycle.epoch === this.lifecycleEpoch &&
+      lifecycle.jobStore === this.jobStore &&
+      lifecycle.eventTransport === this.eventTransport
+    );
+  }
+
+  private async awaitRuntimeInitialization(
+    streamId: string,
+    runtime: RuntimeJobState,
+    lifecycle: ManagerLifecycleSnapshot,
+  ): Promise<RuntimeJobState> {
+    if (runtime.initializationReady) {
+      await awaitLifecycle(runtime.initializationReady, lifecycle.signal);
+    }
+    if (!this.isLifecycleCurrent(lifecycle) || this.runtimeState.get(streamId) !== runtime) {
+      throw streamManagerUnavailableError();
+    }
+    return runtime;
+  }
+
+  private assertLifecycleOperation(
+    lifecycle: ManagerLifecycleSnapshot,
+    streamId?: string,
+    expectedRuntime: RuntimeJobState | undefined | null = null,
+  ): void {
+    if (
+      !this.isLifecycleCurrent(lifecycle) ||
+      (streamId !== undefined &&
+        expectedRuntime !== null &&
+        this.runtimeState.get(streamId) !== expectedRuntime)
+    ) {
+      throw streamManagerUnavailableError();
+    }
+  }
+
+  private async runLifecycleOperation<T>(
+    lifecycle: ManagerLifecycleSnapshot,
+    operation: () => T | PromiseLike<T>,
+    streamId?: string,
+    expectedRuntime: RuntimeJobState | undefined | null = null,
+  ): Promise<T> {
+    this.assertLifecycleOperation(lifecycle, streamId, expectedRuntime);
+    const result = await awaitLifecycle(operation(), lifecycle.signal);
+    this.assertLifecycleOperation(lifecycle, streamId, expectedRuntime);
+    return result;
+  }
+  /* === VIVENTIUM END === */
 
   constructor(options?: GenerationJobManagerOptions) {
     this.jobStore =
@@ -114,7 +272,11 @@ class GenerationJobManagerClass {
     this.jobStore.initialize();
 
     this.cleanupInterval = setInterval(() => {
-      this.cleanup();
+      void this.cleanup().catch((error: { code?: string }) => {
+        if (error?.code !== 'stream_store_unavailable') {
+          logger.warn('[GenerationJobManager] Periodic cleanup unavailable');
+        }
+      });
     }, 60000);
 
     if (this.cleanupInterval.unref) {
@@ -144,17 +306,47 @@ class GenerationJobManagerClass {
     isRedis?: boolean;
     cleanupOnComplete?: boolean;
   }): void {
+    if (this.pendingAdmissions > 0) {
+      throw streamManagerUnavailableError();
+    }
+    const wasInitialized = this.cleanupInterval != null;
+    const previousJobStore = this.jobStore;
+    const previousEventTransport = this.eventTransport;
     if (this.cleanupInterval) {
       logger.warn(
         '[GenerationJobManager] Reconfiguring after initialization - destroying existing services',
       );
-      this.destroy();
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = null;
     }
+    this.lifecycleAbortController.abort('manager_reconfigured');
+    this.lifecycleAbortController = new AbortController();
+    this.lifecycleEpoch += 1;
+    for (const runtime of this.runtimeState.values()) {
+      if (!runtime.abortController.signal.aborted) {
+        runtime.abortController.abort('manager_reconfigured');
+      }
+    }
+    this.runtimeState.clear();
+    this.runStepBuffers?.clear();
 
     this.jobStore = services.jobStore;
     this.eventTransport = services.eventTransport;
     this._isRedis = services.isRedis ?? false;
     this._cleanupOnComplete = services.cleanupOnComplete ?? true;
+    this.unavailable = false;
+
+    if (previousEventTransport !== services.eventTransport) {
+      previousEventTransport.destroy();
+    }
+    if (previousJobStore !== services.jobStore) {
+      void previousJobStore.destroy().catch((error) => {
+        logger.error('[GenerationJobManager] Previous job store destroy failed:', error);
+      });
+    }
+    if (wasInitialized) {
+      this.initialize();
+    }
 
     logger.info(
       `[GenerationJobManager] Configured with ${this._isRedis ? 'Redis' : 'in-memory'} stores`,
@@ -173,6 +365,135 @@ class GenerationJobManagerClass {
    */
   getJobStore(): IJobStore {
     return this.jobStore;
+  }
+
+  /** Persist an adapter's terminal presentation outcome against server-held turn ownership. */
+  async acknowledgeDelivery(
+    acknowledgement: InteractionDeliveryAck,
+    adapterSurface: 'telegram' | 'voice',
+  ): Promise<DeliveryAcknowledgementResult> {
+    const lifecycle = this.captureLifecycle();
+    const ownerStreamId = await this.runLifecycleOperation(lifecycle, () =>
+      lifecycle.jobStore.resolveDeliveryOwner(
+        acknowledgement.logical_turn_id,
+        acknowledgement.revision,
+      ),
+    );
+    const runtime = ownerStreamId ? this.runtimeState.get(ownerStreamId) : undefined;
+    const ownerJob = ownerStreamId
+      ? await this.runLifecycleOperation(
+          lifecycle,
+          () => lifecycle.jobStore.getJob(ownerStreamId),
+          ownerStreamId,
+          runtime,
+        )
+      : null;
+    if (!ownerJob) {
+      return { status: 'not_found' };
+    }
+    if (
+      ownerJob.deliveryPolicy?.commit_authority !== 'external_adapter' ||
+      ownerJob.interactionContext?.surface !== adapterSurface
+    ) {
+      return { status: 'conflict' };
+    }
+    return this.recordDeliveryAcknowledgement(acknowledgement, lifecycle, ownerStreamId!, runtime);
+  }
+
+  private async recordDeliveryAcknowledgement(
+    acknowledgement: InteractionDeliveryAck,
+    lifecycle: ManagerLifecycleSnapshot = this.captureLifecycle(),
+    expectedOwnerStreamId?: string,
+    expectedRuntime: RuntimeJobState | undefined = expectedOwnerStreamId
+      ? this.runtimeState.get(expectedOwnerStreamId)
+      : undefined,
+  ): Promise<DeliveryAcknowledgementResult> {
+    const result = await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.jobStore.acknowledgeDelivery(acknowledgement),
+      expectedOwnerStreamId,
+      expectedOwnerStreamId ? expectedRuntime : null,
+    );
+    if (result.status !== 'recorded' || !result.ownerStreamId) {
+      return result;
+    }
+    if (expectedOwnerStreamId && result.ownerStreamId !== expectedOwnerStreamId) {
+      return { status: 'conflict' };
+    }
+    const runtime = expectedOwnerStreamId
+      ? expectedRuntime
+      : this.runtimeState.get(result.ownerStreamId);
+    const ownerJob = await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.jobStore.getJob(result.ownerStreamId!),
+      result.ownerStreamId,
+      runtime,
+    );
+    const presentation = ownerJob
+      ? {
+          userId: ownerJob.userId,
+          conversationId: ownerJob.conversationId,
+          responseMessageId: ownerJob.responseMessageId,
+          interactionContext: ownerJob.interactionContext,
+        }
+      : undefined;
+    await this.runLifecycleOperation(
+      lifecycle,
+      () =>
+        lifecycle.jobStore.updateJob(result.ownerStreamId!, {
+          deliveryAcknowledgement: result.acknowledgement,
+        }),
+      result.ownerStreamId,
+      runtime,
+    );
+    const job = await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.jobStore.getJob(result.ownerStreamId!),
+      result.ownerStreamId,
+      runtime,
+    );
+    if (acknowledgement.state === 'committed' && job?.generationCompleted === true) {
+      await this.finalizeCompletedJob(
+        result.ownerStreamId,
+        job.deliveryPolicy?.commit_authority === 'external_adapter',
+        lifecycle,
+        runtime,
+      );
+    }
+    return { ...result, presentation };
+  }
+
+  /** Server-owned commit point used only after canonical persistence and successful final emit. */
+  async acknowledgeStreamDelivery(
+    streamId: string,
+    acknowledgement: Pick<InteractionDeliveryAck, 'state' | 'presentation_ref'>,
+  ): Promise<DeliveryAcknowledgementResult> {
+    const lifecycle = this.captureLifecycle();
+    const runtime = this.runtimeState.get(streamId);
+    const job = await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.jobStore.getJob(streamId),
+      streamId,
+      runtime,
+    );
+    const context = job?.interactionContext;
+    if (
+      !job ||
+      !context?.logical_turn_id ||
+      job.deliveryPolicy?.commit_authority === 'external_adapter'
+    ) {
+      return { status: 'conflict' };
+    }
+    return this.recordDeliveryAcknowledgement(
+      {
+        logical_turn_id: context.logical_turn_id,
+        revision: context.revision,
+        ...acknowledgement,
+      },
+      lifecycle,
+      streamId,
+      runtime,
+    );
   }
 
   /**
@@ -196,8 +517,187 @@ class GenerationJobManagerClass {
     streamId: string,
     userId: string,
     conversationId?: string,
+    options?: CreateGenerationJobOptions,
   ): Promise<t.GenerationJob> {
-    const jobData = await this.jobStore.createJob(streamId, userId, conversationId);
+    if (this.unavailable) {
+      throw streamManagerUnavailableError();
+    }
+    const lifecycleEpoch = this.lifecycleEpoch;
+    const lifecycleJobStore = this.jobStore;
+    const lifecycleEventTransport = this.eventTransport;
+    const lifecycleSignal = this.lifecycleAbortController.signal;
+    this.pendingAdmissions += 1;
+    try {
+      const job = await this.createJobWithinLifecycle(
+        streamId,
+        userId,
+        conversationId,
+        options,
+        lifecycleSignal,
+      );
+      if (this.unavailable || lifecycleEpoch !== this.lifecycleEpoch) {
+        if (!job.abortController.signal.aborted) {
+          job.abortController.abort('manager_lifecycle_changed');
+        }
+        await lifecycleJobStore.deleteJob(streamId);
+        lifecycleEventTransport.cleanup(streamId);
+        throw streamManagerUnavailableError();
+      }
+      return job;
+    } finally {
+      this.pendingAdmissions -= 1;
+    }
+  }
+
+  private async createJobWithinLifecycle(
+    streamId: string,
+    userId: string,
+    conversationId?: string,
+    options?: CreateGenerationJobOptions,
+    lifecycleSignal: AbortSignal = this.lifecycleAbortController.signal,
+  ): Promise<t.GenerationJob> {
+    let interactionContext = options?.interactionContext;
+    let supersededStreamIds: string[] = [];
+    let logicalTurnClaim: LogicalTurnClaim | undefined;
+    if (interactionContext) {
+      const baseInteractionContext = interactionContext;
+      let claim = await this.jobStore.claimLogicalTurn(streamId, userId, baseInteractionContext);
+      if (claim.status === 'duplicate' && !(await this.jobStore.hasJob(claim.streamId))) {
+        const forgotten = await this.jobStore.forgetMissingSourceEventReceipt(
+          claim.interactionContext,
+          claim.streamId,
+        );
+        if (forgotten) {
+          claim = await this.jobStore.claimLogicalTurn(streamId, userId, baseInteractionContext);
+        } else {
+          throw streamCreationPendingError();
+        }
+      }
+      if (claim.status === 'claimed' && claim.supersededStreamIds.length > 0) {
+        const supersededJob = await this.jobStore.getJob(claim.supersededStreamIds[0]);
+        const persistedServerFinal =
+          supersededJob?.deliveryPolicy?.commit_authority === 'server' &&
+          supersededJob.status === 'complete' &&
+          Boolean(supersededJob.finalEvent) &&
+          Boolean(supersededJob.interactionContext?.logical_turn_id);
+        if (
+          persistedServerFinal &&
+          (await this.jobStore.rollbackLogicalTurnClaim(streamId, claim.interactionContext))
+        ) {
+          const supersededContext = supersededJob.interactionContext!;
+          await this.recordDeliveryAcknowledgement({
+            logical_turn_id: supersededContext.logical_turn_id!,
+            revision: supersededContext.revision,
+            state: 'committed',
+            ...(supersededJob.responseMessageId
+              ? { presentation_ref: supersededJob.responseMessageId }
+              : {}),
+          });
+          claim = await this.jobStore.claimLogicalTurn(streamId, userId, baseInteractionContext);
+        }
+      }
+      interactionContext = claim.interactionContext;
+      if (claim.status === 'duplicate') {
+        const persistedJob = await this.jobStore.getJob(claim.streamId);
+        if (!persistedJob) {
+          throw new Error(`Duplicate source event references unavailable stream ${claim.streamId}`);
+        }
+        const persistedContext = persistedJob.interactionContext;
+        if (
+          persistedJob.userId !== userId ||
+          !persistedContext?.logical_turn_id ||
+          persistedContext.logical_turn_id !== claim.interactionContext.logical_turn_id ||
+          persistedContext.revision !== claim.interactionContext.revision ||
+          persistedContext.source_event_id !== claim.interactionContext.source_event_id
+        ) {
+          throw streamReceiptConflictError();
+        }
+        const duplicateJob = await this.getJob(claim.streamId);
+        if (!duplicateJob) {
+          throw new Error(`Duplicate source event references unavailable stream ${claim.streamId}`);
+        }
+        duplicateJob.duplicateOfStreamId = claim.streamId;
+        return duplicateJob;
+      }
+      supersededStreamIds = claim.supersededStreamIds;
+      logicalTurnClaim = claim;
+    }
+
+    const staleRuntime = this.runtimeState.get(streamId);
+    if (staleRuntime) {
+      if (await this.jobStore.hasJob(streamId)) {
+        throw streamReceiptConflictError();
+      }
+      if (!staleRuntime.abortController.signal.aborted) {
+        staleRuntime.abortController.abort('stream_reused');
+      }
+      this.runtimeState.delete(streamId);
+      this.eventTransport.cleanup(streamId);
+    }
+    let resolveReady!: () => void;
+    const readyPromise = new Promise<void>((resolve) => {
+      resolveReady = resolve;
+    });
+    const runtime: RuntimeJobState = {
+      abortController: new AbortController(),
+      readyPromise,
+      resolveReady,
+      syncSent: false,
+      earlyEventBuffer: [],
+      hasSubscriber: false,
+    };
+    this.runtimeState.set(streamId, runtime);
+    let jobData: SerializableJobData;
+    let jobAdmitted = false;
+    try {
+      if (this.eventTransport.onAbort) {
+        await awaitLifecycle(
+          this.eventTransport.onAbort(streamId, (reason) => {
+            const currentRuntime = this.runtimeState.get(streamId);
+            if (currentRuntime && !currentRuntime.abortController.signal.aborted) {
+              logger.debug(`[GenerationJobManager] Received cross-replica abort for ${streamId}`);
+              currentRuntime.abortController.abort(reason ?? 'user_cancelled');
+            }
+          }),
+          lifecycleSignal,
+        );
+      }
+      jobData = await this.jobStore.createJob(streamId, userId, conversationId, {
+        interactionContext,
+        adapterCapabilities: options?.adapterCapabilities,
+        deliveryPolicy: options?.deliveryPolicy,
+      });
+      jobAdmitted = true;
+      if (
+        logicalTurnClaim?.supersededStreamIds.length &&
+        this.jobStore.fenceSupersededLogicalTurnClaims
+      ) {
+        await this.jobStore.fenceSupersededLogicalTurnClaims(logicalTurnClaim);
+      }
+    } catch (error) {
+      if (!runtime.abortController.signal.aborted) {
+        runtime.abortController.abort('admission_failed');
+      }
+      this.runtimeState.delete(streamId);
+      this.eventTransport.cleanup(streamId);
+      if (jobAdmitted) {
+        await this.jobStore.deleteJob(streamId);
+      }
+      if (interactionContext?.logical_turn_id) {
+        await this.jobStore.rollbackLogicalTurnClaim(streamId, interactionContext);
+      }
+      throw error;
+    }
+
+    const persistedAdmission = await this.jobStore.getJob(streamId);
+    if (!persistedAdmission || persistedAdmission.status !== 'running') {
+      if (!runtime.abortController.signal.aborted) {
+        runtime.abortController.abort('superseded');
+      }
+      this.runtimeState.delete(streamId);
+      this.eventTransport.cleanup(streamId);
+      throw streamReceiptConflictError();
+    }
 
     /**
      * Create runtime state with readyPromise.
@@ -210,23 +710,8 @@ class GenerationJobManagerClass {
      * We resolve readyPromise immediately to eliminate startup latency.
      * The sync mechanism handles late-connecting clients.
      */
-    let resolveReady: () => void;
-    const readyPromise = new Promise<void>((resolve) => {
-      resolveReady = resolve;
-    });
-
-    const runtime: RuntimeJobState = {
-      abortController: new AbortController(),
-      readyPromise,
-      resolveReady: resolveReady!,
-      syncSent: false,
-      earlyEventBuffer: [],
-      hasSubscriber: false,
-    };
-    this.runtimeState.set(streamId, runtime);
-
     // Resolve immediately - early event buffer handles late subscribers
-    resolveReady!();
+    resolveReady();
 
     /**
      * Set up all-subscribers-left callback.
@@ -267,25 +752,25 @@ class GenerationJobManagerClass {
       }
     });
 
-    /**
-     * Set up cross-replica abort listener (Redis mode only).
-     * When abort is triggered on ANY replica, this replica receives the signal
-     * and aborts its local AbortController (if it's the one running generation).
-     */
-    if (this.eventTransport.onAbort) {
-      this.eventTransport.onAbort(streamId, () => {
-        const currentRuntime = this.runtimeState.get(streamId);
-        if (currentRuntime && !currentRuntime.abortController.signal.aborted) {
-          logger.debug(`[GenerationJobManager] Received cross-replica abort for ${streamId}`);
-          currentRuntime.abortController.abort();
-        }
-      });
-    }
-
     logger.debug(`[GenerationJobManager] Created job: ${streamId}`);
 
+    const supersededPresentations: NonNullable<t.GenerationJob['supersededPresentations']> = [];
+    for (const supersededStreamId of supersededStreamIds) {
+      const supersededJob = await this.jobStore.getJob(supersededStreamId);
+      if (supersededJob?.deliveryAcknowledgement?.state !== 'committed') {
+        supersededPresentations.push({
+          conversationId: supersededJob?.conversationId,
+          responseMessageId: supersededJob?.responseMessageId,
+          interactionContext: supersededJob?.interactionContext,
+        });
+      }
+      await this.supersedeJob(supersededStreamId);
+    }
+
     // Return facade for backwards compatibility
-    return this.buildJobFacade(streamId, jobData, runtime);
+    const facade = this.buildJobFacade(streamId, jobData, runtime);
+    facade.supersededPresentations = supersededPresentations;
+    return facade;
   }
 
   /**
@@ -359,6 +844,11 @@ class GenerationJobManagerClass {
         userMessage: jobData.userMessage,
         responseMessageId: jobData.responseMessageId,
         sender: jobData.sender,
+        interactionContext: jobData.interactionContext,
+        adapterCapabilities: jobData.adapterCapabilities,
+        deliveryPolicy: jobData.deliveryPolicy,
+        deliveryAcknowledgement: jobData.deliveryAcknowledgement,
+        generationCompleted: jobData.generationCompleted,
       },
       readyPromise: runtime.readyPromise,
       resolveReady: runtime.resolveReady,
@@ -383,45 +873,59 @@ class GenerationJobManagerClass {
    * @param streamId - The stream identifier
    * @returns Runtime state or null if job doesn't exist anywhere
    */
-  private async getOrCreateRuntimeState(streamId: string): Promise<RuntimeJobState | null> {
-    const existingRuntime = this.runtimeState.get(streamId);
-    if (existingRuntime) {
-      return existingRuntime;
+  private async getOrCreateRuntimeState(
+    streamId: string,
+    lifecycle: ManagerLifecycleSnapshot = this.captureLifecycle(),
+    persistedJob?: SerializableJobData,
+  ): Promise<RuntimeJobState | null> {
+    /* === VIVENTIUM START ===
+     * Feature: Stream-manager lifecycle fencing.
+     * Purpose: Lazy Redis hydration must fail closed when destroy/reconfigure wins.
+     */
+    if (!this.isLifecycleCurrent(lifecycle)) {
+      throw streamManagerUnavailableError();
     }
 
-    // Job doesn't exist locally - check Redis
-    const jobData = await this.jobStore.getJob(streamId);
+    const existingRuntime = this.runtimeState.get(streamId);
+    if (existingRuntime) {
+      return this.awaitRuntimeInitialization(streamId, existingRuntime, lifecycle);
+    }
+
+    const jobData =
+      persistedJob ?? (await awaitLifecycle(lifecycle.jobStore.getJob(streamId), lifecycle.signal));
+    if (!this.isLifecycleCurrent(lifecycle)) {
+      throw streamManagerUnavailableError();
+    }
     if (!jobData) {
       return null;
     }
 
-    // Cross-replica scenario: job exists in Redis but not locally
-    // Create minimal runtime state for handling reconnection/subscription
+    const concurrentlyInitializedRuntime = this.runtimeState.get(streamId);
+    if (concurrentlyInitializedRuntime) {
+      return this.awaitRuntimeInitialization(streamId, concurrentlyInitializedRuntime, lifecycle);
+    }
+
     logger.debug(`[GenerationJobManager] Creating cross-replica runtime for ${streamId}`);
 
-    let resolveReady: () => void;
+    let resolveReady!: () => void;
     const readyPromise = new Promise<void>((resolve) => {
       resolveReady = resolve;
     });
+    resolveReady();
 
-    // For jobs created on other replicas, readyPromise should be pre-resolved
-    // since generation has already started
-    resolveReady!();
-
-    // Parse finalEvent from Redis if available
     let finalEvent: t.ServerSentEvent | undefined;
     if (jobData.finalEvent) {
       try {
         finalEvent = JSON.parse(jobData.finalEvent) as t.ServerSentEvent;
       } catch {
-        // Ignore parse errors
+        // Ignore malformed persisted terminal data; the durable status still controls replay.
       }
     }
 
     const runtime: RuntimeJobState = {
       abortController: new AbortController(),
       readyPromise,
-      resolveReady: resolveReady!,
+      resolveReady,
       syncSent: jobData.syncSent ?? false,
       earlyEventBuffer: [],
       hasSubscriber: false,
@@ -431,21 +935,24 @@ class GenerationJobManagerClass {
 
     this.runtimeState.set(streamId, runtime);
 
-    // Set up all-subscribers-left callback for this replica
-    this.eventTransport.onAllSubscribersLeft(streamId, () => {
-      const currentRuntime = this.runtimeState.get(streamId);
-      if (currentRuntime) {
+    runtime.initializationReady = (async () => {
+      lifecycle.eventTransport.onAllSubscribersLeft(streamId, () => {
+        const currentRuntime = this.runtimeState.get(streamId);
+        if (!this.isLifecycleCurrent(lifecycle) || currentRuntime !== runtime) {
+          return;
+        }
         currentRuntime.syncSent = false;
         currentRuntime.hasSubscriber = false;
-        // Persist syncSent=false to Redis
-        this.jobStore.updateJob(streamId, { syncSent: false }).catch((err) => {
+        lifecycle.jobStore.updateJob(streamId, { syncSent: false }).catch((err) => {
           logger.error(`[GenerationJobManager] Failed to persist syncSent=false:`, err);
         });
-        // Call registered handlers
         if (currentRuntime.allSubscribersLeftHandlers) {
-          this.jobStore
+          lifecycle.jobStore
             .getContentParts(streamId)
             .then((result) => {
+              if (!this.isLifecycleCurrent(lifecycle)) {
+                return;
+              }
               const parts = result?.content ?? [];
               for (const handler of currentRuntime.allSubscribersLeftHandlers ?? []) {
                 try {
@@ -462,41 +969,85 @@ class GenerationJobManagerClass {
               );
             });
         }
-      }
-    });
-
-    // Set up cross-replica abort listener (Redis mode only)
-    // This ensures lazily-initialized jobs can receive abort signals
-    if (this.eventTransport.onAbort) {
-      this.eventTransport.onAbort(streamId, () => {
-        const currentRuntime = this.runtimeState.get(streamId);
-        if (currentRuntime && !currentRuntime.abortController.signal.aborted) {
-          logger.debug(
-            `[GenerationJobManager] Received cross-replica abort for lazily-init job ${streamId}`,
-          );
-          currentRuntime.abortController.abort();
-        }
       });
-    }
 
-    return runtime;
+      if (lifecycle.eventTransport.onAbort) {
+        await awaitLifecycle(
+          lifecycle.eventTransport.onAbort(streamId, (reason) => {
+            const currentRuntime = this.runtimeState.get(streamId);
+            if (
+              this.isLifecycleCurrent(lifecycle) &&
+              currentRuntime === runtime &&
+              !currentRuntime.abortController.signal.aborted
+            ) {
+              logger.debug(
+                `[GenerationJobManager] Received cross-replica abort for lazily-init job ${streamId}`,
+              );
+              currentRuntime.abortController.abort(reason ?? 'user_cancelled');
+            }
+          }),
+          lifecycle.signal,
+        );
+      }
+
+      if (!this.isLifecycleCurrent(lifecycle) || this.runtimeState.get(streamId) !== runtime) {
+        throw streamManagerUnavailableError();
+      }
+    })();
+
+    try {
+      await runtime.initializationReady;
+      return runtime;
+    } catch (error) {
+      if (!runtime.abortController.signal.aborted) {
+        runtime.abortController.abort('manager_lifecycle_changed');
+      }
+      const currentRuntime = this.runtimeState.get(streamId);
+      const lifecycleChanged = !this.isLifecycleCurrent(lifecycle);
+      if (currentRuntime === runtime) {
+        this.runtimeState.delete(streamId);
+      }
+      if (
+        currentRuntime === runtime ||
+        (lifecycleChanged && lifecycle.eventTransport !== this.eventTransport)
+      ) {
+        lifecycle.eventTransport.cleanup(streamId);
+      }
+      if (lifecycleChanged) {
+        throw streamManagerUnavailableError();
+      }
+      throw error;
+    }
+    /* === VIVENTIUM END === */
   }
 
   /**
    * Get a job by streamId.
    */
   async getJob(streamId: string): Promise<t.GenerationJob | undefined> {
-    const jobData = await this.jobStore.getJob(streamId);
+    /* === VIVENTIUM START ===
+     * Feature: Stream-manager lifecycle fencing.
+     * Purpose: One getJob call may not mix persisted data and runtime state across generations.
+     */
+    const lifecycle = this.captureLifecycle();
+    if (!this.isLifecycleCurrent(lifecycle)) {
+      throw streamManagerUnavailableError();
+    }
+    const jobData = await awaitLifecycle(lifecycle.jobStore.getJob(streamId), lifecycle.signal);
+    if (!this.isLifecycleCurrent(lifecycle)) {
+      throw streamManagerUnavailableError();
+    }
     if (!jobData) {
       return undefined;
     }
 
-    const runtime = await this.getOrCreateRuntimeState(streamId);
+    const runtime = await this.getOrCreateRuntimeState(streamId, lifecycle, jobData);
     if (!runtime) {
       return undefined;
     }
 
     return this.buildJobFacade(streamId, jobData, runtime);
+    /* === VIVENTIUM END === */
   }
 
   /**
@@ -514,6 +1065,139 @@ class GenerationJobManagerClass {
     return jobData?.status as t.GenerationJobStatus | undefined;
   }
 
+  /* === VIVENTIUM START ===
+   * Mark the user-visible Main response complete without tearing down the runtime that may still
+   * deliver non-blocking Phase B updates. This removes the job from active-generation discovery,
+   * while completeJob() retains ownership of final runtime cleanup after the bounded follow-up
+   * window.
+   * === VIVENTIUM END === */
+  async markMainResponseComplete(
+    streamId: string,
+    finalEvent?: t.ServerSentEvent,
+  ): Promise<boolean> {
+    const lifecycle = this.captureLifecycle();
+    const job = await this.runLifecycleOperation(lifecycle, () =>
+      lifecycle.jobStore.getJob(streamId),
+    );
+    if (!job || job.status !== 'running') {
+      return false;
+    }
+    const runtime = this.runtimeState.get(streamId);
+    this.assertLifecycleOperation(lifecycle, streamId, runtime);
+    if (runtime && finalEvent) {
+      runtime.finalEvent = finalEvent;
+    }
+    await this.runLifecycleOperation(
+      lifecycle,
+      () =>
+        lifecycle.jobStore.updateJob(streamId, {
+          status: 'complete',
+          completedAt: Date.now(),
+          ...(finalEvent ? { finalEvent: JSON.stringify(finalEvent) } : {}),
+        }),
+      streamId,
+      runtime,
+    );
+    return true;
+  }
+
+  /**
+   * Terminate only the obsolete provisional revision. Durable messages/tool side effects are not
+   * rolled back; downstream persistence can use the distinct status to remove unfinished output.
+   */
+  private async supersedeJob(streamId: string): Promise<void> {
+    const jobData = await this.jobStore.getJob(streamId);
+    if (!jobData || !['running', 'complete'].includes(jobData.status)) {
+      return;
+    }
+
+    const context = jobData.interactionContext;
+    const terminalEvent = {
+      final: true,
+      superseded: true,
+      logical_turn_id: context?.logical_turn_id,
+      revision: context?.revision,
+    } as unknown as t.ServerSentEvent;
+    const runtime = this.runtimeState.get(streamId);
+    const stopsAuthoring = jobData.adapterCapabilities?.supersede_scope !== 'response_only';
+    if (stopsAuthoring && runtime && !runtime.abortController.signal.aborted) {
+      runtime.abortController.abort('superseded');
+    }
+    if (runtime) {
+      runtime.finalEvent = terminalEvent;
+    }
+    await this.jobStore.updateJob(streamId, {
+      status: 'superseded',
+      completedAt: Date.now(),
+      finalEvent: JSON.stringify(terminalEvent),
+    });
+    if (stopsAuthoring) {
+      try {
+        await this.eventTransport.emitAbort?.(streamId, 'superseded');
+      } catch {
+        logger.warn('[GenerationJobManager] Supersession signal unavailable after durable fence');
+      }
+    }
+    if (stopsAuthoring) {
+      this.jobStore.clearContentState(streamId);
+      this.runStepBuffers?.delete(streamId);
+    }
+    /* === VIVENTIUM START ===
+     * Feature: Durable logical-turn supersession.
+     * Purpose: Terminal delivery is best-effort after the old and new revisions are committed.
+     */
+    try {
+      await this.eventTransport.emitDone(streamId, terminalEvent);
+    } catch {
+      logger.warn(
+        '[GenerationJobManager] Superseded terminal notification unavailable after durable fence',
+      );
+    }
+    /* === VIVENTIUM END === */
+    logger.debug(`[GenerationJobManager] Job superseded: ${streamId}`);
+  }
+
+  private async finalizeCompletedJob(
+    streamId: string,
+    preserveJob = false,
+    lifecycle: ManagerLifecycleSnapshot = this.captureLifecycle(),
+    runtime: RuntimeJobState | undefined = this.runtimeState.get(streamId),
+  ): Promise<void> {
+    this.assertLifecycleOperation(lifecycle, streamId, runtime);
+    if (runtime && !runtime.abortController.signal.aborted) {
+      runtime.abortController.abort('generation_completed');
+    }
+    lifecycle.jobStore.clearContentState(streamId);
+    this.runStepBuffers?.delete(streamId);
+    await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.jobStore.completeLogicalTurn(streamId),
+      streamId,
+      runtime,
+    );
+    if (lifecycle.cleanupOnComplete && !preserveJob) {
+      await this.runLifecycleOperation(
+        lifecycle,
+        () => lifecycle.jobStore.deleteJob(streamId),
+        streamId,
+        runtime,
+      );
+      this.runtimeState.delete(streamId);
+      return;
+    }
+    await this.runLifecycleOperation(
+      lifecycle,
+      () =>
+        lifecycle.jobStore.updateJob(streamId, {
+          status: 'complete',
+          completedAt: Date.now(),
+          generationCompleted: true,
+        }),
+      streamId,
+      runtime,
+    );
+  }
+
   /**
    * Mark job as complete.
    * If cleanupOnComplete is true (default), immediately cleans up job resources.
@@ -524,17 +1208,19 @@ class GenerationJobManagerClass {
    * by the periodic cleanup job.
    */
   async completeJob(streamId: string, error?: string): Promise<void> {
-    const runtime = this.runtimeState.get(streamId);
-
-    // Abort the controller to signal all pending operations (e.g., OAuth flow monitors)
-    // that the job is done and they should clean up
-    if (runtime) {
-      runtime.abortController.abort();
+    /* === VIVENTIUM START ===
+     * Feature: Stream-manager lifecycle fencing.
+     * Purpose: Completion may only finalize the exact runtime and service generation it observed.
+     */
+    const lifecycle = this.captureLifecycle();
+    const existingJob = await this.runLifecycleOperation(lifecycle, () =>
+      lifecycle.jobStore.getJob(streamId),
+    );
+    if (existingJob?.status === 'superseded') {
+      return;
     }
-
-    // Clear content state and run step buffer (Redis only)
-    this.jobStore.clearContentState(streamId);
-    this.runStepBuffers?.delete(streamId);
+    const runtime = this.runtimeState.get(streamId);
+    this.assertLifecycleOperation(lifecycle, streamId, runtime);
 
     // For error jobs, DON'T delete immediately - keep around so late-connecting
     // clients can receive the error. This handles the race condition where error
@@ -546,11 +1232,28 @@ class GenerationJobManagerClass {
     // meaning cleanup on next interval). This gives clients ~60s to connect and
     // receive the error before the job is removed.
     if (error) {
-      await this.jobStore.updateJob(streamId, {
-        status: 'error',
-        completedAt: Date.now(),
-        error,
-      });
+      if (runtime && !runtime.abortController.signal.aborted) {
+        runtime.abortController.abort('generation_completed');
+      }
+      lifecycle.jobStore.clearContentState(streamId);
+      this.runStepBuffers?.delete(streamId);
+      await this.runLifecycleOperation(
+        lifecycle,
+        () =>
+          lifecycle.jobStore.updateJob(streamId, {
+            status: 'error',
+            completedAt: Date.now(),
+            error,
+          }),
+        streamId,
+        runtime,
+      );
+      await this.runLifecycleOperation(
+        lifecycle,
+        () => lifecycle.jobStore.completeLogicalTurn(streamId),
+        streamId,
+        runtime,
+      );
       // Keep runtime state so subscribe() can access errorEvent
       logger.debug(
         `[GenerationJobManager] Job completed with error (keeping for late subscribers): ${streamId}`,
@@ -558,21 +1261,35 @@ class GenerationJobManagerClass {
       return;
     }
 
-    // Immediate cleanup if configured (default: true) - only for successful completions
-    if (this._cleanupOnComplete) {
-      this.runtimeState.delete(streamId);
-      // Don't cleanup eventTransport here - let the done event fully transmit first.
-      // EventTransport will be cleaned up when subscribers disconnect or by periodic cleanup.
-      await this.jobStore.deleteJob(streamId);
-    } else {
-      // Only update status if keeping the job around
-      await this.jobStore.updateJob(streamId, {
-        status: 'complete',
-        completedAt: Date.now(),
-      });
+    await this.runLifecycleOperation(
+      lifecycle,
+      () =>
+        lifecycle.jobStore.updateJob(streamId, {
+          status: 'complete',
+          completedAt: Date.now(),
+          generationCompleted: true,
+        }),
+      streamId,
+      runtime,
+    );
+    const refreshedJob = await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.jobStore.getJob(streamId),
+      streamId,
+      runtime,
+    );
+    const hasTrustedLifecycle = Boolean(refreshedJob?.interactionContext?.logical_turn_id);
+    const presentationCommitted = refreshedJob?.deliveryAcknowledgement?.state === 'committed';
+    if (hasTrustedLifecycle && !presentationCommitted) {
+      logger.debug(
+        `[GenerationJobManager] Generation complete; awaiting presentation acknowledgement: ${streamId}`,
+      );
+      return;
     }
+    await this.finalizeCompletedJob(streamId, false, lifecycle, runtime);
 
     logger.debug(`[GenerationJobManager] Job completed: ${streamId}`);
+    /* === VIVENTIUM END === */
   }
 
   /**
@@ -584,8 +1301,16 @@ class GenerationJobManagerClass {
    * - The replica running generation receives signal and aborts its AbortController
    */
   async abortJob(streamId: string): Promise<AbortResult> {
-    const jobData = await this.jobStore.getJob(streamId);
+    /* === VIVENTIUM START ===
+     * Feature: Stream-manager lifecycle fencing.
+     * Purpose: A stale abort may mutate only the store, transport, and runtime generation it read.
+     */
+    const lifecycle = this.captureLifecycle();
+    const jobData = await this.runLifecycleOperation(lifecycle, () =>
+      lifecycle.jobStore.getJob(streamId),
+    );
     const runtime = this.runtimeState.get(streamId);
+    this.assertLifecycleOperation(lifecycle, streamId, runtime);
 
     if (!jobData) {
       logger.warn(`[GenerationJobManager] Cannot abort - job not found: ${streamId}`);
@@ -599,23 +1324,23 @@ class GenerationJobManagerClass {
       };
     }
 
-    // Emit abort signal for cross-replica support (Redis mode)
-    // This ensures the generating replica receives the abort signal
-    if (this.eventTransport.emitAbort) {
-      this.eventTransport.emitAbort(streamId);
-    }
-
     // Also abort local controller if we have it (same-replica abort)
-    if (runtime) {
-      runtime.abortController.abort();
+    if (runtime && !runtime.abortController.signal.aborted) {
+      runtime.abortController.abort('user_cancelled');
     }
 
     /** Content before clearing state */
-    const result = await this.jobStore.getContentParts(streamId);
+    const result = await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.jobStore.getContentParts(streamId),
+      streamId,
+      runtime,
+    );
     const content = result?.content ?? [];
 
     /** Collected usage for all models */
-    const collectedUsage = this.jobStore.getCollectedUsage(streamId);
+    this.assertLifecycleOperation(lifecycle, streamId, runtime);
+    const collectedUsage = lifecycle.jobStore.getCollectedUsage(streamId);
 
     /** Text from content parts for fallback token counting */
     const text = parseTextParts(content as TMessageContentParts[]);
@@ -662,23 +1387,77 @@ class GenerationJobManagerClass {
       runtime.finalEvent = abortFinalEvent;
     }
 
-    await this.eventTransport.emitDone(streamId, abortFinalEvent);
-    this.jobStore.clearContentState(streamId);
-    this.runStepBuffers?.delete(streamId);
-
-    // Immediate cleanup if configured (default: true)
-    if (this._cleanupOnComplete) {
-      this.runtimeState.delete(streamId);
-      // Don't cleanup eventTransport here - let the abort event fully transmit first.
-      await this.jobStore.deleteJob(streamId);
-    } else {
-      // Only update status if keeping the job around
-      await this.jobStore.updateJob(streamId, {
-        status: 'aborted',
-        completedAt: Date.now(),
-      });
+    /* === VIVENTIUM START ===
+     * Feature: Durable cross-replica cancellation.
+     * Purpose: Persist terminal truth before best-effort Pub/Sub so a missed signal cannot retain
+     * authoring authority on another replica.
+     * === VIVENTIUM END === */
+    await this.runLifecycleOperation(
+      lifecycle,
+      () =>
+        lifecycle.jobStore.updateJob(streamId, {
+          status: 'aborted',
+          completedAt: Date.now(),
+          finalEvent: JSON.stringify(abortFinalEvent),
+        }),
+      streamId,
+      runtime,
+    );
+    if (lifecycle.eventTransport.emitAbort) {
+      try {
+        await this.runLifecycleOperation(
+          lifecycle,
+          () => lifecycle.eventTransport.emitAbort!(streamId, 'user_cancelled'),
+          streamId,
+          runtime,
+        );
+      } catch {
+        this.assertLifecycleOperation(lifecycle, streamId, runtime);
+        logger.warn('[GenerationJobManager] Abort signal unavailable after durable fence');
+      }
     }
 
+    await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.eventTransport.emitDone(streamId, abortFinalEvent),
+      streamId,
+      runtime,
+    );
+    this.assertLifecycleOperation(lifecycle, streamId, runtime);
+    lifecycle.jobStore.clearContentState(streamId);
+    this.runStepBuffers?.delete(streamId);
+    await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.jobStore.completeLogicalTurn(streamId),
+      streamId,
+      runtime,
+    );
+
+    // Immediate cleanup if configured (default: true)
+    if (lifecycle.cleanupOnComplete) {
+      // Don't cleanup eventTransport here - let the abort event fully transmit first.
+      await this.runLifecycleOperation(
+        lifecycle,
+        () => lifecycle.jobStore.deleteJob(streamId),
+        streamId,
+        runtime,
+      );
+      this.runtimeState.delete(streamId);
+    } else {
+      // Only update status if keeping the job around
+      await this.runLifecycleOperation(
+        lifecycle,
+        () =>
+          lifecycle.jobStore.updateJob(streamId, {
+            status: 'aborted',
+            completedAt: Date.now(),
+          }),
+        streamId,
+        runtime,
+      );
+    }
+
+    this.assertLifecycleOperation(lifecycle);
     logger.debug(`[GenerationJobManager] Job aborted: ${streamId}`);
 
     return {
@@ -689,6 +1468,7 @@ class GenerationJobManagerClass {
       text,
       collectedUsage,
     };
+    /* === VIVENTIUM END === */
   }
 
   /**
@@ -715,18 +1495,31 @@ class GenerationJobManagerClass {
     onDone?: t.DoneHandler,
     onError?: t.ErrorHandler,
   ): Promise<{ unsubscribe: t.UnsubscribeFn } | null> {
+    /* === VIVENTIUM START ===
+     * Feature: Stream-manager lifecycle fencing.
+     * Purpose: An SSE subscription cannot escape before its exact lifecycle/channel is ready.
+     */
+    const lifecycle = this.captureLifecycle();
     // Use lazy initialization to support cross-replica subscriptions
-    const runtime = await this.getOrCreateRuntimeState(streamId);
+    const runtime = await this.getOrCreateRuntimeState(streamId, lifecycle);
     if (!runtime) {
       return null;
     }
 
-    const jobData = await this.jobStore.getJob(streamId);
+    const jobData = await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.jobStore.getJob(streamId),
+      streamId,
+      runtime,
+    );
 
     // If job already complete/error, send final event or error
     // Error status takes precedence to ensure errors aren't misreported as successes
     setImmediate(() => {
-      if (jobData && ['complete', 'error', 'aborted'].includes(jobData.status)) {
+      if (!this.isLifecycleCurrent(lifecycle) || this.runtimeState.get(streamId) !== runtime) {
+        return;
+      }
+      if (jobData && ['complete', 'error', 'aborted', 'superseded'].includes(jobData.status)) {
         // Check for error status FIRST and prioritize error handling
         if (jobData.status === 'error' && (runtime.errorEvent || jobData.error)) {
           const errorToSend = runtime.errorEvent ?? jobData.error;
@@ -742,20 +1535,43 @@ class GenerationJobManagerClass {
       }
     });
 
-    const subscription = this.eventTransport.subscribe(streamId, {
+    const subscription = lifecycle.eventTransport.subscribe(streamId, {
       onChunk: (event) => {
+        if (!this.isLifecycleCurrent(lifecycle) || this.runtimeState.get(streamId) !== runtime) {
+          return;
+        }
         const e = event as t.ServerSentEvent;
         // Filter out internal events
         if (!(e as Record<string, unknown>)._internal) {
           onChunk(e);
         }
       },
-      onDone: (event) => onDone?.(event as t.ServerSentEvent),
-      onError,
+      onDone: (event) => {
+        if (this.isLifecycleCurrent(lifecycle) && this.runtimeState.get(streamId) === runtime) {
+          onDone?.(event as t.ServerSentEvent);
+        }
+      },
+      onError: (error) => {
+        if (this.isLifecycleCurrent(lifecycle) && this.runtimeState.get(streamId) === runtime) {
+          onError?.(error);
+        }
+      },
     });
 
+    try {
+      if (subscription.ready) {
+        await this.runLifecycleOperation(lifecycle, () => subscription.ready!, streamId, runtime);
+      } else {
+        this.assertLifecycleOperation(lifecycle, streamId, runtime);
+      }
+    } catch (error) {
+      subscription.unsubscribe();
+      throw error;
+    }
+
     // Check if this is the first subscriber
-    const isFirst = this.eventTransport.isFirstSubscriber(streamId);
+    const isFirst = lifecycle.eventTransport.isFirstSubscriber(streamId);
+    this.assertLifecycleOperation(lifecycle, streamId, runtime);
 
     // First subscriber: replay buffered events and mark as connected
     if (!runtime.hasSubscriber) {
@@ -765,7 +1581,7 @@ class GenerationJobManagerClass {
        * stale expected sequence numbers can buffer fresh chunks until timeout.
        * === VIVENTIUM END === */
       if (isFirst) {
-        this.eventTransport.syncReorderBuffer?.(streamId);
+        lifecycle.eventTransport.syncReorderBuffer?.(streamId);
       }
 
       runtime.hasSubscriber = true;
@@ -789,7 +1605,9 @@ class GenerationJobManagerClass {
       );
     }
 
+    this.assertLifecycleOperation(lifecycle, streamId, runtime);
     return subscription;
+    /* === VIVENTIUM END === */
   }
 
   /**
@@ -803,16 +1621,28 @@ class GenerationJobManagerClass {
    * This is critical for streaming deltas (tool args, message content) to arrive in order.
    */
   async emitChunk(streamId: string, event: t.ServerSentEvent): Promise<void> {
+    const lifecycle = this.captureLifecycle();
     const runtime = this.runtimeState.get(streamId);
     if (!runtime || runtime.abortController.signal.aborted) {
       return;
     }
+    if (
+      !(await this.runLifecycleOperation(
+        lifecycle,
+        () => lifecycle.jobStore.isCurrentLogicalTurn(streamId),
+        streamId,
+        runtime,
+      ))
+    ) {
+      await this.stopRuntimeAfterDurableFence(streamId, lifecycle, runtime);
+      return;
+    }
 
     // Track user message from created event
-    this.trackUserMessage(streamId, event);
+    this.trackUserMessage(streamId, event, lifecycle.jobStore);
 
     // For Redis mode, persist chunk for later reconstruction (fire-and-forget for resumability)
-    if (this._isRedis) {
+    if (lifecycle.isRedis) {
       // The SSE event structure is { event: string, data: unknown, ... }
       // The aggregator expects { event: string, data: unknown } where data is the payload
       const eventObj = event as Record<string, unknown>;
@@ -821,13 +1651,19 @@ class GenerationJobManagerClass {
 
       if (eventType && eventData !== undefined) {
         // Store in format expected by aggregateContent: { event, data }
-        this.jobStore.appendChunk(streamId, { event: eventType, data: eventData }).catch((err) => {
-          logger.error(`[GenerationJobManager] Failed to append chunk:`, err);
-        });
+        lifecycle.jobStore
+          .appendChunk(streamId, { event: eventType, data: eventData })
+          .catch((err) => {
+            logger.error(`[GenerationJobManager] Failed to append chunk:`, err);
+          });
 
         // For run step events, also save to run steps key for quick retrieval
         if (eventType === 'on_run_step' || eventType === 'on_run_step_completed') {
-          this.saveRunStepFromEvent(streamId, eventData as Record<string, unknown>);
+          this.saveRunStepFromEvent(
+            streamId,
+            eventData as Record<string, unknown>,
+            lifecycle.jobStore,
+          );
         }
       }
     }
@@ -838,14 +1674,23 @@ class GenerationJobManagerClass {
     }
 
     // Await the transport emit - critical for Redis mode to maintain event order
-    await this.eventTransport.emitChunk(streamId, event);
+    await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.eventTransport.emitChunk(streamId, event),
+      streamId,
+      runtime,
+    );
   }
 
   /**
    * Extract and save run step from event data.
    * The data is already the run step object from the event payload.
    */
-  private saveRunStepFromEvent(streamId: string, data: Record<string, unknown>): void {
+  private saveRunStepFromEvent(
+    streamId: string,
+    data: Record<string, unknown>,
+    jobStore: IJobStore = this.jobStore,
+  ): void {
     // The data IS the run step object
     const runStep = data as Agents.RunStep;
     if (!runStep.id) {
@@ -853,7 +1698,7 @@ class GenerationJobManagerClass {
     }
 
     // Fire and forget - accumulate run steps
-    this.accumulateRunStep(streamId, runStep);
+    this.accumulateRunStep(streamId, runStep, jobStore);
   }
 
   /**
@@ -863,7 +1708,11 @@ class GenerationJobManagerClass {
    */
   private runStepBuffers: Map<string, Agents.RunStep[]> | null = null;
 
-  private accumulateRunStep(streamId: string, runStep: Agents.RunStep): void {
+  private accumulateRunStep(
+    streamId: string,
+    runStep: Agents.RunStep,
+    jobStore: IJobStore = this.jobStore,
+  ): void {
     // Lazy initialization - only create map when first used (Redis mode)
     if (!this.runStepBuffers) {
       this.runStepBuffers = new Map();
@@ -884,8 +1733,8 @@ class GenerationJobManagerClass {
     }
 
     // Save to Redis
-    if (this.jobStore.saveRunSteps) {
-      this.jobStore.saveRunSteps(streamId, buffer).catch((err) => {
+    if (jobStore.saveRunSteps) {
+      jobStore.saveRunSteps(streamId, buffer).catch((err) => {
         logger.error(`[GenerationJobManager] Failed to save run steps:`, err);
       });
     }
@@ -894,7 +1743,11 @@ class GenerationJobManagerClass {
   /**
    * Track user message from created event.
    */
-  private trackUserMessage(streamId: string, event: t.ServerSentEvent): void {
+  private trackUserMessage(
+    streamId: string,
+    event: t.ServerSentEvent,
+    jobStore: IJobStore = this.jobStore,
+  ): void {
     const data = event as Record<string, unknown>;
     if (!data.created || !data.message) {
       return;
@@ -914,7 +1767,7 @@ class GenerationJobManagerClass {
       updates.conversationId = message.conversationId as string;
     }
 
-    this.jobStore.updateJob(streamId, updates);
+    jobStore.updateJob(streamId, updates);
   }
 
   /**
@@ -1044,20 +1897,68 @@ class GenerationJobManagerClass {
     return jobData?.syncSent ?? false;
   }
 
+  /* === VIVENTIUM START ===
+   * Feature: Durable cross-replica cancellation.
+   * Purpose: Stop a stale local generator when durable ownership is gone, while preserving the
+   * response-only adapter contract that suppresses presentation but allows background authoring.
+   * === VIVENTIUM END === */
+  private async stopRuntimeAfterDurableFence(
+    streamId: string,
+    lifecycle: ManagerLifecycleSnapshot = this.captureLifecycle(),
+    runtime: RuntimeJobState | undefined = this.runtimeState.get(streamId),
+  ): Promise<void> {
+    if (!runtime || runtime.abortController.signal.aborted) {
+      return;
+    }
+    const persisted = await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.jobStore.getJob(streamId),
+      streamId,
+      runtime,
+    );
+    if (
+      persisted?.status === 'superseded' &&
+      persisted.adapterCapabilities?.supersede_scope === 'response_only'
+    ) {
+      return;
+    }
+    runtime.abortController.abort('durable_stream_terminal');
+  }
+
   /**
    * Emit a done event.
    * Persists finalEvent to Redis for cross-replica access.
    */
   async emitDone(streamId: string, event: t.ServerSentEvent): Promise<void> {
+    const lifecycle = this.captureLifecycle();
     const runtime = this.runtimeState.get(streamId);
+    if (
+      !(await this.runLifecycleOperation(
+        lifecycle,
+        () => lifecycle.jobStore.isCurrentLogicalTurn(streamId),
+        streamId,
+        runtime,
+      ))
+    ) {
+      await this.stopRuntimeAfterDurableFence(streamId, lifecycle, runtime);
+      return;
+    }
     if (runtime) {
       runtime.finalEvent = event;
     }
     // Persist finalEvent to Redis for cross-replica consistency
-    this.jobStore.updateJob(streamId, { finalEvent: JSON.stringify(event) }).catch((err) => {
-      logger.error(`[GenerationJobManager] Failed to persist finalEvent:`, err);
-    });
-    await this.eventTransport.emitDone(streamId, event);
+    await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.jobStore.updateJob(streamId, { finalEvent: JSON.stringify(event) }),
+      streamId,
+      runtime,
+    );
+    await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.eventTransport.emitDone(streamId, event),
+      streamId,
+      runtime,
+    );
   }
 
   /**
@@ -1066,15 +1967,35 @@ class GenerationJobManagerClass {
    * occurs before client connects to SSE stream).
    */
   async emitError(streamId: string, error: string): Promise<void> {
+    const lifecycle = this.captureLifecycle();
     const runtime = this.runtimeState.get(streamId);
+    if (
+      !(await this.runLifecycleOperation(
+        lifecycle,
+        () => lifecycle.jobStore.isCurrentLogicalTurn(streamId),
+        streamId,
+        runtime,
+      ))
+    ) {
+      await this.stopRuntimeAfterDurableFence(streamId, lifecycle, runtime);
+      return;
+    }
     if (runtime) {
       runtime.errorEvent = error;
     }
     // Persist error to job store for cross-replica consistency
-    this.jobStore.updateJob(streamId, { error }).catch((err) => {
-      logger.error(`[GenerationJobManager] Failed to persist error:`, err);
-    });
-    await this.eventTransport.emitError(streamId, error);
+    await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.jobStore.updateJob(streamId, { error }),
+      streamId,
+      runtime,
+    );
+    await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.eventTransport.emitError(streamId, error),
+      streamId,
+      runtime,
+    );
   }
 
   /**
@@ -1082,22 +2003,38 @@ class GenerationJobManagerClass {
    * Also cleans up any orphaned runtime state, buffers, and event transport entries.
    */
   private async cleanup(): Promise<void> {
-    const count = await this.jobStore.cleanup();
+    const lifecycle = this.captureLifecycle();
+    const count = await this.runLifecycleOperation(lifecycle, () => lifecycle.jobStore.cleanup());
 
     // Cleanup runtime state for deleted jobs
-    for (const streamId of this.runtimeState.keys()) {
-      if (!(await this.jobStore.hasJob(streamId))) {
+    for (const [streamId, runtime] of this.runtimeState.entries()) {
+      if (
+        !(await this.runLifecycleOperation(
+          lifecycle,
+          () => lifecycle.jobStore.hasJob(streamId),
+          streamId,
+          runtime,
+        ))
+      ) {
         this.runtimeState.delete(streamId);
         this.runStepBuffers?.delete(streamId);
-        this.jobStore.clearContentState(streamId);
-        this.eventTransport.cleanup(streamId);
+        lifecycle.jobStore.clearContentState(streamId);
+        lifecycle.eventTransport.cleanup(streamId);
       }
     }
 
     // Also check runStepBuffers for any orphaned entries (Redis mode only)
     if (this.runStepBuffers) {
       for (const streamId of this.runStepBuffers.keys()) {
-        if (!(await this.jobStore.hasJob(streamId))) {
+        const runtime = this.runtimeState.get(streamId);
+        if (
+          !(await this.runLifecycleOperation(
+            lifecycle,
+            () => lifecycle.jobStore.hasJob(streamId),
+            streamId,
+            runtime,
+          ))
+        ) {
           this.runStepBuffers.delete(streamId);
         }
       }
@@ -1105,9 +2042,18 @@ class GenerationJobManagerClass {
 
     // Check eventTransport for orphaned streams (e.g., connections dropped without clean close)
     // These are streams that exist in eventTransport but have no corresponding job
-    for (const streamId of this.eventTransport.getTrackedStreamIds()) {
-      if (!(await this.jobStore.hasJob(streamId)) && !this.runtimeState.has(streamId)) {
-        this.eventTransport.cleanup(streamId);
+    for (const streamId of lifecycle.eventTransport.getTrackedStreamIds()) {
+      const runtime = this.runtimeState.get(streamId);
+      if (
+        !(await this.runLifecycleOperation(
+          lifecycle,
+          () => lifecycle.jobStore.hasJob(streamId),
+          streamId,
+          runtime,
+        )) &&
+        !runtime
+      ) {
+        lifecycle.eventTransport.cleanup(streamId);
       }
     }
 
@@ -1152,13 +2098,14 @@ class GenerationJobManagerClass {
    * Get job count by status.
    */
   async getJobCountByStatus(): Promise<Record<t.GenerationJobStatus, number>> {
-    const [running, complete, error, aborted] = await Promise.all([
+    const [running, complete, error, aborted, superseded] = await Promise.all([
       this.jobStore.getJobCountByStatus('running'),
       this.jobStore.getJobCountByStatus('complete'),
       this.jobStore.getJobCountByStatus('error'),
       this.jobStore.getJobCountByStatus('aborted'),
+      this.jobStore.getJobCountByStatus('superseded'),
     ]);
-    return { running, complete, error, aborted };
+    return { running, complete, error, aborted, superseded };
   }
 
   getRuntimeStats(): {
@@ -1187,20 +2134,63 @@ class GenerationJobManagerClass {
     return this.jobStore.getActiveJobIdsByUser(userId);
   }
 
+  /** Resolve the newest active stream by stable conversation identity. */
+  async getActiveStreamIdForConversation(
+    userId: string,
+    conversationId: string,
+  ): Promise<string | undefined> {
+    const streamIds = await this.jobStore.getActiveJobIdsByUser(userId);
+    let newest: SerializableJobData | undefined;
+    for (const streamId of streamIds) {
+      const job = await this.jobStore.getJob(streamId);
+      if (
+        job?.status === 'running' &&
+        job.conversationId === conversationId &&
+        (!newest || job.createdAt > newest.createdAt)
+      ) {
+        newest = job;
+      }
+    }
+    return newest?.streamId;
+  }
+
+  /** Conversation identities used by web navigation/title state, deduplicated from stream IDs. */
+  async getActiveConversationIdsForUser(userId: string): Promise<string[]> {
+    const streamIds = await this.jobStore.getActiveJobIdsByUser(userId);
+    const conversationIds = new Set<string>();
+    for (const streamId of streamIds) {
+      const job = await this.jobStore.getJob(streamId);
+      if (job?.status === 'running') {
+        conversationIds.add(job.conversationId ?? streamId);
+      }
+    }
+    return [...conversationIds];
+  }
+
   /**
    * Destroy the manager.
    * Cleans up all resources including runtime state, buffers, and stores.
    */
   async destroy(): Promise<void> {
+    const lifecycleJobStore = this.jobStore;
+    const lifecycleEventTransport = this.eventTransport;
+    this.unavailable = true;
+    this.lifecycleAbortController.abort('manager_destroyed');
+    this.lifecycleEpoch += 1;
     if (this.cleanupInterval) {
       clearInterval(this.cleanupInterval);
       this.cleanupInterval = null;
     }
 
-    await this.jobStore.destroy();
-    this.eventTransport.destroy();
+    for (const runtime of this.runtimeState.values()) {
+      if (!runtime.abortController.signal.aborted) {
+        runtime.abortController.abort('manager_destroyed');
+      }
+    }
     this.runtimeState.clear();
     this.runStepBuffers?.clear();
+    lifecycleEventTransport.destroy();
+    await lifecycleJobStore.destroy();
 
     logger.debug('[GenerationJobManager] Destroyed');
   }

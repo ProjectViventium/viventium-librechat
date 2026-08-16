@@ -7,6 +7,7 @@
  * - Refresh before endpoint initialization so UI/API/voice/Telegram all share the
  *   same durable credential behavior.
  * === VIVENTIUM END === */
+import { createHash } from 'node:crypto';
 import { logger } from '@librechat/data-schemas';
 import { EModelEndpoint } from 'librechat-data-provider';
 import type { EndpointDbMethods, UserKeyValues } from '~/types';
@@ -15,8 +16,11 @@ const OPENAI_CODEX_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
 const OPENAI_TOKEN_URL = 'https://auth.openai.com/oauth/token';
 const OPENAI_CODEX_BASE_URL = 'https://chatgpt.com/backend-api/codex';
 const OPENAI_OAUTH_REFRESH_BUFFER_MS = 5 * 60 * 1000;
+const OPENAI_RECONNECT_MESSAGE =
+  'OpenAI connected account needs reconnect in Settings > Account > Connected Accounts.';
 
 const nonExpiringPersistenceCache = new Set<string>();
+const refreshInFlightByUser = new Map<string, Promise<OpenAISubscriptionUserValues>>();
 
 type OpenAISubscriptionUserValues = UserKeyValues & {
   oauthProvider: 'openai-codex';
@@ -94,13 +98,15 @@ function shouldRefresh(userValues: OpenAISubscriptionUserValues): boolean {
 }
 
 function buildPersistenceCacheKey(userId: string, userValues: OpenAISubscriptionUserValues): string {
-  const tokenSuffix = (userValues.apiKey || '').slice(-12) || 'no-token';
+  const tokenHash = userValues.apiKey
+    ? createHash('sha256').update(userValues.apiKey).digest('hex')
+    : 'no-token';
   return [
     userId,
     userValues.oauthProvider,
     userValues.oauthType ?? 'no-type',
     String(userValues.oauthExpiresAt ?? 'no-expiry'),
-    tokenSuffix,
+    tokenHash,
   ].join(':');
 }
 
@@ -127,6 +133,22 @@ async function persistNonExpiringKey(
   nonExpiringPersistenceCache.add(cacheKey);
 }
 
+async function persistReconnectRequired(
+  userId: string,
+  userValues: OpenAISubscriptionUserValues,
+  db: EndpointDbMethods,
+): Promise<void> {
+  if (!db.updateUserKey) {
+    return;
+  }
+  await db.updateUserKey({
+    userId,
+    name: EModelEndpoint.openAI,
+    value: JSON.stringify({ ...userValues, oauthReconnectRequired: true }),
+    expiresAt: null,
+  });
+}
+
 async function parseTokenResponse(response: Response): Promise<OAuthTokenResponse> {
   const bodyText = await response.text();
   if (!bodyText) {
@@ -150,9 +172,8 @@ async function refreshAccessToken(
   db: EndpointDbMethods,
 ): Promise<OpenAISubscriptionUserValues> {
   if (!userValues.refreshToken) {
-    throw new Error(
-      'OpenAI connected account needs reconnect in Settings > Account > Connected Accounts.',
-    );
+    await persistReconnectRequired(userId, userValues, db);
+    throw new Error(OPENAI_RECONNECT_MESSAGE);
   }
 
   const response = await fetch(getTokenUrl(), {
@@ -172,6 +193,10 @@ async function refreshAccessToken(
   if (!response.ok || typeof tokenData.access_token !== 'string' || tokenData.access_token.length === 0) {
     const details =
       tokenData.error_description || tokenData.error || `HTTP ${response.status} ${response.statusText}`;
+    if (tokenData.error === 'invalid_grant' || response.status === 401 || response.status === 403) {
+      await persistReconnectRequired(userId, userValues, db);
+      throw new Error(OPENAI_RECONNECT_MESSAGE);
+    }
     throw new Error(`OpenAI connected account refresh failed: ${details}`);
   }
 
@@ -200,10 +225,36 @@ async function refreshAccessToken(
         : 3600) *
         1000,
     refreshToken: tokenData.refresh_token ?? userValues.refreshToken,
+    oauthReconnectRequired: false,
   };
 
   await persistNonExpiringKey(userId, refreshedValues, db);
   return refreshedValues;
+}
+
+export async function forceRefreshOpenAISubscriptionUserValues(
+  userId: string,
+  userValues: UserKeyValues | null | undefined,
+  db: EndpointDbMethods,
+): Promise<OpenAISubscriptionUserValues> {
+  if (!isOpenAISubscriptionUserValues(userValues)) {
+    throw new Error(
+      'OpenAI connected account needs reconnect in Settings > Account > Connected Accounts.',
+    );
+  }
+
+  const existingRefresh = refreshInFlightByUser.get(userId);
+  if (existingRefresh) {
+    return existingRefresh;
+  }
+
+  const refreshPromise = refreshAccessToken(userId, userValues, db).finally(() => {
+    if (refreshInFlightByUser.get(userId) === refreshPromise) {
+      refreshInFlightByUser.delete(userId);
+    }
+  });
+  refreshInFlightByUser.set(userId, refreshPromise);
+  return refreshPromise;
 }
 
 export async function resolveOpenAISubscriptionUserValues(
@@ -214,15 +265,16 @@ export async function resolveOpenAISubscriptionUserValues(
   if (!isOpenAISubscriptionUserValues(userValues)) {
     return userValues ?? null;
   }
+  if (userValues.oauthReconnectRequired === true) {
+    throw new Error(OPENAI_RECONNECT_MESSAGE);
+  }
 
   if (shouldRefresh(userValues)) {
     try {
-      return await refreshAccessToken(userId, userValues, db);
+      return await forceRefreshOpenAISubscriptionUserValues(userId, userValues, db);
     } catch (error) {
       logger.warn('[OpenAI OAuth] Refresh failed for connected account', error);
-      throw new Error(
-        'OpenAI connected account needs reconnect in Settings > Account > Connected Accounts.',
-      );
+      throw error;
     }
   }
 

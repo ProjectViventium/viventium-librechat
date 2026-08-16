@@ -11,6 +11,17 @@ export interface ViventiumVoiceRouteState {
   tts?: ViventiumVoiceRouteSelection | null;
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Adaptive parallel-work orchestration preference
+ * Purpose: Keep one account-wide source of truth shared by every client surface.
+ * === VIVENTIUM END === */
+export type ViventiumOrchestrationMode = 'focused' | 'parallel';
+
+export interface ViventiumOrchestrationPreferences {
+  mode?: ViventiumOrchestrationMode;
+  knownWork?: boolean;
+}
+
 export interface IUser extends Document {
   name?: string;
   username?: string;
@@ -48,6 +59,9 @@ export interface IUser extends Document {
      * Added: 2026-02-19
      */
     conversation_recall?: boolean;
+    orchestration_mode?: ViventiumOrchestrationMode;
+    parallel_work_known?: boolean;
+    parallel_work_known_epoch?: number;
     /* === VIVENTIUM END === */
   };
   favorites?: Array<{
@@ -105,6 +119,8 @@ export interface UpdateUserRequest {
      * Added: 2026-02-19
      */
     conversation_recall?: boolean;
+    orchestration_mode?: ViventiumOrchestrationMode;
+    parallel_work_known?: boolean;
     /* === VIVENTIUM END === */
   };
   /* === VIVENTIUM START ===

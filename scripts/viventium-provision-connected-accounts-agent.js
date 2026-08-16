@@ -28,11 +28,14 @@ const { grantPermission } = require('../api/server/services/PermissionService');
 const MAIN_ID = process.env.VIVENTIUM_MAIN_AGENT_ID || 'agent_viventium_main_95aeb3';
 const AGENT_ID = 'agent_viventium_connected_accounts_95aeb3';
 const AGENT_PROVIDER = 'anthropic';
-const AGENT_MODEL = 'claude-opus-4-8';
+const AGENT_MODEL = 'claude-opus-5';
 const AGENT_MODEL_PARAMETERS = { model: AGENT_MODEL, thinking: true, effort: 'high' };
-const FALLBACK_LLM_PROVIDER = 'openAI';
-const FALLBACK_LLM_MODEL = 'gpt-5.4';
-const FALLBACK_LLM_MODEL_PARAMETERS = { model: FALLBACK_LLM_MODEL };
+const FALLBACK_LLM_PROVIDER = 'glasshive-harness';
+const FALLBACK_LLM_MODEL = 'claude-code:opus';
+const FALLBACK_LLM_MODEL_PARAMETERS = {
+  model: FALLBACK_LLM_MODEL,
+  reasoning_effort: 'high',
+};
 const DESCRIPTION =
   'Uses your connected Google Workspace and Microsoft 365 accounts for quick inbox, calendar, and file checks, plus explicitly confirmed email/calendar updates.';
 

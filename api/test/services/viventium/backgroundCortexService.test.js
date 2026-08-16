@@ -83,6 +83,11 @@ jest.mock('~/server/services/Config/app', () => ({
       },
       custom: [
         {
+          name: 'groq',
+          apiKey: 'groq-test-key',
+          baseURL: 'https://api.groq.com/openai/v1',
+        },
+        {
           name: 'xai',
           apiKey: 'xai-test-key',
           baseURL: 'https://api.x.ai/v1',
@@ -107,10 +112,18 @@ jest.mock('~/server/controllers/agents/callbacks', () => ({
 
 jest.mock('~/server/controllers/ModelController', () => ({
   getModelsConfig: jest.fn(async () => ({
-    anthropic: ['claude-sonnet-4-5'],
+    anthropic: ['claude-opus-5'],
     openAI: ['gpt-5.4'],
     xai: ['grok-4.3'],
   })),
+}));
+
+jest.mock('~/server/services/viventium/GlassHiveConversationProviderService', () => ({
+  attachConversationProviderCapabilityBundle: jest.fn(async () => true),
+  buildHarnessIdempotencyKey: jest.fn((role, messageId, agentId = '') =>
+    [role, agentId, messageId].filter(Boolean).join(':'),
+  ),
+  installConversationProviderCapabilityRefresher: jest.fn(() => true),
 }));
 
 jest.mock('~/config', () => ({
@@ -155,13 +168,18 @@ const {
   formatHistoryForActivation,
   buildCortexCompletionPayload,
   getCustomEndpointConfig,
+  buildCortexRequestBody,
+  prepareCortexConversationProviderCapability,
   sanitizeCortexDisplayName,
 } = require('~/server/services/BackgroundCortexService');
 const { Run, createContentAggregator } = require('@librechat/agents');
-const { initializeAgent, initializeAnthropic, createRun } = require('@librechat/api');
+const { initializeAgent, initializeAnthropic, createRun, checkAccess } = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
 const { getAppConfig } = require('~/server/services/Config/app');
 const { loadAgent } = require('~/models/Agent');
+const {
+  attachConversationProviderCapabilityBundle,
+} = require('~/server/services/viventium/GlassHiveConversationProviderService');
 const {
   PROMPT_BUNDLE_ENV,
   resetPromptRegistryForTests,
@@ -192,6 +210,66 @@ RETURN "should_activate": false WHEN:
 - The request is ONLY about Microsoft / Outlook / MS365 / Office 365 / OneDrive / Teams / Planner / OneNote and contains no Google Workspace action
 - A shared link points only to a Microsoft domain (outlook.office.com, onedrive.live.com, sharepoint.com, etc.) and there is no Google action request
 - The user is only asking a capability question ("can you access my email?") rather than requesting an action`;
+
+describe('BackgroundCortexService GlassHive request identity', () => {
+  test('uses the resolved conversation id instead of an empty or provisional request value', () => {
+    expect(
+      buildCortexRequestBody({
+        requestBody: {
+          conversationId: '',
+          parentMessageId: 'parent-1',
+          viventiumSurface: 'web',
+        },
+        runId: 'message-1',
+        conversationId: 'conversation-resolved',
+      }),
+    ).toEqual(
+      expect.objectContaining({
+        conversationId: 'conversation-resolved',
+        messageId: 'message-1',
+        parentMessageId: 'parent-1',
+        viventiumSurface: 'web',
+      }),
+    );
+  });
+
+  test('forces a GlassHive cortex into the provider read-only lane before attaching authority', async () => {
+    const targetAgent = {
+      model_parameters: {
+        configuration: {
+          defaultHeaders: {
+            'X-GlassHive-Agent-Id': 'cortex-agent',
+            'X-GlassHive-Access': 'full',
+          },
+        },
+      },
+    };
+    const attachBundle = jest.fn().mockImplementation(async ({ targetAgent: target }) => {
+      expect(target.model_parameters.configuration.defaultHeaders['X-GlassHive-Access']).toBe(
+        'read_only',
+      );
+      return true;
+    });
+    const installRefresher = jest.fn();
+
+    await expect(
+      prepareCortexConversationProviderCapability({
+        targetAgent,
+        declaredAgent: { provider: 'glasshive-harness' },
+        req: { user: { id: 'owner-1' } },
+        capability: { workspace_binding: true, cortex_execution: true },
+        requestBody: { conversationId: 'conversation-1', messageId: 'cortex-run-1' },
+        attachBundle,
+        installRefresher,
+      }),
+    ).resolves.toBe(true);
+
+    expect(
+      targetAgent.model_parameters.configuration.defaultHeaders['X-GlassHive-Access'],
+    ).toBe('read_only');
+    expect(installRefresher).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe('BackgroundCortexService.detectActivations', () => {
   test('enforces a hard global time budget (does not hang on slow activationRunner)', async () => {
@@ -422,6 +500,53 @@ describe('BackgroundCortexService.checkCortexActivation', () => {
     jest.clearAllMocks();
     clearActivationCooldowns();
     clearActivationProviderHealth();
+  });
+
+  test('always mode activates immediately without invoking a classifier', async () => {
+    const result = await checkCortexActivation({
+      cortexConfig: {
+        agent_id: 'agent_viventium_deep_memory_95aeb3',
+        activation: {
+          enabled: true,
+          mode: 'always',
+        },
+      },
+      messages: [{ role: 'user', content: 'Continue.' }],
+      runId: 'run-always-mode',
+      req: { body: {}, user: {} },
+    });
+
+    expect(Run.create).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      shouldActivate: true,
+      confidence: 1,
+      reason: 'activation_mode_always',
+      agentId: 'agent_viventium_deep_memory_95aeb3',
+      providerAttempts: [],
+    });
+  });
+
+  test.each([
+    ['master switch off', { enabled: false, mode: 'always' }],
+    ['disabled mode', { enabled: true, mode: 'disabled' }],
+  ])('%s skips without invoking a classifier', async (_label, activation) => {
+    const result = await checkCortexActivation({
+      cortexConfig: {
+        agent_id: 'agent_viventium_deep_memory_95aeb3',
+        activation,
+      },
+      messages: [{ role: 'user', content: 'Continue.' }],
+      runId: 'run-disabled-mode',
+      req: { body: {}, user: {} },
+    });
+
+    expect(Run.create).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      shouldActivate: false,
+      confidence: 0,
+      reason: 'disabled',
+      agentId: 'agent_viventium_deep_memory_95aeb3',
+    });
   });
 
   test('passes provider-clarification history to the activation classifier without deterministic preemption', async () => {
@@ -1539,6 +1664,63 @@ describe('BackgroundCortexService.executeCortex', () => {
     );
   });
 
+  test('attaches capabilities by declared endpoint after transport provider normalization', async () => {
+    const processStream = jest.fn(async () => 'run-output');
+    const initializedAgent = {
+      id: 'agent_glasshive_cortex',
+      name: 'GlassHive Cortex',
+      provider: 'openAI',
+      tools: [],
+      userMCPAuthMap: null,
+      recursion_limit: 11,
+    };
+    const capability = {
+      workspace_binding: true,
+      cortex_execution: true,
+      host_tools_transport: 'broker_mcp',
+    };
+
+    initializeAgent.mockResolvedValueOnce(initializedAgent);
+    createRun.mockResolvedValueOnce({ processStream });
+    createContentAggregator.mockReturnValueOnce({
+      contentParts: [{ type: 'text', text: 'aggregated insight' }],
+      aggregateContent: jest.fn(),
+    });
+
+    await executeCortex({
+      agent: {
+        id: 'agent_glasshive_cortex',
+        name: 'GlassHive Cortex',
+        provider: 'glasshive-harness',
+        model: 'codex-cli:gpt-5.6-sol',
+        instructions: 'Use declared capabilities.',
+      },
+      messages: [{ role: 'user', content: 'Inspect the current evidence.' }],
+      runId: 'run-glasshive-cortex',
+      req: {
+        user: { id: 'user-1', role: 'USER' },
+        body: { conversationId: 'c1', parentMessageId: 'p1' },
+        config: {
+          endpoints: {
+            agents: {
+              allowedProviders: ['glasshive-harness'],
+              providerCapabilities: { 'glasshive-harness': capability },
+              capabilityRequiredProviders: ['glasshive-harness'],
+            },
+          },
+        },
+      },
+    });
+
+    expect(attachConversationProviderCapabilityBundle).toHaveBeenCalledWith(
+      expect.objectContaining({
+        targetAgent: initializedAgent,
+        declaredAgent: expect.objectContaining({ provider: 'glasshive-harness' }),
+        capability,
+      }),
+    );
+  });
+
   test('direct executeCortex uses a validated configured fallback after provider failure', async () => {
     const primaryProcessStream = jest.fn(async () => '');
     const fallbackProcessStream = jest.fn(async () => 'fallback-output');
@@ -1580,8 +1762,8 @@ describe('BackgroundCortexService.executeCortex', () => {
         model: 'gpt-5.4',
         model_parameters: { model: 'gpt-5.4', useResponsesApi: true },
         fallback_llm_provider: 'anthropic',
-        fallback_llm_model: 'claude-sonnet-4-5',
-        fallback_llm_model_parameters: { model: 'claude-sonnet-4-5' },
+        fallback_llm_model: 'claude-opus-5',
+        fallback_llm_model_parameters: { model: 'claude-opus-5' },
         tools: [],
       },
       messages: [{ role: 'user', content: 'Return a typed result.' }],
@@ -1596,14 +1778,14 @@ describe('BackgroundCortexService.executeCortex', () => {
 
     expect(createRun).toHaveBeenCalledTimes(2);
     expect(initializeAgent.mock.calls[1][0].agent).toEqual(
-      expect.objectContaining({ provider: 'anthropic', model: 'claude-sonnet-4-5' }),
+      expect.objectContaining({ provider: 'anthropic', model: 'claude-opus-5' }),
     );
     expect(result).toEqual(
       expect.objectContaining({
         insight: 'fallback-output',
         fallbackUsed: true,
         fallbackProvider: 'anthropic',
-        fallbackModel: 'claude-sonnet-4-5',
+        fallbackModel: 'claude-opus-5',
         fallbackServiceTier: null,
         primaryProvider: 'openAI',
         primaryModel: 'gpt-5.4',
@@ -1893,9 +2075,9 @@ describe('BackgroundCortexService.executeCortex', () => {
       id: 'agent_retry',
       name: 'Retry Cortex',
       provider: 'anthropic',
-      model: 'claude-sonnet-4-5',
+      model: 'claude-opus-5',
       model_parameters: {
-        model: 'claude-sonnet-4-5',
+        model: 'claude-opus-5',
         thinking: false,
       },
       fallback_llm_provider: 'openAI',
@@ -2005,9 +2187,9 @@ describe('BackgroundCortexService.executeCortex', () => {
       id: 'agent_retry_auth',
       name: 'Retry Auth Cortex',
       provider: 'anthropic',
-      model: 'claude-sonnet-4-5',
+      model: 'claude-opus-5',
       model_parameters: {
-        model: 'claude-sonnet-4-5',
+        model: 'claude-opus-5',
         thinking: false,
       },
       fallback_llm_provider: 'xai',
@@ -2120,9 +2302,9 @@ describe('BackgroundCortexService.executeCortex', () => {
       id: 'agent_retry_auth_both_fail',
       name: 'Retry Auth Cortex',
       provider: 'anthropic',
-      model: 'claude-sonnet-4-5',
+      model: 'claude-opus-5',
       model_parameters: {
-        model: 'claude-sonnet-4-5',
+        model: 'claude-opus-5',
         thinking: false,
       },
       fallback_llm_provider: 'xai',
@@ -2222,9 +2404,9 @@ describe('BackgroundCortexService.executeCortex', () => {
       id: 'agent_auth_no_fallback',
       name: 'Auth Cortex',
       provider: 'anthropic',
-      model: 'claude-sonnet-4-5',
+      model: 'claude-opus-5',
       model_parameters: {
-        model: 'claude-sonnet-4-5',
+        model: 'claude-opus-5',
         thinking: false,
       },
       tools: [],
@@ -2350,9 +2532,9 @@ describe('BackgroundCortexService.executeCortex', () => {
       id: 'agent_retry_throw',
       name: 'Retry Throw Cortex',
       provider: 'anthropic',
-      model: 'claude-sonnet-4-5',
+      model: 'claude-opus-5',
       model_parameters: {
-        model: 'claude-sonnet-4-5',
+        model: 'claude-opus-5',
         thinking: false,
       },
       fallback_llm_provider: 'openAI',
@@ -2674,6 +2856,48 @@ describe('BackgroundCortexService.executeCortex', () => {
     expect(initArgs.agent.instructions).toContain('# Existing memory about the user:');
     expect(initArgs.agent.instructions).toContain('did x on 2026-02-07');
   });
+
+  test('marks saved memory unavailable when the cortex access check fails', async () => {
+    const processStream = jest.fn(async () => 'run-output');
+    const initializedAgent = {
+      id: 'agent_cortex',
+      name: 'Background Analysis',
+      tools: [],
+      userMCPAuthMap: null,
+      recursion_limit: 11,
+    };
+    checkAccess.mockRejectedValueOnce(new Error('permission store temporarily unavailable'));
+    initializeAgent.mockResolvedValueOnce(initializedAgent);
+    createRun.mockResolvedValueOnce({ processStream });
+    createContentAggregator.mockReturnValueOnce({
+      contentParts: [{ type: 'text', text: 'aggregated insight' }],
+      aggregateContent: jest.fn(),
+    });
+
+    await executeCortex({
+      agent: {
+        id: 'agent_cortex',
+        name: 'Background Analysis',
+        provider: 'openai',
+        model: 'gpt-4o',
+        instructions: 'You are a cortex.',
+      },
+      messages: [{ role: 'user', content: 'test' }],
+      runId: 'run-cortex-memory-unavailable',
+      req: {
+        user: { id: 'user-1', role: 'USER' },
+        config: {
+          endpoints: { agents: { allowedProviders: ['openai'] } },
+          memory: { disabled: false },
+        },
+        body: { conversationId: 'c1', parentMessageId: 'p1' },
+      },
+    });
+
+    const initArgs = initializeAgent.mock.calls[0][0];
+    expect(initArgs.agent.instructions).toContain('# Saved-memory availability');
+    expect(initArgs.agent.instructions).toContain('not evidence that no saved memory exists');
+  });
   /* === VIVENTIUM NOTE === */
 
   /* === VIVENTIUM NOTE ===
@@ -2824,7 +3048,7 @@ describe('BackgroundCortexService.executeCortex', () => {
         id: 'agent_tool',
         name: 'Online Tool Use',
         provider: 'anthropic',
-        model: 'claude-sonnet-4-5',
+        model: 'claude-opus-5',
         instructions: 'You are a cortex.',
       },
       messages,
@@ -2865,7 +3089,7 @@ describe('BackgroundCortexService.executeCortex', () => {
         id: 'agent_confirmation',
         name: 'Confirmation Bias',
         provider: 'anthropic',
-        model: 'claude-sonnet-4-5',
+        model: 'claude-opus-5',
         instructions: 'You are a cortex.',
         model_parameters: {
           temperature: 0.3,
@@ -3028,7 +3252,7 @@ describe('BackgroundCortexService.executeCortex', () => {
       recursion_limit: 11,
       provider: 'anthropic',
       model_parameters: {
-        model: 'claude-sonnet-4-5',
+        model: 'claude-opus-5',
         temperature: 0.5,
         thinking: { type: 'enabled', budget_tokens: 2000 },
       },
@@ -3047,7 +3271,7 @@ describe('BackgroundCortexService.executeCortex', () => {
         id: 'agent_user_created',
         name: 'Custom Reviewer',
         provider: 'anthropic',
-        model: 'claude-sonnet-4-5',
+        model: 'claude-opus-5',
         instructions: 'You are a custom cortex.',
         model_parameters: {
           temperature: 0.5,

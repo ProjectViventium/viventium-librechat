@@ -4,7 +4,89 @@ import type { StandardGraph } from '@librechat/agents';
 /**
  * Job status enum
  */
-export type JobStatus = 'running' | 'complete' | 'error' | 'aborted';
+/* === VIVENTIUM START ===
+ * Feature: Durable logical-turn continuity.
+ * Purpose: Define trusted stream ownership, revision, source, and delivery contracts.
+ */
+export type JobStatus = 'running' | 'complete' | 'error' | 'aborted' | 'superseded';
+
+/** VIVENTIUM: internal-only, ordered unresolved input carried across rapid revisions. */
+export interface InteractionSourceSegment {
+  ordinal: number;
+  source_event_id: string;
+  source_index: number;
+  text: string;
+  truncated?: boolean;
+  original_sha256?: string;
+  /** Owner-scoped file references only; paths, bytes/base64, and provider credentials are banned. */
+  source_files?: Array<{
+    file_id: string;
+    filename?: string;
+    type?: string;
+    bytes?: number;
+    media_group_index?: number;
+  }>;
+}
+
+/** Trusted, server-authored context shared by generation and delivery adapters. */
+export interface InteractionContext {
+  actor_kind: 'external_user' | 'system' | 'worker';
+  origin: 'interactive' | 'scheduler' | 'callback';
+  surface: 'web' | 'telegram' | 'voice' | 'workbench';
+  conversation_id: string;
+  logical_turn_id?: string;
+  revision: number;
+  source_event_id: string;
+  /** Presentation/message metadata must omit this raw text. */
+  source_segments?: InteractionSourceSegment[];
+  /** Number of oldest source segments evicted from the bounded internal ledger. */
+  source_segments_overflow_count?: number;
+}
+
+export interface InteractionAdapterCapabilities {
+  segment_stability: 'immediate' | 'provisional';
+  supersede_scope: 'response_and_authoring' | 'response_only';
+}
+
+export type AdapterCapabilities = InteractionAdapterCapabilities;
+
+export interface InteractionDeliveryPolicy {
+  commit_authority: 'server' | 'external_adapter';
+}
+
+export interface LogicalTurnClaim {
+  status: 'claimed' | 'duplicate';
+  streamId: string;
+  interactionContext: InteractionContext;
+  supersededStreamIds: string[];
+  /** Store-internal owner receipts for fencing a prior claim that has not published its job yet. */
+  supersededClaimIdentities?: string[];
+}
+
+export type DeliveryAcknowledgementState = 'committed' | 'partial_removed' | 'failed';
+
+export interface InteractionDeliveryAck {
+  logical_turn_id: string;
+  revision: number;
+  state: DeliveryAcknowledgementState;
+  presentation_ref?: string;
+}
+
+export interface DeliveryAcknowledgementResult {
+  status: 'recorded' | 'not_found' | 'stale_revision' | 'conflict';
+  acknowledgement?: InteractionDeliveryAck;
+  idempotent?: boolean;
+  /** Internal server-held owner; never accepted from or exposed as client authority. */
+  ownerStreamId?: string;
+  /** Internal persistence target derived from the owner job, never from adapter claims. */
+  presentation?: {
+    userId: string;
+    conversationId?: string;
+    responseMessageId?: string;
+    interactionContext?: InteractionContext;
+  };
+}
+/* === VIVENTIUM END === */
 
 /**
  * Serializable job data - no object references, suitable for Redis/external storage
@@ -43,6 +125,16 @@ export interface SerializableJobData {
   iconURL?: string;
   model?: string;
   promptTokens?: number;
+  /* === VIVENTIUM START ===
+   * Feature: Durable logical-turn continuity.
+   * Purpose: Persist only server-authored generation and delivery ownership metadata with a job.
+   */
+  interactionContext?: InteractionContext;
+  adapterCapabilities?: AdapterCapabilities;
+  deliveryPolicy?: InteractionDeliveryPolicy;
+  deliveryAcknowledgement?: InteractionDeliveryAck;
+  generationCompleted?: boolean;
+  /* === VIVENTIUM END === */
 }
 
 /**
@@ -143,7 +235,54 @@ export interface IJobStore {
     streamId: string,
     userId: string,
     conversationId?: string,
+    /* === VIVENTIUM START ===
+     * Feature: Durable logical-turn continuity.
+     * Purpose: Atomically seed trusted job metadata at create-once admission.
+     */
+    initialData?: Partial<SerializableJobData>,
+    /* === VIVENTIUM END === */
   ): Promise<SerializableJobData>;
+
+  /* === VIVENTIUM START ===
+   * Feature: Durable logical-turn continuity.
+   * Purpose: Keep revision ownership, rollback, and external delivery acknowledgement server-held.
+   */
+  /** Atomically claim a revision, or return the first stream for a duplicate source event. */
+  claimLogicalTurn(
+    streamId: string,
+    userId: string,
+    interactionContext: InteractionContext,
+  ): Promise<LogicalTurnClaim>;
+
+  /** Conditionally undo a failed claim only while that stream still owns the latest revision. */
+  rollbackLogicalTurnClaim(
+    streamId: string,
+    interactionContext: InteractionContext,
+  ): Promise<boolean>;
+
+  /** Fence any older claimed stream slots after this revision's job is durably admitted. */
+  fenceSupersededLogicalTurnClaims?(claim: LogicalTurnClaim): Promise<void>;
+
+  /** Remove only a source-event receipt that points at a confirmed missing owner job. */
+  forgetMissingSourceEventReceipt(
+    interactionContext: InteractionContext,
+    expectedStreamId: string,
+  ): Promise<boolean>;
+
+  /** Release the active revision only when the supplied stream still owns it. */
+  completeLogicalTurn(streamId: string): Promise<void>;
+
+  /** Whether this stream is still the latest revision of its logical turn. */
+  isCurrentLogicalTurn(streamId: string): Promise<boolean>;
+
+  /** Resolve revision ownership from the server-held logical-turn index. */
+  resolveDeliveryOwner(logicalTurnId: string, revision: number): Promise<string | null>;
+
+  /** Record the current presentation outcome using server-held logical-turn ownership. */
+  acknowledgeDelivery(
+    acknowledgement: InteractionDeliveryAck,
+  ): Promise<DeliveryAcknowledgementResult>;
+  /* === VIVENTIUM END === */
 
   /** Get a job by streamId (streamId === conversationId) */
   getJob(streamId: string): Promise<SerializableJobData | null>;
@@ -311,14 +450,24 @@ export interface IEventTransport {
    * generating Replica A receives signal and stops.
    * Optional - only implemented in Redis transport.
    */
-  emitAbort?(streamId: string): void;
+  /* === VIVENTIUM START ===
+   * Feature: Exact stream supersession.
+   * Purpose: Carry a typed internal abort reason without widening public stream authority.
+   */
+  emitAbort?(streamId: string, reason?: string): void | Promise<void>;
+  /* === VIVENTIUM END === */
 
   /**
    * Register callback for abort signals from any replica (Redis mode).
    * Called when abort is triggered from any replica.
    * Optional - only implemented in Redis transport.
    */
-  onAbort?(streamId: string, callback: () => void): void;
+  /* === VIVENTIUM START ===
+   * Feature: Exact stream supersession.
+   * Purpose: Propagate the internal abort reason to the exact stream subscriber.
+   */
+  onAbort?(streamId: string, callback: (reason?: string) => void): void | Promise<void>;
+  /* === VIVENTIUM END === */
 
   /** Get subscriber count for a stream */
   getSubscriberCount(streamId: string): number;

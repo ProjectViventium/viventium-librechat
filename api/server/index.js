@@ -38,6 +38,15 @@ const {
   getStaleCortexRecoveryIntervalMs,
   recoverStaleCortexMessages,
 } = require('./services/viventium/staleCortexMessageRecovery');
+const {
+  reconcilePendingGlassHiveMissionAdjudications,
+} = require('./services/viventium/GlassHiveMissionAdjudicationService');
+const {
+  startGlassHiveLaunchReconciliation,
+} = require('./services/viventium/GlassHiveLaunchReconciliationService');
+const {
+  startOrchestrationReadinessWatcher,
+} = require('./services/viventium/GlassHiveOrchestrationReadinessService');
 const staticCache = require('./utils/staticCache');
 const noIndex = require('./middleware/noIndex');
 const { seedDatabase } = require('~/models');
@@ -246,11 +255,21 @@ const startServer = async () => {
     recoverStaleCortexMessages().catch((error) => {
       logger.error('[staleCortexMessageRecovery] Startup recovery failed:', error);
     });
+    reconcilePendingGlassHiveMissionAdjudications().catch((error) => {
+      logger.error('[glasshiveMissionAdjudication] Startup recovery failed:', error);
+    });
+    startGlassHiveLaunchReconciliation();
+    startOrchestrationReadinessWatcher();
     const staleCortexRecoveryIntervalMs = getStaleCortexRecoveryIntervalMs();
     if (staleCortexRecoveryIntervalMs > 0) {
       setInterval(() => {
         recoverStaleCortexMessages().catch((error) => {
           logger.error('[staleCortexMessageRecovery] Periodic recovery failed:', error);
+        });
+      }, staleCortexRecoveryIntervalMs).unref?.();
+      setInterval(() => {
+        reconcilePendingGlassHiveMissionAdjudications().catch((error) => {
+          logger.error('[glasshiveMissionAdjudication] Periodic recovery failed:', error);
         });
       }, staleCortexRecoveryIntervalMs).unref?.();
     }

@@ -1,3 +1,7 @@
+/* === VIVENTIUM START ===
+ * Feature: Connected-account safety regression coverage.
+ * Purpose: Keep fork-specific OAuth attempt fencing protected during upstream replay.
+ */
 const express = require('express');
 const request = require('supertest');
 const jwt = require('jsonwebtoken');
@@ -16,6 +20,7 @@ jest.mock('~/server/middleware', () => ({
 
 jest.mock('@librechat/api', () => ({
   getBasePath: jest.fn(() => ''),
+  clearMemoryWriterHealth: jest.fn(),
   isEnabled: jest.fn((value) => {
     if (value == null) {
       return false;
@@ -28,6 +33,7 @@ describe('Connected Accounts Routes', () => {
   let app;
   let router;
   let updateUserKey;
+  let clearMemoryWriterHealth;
 
   beforeEach(() => {
     jest.resetModules();
@@ -40,6 +46,7 @@ describe('Connected Accounts Routes', () => {
     global.fetch = jest.fn();
 
     ({ updateUserKey } = require('~/models'));
+    ({ clearMemoryWriterHealth } = require('@librechat/api'));
     router = require('../connectedAccounts');
     app = express();
     app.use(express.json());
@@ -65,6 +72,32 @@ describe('Connected Accounts Routes', () => {
     );
     expect(response.body.authUrl).toContain('code_challenge=');
     expect(response.body.flowMode).toBe('manual_code');
+    expect(response.body.attemptId).toEqual(expect.any(String));
+  });
+
+  it('should scope connection status to the current OAuth attempt', async () => {
+    const firstStart = await request(app).get('/api/connected-accounts/openai/start');
+    const secondStart = await request(app).get('/api/connected-accounts/openai/start');
+
+    expect(firstStart.body.attemptId).not.toBe(secondStart.body.attemptId);
+
+    const firstStatus = await request(app)
+      .get('/api/connected-accounts/openai/status')
+      .query({ attemptId: firstStart.body.attemptId });
+    const secondStatus = await request(app)
+      .get('/api/connected-accounts/openai/status')
+      .query({ attemptId: secondStart.body.attemptId });
+
+    expect(firstStatus.status).toBe(200);
+    expect(firstStatus.body).toEqual({
+      attemptId: firstStart.body.attemptId,
+      status: 'superseded',
+    });
+    expect(secondStatus.status).toBe(200);
+    expect(secondStatus.body).toEqual({
+      attemptId: secondStart.body.attemptId,
+      status: 'pending',
+    });
   });
 
   it('should return an OAuth authorization URL for Anthropic with manual flow mode', async () => {
@@ -97,6 +130,18 @@ describe('Connected Accounts Routes', () => {
     expect(process.env.DOMAIN_SERVER).toBe('https://chat.viventium.ai');
   });
 
+  it('should fail closed when no trusted connected-account return origin is configured', async () => {
+    delete process.env.VIVENTIUM_CONNECTED_ACCOUNTS_RETURN_ORIGIN;
+    delete process.env.DOMAIN_SERVER;
+
+    const response = await request(app)
+      .get('/api/connected-accounts/openai/start')
+      .set('Host', 'untrusted.example');
+
+    expect(response.status).toBe(500);
+    expect(response.body).toEqual({ error: 'oauth_start_failed' });
+  });
+
   it('should exchange callback code and store OpenAI credentials', async () => {
     global.fetch.mockResolvedValue({
       ok: true,
@@ -120,7 +165,14 @@ describe('Connected Accounts Routes', () => {
 
     expect(response.status).toBe(302);
     expect(response.headers.location).toContain('/oauth/success');
+    expect(clearMemoryWriterHealth).toHaveBeenCalledWith({
+      userId: 'test-user-id',
+      provider: EModelEndpoint.openAI,
+    });
     expect(response.headers.location).toContain('provider=openai');
+    expect(response.headers.location).toContain(
+      `attemptId=${encodeURIComponent(startResponse.body.attemptId)}`,
+    );
     expect(updateUserKey).toHaveBeenCalledWith(
       expect.objectContaining({
         userId: 'test-user-id',
@@ -129,6 +181,73 @@ describe('Connected Accounts Routes', () => {
       }),
     );
     expect(global.fetch).toHaveBeenCalledTimes(1);
+
+    const statusResponse = await request(app)
+      .get('/api/connected-accounts/openai/status')
+      .query({ attemptId: startResponse.body.attemptId });
+    expect(statusResponse.body).toEqual({
+      attemptId: startResponse.body.attemptId,
+      status: 'completed',
+    });
+  });
+
+  it('should reject a superseded callback before exchanging or overwriting credentials', async () => {
+    const firstStart = await request(app).get('/api/connected-accounts/openai/start');
+    const firstState = new URL(firstStart.body.authUrl).searchParams.get('state');
+    await request(app).get('/api/connected-accounts/openai/start');
+
+    const response = await request(app).get('/api/connected-accounts/openai/callback').query({
+      code: 'stale-auth-code',
+      state: firstState,
+    });
+
+    expect(response.status).toBe(302);
+    expect(response.headers.location).toContain('/oauth/error');
+    expect(response.headers.location).toContain('error=superseded_flow');
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(updateUserKey).not.toHaveBeenCalled();
+  });
+
+  it('should not persist a callback superseded during token exchange', async () => {
+    let resolveFetch;
+    global.fetch.mockReturnValue(
+      new Promise((resolve) => {
+        resolveFetch = resolve;
+      }),
+    );
+    const firstStart = await request(app).get('/api/connected-accounts/openai/start');
+    const firstState = new URL(firstStart.body.authUrl).searchParams.get('state');
+    const callbackPromise = request(app)
+      .get('/api/connected-accounts/openai/callback')
+      .query({ code: 'stale-auth-code', state: firstState })
+      .then((response) => response);
+
+    await new Promise((resolve) => {
+      const waitForExchange = () => {
+        if (global.fetch.mock.calls.length > 0) {
+          resolve();
+          return;
+        }
+        setImmediate(waitForExchange);
+      };
+      waitForExchange();
+    });
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    await request(app).get('/api/connected-accounts/openai/start');
+    resolveFetch({
+      ok: true,
+      status: 200,
+      text: async () =>
+        JSON.stringify({
+          access_token: 'header.payload.signature',
+          refresh_token: 'stale-refresh-token',
+          expires_in: 3600,
+        }),
+    });
+
+    const response = await callbackPromise;
+    expect(response.headers.location).toContain('error=superseded_flow');
+    expect(updateUserKey).not.toHaveBeenCalled();
   });
 
   it('should complete manual OpenAI flow via callbackInput', async () => {
@@ -297,3 +416,4 @@ describe('Connected Accounts Routes', () => {
     expect(response.body).toEqual({ error: 'oauth_not_enabled' });
   });
 });
+/* === VIVENTIUM END === */

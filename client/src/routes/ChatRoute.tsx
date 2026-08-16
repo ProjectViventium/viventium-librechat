@@ -88,6 +88,15 @@ export default function ChatRoute() {
     }
 
     const isNewConvo = conversationId === Constants.NEW_CONVO;
+    /* === VIVENTIUM START ===
+     * Feature: Exact-route persisted conversation settlement
+     * Purpose: A delayed or stale route query must never initialize or settle another conversation.
+     */
+    const routeConversation =
+      !isNewConvo && initialConvoQuery.data?.conversationId === conversationId
+        ? initialConvoQuery.data
+        : undefined;
+    /* === VIVENTIUM END === */
 
     const getNewConvoPreset = () => {
       const result = getDefaultModelSpec(startupConfig);
@@ -118,16 +127,21 @@ export default function ChatRoute() {
       });
 
       hasSetConversation.current = true;
-    } else if (initialConvoQuery.data && endpointsQuery.data && modelsQuery.data) {
-      logger.log('conversation', 'ChatRoute initialConvoQuery', initialConvoQuery.data);
+    } else if (routeConversation && endpointsQuery.data && modelsQuery.data) {
+      /* === VIVENTIUM START ===
+       * Feature: Exact-route persisted conversation settlement
+       * Purpose: Mark initialization complete only after applying the conversation selected by the route.
+       */
+      logger.log('conversation', 'ChatRoute initialConvoQuery', routeConversation);
       newConversation({
-        template: initialConvoQuery.data,
+        template: routeConversation,
         /* this is necessary to load all existing settings */
-        preset: initialConvoQuery.data as TPreset,
+        preset: routeConversation as TPreset,
         modelsData: modelsQuery.data,
         keepLatestMessage: true,
       });
       hasSetConversation.current = true;
+      /* === VIVENTIUM END === */
     } else if (
       conversationId &&
       endpointsQuery.data &&
@@ -166,23 +180,35 @@ export default function ChatRoute() {
       });
       hasSetConversation.current = true;
     } else if (
+      routeConversation &&
       assistantListMap[EModelEndpoint.assistants] &&
       assistantListMap[EModelEndpoint.azureAssistants]
     ) {
-      logger.log('conversation', 'ChatRoute convo, assistants effect', initialConvoQuery.data);
+      /* === VIVENTIUM START ===
+       * Feature: Exact-route persisted conversation settlement
+       * Purpose: Preserve assistant-map initialization only for a query result correlated to the route.
+       */
+      logger.log('conversation', 'ChatRoute convo, assistants effect', routeConversation);
       newConversation({
-        template: initialConvoQuery.data,
-        preset: initialConvoQuery.data as TPreset,
+        template: routeConversation,
+        preset: routeConversation as TPreset,
         modelsData: modelsQuery.data,
         keepLatestMessage: true,
       });
       hasSetConversation.current = true;
+      /* === VIVENTIUM END === */
     }
     /* Creates infinite render if all dependencies included due to newConversation invocations exceeding call stack before hasSetConversation.current becomes truthy */
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     roles,
     startupConfig,
+    /* === VIVENTIUM START ===
+     * Feature: Exact-route persisted conversation settlement
+     * Purpose: Re-evaluate query correlation whenever the selected route changes.
+     */
+    conversationId,
+    /* === VIVENTIUM END === */
     initialConvoQuery.data,
     initialConvoQuery.isError,
     endpointsQuery.data,
@@ -206,10 +232,14 @@ export default function ChatRoute() {
   if (conversation?.conversationId === Constants.SEARCH) {
     return null;
   }
-  // if conversationId not match
-  if (conversation?.conversationId !== conversationId && !conversation) {
+  /* === VIVENTIUM START ===
+   * Feature: Exact-route persisted conversation settlement
+   * Purpose: Never mount ChatView with a null or stale conversation from another route.
+   */
+  if (!conversation || conversation.conversationId !== conversationId) {
     return null;
   }
+  /* === VIVENTIUM END === */
   // if conversationId is null
   if (!conversationId) {
     return null;

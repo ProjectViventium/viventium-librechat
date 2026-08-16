@@ -1,4 +1,6 @@
+import IoRedis from 'ioredis';
 import type { Redis, Cluster } from 'ioredis';
+import type { RedisClientType, RedisClusterType } from '@redis/client';
 
 /**
  * Integration tests for GenerationJobManager.
@@ -13,23 +15,50 @@ describe('GenerationJobManager Integration Tests', () => {
   let ioredisClient: Redis | Cluster | null = null;
   const testPrefix = 'JobManager-Integration-Test';
 
+  const closeRedisClient = async (
+    client: Redis | Cluster | RedisClientType | RedisClusterType | null,
+  ): Promise<void> => {
+    if (!client) {
+      return;
+    }
+
+    try {
+      await client.quit();
+    } catch {
+      try {
+        if ('disconnect' in client) {
+          client.disconnect();
+        }
+      } catch {
+        // Ignore cleanup errors from an already-closed test client.
+      }
+    }
+  };
+
+  const resetStreamModules = async (): Promise<void> => {
+    const { GenerationJobManager } = await import('../GenerationJobManager');
+    await GenerationJobManager.destroy();
+    jest.resetModules();
+  };
+
   beforeAll(async () => {
     originalEnv = { ...process.env };
 
     // Set up test environment
-    process.env.USE_REDIS = process.env.USE_REDIS ?? 'true';
+    process.env.USE_REDIS = 'false';
     process.env.REDIS_URI = process.env.REDIS_URI ?? 'redis://127.0.0.1:6379';
     process.env.REDIS_KEY_PREFIX = testPrefix;
 
-    jest.resetModules();
-
-    const { ioredisClient: client } = await import('../../cache/redisClients');
-    ioredisClient = client;
+    await resetStreamModules();
+    ioredisClient = new IoRedis(process.env.REDIS_URI, {
+      keyPrefix: `${testPrefix}::`,
+      maxRetriesPerRequest: 3,
+    });
   });
 
   afterEach(async () => {
     // Clean up module state
-    jest.resetModules();
+    await resetStreamModules();
 
     // Clean up Redis keys (delete individually for cluster compatibility)
     if (ioredisClient) {
@@ -45,23 +74,505 @@ describe('GenerationJobManager Integration Tests', () => {
   });
 
   afterAll(async () => {
-    if (ioredisClient) {
-      try {
-        // Use quit() to gracefully close - waits for pending commands
-        await ioredisClient.quit();
-      } catch {
-        // Fall back to disconnect if quit fails
-        try {
-          ioredisClient.disconnect();
-        } catch {
-          // Ignore
-        }
-      }
-    }
+    await closeRedisClient(ioredisClient);
     process.env = originalEnv;
   });
 
   describe('In-Memory Mode', () => {
+    /* === VIVENTIUM START ===
+     * Feature: Owner-safe stream identity.
+     * Purpose: A caller-controlled key must never overwrite an existing generation job.
+     * === VIVENTIUM END === */
+    test('rejects a duplicate stream key without mutating the original owner job', async () => {
+      const { InMemoryJobStore } = await import('../implementations/InMemoryJobStore');
+      const store = new InMemoryJobStore({ ttlAfterComplete: 60000 });
+
+      await store.createJob('shared-stream-key', 'owner-a', 'conversation-a');
+
+      await expect(
+        store.createJob('shared-stream-key', 'owner-b', 'conversation-b'),
+      ).rejects.toMatchObject({ code: 'stream_id_conflict' });
+      await expect(store.getJob('shared-stream-key')).resolves.toMatchObject({
+        userId: 'owner-a',
+        conversationId: 'conversation-a',
+      });
+    });
+
+    test('serializes duplicate creation while an earlier create is queued', async () => {
+      const { InMemoryJobStore } = await import('../implementations/InMemoryJobStore');
+      const store = new InMemoryJobStore({ ttlAfterComplete: 60000, maxJobs: 1 });
+      let releaseQueue!: () => void;
+      const queued = new Promise<void>((resolve) => {
+        releaseQueue = resolve;
+      });
+      (store as unknown as { createJobTail: Promise<void> }).createJobTail = queued;
+
+      const attemptsPromise = Promise.allSettled([
+        store.createJob('shared-capacity-key', 'owner-a', 'conversation-a'),
+        store.createJob('shared-capacity-key', 'owner-b', 'conversation-b'),
+      ]);
+      releaseQueue();
+      const attempts = await attemptsPromise;
+
+      expect(attempts.filter(({ status }) => status === 'fulfilled')).toHaveLength(1);
+      const rejected = attempts.find(({ status }) => status === 'rejected');
+      expect(rejected).toMatchObject({
+        status: 'rejected',
+        reason: { code: 'stream_id_conflict' },
+      });
+      const created = attempts.find(({ status }) => status === 'fulfilled');
+      expect(await store.getJob('shared-capacity-key')).toMatchObject(
+        created?.status === 'fulfilled'
+          ? {
+              userId: created.value.userId,
+              conversationId: created.value.conversationId,
+            }
+          : {},
+      );
+      await expect(store.getJobCount()).resolves.toBe(1);
+    });
+
+    test('does not resurrect a queued job when destroy wins', async () => {
+      const { InMemoryJobStore } = await import('../implementations/InMemoryJobStore');
+      const store = new InMemoryJobStore({ ttlAfterComplete: 60000, maxJobs: 1 });
+      let releaseQueue!: () => void;
+      const queued = new Promise<void>((resolve) => {
+        releaseQueue = resolve;
+      });
+      (store as unknown as { createJobTail: Promise<void> }).createJobTail = queued;
+
+      const pendingCreate = store.createJob('must-not-resurrect', 'owner-a', 'conversation-a');
+      await store.destroy();
+      releaseQueue();
+
+      await expect(pendingCreate).rejects.toMatchObject({ code: 'stream_store_unavailable' });
+      await expect(store.getJob('must-not-resurrect')).resolves.toBeNull();
+      await expect(store.getJobCount()).resolves.toBe(0);
+    });
+
+    test('does not let a pre-destroy create enter a reinitialized store', async () => {
+      const { InMemoryJobStore } = await import('../implementations/InMemoryJobStore');
+      const store = new InMemoryJobStore({ ttlAfterComplete: 60000, maxJobs: 1 });
+      let releaseQueue!: () => void;
+      const queued = new Promise<void>((resolve) => {
+        releaseQueue = resolve;
+      });
+      (store as unknown as { createJobTail: Promise<void> }).createJobTail = queued;
+
+      const staleCreate = store.createJob('stale-before-reopen', 'old-owner', 'old-conversation');
+      await store.destroy();
+      await store.initialize();
+      releaseQueue();
+
+      await expect(staleCreate).rejects.toMatchObject({ code: 'stream_store_unavailable' });
+      await expect(store.getJob('stale-before-reopen')).resolves.toBeNull();
+      await store.createJob('fresh-after-reopen', 'new-owner', 'new-conversation');
+      await expect(store.getJob('fresh-after-reopen')).resolves.toMatchObject({
+        userId: 'new-owner',
+        conversationId: 'new-conversation',
+      });
+    });
+
+    test('reconfigure destroys only the captured old services after asynchronous store cleanup', async () => {
+      const { GenerationJobManagerClass } = await import('../GenerationJobManager');
+      const { InMemoryJobStore } = await import('../implementations/InMemoryJobStore');
+      const { InMemoryEventTransport } = await import('../implementations/InMemoryEventTransport');
+      const oldStore = new InMemoryJobStore({ ttlAfterComplete: 60000 });
+      const oldTransport = new InMemoryEventTransport();
+      const newStore = new InMemoryJobStore({ ttlAfterComplete: 60000 });
+      const newTransport = new InMemoryEventTransport();
+      let releaseOldStore!: () => void;
+      const oldStoreReleased = new Promise<void>((resolve) => {
+        releaseOldStore = resolve;
+      });
+      let markOldDestroyStarted!: () => void;
+      const oldDestroyStarted = new Promise<void>((resolve) => {
+        markOldDestroyStarted = resolve;
+      });
+      jest.spyOn(oldStore, 'destroy').mockImplementation(async () => {
+        markOldDestroyStarted();
+        await oldStoreReleased;
+      });
+      const oldTransportDestroy = jest.spyOn(oldTransport, 'destroy');
+      const newTransportDestroy = jest.spyOn(newTransport, 'destroy');
+      const manager = new GenerationJobManagerClass({
+        jobStore: oldStore,
+        eventTransport: oldTransport,
+      });
+      manager.initialize();
+
+      manager.configure({ jobStore: newStore, eventTransport: newTransport });
+      await oldDestroyStarted;
+      releaseOldStore();
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(manager.getJobStore()).toBe(newStore);
+      expect(oldTransportDestroy).toHaveBeenCalledTimes(1);
+      expect(newTransportDestroy).not.toHaveBeenCalled();
+      await manager.destroy();
+    });
+
+    /* === VIVENTIUM START ===
+     * Feature: Exact stream supersession.
+     * Purpose: Never publish a runnable job before its cross-replica abort listener is ready.
+     * === VIVENTIUM END === */
+    test('waits for abort-listener readiness before admitting a generation job', async () => {
+      const { GenerationJobManagerClass } = await import('../GenerationJobManager');
+      const { InMemoryJobStore } = await import('../implementations/InMemoryJobStore');
+      const { InMemoryEventTransport } = await import('../implementations/InMemoryEventTransport');
+      const store = new InMemoryJobStore({ ttlAfterComplete: 60000 });
+      let releaseAbortListener!: () => void;
+      const abortListenerReady = new Promise<void>((resolve) => {
+        releaseAbortListener = resolve;
+      });
+      const transport = Object.assign(new InMemoryEventTransport(), {
+        onAbort: jest.fn(() => abortListenerReady),
+      });
+      const createJob = jest.spyOn(store, 'createJob');
+      const manager = new GenerationJobManagerClass({ jobStore: store, eventTransport: transport });
+
+      const pending = manager.createJob('abort-ready-before-admission', 'owner-a');
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(createJob).not.toHaveBeenCalled();
+      releaseAbortListener();
+      await expect(pending).resolves.toMatchObject({
+        streamId: 'abort-ready-before-admission',
+        status: 'running',
+      });
+      expect(createJob).toHaveBeenCalledTimes(1);
+      await manager.destroy();
+    });
+
+    test('fails reconfiguration closed while an admission owns the current lifecycle', async () => {
+      const { GenerationJobManagerClass } = await import('../GenerationJobManager');
+      const { InMemoryJobStore } = await import('../implementations/InMemoryJobStore');
+      const { InMemoryEventTransport } = await import('../implementations/InMemoryEventTransport');
+      const oldStore = new InMemoryJobStore({ ttlAfterComplete: 60000 });
+      const oldTransport = new InMemoryEventTransport();
+      const newStore = new InMemoryJobStore({ ttlAfterComplete: 60000 });
+      const newTransport = new InMemoryEventTransport();
+      let releaseAdmission!: () => void;
+      const admissionGate = new Promise<void>((resolve) => {
+        releaseAdmission = resolve;
+      });
+      let admissionStarted!: () => void;
+      const started = new Promise<void>((resolve) => {
+        admissionStarted = resolve;
+      });
+      const createJob = oldStore.createJob.bind(oldStore);
+      jest.spyOn(oldStore, 'createJob').mockImplementation(async (...args) => {
+        admissionStarted();
+        await admissionGate;
+        return createJob(...args);
+      });
+      const oldTransportDestroy = jest.spyOn(oldTransport, 'destroy');
+      const newTransportDestroy = jest.spyOn(newTransport, 'destroy');
+      const manager = new GenerationJobManagerClass({
+        jobStore: oldStore,
+        eventTransport: oldTransport,
+      });
+
+      const pending = manager.createJob('owned-lifecycle-admission', 'owner-a');
+      await started;
+
+      expect(() => manager.configure({ jobStore: newStore, eventTransport: newTransport })).toThrow(
+        expect.objectContaining({ code: 'stream_store_unavailable' }),
+      );
+      expect(manager.getJobStore()).toBe(oldStore);
+      expect(oldTransportDestroy).not.toHaveBeenCalled();
+      expect(newTransportDestroy).not.toHaveBeenCalled();
+
+      releaseAdmission();
+      await expect(pending).resolves.toMatchObject({ streamId: 'owned-lifecycle-admission' });
+      await manager.destroy();
+    });
+
+    test('does not publish a pre-destroy admission into a reopened manager lifecycle', async () => {
+      const { GenerationJobManagerClass } = await import('../GenerationJobManager');
+      const { InMemoryJobStore } = await import('../implementations/InMemoryJobStore');
+      const { InMemoryEventTransport } = await import('../implementations/InMemoryEventTransport');
+      const oldStore = new InMemoryJobStore({ ttlAfterComplete: 60000 });
+      let releaseAdmission!: () => void;
+      const admissionGate = new Promise<void>((resolve) => {
+        releaseAdmission = resolve;
+      });
+      let admissionStarted!: () => void;
+      const started = new Promise<void>((resolve) => {
+        admissionStarted = resolve;
+      });
+      const createJob = oldStore.createJob.bind(oldStore);
+      jest.spyOn(oldStore, 'createJob').mockImplementation(async (...args) => {
+        admissionStarted();
+        await admissionGate;
+        return createJob(...args);
+      });
+      const manager = new GenerationJobManagerClass({
+        jobStore: oldStore,
+        eventTransport: new InMemoryEventTransport(),
+      });
+
+      const staleAdmission = manager.createJob('pre-destroy-admission', 'old-owner');
+      void staleAdmission.catch(() => {});
+      await started;
+      await manager.destroy();
+      releaseAdmission();
+      await expect(staleAdmission).rejects.toMatchObject({ code: 'stream_store_unavailable' });
+
+      const newStore = new InMemoryJobStore({ ttlAfterComplete: 60000 });
+      manager.configure({
+        jobStore: newStore,
+        eventTransport: new InMemoryEventTransport(),
+      });
+      await expect(manager.createJob('fresh-after-reopen', 'new-owner')).resolves.toMatchObject({
+        streamId: 'fresh-after-reopen',
+        status: 'running',
+      });
+      await expect(oldStore.getJob('pre-destroy-admission')).resolves.toBeNull();
+      await manager.destroy();
+    });
+
+    test('cancels a pending abort-listener handshake so destroy can reopen cleanly', async () => {
+      const { GenerationJobManagerClass } = await import('../GenerationJobManager');
+      const { InMemoryJobStore } = await import('../implementations/InMemoryJobStore');
+      const { InMemoryEventTransport } = await import('../implementations/InMemoryEventTransport');
+      let releaseOldListener!: () => void;
+      const oldListenerReady = new Promise<void>((resolve) => {
+        releaseOldListener = resolve;
+      });
+      let markOldListenerStarted!: () => void;
+      const oldListenerStarted = new Promise<void>((resolve) => {
+        markOldListenerStarted = resolve;
+      });
+      const oldTransport = Object.assign(new InMemoryEventTransport(), {
+        onAbort: jest.fn(() => {
+          markOldListenerStarted();
+          return oldListenerReady;
+        }),
+      });
+      const manager = new GenerationJobManagerClass({
+        jobStore: new InMemoryJobStore({ ttlAfterComplete: 60000 }),
+        eventTransport: oldTransport,
+      });
+
+      const staleAdmission = manager.createJob('partitioned-subscribe', 'old-owner');
+      void staleAdmission.catch(() => {});
+      await oldListenerStarted;
+      await manager.destroy();
+      const settlement = await Promise.race([
+        staleAdmission.then(
+          () => 'fulfilled',
+          (error: { code?: string }) => error.code ?? 'rejected',
+        ),
+        new Promise<string>((resolve) => setTimeout(() => resolve('timeout'), 50)),
+      ]);
+      expect(settlement).toBe('stream_store_unavailable');
+
+      const freshStore = new InMemoryJobStore({ ttlAfterComplete: 60000 });
+      manager.configure({
+        jobStore: freshStore,
+        eventTransport: new InMemoryEventTransport(),
+      });
+      const fresh = await manager.createJob('fresh-after-listener-partition', 'new-owner');
+      releaseOldListener();
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(fresh.status).toBe('running');
+      await expect(freshStore.getJob('fresh-after-listener-partition')).resolves.toMatchObject({
+        userId: 'new-owner',
+        status: 'running',
+      });
+      await expect(freshStore.getJob('partitioned-subscribe')).resolves.toBeNull();
+      await manager.destroy();
+    });
+
+    /* === VIVENTIUM START ===
+     * Feature: Stream-manager lifecycle fencing.
+     * Purpose: A lazy cross-replica read must not survive shutdown or mutate a reopened lifecycle.
+     */
+    test('cancels lazy cross-replica hydration without resurrecting runtime state after reopen', async () => {
+      const { GenerationJobManagerClass } = await import('../GenerationJobManager');
+      const { InMemoryJobStore } = await import('../implementations/InMemoryJobStore');
+      const { InMemoryEventTransport } = await import('../implementations/InMemoryEventTransport');
+      const streamId = 'lazy-hydration-across-lifecycle';
+      const oldStore = new InMemoryJobStore({ ttlAfterComplete: 60000 });
+      await oldStore.createJob(streamId, 'old-owner');
+      let releaseOldListener!: () => void;
+      const oldListenerReady = new Promise<void>((resolve) => {
+        releaseOldListener = resolve;
+      });
+      let markOldListenerStarted!: () => void;
+      const oldListenerStarted = new Promise<void>((resolve) => {
+        markOldListenerStarted = resolve;
+      });
+      let oldAbortCallback!: (reason?: string) => void;
+      const oldTransport = Object.assign(new InMemoryEventTransport(), {
+        onAbort: jest.fn((_streamId: string, callback: (reason?: string) => void) => {
+          oldAbortCallback = callback;
+          markOldListenerStarted();
+          return oldListenerReady;
+        }),
+      });
+      const manager = new GenerationJobManagerClass({
+        jobStore: oldStore,
+        eventTransport: oldTransport,
+      });
+
+      const staleRead = manager.getJob(streamId);
+      void staleRead.catch(() => {});
+      await oldListenerStarted;
+      await manager.destroy();
+
+      const staleSettlement = await Promise.race([
+        staleRead.then(
+          () => 'fulfilled',
+          (error: { code?: string }) => error.code ?? 'rejected',
+        ),
+        new Promise<string>((resolve) => setTimeout(() => resolve('timeout'), 50)),
+      ]);
+      expect(staleSettlement).toBe('stream_store_unavailable');
+
+      const freshStore = new InMemoryJobStore({ ttlAfterComplete: 60000 });
+      const freshTransport = new InMemoryEventTransport();
+      manager.configure({ jobStore: freshStore, eventTransport: freshTransport });
+      manager.initialize();
+      await freshStore.createJob(streamId, 'new-owner');
+
+      const freshJob = await manager.getJob(streamId);
+      expect(freshJob?.metadata.userId).toBe('new-owner');
+      const freshSubscription = await manager.subscribe(streamId, () => {});
+      expect(freshSubscription).not.toBeNull();
+
+      releaseOldListener();
+      await new Promise((resolve) => setImmediate(resolve));
+      oldAbortCallback('stale-old-lifecycle-abort');
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(freshJob?.abortController.signal.aborted).toBe(false);
+      await expect(manager.getJob(streamId)).resolves.toMatchObject({
+        metadata: { userId: 'new-owner' },
+      });
+      freshSubscription?.unsubscribe();
+      await manager.destroy();
+    });
+
+    test('holds concurrent lazy reads and subscriptions until Redis acknowledges hydration', async () => {
+      const { GenerationJobManagerClass } = await import('../GenerationJobManager');
+      const { InMemoryJobStore } = await import('../implementations/InMemoryJobStore');
+      const { RedisEventTransport } = await import('../implementations/RedisEventTransport');
+      const streamId = 'lazy-hydration-singleflight';
+      const store = new InMemoryJobStore({ ttlAfterComplete: 60000 });
+      await store.createJob(streamId, 'owner-a');
+      let releaseSubscription!: () => void;
+      const subscriptionReady = new Promise<void>((resolve) => {
+        releaseSubscription = resolve;
+      });
+      let markSubscriptionRequested!: () => void;
+      const subscriptionRequested = new Promise<void>((resolve) => {
+        markSubscriptionRequested = resolve;
+      });
+      const subscriber = {
+        on: jest.fn(),
+        subscribe: jest.fn(() => {
+          markSubscriptionRequested();
+          return subscriptionReady;
+        }),
+        unsubscribe: jest.fn().mockResolvedValue(undefined),
+      };
+      const transport = new RedisEventTransport(
+        { publish: jest.fn().mockResolvedValue(1) } as never,
+        subscriber as never,
+      );
+      const manager = new GenerationJobManagerClass({ jobStore: store, eventTransport: transport });
+
+      const firstRead = manager.getJob(streamId);
+      await subscriptionRequested;
+      const secondRead = manager.getJob(streamId);
+      const sseSubscription = manager.subscribe(streamId, () => {});
+      const [secondReadBeforeAck, sseSubscriptionBeforeAck] = await Promise.all([
+        Promise.race([
+          secondRead.then(() => 'fulfilled'),
+          new Promise<string>((resolve) => setTimeout(() => resolve('pending'), 25)),
+        ]),
+        Promise.race([
+          sseSubscription.then(() => 'fulfilled'),
+          new Promise<string>((resolve) => setTimeout(() => resolve('pending'), 25)),
+        ]),
+      ]);
+
+      expect(secondReadBeforeAck).toBe('pending');
+      expect(sseSubscriptionBeforeAck).toBe('pending');
+
+      releaseSubscription();
+      const [firstJob, secondJob, subscription] = await Promise.all([
+        firstRead,
+        secondRead,
+        sseSubscription,
+      ]);
+      expect(firstJob?.streamId).toBe(streamId);
+      expect(secondJob?.streamId).toBe(streamId);
+      expect(subscription).not.toBeNull();
+      expect(subscriber.subscribe).toHaveBeenCalledTimes(1);
+
+      subscription?.unsubscribe();
+      await manager.destroy();
+    });
+
+    test('does not let a stale abort mutate a fresh same-id job after reopen', async () => {
+      const { GenerationJobManagerClass } = await import('../GenerationJobManager');
+      const { InMemoryJobStore } = await import('../implementations/InMemoryJobStore');
+      const { InMemoryEventTransport } = await import('../implementations/InMemoryEventTransport');
+      const streamId = 'abort-across-lifecycle';
+      const oldStore = new InMemoryJobStore({ ttlAfterComplete: 60000 });
+      await oldStore.createJob(streamId, 'old-owner');
+      const oldJob = await oldStore.getJob(streamId);
+      let releaseOldRead!: () => void;
+      const oldReadReleased = new Promise<void>((resolve) => {
+        releaseOldRead = resolve;
+      });
+      let markOldReadStarted!: () => void;
+      const oldReadStarted = new Promise<void>((resolve) => {
+        markOldReadStarted = resolve;
+      });
+      jest.spyOn(oldStore, 'getJob').mockImplementation(async (requestedStreamId) => {
+        if (requestedStreamId === streamId) {
+          markOldReadStarted();
+          await oldReadReleased;
+          return oldJob;
+        }
+        return null;
+      });
+      const manager = new GenerationJobManagerClass({
+        jobStore: oldStore,
+        eventTransport: new InMemoryEventTransport(),
+      });
+
+      const staleAbort = manager.abortJob(streamId);
+      void staleAbort.catch(() => {});
+      await oldReadStarted;
+      await manager.destroy();
+
+      const freshStore = new InMemoryJobStore({ ttlAfterComplete: 60000 });
+      manager.configure({
+        jobStore: freshStore,
+        eventTransport: new InMemoryEventTransport(),
+      });
+      manager.initialize();
+      const freshJob = await manager.createJob(streamId, 'new-owner');
+
+      releaseOldRead();
+      await expect(staleAbort).rejects.toMatchObject({ code: 'stream_store_unavailable' });
+      expect(freshJob.abortController.signal.aborted).toBe(false);
+      await expect(freshStore.getJob(streamId)).resolves.toMatchObject({
+        userId: 'new-owner',
+        status: 'running',
+      });
+
+      await manager.destroy();
+    });
+    /* === VIVENTIUM END === */
+
     test('should create and manage jobs', async () => {
       const { GenerationJobManager } = await import('../GenerationJobManager');
       const { InMemoryJobStore } = await import('../implementations/InMemoryJobStore');
@@ -156,9 +667,73 @@ describe('GenerationJobManager Integration Tests', () => {
       unsubscribe();
       await GenerationJobManager.destroy();
     });
+
+    test('marks Main complete for discovery while retaining the Phase B runtime', async () => {
+      const { GenerationJobManager } = await import('../GenerationJobManager');
+      const { InMemoryJobStore } = await import('../implementations/InMemoryJobStore');
+      const { InMemoryEventTransport } = await import('../implementations/InMemoryEventTransport');
+
+      GenerationJobManager.configure({
+        jobStore: new InMemoryJobStore({ ttlAfterComplete: 60000 }),
+        eventTransport: new InMemoryEventTransport(),
+        isRedis: false,
+        cleanupOnComplete: true,
+      });
+      await GenerationJobManager.initialize();
+
+      const streamId = `inmem-main-complete-${Date.now()}`;
+      const userId = 'phase-b-user';
+      await GenerationJobManager.createJob(streamId, userId);
+
+      const finalEvent = {
+        final: true,
+        conversation: { conversationId: streamId },
+      } as never;
+
+      await expect(
+        GenerationJobManager.markMainResponseComplete(streamId, finalEvent),
+      ).resolves.toBe(true);
+      await expect(GenerationJobManager.getActiveJobIdsForUser(userId)).resolves.toEqual([]);
+      const completedMain = await GenerationJobManager.getJob(streamId);
+      expect(completedMain?.status).toBe('complete');
+      const storedFinalEvent =
+        typeof completedMain?.finalEvent === 'string'
+          ? JSON.parse(completedMain.finalEvent)
+          : completedMain?.finalEvent;
+      expect(storedFinalEvent).toEqual(finalEvent);
+      expect(GenerationJobManager.getRuntimeStats().runtimeStateCount).toBe(1);
+
+      await GenerationJobManager.completeJob(streamId);
+      await expect(GenerationJobManager.getJob(streamId)).resolves.toBeUndefined();
+      await GenerationJobManager.destroy();
+    });
   });
 
   describe('Redis Mode', () => {
+    /* === VIVENTIUM START ===
+     * Feature: Owner-safe stream identity.
+     * Purpose: Prove the distributed store provides the same create-once owner fence.
+     * === VIVENTIUM END === */
+    test('atomically rejects a duplicate Redis stream key and preserves its first owner', async () => {
+      if (!ioredisClient) {
+        console.warn('Redis not available, skipping test');
+        return;
+      }
+      const { RedisJobStore } = await import('../implementations/RedisJobStore');
+      const store = new RedisJobStore(ioredisClient);
+      const streamId = `redis-owner-fence-${Date.now()}`;
+
+      await store.createJob(streamId, 'owner-a', 'conversation-a');
+
+      await expect(store.createJob(streamId, 'owner-b', 'conversation-b')).rejects.toMatchObject({
+        code: 'stream_id_conflict',
+      });
+      await expect(store.getJob(streamId)).resolves.toMatchObject({
+        userId: 'owner-a',
+        conversationId: 'conversation-a',
+      });
+    });
+
     test('should create and manage jobs via Redis', async () => {
       if (!ioredisClient) {
         console.warn('Redis not available, skipping test');
@@ -312,7 +887,7 @@ describe('GenerationJobManager Integration Tests', () => {
       // regardless of backend mode
 
       const runTestWithMode = async (isRedis: boolean) => {
-        jest.resetModules();
+        await resetStreamModules();
 
         const { GenerationJobManager } = await import('../GenerationJobManager');
 
@@ -327,9 +902,8 @@ describe('GenerationJobManager Integration Tests', () => {
           });
         } else {
           const { InMemoryJobStore } = await import('../implementations/InMemoryJobStore');
-          const { InMemoryEventTransport } = await import(
-            '../implementations/InMemoryEventTransport'
-          );
+          const { InMemoryEventTransport } =
+            await import('../implementations/InMemoryEventTransport');
           GenerationJobManager.configure({
             jobStore: new InMemoryJobStore({ ttlAfterComplete: 60000 }),
             eventTransport: new InMemoryEventTransport(),
@@ -411,7 +985,7 @@ describe('GenerationJobManager Integration Tests', () => {
 
       // === REPLICA B: Receives the stream request ===
       // Fresh GenerationJobManager that does NOT have this job in its local runtimeState
-      jest.resetModules();
+      await resetStreamModules();
       const { GenerationJobManager } = await import('../GenerationJobManager');
       const { createStreamServices } = await import('../createStreamServices');
 
@@ -479,7 +1053,7 @@ describe('GenerationJobManager Integration Tests', () => {
       await jobStore.createJob(streamId, userId);
 
       // Instance 2: Fresh GenerationJobManager that doesn't have this job in memory
-      jest.resetModules();
+      await resetStreamModules();
       const { GenerationJobManager } = await import('../GenerationJobManager');
 
       const services = createStreamServices({
@@ -660,7 +1234,7 @@ describe('GenerationJobManager Integration Tests', () => {
       await replicaAJobStore.createJob(streamId, 'user-1');
 
       // === Replica B: Fresh manager that lazily initializes the job ===
-      jest.resetModules();
+      await resetStreamModules();
       const { GenerationJobManager } = await import('../GenerationJobManager');
 
       const services = createStreamServices({
@@ -776,7 +1350,7 @@ describe('GenerationJobManager Integration Tests', () => {
       await jobStore.updateJob(streamId, { syncSent: true });
 
       // Fresh manager that doesn't have this job locally
-      jest.resetModules();
+      await resetStreamModules();
       const { GenerationJobManager } = await import('../GenerationJobManager');
 
       const services = createStreamServices({
@@ -812,7 +1386,7 @@ describe('GenerationJobManager Integration Tests', () => {
         return;
       }
 
-      jest.resetModules();
+      await resetStreamModules();
       const { GenerationJobManager } = await import('../GenerationJobManager');
       const { createStreamServices } = await import('../createStreamServices');
 
@@ -864,7 +1438,7 @@ describe('GenerationJobManager Integration Tests', () => {
         return;
       }
 
-      jest.resetModules();
+      await resetStreamModules();
       const { GenerationJobManager } = await import('../GenerationJobManager');
       const { createStreamServices } = await import('../createStreamServices');
 
@@ -925,7 +1499,7 @@ describe('GenerationJobManager Integration Tests', () => {
         return;
       }
 
-      jest.resetModules();
+      await resetStreamModules();
       const { GenerationJobManager } = await import('../GenerationJobManager');
       const { createStreamServices } = await import('../createStreamServices');
 
@@ -990,7 +1564,7 @@ describe('GenerationJobManager Integration Tests', () => {
         return;
       }
 
-      jest.resetModules();
+      await resetStreamModules();
       const { GenerationJobManager } = await import('../GenerationJobManager');
       const { createStreamServices } = await import('../createStreamServices');
 
@@ -1255,7 +1829,7 @@ describe('GenerationJobManager Integration Tests', () => {
       });
 
       // === Replica B: Fresh manager receives client connection ===
-      jest.resetModules();
+      await resetStreamModules();
       const { GenerationJobManager } = await import('../GenerationJobManager');
 
       const services = createStreamServices({
@@ -1342,18 +1916,24 @@ describe('GenerationJobManager Integration Tests', () => {
 
       // Force USE_REDIS to true
       process.env.USE_REDIS = 'true';
-      jest.resetModules();
+      await resetStreamModules();
 
       const { createStreamServices } = await import('../createStreamServices');
       const services = createStreamServices();
 
       // Should detect Redis
       expect(services.isRedis).toBe(true);
+      services.eventTransport.destroy();
+
+      const { ioredisClient: autoIoRedisClient, keyvRedisClient: autoKeyvRedisClient } =
+        await import('../../cache/redisClients');
+      await closeRedisClient(autoIoRedisClient);
+      await closeRedisClient(autoKeyvRedisClient);
     });
 
     test('should fall back to in-memory when USE_REDIS is false', async () => {
       process.env.USE_REDIS = 'false';
-      jest.resetModules();
+      await resetStreamModules();
 
       const { createStreamServices } = await import('../createStreamServices');
       const services = createStreamServices();

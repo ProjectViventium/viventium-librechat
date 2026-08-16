@@ -622,7 +622,18 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
   const isImage = file.mimetype.startsWith('image');
   let fileInfoMetadata;
   const entity_id = messageAttachment === true ? undefined : agent_id;
-  const basePath = mime.getType(file.originalname)?.startsWith('image') ? 'images' : 'uploads';
+  /* === VIVENTIUM START ===
+   * Feature: Durable bridge-image handoff.
+   * Purpose: Telegram injects images directly into Main's vision message, but background workers
+   * need an owner-scoped durable source. Store that trusted bridge copy under uploads so GlassHive
+   * can resolve it through the existing signed bootstrap-source contract.
+   * === VIVENTIUM END === */
+  const durableBridgeImage = isImage && req._viventiumBridgeDurableMissionAttachment === true;
+  const basePath = durableBridgeImage
+    ? 'uploads'
+    : mime.getType(file.originalname)?.startsWith('image')
+      ? 'images'
+      : 'uploads';
   const fileConfig = mergeFileConfig(appConfig.fileConfig);
   const supportsOCRExtraction = fileConfig.checkType(
     file.mimetype,
@@ -946,7 +957,7 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
     });
   }
 
-  if (isImage) {
+  if (isImage && !durableBridgeImage) {
     const result = await processImageFile({
       req,
       file,

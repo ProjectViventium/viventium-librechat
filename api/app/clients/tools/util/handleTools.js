@@ -60,11 +60,20 @@ const { createMCPTool, createMCPTools } = require('~/server/services/MCP');
 const { loadAuthValues } = require('~/server/services/Tools/credentials');
 const { getMCPServerTools } = require('~/server/services/Config');
 const { getRoleByName } = require('~/models/Role');
+const { canUseViventiumMCPServer } = require('~/server/services/viventium/mcpAudiencePolicy');
 /* === VIVENTIUM START ===
  * Feature: Surface-aware prompt helpers (shared across tools + agents)
  */
 const { resolveViventiumSurface } = require('~/server/services/viventium/surfacePrompts');
 const { createViventiumSearchTool } = require('./viventiumSearchTool');
+const { createActiveWorkTools } = require('./activeWorkTools');
+const {
+  availableGlassHiveMainOrchestrationTools,
+  createGlassHiveMainDelegationTool,
+} = require('./glassHiveOrchestrationTools');
+const {
+  DELEGATION_TOOL_NAME,
+} = require('~/server/services/viventium/GlassHiveConversationOrchestration');
 /* === VIVENTIUM END === */
 
 /**
@@ -239,6 +248,10 @@ const loadTools = async ({
   };
 
   const customConstructors = {
+    [Tools.active_work_list]: async () =>
+      createActiveWorkTools({ userId: user, req: options.req }).list,
+    [Tools.active_work_action]: async () =>
+      createActiveWorkTools({ userId: user, req: options.req }).action,
     image_gen_oai: async (toolContextMap) => {
       const authFields = getAuthFields('image_gen_oai');
       const authValues = await loadAuthValues({ userId: user, authFields });
@@ -285,6 +298,9 @@ const loadTools = async ({
   };
 
   const requestedTools = {};
+  const availableMainOrchestrationTools = new Set(
+    availableGlassHiveMainOrchestrationTools(agent, tools, { user: options.req?.user }),
+  );
 
   if (functions === true) {
     toolConstructors.dalle = DALLE3;
@@ -312,6 +328,13 @@ const loadTools = async ({
   const requestedMCPTools = {};
 
   for (const tool of tools) {
+    if (
+      (tool === Tools.active_work_list || tool === Tools.active_work_action) &&
+      !availableMainOrchestrationTools.has(tool)
+    ) {
+      logger.warn('[handleTools] GlassHive Main work-control facade is unavailable.');
+      continue;
+    }
     if (tool === Tools.execute_code) {
       requestedTools[tool] = async () => {
         const authValues = await loadAuthValues({
@@ -405,6 +428,20 @@ const loadTools = async ({
         });
       };
       continue;
+    } else if (tool === DELEGATION_TOOL_NAME) {
+      /* === VIVENTIUM START ===
+       * Security: Universal Core-owned Main facade.
+       * Purpose: Never expose the raw peer-spawn MCP schema or execution path to an Agent.
+       * Only a server-declared conversation orchestrator with locally ready isolation receives
+       * the Core facade; every other Agent fails closed instead of falling through to MCP.
+       * === VIVENTIUM END === */
+      if (availableMainOrchestrationTools.has(tool)) {
+        requestedTools[tool] = async () =>
+          createGlassHiveMainDelegationTool({ userId: user, req: options.req });
+      } else {
+        logger.warn('[handleTools] GlassHive Main delegation facade is unavailable.');
+      }
+      continue;
     } else if (tool && mcpToolPattern.test(tool)) {
       const [toolName, serverName] = tool.split(Constants.mcp_delimiter);
       if (toolName === Constants.mcp_server) {
@@ -420,6 +457,19 @@ const loadTools = async ({
         );
         continue;
       }
+      /* === VIVENTIUM START ===
+       * Security: Fail closed before discovery or process startup for request-ineligible servers.
+       */
+      if (
+        !canUseViventiumMCPServer({
+          serverConfig,
+          reqUser: options.req?.user,
+        })
+      ) {
+        logger.warn('[handleTools] MCP server access denied by request audience policy.');
+        continue;
+      }
+      /* === VIVENTIUM END === */
       if (toolName === Constants.mcp_all) {
         requestedMCPTools[serverName] = [
           {
@@ -555,4 +605,5 @@ module.exports = {
   loadToolWithAuth,
   validateTools,
   loadTools,
+  canUseViventiumMCPServer,
 };

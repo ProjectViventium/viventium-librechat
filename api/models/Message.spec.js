@@ -16,6 +16,7 @@ jest.mock('~/server/services/viventium/conversationRecallService', () => {
 const {
   saveMessage,
   getMessages,
+  getMessageAncestorBranch,
   getLatestRecallEligibleMessageCreatedAt,
   updateMessage,
   deleteMessages,
@@ -23,6 +24,7 @@ const {
   updateMessageText,
   deleteMessagesSince,
   recordMessage,
+  __testables: { buildMessageAncestorBranchPipeline },
 } = require('./Message');
 
 jest.mock('~/server/services/Config/app');
@@ -308,6 +310,71 @@ describe('Message Operations', () => {
       expect(messages).toHaveLength(2);
       expect(messages[0].text).toBe('First message');
       expect(messages[1].text).toBe('Second message');
+    });
+  });
+
+  /* === VIVENTIUM START ===
+   * Feature: Bounded GlassHive conversation-context projection.
+   * Purpose: Prove delegation preparation follows one indexed ancestor branch instead of loading
+   * and sorting an entire large conversation in application memory.
+   * === VIVENTIUM END === */
+  describe('getMessageAncestorBranch', () => {
+    it('uses one bounded graph query and ignores a large unrelated branch', async () => {
+      const conversationId = uuidv4();
+      const branch = Array.from({ length: 48 }, (_, index) => ({
+        user: 'user123',
+        conversationId,
+        messageId: `relevant-${index}`,
+        parentMessageId: index > 0 ? `relevant-${index - 1}` : 'root',
+        text: `Relevant ${index}`,
+        isCreatedByUser: index % 2 === 0,
+      }));
+      const unrelated = Array.from({ length: 2000 }, (_, index) => ({
+        user: 'user123',
+        conversationId,
+        messageId: `unrelated-${index}`,
+        parentMessageId: 'root',
+        text: `Unrelated ${index}`,
+        isCreatedByUser: index % 2 === 0,
+      }));
+      await Message.insertMany([...branch, ...unrelated]);
+
+      const startedAt = performance.now();
+      const messages = await getMessageAncestorBranch({
+        user: 'user123',
+        conversationId,
+        messageId: 'relevant-47',
+        maxAncestors: 32,
+      });
+      const elapsedMs = performance.now() - startedAt;
+      const pipeline = buildMessageAncestorBranchPipeline({
+        user: 'user123',
+        conversationId,
+        messageId: 'relevant-47',
+        maxAncestors: 32,
+      });
+
+      expect(pipeline[0]).toEqual({
+        $match: { user: 'user123', conversationId, messageId: 'relevant-47' },
+      });
+      expect(pipeline).not.toEqual(
+        expect.arrayContaining([expect.objectContaining({ $sort: expect.anything() })]),
+      );
+      expect(pipeline.find((stage) => stage.$graphLookup)?.$graphLookup).toEqual(
+        expect.objectContaining({
+          from: Message.collection.name,
+          connectFromField: 'parentMessageId',
+          connectToField: 'messageId',
+          maxDepth: 31,
+          restrictSearchWithMatch: { user: 'user123', conversationId },
+        }),
+      );
+      expect(messages).toHaveLength(33);
+      expect(messages.map((message) => message.messageId)).toEqual(
+        Array.from({ length: 33 }, (_, index) => `relevant-${47 - index}`),
+      );
+      expect(messages.some((message) => message.messageId.startsWith('unrelated-'))).toBe(false);
+      expect(elapsedMs).toBeLessThan(1000);
     });
   });
 

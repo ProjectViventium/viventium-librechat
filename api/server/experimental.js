@@ -30,6 +30,17 @@ const initializeMCPs = require('./services/initializeMCPs');
 const configureSocialLogins = require('./socialLogins');
 const { getAppConfig } = require('./services/Config');
 const { recoverStaleCortexMessages } = require('./services/viventium/staleCortexMessageRecovery');
+/* === VIVENTIUM START ===
+ * Feature: Durable Parallel Work recovery.
+ * Purpose: Resume mission adjudication and lost-launch reconciliation after API restart.
+ */
+const {
+  reconcilePendingGlassHiveMissionAdjudications,
+} = require('./services/viventium/GlassHiveMissionAdjudicationService');
+const {
+  startGlassHiveLaunchReconciliation,
+} = require('./services/viventium/GlassHiveLaunchReconciliationService');
+/* === VIVENTIUM END === */
 const staticCache = require('./utils/staticCache');
 const noIndex = require('./middleware/noIndex');
 const { seedDatabase } = require('~/models');
@@ -368,6 +379,15 @@ if (cluster.isMaster) {
       recoverStaleCortexMessages().catch((error) => {
         logger.error('[staleCortexMessageRecovery] Startup recovery failed:', error);
       });
+      /* === VIVENTIUM START ===
+       * Feature: Durable Parallel Work recovery.
+       * Purpose: Startup repairs accepted launches and pending neutral completion adjudication.
+       */
+      reconcilePendingGlassHiveMissionAdjudications().catch((error) => {
+        logger.error('[glasshiveMissionAdjudication] Startup recovery failed:', error);
+      });
+      startGlassHiveLaunchReconciliation();
+      /* === VIVENTIUM END === */
     });
 
     /** Handle inter-process messages from master */

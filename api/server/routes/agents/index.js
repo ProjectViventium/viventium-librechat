@@ -19,6 +19,15 @@ const { LIMIT_MESSAGE_IP, LIMIT_MESSAGE_USER } = process.env ?? {};
 
 const router = express.Router();
 
+/* === VIVENTIUM START ===
+ * Feature: Parallel Work owner isolation.
+ * Purpose: Generation jobs are account-scoped authority. Missing legacy owner metadata is not a
+ *          compatibility grant: every read/control boundary must prove the authenticated owner.
+ */
+const jobBelongsToUser = (job, userId) =>
+  Boolean(userId && job?.metadata?.userId && job.metadata.userId === userId);
+/* === VIVENTIUM END === */
+
 /**
  * Open Responses API routes (API key authentication handled in route file)
  * Mounted at /agents/v1/responses (full path: /api/agents/v1/responses)
@@ -63,9 +72,17 @@ router.get('/chat/stream/:streamId', async (req, res) => {
     });
   }
 
-  if (job.metadata?.userId && job.metadata.userId !== req.user.id) {
-    return res.status(403).json({ error: 'Unauthorized' });
+  /* === VIVENTIUM START ===
+   * Feature: Parallel Work owner isolation.
+   * Purpose: Fail closed for corrupt/legacy jobs with no durable owner as well as mismatches.
+   */
+  if (!jobBelongsToUser(job, req.user.id)) {
+    return res.status(404).json({
+      error: 'Stream not found',
+      message: 'The generation job does not exist or has expired.',
+    });
   }
+  /* === VIVENTIUM END === */
 
   res.setHeader('Content-Encoding', 'identity');
   res.setHeader('Content-Type', 'text/event-stream');
@@ -140,7 +157,9 @@ router.get('/chat/stream/:streamId', async (req, res) => {
  * @returns { activeJobIds: string[] }
  */
 router.get('/chat/active', async (req, res) => {
-  const activeJobIds = await GenerationJobManager.getActiveJobIdsForUser(req.user.id);
+  const activeJobIds = GenerationJobManager.getActiveConversationIdsForUser
+    ? await GenerationJobManager.getActiveConversationIdsForUser(req.user.id)
+    : await GenerationJobManager.getActiveJobIdsForUser(req.user.id);
   res.json({ activeJobIds });
 });
 
@@ -153,25 +172,32 @@ router.get('/chat/active', async (req, res) => {
 router.get('/chat/status/:conversationId', async (req, res) => {
   const { conversationId } = req.params;
 
-  // streamId === conversationId, so we can use getJob directly
-  const job = await GenerationJobManager.getJob(conversationId);
+  const activeStreamId = GenerationJobManager.getActiveStreamIdForConversation
+    ? await GenerationJobManager.getActiveStreamIdForConversation(req.user.id, conversationId)
+    : conversationId;
+  const job = activeStreamId ? await GenerationJobManager.getJob(activeStreamId) : null;
 
   if (!job) {
     return res.json({ active: false });
   }
 
-  if (job.metadata.userId !== req.user.id) {
-    return res.status(403).json({ error: 'Unauthorized' });
+  /* === VIVENTIUM START ===
+   * Feature: Parallel Work owner isolation.
+   * Purpose: Status is stream data and requires the same exact owner proof as subscription.
+   */
+  if (!jobBelongsToUser(job, req.user.id)) {
+    return res.json({ active: false });
   }
+  /* === VIVENTIUM END === */
 
   // Get resume state which contains aggregatedContent
   // Avoid calling both getStreamInfo and getResumeState (both fetch content)
-  const resumeState = await GenerationJobManager.getResumeState(conversationId);
+  const resumeState = await GenerationJobManager.getResumeState(activeStreamId);
   const isActive = job.status === 'running';
 
   res.json({
     active: isActive,
-    streamId: conversationId,
+    streamId: activeStreamId,
     status: job.status,
     aggregatedContent: resumeState?.aggregatedContent ?? [],
     createdAt: job.createdAt,
@@ -199,15 +225,40 @@ router.post('/chat/abort', async (req, res) => {
     streamId || (conversationId !== 'new' ? conversationId : null) || abortKey?.split(':')[0];
   let job = jobStreamId ? await GenerationJobManager.getJob(jobStreamId) : null;
 
+  if (!job && conversationId && conversationId !== 'new' && userId) {
+    const activeConversationStreamId =
+      await GenerationJobManager.getActiveStreamIdForConversation?.(userId, conversationId);
+    if (activeConversationStreamId) {
+      jobStreamId = activeConversationStreamId;
+    }
+    job = jobStreamId ? await GenerationJobManager.getJob(jobStreamId) : null;
+  }
+
   // Fallback: if job not found and we have a userId, look up active jobs for user
   // This handles the case where frontend sends "new" but job was created with a UUID
   if (!job && userId) {
     logger.debug(`[AgentStream] Job not found by ID, checking active jobs for user: ${userId}`);
     const activeJobIds = await GenerationJobManager.getActiveJobIdsForUser(userId);
     if (activeJobIds.length > 0) {
-      // Abort the most recent active job for this user
-      jobStreamId = activeJobIds[0];
-      job = await GenerationJobManager.getJob(jobStreamId);
+      /* === VIVENTIUM START ===
+       * Feature: Exact Stop rollover.
+       * Purpose: Store iteration order is not recency; select the newest owned running job.
+       * === VIVENTIUM END === */
+      const activeJobs = (
+        await Promise.all(
+          activeJobIds.map(async (candidateStreamId) => ({
+            streamId: candidateStreamId,
+            job: await GenerationJobManager.getJob(candidateStreamId),
+          })),
+        )
+      )
+        .filter(
+          ({ job: candidate }) =>
+            candidate?.status === 'running' && jobBelongsToUser(candidate, userId),
+        )
+        .sort((left, right) => Number(right.job.createdAt || 0) - Number(left.job.createdAt || 0));
+      jobStreamId = activeJobs[0]?.streamId;
+      job = activeJobs[0]?.job || null;
       logger.debug(`[AgentStream] Found active job for user: ${jobStreamId}`);
     }
   }
@@ -215,9 +266,26 @@ router.post('/chat/abort', async (req, res) => {
   logger.debug(`[AgentStream] Computed jobStreamId: ${jobStreamId}`);
 
   if (job && jobStreamId) {
-    if (job.metadata?.userId && job.metadata.userId !== userId) {
-      logger.warn(`[AgentStream] Unauthorized abort attempt for ${jobStreamId} by user ${userId}`);
-      return res.status(403).json({ error: 'Unauthorized' });
+    /* === VIVENTIUM START ===
+     * Feature: Parallel Work owner isolation.
+     * Purpose: A missing owner is unauthorized; never let a guessed legacy key control compute.
+     */
+    if (!jobBelongsToUser(job, userId)) {
+      logger.warn(`[AgentStream] Abort target unavailable for authenticated owner`);
+      return res.status(404).json({ error: 'Job not found', streamId: jobStreamId });
+    }
+    /* === VIVENTIUM END === */
+
+    /* === VIVENTIUM START ===
+     * A completed Main response may retain a short-lived runtime solely for Phase B delivery.
+     * It is not an active generation and must never be abortable, because an abort persists the
+     * volatile stream buffer over the already-final assistant message.
+     * === VIVENTIUM END === */
+    if (job.status && job.status !== 'running') {
+      return res.status(409).json({
+        error: 'Generation is already complete',
+        streamId: jobStreamId,
+      });
     }
 
     logger.debug(`[AgentStream] Job found, aborting: ${jobStreamId}`);

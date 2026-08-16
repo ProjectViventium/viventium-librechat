@@ -11,6 +11,15 @@ export type {
   AbortResult,
   JobStatus,
   IJobStore,
+  // VIVENTIUM START: export durable interaction and delivery contracts.
+  InteractionContext,
+  AdapterCapabilities,
+  InteractionAdapterCapabilities,
+  InteractionDeliveryPolicy,
+  InteractionDeliveryAck,
+  DeliveryAcknowledgementResult,
+  DeliveryAcknowledgementState,
+  // VIVENTIUM END
 } from './interfaces/IJobStore';
 
 export { createStreamServices } from './createStreamServices';

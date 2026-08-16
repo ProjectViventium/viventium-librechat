@@ -121,11 +121,15 @@ const ALLOWED_BODY_FIELDS = [
   'viventiumSurface',
   'viventiumInputMode',
   'viventiumStreamId',
+  'viventiumGlassHiveIdempotencyKey',
+  'viventiumGlassHiveTurnContextB64',
   'viventiumVoiceRequestId',
   'viventiumVoiceCallSessionId',
   'viventiumTelegramChatId',
   'viventiumTelegramUserId',
   'viventiumTelegramMessageId',
+  'viventiumLogicalTurnId',
+  'viventiumLogicalTurnRevision',
   'files',
   'attachments',
   'tool_resources',
@@ -153,6 +157,7 @@ function compactUploadEntryForHeader(value: unknown): unknown {
     'bytes',
     'width',
     'height',
+    'media_group_index',
     'metadata',
   ]) {
     if (entry[key] != null) {

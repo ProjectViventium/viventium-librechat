@@ -71,6 +71,12 @@ const {
   createMCPTool,
   createMCPTools,
   getMCPSetupData,
+  /* === VIVENTIUM START ===
+   * Feature: Request-scoped MCP authority.
+   * Purpose: Exercise the config resolver used by Viventium audience policy.
+   */
+  resolveConfigServers,
+  /* === VIVENTIUM END === */
   checkOAuthFlowStatus,
   getServerConnectionStatus,
 } = require('./MCP');
@@ -126,6 +132,20 @@ jest.mock('./GraphTokenService', () => ({
   getGraphApiToken: jest.fn(),
 }));
 
+/* === VIVENTIUM START ===
+ * Feature: Parallel Work MCP handoff.
+ * Purpose: Isolate capability projection and durable launch reconciliation in upstream MCP tests.
+ */
+jest.mock('~/server/services/viventium/GlassHiveCapabilityBootstrapService', () => ({
+  maybeInjectGlassHiveCapabilityBroker: jest.fn(async ({ toolArguments }) => toolArguments),
+}));
+
+jest.mock('~/server/services/viventium/GlassHiveCallbackBindingService', () => ({
+  markGlassHiveLaunchDispatchUnknown: jest.fn(),
+  reconcileGlassHiveLaunchResult: jest.fn(),
+}));
+/* === VIVENTIUM END === */
+
 describe('tests for the new helper functions used by the MCP connection status endpoints', () => {
   let mockGetMCPManager;
   let mockGetFlowStateManager;
@@ -140,6 +160,29 @@ describe('tests for the new helper functions used by the MCP connection status e
     mockGetLogStores = require('~/cache').getLogStores;
     mockGetOAuthReconnectionManager = require('~/config').getOAuthReconnectionManager;
   });
+
+  /* === VIVENTIUM START ===
+   * Feature: Request-scoped MCP authority.
+   * Purpose: Preserve per-request audience metadata when the registry fallback is used.
+   */
+  describe('resolveConfigServers', () => {
+    it('falls back to the registry bulk API while preserving request-scoped config metadata', async () => {
+      const configServers = {
+        private_source: { viventiumAccess: { audience: 'local_owner' } },
+      };
+      mockGetAppConfig.mockResolvedValueOnce({ mcpConfig: configServers });
+      mockRegistryInstance.getAllServerConfigs.mockResolvedValueOnce(configServers);
+
+      await expect(resolveConfigServers({ user: { id: 'user-1', role: 'USER' } })).resolves.toEqual(
+        configServers,
+      );
+      expect(mockRegistryInstance.getAllServerConfigs).toHaveBeenCalledWith(
+        'user-1',
+        configServers,
+      );
+    });
+  });
+  /* === VIVENTIUM END === */
 
   describe('getMCPSetupData', () => {
     const mockUserId = 'user-123';

@@ -102,23 +102,24 @@ const {
   logPromptFrame,
 } = require('~/server/services/viventium/promptFrameTelemetry');
 const { logFeelingsEvent } = require('~/server/services/viventium/feelingsTelemetry');
+const {
+  attachConversationProviderCapabilityBundle,
+  buildHarnessIdempotencyKey,
+  installConversationProviderCapabilityRefresher,
+} = require('~/server/services/viventium/GlassHiveConversationProviderService');
 
 const NO_PARENT_MESSAGE_ID = '00000000-0000-0000-0000-000000000000';
 
 /* === VIVENTIUM START ===
- * Feature: Request-pinned feeling state for all background agents.
- * Purpose: Keep the same decayed snapshot across every participant in one turn.
+ * Feature: Specialist-cortex affect independence.
+ * Purpose: Background cortices observe, verify, and surface evidence for the conscious agent.
+ * The embodiment capsule addresses Viventium as the speaker, so appending it here would turn an
+ * epistemic specialist into a second persona and can bias Red Team, research, or EQ observations.
+ * User-visible Phase-B synthesis is a separate conscious speaking boundary and handles the pinned
+ * capsule there. Keep this explicit helper as a regression seam for all configured agent scopes.
  * === VIVENTIUM END === */
-function feelingTailForBackgroundAgent(snapshot) {
-  if (
-    !snapshot?.available ||
-    !snapshot?.enabled ||
-    snapshot?.agentScope !== 'all_agents' ||
-    !String(snapshot?.capsule || '').trim()
-  ) {
-    return '';
-  }
-  return String(snapshot.capsule).trim();
+function feelingTailForBackgroundAgent(_snapshot) {
+  return '';
 }
 
 /* === VIVENTIUM NOTE ===
@@ -217,6 +218,7 @@ function shouldSuppressActivationProvider(errorSummary = {}) {
     'provider_quota_or_billing',
     'provider_network',
     'provider_server_error',
+    'provider_invalid_response',
   ]).has(errorSummary.class);
 }
 
@@ -337,16 +339,17 @@ function buildActivationCooldownKey({ agentId, req, runId } = {}) {
 }
 
 /* === VIVENTIUM NOTE ===
- * Feature: Deterministic timeouts for Phase B cortex execution.
+ * Feature: Optional operator-configured Phase B cortex execution guard.
  *
  * Why:
- * - A single hung cortex should never stall the "brewing" UI forever.
- * - Tool/MCP failures must resolve to completion/error states so follow-up logic can decide what to surface.
+ * - Operators may bound one provider attempt when their deployment requires an execution deadline.
+ * - When unset, background execution has no automatic deadline; terminal provider/tool state and
+ *   restart recovery remain separate from browser/voice/Telegram follow-up listening windows.
  */
 function getCortexExecutionTimeoutMs() {
   const raw = String(process.env.VIVENTIUM_CORTEX_EXECUTION_TIMEOUT_MS || '').trim();
   const parsed = parseInt(raw, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 180_000;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
 }
 
 function getCortexExecutionGuardGraceMs() {
@@ -456,7 +459,14 @@ async function resolveBackgroundCortexFallbackAgent({ cortexAgent, req, modelsCo
     return null;
   }
 
-  return buildFallbackAgent(cortexAgent, fallbackAssignment);
+  /* === VIVENTIUM START ===
+   * Feature: Capability-preserving background fallback.
+   * Purpose: Keep capability-declared parameters such as GlassHive reasoning_effort when a
+   * background cortex takes the same configured fallback route as the main agent.
+   * === VIVENTIUM END === */
+  const agentsConfig = req?.config?.endpoints?.agents || {};
+  const fallbackCapability = agentsConfig.providerCapabilities?.[fallbackAssignment.provider] || {};
+  return buildFallbackAgent(cortexAgent, fallbackAssignment, fallbackCapability);
 }
 /* === VIVENTIUM NOTE === */
 
@@ -494,12 +504,11 @@ async function getUserMemoryContextBlock(req) {
       return '';
     }
   } catch (error) {
-    // Fail closed: if access check errors, do not include memory in cortex context.
     logger.warn(
-      '[BackgroundCortexService] Memory access check failed; skipping memory context for cortex',
+      '[BackgroundCortexService] Memory access check failed; marking context unavailable for cortex',
       sanitizeRuntimeErrorForLog(error),
     );
-    return '';
+    return memoryReadUnavailableContext();
   }
 
   try {
@@ -526,8 +535,16 @@ async function getUserMemoryContextBlock(req) {
       '[BackgroundCortexService] Failed to load memory read profile for cortex context',
       sanitizeRuntimeErrorForLog(error),
     );
-    return '';
+    return memoryReadUnavailableContext();
   }
+}
+
+function memoryReadUnavailableContext() {
+  return [
+    '# Saved-memory availability',
+    'Saved memory is unavailable for this turn because its read path failed.',
+    'This is not evidence that no saved memory exists. Do not invent missing facts; be transparent about the unavailable context when it matters to the answer.',
+  ].join('\n');
 }
 /* === VIVENTIUM NOTE === */
 
@@ -863,7 +880,45 @@ function buildIndexTokenCountMap(messages, tokenCounter) {
  * @param {string} response - Raw LLM response
  * @returns {{ activate: boolean, confidence: number, reason: string }}
  */
+function activationResponseError(code) {
+  const error = new Error(
+    code === 'JSON_VALIDATE_FAILED'
+      ? 'activation classifier returned schema-invalid JSON'
+      : 'activation classifier returned unparseable JSON',
+  );
+  error.code = code;
+  return error;
+}
+
+function activationDecisionFromData(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw activationResponseError('JSON_VALIDATE_FAILED');
+  }
+
+  const activationKey = ['activate', 'should_activate', 'shouldActivate'].find((key) =>
+    Object.prototype.hasOwnProperty.call(data, key),
+  );
+  const activationValue = activationKey ? data[activationKey] : undefined;
+  const confidence = data.confidence;
+  if (
+    typeof activationValue !== 'boolean' ||
+    typeof confidence !== 'number' ||
+    !Number.isFinite(confidence) ||
+    confidence < 0 ||
+    confidence > 1
+  ) {
+    throw activationResponseError('JSON_VALIDATE_FAILED');
+  }
+
+  return {
+    activate: activationValue,
+    confidence,
+    reason: typeof data.reason === 'string' ? data.reason : '',
+  };
+}
+
 function parseActivationResponse(response) {
+  let terminalError = null;
   try {
     let cleaned = String(response || '').trim();
     if (cleaned) {
@@ -875,12 +930,9 @@ function parseActivationResponse(response) {
     }
     // Try direct JSON parse
     const data = JSON.parse(cleaned);
-    return {
-      activate: Boolean(data.activate ?? data.should_activate ?? data.shouldActivate),
-      confidence: Number(data.confidence) || 0,
-      reason: String(data.reason || ''),
-    };
-  } catch {
+    return activationDecisionFromData(data);
+  } catch (error) {
+    terminalError = error;
     // Try to extract JSON from response
     const jsonMatch = String(response || '').match(
       /\{[^{}]*("activate"|"should_activate"|"shouldActivate")[^{}]*\}/,
@@ -888,21 +940,25 @@ function parseActivationResponse(response) {
     if (jsonMatch) {
       try {
         const data = JSON.parse(jsonMatch[0]);
-        return {
-          activate: Boolean(data.activate ?? data.should_activate ?? data.shouldActivate),
-          confidence: Number(data.confidence) || 0,
-          reason: String(data.reason || ''),
-        };
-      } catch {
-        // Fall through
+        return activationDecisionFromData(data);
+      } catch (extractedError) {
+        terminalError = extractedError;
       }
     }
 
-    logger.warn('[BackgroundCortexService] Failed to parse activation response', {
+    const errorCode =
+      terminalError?.code === 'JSON_VALIDATE_FAILED' ? 'JSON_VALIDATE_FAILED' : 'JSON_PARSE_FAILED';
+    logger.warn('[BackgroundCortexService] Invalid activation response', {
       response_hash: hashString(response, 12),
       response_length: typeof response === 'string' ? response.length : 0,
+      error_code: errorCode,
     });
-    return { activate: false, confidence: 0, reason: 'parse-error' };
+    // === VIVENTIUM START ===
+    // Rationale: malformed or schema-invalid classifier output is provider failure evidence, not a
+    // trustworthy decision. Throwing lets the configured fallback chain recover without prompt-
+    // text heuristics and keeps terminal unavailability explicit in activation telemetry.
+    throw activationResponseError(errorCode);
+    // === VIVENTIUM END ===
   }
 }
 
@@ -1579,6 +1635,16 @@ function hasVisibleCortexInsight(insight) {
   return Boolean(trimmed) && !isNoResponseOnly(trimmed);
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Detached Phase B lifecycle ownership.
+ * Purpose: Main-response cleanup is not user cancellation. Background cortices must continue to
+ * their own terminal result after `generation_completed`, while an intentional Stop still cancels
+ * their provider/tool work.
+ * === VIVENTIUM END === */
+function isBackgroundCortexCancellationSignal(signal) {
+  return signal?.aborted === true && signal.reason === 'user_cancelled';
+}
+
 function buildCortexCompletionPayload(result) {
   if (!result) {
     return null;
@@ -1608,6 +1674,13 @@ function buildCortexCompletionPayload(result) {
   }
   if (Array.isArray(result.directActionSurfaces)) {
     basePayload.direct_action_surfaces = result.directActionSurfaces;
+  }
+  if (result.fallbackUsed === true) {
+    basePayload.fallback_used = true;
+    basePayload.fallback_reason_class =
+      String(result.primaryErrorClass || '')
+        .trim()
+        .slice(0, 80) || null;
   }
   const directActionSurfaceScopes = normalizeDirectActionSurfaceScopes(
     result.directActionSurfaceScopes,
@@ -1660,6 +1733,8 @@ function buildCompletionInputFromActivation({
     activationScope: result?.activationScope || activationResult.activationScope || null,
     configuredTools: result?.configuredTools || 0,
     completedToolCalls: result?.completedToolCalls || 0,
+    fallbackUsed: result?.fallbackUsed === true,
+    primaryErrorClass: result?.primaryErrorClass || null,
     confidence: activationResult.confidence,
     reason: activationResult.reason,
     cortexDescription: activationResult.cortexDescription,
@@ -1679,6 +1754,7 @@ const RETRYABLE_ACTIVATION_ERROR_CODES = new Set([
   'ECONNRESET',
   'EAI_AGAIN',
   'ETIMEDOUT',
+  'JSON_PARSE_FAILED',
   'JSON_VALIDATE_FAILED',
   'MODEL_DECOMMISSIONED',
   'MODEL_DEPRECATED',
@@ -1972,6 +2048,10 @@ function classifyActivationError({ status, code, message }) {
   const normalizedMessage = String(message || '').toLowerCase();
   const normalizedCode = String(code || '').toUpperCase();
 
+  if (normalizedCode === 'JSON_PARSE_FAILED' || normalizedCode === 'JSON_VALIDATE_FAILED') {
+    return 'provider_invalid_response';
+  }
+
   if (status === 401 || normalizedMessage.includes('unauthorized')) {
     return 'provider_unauthorized';
   }
@@ -2013,7 +2093,7 @@ function classifyActivationError({ status, code, message }) {
   return 'provider_error';
 }
 
-function isActivationFallbackCandidate(error) {
+function isActivationFallbackCandidate(error, classifiedError = null) {
   const status = extractActivationErrorStatus(error);
   if (RETRYABLE_ACTIVATION_STATUS_CODES.has(status)) {
     return true;
@@ -2025,6 +2105,10 @@ function isActivationFallbackCandidate(error) {
   }
 
   const message = String(error?.message || '').toLowerCase();
+  const classified = String(classifiedError?.class || '').toLowerCase();
+  if (classified === 'provider_error' && (!Number.isFinite(status) || status <= 0)) {
+    return true;
+  }
   return (
     message.includes('billing') ||
     message.includes('quota') ||
@@ -2266,14 +2350,10 @@ function mapProvider(provider) {
     google: Providers.GOOGLE,
     azure: Providers.AZURE_OPENAI,
     bedrock: Providers.BEDROCK,
-    // Groq uses OpenAI-compatible API, so use OPENAI provider with custom config
-    groq: Providers.OPENAI,
-    // xAI / Perplexity / other OpenAI-compatible providers are handled as custom endpoints
-    // via getCustomEndpointConfig(...) and also use the OPENAI provider.
-    xai: Providers.OPENAI,
-    perplexity: Providers.OPENAI,
+    // OpenAI-compatible custom endpoints intentionally resolve only after their exact
+    // endpoint configuration is found below.
   };
-  return providerMap[provider?.toLowerCase()] || Providers.OPENAI;
+  return providerMap[provider?.toLowerCase()] || null;
 }
 
 /**
@@ -2301,7 +2381,12 @@ async function getCustomEndpointConfig(endpointName, req) {
       const baseURL = extractEnvVariable(endpoint.baseURL || '');
 
       if (apiKey && baseURL) {
-        return { apiKey, baseURL };
+        return {
+          apiKey,
+          baseURL,
+          defaultHeaders: endpoint.headers || endpoint.defaultHeaders || {},
+          dropParams: endpoint.dropParams || [],
+        };
       }
     }
 
@@ -2453,11 +2538,36 @@ function sanitizeOpenAIReasoningSampling(agentForRun, safeReq) {
 }
 
 async function buildActivationLlmConfig({ providerName, model, req }) {
+  /* === VIVENTIUM START ===
+   * Feature: Capability-enforced Phase A provider boundary.
+   * Purpose: Classifier execution follows compiled capability metadata even when configuration was
+   * written outside Agent Builder.
+   * === VIVENTIUM END === */
+  const agentsConfig = req?.config?.endpoints?.agents || {};
+  const activationCapability = agentsConfig.providerCapabilities?.[providerName];
+  if (activationCapability?.activation_classifier === false) {
+    throw new Error(`Provider "${providerName}" cannot run activation classification`);
+  }
+  if (
+    !activationCapability &&
+    (agentsConfig.capabilityRequiredProviders || []).includes(String(providerName || ''))
+  ) {
+    throw new Error(`Provider capability configuration is unavailable for "${providerName}"`);
+  }
   const mappedProvider = mapProvider(providerName);
+  /* === VIVENTIUM START ===
+   * Feature: Exact custom-provider resolution with testable OpenAI wire semantics.
+   * Purpose: Known OpenAI-compatible endpoints still need OpenAI request shaping before a request
+   * object is available, while live execution below continues to require the exact endpoint config.
+   * === VIVENTIUM END === */
+  const normalizedProviderName = String(providerName || '')
+    .trim()
+    .toLowerCase();
+  const openAICompatibleProvider = ['groq', 'xai', 'perplexity'].includes(normalizedProviderName);
   const usesAdaptiveAnthropicTemperatureRules =
     providerName === 'anthropic' && supportsAdaptiveThinking(model);
   const llmConfig = {
-    provider: mappedProvider,
+    provider: mappedProvider || (openAICompatibleProvider ? Providers.OPENAI : mappedProvider),
     model,
     maxTokens: 100,
     streaming: false,
@@ -2468,15 +2578,29 @@ async function buildActivationLlmConfig({ providerName, model, req }) {
     llmConfig.temperature = 0.1;
   }
 
+  let customEndpointResolved = false;
   if (req && providerName) {
     const customConfig = await getCustomEndpointConfig(providerName, req);
     if (customConfig?.apiKey && customConfig?.baseURL) {
+      customEndpointResolved = true;
       llmConfig.provider = Providers.OPENAI;
       llmConfig.configuration = {
         apiKey: customConfig.apiKey,
         baseURL: customConfig.baseURL,
       };
     }
+  }
+
+  /* === VIVENTIUM START ===
+   * Feature: Fail-loud exact provider resolution.
+   * Purpose: An unknown or unavailable custom provider must never execute silently with OpenAI.
+   * Phase A excludes GlassHive through provider capabilities, but all configured custom endpoints
+   * still resolve exactly through their own base URL and credentials.
+   * === VIVENTIUM END === */
+  if (req && !mappedProvider && !customEndpointResolved) {
+    throw new Error(
+      `Unsupported or unavailable activation provider "${String(providerName || '')}"`,
+    );
   }
 
   if (providerName === 'anthropic') {
@@ -2695,8 +2819,30 @@ async function checkCortexActivation({
 }) {
   const { agent_id, activation } = cortexConfig;
 
-  if (!activation?.enabled) {
+  /* === VIVENTIUM START ===
+   * Feature: Structured background-cortex activation modes.
+   * Purpose: Let a cortex run on every eligible turn without a fake classifier request while
+   * preserving the existing enabled switch and classified default. Invalid persisted values fall
+   * back to classified behavior; API/compiler boundaries reject them for new writes.
+   * === VIVENTIUM END === */
+  const activationMode =
+    activation?.enabled === false || activation?.mode === 'disabled'
+      ? 'disabled'
+      : activation?.mode === 'always'
+        ? 'always'
+        : 'classified';
+
+  if (activationMode === 'disabled') {
     return { shouldActivate: false, confidence: 0, reason: 'disabled', agentId: agent_id };
+  }
+  if (activationMode === 'always') {
+    return {
+      shouldActivate: true,
+      confidence: 1,
+      reason: 'activation_mode_always',
+      agentId: agent_id,
+      providerAttempts: [],
+    };
   }
 
   const {
@@ -3015,7 +3161,8 @@ ${activationFormat}`;
           markedUnhealthy,
         });
 
-        const shouldRetry = i < attempts.length - 1 && isActivationFallbackCandidate(error);
+        const shouldRetry =
+          i < attempts.length - 1 && isActivationFallbackCandidate(error, errorSummary);
         if (shouldRetry) {
           logger.warn(
             `[BackgroundCortexService] Activation classifier failed for ${agent_id}; trying fallback: ` +
@@ -3107,6 +3254,61 @@ ${activationFormat}`;
   }
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Resolved conversation identity for background conversation providers.
+ * Purpose: New-chat requests may still carry an empty/provisional conversation id after Main has
+ * resolved the persisted id. Phase B must send that resolved id so GlassHive can validate and
+ * isolate the background session without mutating the request shared with Main.
+ * === VIVENTIUM END === */
+function buildCortexRequestBody({
+  requestBody = {},
+  runId,
+  conversationId = null,
+  idempotencyKey = '',
+} = {}) {
+  const resolvedConversationId =
+    String(conversationId || '').trim() ||
+    String(requestBody?.conversationId || '').trim() ||
+    String(runId || '').trim();
+  return {
+    ...(requestBody || {}),
+    messageId: runId,
+    conversationId: resolvedConversationId,
+    parentMessageId: requestBody?.parentMessageId,
+    viventiumGlassHiveIdempotencyKey: idempotencyKey,
+  };
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Invocation-fresh background-cortex capability authority.
+ * Purpose: Background execution may begin after the provider's replay window. Attach the exact
+ * cortex turn now and install the same pre-attempt refresh used by foreground graph participants.
+ * === VIVENTIUM END === */
+async function prepareCortexConversationProviderCapability({
+  targetAgent,
+  declaredAgent,
+  req,
+  capability,
+  requestBody,
+  attachBundle = attachConversationProviderCapabilityBundle,
+  installRefresher = installConversationProviderCapabilityRefresher,
+}) {
+  if (targetAgent && capability?.workspace_binding === true) {
+    const modelParameters = { ...(targetAgent.model_parameters || {}) };
+    const configuration = { ...(modelParameters.configuration || {}) };
+    configuration.defaultHeaders = {
+      ...(configuration.defaultHeaders || {}),
+      'X-GlassHive-Access': 'read_only',
+    };
+    modelParameters.configuration = configuration;
+    targetAgent.model_parameters = modelParameters;
+  }
+  const args = { targetAgent, declaredAgent, req, capability, requestBody };
+  const attached = await attachBundle(args);
+  installRefresher(args);
+  return attached;
+}
+
 /**
  * Execute a single cortex agent and collect its response
  * @param {object} params
@@ -3123,17 +3325,20 @@ async function executeCortexOnce({
   agent,
   messages,
   runId,
+  conversationId = null,
   req,
   res,
   activationScope = null,
   contextMode = 'full',
   executionTimeoutMs = null,
+  signal = null,
 }) {
   const startTime = Date.now();
   /** @type {AbortController | null} */
   let abortController = null;
   /** @type {NodeJS.Timeout | null} */
   let abortTimer = null;
+  let removeExternalAbortListener = null;
   /* === VIVENTIUM START ===
    * Fix: Preserve Phase B metadata through provider failures so UI cards, DB parts, and fallback
    * routing can distinguish provider-stage failures from missing tools or auth.
@@ -3348,6 +3553,24 @@ async function executeCortexOnce({
     };
 
     abortController = new AbortController();
+    /* === VIVENTIUM START ===
+     * Feature: composed voice-task cancellation
+     * Purpose: Bind the owning generation signal to background cortex tools/providers so a task
+     * cancellation does not merely hide a late result while avoidable work keeps running.
+     * === VIVENTIUM END === */
+    const ownerSignal = signal || safeReq?._viventiumVoiceAbortSignal || null;
+    if (isBackgroundCortexCancellationSignal(ownerSignal)) {
+      abortController.abort(ownerSignal.reason);
+    } else if (typeof ownerSignal?.addEventListener === 'function') {
+      const abortFromOwner = () => {
+        if (isBackgroundCortexCancellationSignal(ownerSignal)) {
+          abortController?.abort(ownerSignal.reason);
+        }
+      };
+      ownerSignal.addEventListener('abort', abortFromOwner, { once: true });
+      removeExternalAbortListener = () =>
+        ownerSignal.removeEventListener?.('abort', abortFromOwner);
+    }
     const effectiveExecutionTimeoutMs =
       Number.isFinite(executionTimeoutMs) && executionTimeoutMs > 0
         ? Math.floor(executionTimeoutMs)
@@ -3367,6 +3590,20 @@ async function executeCortexOnce({
     );
 
     executionStage = 'initialize_agent';
+    const cortexProviderName = String(agentForRun.provider || '').trim();
+    const cortexAgentsConfig = safeReq.config?.endpoints?.agents || {};
+    const cortexCapability = cortexAgentsConfig.providerCapabilities?.[cortexProviderName];
+    if (cortexCapability?.cortex_execution === false) {
+      throw new Error(`Provider "${cortexProviderName}" cannot execute a background cortex`);
+    }
+    if (
+      !cortexCapability &&
+      (cortexAgentsConfig.capabilityRequiredProviders || []).includes(cortexProviderName)
+    ) {
+      throw new Error(
+        `Provider capability configuration is unavailable for "${cortexProviderName}"`,
+      );
+    }
     const initializedAgent = await initializeAgent(
       {
         req: safeReq,
@@ -3401,6 +3638,9 @@ async function executeCortexOnce({
     }
     logFeelingsEvent(logger, safeReq, 'feelings.inject.background', {
       injected: Boolean(backgroundFeelingTail),
+      reason: 'specialist_cortex_independent',
+      enabled: safeReq._viventiumFeelingSnapshot?.enabled === true,
+      scope: safeReq._viventiumFeelingSnapshot?.agentScope || 'unknown',
       snapshotHash: safeReq._viventiumFeelingSnapshot?.snapshotHash || null,
       agentIdHash: hashString(initializedAgent.id || agentForRun.id, 12),
     });
@@ -3438,8 +3678,8 @@ async function executeCortexOnce({
      * - The ON_TOOL_EXECUTE handler calls toolExecuteOptions.loadTools to create
      *   the actual tool instance (with MCP connection, OAuth, etc.) on demand.
      * - Without toolExecuteOptions, getDefaultHandlers never registers the
-     *   ON_TOOL_EXECUTE handler, so tool calls silently drop into the void:
-     *   the LLM asks to call a tool, nothing happens, 180s timeout fires.
+     *   ON_TOOL_EXECUTE handler, so tool calls silently drop into the void and the run cannot reach
+     *   a truthful tool-result terminal state.
      *
      * Fix:
      * - After initializeAgent returns the agent config (including toolRegistry,
@@ -3588,14 +3828,30 @@ async function executeCortexOnce({
      * Feature: Disable streaming for Anthropic background cortices.
      * Reason: Anthropic SDK streaming can emit control characters that break JSON parsing in background runs.
      */
-    const cortexProvider = (initializedAgent.provider || '').toLowerCase();
-    const disableStreaming = cortexProvider === 'anthropic';
+    const cortexTransportProvider = (initializedAgent.provider || '').toLowerCase();
+    const cortexIdempotencyKey = buildHarnessIdempotencyKey('cortex', runId, agentForRun.id);
+    const cortexRequestBody = buildCortexRequestBody({
+      requestBody: safeReq.body,
+      runId,
+      conversationId,
+      idempotencyKey: cortexIdempotencyKey,
+    });
+    await prepareCortexConversationProviderCapability({
+      targetAgent: initializedAgent,
+      declaredAgent: agentForRun,
+      req: safeReq,
+      // Initialization may normalize a custom OpenAI-compatible endpoint to `openAI`.
+      // Capability ownership stays with the declared endpoint captured before initialization.
+      capability: cortexCapability,
+      requestBody: cortexRequestBody,
+    });
+    const disableStreaming = cortexTransportProvider === 'anthropic';
     const runOptions = {
       agents: [initializedAgent],
       runId: `${runId}-cortex-${agent.id}`,
       signal: abortController.signal,
       customHandlers: eventHandlers,
-      requestBody: safeReq.body,
+      requestBody: cortexRequestBody,
       user: safeReq.user,
       /* Provide token counter/context map for context window management. */
       tokenCounter,
@@ -3618,16 +3874,19 @@ async function executeCortexOnce({
       configurable: {
         thread_id: runId,
         user_id: safeReq.user?.id,
-        requestBody: {
-          messageId: runId,
-          conversationId: safeReq.body.conversationId,
-          parentMessageId: safeReq.body.parentMessageId,
-        },
+        requestBody: cortexRequestBody,
         user: safeReq.user,
         glasshive_worker_feelings: backgroundFeelingTail,
         glasshive_worker_feelings_hash: backgroundFeelingTail
           ? safeReq._viventiumFeelingSnapshot?.snapshotHash || ''
           : '',
+        glasshive_worker_feelings_scope: safeReq._viventiumFeelingSnapshot?.agentScope || 'unknown',
+        glasshive_worker_feelings_range_prompt_override_count:
+          safeReq._viventiumFeelingSnapshot?.rangePromptOverrideCount ?? 0,
+        glasshive_worker_feelings_active_range_prompt_override_count:
+          safeReq._viventiumFeelingSnapshot?.activeRangePromptOverrideCount ?? 0,
+        glasshive_worker_feelings_active_range_prompt_override_chars:
+          safeReq._viventiumFeelingSnapshot?.activeRangePromptOverrideChars ?? 0,
       },
       recursionLimit: initializedAgent.recursion_limit || 25,
       signal: abortController.signal,
@@ -3783,6 +4042,7 @@ async function executeCortexOnce({
     if (abortTimer) {
       clearTimeout(abortTimer);
     }
+    removeExternalAbortListener?.();
   }
 }
 
@@ -3794,7 +4054,9 @@ async function executeCortexOnce({
 async function executeCortex(params) {
   const primaryAgent = params?.agent;
   const primaryResult = await executeCortexOnce(params);
+  const ownerSignal = params?.signal || params?.req?._viventiumVoiceAbortSignal;
   if (
+    isBackgroundCortexCancellationSignal(ownerSignal) ||
     !resolveFallbackAssignment(primaryAgent) ||
     !shouldRetryBackgroundCortexWithFallback(primaryResult)
   ) {
@@ -4371,6 +4633,7 @@ async function executeActivated({
   mainAgent,
   messages,
   runId,
+  conversationId = null,
   activatedCortices,
   onCortexBrewing,
   onCortexComplete,
@@ -4381,6 +4644,10 @@ async function executeActivated({
   }
 
   const executionTimeoutMs = getCortexExecutionTimeoutMs();
+  const ownerSignal = req?._viventiumVoiceAbortSignal || null;
+  if (isBackgroundCortexCancellationSignal(ownerSignal)) {
+    return { insights: [], cancelled: true };
+  }
   let modelsConfigPromise = null;
   const getModelsConfigOnce = () => {
     if (!modelsConfigPromise) {
@@ -4399,9 +4666,11 @@ async function executeActivated({
       agent,
       messages,
       runId,
+      conversationId,
       req,
       res,
       activationScope: activationResult.activationScope || null,
+      signal: ownerSignal,
     });
     const guardTimeoutMs = getCortexAttemptGuardTimeoutMs(executionTimeoutMs);
     if (!guardTimeoutMs) {
@@ -4460,7 +4729,7 @@ async function executeActivated({
       }
 
       // Notify UI that cortex is brewing
-      if (onCortexBrewing) {
+      if (onCortexBrewing && !isBackgroundCortexCancellationSignal(ownerSignal)) {
         try {
           onCortexBrewing({
             cortex_id: activationResult.agentId,
@@ -4551,6 +4820,7 @@ async function executeActivated({
       }
       if (
         fallbackAgent &&
+        !isBackgroundCortexCancellationSignal(ownerSignal) &&
         result?.fallbackUsed !== true &&
         shouldRetryBackgroundCortexWithFallback(result)
       ) {
@@ -4590,7 +4860,11 @@ async function executeActivated({
       const completionPayload = buildCortexCompletionPayload(
         buildCompletionInputFromActivation({ activationResult, cortexAgent, result }),
       );
-      if (completionPayload && onCortexComplete) {
+      if (
+        completionPayload &&
+        onCortexComplete &&
+        !isBackgroundCortexCancellationSignal(ownerSignal)
+      ) {
         try {
           onCortexComplete(completionPayload);
         } catch (e) {
@@ -4615,7 +4889,7 @@ async function executeActivated({
       );
 
       // Notify UI of error so it doesn't stay stuck on "Analyzing..."
-      if (onCortexComplete) {
+      if (onCortexComplete && !isBackgroundCortexCancellationSignal(ownerSignal)) {
         try {
           onCortexComplete(
             buildCortexCompletionPayload(
@@ -4651,6 +4925,9 @@ async function executeActivated({
    * downstream code stays unchanged.
    */
   const settledResults = await Promise.allSettled(executionPromises);
+  if (isBackgroundCortexCancellationSignal(ownerSignal)) {
+    return { insights: [], cancelled: true };
+  }
   const executionResults = settledResults.map((s) => {
     if (s.status === 'fulfilled') {
       return s.value;
@@ -5085,6 +5362,7 @@ module.exports = {
   normalizeAgentToolNames,
   hasVisibleCortexInsight,
   buildCortexCompletionPayload,
+  isBackgroundCortexCancellationSignal,
   summarizeActivationError,
   classifyActivationError,
   buildActivationLlmConfig,
@@ -5110,4 +5388,7 @@ module.exports = {
   DEFAULT_ACTIVATION_DECISION_SUBJECT_RULE,
   // Exported for unit testing only
   createBackgroundRes,
+  memoryReadUnavailableContext,
+  buildCortexRequestBody,
+  prepareCortexConversationProviderCapability,
 };

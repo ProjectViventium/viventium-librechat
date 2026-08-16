@@ -699,6 +699,114 @@ describe('getOpenAIConfig', () => {
     }
   });
 
+  it('should refresh once and replay a Codex response request after an early 401', async () => {
+    const originalFetch = globalThis.fetch;
+    const mockFetch = jest
+      .fn()
+      .mockResolvedValueOnce(new Response('unauthorized', { status: 401 }))
+      .mockResolvedValueOnce(new Response('ok', { status: 200 }));
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+    const connectedAccountAuthRefresh = jest.fn().mockResolvedValue({
+      apiKey: 'refreshed-access-token',
+      headers: { 'chatgpt-account-id': 'acct_refreshed' },
+    });
+
+    try {
+      const result = getOpenAIConfig(mockApiKey, {
+        reverseProxyUrl: 'https://chatgpt.com/backend-api/codex',
+        connectedAccountAuthRefresh,
+      });
+      const response = await result.configOptions?.fetch?.(
+        'https://chatgpt.com/backend-api/codex/responses',
+        {
+          method: 'POST',
+          headers: { authorization: 'Bearer expired-access-token' },
+          body: JSON.stringify({
+            model: 'gpt-5.6-sol',
+            input: [{ type: 'message', role: 'user', content: 'hello' }],
+            stream: true,
+          }),
+        },
+      );
+
+      expect(response?.status).toBe(200);
+      expect(connectedAccountAuthRefresh).toHaveBeenCalledTimes(1);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      const retryInit = mockFetch.mock.calls[1]?.[1] as RequestInit;
+      const retryHeaders = new Headers(retryInit.headers);
+      expect(retryHeaders.get('authorization')).toBe('Bearer refreshed-access-token');
+      expect(retryHeaders.get('chatgpt-account-id')).toBe('acct_refreshed');
+      expect(retryInit.body).toBe(mockFetch.mock.calls[0]?.[1]?.body);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('should preserve the original Codex 401 when connected-account refresh fails', async () => {
+    const originalFetch = globalThis.fetch;
+    const mockFetch = jest.fn().mockResolvedValue(new Response('unauthorized', { status: 401 }));
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+    const connectedAccountAuthRefresh = jest.fn().mockRejectedValue(new Error('invalid_grant'));
+
+    try {
+      const result = getOpenAIConfig(mockApiKey, {
+        reverseProxyUrl: 'https://chatgpt.com/backend-api/codex',
+        connectedAccountAuthRefresh,
+      });
+      const response = await result.configOptions?.fetch?.(
+        'https://chatgpt.com/backend-api/codex/responses',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            model: 'gpt-5.6-sol',
+            input: [{ type: 'message', role: 'user', content: 'hello' }],
+            stream: true,
+          }),
+        },
+      );
+
+      expect(response?.status).toBe(401);
+      expect(connectedAccountAuthRefresh).toHaveBeenCalledTimes(1);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('should replay only once when the refreshed Codex credential is also rejected', async () => {
+    const originalFetch = globalThis.fetch;
+    const mockFetch = jest.fn().mockResolvedValue(new Response('unauthorized', { status: 401 }));
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+    const connectedAccountAuthRefresh = jest.fn().mockResolvedValue({
+      apiKey: 'still-rejected-access-token',
+      headers: { 'chatgpt-account-id': 'acct_refreshed' },
+    });
+
+    try {
+      const result = getOpenAIConfig(mockApiKey, {
+        reverseProxyUrl: 'https://chatgpt.com/backend-api/codex',
+        connectedAccountAuthRefresh,
+      });
+      const response = await result.configOptions?.fetch?.(
+        'https://chatgpt.com/backend-api/codex/responses',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            model: 'gpt-5.6-sol',
+            input: [{ type: 'message', role: 'user', content: 'hello' }],
+            stream: true,
+          }),
+        },
+      );
+
+      expect(response?.status).toBe(401);
+      expect(connectedAccountAuthRefresh).toHaveBeenCalledTimes(1);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it('should lift Codex system and developer messages into top-level instructions', async () => {
     const originalFetch = globalThis.fetch;
     const mockFetch = jest.fn(async (_input: string | URL | Request, init?: RequestInit) => {

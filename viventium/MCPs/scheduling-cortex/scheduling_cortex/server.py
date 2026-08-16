@@ -51,6 +51,131 @@ HEADER_AGENT_ID = "x-viventium-agent-id"
 logger = logging.getLogger(__name__)
 
 
+def _glasshive_callback_reconciliation_allowed(run: dict[str, Any], event: str) -> bool:
+    """Return whether this callback may mutate the occurrence ledger.
+
+    Terminal callback evidence normally wins forever. The one exception is a synthetic
+    ``stale_run_reconciled`` failure written by startup recovery before GlassHive's signed
+    completion arrived. That row does not contain provider terminal evidence, so the matching
+    late completion is authoritative and may repair it.
+    """
+
+    current_status = str(run.get("status") or "queued")
+    if current_status not in {"completed", "failed"}:
+        return True
+    return (
+        current_status == "failed"
+        and str(run.get("error_class") or "") == "stale_run_reconciled"
+        and event == "run.completed"
+    )
+
+
+def _glasshive_callback_lifecycle(
+    run: dict[str, Any], event: str, payload: dict[str, Any], now: str
+) -> tuple[str, str, Optional[str], Optional[str]]:
+    """Apply monotonic callback state so late transport events cannot reopen terminal work."""
+
+    current_status = str(run.get("status") or "queued")
+    current_disposition = str(run.get("disposition") or "running")
+    if current_status in {"completed", "failed"} and not _glasshive_callback_reconciliation_allowed(
+        run, event
+    ):
+        return (
+            current_status,
+            current_disposition,
+            run.get("completed_at"),
+            run.get("error_class"),
+        )
+    if event == "run.completed":
+        return "completed", "delivered", now, None
+    if event in {"run.failed", "run.cancelled", "run.interrupted"}:
+        callback_failure_class = str(
+            payload.get("failure_class") or payload.get("failure_code") or ""
+        ).strip()
+        error_class = (
+            callback_failure_class
+            if re.fullmatch(r"[a-z0-9_.:-]{1,128}", callback_failure_class)
+            else event.replace("run.", "")
+        )
+        disposition = "failed" if event == "run.failed" else "cancelled"
+        return "failed", disposition, now, error_class
+    if event == "run.queued":
+        status = (
+            current_status
+            if current_status in {"running", "completed", "failed"}
+            else "queued"
+        )
+        return (
+            status,
+            current_disposition if status in {"completed", "failed"} else "running",
+            run.get("completed_at"),
+            run.get("error_class") if status != "queued" else None,
+        )
+    if event in {"run.waiting_on_capacity", "run.requeued"}:
+        return "queued", "running", run.get("completed_at"), None
+    if event == "run.started":
+        return "running", "running", run.get("completed_at"), run.get("error_class")
+    return current_status, current_disposition, run.get("completed_at"), run.get("error_class")
+
+
+def _external_work_callback_updates(
+    run: dict[str, Any], summary: dict[str, Any], now: str
+) -> dict[str, Any]:
+    """Project Core's authoritative required-mission aggregate onto one occurrence ledger row."""
+
+    def _count(camel: str, snake: str) -> int:
+        try:
+            return max(0, int(summary.get(camel) or summary.get(snake) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    required_total = _count("requiredTotal", "required_total")
+    required_terminal = _count("requiredTerminal", "required_terminal")
+    required_failed = _count("requiredFailed", "required_failed")
+    all_required_terminal = bool(
+        summary.get("allRequiredTerminal")
+        if "allRequiredTerminal" in summary
+        else summary.get("all_required_terminal")
+    )
+    canonical_summary = {
+        "requiredTotal": required_total,
+        "requiredTerminal": required_terminal,
+        "requiredFailed": required_failed,
+        "allRequiredTerminal": all_required_terminal,
+        "state": str(summary.get("state") or "").strip()
+        or ("completed" if all_required_terminal else "waiting_external"),
+    }
+    execution = (
+        dict(run.get("execution_snapshot"))
+        if isinstance(run.get("execution_snapshot"), dict)
+        else {}
+    )
+    execution["external_work"] = canonical_summary
+    base = {
+        "execution_snapshot": execution,
+        "lease_owner": None,
+        "lease_until": None,
+        "updated_at": now,
+    }
+    if required_total > 0 and not all_required_terminal:
+        return {
+            **base,
+            "status": "waiting_external",
+            "disposition": "running",
+            "completed_at": None,
+            "error_class": None,
+        }
+    if required_total > 0:
+        return {
+            **base,
+            "status": "failed" if required_failed else "completed",
+            "disposition": "failed" if required_failed else "delivered",
+            "completed_at": now,
+            "error_class": "required_external_work_failed" if required_failed else None,
+        }
+    return base
+
+
 def _default_scheduling_db_path() -> str:
     configured_root = str(os.getenv("VIVENTIUM_APP_SUPPORT_DIR") or "").strip()
     if configured_root:
@@ -211,9 +336,35 @@ def _serialize_periphery_list_for_agent(payload: Dict[str, Any]) -> Dict[str, An
     current = latest_per_module(current_only=True, limit=5)
     historical = latest_per_module(current_only=False, limit=3)
     index = payload.get("index") if isinstance(payload.get("index"), dict) else {}
+    allowed_blockers = {
+        "outside_periphery_root",
+        "private_permissions_unavailable",
+        "unsafe_hard_link",
+        "unsafe_symlink",
+    }
+    blocked_reasons = [
+        str(reason)
+        for reason in index.get("blockedReasons", [])
+        if str(reason) in allowed_blockers
+    ]
+    status = str(index.get("status") or "").strip().lower()
+    if status not in {"available", "degraded", "blocked"}:
+        status = "degraded" if blocked_reasons and artifacts else "blocked" if blocked_reasons else "available"
+    reason_guidance = {
+        "outside_periphery_root": "An insight outside the private Periphery boundary was withheld.",
+        "private_permissions_unavailable": "Private insight permissions could not be verified; check ownership and filesystem support.",
+        "unsafe_hard_link": "A linked insight was withheld because its private storage boundary cannot be proven; restore it as a normal private file.",
+        "unsafe_symlink": "A linked insight path was withheld because it could leave the private Periphery boundary.",
+    }
     return {
         "currentInsights": current,
         "historicalInsights": historical,
+        "availability": {
+            "status": status,
+            "reasons": blocked_reasons,
+            "blockedCount": index.get("blockedArtifactCount", len(blocked_reasons)),
+            "guidance": [reason_guidance[reason] for reason in blocked_reasons],
+        },
         "totals": {
             "insights": index.get("artifactCount", len(artifacts)),
             "invalid": index.get("invalidArtifactCount", 0),
@@ -221,7 +372,9 @@ def _serialize_periphery_list_for_agent(payload: Dict[str, Any]) -> Dict[str, An
         },
         "usage": (
             "Prefer the newest current insight. Read historical insight only when explicitly useful, "
-            "and describe stale or legacy material as historical uncertainty."
+            "and describe stale or legacy material as historical uncertainty. If availability is degraded, "
+            "use the available insights and disclose that some private artifacts were withheld. If it is blocked, "
+            "report that private insight access is unavailable instead of claiming no insights exist."
         ),
     }
 
@@ -493,6 +646,55 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
     # VIVENTIUM NOTE
 
     # === VIVENTIUM START ===
+    # Feature: Required external-work occurrence reconciliation.
+    # Core resolves callback ownership and sends only the aggregate required-mission state; the
+    # scheduling sidecar never accepts Telegram identifiers or worker-authored destination data.
+    @mcp.custom_route("/internal/scheduled-prompts/external-work-callback", methods=["POST"])
+    async def external_work_callback(request: Request) -> Response:
+        expected_secret = str(
+            os.getenv("VIVENTIUM_SCHEDULER_SECRET")
+            or os.getenv("SCHEDULER_LIBRECHAT_SECRET")
+            or ""
+        ).strip()
+        provided_secret = str(
+            request.headers.get("x-viventium-scheduler-secret", "")
+        ).strip()
+        if not expected_secret or not hmac.compare_digest(provided_secret, expected_secret):
+            return JSONResponse(
+                {"status": "error", "reason": "invalid_scheduler_secret"},
+                status_code=401,
+            )
+        try:
+            payload = await request.json()
+        except Exception:
+            return JSONResponse({"status": "error", "reason": "invalid_json"}, status_code=400)
+        if not isinstance(payload, dict):
+            return JSONResponse({"status": "error", "reason": "invalid_payload"}, status_code=400)
+        occurrence_key = str(payload.get("occurrence_key") or "").strip()
+        user_id = str(payload.get("user_id") or "").strip()
+        if not occurrence_key or not user_id:
+            return JSONResponse(
+                {"status": "error", "reason": "missing_occurrence_owner"},
+                status_code=400,
+            )
+        run = storage.get_scheduled_prompt_run_by_occurrence_key(occurrence_key)
+        if not run:
+            return JSONResponse({"status": "error", "reason": "unknown_occurrence"}, status_code=404)
+        if str(run.get("user_id") or "") != user_id:
+            return JSONResponse({"status": "error", "reason": "owner_mismatch"}, status_code=403)
+        now = _now_iso()
+        updates = _external_work_callback_updates(run, payload, now)
+        updated = storage.update_scheduled_prompt_run(str(run["run_id"]), updates)
+        return JSONResponse(
+            {
+                "status": "http_accepted",
+                "run_id": run["run_id"],
+                "occurrence_status": updated.get("status") if updated else None,
+            }
+        )
+    # === VIVENTIUM END ===
+
+    # === VIVENTIUM START ===
     # Feature: Signed GlassHive completion callback for Workbench scheduled prompts.
     def _glasshive_callback_secret() -> str:
         return (
@@ -685,7 +887,7 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
 
         event = str(payload.get("event") or "").strip()
         if event.startswith("worker.") and not run_id:
-            return JSONResponse({"status": "ok", "ignored": event})
+            return JSONResponse({"status": "http_accepted", "ignored": event})
 
         run = storage.get_scheduled_prompt_run_by_glasshive_run(run_id)
         callback_run_id = str(payload.get("message_id") or payload.get("scheduled_prompt_run_id") or "").strip()
@@ -695,48 +897,13 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             return JSONResponse({"status": "error", "reason": "unknown_run"}, status_code=404)
 
         now = _now_iso()
-        if event == "run.completed":
-            status = "completed"
-            completed_at = now
-            error_class = None
-        elif event in {"run.failed", "run.cancelled", "run.interrupted"}:
-            status = "failed"
-            completed_at = now
-            callback_failure_class = str(
-                payload.get("failure_class") or payload.get("failure_code") or ""
-            ).strip()
-            error_class = (
-                callback_failure_class
-                if re.fullmatch(r"[a-z0-9_.:-]{1,128}", callback_failure_class)
-                else event.replace("run.", "")
-            )
-        elif event == "run.queued":
-            current_status = str(run.get("status") or "queued")
-            status = current_status if current_status in {"running", "completed", "failed"} else "queued"
-            completed_at = run.get("completed_at")
-            error_class = run.get("error_class") if status != "queued" else None
-        elif event in {"run.waiting_on_capacity", "run.requeued"}:
-            status = "queued"
-            completed_at = run.get("completed_at")
-            error_class = None
-        elif event == "run.started":
-            status = "running"
-            completed_at = run.get("completed_at")
-            error_class = run.get("error_class")
-        else:
-            status = str(run.get("status") or "queued")
-            completed_at = run.get("completed_at")
-            error_class = run.get("error_class")
+        callback_reconciliation_allowed = _glasshive_callback_reconciliation_allowed(run, event)
+        status, disposition, completed_at, error_class = _glasshive_callback_lifecycle(
+            run, event, payload, now
+        )
 
         private_detail = _append_private_callback(run, payload, now)
-        memory_apply = _maybe_apply_governed_memory(run, private_detail) if event == "run.completed" else None
-        if memory_apply and not memory_apply.get("ok"):
-            error_class = str(memory_apply.get("reason") or "memory_apply_blocked")
-            result_summary = f"GlassHive run completed; governed memory apply blocked: {error_class}."
-        elif memory_apply and memory_apply.get("ok"):
-            result_summary = "GlassHive run completed; governed memory proposal applied."
-        else:
-            result_summary = _safe_callback_summary(payload, status, error_class)
+        result_summary = _safe_callback_summary(payload, status, error_class)
 
         callback_summary = {
             "event": event,
@@ -744,7 +911,7 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             "status": status,
             "message_hash": _hash_payload_text(payload),
             "has_private_payload": bool(payload.get("message") or payload.get("full_message") or payload.get("error")),
-            "memory_apply_reason": memory_apply.get("reason") if isinstance(memory_apply, dict) else None,
+            "memory_apply_reason": None,
             "effort_projection": {
                 "requested": str((payload.get("effort_projection") or {}).get("requested") or "")[:32],
                 "effective": str((payload.get("effort_projection") or {}).get("effective") or "")[:32],
@@ -756,28 +923,76 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             else None,
         }
 
-        storage.update_scheduled_prompt_run(
-            str(run["run_id"]),
+        callback_persisted = False
+        if callback_reconciliation_allowed:
+            update_result = storage.update_scheduled_prompt_run_if_current(
+                str(run["run_id"]),
+                {
+                    "status": status,
+                    "disposition": disposition,
+                    "completed_at": completed_at,
+                    "result_summary": result_summary or run.get("result_summary"),
+                    "error_class": error_class,
+                    "callback_payload_json": json.dumps(callback_summary),
+                    "updated_at": now,
+                },
+                expected_status=str(run.get("status") or "queued"),
+                expected_error_class=run.get("error_class"),
+            )
+            callback_persisted = bool(update_result.get("updated"))
+            if callback_persisted:
+                persisted_run = update_result.get("run") or run
+                # Governed memory application is an external side effect. Run it only after the
+                # lifecycle compare-and-swap wins, otherwise a stale callback that lost to newer
+                # terminal evidence could still mutate account memory.
+                memory_apply = (
+                    _maybe_apply_governed_memory(persisted_run, private_detail)
+                    if event == "run.completed"
+                    else None
+                )
+                if memory_apply and not memory_apply.get("ok"):
+                    error_class = str(memory_apply.get("reason") or "memory_apply_blocked")
+                    result_summary = (
+                        "GlassHive run completed; governed memory apply blocked: "
+                        f"{error_class}."
+                    )
+                elif memory_apply and memory_apply.get("ok"):
+                    result_summary = "GlassHive run completed; governed memory proposal applied."
+                if isinstance(memory_apply, dict):
+                    callback_summary["memory_apply_reason"] = memory_apply.get("reason")
+                    memory_update = storage.update_scheduled_prompt_run_if_current(
+                        str(run["run_id"]),
+                        {
+                            "result_summary": result_summary,
+                            "error_class": error_class,
+                            "callback_payload_json": json.dumps(callback_summary),
+                            "updated_at": now,
+                        },
+                        expected_status=status,
+                        expected_error_class=(update_result.get("run") or {}).get("error_class"),
+                    )
+                    persisted_run = memory_update.get("run") or persisted_run
+                    result_summary = str(
+                        persisted_run.get("result_summary") or result_summary or ""
+                    )
+                    error_class = persisted_run.get("error_class")
+                _update_parent_task_for_glasshive_callback(
+                    persisted_run,
+                    status=status,
+                    result_summary=result_summary or str(run.get("result_summary") or ""),
+                    error_class=error_class,
+                    payload=payload,
+                    received_at=now,
+                )
+                if event == "run.completed":
+                    _refresh_workbench_periphery_index(persisted_run)
+        return JSONResponse(
             {
-                "status": status,
-                "completed_at": completed_at,
-                "result_summary": result_summary or run.get("result_summary"),
-                "error_class": error_class,
-                "callback_payload_json": json.dumps(callback_summary),
-                "updated_at": now,
-            },
+                "status": "http_accepted",
+                "run_id": run["run_id"],
+                "callback_persisted": callback_persisted,
+            }
         )
-        _update_parent_task_for_glasshive_callback(
-            run,
-            status=status,
-            result_summary=result_summary or str(run.get("result_summary") or ""),
-            error_class=error_class,
-            payload=payload,
-            received_at=now,
-        )
-        if event == "run.completed":
-            _refresh_workbench_periphery_index(run)
-        return JSONResponse({"status": "ok", "run_id": run["run_id"]})
     # === VIVENTIUM END ===
 
     # === VIVENTIUM NOTE ===
@@ -927,7 +1142,9 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
                 "The request is immediate, or a matching existing schedule should be updated instead."
             ),
             inputs=(
-                "prompt, schedule, optional channel, conversation_policy, active, metadata; "
+                "prompt, schedule, optional channel, conversation_policy, active, metadata. "
+                "schedule.type is required; for one-time work use "
+                "{'type': 'once', 'run_at': '<ISO datetime>', 'timezone': '<IANA timezone>'}. "
                 "user_id, agent_id, and created_by are auto-injected when omitted."
             ),
             returns="success, full task object, and creation message.",
@@ -1246,7 +1463,10 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Scheduling Cortex MCP")
     parser.add_argument("--transport", choices=["stdio", "streamable-http"], default="streamable-http")
-    parser.add_argument("--host", default=os.getenv("SCHEDULER_HOST", "0.0.0.0"))
+    # === VIVENTIUM START ===
+    # Local-only installs fail closed to loopback unless a future declared remote boundary owns exposure.
+    parser.add_argument("--host", default=os.getenv("SCHEDULER_HOST", "127.0.0.1"))
+    # === VIVENTIUM END ===
     parser.add_argument("--port", type=int, default=int(os.getenv("SCHEDULER_PORT", DEFAULT_PORT)))
     args = parser.parse_args()
 

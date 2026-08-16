@@ -23,9 +23,27 @@ jest.mock('@librechat/agents', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  createSafeUser: jest.fn((user) => user || {}),
+  resolveHeaders: jest.fn(({ headers, user, body }) =>
+    Object.fromEntries(
+      Object.entries(headers || {}).map(([key, rawValue]) => [
+        key,
+        String(rawValue)
+          .replace(/\{\{LIBRECHAT_USER_ID\}\}/g, user?.id || '')
+          .replace(/\{\{LIBRECHAT_BODY_CONVERSATIONID\}\}/g, body?.conversationId || '')
+          .replace(/\{\{LIBRECHAT_BODY_MESSAGEID\}\}/g, body?.messageId || '')
+          .replace(/\{\{LIBRECHAT_BODY_VIVENTIUMSTREAMID\}\}/g, body?.viventiumStreamId || '')
+          .replace(/\{\{LIBRECHAT_BODY_VIVENTIUMSURFACE\}\}/g, body?.viventiumSurface || '')
+          .replace(
+            /\{\{LIBRECHAT_BODY_VIVENTIUMINPUTMODE\}\}/g,
+            body?.viventiumInputMode || '',
+          ),
+      ]),
+    ),
+  ),
   initializeAnthropic: jest.fn(async ({ model_parameters }) => ({
     llmConfig: {
-      model: model_parameters?.model ?? 'claude-sonnet-4-5',
+      model: model_parameters?.model ?? 'claude-opus-5',
       ...(model_parameters?.temperature != null
         ? { temperature: model_parameters.temperature }
         : {}),
@@ -49,6 +67,33 @@ jest.mock('@librechat/api', () => ({
       },
     },
   })),
+}));
+
+jest.mock('~/server/services/viventium/GlassHiveConversationProviderService', () => ({
+  attachConversationProviderCapabilityBundle: jest.fn(async () => false),
+  clearConversationProviderCapabilityBundle: jest.fn((targetAgent) => {
+    const modelParameters = targetAgent?.model_parameters || {};
+    const configuration = modelParameters.configuration || {};
+    const defaultHeaders = { ...(configuration.defaultHeaders || {}) };
+    const bearerHeaders = new Set([
+      'x-glasshive-bootstrap-bundle-b64',
+      'x-glasshive-bootstrap-timestamp',
+      'x-glasshive-bootstrap-signature',
+    ]);
+    for (const key of Object.keys(defaultHeaders)) {
+      if (bearerHeaders.has(key.toLowerCase())) {
+        delete defaultHeaders[key];
+      }
+    }
+    targetAgent.model_parameters = {
+      ...modelParameters,
+      configuration: { ...configuration, defaultHeaders },
+    };
+    return targetAgent;
+  }),
+  buildHarnessIdempotencyKey: jest.fn((role, messageId, agentId = '') =>
+    [role, agentId, messageId].filter(Boolean).join(':'),
+  ),
 }));
 
 jest.mock('~/server/services/BackgroundCortexService', () => ({
@@ -222,6 +267,30 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(updated).toEqual(
       expect.arrayContaining([expect.objectContaining({ cortex_id: 'c1', status: 'brewing' })]),
     );
+  });
+
+  test('persistCortexPartsToCanonicalMessage does not collapse graph-authored text parts', async () => {
+    const req = { user: { id: 'u1' } };
+    const graphContent = [
+      { type: 'text', agentId: 'agent-consultant', text: 'Verified evidence.' },
+      { type: 'text', agentId: 'agent-author', text: ' Final synthesis.' },
+    ];
+    db.getMessage.mockResolvedValue({
+      messageId: 'm1',
+      text: 'Verified evidence. Final synthesis.',
+      content: graphContent,
+    });
+    db.updateMessage.mockResolvedValue({ messageId: 'm1' });
+
+    const updated = await persistCortexPartsToCanonicalMessage({
+      req,
+      responseMessageId: 'm1',
+      cortexParts: [{ type: 'cortex_brewing', cortex_id: 'c1', status: 'brewing' }],
+      maxAttempts: 1,
+    });
+
+    expect(updated.slice(0, 2)).toEqual(graphContent);
+    expect(updated[0].text).not.toContain('Final synthesis.');
   });
 
   test('finalizeCanonicalCortexMessage marks the canonical parent as finished', async () => {
@@ -644,7 +713,7 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(db.saveMessage).not.toHaveBeenCalled();
   });
 
-  test('createCortexFollowUpMessage gives moved-on context to the follow-up LLM', async () => {
+  test('mission-style moved-on exemption gives Main current context but still respects NTA', async () => {
     const req = { user: { id: 'u1' } };
     db.getMessages.mockResolvedValueOnce([
       { messageId: 'm-parent', parentMessageId: 'u-parent', sender: 'AI', text: 'Earlier answer.' },
@@ -681,6 +750,7 @@ describe('BackgroundCortexFollowUpService', () => {
         insights: [{ cortexName: 'Pattern Recognition', insight: 'A now-stale reminder.' }],
       },
       recentResponse: 'Earlier answer.',
+      allowMovedOnUsefulFollowUp: true,
     });
 
     expect(msg).toBeNull();
@@ -850,6 +920,71 @@ describe('BackgroundCortexFollowUpService', () => {
 
     expect(msg).toBeNull();
     expect(db.saveMessage).not.toHaveBeenCalled();
+  });
+
+  test('mission-style exemption preserves useful Main prose when the conversation moves during generation', async () => {
+    const req = { user: { id: 'u1' } };
+    db.getMessages
+      .mockResolvedValueOnce([
+        {
+          messageId: 'm-parent',
+          parentMessageId: 'u-parent',
+          sender: 'AI',
+          text: 'Earlier answer.',
+        },
+      ])
+      .mockResolvedValueOnce([
+        {
+          messageId: 'm-parent',
+          parentMessageId: 'u-parent',
+          sender: 'AI',
+          text: 'Earlier answer.',
+        },
+        {
+          messageId: 'u-new',
+          parentMessageId: 'm-parent',
+          sender: 'User',
+          isCreatedByUser: true,
+          text: 'I am discussing something else now.',
+        },
+      ]);
+    db.saveMessage.mockResolvedValueOnce({});
+    Run.create.mockResolvedValueOnce({
+      processStream: jest.fn(async () => 'The background mission found a still-useful result.'),
+    });
+
+    const msg = await createCortexFollowUpMessage({
+      req,
+      conversationId: 'c-123',
+      parentMessageId: 'm-parent',
+      agent: { id: 'agent_123', provider: 'openai', model: 'gpt-5.4', model_parameters: {} },
+      insightsData: {
+        insights: [
+          {
+            cortexName: 'Mission evidence',
+            insight: 'The background mission found a still-useful result.',
+          },
+        ],
+      },
+      recentResponse: 'Earlier answer.',
+      forceVisibleFollowUp: false,
+      allowMovedOnUsefulFollowUp: true,
+    });
+
+    expect(msg).toEqual(
+      expect.objectContaining({
+        parentMessageId: 'u-new',
+        text: 'The background mission found a still-useful result.',
+      }),
+    );
+    expect(msg.metadata.viventium).toEqual(
+      expect.objectContaining({
+        parentMessageId: 'm-parent',
+        forceVisibleFollowUp: false,
+        allowMovedOnUsefulFollowUp: true,
+      }),
+    );
+    expect(db.saveMessage).toHaveBeenCalled();
   });
 
   test('createCortexFollowUpMessage suppresses question-only follow-up as {NTA}', async () => {
@@ -1664,10 +1799,125 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(initializeAnthropic).toHaveBeenCalledWith(
       expect.objectContaining({
         model_parameters: expect.objectContaining({
-          model: 'claude-sonnet-4-5',
+          model: 'claude-opus-5',
         }),
       }),
     );
+  });
+
+  test.each([
+    ['openai', initializeOpenAI],
+    ['anthropic', initializeAnthropic],
+  ])('strips broker bearer headers before the %s Phase B initializer', async (provider, initializer) => {
+    const req = { user: { id: 'u1' }, body: {}, config: {} };
+    await generateFollowUpText({
+      req,
+      agent: {
+        id: `agent-phase-b-${provider}`,
+        provider,
+        model_parameters: {
+          model: provider === 'openai' ? 'gpt-5.4' : 'claude-opus-5',
+          configuration: {
+            defaultHeaders: {
+              'X-GlassHive-Bootstrap-Bundle-B64': 'forbidden-bundle',
+              'x-glasshive-bootstrap-timestamp': 'forbidden-timestamp',
+              'X-GLASSHIVE-BOOTSTRAP-SIGNATURE': 'forbidden-signature',
+              'X-Safe-Presentation-Header': 'safe',
+            },
+          },
+        },
+      },
+      insightsData: {
+        insights: [{ cortexName: 'Research', insight: 'Presentation evidence is ready.' }],
+      },
+      recentResponse: 'I am checking.',
+      runId: `run-phase-b-${provider}`,
+    });
+
+    const initializerHeaders = initializer.mock.calls.at(-1)[0].model_parameters.configuration
+      .defaultHeaders;
+    expect(initializerHeaders).toEqual({ 'X-Safe-Presentation-Header': 'safe' });
+  });
+
+  test('generateFollowUpText preserves the GlassHive provider session binding for Phase B', async () => {
+    const { getCustomEndpointConfig, mapProvider } = require('~/server/services/BackgroundCortexService');
+    const {
+      attachConversationProviderCapabilityBundle,
+      clearConversationProviderCapabilityBundle,
+    } = require('~/server/services/viventium/GlassHiveConversationProviderService');
+    mapProvider.mockReturnValueOnce(null);
+    getCustomEndpointConfig.mockResolvedValueOnce({
+      apiKey: 'glasshive-provider-key',
+      baseURL: 'http://glasshive.test/v1',
+      dropParams: ['temperature', 'tools'],
+    });
+    const req = {
+      user: { id: 'user-phase-b' },
+      body: {
+        viventiumSurface: 'telegram',
+        viventiumInputMode: 'voice_note',
+        viventiumStreamId: 'stream-phase-b',
+      },
+      config: {
+        endpoints: {
+          agents: {
+            providerCapabilities: {
+              'glasshive-harness': { workspace_binding: true },
+            },
+          },
+        },
+      },
+    };
+
+    await generateFollowUpText({
+      req,
+      agent: {
+        id: 'agent-main',
+        provider: 'glasshive-harness',
+        model: 'codex-cli:gpt-5.6-sol',
+        model_parameters: { reasoning_effort: 'medium' },
+        glasshive_options: {
+          workspace: { mode: 'custom', path: '/srv/Life folder' },
+          access: 'full',
+        },
+      },
+      insightsData: {
+        insights: [{ cortexName: 'Research', insight: 'The verified result is ready.' }],
+      },
+      recentResponse: 'I am checking.',
+      runId: 'run-phase-b',
+      conversationId: 'conversation-phase-b',
+      parentMessageId: 'message-phase-b',
+    });
+
+    expect(Run.create).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        graphConfig: expect.objectContaining({
+          llmConfig: expect.objectContaining({
+            provider: 'openai',
+            model: 'codex-cli:gpt-5.6-sol',
+            dropParams: ['temperature', 'tools'],
+            configuration: expect.objectContaining({
+              baseURL: 'http://glasshive.test/v1',
+              defaultHeaders: expect.objectContaining({
+                'X-Viventium-User-Id': 'user-phase-b',
+                'X-Viventium-Conversation-Id': 'conversation-phase-b',
+                'X-Viventium-Message-Id': 'message-phase-b',
+                'X-GlassHive-Agent-Id': 'agent-main',
+                'X-GlassHive-Workspace-Mode': 'custom',
+                'X-GlassHive-Workspace-Path-B64': Buffer.from(
+                  '/srv/Life folder',
+                  'utf8',
+                ).toString('base64'),
+                'X-GlassHive-Access': 'full',
+              }),
+            }),
+          }),
+        }),
+      }),
+    );
+    expect(clearConversationProviderCapabilityBundle).toHaveBeenCalledTimes(1);
+    expect(attachConversationProviderCapabilityBundle).not.toHaveBeenCalled();
   });
 
   test('generateFollowUpText rehydrates canonical runtime provider/model when follow-up agent payload dropped provider', async () => {
@@ -1675,7 +1925,7 @@ describe('BackgroundCortexFollowUpService', () => {
     const originalProvider = process.env.VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER;
     const originalModel = process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL;
     process.env.VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER = 'anthropic';
-    process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL = 'claude-opus-4-8';
+    process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL = 'claude-opus-5';
 
     try {
       await generateFollowUpText({
@@ -1706,7 +1956,7 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(initializeAnthropic).toHaveBeenCalledWith(
       expect.objectContaining({
         model_parameters: expect.objectContaining({
-          model: 'claude-opus-4-8',
+          model: 'claude-opus-5',
         }),
       }),
     );
@@ -1717,7 +1967,7 @@ describe('BackgroundCortexFollowUpService', () => {
     const originalProvider = process.env.VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER;
     const originalModel = process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL;
     process.env.VIVENTIUM_FC_CONSCIOUS_LLM_PROVIDER = 'anthropic';
-    process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL = 'claude-opus-4-8';
+    process.env.VIVENTIUM_FC_CONSCIOUS_LLM_MODEL = 'claude-opus-5';
 
     try {
       await generateFollowUpText({
@@ -1751,7 +2001,7 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(initializeAnthropic).toHaveBeenCalledWith(
       expect.objectContaining({
         model_parameters: expect.objectContaining({
-          model: 'claude-opus-4-8',
+          model: 'claude-opus-5',
         }),
       }),
     );

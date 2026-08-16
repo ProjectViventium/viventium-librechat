@@ -7,6 +7,14 @@ const { getAppConfig } = require('~/server/services/Config/app');
 const { getProjectByName } = require('~/models/Project');
 const { getLogStores } = require('~/cache');
 const { isBrowserRegistrationOpen } = require('~/server/services/viventium/registrationGate');
+const { parallelWorkAvailable } = require('~/server/services/viventium/ViventiumOrchestrationMode');
+/* === VIVENTIUM START ===
+ * Feature: Background follow-up browser-listening parity.
+ * Purpose: Project the canonical server-side Phase B window instead of duplicating a client timer.
+ * === VIVENTIUM END === */
+const {
+  getCortexFollowupGraceSeconds,
+} = require('~/server/services/viventium/cortexFollowupGrace');
 
 const router = express.Router();
 const emailLoginEnabled =
@@ -33,6 +41,26 @@ const viventiumGlassHiveFollowupTimeoutS =
   Number.isFinite(glasshiveFollowupTimeoutS) && glasshiveFollowupTimeoutS > 0
     ? glasshiveFollowupTimeoutS
     : 600;
+
+const connectedAccountRequired = (...values) =>
+  values.some(
+    (value) =>
+      String(value || '')
+        .trim()
+        .toLowerCase() === 'connected_account',
+  );
+
+const connectedAccountAuthRequirements = () => ({
+  viventiumOpenAIConnectedAccountRequired: connectedAccountRequired(
+    process.env.VIVENTIUM_OPENAI_AUTH_MODE,
+    process.env.VIVENTIUM_PRIMARY_AUTH_MODE,
+  ),
+  viventiumAnthropicConnectedAccountRequired: connectedAccountRequired(
+    process.env.VIVENTIUM_ANTHROPIC_AUTH_MODE,
+    process.env.VIVENTIUM_PRIMARY_AUTH_MODE,
+    process.env.VIVENTIUM_SECONDARY_AUTH_MODE,
+  ),
+});
 // VIVENTIUM END
 
 router.get('/', async function (req, res) {
@@ -42,7 +70,11 @@ router.get('/', async function (req, res) {
   const cachedStartupConfig =
     bootstrapRegistrationOnce === true ? null : await cache.get(CacheKeys.STARTUP_CONFIG);
   if (cachedStartupConfig) {
-    res.send(cachedStartupConfig);
+    res.send({
+      ...cachedStartupConfig,
+      viventiumParallelWorkAvailable: parallelWorkAvailable(),
+      ...connectedAccountAuthRequirements(),
+    });
     return;
   }
 
@@ -117,6 +149,16 @@ router.get('/', async function (req, res) {
        * Purpose: Gate OAuth-only OpenAI/Anthropic account connection UI to local/self-hosted mode.
        * === VIVENTIUM END === */
       viventiumConnectedAccountsEnabled: isEnabled(process.env.VIVENTIUM_LOCAL_SUBSCRIPTION_AUTH),
+      ...connectedAccountAuthRequirements(),
+      /* === VIVENTIUM START ===
+       * Feature: Easy Install browser-first onboarding.
+       * Purpose: Project the bounded installer experience into the authenticated first-user UI.
+       * === VIVENTIUM END === */
+      viventiumInstallExperience: ['express', 'custom', 'legacy'].includes(
+        process.env.VIVENTIUM_INSTALL_EXPERIENCE,
+      )
+        ? process.env.VIVENTIUM_INSTALL_EXPERIENCE
+        : undefined,
       /* === VIVENTIUM START ===
        * Feature: Prompt Workbench local launcher.
        * Purpose: Keep the Connected Accounts workbench entry in sync with the server-side local
@@ -126,12 +168,30 @@ router.get('/', async function (req, res) {
         isEnabled(process.env.VIVENTIUM_LOCAL_SUBSCRIPTION_AUTH) &&
         !isEnabled(process.env.VIVENTIUM_PROMPT_WORKBENCH_LINK_DISABLED),
       /* === VIVENTIUM START ===
+       * Feature: WHOOP owner onboarding visibility.
+       * Purpose: Keep the browser card aligned with the admin-only local health route.
+       * === VIVENTIUM END === */
+      viventiumHealthWhoopEnabled:
+        isEnabled(process.env.VIVENTIUM_LOCAL_SUBSCRIPTION_AUTH) &&
+        isEnabled(process.env.VIVENTIUM_HEALTH_ENABLED),
+      /* === VIVENTIUM START ===
        * Feature: Feelings instrument availability.
        * Purpose: Keep navigation aligned with the operator-level feature gate.
        * === VIVENTIUM END === */
       viventiumFeelingsAvailable:
         process.env.VIVENTIUM_FEELINGS_AVAILABLE == null ||
         isEnabled(process.env.VIVENTIUM_FEELINGS_AVAILABLE),
+      /* === VIVENTIUM START ===
+       * Feature: Parallel work staged availability.
+       * Purpose: Keep every product control dark until durable runtime admission gates pass.
+       * === VIVENTIUM END === */
+      viventiumParallelWorkAvailable: parallelWorkAvailable(),
+      /* === VIVENTIUM START ===
+       * Feature: Background follow-up browser-listening parity.
+       * Purpose: Bound Web query refreshes with the same compiled window as Phase B surfaces.
+       * This is a listening window only; it does not cancel or deadline background execution.
+       * === VIVENTIUM END === */
+      viventiumBackgroundFollowupWindowS: getCortexFollowupGraceSeconds(),
       /* === VIVENTIUM START ===
        * Feature: GlassHive host worker callbacks.
        * Purpose: Project the compiled callback wait window into the web client.

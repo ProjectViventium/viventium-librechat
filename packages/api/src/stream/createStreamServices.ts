@@ -89,9 +89,15 @@ export function createStreamServices(config: StreamServicesConfig = {}): StreamS
       // For subscribing, we need a dedicated connection
       // If subscriber not provided, duplicate the main client
       let subscriber = redisSubscriber;
+      /* === VIVENTIUM START ===
+       * Feature: Redis stream lifecycle cleanup.
+       * Purpose: Tell the transport when it owns the duplicated subscriber socket.
+       * === VIVENTIUM END === */
+      let closeSubscriberOnDestroy = false;
 
       if (!subscriber && 'duplicate' in redisClient) {
         subscriber = (redisClient as Redis).duplicate();
+        closeSubscriberOnDestroy = true;
         logger.info('[StreamServices] Duplicated Redis client for subscriber');
       }
 
@@ -101,7 +107,9 @@ export function createStreamServices(config: StreamServicesConfig = {}): StreamS
       }
 
       const jobStore = new RedisJobStore(redisClient);
-      const eventTransport = new RedisEventTransport(redisClient, subscriber);
+      const eventTransport = new RedisEventTransport(redisClient, subscriber, {
+        closeSubscriberOnDestroy,
+      });
 
       logger.info('[StreamServices] Created Redis-backed stream services');
 

@@ -32,6 +32,22 @@ function anthropicConnectedAccountReconnectError(): ViventiumConnectedAccountRec
   error.viventiumConnectedAccountProvider = 'Anthropic';
   return error;
 }
+
+function isTerminalAnthropicConnectedAccountAuthFailure(error: unknown): boolean {
+  if (error == null || typeof error !== 'object') {
+    return false;
+  }
+  const candidate = error as {
+    status?: unknown;
+    statusCode?: unknown;
+    code?: unknown;
+    error?: { type?: unknown };
+    response?: { status?: unknown };
+  };
+  const status = Number(candidate.status ?? candidate.statusCode ?? candidate.response?.status);
+  const code = String(candidate.code || candidate.error?.type || '').trim().toLowerCase();
+  return status === 401 || status === 403 || code === 'invalid_grant' || code === 'authentication_error';
+}
 /* === VIVENTIUM END === */
 
 const isNoUserKeyError = (error: unknown): boolean => {
@@ -76,6 +92,10 @@ const isAnthropicConnectedAccountReadError = (error: unknown): boolean => {
     message.includes('invalid key length')
   );
 };
+
+const isAnthropicConnectedAccountReconnectFailure = (error: unknown): boolean =>
+  error instanceof Error &&
+  error.message.includes('Anthropic connected account needs reconnect');
 
 const isConnectedAccountAuthMode = (): boolean => {
   const values = [
@@ -171,6 +191,8 @@ export async function initializeAnthropic({
         if (isConnectedAccountAuthMode()) {
           throw anthropicConnectedAccountReconnectError();
         }
+      } else if (isAnthropicConnectedAccountReconnectFailure(error)) {
+        throw anthropicConnectedAccountReconnectError();
       } else if (!isNoUserKeyError(error)) {
         throw error;
       }
@@ -202,6 +224,24 @@ export async function initializeAnthropic({
     reverseProxyUrl: ANTHROPIC_REVERSE_PROXY ?? undefined,
     ...(userValues?.oauthType ? { oauthType: userValues.oauthType } : {}),
     ...(userValues?.oauthProvider ? { oauthProvider: userValues.oauthProvider } : {}),
+    ...(userValues?.oauthProvider === 'anthropic' && userValues?.oauthType === 'subscription'
+      ? {
+          connectedAccountAuthFailure: async (error: unknown) => {
+            if (!isTerminalAnthropicConnectedAccountAuthFailure(error)) {
+              return;
+            }
+            if (db.updateUserKey) {
+              await db.updateUserKey({
+                userId: req.user?.id ?? '',
+                name: EModelEndpoint.anthropic,
+                value: JSON.stringify({ ...userValues, oauthReconnectRequired: true }),
+                expiresAt: null,
+              });
+            }
+            throw anthropicConnectedAccountReconnectError();
+          },
+        }
+      : {}),
     modelOptions: {
       ...(model_parameters ?? {}),
       user: req.user?.id,
@@ -227,3 +267,5 @@ export async function initializeAnthropic({
 
   return result;
 }
+
+export { isTerminalAnthropicConnectedAccountAuthFailure };

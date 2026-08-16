@@ -13,3 +13,20 @@ export const CONNECTED_ACCOUNTS_OPEN_EVENT = 'viventium:open-connected-accounts'
 export const CONNECTED_ACCOUNTS_MANUAL_FLOW_EVENT = 'viventium:connected-accounts-manual-flow';
 export const CONNECTED_ACCOUNTS_MANUAL_FLOW_STORAGE_KEY =
   'viventium:connected-accounts:manual-flow';
+
+export function shouldOpenConnectedAccountsSetup(
+  installExperience: string | undefined,
+  search: string,
+): boolean {
+  if (installExperience !== 'express') {
+    return false;
+  }
+  return new URLSearchParams(search).get('setup') === 'accounts';
+}
+
+export function removeSetupParamFromUrl(pathname: string, search: string, hash: string): string {
+  const nextSearch = new URLSearchParams(search);
+  nextSearch.delete('setup');
+  const serializedSearch = nextSearch.toString();
+  return `${pathname}${serializedSearch ? `?${serializedSearch}` : ''}${hash}`;
+}

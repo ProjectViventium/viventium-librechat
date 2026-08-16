@@ -1,3 +1,4 @@
+// VIVENTIUM START: verify Viventium background-cortex activation policy behavior.
 const {
   buildActivationPolicySection,
   applyActivationJsonMode,
@@ -24,6 +25,7 @@ const {
   shouldProbeSuppressedActivationAttempt,
   activationProviderAttemptsUnavailable,
   isActivationFallbackCandidate,
+  parseActivationResponse,
   activationFailureVisibility,
   shouldSurfaceActivationProviderUnavailable,
   shouldSurfaceActivationTimeout,
@@ -32,6 +34,8 @@ const {
   detectActivations,
   normalizePhaseANoticeMode,
   resolvePhaseANoticeModeForRequest,
+  isBackgroundCortexCancellationSignal,
+  prepareCortexConversationProviderCapability,
 } = require('../BackgroundCortexService');
 const fs = require('fs');
 const path = require('path');
@@ -44,7 +48,40 @@ describe('BackgroundCortexService activation policy helpers', () => {
     delete process.env.VIVENTIUM_CORTEX_PHASE_A_NOTICE_MODE;
   });
 
-  test('injects a pinned feeling capsule only into the configured all-agent scope', () => {
+  test('installs invocation-fresh capability refresh after the scoped cortex bundle', async () => {
+    const attachBundle = jest.fn().mockResolvedValue(true);
+    const installRefresher = jest.fn().mockReturnValue(true);
+    const args = {
+      targetAgent: { id: 'cortex-runtime' },
+      declaredAgent: { id: 'cortex-declared' },
+      req: { user: { id: 'user-synthetic' } },
+      capability: { workspace_binding: true },
+      requestBody: { conversationId: 'conversation-synthetic', messageId: 'message-synthetic' },
+    };
+
+    await expect(
+      prepareCortexConversationProviderCapability({
+        ...args,
+        attachBundle,
+        installRefresher,
+      }),
+    ).resolves.toBe(true);
+    expect(attachBundle).toHaveBeenCalledWith(args);
+    expect(installRefresher).toHaveBeenCalledWith(args);
+  });
+
+  test('keeps detached Phase B alive after Main cleanup but honors intentional Stop', () => {
+    expect(
+      isBackgroundCortexCancellationSignal({ aborted: true, reason: 'generation_completed' }),
+    ).toBe(false);
+    expect(isBackgroundCortexCancellationSignal({ aborted: true, reason: 'user_cancelled' })).toBe(
+      true,
+    );
+    expect(isBackgroundCortexCancellationSignal({ aborted: false })).toBe(false);
+    expect(isBackgroundCortexCancellationSignal(null)).toBe(false);
+  });
+
+  test('keeps specialist background cortices independent from the pinned embodiment capsule', () => {
     const capsule = '<viventium_feeling_state>\n- Energy: steady\n</viventium_feeling_state>';
     expect(
       feelingTailForBackgroundAgent({
@@ -53,7 +90,7 @@ describe('BackgroundCortexService activation policy helpers', () => {
         agentScope: 'all_agents',
         capsule,
       }),
-    ).toBe(capsule);
+    ).toBe('');
     expect(
       feelingTailForBackgroundAgent({
         available: true,
@@ -215,8 +252,8 @@ describe('BackgroundCortexService activation policy helpers', () => {
       fallbacks: [
         { provider: 'groq', model: 'qwen/qwen3.6-27b' },
         { provider: 'xai', model: 'grok-4.20-non-reasoning' },
-        { provider: 'openai', model: 'gpt-5.4' },
         { provider: 'anthropic', model: 'claude-haiku-4-5' },
+        { provider: 'openai', model: 'gpt-5.4' },
       ],
     });
 
@@ -227,8 +264,8 @@ describe('BackgroundCortexService activation policy helpers', () => {
         source: 'primary',
       },
       { provider: 'xai', model: 'grok-4.20-non-reasoning', source: 'fallback' },
-      { provider: 'openai', model: 'gpt-5.4', source: 'fallback' },
       { provider: 'anthropic', model: 'claude-haiku-4-5', source: 'fallback' },
+      { provider: 'openai', model: 'gpt-5.4', source: 'fallback' },
     ]);
   });
 
@@ -236,7 +273,62 @@ describe('BackgroundCortexService activation policy helpers', () => {
     expect(isActivationFallbackCandidate({ code: 'MODEL_NOT_FOUND', status: 404 })).toBe(true);
     expect(isActivationFallbackCandidate({ code: 'MODEL_DECOMMISSIONED', status: 404 })).toBe(true);
     expect(isActivationFallbackCandidate({ code: 'JSON_VALIDATE_FAILED', status: 400 })).toBe(true);
+    expect(
+      isActivationFallbackCandidate(new Error('provider initialization failed'), {
+        class: 'provider_error',
+        status: null,
+        code: '',
+      }),
+    ).toBe(true);
     expect(isActivationFallbackCandidate({ code: 'INVALID_REQUEST', status: 400 })).toBe(false);
+  });
+
+  test('treats an unparseable completed classifier response as unavailable fallback evidence', () => {
+    let parseError;
+    try {
+      parseActivationResponse('provider returned prose instead of the required JSON object');
+    } catch (error) {
+      parseError = error;
+    }
+
+    expect(parseError).toEqual(
+      expect.objectContaining({
+        code: 'JSON_PARSE_FAILED',
+      }),
+    );
+    const errorSummary = summarizeActivationError(parseError);
+    expect(errorSummary).toEqual(
+      expect.objectContaining({
+        class: 'provider_invalid_response',
+        code: 'JSON_PARSE_FAILED',
+      }),
+    );
+    expect(isActivationFallbackCandidate(parseError, errorSummary)).toBe(true);
+    expect(
+      activationProviderAttemptsUnavailable([
+        {
+          status: 'error',
+          error: errorSummary,
+        },
+      ]),
+    ).toBe(true);
+  });
+
+  test('rejects schema-invalid classifier JSON instead of coercing it into a decision', () => {
+    for (const response of [
+      '{}',
+      '{"activate":"false","confidence":0.9,"reason":"wrong type"}',
+      '{"activate":false,"confidence":"0.9","reason":"wrong type"}',
+      '{"activate":true,"confidence":1.4,"reason":"out of range"}',
+    ]) {
+      expect(() => parseActivationResponse(response)).toThrow(
+        expect.objectContaining({ code: 'JSON_VALIDATE_FAILED' }),
+      );
+    }
+
+    expect(
+      parseActivationResponse('{"should_activate":false,"confidence":0.91,"reason":"valid alias"}'),
+    ).toEqual({ activate: false, confidence: 0.91, reason: 'valid alias' });
   });
 
   test('renders configured direct-action surfaces only when exact tools are attached', () => {
@@ -501,9 +593,9 @@ describe('BackgroundCortexService activation policy helpers', () => {
       expect.arrayContaining([
         expect.objectContaining({
           server: 'google-workspace',
-          same_scope_background_allowed: true,
+          same_scope_background_allowed: false,
         }),
-        expect.objectContaining({ server: 'ms365', same_scope_background_allowed: true }),
+        expect.objectContaining({ server: 'ms365', same_scope_background_allowed: false }),
       ]),
     );
     expect(declaredTools).not.toContain('web_search');
@@ -651,6 +743,24 @@ describe('BackgroundCortexService activation policy helpers', () => {
         insight: 'Useful supporting evidence.',
         silent: false,
         no_response: false,
+      }),
+    );
+  });
+
+  test('preserves public fallback disclosure on cortex completion', () => {
+    expect(
+      buildCortexCompletionPayload({
+        agentId: 'agent_research',
+        agentName: 'Deep Research',
+        insight: 'Useful fallback evidence.',
+        fallbackUsed: true,
+        primaryErrorClass: 'provider_unauthorized',
+      }),
+    ).toEqual(
+      expect.objectContaining({
+        status: 'complete',
+        fallback_used: true,
+        fallback_reason_class: 'provider_unauthorized',
       }),
     );
   });
@@ -1022,8 +1132,21 @@ describe('BackgroundCortexService activation policy helpers', () => {
     expect(llmConfig.modelKwargs).toBeUndefined();
   });
 
+  test('fails loudly when an activation provider cannot be resolved exactly', async () => {
+    await expect(
+      buildActivationLlmConfig({
+        providerName: 'missing-provider',
+        model: 'missing-model',
+        req: { user: { id: 'user-test' }, config: { endpoints: { custom: [] } } },
+      }),
+    ).rejects.toThrow('Unsupported or unavailable activation provider');
+  });
+
   test('adds a bounded guard grace around each Phase B cortex attempt', () => {
+    const previousTimeout = process.env.VIVENTIUM_CORTEX_EXECUTION_TIMEOUT_MS;
     const previous = process.env.VIVENTIUM_CORTEX_EXECUTION_GUARD_GRACE_MS;
+    delete process.env.VIVENTIUM_CORTEX_EXECUTION_TIMEOUT_MS;
+    expect(getCortexAttemptGuardTimeoutMs()).toBe(0);
     process.env.VIVENTIUM_CORTEX_EXECUTION_GUARD_GRACE_MS = '5000';
     expect(getCortexAttemptGuardTimeoutMs(1000)).toBe(6000);
     process.env.VIVENTIUM_CORTEX_EXECUTION_GUARD_GRACE_MS = '120000';
@@ -1032,6 +1155,11 @@ describe('BackgroundCortexService activation policy helpers', () => {
       delete process.env.VIVENTIUM_CORTEX_EXECUTION_GUARD_GRACE_MS;
     } else {
       process.env.VIVENTIUM_CORTEX_EXECUTION_GUARD_GRACE_MS = previous;
+    }
+    if (previousTimeout == null) {
+      delete process.env.VIVENTIUM_CORTEX_EXECUTION_TIMEOUT_MS;
+    } else {
+      process.env.VIVENTIUM_CORTEX_EXECUTION_TIMEOUT_MS = previousTimeout;
     }
   });
 
@@ -1137,4 +1265,54 @@ describe('BackgroundCortexService activation policy helpers', () => {
       reasoning_effort: 'high',
     });
   });
+
+  test('preserves capability-declared high effort for a GlassHive background fallback', async () => {
+    const fallbackAgent = await resolveBackgroundCortexFallbackAgent({
+      req: {
+        config: {
+          endpoints: {
+            agents: {
+              allowedProviders: ['openAI', 'glasshive-harness'],
+              providerCapabilities: {
+                'glasshive-harness': {
+                  automatic_fallback_target: true,
+                  models: [
+                    {
+                      id: 'claude-code:opus',
+                      effortChoices: ['low', 'medium', 'high', 'xhigh', 'max'],
+                    },
+                  ],
+                },
+              },
+            },
+          },
+        },
+      },
+      modelsConfig: {
+        'glasshive-harness': ['claude-code:opus'],
+      },
+      cortexAgent: {
+        id: 'agent_viventium_confirmation_bias_95aeb3',
+        provider: 'openAI',
+        model: 'gpt-5.6-sol',
+        model_parameters: { model: 'gpt-5.6-sol' },
+        fallback_llm_provider: 'glasshive-harness',
+        fallback_llm_model: 'claude-code:opus',
+        fallback_llm_model_parameters: {
+          model: 'claude-code:opus',
+          reasoning_effort: 'high',
+        },
+      },
+    });
+
+    expect(fallbackAgent).toMatchObject({
+      provider: 'glasshive-harness',
+      model: 'claude-code:opus',
+      model_parameters: {
+        model: 'claude-code:opus',
+        reasoning_effort: 'high',
+      },
+    });
+  });
 });
+// VIVENTIUM END

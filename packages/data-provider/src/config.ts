@@ -284,6 +284,50 @@ export const defaultAgentCapabilities = [
   AgentCapabilities.ocr,
 ];
 
+/* === VIVENTIUM START ===
+ * Feature: Config-sourced provider capability registry
+ * Purpose: Let every consumer filter provider roles and render provider/model metadata without
+ * branching on provider labels or model-name substrings.
+ * === VIVENTIUM END === */
+export const agentProviderModelCapabilitySchema = z.object({
+  id: z.string(),
+  label: z.string(),
+  harnessProfile: z.string().optional(),
+  effortChoices: z.array(z.string()).default([]),
+  recommendedEffort: z.string().optional(),
+  contextLimit: z.number().int().positive().optional(),
+});
+
+export const agentProviderCapabilitySchema = z.object({
+  label: z.string(),
+  main_chat: z.boolean().default(false),
+  cortex_execution: z.boolean().default(false),
+  phase_b_followup: z.boolean().default(false),
+  activation_classifier: z.boolean().default(false),
+  realtime_voice: z.boolean().default(false),
+  automatic_fallback_target: z.boolean().default(false),
+  serial_model_fallback: z.boolean().default(false),
+  workspace_binding: z.boolean().default(false),
+  conversation_session: z.boolean().default(false),
+  /** @deprecated Ambiguous pre-contract field; retained only for older config compatibility. */
+  native_tools: z.boolean().default(false),
+  worker_native_tools: z.boolean().default(false),
+  host_tools_transport: z.enum(['none', 'broker_mcp']).default('none'),
+  host_tools: z.array(z.string()).default([]),
+  /**
+   * VIVENTIUM: Core-owned top-level orchestration facades available only to an authenticated
+   * conversation orchestrator. This is deliberately separate from `host_tools`: mission roots
+   * inherit the latter as their bounded capability set and must never inherit peer-spawn/control.
+   */
+  conversation_orchestration_tools: z.array(z.string()).default([]),
+  activity_stream: z.boolean().default(false),
+  responses_api: z.boolean().default(false),
+  excluded_mcp_servers: z.array(z.string()).optional().default([]),
+  models: z.array(agentProviderModelCapabilitySchema).default([]),
+});
+
+export type TAgentProviderCapability = z.infer<typeof agentProviderCapabilitySchema>;
+
 export const agentsEndpointSchema = baseEndpointSchema
   .merge(
     z.object({
@@ -295,12 +339,26 @@ export const agentsEndpointSchema = baseEndpointSchema
       maxCitationsPerFile: z.number().min(1).max(10).optional().default(7),
       minRelevanceScore: z.number().min(0.0).max(1.0).optional().default(0.45),
       allowedProviders: z.array(z.union([z.string(), eModelEndpointSchema])).optional(),
+      providerCapabilities: z.record(agentProviderCapabilitySchema).optional().default({}),
+      capabilityRequiredProviders: z.array(z.string()).optional().default([]),
       capabilities: z
         .array(z.nativeEnum(AgentCapabilities))
         .optional()
         .default(defaultAgentCapabilities),
     }),
   )
+  .superRefine((value, context) => {
+    for (const provider of value.capabilityRequiredProviders ?? []) {
+      if (value.providerCapabilities?.[provider]) {
+        continue;
+      }
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['providerCapabilities', provider],
+        message: `Provider capability configuration is required for ${provider}`,
+      });
+    }
+  })
   .default({
     disableBuilder: false,
     capabilities: defaultAgentCapabilities,
@@ -796,12 +854,29 @@ export type TStartupConfig = {
    * === VIVENTIUM END === */
   viventiumConnectedAccountsEnabled?: boolean;
   /* === VIVENTIUM START ===
+   * Feature: Express browser-first onboarding.
+   * Purpose: Expose only the bounded install experience needed for the first-user handoff.
+   * === VIVENTIUM END === */
+  viventiumInstallExperience?: 'express' | 'custom' | 'legacy';
+  /* === VIVENTIUM START ===
    * Feature: Prompt Workbench local launcher.
    * Purpose: Expose the server-side workbench link gate to the web client.
    * === VIVENTIUM END === */
   viventiumPromptWorkbenchLinkEnabled?: boolean;
+  /* === VIVENTIUM START ===
+   * Feature: WHOOP owner onboarding visibility.
+   * Purpose: Show the host-owner connector only when the compiled health integration is enabled.
+   * === VIVENTIUM END === */
+  viventiumHealthWhoopEnabled?: boolean;
   /** Operator-level Feelings instrument availability. */
   viventiumFeelingsAvailable?: boolean;
+  /** Dark-release gate for account-wide Parallel work controls and automatic delegation. */
+  viventiumParallelWorkAvailable?: boolean;
+  /* === VIVENTIUM START ===
+   * Feature: Background follow-up browser-listening parity.
+   * Purpose: Expose the canonical Phase B listening window without making it an execution deadline.
+   * === VIVENTIUM END === */
+  viventiumBackgroundFollowupWindowS?: number;
   /* === VIVENTIUM START ===
    * Feature: GlassHive host worker callbacks.
    * Purpose: Expose the compiled callback wait window to the web polling hook.
@@ -984,7 +1059,7 @@ export const memorySchema = z.object({
    * === VIVENTIUM END === */
   readProfile: z
     .object({
-      tokenLimit: z.number().optional().default(1800),
+      tokenLimit: z.number().optional().default(8000),
       keyLimits: z.record(z.number()).optional(),
       keyOrder: z.array(z.string()).optional(),
       cacheTtlMs: z.number().optional().default(30000),
@@ -1284,11 +1359,11 @@ const sharedOpenAIModels = [
 ];
 
 const sharedAnthropicModels = [
-  'claude-opus-4-8', // VIVENTIUM: opus-4.8 support (2026-05-29 eval; subscription-granted)
+  /* === VIVENTIUM START === Current direct Anthropic route. === */
+  'claude-opus-5',
+  /* === VIVENTIUM END === */
   'claude-opus-4-7',
   'claude-opus-4-6',
-  'claude-sonnet-4-5',
-  'claude-sonnet-4-5-20250929',
   'claude-haiku-4-5',
   'claude-haiku-4-5-20251001',
   'claude-opus-4-1',
@@ -1308,7 +1383,6 @@ const sharedAnthropicModels = [
 
 export const bedrockModels = [
   'anthropic.claude-opus-4-7',
-  'anthropic.claude-sonnet-4-5-20250929-v1:0',
   'anthropic.claude-haiku-4-5-20251001-v1:0',
   'anthropic.claude-opus-4-1-20250805-v1:0',
   'anthropic.claude-3-5-sonnet-20241022-v2:0',

@@ -1,3 +1,4 @@
+// VIVENTIUM START: protect non-interactive MCP authorization and recovery contracts.
 jest.mock('@librechat/data-schemas', () => ({
   logger: {
     debug: jest.fn(),
@@ -164,4 +165,123 @@ describe('reinitMCPServer', () => {
       },
     });
   });
+
+  it('returns OAuth unavailable without starting a flow for a non-interactive caller', async () => {
+    const mcpManager = {
+      getConnection: jest.fn(),
+      discoverServerTools: jest.fn(),
+    };
+
+    getMCPManager.mockReturnValue(mcpManager);
+    mockRegistryInstance.getServerConfig.mockResolvedValue({
+      url: 'http://localhost:8111/mcp',
+      requiresOAuth: true,
+    });
+    findToken.mockResolvedValue(null);
+
+    const result = await reinitMCPServer({
+      user: { id: 'user-123' },
+      serverName: 'google_workspace',
+      suppressOAuthFlow: true,
+    });
+
+    expect(result).toMatchObject({
+      availableTools: null,
+      success: false,
+      failureClass: 'oauth_authorization_unavailable',
+      oauthRequired: true,
+      oauthUrl: null,
+      serverName: 'google_workspace',
+    });
+    expect(getFlowStateManager).not.toHaveBeenCalled();
+    expect(mcpManager.getConnection).not.toHaveBeenCalled();
+    expect(mcpManager.discoverServerTools).not.toHaveBeenCalled();
+    expect(MCPOAuthHandler.initiateOAuthFlow).not.toHaveBeenCalled();
+  });
+
+  it('reports a revoked stored authorization without falling back to an OAuth flow', async () => {
+    const mcpManager = {
+      getConnection: jest.fn().mockRejectedValue(new Error('Missing or invalid access token')),
+      discoverServerTools: jest.fn(),
+    };
+
+    getMCPManager.mockReturnValue(mcpManager);
+    getFlowStateManager.mockReturnValue({ createFlow: jest.fn() });
+    mockRegistryInstance.getServerConfig.mockResolvedValue({
+      url: 'http://localhost:6274/mcp',
+      requiresOAuth: true,
+    });
+    findToken
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ token: 'stored-refresh-token', expiresAt: null });
+
+    const result = await reinitMCPServer({
+      user: { id: 'user-123' },
+      serverName: 'ms-365',
+      suppressOAuthFlow: true,
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      failureClass: 'oauth_authorization_unavailable',
+      oauthRequired: true,
+      oauthUrl: null,
+      serverName: 'ms-365',
+    });
+    expect(mcpManager.discoverServerTools).not.toHaveBeenCalled();
+    expect(MCPOAuthHandler.initiateOAuthFlow).not.toHaveBeenCalled();
+  });
+
+  it('returns an explicit failure result when reinitialization throws before connecting', async () => {
+    mockRegistryInstance.getServerConfig.mockRejectedValue(new Error('registry unavailable'));
+
+    const result = await reinitMCPServer({
+      user: { id: 'user-123' },
+      serverName: 'glasshive-workers-projects',
+    });
+
+    expect(result).toEqual({
+      availableTools: null,
+      success: false,
+      failureClass: 'reinitialization_error',
+      message: "Failed to reinitialize MCP server 'glasshive-workers-projects'",
+      oauthRequired: false,
+      serverName: 'glasshive-workers-projects',
+      oauthUrl: null,
+      tools: null,
+    });
+  });
+
+  it('preserves OAuth state when a later reinitialization step fails', async () => {
+    const discoveredTools = [{ name: 'list_docs', inputSchema: {} }];
+    const mcpManager = {
+      getConnection: jest.fn().mockImplementation(async ({ oauthStart }) => {
+        await oauthStart('https://accounts.example.com/oauth');
+        throw new Error('OAuth flow initiated - return early');
+      }),
+      discoverServerTools: jest.fn().mockResolvedValue({ tools: discoveredTools }),
+    };
+
+    getMCPManager.mockReturnValue(mcpManager);
+    mockRegistryInstance.getServerConfig.mockResolvedValue({
+      url: 'http://localhost:8113/mcp',
+      requiresOAuth: true,
+    });
+    findToken.mockResolvedValue(null);
+    updateMCPServerTools.mockRejectedValue(new Error('tool cache unavailable'));
+
+    const result = await reinitMCPServer({
+      user: { id: 'user-123' },
+      serverName: 'google_workspace',
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      failureClass: 'reinitialization_error',
+      oauthRequired: true,
+      oauthUrl: 'https://accounts.example.com/oauth',
+      tools: discoveredTools,
+    });
+  });
 });
+// VIVENTIUM END

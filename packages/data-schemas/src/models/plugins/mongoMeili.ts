@@ -804,15 +804,30 @@ export default function mongoMeili(schema: Schema, options: MongoMeiliOptions): 
 
   // Register Mongoose hooks
   schema.post('save', function (doc: DocumentWithMeiliIndex, next) {
-    doc.postSaveHook?.(next);
+    if (typeof doc?.postSaveHook === 'function') {
+      return doc.postSaveHook(next);
+    }
+    next();
   });
 
   schema.post('updateOne', function (doc: DocumentWithMeiliIndex, next) {
-    doc.postUpdateHook?.(next);
+    /* === VIVENTIUM START ===
+     * Feature: Non-blocking model-level persistence hooks.
+     * Purpose: Query middleware receives Mongo's update result rather than a hydrated document.
+     * Optional chaining without calling `next()` leaves Model.updateOne() pending forever when
+     * Meili is enabled, including trusted scheduler visibility updates.
+     * === VIVENTIUM END === */
+    if (typeof doc?.postUpdateHook === 'function') {
+      return doc.postUpdateHook(next);
+    }
+    next();
   });
 
   schema.post('deleteOne', function (doc: DocumentWithMeiliIndex, next) {
-    doc.postRemoveHook?.(next);
+    if (typeof doc?.postRemoveHook === 'function') {
+      return doc.postRemoveHook(next);
+    }
+    next();
   });
 
   // Pre-deleteMany hook: remove corresponding documents from MeiliSearch when multiple documents are deleted.

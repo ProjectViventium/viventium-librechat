@@ -26,6 +26,7 @@ interface PubSubMessage {
   seq?: number;
   data?: unknown;
   error?: string;
+  reason?: string;
 }
 
 /**
@@ -61,7 +62,7 @@ interface StreamSubscribers {
   >;
   allSubscribersLeftCallbacks: Array<() => void>;
   /** Abort callbacks - called when abort signal is received from any replica */
-  abortCallbacks: Array<() => void>;
+  abortCallbacks: Array<(reason?: string) => void>;
   /** Reorder buffer for handling out-of-order delivery in Redis Cluster */
   reorderBuffer: ReorderBuffer;
 }
@@ -90,10 +91,20 @@ export class RedisEventTransport implements IEventTransport {
   private publisher: Redis | Cluster;
   /** Redis client for subscribing to events (separate connection required) */
   private subscriber: Redis | Cluster;
+  /* === VIVENTIUM START ===
+   * Feature: Redis stream lifecycle cleanup.
+   * Purpose: Close factory-created subscriber sockets while preserving caller-owned clients.
+   * === VIVENTIUM END === */
+  private closeSubscriberOnDestroy: boolean;
   /** Track subscribers per stream */
   private streams = new Map<string, StreamSubscribers>();
   /** Track which channels we're subscribed to */
   private subscribedChannels = new Set<string>();
+  /* === VIVENTIUM START ===
+   * Feature: Exact stream supersession.
+   * Purpose: Distinguish a requested Redis subscription from one acknowledged by the server.
+   * === VIVENTIUM END === */
+  private pendingSubscriptions = new Map<string, Promise<void>>();
   /** Counter for generating unique subscriber IDs */
   private subscriberIdCounter = 0;
   /** Sequence counters per stream for publishing (ensures ordered delivery in cluster mode) */
@@ -117,15 +128,65 @@ export class RedisEventTransport implements IEventTransport {
     };
   }
 
+  /* === VIVENTIUM START ===
+   * Feature: Exact stream supersession.
+   * Purpose: Share one acknowledged subscription per channel and never advertise readiness early.
+   * === VIVENTIUM END === */
+  private ensureChannelSubscribed(channel: string): Promise<void> {
+    if (this.subscribedChannels.has(channel)) {
+      return Promise.resolve();
+    }
+    const existing = this.pendingSubscriptions.get(channel);
+    if (existing) {
+      return existing;
+    }
+
+    let readiness!: Promise<void>;
+    readiness = Promise.resolve(this.subscriber.subscribe(channel)).then(
+      () => {
+        if (this.pendingSubscriptions.get(channel) === readiness) {
+          this.pendingSubscriptions.delete(channel);
+          this.subscribedChannels.add(channel);
+        }
+      },
+      (error: unknown) => {
+        if (this.pendingSubscriptions.get(channel) === readiness) {
+          this.pendingSubscriptions.delete(channel);
+        }
+        this.subscribedChannels.delete(channel);
+        throw error;
+      },
+    );
+    this.pendingSubscriptions.set(channel, readiness);
+    return readiness;
+  }
+
+  private unsubscribeChannel(channel: string): void {
+    const hadPending = this.pendingSubscriptions.delete(channel);
+    const wasSubscribed = this.subscribedChannels.delete(channel);
+    if (!hadPending && !wasSubscribed) {
+      return;
+    }
+    this.subscriber.unsubscribe(channel).catch((err) => {
+      logger.error(`[RedisEventTransport] Failed to cleanup ${channel}:`, err);
+    });
+  }
+
   /**
    * Create a new Redis event transport.
    *
    * @param publisher - Redis client for publishing (can be shared)
    * @param subscriber - Redis client for subscribing (must be dedicated)
+   * @param options - Subscriber ownership used for deterministic lifecycle cleanup
    */
-  constructor(publisher: Redis | Cluster, subscriber: Redis | Cluster) {
+  constructor(
+    publisher: Redis | Cluster,
+    subscriber: Redis | Cluster,
+    options: { closeSubscriberOnDestroy?: boolean } = {},
+  ) {
     this.publisher = publisher;
     this.subscriber = subscriber;
+    this.closeSubscriberOnDestroy = options.closeSubscriberOnDestroy ?? false;
 
     // Set up message handler for all subscriptions
     this.subscriber.on('message', (channel: string, message: string) => {
@@ -328,7 +389,7 @@ export class RedisEventTransport implements IEventTransport {
     if (message.type === EventTypes.ABORT) {
       for (const callback of streamState.abortCallbacks) {
         try {
-          callback();
+          callback(message.reason);
         } catch (err) {
           logger.error(`[RedisEventTransport] Error in abort callback:`, err);
         }
@@ -349,7 +410,7 @@ export class RedisEventTransport implements IEventTransport {
       onDone?: (event: unknown) => void;
       onError?: (error: string) => void;
     },
-  ): { unsubscribe: () => void } {
+  ): { unsubscribe: () => void; ready?: Promise<void> } {
     const channel = CHANNELS.events(streamId);
     const subscriberId = `sub_${++this.subscriberIdCounter}`;
 
@@ -366,13 +427,11 @@ export class RedisEventTransport implements IEventTransport {
     streamState.count++;
     streamState.handlers.set(subscriberId, handlers);
 
-    // Subscribe to Redis channel if this is first subscriber
-    if (!this.subscribedChannels.has(channel)) {
-      this.subscribedChannels.add(channel);
-      this.subscriber.subscribe(channel).catch((err) => {
-        logger.error(`[RedisEventTransport] Failed to subscribe to ${channel}:`, err);
-      });
-    }
+    // Subscribe to Redis channel if this is first subscriber.
+    const ready = this.ensureChannelSubscribed(channel);
+    void ready.catch((err) => {
+      logger.error(`[RedisEventTransport] Failed to subscribe to ${channel}:`, err);
+    });
 
     // Return unsubscribe function
     return {
@@ -394,10 +453,11 @@ export class RedisEventTransport implements IEventTransport {
           }
           state.reorderBuffer.pending.clear();
 
-          this.subscriber.unsubscribe(channel).catch((err) => {
-            logger.error(`[RedisEventTransport] Failed to unsubscribe from ${channel}:`, err);
-          });
-          this.subscribedChannels.delete(channel);
+          // The generation-level abort callback owns the channel even when no
+          // browser SSE subscriber is attached. Final stream cleanup releases it.
+          if (state.abortCallbacks.length === 0) {
+            this.unsubscribeChannel(channel);
+          }
 
           // Call all-subscribers-left callbacks
           for (const callback of state.allSubscribersLeftCallbacks) {
@@ -414,6 +474,7 @@ export class RedisEventTransport implements IEventTransport {
            * === VIVENTIUM END === */
         }
       },
+      ready,
     };
   }
 
@@ -537,13 +598,10 @@ export class RedisEventTransport implements IEventTransport {
    * This enables cross-replica abort: when a user aborts on Replica B,
    * the generating Replica A receives the signal and stops.
    */
-  emitAbort(streamId: string): void {
+  async emitAbort(streamId: string, reason?: string): Promise<void> {
     const channel = CHANNELS.events(streamId);
-    const message: PubSubMessage = { type: EventTypes.ABORT };
-
-    this.publisher.publish(channel, JSON.stringify(message)).catch((err) => {
-      logger.error(`[RedisEventTransport] Failed to publish abort:`, err);
-    });
+    const message: PubSubMessage = { type: EventTypes.ABORT, reason };
+    await this.publisher.publish(channel, JSON.stringify(message));
   }
 
   /**
@@ -553,7 +611,7 @@ export class RedisEventTransport implements IEventTransport {
    * @param streamId - The stream identifier
    * @param callback - Called when abort signal is received
    */
-  onAbort(streamId: string, callback: () => void): void {
+  onAbort(streamId: string, callback: (reason?: string) => void): Promise<void> {
     const channel = CHANNELS.events(streamId);
     let state = this.streams.get(streamId);
 
@@ -566,15 +624,21 @@ export class RedisEventTransport implements IEventTransport {
       this.streams.set(streamId, state);
     }
 
-    state.abortCallbacks.push(callback);
+    const streamState = state;
+    streamState.abortCallbacks.push(callback);
 
-    // Subscribe to Redis channel if not already subscribed
-    if (!this.subscribedChannels.has(channel)) {
-      this.subscribedChannels.add(channel);
-      this.subscriber.subscribe(channel).catch((err) => {
-        logger.error(`[RedisEventTransport] Failed to subscribe to ${channel}:`, err);
-      });
-    }
+    // A runnable job cannot escape until Redis has acknowledged this channel.
+    const readiness = this.ensureChannelSubscribed(channel).catch((error) => {
+      const callbackIndex = streamState.abortCallbacks.indexOf(callback);
+      if (callbackIndex >= 0) {
+        streamState.abortCallbacks.splice(callbackIndex, 1);
+      }
+      throw error;
+    });
+    void readiness.catch((err) => {
+      logger.error(`[RedisEventTransport] Failed to subscribe to ${channel}:`, err);
+    });
+    return readiness;
   }
 
   /**
@@ -608,12 +672,7 @@ export class RedisEventTransport implements IEventTransport {
     this.resetSequence(streamId);
 
     // Unsubscribe from Redis channel
-    if (this.subscribedChannels.has(channel)) {
-      this.subscriber.unsubscribe(channel).catch((err) => {
-        logger.error(`[RedisEventTransport] Failed to cleanup ${channel}:`, err);
-      });
-      this.subscribedChannels.delete(channel);
-    }
+    this.unsubscribeChannel(channel);
 
     this.streams.delete(streamId);
   }
@@ -631,18 +690,30 @@ export class RedisEventTransport implements IEventTransport {
       state.reorderBuffer.pending.clear();
     }
 
-    // Unsubscribe from all channels
-    for (const channel of this.subscribedChannels) {
+    // Unsubscribe from all acknowledged or still-pending channels.
+    for (const channel of new Set([
+      ...this.subscribedChannels,
+      ...this.pendingSubscriptions.keys(),
+    ])) {
       this.subscriber.unsubscribe(channel).catch(() => {
         // Ignore errors during shutdown
       });
     }
 
     this.subscribedChannels.clear();
+    this.pendingSubscriptions.clear();
     this.streams.clear();
     this.sequenceCounters.clear();
 
-    // Note: Don't close Redis connections - they may be shared
+    /* === VIVENTIUM START ===
+     * Feature: Redis stream lifecycle cleanup.
+     * Purpose: A subscriber duplicated by createStreamServices belongs to this transport.
+     * === VIVENTIUM END === */
+    if (this.closeSubscriberOnDestroy) {
+      this.subscriber.disconnect();
+    }
+
+    // Caller-provided Redis connections remain shared and caller-owned.
     logger.info('[RedisEventTransport] Destroyed');
   }
 }

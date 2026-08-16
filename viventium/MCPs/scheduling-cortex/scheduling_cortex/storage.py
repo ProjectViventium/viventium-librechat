@@ -7,6 +7,8 @@ import os
 import re
 import shutil
 import sqlite3
+import threading
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -19,6 +21,9 @@ class StorageConfig:
     # === VIVENTIUM START ===
     # Feature: Optional mirror path for durable storage on file shares.
     mirror_db_path: Optional[str] = None
+    # Read-only observers must never run schema migration, stale-run reconciliation,
+    # mirror restore/sync, or directory creation as a side effect of inspection.
+    read_only: bool = False
     # === VIVENTIUM END ===
 
 
@@ -27,12 +32,25 @@ _LOCAL_PATH_RE = re.compile(r"(?:/Users|/home|/private/var|/var/folders)/[^\s`'\
 _URL_RE = re.compile(r"https?:\/\/[^\s`'\"<>)]*", re.IGNORECASE)
 _MONGO_URI_RE = re.compile(r"mongodb(?:\+srv)?:\/\/[^\s`'\"<>]+", re.IGNORECASE)
 _BEARER_RE = re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}", re.IGNORECASE)
+_MIRROR_LOCKS_GUARD = threading.Lock()
+_MIRROR_LOCKS: dict[str, threading.RLock] = {}
+
+
+def _mirror_lock_for(db_path: Path, mirror_path: Optional[Path]) -> threading.RLock:
+    key = f"{db_path.resolve()}\0{mirror_path.resolve() if mirror_path else ''}"
+    with _MIRROR_LOCKS_GUARD:
+        return _MIRROR_LOCKS.setdefault(key, threading.RLock())
 
 
 class ScheduleStorage:
     def __init__(self, config: StorageConfig) -> None:
         self._db_path = Path(config.db_path).expanduser()
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._read_only = bool(config.read_only)
+        if self._read_only:
+            if not self._db_path.is_file():
+                raise FileNotFoundError(f"scheduling database does not exist: {self._db_path}")
+        else:
+            self._db_path.parent.mkdir(parents=True, exist_ok=True)
         # === VIVENTIUM NOTE ===
         # Feature: Mirror SQLite DB to shared storage without locking issues.
         self._mirror_path = (
@@ -40,14 +58,17 @@ class ScheduleStorage:
             if config.mirror_db_path
             else None
         )
-        if self._mirror_path:
+        self._mirror_lock = _mirror_lock_for(self._db_path, self._mirror_path)
+        if self._mirror_path and not self._read_only:
             self._mirror_path.parent.mkdir(parents=True, exist_ok=True)
             self._restore_from_mirror()
         # === VIVENTIUM NOTE ===
-        self._init_db()
+        if not self._read_only:
+            self._init_db()
         # === VIVENTIUM NOTE ===
         # Feature: Ensure mirror contains initialized DB.
-        self._sync_to_mirror()
+        if not self._read_only:
+            self._sync_to_mirror()
         # === VIVENTIUM NOTE ===
 
     @property
@@ -55,7 +76,17 @@ class ScheduleStorage:
         return str(self._db_path)
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._db_path, timeout=30, check_same_thread=False)
+        target: str | Path = self._db_path
+        connect_kwargs: dict[str, Any] = {}
+        if self._read_only:
+            target = f"{self._db_path.resolve().as_uri()}?mode=ro"
+            connect_kwargs["uri"] = True
+        conn = sqlite3.connect(
+            target,
+            timeout=30,
+            check_same_thread=False,
+            **connect_kwargs,
+        )
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -201,11 +232,43 @@ class ScheduleStorage:
               error_class TEXT,
               private_detail_path TEXT,
               callback_payload_json TEXT,
+              trigger_kind TEXT,
+              trigger_source TEXT,
+              occurrence_key TEXT,
+              lease_owner TEXT,
+              lease_until TEXT,
+              attempt INTEGER NOT NULL DEFAULT 0,
+              disposition TEXT,
+              execution_snapshot_json TEXT,
+              channel_outcomes_json TEXT,
+              interaction_ref TEXT,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             )
             """
         )
+        run_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(scheduled_prompt_runs)").fetchall()
+        }
+        if "trigger_kind" not in run_columns:
+            conn.execute("ALTER TABLE scheduled_prompt_runs ADD COLUMN trigger_kind TEXT")
+        if "trigger_source" not in run_columns:
+            conn.execute("ALTER TABLE scheduled_prompt_runs ADD COLUMN trigger_source TEXT")
+        additive_run_columns = {
+            "occurrence_key": "TEXT",
+            "lease_owner": "TEXT",
+            "lease_until": "TEXT",
+            "attempt": "INTEGER NOT NULL DEFAULT 0",
+            "disposition": "TEXT",
+            "execution_snapshot_json": "TEXT",
+            "channel_outcomes_json": "TEXT",
+            "interaction_ref": "TEXT",
+        }
+        for column, declaration in additive_run_columns.items():
+            if column not in run_columns:
+                conn.execute(
+                    f"ALTER TABLE scheduled_prompt_runs ADD COLUMN {column} {declaration}"
+                )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_scheduled_prompt_definitions_user ON scheduled_prompt_definitions(user_id)"
         )
@@ -223,6 +286,13 @@ class ScheduleStorage:
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_scheduled_prompt_runs_glasshive ON scheduled_prompt_runs(glasshive_run_id)"
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_scheduled_prompt_runs_occurrence
+            ON scheduled_prompt_runs(occurrence_key)
+            WHERE occurrence_key IS NOT NULL
+            """
         )
         self._sanitize_existing_scheduled_prompt_runs(conn)
         self._sanitize_existing_scheduled_prompt_snapshots(conn)
@@ -408,6 +478,19 @@ class ScheduleStorage:
 
     @staticmethod
     def _reconcile_stale_scheduled_prompt_runs(conn: sqlite3.Connection) -> None:
+        # === VIVENTIUM START ===
+        # Keep the persisted audit disposition consistent with an already-terminal run.
+        repaired = conn.execute(
+            """
+            UPDATE scheduled_prompt_runs
+            SET disposition = 'failed'
+            WHERE status = 'failed'
+              AND COALESCE(disposition, 'running') = 'running'
+            """
+        )
+        if repaired.rowcount:
+            logger.info("Repaired %s terminal scheduled prompt disposition(s)", repaired.rowcount)
+        # === VIVENTIUM END ===
         try:
             stale_seconds = int(os.getenv("SCHEDULING_STALE_PROMPT_RUN_SECONDS") or 24 * 60 * 60)
         except ValueError:
@@ -425,6 +508,9 @@ class ScheduleStorage:
                 completed_at = COALESCE(completed_at, ?),
                 error_class = 'stale_run_reconciled',
                 result_summary = 'Run did not reach a terminal callback before the recovery window.',
+                disposition = 'failed',
+                lease_owner = NULL,
+                lease_until = NULL,
                 updated_at = ?
             WHERE status IN ('queued', 'running')
               AND COALESCE(updated_at, started_at, created_at) < ?
@@ -469,36 +555,50 @@ class ScheduleStorage:
     def _restore_from_mirror(self) -> None:
         if not self._mirror_path or not self._mirror_path.exists():
             return
-        try:
-            if not self._db_path.exists():
-                tmp_path = self._db_path.with_suffix(self._db_path.suffix + ".tmp")
-                shutil.copy2(self._mirror_path, tmp_path)
-                os.replace(tmp_path, self._db_path)
-                return
-            mirror_mtime = self._mirror_path.stat().st_mtime
-            local_mtime = self._db_path.stat().st_mtime
-            if mirror_mtime > local_mtime:
-                tmp_path = self._db_path.with_suffix(self._db_path.suffix + ".tmp")
-                shutil.copy2(self._mirror_path, tmp_path)
-                os.replace(tmp_path, self._db_path)
-        except Exception as exc:
-            logger.warning(
-                "Failed to restore scheduling DB from mirror %s: %s", self._mirror_path, exc
-            )
+        with self._mirror_lock:
+            try:
+                mirror_mtime = self._mirror_path.stat().st_mtime
+                local_candidates = [self._db_path, Path(f"{self._db_path}-wal")]
+                local_mtime = max(
+                    (path.stat().st_mtime for path in local_candidates if path.exists()),
+                    default=0.0,
+                )
+                if self._db_path.exists() and mirror_mtime <= local_mtime:
+                    return
+                mirror_uri = f"{self._mirror_path.resolve().as_uri()}?mode=ro"
+                with sqlite3.connect(mirror_uri, uri=True) as source, self._connect() as destination:
+                    integrity = source.execute("PRAGMA quick_check").fetchone()
+                    if not integrity or integrity[0] != "ok":
+                        raise sqlite3.DatabaseError("scheduling mirror failed integrity check")
+                    source.backup(destination)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to restore scheduling DB from mirror %s: %s", self._mirror_path, exc
+                )
 
     def _sync_to_mirror(self) -> None:
         if not self._mirror_path:
             return
         if not self._db_path.exists():
             return
-        try:
-            tmp_path = self._mirror_path.with_suffix(self._mirror_path.suffix + ".tmp")
-            shutil.copy2(self._db_path, tmp_path)
-            os.replace(tmp_path, self._mirror_path)
-        except Exception as exc:
-            logger.warning(
-                "Failed to sync scheduling DB to mirror %s: %s", self._mirror_path, exc
+        with self._mirror_lock:
+            tmp_path = self._mirror_path.with_name(
+                f".{self._mirror_path.name}.{uuid.uuid4().hex}.tmp"
             )
+            try:
+                with self._connect() as source, sqlite3.connect(tmp_path) as snapshot:
+                    source.backup(snapshot)
+                    snapshot.execute("PRAGMA optimize")
+                os.replace(tmp_path, self._mirror_path)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to sync scheduling DB to mirror %s: %s", self._mirror_path, exc
+                )
+            finally:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
     # === VIVENTIUM NOTE ===
 
     def create_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
@@ -877,6 +977,27 @@ class ScheduleStorage:
         return self._row_to_scheduled_prompt_version(row)
 
     def create_scheduled_prompt_run(self, run: Dict[str, Any]) -> Dict[str, Any]:
+        payload = dict(run)
+        payload.setdefault("trigger_kind", None)
+        payload.setdefault("trigger_source", None)
+        payload.setdefault("occurrence_key", None)
+        payload.setdefault("lease_owner", None)
+        payload.setdefault("lease_until", None)
+        payload.setdefault("attempt", 0)
+        payload.setdefault("disposition", None)
+        if "execution_snapshot" in payload:
+            payload["execution_snapshot_json"] = self._json_or_none(
+                payload.pop("execution_snapshot")
+            )
+        else:
+            payload.setdefault("execution_snapshot_json", None)
+        if "channel_outcomes" in payload:
+            payload["channel_outcomes_json"] = self._json_or_none(
+                payload.pop("channel_outcomes")
+            )
+        else:
+            payload.setdefault("channel_outcomes_json", None)
+        payload.setdefault("interaction_ref", None)
         with self._connect() as conn:
             conn.execute(
                 """
@@ -885,24 +1006,192 @@ class ScheduleStorage:
                   started_at, completed_at, status, executor, rendered_hash,
                   variable_snapshot_hash, glasshive_project_id, glasshive_worker_id,
                   glasshive_run_id, result_summary, error_class, private_detail_path,
-                  callback_payload_json, created_at, updated_at
+                  callback_payload_json, trigger_kind, trigger_source, occurrence_key,
+                  lease_owner, lease_until, attempt, disposition, execution_snapshot_json,
+                  channel_outcomes_json, interaction_ref, created_at, updated_at
                 ) VALUES (
                   :run_id, :task_id, :definition_id, :user_id, :version_id, :due_at,
                   :started_at, :completed_at, :status, :executor, :rendered_hash,
                   :variable_snapshot_hash, :glasshive_project_id, :glasshive_worker_id,
                   :glasshive_run_id, :result_summary, :error_class, :private_detail_path,
-                  :callback_payload_json, :created_at, :updated_at
+                  :callback_payload_json, :trigger_kind, :trigger_source, :occurrence_key,
+                  :lease_owner, :lease_until, :attempt, :disposition, :execution_snapshot_json,
+                  :channel_outcomes_json, :interaction_ref, :created_at, :updated_at
                 )
                 """,
-                run,
+                payload,
             )
         self._sync_to_mirror()
-        return run
+        return payload
+
+    @staticmethod
+    def scheduled_prompt_occurrence_key(task_id: str, due_at: str) -> str:
+        due_value = str(due_at).strip()
+        try:
+            due = datetime.fromisoformat(due_value.replace("Z", "+00:00"))
+            if due.tzinfo is not None:
+                due_value = due.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        except ValueError:
+            pass
+        canonical = f"{str(task_id).strip()}\0{due_value}"
+        return f"schedule:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
+
+    def claim_scheduled_prompt_occurrence(
+        self,
+        *,
+        task_id: str,
+        user_id: str,
+        executor: str,
+        due_at: str,
+        lease_owner: str,
+        now: str,
+        lease_seconds: int,
+        definition_id: Optional[str] = None,
+        version_id: Optional[str] = None,
+        trigger_kind: str = "scheduled",
+        trigger_source: str = "scheduler_loop",
+    ) -> Dict[str, Any]:
+        occurrence_key = self.scheduled_prompt_occurrence_key(task_id, due_at)
+        now_dt = datetime.fromisoformat(str(now).replace("Z", "+00:00"))
+        if now_dt.tzinfo is None:
+            now_dt = now_dt.replace(tzinfo=timezone.utc)
+        now_utc = now_dt.astimezone(timezone.utc)
+        now_iso = now_utc.isoformat().replace("+00:00", "Z")
+        lease_until = now_utc + timedelta(seconds=max(1, lease_seconds))
+        lease_until_iso = lease_until.isoformat().replace("+00:00", "Z")
+        run: Optional[Dict[str, Any]] = None
+        claimed = False
+        reason = ""
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            occurrence = conn.execute(
+                "SELECT * FROM scheduled_prompt_runs WHERE occurrence_key = ?",
+                (occurrence_key,),
+            ).fetchone()
+            if occurrence is not None:
+                occurrence_data = dict(occurrence)
+                lease_until_value = str(occurrence_data.get("lease_until") or "").strip()
+                try:
+                    existing_lease_until = datetime.fromisoformat(
+                        lease_until_value.replace("Z", "+00:00")
+                    )
+                    if existing_lease_until.tzinfo is None:
+                        existing_lease_until = existing_lease_until.replace(tzinfo=timezone.utc)
+                    lease_is_active = existing_lease_until.astimezone(timezone.utc) > now_utc
+                except ValueError:
+                    lease_is_active = False
+                if (
+                    lease_until_value
+                    and lease_is_active
+                ):
+                    run = occurrence_data
+                    reason = "occurrence_already_claimed"
+                elif str(occurrence_data.get("status") or "") in {
+                    "completed",
+                    "failed",
+                    "cancelled",
+                    "missed",
+                }:
+                    run = occurrence_data
+                    reason = "occurrence_already_terminal"
+                else:
+                    conn.execute(
+                        """
+                        UPDATE scheduled_prompt_runs
+                        SET lease_owner = ?, lease_until = ?, attempt = COALESCE(attempt, 0) + 1,
+                            status = 'claimed', disposition = 'running', started_at = ?,
+                            completed_at = NULL, error_class = NULL, updated_at = ?
+                        WHERE occurrence_key = ?
+                        """,
+                        (lease_owner, lease_until_iso, now_iso, now_iso, occurrence_key),
+                    )
+                    run = dict(
+                        conn.execute(
+                            "SELECT * FROM scheduled_prompt_runs WHERE occurrence_key = ?",
+                            (occurrence_key,),
+                        ).fetchone()
+                    )
+                    claimed = True
+                    reason = "lease_recovered"
+            else:
+                active = conn.execute(
+                    """
+                    SELECT * FROM scheduled_prompt_runs
+                    WHERE task_id = ? AND lease_until IS NOT NULL
+                      AND julianday(lease_until) > julianday(?)
+                      AND status IN ('claimed', 'running', 'dispatching', 'queued')
+                    ORDER BY lease_until DESC LIMIT 1
+                    """,
+                    (task_id, now_iso),
+                ).fetchone()
+                if active is not None:
+                    run = dict(active)
+                    reason = "task_has_active_occurrence"
+                else:
+                    run_id = f"sp_run_{uuid.uuid4().hex}"
+                    conn.execute(
+                        """
+                        INSERT INTO scheduled_prompt_runs (
+                          run_id, task_id, definition_id, user_id, version_id, due_at,
+                          started_at, completed_at, status, executor, rendered_hash,
+                          variable_snapshot_hash, glasshive_project_id, glasshive_worker_id,
+                          glasshive_run_id, result_summary, error_class, private_detail_path,
+                          callback_payload_json, trigger_kind, trigger_source, occurrence_key,
+                          lease_owner, lease_until, attempt, disposition, execution_snapshot_json,
+                          channel_outcomes_json, interaction_ref, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'claimed', ?, NULL, NULL, NULL,
+                                  NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, 1,
+                                  'running', NULL, NULL, NULL, ?, ?)
+                        """,
+                        (
+                            run_id,
+                            task_id,
+                            definition_id,
+                            user_id,
+                            version_id,
+                            due_at,
+                            now_iso,
+                            executor,
+                            trigger_kind,
+                            trigger_source,
+                            occurrence_key,
+                            lease_owner,
+                            lease_until_iso,
+                            now_iso,
+                            now_iso,
+                        ),
+                    )
+                    run = dict(
+                        conn.execute(
+                            "SELECT * FROM scheduled_prompt_runs WHERE run_id = ?", (run_id,)
+                        ).fetchone()
+                    )
+                    claimed = True
+                    reason = "claimed"
+        if claimed:
+            self._sync_to_mirror()
+        return {
+            "claimed": claimed,
+            "reason": reason,
+            "occurrence_key": occurrence_key,
+            "run": self._row_to_scheduled_prompt_run_dict(run),
+        }
 
     def update_scheduled_prompt_run(self, run_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if not updates:
             return self.get_scheduled_prompt_run(run_id)
         payload = dict(updates)
+        if "execution_snapshot" in payload:
+            payload["execution_snapshot_json"] = self._json_or_none(
+                payload.pop("execution_snapshot")
+            )
+        if "channel_outcomes" in payload:
+            payload["channel_outcomes_json"] = self._json_or_none(
+                payload.pop("channel_outcomes")
+            )
+        if str(payload.get("status") or "") in {"completed", "failed", "cancelled", "missed"}:
+            payload.setdefault("lease_owner", None)
+            payload.setdefault("lease_until", None)
         assignments = ", ".join([f"{key} = ?" for key in payload.keys()])
         params = list(payload.values()) + [run_id]
         with self._connect() as conn:
@@ -913,11 +1202,80 @@ class ScheduleStorage:
         self._sync_to_mirror()
         return self.get_scheduled_prompt_run(run_id)
 
+    def update_scheduled_prompt_run_if_current(
+        self,
+        run_id: str,
+        updates: Dict[str, Any],
+        *,
+        expected_status: str,
+        expected_error_class: Optional[str],
+    ) -> Dict[str, Any]:
+        """Atomically apply callback state only while its observed lifecycle is still current.
+
+        A callback is verified before this method is called, but another verified callback may
+        win between the initial lookup and persistence. Comparing the lifecycle fields inside one
+        immediate transaction prevents an older callback from overwriting newer terminal evidence.
+        """
+
+        payload = dict(updates)
+        if "execution_snapshot" in payload:
+            payload["execution_snapshot_json"] = self._json_or_none(
+                payload.pop("execution_snapshot")
+            )
+        if "channel_outcomes" in payload:
+            payload["channel_outcomes_json"] = self._json_or_none(
+                payload.pop("channel_outcomes")
+            )
+        if str(payload.get("status") or "") in {"completed", "failed", "cancelled", "missed"}:
+            payload.setdefault("lease_owner", None)
+            payload.setdefault("lease_until", None)
+
+        updated = False
+        row = None
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT status, error_class FROM scheduled_prompt_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            current_matches = bool(
+                current is not None
+                and str(current["status"] or "") == str(expected_status or "")
+                and current["error_class"] == expected_error_class
+            )
+            if current_matches and payload:
+                assignments = ", ".join([f"{key} = ?" for key in payload.keys()])
+                conn.execute(
+                    f"UPDATE scheduled_prompt_runs SET {assignments} WHERE run_id = ?",
+                    list(payload.values()) + [run_id],
+                )
+                updated = True
+            row = conn.execute(
+                "SELECT * FROM scheduled_prompt_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        if updated:
+            self._sync_to_mirror()
+        return {
+            "updated": updated,
+            "run": self._row_to_scheduled_prompt_run(row),
+        }
+
     def get_scheduled_prompt_run(self, run_id: str) -> Optional[Dict[str, Any]]:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM scheduled_prompt_runs WHERE run_id = ?",
                 (run_id,),
+            ).fetchone()
+        return self._row_to_scheduled_prompt_run(row)
+
+    def get_scheduled_prompt_run_by_occurrence_key(
+        self, occurrence_key: str
+    ) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM scheduled_prompt_runs WHERE occurrence_key = ?",
+                (occurrence_key,),
             ).fetchone()
         return self._row_to_scheduled_prompt_run(row)
 
@@ -934,6 +1292,8 @@ class ScheduleStorage:
         *,
         definition_id: Optional[str] = None,
         task_id: Optional[str] = None,
+        trigger_kind: Optional[str] = None,
+        trigger_source: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
@@ -945,6 +1305,12 @@ class ScheduleStorage:
         if task_id:
             clauses.append("task_id = ?")
             params.append(task_id)
+        if trigger_kind:
+            clauses.append("trigger_kind = ?")
+            params.append(trigger_kind)
+        if trigger_source:
+            clauses.append("trigger_source = ?")
+            params.append(trigger_source)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.extend([limit, offset])
         with self._connect() as conn:
@@ -980,9 +1346,19 @@ class ScheduleStorage:
     def _row_to_scheduled_prompt_run(self, row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
         if row is None:
             return None
-        data = dict(row)
+        return self._row_to_scheduled_prompt_run_dict(dict(row))
+
+    @staticmethod
+    def _row_to_scheduled_prompt_run_dict(data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if data is None:
+            return None
+        data = dict(data)
         callback_json = data.get("callback_payload_json")
         data["callback_payload"] = json.loads(callback_json) if callback_json else None
+        execution_json = data.get("execution_snapshot_json")
+        data["execution_snapshot"] = json.loads(execution_json) if execution_json else None
+        channel_json = data.get("channel_outcomes_json")
+        data["channel_outcomes"] = json.loads(channel_json) if channel_json else None
         return data
     # === VIVENTIUM NOTE ===
 

@@ -81,6 +81,13 @@ const MAX_MESSAGE_TEXT_CHARS = Math.max(
   120,
   Number.parseInt(process.env.VIVENTIUM_CONVERSATION_RECALL_MAX_MESSAGE_TEXT_CHARS || '2400', 10),
 );
+const MAX_USER_MESSAGE_TEXT_CHARS = Math.max(
+  MAX_MESSAGE_TEXT_CHARS,
+  Number.parseInt(
+    process.env.VIVENTIUM_CONVERSATION_RECALL_MAX_USER_MESSAGE_TEXT_CHARS || '12000',
+    10,
+  ),
+);
 const MAX_AGENT_CONVERSATIONS = Math.max(
   50,
   Number.parseInt(process.env.VIVENTIUM_CONVERSATION_RECALL_MAX_AGENT_CONVERSATIONS || '1500', 10),
@@ -467,15 +474,58 @@ function getMessageText(message) {
   return cleanupText(parseTextParts(contentParts, true));
 }
 
-function clipMessageText(text) {
+function clipMessageText(text, isCreatedByUser = false) {
   if (typeof text !== 'string' || !text.length) {
     return '';
   }
-  if (text.length <= MAX_MESSAGE_TEXT_CHARS) {
+  const maxChars = isCreatedByUser ? MAX_USER_MESSAGE_TEXT_CHARS : MAX_MESSAGE_TEXT_CHARS;
+  if (text.length <= maxChars) {
     return text;
   }
-  return `${text.slice(0, MAX_MESSAGE_TEXT_CHARS - 3)}...`;
+  return `${text.slice(0, maxChars - 3)}...`;
 }
+
+/* === VIVENTIUM START ===
+ * Persisted assistant rows can precede their parent user row by a few milliseconds because both
+ * are created at request start. Recall must honor the message tree instead of presenting reversed
+ * dialogue to retrieval. Preserve the existing chronological order everywhere it does not conflict
+ * with a known same-conversation parent edge.
+ */
+function orderRecallMessagesParentFirst(messages) {
+  const source = Array.isArray(messages) ? messages : [];
+  const byId = new Map(
+    source
+      .filter((message) => typeof message?.messageId === 'string' && message.messageId)
+      .map((message) => [message.messageId, message]),
+  );
+  const state = new Map();
+  const ordered = [];
+
+  const visit = (message) => {
+    const messageId = message?.messageId;
+    if (!messageId || state.get(messageId) === 2) {
+      if (!messageId) {
+        ordered.push(message);
+      }
+      return;
+    }
+    if (state.get(messageId) === 1) {
+      return;
+    }
+
+    state.set(messageId, 1);
+    const parent = byId.get(message.parentMessageId);
+    if (parent && parent.conversationId === message.conversationId) {
+      visit(parent);
+    }
+    state.set(messageId, 2);
+    ordered.push(message);
+  };
+
+  source.forEach(visit);
+  return ordered;
+}
+/* === VIVENTIUM END === */
 
 function shouldSkipFromRecallCorpus({
   message,
@@ -603,14 +653,15 @@ async function buildConversationRecallCorpus({ userId, agentId }) {
   }
 
   rawMessages.reverse();
+  const orderedMessages = orderRecallMessagesParentFirst(rawMessages);
 
-  const recallDerivedParentIds = buildRecallDerivedParentIdSet(rawMessages);
+  const recallDerivedParentIds = buildRecallDerivedParentIdSet(orderedMessages);
   const segments = [];
   let totalChars = 0;
   let latestTimestamp = '';
-  for (let i = 0; i < rawMessages.length; i += 1) {
-    const message = rawMessages[i];
-    const content = clipMessageText(getMessageText(message));
+  for (let i = 0; i < orderedMessages.length; i += 1) {
+    const message = orderedMessages[i];
+    const content = clipMessageText(getMessageText(message), message.isCreatedByUser === true);
     if (
       shouldSkipFromRecallCorpus({
         message,
@@ -628,7 +679,9 @@ async function buildConversationRecallCorpus({ userId, agentId }) {
       : new Date().toISOString();
     const convoId = message.conversationId || 'unknown';
 
-    latestTimestamp = timestamp;
+    if (!latestTimestamp || timestamp > latestTimestamp) {
+      latestTimestamp = timestamp;
+    }
     const segment =
       `<turn timestamp="${escapeXmlAttr(timestamp)}" conversation="${escapeXmlAttr(
         convoId,
@@ -1218,6 +1271,7 @@ module.exports = {
   /* exported for testability */
   getMessageText,
   shouldSkipFromRecallCorpus,
+  orderRecallMessagesParentFirst,
   refreshConversationRecallForUser,
   syncConversationRecallForConversation,
 };

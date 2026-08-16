@@ -49,6 +49,8 @@ const AGENT_FIELDS = [
   'tools',
   'tool_kwargs',
   'model_parameters',
+  'glasshive_options',
+  'recursion_limit',
   'end_after_tools',
   'hide_sequential_outputs',
   'support_contact',
@@ -196,6 +198,13 @@ function pickAgentFields(agent) {
     }
   }
   return picked;
+}
+
+function collectSeedAgentDefinitions(bundle) {
+  return [
+    ...(Array.isArray(bundle?.backgroundAgents) ? bundle.backgroundAgents : []),
+    ...(Array.isArray(bundle?.handoffAgents) ? bundle.handoffAgents : []),
+  ];
 }
 
 function buildUpdateData(agentData) {
@@ -426,22 +435,20 @@ async function run() {
   });
   results.push(mainResult);
 
-  if (Array.isArray(bundle.backgroundAgents)) {
-    for (const agentData of bundle.backgroundAgents) {
-      if (agentData && agentData.missing) {
-        results.push({ id: agentData.id || null, status: 'missing', reason: 'marked missing' });
-        continue;
-      }
-      const result = await upsertAgent({ agentData, userId: owner._id, dryRun: args.dryRun });
-      result.permissions = await ensureAgentPermissions({
-        resourceId: result.resourceId,
-        ownerId: owner._id,
-        publicAccess: args.public,
-        publicAccessRole,
-        dryRun: args.dryRun,
-      });
-      results.push(result);
+  for (const agentData of collectSeedAgentDefinitions(bundle)) {
+    if (agentData && agentData.missing) {
+      results.push({ id: agentData.id || null, status: 'missing', reason: 'marked missing' });
+      continue;
     }
+    const result = await upsertAgent({ agentData, userId: owner._id, dryRun: args.dryRun });
+    result.permissions = await ensureAgentPermissions({
+      resourceId: result.resourceId,
+      ownerId: owner._id,
+      publicAccess: args.public,
+      publicAccessRole,
+      dryRun: args.dryRun,
+    });
+    results.push(result);
   }
 
   const summary = {
@@ -483,6 +490,7 @@ module.exports = {
   normalizeBundleForRuntimeWithOwner,
   normalizePublicAccessRole,
   buildSeedAgentUpdatePlan,
+  collectSeedAgentDefinitions,
   pickAgentFields,
   resolvePublicAccessRoleIds,
   preserveExistingEditableFields,

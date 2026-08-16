@@ -3,11 +3,83 @@ import { EModelEndpoint, isDocumentSupportedProvider } from './schemas';
 import { getEndpointFileConfig, mergeFileConfig } from './file-config';
 import {
   AgentCapabilities,
+  /* === VIVENTIUM START ===
+   * Feature: Provider capability authority.
+   * Purpose: Exercise fail-closed provider and conversation-orchestration capability schema.
+   */
+  agentsEndpointSchema,
+  /* === VIVENTIUM END === */
   configSchema,
   getEndpointField,
   memorySchema,
   resolveEndpointType,
 } from './config';
+
+/* === VIVENTIUM START ===
+ * Feature: Provider capability authority.
+ * Purpose: Omitted roles default false and Main orchestration tools never become worker host tools.
+ */
+describe('agentsEndpointSchema provider capability policy', () => {
+  it('fails closed when a capability-required provider has no registry entry', () => {
+    expect(() =>
+      agentsEndpointSchema.parse({
+        capabilityRequiredProviders: ['synthetic-harness'],
+        providerCapabilities: {},
+      }),
+    ).toThrow('Provider capability configuration is required for synthetic-harness');
+  });
+
+  it('defaults every omitted role flag to false for a declared capability', () => {
+    const parsed = agentsEndpointSchema.parse({
+      capabilityRequiredProviders: ['synthetic-harness'],
+      providerCapabilities: {
+        'synthetic-harness': {
+          label: 'Synthetic Harness',
+          models: [{ id: 'synthetic:model', label: 'Synthetic Model' }],
+        },
+      },
+    });
+
+    expect(parsed.providerCapabilities['synthetic-harness']).toMatchObject({
+      main_chat: false,
+      cortex_execution: false,
+      phase_b_followup: false,
+      activation_classifier: false,
+      realtime_voice: false,
+      automatic_fallback_target: false,
+      serial_model_fallback: false,
+      workspace_binding: false,
+      native_tools: false,
+      worker_native_tools: false,
+      host_tools_transport: 'none',
+      host_tools: [],
+      conversation_orchestration_tools: [],
+      activity_stream: false,
+      responses_api: false,
+    });
+  });
+
+  it('keeps conversation orchestration facades distinct from inheritable worker host tools', () => {
+    const parsed = agentsEndpointSchema.parse({
+      providerCapabilities: {
+        'synthetic-harness': {
+          label: 'Synthetic Harness',
+          workspace_binding: true,
+          host_tools_transport: 'broker_mcp',
+          host_tools: ['file_search'],
+          conversation_orchestration_tools: ['active_work_list'],
+          models: [],
+        },
+      },
+    });
+
+    expect(parsed.providerCapabilities['synthetic-harness']).toMatchObject({
+      host_tools: ['file_search'],
+      conversation_orchestration_tools: ['active_work_list'],
+    });
+  });
+});
+/* === VIVENTIUM END === */
 
 const endpointsConfig: TEndpointsConfig = {
   [EModelEndpoint.openAI]: { userProvide: false, order: 0 },
@@ -134,6 +206,20 @@ describe('getEndpointField', () => {
 });
 
 describe('memorySchema', () => {
+  /* === VIVENTIUM START ===
+   * Feature: Bounded Viventium memory context.
+   * Purpose: Keep configured memory reads aligned with the runtime token ceiling.
+   */
+  it('defaults bounded memory reads to the same 8,000-token ceiling as the runtime', () => {
+    const parsed = memorySchema.parse({
+      agent: { provider: 'anthropic', model: 'claude-sonnet-4-5' },
+      readProfile: {},
+    });
+
+    expect(parsed.readProfile?.tokenLimit).toBe(8000);
+  });
+  /* === VIVENTIUM END === */
+
   it('accepts the bounded read profile config used by Viventium memory reads', () => {
     const parsed = memorySchema.parse({
       agent: { provider: 'anthropic', model: 'claude-sonnet-4-5' },

@@ -16,12 +16,62 @@
 'use strict';
 
 const { AsyncLocalStorage } = require('node:async_hooks');
+const { SystemMessage } = require('@langchain/core/messages');
 const { logger } = require('@librechat/data-schemas');
 const { StandardGraph } = require('@librechat/agents');
+const { isRecoverableProviderFallbackError } = require('./agentLlmFallback');
 
-const PATCH_FLAG = Symbol.for('viventium.agent.schema.tool.binding.patch.v2');
+const PATCH_FLAG = Symbol.for('viventium.agent.schema.tool.binding.patch.v6');
 const SCOPED_TOOLS_FLAG = Symbol.for('viventium.agent.schema.tool.binding.accessor.v1');
+const DEDUPED_BINDING_FLAG = Symbol.for('viventium.agent.schema.tool.binding.dedupe.v1');
+const SCOPED_FALLBACK_ROUTE_FLAG = Symbol.for('viventium.agent.graph.fallback.route.accessor.v1');
+const GRAPH_FALLBACK_CONTEXT = Symbol.for('viventium.agent.graph.fallback.runtime.context.v1');
+const MODEL_ROUTE_CAPABILITY_REFRESH = Symbol.for(
+  'viventium.agent.model.route.capability.refresh.v1',
+);
 const scopedTools = new AsyncLocalStorage();
+const fallbackInvocationPolicy = new AsyncLocalStorage();
+
+function dedupeToolsByName(tools) {
+  if (!Array.isArray(tools) || tools.length < 2) {
+    return tools;
+  }
+  const seenNames = new Set();
+  let duplicateFound = false;
+  const deduped = tools.filter((tool) => {
+    const name = toolName(tool);
+    if (!name) {
+      return true;
+    }
+    if (seenNames.has(name)) {
+      duplicateFound = true;
+      return false;
+    }
+    seenNames.add(name);
+    return true;
+  });
+  return duplicateFound ? deduped : tools;
+}
+
+function installDedupedBindingMethod(agentContext) {
+  if (agentContext?.[DEDUPED_BINDING_FLAG] === true) {
+    return true;
+  }
+  if (!agentContext || typeof agentContext.getToolsForBinding !== 'function') {
+    return false;
+  }
+  const originalGetToolsForBinding = agentContext.getToolsForBinding;
+  agentContext.getToolsForBinding = function getDedupedToolsForBinding(...args) {
+    return dedupeToolsByName(originalGetToolsForBinding.apply(this, args));
+  };
+  Object.defineProperty(agentContext, DEDUPED_BINDING_FLAG, {
+    value: true,
+    enumerable: false,
+    configurable: false,
+    writable: false,
+  });
+  return true;
+}
 
 function installScopedToolsAccessor(agentContext) {
   if (agentContext?.[SCOPED_TOOLS_FLAG] === true) {
@@ -106,6 +156,200 @@ function summarizeTools(tools) {
   };
 }
 
+function createGraphAbortError() {
+  const error = new Error('operation was aborted');
+  error.name = 'AbortError';
+  error.code = 'ABORT_ERR';
+  return error;
+}
+
+function installScopedFallbackRouteAccessors(agentContext) {
+  if (agentContext?.[SCOPED_FALLBACK_ROUTE_FLAG] === true) {
+    return true;
+  }
+  if (!agentContext || typeof agentContext !== 'object') {
+    return false;
+  }
+  for (const field of ['provider', 'reasoningKey']) {
+    const descriptor = Object.getOwnPropertyDescriptor(agentContext, field);
+    if (descriptor?.configurable === false) {
+      return false;
+    }
+    let baseValue = agentContext[field];
+    Object.defineProperty(agentContext, field, {
+      configurable: true,
+      enumerable: descriptor?.enumerable ?? true,
+      get() {
+        const fallbackContext = fallbackInvocationPolicy.getStore()?.activeFallbackContext;
+        return fallbackContext?.[field] ?? baseValue;
+      },
+      set(value) {
+        baseValue = value;
+      },
+    });
+  }
+  Object.defineProperty(agentContext, SCOPED_FALLBACK_ROUTE_FLAG, {
+    value: true,
+    enumerable: false,
+    configurable: false,
+    writable: false,
+  });
+  return true;
+}
+
+function systemMessageText(message) {
+  if (!message) {
+    return '';
+  }
+  if (typeof message.content === 'string') {
+    return message.content;
+  }
+  if (!Array.isArray(message.content)) {
+    return '';
+  }
+  return message.content
+    .map((part) => {
+      if (!part || typeof part !== 'object') {
+        return '';
+      }
+      return typeof part.text === 'string' ? part.text : '';
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
+function appendFallbackSystemInstructions(messages, instructions) {
+  const append = String(instructions || '').trim();
+  if (!append) {
+    return messages;
+  }
+  const nextMessages = Array.isArray(messages) ? [...messages] : [];
+  const systemIndex = nextMessages.findIndex(
+    (message) => typeof message?.getType === 'function' && message.getType() === 'system',
+  );
+  if (systemIndex < 0) {
+    return [new SystemMessage(append), ...nextMessages];
+  }
+  const currentText = systemMessageText(nextMessages[systemIndex]);
+  if (currentText.includes(append)) {
+    return nextMessages;
+  }
+  nextMessages[systemIndex] = new SystemMessage([currentText, append].filter(Boolean).join('\n\n'));
+  return nextMessages;
+}
+
+function replaceCapabilitySystemInstructions(
+  messages,
+  { previousInstructionAppend = '', instructionAppend = '' } = {},
+) {
+  const previous = String(previousInstructionAppend || '').trim();
+  const next = String(instructionAppend || '').trim();
+  if (!previous && !next) {
+    return messages;
+  }
+  const nextMessages = Array.isArray(messages) ? [...messages] : [];
+  const systemIndex = nextMessages.findIndex(
+    (message) => typeof message?.getType === 'function' && message.getType() === 'system',
+  );
+  if (systemIndex < 0) {
+    return next ? [new SystemMessage(next), ...nextMessages] : nextMessages;
+  }
+  let currentText = systemMessageText(nextMessages[systemIndex]);
+  if (previous && currentText.includes(previous)) {
+    currentText = currentText
+      .replace(previous, '')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+  if (next && !currentText.includes(next)) {
+    currentText = [currentText, next].filter(Boolean).join('\n\n');
+  }
+  nextMessages[systemIndex] = new SystemMessage(currentText);
+  return nextMessages;
+}
+
+async function prepareFallbackInvocationInput(input, config, policy) {
+  const agentContext = policy?.agentContext;
+  let finalMessages = input?.finalMessages;
+  if (agentContext?.systemRunnable && typeof agentContext.systemRunnable.invoke === 'function') {
+    finalMessages = await agentContext.systemRunnable.invoke(finalMessages, config);
+  }
+  const refreshResult = policy?.activeCapabilityRefreshResult;
+  if (refreshResult) {
+    finalMessages = replaceCapabilitySystemInstructions(finalMessages, {
+      previousInstructionAppend:
+        refreshResult.previousInstructionAppend ||
+        policy?.activeFallbackContext?.systemInstructionAppend,
+      instructionAppend:
+        refreshResult.instructionAppend ?? policy?.activeFallbackContext?.systemInstructionAppend,
+    });
+  } else {
+    finalMessages = appendFallbackSystemInstructions(
+      finalMessages,
+      policy?.activeFallbackContext?.systemInstructionAppend,
+    );
+  }
+  return { ...input, finalMessages };
+}
+
+function preparePrimaryInvocationInput(input, policy) {
+  const refreshResult = policy?.activeCapabilityRefreshResult;
+  if (!refreshResult) {
+    return input;
+  }
+  return {
+    ...input,
+    finalMessages: replaceCapabilitySystemInstructions(input?.finalMessages, refreshResult),
+  };
+}
+
+async function refreshCapabilityForAttempt(policy, attemptIndex) {
+  const refresh =
+    attemptIndex === 0
+      ? policy?.agentContext?.clientOptions?.[MODEL_ROUTE_CAPABILITY_REFRESH]
+      : policy?.activeCapabilityRefresh;
+  if (typeof refresh !== 'function') {
+    if (policy) {
+      policy.activeCapabilityRefreshResult = null;
+    }
+    return;
+  }
+  const refreshed = await refresh();
+  policy.activeCapabilityRefreshResult = refreshed;
+  if (attemptIndex > 0 && refreshed && typeof refreshed === 'object') {
+    policy.activeFallbackInstructionAppend = String(
+      refreshed.instructionAppend ?? policy?.activeFallbackContext?.systemInstructionAppend ?? '',
+    ).trim();
+  }
+}
+
+function authoringEvidenceSnapshot(graph) {
+  return {
+    runStepCount: Array.isArray(graph?.contentData) ? graph.contentData.length : 0,
+    toolCallCount: graph?.toolCallStepIds instanceof Map ? graph.toolCallStepIds.size : 0,
+  };
+}
+
+function hasNewAuthoringEvidence(graph, before) {
+  const after = authoringEvidenceSnapshot(graph);
+  return after.runStepCount > before.runStepCount || after.toolCallCount > before.toolCallCount;
+}
+
+function recordGraphFallbackRecovery(graph, fallbackContext) {
+  if (!graph || graph.viventiumGraphFallbackRecoveryReceipt || !fallbackContext) {
+    return;
+  }
+  Object.defineProperty(graph, 'viventiumGraphFallbackRecoveryReceipt', {
+    value: Object.freeze({
+      provider: String(fallbackContext.provider || '').trim(),
+      model: String(fallbackContext.model || '').trim(),
+    }),
+    configurable: true,
+    enumerable: false,
+    writable: false,
+  });
+}
+
 function installUnifiedSchemaToolBindingPatch(proto = StandardGraph?.prototype) {
   if (!proto || typeof proto.createCallModel !== 'function') {
     logger.warn('[Agent Schema Tool Binding Patch] StandardGraph.createCallModel unavailable');
@@ -116,6 +360,72 @@ function installUnifiedSchemaToolBindingPatch(proto = StandardGraph?.prototype) 
   }
 
   const originalCreateCallModel = proto.createCallModel;
+  const originalResetValues = proto.resetValues;
+  if (typeof originalResetValues === 'function') {
+    proto.resetValues = function patchedResetValues(...args) {
+      if (Object.prototype.hasOwnProperty.call(this, 'viventiumGraphFallbackRecoveryReceipt')) {
+        delete this.viventiumGraphFallbackRecoveryReceipt;
+      }
+      return originalResetValues.apply(this, args);
+    };
+  }
+  const originalAttemptInvoke = proto.attemptInvoke;
+  if (typeof originalAttemptInvoke === 'function') {
+    proto.attemptInvoke = async function patchedAttemptInvoke(input, config, ...rest) {
+      if (config?.signal?.aborted === true) {
+        throw createGraphAbortError();
+      }
+      const policy = fallbackInvocationPolicy.getStore();
+      if (policy?.blockedError) {
+        throw policy.blockedError;
+      }
+      const attemptIndex = policy?.attemptCount ?? 0;
+      const authoringBefore = authoringEvidenceSnapshot(this);
+      if (policy) {
+        policy.attemptCount += 1;
+      }
+      try {
+        await refreshCapabilityForAttempt(policy, attemptIndex);
+        if (config?.signal?.aborted === true) {
+          throw createGraphAbortError();
+        }
+        const invocationInput =
+          attemptIndex > 0
+            ? await prepareFallbackInvocationInput(input, config, policy)
+            : preparePrimaryInvocationInput(input, policy);
+        const result = await originalAttemptInvoke.call(this, invocationInput, config, ...rest);
+        if (attemptIndex > 0) {
+          recordGraphFallbackRecovery(this, policy?.activeFallbackContext);
+        }
+        return result;
+      } catch (error) {
+        if (policy && attemptIndex === 0) {
+          const primaryAuthored = hasNewAuthoringEvidence(this, authoringBefore);
+          if (primaryAuthored || !isRecoverableProviderFallbackError(error)) {
+            policy.blockedError = error;
+          }
+        }
+        throw error;
+      }
+    };
+  }
+  const originalGetNewModel = proto.getNewModel;
+  if (typeof originalGetNewModel === 'function') {
+    proto.getNewModel = function patchedGetNewModel(...args) {
+      const blockedError = fallbackInvocationPolicy.getStore()?.blockedError;
+      if (blockedError) {
+        throw blockedError;
+      }
+      const clientOptions = args[0]?.clientOptions;
+      const runtimeContext = clientOptions?.[GRAPH_FALLBACK_CONTEXT];
+      const policy = fallbackInvocationPolicy.getStore();
+      if (policy && runtimeContext) {
+        policy.activeFallbackContext = runtimeContext;
+        policy.activeCapabilityRefresh = clientOptions?.[MODEL_ROUTE_CAPABILITY_REFRESH];
+      }
+      return originalGetNewModel.apply(this, args);
+    };
+  }
   proto.createCallModel = function patchedCreateCallModel(agentId = 'default', ...rest) {
     const originalCallModel = originalCreateCallModel.call(this, agentId, ...rest);
     if (typeof originalCallModel !== 'function') {
@@ -123,7 +433,31 @@ function installUnifiedSchemaToolBindingPatch(proto = StandardGraph?.prototype) 
     }
 
     return async (state, config) => {
+      const invokeWithFallbackPolicy = () =>
+        fallbackInvocationPolicy.run(
+          {
+            attemptCount: 0,
+            blockedError: null,
+            activeFallbackContext: null,
+            activeFallbackInstructionAppend: '',
+            activeCapabilityRefresh: null,
+            activeCapabilityRefreshResult: null,
+            agentContext,
+          },
+          () => originalCallModel(state, config),
+        );
       const agentContext = this?.agentContexts?.get?.(agentId);
+      if (agentContext && !installScopedFallbackRouteAccessors(agentContext)) {
+        logger.error(
+          `[Agent Schema Tool Binding Patch] fallback route accessor unavailable agent=${agentId}`,
+        );
+      }
+      if (agentContext && !installDedupedBindingMethod(agentContext)) {
+        logger.error(
+          `[Agent Schema Tool Binding Patch] binding dedupe unavailable agent=${agentId}`,
+        );
+        return invokeWithFallbackPolicy();
+      }
       const getToolsForBinding =
         agentContext && typeof agentContext.getToolsForBinding === 'function'
           ? agentContext.getToolsForBinding
@@ -156,12 +490,12 @@ function installUnifiedSchemaToolBindingPatch(proto = StandardGraph?.prototype) 
               ? () => getToolsForBinding.call(agentContext)
               : unifiedTools;
           return scopedTools.run(new Map([[agentContext, scopedValue]]), () =>
-            originalCallModel(state, config),
+            invokeWithFallbackPolicy(),
           );
         }
       }
 
-      return originalCallModel(state, config);
+      return invokeWithFallbackPolicy();
     };
   };
 
@@ -186,6 +520,7 @@ try {
 }
 
 module.exports = {
+  dedupeToolsByName,
   installUnifiedSchemaToolBindingPatch,
   sameToolList,
 };

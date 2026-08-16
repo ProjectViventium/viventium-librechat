@@ -25,6 +25,42 @@ import {
  */
 describe('Reconnect Reorder Buffer Desync (Regression)', () => {
   describe('Callback preservation across reconnect cycles (Unit)', () => {
+    /* === VIVENTIUM START ===
+     * Feature: Redis stream lifecycle cleanup.
+     * Purpose: Factory-owned subscriber sockets must close without taking caller-owned sockets down.
+     * === VIVENTIUM END === */
+    test('closes only subscriber connections explicitly owned by the transport', () => {
+      const mockPublisher = {
+        publish: jest.fn().mockResolvedValue(1),
+      };
+      const callerOwnedSubscriber = {
+        on: jest.fn(),
+        unsubscribe: jest.fn().mockResolvedValue(undefined),
+        disconnect: jest.fn(),
+      };
+      const transportOwnedSubscriber = {
+        on: jest.fn(),
+        unsubscribe: jest.fn().mockResolvedValue(undefined),
+        disconnect: jest.fn(),
+      };
+
+      const callerOwnedTransport = new RedisEventTransport(
+        mockPublisher as unknown as Redis,
+        callerOwnedSubscriber as unknown as Redis,
+      );
+      const transportOwnedTransport = new RedisEventTransport(
+        mockPublisher as unknown as Redis,
+        transportOwnedSubscriber as unknown as Redis,
+        { closeSubscriberOnDestroy: true },
+      );
+
+      callerOwnedTransport.destroy();
+      transportOwnedTransport.destroy();
+
+      expect(callerOwnedSubscriber.disconnect).not.toHaveBeenCalled();
+      expect(transportOwnedSubscriber.disconnect).toHaveBeenCalledTimes(1);
+    });
+
     test('allSubscribersLeft callback fires on every disconnect, not just the first', () => {
       const mockPublisher = {
         publish: jest.fn().mockResolvedValue(1),

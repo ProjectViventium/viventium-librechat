@@ -17,3 +17,6 @@ export * from './tags';
 export * from './MCP';
 export * from './SSE';
 export * from './Feelings';
+/* === VIVENTIUM START === Account-wide parallel-work orchestration. === */
+export * from './ViventiumOrchestration';
+/* === VIVENTIUM END === */

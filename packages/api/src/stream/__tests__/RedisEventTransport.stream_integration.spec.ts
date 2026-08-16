@@ -13,6 +13,8 @@ import type { Redis, Cluster } from 'ioredis';
 describe('RedisEventTransport Integration Tests', () => {
   let originalEnv: NodeJS.ProcessEnv;
   let ioredisClient: Redis | Cluster | null = null;
+  let keyvRedisClient: { disconnect: () => void | Promise<void> } | null = null;
+  let keyvRedisClientReady: Promise<unknown> | null = null;
   const testPrefix = 'EventTransport-Integration-Test';
 
   beforeAll(async () => {
@@ -27,11 +29,23 @@ describe('RedisEventTransport Integration Tests', () => {
 
     jest.resetModules();
 
-    const { ioredisClient: client } = await import('../../cache/redisClients');
-    ioredisClient = client;
+    const redisModule = await import('../../cache/redisClients');
+    ioredisClient = redisModule.ioredisClient;
+    keyvRedisClient = redisModule.keyvRedisClient;
+    keyvRedisClientReady = redisModule.keyvRedisClientReady;
   });
 
   afterAll(async () => {
+    if (keyvRedisClientReady) {
+      await keyvRedisClientReady.catch(() => {});
+    }
+    if (keyvRedisClient) {
+      try {
+        await keyvRedisClient.disconnect();
+      } catch {
+        // Ignore cleanup errors from an already-closed test client.
+      }
+    }
     if (ioredisClient) {
       try {
         // Use quit() to gracefully close - waits for pending commands
@@ -717,6 +731,80 @@ describe('RedisEventTransport Integration Tests', () => {
   });
 
   describe('Cross-Replica Abort', () => {
+    /* === VIVENTIUM START ===
+     * Feature: Exact stream supersession.
+     * Purpose: Admission must be able to wait until Redis confirms the abort channel subscription.
+     * === VIVENTIUM END === */
+    test('reports abort subscription readiness instead of returning before Redis acknowledges it', async () => {
+      const { RedisEventTransport } = await import('../implementations/RedisEventTransport');
+
+      let releaseSubscription!: () => void;
+      const subscriptionReady = new Promise<void>((resolve) => {
+        releaseSubscription = resolve;
+      });
+      const mockPublisher = {
+        publish: jest.fn().mockResolvedValue(1),
+      };
+      const mockSubscriber = {
+        subscribe: jest.fn().mockReturnValue(subscriptionReady),
+        unsubscribe: jest.fn().mockResolvedValue(undefined),
+        on: jest.fn(),
+      };
+      const transport = new RedisEventTransport(mockPublisher as never, mockSubscriber as never);
+
+      let registrationReady = false;
+      const registration = transport.onAbort('abort-readiness', () => {});
+      void Promise.resolve(registration).then(() => {
+        registrationReady = true;
+      });
+      await Promise.resolve();
+
+      expect(registrationReady).toBe(false);
+      releaseSubscription();
+      await registration;
+      expect(registrationReady).toBe(true);
+
+      transport.destroy();
+    });
+
+    test('keeps the abort channel subscribed after the last SSE listener disconnects', async () => {
+      const { RedisEventTransport } = await import('../implementations/RedisEventTransport');
+
+      const mockPublisher = {
+        publish: jest.fn().mockResolvedValue(1),
+      };
+      const mockSubscriber = {
+        subscribe: jest.fn().mockResolvedValue(undefined),
+        unsubscribe: jest.fn().mockResolvedValue(undefined),
+        on: jest.fn(),
+      };
+      const transport = new RedisEventTransport(mockPublisher as never, mockSubscriber as never);
+      let abortReason: string | undefined;
+      await transport.onAbort('abort-survives-sse-disconnect', (reason) => {
+        abortReason = reason;
+      });
+      const subscription = transport.subscribe('abort-survives-sse-disconnect', {
+        onChunk: () => {},
+      });
+      await subscription.ready;
+
+      subscription.unsubscribe();
+      expect(mockSubscriber.unsubscribe).not.toHaveBeenCalled();
+
+      const messageHandler = mockSubscriber.on.mock.calls.find(
+        (call) => call[0] === 'message',
+      )?.[1] as (channel: string, message: string) => void;
+      messageHandler(
+        'stream:{abort-survives-sse-disconnect}:events',
+        JSON.stringify({ type: 'abort', reason: 'superseded' }),
+      );
+      expect(abortReason).toBe('superseded');
+
+      transport.cleanup('abort-survives-sse-disconnect');
+      expect(mockSubscriber.unsubscribe).toHaveBeenCalledTimes(1);
+      transport.destroy();
+    });
+
     test('should emit and receive abort signals on same instance', async () => {
       if (!ioredisClient) {
         console.warn('Redis not available, skipping test');

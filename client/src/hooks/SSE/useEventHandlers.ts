@@ -38,6 +38,12 @@ import useAttachmentHandler from '~/hooks/SSE/useAttachmentHandler';
 import useContentHandler from '~/hooks/SSE/useContentHandler';
 import useStepHandler from '~/hooks/SSE/useStepHandler';
 import { preserveTransientCortexState } from '~/hooks/SSE/viventiumTransientCortex';
+/* === VIVENTIUM START === Canonical new-chat title provenance === */
+import {
+  shouldQueueCanonicalTitle,
+  type CanonicalConversationSubmission,
+} from '~/hooks/SSE/canonicalConversation';
+/* === VIVENTIUM END === */
 import { useApplyAgentTemplate } from '~/hooks/Agents';
 import { useAuthContext } from '~/hooks/AuthContext';
 import { MESSAGE_UPDATE_INTERVAL } from '~/common';
@@ -490,9 +496,20 @@ export default function useEventHandlers({
 
         const isNewConvo = conversation.conversationId !== submissionConvo.conversationId;
 
-        if (isNewConvo && conversation.conversationId) {
-          queueTitleGeneration(conversation.conversationId);
+        /* === VIVENTIUM START ===
+         * Feature: Canonical new-chat title provenance.
+         * Purpose: Canonical route settlement makes the two live IDs equal before completion;
+         *          retain the original `new` provenance so the first title is still queued.
+         */
+        if (
+          shouldQueueCanonicalTitle(
+            conversation.conversationId,
+            submission as CanonicalConversationSubmission<EventSubmission>,
+          )
+        ) {
+          queueTitleGeneration(conversation.conversationId as string);
         }
+        /* === VIVENTIUM END === */
 
         const setFinalMessages = (id: string | null, _messages: TMessage[]) => {
           setMessages(_messages);

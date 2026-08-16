@@ -8,6 +8,8 @@
  * Added: 2026-03-06
  * === VIVENTIUM END === */
 
+const { logger } = require('@librechat/data-schemas');
+const { Run } = require('@librechat/agents');
 const {
   formatFollowUpPrompt,
   resolveFollowUpContinuationContext,
@@ -23,6 +25,9 @@ const {
   upsertCortexParts,
   buildFollowUpDecisionRecord,
   compactDecisionRecordForMetadata,
+  generateFollowUpText,
+  resolvePhaseBFeelingContext,
+  resolvePhaseBFeelingInjection,
 } = require('../BackgroundCortexFollowUpService');
 
 describe('upsertCortexParts', () => {
@@ -69,6 +74,43 @@ describe('upsertCortexParts', () => {
       expect.objectContaining({
         type: 'cortex_insight',
         cortex_id: 'red_team',
+      }),
+    ]);
+  });
+
+  test('preserves graph-authored text parts when top-level text is their concatenated transcript', () => {
+    const existing = [
+      {
+        type: 'text',
+        agentId: 'agent-consultant',
+        text: 'Verified evidence.',
+      },
+      {
+        type: 'text',
+        agentId: 'agent-author',
+        text: ' Final synthesis.',
+      },
+    ];
+
+    const merged = upsertCortexParts(
+      existing,
+      [
+        {
+          type: 'cortex_insight',
+          cortex_id: 'background-review',
+          status: 'complete',
+          insight: 'No additional correction.',
+        },
+      ],
+      { visibleText: 'Verified evidence. Final synthesis.' },
+    );
+
+    expect(merged).toEqual([
+      existing[0],
+      existing[1],
+      expect.objectContaining({
+        type: 'cortex_insight',
+        cortex_id: 'background-review',
       }),
     ]);
   });
@@ -178,6 +220,20 @@ describe('Phase B prompt registry ownership', () => {
     );
   });
 
+  test('pins one Feeling capsule as the final system layer for a visible follow-up', () => {
+    const capsule =
+      '<viventium_feeling_state>\nsynthetic private cause\n</viventium_feeling_state>';
+    const systemPrompt = require('../BackgroundCortexFollowUpService').buildFollowUpSystemPrompt({
+      primaryResponseMode: false,
+      noResponseInstructions: 'Use {NTA} when no reply is needed.',
+      feelingCapsule: capsule,
+    });
+
+    expect(systemPrompt.endsWith(capsule)).toBe(true);
+    expect(systemPrompt.match(/<viventium_feeling_state>/g)).toHaveLength(1);
+    expect(systemPrompt.indexOf('Use {NTA}')).toBeLessThan(systemPrompt.indexOf(capsule));
+  });
+
   test('routes forced primary follow-up prompts with the user request through the prompt registry', () => {
     jest.resetModules();
     const getPromptText = jest.fn((_promptId, fallback) => fallback);
@@ -206,6 +262,175 @@ describe('Phase B prompt registry ownership', () => {
   });
 });
 
+describe('Phase B conscious Feelings context', () => {
+  const capsule = '<viventium_feeling_state>\nsynthetic private cause\n</viventium_feeling_state>';
+
+  test.each(['all_agents', 'conscious_agent'])(
+    'applies the pinned capsule to conscious synthesis under %s scope',
+    (agentScope) => {
+      expect(
+        resolvePhaseBFeelingContext({
+          enabled: true,
+          agentScope,
+          snapshotHash: 'synthetic-hash',
+          capsule,
+        }),
+      ).toEqual({
+        capsule,
+        enabled: true,
+        scope: agentScope,
+        snapshotHash: 'synthetic-hash',
+        rangePromptOverrideCount: 0,
+        activeRangePromptOverrideCount: 0,
+        activeRangePromptOverrideChars: 0,
+        reason: 'conscious_synthesis',
+      });
+    },
+  );
+
+  test('does not inject a second capsule into a same-session continuation', () => {
+    expect(
+      resolvePhaseBFeelingInjection({
+        feelingContext: { capsule, reason: 'conscious_synthesis' },
+        providerCapability: { conversation_session: true },
+        primaryResponseMode: false,
+      }),
+    ).toEqual({
+      capsule: '',
+      reason: 'preserved_in_conversation_session',
+    });
+  });
+
+  test('keeps the capsule for direct providers and a session-backed primary response', () => {
+    const feelingContext = { capsule, reason: 'conscious_synthesis' };
+    expect(
+      resolvePhaseBFeelingInjection({
+        feelingContext,
+        providerCapability: { conversation_session: false },
+      }).capsule,
+    ).toBe(capsule);
+    expect(
+      resolvePhaseBFeelingInjection({
+        feelingContext,
+        providerCapability: { conversation_session: true },
+        primaryResponseMode: true,
+      }).capsule,
+    ).toBe(capsule);
+  });
+
+  test('does not apply a capsule when Feelings is off', () => {
+    expect(
+      resolvePhaseBFeelingContext({
+        enabled: false,
+        agentScope: 'all_agents',
+        snapshotHash: 'synthetic-off-hash',
+        capsule,
+      }),
+    ).toEqual({
+      capsule: '',
+      enabled: false,
+      scope: 'all_agents',
+      snapshotHash: 'synthetic-off-hash',
+      rangePromptOverrideCount: 0,
+      activeRangePromptOverrideCount: 0,
+      activeRangePromptOverrideChars: 0,
+      reason: 'feelings_disabled',
+    });
+  });
+
+  test('distinguishes operator unavailability from a user turning Feelings off', () => {
+    expect(
+      resolvePhaseBFeelingContext({
+        available: false,
+        enabled: false,
+        agentScope: 'all_agents',
+        snapshotHash: 'synthetic-unavailable-hash',
+        capsule: '',
+      }),
+    ).toEqual({
+      capsule: '',
+      enabled: false,
+      scope: 'all_agents',
+      snapshotHash: 'synthetic-unavailable-hash',
+      rangePromptOverrideCount: 0,
+      activeRangePromptOverrideCount: 0,
+      activeRangePromptOverrideChars: 0,
+      reason: 'operator_unavailable',
+    });
+  });
+
+  test.each([
+    [null, 'snapshot_unavailable'],
+    [
+      {
+        enabled: true,
+        agentScope: 'all_agents',
+        snapshotHash: 'synthetic-empty-hash',
+        capsule: '',
+      },
+      'capsule_unavailable',
+    ],
+  ])(
+    'fails open without invented affect when pinned context is unavailable',
+    (snapshot, reason) => {
+      expect(resolvePhaseBFeelingContext(snapshot)).toEqual(
+        expect.objectContaining({
+          capsule: '',
+          reason,
+        }),
+      );
+    },
+  );
+
+  test('sends the exact pinned capsule to the model and logs only structural application evidence', async () => {
+    process.env.XAI_API_KEY = 'synthetic-provider-key';
+    const processStream = jest.fn().mockResolvedValue('A natural synthesized continuation.');
+    const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
+    const infoLog = jest.spyOn(logger, 'info').mockImplementation(() => {});
+    const warnLog = jest.spyOn(logger, 'warn').mockImplementation(() => {});
+
+    try {
+      await generateFollowUpText({
+        req: {
+          id: 'synthetic-phase-b-request',
+          body: {},
+          _viventiumFeelingSnapshot: {
+            enabled: true,
+            agentScope: 'conscious_agent',
+            snapshotHash: 'synthetic-hash',
+            capsule,
+          },
+        },
+        agent: {
+          provider: 'xai',
+          model: 'synthetic-model',
+          model_parameters: {},
+        },
+        insightsData: {
+          insights: [{ cortexName: 'Synthetic specialist', insight: 'A new grounded fact.' }],
+        },
+        recentResponse: 'The initial answer is already visible.',
+        runId: 'synthetic-run',
+      });
+
+      const modelInstructions = createRun.mock.calls[0][0].graphConfig.instructions;
+      expect(modelInstructions.endsWith(capsule)).toBe(true);
+      expect(modelInstructions.match(/<viventium_feeling_state>/g)).toHaveLength(1);
+
+      const serializedLogs = infoLog.mock.calls.map(([message]) => String(message)).join('\n');
+      expect(serializedLogs).toContain('feelings.inject.final_run');
+      expect(serializedLogs).toContain('phase_b_followup');
+      expect(serializedLogs).toContain('conscious_synthesis');
+      expect(serializedLogs).not.toContain('synthetic private cause');
+    } finally {
+      delete process.env.XAI_API_KEY;
+      createRun.mockRestore();
+      infoLog.mockRestore();
+      warnLog.mockRestore();
+    }
+  });
+});
+
 describe('formatFollowUpPrompt', () => {
   test('defaults web follow-ups to markdown-friendly web text rules', () => {
     const prompt = formatFollowUpPrompt({
@@ -231,6 +456,28 @@ describe('formatFollowUpPrompt', () => {
 
     expect(prompt).toContain('PLAYGROUND TEXT MODE:');
     expect(prompt).not.toContain('WEB TEXT MODE:');
+  });
+
+  test('teaches smart optional audio only to Telegram follow-ups that can attach audio', () => {
+    const base = {
+      insights: [{ cortexName: 'planner', insight: 'The synthetic draft is ready.' }],
+      recentResponse: 'I started checking it.',
+      voiceMode: false,
+      surface: 'telegram',
+    };
+
+    const textOnlyPrompt = formatFollowUpPrompt(base);
+    const audioEligiblePrompt = formatFollowUpPrompt({
+      ...base,
+      telegramAudioRequested: true,
+      voiceProvider: 'xai',
+    });
+
+    expect(textOnlyPrompt).toContain('{MSG_BREAK}');
+    expect(textOnlyPrompt).not.toContain('{SKIP_VOICE}');
+    expect(audioEligiblePrompt).toContain('{MSG_BREAK}');
+    expect(audioEligiblePrompt).toContain('{SKIP_VOICE}');
+    expect(audioEligiblePrompt).toContain('explicitly asks to hear, read aloud, speak');
   });
 
   test('keeps Wing Mode follow-ups silence-first', () => {
@@ -295,6 +542,24 @@ describe('formatFollowUpPrompt', () => {
       'Background agents provide evidence only. You decide whether there is anything worth surfacing.',
     );
     expect(prompt).toContain('respond with {NTA}');
+  });
+
+  test('preserves a bounded larger evidence packet for durable mission results', () => {
+    const marker = 'END_OF_SYNTHETIC_MISSION_EVIDENCE';
+    const prompt = formatFollowUpPrompt({
+      insights: [
+        {
+          cortexName: 'Mission evidence',
+          insight: `${'A'.repeat(2000)}${marker}`,
+          maxPromptChars: 4096,
+        },
+      ],
+      recentResponse: 'The mission is running.',
+      voiceMode: false,
+      surface: '',
+    });
+
+    expect(prompt).toContain(marker);
   });
 
   test('shows the follow-up model newer conversation context when the thread moved on', () => {
@@ -1003,7 +1268,7 @@ describe('resolveFollowUpContinuationContext', () => {
 describe('sanitizeAnthropicFollowUpLLMConfig', () => {
   test('removes temperature when Anthropic follow-up relies on default thinking', () => {
     const result = sanitizeAnthropicFollowUpLLMConfig({
-      model: 'claude-sonnet-4-5',
+      model: 'claude-opus-5',
       temperature: 0.3,
     });
 
@@ -1020,9 +1285,19 @@ describe('sanitizeAnthropicFollowUpLLMConfig', () => {
     expect(result.temperature).toBeUndefined();
   });
 
+  test('keeps adaptive-era safety for date-stamped models with an explicit adaptive revision', () => {
+    const result = sanitizeAnthropicFollowUpLLMConfig({
+      model: 'claude-opus-4-7-20250929',
+      temperature: 0.3,
+      thinking: false,
+    });
+
+    expect(result.temperature).toBeUndefined();
+  });
+
   test('preserves temperature for legacy Anthropic models when thinking is explicitly disabled', () => {
     const result = sanitizeAnthropicFollowUpLLMConfig({
-      model: 'claude-sonnet-4-5-20250929',
+      model: 'claude-opus-5-20250929',
       temperature: 0.3,
       thinking: false,
     });

@@ -1,7 +1,7 @@
 import { useState, memo, useRef, useCallback, useEffect } from 'react';
 import * as Select from '@ariakit/react/select';
 import { FileText, FlaskConical, HeartPulse, LogOut, Plug2 } from 'lucide-react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { SettingsTabValues, SystemRoles, apiBaseUrl, request } from 'librechat-data-provider';
 import {
   LinkIcon,
@@ -16,7 +16,11 @@ import { useGetStartupConfig, useGetUserBalance } from '~/data-provider';
 import { useAuthContext } from '~/hooks/AuthContext';
 import { NotificationSeverity } from '~/common';
 import { useLocalize } from '~/hooks';
-import { CONNECTED_ACCOUNTS_OPEN_EVENT } from '~/common/connectedAccounts';
+import {
+  CONNECTED_ACCOUNTS_OPEN_EVENT,
+  removeSetupParamFromUrl,
+  shouldOpenConnectedAccountsSetup,
+} from '~/common/connectedAccounts';
 import Settings from './Settings';
 
 type PromptWorkbenchStartResponse = {
@@ -27,6 +31,7 @@ type PromptWorkbenchStartResponse = {
 
 function AccountSettings() {
   const navigate = useNavigate();
+  const location = useLocation();
   const localize = useLocalize();
   const { showToast } = useToastContext();
   const { user, isAuthenticated, logout } = useAuthContext();
@@ -34,6 +39,9 @@ function AccountSettings() {
   const connectedAccountsEnabled =
     (startupConfig as { viventiumConnectedAccountsEnabled?: boolean } | undefined)
       ?.viventiumConnectedAccountsEnabled === true;
+  const whoopSetupEnabled =
+    startupConfig?.viventiumHealthWhoopEnabled === true && user?.role === SystemRoles.ADMIN;
+  const installExperience = startupConfig?.viventiumInstallExperience;
   const promptWorkbenchLinkEnabled =
     (startupConfig as { viventiumPromptWorkbenchLinkEnabled?: boolean } | undefined)
       ?.viventiumPromptWorkbenchLinkEnabled === true && user?.role === SystemRoles.ADMIN;
@@ -57,6 +65,48 @@ function AccountSettings() {
     setSettingsInitialTab(initialTab);
     setShowSettings(true);
   }, []);
+
+  const handleSettingsOpenChange = useCallback((open: boolean) => {
+    setShowSettings(open);
+    if (open) {
+      return;
+    }
+
+    const currentUrl = new URL(window.location.href);
+    if (!currentUrl.searchParams.has('setup')) {
+      return;
+    }
+    window.history.replaceState(
+      window.history.state,
+      '',
+      removeSetupParamFromUrl(currentUrl.pathname, currentUrl.search, currentUrl.hash),
+    );
+  }, []);
+
+  /* === VIVENTIUM START ===
+   * Feature: Express browser-first onboarding.
+   * Purpose: Consume the registration handoff once, open the real account UI, and leave a clean URL.
+   * === VIVENTIUM END === */
+  useEffect(() => {
+    const setup = new URLSearchParams(location.search).get('setup');
+    const openConnectedAccounts =
+      connectedAccountsEnabled &&
+      shouldOpenConnectedAccountsSetup(installExperience, location.search);
+    const openWhoop = whoopSetupEnabled && setup === 'whoop';
+    if (!openConnectedAccounts && !openWhoop) {
+      return;
+    }
+
+    openSettings(SettingsTabValues.ACCOUNT);
+  }, [
+    connectedAccountsEnabled,
+    installExperience,
+    location.hash,
+    location.pathname,
+    location.search,
+    openSettings,
+    whoopSetupEnabled,
+  ]);
 
   /* === VIVENTIUM START ===
    * Feature: Prompt Workbench account-menu entry.
@@ -227,7 +277,7 @@ function AccountSettings() {
       {showSettings && (
         <Settings
           open={showSettings}
-          onOpenChange={setShowSettings}
+          onOpenChange={handleSettingsOpenChange}
           initialTab={settingsInitialTab}
         />
       )}

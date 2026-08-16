@@ -8,7 +8,10 @@ import type {
 } from '~/types';
 import { getAzureCredentials, resolveHeaders, isUserProvided, checkUserKeyExpiry } from '~/utils';
 import { getOpenAIConfig } from './config';
-import { resolveOpenAISubscriptionUserValues } from './oauthSubscription';
+import {
+  forceRefreshOpenAISubscriptionUserValues,
+  resolveOpenAISubscriptionUserValues,
+} from './oauthSubscription';
 
 /* === VIVENTIUM START ===
  * Feature: Connected Accounts routing policy.
@@ -84,16 +87,11 @@ const isOpenAIConnectedAccountReadError = (error: unknown): boolean => {
   );
 };
 
-const isOpenAIConnectedAccountOAuthFailure = (error: unknown): boolean => {
-  if (!(error instanceof Error)) {
-    return false;
-  }
+const isOpenAIConnectedAccountReconnectFailure = (error: unknown): boolean =>
+  error instanceof Error && error.message === OPENAI_CONNECTED_ACCOUNT_RECONNECT_MESSAGE;
 
-  return (
-    error.message === OPENAI_CONNECTED_ACCOUNT_RECONNECT_MESSAGE ||
-    error.message.startsWith(OPENAI_CONNECTED_ACCOUNT_REFRESH_FAILED_PREFIX)
-  );
-};
+const isOpenAIConnectedAccountTransientFailure = (error: unknown): boolean =>
+  error instanceof Error && error.message.startsWith(OPENAI_CONNECTED_ACCOUNT_REFRESH_FAILED_PREFIX);
 
 const isConnectedAccountAuthMode = (): boolean => {
   const values = [process.env.VIVENTIUM_OPENAI_AUTH_MODE, process.env.VIVENTIUM_PRIMARY_AUTH_MODE];
@@ -154,9 +152,14 @@ export async function initializeOpenAI({
         throw openAIConnectedAccountReconnectError();
       }
       userValues = null;
-    } else if (isOpenAIConnectedAccountOAuthFailure(error)) {
+    } else if (isOpenAIConnectedAccountReconnectFailure(error)) {
       if (isConnectedAccountAuthMode() || !allowPlatformFallbackOnOAuthFailure(req)) {
         throw openAIConnectedAccountReconnectError();
+      }
+      userValues = null;
+    } else if (isOpenAIConnectedAccountTransientFailure(error)) {
+      if (isConnectedAccountAuthMode() || !allowPlatformFallbackOnOAuthFailure(req)) {
+        throw error;
       }
       userValues = null;
     } else {
@@ -190,6 +193,40 @@ export async function initializeOpenAI({
     reverseProxyUrl: baseURL || undefined,
     streaming: true,
   };
+
+  /* === VIVENTIUM START ===
+   * Feature: Connected-account early-401 recovery
+   * Purpose: Refresh from the latest encrypted user record, while reusing a token already rotated
+   * by another concurrent request.
+   */
+  if (isOpenAIOAuthSubscription) {
+    const initializedAccessToken = userValues?.apiKey;
+    clientOptions.connectedAccountAuthRefresh = async () => {
+      const latestValues = await db.getUserKeyValues({
+        userId: req.user?.id ?? '',
+        name: endpoint,
+      });
+      const resolvedValues =
+        latestValues.oauthProvider === 'openai-codex' &&
+        latestValues.apiKey &&
+        latestValues.apiKey !== initializedAccessToken
+          ? latestValues
+          : await forceRefreshOpenAISubscriptionUserValues(
+              req.user?.id ?? '',
+              latestValues,
+              db,
+            );
+
+      if (!resolvedValues.apiKey) {
+        throw openAIConnectedAccountReconnectError();
+      }
+      return {
+        apiKey: resolvedValues.apiKey,
+        headers: resolvedValues.headers,
+      };
+    };
+  }
+  /* === VIVENTIUM END === */
 
   if (hasUserHeaders) {
     clientOptions.headers = resolveHeaders({

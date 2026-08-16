@@ -82,11 +82,155 @@ const { loadAgent } = require('~/models/Agent');
 const { getMCPManager } = require('~/config');
 const db = require('~/models');
 const { updateBalance, bulkInsertTransactions } = require('~/models');
-const { logFeelingsEvent } = require('~/server/services/viventium/feelingsTelemetry');
+const {
+  logFeelingsEvent,
+  summarizeFeelingCapsulePlacement,
+} = require('~/server/services/viventium/feelingsTelemetry');
+const {
+  VIVENTIUM_USER_FACT_GUARD,
+  buildViventiumDynamicTail,
+  pinViventiumDynamicTailLast,
+} = require('~/server/services/viventium/feelingPromptTail');
 const {
   scheduleEmotionalReaction,
 } = require('~/server/services/viventium/EmotionalReactionService');
 const { enqueueUserMemoryWriter } = require('~/server/services/viventium/memoryWriterCoordinator');
+const {
+  recordMemoryContinuityHealth,
+} = require('~/server/services/viventium/memoryContinuityHealthLedger');
+const {
+  initializeTextTurnTiming,
+  setTextMainRunContext,
+} = require('~/server/services/viventium/textTurnTiming');
+const {
+  bindHarnessCancellation,
+  bindConversationProviderDeveloperInstructionTail,
+  buildHarnessAgentIdempotencyKeys,
+  buildHarnessAttemptIdempotencyKey,
+  applyHostEvidenceBoundaryInstructions,
+  configuredBrokerHostTools,
+  resolveHostToolCapabilityState,
+  resolveConversationProviderId,
+  setConversationProviderCapability,
+} = require('~/server/services/viventium/GlassHiveConversationProviderService');
+const {
+  getTrustedInteractionContext,
+  normalizeInteractionSourceSegments,
+  shouldSkipAutomaticMemoryWriter,
+  shouldSkipEmotionalReaction,
+} = require('~/server/services/viventium/interactionContext');
+const {
+  buildActiveWorkCapsule,
+  loadActiveWorkTurnContext,
+} = require('~/server/services/viventium/ViventiumDynamicTurnContext');
+const {
+  effectiveOrchestrationMode,
+  parallelWorkAvailable,
+} = require('~/server/services/viventium/ViventiumOrchestrationMode');
+const {
+  buildSourceSelectionCapsule,
+} = require('~/server/services/viventium/ViventiumSourceSelectionContext');
+const {
+  mainDelegationTurnTruth,
+} = require('~/server/services/viventium/GlassHiveConversationOrchestration');
+
+/* === VIVENTIUM START ===
+ * Feature: Request-pinned Parallel work roster.
+ * Purpose: Begin local preference/projection and GlassHive snapshot work alongside ordinary turn
+ * setup, reuse it across retries, and never hold the user-facing Main past the cold budget.
+ * === VIVENTIUM END === */
+function activeWorkUnavailableFallback(req) {
+  const preference = req?.user?.personalization || {};
+  const mode = effectiveOrchestrationMode(req?.user, { available: parallelWorkAvailable() });
+  if (mode !== 'parallel' && preference.parallel_work_known !== true) return '';
+  return buildActiveWorkCapsule({
+    mode,
+    voice: req?.body?.voiceMode === true,
+    snapshot: { snapshot: 'unavailable', work: null, overflowCount: null },
+  });
+}
+
+function startActiveWorkTurnContext(req) {
+  if (!req || typeof req !== 'object') return Promise.resolve('');
+  if (req._viventiumActiveWorkTurnContextPromise) {
+    return req._viventiumActiveWorkTurnContextPromise;
+  }
+  let pending;
+  try {
+    pending = loadActiveWorkTurnContext({
+      userId: String(req.user?.id || req.user?._id || ''),
+      user: req.user,
+      voice: req.body?.voiceMode === true,
+    });
+  } catch (error) {
+    pending = Promise.reject(error);
+  }
+  req._viventiumActiveWorkTurnContextPromise = Promise.resolve(pending).catch((error) => {
+    logger.warn('[VIVENTIUM][parallel-work] Dynamic turn context unavailable', {
+      errorClass: String(error?.message || 'parallel_work_context_failed').slice(0, 120),
+    });
+    return activeWorkUnavailableFallback(req);
+  });
+  return req._viventiumActiveWorkTurnContextPromise;
+}
+
+async function resolveActiveWorkTurnContext(req) {
+  const pending = startActiveWorkTurnContext(req);
+  const configured = Number(process.env.VIVENTIUM_ACTIVE_WORK_COLD_TIMEOUT_MS || 100);
+  const timeoutMs = Number.isFinite(configured) ? Math.min(500, Math.max(25, configured)) : 100;
+  let timer;
+  const timeoutFallback = activeWorkUnavailableFallback(req);
+  try {
+    return await Promise.race([
+      pending,
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(timeoutFallback), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function combineTurnContextInstructions(timeContext, activeWorkContext, sourceSelectionContext) {
+  return [timeContext, activeWorkContext, sourceSelectionContext]
+    .filter((value) => typeof value === 'string' && value.trim())
+    .join('\n\n');
+}
+
+/* === VIVENTIUM START ===
+ * Classify the detached writer from its structured memory artifact. A completed provider call is
+ * not a successful memory run when storage policy rejected the write.
+ */
+function classifyMemoryWriterResult(result) {
+  if (result == null) {
+    return 'processor_failed';
+  }
+  for (const attachment of result) {
+    const artifact = attachment?.[Tools.memory];
+    if (artifact?.type !== 'error') {
+      continue;
+    }
+    try {
+      const details = JSON.parse(String(artifact.value ?? ''));
+      return typeof details?.errorType === 'string' && details.errorType
+        ? details.errorType
+        : 'memory_error';
+    } catch {
+      return 'memory_error';
+    }
+  }
+  return null;
+}
+
+function memoryReadUnavailableContext() {
+  return [
+    '# Saved-memory availability',
+    'Saved memory is unavailable for this turn because its read path failed.',
+    'This is not evidence that no saved memory exists. Do not invent missing facts; be transparent about the unavailable context when it matters to the answer.',
+  ].join('\n');
+}
+/* === VIVENTIUM END === */
 
 /* === VIVENTIUM START ===
  * Feature: Scope-aware Feelings dynamic tail.
@@ -119,6 +263,9 @@ function evalIsolationForRequest(req) {
 }
 
 function externalUserStimulusForReaction(req, payload) {
+  if (shouldSkipEmotionalReaction(req)) {
+    return '';
+  }
   const candidates = [req?.body?.text, req?.body?.prompt, req?.body?.message?.text, payload?.text];
   return String(candidates.find((value) => typeof value === 'string' && value.trim()) || '').trim();
 }
@@ -148,6 +295,25 @@ const {
   isRuntimeHoldTextPart,
 } = require('~/server/services/viventium/runtimeHoldText');
 const { getPromptText } = require('~/server/services/viventium/promptRegistry');
+const {
+  isVoiceTaskSuppressed,
+  isVoiceTaskSuppressedDurably,
+} = require('~/server/services/viventium/VoiceTaskService');
+
+function isCancelledVoiceTask(req) {
+  const taskId = req?.body?.viventiumVoiceTaskId;
+  return typeof taskId === 'string' && taskId.trim() ? isVoiceTaskSuppressed(taskId.trim()) : false;
+}
+
+async function isCancelledVoiceTaskDurably(req) {
+  const taskId = req?.body?.viventiumVoiceTaskId;
+  if (typeof taskId !== 'string' || !taskId.trim()) return false;
+  return isVoiceTaskSuppressedDurably(taskId.trim(), {
+    callSessionId: req?.body?.viventiumCallSessionId,
+    userId: req?.user?.id,
+    streamId: req?.body?.streamId,
+  });
+}
 /* === VIVENTIUM NOTE ===
  * Feature: Background cortex follow-up grace window
  */
@@ -185,6 +351,7 @@ const INTERNAL_CONTENT_TYPES = new Set([
   ContentTypes.AGENT_UPDATE,
   ContentTypes.ERROR,
   ContentTypes.THINK,
+  ContentTypes.HARNESS_ACTIVITY,
 ]);
 
 const CORTEX_CONTENT_TYPES = new Set([
@@ -192,6 +359,39 @@ const CORTEX_CONTENT_TYPES = new Set([
   ContentTypes.CORTEX_BREWING,
   ContentTypes.CORTEX_INSIGHT,
 ]);
+
+function insertFallbackRecoveryNotice(contentParts, fallbackRoute) {
+  if (!Array.isArray(contentParts)) {
+    return false;
+  }
+  const alreadyPresent = contentParts.some(
+    (part) =>
+      part?.type === ContentTypes.HARNESS_ACTIVITY &&
+      part?.harness_activity?.event === 'fallback-recovery',
+  );
+  if (alreadyPresent) {
+    return false;
+  }
+  const hasStructuredRoute = fallbackRoute && typeof fallbackRoute === 'object';
+  const model = String(hasStructuredRoute ? fallbackRoute.model : fallbackRoute || '').trim();
+  const provider = String(hasStructuredRoute ? fallbackRoute.provider || '' : '').trim();
+  const notice = {
+    type: ContentTypes.HARNESS_ACTIVITY,
+    harness_activity: {
+      event: 'fallback-recovery',
+      summary: model
+        ? `The primary model route was unavailable. This response was recovered with your configured fallback model (${model}).`
+        : 'The primary model route was unavailable. This response was recovered with your configured fallback model.',
+      ...(hasStructuredRoute && provider ? { provider } : {}),
+      ...(hasStructuredRoute && model ? { model } : {}),
+    },
+  };
+  const firstTextIndex = contentParts.findIndex(
+    (part) => part?.type === ContentTypes.TEXT && extractTextFromContentParts([part]).trim(),
+  );
+  contentParts.splice(firstTextIndex >= 0 ? firstTextIndex : contentParts.length, 0, notice);
+  return true;
+}
 
 function upsertCortexContentPart(parts, cortexPart) {
   if (
@@ -577,12 +777,15 @@ const {
   buildVoiceModeInstructions,
   buildTelegramAudioOutputInstructions,
   buildTelegramTextInstructions,
+  buildWebTextInstructions,
+  buildScheduledCanonicalOutputInstructions,
   buildPlaygroundTextInstructions,
   buildVoiceNoteInputInstructions,
   buildVoiceCallInputInstructions,
   buildWingModeInstructions,
   isWingModeEnabledForRequest,
   buildTimeContextInstructions,
+  applyTimeContextDelivery,
 } = require('~/server/services/viventium/surfacePrompts');
 /* === VIVENTIUM NOTE END === */
 
@@ -932,14 +1135,18 @@ const BACKGROUND_CORTEX_RUNTIME_CARD_GUARD_FALLBACK = [
   '# Runtime-Owned Background Cards',
   'Runtime may display background-cortex status/result cards outside your text.',
   'Do not claim you cannot control those cards, do not say there is nothing to show, and do not narrate UI mechanics.',
-  'Do not offer to start, spin up, launch, or run background agents/cortices when the user already asked for background analysis, red-team review, bias checking, or visible background work; treat that work as already runtime-owned and answer the substantive request.',
+  'A background-cortex card is not a durable mission receipt and never proves that user-requested background work started.',
+  '',
+  'When the user asks for a durable background mission, use the exact delegation tool for that mission. Only acknowledge durable background work after its delegation tool returns a work receipt. Without that receipt, do not say the mission started, is underway, or will report back.',
+  '',
+  'A cortex insight may inform your answer, but it is not a substitute for a requested durable mission. This rule supersedes earlier background-card guidance.',
   'Do not say a specific background agent/cortex ran, is running, activated, completed, or checked the issue unless it appears in the current turn\'s "Activated Background Agents" runtime section. If the user asked for a named background agent that is not listed there, do not claim it ran; answer the substantive request and let visible runtime cards provide the proof.',
   'Do not tell the user that background cortices will check Gmail, Outlook, MS365, Google Workspace, the web, or any live connector. For live data, use verified current-run tool evidence, a brokered worker, or state the limitation plainly.',
   "Answer the user's substantive request and let runtime-owned cards speak for themselves.",
 ].join('\n');
 
 const BACKGROUND_CORTEX_RUNTIME_CARD_GUARD_MARKER =
-  'Do not offer to start, spin up, launch, or run background agents/cortices';
+  'A background-cortex card is not a durable mission receipt';
 
 function ensureBackgroundCortexRuntimeCardGuard(agent) {
   if (!agent || typeof agent !== 'object') {
@@ -987,6 +1194,29 @@ function extractTextFromContentParts(parts) {
   return texts.join('');
 }
 
+/** Replace model-authored launch narration when no matching authoritative receipt exists. */
+function enforceMainDelegationTurnTruth(contentParts, req) {
+  if (!Array.isArray(contentParts)) return false;
+  const truth = mainDelegationTurnTruth(req);
+  if (!truth || truth.unconfirmedCount === 0) return false;
+  const message = truth.confirmedCount
+    ? `${truth.confirmedCount} background task${truth.confirmedCount === 1 ? '' : 's'} started, but ${truth.unconfirmedCount} requested launch${truth.unconfirmedCount === 1 ? '' : 'es'} could not be confirmed. Check Active work before retrying.`
+    : 'I could not confirm that the requested background work started. Check Active work before retrying.';
+  const firstTextIndex = contentParts.findIndex((part) => part?.type === ContentTypes.TEXT);
+  const firstText = firstTextIndex >= 0 ? contentParts[firstTextIndex] : null;
+  const replacement = {
+    ...(firstText && typeof firstText === 'object' ? firstText : {}),
+    type: ContentTypes.TEXT,
+    text: message,
+    [ContentTypes.TEXT]: message,
+  };
+  const withoutText = contentParts.filter((part) => part?.type !== ContentTypes.TEXT);
+  const insertionIndex = firstTextIndex >= 0 ? Math.min(firstTextIndex, withoutText.length) : 0;
+  withoutText.splice(insertionIndex, 0, replacement);
+  contentParts.splice(0, contentParts.length, ...withoutText);
+  return true;
+}
+
 /* === VIVENTIUM START ===
  * Feature: Background cortex card parity with hidden sequential outputs.
  *
@@ -1023,6 +1253,9 @@ function pruneSequentialOutputPartsForPersistence(contentParts) {
     if (CORTEX_CONTENT_TYPES.has(part.type)) {
       return true;
     }
+    if (part.type === ContentTypes.HARNESS_ACTIVITY) {
+      return true;
+    }
     return false;
   });
 }
@@ -1045,11 +1278,55 @@ function getCompletionErrorMessage(err) {
   return String(err);
 }
 
+function getCompletionErrorChain(err, maxNodes = 8) {
+  const chain = [];
+  const queue = [err];
+  const seen = new Set();
+  while (queue.length > 0 && chain.length < maxNodes) {
+    const current = queue.shift();
+    if (current == null || seen.has(current)) {
+      continue;
+    }
+    if (typeof current !== 'object') {
+      chain.push(current);
+      continue;
+    }
+    seen.add(current);
+    chain.push(current);
+    for (const nested of [
+      current.cause,
+      current.error,
+      current.originalError,
+      current.reason,
+      current.response?.data,
+      current.response?.data?.error,
+      current.body,
+      current.body?.error,
+    ]) {
+      if (nested != null && !seen.has(nested)) {
+        queue.push(nested);
+      }
+    }
+  }
+  return chain;
+}
+
 function classifyCompletionErrorForLog(err) {
-  const message = getCompletionErrorMessage(err).trim().toLowerCase();
-  const code = String(err?.code || err?.lc_error_code || err?.error?.code || '')
-    .trim()
-    .toLowerCase();
+  const errorChain = getCompletionErrorChain(err);
+  const message = errorChain
+    .map((candidate) => getCompletionErrorMessage(candidate).trim().toLowerCase())
+    .filter(Boolean)
+    .join('\n');
+  const codes = errorChain.map((candidate) =>
+    String(candidate?.code || candidate?.lc_error_code || '')
+      .trim()
+      .toLowerCase(),
+  );
+  const statuses = errorChain.flatMap((candidate) => [
+    candidate?.status,
+    candidate?.statusCode,
+    candidate?.response?.status,
+  ]);
   /* === VIVENTIUM START ===
    * Feature: Post-stream finalization error handling.
    * Purpose: Distinguish provider/stream failures from deterministic cleanup work that runs only
@@ -1067,26 +1344,72 @@ function classifyCompletionErrorForLog(err) {
   if (isLocalRetrievalTimeoutError(err)) {
     return 'local_retrieval_timeout';
   }
-  if (isConnectedAccountReconnectError(err)) {
+  if (errorChain.some((candidate) => isConnectedAccountReconnectError(candidate))) {
     return 'provider_connected_account_reconnect_required';
+  }
+  /* === VIVENTIUM START ===
+   * Feature: Structured provider failure propagation.
+   * Purpose: GlassHive streams terminal failure metadata over an already-open HTTP 200 response.
+   * Preserve known structured classes directly so fallback policy never depends on error prose.
+   * === VIVENTIUM END === */
+  for (const structuredCode of [
+    'provider_rate_limited',
+    'provider_quota_exhausted',
+    'provider_response_deadline_exceeded',
+    'provider_temporarily_unavailable',
+    'provider_unauthorized',
+    'provider_access_denied',
+    'context_length_exceeded',
+  ]) {
+    if (codes.includes(structuredCode)) {
+      return structuredCode;
+    }
   }
   if (
     message.includes('rate limit') ||
     message.includes('rate_limit') ||
     message.includes('rate-limited') ||
     message.includes('rate limited') ||
-    err?.status === 429
+    statuses.includes(429)
   ) {
     return 'provider_rate_limited';
   }
   if (
-    code === 'server_is_overloaded' ||
+    codes.includes('server_is_overloaded') ||
     message.includes('server_is_overloaded') ||
     message.includes('server is overloaded') ||
     message.includes('servers are currently overloaded') ||
     message.includes('temporarily unavailable') ||
-    err?.status === 503 ||
-    err?.status === 529
+    statuses.includes(503) ||
+    statuses.includes(529)
+  ) {
+    return 'provider_temporarily_unavailable';
+  }
+  /* === VIVENTIUM START ===
+   * Feature: Provider-connection fallback classification.
+   * Purpose: Transport failures from the selected model provider are recoverable before any
+   * assistant text exists, just like provider overloads; tool/MCP failures retain their own
+   * structured classes and remain excluded by the fallback policy.
+   * === VIVENTIUM END === */
+  if (
+    codes.some((code) =>
+      [
+        'econnaborted',
+        'econnrefused',
+        'econnreset',
+        'ehostunreach',
+        'enetunreach',
+        'etimedout',
+        'und_err_connect_timeout',
+        'und_err_socket',
+      ].includes(code),
+    ) ||
+    message.includes('connection refused') ||
+    message.includes('connection reset') ||
+    message.includes('socket hang up') ||
+    message.includes('fetch failed') ||
+    statuses.includes(502) ||
+    statuses.includes(504)
   ) {
     return 'provider_temporarily_unavailable';
   }
@@ -1094,14 +1417,17 @@ function classifyCompletionErrorForLog(err) {
     message.includes('unauthorized') ||
     message.includes('invalid x-api-key') ||
     message.includes('invalid api key') ||
+    message.includes('incorrect api key') ||
+    /^\s*(401|403)\b/.test(message) ||
     message.includes('authentication_error') ||
-    code === 'authentication_error' ||
-    code === 'invalid_api_key' ||
-    err?.status === 401
+    codes.includes('authentication_error') ||
+    codes.includes('invalid_api_key') ||
+    codes.includes('model_authentication') ||
+    statuses.includes(401)
   ) {
     return 'provider_unauthorized';
   }
-  if (message.includes('forbidden') || err?.status === 403) {
+  if (message.includes('forbidden') || statuses.includes(403)) {
     return 'provider_access_denied';
   }
   if (message.includes('context length') || message.includes('maximum context')) {
@@ -1197,13 +1523,29 @@ function createFallbackInitializationError(fallbackError, contentParts) {
 }
 /* === VIVENTIUM END === */
 
+/* === VIVENTIUM START ===
+ * Feature: Safe nested completion-error diagnostics.
+ * Purpose: Preserve structured classification from wrapped provider failures without logging
+ * credential-bearing messages or stacks.
+ */
 function sanitizeCompletionErrorForLog(err) {
   const errorClass = classifyCompletionErrorForLog(err);
+  const errorChain = getCompletionErrorChain(err);
+  const structured = errorChain.find((candidate) => candidate && typeof candidate === 'object');
+  const status = errorChain
+    .flatMap((candidate) => [candidate?.status, candidate?.statusCode, candidate?.response?.status])
+    .find((value) => Number.isFinite(value));
+  const code = errorChain
+    .map((candidate) => candidate?.code || candidate?.lc_error_code)
+    .find((value) => value != null && value !== '');
+  const diagnosticText = errorChain.map(getCompletionErrorMessage).filter(Boolean).join('\n');
   const sanitized = {
     class: errorClass,
-    name: err?.name || null,
-    status: Number.isFinite(err?.status) ? err.status : null,
-    code: err?.code || err?.lc_error_code || null,
+    name: structured?.name || null,
+    status: status ?? null,
+    code: code || null,
+    chainDepth: errorChain.length,
+    messageHash: diagnosticText ? hashCompletionTextForLog(diagnosticText) : null,
   };
   if (errorClass === 'provider_connected_account_reconnect_required') {
     sanitized.action = 'reconnect_connected_account';
@@ -1211,6 +1553,7 @@ function sanitizeCompletionErrorForLog(err) {
   }
   return sanitized;
 }
+/* === VIVENTIUM END === */
 
 function hashCompletionTextForLog(text, length = 12) {
   return crypto
@@ -1300,6 +1643,10 @@ function createCompletionErrorContentPart(err) {
       'Background tool work is continuing in a follow-up response.',
     provider_rate_limited:
       'The model provider rate-limited this request. Please try again shortly.',
+    provider_quota_exhausted:
+      'The selected model provider quota is exhausted. Try again after the reset or use the configured fallback.',
+    provider_response_deadline_exceeded:
+      "The model response exceeded this turn's configured deadline and was stopped. Please retry the turn.",
     provider_temporarily_unavailable:
       'The model provider is temporarily overloaded. Please try again shortly.',
     provider_connected_account_reconnect_required: getPublicConnectedAccountReconnectMessage(err),
@@ -1463,6 +1810,178 @@ function getCortexSpeculativeParallelEnabled(req) {
   return !voiceMode;
 }
 
+function convertHarnessActivityParts(contentParts) {
+  if (!Array.isArray(contentParts)) {
+    return contentParts;
+  }
+  for (let index = 0; index < contentParts.length; index += 1) {
+    const part = contentParts[index];
+    if (!part || part.type !== ContentTypes.THINK) {
+      continue;
+    }
+    const summary = typeof part.think === 'string' ? part.think : String(part.think?.value || '');
+    contentParts[index] = {
+      type: ContentTypes.HARNESS_ACTIVITY,
+      harness_activity: {
+        event: 'reasoning-summary',
+        summary,
+      },
+    };
+  }
+  return contentParts;
+}
+
+/* === VIVENTIUM START ===
+ * Feature: GlassHive activity durability across upstream aggregation.
+ * Purpose: Reconcile the request-local safe activity stream with aggregated content before final
+ * persistence. Sequence reconciliation expands upstream-concatenated reasoning, preserves true
+ * repeated operations, and keeps unrelated activity in its original position.
+ */
+function mergeCapturedHarnessActivityParts(contentParts, req) {
+  if (!Array.isArray(contentParts)) {
+    return contentParts;
+  }
+  const captured = Array.isArray(req?._viventiumCapturedHarnessActivityParts)
+    ? req._viventiumCapturedHarnessActivityParts
+    : [];
+  if (!captured.length) {
+    return contentParts;
+  }
+  const safeCaptured = captured
+    .map((part) => {
+      if (!part || part.type !== ContentTypes.HARNESS_ACTIVITY) {
+        return null;
+      }
+      const event = String(part?.harness_activity?.event || '');
+      const summary = String(part?.harness_activity?.summary || '');
+      if (!event || !summary) {
+        return null;
+      }
+      return {
+        type: ContentTypes.HARNESS_ACTIVITY,
+        harness_activity: { event, summary },
+      };
+    })
+    .filter(Boolean);
+  if (!safeCaptured.length) {
+    return contentParts;
+  }
+  const capturedMatch = (part, startIndex) => {
+    if (!part || part.type !== ContentTypes.HARNESS_ACTIVITY) {
+      return null;
+    }
+    const event = String(part?.harness_activity?.event || '');
+    const summary = String(part?.harness_activity?.summary || '');
+    if (!event || !summary) {
+      return null;
+    }
+    let combined = '';
+    let matchedCount = 0;
+    for (let index = startIndex; index < safeCaptured.length; index += 1) {
+      const candidate = safeCaptured[index];
+      if (candidate.harness_activity.event !== event) {
+        break;
+      }
+      combined += candidate.harness_activity.summary;
+      matchedCount += 1;
+      if (combined === summary) {
+        return { length: index - startIndex + 1, remainder: '' };
+      }
+      if (!summary.startsWith(combined)) {
+        break;
+      }
+    }
+    if (
+      matchedCount > 0 &&
+      startIndex + matchedCount === safeCaptured.length &&
+      summary.startsWith(combined) &&
+      combined.length < summary.length
+    ) {
+      return {
+        length: matchedCount,
+        remainder: summary.slice(combined.length),
+      };
+    }
+    return null;
+  };
+  const cloneCapturedRange = (startIndex, endIndex) =>
+    safeCaptured.slice(startIndex, endIndex).map((part) => ({
+      type: ContentTypes.HARNESS_ACTIVITY,
+      harness_activity: {
+        event: String(part.harness_activity.event),
+        summary: String(part.harness_activity.summary),
+      },
+    }));
+  const reconciled = [];
+  let captureIndex = 0;
+  let flushedBeforeText = false;
+  for (const part of contentParts) {
+    if (part?.type === ContentTypes.TEXT && !flushedBeforeText) {
+      reconciled.push(...cloneCapturedRange(captureIndex, safeCaptured.length));
+      captureIndex = safeCaptured.length;
+      flushedBeforeText = true;
+    }
+    if (captureIndex < safeCaptured.length && part?.type === ContentTypes.HARNESS_ACTIVITY) {
+      let matchedStart = -1;
+      let matchedLength = 0;
+      let matchedRemainder = '';
+      for (let start = captureIndex; start < safeCaptured.length; start += 1) {
+        const match = capturedMatch(part, start);
+        if (match) {
+          matchedStart = start;
+          matchedLength = match.length;
+          matchedRemainder = match.remainder;
+          break;
+        }
+      }
+      if (matchedStart >= 0) {
+        reconciled.push(...cloneCapturedRange(captureIndex, matchedStart + matchedLength));
+        captureIndex = matchedStart + matchedLength;
+        if (matchedRemainder) {
+          reconciled.push({
+            type: ContentTypes.HARNESS_ACTIVITY,
+            harness_activity: {
+              event: String(part.harness_activity.event),
+              summary: matchedRemainder,
+            },
+          });
+        }
+        continue;
+      }
+    }
+    reconciled.push(part);
+  }
+  reconciled.push(...cloneCapturedRange(captureIndex, safeCaptured.length));
+  contentParts.splice(0, contentParts.length, ...reconciled);
+  return contentParts;
+}
+
+function finalizeHarnessActivityPartsForPersistence(contentParts, req) {
+  for (let index = 0; index < contentParts.length; index += 1) {
+    const part = contentParts[index];
+    if (part?.type === ContentTypes.TEXT && typeof part.viventium_render_part_id !== 'string') {
+      part.viventium_render_part_id = `content:${index}`;
+    }
+  }
+  sanitizeAggregatedContentParts(contentParts);
+  if (
+    req?._viventiumHarnessExecutionEnabled === true ||
+    req?._viventiumCapturedHarnessActivityParts?.length > 0
+  ) {
+    convertHarnessActivityParts(contentParts);
+  }
+  return mergeCapturedHarnessActivityParts(contentParts, req);
+}
+/* === VIVENTIUM END === */
+
+function isHarnessInvocationLocked(req) {
+  return (
+    (req?._viventiumHarnessExecutionEnabled === true ||
+      req?._viventiumHarnessActivityEnabled === true) &&
+    req?._viventiumHarnessInvocationStarted === true
+  );
+}
+
 /**
  * Fail-closed gate for speculative parallel detection.
  *
@@ -1525,6 +2044,80 @@ function decideSpeculativeParallelOutcome({ activatedCortices, timedOut } = {}) 
 
 function shouldRunLiveSpeculativePhaseA({ policy } = {}) {
   return policy?.enabled === true;
+}
+
+function shouldRunOnePassNonblockingPhaseA({ policy, speculativeMode } = {}) {
+  // `speculativeMode` is accepted for backward-compatible callers but cannot disqualify the
+  // one-pass contract: an async conscious Main must never be cancelled/replayed after it starts.
+  void speculativeMode;
+  return policy?.enabled === true;
+}
+
+function resolveParallelDetectionNoticeMode({ onePass, noticeMode } = {}) {
+  if (onePass === true) {
+    return noticeMode;
+  }
+  return noticeMode === 'first_activation_continue' ? 'all_within_budget' : noticeMode;
+}
+
+function startOnePassNonblockingMain({ runMain, detectionPromise, onDetection }) {
+  const backgroundPromise = Promise.resolve(detectionPromise).then(onDetection);
+  const mainPromise = Promise.resolve().then(runMain);
+  return { mainPromise, backgroundPromise };
+}
+
+function startParallelPhaseBRecovery({ runInitial, runLate }) {
+  const initialPromise = Promise.resolve().then(runInitial);
+  const latePromise = typeof runLate === 'function' ? Promise.resolve().then(runLate) : null;
+  return Promise.all(latePromise ? [initialPromise, latePromise] : [initialPromise]);
+}
+
+/**
+ * Resolve the complete activation set for one-pass Phase B. Early detection may return before the
+ * detection budget is exhausted, so the final result remains authoritative for timeout-based late
+ * recovery. The returned late merge is anchored to the initial Phase B set, ensuring a cortex runs
+ * either in the initial execution or late recovery, never both.
+ */
+async function resolveOnePassPhaseBPlan({
+  detectionResult,
+  detectTimeoutMs,
+  awaitFinalDetection = (promise) => promise,
+  resolveLateDetectTimeoutMs = getCortexLateDetectTimeoutMs,
+} = {}) {
+  let initialActivations = Array.isArray(detectionResult?.activatedCortices)
+    ? detectionResult.activatedCortices
+    : [];
+  let finalRecoveredActivations = [];
+  let effectiveDetectionResult = detectionResult;
+
+  if (
+    detectionResult?.earlyReturned === true &&
+    detectionResult.finalDetectionPromise &&
+    typeof detectionResult.finalDetectionPromise.then === 'function'
+  ) {
+    const finalDetectionResult = await awaitFinalDetection(detectionResult.finalDetectionPromise);
+    const finalActivations = Array.isArray(finalDetectionResult?.activatedCortices)
+      ? finalDetectionResult.activatedCortices
+      : initialActivations;
+    if (finalDetectionResult) {
+      effectiveDetectionResult = finalDetectionResult;
+    }
+    const finalMerge = mergeLateActivationCandidates(initialActivations, finalActivations);
+    initialActivations = finalMerge.all;
+    finalRecoveredActivations = finalMerge.recovered;
+  }
+
+  const lateDetectTimeoutMs =
+    effectiveDetectionResult?.timedOut === true ? resolveLateDetectTimeoutMs(detectTimeoutMs) : 0;
+
+  return {
+    effectiveDetectionResult,
+    initialActivations,
+    finalRecoveredActivations,
+    lateDetectTimeoutMs,
+    mergeLateActivations: (lateActivations) =>
+      mergeLateActivationCandidates(initialActivations, lateActivations),
+  };
 }
 
 function shouldSuppressSpeculativeRunError(err, { aborted = false } = {}) {
@@ -1861,39 +2454,126 @@ function createMultiAgentMapper(primaryAgent, agentConfigs) {
  * API, and voice agent runs pass the same attachments/tool resources to GlassHive.
  * Added: 2026-04-28
  * === VIVENTIUM END === */
+/**
+ * Project the server-claimed ordered logical-turn source packet. Caller-provided delegation-context
+ * objects are ignored. If no ledger claim exists (legacy/direct callers), fall back to the exact
+ * current request segment with its trusted source-event identity.
+ */
+function buildViventiumTriggeringSourceSegments(req, interactionContext) {
+  const claimed = normalizeInteractionSourceSegments(
+    interactionContext?.source_segments,
+    interactionContext?.source_segments_overflow_count,
+  );
+  if (claimed.segments.length) {
+    return {
+      segments: claimed.segments.map((segment) => ({ ...segment })),
+      overflowCount: claimed.overflowCount,
+    };
+  }
+  const text = req?.body?.text;
+  const values = Array.isArray(text) ? text : typeof text === 'string' ? [text] : [];
+  const fallback = normalizeInteractionSourceSegments(
+    values.map((value, sourceIndex) => ({
+      source_event_id: interactionContext?.source_event_id || req?.body?.messageId || '',
+      source_index: sourceIndex,
+      text: value,
+    })),
+  );
+  return {
+    segments: fallback.segments.map((segment) => ({ ...segment })),
+    overflowCount: fallback.overflowCount,
+  };
+}
+
 function buildViventiumMcpRequestBody({
   messageId,
   conversationId,
   parentMessageId,
+  harnessIdempotencyKey,
+  harnessAgentIdempotencyKeys,
   req,
   attachments,
   toolResources,
 }) {
-  const files = Array.isArray(attachments)
-    ? attachments.map((file) => {
-        const metadata = file?.metadata?.fileIdentifier
-          ? { fileIdentifier: file.metadata.fileIdentifier }
-          : undefined;
-        return {
-          file_id: file?.file_id,
-          temp_file_id: file?.temp_file_id,
-          filename: file?.filename,
-          filepath: file?.filepath,
-          source: file?.source,
-          context: file?.context,
-          type: file?.type,
-          bytes: file?.bytes,
-          width: file?.width,
-          height: file?.height,
-          ...(metadata ? { metadata } : {}),
-          ...(typeof file?.text === 'string' ? { text: file.text } : {}),
-        };
-      })
+  const interactionContext = getTrustedInteractionContext(req);
+  const normalizedTriggeringSourceSegments = buildViventiumTriggeringSourceSegments(
+    req,
+    interactionContext,
+  );
+  const triggeringSourceSegments = normalizedTriggeringSourceSegments.segments;
+  const sourceLedgerAttachments = triggeringSourceSegments.flatMap((segment) =>
+    (Array.isArray(segment?.source_files) ? segment.source_files : []).map((file) => ({
+      ...file,
+      source_event_id: segment.source_event_id,
+      source_index: segment.source_index,
+    })),
+  );
+  const missionAttachments = Array.isArray(req?._viventiumMissionAttachments)
+    ? req._viventiumMissionAttachments
     : [];
+  const attachmentCandidates = [
+    ...sourceLedgerAttachments,
+    ...missionAttachments,
+    ...(Array.isArray(attachments) ? attachments : []),
+  ];
+  const seenFileIdentities = new Set();
+  const files = attachmentCandidates
+    .filter((file) => {
+      const fileId = String(file?.file_id || file?.temp_file_id || '').trim();
+      if (!fileId) return true;
+      const sourceEventId = String(
+        file?.source_event_id || interactionContext?.source_event_id || '',
+      ).trim();
+      const sourceIndex = Number.isInteger(Number(file?.source_index))
+        ? Number(file.source_index)
+        : 0;
+      const identity = `${sourceEventId}\0${sourceIndex}\0${fileId}`;
+      if (seenFileIdentities.has(identity)) return false;
+      seenFileIdentities.add(identity);
+      return true;
+    })
+    .map((file) => {
+      const metadata = file?.metadata?.fileIdentifier
+        ? { fileIdentifier: file.metadata.fileIdentifier }
+        : undefined;
+      return {
+        file_id: file?.file_id,
+        temp_file_id: file?.temp_file_id,
+        filename: file?.filename,
+        filepath: file?.filepath,
+        source: file?.source,
+        context: file?.context,
+        type: file?.type,
+        bytes: file?.bytes,
+        width: file?.width,
+        height: file?.height,
+        ...(Number.isInteger(Number(file?.media_group_index ?? file?.viventium_media_group_index))
+          ? {
+              media_group_index: Number(file.media_group_index ?? file.viventium_media_group_index),
+            }
+          : {}),
+        ...(String(file?.source_event_id || interactionContext?.source_event_id || '').trim()
+          ? {
+              source_event_id: String(file?.source_event_id || interactionContext?.source_event_id)
+                .trim()
+                .slice(0, 160),
+              source_index: Number.isInteger(Number(file?.source_index))
+                ? Math.max(0, Number(file.source_index))
+                : 0,
+            }
+          : {}),
+        ...(metadata ? { metadata } : {}),
+        ...(typeof file?.text === 'string' ? { text: file.text } : {}),
+      };
+    });
   return {
     messageId,
     conversationId,
     parentMessageId,
+    viventiumGlassHiveIdempotencyKey: harnessIdempotencyKey,
+    ...(harnessAgentIdempotencyKeys && Object.keys(harnessAgentIdempotencyKeys).length > 0
+      ? { viventiumGlassHiveAgentIdempotencyKeys: { ...harnessAgentIdempotencyKeys } }
+      : {}),
     viventiumSurface: req?.body?.viventiumSurface,
     viventiumInputMode: req?.body?.viventiumInputMode,
     viventiumStreamId: req?.body?.streamId || req?._resumableStreamId,
@@ -1904,12 +2584,67 @@ function buildViventiumMcpRequestBody({
     viventiumTelegramChatId: req?.body?.telegramChatId,
     viventiumTelegramUserId: req?.body?.telegramUserId,
     viventiumTelegramMessageId: req?.body?.telegramMessageId,
+    viventiumScheduleId: req?.body?.scheduleId,
+    viventiumSchedulerDispatchDocumentId: req?.viventiumSchedulerDispatchDocumentId,
+    viventiumSchedulerOccurrenceKey: req?.body?.idempotencyKey,
+    viventiumSchedulerDeliveryChannels: req?.body?.deliveryChannels,
+    viventiumSchedulerExternalWorkRequired: req?.viventiumSchedulerExternalWorkRequired === true,
+    viventiumAuthoringSourceEventId: interactionContext?.source_event_id,
+    viventiumSourceEventId: interactionContext?.source_event_id,
+    viventiumTriggeringSourceSegments: triggeringSourceSegments,
+    ...(normalizedTriggeringSourceSegments.overflowCount > 0
+      ? {
+          viventiumTriggeringSourceSegmentsOverflowCount:
+            normalizedTriggeringSourceSegments.overflowCount,
+        }
+      : {}),
+    viventiumLogicalTurnId: interactionContext?.logical_turn_id,
+    viventiumLogicalTurnRevision: interactionContext?.logical_turn_id
+      ? String(interactionContext.revision)
+      : undefined,
     ...(files.length
       ? { files, attachments: files, file_ids: files.map((file) => file.file_id).filter(Boolean) }
       : {}),
     ...(toolResources ? { tool_resources: toolResources } : {}),
   };
 }
+
+/* === VIVENTIUM START ===
+ * Feature: Graph-participant workspace route parity.
+ * Purpose: A participant owns one request identity even when only an initialized runtime fallback
+ * route is workspace-bound. Resolve that structured route metadata once for idempotency and Stop
+ * binding; never infer it from provider names, agent names, prompts, or model text.
+ * Added: 2026-08-10
+ */
+function resolveWorkspaceParticipantBindings(participatingAgents, providerCapabilities = {}) {
+  const bindingsByAgentId = new Map();
+  for (const participant of participatingAgents || []) {
+    const agentId = String(participant?.id || '').trim();
+    if (!agentId) {
+      continue;
+    }
+    const fallbackRoutes = Array.isArray(participant?.viventiumGraphLlmFallbacks)
+      ? participant.viventiumGraphLlmFallbacks
+      : [];
+    for (const route of [participant, ...fallbackRoutes]) {
+      const providerId = resolveConversationProviderId(route);
+      if (!providerId || providerCapabilities?.[providerId]?.workspace_binding !== true) {
+        continue;
+      }
+      let binding = bindingsByAgentId.get(agentId);
+      if (!binding) {
+        binding = { agentId, cancellationEndpointConfigs: [] };
+        bindingsByAgentId.set(agentId, binding);
+      }
+      const endpointConfig = route?.viventiumHarnessCancellationEndpointConfig;
+      if (endpointConfig != null && !binding.cancellationEndpointConfigs.includes(endpointConfig)) {
+        binding.cancellationEndpointConfigs.push(endpointConfig);
+      }
+    }
+  }
+  return Array.from(bindingsByAgentId.values());
+}
+/* === VIVENTIUM END === */
 /* === VIVENTIUM START ===
  * Feature: GlassHive MCP upload/context propagation
  * Added: 2026-04-28
@@ -1950,6 +2685,21 @@ class AgentClient extends BaseClient {
     this.artifactPromises = artifactPromises;
     /** @type {AgentClientOptions} */
     this.options = Object.assign({ endpoint: options.endpoint }, clientOptions);
+    /* === VIVENTIUM START ===
+     * Feature: Voice actor authority boundary
+     * Purpose: Shared-mic/guest attribution may inform the reply, but it cannot authorize tools,
+     * GlassHive work, or background cortices. Clone the per-request agent to avoid shared mutation.
+     * === VIVENTIUM END === */
+    if (
+      this.options.req?.body?.viventiumCanAuthorizeSideEffects === false &&
+      this.options.req?.body?.viventiumActorTrust !== 'owner_participant'
+    ) {
+      this.options.agent = {
+        ...this.options.agent,
+        tools: [],
+        background_cortices: [],
+      };
+    }
     /** @type {string} */
     this.model = this.options.agent.model_parameters.model;
     /** The key for the usage object's input tokens
@@ -2058,6 +2808,7 @@ class AgentClient extends BaseClient {
 
   async buildMessages(messages, parentMessageId, _buildOptions, opts) {
     const req = this.options.req;
+    startActiveWorkTurnContext(req);
     const buildStart = startDeepTiming(req);
     if (isDeepTimingEnabled(req)) {
       logDeepTiming(req, 'build_messages_start', null, `count=${messages?.length ?? 0}`);
@@ -2134,6 +2885,7 @@ class AgentClient extends BaseClient {
      * - Fail open to ordinary Viventium if local state is unavailable or slow.
      * === VIVENTIUM END === */
     let feelingSnapshot = null;
+    promptFrameLayers.viventium_user_fact_guard = VIVENTIUM_USER_FACT_GUARD;
     const feelingReadStartedAt = Date.now();
     const evalIsolation = evalIsolationForRequest(req);
     if (evalIsolation.feelings) {
@@ -2182,6 +2934,9 @@ class AgentClient extends BaseClient {
           version: feelingSnapshot?.version ?? 0,
           snapshotHash: feelingSnapshot?.snapshotHash || 'none',
           cacheHit: feelingSnapshot?.cacheHit === true,
+          rangePromptOverrideCount: feelingSnapshot?.rangePromptOverrideCount ?? 0,
+          activeRangePromptOverrideCount: feelingSnapshot?.activeRangePromptOverrideCount ?? 0,
+          activeRangePromptOverrideChars: feelingSnapshot?.activeRangePromptOverrideChars ?? 0,
           durationMs: Date.now() - feelingReadStartedAt,
         });
       } catch (error) {
@@ -2357,6 +3112,8 @@ class AgentClient extends BaseClient {
               `includedKeys=${readContext?.includedKeys?.length ?? 0}`,
               `omittedKeys=${readContext?.omittedKeys?.length ?? 0}`,
               `duplicateKeys=${readContext?.duplicateKeys?.length ?? 0}`,
+              `includedKeyNames=${readContext?.includedKeys?.join(',') || 'none'}`,
+              `omittedKeyNames=${readContext?.omittedKeys?.join(',') || 'none'}`,
               `cacheHit=${readContext?.cacheHit === true}`,
             ].join(' '),
           );
@@ -2380,7 +3137,16 @@ class AgentClient extends BaseClient {
       // Carry the (already permission-gated + token-limited) memory content so a GlassHive worker
       // launched during this run receives the same user context the main agent has (Quality parity).
       this.glasshiveWorkerMemory = memoryResult;
+    } else if (this.memoryReadUnavailable === true) {
+      const unavailableContext = memoryReadUnavailableContext();
+      sharedRunContextParts.push(unavailableContext);
+      promptFrameLayers.memory_context = unavailableContext;
+      this.glasshiveWorkerMemory = unavailableContext;
     }
+    // VIVENTIUM: the invocation-fresh conversation-provider grant is rebuilt after this point.
+    // Keep the already permission-gated snapshot on the request object (never in the model prompt
+    // scraper) so a Main-brokered mission receives the same factual memory as direct delegation.
+    req._viventiumGlassHiveWorkerMemory = this.glasshiveWorkerMemory || '';
     if (isDeepTimingEnabled(req)) {
       logDeepTiming(
         req,
@@ -2470,10 +3236,12 @@ class AgentClient extends BaseClient {
           logger,
           mcpManager,
           sharedRunContext,
-          dynamicTailContext: feelingTailForAgent({
-            snapshot: feelingSnapshot,
-            agentId,
-            primaryAgentId: this.options.agent.id,
+          dynamicTailContext: buildViventiumDynamicTail({
+            capsule: feelingTailForAgent({
+              snapshot: feelingSnapshot,
+              agentId,
+              primaryAgentId: this.options.agent.id,
+            }),
           }),
           ephemeralAgent: agentId === this.options.agent.id ? ephemeralAgent : undefined,
         }),
@@ -2496,6 +3264,9 @@ class AgentClient extends BaseClient {
       participatingAgentCount: allAgents.length,
       injectedAgentCount: feelingsInjectedAgentCount,
       skippedAgentCount: allAgents.length - feelingsInjectedAgentCount,
+      rangePromptOverrideCount: feelingSnapshot?.rangePromptOverrideCount ?? 0,
+      activeRangePromptOverrideCount: feelingSnapshot?.activeRangePromptOverrideCount ?? 0,
+      activeRangePromptOverrideChars: feelingSnapshot?.activeRangePromptOverrideChars ?? 0,
     });
     promptFrameLayers.shared_run_context = sharedRunContext;
     promptFrameLayers.primary_final_instructions = this.options.agent?.instructions || '';
@@ -2584,6 +3355,7 @@ class AgentClient extends BaseClient {
    * @returns {Promise<string | undefined>}
    */
   async useMemory() {
+    this.memoryReadUnavailable = false;
     if (evalIsolationForRequest(this.options.req).savedMemory) {
       this.memoryWriterState = null;
       logger.debug('[VIVENTIUM][EvalIsolation] Saved memory read/write skipped');
@@ -2594,12 +3366,29 @@ class AgentClient extends BaseClient {
       this.memoryWriterState = null;
       return;
     }
-    const hasAccess = await checkAccess({
-      user,
-      permissionType: PermissionTypes.MEMORIES,
-      permissions: [Permissions.USE],
-      getRoleByName,
-    });
+    let hasAccess;
+    try {
+      hasAccess = await checkAccess({
+        user,
+        permissionType: PermissionTypes.MEMORIES,
+        permissions: [Permissions.USE],
+        getRoleByName,
+      });
+    } catch (error) {
+      this.memoryReadUnavailable = true;
+      this.memoryWriterState = null;
+      void recordMemoryContinuityHealth({
+        userId: String(user.id),
+        path: 'read',
+        status: 'degraded',
+        reason: 'access_check_failed',
+      });
+      logger.error(
+        '[api/server/controllers/agents/client.js #useMemory] Memory access check failed',
+        sanitizeCompletionErrorForLog(error),
+      );
+      return;
+    }
 
     if (!hasAccess) {
       logger.debug(
@@ -2621,6 +3410,10 @@ class AgentClient extends BaseClient {
       deleteMemory: db.deleteMemory,
       getFormattedMemories: db.getFormattedMemories,
       getAllUserMemories: db.getAllUserMemories,
+      /* === VIVENTIUM START ===
+       * The detached writer snapshot needs tombstone revisions for atomic compare-and-set writes.
+       * === VIVENTIUM END === */
+      getAllUserMemoryStates: db.getAllUserMemoryStates,
     };
     const memoryPolicyConfig = {
       validKeys: memoryConfig.validKeys,
@@ -2657,8 +3450,21 @@ class AgentClient extends BaseClient {
         config: memoryPolicyConfig,
       });
       this.memoryReadContext = readContext;
+      void recordMemoryContinuityHealth({
+        userId,
+        path: 'read',
+        status: 'ok',
+        reason: readContext.text ? 'context_loaded' : 'empty_result',
+      });
       return readContext.text || undefined;
     } catch (error) {
+      this.memoryReadUnavailable = true;
+      void recordMemoryContinuityHealth({
+        userId,
+        path: 'read',
+        status: 'degraded',
+        reason: 'read_failed',
+      });
       logger.error(
         '[api/server/controllers/agents/client.js #useMemory] Error loading memory read profile',
         sanitizeCompletionErrorForLog(error),
@@ -2681,6 +3487,15 @@ class AgentClient extends BaseClient {
         }),
       },
     };
+  }
+
+  createMemoryWriterUnavailableAttachment(message) {
+    return this.createMemoryWriterStatusAttachment({
+      message:
+        message ||
+        'Saved memory could not be updated after this turn. The reply is preserved, but durable memory freshness is degraded until the writer recovers.',
+      errorType: 'writer_unavailable',
+    });
   }
 
   async initializeMemoryWriter(writerContext = {}) {
@@ -2754,7 +3569,12 @@ class AgentClient extends BaseClient {
     }
 
     if (!prelimAgent) {
-      return { ok: false };
+      return {
+        ok: false,
+        attachment: this.createMemoryWriterUnavailableAttachment(
+          'Saved memory could not be updated because no usable memory writer is configured.',
+        ),
+      };
     }
 
     let agent;
@@ -2808,7 +3628,7 @@ class AgentClient extends BaseClient {
         ok: false,
         attachment: healthEntry
           ? this.createMemoryWriterStatusAttachment({ message: healthEntry.message })
-          : undefined,
+          : this.createMemoryWriterUnavailableAttachment(),
       };
     }
 
@@ -2821,7 +3641,12 @@ class AgentClient extends BaseClient {
           model: memoryConfig?.agent?.model || null,
         },
       );
-      return { ok: false };
+      return {
+        ok: false,
+        attachment: this.createMemoryWriterUnavailableAttachment(
+          'Saved memory could not be updated because the configured memory writer is unavailable.',
+        ),
+      };
     }
 
     const llmConfig = Object.assign(
@@ -2924,7 +3749,7 @@ class AgentClient extends BaseClient {
         ok: false,
         attachment: healthEntry
           ? this.createMemoryWriterStatusAttachment({ message: healthEntry.message })
-          : undefined,
+          : this.createMemoryWriterUnavailableAttachment(),
       };
     }
 
@@ -3051,6 +3876,18 @@ class AgentClient extends BaseClient {
         );
       }
       if (!writerInit?.ok || this.processMemory == null) {
+        const writerFailure = classifyMemoryWriterResult(
+          writerInit?.attachment ? [writerInit.attachment] : undefined,
+        );
+        void recordMemoryContinuityHealth({
+          userId,
+          path: 'writer',
+          status: 'degraded',
+          reason: writerFailure || 'writer_unavailable',
+          provider: memoryConfig?.agent?.provider,
+          model: memoryConfig?.agent?.model,
+          effort: memoryConfig?.agent?.model_parameters?.reasoning_effort,
+        });
         if (isDeepTimingEnabled(req)) {
           logDeepTiming(req, 'memory_run_done', memStart, 'status=skipped writer_unavailable=true');
         }
@@ -3058,11 +3895,32 @@ class AgentClient extends BaseClient {
       }
 
       const result = await this.processMemory([bufferMessage]);
+      const memoryFailure = classifyMemoryWriterResult(result);
+      void recordMemoryContinuityHealth({
+        userId,
+        path: 'writer',
+        status: memoryFailure ? 'degraded' : 'ok',
+        reason: memoryFailure || 'writer_completed',
+        provider: memoryConfig?.agent?.provider,
+        model: memoryConfig?.agent?.model,
+        effort: memoryConfig?.agent?.model_parameters?.reasoning_effort,
+      });
       if (isDeepTimingEnabled(req)) {
-        logDeepTiming(req, 'memory_run_done', memStart, 'status=ok');
+        logDeepTiming(
+          req,
+          'memory_run_done',
+          memStart,
+          memoryFailure ? `status=error failure=${memoryFailure}` : 'status=ok',
+        );
       }
       return result;
     } catch (error) {
+      void recordMemoryContinuityHealth({
+        userId,
+        path: 'writer',
+        status: 'degraded',
+        reason: 'writer_exception',
+      });
       logger.error('Memory Agent failed to process memory', sanitizeCompletionErrorForLog(error));
       if (isDeepTimingEnabled(req)) {
         logDeepTiming(req, 'memory_run_done', memStart, 'status=error');
@@ -3077,6 +3935,27 @@ class AgentClient extends BaseClient {
   scheduleMemoryWriter(messages) {
     const req = this.options?.req;
     const scheduleStart = startDeepTiming(req);
+    if (shouldSkipAutomaticMemoryWriter(req)) {
+      const interaction = getTrustedInteractionContext(req);
+      logger.info('[VIVENTIUM][InteractionContext] Automatic memory writer skipped', {
+        reason: 'internal_origin',
+        actor_kind: interaction?.actor_kind,
+        origin: interaction?.origin,
+        surface: interaction?.surface,
+      });
+      return;
+    }
+    /* === VIVENTIUM START ===
+     * Feature: Post-call durable-memory hardening
+     * Purpose: Voice reads stay live, but all voice-derived writes wait for the existing call-session
+     * hardener so late diarization revisions cannot create stable owner facts during the call.
+     * === VIVENTIUM END === */
+    if (req?.body?.viventiumDeferVoiceMemory === true || isCancelledVoiceTask(req)) {
+      if (isDeepTimingEnabled(req)) {
+        logDeepTiming(req, 'memory_writer_deferred_post_call', scheduleStart);
+      }
+      return;
+    }
     if (this.memoryWriterPromise) {
       if (isDeepTimingEnabled(req)) {
         logDeepTiming(req, 'memory_writer_already_scheduled', scheduleStart);
@@ -3156,6 +4035,16 @@ class AgentClient extends BaseClient {
   scheduleFeelingsReaction(payload) {
     const req = this.options?.req;
     const snapshot = req?._viventiumFeelingSnapshot;
+    if (shouldSkipEmotionalReaction(req)) {
+      const interaction = getTrustedInteractionContext(req);
+      logFeelingsEvent(logger, req, 'feelings.reaction.schedule_skip', {
+        reason: 'internal_origin',
+        actor_kind: interaction?.actor_kind,
+        origin: interaction?.origin,
+        surface: interaction?.surface,
+      });
+      return null;
+    }
     const userText = externalUserStimulusForReaction(req, payload);
     if (!snapshot?.enabled || !userText) {
       logFeelingsEvent(logger, req, 'feelings.reaction.schedule_skip', {
@@ -3204,6 +4093,9 @@ class AgentClient extends BaseClient {
     this._phaseBPromise = null;
     this._phaseBPipelineResponseMessageId = null;
     const mainResponseReady = createDeferredPromise();
+    let fallbackRecoveryModel = String(
+      this.options.req?._viventiumFallbackRouteNotice?.model || '',
+    ).trim();
     this._phaseBMainResponseReadyPromise = mainResponseReady.promise;
     try {
       let primaryError = null;
@@ -3216,6 +4108,14 @@ class AgentClient extends BaseClient {
         });
       } catch (error) {
         primaryError = error;
+        const sanitizedPrimaryError = sanitizeCompletionErrorForLog(error);
+        logger.warn('[AgentClient] Primary completion threw before fallback evaluation', {
+          class: sanitizedPrimaryError.class,
+          status: sanitizedPrimaryError.status,
+          code: sanitizedPrimaryError.code,
+          chainDepth: sanitizedPrimaryError.chainDepth,
+          messageHash: sanitizedPrimaryError.messageHash,
+        });
       }
 
       /* === VIVENTIUM START ===
@@ -3228,18 +4128,26 @@ class AgentClient extends BaseClient {
       const fallbackInitializer = this.options.agent?.viventiumFallbackLlmInitializer;
       let fallbackAttempted = false;
       const fallbackAborted = opts.abortController?.signal?.aborted === true;
+      const harnessInvocationLocked = isHarnessInvocationLocked(this.options.req);
       const shouldRetryPrimaryErrorWithFallback =
         !fallbackAborted &&
+        !harnessInvocationLocked &&
         primaryError &&
         !hasVisibleAssistantText(this.contentParts) &&
         shouldRetryWithFallback([createCompletionErrorContentPart(primaryError)]);
       if (
         !fallbackAborted &&
+        !harnessInvocationLocked &&
         (fallbackAgent || typeof fallbackInitializer === 'function') &&
         (shouldRetryWithFallback(this.contentParts) || shouldRetryPrimaryErrorWithFallback)
       ) {
         if (!fallbackAgent && typeof fallbackInitializer === 'function') {
           fallbackAgent = await fallbackInitializer();
+        }
+        if (opts.abortController?.signal?.aborted === true) {
+          const fallbackAbortError = new Error('operation was aborted');
+          fallbackAbortError.name = 'AbortError';
+          throw fallbackAbortError;
         }
         if (!fallbackAgent) {
           /* === VIVENTIUM START ===
@@ -3275,10 +4183,10 @@ class AgentClient extends BaseClient {
         } else {
           fallbackAttempted = true;
           const primaryProvider =
-            this.options.agent?.provider || this.options.agent?.endpoint || 'unknown';
+            this.options.agent?.endpoint || this.options.agent?.provider || 'unknown';
           const primaryModel =
             this.options.agent?.model || this.options.agent?.model_parameters?.model || 'unknown';
-          const fallbackProvider = fallbackAgent.provider || fallbackAgent.endpoint || 'unknown';
+          const fallbackProvider = fallbackAgent.endpoint || fallbackAgent.provider || 'unknown';
           const fallbackModel =
             fallbackAgent.model || fallbackAgent.model_parameters?.model || 'unknown';
           logger.warn(
@@ -3297,6 +4205,110 @@ class AgentClient extends BaseClient {
           this.options.maxContextTokens =
             fallbackAgent.maxContextTokens ?? this.options.maxContextTokens;
           this.model = fallbackModel;
+          const fallbackReq = this.options.req;
+          if (fallbackReq) {
+            fallbackReq._viventiumFallbackLlmAttempt = true;
+            fallbackReq._viventiumHarnessInvocationStarted = false;
+            /* === VIVENTIUM START ===
+             * Feature: Fallback graph-family identity and Stop parity.
+             * Purpose: Replace workspace-bound identity on workspace fallbacks, while preserving
+             * exact Stop authority for any primary mission across a direct-model fallback.
+             */
+            const priorCancellationAuthority = {
+              activeBaseURL: String(
+                fallbackReq._viventiumHarnessCancellationActiveBaseURL || '',
+              ).trim(),
+              primaryKey: String(fallbackReq._viventiumHarnessIdempotencyKey || '').trim(),
+              allKeys:
+                fallbackReq._viventiumHarnessIdempotencyKeys instanceof Set
+                  ? new Set(fallbackReq._viventiumHarnessIdempotencyKeys)
+                  : Array.isArray(fallbackReq._viventiumHarnessIdempotencyKeys)
+                    ? new Set(fallbackReq._viventiumHarnessIdempotencyKeys)
+                    : new Set(),
+            };
+            setConversationProviderCapability(fallbackReq, fallbackProvider);
+            const fallbackParticipants = [
+              fallbackAgent,
+              ...(this.agentConfigs instanceof Map ? Array.from(this.agentConfigs.values()) : []),
+            ];
+            const fallbackProviderCapabilities =
+              fallbackReq.config?.endpoints?.agents?.providerCapabilities || {};
+            const fallbackWorkspaceBindings = resolveWorkspaceParticipantBindings(
+              fallbackParticipants,
+              fallbackProviderCapabilities,
+            );
+            const fallbackWorkspaceBoundAgentIds = fallbackWorkspaceBindings.map(
+              ({ agentId }) => agentId,
+            );
+            const fallbackHarnessIdentity = buildHarnessAgentIdempotencyKeys(
+              fallbackReq,
+              this.responseMessageId,
+              {
+                primaryAgentId: fallbackAgent?.id,
+                agentIds: fallbackWorkspaceBoundAgentIds,
+                preserveGraphTurnFamily: fallbackParticipants.length > 1,
+              },
+            );
+            if (fallbackHarnessIdentity.primaryKey) {
+              fallbackReq._viventiumHarnessIdempotencyKey = fallbackHarnessIdentity.primaryKey;
+            } else if (fallbackWorkspaceBindings.length > 0) {
+              delete fallbackReq._viventiumHarnessIdempotencyKey;
+            }
+            if (fallbackHarnessIdentity.allKeys.length > 0) {
+              fallbackReq._viventiumHarnessIdempotencyKeys = new Set(
+                fallbackHarnessIdentity.allKeys,
+              );
+            } else if (fallbackWorkspaceBindings.length > 0) {
+              delete fallbackReq._viventiumHarnessIdempotencyKeys;
+            }
+            for (const binding of fallbackWorkspaceBindings) {
+              for (const endpointConfig of binding.cancellationEndpointConfigs) {
+                bindHarnessCancellation({
+                  req: fallbackReq,
+                  signal: opts.abortController?.signal,
+                  endpointConfig,
+                  onDeliveryError: (error) => {
+                    logger.warn('[GlassHiveProvider] Fallback cancellation delivery failed', {
+                      error: error?.message || 'provider_unreachable',
+                    });
+                  },
+                });
+              }
+            }
+            /* A direct fallback creates no new GlassHive work, but the primary attempt may already
+             * have committed a mission. Keep its exact Stop listener/key family authoritative
+             * until this user turn ends instead of disarming cancellation during model recovery. */
+            if (
+              fallbackWorkspaceBindings.length === 0 &&
+              priorCancellationAuthority.activeBaseURL &&
+              priorCancellationAuthority.allKeys.size > 0
+            ) {
+              fallbackReq._viventiumHarnessCancellationActiveBaseURL =
+                priorCancellationAuthority.activeBaseURL;
+              fallbackReq._viventiumHarnessIdempotencyKeys = priorCancellationAuthority.allKeys;
+              if (priorCancellationAuthority.primaryKey) {
+                fallbackReq._viventiumHarnessIdempotencyKey = priorCancellationAuthority.primaryKey;
+              }
+            }
+            if (
+              fallbackHarnessIdentity.allKeys.length === 0 &&
+              fallbackReq._viventiumHarnessExecutionEnabled === true
+            ) {
+              const fallbackIdempotencyKey = buildHarnessAttemptIdempotencyKey(
+                fallbackReq,
+                this.responseMessageId,
+              );
+              if (fallbackIdempotencyKey) {
+                fallbackReq._viventiumHarnessIdempotencyKey = fallbackIdempotencyKey;
+              }
+            }
+            /* === VIVENTIUM END === */
+            if (opts.abortController?.signal?.aborted === true) {
+              const fallbackAbortError = new Error('operation was aborted');
+              fallbackAbortError.name = 'AbortError';
+              throw fallbackAbortError;
+            }
+          }
           const reqBody = this.options.req?.body;
           const primaryPhaseBOwnsThisResponse =
             this._phaseBPromise && this._phaseBPipelineResponseMessageId === this.responseMessageId;
@@ -3313,6 +4325,9 @@ class AgentClient extends BaseClient {
               userMCPAuthMap: fallbackAgent.userMCPAuthMap ?? opts.userMCPAuthMap,
               abortController: opts.abortController,
             });
+            if (hasVisibleAssistantText(this.contentParts)) {
+              fallbackRecoveryModel = fallbackModel;
+            }
           } finally {
             if (reqBody && primaryPhaseBOwnsThisResponse) {
               if (hadSuppressBackgroundCortices) {
@@ -3335,6 +4350,13 @@ class AgentClient extends BaseClient {
       }
     }
 
+    if (fallbackRecoveryModel && hasVisibleAssistantText(this.contentParts)) {
+      insertFallbackRecoveryNotice(this.contentParts, fallbackRecoveryModel);
+    }
+    const graphFallbackRecoveryReceipt = this.run?.Graph?.viventiumGraphFallbackRecoveryReceipt;
+    if (graphFallbackRecoveryReceipt && hasVisibleAssistantText(this.contentParts)) {
+      insertFallbackRecoveryNotice(this.contentParts, graphFallbackRecoveryReceipt);
+    }
     const completion = normalizeTextContentParts(filterMalformedContentParts(this.contentParts));
     if (hasVisibleAssistantText(completion)) {
       this.scheduleFeelingsReaction(payload);
@@ -3473,6 +4495,10 @@ class AgentClient extends BaseClient {
         ? shouldDeferMainResponse
         : () => shouldDeferMainResponse === true;
     const capturedTurnUserInputTime = turnUserInputTime;
+    const trustedInteractionContext = getTrustedInteractionContext(req);
+    const isCallbackOrigin =
+      trustedInteractionContext?.actor_kind === 'worker' &&
+      trustedInteractionContext?.origin === 'callback';
     const mainResponseReadyPromise =
       this._phaseBMainResponseReadyPromise &&
       typeof this._phaseBMainResponseReadyPromise.then === 'function'
@@ -3629,6 +4655,7 @@ class AgentClient extends BaseClient {
 
         // Suppress follow-up if user sent a newer message before completion.
         if (
+          !isCallbackOrigin &&
           responseController &&
           responseController.lastUserInputTime !== capturedTurnUserInputTime
         ) {
@@ -3760,6 +4787,25 @@ class AgentClient extends BaseClient {
             return null;
           }
           /* === VIVENTIUM END === */
+          /* === VIVENTIUM START ===
+           * Feature: voice task cancellation follow-up barrier
+           * Purpose: A late cortex/remote result may be audited, but cannot create or announce a
+           * follow-up after the authoritative task has entered cancellation.
+           * === VIVENTIUM END === */
+          if (await isCancelledVoiceTaskDurably(req)) {
+            logger.info('[AgentClient] Suppressing cortex follow-up for cancelled voice task', {
+              taskId: req?.body?.viventiumVoiceTaskId,
+              parentMessageId: responseMessageId,
+            });
+            await recordTerminalPhaseBDecision({
+              result: 'suppressed',
+              suppressionReason: 'voice_task_cancelled',
+              selectedStrategy: 'cancel_suppression_barrier',
+              llmResult: 'not_requested',
+            });
+            await finalizeCanonicalParent();
+            return null;
+          }
           const followUpMessage = await createCortexFollowUpMessage({
             req,
             conversationId,
@@ -3844,6 +4890,12 @@ class AgentClient extends BaseClient {
     /** @type {ReturnType<createRun>} */
     let run;
     const req = this.options.req;
+    startActiveWorkTurnContext(req);
+    initializeTextTurnTiming(req, {
+      turnId: this.responseMessageId,
+      mainAgentId: this.options.agent?.id,
+      turnStartedAtMs: Date.now(),
+    });
     const chatStart = startDeepTiming(req);
     const voiceLatencyEnabled = isVoiceLatencyEnabled(req);
     const voiceChatStartAt = voiceLatencyNow();
@@ -3886,6 +4938,70 @@ class AgentClient extends BaseClient {
 
       /** @type {AppConfig['endpoints']['agents']} */
       const agentsEConfig = appConfig.endpoints?.[EModelEndpoint.agents];
+      const delegatedHostToolPolicy = configuredBrokerHostTools(
+        agentsEConfig?.providerCapabilities,
+      );
+      const delegatedHostToolCapability = {
+        host_tools_transport: 'broker_mcp',
+        host_tools: delegatedHostToolPolicy,
+      };
+      const delegatedHostToolState = await resolveHostToolCapabilityState({
+        targetAgent: this.options.agent,
+        capability: delegatedHostToolCapability,
+        req,
+      });
+      applyHostEvidenceBoundaryInstructions(
+        this.options.agent,
+        delegatedHostToolState.unavailableHostTools,
+      );
+
+      const participatingAgents = [
+        this.options.agent,
+        ...(this.agentConfigs instanceof Map ? Array.from(this.agentConfigs.values()) : []),
+      ];
+      const providerCapabilities = req?.config?.endpoints?.agents?.providerCapabilities || {};
+      const workspaceParticipantBindings = resolveWorkspaceParticipantBindings(
+        participatingAgents,
+        providerCapabilities,
+      );
+      const workspaceBoundAgentIds = workspaceParticipantBindings.map(({ agentId }) => agentId);
+      const harnessIdentity = buildHarnessAgentIdempotencyKeys(req, this.responseMessageId, {
+        primaryAgentId: this.options.agent?.id,
+        agentIds: workspaceBoundAgentIds,
+        preserveGraphTurnFamily: participatingAgents.length > 1,
+      });
+      const harnessIdempotencyKey = harnessIdentity.primaryKey;
+      if (harnessIdempotencyKey) {
+        req._viventiumHarnessIdempotencyKey = harnessIdempotencyKey;
+      }
+      if (harnessIdentity.allKeys.length > 0) {
+        req._viventiumHarnessIdempotencyKeys = new Set(harnessIdentity.allKeys);
+        for (const binding of workspaceParticipantBindings) {
+          for (const endpointConfig of binding.cancellationEndpointConfigs) {
+            bindHarnessCancellation({
+              req,
+              signal: abortController?.signal,
+              endpointConfig,
+              onDeliveryError: (error) => {
+                logger.warn('[GlassHiveProvider] Graph handoff cancellation delivery failed', {
+                  error: error?.message || 'provider_unreachable',
+                });
+              },
+            });
+          }
+        }
+      }
+
+      const glasshiveCapabilityDependency = {
+        version: 1,
+        source: 'turn_tool_activation',
+        server_names: Object.keys(this.options.agent?.viventiumMCPInstructionSources || {}),
+        host_tools: delegatedHostToolState.authorizedHostTools,
+        connected_auth_present: Boolean(userMCPAuthMap && Object.keys(userMCPAuthMap).length > 0),
+      };
+      // The conversation-provider capability refresher closes over `req` and runs immediately
+      // before the provider attempt. This value is Core-derived and never accepted from tool args.
+      req._viventiumGlassHiveCapabilityDependency = glasshiveCapabilityDependency;
 
       config = {
         runName: 'AgentRun',
@@ -3898,6 +5014,8 @@ class AgentClient extends BaseClient {
             messageId: this.responseMessageId,
             conversationId: this.conversationId,
             parentMessageId: this.parentMessageId,
+            harnessIdempotencyKey,
+            harnessAgentIdempotencyKeys: harnessIdentity.byAgentId,
             req,
             attachments: this.options.attachments,
             toolResources: this.options.agent?.tool_resources,
@@ -3906,12 +5024,21 @@ class AgentClient extends BaseClient {
           // VIVENTIUM: pass the run's gated memory so a GlassHive worker launched via the broker
           // can be given the same user context the main agent has (see GlassHiveCapabilityBootstrapService).
           glasshive_worker_memory: this.glasshiveWorkerMemory,
-          glasshive_worker_feelings:
-            this.feelingSnapshot?.agentScope === 'all_agents' ? this.feelingsCapsule : '',
-          glasshive_worker_feelings_hash:
-            this.feelingSnapshot?.agentScope === 'all_agents'
-              ? this.feelingSnapshot?.snapshotHash || ''
-              : '',
+          glasshive_host_tools: delegatedHostToolState.authorizedHostTools,
+          glasshive_host_tool_resources: delegatedHostToolState.hostToolResources,
+          // VIVENTIUM: server-owned structured Agent capability. Automatic/explicit Main
+          // delegation is isolated; agents without this declaration retain the legacy operator
+          // path and never acquire orchestration authority from tool arguments.
+          glasshive_launch_authority_kind:
+            this.options.agent?.glasshive_options?.orchestration?.parallel_available === true
+              ? 'conversation_orchestrator'
+              : 'mission_worker',
+          /* === VIVENTIUM START ===
+           * Feature: Trusted broker dependency signal.
+           * Purpose: Capability failure semantics come from the actual server-activated turn/tool
+           * envelope, never a model-authored `content_read_intent` argument or prompt heuristic.
+           * === VIVENTIUM END === */
+          glasshive_capability_dependency: glasshiveCapabilityDependency,
         },
         recursionLimit: agentsEConfig?.recursionLimit ?? 25,
         signal: abortController.signal,
@@ -3932,9 +5059,11 @@ class AgentClient extends BaseClient {
       /* === VIVENTIUM NOTE === */
       const inputMode = (this.options.req?.body?.viventiumInputMode || '').toString().toLowerCase();
       const surface = resolveViventiumSurface(this.options.req);
+      const trustedInteractionContext = getTrustedInteractionContext(this.options.req);
       const wingModeActive = isWingModeEnabledForRequest(this.options.req, inputMode);
       const isTelegramSurface = surface === 'telegram';
       const isPlaygroundSurface = surface === 'playground';
+      const isWorkbenchSurface = surface === 'workbench';
       const telegramAudioRequestRaw =
         this.options.req?.body?.telegramAudioRequested ??
         this.options.req?.body?.viventiumAudioRequested ??
@@ -4049,6 +5178,23 @@ class AgentClient extends BaseClient {
             .join('\n\n');
         }
       }
+      if (isWorkbenchSurface && !voiceMode) {
+        const scheduledCanonicalOutput = trustedInteractionContext?.origin === 'scheduler';
+        const workbenchInstructions = scheduledCanonicalOutput
+          ? buildScheduledCanonicalOutputInstructions()
+          : buildWebTextInstructions();
+        if (workbenchInstructions) {
+          surfacePromptLayers[
+            scheduledCanonicalOutput ? 'scheduled_canonical_output' : 'workbench_text'
+          ] = workbenchInstructions;
+          this.options.agent.instructions = [
+            this.options.agent.instructions || '',
+            workbenchInstructions,
+          ]
+            .filter(Boolean)
+            .join('\n\n');
+        }
+      }
 
       /* === VIVENTIUM NOTE ===
        * Feature: Time context injection for scheduling awareness
@@ -4056,14 +5202,38 @@ class AgentClient extends BaseClient {
        * Added: 2026-01-31
        */
       const timeContextInstructions = buildTimeContextInstructions(this.options.req);
-      if (timeContextInstructions) {
+      const activeWorkContextInstructions = await resolveActiveWorkTurnContext(this.options.req);
+      const sourceSelectionContextInstructions =
+        this.options.agent?.glasshive_options?.orchestration?.parallel_available === true
+          ? buildSourceSelectionCapsule(this.options.req)
+          : '';
+      const turnContextInstructions = combineTurnContextInstructions(
+        timeContextInstructions,
+        activeWorkContextInstructions,
+        sourceSelectionContextInstructions,
+      );
+      if (turnContextInstructions) {
         surfacePromptLayers.time_context = timeContextInstructions;
-        this.options.agent.instructions = [
-          this.options.agent.instructions || '',
-          timeContextInstructions,
-        ]
-          .filter(Boolean)
-          .join('\n\n');
+        if (activeWorkContextInstructions) {
+          surfacePromptLayers.active_work_context = activeWorkContextInstructions;
+        }
+        if (sourceSelectionContextInstructions) {
+          surfacePromptLayers.rapid_source_selection = sourceSelectionContextInstructions;
+        }
+        const providerCapabilities =
+          this.options.req?.config?.endpoints?.agents?.providerCapabilities || {};
+        const providerCapability =
+          this.options.req?.viventiumTimeContextDelivery === 'per_turn_header'
+            ? { workspace_binding: true, conversation_session: true }
+            : providerCapabilities[this.options.agent?.provider] ||
+              providerCapabilities[this.options.agent?.endpoint];
+        this.options.agent.instructions = applyTimeContextDelivery({
+          req: this.options.req,
+          requestBody: config?.configurable?.requestBody,
+          instructions: this.options.agent.instructions || '',
+          timeContextInstructions: turnContextInstructions,
+          providerCapability,
+        });
       }
       /* === VIVENTIUM NOTE END === */
       surfacePromptLayers.final_runtime_instructions = this.options.agent?.instructions || '';
@@ -4228,6 +5398,8 @@ class AgentClient extends BaseClient {
        * Declared at method scope so the run-site orchestration below the detection block can see them. */
       let speculativeMode = false;
       let speculativeDetectionPromise = null;
+      let onePassNonblockingMode = false;
+      let onePassDetectionPromise = null;
       // emitCortexEvent is assigned inside the hasBackgroundCortices block below but is also needed at
       // the run site (outside that block) by the speculative orchestration; declare it at method scope.
       let emitCortexEvent = null;
@@ -4420,13 +5592,19 @@ class AgentClient extends BaseClient {
           );
         }
 
-        /* === VIVENTIUM START === Async-ON speculative parallel (nevermind+redo) eligibility.
-         * speculativeMode = async ON for this mode after the policy resolver has applied direct-action
-         * safety gates. Voice async remains the desired default, but unowned tool-hold/direct-action
-         * cases must use the blocking path unless explicitly overridden; otherwise a speculative main
-         * run could reach a real tool side effect before the nevermind decision.
+        /* === VIVENTIUM START === Async-ON one-pass parallel eligibility.
+         * Main and activation detection start together, but Main is invoked exactly once. Any
+         * activation not ready before Main invocation belongs to cards and Phase B. The historical
+         * speculative cancel/replay branch remains below as dormant compatibility code.
          * === */
-        speculativeMode = shouldRunLiveSpeculativePhaseA({ policy: voicePhaseAPolicy });
+        onePassNonblockingMode = shouldRunOnePassNonblockingPhaseA({
+          policy: voicePhaseAPolicy,
+        });
+        // The conscious Main now owns one exact authoring invocation on every async route. Keep the
+        // older speculative branch available in source for compatibility review, but never select
+        // cancel/replay while the one-pass contract is active.
+        speculativeMode =
+          !onePassNonblockingMode && shouldRunLiveSpeculativePhaseA({ policy: voicePhaseAPolicy });
         if (speculativeMode) {
           speculativeDetectionPromise = detectActivations({
             req,
@@ -4434,10 +5612,10 @@ class AgentClient extends BaseClient {
             messages: initialMessages,
             runId: this.responseMessageId,
             timeBudgetMs: cortexDetectTimeoutMs,
-            noticeMode:
-              phaseANoticeMode === 'first_activation_continue'
-                ? 'all_within_budget'
-                : phaseANoticeMode,
+            noticeMode: resolveParallelDetectionNoticeMode({
+              onePass: false,
+              noticeMode: phaseANoticeMode,
+            }),
           });
           if (voiceLatencyEnabled) {
             logVoiceLatencyStage(
@@ -4447,6 +5625,31 @@ class AgentClient extends BaseClient {
               `budget_ms=${cortexDetectTimeoutMs} notice_mode=${phaseANoticeMode}`,
             );
           }
+        }
+        if (onePassNonblockingMode) {
+          onePassDetectionPromise = detectActivations({
+            req,
+            mainAgent: this.options.agent,
+            messages: initialMessages,
+            runId: this.responseMessageId,
+            timeBudgetMs: cortexDetectTimeoutMs,
+            // `phaseANoticeMode` is already guarded for unsafe tool-hold scopes above. Preserve an
+            // allowed early-return mode so Main and detection remain genuinely parallel.
+            noticeMode: phaseANoticeMode,
+          }).then(
+            (result) => {
+              return { result, error: null };
+            },
+            (error) => {
+              return { result: null, error };
+            },
+          );
+          logger.info(
+            `[AgentClient] Phase A one-pass nonblocking detection started ` +
+              `(budget=${cortexDetectTimeoutMs}ms, workspace_bound=${
+                req?._viventiumHarnessExecutionEnabled === true
+              })`,
+          );
         }
         /* === VIVENTIUM END === */
 
@@ -4654,6 +5857,7 @@ class AgentClient extends BaseClient {
                 mainAgent: this.options.agent,
                 messages: initialMessages,
                 runId: this.responseMessageId,
+                conversationId: this.conversationId,
                 activatedCortices: phaseBActivatedCorticesList,
 
                 onCortexBrewing: (cortexData) => {
@@ -4803,6 +6007,7 @@ class AgentClient extends BaseClient {
                     mainAgent: this.options.agent,
                     messages: initialMessages,
                     runId: this.responseMessageId,
+                    conversationId: this.conversationId,
                     activatedCortices: recoveredCortices,
                     onCortexBrewing: (cortexData) => {
                       void emitCortexEvent({ ...cortexData, type: ContentTypes.CORTEX_BREWING });
@@ -4888,6 +6093,7 @@ class AgentClient extends BaseClient {
         if (this.agentConfigs && this.agentConfigs.size > 0) {
           agents.push(...this.agentConfigs.values());
         }
+        setTextMainRunContext(req, { agentCount: agents.length });
 
         if (agents[0].recursion_limit && typeof agents[0].recursion_limit === 'number') {
           config.recursionLimit = agents[0].recursion_limit;
@@ -4991,6 +6197,54 @@ class AgentClient extends BaseClient {
           }
         }
         /* === VIVENTIUM NOTE END === */
+        /* === VIVENTIUM START ===
+         * Feature: Final Feeling authority after surface assembly.
+         * Purpose: Surface/no-response contracts are assembled first; the exact pinned capsule is
+         * then moved (not copied) to the final instruction layer for every in-scope speaking agent.
+         * === VIVENTIUM END === */
+        for (const agent of agents) {
+          if (!agent || typeof agent !== 'object') continue;
+          const capsule = feelingTailForAgent({
+            snapshot: this.feelingSnapshot,
+            agentId: agent.id,
+            primaryAgentId: this.options.agent.id,
+          });
+          const dynamicTail = buildViventiumDynamicTail({ capsule });
+          agent.instructions = pinViventiumDynamicTailLast({
+            instructions: agent.instructions || '',
+            capsule,
+          });
+          bindConversationProviderDeveloperInstructionTail({
+            targetAgent: agent,
+            tail: dynamicTail,
+          });
+          const placement = summarizeFeelingCapsulePlacement({
+            instructions: agent.instructions || '',
+            capsule,
+          });
+          logFeelingsEvent(logger, req, 'feelings.inject.final_run', {
+            route:
+              agent.id === this.options.agent.id
+                ? 'main_conscious_agent'
+                : 'in_process_participant',
+            agentIdHash: hashCompletionTextForLog(agent.id || 'unknown'),
+            enabled: this.feelingSnapshot?.enabled === true,
+            scope: this.feelingSnapshot?.agentScope || 'unknown',
+            snapshotHash: this.feelingSnapshot?.snapshotHash || 'none',
+            rangePromptOverrideCount: this.feelingSnapshot?.rangePromptOverrideCount ?? 0,
+            activeRangePromptOverrideCount:
+              this.feelingSnapshot?.activeRangePromptOverrideCount ?? 0,
+            activeRangePromptOverrideChars:
+              this.feelingSnapshot?.activeRangePromptOverrideChars ?? 0,
+            injected: placement.presentInFinalRun,
+            ...placement,
+          });
+        }
+        const finalFeelingCapsule = feelingTailForAgent({
+          snapshot: this.feelingSnapshot,
+          agentId: agents[0]?.id,
+          primaryAgentId: this.options.agent.id,
+        });
         logPromptFrame(
           logger,
           buildPromptFrame({
@@ -5001,6 +6255,8 @@ class AgentClient extends BaseClient {
             authClass: userMCPAuthMap ? 'connected_account_runtime' : 'user_runtime',
             layers: {
               primary_run_instructions: agents[0]?.instructions || '',
+              viventium_user_fact_guard: VIVENTIUM_USER_FACT_GUARD,
+              viventium_feeling_state: finalFeelingCapsule,
               additional_run_instructions: agents
                 .slice(1)
                 .map((agent) => agent?.instructions || '')
@@ -5212,8 +6468,8 @@ class AgentClient extends BaseClient {
       const hideSequentialOutputs = config.configurable.hide_sequential_outputs;
       const shouldDeferMainResponse =
         cortexExecutionPromise != null && toolCortexHoldWanted === true;
-      /* VIVENTIUM: Anthropic overflow recovery (hoisted so the speculative + redo runs reuse it).
-       * signalOverride lets the speculative ("nevermind") run use a dedicated abort controller. */
+      /* VIVENTIUM: Anthropic overflow recovery. `signalOverride` is retained for the dormant
+       * speculative compatibility branch; the canonical async lane invokes Main exactly once. */
       const runWithAnthropicRecovery = async (signalOverride = null) => {
         if (!isAnthropicProvider(this.options.agent?.provider)) {
           await runAgents(mainAgentMessages, signalOverride);
@@ -5244,12 +6500,207 @@ class AgentClient extends BaseClient {
         }
       };
 
-      /* VIVENTIUM: Async-ON nevermind+redo orchestration (canonical 2026-05-30, docs 02). Run the main
-       * answer (streams LIVE) under a dedicated abort signal, in parallel with the already-running
-       * Activation Detection. Cortex activates within budget AND nothing streamed yet (budget < TTFT)
-       * => "nevermind": abort + clear (empty) buffers + inject awareness + Phase B + re-run as Phase A.
-       * Else (no activation, or already streamed = TTFT guard) => the speculative answer stands. */
-      if (speculativeMode) {
+      /* VIVENTIUM: The legacy speculative cancel/replay branch remains below only as dormant
+       * compatibility code. Every enabled async route enters the one-pass branch first. */
+      /* === VIVENTIUM START ===
+       * One-pass nonblocking Phase A for every async-enabled Main agent.
+       *
+       * Detection and Main start in parallel, Main is invoked exactly once, and any activation that
+       * arrives after that invocation boundary is handled only by the ordinary Phase B/follow-up
+       * lane. This preserves A/B parallelism without speculative cancel/replay or side-effect replay.
+       * === */
+      if (onePassNonblockingMode) {
+        let mainInvocationStarted = false;
+
+        const emitOnePassActivationCards = async (cortices) => {
+          for (const cortex of Array.isArray(cortices) ? cortices : []) {
+            await emitCortexEvent({
+              type: ContentTypes.CORTEX_ACTIVATION,
+              cortex_id: cortex.agentId,
+              cortex_name: sanitizeCortexDisplayName(cortex.cortexName || cortex.agentId),
+              status: 'activating',
+              confidence: cortex.confidence,
+              reason: cortex.reason,
+              cortex_description: cortex.cortexDescription || '',
+              activation_scope: cortex.activationScope || null,
+              direct_action_surfaces: Array.isArray(cortex.directActionSurfaces)
+                ? cortex.directActionSurfaces
+                : [],
+              direct_action_surface_scopes: Array.isArray(cortex.directActionSurfaceScopes)
+                ? cortex.directActionSurfaceScopes
+                : [],
+            });
+          }
+        };
+
+        const executeOnePassCortices = async (cortices, phaseLabel) => {
+          if (!Array.isArray(cortices) || cortices.length === 0) {
+            return null;
+          }
+          const directActionScopeKeys = collectDirectActionScopeKeysFromCortices(cortices);
+          const effectiveDirectActionScopeKeys = collectEffectiveDirectActionScopeKeys({
+            directActionSurfaces: directActionPolicySurfaces,
+            agentTools: this.options.agent?.tools,
+            toolDefinitions: this.options.agent?.toolDefinitions,
+          });
+          const wouldHold = shouldDeferToolCortexMainResponse({
+            activatedCortices: cortices,
+            directActionScopeKeys: effectiveDirectActionScopeKeys,
+          });
+          logger.info(
+            `[AgentClient] ${phaseLabel} one-pass Phase B: starting ${cortices.length} cortex(es) ` +
+              `without Main replay (would_hold=${wouldHold} ` +
+              `canonical_direct_action_scope_keys=${directActionScopeKeys.join(',') || 'none'} ` +
+              `effective_direct_action_scope_keys=${
+                effectiveDirectActionScopeKeys.join(',') || 'none'
+              })`,
+          );
+
+          let mergedInsightsData = null;
+          await executeActivated({
+            req: this.options.req,
+            // The Main stream may finish before Phase B. Keep background work detached from the
+            // response lifecycle and deliver through the existing persisted/resumable event path.
+            res: null,
+            mainAgent: this.options.agent,
+            messages: initialMessages,
+            runId: this.responseMessageId,
+            conversationId: this.conversationId,
+            activatedCortices: cortices,
+            onCortexBrewing: (cortexData) => {
+              void emitCortexEvent({ ...cortexData, type: ContentTypes.CORTEX_BREWING });
+            },
+            onCortexComplete: (cortexData) => {
+              void emitCortexEvent({ ...cortexData, type: ContentTypes.CORTEX_INSIGHT });
+            },
+            onAllComplete: (completeData) => {
+              mergedInsightsData = completeData;
+            },
+          });
+          return mergedInsightsData;
+        };
+
+        const handleOnePassDetection = async ({ result: detectionResult, error }) => {
+          if (error) {
+            logger.error(
+              '[AgentClient] Phase A one-pass nonblocking detection failed',
+              sanitizeCompletionErrorForLog(error),
+            );
+            return null;
+          }
+
+          const phaseBActivations = Array.isArray(detectionResult?.activatedCortices)
+            ? detectionResult.activatedCortices
+            : [];
+          activatedCorticesList = phaseBActivations;
+
+          // Only mutate Main instructions before its single invocation begins. Results that land
+          // later remain subconscious and surface through Phase B instead of racing the live run.
+          if (!mainInvocationStarted && phaseBActivations.length > 0) {
+            const activationContext =
+              detectionResult?.earlyReturned === true
+                ? formatEarlyActivationNotice()
+                : formatBrewingAcknowledgment(phaseBActivations) +
+                  formatActivationSummary(phaseBActivations);
+            this.options.agent.instructions = [
+              this.options.agent.instructions || '',
+              activationContext,
+            ]
+              .filter(Boolean)
+              .join('\n\n');
+            logger.info(
+              `[AgentClient] Phase A one-pass awareness reached Main before invocation ` +
+                `(activated=${phaseBActivations.length})`,
+            );
+          }
+
+          await emitOnePassActivationCards(phaseBActivations);
+
+          const phaseBPlan = await resolveOnePassPhaseBPlan({
+            detectionResult,
+            detectTimeoutMs: cortexDetectTimeoutMs,
+            awaitFinalDetection: (finalDetectionPromise) =>
+              finalDetectionPromise.catch((finalDetectionError) => {
+                logger.error(
+                  '[AgentClient] Final one-pass Phase A detection failed',
+                  sanitizeCompletionErrorForLog(finalDetectionError),
+                );
+                return null;
+              }),
+          });
+          await emitOnePassActivationCards(phaseBPlan.finalRecoveredActivations);
+          const initialPhaseBActivations = [...phaseBPlan.initialActivations];
+          activatedCorticesList = initialPhaseBActivations;
+          const lateDetectTimeoutMs = phaseBPlan.lateDetectTimeoutMs;
+          const runLateRecovery =
+            lateDetectTimeoutMs > 0
+              ? async () => {
+                  const lateDetectionResult = await detectActivations({
+                    req: this.options.req,
+                    mainAgent: this.options.agent,
+                    messages: initialMessages,
+                    runId: this.responseMessageId,
+                    timeBudgetMs: lateDetectTimeoutMs,
+                  }).catch((lateDetectionError) => {
+                    logger.error(
+                      '[AgentClient] Late one-pass Phase A recovery failed',
+                      sanitizeCompletionErrorForLog(lateDetectionError),
+                    );
+                    return null;
+                  });
+                  const lateMerge = phaseBPlan.mergeLateActivations(
+                    lateDetectionResult?.activatedCortices,
+                  );
+                  await emitOnePassActivationCards(lateMerge.recovered);
+                  activatedCorticesList = lateMerge.all;
+                  return executeOnePassCortices(lateMerge.recovered, 'late-recovery');
+                }
+              : null;
+
+          await startParallelPhaseBRecovery({
+            runInitial: () => executeOnePassCortices(initialPhaseBActivations, 'initial'),
+            runLate: runLateRecovery,
+          });
+
+          return buildMergedInsightsDataFromCortexParts(pendingCortexParts);
+        };
+
+        const onePass = startOnePassNonblockingMain({
+          runMain: () => {
+            mainInvocationStarted = true;
+            return runWithAnthropicRecovery();
+          },
+          detectionPromise: onePassDetectionPromise,
+          onDetection: handleOnePassDetection,
+        });
+        cortexExecutionPromise = onePass.backgroundPromise.catch((error) => {
+          logger.error(
+            '[AgentClient] One-pass nonblocking Phase A/B pipeline failed',
+            sanitizeCompletionErrorForLog(error),
+          );
+          return null;
+        });
+        this.attachBackgroundCortexCompletionPipeline({
+          cortexExecutionPromise,
+          pendingCortexParts,
+          req: this.options.req,
+          conversationId: this.conversationId,
+          responseMessageId: this.responseMessageId,
+          agent: this.options.agent,
+          getResponseContentParts: () => this.contentParts,
+          responseController,
+          turnUserInputTime,
+          followupGraceMs,
+          shouldDeferMainResponse: false,
+          getActivatedCorticesList: () => activatedCorticesList,
+          waitForIncrementalCortexPersistence: () => cortexPersistenceCoordinator.wait(),
+        });
+        await onePass.mainPromise;
+        if (isDeepTimingEnabled(req)) {
+          logDeepTiming(req, 'chat_completion_done', chatStart);
+        }
+        this.scheduleMemoryWriter(mainAgentMessages);
+      } else if (speculativeMode) {
         const emitSpeculativeActivationCards = async () => {
           for (const cortex of activatedCorticesList) {
             await emitCortexEvent(
@@ -5290,6 +6741,7 @@ class AgentClient extends BaseClient {
             mainAgent: this.options.agent,
             messages: initialMessages,
             runId: this.responseMessageId,
+            conversationId: this.conversationId,
             activatedCortices: activatedCorticesList,
             onCortexBrewing: (cortexData) => {
               void emitCortexEvent({ ...cortexData, type: ContentTypes.CORTEX_BREWING });
@@ -5458,6 +6910,7 @@ class AgentClient extends BaseClient {
         }
         this.scheduleMemoryWriter(mainAgentMessages);
       }
+      /* === VIVENTIUM END === */
       /* === VIVENTIUM NOTE END === */
       if (voiceLatencyEnabled) {
         logVoiceLatencyStage(
@@ -5467,7 +6920,8 @@ class AgentClient extends BaseClient {
           `activated=${activatedCorticesList.length}`,
         );
       }
-      sanitizeAggregatedContentParts(this.contentParts);
+      enforceMainDelegationTurnTruth(this.contentParts, req);
+      finalizeHarnessActivityPartsForPersistence(this.contentParts, req);
       /** @deprecated Agent Chain */
       if (hideSequentialOutputs) {
         this.contentParts = pruneSequentialOutputPartsForPersistence(this.contentParts);
@@ -5513,6 +6967,7 @@ class AgentClient extends BaseClient {
       ) {
         err.viventiumCompletionPhase = 'tool_cortex_deferred_main_response';
       }
+      finalizeHarnessActivityPartsForPersistence(this.contentParts, req);
       handleCompletionErrorContentPart({
         contentParts: this.contentParts,
         err,
@@ -5614,7 +7069,17 @@ class AgentClient extends BaseClient {
           `[api/server/controllers/agents/client.js #titleConvo] Error getting title endpoint config for "${endpointConfig.titleEndpoint}", falling back to default`,
           error,
         );
-        // Fall back to original provider config
+        /* === VIVENTIUM START ===
+         * Feature: Direct-only title generation for workspace-bound harness providers.
+         * Purpose: If the configured lightweight title provider is unavailable, skip a title
+         * instead of launching a second full harness turn against the user's workspace.
+         * === VIVENTIUM END === */
+        const primaryCapability =
+          appConfig.endpoints?.agents?.providerCapabilities?.[agent.endpoint];
+        if (primaryCapability?.workspace_binding === true) {
+          return;
+        }
+        // Fall back to original provider config for ordinary direct providers.
         endpoint = agent.endpoint;
         titleProviderConfig = getProviderConfig({ provider: endpoint, appConfig });
       }
@@ -5851,19 +7316,37 @@ module.exports.getCortexLateDetectTimeoutMs = getCortexLateDetectTimeoutMs;
 module.exports.mergeLateActivationCandidates = mergeLateActivationCandidates;
 module.exports.pruneSequentialOutputPartsForPersistence = pruneSequentialOutputPartsForPersistence;
 /* === VIVENTIUM START ===
- * Export speculative-parallel-detection primitives for focused unit testing. The pure helpers cover
- * commit/abort and policy eligibility; the live AgentClient branch owns the streaming reuse path.
+ * Export one-pass and legacy speculative detection primitives for focused unit testing. The pure
+ * helpers cover activation planning, exactly-once/concurrent orchestration, and legacy decisions.
  * === VIVENTIUM END === */
 module.exports.getCortexSpeculativeParallelEnabled = getCortexSpeculativeParallelEnabled;
 module.exports.speculativeParallelDirectActionBlocked = speculativeParallelDirectActionBlocked;
 module.exports.decideSpeculativeParallelOutcome = decideSpeculativeParallelOutcome;
 module.exports.runSpeculativeParallelMainRun = runSpeculativeParallelMainRun;
 module.exports.shouldRunLiveSpeculativePhaseA = shouldRunLiveSpeculativePhaseA;
+module.exports.shouldRunOnePassNonblockingPhaseA = shouldRunOnePassNonblockingPhaseA;
+module.exports.resolveParallelDetectionNoticeMode = resolveParallelDetectionNoticeMode;
+module.exports.resolveOnePassPhaseBPlan = resolveOnePassPhaseBPlan;
+module.exports.startOnePassNonblockingMain = startOnePassNonblockingMain;
+module.exports.startParallelPhaseBRecovery = startParallelPhaseBRecovery;
 module.exports.shouldSuppressSpeculativeRunError = shouldSuppressSpeculativeRunError;
 module.exports.buildMergedInsightsDataFromCortexParts = buildMergedInsightsDataFromCortexParts;
 module.exports.createCortexPersistenceCoordinator = createCortexPersistenceCoordinator;
 module.exports.feelingTailForAgent = feelingTailForAgent;
 module.exports.externalUserStimulusForReaction = externalUserStimulusForReaction;
 module.exports.evalIsolationForRequest = evalIsolationForRequest;
+module.exports.classifyMemoryWriterResult = classifyMemoryWriterResult;
+module.exports.memoryReadUnavailableContext = memoryReadUnavailableContext;
+module.exports.resolveWorkspaceParticipantBindings = resolveWorkspaceParticipantBindings;
+module.exports.convertHarnessActivityParts = convertHarnessActivityParts;
+module.exports.finalizeHarnessActivityPartsForPersistence =
+  finalizeHarnessActivityPartsForPersistence;
+module.exports.mergeCapturedHarnessActivityParts = mergeCapturedHarnessActivityParts;
+module.exports.isHarnessInvocationLocked = isHarnessInvocationLocked;
+module.exports.isCancelledVoiceTask = isCancelledVoiceTask;
+module.exports.startActiveWorkTurnContext = startActiveWorkTurnContext;
+module.exports.resolveActiveWorkTurnContext = resolveActiveWorkTurnContext;
+module.exports.combineTurnContextInstructions = combineTurnContextInstructions;
+module.exports.enforceMainDelegationTurnTruth = enforceMainDelegationTurnTruth;
 
 /* === VIVENTIUM END === */

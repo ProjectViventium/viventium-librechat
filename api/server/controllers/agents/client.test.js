@@ -1,14 +1,97 @@
-const { Providers } = require('@librechat/agents');
+const { Providers, GraphEvents, createContentAggregator } = require('@librechat/agents');
 const { Constants, ContentTypes, EModelEndpoint, Tools } = require('librechat-data-provider');
+const { logger } = require('@librechat/data-schemas');
+const { APIError } = require('openai');
 const db = require('~/models');
+const mockIsVoiceTaskSuppressed = jest.fn(() => false);
+const mockLoadActiveWorkTurnContext = jest.fn().mockResolvedValue('');
+
+jest.mock('~/server/services/viventium/VoiceTaskService', () => ({
+  isVoiceTaskSuppressed: (...args) => mockIsVoiceTaskSuppressed(...args),
+}));
+
+jest.mock('~/server/services/viventium/ViventiumDynamicTurnContext', () => ({
+  buildActiveWorkCapsule: ({ mode }) =>
+    `# Parallel work (ephemeral account state)\nMode: ${mode}\nRoster: unavailable. Do not infer that nothing is running. Use active_work_list for authoritative state.`,
+  loadActiveWorkTurnContext: (...args) => mockLoadActiveWorkTurnContext(...args),
+}));
+
+jest.mock('~/server/services/viventium/GlassHiveOrchestrationReadinessService', () => ({
+  orchestrationReadinessSnapshot: () => ({
+    available: process.env.VIVENTIUM_PARALLEL_WORK_AVAILABLE === 'true',
+  }),
+}));
+
 const AgentClient = require('./client');
+const {
+  bindHarnessCancellation,
+  buildHarnessAgentIdempotencyKeys,
+  buildHarnessAttemptIdempotencyKey,
+} = require('~/server/services/viventium/GlassHiveConversationProviderService');
 const {
   createCortexPersistenceCoordinator,
   feelingTailForAgent,
   externalUserStimulusForReaction,
   evalIsolationForRequest,
+  classifyMemoryWriterResult,
+  memoryReadUnavailableContext,
+  resolveWorkspaceParticipantBindings,
   mergeLateActivationCandidates,
+  convertHarnessActivityParts,
+  finalizeHarnessActivityPartsForPersistence,
+  mergeCapturedHarnessActivityParts,
+  isHarnessInvocationLocked,
+  shouldRunOnePassNonblockingPhaseA,
+  resolveParallelDetectionNoticeMode,
+  resolveOnePassPhaseBPlan,
+  startOnePassNonblockingMain,
+  startParallelPhaseBRecovery,
+  isCancelledVoiceTask,
+  resolveActiveWorkTurnContext,
+  startActiveWorkTurnContext,
+  combineTurnContextInstructions,
+  enforceMainDelegationTurnTruth,
 } = AgentClient;
+const {
+  recordMainDelegationOutcome,
+} = require('~/server/services/viventium/GlassHiveConversationOrchestration');
+
+test('replaces an unconfirmed delegation narrative with authoritative fail-closed turn truth', () => {
+  const req = {};
+  recordMainDelegationOutcome(req, 'native-call-blocked', {
+    status: 'blocked',
+    reason: 'glasshive_delegation_tool_error',
+    retryable: false,
+  });
+  const harnessPart = {
+    type: ContentTypes.HARNESS_ACTIVITY,
+    harness_activity: { event: 'tool', summary: 'Connected tool failed.' },
+  };
+  const parts = [
+    { type: ContentTypes.TEXT, text: 'The background task is running now.' },
+    harnessPart,
+  ];
+
+  expect(enforceMainDelegationTurnTruth(parts, req)).toBe(true);
+  expect(parts).toContain(harnessPart);
+  expect(parts.filter((part) => part.type === ContentTypes.TEXT)).toEqual([
+    expect.objectContaining({
+      text: 'I could not confirm that the requested background work started. Check Active work before retrying.',
+    }),
+  ]);
+  expect(JSON.stringify(parts)).not.toContain('is running now');
+});
+
+const createProviderDeadlineApiError = (status) => {
+  const payload = {
+    message: 'The foreground response exceeded its configured deadline.',
+    type: 'glasshive_timeout_error',
+    code: 'provider_response_deadline_exceeded',
+  };
+  return status == null
+    ? new APIError(undefined, payload, undefined, new Headers())
+    : APIError.generate(status, { error: payload }, undefined, new Headers());
+};
 
 jest.mock('@librechat/agents', () => ({
   ...jest.requireActual('@librechat/agents'),
@@ -74,6 +157,9 @@ jest.mock('~/server/services/viventium/conversationRecallService', () => ({
 jest.mock('~/server/services/viventium/EmotionalReactionService', () => ({
   scheduleEmotionalReaction: jest.fn().mockResolvedValue({ status: 'healthy' }),
 }));
+jest.mock('~/server/services/viventium/memoryContinuityHealthLedger', () => ({
+  recordMemoryContinuityHealth: jest.fn().mockResolvedValue(undefined),
+}));
 
 // Mock getMCPManager
 const mockFormatInstructions = jest.fn();
@@ -99,6 +185,12 @@ const mockPersistFollowUpDecisionToParentMessage =
   require('~/server/services/viventium/BackgroundCortexFollowUpService').persistFollowUpDecisionToParentMessage;
 const mockScheduleEmotionalReaction =
   require('~/server/services/viventium/EmotionalReactionService').scheduleEmotionalReaction;
+const mockRecordMemoryContinuityHealth =
+  require('~/server/services/viventium/memoryContinuityHealthLedger').recordMemoryContinuityHealth;
+const {
+  createSchedulerInteractionContext,
+  setTrustedInteractionContext,
+} = require('~/server/services/viventium/interactionContext');
 
 function deferred() {
   let resolve;
@@ -109,6 +201,142 @@ function deferred() {
   });
   return { promise, resolve, reject };
 }
+
+describe('Parallel work dynamic turn context scheduling', () => {
+  beforeEach(() => {
+    mockLoadActiveWorkTurnContext.mockReset().mockResolvedValue('');
+    delete process.env.VIVENTIUM_ACTIVE_WORK_COLD_TIMEOUT_MS;
+    process.env.VIVENTIUM_PARALLEL_WORK_AVAILABLE = 'true';
+  });
+
+  afterEach(() => {
+    delete process.env.VIVENTIUM_ACTIVE_WORK_COLD_TIMEOUT_MS;
+    delete process.env.VIVENTIUM_PARALLEL_WORK_AVAILABLE;
+    delete process.env.VIVENTIUM_PARALLEL_WORK_DEFAULT_MODE;
+  });
+
+  test('starts one request-pinned read immediately and preserves the voice surface', async () => {
+    mockLoadActiveWorkTurnContext.mockResolvedValue('parallel capsule');
+    const req = { user: { id: 'owner-1' }, body: { voiceMode: true } };
+
+    const first = startActiveWorkTurnContext(req);
+    const second = startActiveWorkTurnContext(req);
+
+    expect(first).toBe(second);
+    expect(mockLoadActiveWorkTurnContext).toHaveBeenCalledTimes(1);
+    expect(mockLoadActiveWorkTurnContext).toHaveBeenCalledWith({
+      userId: 'owner-1',
+      user: req.user,
+      voice: true,
+    });
+    await expect(resolveActiveWorkTurnContext(req)).resolves.toBe('parallel capsule');
+  });
+
+  test('never holds Main beyond the configured cold budget', async () => {
+    process.env.VIVENTIUM_ACTIVE_WORK_COLD_TIMEOUT_MS = '25';
+    mockLoadActiveWorkTurnContext.mockReturnValue(new Promise(() => {}));
+    const req = {
+      user: {
+        id: 'owner-1',
+        personalization: { orchestration_mode: 'parallel', parallel_work_known: true },
+      },
+      body: {},
+    };
+    startActiveWorkTurnContext(req);
+
+    const startedAt = Date.now();
+    await expect(resolveActiveWorkTurnContext(req)).resolves.toContain('Roster: unavailable');
+    expect(Date.now() - startedAt).toBeLessThan(250);
+  });
+
+  test('focused mode with an authoritative no-work hint keeps the timeout fallback empty', async () => {
+    process.env.VIVENTIUM_ACTIVE_WORK_COLD_TIMEOUT_MS = '25';
+    mockLoadActiveWorkTurnContext.mockReturnValue(new Promise(() => {}));
+    const req = {
+      user: {
+        id: 'owner-1',
+        personalization: { orchestration_mode: 'focused', parallel_work_known: false },
+      },
+      body: {},
+    };
+
+    await expect(resolveActiveWorkTurnContext(req)).resolves.toBe('');
+  });
+
+  test('timeout fallback honors the configured parallel default when no user override exists', async () => {
+    process.env.VIVENTIUM_ACTIVE_WORK_COLD_TIMEOUT_MS = '25';
+    process.env.VIVENTIUM_PARALLEL_WORK_DEFAULT_MODE = 'parallel';
+    mockLoadActiveWorkTurnContext.mockReturnValue(new Promise(() => {}));
+    const req = {
+      user: {
+        id: 'owner-default-parallel',
+        personalization: { parallel_work_known: false },
+      },
+      body: {},
+    };
+
+    const capsule = await resolveActiveWorkTurnContext(req);
+    expect(capsule).toContain('Mode: parallel');
+    expect(capsule).toContain('Roster: unavailable');
+  });
+
+  test('timeout fallback fails a stored parallel preference closed when the feature is unavailable', async () => {
+    process.env.VIVENTIUM_ACTIVE_WORK_COLD_TIMEOUT_MS = '25';
+    process.env.VIVENTIUM_PARALLEL_WORK_AVAILABLE = 'false';
+    mockLoadActiveWorkTurnContext.mockReturnValue(new Promise(() => {}));
+    const req = {
+      user: {
+        id: 'owner-unavailable',
+        personalization: { orchestration_mode: 'parallel', parallel_work_known: true },
+      },
+      body: {},
+    };
+
+    const capsule = await resolveActiveWorkTurnContext(req);
+    expect(capsule).toContain('Mode: focused');
+    expect(capsule).toContain('Roster: unavailable');
+    expect(capsule).not.toContain('Mode: parallel');
+  });
+
+  test('local context failure returns explicit availability-aware unknown truth when work may exist', async () => {
+    process.env.VIVENTIUM_PARALLEL_WORK_AVAILABLE = 'false';
+    mockLoadActiveWorkTurnContext.mockRejectedValueOnce(new Error('synthetic local read failure'));
+    const req = {
+      user: {
+        id: 'owner-read-failed',
+        personalization: { orchestration_mode: 'parallel', parallel_work_known: true },
+      },
+      body: {},
+    };
+
+    const capsule = await resolveActiveWorkTurnContext(req);
+    expect(capsule).toContain('Mode: focused');
+    expect(capsule).toContain('Roster: unavailable');
+    expect(capsule).not.toContain('Mode: parallel');
+  });
+
+  test('local context failure stays empty on the focused authoritative no-work fast path', async () => {
+    mockLoadActiveWorkTurnContext.mockRejectedValueOnce(new Error('synthetic local read failure'));
+    const req = {
+      user: {
+        id: 'owner-no-work',
+        personalization: { orchestration_mode: 'focused', parallel_work_known: false },
+      },
+      body: {},
+    };
+
+    await expect(resolveActiveWorkTurnContext(req)).resolves.toBe('');
+  });
+
+  test('combines time and active work once for direct and session-backed providers', () => {
+    expect(
+      combineTurnContextInstructions('Current time: now.', 'Parallel work: one mission.'),
+    ).toBe('Current time: now.\n\nParallel work: one mission.');
+    expect(combineTurnContextInstructions('', 'Parallel work: one mission.')).toBe(
+      'Parallel work: one mission.',
+    );
+  });
+});
 
 /* === VIVENTIUM START ===
  * Feature: interruption-safe background cortex persistence regression tests.
@@ -281,24 +509,440 @@ describe('Feelings agent scope', () => {
       'must not be appraised',
     );
   });
+
+  it('does not treat a trusted scheduler self-prompt as external emotional stimulus', () => {
+    mockScheduleEmotionalReaction.mockClear();
+    const req = {
+      user: { id: 'user-1' },
+      body: { text: 'internal scheduled self-prompt', messageId: 'scheduled-input-1' },
+      _viventiumFeelingSnapshot: { ...snapshot, version: 8, snapshotHash: 'snapshot-8' },
+    };
+    setTrustedInteractionContext(
+      req,
+      createSchedulerInteractionContext({
+        conversation_id: 'scheduled-conversation-1',
+        source_event_id: 'scheduled-run-1',
+      }),
+    );
+    const client = new AgentClient({
+      agent: { model_parameters: { model: 'gpt-test' } },
+      req,
+      res: {},
+      contentParts: [],
+      collectedUsage: [],
+      artifactPromises: [],
+    });
+
+    expect(externalUserStimulusForReaction(req, { text: 'payload fallback' })).toBe('');
+    expect(client.scheduleFeelingsReaction({ text: 'payload fallback' })).toBeNull();
+    expect(mockScheduleEmotionalReaction).not.toHaveBeenCalled();
+  });
+
+  it('does not start the automatic memory writer for a trusted scheduler origin', () => {
+    const req = {
+      user: { id: 'user-1' },
+      body: { text: 'internal scheduled self-prompt' },
+    };
+    setTrustedInteractionContext(
+      req,
+      createSchedulerInteractionContext({
+        conversation_id: 'scheduled-conversation-2',
+        source_event_id: 'scheduled-run-2',
+      }),
+    );
+    const client = new AgentClient({
+      agent: { model_parameters: { model: 'gpt-test' } },
+      req,
+      res: {},
+      contentParts: [],
+      collectedUsage: [],
+      artifactPromises: [],
+    });
+    client.runMemory = jest.fn().mockResolvedValue(undefined);
+
+    expect(client.scheduleMemoryWriter([])).toBeUndefined();
+    expect(client.runMemory).not.toHaveBeenCalled();
+  });
+
+  it('removes tools and cortices from an unverified shared-mic voice turn without mutating source agent', () => {
+    const sourceAgent = {
+      model_parameters: { model: 'gpt-test' },
+      tools: [{ name: 'send_email' }],
+      background_cortices: [{ agent_id: 'online_tools' }],
+    };
+    const client = new AgentClient({
+      agent: sourceAgent,
+      req: {
+        user: { id: 'user-1' },
+        body: {
+          voiceMode: true,
+          viventiumActorTrust: 'shared_mic_unverified',
+          viventiumCanAuthorizeSideEffects: false,
+        },
+      },
+      res: {},
+      contentParts: [],
+      collectedUsage: [],
+      artifactPromises: [],
+    });
+
+    expect(client.options.agent.tools).toEqual([]);
+    expect(client.options.agent.background_cortices).toEqual([]);
+    expect(sourceAgent.tools).toEqual([{ name: 'send_email' }]);
+    expect(sourceAgent.background_cortices).toEqual([{ agent_id: 'online_tools' }]);
+  });
+});
+
+describe('Detached memory writer result classification', () => {
+  test('treats a structured storage rejection and a missing processor result as failures', () => {
+    expect(classifyMemoryWriterResult(undefined)).toBe('processor_failed');
+    expect(
+      classifyMemoryWriterResult([
+        {
+          [Tools.memory]: {
+            type: 'error',
+            value: JSON.stringify({ errorType: 'key_limit_exceeded' }),
+          },
+        },
+      ]),
+    ).toBe('key_limit_exceeded');
+  });
+
+  test('accepts empty/noop and successful update results', () => {
+    expect(classifyMemoryWriterResult([])).toBeNull();
+    expect(
+      classifyMemoryWriterResult([
+        {
+          [Tools.memory]: {
+            type: 'update',
+            key: 'preferences',
+          },
+        },
+      ]),
+    ).toBeNull();
+  });
+});
+
+describe('Saved-memory availability transparency', () => {
+  test('gives the model a truthful provider-unavailable boundary without pretending memory is empty', () => {
+    expect(memoryReadUnavailableContext()).toContain('unavailable for this turn');
+    expect(memoryReadUnavailableContext()).toContain('not evidence that no saved memory exists');
+  });
+});
+
+describe('GlassHive harness activity persistence', () => {
+  test('converts provider reasoning summaries without exposing them as model thinking', () => {
+    const parts = [
+      { type: ContentTypes.THINK, think: 'Queued.\nStarted.\n' },
+      { type: ContentTypes.TEXT, text: 'The answer.' },
+    ];
+
+    expect(convertHarnessActivityParts(parts)).toBe(parts);
+    expect(parts).toEqual([
+      {
+        type: ContentTypes.HARNESS_ACTIVITY,
+        harness_activity: {
+          event: 'reasoning-summary',
+          summary: 'Queued.\nStarted.\n',
+        },
+      },
+      { type: ContentTypes.TEXT, text: 'The answer.' },
+    ]);
+  });
+
+  test('locks fallback and redispatch only after a harness invocation begins', () => {
+    expect(
+      isHarnessInvocationLocked({
+        _viventiumHarnessActivityEnabled: true,
+        _viventiumHarnessInvocationStarted: false,
+      }),
+    ).toBe(false);
+    expect(
+      isHarnessInvocationLocked({
+        _viventiumHarnessActivityEnabled: true,
+        _viventiumHarnessInvocationStarted: true,
+      }),
+    ).toBe(true);
+    expect(
+      isHarnessInvocationLocked({
+        _viventiumHarnessActivityEnabled: false,
+        _viventiumHarnessInvocationStarted: true,
+      }),
+    ).toBe(false);
+  });
+
+  test('merges captured activity before final text and deduplicates aggregated activity', () => {
+    const captured = {
+      _viventiumCapturedHarnessActivityParts: [
+        {
+          type: ContentTypes.HARNESS_ACTIVITY,
+          harness_activity: {
+            event: 'reasoning-summary',
+            summary: 'Connected tool completed: schedule create.\n',
+          },
+        },
+      ],
+    };
+    const parts = [
+      {
+        type: ContentTypes.HARNESS_ACTIVITY,
+        harness_activity: {
+          event: 'reasoning-summary',
+          summary: 'Connected tool completed: schedule search.\n',
+        },
+      },
+      { type: ContentTypes.TEXT, text: 'Created exactly one reminder.' },
+    ];
+
+    expect(mergeCapturedHarnessActivityParts(parts, captured)).toEqual([
+      {
+        type: ContentTypes.HARNESS_ACTIVITY,
+        harness_activity: {
+          event: 'reasoning-summary',
+          summary: 'Connected tool completed: schedule search.\n',
+        },
+      },
+      {
+        type: ContentTypes.HARNESS_ACTIVITY,
+        harness_activity: {
+          event: 'reasoning-summary',
+          summary: 'Connected tool completed: schedule create.\n',
+        },
+      },
+      { type: ContentTypes.TEXT, text: 'Created exactly one reminder.' },
+    ]);
+    expect(mergeCapturedHarnessActivityParts(parts, captured)).toHaveLength(3);
+  });
+
+  test('replaces real upstream concatenated reasoning aggregation with the captured activity sequence', () => {
+    const first = 'Connected tool completed: schedule search.\n';
+    const second = 'Connected tool completed: schedule create.\n';
+    const { contentParts, aggregateContent } = createContentAggregator();
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: {
+        id: 'reasoning-step',
+        index: 0,
+        stepDetails: { type: 'message_creation' },
+      },
+    });
+    for (const think of [first, second]) {
+      aggregateContent({
+        event: GraphEvents.ON_REASONING_DELTA,
+        data: {
+          id: 'reasoning-step',
+          delta: { content: [{ type: ContentTypes.THINK, think }] },
+        },
+      });
+    }
+    contentParts.push({ type: ContentTypes.TEXT, text: 'Created exactly one reminder.' });
+    convertHarnessActivityParts(contentParts);
+
+    const req = {
+      _viventiumCapturedHarnessActivityParts: [first, second].map((summary) => ({
+        type: ContentTypes.HARNESS_ACTIVITY,
+        harness_activity: { event: 'reasoning-summary', summary },
+      })),
+    };
+
+    expect(mergeCapturedHarnessActivityParts(contentParts, req)).toEqual([
+      req._viventiumCapturedHarnessActivityParts[0],
+      req._viventiumCapturedHarnessActivityParts[1],
+      { type: ContentTypes.TEXT, text: 'Created exactly one reminder.' },
+    ]);
+  });
+
+  test('reconciles a captured prefix when upstream aggregates beyond the safety cap', () => {
+    const summary = 'Connected tool completed: schedule search.\n';
+    const { contentParts, aggregateContent } = createContentAggregator();
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: {
+        id: 'reasoning-step',
+        index: 0,
+        stepDetails: { type: 'message_creation' },
+      },
+    });
+    for (let index = 0; index < 129; index += 1) {
+      aggregateContent({
+        event: GraphEvents.ON_REASONING_DELTA,
+        data: {
+          id: 'reasoning-step',
+          delta: { content: [{ type: ContentTypes.THINK, think: summary }] },
+        },
+      });
+    }
+    contentParts.push({ type: ContentTypes.TEXT, text: 'The answer.' });
+    convertHarnessActivityParts(contentParts);
+
+    const req = {
+      _viventiumCapturedHarnessActivityParts: Array.from({ length: 128 }, () => ({
+        type: ContentTypes.HARNESS_ACTIVITY,
+        harness_activity: { event: 'reasoning-summary', summary },
+      })),
+    };
+
+    mergeCapturedHarnessActivityParts(contentParts, req);
+    expect(contentParts.filter((part) => part.type === ContentTypes.HARNESS_ACTIVITY)).toEqual(
+      Array.from({ length: 129 }, () => ({
+        type: ContentTypes.HARNESS_ACTIVITY,
+        harness_activity: { event: 'reasoning-summary', summary },
+      })),
+    );
+    expect(contentParts.at(-1)).toEqual({ type: ContentTypes.TEXT, text: 'The answer.' });
+
+    const firstPass = JSON.parse(JSON.stringify(contentParts));
+    mergeCapturedHarnessActivityParts(contentParts, req);
+    expect(contentParts).toEqual(firstPass);
+  });
+
+  test('preserves true repeated activity and unrelated activity while reconciling partial aggregation in order', () => {
+    const repeated = {
+      type: ContentTypes.HARNESS_ACTIVITY,
+      harness_activity: {
+        event: 'reasoning-summary',
+        summary: 'Connected tool completed: schedule search.\n',
+      },
+    };
+    const create = {
+      type: ContentTypes.HARNESS_ACTIVITY,
+      harness_activity: {
+        event: 'reasoning-summary',
+        summary: 'Connected tool completed: schedule create.\n',
+      },
+    };
+    const fallback = {
+      type: ContentTypes.HARNESS_ACTIVITY,
+      harness_activity: {
+        event: 'fallback-recovery',
+        summary: 'The fallback route completed.\n',
+      },
+    };
+    const req = {
+      _viventiumCapturedHarnessActivityParts: [repeated, repeated, create],
+    };
+    const parts = [
+      repeated,
+      fallback,
+      create,
+      { type: ContentTypes.TEXT, text: 'Created exactly one reminder.' },
+    ];
+
+    expect(mergeCapturedHarnessActivityParts(parts, req)).toEqual([
+      repeated,
+      fallback,
+      repeated,
+      create,
+      { type: ContentTypes.TEXT, text: 'Created exactly one reminder.' },
+    ]);
+    expect(mergeCapturedHarnessActivityParts(parts, req)).toEqual([
+      repeated,
+      fallback,
+      repeated,
+      create,
+      { type: ContentTypes.TEXT, text: 'Created exactly one reminder.' },
+    ]);
+  });
+
+  test.each([
+    ['late provider error', false],
+    ['controller cancellation', true],
+  ])('finalizes captured completed activity before %s persistence', (_label, aborted) => {
+    const req = {
+      _viventiumCapturedHarnessActivityParts: [
+        {
+          type: ContentTypes.HARNESS_ACTIVITY,
+          harness_activity: {
+            event: 'reasoning-summary',
+            summary: 'Connected tool completed: schedule create.\n',
+          },
+        },
+      ],
+    };
+    const parts = [
+      {
+        type: ContentTypes.THINK,
+        think: 'Connected tool completed: schedule create.\n',
+      },
+      { type: ContentTypes.TEXT, text: 'The tool completed before the stream ended.' },
+    ];
+
+    finalizeHarnessActivityPartsForPersistence(parts, req);
+    AgentClient.handleCompletionErrorContentPart({
+      contentParts: parts,
+      err: new Error(aborted ? 'operation was aborted' : 'late provider failure'),
+      abortController: { signal: { aborted } },
+      log: { warn: jest.fn(), error: jest.fn() },
+    });
+
+    expect(parts.filter((part) => part.type === ContentTypes.HARNESS_ACTIVITY)).toEqual(
+      req._viventiumCapturedHarnessActivityParts,
+    );
+    expect(parts.filter((part) => part.type === ContentTypes.TEXT)).toHaveLength(1);
+    expect(parts.filter((part) => part.type === ContentTypes.ERROR)).toHaveLength(aborted ? 0 : 1);
+  });
+
+  test('preserves the streamed text identity when captured activity is inserted before it', () => {
+    const req = {
+      _viventiumCapturedHarnessActivityParts: [
+        {
+          type: ContentTypes.HARNESS_ACTIVITY,
+          harness_activity: {
+            event: 'reasoning-summary',
+            summary: 'Connected tool completed: schedule create.\n',
+          },
+        },
+      ],
+    };
+    const parts = [
+      { type: ContentTypes.CORTEX_INSIGHT, cortex_insight: { status: 'complete' } },
+      { type: ContentTypes.TEXT, text: 'Created exactly one reminder.', agentId: 'agent-main' },
+    ];
+
+    finalizeHarnessActivityPartsForPersistence(parts, req);
+
+    expect(parts.map((part) => part.type)).toEqual([
+      ContentTypes.CORTEX_INSIGHT,
+      ContentTypes.HARNESS_ACTIVITY,
+      ContentTypes.TEXT,
+    ]);
+    expect(parts[2]).toMatchObject({ viventium_render_part_id: 'content:1' });
+  });
 });
 
 describe('buildViventiumMcpRequestBody', () => {
   test('passes surface context and existing upload references to GlassHive MCP', () => {
+    const req = {
+      body: {
+        text: 'First Telegram segment.\n\nSecond Telegram segment.',
+        viventiumSurface: 'telegram',
+        viventiumInputMode: 'voice_note',
+        streamId: 'stream-1',
+        telegramChatId: 'chat-1',
+        telegramUserId: 'tg-user-1',
+        telegramMessageId: 'tg-msg-1',
+        scheduleId: 'schedule-1',
+        idempotencyKey: 'schedule-1:occurrence-1',
+        deliveryChannels: ['telegram', 'librechat'],
+        viventiumTriggeringSourceSegments: [{ text: 'forged caller context' }],
+      },
+      viventiumSchedulerDispatchDocumentId: 'dispatch-doc-1',
+      viventiumSchedulerExternalWorkRequired: true,
+    };
+    setTrustedInteractionContext(req, {
+      actor_kind: 'external_user',
+      origin: 'interactive',
+      surface: 'telegram',
+      conversation_id: 'conv-1',
+      logical_turn_id: 'turn-1',
+      revision: 2,
+      source_event_id: 'telegram:chat-1:tg-msg-1',
+    });
     const body = AgentClient.buildViventiumMcpRequestBody({
       messageId: 'assistant-1',
       conversationId: 'conv-1',
       parentMessageId: 'user-1',
-      req: {
-        body: {
-          viventiumSurface: 'telegram',
-          viventiumInputMode: 'voice_note',
-          streamId: 'stream-1',
-          telegramChatId: 'chat-1',
-          telegramUserId: 'tg-user-1',
-          telegramMessageId: 'tg-msg-1',
-        },
-      },
+      req,
       attachments: [
         {
           file_id: 'file-1',
@@ -314,6 +958,28 @@ describe('buildViventiumMcpRequestBody', () => {
     expect(body.viventiumSurface).toBe('telegram');
     expect(body.viventiumStreamId).toBe('stream-1');
     expect(body.viventiumTelegramChatId).toBe('chat-1');
+    expect(body).toMatchObject({
+      viventiumScheduleId: 'schedule-1',
+      viventiumSchedulerDispatchDocumentId: 'dispatch-doc-1',
+      viventiumSchedulerOccurrenceKey: 'schedule-1:occurrence-1',
+      viventiumSchedulerDeliveryChannels: ['telegram', 'librechat'],
+      viventiumSchedulerExternalWorkRequired: true,
+    });
+    expect(body.viventiumLogicalTurnId).toBe('turn-1');
+    expect(body.viventiumLogicalTurnRevision).toBe('2');
+    expect(body.viventiumSourceEventId).toBe('telegram:chat-1:tg-msg-1');
+    expect(body.viventiumAuthoringSourceEventId).toBe('telegram:chat-1:tg-msg-1');
+    expect(body.viventiumTriggeringSourceSegments).toEqual([
+      {
+        ordinal: 0,
+        source_event_id: 'telegram:chat-1:tg-msg-1',
+        source_index: 0,
+        text: 'First Telegram segment.\n\nSecond Telegram segment.',
+      },
+    ]);
+    expect(JSON.stringify(body.viventiumTriggeringSourceSegments)).not.toContain(
+      'forged caller context',
+    );
     expect(body.files[0]).toMatchObject({
       file_id: 'file-1',
       filename: 'brief.txt',
@@ -323,6 +989,442 @@ describe('buildViventiumMcpRequestBody', () => {
     expect(body.attachments).toEqual(body.files);
     expect(body.file_ids).toEqual(['file-1']);
     expect(body.tool_resources.code_interpreter.file_ids).toEqual(['file-1']);
+  });
+
+  test('projects every ordered unresolved logical-turn source segment into a mission handoff', () => {
+    const req = {
+      body: {
+        text: 'C: quick follow-up',
+        viventiumSurface: 'telegram',
+        viventiumTriggeringSourceSegments: [{ text: 'forged packet' }],
+      },
+    };
+    setTrustedInteractionContext(req, {
+      actor_kind: 'external_user',
+      origin: 'interactive',
+      surface: 'telegram',
+      conversation_id: 'conv-rapid',
+      logical_turn_id: 'turn-rapid',
+      revision: 3,
+      source_event_id: 'event-c',
+      source_segments: [
+        {
+          ordinal: 0,
+          source_event_id: 'event-a',
+          source_index: 0,
+          text: 'A: large mission',
+          source_files: [
+            { file_id: 'file-a', filename: 'a.png', type: 'image/png', media_group_index: 0 },
+          ],
+        },
+        { ordinal: 1, source_event_id: 'event-b', source_index: 0, text: 'B: another mission' },
+        { ordinal: 2, source_event_id: 'event-c', source_index: 0, text: 'C: quick follow-up' },
+      ],
+    });
+
+    const body = AgentClient.buildViventiumMcpRequestBody({
+      messageId: 'assistant-c',
+      conversationId: 'conv-rapid',
+      parentMessageId: 'user-c',
+      req,
+      attachments: [],
+    });
+
+    expect(body.viventiumTriggeringSourceSegments).toEqual([
+      {
+        ordinal: 0,
+        source_event_id: 'event-a',
+        source_index: 0,
+        text: 'A: large mission',
+        source_files: [
+          { file_id: 'file-a', filename: 'a.png', type: 'image/png', media_group_index: 0 },
+        ],
+      },
+      { ordinal: 1, source_event_id: 'event-b', source_index: 0, text: 'B: another mission' },
+      { ordinal: 2, source_event_id: 'event-c', source_index: 0, text: 'C: quick follow-up' },
+    ]);
+    expect(JSON.stringify(body.viventiumTriggeringSourceSegments)).not.toContain('forged packet');
+    expect(body.files).toEqual([
+      expect.objectContaining({
+        file_id: 'file-a',
+        source_event_id: 'event-a',
+        source_index: 0,
+        media_group_index: 0,
+      }),
+    ]);
+    expect(JSON.stringify(body.files)).not.toContain('filepath');
+  });
+
+  test('projects the newest bounded source packet with an explicit overflow count', () => {
+    const req = { body: { text: 'latest', viventiumSurface: 'web' } };
+    setTrustedInteractionContext(req, {
+      actor_kind: 'external_user',
+      origin: 'interactive',
+      surface: 'web',
+      conversation_id: 'conv-overflow',
+      logical_turn_id: 'turn-overflow',
+      revision: 3,
+      source_event_id: 'event-c',
+      source_segments: [
+        { source_event_id: 'event-a', source_index: 0, text: 'A'.repeat(30 * 1024) },
+        { source_event_id: 'event-b', source_index: 0, text: 'B'.repeat(30 * 1024) },
+        { source_event_id: 'event-c', source_index: 0, text: 'C'.repeat(30 * 1024) },
+      ],
+    });
+
+    const body = AgentClient.buildViventiumMcpRequestBody({
+      messageId: 'assistant-overflow',
+      conversationId: 'conv-overflow',
+      parentMessageId: 'user-overflow',
+      req,
+      attachments: [],
+    });
+
+    expect(
+      body.viventiumTriggeringSourceSegments.map((segment) => segment.source_event_id),
+    ).toEqual(['event-b', 'event-c']);
+    expect(body.viventiumTriggeringSourceSegmentsOverflowCount).toBe(1);
+  });
+
+  test('projects server-owned Telegram mission uploads once in original media-group order', () => {
+    const req = {
+      body: { text: 'compare these', viventiumSurface: 'telegram' },
+      _viventiumMissionAttachments: [
+        {
+          file_id: 'photo-1',
+          filename: 'first.png',
+          filepath: '/uploads/user-1/photo-1__first.png',
+          type: 'image/png',
+          source: 'local',
+          viventium_media_group_index: 0,
+        },
+        {
+          file_id: 'photo-2',
+          filename: 'second.png',
+          filepath: '/uploads/user-1/photo-2__second.png',
+          type: 'image/png',
+          source: 'local',
+          viventium_media_group_index: 1,
+        },
+      ],
+    };
+    setTrustedInteractionContext(req, {
+      actor_kind: 'external_user',
+      origin: 'interactive',
+      surface: 'telegram',
+      conversation_id: 'conv-media',
+      source_event_id: 'telegram:album:1',
+    });
+
+    const body = AgentClient.buildViventiumMcpRequestBody({
+      messageId: 'assistant-media',
+      conversationId: 'conv-media',
+      parentMessageId: 'user-media',
+      req,
+      attachments: [req._viventiumMissionAttachments[0]],
+    });
+
+    expect(body.files).toEqual([
+      expect.objectContaining({ file_id: 'photo-1', media_group_index: 0 }),
+      expect.objectContaining({ file_id: 'photo-2', media_group_index: 1 }),
+    ]);
+    expect(body.files.filter((file) => file.file_id === 'photo-1')).toHaveLength(1);
+    expect(body.attachments).toEqual(body.files);
+  });
+
+  test('passes the per-agent idempotency map without changing the primary key', () => {
+    const body = AgentClient.buildViventiumMcpRequestBody({
+      messageId: 'assistant-1',
+      conversationId: 'conv-1',
+      parentMessageId: 'user-1',
+      harnessIdempotencyKey: 'main:assistant-1',
+      harnessAgentIdempotencyKeys: {
+        'main-agent': 'main:assistant-1',
+        'reality-agent': 'main:reality-agent:assistant-1',
+      },
+      req: { body: {} },
+    });
+
+    expect(body.viventiumGlassHiveIdempotencyKey).toBe('main:assistant-1');
+    expect(body.viventiumGlassHiveAgentIdempotencyKeys).toEqual({
+      'main-agent': 'main:assistant-1',
+      'reality-agent': 'main:reality-agent:assistant-1',
+    });
+  });
+});
+
+describe('graph participant workspace bindings', () => {
+  test('includes a direct-primary participant when its hidden runtime fallback is workspace-bound', () => {
+    const fallbackEndpointConfig = {
+      baseURL: 'http://workspace-fallback.local/v1',
+      apiKey: 'synthetic-key',
+    };
+    const directParticipant = {
+      id: 'red-agent',
+      endpoint: 'direct-endpoint',
+    };
+    Object.defineProperty(directParticipant, 'viventiumGraphLlmFallbacks', {
+      value: [
+        {
+          id: 'red-agent',
+          endpoint: 'workspace-endpoint',
+          viventiumHarnessCancellationEndpointConfig: fallbackEndpointConfig,
+        },
+      ],
+      enumerable: false,
+    });
+
+    expect(
+      resolveWorkspaceParticipantBindings([directParticipant], {
+        'direct-endpoint': { workspace_binding: false },
+        'workspace-endpoint': { workspace_binding: true },
+      }),
+    ).toEqual([
+      {
+        agentId: 'red-agent',
+        cancellationEndpointConfigs: [fallbackEndpointConfig],
+      },
+    ]);
+  });
+
+  test('preserves primary workspace bindings and dedupes shared cancellation configs', () => {
+    const sharedEndpointConfig = {
+      baseURL: 'http://workspace-primary.local/v1',
+      apiKey: 'synthetic-key',
+    };
+    const secondEndpointConfig = {
+      baseURL: 'http://workspace-secondary.local/v1',
+      apiKey: 'synthetic-key',
+    };
+    const participant = {
+      id: 'main-agent',
+      endpoint: 'workspace-primary',
+      viventiumHarnessCancellationEndpointConfig: sharedEndpointConfig,
+      viventiumGraphLlmFallbacks: [
+        {
+          id: 'main-agent',
+          endpoint: 'workspace-primary',
+          viventiumHarnessCancellationEndpointConfig: sharedEndpointConfig,
+        },
+        {
+          id: 'main-agent',
+          endpoint: 'workspace-secondary',
+          viventiumHarnessCancellationEndpointConfig: secondEndpointConfig,
+        },
+      ],
+    };
+
+    expect(
+      resolveWorkspaceParticipantBindings([participant], {
+        'workspace-primary': { workspace_binding: true },
+        'workspace-secondary': { workspace_binding: true },
+      }),
+    ).toEqual([
+      {
+        agentId: 'main-agent',
+        cancellationEndpointConfigs: [sharedEndpointConfig, secondEndpointConfig],
+      },
+    ]);
+  });
+
+  test('creates the participant-scoped key and delivers Stop to a fallback-only workspace route', async () => {
+    const fallbackEndpointConfig = {
+      baseURL: 'http://workspace-fallback.local/v1',
+      apiKey: 'synthetic-key',
+    };
+    const participant = {
+      id: 'red-agent',
+      endpoint: 'direct-endpoint',
+      viventiumGraphLlmFallbacks: [
+        {
+          id: 'red-agent',
+          endpoint: 'workspace-endpoint',
+          viventiumHarnessCancellationEndpointConfig: fallbackEndpointConfig,
+        },
+      ],
+    };
+    const bindings = resolveWorkspaceParticipantBindings([participant], {
+      'workspace-endpoint': { workspace_binding: true },
+    });
+    const request = {
+      user: { id: 'synthetic-user' },
+      body: { responseMessageId: 'response-1' },
+    };
+    const identity = buildHarnessAgentIdempotencyKeys(request, 'response-1', {
+      primaryAgentId: 'main-agent',
+      agentIds: bindings.map(({ agentId }) => agentId),
+      preserveGraphTurnFamily: true,
+    });
+    request._viventiumHarnessIdempotencyKey = identity.primaryKey;
+    request._viventiumHarnessIdempotencyKeys = new Set(identity.allKeys);
+    const cancellationFetch = jest.fn().mockResolvedValue({ ok: true });
+    const abortController = new AbortController();
+    for (const binding of bindings) {
+      for (const endpointConfig of binding.cancellationEndpointConfigs) {
+        bindHarnessCancellation({
+          req: request,
+          signal: abortController.signal,
+          endpointConfig,
+          fetchImpl: cancellationFetch,
+        });
+      }
+    }
+
+    abortController.abort('user_cancelled');
+    await Promise.resolve();
+
+    expect(identity.byAgentId['red-agent']).toBe('main:red-agent:response-1');
+    expect(cancellationFetch).toHaveBeenCalledWith(
+      'http://workspace-fallback.local/v1/requests/by-idempotency/main%3Ared-agent%3Aresponse-1/cancel',
+      expect.any(Object),
+    );
+  });
+});
+
+describe('one-pass nonblocking Phase A', () => {
+  test('preserves early voice notice mode only for exactly-once orchestration', () => {
+    expect(
+      resolveParallelDetectionNoticeMode({
+        onePass: true,
+        noticeMode: 'first_activation_continue',
+      }),
+    ).toBe('first_activation_continue');
+    expect(
+      resolveParallelDetectionNoticeMode({
+        onePass: false,
+        noticeMode: 'first_activation_continue',
+      }),
+    ).toBe('all_within_budget');
+  });
+
+  test('is selected when async detection is enabled but speculative reruns are unsafe', () => {
+    expect(
+      shouldRunOnePassNonblockingPhaseA({ policy: { enabled: true }, speculativeMode: false }),
+    ).toBe(true);
+    expect(
+      shouldRunOnePassNonblockingPhaseA({ policy: { enabled: true }, speculativeMode: true }),
+    ).toBe(true);
+    expect(
+      shouldRunOnePassNonblockingPhaseA({ policy: { enabled: false }, speculativeMode: false }),
+    ).toBe(false);
+  });
+
+  test('starts detection and completes Main exactly once without waiting for detection', async () => {
+    const detection = deferred();
+    const runMain = jest.fn().mockResolvedValue(undefined);
+    const onDetection = jest.fn().mockResolvedValue('phase-b-result');
+
+    const result = startOnePassNonblockingMain({
+      runMain,
+      detectionPromise: detection.promise,
+      onDetection,
+    });
+
+    await result.mainPromise;
+    expect(runMain).toHaveBeenCalledTimes(1);
+    expect(onDetection).not.toHaveBeenCalled();
+    detection.resolve({ activatedCortices: [{ agentId: 'deep-memory' }] });
+    await expect(result.backgroundPromise).resolves.toBe('phase-b-result');
+    expect(onDetection).toHaveBeenCalledTimes(1);
+  });
+
+  test('starts late recovery without waiting for initial Phase B execution', async () => {
+    const initialExecution = deferred();
+    const runInitial = jest.fn(() => initialExecution.promise);
+    const runLate = jest.fn().mockResolvedValue('late-result');
+
+    const completion = startParallelPhaseBRecovery({ runInitial, runLate });
+
+    await Promise.resolve();
+    expect(runInitial).toHaveBeenCalledTimes(1);
+    expect(runLate).toHaveBeenCalledTimes(1);
+    initialExecution.resolve('initial-result');
+    await expect(completion).resolves.toEqual(['initial-result', 'late-result']);
+  });
+
+  test.each([
+    {
+      name: 'no-classified',
+      detectionResult: { timedOut: false, activatedCortices: [] },
+      expectedInitial: [],
+      expectedLateBudget: 0,
+    },
+    {
+      name: 'fast-before-boundary',
+      detectionResult: {
+        timedOut: false,
+        activatedCortices: [{ agentId: 'deep-memory' }],
+      },
+      expectedInitial: ['deep-memory'],
+      expectedLateBudget: 0,
+    },
+    {
+      name: 'timed-out-no-new',
+      detectionResult: { timedOut: true, activatedCortices: [] },
+      expectedInitial: [],
+      expectedLateBudget: 900,
+    },
+  ])('resolves the $name activation boundary without replaying Main', async (scenario) => {
+    const plan = await resolveOnePassPhaseBPlan({
+      detectionResult: scenario.detectionResult,
+      detectTimeoutMs: 400,
+      resolveLateDetectTimeoutMs: () => 900,
+    });
+
+    expect(plan.initialActivations.map((cortex) => cortex.agentId)).toEqual(
+      scenario.expectedInitial,
+    );
+    expect(plan.lateDetectTimeoutMs).toBe(scenario.expectedLateBudget);
+    expect(plan.mergeLateActivations([]).recovered).toEqual([]);
+  });
+
+  test('runs early activation, final timeout, and late recovery once per cortex', async () => {
+    const early = [{ agentId: 'deep-memory' }];
+    const final = [{ agentId: 'deep-memory' }, { agentId: 'red-team' }];
+    const late = [{ agentId: 'red-team' }, { agentId: 'pattern' }];
+    const finalDetection = deferred();
+    const resolveLateDetectTimeoutMs = jest.fn((timeoutMs) => timeoutMs + 1000);
+    const planPromise = resolveOnePassPhaseBPlan({
+      detectionResult: {
+        earlyReturned: true,
+        timedOut: false,
+        activatedCortices: early,
+        finalDetectionPromise: finalDetection.promise,
+      },
+      detectTimeoutMs: 500,
+      resolveLateDetectTimeoutMs,
+    });
+
+    finalDetection.resolve({ timedOut: true, activatedCortices: final });
+    const plan = await planPromise;
+    expect(plan.initialActivations.map((cortex) => cortex.agentId)).toEqual([
+      'deep-memory',
+      'red-team',
+    ]);
+    expect(plan.finalRecoveredActivations.map((cortex) => cortex.agentId)).toEqual(['red-team']);
+    expect(plan.lateDetectTimeoutMs).toBe(1500);
+    expect(resolveLateDetectTimeoutMs).toHaveBeenCalledWith(500);
+
+    const lateMerge = plan.mergeLateActivations(late);
+    const initialExecution = deferred();
+    const executed = [];
+
+    const completion = startParallelPhaseBRecovery({
+      runInitial: () => {
+        executed.push(...plan.initialActivations.map((cortex) => cortex.agentId));
+        return initialExecution.promise;
+      },
+      runLate: async () => {
+        executed.push(...lateMerge.recovered.map((cortex) => cortex.agentId));
+        return 'late-result';
+      },
+    });
+
+    await Promise.resolve();
+    expect(executed).toEqual(['deep-memory', 'red-team', 'pattern']);
+    expect(new Set(executed).size).toBe(executed.length);
+    initialExecution.resolve('initial-result');
+    await expect(completion).resolves.toEqual(['initial-result', 'late-result']);
   });
 });
 
@@ -406,6 +1508,31 @@ describe('late completion error content parts', () => {
         'The model provider is temporarily overloaded. Please try again shortly.',
       error_class: 'provider_temporarily_unavailable',
     });
+
+    const structuredHostLoss = new Error(
+      'The provider worker stopped unexpectedly before completing the response.',
+    );
+    structuredHostLoss.code = 'provider_temporarily_unavailable';
+    expect(AgentClient.createCompletionErrorContentPart(structuredHostLoss)).toEqual({
+      type: ContentTypes.ERROR,
+      [ContentTypes.ERROR]:
+        'The model provider is temporarily overloaded. Please try again shortly.',
+      error_class: 'provider_temporarily_unavailable',
+    });
+  });
+
+  test.each([
+    ['non-stream HTTP 504', 504],
+    ['HTTP-200 SSE APIError', undefined],
+  ])('classifies a %s foreground deadline as the same honest timeout', (_transport, status) => {
+    const error = createProviderDeadlineApiError(status);
+
+    expect(AgentClient.createCompletionErrorContentPart(error)).toEqual({
+      type: ContentTypes.ERROR,
+      [ContentTypes.ERROR]:
+        "The model response exceeded this turn's configured deadline and was stopped. Please retry the turn.",
+      error_class: 'provider_response_deadline_exceeded',
+    });
   });
 
   test('surfaces connected-account reconnect guidance before generic provider classes', () => {
@@ -450,6 +1577,20 @@ describe('late completion error content parts', () => {
     expect(AgentClient.createCompletionErrorContentPart(structured).error_class).toBe(
       'provider_unauthorized',
     );
+  });
+
+  test('classifies authentication signals preserved on nested provider errors', () => {
+    const providerError = new Error('Incorrect API key provided.');
+    providerError.status = 401;
+    providerError.code = 'invalid_api_key';
+    const wrapped = new Error('No result after model invocation');
+    wrapped.cause = providerError;
+
+    expect(AgentClient.createCompletionErrorContentPart(wrapped)).toEqual({
+      type: ContentTypes.ERROR,
+      [ContentTypes.ERROR]: 'The model provider credentials were rejected.',
+      error_class: 'provider_unauthorized',
+    });
   });
 
   test('does not mutate content parts for late stream termination after assistant text', () => {
@@ -673,11 +1814,15 @@ describe('background cortex runtime card guard', () => {
       'Runtime may display background-cortex status/result cards',
     );
     expect(agent.instructions).toContain(
-      'Do not offer to start, spin up, launch, or run background agents/cortices',
-    );
-    expect(agent.instructions).toContain(
       'Do not say a specific background agent/cortex ran, is running, activated, completed, or checked the issue unless it appears in the current turn',
     );
+    expect(agent.instructions).toContain(
+      'A background-cortex card is not a durable mission receipt',
+    );
+    expect(agent.instructions).toContain(
+      'Only acknowledge durable background work after its delegation tool returns a work receipt',
+    );
+    expect(agent.instructions).not.toContain('treat that work as already runtime-owned');
 
     const afterFirstInjection = agent.instructions;
     expect(AgentClient.ensureBackgroundCortexRuntimeCardGuard(agent)).toBe(false);
@@ -1662,6 +2807,15 @@ describe('AgentClient - titleConvo', () => {
     });
   });
 
+  test('classifies wrapped OpenAI incorrect-key errors as provider authentication failures', () => {
+    const incorrectKey = new Error('401 Incorrect API key provided.');
+    expect(AgentClient.createCompletionErrorContentPart(incorrectKey)).toEqual({
+      type: ContentTypes.ERROR,
+      [ContentTypes.ERROR]: 'The model provider credentials were rejected.',
+      error_class: 'provider_unauthorized',
+    });
+  });
+
   describe('getOptions method - GPT-5+ model handling', () => {
     let mockReq;
     let mockRes;
@@ -1670,6 +2824,7 @@ describe('AgentClient - titleConvo', () => {
 
     beforeEach(() => {
       jest.clearAllMocks();
+      mockIsVoiceTaskSuppressed.mockReturnValue(false);
 
       mockAgent = {
         id: 'agent-123',
@@ -2074,7 +3229,10 @@ describe('AgentClient - titleConvo', () => {
       });
 
       // Verify the instructions still work without MCP content (from agent config, not buildOptions)
-      expect(client.options.agent.instructions).toBe('Base agent instructions');
+      expect(client.options.agent.instructions).toContain('Base agent instructions');
+      expect(client.options.agent.instructions).toContain(
+        "Use only facts from the user's current request, prepared My World context",
+      );
       expect(client.options.agent.instructions).not.toContain('[object Promise]');
     });
 
@@ -2453,6 +3611,42 @@ describe('AgentClient - titleConvo', () => {
       expect(mockProcessMemory).not.toHaveBeenCalled();
     });
 
+    it('records a structured storage rejection as an error in deep timing', async () => {
+      const { HumanMessage } = require('@langchain/core/messages');
+      const previousTimingFlag = process.env.VIVENTIUM_TIMING_DEEP;
+      const logSpy = jest.spyOn(logger, 'info').mockImplementation(() => undefined);
+      process.env.VIVENTIUM_TIMING_DEEP = 'true';
+      mockReq.body = { traceId: 'synthetic-memory-timing' };
+      mockProcessMemory.mockResolvedValue([
+        {
+          [Tools.memory]: {
+            type: 'error',
+            value: JSON.stringify({ errorType: 'key_limit_exceeded' }),
+          },
+        },
+      ]);
+
+      try {
+        await client.runMemory([new HumanMessage('Remember a synthetic preference.')]);
+
+        expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('step=memory_run_done ms='));
+        expect(
+          logSpy.mock.calls.some(
+            ([message]) =>
+              String(message).includes('step=memory_run_done') &&
+              String(message).includes('status=error failure=key_limit_exceeded'),
+          ),
+        ).toBe(true);
+      } finally {
+        logSpy.mockRestore();
+        if (previousTimingFlag == null) {
+          delete process.env.VIVENTIUM_TIMING_DEEP;
+        } else {
+          process.env.VIVENTIUM_TIMING_DEEP = previousTimingFlag;
+        }
+      }
+    });
+
     it('clears only the captured user cache when the client options are disposed mid-writer', async () => {
       const { HumanMessage } = require('@langchain/core/messages');
       const mockClearMemoryReadContextCache = require('@librechat/api').clearMemoryReadContextCache;
@@ -2525,6 +3719,34 @@ describe('AgentClient - titleConvo', () => {
       await firstPromise;
       expect(client.runMemory).toHaveBeenCalledTimes(1);
       expect(client.memoryWriterPromise).toBeNull();
+    });
+
+    it('defers every live voice memory write to the post-call hardener', () => {
+      client.options.req.body = {
+        voiceMode: true,
+        viventiumDeferVoiceMemory: true,
+      };
+      client.runMemory = jest.fn();
+      client.processMemory = jest.fn();
+
+      const scheduled = client.scheduleMemoryWriter([]);
+
+      expect(scheduled).toBeUndefined();
+      expect(client.runMemory).not.toHaveBeenCalled();
+      expect(client.processMemory).not.toHaveBeenCalled();
+    });
+
+    it('suppresses memory writes when cancellation wins a remote-completion race', () => {
+      client.options.req.body = {
+        voiceMode: true,
+        viventiumVoiceTaskId: 'voice-task-cancelled',
+      };
+      mockIsVoiceTaskSuppressed.mockReturnValue(true);
+      client.runMemory = jest.fn();
+
+      expect(isCancelledVoiceTask(client.options.req)).toBe(true);
+      expect(client.scheduleMemoryWriter([])).toBeUndefined();
+      expect(client.runMemory).not.toHaveBeenCalled();
     });
   });
 
@@ -2927,7 +4149,10 @@ describe('AgentClient - titleConvo', () => {
         additional_instructions: null,
       });
 
-      expect(parallelAgent.instructions).toBe('Original parallel instructions');
+      expect(parallelAgent.instructions).toContain('Original parallel instructions');
+      expect(parallelAgent.instructions).toContain(
+        "Use only facts from the user's current request, prepared My World context",
+      );
     });
 
     it('should handle parallel agents without existing instructions', async () => {
@@ -3107,6 +4332,65 @@ describe('AgentClient - titleConvo', () => {
       expect(mockCreateMemoryProcessor).not.toHaveBeenCalled();
     });
 
+    it('keeps stored-memory reads available while deferring every active voice write', async () => {
+      mockCheckAccess.mockResolvedValue(true);
+      mockReq.body = {
+        voiceMode: true,
+        viventiumDeferVoiceMemory: true,
+      };
+      client = new AgentClient(mockOptions);
+      client.conversationId = 'convo-voice';
+      client.responseMessageId = 'response-voice';
+
+      const result = await client.useMemory();
+      client.runMemory = jest.fn();
+      client.processMemory = jest.fn();
+      const scheduled = client.scheduleMemoryWriter([]);
+
+      expect(result).toBe('stored memories');
+      expect(mockLoadMemoryReadContext).toHaveBeenCalled();
+      expect(scheduled).toBeUndefined();
+      expect(client.runMemory).not.toHaveBeenCalled();
+      expect(client.processMemory).not.toHaveBeenCalled();
+      expect(mockInitializeAgent).not.toHaveBeenCalled();
+      expect(mockCreateMemoryProcessor).not.toHaveBeenCalled();
+    });
+
+    it('should preserve an explicit unavailable state when the saved-memory read fails', async () => {
+      mockCheckAccess.mockResolvedValue(true);
+      mockLoadMemoryReadContext.mockRejectedValueOnce(
+        new Error('database temporarily unavailable'),
+      );
+
+      client = new AgentClient(mockOptions);
+      const result = await client.useMemory();
+
+      expect(result).toBeUndefined();
+      expect(client.memoryReadUnavailable).toBe(true);
+      expect(mockRecordMemoryContinuityHealth).toHaveBeenCalledWith(
+        expect.objectContaining({ path: 'read', status: 'degraded', reason: 'read_failed' }),
+      );
+    });
+
+    it('should preserve an explicit unavailable state when the memory access check fails', async () => {
+      mockCheckAccess.mockRejectedValueOnce(new Error('permission store temporarily unavailable'));
+
+      client = new AgentClient(mockOptions);
+      const result = await client.useMemory();
+
+      expect(result).toBeUndefined();
+      expect(client.memoryReadUnavailable).toBe(true);
+      expect(client.memoryWriterState).toBeNull();
+      expect(mockLoadMemoryReadContext).not.toHaveBeenCalled();
+      expect(mockRecordMemoryContinuityHealth).toHaveBeenCalledWith(
+        expect.objectContaining({
+          path: 'read',
+          status: 'degraded',
+          reason: 'access_check_failed',
+        }),
+      );
+    });
+
     it('should use current agent when memory config agent.id matches current agent id', async () => {
       mockCheckAccess.mockResolvedValue(true);
       mockInitializeAgent.mockResolvedValue({
@@ -3128,6 +4412,16 @@ describe('AgentClient - titleConvo', () => {
           agent: mockAgent,
         }),
         expect.any(Object),
+      );
+      /* === VIVENTIUM START ===
+       * Regression: detached writer initialization must receive the revision-bearing state reader.
+       * === VIVENTIUM END === */
+      expect(mockCreateMemoryProcessor).toHaveBeenCalledWith(
+        expect.objectContaining({
+          memoryMethods: expect.objectContaining({
+            getAllUserMemoryStates: expect.any(Function),
+          }),
+        }),
       );
     });
 
@@ -3237,6 +4531,10 @@ describe('AgentClient - titleConvo', () => {
 
       expect(result).toBe('stored memories');
       expect(writerResult.ok).toBe(false);
+      expect(writerResult.attachment?.[Tools.memory]?.type).toBe('error');
+      expect(JSON.parse(writerResult.attachment[Tools.memory].value)).toEqual(
+        expect.objectContaining({ errorType: 'writer_unavailable' }),
+      );
       expect(mockCreateMemoryProcessor).not.toHaveBeenCalled();
     });
   });
@@ -3251,6 +4549,18 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
   let client;
   let req;
   let primaryAgent;
+
+  const fallbackRecoveryPart = (model) => ({
+    type: ContentTypes.HARNESS_ACTIVITY,
+    harness_activity: {
+      event: 'fallback-recovery',
+      summary: expect.stringContaining(`configured fallback model (${model})`),
+    },
+  });
+
+  const expectFallbackCompletion = (parts, text, model) => {
+    expect(parts).toEqual([fallbackRecoveryPart(model), { type: ContentTypes.TEXT, text }]);
+  };
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -3283,6 +4593,33 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     });
     client.conversationId = 'conv-1';
     client.responseMessageId = 'resp-1';
+  });
+
+  test('persists one graph participant fallback receipt for refresh without duplicate answer text', async () => {
+    client.chatCompletion = jest.fn(async () => {
+      client.run = { Graph: {} };
+      Object.defineProperty(client.run.Graph, 'viventiumGraphFallbackRecoveryReceipt', {
+        value: { provider: 'openAI', model: 'synthetic-worker-fallback' },
+        enumerable: false,
+      });
+      client.contentParts.push({ type: ContentTypes.TEXT, text: 'One recovered final answer.' });
+    });
+
+    const { completion } = await client.sendCompletion({ text: 'hello' });
+    const refreshed = JSON.parse(JSON.stringify(completion));
+
+    expect(client.chatCompletion).toHaveBeenCalledTimes(1);
+    expect(refreshed).toEqual([
+      {
+        type: ContentTypes.HARNESS_ACTIVITY,
+        harness_activity: expect.objectContaining({
+          event: 'fallback-recovery',
+          provider: 'openAI',
+          model: 'synthetic-worker-fallback',
+        }),
+      },
+      { type: ContentTypes.TEXT, text: 'One recovered final answer.' },
+    ]);
   });
 
   test('persists Phase B parts and waits for fallback text before follow-up synthesis', async () => {
@@ -3810,6 +5147,62 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     });
   });
 
+  test('does not apply the short moved-on grace suppression to callback-origin terminal evidence', async () => {
+    const phaseB = deferred();
+    const responseController = { lastUserInputTime: 20 };
+    setTrustedInteractionContext(req, {
+      actor_kind: 'worker',
+      origin: 'callback',
+      surface: 'web',
+      conversation_id: 'conv-1',
+      source_event_id: 'callback-1',
+    });
+    client.contentParts.push({ type: ContentTypes.TEXT, text: 'Mission status recorded.' });
+    mockCreateCortexFollowUpMessage.mockResolvedValue({
+      messageId: 'callback-follow-up',
+      parentMessageId: 'resp-1',
+      text: 'Main-authored mission result.',
+    });
+
+    const attached = client.attachBackgroundCortexCompletionPipeline({
+      cortexExecutionPromise: phaseB.promise,
+      pendingCortexParts: [
+        {
+          type: ContentTypes.CORTEX_INSIGHT,
+          cortex_id: 'glasshive-callback',
+          status: 'complete',
+          insight: 'Terminal mission evidence.',
+        },
+      ],
+      req,
+      conversationId: 'conv-1',
+      responseMessageId: 'resp-1',
+      agent: primaryAgent,
+      getResponseContentParts: () => client.contentParts,
+      responseController,
+      turnUserInputTime: 10,
+      followupGraceMs: 0,
+      shouldDeferMainResponse: false,
+      getActivatedCorticesList: () => [],
+    });
+
+    phaseB.resolve({
+      insights: [{ cortexName: 'Mission', insight: 'Terminal mission evidence.' }],
+      mergedPrompt: 'Terminal mission evidence.',
+      cortexCount: 1,
+    });
+    await attached;
+
+    expect(mockCreateCortexFollowUpMessage).toHaveBeenCalledTimes(1);
+    expect(mockEmitChunk).toHaveBeenCalledWith(
+      'stream-1',
+      expect.objectContaining({
+        event: 'on_cortex_followup',
+        data: expect.objectContaining({ text: 'Main-authored mission result.' }),
+      }),
+    );
+  });
+
   test('records skipped decision for empty Phase B completion with no terminal parts', async () => {
     const phaseB = deferred();
     const attached = client.attachBackgroundCortexCompletionPipeline({
@@ -3872,6 +5265,35 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     expect(result.completion).toEqual([{ type: ContentTypes.TEXT, text: 'Primary answer.' }]);
   });
 
+  test.each([
+    ['non-stream HTTP 504', 504],
+    ['HTTP-200 SSE APIError', undefined],
+  ])(
+    'does not start an outer fallback after a %s foreground deadline',
+    async (_transport, status) => {
+      primaryAgent.viventiumFallbackLlm = {
+        id: 'agent-fallback',
+        provider: EModelEndpoint.openAI,
+        model: 'gpt-5.4',
+        model_parameters: { model: 'gpt-5.4' },
+      };
+      const deadlineError = createProviderDeadlineApiError(status);
+      client.chatCompletion = jest.fn(async () => {
+        throw deadlineError;
+      });
+
+      await expect(client.sendCompletion({ text: 'hello' })).rejects.toBe(deadlineError);
+
+      expect(client.chatCompletion).toHaveBeenCalledTimes(1);
+      expect(AgentClient.createCompletionErrorContentPart(deadlineError)).toEqual({
+        type: ContentTypes.ERROR,
+        [ContentTypes.ERROR]:
+          "The model response exceeded this turn's configured deadline and was stopped. Please retry the turn.",
+        error_class: 'provider_response_deadline_exceeded',
+      });
+    },
+  );
+
   test('materializes lazy fallback only after primary fails before assistant text', async () => {
     const fallbackAgent = {
       id: 'agent-fallback',
@@ -3901,7 +5323,7 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     expect(primaryAgent.viventiumFallbackLlmInitializer).toHaveBeenCalledTimes(1);
     expect(client.chatCompletion).toHaveBeenCalledTimes(2);
     expect(fallbackSawUserMcpAuthMap).toEqual(fallbackAgent.userMCPAuthMap);
-    expect(result.completion).toEqual([{ type: ContentTypes.TEXT, text: 'Fallback answer.' }]);
+    expectFallbackCompletion(result.completion, 'Fallback answer.', 'gpt-5.4');
   });
 
   test('replaces stale primary rate-limit part when lazy fallback needs reconnect', async () => {
@@ -3971,7 +5393,7 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     expect(Object.prototype.hasOwnProperty.call(req.body, 'suppressBackgroundCortices')).toBe(
       false,
     );
-    expect(result.completion).toEqual([{ type: ContentTypes.TEXT, text: 'Fallback answer.' }]);
+    expectFallbackCompletion(result.completion, 'Fallback answer.', 'gpt-5.4');
   });
 
   test('retries fallback when primary throws after adding a recoverable error part', async () => {
@@ -4002,8 +5424,90 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     const result = await client.sendCompletion({ text: 'hello' });
 
     expect(client.chatCompletion).toHaveBeenCalledTimes(2);
-    expect(result.completion).toEqual([{ type: ContentTypes.TEXT, text: 'Fallback answer.' }]);
-    expect(client.contentParts).toEqual([{ type: ContentTypes.TEXT, text: 'Fallback answer.' }]);
+    expectFallbackCompletion(result.completion, 'Fallback answer.', 'gpt-5.4');
+    expectFallbackCompletion(client.contentParts, 'Fallback answer.', 'gpt-5.4');
+  });
+
+  test('logs one metadata-only diagnostic for a wrapped primary error before fallback', async () => {
+    const secret = 'sk-test-primary-error-secret-never-log';
+    const providerError = new Error(`rate limit from provider with ${secret}`);
+    providerError.status = 429;
+    providerError.code = 'rate_limit_exceeded';
+    const wrappedError = new Error(`wrapped provider failure with ${secret}`);
+    wrappedError.cause = providerError;
+    primaryAgent.viventiumFallbackLlm = {
+      id: 'agent-fallback',
+      provider: EModelEndpoint.openAI,
+      model: 'gpt-5.4',
+      model_parameters: { model: 'gpt-5.4' },
+    };
+    let calls = 0;
+    client.chatCompletion = jest.fn(async () => {
+      calls += 1;
+      if (calls === 1) {
+        throw wrappedError;
+      }
+      client.contentParts.push({ type: ContentTypes.TEXT, text: 'Fallback answer.' });
+    });
+    const warnSpy = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+
+    try {
+      const result = await client.sendCompletion({ text: 'hello' });
+      const diagnosticCalls = warnSpy.mock.calls.filter(
+        ([message]) =>
+          message === '[AgentClient] Primary completion threw before fallback evaluation',
+      );
+
+      expectFallbackCompletion(result.completion, 'Fallback answer.', 'gpt-5.4');
+      expect(diagnosticCalls).toHaveLength(1);
+      expect(diagnosticCalls[0][1]).toEqual({
+        class: 'provider_rate_limited',
+        status: 429,
+        code: 'rate_limit_exceeded',
+        chainDepth: 2,
+        messageHash: expect.stringMatching(/^[a-f0-9]{12}$/),
+      });
+      const serializedCalls = JSON.stringify(warnSpy.mock.calls);
+      expect(serializedCalls).not.toContain(secret);
+      expect(serializedCalls).not.toContain(wrappedError.message);
+      expect(serializedCalls).not.toContain(providerError.message);
+      expect(serializedCalls).not.toContain(wrappedError.stack);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  test('does not log a thrown-primary diagnostic for content-part-only fallback', async () => {
+    primaryAgent.viventiumFallbackLlm = {
+      id: 'agent-fallback',
+      provider: EModelEndpoint.openAI,
+      model: 'gpt-5.4',
+      model_parameters: { model: 'gpt-5.4' },
+    };
+    let calls = 0;
+    client.chatCompletion = jest.fn(async () => {
+      calls += 1;
+      if (calls === 1) {
+        client.contentParts.push({
+          type: ContentTypes.ERROR,
+          [ContentTypes.ERROR]: 'provider temporarily unavailable',
+        });
+        return;
+      }
+      client.contentParts.push({ type: ContentTypes.TEXT, text: 'Fallback answer.' });
+    });
+    const warnSpy = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+
+    try {
+      await client.sendCompletion({ text: 'hello' });
+
+      expect(warnSpy).not.toHaveBeenCalledWith(
+        '[AgentClient] Primary completion threw before fallback evaluation',
+        expect.anything(),
+      );
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 
   test('retries fallback when primary throws public hyphenated rate-limit text', async () => {
@@ -4026,8 +5530,272 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     const result = await client.sendCompletion({ text: 'hello' });
 
     expect(client.chatCompletion).toHaveBeenCalledTimes(2);
-    expect(result.completion).toEqual([{ type: ContentTypes.TEXT, text: 'Fallback answer.' }]);
-    expect(client.contentParts).toEqual([{ type: ContentTypes.TEXT, text: 'Fallback answer.' }]);
+    expectFallbackCompletion(result.completion, 'Fallback answer.', 'gpt-5.4');
+    expectFallbackCompletion(client.contentParts, 'Fallback answer.', 'gpt-5.4');
+  });
+
+  test.each([
+    ['connection refusal', { code: 'ECONNREFUSED' }],
+    ['connection reset', { code: 'ECONNRESET' }],
+    ['gateway failure', { status: 502 }],
+    ['gateway timeout without a persisted deadline code', { status: 504 }],
+    ['provider timeout', { code: 'ETIMEDOUT' }],
+  ])('retries fallback when the primary provider has a %s', async (_label, shape) => {
+    primaryAgent.viventiumFallbackLlm = {
+      id: 'agent-fallback',
+      provider: 'glasshive-harness',
+      model: 'claude-code:opus',
+      model_parameters: { model: 'claude-code:opus', reasoning_effort: 'high' },
+    };
+    let calls = 0;
+    client.chatCompletion = jest.fn(async () => {
+      calls += 1;
+      if (calls === 1) {
+        throw Object.assign(new Error('provider connection failed'), shape);
+      }
+      client.contentParts.push({ type: ContentTypes.TEXT, text: 'Connection fallback answer.' });
+    });
+
+    const result = await client.sendCompletion({ text: 'hello' });
+
+    expect(client.chatCompletion).toHaveBeenCalledTimes(2);
+    expectFallbackCompletion(result.completion, 'Connection fallback answer.', 'claude-code:opus');
+  });
+
+  test('marks a same-provider generic fallback as a distinct harness attempt', async () => {
+    req.config.endpoints.agents = {
+      providerCapabilities: {
+        'glasshive-harness': {
+          activity_stream: true,
+          workspace_binding: true,
+          conversation_session: true,
+        },
+      },
+    };
+    primaryAgent.provider = EModelEndpoint.openAI;
+    primaryAgent.endpoint = 'glasshive-harness';
+    primaryAgent.model = 'codex-cli:gpt-5.6-sol';
+    primaryAgent.model_parameters.model = 'codex-cli:gpt-5.6-sol';
+    req._viventiumHarnessActivityEnabled = true;
+    req._viventiumHarnessExecutionEnabled = true;
+    primaryAgent.viventiumFallbackLlm = {
+      ...primaryAgent,
+      provider: EModelEndpoint.openAI,
+      endpoint: 'glasshive-harness',
+      model: 'claude-code:opus',
+      model_parameters: { model: 'claude-code:opus', reasoning_effort: 'high' },
+    };
+    const attempts = [];
+    client.chatCompletion = jest.fn(async () => {
+      attempts.push({
+        fallback: req._viventiumFallbackLlmAttempt === true,
+        key: buildHarnessAttemptIdempotencyKey(req, client.responseMessageId),
+        provider: client.options.agent.endpoint || client.options.agent.provider,
+        model: client.options.agent.model,
+      });
+      if (attempts.length === 1) {
+        const error = new Error(
+          'The model provider rate-limited this request. Please try again shortly.',
+        );
+        error.errorClass = 'provider_quota_exhausted';
+        throw error;
+      }
+      client.contentParts.push({ type: ContentTypes.TEXT, text: 'Claude fallback answer.' });
+    });
+
+    const result = await client.sendCompletion({ text: 'hello' });
+
+    expect(attempts).toEqual([
+      {
+        fallback: false,
+        key: 'main:resp-1',
+        provider: 'glasshive-harness',
+        model: 'codex-cli:gpt-5.6-sol',
+      },
+      {
+        fallback: true,
+        key: 'main-fallback:resp-1',
+        provider: 'glasshive-harness',
+        model: 'claude-code:opus',
+      },
+    ]);
+    expect(req._viventiumHarnessExecutionEnabled).toBe(true);
+    expectFallbackCompletion(result.completion, 'Claude fallback answer.', 'claude-code:opus');
+  });
+
+  test('rebuilds the complete same-provider fallback graph family before Stop can fire', async () => {
+    const abortController = new AbortController();
+    const cancellationFetch = jest.fn().mockResolvedValue({ ok: true });
+    const cancellationEndpoint = {
+      baseURL: 'http://glasshive.local/v1',
+      apiKey: 'synthetic-key',
+    };
+    req.body.responseMessageId = 'resp-1';
+    req.config.endpoints.agents = {
+      providerCapabilities: {
+        'glasshive-harness': {
+          activity_stream: true,
+          workspace_binding: true,
+          conversation_session: true,
+        },
+      },
+    };
+    primaryAgent.id = 'main-agent';
+    primaryAgent.provider = EModelEndpoint.openAI;
+    primaryAgent.endpoint = 'glasshive-harness';
+    primaryAgent.model = 'codex-cli:gpt-5.6-sol';
+    primaryAgent.model_parameters.model = 'codex-cli:gpt-5.6-sol';
+    primaryAgent.viventiumHarnessCancellationEndpointConfig = cancellationEndpoint;
+    primaryAgent.viventiumFallbackLlm = {
+      ...primaryAgent,
+      model: 'claude-code:opus',
+      model_parameters: { model: 'claude-code:opus', reasoning_effort: 'high' },
+    };
+    client.agentConfigs = new Map([
+      [
+        'reality-agent',
+        {
+          id: 'reality-agent',
+          endpoint: 'glasshive-harness',
+          viventiumHarnessCancellationEndpointConfig: cancellationEndpoint,
+        },
+      ],
+      [
+        'red-agent',
+        {
+          id: 'red-agent',
+          endpoint: 'glasshive-harness',
+          viventiumHarnessCancellationEndpointConfig: cancellationEndpoint,
+        },
+      ],
+    ]);
+
+    req._viventiumHarnessExecutionEnabled = true;
+    const primaryIdentity = buildHarnessAgentIdempotencyKeys(req, 'resp-1', {
+      primaryAgentId: 'main-agent',
+      agentIds: ['main-agent'],
+    });
+    req._viventiumHarnessIdempotencyKey = primaryIdentity.primaryKey;
+    req._viventiumHarnessIdempotencyKeys = new Set(primaryIdentity.allKeys);
+    bindHarnessCancellation({
+      req,
+      signal: abortController.signal,
+      endpointConfig: cancellationEndpoint,
+      fetchImpl: cancellationFetch,
+    });
+
+    let calls = 0;
+    let fallbackKeys = [];
+    client.chatCompletion = jest.fn(async () => {
+      calls += 1;
+      if (calls === 1) {
+        throw Object.assign(new Error('provider rate limited'), {
+          errorClass: 'provider_quota_exhausted',
+        });
+      }
+      fallbackKeys = Array.from(req._viventiumHarnessIdempotencyKeys || []);
+      abortController.abort('user_cancelled');
+      client.contentParts.push({ type: ContentTypes.TEXT, text: 'Stopped fallback answer.' });
+    });
+
+    await client.sendCompletion({ text: 'hello' }, { abortController });
+    await Promise.resolve();
+
+    expect(fallbackKeys).toEqual([
+      'main:resp-1',
+      'main:reality-agent:resp-1',
+      'main:red-agent:resp-1',
+    ]);
+    expect(cancellationFetch.mock.calls.map(([url]) => url)).toEqual([
+      'http://glasshive.local/v1/requests/by-idempotency/main%3Aresp-1/cancel',
+      'http://glasshive.local/v1/requests/by-idempotency/main%3Areality-agent%3Aresp-1/cancel',
+      'http://glasshive.local/v1/requests/by-idempotency/main%3Ared-agent%3Aresp-1/cancel',
+    ]);
+  });
+
+  test('preserves Stop authority for a committed workspace attempt during a direct fallback', async () => {
+    const abortController = new AbortController();
+    const cancellationFetch = jest.fn().mockResolvedValue({ ok: true });
+    const cancellationEndpoint = {
+      baseURL: 'http://glasshive.local/v1',
+      apiKey: 'synthetic-key',
+    };
+    req.body.responseMessageId = 'resp-1';
+    req.config.endpoints.agents = {
+      providerCapabilities: {
+        'glasshive-harness': {
+          activity_stream: true,
+          workspace_binding: true,
+          conversation_session: true,
+        },
+        openAI: { workspace_binding: false },
+      },
+    };
+    primaryAgent.id = 'main-agent';
+    primaryAgent.provider = EModelEndpoint.openAI;
+    primaryAgent.endpoint = 'glasshive-harness';
+    primaryAgent.viventiumHarnessCancellationEndpointConfig = cancellationEndpoint;
+    primaryAgent.viventiumFallbackLlm = {
+      id: 'direct-fallback',
+      provider: EModelEndpoint.openAI,
+      model: 'gpt-direct-fallback',
+      model_parameters: { model: 'gpt-direct-fallback' },
+    };
+
+    req._viventiumHarnessExecutionEnabled = true;
+    req._viventiumHarnessIdempotencyKey = 'main:resp-1';
+    req._viventiumHarnessIdempotencyKeys = new Set(['main:resp-1']);
+    bindHarnessCancellation({
+      req,
+      signal: abortController.signal,
+      endpointConfig: cancellationEndpoint,
+      fetchImpl: cancellationFetch,
+    });
+
+    let calls = 0;
+    client.chatCompletion = jest.fn(async () => {
+      calls += 1;
+      if (calls === 1) {
+        throw Object.assign(new Error('provider unavailable after launch'), {
+          status: 429,
+        });
+      }
+      abortController.abort('user_cancelled');
+      client.contentParts.push({ type: ContentTypes.TEXT, text: 'Direct fallback stopped.' });
+    });
+
+    await client.sendCompletion({ text: 'hello' }, { abortController });
+    await Promise.resolve();
+
+    expect(req._viventiumHarnessExecutionEnabled).toBe(false);
+    expect(cancellationFetch.mock.calls.map(([url]) => url)).toEqual([
+      'http://glasshive.local/v1/requests/by-idempotency/main%3Aresp-1/cancel',
+    ]);
+  });
+
+  test('cancellation during lazy fallback initialization prevents the fallback request', async () => {
+    const fallbackReady = deferred();
+    const abortController = new AbortController();
+    primaryAgent.viventiumFallbackLlmInitializer = jest.fn(() => fallbackReady.promise);
+    client.chatCompletion = jest.fn(async () => {
+      throw new Error('The model provider rate-limited this request. Please try again shortly.');
+    });
+
+    const completionPromise = client.sendCompletion({ text: 'hello' }, { abortController });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(primaryAgent.viventiumFallbackLlmInitializer).toHaveBeenCalledTimes(1);
+
+    abortController.abort('user_cancelled');
+    fallbackReady.resolve({
+      id: 'agent-fallback',
+      provider: 'glasshive-harness',
+      model: 'claude-code:opus',
+      model_parameters: { model: 'claude-code:opus' },
+    });
+
+    await expect(completionPromise).rejects.toMatchObject({ name: 'AbortError' });
+    expect(client.chatCompletion).toHaveBeenCalledTimes(1);
   });
 
   test('retries fallback when primary auth throws before adding an error part', async () => {
@@ -4055,12 +5823,27 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     const result = await client.sendCompletion({ text: 'hello' });
 
     expect(client.chatCompletion).toHaveBeenCalledTimes(2);
-    expect(result.completion).toEqual([
-      { type: ContentTypes.TEXT, text: 'Fallback answer after auth.' },
-    ]);
-    expect(client.contentParts).toEqual([
-      { type: ContentTypes.TEXT, text: 'Fallback answer after auth.' },
-    ]);
+    expectFallbackCompletion(result.completion, 'Fallback answer after auth.', 'gpt-5.4');
+    expectFallbackCompletion(client.contentParts, 'Fallback answer after auth.', 'gpt-5.4');
+  });
+
+  test('discloses a fallback that already recovered during provider initialization', async () => {
+    req._viventiumFallbackRouteNotice = { model: 'claude-code:opus' };
+    client.chatCompletion = jest.fn(async () => {
+      client.contentParts.push({
+        type: ContentTypes.TEXT,
+        text: 'Answer from the initialization fallback.',
+      });
+    });
+
+    const result = await client.sendCompletion({ text: 'hello' });
+
+    expect(client.chatCompletion).toHaveBeenCalledTimes(1);
+    expectFallbackCompletion(
+      result.completion,
+      'Answer from the initialization fallback.',
+      'claude-code:opus',
+    );
   });
 
   test('does not retry fallback when primary is aborted by the user before assistant text', async () => {
@@ -4112,12 +5895,8 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     const result = await client.sendCompletion({ text: 'hello' });
 
     expect(client.chatCompletion).toHaveBeenCalledTimes(2);
-    expect(result.completion).toEqual([
-      { type: ContentTypes.TEXT, text: 'Fallback answer after overload.' },
-    ]);
-    expect(client.contentParts).toEqual([
-      { type: ContentTypes.TEXT, text: 'Fallback answer after overload.' },
-    ]);
+    expectFallbackCompletion(result.completion, 'Fallback answer after overload.', 'gpt-5.4');
+    expectFallbackCompletion(client.contentParts, 'Fallback answer after overload.', 'gpt-5.4');
   });
 
   test('suppresses fallback background cortices only when primary Phase B already owns the response', async () => {
@@ -4165,6 +5944,7 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
         cortex_id: 'agent-background',
         status: 'error',
       }),
+      fallbackRecoveryPart('gpt-5.4'),
       { type: ContentTypes.TEXT, text: 'Fallback answer.' },
     ]);
   });
@@ -4212,6 +5992,26 @@ describe('pruneSequentialOutputPartsForPersistence', () => {
         status: 'complete',
         insight: 'Background result.',
       },
+    ]);
+  });
+
+  test('keeps a visible fallback disclosure when sequential output hiding is enabled', () => {
+    const fallbackNotice = {
+      type: ContentTypes.HARNESS_ACTIVITY,
+      harness_activity: {
+        event: 'fallback-recovery',
+        summary: 'The primary route was unavailable. The fallback completed.',
+      },
+    };
+    const parts = [
+      { type: ContentTypes.TEXT, text: 'Intermediate response.' },
+      fallbackNotice,
+      { type: ContentTypes.TEXT, text: 'Recovered final response.' },
+    ];
+
+    expect(AgentClient.pruneSequentialOutputPartsForPersistence(parts)).toEqual([
+      fallbackNotice,
+      { type: ContentTypes.TEXT, text: 'Recovered final response.' },
     ]);
   });
 });

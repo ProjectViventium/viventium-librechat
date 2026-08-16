@@ -58,7 +58,10 @@ const { primeFiles: primeCodeFiles } = require('~/server/services/Files/Code/pro
 const { manifestToolMap, toolkits } = require('~/app/clients/tools/manifest');
 const { createOnSearchResults } = require('~/server/services/Tools/search');
 const { loadAuthValues } = require('~/server/services/Tools/credentials');
-const { reinitMCPServer } = require('~/server/services/Tools/mcp');
+const {
+  hasUsableOAuthTokens,
+  reinitMCPServer,
+} = require('~/server/services/Tools/mcp');
 const { resolveConfigServers } = require('~/server/services/MCP');
 const { recordUsage } = require('~/server/services/Threads');
 const { loadTools } = require('~/app/clients/tools/util');
@@ -71,8 +74,6 @@ const {
   voiceLatencyNow,
 } = require('~/server/services/viventium/voiceLatencyTiming');
 // === VIVENTIUM START ===
-// Feature: Telegram tool guard (fast-path for trivial messages).
-const { shouldSkipTelegramTools } = require('~/server/services/viventium/telegramToolGuard');
 // Feature: Deep Telegram timing instrumentation (toggleable).
 const {
   isDeepTimingEnabled,
@@ -81,8 +82,17 @@ const {
 } = require('~/server/services/viventium/telegramTimingDeep');
 const {
   getMcpOAuthWaitDecision,
+  shouldSuppressMcpOAuthFlow,
   stripOAuthPendingMcpTools,
 } = require('~/server/services/viventium/mcpOAuthPolicy');
+const { filterMCPToolsForAudience } = require('~/server/services/viventium/mcpAudiencePolicy');
+const {
+  isConversationOrchestrationTool,
+} = require('~/server/services/viventium/GlassHiveConversationOrchestration');
+const {
+  appendGlassHiveMainOrchestrationFacade,
+  availableGlassHiveMainOrchestrationTools,
+} = require('~/app/clients/tools/util/glassHiveOrchestrationTools');
 // === VIVENTIUM END ===
 const VIVENTIUM_GLASSHIVE_MCP_SERVER_NAME = 'glasshive-workers-projects';
 /* === VIVENTIUM START ===
@@ -577,8 +587,32 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
   const checkCapability = (capability) => enabledCapabilities.has(capability);
   const areToolsEnabled = checkCapability(AgentCapabilities.tools);
   const deferredToolsEnabled = checkCapability(AgentCapabilities.deferred_tools);
+  /* === VIVENTIUM START ===
+   * Feature: Rollback-safe Main orchestration definitions.
+   * Purpose: Readiness gates new delegation, while a trusted known-work hint preserves only
+   * list/action definitions for existing missions across direct, voice, and native providers.
+   * === VIVENTIUM END === */
+  const requestedOrchestrationTools = (agent.tools || []).filter(isConversationOrchestrationTool);
+  const availableMainOrchestrationTools = areToolsEnabled
+    ? availableGlassHiveMainOrchestrationTools(agent, requestedOrchestrationTools, {
+        user: req.user,
+      })
+    : [];
+  const exposeMainOrchestration = availableMainOrchestrationTools.length > 0;
 
-  const filteredTools = agent.tools?.filter((tool) => {
+  /* === VIVENTIUM START ===
+   * Security: Apply server-declared request audiences before definition discovery or process
+   * startup. Execution repeats the same shared check as defense in depth.
+   * === VIVENTIUM END === */
+  const configServers = await resolveConfigServers(req);
+  const audienceEligibleTools = filterMCPToolsForAudience({
+    tools: agent.tools || [],
+    configServers,
+    reqUser: req.user,
+  });
+  const filteredTools = audienceEligibleTools.filter((tool) => {
+    // Raw peer-spawn MCP is never provider-visible. The server-owned facade is appended below.
+    if (isConversationOrchestrationTool(tool)) return false;
     if (tool === Tools.file_search) {
       return checkCapability(AgentCapabilities.file_search);
     }
@@ -594,7 +628,7 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
     return true;
   });
 
-  if (!filteredTools || filteredTools.length === 0) {
+  if ((!filteredTools || filteredTools.length === 0) && !exposeMainOrchestration) {
     return { toolDefinitions: [] };
   }
 
@@ -610,13 +644,6 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
 
   const flowsCache = getLogStores(CacheKeys.FLOWS);
   const flowManager = getFlowStateManager(flowsCache);
-  /* === VIVENTIUM START ===
-   * Feature: MCP config-server hot-path plumbing.
-   * Purpose: Follow upstream LibreChat's request-scoped config resolution pattern
-   * so MCP reinit can reuse config-source server state when the registry supports it.
-   */
-  const configServers = await resolveConfigServers(req);
-  /* === VIVENTIUM END === */
   const pendingOAuthServers = new Set();
 
   const createOAuthEmitter = (serverName) => {
@@ -723,6 +750,32 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
     }
     // === VIVENTIUM END ===
 
+    /* === VIVENTIUM START ===
+     * Feature: Non-interactive OAuth capability degradation.
+     * Purpose: Do not reuse cached schemas for an OAuth-backed tool when the trusted
+     * background caller has no usable authorization. Otherwise a later tool call could
+     * recreate the same unattended wait that definition loading intentionally avoids.
+     * === VIVENTIUM END === */
+    const suppressOAuthFlow = shouldSuppressMcpOAuthFlow(req);
+    const resolvedServerConfig = configServers?.[serverName];
+    const requiresOAuth = Boolean(
+      resolvedServerConfig?.requiresOAuth || resolvedServerConfig?.oauthMetadata,
+    );
+    if (
+      suppressOAuthFlow &&
+      requiresOAuth &&
+      !(await hasUsableOAuthTokens(userId, serverName))
+    ) {
+      pendingOAuthServers.add(serverName);
+      writeMcpOAuthPendingMemo({
+        userId,
+        serverName,
+        reason: 'oauth_authorization_unavailable',
+      });
+      logFetchDone('oauth_unavailable_noninteractive');
+      return null;
+    }
+
     const cached = await getMCPServerTools(userId, serverName);
     if (cached) {
       clearMcpOAuthPendingMemo({ userId, serverName });
@@ -749,6 +802,7 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
       serverName,
       configServers,
       userMCPAuthMap,
+      suppressOAuthFlow,
     });
 
     if (result?.availableTools) {
@@ -760,6 +814,19 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
     if (pendingOAuthServers.has(serverName) || result?.oauthRequired) {
       writeMcpOAuthPendingMemo({ userId, serverName, reason: 'oauth_pending' });
       logFetchDone('oauth_pending', `oauth_required=${Boolean(result?.oauthRequired)}`);
+      return null;
+    }
+
+    /* === VIVENTIUM START ===
+     * Feature: Explicit MCP reinitialization failure observability.
+     * Purpose: Keep a failed server reinitialization distinct from a healthy
+     * no-tools result without failing unrelated tools or exposing provider detail.
+     * === VIVENTIUM END === */
+    if (result?.failureClass) {
+      logger.warn(`[Tool Definitions] MCP reinitialization failed for ${serverName}`, {
+        failureClass: result.failureClass,
+      });
+      logFetchDone('reinit_error', `failure_class=${result.failureClass}`);
       return null;
     }
 
@@ -830,6 +897,14 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
       getActionToolDefinitions,
     },
   );
+
+  if (exposeMainOrchestration) {
+    ({ toolDefinitions, toolRegistry } = appendGlassHiveMainOrchestrationFacade({
+      toolDefinitions,
+      toolRegistry,
+      requestedTools: availableMainOrchestrationTools,
+    }));
+  }
 
   if (pendingOAuthServers.size > 0 && (res || streamId)) {
     const serverNames = Array.from(pendingOAuthServers);
@@ -932,6 +1007,13 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
         toolDefinitions = reloadResult.toolDefinitions;
         toolRegistry = reloadResult.toolRegistry;
         hasDeferredTools = reloadResult.hasDeferredTools;
+        if (exposeMainOrchestration) {
+          ({ toolDefinitions, toolRegistry } = appendGlassHiveMainOrchestrationFacade({
+            toolDefinitions,
+            toolRegistry,
+            requestedTools: availableMainOrchestrationTools,
+          }));
+        }
       }
     }
   }
@@ -1045,20 +1127,10 @@ async function loadAgentTools({
   definitionsOnly = true,
 }) {
   // === VIVENTIUM START ===
-  // Feature: Skip tool loading for trivial Telegram messages to avoid MCP stalls.
+  // Feature: Deep tool-loading timing for Telegram diagnostics.
   const toolLoadStart = startDeepTiming(req);
   if (isDeepTimingEnabled(req)) {
     logDeepTiming(req, 'tool_load_start', toolLoadStart, `tools=${agent?.tools?.length ?? 0}`);
-  }
-  if (shouldSkipTelegramTools(req)) {
-    const traceId = req?.body?.traceId || 'na';
-    logger.info(
-      `[VIVENTIUM][telegram] Tool guard: skipping tools for short message (trace=${traceId})`,
-    );
-    if (isDeepTimingEnabled(req)) {
-      logDeepTiming(req, 'tool_load_skip', toolLoadStart, 'reason=guard');
-    }
-    return {};
   }
   // === VIVENTIUM END ===
   if (definitionsOnly) {

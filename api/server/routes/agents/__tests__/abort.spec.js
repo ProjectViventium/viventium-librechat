@@ -76,9 +76,31 @@ describe('Agent Abort Endpoint', () => {
     jest.clearAllMocks();
   });
 
+  describe('GET /chat/stream/:streamId', () => {
+    /* === VIVENTIUM START ===
+     * Feature: Parallel Work owner isolation.
+     * Purpose: An ownerless legacy stream must not become readable by an arbitrary account.
+     */
+    it('rejects a stream whose durable owner identity is missing', async () => {
+      mockGenerationJobManager.getJob.mockResolvedValue({
+        status: 'running',
+        metadata: {},
+      });
+
+      const response = await request(app).get('/api/agents/chat/stream/ownerless-stream');
+
+      expect(response.status).toBe(404);
+      expect(response.body).toEqual({
+        error: 'Stream not found',
+        message: 'The generation job does not exist or has expired.',
+      });
+    });
+    /* === VIVENTIUM END === */
+  });
+
   describe('POST /chat/abort', () => {
     describe('Authorization', () => {
-      it("should return 403 when user tries to abort another user's job", async () => {
+      it("returns the same 404 when a user tries to abort another user's job", async () => {
         const jobStreamId = 'test-stream-123';
 
         mockGenerationJobManager.getJob.mockResolvedValue({
@@ -89,10 +111,10 @@ describe('Agent Abort Endpoint', () => {
           .post('/api/agents/chat/abort')
           .send({ conversationId: jobStreamId });
 
-        expect(response.status).toBe(403);
-        expect(response.body).toEqual({ error: 'Unauthorized' });
+        expect(response.status).toBe(404);
+        expect(response.body).toEqual({ error: 'Job not found', streamId: jobStreamId });
         expect(mockLogger.warn).toHaveBeenCalledWith(
-          expect.stringContaining('Unauthorized abort attempt'),
+          expect.stringContaining('Abort target unavailable'),
         );
         expect(mockGenerationJobManager.abortJob).not.toHaveBeenCalled();
       });
@@ -101,6 +123,7 @@ describe('Agent Abort Endpoint', () => {
         const jobStreamId = 'test-stream-123';
 
         mockGenerationJobManager.getJob.mockResolvedValue({
+          status: 'running',
           metadata: { userId: 'test-user-123' },
         });
 
@@ -120,27 +143,48 @@ describe('Agent Abort Endpoint', () => {
         expect(mockGenerationJobManager.abortJob).toHaveBeenCalledWith(jobStreamId);
       });
 
-      it('should allow abort when job has no userId metadata (backwards compatibility)', async () => {
-        const jobStreamId = 'test-stream-123';
+      it('should reject aborting a job whose main response is already complete', async () => {
+        const jobStreamId = 'test-stream-complete';
 
         mockGenerationJobManager.getJob.mockResolvedValue({
-          metadata: {},
-        });
-
-        mockGenerationJobManager.abortJob.mockResolvedValue({
-          success: true,
-          jobData: null,
-          content: [],
-          text: '',
+          status: 'complete',
+          metadata: { userId: 'test-user-123' },
         });
 
         const response = await request(app)
           .post('/api/agents/chat/abort')
           .send({ conversationId: jobStreamId });
 
-        expect(response.status).toBe(200);
-        expect(response.body).toEqual({ success: true, aborted: jobStreamId });
+        expect(response.status).toBe(409);
+        expect(response.body).toEqual({
+          error: 'Generation is already complete',
+          streamId: jobStreamId,
+        });
+        expect(mockGenerationJobManager.abortJob).not.toHaveBeenCalled();
+        expect(mockSaveMessage).not.toHaveBeenCalled();
       });
+
+      /* === VIVENTIUM START ===
+       * Feature: Parallel Work owner isolation.
+       * Purpose: A legacy/corrupt job without durable owner identity must fail closed rather than
+       *          becoming abortable by whichever authenticated account knows its stream key.
+       */
+      it('should reject abort when job has no userId metadata', async () => {
+        const jobStreamId = 'test-stream-123';
+
+        mockGenerationJobManager.getJob.mockResolvedValue({
+          metadata: {},
+        });
+
+        const response = await request(app)
+          .post('/api/agents/chat/abort')
+          .send({ conversationId: jobStreamId });
+
+        expect(response.status).toBe(404);
+        expect(response.body).toEqual({ error: 'Job not found', streamId: jobStreamId });
+        expect(mockGenerationJobManager.abortJob).not.toHaveBeenCalled();
+      });
+      /* === VIVENTIUM END === */
     });
 
     describe('Early Abort Handling', () => {
@@ -284,6 +328,39 @@ describe('Agent Abort Endpoint', () => {
     });
 
     describe('Job Not Found', () => {
+      /* === VIVENTIUM START ===
+       * Feature: Exact Stop rollover.
+       * Purpose: A placeholder route must select the newest owned job, never array order.
+       * === VIVENTIUM END === */
+      it('aborts the newest owned active job when the new-chat placeholder has no exact key', async () => {
+        mockGenerationJobManager.getJob.mockImplementation(async (streamId) => {
+          if (streamId === 'older-stream') {
+            return { status: 'running', createdAt: 10, metadata: { userId: 'test-user-123' } };
+          }
+          if (streamId === 'newer-stream') {
+            return { status: 'running', createdAt: 20, metadata: { userId: 'test-user-123' } };
+          }
+          return null;
+        });
+        mockGenerationJobManager.getActiveJobIdsForUser.mockResolvedValue([
+          'older-stream',
+          'newer-stream',
+        ]);
+        mockGenerationJobManager.abortJob.mockResolvedValue({
+          success: true,
+          jobData: null,
+          content: [],
+          text: '',
+        });
+
+        const response = await request(app)
+          .post('/api/agents/chat/abort')
+          .send({ conversationId: 'new' });
+
+        expect(response.status).toBe(200);
+        expect(mockGenerationJobManager.abortJob).toHaveBeenCalledWith('newer-stream');
+      });
+
       it('should return 404 when job is not found', async () => {
         mockGenerationJobManager.getJob.mockResolvedValue(null);
         mockGenerationJobManager.getActiveJobIdsForUser.mockResolvedValue([]);

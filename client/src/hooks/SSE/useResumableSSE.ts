@@ -3,6 +3,13 @@ import { v4 } from 'uuid';
 import { SSE } from 'sse.js';
 import { useSetRecoilState } from 'recoil';
 import { useQueryClient } from '@tanstack/react-query';
+/* === VIVENTIUM START ===
+ * Feature: Canonical new-chat route settlement.
+ * Purpose: Keep the route aligned with the server-authored conversation before exact-route guards
+ *          can unmount the stream that produced it.
+ */
+import { useNavigate } from 'react-router-dom';
+/* === VIVENTIUM END === */
 import {
   request,
   Constants,
@@ -18,6 +25,9 @@ import { useGetStartupConfig, useGetUserBalance } from '~/data-provider';
 import type { ActiveJobsResponse } from '~/data-provider';
 import { useAuthContext } from '~/hooks/AuthContext';
 import useEventHandlers from './useEventHandlers';
+/* === VIVENTIUM START === Canonical new-chat title provenance === */
+import type { CanonicalConversationSubmission } from './canonicalConversation';
+/* === VIVENTIUM END === */
 import { createCortexPendingBuffer } from './cortexPendingBuffer';
 import store from '~/store';
 
@@ -43,6 +53,13 @@ type ChatHelpers = Pick<
 
 const MAX_RETRIES = 5;
 
+type GenerationStartReceipt = {
+  streamId: string;
+  conversationId?: string;
+  logical_turn_id?: string;
+  revision?: number;
+};
+
 /**
  * Hook for resumable SSE streams.
  * Separates generation start (POST) from stream subscription (GET EventSource).
@@ -60,6 +77,9 @@ export default function useResumableSSE(
   runIndex = 0,
 ) {
   const queryClient = useQueryClient();
+  /* === VIVENTIUM START === Canonical new-chat route settlement === */
+  const navigate = useNavigate();
+  /* === VIVENTIUM END === */
   const setActiveRunId = useSetRecoilState(store.activeRunFamily(runIndex));
 
   const { token, isAuthenticated } = useAuthContext();
@@ -98,7 +118,6 @@ export default function useResumableSSE(
   const reconnectAttemptRef = useRef(0);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const submissionRef = useRef<TSubmission | null>(null);
-
   const {
     setMessages,
     getMessages,
@@ -107,6 +126,36 @@ export default function useResumableSSE(
     newConversation,
     resetLatestMessage,
   } = chatHelpers;
+
+  /* === VIVENTIUM START ===
+   * Feature: Canonical new-chat message ownership.
+   * Purpose: Stream handlers outlive the `new` route render that created them. Resolve every
+   *          handler read/write through the currently claimed QueryKeys.messages identity.
+   */
+  const messageConversationIdRef = useRef<string | null>(null);
+
+  const getStreamMessages = useCallback(() => {
+    const conversationId = messageConversationIdRef.current;
+    if (!conversationId) {
+      return getMessages();
+    }
+    return (
+      queryClient.getQueryData<TMessage[]>([QueryKeys.messages, conversationId]) ?? getMessages()
+    );
+  }, [getMessages, queryClient]);
+
+  const setStreamMessages = useCallback(
+    (messages: TMessage[]) => {
+      const conversationId = messageConversationIdRef.current;
+      if (!conversationId) {
+        setMessages(messages);
+        return;
+      }
+      queryClient.setQueryData<TMessage[]>([QueryKeys.messages, conversationId], messages);
+    },
+    [queryClient, setMessages],
+  );
+  /* === VIVENTIUM END === */
 
   const {
     stepHandler,
@@ -120,8 +169,8 @@ export default function useResumableSSE(
     attachmentHandler,
     resetContentHandler,
   } = useEventHandlers({
-    setMessages,
-    getMessages,
+    setMessages: setStreamMessages,
+    getMessages: getStreamMessages,
     setCompleted,
     isAddedRequest,
     setConversation,
@@ -156,8 +205,8 @@ export default function useResumableSSE(
        *          buffer them and flush on `created`.
        */
       const cortexBuffer = createCortexPendingBuffer({
-        getMessages,
-        setMessages,
+        getMessages: getStreamMessages,
+        setMessages: setStreamMessages,
       });
       /* === VIVENTIUM END === */
       const sse = new SSE(url, {
@@ -185,6 +234,25 @@ export default function useResumableSSE(
               conversationId: data.conversation?.conversationId,
               hasResponseMessage: !!data.responseMessage,
             });
+            if (data.superseded === true) {
+              const supersededUserMessageId = userMessage?.messageId;
+              if (supersededUserMessageId) {
+                setStreamMessages(
+                  (getStreamMessages() ?? []).filter(
+                    (message) =>
+                      message.isCreatedByUser === true ||
+                      message.parentMessageId !== supersededUserMessageId,
+                  ),
+                );
+              }
+              clearStepMaps();
+              removeActiveJob(currentStreamId);
+              sse.close();
+              setIsSubmitting(false);
+              setShowStopButton(false);
+              setStreamId(null);
+              return;
+            }
             clearDraft(currentSubmission.conversation?.conversationId);
             try {
               finalHandler(data, currentSubmission as EventSubmission);
@@ -244,7 +312,7 @@ export default function useResumableSSE(
             console.log('[ResumableSSE] Cortex update:', cortexData.cortex_name, cortexData.status);
 
             // Update message cortex status WITHOUT touching message.content (avoids index collisions with streaming/tool calls)
-            const messages = getMessages() ?? [];
+            const messages = getStreamMessages() ?? [];
             const candidateMessageIds = [
               typeof cortexData.runId === 'string' ? cortexData.runId : null,
               typeof cortexData.userMessageId === 'string' && cortexData.userMessageId.length > 0
@@ -281,6 +349,8 @@ export default function useResumableSSE(
               direct_action_surface_scopes: cortexData.direct_action_surface_scopes,
               configured_tools: cortexData.configured_tools,
               completed_tool_calls: cortexData.completed_tool_calls,
+              fallback_used: cortexData.fallback_used,
+              fallback_reason_class: cortexData.fallback_reason_class,
               status_changed_at: cortexData.status_changed_at,
             };
 
@@ -312,7 +382,7 @@ export default function useResumableSSE(
             }
             (response as any).__viventiumCortexParts = cortexParts;
             updatedMessages[responseIdx] = response;
-            setMessages(updatedMessages);
+            setStreamMessages(updatedMessages);
             return;
           }
           /* === VIVENTIUM END === */
@@ -341,7 +411,7 @@ export default function useResumableSSE(
 
             // Set message content from aggregatedContent
             if (data.resumeState?.aggregatedContent && userMessage?.messageId) {
-              const messages = getMessages() ?? [];
+              const messages = getStreamMessages() ?? [];
               const userMsgId = userMessage.messageId;
               const serverResponseId = data.resumeState.responseMessageId;
 
@@ -382,7 +452,7 @@ export default function useResumableSSE(
                   oldContentLength: Array.isArray(oldContent) ? oldContent.length : 0,
                   newContentLength: data.resumeState.aggregatedContent?.length,
                 });
-                setMessages(updated);
+                setStreamMessages(updated);
                 // Sync both content handler and step handler with the updated message
                 // so subsequent deltas build on synced content, not stale content
                 resetContentHandler();
@@ -391,7 +461,7 @@ export default function useResumableSSE(
               } else {
                 // Add new response message
                 const responseId = serverResponseId ?? `${userMsgId}_`;
-                setMessages([
+                setStreamMessages([
                   ...messages,
                   {
                     messageId: responseId,
@@ -619,8 +689,8 @@ export default function useResumableSSE(
       messageHandler,
       errorHandler,
       setIsSubmitting,
-      getMessages,
-      setMessages,
+      getStreamMessages,
+      setStreamMessages,
       startupConfig?.balance?.enabled,
       balanceQuery,
       removeActiveJob,
@@ -633,10 +703,18 @@ export default function useResumableSSE(
    * Retries up to 3 times on network errors with exponential backoff.
    */
   const startGeneration = useCallback(
-    async (currentSubmission: TSubmission): Promise<string | null> => {
+    async (currentSubmission: TSubmission): Promise<GenerationStartReceipt | null> => {
       const payloadData = createPayload(currentSubmission);
       let { payload } = payloadData;
       payload = removeNullishValues(payload) as TPayload;
+      /* === VIVENTIUM START ===
+       * Feature: Stable authoring identity across start-POST retries.
+       * Purpose: A lost HTTP response may cause this loop to POST again. Reuse one client-minted
+       * assistant ID so the server and GlassHive idempotency boundary see the same turn.
+       * === VIVENTIUM END === */
+      if (!payload.responseMessageId) {
+        payload.responseMessageId = v4();
+      }
 
       clearStepMaps();
 
@@ -648,9 +726,9 @@ export default function useResumableSSE(
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
           // Use request.post which handles auth token refresh via axios interceptors
-          const data = (await request.post(url, payload)) as { streamId: string };
+          const data = (await request.post(url, payload)) as GenerationStartReceipt;
           console.log('[ResumableSSE] Generation started:', { streamId: data.streamId });
-          return data.streamId;
+          return data;
         } catch (error) {
           lastError = error;
           // Check if it's a network error (retry) vs server error (don't retry)
@@ -709,8 +787,16 @@ export default function useResumableSSE(
       setStreamId(null);
       reconnectAttemptRef.current = 0;
       submissionRef.current = null;
+      messageConversationIdRef.current = null;
       return;
     }
+
+    /* === VIVENTIUM START ===
+     * Feature: Canonical new-chat route settlement.
+     * Purpose: A start receipt that resolves after navigation must not reclaim the abandoned route.
+     */
+    let effectDisposed = false;
+    /* === VIVENTIUM END === */
 
     const resumeStreamId = (submission as TSubmission & { resumeStreamId?: string }).resumeStreamId;
     console.log('[ResumableSSE] Effect triggered', {
@@ -721,6 +807,7 @@ export default function useResumableSSE(
     });
 
     submissionRef.current = submission;
+    messageConversationIdRef.current = submission.conversation?.conversationId ?? null;
 
     const initStream = async () => {
       setIsSubmitting(true);
@@ -736,12 +823,82 @@ export default function useResumableSSE(
       } else {
         // New generation: start and then subscribe
         console.log('[ResumableSSE] Starting NEW generation');
-        const newStreamId = await startGeneration(submission);
-        if (newStreamId) {
+        const startReceipt = await startGeneration(submission);
+        /* === VIVENTIUM START === Canonical new-chat route settlement === */
+        if (effectDisposed) {
+          return;
+        }
+        /* === VIVENTIUM END === */
+        if (startReceipt?.streamId) {
+          const newStreamId = startReceipt.streamId;
+          const canonicalConversationId = startReceipt.conversationId;
+          let claimedSubmission: CanonicalConversationSubmission = submission;
+
+          /* === VIVENTIUM START ===
+           * Feature: Cross-surface logical-turn coherence.
+           * Purpose: Bind the server-authored canonical conversation as soon as
+           *          the start request is accepted. A rapid follow-up can then
+           *          claim revision 2 of the same turn before the slower CREATED
+           *          model event arrives.
+           * === VIVENTIUM END === */
+          if (
+            canonicalConversationId &&
+            canonicalConversationId !== submission.conversation?.conversationId
+          ) {
+            claimedSubmission = {
+              ...submission,
+              /* === VIVENTIUM START ===
+               * Feature: Canonical new-chat title provenance.
+               * Purpose: Preserve the pre-claim route identity after every message/cache ID is
+               *          rebound to the canonical conversation.
+               */
+              viventiumOriginalConversationId: submission.conversation?.conversationId ?? null,
+              /* === VIVENTIUM END === */
+              conversation: {
+                ...submission.conversation,
+                conversationId: canonicalConversationId,
+              },
+              userMessage: {
+                ...submission.userMessage,
+                conversationId: canonicalConversationId,
+              },
+              ...(submission.initialResponse
+                ? {
+                    initialResponse: {
+                      ...submission.initialResponse,
+                      conversationId: canonicalConversationId,
+                    },
+                  }
+                : {}),
+            };
+            const previousConversationId = submission.conversation?.conversationId;
+            const currentMessages =
+              (previousConversationId
+                ? queryClient.getQueryData<TMessage[]>([QueryKeys.messages, previousConversationId])
+                : undefined) ??
+              getStreamMessages() ??
+              [];
+            queryClient.setQueryData<TMessage[]>(
+              [QueryKeys.messages, canonicalConversationId],
+              currentMessages,
+            );
+            messageConversationIdRef.current = canonicalConversationId;
+            if (
+              !submission.conversation?.conversationId ||
+              submission.conversation.conversationId === Constants.NEW_CONVO
+            ) {
+              navigate(`/c/${canonicalConversationId}`, { replace: true });
+            }
+            setConversation?.((previous) =>
+              previous ? { ...previous, conversationId: canonicalConversationId } : previous,
+            );
+          }
+
+          submissionRef.current = claimedSubmission;
           setStreamId(newStreamId);
           // Optimistically add to active jobs
           addActiveJob(newStreamId);
-          subscribeToStream(newStreamId, submission);
+          subscribeToStream(newStreamId, claimedSubmission);
         } else {
           console.error('[ResumableSSE] Failed to get streamId from startGeneration');
         }
@@ -752,6 +909,9 @@ export default function useResumableSSE(
 
     return () => {
       console.log('[ResumableSSE] Cleanup - closing SSE, resetting UI state');
+      /* === VIVENTIUM START === Canonical new-chat route settlement === */
+      effectDisposed = true;
+      /* === VIVENTIUM END === */
       // Cleanup on unmount/navigation - close connection but DO NOT abort backend
       // Reset UI state so it doesn't leak to other conversations
       // If user returns to this conversation, useResumeOnLoad will restore the state
@@ -765,6 +925,7 @@ export default function useResumableSSE(
         sseRef.current.close();
         sseRef.current = null;
       }
+      messageConversationIdRef.current = null;
       // Clear handler maps to prevent memory leaks and stale state
       clearStepMaps();
       // Reset UI state on cleanup - useResumeOnLoad will restore if needed

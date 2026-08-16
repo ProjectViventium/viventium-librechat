@@ -1,3 +1,4 @@
+// VIVENTIUM START: preserve Viventium agent-panel form behavior.
 /**
  * @jest-environment jsdom
  */
@@ -39,6 +40,7 @@ const createForm = (): AgentForm => ({
   avatar_preview: '',
   avatar_action: null,
 });
+// VIVENTIUM END
 
 describe('composeAgentUpdatePayload', () => {
   it('includes avatar: null when resetting a persistent agent', () => {
@@ -164,7 +166,7 @@ describe('composeAgentUpdatePayload', () => {
       max_output_tokens: 320,
     } as AgentForm['voice_fallback_llm_model_parameters'];
     form.fallback_llm_provider = 'anthropic';
-    form.fallback_llm_model = 'claude-sonnet-4-5';
+    form.fallback_llm_model = 'claude-opus-5';
 
     const { payload } = composeAgentUpdatePayload(form, 'agent_123');
 
@@ -179,7 +181,54 @@ describe('composeAgentUpdatePayload', () => {
       temperature: 0.1,
       max_output_tokens: 320,
     });
-    expect(payload.fallback_llm_model).toBe('claude-sonnet-4-5');
+    expect(payload.fallback_llm_model).toBe('claude-opus-5');
+  });
+
+  it('persists typed GlassHive workspace options on the normal agent payload', () => {
+    const form = createForm();
+    form.provider = 'glasshive-harness';
+    form.model = 'codex-cli:gpt-5.6-sol';
+    form.model_parameters = {
+      reasoning_effort: 'medium',
+    } as AgentForm['model_parameters'];
+    form.glasshive_options = {
+      workspace: { mode: 'custom', path: '/srv/viventium/life' },
+      access: 'workspace',
+      fallback_model: 'claude-code:opus',
+      fallback_reasoning_effort: 'high',
+    };
+
+    const { payload } = composeAgentUpdatePayload(form, 'agent_123', true);
+
+    expect(payload.provider).toBe('glasshive-harness');
+    expect(payload.model).toBe('codex-cli:gpt-5.6-sol');
+    expect(payload.model_parameters).toMatchObject({
+      model: 'codex-cli:gpt-5.6-sol',
+      reasoning_effort: 'medium',
+    });
+    expect(payload.glasshive_options).toEqual({
+      workspace: { mode: 'custom', path: '/srv/viventium/life' },
+      access: 'workspace',
+      fallback_model: 'claude-code:opus',
+      fallback_reasoning_effort: 'high',
+    });
+  });
+
+  it('does not let an unfinished custom path block a temporary direct-provider save', () => {
+    const form = createForm();
+    form.glasshive_options = {
+      workspace: { mode: 'custom', path: '' },
+      access: 'full',
+    };
+
+    const { payload } = composeAgentUpdatePayload(form, 'agent_123', false);
+
+    expect(payload.provider).toBe('openai');
+    expect(payload.glasshive_options).toBeUndefined();
+    expect(form.glasshive_options).toEqual({
+      workspace: { mode: 'custom', path: '' },
+      access: 'full',
+    });
   });
 });
 

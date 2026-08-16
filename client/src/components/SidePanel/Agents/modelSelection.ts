@@ -34,6 +34,21 @@ export function resolveAgentModelForProvider({
 }
 
 /* === VIVENTIUM START ===
+ * Feature: Optional-route provider parameter isolation.
+ * Purpose: Provider-specific settings such as OpenAI Responses must not survive a real provider
+ * change and contaminate an xAI, Anthropic, or other optional agent route.
+ * === VIVENTIUM END === */
+export function didAgentProviderChange({
+  provider,
+  previousProvider,
+}: {
+  provider: string;
+  previousProvider?: string;
+}): boolean {
+  return Boolean(previousProvider) && previousProvider !== provider;
+}
+
+/* === VIVENTIUM START ===
  * Feature: GPT-5.6 Agent Builder Responses default.
  * Purpose: GPT-5.6 agent workflows should use the existing Responses path by default, while an
  * explicit operator choice remains authoritative.

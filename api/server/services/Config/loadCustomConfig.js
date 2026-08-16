@@ -138,9 +138,9 @@ https://www.librechat.ai/docs/configuration/stt_tts`);
     process.exit(1);
   } else {
     if (printConfig) {
-      logger.info('Custom config file loaded:');
-      logger.info(JSON.stringify(customConfig, null, 2));
-      logger.debug('Custom config:', customConfig);
+      // VIVENTIUM START: Interpolation makes the config secret-bearing; never log its contents.
+      logger.info('Custom config file loaded and validated.');
+      // VIVENTIUM END
     }
   }
 

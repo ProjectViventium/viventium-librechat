@@ -281,15 +281,21 @@ describe('loadCustomConfig', () => {
     await loadCustomConfig();
   });
 
-  it('should log the loaded custom config', async () => {
+  // VIVENTIUM START: Never expose interpolated secrets or private prompts in startup logs.
+  it('should report successful config loading without logging private config values', async () => {
+    const privateApiKey = 'sk-test-private-config-marker';
+    const privateInstruction = 'synthetic-private-instruction-marker';
     const mockConfig = {
       version: '1.0',
       cache: true,
+      memory: {
+        instructions: privateInstruction,
+      },
       endpoints: {
         custom: [
           {
             name: 'mistral',
-            apiKey: 'user_provided',
+            apiKey: privateApiKey,
             baseURL: 'https://api.mistral.ai/v1',
           },
         ],
@@ -298,10 +304,16 @@ describe('loadCustomConfig', () => {
     process.env.CONFIG_PATH = 'validConfig.yaml';
     loadYaml.mockReturnValueOnce(mockConfig);
     await loadCustomConfig();
-    expect(logger.info).toHaveBeenCalledWith('Custom config file loaded:');
-    expect(logger.info).toHaveBeenCalledWith(JSON.stringify(mockConfig, null, 2));
-    expect(logger.debug).toHaveBeenCalledWith('Custom config:', mockConfig);
+    expect(logger.info).toHaveBeenCalledWith('Custom config file loaded and validated.');
+
+    const renderedLogs = JSON.stringify({
+      info: logger.info.mock.calls,
+      debug: logger.debug.mock.calls,
+    });
+    expect(renderedLogs).not.toContain(privateApiKey);
+    expect(renderedLogs).not.toContain(privateInstruction);
   });
+  // VIVENTIUM END
 
   describe('parseCustomParams', () => {
     const mockConfig = {
